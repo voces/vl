@@ -59,7 +59,6 @@ LBRACK   : '[';
 RBRACK   : ']';
 COMMA    : ',';
 DOT      : '.';
-SEMI     : ';';
 COLON    : ':';
 
 // Other tokens
