@@ -1,6 +1,6 @@
-import { ParseTree, TerminalNode, Token } from "antlr4";
+import { ParseTree, TerminalNode } from "antlr4";
 import VLLexer from "./antlr/VL_Lexer.ts";
-import VLParser, {
+import {
   ArrayContext,
   AssignStatementContext,
   BlockContext,
@@ -443,7 +443,6 @@ const internalExecute = (
     try {
       if (cur.symbol.type === VLLexer.NUMBER) return parseFloat(cur.getText());
     } catch (err) {
-      debugger;
       throw err;
     }
     if (cur.symbol.type === VLLexer.STRING) return cur.getText().slice(1, -1);

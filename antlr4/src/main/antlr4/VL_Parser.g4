@@ -26,8 +26,8 @@ functionDecl
     ;
 
 varDecl
-    : CONST ID (NEWLINE* EQUAL NEWLINE* expr)?
-    | LET ID (NEWLINE* EQUAL NEWLINE* expr)?
+    : CONST ID ID? (NEWLINE* EQUAL NEWLINE* expr)?
+    | LET ID? ID? (NEWLINE* EQUAL NEWLINE* expr)?
     | ID ID (NEWLINE* EQUAL NEWLINE* expr)?
     ;
 
