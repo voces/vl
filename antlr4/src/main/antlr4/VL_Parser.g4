@@ -19,16 +19,16 @@ statement
     | continueStatement
     | returnStatement
     | expr
+    | typeStatement
     ;
 
 functionDecl
-    : FUNCTION ID? LPAREN params? RPAREN NEWLINE* statement
+    : FUNCTION ID? LPAREN params? RPAREN (COLON NEWLINE* type)? NEWLINE* statement
     ;
 
 varDecl
-    : CONST ID ID? (NEWLINE* EQUAL NEWLINE* expr)?
-    | LET ID? ID? (NEWLINE* EQUAL NEWLINE* expr)?
-    | ID ID (NEWLINE* EQUAL NEWLINE* expr)?
+    : CONST type? ID (NEWLINE* EQUAL NEWLINE* expr)?
+    | LET type? ID (NEWLINE* EQUAL NEWLINE* expr)?
     ;
 
 ifStatement
@@ -111,7 +111,7 @@ functionCall
     ;
 
 params : param (NEWLINE* COMMA NEWLINE* param)* ;
-param  : (ID)? ID ;
+param  : type? ID ;
 args   : expr (NEWLINE* COMMA NEWLINE* expr)* ;
 
 binaryOp
@@ -137,3 +137,24 @@ label
 block : label? LBRACE NEWLINE blockStatement* NEWLINE RBRACE
       | label? LBRACE NEWLINE RBRACE
       ;
+
+typeStatement : TYPE EQUAL type ;
+
+type
+    : ID
+    | NUMBER
+    | TRUE
+    | FALSE
+    | STRING
+    | NULL
+    | objectType
+    | type RBRACK LBRACK
+    | RBRACE NEWLINE* type (NEWLINE* COMMA type)* NEWLINE* LBRACE
+    ;
+
+objectType
+    : LBRACE RBRACE
+    | LBRACE NEWLINE* pairType (NEWLINE* COMMA NEWLINE* pairType)* NEWLINE* RBRACE
+    ;
+
+pairType : (ID | STRING) NEWLINE* COLON NEWLINE* type ;

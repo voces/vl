@@ -1,10 +1,11 @@
-import {
+import VL_Parser, {
   ExprContext,
   FunctionDeclContext,
   ObjectContext,
   ParamContext,
   ProgramContext,
   StatementContext,
+  TypeContext,
   VarDeclContext,
 } from "./antlr/VL_Parser.ts";
 
@@ -38,6 +39,11 @@ type VLStringLiteralNode = {
   value: string;
 };
 
+type VLNumberLiteralNode = {
+  type: "NumberLiteral";
+  value: number;
+};
+
 type VLPropertyNode = {
   type: "Property";
   name: VLNameNode | VLStringLiteralNode | VLExpressionNode;
@@ -52,12 +58,15 @@ type VLExpressionNode =
   | VLFunctionDeclarationNode
   | VLNameNode
   | VLBlockNode
-  | VLObjectLiteralNode;
+  | VLObjectLiteralNode
+  | VLStringLiteralNode
+  | VLNumberLiteralNode;
 
 type VLVariableDeclarationNode = {
   type: "VariableDeclaration";
   name: string;
   variableType: VLType | undefined;
+  value: VLExpressionNode | undefined;
 };
 
 type VLReturnNode = {
@@ -77,7 +86,11 @@ type VLFunctionType = {
   return: VLAliasType;
   exceptions: VLAliasType[];
 };
-type VLType = VLAliasType | VLFunctionType;
+type VLType =
+  | VLAliasType
+  | VLFunctionType
+  | VLStringLiteralNode
+  | VLNumberLiteralNode;
 
 export type VLProgramNode = {
   type: "Program";
@@ -88,12 +101,14 @@ export type VLProgramNode = {
 
 const toVariableDeclaration = (ctx: VarDeclContext) => {
   const ids = ctx.ID_list();
+  const expr = ctx.expr();
   const node: VLVariableDeclarationNode = {
     type: "VariableDeclaration",
     name: ids.length === 1 ? ids[0].getText() : ids[1].getText(),
     variableType: ids.length === 2
       ? { type: "Alias", name: ids[0].getText() }
       : undefined,
+    value: expr ? toExpression(expr) : undefined,
   };
   return node;
 };
@@ -109,14 +124,27 @@ const toParameter = (ctx: ParamContext): VLParameterNode => {
   };
 };
 
+const toType = (ctx: TypeContext): VLType => {
+  {
+    const id = ctx.ID();
+    if (id) return { type: "Alias", name: id.getText() };
+  }
+
+  throw new Error(`toType not implemented ${ctx.getText()}`);
+};
+
 const toFunctionDeclaration = (ast: FunctionDeclContext) => {
   const statement = toStatement(ast.statement());
+  const statements = statement.type === "Block"
+    ? statement.statements
+    : [statement];
+  const returnType = ast.type_();
   const node: VLFunctionDeclarationNode = {
     type: "FunctionDeclaration",
     name: ast.ID()?.getText(),
     parameters: ast.params().param_list().map(toParameter),
-    body: statement.type === "Block" ? statement.statements : [statement],
-    returnType: undefined,
+    body: statements,
+    returnType: returnType ? toType(returnType) : undefined,
   };
   return node;
 };
@@ -171,7 +199,7 @@ const toExpression = (ctx: ExprContext): VLExpressionNode => {
         type: "Block",
         label: ctx.ID()?.getText(),
         statements: block.blockStatement_list().map((b) => b.statement())
-          .filter(Boolean).map((s) => toStatement(s)),
+          .filter(Boolean).map(toStatement),
       };
     }
   }
@@ -179,6 +207,18 @@ const toExpression = (ctx: ExprContext): VLExpressionNode => {
   {
     const obj = ctx.object();
     if (obj) return toObjectLiteral(obj);
+  }
+
+  {
+    const num = ctx.NUMBER();
+    if (num) return { type: "NumberLiteral", value: parseFloat(num.getText()) };
+  }
+
+  {
+    const string = ctx.STRING();
+    if (string) {
+      return { type: "StringLiteral", value: string.getText().slice(1, -1) };
+    }
   }
 
   throw new Error(`toExpression not implemented ${ctx.getText()}`);
@@ -203,7 +243,22 @@ const toStatement = (ctx: StatementContext): VLStatementNode => {
     }
   }
 
-  throw new Error("toStatement not implemented");
+  const opts = {
+    assignStatement: ctx.assignStatement() ? true : false,
+    ifStatement: ctx.ifStatement() ? true : false,
+    whileStatement: ctx.whileStatement() ? true : false,
+    forStatement: ctx.forStatement() ? true : false,
+    breakStatement: ctx.breakStatement() ? true : false,
+    continueStatement: ctx.continueStatement() ? true : false,
+    returnStatement: ctx.returnStatement() ? true : false,
+    typeStatement: ctx.typeStatement() ? true : false,
+  };
+
+  throw new Error(
+    `toStatement not implemented ${ctx.getText()} ${
+      Object.entries(opts).filter(([, v]) => v).map(([n]) => n)
+    }`,
+  );
 };
 
 export const toAST = (cst: ProgramContext) => {
@@ -213,6 +268,8 @@ export const toAST = (cst: ProgramContext) => {
     locals: {},
     errors: [],
   };
+
+  console.log(cst.toStringTree(VL_Parser.ruleNames, cst.parser!));
 
   for (const blkStmt of cst.blockStatement_list()) {
     const stmt = blkStmt.statement();
@@ -231,8 +288,6 @@ export const toAST = (cst: ProgramContext) => {
       program.statements.push(toStatement(stmt));
     }
   }
-
-  // resolveTypes(ast)
 
   return program;
 };

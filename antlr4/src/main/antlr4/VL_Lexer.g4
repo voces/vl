@@ -19,6 +19,7 @@ BREAK    : 'break';
 CONTINUE : 'continue';
 NOT      : 'not';
 FROM     : 'from';
+TYPE     : 'type';
 
 // Values
 NUMBER   : [0-9]+ ('.' [0-9]+)?;
