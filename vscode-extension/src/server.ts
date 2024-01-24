@@ -1,4 +1,5 @@
 import { inspect } from "node:util";
+import { ParserRuleContext, TerminalNode } from "antlr4";
 import {
   createConnection,
   Diagnostic,
@@ -18,7 +19,7 @@ import {
 } from "antlr4";
 import VLLexer from "./antlr/VL_Lexer.ts";
 import VLParser from "./antlr/VL_Parser.ts";
-import { toAST } from "./toAST.ts";
+import { toAST, VLType } from "./toAST.ts";
 
 declare const process: NodeJS.Process;
 
@@ -81,15 +82,88 @@ export const parse = (code: string) => {
   return [parser.program(), diagnostics] as const;
 };
 
+const rangeFromCtx = (ctx: ParserRuleContext | TerminalNode) => {
+  if (ctx instanceof TerminalNode) {
+    return {
+      start: {
+        line: ctx.symbol.line - 1,
+        character: ctx.symbol.column,
+      },
+      end: {
+        line: ctx.symbol.line - 1,
+        character: ctx.symbol.column + (ctx.symbol.stop - ctx.symbol.start) + 1,
+      },
+    };
+  }
+
+  const stop = ctx.stop ?? ctx.start;
+  return {
+    start: {
+      line: ctx.start.line - 1,
+      character: ctx.start.column,
+    },
+    end: {
+      line: stop.line - 1,
+      character: stop.column + (stop.stop - stop.start) + 1,
+    },
+  };
+};
+
+const stringifyType = (type: VLType) => {
+  if (type.type === "Alias") return type.name;
+  return type.type;
+};
+
 documents.onDidChangeContent((event) => {
   connection.console.log(
     `[Server(${process.pid}) ${workspaceFolder}] Document changed: ${event.document.uri}`,
   );
   const [program, diagnostics] = parse(event.document.getText());
 
-  console.log(
-    inspect(toAST(program), { depth: Infinity, compact: true }),
-  );
+  const [ast, errors] = toAST(program);
+
+  for (const error of errors) {
+    switch (error.type) {
+      case "Redeclaration":
+        diagnostics.push({
+          message: `Syntax error: redeclared ${error.name}`,
+          severity: DiagnosticSeverity.Error,
+          range: rangeFromCtx(error.ctx),
+        });
+        break;
+      case "Undeclared":
+        diagnostics.push({
+          message: `Syntax error: undeclared ${error.name}`,
+          severity: DiagnosticSeverity.Error,
+          range: rangeFromCtx(error.ctx),
+        });
+        break;
+      case "Type": {
+        diagnostics.push({
+          message: `Type error: expected ${stringifyType(error.left)}, got ${
+            stringifyType(error.right)
+          }`,
+          severity: DiagnosticSeverity.Error,
+          range: rangeFromCtx(error.ctx),
+        });
+        break;
+      }
+      case "UnmatchedParameter": {
+        diagnostics.push({
+          message: `Type error: unmatched parameter`,
+          severity: DiagnosticSeverity.Error,
+          range: rangeFromCtx(error.ctx),
+        });
+        break;
+      }
+      default: {
+        const exhaustive: never = error;
+        console.warn(`Unhandled AST error: ${exhaustive}`);
+      }
+    }
+  }
+
+  console.log(inspect(ast, { depth: Infinity, compact: true }));
 
   connection.sendDiagnostics({
     uri: event.document.uri,

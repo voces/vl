@@ -61,6 +61,7 @@ RBRACK   : ']';
 COMMA    : ',';
 DOT      : '.';
 COLON    : ':';
+PIPE     : '|';
 
 // Other tokens
 ID       : [a-zA-Z_][a-zA-Z_0-9]*;

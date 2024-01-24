@@ -27,8 +27,8 @@ functionDecl
     ;
 
 varDecl
-    : CONST type? ID (NEWLINE* EQUAL NEWLINE* expr)?
-    | LET type? ID (NEWLINE* EQUAL NEWLINE* expr)?
+    : CONST ID (COLON NEWLINE* type)? (NEWLINE* EQUAL NEWLINE* expr)?
+    | LET ID (COLON NEWLINE* type)? (NEWLINE* EQUAL NEWLINE* expr)?
     ;
 
 ifStatement
@@ -101,8 +101,8 @@ array
     ;
 
 assignStatement
-    : ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr // TODO: ID should be expr
-    | expr NEWLINE* DOT ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr // TODO: ID should be expr
+    : ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
+    | expr NEWLINE* DOT ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     | expr LBRACK NEWLINE* expr NEWLINE* RBRACK NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     ;
 
@@ -111,7 +111,7 @@ functionCall
     ;
 
 params : param (NEWLINE* COMMA NEWLINE* param)* ;
-param  : type? ID ;
+param  : ID (COLON NEWLINE* type)? ;
 args   : expr (NEWLINE* COMMA NEWLINE* expr)* ;
 
 binaryOp
@@ -150,6 +150,7 @@ type
     | objectType
     | type RBRACK LBRACK
     | RBRACE NEWLINE* type (NEWLINE* COMMA type)* NEWLINE* LBRACE
+    | type NEWLINE* PIPE NEWLINE* type
     ;
 
 objectType
