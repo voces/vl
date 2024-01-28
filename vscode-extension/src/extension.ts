@@ -19,7 +19,7 @@ let defaultClient: LanguageClient;
 const clients: Map<string, LanguageClient> = new Map();
 
 let _sortedWorkspaceFolders: string[] | undefined;
-function sortedWorkspaceFolders(): string[] {
+const sortedWorkspaceFolders = () => {
   if (_sortedWorkspaceFolders === void 0) {
     _sortedWorkspaceFolders = Workspace.workspaceFolders
       ? Workspace.workspaceFolders.map((folder) => {
@@ -30,12 +30,12 @@ function sortedWorkspaceFolders(): string[] {
       : [];
   }
   return _sortedWorkspaceFolders;
-}
+};
 Workspace.onDidChangeWorkspaceFolders(() =>
   _sortedWorkspaceFolders = undefined
 );
 
-function getOuterMostWorkspaceFolder(folder: WorkspaceFolder): WorkspaceFolder {
+const getOuterMostWorkspaceFolder = (folder: WorkspaceFolder) => {
   const sorted = sortedWorkspaceFolders();
   for (const element of sorted) {
     let uri = folder.uri.toString();
@@ -45,7 +45,7 @@ function getOuterMostWorkspaceFolder(folder: WorkspaceFolder): WorkspaceFolder {
     }
   }
   return folder;
-}
+};
 
 const createClient = (
   module: string,
@@ -55,7 +55,11 @@ const createClient = (
 ) => {
   const serverOptions = {
     run: { module, transport: TransportKind.ipc },
-    debug: { module, transport: TransportKind.ipc },
+    debug: {
+      module,
+      transport: TransportKind.ipc,
+      options: { execArgv: ["--nolazy", "--inspect=6012"] },
+    },
   };
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{
@@ -68,14 +72,15 @@ const createClient = (
   };
   const client = new LanguageClient("Vital", serverOptions, clientOptions);
   client.start();
+  client.registerProposedFeatures();
   return client;
 };
 
-export function activate(context: ExtensionContext) {
+export const activate = (context: ExtensionContext) => {
   const module = context.asAbsolutePath(path.join("dist", "server.js"));
   const outputChannel: OutputChannel = Window.createOutputChannel("vital");
 
-  function didOpenTextDocument(document: TextDocument): void {
+  const didOpenTextDocument = (document: TextDocument) => {
     // We are only interested in language mode text
     if (
       document.languageId !== "vital" ||
@@ -104,7 +109,7 @@ export function activate(context: ExtensionContext) {
         createClient(module, outputChannel, "file", folder),
       );
     }
-  }
+  };
 
   Workspace.onDidOpenTextDocument(didOpenTextDocument);
   Workspace.textDocuments.forEach(didOpenTextDocument);
@@ -117,11 +122,12 @@ export function activate(context: ExtensionContext) {
       }
     }
   });
-}
+};
 
-export function deactivate(): Thenable<void> {
+export const deactivate = async () => {
   const promises: Thenable<void>[] = [];
   if (defaultClient) promises.push(defaultClient.stop());
   for (const client of clients.values()) promises.push(client.stop());
-  return Promise.all(promises).then(() => undefined);
-}
+  await Promise.all(promises);
+  return;
+};

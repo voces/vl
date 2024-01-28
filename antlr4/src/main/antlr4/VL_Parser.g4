@@ -112,7 +112,8 @@ functionCall
 
 params : param (NEWLINE* COMMA NEWLINE* param)* ;
 param  : ID (COLON NEWLINE* type)? ;
-args   : expr (NEWLINE* COMMA NEWLINE* expr)* ;
+args   : arg (NEWLINE* COMMA NEWLINE* arg)* ;
+arg    : (ID COLON NEWLINE*)? expr;
 
 binaryOp
     : PLUS | MINUS | STAR | DIV | MOD | CARET | AND | OR | GREATER_THAN | GREATER_THAN_OR_EQUAL_TO | LESS_THAN | LESS_THAN_OR_EQUAL_TO | EQUAL_TO
@@ -138,18 +139,22 @@ block : label? LBRACE NEWLINE blockStatement* NEWLINE RBRACE
       | label? LBRACE NEWLINE RBRACE
       ;
 
-typeStatement : TYPE EQUAL type ;
+typeStatement
+    : TYPE ID EQUAL type
+    | TYPE ID
+    ;
 
 type
-    : ID
+    : LPAREN NEWLINE* type NEWLINE* RPAREN
+    | ID
     | NUMBER
     | TRUE
     | FALSE
     | STRING
     | NULL
     | objectType
-    | type RBRACK LBRACK
-    | RBRACE NEWLINE* type (NEWLINE* COMMA type)* NEWLINE* LBRACE
+    | type LBRACK RBRACK
+    // | LBRACK NEWLINE* type (NEWLINE* COMMA type)* NEWLINE* RBRACK
     | type NEWLINE* PIPE NEWLINE* type
     ;
 
@@ -158,4 +163,7 @@ objectType
     | LBRACE NEWLINE* pairType (NEWLINE* COMMA NEWLINE* pairType)* NEWLINE* RBRACE
     ;
 
-pairType : (ID | STRING) NEWLINE* COLON NEWLINE* type ;
+pairType
+    : (ID | STRING) NEWLINE* COLON NEWLINE* type
+    | LBRACK NEWLINE* type NEWLINE* RBRACK NEWLINE* COLON NEWLINE* type
+    ;

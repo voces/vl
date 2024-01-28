@@ -65,7 +65,7 @@ class VLErrorListener<T> extends ErrorListener<T> {
   }
 }
 
-export const parse = (code: string) => {
+const parse = (code: string) => {
   const chars = new CharStream(code);
   const lexer = new VLLexer(chars);
   const diagnostics: Diagnostic[] = [];
@@ -109,9 +109,42 @@ const rangeFromCtx = (ctx: ParserRuleContext | TerminalNode) => {
   };
 };
 
-const stringifyType = (type: VLType) => {
+const stringifyType = (type: VLType): string => {
   if (type.type === "Alias") return type.name;
-  return type.type;
+  if (type.type === "Union") {
+    return type.subTypes.map((t) => stringifyType(t)).join(" | ");
+  }
+  if (type.type === "Nullable") return `${stringifyType(type.subType)} | null`;
+  if (type.type === "Object") {
+    if (
+      type.properties.length === 1 &&
+      type.properties[0].name.type === "Alias" &&
+      type.properties[0].name.name === "number"
+    ) return `${stringifyType(type.properties[0].type)}[]`;
+    return `{${
+      type.properties.map((p) =>
+        `${stringifyType(p.name).replace(/^"(.*)"$/, "$1")}: ${
+          stringifyType(p.type)
+        }`
+      ).join(
+        ", ",
+      )
+    }}`;
+  }
+  if (type.type === "StringLiteral") return `"${type.value}"`;
+  if (type.type === "NumberLiteral") return type.value.toString();
+  if (type.type === "BooleanLiteral") return type.value.toString();
+  if (type.type === "Unknown") return "any"; // Was null, changed to any for when doing "string".bar
+  if (type.type === "Never") return "never";
+  if (type.type === "Function") {
+    return `(${
+      type.paramaters.map((p) => `${p.name}: ${stringifyType(p.paramaterType)}`)
+        .join(", ")
+    }): ${stringifyType(type.return)}`;
+  }
+  if (type.type === "Type") return `<${stringifyType(type.subType)}>`;
+  const exhaustive: never = type;
+  return exhaustive;
 };
 
 documents.onDidChangeContent((event) => {
@@ -129,6 +162,8 @@ documents.onDidChangeContent((event) => {
           message: `Syntax error: redeclared ${error.name}`,
           severity: DiagnosticSeverity.Error,
           range: rangeFromCtx(error.ctx),
+          code: error.code,
+          source: "vital",
         });
         break;
       case "Undeclared":
@@ -136,26 +171,50 @@ documents.onDidChangeContent((event) => {
           message: `Syntax error: undeclared ${error.name}`,
           severity: DiagnosticSeverity.Error,
           range: rangeFromCtx(error.ctx),
+          code: error.code,
+          source: "vital",
         });
         break;
-      case "Type": {
+      case "Type":
         diagnostics.push({
           message: `Type error: expected ${stringifyType(error.left)}, got ${
             stringifyType(error.right)
           }`,
           severity: DiagnosticSeverity.Error,
           range: rangeFromCtx(error.ctx),
+          code: error.code,
+          source: "vital",
         });
         break;
-      }
-      case "UnmatchedParameter": {
+      case "UnmatchedParameter":
         diagnostics.push({
           message: `Type error: unmatched parameter`,
           severity: DiagnosticSeverity.Error,
           range: rangeFromCtx(error.ctx),
+          code: error.code,
+          source: "vital",
         });
         break;
-      }
+      case "Syntax":
+        diagnostics.push({
+          message: error.message,
+          severity: DiagnosticSeverity.Error,
+          range: rangeFromCtx(error.ctx),
+          code: error.code,
+          source: "vital",
+        });
+        break;
+      case "Property":
+        diagnostics.push({
+          message: `Unknown property \`${
+            stringifyType(error.property).replace(/^"(.*)"$/, "$1")
+          }\``,
+          severity: DiagnosticSeverity.Error,
+          range: rangeFromCtx(error.ctx),
+          code: error.code,
+          source: "vital",
+        });
+        break;
       default: {
         const exhaustive: never = error;
         console.warn(`Unhandled AST error: ${exhaustive}`);
@@ -189,4 +248,5 @@ connection.onInitialize((params) => {
     },
   };
 });
+
 connection.listen();
