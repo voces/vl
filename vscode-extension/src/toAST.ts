@@ -26,7 +26,7 @@ type VLFunctionDeclarationNode = {
   type: "FunctionDeclaration";
   name: string | undefined;
   parameters: VLParameterNode[];
-  body: VLStatement[];
+  body: VLStatement;
   returnType: VLType;
   scope: Scope;
 };
@@ -136,10 +136,48 @@ type VLReturnNode = {
   value: VLExpression | undefined;
 };
 
+type VLIfNode = {
+  type: "If";
+  conditionals: { condition: VLExpression; statement: VLStatement }[];
+  else: VLStatement | undefined;
+};
+
+type VLWhileNode = {
+  type: "While";
+  condition: VLExpression;
+  statement: VLStatement;
+  label: string | undefined;
+};
+
+type VLForNode = {
+  type: "For";
+  variable: string;
+  from: VLExpression;
+  to: VLExpression;
+  step: VLExpression | undefined;
+  statement: VLStatement;
+  label: string | undefined;
+};
+
+type VLBreakNode = {
+  type: "Break";
+  label: string | undefined;
+};
+
+type VLContinueNode = {
+  type: "Continue";
+  label: string | undefined;
+};
+
 type VLStatement =
   | VLReturnNode
   | VLExpression
-  | VLVariableDeclarationNode;
+  | VLVariableDeclarationNode
+  | VLIfNode
+  | VLWhileNode
+  | VLForNode
+  | VLBreakNode
+  | VLContinueNode;
 
 type VLAliasType = { type: "Alias"; name: string };
 type VLFunctionType = {
@@ -201,12 +239,16 @@ type ParseErrors =
 
 const errors: ParseErrors[] = [];
 
+const returnTypes: VLType[] = [];
+let desiredType: VLType | undefined = undefined;
+
 const typeFromExpression = (
   expr: VLExpression,
+  ctx: Context,
 ): VLType => {
   switch (expr.type) {
     case "BinaryOperation": {
-      const rightSide = typeFromExpression(expr.right);
+      const rightSide = typeFromExpression(expr.right, ctx);
       if (expr.operator === "=") return rightSide;
       // Could maybe do math?
       if (rightSide.type === "NumberLiteral") {
@@ -219,8 +261,14 @@ const typeFromExpression = (
       return rightSide;
     }
     case "Block":
-      console.warn("Not inferring type from block yet...");
-      return { type: "Never" };
+      // for (let i = 0; i < expr.statements.length; i++) {
+      //   const t = typeFromStatement(expr.statements[expr.statements.length - 1], ctx);
+      //   if (returnType);
+      // }
+      return typeFromStatement(
+        expr.statements[expr.statements.length - 1],
+        ctx,
+      );
     case "FunctionDeclaration":
       return {
         type: "Function",
@@ -229,10 +277,10 @@ const typeFromExpression = (
         exceptions: [],
       };
     case "IndexAccess": {
-      const objType = typeFromExpression(expr.array);
+      const objType = typeFromExpression(expr.array, ctx);
       if (objType.type !== "Object") return { type: "Never" };
-      const oldErrors = [...errors];
-      const propType = typeFromExpression(expr.index);
+      const oldErrors = errors.splice(0, Infinity);
+      const propType = typeFromExpression(expr.index, ctx);
       const property = objType.properties.find((p) =>
         validateType(p.name, propType, null as unknown as Context)
       );
@@ -256,44 +304,25 @@ const typeFromExpression = (
           .map((p) => ({
             name: p.name.type === "Name"
               ? { type: "StringLiteral", value: p.name.name }
-              : typeFromExpression(p.name),
-            type: typeFromExpression(p.value),
+              : typeFromExpression(p.name, ctx),
+            type: typeFromExpression(p.value, ctx),
             readonly: false,
           })),
       };
-    case "ArrayLiteral": {
-      const subTypes: VLType[] = [];
-      const oldErrors = [...errors];
-      for (const value of expr.values) {
-        let type = typeFromExpression(value);
-        if (type.type === "NumberLiteral") {
-          type = { type: "Alias", name: "number" };
-        } else if (type.type === "StringLiteral") {
-          type = { type: "Alias", name: "string" };
-        }
-        if (
-          subTypes.every((s) =>
-            !validateType(s, type, null as unknown as Context)
-          )
-        ) subTypes.push(type);
-      }
-      errors.splice(0, Infinity, ...oldErrors);
+    case "ArrayLiteral":
       return {
         type: "Object",
         properties: [{
           name: { type: "Alias", name: "number" },
-          type: subTypes.length === 1
-            ? subTypes[0]
-            // Do we need to special case empty arrays? Empty arrays are contravariant, assignable to known arrays but
-            // -
-            // -
-            : { type: "Union", subTypes },
+          type: {
+            type: "Union",
+            subTypes: expr.values.map((v) => typeFromExpression(v, ctx)),
+          },
           readonly: false,
         }],
       };
-    }
     case "PropertyAccess": {
-      const objType = typeFromExpression(expr.object);
+      const objType = typeFromExpression(expr.object, ctx);
       if (objType.type !== "Object") return { type: "Never" };
       const oldErrors = [...errors];
       const propType: VLStringLiteralNode = {
@@ -331,6 +360,136 @@ const typeFromExpression = (
   }
 };
 
+const softenImplicitType = (type: VLType): VLType => {
+  if (type.type === "NumberLiteral") return { type: "Alias", name: "number" };
+  if (type.type === "StringLiteral") return { type: "Alias", name: "string" };
+  if (type.type === "BooleanLiteral") return { type: "Alias", name: "boolean" };
+  if (type.type === "Nullable") {
+    const subType = softenImplicitType(type.subType);
+    if (subType === type.subType) return type;
+    return { type: "Nullable", subType: softenImplicitType(type.subType) };
+  }
+  if (
+    type.type === "Alias" || type.type === "Function" ||
+    type.type === "Never" || type.type === "Type" || type.type === "Unknown"
+  ) return type;
+  if (type.type === "Object") {
+    let softenedProperty = false;
+    const properties = type.properties.map((p) => {
+      const next = softenImplicitType(p.type);
+      if (p.type !== next) softenedProperty = true;
+      return next;
+    });
+    if (softenedProperty) {
+      return {
+        type: "Object",
+        properties: type.properties.map((p, i) => ({
+          ...p,
+          type: properties[i],
+        })),
+      };
+    }
+    return type;
+  }
+  if (type.type === "Union") {
+    const hasSubUnions = type.subTypes.some((s) => s.type === "Union");
+    if (hasSubUnions) {
+      return softenImplicitType({
+        type: "Union",
+        subTypes: type.subTypes.flatMap((s) =>
+          s.type === "Union" ? s.subTypes : s
+        ),
+      });
+    }
+    if (type.subTypes.length === 1) return softenImplicitType(type.subTypes[0]);
+    let softenedSubType = false;
+    const softenedSubTypes = type.subTypes.map((t) => {
+      const next = softenImplicitType(t);
+      if (next !== t) softenedSubType = true;
+      return next;
+    });
+    const subTypes: VLType[] = [softenedSubTypes[0]];
+    const oldErrors = errors.splice(0, Infinity);
+    outer: for (let i = 1; i < softenedSubTypes.length; i++) {
+      for (let n = 0; n < subTypes.length; n++) {
+        if (
+          validateType(
+            subTypes[n],
+            softenedSubTypes[i],
+            null as unknown as Context,
+          )
+        ) continue outer;
+        if (
+          validateType(
+            softenedSubTypes[i],
+            subTypes[n],
+            null as unknown as Context,
+          )
+        ) {
+          subTypes.splice(n, 1, softenedSubTypes[i]);
+          continue outer;
+        }
+      }
+      subTypes.push(softenedSubTypes[i]);
+    }
+    errors.splice(0, Infinity, ...oldErrors);
+    if (subTypes.length !== type.subTypes.length || softenedSubType) {
+      // if (subTypes.length === 0) Unknown? Never? Never breaks array...
+      if (subTypes.length === 1) return subTypes[0];
+      return { type: "Union", subTypes: subTypes };
+    }
+    return type;
+  }
+  const exhaustive: never = type;
+  throw new Error(`Unhandled soften type: ${exhaustive}`);
+};
+
+const typeFromStatement = (
+  stmt: VLStatement,
+  ctx: Context,
+): VLType => {
+  switch (stmt.type) {
+    case "Return":
+      return stmt.value
+        ? typeFromExpression(stmt.value, ctx)
+        : { type: "Alias", name: "null" };
+    case "VariableDeclaration":
+      return stmt.variableType;
+    case "If": {
+      const stmts = stmt.conditionals.map((c) => c.statement);
+      if (stmt.else) {
+        stmts.push(stmt.else);
+        return {
+          type: "Union",
+          subTypes: stmts.map((s) => typeFromStatement(s, ctx)),
+        };
+      }
+      return {
+        type: "Nullable",
+        subType: {
+          type: "Union",
+          subTypes: stmts.map((s) => typeFromStatement(s, ctx)),
+        },
+      };
+    }
+    case "While":
+      return {
+        type: "Nullable",
+        subType: typeFromStatement(stmt.statement, ctx),
+      };
+    case "For":
+      return {
+        type: "Nullable",
+        subType: typeFromStatement(stmt.statement, ctx),
+      };
+    case "Break":
+    case "Continue":
+      return { type: "Never" };
+    default:
+      return typeFromExpression(stmt, ctx);
+  }
+};
+
 const toVariableDeclaration = (ctx: VarDeclContext) => {
   const expr = ctx.expr();
   const type = ctx.type_();
@@ -340,25 +499,15 @@ const toVariableDeclaration = (ctx: VarDeclContext) => {
     variableType: type ? toType(type) : { type: "Unknown" },
     value: expr ? toExpression(expr) : undefined,
   };
-  if (node.name in scopes[scopes.length - 1]) {
-    errors.push({ type: "Redeclaration", name: node.name, ctx, code: 0 });
-  }
   if (node.value) {
-    const valueType = typeFromExpression(node.value);
-    if (node.variableType.type === "Unknown") {
-      node.variableType = valueType;
-      if (
-        node.variableType.type === "Alias" && node.variableType.name === "null"
-      ) {
-        node.variableType = { type: "Nullable", subType: { type: "Unknown" } };
-      } else if (node.variableType.type === "StringLiteral") {
-        node.variableType = { type: "Alias", name: "string" };
-      } else if (node.variableType.type === "NumberLiteral") {
-        node.variableType = { type: "Alias", name: "number" };
-      }
+    const valueType = typeFromExpression(node.value, ctx);
+    if (!type) {
+      node.variableType = softenImplicitType(valueType);
     } else validateType(node.variableType, valueType, expr);
   }
-  scopes[scopes.length - 1][node.name] = node.variableType;
+  if (node.name in scopes[scopes.length - 1]) {
+    errors.push({ type: "Redeclaration", name: node.name, ctx, code: 0 });
+  } else scopes[scopes.length - 1][node.name] = node.variableType;
   return node;
 };
 
@@ -371,40 +520,102 @@ const toParameter = (ctx: ParamContext): VLParameterNode => {
   };
 };
 
+const _flattenType = (type: VLType): VLType[] => {
+  if (type.type === "Union") return type.subTypes.flatMap(_flattenType);
+  if (type.type === "Nullable") {
+    let flattened = _flattenType(type.subType);
+    if (!Array.isArray(flattened)) flattened = [flattened];
+    return [{ type: "Alias", name: "null" }, ...flattened];
+  }
+  return [type];
+};
+
+const flattenType = (type: VLType): VLType => {
+  const flattened = _flattenType(type);
+  if (flattened.length === 1 && flattened[0] === type) return type;
+
+  const deduped: VLType[] = [flattened[0]];
+  const oldErrors = errors.splice(0, Infinity);
+  outer: for (let i = 1; i < flattened.length; i++) {
+    for (let n = 0; n < deduped.length; n++) {
+      if (
+        validateType(
+          deduped[n],
+          flattened[i],
+          null as unknown as Context,
+        )
+      ) continue outer;
+      if (
+        validateType(
+          flattened[i],
+          deduped[n],
+          null as unknown as Context,
+        )
+      ) {
+        deduped.splice(n, 1, flattened[i]);
+        continue outer;
+      }
+    }
+    deduped.push(flattened[i]);
+  }
+  errors.splice(0, Infinity, ...oldErrors);
+
+  if (deduped.length === 1) return deduped[0];
+
+  let nullable = false;
+  for (let i = 0; i < deduped.length; i++) {
+    const t = deduped[i];
+    if (t.type === "Alias" && t.name === "null") {
+      nullable = true;
+      deduped.splice(i, 1);
+      break;
+    }
+  }
+
+  if (nullable) {
+    return {
+      type: "Nullable",
+      subType: deduped.length === 1
+        ? deduped[0]
+        : { type: "Union", subTypes: deduped },
+    };
+  }
+
+  return { type: "Union", subTypes: deduped };
+};
+
 const toType = (ctx: TypeContext): VLType => {
   {
     const id = ctx.ID();
     if (id) {
       const name = id.getText();
-      if (name !== "string" && name !== "number" && name !== "boolean") {
-        let found = false;
-        for (let i = scopes.length - 1; i >= 0; i--) {
-          if (name in scopes[i]) {
-            found = true;
-            break;
-          }
-        }
-        if (!found) errors.push({ type: "Undeclared", name, ctx, code: 1 });
+      if (name === "string" || name === "number" || name === "boolean") {
+        return { type: "Alias", name };
       }
-      return { type: "Alias", name };
+
+      for (let i = scopes.length - 1; i >= 0; i--) {
+        if (name in scopes[i]) {
+          const type = scopes[i][name];
+          if (type.type === "Type") return type.subType;
+          return type;
+        }
+      }
+
+      errors.push({ type: "Undeclared", name, ctx, code: 1 });
+
+      return { type: "Never" };
     }
   }
 
-  {
-    const pipe = ctx.PIPE();
-    if (pipe) {
-      const union: VLUnionType = {
-        type: "Union",
-        subTypes: [toType(ctx.type_(0)), toType(ctx.type_(1))],
-      };
-      return union;
-    }
+  if (ctx.PIPE()) {
+    // Note, we're calling flattenType in toType, so we're doing a bunch of extra work...
+    return flattenType({
+      type: "Union",
+      subTypes: [toType(ctx.type_(0)), toType(ctx.type_(1))],
+    });
   }
 
-  {
-    const null_ = ctx.NULL();
-    if (null_) return { type: "Alias", name: "null" };
-  }
+  if (ctx.NULL()) return { type: "Alias", name: "null" };
 
   {
     const obj = ctx.objectType();
@@ -447,43 +658,21 @@ const toType = (ctx: TypeContext): VLType => {
     }
   }
 
-  {
-    const true_ = ctx.TRUE();
-    if (true_) return { type: "BooleanLiteral", value: true };
-  }
+  if (ctx.TRUE()) return { type: "BooleanLiteral", value: true };
 
-  {
-    const false_ = ctx.FALSE();
-    if (false_) return { type: "BooleanLiteral", value: false };
-  }
+  if (ctx.FALSE()) return { type: "BooleanLiteral", value: false };
 
-  {
-    const paren = ctx.LPAREN();
-    if (paren) return toType(ctx.type_(0));
-  }
+  if (ctx.LPAREN()) return toType(ctx.type_(0));
 
-  {
-    const pipe = ctx.PIPE();
-    if (pipe) {
-      return {
-        type: "Union",
-        subTypes: [toType(ctx.type_(0)), toType(ctx.type_(1))],
-      };
-    }
-  }
-
-  {
-    const brack = ctx.LBRACK();
-    if (brack) {
-      return {
-        type: "Object",
-        properties: [{
-          name: { type: "Alias", name: "number" },
-          type: toType(ctx.type_(0)),
-          readonly: false,
-        }],
-      };
-    }
+  if (ctx.LBRACK()) {
+    return {
+      type: "Object",
+      properties: [{
+        name: { type: "Alias", name: "number" },
+        type: toType(ctx.type_(0)),
+        readonly: false,
+      }],
+    };
   }
 
   throw new Error(`toType not implemented ${ctx.getText()}`);
@@ -496,43 +685,51 @@ const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
     parameters.map((p) => [p.name, p.paramaterType]),
   );
   scopes.push(scope);
+  let name: string;
+  let node: VLFunctionDeclarationNode;
   try {
-    const stmt = ctx.statement();
-    const block = stmt.expr()?.block();
-    const statements = (block
-      ? block.blockStatement_list().map((b) =>
-        b.statement()
-      ).filter(Boolean).map(toStatement)
-      : [toStatement(stmt)]).filter(<T>(s: T | undefined): s is T => !!s);
-    const returnType = ctx.type_();
-    const node: VLFunctionDeclarationNode = {
+    const returnTypeExpr = ctx.type_();
+    let returnType: VLType | undefined = returnTypeExpr
+      ? toType(returnTypeExpr)
+      : undefined;
+
+    const oldReturnTypes = returnTypes.splice(0, Infinity);
+    const oldDesiredType = desiredType;
+    desiredType = returnTypeExpr ? returnType : undefined;
+    const body = toStatement(ctx.statement()) ??
+      { type: "Return", value: undefined };
+    const bodyType = typeFromStatement(body, ctx);
+    const subTypes = returnTypes.splice(0, Infinity, ...oldReturnTypes);
+    desiredType = oldDesiredType;
+    if (!returnType) {
+      if (bodyType.type !== "Never") subTypes.push(bodyType);
+      returnType = softenImplicitType({ type: "Union", subTypes });
+    } else returnType = { type: "Alias", name: "null" };
+
+    name = ctx.ID()?.getText();
+
+    node = {
       type: "FunctionDeclaration",
-      name: ctx.ID()?.getText(),
+      name,
       parameters,
-      body: statements,
-      returnType: returnType ? toType(returnType) : { type: "Never" },
+      body,
+      returnType,
       scope,
     };
 
     scopes.pop();
-
-    if (node.name) {
-      if (node.name in scopes[scopes.length - 1]) {
-        errors.push({
-          type: "Redeclaration",
-          name: node.name,
-          ctx: ctx.ID()!,
-          code: 2,
-        });
-      }
-      scopes[scopes.length - 1][node.name] = typeFromExpression(node);
-    }
-
-    return node;
   } catch (err) {
     scopes.pop();
     throw err;
   }
+
+  if (name) {
+    if (name in scopes[scopes.length - 1]) {
+      errors.push({ type: "Redeclaration", name, ctx: ctx.ID()!, code: 2 });
+    } else scopes[scopes.length - 1][name] = typeFromExpression(node, ctx);
+  }
+
+  return node;
 };
 
 const toObjectLiteral = (ctx: ObjectContext): VLObjectLiteralNode => ({
@@ -567,7 +764,7 @@ const toObjectLiteral = (ctx: ObjectContext): VLObjectLiteralNode => ({
 
 const toArrayLiteral = (ctx: ArrayContext): VLArrayLiteralNode => ({
   type: "ArrayLiteral",
-  values: ctx.expr_list().map(toExpression),
+  values: ctx.expr_list().map((e) => toExpression(e)),
 });
 
 const getType = (name: string, ctx: Context): VLType => {
@@ -616,6 +813,33 @@ const getChildType = (
   return propertyType.type;
 };
 
+const updateType = (oldType: VLType, newType: VLType) => {
+  // deno-lint-ignore no-explicit-any
+  for (const prop in oldType) delete (oldType as any)[prop];
+  if (newType.type === "NumberLiteral") {
+    Object.assign(oldType, { type: "Alias", name: "number" });
+  } else if (newType.type === "StringLiteral") {
+    Object.assign(oldType, { type: "Alias", name: "string" });
+  } else if (newType.type === "BooleanLiteral") {
+    Object.assign(oldType, { type: "Alias", name: "boolean" });
+  } else Object.assign(oldType, structuredClone(newType));
+  return oldType;
+};
+
+const nonNullable = (type: VLType): VLType => {
+  if (type.type === "Alias" && type.name === "null") return { type: "Never" };
+  if (type.type === "Nullable") return nonNullable(type.subType);
+  if (type.type === "Union") {
+    const subTypes = type.subTypes.map((s) => nonNullable(s));
+    if (subTypes.some((s, i) => s !== type.subTypes[i])) {
+      const filtered = subTypes.filter((v) => v.type !== "Never");
+      if (!filtered.length) return { type: "Never" };
+      return { type: "Union", subTypes: filtered };
+    }
+  }
+  return type;
+};
+
 const validateType = (
   left: VLType,
   right: VLType,
@@ -631,28 +855,42 @@ const validateType = (
     case "Unknown": {
       // TODO: we should keep the literal type if it came from a non-literal node
       // We shouldn't do this at all here, since this is greedy and complex objects may fail later
-      if (right.type === "NumberLiteral") {
-        Object.assign(left, { type: "Alias", name: "number" });
-      } else if (right.type === "StringLiteral") {
-        Object.assign(left, { type: "Alias", name: "string" });
-      } else Object.assign(left, structuredClone(right));
+      updateType(left, right);
       return true;
     }
     case "Alias":
       if (left.name === "number") {
         if (right.type === "Alias") {
           if (right.name !== "number") return pushError(6);
+        } else if (right.type === "Union") {
+          const oldErrors = errors.splice(0, Infinity);
+          const valid = right.subTypes.some((t) => validateType(left, t, ctx));
+          errors.splice(0, Infinity, ...oldErrors);
+          if (!valid) return pushError("union-not-number");
         } else if (right.type !== "NumberLiteral") return pushError(12);
       } else if (left.name === "string") {
         if (right.type === "Alias") {
           if (right.name !== "string") return pushError(13);
+        } else if (right.type === "Union") {
+          const oldErrors = errors.splice(0, Infinity);
+          const valid = right.subTypes.some((t) => validateType(left, t, ctx));
+          errors.splice(0, Infinity, ...oldErrors);
+          if (!valid) return pushError("union-not-string");
         } else if (right.type !== "StringLiteral") return pushError(14);
       } else if (left.name === "boolean") {
         if (right.type === "Alias") {
           if (right.name !== "boolean") return pushError(15);
+        } else if (right.type === "Union") {
+          const oldErrors = errors.splice(0, Infinity);
+          const valid = right.subTypes.some((t) => validateType(left, t, ctx));
+          errors.splice(0, Infinity, ...oldErrors);
+          if (!valid) return pushError("union-not-boolean");
         } else if (right.type !== "BooleanLiteral") return pushError(16);
       } else if (left.name === "null") {
-        if (right.type !== "Alias" || right.name !== "null") {
+        if (
+          (right.type !== "Alias" || right.name !== "null") &&
+          right === nonNullable(right)
+        ) {
           return pushError(17);
         }
       } else {
@@ -672,6 +910,7 @@ const validateType = (
     case "Function":
       if (right.type !== "Function") return pushError(18);
       if (!validateType(left.return, right.return, ctx)) return false;
+      // Could maybe allow right to have extra parameters so long as they are nullable
       if (left.paramaters.length !== right.paramaters.length) {
         return pushError("different-parameters-length");
       }
@@ -753,21 +992,18 @@ const validateType = (
       return true;
     }
     case "Nullable": {
-      let subLeft: VLType = left;
-      let subRight = right;
-      while (subLeft.type === "Nullable") subLeft = subLeft.subType;
-      while (subRight.type === "Nullable") subRight = subRight.subType;
+      const nonNullableLeft = nonNullable(left);
+      const nonNullableRight = nonNullable(right);
       if (
-        (subRight.type === "Alias" && subRight.name === "null") ||
-        subRight.type === "Unknown"
+        (nonNullableRight.type === "Alias" &&
+          nonNullableRight.name === "null") ||
+        nonNullableRight.type === "Never"
       ) return true;
-      const oldErrors = [...errors];
-      errors.splice(0);
-      const ret = validateType(subLeft, subRight, ctx);
-      if (!ret) {
-        errors.splice(0, Infinity, ...oldErrors);
-        return pushError(27);
-      }
+      console.log("nonNullableRight", nonNullableRight);
+      const oldErrors = errors.splice(0, Infinity);
+      const ret = validateType(nonNullableLeft, nonNullableRight, ctx);
+      errors.splice(0, Infinity, ...oldErrors);
+      if (!ret) return pushError(27);
       return true;
     }
     case "Union": {
@@ -803,38 +1039,32 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     if (funcDecl) return toFunctionDeclaration(funcDecl);
   }
 
-  {
-    const dot = ctx.DOT();
-    if (dot) {
-      const expr = ctx.expr(0);
-      const object = toExpression(expr);
-      const id = ctx.ID();
-      const property = id.getText();
-      getChildType(
-        typeFromExpression(object),
-        { type: "StringLiteral", value: property },
-        expr,
-        id,
-      );
-      return { type: "PropertyAccess", object, property };
-    }
+  if (ctx.DOT()) {
+    const expr = ctx.expr(0);
+    const object = toExpression(expr);
+    const id = ctx.ID();
+    const property = id.getText();
+    getChildType(
+      typeFromExpression(object, ctx),
+      { type: "StringLiteral", value: property },
+      expr,
+      id,
+    );
+    return { type: "PropertyAccess", object, property };
   }
 
-  {
-    const lbrack = ctx.LBRACK();
-    if (lbrack) {
-      const expr1 = ctx.expr(0);
-      const array = toExpression(expr1);
-      const expr2 = ctx.expr(1);
-      const index = toExpression(expr2);
-      getChildType(
-        typeFromExpression(array),
-        typeFromExpression(index),
-        expr1,
-        expr2,
-      );
-      return { type: "IndexAccess", array, index };
-    }
+  if (ctx.LBRACK()) {
+    const expr1 = ctx.expr(0);
+    const array = toExpression(expr1);
+    const expr2 = ctx.expr(1);
+    const index = toExpression(expr2);
+    getChildType(
+      typeFromExpression(array, ctx),
+      typeFromExpression(index, ctx),
+      expr1,
+      expr2,
+    );
+    return { type: "IndexAccess", array, index };
   }
 
   {
@@ -854,12 +1084,21 @@ const toExpression = (ctx: ExprContext): VLExpression => {
         const statements = block.blockStatement_list()
           .map((b) => b.statement())
           .filter(Boolean)
-          .map(toStatement)
-          .filter(<T>(s: T | undefined): s is T => !!s);
+          .map((s): [StatementContext, VLStatement] => [s, toStatement(s)]);
+        if (statements.length > 0 && desiredType) {
+          const [ctx, stmt] = statements[statements.length - 1];
+          const oldErrors = errors.splice(0, Infinity);
+          if (
+            !validateType(desiredType, { type: "Alias", name: "null" }, ctx)
+          ) {
+            errors.splice(0, Infinity, ...oldErrors);
+            validateType(desiredType, typeFromStatement(stmt, ctx), ctx);
+          } else errors.splice(0, Infinity, ...oldErrors);
+        }
         return {
           type: "Block",
           label: ctx.ID()?.getText(),
-          statements,
+          statements: statements.map((s) => s[1]),
         };
       } finally {
         scopes.pop();
@@ -889,20 +1128,11 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     }
   }
 
-  {
-    const _true = ctx.TRUE();
-    if (_true) return { type: "BooleanLiteral", value: true };
-  }
+  if (ctx.TRUE()) return { type: "BooleanLiteral", value: true };
 
-  {
-    const _false = ctx.FALSE();
-    if (_false) return { type: "BooleanLiteral", value: false };
-  }
+  if (ctx.FALSE()) return { type: "BooleanLiteral", value: false };
 
-  {
-    const _null = ctx.NULL();
-    if (_null) return { type: "NullLiteral" };
-  }
+  if (ctx.NULL()) return { type: "NullLiteral" };
 
   {
     const op = ctx.binaryOp();
@@ -956,24 +1186,21 @@ const toExpression = (ctx: ExprContext): VLExpression => {
           for (let i = 0; i < args2.length; i++) {
             const [arg, ctx] = args2[i];
             if (arg.name) {
-              console.log("arg name match", arg.name);
               const paramIndex = params.findIndex((p) => p.name === arg.name);
               if (paramIndex === -1) {
                 errors.push({ type: "UnmatchedParameter", ctx, code: 8 });
               } else if (
                 validateType(
                   params[paramIndex].paramaterType,
-                  typeFromExpression(arg.value),
+                  typeFromExpression(arg.value, ctx),
                   ctx,
                 )
               ) {
                 params.splice(paramIndex, 1);
                 args2.splice(i, 1);
                 i--;
-              } else {
-                console.log("no matchy?", arg, ctx, params);
               }
-            } else console.log("arg name no match", arg);
+            }
           }
           // Then consume positional ones
           while (args2.length) {
@@ -984,7 +1211,7 @@ const toExpression = (ctx: ExprContext): VLExpression => {
             } else {
               validateType(
                 params[0].paramaterType,
-                typeFromExpression(arg.value),
+                typeFromExpression(arg.value, ctx),
                 ctx,
               );
               params.splice(0, 1);
@@ -1005,14 +1232,18 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     }
   }
 
+  if (ctx.LPAREN()) return toExpression(ctx.expr(0));
+
   throw new Error(`toExpression not implemented ${ctx.getText()}`);
 };
 
+// TODO: Should we validateType or updateType? The former will certainly make
+// codegen easier; the latter is more aligned with the goals of vital
 const toAssignment = (ctx: AssignStatementContext): VLBinaryOperationNode => {
   if (ctx.DOT()) {
     const objectCtx = ctx.expr(0);
     const object = toExpression(objectCtx);
-    const objectType = typeFromExpression(object);
+    const objectType = typeFromExpression(object, objectCtx);
     const propertyCtx = ctx.ID();
     const property = propertyCtx.getText();
     const childType = getChildType(
@@ -1023,7 +1254,7 @@ const toAssignment = (ctx: AssignStatementContext): VLBinaryOperationNode => {
     );
     const rightCtx = ctx.expr(1);
     const right = toExpression(rightCtx);
-    const rightType = typeFromExpression(right);
+    const rightType = typeFromExpression(right, rightCtx);
     if (childType) validateType(childType, rightType, rightCtx);
     return {
       type: "BinaryOperation",
@@ -1036,29 +1267,21 @@ const toAssignment = (ctx: AssignStatementContext): VLBinaryOperationNode => {
   if (ctx.LBRACK()) {
     const arrayCtx = ctx.expr(0);
     const array = toExpression(arrayCtx);
-    const arrayType = typeFromExpression(array);
+    const arrayType = typeFromExpression(array, arrayCtx);
     const indexCtx = ctx.expr(1);
     const index = toExpression(indexCtx);
     const childType = getChildType(
       arrayType,
-      typeFromExpression(index),
+      typeFromExpression(index, indexCtx),
       arrayCtx,
       indexCtx,
     );
     const rightCtx = ctx.expr(2);
     const right = toExpression(rightCtx);
-    const rightType = typeFromExpression(right);
+    const rightType = typeFromExpression(right, rightCtx);
     if (childType) {
       if (childType.type === "Union" && childType.subTypes.length === 0) {
-        if (right.type === "NumberLiteral") {
-          Object.assign(childType, { type: "Alias", name: "number" });
-        } else if (right.type === "StringLiteral") {
-          Object.assign(childType, { type: "Alias", name: "string" });
-        } else {
-          Object.assign(childType, structuredClone(rightType));
-          // @ts-expect-error Can't delete, but we can!
-          if (rightType.type !== "Union") delete childType.subTypes;
-        }
+        updateType(childType, rightType);
       } else validateType(childType, rightType, rightCtx);
     }
     return {
@@ -1073,8 +1296,8 @@ const toAssignment = (ctx: AssignStatementContext): VLBinaryOperationNode => {
   const name = id.getText();
   const knownType = getType(name, id);
   const rightExpr = ctx.expr(0);
-  const right = toExpression(ctx.expr(0));
-  const rightType = typeFromExpression(right);
+  const right = toExpression(rightExpr);
+  const rightType = typeFromExpression(right, rightExpr);
   validateType(knownType, rightType, rightExpr);
   return {
     type: "BinaryOperation",
@@ -1090,18 +1313,19 @@ const toBinaryOperation = (ctx: AssignStatementContext) => {
 
 const toTypeStatement = (ctx: TypeStatementContext) => {
   const name = ctx.ID().getText();
+  const type = ctx.type_();
   if (name in scopes[scopes.length - 1]) {
     errors.push({ type: "Redeclaration", name: name, ctx, code: 11 });
+  } else {
+    scopes[scopes.length - 1][name] = {
+      type: "Type",
+      subType: type ? toType(ctx.type_()) : { type: "Alias", name },
+    };
   }
-  const type = ctx.type_();
-  scopes[scopes.length - 1][name] = {
-    type: "Type",
-    subType: type ? toType(ctx.type_()) : { type: "Alias", name },
-  };
   return undefined;
 };
 
-const toStatement = (ctx: StatementContext): VLStatement | undefined => {
+const toStatement = (ctx: StatementContext): VLStatement => {
   {
     const varDecl = ctx.varDecl();
     if (varDecl) return toVariableDeclaration(varDecl);
@@ -1116,6 +1340,12 @@ const toStatement = (ctx: StatementContext): VLStatement | undefined => {
     const rtrn = ctx.returnStatement();
     if (rtrn) {
       const expr = rtrn.expr();
+      const value = expr ? toExpression(expr) : undefined;
+      const type = value ? typeFromExpression(value, ctx) : undefined;
+      if (type) {
+        if (desiredType) validateType(desiredType, type, ctx);
+        returnTypes.push(type);
+      }
       return { type: "Return", value: expr ? toExpression(expr) : undefined };
     }
   }
@@ -1127,24 +1357,131 @@ const toStatement = (ctx: StatementContext): VLStatement | undefined => {
 
   {
     const type = ctx.typeStatement();
-    if (type) return toTypeStatement(type);
+    if (type) {
+      toTypeStatement(type);
+      // TODO: Empty statement?
+      return {
+        type: "Block",
+        label: `__type_${type.ID().getText()}__`,
+        statements: [],
+      };
+    }
   }
 
-  const opts = {
-    assignStatement: ctx.assignStatement() ? true : false,
-    ifStatement: ctx.ifStatement() ? true : false,
-    whileStatement: ctx.whileStatement() ? true : false,
-    forStatement: ctx.forStatement() ? true : false,
-    breakStatement: ctx.breakStatement() ? true : false,
-    continueStatement: ctx.continueStatement() ? true : false,
-    returnStatement: ctx.returnStatement() ? true : false,
-    typeStatement: ctx.typeStatement() ? true : false,
-  };
+  {
+    const ifStatement = ctx.ifStatement();
+    if (ifStatement) {
+      const elseStatement = ifStatement.elseStatement();
+      return {
+        type: "If",
+        conditionals: [
+          {
+            condition: toExpression(ifStatement.expr()),
+            statement: toStatement(ifStatement.statement()),
+          },
+          ...ifStatement.elseIfStatement_list().map((e) => ({
+            condition: toExpression(e.expr()),
+            statement: toStatement(e.statement()),
+          })),
+        ],
+        else: elseStatement
+          ? toStatement(elseStatement.statement())
+          : undefined,
+      };
+    }
+  }
+
+  {
+    const whileStatement = ctx.whileStatement();
+    if (whileStatement) {
+      const conditionCtx = whileStatement.expr();
+      const condition = toExpression(conditionCtx);
+      validateType(
+        { type: "Nullable", subType: { type: "Alias", name: "boolean" } },
+        typeFromExpression(condition, conditionCtx),
+        conditionCtx,
+      );
+      return {
+        type: "While",
+        label: whileStatement.label()?.getText(),
+        condition,
+        statement: toStatement(whileStatement.statement()),
+      };
+    }
+  }
+
+  {
+    const forStatement = ctx.forStatement();
+    if (forStatement) {
+      const variable = forStatement.ID().getText();
+
+      const fromCtx = forStatement.expr(0);
+      const from = toExpression(fromCtx);
+      const fromType = typeFromExpression(from, fromCtx);
+      validateType({ type: "Alias", name: "number" }, fromType, fromCtx);
+
+      const toCtx = forStatement.expr(1);
+      const to = toExpression(toCtx);
+      const toType = typeFromExpression(to, toCtx);
+      validateType(
+        { type: "Alias", name: "number" },
+        toType,
+        toCtx,
+      );
+
+      const stepCtx = forStatement.expr(2) as ExprContext | undefined;
+      let step: VLExpression | undefined = undefined;
+
+      const statementCtx = forStatement.statement();
+      let statement: VLStatement;
+
+      scopes.push({ [variable]: fromType });
+      try {
+        if (stepCtx) {
+          step = toExpression(stepCtx);
+          validateType(
+            { type: "Alias", name: "number" },
+            typeFromExpression(step, stepCtx ?? forStatement),
+            stepCtx ?? forStatement,
+          );
+        }
+
+        statement = toStatement(statementCtx);
+
+        scopes.pop();
+      } catch (err) {
+        scopes.pop();
+        throw err;
+      }
+
+      return {
+        type: "For",
+        label: forStatement.label()?.ID().getText(),
+        variable,
+        from,
+        to,
+        step,
+        statement,
+      };
+    }
+  }
+
+  {
+    const breakStatement = ctx.breakStatement();
+    if (breakStatement) {
+      return { type: "Break", label: breakStatement.ID()?.getText() };
+    }
+  }
+
+  {
+    const continueStatement = ctx.continueStatement();
+    if (continueStatement) {
+      return { type: "Continue", label: continueStatement.ID()?.getText() };
+    }
+  }
 
   throw new Error(
-    `toStatement not implemented ${ctx.getText()} ${
-      Object.entries(opts).filter(([, v]) => v).map(([n]) => n)
-    }`,
+    `toStatement not implemented ${ctx.getText()}`,
   );
 };
 
@@ -1171,7 +1508,7 @@ export const toAST = (cst: ProgramContext): [VLProgramNode, ParseErrors[]] => {
     if (stmt) {
       try {
         const ast = toStatement(stmt);
-        if (ast) program.statements.push(ast);
+        program.statements.push(ast);
       } catch (err) {
         console.error(err);
       }
