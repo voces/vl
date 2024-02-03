@@ -2,7 +2,6 @@ import { ParserRuleContext, TerminalNode } from "antlr4";
 import VL_Parser, {
   ArgContext,
   ArrayContext,
-  AssignStatementContext,
   ExprContext,
   FunctionDeclContext,
   ObjectContext,
@@ -28,7 +27,6 @@ type VLFunctionDeclarationNode = {
   parameters: VLParameterNode[];
   body: VLStatement;
   returnType: VLType;
-  scope: Scope;
 };
 
 type VLNameNode = {
@@ -113,6 +111,12 @@ type VLVariableDeclarationNode = {
   value: VLExpression | undefined;
 };
 
+type VLIfNode = {
+  type: "If";
+  conditionals: { condition: VLExpression; statement: VLStatement }[];
+  else: VLStatement | undefined;
+};
+
 type VLValue =
   | VLStringLiteralNode
   | VLNumberLiteralNode
@@ -129,17 +133,12 @@ type VLExpression =
   | VLPropertyAccessNode
   | VLIndexAccessNode
   | VLBinaryOperationNode
-  | VLFunctionCallNode;
+  | VLFunctionCallNode
+  | VLIfNode;
 
 type VLReturnNode = {
   type: "Return";
   value: VLExpression | undefined;
-};
-
-type VLIfNode = {
-  type: "If";
-  conditionals: { condition: VLExpression; statement: VLStatement }[];
-  else: VLStatement | undefined;
 };
 
 type VLWhileNode = {
@@ -173,18 +172,17 @@ type VLStatement =
   | VLReturnNode
   | VLExpression
   | VLVariableDeclarationNode
-  | VLIfNode
   | VLWhileNode
   | VLForNode
   | VLBreakNode
   | VLContinueNode;
 
 type VLAliasType = { type: "Alias"; name: string };
+// TODO: exceptions
 type VLFunctionType = {
   type: "Function";
   paramaters: VLParameterNode[];
   return: VLType;
-  exceptions: VLType[];
 };
 type VLObjectType = {
   type: "Object";
@@ -195,6 +193,7 @@ type VLNullableType = { type: "Nullable"; subType: VLType };
 type VLUnionType = { type: "Union"; subTypes: VLType[] };
 type VLNeverType = { type: "Never" };
 type VLTypeType = { type: "Type"; subType: VLType };
+type VLInferType = { type: "Infer"; subType: VLType };
 export type VLType =
   | VLAliasType
   | VLFunctionType
@@ -206,7 +205,8 @@ export type VLType =
   | VLNullableType
   | VLUnionType
   | VLNeverType
-  | VLTypeType;
+  | VLTypeType
+  | VLInferType;
 
 type Scope = Record<string, VLType>;
 
@@ -274,7 +274,6 @@ const typeFromExpression = (
         type: "Function",
         paramaters: expr.parameters,
         return: expr.returnType,
-        exceptions: [],
       };
     case "IndexAccess": {
       const objType = typeFromExpression(expr.array, ctx);
@@ -322,9 +321,10 @@ const typeFromExpression = (
         }],
       };
     case "PropertyAccess": {
-      const objType = typeFromExpression(expr.object, ctx);
+      let objType = typeFromExpression(expr.object, ctx);
+      if (objType.type === "Infer") objType = objType.subType;
       if (objType.type !== "Object") return { type: "Never" };
-      const oldErrors = [...errors];
+      const oldErrors = errors.splice(0, Infinity);
       const propType: VLStringLiteralNode = {
         type: "StringLiteral",
         value: expr.property,
@@ -349,8 +349,24 @@ const typeFromExpression = (
           return { type: "Never" };
         }
       }
-      console.warn("Undefined function?", expr.function);
       return { type: "Never" };
+    case "If": {
+      const stmts = expr.conditionals.map((c) => c.statement);
+      if (expr.else) {
+        stmts.push(expr.else);
+        return {
+          type: "Union",
+          subTypes: stmts.map((s) => typeFromStatement(s, ctx)),
+        };
+      }
+      return {
+        type: "Nullable",
+        subType: {
+          type: "Union",
+          subTypes: stmts.map((s) => typeFromStatement(s, ctx)),
+        },
+      };
+    }
     default: {
       const exhaustive: never = expr;
       throw new Error(
@@ -440,6 +456,11 @@ const softenImplicitType = (type: VLType): VLType => {
     }
     return type;
   }
+  if (type.type === "Infer") {
+    const subType = softenImplicitType(type.subType);
+    if (subType === type.subType) return type;
+    return { type: "Infer", subType };
+  }
   const exhaustive: never = type;
   throw new Error(`Unhandled soften type: ${exhaustive}`);
 };
@@ -455,23 +476,6 @@ const typeFromStatement = (
         : { type: "Alias", name: "null" };
     case "VariableDeclaration":
       return stmt.variableType;
-    case "If": {
-      const stmts = stmt.conditionals.map((c) => c.statement);
-      if (stmt.else) {
-        stmts.push(stmt.else);
-        return {
-          type: "Union",
-          subTypes: stmts.map((s) => typeFromStatement(s, ctx)),
-        };
-      }
-      return {
-        type: "Nullable",
-        subType: {
-          type: "Union",
-          subTypes: stmts.map((s) => typeFromStatement(s, ctx)),
-        },
-      };
-    }
     case "While":
       return {
         type: "Nullable",
@@ -516,7 +520,9 @@ const toParameter = (ctx: ParamContext): VLParameterNode => {
   return {
     type: "Parameter",
     name: ctx.ID().getText(),
-    paramaterType: type ? toType(type) : { type: "Unknown" },
+    paramaterType: type
+      ? toType(type)
+      : { type: "Infer", subType: { type: "Unknown" } },
   };
 };
 
@@ -678,8 +684,30 @@ const toType = (ctx: TypeContext): VLType => {
   throw new Error(`toType not implemented ${ctx.getText()}`);
 };
 
+/**
+ * Called to convert an inferred parameter type to an exact parameter type so
+ * that calls are typechecked.
+ */
+const makeExact = (type: VLType): VLType => {
+  if (type.type === "Infer") return makeExact(type.subType);
+  if (type.type === "Object") {
+    let exacted = false;
+    const props = type.properties.map((p) => {
+      const n = makeExact(p.type);
+      if (n !== p.type) exacted = true;
+      return n;
+    });
+    if (exacted) {
+      return {
+        type: "Object",
+        properties: type.properties.map((p, i) => ({ ...p, type: props[i] })),
+      };
+    }
+  }
+  return type;
+};
+
 const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
-  // TODO: scope...
   const parameters = ctx.params()?.param_list().map(toParameter) ?? [];
   const scope = Object.fromEntries(
     parameters.map((p) => [p.name, p.paramaterType]),
@@ -706,6 +734,13 @@ const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
       returnType = softenImplicitType({ type: "Union", subTypes });
     } else returnType = { type: "Alias", name: "null" };
 
+    for (const param of parameters) {
+      // Should be recursive
+      if (param.paramaterType.type === "Infer") {
+        updateType(param.paramaterType, makeExact(param.paramaterType));
+      }
+    }
+
     name = ctx.ID()?.getText();
 
     node = {
@@ -714,7 +749,6 @@ const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
       parameters,
       body,
       returnType,
-      scope,
     };
 
     scopes.pop();
@@ -781,6 +815,14 @@ const getChildType = (
   objectCtx: Context,
   propertyCtx: Context,
 ) => {
+  let infer = false;
+  if (object.type === "Infer") {
+    infer = true;
+    object = object.subType;
+    if (object.type === "Unknown") {
+      updateType(object, { type: "Object", properties: [] });
+    }
+  }
   if (object.type !== "Object") {
     errors.push({
       type: "Type",
@@ -799,15 +841,25 @@ const getChildType = (
     return;
   }
 
-  const oldErrors = [...errors];
-  const propertyType = object.properties.find((p) =>
+  const oldErrors = errors.splice(0, Infinity);
+  let propertyType = object.properties.find((p) =>
     validateType(p.name, property, propertyCtx)
     // && (p.type.type !== "Union" || p.type.subTypes.length > 0)
   );
   errors.splice(0, Infinity, ...oldErrors);
   if (!propertyType) {
-    errors.push({ type: "Property", property, ctx: propertyCtx, code: 5 });
-    return;
+    if (infer) {
+      console.log("adding infer property");
+      propertyType = {
+        name: property,
+        type: { type: "Infer", subType: { type: "Unknown" } },
+        readonly: false,
+      };
+      object.properties.push(propertyType);
+    } else {
+      errors.push({ type: "Property", property, ctx: propertyCtx, code: 5 });
+      return;
+    }
   }
 
   return propertyType.type;
@@ -816,13 +868,7 @@ const getChildType = (
 const updateType = (oldType: VLType, newType: VLType) => {
   // deno-lint-ignore no-explicit-any
   for (const prop in oldType) delete (oldType as any)[prop];
-  if (newType.type === "NumberLiteral") {
-    Object.assign(oldType, { type: "Alias", name: "number" });
-  } else if (newType.type === "StringLiteral") {
-    Object.assign(oldType, { type: "Alias", name: "string" });
-  } else if (newType.type === "BooleanLiteral") {
-    Object.assign(oldType, { type: "Alias", name: "boolean" });
-  } else Object.assign(oldType, structuredClone(newType));
+  Object.assign(oldType, structuredClone(newType));
   return oldType;
 };
 
@@ -845,6 +891,10 @@ const validateType = (
   right: VLType,
   ctx: Context,
 ): boolean => {
+  if (right.type === "Infer" && left.type !== "Infer") {
+    [right, left] = [left, right];
+  }
+
   const pushError = (code: number | string) => {
     errors.push({ type: "Type", left, right, ctx, code });
     return false;
@@ -855,7 +905,7 @@ const validateType = (
     case "Unknown": {
       // TODO: we should keep the literal type if it came from a non-literal node
       // We shouldn't do this at all here, since this is greedy and complex objects may fail later
-      updateType(left, right);
+      updateType(left, softenImplicitType(right));
       return true;
     }
     case "Alias":
@@ -958,7 +1008,6 @@ const validateType = (
           for (const rprop of right.properties) {
             const oldErrors = [...errors];
             if (validateType(lprop.name, rprop.name, ctx)) {
-              errors.push(...oldErrors);
               if (
                 (rprop.type.type === "Union" &&
                   rprop.type.subTypes.length === 0) ||
@@ -982,7 +1031,6 @@ const validateType = (
           for (const lprop of indexProperties) {
             const oldErrors = [...errors];
             if (validateType(lprop.name, rprop.name, ctx)) {
-              errors.push(...oldErrors);
               continue outer;
             } else errors.splice(0, Infinity, ...oldErrors);
           }
@@ -1007,8 +1055,7 @@ const validateType = (
       return true;
     }
     case "Union": {
-      const oldErrors = [...errors];
-      errors.splice(0);
+      const oldErrors = errors.splice(0, Infinity);
       for (const subType of left.subTypes) {
         const valid = validateType(subType, right, ctx);
         if (valid) {
@@ -1025,6 +1072,22 @@ const validateType = (
     case "Type":
       if (right.type !== "Type") return pushError(30);
       return validateType(left, right, ctx);
+    case "Infer": {
+      const oldErrors = errors.splice(0, Infinity);
+      if (!validateType(left.subType, right, ctx)) {
+        if (left.subType.type === "Unknown") updateType(left.subType, right);
+        else if (left.subType.type === "Union") {
+          left.subType.subTypes.push(softenImplicitType(right));
+        } else {
+          left.subType = {
+            type: "Union",
+            subTypes: [left.subType, softenImplicitType(right)],
+          };
+        }
+      }
+      errors.splice(0, Infinity, ...oldErrors);
+      return true;
+    }
     default: {
       const exhaustive: never = left;
       console.warn(`Did not type check ${exhaustive}`);
@@ -1034,6 +1097,8 @@ const validateType = (
 };
 
 const toExpression = (ctx: ExprContext): VLExpression => {
+  if (ctx.EQUAL()) return toAssignment(ctx);
+
   {
     const funcDecl = ctx.functionDecl();
     if (funcDecl) return toFunctionDeclaration(funcDecl);
@@ -1170,7 +1235,6 @@ const toExpression = (ctx: ExprContext): VLExpression => {
               type: "Function",
               paramaters: [],
               return: { type: "Unknown" },
-              exceptions: [],
             },
             right: t,
             ctx: id,
@@ -1234,12 +1298,40 @@ const toExpression = (ctx: ExprContext): VLExpression => {
 
   if (ctx.LPAREN()) return toExpression(ctx.expr(0));
 
+  {
+    const ifCtx = ctx.if_();
+    if (ifCtx) {
+      const conditionCtx = ifCtx.expr();
+      const condition = toExpression(conditionCtx);
+      validateType(
+        { type: "Nullable", subType: { type: "Alias", name: "boolean" } },
+        typeFromExpression(condition, conditionCtx),
+        conditionCtx,
+      );
+      const elseCtx = ifCtx.else_();
+      return {
+        type: "If",
+        conditionals: [
+          {
+            condition,
+            statement: toStatement(ifCtx.statement()),
+          },
+          ...ifCtx.elseIf_list().map((e) => ({
+            condition: toExpression(e.expr()),
+            statement: toStatement(e.statement()),
+          })),
+        ],
+        else: elseCtx ? toStatement(elseCtx.statement()) : undefined,
+      };
+    }
+  }
+
   throw new Error(`toExpression not implemented ${ctx.getText()}`);
 };
 
 // TODO: Should we validateType or updateType? The former will certainly make
 // codegen easier; the latter is more aligned with the goals of vital
-const toAssignment = (ctx: AssignStatementContext): VLBinaryOperationNode => {
+const toAssignment = (ctx: ExprContext): VLBinaryOperationNode => {
   if (ctx.DOT()) {
     const objectCtx = ctx.expr(0);
     const object = toExpression(objectCtx);
@@ -1299,16 +1391,13 @@ const toAssignment = (ctx: AssignStatementContext): VLBinaryOperationNode => {
   const right = toExpression(rightExpr);
   const rightType = typeFromExpression(right, rightExpr);
   validateType(knownType, rightType, rightExpr);
+  if (knownType.type === "Infer") updateType(knownType, makeExact(knownType));
   return {
     type: "BinaryOperation",
     left: { type: "Name", name },
     right,
     operator: "=",
   };
-};
-
-const toBinaryOperation = (ctx: AssignStatementContext) => {
-  return toAssignment(ctx);
 };
 
 const toTypeStatement = (ctx: TypeStatementContext) => {
@@ -1351,11 +1440,6 @@ const toStatement = (ctx: StatementContext): VLStatement => {
   }
 
   {
-    const assign = ctx.assignStatement();
-    if (assign) return toBinaryOperation(assign);
-  }
-
-  {
     const type = ctx.typeStatement();
     if (type) {
       toTypeStatement(type);
@@ -1364,29 +1448,6 @@ const toStatement = (ctx: StatementContext): VLStatement => {
         type: "Block",
         label: `__type_${type.ID().getText()}__`,
         statements: [],
-      };
-    }
-  }
-
-  {
-    const ifStatement = ctx.ifStatement();
-    if (ifStatement) {
-      const elseStatement = ifStatement.elseStatement();
-      return {
-        type: "If",
-        conditionals: [
-          {
-            condition: toExpression(ifStatement.expr()),
-            statement: toStatement(ifStatement.statement()),
-          },
-          ...ifStatement.elseIfStatement_list().map((e) => ({
-            condition: toExpression(e.expr()),
-            statement: toStatement(e.statement()),
-          })),
-        ],
-        else: elseStatement
-          ? toStatement(elseStatement.statement())
-          : undefined,
       };
     }
   }

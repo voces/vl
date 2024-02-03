@@ -142,7 +142,8 @@ const stringifyType = (type: VLType): string => {
         .join(", ")
     }): ${stringifyType(type.return)}`;
   }
-  if (type.type === "Type") return `<${stringifyType(type.subType)}>`;
+  if (type.type === "Type") return `T<${stringifyType(type.subType)}>`;
+  if (type.type === "Infer") return `I<${stringifyType(type.subType)}>`;
   const exhaustive: never = type;
   return exhaustive;
 };

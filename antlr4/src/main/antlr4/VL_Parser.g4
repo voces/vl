@@ -11,8 +11,6 @@ blockStatement
 
 statement
     : varDecl
-    | assignStatement
-    | ifStatement
     | whileStatement
     | forStatement
     | breakStatement
@@ -31,17 +29,17 @@ varDecl
     | LET ID (COLON NEWLINE* type)? (NEWLINE* EQUAL NEWLINE* expr)?
     ;
 
-ifStatement
+if
     : IF NEWLINE* expr NEWLINE* THEN? NEWLINE* statement
-      (NEWLINE* elseIfStatement)*
-      (NEWLINE* elseStatement)?
+      (NEWLINE* elseIf)*
+      (NEWLINE* else)?
     ;
 
-elseIfStatement
+elseIf
     : ELSEIF NEWLINE* expr NEWLINE* THEN? NEWLINE* statement
     ;
 
-elseStatement
+else
     : ELSE NEWLINE* statement
     ;
 
@@ -74,6 +72,10 @@ expr
     | object
     | block
     | array
+    | if
+    | ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
+    | expr NEWLINE* DOT ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
+    | expr LBRACK NEWLINE* expr NEWLINE* RBRACK NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     | LPAREN NEWLINE* expr NEWLINE* RPAREN
     | expr LBRACK NEWLINE* expr NEWLINE* RBRACK // index expr
     | expr NEWLINE* DOT ID // property expr
@@ -98,12 +100,6 @@ pair
 array
     : LBRACK NEWLINE* expr (NEWLINE* COMMA NEWLINE* expr?)* RBRACK
     | LBRACK NEWLINE* RBRACK
-    ;
-
-assignStatement
-    : ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
-    | expr NEWLINE* DOT ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
-    | expr LBRACK NEWLINE* expr NEWLINE* RBRACK NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     ;
 
 functionCall
