@@ -971,7 +971,7 @@ const validateType = (
         if (left.paramaters[i].name !== right.paramaters[i].name) {
           return pushError("different-parameter-names");
         }
-        const oldErrors = [...errors];
+        const oldErrors = errors.splice(0, Infinity);
         if (
           !validateType(
             right.paramaters[i].paramaterType,
@@ -982,6 +982,7 @@ const validateType = (
           errors.splice(0, Infinity, ...oldErrors);
           return pushError("different-typed-parameters");
         }
+        errors.splice(0, Infinity, ...oldErrors);
       }
       return true;
     case "NumberLiteral":
@@ -1006,7 +1007,7 @@ const validateType = (
           lprop.name.type === "NumberLiteral"
         ) {
           for (const rprop of right.properties) {
-            const oldErrors = [...errors];
+            const oldErrors = errors.splice(0, Infinity);
             if (validateType(lprop.name, rprop.name, ctx)) {
               if (
                 (rprop.type.type === "Union" &&
@@ -1014,8 +1015,10 @@ const validateType = (
                 validateType(lprop.type, rprop.type, ctx)
               ) {
                 rprops.delete(rprop);
+                errors.splice(0, Infinity, ...oldErrors);
                 continue outer;
               }
+              errors.splice(0, Infinity, ...oldErrors);
               return false;
             } else errors.splice(0, Infinity, ...oldErrors);
           }
@@ -1251,12 +1254,23 @@ const toExpression = (ctx: ExprContext): VLExpression => {
             const [arg, ctx] = args2[i];
             if (arg.name) {
               const paramIndex = params.findIndex((p) => p.name === arg.name);
+              const argType = typeFromExpression(arg.value, ctx);
+              console.log(
+                "checking param",
+                params[paramIndex].paramaterType,
+                argType,
+              );
               if (paramIndex === -1) {
                 errors.push({ type: "UnmatchedParameter", ctx, code: 8 });
               } else if (
                 validateType(
                   params[paramIndex].paramaterType,
-                  typeFromExpression(arg.value, ctx),
+                  argType,
+                  ctx,
+                ) &&
+                validateType(
+                  argType,
+                  params[paramIndex].paramaterType,
                   ctx,
                 )
               ) {
@@ -1269,15 +1283,14 @@ const toExpression = (ctx: ExprContext): VLExpression => {
           // Then consume positional ones
           while (args2.length) {
             const [arg, ctx] = args2[0];
+
             if (!params.length) {
               errors.push({ type: "UnmatchedParameter", ctx, code: 9 });
               break;
             } else {
-              validateType(
-                params[0].paramaterType,
-                typeFromExpression(arg.value, ctx),
-                ctx,
-              );
+              const argType = typeFromExpression(arg.value, ctx);
+              validateType(params[0].paramaterType, argType, ctx) &&
+                validateType(argType, params[0].paramaterType, ctx);
               params.splice(0, 1);
               args2.splice(0, 1);
             }
@@ -1375,6 +1388,9 @@ const toAssignment = (ctx: ExprContext): VLBinaryOperationNode => {
       if (childType.type === "Union" && childType.subTypes.length === 0) {
         updateType(childType, rightType);
       } else validateType(childType, rightType, rightCtx);
+      if (childType.type === "Infer") {
+        updateType(childType, makeExact(childType));
+      }
     }
     return {
       type: "BinaryOperation",
