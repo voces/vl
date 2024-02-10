@@ -216,6 +216,8 @@ export type VLProgramNode = {
   scope: Scope;
 };
 
+export type VLNode = VLProgramNode;
+
 const scopes: Scope[] = [];
 
 type ParseErrors =
@@ -1563,7 +1565,7 @@ const toStatement = (ctx: StatementContext): VLStatement => {
 };
 
 export const toAST = (cst: ProgramContext): [VLProgramNode, ParseErrors[]] => {
-  console.log(cst.toStringTree(VL_Parser.ruleNames, cst.parser!));
+  // console.log(cst.toStringTree(VL_Parser.ruleNames, cst.parser!));
 
   scopes.splice(0);
   errors.splice(0);

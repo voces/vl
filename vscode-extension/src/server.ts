@@ -20,6 +20,7 @@ import {
 import VLLexer from "./antlr/VL_Lexer.ts";
 import VLParser from "./antlr/VL_Parser.ts";
 import { toAST, VLType } from "./toAST.ts";
+import { toWasm } from "./toWasm.ts";
 
 declare const process: NodeJS.Process;
 
@@ -223,7 +224,10 @@ documents.onDidChangeContent((event) => {
     }
   }
 
-  console.log(inspect(ast, { depth: Infinity, compact: true }));
+  // if (!diagnostics.length)
+  toWasm(ast);
+
+  // console.log(inspect(ast, { depth: Infinity, compact: true }));
 
   connection.sendDiagnostics({
     uri: event.document.uri,
