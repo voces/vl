@@ -1,4 +1,3 @@
-import { inspect } from "node:util";
 import { ParserRuleContext, TerminalNode } from "antlr4";
 import {
   createConnection,
@@ -117,6 +116,7 @@ const stringifyType = (type: VLType): string => {
   }
   if (type.type === "Nullable") return `${stringifyType(type.subType)} | null`;
   if (type.type === "Object") {
+    if (type.name) return type.name;
     if (
       type.properties.length === 1 &&
       type.properties[0].name.type === "Alias" &&
@@ -133,7 +133,12 @@ const stringifyType = (type: VLType): string => {
     }}`;
   }
   if (type.type === "StringLiteral") return `"${type.value}"`;
-  if (type.type === "NumberLiteral") return type.value.toString();
+  if (type.type === "IntegerLiteral") return type.value.toString();
+  if (type.type === "RealLiteral") {
+    return Number.isInteger(type.value)
+      ? `${type.value.toString()}.0`
+      : type.value.toString();
+  }
   if (type.type === "BooleanLiteral") return type.value.toString();
   if (type.type === "Unknown") return "any"; // Was null, changed to any for when doing "string".bar
   if (type.type === "Never") return "never";
@@ -145,11 +150,12 @@ const stringifyType = (type: VLType): string => {
   }
   if (type.type === "Type") return `T<${stringifyType(type.subType)}>`;
   if (type.type === "Infer") return `I<${stringifyType(type.subType)}>`;
+  if (type.type === "Custom") return type.validate.toString();
   const exhaustive: never = type;
   return exhaustive;
 };
 
-documents.onDidChangeContent((event) => {
+documents.onDidChangeContent(async (event) => {
   connection.console.log(
     `[Server(${process.pid}) ${workspaceFolder}] Document changed: ${event.document.uri}`,
   );
@@ -225,7 +231,26 @@ documents.onDidChangeContent((event) => {
   }
 
   // if (!diagnostics.length)
-  toWasm(ast);
+  try {
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 65536 });
+    await WebAssembly.instantiate(
+      await toWasm(ast),
+      {
+        imports: {
+          memory,
+          log: (offset: number, length: number) => {
+            const view = new Int32Array(memory.buffer, offset, length / 4);
+            const args: number[] = [];
+            for (let i = 0; i < length / 4; i++) args.push(view[i]);
+            console.log(...args);
+          },
+        },
+      },
+    );
+    // console.log(module.instance.exports);
+  } catch (err) {
+    console.error(err);
+  }
 
   // console.log(inspect(ast, { depth: Infinity, compact: true }));
 

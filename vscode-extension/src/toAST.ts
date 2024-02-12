@@ -1,5 +1,6 @@
+import { inspect } from "node:util";
 import { ParserRuleContext, TerminalNode } from "antlr4";
-import VL_Parser, {
+import {
   ArgContext,
   ArrayContext,
   ExprContext,
@@ -62,6 +63,7 @@ type VLFunctionCallNode = {
   type: "FunctionCall";
   function: string;
   arguments: VLArgumentNode[];
+  functionType: VLFunctionType | undefined;
 };
 
 type VLStringLiteralNode = {
@@ -69,8 +71,13 @@ type VLStringLiteralNode = {
   value: string;
 };
 
-type VLNumberLiteralNode = {
-  type: "NumberLiteral";
+type VLIntegerLiteralNode = {
+  type: "IntegerLiteral";
+  value: number;
+};
+
+type VLRealLiteralNode = {
+  type: "RealLiteral";
   value: number;
 };
 
@@ -109,6 +116,7 @@ type VLVariableDeclarationNode = {
   name: string;
   variableType: VLType;
   value: VLExpression | undefined;
+  mutable: boolean;
 };
 
 type VLIfNode = {
@@ -119,14 +127,15 @@ type VLIfNode = {
 
 type VLValue =
   | VLStringLiteralNode
-  | VLNumberLiteralNode
+  | VLIntegerLiteralNode
+  | VLRealLiteralNode
   | VLBooleanLiteralNode
   | VLNullLiteral
   | VLObjectLiteralNode
   | VLFunctionDeclarationNode
   | VLArrayLiteralNode;
 
-type VLExpression =
+export type VLExpression =
   | VLNameNode
   | VLBlockNode
   | VLValue
@@ -168,7 +177,7 @@ type VLContinueNode = {
   label: string | undefined;
 };
 
-type VLStatement =
+export type VLStatement =
   | VLReturnNode
   | VLExpression
   | VLVariableDeclarationNode
@@ -186,7 +195,8 @@ type VLFunctionType = {
 };
 type VLObjectType = {
   type: "Object";
-  properties: { name: VLType; type: VLType; readonly: boolean }[];
+  properties: { name: VLType; type: VLType }[];
+  name?: string;
 };
 type VLUnknownType = { type: "Unknown" };
 type VLNullableType = { type: "Nullable"; subType: VLType };
@@ -194,19 +204,22 @@ type VLUnionType = { type: "Union"; subTypes: VLType[] };
 type VLNeverType = { type: "Never" };
 type VLTypeType = { type: "Type"; subType: VLType };
 type VLInferType = { type: "Infer"; subType: VLType };
+type VLCustomType = { type: "Custom"; validate: (right: VLType) => boolean };
 export type VLType =
   | VLAliasType
   | VLFunctionType
   | VLObjectType
   | VLStringLiteralNode
-  | VLNumberLiteralNode
+  | VLIntegerLiteralNode
+  | VLRealLiteralNode
   | VLBooleanLiteralNode
   | VLUnknownType
   | VLNullableType
   | VLUnionType
   | VLNeverType
   | VLTypeType
-  | VLInferType;
+  | VLInferType
+  | VLCustomType;
 
 type Scope = Record<string, VLType>;
 
@@ -227,7 +240,7 @@ type ParseErrors =
     ctx: Context;
     code: number;
   }
-  | { type: "Undeclared"; name: string; ctx: Context; code: number }
+  | { type: "Undeclared"; name: string; ctx: Context; code: number | string }
   | {
     type: "Type";
     left: VLType;
@@ -244,23 +257,48 @@ const errors: ParseErrors[] = [];
 const returnTypes: VLType[] = [];
 let desiredType: VLType | undefined = undefined;
 
-const typeFromExpression = (
+const _typeFromExpression = (
   expr: VLExpression,
   ctx: Context,
 ): VLType => {
   switch (expr.type) {
     case "BinaryOperation": {
-      const rightSide = typeFromExpression(expr.right, ctx);
-      if (expr.operator === "=") return rightSide;
-      // Could maybe do math?
-      if (rightSide.type === "NumberLiteral") {
-        return { type: "Alias", name: "number" };
-      }
-      // Could maybe do string math? ("a" + "b" = "ab")
-      if (rightSide.type === "StringLiteral") {
-        return { type: "Alias", name: "string" };
-      }
-      return rightSide;
+      const leftType = typeFromExpression(expr.left, ctx);
+      const rightType = typeFromExpression(expr.right, ctx);
+      const op = expr.operator;
+      const missingOpFunc = (): VLType => {
+        errors.push({
+          type: "Type",
+          left: {
+            type: "Object",
+            properties: [{
+              name: { type: "StringLiteral", value: op },
+              type: {
+                type: "Function",
+                paramaters: [{
+                  type: "Parameter",
+                  name: "right",
+                  paramaterType: rightType,
+                }],
+                return: desiredType ?? { type: "Unknown" },
+              },
+            }],
+          },
+          right: leftType,
+          ctx,
+          code: "binary-op",
+        });
+        return { type: "Never" };
+      };
+      if (leftType.type !== "Object") return missingOpFunc();
+      const opFunc = leftType.properties.find((p) =>
+        p.name.type === "StringLiteral" && p.name.value === op
+      )?.type;
+      if (!opFunc || opFunc.type !== "Function") return missingOpFunc();
+      const param = opFunc.paramaters[0]?.paramaterType;
+      if (!param) return missingOpFunc();
+      if (!validateType(param, rightType, ctx)) return { type: "Never" };
+      return opFunc.return;
     }
     case "Block":
       // for (let i = 0; i < expr.statements.length; i++) {
@@ -294,8 +332,10 @@ const typeFromExpression = (
         if (expr.name in scopes[i]) return scopes[i][expr.name];
       }
       return { type: "Never" };
-    case "NumberLiteral":
-      return { type: "NumberLiteral", value: expr.value };
+    case "IntegerLiteral":
+      return { type: "IntegerLiteral", value: expr.value };
+    case "RealLiteral":
+      return { type: "RealLiteral", value: expr.value };
     case "StringLiteral":
       return { type: "StringLiteral", value: expr.value };
     case "ObjectLiteral":
@@ -314,12 +354,11 @@ const typeFromExpression = (
       return {
         type: "Object",
         properties: [{
-          name: { type: "Alias", name: "number" },
+          name: { type: "Alias", name: "i32" },
           type: {
             type: "Union",
             subTypes: expr.values.map((v) => typeFromExpression(v, ctx)),
           },
-          readonly: false,
         }],
       };
     case "PropertyAccess": {
@@ -378,8 +417,21 @@ const typeFromExpression = (
   }
 };
 
+const typeFromExpressionMemory = new WeakMap<VLExpression, VLType>();
+export const typeFromExpression = (
+  expr: VLExpression,
+  ctx: Context,
+): VLType => {
+  const memoized = typeFromExpressionMemory.get(expr);
+  if (memoized) return memoized;
+  const type = _typeFromExpression(expr, ctx);
+  typeFromExpressionMemory.set(expr, type);
+  return type;
+};
+
 const softenImplicitType = (type: VLType): VLType => {
-  if (type.type === "NumberLiteral") return { type: "Alias", name: "number" };
+  if (type.type === "IntegerLiteral") return { type: "Alias", name: "i32" };
+  if (type.type === "RealLiteral") return { type: "Alias", name: "f64" };
   if (type.type === "StringLiteral") return { type: "Alias", name: "string" };
   if (type.type === "BooleanLiteral") return { type: "Alias", name: "boolean" };
   if (type.type === "Nullable") {
@@ -389,7 +441,8 @@ const softenImplicitType = (type: VLType): VLType => {
   }
   if (
     type.type === "Alias" || type.type === "Function" ||
-    type.type === "Never" || type.type === "Type" || type.type === "Unknown"
+    type.type === "Never" || type.type === "Type" || type.type === "Unknown" ||
+    type.type === "Custom"
   ) return type;
   if (type.type === "Object") {
     let softenedProperty = false;
@@ -504,6 +557,7 @@ const toVariableDeclaration = (ctx: VarDeclContext) => {
     name: ctx.ID().getText(),
     variableType: type ? toType(type) : { type: "Unknown" },
     value: expr ? toExpression(expr) : undefined,
+    mutable: !!ctx.CONST(),
   };
   if (node.value) {
     const valueType = typeFromExpression(node.value, ctx);
@@ -592,20 +646,48 @@ const flattenType = (type: VLType): VLType => {
   return { type: "Union", subTypes: deduped };
 };
 
+const getConcreteType = (type: VLType, ctx: Context | undefined): VLType => {
+  if (type.type !== "Alias") return type; // TODO: Should handle recursiveness (objects, params, etc)
+  if (
+    type.name === "null" || type.name === "string" || type.name === "boolean"
+  ) {
+    return type; // TODO: remove these and make them object types
+  }
+
+  for (let i = scopes.length - 1; i >= 0; i--) {
+    if (type.name in scopes[i]) {
+      type = scopes[i][type.name];
+      if (type.type === "Type") return getConcreteType(type.subType, ctx);
+      return getConcreteType(type, ctx);
+    }
+  }
+
+  if (ctx) errors.push({ type: "Undeclared", name: type.name, ctx, code: 1 });
+  else {
+    throw new Error(
+      `Expected ctx to be defined or the alias ${type.name} to be resolveable`,
+    );
+  }
+
+  return { type: "Never" };
+};
+
 const toType = (ctx: TypeContext): VLType => {
   {
     const id = ctx.ID();
     if (id) {
       const name = id.getText();
-      if (name === "string" || name === "number" || name === "boolean") {
+      // return getConcreteType()
+      // TODO: kill these; all types should ultimately resolve to something concrete
+      if (name === "string" || name === "boolean") {
         return { type: "Alias", name };
       }
 
       for (let i = scopes.length - 1; i >= 0; i--) {
         if (name in scopes[i]) {
           const type = scopes[i][name];
-          if (type.type === "Type") return type.subType;
-          return type;
+          if (type.type === "Type") return getConcreteType(type.subType, ctx);
+          return getConcreteType(type, ctx);
         }
       }
 
@@ -662,7 +744,14 @@ const toType = (ctx: TypeContext): VLType => {
   {
     const nLit = ctx.NUMBER();
     if (nLit) {
-      return { type: "NumberLiteral", value: parseFloat(nLit.getText()) };
+      const text = nLit.getText();
+      const value = parseFloat(text);
+      return {
+        type: Number.isInteger(value) && !text.includes(".")
+          ? "IntegerLiteral"
+          : "RealLiteral",
+        value,
+      };
     }
   }
 
@@ -676,9 +765,8 @@ const toType = (ctx: TypeContext): VLType => {
     return {
       type: "Object",
       properties: [{
-        name: { type: "Alias", name: "number" },
+        name: { type: "Alias", name: "i32" },
         type: toType(ctx.type_(0)),
-        readonly: false,
       }],
     };
   }
@@ -807,7 +895,8 @@ const getType = (name: string, ctx: Context): VLType => {
   for (let i = scopes.length - 1; i >= 0; i--) {
     if (name in scopes[i]) return scopes[i][name];
   }
-  errors.push({ type: "Undeclared", name, ctx, code: 3 });
+  console.log(scopes);
+  errors.push({ type: "Undeclared", name, ctx, code: "undeclared-type" });
   return { type: "Unknown" };
 };
 
@@ -830,11 +919,7 @@ const getChildType = (
       type: "Type",
       left: {
         type: "Object",
-        properties: [{
-          name: property,
-          type: { type: "Unknown" },
-          readonly: false,
-        }],
+        properties: [{ name: property, type: { type: "Unknown" } }],
       },
       right: object,
       ctx: objectCtx,
@@ -855,7 +940,6 @@ const getChildType = (
       propertyType = {
         name: property,
         type: { type: "Infer", subType: { type: "Unknown" } },
-        readonly: false,
       };
       object.properties.push(propertyType);
     } else {
@@ -897,10 +981,37 @@ const validateType = (
     [right, left] = [left, right];
   }
 
+  outer: while (left.type === "Alias") {
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if (left.name in scopes[i]) {
+        left = scopes[i][left.name];
+        continue outer;
+      }
+    }
+    break;
+  }
+
+  outer: while (right.type === "Alias") {
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if (right.name in scopes[i]) {
+        right = scopes[i][right.name];
+        continue outer;
+      }
+    }
+    break;
+  }
+
+  if (left === right) return true;
+
   const pushError = (code: number | string) => {
     errors.push({ type: "Type", left, right, ctx, code });
     return false;
   };
+
+  if (left.type === "Never" || right.type === "Never") {
+    // We can assume this has already been errored?
+    return false;
+  }
 
   switch (left.type) {
     // Unknown is inferrable
@@ -911,16 +1022,18 @@ const validateType = (
       return true;
     }
     case "Alias":
-      if (left.name === "number") {
-        if (right.type === "Alias") {
-          if (right.name !== "number") return pushError(6);
-        } else if (right.type === "Union") {
-          const oldErrors = errors.splice(0, Infinity);
-          const valid = right.subTypes.some((t) => validateType(left, t, ctx));
-          errors.splice(0, Infinity, ...oldErrors);
-          if (!valid) return pushError("union-not-number");
-        } else if (right.type !== "NumberLiteral") return pushError(12);
-      } else if (left.name === "string") {
+      // TODO: this should be inverted for safety...
+      // if (left.name === "number") {
+      //   if (right.type === "Alias") {
+      //     if (right.name !== "number") return pushError(6);
+      //   } else if (right.type === "Union") {
+      //     const oldErrors = errors.splice(0, Infinity);
+      //     const valid = right.subTypes.some((t) => validateType(left, t, ctx));
+      //     errors.splice(0, Infinity, ...oldErrors);
+      //     if (!valid) return pushError("union-not-number");
+      //   } else if (right.type !== "NumberLiteral") return pushError(12);
+      // } else
+      if (left.name === "string") {
         if (right.type === "Alias") {
           if (right.name !== "string") return pushError(13);
         } else if (right.type === "Union") {
@@ -987,8 +1100,15 @@ const validateType = (
         errors.splice(0, Infinity, ...oldErrors);
       }
       return true;
-    case "NumberLiteral":
-      if (right.type !== "NumberLiteral") return pushError(19);
+      // Technically we should an integer literal outside the i32 range as an exception, same as f32/f64
+    case "IntegerLiteral":
+      if (right.type !== "IntegerLiteral") return pushError(19);
+      if (left.value !== right.value) return pushError(20);
+      return true;
+    case "RealLiteral":
+      if (right.type !== "RealLiteral" && right.type !== "IntegerLiteral") {
+        return pushError(19);
+      }
       if (left.value !== right.value) return pushError(20);
       return true;
     case "StringLiteral":
@@ -1000,13 +1120,27 @@ const validateType = (
       if (left.value !== right.value) return pushError(24);
       return true;
     case "Object": {
+      const assignmentProp = left.properties.find((p) =>
+        p.name.type === "StringLiteral" && p.name.value === "="
+      )?.type;
+      if (
+        assignmentProp && assignmentProp.type === "Function" &&
+        assignmentProp.paramaters.length > 0
+      ) {
+        return validateType(
+          assignmentProp.paramaters[0].paramaterType,
+          right,
+          ctx,
+        );
+      }
+
       if (right.type !== "Object") return pushError(25);
       const indexProperties = [];
       const rprops = new Set(right.properties);
       outer: for (const lprop of left.properties) {
         if (
           lprop.name.type === "StringLiteral" ||
-          lprop.name.type === "NumberLiteral"
+          lprop.name.type === "IntegerLiteral"
         ) {
           for (const rprop of right.properties) {
             const oldErrors = errors.splice(0, Infinity);
@@ -1071,9 +1205,9 @@ const validateType = (
       errors.splice(0, Infinity, ...oldErrors);
       return pushError(28);
     }
-    case "Never":
-      if (right.type !== "Never") return pushError(29);
-      return true;
+    // case "Never":
+    //   if (right.type !== "Never") return pushError(29);
+    //   return true;
     case "Type":
       if (right.type !== "Type") return pushError(30);
       return validateType(left, right, ctx);
@@ -1093,6 +1227,9 @@ const validateType = (
       errors.splice(0, Infinity, ...oldErrors);
       return true;
     }
+    case "Custom":
+      if (!left.validate(right)) return pushError("custom-validation");
+      return true;
     default: {
       const exhaustive: never = left;
       console.warn(`Did not type check ${exhaustive}`);
@@ -1188,7 +1325,16 @@ const toExpression = (ctx: ExprContext): VLExpression => {
 
   {
     const num = ctx.NUMBER();
-    if (num) return { type: "NumberLiteral", value: parseFloat(num.getText()) };
+    if (num) {
+      const text = num.getText();
+      const value = parseFloat(text);
+      return {
+        type: Number.isInteger(value) && !text.includes(".")
+          ? "IntegerLiteral"
+          : "RealLiteral",
+        value,
+      };
+    }
   }
 
   {
@@ -1220,15 +1366,17 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     const call = ctx.functionCall();
     if (call) {
       const id = call.ID();
+      const name = id.getText();
       const args = call.args()?.arg_list() ?? [];
       const funcCall: VLFunctionCallNode = {
         type: "FunctionCall",
-        function: id.getText(),
+        function: name,
         arguments: args.map((a): VLArgumentNode => ({
           type: "Argument",
           name: a.ID()?.getText(),
           value: toExpression(a.expr()),
         })),
+        functionType: undefined,
       };
 
       const t = getType(funcCall.function, id);
@@ -1257,11 +1405,6 @@ const toExpression = (ctx: ExprContext): VLExpression => {
             if (arg.name) {
               const paramIndex = params.findIndex((p) => p.name === arg.name);
               const argType = typeFromExpression(arg.value, ctx);
-              console.log(
-                "checking param",
-                params[paramIndex].paramaterType,
-                argType,
-              );
               if (paramIndex === -1) {
                 errors.push({ type: "UnmatchedParameter", ctx, code: 8 });
               } else if (
@@ -1269,12 +1412,12 @@ const toExpression = (ctx: ExprContext): VLExpression => {
                   params[paramIndex].paramaterType,
                   argType,
                   ctx,
-                ) &&
-                validateType(
-                  argType,
-                  params[paramIndex].paramaterType,
-                  ctx,
                 )
+                // validateType(
+                //   argType,
+                //   params[paramIndex].paramaterType,
+                //   ctx,
+                // )
               ) {
                 params.splice(paramIndex, 1);
                 args2.splice(i, 1);
@@ -1291,8 +1434,8 @@ const toExpression = (ctx: ExprContext): VLExpression => {
               break;
             } else {
               const argType = typeFromExpression(arg.value, ctx);
-              validateType(params[0].paramaterType, argType, ctx) &&
-                validateType(argType, params[0].paramaterType, ctx);
+              validateType(params[0].paramaterType, argType, ctx);
+              // validateType(argType, params[0].paramaterType, ctx);
               params.splice(0, 1);
               args2.splice(0, 1);
             }
@@ -1304,6 +1447,8 @@ const toExpression = (ctx: ExprContext): VLExpression => {
             // TODO: indicate how many?
             errors.push({ type: "UnmatchedParameter", ctx, code: 10 });
           }
+
+          funcCall.functionType = t;
         }
       }
 
@@ -1497,13 +1642,13 @@ const toStatement = (ctx: StatementContext): VLStatement => {
       const fromCtx = forStatement.expr(0);
       const from = toExpression(fromCtx);
       const fromType = typeFromExpression(from, fromCtx);
-      validateType({ type: "Alias", name: "number" }, fromType, fromCtx);
+      validateType({ type: "Alias", name: "i32" }, fromType, fromCtx);
 
       const toCtx = forStatement.expr(1);
       const to = toExpression(toCtx);
       const toType = typeFromExpression(to, toCtx);
       validateType(
-        { type: "Alias", name: "number" },
+        { type: "Alias", name: "i32" },
         toType,
         toCtx,
       );
@@ -1519,7 +1664,7 @@ const toStatement = (ctx: StatementContext): VLStatement => {
         if (stepCtx) {
           step = toExpression(stepCtx);
           validateType(
-            { type: "Alias", name: "number" },
+            { type: "Alias", name: "i32" },
             typeFromExpression(step, stepCtx ?? forStatement),
             stepCtx ?? forStatement,
           );
@@ -1565,22 +1710,162 @@ const toStatement = (ctx: StatementContext): VLStatement => {
 };
 
 export const toAST = (cst: ProgramContext): [VLProgramNode, ParseErrors[]] => {
-  // console.log(cst.toStringTree(VL_Parser.ruleNames, cst.parser!));
-
   scopes.splice(0);
   errors.splice(0);
+
+  const symmetricOps = (
+    name: string,
+    paramaterType: VLType,
+  ): VLObjectType["properties"] => [{
+    name: { type: "StringLiteral", value: "=" },
+    type: {
+      type: "Function",
+      paramaters: [{ type: "Parameter", name: "right", paramaterType }],
+      return: { type: "Alias", name },
+    },
+  }, {
+    name: { type: "StringLiteral", value: "+" },
+    type: {
+      type: "Function",
+      paramaters: [{ type: "Parameter", name: "right", paramaterType }],
+      return: { type: "Alias", name },
+    },
+  }];
+
+  // console.log(cst.toStringTree(VL_Parser.ruleNames, cst.parser!));
 
   const program: VLProgramNode = {
     type: "Program",
     statements: [],
     scope: {
-      // number: { type: "Type", subType: { type: "Object", properties: [] } },
+      i32: {
+        type: "Object",
+        properties: symmetricOps("i32", {
+          type: "Custom",
+          validate: Object.assign(
+            (right: VLType) => right.type === "IntegerLiteral",
+            { toString: () => "i32" },
+          ),
+        }),
+        name: "i32",
+      },
+      i64: {
+        type: "Object",
+        properties: symmetricOps("i64", {
+          type: "Union",
+          subTypes: [{ type: "Alias", name: "i32" }, {
+            type: "Custom",
+            validate: Object.assign(
+              (right: VLType) => right.type === "IntegerLiteral",
+              { toString: () => "i64" },
+            ),
+          }],
+        }),
+        name: "i64",
+      },
+      f32: {
+        type: "Object",
+        properties: symmetricOps("f32", {
+          type: "Custom",
+          validate: Object.assign(
+            (right: VLType) =>
+              right.type === "IntegerLiteral" ||
+              right.type === "RealLiteral",
+            { toString: () => "f32" },
+          ),
+        }),
+        name: "f32",
+      },
+      f64: {
+        type: "Object",
+        properties: symmetricOps("f64", {
+          type: "Union",
+          subTypes: [
+            { type: "Alias", name: "i32" },
+            { type: "Alias", name: "f32" },
+            {
+              type: "Custom",
+              validate: Object.assign(
+                (right: VLType) =>
+                  right.type === "IntegerLiteral" ||
+                  right.type === "RealLiteral",
+                { toString: () => "f64" },
+              ),
+            },
+          ],
+        }),
+        name: "f64",
+      },
+      // "__store_f64__": {
+      //   type: "Function",
+      //   paramaters: [{
+      //     type: "Parameter",
+      //     name: "address",
+      //     paramaterType: { type: "Alias", name: "f64" },
+      //   }, {
+      //     type: "Parameter",
+      //     name: "value",
+      //     paramaterType: { type: "Alias", name: "f64" },
+      //   }],
+      //   return: { type: "Alias", name: "null" },
+      // },
       // string: { type: "Type", subType: { type: "Object", properties: [] } },
       // boolean: { type: "Type", subType: { type: "Object", properties: [] } },
     },
   };
-
   scopes.push(program.scope);
+
+  program.scope.__allocate__ = {
+    type: "Function",
+    paramaters: [{
+      type: "Parameter",
+      name: "address",
+      paramaterType: { type: "Alias", name: "i32" },
+    }],
+    return: getConcreteType({ type: "Alias", name: "i32" }, undefined),
+  };
+
+  program.scope.__store_i32__ = {
+    type: "Function",
+    paramaters: [{
+      type: "Parameter",
+      name: "address",
+      paramaterType: { type: "Alias", name: "i32" },
+    }, {
+      type: "Parameter",
+      name: "value",
+      paramaterType: { type: "Alias", name: "i32" },
+    }],
+    return: { type: "Alias", name: "null" },
+  };
+
+  program.scope.__store_i64__ = {
+    type: "Function",
+    paramaters: [{
+      type: "Parameter",
+      name: "address",
+      paramaterType: { type: "Alias", name: "i64" },
+    }, {
+      type: "Parameter",
+      name: "value",
+      paramaterType: { type: "Alias", name: "i64" },
+    }],
+    return: { type: "Alias", name: "null" },
+  };
+
+  program.scope.log = {
+    type: "Function",
+    paramaters: [{
+      type: "Parameter",
+      name: "address",
+      paramaterType: { type: "Alias", name: "i32" },
+    }, {
+      type: "Parameter",
+      name: "length",
+      paramaterType: { type: "Alias", name: "i32" },
+    }],
+    return: { type: "Alias", name: "null" },
+  };
 
   for (const blkStmt of cst.blockStatement_list()) {
     const stmt = blkStmt.statement();

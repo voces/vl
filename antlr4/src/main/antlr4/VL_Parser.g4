@@ -64,15 +64,11 @@ returnStatement
     ;
 
 expr
-    : NUMBER
-    | STRING
-    | TRUE
-    | FALSE
-    | NULL
-    | object
+    : object
     | block
     | array
     | if
+    | expr NEWLINE* binaryOp NEWLINE* expr
     | ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     | expr NEWLINE* DOT ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     | expr LBRACK NEWLINE* expr NEWLINE* RBRACK NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
@@ -81,9 +77,13 @@ expr
     | expr NEWLINE* DOT ID // property expr
     | prefixOp expr
     | expr postfixOp
-    | expr NEWLINE* binaryOp NEWLINE* expr
     | functionCall
     | functionDecl
+    | NUMBER
+    | STRING
+    | TRUE
+    | FALSE
+    | NULL
     | ID
     ;
 
