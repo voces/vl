@@ -20,6 +20,7 @@ import VLLexer from "./antlr/VL_Lexer.ts";
 import VLParser from "./antlr/VL_Parser.ts";
 import { toAST, VLType } from "./toAST.ts";
 import { toWasm } from "./toWasm.ts";
+import { defaultScope } from "./defaultScope.ts";
 
 declare const process: NodeJS.Process;
 
@@ -161,7 +162,7 @@ documents.onDidChangeContent(async (event) => {
   );
   const [program, diagnostics] = parse(event.document.getText());
 
-  const [ast, errors] = toAST(program);
+  const [ast, errors] = toAST(program, defaultScope());
 
   for (const error of errors) {
     switch (error.type) {
@@ -230,26 +231,44 @@ documents.onDidChangeContent(async (event) => {
     }
   }
 
-  // if (!diagnostics.length)
-  try {
-    const memory = new WebAssembly.Memory({ initial: 1, maximum: 65536 });
-    await WebAssembly.instantiate(
-      await toWasm(ast),
-      {
-        imports: {
-          memory,
-          log: (offset: number, length: number) => {
-            const view = new Int32Array(memory.buffer, offset, length / 4);
-            const args: number[] = [];
-            for (let i = 0; i < length / 4; i++) args.push(view[i]);
-            console.log(...args);
+  if (!diagnostics.length) {
+    try {
+      const memory = new WebAssembly.Memory({ initial: 1, maximum: 65536 });
+      await WebAssembly.instantiate(
+        await toWasm(ast),
+        {
+          imports: {
+            memory,
+            log: (offset: number, length: number) => {
+              const view = new Int32Array(memory.buffer, offset, length / 4);
+              const args: (number | bigint)[] = [];
+              for (let i = 0; i < length / 4; i++) {
+                if (view[i] === 1) {
+                  const low = BigInt(view[++i]) & BigInt(0xFFFFFFFF);
+                  const high = BigInt(view[++i]) << BigInt(32);
+                  args.push(high | low);
+                } else if (view[i] === 2) {
+                  i++;
+                  args.push(
+                    new Float32Array(memory.buffer, offset + i * 4, 1)[0],
+                  );
+                } else if (view[i] === 3) {
+                  const swap = new Int32Array(2);
+                  swap[0] = view[++i];
+                  swap[1] = view[++i];
+                  args.push(new Float64Array(swap.buffer, 0, 1)[0]);
+                } // 0 and fallback
+                else args.push(view[++i]);
+              }
+              console.log(...args);
+            },
           },
         },
-      },
-    );
-    // console.log(module.instance.exports);
-  } catch (err) {
-    console.error(err);
+      );
+      // console.log(module.instance.exports);
+    } catch (err) {
+      console.error(err);
+    }
   }
 
   // console.log(inspect(ast, { depth: Infinity, compact: true }));

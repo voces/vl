@@ -1,4 +1,4 @@
-import { inspect } from "node:util";
+// import { inspect } from "node:util";
 import { ParserRuleContext, TerminalNode } from "antlr4";
 import {
   ArgContext,
@@ -74,6 +74,7 @@ type VLStringLiteralNode = {
 type VLIntegerLiteralNode = {
   type: "IntegerLiteral";
   value: number;
+  text: string;
 };
 
 type VLRealLiteralNode = {
@@ -193,7 +194,7 @@ type VLFunctionType = {
   paramaters: VLParameterNode[];
   return: VLType;
 };
-type VLObjectType = {
+export type VLObjectType = {
   type: "Object";
   properties: { name: VLType; type: VLType }[];
   name?: string;
@@ -204,7 +205,11 @@ type VLUnionType = { type: "Union"; subTypes: VLType[] };
 type VLNeverType = { type: "Never" };
 type VLTypeType = { type: "Type"; subType: VLType };
 type VLInferType = { type: "Infer"; subType: VLType };
-type VLCustomType = { type: "Custom"; validate: (right: VLType) => boolean };
+type VLCustomType = {
+  type: "Custom";
+  validate: (right: VLType) => boolean;
+  name?: string;
+};
 export type VLType =
   | VLAliasType
   | VLFunctionType
@@ -221,7 +226,7 @@ export type VLType =
   | VLInferType
   | VLCustomType;
 
-type Scope = Record<string, VLType>;
+export type Scope = Record<string, VLType>;
 
 export type VLProgramNode = {
   type: "Program";
@@ -232,6 +237,14 @@ export type VLProgramNode = {
 export type VLNode = VLProgramNode;
 
 const scopes: Scope[] = [];
+export const withScope = <T>(scope: Scope, fn: () => T) => {
+  scopes.push(scope);
+  try {
+    return fn();
+  } finally {
+    scopes.pop();
+  }
+};
 
 type ParseErrors =
   | {
@@ -333,7 +346,7 @@ const _typeFromExpression = (
       }
       return { type: "Never" };
     case "IntegerLiteral":
-      return { type: "IntegerLiteral", value: expr.value };
+      return { type: "IntegerLiteral", value: expr.value, text: expr.text };
     case "RealLiteral":
       return { type: "RealLiteral", value: expr.value };
     case "StringLiteral":
@@ -418,7 +431,7 @@ const _typeFromExpression = (
 };
 
 const typeFromExpressionMemory = new WeakMap<VLExpression, VLType>();
-export const typeFromExpression = (
+const typeFromExpression = (
   expr: VLExpression,
   ctx: Context,
 ): VLType => {
@@ -427,6 +440,11 @@ export const typeFromExpression = (
   const type = _typeFromExpression(expr, ctx);
   typeFromExpressionMemory.set(expr, type);
   return type;
+};
+export const vlType = (expr: VLExpression) => {
+  const memoized = typeFromExpressionMemory.get(expr);
+  if (memoized) return memoized;
+  throw new Error("Expected expression's type to have been memoized");
 };
 
 const softenImplicitType = (type: VLType): VLType => {
@@ -577,7 +595,7 @@ const toParameter = (ctx: ParamContext): VLParameterNode => {
     type: "Parameter",
     name: ctx.ID().getText(),
     paramaterType: type
-      ? toType(type)
+      ? getConcreteType(toType(type), ctx)
       : { type: "Infer", subType: { type: "Unknown" } },
   };
 };
@@ -646,7 +664,10 @@ const flattenType = (type: VLType): VLType => {
   return { type: "Union", subTypes: deduped };
 };
 
-const getConcreteType = (type: VLType, ctx: Context | undefined): VLType => {
+export const getConcreteType = (
+  type: VLType,
+  ctx: Context | undefined,
+): VLType => {
   if (type.type !== "Alias") return type; // TODO: Should handle recursiveness (objects, params, etc)
   if (
     type.name === "null" || type.name === "string" || type.name === "boolean"
@@ -751,6 +772,7 @@ const toType = (ctx: TypeContext): VLType => {
           ? "IntegerLiteral"
           : "RealLiteral",
         value,
+        text,
       };
     }
   }
@@ -1333,6 +1355,7 @@ const toExpression = (ctx: ExprContext): VLExpression => {
           ? "IntegerLiteral"
           : "RealLiteral",
         value,
+        text,
       };
     }
   }
@@ -1709,163 +1732,21 @@ const toStatement = (ctx: StatementContext): VLStatement => {
   );
 };
 
-export const toAST = (cst: ProgramContext): [VLProgramNode, ParseErrors[]] => {
+export const toAST = (
+  cst: ProgramContext,
+  initialScope: Scope = {},
+): [VLProgramNode, ParseErrors[]] => {
   scopes.splice(0);
   errors.splice(0);
-
-  const symmetricOps = (
-    name: string,
-    paramaterType: VLType,
-  ): VLObjectType["properties"] => [{
-    name: { type: "StringLiteral", value: "=" },
-    type: {
-      type: "Function",
-      paramaters: [{ type: "Parameter", name: "right", paramaterType }],
-      return: { type: "Alias", name },
-    },
-  }, {
-    name: { type: "StringLiteral", value: "+" },
-    type: {
-      type: "Function",
-      paramaters: [{ type: "Parameter", name: "right", paramaterType }],
-      return: { type: "Alias", name },
-    },
-  }];
 
   // console.log(cst.toStringTree(VL_Parser.ruleNames, cst.parser!));
 
   const program: VLProgramNode = {
     type: "Program",
     statements: [],
-    scope: {
-      i32: {
-        type: "Object",
-        properties: symmetricOps("i32", {
-          type: "Custom",
-          validate: Object.assign(
-            (right: VLType) => right.type === "IntegerLiteral",
-            { toString: () => "i32" },
-          ),
-        }),
-        name: "i32",
-      },
-      i64: {
-        type: "Object",
-        properties: symmetricOps("i64", {
-          type: "Union",
-          subTypes: [{ type: "Alias", name: "i32" }, {
-            type: "Custom",
-            validate: Object.assign(
-              (right: VLType) => right.type === "IntegerLiteral",
-              { toString: () => "i64" },
-            ),
-          }],
-        }),
-        name: "i64",
-      },
-      f32: {
-        type: "Object",
-        properties: symmetricOps("f32", {
-          type: "Custom",
-          validate: Object.assign(
-            (right: VLType) =>
-              right.type === "IntegerLiteral" ||
-              right.type === "RealLiteral",
-            { toString: () => "f32" },
-          ),
-        }),
-        name: "f32",
-      },
-      f64: {
-        type: "Object",
-        properties: symmetricOps("f64", {
-          type: "Union",
-          subTypes: [
-            { type: "Alias", name: "i32" },
-            { type: "Alias", name: "f32" },
-            {
-              type: "Custom",
-              validate: Object.assign(
-                (right: VLType) =>
-                  right.type === "IntegerLiteral" ||
-                  right.type === "RealLiteral",
-                { toString: () => "f64" },
-              ),
-            },
-          ],
-        }),
-        name: "f64",
-      },
-      // "__store_f64__": {
-      //   type: "Function",
-      //   paramaters: [{
-      //     type: "Parameter",
-      //     name: "address",
-      //     paramaterType: { type: "Alias", name: "f64" },
-      //   }, {
-      //     type: "Parameter",
-      //     name: "value",
-      //     paramaterType: { type: "Alias", name: "f64" },
-      //   }],
-      //   return: { type: "Alias", name: "null" },
-      // },
-      // string: { type: "Type", subType: { type: "Object", properties: [] } },
-      // boolean: { type: "Type", subType: { type: "Object", properties: [] } },
-    },
+    scope: initialScope,
   };
   scopes.push(program.scope);
-
-  program.scope.__allocate__ = {
-    type: "Function",
-    paramaters: [{
-      type: "Parameter",
-      name: "address",
-      paramaterType: { type: "Alias", name: "i32" },
-    }],
-    return: getConcreteType({ type: "Alias", name: "i32" }, undefined),
-  };
-
-  program.scope.__store_i32__ = {
-    type: "Function",
-    paramaters: [{
-      type: "Parameter",
-      name: "address",
-      paramaterType: { type: "Alias", name: "i32" },
-    }, {
-      type: "Parameter",
-      name: "value",
-      paramaterType: { type: "Alias", name: "i32" },
-    }],
-    return: { type: "Alias", name: "null" },
-  };
-
-  program.scope.__store_i64__ = {
-    type: "Function",
-    paramaters: [{
-      type: "Parameter",
-      name: "address",
-      paramaterType: { type: "Alias", name: "i64" },
-    }, {
-      type: "Parameter",
-      name: "value",
-      paramaterType: { type: "Alias", name: "i64" },
-    }],
-    return: { type: "Alias", name: "null" },
-  };
-
-  program.scope.log = {
-    type: "Function",
-    paramaters: [{
-      type: "Parameter",
-      name: "address",
-      paramaterType: { type: "Alias", name: "i32" },
-    }, {
-      type: "Parameter",
-      name: "length",
-      paramaterType: { type: "Alias", name: "i32" },
-    }],
-    return: { type: "Alias", name: "null" },
-  };
 
   for (const blkStmt of cst.blockStatement_list()) {
     const stmt = blkStmt.statement();

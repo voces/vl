@@ -1,16 +1,13 @@
-import { inspect } from "node:util";
+// import { inspect } from "node:util";
 import Binaryen from "binaryen";
-import {
-  typeFromExpression,
-  VLProgramNode,
-  VLStatement,
-  VLType,
-} from "./toAST.ts";
+import { VLProgramNode, VLStatement, VLType, vlType } from "./toAST.ts";
 
 const raise = (err?: string | Error) => {
   if (typeof err === "object" && err instanceof Error) throw err;
   throw new Error(err);
 };
+
+const lowMask = BigInt(0xFFFFFFFF);
 
 export const toWasm = async (ast: VLProgramNode) => {
   const binaryen = await Binaryen();
@@ -79,20 +76,35 @@ export const toWasm = async (ast: VLProgramNode) => {
     ]),
   );
 
-  // m.addFunction(
-  //   "__store_f64__",
-  //   binaryen.createType([binaryen.i32, binaryen.f64]),
-  //   binaryen.none,
-  //   [],
-  //   m.block(null, [
-  //     m.i64.store(
-  //       0,
-  //       8,
-  //       m.local.get(0, binaryen.i32),
-  //       m.local.get(1, binaryen.f64),
-  //     ),
-  //   ]),
-  // );
+  m.addFunction(
+    "__store_f32__",
+    binaryen.createType([binaryen.i32, binaryen.f32]),
+    binaryen.none,
+    [],
+    m.block(null, [
+      m.f32.store(
+        0,
+        4,
+        m.local.get(0, binaryen.i32),
+        m.local.get(1, binaryen.f32),
+      ),
+    ]),
+  );
+
+  m.addFunction(
+    "__store_f64__",
+    binaryen.createType([binaryen.i32, binaryen.f64]),
+    binaryen.none,
+    [],
+    m.block(null, [
+      m.f64.store(
+        0,
+        8,
+        m.local.get(0, binaryen.i32),
+        m.local.get(1, binaryen.f64),
+      ),
+    ]),
+  );
 
   type Scope = Record<string, VLType>;
   const scopes: Scope[] = [];
@@ -105,8 +117,29 @@ export const toWasm = async (ast: VLProgramNode) => {
     currentScope = scopes[scopes.length - 1];
     return ret;
   };
+  let desiredType: VLType | undefined = undefined;
+  const withDesiredType = <T>(type: VLType | undefined, fn: () => T) => {
+    const oldType = desiredType;
+    desiredType = type;
+    const ret = fn();
+    desiredType = oldType;
+    return ret;
+  };
+  // const fromScope = (name: string) => {
+  //   let type: VLType | undefined;
+  //   for (let i = scopes.length - 1; i >= 0; i--) {
+  //     if (name in scopes[i]) type = scopes[i][name];
+  //   }
+  //   if (!type) throw new Error(`Expected "${name}" to be in scope`);
+  //   return type;
+  // };
 
   const toExpression = (node: VLProgramNode | VLStatement): number => {
+    // console.log(
+    //   "toExpression",
+    //   inspect(node, { depth: Infinity, compact: true }),
+    //   desiredType,
+    // );
     switch (node.type) {
       case "Program": {
         const modifiedScope = Object.fromEntries(
@@ -119,6 +152,8 @@ export const toWasm = async (ast: VLProgramNode) => {
               "__allocate__",
               "__store_i32__",
               "__store_i64__",
+              "__store_f32__",
+              "__store_f64__",
               "log",
             ].includes(k)
           ),
@@ -131,18 +166,48 @@ export const toWasm = async (ast: VLProgramNode) => {
               binaryen.none,
               binaryen.none,
               // This really doesn't work with closures...
-              Object.values(modifiedScope).map(toType),
+              Object.values(modifiedScope).map(toWasmType),
               m.block(null, node.statements.map(toExpression)),
             ),
         );
       }
-      case "IntegerLiteral":
-        return m.i32.const(node.value);
+      case "IntegerLiteral": {
+        const type = desiredType?.type === "Object"
+          ? desiredType?.name || "i32"
+          : desiredType?.type === "Alias" // TODO: Should be concrete, but right now the built-ins have Aliases
+          ? desiredType.name
+          : "i32";
+        if (
+          type !== "i32" && type !== "i64" && type !== "f32" && type !== "f64"
+        ) throw new Error("Expected numeric type");
+        if (type === "i64") {
+          const big = BigInt(node.text);
+          return m.i64.const(Number(big & lowMask), Number(big >> BigInt(32)));
+        }
+        return m[type].const(node.value);
+      }
+      case "RealLiteral": {
+        const type = desiredType?.type === "Object"
+          ? desiredType?.name || "f64"
+          : desiredType?.type === "Alias" // TODO: Should be concrete, but right now the built-ins have Aliases
+          ? desiredType.name
+          : "f64";
+        if (type !== "f32" && type !== "f64") {
+          throw new Error("Expected numeric type");
+        }
+        return m[type].const(node.value);
+      }
       case "FunctionCall":
         return m.call(
           node.function,
-          node.arguments.map((a) => toExpression(a.value)),
-          toType(node.functionType!.return),
+          node.arguments.map((a, i) =>
+            withDesiredType(
+              // TODO: named params
+              node.functionType?.paramaters[i]?.paramaterType,
+              () => toExpression(a.value),
+            )
+          ),
+          toWasmType(node.functionType!.return),
         );
       case "VariableDeclaration":
         if (node.value) {
@@ -165,18 +230,20 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "BinaryOperation": {
         const op = node.operator;
-        const leftType = typeFromExpression(node.left, null as any);
-        const rightType = typeFromExpression(node.right, null as any);
-        // const opFunc = leftType.type === "Object"
-        //   ? leftType.properties.find((p) =>
-        //     p.name.type === "StringLiteral" && p.name.value === op
-        //   )?.type
-        //   : raise();
+        const leftType = vlType(node.left);
+        const opFunc = leftType.type === "Object"
+          ? leftType.properties.find((p) =>
+            p.name.type === "StringLiteral" && p.name.value === op
+          )?.type
+          : raise();
+        const paramType = opFunc?.type === "Function"
+          ? opFunc.paramaters[0].paramaterType ?? raise()
+          : raise();
         // const ret = opFunc?.type === "Function" ? opFunc.return : raise();
         if (leftType.type === "Object" && leftType.name === "i32") {
           return m.i32[op === "+" ? "add" : raise()](
             toExpression(node.left),
-            toExpression(node.right), // TODO need to handle casting...
+            withDesiredType(paramType, () => toExpression(node.right)),
           );
         }
         throw new Error("Have only handled addition for i32");
@@ -187,7 +254,7 @@ export const toWasm = async (ast: VLProgramNode) => {
     }
   };
 
-  const toType = (node: VLType): number => {
+  const toWasmType = (node: VLType): number => {
     switch (node.type) {
       case "Alias":
         if (node.name === "number") return binaryen.i32;
