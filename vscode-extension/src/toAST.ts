@@ -1,7 +1,6 @@
 // import { inspect } from "node:util";
 import { ParserRuleContext, TerminalNode } from "antlr4";
 import {
-  ArgContext,
   ArrayContext,
   ExprContext,
   FunctionDeclContext,
@@ -16,13 +15,13 @@ import {
 
 type Context = ParserRuleContext | TerminalNode;
 
-type VLParameterNode = {
+export type VLParameterNode = {
   type: "Parameter";
   name: string;
   paramaterType: VLType;
 };
 
-type VLFunctionDeclarationNode = {
+export type VLFunctionDeclarationNode = {
   type: "FunctionDeclaration";
   name: string | undefined;
   parameters: VLParameterNode[];
@@ -57,6 +56,7 @@ type VLArgumentNode = {
   type: "Argument";
   name: string | undefined;
   value: VLExpression;
+  context: Context;
 };
 
 type VLFunctionCallNode = {
@@ -261,14 +261,21 @@ type ParseErrors =
     ctx: Context;
     code: number | string;
   }
-  | { type: "UnmatchedParameter"; ctx: ParserRuleContext; code: number }
+  | { type: "UnmatchedParameter"; ctx: Context; code: number }
   | { type: "Syntax"; message: string; ctx: Context; code: number }
   | { type: "Property"; property: VLType; ctx: Context; code: number };
 
 const errors: ParseErrors[] = [];
 
+/** Implicit return types */
 const returnTypes: VLType[] = [];
+/**
+ * Expected implicit return type (used for value returning expressions, such as
+ * the last statement of a block or binary operations)
+ */
 let desiredType: VLType | undefined = undefined;
+/** Expected return type (used for return statements in a function) */
+let returnType: VLType | undefined;
 
 const _typeFromExpression = (
   expr: VLExpression,
@@ -279,7 +286,7 @@ const _typeFromExpression = (
       const leftType = typeFromExpression(expr.left, ctx);
       const rightType = typeFromExpression(expr.right, ctx);
       const op = expr.operator;
-      const missingOpFunc = (): VLType => {
+      const missingOpFunc = (variant: string): VLType => {
         errors.push({
           type: "Type",
           left: {
@@ -299,18 +306,20 @@ const _typeFromExpression = (
           },
           right: leftType,
           ctx,
-          code: "binary-op",
+          code: `binary-op-${variant}`,
         });
         return { type: "Never" };
       };
-      if (leftType.type !== "Object") return missingOpFunc();
+      if (leftType.type !== "Object") return missingOpFunc("left-not-object");
       const opFunc = leftType.properties.find((p) =>
-        p.name.type === "StringLiteral" && p.name.value === op
+        validateType(p.name, { type: "StringLiteral", value: op })
       )?.type;
-      if (!opFunc || opFunc.type !== "Function") return missingOpFunc();
+      if (!opFunc || opFunc.type !== "Function") {
+        return missingOpFunc("no-operator-function");
+      }
       const param = opFunc.paramaters[0]?.paramaterType;
-      if (!param) return missingOpFunc();
-      if (!validateType(param, rightType, ctx)) return { type: "Never" };
+      if (!param) return missingOpFunc("bad-operator-function");
+      if (!ensureType(param, rightType, ctx)) return { type: "Never" };
       return opFunc.return;
     }
     case "Block":
@@ -331,12 +340,10 @@ const _typeFromExpression = (
     case "IndexAccess": {
       const objType = typeFromExpression(expr.array, ctx);
       if (objType.type !== "Object") return { type: "Never" };
-      const oldErrors = errors.splice(0, Infinity);
       const propType = typeFromExpression(expr.index, ctx);
       const property = objType.properties.find((p) =>
-        validateType(p.name, propType, null as unknown as Context)
+        validateType(p.name, propType)
       );
-      errors.splice(0, Infinity, ...oldErrors);
       if (!property) return { type: "Never" };
       return property.type;
     }
@@ -378,15 +385,13 @@ const _typeFromExpression = (
       let objType = typeFromExpression(expr.object, ctx);
       if (objType.type === "Infer") objType = objType.subType;
       if (objType.type !== "Object") return { type: "Never" };
-      const oldErrors = errors.splice(0, Infinity);
       const propType: VLStringLiteralNode = {
         type: "StringLiteral",
         value: expr.property,
       };
       const property = objType.properties.find((p) =>
-        validateType(p.name, propType, null as unknown as Context)
+        validateType(p.name, propType)
       );
-      errors.splice(0, Infinity, ...oldErrors);
       if (!property) return { type: "Never" };
       return property.type;
     }
@@ -437,7 +442,16 @@ const typeFromExpression = (
 ): VLType => {
   const memoized = typeFromExpressionMemory.get(expr);
   if (memoized) return memoized;
-  const type = _typeFromExpression(expr, ctx);
+  let type = _typeFromExpression(expr, ctx);
+  while (type.type === "Alias") {
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if ((type as VLAliasType).name in scopes[i]) {
+        type = scopes[i][(type as VLAliasType).name];
+        continue;
+      }
+    }
+    break;
+  }
   typeFromExpressionMemory.set(expr, type);
   return type;
 };
@@ -447,7 +461,7 @@ export const vlType = (expr: VLExpression) => {
   throw new Error("Expected expression's type to have been memoized");
 };
 
-const softenImplicitType = (type: VLType): VLType => {
+const _softenImplicitType = (type: VLType): VLType => {
   if (type.type === "IntegerLiteral") return { type: "Alias", name: "i32" };
   if (type.type === "RealLiteral") return { type: "Alias", name: "f64" };
   if (type.type === "StringLiteral") return { type: "Alias", name: "string" };
@@ -498,30 +512,16 @@ const softenImplicitType = (type: VLType): VLType => {
       return next;
     });
     const subTypes: VLType[] = [softenedSubTypes[0]];
-    const oldErrors = errors.splice(0, Infinity);
     outer: for (let i = 1; i < softenedSubTypes.length; i++) {
       for (let n = 0; n < subTypes.length; n++) {
-        if (
-          validateType(
-            subTypes[n],
-            softenedSubTypes[i],
-            null as unknown as Context,
-          )
-        ) continue outer;
-        if (
-          validateType(
-            softenedSubTypes[i],
-            subTypes[n],
-            null as unknown as Context,
-          )
-        ) {
+        if (validateType(subTypes[n], softenedSubTypes[i])) continue outer;
+        if (validateType(softenedSubTypes[i], subTypes[n])) {
           subTypes.splice(n, 1, softenedSubTypes[i]);
           continue outer;
         }
       }
       subTypes.push(softenedSubTypes[i]);
     }
-    errors.splice(0, Infinity, ...oldErrors);
     if (subTypes.length !== type.subTypes.length || softenedSubType) {
       // if (subTypes.length === 0) Unknown? Never? Never breaks array...
       if (subTypes.length === 1) return subTypes[0];
@@ -537,6 +537,9 @@ const softenImplicitType = (type: VLType): VLType => {
   const exhaustive: never = type;
   throw new Error(`Unhandled soften type: ${exhaustive}`);
 };
+
+export const softenImplicitType = (type: VLType): VLType =>
+  getConcreteType(_softenImplicitType(type), undefined);
 
 const typeFromStatement = (
   stmt: VLStatement,
@@ -581,7 +584,7 @@ const toVariableDeclaration = (ctx: VarDeclContext) => {
     const valueType = typeFromExpression(node.value, ctx);
     if (!type) {
       node.variableType = softenImplicitType(valueType);
-    } else validateType(node.variableType, valueType, expr);
+    } else ensureType(node.variableType, valueType, expr);
   }
   if (node.name in scopes[scopes.length - 1]) {
     errors.push({ type: "Redeclaration", name: node.name, ctx, code: 0 });
@@ -615,30 +618,16 @@ const flattenType = (type: VLType): VLType => {
   if (flattened.length === 1 && flattened[0] === type) return type;
 
   const deduped: VLType[] = [flattened[0]];
-  const oldErrors = errors.splice(0, Infinity);
   outer: for (let i = 1; i < flattened.length; i++) {
     for (let n = 0; n < deduped.length; n++) {
-      if (
-        validateType(
-          deduped[n],
-          flattened[i],
-          null as unknown as Context,
-        )
-      ) continue outer;
-      if (
-        validateType(
-          flattened[i],
-          deduped[n],
-          null as unknown as Context,
-        )
-      ) {
+      if (validateType(deduped[n], flattened[i])) continue outer;
+      if (validateType(flattened[i], deduped[n])) {
         deduped.splice(n, 1, flattened[i]);
         continue outer;
       }
     }
     deduped.push(flattened[i]);
   }
-  errors.splice(0, Infinity, ...oldErrors);
 
   if (deduped.length === 1) return deduped[0];
 
@@ -669,11 +658,7 @@ export const getConcreteType = (
   ctx: Context | undefined,
 ): VLType => {
   if (type.type !== "Alias") return type; // TODO: Should handle recursiveness (objects, params, etc)
-  if (
-    type.name === "null" || type.name === "string" || type.name === "boolean"
-  ) {
-    return type; // TODO: remove these and make them object types
-  }
+  if (type.name === "null" || type.name === "string") return type; // TODO: remove string and make it an object type
 
   for (let i = scopes.length - 1; i >= 0; i--) {
     if (type.name in scopes[i]) {
@@ -699,10 +684,8 @@ const toType = (ctx: TypeContext): VLType => {
     if (id) {
       const name = id.getText();
       // return getConcreteType()
-      // TODO: kill these; all types should ultimately resolve to something concrete
-      if (name === "string" || name === "boolean") {
-        return { type: "Alias", name };
-      }
+      // TODO: kill this; all types should ultimately resolve to something concrete
+      if (name === "string") return { type: "Alias", name };
 
       for (let i = scopes.length - 1; i >= 0; i--) {
         if (name in scopes[i]) {
@@ -829,22 +812,25 @@ const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
   let node: VLFunctionDeclarationNode;
   try {
     const returnTypeExpr = ctx.type_();
-    let returnType: VLType | undefined = returnTypeExpr
+    let functionReturnType: VLType | undefined = returnTypeExpr
       ? toType(returnTypeExpr)
       : undefined;
 
     const oldReturnTypes = returnTypes.splice(0, Infinity);
     const oldDesiredType = desiredType;
-    desiredType = returnTypeExpr ? returnType : undefined;
+    desiredType = returnTypeExpr ? functionReturnType : undefined;
+    const oldReturnType = returnType;
+    returnType = functionReturnType;
     const body = toStatement(ctx.statement()) ??
       { type: "Return", value: undefined };
     const bodyType = typeFromStatement(body, ctx);
     const subTypes = returnTypes.splice(0, Infinity, ...oldReturnTypes);
     desiredType = oldDesiredType;
-    if (!returnType) {
+    returnType = oldReturnType;
+    if (!functionReturnType) {
       if (bodyType.type !== "Never") subTypes.push(bodyType);
-      returnType = softenImplicitType({ type: "Union", subTypes });
-    } else returnType = { type: "Alias", name: "null" };
+      functionReturnType = softenImplicitType({ type: "Union", subTypes });
+    }
 
     for (const param of parameters) {
       // Should be recursive
@@ -860,7 +846,7 @@ const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
       name,
       parameters,
       body,
-      returnType,
+      returnType: functionReturnType,
     };
 
     scopes.pop();
@@ -917,7 +903,6 @@ const getType = (name: string, ctx: Context): VLType => {
   for (let i = scopes.length - 1; i >= 0; i--) {
     if (name in scopes[i]) return scopes[i][name];
   }
-  console.log(scopes);
   errors.push({ type: "Undeclared", name, ctx, code: "undeclared-type" });
   return { type: "Unknown" };
 };
@@ -950,15 +935,11 @@ const getChildType = (
     return;
   }
 
-  const oldErrors = errors.splice(0, Infinity);
   let propertyType = object.properties.find((p) =>
-    validateType(p.name, property, propertyCtx)
-    // && (p.type.type !== "Union" || p.type.subTypes.length > 0)
+    validateType(p.name, property)
   );
-  errors.splice(0, Infinity, ...oldErrors);
   if (!propertyType) {
     if (infer) {
-      console.log("adding infer property");
       propertyType = {
         name: property,
         type: { type: "Infer", subType: { type: "Unknown" } },
@@ -994,7 +975,8 @@ const nonNullable = (type: VLType): VLType => {
   return type;
 };
 
-const validateType = (
+/** Registers diagnostics automatically */
+const ensureType = (
   left: VLType,
   right: VLType,
   ctx: Context,
@@ -1035,6 +1017,13 @@ const validateType = (
     return false;
   }
 
+  if (right.type === "Union") {
+    if (!right.subTypes.every((s) => validateType(left, s))) {
+      return pushError("union");
+    }
+    return true;
+  }
+
   switch (left.type) {
     // Unknown is inferrable
     case "Unknown": {
@@ -1045,34 +1034,10 @@ const validateType = (
     }
     case "Alias":
       // TODO: this should be inverted for safety...
-      // if (left.name === "number") {
-      //   if (right.type === "Alias") {
-      //     if (right.name !== "number") return pushError(6);
-      //   } else if (right.type === "Union") {
-      //     const oldErrors = errors.splice(0, Infinity);
-      //     const valid = right.subTypes.some((t) => validateType(left, t, ctx));
-      //     errors.splice(0, Infinity, ...oldErrors);
-      //     if (!valid) return pushError("union-not-number");
-      //   } else if (right.type !== "NumberLiteral") return pushError(12);
-      // } else
       if (left.name === "string") {
         if (right.type === "Alias") {
           if (right.name !== "string") return pushError(13);
-        } else if (right.type === "Union") {
-          const oldErrors = errors.splice(0, Infinity);
-          const valid = right.subTypes.some((t) => validateType(left, t, ctx));
-          errors.splice(0, Infinity, ...oldErrors);
-          if (!valid) return pushError("union-not-string");
         } else if (right.type !== "StringLiteral") return pushError(14);
-      } else if (left.name === "boolean") {
-        if (right.type === "Alias") {
-          if (right.name !== "boolean") return pushError(15);
-        } else if (right.type === "Union") {
-          const oldErrors = errors.splice(0, Infinity);
-          const valid = right.subTypes.some((t) => validateType(left, t, ctx));
-          errors.splice(0, Infinity, ...oldErrors);
-          if (!valid) return pushError("union-not-boolean");
-        } else if (right.type !== "BooleanLiteral") return pushError(16);
       } else if (left.name === "null") {
         if (
           (right.type !== "Alias" || right.name !== "null") &&
@@ -1090,13 +1055,13 @@ const validateType = (
         }
         // We should be showing an error on the type itself
         if (!type) return false;
-        if (type.type === "Type") return validateType(type.subType, right, ctx);
-        return validateType(type, right, ctx);
+        if (type.type === "Type") return ensureType(type.subType, right, ctx);
+        return ensureType(type, right, ctx);
       }
       return true;
     case "Function":
       if (right.type !== "Function") return pushError(18);
-      if (!validateType(left.return, right.return, ctx)) return false;
+      if (!ensureType(left.return, right.return, ctx)) return false;
       // Could maybe allow right to have extra parameters so long as they are nullable
       if (left.paramaters.length !== right.paramaters.length) {
         return pushError("different-parameters-length");
@@ -1108,18 +1073,14 @@ const validateType = (
         if (left.paramaters[i].name !== right.paramaters[i].name) {
           return pushError("different-parameter-names");
         }
-        const oldErrors = errors.splice(0, Infinity);
         if (
           !validateType(
             right.paramaters[i].paramaterType,
             left.paramaters[i].paramaterType,
-            ctx,
           )
         ) {
-          errors.splice(0, Infinity, ...oldErrors);
           return pushError("different-typed-parameters");
         }
-        errors.splice(0, Infinity, ...oldErrors);
       }
       return true;
       // Technically we should an integer literal outside the i32 range as an exception, same as f32/f64
@@ -1143,13 +1104,13 @@ const validateType = (
       return true;
     case "Object": {
       const assignmentProp = left.properties.find((p) =>
-        p.name.type === "StringLiteral" && p.name.value === "="
+        validateType(p.name, { type: "StringLiteral", value: "=" })
       )?.type;
       if (
         assignmentProp && assignmentProp.type === "Function" &&
         assignmentProp.paramaters.length > 0
       ) {
-        return validateType(
+        return ensureType(
           assignmentProp.paramaters[0].paramaterType,
           right,
           ctx,
@@ -1165,20 +1126,17 @@ const validateType = (
           lprop.name.type === "IntegerLiteral"
         ) {
           for (const rprop of right.properties) {
-            const oldErrors = errors.splice(0, Infinity);
-            if (validateType(lprop.name, rprop.name, ctx)) {
+            if (validateType(lprop.name, rprop.name)) {
               if (
                 (rprop.type.type === "Union" &&
                   rprop.type.subTypes.length === 0) ||
-                validateType(lprop.type, rprop.type, ctx)
+                validateType(lprop.type, rprop.type)
               ) {
                 rprops.delete(rprop);
-                errors.splice(0, Infinity, ...oldErrors);
                 continue outer;
               }
-              errors.splice(0, Infinity, ...oldErrors);
               return false;
-            } else errors.splice(0, Infinity, ...oldErrors);
+            }
           }
           return pushError("missing-prop");
         } else {
@@ -1190,10 +1148,7 @@ const validateType = (
         if (!indexProperties) return pushError(31);
         outer: for (const rprop of rprops.values()) {
           for (const lprop of indexProperties) {
-            const oldErrors = [...errors];
-            if (validateType(lprop.name, rprop.name, ctx)) {
-              continue outer;
-            } else errors.splice(0, Infinity, ...oldErrors);
+            if (validateType(lprop.name, rprop.name)) continue outer;
           }
           return pushError("extra-prop");
         }
@@ -1208,23 +1163,16 @@ const validateType = (
           nonNullableRight.name === "null") ||
         nonNullableRight.type === "Never"
       ) return true;
-      console.log("nonNullableRight", nonNullableRight);
-      const oldErrors = errors.splice(0, Infinity);
-      const ret = validateType(nonNullableLeft, nonNullableRight, ctx);
-      errors.splice(0, Infinity, ...oldErrors);
-      if (!ret) return pushError(27);
+      if (!validateType(nonNullableLeft, nonNullableRight)) {
+        return pushError(27);
+      }
       return true;
     }
     case "Union": {
-      const oldErrors = errors.splice(0, Infinity);
       for (const subType of left.subTypes) {
-        const valid = validateType(subType, right, ctx);
-        if (valid) {
-          errors.splice(0, Infinity, ...oldErrors);
-          return true;
-        }
+        const valid = validateType(subType, right);
+        if (valid) return true;
       }
-      errors.splice(0, Infinity, ...oldErrors);
       return pushError(28);
     }
     // case "Never":
@@ -1232,10 +1180,9 @@ const validateType = (
     //   return true;
     case "Type":
       if (right.type !== "Type") return pushError(30);
-      return validateType(left, right, ctx);
+      return ensureType(left, right, ctx);
     case "Infer": {
-      const oldErrors = errors.splice(0, Infinity);
-      if (!validateType(left.subType, right, ctx)) {
+      if (!validateType(left.subType, right)) {
         if (left.subType.type === "Unknown") updateType(left.subType, right);
         else if (left.subType.type === "Union") {
           left.subType.subTypes.push(softenImplicitType(right));
@@ -1246,7 +1193,6 @@ const validateType = (
           };
         }
       }
-      errors.splice(0, Infinity, ...oldErrors);
       return true;
     }
     case "Custom":
@@ -1258,6 +1204,93 @@ const validateType = (
       return false;
     }
   }
+};
+
+/** Does not register diangostics */
+export const validateType = (left: VLType, right: VLType): boolean => {
+  const oldErrors = errors.splice(0, Infinity);
+  const ret = ensureType(left, right, null as unknown as Context);
+  errors.splice(0, Infinity, ...oldErrors);
+  return ret;
+};
+
+const ensureParameters = (
+  parameters: VLParameterNode[],
+  args: VLArgumentNode[],
+  ctx: Context,
+) => {
+  let pass = false;
+  const params = [...parameters];
+
+  // First consume named parameters
+  for (let i = 0; i < args.length; i++) {
+    // const [arg, ctx] = args2[i];
+    if (args[i].name) {
+      const paramIndex = params.findIndex((p) => p.name === args[i].name);
+      const argType = typeFromExpression(args[i].value, args[i].context);
+      if (paramIndex === -1) {
+        errors.push({ type: "UnmatchedParameter", ctx, code: 8 });
+        pass = false;
+      } else if (
+        ensureType(
+          params[paramIndex].paramaterType,
+          argType,
+          ctx,
+        )
+        // validateType(
+        //   argType,
+        //   params[paramIndex].paramaterType,
+        //   ctx,
+        // )
+      ) {
+        params.splice(paramIndex, 1);
+        args.splice(i, 1);
+        i--;
+      }
+    }
+  }
+
+  // Then consume positional ones
+  while (args.length) {
+    // const [arg, ctx] = args[0];
+
+    if (!params.length) {
+      errors.push({
+        type: "UnmatchedParameter",
+        ctx: args[0].context,
+        code: 9,
+      });
+      pass = false;
+      break;
+    } else {
+      const argType = typeFromExpression(args[0].value, ctx);
+      ensureType(params[0].paramaterType, argType, ctx);
+      // validateType(argType, params[0].paramaterType, ctx);
+      params.splice(0, 1);
+      args.splice(0, 1);
+    }
+  }
+
+  const unmatchedParams = params.filter((p) =>
+    p.paramaterType.type !== "Nullable"
+  );
+  if (unmatchedParams.length) {
+    // TODO: indicate how many?
+    errors.push({ type: "UnmatchedParameter", ctx, code: 10 });
+    pass = false;
+  }
+
+  return pass;
+};
+
+export const validateParameters = (
+  params: VLParameterNode[],
+  args: VLArgumentNode[],
+) => {
+  const oldErrors = errors.splice(0, Infinity);
+  const ret = ensureParameters(params, args, null as unknown as Context);
+  errors.splice(0, Infinity, ...oldErrors);
+  return ret;
 };
 
 const toExpression = (ctx: ExprContext): VLExpression => {
@@ -1310,19 +1343,18 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     if (block) {
       scopes.push({});
       try {
+        const oldDesiredType = desiredType;
+        desiredType = undefined;
         const statements = block.blockStatement_list()
           .map((b) => b.statement())
           .filter(Boolean)
           .map((s): [StatementContext, VLStatement] => [s, toStatement(s)]);
+        desiredType = oldDesiredType;
         if (statements.length > 0 && desiredType) {
           const [ctx, stmt] = statements[statements.length - 1];
-          const oldErrors = errors.splice(0, Infinity);
-          if (
-            !validateType(desiredType, { type: "Alias", name: "null" }, ctx)
-          ) {
-            errors.splice(0, Infinity, ...oldErrors);
-            validateType(desiredType, typeFromStatement(stmt, ctx), ctx);
-          } else errors.splice(0, Infinity, ...oldErrors);
+          if (!validateType(desiredType, { type: "Alias", name: "null" })) {
+            ensureType(desiredType, typeFromStatement(stmt, ctx), ctx);
+          }
         }
         return {
           type: "Block",
@@ -1374,7 +1406,11 @@ const toExpression = (ctx: ExprContext): VLExpression => {
   if (ctx.NULL()) return { type: "NullLiteral" };
 
   {
-    const op = ctx.binaryOp();
+    const op = ctx.CARET() ?? ctx.STAR() ?? ctx.DIV() ?? ctx.MOD() ??
+      ctx.PLUS() ?? ctx.MINUS() ?? ctx.GREATER_THAN() ??
+      ctx.GREATER_THAN_OR_EQUAL_TO() ?? ctx.LESS_THAN() ??
+      ctx.LESS_THAN_OR_EQUAL_TO() ?? ctx.EQUAL_TO() ?? ctx.NOT_EQUAL_TO() ??
+      ctx.AND() ?? ctx.OR();
     if (op) {
       return {
         type: "BinaryOperation",
@@ -1394,10 +1430,11 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       const funcCall: VLFunctionCallNode = {
         type: "FunctionCall",
         function: name,
-        arguments: args.map((a): VLArgumentNode => ({
+        arguments: args.map((arg): VLArgumentNode => ({
           type: "Argument",
-          name: a.ID()?.getText(),
-          value: toExpression(a.expr()),
+          name: arg.ID()?.getText(),
+          value: toExpression(arg.expr()),
+          context: arg,
         })),
         functionType: undefined,
       };
@@ -1413,64 +1450,11 @@ const toExpression = (ctx: ExprContext): VLExpression => {
               return: { type: "Unknown" },
             },
             right: t,
-            ctx: id,
-            code: 7,
+            ctx,
+            code: "function-call",
           });
         } else {
-          const args2 = funcCall.arguments.map((
-            a,
-            i,
-          ): [VLArgumentNode, ArgContext] => [a, args[i]]);
-          const params = [...t.paramaters];
-          // First consume named parameters
-          for (let i = 0; i < args2.length; i++) {
-            const [arg, ctx] = args2[i];
-            if (arg.name) {
-              const paramIndex = params.findIndex((p) => p.name === arg.name);
-              const argType = typeFromExpression(arg.value, ctx);
-              if (paramIndex === -1) {
-                errors.push({ type: "UnmatchedParameter", ctx, code: 8 });
-              } else if (
-                validateType(
-                  params[paramIndex].paramaterType,
-                  argType,
-                  ctx,
-                )
-                // validateType(
-                //   argType,
-                //   params[paramIndex].paramaterType,
-                //   ctx,
-                // )
-              ) {
-                params.splice(paramIndex, 1);
-                args2.splice(i, 1);
-                i--;
-              }
-            }
-          }
-          // Then consume positional ones
-          while (args2.length) {
-            const [arg, ctx] = args2[0];
-
-            if (!params.length) {
-              errors.push({ type: "UnmatchedParameter", ctx, code: 9 });
-              break;
-            } else {
-              const argType = typeFromExpression(arg.value, ctx);
-              validateType(params[0].paramaterType, argType, ctx);
-              // validateType(argType, params[0].paramaterType, ctx);
-              params.splice(0, 1);
-              args2.splice(0, 1);
-            }
-          }
-          const unmatchedParams = params.filter((p) =>
-            p.paramaterType.type !== "Nullable"
-          );
-          if (unmatchedParams.length) {
-            // TODO: indicate how many?
-            errors.push({ type: "UnmatchedParameter", ctx, code: 10 });
-          }
-
+          ensureParameters(t.paramaters, funcCall.arguments, ctx);
           funcCall.functionType = t;
         }
       }
@@ -1486,11 +1470,6 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     if (ifCtx) {
       const conditionCtx = ifCtx.expr();
       const condition = toExpression(conditionCtx);
-      validateType(
-        { type: "Nullable", subType: { type: "Alias", name: "boolean" } },
-        typeFromExpression(condition, conditionCtx),
-        conditionCtx,
-      );
       const elseCtx = ifCtx.else_();
       return {
         type: "If",
@@ -1530,7 +1509,7 @@ const toAssignment = (ctx: ExprContext): VLBinaryOperationNode => {
     const rightCtx = ctx.expr(1);
     const right = toExpression(rightCtx);
     const rightType = typeFromExpression(right, rightCtx);
-    if (childType) validateType(childType, rightType, rightCtx);
+    if (childType) ensureType(childType, rightType, rightCtx);
     return {
       type: "BinaryOperation",
       left: { type: "PropertyAccess", object, property },
@@ -1557,7 +1536,7 @@ const toAssignment = (ctx: ExprContext): VLBinaryOperationNode => {
     if (childType) {
       if (childType.type === "Union" && childType.subTypes.length === 0) {
         updateType(childType, rightType);
-      } else validateType(childType, rightType, rightCtx);
+      } else ensureType(childType, rightType, rightCtx);
       if (childType.type === "Infer") {
         updateType(childType, makeExact(childType));
       }
@@ -1576,7 +1555,7 @@ const toAssignment = (ctx: ExprContext): VLBinaryOperationNode => {
   const rightExpr = ctx.expr(0);
   const right = toExpression(rightExpr);
   const rightType = typeFromExpression(right, rightExpr);
-  validateType(knownType, rightType, rightExpr);
+  ensureType(knownType, rightType, rightExpr);
   if (knownType.type === "Infer") updateType(knownType, makeExact(knownType));
   return {
     type: "BinaryOperation",
@@ -1618,7 +1597,7 @@ const toStatement = (ctx: StatementContext): VLStatement => {
       const value = expr ? toExpression(expr) : undefined;
       const type = value ? typeFromExpression(value, ctx) : undefined;
       if (type) {
-        if (desiredType) validateType(desiredType, type, ctx);
+        if (desiredType) ensureType(desiredType, type, ctx);
         returnTypes.push(type);
       }
       return { type: "Return", value: expr ? toExpression(expr) : undefined };
@@ -1643,7 +1622,7 @@ const toStatement = (ctx: StatementContext): VLStatement => {
     if (whileStatement) {
       const conditionCtx = whileStatement.expr();
       const condition = toExpression(conditionCtx);
-      validateType(
+      ensureType(
         { type: "Nullable", subType: { type: "Alias", name: "boolean" } },
         typeFromExpression(condition, conditionCtx),
         conditionCtx,
@@ -1665,12 +1644,12 @@ const toStatement = (ctx: StatementContext): VLStatement => {
       const fromCtx = forStatement.expr(0);
       const from = toExpression(fromCtx);
       const fromType = typeFromExpression(from, fromCtx);
-      validateType({ type: "Alias", name: "i32" }, fromType, fromCtx);
+      ensureType({ type: "Alias", name: "i32" }, fromType, fromCtx);
 
       const toCtx = forStatement.expr(1);
       const to = toExpression(toCtx);
       const toType = typeFromExpression(to, toCtx);
-      validateType(
+      ensureType(
         { type: "Alias", name: "i32" },
         toType,
         toCtx,
@@ -1686,7 +1665,7 @@ const toStatement = (ctx: StatementContext): VLStatement => {
       try {
         if (stepCtx) {
           step = toExpression(stepCtx);
-          validateType(
+          ensureType(
             { type: "Alias", name: "i32" },
             typeFromExpression(step, stepCtx ?? forStatement),
             stepCtx ?? forStatement,

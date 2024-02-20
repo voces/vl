@@ -1,27 +1,41 @@
-import {
-  getConcreteType,
-  Scope,
-  VLObjectType,
-  VLType,
-  withScope,
-} from "./toAST.ts";
+import { Scope, VLObjectType, VLType, withScope } from "./toAST.ts";
 
 const symmetricOps = (
   name: string,
   paramaterType: VLType,
 ): VLObjectType["properties"] => [{
-  name: { type: "StringLiteral", value: "=" },
+  name: {
+    type: "Union",
+    subTypes: [
+      { type: "StringLiteral", value: "-" },
+      { type: "StringLiteral", value: "*" },
+      { type: "StringLiteral", value: "/" },
+      { type: "StringLiteral", value: "%" },
+      { type: "StringLiteral", value: "+" },
+      { type: "StringLiteral", value: "=" },
+    ],
+  },
   type: {
     type: "Function",
     paramaters: [{ type: "Parameter", name: "right", paramaterType }],
     return: { type: "Alias", name },
   },
 }, {
-  name: { type: "StringLiteral", value: "+" },
+  name: {
+    type: "Union",
+    subTypes: [
+      { type: "StringLiteral", value: "!=" },
+      { type: "StringLiteral", value: "<" },
+      { type: "StringLiteral", value: "<=" },
+      { type: "StringLiteral", value: "==" },
+      { type: "StringLiteral", value: ">" },
+      { type: "StringLiteral", value: ">=" },
+    ],
+  },
   type: {
     type: "Function",
     paramaters: [{ type: "Parameter", name: "right", paramaterType }],
-    return: { type: "Alias", name },
+    return: { type: "Alias", name: "boolean" },
   },
 }];
 
@@ -32,7 +46,9 @@ export const defaultScope = () => {
       properties: symmetricOps("i32", {
         type: "Custom",
         validate: Object.assign(
-          (right: VLType) => right.type === "IntegerLiteral",
+          (right: VLType) =>
+            // TODO: should use union type?
+            right === scope.i32 || right.type === "IntegerLiteral",
           { toString: () => "i32" },
         ),
         name: "i32",
@@ -46,7 +62,8 @@ export const defaultScope = () => {
         subTypes: [{ type: "Alias", name: "i32" }, {
           type: "Custom",
           validate: Object.assign(
-            (right: VLType) => right.type === "IntegerLiteral",
+            (right: VLType) =>
+              right === scope.i64 || right.type === "IntegerLiteral",
             { toString: () => "i64" },
           ),
           name: "i64",
@@ -60,6 +77,7 @@ export const defaultScope = () => {
         type: "Custom",
         validate: Object.assign(
           (right: VLType) =>
+            right === scope.f32 ||
             right.type === "IntegerLiteral" ||
             right.type === "RealLiteral",
           { toString: () => "f32" },
@@ -79,6 +97,7 @@ export const defaultScope = () => {
             type: "Custom",
             validate: Object.assign(
               (right: VLType) =>
+                right === scope.f64 ||
                 right.type === "IntegerLiteral" ||
                 right.type === "RealLiteral",
               { toString: () => "f64" },
@@ -90,20 +109,43 @@ export const defaultScope = () => {
       name: "f64",
     },
     // string: { type: "Type", subType: { type: "Object", properties: [] } },
-    // boolean: { type: "Type", subType: { type: "Object", properties: [] } },
+    boolean: {
+      type: "Object",
+      properties: [{
+        name: {
+          type: "Union",
+          subTypes: [
+            { type: "StringLiteral", value: "!=" },
+            { type: "StringLiteral", value: "&&" },
+            { type: "StringLiteral", value: "=" },
+            { type: "StringLiteral", value: "==" },
+            { type: "StringLiteral", value: "||" },
+          ],
+        },
+        type: {
+          type: "Function",
+          paramaters: [{
+            type: "Parameter",
+            name: "right",
+            paramaterType: {
+              type: "Custom",
+              validate: Object.assign(
+                (right: VLType) =>
+                  right === scope.boolean ||
+                  right.type === "BooleanLiteral" ||
+                  (right.type === "Alias" && right.name === "boolean"),
+                { toString: () => "boolean" },
+              ),
+            },
+          }],
+          return: { type: "Alias", name: "boolean" },
+        },
+      }],
+      name: "boolean",
+    },
   };
 
   withScope(scope, () => {
-    scope.__allocate__ = {
-      type: "Function",
-      paramaters: [{
-        type: "Parameter",
-        name: "address",
-        paramaterType: { type: "Alias", name: "i32" },
-      }],
-      return: getConcreteType({ type: "Alias", name: "i32" }, undefined),
-    };
-
     scope.__store_i32__ = {
       type: "Function",
       paramaters: [{
@@ -116,6 +158,16 @@ export const defaultScope = () => {
         paramaterType: { type: "Alias", name: "i32" },
       }],
       return: { type: "Alias", name: "null" },
+    };
+
+    scope.__load_i32__ = {
+      type: "Function",
+      paramaters: [{
+        type: "Parameter",
+        name: "address",
+        paramaterType: { type: "Alias", name: "i32" },
+      }],
+      return: { type: "Alias", name: "i32" },
     };
 
     scope.__store_i64__ = {
@@ -158,6 +210,23 @@ export const defaultScope = () => {
         paramaterType: { type: "Alias", name: "f64" },
       }],
       return: { type: "Alias", name: "null" },
+    };
+
+    scope.__memory_grow__ = {
+      type: "Function",
+      paramaters: [{
+        type: "Parameter",
+        name: "pages",
+        paramaterType: { type: "Alias", name: "i32" },
+      }],
+      return: {
+        // TODO: Should instead return null and be throwable
+        type: "Union",
+        subTypes: [
+          { type: "IntegerLiteral", value: 0, text: "0" },
+          { type: "IntegerLiteral", value: 1, text: "1" },
+        ],
+      },
     };
 
     scope.log = {

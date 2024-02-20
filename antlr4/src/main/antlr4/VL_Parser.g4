@@ -68,7 +68,13 @@ expr
     | block
     | array
     | if
-    | expr NEWLINE* binaryOp NEWLINE* expr
+    | expr NEWLINE* CARET NEWLINE* expr
+    | expr NEWLINE* (STAR | DIV | MOD) NEWLINE* expr
+    | expr NEWLINE* (PLUS | MINUS) NEWLINE* expr
+    | expr NEWLINE* (GREATER_THAN | GREATER_THAN_OR_EQUAL_TO | LESS_THAN | LESS_THAN_OR_EQUAL_TO) NEWLINE* expr
+    | expr NEWLINE* (EQUAL_TO | NOT_EQUAL_TO) NEWLINE* expr
+    | expr NEWLINE* AND NEWLINE* expr
+    | expr NEWLINE* OR NEWLINE* expr
     | ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     | expr NEWLINE* DOT ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     | expr LBRACK NEWLINE* expr NEWLINE* RBRACK NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
@@ -110,10 +116,6 @@ params : param (NEWLINE* COMMA NEWLINE* param)* ;
 param  : ID (COLON NEWLINE* type)? ;
 args   : arg (NEWLINE* COMMA NEWLINE* arg)* ;
 arg    : (ID COLON NEWLINE*)? expr;
-
-binaryOp
-    : PLUS | MINUS | STAR | DIV | MOD | CARET | AND | OR | GREATER_THAN | GREATER_THAN_OR_EQUAL_TO | LESS_THAN | LESS_THAN_OR_EQUAL_TO | EQUAL_TO
-    ;
 
 prefixOp
     : NOT
