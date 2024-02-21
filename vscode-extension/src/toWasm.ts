@@ -55,9 +55,13 @@ export const toWasm = async (ast: VLProgramNode) => {
   m.addFunction(
     "__load_i32__",
     binaryen.createType([binaryen.i32, binaryen.i32]),
-    binaryen.none,
+    binaryen.i32,
     [],
-    m.block(null, [m.i32.load(0, 4, m.local.get(0, binaryen.i32))]),
+    m.block(
+      null,
+      [m.i32.load(0, 4, m.local.get(0, binaryen.i32))],
+      binaryen.i32,
+    ),
   );
 
   m.addFunction(
@@ -233,8 +237,17 @@ export const toWasm = async (ast: VLProgramNode) => {
                 declaration.parameters.map((p) => toWasmType(p.paramaterType)),
               ),
               toWasmType(declaration.returnType),
-              [],
-              m.block(null, []), // TODO
+              [], // TODO: calc vars
+              withScope(
+                Object.fromEntries(
+                  declaration.parameters.map((p) => [p.name, p.paramaterType]),
+                ),
+                () =>
+                  withDesiredType(
+                    declaration.returnType,
+                    () => toExpression(declaration.body),
+                  ),
+              ),
             );
           }
         }
@@ -288,6 +301,12 @@ export const toWasm = async (ast: VLProgramNode) => {
               ? "add"
               : op === "-"
               ? "sub"
+              : op === "/"
+              ? "div_s"
+              : op === ">"
+              ? "gt_s"
+              : op === "%"
+              ? "rem_s"
               : raise(`binop ${op} not handled`)
           ](
             toExpression(node.left),
@@ -296,6 +315,31 @@ export const toWasm = async (ast: VLProgramNode) => {
         }
         throw new Error("Have only handled addition for i32");
       }
+      case "Block":
+        return m.block(
+          null,
+          withDesiredType(undefined, () => node.statements.map(toExpression)),
+          desiredType ? toWasmType(desiredType) : undefined,
+        );
+      case "If":
+        return m.if(
+          withDesiredType(
+            { type: "Alias", name: "boolean" },
+            () => toExpression(node.conditionals[0].condition),
+          ),
+          toExpression(node.conditionals[0].statement),
+          node.conditionals.length > 1
+            ? toExpression({
+              ...node,
+              conditionals: node.conditionals.slice(1),
+            })
+            : node.else
+            ? toExpression(node.else)
+            : undefined,
+        );
+      case "Return":
+        // TODO: need returnType in global scope
+        return m.return(node.value ? toExpression(node.value) : undefined);
       default:
         throw new Error(`Unhandled AST -> WASM "${node.type}" expression`);
     }
@@ -324,7 +368,8 @@ export const toWasm = async (ast: VLProgramNode) => {
   // console.log(inspect(ast, { depth: Infinity }));
   m.setStart(toExpression(ast));
 
-  // console.log(m.emitText());
+  console.log(m.emitText());
+  if (!m.validate()) throw new Error("validation error");
   m.optimize();
   console.log(m.emitText());
   if (!m.validate()) throw new Error("validation error");

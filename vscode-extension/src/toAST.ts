@@ -458,6 +458,7 @@ const typeFromExpression = (
 export const vlType = (expr: VLExpression) => {
   const memoized = typeFromExpressionMemory.get(expr);
   if (memoized) return memoized;
+  console.log(expr);
   throw new Error("Expected expression's type to have been memoized");
 };
 
@@ -1221,13 +1222,14 @@ const ensureParameters = (
 ) => {
   let pass = false;
   const params = [...parameters];
+  const args2 = [...args];
 
   // First consume named parameters
-  for (let i = 0; i < args.length; i++) {
+  for (let i = 0; i < args2.length; i++) {
     // const [arg, ctx] = args2[i];
-    if (args[i].name) {
-      const paramIndex = params.findIndex((p) => p.name === args[i].name);
-      const argType = typeFromExpression(args[i].value, args[i].context);
+    if (args2[i].name) {
+      const paramIndex = params.findIndex((p) => p.name === args2[i].name);
+      const argType = typeFromExpression(args2[i].value, args2[i].context);
       if (paramIndex === -1) {
         errors.push({ type: "UnmatchedParameter", ctx, code: 8 });
         pass = false;
@@ -1244,30 +1246,30 @@ const ensureParameters = (
         // )
       ) {
         params.splice(paramIndex, 1);
-        args.splice(i, 1);
+        args2.splice(i, 1);
         i--;
       }
     }
   }
 
   // Then consume positional ones
-  while (args.length) {
+  while (args2.length) {
     // const [arg, ctx] = args[0];
 
     if (!params.length) {
       errors.push({
         type: "UnmatchedParameter",
-        ctx: args[0].context,
+        ctx: args2[0].context,
         code: 9,
       });
       pass = false;
       break;
     } else {
-      const argType = typeFromExpression(args[0].value, ctx);
+      const argType = typeFromExpression(args2[0].value, ctx);
       ensureType(params[0].paramaterType, argType, ctx);
       // validateType(argType, params[0].paramaterType, ctx);
       params.splice(0, 1);
-      args.splice(0, 1);
+      args2.splice(0, 1);
     }
   }
 
@@ -1468,21 +1470,44 @@ const toExpression = (ctx: ExprContext): VLExpression => {
   {
     const ifCtx = ctx.if_();
     if (ifCtx) {
-      const conditionCtx = ifCtx.expr();
-      const condition = toExpression(conditionCtx);
+      const conditionContext = ifCtx.expr();
+      const condition = toExpression(conditionContext);
+      const statementContext = ifCtx.statement();
       const elseCtx = ifCtx.else_();
+      const conditionals = [
+        {
+          condition,
+          statement: toStatement(statementContext),
+          conditionContext,
+          statementContext,
+        },
+        ...ifCtx.elseIf_list().map((e) => {
+          const conditionContext = e.expr();
+          const statementContext = e.statement();
+          return {
+            condition: toExpression(conditionContext),
+            statement: toStatement(statementContext),
+            conditionContext,
+            statementContext,
+          };
+        }),
+      ];
+      for (const conditional of conditionals) {
+        ensureType(
+          {
+            type: "Nullable",
+            subType: { type: "Alias", name: "boolean" },
+          },
+          typeFromExpression(
+            conditional.condition,
+            conditional.conditionContext,
+          ),
+          conditional.conditionContext,
+        );
+      }
       return {
         type: "If",
-        conditionals: [
-          {
-            condition,
-            statement: toStatement(ifCtx.statement()),
-          },
-          ...ifCtx.elseIf_list().map((e) => ({
-            condition: toExpression(e.expr()),
-            statement: toStatement(e.statement()),
-          })),
-        ],
+        conditionals,
         else: elseCtx ? toStatement(elseCtx.statement()) : undefined,
       };
     }
@@ -1494,6 +1519,10 @@ const toExpression = (ctx: ExprContext): VLExpression => {
 // TODO: Should we validateType or updateType? The former will certainly make
 // codegen easier; the latter is more aligned with the goals of vital
 const toAssignment = (ctx: ExprContext): VLBinaryOperationNode => {
+  const op = ctx.PLUS() ?? ctx.MINUS() ?? ctx.STAR() ?? ctx.DIV() ??
+    ctx.MOD() ?? ctx.CARET() ?? ctx.EXCLAMATION();
+  const operator = op?.getText();
+
   if (ctx.DOT()) {
     const objectCtx = ctx.expr(0);
     const object = toExpression(objectCtx);
@@ -1507,7 +1536,15 @@ const toAssignment = (ctx: ExprContext): VLBinaryOperationNode => {
       propertyCtx,
     );
     const rightCtx = ctx.expr(1);
-    const right = toExpression(rightCtx);
+    const rawRight = toExpression(rightCtx);
+    const right: VLExpression = operator
+      ? {
+        type: "BinaryOperation",
+        left: { type: "PropertyAccess", object, property },
+        right: rawRight,
+        operator,
+      }
+      : rawRight;
     const rightType = typeFromExpression(right, rightCtx);
     if (childType) ensureType(childType, rightType, rightCtx);
     return {
@@ -1531,7 +1568,15 @@ const toAssignment = (ctx: ExprContext): VLBinaryOperationNode => {
       indexCtx,
     );
     const rightCtx = ctx.expr(2);
-    const right = toExpression(rightCtx);
+    const rawRight = toExpression(rightCtx);
+    const right: VLExpression = operator
+      ? {
+        type: "BinaryOperation",
+        left: { type: "IndexAccess", array, index },
+        right: rawRight,
+        operator,
+      }
+      : rawRight;
     const rightType = typeFromExpression(right, rightCtx);
     if (childType) {
       if (childType.type === "Union" && childType.subTypes.length === 0) {
@@ -1553,7 +1598,15 @@ const toAssignment = (ctx: ExprContext): VLBinaryOperationNode => {
   const name = id.getText();
   const knownType = getType(name, id);
   const rightExpr = ctx.expr(0);
-  const right = toExpression(rightExpr);
+  const rawRight = toExpression(rightExpr);
+  const right: VLExpression = operator
+    ? {
+      type: "BinaryOperation",
+      left: { type: "Name", name },
+      right: rawRight,
+      operator,
+    }
+    : rawRight;
   const rightType = typeFromExpression(right, rightExpr);
   ensureType(knownType, rightType, rightExpr);
   if (knownType.type === "Infer") updateType(knownType, makeExact(knownType));
