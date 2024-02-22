@@ -1579,6 +1579,7 @@ const toAssignment = (ctx: ExprContext): VLBinaryOperationNode => {
       : rawRight;
     const rightType = typeFromExpression(right, rightCtx);
     if (childType) {
+      // Why?
       if (childType.type === "Union" && childType.subTypes.length === 0) {
         updateType(childType, rightType);
       } else ensureType(childType, rightType, rightCtx);
@@ -1596,23 +1597,24 @@ const toAssignment = (ctx: ExprContext): VLBinaryOperationNode => {
 
   const id = ctx.ID();
   const name = id.getText();
-  const knownType = getType(name, id);
+  const left: VLExpression = { type: "Name", name };
+  const leftType = typeFromExpression(left, id);
   const rightExpr = ctx.expr(0);
   const rawRight = toExpression(rightExpr);
   const right: VLExpression = operator
     ? {
       type: "BinaryOperation",
-      left: { type: "Name", name },
+      left,
       right: rawRight,
       operator,
     }
     : rawRight;
   const rightType = typeFromExpression(right, rightExpr);
-  ensureType(knownType, rightType, rightExpr);
-  if (knownType.type === "Infer") updateType(knownType, makeExact(knownType));
+  ensureType(leftType, rightType, rightExpr);
+  if (leftType.type === "Infer") updateType(leftType, makeExact(leftType)); // Should maybe typecheck after exacting?
   return {
     type: "BinaryOperation",
-    left: { type: "Name", name },
+    left,
     right,
     operator: "=",
   };
