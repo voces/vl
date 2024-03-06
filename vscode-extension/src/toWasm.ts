@@ -13,7 +13,7 @@ import {
 import { defaultScope } from "./defaultScope.ts";
 import { softenImplicitType } from "./toAST.ts";
 
-const raise = (err?: string | Error) => {
+const raise = (err?: string | Error): never => {
   if (typeof err === "object" && err instanceof Error) throw err;
   throw new Error(err);
 };
@@ -296,6 +296,16 @@ export const toWasm = async (ast: VLProgramNode) => {
           : raise("op not function");
         // const ret = opFunc?.type === "Function" ? opFunc.return : raise();
         if (leftType.type === "Object" && leftType.name === "i32") {
+          if (op === "=") {
+            const left = node.left;
+            if (left.type !== "Name") {
+              throw new Error(`binop = for non-names not handled`);
+            }
+            return m.local.set(
+              Object.keys(currentScope).indexOf(left.name),
+              toExpression(node.right),
+            );
+          }
           return m.i32[
             op === "+"
               ? "add"
