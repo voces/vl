@@ -809,7 +809,7 @@ const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
     parameters.map((p) => [p.name, p.paramaterType]),
   );
   scopes.push(scope);
-  let name: string;
+  const name = ctx.ID()?.getText();
   let node: VLFunctionDeclarationNode;
   try {
     const returnTypeExpr = ctx.type_();
@@ -839,8 +839,6 @@ const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
         updateType(param.paramaterType, makeExact(param.paramaterType));
       }
     }
-
-    name = ctx.ID()?.getText();
 
     node = {
       type: "FunctionDeclaration",
@@ -1220,7 +1218,7 @@ const ensureParameters = (
   args: VLArgumentNode[],
   ctx: Context,
 ) => {
-  let pass = false;
+  let pass = true;
   const params = [...parameters];
   const args2 = [...args];
 
@@ -1414,12 +1412,22 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       ctx.LESS_THAN_OR_EQUAL_TO() ?? ctx.EQUAL_TO() ?? ctx.NOT_EQUAL_TO() ??
       ctx.AND() ?? ctx.OR();
     if (op) {
-      return {
+      const leftCtx = ctx.expr(0);
+      const left = toExpression(leftCtx);
+      const rightCtx = ctx.expr(1);
+      const right = toExpression(rightCtx);
+
+      const expr: VLBinaryOperationNode = {
         type: "BinaryOperation",
-        left: toExpression(ctx.expr(0)),
-        right: toExpression(ctx.expr(1)),
+        left,
+        right,
         operator: op.getText(),
       };
+
+      // This asserts binary operations
+      typeFromExpression(expr, ctx);
+
+      return expr;
     }
   }
 

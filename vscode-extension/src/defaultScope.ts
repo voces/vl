@@ -229,6 +229,12 @@ export const defaultScope = () => {
       },
     };
 
+    scope.__memory_size__ = {
+      type: "Function",
+      paramaters: [],
+      return: { type: "Alias", name: "i32" },
+    };
+
     scope.log = {
       type: "Function",
       paramaters: [{

@@ -42,26 +42,20 @@ export const toWasm = async (ast: VLProgramNode) => {
     binaryen.createType([binaryen.i32, binaryen.i32]),
     binaryen.none,
     [],
-    m.block(null, [
-      m.i32.store(
-        0,
-        4,
-        m.local.get(0, binaryen.i32),
-        m.local.get(1, binaryen.i32),
-      ),
-    ]),
+    m.i32.store(
+      0,
+      4,
+      m.local.get(0, binaryen.i32),
+      m.local.get(1, binaryen.i32),
+    ),
   );
 
   m.addFunction(
     "__load_i32__",
-    binaryen.createType([binaryen.i32, binaryen.i32]),
+    binaryen.i32,
     binaryen.i32,
     [],
-    m.block(
-      null,
-      [m.i32.load(0, 4, m.local.get(0, binaryen.i32))],
-      binaryen.i32,
-    ),
+    m.i32.load(0, 4, m.local.get(0, binaryen.i32)),
   );
 
   m.addFunction(
@@ -69,14 +63,12 @@ export const toWasm = async (ast: VLProgramNode) => {
     binaryen.createType([binaryen.i32, binaryen.i64]),
     binaryen.none,
     [],
-    m.block(null, [
-      m.i64.store(
-        0,
-        8,
-        m.local.get(0, binaryen.i32),
-        m.local.get(1, binaryen.i64),
-      ),
-    ]),
+    m.i64.store(
+      0,
+      8,
+      m.local.get(0, binaryen.i32),
+      m.local.get(1, binaryen.i64),
+    ),
   );
 
   m.addFunction(
@@ -84,14 +76,12 @@ export const toWasm = async (ast: VLProgramNode) => {
     binaryen.createType([binaryen.i32, binaryen.f32]),
     binaryen.none,
     [],
-    m.block(null, [
-      m.f32.store(
-        0,
-        4,
-        m.local.get(0, binaryen.i32),
-        m.local.get(1, binaryen.f32),
-      ),
-    ]),
+    m.f32.store(
+      0,
+      4,
+      m.local.get(0, binaryen.i32),
+      m.local.get(1, binaryen.f32),
+    ),
   );
 
   m.addFunction(
@@ -99,17 +89,33 @@ export const toWasm = async (ast: VLProgramNode) => {
     binaryen.createType([binaryen.i32, binaryen.f64]),
     binaryen.none,
     [],
-    m.block(null, [
-      m.f64.store(
-        0,
-        8,
-        m.local.get(0, binaryen.i32),
-        m.local.get(1, binaryen.f64),
-      ),
-    ]),
+    m.f64.store(
+      0,
+      8,
+      m.local.get(0, binaryen.i32),
+      m.local.get(1, binaryen.f64),
+    ),
   );
 
-  type Scope = Record<string, VLType>;
+  m.addFunction(
+    "__memory_grow__",
+    binaryen.i32,
+    binaryen.i32,
+    [],
+    m.memory.grow(m.local.get(0, binaryen.i32)),
+  );
+
+  m.addFunction(
+    "__memory_size__",
+    binaryen.none,
+    binaryen.i32,
+    [],
+    m.memory.size(),
+  );
+
+  let loopIndex = 0;
+
+  type Scope = Record<string, [type: VLType, index: number]>;
   const scopes: Scope[] = [];
   let currentScope: Scope;
   const withScope = <T>(scope: Scope, fn: () => T) => {
@@ -123,6 +129,22 @@ export const toWasm = async (ast: VLProgramNode) => {
     return ret;
   };
 
+  const getScopeEntry = (name: string) => {
+    let entry: [VLType, number] | undefined;
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if (name in scopes[i]) {
+        entry = scopes[i][name];
+        break;
+      }
+    }
+    if (!entry) throw new Error(`Expected "${name}" to be in scope`);
+    return entry;
+  };
+
+  const isSomething = (type: VLType | undefined) =>
+    !!type && !validateType({ type: "Alias", name: "null" }, type);
+
+  let returnType: VLType | undefined = undefined;
   let desiredType: VLType | undefined = undefined;
   const withDesiredType = <T>(type: VLType | undefined, fn: () => T) => {
     const oldType = desiredType;
@@ -131,6 +153,9 @@ export const toWasm = async (ast: VLProgramNode) => {
     desiredType = oldType;
     return ret;
   };
+  const hasDesiredType = () => isSomething(desiredType);
+
+  const loopLabels: string[] = [];
 
   const functionScopes: Record<string, string>[] = [];
   const functions: Record<
@@ -151,6 +176,15 @@ export const toWasm = async (ast: VLProgramNode) => {
   const getFunction = (name: string) =>
     functions[getResolvedFunctionName(name)];
 
+  let _locals: number[] & { params?: number };
+  const withLocals = <T>(newLocals: number[], fn: () => T) => {
+    const oldLocals = _locals;
+    _locals = newLocals;
+    const ret = fn();
+    _locals = oldLocals;
+    return ret;
+  };
+
   const handleFunctionDecl = (node: VLFunctionDeclarationNode) => {
     if (!node.name) throw new Error("Anonymous functions not yet handled");
     let name = node.name;
@@ -169,32 +203,37 @@ export const toWasm = async (ast: VLProgramNode) => {
     switch (node.type) {
       case "Program": {
         const modifiedScope = Object.fromEntries(
-          Object.entries(node.scope).filter(([k, v]) =>
-            !ignoredKeys.has(k) && v.type !== "Function"
-          ),
+          Object.entries(node.scope)
+            .filter(([k, v]) => !ignoredKeys.has(k) && v.type !== "Function")
+            .map(([k, v], i): [string, [VLType, number]] => [k, [v, i]]),
         );
-        return withScope(
-          modifiedScope,
-          () =>
-            m.addFunction(
-              "__program__",
-              binaryen.none,
-              binaryen.none,
-              // This really doesn't work with closures...
-              Object.values(modifiedScope).filter((v) => v.type !== "Function")
-                .map(toWasmType),
-              m.block(
-                null,
-                node.statements.map((n) =>
-                  n.type === "FunctionDeclaration"
-                    ? handleFunctionDecl(n)
-                    : toExpression(n)
-                ).filter((v: number | void): v is number =>
-                  typeof v === "number"
+        const locals: number[] = [];
+        return withLocals(locals, () =>
+          withScope(
+            modifiedScope,
+            () =>
+              m.addFunction(
+                "__program__",
+                binaryen.none,
+                binaryen.none,
+                // This really doesn't work with closures...
+                locals,
+                // Object.values(modifiedScope).filter((v) => v.type !== "Function")
+                //   .map(toWasmType),
+                m.block(
+                  null,
+                  node.statements
+                    .map((n) =>
+                      n.type === "FunctionDeclaration"
+                        ? handleFunctionDecl(n)
+                        : toExpression(n)
+                    )
+                    .filter((v: number | void): v is number =>
+                      typeof v === "number"
+                    ),
                 ),
               ),
-            ),
-        );
+          ));
       }
       case "IntegerLiteral": {
         const type = desiredType?.type === "Object"
@@ -211,6 +250,8 @@ export const toWasm = async (ast: VLProgramNode) => {
         }
         return m[type].const(node.value);
       }
+      case "BooleanLiteral":
+        return m.i32.const(node.value ? 1 : 0);
       case "RealLiteral": {
         const type = desiredType?.type === "Object"
           ? desiredType?.name || "f64"
@@ -223,36 +264,56 @@ export const toWasm = async (ast: VLProgramNode) => {
         return m[type].const(node.value);
       }
       case "FunctionCall": {
+        // console.log("FunctionCall", 0, node.function, desiredType);
         if (!ignoredKeys.has(node.function)) {
+          // console.log("FunctionCall", 1, node.function, desiredType);
           const { declaration, instances } = getFunction(node.function);
+          // console.log(node.function, instances);
           if (
             !instances.some((i) =>
               validateParameters(i.parameters, node.arguments)
             )
           ) {
-            m.addFunction(
-              getResolvedFunctionName(node.function),
-              // TODO: named/optional params
-              binaryen.createType(
-                declaration.parameters.map((p) => toWasmType(p.paramaterType)),
+            // console.log("did not pass!", node.function);
+            const name = getResolvedFunctionName(node.function);
+            // TODO: named/optional params
+            const params = binaryen.createType(
+              declaration.parameters.map((p) => toWasmType(p.paramaterType)),
+            );
+            const oldReturnType = returnType;
+            returnType = declaration.returnType;
+            const locals: number[] & { params?: number } = [];
+            locals.params = declaration.parameters.length;
+            const body = withScope(
+              Object.fromEntries(
+                declaration.parameters.map((
+                  p,
+                  i,
+                ) => [p.name, [p.paramaterType, i]]),
               ),
-              toWasmType(declaration.returnType),
-              [], // TODO: calc vars
-              withScope(
-                Object.fromEntries(
-                  declaration.parameters.map((p) => [p.name, p.paramaterType]),
-                ),
-                () =>
+              () =>
+                withLocals(locals, () =>
                   withDesiredType(
                     declaration.returnType,
                     () => toExpression(declaration.body),
-                  ),
-              ),
+                  )),
             );
+            instances.push({
+              parameters: node.functionType!.paramaters,
+              ref: m.addFunction(
+                name,
+                params,
+                toWasmType(returnType),
+                locals,
+                body,
+              ),
+            });
+            returnType = oldReturnType;
           }
+          // console.log("FunctionCall", 2, node.function, desiredType);
         }
-        console.log("writing call for", node);
-        return m.call(
+        // console.log("writing call for", node, desiredType);
+        const call = m.call(
           node.function,
           node.arguments.map((a, i) =>
             withDesiredType(
@@ -263,28 +324,42 @@ export const toWasm = async (ast: VLProgramNode) => {
           ),
           toWasmType(node.functionType!.return),
         );
+
+        // console.log(
+        //   "drop call result?",
+        //   node.function,
+        //   !hasDesiredType(),
+        //   isSomething(node.functionType?.return),
+        // );
+        return !hasDesiredType() && isSomething(node.functionType?.return)
+          ? m.drop(call)
+          : call;
       }
-      case "VariableDeclaration":
+      case "VariableDeclaration": {
+        const index = _locals.push(toWasmType(node.variableType)) - 1 +
+          (_locals.params ?? 0);
+        currentScope[node.name] = [node.variableType, index];
         if (node.value) {
+          // console.log(
+          //   "decl var",
+          //   node.name,
+          //   "with desired type",
+          //   node.variableType,
+          // );
           return m.local.set(
-            Object.keys(currentScope).indexOf(node.name),
-            toExpression(node.value),
+            index,
+            withDesiredType(node.variableType, () => toExpression(node.value!)),
           );
         }
         return m.i32.const(0); // Hmm...
+      }
       case "Name": {
-        let type: VLType | undefined;
-        for (let i = scopes.length - 1; i >= 0; i--) {
-          if (node.name in scopes[i]) type = scopes[i][node.name];
-        }
-        if (!type) throw new Error(`Expected "${node.name}" to be in scope`);
-        return m.local.get(
-          Object.keys(currentScope).indexOf(node.name),
-          binaryen.i32,
-        );
+        const entry = getScopeEntry(node.name);
+        return m.local.get(entry[1], toWasmType(entry[0]));
       }
       case "BinaryOperation": {
         const op = node.operator;
+        // console.log("binary op", op);
         const leftType = vlType(node.left);
         const opFunc = leftType.type === "Object"
           ? leftType.properties.find((p) =>
@@ -295,16 +370,30 @@ export const toWasm = async (ast: VLProgramNode) => {
           ? opFunc.paramaters[0].paramaterType ?? raise("op missing param")
           : raise("op not function");
         // const ret = opFunc?.type === "Function" ? opFunc.return : raise();
-        if (leftType.type === "Object" && leftType.name === "i32") {
+        if (
+          leftType.type === "Object" &&
+          (leftType.name === "i32" || leftType.name === "boolean")
+        ) {
           if (op === "=") {
             const left = node.left;
             if (left.type !== "Name") {
               throw new Error(`binop = for non-names not handled`);
             }
-            return m.local.set(
-              Object.keys(currentScope).indexOf(left.name),
-              toExpression(node.right),
+            const [type, localIndex] = getScopeEntry(left.name);
+            const wasmType = toWasmType(type);
+            // console.log("assign with right desired", left.name, type);
+            const set = m.local.set(
+              localIndex,
+              withDesiredType(type, () => toExpression(node.right)),
             );
+            // console.log("desiredType", desiredType);
+            return desiredType
+              ? m.block(
+                null,
+                [set, m.local.get(localIndex, wasmType)],
+                wasmType,
+              )
+              : set;
           }
           return m.i32[
             op === "+"
@@ -315,20 +404,42 @@ export const toWasm = async (ast: VLProgramNode) => {
               ? "div_s"
               : op === ">"
               ? "gt_s"
+              : op === "<"
+              ? "lt_s"
               : op === "%"
               ? "rem_s"
-              : raise(`binop ${op} not handled`)
+              : op === "*"
+              ? "mul"
+              : op === "=="
+              ? "eq"
+              : op === "!="
+              ? "ne"
+              : op === ">="
+              ? "ge_s"
+              : op === "<="
+              ? "le_s"
+              : op === "&&"
+              ? "and"
+              : raise(`binop ${op} not handled on i32`)
           ](
-            toExpression(node.left),
+            withDesiredType(leftType, () => toExpression(node.left)),
             withDesiredType(paramType, () => toExpression(node.right)),
           );
         }
-        throw new Error("Have only handled addition for i32");
+        throw new Error("Have only handled i32");
       }
       case "Block":
         return m.block(
           null,
-          withDesiredType(undefined, () => node.statements.map(toExpression)),
+          withScope(
+            {},
+            () =>
+              node.statements.map((stmt, i, arr) =>
+                i === arr.length - 1
+                  ? toExpression(stmt)
+                  : withDesiredType(undefined, () => toExpression(stmt))
+              ),
+          ),
           desiredType ? toWasmType(desiredType) : undefined,
         );
       case "If":
@@ -349,7 +460,27 @@ export const toWasm = async (ast: VLProgramNode) => {
         );
       case "Return":
         // TODO: need returnType in global scope
-        return m.return(node.value ? toExpression(node.value) : undefined);
+        // console.log("Setting desired type to return type");
+        return withDesiredType(
+          returnType,
+          () => m.return(node.value ? toExpression(node.value) : undefined),
+        );
+      case "While": {
+        const name = node.label ?? `loop${loopIndex++}`;
+        loopLabels.push(name);
+        const loop = m.loop(
+          name,
+          m.block(null, [
+            m.br(name, toExpression(node.condition)),
+            toExpression(node.statement),
+          ]),
+        );
+        if (!node.label) loopIndex--;
+        loopLabels.pop();
+        return loop;
+      }
+      case "Continue":
+        return m.br(node.label ?? loopLabels[loopLabels.length - 1]);
       default:
         throw new Error(`Unhandled AST -> WASM "${node.type}" expression`);
     }
@@ -378,9 +509,11 @@ export const toWasm = async (ast: VLProgramNode) => {
   // console.log(inspect(ast, { depth: Infinity }));
   m.setStart(toExpression(ast));
 
+  console.log("result");
   console.log(m.emitText());
-  if (!m.validate()) throw new Error("validation error");
+  // if (!m.validate()) throw new Error("validation error");
   m.optimize();
+  console.log("optimized");
   console.log(m.emitText());
   if (!m.validate()) throw new Error("validation error");
   return m.emitBinary();
