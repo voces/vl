@@ -59,7 +59,7 @@ type VLArgumentNode = {
   context: Context;
 };
 
-type VLFunctionCallNode = {
+export type VLFunctionCallNode = {
   type: "FunctionCall";
   function: string;
   arguments: VLArgumentNode[];

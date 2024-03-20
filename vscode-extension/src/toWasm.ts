@@ -1,8 +1,10 @@
 // import { inspect } from "node:util";
 import Binaryen from "binaryen";
 import {
+  softenImplicitType,
   validateParameters,
   validateType,
+  VLFunctionCallNode,
   VLFunctionDeclarationNode,
   VLParameterNode,
   VLProgramNode,
@@ -11,7 +13,6 @@ import {
   vlType,
 } from "./toAST.ts";
 import { defaultScope } from "./defaultScope.ts";
-import { softenImplicitType } from "./toAST.ts";
 
 const raise = (err?: string | Error): never => {
   if (typeof err === "object" && err instanceof Error) throw err;
@@ -115,7 +116,8 @@ export const toWasm = async (ast: VLProgramNode) => {
 
   let loopIndex = 0;
 
-  type Scope = Record<string, [type: VLType, index: number]>;
+  type ScopeEntry = [type: VLType, index: number];
+  type Scope = Record<string, ScopeEntry>;
   const scopes: Scope[] = [];
   let currentScope: Scope;
   const withScope = <T>(scope: Scope, fn: () => T) => {
@@ -130,7 +132,7 @@ export const toWasm = async (ast: VLProgramNode) => {
   };
 
   const getScopeEntry = (name: string) => {
-    let entry: [VLType, number] | undefined;
+    let entry: ScopeEntry | undefined;
     for (let i = scopes.length - 1; i >= 0; i--) {
       if (name in scopes[i]) {
         entry = scopes[i][name];
@@ -173,8 +175,75 @@ export const toWasm = async (ast: VLProgramNode) => {
     }
     throw new Error(`Expected function ${name} to be in scope`);
   };
-  const getFunction = (name: string) =>
-    functions[getResolvedFunctionName(name)];
+  const getDirectFunction = (name: string, node: VLFunctionCallNode) => {
+    // Don't need to instantate built-ins
+    if (ignoredKeys.has(name)) return name;
+
+    // This just handles functions with the same name in different scopes; does not handle polymorphism
+    const resolvedName = getResolvedFunctionName(name);
+    const { declaration, instances } = functions[resolvedName];
+    // This is wrong; we need to return a type-specific name of the function
+    if (
+      instances.some((i) => validateParameters(i.parameters, node.arguments))
+    ) return resolvedName;
+
+    // TODO: named/optional params
+    const params = binaryen.createType(
+      declaration.parameters.map((p) => toWasmType(p.paramaterType)),
+    );
+    const oldReturnType = returnType;
+    returnType = declaration.returnType;
+    const locals: number[] & { params?: number } = [];
+    locals.params = declaration.parameters.length;
+    const body = withScope(
+      Object.fromEntries(
+        declaration.parameters.map((
+          p,
+          i,
+        ): [string, ScopeEntry] => [p.name, [p.paramaterType, i]]),
+      ),
+      () =>
+        withLocals(locals, () =>
+          withDesiredType(
+            declaration.returnType,
+            () => toExpression(declaration.body),
+          )),
+    );
+    instances.push({
+      parameters: node.functionType!.paramaters,
+      ref: m.addFunction(
+        resolvedName,
+        params,
+        toWasmType(returnType),
+        locals,
+        body,
+      ),
+    });
+    returnType = oldReturnType;
+
+    return resolvedName;
+  };
+  const getFunction = (node: VLFunctionCallNode) => {
+    const [type, index] = getScopeEntry(node.function);
+
+    if (type.type !== "Function") {
+      throw new Error("Can only get function types");
+    }
+
+    let isDirect = true;
+    try {
+      getResolvedFunctionName(node.function);
+    } catch {
+      isDirect = false;
+    }
+
+    console.log("getFunction", node.function);
+
+    if (isDirect) return getDirectFunction(node.function, node);
+
+    // WRONG; we need to instantiate!
+    return m.local.get(index, toWasmType(type));
+  };
 
   let _locals: number[] & { params?: number };
   const withLocals = <T>(newLocals: number[], fn: () => T) => {
@@ -192,6 +261,8 @@ export const toWasm = async (ast: VLProgramNode) => {
     while (name in functions) name = `${node.name}_${i++}`;
     functionScopes[functionScopes.length - 1][node.name] = name;
     functions[name] = { declaration: node, instances: [] };
+    const index = _locals.push(binaryen.funcref) - 1 + (_locals.params ?? 0);
+    currentScope[name] = [vlType(node), index];
   };
 
   const toExpression = (node: VLProgramNode | VLStatement): number => {
@@ -205,7 +276,7 @@ export const toWasm = async (ast: VLProgramNode) => {
         const modifiedScope = Object.fromEntries(
           Object.entries(node.scope)
             .filter(([k, v]) => !ignoredKeys.has(k) && v.type !== "Function")
-            .map(([k, v], i): [string, [VLType, number]] => [k, [v, i]]),
+            .map(([k, v], i): [string, ScopeEntry] => [k, [v, i]]),
         );
         const locals: number[] = [];
         return withLocals(locals, () =>
@@ -264,74 +335,87 @@ export const toWasm = async (ast: VLProgramNode) => {
         return m[type].const(node.value);
       }
       case "FunctionCall": {
-        // console.log("FunctionCall", 0, node.function, desiredType);
-        if (!ignoredKeys.has(node.function)) {
-          // console.log("FunctionCall", 1, node.function, desiredType);
-          const { declaration, instances } = getFunction(node.function);
-          // console.log(node.function, instances);
-          if (
-            !instances.some((i) =>
-              validateParameters(i.parameters, node.arguments)
-            )
-          ) {
-            // console.log("did not pass!", node.function);
-            const name = getResolvedFunctionName(node.function);
-            // TODO: named/optional params
-            const params = binaryen.createType(
-              declaration.parameters.map((p) => toWasmType(p.paramaterType)),
-            );
-            const oldReturnType = returnType;
-            returnType = declaration.returnType;
-            const locals: number[] & { params?: number } = [];
-            locals.params = declaration.parameters.length;
-            const body = withScope(
-              Object.fromEntries(
-                declaration.parameters.map((
-                  p,
-                  i,
-                ) => [p.name, [p.paramaterType, i]]),
-              ),
-              () =>
-                withLocals(locals, () =>
-                  withDesiredType(
-                    declaration.returnType,
-                    () => toExpression(declaration.body),
-                  )),
-            );
-            instances.push({
-              parameters: node.functionType!.paramaters,
-              ref: m.addFunction(
-                name,
-                params,
-                toWasmType(returnType),
-                locals,
-                body,
-              ),
-            });
-            returnType = oldReturnType;
-          }
-          // console.log("FunctionCall", 2, node.function, desiredType);
+        const func = getFunction(node) as unknown as string | number;
+        const functionType = node.functionType;
+        if (!functionType) {
+          throw new Error("Expected functionType to be set on function");
         }
-        // console.log("writing call for", node, desiredType);
-        const call = m.call(
-          node.function,
-          node.arguments.map((a, i) =>
-            withDesiredType(
-              // TODO: named params
-              node.functionType?.paramaters[i]?.paramaterType,
-              () => toExpression(a.value),
-            )
-          ),
-          toWasmType(node.functionType!.return),
-        );
+        // const func = getScopeEntry(node.function)[0];
 
-        // console.log(
-        //   "drop call result?",
-        //   node.function,
-        //   !hasDesiredType(),
-        //   isSomething(node.functionType?.return),
-        // );
-        return !hasDesiredType() && isSomething(node.functionType?.return)
+        // const direct = func.type === "Function";
+        // let name = direct ? node.function : undefined;
+
+        // if (!func.name) throw new Error("Anonymos functions cannot be called");
+        // if (!ignoredKeys.has(func.name)) {
+        //   const { declaration, instances } = getFunction(func.name);
+        //   if (
+        //     !instances.some((i) =>
+        //       validateParameters(i.parameters, node.arguments)
+        //     )
+        //   ) {
+        //     const name = getResolvedFunctionName(func.name);
+        //     // TODO: named/optional params
+        //     const params = binaryen.createType(
+        //       declaration.parameters.map((p) => toWasmType(p.paramaterType)),
+        //     );
+        //     const oldReturnType = returnType;
+        //     returnType = declaration.returnType;
+        //     const locals: number[] & { params?: number } = [];
+        //     locals.params = declaration.parameters.length;
+        //     const body = withScope(
+        //       Object.fromEntries(
+        //         declaration.parameters.map((
+        //           p,
+        //           i,
+        //         ): [string, ScopeEntry] => [p.name, [p.paramaterType, i, {
+        //           type: "Name",
+        //           name: p.name,
+        //         }]]),
+        //       ),
+        //       () =>
+        //         withLocals(locals, () =>
+        //           withDesiredType(
+        //             declaration.returnType,
+        //             () => toExpression(declaration.body),
+        //           )),
+        //     );
+        //     instances.push({
+        //       parameters: node.functionType!.paramaters,
+        //       ref: m.addFunction(
+        //         name,
+        //         params,
+        //         toWasmType(returnType),
+        //         locals,
+        //         body,
+        //       ),
+        //     });
+        //     returnType = oldReturnType;
+        //   }
+        // }
+
+        // TODO: named params
+        const operands = node.arguments.map((a, i) =>
+          withDesiredType(
+            functionType.paramaters[i].paramaterType,
+            () => toExpression(a.value),
+          )
+        );
+        const returnType = toWasmType(functionType.return);
+
+        console.log("???", func);
+
+        const call = typeof func === "string"
+          ? m.call(func, operands, returnType)
+          : m.call_indirect(
+            func,
+            operands,
+            binaryen.createType(
+              functionType.paramaters.map((p) => toWasmType(p.paramaterType)),
+            ),
+            returnType,
+          );
+
+        return !hasDesiredType() && isSomething(functionType.return)
           ? m.drop(call)
           : call;
       }
@@ -340,12 +424,6 @@ export const toWasm = async (ast: VLProgramNode) => {
           (_locals.params ?? 0);
         currentScope[node.name] = [node.variableType, index];
         if (node.value) {
-          // console.log(
-          //   "decl var",
-          //   node.name,
-          //   "with desired type",
-          //   node.variableType,
-          // );
           return m.local.set(
             index,
             withDesiredType(node.variableType, () => toExpression(node.value!)),
@@ -359,20 +437,24 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "BinaryOperation": {
         const op = node.operator;
-        // console.log("binary op", op);
         const leftType = vlType(node.left);
-        const opFunc = leftType.type === "Object"
-          ? leftType.properties.find((p) =>
-            validateType(p.name, { type: "StringLiteral", value: op })
-          )?.type
-          : raise("left not object");
-        const paramType = opFunc?.type === "Function"
-          ? opFunc.paramaters[0].paramaterType ?? raise("op missing param")
-          : raise("op not function");
-        // const ret = opFunc?.type === "Function" ? opFunc.return : raise();
+        let rightType: VLType;
+        {
+          if (leftType.type !== "Object") rightType = leftType;
+          else {
+            const opFunc = leftType.properties.find((p) =>
+              validateType(p.name, { type: "StringLiteral", value: op })
+            )?.type;
+            rightType = opFunc?.type === "Function"
+              ? opFunc.paramaters[0].paramaterType ?? raise("op missing param")
+              : raise("op not function");
+          }
+        }
+
         if (
-          leftType.type === "Object" &&
-          (leftType.name === "i32" || leftType.name === "boolean")
+          (leftType.type === "Object" &&
+            (leftType.name === "i32" || leftType.name === "boolean")) ||
+          op === "="
         ) {
           if (op === "=") {
             const left = node.left;
@@ -381,12 +463,10 @@ export const toWasm = async (ast: VLProgramNode) => {
             }
             const [type, localIndex] = getScopeEntry(left.name);
             const wasmType = toWasmType(type);
-            // console.log("assign with right desired", left.name, type);
             const set = m.local.set(
               localIndex,
               withDesiredType(type, () => toExpression(node.right)),
             );
-            // console.log("desiredType", desiredType);
             return desiredType
               ? m.block(
                 null,
@@ -423,10 +503,10 @@ export const toWasm = async (ast: VLProgramNode) => {
               : raise(`binop ${op} not handled on i32`)
           ](
             withDesiredType(leftType, () => toExpression(node.left)),
-            withDesiredType(paramType, () => toExpression(node.right)),
+            withDesiredType(rightType, () => toExpression(node.right)),
           );
         }
-        throw new Error("Have only handled i32");
+        throw new Error(`Have only handled i32 with ${op}`);
       }
       case "Block":
         return m.block(
@@ -460,7 +540,6 @@ export const toWasm = async (ast: VLProgramNode) => {
         );
       case "Return":
         // TODO: need returnType in global scope
-        // console.log("Setting desired type to return type");
         return withDesiredType(
           returnType,
           () => m.return(node.value ? toExpression(node.value) : undefined),
@@ -500,6 +579,8 @@ export const toWasm = async (ast: VLProgramNode) => {
       case "Object":
         if (type.name === "i32") return binaryen.i32;
         throw new Error(`Unhandled AST -> WASM "Object" type`);
+      case "Function":
+        return binaryen.funcref;
       default:
         console.log(type);
         throw new Error(`Unhandled AST -> WASM "${type.type}" type`);
