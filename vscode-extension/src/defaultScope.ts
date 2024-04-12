@@ -39,18 +39,27 @@ const symmetricOps = (
   },
 }];
 
+// deno-lint-ignore no-explicit-any
+const namedFunc = <F extends (...args: any[]) => unknown>(
+  name: string,
+  fn: F,
+) => {
+  Object.defineProperty(fn, "toString", {
+    value: () => name,
+    enumerable: false,
+  });
+  return fn;
+};
+
 export const defaultScope = () => {
   const scope: Scope = {
     i32: {
       type: "Object",
       properties: symmetricOps("i32", {
         type: "Custom",
-        validate: Object.assign(
-          (right: VLType) =>
-            // TODO: should use union type?
-            right === scope.i32 || right.type === "IntegerLiteral",
-          { toString: () => "i32" },
-        ),
+        validate: namedFunc("i32", (right: VLType) =>
+          // TODO: should use union type?
+          right === scope.i32 || right.type === "IntegerLiteral"),
         name: "i32",
       }),
       name: "i32",
@@ -61,10 +70,10 @@ export const defaultScope = () => {
         type: "Union",
         subTypes: [{ type: "Alias", name: "i32" }, {
           type: "Custom",
-          validate: Object.assign(
+          validate: namedFunc(
+            "i64",
             (right: VLType) =>
               right === scope.i64 || right.type === "IntegerLiteral",
-            { toString: () => "i64" },
           ),
           name: "i64",
         }],
@@ -75,13 +84,10 @@ export const defaultScope = () => {
       type: "Object",
       properties: symmetricOps("f32", {
         type: "Custom",
-        validate: Object.assign(
-          (right: VLType) =>
-            right === scope.f32 ||
-            right.type === "IntegerLiteral" ||
-            right.type === "RealLiteral",
-          { toString: () => "f32" },
-        ),
+        validate: namedFunc("f32", (right: VLType) =>
+          right === scope.f32 ||
+          right.type === "IntegerLiteral" ||
+          right.type === "RealLiteral"),
         name: "f32",
       }),
       name: "f32",
@@ -95,13 +101,10 @@ export const defaultScope = () => {
           { type: "Alias", name: "f32" },
           {
             type: "Custom",
-            validate: Object.assign(
-              (right: VLType) =>
-                right === scope.f64 ||
-                right.type === "IntegerLiteral" ||
-                right.type === "RealLiteral",
-              { toString: () => "f64" },
-            ),
+            validate: namedFunc("f64", (right: VLType) =>
+              right === scope.f64 ||
+              right.type === "IntegerLiteral" ||
+              right.type === "RealLiteral"),
             name: "f64",
           },
         ],
@@ -129,12 +132,12 @@ export const defaultScope = () => {
             name: "right",
             paramaterType: {
               type: "Custom",
-              validate: Object.assign(
+              validate: namedFunc(
+                "boolean",
                 (right: VLType) =>
                   right === scope.boolean ||
                   right.type === "BooleanLiteral" ||
                   (right.type === "Alias" && right.name === "boolean"),
-                { toString: () => "boolean" },
               ),
             },
           }],

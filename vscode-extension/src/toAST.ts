@@ -443,6 +443,7 @@ const typeFromExpression = (
   const memoized = typeFromExpressionMemory.get(expr);
   if (memoized) return memoized;
   let type = _typeFromExpression(expr, ctx);
+  // This is wrong... the scope chain should be derived from the type itself
   while (type.type === "Alias") {
     for (let i = scopes.length - 1; i >= 0; i--) {
       if ((type as VLAliasType).name in scopes[i]) {
@@ -956,7 +957,8 @@ const getChildType = (
 const updateType = (oldType: VLType, newType: VLType) => {
   // deno-lint-ignore no-explicit-any
   for (const prop in oldType) delete (oldType as any)[prop];
-  Object.assign(oldType, structuredClone(newType));
+  Object.assign(oldType, newType);
+  // Object.assign(oldType, structuredClone(newType));
   return oldType;
 };
 
@@ -1440,12 +1442,16 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       const funcCall: VLFunctionCallNode = {
         type: "FunctionCall",
         function: name,
-        arguments: args.map((arg): VLArgumentNode => ({
-          type: "Argument",
-          name: arg.ID()?.getText(),
-          value: toExpression(arg.expr()),
-          context: arg,
-        })),
+        arguments: args.map((arg): VLArgumentNode => {
+          const fullArg: VLArgumentNode = {
+            type: "Argument",
+            name: arg.ID()?.getText(),
+            value: toExpression(arg.expr()),
+            context: arg,
+          };
+          Object.defineProperty(fullArg, "context", { enumerable: false });
+          return fullArg;
+        }),
         functionType: undefined,
       };
 
@@ -1482,22 +1488,32 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       const condition = toExpression(conditionContext);
       const statementContext = ifCtx.statement();
       const elseCtx = ifCtx.else_();
+      const mainIf = {
+        condition,
+        statement: toStatement(statementContext),
+        conditionContext,
+        statementContext,
+      };
+      Object.defineProperty(mainIf, "conditionContext", { enumerable: false });
+      Object.defineProperty(mainIf, "statementContext", { enumerable: false });
       const conditionals = [
-        {
-          condition,
-          statement: toStatement(statementContext),
-          conditionContext,
-          statementContext,
-        },
+        mainIf,
         ...ifCtx.elseIf_list().map((e) => {
           const conditionContext = e.expr();
           const statementContext = e.statement();
-          return {
+          const elseIf = {
             condition: toExpression(conditionContext),
             statement: toStatement(statementContext),
             conditionContext,
             statementContext,
           };
+          Object.defineProperty(elseIf, "conditionContext", {
+            enumerable: false,
+          });
+          Object.defineProperty(elseIf, "statementContext", {
+            enumerable: false,
+          });
+          return elseIf;
         }),
       ];
       for (const conditional of conditionals) {
@@ -1724,7 +1740,7 @@ const toStatement = (ctx: StatementContext): VLStatement => {
       const statementCtx = forStatement.statement();
       let statement: VLStatement;
 
-      scopes.push({ [variable]: fromType });
+      scopes.push({ [variable]: softenImplicitType(fromType) });
       try {
         if (stepCtx) {
           step = toExpression(stepCtx);

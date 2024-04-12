@@ -1,4 +1,4 @@
-// import { inspect } from "node:util";
+import { inspect } from "node:util";
 import Binaryen from "binaryen";
 import {
   softenImplicitType,
@@ -587,7 +587,7 @@ export const toWasm = async (ast: VLProgramNode) => {
     }
   };
 
-  // console.log(inspect(ast, { depth: Infinity }));
+  console.log(inspect(ast, { depth: Infinity }));
   m.setStart(toExpression(ast));
 
   console.log("result");
