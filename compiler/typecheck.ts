@@ -148,6 +148,10 @@ export const _typeFromExpression = (
       // We can assume this is meant as a nullable value, though that's slightly different than a complex inference
       return { type: "Alias", name: "null" };
     case "FunctionCall":
+      // Prefer the per-call instantiated signature (its return is resolved to a
+      // concrete type for this call's arguments); the shared scope entry's
+      // return may still hold an inference hole pinned by another call site.
+      if (expr.functionType) return expr.functionType.return;
       for (let i = scopes.length - 1; i >= 0; i--) {
         if (expr.function in scopes[i]) {
           const funcType = scopes[i][expr.function];
@@ -417,6 +421,115 @@ export const makeExact = (type: VLType): VLType => {
     }
   }
   return type;
+};
+
+// True if `type` reaches an inference hole — i.e. it is generic and must be
+// instantiated (cloned with fresh holes) before being unified at a call site.
+export const containsInfer = (
+  type: VLType,
+  seen = new Set<VLType>(),
+): boolean => {
+  if (seen.has(type)) return false;
+  seen.add(type);
+  switch (type.type) {
+    case "Infer":
+      return true;
+    case "Function":
+      return type.paramaters.some((p) => containsInfer(p.paramaterType, seen)) ||
+        containsInfer(type.return, seen);
+    case "Object":
+      return type.properties.some((p) => containsInfer(p.type, seen));
+    case "Union":
+      return type.subTypes.some((s) => containsInfer(s, seen));
+    case "Nullable":
+      return containsInfer(type.subType, seen);
+    default:
+      return false;
+  }
+};
+
+// Deep-copy a type, giving every inference hole a *fresh* cell while preserving
+// internal sharing (a hole reachable by two paths maps to one fresh hole, so
+// correlated params/return stay linked). This is monomorphization at the type
+// level: a generic signature is cloned per call site so each unifies against
+// its own arguments independently. Non-hole leaves are copied too, so the
+// in-place unification (`updateType`) of one instance can't leak into another.
+export const cloneTypeFresh = (
+  type: VLType,
+  map: Map<VLType, VLType> = new Map(),
+): VLType => {
+  const existing = map.get(type);
+  if (existing) return existing;
+  switch (type.type) {
+    case "Infer": {
+      const fresh: VLType = { type: "Infer", subType: type.subType };
+      map.set(type, fresh);
+      fresh.subType = cloneTypeFresh(type.subType, map);
+      return fresh;
+    }
+    case "Function": {
+      const fresh: VLType = { type: "Function", paramaters: [], return: type };
+      map.set(type, fresh);
+      fresh.paramaters = type.paramaters.map((p) => ({
+        ...p,
+        paramaterType: cloneTypeFresh(p.paramaterType, map),
+      }));
+      fresh.return = cloneTypeFresh(type.return, map);
+      return fresh;
+    }
+    case "Object": {
+      const fresh: VLType = { type: "Object", properties: [], name: type.name };
+      map.set(type, fresh);
+      fresh.properties = type.properties.map((p) => ({
+        ...p,
+        type: cloneTypeFresh(p.type, map),
+      }));
+      return fresh;
+    }
+    case "Union": {
+      const fresh: VLType = { type: "Union", subTypes: [] };
+      map.set(type, fresh);
+      fresh.subTypes = type.subTypes.map((s) => cloneTypeFresh(s, map));
+      return fresh;
+    }
+    case "Nullable": {
+      const fresh: VLType = { type: "Nullable", subType: type.subType };
+      map.set(type, fresh);
+      fresh.subType = cloneTypeFresh(type.subType, map);
+      return fresh;
+    }
+    default: {
+      const fresh = { ...type };
+      map.set(type, fresh);
+      return fresh;
+    }
+  }
+};
+
+// Instantiate a (possibly generic) function type for a single call site: clone
+// it with fresh holes, unify those holes against the call's arguments, then
+// collapse each now-resolved hole to a concrete type so the call's argument and
+// return types are checked *strictly* — closing the soundness gap where a bare
+// `Infer` always widens-and-accepts. Non-generic functions are returned as-is.
+export const instantiateFunctionType = (
+  type: VLType,
+  args: VLArgumentNode[],
+  ctx: Context,
+): VLType => {
+  if (type.type !== "Function" || !containsInfer(type)) {
+    if (type.type === "Function") ensureParameters(type.paramaters, args, ctx);
+    return type;
+  }
+  const instance = cloneTypeFresh(type) as VLType & { type: "Function" };
+  ensureParameters(instance.paramaters, args, ctx);
+  return {
+    type: "Function",
+    paramaters: instance.paramaters.map((p) => ({
+      ...p,
+      paramaterType: makeExact(p.paramaterType),
+    })),
+    return: makeExact(instance.return),
+  };
 };
 
 export const getType = (name: string, ctx: Context): VLType => {
@@ -789,8 +902,10 @@ export const ensureParameters = (
       pass = false;
       break;
     } else {
-      const argType = typeFromExpression(args2[0].value, ctx);
-      ensureType(params[0].paramaterType, argType, ctx);
+      // Point a mismatch at the offending argument, not the whole call.
+      const argCtx = args2[0].context ?? ctx;
+      const argType = typeFromExpression(args2[0].value, argCtx);
+      ensureType(params[0].paramaterType, argType, argCtx);
       // validateType(argType, params[0].paramaterType, ctx);
       params.splice(0, 1);
       args2.splice(0, 1);

@@ -79,22 +79,30 @@ stays tolerant of both binaryen forms (sync object / async init).*
   moot since the LSP server is ESM. Only API drift: `i64.const` now takes a single bigint.
 - 🟡 **B2. Finish numeric codegen.** i64 & f32 binary ops are not wired (only i32/boolean/
   f64 branches exist). Add numeric **casting/coercion** (none today).
-- 🟡 **B3. First-class functions / indirect calls** (working for the single-shape case).
+- ✅ **B3. First-class functions / indirect calls** — incl. per-shape monomorphization.
   *Representation note: B4 superseded the bare i32 index — a function value is now a fat-pointer
   closure struct `{ i32 tableIndex, structref env }`; the table + `call_indirect` dispatch below
   still stand.*
   A function value is an **i32 index into a wasm function table** (`addTable` +
   `addActiveElementSegment`); function-typed locals/params hold that index and
-  `call_indirect` dispatches on it. Functions are instantiated lazily (per resolved name)
-  and emit at most once — a direct call compiles the callee against its **call-site
-  argument types**, so an un-annotated higher-order param works: `function apply(fn, a, b)
-  fn(a, b)` infers `fn` is a 2-arg function (see A6-adjacent inference in `toAST.ts`) and
-  monomorphizes. Indirect-call signatures and inferred return types are read back from the
+  `call_indirect` dispatches on it. An un-annotated higher-order param works: `function
+  apply(fn, a, b) fn(a, b)` infers `fn` is a 2-arg function (see A6-adjacent inference in
+  `toAST.ts`). Indirect-call signatures and inferred return types are read back from the
   monomorphized scope / compiled body (`getExpressionType`), not the once-inferred AST.
-  **Remaining (→ A10):** true per-shape monomorphization — today there is one wasm instance
-  per resolved name, so calling the *same* inferred-generic function with two different type
-  shapes (e.g. `apply(addi, …)` then `apply(addf, …)`) fails validation. Emit `name$i32` /
-  `name$f64` instances keyed on the concrete signature. See `vl-current-work-indirect-calls`.
+  **Per-shape monomorphization (done, → folds into A10):** each call site instantiates a
+  *fresh* copy of the (generic) signature — `cloneTypeFresh` gives fresh-but-consistent
+  inference holes, unified against that call's args, then collapsed (`makeExact`) to concrete
+  types so the check is strict (this also closed the inferred-return soundness gap). Codegen
+  keys wasm instances on the **wasm parameter signature** (`name`, `name$1`, …), so
+  `apply(addi, …)` and `apply(addf, …)` emit two correctly-typed instances. *Numeric builtins
+  now validate **nominally** (by `name`), not by reference identity, since instantiation
+  copies types (`defaultScope.ts isNominal`).*
+  **Variant-count tradeoff:** closures collapse to 1 instance (shared fat-pointer struct) and
+  primitives to ≤4, but a **structural-object** param yields one instance per distinct concrete
+  shape passed — WasmGC structs aren't width-subtypes, and the body is compiled against the
+  argument's actual shape (so `getx({x,y})` ≠ `getx({x})`). Bounded in practice (few shapes per
+  generic); the principled collapse is **WasmGC struct subtyping** via a global field-slot layout
+  (row-polymorphism lowering) — a future optimization, not built. See `vl-monomorphization`.
 - ✅ **B4. Closures** — full closures WORK (the project's first WasmGC codegen).
   1. **Nested function declarations** — a function-body block caches its value type during the
      walk (so return-type inference survives the scope pop), and Block codegen registers nested

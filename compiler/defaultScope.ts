@@ -52,14 +52,22 @@ const namedFunc = <F extends (...args: any[]) => unknown>(
 };
 
 export const defaultScope = () => {
+  // A builtin numeric/boolean accepts another object that is *nominally* the
+  // same type (same `name`), not only the canonical scope object by reference.
+  // Per-call-site type instantiation (monomorphization) clones and unifies
+  // types, producing structural copies of e.g. `i32` that are no longer ===
+  // the scope object; identity alone would then reject a value that is plainly
+  // an i32. The `name` is set only on these builtins, so this stays precise.
+  const isNominal = (right: VLType, name: string): boolean =>
+    right.type === "Object" && right.name === name;
   const scope: Scope = {
     i32: {
       type: "Object",
       properties: symmetricOps("i32", {
         type: "Custom",
         validate: namedFunc("i32", (right: VLType) =>
-          // TODO: should use union type?
-          right === scope.i32 || right.type === "IntegerLiteral"),
+          right === scope.i32 || isNominal(right, "i32") ||
+          right.type === "IntegerLiteral"),
         name: "i32",
       }),
       name: "i32",
@@ -73,7 +81,8 @@ export const defaultScope = () => {
           validate: namedFunc(
             "i64",
             (right: VLType) =>
-              right === scope.i64 || right.type === "IntegerLiteral",
+              right === scope.i64 || isNominal(right, "i64") ||
+              right.type === "IntegerLiteral",
           ),
           name: "i64",
         }],
@@ -85,7 +94,7 @@ export const defaultScope = () => {
       properties: symmetricOps("f32", {
         type: "Custom",
         validate: namedFunc("f32", (right: VLType) =>
-          right === scope.f32 ||
+          right === scope.f32 || isNominal(right, "f32") ||
           right.type === "IntegerLiteral" ||
           right.type === "RealLiteral"),
         name: "f32",
@@ -102,7 +111,7 @@ export const defaultScope = () => {
           {
             type: "Custom",
             validate: namedFunc("f64", (right: VLType) =>
-              right === scope.f64 ||
+              right === scope.f64 || isNominal(right, "f64") ||
               right.type === "IntegerLiteral" ||
               right.type === "RealLiteral"),
             name: "f64",
@@ -135,7 +144,7 @@ export const defaultScope = () => {
               validate: namedFunc(
                 "boolean",
                 (right: VLType) =>
-                  right === scope.boolean ||
+                  right === scope.boolean || isNominal(right, "boolean") ||
                   right.type === "BooleanLiteral" ||
                   (right.type === "Alias" && right.name === "boolean"),
               ),

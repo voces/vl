@@ -110,12 +110,20 @@ export const toWasm = async (ast: VLProgramNode) => {
     string,
     { declaration: VLFunctionDeclarationNode }
   > = {};
-  // Each resolved function name is emitted at most once (no real polymorphism
-  // yet — monomorphization keys on the resolved name).
-  const instantiated = new Set<string>();
-  // The wasm result type of each emitted function, keyed by resolved name. For
-  // functions with an inferred (unresolved) return type, this is read back from
-  // the compiled body rather than the declaration.
+  // (resolved name + wasm parameter signature) -> emitted instance name. A
+  // generic function (inferred / non-concrete params) yields one wasm instance
+  // per distinct parameter ABI shape, so `apply(addi,…)` and `apply(addf,…)` —
+  // same resolved name, different shapes — compile to two correctly-typed
+  // instances. Keying on the *wasm* type also maximises sharing (every closure,
+  // and every object of one shape, maps to a single wasm type), keeping the
+  // instance count small.
+  const instances = new Map<string, string>();
+  // Per resolved name, how many instances exist — names the extra shapes
+  // `name$1`, `name$2`, … (the first keeps the bare resolved name).
+  const instanceCounts: Record<string, number> = {};
+  // The wasm result type of each emitted instance, keyed by instance name. For
+  // an instance with an inferred (unresolved) return type, this is read back
+  // from the compiled body rather than the declaration.
   const instanceResult: Record<string, number> = {};
   // Functions referenced as *values* live in a wasm function table; a function
   // value is the i32 index into this table, which `call_indirect` dispatches on.
@@ -201,12 +209,17 @@ export const toWasm = async (ast: VLProgramNode) => {
   };
 
   // A function value (fat pointer) for a declared function: its table index +
-  // environment, packed into the uniform closure struct. tableIndexOf runs
-  // first (it instantiates the function, populating `closures`).
+  // environment, packed into the uniform closure struct. A value reference uses
+  // the declaration's own (concrete) parameter types as its canonical instance.
   const closureValue = (resolvedName: string): number => {
-    const index = tableIndexOf(resolvedName);
+    const { declaration } = functions[resolvedName];
+    const instanceName = instantiate(
+      resolvedName,
+      declaration.parameters.map((p) => p.paramaterType),
+    );
+    const index = tableIndexOf(instanceName);
     return m.struct.new(
-      [m.i32.const(index), envArgFor(resolvedName)],
+      [m.i32.const(index), envArgFor(instanceName)],
       closureStruct().heapType,
     );
   };
@@ -253,10 +266,31 @@ export const toWasm = async (ast: VLProgramNode) => {
     return cached;
   };
 
+  // The VL type of an expression *in the current instance's scope*. A generic
+  // function is monomorphized per call, so a parameter's concrete shape lives in
+  // the codegen scope, not the AST-inferred (declaration-time) type: resolve a
+  // Name from scope and a PropertyAccess through its object's shape, falling back
+  // to the AST type for literals/calls. (Name reads already use scope elsewhere;
+  // this keeps object-shape resolution consistent with them.)
+  const codegenType = (node: VLProgramNode | VLStatement): VLType => {
+    if (node.type === "Name") {
+      const found = lookupName(node.name);
+      if (found) return found.type;
+    }
+    if (node.type === "PropertyAccess") {
+      const obj = objectTypeOf(node.object);
+      const field = obj.properties.find((p) =>
+        p.name.type === "StringLiteral" && p.name.value === node.property
+      );
+      if (field) return field.type;
+    }
+    return vlType(node as Parameters<typeof vlType>[0]);
+  };
+
   // Resolve an expression's structural object type (soften + unwrap an Infer).
   const objectTypeOf = (node: VLProgramNode | VLStatement): VLObjectType => {
-    let t = softenImplicitType(vlType(node as Parameters<typeof vlType>[0]));
-    if (t.type === "Infer") t = t.subType;
+    let t = softenImplicitType(codegenType(node));
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
     if (t.type !== "Object") {
       throw new Error(`Expected an object type, got "${t.type}"`);
     }
@@ -295,9 +329,17 @@ export const toWasm = async (ast: VLProgramNode) => {
   // concrete parameter types to compile against (call-site argument types for a
   // direct call, the declaration's own types for a value reference) so that
   // untyped/inferred params (`function process(fn, a, b)`) get a real signature.
-  const instantiate = (resolvedName: string, paramTypes: VLType[]) => {
-    if (instantiated.has(resolvedName)) return;
-    instantiated.add(resolvedName);
+  const instantiate = (resolvedName: string, paramTypes: VLType[]): string => {
+    const wasmParams = paramTypes.map(toWasmType);
+    const key = `${resolvedName}#${wasmParams.join(",")}`;
+    const cached = instances.get(key);
+    if (cached) return cached;
+
+    const count = instanceCounts[resolvedName] ?? 0;
+    instanceCounts[resolvedName] = count + 1;
+    const instanceName = count === 0 ? resolvedName : `${resolvedName}$${count}`;
+    // Register before compiling the body so recursive self-calls resolve here.
+    instances.set(key, instanceName);
 
     const { declaration } = functions[resolvedName];
     const oldReturnType = returnType;
@@ -347,14 +389,12 @@ export const toWasm = async (ast: VLProgramNode) => {
     if (collector.size) {
       const fields = [...collector.keys()];
       const env = buildEnvStruct(fields, fields.map((f) => collector.get(f)!));
-      closures[resolvedName] = env;
+      closures[instanceName] = env;
       // Pass 2: recompile with the env bound; captured reads -> cast + struct.get.
       ({ body, locals } = compileBody({ ...env, paramIndex: 0 }, null));
     }
 
-    const params = binaryen.createType(
-      [binaryen.structref, ...paramTypes.map(toWasmType)],
-    );
+    const params = binaryen.createType([binaryen.structref, ...wasmParams]);
     // An inferred return type (`Unknown`/`Infer`) has no wasm mapping; read the
     // actual result type back off the compiled body instead.
     let resultType: number;
@@ -363,21 +403,17 @@ export const toWasm = async (ast: VLProgramNode) => {
     } catch {
       resultType = binaryen.getExpressionType(body);
     }
-    instanceResult[resolvedName] = resultType;
-    m.addFunction(resolvedName, params, resultType, locals, body);
+    instanceResult[instanceName] = resultType;
+    m.addFunction(instanceName, params, resultType, locals, body);
     returnType = oldReturnType;
+    return instanceName;
   };
 
-  // Reserve a table slot for a function used as a value, returning its index.
-  const tableIndexOf = (resolvedName: string) => {
-    const { declaration } = functions[resolvedName];
-    instantiate(
-      resolvedName,
-      declaration.parameters.map((p) => p.paramaterType),
-    );
-    const existing = functionTable.indexOf(resolvedName);
+  // Reserve a table slot for an already-instantiated function, by its index.
+  const tableIndexOf = (instanceName: string) => {
+    const existing = functionTable.indexOf(instanceName);
     return existing === -1
-      ? functionTable.push(resolvedName) - 1
+      ? functionTable.push(instanceName) - 1
       : existing;
   };
 
@@ -386,12 +422,28 @@ export const toWasm = async (ast: VLProgramNode) => {
     if (ignoredKeys.has(name)) return name;
 
     const resolvedName = getResolvedFunctionName(name);
-    // Compile the callee against the concrete argument types at this call site.
-    instantiate(
-      resolvedName,
-      node.arguments.map((a) => softenImplicitType(vlType(a.value))),
-    );
-    return resolvedName;
+    // Compile the callee against this call's *unified parameter* types (the
+    // call's instantiated signature), not the raw argument soft-types: for
+    // `apply(addf, 1, 2)` the parameters resolve to f64 (from `addf`), so the
+    // body must compile at f64 even though the literal arguments soften to i32.
+    //
+    // Exception: a *structural object* parameter must take the argument's own
+    // shape, not the (possibly narrower) inferred param shape. WasmGC structs
+    // aren't width-subtypes, and objects aren't coerced at the call boundary —
+    // `getx({x, y})` passes an {x, y} struct, so the instance must be compiled
+    // at {x, y} for `o.x` to read it. Numerics/functions keep the param type
+    // (literals coerce to it; closures share one struct).
+    const paramTypes = node.functionType
+      ? node.functionType.paramaters.map((p, i) => {
+        let pt = softenImplicitType(p.paramaterType);
+        while (pt.type === "Infer") pt = softenImplicitType(pt.subType);
+        if (pt.type === "Object" && pt.name === undefined && node.arguments[i]) {
+          return softenImplicitType(vlType(node.arguments[i].value));
+        }
+        return p.paramaterType;
+      })
+      : node.arguments.map((a) => softenImplicitType(vlType(a.value)));
+    return instantiate(resolvedName, paramTypes);
   };
 
   const getFunction = (node: VLFunctionCallNode) => {
@@ -956,12 +1008,15 @@ export const toWasm = async (ast: VLProgramNode) => {
 
   // VLType -> binaryen wasm type, bound to this module's binaryen instance.
   const toWasmType = (node: VLType): number => {
-    const t = softenImplicitType(node);
+    let t = softenImplicitType(node);
+    // Unwrap inference holes resolved during monomorphization (`Infer<i32>` ->
+    // i32); softening keeps the wrapper, but codegen wants the concrete type.
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
     // A structural object (no builtin `name` like i32/f64) is a WasmGC struct.
     if (t.type === "Object" && t.name === undefined) return objectStruct(t).refType;
     // A function value is a fat-pointer closure struct.
     if (t.type === "Function") return closureStruct().refType;
-    return toWasmTypeOf(binaryen, node);
+    return toWasmTypeOf(binaryen, t);
   };
 
   // console.log(inspect(logSimplified(ast), { depth: Infinity }));

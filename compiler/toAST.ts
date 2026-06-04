@@ -35,12 +35,12 @@ import type {
 } from "./ast.ts";
 import { errors, flow, scopes } from "./state.ts";
 import {
-  ensureParameters,
   ensureType,
   flattenType,
   getChildType,
   getConcreteType,
   getType,
+  instantiateFunctionType,
   makeExact,
   softenImplicitType,
   typeFromExpression,
@@ -345,8 +345,11 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       functionType: undefined,
     };
     if (calleeType?.type === "Function") {
-      ensureParameters(calleeType.paramaters, call.arguments, ctx);
-      call.functionType = calleeType;
+      call.functionType = instantiateFunctionType(
+        calleeType,
+        call.arguments,
+        ctx,
+      ) as VLFunctionType;
     } else if (calleeType && calleeType.type !== "Unknown") {
       errors.push({
         type: "Type",
@@ -545,8 +548,14 @@ const toExpression = (ctx: ExprContext): VLExpression => {
             code: "function-call",
           });
         } else {
-          ensureParameters(t.paramaters, funcCall.arguments, ctx);
-          funcCall.functionType = t;
+          // Instantiate a fresh copy of the (possibly generic) signature for
+          // THIS call site, so its inference holes unify against these arguments
+          // independently of other call sites — type-level monomorphization.
+          funcCall.functionType = instantiateFunctionType(
+            t,
+            funcCall.arguments,
+            ctx,
+          ) as VLFunctionType;
         }
       }
 
