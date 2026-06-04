@@ -249,11 +249,15 @@ stays tolerant of both binaryen forms (sync object / async init).*
   is: a `FunctionDeclaration` in value position → emit it as an instance + produce a
   `closureValue` (the same fat-pointer the Name-as-value path already builds). This **also**
   fixes B5's inline-function-literal object fields (`{ add: function… }`) — same root gap.
-  - **DECIDED — syntax:** no keyword-less lambdas. Bare `(params) body` is the classic
-    arrow-parsing ambiguity (`(a, b)` reads as a paren/tuple expr until after the `)`), and
-    today it's a hard parse error. Use the existing **`function(params) body`** (unambiguous,
-    already modeled — just needs codegen) and OPTIONALLY add **`(params) => body`** later, where
-    the explicit `=>` is the disambiguator. Reject the bare form.
+  - **DECIDED — syntax:** **one form, `function(params) body`** (unambiguous, already modeled —
+    just needs codegen). Bare keyword-less `(params) body` is rejected (the classic arrow
+    ambiguity — `(a, b)` reads as a paren/tuple expr until after the `)`; today a hard parse
+    error). In VL an arrow form would be **purely cosmetic** — the usual reason for two forms
+    (JS's lexical `this`) is moot since VL has no `this`, and `function(…)` already captures
+    lexically + has implicit single-expr return. The *only* upside is callback terseness
+    (`map(xs, x => x*2)`). **DEPRIORITIZED:** a `(params) => body` arrow (explicit `=>` as the
+    disambiguator) may be added later purely for that terseness; not now. Prefer non-syntax
+    answers to callback noise first (trailing-closure sugar, UFCS/methods).
   - **DECIDED — declaration vs value (the important semantic):** a top-level `function f`
     monomorphizes **per call site** (B3 cloning), so an untyped `function add(self, b) …` is
     polymorphic across shapes. A `let`-bound lambda is a **closure value** with **one** wasm
