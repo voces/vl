@@ -515,17 +515,29 @@ export const toWasm = async (ast: VLProgramNode) => {
     );
   };
 
-  const handleFunctionDecl = (node: VLFunctionDeclarationNode) => {
-    if (!node.name) throw new Error("Anonymous functions not yet handled");
-    let name = node.name;
+  let lambdaCounter = 0;
+  // Register a function declaration (named or anonymous) and return its unique
+  // wasm-side name. Named functions key on their name (a shadowing nested decl
+  // gets a numeric suffix) and bind a value-scope entry so later references
+  // resolve; anonymous functions (used directly as a value) get a synthesized
+  // name and bind nothing. The function emits no wasm here — it's instantiated
+  // lazily on first use (direct call, or `closureValue` for a value).
+  const registerFunctionDecl = (node: VLFunctionDeclarationNode): string => {
+    const base = node.name ?? `__lambda_${lambdaCounter++}__`;
+    let name = base;
     let i = 1;
-    while (name in functions) name = `${node.name}_${i++}`;
-    functionScopes[functionScopes.length - 1][node.name] = name;
+    while (name in functions) name = `${base}_${i++}`;
     functions[name] = { declaration: node };
-    // A declaration emits no wasm at its site and needs no local; it is
-    // instantiated lazily on first use (direct call or value reference). The
-    // scope entry's index is unused for declared functions (-1).
-    currentScope[node.name] = [vlType(node), -1];
+    if (node.name) {
+      functionScopes[functionScopes.length - 1][node.name] = name;
+      // The scope entry's index is unused for declared functions (-1).
+      currentScope[node.name] = [vlType(node), -1];
+    }
+    return name;
+  };
+
+  const handleFunctionDecl = (node: VLFunctionDeclarationNode) => {
+    registerFunctionDecl(node);
   };
 
   // Lower a statement list to wasm expressions. Nested function declarations
@@ -692,6 +704,12 @@ export const toWasm = async (ast: VLProgramNode) => {
           );
         }
         return m.i32.const(0); // Hmm...
+      }
+      case "FunctionDeclaration": {
+        // A function literal in value position (RHS of a binding, an object
+        // field, an argument): register it and produce its fat-pointer closure
+        // value — the same representation a function-name reference yields.
+        return closureValue(registerFunctionDecl(node));
       }
       case "Name": {
         const found = lookupName(node.name);
