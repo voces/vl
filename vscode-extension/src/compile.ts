@@ -237,8 +237,8 @@ export const compile = async (source: string): Promise<CompileResult> => {
 export type RunResult = { logs: string[] };
 
 /**
- * Instantiate compiled wasm with a memory + `log` import, capturing each `log`
- * call as a formatted line. Mirrors the tagged-value decoding the LSP uses.
+ * Instantiate compiled wasm with a memory + `__log__` import, capturing each
+ * `__log__` call as a formatted line. Mirrors the tagged-value decoding.
  */
 export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
   const logs: string[] = [];
@@ -246,7 +246,7 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
   await WebAssembly.instantiate(wasm, {
     imports: {
       memory,
-      log: (offset: number, length: number) => {
+      __log__: (offset: number, length: number) => {
         const view = new Int32Array(memory.buffer, offset, length / 4);
         const args: (number | bigint)[] = [];
         for (let i = 0; i < length / 4; i++) {

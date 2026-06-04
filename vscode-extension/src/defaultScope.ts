@@ -238,7 +238,7 @@ export const defaultScope = () => {
       return: { type: "Alias", name: "i32" },
     };
 
-    scope.log = {
+    scope.__log__ = {
       type: "Function",
       paramaters: [{
         type: "Parameter",

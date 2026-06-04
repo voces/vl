@@ -39,9 +39,9 @@ export const toWasm = async (ast: VLProgramNode) => {
   m.addMemoryImport("memory", "imports", "memory");
 
   m.addFunctionImport(
-    "log",
+    "__log__",
     "imports",
-    "log",
+    "__log__",
     binaryen.createType([binaryen.i32, binaryen.i32]),
     0,
   );
