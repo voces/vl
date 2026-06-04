@@ -462,6 +462,10 @@ export const vlType = (expr: VLExpression) => {
   console.log(expr);
   throw new Error("Expected expression's type to have been memoized");
 };
+export const setNodeType = (node: VLExpression, type: VLType) => {
+  typeFromExpressionMemory.set(node, type);
+  return node;
+};
 
 const _softenImplicitType = (type: VLType): VLType => {
   if (type.type === "IntegerLiteral") return { type: "Alias", name: "i32" };

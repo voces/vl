@@ -1,6 +1,7 @@
 import { inspect } from "node:util";
 import Binaryen from "binaryen";
 import {
+  setNodeType,
   softenImplicitType,
   validateParameters,
   validateType,
@@ -237,7 +238,7 @@ export const toWasm = async (ast: VLProgramNode) => {
       isDirect = false;
     }
 
-    console.log("getFunction", node.function);
+    console.log("getFunction", node.function, isDirect);
 
     if (isDirect) return getDirectFunction(node.function, node);
 
@@ -262,6 +263,13 @@ export const toWasm = async (ast: VLProgramNode) => {
     functionScopes[functionScopes.length - 1][node.name] = name;
     functions[name] = { declaration: node, instances: [] };
     const index = _locals.push(binaryen.funcref) - 1 + (_locals.params ?? 0);
+    console.log(...[
+      "declared function",
+      node.name,
+      ...(name === node.name) ? [] : ["with alias", name],
+      "at index",
+      index,
+    ]);
     currentScope[name] = [vlType(node), index];
   };
 
@@ -340,58 +348,6 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (!functionType) {
           throw new Error("Expected functionType to be set on function");
         }
-        // const func = getScopeEntry(node.function)[0];
-
-        // const direct = func.type === "Function";
-        // let name = direct ? node.function : undefined;
-
-        // if (!func.name) throw new Error("Anonymos functions cannot be called");
-        // if (!ignoredKeys.has(func.name)) {
-        //   const { declaration, instances } = getFunction(func.name);
-        //   if (
-        //     !instances.some((i) =>
-        //       validateParameters(i.parameters, node.arguments)
-        //     )
-        //   ) {
-        //     const name = getResolvedFunctionName(func.name);
-        //     // TODO: named/optional params
-        //     const params = binaryen.createType(
-        //       declaration.parameters.map((p) => toWasmType(p.paramaterType)),
-        //     );
-        //     const oldReturnType = returnType;
-        //     returnType = declaration.returnType;
-        //     const locals: number[] & { params?: number } = [];
-        //     locals.params = declaration.parameters.length;
-        //     const body = withScope(
-        //       Object.fromEntries(
-        //         declaration.parameters.map((
-        //           p,
-        //           i,
-        //         ): [string, ScopeEntry] => [p.name, [p.paramaterType, i, {
-        //           type: "Name",
-        //           name: p.name,
-        //         }]]),
-        //       ),
-        //       () =>
-        //         withLocals(locals, () =>
-        //           withDesiredType(
-        //             declaration.returnType,
-        //             () => toExpression(declaration.body),
-        //           )),
-        //     );
-        //     instances.push({
-        //       parameters: node.functionType!.paramaters,
-        //       ref: m.addFunction(
-        //         name,
-        //         params,
-        //         toWasmType(returnType),
-        //         locals,
-        //         body,
-        //       ),
-        //     });
-        //     returnType = oldReturnType;
-        //   }
-        // }
 
         // TODO: named params
         const operands = node.arguments.map((a, i) =>
@@ -453,7 +409,8 @@ export const toWasm = async (ast: VLProgramNode) => {
 
         if (
           (leftType.type === "Object" &&
-            (leftType.name === "i32" || leftType.name === "boolean")) ||
+            (leftType.name === "i32" || leftType.name === "boolean" ||
+              leftType.name === "f64")) ||
           op === "="
         ) {
           if (op === "=") {
@@ -475,38 +432,68 @@ export const toWasm = async (ast: VLProgramNode) => {
               )
               : set;
           }
-          return m.i32[
-            op === "+"
-              ? "add"
-              : op === "-"
-              ? "sub"
-              : op === "/"
-              ? "div_s"
-              : op === ">"
-              ? "gt_s"
-              : op === "<"
-              ? "lt_s"
-              : op === "%"
-              ? "rem_s"
-              : op === "*"
-              ? "mul"
-              : op === "=="
-              ? "eq"
-              : op === "!="
-              ? "ne"
-              : op === ">="
-              ? "ge_s"
-              : op === "<="
-              ? "le_s"
-              : op === "&&"
-              ? "and"
-              : raise(`binop ${op} not handled on i32`)
-          ](
-            withDesiredType(leftType, () => toExpression(node.left)),
-            withDesiredType(rightType, () => toExpression(node.right)),
-          );
+
+          if (leftType.type !== "Object") throw new Error("Expected object");
+          const name = leftType.name;
+          if (name === "i32" || name === "boolean") {
+            return m.i32[
+              op === "+"
+                ? "add"
+                : op === "-"
+                ? "sub"
+                : op === "/"
+                ? "div_s"
+                : op === ">"
+                ? "gt_s"
+                : op === "<"
+                ? "lt_s"
+                : op === "%"
+                ? "rem_s"
+                : op === "*"
+                ? "mul"
+                : op === "=="
+                ? "eq"
+                : op === "!="
+                ? "ne"
+                : op === ">="
+                ? "ge_s"
+                : op === "<="
+                ? "le_s"
+                : op === "&&"
+                ? "and"
+                : raise(`binop ${op} not handled on i32`)
+            ](
+              withDesiredType(leftType, () => toExpression(node.left)),
+              withDesiredType(rightType, () => toExpression(node.right)),
+            );
+          }
+          if (name === "f64") {
+            return m.f64[
+              op === "+"
+                ? "add"
+                : op === "-"
+                ? "sub"
+                : op === "*"
+                ? "mul"
+                : op === "=="
+                ? "eq"
+                : op === "!="
+                ? "ne"
+                : raise(`binop ${op} not handled on f64`)
+            ](
+              withDesiredType(leftType, () => toExpression(node.left)),
+              withDesiredType(rightType, () => toExpression(node.right)),
+            );
+          }
+          throw new Error(`Didn't handle ${op} on ${name}`);
         }
-        throw new Error(`Have only handled i32 with ${op}`);
+        throw new Error(
+          `Have only handled i32 with ${op}, got ${leftType.type}${
+            leftType.type === "Object"
+              ? leftType.name ? ` (${leftType.name})` : ""
+              : ""
+          }`,
+        );
       }
       case "Block":
         return m.block(
@@ -558,6 +545,52 @@ export const toWasm = async (ast: VLProgramNode) => {
         loopLabels.pop();
         return loop;
       }
+      case "For": {
+        const name = node.label ?? `loop${loopIndex++}`;
+        loopLabels.push(name);
+        const variableType = softenImplicitType(vlType(node.from));
+        const varRef = setNodeType(
+          { type: "Name", name: node.variable },
+          variableType,
+        );
+        const loop = m.loop(
+          name,
+          m.block(null, [
+            toExpression({
+              type: "VariableDeclaration",
+              name: node.variable,
+              variableType,
+              value: node.from,
+              mutable: true,
+            }),
+            m.br(
+              name,
+              toExpression({
+                type: "BinaryOperation",
+                left: varRef,
+                operator: ">",
+                right: node.to,
+              }),
+            ),
+            toExpression(node.statement),
+            // TODO, actually wire up step
+            toExpression({
+              type: "BinaryOperation",
+              left: varRef,
+              operator: "=",
+              right: {
+                type: "BinaryOperation",
+                left: varRef,
+                operator: "+",
+                right: { type: "IntegerLiteral", value: 1, text: "1" },
+              },
+            }),
+          ]),
+        );
+        if (!node.label) loopIndex--;
+        loopLabels.pop();
+        return loop;
+      }
       case "Continue":
         return m.br(node.label ?? loopLabels[loopLabels.length - 1]);
       default:
@@ -578,7 +611,8 @@ export const toWasm = async (ast: VLProgramNode) => {
         return binaryen.f64;
       case "Object":
         if (type.name === "i32") return binaryen.i32;
-        throw new Error(`Unhandled AST -> WASM "Object" type`);
+        if (type.name === "f64") return binaryen.f64;
+        throw new Error(`Unhandled AST -> WASM "Object" type ${type.name}`);
       case "Function":
         return binaryen.funcref;
       default:
@@ -587,7 +621,7 @@ export const toWasm = async (ast: VLProgramNode) => {
     }
   };
 
-  console.log(inspect(ast, { depth: Infinity }));
+  // console.log(inspect(logSimplified(ast), { depth: Infinity }));
   m.setStart(toExpression(ast));
 
   console.log("result");
@@ -598,4 +632,19 @@ export const toWasm = async (ast: VLProgramNode) => {
   console.log(m.emitText());
   if (!m.validate()) throw new Error("validation error");
   return m.emitBinary();
+};
+
+const logSimplified = (obj: unknown): unknown => {
+  if (obj == null) return obj;
+  if (typeof obj !== "object") return obj;
+  if (
+    "type" in obj && obj.type === "Object" && "name" in obj &&
+    typeof obj.name === "string"
+  ) {
+    return { type: "Alias", name: obj.name };
+  }
+  if (Array.isArray(obj)) return obj.map((v) => logSimplified(v));
+  return Object.fromEntries(
+    Object.entries(obj).map(([k, v]) => [k, logSimplified(v)]),
+  );
 };
