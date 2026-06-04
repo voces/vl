@@ -157,6 +157,60 @@ export const toWasm = async (ast: VLProgramNode) => {
     };
   };
 
+  // A function value is a "fat pointer": a uniform WasmGC struct holding the
+  // callee's table index and its environment (a `structref`, null for a
+  // non-capturing function). One struct type for *all* function values makes
+  // them interchangeable regardless of captures, and lets a closure escape
+  // (be stored/returned/passed) carrying its environment.
+  let _closureStruct: { heapType: number; refType: number } | null = null;
+  const closureStruct = () => {
+    if (!_closureStruct) {
+      const tb = new binaryen.TypeBuilder(1);
+      tb.setStructType(0, [
+        { type: binaryen.i32, packedType: binaryen.notPacked, mutable: false },
+        {
+          type: binaryen.structref,
+          packedType: binaryen.notPacked,
+          mutable: false,
+        },
+      ]);
+      const heapType = tb.buildAndDispose()[0];
+      _closureStruct = {
+        heapType,
+        refType: binaryen.getTypeFromHeapType(heapType, false),
+      };
+    }
+    return _closureStruct;
+  };
+  const nullEnv = () => m.ref.null(binaryen.structref);
+
+  // The environment argument for calling `resolvedName`: a struct of its
+  // captured variables' current values (read in the current scope), or null.
+  const envArgFor = (resolvedName: string): number => {
+    const env = closures[resolvedName];
+    if (!env) return nullEnv();
+    return m.struct.new(
+      env.fields.map((f, i) =>
+        withDesiredType(
+          env.types[i],
+          () => toExpression({ type: "Name", name: f }),
+        )
+      ),
+      env.heapType,
+    );
+  };
+
+  // A function value (fat pointer) for a declared function: its table index +
+  // environment, packed into the uniform closure struct. tableIndexOf runs
+  // first (it instantiates the function, populating `closures`).
+  const closureValue = (resolvedName: string): number => {
+    const index = tableIndexOf(resolvedName);
+    return m.struct.new(
+      [m.i32.const(index), envArgFor(resolvedName)],
+      closureStruct().heapType,
+    );
+  };
+
   // --- Objects (WasmGC structs) ---
   type ObjectStruct = {
     heapType: number;
@@ -249,17 +303,18 @@ export const toWasm = async (ast: VLProgramNode) => {
     const oldReturnType = returnType;
     returnType = declaration.returnType;
 
-    // Compile the body once with the given environment. With `collector` set
-    // (no env yet), captured reads record themselves and emit a placeholder;
-    // with `env` set, captured reads become `struct.get` on the env parameter.
-    // An env occupies local 0, shifting the declared parameters up by one.
+    // Every function takes a leading `structref` environment parameter (local 0)
+    // — null/ignored for a non-capturing function — so all function values share
+    // one calling convention. The declared parameters therefore sit at index 1+.
+    // With `collector` set, captured reads record themselves and emit a
+    // placeholder; with `env` set, captured reads `ref.cast` the env parameter to
+    // the closure's struct type and `struct.get` the field.
     const compileBody = (
       env: (EnvShape & { paramIndex: number }) | null,
       collector: Map<string, VLType> | null,
     ) => {
-      const offset = env ? 1 : 0;
       const locals: number[] & { params?: number } = [];
-      locals.params = declaration.parameters.length + offset;
+      locals.params = declaration.parameters.length + 1;
       const oldCollector = captureCollector;
       const oldEnv = currentEnv;
       captureCollector = collector;
@@ -270,7 +325,7 @@ export const toWasm = async (ast: VLProgramNode) => {
           declaration.parameters.map((
             p,
             i,
-          ): [string, ScopeEntry] => [p.name, [paramTypes[i], i + offset]]),
+          ): [string, ScopeEntry] => [p.name, [paramTypes[i], i + 1]]),
         ),
         () =>
           withLocals(locals, () =>
@@ -289,17 +344,16 @@ export const toWasm = async (ast: VLProgramNode) => {
     const collector = new Map<string, VLType>();
     let { body, locals } = compileBody(null, collector);
 
-    let env: EnvShape | null = null;
     if (collector.size) {
       const fields = [...collector.keys()];
-      env = buildEnvStruct(fields, fields.map((f) => collector.get(f)!));
+      const env = buildEnvStruct(fields, fields.map((f) => collector.get(f)!));
       closures[resolvedName] = env;
-      // Pass 2: recompile with the env parameter; captured reads -> struct.get.
+      // Pass 2: recompile with the env bound; captured reads -> cast + struct.get.
       ({ body, locals } = compileBody({ ...env, paramIndex: 0 }, null));
     }
 
     const params = binaryen.createType(
-      (env ? [env.refType] : []).concat(paramTypes.map(toWasmType)),
+      [binaryen.structref, ...paramTypes.map(toWasmType)],
     );
     // An inferred return type (`Unknown`/`Infer`) has no wasm mapping; read the
     // actual result type back off the compiled body instead.
@@ -321,15 +375,6 @@ export const toWasm = async (ast: VLProgramNode) => {
       resolvedName,
       declaration.parameters.map((p) => p.paramaterType),
     );
-    if (closures[resolvedName]) {
-      // The table holds a bare funcref with no environment, so a closure used as
-      // a value would be called without its captures. Escaping closures need a
-      // fat pointer (funcref + env); not yet implemented (ROADMAP B4).
-      throw new Error(
-        `Escaping closures are not yet implemented: "${resolvedName}" ` +
-          `captures variables and cannot be used as a value.`,
-      );
-    }
     const existing = functionTable.indexOf(resolvedName);
     return existing === -1
       ? functionTable.push(resolvedName) - 1
@@ -370,9 +415,9 @@ export const toWasm = async (ast: VLProgramNode) => {
 
     if (isDirect) return getDirectFunction(node.function, node);
 
-    // Indirect: `node.function` is a local holding an i32 table index. Return
-    // that index expression as the `call_indirect` target.
-    return m.local.get(index, binaryen.i32);
+    // Indirect: `node.function` is a value holding a closure struct (fat
+    // pointer). Return that expression; the caller extracts its index + env.
+    return m.local.get(index, closureStruct().refType);
   };
 
   let _locals: number[] & { params?: number };
@@ -383,6 +428,9 @@ export const toWasm = async (ast: VLProgramNode) => {
     _locals = oldLocals;
     return ret;
   };
+  // Allocate a fresh local of the given wasm type in the current function.
+  const newLocal = (wasmType: number): number =>
+    _locals.push(wasmType) - 1 + (_locals.params ?? 0);
 
   const handleFunctionDecl = (node: VLFunctionDeclarationNode) => {
     if (!node.name) throw new Error("Anonymous functions not yet handled");
@@ -497,40 +545,50 @@ export const toWasm = async (ast: VLProgramNode) => {
             () => toExpression(a.value),
           )
         );
-        // A closure call allocates the environment from the captured variables'
-        // current values (read here in the caller's scope) and threads it as the
-        // hidden leading argument.
-        if (typeof func === "string" && closures[func]) {
-          const env = closures[func];
-          operands.unshift(
-            m.struct.new(
-              env.fields.map((f, i) =>
-                withDesiredType(
-                  env.types[i],
-                  () => toExpression({ type: "Name", name: f }),
-                )
-              ),
-              env.heapType,
-            ),
-          );
-        }
         // Direct calls to functions with an inferred return type read their
         // result type from the emitted instance; otherwise map the declared type.
         const returnType = typeof func === "string" && func in instanceResult
           ? instanceResult[func]
           : toWasmType(functionType.return);
 
-        const call = typeof func === "string"
-          ? m.call(func, operands, returnType)
-          : m.call_indirect(
+        let call: number;
+        if (typeof func === "string") {
+          if (ignoredKeys.has(func)) {
+            // A builtin: it has its own signature with no environment parameter.
+            call = m.call(func, operands, returnType);
+          } else {
+            // A VL function: prepend the environment (captures struct or null).
+            call = m.call(func, [envArgFor(func), ...operands], returnType);
+          }
+        } else {
+          // Indirect call through a function value (closure struct). Stash it,
+          // then dispatch on its table index, threading its environment.
+          const clo = closureStruct().refType;
+          const cloLocal = newLocal(clo);
+          const idx = m.struct.get(
+            0,
+            m.local.get(cloLocal, clo),
+            binaryen.i32,
+            false,
+          );
+          const env = m.struct.get(
+            1,
+            m.local.get(cloLocal, clo),
+            binaryen.structref,
+            false,
+          );
+          const indirect = m.call_indirect(
             "table",
-            func,
-            operands,
-            binaryen.createType(
-              functionType.paramaters.map((p) => toWasmType(p.paramaterType)),
-            ),
+            idx,
+            [env, ...operands],
+            binaryen.createType([
+              binaryen.structref,
+              ...functionType.paramaters.map((p) => toWasmType(p.paramaterType)),
+            ]),
             returnType,
           );
+          call = m.block(null, [m.local.set(cloLocal, func), indirect], returnType);
+        }
 
         return !hasDesiredType() && returnType !== binaryen.none
           ? m.drop(call)
@@ -554,9 +612,14 @@ export const toWasm = async (ast: VLProgramNode) => {
           // A closed-over variable: read from the environment (or, during the
           // capture-collection pass, record it and emit a typed placeholder).
           if (currentEnv) {
+            // The env parameter is a generic `structref`; cast to this closure's
+            // env struct, then read the captured field.
             return m.struct.get(
               currentEnv.fields.indexOf(node.name),
-              m.local.get(currentEnv.paramIndex, currentEnv.refType),
+              m.ref.cast(
+                m.local.get(currentEnv.paramIndex, binaryen.structref),
+                currentEnv.refType,
+              ),
               toWasmType(found.type),
               false,
             );
@@ -570,9 +633,9 @@ export const toWasm = async (ast: VLProgramNode) => {
         }
         const entry = getScopeEntry(node.name);
         if (entry[0].type === "Function") {
-          // A function used as a value. If it names a declared function, its
-          // value is its table index; otherwise it's a function-valued local
-          // (e.g. a parameter) already holding an i32 table index.
+          // A function used as a value. A declared function becomes a fresh fat
+          // pointer (table index + environment); a function-valued local (e.g. a
+          // parameter) already holds a closure struct.
           let resolved: string | null = null;
           try {
             resolved = getResolvedFunctionName(node.name);
@@ -580,8 +643,8 @@ export const toWasm = async (ast: VLProgramNode) => {
             resolved = null;
           }
           return resolved
-            ? m.i32.const(tableIndexOf(resolved))
-            : m.local.get(entry[1], binaryen.i32);
+            ? closureValue(resolved)
+            : m.local.get(entry[1], closureStruct().refType);
         }
         return m.local.get(entry[1], toWasmType(entry[0]));
       }
@@ -861,6 +924,8 @@ export const toWasm = async (ast: VLProgramNode) => {
     const t = softenImplicitType(node);
     // A structural object (no builtin `name` like i32/f64) is a WasmGC struct.
     if (t.type === "Object" && t.name === undefined) return objectStruct(t).refType;
+    // A function value is a fat-pointer closure struct.
+    if (t.type === "Function") return closureStruct().refType;
     return toWasmTypeOf(binaryen, node);
   };
 
