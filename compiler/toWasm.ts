@@ -19,8 +19,6 @@ const raise = (err?: string | Error): never => {
   throw new Error(err);
 };
 
-const lowMask = BigInt(0xFFFFFFFF);
-
 const ignoredKeys = new Set(Object.keys(defaultScope()));
 
 export const toWasm = async (ast: VLProgramNode) => {
@@ -275,10 +273,8 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (
           type !== "i32" && type !== "i64" && type !== "f32" && type !== "f64"
         ) throw new Error("Expected numeric type");
-        if (type === "i64") {
-          const big = BigInt(node.text);
-          return m.i64.const(Number(big & lowMask), Number(big >> BigInt(32)));
-        }
+        // binaryen >=120: i64.const takes a single bigint (was low/high i32 pair).
+        if (type === "i64") return m.i64.const(BigInt(node.text));
         return m[type].const(node.value);
       }
       case "BooleanLiteral":
