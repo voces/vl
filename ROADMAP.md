@@ -1,8 +1,9 @@
 # VL / Vital — Roadmap
 
 The vision: a scripting-feel language with types **hidden by aggressive inference**,
-**permissive & structural**, **fairly type-safe** (sound where types are known,
-`dynamic` elsewhere), compiling to **lean WebAssembly**. Deliverables:
+**permissive & structural**, **fully type-safe** (statically sound — there is no
+untyped code; inference holes resolve to concrete types), compiling to **lean
+WebAssembly**. Deliverables:
 **LSP-backed VS Code extension** (exists, partial) · **CLI to compile/run** (missing) ·
 **in-browser playground with a sandbox** (missing).
 
@@ -23,18 +24,15 @@ closures / `is` / variance designs referenced here.
 ---
 
 ## Track A — Type system (`toAST.ts`)
-*Blueprint: Elixir v1.20 set-theoretic + gradual inference. Independent of codegen.*
+*Blueprint: Elixir v1.20 set-theoretic types, adapted for a **fully-typed** language
+(no `dynamic`/gradual escape hatch — VL has no untyped code). Independent of codegen.*
 
 - 🟡 **A0. Inventory the existing type algebra.** Have: `Alias`, `Function`, `Object`
   (structural, with index signatures), literal types (`IntegerLiteral`/`RealLiteral`/
   `StringLiteral`/`BooleanLiteral`), `Union`, `Nullable`, `Unknown`, `Never`, `Type`,
-  `Infer`, `Custom` (predicate). Missing the rest below.
-- ⬜ **A1. `dynamic()` type** (replaces the role of `any`). The gradual escape hatch;
-  behaves statically when absent. Foundation for permissiveness.
-- ⬜ **A2. Disjoint-only errors.** Change `ensureType` to emit a violation **only when
-  supplied and accepted types are provably disjoint** (Elixir's rule). Today it's strict
-  and will throw false positives as inference gets fuzzy — directly at odds with the
-  "permissive" goal. *Highest-leverage, lowest-risk starting point; independent of GC.*
+  `Infer`, `Custom` (predicate). Missing the rest below. Note: `Unknown`/`Infer` are
+  **inference holes that resolve** to concrete types, not a runtime `dynamic` — VL is
+  fully typed, so there is no gradual escape hatch.
 - ⬜ **A3. Intersection types** (`A & B`). Needed for narrowing results and structural
   refinement. Round out the set-theoretic algebra.
 - ⬜ **A4. Negation types** (`not A`). Needed so guards can subtract types on the false
@@ -55,7 +53,7 @@ closures / `is` / variance designs referenced here.
   Needed for trees/lists/JSON-shaped data.
 - ⬜ **A12. Soundness pass / test suite.** Port the "If T" narrowing benchmark idea; build
   a corpus of "must-error" and "must-not-error" programs. Define the soundness contract
-  (sound modulo `dynamic`).
+  (statically sound — every well-typed program is type-safe at runtime).
 
 ---
 
@@ -78,10 +76,19 @@ stays tolerant of both binaryen forms (sync object / async init).*
   B5/B6/B7; everything heap-shaped waits on this.*
 - 🟡 **B2. Finish numeric codegen.** i64 & f32 binary ops are not wired (only i32/boolean/
   f64 branches exist). Add numeric **casting/coercion** (none today).
-- 🟡 **B3. First-class functions / indirect calls** (in progress, currently broken). Build a
-  wasm **function table** + elem segments; store table indices in locals; fix
-  `call_indirect`. Generalize monomorphization beyond resolved-name + param validation
-  (no real polymorphism today). See `vl-current-work-indirect-calls` memory.
+- 🟡 **B3. First-class functions / indirect calls** (working for the single-shape case).
+  A function value is an **i32 index into a wasm function table** (`addTable` +
+  `addActiveElementSegment`); function-typed locals/params hold that index and
+  `call_indirect` dispatches on it. Functions are instantiated lazily (per resolved name)
+  and emit at most once — a direct call compiles the callee against its **call-site
+  argument types**, so an un-annotated higher-order param works: `function apply(fn, a, b)
+  fn(a, b)` infers `fn` is a 2-arg function (see A6-adjacent inference in `toAST.ts`) and
+  monomorphizes. Indirect-call signatures and inferred return types are read back from the
+  monomorphized scope / compiled body (`getExpressionType`), not the once-inferred AST.
+  **Remaining (→ A10):** true per-shape monomorphization — today there is one wasm instance
+  per resolved name, so calling the *same* inferred-generic function with two different type
+  shapes (e.g. `apply(addi, …)` then `apply(addf, …)`) fails validation. Emit `name$i32` /
+  `name$f64` instances keyed on the concrete signature. See `vl-current-work-indirect-calls`.
 - ⬜ **B4. Closures** (TODO.md plan). Static stack-vs-heap promotion via escape analysis:
   a variable captured by a child function gets promoted (`memoryType: stack → heap`),
   detected by comparing declaration scope to reference scope. Depends on B1 + B3.
@@ -106,8 +113,9 @@ stays tolerant of both binaryen forms (sync object / async init).*
 *New surface. Depends on the existing parse→AST→wasm pipeline being callable outside the
 LSP (today `toWasm` only runs inside `server.ts`).*
 
-- ⬜ **C1. Extract a headless `compile(source) → { wasm, diagnostics }`** entry point,
-  decoupled from the LSP. Single source of truth shared by CLI, LSP, and browser.
+- ✅ **C1. Extract a headless `compile(source) → { wasm, diagnostics }`** entry point,
+  decoupled from the LSP. Done — `compiler/compile.ts` is the single source of truth shared
+  by the LSP, `tests/run.ts`, and (future) CLI + browser.
 - ⬜ **C2. `vl run <file>`** — compile + instantiate + execute, wiring the `log` import
   (host stdout) the way `server.ts` does today.
 - ⬜ **C3. `vl build <file> -o out.wasm`** — emit `.wasm` (and optional `.wat`).
@@ -207,7 +215,8 @@ Why drop it:
 ---
 
 ## Suggested first moves (highest leverage, lowest risk, mostly independent)
-1. **A2 + A1** — `dynamic()` and disjoint-only errors. Reshapes the type system toward the
-   permissive vision without touching codegen.
-2. **C1** — headless `compile()`. Unblocks the CLI, the browser, *and* a real test suite.
-3. **B3** — finish indirect calls (already in flight) to unblock closures.
+1. ✅ **C1** — headless `compile()`. Done: unblocked the CLI, the browser, *and* the
+   `tests/run.ts` corpus.
+2. **B3** — finish indirect calls (in flight) to unblock closures (B4).
+3. **A6 + A5** — `is` operator + flow narrowing. The set-theoretic payoff for a fully-typed
+   language: structural guards that refine types along control flow (needs A3/A4 first).

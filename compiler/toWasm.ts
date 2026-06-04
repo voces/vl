@@ -3,11 +3,9 @@ import Binaryen from "binaryen";
 import {
   setNodeType,
   softenImplicitType,
-  validateParameters,
   validateType,
   VLFunctionCallNode,
   VLFunctionDeclarationNode,
-  VLParameterNode,
   VLProgramNode,
   VLStatement,
   VLType,
@@ -164,18 +162,32 @@ export const toWasm = async (ast: VLProgramNode) => {
     desiredType = oldType;
     return ret;
   };
-  const hasDesiredType = () => isSomething(desiredType);
+  // Whether the current expression's value is wanted (return/operand position)
+  // rather than discarded (statement position). This is signalled by whether a
+  // desired type is *set* at all — the Block case passes `undefined` for the
+  // non-tail statements it intends to drop. Note this must be set-vs-unset, not
+  // `isSomething`: a function with an inferred (still-`Infer`) return type has a
+  // desired type that is wanted but not yet concrete.
+  const hasDesiredType = () => desiredType !== undefined;
 
   const loopLabels: string[] = [];
 
   const functionScopes: Record<string, string>[] = [];
   const functions: Record<
     string,
-    {
-      declaration: VLFunctionDeclarationNode;
-      instances: { parameters: VLParameterNode[]; ref: number }[];
-    }
+    { declaration: VLFunctionDeclarationNode }
   > = {};
+  // Each resolved function name is emitted at most once (no real polymorphism
+  // yet — monomorphization keys on the resolved name).
+  const instantiated = new Set<string>();
+  // The wasm result type of each emitted function, keyed by resolved name. For
+  // functions with an inferred (unresolved) return type, this is read back from
+  // the compiled body rather than the declaration.
+  const instanceResult: Record<string, number> = {};
+  // Functions referenced as *values* live in a wasm function table; a function
+  // value is the i32 index into this table, which `call_indirect` dispatches on.
+  const functionTable: string[] = [];
+
   const getResolvedFunctionName = (name: string) => {
     let i = functionScopes.length - 1;
     while (i >= 0) {
@@ -184,22 +196,17 @@ export const toWasm = async (ast: VLProgramNode) => {
     }
     throw new Error(`Expected function ${name} to be in scope`);
   };
-  const getDirectFunction = (name: string, node: VLFunctionCallNode) => {
-    // Don't need to instantate built-ins
-    if (ignoredKeys.has(name)) return name;
 
-    // This just handles functions with the same name in different scopes; does not handle polymorphism
-    const resolvedName = getResolvedFunctionName(name);
-    const { declaration, instances } = functions[resolvedName];
-    // This is wrong; we need to return a type-specific name of the function
-    if (
-      instances.some((i) => validateParameters(i.parameters, node.arguments))
-    ) return resolvedName;
+  // Emit the wasm function for `resolvedName` once. `paramTypes` supplies the
+  // concrete parameter types to compile against (call-site argument types for a
+  // direct call, the declaration's own types for a value reference) so that
+  // untyped/inferred params (`function process(fn, a, b)`) get a real signature.
+  const instantiate = (resolvedName: string, paramTypes: VLType[]) => {
+    if (instantiated.has(resolvedName)) return;
+    instantiated.add(resolvedName);
 
-    // TODO: named/optional params
-    const params = binaryen.createType(
-      declaration.parameters.map((p) => toWasmType(p.paramaterType)),
-    );
+    const { declaration } = functions[resolvedName];
+    const params = binaryen.createType(paramTypes.map(toWasmType));
     const oldReturnType = returnType;
     returnType = declaration.returnType;
     const locals: number[] & { params?: number } = [];
@@ -209,7 +216,7 @@ export const toWasm = async (ast: VLProgramNode) => {
         declaration.parameters.map((
           p,
           i,
-        ): [string, ScopeEntry] => [p.name, [p.paramaterType, i]]),
+        ): [string, ScopeEntry] => [p.name, [paramTypes[i], i]]),
       ),
       () =>
         withLocals(locals, () =>
@@ -218,20 +225,45 @@ export const toWasm = async (ast: VLProgramNode) => {
             () => toExpression(declaration.body),
           )),
     );
-    instances.push({
-      parameters: node.functionType!.paramaters,
-      ref: m.addFunction(
-        resolvedName,
-        params,
-        toWasmType(returnType),
-        locals,
-        body,
-      ),
-    });
+    // An inferred return type (`Unknown`/`Infer`) has no wasm mapping; read the
+    // actual result type back off the compiled body instead.
+    let resultType: number;
+    try {
+      resultType = toWasmType(declaration.returnType);
+    } catch {
+      resultType = binaryen.getExpressionType(body);
+    }
+    instanceResult[resolvedName] = resultType;
+    m.addFunction(resolvedName, params, resultType, locals, body);
     returnType = oldReturnType;
+  };
 
+  // Reserve a table slot for a function used as a value, returning its index.
+  const tableIndexOf = (resolvedName: string) => {
+    const { declaration } = functions[resolvedName];
+    instantiate(
+      resolvedName,
+      declaration.parameters.map((p) => p.paramaterType),
+    );
+    const existing = functionTable.indexOf(resolvedName);
+    return existing === -1
+      ? functionTable.push(resolvedName) - 1
+      : existing;
+  };
+
+  const getDirectFunction = (name: string, node: VLFunctionCallNode) => {
+    // Don't need to instantiate built-ins
+    if (ignoredKeys.has(name)) return name;
+
+    const resolvedName = getResolvedFunctionName(name);
+    // Compile the callee against the concrete argument types at this call site.
+    instantiate(
+      resolvedName,
+      node.arguments.map((a) => softenImplicitType(vlType(a.value))),
+    );
     return resolvedName;
   };
+
   const getFunction = (node: VLFunctionCallNode) => {
     // Built-ins resolve directly to their wasm function name; they are never in
     // the value scope (the Program case filters Function-typed entries out), so
@@ -251,12 +283,11 @@ export const toWasm = async (ast: VLProgramNode) => {
       isDirect = false;
     }
 
-    console.log("getFunction", node.function, isDirect);
-
     if (isDirect) return getDirectFunction(node.function, node);
 
-    // WRONG; we need to instantiate!
-    return m.local.get(index, toWasmType(type));
+    // Indirect: `node.function` is a local holding an i32 table index. Return
+    // that index expression as the `call_indirect` target.
+    return m.local.get(index, binaryen.i32);
   };
 
   let _locals: number[] & { params?: number };
@@ -274,16 +305,11 @@ export const toWasm = async (ast: VLProgramNode) => {
     let i = 1;
     while (name in functions) name = `${node.name}_${i++}`;
     functionScopes[functionScopes.length - 1][node.name] = name;
-    functions[name] = { declaration: node, instances: [] };
-    const index = _locals.push(binaryen.funcref) - 1 + (_locals.params ?? 0);
-    console.log(...[
-      "declared function",
-      node.name,
-      ...(name === node.name) ? [] : ["with alias", name],
-      "at index",
-      index,
-    ]);
-    currentScope[name] = [vlType(node), index];
+    functions[name] = { declaration: node };
+    // A declaration emits no wasm at its site and needs no local; it is
+    // instantiated lazily on first use (direct call or value reference). The
+    // scope entry's index is unused for declared functions (-1).
+    currentScope[node.name] = [vlType(node), -1];
   };
 
   const toExpression = (node: VLProgramNode | VLStatement): number => {
@@ -357,7 +383,14 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "FunctionCall": {
         const func = getFunction(node) as unknown as string | number;
-        const functionType = node.functionType;
+        // For an indirect call the callee is a value whose concrete signature
+        // is bound in scope by the current monomorphization (more precise than
+        // the AST's once-inferred `functionType`, which may still hold holes).
+        let functionType = node.functionType;
+        if (typeof func !== "string") {
+          const scoped = getScopeEntry(node.function)[0];
+          if (scoped.type === "Function") functionType = scoped;
+        }
         if (!functionType) {
           throw new Error("Expected functionType to be set on function");
         }
@@ -365,17 +398,20 @@ export const toWasm = async (ast: VLProgramNode) => {
         // TODO: named params
         const operands = node.arguments.map((a, i) =>
           withDesiredType(
-            functionType.paramaters[i].paramaterType,
+            functionType.paramaters[i]?.paramaterType,
             () => toExpression(a.value),
           )
         );
-        const returnType = toWasmType(functionType.return);
-
-        console.log("???", func);
+        // Direct calls to functions with an inferred return type read their
+        // result type from the emitted instance; otherwise map the declared type.
+        const returnType = typeof func === "string" && func in instanceResult
+          ? instanceResult[func]
+          : toWasmType(functionType.return);
 
         const call = typeof func === "string"
           ? m.call(func, operands, returnType)
           : m.call_indirect(
+            "table",
             func,
             operands,
             binaryen.createType(
@@ -384,7 +420,7 @@ export const toWasm = async (ast: VLProgramNode) => {
             returnType,
           );
 
-        return !hasDesiredType() && isSomething(functionType.return)
+        return !hasDesiredType() && returnType !== binaryen.none
           ? m.drop(call)
           : call;
       }
@@ -402,6 +438,20 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "Name": {
         const entry = getScopeEntry(node.name);
+        if (entry[0].type === "Function") {
+          // A function used as a value. If it names a declared function, its
+          // value is its table index; otherwise it's a function-valued local
+          // (e.g. a parameter) already holding an i32 table index.
+          let resolved: string | null = null;
+          try {
+            resolved = getResolvedFunctionName(node.name);
+          } catch {
+            resolved = null;
+          }
+          return resolved
+            ? m.i32.const(tableIndexOf(resolved))
+            : m.local.get(entry[1], binaryen.i32);
+        }
         return m.local.get(entry[1], toWasmType(entry[0]));
       }
       case "BinaryOperation": {
@@ -646,7 +696,8 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (type.name === "f64") return binaryen.f64;
         throw new Error(`Unhandled AST -> WASM "Object" type ${type.name}`);
       case "Function":
-        return binaryen.funcref;
+        // A function value is an i32 index into the function table.
+        return binaryen.i32;
       default:
         console.log(type);
         throw new Error(`Unhandled AST -> WASM "${type.type}" type`);
@@ -655,6 +706,18 @@ export const toWasm = async (ast: VLProgramNode) => {
 
   // console.log(inspect(logSimplified(ast), { depth: Infinity }));
   m.setStart(toExpression(ast));
+
+  // Functions referenced as values were collected into `functionTable` during
+  // codegen; lay them out in a wasm table so `call_indirect` can dispatch.
+  if (functionTable.length) {
+    m.addTable("table", functionTable.length, functionTable.length);
+    m.addActiveElementSegment(
+      "table",
+      "table-segment",
+      functionTable,
+      m.i32.const(0),
+    );
+  }
 
   console.log("result");
   console.log(m.emitText());

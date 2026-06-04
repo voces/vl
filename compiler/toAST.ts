@@ -851,7 +851,14 @@ const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
 
     for (const param of parameters) {
       // Should be recursive
-      if (param.paramaterType.type === "Infer") {
+      // Only "exact" a parameter the body actually constrained. A pure hole
+      // (`Infer<Unknown>` — an un-annotated param never pinned down, e.g. the
+      // `a`/`b` in `function apply(fn, a, b) fn(a, b)`) is left as an inference
+      // variable so each call site can unify it against the real argument type.
+      if (
+        param.paramaterType.type === "Infer" &&
+        param.paramaterType.subType.type !== "Unknown"
+      ) {
         updateType(param.paramaterType, makeExact(param.paramaterType));
       }
     }
@@ -1471,7 +1478,25 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       };
 
       const t = getType(funcCall.function, id);
-      if (t.type !== "Unknown") {
+      // Calling an unresolved inference hole (an un-annotated parameter such as
+      // `fn` in `function apply(fn, a, b) fn(a, b)`) infers that the value is a
+      // function: it must implement a call accepting this many arguments. This
+      // mirrors how `a.foo` infers `a` is an object with a `foo` property. The
+      // parameter/return types are fresh holes, unified against the actual
+      // argument types at each call site; codegen monomorphizes from there.
+      if (t.type === "Infer" && t.subType.type === "Unknown") {
+        const inferred: VLFunctionType = {
+          type: "Function",
+          paramaters: funcCall.arguments.map((arg, i) => ({
+            type: "Parameter",
+            name: arg.value.type === "Name" ? arg.value.name : `_${i}`,
+            paramaterType: typeFromExpression(arg.value, arg.context ?? ctx),
+          })),
+          return: { type: "Infer", subType: { type: "Unknown" } },
+        };
+        updateType(t, inferred);
+        funcCall.functionType = inferred;
+      } else if (t.type !== "Unknown") {
         if (t.type !== "Function") {
           errors.push({
             type: "Type",
