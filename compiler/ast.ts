@@ -26,6 +26,13 @@ export type VLBlockNode = {
   type: "Block";
   label: string | undefined;
   statements: VLStatement[];
+  /**
+   * The block's fall-through value type (type of its last statement), computed
+   * during the walk while the block's scope is still live. Cached because the
+   * scope — including any nested declarations the last statement references — is
+   * popped before return-type inference would re-derive the type.
+   */
+  valueType?: VLType;
 };
 
 export type VLPropertyAccessNode = {

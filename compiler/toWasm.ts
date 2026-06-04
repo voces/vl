@@ -467,20 +467,34 @@ export const toWasm = async (ast: VLProgramNode) => {
           }`,
         );
       }
-      case "Block":
+      case "Block": {
+        // The tail value is the last non-declaration statement; nested function
+        // declarations register lazily (like the Program case) and emit nothing.
+        let lastValueIdx = -1;
+        for (let i = node.statements.length - 1; i >= 0; i--) {
+          if (node.statements[i].type !== "FunctionDeclaration") {
+            lastValueIdx = i;
+            break;
+          }
+        }
         return m.block(
           null,
           withScope(
             {},
             () =>
-              node.statements.map((stmt, i, arr) =>
-                i === arr.length - 1
-                  ? toExpression(stmt)
-                  : withDesiredType(undefined, () => toExpression(stmt))
-              ),
+              node.statements
+                .map((stmt, i) =>
+                  stmt.type === "FunctionDeclaration"
+                    ? handleFunctionDecl(stmt)
+                    : i === lastValueIdx
+                    ? toExpression(stmt)
+                    : withDesiredType(undefined, () => toExpression(stmt))
+                )
+                .filter((v): v is number => typeof v === "number"),
           ),
           desiredType ? toWasmType(desiredType) : undefined,
         );
+      }
       case "If":
         return m.if(
           withDesiredType(

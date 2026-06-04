@@ -360,17 +360,28 @@ const toExpression = (ctx: ExprContext): VLExpression => {
           .map((b) => b.statement())
           .filter(Boolean)
           .map((s): [StatementContext, VLStatement] => [s, toStatement(s)]);
+        // The block's value type is its last statement's type — derive it now,
+        // while this block's scope (and any nested declarations) is still live.
+        let valueType: VLType | undefined;
+        if (statements.length > 0) {
+          const [lctx, lstmt] = statements[statements.length - 1];
+          valueType = typeFromStatement(lstmt, lctx);
+        }
         flow.desiredType = oldDesiredType;
-        if (statements.length > 0 && flow.desiredType) {
-          const [ctx, stmt] = statements[statements.length - 1];
+        if (valueType && flow.desiredType) {
           if (!validateType(flow.desiredType, { type: "Alias", name: "null" })) {
-            ensureType(flow.desiredType, typeFromStatement(stmt, ctx), ctx);
+            ensureType(
+              flow.desiredType,
+              valueType,
+              statements[statements.length - 1][0],
+            );
           }
         }
         return {
           type: "Block",
           label: ctx.ID()?.getText(),
           statements: statements.map((s) => s[1]),
+          valueType,
         };
       } finally {
         scopes.pop();

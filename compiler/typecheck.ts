@@ -70,10 +70,10 @@ export const _typeFromExpression = (
       return opFunc.return;
     }
     case "Block":
-      // for (let i = 0; i < expr.statements.length; i++) {
-      //   const t = typeFromStatement(expr.statements[expr.statements.length - 1], ctx);
-      //   if (returnType);
-      // }
+      // Prefer the value type cached during the walk (the last statement's type,
+      // resolved while the block scope was live); fall back to re-deriving.
+      if (expr.valueType) return expr.valueType;
+      if (!expr.statements.length) return { type: "Alias", name: "null" };
       return typeFromStatement(
         expr.statements[expr.statements.length - 1],
         ctx,
