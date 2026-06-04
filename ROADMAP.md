@@ -80,6 +80,9 @@ stays tolerant of both binaryen forms (sync object / async init).*
 - 🟡 **B2. Finish numeric codegen.** i64 & f32 binary ops are not wired (only i32/boolean/
   f64 branches exist). Add numeric **casting/coercion** (none today).
 - 🟡 **B3. First-class functions / indirect calls** (working for the single-shape case).
+  *Representation note: B4 superseded the bare i32 index — a function value is now a fat-pointer
+  closure struct `{ i32 tableIndex, structref env }`; the table + `call_indirect` dispatch below
+  still stand.*
   A function value is an **i32 index into a wasm function table** (`addTable` +
   `addActiveElementSegment`); function-typed locals/params hold that index and
   `call_indirect` dispatches on it. Functions are instantiated lazily (per resolved name)
@@ -92,28 +95,25 @@ stays tolerant of both binaryen forms (sync object / async init).*
   per resolved name, so calling the *same* inferred-generic function with two different type
   shapes (e.g. `apply(addi, …)` then `apply(addf, …)`) fails validation. Emit `name$i32` /
   `name$f64` instances keyed on the concrete signature. See `vl-current-work-indirect-calls`.
-- 🟡 **B4. Closures** — **non-escaping closures WORK** (the project's first WasmGC codegen).
-  DONE:
+- ✅ **B4. Closures** — full closures WORK (the project's first WasmGC codegen).
   1. **Nested function declarations** — a function-body block caches its value type during the
      walk (so return-type inference survives the scope pop), and Block codegen registers nested
      decls like the Program case.
   2. **Capture analysis** — `instantiate` compiles a capturing body twice: pass 1 collects the
-     captured names (placeholders, body discarded) via a function-boundary check in
-     `lookupName`; pass 2 recompiles against the env.
-  3. **Environment struct** — a WasmGC struct (`TypeBuilder`, one immutable field per capture);
-     the callee takes a hidden leading `(ref env)` param and each captured read is a
-     `struct.get` on it.
-  4. **Non-escaping call** — call sites `struct.new` the env from the captures' current values
-     (read in the caller's scope) and thread it as the hidden leading arg.
-  Captures are **read-only and numeric** for now. Test: `functions/closure.vl` (15, 110).
-  REMAINING:
-  - **Escaping closures** — a capturing function used as a *value* throws a clear guard today
-    (the function table holds a bare funcref, no env). Make a function value a **fat pointer**
-    (closure struct: funcref + env), call via `call_ref`, unifying with B3's table. The big
-    one — reworks the i32-table-index function-value representation.
-  - **Mutable / non-numeric captures** — writing to a captured var (needs boxing / a mutable
-    env field) and capturing refs (objects, strings — depends on B5/B7).
-  Depends on B1 (done) + B3 (done).
+     captured names (placeholders, body discarded) via a function-boundary check in `lookupName`;
+     pass 2 recompiles against the env.
+  3. **Environment struct** — a WasmGC struct (`TypeBuilder`, one field per capture); captured
+     reads `ref.cast` the env parameter to it and `struct.get`. Captures may be objects (refs).
+  4. **Escaping closures** — a function value is a **fat pointer**: a uniform WasmGC struct
+     `{ i32 tableIndex, structref env }`. Every impl takes a leading `structref` env param (null
+     for non-capturing), so all function values are interchangeable; a value packs
+     `{ tableIndexOf(f), env }` (env captured at creation time, travels with the value); direct
+     calls prepend the env, indirect calls extract index+env and `call_indirect`. Dispatch stays
+     table-based (reuses B3). So capturing functions can be returned / stored in fields / passed,
+     each keeping its own env (`functions/escaping.vl`: 15, 110, 17).
+  Tests: `functions/closure.vl`, `functions/escaping.vl`. REMAINING (smaller): **mutable
+  captures** — writing to a captured variable (needs boxing / a mutable env cell; reads are
+  by-value today). Depends on B1 (done) + B3 (done).
 - 🟡 **B5. Objects in codegen** — core object support DONE on **WasmGC structs** (reusing the
   closure struct machinery). `{x,y}` → `struct.new`; `p.x` → `struct.get`; `p.x = v` →
   `struct.set`. Shapes are interned by a canonical signature (fields sorted by name, mutable),
