@@ -132,6 +132,40 @@ run client-side.*
 
 ---
 
+## Track G — Replace antlr4 with a hand-written parser
+*Goal: drop the antlr4 dependency. Independent; safe to do incrementally because
+the `.vl` test corpus is parser-agnostic and `compile()` isolates the parser.*
+
+Why drop it:
+- **Heavyweight non-JS build step.** Regenerating the parser (`deno task gen`)
+  needs Java + Gradle + the antlr4 gradle plugin — bolted onto a Deno/TS project.
+  Every new syntax feature (e.g. the `is` operator) requires a regen.
+- **Large committed generated code that drifts.** `VL_Parser.ts`/`VL_Lexer.ts`
+  are committed in two places and copied around; they've already drifted (the
+  dead interpreter test, a stray `override` type error in the generated parser).
+- **Awkward CST→AST layer.** Half of `toAST.ts` is spelunking the untyped parse
+  tree (`ctx.expr(0)`, `ctx.LBRACK()`, null-checks). Precedence is encoded as
+  ordered `expr` alternatives; newline handling is `NEWLINE*` sprinkled everywhere.
+- **Bootstrap blocker.** A Java-toolchain-generated parser can never be part of a
+  self-hosted VL compiler. A hand-written one is a stepping stone toward it.
+
+- ⬜ **G1. Hand-written lexer.** The lexer is already essentially a token list
+  (`VL_Lexer.g4`); reimplement directly in TS. Cleaner significant-newline
+  handling than `NEWLINE*` everywhere.
+- ⬜ **G2. Recursive-descent statements + Pratt/precedence-climbing expressions.**
+  Pratt handles the operator-precedence cascade elegantly. **Emit the typed AST
+  (`VLExpression`/`VLStatement`) directly**, collapsing the CST→AST translation
+  out of `toAST.ts` (the type-checking half stays). Full control over error
+  messages and incremental parsing; no build step, no generated blob.
+- ⬜ **G3. Keep `.g4` (or an EBNF doc) as the human-readable grammar spec.**
+- ⬜ **G4. Delete antlr4 deps, the gradle project, generated dirs, and the
+  `gen` task.** The `.vl` corpus validates behavior across the swap.
+- Alternatives considered: a pure-JS PEG generator (peggy) drops Java but keeps a
+  generic tree + a dep; parser combinators similar. Hand-written wins on errors
+  and bootstrappability for a grammar this small.
+
+---
+
 ## Track F — Infrastructure & hygiene
 *Independent; do continuously.*
 
