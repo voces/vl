@@ -7,7 +7,12 @@ import {
   TextDocumentSyncKind,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
-import { compile, runWasm, VLDiagnostic, VLSeverity } from "./compile.ts";
+import {
+  compile,
+  runWasm,
+  VLDiagnostic,
+  VLSeverity,
+} from "../../compiler/compile.ts";
 
 declare const process: NodeJS.Process;
 

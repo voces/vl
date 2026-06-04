@@ -8,8 +8,16 @@ The vision: a scripting-feel language with types **hidden by aggressive inferenc
 
 Status legend: ✅ done · 🟡 partial · ⬜ not started.
 
+**Repo layout** (restructured June 2026): `compiler/` — the language core (compile,
+toAST, toWasm, defaultScope + generated `antlr/`), owned by nobody else · `lsp/` — the
+VS Code extension/LSP client+server over the core · `cli/` (future) · `playground/`
+(future) · `grammar/` — the `.g4` spec + antlr gen project · `samples/` · `tests/` —
+`.vl` corpus + runner · `docs/` · `reference/` — retired ts-interpreter. Single root
+`package.json`/`node_modules` (so esbuild resolves deps from both `compiler/` and `lsp/`)
+and root `deno.json` (workspace config + test/lint).
+
 The tracks below are **independent** unless a dependency is called out. Within a
-track, items are roughly ordered. See `vscode-extension/TODO.md` for prose on the
+track, items are roughly ordered. See `docs/language-todo.md` for prose on the
 closures / `is` / variance designs referenced here.
 
 ---
@@ -177,12 +185,12 @@ Why drop it:
 *Independent; do continuously.*
 
 - ✅ **F1. Test harness for the wasm path.** `deno task test` runs `tests/run.ts` over a
-  black-box `.vl` corpus with `// @directive` expectations. (`ts-interpreter` was the
-  only prior test; excluded via `deno.json`.)
+  black-box `.vl` corpus with `// @directive` expectations. (`reference/ts-interpreter`
+  was the only prior test; excluded via `deno.json`.)
 - ⬜ **F2. Strip / gate debug `console.log`s** in `toWasm.ts` (getFunction, "???",
   emitText dumps) behind a debug flag.
-- ⬜ **F3. Decide the fate of `ts-interpreter/`** — keep as a reference oracle for tests,
-  or retire. It's older than the wasm path.
+- ✅ **F3. Retired `ts-interpreter/` → `reference/ts-interpreter/`** (stale tree-walking
+  backend; kept for reference, excluded from tests/lint).
 - ⬜ **F4. Re-enable inline `m.validate()`** during dev (currently only the final validate
   runs) for earlier failure.
 - ⬜ **F5. Settle the name** (VL vs Vital vs Vital Language) and apply consistently.

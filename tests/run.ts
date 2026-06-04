@@ -19,7 +19,7 @@ import {
   compile,
   runWasm,
   type VLDiagnostic,
-} from "../vscode-extension/src/compile.ts";
+} from "../compiler/compile.ts";
 
 const CASES_DIR = new URL("./cases/", import.meta.url);
 
