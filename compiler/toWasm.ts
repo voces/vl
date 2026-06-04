@@ -545,61 +545,80 @@ export const toWasm = async (ast: VLProgramNode) => {
           () => m.return(node.value ? toExpression(node.value) : undefined),
         );
       case "While": {
-        const name = node.label ?? `loop${loopIndex++}`;
-        loopLabels.push(name);
-        const loop = m.loop(
-          name,
-          m.block(null, [
-            m.br(name, toExpression(node.condition)),
-            toExpression(node.statement),
-          ]),
-        );
+        // (block $brk (loop $cont (br_if $brk (eqz cond)) body (br $cont)))
+        // $cont is the continue target (re-checks the condition each pass).
+        const cont = node.label ?? `loop${loopIndex++}`;
+        const brk = `${cont}__brk`;
+        loopLabels.push(cont);
+        const loop = m.block(brk, [
+          m.loop(
+            cont,
+            m.block(null, [
+              m.br(brk, m.i32.eqz(toExpression(node.condition))),
+              toExpression(node.statement),
+              m.br(cont),
+            ]),
+          ),
+        ]);
         if (!node.label) loopIndex--;
         loopLabels.pop();
         return loop;
       }
       case "For": {
-        const name = node.label ?? `loop${loopIndex++}`;
-        loopLabels.push(name);
+        // (block $brk
+        //   i = from                         ; declared once, before the loop
+        //   (loop $loop
+        //     (br_if $brk (i > to))           ; inclusive: exit once past `to`
+        //     (block $cont body)              ; continue → falls through to step
+        //     i = i + step
+        //     (br $loop)))
+        const cont = node.label ?? `loop${loopIndex++}`;
+        const loopLabel = `${cont}__loop`;
+        const brk = `${cont}__brk`;
+        loopLabels.push(cont);
         const variableType = softenImplicitType(vlType(node.from));
         const varRef = setNodeType(
           { type: "Name", name: node.variable },
           variableType,
         );
-        const loop = m.loop(
-          name,
-          m.block(null, [
-            toExpression({
-              type: "VariableDeclaration",
-              name: node.variable,
-              variableType,
-              value: node.from,
-              mutable: true,
-            }),
-            m.br(
-              name,
+        const step: VLStatement = node.step ??
+          { type: "IntegerLiteral", value: 1, text: "1" };
+        const loop = m.block(brk, [
+          toExpression({
+            type: "VariableDeclaration",
+            name: node.variable,
+            variableType,
+            value: node.from,
+            mutable: true,
+          }),
+          m.loop(
+            loopLabel,
+            m.block(null, [
+              m.br(
+                brk,
+                toExpression({
+                  type: "BinaryOperation",
+                  left: varRef,
+                  operator: ">",
+                  right: node.to,
+                }),
+              ),
+              m.block(cont, [toExpression(node.statement)]),
               toExpression({
                 type: "BinaryOperation",
                 left: varRef,
-                operator: ">",
-                right: node.to,
+                operator: "=",
+                right: {
+                  type: "BinaryOperation",
+                  left: varRef,
+                  operator: "+",
+                  right: step,
+                },
               }),
-            ),
-            toExpression(node.statement),
-            // TODO, actually wire up step
-            toExpression({
-              type: "BinaryOperation",
-              left: varRef,
-              operator: "=",
-              right: {
-                type: "BinaryOperation",
-                left: varRef,
-                operator: "+",
-                right: { type: "IntegerLiteral", value: 1, text: "1" },
-              },
-            }),
-          ]),
-        );
+              m.br(loopLabel),
+            ]),
+          ),
+        ]);
         if (!node.label) loopIndex--;
         loopLabels.pop();
         return loop;
