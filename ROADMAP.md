@@ -56,6 +56,15 @@ closures / `is` / variance designs referenced here.
 decision — escape analysis stack-allocates non-escaping values; escaping values go to
 WasmGC; keep manual linear memory as an opt-in escape hatch.*
 
+*Dependency decision: **keep binaryen** (unlike antlr4 — Track G). It's pure WASM/JS,
+does the heavy lifting (IR + validation + optimizer), supports WasmGC types (helps
+B1/B4), and is a library binding that does **not** block self-hosting. The
+`patches/binaryen+116.0.0.patch` is load-bearing for the **CJS LSP bundle only**:
+binaryen@116's `index.js` uses top-level await, which `require()`/CJS can't load, so
+the patch strips the TLA by wrapping init in an async `Binaryen()`. The ESM path
+(Deno core/CLI/tests/browser) needs no patch — the default export is the ready object;
+`toWasm` is tolerant of both forms. To drop the patch, see F8.*
+
 - ✅ **B0. Numeric literals + i32/f64 arithmetic, if/while, direct calls, `__program__`
   start fn, memory builtins.**
 - ⬜ **B1. Decide allocation strategy** (see top of track). Recommendation: WasmGC as the
@@ -169,8 +178,9 @@ Why drop it:
 ## Track F — Infrastructure & hygiene
 *Independent; do continuously.*
 
-- ⬜ **F1. Test harness for the wasm path.** Today only `ts-interpreter/` has tests; the
-  real compiler has none. Add golden `.vl → expected output` tests (depends on C1).
+- ✅ **F1. Test harness for the wasm path.** `deno task test` runs `tests/run.ts` over a
+  black-box `.vl` corpus with `// @directive` expectations. (`ts-interpreter` was the
+  only prior test; excluded via `deno.json`.)
 - ⬜ **F2. Strip / gate debug `console.log`s** in `toWasm.ts` (getFunction, "???",
   emitText dumps) behind a debug flag.
 - ⬜ **F3. Decide the fate of `ts-interpreter/`** — keep as a reference oracle for tests,
@@ -181,6 +191,12 @@ Why drop it:
 - ⬜ **F6. Document grammar regen** (`deno task gen`, needs gradle + the antlr4 project)
   and the build (`deno task build`).
 - ⬜ **F7. Fix the `paramater` misspelling** project-wide (optional; currently consistent).
+- ⬜ **F8. Optionally drop `patches/binaryen+116.0.0.patch`.** Only the CJS LSP bundle
+  needs it (binaryen's top-level await). Two clean paths: (a) build the LSP server as
+  **ESM** (`--format=esm`, drop the `import.meta.url` banner shim) — TLA is then legal; or
+  (b) keep CJS but `--external:binaryen` and `await import("binaryen")` at runtime (ship
+  binaryen as a real dep). Either removes the patch + the patch-package postinstall.
+  Verify the LSP in VS Code after — can't be checked headlessly.
 
 ---
 
