@@ -663,8 +663,12 @@ export const ensureType = (
           continue;
         }
       }
-      if (rprops.size) {
-        if (!indexProperties) return pushError(31);
+      // Excess properties on the supplied object: if the expected type has
+      // index signatures they must satisfy one; otherwise they are allowed
+      // (permissive structural width subtyping — a wider object satisfies a
+      // narrower shape, so `function f(o) o.x` accepts `{ x, y }`). Exact-by-
+      // default for values is a later refinement (ROADMAP A8 variance).
+      if (rprops.size && indexProperties.length) {
         outer: for (const rprop of rprops.values()) {
           for (const lprop of indexProperties) {
             if (validateType(lprop.name, rprop.name)) continue outer;

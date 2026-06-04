@@ -606,31 +606,51 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "BinaryOperation": {
         const op = node.operator;
-        // Property assignment: `obj.field = value` -> struct.set. Handled before
-        // `vlType(node.left)`, which a PropertyAccess LHS would not satisfy.
-        if (op === "=" && node.left.type === "PropertyAccess") {
-          const access = node.left;
-          const struct = objectStruct(objectTypeOf(access.object));
-          const field = struct.fields.find((f) => f.name === access.property);
-          if (!field) {
-            throw new Error(`Object has no field "${access.property}"`);
+        // Assignment is handled before the operator-method machinery below: the
+        // LHS (a Name or `obj.field`) is not a value to evaluate, and an object
+        // type carries no `=` method to look up.
+        if (op === "=") {
+          if (node.left.type === "PropertyAccess") {
+            const access = node.left;
+            const struct = objectStruct(objectTypeOf(access.object));
+            const field = struct.fields.find((f) => f.name === access.property);
+            if (!field) {
+              throw new Error(`Object has no field "${access.property}"`);
+            }
+            const value = withDesiredType(
+              field.type,
+              () => toExpression(node.right),
+            );
+            const set = m.struct.set(
+              field.index,
+              toExpression(access.object),
+              value,
+            );
+            // In value position, read the field back (re-evaluates the object).
+            const wasmType = toWasmType(field.type);
+            return desiredType
+              ? m.block(null, [
+                set,
+                m.struct.get(
+                  field.index,
+                  toExpression(access.object),
+                  wasmType,
+                  false,
+                ),
+              ], wasmType)
+              : set;
           }
-          const value = withDesiredType(
-            field.type,
-            () => toExpression(node.right),
+          if (node.left.type !== "Name") {
+            throw new Error(`binop = for non-names/properties not handled`);
+          }
+          const [type, localIndex] = getScopeEntry(node.left.name);
+          const wasmType = toWasmType(type);
+          const set = m.local.set(
+            localIndex,
+            withDesiredType(type, () => toExpression(node.right)),
           );
-          const set = m.struct.set(field.index, toExpression(access.object), value);
-          // In value position, read the field back (re-evaluates the object).
           return desiredType
-            ? m.block(null, [
-              set,
-              m.struct.get(
-                field.index,
-                toExpression(access.object),
-                toWasmType(field.type),
-                false,
-              ),
-            ], toWasmType(field.type))
+            ? m.block(null, [set, m.local.get(localIndex, wasmType)], wasmType)
             : set;
         }
         const leftType = vlType(node.left);
@@ -648,31 +668,10 @@ export const toWasm = async (ast: VLProgramNode) => {
         }
 
         if (
-          (leftType.type === "Object" &&
-            (leftType.name === "i32" || leftType.name === "boolean" ||
-              leftType.name === "f64")) ||
-          op === "="
+          leftType.type === "Object" &&
+          (leftType.name === "i32" || leftType.name === "boolean" ||
+            leftType.name === "f64")
         ) {
-          if (op === "=") {
-            const left = node.left;
-            if (left.type !== "Name") {
-              throw new Error(`binop = for non-names not handled`);
-            }
-            const [type, localIndex] = getScopeEntry(left.name);
-            const wasmType = toWasmType(type);
-            const set = m.local.set(
-              localIndex,
-              withDesiredType(type, () => toExpression(node.right)),
-            );
-            return desiredType
-              ? m.block(
-                null,
-                [set, m.local.get(localIndex, wasmType)],
-                wasmType,
-              )
-              : set;
-          }
-
           if (leftType.type !== "Object") throw new Error("Expected object");
           const name = leftType.name;
           if (name === "i32" || name === "boolean") {
