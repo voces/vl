@@ -26,6 +26,7 @@ const CASES_DIR = new URL("./cases/", import.meta.url);
 type Directives = {
   mode: "check" | "run";
   errors: string[];
+  errorsAt: { line: number; col: number; text: string }[];
   logs: string[];
   noError: boolean;
   skip: string | null;
@@ -35,6 +36,7 @@ const parseDirectives = (src: string): Directives => {
   const d: Directives = {
     mode: "check",
     errors: [],
+    errorsAt: [],
     logs: [],
     noError: false,
     skip: null,
@@ -58,6 +60,17 @@ const parseDirectives = (src: string): Directives => {
       case "error":
         d.errors.push(rest);
         break;
+      case "error-at": {
+        const at = rest.match(/^(\d+):(\d+)\s+(.*)$/);
+        if (at) {
+          d.errorsAt.push({
+            line: Number(at[1]),
+            col: Number(at[2]),
+            text: at[3],
+          });
+        }
+        break;
+      }
       case "log":
         d.logs.push(rest);
         break;
@@ -113,6 +126,26 @@ for (const file of files) {
             `expected an error containing "${want}", got: ${
               JSON.stringify(errs)
             }`,
+          );
+        }
+      }
+
+      for (const want of d.errorsAt) {
+        const hit = diagnostics.some((di) =>
+          di.severity === "error" &&
+          di.range.start.line === want.line &&
+          di.range.start.character === want.col &&
+          di.message.includes(want.text)
+        );
+        if (!hit) {
+          const got = diagnostics
+            .filter((di) => di.severity === "error")
+            .map((di) =>
+              `${di.range.start.line}:${di.range.start.character} ${di.message}`
+            );
+          throw new Error(
+            `expected an error at ${want.line}:${want.col} containing ` +
+              `"${want.text}", got: ${JSON.stringify(got)}`,
           );
         }
       }
