@@ -157,9 +157,10 @@ stays tolerant of both binaryen forms (sync object / async init).*
   7, 42, 105). Also fixed a parser precedence bug this surfaced: member-access *reads* (`.`/`[]`)
   bound looser than arithmetic (`a.x + b.y` mis-parsed as `(a.x + b).y`) — moved them above the
   operators in `VL_Parser.g4` + regen. REMAINING (separate features): **methods via explicit
-  receiver + UFCS** (see B14 — DECIDED: no `this`), **function literals in object values**
-  (`{ f: function() … }` — parser), typed literals in object values (`{n: 4<i64>}` — parser),
-  and **Exact-by-default for values** (A8 variance — excess is permissive everywhere today).
+  receiver + UFCS** (see B14 — DECIDED: no `this`), **method-shorthand** field sugar
+  (`{ add(a,b) … }` — parser; the `{ f: function… }` form already works, B15 done), typed
+  literals in object values (`{n: 4<i64>}` — parser), and **Exact-by-default for values**
+  (A8 variance — excess is permissive everywhere today).
 - ⬜ **B6. Arrays in codegen** (WasmGC arrays or linear memory). Depends on B1.
 - ⬜ **B7. Strings in codegen.** Depends on A7 + B1.
 - 🟡 **B8. Loops: wire `for` `step`** (parsed/typechecked but hardcoded `+1`), and
@@ -242,13 +243,16 @@ stays tolerant of both binaryen forms (sync object / async init).*
     shorthand** `{ add(a,b) a+b }` (doesn't parse). Both already in B5's remaining list.
   Reuses B5 (`o.f()` lowering). Pairs with B13 (operator/call/index dispatch) — together they
   make "methods, operators, call, index" all ordinary typed functions resolved statically.
-- ⬜ **B15. Anonymous / lambda functions (codegen) + the declaration-vs-value distinction.**
-  Anonymous functions are *modeled* (the name is optional in `toFunctionDeclaration`) and
-  type-check, but **codegen throws** `Unhandled FunctionDeclaration` for a function expression
-  in value position — `let add = function(a: i32, b: i32) a + b` doesn't compile. The lowering
-  is: a `FunctionDeclaration` in value position → emit it as an instance + produce a
-  `closureValue` (the same fat-pointer the Name-as-value path already builds). This **also**
-  fixes B5's inline-function-literal object fields (`{ add: function… }`) — same root gap.
+- 🟡 **B15. Anonymous / lambda functions (codegen) + the declaration-vs-value distinction.**
+  DONE (typed): a `FunctionDeclaration` in value position lowers to its `closureValue`
+  (`registerFunctionDecl` handles anonymous fns with a synthesized name; `toExpression` has a
+  `FunctionDeclaration` case). Verified: let-bound lambdas called directly, lambdas capturing an
+  enclosing variable, lambdas as higher-order args, and **inline function literals as object
+  fields** (`let foo = { add: function(a,b) a+b }; foo.add(1,2)` — the container/namespace
+  pattern, which also closed B5's inline-function-literal gap). Tests: `functions/lambda.vl`,
+  `objects/inline-method.vl`. REMAINING: **untyped** lambdas (the first-class-polymorphic-value
+  case below — a stored closure has one signature; needs pinning-by-use or boxing) and the
+  **method-shorthand** `{ add(a,b) … }` parser sugar (B5).
   - **DECIDED — syntax:** **one form, `function(params) body`** (unambiguous, already modeled —
     just needs codegen). Bare keyword-less `(params) body` is rejected (the classic arrow
     ambiguity — `(a, b)` reads as a paren/tuple expr until after the `)`; today a hard parse
