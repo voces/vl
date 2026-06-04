@@ -25,7 +25,15 @@ const lowMask = BigInt(0xFFFFFFFF);
 const ignoredKeys = new Set(Object.keys(defaultScope()));
 
 export const toWasm = async (ast: VLProgramNode) => {
-  const binaryen = await Binaryen();
+  // binaryen's default export is a synchronous module object (plain npm), or,
+  // when the binaryen patch is applied (patch-package, used by the bundled
+  // extension), an async init function returning that object. Support both so
+  // the core runs under Deno/CLI (unpatched) and the esbuild bundle (patched).
+  // deno-lint-ignore no-explicit-any
+  const _Binaryen = Binaryen as any;
+  const binaryen = typeof _Binaryen === "function"
+    ? await _Binaryen()
+    : _Binaryen;
   const m = new binaryen.Module();
 
   m.addMemoryImport("memory", "imports", "memory");

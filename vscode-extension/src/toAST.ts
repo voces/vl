@@ -246,7 +246,7 @@ export const withScope = <T>(scope: Scope, fn: () => T) => {
   }
 };
 
-type ParseErrors =
+export type ParseErrors =
   | {
     type: "Redeclaration";
     name: string;
