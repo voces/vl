@@ -77,7 +77,7 @@ const createClient = (
 };
 
 export const activate = (context: ExtensionContext) => {
-  const module = context.asAbsolutePath(path.join("dist", "server.js"));
+  const module = context.asAbsolutePath(path.join("dist", "server.mjs"));
   const outputChannel: OutputChannel = Window.createOutputChannel("vital");
 
   const didOpenTextDocument = (document: TextDocument) => {

@@ -58,12 +58,10 @@ WasmGC; keep manual linear memory as an opt-in escape hatch.*
 
 *Dependency decision: **keep binaryen** (unlike antlr4 — Track G). It's pure WASM/JS,
 does the heavy lifting (IR + validation + optimizer), supports WasmGC types (helps
-B1/B4), and is a library binding that does **not** block self-hosting. The
-`patches/binaryen+116.0.0.patch` is load-bearing for the **CJS LSP bundle only**:
-binaryen@116's `index.js` uses top-level await, which `require()`/CJS can't load, so
-the patch strips the TLA by wrapping init in an async `Binaryen()`. The ESM path
-(Deno core/CLI/tests/browser) needs no patch — the default export is the ready object;
-`toWasm` is tolerant of both forms. To drop the patch, see F8.*
+B1/B4), and is a library binding that does **not** block self-hosting. The binaryen
+patch was **removed** (F8 done): the LSP server now builds as ESM, where binaryen's
+top-level await is legal, so `patch-package` and the 242KB patch are gone. `toWasm`
+stays tolerant of both binaryen forms (sync object / async init).*
 
 - ✅ **B0. Numeric literals + i32/f64 arithmetic, if/while, direct calls, `__program__`
   start fn, memory builtins.**
@@ -191,12 +189,12 @@ Why drop it:
 - ⬜ **F6. Document grammar regen** (`deno task gen`, needs gradle + the antlr4 project)
   and the build (`deno task build`).
 - ⬜ **F7. Fix the `paramater` misspelling** project-wide (optional; currently consistent).
-- ⬜ **F8. Optionally drop `patches/binaryen+116.0.0.patch`.** Only the CJS LSP bundle
-  needs it (binaryen's top-level await). Two clean paths: (a) build the LSP server as
-  **ESM** (`--format=esm`, drop the `import.meta.url` banner shim) — TLA is then legal; or
-  (b) keep CJS but `--external:binaryen` and `await import("binaryen")` at runtime (ship
-  binaryen as a real dep). Either removes the patch + the patch-package postinstall.
-  Verify the LSP in VS Code after — can't be checked headlessly.
+- ✅ **F8. Dropped `patches/binaryen+116.0.0.patch` + `patch-package`.** The LSP server
+  now builds as **ESM** (`dist/server.mjs`, `--format=esm`); the client stays CJS
+  (`dist/extension.js`). binaryen's top-level await is legal in ESM, so no patch is
+  needed. Cleared all 9 `npm audit` advisories (77→13 packages). Verified headlessly:
+  esbuild-bundled unpatched binaryen compiles + runs a VL program under Node. **Still to
+  confirm in VS Code (F5):** vscode-languageclient forking an ESM server over IPC.
 
 ---
 
