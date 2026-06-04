@@ -122,12 +122,16 @@ stays tolerant of both binaryen forms (sync object / async init).*
   reads (`p.a.x`), f64 fields, **objects as function args/returns**, **reassignment**, empty
   objects, and **objects captured in closures** (ref-typed env fields). **Excess properties are
   allowed** (permissive structural width subtyping: `function f(o) o.x` accepts `{x,y}`).
-  Also fixed a parser precedence bug this surfaced: member-access *reads* (`.`/`[]`) bound looser
-  than arithmetic (`a.x + b.y` mis-parsed as `(a.x + b).y`) — moved them above the operators in
-  `VL_Parser.g4` + regen. REMAINING (separate features): **methods** (function-typed fields +
-  `o.f()` — needs parser support for function literals in object values and calling a
-  property-access result), typed literals in object values (`{n: 4<i64>}` — parser), and
-  **Exact-by-default for values** (A8 variance — today excess is permissive everywhere).
+  **Function-valued fields + member-call syntax** work: `let o = { f: someFn }` then `o.f(args)`
+  (a new `VLCallNode` for calling an arbitrary expression value; dispatches through the closure
+  struct, so the field may hold a plain function *or* an escaping closure — `objects/member-call.vl`:
+  7, 42, 105). Also fixed a parser precedence bug this surfaced: member-access *reads* (`.`/`[]`)
+  bound looser than arithmetic (`a.x + b.y` mis-parsed as `(a.x + b).y`) — moved them above the
+  operators in `VL_Parser.g4` + regen. REMAINING (separate features): **`this`-bound methods** (a
+  field fn implicitly seeing its object — today capture the object explicitly), **function
+  literals in object values** (`{ f: function() … }` — parser), typed literals in object values
+  (`{n: 4<i64>}` — parser), and **Exact-by-default for values** (A8 variance — excess is permissive
+  everywhere today).
 - ⬜ **B6. Arrays in codegen** (WasmGC arrays or linear memory). Depends on B1.
 - ⬜ **B7. Strings in codegen.** Depends on A7 + B1.
 - 🟡 **B8. Loops: wire `for` `step`** (parsed/typechecked but hardcoded `+1`), and
