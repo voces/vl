@@ -114,15 +114,20 @@ stays tolerant of both binaryen forms (sync object / async init).*
   - **Mutable / non-numeric captures** — writing to a captured var (needs boxing / a mutable
     env field) and capturing refs (objects, strings — depends on B5/B7).
   Depends on B1 (done) + B3 (done).
-- 🟡 **B5. Objects in codegen** — structural objects compile to **WasmGC structs** (reusing
-  the closure struct machinery). `{x,y}` → `struct.new`; `p.x` → `struct.get`; `p.x = v` →
+- 🟡 **B5. Objects in codegen** — core object support DONE on **WasmGC structs** (reusing the
+  closure struct machinery). `{x,y}` → `struct.new`; `p.x` → `struct.get`; `p.x = v` →
   `struct.set`. Shapes are interned by a canonical signature (fields sorted by name, mutable),
-  so identical shapes share a struct type. `toWasmType` maps a structural Object to its struct
-  ref. Test: `objects/struct.vl`. Also fixed a parser precedence bug this surfaced: member-access
-  *reads* (`.`/`[]`) bound looser than arithmetic (`a.x + b.y` mis-parsed as `(a.x + b).y`) —
-  moved them above the operators in `VL_Parser.g4` + regen. REMAINING: non-numeric/nested
-  field types beyond the basics, objects as function args/returns (should work via the struct
-  ref but untested), excess-property/structural-subtype coercion at boundaries, methods.
+  so identical shapes share a struct type; `toWasmType` maps a structural Object to its struct
+  ref. Working & tested (`objects/struct.vl`, `objects/pass.vl`): literals, read/write, nested
+  reads (`p.a.x`), f64 fields, **objects as function args/returns**, **reassignment**, empty
+  objects, and **objects captured in closures** (ref-typed env fields). **Excess properties are
+  allowed** (permissive structural width subtyping: `function f(o) o.x` accepts `{x,y}`).
+  Also fixed a parser precedence bug this surfaced: member-access *reads* (`.`/`[]`) bound looser
+  than arithmetic (`a.x + b.y` mis-parsed as `(a.x + b).y`) — moved them above the operators in
+  `VL_Parser.g4` + regen. REMAINING (separate features): **methods** (function-typed fields +
+  `o.f()` — needs parser support for function literals in object values and calling a
+  property-access result), typed literals in object values (`{n: 4<i64>}` — parser), and
+  **Exact-by-default for values** (A8 variance — today excess is permissive everywhere).
 - ⬜ **B6. Arrays in codegen** (WasmGC arrays or linear memory). Depends on B1.
 - ⬜ **B7. Strings in codegen.** Depends on A7 + B1.
 - 🟡 **B8. Loops: wire `for` `step`** (parsed/typechecked but hardcoded `+1`), and
