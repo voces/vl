@@ -3,6 +3,7 @@
 // public facade — it re-exports the AST types, shared `withScope`, and the
 // type-algebra entry points so existing `./toAST.ts` imports keep working.
 import {
+  ArgContext,
   ArrayContext,
   ExprContext,
   FunctionDeclContext,
@@ -20,6 +21,7 @@ import type {
   VLArgumentNode,
   VLArrayLiteralNode,
   VLBinaryOperationNode,
+  VLCallNode,
   VLExpression,
   VLFunctionCallNode,
   VLFunctionDeclarationNode,
@@ -304,12 +306,57 @@ const toArrayLiteral = (ctx: ArrayContext): VLArrayLiteralNode => ({
   values: ctx.expr_list().map((e) => toExpression(e)),
 });
 
+const toArguments = (args: ArgContext[]): VLArgumentNode[] =>
+  args.map((arg): VLArgumentNode => {
+    const fullArg: VLArgumentNode = {
+      type: "Argument",
+      name: arg.ID()?.getText(),
+      value: toExpression(arg.expr()),
+      context: arg,
+    };
+    Object.defineProperty(fullArg, "context", { enumerable: false });
+    return fullArg;
+  });
+
 const toExpression = (ctx: ExprContext): VLExpression => {
   if (ctx.EQUAL()) return toAssignment(ctx);
 
   {
     const funcDecl = ctx.functionDecl();
     if (funcDecl) return toFunctionDeclaration(funcDecl);
+  }
+
+  // Member call: `o.f(args)` — call the function-valued property `o.f`.
+  if (ctx.DOT() && ctx.LPAREN()) {
+    const objCtx = ctx.expr(0);
+    const object = toExpression(objCtx);
+    const id = ctx.ID();
+    const property = id.getText();
+    const calleeType = getChildType(
+      typeFromExpression(object, ctx),
+      { type: "StringLiteral", value: property },
+      objCtx,
+      id,
+    );
+    const call: VLCallNode = {
+      type: "Call",
+      callee: { type: "PropertyAccess", object, property },
+      arguments: toArguments(ctx.args()?.arg_list() ?? []),
+      functionType: undefined,
+    };
+    if (calleeType?.type === "Function") {
+      ensureParameters(calleeType.paramaters, call.arguments, ctx);
+      call.functionType = calleeType;
+    } else if (calleeType && calleeType.type !== "Unknown") {
+      errors.push({
+        type: "Type",
+        left: { type: "Function", paramaters: [], return: { type: "Unknown" } },
+        right: calleeType,
+        ctx,
+        code: "member-call",
+      });
+    }
+    return call;
   }
 
   if (ctx.DOT()) {
@@ -458,20 +505,10 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     if (call) {
       const id = call.ID();
       const name = id.getText();
-      const args = call.args()?.arg_list() ?? [];
       const funcCall: VLFunctionCallNode = {
         type: "FunctionCall",
         function: name,
-        arguments: args.map((arg): VLArgumentNode => {
-          const fullArg: VLArgumentNode = {
-            type: "Argument",
-            name: arg.ID()?.getText(),
-            value: toExpression(arg.expr()),
-            context: arg,
-          };
-          Object.defineProperty(fullArg, "context", { enumerable: false });
-          return fullArg;
-        }),
+        arguments: toArguments(call.args()?.arg_list() ?? []),
         functionType: undefined,
       };
 

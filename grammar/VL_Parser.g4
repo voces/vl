@@ -72,6 +72,10 @@ expr
     // operators, so these reads must precede them (ANTLR4 left-recursive
     // precedence = alternative order). Else `a.x + b.y` mis-parses as
     // `(a.x + b).y`.
+    // Method/indirect call on a member: `o.f(args)`. Must precede the bare
+    // property read so the call form (the longer match) wins; no ambiguity with
+    // the ID-based functionCall, which has no DOT.
+    | expr NEWLINE* DOT ID NEWLINE* LPAREN NEWLINE* args? RPAREN // member call
     | expr LBRACK NEWLINE* expr NEWLINE* RBRACK // index expr
     | expr NEWLINE* DOT ID // property expr
     | expr NEWLINE* CARET NEWLINE* expr

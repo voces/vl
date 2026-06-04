@@ -432,6 +432,37 @@ export const toWasm = async (ast: VLProgramNode) => {
   const newLocal = (wasmType: number): number =>
     _locals.push(wasmType) - 1 + (_locals.params ?? 0);
 
+  // Call a function *value* (a closure struct): stash it, then dispatch on its
+  // table index, threading its environment as the leading argument.
+  const indirectCall = (
+    closureExpr: number,
+    paramTypes: VLType[],
+    operands: number[],
+    returnType: number,
+  ): number => {
+    const clo = closureStruct().refType;
+    const cloLocal = newLocal(clo);
+    const idx = m.struct.get(0, m.local.get(cloLocal, clo), binaryen.i32, false);
+    const env = m.struct.get(
+      1,
+      m.local.get(cloLocal, clo),
+      binaryen.structref,
+      false,
+    );
+    const indirect = m.call_indirect(
+      "table",
+      idx,
+      [env, ...operands],
+      binaryen.createType([binaryen.structref, ...paramTypes.map(toWasmType)]),
+      returnType,
+    );
+    return m.block(
+      null,
+      [m.local.set(cloLocal, closureExpr), indirect],
+      returnType,
+    );
+  };
+
   const handleFunctionDecl = (node: VLFunctionDeclarationNode) => {
     if (!node.name) throw new Error("Anonymous functions not yet handled");
     let name = node.name;
@@ -561,35 +592,39 @@ export const toWasm = async (ast: VLProgramNode) => {
             call = m.call(func, [envArgFor(func), ...operands], returnType);
           }
         } else {
-          // Indirect call through a function value (closure struct). Stash it,
-          // then dispatch on its table index, threading its environment.
-          const clo = closureStruct().refType;
-          const cloLocal = newLocal(clo);
-          const idx = m.struct.get(
-            0,
-            m.local.get(cloLocal, clo),
-            binaryen.i32,
-            false,
-          );
-          const env = m.struct.get(
-            1,
-            m.local.get(cloLocal, clo),
-            binaryen.structref,
-            false,
-          );
-          const indirect = m.call_indirect(
-            "table",
-            idx,
-            [env, ...operands],
-            binaryen.createType([
-              binaryen.structref,
-              ...functionType.paramaters.map((p) => toWasmType(p.paramaterType)),
-            ]),
+          // Indirect call through a function value (closure struct).
+          call = indirectCall(
+            func,
+            functionType.paramaters.map((p) => p.paramaterType),
+            operands,
             returnType,
           );
-          call = m.block(null, [m.local.set(cloLocal, func), indirect], returnType);
         }
 
+        return !hasDesiredType() && returnType !== binaryen.none
+          ? m.drop(call)
+          : call;
+      }
+      case "Call": {
+        // Calling an arbitrary expression value, e.g. `o.f(args)`. The callee
+        // evaluates to a closure struct; dispatch through it.
+        const functionType = node.functionType;
+        if (!functionType) {
+          throw new Error("Expected functionType to be set on a Call");
+        }
+        const operands = node.arguments.map((a, i) =>
+          withDesiredType(
+            functionType.paramaters[i]?.paramaterType,
+            () => toExpression(a.value),
+          )
+        );
+        const returnType = toWasmType(functionType.return);
+        const call = indirectCall(
+          toExpression(node.callee),
+          functionType.paramaters.map((p) => p.paramaterType),
+          operands,
+          returnType,
+        );
         return !hasDesiredType() && returnType !== binaryen.none
           ? m.drop(call)
           : call;

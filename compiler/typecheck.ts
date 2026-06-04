@@ -156,6 +156,8 @@ export const _typeFromExpression = (
         }
       }
       return { type: "Never" };
+    case "Call":
+      return expr.functionType?.return ?? { type: "Never" };
     case "If": {
       const stmts = expr.conditionals.map((c) => c.statement);
       if (expr.else) {

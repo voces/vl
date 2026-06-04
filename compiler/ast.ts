@@ -61,6 +61,14 @@ export type VLFunctionCallNode = {
   functionType: VLFunctionType | undefined;
 };
 
+/** Calling an arbitrary expression value (e.g. `o.f(args)`), vs a named call. */
+export type VLCallNode = {
+  type: "Call";
+  callee: VLExpression;
+  arguments: VLArgumentNode[];
+  functionType: VLFunctionType | undefined;
+};
+
 export type VLStringLiteralNode = {
   type: "StringLiteral";
   value: string;
@@ -139,6 +147,7 @@ export type VLExpression =
   | VLIndexAccessNode
   | VLBinaryOperationNode
   | VLFunctionCallNode
+  | VLCallNode
   | VLIfNode;
 
 export type VLReturnNode = {
