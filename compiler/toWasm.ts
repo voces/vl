@@ -1,4 +1,3 @@
-import { inspect } from "node:util";
 import Binaryen from "binaryen";
 import {
   setNodeType,
@@ -12,6 +11,8 @@ import {
   vlType,
 } from "./toAST.ts";
 import { defaultScope } from "./defaultScope.ts";
+import { registerBuiltins } from "./wasmBuiltins.ts";
+import { toWasmType as toWasmTypeOf } from "./wasmType.ts";
 
 const raise = (err?: string | Error): never => {
   if (typeof err === "object" && err instanceof Error) throw err;
@@ -34,92 +35,7 @@ export const toWasm = async (ast: VLProgramNode) => {
     : _Binaryen;
   const m = new binaryen.Module();
 
-  m.addMemoryImport("memory", "imports", "memory");
-
-  m.addFunctionImport(
-    "__log__",
-    "imports",
-    "__log__",
-    binaryen.createType([binaryen.i32, binaryen.i32]),
-    0,
-  );
-
-  // TODO: These don't need to be actual funcitons... can inline. But I think binaryen does that for us.
-  m.addFunction(
-    "__store_i32__",
-    binaryen.createType([binaryen.i32, binaryen.i32]),
-    binaryen.none,
-    [],
-    m.i32.store(
-      0,
-      4,
-      m.local.get(0, binaryen.i32),
-      m.local.get(1, binaryen.i32),
-    ),
-  );
-
-  m.addFunction(
-    "__load_i32__",
-    binaryen.i32,
-    binaryen.i32,
-    [],
-    m.i32.load(0, 4, m.local.get(0, binaryen.i32)),
-  );
-
-  m.addFunction(
-    "__store_i64__",
-    binaryen.createType([binaryen.i32, binaryen.i64]),
-    binaryen.none,
-    [],
-    m.i64.store(
-      0,
-      8,
-      m.local.get(0, binaryen.i32),
-      m.local.get(1, binaryen.i64),
-    ),
-  );
-
-  m.addFunction(
-    "__store_f32__",
-    binaryen.createType([binaryen.i32, binaryen.f32]),
-    binaryen.none,
-    [],
-    m.f32.store(
-      0,
-      4,
-      m.local.get(0, binaryen.i32),
-      m.local.get(1, binaryen.f32),
-    ),
-  );
-
-  m.addFunction(
-    "__store_f64__",
-    binaryen.createType([binaryen.i32, binaryen.f64]),
-    binaryen.none,
-    [],
-    m.f64.store(
-      0,
-      8,
-      m.local.get(0, binaryen.i32),
-      m.local.get(1, binaryen.f64),
-    ),
-  );
-
-  m.addFunction(
-    "__memory_grow__",
-    binaryen.i32,
-    binaryen.i32,
-    [],
-    m.memory.grow(m.local.get(0, binaryen.i32)),
-  );
-
-  m.addFunction(
-    "__memory_size__",
-    binaryen.none,
-    binaryen.i32,
-    [],
-    m.memory.size(),
-  );
+  registerBuiltins(m, binaryen);
 
   let loopIndex = 0;
 
@@ -149,9 +65,6 @@ export const toWasm = async (ast: VLProgramNode) => {
     if (!entry) throw new Error(`Expected "${name}" to be in scope`);
     return entry;
   };
-
-  const isSomething = (type: VLType | undefined) =>
-    !!type && !validateType({ type: "Alias", name: "null" }, type);
 
   let returnType: VLType | undefined = undefined;
   let desiredType: VLType | undefined = undefined;
@@ -680,29 +593,8 @@ export const toWasm = async (ast: VLProgramNode) => {
     }
   };
 
-  const toWasmType = (node: VLType): number => {
-    const type = softenImplicitType(node);
-    switch (type.type) {
-      case "Alias":
-        if (type.name === "number") return binaryen.i32;
-        if (type.name === "null") return binaryen.none;
-        throw new Error(`Unhandled AST -> WASM Alias type "${type.name}"`);
-      case "IntegerLiteral":
-        return binaryen.i32;
-      case "RealLiteral":
-        return binaryen.f64;
-      case "Object":
-        if (type.name === "i32") return binaryen.i32;
-        if (type.name === "f64") return binaryen.f64;
-        throw new Error(`Unhandled AST -> WASM "Object" type ${type.name}`);
-      case "Function":
-        // A function value is an i32 index into the function table.
-        return binaryen.i32;
-      default:
-        console.log(type);
-        throw new Error(`Unhandled AST -> WASM "${type.type}" type`);
-    }
-  };
+  // VLType -> binaryen wasm type, bound to this module's binaryen instance.
+  const toWasmType = (node: VLType): number => toWasmTypeOf(binaryen, node);
 
   // console.log(inspect(logSimplified(ast), { depth: Infinity }));
   m.setStart(toExpression(ast));
@@ -729,17 +621,3 @@ export const toWasm = async (ast: VLProgramNode) => {
   return m.emitBinary();
 };
 
-const logSimplified = (obj: unknown): unknown => {
-  if (obj == null) return obj;
-  if (typeof obj !== "object") return obj;
-  if (
-    "type" in obj && obj.type === "Object" && "name" in obj &&
-    typeof obj.name === "string"
-  ) {
-    return { type: "Alias", name: obj.name };
-  }
-  if (Array.isArray(obj)) return obj.map((v) => logSimplified(v));
-  return Object.fromEntries(
-    Object.entries(obj).map(([k, v]) => [k, logSimplified(v)]),
-  );
-};
