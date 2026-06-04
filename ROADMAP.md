@@ -43,6 +43,7 @@ closures / `is` / variance designs referenced here.
   The guard primitive that feeds A5: `if x is string then …`.
 - ⬜ **A7. Real `string` type.** Currently a half-baked `Alias`. Make it a proper object
   type with its methods/operators (mirrors how numerics are modeled in `defaultScope.ts`).
+  Needs **B13** (operator-method codegen) to actually emit those operators.
 - ⬜ **A8. Exact / Inexact variance** (TODO.md). Params Inexact by default (accept excess
   properties), values Exact. Guard the `a.foo = b` footgun noted in TODO.md.
 - ⬜ **A9. Readable / Writable variance** (TODO.md). Applied automatically during
@@ -151,6 +152,35 @@ stays tolerant of both binaryen forms (sync object / async init).*
   returns (malloc has a trailing-`0` workaround). Special-case or add proper reachability.
 - ⬜ **B12. `async`/`await`.** Keywords exist in the lexer; no semantics or codegen.
   Large; likely last.
+- ⬜ **B13. Well-known-symbol dispatch (operator overloading / callable objects / index
+  traps).** Generalize codegen so an operation on a *user* shape calls the typed method named
+  for that operation in the shape's contract, instead of being hardcoded. The type system
+  **already** dispatches generically — `_typeFromExpression` BinaryOperation (`typecheck.ts`)
+  finds the left operand's property whose name matches the operator and checks the right
+  operand against its parameter type — but codegen (`toWasm.ts` BinaryOperation) only inlines
+  `i32`/`f64`/`boolean` by name and **throws** for any other shape. The fix reuses the B5
+  `VLCallNode` / `indirectCall` machinery (already used for `o.f()`): look up the method,
+  `struct.get` the closure field, `call_indirect` it — all **static** (monomorphized via B3),
+  so it's Proxy-like power with zero runtime reflection / no JS-`Proxy` overhead.
+  - **Operator overloading:** `a + b` (and `- * / %  == < …`) on a user object calls its
+    `"+"` method (typed `(right: T) -> R`). Mixed operands already expressible — the method's
+    parameter type governs the RHS, so `vec + 5` vs `vec + vec` are distinct contracts.
+  - **Callable objects:** an object with a `"()"` method **taking parameters and returning a
+    value** is invokable — `obj(a, b)` dispatches to that method with `[a, b]` (the call
+    operator is overloadable exactly like `+`). Needs (1) grammar/`toAST` to route a call
+    whose callee is a *callable-object*-typed value to a `VLCallNode` instead of erroring
+    (today `toAST.ts` pushes a `function-call` type error for a non-`Function` callee), and
+    (2) the `"()"` well-known name in the operator-lookup path. (Multiple call signatures —
+    true ad-hoc overloading by arity/type — is a later extension.)
+  - **Index traps:** `o[k]` / `o[k] = v` dispatch to `"[]"` / `"[]="` methods when the shape
+    declares them (else the static `struct.get`/`struct.set` field path). This is the
+    "built-in instead of `Proxy`" goal: get/set/apply traps as **typed methods in the
+    contract**, resolved statically. (Note: index *signatures* `{[string]: i32}` type-check
+    today but are **dropped** at codegen — `objectStruct` keeps only StringLiteral keys — so
+    dynamic-key storage is a separate runtime-representation question, likely a map/array
+    backing, distinct from the trap-dispatch above.)
+  Unblocks/over­laps **A7** (a real `string` object type needs exactly this operator-method
+  codegen). Reuses B3 (monomorphization) + B5 (`Call`/`indirectCall`).
 
 ---
 
