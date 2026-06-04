@@ -283,9 +283,20 @@ const _typeFromExpression = (
 ): VLType => {
   switch (expr.type) {
     case "BinaryOperation": {
-      const leftType = typeFromExpression(expr.left, ctx);
+      let leftType = typeFromExpression(expr.left, ctx);
       const rightType = typeFromExpression(expr.right, ctx);
       const op = expr.operator;
+      // Operators live on the numeric object types (i32/f64/...), not on the
+      // literal types, so a bare literal operand (e.g. `2` in `2 + 3`) has no
+      // operator methods. Default an unconstrained numeric literal to its soft
+      // type (IntegerLiteral -> i32, RealLiteral -> f64) and re-memoize the
+      // operand so both type-checking and codegen see the concrete type.
+      // TODO: when there's a concrete desiredType, prefer it over the default
+      // (so `f64 x = 2 + 3` makes the literals f64) with range checking.
+      if (leftType.type === "IntegerLiteral" || leftType.type === "RealLiteral") {
+        leftType = softenImplicitType(leftType);
+        setNodeType(expr.left, leftType);
+      }
       const missingOpFunc = (variant: string): VLType => {
         errors.push({
           type: "Type",
