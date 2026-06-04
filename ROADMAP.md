@@ -71,9 +71,12 @@ stays tolerant of both binaryen forms (sync object / async init).*
 
 - ✅ **B0. Numeric literals + i32/f64 arithmetic, if/while, direct calls, `__program__`
   start fn, memory builtins.**
-- ⬜ **B1. Decide allocation strategy** (see top of track). Recommendation: WasmGC as the
-  default "heap", escape analysis for "stack", linear memory as escape hatch. *Unblocks
-  B5/B6/B7; everything heap-shaped waits on this.*
+- ✅ **B1. Allocation strategy DECIDED: WasmGC** (June 2026). The heap phase (closures,
+  objects, arrays, strings) builds on WasmGC structs/arrays; linear memory stays as an
+  opt-in escape hatch; escape-analysis stack-allocation is a later optimization.
+  **binaryen upgraded 116→130** for the ergonomic GC API (`module.struct`/`module.array`/
+  `TypeBuilder` — absent in 116). The old upgrade blocker (binaryen TLA breaking CJS) is
+  moot since the LSP server is ESM. Only API drift: `i64.const` now takes a single bigint.
 - 🟡 **B2. Finish numeric codegen.** i64 & f32 binary ops are not wired (only i32/boolean/
   f64 branches exist). Add numeric **casting/coercion** (none today).
 - 🟡 **B3. First-class functions / indirect calls** (working for the single-shape case).
@@ -89,9 +92,24 @@ stays tolerant of both binaryen forms (sync object / async init).*
   per resolved name, so calling the *same* inferred-generic function with two different type
   shapes (e.g. `apply(addi, …)` then `apply(addf, …)`) fails validation. Emit `name$i32` /
   `name$f64` instances keyed on the concrete signature. See `vl-current-work-indirect-calls`.
-- ⬜ **B4. Closures** (TODO.md plan). Static stack-vs-heap promotion via escape analysis:
-  a variable captured by a child function gets promoted (`memoryType: stack → heap`),
-  detected by comparing declaration scope to reference scope. Depends on B1 + B3.
+- 🟡 **B4. Closures** (in progress). DONE: **nested (non-capturing) function declarations**
+  work — a function-body block caches its value type during the walk (so return-type
+  inference survives the scope pop), and the Block codegen registers nested decls like the
+  Program case. SAFETY NET: a nested function that **captures** an enclosing frame's variable
+  now throws a clear codegen error (was a *silent miscompile* — `add(x) x+n` emitted `x+x`);
+  detected via a function-boundary stack in `getScopeEntry`. REMAINING (the actual closures,
+  on WasmGC per B1):
+  1. **Capture analysis** — for each nested function, collect free variables resolving to an
+     enclosing frame (the boundary check already locates them).
+  2. **Environment struct** — per closure, a WasmGC struct (via `TypeBuilder`) of the captured
+     vars; the function takes the env `(ref $env)` as a leading param and reads captures via
+     `struct.get`.
+  3. **Direct (non-escaping) call** — allocate `struct.new $env (…captured values…)` at the
+     declaration, thread it as the hidden leading arg at call sites in scope.
+  4. **Escaping closures** — a function *value* becomes a fat pointer (closure struct holding
+     the funcref + env), unifying with B3's function table; call via `call_ref`. This is the
+     big one and reworks the i32-table-index function-value representation.
+  Tests: `functions/closure.vl` (@skip, target 15). Depends on B1 (done) + B3 (done).
 - ⬜ **B5. Objects in codegen.** Type system models them structurally, but `toWasmType`
   only handles i32/f64/funcref/none. Lay out objects (WasmGC structs or linear memory).
   Depends on B1.
