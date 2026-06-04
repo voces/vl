@@ -41,6 +41,10 @@ export const toWasm = async (ast: VLProgramNode) => {
   type Scope = Record<string, ScopeEntry>;
   const scopes: Scope[] = [];
   let currentScope: Scope;
+  // `scopes` index where the current function's own scopes begin. A value
+  // reference resolving below this belongs to an enclosing frame — i.e. a
+  // capture, which closures (not yet implemented) would carry in an environment.
+  const functionBoundaries: number[] = [];
   const withScope = <T>(scope: Scope, fn: () => T) => {
     scopes.push(scope);
     currentScope = scope;
@@ -53,15 +57,22 @@ export const toWasm = async (ast: VLProgramNode) => {
   };
 
   const getScopeEntry = (name: string) => {
-    let entry: ScopeEntry | undefined;
     for (let i = scopes.length - 1; i >= 0; i--) {
       if (name in scopes[i]) {
-        entry = scopes[i][name];
-        break;
+        const entry = scopes[i][name];
+        const boundary = functionBoundaries[functionBoundaries.length - 1] ?? 0;
+        // entry[1] >= 0 is a real frame local (function-decl markers use -1 and
+        // are dispatched via the function table, not the frame).
+        if (i < boundary && entry[1] >= 0) {
+          throw new Error(
+            `Closures are not yet implemented: this function captures ` +
+              `"${name}" from an enclosing scope.`,
+          );
+        }
+        return entry;
       }
     }
-    if (!entry) throw new Error(`Expected "${name}" to be in scope`);
-    return entry;
+    throw new Error(`Expected "${name}" to be in scope`);
   };
 
   let returnType: VLType | undefined = undefined;
@@ -122,6 +133,7 @@ export const toWasm = async (ast: VLProgramNode) => {
     returnType = declaration.returnType;
     const locals: number[] & { params?: number } = [];
     locals.params = declaration.parameters.length;
+    functionBoundaries.push(scopes.length);
     const body = withScope(
       Object.fromEntries(
         declaration.parameters.map((
@@ -136,6 +148,7 @@ export const toWasm = async (ast: VLProgramNode) => {
             () => toExpression(declaration.body),
           )),
     );
+    functionBoundaries.pop();
     // An inferred return type (`Unknown`/`Infer`) has no wasm mapping; read the
     // actual result type back off the compiled body instead.
     let resultType: number;
@@ -237,6 +250,7 @@ export const toWasm = async (ast: VLProgramNode) => {
             .map(([k, v], i): [string, ScopeEntry] => [k, [v, i]]),
         );
         const locals: number[] = [];
+        functionBoundaries.push(scopes.length);
         return withLocals(locals, () =>
           withScope(
             modifiedScope,
