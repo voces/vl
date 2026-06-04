@@ -233,6 +233,11 @@ export const toWasm = async (ast: VLProgramNode) => {
     return resolvedName;
   };
   const getFunction = (node: VLFunctionCallNode) => {
+    // Built-ins resolve directly to their wasm function name; they are never in
+    // the value scope (the Program case filters Function-typed entries out), so
+    // resolve them before getScopeEntry, which would otherwise throw.
+    if (ignoredKeys.has(node.function)) return node.function;
+
     const [type, index] = getScopeEntry(node.function);
 
     if (type.type !== "Function") {
