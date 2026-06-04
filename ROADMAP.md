@@ -136,11 +136,10 @@ stays tolerant of both binaryen forms (sync object / async init).*
   struct, so the field may hold a plain function *or* an escaping closure — `objects/member-call.vl`:
   7, 42, 105). Also fixed a parser precedence bug this surfaced: member-access *reads* (`.`/`[]`)
   bound looser than arithmetic (`a.x + b.y` mis-parsed as `(a.x + b).y`) — moved them above the
-  operators in `VL_Parser.g4` + regen. REMAINING (separate features): **`this`-bound methods** (a
-  field fn implicitly seeing its object — today capture the object explicitly), **function
-  literals in object values** (`{ f: function() … }` — parser), typed literals in object values
-  (`{n: 4<i64>}` — parser), and **Exact-by-default for values** (A8 variance — excess is permissive
-  everywhere today).
+  operators in `VL_Parser.g4` + regen. REMAINING (separate features): **methods via explicit
+  receiver + UFCS** (see B14 — DECIDED: no `this`), **function literals in object values**
+  (`{ f: function() … }` — parser), typed literals in object values (`{n: 4<i64>}` — parser),
+  and **Exact-by-default for values** (A8 variance — excess is permissive everywhere today).
 - ⬜ **B6. Arrays in codegen** (WasmGC arrays or linear memory). Depends on B1.
 - ⬜ **B7. Strings in codegen.** Depends on A7 + B1.
 - 🟡 **B8. Loops: wire `for` `step`** (parsed/typechecked but hardcoded `+1`), and
@@ -181,6 +180,25 @@ stays tolerant of both binaryen forms (sync object / async init).*
     backing, distinct from the trap-dispatch above.)
   Unblocks/over­laps **A7** (a real `string` object type needs exactly this operator-method
   codegen). Reuses B3 (monomorphization) + B5 (`Call`/`indirectCall`).
+- ⬜ **B14. Methods via explicit receiver + UFCS (no `this`).** DECIDED: VL has **no `this`
+  keyword**. A method is just a function whose first parameter *is* the object, and `o.f(a)`
+  is sugar for `f(o, a)` (uniform function call syntax). Rationale: VL already has first-class
+  closures and `o.f()`→`indirectCall`, so this adds **no hidden parameter** and no call-site
+  rebinding (the JS footgun) — the receiver is an ordinary, visible, type-checked param,
+  consistent with "structural, fully typed, no hidden data flow." Methods need no `class`/
+  `shape` declaration site and are open/extensible (any module may add `fn area(self: Circle)
+  …`). Design decisions captured:
+  - **Resolution order for `o.f()`:** a callable **field** `f` on the shape wins (today's B5
+    path); else fall back to a free **function** `f` whose first (receiver) param structurally
+    accepts `o`. Field-first keeps shapes self-describing and makes UFCS purely additive; emit
+    a clear diagnostic if both exist.
+  - **Mutation is free, variance is separate:** WasmGC objects are ref-typed, so `self: T`
+    is already a reference and `self.x = …` is a `struct.set`. "May a method mutate its
+    receiver?" is therefore an **A9 (Readable/Writable)** question, not a receiver question.
+  - **`c.area` without `()`:** start as a plain value (resolves only if `area` is a field);
+    optional later sugar = a bound method (a closure `() -> area(c)`), purely additive.
+  Reuses B5 (`o.f()` lowering). Pairs with B13 (operator/call/index dispatch) — together they
+  make "methods, operators, call, index" all ordinary typed functions resolved statically.
 
 ---
 
