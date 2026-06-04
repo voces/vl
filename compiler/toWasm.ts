@@ -5,6 +5,7 @@ import {
   validateType,
   VLFunctionCallNode,
   VLFunctionDeclarationNode,
+  VLObjectType,
   VLProgramNode,
   VLStatement,
   VLType,
@@ -154,6 +155,58 @@ export const toWasm = async (ast: VLProgramNode) => {
       heapType,
       refType: binaryen.getTypeFromHeapType(heapType, false),
     };
+  };
+
+  // --- Objects (WasmGC structs) ---
+  type ObjectStruct = {
+    heapType: number;
+    refType: number;
+    fields: { name: string; type: VLType; index: number }[];
+  };
+  // Structural object shapes are interned to a WasmGC struct, keyed by a
+  // canonical signature so identical shapes share a type. Fields are sorted by
+  // name (deterministic order independent of literal/annotation order) and
+  // mutable (so `o.x = …` can `struct.set`).
+  const objectStructs = new Map<string, ObjectStruct>();
+  const objectStruct = (type: VLObjectType): ObjectStruct => {
+    const fields = type.properties
+      .flatMap((p) =>
+        p.name.type === "StringLiteral"
+          ? [{ name: p.name.value, type: p.type }]
+          : []
+      )
+      .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    const sig = fields.map((f) => `${f.name}:${toWasmType(f.type)}`).join(",");
+    let cached = objectStructs.get(sig);
+    if (!cached) {
+      const tb = new binaryen.TypeBuilder(1);
+      tb.setStructType(
+        0,
+        fields.map((f) => ({
+          type: toWasmType(f.type),
+          packedType: binaryen.notPacked,
+          mutable: true,
+        })),
+      );
+      const heapType = tb.buildAndDispose()[0];
+      cached = {
+        heapType,
+        refType: binaryen.getTypeFromHeapType(heapType, false),
+        fields: fields.map((f, index) => ({ ...f, index })),
+      };
+      objectStructs.set(sig, cached);
+    }
+    return cached;
+  };
+
+  // Resolve an expression's structural object type (soften + unwrap an Infer).
+  const objectTypeOf = (node: VLProgramNode | VLStatement): VLObjectType => {
+    let t = softenImplicitType(vlType(node as Parameters<typeof vlType>[0]));
+    if (t.type === "Infer") t = t.subType;
+    if (t.type !== "Object") {
+      throw new Error(`Expected an object type, got "${t.type}"`);
+    }
+    return t;
   };
 
   // A zero value of a numeric wasm type — the placeholder for a captured read
@@ -524,8 +577,62 @@ export const toWasm = async (ast: VLProgramNode) => {
         }
         return m.local.get(entry[1], toWasmType(entry[0]));
       }
+      case "ObjectLiteral": {
+        const struct = objectStruct(objectTypeOf(node));
+        // Fields are emitted in the struct's (sorted) order, each from its
+        // matching literal property.
+        const operands = struct.fields.map((f) => {
+          const prop = node.properties.find((p) =>
+            (p.name.type === "Name" && p.name.name === f.name) ||
+            (p.name.type === "StringLiteral" && p.name.value === f.name)
+          );
+          if (!prop) throw new Error(`Object literal missing field "${f.name}"`);
+          return withDesiredType(f.type, () => toExpression(prop.value));
+        });
+        return m.struct.new(operands, struct.heapType);
+      }
+      case "PropertyAccess": {
+        const struct = objectStruct(objectTypeOf(node.object));
+        const field = struct.fields.find((f) => f.name === node.property);
+        if (!field) {
+          throw new Error(`Object has no field "${node.property}"`);
+        }
+        return m.struct.get(
+          field.index,
+          toExpression(node.object),
+          toWasmType(field.type),
+          false,
+        );
+      }
       case "BinaryOperation": {
         const op = node.operator;
+        // Property assignment: `obj.field = value` -> struct.set. Handled before
+        // `vlType(node.left)`, which a PropertyAccess LHS would not satisfy.
+        if (op === "=" && node.left.type === "PropertyAccess") {
+          const access = node.left;
+          const struct = objectStruct(objectTypeOf(access.object));
+          const field = struct.fields.find((f) => f.name === access.property);
+          if (!field) {
+            throw new Error(`Object has no field "${access.property}"`);
+          }
+          const value = withDesiredType(
+            field.type,
+            () => toExpression(node.right),
+          );
+          const set = m.struct.set(field.index, toExpression(access.object), value);
+          // In value position, read the field back (re-evaluates the object).
+          return desiredType
+            ? m.block(null, [
+              set,
+              m.struct.get(
+                field.index,
+                toExpression(access.object),
+                toWasmType(field.type),
+                false,
+              ),
+            ], toWasmType(field.type))
+            : set;
+        }
         const leftType = vlType(node.left);
         let rightType: VLType;
         {
@@ -743,7 +850,12 @@ export const toWasm = async (ast: VLProgramNode) => {
   };
 
   // VLType -> binaryen wasm type, bound to this module's binaryen instance.
-  const toWasmType = (node: VLType): number => toWasmTypeOf(binaryen, node);
+  const toWasmType = (node: VLType): number => {
+    const t = softenImplicitType(node);
+    // A structural object (no builtin `name` like i32/f64) is a WasmGC struct.
+    if (t.type === "Object" && t.name === undefined) return objectStruct(t).refType;
+    return toWasmTypeOf(binaryen, node);
+  };
 
   // console.log(inspect(logSimplified(ast), { depth: Infinity }));
   m.setStart(toExpression(ast));

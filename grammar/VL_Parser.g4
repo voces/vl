@@ -68,6 +68,12 @@ expr
     | block
     | array
     | if
+    // Member access (`.` / `[]`) binds tighter than arithmetic/comparison
+    // operators, so these reads must precede them (ANTLR4 left-recursive
+    // precedence = alternative order). Else `a.x + b.y` mis-parses as
+    // `(a.x + b).y`.
+    | expr LBRACK NEWLINE* expr NEWLINE* RBRACK // index expr
+    | expr NEWLINE* DOT ID // property expr
     | expr NEWLINE* CARET NEWLINE* expr
     | expr NEWLINE* (STAR | DIV | MOD) NEWLINE* expr
     | expr NEWLINE* (PLUS | MINUS) NEWLINE* expr
@@ -79,8 +85,6 @@ expr
     | expr NEWLINE* DOT ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     | expr LBRACK NEWLINE* expr NEWLINE* RBRACK NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     | LPAREN NEWLINE* expr NEWLINE* RPAREN
-    | expr LBRACK NEWLINE* expr NEWLINE* RBRACK // index expr
-    | expr NEWLINE* DOT ID // property expr
     | prefixOp expr
     | expr postfixOp
     | functionCall
