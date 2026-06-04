@@ -180,23 +180,38 @@ stays tolerant of both binaryen forms (sync object / async init).*
     backing, distinct from the trap-dispatch above.)
   Unblocks/over­laps **A7** (a real `string` object type needs exactly this operator-method
   codegen). Reuses B3 (monomorphization) + B5 (`Call`/`indirectCall`).
-- ⬜ **B14. Methods via explicit receiver + UFCS (no `this`).** DECIDED: VL has **no `this`
-  keyword**. A method is just a function whose first parameter *is* the object, and `o.f(a)`
-  is sugar for `f(o, a)` (uniform function call syntax). Rationale: VL already has first-class
-  closures and `o.f()`→`indirectCall`, so this adds **no hidden parameter** and no call-site
-  rebinding (the JS footgun) — the receiver is an ordinary, visible, type-checked param,
-  consistent with "structural, fully typed, no hidden data flow." Methods need no `class`/
-  `shape` declaration site and are open/extensible (any module may add `fn area(self: Circle)
-  …`). Design decisions captured:
-  - **Resolution order for `o.f()`:** a callable **field** `f` on the shape wins (today's B5
-    path); else fall back to a free **function** `f` whose first (receiver) param structurally
-    accepts `o`. Field-first keeps shapes self-describing and makes UFCS purely additive; emit
-    a clear diagnostic if both exist.
+- ⬜ **B14. Methods via explicit `self` receiver + UFCS (no `this`).** DECIDED: VL has **no
+  `this` keyword**. A method is a function whose first parameter is the **`self` keyword**
+  (Rust-style); `o.f(a)` is sugar for `f(o, a)` (uniform function call syntax). Rationale: VL
+  already has first-class closures and `o.f()`→`indirectCall`, so this adds **no hidden
+  parameter** and no call-site rebinding (the JS footgun) — the receiver is an ordinary,
+  visible, type-checked param, consistent with "structural, fully typed, no hidden data flow."
+  Methods need no `class`/`shape` site and are open/extensible (any module may add `fn
+  area(self: Circle) …`). Design decisions captured:
+  - **`self` is the explicit, optional method marker.** First param is `self` → the function
+    is a **method**: UFCS binds the receiver, and it's reachable as `o.f()`. No `self` → a
+    **plain function / container field**: NOT reachable through an instance. `self`'s type is
+    annotated (`self: Circle` → method on Circle) or inferred (`self` → *generic* method over
+    any shape the body needs, monomorphized per receiver via B3). This is strictly better than
+    a type-directed "first param happens to accept `o`" rule: it's syntactic, so (1) no
+    namespace **pollution** — a global `println()` has no `self`, so `o.println()` never
+    resolves; (2) **crisp errors** ("expected Circle, got Square", not "no candidate matched");
+    (3) it *is* the method-vs-static split for free (no `self` → associated/`Type.f()` story).
+  - **Resolution of `o.f()`:** a callable **field** `f` on the shape wins → call the field
+    value with the args, **no receiver** (the container/namespace case, e.g. `let foo = { add(a,b)
+    a+b }; foo.add(1,2)` — `foo` is pure data, nothing implicit passed); else a free **function**
+    whose first param is `self` (typed to / inferring `o`'s type) → `f(o, args)`; else `o.f()`
+    is an error. Diagnose field-vs-method collisions.
   - **Mutation is free, variance is separate:** WasmGC objects are ref-typed, so `self: T`
     is already a reference and `self.x = …` is a `struct.set`. "May a method mutate its
     receiver?" is therefore an **A9 (Readable/Writable)** question, not a receiver question.
   - **`c.area` without `()`:** start as a plain value (resolves only if `area` is a field);
     optional later sugar = a bound method (a closure `() -> area(c)`), purely additive.
+  - **Container/namespace objects** (your no-`self` field functions) are the motivating case:
+    the function-reference form `{ add: add }` already runs today; what's missing is the B5
+    parser/codegen sugar — **inline function literals as field values** (`{ add: function… }`
+    parses + type-checks but codegen throws `Unhandled FunctionDeclaration`) and **method
+    shorthand** `{ add(a,b) a+b }` (doesn't parse). Both already in B5's remaining list.
   Reuses B5 (`o.f()` lowering). Pairs with B13 (operator/call/index dispatch) — together they
   make "methods, operators, call, index" all ordinary typed functions resolved statically.
 
