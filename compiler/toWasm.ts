@@ -32,6 +32,8 @@ export const toWasm = async (ast: VLProgramNode) => {
     ? await _Binaryen()
     : _Binaryen;
   const m = new binaryen.Module();
+  // Closures and the heap phase use WasmGC structs/arrays.
+  m.setFeatures(binaryen.Features.GC | binaryen.Features.ReferenceTypes);
 
   registerBuiltins(m, binaryen);
 
@@ -56,23 +58,31 @@ export const toWasm = async (ast: VLProgramNode) => {
     return ret;
   };
 
-  const getScopeEntry = (name: string) => {
+  // Locate a name in the scope stack. `capture` is true when it resolves to an
+  // enclosing function's frame local (index >= 0; function-decl markers use -1
+  // and dispatch via the table, not the frame) — i.e. a closed-over variable.
+  const lookupName = (name: string) => {
     for (let i = scopes.length - 1; i >= 0; i--) {
       if (name in scopes[i]) {
-        const entry = scopes[i][name];
+        const [type, index] = scopes[i][name];
         const boundary = functionBoundaries[functionBoundaries.length - 1] ?? 0;
-        // entry[1] >= 0 is a real frame local (function-decl markers use -1 and
-        // are dispatched via the function table, not the frame).
-        if (i < boundary && entry[1] >= 0) {
-          throw new Error(
-            `Closures are not yet implemented: this function captures ` +
-              `"${name}" from an enclosing scope.`,
-          );
-        }
-        return entry;
+        return { type, index, capture: i < boundary && index >= 0 };
       }
     }
-    throw new Error(`Expected "${name}" to be in scope`);
+    return null;
+  };
+
+  const getScopeEntry = (name: string): ScopeEntry => {
+    const found = lookupName(name);
+    if (!found) throw new Error(`Expected "${name}" to be in scope`);
+    // Captures are handled by the Name case (read from the closure environment);
+    // any other path reaching a capture is unsupported (e.g. assigning to one).
+    if (found.capture && !captureCollector && !currentEnv) {
+      throw new Error(
+        `Closures: cannot yet write to or otherwise use captured "${name}".`,
+      );
+    }
+    return [found.type, found.index];
   };
 
   let returnType: VLType | undefined = undefined;
@@ -110,6 +120,53 @@ export const toWasm = async (ast: VLProgramNode) => {
   // value is the i32 index into this table, which `call_indirect` dispatches on.
   const functionTable: string[] = [];
 
+  // --- Closures (WasmGC environments) ---
+  type EnvShape = {
+    fields: string[]; // capture names, in struct-field order
+    types: VLType[]; // their VL types
+    heapType: number; // the env struct's wasm heap type
+    refType: number; // a non-nullable ref to it
+  };
+  // While a closure body is compiled, captures it references are collected here
+  // (name -> type, in encounter order) to shape the environment struct.
+  let captureCollector: Map<string, VLType> | null = null;
+  // While compiling a closure body, captured names read from this environment
+  // (its `paramIndex` is the hidden leading `(ref env)` parameter, local 0).
+  let currentEnv: (EnvShape & { paramIndex: number }) | null = null;
+  // resolvedName -> its environment shape, so call sites can allocate + pass it.
+  const closures: Record<string, EnvShape> = {};
+
+  // Build a WasmGC struct type holding one (immutable) field per captured value.
+  const buildEnvStruct = (fields: string[], types: VLType[]): EnvShape => {
+    const tb = new binaryen.TypeBuilder(1);
+    tb.setStructType(
+      0,
+      types.map((t) => ({
+        type: toWasmType(t),
+        packedType: binaryen.notPacked,
+        mutable: false,
+      })),
+    );
+    const heapType = tb.buildAndDispose()[0];
+    return {
+      fields,
+      types,
+      heapType,
+      refType: binaryen.getTypeFromHeapType(heapType, false),
+    };
+  };
+
+  // A zero value of a numeric wasm type — the placeholder for a captured read
+  // during the capture-collection pass (whose body is discarded).
+  const zeroOf = (type: VLType): number => {
+    const wt = toWasmType(type);
+    if (wt === binaryen.i64) return m.i64.const(BigInt(0));
+    if (wt === binaryen.f32) return m.f32.const(0);
+    if (wt === binaryen.f64) return m.f64.const(0);
+    if (wt === binaryen.i32) return m.i32.const(0);
+    throw new Error("Cannot capture a non-numeric value yet");
+  };
+
   const getResolvedFunctionName = (name: string) => {
     let i = functionScopes.length - 1;
     while (i >= 0) {
@@ -128,27 +185,61 @@ export const toWasm = async (ast: VLProgramNode) => {
     instantiated.add(resolvedName);
 
     const { declaration } = functions[resolvedName];
-    const params = binaryen.createType(paramTypes.map(toWasmType));
     const oldReturnType = returnType;
     returnType = declaration.returnType;
-    const locals: number[] & { params?: number } = [];
-    locals.params = declaration.parameters.length;
-    functionBoundaries.push(scopes.length);
-    const body = withScope(
-      Object.fromEntries(
-        declaration.parameters.map((
-          p,
-          i,
-        ): [string, ScopeEntry] => [p.name, [paramTypes[i], i]]),
-      ),
-      () =>
-        withLocals(locals, () =>
-          withDesiredType(
-            declaration.returnType,
-            () => toExpression(declaration.body),
-          )),
+
+    // Compile the body once with the given environment. With `collector` set
+    // (no env yet), captured reads record themselves and emit a placeholder;
+    // with `env` set, captured reads become `struct.get` on the env parameter.
+    // An env occupies local 0, shifting the declared parameters up by one.
+    const compileBody = (
+      env: (EnvShape & { paramIndex: number }) | null,
+      collector: Map<string, VLType> | null,
+    ) => {
+      const offset = env ? 1 : 0;
+      const locals: number[] & { params?: number } = [];
+      locals.params = declaration.parameters.length + offset;
+      const oldCollector = captureCollector;
+      const oldEnv = currentEnv;
+      captureCollector = collector;
+      currentEnv = env;
+      functionBoundaries.push(scopes.length);
+      const body = withScope(
+        Object.fromEntries(
+          declaration.parameters.map((
+            p,
+            i,
+          ): [string, ScopeEntry] => [p.name, [paramTypes[i], i + offset]]),
+        ),
+        () =>
+          withLocals(locals, () =>
+            withDesiredType(
+              declaration.returnType,
+              () => toExpression(declaration.body),
+            )),
+      );
+      functionBoundaries.pop();
+      captureCollector = oldCollector;
+      currentEnv = oldEnv;
+      return { body, locals };
+    };
+
+    // Pass 1: discover captures. Its body is discarded if any are found.
+    const collector = new Map<string, VLType>();
+    let { body, locals } = compileBody(null, collector);
+
+    let env: EnvShape | null = null;
+    if (collector.size) {
+      const fields = [...collector.keys()];
+      env = buildEnvStruct(fields, fields.map((f) => collector.get(f)!));
+      closures[resolvedName] = env;
+      // Pass 2: recompile with the env parameter; captured reads -> struct.get.
+      ({ body, locals } = compileBody({ ...env, paramIndex: 0 }, null));
+    }
+
+    const params = binaryen.createType(
+      (env ? [env.refType] : []).concat(paramTypes.map(toWasmType)),
     );
-    functionBoundaries.pop();
     // An inferred return type (`Unknown`/`Infer`) has no wasm mapping; read the
     // actual result type back off the compiled body instead.
     let resultType: number;
@@ -169,6 +260,15 @@ export const toWasm = async (ast: VLProgramNode) => {
       resolvedName,
       declaration.parameters.map((p) => p.paramaterType),
     );
+    if (closures[resolvedName]) {
+      // The table holds a bare funcref with no environment, so a closure used as
+      // a value would be called without its captures. Escaping closures need a
+      // fat pointer (funcref + env); not yet implemented (ROADMAP B4).
+      throw new Error(
+        `Escaping closures are not yet implemented: "${resolvedName}" ` +
+          `captures variables and cannot be used as a value.`,
+      );
+    }
     const existing = functionTable.indexOf(resolvedName);
     return existing === -1
       ? functionTable.push(resolvedName) - 1
@@ -336,6 +436,23 @@ export const toWasm = async (ast: VLProgramNode) => {
             () => toExpression(a.value),
           )
         );
+        // A closure call allocates the environment from the captured variables'
+        // current values (read here in the caller's scope) and threads it as the
+        // hidden leading argument.
+        if (typeof func === "string" && closures[func]) {
+          const env = closures[func];
+          operands.unshift(
+            m.struct.new(
+              env.fields.map((f, i) =>
+                withDesiredType(
+                  env.types[i],
+                  () => toExpression({ type: "Name", name: f }),
+                )
+              ),
+              env.heapType,
+            ),
+          );
+        }
         // Direct calls to functions with an inferred return type read their
         // result type from the emitted instance; otherwise map the declared type.
         const returnType = typeof func === "string" && func in instanceResult
@@ -371,6 +488,25 @@ export const toWasm = async (ast: VLProgramNode) => {
         return m.i32.const(0); // Hmm...
       }
       case "Name": {
+        const found = lookupName(node.name);
+        if (found?.capture) {
+          // A closed-over variable: read from the environment (or, during the
+          // capture-collection pass, record it and emit a typed placeholder).
+          if (currentEnv) {
+            return m.struct.get(
+              currentEnv.fields.indexOf(node.name),
+              m.local.get(currentEnv.paramIndex, currentEnv.refType),
+              toWasmType(found.type),
+              false,
+            );
+          }
+          if (captureCollector) {
+            if (!captureCollector.has(node.name)) {
+              captureCollector.set(node.name, found.type);
+            }
+            return zeroOf(found.type);
+          }
+        }
         const entry = getScopeEntry(node.name);
         if (entry[0].type === "Function") {
           // A function used as a value. If it names a declared function, its
