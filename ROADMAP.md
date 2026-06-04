@@ -92,24 +92,28 @@ stays tolerant of both binaryen forms (sync object / async init).*
   per resolved name, so calling the *same* inferred-generic function with two different type
   shapes (e.g. `apply(addi, …)` then `apply(addf, …)`) fails validation. Emit `name$i32` /
   `name$f64` instances keyed on the concrete signature. See `vl-current-work-indirect-calls`.
-- 🟡 **B4. Closures** (in progress). DONE: **nested (non-capturing) function declarations**
-  work — a function-body block caches its value type during the walk (so return-type
-  inference survives the scope pop), and the Block codegen registers nested decls like the
-  Program case. SAFETY NET: a nested function that **captures** an enclosing frame's variable
-  now throws a clear codegen error (was a *silent miscompile* — `add(x) x+n` emitted `x+x`);
-  detected via a function-boundary stack in `getScopeEntry`. REMAINING (the actual closures,
-  on WasmGC per B1):
-  1. **Capture analysis** — for each nested function, collect free variables resolving to an
-     enclosing frame (the boundary check already locates them).
-  2. **Environment struct** — per closure, a WasmGC struct (via `TypeBuilder`) of the captured
-     vars; the function takes the env `(ref $env)` as a leading param and reads captures via
-     `struct.get`.
-  3. **Direct (non-escaping) call** — allocate `struct.new $env (…captured values…)` at the
-     declaration, thread it as the hidden leading arg at call sites in scope.
-  4. **Escaping closures** — a function *value* becomes a fat pointer (closure struct holding
-     the funcref + env), unifying with B3's function table; call via `call_ref`. This is the
-     big one and reworks the i32-table-index function-value representation.
-  Tests: `functions/closure.vl` (@skip, target 15). Depends on B1 (done) + B3 (done).
+- 🟡 **B4. Closures** — **non-escaping closures WORK** (the project's first WasmGC codegen).
+  DONE:
+  1. **Nested function declarations** — a function-body block caches its value type during the
+     walk (so return-type inference survives the scope pop), and Block codegen registers nested
+     decls like the Program case.
+  2. **Capture analysis** — `instantiate` compiles a capturing body twice: pass 1 collects the
+     captured names (placeholders, body discarded) via a function-boundary check in
+     `lookupName`; pass 2 recompiles against the env.
+  3. **Environment struct** — a WasmGC struct (`TypeBuilder`, one immutable field per capture);
+     the callee takes a hidden leading `(ref env)` param and each captured read is a
+     `struct.get` on it.
+  4. **Non-escaping call** — call sites `struct.new` the env from the captures' current values
+     (read in the caller's scope) and thread it as the hidden leading arg.
+  Captures are **read-only and numeric** for now. Test: `functions/closure.vl` (15, 110).
+  REMAINING:
+  - **Escaping closures** — a capturing function used as a *value* throws a clear guard today
+    (the function table holds a bare funcref, no env). Make a function value a **fat pointer**
+    (closure struct: funcref + env), call via `call_ref`, unifying with B3's table. The big
+    one — reworks the i32-table-index function-value representation.
+  - **Mutable / non-numeric captures** — writing to a captured var (needs boxing / a mutable
+    env field) and capturing refs (objects, strings — depends on B5/B7).
+  Depends on B1 (done) + B3 (done).
 - ⬜ **B5. Objects in codegen.** Type system models them structurally, but `toWasmType`
   only handles i32/f64/funcref/none. Lay out objects (WasmGC structs or linear memory).
   Depends on B1.
