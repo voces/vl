@@ -209,15 +209,23 @@ export const toWasm = async (ast: VLProgramNode) => {
     return t;
   };
 
-  // A zero value of a numeric wasm type — the placeholder for a captured read
-  // during the capture-collection pass (whose body is discarded).
+  // A placeholder value of a captured variable's wasm type, used during the
+  // capture-collection pass (whose body is discarded once captures are known).
   const zeroOf = (type: VLType): number => {
+    const t = softenImplicitType(type);
+    // A captured object is a struct ref; a null of its (nullable) ref type
+    // suffices for the discarded pass-1 body.
+    if (t.type === "Object" && t.name === undefined) {
+      return m.ref.null(
+        binaryen.getTypeFromHeapType(objectStruct(t).heapType, true),
+      );
+    }
     const wt = toWasmType(type);
     if (wt === binaryen.i64) return m.i64.const(BigInt(0));
     if (wt === binaryen.f32) return m.f32.const(0);
     if (wt === binaryen.f64) return m.f64.const(0);
     if (wt === binaryen.i32) return m.i32.const(0);
-    throw new Error("Cannot capture a non-numeric value yet");
+    throw new Error("Cannot capture this value type yet");
   };
 
   const getResolvedFunctionName = (name: string) => {
