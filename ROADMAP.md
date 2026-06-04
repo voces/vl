@@ -55,6 +55,26 @@ closures / `is` / variance designs referenced here.
 - ⬜ **A12. Soundness pass / test suite.** Port the "If T" narrowing benchmark idea; build
   a corpus of "must-error" and "must-not-error" programs. Define the soundness contract
   (statically sound — every well-typed program is type-safe at runtime).
+- ⬜ **A13. Operator-constraint inference (row-polymorphic generics).** Infer operator/method
+  requirements on an *un-annotated* value from how the body uses it, the same way VL already
+  infers *property* constraints (`o.x` makes a hole gain an inferred `x` via `getChildType`)
+  and *callability* (`fn(a,b)` infers `fn` is a 2-arg function). Today the BinaryOperation
+  rule (`_typeFromExpression`, `typecheck.ts`) **errors** when the left operand is a bare
+  inference hole instead of inferring "left must have a `+` method accepting right, returning
+  a fresh hole." Wiring that makes a fully-inferred structural method legal:
+  `add(self, b) { x: self.x + b.x, y: self.y + b.y }` — `add` works on *any* shape with an
+  `x` and `y` that are addable, monomorphized per call shape (rides B3). This is bounded/row
+  polymorphism with operator constraints; pairs with B13 (operator dispatch) for the codegen.
+- ⬜ **A14. Named/opaque type robustness (+ a real crash bug).** `type Point = { x: f64, y:
+  f64 }` (with `=`) works as a structural alias and resolves as a param type. **BUG:** the
+  opaque form `type Point` (no `=`/body — the `TYPE ID` grammar alt) registers a
+  *self-referential* alias (`subType: {Alias: "Point"}`); using it as a type sends
+  `getConcreteType` (`typecheck.ts`) into **infinite recursion → stack overflow**, which the
+  per-statement `try/catch` swallows, silently dropping the declaration and yielding a
+  misleading "undeclared." Fix: cycle-guard `getConcreteType` (it "explicitly punts on
+  recursion" per A11 — same area), and DECIDE what `type Point` (no body) means — lean **clean
+  error for now**, real **nominal/opaque types** later. Also surfaces the `{…}`-block-vs-object
+  ambiguity: a bare `{…}` after `type Point` parses as a separate statement, not the body.
 
 ---
 
@@ -202,6 +222,14 @@ stays tolerant of both binaryen forms (sync object / async init).*
     a+b }; foo.add(1,2)` — `foo` is pure data, nothing implicit passed); else a free **function**
     whose first param is `self` (typed to / inferring `o`'s type) → `f(o, args)`; else `o.f()`
     is an error. Diagnose field-vs-method collisions.
+  - **Receiver is any expression, incl. literals:** `{x:1,y:2}.add({x:3,y:4})` is `add({x:1,y:2},
+    {x:3,y:4})` — UFCS isn't limited to a `Name`. (Today the member-call only resolves `.f` as a
+    *field*: a free-function `.add` gives "Unknown property `add`" — the UFCS fallback is the work.)
+  - **DECIDED — local function-values also participate (gated by `self`):** UFCS is plain lexical
+    name lookup, so a `let`-bound function with a `self` first param is reachable as `o.f()` too,
+    not just top-level decls. The `self` marker still gates pollution (a local lambda without
+    `self` isn't a method); lexical scope keeps it predictable. (But see B15 — a lambda *value*
+    is monomorphic, so an untyped local method is shape-locked, unlike a top-level decl.)
   - **Mutation is free, variance is separate:** WasmGC objects are ref-typed, so `self: T`
     is already a reference and `self.x = …` is a `struct.set`. "May a method mutate its
     receiver?" is therefore an **A9 (Readable/Writable)** question, not a receiver question.
@@ -214,8 +242,33 @@ stays tolerant of both binaryen forms (sync object / async init).*
     shorthand** `{ add(a,b) a+b }` (doesn't parse). Both already in B5's remaining list.
   Reuses B5 (`o.f()` lowering). Pairs with B13 (operator/call/index dispatch) — together they
   make "methods, operators, call, index" all ordinary typed functions resolved statically.
-
----
+- ⬜ **B15. Anonymous / lambda functions (codegen) + the declaration-vs-value distinction.**
+  Anonymous functions are *modeled* (the name is optional in `toFunctionDeclaration`) and
+  type-check, but **codegen throws** `Unhandled FunctionDeclaration` for a function expression
+  in value position — `let add = function(a: i32, b: i32) a + b` doesn't compile. The lowering
+  is: a `FunctionDeclaration` in value position → emit it as an instance + produce a
+  `closureValue` (the same fat-pointer the Name-as-value path already builds). This **also**
+  fixes B5's inline-function-literal object fields (`{ add: function… }`) — same root gap.
+  - **DECIDED — syntax:** no keyword-less lambdas. Bare `(params) body` is the classic
+    arrow-parsing ambiguity (`(a, b)` reads as a paren/tuple expr until after the `)`), and
+    today it's a hard parse error. Use the existing **`function(params) body`** (unambiguous,
+    already modeled — just needs codegen) and OPTIONALLY add **`(params) => body`** later, where
+    the explicit `=>` is the disambiguator. Reject the bare form.
+  - **DECIDED — declaration vs value (the important semantic):** a top-level `function f`
+    monomorphizes **per call site** (B3 cloning), so an untyped `function add(self, b) …` is
+    polymorphic across shapes. A `let`-bound lambda is a **closure value** with **one** wasm
+    signature, fixed at creation — there's no per-call-site to specialize. So an *untyped*
+    lambda is the **first-class-polymorphic-value** case: it's monomorphic (pinned by a single
+    use, or annotate it); being usable at multiple shapes needs boxing (see the dictionary/
+    uniform-rep fallback noted under B3). Annotated lambdas are fine (one concrete shape).
+- ⬜ **B16. Redeclaration / overloading policy.** CURRENT (working): **same-scope
+  redeclaration is an error** for `function`, `let`, and `type` (all push a `Redeclaration`
+  diagnostic — `toAST.ts`); **nested shadowing** in a deeper scope is allowed (codegen
+  uniquifies via `name_1` — `toWasm.ts handleFunctionDecl`) and is **verified correct** (a
+  nested same-name `f` shadowing an outer `f` returns the inner one). FUTURE decision: whether
+  to allow **ad-hoc overloading** (same name, multiple signatures by
+  arity/type) — ties into B13's multi-call-signature note; default for now is "no, one binding
+  per name per scope."
 
 ## Track C — CLI (`vl` / `vital` command)
 *New surface. Depends on the existing parse→AST→wasm pipeline being callable outside the
