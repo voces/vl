@@ -382,15 +382,34 @@ export const flattenType = (type: VLType): VLType => {
 export const getConcreteType = (
   type: VLType,
   ctx: Context | undefined,
+  seen: Set<string> = new Set(),
 ): VLType => {
   if (type.type !== "Alias") return type; // TODO: Should handle recursiveness (objects, params, etc)
   if (type.name === "null" || type.name === "string") return type; // TODO: remove string and make it an object type
 
+  // A self-referential alias chain (e.g. the bodyless `type Point`, whose grammar
+  // alt `TYPE ID` aliases the name to itself) would otherwise recurse forever and
+  // stack-overflow. Opaque/recursive type aliases aren't supported yet (A14):
+  // report it cleanly and bail instead of crashing.
+  if (seen.has(type.name)) {
+    if (ctx) {
+      errors.push({
+        type: "Syntax",
+        message:
+          `Type \`${type.name}\` refers to itself; opaque/recursive type aliases are not yet supported`,
+        ctx,
+        code: 1,
+      });
+    }
+    return { type: "Never" };
+  }
+  seen.add(type.name);
+
   for (let i = scopes.length - 1; i >= 0; i--) {
     if (type.name in scopes[i]) {
       type = scopes[i][type.name];
-      if (type.type === "Type") return getConcreteType(type.subType, ctx);
-      return getConcreteType(type, ctx);
+      if (type.type === "Type") return getConcreteType(type.subType, ctx, seen);
+      return getConcreteType(type, ctx, seen);
     }
   }
 
