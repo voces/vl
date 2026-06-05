@@ -48,7 +48,7 @@ whileStatement
     ;
 
 forStatement
-    : label? NEWLINE* FOR NEWLINE* ID NEWLINE* IN NEWLINE* expr NEWLINE* TO NEWLINE* expr (NEWLINE* STEP NEWLINE* expr)? NEWLINE* statement
+    : label? NEWLINE* FOR NEWLINE* ID NEWLINE* IN NEWLINE* expr (NEWLINE* TO NEWLINE* expr (NEWLINE* STEP NEWLINE* expr)?)? NEWLINE* statement
     ;
 
 breakStatement

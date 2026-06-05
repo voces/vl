@@ -195,8 +195,15 @@ stays tolerant of both binaryen forms (sync object / async init).*
   codegen** — `objectStruct` keeps only StringLiteral keys) are the type-level precursor →
   this is their codegen. Dispatches through B13's `"[]"`/`"[]="` traps. Deferred.
 - ⬜ **B7. Strings in codegen.** Depends on A7 + B1.
-- 🟡 **B8. Loops: wire `for` `step`** (parsed/typechecked but hardcoded `+1`), and
-  implement `for…in` over arrays/objects (aspirational in `samples/loops.vl`).
+- 🟡 **B8. Loops.** DONE: **`for…in` over arrays** — the `to`-less `for x in arr` (grammar:
+  the `TO expr` clause is now optional) binds `x` to each element, lowered to a 0..length index
+  loop over `array.get` (iterable evaluated once into a local); a non-array iterable is a clean
+  type error (`loops/for-in.vl`, `loops/for-in-not-array.vl`). REMAINING: wire `for` `step` (the
+  range form parses/type-checks `step` but codegen still hardcodes `+1`); `for…in` over objects
+  / maps; the `for val, i in arr` (value + index) and `for , v in obj` destructuring forms
+  (aspirational in `samples/loops.vl`). NOTE: a single-line `for … { s = s + i }` mis-parses the
+  `{…}` as an object literal (pre-existing block-vs-object ambiguity, affects range-for too) —
+  use a newline after `{` for now.
 - 🟡 **B9. `break` in codegen** (only `continue` is handled); verify labeled break/continue.
 - ⬜ **B10. Prefix/postfix ops in codegen** (`++ -- not !`) — parsed & in the interpreter,
   not in the wasm path.

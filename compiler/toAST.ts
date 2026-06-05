@@ -35,6 +35,7 @@ import type {
 } from "./ast.ts";
 import { errors, flow, scopes } from "./state.ts";
 import {
+  arrayElementType,
   ensureType,
   flattenType,
   getChildType,
@@ -804,6 +805,47 @@ const toStatement = (ctx: StatementContext): VLStatement => {
     const forStatement = ctx.forStatement();
     if (forStatement) {
       const variable = forStatement.ID().getText();
+
+      // Collection iteration: `for x in arr` (no `to`) binds `x` to each element.
+      const toCtx0 = forStatement.expr(1);
+      if (!toCtx0) {
+        const iterableCtx = forStatement.expr(0);
+        const iterable = toExpression(iterableCtx);
+        const iterableType = typeFromExpression(iterable, iterableCtx);
+        const element = arrayElementType(iterableType);
+        if (!element) {
+          errors.push({
+            type: "Type",
+            left: {
+              type: "Object",
+              properties: [{
+                name: { type: "Alias", name: "i32" },
+                type: { type: "Unknown" },
+              }],
+            },
+            right: iterableType,
+            ctx: iterableCtx,
+            code: "for-in-not-array",
+          });
+        }
+        const statementCtx = forStatement.statement();
+        scopes.push({ [variable]: softenImplicitType(element ?? { type: "Never" }) });
+        let statement: VLStatement;
+        try {
+          statement = toStatement(statementCtx);
+          scopes.pop();
+        } catch (err) {
+          scopes.pop();
+          throw err;
+        }
+        return {
+          type: "ForIn",
+          label: forStatement.label()?.ID().getText(),
+          variable,
+          iterable,
+          statement,
+        };
+      }
 
       const fromCtx = forStatement.expr(0);
       const from = toExpression(fromCtx);

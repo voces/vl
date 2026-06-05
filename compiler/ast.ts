@@ -172,6 +172,15 @@ export type VLForNode = {
   label: string | undefined;
 };
 
+// `for x in arr` — iterate an array's elements (the `to`-less form of `for`).
+export type VLForInNode = {
+  type: "ForIn";
+  variable: string;
+  iterable: VLExpression;
+  statement: VLStatement;
+  label: string | undefined;
+};
+
 export type VLBreakNode = {
   type: "Break";
   label: string | undefined;
@@ -188,6 +197,7 @@ export type VLStatement =
   | VLVariableDeclarationNode
   | VLWhileNode
   | VLForNode
+  | VLForInNode
   | VLBreakNode
   | VLContinueNode;
 

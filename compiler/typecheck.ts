@@ -338,6 +338,7 @@ export const typeFromStatement = (
         subType: typeFromStatement(stmt.statement, ctx),
       };
     case "For":
+    case "ForIn":
       return {
         type: "Nullable",
         subType: typeFromStatement(stmt.statement, ctx),

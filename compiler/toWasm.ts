@@ -1114,6 +1114,53 @@ export const toWasm = async (ast: VLProgramNode) => {
         loopLabels.pop();
         return loop;
       }
+      case "ForIn": {
+        // (block $brk
+        //   arr = <iterable>                 ; evaluated once
+        //   len = array.len(arr)
+        //   i = 0
+        //   (loop $loop
+        //     (br_if $brk (i >= len))
+        //     var = array.get(arr, i)        ; bind the element
+        //     (block $cont body)
+        //     i = i + 1
+        //     (br $loop)))
+        const cont = node.label ?? `loop${loopIndex++}`;
+        const loopLabel = `${cont}__loop`;
+        const brk = `${cont}__brk`;
+        loopLabels.push(cont);
+
+        const info = arrayTypeOf(node.iterable);
+        if (!info) throw new Error("for…in over a non-array");
+        const elemWasm = toWasmType(info.element);
+        const arrLocal = newLocal(info.at.refType);
+        const lenLocal = newLocal(binaryen.i32);
+        const iLocal = newLocal(binaryen.i32);
+        const varLocal = newLocal(elemWasm);
+        // The body resolves the loop variable to its local (element type).
+        currentScope[node.variable] = [info.element, varLocal];
+        const arr = () => m.local.get(arrLocal, info.at.refType);
+        const i = () => m.local.get(iLocal, binaryen.i32);
+
+        const loop = m.block(brk, [
+          m.local.set(arrLocal, toExpression(node.iterable)),
+          m.local.set(lenLocal, m.array.len(arr())),
+          m.local.set(iLocal, m.i32.const(0)),
+          m.loop(
+            loopLabel,
+            m.block(null, [
+              m.br(brk, m.i32.ge_s(i(), m.local.get(lenLocal, binaryen.i32))),
+              m.local.set(varLocal, m.array.get(arr(), i(), elemWasm, false)),
+              m.block(cont, [toExpression(node.statement)]),
+              m.local.set(iLocal, m.i32.add(i(), m.i32.const(1))),
+              m.br(loopLabel),
+            ]),
+          ),
+        ]);
+        if (!node.label) loopIndex--;
+        loopLabels.pop();
+        return loop;
+      }
       case "Continue":
         return m.br(node.label ?? loopLabels[loopLabels.length - 1]);
       default:
