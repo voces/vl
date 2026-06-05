@@ -140,7 +140,7 @@ closures / `is` / variance designs referenced here.
 - 🟢 **A11. Recursive types.** **DONE:** a recursive *structural* type resolves and
   compiles end to end — `type Tree = { value: i32, left: Tree | null, right: Tree | null }`
   constructs, traverses (null-narrowing on the recursive field), and accumulates
-  (`types/recursive-tree.vl`). The recursion is carried by the alias **name**: `toAST`
+  (`types/recursive-tree.vl`). The recursion is carried by the alias **name**: the parser
   forward-registers the alias and returns a lazy `Alias` leaf for a self-reference inside the
   body (`typeBuilding`), and `_softenImplicitType` **preserves** that nested `Alias` leaf
   (softens via the un-wrapped helper, so the structure stays finite) — a top-level alias is
@@ -153,7 +153,7 @@ closures / `is` / variance designs referenced here.
   types share one struct), isolates the recursion group (SCC) and builds it in one
   `TypeBuilder` rec group with forward references, while a non-recursive nested struct is still
   built independently. REMAINING: **mutual recursion** across *separate* `type` declarations
-  (needs forward-registration of the not-yet-declared name in `toAST`); recursion through an
+  (needs forward-registration of the not-yet-declared name in the parser); recursion through an
   **array** element (`type List = { rest: [List] }` — the array's own type-builder isn't in the
   rec group); the degenerate bodyless `type Point` still errors cleanly (A14).
 - ⬜ **A12. Soundness pass / test suite.** Port the "If T" narrowing benchmark idea; build
@@ -604,8 +604,18 @@ LSP (today `toWasm` only runs inside `server.ts`).*
   non-zero exit on errors. The VS Code extension's **Run Current File** command (Ctrl+F5) shells
   out to it in a terminal (runs the live buffer via a temp file when unsaved). REMAINING: a real
   `vl`/`vital` binary (C5) rather than `deno task run`.
-- ⬜ **C3. `vl build <file> -o out.wasm`** — emit `.wasm` (and optional `.wat`).
-- ⬜ **C4. `vl check <file>`** — diagnostics only, exit code for CI.
+- ✅ **C3. `vl build <file> -o out.wasm`** — emit `.wasm` (and optional `.wat`). DONE:
+  `deno task build <file> [-o <out.wasm>] [--wat]` compiles and writes the wasm bytes
+  (default output drops the `.vl` extension → `foo.vl` → `foo.wasm`); on error diagnostics it
+  prints them to stderr and exits non-zero without writing. `--wat` also emits a sibling `.wat`
+  text file via a thin `wasmToWat` (`compile.ts`) that reads the binary back through binaryen and
+  `emitText`s it (`toWasm` only hands out bytes). `cli.ts` now dispatches on a leading subcommand
+  (`run` | `build` | `check`); a missing/unknown word falls back to `run`, so the bare
+  `deno task run <file>` and the VS Code Run-Current-File integration are unchanged. All
+  `Deno`/`process` usage stays in `cli.ts`; the core remains runtime-agnostic.
+- ✅ **C4. `vl check <file>`** — diagnostics only, exit code for CI. DONE: `deno task check <file>`
+  compiles, prints diagnostics to stderr, and exits 1 iff there is an ERROR-severity diagnostic
+  (else 0) — never instantiates or runs the program. A clean CI gate.
 - ⬜ **C5. Decide CLI runtime/distribution** — Deno (`deno compile` for a binary) vs Node.
   Affects packaging.
 

@@ -10,22 +10,12 @@
 // adapts these to vscode-languageserver Diagnostics; everyone else consumes
 // them directly.
 
-import { ParserRuleContext, TerminalNode } from "antlr4";
-import {
-  CharStream,
-  CommonTokenStream,
-  ErrorListener,
-  RecognitionException,
-  Recognizer,
-  Token,
-} from "antlr4";
-import VLLexer from "./antlr/VL_Lexer.ts";
-import VLParser, { ProgramContext } from "./antlr/VL_Parser.ts";
-import { ParseErrors, toAST, VLProgramNode, VLType } from "./toAST.ts";
+import Binaryen from "binaryen";
+import type { Context, ParseErrors, VLProgramNode, VLType } from "./ast.ts";
+import { tokenize } from "./lexer.ts";
+import { parseProgram } from "./parser.ts";
 import { toWasm } from "./toWasm.ts";
 import { defaultScope } from "./defaultScope.ts";
-
-type Context = ParserRuleContext | TerminalNode;
 
 export type VLSeverity = "error" | "warning" | "info";
 export type VLPosition = { line: number; character: number };
@@ -46,76 +36,12 @@ export type CompileResult = {
   wasm: Uint8Array | undefined;
 };
 
-class VLErrorListener<T> extends ErrorListener<T> {
-  constructor(
-    readonly diagnostic: (diagnostic: VLDiagnostic) => void,
-    readonly getText: (symbol: T) => string,
-  ) {
-    super();
-  }
-
-  override syntaxError(
-    _recognizer: Recognizer<T>,
-    offendingSymbol: T | null,
-    line: number,
-    character: number,
-    msg: string,
-    _e: RecognitionException | undefined,
-  ): void {
-    const message = offendingSymbol != null
-      ? `Syntax error at ${this.getText(offendingSymbol)}: ${msg}`
-      : `Syntax error: ${msg}`;
-    this.diagnostic({
-      message,
-      severity: "error",
-      source: "vital",
-      range: {
-        start: { line: line - 1, character },
-        end: { line: line - 1, character: character + 1 },
-      },
-    });
-  }
-}
-
-/** Lex + parse, collecting syntax diagnostics. */
-export const parse = (
-  code: string,
-): { tree: ProgramContext; diagnostics: VLDiagnostic[] } => {
-  const chars = new CharStream(code);
-  const lexer = new VLLexer(chars);
-  const diagnostics: VLDiagnostic[] = [];
-  lexer.removeErrorListeners();
-  lexer.addErrorListener(
-    new VLErrorListener((d) => diagnostics.push(d), (s) => s.toString()),
-  );
-  const tokens = new CommonTokenStream(lexer);
-  const parser = new VLParser(tokens);
-  parser.removeErrorListeners();
-  parser.addErrorListener(
-    new VLErrorListener<Token>((d) => diagnostics.push(d), (s) => s.text),
-  );
-  return { tree: parser.program(), diagnostics };
-};
-
-export const rangeFromCtx = (ctx: Context): VLRange => {
-  if (ctx instanceof TerminalNode) {
-    return {
-      start: { line: ctx.symbol.line - 1, character: ctx.symbol.column },
-      end: {
-        line: ctx.symbol.line - 1,
-        character: ctx.symbol.column + (ctx.symbol.stop - ctx.symbol.start) + 1,
-      },
-    };
-  }
-  const stop = ctx.stop ?? ctx.start;
-  return {
-    start: { line: ctx.start.line - 1, character: ctx.start.column },
-    end: {
-      line: stop.line - 1,
-      character: stop.column + (stop.stop - stop.start) + 1,
-    },
-  };
-};
+// A source span (`Context`) carries 1-based lines / 0-based columns, with `stop`
+// one past the last character. Diagnostics use 0-based lines, so shift here.
+export const rangeFromCtx = (ctx: Context): VLRange => ({
+  start: { line: ctx.start.line - 1, character: ctx.start.column },
+  end: { line: ctx.stop.line - 1, character: ctx.stop.column },
+});
 
 export const stringifyType = (type: VLType, seen: Set<VLType> = new Set()): string => {
   if (type.type === "Alias") return type.name;
@@ -226,8 +152,8 @@ const diagnosticFromError = (error: ParseErrors): VLDiagnostic => {
  * throw is surfaced as a diagnostic rather than escaping.
  */
 export const compile = async (source: string): Promise<CompileResult> => {
-  const { tree, diagnostics } = parse(source);
-  const [ast, errors] = toAST(tree, defaultScope());
+  const { tokens, diagnostics } = tokenize(source);
+  const [ast, errors] = parseProgram(tokens, defaultScope());
   for (const error of errors) diagnostics.push(diagnosticFromError(error));
 
   let wasm: Uint8Array | undefined;
@@ -250,6 +176,27 @@ export const compile = async (source: string): Promise<CompileResult> => {
   }
 
   return { ast, diagnostics, wasm };
+};
+
+/**
+ * Render compiled wasm bytes as WAT text (used by `vl build --wat`). Reads the
+ * binary back through binaryen and emits its textual form — `toWasm` only hands
+ * out bytes, so this is the thin module-exposing variant. Pure binaryen, no
+ * runtime globals, so the core stays runtime-agnostic.
+ */
+export const wasmToWat = async (wasm: Uint8Array): Promise<string> => {
+  // Mirror toWasm's tolerance of both binaryen forms (sync object / async init).
+  // deno-lint-ignore no-explicit-any
+  const _Binaryen = Binaryen as any;
+  const binaryen = typeof _Binaryen === "function"
+    ? await _Binaryen()
+    : _Binaryen;
+  const m = binaryen.readBinary(wasm);
+  try {
+    return m.emitText();
+  } finally {
+    m.dispose();
+  }
 };
 
 export type RunResult = { logs: string[] };
