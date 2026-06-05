@@ -849,7 +849,7 @@ export const toWasm = async (ast: VLProgramNode) => {
       case "UnaryOperation": {
         const op = node.operator;
         // Logical not on a boolean (an i32 0/1): eqz maps 0→1, nonzero→0.
-        if (op === "!" || op === "not") {
+        if (op === "!") {
           return m.i32.eqz(toExpression(node.operand));
         }
         // `++` / `--` mutate a variable (the AST guards non-Name operands).

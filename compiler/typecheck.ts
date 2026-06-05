@@ -71,8 +71,8 @@ export const _typeFromExpression = (
     }
     case "UnaryOperation": {
       const operandType = typeFromExpression(expr.operand, ctx);
-      // Logical not (`!` / `not`): boolean → boolean.
-      if (expr.operator === "!" || expr.operator === "not") {
+      // Logical not (`!`): boolean → boolean.
+      if (expr.operator === "!") {
         ensureType(
           { type: "Nullable", subType: { type: "Alias", name: "boolean" } },
           operandType,

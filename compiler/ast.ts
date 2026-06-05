@@ -115,7 +115,7 @@ export type VLBinaryOperationNode = {
   operator: string;
 };
 
-// Unary operators: logical not (`!` / `not`) and in/decrement (`++` / `--`).
+// Unary operators: logical not (`!`) and in/decrement (`++` / `--`).
 // `prefix` distinguishes `++x` (returns the new value) from `x++` (the old).
 export type VLUnaryOperationNode = {
   type: "UnaryOperation";

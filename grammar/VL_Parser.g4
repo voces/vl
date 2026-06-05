@@ -130,8 +130,7 @@ args   : arg (NEWLINE* COMMA NEWLINE* arg)* ;
 arg    : (ID COLON NEWLINE*)? expr;
 
 prefixOp
-    : NOT
-    | EXCLAMATION
+    : EXCLAMATION
     | PLUSPLUS
     | MINUSMINUS
     ;

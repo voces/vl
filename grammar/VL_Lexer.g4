@@ -17,7 +17,6 @@ RETURN   : 'return';
 AWAIT    : 'await';
 BREAK    : 'break';
 CONTINUE : 'continue';
-NOT      : 'not';
 FROM     : 'from';
 TYPE     : 'type';
 

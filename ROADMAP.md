@@ -215,9 +215,11 @@ stays tolerant of both binaryen forms (sync object / async init).*
   else lowers `-x` to a type-matched `0 - x`, reusing `-` codegen — i32 + f64). **`++` / `--`**
   (prefix returns the new value via `local.tee`; postfix returns the old via `tee` then undo the
   delta; statement position just mutates; a new `UnaryOperation` AST node, operand must be a
-  variable). **`!` / `not`** (logical not → `i32.eqz`; also wired `boolean`→i32 in `wasmType.ts`,
-  which booleans-as-values needed). Tests `operators/unary.vl`, `loops/for-step.vl`. Minor gaps:
-  `++`/`--` are i32-only and operate on a `Name` (not `o.x++` / `a[i]++` yet).
+  variable). **`!`** (logical not → `i32.eqz`; also wired `boolean`→i32 in `wasmType.ts`, which
+  booleans-as-values needed). DECIDED: **only `!`, not `not`** — VL's logical operators are
+  symbolic (`&&`/`||`/`!=`), so the `not` keyword (the lone word-operator) was dropped from the
+  lexer + grammar for one-way consistency. Tests `operators/unary.vl`, `loops/for-step.vl`.
+  Minor gaps: `++`/`--` are i32-only and operate on a `Name` (not `o.x++` / `a[i]++` yet).
 - ⬜ **B11. `while true` return analysis.** Compiler can't prove an infinite loop always
   returns (malloc has a trailing-`0` workaround). Special-case or add proper reachability.
 - ⬜ **B12. `async`/`await`.** Keywords exist in the lexer; no semantics or codegen.
