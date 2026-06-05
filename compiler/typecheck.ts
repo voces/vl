@@ -160,6 +160,19 @@ export const _typeFromExpression = (
         }
         return missingOpFunc("left-not-object");
       }
+      // `==` / `!=` on a union or nullable (incl. a literal union like
+      // `"expense" | "reimbursement"` or `0 | 1 | 2`): value equality yielding
+      // boolean, allowed when the operands are comparable (one assignable to the
+      // other — e.g. discriminating `s == "expense"`). Codegen lowers it through
+      // the softened base type's equality (numeric / string / struct), and the
+      // literal narrowing (`atomFact`) refines the place in the branch.
+      if (
+        (op === "==" || op === "!=") &&
+        (leftType.type === "Union" || leftType.type === "Nullable") &&
+        (validateType(leftType, rightType) || validateType(rightType, leftType))
+      ) {
+        return { type: "Alias", name: "boolean" };
+      }
       if (leftType.type !== "Object") return missingOpFunc("left-not-object");
       const opFunc = leftType.properties.find((p) =>
         validateType(p.name, { type: "StringLiteral", value: op })
