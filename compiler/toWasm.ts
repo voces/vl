@@ -846,6 +846,29 @@ export const toWasm = async (ast: VLProgramNode) => {
           false,
         );
       }
+      case "UnaryOperation": {
+        const op = node.operator;
+        // Logical not on a boolean (an i32 0/1): eqz maps 0→1, nonzero→0.
+        if (op === "!" || op === "not") {
+          return m.i32.eqz(toExpression(node.operand));
+        }
+        // `++` / `--` mutate a variable (the AST guards non-Name operands).
+        if (node.operand.type !== "Name") {
+          throw new Error(`${op} requires a variable operand`);
+        }
+        const [, idx] = getScopeEntry(node.operand.name);
+        const delta = op === "++" ? 1 : -1;
+        const next = m.i32.add(
+          m.local.get(idx, binaryen.i32),
+          m.i32.const(delta),
+        );
+        // In statement position the result is unused — just mutate.
+        if (!hasDesiredType()) return m.local.set(idx, next);
+        // Prefix returns the new value; postfix returns the old (undo the delta
+        // after tee-ing the incremented value back).
+        const teed = m.local.tee(idx, next, binaryen.i32);
+        return node.prefix ? teed : m.i32.sub(teed, m.i32.const(delta));
+      }
       case "BinaryOperation": {
         const op = node.operator;
         // Assignment is handled before the operator-method machinery below: the

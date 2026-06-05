@@ -31,6 +31,7 @@ import type {
   VLProgramNode,
   VLStatement,
   VLType,
+  VLUnaryOperationNode,
   VLVariableDeclarationNode,
 } from "./ast.ts";
 import { errors, flow, scopes } from "./state.ts";
@@ -365,6 +366,36 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     };
     typeFromExpression(expr, ctx);
     return expr;
+  }
+
+  // Unary operators: prefix `not x` / `!x` / `++x` / `--x`, postfix `x++` / `x--`.
+  {
+    const pre = ctx.prefixOp();
+    const post = ctx.postfixOp();
+    const opNode = pre ?? post;
+    if (opNode) {
+      const operator = opNode.getText();
+      const operand = toExpression(ctx.expr(0));
+      // `++`/`--` mutate their operand, so it must be an assignable variable.
+      if (
+        (operator === "++" || operator === "--") && operand.type !== "Name"
+      ) {
+        errors.push({
+          type: "Syntax",
+          message: `\`${operator}\` requires a variable operand`,
+          ctx,
+          code: 0,
+        });
+      }
+      const node: VLUnaryOperationNode = {
+        type: "UnaryOperation",
+        operator,
+        operand,
+        prefix: !!pre,
+      };
+      typeFromExpression(node, ctx);
+      return node;
+    }
   }
 
   // Member call: `o.f(args)` — call the function-valued property `o.f`.

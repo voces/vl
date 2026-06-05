@@ -69,6 +69,21 @@ export const _typeFromExpression = (
       if (!ensureType(param, rightType, ctx)) return { type: "Never" };
       return opFunc.return;
     }
+    case "UnaryOperation": {
+      const operandType = typeFromExpression(expr.operand, ctx);
+      // Logical not (`!` / `not`): boolean → boolean.
+      if (expr.operator === "!" || expr.operator === "not") {
+        ensureType(
+          { type: "Nullable", subType: { type: "Alias", name: "boolean" } },
+          operandType,
+          ctx,
+        );
+        return { type: "Alias", name: "boolean" };
+      }
+      // `++` / `--`: in/decrement a numeric, yielding the same (softened) type.
+      ensureType({ type: "Alias", name: "i32" }, operandType, ctx);
+      return softenImplicitType(operandType);
+    }
     case "Block":
       // Prefer the value type cached during the walk (the last statement's type,
       // resolved while the block scope was live); fall back to re-deriving.

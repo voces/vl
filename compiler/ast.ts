@@ -115,6 +115,15 @@ export type VLBinaryOperationNode = {
   operator: string;
 };
 
+// Unary operators: logical not (`!` / `not`) and in/decrement (`++` / `--`).
+// `prefix` distinguishes `++x` (returns the new value) from `x++` (the old).
+export type VLUnaryOperationNode = {
+  type: "UnaryOperation";
+  operator: string;
+  operand: VLExpression;
+  prefix: boolean;
+};
+
 export type VLVariableDeclarationNode = {
   type: "VariableDeclaration";
   name: string;
@@ -146,6 +155,7 @@ export type VLExpression =
   | VLPropertyAccessNode
   | VLIndexAccessNode
   | VLBinaryOperationNode
+  | VLUnaryOperationNode
   | VLFunctionCallNode
   | VLCallNode
   | VLIfNode;

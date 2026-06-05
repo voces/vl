@@ -17,6 +17,8 @@ export const toWasmType = (binaryen: any, node: VLType): number => {
       case "Object":
         if (type.name === "i32") return binaryen.i32;
         if (type.name === "f64") return binaryen.f64;
+        // Booleans are represented as an i32 (0 / 1).
+        if (type.name === "boolean") return binaryen.i32;
         throw new Error(`Unhandled AST -> WASM "Object" type ${type.name}`);
       case "Function":
         // A function value is an i32 index into the function table.
