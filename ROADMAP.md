@@ -44,9 +44,13 @@ closures / `is` / variance designs referenced here.
   `conditionNarrowing` fact (`typecheck.ts`) is applied by **both** passes: toAST narrows the type
   scope around the then-branch, toWasm a `narrowed` overlay consulted by `codegenType` (the local
   keeps its nullable wasm type, so `local.get`/`struct.get` — which accept a nullable ref — stay
-  valid). Test `types/nullable.vl`. REMAINING (needs A3/A4 for the general case): **else-branch /
-  post-guard narrowing** (`if x == null { return } /* x non-null after */` — flow-sensitive, needs
-  divergence tracking), narrowing **union** members (not just null), and `case`/multi-guard.
+  valid). **DONE (post-guard narrowing):** a guard clause whose then-branch *diverges*
+  (`if x == null { return } /* x non-null below */`) narrows `x` for the rest of the block — the
+  idiomatic null-handling pattern. `divergesStatement` (return/break/continue, a block ending in
+  one, an `if` with all branches diverging, a divergent `while true`) + `postGuardNarrowing`,
+  applied by both passes when walking a block's statements. Tests `types/nullable.vl`,
+  `types/guard-narrowing.vl`. REMAINING (needs A3/A4 for the general case): narrowing **union**
+  members (not just null), `&&`-chained guards (`if x != null && x.y …`), and `case`/multi-guard.
 - 🟡 **A6. `is` operator.** **DONE (stage 1):** grammar `expr IS type` (`x is T`), a `VLIsNode`,
   typed boolean, feeds A5 narrowing. Runtime test is `ref.is_null` (for a `T | null`, `is null` vs
   `is T` are the only variants); `==`/`!=` against `null` are the natural sugar (also

@@ -44,6 +44,7 @@ import {
   flattenType,
   getChildType,
   nonNullable,
+  postGuardNarrowing,
   getConcreteType,
   getType,
   instantiateFunctionType,
@@ -64,6 +65,7 @@ export {
   defaultIntegerType,
   getConcreteType,
   nonNullable,
+  postGuardNarrowing,
   setNodeType,
   softenImplicitType,
   validateParameters,
@@ -549,10 +551,25 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       try {
         const oldDesiredType = flow.desiredType;
         flow.desiredType = undefined;
-        const statements = block.blockStatement_list()
-          .map((b) => b.statement())
-          .filter(Boolean)
-          .map((s): [StatementContext, VLStatement] => [s, toStatement(s)]);
+        const blockScope = scopes[scopes.length - 1];
+        const statements: [StatementContext, VLStatement][] = [];
+        for (const s of block.blockStatement_list().map((b) => b.statement())) {
+          if (!s) continue;
+          const stmt = toStatement(s);
+          statements.push([s, stmt]);
+          // Post-guard narrowing (A5): a guard clause `if x == null { return }`
+          // leaves `x` non-null for the rest of this block — narrow it in the
+          // block scope so subsequent statements see the non-null type.
+          const name = postGuardNarrowing(stmt);
+          if (name) {
+            for (let i = scopes.length - 1; i >= 0; i--) {
+              if (name in scopes[i]) {
+                blockScope[name] = nonNullable(scopes[i][name]);
+                break;
+              }
+            }
+          }
+        }
         // The block's value type is its last statement's type — derive it now,
         // while this block's scope (and any nested declarations) is still live.
         let valueType: VLType | undefined;

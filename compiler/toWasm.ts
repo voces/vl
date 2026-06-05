@@ -4,6 +4,7 @@ import {
   conditionNarrowing,
   defaultIntegerType,
   nonNullable,
+  postGuardNarrowing,
   softenImplicitType,
   validateType,
   VLFunctionCallNode,
@@ -925,15 +926,34 @@ export const toWasm = async (ast: VLProgramNode) => {
         break;
       }
     }
-    return statements
-      .map((stmt, i) =>
-        stmt.type === "FunctionDeclaration"
-          ? handleFunctionDecl(stmt)
-          : i === tail
-          ? toExpression(stmt)
-          : withDesiredType(undefined, () => toExpression(stmt))
-      )
-      .filter((v): v is number => typeof v === "number");
+    // Overlay entries we add for post-guard narrowing, restored at the end so
+    // the narrowing doesn't leak past this statement list.
+    const saved: Record<string, VLType | undefined> = {};
+    const out: number[] = [];
+    for (let i = 0; i < statements.length; i++) {
+      const stmt = statements[i];
+      const v = stmt.type === "FunctionDeclaration"
+        ? handleFunctionDecl(stmt)
+        : i === tail
+        ? toExpression(stmt)
+        : withDesiredType(undefined, () => toExpression(stmt));
+      if (typeof v === "number") out.push(v);
+      // Post-guard narrowing (A5): after a divergent guard (`if x == null
+      // { return }`), narrow `x` to non-null for the rest of this block.
+      const name = postGuardNarrowing(stmt);
+      if (name) {
+        const entry = lookupName(name);
+        if (entry) {
+          if (!(name in saved)) saved[name] = narrowed[name];
+          narrowed[name] = nonNullable(entry.type);
+        }
+      }
+    }
+    for (const name in saved) {
+      if (saved[name] === undefined) delete narrowed[name];
+      else narrowed[name] = saved[name];
+    }
+    return out;
   };
 
   const toExpression = (node: VLProgramNode | VLStatement): number => {

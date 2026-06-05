@@ -875,6 +875,43 @@ export const conditionNarrowing = (
   return { name: named.name, nonNullOn: cond.operator === "!=" ? "then" : "else" };
 };
 
+// Whether a statement always diverges (never falls through to the next): a
+// `return`/`break`/`continue`, a block ending in one, an `if` whose every branch
+// (incl. an `else`) diverges, or a `while true` with no escaping break.
+export const divergesStatement = (s: VLStatement): boolean => {
+  switch (s.type) {
+    case "Return":
+    case "Break":
+    case "Continue":
+      return true;
+    case "Block":
+      return s.statements.length > 0 &&
+        divergesStatement(s.statements[s.statements.length - 1]);
+    case "If":
+      return s.else !== undefined &&
+        s.conditionals.every((c) => divergesStatement(c.statement)) &&
+        divergesStatement(s.else);
+    case "While":
+      return isConstTrue(s.condition) && !hasEscapingBreak(s.statement, s.label);
+    default:
+      return false;
+  }
+};
+
+// Post-guard narrowing (A5): a guard clause `if x == null { return }` (a single
+// conditional, no else, whose then-branch diverges) leaves `x` non-null for the
+// REST of the enclosing block. Returns the variable to narrow to non-null, else
+// null. (Only the non-null direction is applied.)
+export const postGuardNarrowing = (stmt: VLStatement): string | null => {
+  if (stmt.type !== "If") return null;
+  if (stmt.conditionals.length !== 1 || stmt.else) return null;
+  if (!divergesStatement(stmt.conditionals[0].statement)) return null;
+  const narrow = conditionNarrowing(stmt.conditionals[0].condition);
+  // The then-branch diverged, so the fall-through is the else side: `x` is
+  // non-null there iff the condition placed it non-null in the else.
+  return narrow?.nonNullOn === "else" ? narrow.name : null;
+};
+
 /** Registers diagnostics automatically */
 export const ensureType = (
   left: VLType,
