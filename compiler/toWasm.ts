@@ -5,6 +5,7 @@ import {
   defaultIntegerType,
   elseNarrowing,
   nonNullable,
+  placeKey,
   postGuardNarrowing,
   softenImplicitType,
   validateType,
@@ -607,6 +608,10 @@ export const toWasm = async (ast: VLProgramNode) => {
       if (found) return found.type;
     }
     if (node.type === "PropertyAccess") {
+      // A flow-narrowed property path (`if o.v is i32 { … }`) overrides the
+      // stored field type within the branch.
+      const key = placeKey(node);
+      if (key !== null && key in narrowed) return narrowed[key];
       const obj = objectTypeOf(node.object);
       const field = obj.properties.find((p) =>
         p.name.type === "StringLiteral" && p.name.value === node.property
@@ -791,6 +796,44 @@ export const toWasm = async (ast: VLProgramNode) => {
       : existing;
   };
 
+  // `base` object shape with each field overridden by `desired`'s field type
+  // when that is a union or nullable — those carry the boxed / niche
+  // representation that `base` (an object literal's or argument's narrower
+  // inferred shape) lacks. Other fields keep `base`'s own concrete/inferred
+  // type. Used to reconcile a value with the union fields of its target shape,
+  // so the struct it builds matches the binding/parameter it flows into.
+  const mergeDesiredUnionFields = (
+    base: VLObjectType,
+    desired: VLObjectType,
+  ): VLObjectType => {
+    const desiredProp = (name: string) =>
+      desired.properties.find((p) =>
+        p.name.type === "StringLiteral" && p.name.value === name
+      );
+    return {
+      type: "Object",
+      name: base.name,
+      properties: base.properties.map((p) => {
+        const name = p.name.type === "StringLiteral" ? p.name.value : undefined;
+        const dp = name !== undefined ? desiredProp(name) : undefined;
+        if (!dp) return p;
+        const ds = softenImplicitType(dp.type);
+        // A union/nullable field needs its boxed/niche type from the target.
+        if (ds.type === "Union" || ds.type === "Nullable") {
+          return { ...p, type: dp.type };
+        }
+        // Recurse into a nested object field so a deeper union (`{a:{b:T|U}}`)
+        // is reconciled too — overriding only union/nullable leaves, so generic
+        // inference holes in the target are left untouched.
+        const bs = softenImplicitType(p.type);
+        if (ds.type === "Object" && bs.type === "Object") {
+          return { ...p, type: mergeDesiredUnionFields(bs, ds) };
+        }
+        return p;
+      }),
+    };
+  };
+
   const getDirectFunction = (name: string, node: VLFunctionCallNode) => {
     // Don't need to instantiate built-ins
     if (ignoredKeys.has(name)) return name;
@@ -812,7 +855,14 @@ export const toWasm = async (ast: VLProgramNode) => {
         let pt = softenImplicitType(p.paramaterType);
         while (pt.type === "Infer") pt = softenImplicitType(pt.subType);
         if (pt.type === "Object" && pt.name === undefined && node.arguments[i]) {
-          return softenImplicitType(vlType(node.arguments[i].value));
+          const argShape = softenImplicitType(vlType(node.arguments[i].value));
+          // Take the argument's own shape (WasmGC structs aren't width-subtypes),
+          // but keep the declared union/nullable fields — the argument is coerced
+          // to them at the call boundary, so the instance must compile against
+          // them too (else `o.v`'s narrowing and the passed struct disagree).
+          return argShape.type === "Object"
+            ? mergeDesiredUnionFields(argShape, pt)
+            : argShape;
         }
         return p.paramaterType;
       })
@@ -1262,9 +1312,22 @@ export const toWasm = async (ast: VLProgramNode) => {
         return m.local.get(entry[1], toWasmType(entry[0]));
       }
       case "ObjectLiteral": {
-        const struct = objectStruct(objectTypeOf(node));
+        // A union- or nullable-typed field needs its declared (boxed / niche)
+        // representation, but the literal only knows the *value's* narrower type
+        // (`{ v: 5 }` infers `v: i32`, not the binding's `v: string | i32`). So
+        // where the desired object shape types a field as a union/nullable,
+        // override the field's type with it — both to build a matching struct and
+        // to coerce the value. Other fields (incl. generic holes) keep the
+        // literal's own concrete inferred type.
+        let shape = objectTypeOf(node);
+        let dt = desiredType ? softenImplicitType(desiredType) : undefined;
+        while (dt && dt.type === "Infer") dt = softenImplicitType(dt.subType);
+        if (dt && dt.type === "Object" && dt.name === undefined) {
+          shape = mergeDesiredUnionFields(shape, dt);
+        }
+        const struct = objectStruct(shape);
         // Fields are emitted in the struct's (sorted) order, each from its
-        // matching literal property.
+        // matching literal property and coerced to the field's declared type.
         const operands = struct.fields.map((f) => {
           const prop = node.properties.find((p) =>
             (p.name.type === "Name" && p.name.name === f.name) ||
@@ -1307,12 +1370,28 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (!field) {
           throw new Error(`Object has no field "${node.property}"`);
         }
-        return m.struct.get(
+        const read = m.struct.get(
           field.index,
           toExpression(node.object),
           toWasmType(field.type),
           false,
         );
+        // A flow-narrowed union field (`if o.v is i32 { o.v }`) is read as the
+        // narrowed variant — pull the payload out of the field's `{ tag, value }`
+        // struct and recover it, mirroring the narrowed-Name case.
+        const key = placeKey(node);
+        const info = key !== null && key in narrowed
+          ? unionInfo(field.type)
+          : null;
+        if (info) {
+          const nt = narrowed[key!];
+          const member = findVariant(info, nt);
+          if (member && variantTag(info, nt) !== info.nullTag && !unionInfo(nt)) {
+            const payload = m.struct.get(1, read, info.payloadWasm, false);
+            return unboxPayload(info, member, payload);
+          }
+        }
+        return read;
       }
       case "UnaryOperation": {
         const op = node.operator;
@@ -1642,13 +1721,13 @@ export const toWasm = async (ast: VLProgramNode) => {
           else narrowed[name] = prev;
           return r;
         };
-        // The variable's type *as currently narrowed* (an outer branch may have
+        // The place's type *as currently narrowed* (an outer branch may have
         // already refined it), so nested narrowings compose rather than reset.
-        const curType = (name: string) =>
-          narrowed[name] ?? lookupName(name)?.type;
+        // `codegenType` consults the `narrowed` overlay for both names and paths.
+        const curType = () => narrow && codegenType(narrow.place);
         const thenStmt = () => toExpression(node.conditionals[0].statement);
         const thenBranch = () => {
-          const base = narrow && curType(narrow.name);
+          const base = curType();
           return narrow?.nonNullOn === "then" && base
             ? withNarrowed(
               narrow.name,
@@ -1667,7 +1746,7 @@ export const toWasm = async (ast: VLProgramNode) => {
             : undefined;
         const elseBranch = (): number | undefined => {
           const hasElse = node.conditionals.length > 1 || node.else !== undefined;
-          const base = narrow && curType(narrow.name);
+          const base = curType();
           if (hasElse && base) {
             const elseType = elseNarrowing(cond, base);
             if (elseType && elseType.type !== "Never") {
@@ -2070,6 +2149,12 @@ export const toWasm = async (ast: VLProgramNode) => {
       else if (s.type !== "Never") nonNull.push(v);
     }
     if (nonNull.length === 0 || (nonNull.length === 1 && !hasNull)) return null;
+    // `T | null` for a single *reference* T → a niche nullable ref (`ref null $t`)
+    // rather than a box; `toWasmType`'s Nullable branch handles it. (A scalar `T`
+    // like `i32 | null` has no spare null, so it still boxes.)
+    if (
+      nonNull.length === 1 && hasNull && valueTypeName(nonNull[0]) === null
+    ) return null;
     const variants = nonNull.sort((a, b) => {
       const ka = variantKey(a);
       const kb = variantKey(b);

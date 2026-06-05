@@ -35,7 +35,14 @@ import type {
   VLUnaryOperationNode,
   VLVariableDeclarationNode,
 } from "./ast.ts";
-import { errors, flow, guards, scopes, withScope } from "./state.ts";
+import {
+  errors,
+  flow,
+  guards,
+  narrowedPaths,
+  scopes,
+  withScope,
+} from "./state.ts";
 import {
   arrayElementType,
   conditionNarrowing,
@@ -67,6 +74,7 @@ export {
   elseNarrowing,
   getConcreteType,
   nonNullable,
+  placeKey,
   postGuardNarrowing,
   setNodeType,
   softenImplicitType,
@@ -823,17 +831,49 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       // Walk a conditional's then-statement with flow narrowing (A5): inside
       // `if x != null { … }`, `x` is seen as non-null. Only the non-null case is
       // narrowed (the useful one); a `== null` then-branch is left as-is.
+      // A place's current type: a bare name from the scope stack, a property
+      // path resolved through its object's shape.
+      // deno-lint-ignore no-explicit-any
+      const placeType = (n: NonNullable<ReturnType<typeof conditionNarrowing>>, ctx: any) => {
+        if (n.place.type === "Name") {
+          for (let i = scopes.length - 1; i >= 0; i--) {
+            if (n.name in scopes[i]) return scopes[i][n.name];
+          }
+          return undefined;
+        }
+        return typeFromExpression(n.place, ctx);
+      };
+      // Walk a statement with `place` narrowed to `type`: a bare name via the
+      // scope stack, a property path via the shared `narrowedPaths` overlay.
+      const withNarrowedPlace = (
+        n: NonNullable<ReturnType<typeof conditionNarrowing>>,
+        type: VLType,
+        // deno-lint-ignore no-explicit-any
+        stmtCtx: any,
+      ) => {
+        if (n.place.type === "Name") {
+          return withScope({ [n.name]: type }, () => toStatement(stmtCtx));
+        }
+        const had = n.name in narrowedPaths;
+        const prev = narrowedPaths[n.name];
+        narrowedPaths[n.name] = type;
+        try {
+          return toStatement(stmtCtx);
+        } finally {
+          if (had) narrowedPaths[n.name] = prev;
+          else delete narrowedPaths[n.name];
+        }
+      };
+      // Walk a conditional's then-statement with flow narrowing (A5): inside
+      // `if x is T { … }`, `x` (or `o.v`) is the narrowed variant. Only the
+      // then-positive case is narrowed here; the else mirror is below.
       // deno-lint-ignore no-explicit-any
       const narrowThen = (cond: VLExpression, stmtCtx: any) => {
         const n = conditionNarrowing(cond);
         if (n?.nonNullOn === "then") {
-          for (let i = scopes.length - 1; i >= 0; i--) {
-            if (n.name in scopes[i]) {
-              return withScope(
-                { [n.name]: n.thenType ?? nonNullable(scopes[i][n.name]) },
-                () => toStatement(stmtCtx),
-              );
-            }
+          const cur = placeType(n, stmtCtx);
+          if (cur) {
+            return withNarrowedPlace(n, n.thenType ?? nonNullable(cur), stmtCtx);
           }
         }
         return toStatement(stmtCtx);
@@ -845,17 +885,10 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       const narrowElse = (cond: VLExpression, stmtCtx: any) => {
         const n = conditionNarrowing(cond);
         if (n) {
-          for (let i = scopes.length - 1; i >= 0; i--) {
-            if (n.name in scopes[i]) {
-              const elseType = elseNarrowing(cond, scopes[i][n.name]);
-              if (elseType && elseType.type !== "Never") {
-                return withScope(
-                  { [n.name]: elseType },
-                  () => toStatement(stmtCtx),
-                );
-              }
-              break;
-            }
+          const cur = placeType(n, stmtCtx);
+          const elseType = cur && elseNarrowing(cond, cur);
+          if (elseType && elseType.type !== "Never") {
+            return withNarrowedPlace(n, elseType, stmtCtx);
           }
         }
         return toStatement(stmtCtx);
@@ -1242,6 +1275,7 @@ export const toAST = (
   scopes.splice(0);
   errors.splice(0);
   guards.clear();
+  for (const k in narrowedPaths) delete narrowedPaths[k];
 
   // console.log(cst.toStringTree(VL_Parser.ruleNames, cst.parser!));
 

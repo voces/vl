@@ -18,6 +18,15 @@ export const withScope = <T>(scope: Scope, fn: () => T) => {
 export const errors: ParseErrors[] = [];
 
 /**
+ * Flow-narrowing overlay for *property paths* (`o.v`, `o.v.w`) — a place that a
+ * lexical scope can't hold (only a bare name can). Inside `if o.v is i32 { … }`,
+ * `o.v`'s type is overridden to the narrowed variant here, keyed by a canonical
+ * path string. A bare `Name` keeps using the scope stack; this covers the rest.
+ * Consulted by `typeFromExpression` (PropertyAccess), written by the if-walker.
+ */
+export const narrowedPaths: Record<string, VLType> = {};
+
+/**
  * Expected implicit type for value-returning expressions (the last statement of
  * a block, a binary operand, etc.). A holder object because it is reassigned
  * across the typecheck.ts / toAST.ts module boundary, which a bare `let` export

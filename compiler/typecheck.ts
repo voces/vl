@@ -11,7 +11,20 @@ import type {
   VLStringLiteralNode,
   VLType,
 } from "./ast.ts";
-import { errors, flow, guards, scopes } from "./state.ts";
+import { errors, flow, guards, narrowedPaths, scopes } from "./state.ts";
+
+// The canonical narrowing key for a "place" — a bare name (`x`) or a property
+// path rooted at one (`o.v`, `o.v.w`) — or null for anything else (a call,
+// index, literal: not a stable place to narrow). Names can't contain `.`, so
+// the path string is unambiguous.
+export const placeKey = (expr: VLExpression): string | null => {
+  if (expr.type === "Name") return expr.name;
+  if (expr.type === "PropertyAccess") {
+    const base = placeKey(expr.object);
+    return base === null ? null : `${base}.${expr.property}`;
+  }
+  return null;
+};
 
 // Binary operators that yield a boolean (comparisons + logical), used when the
 // operand is still an inference hole and we infer the result without the method.
@@ -237,6 +250,10 @@ export const _typeFromExpression = (
         }],
       };
     case "PropertyAccess": {
+      // A flow-narrowed property path (`if o.v is i32 { … }`) overrides the
+      // stored field type within the branch.
+      const key = placeKey(expr);
+      if (key !== null && key in narrowedPaths) return narrowedPaths[key];
       let objType = typeFromExpression(expr.object, ctx);
       if (objType.type === "Infer") objType = objType.subType;
       if (objType.type !== "Object") return { type: "Never" };
@@ -891,14 +908,16 @@ export const nonNullable = (type: VLType): VLType => {
   return type;
 };
 
-// Flow narrowing (A5): a fact extracted from an `if` condition — which variable
-// becomes non-null in which branch. Currently a nullness test (`x != null` /
-// `x == null`) on a plain variable. Applied by both passes: toAST narrows the
-// type scope, toWasm the codegen scope, around the relevant branch.
+// Flow narrowing (A5): a fact extracted from an `if` condition — which *place*
+// (a name `x` or a property path `o.v`) becomes which type in which branch.
+// `name` is the place's canonical key; `place` is the expression itself (so the
+// appliers can read its current type). Applied by both passes: toAST narrows the
+// type scope / path overlay, toWasm its codegen overlay, around the branch.
 export const conditionNarrowing = (
   cond: VLExpression,
 ): {
   name: string;
+  place: VLExpression;
   nonNullOn: "then" | "else";
   thenType?: VLType;
 } | null => {
@@ -907,11 +926,14 @@ export const conditionNarrowing = (
   // and `null` are the only variants, so this is a nullness narrowing. For a
   // (boxed) value union, `thenType` carries the concrete variant `T`, so the
   // then-branch sees `x: T` (not merely non-null) — codegen unboxes accordingly.
-  if (cond.type === "Is" && cond.value.type === "Name") {
+  if (cond.type === "Is") {
+    const key = placeKey(cond.value);
+    if (key === null) return null;
     const checksNull = cond.checkType.type === "Alias" &&
       cond.checkType.name === "null";
     return {
-      name: cond.value.name,
+      name: key,
+      place: cond.value,
       nonNullOn: checksNull ? "else" : "then",
       thenType: checksNull ? undefined : cond.checkType,
     };
@@ -921,23 +943,25 @@ export const conditionNarrowing = (
   if (cond.type === "FunctionCall") {
     const guard = guards.get(cond.function);
     const arg = guard && cond.arguments[guard.paramIndex]?.value;
-    if (guard && arg && arg.type === "Name") {
-      return { name: arg.name, nonNullOn: guard.nonNullOn };
+    const key = arg ? placeKey(arg) : null;
+    if (guard && arg && key !== null) {
+      return { name: key, place: arg, nonNullOn: guard.nonNullOn };
     }
     return null;
   }
   if (cond.type !== "BinaryOperation") return null;
   if (cond.operator !== "==" && cond.operator !== "!=") return null;
-  const named = cond.left.type === "Name"
-    ? cond.left
-    : cond.right.type === "Name"
-    ? cond.right
-    : null;
   const isNull = cond.left.type === "NullLiteral" ||
     cond.right.type === "NullLiteral";
-  if (!named || !isNull) return null;
+  const place = cond.left.type === "NullLiteral" ? cond.right : cond.left;
+  const key = placeKey(place);
+  if (!isNull || key === null) return null;
   // `x != null` → x is non-null in the THEN branch; `x == null` → in the ELSE.
-  return { name: named.name, nonNullOn: cond.operator === "!=" ? "then" : "else" };
+  return {
+    name: key,
+    place,
+    nonNullOn: cond.operator === "!=" ? "then" : "else",
+  };
 };
 
 // Two types denoting the same variant (mutually assignable) — used to remove a
