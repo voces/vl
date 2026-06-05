@@ -3,7 +3,6 @@
 // expression/statement type derivations. Operates on the AST + shared state.
 import type {
   Context,
-  VLAliasType,
   VLArgumentNode,
   VLExpression,
   VLParameterNode,
@@ -38,6 +37,20 @@ export const placeKey = (expr: VLExpression): string | null => {
 // Binary operators that yield a boolean (comparisons + logical), used when the
 // operand is still an inference hole and we infer the result without the method.
 const BOOLEAN_OPS = new Set(["<", ">", "<=", ">=", "==", "!=", "&&", "||"]);
+
+// Stable per-object ids + the set of object pairs currently mid-comparison, for
+// coinductive structural subtyping of *recursive* types (A11): re-entering a
+// pair already on the stack assumes it holds (the standard equirecursive rule),
+// so comparing two mutually-recursive shapes terminates instead of looping. The
+// id map is a WeakMap so it doesn't retain types.
+let _typeIdCounter = 0;
+const _typeIds = new WeakMap<object, number>();
+const typeId = (t: object): number => {
+  let id = _typeIds.get(t);
+  if (id === undefined) _typeIds.set(t, id = ++_typeIdCounter);
+  return id;
+};
+const comparingPairs = new Set<string>();
 
 // Whether a value can be compared with the *default* structural `==` — every
 // component must itself be value-comparable. A function-valued field makes an
@@ -463,14 +476,28 @@ export const typeFromExpression = (
   if (memoized) return memoized;
   let type = _typeFromExpression(expr, ctx);
   // This is wrong... the scope chain should be derived from the type itself
-  while (type.type === "Alias") {
+  // Resolve a named alias to its definition, unwrapping a `Type` alias to its
+  // underlying type (a recursive `type X` resolves to `T<…X…>`; the value is the
+  // `…X…`, not the wrapper). The seen-set guards a self-referential alias from
+  // looping forever (A11/A14).
+  const seen = new Set<string>();
+  while (type.type === "Alias" || type.type === "Type") {
+    if (type.type === "Type") {
+      type = type.subType;
+      continue;
+    }
+    const name = type.name;
+    if (seen.has(name)) break;
+    seen.add(name);
+    let resolved: VLType | undefined;
     for (let i = scopes.length - 1; i >= 0; i--) {
-      if ((type as VLAliasType).name in scopes[i]) {
-        type = scopes[i][(type as VLAliasType).name];
-        continue;
+      if (name in scopes[i]) {
+        resolved = scopes[i][name];
+        break;
       }
     }
-    break;
+    if (!resolved) break;
+    type = resolved;
   }
   typeFromExpressionMemory.set(expr, type);
   return type;
@@ -525,9 +552,14 @@ export const _softenImplicitType = (type: VLType): VLType => {
   if (type.type === "StringLiteral") return { type: "Alias", name: "string" };
   if (type.type === "BooleanLiteral") return { type: "Alias", name: "boolean" };
   if (type.type === "Nullable") {
-    const subType = softenImplicitType(type.subType);
+    // Soften the payload WITHOUT expanding a nested alias (`_softenImplicitType`,
+    // not the `getConcreteType`-wrapped `softenImplicitType`): a recursive type's
+    // self-reference (`Tree | null` → `Nullable<Alias "Tree">`) must keep its
+    // `Alias` leaf so the structure stays finite (A11). A top-level alias is still
+    // expanded by the outer `softenImplicitType` wrapper when one is wanted.
+    const subType = _softenImplicitType(type.subType);
     if (subType === type.subType) return type;
-    return { type: "Nullable", subType: softenImplicitType(type.subType) };
+    return { type: "Nullable", subType };
   }
   if (
     type.type === "Alias" || type.type === "Function" ||
@@ -537,7 +569,11 @@ export const _softenImplicitType = (type: VLType): VLType => {
   if (type.type === "Object") {
     let softenedProperty = false;
     const properties = type.properties.map((p) => {
-      const next = softenImplicitType(p.type);
+      // `_softenImplicitType`, not the alias-expanding `softenImplicitType`, so a
+      // recursive field's self-reference keeps its `Alias` leaf (A11). Literals
+      // nested in the field still soften (it recurses); only a top-level alias is
+      // left lazy, which is exactly the recursion barrier we want.
+      const next = _softenImplicitType(p.type);
       if (p.type !== next) softenedProperty = true;
       return next;
     });
@@ -1515,46 +1551,56 @@ export const ensureType = (
       }
 
       if (right.type !== "Object") return pushError(25);
-      const indexProperties = [];
-      const rprops = new Set(right.properties);
-      outer: for (const lprop of left.properties) {
-        if (
-          lprop.name.type === "StringLiteral" ||
-          lprop.name.type === "IntegerLiteral"
-        ) {
-          for (const rprop of right.properties) {
-            if (validateType(lprop.name, rprop.name)) {
-              if (
-                (rprop.type.type === "Union" &&
-                  rprop.type.subTypes.length === 0) ||
-                validateType(lprop.type, rprop.type)
-              ) {
-                rprops.delete(rprop);
-                continue outer;
+      // Coinductive guard: while already comparing this exact pair (a recursive
+      // type reached through its own fields), assume the relation holds so the
+      // structural walk terminates (A11).
+      const pairKey = `${typeId(left)}:${typeId(right)}`;
+      if (comparingPairs.has(pairKey)) return true;
+      comparingPairs.add(pairKey);
+      try {
+        const indexProperties = [];
+        const rprops = new Set(right.properties);
+        outer: for (const lprop of left.properties) {
+          if (
+            lprop.name.type === "StringLiteral" ||
+            lprop.name.type === "IntegerLiteral"
+          ) {
+            for (const rprop of right.properties) {
+              if (validateType(lprop.name, rprop.name)) {
+                if (
+                  (rprop.type.type === "Union" &&
+                    rprop.type.subTypes.length === 0) ||
+                  validateType(lprop.type, rprop.type)
+                ) {
+                  rprops.delete(rprop);
+                  continue outer;
+                }
+                return false;
               }
-              return false;
             }
+            return pushError("missing-prop");
+          } else {
+            indexProperties.push(lprop);
+            continue;
           }
-          return pushError("missing-prop");
-        } else {
-          indexProperties.push(lprop);
-          continue;
         }
-      }
-      // Excess properties on the supplied object: if the expected type has
-      // index signatures they must satisfy one; otherwise they are allowed
-      // (permissive structural width subtyping — a wider object satisfies a
-      // narrower shape, so `function f(o) o.x` accepts `{ x, y }`). Exact-by-
-      // default for values is a later refinement (ROADMAP A8 variance).
-      if (rprops.size && indexProperties.length) {
-        outer: for (const rprop of rprops.values()) {
-          for (const lprop of indexProperties) {
-            if (validateType(lprop.name, rprop.name)) continue outer;
+        // Excess properties on the supplied object: if the expected type has
+        // index signatures they must satisfy one; otherwise they are allowed
+        // (permissive structural width subtyping — a wider object satisfies a
+        // narrower shape, so `function f(o) o.x` accepts `{ x, y }`). Exact-by-
+        // default for values is a later refinement (ROADMAP A8 variance).
+        if (rprops.size && indexProperties.length) {
+          outer: for (const rprop of rprops.values()) {
+            for (const lprop of indexProperties) {
+              if (validateType(lprop.name, rprop.name)) continue outer;
+            }
+            return pushError("extra-prop");
           }
-          return pushError("extra-prop");
         }
+        return true;
+      } finally {
+        comparingPairs.delete(pairKey);
       }
-      return true;
     }
     case "Nullable": {
       const nonNullableLeft = nonNullable(left);
@@ -1594,7 +1640,11 @@ export const ensureType = (
     //   return true;
     case "Type":
       if (right.type !== "Type") return pushError(30);
-      return ensureType(left, right, ctx);
+      // Compare the *underlying* types — re-calling with the `Type` wrappers
+      // unchanged would loop forever on a recursive alias (A11). The structural
+      // walk below is made cycle-safe by the coinductive guard in the `Object`
+      // case.
+      return ensureType(left.subType, right.subType, ctx);
     case "Infer": {
       if (!validateType(left.subType, right)) {
         if (left.subType.type === "Unknown") updateType(left.subType, right);

@@ -137,8 +137,25 @@ closures / `is` / variance designs referenced here.
   parameter inference.
 - ⬜ **A10. Parametric types / generics.** `function foo<T>(x: T)`. Elixir defers these too —
   hard. Needed for real collections.
-- ⬜ **A11. Recursive types.** `getConcreteType` explicitly punts on recursion today.
-  Needed for trees/lists/JSON-shaped data.
+- 🟢 **A11. Recursive types.** **DONE:** a recursive *structural* type resolves and
+  compiles end to end — `type Tree = { value: i32, left: Tree | null, right: Tree | null }`
+  constructs, traverses (null-narrowing on the recursive field), and accumulates
+  (`types/recursive-tree.vl`). The recursion is carried by the alias **name**: `toAST`
+  forward-registers the alias and returns a lazy `Alias` leaf for a self-reference inside the
+  body (`typeBuilding`), and `_softenImplicitType` **preserves** that nested `Alias` leaf
+  (softens via the un-wrapped helper, so the structure stays finite) — a top-level alias is
+  still expanded. Every traversal is cycle-safe: `getConcreteType` already had the A14 seen-set;
+  `typeFromExpression` resolution unwraps a `Type` alias with a seen-guard; `ensureType`'s
+  structural `Object` case has a **coinductive** pair-guard (and the latent `case "Type"`
+  self-loop is fixed) so two mutually-recursive shapes terminate; `stringifyType` has a seen-set.
+  Codegen builds a **self-referential WasmGC struct**: `objectStruct` interns by a cycle-safe
+  structural signature (de-Bruijn-style depth back-refs, so structurally-identical recursive
+  types share one struct), isolates the recursion group (SCC) and builds it in one
+  `TypeBuilder` rec group with forward references, while a non-recursive nested struct is still
+  built independently. REMAINING: **mutual recursion** across *separate* `type` declarations
+  (needs forward-registration of the not-yet-declared name in `toAST`); recursion through an
+  **array** element (`type List = { rest: [List] }` — the array's own type-builder isn't in the
+  rec group); the degenerate bodyless `type Point` still errors cleanly (A14).
 - ⬜ **A12. Soundness pass / test suite.** Port the "If T" narrowing benchmark idea; build
   a corpus of "must-error" and "must-not-error" programs. Define the soundness contract
   (statically sound — every well-typed program is type-safe at runtime).

@@ -5,6 +5,7 @@ import {
   defaultIntegerType,
   distinctScalars,
   elseNarrowings,
+  getConcreteType,
   nonNullable,
   placeKey,
   postGuardNarrowings,
@@ -270,35 +271,161 @@ export const toWasm = async (ast: VLProgramNode) => {
   // name (deterministic order independent of literal/annotation order) and
   // mutable (so `o.x = …` can `struct.set`).
   const objectStructs = new Map<string, ObjectStruct>();
-  const objectStruct = (type: VLObjectType): ObjectStruct => {
-    const fields = type.properties
+
+  // A struct's string-keyed fields, sorted by name (the canonical field order).
+  // Index-signature / non-string keys are dropped — arrays use a separate
+  // representation and dynamic keys are a future map.
+  const structFields = (type: VLObjectType) =>
+    type.properties
       .flatMap((p) =>
         p.name.type === "StringLiteral"
           ? [{ name: p.name.value, type: p.type }]
           : []
       )
       .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-    const sig = fields.map((f) => `${f.name}:${toWasmType(f.type)}`).join(",");
-    let cached = objectStructs.get(sig);
-    if (!cached) {
-      const tb = new binaryen.TypeBuilder(1);
+
+  // A structural struct: an anonymous object that isn't an array (a builtin like
+  // `i32`/`string` carries a `name`; an array carries an `i32` index sig). Only
+  // these can be (mutually) recursive, so they drive the cycle handling below.
+  const isStructObject = (t: VLType): t is VLObjectType =>
+    t.type === "Object" && t.name === undefined && !arrayElementType(t);
+
+  // Follow a (possibly nullable) field/type to the struct it denotes, or null —
+  // used to walk recursive edges. A recursive self-reference is an `Alias` leaf
+  // (`_softenImplicitType` preserves it); the outer `softenImplicitType` wrapper
+  // here resolves that leaf to its concrete struct body.
+  const asStructTarget = (type: VLType): VLObjectType | null => {
+    let t = softenImplicitType(type);
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
+    if (t.type === "Nullable") {
+      t = softenImplicitType(t.subType);
+      while (t.type === "Infer") t = softenImplicitType(t.subType);
+    }
+    return isStructObject(t) ? t : null;
+  };
+
+  // A canonical, cycle-safe signature for a shape. Recursion is carried by the
+  // type-alias name (`Tree`), which `_softenImplicitType` keeps as an `Alias`
+  // leaf — so a self-reference closes the cycle by name, and two shapes that are
+  // structurally equal (however derived) get the same signature and share one
+  // WasmGC struct. A non-struct leaf falls back to its wasm type (no struct
+  // cycle possible), matching the pre-recursion interning.
+  const structSig = (type: VLType, nameStack: string[] = []): string => {
+    let t = type;
+    while (t.type === "Infer") t = t.subType;
+    let prefix = "";
+    if (t.type === "Nullable") {
+      prefix = "?";
+      t = t.subType;
+      while (t.type === "Infer") t = t.subType;
+    }
+    if (t.type === "Alias" && t.name !== "null") {
+      // A recursive reference: close the cycle with a *relative-depth* back-ref
+      // (de Bruijn style) rather than the name, so two structurally-identical
+      // recursive types canonicalize to one signature (and share one WasmGC
+      // struct) regardless of what they're named. Else expand the body once,
+      // pushing the name so its own self-references resolve to this depth.
+      const i = nameStack.indexOf(t.name);
+      if (i >= 0) return `${prefix}@${nameStack.length - i}`;
+      return prefix +
+        structSig(getConcreteType(t, undefined), [...nameStack, t.name]);
+    }
+    const soft = softenImplicitType(t);
+    if (isStructObject(soft)) {
+      return prefix + `{${
+        structFields(soft)
+          .map((f) => `${f.name}:${structSig(f.type, nameStack)}`)
+          .join(",")
+      }}`;
+    }
+    return prefix + `#${toWasmType(t)}`;
+  };
+
+  const objectStruct = (type: VLObjectType): ObjectStruct => {
+    const sig = structSig(type);
+    const cached = objectStructs.get(sig);
+    if (cached) return cached;
+
+    // Discover the struct shapes reachable from `type` and the reference edges
+    // between them, so we can isolate the *recursion group* — the set of shapes
+    // that are mutually recursive with `type` (its strongly-connected component).
+    // Only that group needs a shared WasmGC rec group with forward references; a
+    // non-recursive nested struct is built independently (keeping its own
+    // identity, so identical shapes still share one type across the module).
+    const nodes = new Map<string, { fields: { name: string; type: VLType }[]; targets: string[] }>();
+    const visit = (t: VLObjectType) => {
+      const s = structSig(t);
+      if (objectStructs.has(s) || nodes.has(s)) return;
+      const fields = structFields(t);
+      const targets: string[] = [];
+      nodes.set(s, { fields, targets });
+      for (const f of fields) {
+        const target = asStructTarget(f.type);
+        if (target) {
+          targets.push(structSig(target));
+          visit(target);
+        }
+      }
+    };
+    visit(type);
+
+    // The SCC of `sig`: every reachable node is reachable *from* `sig` (we walked
+    // from it), so a node shares `sig`'s component iff it can reach `sig` back.
+    const reachesRoot = (start: string): boolean => {
+      const stack = [start];
+      const seen = new Set<string>();
+      while (stack.length) {
+        const cur = stack.pop()!;
+        if (cur === sig) return true;
+        if (seen.has(cur)) continue;
+        seen.add(cur);
+        // A node already finalized (built earlier) can't be part of this group.
+        for (const t of nodes.get(cur)?.targets ?? []) stack.push(t);
+      }
+      return false;
+    };
+    const group = [...nodes.keys()].filter(reachesRoot);
+    const sigToIndex = new Map(group.map((s, i) => [s, i]));
+
+    const tb = new binaryen.TypeBuilder(group.length);
+    // A mutually-recursive component must form one rec group so its members may
+    // forward-reference each other; a self-referential single struct likewise.
+    const recursive = group.some((s) =>
+      nodes.get(s)!.targets.some((t) => sigToIndex.has(t))
+    );
+    if (recursive) tb.createRecGroup(0, group.length);
+    // A field's wasm type: a forward (builder-local) reference for an in-group
+    // (recursive) struct, else normal lowering — which builds and caches a
+    // non-recursive nested struct independently, referenced as a finalized type.
+    const fieldWasmType = (ft: VLType): number => {
+      const target = asStructTarget(ft);
+      const idx = target && sigToIndex.get(structSig(target));
+      if (idx !== undefined && idx !== null) {
+        let nt = softenImplicitType(ft);
+        while (nt.type === "Infer") nt = softenImplicitType(nt.subType);
+        return tb.getTempRefType(tb.getTempHeapType(idx), nt.type === "Nullable");
+      }
+      return toWasmType(ft);
+    };
+    group.forEach((s, i) => {
       tb.setStructType(
-        0,
-        fields.map((f) => ({
-          type: toWasmType(f.type),
+        i,
+        nodes.get(s)!.fields.map((f) => ({
+          type: fieldWasmType(f.type),
           packedType: binaryen.notPacked,
           mutable: true,
         })),
       );
-      const heapType = tb.buildAndDispose()[0];
-      cached = {
-        heapType,
-        refType: binaryen.getTypeFromHeapType(heapType, false),
-        fields: fields.map((f, index) => ({ ...f, index })),
-      };
-      objectStructs.set(sig, cached);
-    }
-    return cached;
+    });
+    const heapTypes = tb.buildAndDispose();
+    group.forEach((s, i) => {
+      objectStructs.set(s, {
+        heapType: heapTypes[i],
+        refType: binaryen.getTypeFromHeapType(heapTypes[i], false),
+        fields: nodes.get(s)!.fields.map((f, index) => ({ ...f, index })),
+      });
+    });
+    return objectStructs.get(sig)!;
   };
 
   // --- Arrays (WasmGC arrays) ---

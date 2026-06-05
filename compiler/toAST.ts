@@ -86,6 +86,14 @@ export {
 const returnTypes: VLType[] = [];
 /** Expected return type for `return` statements in the current function. */
 let returnType: VLType | undefined;
+/**
+ * Names of `type` aliases whose body is currently being walked. A reference to
+ * one of these from inside its own definition (a recursive structural type,
+ * `type Tree = { …: Tree … }`) resolves to a lazy `Alias` leaf rather than being
+ * eagerly inlined — so the body stays a finite structure with the recursion
+ * carried by the name, resolved on demand (A11).
+ */
+const typeBuilding = new Set<string>();
 
 const toVariableDeclaration = (ctx: VarDeclContext) => {
   const expr = ctx.expr();
@@ -125,6 +133,12 @@ const toType = (ctx: TypeContext): VLType => {
     const id = ctx.ID();
     if (id) {
       const name = id.getText();
+
+      // A self-reference inside a recursive `type`'s own body resolves to a lazy
+      // alias leaf — the recursion is carried by the name (see `typeBuilding`),
+      // so the body is a finite structure resolved on demand instead of being
+      // expanded forever.
+      if (typeBuilding.has(name)) return { type: "Alias", name };
 
       for (let i = scopes.length - 1; i >= 0; i--) {
         if (name in scopes[i]) {
@@ -1049,11 +1063,24 @@ const toTypeStatement = (ctx: TypeStatementContext) => {
   const type = ctx.type_();
   if (name in scopes[scopes.length - 1]) {
     errors.push({ type: "Redeclaration", name: name, ctx, code: 11 });
-  } else {
-    scopes[scopes.length - 1][name] = {
-      type: "Type",
-      subType: type ? toType(ctx.type_()) : { type: "Alias", name },
-    };
+    return undefined;
+  }
+  // Register the alias *before* walking its body so a recursive reference inside
+  // it resolves (to a lazy `Alias` leaf, via `typeBuilding`). The bodyless form
+  // (`type Point`, no `=`) aliases the name to itself — a degenerate self-cycle
+  // that `getConcreteType` reports cleanly when the name is later used (A14).
+  const entry: { type: "Type"; subType: VLType } = {
+    type: "Type",
+    subType: { type: "Alias", name },
+  };
+  scopes[scopes.length - 1][name] = entry;
+  if (type) {
+    typeBuilding.add(name);
+    try {
+      entry.subType = toType(type);
+    } finally {
+      typeBuilding.delete(name);
+    }
   }
   return undefined;
 };
