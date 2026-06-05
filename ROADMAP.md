@@ -98,11 +98,15 @@ closures / `is` / variance designs referenced here.
   the table index) AND *same captured env* (`ref.eq`). Sound and well-defined ("data by value,
   functions by identity"); conservative only for capturing closures (a fresh env per instance
   compares unequal even with identical captured values — the non-idiomatic field-method pattern).
-  A custom `==` operator (B13/B14) overrides the default. Tests `objects/equality.vl`,
-  `objects/equality-function-field.vl`. REMAINING: **referential identity**
+  A custom `==` operator (B13/B14) overrides the default. **Array `==` DONE** — length +
+  element compare via a per-element-type `arrayEqFn`, recursing through a shared `valueEq` helper
+  (numerics native, strings/arrays/structs recursive, functions by reference) that now also backs
+  `objectEqFn` and the top-level `==`; an array is equatable iff its element type is, and a
+  struct with an array field is now equatable too. Tests `objects/equality.vl`,
+  `objects/equality-function-field.vl`, `arrays/equality.vl`. REMAINING: **referential identity**
   operator (O(1) `ref.eq`) — deferred; `is` is reserved for A6 type-narrowing, so identity needs
-  its own spelling (`===`, or `identical(a,b)`); array `==` (element compare, like strings);
-  storing a comparison result as i32 still needs an `if` (boolean↔i32 coercion).
+  its own spelling (`===`, or `identical(a,b)`); storing a comparison result as i32 still needs an
+  `if` (boolean↔i32 coercion).
 
 ---
 

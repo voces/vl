@@ -468,6 +468,81 @@ export const toWasm = async (ast: VLProgramNode) => {
       ),
     );
 
+  // Equality (i32 0/1) of two values of VL type `t`, given thunks that (re)produce
+  // each side — the shared element/field/operand comparison behind array, object,
+  // and top-level `==`. Numerics compare natively; strings/arrays/structs recurse;
+  // a function value compares by reference (same function + same captured env).
+  const valueEq = (t: VLType, a: () => number, b: () => number): number => {
+    let ft = softenImplicitType(t);
+    while (ft.type === "Infer") ft = softenImplicitType(ft.subType);
+    if (ft.type === "Object" && ft.name === "f64") return m.f64.eq(a(), b());
+    if (ft.type === "Object" && ft.name === "f32") return m.f32.eq(a(), b());
+    if (ft.type === "Object" && ft.name === "i64") return m.i64.eq(a(), b());
+    if (ft.type === "Object" && ft.name === "string") {
+      return m.call(stringEqFn(), [a(), b()], binaryen.i32);
+    }
+    if (ft.type === "Function") return closureRefEq(a, b);
+    const element = ft.type === "Object" ? arrayElementType(ft) : undefined;
+    if (element) return m.call(arrayEqFn(element), [a(), b()], binaryen.i32);
+    if (ft.type === "Object" && ft.name === undefined) {
+      return m.call(objectEqFn(ft), [a(), b()], binaryen.i32);
+    }
+    return m.i32.eq(a(), b()); // i32 / boolean
+  };
+
+  // Per-element-type array equality: `__arr_eq_<n>__(a, b)` returns 1 iff the two
+  // arrays have equal length and equal elements (each compared via `valueEq`, so
+  // arrays of strings/structs/arrays recurse). `__string_eq__` is the same shape
+  // specialized to i32 char codes.
+  const arrayEqFns = new Map<number, string>();
+  const arrayEqFn = (element: VLType): string => {
+    const at = arrayType(element);
+    const existing = arrayEqFns.get(at.heapType);
+    if (existing) return existing;
+    const name = `__arr_eq_${arrayEqFns.size}__`;
+    arrayEqFns.set(at.heapType, name); // before body for cycle safety
+    const elemWasm = toWasmType(element);
+    const a = () => m.local.get(0, at.refType);
+    const b = () => m.local.get(1, at.refType);
+    const i = () => m.local.get(2, binaryen.i32);
+    const len = () => m.local.get(3, binaryen.i32);
+    const body = m.block(null, [
+      m.if(
+        m.i32.ne(m.array.len(a()), m.array.len(b())),
+        m.return(m.i32.const(0)),
+      ),
+      m.local.set(3, m.array.len(a())),
+      m.local.set(2, m.i32.const(0)),
+      m.block("aeq_brk", [
+        m.loop(
+          "aeq_loop",
+          m.block(null, [
+            m.br("aeq_brk", m.i32.ge_s(i(), len())),
+            m.if(
+              m.i32.eqz(valueEq(
+                element,
+                () => m.array.get(a(), i(), elemWasm, false),
+                () => m.array.get(b(), i(), elemWasm, false),
+              )),
+              m.return(m.i32.const(0)),
+            ),
+            m.local.set(2, m.i32.add(i(), m.i32.const(1))),
+            m.br("aeq_loop"),
+          ]),
+        ),
+      ]),
+      m.i32.const(1),
+    ], binaryen.i32);
+    m.addFunction(
+      name,
+      binaryen.createType([at.refType, at.refType]),
+      binaryen.i32,
+      [binaryen.i32, binaryen.i32],
+      body,
+    );
+    return name;
+  };
+
   // Per-shape structural equality: `__eq_<n>__(a, b)` returns 1 iff every field
   // of the two structs is equal (native for numerics, `__string_eq__` for
   // strings, a recursive call for nested structs). The type checker guarantees
@@ -483,30 +558,14 @@ export const toWasm = async (ast: VLProgramNode) => {
     let cond = m.i32.const(1);
     for (const field of struct.fields) {
       const ftWasm = toWasmType(field.type);
-      const aGet = m.struct.get(field.index, m.local.get(0, ref), ftWasm, false);
-      const bGet = m.struct.get(field.index, m.local.get(1, ref), ftWasm, false);
-      let ft = softenImplicitType(field.type);
-      while (ft.type === "Infer") ft = softenImplicitType(ft.subType);
-      let fieldEq: number;
-      if (ft.type === "Object" && ft.name === "f64") {
-        fieldEq = m.f64.eq(aGet, bGet);
-      } else if (ft.type === "Object" && ft.name === "string") {
-        fieldEq = m.call(stringEqFn(), [aGet, bGet], binaryen.i32);
-      } else if (ft.type === "Function") {
-        // A function value is a fat-pointer closure, freshly allocated — compare
-        // by reference (same function + same captured env), re-reading the field.
-        const clo = closureStruct().refType;
-        fieldEq = closureRefEq(
-          () => m.struct.get(field.index, m.local.get(0, ref), clo, false),
-          () => m.struct.get(field.index, m.local.get(1, ref), clo, false),
-        );
-      } else if (
-        ft.type === "Object" && ft.name === undefined && !arrayElementType(ft)
-      ) {
-        fieldEq = m.call(objectEqFn(ft), [aGet, bGet], binaryen.i32);
-      } else {
-        fieldEq = m.i32.eq(aGet, bGet);
-      }
+      // Re-readable thunks per side (binaryen wants trees; `valueEq` re-reads for
+      // the by-reference function case). `valueEq` dispatches f64/f32/i64 native,
+      // string/array/struct recursive, function by reference, else i32.
+      const fieldEq = valueEq(
+        field.type,
+        () => m.struct.get(field.index, m.local.get(0, ref), ftWasm, false),
+        () => m.struct.get(field.index, m.local.get(1, ref), ftWasm, false),
+      );
       cond = m.i32.and(cond, fieldEq);
     }
     m.addFunction(
@@ -1293,6 +1352,23 @@ export const toWasm = async (ast: VLProgramNode) => {
             m.local.set(bLocal, toExpression(node.right)),
             op === "==" ? eq : m.i32.eqz(eq),
           ], binaryen.i32);
+        }
+        // Array `==`/`!=`: length + element compare via a per-element-type
+        // helper (recurses through `valueEq`). Must precede the structural-struct
+        // branch below, which would otherwise treat the array as a struct.
+        if (
+          leftType.type === "Object" && leftType.name === undefined &&
+          (op === "==" || op === "!=")
+        ) {
+          const element = arrayElementType(leftType);
+          if (element) {
+            const eq = m.call(
+              arrayEqFn(element),
+              [toExpression(node.left), toExpression(node.right)],
+              binaryen.i32,
+            );
+            return op === "==" ? eq : m.i32.eqz(eq);
+          }
         }
         // String operators (strings are WasmGC i32-arrays of char codes):
         // `==`/`!=` element-compare via the `__string_eq__` helper; `+`

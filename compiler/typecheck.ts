@@ -39,11 +39,12 @@ export const isEquatable = (
       return true;
     case "Object":
       if (
-        t.name === "i32" || t.name === "f64" || t.name === "boolean" ||
-        t.name === "string"
+        t.name === "i32" || t.name === "i64" || t.name === "f32" ||
+        t.name === "f64" || t.name === "boolean" || t.name === "string"
       ) return true;
-      // Arrays (an i32-index-sig object) don't have a default `==` yet.
-      if (arrayElementType(t)) return false;
+      // An array (i32-index-sig object) is equatable iff its element type is —
+      // `==` compares length + elements (`arrayEqFn`).
+      if (arrayElementType(t)) return isEquatable(arrayElementType(t)!, seen);
       if (seen.has(t)) return true; // cycle guard
       seen.add(t);
       return t.properties.every((p) => isEquatable(p.type, seen));
