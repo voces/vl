@@ -105,6 +105,11 @@ export const toWasm = async (ast: VLProgramNode) => {
   };
 
   let returnType: VLType | undefined = undefined;
+  // The wasm type of the value the current function instance `return`s, captured
+  // during body compilation. Used as the result type when the body ends in a
+  // `return` (so its block is `unreachable`) and the declared return type is an
+  // unresolved inference hole — i.e. a generic function with an inferred return.
+  let returnedWasmType: number | undefined = undefined;
   let desiredType: VLType | undefined = undefined;
   const withDesiredType = <T>(type: VLType | undefined, fn: () => T) => {
     const oldType = desiredType;
@@ -691,6 +696,8 @@ export const toWasm = async (ast: VLProgramNode) => {
     const { declaration } = functions[resolvedName];
     const oldReturnType = returnType;
     returnType = declaration.returnType;
+    const oldReturnedWasmType = returnedWasmType;
+    returnedWasmType = undefined;
 
     // Every function takes a leading `structref` environment parameter (local 0)
     // — null/ignored for a non-capturing function — so all function values share
@@ -748,11 +755,19 @@ export const toWasm = async (ast: VLProgramNode) => {
     try {
       resultType = toWasmType(declaration.returnType);
     } catch {
-      resultType = binaryen.getExpressionType(body);
+      const bodyType = binaryen.getExpressionType(body);
+      // A body ending in `return` (or a divergent `while true`) compiles to an
+      // `unreachable` block; fall back to the recorded `return` value type — the
+      // generic-inferred-return case where the declared type can't be mapped.
+      resultType = bodyType === binaryen.unreachable &&
+          returnedWasmType !== undefined
+        ? returnedWasmType
+        : bodyType;
     }
     instanceResult[instanceName] = resultType;
     m.addFunction(instanceName, params, resultType, locals, body);
     returnType = oldReturnType;
+    returnedWasmType = oldReturnedWasmType;
     return instanceName;
   };
 
@@ -1528,10 +1543,15 @@ export const toWasm = async (ast: VLProgramNode) => {
         );
       case "Return":
         // TODO: need returnType in global scope
-        return withDesiredType(
-          returnType,
-          () => m.return(node.value ? toExpression(node.value) : undefined),
-        );
+        return withDesiredType(returnType, () => {
+          if (!node.value) return m.return(undefined);
+          const value = toExpression(node.value);
+          // Record the concrete result type for `instantiate`'s fallback (used
+          // when the body ends in `return` so its block is `unreachable`).
+          const vt = binaryen.getExpressionType(value);
+          if (vt !== binaryen.unreachable) returnedWasmType = vt;
+          return m.return(value);
+        });
       case "While": {
         // (block $brk (loop $cont (br_if $brk (eqz cond)) body (br $cont)))
         // $cont is the continue target (re-checks the condition each pass).

@@ -287,8 +287,17 @@ stays tolerant of both binaryen forms (sync object / async init).*
   symbolic (`&&`/`||`/`!=`), so the `not` keyword (the lone word-operator) was dropped from the
   lexer + grammar for one-way consistency. Tests `operators/unary.vl`, `loops/for-step.vl`.
   Minor gaps: `++`/`--` are i32-only and operate on a `Name` (not `o.x++` / `a[i]++` yet).
-- ⬜ **B11. `while true` return analysis.** Compiler can't prove an infinite loop always
-  returns (malloc has a trailing-`0` workaround). Special-case or add proper reachability.
+- ✅ **B11. `while true` return analysis.** A `while true` with no `break` escaping it now
+  types as **`Never`** (it never fails its test, and `return` leaves the whole function — so it
+  never falls through to a value), instead of `Nullable<body>`. So a function whose tail is such a
+  loop returns purely via its inner `return`s, with no spurious `… | null` (`isConstTrue` +
+  `hasEscapingBreak`, which respects labels + nested loops). Tests `loops/while-true-return.vl`.
+  Two adjacent codegen gaps this surfaced, also fixed: (a) an un-annotated param used as a numeric
+  operator's **right** operand (`i32 >= n`) unifies to the builtin's `Custom` validator type —
+  `wasmType.ts` now maps a named `Custom` like its numeric; (b) a **generic inferred-return**
+  function whose body ends in `return` compiled to a non-concrete (`unreachable`) result —
+  `instantiate` now records the `return` value's wasm type and uses it as the fallback
+  (`functions/generic-return.vl`, e.g. `function double(n) { return n * 2 }`).
 - ⬜ **B12. `async`/`await`.** Keywords exist in the lexer; no semantics or codegen.
   Large; likely last.
 - 🟡 **B13. Well-known-symbol dispatch (operator overloading / callable objects / index

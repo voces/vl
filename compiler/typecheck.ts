@@ -452,6 +452,38 @@ export const arrayElementType = (type: VLType): VLType | null => {
   return prop ? prop.type : null;
 };
 
+// A literal `true` loop condition (`while true`) — the loop never exits by
+// failing its test, so it only leaves via `break` or `return`.
+const isConstTrue = (cond: VLExpression): boolean =>
+  cond.type === "BooleanLiteral" && cond.value === true;
+
+// Does a `break` escape the loop with the given label? An unlabelled `break` at
+// this loop's level escapes it; a `break <label>` escapes it from anywhere
+// (even inside a nested loop). An unlabelled break inside a *nested* loop
+// targets that loop, not this one.
+const hasEscapingBreak = (
+  stmt: VLStatement,
+  label: string | undefined,
+  nested = false,
+): boolean => {
+  switch (stmt.type) {
+    case "Break":
+      return stmt.label !== undefined ? stmt.label === label : !nested;
+    case "While":
+    case "For":
+    case "ForIn":
+      return hasEscapingBreak(stmt.statement, label, true);
+    case "Block":
+      return stmt.statements.some((s) => hasEscapingBreak(s, label, nested));
+    case "If":
+      return stmt.conditionals.some((c) =>
+        hasEscapingBreak(c.statement, label, nested)
+      ) || (stmt.else ? hasEscapingBreak(stmt.else, label, nested) : false);
+    default:
+      return false;
+  }
+};
+
 export const typeFromStatement = (
   stmt: VLStatement,
   ctx: Context,
@@ -464,6 +496,17 @@ export const typeFromStatement = (
     case "VariableDeclaration":
       return stmt.variableType;
     case "While":
+      // A `while true` with no `break` escaping it diverges: it never fails its
+      // test, and `return` leaves the whole function — so it never falls through
+      // to a value. Typing it `Never` (not `Nullable<body>`) lets a function
+      // whose tail is such a loop return purely via its inner `return`s, without
+      // a spurious `… | null`.
+      if (
+        isConstTrue(stmt.condition) &&
+        !hasEscapingBreak(stmt.statement, stmt.label)
+      ) {
+        return { type: "Never" };
+      }
       return {
         type: "Nullable",
         subType: typeFromStatement(stmt.statement, ctx),

@@ -15,13 +15,19 @@ export const toWasmType = (binaryen: any, node: VLType): number => {
       case "RealLiteral":
         return binaryen.f64;
       case "Object":
+      // A `Custom` is a builtin operator-param validator; it carries the same
+      // numeric `name` and arises when an un-annotated value unifies to a
+      // builtin operator's RHS type (e.g. `n` in `i32 >= n`). Map both by name.
+      case "Custom":
         if (type.name === "i32") return binaryen.i32;
         if (type.name === "i64") return binaryen.i64;
         if (type.name === "f32") return binaryen.f32;
         if (type.name === "f64") return binaryen.f64;
         // Booleans are represented as an i32 (0 / 1).
         if (type.name === "boolean") return binaryen.i32;
-        throw new Error(`Unhandled AST -> WASM "Object" type ${type.name}`);
+        throw new Error(
+          `Unhandled AST -> WASM "${type.type}" type ${type.name}`,
+        );
       case "Function":
         // A function value is an i32 index into the function table.
         return binaryen.i32;
