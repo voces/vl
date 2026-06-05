@@ -616,8 +616,13 @@ LSP (today `toWasm` only runs inside `server.ts`).*
 - ✅ **C4. `vl check <file>`** — diagnostics only, exit code for CI. DONE: `deno task check <file>`
   compiles, prints diagnostics to stderr, and exits 1 iff there is an ERROR-severity diagnostic
   (else 0) — never instantiates or runs the program. A clean CI gate.
-- ⬜ **C5. Decide CLI runtime/distribution** — Deno (`deno compile` for a binary) vs Node.
-  Affects packaging.
+- 🟡 **C5. CLI runtime / distribution — DECIDED: `deno compile`.** Ship `vl` as a single native
+  binary via `deno compile` (bundles V8 + the TS compiler + binaryen.js), distributed through brew
+  (a formula that links the released binary). **Versionless for now** — one install, no toolchain
+  manager (see Track H for the versioning model if/when multiple releases warrant it). This is the
+  near-term distribution (M1); the wasm-native, Deno-free end-state is Track H (M2). REMAINING:
+  the `deno compile` build + release pipeline + brew formula; verify binaryen.js loads correctly
+  inside a compiled binary.
 
 ---
 
@@ -651,9 +656,13 @@ run client-side.*
 
 ---
 
-## Track G — Replace antlr4 with a hand-written parser
+## Track G — Replace antlr4 with a hand-written parser ✅ DONE
 *Goal: drop the antlr4 dependency. Independent; safe to do incrementally because
 the `.vl` test corpus is parser-agnostic and `compile()` isolates the parser.*
+**DONE (G1–G4):** a hand-written TS lexer + recursive-descent/Pratt parser emits the typed AST
+directly; antlr4, the gradle project, the generated dirs, and the `gen` task are gone. AST/diagnostic
+nodes now carry real source spans (`Context = { start, stop }` in `ast.ts`) — the groundwork D1/D2
+(hover, go-to-def) needed. This was the parser-side bootstrap gate (Track H / H1).*
 
 Why drop it:
 - **Heavyweight non-JS build step.** Regenerating the parser (`deno task gen`)
@@ -668,17 +677,12 @@ Why drop it:
 - **Bootstrap blocker.** A Java-toolchain-generated parser can never be part of a
   self-hosted VL compiler. A hand-written one is a stepping stone toward it.
 
-- ⬜ **G1. Hand-written lexer.** The lexer is already essentially a token list
-  (`VL_Lexer.g4`); reimplement directly in TS. Cleaner significant-newline
-  handling than `NEWLINE*` everywhere.
-- ⬜ **G2. Recursive-descent statements + Pratt/precedence-climbing expressions.**
-  Pratt handles the operator-precedence cascade elegantly. **Emit the typed AST
-  (`VLExpression`/`VLStatement`) directly**, collapsing the CST→AST translation
-  out of `toAST.ts` (the type-checking half stays). Full control over error
-  messages and incremental parsing; no build step, no generated blob.
-- ⬜ **G3. Keep `.g4` (or an EBNF doc) as the human-readable grammar spec.**
-- ⬜ **G4. Delete antlr4 deps, the gradle project, generated dirs, and the
-  `gen` task.** The `.vl` corpus validates behavior across the swap.
+- ✅ **G1. Hand-written lexer** (TS, clean significant-newline handling).
+- ✅ **G2. Recursive-descent statements + Pratt expressions**, emitting the typed AST directly
+  (the CST→AST spelunking is gone; the type-checking half of `toAST.ts` stays).
+- ✅ **G3. `.g4` kept as the human-readable grammar spec.**
+- ✅ **G4. antlr4 deps, gradle project, generated dirs, and the `gen` task deleted.** The `.vl`
+  corpus validated behavior across the swap.
 - Alternatives considered: a pure-JS PEG generator (peggy) drops Java but keeps a
   generic tree + a dep; parser combinators similar. Hand-written wins on errors
   and bootstrappability for a grammar this small.
@@ -707,6 +711,54 @@ Why drop it:
   needed. Cleared all 9 `npm audit` advisories (77→13 packages). Verified headlessly:
   esbuild-bundled unpatched binaryen compiles + runs a VL program under Node. **Still to
   confirm in VS Code (F5):** vscode-languageclient forking an ESM server over IPC.
+
+---
+
+## Track H — Self-hosting & distribution (the bootstrap end-state)
+*The eventual goal: VL compiles itself, and the TypeScript/Deno host — the Deno runtime, the TS
+compiler core (`compiler/*.ts`), and (already gone) the antlr4/Java generator — is retired. The
+compiler becomes VL source compiled to WASM, run on a generic WASM runtime. Every other track
+feeds this; the `.vl` corpus (A12) is the host-agnostic correctness oracle — the same tests must
+pass whether the compiler is the TS one or the VL one.*
+
+**Two distinct timelines — distribution does NOT require self-hosting:**
+
+- 🟡 **H-M1. Distribute now via `deno compile` (= C5).** A single native `vl` binary bundling
+  V8 + the current TS compiler + binaryen.js, shipped through brew. **Versionless for now** (one
+  install, no toolchain manager). Decoupled from everything below — gives the brew-installable
+  binary immediately, with today's compiler unchanged. (Execution today is V8's `WebAssembly` via
+  Deno; the compiled binary keeps that.) Trade-off: chunky (~V8-sized) and Deno-under-the-hood.
+- ⬜ **H1. Parser self-hostable — DONE (= Track G).** The antlr/Java generator was the one piece
+  that categorically can't live in a VL-in-VL compiler; it's gone.
+- ⬜ **H2. Make VL expressive enough to write a compiler.** A compiler is recursive tree types
+  (AST — **A11 ✅**), generic collections (symbol tables, the tag/scope registries — **A10**,
+  **B6 tier-2** lists, **B6a** maps), and string munging (lexing — **A7** methods). This is the
+  capability bar for the port; A10/collections are the remaining gap.
+- ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl` source,
+  validated by running the existing `.vl` corpus through the VL-written compiler (same oracle, new
+  implementation). Incremental — TS and VL compilers cross-checked stage by stage.
+- ⬜ **H4. WASM emission — DECIDED: emit bytes directly, `wasm-opt` as an optional external pass.**
+  binaryen's npm build is JS-bound (an Emscripten wasm module that imports JS glue — *not* a
+  standalone WASI module), so embedding it in a wasm-runtime-hosted compiler is the highest-friction
+  path. Instead, the self-hosted `toWasm` **emits the wasm binary encoding directly** (mechanical,
+  no dependency); optimization is an optional external `wasm-opt` (native CLI) pass. **Caveat:** VL
+  leans on binaryen's **Heap2Local** to scalarize the union value-kind box (see
+  `vl-gc-escape-analysis`) — emitting raw wasm means those boxes stay heap-allocated until
+  `wasm-opt` runs (or VL grows its own escape analysis). So "produce correct wasm" (in VL,
+  dependency-free) decouples from "optimize it" (external) — the right separation. (binaryen stays
+  for the TS compiler / H-M1; it's only retired from the *self-hosted* path.)
+- ⬜ **H-M2. Wasm-native distribution (the end-state).** Once self-hosted, the `vl` binary becomes
+  a WASM runtime (**wasmtime** — full WasmGC since v27 / Wasm 3.0, which VL requires) + a small host
+  shim. That one runtime executes *both* the compiler-wasm and user-program-wasm — the "one runtime
+  for compiler + interpreter" symmetry — with no V8, no binaryen, no Deno.
+- ⬜ **H5. Versioning — deferred; if/when needed, rustup/Volta model, NOT nvm.** Versionless for
+  now (H-M1). When multiple releases warrant a manager, a thin `vl` launcher resolves a *project
+  pin* (`.vl-version`) and dispatches to / auto-installs the right toolchain (`~/.vl/versions/X.Y.Z`)
+  — transparent, CI-reproducible. Avoid the nvm-style manual-`use`/shim footgun. Make the H-M1
+  install path version-stamped so the launcher can slot in later without rework.
+
+**Sequence:** H-M1 (now, decoupled) → H2 capabilities (A10 + collections remain) → H3 port → H-M2
+host swap. The cost is dominated by H2/H3 (language depth + the port); H1 is done, H4 is decided.
 
 ---
 
