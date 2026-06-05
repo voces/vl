@@ -33,6 +33,10 @@ export const isEquatable = (
     case "BooleanLiteral":
     case "StringLiteral":
       return true;
+    // Functions compare by reference (same function + same captured env), not by
+    // value — so a function-valued field doesn't make its object non-equatable.
+    case "Function":
+      return true;
     case "Object":
       if (
         t.name === "i32" || t.name === "f64" || t.name === "boolean" ||
@@ -42,9 +46,7 @@ export const isEquatable = (
       if (arrayElementType(t)) return false;
       if (seen.has(t)) return true; // cycle guard
       seen.add(t);
-      return t.properties.every((p) =>
-        p.type.type !== "Function" && isEquatable(p.type, seen)
-      );
+      return t.properties.every((p) => isEquatable(p.type, seen));
     default:
       return false;
   }

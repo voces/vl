@@ -414,6 +414,26 @@ export const toWasm = async (ast: VLProgramNode) => {
         fieldEq = m.f64.eq(aGet, bGet);
       } else if (ft.type === "Object" && ft.name === "string") {
         fieldEq = m.call(stringEqFn(), [aGet, bGet], binaryen.i32);
+      } else if (ft.type === "Function") {
+        // A function value is a fat-pointer closure `{i32 tableIndex, structref
+        // env}`, freshly allocated — so compare by *reference*: same function
+        // (table index) AND same captured environment (`ref.eq` on env). Re-read
+        // the field per use (no shared expression refs — binaryen wants trees).
+        const clo = closureStruct().refType;
+        const aClo = () =>
+          m.struct.get(field.index, m.local.get(0, ref), clo, false);
+        const bClo = () =>
+          m.struct.get(field.index, m.local.get(1, ref), clo, false);
+        fieldEq = m.i32.and(
+          m.i32.eq(
+            m.struct.get(0, aClo(), binaryen.i32, false),
+            m.struct.get(0, bClo(), binaryen.i32, false),
+          ),
+          m.ref.eq(
+            m.struct.get(1, aClo(), binaryen.structref, false),
+            m.struct.get(1, bClo(), binaryen.structref, false),
+          ),
+        );
       } else if (
         ft.type === "Object" && ft.name === undefined && !arrayElementType(ft)
       ) {

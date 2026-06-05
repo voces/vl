@@ -91,11 +91,14 @@ closures / `is` / variance designs referenced here.
   strings (already value-compared) and numerics, and with VL's structural/value semantics
   (`{x:1} == {x:1}` is `true`). Codegen: a per-shape `objectEqFn` (`toWasm.ts`) ANDs field
   equalities (native numerics, `__string_eq__` for strings, a recursive helper for nested
-  structs); the type rule gates it on `isEquatable` (`typecheck.ts`). **An object with a
-  function-valued field is NOT auto-equatable** — closures can't be soundly value-compared
-  (hidden captured state), so it's a clean error ("isn't equatable — define a `==`") rather than
-  silently ignoring the field. A custom `==` operator (B13/B14) overrides the default. Tests
-  `objects/equality.vl`, `objects/equality-function-field.vl`. REMAINING: **referential identity**
+  structs); the type rule gates it on `isEquatable` (`typecheck.ts`). **Function-valued fields
+  compare by reference** — a function value is a fat-pointer closure `{tableIndex, env}` (freshly
+  allocated, so comparing the pointer is useless), so equality is *same function* (`i32.eq` on
+  the table index) AND *same captured env* (`ref.eq`). Sound and well-defined ("data by value,
+  functions by identity"); conservative only for capturing closures (a fresh env per instance
+  compares unequal even with identical captured values — the non-idiomatic field-method pattern).
+  A custom `==` operator (B13/B14) overrides the default. Tests `objects/equality.vl`,
+  `objects/equality-function-field.vl`. REMAINING: **referential identity**
   operator (O(1) `ref.eq`) — deferred; `is` is reserved for A6 type-narrowing, so identity needs
   its own spelling (`===`, or `identical(a,b)`); array `==` (element compare, like strings);
   storing a comparison result as i32 still needs an `if` (boolean↔i32 coercion).
