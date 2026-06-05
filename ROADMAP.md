@@ -270,7 +270,17 @@ stays tolerant of both binaryen forms (sync object / async init).*
     backing, distinct from the trap-dispatch above.)
   Unblocks/over­laps **A7** (a real `string` object type needs exactly this operator-method
   codegen). Reuses B3 (monomorphization) + B5 (`Call`/`indirectCall`).
-- ⬜ **B14. Methods via explicit `self` receiver + UFCS (no `this`).** DECIDED: VL has **no
+- 🟡 **B14. Methods via explicit `self` receiver + UFCS (no `this`).** **DONE (core):** a free
+  function whose first parameter is named `self` is callable as `o.f(args)` — toAST rewrites it
+  to `f(o, args)`, reusing the FunctionCall machinery, so `self` **monomorphizes to the
+  receiver's shape per call** (rides A13/B3). Verified: `a.add({…})` returns a new shaped object,
+  `p.sumsq()` (`objects/self-method.vl`). Resolution order implemented: a callable **field** wins
+  (container/data, no receiver — `foo.add(…)`); else a free `self`-function (UFCS); else error. A
+  **non-`self`** function is NOT reachable via an instance (`o.plain(2)` → "Unknown property" —
+  no namespace pollution, `objects/self-method-pollution.vl`). `self` is a plain param *name*, no
+  lexer keyword needed. REMAINING: route **operator** dispatch (B13) through self-methods so
+  `vec + vec` works (the method path avoids the stored-closure width wall — `a.add(b)` already
+  does); `c.area` (no `()`) as a bound value; mutation/variance (A9). DECIDED: VL has **no
   `this` keyword**. A method is a function whose first parameter is the **`self` keyword**
   (Rust-style); `o.f(a)` is sugar for `f(o, a)` (uniform function call syntax). Rationale: VL
   already has first-class closures and `o.f()`→`indirectCall`, so this adds **no hidden

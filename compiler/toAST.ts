@@ -422,40 +422,82 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     }
   }
 
-  // Member call: `o.f(args)` — call the function-valued property `o.f`.
+  // Member call: `o.f(args)`.
   if (ctx.DOT() && ctx.LPAREN()) {
     const objCtx = ctx.expr(0);
     const object = toExpression(objCtx);
+    const objectType = typeFromExpression(object, objCtx);
     const id = ctx.ID();
     const property = id.getText();
-    const calleeType = getChildType(
-      typeFromExpression(object, ctx),
+    const args = toArguments(ctx.args()?.arg_list() ?? []);
+
+    // 1. Field method (container/data): a callable field named `property` on the
+    //    object's shape — called with the args, no receiver. (Field wins.)
+    let shape = objectType;
+    if (shape.type === "Infer") shape = shape.subType;
+    const fieldType = shape.type === "Object"
+      ? shape.properties.find((p) =>
+        validateType(p.name, { type: "StringLiteral", value: property })
+      )?.type
+      : undefined;
+    if (fieldType?.type === "Function") {
+      return {
+        type: "Call",
+        callee: { type: "PropertyAccess", object, property },
+        arguments: args,
+        functionType: instantiateFunctionType(
+          fieldType,
+          args,
+          ctx,
+        ) as VLFunctionType,
+      } satisfies VLCallNode;
+    }
+
+    // 2. UFCS method: a free function named `property` whose first parameter is
+    //    the `self` marker. `o.f(args)` rewrites to `f(o, args)` — reusing the
+    //    FunctionCall machinery, so `self` monomorphizes to o's shape per call.
+    let fn: VLType | undefined;
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if (property in scopes[i]) {
+        fn = scopes[i][property];
+        break;
+      }
+    }
+    if (fn?.type === "Function" && fn.paramaters[0]?.name === "self") {
+      const selfArg: VLArgumentNode = {
+        type: "Argument",
+        name: undefined,
+        value: object,
+        context: objCtx,
+      };
+      Object.defineProperty(selfArg, "context", { enumerable: false });
+      const allArgs = [selfArg, ...args];
+      return {
+        type: "FunctionCall",
+        function: property,
+        arguments: allArgs,
+        functionType: instantiateFunctionType(
+          fn,
+          allArgs,
+          ctx,
+        ) as VLFunctionType,
+      } satisfies VLFunctionCallNode;
+    }
+
+    // 3. Neither a callable field nor a `self`-method — report via getChildType
+    //    (errors that `property` isn't a member, or that it isn't callable).
+    getChildType(
+      objectType,
       { type: "StringLiteral", value: property },
       objCtx,
       id,
     );
-    const call: VLCallNode = {
+    return {
       type: "Call",
       callee: { type: "PropertyAccess", object, property },
-      arguments: toArguments(ctx.args()?.arg_list() ?? []),
+      arguments: args,
       functionType: undefined,
-    };
-    if (calleeType?.type === "Function") {
-      call.functionType = instantiateFunctionType(
-        calleeType,
-        call.arguments,
-        ctx,
-      ) as VLFunctionType;
-    } else if (calleeType && calleeType.type !== "Unknown") {
-      errors.push({
-        type: "Type",
-        left: { type: "Function", paramaters: [], return: { type: "Unknown" } },
-        right: calleeType,
-        ctx,
-        code: "member-call",
-      });
-    }
-    return call;
+    } satisfies VLCallNode;
   }
 
   if (ctx.DOT()) {
