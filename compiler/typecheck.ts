@@ -259,10 +259,29 @@ export const _typeFromExpression = (
     case "NullLiteral":
       // We can assume this is meant as a nullable value, though that's slightly different than a complex inference
       return { type: "Alias", name: "null" };
-    case "Is":
+    case "Is": {
       // `x is T` — a type guard yielding boolean (and narrowing in an `if`).
-      typeFromExpression(expr.value, ctx);
+      const valueType = typeFromExpression(expr.value, ctx);
+      const checksNull = expr.checkType.type === "Alias" &&
+        expr.checkType.name === "null";
+      // Stage 1 supports nullness tests on a nullable: `is null` or `is <the
+      // non-null variant>`. Reject a check type that can never hold (e.g.
+      // `({x} | null) is {y}`), which would otherwise read as a plain non-null
+      // test and mislead. (General `is SomeType` discrimination is stage 2.)
+      if (
+        !checksNull && valueType.type === "Nullable" &&
+        !validateType(nonNullable(valueType), expr.checkType)
+      ) {
+        errors.push({
+          type: "Syntax",
+          message:
+            `\`is\` check type is not a variant of the value's type (only \`null\` or its non-null type are testable yet)`,
+          ctx,
+          code: 0,
+        });
+      }
       return { type: "Alias", name: "boolean" };
+    }
     case "FunctionCall":
       // Prefer the per-call instantiated signature (its return is resolved to a
       // concrete type for this call's arguments); the shared scope entry's
