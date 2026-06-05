@@ -828,7 +828,7 @@ const toExpression = (ctx: ExprContext): VLExpression => {
           for (let i = scopes.length - 1; i >= 0; i--) {
             if (n.name in scopes[i]) {
               return withScope(
-                { [n.name]: nonNullable(scopes[i][n.name]) },
+                { [n.name]: n.thenType ?? nonNullable(scopes[i][n.name]) },
                 () => toStatement(stmtCtx),
               );
             }

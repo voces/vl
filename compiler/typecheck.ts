@@ -264,18 +264,19 @@ export const _typeFromExpression = (
       const valueType = typeFromExpression(expr.value, ctx);
       const checksNull = expr.checkType.type === "Alias" &&
         expr.checkType.name === "null";
-      // Stage 1 supports nullness tests on a nullable: `is null` or `is <the
-      // non-null variant>`. Reject a check type that can never hold (e.g.
-      // `({x} | null) is {y}`), which would otherwise read as a plain non-null
-      // test and mislead. (General `is SomeType` discrimination is stage 2.)
+      // A check type must be `null` or a variant of the value's union/nullable
+      // type. Reject one that can never hold (e.g. `(boolean | i32) is f64`),
+      // which would otherwise read as a meaningless tag compare and mislead.
+      const testable = valueType.type === "Nullable" ||
+        valueType.type === "Union";
       if (
-        !checksNull && valueType.type === "Nullable" &&
+        !checksNull && testable &&
         !validateType(nonNullable(valueType), expr.checkType)
       ) {
         errors.push({
           type: "Syntax",
           message:
-            `\`is\` check type is not a variant of the value's type (only \`null\` or its non-null type are testable yet)`,
+            `\`is\` check type is not a variant of the value's type (testable variants are \`null\` and the union's members)`,
           ctx,
           code: 0,
         });
@@ -871,14 +872,24 @@ export const nonNullable = (type: VLType): VLType => {
 // type scope, toWasm the codegen scope, around the relevant branch.
 export const conditionNarrowing = (
   cond: VLExpression,
-): { name: string; nonNullOn: "then" | "else" } | null => {
+): {
+  name: string;
+  nonNullOn: "then" | "else";
+  thenType?: VLType;
+} | null => {
   // `x is T` — narrows x to T in the then-branch (or, for `x is null`, leaves it
   // null there and non-null in the else). For a nullable, the non-null subtype
-  // and `null` are the only variants, so this is a nullness narrowing.
+  // and `null` are the only variants, so this is a nullness narrowing. For a
+  // (boxed) value union, `thenType` carries the concrete variant `T`, so the
+  // then-branch sees `x: T` (not merely non-null) — codegen unboxes accordingly.
   if (cond.type === "Is" && cond.value.type === "Name") {
     const checksNull = cond.checkType.type === "Alias" &&
       cond.checkType.name === "null";
-    return { name: cond.value.name, nonNullOn: checksNull ? "else" : "then" };
+    return {
+      name: cond.value.name,
+      nonNullOn: checksNull ? "else" : "then",
+      thenType: checksNull ? undefined : cond.checkType,
+    };
   }
   // A call to an inferred type-guard function (A6b): `if present(v) { … }`
   // narrows the argument the way the guard's body narrows its parameter.

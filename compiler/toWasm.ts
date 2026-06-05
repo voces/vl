@@ -956,7 +956,7 @@ export const toWasm = async (ast: VLProgramNode) => {
     return out;
   };
 
-  const toExpression = (node: VLProgramNode | VLStatement): number => {
+  const toExpressionRaw = (node: VLProgramNode | VLStatement): number => {
     // console.log(
     //   "toExpression",
     //   inspect(node, { depth: Infinity, compact: true }),
@@ -1010,6 +1010,9 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (!dt || dt.type !== "Nullable") {
           throw new Error("`null` needs a nullable type from context");
         }
+        // A boxed nullable value union (`i32 | null`) → the `null`-tagged box.
+        const boxed = unionInfo(dt);
+        if (boxed && boxed.hasNull) return boxUnion(boxed, boxed.nullTag, null);
         const sentinel = nullSentinel(dt.subType);
         if (sentinel !== null) return m.i32.const(sentinel);
         // `ref.null` takes a nullable ref *type* (not a heap type).
@@ -1018,11 +1021,23 @@ export const toWasm = async (ast: VLProgramNode) => {
         );
       }
       case "Is": {
-        // Type guard on a nullable: `x is null` → null test; `x is T` (T the
-        // non-null variant) → its negation.
-        const isNull = nullnessTest(node.value);
         const checksNull = node.checkType.type === "Alias" &&
           node.checkType.name === "null";
+        // A boxed value union discriminates on its tag: `x is T` compares the
+        // tag field to T's tag (`null` included).
+        let t = softenImplicitType(codegenType(node.value));
+        while (t.type === "Infer") t = softenImplicitType(t.subType);
+        const info = unionInfo(t);
+        if (info) {
+          const tag = checksNull ? info.nullTag : variantTag(info, node.checkType);
+          return m.i32.eq(
+            m.struct.get(0, toExpression(node.value), binaryen.i32, false),
+            m.i32.const(tag),
+          );
+        }
+        // A niche / reference nullable: `x is null` → null test; `x is T` (T the
+        // non-null variant) → its negation.
+        const isNull = nullnessTest(node.value);
         return checksNull ? isNull : m.i32.eqz(isNull);
       }
       case "StringLiteral": {
@@ -1218,6 +1233,18 @@ export const toWasm = async (ast: VLProgramNode) => {
           return resolved
             ? closureValue(resolved)
             : m.local.get(entry[1], closureStruct().refType);
+        }
+        // A boxed-union local narrowed to a single variant (`if x is i32 { x }`)
+        // is read as that variant — unbox the payload out of the `{ tag, value }`
+        // struct. (A narrowing to a sub-union stays boxed.)
+        const info = unionInfo(entry[0]);
+        if (info && node.name in narrowed && !unionInfo(narrowed[node.name])) {
+          return m.struct.get(
+            1,
+            m.local.get(entry[1], info.refType),
+            info.payloadWasm,
+            false,
+          );
         }
         return m.local.get(entry[1], toWasmType(entry[0]));
       }
@@ -1599,7 +1626,7 @@ export const toWasm = async (ast: VLProgramNode) => {
             const entry = lookupName(narrow.name);
             if (entry) {
               const prev = narrowed[narrow.name];
-              narrowed[narrow.name] = nonNullable(entry.type);
+              narrowed[narrow.name] = narrow.thenType ?? nonNullable(entry.type);
               const body = toExpression(node.conditionals[0].statement);
               if (prev === undefined) delete narrowed[narrow.name];
               else narrowed[narrow.name] = prev;
@@ -1813,6 +1840,14 @@ export const toWasm = async (ast: VLProgramNode) => {
   const nullnessTest = (valueExpr: VLProgramNode | VLStatement): number => {
     let t = softenImplicitType(codegenType(valueExpr));
     while (t.type === "Infer") t = softenImplicitType(t.subType);
+    // A boxed nullable value union → compare its tag field to the `null` tag.
+    const info = unionInfo(t);
+    if (info && info.hasNull) {
+      return m.i32.eq(
+        m.struct.get(0, toExpression(valueExpr), binaryen.i32, false),
+        m.i32.const(info.nullTag),
+      );
+    }
     const sentinel = t.type === "Nullable" ? nullSentinel(t.subType) : null;
     const value = toExpression(valueExpr);
     return sentinel !== null
@@ -1825,6 +1860,11 @@ export const toWasm = async (ast: VLProgramNode) => {
     // Unwrap inference holes resolved during monomorphization (`Infer<i32>` ->
     // i32); softening keeps the wrapper, but codegen wants the concrete type.
     while (t.type === "Infer") t = softenImplicitType(t.subType);
+    // A value union (`boolean | i32`, `i32 | null` — no niche) is a boxed tagged
+    // GC struct. Binaryen's Heap2Local scalarizes the box where it doesn't
+    // escape, so the common case costs no allocation.
+    const info = unionInfo(t);
+    if (info) return info.refType;
     // A nullable value type with a niche → its payload's wasm type (the sentinel
     // lives in a spare value). A nullable reference → a nullable ref.
     if (t.type === "Nullable") {
@@ -1843,6 +1883,163 @@ export const toWasm = async (ast: VLProgramNode) => {
     if (t.type === "Function") return closureStruct().refType;
     return toWasmTypeOf(binaryen, t);
   };
+
+  // --- Boxed tagged unions (WasmGC structs) ---
+  // A *value* union (`boolean | i32`, `i32 | null`) whose members share one wasm
+  // representation is boxed into a `{ tag: i32, value }` struct: `tag` selects
+  // the variant, `value` carries the payload. Same-representation only for now —
+  // a mixed-rep union (`i32 | f64`) would need a per-rep payload and is deferred.
+  // (Niche cases — a nullable reference, and `boolean | null` via a sentinel —
+  // stay unboxed; `unionInfo` returns null for them so they keep their encoding.)
+  type UnionInfo = {
+    variants: VLType[]; // the non-null members, in a canonical (name) order
+    hasNull: boolean;
+    payloadWasm: number; // the shared wasm rep of every variant
+    heapType: number;
+    refType: number;
+    nullTag: number; // the tag value standing for `null`, or -1 when not nullable
+  };
+  const UNION_REPS = ["i32", "i64", "f32", "f64", "boolean"];
+  // The builtin scalar name backing a type (`i32`/`boolean`/…), or null for a
+  // reference type, `null`, or anything without a uniform value representation.
+  const valueTypeName = (type: VLType): string | null => {
+    let t = softenImplicitType(type);
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
+    if (t.type === "BooleanLiteral") return "boolean";
+    const name =
+      t.type === "Object" || t.type === "Alias" || t.type === "Custom"
+        ? t.name
+        : undefined;
+    return name && UNION_REPS.includes(name) ? name : null;
+  };
+  // The `{ tag, value }` struct is interned by its payload wasm type, so unions
+  // sharing a representation (`boolean | i32` and `i32 | null` are both i32)
+  // share one wasm struct type.
+  const unionStructs = new Map<number, { heapType: number; refType: number }>();
+  const unionStruct = (payloadWasm: number) => {
+    let cached = unionStructs.get(payloadWasm);
+    if (!cached) {
+      const tb = new binaryen.TypeBuilder(1);
+      tb.setStructType(0, [
+        { type: binaryen.i32, packedType: binaryen.notPacked, mutable: false },
+        { type: payloadWasm, packedType: binaryen.notPacked, mutable: false },
+      ]);
+      const heapType = tb.buildAndDispose()[0];
+      cached = {
+        heapType,
+        refType: binaryen.getTypeFromHeapType(heapType, false),
+      };
+      unionStructs.set(payloadWasm, cached);
+    }
+    return cached;
+  };
+  // Describe a boxed value union, or null if `type` isn't one (a niche nullable,
+  // a reference union, or a non-union). Variants are sorted by name so the tag
+  // assignment is canonical — `boolean | i32` and `i32 | boolean` agree, so a
+  // value flows between the two orderings soundly.
+  const unionInfo = (type: VLType): UnionInfo | null => {
+    let t = softenImplicitType(type);
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
+    let raw: VLType[];
+    let hasNull: boolean;
+    if (t.type === "Union") {
+      // `flattenType` pulls `null` out into a `Nullable`, so a bare `Union` here
+      // is null-free.
+      raw = t.subTypes;
+      hasNull = false;
+    } else if (t.type === "Nullable") {
+      // `boolean | null` hides null in a sentinel; a nullable reference uses
+      // `ref.null`. Neither boxes.
+      if (nullSentinel(t.subType) !== null) return null;
+      let sub = softenImplicitType(t.subType);
+      while (sub.type === "Infer") sub = softenImplicitType(sub.subType);
+      raw = sub.type === "Union" ? sub.subTypes : [sub];
+      hasNull = true;
+    } else {
+      return null;
+    }
+    // Every member must be a value type (a reference member → a ref union, which
+    // discriminates via `ref.test` and is deferred).
+    if (raw.some((v) => valueTypeName(v) === null)) return null;
+    const variants = [...raw].sort((a, b) => {
+      const na = valueTypeName(a)!;
+      const nb = valueTypeName(b)!;
+      return na < nb ? -1 : na > nb ? 1 : 0;
+    });
+    const payloads = variants.map((v) => toWasmType(v));
+    if (payloads.some((p) => p !== payloads[0])) {
+      throw new Error(
+        `Mixed-representation union "${
+          variants.map((v) => valueTypeName(v)).join(" | ")
+        }" is not yet supported (needs a per-representation payload)`,
+      );
+    }
+    const struct = unionStruct(payloads[0]);
+    return {
+      variants,
+      hasNull,
+      payloadWasm: payloads[0],
+      heapType: struct.heapType,
+      refType: struct.refType,
+      nullTag: hasNull ? variants.length : -1,
+    };
+  };
+  // The tag for a variant `type` within `info`. Members sharing a payload rep
+  // differ only by boolean-ness (a rep carries at most one boolean and one
+  // numeric), so that is the whole discriminant. `null` → `nullTag`.
+  const variantTag = (info: UnionInfo, type: VLType): number => {
+    let t = softenImplicitType(type);
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
+    if (t.type === "Alias" && t.name === "null") return info.nullTag;
+    const wantBool = valueTypeName(t) === "boolean";
+    return info.variants.findIndex((v) =>
+      (valueTypeName(v) === "boolean") === wantBool
+    );
+  };
+  // A typed zero, for the payload slot of a boxed `null` (its value is unread).
+  const wasmZero = (wasm: number): number => {
+    if (wasm === binaryen.i64) return m.i64.const(BigInt(0));
+    if (wasm === binaryen.f32) return m.f32.const(0);
+    if (wasm === binaryen.f64) return m.f64.const(0);
+    return m.i32.const(0);
+  };
+  const boxUnion = (
+    info: UnionInfo,
+    tag: number,
+    payload: number | null,
+  ): number =>
+    m.struct.new(
+      [m.i32.const(tag), payload ?? wasmZero(info.payloadWasm)],
+      info.heapType,
+    );
+  // Box a freshly-produced value into the desired union, when it isn't already
+  // one. The single value-flow boxing hook: every boundary that wants a value
+  // (assignment, argument, operand, return) sets `desiredType`, so wrapping
+  // `toExpression` here covers them all. A `null` is boxed by the NullLiteral
+  // case directly; an already-union value (variable, call result) is left as is.
+  const coerceUnion = (
+    value: number,
+    node: VLProgramNode | VLStatement,
+  ): number => {
+    if (!hasDesiredType() || node.type === "NullLiteral") return value;
+    const info = unionInfo(desiredType!);
+    if (!info) return value;
+    const wt = binaryen.getExpressionType(value);
+    // Nothing to box: a control-flow statement (`return`/`break`, an `unreachable`
+    // block) or a discarded (`none`) value, or a value that is *already* the box
+    // (a union variable, a call returning the union, a branch boxed internally).
+    if (
+      wt === binaryen.unreachable || wt === binaryen.none || wt === info.refType
+    ) return value;
+    let nt = softenImplicitType(codegenType(node));
+    while (nt.type === "Infer") nt = softenImplicitType(nt.subType);
+    if (nt.type === "Union" || nt.type === "Nullable") return value;
+    const tag = variantTag(info, nt);
+    return tag < 0 ? value : boxUnion(info, tag, value);
+  };
+  // Lower an expression, then box it into the desired union if one is wanted.
+  const toExpression = (node: VLProgramNode | VLStatement): number =>
+    coerceUnion(toExpressionRaw(node), node);
 
   // console.log(inspect(logSimplified(ast), { depth: Infinity }));
   m.setStart(toExpression(ast));
