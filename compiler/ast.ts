@@ -266,6 +266,14 @@ export type ParseErrors =
     code: number | string;
   }
   | { type: "UnmatchedParameter"; ctx: Context; code: number }
-  | { type: "Syntax"; message: string; ctx: Context; code: number }
+  | {
+    type: "Syntax";
+    message: string;
+    ctx: Context;
+    code: number;
+    // Defaults to "error" when omitted (see `diagnosticFromError`). Lets a
+    // diagnostic be a non-fatal warning (e.g. a provably-empty `for` range).
+    severity?: "error" | "warning" | "info";
+  }
   | { type: "Property"; property: VLType; ctx: Context; code: number };
 

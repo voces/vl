@@ -204,14 +204,16 @@ stays tolerant of both binaryen forms (sync object / async init).*
   descending loops work too (`loops/for-step.vl`: ascending 0,2,4,6→12; descending 5..1→15).
   DONE: single-line block bodies (`for … { s = s + i }`) — `block` no longer requires a leading
   newline after `{`, so `object` (tried first, fails on a non-pair) falls back to `block`;
-  objects still win on key:value contents (`loops/single-line-block.vl`). REMAINING: `for…in`
-  over objects / maps; the `for val, i in arr` (value + index) and `for , v in obj`
-  destructuring forms (aspirational in `samples/loops.vl`). NOTE: descending steps are written
-  `0 - 1` for now because **unary `-` isn't a token** (no negative literals / negation) — a
-  separate small lexer/grammar add (would also clean up `step -1`); tracks near B10.
+  objects still win on key:value contents (`loops/single-line-block.vl`). DONE: a provably-empty
+  literal `for` range **warns** (`5 to 1` → "range is empty and never iterates"; `loops/empty-range.vl`)
+  — the first non-error diagnostic (see B17). REMAINING: `for…in` over objects / maps; the `for
+  val, i in arr` (value + index) and `for , v in obj` destructuring forms (aspirational in
+  `samples/loops.vl`).
 - 🟡 **B9. `break` in codegen** (only `continue` is handled); verify labeled break/continue.
-- ⬜ **B10. Prefix/postfix ops in codegen** (`++ -- not !`) — parsed & in the interpreter,
-  not in the wasm path.
+- 🟡 **B10. Unary / prefix / postfix ops in codegen.** DONE: **unary `-`** (grammar prefix at
+  tighter-than-`*`/looser-than-`^` precedence; toAST folds `-<literal>` to a negative literal,
+  else lowers `-x` to a type-matched `0 - x`, reusing `-` codegen — i32 + f64, `loops/for-step.vl`
+  uses `step -1`). REMAINING: `++ -- not !` (parsed & in the interpreter, not the wasm path).
 - ⬜ **B11. `while true` return analysis.** Compiler can't prove an infinite loop always
   returns (malloc has a trailing-`0` workaround). Special-case or add proper reachability.
 - ⬜ **B12. `async`/`await`.** Keywords exist in the lexer; no semantics or codegen.
@@ -321,6 +323,18 @@ stays tolerant of both binaryen forms (sync object / async init).*
   to allow **ad-hoc overloading** (same name, multiple signatures by
   arity/type) — ties into B13's multi-call-signature note; default for now is "no, one binding
   per name per scope."
+- 🟡 **B17. Diagnostics, in general.** STARTED: diagnostics carry `severity` (`error | warning
+  | info`, `compile.ts`); the `Syntax` `ParseErrors` variant now has an optional `severity`
+  (defaults `error`), so a diagnostic can be a non-fatal **warning** — first consumer is the
+  empty-`for`-range warning (B8), and the test harness gained a `@warning` directive. BUILD OUT
+  (deferred): (1) thread `severity` through *all* `ParseErrors` variants (only `Syntax` carries
+  it today), or move to a dedicated warnings channel; (2) **stable diagnostic codes / categories**
+  (the `code` field is ad-hoc ints/strings) for doc links + suppression; (3) a real **lint pass**
+  — unused variable/param, unreachable code after `return`/`break`, `step 0` (non-progressing
+  loop), shadowing hints, dead branches; (4) **quick-fixes / related-information** for the LSP
+  (Track D); (5) consistent **message style** (currently "Syntax error:" prefixes a lot that
+  isn't syntactic). The empty-range warning is the template: detect statically, emit a `warning`,
+  don't block codegen.
 
 ## Track C — CLI (`vl` / `vital` command)
 *New surface. Depends on the existing parse→AST→wasm pipeline being callable outside the

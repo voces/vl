@@ -27,6 +27,7 @@ type Directives = {
   mode: "check" | "run";
   errors: string[];
   errorsAt: { line: number; col: number; text: string }[];
+  warnings: string[];
   logs: string[];
   noError: boolean;
   skip: string | null;
@@ -37,6 +38,7 @@ const parseDirectives = (src: string): Directives => {
     mode: "check",
     errors: [],
     errorsAt: [],
+    warnings: [],
     logs: [],
     noError: false,
     skip: null,
@@ -59,6 +61,9 @@ const parseDirectives = (src: string): Directives => {
         break;
       case "error":
         d.errors.push(rest);
+        break;
+      case "warning":
+        d.warnings.push(rest);
         break;
       case "error-at": {
         const at = rest.match(/^(\d+):(\d+)\s+(.*)$/);
@@ -104,6 +109,9 @@ const walk = async function* (dir: URL): AsyncGenerator<URL> {
 const errorMessages = (diags: VLDiagnostic[]) =>
   diags.filter((d) => d.severity === "error").map((d) => d.message);
 
+const warningMessages = (diags: VLDiagnostic[]) =>
+  diags.filter((d) => d.severity === "warning").map((d) => d.message);
+
 const files: URL[] = [];
 for await (const f of walk(CASES_DIR)) files.push(f);
 files.sort((a, b) => a.href.localeCompare(b.href));
@@ -125,6 +133,17 @@ for (const file of files) {
           throw new Error(
             `expected an error containing "${want}", got: ${
               JSON.stringify(errs)
+            }`,
+          );
+        }
+      }
+
+      const warns = warningMessages(diagnostics);
+      for (const want of d.warnings) {
+        if (!warns.some((m) => m.includes(want))) {
+          throw new Error(
+            `expected a warning containing "${want}", got: ${
+              JSON.stringify(warns)
             }`,
           );
         }

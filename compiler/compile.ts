@@ -184,7 +184,11 @@ const diagnosticFromError = (error: ParseErrors): VLDiagnostic => {
     case "UnmatchedParameter":
       return { ...base, message: `Type error: unmatched parameter` };
     case "Syntax":
-      return { ...base, message: error.message };
+      return {
+        ...base,
+        severity: error.severity ?? "error",
+        message: error.message,
+      };
     case "Property":
       return {
         ...base,

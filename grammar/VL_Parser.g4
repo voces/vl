@@ -79,6 +79,10 @@ expr
     | expr LBRACK NEWLINE* expr NEWLINE* RBRACK // index expr
     | expr NEWLINE* DOT ID // property expr
     | expr NEWLINE* CARET NEWLINE* expr
+    // Unary minus: binds tighter than `* / %` and `+ -` (so `-a * b` = `(-a) * b`)
+    // but looser than `^` (so `-a ^ b` = `-(a ^ b)`). A leading `-` (no left
+    // operand) is unary; between two exprs it's the binary subtraction above.
+    | MINUS NEWLINE* expr
     | expr NEWLINE* (STAR | DIV | MOD) NEWLINE* expr
     | expr NEWLINE* (PLUS | MINUS) NEWLINE* expr
     | expr NEWLINE* (GREATER_THAN | GREATER_THAN_OR_EQUAL_TO | LESS_THAN | LESS_THAN_OR_EQUAL_TO) NEWLINE* expr

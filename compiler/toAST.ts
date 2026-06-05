@@ -328,6 +328,45 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     if (funcDecl) return toFunctionDeclaration(funcDecl);
   }
 
+  // Unary minus: a leading `-expr` (one operand). Binary `a - b` has a second
+  // expr and is handled by the operator block below.
+  if (ctx.MINUS() && ctx.expr(0) && !ctx.expr(1)) {
+    const operandCtx = ctx.expr(0);
+    const operand = toExpression(operandCtx);
+    // Fold a negated numeric literal into a proper negative literal.
+    if (operand.type === "IntegerLiteral") {
+      const node: VLExpression = {
+        type: "IntegerLiteral",
+        value: -operand.value,
+        text: `-${operand.text}`,
+      };
+      typeFromExpression(node, ctx);
+      return node;
+    }
+    if (operand.type === "RealLiteral") {
+      const node: VLExpression = { type: "RealLiteral", value: -operand.value };
+      typeFromExpression(node, ctx);
+      return node;
+    }
+    // Otherwise negate by subtracting from a type-matched zero (reuses the `-`
+    // operator's type-check + codegen; no dedicated negation node needed).
+    const operandType = softenImplicitType(
+      typeFromExpression(operand, operandCtx),
+    );
+    const zero: VLExpression =
+      operandType.type === "Object" && operandType.name === "f64"
+        ? { type: "RealLiteral", value: 0 }
+        : { type: "IntegerLiteral", value: 0, text: "0" };
+    const expr: VLBinaryOperationNode = {
+      type: "BinaryOperation",
+      left: zero,
+      right: operand,
+      operator: "-",
+    };
+    typeFromExpression(expr, ctx);
+    return expr;
+  }
+
   // Member call: `o.f(args)` — call the function-valued property `o.f`.
   if (ctx.DOT() && ctx.LPAREN()) {
     const objCtx = ctx.expr(0);
@@ -884,6 +923,31 @@ const toStatement = (ctx: StatementContext): VLStatement => {
       } catch (err) {
         scopes.pop();
         throw err;
+      }
+
+      // Warn on a provably-empty literal range (a likely bug): with constant
+      // bounds and step, the direction of `step` never carries `from` to `to`.
+      // (Non-literal bounds can't be judged statically.)
+      if (from.type === "IntegerLiteral" && to.type === "IntegerLiteral") {
+        const stepVal = !step
+          ? 1
+          : step.type === "IntegerLiteral"
+          ? step.value
+          : null;
+        if (
+          stepVal !== null && stepVal !== 0 &&
+          (stepVal > 0 ? from.value > to.value : from.value < to.value)
+        ) {
+          errors.push({
+            type: "Syntax",
+            severity: "warning",
+            message: `This \`for\` range is empty and never iterates: ${from.value} to ${to.value}${
+              stepVal !== 1 ? ` step ${stepVal}` : ""
+            }`,
+            ctx: forStatement,
+            code: 0,
+          });
+        }
       }
 
       return {
