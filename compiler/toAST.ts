@@ -209,17 +209,40 @@ const toType = (ctx: TypeContext): VLType => {
  */
 const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
   const parameters = ctx.params()?.param_list().map(toParameter) ?? [];
+  const name = ctx.ID()?.getText();
+  const returnTypeExpr = ctx.type_();
+  const annotatedReturn: VLType | undefined = returnTypeExpr
+    ? toType(returnTypeExpr)
+    : undefined;
+
+  // Forward-register the function in the ENCLOSING scope *before* walking the
+  // body, so recursive calls (`f` inside `f`) resolve. Parameters are already
+  // known; the return is the annotation if given, else a placeholder hole that
+  // is refined in place (`selfType.return = …`) once the body is inferred — so
+  // the scope entry ends up as the final function type.
+  const enclosing = scopes[scopes.length - 1];
+  const selfType: VLFunctionType = {
+    type: "Function",
+    paramaters: parameters,
+    return: annotatedReturn ?? { type: "Infer", subType: { type: "Unknown" } },
+  };
+  let registered = false;
+  if (name) {
+    if (name in enclosing) {
+      errors.push({ type: "Redeclaration", name, ctx: ctx.ID()!, code: 2 });
+    } else {
+      enclosing[name] = selfType;
+      registered = true;
+    }
+  }
+
   const scope = Object.fromEntries(
     parameters.map((p) => [p.name, p.paramaterType]),
   );
   scopes.push(scope);
-  const name = ctx.ID()?.getText();
   let node: VLFunctionDeclarationNode;
   try {
-    const returnTypeExpr = ctx.type_();
-    let functionReturnType: VLType | undefined = returnTypeExpr
-      ? toType(returnTypeExpr)
-      : undefined;
+    let functionReturnType: VLType | undefined = annotatedReturn;
 
     const oldReturnTypes = returnTypes.splice(0, Infinity);
     const oldDesiredType = flow.desiredType;
@@ -265,11 +288,10 @@ const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
     throw err;
   }
 
-  if (name) {
-    if (name in scopes[scopes.length - 1]) {
-      errors.push({ type: "Redeclaration", name, ctx: ctx.ID()!, code: 2 });
-    } else scopes[scopes.length - 1][name] = typeFromExpression(node, ctx);
-  }
+  // Memoize the node's final type (codegen's `vlType(node)` needs it) and, for a
+  // named function, refine the forward-registered scope entry to the final type.
+  const finalType = typeFromExpression(node, ctx);
+  if (registered) enclosing[name!] = finalType;
 
   return node;
 };
