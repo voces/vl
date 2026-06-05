@@ -187,8 +187,23 @@ closures / `is` / variance designs referenced here.
   operator (O(1) `ref.eq`) — deferred; `is` is reserved for A6 type-narrowing, so identity needs
   its own spelling (`===`, or `identical(a,b)`); storing a comparison result as i32 still needs an
   `if` (boolean↔i32 coercion).
-
----
+- 🟡 **A16. Literal-union types (enums-as-unions).** Literal types (`0 | 1 | 2`,
+  `"expense" | "reimbursement"`) are the union idiom for enums — no separate `enum` construct.
+  **DONE (the type-level story):** they parse + constrain as annotations (a `"a" | "b"` param
+  rejects `"c"`); **`==`/`!=` discriminate** them (yielding boolean + literal narrowing, `ff65e35`);
+  a **numeric-literal union is its base scalar** for arithmetic / ordered comparison (`n + 1`,
+  `n < 2`); and a discrimination that covers every case is **exhaustive** — `conditionsExhaust`
+  (`typecheck.ts`) flattens the `else if` chain and subtracts each case from the discriminated
+  place; if the residual is `Never` an else-less `if` has no `| null` fall-through, and codegen
+  emits `unreachable` for the proven-impossible fall-through (so `if s == "a" … else if s == "b" …`
+  over `"a" | "b"` returns non-null with no dummy `else`). A bare literal still defaults to its base
+  type (`let x = 0` is `i32`); only an explicit annotation keeps the literal. Tests
+  `types/{literal-union,literal-union-exhaustive}.vl`. REMAINING: the **enum representation**
+  optimization — a closed union of same-base literals stored as an i32 tag (intern each literal,
+  materialize at print / coercion boundaries) instead of a full string per value; literal unions
+  currently soften to their base at the value level (correct, but a string union stores whole
+  strings). Also: a literal union read *inside* a body softens to base (the `==`-operand soften
+  path re-memoizes it), so member-level narrowing there is coarser than at the call boundary.
 
 ## Track B — Codegen, memory model & runtime (`toWasm.ts`)
 *The "no-GC vs WasmGC" decision lives here. Recommendation: make placement a compiler

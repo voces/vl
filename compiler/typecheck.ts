@@ -75,6 +75,38 @@ export const isEquatable = (
   }
 };
 
+// Whether an `if`'s conditionals exhaust their discriminated place — i.e. they
+// all narrow the *same* place and, subtracting each condition's case in turn,
+// leave `Never`. Then an `else`-less `if` has no reachable fall-through (no
+// `null`). Only the simple single-place case (`if x == a … else if x == b …` /
+// `is`); a compound condition (`&&`/`||`, or a different place) is conservatively
+// non-exhaustive. Uses the same else-narrowings the runtime branches do.
+const conditionsExhaust = (
+  conditionals: { condition: VLExpression }[],
+  ctx: Context,
+): boolean => {
+  let key: string | null = null;
+  let residual: VLType | null = null;
+  for (const c of conditionals) {
+    const facts = elseNarrowings(c.condition);
+    if (facts.length !== 1) return false;
+    const fk = placeKey(facts[0].place);
+    if (fk === null) return false;
+    if (key === null) {
+      key = fk;
+      // Read the place from scope (not the memoized node type, which the
+      // `==`-operand soften path may have collapsed to the base scalar).
+      const cur = placeCurrentType(facts[0].place, ctx);
+      if (cur === undefined) return false;
+      residual = cur;
+    } else if (fk !== key) {
+      return false;
+    }
+    residual = facts[0].apply(residual!);
+  }
+  return residual !== null && residual.type === "Never";
+};
+
 export const _typeFromExpression = (
   expr: VLExpression,
   ctx: Context,
@@ -172,6 +204,16 @@ export const _typeFromExpression = (
         (validateType(leftType, rightType) || validateType(rightType, leftType))
       ) {
         return { type: "Alias", name: "boolean" };
+      }
+      // A numeric-literal union (`0 | 1 | 2`) softens to its base scalar, so it
+      // behaves like the underlying numeric for arithmetic and ordered
+      // comparison (`n + 1`, `n < 2`). (`==`/`!=` above keep the union for
+      // narrowing; this covers the other operators.)
+      if (leftType.type === "Union" || leftType.type === "Nullable") {
+        const soft = softenImplicitType(leftType);
+        if (soft.type === "Object" && SCALARS.includes(soft.name ?? "")) {
+          leftType = soft;
+        }
       }
       if (leftType.type !== "Object") return missingOpFunc("left-not-object");
       const opFunc = leftType.properties.find((p) =>
@@ -368,21 +410,40 @@ export const _typeFromExpression = (
     case "Call":
       return expr.functionType?.return ?? { type: "Never" };
     case "If": {
-      const stmts = expr.conditionals.map((c) => c.statement);
-      if (expr.else) {
-        stmts.push(expr.else);
-        return {
-          type: "Union",
-          subTypes: stmts.map((s) => typeFromStatement(s, ctx)),
-        };
+      // Flatten the else-if chain — `else if` parses as a nested `if` in the
+      // `else`, so follow those too — into the full condition + branch lists and
+      // the final (real) `else`, if any.
+      const conditions: VLExpression[] = [];
+      const branchStmts: VLStatement[] = [];
+      let node: typeof expr | undefined = expr;
+      let finalElse: VLStatement | undefined;
+      while (node) {
+        for (const c of node.conditionals) {
+          conditions.push(c.condition);
+          branchStmts.push(c.statement);
+        }
+        if (node.else && node.else.type === "If") {
+          node = node.else;
+        } else {
+          finalElse = node.else;
+          node = undefined;
+        }
       }
-      return {
-        type: "Nullable",
-        subType: {
-          type: "Union",
-          subTypes: stmts.map((s) => typeFromStatement(s, ctx)),
-        },
+      if (finalElse) branchStmts.push(finalElse);
+      const branches: VLType = {
+        type: "Union",
+        subTypes: branchStmts.map((s) => typeFromStatement(s, ctx)),
       };
+      // With a real `else`, every path is covered. Without one, the chain falls
+      // through to `null` — *unless* the conditions are exhaustive (they subtract
+      // the discriminated place to `Never`), so the fall-through is unreachable.
+      // Lets a fully-covered literal-union discrimination (`if s == "a" … else if
+      // s == "b" …` over `"a" | "b"`) type without a spurious `| null`.
+      if (finalElse) return branches;
+      if (conditionsExhaust(conditions.map((c) => ({ condition: c })), ctx)) {
+        return branches;
+      }
+      return { type: "Nullable", subType: branches };
     }
     default: {
       const exhaustive: never = expr;

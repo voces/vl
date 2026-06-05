@@ -1856,12 +1856,27 @@ export const toWasm = async (ast: VLProgramNode) => {
         // recursion re-applies the next condition's else-narrowing on top of this
         // one (the `narrowed` overlay persists), so an else-if chain composes —
         // `if x is A {} else if x is B {} else { /* x: U − A − B */ }`.
-        const elseStmt = (): number | undefined =>
-          node.conditionals.length > 1
-            ? toExpression({ ...node, conditionals: node.conditionals.slice(1) })
-            : node.else
-            ? toExpression(node.else)
-            : undefined;
+        const elseStmt = (): number | undefined => {
+          if (node.conditionals.length > 1) {
+            return toExpression({
+              ...node,
+              conditionals: node.conditionals.slice(1),
+            });
+          }
+          if (node.else) return toExpression(node.else);
+          // No `else`. If the `if`'s value is wanted as a *non-nullable* type,
+          // the type checker proved the conditions exhaustive (an else-less `if`
+          // with a reachable fall-through would type as nullable) — so the
+          // fall-through is unreachable; emit `unreachable`, not a `none` branch.
+          if (hasDesiredType()) {
+            let dt = softenImplicitType(desiredType!);
+            while (dt.type === "Infer") dt = softenImplicitType(dt.subType);
+            const nullable = dt.type === "Nullable" ||
+              (dt.type === "Alias" && dt.name === "null");
+            if (!nullable) return m.unreachable();
+          }
+          return undefined;
+        };
         const elseBranch = (): number | undefined =>
           withNarrowedList(elseNarrowings(cond), elseStmt);
         return m.if(
