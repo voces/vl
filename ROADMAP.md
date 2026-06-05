@@ -446,6 +446,25 @@ stays tolerant of both binaryen forms (sync object / async init).*
   result type from the resolved return type (not the body). Tests `functions/early-return.vl`
   (early/loop/fall-through, inferred i32 + string). *(Fixed alongside: `print(f())` dropped its
   function-call argument in statement position — now evaluated in value position.)*
+- ⬜ **B20. Loops as expressions + `break <value>`.** VL is expression-oriented (`if` is an
+  expression; blocks yield their tail) and the type system *already* types loops as `Nullable<T>`,
+  but the **grammar makes `for`/`while` statements only** (`let x = for …` is a syntax error) and
+  `break` carries no value. Proposal: lift loops into expression position, and let a loop evaluate
+  to its `break` value — or **null** when it completes without one. Fits VL more cleanly than Rust
+  (which restricts break-value to `loop`, since `while`/`for` are `()`): a loop becomes a natural
+  *search* expression — `let found = for x in items { if test(x) { break x } }` → `Nullable<elem>`.
+  Three layers: (1) **grammar** — `for`/`while` as expressions (follow `if`); (2) **types** —
+  collect each loop's break-value types → `Nullable<union>` (a bare `break` + normal completion
+  give the null arm), mirroring the `returnTypes` mechanism functions use; (3) **codegen** — the
+  loop's outer `__brk` block gets a result type, `break v` → `br $brk (v)`, fall-through pushes the
+  null default. **Labels:** `break outer v` targets the outer loop, so break-value collection is a
+  *stack of per-loop collectors* indexed like `loopLabels` (a labelled break pushes into that
+  label's collector); the value-carrying `br` already targets the right block by name. Notes:
+  body's per-iteration tail value is discarded (only break-values + null form the loop value, so
+  today's `Nullable<bodyType>` becomes `Nullable<breakValueUnion>`); `continue` stays value-less; a
+  *provably* infinite loop (`while true { break v }`) could be non-null `T` — but that needs **B11**
+  reachability (independent; Nullable is the safe default until then). Self-contained; sequence as
+  (1)→(2) so each step is testable.
 
 ## Track C — CLI (`vl` / `vital` command)
 *New surface. Depends on the existing parse→AST→wasm pipeline being callable outside the
