@@ -87,6 +87,7 @@ expr
     | expr NEWLINE* DOT ID NEWLINE* LPAREN NEWLINE* args? RPAREN // member call
     | expr LBRACK NEWLINE* expr NEWLINE* RBRACK // index expr
     | expr NEWLINE* DOT ID // property expr
+    | expr NEWLINE* QUESTION_DOT ID // optional property read (`x?.y`, null-safe)
     | expr NEWLINE* CARET NEWLINE* expr
     // Unary minus: binds tighter than `* / %` and `+ -` (so `-a * b` = `(-a) * b`)
     // but looser than `^` (so `-a ^ b` = `-(a ^ b)`). A leading `-` (no left
@@ -99,6 +100,7 @@ expr
     | expr NEWLINE* IS NEWLINE* type // type guard (A6): `x is T`
     | expr NEWLINE* AND NEWLINE* expr
     | expr NEWLINE* OR NEWLINE* expr
+    | expr NEWLINE* QUESTION_QUESTION NEWLINE* expr // null-coalescing (`x ?? y`)
     | ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     | expr NEWLINE* DOT ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr
     | expr LBRACK NEWLINE* expr NEWLINE* RBRACK NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr

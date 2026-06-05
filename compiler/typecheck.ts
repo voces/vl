@@ -26,7 +26,9 @@ import {
 // the path string is unambiguous.
 export const placeKey = (expr: VLExpression): string | null => {
   if (expr.type === "Name") return expr.name;
-  if (expr.type === "PropertyAccess") {
+  // `x?.y` keys the same place as `x.y`, so narrowing a guard written with `?.`
+  // (`if x?.y is i32`) refines the regular `x.y` reads in the branch body.
+  if (expr.type === "PropertyAccess" || expr.type === "OptionalAccess") {
     const base = placeKey(expr.object);
     return base === null ? null : `${base}.${expr.property}`;
   }
@@ -287,6 +289,26 @@ export const _typeFromExpression = (
       );
       if (!property) return { type: "Never" };
       return property.type;
+    }
+    case "OptionalAccess": {
+      // `x?.y`: look up `y` on the *non-null* part of `x`; the result is
+      // `(member) | null` — null when `x` is null, else the member's type.
+      const objType = nonNullable(typeFromExpression(expr.object, ctx));
+      if (objType.type !== "Object") return { type: "Never" };
+      const property = objType.properties.find((p) =>
+        validateType(p.name, { type: "StringLiteral", value: expr.property })
+      );
+      const member: VLType = property ? property.type : { type: "Never" };
+      return flattenType({
+        type: "Union",
+        subTypes: [member, { type: "Alias", name: "null" }],
+      });
+    }
+    case "NullCoalesce": {
+      // `x ?? y`: `x`'s non-null part unioned with `y`'s type.
+      const leftType = nonNullable(typeFromExpression(expr.left, ctx));
+      const rightType = typeFromExpression(expr.right, ctx);
+      return flattenType({ type: "Union", subTypes: [leftType, rightType] });
     }
     case "BooleanLiteral":
       return { type: "BooleanLiteral", value: expr.value };
@@ -1128,27 +1150,56 @@ const factNarrowing = (f: AtomFact, dir: "then" | "else"): Narrowing[] => {
   return apply ? [{ name: f.name, place: f.place, apply }] : [];
 };
 
+// Whether a place involves an optional `?.` hop, so its narrowing is guarded by
+// the receiver being non-null (the else branch then can't narrow it soundly).
+const isOptionalChain = (e: VLExpression): boolean =>
+  e.type === "OptionalAccess" ||
+  (e.type === "PropertyAccess" && isOptionalChain(e.object));
+
+// For a guard on an optional chain (`x?.y is T`), the truthy branch also implies
+// every `?.` receiver is non-null — emit those facts (innermost first, so each
+// resolves against an already-narrowed receiver) so the body's regular `x.y`
+// reads resolve. Only the THEN branch; the else may still be null.
+const optionalChainThenFacts = (place: VLExpression): Narrowing[] => {
+  if (place.type !== "OptionalAccess" && place.type !== "PropertyAccess") {
+    return [];
+  }
+  const inner = optionalChainThenFacts(place.object);
+  if (place.type === "OptionalAccess") {
+    const key = placeKey(place.object);
+    if (key !== null) {
+      return [...inner, { name: key, place: place.object, apply: nonNullable }];
+    }
+  }
+  return inner;
+};
+
 // Narrowings that hold in the THEN branch of `if <cond>`. A `&&` contributes
 // *both* sides' then-facts (the conjunction holds), a `||` contributes none (a
-// disjunction narrows nothing positively); an atom contributes its then-fact.
+// disjunction narrows nothing positively); an atom contributes its then-fact,
+// plus (for an optional-chain guard) its receivers' non-null facts.
 export const thenNarrowings = (cond: VLExpression): Narrowing[] => {
   if (cond.type === "BinaryOperation" && cond.operator === "&&") {
     return [...thenNarrowings(cond.left), ...thenNarrowings(cond.right)];
   }
   if (cond.type === "BinaryOperation" && cond.operator === "||") return [];
   const f = atomFact(cond);
-  return f ? factNarrowing(f, "then") : [];
+  if (!f) return [];
+  return [...optionalChainThenFacts(f.place), ...factNarrowing(f, "then")];
 };
 
 // Narrowings that hold in the ELSE branch — the De Morgan dual: `||` contributes
-// both sides' else-facts (neither arm held), `&&` contributes none.
+// both sides' else-facts (neither arm held), `&&` contributes none. An
+// optional-chain guard contributes nothing here: the chain may be null, so its
+// negation isn't a sound refinement of the path.
 export const elseNarrowings = (cond: VLExpression): Narrowing[] => {
   if (cond.type === "BinaryOperation" && cond.operator === "||") {
     return [...elseNarrowings(cond.left), ...elseNarrowings(cond.right)];
   }
   if (cond.type === "BinaryOperation" && cond.operator === "&&") return [];
   const f = atomFact(cond);
-  return f ? factNarrowing(f, "else") : [];
+  if (!f || isOptionalChain(f.place)) return [];
+  return factNarrowing(f, "else");
 };
 
 // A place's current (possibly already-narrowed) type for a narrowing: a bare

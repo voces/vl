@@ -27,6 +27,7 @@ import type {
   VLFunctionDeclarationNode,
   VLFunctionType,
   VLIsNode,
+  VLNullCoalesceNode,
   VLObjectLiteralNode,
   VLParameterNode,
   VLProgramNode,
@@ -45,6 +46,7 @@ import {
   ensureType,
   flattenType,
   getChildType,
+  nonNullable,
   postGuardNarrowings,
   thenNarrowings,
   getConcreteType,
@@ -551,6 +553,24 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     return { type: "PropertyAccess", object, property };
   }
 
+  // Optional (null-safe) property read `x?.y`. The member is looked up on the
+  // *non-null* part of the object (so `x.y`'s shape resolves); the access result
+  // is `(member) | null` (typed in `typeFromExpression`). `?.` is null-only — it
+  // guards `null`, not a union variant (use `is` for those).
+  if (ctx.QUESTION_DOT()) {
+    const expr = ctx.expr(0);
+    const object = toExpression(expr);
+    const id = ctx.ID();
+    const property = id.getText();
+    getChildType(
+      nonNullable(typeFromExpression(object, ctx)),
+      { type: "StringLiteral", value: property },
+      expr,
+      id,
+    );
+    return { type: "OptionalAccess", object, property };
+  }
+
   if (ctx.LBRACK()) {
     const expr1 = ctx.expr(0);
     const array = toExpression(expr1);
@@ -687,6 +707,16 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       typeFromExpression(node, ctx); // assert + memoize the boolean result
       return node;
     }
+  }
+
+  // Null-coalescing `x ?? y`: yields `x` when non-null, else `y`. Typed and
+  // codegen'd as a unit (evaluates `x` once) — see `typeFromExpression`/codegen.
+  if (ctx.QUESTION_QUESTION()) {
+    const left = toExpression(ctx.expr(0));
+    const right = toExpression(ctx.expr(1));
+    const node: VLNullCoalesceNode = { type: "NullCoalesce", left, right };
+    typeFromExpression(node, ctx);
+    return node;
   }
 
   {

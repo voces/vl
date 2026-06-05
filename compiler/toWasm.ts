@@ -4,11 +4,13 @@ import {
   arrayElementType,
   defaultIntegerType,
   elseNarrowings,
+  nonNullable,
   placeKey,
   postGuardNarrowings,
   thenNarrowings,
   softenImplicitType,
   validateType,
+  VLExpression,
   VLFunctionCallNode,
   VLFunctionDeclarationNode,
   VLObjectType,
@@ -1427,6 +1429,65 @@ export const toWasm = async (ast: VLProgramNode) => {
         }
         return read;
       }
+      case "OptionalAccess": {
+        // `x?.y` ≡ eval `x` once into a temp; `null` if it's null, else `x.y`.
+        // The temp is bound in scope and (in the non-null arm) narrowed to the
+        // non-null object, so the member read + boxing reuse the normal paths.
+        let objType = softenImplicitType(codegenType(node.object));
+        while (objType.type === "Infer") objType = softenImplicitType(objType.subType);
+        const objWasm = toWasmType(objType);
+        const index = _locals.push(objWasm) - 1 + (_locals.params ?? 0);
+        const tmpName = `$opt${index}`;
+        currentScope[tmpName] = [objType, index];
+        const tmpRef: VLExpression = { type: "Name", name: tmpName };
+        let R = softenImplicitType(codegenType(node));
+        while (R.type === "Infer") R = softenImplicitType(R.subType);
+        const setTmp = m.local.set(index, toExpression(node.object));
+        const nullArm = withDesiredType(R, () => toExpression({ type: "NullLiteral" }));
+        const memberArm = withDesiredType(
+          R,
+          () =>
+            withNarrowed(
+              tmpName,
+              nonNullable(objType),
+              () =>
+                toExpression({
+                  type: "PropertyAccess",
+                  object: tmpRef,
+                  property: node.property,
+                }),
+            ),
+        );
+        return m.block(
+          null,
+          [setTmp, m.if(nullnessTest(tmpRef), nullArm, memberArm)],
+          binaryen.auto,
+        );
+      }
+      case "NullCoalesce": {
+        // `x ?? y` ≡ eval `x` once into a temp; `x` (narrowed non-null) if it's
+        // non-null, else `y`. Both arms coerced to the result union.
+        let leftType = softenImplicitType(codegenType(node.left));
+        while (leftType.type === "Infer") leftType = softenImplicitType(leftType.subType);
+        const leftWasm = toWasmType(leftType);
+        const index = _locals.push(leftWasm) - 1 + (_locals.params ?? 0);
+        const tmpName = `$coal${index}`;
+        currentScope[tmpName] = [leftType, index];
+        const tmpRef: VLExpression = { type: "Name", name: tmpName };
+        let R = softenImplicitType(codegenType(node));
+        while (R.type === "Infer") R = softenImplicitType(R.subType);
+        const setTmp = m.local.set(index, toExpression(node.left));
+        const leftArm = withDesiredType(
+          R,
+          () => withNarrowed(tmpName, nonNullable(leftType), () => toExpression(tmpRef)),
+        );
+        const rightArm = withDesiredType(R, () => toExpression(node.right));
+        return m.block(
+          null,
+          [setTmp, m.if(nullnessTest(tmpRef), rightArm, leftArm)],
+          binaryen.auto,
+        );
+      }
       case "UnaryOperation": {
         const op = node.operator;
         // Logical not on a boolean (an i32 0/1): eqz maps 0→1, nonzero→0.
@@ -2270,21 +2331,22 @@ export const toWasm = async (ast: VLProgramNode) => {
   // (assignment, argument, operand, return) sets `desiredType`, so wrapping
   // `toExpression` here covers them all. A `null` is boxed by the NullLiteral
   // case directly; an already-union value (variable, call result) is left as is.
-  const coerceUnion = (
+  // Box a raw `value` of VL type `fromType` into the union/nullable `toType`'s
+  // representation, or pass it through when no boxing is needed (a niche nullable,
+  // a value already the box, or an already-union source). The typed core shared
+  // by the `coerceUnion` node hook and the `?.`/`??` lowering.
+  const coerceToUnion = (
     value: number,
-    node: VLProgramNode | VLStatement,
+    fromType: VLType,
+    toType: VLType,
   ): number => {
-    if (!hasDesiredType() || node.type === "NullLiteral") return value;
-    const info = unionInfo(desiredType!);
+    const info = unionInfo(toType);
     if (!info) return value;
     const wt = binaryen.getExpressionType(value);
-    // Nothing to box: a control-flow statement (`return`/`break`, an `unreachable`
-    // block) or a discarded (`none`) value, or a value that is *already* the box
-    // (a union variable, a call returning the union, a branch boxed internally).
     if (
       wt === binaryen.unreachable || wt === binaryen.none || wt === info.refType
     ) return value;
-    let nt = softenImplicitType(codegenType(node));
+    let nt = softenImplicitType(fromType);
     while (nt.type === "Infer") nt = softenImplicitType(nt.subType);
     if (nt.type === "Union" || nt.type === "Nullable") return value;
     const tag = variantTag(info, nt);
@@ -2292,6 +2354,22 @@ export const toWasm = async (ast: VLProgramNode) => {
     // Box against the union's own member type, not the source expression's (a
     // literal `5` has type `IntegerLiteral`, which `boxPayload` can't classify).
     return boxUnion(info, tag, findVariant(info, nt) ?? null, value);
+  };
+  const coerceUnion = (
+    value: number,
+    node: VLProgramNode | VLStatement,
+  ): number => {
+    if (!hasDesiredType() || node.type === "NullLiteral") return value;
+    const info = unionInfo(desiredType!);
+    if (!info) return value;
+    // Skip before resolving the node's type — `codegenType` is only valid
+    // (memoized) on expressions, but statements (`return …`, whose value is
+    // `unreachable`) and already-boxed values reach here too and need no boxing.
+    const wt = binaryen.getExpressionType(value);
+    if (
+      wt === binaryen.unreachable || wt === binaryen.none || wt === info.refType
+    ) return value;
+    return coerceToUnion(value, codegenType(node), desiredType!);
   };
   // Lower an expression, then box it into the desired union if one is wanted.
   const toExpression = (node: VLProgramNode | VLStatement): number =>

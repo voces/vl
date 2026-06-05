@@ -47,6 +47,20 @@ export type VLIndexAccessNode = {
   index: VLExpression;
 };
 
+/** Optional (null-safe) property read `x?.y`: `null` if `x` is null, else `x.y`. */
+export type VLOptionalAccessNode = {
+  type: "OptionalAccess";
+  object: VLExpression;
+  property: string;
+};
+
+/** Null-coalescing `x ?? y`: `x` when non-null, else `y`. */
+export type VLNullCoalesceNode = {
+  type: "NullCoalesce";
+  left: VLExpression;
+  right: VLExpression;
+};
+
 export type VLArgumentNode = {
   type: "Argument";
   name: string | undefined;
@@ -162,6 +176,8 @@ export type VLExpression =
   | VLValue
   | VLPropertyAccessNode
   | VLIndexAccessNode
+  | VLOptionalAccessNode
+  | VLNullCoalesceNode
   | VLBinaryOperationNode
   | VLUnaryOperationNode
   | VLIsNode

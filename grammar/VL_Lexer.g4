@@ -44,6 +44,10 @@ AND      : '&&';
 OR       : '||';
 EXCLAMATION : '!';
 
+// Null operators: optional chaining (`x?.y`) and null-coalescing (`x ?? y`).
+QUESTION_DOT      : '?.';
+QUESTION_QUESTION : '??';
+
 // Comparison Operators
 EQUAL_TO                 : '==';
 NOT_EQUAL_TO             : '!=';

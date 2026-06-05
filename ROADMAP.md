@@ -77,7 +77,16 @@ closures / `is` / variance designs referenced here.
   or-guard-narrowing,else-chain-narrowing,literal-narrowing}.vl`. *(Fixed alongside: a niche-nullable
   object literal — `{ y: 5 }` for a `{ y: string | i32 } | null` param — wasn't built with its
   field's boxed union representation, crashing binaryen when the field was later discriminated.)*
-  REMAINING: `case`/multi-guard (no grammar yet); the **stored-witness** correlation is A6b Stage B.
+  **DONE (optional chaining + null-coalescing):** `x?.y` (grammar `QUESTION_DOT`) reads `null` when
+  `x` is null else `x.y`, typed `(member) | null`; as a guard `if x?.y is T { … }` it narrows
+  **both** the receiver (`x` non-null) and the path (`x.y` is `T`), so the body reads `x.y` directly
+  — the requested shorthand for `x != null && x.y is T`. `x ?? y` (`QUESTION_QUESTION`) yields `x`'s
+  non-null part else `y`. Both lower via a once-evaluated temp + null test, reusing the
+  union/narrowing machinery (`VLOptionalAccessNode` / `VLNullCoalesceNode`). `?.` is **null-only** by
+  design — a value-union arm (`foo: i32 | {x}`) uses `is`, not `?.`. Tests
+  `types/{optional-chain,null-coalesce}.vl`. REMAINING: `case`/multi-guard (no grammar yet); the
+  **stored-witness** correlation is A6b Stage B; optional *call* `x?.f()` and chain short-circuit
+  (`x?.y.z`) deferred (use `x?.y?.z`).
 - 🟢 **A6. `is` operator + tagged unions.** **DONE (stage 1):** grammar `expr IS type` (`x is T`),
   a `VLIsNode`, typed boolean, feeds A5 narrowing; `==`/`!=` against `null` are the natural sugar.
   **DONE (stage 2 — general union discrimination):** an arbitrary value union now has a runtime
