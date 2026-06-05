@@ -120,7 +120,41 @@ export const defaultScope = () => {
       }),
       name: "f64",
     },
-    // string: { type: "Type", subType: { type: "Object", properties: [] } },
+    // A string is an `i32`-indexed collection of char codes — the index signature
+    // gives it a WasmGC i32-array representation plus `.length` (array.len) and
+    // `s[i]` (array.get) for free — with `+` (concat) and `=` operators. Operands
+    // validate nominally (another string, or a string literal).
+    string: {
+      type: "Object",
+      name: "string",
+      properties: [
+        { name: { type: "Alias", name: "i32" }, type: { type: "Alias", name: "i32" } },
+        {
+          name: {
+            type: "Union",
+            subTypes: [
+              { type: "StringLiteral", value: "+" },
+              { type: "StringLiteral", value: "=" },
+            ],
+          },
+          type: {
+            type: "Function",
+            paramaters: [{
+              type: "Parameter",
+              name: "right",
+              paramaterType: {
+                type: "Custom",
+                validate: namedFunc("string", (right: VLType) =>
+                  right === scope.string || isNominal(right, "string") ||
+                  right.type === "StringLiteral"),
+                name: "string",
+              },
+            }],
+            return: { type: "Alias", name: "string" },
+          },
+        },
+      ],
+    },
     boolean: {
       type: "Object",
       properties: [{

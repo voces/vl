@@ -33,7 +33,10 @@ export const _typeFromExpression = (
       // operand so both type-checking and codegen see the concrete type.
       // TODO: when there's a concrete flow.desiredType, prefer it over the default
       // (so `f64 x = 2 + 3` makes the literals f64) with range checking.
-      if (leftType.type === "IntegerLiteral" || leftType.type === "RealLiteral") {
+      if (
+        leftType.type === "IntegerLiteral" || leftType.type === "RealLiteral" ||
+        leftType.type === "StringLiteral"
+      ) {
         leftType = softenImplicitType(leftType);
         setNodeType(expr.left, leftType);
       }
@@ -282,6 +285,10 @@ export const _softenImplicitType = (type: VLType): VLType => {
     if (softenedProperty) {
       return {
         type: "Object",
+        // Preserve the nominal `name` (e.g. `string`) — softening a property
+        // (here the `[i32]` index sig) must not turn a named builtin into an
+        // anonymous structural object.
+        name: type.name,
         properties: type.properties.map((p, i) => ({
           ...p,
           type: properties[i],
@@ -436,7 +443,7 @@ export const getConcreteType = (
   seen: Set<string> = new Set(),
 ): VLType => {
   if (type.type !== "Alias") return type; // TODO: Should handle recursiveness (objects, params, etc)
-  if (type.name === "null" || type.name === "string") return type; // TODO: remove string and make it an object type
+  if (type.name === "null") return type;
 
   // A self-referential alias chain (e.g. the bodyless `type Point`, whose grammar
   // alt `TYPE ID` aliases the name to itself) would otherwise recurse forever and

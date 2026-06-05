@@ -107,9 +107,6 @@ const toType = (ctx: TypeContext): VLType => {
     const id = ctx.ID();
     if (id) {
       const name = id.getText();
-      // return getConcreteType()
-      // TODO: kill this; all types should ultimately resolve to something concrete
-      if (name === "string") return { type: "Alias", name };
 
       for (let i = scopes.length - 1; i >= 0; i--) {
         if (name in scopes[i]) {

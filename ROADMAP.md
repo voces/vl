@@ -41,9 +41,14 @@ closures / `is` / variance designs referenced here.
   `case`, guards). Depends on A3/A4. This is what makes structural types precise.
 - ⬜ **A6. `is` operator** (ducktype `instanceof`/`typeof` replacement, from TODO.md).
   The guard primitive that feeds A5: `if x is string then …`.
-- ⬜ **A7. Real `string` type.** Currently a half-baked `Alias`. Make it a proper object
-  type with its methods/operators (mirrors how numerics are modeled in `defaultScope.ts`).
-  Needs **B13** (operator-method codegen) to actually emit those operators.
+- 🟡 **A7. Real `string` type.** DONE (core): `string` is now a proper Object in
+  `defaultScope.ts` (was a half-baked `Alias`) — `name: "string"`, an `{[i32]: i32}` index
+  signature (so it's an i32-array of char codes, with `.length`/`s[i]` for free), and `+`/`=`
+  operators with a nominal `Custom` validator (mirrors the numeric pattern). Removed the
+  `Alias "string"` special-cases (`toAST` `toType`, `getConcreteType`). Fixed a latent bug:
+  `_softenImplicitType`'s Object case **dropped the `name`** when a property softened, which
+  turned `string` into an anonymous object. REMAINING: `==`/`!=` (needs an element-compare loop);
+  richer methods (slice, indexOf, …).
 - ⬜ **A8. Exact / Inexact variance** (TODO.md). Params Inexact by default (accept excess
   properties), values Exact. Guard the `a.foo = b` footgun noted in TODO.md.
 - ⬜ **A9. Readable / Writable variance** (TODO.md). Applied automatically during
@@ -200,7 +205,15 @@ stays tolerant of both binaryen forms (sync object / async init).*
   it stays fully typed. Index signatures (`{[string]: T}`, already type-check but **dropped at
   codegen** — `objectStruct` keeps only StringLiteral keys) are the type-level precursor →
   this is their codegen. Dispatches through B13's `"[]"`/`"[]="` traps. Deferred.
-- ⬜ **B7. Strings in codegen.** Depends on A7 + B1.
+- 🟡 **B7. Strings in codegen.** DONE (core): a string literal lowers to `array.new_fixed` of
+  its code points; `toWasmType(string)` → a WasmGC i32-array (via the index sig, regardless of
+  the nominal `name`); `.length`/`s[i]` ride the array machinery; `+` concatenates inline
+  (`array.new` + two `array.copy`). Works as a value, param (`function f(s: string)`),
+  reassignment, and a `self`-receiver (`"hi".first()`). Tests `strings/basics.vl`,
+  `strings/string-method.vl`. REMAINING: **`==`/`!=`** (element-compare loop, likely a helper
+  fn); **printing** — a GC i32-array string can't be `__log__`'d directly (that reads linear
+  memory), so wire a `string → linear memory` copy or a string-aware log; **UTF-8 / i8-packed**
+  representation as a size optimization (MVP is 4 bytes/char, codepoints).
 - 🟡 **B8. Loops.** DONE: **`for…in` over arrays** — the `to`-less `for x in arr` (grammar:
   the `TO expr` clause is now optional) binds `x` to each element, lowered to a 0..length index
   loop over `array.get` (iterable evaluated once into a local); a non-array iterable is a clean

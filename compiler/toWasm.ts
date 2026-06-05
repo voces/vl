@@ -674,6 +674,12 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "BooleanLiteral":
         return m.i32.const(node.value ? 1 : 0);
+      case "StringLiteral": {
+        // A string literal is a WasmGC i32-array of its code points.
+        const at = arrayType(i32Type);
+        const chars = [...node.value].map((c) => m.i32.const(c.codePointAt(0)!));
+        return m.array.new_fixed(at.heapType, chars);
+      }
       case "RealLiteral": {
         const type = desiredType?.type === "Object"
           ? desiredType?.name || "f64"
@@ -992,6 +998,45 @@ export const toWasm = async (ast: VLProgramNode) => {
           }
         }
 
+        // String `+` concatenates: allocate an i32-array of len(a)+len(b) and
+        // copy both halves in. (Strings are WasmGC i32-arrays of char codes.)
+        if (leftType.type === "Object" && leftType.name === "string") {
+          if (op !== "+") raise(`string operator ${op} not implemented`);
+          const at = arrayType(i32Type);
+          const aLocal = newLocal(at.refType);
+          const bLocal = newLocal(at.refType);
+          const outLocal = newLocal(at.refType);
+          const a = () => m.local.get(aLocal, at.refType);
+          const b = () => m.local.get(bLocal, at.refType);
+          const out = () => m.local.get(outLocal, at.refType);
+          return m.block(null, [
+            m.local.set(aLocal, toExpression(node.left)),
+            m.local.set(bLocal, toExpression(node.right)),
+            m.local.set(
+              outLocal,
+              m.array.new(
+                at.heapType,
+                m.i32.add(m.array.len(a()), m.array.len(b())),
+                m.i32.const(0),
+              ),
+            ),
+            m.array.copy(
+              out(),
+              m.i32.const(0),
+              a(),
+              m.i32.const(0),
+              m.array.len(a()),
+            ),
+            m.array.copy(
+              out(),
+              m.array.len(a()),
+              b(),
+              m.i32.const(0),
+              m.array.len(b()),
+            ),
+            out(),
+          ], at.refType);
+        }
         if (
           leftType.type === "Object" &&
           (leftType.name === "i32" || leftType.name === "boolean" ||
@@ -1270,12 +1315,13 @@ export const toWasm = async (ast: VLProgramNode) => {
     // Unwrap inference holes resolved during monomorphization (`Infer<i32>` ->
     // i32); softening keeps the wrapper, but codegen wants the concrete type.
     while (t.type === "Infer") t = softenImplicitType(t.subType);
-    if (t.type === "Object" && t.name === undefined) {
-      // An `i32`-index-sig object is a WasmGC array; any other structural object
-      // (no builtin `name`) is a WasmGC struct.
+    if (t.type === "Object") {
+      // An `i32`-index-sig object is a WasmGC array — this covers `[i32]`-arrays
+      // and `string` (an i32-array of char codes). A *structural* object (no
+      // builtin `name`) without an index sig is a WasmGC struct.
       const element = arrayElementType(t);
       if (element) return arrayType(element).refType;
-      return objectStruct(t).refType;
+      if (t.name === undefined) return objectStruct(t).refType;
     }
     // A function value is a fat-pointer closure struct.
     if (t.type === "Function") return closureStruct().refType;
