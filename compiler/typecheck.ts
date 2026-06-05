@@ -118,6 +118,10 @@ export const _typeFromExpression = (
           })),
       };
     case "ArrayLiteral":
+      // An array is an `i32`-indexed collection (→ a WasmGC array). `length` is
+      // NOT a structural member here (that would break `{[i32]: T}` subtyping —
+      // a literal would no longer match an index-sig param); it's an *intrinsic*
+      // of any array type, resolved specially at property access (→ array.len).
       return {
         type: "Object",
         properties: [{
@@ -132,6 +136,10 @@ export const _typeFromExpression = (
       let objType = typeFromExpression(expr.object, ctx);
       if (objType.type === "Infer") objType = objType.subType;
       if (objType.type !== "Object") return { type: "Never" };
+      // `array.length` is an intrinsic i32 (not a structural member).
+      if (expr.property === "length" && arrayElementType(objType)) {
+        return { type: "Alias", name: "i32" };
+      }
       const propType: VLStringLiteralNode = {
         type: "StringLiteral",
         value: expr.property,
@@ -299,6 +307,19 @@ export const _softenImplicitType = (type: VLType): VLType => {
 
 export const softenImplicitType = (type: VLType): VLType =>
   getConcreteType(_softenImplicitType(type), undefined);
+
+// If `type` is an array — a structural object carrying an `i32`-keyed index
+// signature (`{[i32]: T}`) — return its element type `T`, else null. This is
+// what marks a value as an array (→ WasmGC array) rather than a struct, shared
+// by the type checker (here) and codegen (`toWasm.ts`).
+export const arrayElementType = (type: VLType): VLType | null => {
+  if (type.type !== "Object") return null;
+  const prop = type.properties.find((p) => {
+    const name = softenImplicitType(p.name);
+    return name.type === "Object" && name.name === "i32";
+  });
+  return prop ? prop.type : null;
+};
 
 export const typeFromStatement = (
   stmt: VLStatement,
@@ -585,6 +606,14 @@ export const getChildType = (
       code: 4,
     });
     return;
+  }
+
+  // `array.length` is an intrinsic i32 member of any array type.
+  if (
+    property.type === "StringLiteral" && property.value === "length" &&
+    arrayElementType(object)
+  ) {
+    return { type: "Alias", name: "i32" };
   }
 
   let propertyType = object.properties.find((p) =>

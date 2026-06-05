@@ -161,7 +161,39 @@ stays tolerant of both binaryen forms (sync object / async init).*
   (`{ add(a,b) … }` — parser; the `{ f: function… }` form already works, B15 done), typed
   literals in object values (`{n: 4<i64>}` — parser), and **Exact-by-default for values**
   (A8 variance — excess is permissive everywhere today).
-- ⬜ **B6. Arrays in codegen** (WasmGC arrays or linear memory). Depends on B1.
+- 🟡 **B6. Arrays in codegen** (WasmGC arrays). Depends on B1. **MVP DONE.** Arrays are the
+  type whose `[]` index operator (B13) is *native* (`array.get`/`array.set`) — fast integer-
+  keyed, contiguous, the performance path. Represented (reusing the type layer) as an
+  `i32`-index-sig object `{[i32]: T}` (`arrayElementType` is the shared detector). DONE:
+  literal → `array.new_fixed`, `a[i]` → `array.get`, `a[i] = v` → `array.set`, `a.length` →
+  `array.len`, native bounds-trap; verified through fn params/returns, object fields, loops,
+  f64 elems (`arrays/basics.vl`, `arrays/f64-elems.vl`).
+  **Size-member design (DECIDED):** `length` is **not** a structural member of `{[i32]:T}`
+  (baking it in broke index-sig subtyping — a literal would carry a `length` a `{[i32]:i32}`
+  param lacks). It's a **contract member accessed with property syntax, dispatched per type to
+  a native lowering** — the *uniform access principle* (Ruby/Scala/Eiffel), the same model as
+  `+`→`i32.add`. Rules: (a) `length` is **read-only** (no JS writable-length truncation —
+  resizing is explicit ops); (b) **property syntax (no parens) is reserved for O(1)** members
+  (`length`/`count`/`capacity`); computing operations (`push`/`map`/`slice`) are **methods**
+  (parens), so a `.length` you see is always cheap; (c) **sparse uses distinct
+  `count`/`capacity`/`extent`, never an overloaded `length`** (avoids Lua's `#`-on-sparse
+  ambiguity — extent ≠ count ≠ capacity). Generalization (later, → B13): a per-built-in
+  intrinsic-members table instead of the hardcoded `length` check; don't build until the 2nd
+  intrinsic (`push` / string `length`) arrives.
+  **Tiers (simplest first):** (1) ✅ **fixed-length arrays** — WasmGC arrays are runtime-*sized*
+  but fixed-length-after-creation; `length` is intrinsic (`array.len`). (2) **growable
+  list/vector** — a struct `{ array backing, i32 len, i32 cap }` where `length` is now a *real
+  stored* field (logical len ≠ capacity), read-only; push/grow reallocates, built on (1). (3)
+  sparse → the map below (`count`/`capacity`), not an array tier.
+- ⬜ **B6a. Maps / non-string keys (`Map<K,V>`, Lua-flavored — distinct type, not every
+  object).** DECIDED vision: support arbitrary keys (numbers, objects, …) as a *separate* hash
+  `Map` type, NOT by making every object a dynamic table — keep three representations under one
+  `[]`/`.field` surface: static-string-key **structs** (compile-time field index, fastest),
+  `i32`-key **arrays** (native, contiguous), arbitrary-key **maps** (hashed, heap). You pay
+  hashing only when you use a `Map` (no JS/Lua "every object is secretly a hashmap" tax), and
+  it stays fully typed. Index signatures (`{[string]: T}`, already type-check but **dropped at
+  codegen** — `objectStruct` keeps only StringLiteral keys) are the type-level precursor →
+  this is their codegen. Dispatches through B13's `"[]"`/`"[]="` traps. Deferred.
 - ⬜ **B7. Strings in codegen.** Depends on A7 + B1.
 - 🟡 **B8. Loops: wire `for` `step`** (parsed/typechecked but hardcoded `+1`), and
   implement `for…in` over arrays/objects (aspirational in `samples/loops.vl`).

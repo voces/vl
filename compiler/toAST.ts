@@ -53,6 +53,7 @@ import {
 export * from "./ast.ts";
 export { withScope } from "./state.ts";
 export {
+  arrayElementType,
   getConcreteType,
   setNodeType,
   softenImplicitType,

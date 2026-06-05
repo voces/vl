@@ -1,5 +1,6 @@
 import Binaryen from "binaryen";
 import {
+  arrayElementType,
   setNodeType,
   softenImplicitType,
   validateType,
@@ -39,6 +40,8 @@ export const toWasm = async (ast: VLProgramNode) => {
   registerBuiltins(m, binaryen);
 
   let loopIndex = 0;
+  // A reusable i32 desired-type, e.g. for array indices.
+  const i32Type: VLType = { type: "Alias", name: "i32" };
 
   type ScopeEntry = [type: VLType, index: number];
   type Scope = Record<string, ScopeEntry>;
@@ -266,6 +269,32 @@ export const toWasm = async (ast: VLProgramNode) => {
     return cached;
   };
 
+  // --- Arrays (WasmGC arrays) ---
+  // An array type is a structural object carrying an `i32`-keyed index signature
+  // (`{[i32]: T}` — see `arrayElementType`); that key is what selects the WasmGC-
+  // array representation (contiguous, native `array.get` — the performance path)
+  // over a struct. `length` rides as an intrinsic lowered to `array.len`.
+  type ArrayType = { heapType: number; refType: number; element: VLType };
+  const arrayTypes = new Map<number, ArrayType>();
+  // Intern a WasmGC array type by its element's wasm type (so identical element
+  // types share one array type). Mutable so `a[i] = v` can `array.set`.
+  const arrayType = (element: VLType): ArrayType => {
+    const elemWasm = toWasmType(element);
+    let cached = arrayTypes.get(elemWasm);
+    if (!cached) {
+      const tb = new binaryen.TypeBuilder(1);
+      tb.setArrayType(0, elemWasm, binaryen.notPacked, true);
+      const heapType = tb.buildAndDispose()[0];
+      cached = {
+        heapType,
+        refType: binaryen.getTypeFromHeapType(heapType, false),
+        element,
+      };
+      arrayTypes.set(elemWasm, cached);
+    }
+    return cached;
+  };
+
   // The VL type of an expression *in the current instance's scope*. A generic
   // function is monomorphized per call, so a parameter's concrete shape lives in
   // the codegen scope, not the AST-inferred (declaration-time) type: resolve a
@@ -295,6 +324,17 @@ export const toWasm = async (ast: VLProgramNode) => {
       throw new Error(`Expected an object type, got "${t.type}"`);
     }
     return t;
+  };
+
+  // Resolve an expression's array type + (softened) element type, or null if it
+  // isn't an array (e.g. a struct, which the caller handles separately).
+  const arrayTypeOf = (
+    node: VLProgramNode | VLStatement,
+  ): { at: ArrayType; element: VLType } | null => {
+    const element = arrayElementType(objectTypeOf(node));
+    if (!element) return null;
+    const soft = softenImplicitType(element);
+    return { at: arrayType(soft), element: soft };
   };
 
   // A placeholder value of a captured variable's wasm type, used during the
@@ -767,8 +807,34 @@ export const toWasm = async (ast: VLProgramNode) => {
         });
         return m.struct.new(operands, struct.heapType);
       }
+      case "ArrayLiteral": {
+        const info = arrayTypeOf(node);
+        if (!info) throw new Error("Array literal did not resolve to an array");
+        const values = node.values.map((v) =>
+          withDesiredType(info.element, () => toExpression(v))
+        );
+        return m.array.new_fixed(info.at.heapType, values);
+      }
+      case "IndexAccess": {
+        const info = arrayTypeOf(node.array);
+        if (!info) throw new Error("Index access on a non-array");
+        return m.array.get(
+          toExpression(node.array),
+          withDesiredType(i32Type, () => toExpression(node.index)),
+          toWasmType(info.element),
+          false,
+        );
+      }
       case "PropertyAccess": {
-        const struct = objectStruct(objectTypeOf(node.object));
+        const objType = objectTypeOf(node.object);
+        // `array.length` is intrinsic — lower it to `array.len` (no stored field).
+        if (arrayElementType(objType)) {
+          if (node.property === "length") {
+            return m.array.len(toExpression(node.object));
+          }
+          throw new Error(`Array has no member "${node.property}"`);
+        }
+        const struct = objectStruct(objType);
         const field = struct.fields.find((f) => f.name === node.property);
         if (!field) {
           throw new Error(`Object has no field "${node.property}"`);
@@ -786,6 +852,37 @@ export const toWasm = async (ast: VLProgramNode) => {
         // LHS (a Name or `obj.field`) is not a value to evaluate, and an object
         // type carries no `=` method to look up.
         if (op === "=") {
+          if (node.left.type === "IndexAccess") {
+            const access = node.left;
+            const info = arrayTypeOf(access.array);
+            if (!info) throw new Error("Index assignment on a non-array");
+            const index = withDesiredType(
+              i32Type,
+              () => toExpression(access.index),
+            );
+            const value = withDesiredType(
+              info.element,
+              () => toExpression(node.right),
+            );
+            const set = m.array.set(
+              toExpression(access.array),
+              index,
+              value,
+            );
+            // In value position, read the element back.
+            const wasmType = toWasmType(info.element);
+            return desiredType
+              ? m.block(null, [
+                set,
+                m.array.get(
+                  toExpression(access.array),
+                  withDesiredType(i32Type, () => toExpression(access.index)),
+                  wasmType,
+                  false,
+                ),
+              ], wasmType)
+              : set;
+          }
           if (node.left.type === "PropertyAccess") {
             const access = node.left;
             const struct = objectStruct(objectTypeOf(access.object));
@@ -1030,8 +1127,13 @@ export const toWasm = async (ast: VLProgramNode) => {
     // Unwrap inference holes resolved during monomorphization (`Infer<i32>` ->
     // i32); softening keeps the wrapper, but codegen wants the concrete type.
     while (t.type === "Infer") t = softenImplicitType(t.subType);
-    // A structural object (no builtin `name` like i32/f64) is a WasmGC struct.
-    if (t.type === "Object" && t.name === undefined) return objectStruct(t).refType;
+    if (t.type === "Object" && t.name === undefined) {
+      // An `i32`-index-sig object is a WasmGC array; any other structural object
+      // (no builtin `name`) is a WasmGC struct.
+      const element = arrayElementType(t);
+      if (element) return arrayType(element).refType;
+      return objectStruct(t).refType;
+    }
     // A function value is a fat-pointer closure struct.
     if (t.type === "Function") return closureStruct().refType;
     return toWasmTypeOf(binaryen, t);
