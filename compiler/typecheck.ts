@@ -17,6 +17,39 @@ import { errors, flow, scopes } from "./state.ts";
 // operand is still an inference hole and we infer the result without the method.
 const BOOLEAN_OPS = new Set(["<", ">", "<=", ">=", "==", "!=", "&&", "||"]);
 
+// Whether a value can be compared with the *default* structural `==` — every
+// component must itself be value-comparable. A function-valued field makes an
+// object non-equatable (closures can't be soundly value-compared); such a type
+// needs an explicit `==` operator instead.
+export const isEquatable = (
+  type: VLType,
+  seen = new Set<VLType>(),
+): boolean => {
+  let t = softenImplicitType(type);
+  if (t.type === "Infer") t = t.subType;
+  switch (t.type) {
+    case "IntegerLiteral":
+    case "RealLiteral":
+    case "BooleanLiteral":
+    case "StringLiteral":
+      return true;
+    case "Object":
+      if (
+        t.name === "i32" || t.name === "f64" || t.name === "boolean" ||
+        t.name === "string"
+      ) return true;
+      // Arrays (an i32-index-sig object) don't have a default `==` yet.
+      if (arrayElementType(t)) return false;
+      if (seen.has(t)) return true; // cycle guard
+      seen.add(t);
+      return t.properties.every((p) =>
+        p.type.type !== "Function" && isEquatable(p.type, seen)
+      );
+    default:
+      return false;
+  }
+};
+
 export const _typeFromExpression = (
   expr: VLExpression,
   ctx: Context,
@@ -79,6 +112,24 @@ export const _typeFromExpression = (
         validateType(p.name, { type: "StringLiteral", value: op })
       )?.type;
       if (!opFunc || opFunc.type !== "Function") {
+        // `==` / `!=` default to *structural* equality on a plain data object
+        // (no custom operator). Sound only when every field is itself equatable
+        // — an object with a function-valued field needs an explicit `==`, since
+        // closures can't be value-compared.
+        if ((op === "==" || op === "!=") && leftType.name === undefined) {
+          if (isEquatable(leftType)) {
+            ensureType(leftType, rightType, ctx);
+            return { type: "Alias", name: "boolean" };
+          }
+          errors.push({
+            type: "Syntax",
+            message:
+              `This type isn't equatable (a field is a function or otherwise not value-comparable) — define a \`==\` operator for it`,
+            ctx,
+            code: 0,
+          });
+          return { type: "Never" };
+        }
         return missingOpFunc("no-operator-function");
       }
       const param = opFunc.paramaters[0]?.paramaterType;

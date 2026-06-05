@@ -390,6 +390,49 @@ export const toWasm = async (ast: VLProgramNode) => {
     return name;
   };
 
+  // Per-shape structural equality: `__eq_<n>__(a, b)` returns 1 iff every field
+  // of the two structs is equal (native for numerics, `__string_eq__` for
+  // strings, a recursive call for nested structs). The type checker guarantees
+  // every field is equatable (no function fields).
+  const objectEqFns = new Map<number, string>();
+  const objectEqFn = (objType: VLObjectType): string => {
+    const struct = objectStruct(objType);
+    const existing = objectEqFns.get(struct.heapType);
+    if (existing) return existing;
+    const name = `__eq_${objectEqFns.size}__`;
+    objectEqFns.set(struct.heapType, name); // before body for cycle safety
+    const ref = struct.refType;
+    let cond = m.i32.const(1);
+    for (const field of struct.fields) {
+      const ftWasm = toWasmType(field.type);
+      const aGet = m.struct.get(field.index, m.local.get(0, ref), ftWasm, false);
+      const bGet = m.struct.get(field.index, m.local.get(1, ref), ftWasm, false);
+      let ft = softenImplicitType(field.type);
+      while (ft.type === "Infer") ft = softenImplicitType(ft.subType);
+      let fieldEq: number;
+      if (ft.type === "Object" && ft.name === "f64") {
+        fieldEq = m.f64.eq(aGet, bGet);
+      } else if (ft.type === "Object" && ft.name === "string") {
+        fieldEq = m.call(stringEqFn(), [aGet, bGet], binaryen.i32);
+      } else if (
+        ft.type === "Object" && ft.name === undefined && !arrayElementType(ft)
+      ) {
+        fieldEq = m.call(objectEqFn(ft), [aGet, bGet], binaryen.i32);
+      } else {
+        fieldEq = m.i32.eq(aGet, bGet);
+      }
+      cond = m.i32.and(cond, fieldEq);
+    }
+    m.addFunction(
+      name,
+      binaryen.createType([ref, ref]),
+      binaryen.i32,
+      [],
+      cond,
+    );
+    return name;
+  };
+
   // The VL type of an expression *in the current instance's scope*. A generic
   // function is monomorphized per call, so a parameter's concrete shape lives in
   // the codegen scope, not the AST-inferred (declaration-time) type: resolve a
@@ -1090,6 +1133,10 @@ export const toWasm = async (ast: VLProgramNode) => {
             )?.type;
             rightType = opFunc?.type === "Function"
               ? opFunc.paramaters[0].paramaterType ?? raise("op missing param")
+              // Structural `==`/`!=` has no operator method — the right operand
+              // is just the same object type.
+              : (op === "==" || op === "!=")
+              ? leftType
               : raise("op not function");
           }
         }
@@ -1200,6 +1247,25 @@ export const toWasm = async (ast: VLProgramNode) => {
             );
           }
           throw new Error(`Didn't handle ${op} on ${name}`);
+        }
+        // Structural equality on a plain data struct (no custom `==`/`!=`
+        // operator field): compare fields recursively via a per-shape helper.
+        if (
+          leftType.type === "Object" && leftType.name === undefined &&
+          (op === "==" || op === "!=")
+        ) {
+          const objType = objectTypeOf(node.left);
+          const hasCustom = objectStruct(objType).fields.some((f) =>
+            f.name === op
+          );
+          if (!hasCustom) {
+            const eq = m.call(
+              objectEqFn(objType),
+              [toExpression(node.left), toExpression(node.right)],
+              binaryen.i32,
+            );
+            return op === "==" ? eq : m.i32.eqz(eq);
+          }
         }
         // User-defined operator: a structural object carries a method field named
         // for the operator (e.g. `"+"`). Dispatch through it like a member call —

@@ -87,6 +87,18 @@ closures / `is` / variance designs referenced here.
   recursion" per A11 — same area), and DECIDE what `type Point` (no body) means — lean **clean
   error for now**, real **nominal/opaque types** later. Also surfaces the `{…}`-block-vs-object
   ambiguity: a bare `{…}` after `type Point` parses as a separate statement, not the body.
+- 🟡 **A15. Equality.** DONE: `==`/`!=` default to **structural (by value)** — consistent with
+  strings (already value-compared) and numerics, and with VL's structural/value semantics
+  (`{x:1} == {x:1}` is `true`). Codegen: a per-shape `objectEqFn` (`toWasm.ts`) ANDs field
+  equalities (native numerics, `__string_eq__` for strings, a recursive helper for nested
+  structs); the type rule gates it on `isEquatable` (`typecheck.ts`). **An object with a
+  function-valued field is NOT auto-equatable** — closures can't be soundly value-compared
+  (hidden captured state), so it's a clean error ("isn't equatable — define a `==`") rather than
+  silently ignoring the field. A custom `==` operator (B13/B14) overrides the default. Tests
+  `objects/equality.vl`, `objects/equality-function-field.vl`. REMAINING: **referential identity**
+  operator (O(1) `ref.eq`) — deferred; `is` is reserved for A6 type-narrowing, so identity needs
+  its own spelling (`===`, or `identical(a,b)`); array `==` (element compare, like strings);
+  storing a comparison result as i32 still needs an `if` (boolean↔i32 coercion).
 
 ---
 
