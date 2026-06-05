@@ -121,7 +121,11 @@ export const toWasm = async (ast: VLProgramNode) => {
   // desired type that is wanted but not yet concrete.
   const hasDesiredType = () => desiredType !== undefined;
 
+  // A loop's `break` target — the outer block wrapping the loop. `loopLabels`
+  // holds the matching `continue` (loop) labels; appending here keeps the
+  // convention in one place for both the loops and the `Break`/`Continue` cases.
   const loopLabels: string[] = [];
+  const brkLabel = (cont: string) => `${cont}__brk`;
 
   const functionScopes: Record<string, string>[] = [];
   const functions: Record<
@@ -1456,7 +1460,7 @@ export const toWasm = async (ast: VLProgramNode) => {
         // (block $brk (loop $cont (br_if $brk (eqz cond)) body (br $cont)))
         // $cont is the continue target (re-checks the condition each pass).
         const cont = node.label ?? `loop${loopIndex++}`;
-        const brk = `${cont}__brk`;
+        const brk = brkLabel(cont);
         loopLabels.push(cont);
         const loop = m.block(brk, [
           m.loop(
@@ -1468,7 +1472,6 @@ export const toWasm = async (ast: VLProgramNode) => {
             ]),
           ),
         ]);
-        if (!node.label) loopIndex--;
         loopLabels.pop();
         return loop;
       }
@@ -1484,7 +1487,7 @@ export const toWasm = async (ast: VLProgramNode) => {
         //     (br $loop)))
         const cont = node.label ?? `loop${loopIndex++}`;
         const loopLabel = `${cont}__loop`;
-        const brk = `${cont}__brk`;
+        const brk = brkLabel(cont);
         loopLabels.push(cont);
         const variableType = softenImplicitType(vlType(node.from));
         const stepExpr: VLStatement = node.step ??
@@ -1531,7 +1534,6 @@ export const toWasm = async (ast: VLProgramNode) => {
             ]),
           ),
         ]);
-        if (!node.label) loopIndex--;
         loopLabels.pop();
         return loop;
       }
@@ -1548,7 +1550,7 @@ export const toWasm = async (ast: VLProgramNode) => {
         //     (br $loop)))
         const cont = node.label ?? `loop${loopIndex++}`;
         const loopLabel = `${cont}__loop`;
-        const brk = `${cont}__brk`;
+        const brk = brkLabel(cont);
         loopLabels.push(cont);
 
         const info = arrayTypeOf(node.iterable);
@@ -1578,12 +1580,17 @@ export const toWasm = async (ast: VLProgramNode) => {
             ]),
           ),
         ]);
-        if (!node.label) loopIndex--;
         loopLabels.pop();
         return loop;
       }
       case "Continue":
         return m.br(node.label ?? loopLabels[loopLabels.length - 1]);
+      case "Break":
+        // Branch to the (innermost, or labelled) loop's break target — the outer
+        // block, so control resumes after the whole loop.
+        return m.br(
+          brkLabel(node.label ?? loopLabels[loopLabels.length - 1]),
+        );
       default:
         throw new Error(`Unhandled AST -> WASM "${node.type}" expression`);
     }

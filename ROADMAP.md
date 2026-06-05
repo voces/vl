@@ -266,7 +266,13 @@ stays tolerant of both binaryen forms (sync object / async init).*
   — the first non-error diagnostic (see B17). REMAINING: `for…in` over objects / maps; the `for
   val, i in arr` (value + index) and `for , v in obj` destructuring forms (aspirational in
   `samples/loops.vl`).
-- 🟡 **B9. `break` in codegen** (only `continue` is handled); verify labeled break/continue.
+- ✅ **B9. `break` in codegen.** A `break` branches to the loop's outer (`__brk`) block —
+  the same target the loops already used for their exit test — so control resumes after the loop;
+  `break <label>` targets a labelled loop (`brkLabel` centralizes the `cont`→`brk` naming, shared
+  by the loops + the `Break`/`Continue` cases). Verified with `continue` and labelled `break outer`
+  (`loops/break.vl`). Also fixed a pre-existing bug this surfaced: **sequential unlabelled loops
+  collided** — `loopIndex--` undid its own increment, so every auto-named loop became `loop0`
+  (binaryen requires unique IR names); the decrement is removed, so the counter is monotonic.
 - ✅ **B10. Unary / prefix / postfix ops in codegen.** **unary `-`** (grammar prefix at
   tighter-than-`*`/looser-than-`^` precedence; toAST folds `-<literal>` to a negative literal,
   else lowers `-x` to a type-matched `0 - x`, reusing `-` codegen — i32 + f64). **`++` / `--`**
