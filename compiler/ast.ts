@@ -1,7 +1,14 @@
 // AST + type-system node definitions for VL. Pure types, no runtime.
-import { ParserRuleContext, TerminalNode } from "antlr4";
 
-export type Context = ParserRuleContext | TerminalNode;
+// A source position: 1-based line, 0-based column (matching the convention the
+// diagnostics layer expects — see `rangeFromCtx` in compile.ts).
+export type Position = { line: number; column: number };
+
+// A source span attached to AST/diagnostic nodes for error reporting. `start` is
+// the first character (inclusive); `stop` is one past the last character
+// (exclusive). The type algebra only stores a `Context` on diagnostics — it
+// never inspects it — so a plain span is all that is needed.
+export type Context = { start: Position; stop: Position };
 
 export type VLParameterNode = {
   type: "Parameter";
