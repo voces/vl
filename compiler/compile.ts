@@ -10,6 +10,7 @@
 // adapts these to vscode-languageserver Diagnostics; everyone else consumes
 // them directly.
 
+import Binaryen from "binaryen";
 import type { Context, ParseErrors, VLProgramNode, VLType } from "./ast.ts";
 import { tokenize } from "./lexer.ts";
 import { parseProgram } from "./parser.ts";
@@ -165,6 +166,27 @@ export const compile = async (source: string): Promise<CompileResult> => {
   }
 
   return { ast, diagnostics, wasm };
+};
+
+/**
+ * Render compiled wasm bytes as WAT text (used by `vl build --wat`). Reads the
+ * binary back through binaryen and emits its textual form — `toWasm` only hands
+ * out bytes, so this is the thin module-exposing variant. Pure binaryen, no
+ * runtime globals, so the core stays runtime-agnostic.
+ */
+export const wasmToWat = async (wasm: Uint8Array): Promise<string> => {
+  // Mirror toWasm's tolerance of both binaryen forms (sync object / async init).
+  // deno-lint-ignore no-explicit-any
+  const _Binaryen = Binaryen as any;
+  const binaryen = typeof _Binaryen === "function"
+    ? await _Binaryen()
+    : _Binaryen;
+  const m = binaryen.readBinary(wasm);
+  try {
+    return m.emitText();
+  } finally {
+    m.dispose();
+  }
 };
 
 export type RunResult = { logs: string[] };

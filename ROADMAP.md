@@ -587,8 +587,18 @@ LSP (today `toWasm` only runs inside `server.ts`).*
   non-zero exit on errors. The VS Code extension's **Run Current File** command (Ctrl+F5) shells
   out to it in a terminal (runs the live buffer via a temp file when unsaved). REMAINING: a real
   `vl`/`vital` binary (C5) rather than `deno task run`.
-- ⬜ **C3. `vl build <file> -o out.wasm`** — emit `.wasm` (and optional `.wat`).
-- ⬜ **C4. `vl check <file>`** — diagnostics only, exit code for CI.
+- ✅ **C3. `vl build <file> -o out.wasm`** — emit `.wasm` (and optional `.wat`). DONE:
+  `deno task build <file> [-o <out.wasm>] [--wat]` compiles and writes the wasm bytes
+  (default output drops the `.vl` extension → `foo.vl` → `foo.wasm`); on error diagnostics it
+  prints them to stderr and exits non-zero without writing. `--wat` also emits a sibling `.wat`
+  text file via a thin `wasmToWat` (`compile.ts`) that reads the binary back through binaryen and
+  `emitText`s it (`toWasm` only hands out bytes). `cli.ts` now dispatches on a leading subcommand
+  (`run` | `build` | `check`); a missing/unknown word falls back to `run`, so the bare
+  `deno task run <file>` and the VS Code Run-Current-File integration are unchanged. All
+  `Deno`/`process` usage stays in `cli.ts`; the core remains runtime-agnostic.
+- ✅ **C4. `vl check <file>`** — diagnostics only, exit code for CI. DONE: `deno task check <file>`
+  compiles, prints diagnostics to stderr, and exits 1 iff there is an ERROR-severity diagnostic
+  (else 0) — never instantiates or runs the program. A clean CI gate.
 - ⬜ **C5. Decide CLI runtime/distribution** — Deno (`deno compile` for a binary) vs Node.
   Affects packaging.
 
