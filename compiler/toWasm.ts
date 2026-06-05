@@ -1003,22 +1003,24 @@ export const toWasm = async (ast: VLProgramNode) => {
       case "BooleanLiteral":
         return m.i32.const(node.value ? 1 : 0);
       case "NullLiteral": {
-        // `null` takes its (reference) heap type from the desired nullable type
-        // so the produced `ref.null` matches the slot it flows into.
+        // `null` takes its representation from the desired nullable type: a
+        // niche sentinel for a nullable value type, else a typed `ref.null`.
         let dt = desiredType ? softenImplicitType(desiredType) : undefined;
         while (dt && dt.type === "Infer") dt = softenImplicitType(dt.subType);
         if (!dt || dt.type !== "Nullable") {
           throw new Error("`null` needs a nullable type from context");
         }
+        const sentinel = nullSentinel(dt.subType);
+        if (sentinel !== null) return m.i32.const(sentinel);
         // `ref.null` takes a nullable ref *type* (not a heap type).
         return m.ref.null(
           binaryen.getTypeFromHeapType(refHeapType(dt.subType), true),
         );
       }
       case "Is": {
-        // Type guard on a nullable reference: `x is null` → `ref.is_null`;
-        // `x is T` (T the non-null variant) → its negation.
-        const isNull = m.ref.is_null(toExpression(node.value));
+        // Type guard on a nullable: `x is null` → null test; `x is T` (T the
+        // non-null variant) → its negation.
+        const isNull = nullnessTest(node.value);
         const checksNull = node.checkType.type === "Alias" &&
           node.checkType.name === "null";
         return checksNull ? isNull : m.i32.eqz(isNull);
@@ -1375,16 +1377,14 @@ export const toWasm = async (ast: VLProgramNode) => {
             ? m.block(null, [set, m.local.get(localIndex, wasmType)], wasmType)
             : set;
         }
-        // `x == null` / `x != null`: a nullness test on a nullable reference —
-        // `ref.is_null`. Handled before operand typing, since `null` carries no
-        // numeric/operator type. (`null` on either side.)
+        // `x == null` / `x != null`: a nullness test (sentinel compare for a
+        // niche-nullable, `ref.is_null` for a nullable ref). Handled before
+        // operand typing, since `null` carries no numeric/operator type.
         if (op === "==" || op === "!=") {
           const leftNull = node.left.type === "NullLiteral";
           const rightNull = node.right.type === "NullLiteral";
           if (leftNull || rightNull) {
-            const isNull = m.ref.is_null(
-              toExpression(leftNull ? node.right : node.left),
-            );
+            const isNull = nullnessTest(leftNull ? node.right : node.left);
             return op === "==" ? isNull : m.i32.eqz(isNull);
           }
         }
@@ -1797,13 +1797,38 @@ export const toWasm = async (ast: VLProgramNode) => {
     );
   };
 
+  // A *niche* encoding for a nullable value type — `null` hides in a spare value
+  // of the payload, so no box (Rust's `Option<bool>`). A `boolean` is 0/1, so 2
+  // encodes `null` in a plain i32. Returns the sentinel, or null when the
+  // subtype is a reference (use a nullable ref + `ref.null` instead).
+  const NULL_SENTINEL = 2;
+  const nullSentinel = (subType: VLType): number | null => {
+    let t = softenImplicitType(subType);
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
+    return t.type === "Object" && t.name === "boolean" ? NULL_SENTINEL : null;
+  };
+
+  // `<value> is null` test: a sentinel compare for a niche-nullable, else
+  // `ref.is_null` for a nullable ref.
+  const nullnessTest = (valueExpr: VLProgramNode | VLStatement): number => {
+    let t = softenImplicitType(codegenType(valueExpr));
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
+    const sentinel = t.type === "Nullable" ? nullSentinel(t.subType) : null;
+    const value = toExpression(valueExpr);
+    return sentinel !== null
+      ? m.i32.eq(value, m.i32.const(sentinel))
+      : m.ref.is_null(value);
+  };
+
   const toWasmType = (node: VLType): number => {
     let t = softenImplicitType(node);
     // Unwrap inference holes resolved during monomorphization (`Infer<i32>` ->
     // i32); softening keeps the wrapper, but codegen wants the concrete type.
     while (t.type === "Infer") t = softenImplicitType(t.subType);
-    // A nullable reference: the nullable variant of its subtype's heap type.
+    // A nullable value type with a niche → its payload's wasm type (the sentinel
+    // lives in a spare value). A nullable reference → a nullable ref.
     if (t.type === "Nullable") {
+      if (nullSentinel(t.subType) !== null) return binaryen.i32;
       return binaryen.getTypeFromHeapType(refHeapType(t.subType), true);
     }
     if (t.type === "Object") {
