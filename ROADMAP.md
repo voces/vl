@@ -1,770 +1,256 @@
 # VL / Vital — Roadmap
 
-The vision: a scripting-feel language with types **hidden by aggressive inference**,
-**permissive & structural**, **fully type-safe** (statically sound — there is no
-untyped code; inference holes resolve to concrete types), compiling to **lean
-WebAssembly**. Deliverables:
-**LSP-backed VS Code extension** (exists, partial; now with a Run-Current-File command) ·
-**CLI to compile/run** (MVP: `deno task run` / `compiler/cli.ts`; native binary TBD) ·
-**in-browser playground with a sandbox** (missing).
+The vision: a scripting-feel language with types **hidden by aggressive inference**, **permissive &
+structural**, **fully type-safe** (statically sound — no untyped code; inference holes resolve to
+concrete types), compiling to **lean WebAssembly**. Deliverables: an **LSP-backed VS Code extension**
+(partial), a **CLI** (`deno task run`/`build`/`check`; native binary TBD), and an **in-browser
+playground** (missing).
 
-Status legend: ✅ done · 🟡 partial · ⬜ not started.
+Status: ✅ done · 🟡 partial · ⬜ not started.
 
-**Repo layout** (restructured June 2026): `compiler/` — the language core (compile,
-toAST, toWasm, defaultScope + generated `antlr/`), owned by nobody else · `lsp/` — the
-VS Code extension/LSP client+server over the core · `cli/` (future) · `playground/`
-(future) · `grammar/` — the `.g4` spec + antlr gen project · `samples/` · `tests/` —
-`.vl` corpus + runner · `docs/` · `reference/` — retired ts-interpreter. Single root
-`package.json`/`node_modules` (so esbuild resolves deps from both `compiler/` and `lsp/`)
-and root `deno.json` (workspace config + test/lint).
+**Repo layout:** `compiler/` — the language core (compile, toAST, typecheck, toWasm, defaultScope) ·
+`lsp/` — the VS Code extension + LSP server over the core · `grammar/` — the `.g4` spec (reference
+only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + runner · `docs/` ·
+`reference/` — retired ts-interpreter. Tracks are **independent** unless a dependency is called out.
 
-The tracks below are **independent** unless a dependency is called out. Within a
-track, items are roughly ordered. See `docs/language-todo.md` for prose on the
-closures / `is` / variance designs referenced here.
+> **Maintaining this file.** The roadmap is *forward-looking* — what to do, why, dependencies, what's
+> remaining. It is **not** a changelog. Rule of thumb:
+> - *Helps decide what to do next?* → here.
+> - *Why we chose something non-obvious?* → `DECISIONS.md`.
+> - *How an already-done thing works?* → the code + git history, or a `docs/<subsystem>.md` explainer
+>   only where the mental model aids future work (`docs/unions.md`, `docs/narrowing.md`).
+>
+> Done items collapse to a one-line breadcrumb. Don't paste implementation narrative here. (Agents:
+> on finishing, set the item to a one-line done marker; put rationale in `DECISIONS.md`.)
 
 ---
 
-## Track A — Type system (`toAST.ts`)
-*Blueprint: Elixir v1.20 set-theoretic types, adapted for a **fully-typed** language
-(no `dynamic`/gradual escape hatch — VL has no untyped code). Independent of codegen.*
+## Track A — Type system (`typecheck.ts`)
+*Blueprint: Elixir v1.20 set-theoretic types, fully-typed (no gradual escape hatch).*
 
-- 🟡 **A0. Inventory the existing type algebra.** Have: `Alias`, `Function`, `Object`
-  (structural, with index signatures), literal types (`IntegerLiteral`/`RealLiteral`/
-  `StringLiteral`/`BooleanLiteral`), `Union`, `Nullable`, `Unknown`, `Never`, `Type`,
-  `Infer`, `Custom` (predicate). Missing the rest below. Note: `Unknown`/`Infer` are
-  **inference holes that resolve** to concrete types, not a runtime `dynamic` — VL is
-  fully typed, so there is no gradual escape hatch.
-- 🟡 **A3. Intersection types** (`A & B`). **DONE (as narrowing algebra):** a `VLIntersectionType`
-  + `intersectType(a, b)` (`typecheck.ts`) is the then-branch refinement of a guard — `if x is A`
-  narrows `x` to `x & A`, each member of `x` refined to its meet with `A` and disjoint members
-  dropped (so `(string | i32) & i32` is `i32`, an impossible refinement is `Never`). Composes when
-  the same place is guarded twice (`x is A && x is B` → `A & B`). Wired into `ensureType` /
-  `stringify` / soften. REMAINING: **surface syntax** (`A & B` as a type annotation — parser) and
-  general structural-refinement uses beyond narrowing.
-- 🟡 **A4. Negation types** (`not A`). **DONE (as narrowing algebra):** a `VLNegationType` is the
-  else-branch subtraction — `if x is A { … } else { /* x: x − A */ }`, and `x == L` narrows the
-  else to `x − L`. `intersectType` consumes a `Negation` as a subtraction and `subtractType`
-  removes finite-union members; an open-world residual (`i32 − 1`) is dropped to its positive part
-  (so codegen never sees an unrepresentable negation). Wired into `ensureType`/`stringify`/soften.
-  REMAINING: **surface syntax** (`not A`), and full open-world negation tracking (needs A12).
-- 🟡 **A5. Flow narrowing.** **DONE (nullness slice):** inside `if x != null { … }` (or
-  `if x is T { … }`), `x` is narrowed to its non-null type, so member access resolves to the
-  underlying shape (`p.x` is a type error on `{x:i32} | null`, valid after the guard). A shared
-  `conditionNarrowing` fact (`typecheck.ts`) is applied by **both** passes: toAST narrows the type
-  scope around the then-branch, toWasm a `narrowed` overlay consulted by `codegenType` (the local
-  keeps its nullable wasm type, so `local.get`/`struct.get` — which accept a nullable ref — stay
-  valid). **DONE (post-guard narrowing):** a guard clause whose then-branch *diverges*
-  (`if x == null { return } /* x non-null below */`) narrows `x` for the rest of the block — the
-  idiomatic null-handling pattern. `divergesStatement` (return/break/continue, a block ending in
-  one, an `if` with all branches diverging, a divergent `while true`) + `postGuardNarrowing`,
-  applied by both passes when walking a block's statements. **DONE (union-member narrowing):**
-  narrowing is no longer null-only — `if x is A { … } else { … }` narrows `x` to `A` in the then
-  branch and to its **complement** `U − A` in the else branch (`subtractType`/`elseNarrowing` in
-  `typecheck.ts`), so a two-case union is fully discriminated by one `if` and an N-case union peels
-  one variant at a time. Nested narrowings compose (each is based on the *current* narrowed view,
-  not the declared type). **DONE (general case — A3/A4):** `&&`/`||`-chained guards now narrow.
-  Short-circuit narrowing — the RHS of `&&` is type-checked *and* codegen'd with the LHS's
-  then-narrowings applied (`||` with its else-narrowings), so `if x != null && x.y is i32 { x.y }`
-  resolves `x.y` and discriminates it in one condition; `&&`/`||` also gained short-circuit codegen
-  (`if a then b else 0` / `if a then 1 else b`). A guard narrows a *list* of facts (a `&&` of guards
-  narrows several places at once); the De Morgan dual gives `||` guard clauses — `if x == null ||
-  y == null { return }` narrows **both** after. else-of-else-if now chains: the final `else` (and
-  each later `else if`) is narrowed by the complement of **every** prior condition, not just the
-  first (`elseAcc` accumulator in toAST + the persistent overlay in toWasm). `==`/`!=` against a
-  **literal** discriminates too (then `x & L`, else `x − L`). Shared `withNarrowings` applier
-  (`typecheck.ts`) used by both passes; `thenNarrowings`/`elseNarrowings`/`postGuardNarrowings`
-  return fact lists. Tests `types/{nullable,guard-narrowing,union-narrowing,and-narrowing,
-  or-guard-narrowing,else-chain-narrowing,literal-narrowing}.vl`. *(Fixed alongside: a niche-nullable
-  object literal — `{ y: 5 }` for a `{ y: string | i32 } | null` param — wasn't built with its
-  field's boxed union representation, crashing binaryen when the field was later discriminated.)*
-  **DONE (optional chaining + null-coalescing):** `x?.y` (grammar `QUESTION_DOT`) reads `null` when
-  `x` is null else `x.y`, typed `(member) | null`; as a guard `if x?.y is T { … }` it narrows
-  **both** the receiver (`x` non-null) and the path (`x.y` is `T`), so the body reads `x.y` directly
-  — the requested shorthand for `x != null && x.y is T`. `x ?? y` (`QUESTION_QUESTION`) yields `x`'s
-  non-null part else `y`. Both lower via a once-evaluated temp + null test, reusing the
-  union/narrowing machinery (`VLOptionalAccessNode` / `VLNullCoalesceNode`). `?.` is **null-only** by
-  design — a value-union arm (`foo: i32 | {x}`) uses `is`, not `?.`. Tests
-  `types/{optional-chain,null-coalesce}.vl`. REMAINING: `case`/multi-guard (no grammar yet); the
-  **stored-witness** correlation is A6b Stage B; optional *call* `x?.f()` and chain short-circuit
-  (`x?.y.z`) deferred (use `x?.y?.z`).
-- 🟢 **A6. `is` operator + tagged unions.** **DONE (stage 1):** grammar `expr IS type` (`x is T`),
-  a `VLIsNode`, typed boolean, feeds A5 narrowing; `==`/`!=` against `null` are the natural sugar.
-  **DONE (stage 2 — general union discrimination):** an arbitrary value union now has a runtime
-  representation and `is T` discriminates it. Two encodings, chosen by `unionInfo` (`toWasm.ts`):
-  a **niche** where one is free (a `T | null` reference → WasmGC nullable ref + `ref.is_null`;
-  `boolean | null` → an i32 sentinel), else a **tagged `{ tag, value }` struct**. The struct has
-  two payload shapes — a *value* kind (members share one scalar wasm rep, e.g. `boolean | i32`,
-  `i32 | null`: `value` is that rep, so binaryen's Heap2Local usually scalarizes the box away) and
-  a *boxed* kind (reference or mixed-rep members, e.g. `string | i32`, `{x} | {y}`, `i32 | f64`:
-  `value` is `anyref`, a reference stored as-is and a scalar in a one-field `{ rep }` box). `is T`
-  compares the `tag` field; tags are interned in a **global** registry keyed by variant, so a value
-  keeps its tag identity as it flows between a union and its sub-unions. Boxing happens at every
-  value-flow boundary through one `coerceUnion` hook (assignment, argument, return — works across
-  function boundaries). Tests `types/{value,ref,mixed-rep,union-narrowing}-union*.vl`. REMAINING:
-  reference-vs-reference discrimination still uses the tag rather than `ref.test` (fine, but a
-  `ref.test` fast-path could drop the tag for all-distinct-heap-type ref unions); union **arrays**
-  (`[boolean | i32]`) — the single-element-type WasmGC array wall; declared (verified) type-guard
-  predicate signatures (A6b stage A).
-- 🟡 **A6b. Proof-carrying narrowing (type guards as values).** Rather than TS-style `x is T`
-  *predicate annotations*, narrowing is a **fact carried by a function's return value** — the
-  classic boolean guard is the degenerate case; the general case is a discriminable return
-  (`number | null`, a union, an enum) whose **variants correlate with narrowings of the inputs**.
-  Discriminating the (possibly *stored*) witness later refines the input that produced it — a
-  proof-carrying value (cf. GADTs / refinement types / assertion signatures, but more expressive:
-  it survives a `const`). **DONE (degenerate, immediately-consumed case):** a guard is *inferred*
-  (sound, no trust) when a function's body is exactly `return <narrowing-predicate-on-a-param>`
-  (e.g. `function present(p) { return p != null }`); a call to it **in a condition** narrows the
-  argument — `if present(v) { v.x }`, and the guard-clause form `if absent(v) { return }` narrows
-  after. Stored in a `guards` registry; `conditionNarrowing` gains a `FunctionCall` case, so both
-  passes + post-guard narrowing get it for free (and UFCS `v.present()` works, since it lowers to
-  `present(v, …)`). Test `types/guard-function.vl`. **Stage A (remaining):** richer discriminants
-  (`if bar(x) is null` narrowing x), multi-input correlation, declared (verified) predicate
-  signatures. **Stage B:** the **stored witness** — `const foo = bar(x); … if foo is null` narrows
-  x — needs binding tracking + invalidation on mutation of either side (a lightweight borrow), and
-  benefits from A3/A4 (intersection/negation) underneath. Design-only beyond the degenerate case.
-- 🟡 **A7. Real `string` type.** DONE (core): `string` is now a proper Object in
-  `defaultScope.ts` (was a half-baked `Alias`) — `name: "string"`, an `{[i32]: i32}` index
-  signature (so it's an i32-array of char codes, with `.length`/`s[i]` for free), and `+`/`=`
-  operators with a nominal `Custom` validator (mirrors the numeric pattern). Removed the
-  `Alias "string"` special-cases (`toAST` `toType`, `getConcreteType`). Fixed a latent bug:
-  `_softenImplicitType`'s Object case **dropped the `name`** when a property softened, which
-  turned `string` into an anonymous object. `==`/`!=` now type-check (boolean) + codegen.
-  REMAINING: richer methods (slice, indexOf, …); `boolean`-where-`i32`-expected coercion (storing
-  a comparison result needs an `if` today).
-- ⬜ **A8. Exact / Inexact variance** (TODO.md). Params Inexact by default (accept excess
-  properties), values Exact. Guard the `a.foo = b` footgun noted in TODO.md.
-- ⬜ **A9. Readable / Writable variance** (TODO.md). Applied automatically during
-  parameter inference.
-- ⬜ **A10. Parametric types / generics.** `function foo<T>(x: T)`. Elixir defers these too —
-  hard. Needed for real collections.
-- 🟢 **A11. Recursive types.** **DONE:** a recursive *structural* type resolves and
-  compiles end to end — `type Tree = { value: i32, left: Tree | null, right: Tree | null }`
-  constructs, traverses (null-narrowing on the recursive field), and accumulates
-  (`types/recursive-tree.vl`). The recursion is carried by the alias **name**: the parser
-  forward-registers the alias and returns a lazy `Alias` leaf for a self-reference inside the
-  body (`typeBuilding`), and `_softenImplicitType` **preserves** that nested `Alias` leaf
-  (softens via the un-wrapped helper, so the structure stays finite) — a top-level alias is
-  still expanded. Every traversal is cycle-safe: `getConcreteType` already had the A14 seen-set;
-  `typeFromExpression` resolution unwraps a `Type` alias with a seen-guard; `ensureType`'s
-  structural `Object` case has a **coinductive** pair-guard (and the latent `case "Type"`
-  self-loop is fixed) so two mutually-recursive shapes terminate; `stringifyType` has a seen-set.
-  Codegen builds a **self-referential WasmGC struct**: `objectStruct` interns by a cycle-safe
-  structural signature (de-Bruijn-style depth back-refs, so structurally-identical recursive
-  types share one struct), isolates the recursion group (SCC) and builds it in one
-  `TypeBuilder` rec group with forward references, while a non-recursive nested struct is still
-  built independently. REMAINING: **mutual recursion** across *separate* `type` declarations
-  (needs forward-registration of the not-yet-declared name in the parser); recursion through an
-  **array** element (`type List = { rest: [List] }` — the array's own type-builder isn't in the
-  rec group); the degenerate bodyless `type Point` still errors cleanly (A14).
-- ⬜ **A12. Soundness pass / test suite.** Port the "If T" narrowing benchmark idea; build
-  a corpus of "must-error" and "must-not-error" programs. Define the soundness contract
-  (statically sound — every well-typed program is type-safe at runtime).
-- 🟡 **A13. Operator-constraint inference (row-polymorphic generics).** **DONE (the core):**
-  a fully-inferred structural function now works end to end —
-  `function add(self, b) { x: self.x + b.x, y: self.y + b.y }` over `{x, y}`, monomorphized per
-  call shape (verified at **both i32 and f64** from two call sites, `functions/structural-generic.vl`),
-  and `function max(a, b) { if a > b then a else b }` (`functions/inferred-compare.vl`). Three
-  changes made it work: (1) `_typeFromExpression` BinaryOperation no longer **errors** on a hole
-  operand — it returns boolean for comparisons / the operand type for arithmetic, deferring
-  concretization to the call site; (2) codegen resolves operand + object-literal types from the
-  **instance scope** (`codegenType` extended to `BinaryOperation` / `ObjectLiteral`), so a
-  monomorphized body sees concrete numerics instead of declaration-time holes; (3) a block whose
-  desired type is an unresolved hole takes its tail expression's concrete type. Mirrors how VL
-  already infers *property* constraints (`o.x`) and *callability* (`fn(a,b)`). **REMAINING:**
-  soundness of the hole-operand rule is permissive (doesn't yet reject `i32 + string`); and the
-  *stored-closure* operator case (`vec + vec` via a `"+"` field, B13) is still blocked — there
-  the method is compiled once at the inferred param shape, not per call, so it hits the WasmGC
-  width-subtyping wall independently of this inference work.
-- ⬜ **A14. Named/opaque type robustness (+ a real crash bug).** `type Point = { x: f64, y:
-  f64 }` (with `=`) works as a structural alias and resolves as a param type. **BUG:** the
-  opaque form `type Point` (no `=`/body — the `TYPE ID` grammar alt) registers a
-  *self-referential* alias (`subType: {Alias: "Point"}`); using it as a type sends
-  `getConcreteType` (`typecheck.ts`) into **infinite recursion → stack overflow**, which the
-  per-statement `try/catch` swallows, silently dropping the declaration and yielding a
-  misleading "undeclared." Fix: cycle-guard `getConcreteType` (it "explicitly punts on
-  recursion" per A11 — same area), and DECIDE what `type Point` (no body) means — lean **clean
-  error for now**, real **nominal/opaque types** later. Also surfaces the `{…}`-block-vs-object
-  ambiguity: a bare `{…}` after `type Point` parses as a separate statement, not the body.
-- 🟡 **A15. Equality.** DONE: `==`/`!=` default to **structural (by value)** — consistent with
-  strings (already value-compared) and numerics, and with VL's structural/value semantics
-  (`{x:1} == {x:1}` is `true`). Codegen: a per-shape `objectEqFn` (`toWasm.ts`) ANDs field
-  equalities (native numerics, `__string_eq__` for strings, a recursive helper for nested
-  structs); the type rule gates it on `isEquatable` (`typecheck.ts`). **Function-valued fields
-  compare by reference** — a function value is a fat-pointer closure `{tableIndex, env}` (freshly
-  allocated, so comparing the pointer is useless), so equality is *same function* (`i32.eq` on
-  the table index) AND *same captured env* (`ref.eq`). Sound and well-defined ("data by value,
-  functions by identity"); conservative only for capturing closures (a fresh env per instance
-  compares unequal even with identical captured values — the non-idiomatic field-method pattern).
-  A custom `==` operator (B13/B14) overrides the default. **Array `==` DONE** — length +
-  element compare via a per-element-type `arrayEqFn`, recursing through a shared `valueEq` helper
-  (numerics native, strings/arrays/structs recursive, functions by reference) that now also backs
-  `objectEqFn` and the top-level `==`; an array is equatable iff its element type is, and a
-  struct with an array field is now equatable too. Tests `objects/equality.vl`,
-  `objects/equality-function-field.vl`, `arrays/equality.vl`. REMAINING: **referential identity**
-  operator (O(1) `ref.eq`) — deferred; `is` is reserved for A6 type-narrowing, so identity needs
-  its own spelling (`===`, or `identical(a,b)`); storing a comparison result as i32 still needs an
-  `if` (boolean↔i32 coercion).
-- 🟡 **A16. Literal-union types (enums-as-unions).** Literal types (`0 | 1 | 2`,
-  `"expense" | "reimbursement"`) are the union idiom for enums — no separate `enum` construct.
-  **DONE (the type-level story):** they parse + constrain as annotations (a `"a" | "b"` param
-  rejects `"c"`); **`==`/`!=` discriminate** them (yielding boolean + literal narrowing, `ff65e35`);
-  a **numeric-literal union is its base scalar** for arithmetic / ordered comparison (`n + 1`,
-  `n < 2`); and a discrimination that covers every case is **exhaustive** — `conditionsExhaust`
-  (`typecheck.ts`) flattens the `else if` chain and subtracts each case from the discriminated
-  place; if the residual is `Never` an else-less `if` has no `| null` fall-through, and codegen
-  emits `unreachable` for the proven-impossible fall-through (so `if s == "a" … else if s == "b" …`
-  over `"a" | "b"` returns non-null with no dummy `else`). A bare literal still defaults to its base
-  type (`let x = 0` is `i32`); only an explicit annotation keeps the literal. Tests
-  `types/{literal-union,literal-union-exhaustive}.vl`. REMAINING: the **enum representation**
-  optimization — a closed union of same-base literals stored as an i32 tag (intern each literal,
-  materialize at print / coercion boundaries) instead of a full string per value; literal unions
-  currently soften to their base at the value level (correct, but a string union stores whole
-  strings). Also: a literal union read *inside* a body softens to base (the `==`-operand soften
-  path re-memoizes it), so member-level narrowing there is coarser than at the call boundary.
+- ✅ **A0. Type-algebra inventory.** `Alias`, `Function`, `Object` (structural + index sigs), literal
+  types, `Union`, `Nullable`, `Intersection`, `Negation`, `Unknown`/`Infer` (resolving holes),
+  `Never`, `Type`, `Custom`.
+- 🟡 **A3. Intersection types** (`A & B`). Done as narrowing algebra (`intersectType`, the then-branch
+  refinement; → `docs/narrowing.md`). REMAINING: surface syntax (`A & B` annotation) + uses beyond
+  narrowing.
+- 🟡 **A4. Negation types** (`not A`). Done as narrowing algebra (`subtractType`, the else-branch).
+  REMAINING: surface syntax (`not A`); full open-world negation tracking (needs A12).
+- 🟡 **A5. Flow narrowing.** Done broadly — nullness, union-member (then `A` / else `U − A`),
+  post-guard guard-clauses, `&&`/`||` chains (short-circuit, multi-place, De Morgan), else-of-else-if
+  chaining, literal discrimination, `?.`/`??`. See **`docs/narrowing.md`**. REMAINING: `case`/multi-
+  guard (no grammar); stored-witness (A6b Stage B); optional *call* `x?.f()` + chain short-circuit
+  `x?.y.z` (use `x?.y?.z`); per-call reachability-pruned return types (blocked on memoize-with-holes —
+  see `docs/narrowing.md`).
+- 🟢 **A6. `is` operator + tagged unions.** Done — `x is T` discriminates an arbitrary value union at
+  runtime (niche / value-kind / boxed encodings, global tag registry, `coerceUnion` at boundaries).
+  See **`docs/unions.md`**. REMAINING: `ref.test` fast-path for ref-vs-ref; union arrays
+  (`[boolean | i32]`); declared type-guard signatures (A6b Stage A).
+- 🟡 **A6b. Proof-carrying narrowing (type guards as values).** Narrowing as a fact carried by a
+  return value; discriminating the (possibly stored) witness refines the input that produced it. Done
+  (degenerate, immediately-consumed): a body that is exactly `return <predicate-on-a-param>` is an
+  inferred guard — `if present(v) { v.x }`, and the guard-clause `if absent(v) { return }`.
+  REMAINING — **Stage A:** richer discriminants (`if bar(x) is null`), multi-input correlation,
+  declared (verified) predicate signatures. **Stage B:** the *stored witness* (`const f = bar(x); …
+  if f is null` narrows x) — needs binding tracking + invalidation (a lightweight borrow). Stage B
+  also subsumes per-call tight return types (the forward direction of the same correlation).
+- 🟡 **A7. Real `string` type.** Done (core): a proper Object (`{[i32]: i32}` index sig → i32-array of
+  char codes, `.length`/`s[i]`/`+`/`==`). REMAINING: richer methods (slice, indexOf); `boolean`-where-
+  `i32`-expected coercion. (UTF-16 backing is B7.)
+- ⬜ **A8. Exact / Inexact variance.** Params Inexact by default (accept excess properties), values
+  Exact. Guards the `a.foo = b` width footgun. (TODO.md)
+- ⬜ **A9. Readable / Writable variance.** Applied automatically during parameter inference. (TODO.md)
+- ⬜ **A10. Parametric types / generics** (`function foo<T>(x: T)`). Hard (Elixir defers it). Needed
+  for real collections → the main remaining gap for self-hosting (Track H/H2).
+- 🟢 **A11. Recursive structural types.** Done — `type Tree = { value, left: Tree | null, … }`
+  constructs/traverses/compiles (cycle-safe traversals + a self-referential WasmGC struct rec-group;
+  `types/recursive-tree.vl`). REMAINING: mutual recursion across *separate* `type` decls; recursion
+  through an **array** element (`{ rest: [List] }`); bodyless `type Point` still errors cleanly (A14).
+- 🟡 **A12. Soundness corpus.** Done (started): a must-error / must-not-error `.vl` corpus under
+  `tests/cases/soundness/`; the runner is strict-by-default. REMAINING: keep growing it; the
+  known-unsound corners are `xfail`-marked (e.g. the permissive `i32 + string` hole rule, A13).
+- 🟡 **A13. Operator-constraint inference (row-polymorphic generics).** Done (core): a fully-inferred
+  structural function (`add(self, b) { x: self.x + b.x, … }`) monomorphizes per call shape (i32 & f64
+  from two call sites). REMAINING: the hole-operand rule is permissive (doesn't reject `i32 + string`
+  yet); the *stored-closure* operator case (`vec + vec` via a `"+"` field) still hits the WasmGC
+  width wall (B13).
+- 🟡 **A14. Named/opaque type robustness.** The bodyless-`type Point` infinite-recursion crash is
+  fixed (cycle-guarded `getConcreteType`; it now errors cleanly). REMAINING: real **nominal/opaque
+  types** (decision: clean-error-for-now → `DECISIONS.md`).
+- 🟡 **A15. Equality.** Done — `==`/`!=` are structural by value; functions by reference; arrays + nested
+  structs recurse via a shared `valueEq` helper, gated by `isEquatable`. (→ `DECISIONS.md`.) REMAINING:
+  a referential-identity operator (`===` / `identical`, O(1) `ref.eq`); `boolean`→i32 coercion when
+  storing a comparison result.
+- 🟡 **A16. Literal-union types (enums-as-unions).** Done (type-level): annotations constrain
+  (`"a"|"b"` rejects `"c"`); `==`/`!=` discriminate + narrow; a numeric-literal union is its base
+  scalar for arithmetic; a covering `if/else if` chain is **exhaustive** (no spurious `| null`). (→
+  `DECISIONS.md`.) REMAINING: the **enum representation** (i32 tag for a closed literal union — see
+  `docs/unions.md`); a literal union read *inside* a body softens to base (coarser member-narrowing
+  there than at the call boundary).
+
+---
 
 ## Track B — Codegen, memory model & runtime (`toWasm.ts`)
-*The "no-GC vs WasmGC" decision lives here. Recommendation: make placement a compiler
-decision — escape analysis stack-allocates non-escaping values; escaping values go to
-WasmGC; keep manual linear memory as an opt-in escape hatch.*
+*Allocation = WasmGC; binaryen stays (it doesn't block self-hosting). → `DECISIONS.md`.*
 
-*Dependency decision: **keep binaryen** (unlike antlr4 — Track G). It's pure WASM/JS,
-does the heavy lifting (IR + validation + optimizer), supports WasmGC types (helps
-B1/B4), and is a library binding that does **not** block self-hosting. The binaryen
-patch was **removed** (F8 done): the LSP server now builds as ESM, where binaryen's
-top-level await is legal, so `patch-package` and the 242KB patch are gone. `toWasm`
-stays tolerant of both binaryen forms (sync object / async init).*
-
-- ✅ **B0. Numeric literals + i32/f64 arithmetic, if/while, direct calls, `__program__`
-  start fn, memory builtins.**
-- ✅ **B1. Allocation strategy DECIDED: WasmGC** (June 2026). The heap phase (closures,
-  objects, arrays, strings) builds on WasmGC structs/arrays; linear memory stays as an
-  opt-in escape hatch; escape-analysis stack-allocation is a later optimization.
-  **binaryen upgraded 116→130** for the ergonomic GC API (`module.struct`/`module.array`/
-  `TypeBuilder` — absent in 116). The old upgrade blocker (binaryen TLA breaking CJS) is
-  moot since the LSP server is ESM. Only API drift: `i64.const` now takes a single bigint.
-- 🟡 **B2. Finish numeric codegen.** DONE: **i64 & f32 binary arithmetic** — the numeric
-  BinaryOperation dispatch was unified into two op tables (`INT_BINOPS` signed / `FLOAT_BINOPS`),
-  applied as `m[wasmType][method]`, covering i32/i64/boolean (integer) and f32/f64 (float); this
-  also enabled **float `/` and comparisons** (`<`/`>`/`<=`/`>=`), previously unhandled even for
-  f64. A literal operand coerces to the other side's concrete numeric type (`i64var * 2` lowers
-  `2` as i64) — the right operand of a builtin numeric op takes the left's type, not the operator
-  method's (Union) param type. Tests `numerics/wide-arith.vl`. DONE: i64/f32 **type mappings**
-  (`wasmType.ts`) — typed locals/params/returns + `print` of those. DONE: **range-aware
-  integer-literal defaults** — an un-annotated integer literal defaults to the narrowest type that
-  holds it *exactly* (i32, else i64) instead of wrapping; beyond-i64 is a diagnostic
-  (`defaultIntegerType`, shared by `typecheck.ts` soften + `toWasm.ts` codegen). Still TODO:
-  numeric **casting/coercion** between types (none today — e.g. `i32`→`i64` is implicit-only via
-  literals; no explicit conversion of a *value*).
-- ✅ **B3. First-class functions / indirect calls** — incl. per-shape monomorphization.
-  *Representation note: B4 superseded the bare i32 index — a function value is now a fat-pointer
-  closure struct `{ i32 tableIndex, structref env }`; the table + `call_indirect` dispatch below
-  still stand.*
-  A function value is an **i32 index into a wasm function table** (`addTable` +
-  `addActiveElementSegment`); function-typed locals/params hold that index and
-  `call_indirect` dispatches on it. An un-annotated higher-order param works: `function
-  apply(fn, a, b) fn(a, b)` infers `fn` is a 2-arg function (see A6-adjacent inference in
-  `toAST.ts`). Indirect-call signatures and inferred return types are read back from the
-  monomorphized scope / compiled body (`getExpressionType`), not the once-inferred AST.
-  **Per-shape monomorphization (done, → folds into A10):** each call site instantiates a
-  *fresh* copy of the (generic) signature — `cloneTypeFresh` gives fresh-but-consistent
-  inference holes, unified against that call's args, then collapsed (`makeExact`) to concrete
-  types so the check is strict (this also closed the inferred-return soundness gap). Codegen
-  keys wasm instances on the **wasm parameter signature** (`name`, `name$1`, …), so
-  `apply(addi, …)` and `apply(addf, …)` emit two correctly-typed instances. *Numeric builtins
-  now validate **nominally** (by `name`), not by reference identity, since instantiation
-  copies types (`defaultScope.ts isNominal`).*
-  **Variant-count tradeoff:** closures collapse to 1 instance (shared fat-pointer struct) and
-  primitives to ≤4, but a **structural-object** param yields one instance per distinct concrete
-  shape passed — WasmGC structs aren't width-subtypes, and the body is compiled against the
-  argument's actual shape (so `getx({x,y})` ≠ `getx({x})`). Bounded in practice (few shapes per
-  generic); the principled collapse is **WasmGC struct subtyping** via a global field-slot layout
-  (row-polymorphism lowering) — a future optimization, not built. See `vl-monomorphization`.
-- ✅ **B4. Closures** — full closures WORK (the project's first WasmGC codegen).
-  1. **Nested function declarations** — a function-body block caches its value type during the
-     walk (so return-type inference survives the scope pop), and Block codegen registers nested
-     decls like the Program case.
-  2. **Capture analysis** — `instantiate` compiles a capturing body twice: pass 1 collects the
-     captured names (placeholders, body discarded) via a function-boundary check in `lookupName`;
-     pass 2 recompiles against the env.
-  3. **Environment struct** — a WasmGC struct (`TypeBuilder`, one field per capture); captured
-     reads `ref.cast` the env parameter to it and `struct.get`. Captures may be objects (refs).
-  4. **Escaping closures** — a function value is a **fat pointer**: a uniform WasmGC struct
-     `{ i32 tableIndex, structref env }`. Every impl takes a leading `structref` env param (null
-     for non-capturing), so all function values are interchangeable; a value packs
-     `{ tableIndexOf(f), env }` (env captured at creation time, travels with the value); direct
-     calls prepend the env, indirect calls extract index+env and `call_indirect`. Dispatch stays
-     table-based (reuses B3). So capturing functions can be returned / stored in fields / passed,
-     each keeping its own env (`functions/escaping.vl`: 15, 110, 17).
-  Tests: `functions/closure.vl`, `functions/escaping.vl`. REMAINING (smaller): **mutable
-  captures** — writing to a captured variable (needs boxing / a mutable env cell; reads are
-  by-value today). Depends on B1 (done) + B3 (done).
-- 🟡 **B5. Objects in codegen** — core object support DONE on **WasmGC structs** (reusing the
-  closure struct machinery). `{x,y}` → `struct.new`; `p.x` → `struct.get`; `p.x = v` →
-  `struct.set`. Shapes are interned by a canonical signature (fields sorted by name, mutable),
-  so identical shapes share a struct type; `toWasmType` maps a structural Object to its struct
-  ref. Working & tested (`objects/struct.vl`, `objects/pass.vl`): literals, read/write, nested
-  reads (`p.a.x`), f64 fields, **objects as function args/returns**, **reassignment**, empty
-  objects, and **objects captured in closures** (ref-typed env fields). **Excess properties are
-  allowed** (permissive structural width subtyping: `function f(o) o.x` accepts `{x,y}`).
-  **Function-valued fields + member-call syntax** work: `let o = { f: someFn }` then `o.f(args)`
-  (a new `VLCallNode` for calling an arbitrary expression value; dispatches through the closure
-  struct, so the field may hold a plain function *or* an escaping closure — `objects/member-call.vl`:
-  7, 42, 105). Also fixed a parser precedence bug this surfaced: member-access *reads* (`.`/`[]`)
-  bound looser than arithmetic (`a.x + b.y` mis-parsed as `(a.x + b).y`) — moved them above the
-  operators in `VL_Parser.g4` + regen. REMAINING (separate features): **methods via explicit
-  receiver + UFCS** (see B14 — DECIDED: no `this`), **method-shorthand** field sugar
-  (`{ add(a,b) … }` — parser; the `{ f: function… }` form already works, B15 done), typed
-  literals in object values (`{n: 4<i64>}` — parser), and **Exact-by-default for values**
-  (A8 variance — excess is permissive everywhere today).
-- 🟡 **B6. Arrays in codegen** (WasmGC arrays). Depends on B1. **MVP DONE.** Arrays are the
-  type whose `[]` index operator (B13) is *native* (`array.get`/`array.set`) — fast integer-
-  keyed, contiguous, the performance path. Represented (reusing the type layer) as an
-  `i32`-index-sig object `{[i32]: T}` (`arrayElementType` is the shared detector). DONE:
-  literal → `array.new_fixed`, `a[i]` → `array.get`, `a[i] = v` → `array.set`, `a.length` →
-  `array.len`, native bounds-trap; verified through fn params/returns, object fields, loops,
-  f64 elems (`arrays/basics.vl`, `arrays/f64-elems.vl`).
-  **Size-member design (DECIDED):** `length` is **not** a structural member of `{[i32]:T}`
-  (baking it in broke index-sig subtyping — a literal would carry a `length` a `{[i32]:i32}`
-  param lacks). It's a **contract member accessed with property syntax, dispatched per type to
-  a native lowering** — the *uniform access principle* (Ruby/Scala/Eiffel), the same model as
-  `+`→`i32.add`. Rules: (a) `length` is **read-only** (no JS writable-length truncation —
-  resizing is explicit ops); (b) **property syntax (no parens) is reserved for O(1)** members
-  (`length`/`count`/`capacity`); computing operations (`push`/`map`/`slice`) are **methods**
-  (parens), so a `.length` you see is always cheap; (c) **sparse uses distinct
-  `count`/`capacity`/`extent`, never an overloaded `length`** (avoids Lua's `#`-on-sparse
-  ambiguity — extent ≠ count ≠ capacity). Generalization (later, → B13): a per-built-in
-  intrinsic-members table instead of the hardcoded `length` check; don't build until the 2nd
-  intrinsic (`push` / string `length`) arrives.
-  **Tiers (simplest first):** (1) ✅ **fixed-length arrays** — WasmGC arrays are runtime-*sized*
-  but fixed-length-after-creation; `length` is intrinsic (`array.len`). (2) **growable
-  list/vector** — a struct `{ array backing, i32 len, i32 cap }` where `length` is now a *real
-  stored* field (logical len ≠ capacity), read-only; push/grow reallocates, built on (1). (3)
-  sparse → the map below (`count`/`capacity`), not an array tier.
-- ⬜ **B6a. Maps / non-string keys (`Map<K,V>`, Lua-flavored — distinct type, not every
-  object).** DECIDED vision: support arbitrary keys (numbers, objects, …) as a *separate* hash
-  `Map` type, NOT by making every object a dynamic table — keep three representations under one
-  `[]`/`.field` surface: static-string-key **structs** (compile-time field index, fastest),
-  `i32`-key **arrays** (native, contiguous), arbitrary-key **maps** (hashed, heap). You pay
-  hashing only when you use a `Map` (no JS/Lua "every object is secretly a hashmap" tax), and
-  it stays fully typed. Index signatures (`{[string]: T}`, already type-check but **dropped at
-  codegen** — `objectStruct` keeps only StringLiteral keys) are the type-level precursor →
-  this is their codegen. Dispatches through B13's `"[]"`/`"[]="` traps. Deferred.
-- 🟡 **B7. Strings in codegen.** DONE (core): a string literal lowers to `array.new_fixed` of
-  its code points; `toWasmType(string)` → a WasmGC i32-array (via the index sig, regardless of
-  the nominal `name`); `.length`/`s[i]` ride the array machinery; `+` concatenates inline
-  (`array.new` + two `array.copy`). Works as a value, param (`function f(s: string)`),
-  reassignment, and a `self`-receiver (`"hi".first()`). **`==`/`!=`** done — a lazily-emitted
-  `__string_eq__` helper (length + element compare). **Low-level printing** — `__store_string__(off,
-  s)` copies a GC string's chars as bytes into linear memory (lazy `storeStringFn` helper), and
-  `__log_string__(off, len)` host import renders raw bytes as text (used by `strings/print-and-eq.vl`).
-  **`print(x)` convenience** done: a string streams its code points to the host one at a time
-  (`__print_string__` → `__print_char__`/`__print_str_flush__`, no linear memory — the host can't read
-  a GC array directly). Tests `strings/basics.vl`, `strings/string-method.vl`, `strings/print-and-eq.vl`,
-  `run/print.vl`.
-  REMAINING: **`wasm:js-string` builtins + UTF-16 (`i16`) string representation** — the *conventional*
-  WasmGC↔JS-host story (what dart2wasm/Kotlin-Wasm do): the engine reads the GC array directly via
-  `fromCharCodeArray`, replacing both per-char `print` streaming and any linear-memory copy in one bulk
-  native call. Requires switching the string backing from an i32 code-point array to `(array mut i16)`
-  (touches literals, indexing, `.length`, concat, `==`). Engine support confirmed (V8 14.9 accepts
-  `{builtins:["js-string"]}`). Also: **UTF-8 / i8-packed** representation as a size optimization
-  (current MVP is 4 bytes/char); richer methods (slice, indexOf).
-- 🟡 **B8. Loops.** DONE: **`for…in` over arrays** — the `to`-less `for x in arr` (grammar:
-  the `TO expr` clause is now optional) binds `x` to each element, lowered to a 0..length index
-  loop over `array.get` (iterable evaluated once into a local); a non-array iterable is a clean
-  type error (`loops/for-in.vl`, `loops/for-in-not-array.vl`). DONE: **`for` `step`** —
-  increment uses the actual `step`, and the inclusive exit test is **direction-aware**
-  (`(step>=0 && i>to) || (step<0 && i<to)`, with `to`/`step` evaluated once into locals), so
-  descending loops work too (`loops/for-step.vl`: ascending 0,2,4,6→12; descending 5..1→15).
-  DONE: single-line block bodies (`for … { s = s + i }`) — `block` no longer requires a leading
-  newline after `{`, so `object` (tried first, fails on a non-pair) falls back to `block`;
-  objects still win on key:value contents (`loops/single-line-block.vl`). DONE: a provably-empty
-  literal `for` range **warns** (`5 to 1` → "range is empty and never iterates"; `loops/empty-range.vl`)
-  — the first non-error diagnostic (see B17). REMAINING: `for…in` over objects / maps; the `for
-  val, i in arr` (value + index) and `for , v in obj` destructuring forms (aspirational in
-  `samples/loops.vl`).
-- ✅ **B9. `break` in codegen.** A `break` branches to the loop's outer (`__brk`) block —
-  the same target the loops already used for their exit test — so control resumes after the loop;
-  `break <label>` targets a labelled loop (`brkLabel` centralizes the `cont`→`brk` naming, shared
-  by the loops + the `Break`/`Continue` cases). Verified with `continue` and labelled `break outer`
-  (`loops/break.vl`). Also fixed a pre-existing bug this surfaced: **sequential unlabelled loops
-  collided** — `loopIndex--` undid its own increment, so every auto-named loop became `loop0`
-  (binaryen requires unique IR names); the decrement is removed, so the counter is monotonic.
-- ✅ **B10. Unary / prefix / postfix ops in codegen.** **unary `-`** (grammar prefix at
-  tighter-than-`*`/looser-than-`^` precedence; toAST folds `-<literal>` to a negative literal,
-  else lowers `-x` to a type-matched `0 - x`, reusing `-` codegen — i32 + f64). **`++` / `--`**
-  (prefix returns the new value via `local.tee`; postfix returns the old via `tee` then undo the
-  delta; statement position just mutates; a new `UnaryOperation` AST node, operand must be a
-  variable). **`!`** (logical not → `i32.eqz`; also wired `boolean`→i32 in `wasmType.ts`, which
-  booleans-as-values needed). DECIDED: **only `!`, not `not`** — VL's logical operators are
-  symbolic (`&&`/`||`/`!=`), so the `not` keyword (the lone word-operator) was dropped from the
-  lexer + grammar for one-way consistency. Tests `operators/unary.vl`, `loops/for-step.vl`.
-  Minor gaps: `++`/`--` are i32-only and operate on a `Name` (not `o.x++` / `a[i]++` yet).
-- ✅ **B11. `while true` return analysis.** A `while true` with no `break` escaping it now
-  types as **`Never`** (it never fails its test, and `return` leaves the whole function — so it
-  never falls through to a value), instead of `Nullable<body>`. So a function whose tail is such a
-  loop returns purely via its inner `return`s, with no spurious `… | null` (`isConstTrue` +
-  `hasEscapingBreak`, which respects labels + nested loops). Tests `loops/while-true-return.vl`.
-  Two adjacent codegen gaps this surfaced, also fixed: (a) an un-annotated param used as a numeric
-  operator's **right** operand (`i32 >= n`) unifies to the builtin's `Custom` validator type —
-  `wasmType.ts` now maps a named `Custom` like its numeric; (b) a **generic inferred-return**
-  function whose body ends in `return` compiled to a non-concrete (`unreachable`) result —
-  `instantiate` now records the `return` value's wasm type and uses it as the fallback
-  (`functions/generic-return.vl`, e.g. `function double(n) { return n * 2 }`).
-- ⬜ **B12. `async`/`await`.** Keywords exist in the lexer; no semantics or codegen.
-  Large; likely last.
-- 🟡 **B13. Well-known-symbol dispatch (operator overloading / callable objects / index
-  traps).** Generalize codegen so an operation on a *user* shape calls the typed method named
-  for that operation in the shape's contract, instead of being hardcoded. **DONE (operators):**
-  `toWasm.ts` BinaryOperation now dispatches a structural-object operand through its operator
-  method field — `struct.get` the method closure, `indirectCall` with the right operand, reusing
-  the B5 member-call machinery. A `vec` with a `"*"` / `"/"` field scales by a scalar
-  (`objects/operator-overload.vl`). Also fixed a real bug this needed: **string object keys kept
-  their quotes** (`toObjectLiteral` `getText()` without `.slice(1,-1)`), so a `"+"` key never
-  matched the operator `+` — affected *all* string keys, not just operators.
-  **DONE (object-shaped operands, e.g. `vec + vec`) via self-methods (B13+B14):** grammar now
-  allows an **operator-named function** (`function +(self, b) …`, a `funcName` rule), and toAST
-  routes `a op b` on a user object to `op(a, b)` when a free `self`-function named for the
-  operator is in scope — reusing the FunctionCall path, so it **monomorphizes per call** and
-  sidesteps the stored-closure width wall (`objects/operator-self-method.vl`: `vec + vec` →
-  `{4,6}`, chains, native numeric `+` keeps its inlined path). The *field*-operator form (B13
-  stored closure) still works for primitive operands and coexists (field has no free function →
-  native BinaryOperation dispatch). REMAINING: callable objects (`"()"`) + index traps
-  (`"[]"`/`"[]="`), still to wire.
-  The type system **already** dispatches generically — `_typeFromExpression` BinaryOperation
-  (`typecheck.ts`) finds the left operand's property whose name matches the operator and checks
-  the right operand against its parameter type. Builds on B5 `indirectCall` — static, no runtime
-  `Proxy`. (Also surfaced: **direct recursion doesn't work** — `toFunctionDeclaration` registers
-  the name *after* the body, so `function f() … f() …` is "undeclared f"; forward-register the
-  name before walking the body. Separate gap, tracks near A-track / functions.)
-  - **Operator overloading:** `a + b` (and `- * / %  == < …`) on a user object calls its
-    `"+"` method (typed `(right: T) -> R`). Mixed operands already expressible — the method's
-    parameter type governs the RHS, so `vec + 5` vs `vec + vec` are distinct contracts.
-  - **Callable objects:** an object with a `"()"` method **taking parameters and returning a
-    value** is invokable — `obj(a, b)` dispatches to that method with `[a, b]` (the call
-    operator is overloadable exactly like `+`). Needs (1) grammar/`toAST` to route a call
-    whose callee is a *callable-object*-typed value to a `VLCallNode` instead of erroring
-    (today `toAST.ts` pushes a `function-call` type error for a non-`Function` callee), and
-    (2) the `"()"` well-known name in the operator-lookup path. (Multiple call signatures —
-    true ad-hoc overloading by arity/type — is a later extension.)
-  - **Index traps:** `o[k]` / `o[k] = v` dispatch to `"[]"` / `"[]="` methods when the shape
-    declares them (else the static `struct.get`/`struct.set` field path). This is the
-    "built-in instead of `Proxy`" goal: get/set/apply traps as **typed methods in the
-    contract**, resolved statically. (Note: index *signatures* `{[string]: i32}` type-check
-    today but are **dropped** at codegen — `objectStruct` keeps only StringLiteral keys — so
-    dynamic-key storage is a separate runtime-representation question, likely a map/array
-    backing, distinct from the trap-dispatch above.)
-  Unblocks/over­laps **A7** (a real `string` object type needs exactly this operator-method
-  codegen). Reuses B3 (monomorphization) + B5 (`Call`/`indirectCall`).
-- 🟡 **B14. Methods via explicit `self` receiver + UFCS (no `this`).** **DONE (core):** a free
-  function whose first parameter is named `self` is callable as `o.f(args)` — toAST rewrites it
-  to `f(o, args)`, reusing the FunctionCall machinery, so `self` **monomorphizes to the
-  receiver's shape per call** (rides A13/B3). Verified: `a.add({…})` returns a new shaped object,
-  `p.sumsq()` (`objects/self-method.vl`). Resolution order implemented: a callable **field** wins
-  (container/data, no receiver — `foo.add(…)`); else a free `self`-function (UFCS); else error. A
-  **non-`self`** function is NOT reachable via an instance (`o.plain(2)` → "Unknown property" —
-  no namespace pollution, `objects/self-method-pollution.vl`). `self` is a plain param *name*, no
-  lexer keyword needed. REMAINING: route **operator** dispatch (B13) through self-methods so
-  `vec + vec` works (the method path avoids the stored-closure width wall — `a.add(b)` already
-  does); `c.area` (no `()`) as a bound value; mutation/variance (A9). DECIDED: VL has **no
-  `this` keyword**. A method is a function whose first parameter is the **`self` keyword**
-  (Rust-style); `o.f(a)` is sugar for `f(o, a)` (uniform function call syntax). Rationale: VL
-  already has first-class closures and `o.f()`→`indirectCall`, so this adds **no hidden
-  parameter** and no call-site rebinding (the JS footgun) — the receiver is an ordinary,
-  visible, type-checked param, consistent with "structural, fully typed, no hidden data flow."
-  Methods need no `class`/`shape` site and are open/extensible (any module may add `fn
-  area(self: Circle) …`). Design decisions captured:
-  - **`self` is the explicit, optional method marker.** First param is `self` → the function
-    is a **method**: UFCS binds the receiver, and it's reachable as `o.f()`. No `self` → a
-    **plain function / container field**: NOT reachable through an instance. `self`'s type is
-    annotated (`self: Circle` → method on Circle) or inferred (`self` → *generic* method over
-    any shape the body needs, monomorphized per receiver via B3). This is strictly better than
-    a type-directed "first param happens to accept `o`" rule: it's syntactic, so (1) no
-    namespace **pollution** — a global `println()` has no `self`, so `o.println()` never
-    resolves; (2) **crisp errors** ("expected Circle, got Square", not "no candidate matched");
-    (3) it *is* the method-vs-static split for free (no `self` → associated/`Type.f()` story).
-  - **Resolution of `o.f()`:** a callable **field** `f` on the shape wins → call the field
-    value with the args, **no receiver** (the container/namespace case, e.g. `let foo = { add(a,b)
-    a+b }; foo.add(1,2)` — `foo` is pure data, nothing implicit passed); else a free **function**
-    whose first param is `self` (typed to / inferring `o`'s type) → `f(o, args)`; else `o.f()`
-    is an error. Diagnose field-vs-method collisions.
-  - **Receiver is any expression, incl. literals:** `{x:1,y:2}.add({x:3,y:4})` is `add({x:1,y:2},
-    {x:3,y:4})` — UFCS isn't limited to a `Name`. (Today the member-call only resolves `.f` as a
-    *field*: a free-function `.add` gives "Unknown property `add`" — the UFCS fallback is the work.)
-  - **DECIDED — local function-values also participate (gated by `self`):** UFCS is plain lexical
-    name lookup, so a `let`-bound function with a `self` first param is reachable as `o.f()` too,
-    not just top-level decls. The `self` marker still gates pollution (a local lambda without
-    `self` isn't a method); lexical scope keeps it predictable. (But see B15 — a lambda *value*
-    is monomorphic, so an untyped local method is shape-locked, unlike a top-level decl.)
-  - **Mutation is free, variance is separate:** WasmGC objects are ref-typed, so `self: T`
-    is already a reference and `self.x = …` is a `struct.set`. "May a method mutate its
-    receiver?" is therefore an **A9 (Readable/Writable)** question, not a receiver question.
-  - **`c.area` without `()`:** start as a plain value (resolves only if `area` is a field);
-    optional later sugar = a bound method (a closure `() -> area(c)`), purely additive.
-  - **Container/namespace objects** (your no-`self` field functions) are the motivating case:
-    the function-reference form `{ add: add }` already runs today; what's missing is the B5
-    parser/codegen sugar — **inline function literals as field values** (`{ add: function… }`
-    parses + type-checks but codegen throws `Unhandled FunctionDeclaration`) and **method
-    shorthand** `{ add(a,b) a+b }` (doesn't parse). Both already in B5's remaining list.
-  Reuses B5 (`o.f()` lowering). Pairs with B13 (operator/call/index dispatch) — together they
-  make "methods, operators, call, index" all ordinary typed functions resolved statically.
-- 🟡 **B15. Anonymous / lambda functions (codegen) + the declaration-vs-value distinction.**
-  DONE (typed): a `FunctionDeclaration` in value position lowers to its `closureValue`
-  (`registerFunctionDecl` handles anonymous fns with a synthesized name; `toExpression` has a
-  `FunctionDeclaration` case). Verified: let-bound lambdas called directly, lambdas capturing an
-  enclosing variable, lambdas as higher-order args, and **inline function literals as object
-  fields** (`let foo = { add: function(a,b) a+b }; foo.add(1,2)` — the container/namespace
-  pattern, which also closed B5's inline-function-literal gap). Tests: `functions/lambda.vl`,
-  `objects/inline-method.vl`. REMAINING: **untyped** lambdas (the first-class-polymorphic-value
-  case below — a stored closure has one signature; needs pinning-by-use or boxing) and the
-  **method-shorthand** `{ add(a,b) … }` parser sugar (B5).
-  - **DECIDED — syntax:** **one form, `function(params) body`** (unambiguous, already modeled —
-    just needs codegen). Bare keyword-less `(params) body` is rejected (the classic arrow
-    ambiguity — `(a, b)` reads as a paren/tuple expr until after the `)`; today a hard parse
-    error). In VL an arrow form would be **purely cosmetic** — the usual reason for two forms
-    (JS's lexical `this`) is moot since VL has no `this`, and `function(…)` already captures
-    lexically + has implicit single-expr return. The *only* upside is callback terseness
-    (`map(xs, x => x*2)`). **DEPRIORITIZED:** a `(params) => body` arrow (explicit `=>` as the
-    disambiguator) may be added later purely for that terseness; not now. Prefer non-syntax
-    answers to callback noise first (trailing-closure sugar, UFCS/methods).
-  - **DECIDED — declaration vs value (the important semantic):** a top-level `function f`
-    monomorphizes **per call site** (B3 cloning), so an untyped `function add(self, b) …` is
-    polymorphic across shapes. A `let`-bound lambda is a **closure value** with **one** wasm
-    signature, fixed at creation — there's no per-call-site to specialize. So an *untyped*
-    lambda is the **first-class-polymorphic-value** case: it's monomorphic (pinned by a single
-    use, or annotate it); being usable at multiple shapes needs boxing (see the dictionary/
-    uniform-rep fallback noted under B3). Annotated lambdas are fine (one concrete shape).
-- ⬜ **B16. Redeclaration / overloading policy.** CURRENT (working): **same-scope
-  redeclaration is an error** for `function`, `let`, and `type` (all push a `Redeclaration`
-  diagnostic — `toAST.ts`); **nested shadowing** in a deeper scope is allowed (codegen
-  uniquifies via `name_1` — `toWasm.ts handleFunctionDecl`) and is **verified correct** (a
-  nested same-name `f` shadowing an outer `f` returns the inner one). FUTURE decision: whether
-  to allow **ad-hoc overloading** (same name, multiple signatures by
-  arity/type) — ties into B13's multi-call-signature note; default for now is "no, one binding
-  per name per scope."
-- 🟡 **B17. Diagnostics, in general.** STARTED: diagnostics carry `severity` (`error | warning
-  | info`, `compile.ts`); the `Syntax` `ParseErrors` variant now has an optional `severity`
-  (defaults `error`), so a diagnostic can be a non-fatal **warning** — first consumer is the
-  empty-`for`-range warning (B8), and the test harness gained a `@warning` directive. BUILD OUT
-  (deferred): (1) thread `severity` through *all* `ParseErrors` variants (only `Syntax` carries
-  it today), or move to a dedicated warnings channel; (2) **stable diagnostic codes / categories**
-  (the `code` field is ad-hoc ints/strings) for doc links + suppression; (3) a real **lint pass**
-  — unused variable/param, unreachable code after `return`/`break`, `step 0` (non-progressing
-  loop), shadowing hints, dead branches; (4) **quick-fixes / related-information** for the LSP
-  (Track D); (5) consistent **message style** (currently "Syntax error:" prefixes a lot that
-  isn't syntactic). The empty-range warning is the template: detect statically, emit a `warning`,
-  don't block codegen.
-- ⬜ **B18. Tail-call optimization (low priority).** Recursion works (B-track / `functions/
-  recursion.vl`) but every call — including recursive — is a regular `m.call`, so it **grows the
-  wasm stack**; binaryen does **not** auto-TCO. Deep tail recursion (`sum(100000)`) overflows.
-  Substrate is ready: binaryen 130 has `return_call` / `return_call_indirect` + the `TailCall`
-  feature (well-supported in V8/browsers). To add: detect **tail position** (a call that is the
-  body's tail expression / `return f(…)` / the tail of a tail branch — *not* `n * f(n-1)`, which
-  isn't tail-recursive and can't be helped) and emit `return_call` there. Caveat: precise
-  tail-position analysis is the fiddly part, and without an explicit `become`/tail keyword it's
-  best-effort, not a guarantee. Note many recursions (`fact`, `fib`) aren't tail-recursive
-  anyway. **Deprioritized** — correctness is fine; this is a depth/perf optimization.
-- ✅ **B19. `return` keyword / early returns.** A function body may `return` early (from a
-  branch, from inside a loop) or fall through to a trailing `return`; a bare `return` yields null.
-  Wired end-to-end: grammar `returnStatement` → toAST collects each `return`'s value type into
-  the function's inferred return (no annotation needed) → toWasm emits `m.return`. A body that
-  ends in `return` compiles to an `unreachable`-typed block, and `instantiate` reads the real
-  result type from the resolved return type (not the body). Tests `functions/early-return.vl`
-  (early/loop/fall-through, inferred i32 + string). *(Fixed alongside: `print(f())` dropped its
-  function-call argument in statement position — now evaluated in value position.)*
-- ⬜ **B20. Loops as expressions + `break <value>`.** VL is expression-oriented (`if` is an
-  expression; blocks yield their tail) and the type system *already* types loops as `Nullable<T>`,
-  but the **grammar makes `for`/`while` statements only** (`let x = for …` is a syntax error) and
-  `break` carries no value. Proposal: lift loops into expression position, and let a loop evaluate
-  to its `break` value — or **null** when it completes without one. Fits VL more cleanly than Rust
-  (which restricts break-value to `loop`, since `while`/`for` are `()`): a loop becomes a natural
-  *search* expression — `let found = for x in items { if test(x) { break x } }` → `Nullable<elem>`.
-  Three layers: (1) **grammar** — `for`/`while` as expressions (follow `if`); (2) **types** —
-  collect each loop's break-value types → `Nullable<union>` (a bare `break` + normal completion
-  give the null arm), mirroring the `returnTypes` mechanism functions use; (3) **codegen** — the
-  loop's outer `__brk` block gets a result type, `break v` → `br $brk (v)`, fall-through pushes the
-  null default. **Labels:** `break outer v` targets the outer loop, so break-value collection is a
-  *stack of per-loop collectors* indexed like `loopLabels` (a labelled break pushes into that
-  label's collector); the value-carrying `br` already targets the right block by name. Notes:
-  body's per-iteration tail value is discarded (only break-values + null form the loop value, so
-  today's `Nullable<bodyType>` becomes `Nullable<breakValueUnion>`); `continue` stays value-less; a
-  *provably* infinite loop (`while true { break v }`) could be non-null `T` — but that needs **B11**
-  reachability (independent; Nullable is the safe default until then). Self-contained; sequence as
-  (1)→(2) so each step is testable.
-
-## Track C — CLI (`vl` / `vital` command)
-*New surface. Depends on the existing parse→AST→wasm pipeline being callable outside the
-LSP (today `toWasm` only runs inside `server.ts`).*
-
-- ✅ **C1. Extract a headless `compile(source) → { wasm, diagnostics }`** entry point,
-  decoupled from the LSP. Done — `compiler/compile.ts` is the single source of truth shared
-  by the LSP, `tests/run.ts`, and (future) CLI + browser.
-- 🟡 **C2. `vl run <file>`** — compile + instantiate + execute, wiring the `log` import
-  (host stdout). **DONE (MVP):** `compiler/cli.ts` + `deno task run` runs a file, an inline
-  snippet (`-e "…"`), or stdin — prints diagnostics to stderr, `print`/`log` output to stdout,
-  non-zero exit on errors. The VS Code extension's **Run Current File** command (Ctrl+F5) shells
-  out to it in a terminal (runs the live buffer via a temp file when unsaved). REMAINING: a real
-  `vl`/`vital` binary (C5) rather than `deno task run`.
-- ✅ **C3. `vl build <file> -o out.wasm`** — emit `.wasm` (and optional `.wat`). DONE:
-  `deno task build <file> [-o <out.wasm>] [--wat]` compiles and writes the wasm bytes
-  (default output drops the `.vl` extension → `foo.vl` → `foo.wasm`); on error diagnostics it
-  prints them to stderr and exits non-zero without writing. `--wat` also emits a sibling `.wat`
-  text file via a thin `wasmToWat` (`compile.ts`) that reads the binary back through binaryen and
-  `emitText`s it (`toWasm` only hands out bytes). `cli.ts` now dispatches on a leading subcommand
-  (`run` | `build` | `check`); a missing/unknown word falls back to `run`, so the bare
-  `deno task run <file>` and the VS Code Run-Current-File integration are unchanged. All
-  `Deno`/`process` usage stays in `cli.ts`; the core remains runtime-agnostic.
-- ✅ **C4. `vl check <file>`** — diagnostics only, exit code for CI. DONE: `deno task check <file>`
-  compiles, prints diagnostics to stderr, and exits 1 iff there is an ERROR-severity diagnostic
-  (else 0) — never instantiates or runs the program. A clean CI gate.
-- 🟡 **C5. CLI runtime / distribution — DECIDED: `deno compile`.** Ship `vl` as a single native
-  binary via `deno compile` (bundles V8 + the TS compiler + binaryen.js), distributed through brew
-  (a formula that links the released binary). **Versionless for now** — one install, no toolchain
-  manager (see Track H for the versioning model if/when multiple releases warrant it). This is the
-  near-term distribution (M1); the wasm-native, Deno-free end-state is Track H (M2). REMAINING:
-  the `deno compile` build + release pipeline + brew formula; verify binaryen.js loads correctly
-  inside a compiled binary.
+- ✅ **B0. Numeric literals, i32/f64 arithmetic, if/while, direct calls, start fn, memory builtins.**
+- ✅ **B1. Allocation strategy = WasmGC** (binaryen 116→130 for the GC API). → `DECISIONS.md`.
+- 🟡 **B2. Numeric codegen.** Done: i64 & f32 arithmetic + float `/` & comparisons; i64/f32 type
+  mappings; range-aware integer-literal defaults. REMAINING: explicit value casting/coercion between
+  numeric types (today only literals coerce).
+- ✅ **B3. First-class functions / indirect calls + per-shape monomorphization.** A function value is
+  a fat-pointer closure `{ tableIndex, env }`; each call site instantiates a fresh signature, keyed in
+  codegen by wasm param signature. (See `vl-monomorphization` memo; folds into A10.)
+- ✅ **B4. Closures** (the first WasmGC codegen) — nested decls, capture analysis, env struct,
+  escaping closures. REMAINING: mutable captures (boxing / a mutable env cell).
+- 🟡 **B5. Objects.** Done on WasmGC structs — literals, read/write, nested, f64 fields, args/returns,
+  reassignment, captured-in-closures, excess-property width subtyping, function-valued fields +
+  member-call. REMAINING: methods via `self`+UFCS (B14); method-shorthand `{ add(a,b) … }` (parser);
+  typed literals in object values (`{n: 4<i64>}`); Exact-by-default for values (A8).
+- 🟡 **B6. Arrays** (WasmGC). MVP done: fixed-length arrays — literal/`a[i]`/`a[i]=v`/`a.length`,
+  bounds-trap. Size-member design DECIDED (→ `DECISIONS.md`). REMAINING: growable list/vector
+  (`{ array, len, cap }`, tier 2).
+- ⬜ **B6a. Maps / non-string keys** (`Map<K,V>` — a separate hash type, not every-object-as-table; →
+  `DECISIONS.md`). Index sigs `{[string]: T}` type-check but are dropped at codegen — this is their
+  codegen, via B13's `"[]"`/`"[]="` traps. Deferred.
+- 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
+  `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
+  (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.
+- 🟡 **B8. Loops.** Done: `for…in` over arrays, direction-aware `step`, single-line block bodies,
+  empty-range warning. REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
+  destructuring forms.
+- ✅ **B9. `break` / `continue` in codegen** (incl. labelled `break outer`).
+- ✅ **B10. Unary / prefix / postfix ops** (`-`, `++`/`--`, `!`; → `DECISIONS.md` for `!`-not-`not`).
+  Minor gaps: `++`/`--` are i32-only and operate on a `Name` (not `o.x++` / `a[i]++`).
+- ✅ **B11. `while true` return analysis** — a non-escaping `while true` types as `Never`, so a
+  function tail'd by one returns via its inner `return`s with no spurious `| null`.
+- ⬜ **B12. `async`/`await`.** Keywords lexed; no semantics/codegen. Large; likely last.
+- 🟡 **B13. Well-known-symbol dispatch (operator / call / index).** Done: operator overloading — a
+  user-shape operand dispatches through its operator method (stored-closure field *or*, for object-
+  shaped operands like `vec + vec`, a free `self`-named operator function that monomorphizes per call).
+  (→ `DECISIONS.md`.) REMAINING: callable objects (`"()"`) + index traps (`"[]"`/`"[]="`).
+- 🟡 **B14. Methods via explicit `self` + UFCS (no `this`).** Done (core): a free `self`-first
+  function is callable as `o.f(args)` (rewrites to `f(o, args)`, monomorphized per receiver);
+  resolution order field-then-self-fn; non-`self` functions aren't instance-reachable. (Full decision
+  set → `DECISIONS.md`.) REMAINING: route operator dispatch (B13) through self-methods; `c.area`
+  (no `()`) as a bound value; mutation/variance (A9).
+- 🟡 **B15. Lambdas + the declaration-vs-value distinction.** Done (typed): a `FunctionDeclaration` in
+  value position lowers to its closure value (let-bound, capturing, higher-order, inline object
+  fields). (Syntax + decl-vs-value decisions → `DECISIONS.md`.) REMAINING: **untyped** lambdas (a
+  stored closure has one signature — needs pinning-by-use or boxing); method-shorthand parser sugar.
+- ⬜ **B16. Redeclaration / overloading.** Current: same-scope redeclaration errors; nested shadowing
+  is allowed (uniquified in codegen). Future: ad-hoc overloading? Default "no, one binding per name
+  per scope" (→ `DECISIONS.md`).
+- 🟡 **B17. Diagnostics.** Started: `severity` (error/warning/info), a `@warning` test directive, the
+  empty-range warning. BUILD OUT: thread `severity` through all error variants; stable diagnostic
+  codes; a real lint pass (unused vars, unreachable code, dead branches, `step 0`); LSP quick-fixes;
+  consistent message style.
+- ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
+  position and emit it. Deprioritized — correctness is fine; this is a depth/perf optimization.
+- ✅ **B19. `return` / early returns** (early, from loops, fall-through; a bare `return` yields null).
+- ⬜ **B20. Loops as expressions + `break <value>`.** Lift `for`/`while` into expression position; a
+  loop evaluates to its `break` value or `null` (a natural *search* expression — `let found = for x
+  in xs { if test(x) { break x } }` → `Nullable<elem>`). Three layers: grammar → types (mirror the
+  `returnTypes` mechanism) → codegen (`__brk` block gets a result type). Labels need a per-loop
+  break-value collector stack.
 
 ---
 
-## Track D — LSP / editor experience (`server.ts`)
-*Mostly independent; benefits from Track A.*
+## Track C — CLI (`vl` / `vital`)
 
-- ✅ **D0. Diagnostics** (parse + type errors) on change.
-- ⬜ **D1. Hover types.** `stringifyType` already exists — surface it on hover.
-- ⬜ **D2. Go-to-definition / find-references** (needs symbol→source-range tracking;
-  AST nodes currently drop most ctx).
+- ✅ **C1. Headless `compile(source) → { ast, wasm, diagnostics }`** (`compiler/compile.ts`), shared
+  by the LSP, the test runner, and the CLI.
+- ✅ **C2. `vl run`** — compile + run a file / `-e` snippet / stdin (`deno task run`). Drives the VS
+  Code Run-Current-File command.
+- ✅ **C3. `vl build <file> [-o out.wasm] [--wat]`** — emit wasm bytes (and optional `.wat`).
+- ✅ **C4. `vl check <file>`** — diagnostics only, non-zero exit on errors (CI gate).
+- 🟡 **C5. Distribution — DECIDED: `deno compile`** single binary via brew, versionless for now (→
+  `DECISIONS.md`; the wasm-native end-state is Track H). REMAINING: the build/release pipeline + brew
+  formula; verify binaryen.js loads inside a compiled binary.
+
+---
+
+## Track D — LSP / editor experience (`lsp/src/server.ts`)
+*Mostly independent; benefits from Track A. AST nodes now carry source spans (Track G), unblocking
+D1/D2.*
+
+- ✅ **D0. Diagnostics on change.**
+- ⬜ **D1. Hover types** (`stringifyType` exists; map a cursor to a symbol/expression via the new spans).
+- ⬜ **D2. Go-to-definition / find-references** (needs symbol→span tracking — spans now exist).
 - ⬜ **D3. Autocomplete** (scope-aware; structural members).
-- ⬜ **D4. Formatter** (+ `vl fmt` in the CLI).
-- ⬜ **D5. Semantic tokens** (richer than the TextMate `syntaxes/vital.tmLanguage.json`).
+- ⬜ **D4. Formatter** (+ `vl fmt`).
+- ⬜ **D5. Semantic tokens.**
 - ⬜ **D6. Inlay hints** for inferred types — *the* feature for a "types are hidden" language.
 
 ---
 
 ## Track E — Browser playground + sandbox
-*Depends on C1 (headless compile). The compiler is pure TS + Binaryen (WASM), so it can
-run client-side.*
+*Depends on C1. The compiler is pure TS + binaryen (wasm), so it runs client-side.*
 
-- ⬜ **E1. Bundle the compiler for the browser** (esbuild target browser; Binaryen runs in
-  wasm already).
-- ⬜ **E2. Playground UI** — editor (Monaco) + output pane. Reuse the LSP via
-  `monaco-languageclient` or run diagnostics inline.
-- ⬜ **E3. Sandboxed execution.** Run compiled user wasm in a **Web Worker** with a fresh
-  `WebAssembly.Memory`, no host imports except a controlled `log`; enforce limits
-  (memory cap, timeout, no network/DOM). The wasm sandbox + worker isolation is the
-  security boundary.
+- ⬜ **E1. Bundle the compiler for the browser** (esbuild browser target).
+- ⬜ **E2. Playground UI** — Monaco editor + output pane.
+- ⬜ **E3. Sandboxed execution** — compiled user wasm in a Web Worker, fresh `Memory`, controlled
+  `log` only, enforced limits. The wasm sandbox + worker isolation is the security boundary.
 - ⬜ **E4. Shareable links** (encode source in URL / gist).
-
----
-
-## Track G — Replace antlr4 with a hand-written parser ✅ DONE
-*Goal: drop the antlr4 dependency. Independent; safe to do incrementally because
-the `.vl` test corpus is parser-agnostic and `compile()` isolates the parser.*
-**DONE (G1–G4):** a hand-written TS lexer + recursive-descent/Pratt parser emits the typed AST
-directly; antlr4, the gradle project, the generated dirs, and the `gen` task are gone. AST/diagnostic
-nodes now carry real source spans (`Context = { start, stop }` in `ast.ts`) — the groundwork D1/D2
-(hover, go-to-def) needed. This was the parser-side bootstrap gate (Track H / H1).*
-
-Why drop it:
-- **Heavyweight non-JS build step.** Regenerating the parser (`deno task gen`)
-  needs Java + Gradle + the antlr4 gradle plugin — bolted onto a Deno/TS project.
-  Every new syntax feature (e.g. the `is` operator) requires a regen.
-- **Large committed generated code that drifts.** `VL_Parser.ts`/`VL_Lexer.ts`
-  are committed in two places and copied around; they've already drifted (the
-  dead interpreter test, a stray `override` type error in the generated parser).
-- **Awkward CST→AST layer.** Half of `toAST.ts` is spelunking the untyped parse
-  tree (`ctx.expr(0)`, `ctx.LBRACK()`, null-checks). Precedence is encoded as
-  ordered `expr` alternatives; newline handling is `NEWLINE*` sprinkled everywhere.
-- **Bootstrap blocker.** A Java-toolchain-generated parser can never be part of a
-  self-hosted VL compiler. A hand-written one is a stepping stone toward it.
-
-- ✅ **G1. Hand-written lexer** (TS, clean significant-newline handling).
-- ✅ **G2. Recursive-descent statements + Pratt expressions**, emitting the typed AST directly
-  (the CST→AST spelunking is gone; the type-checking half of `toAST.ts` stays).
-- ✅ **G3. `.g4` kept as the human-readable grammar spec.**
-- ✅ **G4. antlr4 deps, gradle project, generated dirs, and the `gen` task deleted.** The `.vl`
-  corpus validated behavior across the swap.
-- Alternatives considered: a pure-JS PEG generator (peggy) drops Java but keeps a
-  generic tree + a dep; parser combinators similar. Hand-written wins on errors
-  and bootstrappability for a grammar this small.
 
 ---
 
 ## Track F — Infrastructure & hygiene
 *Independent; do continuously.*
 
-- ✅ **F1. Test harness for the wasm path.** `deno task test` runs `tests/run.ts` over a
-  black-box `.vl` corpus with `// @directive` expectations. (`reference/ts-interpreter`
-  was the only prior test; excluded via `deno.json`.)
-- ⬜ **F2. Strip / gate debug `console.log`s** in `toWasm.ts` (getFunction, "???",
-  emitText dumps) behind a debug flag.
-- ✅ **F3. Retired `ts-interpreter/` → `reference/ts-interpreter/`** (stale tree-walking
-  backend; kept for reference, excluded from tests/lint).
-- ⬜ **F4. Re-enable inline `m.validate()`** during dev (currently only the final validate
-  runs) for earlier failure.
-- ⬜ **F5. Settle the name** (VL vs Vital vs Vital Language) and apply consistently.
-- ⬜ **F6. Document grammar regen** (`deno task gen`, needs gradle + the antlr4 project)
-  and the build (`deno task build`).
+- ✅ **F1. Test harness** (`deno task test` over the `.vl` corpus with `// @directive` expectations).
+- ⬜ **F2. Gate debug `console.log`s** in `toWasm.ts` behind a debug flag.
+- ✅ **F3. Retired `ts-interpreter/` → `reference/`.**
+- ⬜ **F4. Re-enable inline `m.validate()`** during dev for earlier failure.
+- ⬜ **F5. Settle the name** (VL vs Vital) and apply consistently.
+- ⬜ **F6. Document the build** (`deno task build`/`test`; the antlr/gradle gen step is gone).
 - ⬜ **F7. Fix the `paramater` misspelling** project-wide (optional; currently consistent).
-- ✅ **F8. Dropped `patches/binaryen+116.0.0.patch` + `patch-package`.** The LSP server
-  now builds as **ESM** (`dist/server.mjs`, `--format=esm`); the client stays CJS
-  (`dist/extension.js`). binaryen's top-level await is legal in ESM, so no patch is
-  needed. Cleared all 9 `npm audit` advisories (77→13 packages). Verified headlessly:
-  esbuild-bundled unpatched binaryen compiles + runs a VL program under Node. **Still to
-  confirm in VS Code (F5):** vscode-languageclient forking an ESM server over IPC.
+- ✅ **F8. Dropped the binaryen patch + `patch-package`** (LSP server is ESM, where binaryen's TLA is
+  legal). REMAINING (F5-adjacent): confirm vscode-languageclient forking the ESM server in VS Code.
+
+---
+
+## Track G — Hand-written parser ✅ DONE
+Replaced antlr4 with a hand-written TS lexer + recursive-descent/Pratt parser that emits the typed
+AST directly. antlr4, the gradle project, the generated dirs, and the `gen` task are gone; AST nodes
+now carry source spans (`Context = { start, stop }`). This was the parser-side bootstrap gate (H1). →
+`DECISIONS.md` for the hand-written-over-generator choice.
 
 ---
 
 ## Track H — Self-hosting & distribution (the bootstrap end-state)
-*The eventual goal: VL compiles itself, and the TypeScript/Deno host — the Deno runtime, the TS
-compiler core (`compiler/*.ts`), and (already gone) the antlr4/Java generator — is retired. The
-compiler becomes VL source compiled to WASM, run on a generic WASM runtime. Every other track
-feeds this; the `.vl` corpus (A12) is the host-agnostic correctness oracle — the same tests must
-pass whether the compiler is the TS one or the VL one.*
+*The goal: VL compiles itself; the TypeScript/Deno host (Deno, the TS compiler core, the already-gone
+antlr/Java generator) retires; the compiler becomes VL→wasm on a generic wasm runtime. The `.vl`
+corpus (A12) is the host-agnostic oracle — the same tests pass whichever compiler runs them.
+**Distribution does NOT require self-hosting** (the two timelines below are independent).*
 
-**Two distinct timelines — distribution does NOT require self-hosting:**
+- 🟡 **H-M1. Distribute now via `deno compile` (= C5).** A native `vl` binary (V8 + TS compiler +
+  binaryen.js) via brew, versionless. Decoupled from everything below; today's compiler unchanged.
+  Trade-off: chunky and Deno-under-the-hood.
+- ✅ **H1. Parser self-hostable (= Track G).** The one piece that categorically can't live in a
+  VL-in-VL compiler is gone.
+- ⬜ **H2. Make VL expressive enough to write a compiler.** Recursive tree types (**A11 ✅**), generic
+  collections (**A10**, **B6 tier-2** lists, **B6a** maps), string munging (**A7** methods). A10 +
+  collections are the remaining gap — the capability bar for the port.
+- ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
+  running the corpus through the VL-written compiler. Incremental; TS and VL compilers cross-checked.
+- ⬜ **H4. WASM emission — DECIDED: emit bytes directly + optional `wasm-opt`** (binaryen's npm build
+  is JS-bound; → `DECISIONS.md`, incl. the Heap2Local caveat). binaryen stays for the TS compiler.
+- ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime (wasmtime —
+  full WasmGC since v27 / Wasm 3.0) + a small host shim that runs *both* the compiler-wasm and
+  user-program-wasm. No V8, no binaryen, no Deno.
+- ⬜ **H5. Versioning — deferred; rustup/Volta model, not nvm** (→ `DECISIONS.md`). Make the H-M1
+  install path version-stamped so a launcher can slot in later.
 
-- 🟡 **H-M1. Distribute now via `deno compile` (= C5).** A single native `vl` binary bundling
-  V8 + the current TS compiler + binaryen.js, shipped through brew. **Versionless for now** (one
-  install, no toolchain manager). Decoupled from everything below — gives the brew-installable
-  binary immediately, with today's compiler unchanged. (Execution today is V8's `WebAssembly` via
-  Deno; the compiled binary keeps that.) Trade-off: chunky (~V8-sized) and Deno-under-the-hood.
-- ⬜ **H1. Parser self-hostable — DONE (= Track G).** The antlr/Java generator was the one piece
-  that categorically can't live in a VL-in-VL compiler; it's gone.
-- ⬜ **H2. Make VL expressive enough to write a compiler.** A compiler is recursive tree types
-  (AST — **A11 ✅**), generic collections (symbol tables, the tag/scope registries — **A10**,
-  **B6 tier-2** lists, **B6a** maps), and string munging (lexing — **A7** methods). This is the
-  capability bar for the port; A10/collections are the remaining gap.
-- ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl` source,
-  validated by running the existing `.vl` corpus through the VL-written compiler (same oracle, new
-  implementation). Incremental — TS and VL compilers cross-checked stage by stage.
-- ⬜ **H4. WASM emission — DECIDED: emit bytes directly, `wasm-opt` as an optional external pass.**
-  binaryen's npm build is JS-bound (an Emscripten wasm module that imports JS glue — *not* a
-  standalone WASI module), so embedding it in a wasm-runtime-hosted compiler is the highest-friction
-  path. Instead, the self-hosted `toWasm` **emits the wasm binary encoding directly** (mechanical,
-  no dependency); optimization is an optional external `wasm-opt` (native CLI) pass. **Caveat:** VL
-  leans on binaryen's **Heap2Local** to scalarize the union value-kind box (see
-  `vl-gc-escape-analysis`) — emitting raw wasm means those boxes stay heap-allocated until
-  `wasm-opt` runs (or VL grows its own escape analysis). So "produce correct wasm" (in VL,
-  dependency-free) decouples from "optimize it" (external) — the right separation. (binaryen stays
-  for the TS compiler / H-M1; it's only retired from the *self-hosted* path.)
-- ⬜ **H-M2. Wasm-native distribution (the end-state).** Once self-hosted, the `vl` binary becomes
-  a WASM runtime (**wasmtime** — full WasmGC since v27 / Wasm 3.0, which VL requires) + a small host
-  shim. That one runtime executes *both* the compiler-wasm and user-program-wasm — the "one runtime
-  for compiler + interpreter" symmetry — with no V8, no binaryen, no Deno.
-- ⬜ **H5. Versioning — deferred; if/when needed, rustup/Volta model, NOT nvm.** Versionless for
-  now (H-M1). When multiple releases warrant a manager, a thin `vl` launcher resolves a *project
-  pin* (`.vl-version`) and dispatches to / auto-installs the right toolchain (`~/.vl/versions/X.Y.Z`)
-  — transparent, CI-reproducible. Avoid the nvm-style manual-`use`/shim footgun. Make the H-M1
-  install path version-stamped so the launcher can slot in later without rework.
-
-**Sequence:** H-M1 (now, decoupled) → H2 capabilities (A10 + collections remain) → H3 port → H-M2
-host swap. The cost is dominated by H2/H3 (language depth + the port); H1 is done, H4 is decided.
+**Sequence:** H-M1 (now) → H2 (A10 + collections) → H3 port → H-M2 host swap. Cost is dominated by
+H2/H3; H1 done, H4 decided.
 
 ---
 
-## Suggested first moves (highest leverage, lowest risk, mostly independent)
-1. ✅ **C1** — headless `compile()`. Done: unblocked the CLI, the browser, *and* the
-   `tests/run.ts` corpus.
-2. **B3** — finish indirect calls (in flight) to unblock closures (B4).
-3. **A6 + A5** — `is` operator + flow narrowing. The set-theoretic payoff for a fully-typed
-   language: structural guards that refine types along control flow (needs A3/A4 first).
+## Next (highest leverage)
+
+- **A10 generics + collections (B6 tier-2 lists, B6a maps)** — the H2 capability bar, and the gate on
+  self-hosting (H3). The deepest remaining type-system work.
+- **C5 / H-M1** — `deno compile` + brew. Small, decoupled, ships the distribution story now.
+- **D1/D2** — hover + go-to-def, now that AST nodes carry source spans.
+- Smaller/independent: B6 growable lists, B13 callable-objects/index-traps, B17 lint pass, A6b Stage A.
