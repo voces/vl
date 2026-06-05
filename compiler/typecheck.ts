@@ -446,6 +446,9 @@ export const _softenImplicitType = (type: VLType): VLType => {
     const subTypes: VLType[] = [softenedSubTypes[0]];
     outer: for (let i = 1; i < softenedSubTypes.length; i++) {
       for (let n = 0; n < subTypes.length; n++) {
+        // Distinct scalars (`i32` vs `f64`) are separate union variants — the
+        // one-directional numeric coercion must not collapse them.
+        if (distinctScalars(subTypes[n], softenedSubTypes[i])) continue;
         if (validateType(subTypes[n], softenedSubTypes[i])) continue outer;
         if (validateType(softenedSubTypes[i], subTypes[n])) {
           subTypes.splice(n, 1, softenedSubTypes[i]);
@@ -569,6 +572,26 @@ export const _flattenType = (type: VLType): VLType[] => {
   return [type];
 };
 
+// The builtin scalar name a type resolves to (`i32`/`f64`/`boolean`/…), or
+// undefined for a non-scalar.
+const SCALARS = ["i32", "i64", "f32", "f64", "boolean"];
+const scalarName = (type: VLType): string | undefined => {
+  let t = softenImplicitType(type);
+  while (t.type === "Infer") t = softenImplicitType(t.subType);
+  const n = (t.type === "Object" || t.type === "Alias" || t.type === "Custom")
+    ? t.name
+    : undefined;
+  return n && SCALARS.includes(n) ? n : undefined;
+};
+// Two *different* builtin scalars (`i32` vs `f64`). Numeric coercion makes one
+// assignable to a wider one (`i32` ⊑ `f64`), but in a union they are distinct
+// runtime variants — they must not collapse into each other.
+const distinctScalars = (a: VLType, b: VLType): boolean => {
+  const na = scalarName(a);
+  const nb = scalarName(b);
+  return na !== undefined && nb !== undefined && na !== nb;
+};
+
 export const flattenType = (type: VLType): VLType => {
   const flattened = _flattenType(type);
   if (flattened.length === 1 && flattened[0] === type) return type;
@@ -576,6 +599,8 @@ export const flattenType = (type: VLType): VLType => {
   const deduped: VLType[] = [flattened[0]];
   outer: for (let i = 1; i < flattened.length; i++) {
     for (let n = 0; n < deduped.length; n++) {
+      // Distinct scalars never subsume one another — keep both as variants.
+      if (distinctScalars(deduped[n], flattened[i])) continue;
       if (validateType(deduped[n], flattened[i])) continue outer;
       if (validateType(flattened[i], deduped[n])) {
         deduped.splice(n, 1, flattened[i]);
