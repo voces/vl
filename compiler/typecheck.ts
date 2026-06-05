@@ -109,6 +109,14 @@ export const _typeFromExpression = (
           ? { type: "Alias", name: "boolean" }
           : leftType;
       }
+      // Function values compare by reference: `f == g` / `f != g` -> boolean.
+      if (leftType.type === "Function") {
+        if (op === "==" || op === "!=") {
+          ensureType(leftType, rightType, ctx);
+          return { type: "Alias", name: "boolean" };
+        }
+        return missingOpFunc("left-not-object");
+      }
       if (leftType.type !== "Object") return missingOpFunc("left-not-object");
       const opFunc = leftType.properties.find((p) =>
         validateType(p.name, { type: "StringLiteral", value: op })

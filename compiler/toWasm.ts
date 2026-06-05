@@ -390,6 +390,24 @@ export const toWasm = async (ast: VLProgramNode) => {
     return name;
   };
 
+  // Reference equality of two function values (fat-pointer closures): same
+  // function (table index) AND same captured environment (`ref.eq`). Each operand
+  // is a thunk re-read per use (binaryen wants trees, not shared refs).
+  const closureRefEq = (
+    aClo: () => number,
+    bClo: () => number,
+  ): number =>
+    m.i32.and(
+      m.i32.eq(
+        m.struct.get(0, aClo(), binaryen.i32, false),
+        m.struct.get(0, bClo(), binaryen.i32, false),
+      ),
+      m.ref.eq(
+        m.struct.get(1, aClo(), binaryen.structref, false),
+        m.struct.get(1, bClo(), binaryen.structref, false),
+      ),
+    );
+
   // Per-shape structural equality: `__eq_<n>__(a, b)` returns 1 iff every field
   // of the two structs is equal (native for numerics, `__string_eq__` for
   // strings, a recursive call for nested structs). The type checker guarantees
@@ -415,24 +433,12 @@ export const toWasm = async (ast: VLProgramNode) => {
       } else if (ft.type === "Object" && ft.name === "string") {
         fieldEq = m.call(stringEqFn(), [aGet, bGet], binaryen.i32);
       } else if (ft.type === "Function") {
-        // A function value is a fat-pointer closure `{i32 tableIndex, structref
-        // env}`, freshly allocated — so compare by *reference*: same function
-        // (table index) AND same captured environment (`ref.eq` on env). Re-read
-        // the field per use (no shared expression refs — binaryen wants trees).
+        // A function value is a fat-pointer closure, freshly allocated — compare
+        // by reference (same function + same captured env), re-reading the field.
         const clo = closureStruct().refType;
-        const aClo = () =>
-          m.struct.get(field.index, m.local.get(0, ref), clo, false);
-        const bClo = () =>
-          m.struct.get(field.index, m.local.get(1, ref), clo, false);
-        fieldEq = m.i32.and(
-          m.i32.eq(
-            m.struct.get(0, aClo(), binaryen.i32, false),
-            m.struct.get(0, bClo(), binaryen.i32, false),
-          ),
-          m.ref.eq(
-            m.struct.get(1, aClo(), binaryen.structref, false),
-            m.struct.get(1, bClo(), binaryen.structref, false),
-          ),
+        fieldEq = closureRefEq(
+          () => m.struct.get(field.index, m.local.get(0, ref), clo, false),
+          () => m.struct.get(field.index, m.local.get(1, ref), clo, false),
         );
       } else if (
         ft.type === "Object" && ft.name === undefined && !arrayElementType(ft)
@@ -1161,6 +1167,21 @@ export const toWasm = async (ast: VLProgramNode) => {
           }
         }
 
+        // Function values compare by reference (same function + same env).
+        if (leftType.type === "Function" && (op === "==" || op === "!=")) {
+          const clo = closureStruct().refType;
+          const aLocal = newLocal(clo);
+          const bLocal = newLocal(clo);
+          const eq = closureRefEq(
+            () => m.local.get(aLocal, clo),
+            () => m.local.get(bLocal, clo),
+          );
+          return m.block(null, [
+            m.local.set(aLocal, toExpression(node.left)),
+            m.local.set(bLocal, toExpression(node.right)),
+            op === "==" ? eq : m.i32.eqz(eq),
+          ], binaryen.i32);
+        }
         // String operators (strings are WasmGC i32-arrays of char codes):
         // `==`/`!=` element-compare via the `__string_eq__` helper; `+`
         // concatenates (allocate an i32-array of len(a)+len(b) and copy in).
