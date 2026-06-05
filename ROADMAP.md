@@ -239,12 +239,15 @@ stays tolerant of both binaryen forms (sync object / async init).*
   (`objects/operator-overload.vl`). Also fixed a real bug this needed: **string object keys kept
   their quotes** (`toObjectLiteral` `getText()` without `.slice(1,-1)`), so a `"+"` key never
   matched the operator `+` — affected *all* string keys, not just operators.
-  **LIMITATION (object-shaped operands, e.g. `vec + vec`):** the operator method is a *stored
-  closure* compiled once with its param at the inferred shape (`o: {x,y}`), while the argument is
-  the full `{+,x,y}` struct — the WasmGC width-subtyping mismatch (+ a `Custom`-validator leak in
-  the inferred operand) from B6a/A13. Needs **A13** (operator-constraint inference) and/or
-  per-call monomorphization (B14) / recursive types (A11). Primitive operands work now.
-  REMAINING: callable objects (`"()"`) + index traps (`"[]"`/`"[]="`), still to wire.
+  **DONE (object-shaped operands, e.g. `vec + vec`) via self-methods (B13+B14):** grammar now
+  allows an **operator-named function** (`function +(self, b) …`, a `funcName` rule), and toAST
+  routes `a op b` on a user object to `op(a, b)` when a free `self`-function named for the
+  operator is in scope — reusing the FunctionCall path, so it **monomorphizes per call** and
+  sidesteps the stored-closure width wall (`objects/operator-self-method.vl`: `vec + vec` →
+  `{4,6}`, chains, native numeric `+` keeps its inlined path). The *field*-operator form (B13
+  stored closure) still works for primitive operands and coexists (field has no free function →
+  native BinaryOperation dispatch). REMAINING: callable objects (`"()"`) + index traps
+  (`"[]"`/`"[]="`), still to wire.
   The type system **already** dispatches generically — `_typeFromExpression` BinaryOperation
   (`typecheck.ts`) finds the left operand's property whose name matches the operator and checks
   the right operand against its parameter type. Builds on B5 `indirectCall` — static, no runtime

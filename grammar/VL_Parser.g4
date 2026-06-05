@@ -21,7 +21,16 @@ statement
     ;
 
 functionDecl
-    : FUNCTION ID? LPAREN params? RPAREN (COLON NEWLINE* type)? NEWLINE* statement
+    : FUNCTION funcName? LPAREN params? RPAREN (COLON NEWLINE* type)? NEWLINE* statement
+    ;
+
+// A function may be named by an identifier or an operator symbol, so a `self`
+// method can implement an operator: `function +(self, b) …` (dispatched by `a + b`).
+funcName
+    : ID
+    | PLUS | MINUS | STAR | DIV | MOD | CARET
+    | GREATER_THAN | GREATER_THAN_OR_EQUAL_TO | LESS_THAN | LESS_THAN_OR_EQUAL_TO
+    | EQUAL_TO | NOT_EQUAL_TO
     ;
 
 varDecl

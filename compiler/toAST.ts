@@ -209,7 +209,8 @@ const toType = (ctx: TypeContext): VLType => {
  */
 const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
   const parameters = ctx.params()?.param_list().map(toParameter) ?? [];
-  const name = ctx.ID()?.getText();
+  // The name may be an identifier or an operator symbol (`function +(self, b)`).
+  const name = ctx.funcName()?.getText();
   const returnTypeExpr = ctx.type_();
   const annotatedReturn: VLType | undefined = returnTypeExpr
     ? toType(returnTypeExpr)
@@ -229,7 +230,7 @@ const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
   let registered = false;
   if (name) {
     if (name in enclosing) {
-      errors.push({ type: "Redeclaration", name, ctx: ctx.ID()!, code: 2 });
+      errors.push({ type: "Redeclaration", name, ctx: ctx.funcName()!, code: 2 });
     } else {
       enclosing[name] = selfType;
       registered = true;
@@ -626,12 +627,58 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       const left = toExpression(leftCtx);
       const rightCtx = ctx.expr(1);
       const right = toExpression(rightCtx);
+      const operator = op.getText();
+
+      // Operator as a `self`-method: when the left operand is a user object and a
+      // free `self`-function named for the operator is in scope, dispatch `a op b`
+      // as `op(a, b)` — reusing the FunctionCall path, so it monomorphizes per
+      // call (this is what makes `vec + vec` work, where a stored-closure operator
+      // field would hit the WasmGC width wall). Numeric/builtin operators (left is
+      // a named object like i32) keep their native BinaryOperation path.
+      let leftT = typeFromExpression(left, leftCtx);
+      if (leftT.type === "Infer") leftT = leftT.subType;
+      if (leftT.type === "Object" && leftT.name === undefined) {
+        let fn: VLType | undefined;
+        for (let i = scopes.length - 1; i >= 0; i--) {
+          if (operator in scopes[i]) {
+            fn = scopes[i][operator];
+            break;
+          }
+        }
+        if (fn?.type === "Function" && fn.paramaters[0]?.name === "self") {
+          const leftArg: VLArgumentNode = {
+            type: "Argument",
+            name: undefined,
+            value: left,
+            context: leftCtx,
+          };
+          const rightArg: VLArgumentNode = {
+            type: "Argument",
+            name: undefined,
+            value: right,
+            context: rightCtx,
+          };
+          Object.defineProperty(leftArg, "context", { enumerable: false });
+          Object.defineProperty(rightArg, "context", { enumerable: false });
+          const allArgs = [leftArg, rightArg];
+          return {
+            type: "FunctionCall",
+            function: operator,
+            arguments: allArgs,
+            functionType: instantiateFunctionType(
+              fn,
+              allArgs,
+              ctx,
+            ) as VLFunctionType,
+          } satisfies VLFunctionCallNode;
+        }
+      }
 
       const expr: VLBinaryOperationNode = {
         type: "BinaryOperation",
         left,
         right,
-        operator: op.getText(),
+        operator,
       };
 
       // This asserts binary operations
