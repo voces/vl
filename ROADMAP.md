@@ -48,16 +48,33 @@ closures / `is` / variance designs referenced here.
   (`if x == null { return } /* x non-null below */`) narrows `x` for the rest of the block — the
   idiomatic null-handling pattern. `divergesStatement` (return/break/continue, a block ending in
   one, an `if` with all branches diverging, a divergent `while true`) + `postGuardNarrowing`,
-  applied by both passes when walking a block's statements. Tests `types/nullable.vl`,
-  `types/guard-narrowing.vl`. REMAINING (needs A3/A4 for the general case): narrowing **union**
-  members (not just null), `&&`-chained guards (`if x != null && x.y …`), and `case`/multi-guard.
-- 🟡 **A6. `is` operator.** **DONE (stage 1):** grammar `expr IS type` (`x is T`), a `VLIsNode`,
-  typed boolean, feeds A5 narrowing. Runtime test is `ref.is_null` (for a `T | null`, `is null` vs
-  `is T` are the only variants); `==`/`!=` against `null` are the natural sugar (also
-  `ref.is_null`). Nullable **reference** types only so far: `T | null` for a struct/array/string/
-  closure is a WasmGC nullable ref (`ref null $t`), `null` is `ref.null` (heap type from context).
-  Tests `types/nullable.vl`. REMAINING — **stage 2:** general `x is SomeStruct` union discrimination
-  via `ref.test`; **stage 3:** nullable *numerics* (`i32?`), which need a boxing/tagging decision.
+  applied by both passes when walking a block's statements. **DONE (union-member narrowing):**
+  narrowing is no longer null-only — `if x is A { … } else { … }` narrows `x` to `A` in the then
+  branch and to its **complement** `U − A` in the else branch (`subtractType`/`elseNarrowing` in
+  `typecheck.ts`), so a two-case union is fully discriminated by one `if` and an N-case union peels
+  one variant at a time. Nested narrowings compose (each is based on the *current* narrowed view,
+  not the declared type). Tests `types/nullable.vl`, `types/guard-narrowing.vl`,
+  `types/union-narrowing.vl`. REMAINING (needs A3/A4 for the general case): `&&`-chained guards
+  (`if x != null && x.y …`), and `case`/multi-guard; the else-branch narrowing currently keys off
+  the *first* conditional only.
+- 🟢 **A6. `is` operator + tagged unions.** **DONE (stage 1):** grammar `expr IS type` (`x is T`),
+  a `VLIsNode`, typed boolean, feeds A5 narrowing; `==`/`!=` against `null` are the natural sugar.
+  **DONE (stage 2 — general union discrimination):** an arbitrary value union now has a runtime
+  representation and `is T` discriminates it. Two encodings, chosen by `unionInfo` (`toWasm.ts`):
+  a **niche** where one is free (a `T | null` reference → WasmGC nullable ref + `ref.is_null`;
+  `boolean | null` → an i32 sentinel), else a **tagged `{ tag, value }` struct**. The struct has
+  two payload shapes — a *value* kind (members share one scalar wasm rep, e.g. `boolean | i32`,
+  `i32 | null`: `value` is that rep, so binaryen's Heap2Local usually scalarizes the box away) and
+  a *boxed* kind (reference or mixed-rep members, e.g. `string | i32`, `{x} | {y}`, `i32 | f64`:
+  `value` is `anyref`, a reference stored as-is and a scalar in a one-field `{ rep }` box). `is T`
+  compares the `tag` field; tags are interned in a **global** registry keyed by variant, so a value
+  keeps its tag identity as it flows between a union and its sub-unions. Boxing happens at every
+  value-flow boundary through one `coerceUnion` hook (assignment, argument, return — works across
+  function boundaries). Tests `types/{value,ref,mixed-rep,union-narrowing}-union*.vl`. REMAINING:
+  reference-vs-reference discrimination still uses the tag rather than `ref.test` (fine, but a
+  `ref.test` fast-path could drop the tag for all-distinct-heap-type ref unions); union **arrays**
+  (`[boolean | i32]`) — the single-element-type WasmGC array wall; declared (verified) type-guard
+  predicate signatures (A6b stage A).
 - 🟡 **A6b. Proof-carrying narrowing (type guards as values).** Rather than TS-style `x is T`
   *predicate annotations*, narrowing is a **fact carried by a function's return value** — the
   classic boolean guard is the degenerate case; the general case is a discriminable return
