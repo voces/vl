@@ -26,3 +26,15 @@ export const errors: ParseErrors[] = [];
 export const flow: { desiredType: VLType | undefined } = {
   desiredType: undefined,
 };
+
+/**
+ * Inferred type-guard functions (A6b, degenerate case): function name → which
+ * parameter it narrows and the direction (matching `conditionNarrowing`'s
+ * `nonNullOn`). Populated when a function's body is exactly `return
+ * <narrowing-predicate-on-a-param>`; read when such a function is called in a
+ * condition, to narrow the argument. Cleared at the start of each pass.
+ */
+export const guards = new Map<
+  string,
+  { paramIndex: number; nonNullOn: "then" | "else" }
+>();

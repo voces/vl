@@ -58,6 +58,23 @@ closures / `is` / variance designs referenced here.
   closure is a WasmGC nullable ref (`ref null $t`), `null` is `ref.null` (heap type from context).
   Tests `types/nullable.vl`. REMAINING — **stage 2:** general `x is SomeStruct` union discrimination
   via `ref.test`; **stage 3:** nullable *numerics* (`i32?`), which need a boxing/tagging decision.
+- 🟡 **A6b. Proof-carrying narrowing (type guards as values).** Rather than TS-style `x is T`
+  *predicate annotations*, narrowing is a **fact carried by a function's return value** — the
+  classic boolean guard is the degenerate case; the general case is a discriminable return
+  (`number | null`, a union, an enum) whose **variants correlate with narrowings of the inputs**.
+  Discriminating the (possibly *stored*) witness later refines the input that produced it — a
+  proof-carrying value (cf. GADTs / refinement types / assertion signatures, but more expressive:
+  it survives a `const`). **DONE (degenerate, immediately-consumed case):** a guard is *inferred*
+  (sound, no trust) when a function's body is exactly `return <narrowing-predicate-on-a-param>`
+  (e.g. `function present(p) { return p != null }`); a call to it **in a condition** narrows the
+  argument — `if present(v) { v.x }`, and the guard-clause form `if absent(v) { return }` narrows
+  after. Stored in a `guards` registry; `conditionNarrowing` gains a `FunctionCall` case, so both
+  passes + post-guard narrowing get it for free (and UFCS `v.present()` works, since it lowers to
+  `present(v, …)`). Test `types/guard-function.vl`. **Stage A (remaining):** richer discriminants
+  (`if bar(x) is null` narrowing x), multi-input correlation, declared (verified) predicate
+  signatures. **Stage B:** the **stored witness** — `const foo = bar(x); … if foo is null` narrows
+  x — needs binding tracking + invalidation on mutation of either side (a lightweight borrow), and
+  benefits from A3/A4 (intersection/negation) underneath. Design-only beyond the degenerate case.
 - 🟡 **A7. Real `string` type.** DONE (core): `string` is now a proper Object in
   `defaultScope.ts` (was a half-baked `Alias`) — `name: "string"`, an `{[i32]: i32}` index
   signature (so it's an i32-array of char codes, with `.length`/`s[i]` for free), and `+`/`=`

@@ -35,7 +35,7 @@ import type {
   VLUnaryOperationNode,
   VLVariableDeclarationNode,
 } from "./ast.ts";
-import { errors, flow, scopes, withScope } from "./state.ts";
+import { errors, flow, guards, scopes, withScope } from "./state.ts";
 import {
   arrayElementType,
   conditionNarrowing,
@@ -299,6 +299,30 @@ const toFunctionDeclaration = (ctx: FunctionDeclContext) => {
   // named function, refine the forward-registered scope entry to the final type.
   const finalType = typeFromExpression(node, ctx);
   if (registered) enclosing[name!] = finalType;
+
+  // Inferred type guard (A6b, degenerate case): a body that is exactly `return
+  // <narrowing-predicate-on-a-parameter>` (e.g. `return p != null`) makes this
+  // function a guard — calling it narrows the argument. Sound (no trust): the
+  // return value *is* the predicate. Only the single result-expression case.
+  if (name) {
+    const result = node.body.type === "Block"
+      ? (() => {
+        const last = node.body.statements[node.body.statements.length - 1];
+        return last?.type === "Return" ? last.value : last;
+      })()
+      : node.body;
+    // `conditionNarrowing` ignores non-predicate nodes, so a statement tail is
+    // safely a no-op (it returns null).
+    const fact = result
+      ? conditionNarrowing(result as VLExpression)
+      : null;
+    if (fact) {
+      const paramIndex = parameters.findIndex((p) => p.name === fact.name);
+      if (paramIndex >= 0) {
+        guards.set(name, { paramIndex, nonNullOn: fact.nonNullOn });
+      }
+    }
+  }
 
   return node;
 };
@@ -1191,6 +1215,7 @@ export const toAST = (
 ): [VLProgramNode, ParseErrors[]] => {
   scopes.splice(0);
   errors.splice(0);
+  guards.clear();
 
   // console.log(cst.toStringTree(VL_Parser.ruleNames, cst.parser!));
 

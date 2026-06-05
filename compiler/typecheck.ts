@@ -11,7 +11,7 @@ import type {
   VLStringLiteralNode,
   VLType,
 } from "./ast.ts";
-import { errors, flow, scopes } from "./state.ts";
+import { errors, flow, guards, scopes } from "./state.ts";
 
 // Binary operators that yield a boolean (comparisons + logical), used when the
 // operand is still an inference hole and we infer the result without the method.
@@ -879,6 +879,16 @@ export const conditionNarrowing = (
     const checksNull = cond.checkType.type === "Alias" &&
       cond.checkType.name === "null";
     return { name: cond.value.name, nonNullOn: checksNull ? "else" : "then" };
+  }
+  // A call to an inferred type-guard function (A6b): `if present(v) { … }`
+  // narrows the argument the way the guard's body narrows its parameter.
+  if (cond.type === "FunctionCall") {
+    const guard = guards.get(cond.function);
+    const arg = guard && cond.arguments[guard.paramIndex]?.value;
+    if (guard && arg && arg.type === "Name") {
+      return { name: arg.name, nonNullOn: guard.nonNullOn };
+    }
+    return null;
   }
   if (cond.type !== "BinaryOperation") return null;
   if (cond.operator !== "==" && cond.operator !== "!=") return null;
