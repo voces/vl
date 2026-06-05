@@ -43,27 +43,35 @@ export const rangeFromCtx = (ctx: Context): VLRange => ({
   end: { line: ctx.stop.line - 1, character: ctx.stop.column },
 });
 
-export const stringifyType = (type: VLType): string => {
+export const stringifyType = (type: VLType, seen: Set<VLType> = new Set()): string => {
   if (type.type === "Alias") return type.name;
   if (type.type === "Union") {
-    return type.subTypes.map((t) => stringifyType(t)).join(" | ");
+    return type.subTypes.map((t) => stringifyType(t, seen)).join(" | ");
   }
-  if (type.type === "Nullable") return `${stringifyType(type.subType)} | null`;
+  if (type.type === "Nullable") {
+    return `${stringifyType(type.subType, seen)} | null`;
+  }
   if (type.type === "Intersection") {
-    return type.subTypes.map((t) => stringifyType(t)).join(" & ");
+    return type.subTypes.map((t) => stringifyType(t, seen)).join(" & ");
   }
-  if (type.type === "Negation") return `not ${stringifyType(type.subType)}`;
+  if (type.type === "Negation") return `not ${stringifyType(type.subType, seen)}`;
   if (type.type === "Object") {
+    // Cycle guard: a recursive structural type can be a cyclic object graph
+    // (`Tree` whose field is `Tree`). Render a re-encountered object as `…`
+    // rather than recursing forever (A11). Named/aliased recursion already
+    // stops at the `Alias` leaf above; this covers a fully-expanded graph.
+    if (seen.has(type)) return type.name ?? "…";
+    seen = new Set(seen).add(type);
     if (type.name) return type.name;
     if (
       type.properties.length === 1 &&
       type.properties[0].name.type === "Alias" &&
       type.properties[0].name.name === "number"
-    ) return `${stringifyType(type.properties[0].type)}[]`;
+    ) return `${stringifyType(type.properties[0].type, seen)}[]`;
     return `{${
       type.properties.map((p) =>
-        `${stringifyType(p.name).replace(/^"(.*)"$/, "$1")}: ${
-          stringifyType(p.type)
+        `${stringifyType(p.name, seen).replace(/^"(.*)"$/, "$1")}: ${
+          stringifyType(p.type, seen)
         }`
       ).join(", ")
     }}`;
@@ -80,12 +88,14 @@ export const stringifyType = (type: VLType): string => {
   if (type.type === "Never") return "never";
   if (type.type === "Function") {
     return `(${
-      type.paramaters.map((p) => `${p.name}: ${stringifyType(p.paramaterType)}`)
+      type.paramaters.map((p) =>
+        `${p.name}: ${stringifyType(p.paramaterType, seen)}`
+      )
         .join(", ")
-    }): ${stringifyType(type.return)}`;
+    }): ${stringifyType(type.return, seen)}`;
   }
-  if (type.type === "Type") return `T<${stringifyType(type.subType)}>`;
-  if (type.type === "Infer") return `I<${stringifyType(type.subType)}>`;
+  if (type.type === "Type") return `T<${stringifyType(type.subType, seen)}>`;
+  if (type.type === "Infer") return `I<${stringifyType(type.subType, seen)}>`;
   if (type.type === "Custom") return type.validate.toString();
   const exhaustive: never = type;
   return exhaustive;

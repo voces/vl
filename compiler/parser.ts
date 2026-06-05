@@ -122,6 +122,14 @@ export const parseProgram = (
   let returnTypes: VLType[] = [];
   /** Expected return type for `return` statements in the current function. */
   let returnType: VLType | undefined;
+  /**
+   * Names of `type` aliases whose body is currently being parsed. A reference to
+   * one of these from inside its own definition (a recursive structural type,
+   * `type Tree = { …: Tree … }`) resolves to a lazy `Alias` leaf rather than being
+   * eagerly inlined — so the body stays a finite structure with the recursion
+   * carried by the name, resolved on demand (A11).
+   */
+  const typeBuilding = new Set<string>();
 
   // A fresh bare `return` node — the fallback body for a malformed statement.
   // A factory (not a shared constant) so each use is a distinct AST node.
@@ -206,6 +214,11 @@ export const parseProgram = (
     if (at("ID")) {
       next();
       const name = t.text;
+      // A self-reference inside a recursive `type`'s own body resolves to a lazy
+      // alias leaf — the recursion is carried by the name (see `typeBuilding`),
+      // so the body is a finite structure resolved on demand instead of being
+      // expanded forever.
+      if (typeBuilding.has(name)) return { type: "Alias", name };
       for (let i = scopes.length - 1; i >= 0; i--) {
         if (name in scopes[i]) {
           const type = scopes[i][name];
@@ -1460,19 +1473,35 @@ export const parseProgram = (
     expect("TYPE");
     const id = expect("ID");
     const name = id.text;
-    let body: VLType | undefined;
-    if (at("EQUAL")) {
-      next();
-      skipNewlines();
-      body = parseType();
-    }
+    const hasBody = at("EQUAL");
     if (name in scopes[scopes.length - 1]) {
       errors.push({ type: "Redeclaration", name, ctx: spanOf(id), code: 11 });
-    } else {
-      scopes[scopes.length - 1][name] = {
-        type: "Type",
-        subType: body ?? { type: "Alias", name },
-      };
+      // Still consume the body so parsing resumes cleanly after a redeclaration.
+      if (hasBody) {
+        next();
+        skipNewlines();
+        parseType();
+      }
+      return { type: "Block", label: `__type_${name}__`, statements: [] };
+    }
+    // Register the alias *before* parsing its body so a recursive reference
+    // inside it resolves (to a lazy `Alias` leaf, via `typeBuilding`). The
+    // bodyless form (`type Point`, no `=`) aliases the name to itself — a
+    // degenerate self-cycle `getConcreteType` reports cleanly when used (A14).
+    const entry: { type: "Type"; subType: VLType } = {
+      type: "Type",
+      subType: { type: "Alias", name },
+    };
+    scopes[scopes.length - 1][name] = entry;
+    if (hasBody) {
+      next();
+      skipNewlines();
+      typeBuilding.add(name);
+      try {
+        entry.subType = parseType();
+      } finally {
+        typeBuilding.delete(name);
+      }
     }
     return { type: "Block", label: `__type_${name}__`, statements: [] };
   };
