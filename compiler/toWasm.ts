@@ -3,6 +3,7 @@ import {
   arrayElementType,
   conditionNarrowing,
   defaultIntegerType,
+  elseNarrowing,
   nonNullable,
   postGuardNarrowing,
   softenImplicitType,
@@ -1237,19 +1238,26 @@ export const toWasm = async (ast: VLProgramNode) => {
             ? closureValue(resolved)
             : m.local.get(entry[1], closureStruct().refType);
         }
-        // A union local narrowed to a single variant (`if x is i32 { x }`) is
-        // read as that variant — pull the payload out of the `{ tag, value }`
-        // struct and recover the variant from it. (Narrowing to a sub-union
-        // stays boxed.)
+        // A union local narrowed to a single concrete variant (`if x is i32
+        // { x }`) is read as that variant — pull the payload out of the
+        // `{ tag, value }` struct and recover the variant. Only when narrowed to
+        // exactly one *non-null* member (a sub-union, or a bare `null`, stays
+        // boxed).
         const info = unionInfo(entry[0]);
-        if (info && node.name in narrowed && !unionInfo(narrowed[node.name])) {
-          const payload = m.struct.get(
-            1,
-            m.local.get(entry[1], info.refType),
-            info.payloadWasm,
-            false,
-          );
-          return unboxPayload(info, narrowed[node.name], payload);
+        if (info && node.name in narrowed) {
+          const nt = narrowed[node.name];
+          const member = findVariant(info, nt);
+          if (member && variantTag(info, nt) !== info.nullTag && !unionInfo(nt)) {
+            const payload = m.struct.get(
+              1,
+              m.local.get(entry[1], info.refType),
+              info.payloadWasm,
+              false,
+            );
+            // Recover against the union's own member type (canonical), not the
+            // narrowed alias, which may not be classifiable on its own.
+            return unboxPayload(info, member, payload);
+          }
         }
         return m.local.get(entry[1], toWasmType(entry[0]));
       }
@@ -1623,22 +1631,50 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "If": {
         const cond = node.conditionals[0].condition;
-        // Narrow the then-branch (A5): inside `if x != null { … }`, override
-        // `x`'s type to non-null while compiling the branch, then restore.
+        // Flow narrowing (A5): inside `if x is A { … }`, override `x`'s type in
+        // the `narrowed` overlay while compiling that branch, then restore.
         const narrow = conditionNarrowing(cond);
+        const withNarrowed = <T>(name: string, type: VLType, body: () => T) => {
+          const prev = narrowed[name];
+          narrowed[name] = type;
+          const r = body();
+          if (prev === undefined) delete narrowed[name];
+          else narrowed[name] = prev;
+          return r;
+        };
+        // The variable's type *as currently narrowed* (an outer branch may have
+        // already refined it), so nested narrowings compose rather than reset.
+        const curType = (name: string) =>
+          narrowed[name] ?? lookupName(name)?.type;
+        const thenStmt = () => toExpression(node.conditionals[0].statement);
         const thenBranch = () => {
-          if (narrow?.nonNullOn === "then") {
-            const entry = lookupName(narrow.name);
-            if (entry) {
-              const prev = narrowed[narrow.name];
-              narrowed[narrow.name] = narrow.thenType ?? nonNullable(entry.type);
-              const body = toExpression(node.conditionals[0].statement);
-              if (prev === undefined) delete narrowed[narrow.name];
-              else narrowed[narrow.name] = prev;
-              return body;
+          const base = narrow && curType(narrow.name);
+          return narrow?.nonNullOn === "then" && base
+            ? withNarrowed(
+              narrow.name,
+              narrow.thenType ?? nonNullable(base),
+              thenStmt,
+            )
+            : thenStmt();
+        };
+        // The else side (a further `else if` chain, or the `else`), narrowed by
+        // the condition's complement — `if x is A { … } else { /* x: U − A */ }`.
+        const elseStmt = (): number | undefined =>
+          node.conditionals.length > 1
+            ? toExpression({ ...node, conditionals: node.conditionals.slice(1) })
+            : node.else
+            ? toExpression(node.else)
+            : undefined;
+        const elseBranch = (): number | undefined => {
+          const hasElse = node.conditionals.length > 1 || node.else !== undefined;
+          const base = narrow && curType(narrow.name);
+          if (hasElse && base) {
+            const elseType = elseNarrowing(cond, base);
+            if (elseType && elseType.type !== "Never") {
+              return withNarrowed(narrow!.name, elseType, elseStmt);
             }
           }
-          return toExpression(node.conditionals[0].statement);
+          return elseStmt();
         };
         return m.if(
           withDesiredType(
@@ -1646,14 +1682,7 @@ export const toWasm = async (ast: VLProgramNode) => {
             () => toExpression(cond),
           ),
           thenBranch(),
-          node.conditionals.length > 1
-            ? toExpression({
-              ...node,
-              conditionals: node.conditionals.slice(1),
-            })
-            : node.else
-            ? toExpression(node.else)
-            : undefined,
+          elseBranch(),
         );
       }
       case "Return":
@@ -1950,6 +1979,20 @@ export const toWasm = async (ast: VLProgramNode) => {
     if (t.type === "RealLiteral") return `v:${binaryen.f64}:n`;
     return `r:${toWasmType(t)}`;
   };
+  // A *globally* stable tag per variant key (and for `null`). Tags must agree
+  // across every union a value flows through — in particular a value boxed as
+  // `string | i32 | boolean` keeps its tag when narrowed to the sub-union
+  // `i32 | boolean`, so the tag cannot be a per-union dense index; it is interned
+  // here so the same variant always maps to the same tag.
+  const unionTags = new Map<string, number>();
+  const tagOf = (key: string): number => {
+    let tag = unionTags.get(key);
+    if (tag === undefined) {
+      tag = unionTags.size;
+      unionTags.set(key, tag);
+    }
+    return tag;
+  };
   // Intern the `{ tag: i32, value: <payload> }` struct by payload wasm type, so
   // unions sharing a payload share one struct (all boxed unions share `anyref`;
   // `boolean | i32` and `i32 | null` share i32).
@@ -2032,7 +2075,7 @@ export const toWasm = async (ast: VLProgramNode) => {
       const kb = variantKey(b);
       return ka < kb ? -1 : ka > kb ? 1 : 0;
     });
-    const nullTag = hasNull ? variants.length : -1;
+    const nullTag = hasNull ? tagOf("null") : -1;
     // "value" kind when every member is a scalar of one shared rep; else "boxed".
     const names = variants.map(valueTypeName);
     const reps = names.map((n, i) => n !== null ? repWasm(n) : toWasmType(variants[i]));
@@ -2050,14 +2093,18 @@ export const toWasm = async (ast: VLProgramNode) => {
       nullTag,
     };
   };
-  // The tag for a checked/assigned variant `type` within `info` (`null` →
-  // `nullTag`), or -1 if it matches no member.
+  // The union member matching `type` (by discriminant key), or undefined.
+  const findVariant = (info: UnionInfo, type: VLType): VLType | undefined => {
+    const key = variantKey(type);
+    return info.variants.find((v) => variantKey(v) === key);
+  };
+  // The (global) tag for a checked/assigned variant `type` within `info` (`null`
+  // → `nullTag`), or -1 if `type` matches no member of `info`.
   const variantTag = (info: UnionInfo, type: VLType): number => {
     let t = softenImplicitType(type);
     while (t.type === "Infer") t = softenImplicitType(t.subType);
     if (t.type === "Alias" && t.name === "null") return info.nullTag;
-    const key = variantKey(t);
-    return info.variants.findIndex((v) => variantKey(v) === key);
+    return findVariant(info, t) ? tagOf(variantKey(t)) : -1;
   };
   // Wrap a freshly-produced variant value into a union's payload field. For the
   // value kind the payload *is* the rep; for the boxed kind a reference is stored
@@ -2131,7 +2178,10 @@ export const toWasm = async (ast: VLProgramNode) => {
     while (nt.type === "Infer") nt = softenImplicitType(nt.subType);
     if (nt.type === "Union" || nt.type === "Nullable") return value;
     const tag = variantTag(info, nt);
-    return tag < 0 ? value : boxUnion(info, tag, nt, value);
+    if (tag < 0) return value;
+    // Box against the union's own member type, not the source expression's (a
+    // literal `5` has type `IntegerLiteral`, which `boxPayload` can't classify).
+    return boxUnion(info, tag, findVariant(info, nt) ?? null, value);
   };
   // Lower an expression, then box it into the desired union if one is wanted.
   const toExpression = (node: VLProgramNode | VLStatement): number =>

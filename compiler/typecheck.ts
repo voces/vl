@@ -915,6 +915,37 @@ export const conditionNarrowing = (
   return { name: named.name, nonNullOn: cond.operator === "!=" ? "then" : "else" };
 };
 
+// Two types denoting the same variant (mutually assignable) — used to remove a
+// member from a union. Numeric coercion is one-directional (`i32` ⊑ `f64` but
+// not the reverse), so this stays an equality test, not a subtyping one.
+const sameVariant = (a: VLType, b: VLType): boolean =>
+  validateType(a, b) && validateType(b, a);
+
+// Remove a variant from a union/nullable, returning the residual type (the other
+// members, re-flattened). Backs else-branch narrowing: in `if x is A { … } else
+// { … }`, `x` is `U − A` in the else branch. `Never` if nothing remains.
+export const subtractType = (type: VLType, removed: VLType): VLType => {
+  const kept = _flattenType(type).filter((v) => !sameVariant(v, removed));
+  if (kept.length === 0) return { type: "Never" };
+  return flattenType({ type: "Union", subTypes: kept });
+};
+
+// The type `x` narrows to in the ELSE branch of `if <cond>`, given its current
+// type, or null if nothing narrows. `x is A` → `U − A`; a nullness test → the
+// non-null type on whichever side excludes null. (The THEN branch is handled by
+// `conditionNarrowing`'s `thenType` / `nonNullOn`.)
+export const elseNarrowing = (
+  cond: VLExpression,
+  currentType: VLType,
+): VLType | null => {
+  const fact = conditionNarrowing(cond);
+  if (!fact) return null;
+  // `x is A` (a concrete non-null variant): the else branch excludes A.
+  if (fact.thenType) return subtractType(currentType, fact.thenType);
+  // A nullness test: the else branch is non-null exactly when `then` was null.
+  return fact.nonNullOn === "else" ? nonNullable(currentType) : null;
+};
+
 // Whether a statement always diverges (never falls through to the next): a
 // `return`/`break`/`continue`, a block ending in one, an `if` whose every branch
 // (incl. an `else`) diverges, or a `while true` with no escaping break.

@@ -40,6 +40,7 @@ import {
   arrayElementType,
   conditionNarrowing,
   defaultIntegerType,
+  elseNarrowing,
   ensureType,
   flattenType,
   getChildType,
@@ -63,6 +64,7 @@ export {
   arrayElementType,
   conditionNarrowing,
   defaultIntegerType,
+  elseNarrowing,
   getConcreteType,
   nonNullable,
   postGuardNarrowing,
@@ -836,6 +838,28 @@ const toExpression = (ctx: ExprContext): VLExpression => {
         }
         return toStatement(stmtCtx);
       };
+      // The mirror: in the else branch, narrow by the (main) condition's
+      // complement — `if x is A { … } else { /* x: U − A */ }`, or non-null on
+      // the side a nullness test excludes null.
+      // deno-lint-ignore no-explicit-any
+      const narrowElse = (cond: VLExpression, stmtCtx: any) => {
+        const n = conditionNarrowing(cond);
+        if (n) {
+          for (let i = scopes.length - 1; i >= 0; i--) {
+            if (n.name in scopes[i]) {
+              const elseType = elseNarrowing(cond, scopes[i][n.name]);
+              if (elseType && elseType.type !== "Never") {
+                return withScope(
+                  { [n.name]: elseType },
+                  () => toStatement(stmtCtx),
+                );
+              }
+              break;
+            }
+          }
+        }
+        return toStatement(stmtCtx);
+      };
       const conditionContext = ifCtx.expr();
       const condition = toExpression(conditionContext);
       const statementContext = ifCtx.statement();
@@ -885,7 +909,9 @@ const toExpression = (ctx: ExprContext): VLExpression => {
       return {
         type: "If",
         conditionals,
-        else: elseCtx ? toStatement(elseCtx.statement()) : undefined,
+        else: elseCtx
+          ? narrowElse(condition, elseCtx.statement())
+          : undefined,
       };
     }
   }
