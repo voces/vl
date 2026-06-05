@@ -124,6 +124,14 @@ export type VLUnaryOperationNode = {
   prefix: boolean;
 };
 
+// Type guard (A6): `x is T` — tests whether `value` is currently of `checkType`,
+// yielding a boolean and (in an `if`) narrowing `value` to `checkType`.
+export type VLIsNode = {
+  type: "Is";
+  value: VLExpression;
+  checkType: VLType;
+};
+
 export type VLVariableDeclarationNode = {
   type: "VariableDeclaration";
   name: string;
@@ -156,6 +164,7 @@ export type VLExpression =
   | VLIndexAccessNode
   | VLBinaryOperationNode
   | VLUnaryOperationNode
+  | VLIsNode
   | VLFunctionCallNode
   | VLCallNode
   | VLIfNode;

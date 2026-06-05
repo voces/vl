@@ -1,7 +1,9 @@
 import Binaryen from "binaryen";
 import {
   arrayElementType,
+  conditionNarrowing,
   defaultIntegerType,
+  nonNullable,
   softenImplicitType,
   validateType,
   VLFunctionCallNode,
@@ -589,8 +591,16 @@ export const toWasm = async (ast: VLProgramNode) => {
   // Name from scope and a PropertyAccess through its object's shape, falling back
   // to the AST type for literals/calls. (Name reads already use scope elsewhere;
   // this keeps object-shape resolution consistent with them.)
+  // Flow-narrowing overlay (A5): inside `if x != null { … }`, `x`'s *type* is
+  // narrowed to non-null here so member access resolves to the struct/array
+  // shape. The local itself keeps its nullable wasm type (so `local.get` and
+  // `struct.get`, which accepts a nullable ref, stay valid) — only the
+  // type-level view is overridden, scoped to the branch.
+  const narrowed: Record<string, VLType> = {};
+
   const codegenType = (node: VLProgramNode | VLStatement): VLType => {
     if (node.type === "Name") {
+      if (node.name in narrowed) return narrowed[node.name];
       const found = lookupName(node.name);
       if (found) return found.type;
     }
@@ -972,6 +982,27 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "BooleanLiteral":
         return m.i32.const(node.value ? 1 : 0);
+      case "NullLiteral": {
+        // `null` takes its (reference) heap type from the desired nullable type
+        // so the produced `ref.null` matches the slot it flows into.
+        let dt = desiredType ? softenImplicitType(desiredType) : undefined;
+        while (dt && dt.type === "Infer") dt = softenImplicitType(dt.subType);
+        if (!dt || dt.type !== "Nullable") {
+          throw new Error("`null` needs a nullable type from context");
+        }
+        // `ref.null` takes a nullable ref *type* (not a heap type).
+        return m.ref.null(
+          binaryen.getTypeFromHeapType(refHeapType(dt.subType), true),
+        );
+      }
+      case "Is": {
+        // Type guard on a nullable reference: `x is null` → `ref.is_null`;
+        // `x is T` (T the non-null variant) → its negation.
+        const isNull = m.ref.is_null(toExpression(node.value));
+        const checksNull = node.checkType.type === "Alias" &&
+          node.checkType.name === "null";
+        return checksNull ? isNull : m.i32.eqz(isNull);
+      }
       case "StringLiteral": {
         // A string literal is a WasmGC i32-array of its code points.
         const at = arrayType(i32Type);
@@ -1324,6 +1355,19 @@ export const toWasm = async (ast: VLProgramNode) => {
             ? m.block(null, [set, m.local.get(localIndex, wasmType)], wasmType)
             : set;
         }
+        // `x == null` / `x != null`: a nullness test on a nullable reference —
+        // `ref.is_null`. Handled before operand typing, since `null` carries no
+        // numeric/operator type. (`null` on either side.)
+        if (op === "==" || op === "!=") {
+          const leftNull = node.left.type === "NullLiteral";
+          const rightNull = node.right.type === "NullLiteral";
+          if (leftNull || rightNull) {
+            const isNull = m.ref.is_null(
+              toExpression(leftNull ? node.right : node.left),
+            );
+            return op === "==" ? isNull : m.i32.eqz(isNull);
+          }
+        }
         // Resolve from the instance scope (not the once-inferred AST type), so a
         // monomorphized generic's operand — e.g. `self.x` where `self` is bound to
         // a concrete shape this instance — is seen as its concrete numeric type.
@@ -1525,13 +1569,31 @@ export const toWasm = async (ast: VLProgramNode) => {
         }
         return m.block(null, stmts, blockType);
       }
-      case "If":
+      case "If": {
+        const cond = node.conditionals[0].condition;
+        // Narrow the then-branch (A5): inside `if x != null { … }`, override
+        // `x`'s type to non-null while compiling the branch, then restore.
+        const narrow = conditionNarrowing(cond);
+        const thenBranch = () => {
+          if (narrow?.nonNullOn === "then") {
+            const entry = lookupName(narrow.name);
+            if (entry) {
+              const prev = narrowed[narrow.name];
+              narrowed[narrow.name] = nonNullable(entry.type);
+              const body = toExpression(node.conditionals[0].statement);
+              if (prev === undefined) delete narrowed[narrow.name];
+              else narrowed[narrow.name] = prev;
+              return body;
+            }
+          }
+          return toExpression(node.conditionals[0].statement);
+        };
         return m.if(
           withDesiredType(
             { type: "Alias", name: "boolean" },
-            () => toExpression(node.conditionals[0].condition),
+            () => toExpression(cond),
           ),
-          toExpression(node.conditionals[0].statement),
+          thenBranch(),
           node.conditionals.length > 1
             ? toExpression({
               ...node,
@@ -1541,6 +1603,7 @@ export const toWasm = async (ast: VLProgramNode) => {
             ? toExpression(node.else)
             : undefined,
         );
+      }
       case "Return":
         // TODO: need returnType in global scope
         return withDesiredType(returnType, () => {
@@ -1688,16 +1751,41 @@ export const toWasm = async (ast: VLProgramNode) => {
           brkLabel(node.label ?? loopLabels[loopLabels.length - 1]),
         );
       default:
-        throw new Error(`Unhandled AST -> WASM "${node.type}" expression`);
+        throw new Error(
+          `Unhandled AST -> WASM "${(node as { type: string }).type}" expression`,
+        );
     }
   };
 
   // VLType -> binaryen wasm type, bound to this module's binaryen instance.
+  // The WasmGC heap type backing a reference-typed VL type (struct / array /
+  // string / closure). Used to form a *nullable* ref (`ref null $t`) for a
+  // `Nullable<T>`. A non-reference subtype (numeric) would need boxing.
+  const refHeapType = (node: VLType): number => {
+    let t = softenImplicitType(node);
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
+    if (t.type === "Function") return closureStruct().heapType;
+    if (t.type === "Object") {
+      const element = arrayElementType(t);
+      if (element) return arrayType(element).heapType;
+      if (t.name === undefined) return objectStruct(t).heapType;
+    }
+    throw new Error(
+      `Nullable of non-reference type "${
+        t.type === "Object" ? t.name : t.type
+      }" needs boxing (not yet supported)`,
+    );
+  };
+
   const toWasmType = (node: VLType): number => {
     let t = softenImplicitType(node);
     // Unwrap inference holes resolved during monomorphization (`Infer<i32>` ->
     // i32); softening keeps the wrapper, but codegen wants the concrete type.
     while (t.type === "Infer") t = softenImplicitType(t.subType);
+    // A nullable reference: the nullable variant of its subtype's heap type.
+    if (t.type === "Nullable") {
+      return binaryen.getTypeFromHeapType(refHeapType(t.subType), true);
+    }
     if (t.type === "Object") {
       // An `i32`-index-sig object is a WasmGC array — this covers `[i32]`-arrays
       // and `string` (an i32-array of char codes). A *structural* object (no

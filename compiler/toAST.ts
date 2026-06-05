@@ -26,6 +26,7 @@ import type {
   VLFunctionCallNode,
   VLFunctionDeclarationNode,
   VLFunctionType,
+  VLIsNode,
   VLObjectLiteralNode,
   VLParameterNode,
   VLProgramNode,
@@ -34,13 +35,15 @@ import type {
   VLUnaryOperationNode,
   VLVariableDeclarationNode,
 } from "./ast.ts";
-import { errors, flow, scopes } from "./state.ts";
+import { errors, flow, scopes, withScope } from "./state.ts";
 import {
   arrayElementType,
+  conditionNarrowing,
   defaultIntegerType,
   ensureType,
   flattenType,
   getChildType,
+  nonNullable,
   getConcreteType,
   getType,
   instantiateFunctionType,
@@ -57,8 +60,10 @@ export * from "./ast.ts";
 export { withScope } from "./state.ts";
 export {
   arrayElementType,
+  conditionNarrowing,
   defaultIntegerType,
   getConcreteType,
+  nonNullable,
   setNodeType,
   softenImplicitType,
   validateParameters,
@@ -626,6 +631,16 @@ const toExpression = (ctx: ExprContext): VLExpression => {
   if (ctx.NULL()) return { type: "NullLiteral" };
 
   {
+    if (ctx.IS()) {
+      const value = toExpression(ctx.expr(0));
+      const checkType = toType(ctx.type_());
+      const node: VLIsNode = { type: "Is", value, checkType };
+      typeFromExpression(node, ctx); // assert + memoize the boolean result
+      return node;
+    }
+  }
+
+  {
     const op = ctx.CARET() ?? ctx.STAR() ?? ctx.DIV() ?? ctx.MOD() ??
       ctx.PLUS() ?? ctx.MINUS() ?? ctx.GREATER_THAN() ??
       ctx.GREATER_THAN_OR_EQUAL_TO() ?? ctx.LESS_THAN() ??
@@ -762,13 +777,31 @@ const toExpression = (ctx: ExprContext): VLExpression => {
   {
     const ifCtx = ctx.if_();
     if (ifCtx) {
+      // Walk a conditional's then-statement with flow narrowing (A5): inside
+      // `if x != null { … }`, `x` is seen as non-null. Only the non-null case is
+      // narrowed (the useful one); a `== null` then-branch is left as-is.
+      // deno-lint-ignore no-explicit-any
+      const narrowThen = (cond: VLExpression, stmtCtx: any) => {
+        const n = conditionNarrowing(cond);
+        if (n?.nonNullOn === "then") {
+          for (let i = scopes.length - 1; i >= 0; i--) {
+            if (n.name in scopes[i]) {
+              return withScope(
+                { [n.name]: nonNullable(scopes[i][n.name]) },
+                () => toStatement(stmtCtx),
+              );
+            }
+          }
+        }
+        return toStatement(stmtCtx);
+      };
       const conditionContext = ifCtx.expr();
       const condition = toExpression(conditionContext);
       const statementContext = ifCtx.statement();
       const elseCtx = ifCtx.else_();
       const mainIf = {
         condition,
-        statement: toStatement(statementContext),
+        statement: narrowThen(condition, statementContext),
         conditionContext,
         statementContext,
       };
@@ -779,9 +812,10 @@ const toExpression = (ctx: ExprContext): VLExpression => {
         ...ifCtx.elseIf_list().map((e) => {
           const conditionContext = e.expr();
           const statementContext = e.statement();
+          const condition = toExpression(conditionContext);
           const elseIf = {
-            condition: toExpression(conditionContext),
-            statement: toStatement(statementContext),
+            condition,
+            statement: narrowThen(condition, statementContext),
             conditionContext,
             statementContext,
           };

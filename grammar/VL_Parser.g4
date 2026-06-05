@@ -96,6 +96,7 @@ expr
     | expr NEWLINE* (PLUS | MINUS) NEWLINE* expr
     | expr NEWLINE* (GREATER_THAN | GREATER_THAN_OR_EQUAL_TO | LESS_THAN | LESS_THAN_OR_EQUAL_TO) NEWLINE* expr
     | expr NEWLINE* (EQUAL_TO | NOT_EQUAL_TO) NEWLINE* expr
+    | expr NEWLINE* IS NEWLINE* type // type guard (A6): `x is T`
     | expr NEWLINE* AND NEWLINE* expr
     | expr NEWLINE* OR NEWLINE* expr
     | ID NEWLINE* (PLUS | MINUS | STAR | DIV | MOD | CARET | EXCLAMATION)? EQUAL NEWLINE* expr

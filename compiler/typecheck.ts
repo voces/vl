@@ -76,6 +76,16 @@ export const _typeFromExpression = (
         leftType = softenImplicitType(leftType);
         setNodeType(expr.left, leftType);
       }
+      // `x == null` / `x != null`: a nullness test, allowed when either operand
+      // is `null` or a nullable type. Yields boolean (handled in codegen as
+      // `ref.is_null`).
+      if (op === "==" || op === "!=") {
+        const isNullish = (t: VLType) =>
+          t.type === "Nullable" || (t.type === "Alias" && t.name === "null");
+        if (isNullish(leftType) || isNullish(rightType)) {
+          return { type: "Alias", name: "boolean" };
+        }
+      }
       const missingOpFunc = (variant: string): VLType => {
         errors.push({
           type: "Type",
@@ -249,6 +259,10 @@ export const _typeFromExpression = (
     case "NullLiteral":
       // We can assume this is meant as a nullable value, though that's slightly different than a complex inference
       return { type: "Alias", name: "null" };
+    case "Is":
+      // `x is T` — a type guard yielding boolean (and narrowing in an `if`).
+      typeFromExpression(expr.value, ctx);
+      return { type: "Alias", name: "boolean" };
     case "FunctionCall":
       // Prefer the per-call instantiated signature (its return is resolved to a
       // concrete type for this call's arguments); the shared scope entry's
@@ -830,6 +844,35 @@ export const nonNullable = (type: VLType): VLType => {
     }
   }
   return type;
+};
+
+// Flow narrowing (A5): a fact extracted from an `if` condition — which variable
+// becomes non-null in which branch. Currently a nullness test (`x != null` /
+// `x == null`) on a plain variable. Applied by both passes: toAST narrows the
+// type scope, toWasm the codegen scope, around the relevant branch.
+export const conditionNarrowing = (
+  cond: VLExpression,
+): { name: string; nonNullOn: "then" | "else" } | null => {
+  // `x is T` — narrows x to T in the then-branch (or, for `x is null`, leaves it
+  // null there and non-null in the else). For a nullable, the non-null subtype
+  // and `null` are the only variants, so this is a nullness narrowing.
+  if (cond.type === "Is" && cond.value.type === "Name") {
+    const checksNull = cond.checkType.type === "Alias" &&
+      cond.checkType.name === "null";
+    return { name: cond.value.name, nonNullOn: checksNull ? "else" : "then" };
+  }
+  if (cond.type !== "BinaryOperation") return null;
+  if (cond.operator !== "==" && cond.operator !== "!=") return null;
+  const named = cond.left.type === "Name"
+    ? cond.left
+    : cond.right.type === "Name"
+    ? cond.right
+    : null;
+  const isNull = cond.left.type === "NullLiteral" ||
+    cond.right.type === "NullLiteral";
+  if (!named || !isNull) return null;
+  // `x != null` → x is non-null in the THEN branch; `x == null` → in the ELSE.
+  return { name: named.name, nonNullOn: cond.operator === "!=" ? "then" : "else" };
 };
 
 /** Registers diagnostics automatically */

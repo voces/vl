@@ -38,10 +38,22 @@ closures / `is` / variance designs referenced here.
   refinement. Round out the set-theoretic algebra.
 - ⬜ **A4. Negation types** (`not A`). Needed so guards can subtract types on the false
   branch.
-- ⬜ **A5. Flow narrowing.** Refine a variable's type along control flow (`if`, future
-  `case`, guards). Depends on A3/A4. This is what makes structural types precise.
-- ⬜ **A6. `is` operator** (ducktype `instanceof`/`typeof` replacement, from TODO.md).
-  The guard primitive that feeds A5: `if x is string then …`.
+- 🟡 **A5. Flow narrowing.** **DONE (nullness slice):** inside `if x != null { … }` (or
+  `if x is T { … }`), `x` is narrowed to its non-null type, so member access resolves to the
+  underlying shape (`p.x` is a type error on `{x:i32} | null`, valid after the guard). A shared
+  `conditionNarrowing` fact (`typecheck.ts`) is applied by **both** passes: toAST narrows the type
+  scope around the then-branch, toWasm a `narrowed` overlay consulted by `codegenType` (the local
+  keeps its nullable wasm type, so `local.get`/`struct.get` — which accept a nullable ref — stay
+  valid). Test `types/nullable.vl`. REMAINING (needs A3/A4 for the general case): **else-branch /
+  post-guard narrowing** (`if x == null { return } /* x non-null after */` — flow-sensitive, needs
+  divergence tracking), narrowing **union** members (not just null), and `case`/multi-guard.
+- 🟡 **A6. `is` operator.** **DONE (stage 1):** grammar `expr IS type` (`x is T`), a `VLIsNode`,
+  typed boolean, feeds A5 narrowing. Runtime test is `ref.is_null` (for a `T | null`, `is null` vs
+  `is T` are the only variants); `==`/`!=` against `null` are the natural sugar (also
+  `ref.is_null`). Nullable **reference** types only so far: `T | null` for a struct/array/string/
+  closure is a WasmGC nullable ref (`ref null $t`), `null` is `ref.null` (heap type from context).
+  Tests `types/nullable.vl`. REMAINING — **stage 2:** general `x is SomeStruct` union discrimination
+  via `ref.test`; **stage 3:** nullable *numerics* (`i32?`), which need a boxing/tagging decision.
 - 🟡 **A7. Real `string` type.** DONE (core): `string` is now a proper Object in
   `defaultScope.ts` (was a half-baked `Alias`) — `name: "string"`, an `{[i32]: i32}` index
   signature (so it's an i32-array of char codes, with `.length`/`s[i]` for free), and `+`/`=`

@@ -14,6 +14,7 @@ IN       : 'in';
 CONST    : 'const';
 LET      : 'let';
 RETURN   : 'return';
+IS       : 'is';
 AWAIT    : 'await';
 BREAK    : 'break';
 CONTINUE : 'continue';
