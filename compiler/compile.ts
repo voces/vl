@@ -123,6 +123,10 @@ export const stringifyType = (type: VLType): string => {
     return type.subTypes.map((t) => stringifyType(t)).join(" | ");
   }
   if (type.type === "Nullable") return `${stringifyType(type.subType)} | null`;
+  if (type.type === "Intersection") {
+    return type.subTypes.map((t) => stringifyType(t)).join(" & ");
+  }
+  if (type.type === "Negation") return `not ${stringifyType(type.subType)}`;
   if (type.type === "Object") {
     if (type.name) return type.name;
     if (

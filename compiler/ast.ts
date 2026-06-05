@@ -235,6 +235,14 @@ export type VLObjectType = {
 export type VLUnknownType = { type: "Unknown" };
 export type VLNullableType = { type: "Nullable"; subType: VLType };
 export type VLUnionType = { type: "Union"; subTypes: VLType[] };
+// Set-theoretic refinement types (A3/A4). Produced by flow narrowing, not
+// (yet) by surface syntax: an `Intersection` is `A & B` (both hold — the
+// then-branch refinement), a `Negation` is `not A` (the false-branch
+// subtraction). Both simplify aggressively against finite unions, so they
+// rarely survive into codegen; an open-world residual is dropped to its
+// positive part (see `intersectType`/`subtractType`).
+export type VLIntersectionType = { type: "Intersection"; subTypes: VLType[] };
+export type VLNegationType = { type: "Negation"; subType: VLType };
 export type VLNeverType = { type: "Never" };
 export type VLTypeType = { type: "Type"; subType: VLType };
 export type VLInferType = { type: "Infer"; subType: VLType };
@@ -254,6 +262,8 @@ export type VLType =
   | VLUnknownType
   | VLNullableType
   | VLUnionType
+  | VLIntersectionType
+  | VLNegationType
   | VLNeverType
   | VLTypeType
   | VLInferType

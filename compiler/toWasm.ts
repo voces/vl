@@ -1,12 +1,12 @@
 import Binaryen from "binaryen";
+import type { Narrowing } from "./typecheck.ts";
 import {
   arrayElementType,
-  conditionNarrowing,
   defaultIntegerType,
-  elseNarrowing,
-  nonNullable,
+  elseNarrowings,
   placeKey,
-  postGuardNarrowing,
+  postGuardNarrowings,
+  thenNarrowings,
   softenImplicitType,
   validateType,
   VLFunctionCallNode,
@@ -601,6 +601,32 @@ export const toWasm = async (ast: VLProgramNode) => {
   // type-level view is overridden, scoped to the branch.
   const narrowed: Record<string, VLType> = {};
 
+  // Override one narrowed place in the overlay while running `body`, restoring
+  // after (the unit the `If` branches and short-circuit `&&`/`||` build on).
+  const withNarrowed = <T>(name: string, type: VLType, body: () => T): T => {
+    const prev = narrowed[name];
+    narrowed[name] = type;
+    const r = body();
+    if (prev === undefined) delete narrowed[name];
+    else narrowed[name] = prev;
+    return r;
+  };
+  // Run `body` with a *list* of narrowings overlaid — a `&&` of guards narrows
+  // several places; each reads its current (already-overlaid) type via
+  // `codegenType` so successive narrowings compose. A `Never` refinement (a
+  // dead branch) is skipped rather than overlaid.
+  const withNarrowedList = <T>(ns: Narrowing[], body: () => T): T => {
+    const go = (i: number): T => {
+      if (i >= ns.length) return body();
+      const n = ns[i];
+      const cur = codegenType(n.place);
+      const next = cur && n.apply(cur);
+      if (!next || next.type === "Never") return go(i + 1);
+      return withNarrowed(n.name, next, () => go(i + 1));
+    };
+    return go(0);
+  };
+
   const codegenType = (node: VLProgramNode | VLStatement): VLType => {
     if (node.type === "Name") {
       if (node.name in narrowed) return narrowed[node.name];
@@ -990,14 +1016,17 @@ export const toWasm = async (ast: VLProgramNode) => {
         : withDesiredType(undefined, () => toExpression(stmt));
       if (typeof v === "number") out.push(v);
       // Post-guard narrowing (A5): after a divergent guard (`if x == null
-      // { return }`), narrow `x` to non-null for the rest of this block.
-      const name = postGuardNarrowing(stmt);
-      if (name) {
-        const entry = lookupName(name);
-        if (entry) {
-          if (!(name in saved)) saved[name] = narrowed[name];
-          narrowed[name] = nonNullable(entry.type);
-        }
+      // { return }`, or `|| `-chained), narrow each guarded place for the rest of
+      // this block. Names resolve via `lookupName`; paths read the narrowed type.
+      for (const n of postGuardNarrowings(stmt)) {
+        const cur = n.place.type === "Name"
+          ? lookupName(n.name)?.type
+          : codegenType(n.place);
+        if (!cur) continue;
+        const next = n.apply(cur);
+        if (next.type === "Never") continue;
+        if (!(n.name in saved)) saved[n.name] = narrowed[n.name];
+        narrowed[n.name] = next;
       }
     }
     for (const name in saved) {
@@ -1322,6 +1351,11 @@ export const toWasm = async (ast: VLProgramNode) => {
         let shape = objectTypeOf(node);
         let dt = desiredType ? softenImplicitType(desiredType) : undefined;
         while (dt && dt.type === "Infer") dt = softenImplicitType(dt.subType);
+        // Unwrap a niche nullable (`{…} | null`): the object literal still builds
+        // the *pointee* object, whose union-typed fields need their boxed
+        // representation — otherwise `{ y: 5 }` for a `{ y: string | i32 } | null`
+        // param builds `{ y: i32 }` and mismatches the niche struct.
+        while (dt && dt.type === "Nullable") dt = softenImplicitType(dt.subType);
         if (dt && dt.type === "Object" && dt.name === undefined) {
           shape = mergeDesiredUnionFields(shape, dt);
         }
@@ -1506,6 +1540,24 @@ export const toWasm = async (ast: VLProgramNode) => {
             const isNull = nullnessTest(leftNull ? node.right : node.left);
             return op === "==" ? isNull : m.i32.eqz(isNull);
           }
+        }
+        // Short-circuit logical operators: `a && b` ≡ `if a then b else 0`,
+        // `a || b` ≡ `if a then 1 else b`. The right operand is compiled with the
+        // left's narrowing applied (so `o != null && o.y` resolves `o.y`) — the
+        // then-narrowings for `&&`, the else-narrowings for `||`.
+        if (op === "&&" || op === "||") {
+          const boolType: VLType = { type: "Alias", name: "boolean" };
+          const left = withDesiredType(boolType, () => toExpression(node.left));
+          const ns = op === "&&"
+            ? thenNarrowings(node.left)
+            : elseNarrowings(node.left);
+          const right = withNarrowedList(
+            ns,
+            () => withDesiredType(boolType, () => toExpression(node.right)),
+          );
+          return op === "&&"
+            ? m.if(left, right, m.i32.const(0))
+            : m.if(left, m.i32.const(1), right);
         }
         // Resolve from the instance scope (not the once-inferred AST type), so a
         // monomorphized generic's operand — e.g. `self.x` where `self` is bound to
@@ -1710,51 +1762,24 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "If": {
         const cond = node.conditionals[0].condition;
-        // Flow narrowing (A5): inside `if x is A { … }`, override `x`'s type in
-        // the `narrowed` overlay while compiling that branch, then restore.
-        const narrow = conditionNarrowing(cond);
-        const withNarrowed = <T>(name: string, type: VLType, body: () => T) => {
-          const prev = narrowed[name];
-          narrowed[name] = type;
-          const r = body();
-          if (prev === undefined) delete narrowed[name];
-          else narrowed[name] = prev;
-          return r;
-        };
-        // The place's type *as currently narrowed* (an outer branch may have
-        // already refined it), so nested narrowings compose rather than reset.
-        // `codegenType` consults the `narrowed` overlay for both names and paths.
-        const curType = () => narrow && codegenType(narrow.place);
+        // Flow narrowing (A5): the then-branch sees the condition's
+        // then-narrowings (a `&&` narrows several places at once), the else side
+        // its else-narrowings. Uses the function-level `withNarrowedList`.
         const thenStmt = () => toExpression(node.conditionals[0].statement);
-        const thenBranch = () => {
-          const base = curType();
-          return narrow?.nonNullOn === "then" && base
-            ? withNarrowed(
-              narrow.name,
-              narrow.thenType ?? nonNullable(base),
-              thenStmt,
-            )
-            : thenStmt();
-        };
-        // The else side (a further `else if` chain, or the `else`), narrowed by
-        // the condition's complement — `if x is A { … } else { /* x: U − A */ }`.
+        const thenBranch = () =>
+          withNarrowedList(thenNarrowings(cond), thenStmt);
+        // The else side (a further `else if` chain, or the `else`). Its own
+        // recursion re-applies the next condition's else-narrowing on top of this
+        // one (the `narrowed` overlay persists), so an else-if chain composes —
+        // `if x is A {} else if x is B {} else { /* x: U − A − B */ }`.
         const elseStmt = (): number | undefined =>
           node.conditionals.length > 1
             ? toExpression({ ...node, conditionals: node.conditionals.slice(1) })
             : node.else
             ? toExpression(node.else)
             : undefined;
-        const elseBranch = (): number | undefined => {
-          const hasElse = node.conditionals.length > 1 || node.else !== undefined;
-          const base = curType();
-          if (hasElse && base) {
-            const elseType = elseNarrowing(cond, base);
-            if (elseType && elseType.type !== "Never") {
-              return withNarrowed(narrow!.name, elseType, elseStmt);
-            }
-          }
-          return elseStmt();
-        };
+        const elseBranch = (): number | undefined =>
+          withNarrowedList(elseNarrowings(cond), elseStmt);
         return m.if(
           withDesiredType(
             { type: "Alias", name: "boolean" },

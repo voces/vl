@@ -11,7 +11,14 @@ import type {
   VLStringLiteralNode,
   VLType,
 } from "./ast.ts";
-import { errors, flow, guards, narrowedPaths, scopes } from "./state.ts";
+import {
+  errors,
+  flow,
+  guards,
+  narrowedPaths,
+  scopes,
+  withScope,
+} from "./state.ts";
 
 // The canonical narrowing key for a "place" — a bare name (`x`) or a property
 // path rooted at one (`o.v`, `o.v.w`) — or null for anything else (a call,
@@ -72,9 +79,19 @@ export const _typeFromExpression = (
 ): VLType => {
   switch (expr.type) {
     case "BinaryOperation": {
-      let leftType = typeFromExpression(expr.left, ctx);
-      const rightType = typeFromExpression(expr.right, ctx);
       const op = expr.operator;
+      let leftType = typeFromExpression(expr.left, ctx);
+      // Short-circuit narrowing (A5): `B` in `A && B` is only evaluated when `A`
+      // holds, so derive its type with `A`'s then-narrowings applied (`A || B`
+      // with `A`'s else-narrowings). This is what lets `x != null && x.y` resolve
+      // `x.y` — the right operand sees `x` already narrowed.
+      const rightType = op === "&&" || op === "||"
+        ? withNarrowings(
+          op === "&&" ? thenNarrowings(expr.left) : elseNarrowings(expr.left),
+          ctx,
+          () => typeFromExpression(expr.right, ctx),
+        )
+        : typeFromExpression(expr.right, ctx);
       // Operators live on the numeric object types (i32/f64/...), not on the
       // literal types, so a bare literal operand (e.g. `2` in `2 + 3`) has no
       // operator methods. Default an unconstrained numeric literal to its soft
@@ -486,6 +503,9 @@ export const _softenImplicitType = (type: VLType): VLType => {
     if (subType === type.subType) return type;
     return { type: "Infer", subType };
   }
+  // Refinement types (A3/A4) are produced already-simplified by
+  // `intersectType` / `subtractType`; nothing further to soften.
+  if (type.type === "Intersection" || type.type === "Negation") return type;
   const exhaustive: never = type;
   throw new Error(`Unhandled soften type: ${exhaustive}`);
 };
@@ -973,26 +993,211 @@ const sameVariant = (a: VLType, b: VLType): boolean =>
 // Remove a variant from a union/nullable, returning the residual type (the other
 // members, re-flattened). Backs else-branch narrowing: in `if x is A { … } else
 // { … }`, `x` is `U − A` in the else branch. `Never` if nothing remains.
+//
+// `removed` may itself be a finite union (the `||`/De-Morgan case removes each
+// arm). When `type` is *not* a finite union of the removed variant (an open
+// type like `i32` minus the literal `1`), there's nothing concrete to drop, so
+// the type is returned unchanged — open-world negation isn't tracked (A4 note).
 export const subtractType = (type: VLType, removed: VLType): VLType => {
-  const kept = _flattenType(type).filter((v) => !sameVariant(v, removed));
+  const drop = _flattenType(removed);
+  const kept = _flattenType(type).filter((v) =>
+    !drop.some((d) => sameVariant(v, d))
+  );
   if (kept.length === 0) return { type: "Never" };
   return flattenType({ type: "Union", subTypes: kept });
 };
 
-// The type `x` narrows to in the ELSE branch of `if <cond>`, given its current
-// type, or null if nothing narrows. `x is A` → `U − A`; a nullness test → the
-// non-null type on whichever side excludes null. (The THEN branch is handled by
-// `conditionNarrowing`'s `thenType` / `nonNullOn`.)
-export const elseNarrowing = (
-  cond: VLExpression,
-  currentType: VLType,
-): VLType | null => {
-  const fact = conditionNarrowing(cond);
-  if (!fact) return null;
-  // `x is A` (a concrete non-null variant): the else branch excludes A.
-  if (fact.thenType) return subtractType(currentType, fact.thenType);
-  // A nullness test: the else branch is non-null exactly when `then` was null.
-  return fact.nonNullOn === "else" ? nonNullable(currentType) : null;
+// The more specific of two overlapping types (the refinement `a & b`), or null
+// if they're disjoint. `distinctScalars` first: `i32` and `f64` overlap under
+// coercion (`i32 ⊑ f64`) but are distinct *variants*, so their meet is empty.
+const meet = (a: VLType, b: VLType): VLType | null => {
+  if (distinctScalars(a, b)) return null;
+  if (validateType(b, a)) return a; // a ⊑ b → a is the refinement
+  if (validateType(a, b)) return b; // b ⊑ a → b is the refinement
+  return null;
+};
+
+// Intersection (A3): the type a value has when it is *both* `a` and `b` — the
+// then-branch refinement of a guard (`if x is A` → `x & A`). Holes refine to the
+// other side; a `Negation` becomes a subtraction; otherwise each member of `a`
+// that overlaps `b` is refined to the meet, and disjoint members drop (so
+// `(string | i32) & i32` is `i32`, and an impossible refinement is `Never`).
+export const intersectType = (a: VLType, b: VLType): VLType => {
+  if (a.type === "Unknown" || a.type === "Infer") return b;
+  if (b.type === "Unknown" || b.type === "Infer") return a;
+  if (a.type === "Never" || b.type === "Never") return { type: "Never" };
+  if (b.type === "Negation") return subtractType(a, b.subType);
+  if (a.type === "Negation") return subtractType(b, a.subType);
+  const kept = _flattenType(a)
+    .map((m) => meet(m, b))
+    .filter((m): m is VLType => m !== null);
+  if (kept.length === 0) return { type: "Never" };
+  return flattenType({ type: "Union", subTypes: kept });
+};
+
+// A flow-narrowing fact applied to one place: `apply` maps the place's current
+// type to its narrowed type in a given branch. The appliers iterate a *list* of
+// these (a `&&` of guards narrows several places), reading each place's current
+// (already-overlaid) type so the narrowings compose.
+export type Narrowing = {
+  name: string;
+  place: VLExpression;
+  apply: (current: VLType) => VLType;
+};
+
+// One atomic condition's effect on a single place, as a type transform per
+// branch (`then` when truthy, `else` when falsy); either is null when that
+// branch carries no useful refinement. Composite `&&`/`||` conditions combine
+// these — see `thenNarrowings` / `elseNarrowings`.
+type AtomFact = {
+  name: string;
+  place: VLExpression;
+  then: ((cur: VLType) => VLType) | null;
+  else: ((cur: VLType) => VLType) | null;
+};
+
+// A literal *expression* node doubles as a literal *type* (same shape), so an
+// `x == <literal>` comparison can narrow `x` to that literal (A4 discriminant).
+const literalType = (e: VLExpression): VLType | null =>
+  e.type === "IntegerLiteral" || e.type === "RealLiteral" ||
+    e.type === "StringLiteral" || e.type === "BooleanLiteral"
+    ? e
+    : null;
+
+const atomFact = (cond: VLExpression): AtomFact | null => {
+  // `x is T` — then-branch refines `x` to `x & T`, else-branch subtracts `T`.
+  // For `x is null` the roles invert (then keeps null, else is the non-null).
+  if (cond.type === "Is") {
+    const key = placeKey(cond.value);
+    if (key === null) return null;
+    const checksNull = cond.checkType.type === "Alias" &&
+      cond.checkType.name === "null";
+    if (checksNull) {
+      return { name: key, place: cond.value, then: null, else: nonNullable };
+    }
+    const checkType = cond.checkType;
+    return {
+      name: key,
+      place: cond.value,
+      then: (cur) => intersectType(cur, checkType),
+      else: (cur) => subtractType(cur, checkType),
+    };
+  }
+  // Inferred type-guard call (A6b): narrow the argument by the guard's fact.
+  if (cond.type === "FunctionCall") {
+    const guard = guards.get(cond.function);
+    const arg = guard && cond.arguments[guard.paramIndex]?.value;
+    const key = arg ? placeKey(arg) : null;
+    if (!guard || !arg || key === null) return null;
+    return {
+      name: key,
+      place: arg,
+      then: guard.nonNullOn === "then" ? nonNullable : null,
+      else: guard.nonNullOn === "else" ? nonNullable : null,
+    };
+  }
+  if (cond.type !== "BinaryOperation") return null;
+  if (cond.operator !== "==" && cond.operator !== "!=") return null;
+  // The compared-against side is `null` or a literal; the other side is the
+  // place. `x == null` / `x != null`, or `x == L` / `x != L`.
+  const leftConst = cond.left.type === "NullLiteral" || literalType(cond.left);
+  const place = leftConst ? cond.right : cond.left;
+  const lit = literalType(cond.left) ?? literalType(cond.right);
+  const isNull = cond.left.type === "NullLiteral" ||
+    cond.right.type === "NullLiteral";
+  const key = placeKey(place);
+  if (key === null) return null;
+  if (isNull) {
+    // `x != null` → non-null when true; `x == null` → non-null when false.
+    return cond.operator === "!="
+      ? { name: key, place, then: nonNullable, else: null }
+      : { name: key, place, then: null, else: nonNullable };
+  }
+  if (lit) {
+    const eq = (cur: VLType) => intersectType(cur, lit);
+    const ne = (cur: VLType) => subtractType(cur, lit);
+    return cond.operator === "=="
+      ? { name: key, place, then: eq, else: ne }
+      : { name: key, place, then: ne, else: eq };
+  }
+  return null;
+};
+
+const factNarrowing = (f: AtomFact, dir: "then" | "else"): Narrowing[] => {
+  const apply = f[dir];
+  return apply ? [{ name: f.name, place: f.place, apply }] : [];
+};
+
+// Narrowings that hold in the THEN branch of `if <cond>`. A `&&` contributes
+// *both* sides' then-facts (the conjunction holds), a `||` contributes none (a
+// disjunction narrows nothing positively); an atom contributes its then-fact.
+export const thenNarrowings = (cond: VLExpression): Narrowing[] => {
+  if (cond.type === "BinaryOperation" && cond.operator === "&&") {
+    return [...thenNarrowings(cond.left), ...thenNarrowings(cond.right)];
+  }
+  if (cond.type === "BinaryOperation" && cond.operator === "||") return [];
+  const f = atomFact(cond);
+  return f ? factNarrowing(f, "then") : [];
+};
+
+// Narrowings that hold in the ELSE branch — the De Morgan dual: `||` contributes
+// both sides' else-facts (neither arm held), `&&` contributes none.
+export const elseNarrowings = (cond: VLExpression): Narrowing[] => {
+  if (cond.type === "BinaryOperation" && cond.operator === "||") {
+    return [...elseNarrowings(cond.left), ...elseNarrowings(cond.right)];
+  }
+  if (cond.type === "BinaryOperation" && cond.operator === "&&") return [];
+  const f = atomFact(cond);
+  return f ? factNarrowing(f, "else") : [];
+};
+
+// A place's current (possibly already-narrowed) type for a narrowing: a bare
+// name from the scope stack, a path via `typeFromExpression` (which itself
+// consults the `narrowedPaths` overlay).
+const placeCurrentType = (
+  place: VLExpression,
+  ctx: Context,
+): VLType | undefined => {
+  if (place.type === "Name") {
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if (place.name in scopes[i]) return scopes[i][place.name];
+    }
+    return undefined;
+  }
+  return typeFromExpression(place, ctx);
+};
+
+// Run `fn` with a list of narrowings overlaid — a name via the scope stack, a
+// property path via `narrowedPaths` — each read against the current (already-
+// overlaid) type so successive narrowings compose (`x is A && x is B` → `A & B`).
+// A refinement to `Never` (a disjoint / dead branch) is skipped rather than
+// overlaid, so member access doesn't spuriously resolve against `Never`. Used by
+// the appliers and by short-circuit `&&`/`||` type derivation.
+export const withNarrowings = <T>(
+  ns: Narrowing[],
+  ctx: Context,
+  fn: () => T,
+): T => {
+  const go = (i: number): T => {
+    if (i >= ns.length) return fn();
+    const n = ns[i];
+    const cur = placeCurrentType(n.place, ctx);
+    const next = cur && n.apply(cur);
+    if (!next || next.type === "Never") return go(i + 1);
+    if (n.place.type === "Name") {
+      return withScope({ [n.name]: next }, () => go(i + 1));
+    }
+    const had = n.name in narrowedPaths;
+    const prev = narrowedPaths[n.name];
+    narrowedPaths[n.name] = next;
+    try {
+      return go(i + 1);
+    } finally {
+      if (had) narrowedPaths[n.name] = prev;
+      else delete narrowedPaths[n.name];
+    }
+  };
+  return go(0);
 };
 
 // Whether a statement always diverges (never falls through to the next): a
@@ -1019,17 +1224,15 @@ export const divergesStatement = (s: VLStatement): boolean => {
 };
 
 // Post-guard narrowing (A5): a guard clause `if x == null { return }` (a single
-// conditional, no else, whose then-branch diverges) leaves `x` non-null for the
-// REST of the enclosing block. Returns the variable to narrow to non-null, else
-// null. (Only the non-null direction is applied.)
-export const postGuardNarrowing = (stmt: VLStatement): string | null => {
-  if (stmt.type !== "If") return null;
-  if (stmt.conditionals.length !== 1 || stmt.else) return null;
-  if (!divergesStatement(stmt.conditionals[0].statement)) return null;
-  const narrow = conditionNarrowing(stmt.conditionals[0].condition);
-  // The then-branch diverged, so the fall-through is the else side: `x` is
-  // non-null there iff the condition placed it non-null in the else.
-  return narrow?.nonNullOn === "else" ? narrow.name : null;
+// conditional, no else, whose then-branch diverges) leaves `x` narrowed for the
+// REST of the enclosing block. The fall-through *is* the condition's else side,
+// so the narrowings are exactly its `elseNarrowings` — which generalizes to
+// `||` guards (`if x == null || y == null { return }` narrows both x and y).
+export const postGuardNarrowings = (stmt: VLStatement): Narrowing[] => {
+  if (stmt.type !== "If") return [];
+  if (stmt.conditionals.length !== 1 || stmt.else) return [];
+  if (!divergesStatement(stmt.conditionals[0].statement)) return [];
+  return elseNarrowings(stmt.conditionals[0].condition);
 };
 
 /** Registers diagnostics automatically */
@@ -1236,6 +1439,19 @@ export const ensureType = (
       }
       return pushError(28);
     }
+    // Refinement types (A3/A4) appear as narrowed views, rarely as an assignment
+    // target. `right` satisfies `A & B` iff it satisfies every conjunct; it
+    // satisfies `not A` iff it is *not* assignable to `A` (a conservative,
+    // structural check — open-world negation isn't fully tracked).
+    case "Intersection": {
+      if (!left.subTypes.every((s) => validateType(s, right))) {
+        return pushError("intersection");
+      }
+      return true;
+    }
+    case "Negation":
+      if (validateType(left.subType, right)) return pushError("negation");
+      return true;
     // case "Never":
     //   if (right.type !== "Never") return pushError(29);
     //   return true;

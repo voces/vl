@@ -35,24 +35,18 @@ import type {
   VLUnaryOperationNode,
   VLVariableDeclarationNode,
 } from "./ast.ts";
-import {
-  errors,
-  flow,
-  guards,
-  narrowedPaths,
-  scopes,
-  withScope,
-} from "./state.ts";
+import { errors, flow, guards, narrowedPaths, scopes } from "./state.ts";
+import type { Narrowing } from "./typecheck.ts";
 import {
   arrayElementType,
   conditionNarrowing,
   defaultIntegerType,
-  elseNarrowing,
+  elseNarrowings,
   ensureType,
   flattenType,
   getChildType,
-  nonNullable,
-  postGuardNarrowing,
+  postGuardNarrowings,
+  thenNarrowings,
   getConcreteType,
   getType,
   instantiateFunctionType,
@@ -62,6 +56,7 @@ import {
   typeFromStatement,
   updateType,
   validateType,
+  withNarrowings,
 } from "./typecheck.ts";
 
 // Public facade: preserve the historical `./toAST.ts` surface.
@@ -71,11 +66,12 @@ export {
   arrayElementType,
   conditionNarrowing,
   defaultIntegerType,
-  elseNarrowing,
+  elseNarrowings,
   getConcreteType,
   nonNullable,
   placeKey,
-  postGuardNarrowing,
+  postGuardNarrowings,
+  thenNarrowings,
   setNodeType,
   softenImplicitType,
   validateParameters,
@@ -594,11 +590,13 @@ const toExpression = (ctx: ExprContext): VLExpression => {
           // Post-guard narrowing (A5): a guard clause `if x == null { return }`
           // leaves `x` non-null for the rest of this block — narrow it in the
           // block scope so subsequent statements see the non-null type.
-          const name = postGuardNarrowing(stmt);
-          if (name) {
+          for (const n of postGuardNarrowings(stmt)) {
+            // Path post-guard narrowing is deferred (needs block-scoped overlay
+            // cleanup); names narrow into the block scope, cleared on scope pop.
+            if (n.place.type !== "Name") continue;
             for (let i = scopes.length - 1; i >= 0; i--) {
-              if (name in scopes[i]) {
-                blockScope[name] = nonNullable(scopes[i][name]);
+              if (n.name in scopes[i]) {
+                blockScope[n.name] = n.apply(scopes[i][n.name]);
                 break;
               }
             }
@@ -700,9 +698,24 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     if (op) {
       const leftCtx = ctx.expr(0);
       const left = toExpression(leftCtx);
-      const rightCtx = ctx.expr(1);
-      const right = toExpression(rightCtx);
       const operator = op.getText();
+      const rightCtx = ctx.expr(1);
+      // Short-circuit narrowing (A5): the RHS of `&&` is built/type-checked with
+      // the LHS's then-narrowings in scope (the RHS only runs when the LHS held),
+      // and `||` with its else-narrowings — so `x != null && x.y` resolves `x.y`.
+      const right = operator === "&&"
+        ? withNarrowings(
+          thenNarrowings(left),
+          rightCtx,
+          () => toExpression(rightCtx),
+        )
+        : operator === "||"
+        ? withNarrowings(
+          elseNarrowings(left),
+          rightCtx,
+          () => toExpression(rightCtx),
+        )
+        : toExpression(rightCtx);
 
       // Operator as a `self`-method: when the left operand is a user object and a
       // free `self`-function named for the operator is in scope, dispatch `a op b`
@@ -828,103 +841,43 @@ const toExpression = (ctx: ExprContext): VLExpression => {
   {
     const ifCtx = ctx.if_();
     if (ifCtx) {
-      // Walk a conditional's then-statement with flow narrowing (A5): inside
-      // `if x != null { … }`, `x` is seen as non-null. Only the non-null case is
-      // narrowed (the useful one); a `== null` then-branch is left as-is.
-      // A place's current type: a bare name from the scope stack, a property
-      // path resolved through its object's shape.
+      // Flow narrowing (A5), now list-based to support `&&`/`||` and else-chain.
+      // `elseAcc` accumulates the negations of every condition seen so far, so a
+      // later `else if`'s then-branch (and the final `else`) is narrowed by the
+      // complement of all prior conditions plus its own positive narrowing —
+      // `if x is A {} else if x is B { /* x: (U−A) & B */ } else { /* U−A−B */ }`.
+      let elseAcc: Narrowing[] = [];
       // deno-lint-ignore no-explicit-any
-      const placeType = (n: NonNullable<ReturnType<typeof conditionNarrowing>>, ctx: any) => {
-        if (n.place.type === "Name") {
-          for (let i = scopes.length - 1; i >= 0; i--) {
-            if (n.name in scopes[i]) return scopes[i][n.name];
-          }
-          return undefined;
-        }
-        return typeFromExpression(n.place, ctx);
-      };
-      // Walk a statement with `place` narrowed to `type`: a bare name via the
-      // scope stack, a property path via the shared `narrowedPaths` overlay.
-      const withNarrowedPlace = (
-        n: NonNullable<ReturnType<typeof conditionNarrowing>>,
-        type: VLType,
-        // deno-lint-ignore no-explicit-any
-        stmtCtx: any,
-      ) => {
-        if (n.place.type === "Name") {
-          return withScope({ [n.name]: type }, () => toStatement(stmtCtx));
-        }
-        const had = n.name in narrowedPaths;
-        const prev = narrowedPaths[n.name];
-        narrowedPaths[n.name] = type;
-        try {
-          return toStatement(stmtCtx);
-        } finally {
-          if (had) narrowedPaths[n.name] = prev;
-          else delete narrowedPaths[n.name];
-        }
-      };
-      // Walk a conditional's then-statement with flow narrowing (A5): inside
-      // `if x is T { … }`, `x` (or `o.v`) is the narrowed variant. Only the
-      // then-positive case is narrowed here; the else mirror is below.
-      // deno-lint-ignore no-explicit-any
-      const narrowThen = (cond: VLExpression, stmtCtx: any) => {
-        const n = conditionNarrowing(cond);
-        if (n?.nonNullOn === "then") {
-          const cur = placeType(n, stmtCtx);
-          if (cur) {
-            return withNarrowedPlace(n, n.thenType ?? nonNullable(cur), stmtCtx);
-          }
-        }
-        return toStatement(stmtCtx);
-      };
-      // The mirror: in the else branch, narrow by the (main) condition's
-      // complement — `if x is A { … } else { /* x: U − A */ }`, or non-null on
-      // the side a nullness test excludes null.
-      // deno-lint-ignore no-explicit-any
-      const narrowElse = (cond: VLExpression, stmtCtx: any) => {
-        const n = conditionNarrowing(cond);
-        if (n) {
-          const cur = placeType(n, stmtCtx);
-          const elseType = cur && elseNarrowing(cond, cur);
-          if (elseType && elseType.type !== "Never") {
-            return withNarrowedPlace(n, elseType, stmtCtx);
-          }
-        }
-        return toStatement(stmtCtx);
+      const buildConditional = (cond: VLExpression, condCtx: any, stmtCtx: any) => {
+        const statement = withNarrowings(
+          [...elseAcc, ...thenNarrowings(cond)],
+          stmtCtx,
+          () => toStatement(stmtCtx),
+        );
+        elseAcc = [...elseAcc, ...elseNarrowings(cond)];
+        const conditional = {
+          condition: cond,
+          statement,
+          conditionContext: condCtx,
+          statementContext: stmtCtx,
+        };
+        Object.defineProperty(conditional, "conditionContext", {
+          enumerable: false,
+        });
+        Object.defineProperty(conditional, "statementContext", {
+          enumerable: false,
+        });
+        return conditional;
       };
       const conditionContext = ifCtx.expr();
       const condition = toExpression(conditionContext);
       const statementContext = ifCtx.statement();
       const elseCtx = ifCtx.else_();
-      const mainIf = {
-        condition,
-        statement: narrowThen(condition, statementContext),
-        conditionContext,
-        statementContext,
-      };
-      Object.defineProperty(mainIf, "conditionContext", { enumerable: false });
-      Object.defineProperty(mainIf, "statementContext", { enumerable: false });
       const conditionals = [
-        mainIf,
-        ...ifCtx.elseIf_list().map((e) => {
-          const conditionContext = e.expr();
-          const statementContext = e.statement();
-          const condition = toExpression(conditionContext);
-          const elseIf = {
-            condition,
-            statement: narrowThen(condition, statementContext),
-            conditionContext,
-            statementContext,
-          };
-          Object.defineProperty(elseIf, "conditionContext", {
-            enumerable: false,
-          });
-          Object.defineProperty(elseIf, "statementContext", {
-            enumerable: false,
-          });
-          return elseIf;
-        }),
+        buildConditional(condition, conditionContext, statementContext),
+        ...ifCtx.elseIf_list().map((e) =>
+          buildConditional(toExpression(e.expr()), e.expr(), e.statement())
+        ),
       ];
       for (const conditional of conditionals) {
         ensureType(
@@ -943,7 +896,11 @@ const toExpression = (ctx: ExprContext): VLExpression => {
         type: "If",
         conditionals,
         else: elseCtx
-          ? narrowElse(condition, elseCtx.statement())
+          ? withNarrowings(
+            elseAcc,
+            elseCtx.statement(),
+            () => toStatement(elseCtx.statement()),
+          )
           : undefined,
       };
     }

@@ -34,10 +34,19 @@ closures / `is` / variance designs referenced here.
   `Infer`, `Custom` (predicate). Missing the rest below. Note: `Unknown`/`Infer` are
   **inference holes that resolve** to concrete types, not a runtime `dynamic` — VL is
   fully typed, so there is no gradual escape hatch.
-- ⬜ **A3. Intersection types** (`A & B`). Needed for narrowing results and structural
-  refinement. Round out the set-theoretic algebra.
-- ⬜ **A4. Negation types** (`not A`). Needed so guards can subtract types on the false
-  branch.
+- 🟡 **A3. Intersection types** (`A & B`). **DONE (as narrowing algebra):** a `VLIntersectionType`
+  + `intersectType(a, b)` (`typecheck.ts`) is the then-branch refinement of a guard — `if x is A`
+  narrows `x` to `x & A`, each member of `x` refined to its meet with `A` and disjoint members
+  dropped (so `(string | i32) & i32` is `i32`, an impossible refinement is `Never`). Composes when
+  the same place is guarded twice (`x is A && x is B` → `A & B`). Wired into `ensureType` /
+  `stringify` / soften. REMAINING: **surface syntax** (`A & B` as a type annotation — parser) and
+  general structural-refinement uses beyond narrowing.
+- 🟡 **A4. Negation types** (`not A`). **DONE (as narrowing algebra):** a `VLNegationType` is the
+  else-branch subtraction — `if x is A { … } else { /* x: x − A */ }`, and `x == L` narrows the
+  else to `x − L`. `intersectType` consumes a `Negation` as a subtraction and `subtractType`
+  removes finite-union members; an open-world residual (`i32 − 1`) is dropped to its positive part
+  (so codegen never sees an unrepresentable negation). Wired into `ensureType`/`stringify`/soften.
+  REMAINING: **surface syntax** (`not A`), and full open-world negation tracking (needs A12).
 - 🟡 **A5. Flow narrowing.** **DONE (nullness slice):** inside `if x != null { … }` (or
   `if x is T { … }`), `x` is narrowed to its non-null type, so member access resolves to the
   underlying shape (`p.x` is a type error on `{x:i32} | null`, valid after the guard). A shared
@@ -53,10 +62,22 @@ closures / `is` / variance designs referenced here.
   branch and to its **complement** `U − A` in the else branch (`subtractType`/`elseNarrowing` in
   `typecheck.ts`), so a two-case union is fully discriminated by one `if` and an N-case union peels
   one variant at a time. Nested narrowings compose (each is based on the *current* narrowed view,
-  not the declared type). Tests `types/nullable.vl`, `types/guard-narrowing.vl`,
-  `types/union-narrowing.vl`. REMAINING (needs A3/A4 for the general case): `&&`-chained guards
-  (`if x != null && x.y …`), and `case`/multi-guard; the else-branch narrowing currently keys off
-  the *first* conditional only.
+  not the declared type). **DONE (general case — A3/A4):** `&&`/`||`-chained guards now narrow.
+  Short-circuit narrowing — the RHS of `&&` is type-checked *and* codegen'd with the LHS's
+  then-narrowings applied (`||` with its else-narrowings), so `if x != null && x.y is i32 { x.y }`
+  resolves `x.y` and discriminates it in one condition; `&&`/`||` also gained short-circuit codegen
+  (`if a then b else 0` / `if a then 1 else b`). A guard narrows a *list* of facts (a `&&` of guards
+  narrows several places at once); the De Morgan dual gives `||` guard clauses — `if x == null ||
+  y == null { return }` narrows **both** after. else-of-else-if now chains: the final `else` (and
+  each later `else if`) is narrowed by the complement of **every** prior condition, not just the
+  first (`elseAcc` accumulator in toAST + the persistent overlay in toWasm). `==`/`!=` against a
+  **literal** discriminates too (then `x & L`, else `x − L`). Shared `withNarrowings` applier
+  (`typecheck.ts`) used by both passes; `thenNarrowings`/`elseNarrowings`/`postGuardNarrowings`
+  return fact lists. Tests `types/{nullable,guard-narrowing,union-narrowing,and-narrowing,
+  or-guard-narrowing,else-chain-narrowing,literal-narrowing}.vl`. *(Fixed alongside: a niche-nullable
+  object literal — `{ y: 5 }` for a `{ y: string | i32 } | null` param — wasn't built with its
+  field's boxed union representation, crashing binaryen when the field was later discriminated.)*
+  REMAINING: `case`/multi-guard (no grammar yet); the **stored-witness** correlation is A6b Stage B.
 - 🟢 **A6. `is` operator + tagged unions.** **DONE (stage 1):** grammar `expr IS type` (`x is T`),
   a `VLIsNode`, typed boolean, feeds A5 narrowing; `==`/`!=` against `null` are the natural sugar.
   **DONE (stage 2 — general union discrimination):** an arbitrary value union now has a runtime
