@@ -358,6 +358,16 @@ stays tolerant of both binaryen forms (sync object / async init).*
   (Track D); (5) consistent **message style** (currently "Syntax error:" prefixes a lot that
   isn't syntactic). The empty-range warning is the template: detect statically, emit a `warning`,
   don't block codegen.
+- ⬜ **B18. Tail-call optimization (low priority).** Recursion works (B-track / `functions/
+  recursion.vl`) but every call — including recursive — is a regular `m.call`, so it **grows the
+  wasm stack**; binaryen does **not** auto-TCO. Deep tail recursion (`sum(100000)`) overflows.
+  Substrate is ready: binaryen 130 has `return_call` / `return_call_indirect` + the `TailCall`
+  feature (well-supported in V8/browsers). To add: detect **tail position** (a call that is the
+  body's tail expression / `return f(…)` / the tail of a tail branch — *not* `n * f(n-1)`, which
+  isn't tail-recursive and can't be helped) and emit `return_call` there. Caveat: precise
+  tail-position analysis is the fiddly part, and without an explicit `become`/tail keyword it's
+  best-effort, not a guarantee. Note many recursions (`fact`, `fib`) aren't tail-recursive
+  anyway. **Deprioritized** — correctness is fine; this is a depth/perf optimization.
 
 ## Track C — CLI (`vl` / `vital` command)
 *New surface. Depends on the existing parse→AST→wasm pipeline being callable outside the
