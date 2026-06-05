@@ -9,6 +9,9 @@
 //   // @check            type-check only (default)
 //   // @run              compile, then instantiate + run, capturing `log` output
 //   // @no-error         assert there are no error diagnostics
+//   // @ok               alias of @no-error: compiles cleanly (zero ERROR
+//                        diagnostics) without instantiating — for pure
+//                        type-level "must-not-error" soundness checks
 //   // @error TEXT       assert some error diagnostic message contains TEXT
 //   // @log TEXT         assert the Nth `log` line equals TEXT (ordered; @run)
 //   // @skip REASON      register the test but skip it (REASON documents why)
@@ -57,6 +60,7 @@ const parseDirectives = (src: string): Directives => {
         d.mode = "check";
         break;
       case "no-error":
+      case "ok":
         d.noError = true;
         break;
       case "error":
