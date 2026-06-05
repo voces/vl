@@ -23,6 +23,30 @@ export const registerBuiltins = (m: any, binaryen: any) => {
     0,
   );
 
+  // Direct value imports backing the `print(x)` builtin — each receives the
+  // value itself (no linear-memory round-trip) and the host formats it.
+  // `__print_char__` streams one code point of a string; `__print_str_flush__`
+  // (below) emits the assembled line.
+  for (
+    const [name, type] of [
+      ["__print_i32__", binaryen.i32],
+      ["__print_i64__", binaryen.i64],
+      ["__print_f32__", binaryen.f32],
+      ["__print_f64__", binaryen.f64],
+      ["__print_bool__", binaryen.i32],
+      ["__print_char__", binaryen.i32],
+    ]
+  ) {
+    m.addFunctionImport(name, "imports", name, binaryen.createType([type]), 0);
+  }
+  m.addFunctionImport(
+    "__print_str_flush__",
+    "imports",
+    "__print_str_flush__",
+    binaryen.createType([]),
+    0,
+  );
+
   // TODO: These don't need to be actual funcitons... can inline. But I think binaryen does that for us.
   m.addFunction(
     "__store_i32__",

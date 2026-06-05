@@ -37,6 +37,7 @@ import type {
 import { errors, flow, scopes } from "./state.ts";
 import {
   arrayElementType,
+  defaultIntegerType,
   ensureType,
   flattenType,
   getChildType,
@@ -56,6 +57,7 @@ export * from "./ast.ts";
 export { withScope } from "./state.ts";
 export {
   arrayElementType,
+  defaultIntegerType,
   getConcreteType,
   setNodeType,
   softenImplicitType,
@@ -590,10 +592,20 @@ const toExpression = (ctx: ExprContext): VLExpression => {
     if (num) {
       const text = num.getText();
       const value = parseFloat(text);
+      const isInteger = Number.isInteger(value) && !text.includes(".");
+      // A literal too large for any integer type (beyond i64) can't be
+      // represented; report it rather than silently wrapping.
+      if (isInteger && defaultIntegerType(text, value) === undefined) {
+        errors.push({
+          type: "Syntax",
+          message:
+            `Integer literal ${text} is too large to represent (exceeds the i64 range).`,
+          ctx,
+          code: 0,
+        });
+      }
       return {
-        type: Number.isInteger(value) && !text.includes(".")
-          ? "IntegerLiteral"
-          : "RealLiteral",
+        type: isInteger ? "IntegerLiteral" : "RealLiteral",
         value,
         text,
       };

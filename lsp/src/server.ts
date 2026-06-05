@@ -7,12 +7,7 @@ import {
   TextDocumentSyncKind,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
-import {
-  compile,
-  runWasm,
-  VLDiagnostic,
-  VLSeverity,
-} from "../../compiler/compile.ts";
+import { compile, VLDiagnostic, VLSeverity } from "../../compiler/compile.ts";
 
 declare const process: NodeJS.Process;
 
@@ -44,17 +39,11 @@ documents.onDidChangeContent(async (event) => {
     `[Server(${process.pid}) ${workspaceFolder}] Document changed: ${event.document.uri}`,
   );
 
-  const { diagnostics, wasm } = await compile(event.document.getText());
-
-  // Best-effort: run the compiled module so `log` output shows in the console.
-  if (wasm) {
-    try {
-      const { logs } = await runWasm(wasm);
-      for (const line of logs) console.log(line);
-    } catch (err) {
-      console.error(err);
-    }
-  }
+  // Diagnostics only — running a program is explicit (the `vital.runFile`
+  // command / Ctrl+F5), never a side effect of editing. (Auto-running on every
+  // change executed arbitrary program logic on each keystroke — e.g. an infinite
+  // loop would hang the server.)
+  const { diagnostics } = await compile(event.document.getText());
 
   connection.sendDiagnostics({
     uri: event.document.uri,

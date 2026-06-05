@@ -4,7 +4,8 @@ The vision: a scripting-feel language with types **hidden by aggressive inferenc
 **permissive & structural**, **fully type-safe** (statically sound — there is no
 untyped code; inference holes resolve to concrete types), compiling to **lean
 WebAssembly**. Deliverables:
-**LSP-backed VS Code extension** (exists, partial) · **CLI to compile/run** (missing) ·
+**LSP-backed VS Code extension** (exists, partial; now with a Run-Current-File command) ·
+**CLI to compile/run** (MVP: `deno task run` / `compiler/cli.ts`; native binary TBD) ·
 **in-browser playground with a sandbox** (missing).
 
 Status legend: ✅ done · 🟡 partial · ⬜ not started.
@@ -125,8 +126,14 @@ stays tolerant of both binaryen forms (sync object / async init).*
   **binaryen upgraded 116→130** for the ergonomic GC API (`module.struct`/`module.array`/
   `TypeBuilder` — absent in 116). The old upgrade blocker (binaryen TLA breaking CJS) is
   moot since the LSP server is ESM. Only API drift: `i64.const` now takes a single bigint.
-- 🟡 **B2. Finish numeric codegen.** i64 & f32 binary ops are not wired (only i32/boolean/
-  f64 branches exist). Add numeric **casting/coercion** (none today).
+- 🟡 **B2. Finish numeric codegen.** i64 & f32 **binary ops** are still not wired (only
+  i32/boolean/f64 arithmetic branches exist). DONE: i64/f32 **type mappings** — `wasmType.ts`
+  now maps the `i64`/`f32` object types, so typed locals/params/returns (`let x: i64 = …`,
+  `function f(x: f32)`) and `print` of those work; only the arithmetic operator branches remain.
+  DONE: **range-aware integer-literal defaults** — an un-annotated integer literal defaults to
+  the narrowest integer type that holds it *exactly* (i32, else i64) instead of silently wrapping
+  into i32; a literal beyond the i64 range is a diagnostic (`defaultIntegerType`, shared by
+  `typecheck.ts` soften + `toWasm.ts` codegen). Still TODO: numeric **casting/coercion** (none today).
 - ✅ **B3. First-class functions / indirect calls** — incl. per-shape monomorphization.
   *Representation note: B4 superseded the bare i32 index — a function value is now a fat-pointer
   closure struct `{ i32 tableIndex, structref env }`; the table + `call_indirect` dispatch below
@@ -226,12 +233,20 @@ stays tolerant of both binaryen forms (sync object / async init).*
   the nominal `name`); `.length`/`s[i]` ride the array machinery; `+` concatenates inline
   (`array.new` + two `array.copy`). Works as a value, param (`function f(s: string)`),
   reassignment, and a `self`-receiver (`"hi".first()`). **`==`/`!=`** done — a lazily-emitted
-  `__string_eq__` helper (length + element compare). **Printing** done — `__store_string__(off,
+  `__string_eq__` helper (length + element compare). **Low-level printing** — `__store_string__(off,
   s)` copies a GC string's chars as bytes into linear memory (lazy `storeStringFn` helper), and
-  the new `__log_string__(off, len)` host import renders raw bytes as text (so `"hello"` prints
-  "hello"). Tests `strings/basics.vl`, `strings/string-method.vl`, `strings/print-and-eq.vl`.
-  REMAINING: **UTF-8 / i8-packed** representation as a size optimization (MVP is 4 bytes/char,
-  codepoints); richer methods (slice, indexOf); a `print(s)` convenience wrapping store+log.
+  `__log_string__(off, len)` host import renders raw bytes as text (used by `strings/print-and-eq.vl`).
+  **`print(x)` convenience** done: a string streams its code points to the host one at a time
+  (`__print_string__` → `__print_char__`/`__print_str_flush__`, no linear memory — the host can't read
+  a GC array directly). Tests `strings/basics.vl`, `strings/string-method.vl`, `strings/print-and-eq.vl`,
+  `run/print.vl`.
+  REMAINING: **`wasm:js-string` builtins + UTF-16 (`i16`) string representation** — the *conventional*
+  WasmGC↔JS-host story (what dart2wasm/Kotlin-Wasm do): the engine reads the GC array directly via
+  `fromCharCodeArray`, replacing both per-char `print` streaming and any linear-memory copy in one bulk
+  native call. Requires switching the string backing from an i32 code-point array to `(array mut i16)`
+  (touches literals, indexing, `.length`, concat, `==`). Engine support confirmed (V8 14.9 accepts
+  `{builtins:["js-string"]}`). Also: **UTF-8 / i8-packed** representation as a size optimization
+  (current MVP is 4 bytes/char); richer methods (slice, indexOf).
 - 🟡 **B8. Loops.** DONE: **`for…in` over arrays** — the `to`-less `for x in arr` (grammar:
   the `TO expr` clause is now optional) binds `x` to each element, lowered to a 0..length index
   loop over `array.get` (iterable evaluated once into a local); a non-array iterable is a clean
@@ -412,6 +427,14 @@ stays tolerant of both binaryen forms (sync object / async init).*
   tail-position analysis is the fiddly part, and without an explicit `become`/tail keyword it's
   best-effort, not a guarantee. Note many recursions (`fact`, `fib`) aren't tail-recursive
   anyway. **Deprioritized** — correctness is fine; this is a depth/perf optimization.
+- ✅ **B19. `return` keyword / early returns.** A function body may `return` early (from a
+  branch, from inside a loop) or fall through to a trailing `return`; a bare `return` yields null.
+  Wired end-to-end: grammar `returnStatement` → toAST collects each `return`'s value type into
+  the function's inferred return (no annotation needed) → toWasm emits `m.return`. A body that
+  ends in `return` compiles to an `unreachable`-typed block, and `instantiate` reads the real
+  result type from the resolved return type (not the body). Tests `functions/early-return.vl`
+  (early/loop/fall-through, inferred i32 + string). *(Fixed alongside: `print(f())` dropped its
+  function-call argument in statement position — now evaluated in value position.)*
 
 ## Track C — CLI (`vl` / `vital` command)
 *New surface. Depends on the existing parse→AST→wasm pipeline being callable outside the
@@ -420,8 +443,12 @@ LSP (today `toWasm` only runs inside `server.ts`).*
 - ✅ **C1. Extract a headless `compile(source) → { wasm, diagnostics }`** entry point,
   decoupled from the LSP. Done — `compiler/compile.ts` is the single source of truth shared
   by the LSP, `tests/run.ts`, and (future) CLI + browser.
-- ⬜ **C2. `vl run <file>`** — compile + instantiate + execute, wiring the `log` import
-  (host stdout) the way `server.ts` does today.
+- 🟡 **C2. `vl run <file>`** — compile + instantiate + execute, wiring the `log` import
+  (host stdout). **DONE (MVP):** `compiler/cli.ts` + `deno task run` runs a file, an inline
+  snippet (`-e "…"`), or stdin — prints diagnostics to stderr, `print`/`log` output to stdout,
+  non-zero exit on errors. The VS Code extension's **Run Current File** command (Ctrl+F5) shells
+  out to it in a terminal (runs the live buffer via a temp file when unsaved). REMAINING: a real
+  `vl`/`vital` binary (C5) rather than `deno task run`.
 - ⬜ **C3. `vl build <file> -o out.wasm`** — emit `.wasm` (and optional `.wat`).
 - ⬜ **C4. `vl check <file>`** — diagnostics only, exit code for CI.
 - ⬜ **C5. Decide CLI runtime/distribution** — Deno (`deno compile` for a binary) vs Node.

@@ -1,7 +1,7 @@
 import Binaryen from "binaryen";
 import {
   arrayElementType,
-  setNodeType,
+  defaultIntegerType,
   softenImplicitType,
   validateType,
   VLFunctionCallNode,
@@ -383,6 +383,49 @@ export const toWasm = async (ast: VLProgramNode) => {
         name,
         binaryen.createType([binaryen.i32, at.refType]),
         binaryen.i32,
+        [binaryen.i32, binaryen.i32],
+        body,
+      );
+    }
+    return name;
+  };
+
+  // `__print_string__(str)`: stream a string's char codes to the host one at a
+  // time (`__print_char__`), then `__print_str_flush__` emits the assembled
+  // line. Backs `print(string)` without touching linear memory — the host can't
+  // read a WasmGC array directly, but it can accumulate the code points.
+  const printStringFn = (): string => {
+    const name = "__print_string__";
+    if (!_helpers.has(name)) {
+      _helpers.add(name);
+      const at = arrayType(i32Type);
+      const str = () => m.local.get(0, at.refType);
+      const i = () => m.local.get(1, binaryen.i32);
+      const len = () => m.local.get(2, binaryen.i32);
+      const body = m.block(null, [
+        m.local.set(2, m.array.len(str())),
+        m.local.set(1, m.i32.const(0)),
+        m.block("ps_brk", [
+          m.loop(
+            "ps_loop",
+            m.block(null, [
+              m.br("ps_brk", m.i32.ge_s(i(), len())),
+              m.call(
+                "__print_char__",
+                [m.array.get(str(), i(), binaryen.i32, false)],
+                binaryen.none,
+              ),
+              m.local.set(1, m.i32.add(i(), m.i32.const(1))),
+              m.br("ps_loop"),
+            ]),
+          ),
+        ]),
+        m.call("__print_str_flush__", [], binaryen.none),
+      ], binaryen.none);
+      m.addFunction(
+        name,
+        binaryen.createType([at.refType]),
+        binaryen.none,
         [binaryen.i32, binaryen.i32],
         body,
       );
@@ -826,7 +869,9 @@ export const toWasm = async (ast: VLProgramNode) => {
           ? desiredType?.name || "i32"
           : desiredType?.type === "Alias" // TODO: Should be concrete, but right now the built-ins have Aliases
           ? desiredType.name
-          : "i32";
+          // No desired type: widen to the narrowest integer type that holds the
+          // literal exactly (i32, else i64) rather than wrapping into i32.
+          : defaultIntegerType(node.text, node.value) ?? "i64";
         if (
           type !== "i32" && type !== "i64" && type !== "f32" && type !== "f64"
         ) throw new Error("Expected numeric type");
@@ -854,6 +899,48 @@ export const toWasm = async (ast: VLProgramNode) => {
         return m[type].const(node.value);
       }
       case "FunctionCall": {
+        // `print(x)` is a compiler builtin (no module/import system yet): lower
+        // it to a type-appropriate host call. Numerics/bool go through a direct
+        // value import; a string streams its char codes to the host (no linear
+        // memory). We branch on the emitted value's wasm type so the call
+        // signature always matches, refining i32 → bool/i32 and a ref → string
+        // by the VL-level type.
+        if (node.function === "print") {
+          const arg = node.arguments[0].value;
+          let t = softenImplicitType(codegenType(arg));
+          while (t.type === "Infer") t = softenImplicitType(t.subType);
+          const name = t.type === "Object" || t.type === "Alias"
+            ? t.name
+            : undefined;
+          // Evaluate in value (wanted) position: a bare `toExpression` in
+          // statement context would `drop` a function-call argument (yielding a
+          // `none`-typed value). The argument's own type is the desired type.
+          const value = withDesiredType(t, () => toExpression(arg));
+          const wt = binaryen.getExpressionType(value);
+          if (wt === binaryen.i64) {
+            return m.call("__print_i64__", [value], binaryen.none);
+          }
+          if (wt === binaryen.f32) {
+            return m.call("__print_f32__", [value], binaryen.none);
+          }
+          if (wt === binaryen.f64) {
+            return m.call("__print_f64__", [value], binaryen.none);
+          }
+          if (wt === binaryen.i32) {
+            return m.call(
+              name === "boolean" ? "__print_bool__" : "__print_i32__",
+              [value],
+              binaryen.none,
+            );
+          }
+          if (name === "string") {
+            return m.call(printStringFn(), [value], binaryen.none);
+          }
+          throw new Error(
+            `print: unsupported argument type "${name ?? t.type}" ` +
+              "(only numerics, boolean, and string are supported so far)",
+          );
+        }
         const func = getFunction(node) as unknown as string | number;
         // For an indirect call the callee is a value whose concrete signature
         // is bound in scope by the current monomorphization (more precise than
@@ -1555,12 +1642,19 @@ export const toWasm = async (ast: VLProgramNode) => {
     );
   }
 
-  console.log("result");
-  console.log(m.emitText());
+  // Guarded so the compiler core stays runtime-agnostic: it's also bundled into
+  // the Node-based LSP server, where `Deno` is undefined.
+  const debug = "Deno" in globalThis ? Deno.env.get("VL_DEBUG") : undefined;
+  if (debug) {
+    console.log("result");
+    console.log(m.emitText());
+  }
   // if (!m.validate()) throw new Error("validation error");
   m.optimize();
-  console.log("optimized");
-  console.log(m.emitText());
+  if (debug) {
+    console.log("optimized");
+    console.log(m.emitText());
+  }
   if (!m.validate()) throw new Error("validation error");
   return m.emitBinary();
 };

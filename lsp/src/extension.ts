@@ -1,7 +1,11 @@
 import * as path from "path";
+import * as os from "node:os";
+import { writeFile } from "node:fs/promises";
 import {
+  commands as Commands,
   ExtensionContext,
   OutputChannel,
+  Terminal,
   TextDocument,
   Uri,
   window as Window,
@@ -76,9 +80,49 @@ const createClient = (
   return client;
 };
 
+// Runs the active `.vl` file in an integrated terminal via the compiler's
+// `deno task run` CLI (compile + run, streaming diagnostics and program output).
+// The terminal is reused across runs. `cwd` is the compiler project root — the
+// parent of the extension dir (`<root>/lsp`) — so deno finds `<root>/deno.json`
+// (the `run` task + the binaryen import map).
+const registerRunCommand = (context: ExtensionContext) => {
+  let terminal: Terminal | undefined;
+  Window.onDidCloseTerminal((closed) => {
+    if (closed === terminal) terminal = undefined;
+  });
+
+  const run = async () => {
+    const editor = Window.activeTextEditor;
+    if (!editor || editor.document.languageId !== "vital") {
+      Window.showErrorMessage("Vital: open a .vl file to run it.");
+      return;
+    }
+    const doc = editor.document;
+    // Run the buffer as-is, with no save side effect: an untitled or unsaved
+    // (dirty) document has no usable on-disk path, so mirror its current text to
+    // a reused temp file. A clean, saved file runs by its real path (accurate
+    // error paths, no temp clutter).
+    let file: string;
+    if (doc.isUntitled || doc.isDirty) {
+      file = path.join(os.tmpdir(), "vital-run.vl");
+      await writeFile(file, doc.getText());
+    } else {
+      file = doc.uri.fsPath;
+    }
+    const cwd = path.dirname(context.extensionPath);
+    if (!terminal) terminal = Window.createTerminal({ name: "Vital", cwd });
+    terminal.show(true);
+    terminal.sendText(`deno task run "${file}"`);
+  };
+
+  context.subscriptions.push(Commands.registerCommand("vital.runFile", run));
+};
+
 export const activate = (context: ExtensionContext) => {
   const module = context.asAbsolutePath(path.join("dist", "server.mjs"));
   const outputChannel: OutputChannel = Window.createOutputChannel("vital");
+
+  registerRunCommand(context);
 
   const didOpenTextDocument = (document: TextDocument) => {
     // We are only interested in language mode text

@@ -246,6 +246,8 @@ export type RunResult = { logs: string[] };
  */
 export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
   const logs: string[] = [];
+  // Accumulates code points streamed by `__print_char__` until `__print_str_flush__`.
+  const printChars: number[] = [];
   const memory = new WebAssembly.Memory({ initial: 1, maximum: 65536 });
   await WebAssembly.instantiate(wasm, {
     imports: {
@@ -278,6 +280,20 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
           } else args.push(view[++i]);
         }
         logs.push(args.map((a) => a.toString()).join(" "));
+      },
+      // Direct value sinks for the `print(x)` builtin. A wasm i64 arrives as a
+      // JS bigint; the rest as numbers. Booleans render as `true`/`false`.
+      __print_i32__: (v: number) => logs.push(String(v)),
+      __print_i64__: (v: bigint) => logs.push(v.toString()),
+      __print_f32__: (v: number) => logs.push(String(v)),
+      __print_f64__: (v: number) => logs.push(String(v)),
+      __print_bool__: (v: number) => logs.push(v ? "true" : "false"),
+      // A string prints by streaming its code points (no shared memory); flush
+      // assembles and emits the accumulated line.
+      __print_char__: (code: number) => printChars.push(code),
+      __print_str_flush__: () => {
+        logs.push(String.fromCodePoint(...printChars));
+        printChars.length = 0;
       },
     },
   });

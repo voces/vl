@@ -350,6 +350,20 @@ export const defaultScope = () => {
       }],
       return: { type: "Alias", name: "null" },
     };
+
+    // `print(value)`: a built-in that logs a value of any printable type. The
+    // parameter accepts anything (codegen in toWasm dispatches on the argument's
+    // type to a type-specific host sink); supported today are numerics, boolean,
+    // and string.
+    scope.print = {
+      type: "Function",
+      paramaters: [{
+        type: "Parameter",
+        name: "value",
+        paramaterType: { type: "Custom", validate: namedFunc("any", () => true) },
+      }],
+      return: { type: "Alias", name: "null" },
+    };
   });
 
   return scope;

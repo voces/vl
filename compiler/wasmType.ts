@@ -16,6 +16,8 @@ export const toWasmType = (binaryen: any, node: VLType): number => {
         return binaryen.f64;
       case "Object":
         if (type.name === "i32") return binaryen.i32;
+        if (type.name === "i64") return binaryen.i64;
+        if (type.name === "f32") return binaryen.f32;
         if (type.name === "f64") return binaryen.f64;
         // Booleans are represented as an i32 (0 / 1).
         if (type.name === "boolean") return binaryen.i32;
@@ -24,7 +26,10 @@ export const toWasmType = (binaryen: any, node: VLType): number => {
         // A function value is an i32 index into the function table.
         return binaryen.i32;
       default:
-        console.log(type);
+        // Thrown (not logged): an inferred return type (`Unknown`/`Infer`) has
+        // no wasm mapping, and `instantiate` deliberately catches this to read
+        // the result type off the compiled body instead. Logging here would
+        // leak to stdout on that expected path.
         throw new Error(`Unhandled AST -> WASM "${type.type}" type`);
     }
 };

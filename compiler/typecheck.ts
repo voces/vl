@@ -321,8 +321,41 @@ export const setNodeType = (node: VLExpression, type: VLType) => {
   return node;
 };
 
+// Integer type ranges: i32 is [-2^31, 2^31-1]; i64 is [-2^63, 2^63-1].
+const I32_MIN = -2147483648n;
+const I32_MAX = 2147483647n;
+const I64_MIN = -9223372036854775808n;
+const I64_MAX = 9223372036854775807n;
+
+// The default numeric type of an un-annotated integer literal: the narrowest
+// integer type that represents it *exactly* — i32 if it fits, otherwise i64.
+// Returns undefined when the literal exceeds the i64 range (no integer type can
+// hold it; the caller reports a diagnostic). Defaulting an out-of-i32-range
+// literal to i32 would silently wrap, so we widen instead.
+export const defaultIntegerType = (
+  text: string,
+  value: number,
+): "i32" | "i64" | undefined => {
+  let v: bigint;
+  try {
+    v = BigInt(text);
+  } catch {
+    // Non-decimal source text (e.g. exponent form): fall back to the parsed
+    // value, which is exact for any literal small enough to matter here.
+    v = BigInt(Math.trunc(value));
+  }
+  if (v >= I32_MIN && v <= I32_MAX) return "i32";
+  if (v >= I64_MIN && v <= I64_MAX) return "i64";
+  return undefined;
+};
+
 export const _softenImplicitType = (type: VLType): VLType => {
-  if (type.type === "IntegerLiteral") return { type: "Alias", name: "i32" };
+  if (type.type === "IntegerLiteral") {
+    return {
+      type: "Alias",
+      name: defaultIntegerType(type.text, type.value) ?? "i64",
+    };
+  }
   if (type.type === "RealLiteral") return { type: "Alias", name: "f64" };
   if (type.type === "StringLiteral") return { type: "Alias", name: "string" };
   if (type.type === "BooleanLiteral") return { type: "Alias", name: "boolean" };
