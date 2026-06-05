@@ -1057,10 +1057,12 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "For": {
         // (block $brk
-        //   i = from                         ; declared once, before the loop
+        //   i = from                          ; declares the loop variable
+        //   to = <to>, step = <step>          ; evaluated once into locals
         //   (loop $loop
-        //     (br_if $brk (i > to))           ; inclusive: exit once past `to`
-        //     (block $cont body)              ; continue → falls through to step
+        //     ;; inclusive, direction-aware exit:
+        //     (br_if $brk ((step>=0 && i>to) || (step<0 && i<to)))
+        //     (block $cont body)               ; continue → falls through to step
         //     i = i + step
         //     (br $loop)))
         const cont = node.label ?? `loop${loopIndex++}`;
@@ -1068,44 +1070,46 @@ export const toWasm = async (ast: VLProgramNode) => {
         const brk = `${cont}__brk`;
         loopLabels.push(cont);
         const variableType = softenImplicitType(vlType(node.from));
-        const varRef = setNodeType(
-          { type: "Name", name: node.variable },
-          variableType,
-        );
-        const step: VLStatement = node.step ??
+        const stepExpr: VLStatement = node.step ??
           { type: "IntegerLiteral", value: 1, text: "1" };
+        const toLocal = newLocal(binaryen.i32);
+        const stepLocal = newLocal(binaryen.i32);
+        // Declare the loop variable (i = from); this registers its scope entry.
+        const declare = toExpression({
+          type: "VariableDeclaration",
+          name: node.variable,
+          variableType,
+          value: node.from,
+          mutable: true,
+        });
+        const [, varIndex] = getScopeEntry(node.variable);
+        const i = () => m.local.get(varIndex, binaryen.i32);
+        const to = () => m.local.get(toLocal, binaryen.i32);
+        const step = () => m.local.get(stepLocal, binaryen.i32);
         const loop = m.block(brk, [
-          toExpression({
-            type: "VariableDeclaration",
-            name: node.variable,
-            variableType,
-            value: node.from,
-            mutable: true,
-          }),
+          declare,
+          m.local.set(toLocal, withDesiredType(i32Type, () => toExpression(node.to))),
+          m.local.set(stepLocal, withDesiredType(i32Type, () => toExpression(stepExpr))),
           m.loop(
             loopLabel,
             m.block(null, [
+              // Inclusive exit; the comparison flips with the step's sign so
+              // descending loops (negative step) work, not just ascending ones.
               m.br(
                 brk,
-                toExpression({
-                  type: "BinaryOperation",
-                  left: varRef,
-                  operator: ">",
-                  right: node.to,
-                }),
+                m.i32.or(
+                  m.i32.and(
+                    m.i32.ge_s(step(), m.i32.const(0)),
+                    m.i32.gt_s(i(), to()),
+                  ),
+                  m.i32.and(
+                    m.i32.lt_s(step(), m.i32.const(0)),
+                    m.i32.lt_s(i(), to()),
+                  ),
+                ),
               ),
               m.block(cont, [toExpression(node.statement)]),
-              toExpression({
-                type: "BinaryOperation",
-                left: varRef,
-                operator: "=",
-                right: {
-                  type: "BinaryOperation",
-                  left: varRef,
-                  operator: "+",
-                  right: step,
-                },
-              }),
+              m.local.set(varIndex, m.i32.add(i(), step())),
               m.br(loopLabel),
             ]),
           ),

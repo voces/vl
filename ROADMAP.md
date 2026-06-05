@@ -198,12 +198,17 @@ stays tolerant of both binaryen forms (sync object / async init).*
 - 🟡 **B8. Loops.** DONE: **`for…in` over arrays** — the `to`-less `for x in arr` (grammar:
   the `TO expr` clause is now optional) binds `x` to each element, lowered to a 0..length index
   loop over `array.get` (iterable evaluated once into a local); a non-array iterable is a clean
-  type error (`loops/for-in.vl`, `loops/for-in-not-array.vl`). REMAINING: wire `for` `step` (the
-  range form parses/type-checks `step` but codegen still hardcodes `+1`); `for…in` over objects
-  / maps; the `for val, i in arr` (value + index) and `for , v in obj` destructuring forms
-  (aspirational in `samples/loops.vl`). FIXED: single-line block bodies (`for … { s = s + i }`)
-  — `block` no longer requires a leading newline after `{`, so `object` (tried first, fails on a
-  non-pair) falls back to `block`; objects still win on key:value contents (`loops/single-line-block.vl`).
+  type error (`loops/for-in.vl`, `loops/for-in-not-array.vl`). DONE: **`for` `step`** —
+  increment uses the actual `step`, and the inclusive exit test is **direction-aware**
+  (`(step>=0 && i>to) || (step<0 && i<to)`, with `to`/`step` evaluated once into locals), so
+  descending loops work too (`loops/for-step.vl`: ascending 0,2,4,6→12; descending 5..1→15).
+  DONE: single-line block bodies (`for … { s = s + i }`) — `block` no longer requires a leading
+  newline after `{`, so `object` (tried first, fails on a non-pair) falls back to `block`;
+  objects still win on key:value contents (`loops/single-line-block.vl`). REMAINING: `for…in`
+  over objects / maps; the `for val, i in arr` (value + index) and `for , v in obj`
+  destructuring forms (aspirational in `samples/loops.vl`). NOTE: descending steps are written
+  `0 - 1` for now because **unary `-` isn't a token** (no negative literals / negation) — a
+  separate small lexer/grammar add (would also clean up `step -1`); tracks near B10.
 - 🟡 **B9. `break` in codegen** (only `continue` is handled); verify labeled break/continue.
 - ⬜ **B10. Prefix/postfix ops in codegen** (`++ -- not !`) — parsed & in the interpreter,
   not in the wasm path.
