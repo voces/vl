@@ -13,6 +13,16 @@ export const registerBuiltins = (m: any, binaryen: any) => {
     0,
   );
 
+  // Render `length` raw bytes at an offset as a string (pairs with
+  // `__store_string__`, which copies a GC string's bytes into linear memory).
+  m.addFunctionImport(
+    "__log_string__",
+    "imports",
+    "__log_string__",
+    binaryen.createType([binaryen.i32, binaryen.i32]),
+    0,
+  );
+
   // TODO: These don't need to be actual funcitons... can inline. But I think binaryen does that for us.
   m.addFunction(
     "__store_i32__",

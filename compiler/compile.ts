@@ -250,6 +250,15 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
   await WebAssembly.instantiate(wasm, {
     imports: {
       memory,
+      // Read `length` raw bytes at `offset` and render them as a UTF-8 string
+      // (the byte form a `__store_string__` writes from a GC string).
+      __log_string__: (offset: number, length: number) => {
+        logs.push(
+          new TextDecoder().decode(
+            new Uint8Array(memory.buffer, offset, length),
+          ),
+        );
+      },
       __log__: (offset: number, length: number) => {
         const view = new Int32Array(memory.buffer, offset, length / 4);
         const args: (number | bigint)[] = [];

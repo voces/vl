@@ -297,6 +297,99 @@ export const toWasm = async (ast: VLProgramNode) => {
     return cached;
   };
 
+  // Lazily-emitted wasm helper functions (string equality, string→memory copy),
+  // each added to the module once on first use. Strings are i32-arrays of char
+  // codes, so these are small loops over `array.get`.
+  const _helpers = new Set<string>();
+  // `__string_eq__(a, b)`: 1 if equal length + elements, else 0.
+  const stringEqFn = (): string => {
+    const name = "__string_eq__";
+    if (!_helpers.has(name)) {
+      _helpers.add(name);
+      const at = arrayType(i32Type);
+      const a = () => m.local.get(0, at.refType);
+      const b = () => m.local.get(1, at.refType);
+      const i = () => m.local.get(2, binaryen.i32);
+      const len = () => m.local.get(3, binaryen.i32);
+      const body = m.block(null, [
+        m.if(
+          m.i32.ne(m.array.len(a()), m.array.len(b())),
+          m.return(m.i32.const(0)),
+        ),
+        m.local.set(3, m.array.len(a())),
+        m.local.set(2, m.i32.const(0)),
+        m.block("eq_brk", [
+          m.loop(
+            "eq_loop",
+            m.block(null, [
+              m.br("eq_brk", m.i32.ge_s(i(), len())),
+              m.if(
+                m.i32.ne(
+                  m.array.get(a(), i(), binaryen.i32, false),
+                  m.array.get(b(), i(), binaryen.i32, false),
+                ),
+                m.return(m.i32.const(0)),
+              ),
+              m.local.set(2, m.i32.add(i(), m.i32.const(1))),
+              m.br("eq_loop"),
+            ]),
+          ),
+        ]),
+        m.i32.const(1),
+      ], binaryen.i32);
+      m.addFunction(
+        name,
+        binaryen.createType([at.refType, at.refType]),
+        binaryen.i32,
+        [binaryen.i32, binaryen.i32],
+        body,
+      );
+    }
+    return name;
+  };
+  // `__store_string__(offset, str)`: copy str's char codes as bytes into linear
+  // memory at `offset` and return the length — bridges a GC string to `__log__`.
+  const storeStringFn = (): string => {
+    const name = "__store_string__";
+    if (!_helpers.has(name)) {
+      _helpers.add(name);
+      const at = arrayType(i32Type);
+      const offset = () => m.local.get(0, binaryen.i32);
+      const str = () => m.local.get(1, at.refType);
+      const i = () => m.local.get(2, binaryen.i32);
+      const len = () => m.local.get(3, binaryen.i32);
+      const body = m.block(null, [
+        m.local.set(3, m.array.len(str())),
+        m.local.set(2, m.i32.const(0)),
+        m.block("ss_brk", [
+          m.loop(
+            "ss_loop",
+            m.block(null, [
+              m.br("ss_brk", m.i32.ge_s(i(), len())),
+              m.i32.store8(
+                0,
+                0,
+                m.i32.add(offset(), i()),
+                m.array.get(str(), i(), binaryen.i32, false),
+              ),
+              m.local.set(2, m.i32.add(i(), m.i32.const(1))),
+              m.br("ss_loop"),
+            ]),
+          ),
+        ]),
+        len(),
+      ], binaryen.i32);
+      m.addFunction(
+        name,
+        binaryen.createType([binaryen.i32, at.refType]),
+        binaryen.i32,
+        [binaryen.i32, binaryen.i32],
+        body,
+      );
+    }
+    return name;
+  };
+
   // The VL type of an expression *in the current instance's scope*. A generic
   // function is monomorphized per call, so a parameter's concrete shape lives in
   // the codegen scope, not the AST-inferred (declaration-time) type: resolve a
@@ -721,6 +814,9 @@ export const toWasm = async (ast: VLProgramNode) => {
         let call: number;
         if (typeof func === "string") {
           if (ignoredKeys.has(func)) {
+            // `__store_string__` is emitted lazily as a wasm helper (it needs the
+            // string array type); ensure it exists before the call.
+            if (func === "__store_string__") storeStringFn();
             // A builtin: it has its own signature with no environment parameter.
             call = m.call(func, operands, returnType);
           } else {
@@ -998,9 +1094,18 @@ export const toWasm = async (ast: VLProgramNode) => {
           }
         }
 
-        // String `+` concatenates: allocate an i32-array of len(a)+len(b) and
-        // copy both halves in. (Strings are WasmGC i32-arrays of char codes.)
+        // String operators (strings are WasmGC i32-arrays of char codes):
+        // `==`/`!=` element-compare via the `__string_eq__` helper; `+`
+        // concatenates (allocate an i32-array of len(a)+len(b) and copy in).
         if (leftType.type === "Object" && leftType.name === "string") {
+          if (op === "==" || op === "!=") {
+            const eq = m.call(
+              stringEqFn(),
+              [toExpression(node.left), toExpression(node.right)],
+              binaryen.i32,
+            );
+            return op === "==" ? eq : m.i32.eqz(eq);
+          }
           if (op !== "+") raise(`string operator ${op} not implemented`);
           const at = arrayType(i32Type);
           const aLocal = newLocal(at.refType);

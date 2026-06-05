@@ -153,6 +153,30 @@ export const defaultScope = () => {
             return: { type: "Alias", name: "string" },
           },
         },
+        {
+          name: {
+            type: "Union",
+            subTypes: [
+              { type: "StringLiteral", value: "==" },
+              { type: "StringLiteral", value: "!=" },
+            ],
+          },
+          type: {
+            type: "Function",
+            paramaters: [{
+              type: "Parameter",
+              name: "right",
+              paramaterType: {
+                type: "Custom",
+                validate: namedFunc("string", (right: VLType) =>
+                  right === scope.string || isNominal(right, "string") ||
+                  right.type === "StringLiteral"),
+                name: "string",
+              },
+            }],
+            return: { type: "Alias", name: "boolean" },
+          },
+        },
       ],
     },
     boolean: {
@@ -204,6 +228,38 @@ export const defaultScope = () => {
         paramaterType: { type: "Alias", name: "i32" },
       }],
       return: { type: "Alias", name: "null" },
+    };
+
+    // Render `length` raw bytes at `address` as a string (pairs with
+    // `__store_string__`).
+    scope.__log_string__ = {
+      type: "Function",
+      paramaters: [{
+        type: "Parameter",
+        name: "address",
+        paramaterType: { type: "Alias", name: "i32" },
+      }, {
+        type: "Parameter",
+        name: "length",
+        paramaterType: { type: "Alias", name: "i32" },
+      }],
+      return: { type: "Alias", name: "null" },
+    };
+
+    // Copy a string's char codes as bytes into linear memory at `address`,
+    // returning the byte length — bridges a GC string to `__log_string__`.
+    scope.__store_string__ = {
+      type: "Function",
+      paramaters: [{
+        type: "Parameter",
+        name: "address",
+        paramaterType: { type: "Alias", name: "i32" },
+      }, {
+        type: "Parameter",
+        name: "value",
+        paramaterType: { type: "Alias", name: "string" },
+      }],
+      return: { type: "Alias", name: "i32" },
     };
 
     scope.__load_i32__ = {

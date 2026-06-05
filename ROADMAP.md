@@ -47,8 +47,9 @@ closures / `is` / variance designs referenced here.
   operators with a nominal `Custom` validator (mirrors the numeric pattern). Removed the
   `Alias "string"` special-cases (`toAST` `toType`, `getConcreteType`). Fixed a latent bug:
   `_softenImplicitType`'s Object case **dropped the `name`** when a property softened, which
-  turned `string` into an anonymous object. REMAINING: `==`/`!=` (needs an element-compare loop);
-  richer methods (slice, indexOf, …).
+  turned `string` into an anonymous object. `==`/`!=` now type-check (boolean) + codegen.
+  REMAINING: richer methods (slice, indexOf, …); `boolean`-where-`i32`-expected coercion (storing
+  a comparison result needs an `if` today).
 - ⬜ **A8. Exact / Inexact variance** (TODO.md). Params Inexact by default (accept excess
   properties), values Exact. Guard the `a.foo = b` footgun noted in TODO.md.
 - ⬜ **A9. Readable / Writable variance** (TODO.md). Applied automatically during
@@ -209,11 +210,13 @@ stays tolerant of both binaryen forms (sync object / async init).*
   its code points; `toWasmType(string)` → a WasmGC i32-array (via the index sig, regardless of
   the nominal `name`); `.length`/`s[i]` ride the array machinery; `+` concatenates inline
   (`array.new` + two `array.copy`). Works as a value, param (`function f(s: string)`),
-  reassignment, and a `self`-receiver (`"hi".first()`). Tests `strings/basics.vl`,
-  `strings/string-method.vl`. REMAINING: **`==`/`!=`** (element-compare loop, likely a helper
-  fn); **printing** — a GC i32-array string can't be `__log__`'d directly (that reads linear
-  memory), so wire a `string → linear memory` copy or a string-aware log; **UTF-8 / i8-packed**
-  representation as a size optimization (MVP is 4 bytes/char, codepoints).
+  reassignment, and a `self`-receiver (`"hi".first()`). **`==`/`!=`** done — a lazily-emitted
+  `__string_eq__` helper (length + element compare). **Printing** done — `__store_string__(off,
+  s)` copies a GC string's chars as bytes into linear memory (lazy `storeStringFn` helper), and
+  the new `__log_string__(off, len)` host import renders raw bytes as text (so `"hello"` prints
+  "hello"). Tests `strings/basics.vl`, `strings/string-method.vl`, `strings/print-and-eq.vl`.
+  REMAINING: **UTF-8 / i8-packed** representation as a size optimization (MVP is 4 bytes/char,
+  codepoints); richer methods (slice, indexOf); a `print(s)` convenience wrapping store+log.
 - 🟡 **B8. Loops.** DONE: **`for…in` over arrays** — the `to`-less `for x in arr` (grammar:
   the `TO expr` clause is now optional) binds `x` to each element, lowered to a 0..length index
   loop over `array.get` (iterable evaluated once into a local); a non-array iterable is a clean
