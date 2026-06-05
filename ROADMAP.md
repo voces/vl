@@ -126,14 +126,19 @@ stays tolerant of both binaryen forms (sync object / async init).*
   **binaryen upgraded 116→130** for the ergonomic GC API (`module.struct`/`module.array`/
   `TypeBuilder` — absent in 116). The old upgrade blocker (binaryen TLA breaking CJS) is
   moot since the LSP server is ESM. Only API drift: `i64.const` now takes a single bigint.
-- 🟡 **B2. Finish numeric codegen.** i64 & f32 **binary ops** are still not wired (only
-  i32/boolean/f64 arithmetic branches exist). DONE: i64/f32 **type mappings** — `wasmType.ts`
-  now maps the `i64`/`f32` object types, so typed locals/params/returns (`let x: i64 = …`,
-  `function f(x: f32)`) and `print` of those work; only the arithmetic operator branches remain.
-  DONE: **range-aware integer-literal defaults** — an un-annotated integer literal defaults to
-  the narrowest integer type that holds it *exactly* (i32, else i64) instead of silently wrapping
-  into i32; a literal beyond the i64 range is a diagnostic (`defaultIntegerType`, shared by
-  `typecheck.ts` soften + `toWasm.ts` codegen). Still TODO: numeric **casting/coercion** (none today).
+- 🟡 **B2. Finish numeric codegen.** DONE: **i64 & f32 binary arithmetic** — the numeric
+  BinaryOperation dispatch was unified into two op tables (`INT_BINOPS` signed / `FLOAT_BINOPS`),
+  applied as `m[wasmType][method]`, covering i32/i64/boolean (integer) and f32/f64 (float); this
+  also enabled **float `/` and comparisons** (`<`/`>`/`<=`/`>=`), previously unhandled even for
+  f64. A literal operand coerces to the other side's concrete numeric type (`i64var * 2` lowers
+  `2` as i64) — the right operand of a builtin numeric op takes the left's type, not the operator
+  method's (Union) param type. Tests `numerics/wide-arith.vl`. DONE: i64/f32 **type mappings**
+  (`wasmType.ts`) — typed locals/params/returns + `print` of those. DONE: **range-aware
+  integer-literal defaults** — an un-annotated integer literal defaults to the narrowest type that
+  holds it *exactly* (i32, else i64) instead of wrapping; beyond-i64 is a diagnostic
+  (`defaultIntegerType`, shared by `typecheck.ts` soften + `toWasm.ts` codegen). Still TODO:
+  numeric **casting/coercion** between types (none today — e.g. `i32`→`i64` is implicit-only via
+  literals; no explicit conversion of a *value*).
 - ✅ **B3. First-class functions / indirect calls** — incl. per-shape monomorphization.
   *Representation note: B4 superseded the bare i32 index — a function value is now a fat-pointer
   closure struct `{ i32 tableIndex, structref env }`; the table + `call_indirect` dispatch below

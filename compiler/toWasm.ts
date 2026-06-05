@@ -45,6 +45,19 @@ export const toWasm = async (ast: VLProgramNode) => {
   // Binary operators that yield a boolean (used by instance-aware type resolution).
   const COMPARE_OPS = new Set(["<", ">", "<=", ">=", "==", "!=", "&&", "||"]);
 
+  // VL binary operator -> binaryen method name, by operand class. Integers are
+  // signed (`div_s`/`rem_s`/`gt_s`/…); floats use the unsuffixed forms. Applied
+  // as `m[wasmType][method]` (e.g. `m.i64.add`, `m.f32.lt`).
+  const INT_BINOPS: Record<string, string> = {
+    "+": "add", "-": "sub", "*": "mul", "/": "div_s", "%": "rem_s",
+    "==": "eq", "!=": "ne", ">": "gt_s", "<": "lt_s", ">=": "ge_s",
+    "<=": "le_s", "&&": "and",
+  };
+  const FLOAT_BINOPS: Record<string, string> = {
+    "+": "add", "-": "sub", "*": "mul", "/": "div",
+    "==": "eq", "!=": "ne", ">": "gt", "<": "lt", ">=": "ge", "<=": "le",
+  };
+
   type ScopeEntry = [type: VLType, index: number];
   type Scope = Record<string, ScopeEntry>;
   const scopes: Scope[] = [];
@@ -1237,10 +1250,18 @@ export const toWasm = async (ast: VLProgramNode) => {
         // monomorphized generic's operand — e.g. `self.x` where `self` is bound to
         // a concrete shape this instance — is seen as its concrete numeric type.
         const leftType = softenImplicitType(codegenType(node.left));
+        const NUMERIC = ["i32", "i64", "f32", "f64", "boolean"];
         let rightType: VLType;
         {
           if (leftType.type !== "Object") rightType = leftType;
-          else {
+          // A builtin numeric op is symmetric: the right operand takes the
+          // left's concrete numeric type, so a literal coerces to it (`i64var *
+          // 2` lowers `2` as i64, not its i32 default). Using the operator
+          // method's param type instead would yield a `Union` the literal
+          // codegen can't resolve.
+          else if (leftType.name && NUMERIC.includes(leftType.name)) {
+            rightType = leftType;
+          } else {
             const opFunc = leftType.properties.find((p) =>
               validateType(p.name, { type: "StringLiteral", value: op })
             )?.type;
@@ -1319,62 +1340,22 @@ export const toWasm = async (ast: VLProgramNode) => {
         }
         if (
           leftType.type === "Object" &&
-          (leftType.name === "i32" || leftType.name === "boolean" ||
+          (leftType.name === "i32" || leftType.name === "i64" ||
+            leftType.name === "boolean" || leftType.name === "f32" ||
             leftType.name === "f64")
         ) {
-          if (leftType.type !== "Object") throw new Error("Expected object");
+          // Native numeric op. Integer types (incl. boolean, an i32) share one
+          // signed op set; float types share another. The wasm namespace is the
+          // type's name — `m.i64.add`, `m.f32.lt`, … — with boolean using i32.
           const name = leftType.name;
-          if (name === "i32" || name === "boolean") {
-            return m.i32[
-              op === "+"
-                ? "add"
-                : op === "-"
-                ? "sub"
-                : op === "/"
-                ? "div_s"
-                : op === ">"
-                ? "gt_s"
-                : op === "<"
-                ? "lt_s"
-                : op === "%"
-                ? "rem_s"
-                : op === "*"
-                ? "mul"
-                : op === "=="
-                ? "eq"
-                : op === "!="
-                ? "ne"
-                : op === ">="
-                ? "ge_s"
-                : op === "<="
-                ? "le_s"
-                : op === "&&"
-                ? "and"
-                : raise(`binop ${op} not handled on i32`)
-            ](
-              withDesiredType(leftType, () => toExpression(node.left)),
-              withDesiredType(rightType, () => toExpression(node.right)),
-            );
-          }
-          if (name === "f64") {
-            return m.f64[
-              op === "+"
-                ? "add"
-                : op === "-"
-                ? "sub"
-                : op === "*"
-                ? "mul"
-                : op === "=="
-                ? "eq"
-                : op === "!="
-                ? "ne"
-                : raise(`binop ${op} not handled on f64`)
-            ](
-              withDesiredType(leftType, () => toExpression(node.left)),
-              withDesiredType(rightType, () => toExpression(node.right)),
-            );
-          }
-          throw new Error(`Didn't handle ${op} on ${name}`);
+          const isInt = name === "i32" || name === "i64" || name === "boolean";
+          const wasmName = name === "boolean" ? "i32" : name;
+          const method = (isInt ? INT_BINOPS : FLOAT_BINOPS)[op] ??
+            raise(`binop ${op} not handled on ${name}`);
+          return m[wasmName][method](
+            withDesiredType(leftType, () => toExpression(node.left)),
+            withDesiredType(rightType, () => toExpression(node.right)),
+          );
         }
         // Structural equality on a plain data struct (no custom `==`/`!=`
         // operator field): compare fields recursively via a per-shape helper.
