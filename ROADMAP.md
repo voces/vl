@@ -224,16 +224,27 @@ stays tolerant of both binaryen forms (sync object / async init).*
   returns (malloc has a trailing-`0` workaround). Special-case or add proper reachability.
 - ⬜ **B12. `async`/`await`.** Keywords exist in the lexer; no semantics or codegen.
   Large; likely last.
-- ⬜ **B13. Well-known-symbol dispatch (operator overloading / callable objects / index
+- 🟡 **B13. Well-known-symbol dispatch (operator overloading / callable objects / index
   traps).** Generalize codegen so an operation on a *user* shape calls the typed method named
-  for that operation in the shape's contract, instead of being hardcoded. The type system
-  **already** dispatches generically — `_typeFromExpression` BinaryOperation (`typecheck.ts`)
-  finds the left operand's property whose name matches the operator and checks the right
-  operand against its parameter type — but codegen (`toWasm.ts` BinaryOperation) only inlines
-  `i32`/`f64`/`boolean` by name and **throws** for any other shape. The fix reuses the B5
-  `VLCallNode` / `indirectCall` machinery (already used for `o.f()`): look up the method,
-  `struct.get` the closure field, `call_indirect` it — all **static** (monomorphized via B3),
-  so it's Proxy-like power with zero runtime reflection / no JS-`Proxy` overhead.
+  for that operation in the shape's contract, instead of being hardcoded. **DONE (operators):**
+  `toWasm.ts` BinaryOperation now dispatches a structural-object operand through its operator
+  method field — `struct.get` the method closure, `indirectCall` with the right operand, reusing
+  the B5 member-call machinery. A `vec` with a `"*"` / `"/"` field scales by a scalar
+  (`objects/operator-overload.vl`). Also fixed a real bug this needed: **string object keys kept
+  their quotes** (`toObjectLiteral` `getText()` without `.slice(1,-1)`), so a `"+"` key never
+  matched the operator `+` — affected *all* string keys, not just operators.
+  **LIMITATION (object-shaped operands, e.g. `vec + vec`):** the operator method is a *stored
+  closure* compiled once with its param at the inferred shape (`o: {x,y}`), while the argument is
+  the full `{+,x,y}` struct — the WasmGC width-subtyping mismatch (+ a `Custom`-validator leak in
+  the inferred operand) from B6a/A13. Needs **A13** (operator-constraint inference) and/or
+  per-call monomorphization (B14) / recursive types (A11). Primitive operands work now.
+  REMAINING: callable objects (`"()"`) + index traps (`"[]"`/`"[]="`), still to wire.
+  The type system **already** dispatches generically — `_typeFromExpression` BinaryOperation
+  (`typecheck.ts`) finds the left operand's property whose name matches the operator and checks
+  the right operand against its parameter type. Builds on B5 `indirectCall` — static, no runtime
+  `Proxy`. (Also surfaced: **direct recursion doesn't work** — `toFunctionDeclaration` registers
+  the name *after* the body, so `function f() … f() …` is "undeclared f"; forward-register the
+  name before walking the body. Separate gap, tracks near A-track / functions.)
   - **Operator overloading:** `a + b` (and `- * / %  == < …`) on a user object calls its
     `"+"` method (typed `(right: T) -> R`). Mixed operands already expressible — the method's
     parameter type governs the RHS, so `vec + 5` vs `vec + vec` are distinct contracts.

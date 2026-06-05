@@ -292,7 +292,9 @@ const toObjectLiteral = (ctx: ObjectContext): VLObjectLiteralNode => ({
     if (string) {
       return {
         type: "PropertyLiteral",
-        name: { type: "StringLiteral", value: string.getText() },
+        // Strip the surrounding quotes (as STRING handling does elsewhere), so a
+        // key like `"+"` matches the operator name `+`, not the literal `"+"`.
+        name: { type: "StringLiteral", value: string.getText().slice(1, -1) },
         value: toExpression(p.expr(0)),
       };
     }

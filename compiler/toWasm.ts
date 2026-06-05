@@ -1022,6 +1022,34 @@ export const toWasm = async (ast: VLProgramNode) => {
           }
           throw new Error(`Didn't handle ${op} on ${name}`);
         }
+        // User-defined operator: a structural object carries a method field named
+        // for the operator (e.g. `"+"`). Dispatch through it like a member call —
+        // `struct.get` the method closure, then `indirectCall` with the right
+        // operand. (The type checker already verified the method + operand.)
+        if (leftType.type === "Object" && leftType.name === undefined) {
+          const struct = objectStruct(objectTypeOf(node.left));
+          const field = struct.fields.find((f) => f.name === op);
+          const methodType = field ? softenImplicitType(field.type) : undefined;
+          if (!field || !methodType || methodType.type !== "Function") {
+            throw new Error(`Object has no operator method "${op}"`);
+          }
+          const closure = m.struct.get(
+            field.index,
+            toExpression(node.left),
+            closureStruct().refType,
+            false,
+          );
+          const operand = withDesiredType(
+            methodType.paramaters[0]?.paramaterType,
+            () => toExpression(node.right),
+          );
+          return indirectCall(
+            closure,
+            methodType.paramaters.map((p) => p.paramaterType),
+            [operand],
+            toWasmType(methodType.return),
+          );
+        }
         throw new Error(
           `Have only handled i32 with ${op}, got ${leftType.type}${
             leftType.type === "Object"
