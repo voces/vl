@@ -68,6 +68,7 @@ export {
   arrayElementType,
   conditionNarrowing,
   defaultIntegerType,
+  distinctScalars,
   elseNarrowings,
   getConcreteType,
   nonNullable,

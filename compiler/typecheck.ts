@@ -658,7 +658,7 @@ const scalarName = (type: VLType): string | undefined => {
 // Two *different* builtin scalars (`i32` vs `f64`). Numeric coercion makes one
 // assignable to a wider one (`i32` ⊑ `f64`), but in a union they are distinct
 // runtime variants — they must not collapse into each other.
-const distinctScalars = (a: VLType, b: VLType): boolean => {
+export const distinctScalars = (a: VLType, b: VLType): boolean => {
   const na = scalarName(a);
   const nb = scalarName(b);
   return na !== undefined && nb !== undefined && na !== nb;
@@ -1022,8 +1022,16 @@ export const conditionNarrowing = (
 // Two types denoting the same variant (mutually assignable) — used to remove a
 // member from a union. Numeric coercion is one-directional (`i32` ⊑ `f64` but
 // not the reverse), so this stays an equality test, not a subtyping one.
+//
+// Holes (`Unknown` / `Infer`) are never "the same variant" as a concrete type —
+// and must be skipped *before* `validateType`, which has a hidden side effect:
+// `ensureType`'s `Unknown` case greedily pins the hole to whatever it's compared
+// against. Narrowing inspects holes (an un-annotated param flows through `is`
+// guards), so an un-guarded compare here would permanently pin the parameter.
+const isHole = (t: VLType): boolean =>
+  t.type === "Unknown" || t.type === "Infer";
 const sameVariant = (a: VLType, b: VLType): boolean =>
-  validateType(a, b) && validateType(b, a);
+  !isHole(a) && !isHole(b) && validateType(a, b) && validateType(b, a);
 
 // Remove a variant from a union/nullable, returning the residual type (the other
 // members, re-flattened). Backs else-branch narrowing: in `if x is A { … } else
@@ -1046,6 +1054,10 @@ export const subtractType = (type: VLType, removed: VLType): VLType => {
 // if they're disjoint. `distinctScalars` first: `i32` and `f64` overlap under
 // coercion (`i32 ⊑ f64`) but are distinct *variants*, so their meet is empty.
 const meet = (a: VLType, b: VLType): VLType | null => {
+  // A hole would be pinned by `validateType` (see `sameVariant`); refine toward
+  // the concrete side instead of inspecting it.
+  if (isHole(a)) return b;
+  if (isHole(b)) return a;
   if (distinctScalars(a, b)) return null;
   if (validateType(b, a)) return a; // a ⊑ b → a is the refinement
   if (validateType(a, b)) return b; // b ⊑ a → b is the refinement

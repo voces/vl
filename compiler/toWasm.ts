@@ -3,6 +3,7 @@ import type { Narrowing } from "./typecheck.ts";
 import {
   arrayElementType,
   defaultIntegerType,
+  distinctScalars,
   elseNarrowings,
   nonNullable,
   placeKey,
@@ -670,6 +671,14 @@ export const toWasm = async (ast: VLProgramNode) => {
         })),
       };
     }
+    // Literal nodes double as literal *types* — resolve directly (they may be
+    // freshly built at codegen, e.g. a synthesized branch value, and so not
+    // memoized). `null` has no literal type node.
+    if (
+      node.type === "IntegerLiteral" || node.type === "RealLiteral" ||
+      node.type === "StringLiteral" || node.type === "BooleanLiteral"
+    ) return node;
+    if (node.type === "NullLiteral") return { type: "Alias", name: "null" };
     return vlType(node as Parameters<typeof vlType>[0]);
   };
 
@@ -1122,8 +1131,22 @@ export const toWasm = async (ast: VLProgramNode) => {
         }
         // A niche / reference nullable: `x is null` → null test; `x is T` (T the
         // non-null variant) → its negation.
-        const isNull = nullnessTest(node.value);
-        return checksNull ? isNull : m.i32.eqz(isNull);
+        if (t.type === "Nullable") {
+          const isNull = nullnessTest(node.value);
+          return checksNull ? isNull : m.i32.eqz(isNull);
+        }
+        // A monomorphic concrete type (e.g. an un-annotated param specialized to
+        // `i32` per call): `x is T` is statically decidable — a value of type `t`
+        // is a `T` iff `t` is (a variant/subtype of) `T` and not a *distinct*
+        // scalar (`i32` is not `f64`). `x is null` on a non-nullable is false.
+        // Evaluate the operand for side effects, then yield the constant.
+        const matches = !checksNull && !distinctScalars(t, node.checkType) &&
+          validateType(node.checkType, t);
+        return m.block(
+          null,
+          [m.drop(toExpression(node.value)), m.i32.const(matches ? 1 : 0)],
+          binaryen.i32,
+        );
       }
       case "StringLiteral": {
         // A string literal is a WasmGC i32-array of its code points.
