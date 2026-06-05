@@ -141,8 +141,7 @@ label
     : ID COLON
     ;
 
-block : label? LBRACE NEWLINE blockStatement* NEWLINE RBRACE
-      | label? LBRACE NEWLINE RBRACE
+block : label? LBRACE NEWLINE* blockStatement* RBRACE
       ;
 
 typeStatement

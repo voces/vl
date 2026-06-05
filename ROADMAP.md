@@ -201,9 +201,9 @@ stays tolerant of both binaryen forms (sync object / async init).*
   type error (`loops/for-in.vl`, `loops/for-in-not-array.vl`). REMAINING: wire `for` `step` (the
   range form parses/type-checks `step` but codegen still hardcodes `+1`); `for…in` over objects
   / maps; the `for val, i in arr` (value + index) and `for , v in obj` destructuring forms
-  (aspirational in `samples/loops.vl`). NOTE: a single-line `for … { s = s + i }` mis-parses the
-  `{…}` as an object literal (pre-existing block-vs-object ambiguity, affects range-for too) —
-  use a newline after `{` for now.
+  (aspirational in `samples/loops.vl`). FIXED: single-line block bodies (`for … { s = s + i }`)
+  — `block` no longer requires a leading newline after `{`, so `object` (tried first, fails on a
+  non-pair) falls back to `block`; objects still win on key:value contents (`loops/single-line-block.vl`).
 - 🟡 **B9. `break` in codegen** (only `continue` is handled); verify labeled break/continue.
 - ⬜ **B10. Prefix/postfix ops in codegen** (`++ -- not !`) — parsed & in the interpreter,
   not in the wasm path.

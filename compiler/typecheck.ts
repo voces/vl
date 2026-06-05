@@ -586,7 +586,7 @@ export const getChildType = (
   property: VLType,
   objectCtx: Context,
   propertyCtx: Context,
-) => {
+): VLType | undefined => {
   let infer = false;
   if (object.type === "Infer") {
     infer = true;
