@@ -13,13 +13,15 @@ toWasm.ts (binaryen WasmGC codegen) → wasm`. The headless entry point is `comp
 - `compiler/` — the language core (compile, the parser, toAST, typecheck, toWasm, defaultScope).
 - `lsp/` — VS Code extension + LSP server over the core (`lsp/src/server.ts`).
 - `tests/` — the `.vl` corpus (`tests/cases/**`) + the runner (`tests/run.ts`).
-- `grammar/` — `.g4` files kept as a human-readable spec only (the parser is hand-written, no antlr).
 - `samples/`, `docs/`, `reference/` (retired ts-interpreter, excluded from lint/test).
+
+The parser is **hand-written** (`compiler/lexer.ts` + `compiler/parser.ts`) — no antlr, no grammar
+file; the lexer/parser are the grammar.
 
 ## Commands
 
 - **Gate (run all three after changes):**
-  - `deno check compiler/*.ts` — type-check the core.
+  - `deno check compiler/*.ts tests/run.ts` — type-check the core + test runner.
   - `deno lint` — lint (excludes `reference/`).
   - `deno task test` — the `.vl` corpus (the behavior oracle).
 - **Run / build / check a file:** `deno task run <file.vl>` · `deno task build <file> [-o out.wasm] [--wat]`

@@ -1,5 +1,5 @@
-// Hand-written lexer for VL — a direct reimplementation of `grammar/VL_Lexer.g4`
-// (which is essentially a token list). Replaces the antlr4-generated lexer.
+// Hand-written lexer for VL — essentially a token list. This (with parser.ts)
+// is the grammar now; it replaced the antlr4-generated lexer.
 //
 // Significant newlines are handled cleanly downstream: NEWLINE is emitted as a
 // real token and the parser treats it as a statement terminator, transparently

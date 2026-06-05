@@ -2555,9 +2555,13 @@ export const toWasm = async (ast: VLProgramNode) => {
     );
   }
 
-  // Guarded so the compiler core stays runtime-agnostic: it's also bundled into
-  // the Node-based LSP server, where `Deno` is undefined.
-  const debug = "Deno" in globalThis ? Deno.env.get("VL_DEBUG") : undefined;
+  // Read through a typed `globalThis` (not the bare `Deno` global) so the core
+  // stays runtime-agnostic *and* type-checks under both the Deno and Node libs —
+  // it's bundled into the Node-based LSP server, where `Deno` is undefined.
+  const deno = (globalThis as {
+    Deno?: { env: { get(key: string): string | undefined } };
+  }).Deno;
+  const debug = deno?.env.get("VL_DEBUG");
   if (debug) {
     console.log("result");
     console.log(m.emitText());
