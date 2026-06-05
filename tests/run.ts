@@ -6,15 +6,23 @@
 // compiler unchanged.
 //
 // Directives:
-//   // @check            type-check only (default)
+//   // @check            type-check only, no run (default)
 //   // @run              compile, then instantiate + run, capturing `log` output
-//   // @no-error         assert there are no error diagnostics
-//   // @ok               alias of @no-error: compiles cleanly (zero ERROR
-//                        diagnostics) without instantiating — for pure
-//                        type-level "must-not-error" soundness checks
-//   // @error TEXT       assert some error diagnostic message contains TEXT
+//   // @error TEXT       expect an error diagnostic containing TEXT
+//   // @error-at L:C TEXT expect an error at line L, col C containing TEXT
+//   // @warning TEXT     expect a warning diagnostic containing TEXT
+//   // @info TEXT        expect an info diagnostic containing TEXT
 //   // @log TEXT         assert the Nth `log` line equals TEXT (ordered; @run)
 //   // @skip REASON      register the test but skip it (REASON documents why)
+//
+// STRICT BY DEFAULT: a test fails on ANY diagnostic it did not declare — every
+// error, warning, AND info must be matched by a directive of that severity.
+// "Compiles cleanly" is therefore the default contract — a file with no
+// diagnostic directives is asserting it produces zero diagnostics, so there is
+// no @ok / @no-error directive (omitting them IS the must-not-error assertion).
+// Runtime `log` output is likewise fully specified: @run compares the entire,
+// ordered log list, so an extra or missing line fails. An unrecognized directive
+// also fails the test, so a typo can't silently disable a check.
 //
 // Run with:  deno task test
 
@@ -31,8 +39,9 @@ type Directives = {
   errors: string[];
   errorsAt: { line: number; col: number; text: string }[];
   warnings: string[];
+  infos: string[];
   logs: string[];
-  noError: boolean;
+  unknown: string[];
   skip: string | null;
 };
 
@@ -42,8 +51,9 @@ const parseDirectives = (src: string): Directives => {
     errors: [],
     errorsAt: [],
     warnings: [],
+    infos: [],
     logs: [],
-    noError: false,
+    unknown: [],
     skip: null,
   };
   for (const raw of src.split(/\r?\n/)) {
@@ -59,15 +69,14 @@ const parseDirectives = (src: string): Directives => {
       case "check":
         d.mode = "check";
         break;
-      case "no-error":
-      case "ok":
-        d.noError = true;
-        break;
       case "error":
         d.errors.push(rest);
         break;
       case "warning":
         d.warnings.push(rest);
+        break;
+      case "info":
+        d.infos.push(rest);
         break;
       case "error-at": {
         const at = rest.match(/^(\d+):(\d+)\s+(.*)$/);
@@ -85,6 +94,9 @@ const parseDirectives = (src: string): Directives => {
         break;
       case "skip":
         d.skip = rest || "no reason given";
+        break;
+      default:
+        d.unknown.push(key);
         break;
     }
   }
@@ -116,6 +128,9 @@ const errorMessages = (diags: VLDiagnostic[]) =>
 const warningMessages = (diags: VLDiagnostic[]) =>
   diags.filter((d) => d.severity === "warning").map((d) => d.message);
 
+const infoMessages = (diags: VLDiagnostic[]) =>
+  diags.filter((d) => d.severity === "info").map((d) => d.message);
+
 const files: URL[] = [];
 for await (const f of walk(CASES_DIR)) files.push(f);
 files.sort((a, b) => a.href.localeCompare(b.href));
@@ -129,6 +144,14 @@ for (const file of files) {
     name,
     ignore: d.skip != null,
     fn: async () => {
+      if (d.unknown.length) {
+        throw new Error(
+          `unrecognized directive(s): ${
+            d.unknown.map((k) => `@${k}`).join(", ")
+          }`,
+        );
+      }
+
       const { diagnostics, wasm } = await quiet(() => compile(src));
       const errs = errorMessages(diagnostics);
 
@@ -148,6 +171,17 @@ for (const file of files) {
           throw new Error(
             `expected a warning containing "${want}", got: ${
               JSON.stringify(warns)
+            }`,
+          );
+        }
+      }
+
+      const infos = infoMessages(diagnostics);
+      for (const want of d.infos) {
+        if (!infos.some((m) => m.includes(want))) {
+          throw new Error(
+            `expected an info containing "${want}", got: ${
+              JSON.stringify(infos)
             }`,
           );
         }
@@ -173,9 +207,35 @@ for (const file of files) {
         }
       }
 
-      if (d.noError && errs.length) {
-        throw new Error(`expected no errors, got: ${JSON.stringify(errs)}`);
-      }
+      // Strict by default: EVERY diagnostic must have been declared, at every
+      // severity. A diagnostic is "expected" if a directive of its severity
+      // matches its message (errors also via @error-at). Anything left over is
+      // an unexpected regression and fails — so omitting the directives is
+      // itself the must-not-error assertion (no @ok needed).
+      const unexpected = (
+        actual: string[],
+        expected: (m: string) => boolean,
+        severity: string,
+        directive: string,
+      ) => {
+        const extra = actual.filter((m) => !expected(m));
+        if (extra.length) {
+          throw new Error(
+            `unexpected ${severity}(s) (declare with ${directive} if ` +
+              `intended): ${JSON.stringify(extra)}`,
+          );
+        }
+      };
+      unexpected(
+        errs,
+        (m) =>
+          d.errors.some((w) => m.includes(w)) ||
+          d.errorsAt.some((w) => m.includes(w.text)),
+        "error",
+        "@error",
+      );
+      unexpected(warns, (m) => d.warnings.some((w) => m.includes(w)), "warning", "@warning");
+      unexpected(infos, (m) => d.infos.some((w) => m.includes(w)), "info", "@info");
 
       if (d.mode === "run") {
         if (!wasm) {

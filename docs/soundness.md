@@ -11,10 +11,14 @@ fails to compile; it never defers a type decision to runtime.
 
 This document states the contract. The executable form of the contract lives in
 [`tests/cases/soundness/`](../tests/cases/soundness/): a curated, growing corpus
-of small "must-error" and "must-not-error" programs. Deep changes to inference,
-flow narrowing, union representation, or codegen must keep that corpus green
-(`deno task test`); a soundness regression flips a `@error` case to `@ok` (or
-vice-versa) and breaks the suite.
+of small "must-error" and "must-not-error" programs. The test runner is **strict
+by default** — a case fails on any diagnostic (error, warning, or info) it did
+not declare, and `@run` cases compare the entire log output — so a "must-not-error"
+case is simply one with no `@error` directive: clean compile is the default
+assertion, no `@ok` needed. Deep changes to inference, flow narrowing, union
+representation, or codegen must keep that corpus green (`deno task test`); a
+soundness regression either makes a clean case start erroring, or removes the
+error from a `@error` case, and breaks the suite.
 
 ## What the contract guarantees
 
@@ -33,8 +37,8 @@ vice-versa) and breaks the suite.
 After `if x is T { … }`, the value is `T` in the then-branch and the
 **complement** (`U − T`) in the else-branch; after `if x != null { … }` /
 `if x == null { return }`, the value is non-null where it is used. A use that
-depends on a narrowing the compiler can prove is sound (`@run`/`@ok`); a use that
-relies on the *opposite* of what was narrowed is rejected (`@error`).
+depends on a narrowing the compiler can prove is sound compiles clean (`@run`);
+a use that relies on the *opposite* of what was narrowed is rejected (`@error`).
 
 - sound: `narrowing-is-sound.vl`, `narrowing-null-guard.vl`,
   `nullable-access-guarded.vl`
@@ -90,9 +94,9 @@ do not cross-contaminate.
 
 The contract is the goal; a few corners are not yet enforced. They are captured
 as `xfail-*.vl` files with a `TODO(soundness):` note so the gap is *documented*
-even where it is not yet caught. Each runs/`@ok`s today to encode current
-behavior, and is annotated with what it *should* do — the regression guard fires
-the moment a fix changes the behavior, surfacing it at merge.
+even where it is not yet caught. Each compiles clean / runs today to encode
+current behavior, and is annotated with what it *should* do — the regression
+guard fires the moment a fix changes the behavior, surfacing it at merge.
 
 - **Arithmetic hole-operand rule is permissive** (ROADMAP A13). `i32 + string`
   is rejected when both operands are concretely annotated
