@@ -55,16 +55,22 @@ closures / `is` / variance designs referenced here.
 - ⬜ **A12. Soundness pass / test suite.** Port the "If T" narrowing benchmark idea; build
   a corpus of "must-error" and "must-not-error" programs. Define the soundness contract
   (statically sound — every well-typed program is type-safe at runtime).
-- ⬜ **A13. Operator-constraint inference (row-polymorphic generics).** Infer operator/method
-  requirements on an *un-annotated* value from how the body uses it, the same way VL already
-  infers *property* constraints (`o.x` makes a hole gain an inferred `x` via `getChildType`)
-  and *callability* (`fn(a,b)` infers `fn` is a 2-arg function). Today the BinaryOperation
-  rule (`_typeFromExpression`, `typecheck.ts`) **errors** when the left operand is a bare
-  inference hole instead of inferring "left must have a `+` method accepting right, returning
-  a fresh hole." Wiring that makes a fully-inferred structural method legal:
-  `add(self, b) { x: self.x + b.x, y: self.y + b.y }` — `add` works on *any* shape with an
-  `x` and `y` that are addable, monomorphized per call shape (rides B3). This is bounded/row
-  polymorphism with operator constraints; pairs with B13 (operator dispatch) for the codegen.
+- 🟡 **A13. Operator-constraint inference (row-polymorphic generics).** **DONE (the core):**
+  a fully-inferred structural function now works end to end —
+  `function add(self, b) { x: self.x + b.x, y: self.y + b.y }` over `{x, y}`, monomorphized per
+  call shape (verified at **both i32 and f64** from two call sites, `functions/structural-generic.vl`),
+  and `function max(a, b) { if a > b then a else b }` (`functions/inferred-compare.vl`). Three
+  changes made it work: (1) `_typeFromExpression` BinaryOperation no longer **errors** on a hole
+  operand — it returns boolean for comparisons / the operand type for arithmetic, deferring
+  concretization to the call site; (2) codegen resolves operand + object-literal types from the
+  **instance scope** (`codegenType` extended to `BinaryOperation` / `ObjectLiteral`), so a
+  monomorphized body sees concrete numerics instead of declaration-time holes; (3) a block whose
+  desired type is an unresolved hole takes its tail expression's concrete type. Mirrors how VL
+  already infers *property* constraints (`o.x`) and *callability* (`fn(a,b)`). **REMAINING:**
+  soundness of the hole-operand rule is permissive (doesn't yet reject `i32 + string`); and the
+  *stored-closure* operator case (`vec + vec` via a `"+"` field, B13) is still blocked — there
+  the method is compiled once at the inferred param shape, not per call, so it hits the WasmGC
+  width-subtyping wall independently of this inference work.
 - ⬜ **A14. Named/opaque type robustness (+ a real crash bug).** `type Point = { x: f64, y:
   f64 }` (with `=`) works as a structural alias and resolves as a param type. **BUG:** the
   opaque form `type Point` (no `=`/body — the `TYPE ID` grammar alt) registers a

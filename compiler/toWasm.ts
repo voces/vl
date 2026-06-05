@@ -42,6 +42,8 @@ export const toWasm = async (ast: VLProgramNode) => {
   let loopIndex = 0;
   // A reusable i32 desired-type, e.g. for array indices.
   const i32Type: VLType = { type: "Alias", name: "i32" };
+  // Binary operators that yield a boolean (used by instance-aware type resolution).
+  const COMPARE_OPS = new Set(["<", ">", "<=", ">=", "==", "!=", "&&", "||"]);
 
   type ScopeEntry = [type: VLType, index: number];
   type Scope = Record<string, ScopeEntry>;
@@ -312,6 +314,30 @@ export const toWasm = async (ast: VLProgramNode) => {
         p.name.type === "StringLiteral" && p.name.value === node.property
       );
       if (field) return field.type;
+    }
+    // Resolve an arithmetic result instance-aware (`self.x + b.x` → the operand's
+    // concrete numeric); comparisons/logical → boolean. This lets a monomorphized
+    // generic body's expressions concretize rather than carry declaration holes.
+    if (node.type === "BinaryOperation" && node.operator !== "=") {
+      if (COMPARE_OPS.has(node.operator)) {
+        return { type: "Alias", name: "boolean" };
+      }
+      return codegenType(node.left);
+    }
+    // An object literal's field types come from its values (instance-aware), not
+    // the once-inferred literal type.
+    if (node.type === "ObjectLiteral") {
+      return {
+        type: "Object",
+        properties: node.properties.map((p) => ({
+          name: p.name.type === "Name"
+            ? { type: "StringLiteral", value: p.name.name }
+            : p.name.type === "StringLiteral"
+            ? p.name
+            : codegenType(p.name),
+          type: codegenType(p.value),
+        })),
+      };
     }
     return vlType(node as Parameters<typeof vlType>[0]);
   };
@@ -949,7 +975,10 @@ export const toWasm = async (ast: VLProgramNode) => {
             ? m.block(null, [set, m.local.get(localIndex, wasmType)], wasmType)
             : set;
         }
-        const leftType = vlType(node.left);
+        // Resolve from the instance scope (not the once-inferred AST type), so a
+        // monomorphized generic's operand — e.g. `self.x` where `self` is bound to
+        // a concrete shape this instance — is seen as its concrete numeric type.
+        const leftType = softenImplicitType(codegenType(node.left));
         let rightType: VLType;
         {
           if (leftType.type !== "Object") rightType = leftType;
@@ -1058,12 +1087,24 @@ export const toWasm = async (ast: VLProgramNode) => {
           }`,
         );
       }
-      case "Block":
-        return m.block(
-          null,
-          withScope({}, () => lowerStatements(node.statements)),
-          desiredType ? toWasmType(desiredType) : undefined,
-        );
+      case "Block": {
+        const stmts = withScope({}, () => lowerStatements(node.statements));
+        // The block's result type follows the desired type — but a generic body's
+        // desired type can be an unresolved inference hole (e.g. an inferred
+        // return `Union<Infer, Infer>`) with no wasm mapping. Then take the
+        // concrete type of the block's tail expression instead.
+        let blockType: number | undefined = undefined;
+        if (desiredType) {
+          try {
+            blockType = toWasmType(desiredType);
+          } catch {
+            const tail = stmts[stmts.length - 1];
+            const t = tail !== undefined ? binaryen.getExpressionType(tail) : 0;
+            if (t !== binaryen.none && t !== binaryen.unreachable) blockType = t;
+          }
+        }
+        return m.block(null, stmts, blockType);
+      }
       case "If":
         return m.if(
           withDesiredType(

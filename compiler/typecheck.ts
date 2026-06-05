@@ -13,6 +13,10 @@ import type {
 } from "./ast.ts";
 import { errors, flow, scopes } from "./state.ts";
 
+// Binary operators that yield a boolean (comparisons + logical), used when the
+// operand is still an inference hole and we infer the result without the method.
+const BOOLEAN_OPS = new Set(["<", ">", "<=", ">=", "==", "!=", "&&", "||"]);
+
 export const _typeFromExpression = (
   expr: VLExpression,
   ctx: Context,
@@ -57,6 +61,16 @@ export const _typeFromExpression = (
         });
         return { type: "Never" };
       };
+      // Operator on an inference hole (e.g. `self.x + b.x` in a fully-inferred
+      // structural function): don't error — the operand is concretized per call
+      // site (monomorphization), and codegen reads the concrete type from the
+      // instance scope. Comparisons/logical ops yield boolean; arithmetic yields
+      // the operand's (to-be-resolved) type.
+      if (leftType.type === "Infer" || leftType.type === "Unknown") {
+        return BOOLEAN_OPS.has(op)
+          ? { type: "Alias", name: "boolean" }
+          : leftType;
+      }
       if (leftType.type !== "Object") return missingOpFunc("left-not-object");
       const opFunc = leftType.properties.find((p) =>
         validateType(p.name, { type: "StringLiteral", value: op })
