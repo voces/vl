@@ -8,6 +8,7 @@
 //   deno task check <dir>              # recursively check every *.vl under dir
 //   deno task check                    # no path → check the cwd (like `check .`)
 //   deno task check --concise <path>   # one terse line per diagnostic (grep-safe)
+//   deno task check . --severity warning  # also fail the exit code on warnings
 //   deno task run help / --help / -h    # list commands (also shown when the
 //                                       # binary is run with no args in a TTY)
 //
@@ -30,10 +31,36 @@ import {
   compile,
   runWasm,
   type VLDiagnostic,
+  type VLSeverity,
   wasmToWat,
 } from "./compile.ts";
 
 const SUBCOMMANDS = new Set(["run", "build", "check"]);
+
+// --- severity ranking -----------------------------------------------------
+
+// Total order on severities, high → low: error > warning > info > hint. Used by
+// `check`'s `--severity` threshold: a diagnostic gates the exit code when its
+// rank is at or above the chosen level's rank. Listed low → high so the array
+// index IS the rank (hint = 0 … error = 3). The default threshold is `error`,
+// so warnings/info/hints never fail unless a lower level is requested; `hint`
+// sits below `warning`, so hints only gate under an explicit `--severity hint`.
+const SEVERITY_ORDER: readonly VLSeverity[] = [
+  "hint",
+  "info",
+  "warning",
+  "error",
+];
+
+export const severityRank = (sev: VLSeverity): number =>
+  SEVERITY_ORDER.indexOf(sev);
+
+// True when `sev` is at or above `threshold` in the severity order, i.e. when a
+// diagnostic of that severity should count toward `check`'s non-zero exit.
+export const meetsThreshold = (
+  sev: VLSeverity,
+  threshold: VLSeverity,
+): boolean => severityRank(sev) >= severityRank(threshold);
 
 // --- diagnostic rendering -------------------------------------------------
 
@@ -159,13 +186,17 @@ const formatPretty = (
 
 // One-line summary for a pretty `check` run, mirroring Deno's `Found N errors.`
 // Counts errors (always) and warnings (when present); a clean run reports the
-// number of files checked.
+// number of files checked. When a non-default `--severity` threshold makes the
+// run fail (`tally.gating > 0`), the line notes the threshold so the reader
+// understands why warnings/info/hints gated the exit code. Colour follows
+// whether the run is failing (red when gating, else yellow for stray warnings).
 const summarize = (
-  errors: number,
-  warnings: number,
+  tally: CheckTally,
   filesChecked: number,
+  threshold: VLSeverity,
   c: Colors,
 ): string => {
+  const { errors, warnings, gating } = tally;
   if (errors === 0 && warnings === 0) {
     const noun = filesChecked === 1 ? "file" : "files";
     return c.dim(`Checked ${filesChecked} ${noun}, no errors.`);
@@ -173,8 +204,13 @@ const summarize = (
   const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
   const parts = [plural(errors, "error")];
   if (warnings > 0) parts.push(plural(warnings, "warning"));
-  const text = `Found ${parts.join(", ")}.`;
-  return errors > 0 ? c.red(text) : c.yellow(text);
+  // Only mention the threshold when it is the reason a non-error run fails — at
+  // the default `error` threshold the line stays byte-for-byte as before.
+  const note = gating > 0 && threshold !== "error"
+    ? ` (failing at severity ${threshold})`
+    : "";
+  const text = `Found ${parts.join(", ")}.${note}`;
+  return gating > 0 ? c.red(text) : c.yellow(text);
 };
 
 // --- run ------------------------------------------------------------------
@@ -369,17 +405,25 @@ export const collectVlFiles = async (
   return found;
 };
 
-type CheckTally = { errors: number; warnings: number };
+// Running counts across a `check` run. `errors`/`warnings` drive the summary
+// line; `gating` counts diagnostics at or above the chosen `--severity`
+// threshold and is what decides the exit code (so `--severity warning` makes
+// warnings — and errors — gate, while a hint never gates unless `--severity
+// hint` is chosen). At the default `error` threshold `gating === errors`.
+type CheckTally = { errors: number; warnings: number; gating: number };
 
 // Check one file: compile, print its diagnostics in the requested style, and
 // accumulate error/warning counts into `tally`. Concise mode reproduces the
 // historical `<file>: <severity> [L:C] <message>` line exactly (grep-safe,
 // uncolored); pretty mode renders the rustc/Deno-style block per diagnostic.
+// `threshold` decides which diagnostics count toward `tally.gating` (the exit
+// gate); display is unaffected — every diagnostic still prints.
 const checkFile = async (
   file: string,
   concise: boolean,
   c: Colors,
   tally: CheckTally,
+  threshold: VLSeverity,
 ): Promise<void> => {
   const source = await Deno.readTextFile(file);
   // `check` only needs diagnostics, so use the codegen-free front end: it skips
@@ -406,18 +450,42 @@ const checkFile = async (
   for (const d of diagnostics) {
     if (d.severity === "error") tally.errors++;
     else if (d.severity === "warning") tally.warnings++;
+    if (meetsThreshold(d.severity, threshold)) tally.gating++;
   }
 };
 
-type CheckArgs = { target: string; concise: boolean; excludes: string[] };
+type CheckArgs = {
+  target: string;
+  concise: boolean;
+  excludes: string[];
+  severity: VLSeverity;
+};
 
-// Parse `check`'s args into a path target, the `--concise` flag, and the list of
-// `--exclude`/`--ignore` patterns. Both forms are accepted: a separate value
-// (`--exclude foo`) and an inline comma list (`--exclude=foo,bar`). The exclude
-// VALUE is consumed here so it is never mistaken for the path target.
+// Validate a `--severity` value against the known levels, exiting with a clean
+// error on anything else (so `--severity warn` doesn't silently behave like the
+// default). Returns the value narrowed to `VLSeverity`.
+const parseSeverity = (value: string | undefined): VLSeverity => {
+  if (value !== undefined && (SEVERITY_ORDER as readonly string[]).includes(value)) {
+    return value as VLSeverity;
+  }
+  const levels = SEVERITY_ORDER.slice().reverse().join(", ");
+  console.error(
+    `check: invalid --severity \`${value ?? ""}\` (expected one of: ${levels})`,
+  );
+  Deno.exit(2);
+};
+
+// Parse `check`'s args into a path target, the `--concise` flag, the list of
+// `--exclude`/`--ignore` patterns, and the `--severity` exit-code threshold.
+// Both value forms are accepted for `--exclude`/`--ignore` and `--severity`: a
+// separate value (`--severity warning`) and an inline `=` form
+// (`--severity=warning`). The consumed VALUE is never mistaken for the path
+// target. `--severity` defaults to `error` (today's behaviour: only errors
+// fail).
 const parseCheckArgs = (args: string[]): CheckArgs => {
   let target: string | undefined;
   let concise = false;
+  let severity: VLSeverity = "error";
   const excludes: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -428,6 +496,10 @@ const parseCheckArgs = (args: string[]): CheckArgs => {
       if (value !== undefined) excludes.push(...value.split(","));
     } else if (a.startsWith("--exclude=") || a.startsWith("--ignore=")) {
       excludes.push(...a.slice(a.indexOf("=") + 1).split(","));
+    } else if (a === "--severity") {
+      severity = parseSeverity(args[++i]);
+    } else if (a.startsWith("--severity=")) {
+      severity = parseSeverity(a.slice(a.indexOf("=") + 1));
     } else if (!a.startsWith("-") && target === undefined) {
       target = a;
     }
@@ -437,12 +509,13 @@ const parseCheckArgs = (args: string[]): CheckArgs => {
     target: target ?? ".",
     concise,
     excludes: excludes.filter((p) => p !== ""),
+    severity,
   };
 };
 
 const check = async (args: string[]): Promise<void> => {
   // No path argument → default to the current working directory (`vl check .`).
-  const { target, concise, excludes } = parseCheckArgs(args);
+  const { target, concise, excludes, severity } = parseCheckArgs(args);
   // No color when piped, when NO_COLOR is set, or in concise mode (kept plain
   // so scripts/grep see stable bytes).
   const c = makeColors(!concise && shouldColor());
@@ -467,19 +540,20 @@ const check = async (args: string[]): Promise<void> => {
     files = [target];
   }
 
-  // CI gate: never run the program; fail only on ERROR-severity diagnostics,
-  // aggregated across every file checked.
-  const tally: CheckTally = { errors: 0, warnings: 0 };
+  // CI gate: never run the program; fail on any diagnostic at or above the
+  // `--severity` threshold (default `error`), aggregated across every file
+  // checked. `tally.gating` counts exactly those diagnostics.
+  const tally: CheckTally = { errors: 0, warnings: 0, gating: 0 };
   for (const file of files) {
-    await checkFile(file, concise, c, tally);
+    await checkFile(file, concise, c, tally, severity);
   }
 
   // Pretty mode ends with a Deno-style summary; concise stays output-stable.
   if (!concise) {
-    console.error(summarize(tally.errors, tally.warnings, files.length, c));
+    console.error(summarize(tally, files.length, severity, c));
   }
 
-  Deno.exit(tally.errors > 0 ? 1 : 0);
+  Deno.exit(tally.gating > 0 ? 1 : 0);
 };
 
 // --- dispatch -------------------------------------------------------------
@@ -509,13 +583,18 @@ check:
                                directory; repeatable, or comma-separated.
                                Matches the path relative to <path> and the
                                basename; \`*\` stops at \`/\`, \`**\` crosses it
+  --severity <level>           exit non-zero on any diagnostic at or above
+                               <level> (error > warning > info > hint;
+                               default: error). All diagnostics still print;
+                               this only gates the exit code
 
 examples:
   vl hello.vl
   vl -e 'print(1 + 2)'
   vl build hello.vl --wat
   vl check .
-  vl check . --exclude tests --exclude '*.gen.vl'`;
+  vl check . --exclude tests --exclude '*.gen.vl'
+  vl check . --severity warning`;
 
 const main = async (): Promise<void> => {
   const [maybeCmd, ...rest] = Deno.args;
