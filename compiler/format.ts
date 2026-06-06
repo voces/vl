@@ -1143,9 +1143,14 @@ class Printer {
   /**
    * Render `open item, item, … close`, collapsing to one line when it fits in
    * `width` from `column`, otherwise breaking one item per continuation line.
-   * No trailing comma is emitted — VL call-argument lists reject one (object /
-   * array literals tolerate one, but omitting it everywhere is always valid and
-   * keeps the rule uniform and idempotent).
+   *
+   * Trailing comma policy: the SINGLE-LINE (collapsed) form never carries a
+   * trailing comma, but the MULTI-LINE (wrapped) form emits one after the last
+   * element — before the closing delimiter on its own line — for cleaner diffs.
+   * The parser now accepts a trailing comma in every list it produces (call
+   * arguments, array / object literals, parameter lists), so this is faithful
+   * and idempotent: re-formatting wrapped output re-parses to the same list and
+   * re-emits the same trailing comma.
    */
   private wrapList(
     open: string,
@@ -1159,15 +1164,15 @@ class Printer {
     if (column + oneLine.length <= this.width && !oneLine.includes("\n")) {
       return oneLine;
     }
-    // Multi-line: each item on its own line, one indent level deeper, with the
-    // comma trailing each item except the last. Nested multi-line items keep
-    // their own internal line breaks.
+    // Multi-line: each item on its own line, one indent level deeper, with a
+    // comma trailing EVERY item — including the last, before the close on its
+    // own line. Nested multi-line items keep their own internal line breaks.
     const pad = INDENT.repeat(indent + 1);
     const closePad = INDENT.repeat(indent);
     const openTok = open.trimEnd();
     const closeTok = close.trimStart();
     const body = items
-      .map((it, i) => `${pad}${it}${i < items.length - 1 ? "," : ""}`)
+      .map((it) => `${pad}${it},`)
       .join("\n");
     return `${openTok}\n${body}\n${closePad}${closeTok}`;
   }
