@@ -2835,6 +2835,11 @@ export const toWasm = async (ast: VLProgramNode) => {
   const nullableNull = (nullableType: VLType): number => {
     const info = unionInfo(nullableType);
     if (info) return boxUnion(info, info.nullTag, null, null);
+    // A sentinel-encoded scalar nullable (`boolean | null`) is an i32 whose
+    // `null` is the out-of-range sentinel — not a ref. Mirror the NullLiteral
+    // lowering before falling through to the niche-`ref.null` path.
+    const sentinel = nullSentinel(nonNullable(nullableType));
+    if (sentinel !== null) return m.i32.const(sentinel);
     // `ref.null` takes a nullable ref *type* (not a bare heap type).
     return m.ref.null(
       binaryen.getTypeFromHeapType(refHeapType(nonNullable(nullableType)), true),
