@@ -1,12 +1,12 @@
 # VL module system (import/export) + standard-library layout
 
-> Status: **design / research only — every choice here is PROPOSED and
-> UNCOMMITTED.** No compiler code exists for this yet, and this document changes
-> none. It is a decision record to react to (in the spirit of
-> `docs/collections-design.md` and its "names uncommitted" stance), not a fait
-> accompli. Names, syntax, and directory layout are all placeholders the owner is
-> invited to overrule. A separate change will reference this once the shape is
-> agreed.
+> Status: **design — owner-reviewed direction, pending implementation.** No
+> compiler code exists for this yet, and this document changes none; the final
+> word lands in `DECISIONS.md` at implementation time (in the spirit of
+> `docs/collections-design.md`). The eight points the owner reviewed (§5) are now
+> **decided directions (pending implementation)** — settled leanings, not open
+> questions — and the prose below reflects them. Remaining sub-questions and exact
+> spellings of unreviewed details stay open and are flagged as such.
 
 ## Why this exists (the bootstrapping frame)
 
@@ -45,32 +45,51 @@ linked ones.
 
 ---
 
-## TL;DR — the proposed shape
+## TL;DR — the shape
 
 - **Syntax.** Newline-delimited, no semicolons, fitting VL's existing `function` /
   `let` / `type` decls. **Explicit `export`** on declarations; **named imports**
-  with relative paths for user code (`import { f, T } from "./util.vl"`) and
-  **bare specifiers** for std (`import { List } from "std/list"`). No
-  export-all, no default export, no namespace import in v1.
-- **Resolution.** Relative paths resolve from the importing file's directory. Std
-  bare specifiers resolve to an **embedded std** bundled into the compiler. A
-  thin slice of std (the collections, once migrated) is an **implicit prelude**
-  always in scope; the rest is explicitly imported. `defaultScope` stays the
-  intrinsic floor (builtins + `__…__` intrinsics), conceptually the root every
-  module's scope chains to.
+  with relative paths for user code (`import { f, T } from "./util"`, no `.vl`
+  extension) and a **`std:` scheme** specifier for std
+  (`import { list } from "std:list"`). **`import { x as y }` rename is in v1.**
+  No export-all, no default export, no namespace import in v1.
+- **Specifiers.** A `scheme:` prefix names a resolution *source* — `std:` now,
+  extensible to a package registry later — while `/` and `./` are file paths.
+  `std:list` (clean, extensible) over `std/list` (reads like a path from a `std`
+  root, conflating source with filesystem). Import maps stay a **separate
+  aliasing layer**, not folded into the scheme. Sort order: `std:` → registry →
+  mapped → relative.
+- **Resolution.** Relative paths resolve from the importing file's directory; the
+  `.vl` extension is **omitted** in specifiers (resolution rule = "append `.vl`",
+  no index/directory guessing). `std:` specifiers resolve to an **embedded std**
+  bundled into the compiler. **No implicit library prelude** — every *named*
+  library value (`print`, math, …) is an explicit `import` from `std:`.
+  Collections are **language syntax** (`[…]`, `{[K]:V}`), so they need no
+  prelude. `defaultScope` stays the intrinsic floor (the two array primitives +
+  memory/print sinks + builtin types), conceptually the root every module's scope
+  chains to — the privileged floor, *not* a prelude.
 - **Compilation model — whole-program → one wasm module.** `compile()` grows from
   "one string" to "an entry module + a resolver"; the compiler walks the import
   graph, loads every reachable module, type-checks them into one program, and
   emits **one wasm module**. This is the natural fit for VL's existing
   monomorphization and single-wasm-output, and the direct fit for H-M2. Separate
   compilation / wasm-linking is rejected for v1 (rationale below).
+- **Export semantics.** Exported bindings are **live references** (`export let x`
+  shares the live object with importers — like JS's live bindings); the imported
+  name is a **read-only binding** (an importer can't reassign another module's
+  `let`; `const` is also exportable and additionally forbids local reassignment).
+  Readonly/encapsulated exports ("public shape vs private shape") are an
+  application of **A9 Readable/Writable variance** at the module boundary — A9 is
+  unstarted (⬜), so this depends on it; no parallel readonly mechanism is invented.
 - **Std layout.** `std/` of `.vl` source in the repo, **embedded into the compiler
-  binary** at build time, exposed via bare specifiers and a small implicit
-  prelude. `List`/`Map`/`Set` live here once they migrate off compiler-internal
-  helpers, over the collections-design two-primitive intrinsic floor.
+  binary** at build time, exposed via `std:` specifiers as **fine-grained modules**
+  (`std:list`, `std:map`, `std:set`, `std:testing`, `std:fmt` — one per concern,
+  not a monolithic `std:collections`). `List`/`Map`/`Set` capabilities live here
+  once they migrate off compiler-internal helpers, over the collections-design
+  two-primitive intrinsic floor.
 - **Phasing.** (1) relative-path imports + explicit `export` + whole-program
-  compile → unblocks H3. (2) embedded std + prelude → unblocks std-over-primitives.
-  (3) tooling (cross-file LSP).
+  compile → unblocks H3. (2) embedded std (fine-grained `std:` modules) →
+  unblocks std-over-primitives. (3) tooling (cross-file/std LSP).
 
 ---
 
@@ -99,11 +118,17 @@ inference**.
   will host its own compiler (you want the compiler's module boundaries to be
   deliberate). **Lean explicit.**
 
-- **Path vs registry resolution.** Deno's "paths and URLs, no central registry" is
-  the lightest possible scheme and matches a young language with no package
-  ecosystem yet. Rust/Go bake in a package manager and a resolver — premature for
-  VL. **Relative paths for user code now; defer any registry.** Bare specifiers
-  (`std/…`) are the one non-path form, reserved for the embedded std.
+- **Path vs registry vs scheme resolution.** Deno's "paths and URLs, no central
+  registry" is the lightest possible scheme and matches a young language with no
+  package ecosystem yet. Rust/Go bake in a package manager and a resolver —
+  premature for VL. **Relative paths for user code now; defer any registry.** For
+  the one non-path form (the embedded std) the survey points to a `scheme:`
+  prefix: **Node's `node:` disambiguates builtins from userland unspoofably, and
+  Deno's `npm:`/`jsr:`/`node:` use `scheme:` to name a resolution *source*.** A
+  `std/…` bare specifier instead reads like a filesystem path rooted at a `std`
+  directory — conflating *source* with *path*. **`std:…` is cleaner and
+  extensible** (a future package registry is just another scheme), and import maps
+  stay a *separate* aliasing layer rather than being folded into the scheme.
 
 - **Std: privileged vs just-modules.** Go bakes the growable collection into the
   *language* (`make`/`append`); Python/JS ship one privileged runtime. Rust, C++,
@@ -114,11 +139,17 @@ inference**.
   (`__array_new__` etc.), already the same class as `__store_i32__`.
 
 - **Prelude vs explicit-everything.** Rust's auto-prelude (`Vec`, `Option`,
-  `String`… in scope unqualified) gives scripting ergonomics without making *all*
-  of std implicit; Go/Zig make you import even common things. For a language whose
-  pitch is "scripting feel," reaching for a list/map without an import line matters.
-  **A small implicit prelude (the collections), explicit import for the rest** —
-  the Rust split, sized for a scripting feel.
+  `String`… in scope unqualified) gives scripting ergonomics by injecting *named
+  identifiers* into every module; Go/Zig make you import even common things. VL
+  sidesteps the dilemma: **its collections are language *syntax*** (`[…]`,
+  `{[K]:V}`), so reaching for a list/map needs no import *and* puts no `List`/`Map`
+  *identifier* in scope to collide with — a user defining their own `List` isn't
+  blocked. With the collections covered by syntax, the scripting-feel argument for
+  an implicit prelude largely evaporates. **No implicit library prelude: every
+  *named* library value is an explicit `import` from `std:`** — keeping the user's
+  namespace clean and shadow-free, and giving the lever to replace the weak builtin
+  `print` with a real `std:fmt`. (A single *shadowable* convenience name could be
+  reintroduced later if scripting-feel demands; the lean is explicit.)
 
 - **Compile model: whole-program vs separate.** Rust/Go produce per-unit artifacts
   then link; ES/Deno can bundle a graph into one file; Zig is whole-program and
@@ -134,8 +165,11 @@ inference**.
 
 ## 2. Proposed shape for VL
 
-> Reminder: **all PROPOSED / UNCOMMITTED.** Keywords, the `std/` spelling, and the
-> directory layout are placeholders.
+> Reminder: this is owner-reviewed **direction pending implementation**, not yet
+> in `DECISIONS.md`. The reviewed points (specifier scheme, no prelude,
+> fine-grained modules, export semantics, `as` rename, no extension, LSP phasing,
+> visibility) are settled leanings below; exact keyword spellings and unreviewed
+> details remain open.
 
 ### 2.1 Import / export syntax
 
@@ -156,13 +190,29 @@ export type Point = { x: f64, y: f64 }
   module-private. No export-all (rejected: makes the public surface implicit and
   un-evolvable — Python's problem) and no separate `export { … }` statement list
   in v1 (rejected: a second place to keep in sync; the inline modifier is enough).
+- **Export semantics = live references.** An exported binding is a *live
+  reference*, not a by-value snapshot: `export let cfg = { … }` shares the live
+  object with importers, so mutations are visible across modules with no getter
+  boilerplate. (Aside: JS exports are live read-only bindings too, not by-value —
+  same model.) The **imported name is a read-only binding**: an importer can read
+  and (for an exported object) mutate the *object*, but **cannot reassign** another
+  module's `let`. `const` is also exportable — it adds nothing at the import
+  boundary (already read-only there) but additionally forbids reassignment in the
+  *defining* module.
+- **Readonly/encapsulated exports depend on A9.** Exporting a value importers can
+  read but **cannot mutate** ("public shape vs private shape") is an application of
+  **A9 Readable/Writable variance** at the module boundary, *not* a separate
+  feature: the export's public type is the readable view, the module keeps the
+  writable view. **A9 is unstarted (⬜)**, so encapsulated exports are gated on it;
+  this design does **not** invent a parallel module-only readonly mechanism.
 - Re-exports (`export … from`) are **deferred** (not needed to unblock H3).
 
 **Import — named imports, one line, from a specifier:**
 
 ```
-import { distance, Point } from "./geometry.vl"     // relative, user code
-import { List, Map } from "std/collections"         // bare specifier, std
+import { distance, Point } from "./geometry"        // relative, user code (no .vl)
+import { format } from "std:fmt"                     // std: scheme specifier
+import { distance as dist } from "./geometry"        // rename (in v1)
 ```
 
 - **Named imports only** in v1 — the imported names bind into the importing
@@ -179,37 +229,56 @@ import { List, Map } from "std/collections"         // bare specifier, std
   boundary (see §2.5 monomorphization).
 - An imported name participates in **no-redeclaration (B16)** like any other: you
   cannot `import { x }` and also declare a top-level `x` in the same module (one
-  binding per name per scope). Shadowing in a nested block stays legal (B16). An
-  import *rename* form (`import { x as y }`) is the escape hatch for collisions and
-  is a natural early addition (sketched, uncommitted).
+  binding per name per scope). Shadowing in a nested block stays legal (B16).
+- **Import rename (`import { x as y }`) is in v1.** It is cheap and important —
+  the escape hatch for cross-module name collisions and a near-necessity for
+  *generated* code (the H3 self-hosted compiler) where two modules may export the
+  same name. (Re-export, `export … from`, stays deferred — §2.4.)
 
 ### 2.2 Resolution & loading
 
-- **Relative specifiers (`./`, `../`)** resolve against the **importing file's
-  directory** (ES/Deno semantics). This is the whole user-code story for v1. The
-  `.vl` extension is written explicitly (`"./geometry.vl"`) — matching Deno's
-  no-magic-extension stance and keeping the resolver trivial; an
-  extension-optional sugar can come later.
-- **Bare specifiers (`std/…` or `std:…`)** are reserved for the **embedded std**
-  (§2.4) and resolve into the compiler's bundled std, *not* the filesystem. This is
-  the one non-path form. There is **no central registry / URL import** in v1
-  (rejected as premature — VL has no ecosystem yet; Deno shows URL imports can be
-  added later without disturbing path imports).
-- **Project root.** v1 needs none — relative paths + the std bare-specifier root
-  are sufficient. A future `vl.json`/manifest defining a root or import map
-  (Deno-style) is the natural place to add registry/alias resolution; **deferred.**
+- **Specifier kinds — `scheme:` vs path.** A `scheme:` prefix names a resolution
+  *source*; `/` and `./` name file paths. This is the organizing convention:
+  - **Relative path specifiers (`./`, `../`)** resolve against the **importing
+    file's directory** (ES/Deno semantics) — the whole user-code story for v1. The
+    **`.vl` extension is omitted** (`"./geometry"` → `geometry.vl`); the resolution
+    rule is simply "append `.vl`", with **no index/directory guessing**. VL avoids
+    JS's bare-specifier/extension pain by construction (single extension, no
+    registry, no `node_modules`), so extensionless is unambiguous and cleaner. (This
+    flips the earlier "require `.vl` in v1" proposal.)
+  - **The `std:` scheme** is reserved for the **embedded std** (§2.4): `std:list`,
+    `std:fmt`, … resolve into the compiler's bundled std, *not* the filesystem.
+    `std:` (not `std/…`) is deliberate — see the survey trade-off: `scheme:` names a
+    *source* unspoofably (Node `node:`, Deno `npm:`/`jsr:`/`node:`), whereas
+    `std/list` reads like a filesystem path from a `std` root and conflates source
+    with path. The scheme is **extensible**: a future package registry is just
+    another scheme (e.g. `pkg:…`/registry), added without disturbing `std:` or paths.
+  - **No URL import** in v1 (rejected as premature — VL has no ecosystem yet; Deno
+    shows URL imports/registries can be added later as a scheme without disturbing
+    path imports).
+- **Import maps are a separate aliasing layer.** Any future alias mechanism (a
+  Deno-style import map) is **not** folded into the scheme — it sits above
+  resolution as its own layer. **Specifier sort/resolution order:** `std:` →
+  registry (future) → mapped (import map) → relative paths.
+- **Project root.** v1 needs none — relative paths + the `std:` scheme are
+  sufficient. A future `vl.json`/manifest defining a root or import map (Deno-style)
+  is the natural place to add registry/alias resolution; **deferred.**
 - **How `defaultScope` relates.** `defaultScope` stays the **intrinsic floor**: the
   builtin types and the `__…__` intrinsics (memory ops, and the collections-design
   `__array_new__`/`__array_copy__` floor when added). Conceptually it is the **root
   scope every module's top-level scope chains to** — always in scope, never
-  imported, not part of std. Std proper (`.vl` modules) sits *above* the floor:
-  partly implicit (the prelude, §2.4), partly explicit-import.
-- **Implicit prelude vs explicit import.** The collections (`List`/`Map`/`Set`) and
-  a thin set of universally-useful helpers are an **implicit prelude** — injected
-  into every module's scope so `[1, 2, 3]` and a map "just work" without an import
-  line (the scripting feel). Everything else in std is **explicitly imported**
-  (`import { … } from "std/…"`). This is the Rust prelude split. (Open question:
-  exactly what is in the prelude — §OQ.)
+  imported, not part of std. It is **the privileged floor, not a prelude**: it
+  holds no library values, only intrinsics. Std proper (`.vl` modules) sits *above*
+  the floor and is **always explicitly imported** (§2.4).
+- **No implicit library prelude.** There is **no implicit prelude** injecting
+  library *identifiers* into every module. The collections are **language syntax**
+  (`[1, 2, 3]`, `{[k]: v}`) — they "just work" without an import *and* put no
+  `List`/`Map` identifier in scope to collide with, so the scripting feel is kept
+  without a prelude and a user may still define their own `List`. Every *named*
+  library value (`print`/a real `std:fmt`, math helpers, …) is an **explicit
+  `import` from `std:`** — keeping each module's namespace clean and shadow-free.
+  (A single *shadowable* convenience name could be reintroduced later if
+  scripting-feel demands; the lean is explicit.)
 
 **Interaction with the current `compile()` entry.** Today `compile(source: string)`
 is single-input. The proposal makes it **graph-aware** without changing the *shape*
@@ -217,7 +286,7 @@ callers want:
 
 - `compile()` gains a way to resolve a specifier to source — a **module loader**
   (an injectable `(specifier, fromPath) => source` function, defaulting to "read
-  the file" in the CLI, "read the embedded map" for `std/…`, and an in-memory map
+  the file" in the CLI, "read the embedded map" for `std:…`, and an in-memory map
   in tests/playground). This keeps `compile.ts` runtime-agnostic (it already avoids
   `Deno`/`process`; the loader is where the host I/O lives, like the CLI's
   `readSource`).
@@ -238,7 +307,8 @@ one module. **Proposed: whole-program compilation of the resolved module graph.*
    cycles — same rule the type checker already needs for mutually-recursive types;
    `let` init order across modules is the only genuinely new ordering constraint).
 2. **Type-check the whole program together.** Each module gets its own top-level
-   scope chained to `defaultScope` + the prelude; imports bind cross-module
+   scope chained to `defaultScope` (the intrinsic floor — no prelude); imports
+   bind cross-module
    bindings into the importing scope. Names stay module-scoped (no global
    flattening) so B16 no-redeclaration is *per module*, and two modules may each
    define `helper` privately without colliding.
@@ -290,49 +360,70 @@ model is what lets those files still become the *one* module H-M2 requires.
   `compiler/` and `samples/`). Source-controlled, testable with the existing `.vl`
   corpus (A12), and — critically for self-hosting — *just VL code the compiler
   already compiles*.
+- **Granularity — fine-grained `std:` modules, one per concern.** `std:list`,
+  `std:map`, `std:set`, `std:testing`, `std:fmt` — **not** a monolithic
+  `std:collections`. With whole-program compile, *unused code is never emitted
+  regardless* (dead-code elimination, §2.3), so there is **no size pressure toward
+  bundling**: granularity is purely an ergonomics/clarity choice, and small focused
+  modules win. The survey backs this: Deno's `@std/assert`/`@std/fmt`, Go's small
+  flat packages, Rust's module tree, and Python's focused modules all favor small,
+  explicit-import modules over one grab-bag. **Flat now** (`std:list`, not
+  `std:collections/list`); sub-paths only if the namespace sprawls later.
 - **What's in it (as collections migrate off compiler-internal helpers):**
-  - `List<T>` — the growable sequence (`docs/collections-design.md` §VL.1–VL.7),
-    written in `.vl` over the **two-primitive intrinsic floor** (`__array_new__` /
-    `__array_new_default__` + `__array_copy__`). Today its capabilities live as
-    compiler-internal helpers / the fixed-array MVP; this is where they land as
-    library code.
-  - `Map<K, V>` and `Set<T>` — same floor (buckets are dynamic-length arrays),
-    deterministic insertion-order iteration (the multiplayer/replay requirement,
-    §LS.6).
-  - String utilities beyond the builtin `string` methods; later, math helpers,
-    `print`/`println` dispatcher (the §LS.3 opportunistic migration of `print` out
-    of codegen into a std `.vl` dispatcher over the existing `__print_T__` sinks).
-  - **`std/testing` — a `.vl` test framework** (`assert`/`expect`, `it`/`describe`).
+  - `std:list` — `List<T>`, the growable sequence (`docs/collections-design.md`
+    §VL.1–VL.7), written in `.vl` over the **two-primitive intrinsic floor**
+    (`__array_new__` / `__array_new_default__` + `__array_copy__`). Today its
+    capabilities live as compiler-internal helpers / the fixed-array MVP; this is
+    where they land as library code.
+  - `std:map` and `std:set` — `Map<K, V>` / `Set<T>`, same floor (buckets are
+    dynamic-length arrays), deterministic insertion-order iteration (the
+    multiplayer/replay requirement, §LS.6).
+  - `std:fmt` — value→string rendering and a real `print`/`println` dispatcher (the
+    §LS.3 opportunistic migration of `print` out of codegen into a std `.vl`
+    dispatcher over the existing `__print_T__` sinks). With no prelude, *this* is
+    the import that replaces the weak builtin `print`. String utilities beyond the
+    builtin `string` methods and later math helpers live as their own focused
+    modules in the same vein.
+  - **`std:testing` — a `.vl` test framework** (`assert`/`expect`, `it`/`describe`).
     More than ergonomics: it's how a *self-hosted* toolchain tests itself — the
     `.vl` corpus (A12) becomes the oracle run **by VL**, not the TS harness, which is
     the H3→H-M2 end-state (no Deno/TS in the loop). Needs little: closures for
     `it`/`describe` blocks (have — B15), value comparison for assertions (have —
     structural `==` / `valueEq`, A15), and value→string rendering for failure
-    messages (the one likely gap — a `toString`/stringify capability worth scoping
-    alongside). A minimal `assert` is expressible in `.vl` today; the full framework
-    wants modules (to be importable) + that stringify. Good early "real VL" target
-    once imports land.
+    messages (the one likely gap — covered by `std:fmt`). A minimal `assert` is
+    expressible in `.vl` today; the full framework wants modules (to be importable)
+    + that stringify. Good early "real VL" target once imports land.
 - **How it's bundled / loaded — embedded in the compiler binary.** Std `.vl` source
   is **embedded into the compiler at build time** (a generated source map the
-  loader consults for `std/…` specifiers), so a user program needs no std files on
+  loader consults for `std:…` specifiers), so a user program needs no std files on
   disk and no install step — the compiler *is* its std. This matches the H-M2
   end-state cleanly: the compiler-wasm carries its std with it. (Mechanism is an
   implementation detail — a generated `.ts`/embedded blob for the TS compiler, an
   embedded data section for the self-hosted one.)
-- **Implicit vs explicit (connecting to "std over primitives").** The collections
-  are the **implicit prelude** (no import needed — scripting feel). The rest of std
-  is **explicit `import { … } from "std/…"`**. The intrinsic floor stays in
-  `defaultScope` (privileged, but *tiny* — two array primitives + the existing
-  memory/print sinks); everything above the floor is ordinary `.vl` std. This is
+- **All std is explicitly imported (connecting to "std over primitives").** There
+  is **no implicit prelude**: the collections are reached via **language syntax**
+  (`[…]`, `{[K]:V}`), and every *named* std value is an **explicit
+  `import { … } from "std:…"`**. The intrinsic floor stays in `defaultScope`
+  (privileged, but *tiny* — two array primitives + the existing memory/print
+  sinks); everything above the floor is ordinary `.vl` std. This is
   precisely the collections-design recommendation: **no compiler-intrinsic `List`;
   expose the two-primitive floor and write `List` in VL** — the module system is the
   delivery vehicle that recommendation was missing (§LS.7 OQ2).
+- **Export semantics across the std boundary.** Std exports follow the §2.1 rule —
+  **live references, read-only at the import site.** A std `List<T>` value handed
+  to user code shares its live object (mutations visible), and the user cannot
+  reassign a std `let`. Where std wants to expose a value users may read but **not
+  mutate** (encapsulated state, "public shape vs private shape"), that is the
+  **A9 Readable/Writable** application at the module boundary — **A9 is unstarted
+  (⬜)**, so any encapsulated-export need in std is gated on A9, not on a parallel
+  readonly mechanism invented here.
 
 ### 2.5 Interaction with existing features
 
 - **Symbol table / scopes (`compiler/symbols.ts`, `parser.ts`).** Resolution already
   piggybacks on the live `scopes` stack as the parser walks it. Modules add a
-  **per-module top-level scope** chained to `defaultScope` + prelude. An imported
+  **per-module top-level scope** chained to `defaultScope` (the intrinsic floor;
+  no prelude). An imported
   name becomes a `Binding` (kind `function`/`type`/`variable`) whose `decl` span
   points into the *defining* module's source — so cross-file go-to-def is "follow
   the import to the export's binding." `Binding`/`SymbolOccurrence` need a notion of
@@ -348,13 +439,19 @@ model is what lets those files still become the *one* module H-M2 requires.
   per-element array-type interner shared program-wide. No boxing at boundaries (the
   soundness contract holds end-to-end). This is *why* whole-program compile is the
   fit (§2.3).
-- **LSP (cross-file).** Currently single-document (`SymbolTable` is per-document;
-  DECISIONS D2 explicitly scopes cross-file out). Modules make go-to-def / hover /
-  find-refs inherently cross-file. The proposal: the LSP keeps a **workspace of
-  parsed modules** (a `SymbolTable` per open/loaded file, plus the import edges), so
-  `definitionAt` can jump *into another file's* `SymbolTable`, and `referencesAt`
-  can scan importers. This is a real expansion of D2 (per-document → workspace) and
-  is **phase 3**, not needed to unblock H3.
+- **LSP (cross-file + std navigation) — Phase 3, perf-bounded.** Currently
+  single-document (`SymbolTable` is per-document; DECISIONS D2 explicitly scopes
+  cross-file out). Modules make go-to-def / hover / find-refs inherently
+  cross-file, and navigation *into the embedded std* is a natural extension. Both
+  are **Phase 3** — later tooling, **not a constraint on the module system itself**
+  (Phase 1 needs no LSP). The LSP keeps a **workspace of parsed modules** (a
+  `SymbolTable` per open/loaded file, plus the import edges), so `definitionAt` can
+  jump *into another file's* `SymbolTable` and `referencesAt` can scan importers.
+  **Indexing aggressiveness is a strategy choice bounded by perf:** lazy/on-demand
+  indexing is expected to suffice at VL's scale; an eager workspace scan is the
+  fallback only if it doesn't. The **embedded std is fixed**, so it is indexed
+  **once and cached** rather than re-scanned. This is a real expansion of D2
+  (per-document → workspace).
 
 ### 2.6 What changes in the compiler (front-end sketch, not implementation)
 
@@ -362,8 +459,9 @@ model is what lets those files still become the *one* module H-M2 requires.
   graph-walking (resolve → load → check-together → emit-one). Back-compatible
   single-string path = a one-module graph.
 - A small **resolver** (specifier + importing path → resolved key + source) with
-  three cases: relative path (filesystem via loader), bare `std/…` (embedded map),
-  and the synthetic entry. Cycle/dedupe handling lives here.
+  three cases: relative path (filesystem via loader, appending `.vl`), `std:…`
+  scheme (embedded map), and the synthetic entry; the `std:` → registry → mapped →
+  relative sort order lives here too. Cycle/dedupe handling lives here.
 - `parseProgram` already takes an `initialScope`; it grows to thread a
   **per-module scope** and record cross-module bindings. `SymbolTable` grows a
   file/module dimension (multi-document).
@@ -376,26 +474,33 @@ model is what lets those files still become the *one* module H-M2 requires.
 
 1. **Phase 1 — relative imports + explicit export + whole-program compile
    (unblocks H3).**
-   - `export` modifier on `function`/`let`/`type`; `import { … } from "./path.vl"`.
-   - Loader + resolver for relative paths; graph walk with dedupe + cycle handling;
-     per-module scopes chained to `defaultScope`.
+   - `export` modifier on `function`/`let`/`type`; `import { … } from "./path"`
+     (no `.vl` extension); live-reference / read-only-binding export semantics;
+     **`import { x as y }` rename** (cheap, needed for generated code).
+   - Loader + resolver for relative paths (append `.vl`); graph walk with dedupe +
+     cycle handling; per-module scopes chained to `defaultScope` (no prelude).
    - Whole-program type-check + monomorphize + emit one wasm module.
    - **This alone unblocks the H3 port**: the self-hosted compiler can be many
-     `.vl` files compiled into one module. No std, no prelude, no tooling needed
-     yet. Smallest viable step.
+     `.vl` files compiled into one module. No std, no tooling needed yet. Smallest
+     viable step.
 
-2. **Phase 2 — embedded std + implicit prelude (unblocks std-over-primitives).**
+2. **Phase 2 — embedded std (fine-grained `std:` modules; unblocks
+   std-over-primitives).**
    - Add the two-primitive intrinsic floor to `defaultScope` (the collections-design
      §LS.6 step 1 — independently testable).
-   - `std/` directory; bare `std/…` specifier resolution against an embedded map;
+   - `std/` directory; `std:…` scheme resolution against an embedded map;
      build-time embedding into the compiler.
-   - Write `List`/`Map`/`Set` as `.vl` std modules over the floor; wire the
-     collections as the implicit prelude.
-   - Opportunistically migrate `print` to a std dispatcher (§LS.3) during this work.
+   - Write `List`/`Map`/`Set` as fine-grained `.vl` std modules over the floor
+     (`std:list`, `std:map`, `std:set`) — **no implicit prelude**; collections are
+     reached via language syntax, named std values via explicit `import`.
+   - Migrate `print` to a `std:fmt` dispatcher (§LS.3) during this work — the
+     explicit-import replacement for the weak builtin `print`.
 
-3. **Phase 3 — tooling (cross-file LSP).**
+3. **Phase 3 — tooling (cross-file + std LSP, perf-bounded).**
    - Workspace of parsed modules; cross-file go-to-def / hover / find-refs;
-     import-aware completion. Expands DECISIONS D2 from single-document to workspace.
+     navigation into the embedded std (indexed once + cached); import-aware
+     completion. Indexing strategy bounded by perf (lazy first, eager only if
+     needed). Expands DECISIONS D2 from single-document to workspace.
 
 Phases 1 and 2 are independent enough that Phase 1 can land and serve the H3 port
 while Phase 2 proceeds; Phase 3 is purely additive tooling.
@@ -411,44 +516,100 @@ while Phase 2 proceeds; Phase 3 is purely additive tooling.
 - **Default exports / namespace imports in v1** — second export concept / needs a
   module-value type; not needed for H3. Deferred, addable later.
 - **URL imports / a package registry now** — premature; no ecosystem. Relative
-  paths + bare std specifiers suffice; registry deferrable Deno-style.
+  paths + the `std:` scheme suffice; a registry is a future *scheme*, deferrable
+  Deno-style.
+- **`std/…` bare specifier (path-shaped)** — reads like a filesystem path from a
+  `std` root, conflating *resolution source* with *file path*. Rejected for the
+  **`std:` scheme** (`scheme:` = source, à la Node/Deno; cleaner + extensible).
+- **`.vl` extension required in specifiers** — earlier proposal; rejected for
+  **extensionless** (`"./util"` → `util.vl`). VL's single-extension/no-registry
+  setup makes "append `.vl`" unambiguous, and it's cleaner.
+- **Implicit library prelude (Rust-style)** — earlier proposal; **rejected for no
+  prelude.** Collections are language *syntax* (no `List`/`Map` identifier to
+  inject or collide with), so the scripting-feel case for a prelude evaporates;
+  every named std value is an explicit `import` from `std:`, keeping namespaces
+  clean and giving the lever to replace builtin `print` with `std:fmt`.
+- **Monolithic `std:collections`** — rejected for **fine-grained modules**
+  (`std:list`/`std:map`/`std:set`/…). Whole-program DCE removes any size pressure
+  to bundle, so granularity is pure ergonomics and small modules win.
 - **Compiler-privileged `List` (Go model)** — machinery the H3 port must
   re-implement; contradicts collections-design §LS.1. Rejected for `.vl` std over
   the intrinsic floor.
 - **Separate compilation + wasm-linking / component model** — adds a cross-module
   ABI + linker, fights monomorphization (forces re-instantiation or boxing), and
   the H-M2 goal is *one* module anyway. Rejected for whole-program compile.
-- **All of std explicit (Go/Zig), no prelude** — loses the scripting feel for the
-  common collections. Rejected for a small implicit prelude + explicit rest.
+- **A parallel module-only readonly-export mechanism** — rejected; encapsulated /
+  readonly exports are an application of **A9 Readable/Writable** at the boundary
+  (⬜ unstarted), not a new feature invented here.
 
 ---
 
-## 5. Open questions
+## 5. Decisions & open questions
 
-1. **Keyword/syntax spellings.** `export` modifier vs `pub`; `import { … } from "…"`
-   vs another form; bare-specifier spelling (`std/list` vs `std:list` vs `@std/list`).
-   All uncommitted.
-2. **Prelude contents.** Exactly which std items are implicit (just
-   `List`/`Map`/`Set`? plus a `print`/`println`? plus some string/option helpers?).
-   Bigger prelude = more scripting feel, less explicitness.
-3. **Std specifier root & directory layout.** One `std/collections` module vs
-   `std/list` + `std/map` + `std/set`; how `std/` maps to bare specifiers; the
-   embedding mechanism (generated source map now; embedded data section for the
-   self-hosted compiler later).
-4. **Cross-module `let` initialization order.** Functions/types can be
-   mutually-recursive across modules (already needed for recursive types); but
-   top-level `let` initializers with cross-module dependencies need a defined order
-   (topological by import, error on init cycles?). The one genuinely new ordering
-   constraint.
-5. **Re-exports and rename imports.** `export … from` and `import { x as y }` —
-   when (likely Phase 1.5 once collisions bite), and exact syntax.
-6. **Extension in specifiers.** Require `.vl` (trivial resolver) vs
-   extension-optional sugar. Proposed: require it in v1.
-7. **LSP workspace model.** How aggressively to index (lazy per-open-file vs eager
-   workspace scan); how this interacts with the embedded std (are std defs
-   navigable?). Phase 3.
-8. **Visibility granularity.** Only top-level `export`, or eventual module-internal
-   visibility tiers? v1: top-level only.
+The eight points below were **owner-reviewed** and are now **decided directions
+(pending implementation)** — settled leanings, with the formal record landing in
+`DECISIONS.md` at implementation time. Remaining sub-questions stay listed under
+each, and the unreviewed item (cross-module init order) stays fully open.
+
+### Decided directions (owner-reviewed, pending implementation)
+
+1. **Std specifier = the `std:` scheme (colon), not `std/`.** ✅ Convention:
+   `scheme:` names a resolution *source* (`std:` now; extensible to a package
+   registry later), while `/`/`./` are file paths. Rationale: Node's `node:` and
+   Deno's `npm:`/`jsr:`/`node:` use `scheme:` for source unspoofably; `std/list`
+   reads like a path from a `std` root and conflates source with filesystem. Import
+   maps stay a **separate aliasing layer**. Sort order: `std:` → registry → mapped
+   → relative. *Remaining:* the exact `export`/`import` keyword spellings (vs `pub`
+   etc.) are still open.
+2. **No implicit library prelude.** ✅ Collections are language **syntax**
+   (`[…]`, `{[K]:V}`) — no `List`/`Map` identifier injected or collidable, so the
+   scripting feel is kept without a prelude. Every *named* library value (`print`,
+   math, …) is an **explicit `import` from `std:`** — clean, shadow-free, and the
+   lever to replace builtin `print` with `std:fmt`. The intrinsic floor
+   (`defaultScope`) stays as the privileged floor, *not* a prelude. *Remaining:*
+   whether to reintroduce a single *shadowable* convenience name later if
+   scripting-feel demands.
+3. **Fine-grained std modules.** ✅ `std:list`, `std:map`, `std:set`,
+   `std:testing`, `std:fmt` — one module per concern, **not** a monolithic
+   `std:collections`. Whole-program DCE removes any size pressure to bundle, so
+   granularity is pure ergonomics; survey (Deno `@std/*`, Go, Rust, Python) favors
+   small focused modules. **Flat now.** *Remaining:* `std:collections/list`-style
+   sub-paths only if the namespace sprawls; the embedding mechanism (generated
+   source map now; embedded data section for the self-hosted compiler later).
+4. **Export semantics = live references; readonly is A9.** ✅ Exported bindings are
+   **live references** (`export let x` shares the live object; cf. JS live
+   bindings); the imported name is **read-only** (no reassigning another module's
+   `let`; `const` also exportable, additionally forbidding local reassignment).
+   **Readonly/encapsulated exports** ("public shape vs private shape") are an
+   application of **A9 Readable/Writable** at the boundary — **A9 is unstarted (⬜),
+   a flagged dependency**; no parallel readonly mechanism is invented.
+5. **Rename in v1; re-export deferred.** ✅ `import { x as y }` (alias) is **in
+   v1** — cheap, important for generated code + collision avoidance.
+   `export … from` (re-export) stays **deferred**. *Remaining:* exact re-export
+   syntax when it lands.
+6. **Omit the `.vl` extension in specifiers.** ✅ `import { x } from "./util"` →
+   `util.vl`. VL's single-extension / no-registry / no-`node_modules` setup makes
+   "append `.vl`" unambiguous and cleaner; **no index/directory guessing.** (Flips
+   the earlier "require `.vl` in v1" proposal.)
+7. **LSP cross-file / std navigation = Phase 3, perf-bounded.** ✅ Navigating into
+   other modules + the embedded std is later tooling, **not a module-system
+   constraint.** Indexing aggressiveness is a strategy choice: lazy/on-demand
+   (expected sufficient at VL's scale) vs eager workspace scan; the embedded std is
+   fixed → indexed once + cached. *Remaining:* the precise indexing/caching policy
+   at implementation.
+8. **Visibility: v1 binary.** ✅ v1 = top-level `export` or private (binary). Not
+   "visibility tiers" — the future possibility is **graduated visibility levels**
+   (à la Rust `pub(crate)`/`pub(super)`, Java package-private), the *same axis* as
+   #4's readonly/encapsulated exports (A9). *Remaining:* whether/when to add those
+   graduated levels.
+
+### Open sub-question (unreviewed)
+
+- **Cross-module `let` initialization order.** Functions/types can be
+  mutually-recursive across modules (already needed for recursive types); but
+  top-level `let` initializers with cross-module dependencies need a defined order
+  (topological by import, error on init cycles?). The one genuinely new ordering
+  constraint — still open.
 
 ## Sources
 
