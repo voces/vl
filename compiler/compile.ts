@@ -78,27 +78,27 @@ export const rangeFromCtx = (ctx: Context): VLRange => ({
 // Re-escape a string-literal type's value for display: literal values are now
 // decoded by the lexer (`"a\nb"` holds a real newline), so rendering them raw in
 // hover/diagnostics would emit literal control chars. Mirror the source spelling.
-const escapeStringLiteral = (s: string): string =>
-  s.replace(/[\x00-\x1f"\\]/g, (c) => {
-    switch (c) {
-      case "\\":
-        return "\\\\";
-      case '"':
-        return '\\"';
-      case "\n":
-        return "\\n";
-      case "\t":
-        return "\\t";
-      case "\r":
-        return "\\r";
-      case "\0":
-        return "\\0";
-      default:
-        return "\\x" + c.charCodeAt(0).toString(16).padStart(2, "0");
-    }
-  });
+const escapeStringLiteral = (s: string): string => {
+  // Char-code loop rather than a control-char regex (avoids deno lint's
+  // `no-control-regex` and any literal control bytes in source).
+  let out = "";
+  for (const c of s) {
+    const code = c.charCodeAt(0);
+    if (c === "\\") out += "\\\\";
+    else if (c === '"') out += '\\"';
+    else if (c === "\n") out += "\\n";
+    else if (c === "\t") out += "\\t";
+    else if (c === "\r") out += "\\r";
+    else if (code < 0x20) out += "\\x" + code.toString(16).padStart(2, "0");
+    else out += c;
+  }
+  return out;
+};
 
-export const stringifyType = (type: VLType, seen: Set<VLType> = new Set()): string => {
+export const stringifyType = (
+  type: VLType,
+  seen: Set<VLType> = new Set(),
+): string => {
   if (type.type === "Alias") return type.name;
   if (type.type === "Union") {
     return type.subTypes.map((t) => stringifyType(t, seen)).join(" | ");
@@ -109,7 +109,9 @@ export const stringifyType = (type: VLType, seen: Set<VLType> = new Set()): stri
   if (type.type === "Intersection") {
     return type.subTypes.map((t) => stringifyType(t, seen)).join(" & ");
   }
-  if (type.type === "Negation") return `not ${stringifyType(type.subType, seen)}`;
+  if (type.type === "Negation") {
+    return `not ${stringifyType(type.subType, seen)}`;
+  }
   if (type.type === "Object") {
     // Cycle guard: a recursive structural type can be a cyclic object graph
     // (`Tree` whose field is `Tree`). Render a re-encountered object as `…`
