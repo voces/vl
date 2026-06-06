@@ -30,6 +30,7 @@ import {
   type Completion,
   type CompletionKind,
   deriveInlayHints,
+  docMarkdown,
   identifierCompletions,
   type LspRange,
   memberCompletions,
@@ -37,7 +38,6 @@ import {
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
   typeLabelDetail,
-  typeMarkdown,
 } from "./typeFeatures.ts";
 
 // The language id the extension registers (`package.json` → contributes.languages,
@@ -168,10 +168,18 @@ connection.onHover(async (params): Promise<Hover | null> => {
     // out of scope here (compiler/*.ts is owned by other agents). When it lands,
     // render both via separate labelled markdown sections — the LSP convention
     // for two types in one hover — e.g. "declared `T`" then "narrowed `U`".
+    // Render the authored `///` doc (if any) as markdown above the type block.
+    // `docMarkdown` collapses to the bare type fence when there's no doc, so
+    // undocumented bindings hover exactly as before.
     return {
-      contents: hoverMarkdown(
-        `${occ.binding.name}: ${stringifyType(occ.binding.type)}`,
-      ),
+      contents: {
+        kind: "markdown",
+        value: docMarkdown(
+          `${occ.binding.name}: ${stringifyType(occ.binding.type)}`,
+          VL_LANGUAGE_ID,
+          occ.binding.doc,
+        ),
+      },
     };
   }
 
@@ -241,17 +249,23 @@ const completionKind: Record<CompletionKind, CompletionItemKind> = {
 // populating the panel body, leaving the highlighted `documentation` as the only
 // thing in the panel — type shown once inline, once highlighted, never duplicated.
 // Items without a type omit both.
-const toCompletionItem = (c: Completion): CompletionItem => ({
-  label: c.name,
-  kind: completionKind[c.kind],
-  ...(c.detail === undefined ? {} : {
-    labelDetails: { detail: typeLabelDetail(c.detail) },
-    documentation: {
+//
+// When the declaration carries a `///` doc-comment (`c.doc`), it's rendered as
+// markdown ABOVE the type block in `documentation` via `docMarkdown` — prose
+// first, type beneath. Items with neither a type nor a doc omit `documentation`.
+const toCompletionItem = (c: Completion): CompletionItem => {
+  const item: CompletionItem = { label: c.name, kind: completionKind[c.kind] };
+  if (c.detail !== undefined) {
+    item.labelDetails = { detail: typeLabelDetail(c.detail) };
+  }
+  if (c.detail !== undefined || (c.doc && c.doc.trim() !== "")) {
+    item.documentation = {
       kind: MarkupKind.Markdown,
-      value: typeMarkdown(c.detail, VL_LANGUAGE_ID),
-    },
-  }),
-});
+      value: docMarkdown(c.detail ?? "", VL_LANGUAGE_ID, c.doc),
+    };
+  }
+  return item;
+};
 
 // The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`
 // on `line`, or null. Used to find a `<name>.` member-completion receiver: we

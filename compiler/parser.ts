@@ -140,10 +140,11 @@ export const parseProgram = (
     kind: BindingKind,
     decl: Context,
     type?: VLType,
+    doc?: string,
   ): Binding => {
     let map = scopeBindings.get(scope);
     if (!map) scopeBindings.set(scope, map = new Map());
-    const binding: Binding = { name, kind, decl, type };
+    const binding: Binding = { name, kind, decl, type, doc };
     map.set(name, binding);
     symbols.declare(binding);
     return binding;
@@ -1437,7 +1438,14 @@ export const parseProgram = (
       } else {
         enclosing[name] = selfType;
         if (nameCtx) {
-          fnBinding = declareBinding(enclosing, name, "function", nameCtx, selfType);
+          fnBinding = declareBinding(
+            enclosing,
+            name,
+            "function",
+            nameCtx,
+            selfType,
+            fnTok.docComment,
+          );
         }
         registered = true;
       }
@@ -1784,13 +1792,20 @@ export const parseProgram = (
     } else {
       const scope = scopes[scopes.length - 1];
       scope[node.name] = node.variableType;
-      declareBinding(scope, node.name, "variable", spanOf(id), node.variableType);
+      declareBinding(
+        scope,
+        node.name,
+        "variable",
+        spanOf(id),
+        node.variableType,
+        kw.docComment,
+      );
     }
     return record(node, spanFrom(kw));
   };
 
   const parseTypeStatement = (): VLStatement => {
-    expect("TYPE");
+    const typeTok = expect("TYPE");
     const id = expect("ID");
     const name = id.text;
     // Generic type parameters (`type Box<T> = …`): a `<` after the name can only
@@ -1835,7 +1850,7 @@ export const parseProgram = (
     if (typeParams.length > 0) entry.params = paramHoles;
     const typeScope = scopes[scopes.length - 1];
     typeScope[name] = entry;
-    declareBinding(typeScope, name, "type", spanOf(id), entry);
+    declareBinding(typeScope, name, "type", spanOf(id), entry, typeTok.docComment);
     if (hasBody) {
       next();
       skipNewlines();

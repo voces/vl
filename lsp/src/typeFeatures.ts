@@ -223,6 +223,13 @@ export type Completion = {
   kind: CompletionKind;
   /** A short type rendering for the detail column, when a type is known. */
   detail?: string;
+  /**
+   * The declaration's authored `///` doc-comment (markdown), when it carries
+   * one. `server.ts` renders it above the type block in the item's
+   * `documentation` panel (see {@link docMarkdown}). Absent for builtins and
+   * members (no source binding to read a doc from).
+   */
+  doc?: string;
 };
 
 /**
@@ -252,6 +259,31 @@ export const typeLabelDetail = (typeStr: string): string => `: ${typeStr}`;
  */
 export const typeMarkdown = (typeStr: string, languageId: string): string =>
   "```" + languageId + "\n" + typeStr + "\n```";
+
+/**
+ * The markdown body shown in hover and in completion `documentation`: the
+ * declaration's authored `///` doc-comment (rendered as markdown by the client),
+ * then a blank line, then the fenced `vital` type block — so prose comes first
+ * and the type reads beneath it. When `doc` is absent or blank, this is exactly
+ * the bare type block ({@link typeMarkdown}), so undocumented declarations render
+ * identically to before. When `typeStr` is empty (a documented binding with no
+ * known type) the type fence is omitted and just the doc prose is returned.
+ *
+ * Returns the markdown *string* only — LSP-enum-free like the rest of this
+ * module; `server.ts` wraps it in a `MarkupContent`. Factored out (and unit
+ * tested) so the doc-above-type layout lives in one place shared by hover and
+ * completion.
+ */
+export const docMarkdown = (
+  typeStr: string,
+  languageId: string,
+  doc?: string,
+): string => {
+  const fence = typeStr === "" ? "" : typeMarkdown(typeStr, languageId);
+  const trimmed = doc?.trim();
+  if (!trimmed) return fence;
+  return fence ? `${trimmed}\n\n${fence}` : trimmed;
+};
 
 /**
  * Classify a builtin (from `defaultScope`) by its `VLType`: a `Function` type is
@@ -298,6 +330,7 @@ export const identifierCompletions = (
       name: binding.name,
       kind: binding.kind,
       detail: binding.type ? stringify(binding.type) : undefined,
+      doc: binding.doc,
     });
   }
   return [...byName.values()];
