@@ -2022,9 +2022,10 @@ export const toWasm = async (ast: VLProgramNode) => {
             )?.type;
             rightType = opFunc?.type === "Function"
               ? opFunc.paramaters[0].paramaterType ?? raise("op missing param")
-              // Structural `==`/`!=` has no operator method — the right operand
-              // is just the same object type.
-              : (op === "==" || op === "!=")
+              // Structural `==`/`!=`, and list `==`/`!=`/`+` (concat), have no
+              // operator method — the right operand is just the same list/object
+              // type.
+              : (op === "==" || op === "!=" || (op === "+" && isListType(leftType)))
               ? leftType
               : raise("op not function");
           }
@@ -2057,6 +2058,42 @@ export const toWasm = async (ast: VLProgramNode) => {
             binaryen.i32,
           );
           return op === "==" ? eq : m.i32.eqz(eq);
+        }
+        // List concat `a + b` → a *new* `T[]` (collections-design §VL.4): size
+        // one backing exactly `lenA + lenB`, then two bulk `array.copy`s (a at
+        // offset 0, b at offset lenA) — no incremental-growth churn — and wrap it
+        // `{ backing, len = cap = lenA + lenB }`. Must precede the string branch.
+        if (isListType(leftType) && op === "+") {
+          const lt = listType(softenImplicitType(arrayElementType(leftType)!));
+          const aLocal = newLocal(lt.refType);
+          const bLocal = newLocal(lt.refType);
+          const outLocal = newLocal(lt.backing.refType);
+          const nLocal = newLocal(binaryen.i32);
+          const a = () => m.local.get(aLocal, lt.refType);
+          const b = () => m.local.get(bLocal, lt.refType);
+          const out = () => m.local.get(outLocal, lt.backing.refType);
+          const n = () => m.local.get(nLocal, binaryen.i32);
+          return m.block(null, [
+            m.local.set(aLocal, toExpression(node.left)),
+            m.local.set(bLocal, toExpression(node.right)),
+            m.local.set(nLocal, m.i32.add(listLen(a()), listLen(b()))),
+            m.local.set(outLocal, m.array.new_default(lt.backing.heapType, n())),
+            m.array.copy(
+              out(),
+              m.i32.const(0),
+              listBacking(lt, a()),
+              m.i32.const(0),
+              listLen(a()),
+            ),
+            m.array.copy(
+              out(),
+              listLen(a()),
+              listBacking(lt, b()),
+              m.i32.const(0),
+              listLen(b()),
+            ),
+            m.struct.new([out(), n(), n()], lt.heapType),
+          ], lt.refType);
         }
         // String operators (strings are WasmGC i32-arrays of char codes):
         // `==`/`!=` element-compare via the `__string_eq__` helper; `+`

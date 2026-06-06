@@ -230,6 +230,15 @@ export const _typeFromExpression = (
         }
       }
       if (leftType.type !== "Object") return missingOpFunc("left-not-object");
+      // List concat `a + b`: a *new* `T[]` (collections-design §VL.4). A `T[]` is
+      // anonymous and carries no `+` operator field, so it is typed here — the
+      // right operand must be a list assignable to the left, the result is the
+      // left list type. (`==`/`!=` on lists are handled by the structural branch
+      // above via `isEquatable`.) `string +` still flows through `opFunc` below.
+      if (op === "+" && isListType(leftType)) {
+        if (!ensureType(leftType, rightType, ctx)) return { type: "Never" };
+        return leftType;
+      }
       const opFunc = leftType.properties.find((p) =>
         validateType(p.name, { type: "StringLiteral", value: op })
       )?.type;
@@ -708,6 +717,19 @@ export const listMemberType = (
   clear: {
     type: "Function",
     paramaters: [],
+    return: { type: "Alias", name: "null" },
+  },
+  // In-place append-all: one grow-to-fit, one bulk copy of `other`'s elements.
+  extend: {
+    type: "Function",
+    paramaters: [{
+      type: "Parameter",
+      name: "other",
+      paramaterType: {
+        type: "Object",
+        properties: [{ name: { type: "Alias", name: "i32" }, type: element }],
+      },
+    }],
     return: { type: "Alias", name: "null" },
   },
 });
