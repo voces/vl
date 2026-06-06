@@ -1,0 +1,481 @@
+// A lexer for VL, written in VL — the first real component of the H3 self-hosting
+// port (re-landing PR #37 clean now that the H2 gaps it found are closed in
+// master: growable `Tok[]` of non-nullable struct values, `.push`, char literals
+// `'a'`, and `toString`).
+//
+// It mirrors the token set and scanning rules of `compiler/lexer.ts` but is a
+// fresh VL implementation, not a transliteration. It scans:
+//   - identifiers and keywords,
+//   - integer / real number literals (`12`, `3.14`),
+//   - char literals `'a'` and string literals `"..."`, both with the shared
+//     escape grammar `\n \t \r \\ \" \' \0 \xXX \uXXXX`,
+//   - the full one- and two-char operator / punctuation set,
+//   - `//` line comments and `///` doc comments,
+//   - whitespace and significant newlines (NEWLINE is a real token, as in the TS
+//     lexer; the parser treats it as a statement terminator).
+//
+// Positions follow the diagnostics convention: `line` is 1-based, `col` is
+// 0-based; `start`/`stop` are char offsets into the source (first char, and one
+// past the last) so a token span measures source extent.
+//
+// VL features this leans on (the now-closed H2 gaps):
+//   - `Tok[]` of non-nullable struct values, accumulated with `.push` (gap 1).
+//   - char literals: every character class is `s[i] == 'a'` / range / `s[i]-'0'`
+//     rather than a magic-number table.
+//   - `toString` for the print-harness diagnostics.
+//
+// Scanner state is a mutable `Lexer` struct threaded explicitly to every helper:
+// module-level scalar globals do lower to shared wasm globals now, but a *string*
+// (ref-typed) global still can't be captured by a function, and the cursor and
+// the source naturally travel together, so a passed-by-reference struct is the
+// clean mechanism. (See the gap inventory in the PR for the remaining limits.)
+
+// ---- token kinds ---------------------------------------------------------
+// Token KINDS are plain string tags ("ID", "NUMBER", ...) rather than a real
+// enum / closed literal-union: VL has no enum tag representation yet, and a wide
+// literal-union is awkward to thread. A bare `string` compares with `==` and
+// prints directly, which is all a token stream needs.
+
+// A lexer diagnostic: a message plus the 1-based line / 0-based column where it
+// was raised. (A struct rather than a formatted string because `toString` is not
+// callable inside a function body yet — see the gap inventory — so positions are
+// kept numeric and rendered at the top-level harness.)
+type Diag = {
+  msg: string,
+  line: i32,
+  col: i32
+}
+
+type Lexer = {
+  src: string,
+  pos: i32,
+  line: i32,
+  col: i32,
+  diags: Diag[]
+}
+
+// A lexed token.
+//   kind  — the string tag (keyword/literal/operator/structural name).
+//   text  — the raw source lexeme (quotes + backslashes kept for STRING/CHAR).
+//   value — for STRING/CHAR: the decoded literal with escapes resolved where VL
+//           can express the result (see the gap note on \x / \u); "" otherwise.
+//   start/stop — char offsets [first, one-past-last).
+//   line/col   — 1-based line, 0-based column of the first char.
+type Tok = {
+  kind: string,
+  text: string,
+  value: string,
+  start: i32,
+  stop: i32,
+  line: i32,
+  col: i32
+}
+
+// ---- character classes (char literals) -----------------------------------
+
+function isDigit(c: i32): boolean {
+  c >= '0' && c <= '9'
+}
+
+function isIdStart(c: i32): boolean {
+  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+function isIdPart(c: i32): boolean {
+  isIdStart(c) || isDigit(c)
+}
+
+function isHex(c: i32): boolean {
+  isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+// ---- number formatting ---------------------------------------------------
+// `toString` is only callable in straight-line module top-level code today (it
+// fails to resolve inside any function / loop / if body — see the gap inventory),
+// so the lexer ships its own int->string for diagnostics and the harness. It
+// builds the string from single-char digit literals because VL has no
+// `String.fromCharCode` to turn a digit code into a one-char string.
+
+function digitStr(d: i32): string {
+  if d == 0 { return "0" }
+  if d == 1 { return "1" }
+  if d == 2 { return "2" }
+  if d == 3 { return "3" }
+  if d == 4 { return "4" }
+  if d == 5 { return "5" }
+  if d == 6 { return "6" }
+  if d == 7 { return "7" }
+  if d == 8 { return "8" }
+  "9"
+}
+
+function i32ToStr(n: i32): string {
+  if n == 0 { return "0" }
+  let neg = n < 0
+  let m = n
+  if neg { m = 0 - m }
+  let out = ""
+  while m > 0 {
+    out = digitStr(m % 10) + out
+    m = m / 10
+  }
+  if neg { out = "-" + out }
+  out
+}
+
+// ---- scanner primitives --------------------------------------------------
+
+// The char code at the current position, or -1 at end of input.
+function peek(lx: Lexer): i32 {
+  if lx.pos >= lx.src.length { return -1 }
+  lx.src[lx.pos]
+}
+
+// The char code one past the current position, or -1 if none.
+function peek2(lx: Lexer): i32 {
+  if lx.pos + 1 >= lx.src.length { return -1 }
+  lx.src[lx.pos + 1]
+}
+
+// The char code `n` past the current position, or -1 if none.
+function peekN(lx: Lexer, n: i32): i32 {
+  if lx.pos + n >= lx.src.length { return -1 }
+  lx.src[lx.pos + n]
+}
+
+// Consume one char, tracking line/column, and return its code.
+function advance(lx: Lexer): i32 {
+  let c = lx.src[lx.pos]
+  lx.pos = lx.pos + 1
+  if c == '\n' {
+    lx.line = lx.line + 1
+    lx.col = 0
+  } else {
+    lx.col = lx.col + 1
+  }
+  c
+}
+
+// Record a diagnostic at the current position (the TS lexer pushes a structured
+// VLDiagnostic; a `Diag` struct is enough to assert in the harness). Returns the
+// diagnostic count (VL has no `void`; functions infer their return type).
+function diag(lx: Lexer, msg: string): i32 {
+  lx.diags.push({ msg: msg, line: lx.line, col: lx.col })
+  lx.diags.length
+}
+
+// ---- keyword + operator tables -------------------------------------------
+// Linear `==` chains: VL maps (B6a) aren't available yet, and a string-keyed map
+// for ~21 keywords / ~30 operators would not buy much here.
+
+function keywordKind(text: string): string {
+  if text == "function" { return "FUNCTION" }
+  if text == "if" { return "IF" }
+  if text == "then" { return "THEN" }
+  if text == "else" { return "ELSE" }
+  if text == "elseif" { return "ELSEIF" }
+  if text == "while" { return "WHILE" }
+  if text == "for" { return "FOR" }
+  if text == "to" { return "TO" }
+  if text == "step" { return "STEP" }
+  if text == "in" { return "IN" }
+  if text == "const" { return "CONST" }
+  if text == "let" { return "LET" }
+  if text == "return" { return "RETURN" }
+  if text == "is" { return "IS" }
+  if text == "await" { return "AWAIT" }
+  if text == "break" { return "BREAK" }
+  if text == "continue" { return "CONTINUE" }
+  if text == "from" { return "FROM" }
+  if text == "type" { return "TYPE" }
+  if text == "true" { return "TRUE" }
+  if text == "false" { return "FALSE" }
+  if text == "null" { return "NULL" }
+  "ID"
+}
+
+// Single-char operator/punctuation kind for char code `c`, or "" if none.
+function oneCharKind(c: i32): string {
+  if c == '+' { return "PLUS" }
+  if c == '-' { return "MINUS" }
+  if c == '*' { return "STAR" }
+  if c == '/' { return "DIV" }
+  if c == '%' { return "MOD" }
+  if c == '^' { return "CARET" }
+  if c == '=' { return "EQUAL" }
+  if c == '!' { return "EXCLAMATION" }
+  if c == '>' { return "GREATER_THAN" }
+  if c == '<' { return "LESS_THAN" }
+  if c == '(' { return "LPAREN" }
+  if c == ')' { return "RPAREN" }
+  if c == '{' { return "LBRACE" }
+  if c == '}' { return "RBRACE" }
+  if c == '[' { return "LBRACK" }
+  if c == ']' { return "RBRACK" }
+  if c == ',' { return "COMMA" }
+  if c == '.' { return "DOT" }
+  if c == ':' { return "COLON" }
+  if c == ';' { return "SEMICOLON" }
+  if c == '?' { return "QUESTION" }
+  if c == '|' { return "PIPE" }
+  if c == '&' { return "AMPERSAND" }
+  ""
+}
+
+// Two-char operator kind for the pair (a, b), or "" if none.
+function twoCharKind(a: i32, b: i32): string {
+  if a == '+' && b == '+' { return "PLUSPLUS" }
+  if a == '-' && b == '-' { return "MINUSMINUS" }
+  if a == '&' && b == '&' { return "AND" }
+  if a == '|' && b == '|' { return "OR" }
+  if a == '?' && b == '.' { return "QUESTION_DOT" }
+  if a == '?' && b == '?' { return "QUESTION_QUESTION" }
+  if a == '=' && b == '=' { return "EQUAL_TO" }
+  if a == '!' && b == '=' { return "NOT_EQUAL_TO" }
+  if a == '>' && b == '=' { return "GREATER_THAN_OR_EQUAL_TO" }
+  if a == '<' && b == '=' { return "LESS_THAN_OR_EQUAL_TO" }
+  ""
+}
+
+// ---- escape decoding -----------------------------------------------------
+// Decode a single escape character `e` (the char after a backslash) to the
+// string it denotes, for the escapes whose result VL can construct as a literal.
+// VL has no `String.fromCharCode`, so `\xXX` / `\uXXXX` (arbitrary code points)
+// cannot be materialized into the decoded `value` here — those are reported via
+// the boolean-ish "" sentinel and the caller keeps the raw lexeme for value (see
+// the gap inventory). Returns the decoded fragment, or the single char `e` for an
+// unknown escape (kept verbatim, matching the TS lexer's lenient policy).
+function decodeSimpleEscape(e: i32): string {
+  if e == 'n' { return "\n" }
+  if e == 't' { return "\t" }
+  if e == 'r' { return "\r" }
+  if e == '\\' { return "\\" }
+  if e == '"' { return "\"" }
+  if e == '\'' { return "'" }
+  if e == '0' { return "\0" }
+  // Unknown / non-simple escape: keep the char after the backslash verbatim.
+  // (\x and \u are handled by the scanner before calling this.)
+  ""
+}
+
+// ---- token builder -------------------------------------------------------
+
+function mkTok(
+  lx: Lexer,
+  kind: string,
+  value: string,
+  start: i32,
+  startLine: i32,
+  startCol: i32
+): Tok {
+  {
+    kind: kind,
+    text: lx.src.slice(start, lx.pos),
+    value: value,
+    start: start,
+    stop: lx.pos,
+    line: startLine,
+    col: startCol
+  }
+}
+
+// ---- string / char scanning ----------------------------------------------
+// Scan a quoted literal (the cursor is on the opening quote). `quote` is the
+// quote char code. Returns the decoded value; appends a CHAR or STRING token via
+// the caller. Decodes the simple escapes into `value`; for `\xXX` / `\uXXXX` it
+// consumes the right number of hex digits (so the span/raw text is correct) but,
+// lacking `fromCharCode`, appends the raw escape text to `value` instead of the
+// decoded code point, and records the limitation as a diagnostic-free fact.
+function scanQuoted(lx: Lexer, quote: i32): string {
+  advance(lx)              // opening quote
+  let value = ""
+  let closed = false
+  while lx.pos < lx.src.length {
+    let ch = peek(lx)
+    if ch == '\\' {
+      advance(lx)          // backslash
+      if lx.pos >= lx.src.length { break }
+      let e = peek(lx)
+      // \xXX — two hex digits.
+      if e == 'x' {
+        if isHex(peek2(lx)) && isHex(peekN(lx, 2)) {
+          let hs = lx.pos + 1
+          advance(lx)      // x
+          advance(lx)      // hex 1
+          advance(lx)      // hex 2
+          // No fromCharCode: keep the raw escape text in value (gap: \x decode).
+          value = value + lx.src.slice(hs - 1, lx.pos)
+        } else {
+          advance(lx)      // x
+          diag(lx, "Invalid \\x escape (needs two hex digits)")
+          value = value + "x"
+        }
+        continue
+      }
+      // \uXXXX — four hex digits.
+      if e == 'u' {
+        if isHex(peek2(lx)) && isHex(peekN(lx, 2)) && isHex(peekN(lx, 3)) && isHex(peekN(lx, 4)) {
+          let hs = lx.pos + 1
+          advance(lx)      // u
+          advance(lx)      // hex 1
+          advance(lx)      // hex 2
+          advance(lx)      // hex 3
+          advance(lx)      // hex 4
+          // No fromCharCode: keep the raw escape text in value (gap: \u decode).
+          value = value + lx.src.slice(hs - 1, lx.pos)
+        } else {
+          advance(lx)      // u
+          diag(lx, "Invalid \\u escape (needs four hex digits)")
+          value = value + "u"
+        }
+        continue
+      }
+      // Simple escape (\n \t \r \\ \" \' \0) or unknown (verbatim char).
+      advance(lx)          // the escaped char
+      let dec = decodeSimpleEscape(e)
+      if dec == "" {
+        // Unknown escape: keep the char after the backslash verbatim.
+        value = value + lx.src.slice(lx.pos - 1, lx.pos)
+      } else {
+        value = value + dec
+      }
+      continue
+    }
+    if ch == quote {
+      advance(lx)          // closing quote
+      closed = true
+      break
+    }
+    value = value + lx.src.slice(lx.pos, lx.pos + 1)
+    advance(lx)
+  }
+  if !closed {
+    if quote == '\'' {
+      diag(lx, "Unterminated char literal")
+    } else {
+      diag(lx, "Unterminated string literal")
+    }
+  }
+  value
+}
+
+// The result of lexing: the token stream (EOF-terminated) and any diagnostics.
+type LexResult = {
+  tokens: Tok[],
+  diags: Diag[]
+}
+
+// ---- main scanner --------------------------------------------------------
+// Tokenize `source`, returning the tokens in order, terminated by an EOF token,
+// plus any diagnostics. Whitespace is skipped; NEWLINE is emitted as a real
+// token; `//` / `///` comments are skipped (comment-as-trivia retention is the
+// TS lexer's job for the formatter — out of scope for this lexing slice;
+// recorded in the gap inventory).
+function tokenize(source: string): LexResult {
+  let seed: Diag[] = []
+  let lx: Lexer = { src: source, pos: 0, line: 1, col: 0, diags: seed }
+  let toks: Tok[] = []
+
+  while lx.pos < lx.src.length {
+    let startPos = lx.pos
+    let startLine = lx.line
+    let startCol = lx.col
+    let c = peek(lx)
+
+    // Newline `\r?\n`. A lone `\r` before `\n` is consumed with it.
+    if c == '\r' || c == '\n' {
+      if c == '\r' && peek2(lx) == '\n' { advance(lx) }
+      advance(lx)
+      toks.push(mkTok(lx, "NEWLINE", "", startPos, startLine, startCol))
+      continue
+    }
+
+    // Whitespace: space, tab.
+    if c == ' ' || c == '\t' {
+      advance(lx)
+      continue
+    }
+
+    // Line comment `// ...` (and doc `/// ...`) — consumed up to the newline.
+    if c == '/' && peek2(lx) == '/' {
+      while lx.pos < lx.src.length && peek(lx) != '\n' && peek(lx) != '\r' {
+        advance(lx)
+      }
+      continue
+    }
+
+    // Identifier / keyword.
+    if isIdStart(c) {
+      while lx.pos < lx.src.length && isIdPart(peek(lx)) {
+        advance(lx)
+      }
+      let text = lx.src.slice(startPos, lx.pos)
+      toks.push(mkTok(lx, keywordKind(text), "", startPos, startLine, startCol))
+      continue
+    }
+
+    // Number: `[0-9]+ ('.' [0-9]+)?`. The fractional part is taken only when a
+    // digit follows the dot, so `a.5` / `p.x` keep `.` as a separate DOT.
+    if isDigit(c) {
+      while lx.pos < lx.src.length && isDigit(peek(lx)) {
+        advance(lx)
+      }
+      if peek(lx) == '.' && isDigit(peek2(lx)) {
+        advance(lx)
+        while lx.pos < lx.src.length && isDigit(peek(lx)) {
+          advance(lx)
+        }
+      }
+      toks.push(mkTok(lx, "NUMBER", "", startPos, startLine, startCol))
+      continue
+    }
+
+    // Char literal `'...'`.
+    if c == '\'' {
+      let value = scanQuoted(lx, '\'')
+      // A char literal must decode to exactly one code point. Empty `''` or
+      // multi-char `'ab'` is an error (we still emit a CHAR token to recover).
+      if value.length != 1 {
+        if value.length == 0 {
+          diag(lx, "Empty char literal")
+        } else {
+          diag(lx, "Char literal must contain exactly one character")
+        }
+      }
+      toks.push(mkTok(lx, "CHAR", value, startPos, startLine, startCol))
+      continue
+    }
+
+    // String literal `"..."`.
+    if c == '"' {
+      let value = scanQuoted(lx, '"')
+      toks.push(mkTok(lx, "STRING", value, startPos, startLine, startCol))
+      continue
+    }
+
+    // Two-char operator (longest match first).
+    let two = twoCharKind(c, peek2(lx))
+    if two != "" {
+      advance(lx)
+      advance(lx)
+      toks.push(mkTok(lx, two, "", startPos, startLine, startCol))
+      continue
+    }
+
+    // One-char operator / punctuation.
+    let one = oneCharKind(c)
+    if one != "" {
+      advance(lx)
+      toks.push(mkTok(lx, one, "", startPos, startLine, startCol))
+      continue
+    }
+
+    // Unknown character — record a diagnostic, emit an ERROR token, make progress.
+    advance(lx)
+    diag(lx, "Unexpected character")
+    toks.push(mkTok(lx, "ERROR", "", startPos, startLine, startCol))
+  }
+
+  toks.push(mkTok(lx, "EOF", "", lx.pos, lx.line, lx.col))
+  { tokens: toks, diags: lx.diags }
+}

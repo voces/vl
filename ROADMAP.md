@@ -343,9 +343,21 @@ corpus (A12) is the host-agnostic oracle — the same tests pass whichever compi
   so reads/writes from a function hit the one cell, not a captured copy (`tests/cases/globals/`); (3) ✅
   **string escapes** now decoded in the lexer (`\n`/`\t`/`\xXX`/`\uXXXX`/…); plus known:
   maps (B6a), enum tag for literal-unions (A16), char literals, a `toString`/stringify.
-- ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
+- 🟡 **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
   running the corpus through the VL-written compiler. Incremental; TS and VL compilers cross-checked.
-  First slice (lexer) spiked + closed (#37) pending the H2 gap-1 fix; re-lands clean as `selfhost/`.
+  **Done (slice 1): the lexer re-landed clean** as `selfhost/lexer.vl` — a full VL-in-VL tokenizer
+  (keywords/ids, int/real/char/string literals with escapes, the full operator/punct set incl.
+  `?? ?. ++ -- && || >= <= != == ; ?`, `//`/`///` comments, NEWLINEs, positions, `Diag`s), running
+  end-to-end on `tests/selfhost_lexer_test.ts`. **New H2 gaps it surfaced** (ranked; the next concrete
+  to-dos): (a) **`toString` only resolves in straight-line top-level code** — it fails to type inside any
+  function / loop / `if` body (`expected (): any, got function toString`), so the lexer ships its own
+  `i32ToStr` (digit-literal concatenation); (b) **no `String.fromCharCode`/`fromCodePoint`** — escape
+  decoding can build `\n \t \r \\ \" \' \0` from one-char literals but cannot materialize `\xXX`/`\uXXXX`
+  arbitrary code points into the decoded `value`, so those keep their raw lexeme; (c) **a ref-typed
+  (e.g. `string`) module-level `let` still can't be captured by a function** (`Cannot capture this value
+  type yet`) — only scalar globals lower, so scanner state must be threaded as a struct; (d) **`.length`
+  on a one-char string *literal* mis-types** as a char (`"\n".length` errors; via a `let` it's fine).
+  Next slice: `toAST`/parser.
 - ⬜ **H4. WASM emission — DECIDED: emit bytes directly + optional `wasm-opt`** (binaryen's npm build
   is JS-bound; → `DECISIONS.md`, incl. the Heap2Local caveat). binaryen stays for the TS compiler.
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime (wasmtime —
