@@ -271,7 +271,10 @@ D1/D2.*
 - ✅ **D2. Go-to-definition / find-references.** Parser populates a symbol/binding table
   (`compiler/symbols.ts`) during its scope walk; the LSP queries it by cursor (`textDocument/definition`
   + `textDocument/references`). Locals, params, function decls, type aliases; single-document. → `DECISIONS.md`.
-- ⬜ **D3. Autocomplete** (scope-aware; structural members).
+- 🟡 **D3. Autocomplete.** Done (core): scope-aware identifier completion + structural member
+  completion via `identifierCompletions`/`memberCompletions` (`lsp/src/typeFeatures.ts`), wired in
+  `server.ts`, tested (`tests/lsp_completion_test.ts`). REMAINING: keyword/snippet completions,
+  trigger-character tuning, and wiring a completion provider into the Monaco playground (E).
 - 🟡 **D4. Formatter** (+ `vl fmt`). Done (core): an AST-driven source formatter (`compiler/format.ts`,
   `vl fmt`, LSP `textDocument/formatting`) — generates source from the AST, idempotent,
   round-trip-AST-equivalent, comment-preserving, with line reflow (wraps long calls / array & object
