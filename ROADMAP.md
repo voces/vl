@@ -314,8 +314,10 @@ corpus (A12) is the host-agnostic oracle — the same tests pass whichever compi
   nullable-widened to `(ref null $T)` for non-defaultable ref elements (so `array.new_default` is legal in
   every allocate-then-fill path: grow, `map`, `filter`, `+`); reads off the live `[0, len)` region
   `ref.as_non_null` back to the surface non-null type. Struct accumulators no longer need `(T|null)[]`
-  (unblocks AST-node lists); (2) ⬜ **module-level mutable `let` not mutated through a function** (bug/restriction —
-  confirm); (3) ✅ **string escapes** now decoded in the lexer (`\n`/`\t`/`\xXX`/`\uXXXX`/…); plus known:
+  (unblocks AST-node lists); (2) ✅ **module-level mutable `let` mutated through a function** — a scalar top-level
+  binding referenced from inside a function now lowers to a shared wasm `global` (`global.get`/`global.set`),
+  so reads/writes from a function hit the one cell, not a captured copy (`tests/cases/globals/`); (3) ✅
+  **string escapes** now decoded in the lexer (`\n`/`\t`/`\xXX`/`\uXXXX`/…); plus known:
   maps (B6a), enum tag for literal-unions (A16), char literals, a `toString`/stringify.
 - ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
   running the corpus through the VL-written compiler. Incremental; TS and VL compilers cross-checked.
