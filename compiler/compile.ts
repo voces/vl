@@ -289,10 +289,14 @@ export const checkOnly = (source: string): CheckResult => {
   const [ast, errors, symbols, spans] = parseProgram(tokens, defaultScope());
   for (const error of errors) diagnostics.push(diagnosticFromError(error));
   // Static lint pass (B17): unused-variable / unreachable-code warnings, derived
-  // from the symbol table + AST the front end already produced. Runs even when
-  // there are errors — lint warnings are independent of codegen and useful while
-  // a file still has type errors. A diverging parse (no statements) yields none.
-  for (const d of lint(ast.statements, symbols, spans)) diagnostics.push(d);
+  // from the symbol table + AST the front end already produced. Suppressed when
+  // the file already has *error*-severity diagnostics: a broken file's "unused"
+  // bindings are usually a symptom of the error (the use lives in the code that
+  // failed to parse/type), so we report the real errors first rather than piling
+  // style warnings on top. A diverging parse (no statements) yields none anyway.
+  if (!diagnostics.some((d) => d.severity === "error")) {
+    for (const d of lint(ast.statements, symbols, spans)) diagnostics.push(d);
+  }
   return { ast, diagnostics, symbols, spans, comments };
 };
 

@@ -193,10 +193,10 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   the empty-range warning, stable diagnostic `code`s, and the **lint pass** (`compiler/lint.ts`):
   unused-variable (function locals + params; `_`-prefix suppresses) and unreachable-code, both tagged
   `unnecessary` so VS Code greys them out. BUILD OUT — the lint rule backlog (keep it a few at a time):
-  - **unused non-exported top-level binding** — *gated on an explicit `export` keyword*. Today every
-    top-level `let` is the file's de-facto export surface (modules-design), so unused can't be inferred
-    from one file; once `export` exists, an unused *non-exported* top-level binding is real dead code and
-    warns. (Ties into the modules/`export` work.)
+  - **`export`-aware top-level unused** — unused top-level bindings are flagged *now* (dead in a
+    whole-program compile). Once an explicit `export` keyword lands, *exported* top-level bindings become
+    exempt (consumer-facing surface, not dead). Lint already suppresses *all* warnings on a file that has
+    error-severity diagnostics (report the real errors first). (Ties into the modules/`export` work.)
   - **prefer-`const`** — a `let` that is never reassigned should be `const` (info/warning + quick-fix).
   - **unused function / unused import**; **dead/constant branch** (`if false`); **`step 0`** range loop;
     **unreachable after a diverging `if/else`** (have the simple after-`return` case).
