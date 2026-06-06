@@ -272,6 +272,12 @@ AST directly. antlr4, the gradle project, the generated dirs, and the `gen` task
 now carry source spans (`Context = { start, stop }`). This was the parser-side bootstrap gate (H1). →
 `DECISIONS.md` for the hand-written-over-generator choice.
 
+**Tooling foundation (done):** node spans are now **publicly exposed** (`NodeSpans` + `spanOf` via
+`toAST`/`compile`), and the lexer emits **comment-carrying tokens** — comments are retained with spans
+(a flat `comments` list + per-token `leading`/`trailing` trivia) without entering the grammar token
+stream. This unblocks an AST-driven formatter (D4), a real `binding.annotated` flag for inlay hints
+(D6), and doc-comment cross-references (D7).
+
 ---
 
 ## Track H — Self-hosting & distribution (the bootstrap end-state)
