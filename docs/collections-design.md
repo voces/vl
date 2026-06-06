@@ -12,25 +12,38 @@
 **`List` is VL's one user-facing collection** — a growable, ordered, indexable
 sequence, and the substrate for `map`/`filter`, builders, and the H2 self-hosting
 collections work (`ROADMAP` A10 + B6). `[...]` constructs a `List`. The raw
-fixed-length WasmGC `array` is **not** a coexisting everyday type: it is demoted to
-(i) `List`'s internal **substrate** (the `backing` field, allocated/copied via the
-`array.new`/`array.copy` intrinsics) and (ii) an **optional low-level escape** (an
-advanced `Array<T>` / unsafe primitive) for the rare contiguous-memory case. The
+fixed-length WasmGC `array` is **not** a coexisting everyday type the programmer
+chooses between; it survives in two non-user-facing roles: (i) `List`'s internal
+**substrate** (the `backing` field, allocated/copied via the
+`array.new`/`array.copy` intrinsics), and (ii) an **inferred representation** —
+when the compiler can prove a `List`-typed value is never grown, it lowers that
+value to a header-less fixed array (raw-array speed, no `{len,cap}` header, no
+indirection) *without changing the program's `List` mental model* (§VL.6). The
 fixed-array MVP is done; this design promotes it into `List` rather than leaving it
-as the default literal.
+as the default literal, and reuses it as the cheap inferred representation
+underneath.
 
 **Decided this review round** (recorded here; the `DECISIONS.md` entry lands with
 implementation, not before): the type is named **`List`**, **`[...]` is a `List`
 literal** (the scripting-feel default — Python/JS/Ruby/Swift), the **growth
-factor is 2×** for v1, and **indexing is result-by-default — `a[i]: T | null`**
-(safe / OOB → `null`) for `List` (and any raw-array escape), with a trapping
-*asserting* accessor as the discouraged opt-in. Still open: value-vs-reference
-(language-wide), the error model (language-wide), indexing perf (the **three**
-enablers of §VL.6 that together make a list loop instruction-identical to a
-raw-array loop — **bounds-narrowing** (drops the `null` + check, §OQ.4), the
-**native-indexing flag** (drops the B13 indirect call), and **backing-pointer
-hoisting** (loads `backing` once per loop, not per access); missing the hoist
-leaves the per-access `struct.get` cost), and the capacity/seed surface specifics.
+factor is 2×** for v1, **indexing traps on out-of-bounds** — `a[i]` / `List[i]`
+yield `T` and **trap** on OOB (an unrecoverable-bug signal — loud, not silent),
+with **`.get(i): T | null`** the safe, checked opt-in accessor; and **`Map[k]`
+returns `V | null`** (a missing key is a *normal, expected* map result, not a
+bug). This is the Rust/Swift convergence: indexing a *sequence* panics/traps and
+`.get` is the checked form, while *map/dict* subscript returns an optional.
+**Representation is inferred:** `List` is the one *semantic* model the programmer
+writes, but the compiler lowers a value to a **header-less fixed array** whenever
+it can prove the value (and all its aliases) is never grown — recovering raw-array
+speed under the single `[...]` literal, and **degrading to a full `List` whenever
+it can't prove it** (so the optimization is never observably wrong). Still open:
+value-vs-reference (language-wide), the error model (language-wide), the
+**representation-inference analysis** (interprocedural growth-detection + alias
+unification, §VL.6/§OQ.4), the remaining indexing-perf knobs — now
+*optimizations*, not prerequisites: the **native-indexing flag** drops the B13
+indirect call, **backing-pointer hoisting** loads `backing` once per loop, and
+**bounds-narrowing** now merely elides the redundant trap-check — and the
+capacity/seed surface specifics.
 
 Recommendation in one screen:
 
@@ -67,30 +80,43 @@ Recommendation in one screen:
    **type-level native-indexing flag** (§VL.6) lets `List`'s `[]`/`[]=`/`.length`
    lower straight to `array.get`/`array.set`/`array.len`, bypassing the dispatch.
    `.length` is the O(1) uniform-access property (read-only, per DECISIONS B6);
-   `.capacity` is the sibling O(1) property. **Indexing is result-by-default**:
-   `l[i]` returns **`T | null`** — out-of-bounds yields `null`, not a trap. A trapping
-   *asserting* accessor (e.g. `a[i]!` / `getUnchecked(i): T`) is the explicit,
-   discouraged opt-in for "I know it's in bounds." (§VL.4–6) **This changes
-   today's fixed-array behavior** (`a[i]` currently traps on OOB → becomes
-   `T | null`); the indexing rule is one rule across `List` and any raw-array escape.
-   The cost — a null-handle on every access — is paid down by **bounds-narrowing**
-   (§VL.6): inside `for i in 0 to a.length` or after `if i < a.length`, `a[i]`
-   narrows from `T | null` to `T`. Combined with the native-indexing flag *and*
-   **backing-pointer hoisting** (§VL.6: load `backing` once per loop, not per
-   access), this reaches the ideal — `a[i]` lowers to a bare `array.get` of `T`,
-   codegen identical to a raw array, while `List` stays a `.vl` std type otherwise.
+   `.capacity` is the sibling O(1) property. **Indexing traps on out-of-bounds**:
+   `l[i]` yields **`T`** and **traps** when `i` is out of range — an out-of-bounds
+   index is an unrecoverable *bug*, surfaced loudly (this is what `a[i]` already
+   does today; the design *keeps* it rather than reversing it). The **safe, checked
+   accessor is `.get(i): T | null`** — reach for it when an index may legitimately
+   be out of range. (`get` conventionally names the *safe* accessor, so we use it
+   for the `T | null` form, not the trapping one. §VL.4–6.) The trap is already a
+   bare `array.get`, so the *safe default is the fast default*; **bounds-narrowing**
+   (§VL.6) is now only an optimization that elides the redundant bounds check inside
+   `for i in 0 to a.length` or after `if i < a.length`. Combined with the
+   native-indexing flag *and* **backing-pointer hoisting** (§VL.6: load `backing`
+   once per loop, not per access), an in-loop `l[i]` lowers to a bare `array.get` of
+   `T`, codegen identical to a raw array, while `List` stays a `.vl` std type
+   otherwise. (Element *mutation* `l[i] = v` likewise traps on OOB and is the in-place
+   write — non-growing, so it does not force the growable representation, §VL.6.)
 
-**Language principle — "result by default."** Fallible operations return values,
-not control-flow escapes: absence is `T | null`, "failed with a reason" is
-`T | E` (a discriminated union narrowed with `is`) — leaning on VL's existing
-union + `is`/`??`/`?.` narrowing rather than try/catch (VL has no catchable
-throw). **Traps are reserved for unrecoverable bugs and are an explicit,
-discouraged opt-in**, not the default for ordinary fallibility. This generalizes
-the errors-as-values direction already noted for the language (§OQ.3); indexing
-(`a[i]: T | null`), `pop(): T | null`, and the asserting/trapping accessors are
-instances of it. The cost of result-by-default in hot code is mitigated by
-**bounds-narrowing** (§VL.6) — proving an index in range erases the `null` arm at
-compile time.
+**Language principle — "results for expected absence, traps for bugs."**
+*Expected, recoverable* outcomes return values, not control-flow escapes: absence
+is `T | null`, "failed with a reason" is `T | E` (a discriminated union narrowed
+with `is`) — leaning on VL's existing union + `is`/`??`/`?.` narrowing rather than
+try/catch (VL has no catchable throw). **Traps are reserved for unrecoverable
+*bugs*.** The dividing line is whether the condition is a *normal program state* or
+a *programmer error*:
+- **Normal absence → `T | null`.** A map lookup that misses (`Map[k]: V | null`),
+  popping an empty list (`pop(): T | null`), or asking for an element that *might*
+  not be there (`list.get(i): T | null`) are ordinary, expected results.
+- **Out-of-bounds *indexing* → trap.** `a[i]` / `l[i]` indexing past the end is a
+  *bug* — the program computed an index it had no business computing — so it traps
+  loudly rather than silently handing back `null` (which would propagate the bug
+  downstream). This is exactly the Rust (`Vec[i]` panics vs `Vec::get -> Option`)
+  and Swift (`array[i]` traps vs dictionary subscript returns optional) split.
+
+This is the errors-as-values direction (§OQ.3) with the bug/normal-state line drawn
+deliberately. Because the trapping `a[i]` is *already* a bare `array.get`, the safe
+default is also the fast default; **bounds-narrowing** (§VL.6) is a pure
+optimization (eliding the redundant trap-check), not the load-bearing prerequisite
+it would be if indexing returned `T | null`.
 
 The rest of this doc is: the cross-language survey and the synthesized
 trade-offs, then the VL design with rationale + rejected alternatives, then a
@@ -168,15 +194,18 @@ is opt-in (`shrink_to_fit`, `trimToSize`). The sane default is **grow-only**.
 
 ### Context: what VL already has
 
-- **The raw fixed array (B6 MVP) — now `List`'s substrate, not a user-facing tier.**
-  A raw VL array is a contiguous WasmGC `array` (one interned `(array mut T)` heap
-  type **per element wasm type** — `arrayType()` in `toWasm.ts`): `array.get` /
-  `array.set` / `array.len` (the last an intrinsic, *not* a stored field), length
-  fixed at `array.new_fixed` time. This is exactly what `List` is built **over** —
-  it becomes `List`'s `backing` substrate (§VL.1) plus an optional low-level escape
-  (an advanced `Array<T>` primitive, §VL.6/§OQ.7), **not** the everyday collection.
-  The MVP gives us the substrate for free. (`a[i]` traps on OOB **today**; under
-  this design the user-facing `List` indexes result-by-default `T | null`, §VL.6.)
+- **The raw fixed array (B6 MVP) — now `List`'s substrate and inferred
+  representation, not a user-facing tier.** A raw VL array is a contiguous WasmGC
+  `array` (one interned `(array mut T)` heap type **per element wasm type** —
+  `arrayType()` in `toWasm.ts`): `array.get` / `array.set` / `array.len` (the last
+  an intrinsic, *not* a stored field), length fixed at `array.new_fixed` time. This
+  is exactly what `List` is built **over** — it becomes `List`'s `backing` substrate
+  (§VL.1) *and* the **inferred representation** the compiler lowers a never-grown
+  `List` value to (header-less, §VL.6), **not** a separate everyday collection the
+  programmer picks. The MVP gives us the substrate for free, and indexing keeps its
+  current behavior: **`a[i]` traps on OOB today and continues to under this design**
+  — the user-facing `List` indexes the same way (trap on OOB; `.get(i): T | null`
+  is the safe accessor, §VL.6).
 - **Monomorphization (A10).** Top-level generic functions monomorphize per call
   shape; inference holes collapse to a single concrete type before codegen (the
   soundness contract — no `dynamic`). Generics already infer *through* collections
@@ -246,9 +275,20 @@ rather than relying on binaryen to do it. With the hoist (the **backing-pointer
 hoisting** enabler, §VL.6), plus the **native-indexing flag** (§VL.6) +
 bounds-narrowing, the access folds back to a bare `array.get`; **without the hoist
 the per-access `struct.get` cost remains.** Scattered/random single accesses
-outside any loop still pay one extra (cache-hot) load — minor there. The
-constant/read-only-literal optimization (§VL.6) avoids even the header for
-compile-time-known literals.
+outside any loop still pay one extra (cache-hot) load — minor there.
+
+**The cleaner answer for the never-grown case: skip the header entirely.** The
+hoist/native-flag combination claws the indirection back for values that *are*
+`List`s. But many `List`-typed values are never grown at all — a `[a, b, c, d]` of
+fixed corners, a lookup table, a matrix row, a function argument that is only read.
+For those the compiler picks the **inferred fixed-array representation** (§VL.6):
+no `{len,cap,backing}` header, no `struct.get`, `l[i]` *is* the raw `array.get`
+from the start — the indirection never exists rather than being optimized away.
+This subsumes the old "constant/read-only-literal" special case (a compile-time
+`[1,2,3]` is just one instance of "provably never grown") and generalizes it to any
+value the growth analysis clears, literal or not. So the indirection cost has two
+backstops: eliminated outright when the value is provably fixed, hoisted out of the
+loop when it genuinely is a growable `List`.
 
 ### VL.2 — Growth strategy: 2× (DECIDED)
 
@@ -370,10 +410,17 @@ substrate and a low-level escape (§VL.6/§OQ.7), not a thing `[...]` ever means
   the `self` receiver are orthogonal mechanisms.)
 - **Mutation methods** (compute → parens, B14 `self`-methods):
   `l.push(x)` (append, amortized O(1)), `l.pop()` (remove+return last, `T | null`
-  on empty — see §VL.6), and the higher-order producers `l.map(f)` / `l.filter(f)`
-  (these are the A10 "build a new array of an inferred element type" use case that
-  was waiting on this subsystem). Each is a free `self`-first function
-  monomorphized per receiver, reachable as `l.push(x)` via UFCS.
+  on empty — see §VL.6), `l.clear()` (reset to empty *retaining capacity* — just
+  `len = 0`, no reallocation; the one cheap building-block kept from the deferred
+  per-frame-reuse story, §VL.6), and the higher-order producers `l.map(f)` /
+  `l.filter(f)` (these are the A10 "build a new array of an inferred element type"
+  use case that was waiting on this subsystem). Each is a free `self`-first function
+  monomorphized per receiver, reachable as `l.push(x)` via UFCS. (Note `push`/`pop`/
+  `clear`/`extend`/`+=` are exactly the **growth/mutation operations the
+  representation-inference analysis watches for**, §VL.6: a value any of them
+  touches is a growable `List`; a value none of them touch can take the fixed-array
+  representation. `clear`, despite resetting `len`, *does* mark the value growable —
+  a cleared-and-refilled list is the canonical reused buffer.)
 - **Bulk combine — `concat` and `extend`** (both ride the bulk `array.copy`
   primitive — see §LS.2 — so neither degrades to a scalar `push` loop):
   - `a + b` (**concat** → a *new* `List<T>`): allocate one backing sized exactly
@@ -398,18 +445,22 @@ substrate and a low-level escape (§VL.6/§OQ.7), not a thing `[...]` ever means
     the change. (*Possible future optimization, not a semantic change:* when the
     compiler can prove `a` is unaliased at the `+=`, lower `a += b` to an in-place
     `extend` — same observable result, the new allocation elided.)
-- **Indexing — result by default (`l[i]: T | null`).** `l[i]` and `l[i] = v`
-  route through the **B13 `"[]"`/`"[]="` index hooks** (assumed landing in
-  parallel) — or, under the **native-indexing flag** (§VL.6), lower directly to
-  `array.get`/`array.set` on `backing`, bypassing B13 dispatch. Reads are
-  **result-oriented**: `l[i]` checks `i` against `len` and yields the element as
-  **`T | null`** — out-of-bounds is `null`, not a trap (§VL.6). The bound is
-  **`len`, not the backing array's physical length** — the spare capacity slots
-  `[len, cap)` read as `null` just like any other OOB index. The `"[]="` lowering
-  bounds-checks the same way. The trapping form is the explicit *asserting*
-  accessor (§VL.6), not `[i]`. Where the compiler can prove `i` in range,
-  **bounds-narrowing** (§VL.6) drops the `null` and the check, recovering a bare
-  `array.get`.
+- **Indexing — traps on out-of-bounds (`l[i]: T`); `.get(i): T | null` is the safe
+  accessor.** `l[i]` and `l[i] = v` route through the **B13 `"[]"`/`"[]="` index
+  hooks** (assumed landing in parallel) — or, under the **native-indexing flag**
+  (§VL.6), lower directly to `array.get`/`array.set` on `backing`, bypassing B13
+  dispatch. A read `l[i]` checks `i` against `len` and yields the element as **`T`**;
+  an out-of-bounds `i` **traps** (the unrecoverable-bug signal — §VL.6, the same
+  thing `a[i]` already does today). The bound is **`len`, not the backing array's
+  physical length** — the spare capacity slots `[len, cap)` are not addressable, so
+  indexing into them traps like any other OOB index. The `"[]="` lowering
+  bounds-checks the same way (and is an in-place element write — non-growing, so it
+  does not force the growable representation). The **safe, checked accessor is a
+  method, `l.get(i): T | null`**, for when an index may legitimately be out of
+  range. Where the compiler can prove `i` in range, **bounds-narrowing** (§VL.6)
+  elides the redundant bounds check, recovering a bare `array.get` — but this is now
+  a pure optimization, because the trapping `l[i]` is *already* a bare `array.get`
+  on the happy path (no `T | null` to unwrap, no tag).
 - **Size members** (O(1), property syntax, read-only — DECISIONS B6):
   - `l.length` → `struct.get $len` (O(1), the logical size; mirrors arrays'
     `.length` but reads the field instead of `array.len`).
@@ -424,16 +475,17 @@ fixed-array literal to fight.
 ### VL.5 — Interaction with `length` and the index traps
 
 - `length` keeps its DECISIONS-B6 contract: O(1), read-only, property syntax. For
-  a `List` it lowers to `struct.get $len`; for the raw-array substrate/escape it
-  lowers to `array.len`. Same surface, two native lowerings — the uniform-access
-  principle the decision was made to preserve. A user can read `l.length` but not
-  assign it; resizing is via `push`/`pop`, never `l.length = n`.
+  the growable-`List` representation it lowers to `struct.get $len`; for the
+  inferred fixed-array representation (and the raw-array substrate) it lowers to
+  `array.len`. Same surface, two native lowerings — the uniform-access principle the
+  decision was made to preserve. A user can read `l.length` but not assign it;
+  resizing is via `push`/`pop`, never `l.length = n`.
 - Indexing sees `len`, not `cap`. `l[i]` for `i in [0, len)` returns the element;
-  `i in [len, cap)` (spare capacity) and any other out-of-range `i` read as
-  **`null`** even though the physical slot may exist — the spare slots are an
-  allocation detail, not addressable state. This is the Go/Rust *bound* (you index
-  `len`, capacity is invisible to `[]`); VL differs only in returning `null`
-  rather than trapping on the OOB case.
+  `i in [len, cap)` (spare capacity) and any other out-of-range `i` **trap** — the
+  spare slots are an allocation detail, not addressable state. This is exactly the
+  Go/Rust *bound* (you index `len`, capacity is invisible to `[]`) *and* the Rust
+  trap-on-OOB behavior (`Vec[i]` panics); the safe `.get(i): T | null` is the form
+  that returns the missing case as a value.
 - `length`/`count`/`capacity` stay distinct per DECISIONS B6: a dense list uses
   `length` (= live element count = `len`) and `capacity` (= `cap`). A future
   sparse collection would use `count`/`extent`; a list never overloads `length`
@@ -441,24 +493,30 @@ fixed-array literal to fight.
 
 ### VL.6 — Bounds, iteration, and out-of-scope (v1)
 
-- **Bounds behavior: `l[i]` is result-by-default (`T | null`).** Out-of-bounds
-  `l[i]` / `l[i] = v` yields **`null`**, *not* a trap — and **the same rule
-  applies to the raw-array escape** (one shared indexing rule; see the implication
-  note below). This is the **"result by default"** language principle (Summary;
-  §OQ.3) applied to indexing: absence is a value, not a control-flow abort. The
-  trapping form is an **opt-in *asserting* accessor** for "I know it's in bounds" —
-  named to signal it is unchecked/asserting (e.g. `getUnchecked(i): T` or an `a[i]!`
-  postfix form), **not** plain `get` (which conventionally names the *safe*
-  accessor, so reserving `get` for trapping would invert every reader's
-  expectation). Trapping is the **explicit, discouraged escape hatch**; the safe
-  `T | null` form is the default.
+- **Bounds behavior: `l[i]` traps on OOB (`l[i]: T`); `.get(i): T | null` is the
+  safe accessor.** Out-of-bounds `l[i]` / `l[i] = v` **traps** — an uncatchable
+  abort, the unrecoverable-bug signal. This is the **"results for expected absence,
+  traps for bugs"** language principle (Summary; §OQ.3) applied to indexing: an
+  index past the end is a *programmer error*, not a normal program state, so it
+  fails loudly instead of silently propagating a `null`. The **safe form is a
+  method, `l.get(i): T | null`**, for the case where an index may legitimately be
+  out of range — named `get` because that is the conventional name for the *safe*
+  accessor (Rust `Vec::get`, the inverse of trapping `Vec[i]`). The same rule
+  applies uniformly to both representations of a `List` (growable and inferred-fixed)
+  and to the raw-array substrate — they all index identically.
 
-  **Implication — this changes today's raw-array behavior.** The raw array `a[i]`
-  *currently traps* on OOB (the B6 MVP). Under result-by-default it becomes
-  `T | null`, matching `List`. Arrays are early enough that changing this is cheap,
-  and a single rule is the cohesive choice — the alternative (the `List` default
-  null-by-default while the raw-array escape keeps trapping) would be a gratuitous
-  inconsistency between two things that index identically.
+  **This keeps today's behavior rather than reversing it.** The raw array `a[i]`
+  *already traps* on OOB (the B6 MVP); the user-facing `List` indexes the same way,
+  so nothing about the existing fixed-array semantics changes. (An earlier review
+  round had proposed flipping indexing to result-by-default `T | null`; this round
+  reverses that and lands on trap + `.get`, the Rust/Swift convergence — which also
+  *de-risks the perf story*: with the safe default already a bare `array.get`,
+  bounds-narrowing drops from a load-bearing prerequisite to a mere optimization,
+  and a missed narrowing costs a redundant compare-and-trap, not a per-access
+  null-unwrap.) **`Map[k]` is the deliberate exception** — a map lookup returns
+  `V | null` because a missing key is a normal, expected result, not a bug (Swift
+  dictionaries and `HashMap::get` do the same). Sequence indexing traps; map lookup
+  yields an optional.
 
 - **Native-indexing flag — the resolution to the B13 indirect-call cost.** A
   pure-VL `List` whose `l[i]` routes through the B13 `"[]"` method pays a
@@ -475,13 +533,14 @@ fixed-array literal to fight.
   - **Declarative annotation** (more general): mark a `"[]"` method as
     native-lowered / intrinsic, so *any* std type can opt into native indexing
     without a hardcoded name in codegen.
-  Combined with **bounds-narrowing** *and* **backing-pointer hoisting** (next
-  bullet), this yields the ideal: a provably-in-range `a[i]` narrows to `T` (no
-  `null`), the native flag makes it a bare `array.get` (no indirect call), and the
-  hoist pulls the `backing` load out of the loop → **codegen identical to a raw
-  array**, while `List` stays an ordinary `.vl` std type everywhere else. **All
-  three are needed**: drop the hoist and the per-access `struct.get` (load
-  `backing`) survives — see §VL.1.
+  Combined with **backing-pointer hoisting** (next bullet) and **bounds-narrowing**,
+  this yields the ideal for a *genuinely growable* `List`: the native flag makes
+  `l[i]` a bare `array.get` (no indirect call), the hoist pulls the `backing` load
+  out of the loop, and bounds-narrowing elides the redundant trap-check → **codegen
+  identical to a raw array**, while `List` stays an ordinary `.vl` std type
+  everywhere else. (For values the growth analysis proves never grow, none of this
+  is needed: the **inferred fixed-array representation** below has no header to load
+  and no dispatch to bypass — `l[i]` is the raw `array.get` outright.)
 
 - **Backing-pointer hoisting (LICM) — the third enabler.** The native flag turns
   `l[i]` into `list.backing[i]`, but that is still a `struct.get` (load `backing`)
@@ -498,46 +557,40 @@ fixed-array literal to fight.
   Without the hoist, bounds-narrowing + the native flag still leave the per-access
   `struct.get`; with all three, the list loop is the raw-array loop.
 
-- **Constant / read-only literal optimization.** A compile-time `[1, 2, 3]` (all
-  elements known, never mutated) can emit a **constant backing** — a fixed-size
-  `List` whose `backing` is a `const` array — skipping even the header allocation.
-  This is an **optimization, not a separate user type**: the value is still a
-  `List` to the program; the compiler just proves it constant and lowers it
-  leaner. (See §OQ.7 / ROADMAP.)
-- **Bounds-narrowing — the enabler that makes this practical (key).** The cost of
-  `T | null` indexing is real: *every* access forces a null-handle, and for scalar
-  elements `i32 | null` is a niche/tagged value, so each read pays a per-access
-  unwrap — noisy in source and slower in hot loops. Left unaddressed, the *safe*
-  default would be slower and noisier than trapping — a safety-vs-speed inversion.
-  The fix is to **extend VL's existing flow-narrowing to array bounds**: when the
-  compiler can prove the index is in range — inside `for i in 0 to a.length`, or
-  in the then-branch of `if i < a.length`, or after an explicit bounds guard —
-  **narrow `a[i]` from `T | null` to `T`**: no `null` arm, no unwrap, no tag, no
-  trap, just a bare `array.get`. This is the same narrowing engine that already
-  refines nullness and union members (A5, `docs/narrowing.md`), pointed at the
-  index/length relation. With it, result-by-default indexing is **safe AND
-  ergonomic AND native-speed in the common case** (the loop/guarded access), and
-  the `T | null` only survives where the compiler genuinely can't prove the bound
-  — exactly where a check is warranted. Bounds-narrowing is therefore the enabler
-  that makes the result-by-default decision practical rather than a tax; it is the
-  headline open work (§OQ.4) because it touches the **core narrowing engine**, not
-  just `List`.
-- **`pop()` on empty — recommend `pop(): T | null`.** A `pop(): T` has no `T` to
-  return on empty, so it could only trap or hand back garbage (unsound); encoding
-  absence in the type keeps it **total** and type-safe. This composes with
-  machinery VL already has — `is`/`??`/`?.` null-narrowing — so the empty case is
-  handled with zero new concepts. It is the typed-language consensus (Rust
+- **Bounds-narrowing — now a pure optimization, not a prerequisite.** Under the
+  trap-on-OOB decision, `l[i]` is *already* a bare `array.get` on the happy path:
+  there is no `T | null` to handle, no per-access null-unwrap, no tagged
+  `i32 | null` for scalars. What remains is the **bounds check that precedes the
+  trap**. Bounds-narrowing elides *that*: when the compiler can prove the index is
+  in range — inside `for i in 0 to a.length`, in the then-branch of
+  `if i < a.length`, or after an explicit guard — it drops the compare-and-trap,
+  leaving the bare `array.get`. This reuses the same narrowing engine that refines
+  nullness and union members (A5, `docs/narrowing.md`), pointed at the
+  index/length relation. The crucial difference from the result-by-default world:
+  **a missed narrowing now costs only a redundant compare-and-trap, not a
+  per-access null-unwrap** — so the safe default is fast *with or without* the
+  optimization, and bounds-narrowing is a "make the hot loop optimal" nicety rather
+  than the thing standing between safe and usable. (It is still worth doing, and
+  still touches the core narrowing engine, §OQ.4 — just no longer load-bearing.)
+- **`pop()` on empty — `pop(): T | null`.** A `pop(): T` has no `T` to return on
+  empty, so it could only trap or hand back garbage (unsound); encoding absence in
+  the type keeps it **total** and type-safe. This is the *normal-absence* side of
+  the principle (not the bug side): an empty list is an ordinary program state, not
+  a programmer error, so `pop` returns `T | null` rather than trapping. It composes
+  with machinery VL already has — `is`/`??`/`?.` null-narrowing — so the empty case
+  needs zero new concepts. It is the typed-language consensus (Rust
   `Vec::pop -> Option<T>`, Swift `popLast() -> Element?`); only the dynamic
   languages throw (Python `IndexError`).
 
   **VL's failure model (clarification).** VL has **traps** — an uncatchable wasm
-  abort, like Rust `panic!` (`a[i]` out-of-bounds already traps today) — but **no
-  exceptions** (no catchable throw). So the real choice for empty `pop` is *trap*
-  vs *total `T | null`*, never "throw." We take total `T | null`: empty-pop is an
-  ordinary control-flow condition, not a program bug — the same **result by
-  default** discipline as indexing. A future Swift-style trapping `removeLast()`
-  for the "known non-empty" case is a natural addition (the same dual as the
-  safe `a[i]: T | null` vs the asserting/trapping accessor for indexing) — not v1.
+  abort, like Rust `panic!` (`a[i]` out-of-bounds traps) — but **no exceptions** (no
+  catchable throw). So the real choice for empty `pop` is *trap* vs *total
+  `T | null`*, never "throw." We take total `T | null` (normal absence). The
+  dividing line is consistent across the API: **bug-class index errors trap**
+  (`l[i]` OOB), **normal-absence results return `T | null`** (`pop()` on empty,
+  `l.get(i)`, `Map[k]`). A future Swift-style trapping `removeLast()` for the "known
+  non-empty" case is a natural addition (the trap/optional dual, mirroring `l[i]`
+  vs `l.get(i)`) — not v1.
 - **Iteration.** `for x in list` works exactly like `for x in array` (B8),
   iterating `[0, len)` via `array.get` on the backing. (`for x, i in list` index
   form rides on the same B8 destructuring work as arrays.) **Mutating the list
@@ -550,14 +603,27 @@ fixed-array literal to fight.
 - `insert(i, x)` / `remove(i)` at arbitrary positions (O(n) shift) — `push`/`pop`
   (ends) only in v1.
 - `shrinkToFit()` / any auto-shrink — grow-only.
-- The asserting/trapping accessor (`getUnchecked(i): T` / `a[i]!`) — the
-  discouraged opt-in escape hatch; the safe `a[i]: T | null` is the v1 default.
+- **Per-frame pooling / reuse beyond `clear()`** — a heavier "retain this buffer
+  across frames" story (`retain`, `mapInto(dst)`, free-list pooling) is **deferred
+  past v1**: it is not clearly first-release-critical, and the inferred fixed-array
+  representation (§VL.7) already removes the per-frame allocation for the
+  fixed-size cases *for free*. The one cheap piece kept in v1 is capacity-retaining
+  **`clear()`** (`len = 0`, no realloc) — the building block a manual frame-reuse
+  loop needs, at zero implementation cost.
+- The **trapping element accessor is the default `l[i]`, so there is nothing to
+  defer here** — the v1 surface is `l[i]: T` (traps on OOB) *plus* the safe
+  `l.get(i): T | null`. A future Swift-style trapping `removeLast()`-flavored
+  "asserting" variant of *other* operations is the only deferred dual.
 - Slicing a list into a view that **aliases** the backing (Go-style shared
   backing); v1 `slice` (if any) copies.
-- The **raw-array low-level escape** (an advanced `Array<T>` / unsafe primitive for
-  header-less contiguous memory — §OQ.7). The raw fixed array exists as `List`'s
-  substrate from day one, but exposing it as a *user-facing* low-level type is a
-  future, deliberately-advanced surface, not v1.
+- **A *user-facing* low-level array escape** (an advanced `Array<T>` / unsafe
+  primitive for header-less contiguous memory exposed deliberately for FFI / SIMD /
+  linear-memory — §OQ.7). Note this is now distinct from, and largely *subsumed*
+  by, the **inferred fixed-array representation** (§VL.7): the common reason to want
+  a fixed array (no header, no indirection, raw `array.get`) is delivered
+  automatically by representation inference under the ordinary `[...]`/`List`
+  surface, so the remaining "explicit low-level escape" is only for the genuinely
+  low-level memory-addressing cases, and stays a future advanced surface, not v1.
 - Value-semantics / copy-on-write (Swift-style). VL lists are **reference**
   values in v1; `let b = a` shares the same list — **consistent with VL objects,
   which are reference types today**. There is no sound case for collections being
@@ -566,6 +632,11 @@ fixed-array literal to fight.
   (objects + collections together), not a `List` detail. Default for v1 =
   **reference**; Swift-style value-everywhere-with-COW is a coherent alternative
   *only if adopted uniformly* — see the language-level open question (§OQ.2).
+  **Note the representation-inference link (§VL.7):** the alias-unification step
+  that the fixed-vs-growable analysis needs exists *only because* lists are
+  reference values (aliases must agree on representation); value semantics would
+  remove aliasing and make the analysis strictly easier. So this language-wide call
+  also moves the difficulty of §VL.7.
 - Equality/hashing of lists (structural `==` over elements) — defer until the
   element-comparison story for the value-eq path is settled.
 
@@ -585,6 +656,105 @@ designed-but-deferred — they are worth pinning now so the surface is coherent:
   Swift's `removeSubrange` / `insert(contentsOf:)` / sub-range subscript, or Rust's
   `drain` (remove + yield) / `split_off` (cut in two). The verb choice is part of
   the deferred decision, not settled here.
+
+### VL.7 — Representation inference: `List` is the model, fixed-array is an inferred lowering
+
+**The decision.** There is **one user-facing collection and one literal** — `List`,
+spelled `[...]` — and that is the entire mental model the programmer carries. The
+compiler then **infers the representation**: a `List`-typed value is lowered to a
+**header-less fixed WasmGC array** when it can prove the value (and every alias of
+it) is *never grown*, and to the full `{ backing, len, cap }` `List` struct (§VL.1)
+otherwise. The choice is **invisible to semantics** — both representations index the
+same way (trap on OOB, `.get(i): T | null`), allow in-place element writes
+(`a[i] = v`), report `.length`, and iterate identically — and visible only in speed
+and footprint.
+
+**Why this is the right shape for VL specifically.** It is the same move VL already
+makes everywhere else: *the type/representation is hidden and inferred from how the
+value is used.* VL infers an un-annotated parameter's type from its body and
+monomorphizes per call shape; inferring "fixed vs growable" from whether
+growth operations are ever applied is that exact philosophy pointed at
+representation. No other mainstream language infers fixed-vs-dynamic from usage —
+Rust/Go/C make you *choose* (`[T;N]` vs `Vec`, `[N]T` vs `[]T`), Swift/Python/JS
+give you *only* the growable one — precisely because none of them have VL's
+"infer everything from usage" stance. This is a place VL's identity buys it
+something the others can't have.
+
+**What it buys — three review concerns resolved by one idea:**
+1. **The indirection cost (raised earlier in this very review) disappears for the
+   fixed case.** A never-grown value has no `{len,cap,backing}` header and no
+   `struct.get` indirection — `l[i]` *is* a raw `array.get`, not a header-load
+   followed by an array-load (§VL.1). The hoist/native-flag machinery is only needed
+   for values that genuinely grow.
+2. **The fixed-size-buffer gap closes** without a second user-facing type. The
+   `[a, b, c, d]` of four corners, a 16-slot lookup table, a matrix row — the cases
+   the systems/game reviewers wanted raw fixed arrays for — get the header-less
+   representation automatically, under the ordinary `[...]` literal.
+3. **The single `[...]` literal is preserved** — the unification stays intact;
+   nobody picks a representation by hand.
+
+**Why it is safe to adopt — it can only ever be a *win*.** Frame it precisely:
+**`List` is the semantic model; fixed-array is an optimization the compiler applies
+only when it can prove it sound.** If the analysis is uncertain, it falls back to a
+`List`. So:
+- **Worst case = today's design** (everything is a growable `List` — correct, just
+  not as lean).
+- **Best case = a header-less raw array** (faster, smaller) — for the values it can
+  prove.
+- **Never observably wrong**, because the two representations are semantically
+  identical. This de-risks the whole idea: ship `List`-as-default first, then layer
+  representation inference in as an optimization pass, with no redesign and no
+  user-visible behavior change.
+
+**How the analysis works (and where it is hard — stated honestly).**
+- **What forces "growable":** the value is the receiver of any *length-changing*
+  operation — `push`, `pop`, `extend`, `+=`, `splice`/`insert`/`remove` (when
+  added), or `clear()` (a cleared-and-refilled buffer is the canonical reuse case,
+  so `clear` marks growable even though it only lowers `len`). In-place element
+  writes (`a[i] = v`) and reads do **not** force growable — a fixed array is still
+  element-mutable, just not resizable (exactly Rust `[T; N]`).
+- **It is interprocedural, not local.** Growth can happen through a callee
+  (`f(xs) { xs.push(1) }` ⇒ any `[...]` passed to `f` is growable) or an alias
+  (`let b = a; b.push(x)` ⇒ `a` is growable too). So "is this ever grown?" is a
+  constraint that **propagates backward from use sites to the literal** — the same
+  flavor of constraint propagation as type inference, and a natural fit for VL's
+  whole-program monomorphizing compile.
+- **Aliases must agree on representation.** Because lists are *reference* values
+  (§VL.6 out-of-scope; §OQ.2), all aliases of a value share one representation, so
+  the analysis unions aliases (union-find) and asks "does *any* alias ever grow
+  it?" This aliasing step is the real cost of the analysis — and it is exactly the
+  part that **value semantics would eliminate** (no aliasing to unify). So §VL.7's
+  difficulty is downstream of the language-wide value-vs-reference call (§OQ.2).
+- **Conservative v1 is shippable.** The analysis degrades gracefully: when in
+  doubt, pick `List`. A first version can take the fixed-array representation only
+  for the easy, provable cases (a local `[...]` that is read-only and never escapes,
+  or escapes only into params the analysis can see are read-only) and leave
+  everything else a `List`. Always correct; optimizes opportunistically; tightens
+  over time.
+
+**Interaction with variance (A8/A9).** "A read-only parameter accepts either a
+fixed array *or* a `List`, but a growing parameter requires a `List`" is exactly a
+**readable/writable variance** statement: the fixed-array representation is usable
+anywhere a *non-mutating* `List` is wanted. So the function-signature side of the
+analysis ("does this param grow its argument?") is the same information the variance
+work (A9) needs, and the two should be designed together: a param typed as a
+*readable* sequence admits both representations; a param that grows its argument
+constrains it to the growable one.
+
+**The escape hatch: annotation overrides inference.** Inference is the default, not
+a straitjacket. An explicit annotation forces a representation when the programmer
+knows better than the local analysis — e.g. `let a: List<T> = []` to force the
+growable representation and `reserve` ahead of a fill the analysis can't yet see,
+or (if/when spelled) a fixed-array annotation to *require* the lean one and get a
+compile error if some code path would grow it. Inference-by-default,
+annotation-to-override — the same posture VL takes for types.
+
+**Status.** The *decision* (one `List` model; fixed-array as inferred
+representation; never-wrong fallback) is taken this round. The *analysis* — the
+interprocedural growth-detection + alias unification — is **new open compiler work**
+(§OQ.4), gated in difficulty by the value-vs-reference call (§OQ.2) and best
+co-designed with variance (A9). It is explicitly fine for v1 to ship the
+conservative version (or even List-only first) and tighten later.
 
 ---
 
@@ -606,11 +776,10 @@ here** — this is the plan the design commits to.
 3. **Codegen — construction & access.** `List<T>()` → `struct.new` with empty
    backing + `len=0,cap=0` (or a shared sentinel empty array); `List<T>(capacity: n)`
    → allocate backing of cap = n, `len=0`; the `[…]` literal → allocate backing of
-   cap = element count, fill, `len=cap=n` (a compile-time-constant `[…]` may emit a
-   `const` backing — the §VL.6 literal optimization). `l[i]`/`l[i]=v` → the
-   `len`-bounded `array.get`/`array.set` lowering, via the B13 traps **or** the
-   native-indexing flag (§VL.6) that bypasses them. `.length`/`.capacity` →
-   `struct.get`.
+   cap = element count, fill, `len=cap=n`. `l[i]`/`l[i]=v` → the `len`-bounded
+   **trap-on-OOB** `array.get`/`array.set` lowering (the safe `l.get(i): T | null` is
+   the method form), via the B13 traps **or** the native-indexing flag (§VL.6) that
+   bypasses them. `.length`/`.capacity` → `struct.get`.
 4. **Codegen — push/pop/grow.** A lazily-emitted-per-element-wasm-type helper set
    (à la `__string_eq__`): `__list_push_T__` (the `len==cap` grow-and-copy + write
    + `len++`), `__list_pop_T__` (`len--`, read, `T|null` on empty),
@@ -623,16 +792,24 @@ here** — this is the plan the design commits to.
    type" capability this subsystem unblocks.
 7. **Tests.** A `tests/cases/collections/` corpus: construct/push/pop, growth
    (assert `length` vs `capacity` across the doubling boundary), index get/set,
-   **OOB `[i]` → `null`** cases (and the **bounds-narrowed** in-range case lowering
-   to a plain `array.get` with no `null`), `map`/`filter`, `for…in`, empty-`pop`
-   nullable narrowing, plus `xfail-*` files pinning the out-of-scope gaps
-   (insert/remove, shrink, the asserting/trapping accessor, COW) per the
+   **OOB `[i]` → trap** cases (alongside the existing array trap tests) and the
+   **safe `l.get(i): T | null`** path (including the OOB → `null` case), the
+   **bounds-narrowed** in-range case lowering to a plain `array.get` with the
+   trap-check elided, `clear()` (capacity retained), `map`/`filter`, `for…in`,
+   empty-`pop` nullable narrowing, plus `xfail-*` files pinning the out-of-scope
+   gaps (insert/remove, shrink, per-frame pooling beyond `clear`, COW) per the
    soundness-corpus convention.
-8. **Docs.** Flip `ROADMAP` B6 to a one-line done marker; add a terse
+8. **Representation inference (optimization, can land after the core).** The
+   §VL.7 growth analysis: detect `List` values that are never grown (interprocedural
+   + alias-unioned) and lower them to the header-less fixed-array representation;
+   conservative default to growable `List` when unproven. Shippable as a later pass
+   — the core `List` above is correct without it.
+9. **Docs.** Flip `ROADMAP` B6 to a one-line done marker; add a terse
    DECISIONS entry (`List` is the one user-facing collection + `[...]`=`List` +
-   2× growth + monomorphized-not-boxed + grow-only + native-indexing flag, with the
-   "WasmGC has no realloc/free so the golden-ratio argument doesn't apply"
-   rationale). This design doc stays as the mental model.
+   2× growth + monomorphized-not-boxed + grow-only + **trap-on-OOB indexing with
+   `.get(i): T | null`** + native-indexing flag + **fixed-array as inferred
+   representation**, with the "WasmGC has no realloc/free so the golden-ratio
+   argument doesn't apply" rationale). This design doc stays as the mental model.
 
 ## Open questions for the owner
 
@@ -649,62 +826,69 @@ here** — this is the plan the design commits to.
    nice predictability (nothing mutated through an alias), cheap via COW — but
    only if applied **uniformly** to structs/objects *and* collections, decided
    once language-wide. Do not bolt COW onto `List` alone.
-3. **Error model — language-wide (errors-as-values / "result by default").** The
-   direction the owner favors, now adopted as the indexing default: fallible ops
-   encode failure **in the return type** via unions — `T | null` for absence,
+3. **Error model — language-wide (errors-as-values, with the bug/normal-state
+   line).** The direction the owner favors: *expected, recoverable* outcomes encode
+   failure **in the return type** via unions — `T | null` for normal absence,
    `T | E` (discriminated with `is`) for "failed with a reason" — rather than
-   try/catch, leaning on VL's existing union + `is`/null narrowing; **traps stay
-   reserved for unrecoverable** programmer errors and are an explicit, discouraged
-   opt-in (the Rust panic-vs-`Result` split). This ties to the `// TODO: exceptions`
-   stub in the AST — the broader language-wide decision is *not* fully settled
-   here, but **result-by-default indexing is decided this review** (see Summary /
-   §VL.6). `a[i]: T | null`, `pop(): T | null`, and the asserting/trapping
-   accessor (§OQ.4) are the instances of this model.
-4. **Indexing — perf, via bounds-narrowing (the headline open work).** Result-by-
-   default is **decided**: `a[i]: T | null` for arrays and lists, with an
-   asserting/trapping accessor as the opt-in (§VL.6). The remaining open work is
-   **perf**, and it now centers on **bounds-narrowing**: `T | null` per access
-   means a null-handle on every read (and a tagged `i32 | null` for scalars), so
-   to keep indexing native-speed the compiler must **extend flow-narrowing to
-   array bounds** — when `i` is provably in range (`for i in 0 to a.length`, after
-   `if i < a.length`, an explicit guard), narrow `a[i]` to `T` and emit a bare
-   `array.get` with no null/unwrap/check. This is the enabler that makes safe-by-
-   default indexing as fast as trapping; without it the safe default is *slower*
-   than the unsafe one (a safety-vs-speed inversion). It touches the **core
-   narrowing engine** (A5, `docs/narrowing.md`), not just `List`. The secondary
-   dispatch question — a pure-VL `List` whose `l[i]` routes through the B13 `"[]"`
-   method is a per-access indirect call — is **resolved by the type-level
-   native-indexing flag** (§VL.6): `List`'s `"[]"`/`"[]="`/`.length` lower to native
-   `array.get`/`array.set`/`array.len` on `backing`, bypassing dispatch (precedent:
-   the `string`/`i32` nominal special-casing in codegen). The remaining sub-choice
-   is **how to express the flag**: **nominal recognition** (codegen knows `List` by
-   name, simplest) vs a **declarative native-lowered/intrinsic annotation** on the
-   `"[]"` method (more general — any std type can opt in). A **third** enabler is
-   needed for a *loop*: **backing-pointer hoisting (LICM)** — `l[i]` is still a
-   `struct.get` (load `backing`) then an `array.get`, two loads per element, and in
-   a tight loop that is ~1.5–2× over a raw array (§VL.1). `backing` is
-   loop-invariant, so hoist its load out of the loop; binaryen's LICM over a GC
-   `struct.get` is not guaranteed (it must prove no `push`/grow/reassign in the
-   loop), so VL likely hoists it explicitly for the canonical `for`-over-index
-   pattern. With all three — bounds-narrowing + native flag + hoist — an in-range
-   `a[i]` in a loop is codegen-identical to a raw `array.get`; missing the hoist
-   leaves the per-access `struct.get`. This is the one spot `List` needs compiler
-   privilege even under "std over primitives."
+   try/catch, leaning on VL's existing union + `is`/null narrowing; while
+   **unrecoverable *bugs* trap** (the Rust panic-vs-`Result` split). The line is
+   drawn at *normal program state vs programmer error*. This ties to the
+   `// TODO: exceptions` stub in the AST — the broader language-wide decision is
+   *not* fully settled here, but the **indexing instance is decided this review**:
+   out-of-bounds `a[i]` **traps** (a bug), while `pop(): T | null`, `l.get(i): T |
+   null`, and `Map[k]: V | null` return **normal absence** as a value. (An earlier
+   round had proposed result-by-default indexing — `a[i]: T | null`; this round
+   reverses that to trap + `.get`, matching Rust/Swift, and recategorizes indexing
+   OOB as a bug rather than expected absence.)
+4. **Indexing & representation — perf knobs + the inference analysis (the headline
+   open work).** Trap-on-OOB indexing is **decided** (`a[i]: T`, traps; `l.get(i):
+   T | null` safe; §VL.6), which **demotes** the old perf prerequisites to
+   optimizations and **adds one new analysis**:
+   - **Bounds-narrowing — now optional.** Because the trapping `a[i]` is already a
+     bare `array.get` on the happy path, narrowing only elides the redundant
+     compare-and-trap; a miss costs a check, not a per-access null-unwrap. Still
+     worth doing (touches the core narrowing engine, A5, `docs/narrowing.md`), no
+     longer load-bearing.
+   - **Native-indexing flag — unchanged.** A pure-VL `List` whose `l[i]` routes
+     through the B13 `"[]"` method is a per-access indirect call; resolve with a
+     type-level flag that lowers `"[]"`/`"[]="`/`.length` to native `array`
+     ops on `backing` (precedent: `string`/`i32` nominal special-casing). Sub-choice:
+     **nominal recognition** (codegen knows `List` by name, simplest) vs a
+     **declarative native-lowered/intrinsic annotation** (any std type can opt in).
+   - **Backing-pointer hoisting (LICM) — unchanged.** For a genuinely growable
+     `List`, `l[i]` is `struct.get backing` then `array.get` — two loads; hoist the
+     loop-invariant `backing` load out of the loop (binaryen's LICM over a GC
+     `struct.get` is not guaranteed). With native flag + hoist + narrowing, an
+     in-range `l[i]` in a loop is codegen-identical to a raw `array.get`.
+   - **NEW — representation inference (§VL.7).** The headline addition this round:
+     infer fixed-array vs growable-`List` from whether growth operations are ever
+     applied, and lower never-grown values to a header-less fixed array (which has
+     *no* `backing` to load and *no* dispatch to bypass — so for those values the
+     three knobs above are moot). The analysis is **interprocedural** (growth via a
+     callee or alias propagates back to the literal) and **alias-unioned** (all
+     aliases share a representation — the cost item, and the part value-semantics
+     would erase, §OQ.2). It is a **safe optimization**: unproven ⇒ growable `List`,
+     so it is never wrong and can land after the core (or be shipped conservatively).
+     Co-design with **variance (A9)**: "read-only param accepts either representation,
+     growing param requires the growable one" is a readable/writable variance
+     statement. This is the one spot `List` needs compiler privilege even under
+     "std over primitives" — and the new analysis is the bulk of the remaining work.
 5. **Growth taper.** 2× is **decided** for v1 (above). Whether to later add a
    Go-style taper to ~1.25× past a size threshold stays deferred — a
    constant-factor tweak behind the same API, not a representation change.
 6. **`map`/`filter` result type.** Should producers return a `List<U>` (proposed)
    or a raw array? Returning a `List` keeps the chain growable and composable.
-7. **Raw fixed array as a low-level escape — surface & timing.** The raw fixed
-   array is `List`'s substrate from day one; the open question is whether/when to
-   *also* expose it as a user-facing **low-level escape** — an advanced `Array<T>` /
-   unsafe primitive for **header-less contiguous memory**, which matters for future
-   **FFI / SIMD / linear-memory** targets if VL ever addresses memory directly.
-   Plus the related **constant/read-only-literal optimization** (§VL.6): a
-   compile-time `[1,2,3]` emitting a `const` backing is an optimization (still a
-   `List` to the program), not a separate user type. Both are deliberately
-   advanced/future surfaces, not v1 — but worth naming so the raw array's continued
-   existence (beyond substrate) is on record.
+7. **Raw fixed array as a *low-level* escape — now largely subsumed by §VL.7.** The
+   raw fixed array is `List`'s substrate from day one *and* the inferred
+   representation (§VL.7) for never-grown values — so the common reason to reach for
+   a fixed array (no header, no indirection, raw `array.get`) is now delivered
+   automatically under the ordinary `[...]`/`List` surface. What *remains* an open
+   question is only the genuinely **low-level memory-addressing escape** — an
+   advanced `Array<T>` / unsafe primitive for **FFI / SIMD / linear-memory** targets
+   if VL ever addresses memory directly — which is a deliberately advanced/future
+   surface, not v1. (The old "constant/read-only-literal optimization" is no longer a
+   separate item: a compile-time `[1,2,3]` is just one case the §VL.7 growth analysis
+   proves fixed, and it is lowered as such — still a `List` to the program.)
 
 ---
 
@@ -835,11 +1019,11 @@ default-init instruction. `__array_copy__` is the bulk mover. All are generic ov
 the element type and monomorphize through the existing per-element array interner —
 i.e. they are the *runtime-length* / *bulk* siblings of the array literal, lowered to
 the WasmGC instructions the backend already uses internally. With these two
-primitives, the entire §VL.1–VL.6 `List` is writable as a `.vl` module: the struct,
+primitives, the entire §VL.1–VL.7 `List` is writable as a `.vl` module: the struct,
 the 2× grow (`__array_new_default__(cap * 2)` + `__array_copy__` + swap `backing`),
-`push`/`pop`, `concat`/`extend` (the two-/one-copy bulk combines of §VL.4),
-the `[]`/`[]=` index hooks (`len`-bounded, result-by-default `T | null`),
-`.length`/`.capacity`, `map`/`filter`.
+`push`/`pop`/`clear`, `concat`/`extend` (the two-/one-copy bulk combines of §VL.4),
+the `[]`/`[]=` index hooks (`len`-bounded, **trap-on-OOB**) plus the safe
+`get(i): T | null` accessor, `.length`/`.capacity`, `map`/`filter`.
 
 **Secondary perf knobs that *might* later want intrinsics — but are not required for
 v1:**
@@ -957,16 +1141,27 @@ the type:
    `array.new_default` / `array.copy`, reusing the existing per-element array
    interner). This is the floor everything else stands on, and it is independently
    testable.
-2. **Write `List<T>` as a `.vl` std module** over that intrinsic (the §VL.1–VL.6
+2. **Write `List<T>` as a `.vl` std module** over that intrinsic (the §VL.1–VL.7
    design, now expressed in VL rather than baked into codegen). This is the H2
-   capability demonstration.
-3. **Then `Map<K, V>`** (B6a) over the same intrinsic floor (its backing buckets
-   are dynamic-length arrays too) — likewise a `.vl` std module.
+   capability demonstration. `List` is built and shipped *first* — `Map`/`Set`
+   below ride on the same floor but are not gated on each other.
+3. **Then `Map<K, V>` and `Set<T>` — the "usable for modding" milestone trio.**
+   The modding/scripting milestone ships **`List` + `Map` + `Set`** together (a
+   scripting language needs all three to be practical), even though `List` lands
+   first in build order. Both `Map` (B6a) and `Set` go over the same intrinsic floor
+   (their backing buckets are dynamic-length arrays too) — likewise `.vl` std
+   modules. **Specify deterministic iteration order** for both: VL targets
+   multiplayer/replay, where map/set iteration feeding into game state must be
+   reproducible across runs and machines (insertion-order iteration, à la JS
+   `Map`/`Set` and Python `dict`, rather than hash-order). Indexing follows the
+   decided split: **`Map[k]: V | null`** (missing key is normal absence, not a
+   trap), distinct from sequence `List[i]` which traps on OOB.
 
 This re-frames the prior outline's "type & checker / WasmGC types / codegen" steps:
 with `List` living in VL, most of that collapses into "compile an ordinary VL
-generic," and the genuinely new compiler work shrinks to **step 1** (plus whatever
-std-module *loading* mechanism step 2 needs — see open questions).
+generic," and the genuinely new compiler work shrinks to **step 1** plus the §VL.7
+representation-inference pass (an optimization that can follow) — plus whatever
+std-module *loading* mechanism step 2 needs (see open questions).
 
 ### LS.7 — Open questions (still open)
 
