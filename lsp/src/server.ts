@@ -8,6 +8,7 @@ import {
   InlayHint,
   InlayHintKind,
   Location,
+  MarkupKind,
   Position,
   ProposedFeatures,
   Range,
@@ -35,6 +36,7 @@ import {
   receiverObjectType,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
+  typeMarkdown,
 } from "./typeFeatures.ts";
 
 // The language id the extension registers (`package.json` → contributes.languages,
@@ -223,10 +225,21 @@ const completionKind: Record<CompletionKind, CompletionItemKind> = {
   type: CompletionItemKind.Struct,
 };
 
+// `detail` is the concise inline type label (plain text per the LSP spec, so the
+// client doesn't syntax-highlight it). For items that carry a type we ALSO set
+// `documentation` to a markdown `MarkupContent` wrapping the same type in a
+// fenced `vital` block (`typeMarkdown`), which the client renders highlighted via
+// the TextMate grammar — matching the hover. Items without a type omit it.
 const toCompletionItem = (c: Completion): CompletionItem => ({
   label: c.name,
   kind: completionKind[c.kind],
   detail: c.detail,
+  ...(c.detail === undefined ? {} : {
+    documentation: {
+      kind: MarkupKind.Markdown,
+      value: typeMarkdown(c.detail, VL_LANGUAGE_ID),
+    },
+  }),
 });
 
 // The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`

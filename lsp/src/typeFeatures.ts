@@ -226,6 +226,21 @@ export type Completion = {
 };
 
 /**
+ * Wrap a stringified type in a fenced `vital` code block so the LSP client
+ * syntax-highlights it. A completion item's `detail` is plain text per the LSP
+ * spec (so the type there renders unstyled); the markdown `documentation` built
+ * from this renders highlighted via the same TextMate grammar the hover uses.
+ *
+ * Returns the markdown *string* only — kept LSP-enum-free like the rest of this
+ * module; `server.ts` wraps it in a `MarkupContent` with `MarkupKind.Markdown`.
+ * The fence info string is the language id `server.ts` passes in (`vital`, the
+ * id the hover code blocks use), so the markup format stays in one place while
+ * the language id lives next to the hover code it must match.
+ */
+export const typeMarkdown = (typeStr: string, languageId: string): string =>
+  "```" + languageId + "\n" + typeStr + "\n```";
+
+/**
  * Classify a builtin (from `defaultScope`) by its `VLType`: a `Function` type is
  * a callable, anything else is treated as a `type` (the builtins are the numeric
  * /string *types* `i32`, `string`, … which are object types naming themselves).

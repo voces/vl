@@ -19,6 +19,7 @@ import {
   identifierCompletions,
   memberCompletions,
   receiverObjectType,
+  typeMarkdown,
 } from "../lsp/src/typeFeatures.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
@@ -238,4 +239,30 @@ Deno.test("receiverObjectType: an unknown / non-object receiver yields no member
     receiverObjectType("nope", table, { line: 1, column: 9 }, {}),
     undefined,
   );
+});
+
+// ---- (3) syntax-highlighted type documentation ------------------------------
+
+Deno.test("typeMarkdown: wraps the type in a fenced `vital` code block", () => {
+  // The `vital` fence info string makes the client render the type highlighted
+  // via the same TextMate grammar the hover uses; `detail` (plain text) can't.
+  assertEquals(typeMarkdown("i32", "vital"), "```vital\ni32\n```");
+});
+
+Deno.test("typeMarkdown: a typed binding's completion detail can render highlighted", () => {
+  // A completion for a typed binding (`p: i32`) carries a `detail`; wrapping it
+  // through `typeMarkdown` produces markdown with a ```vital fence around the
+  // type string. (server.ts sets this as the item's `documentation`.)
+  const src = "function f(p: i32): i32 {\n  return p\n}\n";
+  const table = parseSymbols(src);
+  const cs = identifierCompletions(table, { line: 2, column: 9 }, {}, stringifyType);
+  const detail = cs.find((c) => c.name === "p")?.detail;
+  assertEquals(detail, "i32", "the typed binding carries an inline type detail");
+  const md = typeMarkdown(detail!, "vital");
+  if (!md.includes("```vital\n")) {
+    throw new Error("documentation markdown must open a `vital` fence");
+  }
+  if (!md.includes(detail!)) {
+    throw new Error("documentation markdown must contain the type string");
+  }
 });
