@@ -31,6 +31,19 @@ export type Binding = {
    * (`Infer`/`Unknown`) may appear for still-generic params.
    */
   type?: VLType;
+  /**
+   * Source span over which this binding is *visible* — its enclosing lexical
+   * scope's extent (the program span for top-level decls, the enclosing `{ … }`
+   * block for locals, the function span for parameters). Stamped by the parser
+   * when the scope it lives in closes (see `parseProgram`). Drives scope-aware
+   * completion (roadmap D3): a name is in scope at position P iff `scope`
+   * contains P. We do *not* require the declaration to textually precede P — a
+   * function/type may be used before its declaration, and a `let` is visible for
+   * the whole block; ordering filters (if wanted) are the caller's concern.
+   * Optional because a binding declared in a scope that errored out before
+   * closing may never be stamped (and pre-D3 callers never set it).
+   */
+  scope?: Context;
 };
 
 /** One textual appearance of a name, resolved to the binding it refers to. */
@@ -92,6 +105,39 @@ export class SymbolTable {
       )
       .map((o) => o.span);
   }
+
+  /**
+   * Every distinct `Binding` *visible* at `pos` — the data behind scope-aware
+   * identifier completion (roadmap D3). A binding is visible when its stamped
+   * `scope` span contains `pos` (locals/params/functions/types alike; see
+   * `Binding.scope`). Builtins live in `defaultScope` and have no source span,
+   * so they are *not* returned here — the caller folds those in separately.
+   *
+   * Shadowing: when several bindings of the same name are visible (an inner
+   * `let x` shadows an outer one), the one with the *tightest* enclosing scope
+   * wins, matching lexical resolution. Returns one binding per name.
+   *
+   * Each binding is also de-duplicated by identity first: the parser may re-stamp
+   * the same binding via nested closing scopes, but the occurrence list still
+   * holds it once per textual appearance, so we collapse to unique bindings.
+   */
+  bindingsInScopeAt(pos: Position): Binding[] {
+    // name -> the visible binding with the tightest enclosing scope so far.
+    const byName = new Map<string, Binding>();
+    const seen = new Set<Binding>();
+    for (const occ of this.occurrences) {
+      const { binding } = occ;
+      if (seen.has(binding)) continue;
+      seen.add(binding);
+      if (!binding.scope || !spanContains(binding.scope, pos)) continue;
+      const incumbent = byName.get(binding.name);
+      // Tighter (more specific) scope shadows a looser one of the same name.
+      if (incumbent === undefined || scopeTighter(binding.scope, incumbent.scope!)) {
+        byName.set(binding.name, binding);
+      }
+    }
+    return [...byName.values()];
+  }
 }
 
 /** `a <= b` over positions (1-based line, 0-based column). */
@@ -117,4 +163,19 @@ const spanShorter = (a: Context, b: Context): boolean => {
   const aLines = a.stop.line - a.start.line;
   const bLines = b.stop.line - b.start.line;
   return aLines < bLines;
+};
+
+/**
+ * True when scope `a` is *tighter* (more deeply nested) than scope `b`, used to
+ * decide which of two equally-named visible bindings shadows the other. A nested
+ * scope is enclosed by its parent, so `a` is tighter when `b` contains `a`'s
+ * bounds. Falls back to {@link spanShorter} when neither strictly encloses the
+ * other (defensive — sibling scopes can't both be visible at one position).
+ */
+const scopeTighter = (a: Context, b: Context): boolean => {
+  const bEnclosesA = posLE(b.start, a.start) && posLE(a.stop, b.stop);
+  const aEnclosesB = posLE(a.start, b.start) && posLE(b.stop, a.stop);
+  if (bEnclosesA && !aEnclosesB) return true;
+  if (aEnclosesB && !bEnclosesA) return false;
+  return spanShorter(a, b);
 };
