@@ -29,6 +29,10 @@ import {
   lowerStringMethodCall,
   type StringBuiltinContext,
 } from "./builtins/strings.ts";
+import {
+  type ListBuiltinContext,
+  lowerListMethodCall,
+} from "./builtins/lists.ts";
 
 const raise = (err?: string | Error): never => {
   if (typeof err === "object" && err instanceof Error) throw err;
@@ -915,6 +919,20 @@ export const toWasm = async (ast: VLProgramNode) => {
     m.struct.get(LIST_BACKING, ref, lt.backing.refType, false);
   const listLen = (ref: number): number =>
     m.struct.get(LIST_LEN, ref, binaryen.i32, false);
+  const listCap = (ref: number): number =>
+    m.struct.get(LIST_CAP, ref, binaryen.i32, false);
+
+  // A stable per-module suffix for a list type's emitted helper names, keyed on
+  // the list heap type (the `arrayEqFns`-style cache pattern).
+  const listHelperTags = new Map<number, number>();
+  const listHelperTag = (lt: ListType): number => {
+    let t = listHelperTags.get(lt.heapType);
+    if (t === undefined) {
+      t = listHelperTags.size;
+      listHelperTags.set(lt.heapType, t);
+    }
+    return t;
+  };
 
   // A bounds-checked element read `l[i]` (trap on OOB — collections-design §VL.6):
   // stash the list ref and index in locals, trap when `(unsigned) i >= len` (which
@@ -1522,6 +1540,10 @@ export const toWasm = async (ast: VLProgramNode) => {
         // fall through to the normal closure dispatch below.
         const stringMethod = lowerStringMethodCall(stringBuiltinCtx, node);
         if (stringMethod !== null) return stringMethod;
+        // Intrinsic list methods (`l.get`/`l.push`/`l.pop`/`l.clear`) lower to
+        // their per-element wasm helpers; see `compiler/builtins/lists.ts`.
+        const listMethod = lowerListMethodCall(listBuiltinCtx, node);
+        if (listMethod !== null) return listMethod;
         // Calling an arbitrary expression value, e.g. `o.f(args)`. The callee
         // evaluates to a closure struct; dispatch through it.
         const functionType = node.functionType;
@@ -2757,6 +2779,26 @@ export const toWasm = async (ast: VLProgramNode) => {
     // literal `5` has type `IntegerLiteral`, which `boxPayload` can't classify).
     return boxUnion(info, tag, findVariant(info, nt) ?? null, value);
   };
+  // Build a `null` value in the representation of nullable `nullableType`
+  // (`T | null`): a boxed-union null tag, or a `ref.null` for a niche nullable
+  // reference (so `T[].get`/`pop` can yield absence in the union return rep).
+  const nullableNull = (nullableType: VLType): number => {
+    const info = unionInfo(nullableType);
+    if (info) return boxUnion(info, info.nullTag, null, null);
+    // `ref.null` takes a nullable ref *type* (not a bare heap type).
+    return m.ref.null(
+      binaryen.getTypeFromHeapType(refHeapType(nonNullable(nullableType)), true),
+    );
+  };
+  // Build a *present* value of nullable `nullableType` from a non-null `value`
+  // of element type `element`: box it into the union (scalar element), or pass
+  // the reference through (niche nullable ref).
+  const nullableSome = (
+    nullableType: VLType,
+    element: VLType,
+    value: number,
+  ): number => coerceToUnion(value, element, nullableType);
+
   const coerceUnion = (
     value: number,
     node: VLProgramNode | VLStatement,
@@ -2787,6 +2829,25 @@ export const toWasm = async (ast: VLProgramNode) => {
     codegenType,
     withDesiredType,
     toExpression,
+  };
+
+  // Context handed to the extracted list-method codegen (compiler/builtins).
+  const listBuiltinCtx: ListBuiltinContext = {
+    m,
+    binaryen,
+    i32Type,
+    listTypeOf,
+    toWasmType,
+    newLocal,
+    helpers: _helpers,
+    toExpression,
+    withDesiredType,
+    listBacking,
+    listLen,
+    listCap,
+    nullableNull,
+    nullableSome,
+    tagOf: listHelperTag,
   };
 
   // console.log(inspect(logSimplified(ast), { depth: Infinity }));
