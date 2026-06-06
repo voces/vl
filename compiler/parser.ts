@@ -1687,6 +1687,23 @@ export const parseProgram = (
           code: 2,
         });
       } else {
+        // A forward/mutual caller resolved this name during the pre-pass and
+        // captured the HOISTED signature object (`instantiateFunctionType`
+        // returns a non-generic signature by reference, so the call site's
+        // `functionType` *is* this object). The pre-pass scouts signatures
+        // before any `type` declaration is registered, so a struct-by-value
+        // param annotation (`c: Cur`) couldn't resolve `Cur` and was hoisted as
+        // `Never`. Patch the hoisted object's parameters in place now that the
+        // real pass has resolved them, so every forward caller observes the
+        // concrete struct type instead of the `Never` placeholder — otherwise
+        // codegen lowers a `Never` param and crashes. (Struct-array params
+        // worked because the array's element alias is wrapped in a structural
+        // `Object` whose own resolution did not hinge on the hoist ordering in
+        // the same way; the bare struct alias resolved straight to `Never`.)
+        const prior = enclosing[name];
+        if (hoisted && prior.type === "Function") {
+          prior.paramaters = selfType.paramaters;
+        }
         enclosing[name] = selfType;
         if (nameCtx) {
           fnBinding = declareBinding(
