@@ -21,6 +21,11 @@ const run = async (
   const cmd = new Deno.Command(BIN, {
     args,
     cwd,
+    // NO_COLOR keeps `check` output ANSI-free so text assertions stay clean
+    // (stdout is piped here anyway, so colors are already suppressed — belt
+    // and suspenders). Layered onto the inherited env so the binary still finds
+    // node_modules/binaryen, PATH, HOME, etc.
+    env: { ...Deno.env.toObject(), NO_COLOR: "1" },
     stdin: stdin === undefined ? "null" : "piped",
     stdout: "piped",
     stderr: "piped",
@@ -124,6 +129,43 @@ await Deno.writeTextFile(`${tmpDir}/notes.txt`, "skip me\n");
 }
 
 await Deno.remove(tmpDir, { recursive: true }).catch(() => {});
+
+// A file with one known type error, used by the diagnostic-rendering checks
+// below. `a = "x"` after `let a = 1` is an i32-vs-string assignment error whose
+// span covers the `"x"` literal on line 2 (1-based).
+const badFile = await Deno.makeTempFile({ suffix: ".vl" });
+await Deno.writeTextFile(badFile, `let a = 1\na = "x"\n`);
+
+// 8. default (pretty) check output — must contain the offending source line, a
+//    caret/tilde underline, the `at file:L:C` locator, and the summary, and
+//    must exit non-zero on an error.
+{
+  const r = await run(["check", badFile]);
+  const ok = r.code === 1 &&
+    r.stderr.includes(`a = "x"`) && // offending source line
+    /\^~*/.test(r.stderr) && // caret/tilde underline
+    r.stderr.includes(`at ${badFile}:2:5`) && // locator (1-based L:C)
+    r.stderr.includes("Found 1 error.") && // summary, singular
+    !r.stderr.includes("Found 1 errors."); // pluralization correct
+  check("check pretty default (carets + summary)", ok, r.stderr);
+}
+
+// 9. --concise reproduces the legacy one-line-per-diagnostic format exactly.
+{
+  const r = await run(["check", "--concise", badFile]);
+  const ok = r.code === 1 &&
+    r.stderr === `${badFile}: error [2:5] Type error: expected i32, got "x"`;
+  check("check --concise (legacy line)", ok, r.stderr);
+}
+
+// 10. clean single-file pretty check — exit 0 with the no-errors summary.
+{
+  const r = await run(["check", "samples/functions.vl"]);
+  const ok = r.code === 0 && /no errors\./.test(r.stderr);
+  check("check pretty clean summary (exit 0)", ok, r.stderr || `exit ${r.code}`);
+}
+
+await Deno.remove(badFile).catch(() => {});
 
 console.error("");
 if (failures > 0) {
