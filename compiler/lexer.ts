@@ -71,6 +71,7 @@ export type TokenKind =
   | "DOT"
   | "COLON"
   | "PIPE"
+  | "AMPERSAND"
   // Structural
   | "NEWLINE"
   | "EOF";
@@ -193,7 +194,9 @@ export const tokenize = (source: string): LexResult => {
     // Plain `//` (and `////+`) comments are dropped as trivia, exactly as before.
     if (c === "/" && source[i + 1] === "/") {
       let text = "";
-      while (i < len && source[i] !== "\n" && source[i] !== "\r") text += advance();
+      while (i < len && source[i] !== "\n" && source[i] !== "\r") {
+        text += advance();
+      }
       const isDoc = text.startsWith("///") && text[3] !== "/";
       if (isDoc) {
         // Strip the `///` and one optional leading space; keep the rest verbatim
@@ -329,4 +332,5 @@ const ONE_CHAR: Record<string, TokenKind> = {
   ".": "DOT",
   ":": "COLON",
   "|": "PIPE",
+  "&": "AMPERSAND",
 };

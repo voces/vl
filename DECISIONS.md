@@ -33,6 +33,16 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
   (`left: Tree | null`) hits the `Type`-vs-bare-`Object` false-negative the A11 traversal depends on,
   and `Never` is an upstream-error placeholder. Tightening only the non-alias-leaf case closes the
   soundness gap without re-introducing infinite recursion on self-references. (A12)
+- **Type negation is `!A`, not `not A`; the negated guard is `x !is T`.** Surface syntax for the
+  intersection/negation algebra: `A & B` (intersection, binds tighter than `|`), `!A` (negation, prefix,
+  binds tighter than `&`), and `x !is T` (negated type-guard). Rationale: VL already chose `!` over the
+  `not` keyword for boolean negation (B10), so a single negation token across values, types, and guards
+  keeps the surface consistent and reintroduces no `not` keyword. `x !is T` follows Kotlin's `!is`
+  (negate the operator) over C#'s `is not` / `is !T` — it reads cleanly and stays `!`-consistent; it
+  desugars to the existing `is` node with a `negated` flag and mirrors `is` narrowing (then-branch
+  subtracts `T`, else-branch narrows to `T`). Surface type negation is rare across languages (TS has only
+  the named `Exclude<A,B>`; set-theoretic systems write `¬t`/difference internally) — Whiley is the main
+  precedent for a `!`-style negation type. (A3/A4)
 
 ## Memory, runtime & object model
 

@@ -31,11 +31,13 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ✅ **A0. Type-algebra inventory.** `Alias`, `Function`, `Object` (structural + index sigs), literal
   types, `Union`, `Nullable`, `Intersection`, `Negation`, `Unknown`/`Infer` (resolving holes),
   `Never`, `Type`, `Custom`.
-- 🟡 **A3. Intersection types** (`A & B`). Done as narrowing algebra (`intersectType`, the then-branch
-  refinement; → `docs/narrowing.md`). REMAINING: surface syntax (`A & B` annotation) + uses beyond
-  narrowing.
-- 🟡 **A4. Negation types** (`not A`). Done as narrowing algebra (`subtractType`, the else-branch).
-  REMAINING: surface syntax (`not A`); full open-world negation tracking (needs A12).
+- 🟡 **A3. Intersection types** (`A & B`). Done: narrowing algebra (`intersectType`; → `docs/narrowing.md`)
+  + **surface syntax `A & B`** (parses, binds tighter than `|`, folds through `intersectType` at parse
+  time). REMAINING: object-type structural intersection (`{x} & {y}` merge — needs `intersectType`/`meet`
+  extension; today distinct objects meet to `Never`).
+- 🟡 **A4. Negation types** (`!A`). Done: narrowing algebra (`subtractType`) + **surface syntax `!A`** and
+  the negated type-guard **`x !is T`** (Kotlin-style; mirrors `is` narrowing inverted; → `DECISIONS.md`).
+  REMAINING: full open-world negation tracking (needs A12).
 - 🟡 **A5. Flow narrowing.** Done broadly — nullness, union-member (then `A` / else `U − A`),
   post-guard guard-clauses, `&&`/`||` chains (short-circuit, multi-place, De Morgan), else-of-else-if
   chaining, literal discrimination, `?.`/`??`. See **`docs/narrowing.md`**. REMAINING: `case`/multi-
@@ -108,8 +110,9 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   escaping closures. REMAINING: mutable captures (boxing / a mutable env cell).
 - 🟡 **B5. Objects.** Done on WasmGC structs — literals, read/write, nested, f64 fields, args/returns,
   reassignment, captured-in-closures, excess-property width subtyping, function-valued fields +
-  member-call. REMAINING: methods via `self`+UFCS (B14); method-shorthand `{ add(a,b) … }` (parser);
-  typed literals in object values (`{n: 4<i64>}`); Exact-by-default for values (A8).
+  member-call; **method-shorthand `{ add(a,b){…} }`** (parser desugar to a function-valued field — no
+  typecheck/codegen change). REMAINING: methods via `self`+UFCS (B14); typed literals in object values
+  (`{n: 4<i64>}`); Exact-by-default for values (A8).
 - 🟡 **B6. Collections — one user-facing collection, spelled `T[]`** (WasmGC; design + rationale:
   `docs/collections-design.md`). MVP done: the raw fixed-length array (literal/`a[i]`/`a[i]=v`/`a.length`,
   bounds-trap) is now the substrate, not a separate user tier. DECIDED: one growable collection **spelled
@@ -173,8 +176,9 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   (no `()`) as a bound value; mutation/variance (A9).
 - 🟡 **B15. Lambdas + the declaration-vs-value distinction.** Done (typed): a `FunctionDeclaration` in
   value position lowers to its closure value (let-bound, capturing, higher-order, inline object
-  fields). (Syntax + decl-vs-value decisions → `DECISIONS.md`.) REMAINING: **untyped** lambdas (a
-  stored closure has one signature — needs pinning-by-use or boxing); method-shorthand parser sugar.
+  fields). Method-shorthand `{ add(a,b){…} }` is done (parser desugar, see B5). (Syntax + decl-vs-value
+  decisions → `DECISIONS.md`.) REMAINING: **untyped** lambdas (a stored closure has one signature —
+  needs pinning-by-use or boxing).
 - ⬜ **B16. Redeclaration / overloading.** Current: same-scope redeclaration errors; nested shadowing
   is allowed (uniquified in codegen). Future: ad-hoc overloading? Default "no, one binding per name
   per scope" (→ `DECISIONS.md`).
@@ -223,7 +227,10 @@ D1/D2.*
   Idempotent + AST-preserving (corpus round-trip tested). REMAINING: line reflow/wrapping; LSP
   `textDocument/formatting` wiring (deferred to avoid the D6 PR).
 - ⬜ **D5. Semantic tokens.**
-- ⬜ **D6. Inlay hints** for inferred types — *the* feature for a "types are hidden" language.
+- ✅ **D6. Inlay hints** for inferred types — *the* feature for a "types are hidden" language. Inline
+  `: <type>` at unannotated `let`/`const`/params and omitted returns; annotated positions and unresolved
+  holes are suppressed. (Annotation detection is currently source-text heuristic in `lsp/`; a future
+  compiler-side `binding.annotated` flag would be the cleaner long-term source.)
 - ⬜ **D7. Cross-references in doc-comments** — expand `///` docs with clickable symbol links following
   established conventions (JSDoc `{@link Name}` / rustdoc intra-doc `` [`Name`] ``) rather than a bespoke
   syntax, resolving names via D2's symbol table definition spans for click-to-definition; single-file first,
