@@ -1,0 +1,63 @@
+// @run
+// @log 11
+// @log 4
+// CONTRACT (must-not-error, SOUNDNESS — P0-1): the AST-visitor pattern, the
+// sharpest form of the multi-narrower gap. A `Node` union lives in an arena
+// (`Node[]`), and a MUTUALLY-RECURSIVE pair `checkExpr` ↔ `checkStmt` each
+// `is`-narrows a same-named local `n` (read from the arena) and recurses through
+// the other. This is exactly what forced the H3 typechecker spike to collapse its
+// whole checker into one inlined `checkNode` mega-function.
+//
+// Two compounding bugs are pinned here:
+//   1. UNION ELEMENTS IN AN ARRAY LITERAL must be BOXED into the union rep — a
+//      `[{x:1}]` literal infers a bare variant element, but an `(A|B)[]` slot
+//      holds the `{tag,value}` box; a later `arr[i]` read (and its narrowing)
+//      expects the box. (Codegen ArrayLiteral prefers the desired union element.)
+//   2. The `narrowed` overlay must be FUNCTION-LOCAL: a callee instantiated from
+//      inside a caller's narrowed branch must not inherit the caller's same-named
+//      narrowing. (compileBody snapshots/clears/restores `narrowed`.)
+type NumLit = { tag: i32, value: i32 }
+type BinExpr = { tag: i32, left: i32, right: i32 }
+type RetStmt = { tag: i32, arg: i32 }
+type Node = NumLit | BinExpr | RetStmt
+
+// Sum the leaf values reachable through an expression tree, recursing into the
+// other visitor for statement-shaped nodes.
+function evalExpr(arena: Node[], ix: i32): i32 {
+  let n = arena[ix]
+  if n is NumLit { return n.value }
+  else if n is BinExpr { return evalExpr(arena, n.left) + evalExpr(arena, n.right) }
+  else { return evalStmt(arena, ix) }
+}
+
+// Statement visitor: narrows the SAME union, reads RetStmt's own `arg`, and calls
+// back into the expression visitor (mutual recursion through the union).
+function evalStmt(arena: Node[], ix: i32): i32 {
+  let n = arena[ix]
+  if n is RetStmt { return evalExpr(arena, n.arg) }
+  else { return evalExpr(arena, ix) }
+}
+
+// Count the nodes touched while walking — exercises both visitors narrowing the
+// union independently in the same program.
+function countExpr(arena: Node[], ix: i32): i32 {
+  let n = arena[ix]
+  if n is NumLit { return 1 }
+  else if n is BinExpr { return 1 + countExpr(arena, n.left) + countExpr(arena, n.right) }
+  else { return countStmt(arena, ix) }
+}
+function countStmt(arena: Node[], ix: i32): i32 {
+  let n = arena[ix]
+  if n is RetStmt { return 1 + countExpr(arena, n.arg) }
+  else { return countExpr(arena, ix) }
+}
+
+// arena: 0=NumLit 4, 1=NumLit 7, 2=BinExpr(0,1), 3=RetStmt(2)
+let arena: Node[] = [
+  { tag: 0, value: 4 },
+  { tag: 0, value: 7 },
+  { tag: 1, left: 0, right: 1 },
+  { tag: 2, arg: 2 }
+]
+print(evalStmt(arena, 3))   // 11  (4 + 7, via RetStmt → BinExpr)
+print(countStmt(arena, 3))  // 4   (RetStmt + BinExpr + 2 NumLit leaves)
