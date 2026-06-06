@@ -14,6 +14,10 @@
 //   // @info TEXT        expect an info diagnostic containing TEXT
 //   // @hint TEXT        expect a hint diagnostic containing TEXT
 //   // @log TEXT         assert the Nth `log` line equals TEXT (ordered; @run)
+//   // @trap TEXT        @run, but expect a runtime trap whose VL-located error
+//                        message contains TEXT (e.g. "out of bounds"). The wasm
+//                        is run WITH its source map so the message is mapped to
+//                        `file:line:column` (roadmap B-debug).
 //   // @skip REASON      register the test but skip it (REASON documents why)
 //
 // STRICT BY DEFAULT: a test fails on ANY diagnostic it did not declare — every
@@ -32,6 +36,7 @@ import {
   compile,
   runWasm,
   type VLDiagnostic,
+  VLRuntimeError,
 } from "../compiler/compile.ts";
 
 const CASES_DIR = new URL("./cases/", import.meta.url);
@@ -44,6 +49,12 @@ type Directives = {
   infos: string[];
   hints: string[];
   logs: string[];
+  /**
+   * Expected substrings of a runtime trap's mapped error message (@trap). When
+   * non-empty the test runs in @run mode and asserts a trap whose message
+   * contains EVERY listed substring (reason and/or `line:col`).
+   */
+  trap: string[];
   unknown: string[];
   skip: string | null;
 };
@@ -57,6 +68,7 @@ const parseDirectives = (src: string): Directives => {
     infos: [],
     hints: [],
     logs: [],
+    trap: [],
     unknown: [],
     skip: null,
   };
@@ -98,6 +110,10 @@ const parseDirectives = (src: string): Directives => {
       }
       case "log":
         d.logs.push(rest);
+        break;
+      case "trap":
+        d.mode = "run";
+        d.trap.push(rest);
         break;
       case "skip":
         d.skip = rest || "no reason given";
@@ -162,7 +178,9 @@ for (const file of files) {
         );
       }
 
-      const { diagnostics, wasm } = await quiet(() => compile(src));
+      const { diagnostics, wasm, sourceMap } = await quiet(() =>
+        compile(src, name)
+      );
       const errs = errorMessages(diagnostics);
 
       for (const want of d.errors) {
@@ -255,9 +273,24 @@ for (const file of files) {
         "error",
         "@error",
       );
-      unexpected(warns, (m) => d.warnings.some((w) => m.includes(w)), "warning", "@warning");
-      unexpected(infos, (m) => d.infos.some((w) => m.includes(w)), "info", "@info");
-      unexpected(hints, (m) => d.hints.some((w) => m.includes(w)), "hint", "@hint");
+      unexpected(
+        warns,
+        (m) => d.warnings.some((w) => m.includes(w)),
+        "warning",
+        "@warning",
+      );
+      unexpected(
+        infos,
+        (m) => d.infos.some((w) => m.includes(w)),
+        "info",
+        "@info",
+      );
+      unexpected(
+        hints,
+        (m) => d.hints.some((w) => m.includes(w)),
+        "hint",
+        "@hint",
+      );
 
       if (d.mode === "run") {
         if (!wasm) {
@@ -265,12 +298,44 @@ for (const file of files) {
             `@run but no wasm was produced; errors: ${JSON.stringify(errs)}`,
           );
         }
-        const { logs } = await quiet(() => runWasm(wasm));
-        if (JSON.stringify(logs) !== JSON.stringify(d.logs)) {
-          throw new Error(
-            `log mismatch\n  expected: ${JSON.stringify(d.logs)}\n` +
-              `  actual:   ${JSON.stringify(logs)}`,
-          );
+        if (d.trap.length) {
+          // Expect a runtime trap whose VL-located message contains every
+          // declared substring. Run with the source map so the message is
+          // mapped to `file:line:column` (roadmap B-debug).
+          let thrown: unknown;
+          try {
+            await quiet(() => runWasm(wasm, sourceMap));
+          } catch (err) {
+            thrown = err;
+          }
+          if (!(thrown instanceof VLRuntimeError)) {
+            throw new Error(
+              `@trap expected a runtime trap, but the program ` +
+                (thrown
+                  ? `threw ${(thrown as Error).name}: ${
+                    (thrown as Error).message
+                  }`
+                  : `ran without trapping`),
+            );
+          }
+          for (const want of d.trap) {
+            if (!thrown.message.includes(want)) {
+              throw new Error(
+                `@trap message mismatch\n  expected to contain: ${
+                  JSON.stringify(want)
+                }\n` +
+                  `  actual:              ${JSON.stringify(thrown.message)}`,
+              );
+            }
+          }
+        } else {
+          const { logs } = await quiet(() => runWasm(wasm, sourceMap));
+          if (JSON.stringify(logs) !== JSON.stringify(d.logs)) {
+            throw new Error(
+              `log mismatch\n  expected: ${JSON.stringify(d.logs)}\n` +
+                `  actual:   ${JSON.stringify(logs)}`,
+            );
+          }
         }
       }
     },
