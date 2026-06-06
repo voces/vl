@@ -110,36 +110,39 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   reassignment, captured-in-closures, excess-property width subtyping, function-valued fields +
   member-call. REMAINING: methods via `self`+UFCS (B14); method-shorthand `{ add(a,b) … }` (parser);
   typed literals in object values (`{n: 4<i64>}`); Exact-by-default for values (A8).
-- 🟡 **B6. Collections — `List` is THE user-facing collection** (WasmGC; design + rationale:
+- 🟡 **B6. Collections — one user-facing collection, spelled `T[]`** (WasmGC; design + rationale:
   `docs/collections-design.md`). MVP done: the raw fixed-length array (literal/`a[i]`/`a[i]=v`/`a.length`,
-  bounds-trap) is now `List`'s substrate, not a separate user tier. DECIDED: `List` is the primary
-  collection (a `{backing,len,cap}` struct), `[...]` constructs a `List` (scripting-feel default), 2×
-  growth, monomorphized-not-boxed; **indexing traps on OOB** (`a[i]: T`) with **`.get(i): T | null`** the
-  safe accessor, while **`Map[k]: V | null`** (Rust/Swift split — sequence index traps, map lookup is
-  optional); and **representation is inferred** — `List` is the one semantic model, but the compiler lowers
-  never-grown values to a header-less fixed array (a safe optimization that degrades to `List` when
-  unproven). `DECISIONS.md` entry lands with implementation.
-- ⬜ **B6a. `Map` + `Set`** — the "usable for modding" trio with `List` (a scripting language needs all
-  three). `List` lands first; `Map`/`Set` ride the same intrinsic floor. `Map[k]: V | null` (missing key =
+  bounds-trap) is now the substrate, not a separate user tier. DECIDED: one growable collection **spelled
+  `T[]`** with `[...]` its literal (scripting-feel default), `{backing,len,cap}` rep, 2× growth,
+  monomorphized-not-boxed; **indexing traps on OOB** (`a[i]: T`) with **`.get(i): T | null`** the safe
+  accessor, while **`Map[k]: V | null`** (Rust/Swift split — sequence index traps, map lookup is optional);
+  and **representation is inferred** — the compiler lowers never-grown values to a header-less fixed array
+  (a safe optimization, degrades to the growable rep when unproven). **The names `List`/`Array` are
+  UNCOMMITTED** (design vocabulary only; `T[]` + inference is the whole committed surface — no user-facing
+  way to force a representation yet). `DECISIONS.md` entry lands with implementation.
+- ⬜ **B6a. `Map` + `Set`** — the "usable for modding" trio with `T[]` (a scripting language needs all
+  three). `T[]` lands first; `Map`/`Set` ride the same intrinsic floor. `Map[k]: V | null` (missing key =
   normal absence). **Deterministic insertion-order iteration** (multiplayer/replay reproducibility).
   Deferred.
 - ⬜ **B6b. Collections building blocks & open items** (all detail in `docs/collections-design.md`).
-  - **Prerequisite intrinsics** — the two-primitive floor `List` is built over: dynamic-length
+  - **Prerequisite intrinsics** — the two-primitive floor the collection is built over: dynamic-length
     `__array_new__`/`__array_new_default__` + bulk `__array_copy__`, thin `defaultScope` intrinsics. The
-    building block before `List`.
-  - **Std-over-primitives** — write `List`/collections (and opportunistically `print`) as `.vl` std, not
+    building block before the collection itself.
+  - **Std-over-primitives** — write the collection (and opportunistically `print`) as `.vl` std, not
     compiler-privileged types (ties to H3). Open dependency: no module system yet.
   - **Indexing perf** (DECIDED resolutions; sub-choices/analysis open) — native-indexing flag (drops the
     B13 indirect call; nominal-vs-annotation open), backing-pointer hoisting (LICM), and bounds-narrowing
     (now an optimization, not a prerequisite, since trap-on-OOB is already a bare `array.get`).
   - **Representation inference** (DECIDED direction; analysis is new open compiler work) — infer
-    fixed-array vs growable `List` from usage; interprocedural + alias-unioned; co-design with variance
-    (A9). Subsumes the old constant-literal optimization and most of the raw-array escape.
+    fixed-array vs growable rep from usage; interprocedural + alias-unioned; co-design with variance (A9).
+    Subsumes the old constant-literal optimization and most of the raw-array escape.
+  - **Naming & forcing surface — UNCOMMITTED** — the names `List`/`Array` and any annotation to *force* a
+    representation (vs the inferred default) are deliberately open; `T[]` + inference is the committed surface.
   - **Language-wide, still open** — value-vs-reference (default reference; also gates the inference
     analysis), the error model ("results for expected absence, traps for bugs").
   - **Deferred** — per-frame pooling beyond capacity-retaining `clear()` (kept in v1); a user-facing
     low-level array escape (only the FFI/SIMD/linear-memory case remains, post-inference).
-  - **Remaining open questions** — capacity/seed construction; `map`/`filter` return type.
+  - **Remaining open questions** — capacity/seed construction spelling; `map`/`filter` return type.
 - 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
   `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.

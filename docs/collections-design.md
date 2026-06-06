@@ -1,33 +1,46 @@
-# VL collections design — `List`, VL's one user-facing collection (B6)
+# VL collections design — VL's one user-facing collection, spelled `T[]` (B6)
 
 > Status: **design / research only.** No compiler code exists for this yet. This
 > document is the mental model and the decision record for VL's primary
-> collection — the growable `List` — so the follow-up implementation PR can be
-> small and uncontested. It deliberately surveys how other languages do it, then
-> commits to a concrete shape for VL's WasmGC backend with rationale and rejected
-> alternatives.
+> collection — the growable sequence written `T[]` — so the follow-up
+> implementation PR can be small and uncontested. It deliberately surveys how other
+> languages do it, then commits to a concrete shape for VL's WasmGC backend with
+> rationale and rejected alternatives.
+
+> **Naming caveat (read first).** The committed *user-facing spelling* is the type
+> `T[]` and the literal `[...]` — that is all a program ever writes for now. The
+> names **`List`** (the growable representation) and **`Array`** (the fixed
+> representation) are used throughout this document as **design vocabulary only and
+> are *uncommitted*** — no decision has been made to expose either name to users,
+> and there is deliberately **no user-facing way to *force* a representation yet**
+> (it is always inferred, §VL.7). Read every "`List<T>`" / "`Array<T>`" below as
+> "the growable / fixed *representation* (provisional name)", not as a committed
+> surface type. The forcing annotations and their spellings (§VL.7, §OQ.7) are an
+> explicitly uncommitted future surface.
 
 ## Summary / recommendation
 
-**`List` is VL's one user-facing collection** — a growable, ordered, indexable
-sequence, and the substrate for `map`/`filter`, builders, and the H2 self-hosting
-collections work (`ROADMAP` A10 + B6). `[...]` constructs a `List`. The raw
-fixed-length WasmGC `array` is **not** a coexisting everyday type the programmer
-chooses between; it survives in two non-user-facing roles: (i) `List`'s internal
-**substrate** (the `backing` field, allocated/copied via the
-`array.new`/`array.copy` intrinsics), and (ii) an **inferred representation** —
-when the compiler can prove a `List`-typed value is never grown, it lowers that
-value to a header-less fixed array (raw-array speed, no `{len,cap}` header, no
-indirection) *without changing the program's `List` mental model* (§VL.6). The
-fixed-array MVP is done; this design promotes it into `List` rather than leaving it
-as the default literal, and reuses it as the cheap inferred representation
-underneath.
+**VL has one user-facing collection, spelled `T[]`** — a growable, ordered,
+indexable sequence (provisionally named `List` in this doc), and the substrate for
+`map`/`filter`, builders, and the H2 self-hosting collections work (`ROADMAP` A10 +
+B6). `[...]` constructs one. The raw fixed-length WasmGC `array` is **not** a
+coexisting everyday type the programmer chooses between; it survives in two
+non-user-facing roles: (i) the internal **substrate** (the `backing` field,
+allocated/copied via the `array.new`/`array.copy` intrinsics), and (ii) an
+**inferred representation** — when the compiler can prove a `T[]` value is never
+grown, it lowers that value to a header-less fixed array (raw-array speed, no
+`{len,cap}` header, no indirection) *without changing the program's mental model*
+(§VL.6). The fixed-array MVP is done; this design promotes it into the `T[]`
+collection rather than leaving it as the default literal, and reuses it as the
+cheap inferred representation underneath.
 
 **Decided this review round** (recorded here; the `DECISIONS.md` entry lands with
-implementation, not before): the type is named **`List`**, **`[...]` is a `List`
-literal** (the scripting-feel default — Python/JS/Ruby/Swift), the **growth
-factor is 2×** for v1, **indexing traps on out-of-bounds** — `a[i]` / `List[i]`
-yield `T` and **trap** on OOB (an unrecoverable-bug signal — loud, not silent),
+implementation, not before): the user-facing collection is **spelled `T[]`** with
+**`[...]` its literal** (the scripting-feel default — Python/JS/Ruby/Swift) — the
+*name* `List` (and a fixed-form `Array`) is **uncommitted** design vocabulary, not
+a decided surface type; the **growth factor is 2×** for v1, **indexing traps on
+out-of-bounds** — `a[i]` yields `T` and **traps** on OOB (an unrecoverable-bug
+signal — loud, not silent),
 with **`.get(i): T | null`** the safe, checked opt-in accessor; and **`Map[k]`
 returns `V | null`** (a missing key is a *normal, expected* map result, not a
 bug). This is the Rust/Swift convergence: indexing a *sequence* panics/traps and
@@ -70,11 +83,13 @@ Recommendation in one screen:
    pair per concrete `T`: native `array.get`/`array.set`, no `anyref` boxing, no
    unbox-on-read. This matches the soundness contract (no `dynamic`, every value
    pinned to a concrete type) and the existing array performance path. (§VL.3)
-4. **Surface API.** The **`[...]` literal constructs a `List`** (`[0, 1, 2]` seeds
-   a three-element list — the scripting-feel default). `List<T>()` makes an empty
-   typed list and `List<T>(capacity: n)` a pre-sized one (named-param, unambiguous
-   vs a positional element — VL has no variadics or overloading, §VL.4, so the seed
-   path is the literal, not a variadic `List(...)`). `push`/`pop`/`map`/`filter` are
+4. **Surface API.** The **committed user surface is the `[...]` literal and the
+   `T[]` type** (`[0, 1, 2]` seeds a three-element collection — the scripting-feel
+   default). Empty construction and pre-sized (capacity) construction are needed
+   *capabilities*, but their **spelling is uncommitted** (the doc sketches them as
+   `List<T>()` / `List<T>(capacity: n)` using named params, since VL has no variadics
+   or overloading, §VL.4 — but those names are provisional, not decided).
+   `push`/`pop`/`map`/`filter` are
    `self`-methods (parens — they compute, B14). `l[i]` / `l[i] = v` route through the
    B13 `"[]"`/`"[]="` index traps (assumed to land in parallel) — though a
    **type-level native-indexing flag** (§VL.6) lets `List`'s `[]`/`[]=`/`.length`
@@ -377,16 +392,20 @@ is the Java mistake (`List<Integer>` boxing) we have the type system to avoid.
 
 ### VL.4 — Surface API / spelling
 
-The guiding decision: **`[...]` is a `List` literal.** `[a, b, c]` constructs a
-three-element `List` — the scripting-feel default (Python/JS/Ruby/Swift). There is
-no coexisting user-facing fixed-array literal; the raw fixed array is `List`'s
-substrate and a low-level escape (§VL.6/§OQ.7), not a thing `[...]` ever means.
+The guiding decision: **`[...]` is the collection literal and `T[]` is the type.**
+`[a, b, c]` constructs a three-element collection — the scripting-feel default
+(Python/JS/Ruby/Swift). There is no coexisting user-facing fixed-array literal; the
+raw fixed array is the substrate and inferred representation (§VL.6/§VL.7), not a
+thing `[...]` ever means. (Reminder per the naming caveat: `List`/`Array` below are
+*uncommitted* representation names, not surface types.)
 
-- **Construction.** `[0, 1, 2]` (seed via literal) is the everyday form. `List<T>()`
-  makes an empty typed list and `List<T>(capacity: n)` a pre-sized one. `List` is a
-  builtin generic shape resolved by the checker, lowered by name in `toWasm.ts` (the
-  same pattern string methods use — types in defaultScope, lowering in toWasm, *no
-  typecheck special-casing of a keyword*).
+- **Construction.** `[0, 1, 2]` (seed via literal) is the everyday, committed form.
+  Empty and pre-sized (capacity) construction are needed capabilities whose
+  **spelling is uncommitted**; the doc sketches them as `List<T>()` /
+  `List<T>(capacity: n)`. Whatever the final spelling, it is a builtin generic shape
+  resolved by the checker and lowered by name in `toWasm.ts` (the same pattern string
+  methods use — types in defaultScope, lowering in toWasm, *no typecheck
+  special-casing of a keyword*).
 
   **The `List(0)` ambiguity the owner raised — "is `0` an element or a capacity?"**
   VL **has named parameters** (call-site `f(name: value)`; the checker consumes the
@@ -399,9 +418,9 @@ substrate and a low-level escape (§VL.6/§OQ.7), not a thing `[...]` ever means
   binding per name per scope — DECISIONS B16), so an element-seeding `List(...)`
   would need both variadic arity *and* a second `List` binding overloading the
   capacity constructor — neither exists. Seeded construction is the **`[...]`
-  literal** instead, which is exactly why the literal *is* the `List` literal. The
-  construction surface is therefore: **`[...]`** (seed), **`List<T>()`** (empty),
-  **`List<T>(capacity: n)`** (named).
+  literal** instead, which is exactly why the literal *is* the collection literal.
+  The construction surface is therefore: **`[...]`** (seed), and the empty/capacity
+  forms (uncommitted spelling, sketched as **`List<T>()`** / **`List<T>(capacity: n)`**).
 
   (Clarification: `self` is a **first-position positional convention**, *not* a
   call-site named argument. A function whose first parameter is named `self` is a
@@ -469,8 +488,8 @@ substrate and a low-level escape (§VL.6/§OQ.7), not a thing `[...]` ever means
 
 This ties into every existing feature (B13 index traps, B14 self-methods,
 DECISIONS B6 uniform-access size members, A10 monomorphization) without adding a
-new dispatch mechanism; `[...]` is now the `List` literal, so there is no
-fixed-array literal to fight.
+new dispatch mechanism; `[...]` is now the collection literal (type `T[]`), so there
+is no fixed-array literal to fight.
 
 ### VL.5 — Interaction with `length` and the index traps
 
@@ -657,17 +676,20 @@ designed-but-deferred — they are worth pinning now so the surface is coherent:
   `drain` (remove + yield) / `split_off` (cut in two). The verb choice is part of
   the deferred decision, not settled here.
 
-### VL.7 — Representation inference: `List` is the model, fixed-array is an inferred lowering
+### VL.7 — Representation inference: `T[]` is the model, fixed-array is an inferred lowering
 
-**The decision.** There is **one user-facing collection and one literal** — `List`,
-spelled `[...]` — and that is the entire mental model the programmer carries. The
-compiler then **infers the representation**: a `List`-typed value is lowered to a
-**header-less fixed WasmGC array** when it can prove the value (and every alias of
-it) is *never grown*, and to the full `{ backing, len, cap }` `List` struct (§VL.1)
-otherwise. The choice is **invisible to semantics** — both representations index the
-same way (trap on OOB, `.get(i): T | null`), allow in-place element writes
-(`a[i] = v`), report `.length`, and iterate identically — and visible only in speed
-and footprint.
+**The decision.** There is **one user-facing collection and one literal** — the type
+`T[]`, constructed with `[...]` — and that is the entire mental model the programmer
+carries. The compiler then **infers the representation**: a `T[]` value is lowered to
+a **header-less fixed WasmGC array** when it can prove the value (and every alias of
+it) is *never grown* (the "`Array`" representation), and to the full
+`{ backing, len, cap }` struct (§VL.1; the "`List`" representation) otherwise. The
+choice is **invisible to semantics** — both representations index the same way (trap
+on OOB, `.get(i): T | null`), allow in-place element writes (`a[i] = v`), report
+`.length`, and iterate identically — and visible only in speed and footprint.
+**For now this inference is the *only* mechanism** — there is no user-facing way to
+force a representation (the override below is future/uncommitted), so `T[]` plus
+inference is the whole committed surface.
 
 **Why this is the right shape for VL specifically.** It is the same move VL already
 makes everywhere else: *the type/representation is hidden and inferred from how the
@@ -741,20 +763,28 @@ work (A9) needs, and the two should be designed together: a param typed as a
 *readable* sequence admits both representations; a param that grows its argument
 constrains it to the growable one.
 
-**The escape hatch: annotation overrides inference.** Inference is the default, not
-a straitjacket. An explicit annotation forces a representation when the programmer
-knows better than the local analysis — e.g. `let a: List<T> = []` to force the
-growable representation and `reserve` ahead of a fill the analysis can't yet see,
-or (if/when spelled) a fixed-array annotation to *require* the lean one and get a
-compile error if some code path would grow it. Inference-by-default,
-annotation-to-override — the same posture VL takes for types.
+**The escape hatch: annotation overrides inference — UNCOMMITTED / future.** A
+natural future extension is to let an explicit annotation *force* a representation
+when the programmer knows better than the analysis — e.g. force the growable form to
+`reserve` ahead of a fill the analysis can't yet see, or force the fixed form to
+*require* the lean one and get a compile error if some code path would grow it. This
+would mean **nameable representations** — provisionally `List<T>` (force growable) and
+`Array<T>` (force fixed, growth ops become type errors), with `T[]` remaining the
+inferred default — making `T[]` in a parameter position read as the readable-sequence
+supertype that accepts either (the variance/A9 tie-in). **None of this is committed**:
+the forcing forms, the names `List`/`Array`, and whether to expose forcing at all are
+deliberately left open. For now the surface is `T[]` + inference, full stop. (Note: a
+*safe* fixed-form `Array<T>` here is a different thing from the *unsafe low-level*
+memory escape historically also called `Array<T>` in §OQ.7 — if both are ever
+pursued, the name clash must be resolved.)
 
-**Status.** The *decision* (one `List` model; fixed-array as inferred
-representation; never-wrong fallback) is taken this round. The *analysis* — the
-interprocedural growth-detection + alias unification — is **new open compiler work**
-(§OQ.4), gated in difficulty by the value-vs-reference call (§OQ.2) and best
-co-designed with variance (A9). It is explicitly fine for v1 to ship the
-conservative version (or even List-only first) and tighten later.
+**Status.** The *decision* (one `T[]` model; fixed-array as inferred representation;
+never-wrong fallback) is taken this round. The *analysis* — the interprocedural
+growth-detection + alias unification — is **new open compiler work** (§OQ.4), gated
+in difficulty by the value-vs-reference call (§OQ.2) and best co-designed with
+variance (A9). The *user-facing names* (`List`/`Array`) and any *forcing* surface are
+**uncommitted** (above). It is explicitly fine for v1 to ship the conservative
+inference (or even single-representation-first) and tighten later.
 
 ---
 
@@ -805,19 +835,22 @@ here** — this is the plan the design commits to.
    conservative default to growable `List` when unproven. Shippable as a later pass
    — the core `List` above is correct without it.
 9. **Docs.** Flip `ROADMAP` B6 to a one-line done marker; add a terse
-   DECISIONS entry (`List` is the one user-facing collection + `[...]`=`List` +
-   2× growth + monomorphized-not-boxed + grow-only + **trap-on-OOB indexing with
-   `.get(i): T | null`** + native-indexing flag + **fixed-array as inferred
+   DECISIONS entry (one user-facing collection **spelled `T[]`** + `[...]` literal,
+   the *names* `List`/`Array` **uncommitted** + 2× growth + monomorphized-not-boxed +
+   grow-only + **trap-on-OOB indexing with `.get(i): T | null`** (and
+   `Map[k]: V | null`) + native-indexing flag + **fixed-array as inferred
    representation**, with the "WasmGC has no realloc/free so the golden-ratio
    argument doesn't apply" rationale). This design doc stays as the mental model.
 
 ## Open questions for the owner
 
-1. **List literal syntax — DECIDED this review (no longer open).** `[...]` is the
-   **`List` literal** (the scripting-feel default — Python/JS/Ruby/Swift). The raw
-   fixed array is `List`'s substrate + an optional low-level escape (§OQ.7), not a
-   coexisting `[...]` meaning, so there is no fork left to resolve. (Kept here as a
-   numbered marker; the live questions are §OQ.2 onward.)
+1. **Literal & type spelling — DECIDED this review (no longer open).** `[...]` is the
+   **collection literal** and **`T[]` the type** (the scripting-feel default —
+   Python/JS/Ruby/Swift). The raw fixed array is the substrate + inferred
+   representation (§VL.7), not a coexisting `[...]` meaning, so there is no fork left
+   to resolve. **Open sub-point (deliberately uncommitted):** the *names* `List` /
+   `Array` and any *forcing* annotation surface (§VL.7) — for now `T[]` + inference
+   is the whole committed surface. (The live questions are §OQ.2 onward.)
 2. **Value vs reference — language-wide (default reference).** Not a
    collections-only question: there is no sound case for `List` being a value
    type while VL objects stay reference. v1 default = **reference everywhere**
@@ -879,28 +912,33 @@ here** — this is the plan the design commits to.
 6. **`map`/`filter` result type.** Should producers return a `List<U>` (proposed)
    or a raw array? Returning a `List` keeps the chain growable and composable.
 7. **Raw fixed array as a *low-level* escape — now largely subsumed by §VL.7.** The
-   raw fixed array is `List`'s substrate from day one *and* the inferred
-   representation (§VL.7) for never-grown values — so the common reason to reach for
-   a fixed array (no header, no indirection, raw `array.get`) is now delivered
-   automatically under the ordinary `[...]`/`List` surface. What *remains* an open
-   question is only the genuinely **low-level memory-addressing escape** — an
-   advanced `Array<T>` / unsafe primitive for **FFI / SIMD / linear-memory** targets
-   if VL ever addresses memory directly — which is a deliberately advanced/future
-   surface, not v1. (The old "constant/read-only-literal optimization" is no longer a
-   separate item: a compile-time `[1,2,3]` is just one case the §VL.7 growth analysis
-   proves fixed, and it is lowered as such — still a `List` to the program.)
+   raw fixed array is the substrate from day one *and* the inferred representation
+   (§VL.7) for never-grown values — so the common reason to reach for a fixed array
+   (no header, no indirection, raw `array.get`) is now delivered automatically under
+   the ordinary `[...]`/`T[]` surface. What *remains* an open question is only the
+   genuinely **low-level memory-addressing escape** — an advanced unsafe primitive
+   for **FFI / SIMD / linear-memory** targets if VL ever addresses memory directly —
+   a deliberately advanced/future surface, not v1. **Name-clash warning:** this
+   low-level escape is sometimes sketched as `Array<T>`, but §VL.7 also provisionally
+   uses `Array<T>` for the *safe* fixed representation; both names are uncommitted and
+   if both surfaces are ever pursued the clash must be resolved. (The old
+   "constant/read-only-literal optimization" is no longer a separate item: a
+   compile-time `[1,2,3]` is just one case the §VL.7 growth analysis proves fixed,
+   and it is lowered as such — still a `T[]` value to the program.)
 
 ---
 
 ## Language vs standard library, primitive surface, and syntax
 
-The sections above settle the *representation* of the list (the `{backing, len,
+The sections above settle the *representation* of the collection (the `{backing, len,
 cap}` struct, 2× growth, monomorphized-not-boxed elements) and the *syntax*
-(`[...]` = `List`). This section answers a deeper set of questions the owner raised:
-**where** `List` should live (baked into the language vs. written in VL over a small
-intrinsic surface), **what primitive** the compiler would have to expose for `List`
-to be written in VL at all, and whether `print` belongs in the same bucket. LS.4
-records the now-**decided** `[...]`=`List` syntax call and the reasoning behind it.
+(`[...]` literal, type `T[]`). This section answers a deeper set of questions the
+owner raised: **where** the collection should live (baked into the language vs.
+written in VL over a small intrinsic surface), **what primitive** the compiler would
+have to expose for it to be written in VL at all, and whether `print` belongs in the
+same bucket. LS.4 records the now-**decided** `[...]`/`T[]` syntax call and the
+reasoning behind it. (Per the naming caveat, `List` below is the uncommitted name for
+the std collection/representation.)
 These are forward-looking; the lang-vs-std / primitive-surface choices are not yet
 in `DECISIONS.md` (they land with implementation).
 
@@ -1072,12 +1110,12 @@ reason to do it now, and the current single dispatch branch is small. Recommende
 posture: migrate `print` to a std VL dispatcher **opportunistically, as part of the
 H3 port** (when the std module exists anyway), not as standalone work.
 
-### LS.4 — Syntax: `[...]` is the `List` literal (DECIDED)
+### LS.4 — Syntax: `[...]` is the collection literal, `T[]` the type (DECIDED)
 
 VL inherited the **MVP convention that `[...]` was a *fixed-length* array literal**
 (`array.new_fixed`, length = element count). This review **flips it**: `[...]` is the
-**`List` literal**. That matches what the *scripting* languages VL aims its
-"scripting feel" at all do:
+**growable-collection literal** (type `T[]`). That matches what the *scripting*
+languages VL aims its "scripting feel" at all do:
 
 - **`[...]` is the growable list** in Python, JavaScript, Ruby, and Swift; the
   *fixed*-size array is the niche case with a distinct, heavier spelling: Rust
@@ -1087,26 +1125,27 @@ VL inherited the **MVP convention that `[...]` was a *fixed-length* array litera
   language whose pitch is "scripting feel with hidden types," the growable list is
   the *common* case, so the common case should get the ergonomic literal.
 
-**The decision: `[...]` constructs a `List`** (the scripting-feel default). The raw
-fixed array is **not** a coexisting `[...]` meaning — it is `List`'s substrate and an
-optional low-level escape (§VL.6/§OQ.7). This is the right default-vs-opt-in split
-for a high-level language: the everyday literal grows; reaching *below* `List` to a
-header-less contiguous array is the deliberate, advanced choice (as `[T; N]` /
-`[N]T` are in Rust/Go).
+**The decision: `[...]` constructs the `T[]` collection** (the scripting-feel
+default). The raw fixed array is **not** a coexisting `[...]` meaning — it is the
+substrate and the *inferred* representation (§VL.6/§VL.7). VL goes one better than
+the Rust/Go split: instead of making the programmer *choose* fixed vs growable, the
+common literal is growable-by-default and the compiler *infers* the header-less fixed
+representation where it can prove it (§VL.7) — so the "reach below to a fixed array"
+choice is normally automatic, not a separate spelling.
 
 What the decision entails (the implementation work, not a reopening):
-- A compile-time `[1, 2, 3]` lowers to a `List` whose backing is built via
-  `array.new_fixed` (and, when provably constant/read-only, a `const` backing — the
-  §VL.6 optimization). The §LS.2 dynamic-alloc primitive backs the growth path.
+- A compile-time `[1, 2, 3]` lowers to a backing built via `array.new_fixed`; when
+  the §VL.7 analysis proves it never grows, the value *is* that fixed array (no
+  header). The §LS.2 dynamic-alloc primitive backs the growth path.
 - The empty `[]` literal needs its element type from context (annotation /
-  unification) exactly like any other inference hole — `List<T>()` is the explicit
-  empty form when there is nothing to infer from.
-- If/when a user-facing **low-level escape** is exposed, it gets a distinct,
-  deliberately-heavier spelling (e.g. `[T; N]`-style or `Array<T>`) — not `[...]`
-  (§OQ.7). It is never the default.
+  unification) exactly like any other inference hole; the explicit empty-construction
+  *spelling* is uncommitted (sketched as `List<T>()`).
+- If/when a user-facing **forcing** annotation or **low-level escape** is exposed, it
+  gets a distinct spelling — uncommitted, never `[...]`, never the default (§VL.7/§OQ.7).
 
 (This supersedes the earlier "ship `List(...)` first, keep `[...]` fixed" posture:
-the owner has decided to unify on `List` with `[...]` as its literal from the start.)
+the owner has decided to unify on the `T[]` collection with `[...]` as its literal
+from the start. The *name* `List` remains uncommitted — see the naming caveat.)
 
 ### LS.5 — Recommendation summary
 
@@ -1125,9 +1164,10 @@ the owner has decided to unify on `List` with `[...]` as its literal from the st
 - **`print`:** already thin-intrinsics underneath (`__print_T__` sinks); the
   *dispatcher* could become std VL too, but it needs no new primitive — migrate it
   **opportunistically during the H3 port**, low priority.
-- **Syntax (DECIDED):** `[...]` is the **`List` literal** (scripting-feel default —
-  Python/JS/Ruby/Swift). The raw fixed array is `List`'s substrate + an optional
-  low-level escape (a deliberately-heavier spelling), never the default `[...]`.
+- **Syntax (DECIDED):** `[...]` is the **collection literal** and **`T[]`** the type
+  (scripting-feel default — Python/JS/Ruby/Swift). The raw fixed array is the
+  substrate + inferred representation (§VL.7), never the default `[...]`. The *names*
+  `List`/`Array` and any forcing spelling are **uncommitted**.
 
 ### LS.6 — Updated sequencing note
 
@@ -1165,7 +1205,8 @@ std-module *loading* mechanism step 2 needs (see open questions).
 
 ### LS.7 — Open questions (still open)
 
-(Literal syntax is **no longer open** — `[...]` is the `List` literal, §LS.4.)
+(Literal/type syntax is **no longer open** — `[...]` is the collection literal, `T[]`
+the type, §LS.4. The *names* `List`/`Array` and forcing spellings remain uncommitted.)
 
 1. **Migrate `print` to std VL?** Move the `print` type-dispatcher out of codegen
    into a std VL dispatcher over the existing `__print_T__` sinks — worth the churn,
