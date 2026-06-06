@@ -1,4 +1,5 @@
 import Binaryen from "binaryen";
+import { type NodeSpans, spanOf } from "./ast.ts";
 import type { Narrowing } from "./typecheck.ts";
 import {
   arrayElementType,
@@ -38,17 +39,17 @@ import {
   lowerListMethodCall,
 } from "./builtins/lists.ts";
 import {
-  type MapBuiltinContext,
-  type MapType as MapTypeInfo,
   lowerMapMethodCall,
   MAP_COUNT,
   MAP_KEYS,
   MAP_LIVE,
   MAP_SIZE,
   MAP_VALS,
+  type MapBuiltinContext,
   mapGetFn,
   mapNewFn,
   mapSetFn,
+  type MapType as MapTypeInfo,
 } from "./builtins/maps.ts";
 
 const raise = (err?: string | Error): never => {
@@ -58,7 +59,29 @@ const raise = (err?: string | Error): never => {
 
 const ignoredKeys = new Set(Object.keys(defaultScope()));
 
-export const toWasm = async (ast: VLProgramNode) => {
+/**
+ * Result of codegen: the wasm binary, plus (when `spans` were supplied) a
+ * Source Map v3 string mapping wasm code offsets to VL `file:line:column`.
+ * The map lets `runWasm` turn a raw wasm trap (array OOB, divide-by-zero) into
+ * a VL-source-located runtime error (see `compile.ts`). `sourceMap` is
+ * `undefined` when codegen ran without spans (debug info is purely additive —
+ * the binary is byte-identical to the no-spans build except for the name/debug
+ * sections, which do not affect execution).
+ */
+export type WasmEmit = { binary: Uint8Array; sourceMap?: string };
+
+export type ToWasmOptions = {
+  /** AST node → source span side-table (Track G), threaded into debug locations. */
+  spans?: NodeSpans;
+  /** Logical source file name recorded in the source map (e.g. `main.vl`). */
+  fileName?: string;
+};
+
+export const toWasm = async (
+  ast: VLProgramNode,
+  options: ToWasmOptions = {},
+): Promise<WasmEmit> => {
+  const { spans, fileName = "source.vl" } = options;
   // binaryen's default export is a synchronous module object (plain npm), or,
   // when the binaryen patch is applied (patch-package, used by the bundled
   // extension), an async init function returning that object. Support both so
@@ -71,6 +94,82 @@ export const toWasm = async (ast: VLProgramNode) => {
   const m = new binaryen.Module();
   // Closures and the heap phase use WasmGC structs/arrays.
   m.setFeatures(binaryen.Features.GC | binaryen.Features.ReferenceTypes);
+
+  // --- Debug locations / source map (roadmap B-debug) ----------------------
+  // When the caller supplies spans, attach VL source locations to emitted
+  // expressions so a wasm trap can be mapped back to `file:line:col`. Two
+  // mechanisms cooperate:
+  //   1. binaryen's per-expression debug locations (`setDebugLocation`), which
+  //      it serializes into a Source Map v3 alongside `emitBinary(url)`.
+  //   2. the wasm *name* section (binaryen emits it for named functions), so a
+  //      host stack trace shows the VL function name, not `wasm-function[N]`.
+  // CRITICAL: `binaryen.setDebugInfo(true)` MUST be set before `optimize()` —
+  // otherwise the optimizer rebuilds expressions and drops every debug
+  // location, leaving an empty source map. With it on, locations (and the name
+  // section) survive optimization, so the map describes the binary that runs.
+  const debugEnabled = spans !== undefined;
+  // `setDebugInfo` is global state on the binaryen module object; save/restore
+  // so concurrent/sequential compiles don't leak the flag to a no-spans build.
+  const oldDebugInfo = typeof binaryen.getDebugInfo === "function"
+    ? binaryen.getDebugInfo()
+    : false;
+  if (debugEnabled) binaryen.setDebugInfo(true);
+  const debugFileIndex = debugEnabled ? m.addDebugInfoFileName(fileName) : -1;
+  // A stack of per-function pending debug entries. `setDebugLocation` needs the
+  // function reference, which only exists after `addFunction`; codegen builds a
+  // body fully *before* that call. Nested instantiations (a call inside a body
+  // compiles the callee, whose `addFunction` runs first) mean a flat list would
+  // misattribute the outer function's expressions to the callee. A stack scoped
+  // per body keeps each function's entries separate: push a frame before
+  // building a body, flush+pop it right after `addFunction`.
+  type DebugEntry = { expr: number; line: number; column: number };
+  const debugStack: DebugEntry[][] = [];
+  // Record a span for `expr` against the innermost body frame. `line` is
+  // 1-based and `column` 0-based in VL `Context` (and in binaryen's API), so no
+  // shift is needed. No-op when debug is off or the node has no recorded span.
+  const recordDebug = (expr: number, node: object): number => {
+    if (!debugEnabled || debugStack.length === 0) return expr;
+    const span = spanOf(spans, node);
+    if (span) {
+      debugStack[debugStack.length - 1].push({
+        expr,
+        line: span.start.line,
+        column: span.start.column,
+      });
+    }
+    return expr;
+  };
+  // Record an explicit location for a synthesized sub-expression (e.g. the
+  // bounds-check `unreachable`, whose own offset is what the trap reports). Tries
+  // each candidate node in order and uses the first that has a recorded span —
+  // some lowering targets (an assignment's index-access LHS) carry no span of
+  // their own, so we fall back to the enclosing statement node. Returns the expr
+  // for inline use.
+  const recordDebugAt = (expr: number, ...nodes: object[]): number => {
+    if (!debugEnabled || debugStack.length === 0) return expr;
+    for (const node of nodes) {
+      if (spanOf(spans, node)) return recordDebug(expr, node);
+    }
+    return expr;
+  };
+  const pushDebugFrame = () => {
+    if (debugEnabled) debugStack.push([]);
+  };
+  // Apply a previously-collected frame's entries against `funcRef` (the value
+  // `addFunction` returned). Used where the frame was popped at body-build time
+  // (the two-pass `instantiate`).
+  const applyDebugFrame = (funcRef: number, frame: DebugEntry[]) => {
+    if (!debugEnabled) return;
+    for (const e of frame) {
+      m.setDebugLocation(funcRef, e.expr, debugFileIndex, e.line, e.column);
+    }
+  };
+  // Flush the innermost frame's entries against `funcRef` and pop it. Used where
+  // the body is built and added in one place (the `__program__` entry).
+  const flushDebugFrame = (funcRef: number) => {
+    if (!debugEnabled) return;
+    applyDebugFrame(funcRef, debugStack.pop() ?? []);
+  };
 
   registerBuiltins(m, binaryen);
 
@@ -721,7 +820,11 @@ export const toWasm = async (ast: VLProgramNode) => {
     if (!cached) {
       const tb = new binaryen.TypeBuilder(1);
       tb.setStructType(0, [
-        { type: backing.refType, packedType: binaryen.notPacked, mutable: true },
+        {
+          type: backing.refType,
+          packedType: binaryen.notPacked,
+          mutable: true,
+        },
         { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
         { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
       ]);
@@ -764,7 +867,9 @@ export const toWasm = async (ast: VLProgramNode) => {
     let s = softenImplicitType(t);
     while (s.type === "Infer") s = softenImplicitType(s.subType);
     if (s.type === "Function") return true;
-    if (s.type === "Object") return s.name === "string" || (s.name === undefined);
+    if (s.type === "Object") {
+      return s.name === "string" || (s.name === undefined);
+    }
     if (s.type === "Nullable" || s.type === "Union") return true;
     return false;
   };
@@ -1039,7 +1144,10 @@ export const toWasm = async (ast: VLProgramNode) => {
       const rlen = () => m.local.get(6, binaryen.i32);
       const body = m.block(null, [
         // scratch = new i32[11] (max "-2147483648" is 11 chars)
-        m.local.set(1, m.array.new(at.heapType, m.i32.const(11), m.i32.const(0))),
+        m.local.set(
+          1,
+          m.array.new(at.heapType, m.i32.const(11), m.i32.const(0)),
+        ),
         m.local.set(2, m.i32.const(11)),
         m.local.set(3, m.i32.lt_s(value(), m.i32.const(0))),
         // n = value <= 0 ? value : -value  (magnitude as a non-positive number)
@@ -1086,7 +1194,14 @@ export const toWasm = async (ast: VLProgramNode) => {
         name,
         binaryen.createType([binaryen.i32]),
         at.refType,
-        [at.refType, binaryen.i32, binaryen.i32, binaryen.i32, at.refType, binaryen.i32],
+        [
+          at.refType,
+          binaryen.i32,
+          binaryen.i32,
+          binaryen.i32,
+          at.refType,
+          binaryen.i32,
+        ],
         body,
       );
     }
@@ -1101,7 +1216,10 @@ export const toWasm = async (ast: VLProgramNode) => {
       _helpers.add(name);
       const at = arrayType(i32Type);
       const lit = (s: string) =>
-        m.array.new_fixed(at.heapType, [...s].map((c) => m.i32.const(c.charCodeAt(0))));
+        m.array.new_fixed(
+          at.heapType,
+          [...s].map((c) => m.i32.const(c.charCodeAt(0))),
+        );
       const body = m.if(
         m.local.get(0, binaryen.i32),
         lit("true"),
@@ -1195,12 +1313,22 @@ export const toWasm = async (ast: VLProgramNode) => {
                 () =>
                   arrayReadCast(
                     lt.backing,
-                    m.array.get(listBacking(lt, a()), i(), lt.backing.backingWasm, false),
+                    m.array.get(
+                      listBacking(lt, a()),
+                      i(),
+                      lt.backing.backingWasm,
+                      false,
+                    ),
                   ),
                 () =>
                   arrayReadCast(
                     lt.backing,
-                    m.array.get(listBacking(lt, b()), i(), lt.backing.backingWasm, false),
+                    m.array.get(
+                      listBacking(lt, b()),
+                      i(),
+                      lt.backing.backingWasm,
+                      false,
+                    ),
                   ),
               )),
               m.return(m.i32.const(0)),
@@ -1418,16 +1546,27 @@ export const toWasm = async (ast: VLProgramNode) => {
   // stash the list ref and index in locals, trap when `(unsigned) i >= len` (which
   // covers `i < 0` too, since `len >= 0`), else `array.get(backing, i)`. The bound
   // is `len`, so the spare-capacity slots `[len, cap)` trap like any other OOB.
-  const listGet = (lt: ListType, listExpr: number, indexExpr: number): number => {
+  const listGet = (
+    lt: ListType,
+    listExpr: number,
+    indexExpr: number,
+    sourceNode?: object,
+  ): number => {
     const elemWasm = toWasmType(lt.element);
     const lRef = newLocal(lt.refType);
     const iLocal = newLocal(binaryen.i32);
     const l = () => m.local.get(lRef, lt.refType);
     const i = () => m.local.get(iLocal, binaryen.i32);
+    // Tag the bounds-check `unreachable` with the index expression's span — that
+    // instruction's offset is what a host trap reports, so this is the location
+    // `runWasm` resolves into "runtime error at file:L:C — array index out of
+    // bounds".
+    const trap = m.unreachable();
+    if (sourceNode) recordDebugAt(trap, sourceNode);
     return m.block(null, [
       m.local.set(lRef, listExpr),
       m.local.set(iLocal, indexExpr),
-      m.if(m.i32.ge_u(i(), listLen(l())), m.unreachable()),
+      m.if(m.i32.ge_u(i(), listLen(l())), trap),
       arrayReadCast(
         lt.backing,
         m.array.get(listBacking(lt, l()), i(), lt.backing.backingWasm, false),
@@ -1475,7 +1614,12 @@ export const toWasm = async (ast: VLProgramNode) => {
     const elemAt = () =>
       arrayReadCast(
         src.lt.backing,
-        m.array.get(listBacking(src.lt, s()), i(), src.lt.backing.backingWasm, false),
+        m.array.get(
+          listBacking(src.lt, s()),
+          i(),
+          src.lt.backing.backingWasm,
+          false,
+        ),
       );
 
     if (prop === "map") {
@@ -1596,13 +1740,19 @@ export const toWasm = async (ast: VLProgramNode) => {
     };
     return m.block(null, [
       m.local.set(mapLocal, toExpression(recv)),
-      m.local.set(entriesLocal, m.struct.get(srcField, map(), srcArrRef, false)),
+      m.local.set(
+        entriesLocal,
+        m.struct.get(srcField, map(), srcArrRef, false),
+      ),
       m.local.set(
         liveLocal,
         m.struct.get(MAP_LIVE, map(), mt.flags.refType, false),
       ),
       m.local.set(nLocal, m.struct.get(MAP_SIZE, map(), binaryen.i32, false)),
-      m.local.set(cntLocal, m.struct.get(MAP_COUNT, map(), binaryen.i32, false)),
+      m.local.set(
+        cntLocal,
+        m.struct.get(MAP_COUNT, map(), binaryen.i32, false),
+      ),
       // Allocate the backing. A list backing has a NON-nullable element, so for a
       // reference element `array.new_default` (null init) is invalid; instead fill
       // with a known non-null entry (a stored key/value is never nulled — even a
@@ -1755,6 +1905,11 @@ export const toWasm = async (ast: VLProgramNode) => {
       // module globals don't use this overlay, so clearing it is safe.
       const savedNarrowed = { ...narrowed };
       for (const k in narrowed) delete narrowed[k];
+      // Open a debug frame so this body's expression locations are captured
+      // separately from any callee instantiated while lowering it. The frame is
+      // flushed against this function's ref after `addFunction` (below); a
+      // discarded pass-1 body's frame is popped here without flushing.
+      pushDebugFrame();
       const body = withScope(
         Object.fromEntries(
           declaration.parameters.map((
@@ -1769,24 +1924,29 @@ export const toWasm = async (ast: VLProgramNode) => {
               () => toExpression(declaration.body),
             )),
       );
+      const debugFrame = debugEnabled ? debugStack.pop() ?? [] : [];
       functionBoundaries.pop();
       captureCollector = oldCollector;
       currentEnv = oldEnv;
       for (const k in narrowed) delete narrowed[k];
       Object.assign(narrowed, savedNarrowed);
-      return { body, locals };
+      return { body, locals, debugFrame };
     };
 
-    // Pass 1: discover captures. Its body is discarded if any are found.
+    // Pass 1: discover captures. Its body (and its debug frame) is discarded if
+    // any are found and pass 2 recompiles.
     const collector = new Map<string, VLType>();
-    let { body, locals } = compileBody(null, collector);
+    let { body, locals, debugFrame } = compileBody(null, collector);
 
     if (collector.size) {
       const fields = [...collector.keys()];
       const env = buildEnvStruct(fields, fields.map((f) => collector.get(f)!));
       closures[instanceName] = env;
       // Pass 2: recompile with the env bound; captured reads -> cast + struct.get.
-      ({ body, locals } = compileBody({ ...env, paramIndex: 0 }, null));
+      ({ body, locals, debugFrame } = compileBody(
+        { ...env, paramIndex: 0 },
+        null,
+      ));
     }
 
     const params = binaryen.createType([binaryen.structref, ...wasmParams]);
@@ -1806,7 +1966,14 @@ export const toWasm = async (ast: VLProgramNode) => {
         : bodyType;
     }
     instanceResult[instanceName] = resultType;
-    m.addFunction(instanceName, params, resultType, locals, body);
+    const funcRef = m.addFunction(
+      instanceName,
+      params,
+      resultType,
+      locals,
+      body,
+    );
+    applyDebugFrame(funcRef, debugFrame);
     returnType = oldReturnType;
     returnedWasmType = oldReturnedWasmType;
     return instanceName;
@@ -2108,7 +2275,9 @@ export const toWasm = async (ast: VLProgramNode) => {
         // inside any function are collected by walking the function bodies.
         const usedInFunctions = collectFunctionBodyNames(node.statements);
         for (const [k, v] of topLevel) {
-          if (usedInFunctions.has(k) && (isScalarWasm(v) || isGlobalizableRef(v))) {
+          if (
+            usedInFunctions.has(k) && (isScalarWasm(v) || isGlobalizableRef(v))
+          ) {
             moduleGlobals.set(k, v);
             ensureGlobal(k, v);
           }
@@ -2120,18 +2289,23 @@ export const toWasm = async (ast: VLProgramNode) => {
         );
         const locals: number[] = [];
         functionBoundaries.push(scopes.length);
+        pushDebugFrame();
         return withLocals(locals, () =>
           withScope(
             modifiedScope,
-            () =>
-              m.addFunction(
+            () => {
+              const body = m.block(null, lowerStatements(node.statements));
+              const funcRef = m.addFunction(
                 "__program__",
                 binaryen.none,
                 binaryen.none,
                 // This really doesn't work with closures...
                 locals,
-                m.block(null, lowerStatements(node.statements)),
-              ),
+                body,
+              );
+              flushDebugFrame(funcRef);
+              return funcRef;
+            },
           ));
       }
       case "IntegerLiteral": {
@@ -2327,7 +2501,9 @@ export const toWasm = async (ast: VLProgramNode) => {
             rt = s;
           }
           if (!rt || !isMapType(rt)) {
-            const dt = desiredType ? softenImplicitType(desiredType) : undefined;
+            const dt = desiredType
+              ? softenImplicitType(desiredType)
+              : undefined;
             if (dt && isMapType(dt)) rt = dt;
           }
           if (!rt || !isMapType(rt)) {
@@ -2484,7 +2660,10 @@ export const toWasm = async (ast: VLProgramNode) => {
           if (node.value) {
             return m.global.set(
               node.name,
-              withDesiredType(node.variableType, () => toExpression(node.value!)),
+              withDesiredType(
+                node.variableType,
+                () => toExpression(node.value!),
+              ),
             );
           }
           return m.nop();
@@ -2653,7 +2832,10 @@ export const toWasm = async (ast: VLProgramNode) => {
         );
         const backing = m.array.new_fixed(info.lt.backing.heapType, values);
         const n = m.i32.const(values.length);
-        return m.struct.new([backing, n, m.i32.const(values.length)], info.lt.heapType);
+        return m.struct.new(
+          [backing, n, m.i32.const(values.length)],
+          info.lt.heapType,
+        );
       }
       case "IndexAccess": {
         // A map `m[k]` is a hash lookup yielding `V | null` (normal absence —
@@ -2678,19 +2860,21 @@ export const toWasm = async (ast: VLProgramNode) => {
             list.lt,
             toExpression(node.array),
             withDesiredType(i32Type, () => toExpression(node.index)),
+            node,
           );
         }
         const info = arrayTypeOf(node.array);
         if (!info) throw new Error("Index access on a non-array");
-        return arrayReadCast(
-          info.at,
-          m.array.get(
-            toExpression(node.array),
-            withDesiredType(i32Type, () => toExpression(node.index)),
-            info.at.backingWasm,
-            false,
-          ),
+        // A raw i32-array (string) read traps natively on OOB; tag the
+        // `array.get` itself so its offset resolves to the index expression.
+        const rawGet = m.array.get(
+          toExpression(node.array),
+          withDesiredType(i32Type, () => toExpression(node.index)),
+          info.at.backingWasm,
+          false,
         );
+        recordDebugAt(rawGet, node);
+        return arrayReadCast(info.at, rawGet);
       }
       case "PropertyAccess": {
         // Shared-field access over a struct union (`(A | B).tag`): the field is
@@ -2855,13 +3039,20 @@ export const toWasm = async (ast: VLProgramNode) => {
         // no `global.tee`, so in value position read it back explicitly.
         if (isModuleGlobal(node.operand.name)) {
           const name = node.operand.name;
-          const next = m.i32.add(m.global.get(name, binaryen.i32), m.i32.const(delta));
+          const next = m.i32.add(
+            m.global.get(name, binaryen.i32),
+            m.i32.const(delta),
+          );
           if (!hasDesiredType()) return m.global.set(name, next);
           const set = m.global.set(name, next);
           const read = m.global.get(name, binaryen.i32);
           return node.prefix
             ? m.block(null, [set, read], binaryen.i32)
-            : m.block(null, [set, m.i32.sub(read, m.i32.const(delta))], binaryen.i32);
+            : m.block(
+              null,
+              [set, m.i32.sub(read, m.i32.const(delta))],
+              binaryen.i32,
+            );
         }
         const [, idx] = getScopeEntry(node.operand.name);
         const next = m.i32.add(
@@ -2949,13 +3140,17 @@ export const toWasm = async (ast: VLProgramNode) => {
                 list.element,
                 () => toExpression(node.right),
               );
+              const storeTrap = m.unreachable();
+              // The index-access LHS often carries no span; fall back to the
+              // enclosing assignment node so the trap still maps to line 3.
+              recordDebugAt(storeTrap, access, node);
               const body = [
                 m.local.set(lRef, toExpression(access.array)),
                 m.local.set(
                   iLocal,
                   withDesiredType(i32Type, () => toExpression(access.index)),
                 ),
-                m.if(m.i32.ge_u(i(), listLen(l())), m.unreachable()),
+                m.if(m.i32.ge_u(i(), listLen(l())), storeTrap),
                 m.array.set(listBacking(list.lt, l()), i(), value),
               ];
               return desiredType
@@ -3122,7 +3317,8 @@ export const toWasm = async (ast: VLProgramNode) => {
               // Structural `==`/`!=`, and list `==`/`!=`/`+` (concat), have no
               // operator method — the right operand is just the same list/object
               // type.
-              : (op === "==" || op === "!=" || (op === "+" && isListType(leftType)))
+              : (op === "==" || op === "!=" ||
+                  (op === "+" && isListType(leftType)))
               ? leftType
               : raise("op not function");
           }
@@ -3174,7 +3370,10 @@ export const toWasm = async (ast: VLProgramNode) => {
             m.local.set(aLocal, toExpression(node.left)),
             m.local.set(bLocal, toExpression(node.right)),
             m.local.set(nLocal, m.i32.add(listLen(a()), listLen(b()))),
-            m.local.set(outLocal, m.array.new_default(lt.backing.heapType, n())),
+            m.local.set(
+              outLocal,
+              m.array.new_default(lt.backing.heapType, n()),
+            ),
             m.array.copy(
               out(),
               m.i32.const(0),
@@ -3526,7 +3725,12 @@ export const toWasm = async (ast: VLProgramNode) => {
                   varLocal,
                   arrayReadCast(
                     list.lt.backing,
-                    m.array.get(back(), i(), list.lt.backing.backingWasm, false),
+                    m.array.get(
+                      back(),
+                      i(),
+                      list.lt.backing.backingWasm,
+                      false,
+                    ),
                   ),
                 ),
                 m.block(cont, [toExpression(node.statement)]),
@@ -3989,12 +4193,19 @@ export const toWasm = async (ast: VLProgramNode) => {
     node: { object: VLExpression; property: string },
   ): number | null => {
     let objType = softenImplicitType(codegenType(node.object));
-    while (objType.type === "Infer") objType = softenImplicitType(objType.subType);
+    while (objType.type === "Infer") {
+      objType = softenImplicitType(objType.subType);
+    }
     const info = unionInfo(objType);
     if (!info) return null;
     // Only all-struct members carry named fields; bail if any member is a scalar
     // or other reference (a string/list has no user field), or lacks the field.
-    type Hit = { tag: number; member: VLObjectType; index: number; wasm: number };
+    type Hit = {
+      tag: number;
+      member: VLObjectType;
+      index: number;
+      wasm: number;
+    };
     const hits: Hit[] = [];
     for (const member of info.variants) {
       let m2 = softenImplicitType(member);
@@ -4118,7 +4329,10 @@ export const toWasm = async (ast: VLProgramNode) => {
     if (sentinel !== null) return m.i32.const(sentinel);
     // `ref.null` takes a nullable ref *type* (not a bare heap type).
     return m.ref.null(
-      binaryen.getTypeFromHeapType(refHeapType(nonNullable(nullableType)), true),
+      binaryen.getTypeFromHeapType(
+        refHeapType(nonNullable(nullableType)),
+        true,
+      ),
     );
   };
   // Build a *present* value of nullable `nullableType` from a non-null `value`
@@ -4148,7 +4362,12 @@ export const toWasm = async (ast: VLProgramNode) => {
   };
   // Lower an expression, then box it into the desired union if one is wanted.
   const toExpression = (node: VLProgramNode | VLStatement): number =>
-    coerceUnion(toExpressionRaw(node), node);
+    // Attach the node's source span to its emitted expression (statement- and
+    // expression-level coverage). Trap-prone sites additionally tag the precise
+    // trapping sub-expression (the bounds-check `unreachable`, `array.get`,
+    // division) below — that finer location wins for the trap offset, while this
+    // gives a sensible fallback for everything else.
+    recordDebug(coerceUnion(toExpressionRaw(node), node), node);
 
   // Context handed to the extracted string-method codegen (compiler/builtins).
   const stringBuiltinCtx: StringBuiltinContext = {
@@ -4229,5 +4448,23 @@ export const toWasm = async (ast: VLProgramNode) => {
     console.log(m.emitText());
   }
   if (!m.validate()) throw new Error("validation error");
-  return m.emitBinary();
+  // With debug info on, emit the binary together with its Source Map v3 (offset
+  // → file:line:col). `emitBinary(url)` returns `{ binary, sourceMap }`; the URL
+  // is only the map's `file` field — `runWasm` consumes the map text directly,
+  // not via a fetched URL. Restore the global debug flag so a later no-spans
+  // compile on the same binaryen object emits no debug sections.
+  try {
+    if (debugEnabled) {
+      const out = m.emitBinary(`${fileName}.map`) as {
+        binary: Uint8Array;
+        sourceMap: string;
+      };
+      return { binary: out.binary, sourceMap: out.sourceMap };
+    }
+    return { binary: m.emitBinary() };
+  } finally {
+    if (debugEnabled && typeof binaryen.setDebugInfo === "function") {
+      binaryen.setDebugInfo(oldDebugInfo);
+    }
+  }
 };

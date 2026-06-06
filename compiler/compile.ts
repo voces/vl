@@ -65,6 +65,13 @@ export type CompileResult = {
   /** Present only when there are no error diagnostics. */
   wasm: Uint8Array | undefined;
   /**
+   * Source Map v3 (JSON string) for `wasm`, mapping wasm code offsets to VL
+   * `file:line:column` (roadmap B-debug). Present whenever `wasm` is — codegen
+   * always emits debug locations now. `runWasm` consumes it to turn a raw wasm
+   * trap into a VL-source-located runtime error.
+   */
+  sourceMap: string | undefined;
+  /**
    * Symbol/binding table for the document (go-to-definition, find-references —
    * roadmap D2). Always present; empty if nothing resolved. Query by cursor
    * position; spans use the same 1-based-line / 0-based-column `Position`
@@ -345,14 +352,23 @@ export const checkOnly = (source: string): CheckResult => {
  * escaping. `toWasm` (and thus binaryen) is dynamically imported here so it is
  * only loaded when codegen actually runs.
  */
-export const compile = async (source: string): Promise<CompileResult> => {
+export const compile = async (
+  source: string,
+  fileName = "source.vl",
+): Promise<CompileResult> => {
   const { ast, diagnostics, symbols, spans, comments } = checkOnly(source);
 
   let wasm: Uint8Array | undefined;
+  let sourceMap: string | undefined;
   if (!diagnostics.some((d) => d.severity === "error")) {
     try {
       const { toWasm } = await import("./toWasm.ts");
-      wasm = await toWasm(ast);
+      // Thread the AST spans + file name into codegen so the emitted module
+      // carries debug locations (a source map) and the name section — additive
+      // metadata only; the executable behavior is unchanged.
+      const emit = await toWasm(ast, { spans, fileName });
+      wasm = emit.binary;
+      sourceMap = emit.sourceMap;
     } catch (err) {
       diagnostics.push({
         message: `Codegen error: ${codegenErrorMessage(err)}`,
@@ -371,7 +387,7 @@ export const compile = async (source: string): Promise<CompileResult> => {
     }
   }
 
-  return { ast, diagnostics, wasm, symbols, spans, comments };
+  return { ast, diagnostics, wasm, sourceMap, symbols, spans, comments };
 };
 
 /**
@@ -412,62 +428,287 @@ export const wasmToWat = async (wasm: Uint8Array): Promise<string> => {
 
 export type RunResult = { logs: string[] };
 
+// --- Trap-to-source (roadmap B-debug) --------------------------------------
+//
+// A wasm runtime trap (array OOB, divide-by-zero, …) surfaces in V8/Deno as a
+// `WebAssembly.RuntimeError` whose `.stack` carries the failing wasm location,
+// e.g. `at myFn (wasm://wasm/abcd1234:wasm-function[3]:0x42)`. We extract the
+// byte offset (`0x42`) and look it up in the codegen Source Map v3 to recover
+// the VL `file:line:column`, and the function name (`myFn`) comes from the wasm
+// *name* section binaryen emitted. The result is a VL-source-located error
+// instead of the raw wasm abort. See `mapTrap`.
+
+/** A wasm trap re-rendered as a VL-source-located runtime error. */
+export class VLRuntimeError extends Error {
+  /** The mapped source location, when an offset→line mapping was available. */
+  readonly location?: { file: string; line: number; column: number };
+  /** The wasm function name (from the name section), when present in the trace. */
+  readonly functionName?: string;
+  /** The raw wasm trap reason (e.g. `unreachable`, `divide by zero`). */
+  readonly reason: string;
+  constructor(
+    message: string,
+    reason: string,
+    location?: { file: string; line: number; column: number },
+    functionName?: string,
+  ) {
+    super(message);
+    this.name = "VLRuntimeError";
+    this.reason = reason;
+    this.location = location;
+    this.functionName = functionName;
+  }
+}
+
+// Decode a single base64-VLQ segment into its integer fields.
+const decodeVLQ = (segment: string): number[] => {
+  const CHARS =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const out: number[] = [];
+  let shift = 0;
+  let value = 0;
+  for (const ch of segment) {
+    const idx = CHARS.indexOf(ch);
+    if (idx === -1) continue;
+    const cont = idx & 32;
+    value += (idx & 31) << shift;
+    if (cont) {
+      shift += 5;
+    } else {
+      const negative = value & 1;
+      const magnitude = value >> 1;
+      out.push(negative ? -magnitude : magnitude);
+      shift = 0;
+      value = 0;
+    }
+  }
+  return out;
+};
+
+type SourceMapEntry = {
+  offset: number;
+  sourceIndex: number;
+  line: number; // 0-based, as stored in the source map
+  column: number; // 0-based
+};
+
+type DecodedSourceMap = { sources: string[]; entries: SourceMapEntry[] };
+
+/**
+ * Decode a Source Map v3 into a flat, offset-sorted list of mappings. For a
+ * wasm source map the "generated column" is the byte offset into the code
+ * section (binaryen has no line concept, so all segments live on one line),
+ * which is exactly the offset V8 reports in a trap stack.
+ */
+const decodeSourceMap = (json: string): DecodedSourceMap | undefined => {
+  let parsed: { sources?: unknown; mappings?: unknown };
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return undefined;
+  }
+  const sources = Array.isArray(parsed.sources)
+    ? parsed.sources.map((s) => String(s))
+    : [];
+  const mappings = typeof parsed.mappings === "string" ? parsed.mappings : "";
+  const entries: SourceMapEntry[] = [];
+  let genCol = 0;
+  let srcIdx = 0;
+  let srcLine = 0;
+  let srcCol = 0;
+  // wasm maps use a single "line"; segments are comma-separated. Tolerate the
+  // generic `;` line separator too (resets generated column per spec).
+  for (const line of mappings.split(";")) {
+    genCol = 0;
+    for (const seg of line.split(",")) {
+      if (seg === "") continue;
+      const f = decodeVLQ(seg);
+      if (f.length === 0) continue;
+      genCol += f[0];
+      if (f.length >= 4) {
+        srcIdx += f[1];
+        srcLine += f[2];
+        srcCol += f[3];
+        entries.push({
+          offset: genCol,
+          sourceIndex: srcIdx,
+          line: srcLine,
+          column: srcCol,
+        });
+      }
+    }
+  }
+  entries.sort((a, b) => a.offset - b.offset);
+  return { sources, entries };
+};
+
+/** The mapping whose offset is the greatest ≤ `offset` (the active location). */
+const lookupOffset = (
+  map: DecodedSourceMap,
+  offset: number,
+): SourceMapEntry | undefined => {
+  let found: SourceMapEntry | undefined;
+  for (const e of map.entries) {
+    if (e.offset <= offset) found = e;
+    else break;
+  }
+  return found;
+};
+
+// Pull the function name + byte offset out of a V8/Deno wasm stack frame. The
+// first wasm frame looks like:
+//   at <name> (wasm://wasm/<hash>:wasm-function[<idx>]:0x<offset>)
+// `<name>` is absent (anonymous) when the function is unnamed. Returns the
+// offset (and optional name) of the innermost wasm frame.
+const parseWasmFrame = (
+  stack: string | undefined,
+): { offset: number; functionName?: string } | undefined => {
+  if (!stack) return undefined;
+  for (const rawLine of stack.split("\n")) {
+    const line = rawLine.trim();
+    const m = line.match(
+      /at\s+(?:([^\s(]+)\s+\()?wasm:\/\/[^\s:]+:wasm-function\[\d+\]:0x([0-9a-fA-F]+)/,
+    );
+    if (m) {
+      const functionName = m[1] && m[1] !== "<anonymous>" ? m[1] : undefined;
+      return { offset: parseInt(m[2], 16), functionName };
+    }
+  }
+  return undefined;
+};
+
+// Map a raw wasm trap message to a friendlier VL reason. V8 phrasing varies by
+// version, so match on substrings.
+const trapReason = (message: string): string => {
+  const lower = message.toLowerCase();
+  if (lower.includes("out of bounds") || lower.includes("array")) {
+    return "array index out of bounds";
+  }
+  if (lower.includes("divide by zero") || lower.includes("division")) {
+    return "division by zero";
+  }
+  if (lower.includes("unreachable")) {
+    // VL emits `unreachable` for a failed bounds check, so report that intent.
+    return "array index out of bounds";
+  }
+  if (lower.includes("null")) return "null dereference";
+  return message;
+};
+
+/**
+ * Turn a caught wasm `RuntimeError` into a `VLRuntimeError` carrying a
+ * VL-source location when the source map resolves the trap offset, else a
+ * function-level (name-section) location. Non-wasm errors pass through
+ * unchanged.
+ */
+export const mapTrap = (
+  err: unknown,
+  sourceMap?: string,
+): unknown => {
+  const isRuntime = err instanceof WebAssembly.RuntimeError ||
+    (err instanceof Error && err.name === "RuntimeError");
+  if (!isRuntime) return err;
+  const e = err as Error;
+  const reason = trapReason(e.message);
+  const frame = parseWasmFrame(e.stack);
+  const map = sourceMap ? decodeSourceMap(sourceMap) : undefined;
+  const hit = frame && map ? lookupOffset(map, frame.offset) : undefined;
+  if (hit) {
+    const file = map!.sources[hit.sourceIndex] ?? "source";
+    // Source map stores 0-based line/col; VL diagnostics present 1-based line.
+    const line = hit.line + 1;
+    const column = hit.column;
+    return new VLRuntimeError(
+      `runtime error at ${file}:${line}:${column} — ${reason}`,
+      reason,
+      { file, line, column },
+      frame?.functionName,
+    );
+  }
+  // No precise offset mapping — fall back to a function-level location from the
+  // name section, still better than the raw wasm abort.
+  if (frame?.functionName && frame.functionName !== "__program__") {
+    return new VLRuntimeError(
+      `runtime error in ${frame.functionName} — ${reason}`,
+      reason,
+      undefined,
+      frame.functionName,
+    );
+  }
+  return new VLRuntimeError(`runtime error — ${reason}`, reason);
+};
+
 /**
  * Instantiate compiled wasm with a memory + `__log__` import, capturing each
  * `__log__` call as a formatted line. Mirrors the tagged-value decoding.
+ *
+ * When `sourceMap` is supplied (the codegen Source Map v3 from `compile`), a
+ * wasm trap is rethrown as a {@link VLRuntimeError} with a VL-source location
+ * instead of the raw `WebAssembly.RuntimeError`. Without it, a trap propagates
+ * unchanged.
  */
-export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
+export const runWasm = async (
+  wasm: Uint8Array,
+  sourceMap?: string,
+): Promise<RunResult> => {
   const logs: string[] = [];
   // Accumulates code points streamed by `__print_char__` until `__print_str_flush__`.
   const printChars: number[] = [];
   const memory = new WebAssembly.Memory({ initial: 1, maximum: 65536 });
-  await WebAssembly.instantiate(wasm, {
-    imports: {
-      memory,
-      // Read `length` raw bytes at `offset` and render them as a UTF-8 string
-      // (the byte form a `__store_string__` writes from a GC string).
-      __log_string__: (offset: number, length: number) => {
-        logs.push(
-          new TextDecoder().decode(
-            new Uint8Array(memory.buffer, offset, length),
-          ),
-        );
+  try {
+    await WebAssembly.instantiate(wasm, {
+      imports: {
+        memory,
+        // Read `length` raw bytes at `offset` and render them as a UTF-8 string
+        // (the byte form a `__store_string__` writes from a GC string).
+        __log_string__: (offset: number, length: number) => {
+          logs.push(
+            new TextDecoder().decode(
+              new Uint8Array(memory.buffer, offset, length),
+            ),
+          );
+        },
+        __log__: (offset: number, length: number) => {
+          const view = new Int32Array(memory.buffer, offset, length / 4);
+          const args: (number | bigint)[] = [];
+          for (let i = 0; i < length / 4; i++) {
+            if (view[i] === 1) {
+              const low = BigInt(view[++i]) & BigInt(0xFFFFFFFF);
+              const high = BigInt(view[++i]) << BigInt(32);
+              args.push(high | low);
+            } else if (view[i] === 2) {
+              i++;
+              args.push(new Float32Array(memory.buffer, offset + i * 4, 1)[0]);
+            } else if (view[i] === 3) {
+              const swap = new Int32Array(2);
+              swap[0] = view[++i];
+              swap[1] = view[++i];
+              args.push(new Float64Array(swap.buffer, 0, 1)[0]);
+            } else args.push(view[++i]);
+          }
+          logs.push(args.map((a) => a.toString()).join(" "));
+        },
+        // Direct value sinks for the `print(x)` builtin. A wasm i64 arrives as a
+        // JS bigint; the rest as numbers. Booleans render as `true`/`false`.
+        __print_i32__: (v: number) => logs.push(String(v)),
+        __print_i64__: (v: bigint) => logs.push(v.toString()),
+        __print_f32__: (v: number) => logs.push(String(v)),
+        __print_f64__: (v: number) => logs.push(String(v)),
+        __print_bool__: (v: number) => logs.push(v ? "true" : "false"),
+        // A string prints by streaming its code points (no shared memory); flush
+        // assembles and emits the accumulated line.
+        __print_char__: (code: number) => printChars.push(code),
+        __print_str_flush__: () => {
+          logs.push(String.fromCodePoint(...printChars));
+          printChars.length = 0;
+        },
       },
-      __log__: (offset: number, length: number) => {
-        const view = new Int32Array(memory.buffer, offset, length / 4);
-        const args: (number | bigint)[] = [];
-        for (let i = 0; i < length / 4; i++) {
-          if (view[i] === 1) {
-            const low = BigInt(view[++i]) & BigInt(0xFFFFFFFF);
-            const high = BigInt(view[++i]) << BigInt(32);
-            args.push(high | low);
-          } else if (view[i] === 2) {
-            i++;
-            args.push(new Float32Array(memory.buffer, offset + i * 4, 1)[0]);
-          } else if (view[i] === 3) {
-            const swap = new Int32Array(2);
-            swap[0] = view[++i];
-            swap[1] = view[++i];
-            args.push(new Float64Array(swap.buffer, 0, 1)[0]);
-          } else args.push(view[++i]);
-        }
-        logs.push(args.map((a) => a.toString()).join(" "));
-      },
-      // Direct value sinks for the `print(x)` builtin. A wasm i64 arrives as a
-      // JS bigint; the rest as numbers. Booleans render as `true`/`false`.
-      __print_i32__: (v: number) => logs.push(String(v)),
-      __print_i64__: (v: bigint) => logs.push(v.toString()),
-      __print_f32__: (v: number) => logs.push(String(v)),
-      __print_f64__: (v: number) => logs.push(String(v)),
-      __print_bool__: (v: number) => logs.push(v ? "true" : "false"),
-      // A string prints by streaming its code points (no shared memory); flush
-      // assembles and emits the accumulated line.
-      __print_char__: (code: number) => printChars.push(code),
-      __print_str_flush__: () => {
-        logs.push(String.fromCodePoint(...printChars));
-        printChars.length = 0;
-      },
-    },
-  });
+    });
+  } catch (err) {
+    // The wasm executes inside `instantiate` because the entry runs as the
+    // module's start function; a trap therefore throws here. Map it to a
+    // VL-source-located error (or rethrow non-trap errors unchanged).
+    throw mapTrap(err, sourceMap);
+  }
   return { logs };
 };

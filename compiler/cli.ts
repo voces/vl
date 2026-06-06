@@ -31,6 +31,7 @@ import {
   compile,
   runWasm,
   type VLDiagnostic,
+  VLRuntimeError,
   type VLSeverity,
   wasmToWat,
 } from "./compile.ts";
@@ -168,7 +169,9 @@ const formatPretty = (
 
   const { line, character } = d.range.start;
   const out: string[] = [];
-  out.push(`${sevStyle(c.bold(`[${d.severity.toUpperCase()}]`))}: ${d.message}`);
+  out.push(
+    `${sevStyle(c.bold(`[${d.severity.toUpperCase()}]`))}: ${d.message}`,
+  );
 
   const raw = sourceLines[line];
   if (raw !== undefined) {
@@ -275,13 +278,30 @@ const run = async (args: string[]): Promise<void> => {
     Deno.exit(2);
   }
 
-  const { diagnostics, wasm } = await compile(source);
+  // Use the source file's name in the source map / trap messages when running a
+  // file; inline / stdin snippets fall back to the default.
+  const file = args.find((a) => !a.startsWith("-"));
+  const { diagnostics, wasm, sourceMap } = await compile(
+    source,
+    file ?? "source.vl",
+  );
   for (const d of diagnostics) console.error(formatDiagnostic(d));
 
   if (!wasm) Deno.exit(1);
 
-  const { logs } = await runWasm(wasm);
-  for (const log of logs) console.log(log);
+  try {
+    const { logs } = await runWasm(wasm, sourceMap);
+    for (const log of logs) console.log(log);
+  } catch (err) {
+    // A wasm trap is rethrown by `runWasm` as a VLRuntimeError carrying a
+    // VL-source location (array OOB, divide-by-zero, …). Print it as a clean
+    // diagnostic line instead of a raw wasm stack, then exit non-zero.
+    if (err instanceof VLRuntimeError) {
+      console.error(err.message);
+      Deno.exit(1);
+    }
+    throw err;
+  }
 };
 
 // --- build ----------------------------------------------------------------
@@ -497,7 +517,9 @@ type CheckArgs = {
 // error on anything else (so `--severity warn` doesn't silently behave like the
 // default). Returns the value narrowed to `VLSeverity`.
 const parseSeverity = (value: string | undefined): VLSeverity => {
-  if (value !== undefined && (SEVERITY_ORDER as readonly string[]).includes(value)) {
+  if (
+    value !== undefined && (SEVERITY_ORDER as readonly string[]).includes(value)
+  ) {
     return value as VLSeverity;
   }
   const levels = SEVERITY_ORDER.slice().reverse().join(", ");
@@ -652,7 +674,9 @@ const fmtFile = async (
     return { changed };
   }
   if (opts.write) {
-    if (changed) await Deno.writeFile(file, new TextEncoder().encode(formatted));
+    if (changed) {
+      await Deno.writeFile(file, new TextEncoder().encode(formatted));
+    }
     return { changed };
   }
   await Deno.stdout.write(new TextEncoder().encode(formatted));
