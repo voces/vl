@@ -119,16 +119,24 @@ connection.onHover(async (params): Promise<Hover | null> => {
     start: { line: params.position.line, character: 0 },
     end: { line: params.position.line + 1, character: 0 },
   });
+  // Hover resolves through the D2 symbol table first: it maps the cursor to its
+  // `Binding` (locals/params/functions/type aliases included) and reads the type
+  // each binding carries. Falls back to the top-level scope lookup below for
+  // anything the symbol table doesn't carry.
+  const symbols = parseSymbols(document.getText());
+  const occ = symbols.occurrenceAt(toVLPosition(params.position));
+  if (occ?.binding.type) {
+    return {
+      contents: {
+        kind: "markdown",
+        value: `\`${occ.binding.name}: ${stringifyType(occ.binding.type)}\``,
+      },
+    };
+  }
+
   const word = wordAt(lineText, params.position.character);
   if (!word) return null;
 
-  // HONEST LIMITATION: this resolves only TOP-LEVEL names (functions,
-  // top-level let/const, types) via `ast.scope`. AST nodes don't yet carry
-  // source ranges, so a cursor can't be mapped to an arbitrary
-  // expression/local — we can only look the bare word up in the program's
-  // top-level scope. Richer hover (locals, expression types, go-to-definition)
-  // needs per-node position tracking, which the in-progress parser rewrite
-  // (Track G) will add — that's a follow-up, not this change.
   const { ast } = await compile(document.getText());
   const type = ast?.scope[word];
   if (!type) return null;

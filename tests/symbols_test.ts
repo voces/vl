@@ -5,7 +5,7 @@
 //   deno test -A --no-check tests/symbols_test.ts
 // (the `deno task test` task targets only run.ts; this file is a sibling.)
 
-import { parseSymbols } from "../compiler/compile.ts";
+import { parseSymbols, stringifyType } from "../compiler/compile.ts";
 import type { Position } from "../compiler/ast.ts";
 
 // Tiny structural-equality assert (the repo has no std import map; run.ts
@@ -87,6 +87,34 @@ Deno.test("shadowing: inner binding resolves to inner declaration", () => {
   // The references of the inner `v` do not include the outer let.
   const refs = symbols.referencesAt(cursorOn(src, "v", 2));
   assertEquals(refs.length, 2); // param decl + one use
+});
+
+Deno.test("hover: local let binding carries its inferred type", () => {
+  const src = "function use(b: i32): i32 {\n  let p = b + 1\n  return p\n}\n";
+  const symbols = parseSymbols(src);
+  // Cursor on the `let p` declaration: its binding carries the inferred type.
+  const occ = symbols.occurrenceAt(cursorOn(src, "p", 0));
+  if (!occ?.binding.type) throw new Error("expected a type on the `p` binding");
+  assertEquals(stringifyType(occ.binding.type), "i32");
+});
+
+Deno.test("hover: parameter binding carries its declared type", () => {
+  const src = "function f(a: i32): i32 {\n  return a + 1\n}\n";
+  const symbols = parseSymbols(src);
+  // Cursor on the use of `a` resolves to the parameter binding with its type.
+  const occ = symbols.occurrenceAt(cursorOn(src, "a", 1));
+  if (!occ?.binding.type) throw new Error("expected a type on the `a` binding");
+  assertEquals(stringifyType(occ.binding.type), "i32");
+});
+
+Deno.test("hover: local resolves a union-typed call result", () => {
+  const src =
+    'function maybe(b: i32): { x: i32 } | null { if b > 0 { return { x: 7 } } return null }\n' +
+    "function use(b: i32): i32 {\n  let p = maybe(b)\n  if p == null { return 0 - 1 }\n  return p.x\n}\n";
+  const symbols = parseSymbols(src);
+  const occ = symbols.occurrenceAt(cursorOn(src, "p", 0));
+  if (!occ?.binding.type) throw new Error("expected a type on the `p` binding");
+  assertEquals(stringifyType(occ.binding.type), "{x: i32} | null");
 });
 
 Deno.test("cursor off any symbol yields no definition", () => {

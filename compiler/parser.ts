@@ -136,10 +136,11 @@ export const parseProgram = (
     name: string,
     kind: BindingKind,
     decl: Context,
+    type?: VLType,
   ): Binding => {
     let map = scopeBindings.get(scope);
     if (!map) scopeBindings.set(scope, map = new Map());
-    const binding: Binding = { name, kind, decl };
+    const binding: Binding = { name, kind, decl, type };
     map.set(name, binding);
     symbols.declare(binding);
     return binding;
@@ -1269,6 +1270,7 @@ export const parseProgram = (
       return: annotatedReturn ?? { type: "Infer", subType: { type: "Unknown" } },
     };
     let registered = false;
+    let fnBinding: Binding | undefined;
     if (name) {
       if (name in enclosing) {
         errors.push({
@@ -1279,7 +1281,9 @@ export const parseProgram = (
         });
       } else {
         enclosing[name] = selfType;
-        if (nameCtx) declareBinding(enclosing, name, "function", nameCtx);
+        if (nameCtx) {
+          fnBinding = declareBinding(enclosing, name, "function", nameCtx, selfType);
+        }
         registered = true;
       }
     }
@@ -1289,7 +1293,13 @@ export const parseProgram = (
     );
     scopes.push(scope);
     for (let i = 0; i < parameters.length; i++) {
-      declareBinding(scope, parameters[i].name, "parameter", paramSpans[i]);
+      declareBinding(
+        scope,
+        parameters[i].name,
+        "parameter",
+        paramSpans[i],
+        parameters[i].paramaterType,
+      );
     }
     let node: VLFunctionDeclarationNode;
     const bodyStart = peek();
@@ -1352,6 +1362,9 @@ export const parseProgram = (
     // Memoize the node's final type and refine the forward-registered entry.
     const finalType = typeFromExpression(node, ctx);
     if (registered) enclosing[name!] = finalType;
+    // Refine the binding's type to the inferred (post-body) signature so hover
+    // shows the resolved return rather than the pre-inference `Infer` hole.
+    if (fnBinding) fnBinding.type = finalType;
 
     // Inferred type guard (A6b, degenerate case): body is exactly
     // `return <narrowing-predicate-on-a-param>`.
@@ -1576,7 +1589,7 @@ export const parseProgram = (
     } else {
       const scope = scopes[scopes.length - 1];
       scope[node.name] = node.variableType;
-      declareBinding(scope, node.name, "variable", spanOf(id));
+      declareBinding(scope, node.name, "variable", spanOf(id), node.variableType);
     }
     return record(node, spanFrom(kw));
   };
@@ -1606,7 +1619,7 @@ export const parseProgram = (
     };
     const typeScope = scopes[scopes.length - 1];
     typeScope[name] = entry;
-    declareBinding(typeScope, name, "type", spanOf(id));
+    declareBinding(typeScope, name, "type", spanOf(id), entry);
     if (hasBody) {
       next();
       skipNewlines();
