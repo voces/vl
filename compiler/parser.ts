@@ -155,10 +155,11 @@ export const parseProgram = (
     decl: Context,
     type?: VLType,
     doc?: string,
+    mutable?: boolean,
   ): Binding => {
     let map = scopeBindings.get(scope);
     if (!map) scopeBindings.set(scope, map = new Map());
-    const binding: Binding = { name, kind, decl, type, doc };
+    const binding: Binding = { name, kind, decl, type, doc, mutable };
     map.set(name, binding);
     symbols.declare(binding);
     return binding;
@@ -170,6 +171,24 @@ export const parseProgram = (
       if (binding) return binding;
     }
     return undefined;
+  };
+  /**
+   * Reject a rebind of an immutable (`const`) binding. Covers `x = …` and
+   * `x++`/`x--` where `x` resolves to a `const` variable. This is *binding*
+   * mutability only — mutating the data behind the name (`o.x = …`, `a[i] = …`)
+   * is a separate axis and stays legal regardless of how the name was declared.
+   */
+  const checkRebind = (name: string, ctx: Context): void => {
+    const binding = resolveBinding(name);
+    if (binding && binding.kind === "variable" && binding.mutable === false) {
+      errors.push({
+        type: "Syntax",
+        message:
+          `cannot reassign \`const\` ${name} — declare it \`let\` to allow reassignment`,
+        ctx,
+        code: 0,
+      });
+    }
   };
   /** Record a use of `name` at `span`, resolved through the scope stack. */
   const recordUse = (name: string, span: Context): void => {
@@ -753,13 +772,15 @@ export const parseProgram = (
       const operator = t.text;
       const operand = parseUnary();
       const ctx = spanFrom(t);
-      if ((operator === "++" || operator === "--") && operand.type !== "Name") {
-        errors.push({
-          type: "Syntax",
-          message: `\`${operator}\` requires a variable operand`,
-          ctx,
-          code: 0,
-        });
+      if (operator === "++" || operator === "--") {
+        if (operand.type !== "Name") {
+          errors.push({
+            type: "Syntax",
+            message: `\`${operator}\` requires a variable operand`,
+            ctx,
+            code: 0,
+          });
+        } else checkRebind(operand.name, ctx);
       }
       const node: VLUnaryOperationNode = {
         type: "UnaryOperation",
@@ -867,7 +888,7 @@ export const parseProgram = (
             ctx,
             code: 0,
           });
-        }
+        } else checkRebind(left.name, ctx);
         const node: VLUnaryOperationNode = {
           type: "UnaryOperation",
           operator,
@@ -2022,7 +2043,7 @@ export const parseProgram = (
         ctx: ctxOf(left),
         code: 0,
       });
-    }
+    } else checkRebind(left.name, ctxOf(left));
     const leftCtx = ctxOf(left);
     const leftType = typeFromExpression(left, leftCtx);
     const right: VLExpression = operator
@@ -2044,7 +2065,9 @@ export const parseProgram = (
 
   const parseVariableDeclaration = (): VLVariableDeclarationNode => {
     const kw = next(); // LET or CONST
-    const mutable = kw.kind === "CONST";
+    // JS/TS semantics: `let` is a reassignable binding, `const` is immutable
+    // (the *name* cannot be rebound — data behind it may still mutate).
+    const mutable = kw.kind === "LET";
     const id = expect("ID");
     let annotated: VLType | undefined;
     if (at("COLON")) {
@@ -2093,6 +2116,7 @@ export const parseProgram = (
         spanOf(id),
         node.variableType,
         kw.docComment,
+        mutable,
       );
     }
     return record(node, spanFrom(kw));
