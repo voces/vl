@@ -1,7 +1,8 @@
 # VL — Design Decisions
 
 Decisions where the **rationale isn't recoverable from the code**. Implementation detail lives in
-the code, git history, and `docs/`; this file is the "why we chose X over Y." Append new entries
+the code, git history, and `docs/`; this file is the "why we chose X over Y." Keep entries terse
+(≈2–4 lines) — the decision and rationale, not a code walkthrough. Append new entries
 under the relevant section. Roadmap items reference these by their tag (e.g. A15, B14).
 
 *(Consolidated from ROADMAP.md, 2026-06-05.)*
