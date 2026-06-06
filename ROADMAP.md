@@ -179,7 +179,9 @@ D1/D2.*
 
 - ✅ **D0. Diagnostics on change.**
 - ⬜ **D1. Hover types** (`stringifyType` exists; map a cursor to a symbol/expression via the new spans).
-- ⬜ **D2. Go-to-definition / find-references** (needs symbol→span tracking — spans now exist).
+- ✅ **D2. Go-to-definition / find-references.** Parser populates a symbol/binding table
+  (`compiler/symbols.ts`) during its scope walk; the LSP queries it by cursor (`textDocument/definition`
+  + `textDocument/references`). Locals, params, function decls, type aliases; single-document. → `DECISIONS.md`.
 - ⬜ **D3. Autocomplete** (scope-aware; structural members).
 - ⬜ **D4. Formatter** (+ `vl fmt`).
 - ⬜ **D5. Semantic tokens.**
@@ -255,5 +257,5 @@ H2/H3; H1 done, H4 decided.
 - **A10 generics + collections (B6 tier-2 lists, B6a maps)** — the H2 capability bar, and the gate on
   self-hosting (H3). The deepest remaining type-system work.
 - **C5 / H-M1** — `deno compile` + brew. Small, decoupled, ships the distribution story now.
-- **D1/D2** — hover + go-to-def, now that AST nodes carry source spans.
+- **D1** — hover types, now that AST nodes carry source spans (D2 go-to-def/refs is done).
 - Smaller/independent: B6 growable lists, B13 callable-objects/index-traps, B17 lint pass, A6b Stage A.
