@@ -480,6 +480,21 @@ below.
   two lowerings — exactly the uniform-access pattern the collections/`length` design
   uses.
 
+**Compile-time-known strings (literals) skip the branch entirely.** The flag-and-branch
+above is the *runtime* mechanism, and it only needs to exist for strings whose ASCII-ness
+isn't known until run time — **incoming** strings (host/file/network reads) and the results
+of *dynamic* concatenation. For a **string literal**, the compiler already knows every
+byte, so it knows `ascii` as a **compile-time constant**: it stamps the flag statically
+and, better, **constant-folds the branch away** — an ASCII literal's code-point ops lower
+straight to the fast path with no runtime flag test, and a non-ASCII literal straight to
+the general path. So the owner's instinct is right — the common case (ASCII *literals*,
+which dominate source and compiler text) pays *nothing*: no flag check, no scan. Only
+genuinely runtime strings carry the flag and the branch. The open part is the middle
+ground: a concat/slice of statically-known-ASCII operands can *propagate* the constant
+(`ascii(a) && ascii(b) ⇒ ascii(a + b)`), and how aggressively to push that
+constant-propagation before falling back to the runtime bit is an implementation tuning
+heuristic (§OQ), not a correctness question.
+
 **Honest costs (this is an optimization, not the API).**
 
 - **The branch.** Every code-point operation tests the flag — a predictable branch,
@@ -512,6 +527,54 @@ non-ASCII) is the plain UTF-8 behavior — correct, just not as fast; best case
 (ASCII) is fixed-width speed at 1× memory; never observably wrong, because the two
 paths are semantically identical. So it can be added *after* the UTF-8 migration as a
 pure optimization pass, with no surface change.
+
+### Mutability: strings are immutable; in-place is a compiler optimization
+
+**Decision: VL strings are immutable.** A string value cannot be mutated in place through
+the surface language — no `s[i] = c`, no in-place append. Operations that "change" a string
+(`toLower`/`toUpper`, `replace`, `trim`, slicing, concatenation) **return a new string**.
+This is the high-level-language consensus — Java/C#/JS/Python/Go strings are immutable,
+Swift's `String` is a value type (mutation is a value-copy, never shared), Rust separates
+immutable `&str` from owned `String` with no aliased mutation; the outliers are the
+systems/`char[]` world and Ruby (whose mutable strings are a well-known footgun, hence
+`frozen_string_literal`).
+
+**Why immutable is the right call for VL specifically:**
+- **Map keys must be stable.** VL's `Map`/`Set` are string-keyed with a cached FNV hash
+  (B6a). A *mutable* key could change after insertion, silently corrupting the table (the
+  hash no longer matches the bucket). Immutability makes strings safe, shareable keys —
+  close to decisive on its own, given how central string-keyed maps are to the compiler we
+  are bootstrapping.
+- **No aliasing footgun.** `let b = a` can freely share the bytes, and substrings/slices
+  can *alias* the parent's backing with no defensive copy, precisely because nothing can
+  mutate them out from under each other. This is the same value-vs-reference question the
+  collections design wrestles with — immutability simply *removes* it for strings (there is
+  no shared mutation to reason about).
+- **The ASCII flag (and any cached length/hash) is trivially stable** — set once at
+  construction, never invalidated; no Ruby-style rescan-on-write.
+- **Concurrency-ready** (future): immutable strings are freely shareable across threads.
+
+**The owner's `toUpper`/`toLower` point — handled by optimization, not by mutability.** The
+strongest pragmatic case *for* mutability is in-place case conversion that yields a
+same-length result. But that is exactly a **compiler optimization on an immutable API**, not
+a reason to expose mutation: `toUpper(s)` is *semantically* a new string, and when the
+compiler can prove the input is **unaliased / dead after the call** (the same linear-use /
+copy-on-write analysis §VL.7 of the collections design uses for representation inference), it
+lowers the "new string" to an **in-place rewrite of the old buffer** — mutable-style speed,
+immutable semantics. Two caveats reinforce keeping it a *new-string* op with *optional*
+in-place rather than a mutable API:
+- **Case conversion is not always length-preserving** — `ß`→`SS`, `ﬃ`→`FFI`, and various
+  locale/Unicode mappings change the *byte* (and code-point) length. So "same length ⇒
+  mutate in place" is a *conditional* fast path the compiler takes when the lengths happen to
+  coincide, never a guarantee — an immutable-returns-new model is correct regardless, while a
+  mutable model would have to handle the resize anyway.
+- The in-place rewrite needs the unaliased proof either way; absent it, you must allocate —
+  which is exactly what the immutable semantics already say.
+
+So: **immutable strings; mutation-shaped ops return new strings; in-place is an opportunistic
+compiler optimization.** The owner's framing ("more a compiler-optimizing concern") is exactly
+right — promoted here to an explicit decision with its rationale, since the ASCII fast path and
+the map-key story both quietly depend on it.
 
 ---
 
