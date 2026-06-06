@@ -89,6 +89,11 @@ const build = async (): Promise<void> => {
     platform: "browser",
     conditions: ["browser"],
     target: "es2022",
+    // Monaco's ESM imports `.css` (its widget styles) and a `.ttf` (the codicon
+    // icon font). esbuild bundles the CSS into a sibling `dist/playground.css`
+    // (loaded by index.html); inline the font as a data: URL so there's no extra
+    // asset to serve. Without these loaders esbuild errors on the imports.
+    loader: { ".ttf": "dataurl" },
     sourcemap: true,
     // Quiet, but surface real problems.
     logLevel: "info",
