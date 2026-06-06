@@ -179,6 +179,16 @@ const summarize = (
 
 // --- run ------------------------------------------------------------------
 
+// True only when stdin is an interactive terminal (not piped/redirected). Used
+// to avoid blocking forever on `Deno.stdin` when there is nothing to read.
+const stdinIsTerminal = (): boolean => {
+  try {
+    return Deno.stdin.isTerminal();
+  } catch {
+    return false;
+  }
+};
+
 const readSource = async (args: string[]): Promise<string> => {
   const flagIndex = args.indexOf("-e");
   if (flagIndex !== -1) return args[flagIndex + 1] ?? "";
@@ -190,12 +200,34 @@ const readSource = async (args: string[]): Promise<string> => {
   return await new Response(Deno.stdin.readable).text();
 };
 
+const RUN_USAGE =
+  "usage: vl <file.vl> | -e <source> | < stdin   (vl help for more)";
+
 const run = async (args: string[]): Promise<void> => {
+  // Only fall through to stdin when it is actually piped/redirected. With no
+  // file and no `-e`, an interactive terminal has nothing to read, so blocking
+  // on `Deno.stdin` would hang forever — show usage instead. This also catches a
+  // mistyped subcommand like `vl --check` (the `--` makes it an unknown option
+  // rather than the `check` command, so it lands here) and suggests the fix.
+  const hasInline = args.includes("-e");
+  const positional = args.find((a) => !a.startsWith("-"));
+  if (!hasInline && !positional && stdinIsTerminal()) {
+    const mistyped = args.find((a) =>
+      a.startsWith("-") && SUBCOMMANDS.has(a.replace(/^-+/, ""))
+    );
+    console.error(
+      mistyped
+        ? `vl: unknown option \`${mistyped}\` — did you mean \`vl ${
+          mistyped.replace(/^-+/, "")
+        }\`?`
+        : RUN_USAGE,
+    );
+    Deno.exit(2);
+  }
+
   const source = await readSource(args);
   if (source.trim() === "") {
-    console.error(
-      "usage: vl <file.vl> | -e <source> | < stdin   (vl help for more)",
-    );
+    console.error(RUN_USAGE);
     Deno.exit(2);
   }
 
@@ -262,22 +294,77 @@ const SKIP_DIRS = new Set([
   "reference",
 ]);
 
+// Compile one `--exclude`/`--ignore` pattern into a matcher. A tiny glob→RegExp
+// translation (no dependency): `*` matches anything but a path separator, `**`
+// crosses separators, and every other character is matched literally (regex
+// metacharacters are escaped). A pattern with no glob char is treated as a plain
+// substring/prefix and matches via the same anchored-or-prefix rule below.
+const globToRegExp = (pattern: string): RegExp => {
+  let out = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      if (pattern[i + 1] === "*") {
+        out += ".*"; // `**` crosses path separators
+        i++;
+      } else {
+        out += "[^/]*"; // `*` stops at a separator
+      }
+    } else if ("\\^$.|?+()[]{}".includes(ch)) {
+      out += "\\" + ch; // escape regex metacharacters
+    } else {
+      out += ch;
+    }
+  }
+  // Anchor at start; allow a trailing path segment so a directory pattern like
+  // `tests` matches `tests` and everything beneath it (`tests/...`).
+  return new RegExp(`^${out}(/.*)?$`);
+};
+
+// An exclude matcher tests a candidate path two ways and skips on either:
+//   1. the path RELATIVE TO THE CHECK ROOT (so `--exclude tests` gates the whole
+//      `tests/` subtree, and `--exclude a/b` matches a nested directory), and
+//   2. the BASENAME (so `--exclude '*.gen.vl'` matches generated files anywhere).
+// This is the least-surprising blend of Deno's `--ignore=<paths>` (path-based)
+// and ESLint's `--ignore-pattern` (often basename/glob-based).
+type ExcludeMatcher = (relPath: string, basename: string) => boolean;
+
+export const makeExcludeMatcher = (patterns: string[]): ExcludeMatcher => {
+  if (patterns.length === 0) return () => false;
+  // Normalize: strip leading `./` and trailing `/` so `./tests/` == `tests`.
+  const regexes = patterns.map((p) =>
+    globToRegExp(p.replace(/^\.\//, "").replace(/\/+$/, ""))
+  );
+  return (relPath, basename) =>
+    regexes.some((re) => re.test(relPath) || re.test(basename));
+};
+
 // Recursively collect every `*.vl` file under `dir` (sorted for stable output).
 // Symlinks are not followed (Deno.readDir reports them as neither file nor dir
-// unless resolved) — a sensible default that avoids cycles.
-const collectVlFiles = async (dir: string): Promise<string[]> => {
+// unless resolved) — a sensible default that avoids cycles. `excludes` are
+// applied on top of the hardcoded `SKIP_DIRS`: a directory or file is skipped
+// when it matches any exclude (see `makeExcludeMatcher` for the semantics).
+export const collectVlFiles = async (
+  dir: string,
+  excludes: string[] = [],
+): Promise<string[]> => {
+  const matchesExclude = makeExcludeMatcher(excludes);
   const found: string[] = [];
-  const walk = async (current: string): Promise<void> => {
+  const walk = async (current: string, rel: string): Promise<void> => {
     for await (const entry of Deno.readDir(current)) {
       const path = `${current}/${entry.name}`;
+      const relPath = rel === "" ? entry.name : `${rel}/${entry.name}`;
       if (entry.isDirectory) {
-        if (!SKIP_DIRS.has(entry.name)) await walk(path);
+        if (SKIP_DIRS.has(entry.name)) continue;
+        if (matchesExclude(relPath, entry.name)) continue;
+        await walk(path, relPath);
       } else if (entry.isFile && entry.name.endsWith(".vl")) {
+        if (matchesExclude(relPath, entry.name)) continue;
         found.push(path);
       }
     }
   };
-  await walk(dir);
+  await walk(dir, "");
   found.sort();
   return found;
 };
@@ -322,14 +409,43 @@ const checkFile = async (
   }
 };
 
+type CheckArgs = { target: string; concise: boolean; excludes: string[] };
+
+// Parse `check`'s args into a path target, the `--concise` flag, and the list of
+// `--exclude`/`--ignore` patterns. Both forms are accepted: a separate value
+// (`--exclude foo`) and an inline comma list (`--exclude=foo,bar`). The exclude
+// VALUE is consumed here so it is never mistaken for the path target.
+const parseCheckArgs = (args: string[]): CheckArgs => {
+  let target: string | undefined;
+  let concise = false;
+  const excludes: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--concise") {
+      concise = true;
+    } else if (a === "--exclude" || a === "--ignore") {
+      const value = args[++i];
+      if (value !== undefined) excludes.push(...value.split(","));
+    } else if (a.startsWith("--exclude=") || a.startsWith("--ignore=")) {
+      excludes.push(...a.slice(a.indexOf("=") + 1).split(","));
+    } else if (!a.startsWith("-") && target === undefined) {
+      target = a;
+    }
+  }
+  // Drop empty patterns (e.g. a stray comma) so they don't match everything.
+  return {
+    target: target ?? ".",
+    concise,
+    excludes: excludes.filter((p) => p !== ""),
+  };
+};
+
 const check = async (args: string[]): Promise<void> => {
-  const concise = args.includes("--concise");
+  // No path argument → default to the current working directory (`vl check .`).
+  const { target, concise, excludes } = parseCheckArgs(args);
   // No color when piped, when NO_COLOR is set, or in concise mode (kept plain
   // so scripts/grep see stable bytes).
   const c = makeColors(!concise && shouldColor());
-
-  // No path argument → default to the current working directory (`vl check .`).
-  const target = args.find((a) => !a.startsWith("-")) ?? ".";
 
   let info: Deno.FileInfo;
   try {
@@ -342,7 +458,7 @@ const check = async (args: string[]): Promise<void> => {
   // Build the list of files to check: a single file, or every `*.vl` under a dir.
   let files: string[];
   if (info.isDirectory) {
-    files = await collectVlFiles(target);
+    files = await collectVlFiles(target, excludes);
     if (files.length === 0) {
       console.error(`check: no .vl files found under ${target}`);
       Deno.exit(0);
@@ -377,8 +493,8 @@ Usage:
   vl <file.vl>                 compile and run a file
   vl -e "<source>"             compile and run an inline snippet
   cmd | vl   ·   vl < file.vl   compile and run stdin
-  vl build <file.vl> [options] compile to WebAssembly
-  vl check [path] [--concise]  report diagnostics only (no run); CI exit code
+  vl build <file.vl> [options]  compile to WebAssembly
+  vl check [path] [options]     report diagnostics only (no run); CI exit code
   vl help  ·  --help  ·  -h     show this help
 
 build options:
@@ -389,20 +505,17 @@ check:
   path                         a .vl file, or a directory checked recursively
                                (default: the current directory)
   --concise                    one terse line per diagnostic (grep-safe)
+  --exclude, --ignore <glob>   skip paths matching <glob> when walking a
+                               directory; repeatable, or comma-separated.
+                               Matches the path relative to <path> and the
+                               basename; \`*\` stops at \`/\`, \`**\` crosses it
 
 examples:
   vl hello.vl
   vl -e 'print(1 + 2)'
   vl build hello.vl --wat
-  vl check .`;
-
-const stdinIsTerminal = (): boolean => {
-  try {
-    return Deno.stdin.isTerminal();
-  } catch {
-    return false;
-  }
-};
+  vl check .
+  vl check . --exclude tests --exclude '*.gen.vl'`;
 
 const main = async (): Promise<void> => {
   const [maybeCmd, ...rest] = Deno.args;
@@ -434,4 +547,6 @@ const main = async (): Promise<void> => {
   return await run(args);
 };
 
-await main();
+// Run the CLI only when executed directly, not when imported (e.g. by tests
+// that exercise `collectVlFiles`/`makeExcludeMatcher`).
+if (import.meta.main) await main();
