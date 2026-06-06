@@ -199,59 +199,6 @@ const listClearFn = (ctx: ListBuiltinContext, lt: ListType): string => {
   return name;
 };
 
-// `__list_extend_T__(a, b)`: in-place append-all (§VL.4) — grow `a` to fit
-// `len(a) + len(b)` in *one* allocation if needed (array.new_default of the new
-// total, array.copy a's live elements, swap), then one array.copy of b's
-// elements at offset `len(a)`, then bump `a.len`. One copy of b regardless of
-// size — never a per-element push loop. Returns null. Locals: 2 = need (new len),
-// 3 = newBacking.
-const listExtendFn = (ctx: ListBuiltinContext, lt: ListType): string => {
-  const { m, binaryen, helpers, listBacking, listLen, listCap } = ctx;
-  const name = `__list_extend_${ctx.tagOf(lt)}__`;
-  if (helpers.has(name)) return name;
-  helpers.add(name);
-  const a = () => m.local.get(0, lt.refType);
-  const b = () => m.local.get(1, lt.refType);
-  const need = () => m.local.get(2, binaryen.i32);
-  const newBacking = () => m.local.get(3, lt.backing.refType);
-  const body = m.block(null, [
-    m.local.set(2, m.i32.add(listLen(a()), listLen(b()))),
-    // Grow-to-fit in one shot when the total exceeds the current capacity.
-    m.if(
-      m.i32.gt_s(need(), listCap(a())),
-      m.block(null, [
-        m.local.set(3, m.array.new_default(lt.backing.heapType, need())),
-        m.array.copy(
-          newBacking(),
-          m.i32.const(0),
-          listBacking(lt, a()),
-          m.i32.const(0),
-          listLen(a()),
-        ),
-        m.struct.set(LIST_BACKING, a(), newBacking()),
-        m.struct.set(LIST_CAP, a(), need()),
-      ]),
-    ),
-    // One bulk copy of b's live elements at offset len(a).
-    m.array.copy(
-      listBacking(lt, a()),
-      listLen(a()),
-      listBacking(lt, b()),
-      m.i32.const(0),
-      listLen(b()),
-    ),
-    m.struct.set(LIST_LEN, a(), need()),
-  ], binaryen.none);
-  m.addFunction(
-    name,
-    binaryen.createType([lt.refType, lt.refType]),
-    binaryen.none,
-    [binaryen.i32, lt.backing.refType],
-    body,
-  );
-  return name;
-};
-
 // `__list_get_T__(list, i): T | null` — the safe, checked accessor (§VL.6): `i`
 // in `[0, len)` returns the element (boxed into the nullable rep), else `null`.
 // The unsigned compare folds the `i < 0` check in (`len >= 0`).
@@ -332,19 +279,6 @@ export const lowerListMethodCall = (
   }
   if (prop === "clear") {
     return m.call(listClearFn(ctx, lt), [toExpression(recv)], binaryen.none);
-  }
-  if (prop === "extend") {
-    return m.call(
-      listExtendFn(ctx, lt),
-      [
-        toExpression(recv),
-        withDesiredType(
-          { type: "Object", properties: [{ name: ctx.i32Type, type: lt.element }] },
-          () => toExpression(node.arguments[0].value),
-        ),
-      ],
-      binaryen.none,
-    );
   }
   return null;
 };

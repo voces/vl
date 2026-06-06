@@ -719,19 +719,6 @@ export const listMemberType = (
     paramaters: [],
     return: { type: "Alias", name: "null" },
   },
-  // In-place append-all: one grow-to-fit, one bulk copy of `other`'s elements.
-  extend: {
-    type: "Function",
-    paramaters: [{
-      type: "Parameter",
-      name: "other",
-      paramaterType: {
-        type: "Object",
-        properties: [{ name: { type: "Alias", name: "i32" }, type: element }],
-      },
-    }],
-    return: { type: "Alias", name: "null" },
-  },
 });
 
 // A literal `true` loop condition (`while true`) — the loop never exits by
