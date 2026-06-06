@@ -293,11 +293,19 @@ corpus (A12) is the host-agnostic oracle — the same tests pass whichever compi
   embedded — see C5. Decoupled from everything below; today's compiler unchanged.
 - ✅ **H1. Parser self-hostable (= Track G).** The one piece that categorically can't live in a
   VL-in-VL compiler is gone.
-- ⬜ **H2. Make VL expressive enough to write a compiler.** Recursive tree types (**A11 ✅**), generic
-  collections (**A10**, **B6** `List`, **B6a** maps), string munging (**A7** methods). A10 +
-  collections are the remaining gap — the capability bar for the port.
+- 🟡 **H2. Make VL expressive enough to write a compiler.** Recursive tree types (**A11 ✅**), generic
+  collections (**A10 ✅**, **B6** `List` ✅ + `map`/`filter` ✅, **B6a** maps ⬜), string munging (**A7** methods).
+  **Gaps found by the `selfhost/lexer.vl` spike (H3 slice)** — concrete H2 to-dos, ranked by impact:
+  (1) **can't `.push` onto a non-nullable struct array** (`Tok[]`) — grow path uses `array.new_with_default`,
+  which non-defaultable struct refs reject → forces `(T|null)[]` for any struct accumulator (blocks AST-node
+  lists; **near-term fix**); (2) **module-level mutable `let` not mutated through a function** (bug or
+  restriction — confirm); (3) **string escapes not decoded** (`"a\nb"` keeps the `\`); plus known: modules
+  (`docs/modules-design.md`), enum tag for literal-unions (A16), maps (B6a), char literals.
 - ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
   running the corpus through the VL-written compiler. Incremental; TS and VL compilers cross-checked.
+  **Started:** `selfhost/lexer.vl` — a working VL-in-VL lexer subset (idents/keywords/numbers/strings/
+  operators/comments + positions), validated by `tests/cases/selfhost/`. First real port slice + the
+  expressiveness-gap oracle (see H2).
 - ⬜ **H4. WASM emission — DECIDED: emit bytes directly + optional `wasm-opt`** (binaryen's npm build
   is JS-bound; → `DECISIONS.md`, incl. the Heap2Local caveat). binaryen stays for the TS compiler.
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime (wasmtime —
