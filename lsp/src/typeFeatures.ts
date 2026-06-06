@@ -165,43 +165,160 @@ const posInRange = (line: number, char: number, range: LspRange): boolean => {
 };
 
 /**
- * Derive type inlay hints from a symbol table: one per *declaration* occurrence
- * (`isDecl`) of a `variable` or `parameter` binding that carries a type. The
- * hint sits just after the identifier and reads `: <type>`.
+ * The source as a flat array of physical lines, for the by-character scanning the
+ * annotation detection below needs. Lazily computed once per `deriveInlayHints`
+ * call and threaded through the helpers. A VL `Position` is 1-based line /
+ * 0-based column; `lines[pos.line - 1][pos.column]` is the char at that position.
+ */
+type SourceLines = string[];
+
+const splitLines = (source: string): SourceLines => source.split("\n");
+
+/**
+ * Scan forward from a VL position over whitespace (including newlines) and
+ * return the first non-whitespace character, plus its position — or `null` at
+ * end of input. Used to peek at what immediately follows a span (e.g. is the
+ * next token a `:` annotation marker?).
+ */
+const nextNonSpace = (
+  lines: SourceLines,
+  start: Position,
+): { ch: string; pos: Position } | null => {
+  let line = start.line - 1; // 0-based index into `lines`
+  let col = start.column;
+  while (line < lines.length) {
+    const text = lines[line] ?? "";
+    while (col < text.length) {
+      const ch = text[col];
+      if (!/\s/.test(ch)) return { ch, pos: { line: line + 1, column: col } };
+      col++;
+    }
+    line++;
+    col = 0;
+  }
+  return null;
+};
+
+/**
+ * Whether the declaration whose identifier ends at `idEnd` carries an explicit
+ * `: Type` annotation in the source. VL writes the annotation immediately after
+ * the binding name — `let x: i32 = …`, `const y: T = …`, a parameter `(a: i32)`
+ * — so the binding is annotated iff the first non-whitespace character after the
+ * identifier is a colon. (An object literal's `{ x: 1 }` colons belong to the
+ * literal, not the binding: the binding name there is followed by `=`/`)`/`,`,
+ * never `:`.) This is what lets us honour the headline rule — only hint
+ * *inferred* positions, never echo an annotation the user already wrote — without
+ * a compiler-core change (the symbol table doesn't record an `annotated` flag).
+ */
+const isAnnotated = (lines: SourceLines, idEnd: Position): boolean =>
+  nextNonSpace(lines, idEnd)?.ch === ":";
+
+/**
+ * The position of the matching `)` that closes the parameter list opened by the
+ * first `(` at or after `from`, or `null` if unbalanced / absent. Used to place a
+ * function's return-type hint (which sits just after the `)`), and to find the
+ * gap in which an explicit return annotation (`): T`) would appear. Tracks paren
+ * depth so nested parens (a default value, a parenthesised type) don't fool it.
+ */
+const closingParen = (lines: SourceLines, from: Position): Position | null => {
+  let line = from.line - 1;
+  let col = from.column;
+  let depth = 0;
+  let opened = false;
+  while (line < lines.length) {
+    const text = lines[line] ?? "";
+    while (col < text.length) {
+      const ch = text[col];
+      if (ch === "(") {
+        depth++;
+        opened = true;
+      } else if (ch === ")") {
+        depth--;
+        if (opened && depth === 0) return { line: line + 1, column: col + 1 };
+      }
+      col++;
+    }
+    line++;
+    col = 0;
+  }
+  return null;
+};
+
+const toLsp = (pos: Position): { line: number; char: number } => ({
+  line: pos.line - 1, // 1-based VL → 0-based LSP
+  char: pos.column,
+});
+
+/**
+ * Whether a type is an unresolved inference hole — an `Infer` placeholder or a
+ * bare `Unknown` (`any`) — for which a hint would read `: I<…>` / `: any`. Those
+ * are noise, not the concrete inferred type the feature promises (they occur for
+ * an unconstrained generic parameter), so we skip hinting them.
+ */
+const isHole = (type: VLType): boolean =>
+  type.type === "Infer" || type.type === "Unknown";
+
+/**
+ * Derive type inlay hints from a symbol table: surface the *inferred* type at
+ * each declaration the user left unannotated. Three positions:
+ *   - a `let`/`const` binding (`variable`) with no `: T` — `name: <type>`;
+ *   - a function `parameter` with no `: T` — `name: <type>`;
+ *   - a `function`'s omitted return type — `): <type>` after the param list.
+ *
+ * Crucially, a declaration the user *already annotated* gets NO hint — echoing
+ * the written annotation is noise, the opposite of the feature's point. We detect
+ * the annotation from the source text ({@link isAnnotated} / the return-gap scan)
+ * since the symbol table records `binding.type` but not whether it was authored
+ * or inferred. `source` is therefore required for suppression; without it (legacy
+ * callers / pure-table tests) every eligible declaration is hinted.
  *
  * `stringify` is injected (rather than importing `stringifyType` here) so this
- * stays a pure data transform and tests can pass a trivial stub.
- *
- * Limitation: the symbol table records `binding.type` for *every* binding but
- * not whether that type came from a *source annotation* (`let x: i32 = …`) or
- * was *inferred*. So we can't reliably suppress hints on already-annotated
- * bindings from the table alone; we hint all eligible declarations. (Suppressing
- * annotated ones would need the parser to record an `annotated` flag on the
- * binding — a compiler-core change.) Function/type declarations are skipped:
- * functions show their signature elsewhere and a `type` alias names its own RHS.
+ * stays a pure data transform and tests can pass a trivial stub. A `type` alias
+ * is never hinted (it names its own RHS).
  */
 export const deriveInlayHints = (
   table: SymbolTable,
   stringify: (type: VLType) => string,
   range?: LspRange,
+  source?: string,
 ): TypeInlayHint[] => {
+  const lines = source !== undefined ? splitLines(source) : undefined;
   const hints: TypeInlayHint[] = [];
+
+  const push = (pos: { line: number; char: number }, label: string, name: string) => {
+    if (range && !posInRange(pos.line, pos.char, range)) return;
+    hints.push({ line: pos.line, char: pos.char, label, name });
+  };
+
   for (const occ of table.occurrences) {
     if (!occ.isDecl) continue;
     const { binding } = occ;
-    if (binding.kind !== "variable" && binding.kind !== "parameter") continue;
     if (binding.type === undefined) continue;
-    // Place the hint at the end of the declaring identifier.
-    const end: Position = occ.span.stop;
-    const line = end.line - 1; // 1-based VL → 0-based LSP
-    const char = end.column;
-    if (range && !posInRange(line, char, range)) continue;
-    hints.push({
-      line,
-      char,
-      label: `: ${stringify(binding.type)}`,
-      name: binding.name,
-    });
+
+    if (binding.kind === "variable" || binding.kind === "parameter") {
+      // Skip already-annotated bindings (the headline rule). Without `source`
+      // we can't tell, so we hint all eligible declarations (legacy behaviour).
+      if (lines && isAnnotated(lines, occ.span.stop)) continue;
+      if (isHole(binding.type)) continue;
+      push(toLsp(occ.span.stop), `: ${stringify(binding.type)}`, binding.name);
+      continue;
+    }
+
+    if (binding.kind === "function" && binding.type.type === "Function") {
+      // Return-type hint: only when the user omitted it, and only when we can
+      // locate the param list's `)` from the source. Place it just after `)`.
+      if (!lines) continue;
+      if (isHole(binding.type.return)) continue;
+      const close = closingParen(lines, occ.span.stop);
+      if (!close) continue;
+      // Annotated iff the next non-whitespace char after `)` is `:`.
+      if (isAnnotated(lines, close)) continue;
+      push(
+        toLsp(close),
+        `: ${stringify(binding.type.return)}`,
+        binding.name,
+      );
+    }
   }
   return hints;
 };
