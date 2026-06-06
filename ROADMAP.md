@@ -111,9 +111,11 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   member-call. REMAINING: methods via `self`+UFCS (B14); method-shorthand `{ add(a,b) … }` (parser);
   typed literals in object values (`{n: 4<i64>}`); Exact-by-default for values (A8).
 - 🟡 **B6. Arrays** (WasmGC). MVP done: fixed-length arrays — literal/`a[i]`/`a[i]=v`/`a.length`,
-  bounds-trap. Size-member design DECIDED (→ `DECISIONS.md`). REMAINING: growable list/vector
-  (`{ array, len, cap }`, tier 2) — design DECIDED on **name `List`** and **2× growth**; `DECISIONS.md`
-  entry lands with implementation.
+  bounds-trap (today). Size-member design DECIDED (→ `DECISIONS.md`). Indexing design DECIDED:
+  **result-by-default `a[i]: T | null`** (OOB → `null`) for arrays *and* `List` — flips today's
+  fixed-array OOB-trap; trapping becomes an opt-in asserting accessor (→ `docs/collections-design.md`).
+  REMAINING: growable list/vector (`{ array, len, cap }`, tier 2) — design DECIDED on **name `List`**
+  and **2× growth**; `DECISIONS.md` entry lands with implementation.
 - ⬜ **B6a. Maps / non-string keys** (`Map<K,V>` — a separate hash type, not every-object-as-table; →
   `DECISIONS.md`). Index sigs `{[string]: T}` type-check but are dropped at codegen — this is their
   codegen, via B13's `"[]"`/`"[]="` traps. Deferred.
@@ -127,21 +129,32 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
     dependency: VL has no module system yet (std-module loading is unresolved).
   - **`[...]` list-vs-array syntax fork** (open decision) — (a) keep `[...]` fixed + growable via
     `List(...)`, or (b) make `[...]` the growable `List` with a distinct fixed-array spelling.
-  - **Indexing perf — inline-native vs B13 method dispatch** (open) — a pure-VL `List` whose `l[i]`
-    routes through the B13 `"[]"` method is a per-access (indirect) call; to match native-array speed
-    `l[i]` must inline to a bounds-checked `array.get` (reliably-inlinable monomorphized `"[]"`, or a
-    slice of native indexing lowering). The one spot `List` likely needs compiler privilege under
-    "std over primitives."
+  - **Indexing default — `a[i]: T | null`** (DECIDED) — result-by-default for fixed arrays *and*
+    `List`: OOB reads return `null`, not a trap (one shared rule; flips today's fixed-array OOB-trap).
+    The trapping form is an opt-in *asserting* accessor (`getUnchecked(i): T` / `a[i]!`), the
+    discouraged escape hatch. (→ `docs/collections-design.md` §VL.6.)
+  - **Bounds-narrowing — the enabler** (open; **core narrowing engine**, not collections-only) —
+    extend VL's flow-narrowing (A5) to array bounds so a provably-in-range `a[i]` (inside
+    `for i in 0 to a.length`, after `if i < a.length`, or a guard) narrows from `T | null` to `T` — no
+    null-handle, no per-access unwrap, a bare `array.get`. This is what makes result-by-default indexing
+    safe AND native-speed; without it the safe default is slower than trapping (a safety-vs-speed
+    inversion). Headline enabler for the indexing decision.
+  - **Indexing perf — inline-native vs B13 method dispatch** (open, secondary to bounds-narrowing) — a
+    pure-VL `List` whose `l[i]` routes through the B13 `"[]"` method is a per-access (indirect) call; to
+    match native-array speed `l[i]` must inline to a bounds-checked `array.get` (reliably-inlinable
+    monomorphized `"[]"`, or a slice of native indexing lowering). The one spot `List` likely needs
+    compiler privilege under "std over primitives."
   - **Value vs reference — language-wide** (open; default **reference**) — not collections-only:
     objects *and* collections decided together. v1 = reference everywhere (consistent with VL objects;
     Python/JS/Java); coherent alternative is Swift-style value-everywhere-with-COW, *only if uniform*.
-  - **Error model — language-wide** (open; errors-as-values) — fallible ops encode failure in the
-    return type via unions (`T | null` absence, `T | E` discriminated with `is`) over try/catch;
-    traps reserved for unrecoverable. Ties to the AST `// TODO: exceptions`; `pop`'s `T | null` is the
-    lightweight instance.
+  - **"Result by default" — language principle** (errors-as-values) — fallible ops return values, not
+    control-flow escapes: `T | null` for absence, `T | E` (discriminated with `is`) for "failed with a
+    reason", over try/catch; **traps reserved for unrecoverable bugs, an explicit discouraged opt-in**.
+    Generalizes the errors-as-values direction; indexing (`a[i]: T | null`) and `pop(): T | null` are
+    instances. Ties to the AST `// TODO: exceptions` (the broader try/catch question stays open).
   - **List surface/semantics open questions** — literal syntax; capacity/seed construction specifics;
-    `map`/`filter` return type. DECIDED: name `List`, 2× growth, `pop(): T | null`, `l[i]` traps inline
-    (opt-in `get(i): T | null` safe accessor). Tracked in the design doc.
+    `map`/`filter` return type. DECIDED: name `List`, 2× growth, `pop(): T | null`, **result-by-default
+    `a[i]: T | null`** (opt-in asserting/trapping accessor). Tracked in the design doc.
 - 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
   `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.

@@ -14,10 +14,14 @@ VL needs a growable, ordered, indexable sequence — the substrate for
 tier-2 layer on top of WasmGC's fixed-length `array` heap type.
 
 **Decided this review round** (recorded here; the `DECISIONS.md` entry lands with
-implementation, not before): the type is named **`List`**, and the **growth
-factor is 2×** for v1. Still open: the `[...]` syntax fork, value-vs-reference
-(language-wide), the error model (language-wide), indexing perf
-(inline-native vs B13 dispatch), and the capacity/seed surface specifics.
+implementation, not before): the type is named **`List`**, the **growth
+factor is 2×** for v1, and **indexing is result-by-default — `a[i]: T | null`**
+(safe / OOB → `null`) for **both** fixed arrays and `List`, with a trapping
+*asserting* accessor as the discouraged opt-in. Still open: the `[...]` syntax
+fork, value-vs-reference (language-wide), the error model (language-wide),
+indexing perf (the **bounds-narrowing** enabler — see §VL.6/§OQ.4 — that keeps
+result-by-default indexing native-speed), and the capacity/seed surface
+specifics.
 
 Recommendation in one screen:
 
@@ -52,7 +56,27 @@ Recommendation in one screen:
    compute, B14). `l[i]` / `l[i] = v` route through the B13 `"[]"`/`"[]="` index
    traps (assumed to land in parallel). `.length` is the O(1) uniform-access
    property (read-only, per DECISIONS B6); `.capacity` is the sibling O(1)
-   property. Out-of-bounds **traps** in v1 (matches the fixed-array MVP). (§VL.4–6)
+   property. **Indexing is result-by-default**: `l[i]` (and fixed-array `a[i]`)
+   return **`T | null`** — out-of-bounds yields `null`, not a trap. A trapping
+   *asserting* accessor (e.g. `a[i]!` / `getUnchecked(i): T`) is the explicit,
+   discouraged opt-in for "I know it's in bounds." (§VL.4–6) **This changes
+   today's fixed-array behavior** (`a[i]` currently traps on OOB → becomes
+   `T | null`); arrays are early enough to change, and one rule for arrays and
+   lists is the consistent choice. The cost — a null-handle on every access — is
+   paid down by **bounds-narrowing** (§VL.6): inside `for i in 0 to a.length`
+   or after `if i < a.length`, `a[i]` narrows from `T | null` to `T`.
+
+**Language principle — "result by default."** Fallible operations return values,
+not control-flow escapes: absence is `T | null`, "failed with a reason" is
+`T | E` (a discriminated union narrowed with `is`) — leaning on VL's existing
+union + `is`/`??`/`?.` narrowing rather than try/catch (VL has no catchable
+throw). **Traps are reserved for unrecoverable bugs and are an explicit,
+discouraged opt-in**, not the default for ordinary fallibility. This generalizes
+the errors-as-values direction already noted for the language (§OQ.3); indexing
+(`a[i]: T | null`), `pop(): T | null`, and the asserting/trapping accessors are
+instances of it. The cost of result-by-default in hot code is mitigated by
+**bounds-narrowing** (§VL.6) — proving an index in range erases the `null` arm at
+compile time.
 
 The rest of this doc is: the cross-language survey and the synthesized
 trade-offs, then the VL design with rationale + rejected alternatives, then a
@@ -133,7 +157,9 @@ is opt-in (`shrink_to_fit`, `trimToSize`). The sane default is **grow-only**.
 - **Fixed arrays (B6 MVP).** A VL array is a contiguous WasmGC `array` (one
   interned `(array mut T)` heap type **per element wasm type** — `arrayType()` in
   `toWasm.ts`). `a[i]` → `array.get`, `a[i] = v` → `array.set`, `a.length` →
-  `array.len` (an intrinsic, *not* a stored field). Bounds are trap-checked. The
+  `array.len` (an intrinsic, *not* a stored field). Bounds are trap-checked
+  **today** — but this review flips fixed-array `a[i]` to result-by-default
+  (`T | null`) to share one indexing rule with `List` (§VL.6). The
   length is fixed at `array.new_fixed` time.
 - **Monomorphization (A10).** Top-level generic functions monomorphize per call
   shape; inference holes collapse to a single concrete type before codegen (the
@@ -336,12 +362,16 @@ construction.
     the change. (*Possible future optimization, not a semantic change:* when the
     compiler can prove `a` is unaliased at the `+=`, lower `a += b` to an in-place
     `extend` — same observable result, the new allocation elided.)
-- **Indexing.** `l[i]` and `l[i] = v` route through the **B13 `"[]"`/`"[]="`
-  index traps** (assumed landing in parallel). The `"[]"` lowering is
-  `bounds-check i against len, then array.get backing`; `"[]="` is
-  `bounds-check, then array.set`. Crucially the bound is **`len`, not the backing
-  array's physical length** — the spare capacity slots `[len, cap)` are not
-  user-addressable.
+- **Indexing — result by default (`l[i]: T | null`).** `l[i]` and `l[i] = v`
+  route through the **B13 `"[]"`/`"[]="` index hooks** (assumed landing in
+  parallel). Reads are **result-oriented**: `l[i]` checks `i` against `len` and
+  yields the element as **`T | null`** — out-of-bounds is `null`, not a trap (the
+  same rule as fixed arrays — see §VL.6). The bound is **`len`, not the backing
+  array's physical length** — the spare capacity slots `[len, cap)` read as `null`
+  just like any other OOB index. The `"[]="` lowering bounds-checks the same way.
+  The trapping form is the explicit *asserting* accessor (§VL.6), not `[i]`.
+  Where the compiler can prove `i` in range, **bounds-narrowing** (§VL.6) drops
+  the `null` and the check, recovering a bare `array.get`.
 - **Size members** (O(1), property syntax, read-only — DECISIONS B6):
   - `l.length` → `struct.get $len` (O(1), the logical size; mirrors arrays'
     `.length` but reads the field instead of `array.len`).
@@ -359,11 +389,12 @@ new dispatch mechanism or fighting the fixed-array literal.
   `struct.get $len`. Same surface, two native lowerings — the uniform-access
   principle the decision was made to preserve. A user can read `l.length` but not
   assign it; resizing is via `push`/`pop`, never `l.length = n`.
-- The index traps see `len`, not `cap`. `l[i]` for `i in [0, len)` is valid;
-  `i in [len, cap)` (spare capacity) **traps as out-of-bounds** even though the
-  physical slot exists — the spare slots are an allocation detail, not addressable
-  state. This is the Go/Rust semantics (you index `len`, capacity is invisible to
-  `[]`).
+- Indexing sees `len`, not `cap`. `l[i]` for `i in [0, len)` returns the element;
+  `i in [len, cap)` (spare capacity) and any other out-of-range `i` read as
+  **`null`** even though the physical slot may exist — the spare slots are an
+  allocation detail, not addressable state. This is the Go/Rust *bound* (you index
+  `len`, capacity is invisible to `[]`); VL differs only in returning `null`
+  rather than trapping on the OOB case.
 - `length`/`count`/`capacity` stay distinct per DECISIONS B6: a dense list uses
   `length` (= live element count = `len`) and `capacity` (= `cap`). A future
   sparse collection would use `count`/`extent`; a list never overloads `length`
@@ -371,21 +402,42 @@ new dispatch mechanism or fighting the fixed-array literal.
 
 ### VL.6 — Bounds, iteration, and out-of-scope (v1)
 
-- **Bounds behavior: `l[i]` traps inline.** Out-of-bounds `l[i]` / `l[i] = v`
-  **traps**, exactly like fixed-array `a[i]` — a bounds-checked `array.get` on the
-  backing, **not** a null-returning function call. The result-oriented form is the
-  **opt-in `get(i): T | null`** (Rust's `v[i]` panic vs `v.get(i)`; Swift `a[i]`
-  trap) for callers who want absence as a value — a natural addition, not v1.
-  Trap is the default discipline; the safe accessor is the explicit layer.
-- **Indexing perf — the inline-vs-dispatch tension (open).** This is the one place
-  a *pure-VL* `List` likely needs compiler privilege. If `l[i]` routes through the
-  B13 `"[]"` method, that method is currently an (indirect) call **per access** —
-  death in a tight loop. To match native-array speed, `l[i]` must inline to a
-  bounds-checked `array.get` on the backing with **no per-access call**, via either
-  (a) a reliably-inlinable monomorphized `"[]"`, or (b) a small amount of
-  native indexing lowering (compiler-aware) even while the rest of `List` stays
-  pure-VL std. Captured as an open perf decision (§OQ.4 / §LS.7) — inline-native
-  indexing vs B13 method dispatch.
+- **Bounds behavior: `l[i]` is result-by-default (`T | null`).** Out-of-bounds
+  `l[i]` / `l[i] = v` yields **`null`**, *not* a trap — and **the same rule
+  applies to fixed-array `a[i]`** (one shared indexing rule for arrays and lists;
+  see the implication note below). This is the **"result by default"** language
+  principle (Summary; §OQ.3) applied to indexing: absence is a value, not a
+  control-flow abort. The trapping form is an **opt-in *asserting* accessor** for
+  "I know it's in bounds" — named to signal it is unchecked/asserting (e.g.
+  `getUnchecked(i): T` or an `a[i]!` postfix form), **not** plain `get` (which
+  conventionally names the *safe* accessor, so reserving `get` for trapping would
+  invert every reader's expectation). Trapping is the **explicit, discouraged
+  escape hatch**; the safe `T | null` form is the default.
+
+  **Implication — this changes today's fixed-array behavior.** Fixed-array `a[i]`
+  *currently traps* on OOB (the B6 MVP). Under result-by-default it becomes
+  `T | null`, matching `List`. Arrays are early enough that changing this is cheap,
+  and a single rule for both is the cohesive choice — the alternative (lists
+  null-by-default while arrays keep trapping) would be a gratuitous inconsistency
+  between two collections that index identically.
+- **Bounds-narrowing — the enabler that makes this practical (key).** The cost of
+  `T | null` indexing is real: *every* access forces a null-handle, and for scalar
+  elements `i32 | null` is a niche/tagged value, so each read pays a per-access
+  unwrap — noisy in source and slower in hot loops. Left unaddressed, the *safe*
+  default would be slower and noisier than trapping — a safety-vs-speed inversion.
+  The fix is to **extend VL's existing flow-narrowing to array bounds**: when the
+  compiler can prove the index is in range — inside `for i in 0 to a.length`, or
+  in the then-branch of `if i < a.length`, or after an explicit bounds guard —
+  **narrow `a[i]` from `T | null` to `T`**: no `null` arm, no unwrap, no tag, no
+  trap, just a bare `array.get`. This is the same narrowing engine that already
+  refines nullness and union members (A5, `docs/narrowing.md`), pointed at the
+  index/length relation. With it, result-by-default indexing is **safe AND
+  ergonomic AND native-speed in the common case** (the loop/guarded access), and
+  the `T | null` only survives where the compiler genuinely can't prove the bound
+  — exactly where a check is warranted. Bounds-narrowing is therefore the enabler
+  that makes the result-by-default decision practical rather than a tax; it is the
+  headline open work (§OQ.4) because it touches the **core narrowing engine**, not
+  just `List`.
 - **`pop()` on empty — recommend `pop(): T | null`.** A `pop(): T` has no `T` to
   return on empty, so it could only trap or hand back garbage (unsound); encoding
   absence in the type keeps it **total** and type-safe. This composes with
@@ -398,9 +450,10 @@ new dispatch mechanism or fighting the fixed-array literal.
   abort, like Rust `panic!` (`a[i]` out-of-bounds already traps today) — but **no
   exceptions** (no catchable throw). So the real choice for empty `pop` is *trap*
   vs *total `T | null`*, never "throw." We take total `T | null`: empty-pop is an
-  ordinary control-flow condition, not a program bug. A future Swift-style
-  trapping `removeLast()` for the "known non-empty" case is a natural addition
-  (the same dual as `l[i]` trap vs `get(i): T | null` indexing) — not v1.
+  ordinary control-flow condition, not a program bug — the same **result by
+  default** discipline as indexing. A future Swift-style trapping `removeLast()`
+  for the "known non-empty" case is a natural addition (the same dual as the
+  safe `a[i]: T | null` vs the asserting/trapping accessor for indexing) — not v1.
 - **Iteration.** `for x in list` works exactly like `for x in array` (B8),
   iterating `[0, len)` via `array.get` on the backing. (`for x, i in list` index
   form rides on the same B8 destructuring work as arrays.) **Mutating the list
@@ -413,7 +466,8 @@ new dispatch mechanism or fighting the fixed-array literal.
 - `insert(i, x)` / `remove(i)` at arbitrary positions (O(n) shift) — `push`/`pop`
   (ends) only in v1.
 - `shrinkToFit()` / any auto-shrink — grow-only.
-- Non-trapping `get`/`getOrNull`.
+- The asserting/trapping accessor (`getUnchecked(i): T` / `a[i]!`) — the
+  discouraged opt-in escape hatch; the safe `a[i]: T | null` is the v1 default.
 - Slicing a list into a view that **aliases** the backing (Go-style shared
   backing); v1 `slice` (if any) copies.
 - A dedicated list **literal** syntax (use `List(...)` for now).
@@ -480,9 +534,11 @@ here** — this is the plan the design commits to.
    type" capability this subsystem unblocks.
 7. **Tests.** A `tests/cases/collections/` corpus: construct/push/pop, growth
    (assert `length` vs `capacity` across the doubling boundary), index get/set,
-   bounds-trap cases, `map`/`filter`, `for…in`, empty-`pop` nullable narrowing,
-   plus `xfail-*` files pinning the out-of-scope gaps (insert/remove, shrink,
-   non-trapping get, COW) per the soundness-corpus convention.
+   **OOB `[i]` → `null`** cases (and the **bounds-narrowed** in-range case lowering
+   to a plain `array.get` with no `null`), `map`/`filter`, `for…in`, empty-`pop`
+   nullable narrowing, plus `xfail-*` files pinning the out-of-scope gaps
+   (insert/remove, shrink, the asserting/trapping accessor, COW) per the
+   soundness-corpus convention.
 8. **Docs.** Flip `ROADMAP` B6 tier-2 to a one-line done marker; add a terse
    DECISIONS entry (2× growth + monomorphized-not-boxed + grow-only, with the
    "WasmGC has no realloc/free so the golden-ratio argument doesn't apply"
@@ -501,23 +557,34 @@ here** — this is the plan the design commits to.
    nice predictability (nothing mutated through an alias), cheap via COW — but
    only if applied **uniformly** to structs/objects *and* collections, decided
    once language-wide. Do not bolt COW onto `List` alone.
-3. **Error model — language-wide (errors-as-values).** The direction the owner
-   favors: fallible ops encode failure **in the return type** via unions —
-   `T | null` for absence, `T | E` (discriminated with `is`) for "failed with a
-   reason" — rather than try/catch, leaning on VL's existing union + `is`/null
-   narrowing; **traps stay reserved for unrecoverable** programmer errors (the
-   Rust panic-vs-`Result` split). This ties to the `// TODO: exceptions` stub in
-   the AST — an open language-wide decision, *not* settled here. `pop`'s
-   `T | null` (§VL.6) and the opt-in `get(i): T | null` (§OQ.4) are the
-   lightweight instances of this model.
-4. **Indexing — perf + safe accessor.** `l[i]` traps inline (matches arrays);
-   the opt-in `get(i): T | null` is the safe form (ship it v1, or later?). The
-   harder open call is **perf**: a pure-VL `List` whose `l[i]` goes through the
-   B13 `"[]"` method is a per-access (indirect) call — to reach native-array speed
-   `l[i]` must inline to a bounds-checked `array.get` (no per-access call). Open:
-   **inline-native indexing vs B13 method dispatch** (a reliably-inlinable
-   monomorphized `"[]"`, or a slice of native indexing lowering) — the one spot
-   `List` likely needs compiler privilege even under "std over primitives."
+3. **Error model — language-wide (errors-as-values / "result by default").** The
+   direction the owner favors, now adopted as the indexing default: fallible ops
+   encode failure **in the return type** via unions — `T | null` for absence,
+   `T | E` (discriminated with `is`) for "failed with a reason" — rather than
+   try/catch, leaning on VL's existing union + `is`/null narrowing; **traps stay
+   reserved for unrecoverable** programmer errors and are an explicit, discouraged
+   opt-in (the Rust panic-vs-`Result` split). This ties to the `// TODO: exceptions`
+   stub in the AST — the broader language-wide decision is *not* fully settled
+   here, but **result-by-default indexing is decided this review** (see Summary /
+   §VL.6). `a[i]: T | null`, `pop(): T | null`, and the asserting/trapping
+   accessor (§OQ.4) are the instances of this model.
+4. **Indexing — perf, via bounds-narrowing (the headline open work).** Result-by-
+   default is **decided**: `a[i]: T | null` for arrays and lists, with an
+   asserting/trapping accessor as the opt-in (§VL.6). The remaining open work is
+   **perf**, and it now centers on **bounds-narrowing**: `T | null` per access
+   means a null-handle on every read (and a tagged `i32 | null` for scalars), so
+   to keep indexing native-speed the compiler must **extend flow-narrowing to
+   array bounds** — when `i` is provably in range (`for i in 0 to a.length`, after
+   `if i < a.length`, an explicit guard), narrow `a[i]` to `T` and emit a bare
+   `array.get` with no null/unwrap/check. This is the enabler that makes safe-by-
+   default indexing as fast as trapping; without it the safe default is *slower*
+   than the unsafe one (a safety-vs-speed inversion). It touches the **core
+   narrowing engine** (A5, `docs/narrowing.md`), not just `List`. The secondary
+   dispatch question stands underneath it (a pure-VL `List` whose `l[i]` routes
+   through the B13 `"[]"` method is a per-access indirect call; native-speed wants
+   a reliably-inlinable monomorphized `"[]"` or a slice of native indexing
+   lowering) — the one spot `List` likely needs compiler privilege even under
+   "std over primitives."
 5. **Growth taper.** 2× is **decided** for v1 (above). Whether to later add a
    Go-style taper to ~1.25× past a size threshold stays deferred — a
    constant-factor tweak behind the same API, not a representation change.
@@ -654,7 +721,8 @@ the WasmGC instructions the backend already uses internally. With these two
 primitives, the entire §VL.1–VL.6 `List` is writable as a `.vl` module: the struct,
 the 2× grow (`__array_new_default__(cap * 2)` + `__array_copy__` + swap `backing`),
 `push`/`pop`, `concat`/`extend` (the two-/one-copy bulk combines of §VL.4),
-the `[]`/`[]=` traps bounded by `len`, `.length`/`.capacity`, `map`/`filter`.
+the `[]`/`[]=` index hooks (`len`-bounded, result-by-default `T | null`),
+`.length`/`.capacity`, `map`/`filter`.
 
 **Secondary perf knobs that *might* later want intrinsics — but are not required for
 v1:**
