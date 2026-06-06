@@ -108,6 +108,15 @@ export type Token = {
   start: Position;
   stop: Position;
   /**
+   * For STRING tokens only: the decoded literal value, with the surrounding
+   * quotes removed and escape sequences (`\n`, `\t`, `\\`, `\"`, `\uXXXX`, …)
+   * resolved to their actual characters. `text` keeps the raw source lexeme
+   * (quotes + backslashes) so the token span still measures source extent;
+   * `value` is what a StringLiteral node should carry. Undefined for non-STRING
+   * tokens.
+   */
+  value?: string;
+  /**
    * Markdown doc-comment captured from a run of consecutive `///` lines
    * immediately preceding this (real, non-trivia) token. Each line has its `///`
    * prefix and one optional leading space stripped, and the lines are joined
@@ -217,8 +226,14 @@ export const tokenize = (source: string): LexResult => {
   // it. Reset by EOF handling implicitly (no token follows).
   let lastRealToken: Token | undefined;
 
-  const push = (kind: TokenKind, text: string, start: Position) => {
+  const push = (
+    kind: TokenKind,
+    text: string,
+    start: Position,
+    value?: string,
+  ) => {
     const token: Token = { kind, text, start, stop: pos() };
+    if (value !== undefined) token.value = value;
     // Attach (and consume) a pending `///` run to the first real token after it.
     // NEWLINE is trivia for this purpose — it lets the run span multiple lines —
     // so a run is only handed to a substantive token.
@@ -328,17 +343,133 @@ export const tokenize = (source: string): LexResult => {
       continue;
     }
 
-    // String: `"…"` or `'…'`, with `\<any>` escapes. May span newlines (the
-    // grammar's char class excludes only the quote and backslash).
+    // String: `"…"` or `'…'`, with backslash escapes. May span newlines (the
+    // grammar's char class excludes only the quote and backslash). Escape
+    // sequences are decoded HERE so the STRING token's `value` already holds the
+    // logical characters that flow to the AST and codegen; `text` keeps the raw
+    // source lexeme (quotes + backslashes) so the token span still measures
+    // source extent. Supported escapes: `\n` `\t` `\r` `\\` `\"` `\'` `\0`,
+    // `\b` (8) `\f` (12) `\v` (11), `\xXX` (2 hex), `\uXXXX` (4 hex) and
+    // `\u{…}` (1-6 hex). An unknown escape (e.g. `\q`) or a malformed numeric
+    // escape keeps the character after the backslash verbatim and emits a
+    // warning, so authoring mistakes are visible but never fatal.
     if (c === '"' || c === "'") {
       const quote = c;
       let text = advance(); // opening quote
+      let value = "";
       let closed = false;
       while (i < len) {
         const ch = source[i];
         if (ch === "\\") {
-          text += advance();
-          if (i < len) text += advance();
+          const escStart = pos();
+          text += advance(); // backslash
+          if (i >= len) break; // dangling backslash at EOF; unterminated below
+          const e = source[i];
+          text += advance(); // escaped char
+          switch (e) {
+            case "n":
+              value += "\n";
+              break;
+            case "t":
+              value += "\t";
+              break;
+            case "r":
+              value += "\r";
+              break;
+            case "\\":
+              value += "\\";
+              break;
+            case '"':
+              value += '"';
+              break;
+            case "'":
+              value += "'";
+              break;
+            case "0":
+              value += "\0";
+              break;
+            case "b":
+              value += "\b";
+              break;
+            case "f":
+              value += "\f";
+              break;
+            case "v":
+              value += "\v";
+              break;
+            case "\n":
+            case "\r":
+              // Line continuation: a backslash immediately before a newline
+              // drops both. `advance()` already tracked the line; consume a
+              // paired `\r\n` so column accounting stays correct.
+              if (e === "\r" && source[i] === "\n") text += advance();
+              break;
+            case "x": {
+              const hex = source.slice(i, i + 2);
+              if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+                text += advance() + advance();
+                value += String.fromCharCode(parseInt(hex, 16));
+              } else {
+                value += "x";
+                diagnostics.push({
+                  message:
+                    "Invalid string escape: \\x must be followed by two hex digits",
+                  severity: "warning",
+                  source: "vital",
+                  range: { start: shift(escStart), end: shift(pos()) },
+                });
+              }
+              break;
+            }
+            case "u": {
+              if (source[i] === "{") {
+                const close = source.indexOf("}", i);
+                const hex = close === -1 ? "" : source.slice(i + 1, close);
+                if (close !== -1 && /^[0-9a-fA-F]{1,6}$/.test(hex)) {
+                  const cp = parseInt(hex, 16);
+                  if (cp <= 0x10ffff) {
+                    while (i <= close) text += advance(); // `{` … `}`
+                    value += String.fromCodePoint(cp);
+                    break;
+                  }
+                }
+                value += "u";
+                diagnostics.push({
+                  message:
+                    "Invalid string escape: \\u{…} expects 1-6 hex digits for a valid code point",
+                  severity: "warning",
+                  source: "vital",
+                  range: { start: shift(escStart), end: shift(pos()) },
+                });
+              } else {
+                const hex = source.slice(i, i + 4);
+                if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+                  for (let k = 0; k < 4; k++) text += advance();
+                  value += String.fromCharCode(parseInt(hex, 16));
+                } else {
+                  value += "u";
+                  diagnostics.push({
+                    message:
+                      "Invalid string escape: \\u must be followed by four hex digits or \\u{…}",
+                    severity: "warning",
+                    source: "vital",
+                    range: { start: shift(escStart), end: shift(pos()) },
+                  });
+                }
+              }
+              break;
+            }
+            default:
+              // Unknown escape: keep the character after the backslash verbatim
+              // (so `\q` → `q`) and warn so the typo is visible.
+              value += e;
+              diagnostics.push({
+                message: `Unknown string escape sequence "\\${e}"`,
+                severity: "warning",
+                source: "vital",
+                range: { start: shift(escStart), end: shift(pos()) },
+              });
+          }
           continue;
         }
         if (ch === quote) {
@@ -346,7 +477,7 @@ export const tokenize = (source: string): LexResult => {
           closed = true;
           break;
         }
-        text += advance();
+        value += advance();
       }
       if (!closed) {
         diagnostics.push({
@@ -356,7 +487,7 @@ export const tokenize = (source: string): LexResult => {
           range: { start: shift(start), end: shift(pos()) },
         });
       }
-      push("STRING", text, start);
+      push("STRING", text, start, value);
       continue;
     }
 
