@@ -44,6 +44,13 @@ export type Binding = {
    * closing may never be stamped (and pre-D3 callers never set it).
    */
   scope?: Context;
+  /**
+   * Markdown doc-comment authored on the declaration: the run of consecutive
+   * `///` lines immediately preceding it, concatenated (each line's `///` + one
+   * leading space stripped). Surfaced as rendered markdown in LSP hover and
+   * completion `documentation`. Undefined when the declaration has no `///` doc.
+   */
+  doc?: string;
 };
 
 /** One textual appearance of a name, resolved to the binding it refers to. */

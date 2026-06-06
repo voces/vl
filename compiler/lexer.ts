@@ -80,6 +80,15 @@ export type Token = {
   text: string;
   start: Position;
   stop: Position;
+  /**
+   * Markdown doc-comment captured from a run of consecutive `///` lines
+   * immediately preceding this (real, non-trivia) token. Each line has its `///`
+   * prefix and one optional leading space stripped, and the lines are joined
+   * with `\n`. Only attached to the first real token following the run; a blank
+   * line or any non-`///` content between the run and the token breaks the
+   * association. Plain `//` comments never set this. Undefined when absent.
+   */
+  docComment?: string;
 };
 
 const KEYWORDS: Record<string, TokenKind> = {
@@ -136,8 +145,23 @@ export const tokenize = (source: string): LexResult => {
     return c;
   };
 
+  // Accumulated `///` doc lines for the run currently being built. Joined and
+  // attached to the next real token (see `push`). `lastLineWasDoc` tracks whether
+  // the immediately preceding source line was a `///` line so a blank/code line
+  // in between breaks the run (handled in the NEWLINE branch).
+  let docLines: string[] = [];
+  let lastLineWasDoc = false;
+
   const push = (kind: TokenKind, text: string, start: Position) => {
-    tokens.push({ kind, text, start, stop: pos() });
+    const token: Token = { kind, text, start, stop: pos() };
+    // Attach (and consume) a pending `///` run to the first real token after it.
+    // NEWLINE is trivia for this purpose — it lets the run span multiple lines —
+    // so a run is only handed to a substantive token.
+    if (kind !== "NEWLINE" && docLines.length > 0) {
+      token.docComment = docLines.join("\n");
+      docLines = [];
+    }
+    tokens.push(token);
   };
 
   while (i < len) {
@@ -148,6 +172,12 @@ export const tokenize = (source: string): LexResult => {
     if (c === "\r" || c === "\n") {
       if (c === "\r" && source[i + 1] === "\n") advance();
       advance();
+      // A line that carried no `///` (blank or code) breaks the doc run, so a
+      // non-adjacent `///` doesn't bleed onto a later declaration. We only learn
+      // a line "was a doc line" when its `///` was lexed (sets `lastLineWasDoc`);
+      // a plain newline here with that flag unset drops any accumulated run.
+      if (!lastLineWasDoc) docLines = [];
+      lastLineWasDoc = false;
       push("NEWLINE", "\n", start);
       continue;
     }
@@ -158,9 +188,23 @@ export const tokenize = (source: string): LexResult => {
       continue;
     }
 
-    // Line comment `// …` (skip).
+    // Line comment `// …`. A `///` (but not `////`) line is a doc-comment: its
+    // text is captured and later attached to the following declaration's token.
+    // Plain `//` (and `////+`) comments are dropped as trivia, exactly as before.
     if (c === "/" && source[i + 1] === "/") {
-      while (i < len && source[i] !== "\n" && source[i] !== "\r") advance();
+      let text = "";
+      while (i < len && source[i] !== "\n" && source[i] !== "\r") text += advance();
+      const isDoc = text.startsWith("///") && text[3] !== "/";
+      if (isDoc) {
+        // Strip the `///` and one optional leading space; keep the rest verbatim
+        // so authored markdown (lists, code, blank-ish lines) survives.
+        let body = text.slice(3);
+        if (body.startsWith(" ")) body = body.slice(1);
+        docLines.push(body);
+        lastLineWasDoc = true;
+      }
+      // A non-doc comment line does NOT set `lastLineWasDoc`, so the trailing
+      // NEWLINE breaks any run — `//` can't sit inside a doc block.
       continue;
     }
 
