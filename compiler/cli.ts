@@ -83,6 +83,17 @@ const detab = (s: string): string => {
 const visualWidth = (raw: string, n: number): number =>
   detab(raw.slice(0, Math.min(n, raw.length))).length;
 
+// A location-less diagnostic carries the exact sentinel span 0:0–0:0 (start ==
+// end == 0:0) — used by codegen errors, which have no real source span (see
+// compile.ts). The match is on the EXACT sentinel: a genuine diagnostic at the
+// very start of a file still has `end` past the start, so it won't be confused
+// for one of these.
+const isLocationless = (d: VLDiagnostic): boolean => {
+  const { start, end } = d.range;
+  return start.line === 0 && start.character === 0 &&
+    end.line === 0 && end.character === 0;
+};
+
 // Pretty, rustc/Deno-style multi-line rendering for one diagnostic:
 //
 //   [ERROR]: <message>
@@ -93,14 +104,26 @@ const visualWidth = (raw: string, n: number): number =>
 // `sourceLines` is the file split on newlines; `range.start.line` indexes it
 // (0-based). Guards against an out-of-range line (empty file / synthetic span)
 // by skipping the source/caret block and still emitting header + locator.
+//
+// A location-less diagnostic (the codegen sentinel) is rendered as just the
+// header plus an `at <file>` locator — no source line, no caret, and no
+// misleading `:1:1`, which would otherwise point at the file's first line.
 const formatPretty = (
   d: VLDiagnostic,
   file: string,
   sourceLines: string[],
   c: Colors,
 ): string => {
-  const { line, character } = d.range.start;
   const sevStyle = severityColor(d.severity, c);
+
+  if (isLocationless(d)) {
+    return [
+      `${sevStyle(c.bold(`[${d.severity.toUpperCase()}]`))}: ${d.message}`,
+      c.dim(`  at ${file}`),
+    ].join("\n");
+  }
+
+  const { line, character } = d.range.start;
   const out: string[] = [];
   out.push(`${sevStyle(c.bold(`[${d.severity.toUpperCase()}]`))}: ${d.message}`);
 

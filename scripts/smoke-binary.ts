@@ -167,6 +167,35 @@ await Deno.writeTextFile(badFile, `let a = 1\na = "x"\n`);
 
 await Deno.remove(badFile).catch(() => {});
 
+// A file that type-checks cleanly but throws in codegen: `Tree` recurses through
+// an array element (the tracked A11 gap), overflowing the stack at codegen. Used
+// to assert codegen-error rendering, NOT to claim the gap is fixed.
+const codegenFile = await Deno.makeTempFile({ suffix: ".vl" });
+await Deno.writeTextFile(
+  codegenFile,
+  `type Tree = { value: i32, kids: { [i32]: Tree } | null }\n` +
+    `let t: Tree = { value: 1, kids: null }\n` +
+    `print(t.value)\n`,
+);
+
+// 11. pretty codegen-error rendering — must surface a readable message (not the
+//     raw `[object Object]`), and because a codegen error is location-less it
+//     must NOT print a bogus source line, caret, or `:1:1` locator. The locator
+//     is the bare filename; exit is non-zero.
+{
+  const r = await run(["check", codegenFile]);
+  const ok = r.code === 1 &&
+    r.stderr.includes("Codegen error:") && // header surfaced
+    r.stderr.includes("recursion limit exceeded") && // clean recursion message
+    !r.stderr.includes("[object Object]") && // robust stringification
+    !/:1:1/.test(r.stderr) && // no bogus locator
+    !/\^~*/.test(r.stderr) && // no bogus caret/underline
+    r.stderr.includes(`at ${codegenFile}`); // bare-file locator
+  check("check codegen error (readable, no bogus caret)", ok, r.stderr);
+}
+
+await Deno.remove(codegenFile).catch(() => {});
+
 console.error("");
 if (failures > 0) {
   console.error(`${failures} smoke check(s) FAILED`);
