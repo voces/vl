@@ -135,10 +135,12 @@ Deno.test("classifyDocument: a representative program classifies each category",
   assertEquals(at(toks, 4, 9)?.type, "variable");
 });
 
-Deno.test("classifyDocument: string and boolean literals are classified", () => {
+Deno.test("classifyDocument: booleans are classified; strings are left to the grammar", () => {
   const src = 'let s = "hi"\nlet b = true\nlet n = null\n';
   const toks = tokensOf(src);
-  assertEquals(at(toks, 0, 8)?.type, "string"); // `"hi"`
+  // Strings are NOT semantically tokenized — a whole-string token would override
+  // the grammar's `constant.character.escape` scope (killing `\n` highlighting).
+  assertEquals(at(toks, 0, 8), undefined); // `"hi"` — the grammar colors strings
   assertEquals(at(toks, 1, 8)?.type, "boolean"); // `true`
   assertEquals(at(toks, 2, 8)?.type, "boolean"); // `null`
 });
@@ -160,8 +162,9 @@ Deno.test("classifyDocument: symbol-table classification wins over lexical for i
 Deno.test("classifyDocument: a `//` inside a string is not treated as a comment", () => {
   const src = 'let url = "http://x"\n';
   const toks = tokensOf(src);
-  // The whole `"http://x"` is one string token; nothing on the line is a comment.
-  assertEquals(at(toks, 0, 10)?.type, "string");
+  // `//` inside a string must not become a comment token (the comment scan tracks
+  // quote state). Strings are left to the grammar, so there's no string token
+  // either — nothing on the line is a comment.
   assertEquals(toks.some((t) => t.type === "comment"), false);
 });
 
