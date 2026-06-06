@@ -1,4 +1,6 @@
 import {
+  CompletionItem,
+  CompletionItemKind,
   createConnection,
   Diagnostic,
   DiagnosticSeverity,
@@ -24,8 +26,13 @@ import {
 } from "../../compiler/compile.ts";
 import type { Context } from "../../compiler/ast.ts";
 import {
+  type Completion,
+  type CompletionKind,
   deriveInlayHints,
+  identifierCompletions,
   type LspRange,
+  memberCompletions,
+  receiverObjectType,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
 } from "./typeFeatures.ts";
@@ -205,6 +212,78 @@ connection.languages.semanticTokens.on((params): SemanticTokens => {
   return { data: semanticTokensData(symbols) };
 });
 
+// Map a neutral completion kind (from `typeFeatures.ts`) to the LSP enum. A VL
+// `type` alias / builtin type maps to `Struct` (VL types are structural objects,
+// not nominal classes) — the closest fit and what semantic tokens treat as a
+// "type". Locals/params are `Variable`; callables are `Function`.
+const completionKind: Record<CompletionKind, CompletionItemKind> = {
+  variable: CompletionItemKind.Variable,
+  parameter: CompletionItemKind.Variable,
+  function: CompletionItemKind.Function,
+  type: CompletionItemKind.Struct,
+};
+
+const toCompletionItem = (c: Completion): CompletionItem => ({
+  label: c.name,
+  kind: completionKind[c.kind],
+  detail: c.detail,
+});
+
+// The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`
+// on `line`, or null. Used to find a `<name>.` member-completion receiver: we
+// scan back over `.` then the preceding word. (Cursor-on-word extraction is
+// `wordAt`; this is specifically "the word ending just before the cursor".)
+const wordEndingBefore = (line: string, character: number): string | null => {
+  const isWordChar = (c: string) => /[A-Za-z0-9_]/.test(c);
+  const end = character;
+  let start = end;
+  while (start > 0 && isWordChar(line[start - 1])) start--;
+  if (start === end) return null;
+  const word = line.slice(start, end);
+  return /^[A-Za-z_]/.test(word) ? word : null;
+};
+
+// Completion (D3): scope-aware identifier suggestions everywhere, and structural
+// member suggestions after `.`. Driven by the pure helpers in `typeFeatures.ts`
+// over the compiler's symbol table + program scope (which folds in builtins).
+connection.onCompletion(async (params): Promise<CompletionItem[]> => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+  const text = doc.getText();
+  const vlPos = toVLPosition(params.position);
+
+  // The text on the current line up to the cursor — to detect a `.` trigger and
+  // find the receiver name before it.
+  const linePrefix = doc.getText({
+    start: { line: params.position.line, character: 0 },
+    end: params.position,
+  });
+
+  const symbols = parseSymbols(text);
+  const charBeforeCursor = linePrefix[linePrefix.length - 1];
+
+  // Member completion: cursor follows `<receiver>.`. Only the simple `name.`
+  // receiver is resolved (see `receiverObjectType` / the D3 report); a more
+  // complex receiver yields no member suggestions rather than wrong ones.
+  if (charBeforeCursor === ".") {
+    const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
+    if (!receiver) return [];
+    const { ast } = await compile(text);
+    if (!ast) return [];
+    const objectType = receiverObjectType(receiver, symbols, vlPos, ast.scope);
+    if (!objectType) return [];
+    return memberCompletions(objectType, stringifyType).map(toCompletionItem);
+  }
+
+  // Identifier completion: in-scope names + builtins. `ast.scope` carries the
+  // builtins (from `defaultScope`) plus top-level names; user bindings from the
+  // symbol table override same-named builtins inside `identifierCompletions`.
+  const { ast } = await compile(text);
+  const builtins = ast?.scope ?? {};
+  return identifierCompletions(symbols, vlPos, builtins, stringifyType)
+    .map(toCompletionItem);
+});
+
 documents.listen(connection);
 
 connection.onInitialize((params) => {
@@ -217,6 +296,11 @@ connection.onInitialize((params) => {
       textDocumentSync: {
         openClose: true,
         change: TextDocumentSyncKind.Full,
+      },
+      completionProvider: {
+        // `.` re-triggers completion so member suggestions appear right after a
+        // property access; ordinary identifier completion fires on typing too.
+        triggerCharacters: ["."],
       },
       definitionProvider: true,
       referencesProvider: true,
