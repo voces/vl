@@ -13,6 +13,12 @@ VL needs a growable, ordered, indexable sequence — the substrate for
 (`ROADMAP` A10 + B6 tier-2). The fixed-length array MVP is done; this is the
 tier-2 layer on top of WasmGC's fixed-length `array` heap type.
 
+**Decided this review round** (recorded here; the `DECISIONS.md` entry lands with
+implementation, not before): the type is named **`List`**, and the **growth
+factor is 2×** for v1. Still open: the `[...]` syntax fork, value-vs-reference
+(language-wide), the error model (language-wide), indexing perf
+(inline-native vs B13 dispatch), and the capacity/seed surface specifics.
+
 Recommendation in one screen:
 
 1. **Representation.** A WasmGC `struct { backing: (ref (array mut T)); len: i32; cap: i32 }`
@@ -22,7 +28,8 @@ Recommendation in one screen:
    backing array knows its own length, because reading `array.len` is cheap but
    the field makes the growth test branch-predictable and keeps `len`/`cap`
    adjacent and hot.
-2. **Growth factor: 2×** (double on `len == cap`, minimum first allocation of 4).
+2. **Growth factor: 2× — DECIDED for v1** (double on `len == cap`, minimum first
+   allocation of 4).
    The headline argument *against* 2× — that geometric doubling can never reuse
    the sum of previously freed blocks (the libc++/golden-ratio argument) — is a
    **manual-allocator** concern. Under WasmGC there is no `realloc`, no
@@ -177,9 +184,9 @@ fixed-array representation (which has *no* header and lowers `.length` to
 hold `cap` separately from the physical length. A distinct struct type keeps
 fixed arrays and lists as cleanly different shapes.
 
-### VL.2 — Growth strategy: 2×
+### VL.2 — Growth strategy: 2× (DECIDED)
 
-**Decision.** Double on full, with a small floor:
+**Decision (locked for v1).** Double on full, with a small floor:
 - First push on an empty list (`cap == 0`) → `cap = 4` (small enough not to waste
   on tiny lists, big enough to skip the 1→2→4 reallocation churn; Rust uses 4 for
   small element types, Go effectively starts at small powers of two).
@@ -353,15 +360,36 @@ new dispatch mechanism or fighting the fixed-array literal.
 
 ### VL.6 — Bounds, iteration, and out-of-scope (v1)
 
-- **Bounds behavior: trap.** Out-of-bounds `l[i]` / `l[i] = v` **traps**, matching
-  the fixed-array MVP (which already bounds-traps) and Rust's `[]`. A
-  non-trapping `get(i) -> T | null` accessor (Rust's `.get()`) is a natural future
-  addition but is **not** v1 — keeping one bounds discipline (trap) consistent
-  with arrays for now.
-- **`pop()` on empty.** Returns `T | null` (the nullable signals empty), narrowed
-  by the existing null-guard flow narrowing. Alternative (trap on empty pop) is
-  rejected: empty-pop is an ordinary control-flow condition, not a program bug, so
-  a nullable is the soundness-friendly answer the union machinery already handles.
+- **Bounds behavior: `l[i]` traps inline.** Out-of-bounds `l[i]` / `l[i] = v`
+  **traps**, exactly like fixed-array `a[i]` — a bounds-checked `array.get` on the
+  backing, **not** a null-returning function call. The result-oriented form is the
+  **opt-in `get(i): T | null`** (Rust's `v[i]` panic vs `v.get(i)`; Swift `a[i]`
+  trap) for callers who want absence as a value — a natural addition, not v1.
+  Trap is the default discipline; the safe accessor is the explicit layer.
+- **Indexing perf — the inline-vs-dispatch tension (open).** This is the one place
+  a *pure-VL* `List` likely needs compiler privilege. If `l[i]` routes through the
+  B13 `"[]"` method, that method is currently an (indirect) call **per access** —
+  death in a tight loop. To match native-array speed, `l[i]` must inline to a
+  bounds-checked `array.get` on the backing with **no per-access call**, via either
+  (a) a reliably-inlinable monomorphized `"[]"`, or (b) a small amount of
+  native indexing lowering (compiler-aware) even while the rest of `List` stays
+  pure-VL std. Captured as an open perf decision (§OQ.4 / §LS.7) — inline-native
+  indexing vs B13 method dispatch.
+- **`pop()` on empty — recommend `pop(): T | null`.** A `pop(): T` has no `T` to
+  return on empty, so it could only trap or hand back garbage (unsound); encoding
+  absence in the type keeps it **total** and type-safe. This composes with
+  machinery VL already has — `is`/`??`/`?.` null-narrowing — so the empty case is
+  handled with zero new concepts. It is the typed-language consensus (Rust
+  `Vec::pop -> Option<T>`, Swift `popLast() -> Element?`); only the dynamic
+  languages throw (Python `IndexError`).
+
+  **VL's failure model (clarification).** VL has **traps** — an uncatchable wasm
+  abort, like Rust `panic!` (`a[i]` out-of-bounds already traps today) — but **no
+  exceptions** (no catchable throw). So the real choice for empty `pop` is *trap*
+  vs *total `T | null`*, never "throw." We take total `T | null`: empty-pop is an
+  ordinary control-flow condition, not a program bug. A future Swift-style
+  trapping `removeLast()` for the "known non-empty" case is a natural addition
+  (the same dual as `l[i]` trap vs `get(i): T | null` indexing) — not v1.
 - **Iteration.** `for x in list` works exactly like `for x in array` (B8),
   iterating `[0, len)` via `array.get` on the backing. (`for x, i in list` index
   form rides on the same B8 destructuring work as arrays.) **Mutating the list
@@ -379,8 +407,13 @@ new dispatch mechanism or fighting the fixed-array literal.
   backing); v1 `slice` (if any) copies.
 - A dedicated list **literal** syntax (use `List(...)` for now).
 - Value-semantics / copy-on-write (Swift-style). VL lists are **reference**
-  values in v1; `let b = a` shares the same list. (Whether VL eventually wants
-  COW value semantics for collections is a language-direction question — §OQ.)
+  values in v1; `let b = a` shares the same list — **consistent with VL objects,
+  which are reference types today**. There is no sound case for collections being
+  value types while objects stay reference (the "then why doesn't object
+  assignment copy too?" point): value-vs-reference is a **language-wide** call
+  (objects + collections together), not a `List` detail. Default for v1 =
+  **reference**; Swift-style value-everywhere-with-COW is a coherent alternative
+  *only if adopted uniformly* — see the language-level open question (§OQ.2).
 - Equality/hashing of lists (structural `==` over elements) — defer until the
   element-comparison story for the value-eq path is settled.
 
@@ -449,18 +482,34 @@ here** — this is the plan the design commits to.
 1. **List literal syntax.** Ship v1 with only `List(...)` / `List<T>()`, or
    introduce a distinct list literal now? (Must not collide with the fixed `[...]`
    array literal — options: a sigil prefix, or a method like `[...].toList()`.)
-2. **Reference vs value semantics.** v1 proposes lists as **reference** values
-   (`let b = a` aliases). Does VL want collections to eventually be Swift-style
-   COW value types for consistency with structural `==` and value-feel? That's a
-   language-wide direction call that affects more than lists.
-3. **Empty-`pop` policy.** `T | null` (proposed) vs trap vs a separate
-   `popOrNull`. The nullable is the soundness-friendly default but adds a narrow
-   at every pop site.
-4. **Bounds policy parity.** Keep trap-only (proposed, matches arrays) for v1, or
-   ship a non-trapping `get(i) -> T | null` from the start?
-5. **Growth taper.** Pure 2× for v1 (proposed), or adopt Go-style taper to ~1.25×
-   past a size threshold immediately? (Proposed: defer; it's a constant-factor
-   tweak behind the same API.)
+2. **Value vs reference — language-wide (default reference).** Not a
+   collections-only question: there is no sound case for `List` being a value
+   type while VL objects stay reference. v1 default = **reference everywhere**
+   (objects *and* lists — consistent with VL today; matches Python/JS/Java).
+   The coherent alternative is **value everywhere via copy-on-write** (Swift) —
+   nice predictability (nothing mutated through an alias), cheap via COW — but
+   only if applied **uniformly** to structs/objects *and* collections, decided
+   once language-wide. Do not bolt COW onto `List` alone.
+3. **Error model — language-wide (errors-as-values).** The direction the owner
+   favors: fallible ops encode failure **in the return type** via unions —
+   `T | null` for absence, `T | E` (discriminated with `is`) for "failed with a
+   reason" — rather than try/catch, leaning on VL's existing union + `is`/null
+   narrowing; **traps stay reserved for unrecoverable** programmer errors (the
+   Rust panic-vs-`Result` split). This ties to the `// TODO: exceptions` stub in
+   the AST — an open language-wide decision, *not* settled here. `pop`'s
+   `T | null` (§VL.6) and the opt-in `get(i): T | null` (§OQ.4) are the
+   lightweight instances of this model.
+4. **Indexing — perf + safe accessor.** `l[i]` traps inline (matches arrays);
+   the opt-in `get(i): T | null` is the safe form (ship it v1, or later?). The
+   harder open call is **perf**: a pure-VL `List` whose `l[i]` goes through the
+   B13 `"[]"` method is a per-access (indirect) call — to reach native-array speed
+   `l[i]` must inline to a bounds-checked `array.get` (no per-access call). Open:
+   **inline-native indexing vs B13 method dispatch** (a reliably-inlinable
+   monomorphized `"[]"`, or a slice of native indexing lowering) — the one spot
+   `List` likely needs compiler privilege even under "std over primitives."
+5. **Growth taper.** 2× is **decided** for v1 (above). Whether to later add a
+   Go-style taper to ~1.25× past a size threshold stays deferred — a
+   constant-factor tweak behind the same API, not a representation change.
 6. **`map`/`filter` result type.** Should producers return a `List<U>` (proposed)
    or a fixed array? Returning a list keeps the chain growable and composable.
 

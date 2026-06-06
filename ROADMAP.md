@@ -112,7 +112,8 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   typed literals in object values (`{n: 4<i64>}`); Exact-by-default for values (A8).
 - 🟡 **B6. Arrays** (WasmGC). MVP done: fixed-length arrays — literal/`a[i]`/`a[i]=v`/`a.length`,
   bounds-trap. Size-member design DECIDED (→ `DECISIONS.md`). REMAINING: growable list/vector
-  (`{ array, len, cap }`, tier 2).
+  (`{ array, len, cap }`, tier 2) — design DECIDED on **name `List`** and **2× growth**; `DECISIONS.md`
+  entry lands with implementation.
 - ⬜ **B6a. Maps / non-string keys** (`Map<K,V>` — a separate hash type, not every-object-as-table; →
   `DECISIONS.md`). Index sigs `{[string]: T}` type-check but are dropped at codegen — this is their
   codegen, via B13's `"[]"`/`"[]="` traps. Deferred.
@@ -126,9 +127,21 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
     dependency: VL has no module system yet (std-module loading is unresolved).
   - **`[...]` list-vs-array syntax fork** (open decision) — (a) keep `[...]` fixed + growable via
     `List(...)`, or (b) make `[...]` the growable `List` with a distinct fixed-array spelling.
-  - **List surface/semantics open questions** — literal syntax; reference vs COW value semantics;
-    empty-`pop` → `T|null`/trap; bounds trap vs `get → T|null`; growth 2× vs taper; `map`/`filter`
-    return type. Tracked in the design doc; decisions still open.
+  - **Indexing perf — inline-native vs B13 method dispatch** (open) — a pure-VL `List` whose `l[i]`
+    routes through the B13 `"[]"` method is a per-access (indirect) call; to match native-array speed
+    `l[i]` must inline to a bounds-checked `array.get` (reliably-inlinable monomorphized `"[]"`, or a
+    slice of native indexing lowering). The one spot `List` likely needs compiler privilege under
+    "std over primitives."
+  - **Value vs reference — language-wide** (open; default **reference**) — not collections-only:
+    objects *and* collections decided together. v1 = reference everywhere (consistent with VL objects;
+    Python/JS/Java); coherent alternative is Swift-style value-everywhere-with-COW, *only if uniform*.
+  - **Error model — language-wide** (open; errors-as-values) — fallible ops encode failure in the
+    return type via unions (`T | null` absence, `T | E` discriminated with `is`) over try/catch;
+    traps reserved for unrecoverable. Ties to the AST `// TODO: exceptions`; `pop`'s `T | null` is the
+    lightweight instance.
+  - **List surface/semantics open questions** — literal syntax; capacity/seed construction specifics;
+    `map`/`filter` return type. DECIDED: name `List`, 2× growth, `pop(): T | null`, `l[i]` traps inline
+    (opt-in `get(i): T | null` safe accessor). Tracked in the design doc.
 - 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
   `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.
