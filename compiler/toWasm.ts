@@ -7,6 +7,7 @@ import {
   elseNarrowings,
   getConcreteType,
   isMapType,
+  isSetType,
   mapKeyValueType,
   nonNullable,
   orderArgumentsByParameters,
@@ -652,6 +653,14 @@ export const toWasm = async (ast: VLProgramNode) => {
     return isMapType(s);
   };
 
+  // Is `t` a `Set<T>` (the boolean-valued `{[T]:boolean}` representation)? Used to
+  // route a set's `.values()` to its element (key) array. Mirrors `isSetType`.
+  const isSetTypeCodegen = (t: VLType): boolean => {
+    let s = softenImplicitType(t);
+    while (s.type === "Infer") s = softenImplicitType(s.subType);
+    return isSetType(s);
+  };
+
   // Resolve an expression's map struct type + key/value types, or null.
   const mapTypeOf = (
     node: VLProgramNode | VLStatement,
@@ -1230,7 +1239,12 @@ export const toWasm = async (ast: VLProgramNode) => {
     const src = mapTypeOf(recv);
     if (!src) return null;
     const mt = src.mt;
-    const wantKeys = prop === "keys";
+    // A `Set<T>` stores its elements as the map KEYS (the value slot is the
+    // unused membership boolean). A set exposes only `.values(): T[]` — its
+    // elements — so a set's `.values()` materializes the KEYS, not the booleans.
+    // (Sets never expose `.keys()`.) A map's `.keys()`/`.values()` are unchanged.
+    const isSet = isSetTypeCodegen(softenImplicitType(codegenType(recv)));
+    const wantKeys = isSet ? true : prop === "keys";
     const element = wantKeys ? mt.key : mt.value;
     const outLt = listType(softenImplicitType(element));
     const srcArrRef = wantKeys ? mt.keys.refType : mt.vals.refType;
@@ -2209,9 +2223,12 @@ export const toWasm = async (ast: VLProgramNode) => {
           }
           throw new Error(`List has no member "${node.property}"`);
         }
-        // Map size member: `.size` → `struct.get $size` (O(1) live count).
+        // Map/Set size member: `.length` → `struct.get $size` (O(1) live count).
+        // Unified on `.length` across List/Map/Set (C2.3); both maps and sets use
+        // the same hash-map struct, so both read the stored live-entry/membership
+        // count from `MAP_SIZE`.
         if (isMapTypeCodegen(objType)) {
-          if (node.property === "size") {
+          if (node.property === "length") {
             return m.struct.get(
               MAP_SIZE,
               toExpression(node.object),

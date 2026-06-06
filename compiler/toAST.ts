@@ -16,6 +16,7 @@ export {
   elseNarrowings,
   getConcreteType,
   isMapType,
+  isSetType,
   mapKeyValueType,
   nonNullable,
   orderArgumentsByParameters,

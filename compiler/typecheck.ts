@@ -368,11 +368,15 @@ export const _typeFromExpression = (
         const member = listMemberType(arrayElementType(objType)!)[expr.property];
         if (member) return member;
       }
-      // Intrinsic map members (`.size`, `.get`, `.has`, `.set`, `.delete`).
+      // Intrinsic map/set members. A `Set<T>` (boolean-valued `{[T]:boolean}`)
+      // routes to its OWN surface (`setMemberType`), a `Map<K,V>` to `mapMemberType`.
       {
         const kv = mapKeyValueType(objType);
         if (kv) {
-          const member = mapMemberType(kv.key, kv.value)[expr.property];
+          const setEl = setElementType(objType);
+          const member = setEl !== null
+            ? setMemberType(setEl)[expr.property]
+            : mapMemberType(kv.key, kv.value)[expr.property];
           if (member) return member;
         }
       }
@@ -474,7 +478,10 @@ export const _typeFromExpression = (
         if (obj.type === "Infer") obj = obj.subType;
         const kv = mapKeyValueType(obj);
         if (kv) {
-          const member = mapMemberType(kv.key, kv.value)[expr.callee.property];
+          const setEl = setElementType(obj);
+          const member = setEl !== null
+            ? setMemberType(setEl)[expr.callee.property]
+            : mapMemberType(kv.key, kv.value)[expr.callee.property];
           if (member?.type === "Function") return member.return;
         }
       }
@@ -749,10 +756,13 @@ export const mapKeyValueType = (
 export const isMapType = (type: VLType): boolean =>
   mapKeyValueType(type) !== null;
 
-// A `Set<T>` is spelled as a boolean-valued map `{[T]: boolean}` (uncommitted,
-// provisional surface) — the value carries presence; `.add(x)` sets it, `.has` /
-// `.delete` / `.size` / `.keys()` work as the map members. So a set IS a map, with
-// an extra `.add` member exposed when the value type is boolean.
+// A `Set<T>` is internally a boolean-valued hash map `{[T]: boolean}` (the
+// representation is unchanged — the boolean carries membership), but per the C2
+// design it is its OWN type with its OWN surface: `Set` does NOT share the `Map`
+// member surface. The discriminator is still the boolean value type, but a set
+// routes to `setMemberType` (NOT `mapMemberType`) so it never leaks `.set`/`.get`/
+// `.keys()`/`.values(): boolean[]`. The set's element type is the *key* type of
+// the underlying `{[T]: boolean}`.
 export const isSetType = (type: VLType): boolean => {
   const kv = mapKeyValueType(type);
   if (!kv) return false;
@@ -760,35 +770,39 @@ export const isSetType = (type: VLType): boolean => {
   return v.type === "Object" && v.name === "boolean";
 };
 
-// The intrinsic `Map<K,V>` members (`.size` / `.get` / `.has` / `.set` /
-// `.delete`). A `Map` is an anonymous structural `{[K]:V}` object, so — like list
-// members — these are special-cased here rather than declared on a scope object.
-// `m[k]` (index access) yields `V | null` (normal absence) and `m[k] = v` sets;
-// those are handled at the index-access sites.
+// The element type of a `Set<T>` — the *key* of the underlying `{[T]: boolean}`.
+export const setElementType = (type: VLType): VLType | null => {
+  const kv = mapKeyValueType(type);
+  if (!kv) return null;
+  const v = softenImplicitType(kv.value);
+  return v.type === "Object" && v.name === "boolean" ? kv.key : null;
+};
+
+// The intrinsic `Map<K,V>` members (`.length` / `.get` / `.has` / `.set` /
+// `.delete` / `.keys()` / `.values()`). A `Map` is an anonymous structural
+// `{[K]:V}` object, so — like list members — these are special-cased here rather
+// than declared on a scope object. `m[k]` (index access) yields `V | null`
+// (normal absence) and `m[k] = v` sets; those are handled at the index-access
+// sites.
+//
+// C2 judgment-call note: under the C2 model `.get`/`.has`/`.length`/`.keys`/
+// `.values` plus index read/write are the INTERFACE-level surface (they live on
+// the bare `{[K]:V}` "Mapping" capability), while `.set`/`.delete` are
+// representation-MUTATING ops that belong on the concrete `Map<K,V>` subtype. A
+// fully sound split would require carrying a distinct concrete-vs-interface marker
+// on the value's type so the result of `Map()` is a different type than a bare
+// `{[K]:V}` annotation — an invasive change to the type representation and the
+// bootstrap-critical inference path. We keep `.set`/`.delete` on this shared
+// surface for now (the SAFE SUBSET); see the rework notes. The interface ops
+// below — including index write `m[k]=v` — remain available regardless.
 export const mapMemberType = (
   key: VLType,
   value: VLType,
 ): Record<string, VLType> => {
-  const v = softenImplicitType(value);
-  const isSet = v.type === "Object" && v.name === "boolean";
   return {
-  // `Set<T>.add(x)`: insert `x` (presence). Exposed only on a boolean-valued map
-  // (the Set spelling). Returns null.
-  ...(isSet
-    ? {
-      add: {
-        type: "Function" as const,
-        paramaters: [{
-          type: "Parameter" as const,
-          name: "value",
-          paramaterType: key,
-        }],
-        return: { type: "Alias" as const, name: "null" },
-      },
-    }
-    : {}),
-  // O(1) live entry count (property syntax, read-only).
-  size: { type: "Alias", name: "i32" },
+  // O(1) live entry count (property syntax, read-only). Unified on `.length`
+  // across List/Map/Set (C2.3, DECISIONS B6 uniform-access member).
+  length: { type: "Alias", name: "i32" },
   // Lookup: `V | null` (null on a missing key — normal absence, not a trap).
   get: {
     type: "Function",
@@ -846,6 +860,45 @@ const listOf = (element: VLType): VLType => ({
     name: { type: "Alias", name: "i32" },
     type: element,
   }],
+});
+
+// The intrinsic `Set<T>` members — its OWN surface, distinct from `Map` (C2.2).
+// A set exposes ONLY: `.add(x)`, `.has(x): boolean`, `.delete(x): boolean`,
+// `.length` (O(1) read-only property), and `.values(): T[]` (the ELEMENTS, as
+// `T[]` — NOT the membership booleans, and NOT `boolean[]`). It deliberately does
+// NOT expose `.set`, `.get`, or `.keys()`. `element` is the set's element type
+// (the key type of the underlying `{[T]: boolean}` representation).
+export const setMemberType = (
+  element: VLType,
+): Record<string, VLType> => ({
+  // Insert membership; returns null. (Concrete-subtype op, C2.1 — sets are always
+  // constructed concretely via `Set()`.)
+  add: {
+    type: "Function",
+    paramaters: [{ type: "Parameter", name: "value", paramaterType: element }],
+    return: { type: "Alias", name: "null" },
+  },
+  // Membership test.
+  has: {
+    type: "Function",
+    paramaters: [{ type: "Parameter", name: "value", paramaterType: element }],
+    return: { type: "Alias", name: "boolean" },
+  },
+  // Remove membership; returns whether it was present.
+  delete: {
+    type: "Function",
+    paramaters: [{ type: "Parameter", name: "value", paramaterType: element }],
+    return: { type: "Alias", name: "boolean" },
+  },
+  // O(1) element count (property syntax, read-only). Unified on `.length` (C2.3).
+  length: { type: "Alias", name: "i32" },
+  // The elements as `T[]`, insertion-ordered — the iteration surface (`for x in
+  // s.values()`). NOT `boolean[]`: a set's "values" are its elements.
+  values: {
+    type: "Function",
+    paramaters: [],
+    return: listOf(element),
+  },
 });
 
 export const listMemberType = (
@@ -1340,11 +1393,16 @@ export const getChildType = (
     if (member) return member;
   }
 
-  // Intrinsic map members (`.size`, `.get`, `.has`, `.set`, `.delete`).
+  // Intrinsic map/set members. A `Set<T>` routes to its OWN surface
+  // (`add`/`has`/`delete`/`length`/`values`), a `Map<K,V>` to the map surface;
+  // a set must NOT expose `.set`/`.get`/`.keys()` (C2.2).
   if (property.type === "StringLiteral") {
     const kv = mapKeyValueType(object);
     if (kv) {
-      const member = mapMemberType(kv.key, kv.value)[property.value];
+      const setEl = setElementType(object);
+      const member = setEl !== null
+        ? setMemberType(setEl)[property.value]
+        : mapMemberType(kv.key, kv.value)[property.value];
       if (member) return member;
     }
   }
