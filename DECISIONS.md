@@ -57,6 +57,10 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
 - **Maps are a separate hash type, not every-object-as-table.** Three representations under one
   `[]`/`.field` surface: static-string-key structs (fastest), `i32`-key arrays (native, contiguous),
   arbitrary-key maps (hashed, heap) — you pay hashing only when you use a `Map`. (B6a)
+- **Generics infer through collections, not just scalars.** A generic element type is pinned from the
+  argument's element type (the checker unifies index-signature *value* types, not just keys), so
+  `first<T>(xs: T[])` resolves `T` per call. Read-side only for now — building a new array of an
+  inferred element type (`map`/`filter`) waits on growable lists (B6 tier-2). (A10)
 
 ## Parser, distribution & bootstrapping
 
@@ -77,16 +81,7 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
 ## Editor / LSP
 
 - **D2 symbol table reuses the parser's scope walk, not a second resolver.** Go-to-definition /
-  find-references need use→declaration resolution, which the hand-written parser *already* performs
-  while it drives the type algebra (every `Name`/call/type-ref walks the live `scopes` stack). So the
-  symbol table (`compiler/symbols.ts`) is populated *during* that same walk: each declaration site
-  records a `Binding` carrying its identifier span; each use records an occurrence against the binding
-  it resolves to. To avoid touching the many `scopes.push/pop` sites, bindings hang off each scope
-  object via a `WeakMap<Scope, Map<name, Binding>>` keyed by the scope's identity — resolution piggybacks
-  on the existing stack, and ephemeral narrowing scopes (which carry no binding map) correctly fall
-  through to the real declaration, so a use inside `if x is T {}` still points at `x`'s `let`. Chosen
-  over (a) a separate post-parse AST resolver — would duplicate scope/shadowing logic and drift from the
-  type checker — and (b) a position→type index off the spans WeakMap, which gives hover (D1) but not the
-  declaration *identity* references needs. The LSP queries by cursor position (`SymbolTable.definitionAt`
-  / `referencesAt`); single-document only (cross-file is out of scope, and builtins from `defaultScope`
-  have no source span so they're simply not recorded). (D2)
+  find-references resolve use→declaration, which the parser already does as it walks the live `scopes`
+  stack — so the symbol table is populated during that same walk rather than by a separate post-parse
+  resolver (which would duplicate scope/shadowing logic and drift from the checker). Position-indexed,
+  single-document; cross-file and builtins are out of scope. (D2)

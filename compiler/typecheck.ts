@@ -1589,10 +1589,28 @@ export const ensureType = (
         // (permissive structural width subtyping — a wider object satisfies a
         // narrower shape, so `function f(o) o.x` accepts `{ x, y }`). Exact-by-
         // default for values is a later refinement (ROADMAP A8 variance).
+        //
+        // When BOTH sides carry an index signature on a compatible key (the
+        // array shape `{[i32]: T}` is exactly this), unify their VALUE types so
+        // a generic element hole gets pinned to the argument's element type
+        // (A10 stage 2). For a left index value that is a plain inference hole
+        // this flows `T` out of `first([1, 2, 3])`; otherwise it is the
+        // ordinary structural element check. We recurse on the value only once
+        // the keys validate, so non-array objects (the right side has no
+        // matching index signature) are untouched and the permissive width
+        // behavior above is preserved. An empty right value union (`[]`) is
+        // skipped so an empty array literal leaves the element hole open.
         if (rprops.size && indexProperties.length) {
           outer: for (const rprop of rprops.values()) {
             for (const lprop of indexProperties) {
-              if (validateType(lprop.name, rprop.name)) continue outer;
+              if (validateType(lprop.name, rprop.name)) {
+                const emptyRight = rprop.type.type === "Union" &&
+                  rprop.type.subTypes.length === 0;
+                if (!emptyRight && !ensureType(lprop.type, rprop.type, ctx)) {
+                  return false;
+                }
+                continue outer;
+              }
             }
             return pushError("extra-prop");
           }
