@@ -1,0 +1,314 @@
+// @run
+// @log NUMBER
+// @log 12
+// @log NUMBER
+// @log 3.14
+// @log ID
+// @log a
+// @log DOT
+// @log .
+// @log NUMBER
+// @log 5
+// @log NUMBER
+// @log 100
+// @log EOF
+// Numbers: integers and floats. `3.14` takes its fractional part because a digit follows the
+// dot, but `a.5` does NOT merge — `a` is an ID, `.` a separate DOT, `5` its own NUMBER —
+// since the dot is not preceded by a number.
+// A VL lexer written in VL — the first "compiler component in VL" slice of the
+// H3 self-hosting port. It is a faithful subset of `compiler/lexer.ts`: it
+// scans identifiers/keywords, integer/float numbers, single- and double-quoted
+// strings, the common operators/punctuation, and `//` line comments, emitting a
+// list of tokens carrying a kind tag, the source text, and start/stop positions.
+//
+// Design notes (and the VL features it leans on):
+//   - Token KINDS are string tags ("ID", "NUMBER", ...) rather than a real
+//     enum/literal-union: VL has no enum representation, and a wide closed
+//     literal-union of tags is awkward to thread through. A bare `string` tag
+//     compares with `==` and prints directly, which is all the tests need.
+//   - Tokens live in a `(Tok | null)[]`. A plain `Tok[]` (non-nullable struct
+//     element) cannot be `.push`-ed: the growable backing uses
+//     `array.new_with_default`, which requires a DEFAULTABLE element type, and a
+//     non-nullable struct ref is not defaultable (codegen validation error). The
+//     nullable element type IS defaultable (ref.null), so we store `Tok | null`
+//     and narrow on read.
+//   - Scanner state is a mutable `Lexer` struct threaded explicitly to every
+//     helper. Module-level mutable `let` does NOT persist mutations made inside
+//     a function (the global isn't shared back), so a shared struct passed by
+//     reference is the only working mutable-state mechanism.
+//   - Source is read as char codes via `src[i]` (an i32). There are no char
+//     literals, so every character class is a numeric range check on the code.
+//   - Token text is recovered with `src.slice(start, stop)` rather than built up
+//     char-by-char (no char-to-string append exists).
+
+type Lexer = {
+  src: string,
+  pos: i32,
+  line: i32,
+  col: i32
+}
+
+// A lexed token. `start`/`stop` are byte offsets into the source (the first
+// char and one past the last); `line` is 1-based and `col` is 0-based, matching
+// the diagnostics convention used by the TS lexer's `Position`.
+type Tok = {
+  kind: string,
+  text: string,
+  start: i32,
+  stop: i32,
+  line: i32,
+  col: i32
+}
+
+// ---- character classes (numeric, since there are no char literals) ----
+
+function isDigit(c: i32): boolean {
+  c >= 48 && c <= 57
+}
+
+function isIdStart(c: i32): boolean {
+  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+}
+
+function isIdPart(c: i32): boolean {
+  isIdStart(c) || isDigit(c)
+}
+
+// ---- scanner primitives ----
+
+// The char code at the current position, or -1 at end of input.
+function peek(lx: Lexer): i32 {
+  if lx.pos >= lx.src.length {
+    return -1
+  }
+  lx.src[lx.pos]
+}
+
+// The char code one past the current position, or -1 if none.
+function peek2(lx: Lexer): i32 {
+  if lx.pos + 1 >= lx.src.length {
+    return -1
+  }
+  lx.src[lx.pos + 1]
+}
+
+// Consume one char, tracking line/column, and return its code.
+function advance(lx: Lexer): i32 {
+  let c = lx.src[lx.pos]
+  lx.pos = lx.pos + 1
+  if c == 10 {
+    lx.line = lx.line + 1
+    lx.col = 0
+  } else {
+    lx.col = lx.col + 1
+  }
+  c
+}
+
+// Map an identifier lexeme to its keyword kind, or "ID" if it is not a keyword.
+// This is a linear `==` chain because VL has no map/dictionary type.
+function keywordKind(text: string): string {
+  if text == "function" { return "FUNCTION" }
+  if text == "if" { return "IF" }
+  if text == "then" { return "THEN" }
+  if text == "else" { return "ELSE" }
+  if text == "elseif" { return "ELSEIF" }
+  if text == "while" { return "WHILE" }
+  if text == "for" { return "FOR" }
+  if text == "to" { return "TO" }
+  if text == "step" { return "STEP" }
+  if text == "in" { return "IN" }
+  if text == "const" { return "CONST" }
+  if text == "let" { return "LET" }
+  if text == "return" { return "RETURN" }
+  if text == "is" { return "IS" }
+  if text == "await" { return "AWAIT" }
+  if text == "break" { return "BREAK" }
+  if text == "continue" { return "CONTINUE" }
+  if text == "from" { return "FROM" }
+  if text == "type" { return "TYPE" }
+  if text == "true" { return "TRUE" }
+  if text == "false" { return "FALSE" }
+  if text == "null" { return "NULL" }
+  "ID"
+}
+
+// Build a token for the source range [start, stop) at the given position.
+function mkTok(lx: Lexer, kind: string, start: i32, stop: i32, line: i32, col: i32): Tok {
+  {
+    kind: kind,
+    text: lx.src.slice(start, stop),
+    start: start,
+    stop: stop,
+    line: line,
+    col: col
+  }
+}
+
+// Single-char operator/punctuation kind for char code `c`, or "" if `c` is not
+// a one-char operator.
+function oneCharKind(c: i32): string {
+  if c == 43 { return "PLUS" }
+  if c == 45 { return "MINUS" }
+  if c == 42 { return "STAR" }
+  if c == 47 { return "DIV" }
+  if c == 37 { return "MOD" }
+  if c == 94 { return "CARET" }
+  if c == 61 { return "EQUAL" }
+  if c == 33 { return "EXCLAMATION" }
+  if c == 62 { return "GREATER_THAN" }
+  if c == 60 { return "LESS_THAN" }
+  if c == 40 { return "LPAREN" }
+  if c == 41 { return "RPAREN" }
+  if c == 123 { return "LBRACE" }
+  if c == 125 { return "RBRACE" }
+  if c == 91 { return "LBRACK" }
+  if c == 93 { return "RBRACK" }
+  if c == 44 { return "COMMA" }
+  if c == 46 { return "DOT" }
+  if c == 58 { return "COLON" }
+  if c == 124 { return "PIPE" }
+  if c == 38 { return "AMPERSAND" }
+  ""
+}
+
+// Two-char operator kind for the pair (a, b), or "" if it is not one.
+function twoCharKind(a: i32, b: i32): string {
+  if a == 43 && b == 43 { return "PLUSPLUS" }
+  if a == 45 && b == 45 { return "MINUSMINUS" }
+  if a == 38 && b == 38 { return "AND" }
+  if a == 124 && b == 124 { return "OR" }
+  if a == 63 && b == 46 { return "QUESTION_DOT" }
+  if a == 63 && b == 63 { return "QUESTION_QUESTION" }
+  if a == 61 && b == 61 { return "EQUAL_TO" }
+  if a == 33 && b == 61 { return "NOT_EQUAL_TO" }
+  if a == 62 && b == 61 { return "GREATER_THAN_OR_EQUAL_TO" }
+  if a == 60 && b == 61 { return "LESS_THAN_OR_EQUAL_TO" }
+  ""
+}
+
+// Tokenize `source`, returning the tokens in order, terminated by an EOF token.
+// NEWLINE is emitted as a real token (as in the TS lexer); whitespace and `//`
+// line comments are skipped (comment-as-trivia retention is out of scope for
+// this slice — see the gap report).
+function tokenize(source: string): (Tok | null)[] {
+  let lx = { src: source, pos: 0, line: 1, col: 0 }
+  let toks: (Tok | null)[] = []
+
+  while lx.pos < lx.src.length {
+    let startPos = lx.pos
+    let startLine = lx.line
+    let startCol = lx.col
+    let c = peek(lx)
+
+    // Newline `\n` (a leading `\r` of a `\r\n` pair is consumed as whitespace
+    // below, then the `\n` produces the NEWLINE token).
+    if c == 10 {
+      advance(lx)
+      toks.push(mkTok(lx, "NEWLINE", startPos, lx.pos, startLine, startCol))
+      continue
+    }
+
+    // Whitespace: space, tab, carriage return.
+    if c == 32 || c == 9 || c == 13 {
+      advance(lx)
+      continue
+    }
+
+    // Line comment `// ...` — consumed up to (not including) the newline.
+    if c == 47 && peek2(lx) == 47 {
+      while lx.pos < lx.src.length && peek(lx) != 10 {
+        advance(lx)
+      }
+      continue
+    }
+
+    // Identifier / keyword.
+    if isIdStart(c) {
+      while lx.pos < lx.src.length && isIdPart(peek(lx)) {
+        advance(lx)
+      }
+      let text = lx.src.slice(startPos, lx.pos)
+      toks.push(mkTok(lx, keywordKind(text), startPos, lx.pos, startLine, startCol))
+      continue
+    }
+
+    // Number: `[0-9]+ ('.' [0-9]+)?`. The fractional part is taken only when a
+    // digit follows the dot, so `a.5` / `p.x` keep `.` as a separate DOT.
+    if isDigit(c) {
+      while lx.pos < lx.src.length && isDigit(peek(lx)) {
+        advance(lx)
+      }
+      if peek(lx) == 46 && isDigit(peek2(lx)) {
+        advance(lx)
+        while lx.pos < lx.src.length && isDigit(peek(lx)) {
+          advance(lx)
+        }
+      }
+      toks.push(mkTok(lx, "NUMBER", startPos, lx.pos, startLine, startCol))
+      continue
+    }
+
+    // String: `"..."` or `'...'`, with `\<any>` escapes. The closing quote is
+    // consumed; an unterminated string runs to end of input (this slice does
+    // not emit diagnostics — see the gap report).
+    if c == 34 || c == 39 {
+      let quote = c
+      advance(lx)
+      while lx.pos < lx.src.length {
+        let ch = peek(lx)
+        if ch == 92 {
+          advance(lx)
+          if lx.pos < lx.src.length {
+            advance(lx)
+          }
+          continue
+        }
+        if ch == quote {
+          advance(lx)
+          break
+        }
+        advance(lx)
+      }
+      toks.push(mkTok(lx, "STRING", startPos, lx.pos, startLine, startCol))
+      continue
+    }
+
+    // Two-char operator (longest match first).
+    let two = twoCharKind(c, peek2(lx))
+    if two != "" {
+      advance(lx)
+      advance(lx)
+      toks.push(mkTok(lx, two, startPos, lx.pos, startLine, startCol))
+      continue
+    }
+
+    // One-char operator / punctuation.
+    let one = oneCharKind(c)
+    if one != "" {
+      advance(lx)
+      toks.push(mkTok(lx, one, startPos, lx.pos, startLine, startCol))
+      continue
+    }
+
+    // Unknown character — emit an ERROR token and make progress. (The TS lexer
+    // pushes a diagnostic instead; this slice has no diagnostic channel.)
+    advance(lx)
+    toks.push(mkTok(lx, "ERROR", startPos, lx.pos, startLine, startCol))
+  }
+
+  toks.push(mkTok(lx, "EOF", lx.pos, lx.pos, lx.line, lx.col))
+  toks
+}
+
+// ---- test driver ----
+let toks = tokenize("12 3.14 a.5 100")
+let n = 0
+while n < toks.length {
+  let t = toks[n]
+  if t != null {
+    print(t.kind)
+    if t.kind != "EOF" { print(t.text) }
+  }
+  n = n + 1
+}
