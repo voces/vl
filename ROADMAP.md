@@ -195,6 +195,11 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   consistent message style.
 - ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
   position and emit it. Deprioritized — correctness is fine; this is a depth/perf optimization.
+- 🐛 **B-bug. `while` as the tail statement of a void function crashes binaryen's Vacuum pass.**
+  A `while` loop in *tail position* of a `void`-returning function body aborts inside binaryen
+  optimization (reproduces with locals only — unrelated to globals; found while landing H2 gap #2).
+  Workaround today: don't end a void function on a bare `while`. Fix: investigate the Vacuum-pass
+  input we emit for a result-less loop in tail position (likely a malformed/None-typed block tail).
 - ✅ **B19. `return` / early returns** (early, from loops, fall-through; a bare `return` yields null).
 - ⬜ **B20. Loops as expressions + `break <value>`.** Lift `for`/`while` into expression position; a
   loop evaluates to its `break` value or `null` (a natural *search* expression — `let found = for x
@@ -245,6 +250,25 @@ D1/D2.*
   established conventions (JSDoc `{@link Name}` / rustdoc intra-doc `` [`Name`] ``) rather than a bespoke
   syntax, resolving names via D2's symbol table definition spans for click-to-definition; single-file first,
   workspace-wide later.
+- ⬜ **D8. Preserve type-alias names in display (the "`aliasSymbol`" gap).** Today a reference to an
+  alias resolves *through* to its body before rendering, so a hover on `type thing = "a" | I32` shows
+  `"a" | i32`, not `"a" | I32` — the inner alias name is lost (the `Type` node in `ast.ts` carries
+  `subType` but no `name`). This mirrors TS, which only keeps alias names because it hangs an
+  `aliasSymbol` on the resolved type. Fix: carry the alias name on the resolved type (a `name?` on the
+  `Type` node, or keep the reference as a named `Alias` and resolve lazily) and let the renderer choose
+  per context — **preserve** the name in hovers/inlay (D1/D6: show what the programmer wrote);
+  **expand** to the body in type-mismatch errors (the message must explain the actual incompatibility);
+  show `type I32 = i32` (name = expansion) when hovering the alias *declaration* itself. Self-contained
+  once the name is threaded; the only real design work is the preserve-vs-expand policy above.
+  **Manual step-expansion (owner ask): expand one depth level at a time, on demand.** The renderer
+  should take a *depth* and expand only the outermost alias layer per step (`"a" | I32` → `"a" | i32`,
+  and for nested aliases one layer each press), not all-or-nothing. Surface it via **VS Code hover
+  verbosity levels** — the `+`/`−` controls in the hover popup (LSP hover verbosity: the server returns
+  a hover flagged `canIncrease`/`canDecrease`, and each "increase verbosity" request re-renders at
+  `depth+1`). This needs `stringifyType` to grow a `maxDepth` parameter (alias `Type` nodes below the
+  cap render as their name, above it expand to the body) and the LSP `onHover` to thread the requested
+  verbosity level through. Default hover = depth 0 (all names preserved); stepping reveals the structure
+  progressively. Same `maxDepth` renderer powers the preserve-vs-expand contexts above.
 
 ---
 
