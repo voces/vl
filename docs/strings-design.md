@@ -21,7 +21,7 @@
 > stays until then. Note the target **keeps the code-point-indexed surface** (`s[i]`
 > a code point, `'a'` a code point, `.length` a code-point count) — what changes is
 > the *storage* (UTF-8 bytes, not `array i32`) and therefore the *cost model* (O(1)
-> for ASCII via the fast path, O(n)/index-assisted for non-ASCII), not the indexing
+> for ASCII via the fast path, O(n) for non-ASCII), not the indexing
 > unit.
 
 ## Summary / recommendation
@@ -45,11 +45,10 @@ strings, the overwhelmingly common case. We keep integer indexing on purpose: th
 owner wants to *index* strings, not navigate them through Swift-style opaque
 `String.Index` cursors. The honest tradeoff, stated plainly: for a **non-ASCII**
 string, `s[i]` and the code-point `.length` are **O(n)** (the ASCII flag rescues only
-the ASCII case); an **optional code-point-index side table**, built lazily on first
-code-point index of a non-ASCII string, can restore O(1) there too. **Byte-indexing
-(the Rust/Go camp)** — what an earlier draft recommended — is **demoted to a rejected
-alternative for VL**: we want O(1) char/code-point indexing as the default ergonomic,
-not byte offsets. (§API)
+the ASCII case), and **`for cp in s` — one O(n) pass — is the canonical loop**, not
+indexed `for i { s[i] }`. **Byte-indexing (the Rust/Go camp)** — what an earlier draft
+recommended — is **demoted to a rejected alternative for VL**: we want O(1)
+char/code-point indexing as the default ergonomic, not byte offsets. (§API)
 
 **ASCII fast path — now load-bearing, not a nicety.** Layer an "is this string pure
 ASCII?" bit into the string's struct header (alongside the byte backing) — the
@@ -57,16 +56,21 @@ PEP 393 / V8-Latin1 / Ruby `coderange` / Swift idea. Under code-point indexing t
 bit is **precisely what makes the chosen API O(1) for ASCII**: when the bit is set,
 byte offset == code point == character, so `s[i]` is a direct `array.get_u` and
 `.length` equals the byte length — both O(1), for free. When the bit is clear,
-code-point operations fall back to an O(n) decode scan (or the optional side index).
-String **literals constant-fold the branch away** (the compiler knows their bytes, so
-ASCII-ness is a compile-time constant), and because strings are **immutable** the flag
-is set once at construction and **never invalidated**. (§ASCII)
+code-point operations fall back to an O(n) decode scan. The honest cost the flag does
+*not* erase: the `{bytes, ascii}` struct adds a `struct.get` pointer-chase to **every**
+access (even byte-only ops that never look at the flag), mitigated by explicit
+`$bytes`-hoisting in loops and by the compiler inlining through the struct for the
+intrinsics it controls (below). String **literals constant-fold the branch away** (the
+compiler knows their bytes, so ASCII-ness is a compile-time constant), and because
+strings are **immutable** the flag is set once at construction and **never
+invalidated**. (§ASCII)
 
 The rest of the doc: the cross-language survey (storage encodings, then API/index
 camps, then the small-string/ASCII-flag precedents), then the VL design (storage;
 the API decision with the chosen unit + rejected alternatives; the load-bearing ASCII
-fast path; Unicode scope; validity; mutability), then a phased migration outline
-(explicitly **not before bootstrap**), then open questions for the owner.
+fast path; equality and hashing; the byte view; regex; Unicode scope; validity;
+mutability), then a phased migration outline (explicitly **not before bootstrap**),
+then open questions for the owner.
 
 ---
 
@@ -316,10 +320,12 @@ An earlier draft treated that as disqualifying and recommended byte-indexing. Th
 owner's decision flips this: **VL keeps integer-indexed, code-point-valued strings**
 — `s[i]` is a code point, `.length` is the code-point count — and pays for the
 generality with the **ASCII fast path** (§ASCII), which makes the common case (ASCII)
-O(1), plus an **optional side table** that makes non-ASCII O(1) too. The principle:
-VL wants the **ergonomic of indexing a string by character**, and "a character" at
-the core means **a code point**; the O(n)-non-ASCII cost is named honestly and
-mitigated, not avoided by handing the user byte offsets.
+O(1). The non-ASCII story is honest and simple: **ASCII code-point ops are O(1) via
+the flag; non-ASCII code-point ops are O(n)**, and `for cp in s` (one O(n) pass) is
+the canonical per-character loop. The principle: VL wants the **ergonomic of indexing
+a string by character**, and "a character" at the core means **a code point**; the
+O(n)-non-ASCII cost is named honestly and prescribed-around (iterate, don't index),
+not avoided by handing the user byte offsets.
 
 #### The decided API
 
@@ -340,29 +346,37 @@ mitigated, not avoided by handing the user byte offsets.
 
 #### Cost model — be honest about it
 
+> **Top-level warning — the O(n²) loop.** `for i in 0 to s.length { s[i] }` over a
+> **non-ASCII** string is **O(n²)**, and this is the single most important cost-model
+> fact about the API. Two O(n) costs compound: `s.length` is an O(n) code-point count
+> (it must decode the whole string), *and* each `s[i]` re-decodes from the start (the
+> i-th code point is not at a fixed byte offset). The **only safe per-character loop
+> over a possibly-non-ASCII string is `for cp in s`** — a single O(n) pass that
+> decodes once. Index-based character loops are an ASCII-only idiom; reach for `for cp
+> in s` whenever the string might not be ASCII.
+
 - **ASCII strings: O(1).** For a pure-ASCII string, byte offset == code point ==
   character, so `s[i]` is a direct `array.get_u` at offset `i` and `.length` is the
   byte length. The ASCII flag (§ASCII) is exactly what licenses this — it is
-  **load-bearing**, not decorative.
+  **load-bearing**, not decorative. An index-based loop over an ASCII string is fine:
+  each `s[i]` and `.length` are O(1), so the whole loop is O(n).
 - **Non-ASCII strings: O(n) by default.** For a string containing any multi-byte
   code point, `s[i]` must decode from a boundary (O(i), i.e. O(n) for the worst
   index) and the code-point `.length` is an O(n) decode-count. The flag rescues only
   the ASCII case; this is the real tradeoff of choosing the code-point unit over
-  UTF-8 storage, and it is stated plainly rather than hidden. **Consequence to keep
-  in mind:** a naïve `for i in 0 to s.length { s[i] }` over a non-ASCII string is
-  O(n²) unless the side table (below) is built — which is exactly why the side table
-  exists, and why iteration (`for cp in s`, an O(n) single pass) is the recommended
-  way to walk a string.
-- **Non-ASCII can be made O(1) with an optional code-point-index side table.** A
-  per-string auxiliary array mapping code-point index → byte offset (or a sampled
-  every-k-th-offset index) restores O(1) random access for non-ASCII strings. Built
-  **lazily on first code-point index of a non-ASCII string** (ASCII strings never
-  need it), it costs O(n) memory only for the strings that are actually
-  random-accessed by code point. The exact shape (full vs sampled index, eager vs
-  lazy threshold) is an implementation sub-choice (§OQ).
+  UTF-8 storage, and it is stated plainly rather than hidden. Because a `for i { s[i]
+  }` loop multiplies these two O(n) costs into O(n²) (warning above), `for cp in s` is
+  the prescribed way to walk a string.
 
-The framing: **ASCII (the common case) is O(1) for free; non-ASCII degrades
-gracefully and can be index-assisted to O(1) when it matters.**
+The framing: **ASCII (the common case) is O(1) for free; non-ASCII is O(n), so walk
+it with `for cp in s` (one pass), never with an indexed loop (quadratic).**[^cpindex]
+
+[^cpindex]: A per-string code-point-index side table (code-point index → byte offset)
+    could restore O(1) random access on non-ASCII strings. It is **deliberately left
+    out of v1** as needless complexity — a future optimization if a real
+    non-ASCII-random-access workload ever demands it, addable later with **no surface
+    change** (it only changes the cost of `s[i]` on non-ASCII strings, never its
+    meaning).
 
 #### Rejected alternative for VL — byte-indexing (the Rust/Go camp)
 
@@ -377,8 +391,9 @@ point to a byte (a value that is only meaningful mid-decode for non-ASCII), and 
 themselves. The honest tradeoff is the inverse of ours: byte-indexing pays *nothing*
 for non-ASCII random access but charges *every* "i-th character" access an explicit
 decode; code-point indexing makes "i-th character" the cheap default and pushes the
-cost onto non-ASCII random access (which the flag + side table then recover). The
-owner wants to index by character, so we take the code-point side of that trade. (The
+cost onto non-ASCII random access (which the ASCII flag recovers for the common case,
+and which `for cp in s` sidesteps for iteration). The owner wants to index by
+character, so we take the code-point side of that trade. (The
 byte view still exists — see "Byte access" above — it is just not what `s[i]` means.)
 
 #### Rejected alternative — no integer subscript (Swift camp)
@@ -397,22 +412,90 @@ Keep `array i32` storage so code-point `s[i]` is O(1) without any flag. This is 
 status quo; it forfeits the entire storage win (still 4× memory for ASCII, still
 transcodes at every I/O boundary) to buy an O(1) the ASCII fast path delivers anyway
 for the common case. **Rejected** — the storage decision (§Storage) is the point, and
-the ASCII flag + optional side table recover the O(1) without paying 4× memory for
+the ASCII flag recovers the O(1) for the common case without paying 4× memory for
 everyone.
+
+#### Rejected alternative — `wasm:js-string` builtins
+
+WasmGC hosts (browsers, and Wasm engines that opt in) expose the **`wasm:js-string`**
+builtins — string operations backed by the host's native JS string. Reusing them
+would mean no `array i8` to manage and free host-optimized routines. **Rejected**, on
+two grounds that go to VL's identity:
+
+- **UTF-16 semantics, in an `externref`.** A `wasm:js-string` *is* a JS string —
+  **UTF-16 code units**, with surrogate pairs and `"💩".length === 2`: exactly the
+  footgun VL rejects (§Survey, the UTF-16 cohort). To keep VL's code-point API we
+  would have to wrap **every** operation in code-unit→code-point translation, paying
+  the surrogate tax on each access and re-importing the whole hazard we are designing
+  away from.
+- **Browser-only.** The builtins exist on JS hosts; VL targets CLI/Deno/standalone
+  engines too, where they are simply absent. A core type cannot depend on a
+  host-specific facility.
+
+Owning an `array i8` plus a small UTF-8 decoder is **portable** (identical on every
+Wasm host), keeps the **code-point surface** intact, and avoids the UTF-16 baggage.
+The host strings stay where they belong — at the FFI boundary, reachable via
+`s.bytes()` — not as the core representation.
+
+### Byte view: `s.bytes()` is a zero-copy view — DECIDED
+
+`s.bytes()` returns a **zero-copy view over the same UTF-8 backing** — *not* a copy.
+Because strings are immutable (§Mutability), the view can alias `$bytes` directly with
+no defensive copy and no invalidation risk; constructing it is O(1).
+
+- **Indexable, byte-valued.** `bytes[i]` is the i-th **UTF-8 byte** in O(1) (a direct
+  `array.get_u`), and `bytes.length` is the **byte length** (O(1), `array.len`) — note
+  this is the byte count, distinct from the string's code-point `.length`.
+- **`bytes[i]` yields a `u8`-range value, typed `i32`.** Each byte is **0–255**. VL
+  has no distinct `u8` type today, so the element type is **`i32`** carrying a
+  guaranteed-in-`0..=255` value (lowered as `array.get_u`, the unsigned read, so it is
+  never sign-extended negative). If VL later grows a `u8`, `s.bytes()` is the natural
+  first consumer; until then it is an `i32` in `0..=255`.
+- **Use it for boundaries and FFI**, where the *bytes* are the unit (host I/O, hashing,
+  binary protocols). The default subscript `s[i]` stays the **code point**; `s.bytes()`
+  is the explicit opt-in to the byte view. It does not validate (§Validity) — it hands
+  back the raw stored bytes.
+
+### Equality and hashing — DECIDED
+
+- **`==` is byte equality, no normalization.** Core string equality compares the
+  `$bytes` arrays for **exact byte equality** (length-check then `array`-compare, with
+  the cached length/hash short-circuit below). It does **not** normalize: two strings
+  that render identically but are encoded differently (`"é"` as U+00E9 vs `"e"` +
+  U+0301 combining acute) compare **unequal**. Normalization-aware comparison is an
+  opt-in `std:unicode` concern (§Unicode), never the core `==`. Byte equality is also
+  the *correct* primitive for the ASCII fast path and for map keys: it needs no decode
+  and no tables.
+- **Hash is FNV-1a over the bytes.** The string hash is **FNV-1a over the UTF-8 bytes**
+  (matching B6a's existing string hash, now defined over bytes rather than code
+  points). Byte-domain hashing is consistent with byte-domain `==` — two strings hash
+  equal **iff** their bytes are equal, which is exactly the `==` contract maps require.
+- **Cache the hash in the string header — DECIDED.** Add a cached hash field to the
+  string header (alongside `$bytes`/`$ascii`). Under immutability this is a **pure
+  win**: compute once on first hash, never invalidate; the field is cheap (one `i32`),
+  and the bootstrapped compiler is **extremely map-key-heavy** (symbol tables, scopes,
+  interned names), so a cached key hash pays for itself immediately. The first `==`
+  comparison can also short-circuit on the cached hash before the byte scan.
+
+> **Migration note — atomic switch.** `__map_hash__` and `__string_eq__` must move to
+> **byte-level in the *same* migration step.** A mismatch — one operating on code
+> points while the other operates on bytes — would leave two byte-equal strings hashing
+> to different buckets (or vice versa), **silently corrupting every map** with no error.
+> They are a single, indivisible change; do not land one without the other.
 
 #### API recommendation, summarized
 
 **Code-point indexing, integer-indexed.** `s[i]` = code point (`i32`); `.length` =
 code-point count; `'a'` = code point; `slice`/`indexOf` keep code-point semantics;
-`for cp in s` iterates code points; `s.bytes()` exposes raw UTF-8 for boundaries.
-**O(1) for ASCII** (via §ASCII), **O(n) for non-ASCII** by default, **O(1) for
-non-ASCII** with the optional lazily-built code-point-index side table.
+`for cp in s` iterates code points (the canonical loop); `s.bytes()` exposes a
+zero-copy raw-UTF-8 view for boundaries (§Bytes). **O(1) for ASCII** (via §ASCII),
+**O(n) for non-ASCII** — so walk non-ASCII with `for cp in s`, not an indexed loop.
 
-**Genuinely open (§OQ):** the **shape of the non-ASCII side table** (full
-index vs sampled every-k offsets; eager vs lazy; the threshold at which it is built)
-and tuning heuristics for the ASCII flag. The *unit* (code point), the meaning of
-`'a'` (code point), validity (Go-lean), and graphemes (opt-in module) are **decided**
-below, not open.
+**Genuinely open (§OQ):** tuning heuristics for the ASCII flag, and two ergonomic
+calls left to the owner — a string-building/interpolation story (OQ-A) and whether
+`s[i]` should yield a 1-char string rather than an `i32` (OQ-B). The *unit* (code
+point), the meaning of `'a'` (code point), validity (Go-lean), and graphemes (opt-in
+module) are **decided** below, not open.
 
 ### The ASCII fast path — load-bearing under code-point indexing
 
@@ -424,32 +507,19 @@ it, *every* code-point index over UTF-8 would be an O(n) decode. With it, the co
 case (ASCII source, JSON, identifiers, compiler text) is O(1) for free. So the fast
 path is **load-bearing**, and the honest consequence is stated up front: it rescues
 **only** the ASCII case — a **non-ASCII** string's `s[i]` and code-point `.length`
-are **O(n)** unless the optional side table (below) is built.
+are **O(n)**, and the canonical way to walk such a string is `for cp in s` (one O(n)
+pass), never an indexed loop (§Cost model, O(n²)).
 
 **The idea (the owner's, developed here).** Track whether a string is **pure ASCII**
 and special-case that case. For an all-ASCII string, **byte offset == code point ==
 grapheme**, so over UTF-8 storage you get, for the ASCII string, *for free*: O(1)
 code-point indexing, an accurate code-point `.length` (it equals the byte length),
 and trivially-correct iteration. **Non-ASCII strings fall back to an O(n) decode
-scan**, or — when random-accessed by code point — to a **lazily-built side index**
-(below) that restores O(1). This is the Python-PEP-393 / V8-Latin1 / Ruby-`coderange`
-/ Swift-ASCII-fast-path pattern (§Survey axis 3), shaped for VL.
+scan.** This is the Python-PEP-393 / V8-Latin1 / Ruby-`coderange` /
+Swift-ASCII-fast-path pattern (§Survey axis 3), shaped for VL.
 
-**Making non-ASCII O(1) too — the optional code-point-index side table.** The ASCII
-flag covers the common case; for a **non-ASCII** string that is *randomly accessed by
-code point*, an optional per-string **side table** maps code-point index → byte
-offset (or samples every k-th offset, trading a small per-access scan for a smaller
-table). It is **built lazily on the first code-point index of a non-ASCII string** —
-ASCII strings never allocate it, and non-ASCII strings that are only iterated or
-printed never allocate it either, since iteration is a single O(n) pass and printing
-is a bulk byte copy. With the table present, `s[i]` on a non-ASCII string is O(1)
-(table lookup → `array.get` at the byte offset). The whole picture: **ASCII is O(1)
-for free; non-ASCII degrades gracefully to O(n) and can be index-assisted back to
-O(1)** when a workload actually random-accesses it. The table's exact shape (full vs
-sampled, the lazy threshold) is an open implementation sub-choice (§OQ).
-
-**Where the bit lives.** A **1-bit/1-byte `ascii` flag in the string's struct
-header**, alongside the `array i8` byte backing:
+**Where the bit lives — `{bytes, ascii}` struct (DECIDED).** A **1-byte `ascii` flag
+in the string's struct header**, alongside the `array i8` byte backing:
 
 ```
 string  ≅  (struct (field $bytes (ref (array i8)))
@@ -458,9 +528,14 @@ string  ≅  (struct (field $bytes (ref (array i8)))
 
 This promotes `string` from a bare `array i8` to a small struct — the same
 header-vs-bare-array tradeoff the collections design weighs for `List` (an extra
-`struct.get` + pointer-chase per access, hoistable out of loops via LICM). The flag
-is one byte; the cost that matters is the indirection and the branch, discussed
-below.
+`struct.get` + pointer-chase per access). **Why the struct and not a stolen
+length bit:** on WasmGC you **cannot alias `array.len`** — it is a runtime property
+of the array object, not a user-addressable field you can pack a flag into — so the
+stolen-bit trick would need a *custom* length field anyway, at which point you are
+already carrying a header struct. Given that, `{bytes: (ref (array i8)), ascii: i8}`
+is the idiomatic, equivalent-complexity form, and the open question of "struct vs
+stolen bit" resolves to **struct**. The flag is one byte; the cost that matters is the
+indirection and the branch, discussed below.
 
 **When it's computed.**
 
@@ -483,14 +558,14 @@ below.
 **How operations branch on it.**
 
 - **`.length`** (the code-point count, the default): if `ascii`, return the byte
-  length (O(1)); else O(n) decode-count (or read a built side index).
+  length (O(1)); else O(n) decode-count.
 - **`s[i]`** (code-point indexing, the default subscript): if `ascii`, it's a direct
-  `array.get_u` at byte offset `i` (O(1)); else decode-from-a-boundary (O(n)) — or
-  O(1) via the side index once built.
+  `array.get_u` at byte offset `i` (O(1)); else decode-from-a-boundary (O(n)).
 - **Iteration** `for cp in s`: if `ascii`, the decoder is a trivial 1-byte-per-step
-  loop (no continuation-byte handling); else the full UTF-8 decode (one O(n) pass,
-  no side index needed). Same surface, two lowerings — exactly the uniform-access
-  pattern the collections/`length` design uses.
+  loop (no continuation-byte handling); else the full UTF-8 decode (one O(n) pass).
+  Same surface, two lowerings — exactly the uniform-access pattern the
+  collections/`length` design uses, and the reason `for cp in s` is the canonical loop
+  even over non-ASCII text (one pass, not the quadratic indexed loop).
 
 **Compile-time-known strings (literals) skip the branch entirely.** The flag-and-branch
 above is the *runtime* mechanism, and it only needs to exist for strings whose ASCII-ness
@@ -518,18 +593,32 @@ heuristic (§OQ), not a correctness question.
   **immutable strings** (the current model, recommended to keep) the flag is set once
   at construction and never invalidated — the easy world. This is a reason to keep
   strings immutable.
-- **The header indirection.** Promoting `string` to a `{bytes, ascii}` struct adds a
-  `struct.get` + second-object pointer-chase per byte access vs a bare `array i8`,
-  the same cost the collections design analyzes for `List` — and the same mitigation
-  (hoist the `bytes` load out of the loop). An alternative that avoids the struct
-  entirely: **steal a bit from the length / use a high-bit convention** rather than a
-  separate field — sub-choice for implementation (§OQ).
-- **It rescues only ASCII — non-ASCII is the side table's job.** The flag makes
-  code-point `s[i]`/`.length` O(1) for ASCII strings; it does **nothing** for
-  non-ASCII, which stay O(n) by default and reach O(1) only via the optional
-  code-point-index side table. This is the honest division of labor under the chosen
-  code-point API: flag = the ASCII common case for free; side table = the non-ASCII
-  case when a workload random-accesses it. Stating it plainly so no one mistakes the
+- **The header indirection — paid by *every* access, even byte-only ops.** Promoting
+  `string` to a `{bytes, ascii}` struct adds a `struct.get` (load `$bytes`) +
+  second-object pointer-chase per access vs a bare `array i8`, the same cost the
+  collections design analyzes for `List`. The honest sting: this hits **even the
+  byte-only operations that never consult the flag** — `==`, `print`, `indexOf` —
+  because they too must load `$bytes` through the struct before touching a byte. Two
+  mitigations, both required:
+  - **Explicit `$bytes` LICM-hoisting in string loops.** `$bytes` is loop-invariant
+    (immutable strings never reassign it), so a loop should load it **once** before
+    the body, leaving bare `array.get`s inside — mirroring the collections design's
+    **backing-pointer hoist**. Crucially, binaryen's LICM is **not guaranteed** to
+    hoist a GC `struct.get` across a loop body, so codegen should **hoist explicitly**
+    rather than rely on the optimizer (the same catch the collections design flags for
+    `backing`).
+  - **The compiler inlines through the struct** for the string intrinsics it controls
+    (`__string_eq__`, `__print_string__`, `indexOf`, …), so the `$bytes` load folds
+    into the intrinsic body rather than crossing a call boundary opaque to the
+    optimizer.
+- **It rescues only ASCII — non-ASCII stays O(n).** The flag makes code-point
+  `s[i]`/`.length` O(1) for ASCII strings; it does **nothing** for non-ASCII, which
+  stay O(n) and should be walked with `for cp in s` (one pass), never an indexed loop.
+  This is the honest division of labor under the chosen code-point API: flag = the
+  ASCII common case for free; iteration = the non-ASCII case in one O(n) pass.
+  (A code-point-index side table to make non-ASCII *random access* O(1) is
+  deliberately out of v1 — see the §Cost-model footnote.) Stating it plainly so no one
+  mistakes the
   flag for a general O(1) guarantee.
 
 **Why it's safe — it can only ever be a win** (the same framing as the collections
@@ -557,7 +646,7 @@ text:
   (locale-aware sorting) each need their own sizable tables.
 
 **Principle (the std-over-primitives frame from `docs/modules-design.md`):** the
-common binary stays lean by keeping these in an **opt-in `std/unicode` module**, not
+common binary stays lean by keeping these in an **opt-in `std:unicode` module**, not
 the core type. This matches precedent — Rust ships grapheme segmentation as the
 external `unicode-segmentation` crate, Go puts normalization/collation/segmentation in
 `golang.org/x/text`, not the core `string`. A program that never touches grapheme
@@ -566,21 +655,61 @@ boundaries or NFC never links the tables.
 **Consequences for the core surface:**
 - **No `s.length`-as-graphemes and no grapheme subscript in the core.** Core `s[i]`
   and `.length` are **code points** (decided in §API). Grapheme iteration, when a
-  program wants the user-perceived "character", comes from `std/unicode` as an opt-in
+  program wants the user-perceived "character", comes from `std:unicode` as an opt-in
   `s.graphemes()` view — *added without changing the code-point-indexed core.* This is
   also why §API rejects the Swift opaque-index route: graphemes are a module concern,
   not a reason to remove integer subscript.
 - **Built-in `toUpper`/`toLower` are ASCII-or-simple by default.** The core provides
   the cheap, table-free case conversion (ASCII, and the simple 1:1 Unicode mappings);
-  **full-Unicode case mapping/folding lives in `std/unicode`**. So `"hello".toUpper()`
+  **full-Unicode case mapping/folding lives in `std:unicode`**. So `"hello".toUpper()`
   is core and free; locale-correct or `ß`-aware folding is the opt-in module.
 - **Comparison/equality stay byte/code-point exact in the core**; normalization-aware
   ("é" as one code point vs base+combining equal) comparison and collation are
-  `std/unicode`.
+  `std:unicode`.
 
 This keeps the core string honest about what it is — a UTF-8 byte buffer you index by
 code point — and pushes everything that needs the Unicode Character Database into a
 module the common binary need not pay for.
+
+### Regex: `std:regex`, byte-engine over the UTF-8 backing — DESIGN
+
+Regex is the **biggest gap** flagged by review, and it *reinforces* the whole design
+rather than straining it: the UTF-8 byte backing is exactly what a modern regex engine
+wants underneath, while the code-point surface is what the programmer writes patterns
+against. The decision is to **not** put a regex engine in the core, and to shape it as
+below when it lands.
+
+- **Lives in `std:regex`** (consistent with the `std:` scheme of
+  `docs/modules-design.md` — `std:regex`, like `std:list`/`std:fmt`/`std:unicode`).
+  Programs that never match a regex never link the engine; a regex compiler/VM is real
+  code-size the common binary should not carry.
+- **Runs over the UTF-8 byte backing directly** — the **Rust `regex` / RE2 model**: a
+  **byte-indexed NFA/DFA** that consumes `$bytes` as-is, with **no per-character
+  decode in the hot path**. The matcher steps over bytes; a multi-byte code point is
+  just a fixed byte sequence in the automaton. This is the decisive reason UTF-8
+  storage is the right substrate: the engine's natural unit (the byte) *is* the storage
+  unit, so matching is a tight byte loop with zero transcoding — the same "bytes are
+  the engine's unit" win as the I/O boundary.
+- **Unicode character classes share `std:unicode`'s tables.** `\w`, `\d`, `\s`,
+  `\p{L}`, `\p{Nd}`, etc. are backed by the **same Unicode tables as `std:unicode`**
+  (compiled into byte-class transitions in the automaton). So the common binary does
+  **not** link those tables unless `std:regex` (or `std:unicode`) is imported —
+  ASCII-only patterns (`[a-z0-9_]`) need no tables at all.
+- **Match positions are byte offsets.** A match/capture reports **byte offsets** into
+  the backing, so slicing the matched span is a **zero-copy / O(1) byte-range** sub-view
+  — efficient by construction. A **code-point-offset helper** converts a byte offset to
+  a code-point index when a caller wants the code-point coordinate (an O(n) decode, used
+  only when explicitly asked, never on the match hot path).
+- **Lenient on malformed bytes (Go-lean).** Consistent with §Validity, the engine
+  handles malformed UTF-8 **leniently** — it does not reject or trap on ill-formed
+  input; ill-formed subsequences behave like the lenient decode (no match across a bad
+  boundary, never a crash).
+
+The framing to keep: **code points are the programmer's surface** (the pattern, the
+classes, the code-point-offset helper), **bytes are the engine's unit** (the automaton,
+the offsets, the slicing) — the same split that defines the whole string design,
+applied to regex. This is *why* UTF-8 + a code-point API is the right pair: it serves
+both audiences without a conversion layer in the hot path.
 
 ### Validity: bytes that are usually UTF-8 (Go-style lean-NO) — DECIDED
 
@@ -607,6 +736,19 @@ than trapping or having the type refuse to exist. The string stays usable; the
 garbage surfaces as visible replacement characters, not a crash. (The ASCII fast path
 is unaffected — an all-ASCII byte string is trivially valid; only non-ASCII strings
 from the host can carry malformed bytes, and those take the lenient decode path.)
+
+**Honest cost of "never validate at the boundary."** Skipping boundary validation is
+not *free* — it **shifts a per-access well-formedness check onto non-ASCII code-point
+operations**: because the bytes were never validated up front, the decoder must check
+well-formedness *as it goes* (and substitute U+FFFD on a malformed subsequence) on
+every code-point decode. That cost is **cheap** (the decoder already inspects the lead
+and continuation bits to find boundaries, so the validity check rides along) but it is
+**not literally zero**. The saving grace: the **ASCII fast path skips the decoder
+entirely** — an ASCII string's code-point ops are direct byte reads with no
+well-formedness logic — so for the common case the check is **genuinely free**, and the
+per-access cost lands only on non-ASCII code-point access, which is already on the O(n)
+path. This is the right place to pay it: trade a cheap per-access check on rare
+non-ASCII text for a bulk-copy I/O boundary on *all* text.
 
 **Rejected: Rust-strict validity.** Guaranteeing `string` is always valid UTF-8 is
 cleaner for iteration and lets slicing assume boundaries — but it forces validation at
@@ -689,23 +831,28 @@ self-hosting):
    code-point and byte views *coincide*, so this lands with **no observable change to
    ASCII code** — the cost-model change only surfaces for non-ASCII text.
 2. **Layer in the ASCII fast path (§ASCII) — this is what restores O(1).** Add the
-   `ascii` flag (literals get it as a compile-time constant and constant-fold the
-   branch away; host-read strings scanned once; concat ANDs flags), and branch the
-   code-point operations on it. Under code-point indexing this is **not optional
-   polish — it is what makes `s[i]`/`.length` O(1) for ASCII** over UTF-8 storage.
-3. **(Optional, as needed) the non-ASCII code-point-index side table.** Add the
-   lazily-built side table so non-ASCII random access reaches O(1). Pure optimization,
-   no surface change; build only when a workload demonstrably random-accesses
-   non-ASCII strings by code point.
+   `ascii` flag (the `{bytes, ascii}` struct; literals get the flag as a compile-time
+   constant and constant-fold the branch away; host-read strings scanned once; concat
+   ANDs flags), and branch the code-point operations on it. Add explicit `$bytes`-hoist
+   in string loops (binaryen's LICM over a GC `struct.get` is not guaranteed). Under
+   code-point indexing this is **not optional polish — it is what makes `s[i]`/`.length`
+   O(1) for ASCII** over UTF-8 storage.
+3. **Move `__map_hash__` and `__string_eq__` to byte-level — atomically (§Equality).**
+   In the *same* step, switch hashing (FNV-1a over bytes) and equality (byte equality)
+   off code points and onto the UTF-8 bytes, and add the cached-hash header field. These
+   two must move together — a hash/eq mismatch silently corrupts maps.
 
-A separable, **opt-in** track (not gating the above): the **`std/unicode` module** —
+A separable, **opt-in** track (not gating the above): the **`std:unicode` module** —
 grapheme segmentation (`s.graphemes()`), normalization, collation, full-Unicode case
 mapping — built on the code-point-indexed core, shipped as a module so the common
-binary stays lean.
+binary stays lean. Likewise **`std:regex`** (§Regex) — a byte-engine over the UTF-8
+backing — is its own opt-in module, landed independently after the storage swap.
 
 The `DECISIONS.md` entry — recording UTF-8 storage, the **code-point-indexed API**,
-the **load-bearing ASCII fast path**, **Go-lean validity**, and **Unicode-out-of-core**
-as the committed string model — **lands with that implementation work, not now.** This
+the **load-bearing ASCII fast path** (the `{bytes, ascii}` struct), **byte-level
+equality + FNV-1a-over-bytes hashing with a cached hash**, **Go-lean validity**,
+**Unicode-out-of-core** (`std:unicode`), and **regex-out-of-core** (`std:regex`) as
+the committed string model — **lands with that implementation work, not now.** This
 document is the rationale and the decision record that precedes it.
 
 ---
@@ -726,23 +873,61 @@ re-litigated, and called out as decided so the owner can veto if any reads wrong
   validated invariant; no host-boundary validation; malformed sequences decode
   leniently to **U+FFFD**. Rust-strict is the rejected alternative.
 - **Graphemes / normalization / collation / full-Unicode case — DECIDED: out of the
-  core, in opt-in `std/unicode`.** The core is bytes + ASCII fast path + code-point
+  core, in opt-in `std:unicode`.** The core is bytes + ASCII fast path + code-point
   indexing; the Unicode-table-heavy operations are a module, so the common binary
   stays lean.
 - **Mutability — DECIDED: immutable**, with in-place as an opportunistic compiler
   optimization (§Mutability).
+- **Where the ASCII bit lives — DECIDED: a `{bytes, ascii}` struct.** Previously open
+  (struct vs stolen length-bit vs lazy tri-state); resolved to **struct** because on
+  WasmGC you **cannot alias `array.len`** (it is a runtime property, not a user field),
+  so a stolen-bit scheme needs a custom length field anyway — at which point
+  `{bytes: (ref (array i8)), ascii: i8}` is the idiomatic, equivalent-complexity form
+  (§ASCII). The eager-at-construction form is the default; lazy `coderange` remains a
+  pure implementation sub-choice with no surface effect.
+- **The non-ASCII code-point-index side table — DECIDED: out of v1.** Previously open
+  (full vs sampled, eager vs lazy, thresholds); now **cut** as needless complexity. The
+  honest v1 story is **ASCII code-point ops O(1), non-ASCII O(n)**, with `for cp in s`
+  the canonical loop. A side table is a **future optimization** if a real
+  non-ASCII-random-access workload demands it, addable later with **no surface change**
+  (§Cost-model footnote).
+- **Equality / hashing — DECIDED: byte-level.** `==` is byte equality (no
+  normalization); the hash is FNV-1a over the bytes, cached in the header; the two move
+  atomically in migration (§Equality).
 
-Genuinely still open (sub-choices and tuning, not identity):
+Genuinely still open — owner's calls (recommendations given, decision deferred):
 
-1. **The non-ASCII code-point-index side table — its shape.** Full index (code-point
-   index → byte offset, O(n) memory, O(1) lookup) vs **sampled** (every k-th offset,
-   smaller table, a short bounded scan per access); **eager** at first non-ASCII
-   construction vs **lazy** on first code-point index; and the threshold/heuristic for
-   building it at all. This is the one part of the chosen API left to implementation.
-2. **Where the ASCII bit lives** — a `{bytes, ascii}` struct header (adds the
-   indirection the collections design analyzes), a stolen high bit / length-encoding
-   trick (no extra object, fiddlier), or a tri-state lazy `coderange` (Ruby). And:
-   eager-at-construction vs lazy-on-first-use.
+1. **String building / interpolation / formatting — RECOMMENDATION, owner decides.**
+   The gap: `s = s + piece` in a loop is **O(n²)** (each `+` copies the whole
+   accumulator), and there is no `f"…"` / format story at all. Options, not mutually
+   exclusive:
+   - **A buffer / `StringBuilder` type** — an explicit mutable accumulator (amortized
+     O(1) append, one final `.toString()`), the standard fix for the O(n²) build loop.
+   - **Interpolation syntax** — `f"Hello {name}"` (or `` `Hello ${name}` ``) lowering to
+     a builder/concat sequence; pure ergonomics, orthogonal to the perf fix.
+   - **A `std:fmt` format function** — `format("Hello {}", name)` (already namespaced in
+     `docs/modules-design.md`), no new syntax.
+   - **Recommendation:** land a **buffer type first** (it fixes the real O(n²) perf
+     trap, which is the load-bearing problem), then add **interpolation sugar** on top
+     later for ergonomics; `std:fmt` can back both. Owner to choose the mix and the
+     syntax.
+   - Also to **assign (core vs `std`):** **`split`** (a very common operation with no
+     home yet) — and similarly `join`, `trim`, `replace`, `repeat`. Recommend the cheap
+     byte/code-point ones in core and the Unicode-aware variants in `std:unicode`, but
+     the core-vs-`std` line is the owner's to draw.
+2. **`s[i]` yields an `i32` code point, not a 1-char string — RECOMMENDATION, owner
+   decides.** The friction: `let c = s[0]` gives an `i32`, so `"x" + s[0]` does *integer*
+   work, not concatenation — a real ergonomic papercut. Options:
+   - **Keep `i32`, use the `fromCodePoint(c)` idiom** (exists today) to turn a code
+     point back into a string when concatenating.
+   - **One-char-slice sugar** — make `s[0..1]` (a *string*) the ergonomic single-char
+     accessor, leaving `s[0]` as the `i32` code point.
+   - **A `char`-as-1-char-string type** — `s[i]` yields a `char` that *is* a 1-code-point
+     string (Swift's `Character` flavor), concatenable directly; the largest change.
+   - **Recommendation:** keep `s[i]` an `i32` (consistent with the decided char-literal
+     model and avoids a new type), and add **one-char-slice sugar `s[0..1]`** as the
+     concatenation-friendly accessor. Owner to decide whether the ergonomic gap is worth
+     a dedicated `char` type instead.
 3. **ASCII-flag constant-propagation aggressiveness** — how far to push
    `ascii(a) && ascii(b) ⇒ ascii(a + b)` (and the slice case) at compile time before
    falling back to the runtime bit. A tuning heuristic, not a correctness question.
