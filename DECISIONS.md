@@ -43,6 +43,15 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
   subtracts `T`, else-branch narrows to `T`). Surface type negation is rare across languages (TS has only
   the named `Exclude<A,B>`; set-theoretic systems write `¬t`/difference internally) — Whiley is the main
   precedent for a `!`-style negation type. (A3/A4)
+- **`const` = immutable binding, `let` = reassignable (JS/TS semantics), enforced.** `const x`
+  cannot be rebound (`x = …`, `x++`/`x--` are errors); `let x` can. This corrects an earlier inverted
+  state where `const` was the reassignable form and immutability wasn't enforced at all. Rationale:
+  match the overwhelmingly familiar JS/TS meaning rather than surprise every newcomer. **Binding
+  mutability is a distinct axis from data mutability:** `const` governs only whether the *name* may be
+  rebound — the data behind it may still mutate (`const o = {…}; o.x = 2` and `a[i] = …` stay legal).
+  Read-only data and deep immutability ride a separate axis (A9 `readonly` + immutable value types like
+  strings), not the binding keyword. Follow-up: the `prefer-const` lint (PR #75) must be re-pointed to
+  flag an unmutated `let` (suggest `const`) once both land.
 
 ## Memory, runtime & object model
 

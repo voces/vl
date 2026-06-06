@@ -354,8 +354,9 @@ class Printer {
     indent: number,
     line: number,
   ): void {
-    // `mutable` is true for `const`, false for `let` (parser: const => mutable).
-    const kw = node.mutable ? "const" : "let";
+    // `mutable` is true for `let` (reassignable), false for `const` (immutable
+    // binding) — JS/TS semantics (parser: let => mutable).
+    const kw = node.mutable ? "let" : "const";
     let head = `${kw} ${node.name}`;
     if (node.annotated) {
       const annotation = this.recoverVarAnnotation(node);

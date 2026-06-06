@@ -51,6 +51,15 @@ export type Binding = {
    * completion `documentation`. Undefined when the declaration has no `///` doc.
    */
   doc?: string;
+  /**
+   * Whether this binding's *name* may be rebound. True for `let` variables (and
+   * by default for parameters, which are local copies); false for `const`
+   * variables. Governs only rebind/reassignment of the name (`x = …`, `x++`),
+   * NOT mutation of the data behind it (`obj.x = …` / `a[i] = …` stay legal
+   * regardless — that's the separate A9 readonly / immutable-value-type axis).
+   * Undefined for kinds where it doesn't apply (functions, types).
+   */
+  mutable?: boolean;
 };
 
 /** One textual appearance of a name, resolved to the binding it refers to. */
