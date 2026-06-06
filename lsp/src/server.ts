@@ -18,6 +18,7 @@ import {
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import {
+  checkOnly,
   compile,
   parseSymbols,
   rangeFromCtx,
@@ -36,6 +37,7 @@ import {
   type LspRange,
   memberCompletions,
   receiverObjectType,
+  resolveMemberAt,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
   typeLabelDetail,
@@ -184,6 +186,21 @@ connection.onHover(async (params): Promise<Hover | null> => {
     };
   }
 
+  // Member-aware hover: when the cursor is on the `.member` half of a
+  // `receiver.member` (`o.x`, `xs.get`, `s.length`) — which is NOT a symbol-table
+  // binding — locate the member-access AST node, type its receiver, and render
+  // the resolved member type. Driven by the public AST node spans (`.spans`) +
+  // the checker's member typing (one mechanism shared with semantic tokens).
+  const { ast: checkedAst, spans } = checkOnly(document.getText());
+  if (checkedAst && spans) {
+    const member = resolveMemberAt(checkedAst, spans, toVLPosition(params.position));
+    if (member) {
+      return {
+        contents: hoverMarkdown(`${member.name}: ${stringifyType(member.type)}`),
+      };
+    }
+  }
+
   const word = wordAt(lineText, params.position.character);
   if (!word) return null;
 
@@ -226,9 +243,12 @@ connection.languages.semanticTokens.on((params): SemanticTokens => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return { data: [] };
   const text = doc.getText();
-  const symbols = parseSymbols(text);
   const { tokens } = tokenize(text);
-  return { data: semanticTokensData(symbols, tokens, text) };
+  // `checkOnly` (synchronous, binaryen-free) gives the symbol table AND the AST
+  // node spans, so member names (`o.x`, `xs.get`) get `property`/`method` tokens
+  // alongside the binding-classified identifiers.
+  const { symbols, ast, spans } = checkOnly(text);
+  return { data: semanticTokensData(symbols, tokens, text, ast, spans) };
 });
 
 // Map a neutral completion kind (from `typeFeatures.ts`) to the LSP enum. A VL

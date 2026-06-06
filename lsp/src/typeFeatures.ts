@@ -16,13 +16,23 @@
 
 import type {
   Context,
+  NodeSpans,
   Position,
   Scope,
+  VLExpression,
   VLObjectType,
+  VLProgramNode,
   VLType,
 } from "../../compiler/ast.ts";
+import { spanOf } from "../../compiler/ast.ts";
 import type { BindingKind, SymbolTable } from "../../compiler/symbols.ts";
 import type { Token, TokenKind } from "../../compiler/lexer.ts";
+import {
+  arrayElementType,
+  isListType,
+  listMemberType,
+  typeFromExpression,
+} from "../../compiler/typecheck.ts";
 
 // ---- semantic tokens (D5) ---------------------------------------------------
 
@@ -46,6 +56,8 @@ export const SEMANTIC_TOKEN_TYPES = [
   "boolean", // `true` / `false` / `null` literal (custom; not in the LSP spec)
   "operator", // operators & punctuation operators
   "comment", // `//` line comment (incl. `///` doc comments)
+  "property", // an object field member name (`o.x`)
+  "method", // a function-typed member name (`xs.get`, `s.slice`)
 ] as const;
 
 export const SEMANTIC_TOKEN_MODIFIERS = [
@@ -282,6 +294,8 @@ export const classifyDocument = (
   table: SymbolTable,
   tokens: Token[],
   source: string,
+  ast?: VLProgramNode,
+  spans?: NodeSpans,
 ): ClassifiedToken[] => {
   const symbolTokens = classifySymbolTokens(table);
   const merged: ClassifiedToken[] = [...symbolTokens.values()];
@@ -290,6 +304,14 @@ export const classifyDocument = (
     if (!symbolTokens.has(`${t.line}:${t.char}`)) merged.push(t);
   }
   merged.push(...commentTokens(source));
+  // Member names (`o.x`, `xs.get`) — leftover `ID`s neither pass classifies. A
+  // symbol-table classification at the same position still wins (defensive: a
+  // member name never overlaps a binding occurrence).
+  if (ast && spans) {
+    for (const t of classifyMemberTokens(ast, spans)) {
+      if (!symbolTokens.has(`${t.line}:${t.char}`)) merged.push(t);
+    }
+  }
   merged.sort((a, b) => a.line - b.line || a.char - b.char);
   return merged;
 };
@@ -341,7 +363,10 @@ export const semanticTokensData = (
   table: SymbolTable,
   tokens: Token[],
   source: string,
-): number[] => encodeSemanticTokens(classifyDocument(table, tokens, source));
+  ast?: VLProgramNode,
+  spans?: NodeSpans,
+): number[] =>
+  encodeSemanticTokens(classifyDocument(table, tokens, source, ast, spans));
 
 // ---- inlay hints (D6) -------------------------------------------------------
 
@@ -733,4 +758,233 @@ const asObjectType = (
     return target ? asObjectType(target, scope, depth + 1) : undefined;
   }
   return undefined;
+};
+
+// ---- member-aware hover / semantic tokens (D1/D5 follow-up) -----------------
+//
+// Hover and semantic tokens previously resolved only D2 symbol-table *bindings*.
+// A member name in `receiver.member` (`o.x`, `xs.get`, `s.length`) isn't a
+// binding, so the `.member` half came back empty. The mechanism below closes
+// that gap with ONE path shared by both features: locate the `PropertyAccess` /
+// `OptionalAccess` AST node whose *member name* is under the cursor, type its
+// receiver, and look the member up. (Member calls — `xs.get(i)` — parse to a
+// `Call` whose `callee` is exactly such a `PropertyAccess`, so they're covered
+// by the same node walk.)
+
+/**
+ * How a resolved member is categorised — mirrors the LSP semantic-token split.
+ * A function-typed member is a `method`; any other member is a `property`. (These
+ * are distinct from {@link BindingKind} because a member has no binding.)
+ */
+export type MemberTokenKind = "property" | "method";
+
+/** A member name located under the cursor, with its resolved type. */
+export type ResolvedMember = {
+  /** The member identifier text (`x`, `get`, `length`). */
+  name: string;
+  /** The member's resolved type — the field type, or the builtin member type. */
+  type: VLType;
+  /** `method` for a function-typed member, else `property`. */
+  kind: MemberTokenKind;
+  /** The source span of the member NAME (not the whole `receiver.member`). */
+  span: Context;
+};
+
+/**
+ * The source span of the member NAME in a `PropertyAccess` / `OptionalAccess`.
+ * The parser records the *whole* `receiver.member` span on the node (object
+ * start → member-id stop) and stores the member as a bare string, so the member
+ * name itself has no recorded span. We reconstruct it: the recorded span's
+ * `stop` is the member id's last-char-plus-one, and the id is `property` chars
+ * long, so the name occupies `[stop.column - property.length, stop.column]` on
+ * the stop line. (Member ids never wrap a line, so a single-line span is safe.)
+ * Returns `undefined` when the arithmetic would be inconsistent (defensive).
+ */
+const memberNameSpan = (
+  nodeSpan: Context,
+  property: string,
+): Context | undefined => {
+  const startColumn = nodeSpan.stop.column - property.length;
+  if (startColumn < 0) return undefined;
+  return {
+    start: { line: nodeSpan.stop.line, column: startColumn },
+    stop: nodeSpan.stop,
+  };
+};
+
+/** Whether a 1-based-line / 0-based-column VL position falls inside `span`. */
+const posInSpan = (pos: Position, span: Context): boolean => {
+  const afterStart = pos.line > span.start.line ||
+    (pos.line === span.start.line && pos.column >= span.start.column);
+  const beforeStop = pos.line < span.stop.line ||
+    (pos.line === span.stop.line && pos.column <= span.stop.column);
+  return afterStart && beforeStop;
+};
+
+/** The character span length, for picking the innermost (narrowest) match. */
+const spanWidth = (span: Context): number =>
+  span.start.line === span.stop.line
+    ? span.stop.column - span.start.column
+    : Number.MAX_SAFE_INTEGER; // multi-line: always the outer of a pair
+
+/**
+ * Collect every `PropertyAccess` / `OptionalAccess` node in the AST, paired with
+ * its recorded span. A generic structural walk (recurse into every object/array
+ * field) so it stays decoupled from each node shape — new expression kinds don't
+ * need a visitor here. The `Scope` carried on the program node is skipped (it's a
+ * type environment, not AST, and is cyclic). A `seen` set guards the AST being a
+ * graph (shared sub-nodes) from looping.
+ */
+const collectMemberAccesses = (
+  root: VLProgramNode,
+  spans: NodeSpans,
+): { node: VLPropertyLikeAccess; span: Context }[] => {
+  const out: { node: VLPropertyLikeAccess; span: Context }[] = [];
+  const seen = new Set<object>();
+  const visit = (value: unknown): void => {
+    if (value === null || typeof value !== "object") return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    const node = value as { type?: unknown };
+    if (node.type === "PropertyAccess" || node.type === "OptionalAccess") {
+      const span = spanOf(spans, value);
+      if (span) out.push({ node: value as VLPropertyLikeAccess, span });
+    }
+    for (const key of Object.keys(node)) {
+      if (key === "scope") continue; // the type environment, not AST
+      visit((node as Record<string, unknown>)[key]);
+    }
+  };
+  visit(root);
+  return out;
+};
+
+/** A `PropertyAccess` or `OptionalAccess` — the two member-read node shapes. */
+type VLPropertyLikeAccess = {
+  type: "PropertyAccess" | "OptionalAccess";
+  object: VLExpression;
+  property: string;
+};
+
+/**
+ * Resolve the *member* type for a `receiver.member` whose member NAME is under
+ * the cursor, for hover and semantic tokens alike. Returns `undefined` when the
+ * cursor isn't on a member name, or the member can't be typed.
+ *
+ * Mechanism (one path for both features):
+ *   1. Walk the AST for member-access nodes, reconstruct each member-name span
+ *      ({@link memberNameSpan}), and pick the innermost whose name covers `pos`.
+ *   2. Type the receiver via the checker's `typeFromExpression` — memoized during
+ *      the parse, so this returns the already-computed receiver type (it never
+ *      re-walks scopes for an already-typed node).
+ *   3. Look the member up on that type:
+ *        - `.length` on an array/string → the intrinsic `i32`;
+ *        - an intrinsic list member (`.get`/`.push`/… on a `T[]`) → its
+ *          `listMemberType` entry;
+ *        - otherwise a structural object field (covers user objects AND string
+ *          members, which live as properties on the nominal `string` object).
+ *
+ * `pos` uses the VL 1-based-line / 0-based-column convention (`server.ts`
+ * bridges). `objectType`/member lookup reuses the same compiler type APIs the
+ * checker itself uses, so a member hovers exactly as the checker types it.
+ */
+export const resolveMemberAt = (
+  ast: VLProgramNode,
+  spans: NodeSpans,
+  pos: Position,
+): ResolvedMember | undefined => {
+  let best: { node: VLPropertyLikeAccess; nameSpan: Context } | undefined;
+  for (const { node, span } of collectMemberAccesses(ast, spans)) {
+    const nameSpan = memberNameSpan(span, node.property);
+    if (!nameSpan || !posInSpan(pos, nameSpan)) continue;
+    // Innermost wins: a nested `a.b.c` records spans for both `a.b` and
+    // `(a.b).c`; the member-name spans don't overlap, but prefer the narrowest
+    // defensively in case two ever do.
+    if (!best || spanWidth(nameSpan) < spanWidth(best.nameSpan)) {
+      best = { node, nameSpan };
+    }
+  }
+  if (!best) return undefined;
+
+  const { node, nameSpan } = best;
+  const memberType = memberTypeOf(node.object, node.property);
+  if (!memberType) return undefined;
+  return {
+    name: node.property,
+    type: memberType,
+    kind: memberType.type === "Function" ? "method" : "property",
+    span: nameSpan,
+  };
+};
+
+/**
+ * Classify every member name in the document into {@link ClassifiedToken}s for
+ * semantic highlighting: each `receiver.member` whose member resolves becomes a
+ * `property` (object field) or `method` (function-typed member) token at the
+ * member name's span. Member names are otherwise un-tokenised leftover `ID`s
+ * (the symbol-table pass tracks bindings, not members; the lexical pass skips
+ * identifiers), so these never collide with an existing classification.
+ *
+ * Driven by the same node walk + member typing as {@link resolveMemberAt}, so a
+ * member's hover and its token always agree.
+ */
+const classifyMemberTokens = (
+  ast: VLProgramNode,
+  spans: NodeSpans,
+): ClassifiedToken[] => {
+  const out: ClassifiedToken[] = [];
+  for (const { node, span } of collectMemberAccesses(ast, spans)) {
+    const nameSpan = memberNameSpan(span, node.property);
+    if (!nameSpan) continue;
+    const memberType = memberTypeOf(node.object, node.property);
+    if (!memberType) continue;
+    const tokenType = memberType.type === "Function" ? TT.method : TT.property;
+    const token = spanToken(nameSpan, tokenType, 0);
+    if (token) out.push(token);
+  }
+  return out;
+};
+
+/**
+ * The type of `property` accessed on `object`, reusing the checker's member
+ * rules. `object` is typed via the memoized `typeFromExpression` (populated
+ * during the parse), then `property` is resolved against that type the same way
+ * the checker's `PropertyAccess` case does. Returns `undefined` when the member
+ * doesn't resolve.
+ */
+const memberTypeOf = (
+  object: VLExpression,
+  property: string,
+): VLType | undefined => {
+  // The ctx is only consulted on a *cache miss*; receivers are always typed
+  // during the parse, so the memoized type is returned and the ctx is unused.
+  // (A trivial sentinel span keeps the call total without a real source ctx.)
+  const sentinel: Context = {
+    start: { line: 1, column: 0 },
+    stop: { line: 1, column: 0 },
+  };
+  let objType = typeFromExpression(object, sentinel);
+  if (objType.type === "Infer") objType = objType.subType;
+  if (objType.type === "Nullable") objType = objType.subType; // `x?.y` receiver
+  if (objType.type !== "Object") return undefined;
+
+  // `.length` on an array/string is an intrinsic i32 (not a structural field).
+  if (property === "length" && arrayElementType(objType)) {
+    return { type: "Alias", name: "i32" };
+  }
+  // Intrinsic list members (`.capacity`, `.get`, `.push`, …) on a `T[]`.
+  if (isListType(objType)) {
+    const member = listMemberType(arrayElementType(objType)!)[property];
+    if (member) return member;
+  }
+  // Structural field — covers user-object fields AND string members (which live
+  // as properties on the nominal `string` object in `defaultScope`).
+  const prop = objType.properties.find((p) =>
+    p.name.type === "StringLiteral" && p.name.value === property
+  );
+  return prop?.type;
 };
