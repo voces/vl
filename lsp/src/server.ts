@@ -36,6 +36,7 @@ import {
   receiverObjectType,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
+  typeLabelDetail,
   typeMarkdown,
 } from "./typeFeatures.ts";
 
@@ -225,16 +226,26 @@ const completionKind: Record<CompletionKind, CompletionItemKind> = {
   type: CompletionItemKind.Struct,
 };
 
-// `detail` is the concise inline type label (plain text per the LSP spec, so the
-// client doesn't syntax-highlight it). For items that carry a type we ALSO set
-// `documentation` to a markdown `MarkupContent` wrapping the same type in a
-// fenced `vital` block (`typeMarkdown`), which the client renders highlighted via
-// the TextMate grammar — matching the hover. Items without a type omit it.
+// For items that carry a type we render it in exactly two places, never the same
+// place twice:
+//   - `labelDetails.detail` — a compact `: <type>` shown inline right after the
+//     label (less prominent, no spacing), per the LSP 3.17 field. This is the
+//     at-a-glance type on the suggestion row.
+//   - `documentation` — a markdown `MarkupContent` wrapping the type in a fenced
+//     `vital` block (`typeMarkdown`), which the client renders syntax-highlighted
+//     via the TextMate grammar (matching the hover) in the expanded detail panel.
+// We deliberately do NOT set the top-level `detail`: VS Code echoes `detail` BOTH
+// on the label row AND in the panel header, so combined with the markdown
+// `documentation` the type showed up twice (once unstyled from `detail`, once
+// highlighted from the doc). `labelDetails` gives the inline type WITHOUT
+// populating the panel body, leaving the highlighted `documentation` as the only
+// thing in the panel — type shown once inline, once highlighted, never duplicated.
+// Items without a type omit both.
 const toCompletionItem = (c: Completion): CompletionItem => ({
   label: c.name,
   kind: completionKind[c.kind],
-  detail: c.detail,
   ...(c.detail === undefined ? {} : {
+    labelDetails: { detail: typeLabelDetail(c.detail) },
     documentation: {
       kind: MarkupKind.Markdown,
       value: typeMarkdown(c.detail, VL_LANGUAGE_ID),

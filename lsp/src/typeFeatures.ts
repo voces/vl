@@ -226,10 +226,23 @@ export type Completion = {
 };
 
 /**
+ * The compact inline type annotation shown on a completion's label row, via the
+ * LSP 3.17 `CompletionItem.labelDetails.detail` field (e.g. label `foo`,
+ * labelDetails `: i32`). It renders less prominently right after the label.
+ *
+ * This intentionally replaces the old top-level `detail`: VS Code echoes `detail`
+ * both on the label row and in the expanded panel header, so pairing it with the
+ * highlighted `documentation` markdown made the type appear twice. `labelDetails`
+ * shows the inline type WITHOUT populating the panel body, so the type now shows
+ * once inline (here) and once highlighted (in `documentation`), never duplicated.
+ */
+export const typeLabelDetail = (typeStr: string): string => `: ${typeStr}`;
+
+/**
  * Wrap a stringified type in a fenced `vital` code block so the LSP client
- * syntax-highlights it. A completion item's `detail` is plain text per the LSP
- * spec (so the type there renders unstyled); the markdown `documentation` built
- * from this renders highlighted via the same TextMate grammar the hover uses.
+ * syntax-highlights it. This becomes a completion item's `documentation` (the
+ * expanded detail panel), rendered highlighted via the same TextMate grammar the
+ * hover uses — the panel is where the user wanted the type highlighted.
  *
  * Returns the markdown *string* only — kept LSP-enum-free like the rest of this
  * module; `server.ts` wraps it in a `MarkupContent` with `MarkupKind.Markdown`.

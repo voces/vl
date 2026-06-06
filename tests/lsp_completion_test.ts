@@ -19,6 +19,7 @@ import {
   identifierCompletions,
   memberCompletions,
   receiverObjectType,
+  typeLabelDetail,
   typeMarkdown,
 } from "../lsp/src/typeFeatures.ts";
 
@@ -241,23 +242,46 @@ Deno.test("receiverObjectType: an unknown / non-object receiver yields no member
   );
 });
 
-// ---- (3) syntax-highlighted type documentation ------------------------------
+// ---- (3) completion item type rendering: inline label + highlighted panel ----
+//
+// server.ts maps each `Completion` into a wire `CompletionItem` whose type is
+// rendered in TWO non-overlapping spots, never duplicated:
+//   - `labelDetails.detail` (`typeLabelDetail`) — the compact `: <type>` shown
+//     inline on the label row.
+//   - `documentation` (a `vital`-fenced markdown block from `typeMarkdown`) — the
+//     syntax-highlighted type in the expanded detail panel.
+// The old top-level `detail` is gone: VS Code echoed it on BOTH the label row and
+// the panel header, so combined with `documentation` the type appeared twice.
+// These tests pin the two field formats and that they share one type string.
+
+Deno.test("typeLabelDetail: compact inline `: <type>` for the label row", () => {
+  // `labelDetails.detail` renders less prominently right after the label; a `: `
+  // prefix reads like an annotation (label `foo`, detail `: i32`).
+  assertEquals(typeLabelDetail("i32"), ": i32");
+});
 
 Deno.test("typeMarkdown: wraps the type in a fenced `vital` code block", () => {
   // The `vital` fence info string makes the client render the type highlighted
-  // via the same TextMate grammar the hover uses; `detail` (plain text) can't.
+  // via the same TextMate grammar the hover uses; an inline label can't.
   assertEquals(typeMarkdown("i32", "vital"), "```vital\ni32\n```");
 });
 
-Deno.test("typeMarkdown: a typed binding's completion detail can render highlighted", () => {
-  // A completion for a typed binding (`p: i32`) carries a `detail`; wrapping it
-  // through `typeMarkdown` produces markdown with a ```vital fence around the
-  // type string. (server.ts sets this as the item's `documentation`.)
+Deno.test("a typed binding renders its type once inline and once highlighted, never duplicated", () => {
+  // A completion for a typed binding (`p: i32`) carries a `detail` type string.
+  // server.ts feeds that ONE string into both `labelDetails.detail` (inline) and
+  // `documentation` (highlighted panel) — and crucially no longer into the
+  // top-level `detail`, which is what caused the duplicate. Here we reconstruct
+  // both rendered fields from the same source string to confirm the shape.
   const src = "function f(p: i32): i32 {\n  return p\n}\n";
   const table = parseSymbols(src);
   const cs = identifierCompletions(table, { line: 2, column: 9 }, {}, stringifyType);
   const detail = cs.find((c) => c.name === "p")?.detail;
-  assertEquals(detail, "i32", "the typed binding carries an inline type detail");
+  assertEquals(detail, "i32", "the typed binding carries a single type string");
+
+  // Inline label detail: compact `: i32`.
+  assertEquals(typeLabelDetail(detail!), ": i32");
+
+  // Panel documentation: a highlighted `vital` fence around the same type.
   const md = typeMarkdown(detail!, "vital");
   if (!md.includes("```vital\n")) {
     throw new Error("documentation markdown must open a `vital` fence");
@@ -265,4 +289,8 @@ Deno.test("typeMarkdown: a typed binding's completion detail can render highligh
   if (!md.includes(detail!)) {
     throw new Error("documentation markdown must contain the type string");
   }
+
+  // No duplication: the highlighted panel markdown contains the type exactly once.
+  const occurrences = md.split(detail!).length - 1;
+  assertEquals(occurrences, 1, "type appears exactly once in the panel markdown");
 });
