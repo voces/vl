@@ -325,6 +325,17 @@ construction.
     needed), **one `array.copy`** of `b`'s `len(b)` elements at offset `len(a)`,
     then bump `a.len`. One copy of `b` regardless of its size — never a per-element
     `push` loop.
+  - `a += b` (**compound assignment**): comes for free. VL desugars `+=` to
+    `a = a + b`, so once `+` on lists means **concat** (above), `a += b` works with
+    no extra machinery. The catch is **semantics under reference semantics**: `a += b`
+    *rebinds* `a` to the new concatenated list — any other holder of the old `a` keeps
+    seeing the old (shorter) list, unchanged. `a.extend(b)` instead *mutates in place*,
+    so every alias of `a` observes the appended elements. Put plainly: `+=` is
+    **value-style append** (allocate a new list, rebind the name); `extend` is
+    **in-place append** (one shared list, grown). Pick by whether aliases should see
+    the change. (*Possible future optimization, not a semantic change:* when the
+    compiler can prove `a` is unaliased at the `+=`, lower `a += b` to an in-place
+    `extend` — same observable result, the new allocation elided.)
 - **Indexing.** `l[i]` and `l[i] = v` route through the **B13 `"[]"`/`"[]="`
   index traps** (assumed landing in parallel). The `"[]"` lowering is
   `bounds-check i against len, then array.get backing`; `"[]="` is
