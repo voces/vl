@@ -158,6 +158,12 @@ export type VLIsNode = {
   type: "Is";
   value: VLExpression;
   checkType: VLType;
+  /**
+   * `x !is T` (A4): the negation of `x is T`. The result boolean is inverted and
+   * the then/else narrowings are swapped — then-branch subtracts `T`, else-branch
+   * intersects `T`. Absent/`false` is a plain `x is T`.
+   */
+  negated?: boolean;
 };
 
 export type VLVariableDeclarationNode = {
@@ -265,12 +271,14 @@ export type VLObjectType = {
 export type VLUnknownType = { type: "Unknown" };
 export type VLNullableType = { type: "Nullable"; subType: VLType };
 export type VLUnionType = { type: "Union"; subTypes: VLType[] };
-// Set-theoretic refinement types (A3/A4). Produced by flow narrowing, not
-// (yet) by surface syntax: an `Intersection` is `A & B` (both hold — the
-// then-branch refinement), a `Negation` is `not A` (the false-branch
+// Set-theoretic refinement types (A3/A4). Produced by flow narrowing AND by
+// surface annotations (`A & B`, `!A`): an `Intersection` is `A & B` (both hold —
+// the then-branch refinement), a `Negation` is `not A` (the false-branch
 // subtraction). Both simplify aggressively against finite unions, so they
 // rarely survive into codegen; an open-world residual is dropped to its
-// positive part (see `intersectType`/`subtractType`).
+// positive part (see `intersectType`/`subtractType`). A surface intersection is
+// folded through `intersectType` at parse time, so a finite annotation reaches
+// codegen as its concrete simplification (`(0|1|2) & !2` → `0 | 1`).
 export type VLIntersectionType = { type: "Intersection"; subTypes: VLType[] };
 export type VLNegationType = { type: "Negation"; subType: VLType };
 export type VLNeverType = { type: "Never" };
@@ -345,4 +353,3 @@ export type ParseErrors =
     severity?: "error" | "warning" | "info";
   }
   | { type: "Property"; property: VLType; ctx: Context; code: number };
-

@@ -25,6 +25,7 @@ import {
   getType,
   instantiateAlias,
   instantiateFunctionType,
+  intersectType,
   makeExact,
   nonNullable,
   postGuardNarrowings,
@@ -192,7 +193,10 @@ export const parseProgram = (
 
   // A fresh bare `return` node — the fallback body for a malformed statement.
   // A factory (not a shared constant) so each use is a distinct AST node.
-  const emptyReturn = (): VLReturnNode => ({ type: "Return", value: undefined });
+  const emptyReturn = (): VLReturnNode => ({
+    type: "Return",
+    value: undefined,
+  });
 
   // ---- token cursor helpers ------------------------------------------------
 
@@ -242,13 +246,34 @@ export const parseProgram = (
   // ---- types (the old `toType`) -------------------------------------------
 
   const parseType = (): VLType => {
-    let left = parseArrayType();
+    let left = parseIntersectionType();
     while (at("PIPE")) {
       next();
       skipNewlines();
-      const right = parseArrayType();
+      const right = parseIntersectionType();
       // Mirrors `toType`: flatten as we go (a little redundant, but cheap).
       left = flattenType({ type: "Union", subTypes: [left, right] });
+      skipNewlines();
+    }
+    return left;
+  };
+
+  // Intersection `A & B` (A3). Binds tighter than union `|` (standard
+  // precedence: `A | B & C` is `A | (B & C)`), looser than the prefix `!` and
+  // array suffix. Flattened so `A & B & C` is one `Intersection` node; a single
+  // operand passes through unwrapped.
+  const parseIntersectionType = (): VLType => {
+    let left = parseArrayType();
+    while (at("AMPERSAND")) {
+      next();
+      skipNewlines();
+      const right = parseArrayType();
+      // Fold through the existing algebra so a finite annotation simplifies to a
+      // concrete type for codegen (`(0|1|2) & !2` → `0 | 1`; `A & !B` is the
+      // common "A but not B"). `intersectType` keeps an irreducible open-world
+      // pair as a residual `Intersection`/`Negation` node, which `ensureType`
+      // still validates as an assignment target.
+      left = intersectType(left, right);
       skipNewlines();
     }
     return left;
@@ -305,10 +330,9 @@ export const parseProgram = (
     if (!at("LESS_THAN")) {
       errors.push({
         type: "Syntax",
-        message:
-          `Generic type \`${name}\` expects ${arity} type argument${
-            arity === 1 ? "" : "s"
-          } but was used without any`,
+        message: `Generic type \`${name}\` expects ${arity} type argument${
+          arity === 1 ? "" : "s"
+        } but was used without any`,
         ctx,
         code: 0,
       });
@@ -320,10 +344,9 @@ export const parseProgram = (
     if (args.length !== arity) {
       errors.push({
         type: "Syntax",
-        message:
-          `Generic type \`${name}\` expects ${arity} type argument${
-            arity === 1 ? "" : "s"
-          } but got ${args.length}`,
+        message: `Generic type \`${name}\` expects ${arity} type argument${
+          arity === 1 ? "" : "s"
+        } but got ${args.length}`,
         ctx: { start: ctx.start, stop: ctxWithArgs.stop },
         code: 0,
       });
@@ -335,6 +358,15 @@ export const parseProgram = (
   const parseTypePrimary = (): VLType => {
     const t = peek();
     const ctx = spanOf(t);
+    // Prefix negation `!A` (A4): "anything but `A`". Binds tighter than `&`, so
+    // `A & !B` is `A & (!B)` = "A but not B". Recurses through the primary so
+    // `!!A`, `![T]`, and `!Box<T>` parse, and so `!` distributes over a single
+    // type (not the whole `&`/`|` chain to its right).
+    if (at("EXCLAMATION")) {
+      next();
+      skipNewlines();
+      return { type: "Negation", subType: parseTypePrimary() };
+    }
     if (at("ID")) {
       next();
       const name = t.text;
@@ -444,10 +476,9 @@ export const parseProgram = (
             // Unexpected; report and bail out of the loop.
             errors.push({
               type: "Syntax",
-              message:
-                `Syntax error: expected a property name but found ${
-                  JSON.stringify(key.text)
-                }`,
+              message: `Syntax error: expected a property name but found ${
+                JSON.stringify(key.text)
+              }`,
               ctx: spanOf(key),
               code: 0,
             });
@@ -524,15 +555,27 @@ export const parseProgram = (
     let left = parseUnary();
     for (;;) {
       const opTok = peek();
-      const bp = infixBp(opTok);
+      // `expr !is Type` (A4) — negated type guard, Kotlin-style. Two tokens
+      // (`!` `is`) rather than a dedicated lexeme; shares `is`'s binding power so
+      // `x !is T` precedence matches `x is T`. Detected before `infixBp` because
+      // a leading `EXCLAMATION` is not itself an infix operator.
+      const isNegatedIs = opTok.kind === "EXCLAMATION" && peek(1).kind === "IS";
+      const bp = isNegatedIs ? infixBp(peek(1)) : infixBp(opTok);
       if (bp === 0 || bp <= minBp) break;
 
-      // `expr is Type` — the right side is a type, not an expression (A6).
-      if (opTok.kind === "IS") {
+      // `expr is Type` / `expr !is Type` — the right side is a type, not an
+      // expression (A6/A4). `!is` inverts the boolean and the narrowing.
+      if (opTok.kind === "IS" || isNegatedIs) {
         next();
+        if (isNegatedIs) next(); // consume the `is` after the `!`
         skipNewlines();
         const checkType = parseType();
-        const node: VLIsNode = { type: "Is", value: left, checkType };
+        const node: VLIsNode = {
+          type: "Is",
+          value: left,
+          checkType,
+          negated: isNegatedIs,
+        };
         const ctx = between(ctxOf(left), spanFrom(opTok));
         record(node, ctx);
         typeFromExpression(node, ctx); // assert + memoize the boolean result
@@ -639,7 +682,10 @@ export const parseProgram = (
         return node;
       }
       if (operand.type === "RealLiteral") {
-        const node: VLExpression = { type: "RealLiteral", value: -operand.value };
+        const node: VLExpression = {
+          type: "RealLiteral",
+          value: -operand.value,
+        };
         record(node, ctx);
         typeFromExpression(node, ctx);
         return node;
@@ -712,7 +758,11 @@ export const parseProgram = (
           objectCtx,
           spanOf(id),
         );
-        const node = { type: "PropertyAccess", object: left, property } as const;
+        const node = {
+          type: "PropertyAccess",
+          object: left,
+          property,
+        } as const;
         left = record(node, between(objectCtx, spanOf(id)));
         continue;
       }
@@ -728,7 +778,11 @@ export const parseProgram = (
           objectCtx,
           spanOf(id),
         );
-        const node = { type: "OptionalAccess", object: left, property } as const;
+        const node = {
+          type: "OptionalAccess",
+          object: left,
+          property,
+        } as const;
         left = record(node, between(objectCtx, spanOf(id)));
         continue;
       }
@@ -970,7 +1024,9 @@ export const parseProgram = (
     }
 
     if (at("LBRACE")) {
-      return looksLikeObject(pos) ? parseObjectLiteral() : parseBlock(undefined);
+      return looksLikeObject(pos)
+        ? parseObjectLiteral()
+        : parseBlock(undefined);
     }
     if (at("LBRACK")) return parseArrayLiteral();
     if (at("IF")) return parseIf();
@@ -1083,7 +1139,11 @@ export const parseProgram = (
       if (fnType.type !== "Function") {
         errors.push({
           type: "Type",
-          left: { type: "Function", paramaters: [], return: { type: "Unknown" } },
+          left: {
+            type: "Function",
+            paramaters: [],
+            return: { type: "Unknown" },
+          },
           right: fnType,
           ctx,
           code: "function-call",
@@ -1120,10 +1180,13 @@ export const parseProgram = (
     }
     skipNewlines();
     const close = expect("RBRACE");
-    return record({ type: "ObjectLiteral", properties }, between(
-      spanOf(open),
-      spanOf(close),
-    ));
+    return record(
+      { type: "ObjectLiteral", properties },
+      between(
+        spanOf(open),
+        spanOf(close),
+      ),
+    );
   };
 
   const parsePair = (): VLPropertyLiteral => {
@@ -1189,10 +1252,13 @@ export const parseProgram = (
     }
     skipNewlines();
     const close = expect("RBRACK");
-    return record({ type: "ArrayLiteral", values }, between(
-      spanOf(open),
-      spanOf(close),
-    ));
+    return record(
+      { type: "ArrayLiteral", values },
+      between(
+        spanOf(open),
+        spanOf(close),
+      ),
+    );
   };
 
   /** Whether the `{` at `bracePos` opens an object literal (vs a block). */
@@ -1423,7 +1489,8 @@ export const parseProgram = (
     const selfType: VLFunctionType = {
       type: "Function",
       paramaters: parameters,
-      return: annotatedReturn ?? { type: "Infer", subType: { type: "Unknown" } },
+      return: annotatedReturn ??
+        { type: "Infer", subType: { type: "Unknown" } },
     };
     let registered = false;
     let fnBinding: Binding | undefined;
@@ -1542,9 +1609,7 @@ export const parseProgram = (
           return last?.type === "Return" ? last.value : last;
         })()
         : node.body;
-      const fact = result
-        ? conditionNarrowing(result as VLExpression)
-        : null;
+      const fact = result ? conditionNarrowing(result as VLExpression) : null;
       if (fact) {
         const paramIndex = parameters.findIndex((p) => p.name === fact.name);
         if (paramIndex >= 0) {
@@ -1850,7 +1915,14 @@ export const parseProgram = (
     if (typeParams.length > 0) entry.params = paramHoles;
     const typeScope = scopes[scopes.length - 1];
     typeScope[name] = entry;
-    declareBinding(typeScope, name, "type", spanOf(id), entry, typeTok.docComment);
+    declareBinding(
+      typeScope,
+      name,
+      "type",
+      spanOf(id),
+      entry,
+      typeTok.docComment,
+    );
     if (hasBody) {
       next();
       skipNewlines();
@@ -1941,7 +2013,11 @@ export const parseProgram = (
     const toStart = peek();
     const to = parseBinary(0);
     const toCtx = spanFrom(toStart);
-    ensureType({ type: "Alias", name: "i32" }, typeFromExpression(to, toCtx), toCtx);
+    ensureType(
+      { type: "Alias", name: "i32" },
+      typeFromExpression(to, toCtx),
+      toCtx,
+    );
 
     let step: VLExpression | undefined;
     scopes.push({ [variable]: softenImplicitType(fromType) });
@@ -1981,9 +2057,10 @@ export const parseProgram = (
         errors.push({
           type: "Syntax",
           severity: "warning",
-          message: `This \`for\` range is empty and never iterates: ${first.value} to ${to.value}${
-            stepVal !== 1 ? ` step ${stepVal}` : ""
-          }`,
+          message:
+            `This \`for\` range is empty and never iterates: ${first.value} to ${to.value}${
+              stepVal !== 1 ? ` step ${stepVal}` : ""
+            }`,
           ctx: spanFrom(forTok),
           code: 0,
         });
