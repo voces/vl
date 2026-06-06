@@ -1,14 +1,14 @@
 // Unit tests for the D2 symbol model (go-to-definition / find-references).
 //
-// The `.vl` corpus (run.ts) is black-box behavioral and can't exercise the
+// The `.vl` corpus (cases_test.ts) is black-box behavioral and can't exercise the
 // symbol table, so these drive `parseSymbols` directly. Run with:
 //   deno test -A --no-check tests/symbols_test.ts
-// (the `deno task test` task targets only run.ts; this file is a sibling.)
+// (the `deno task test` task targets only cases_test.ts; this file is a sibling.)
 
 import { parseSymbols, stringifyType } from "../compiler/compile.ts";
 import type { Position } from "../compiler/ast.ts";
 
-// Tiny structural-equality assert (the repo has no std import map; run.ts
+// Tiny structural-equality assert (the repo has no std import map; cases_test.ts
 // likewise rolls its own checks).
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
