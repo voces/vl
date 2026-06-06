@@ -638,6 +638,62 @@ export const docMarkdown = (
   return fence ? `${trimmed}\n\n${fence}` : trimmed;
 };
 
+// ---------------------------------------------------------------------------
+// Hover verbosity (LSP 3.18 hover-verbosity stepping)
+// ---------------------------------------------------------------------------
+// The interactive +/- hover controls let a user peel type-alias layers one step
+// at a time. The renderer (`stringifyType`'s `maxDepth`, D8) already supports
+// this — each +1 of `maxDepth` peels one more named-alias layer. These pure
+// helpers map an LSP "verbosity level" (0 = the default view, each `+` step → +1)
+// onto a `maxDepth`, and decide whether the returned hover should advertise the
+// `+`/`-` controls (`canIncrease`/`canDecrease`). Kept here — Deno-importable,
+// LSP-enum-free — so `server.ts` and the unit tests share one mapping.
+
+/**
+ * The default (verbosity level 0) alias-expansion depth for a binding, matching
+ * the pre-verbosity hover behaviour: a *value* binding (`x: thing`) preserves
+ * every alias name (depth 0 — hover `x: thing`, not its body); a `type` binding
+ * (`type thing = …`) peels exactly one layer (depth 1) so the alias shows its
+ * BODY while keeping inner alias names. Higher verbosity levels add to this base.
+ */
+export const bindingBaseDepth = (kind: BindingKind): number =>
+  kind === "type" ? 1 : 0;
+
+// Upper bound on how many alias layers `+` can peel past a binding's base depth.
+// Beyond this, `stringifyType` has already fully expanded any realistic alias
+// chain, so further `+` steps are no-ops; clamping here stops the client from
+// offering an increase that wouldn't change the rendering. Generous enough to
+// expand deeply-nested aliases, small enough to keep `canIncrease` honest.
+export const MAX_VERBOSITY_STEPS = 8;
+
+/**
+ * Map an LSP hover verbosity level (0 = default, each `+` step increments it) to
+ * the `stringifyType` `maxDepth` for a binding of the given kind. Level 0 yields
+ * the binding's {@link bindingBaseDepth} (current default); each level adds one
+ * peeled layer. Negative levels (shouldn't happen, but a client could send one)
+ * clamp to 0; levels above {@link MAX_VERBOSITY_STEPS} clamp to the cap.
+ */
+export const verbosityToMaxDepth = (
+  kind: BindingKind,
+  verbosityLevel: number,
+): number => {
+  const level = Math.max(0, Math.min(verbosityLevel, MAX_VERBOSITY_STEPS));
+  return bindingBaseDepth(kind) + level;
+};
+
+/**
+ * Whether a hover at `verbosityLevel` should advertise the `+`/`-` controls.
+ * `canDecrease` once we're above the default (level 0); `canIncrease` until the
+ * step cap. The client (when it supports the 3.18 hover-verbosity API) uses these
+ * to render the controls and to send back `verbosityLevel ± 1` on click.
+ */
+export const hoverVerbosityFlags = (
+  verbosityLevel: number,
+): { canIncrease: boolean; canDecrease: boolean } => ({
+  canIncrease: verbosityLevel < MAX_VERBOSITY_STEPS,
+  canDecrease: verbosityLevel > 0,
+});
+
 /**
  * Classify a builtin (from `defaultScope`) by its `VLType`: a `Function` type is
  * a callable, anything else is treated as a `type` (the builtins are the numeric

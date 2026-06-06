@@ -8,6 +8,7 @@ import {
   DiagnosticSeverity,
   DiagnosticTag,
   Hover,
+  HoverParams,
   InlayHint,
   InlayHintKind,
   Location,
@@ -40,15 +41,52 @@ import {
   type CompletionKind,
   deriveInlayHints,
   docMarkdown,
+  hoverVerbosityFlags,
   identifierCompletions,
   type LspRange,
+  MAX_VERBOSITY_STEPS,
   memberCompletions,
   receiverObjectType,
   resolveMemberAt,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
   typeLabelDetail,
+  verbosityToMaxDepth,
 } from "./typeFeatures.ts";
+
+// --- LSP 3.18 hover-verbosity protocol shims ---------------------------------
+// Hover verbosity lets the client show `+`/`-` controls that step a hover through
+// more/less detail. In VL this peels type-alias layers one step per `+` (driving
+// `stringifyType`'s `maxDepth`). The protocol pieces are: the client advertises
+// support via `textDocument.hover.verbosityLevels`; it sends the requested level
+// on `HoverParams.context.verbosityLevel`; the server marks the response with
+// `Hover.canIncrease`/`canDecrease` so the controls render.
+//
+// PROPOSED-vs-STABLE: as of `vscode-languageserver@10` / protocol `3.18.0` (the
+// release we bump to here), these fields are still PROPOSED and are NOT present
+// in ANY exported surface of the package — neither the stable types nor a
+// `/proposed` entry point (the published 3.18.0 simply doesn't ship them yet).
+// So rather than importing from a proposed surface that doesn't exist, we declare
+// the proposed shapes locally as thin extensions of the stable `Hover`/
+// `HoverParams`. When the package ships these types, swap these local shims for
+// the package imports — no other change needed (the wiring below already uses
+// only these field names). The values are plain JSON, so this is wire-compatible
+// with a client that already speaks the proposed protocol.
+
+/** Proposed `HoverContext` (3.18): the verbosity level the client is requesting. */
+type HoverVerbosityContext = { verbosityLevel?: number };
+/** `HoverParams` plus the proposed `context`. */
+type VerbosityHoverParams = HoverParams & { context?: HoverVerbosityContext };
+/** `Hover` plus the proposed `+`/`-` capability flags. */
+type VerbosityHover = Hover & { canIncrease?: boolean; canDecrease?: boolean };
+
+// Server-side capability advertising hover verbosity (proposed 3.18). Spread into
+// `ServerCapabilities` in `onInitialize`. Typed `Record<string, unknown>` because
+// the field name isn't in the shipped 3.18.0 `ServerCapabilities` type yet; the
+// value is plain JSON, ignored by clients that don't speak the proposed protocol.
+const hoverVerbosityCapability: Record<string, unknown> = {
+  hoverVerbosity: { verbosityLevels: MAX_VERBOSITY_STEPS + 1 },
+};
 
 // The language id the extension registers (`package.json` → contributes.languages,
 // id `vital`, scope `source.vital`). Used as the markdown fence info string so
@@ -163,18 +201,22 @@ const hoverMarkdown = (code: string): Hover["contents"] => ({
   value: "```" + VL_LANGUAGE_ID + "\n" + code + "\n```",
 });
 
-// D8 stepwise alias expansion (hover verbosity): the renderer (`stringifyType`'s
-// `maxDepth`) supports peeling one alias layer per step, and the per-kind depths
-// below already wire it for the default view. The interactive +/- VERBOSITY
-// controls require the proposed LSP 3.18 hover-verbosity API
-// (`HoverParams.context.verbosityLevel` + `Hover.canIncrease`/`canDecrease`),
-// which is NOT in the `vscode-languageserver@9` / protocol 3.17.5 in use here.
-// REMAINING PIECE (unblocked-by-design): once that protocol lands, read the
-// requested verbosity level off `params.context`, map it to `maxDepth`, and set
-// `canIncrease`/`canDecrease` on the returned `Hover` — no renderer change needed.
-connection.onHover(async (params): Promise<Hover | null> => {
+// D8 stepwise alias expansion + LSP 3.18 hover verbosity: the renderer
+// (`stringifyType`'s `maxDepth`) peels one type-alias layer per step. The client
+// drives this interactively via the `+`/`-` hover controls — it sends the
+// requested verbosity level on `params.context.verbosityLevel` (0 = default view,
+// each `+` increments it), we map level → `maxDepth` (`verbosityToMaxDepth`), and
+// mark the response with `canIncrease`/`canDecrease` (`hoverVerbosityFlags`) so
+// the controls render. Level 0 preserves the prior behaviour exactly (value
+// bindings keep all alias names, type bindings peel one layer). See the
+// proposed-protocol shims above for the stable-vs-proposed status of these fields.
+connection.onHover(async (params: VerbosityHoverParams): Promise<VerbosityHover | null> => {
   const document = documents.get(params.textDocument.uri);
   if (!document) return null;
+
+  // Requested verbosity level (proposed 3.18 hover-verbosity). Absent (a client
+  // that doesn't speak it, or the first hover) means level 0 — the default view.
+  const verbosityLevel = params.context?.verbosityLevel ?? 0;
 
   const lineText = document.getText({
     start: { line: params.position.line, character: 0 },
@@ -201,12 +243,13 @@ connection.onHover(async (params): Promise<Hover | null> => {
     // `docMarkdown` collapses to the bare type fence when there's no doc, so
     // undocumented bindings hover exactly as before.
     //
-    // D8 alias display: a *value* binding (`x: thing`) renders at maxDepth 0 —
-    // every alias name preserved (hover `x: thing`, not its body). A *type*
-    // binding (`type thing = …`) peels exactly one layer (maxDepth 1) so hovering
-    // the alias shows its BODY while keeping any inner alias names (`type thing =
-    // "a" | I32` hovers as `"a" | I32`) — otherwise it would render its own name.
-    const aliasDepth = occ.binding.kind === "type" ? 1 : 0;
+    // D8 alias display, now verbosity-aware. The binding kind sets the level-0
+    // default depth: a *value* binding (`x: thing`) starts at maxDepth 0 — every
+    // alias name preserved (hover `x: thing`, not its body); a *type* binding
+    // (`type thing = …`) starts at maxDepth 1 so the alias shows its BODY while
+    // keeping inner alias names (`type thing = "a" | I32` hovers as `"a" | I32`).
+    // Each `+` step (verbosityLevel) peels one more layer past that default.
+    const aliasDepth = verbosityToMaxDepth(occ.binding.kind, verbosityLevel);
     return {
       contents: {
         kind: "markdown",
@@ -218,6 +261,9 @@ connection.onHover(async (params): Promise<Hover | null> => {
           occ.binding.doc,
         ),
       },
+      // Advertise the `+`/`-` controls (proposed 3.18). A client that doesn't
+      // speak hover verbosity simply ignores these extra fields.
+      ...hoverVerbosityFlags(verbosityLevel),
     };
   }
 
@@ -460,7 +506,14 @@ connection.onInitialize((params) => {
       codeActionProvider: {
         codeActionKinds: [CodeActionKind.QuickFix],
       },
+      // Hover stays enabled; the proposed 3.18 hover-verbosity capability is
+      // advertised alongside it so a verbosity-aware client knows the server
+      // returns `canIncrease`/`canDecrease` and may send `context.verbosityLevel`.
+      // The flag lives on an extended capabilities object (the proposed fields
+      // aren't in the shipped 3.18.0 types — see the shims above); a client that
+      // doesn't understand it just ignores the extra key and uses plain hover.
       hoverProvider: true,
+      ...hoverVerbosityCapability,
       inlayHintProvider: true,
       semanticTokensProvider: {
         legend: SEMANTIC_TOKEN_LEGEND,
