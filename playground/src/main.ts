@@ -29,12 +29,8 @@ const watSection = $<HTMLDivElement>("wat-section");
 
 // --- sample picker --------------------------------------------------------
 
-for (const [i, s] of SAMPLES.entries()) {
-  const opt = document.createElement("option");
-  opt.value = String(i);
-  opt.textContent = s.name;
-  sampleSelect.append(opt);
-}
+// The <option> list is static in index.html (so the picker isn't empty while the
+// compiler bundle loads); this just wires selection to the sample sources.
 const loadSample = (i: number) => {
   editor.value = SAMPLES[i]?.source ?? "";
 };
