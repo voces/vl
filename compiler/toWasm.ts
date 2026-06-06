@@ -13,6 +13,7 @@ import {
   softenImplicitType,
   thenNarrowings,
   validateType,
+  VLCallNode,
   VLExpression,
   VLFunctionCallNode,
   VLFunctionDeclarationNode,
@@ -975,6 +976,113 @@ export const toWasm = async (ast: VLProgramNode) => {
     ], elemWasm);
   };
 
+  // Lower a list `map`/`filter` call inline (the closure dispatch needs
+  // `indirectCall` + locals, which the per-element helpers in `builtins/lists.ts`
+  // don't have access to, so — like list `+` — these build the loop here).
+  // Returns the binaryen expr, or null if `node` isn't such a call (fall through
+  // to the normal `Call` dispatch). Both allocate a FRESH backing and never touch
+  // the receiver (collections-design §VL.4).
+  let mapFilterCounter = 0;
+  const lowerListMapFilter = (node: VLCallNode): number | null => {
+    if (node.callee.type !== "PropertyAccess") return null;
+    const prop = node.callee.property;
+    if (prop !== "map" && prop !== "filter") return null;
+    const recv = node.callee.object;
+    const src = listTypeOf(recv);
+    if (!src) return null;
+    const fn = node.functionType;
+    if (!fn) return null;
+    // The result element type: for `map` it's the inferred `U` (the callback's
+    // return, surfaced as the method's `U[]` return); for `filter` it's `T`.
+    const out = listTypeOf(node) ?? src;
+    const outLt = out.lt;
+    // Unique loop/break labels per lowering (binaryen IR names must be unique).
+    const tag = mapFilterCounter++;
+    const loopLabel = `__${prop}_loop_${tag}__`;
+    const doneLabel = `__${prop}_done_${tag}__`;
+
+    const cb = node.arguments[0].value;
+    const elemWasm = toWasmType(src.element);
+    const srcRef = newLocal(src.lt.refType);
+    const cloRef = newLocal(closureStruct().refType);
+    const nLocal = newLocal(binaryen.i32);
+    const iLocal = newLocal(binaryen.i32);
+    const backLocal = newLocal(outLt.backing.refType);
+    const s = () => m.local.get(srcRef, src.lt.refType);
+    const clo = () => m.local.get(cloRef, closureStruct().refType);
+    const n = () => m.local.get(nLocal, binaryen.i32);
+    const i = () => m.local.get(iLocal, binaryen.i32);
+    const back = () => m.local.get(backLocal, outLt.backing.refType);
+    // `src.backing[i]` (the loop element, read raw — `i` is always in `[0, len)`).
+    const elemAt = () =>
+      m.array.get(listBacking(src.lt, s()), i(), elemWasm, false);
+
+    if (prop === "map") {
+      const outWasm = toWasmType(outLt.element);
+      // out[i] = f(src[i]); same length, sized once.
+      const body = m.block(null, [
+        m.local.set(srcRef, toExpression(recv)),
+        m.local.set(cloRef, toExpression(cb)),
+        m.local.set(nLocal, listLen(s())),
+        m.local.set(
+          backLocal,
+          m.array.new_default(outLt.backing.heapType, n()),
+        ),
+        m.local.set(iLocal, m.i32.const(0)),
+        m.block(doneLabel, [
+          m.loop(
+            loopLabel,
+            m.block(null, [
+              m.br(doneLabel, m.i32.ge_u(i(), n())),
+              m.array.set(
+                back(),
+                i(),
+                indirectCall(clo(), [src.element], [elemAt()], outWasm),
+              ),
+              m.local.set(iLocal, m.i32.add(i(), m.i32.const(1))),
+              m.br(loopLabel),
+            ]),
+          ),
+        ]),
+        m.struct.new([back(), n(), n()], outLt.heapType),
+      ], outLt.refType);
+      return body;
+    }
+
+    // filter: keep elements where f(src[i]) is true. Size the backing to `n` (the
+    // max possible) once, write survivors compactly, and report the survivor
+    // count as `len` (cap stays `n`).
+    const jLocal = newLocal(binaryen.i32);
+    const j = () => m.local.get(jLocal, binaryen.i32);
+    const body = m.block(null, [
+      m.local.set(srcRef, toExpression(recv)),
+      m.local.set(cloRef, toExpression(cb)),
+      m.local.set(nLocal, listLen(s())),
+      m.local.set(backLocal, m.array.new_default(outLt.backing.heapType, n())),
+      m.local.set(iLocal, m.i32.const(0)),
+      m.local.set(jLocal, m.i32.const(0)),
+      m.block(doneLabel, [
+        m.loop(
+          loopLabel,
+          m.block(null, [
+            m.br(doneLabel, m.i32.ge_u(i(), n())),
+            m.if(
+              indirectCall(clo(), [src.element], [elemAt()], binaryen.i32),
+              m.block(null, [
+                m.array.set(back(), j(), elemAt()),
+                m.local.set(jLocal, m.i32.add(j(), m.i32.const(1))),
+              ]),
+            ),
+            m.local.set(iLocal, m.i32.add(i(), m.i32.const(1))),
+            m.br(loopLabel),
+          ]),
+        ),
+      ]),
+      m.struct.new([back(), j(), n()], outLt.heapType),
+    ], outLt.refType);
+    return body;
+  };
+
   // A placeholder value of a captured variable's wasm type, used during the
   // capture-collection pass (whose body is discarded once captures are known).
   const zeroOf = (type: VLType): number => {
@@ -1578,6 +1686,10 @@ export const toWasm = async (ast: VLProgramNode) => {
         // fall through to the normal closure dispatch below.
         const stringMethod = lowerStringMethodCall(stringBuiltinCtx, node);
         if (stringMethod !== null) return stringMethod;
+        // Higher-order list producers (`l.map(f)`/`l.filter(f)`) build a fresh
+        // list via an inline loop that calls the closure indirectly.
+        const mapFilter = lowerListMapFilter(node);
+        if (mapFilter !== null) return mapFilter;
         // Intrinsic list methods (`l.get`/`l.push`/`l.pop`/`l.clear`) lower to
         // their per-element wasm helpers; see `compiler/builtins/lists.ts`.
         const listMethod = lowerListMethodCall(listBuiltinCtx, node);
