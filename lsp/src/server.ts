@@ -2,12 +2,22 @@ import {
   createConnection,
   Diagnostic,
   DiagnosticSeverity,
+  Location,
+  Position,
   ProposedFeatures,
+  Range,
   TextDocuments,
   TextDocumentSyncKind,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
-import { compile, VLDiagnostic, VLSeverity } from "../../compiler/compile.ts";
+import {
+  compile,
+  parseSymbols,
+  rangeFromCtx,
+  VLDiagnostic,
+  VLSeverity,
+} from "../../compiler/compile.ts";
+import type { Context } from "../../compiler/ast.ts";
 
 declare const process: NodeJS.Process;
 
@@ -52,6 +62,37 @@ documents.onDidChangeContent(async (event) => {
   });
 });
 
+// LSP positions are 0-based line / 0-based character; VL's `Position` (and the
+// spans in the symbol table) are 1-based line / 0-based column. Bridge here.
+const toVLPosition = (p: Position) => ({ line: p.line + 1, column: p.character });
+const ctxToRange = (ctx: Context): Range => rangeFromCtx(ctx);
+
+// Go-to-definition: map the cursor to the binding it lands on, return that
+// binding's declaring span (D2). Single-document; cross-file is out of scope.
+connection.onDefinition((params) => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return null;
+  const symbols = parseSymbols(doc.getText());
+  const decl = symbols.definitionAt(toVLPosition(params.position));
+  if (!decl) return null;
+  return Location.create(params.textDocument.uri, ctxToRange(decl));
+});
+
+// Find-references: every occurrence (declaration + uses) of the binding under
+// the cursor, within this document.
+connection.onReferences((params) => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return null;
+  const symbols = parseSymbols(doc.getText());
+  const spans = symbols.referencesAt(
+    toVLPosition(params.position),
+    params.context?.includeDeclaration ?? true,
+  );
+  return spans.map((ctx) =>
+    Location.create(params.textDocument.uri, ctxToRange(ctx))
+  );
+});
+
 documents.listen(connection);
 
 connection.onInitialize((params) => {
@@ -65,6 +106,8 @@ connection.onInitialize((params) => {
         openClose: true,
         change: TextDocumentSyncKind.Full,
       },
+      definitionProvider: true,
+      referencesProvider: true,
       workspace: { workspaceFolders: { supported: true } },
     },
   };

@@ -73,3 +73,20 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
 - **Versioning (when needed): rustup/Volta model, not nvm.** A launcher that resolves a committed
   project pin and auto-installs the right toolchain — not manual `use`/shims. Deferred until multiple
   releases warrant it. (H5)
+
+## Editor / LSP
+
+- **D2 symbol table reuses the parser's scope walk, not a second resolver.** Go-to-definition /
+  find-references need use→declaration resolution, which the hand-written parser *already* performs
+  while it drives the type algebra (every `Name`/call/type-ref walks the live `scopes` stack). So the
+  symbol table (`compiler/symbols.ts`) is populated *during* that same walk: each declaration site
+  records a `Binding` carrying its identifier span; each use records an occurrence against the binding
+  it resolves to. To avoid touching the many `scopes.push/pop` sites, bindings hang off each scope
+  object via a `WeakMap<Scope, Map<name, Binding>>` keyed by the scope's identity — resolution piggybacks
+  on the existing stack, and ephemeral narrowing scopes (which carry no binding map) correctly fall
+  through to the real declaration, so a use inside `if x is T {}` still points at `x`'s `let`. Chosen
+  over (a) a separate post-parse AST resolver — would duplicate scope/shadowing logic and drift from the
+  type checker — and (b) a position→type index off the spans WeakMap, which gives hover (D1) but not the
+  declaration *identity* references needs. The LSP queries by cursor position (`SymbolTable.definitionAt`
+  / `referencesAt`); single-document only (cross-file is out of scope, and builtins from `defaultScope`
+  have no source span so they're simply not recorded). (D2)

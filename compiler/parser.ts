@@ -36,6 +36,7 @@ import {
   withNarrowings,
 } from "./typecheck.ts";
 import { errors, flow, guards, narrowedPaths, scopes } from "./state.ts";
+import { type Binding, type BindingKind, SymbolTable } from "./symbols.ts";
 import type {
   Context,
   ParseErrors,
@@ -108,7 +109,7 @@ const ARITH_ASSIGN_OPS: ReadonlySet<TokenKind> = new Set<TokenKind>([
 export const parseProgram = (
   tokens: Token[],
   initialScope: Scope = {},
-): [VLProgramNode, ParseErrors[]] => {
+): [VLProgramNode, ParseErrors[], SymbolTable] => {
   // Reset the shared pass state (mirrors the old `toAST`).
   scopes.splice(0);
   errors.splice(0);
@@ -118,6 +119,45 @@ export const parseProgram = (
   let pos = 0;
   /** Source span of each AST node, for diagnostics. */
   const spans = new WeakMap<object, Context>();
+
+  // ---- symbol table (go-to-definition / find-references, D2) ----------------
+  // The binding-resolution piggybacks on the live `scopes` stack: each scope
+  // object carries a parallel name→Binding map (keyed by the scope object's
+  // identity, so push/pop sites need no changes). Resolving a use walks `scopes`
+  // exactly as type lookup does (`getType`), then records the use against the
+  // binding it lands on. Ephemeral narrowing scopes (`withNarrowings`) have no
+  // binding map, so a use inside `if x is T {}` still resolves to x's real
+  // declaration — the desired behaviour.
+  const symbols = new SymbolTable();
+  const scopeBindings = new WeakMap<Scope, Map<string, Binding>>();
+  /** Declare `name` in `scope`, record its declaring identifier, return it. */
+  const declareBinding = (
+    scope: Scope,
+    name: string,
+    kind: BindingKind,
+    decl: Context,
+  ): Binding => {
+    let map = scopeBindings.get(scope);
+    if (!map) scopeBindings.set(scope, map = new Map());
+    const binding: Binding = { name, kind, decl };
+    map.set(name, binding);
+    symbols.declare(binding);
+    return binding;
+  };
+  /** Find the binding `name` resolves to in the current scope stack, if any. */
+  const resolveBinding = (name: string): Binding | undefined => {
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      const binding = scopeBindings.get(scopes[i])?.get(name);
+      if (binding) return binding;
+    }
+    return undefined;
+  };
+  /** Record a use of `name` at `span`, resolved through the scope stack. */
+  const recordUse = (name: string, span: Context): void => {
+    const binding = resolveBinding(name);
+    if (binding) symbols.use(binding, span);
+  };
+
   /** Implicit return types collected from the current function body. */
   let returnTypes: VLType[] = [];
   /** Expected return type for `return` statements in the current function. */
@@ -218,9 +258,13 @@ export const parseProgram = (
       // alias leaf — the recursion is carried by the name (see `typeBuilding`),
       // so the body is a finite structure resolved on demand instead of being
       // expanded forever.
-      if (typeBuilding.has(name)) return { type: "Alias", name };
+      if (typeBuilding.has(name)) {
+        recordUse(name, ctx);
+        return { type: "Alias", name };
+      }
       for (let i = scopes.length - 1; i >= 0; i--) {
         if (name in scopes[i]) {
+          recordUse(name, ctx);
           const type = scopes[i][name];
           if (type.type === "Type") return getConcreteType(type.subType, ctx);
           return getConcreteType(type, ctx);
@@ -835,6 +879,7 @@ export const parseProgram = (
       next();
       const ctx = spanOf(t);
       getType(t.text, ctx);
+      recordUse(t.text, ctx);
       return record({ type: "Name", name: t.text }, ctx);
     }
 
@@ -867,6 +912,7 @@ export const parseProgram = (
     };
 
     const fnType = getType(name, spanOf(id));
+    recordUse(name, spanOf(id));
     // Calling an unresolved inference hole infers the value is a function.
     if (fnType.type === "Infer" && fnType.subType.type === "Unknown") {
       const inferred: VLFunctionType = {
@@ -1180,7 +1226,7 @@ export const parseProgram = (
     }
 
     expect("LPAREN");
-    const parameters = parseParams();
+    const { params: parameters, spans: paramSpans } = parseParams();
     expect("RPAREN");
 
     let annotatedReturn: VLType | undefined;
@@ -1210,6 +1256,7 @@ export const parseProgram = (
         });
       } else {
         enclosing[name] = selfType;
+        if (nameCtx) declareBinding(enclosing, name, "function", nameCtx);
         registered = true;
       }
     }
@@ -1218,6 +1265,9 @@ export const parseProgram = (
       parameters.map((p) => [p.name, p.paramaterType]),
     );
     scopes.push(scope);
+    for (let i = 0; i < parameters.length; i++) {
+      declareBinding(scope, parameters[i].name, "parameter", paramSpans[i]);
+    }
     let node: VLFunctionDeclarationNode;
     const bodyStart = peek();
     try {
@@ -1294,10 +1344,13 @@ export const parseProgram = (
     return node;
   };
 
-  const parseParams = (): VLParameterNode[] => {
+  const parseParams = (): { params: VLParameterNode[]; spans: Context[] } => {
     const params: VLParameterNode[] = [];
+    // Span of each parameter's declaring identifier, parallel to `params`
+    // (the AST node doesn't carry a span; the symbol table needs one).
+    const spans: Context[] = [];
     skipNewlines();
-    if (at("RPAREN")) return params;
+    if (at("RPAREN")) return { params, spans };
     for (;;) {
       skipNewlines();
       const id = expect("ID");
@@ -1310,6 +1363,7 @@ export const parseProgram = (
         paramaterType = { type: "Infer", subType: { type: "Unknown" } };
       }
       params.push({ type: "Parameter", name: id.text, paramaterType });
+      spans.push(spanOf(id));
       skipNewlines();
       if (at("COMMA")) {
         next();
@@ -1317,7 +1371,7 @@ export const parseProgram = (
       }
       break;
     }
-    return params;
+    return { params, spans };
   };
 
   const finishAssignment = (left: VLExpression): VLExpression => {
@@ -1465,7 +1519,11 @@ export const parseProgram = (
         ctx: spanFrom(kw),
         code: 0,
       });
-    } else scopes[scopes.length - 1][node.name] = node.variableType;
+    } else {
+      const scope = scopes[scopes.length - 1];
+      scope[node.name] = node.variableType;
+      declareBinding(scope, node.name, "variable", spanOf(id));
+    }
     return record(node, spanFrom(kw));
   };
 
@@ -1492,7 +1550,9 @@ export const parseProgram = (
       type: "Type",
       subType: { type: "Alias", name },
     };
-    scopes[scopes.length - 1][name] = entry;
+    const typeScope = scopes[scopes.length - 1];
+    typeScope[name] = entry;
+    declareBinding(typeScope, name, "type", spanOf(id));
     if (hasBody) {
       next();
       skipNewlines();
@@ -1717,5 +1777,5 @@ export const parseProgram = (
     skipNewlines();
   }
 
-  return [program, errors];
+  return [program, errors, symbols];
 };
