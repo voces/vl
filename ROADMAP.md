@@ -223,7 +223,10 @@ D1/D2.*
 - ⬜ **D3. Autocomplete** (scope-aware; structural members).
 - ⬜ **D4. Formatter** (+ `vl fmt`).
 - ⬜ **D5. Semantic tokens.**
-- ⬜ **D6. Inlay hints** for inferred types — *the* feature for a "types are hidden" language.
+- ✅ **D6. Inlay hints** for inferred types — *the* feature for a "types are hidden" language. Inline
+  `: <type>` at unannotated `let`/`const`/params and omitted returns; annotated positions and unresolved
+  holes are suppressed. (Annotation detection is currently source-text heuristic in `lsp/`; a future
+  compiler-side `binding.annotated` flag would be the cleaner long-term source.)
 - ⬜ **D7. Cross-references in doc-comments** — expand `///` docs with clickable symbol links following
   established conventions (JSDoc `{@link Name}` / rustdoc intra-doc `` [`Name`] ``) rather than a bespoke
   syntax, resolving names via D2's symbol table definition spans for click-to-definition; single-file first,
