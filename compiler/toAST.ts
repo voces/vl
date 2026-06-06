@@ -16,6 +16,7 @@ export {
   elseNarrowings,
   getConcreteType,
   nonNullable,
+  orderArgumentsByParameters,
   placeKey,
   postGuardNarrowings,
   setNodeType,

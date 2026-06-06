@@ -7,6 +7,7 @@ import {
   elseNarrowings,
   getConcreteType,
   nonNullable,
+  orderArgumentsByParameters,
   placeKey,
   postGuardNarrowings,
   thenNarrowings,
@@ -1018,12 +1019,18 @@ export const toWasm = async (ast: VLProgramNode) => {
     // `getx({x, y})` passes an {x, y} struct, so the instance must be compiled
     // at {x, y} for `o.x` to read it. Numerics/functions keep the param type
     // (literals coerce to it; closures share one struct).
+    // Bind arguments to parameters by name (then positionally), matching the
+    // checker, so the structural-object shape below reads from the argument that
+    // actually fills each slot — not the one at the same source position.
+    const orderedArgs = node.functionType
+      ? orderArgumentsByParameters(node.functionType.paramaters, node.arguments)
+      : node.arguments;
     const paramTypes = node.functionType
       ? node.functionType.paramaters.map((p, i) => {
         let pt = softenImplicitType(p.paramaterType);
         while (pt.type === "Infer") pt = softenImplicitType(pt.subType);
-        if (pt.type === "Object" && pt.name === undefined && node.arguments[i]) {
-          const argShape = softenImplicitType(vlType(node.arguments[i].value));
+        if (pt.type === "Object" && pt.name === undefined && orderedArgs[i]) {
+          const argShape = softenImplicitType(vlType(orderedArgs[i]!.value));
           // Take the argument's own shape (WasmGC structs aren't width-subtypes),
           // but keep the declared union/nullable fields — the argument is coerced
           // to them at the call boundary, so the instance must compile against
@@ -1352,11 +1359,20 @@ export const toWasm = async (ast: VLProgramNode) => {
           throw new Error("Expected functionType to be set on function");
         }
 
-        // TODO: named params
-        const operands = node.arguments.map((a, i) =>
+        // Bind arguments to parameters by NAME (then positionally), matching how
+        // the type checker (`ensureParameters`) resolves them — otherwise an
+        // out-of-order named call like `f(b: 1, a: 2)` would be emitted in source
+        // order and mis-map onto the wasm function's positional parameters. An
+        // injected `self`/operator receiver is an unnamed positional arg, so it
+        // naturally falls into slot 0 here.
+        const ordered = orderArgumentsByParameters(
+          functionType.paramaters,
+          node.arguments,
+        );
+        const operands = functionType.paramaters.map((p, i) =>
           withDesiredType(
-            functionType.paramaters[i]?.paramaterType,
-            () => toExpression(a.value),
+            p.paramaterType,
+            () => toExpression(ordered[i]!.value),
           )
         );
         // Direct calls to functions with an inferred return type read their
@@ -1404,10 +1420,16 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (!functionType) {
           throw new Error("Expected functionType to be set on a Call");
         }
-        const operands = node.arguments.map((a, i) =>
+        // Bind by name (then positionally), as the type checker does, so an
+        // out-of-order named call maps onto the right parameter slots.
+        const ordered = orderArgumentsByParameters(
+          functionType.paramaters,
+          node.arguments,
+        );
+        const operands = functionType.paramaters.map((p, i) =>
           withDesiredType(
-            functionType.paramaters[i]?.paramaterType,
-            () => toExpression(a.value),
+            p.paramaterType,
+            () => toExpression(ordered[i]!.value),
           )
         );
         const returnType = toWasmType(functionType.return);
