@@ -1818,10 +1818,26 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (ds.type === "Union" || ds.type === "Nullable") {
           return { ...p, type: dp.type };
         }
+        // A *list* field (`{ nodes: T[] }`) takes the target's element type:
+        // an empty `[]` literal infers an empty-union element (`{[i32]: ⊥}`),
+        // which can't pin its backing's slot type — and softening that degenerate
+        // union crashes. A non-empty literal infers a narrower/looser element than
+        // the field's declared `T[]` (e.g. `[1]` → `i32[]` vs a field `i64[]`), so
+        // the field's own list type must win for the struct slot to match the
+        // declared `(ref List_T)`. The literal value then coerces to it via the
+        // `withDesiredType(f.type, …)` at the object-literal operand site.
+        if (isListType(ds)) {
+          return { ...p, type: dp.type };
+        }
         // Recurse into a nested object field so a deeper union (`{a:{b:T|U}}`)
         // is reconciled too — overriding only union/nullable leaves, so generic
-        // inference holes in the target are left untouched.
-        const bs = softenImplicitType(p.type);
+        // inference holes in the target are left untouched. Unwrap the base field
+        // *shallowly* (Infer only — NOT a deep `softenImplicitType`, which would
+        // descend into a nested degenerate empty-`[]` field and crash on its empty
+        // union); the recursion re-softens each property on the desired side as it
+        // goes, applying the list/union overrides above per field.
+        let bs = p.type;
+        while (bs.type === "Infer") bs = bs.subType;
         if (ds.type === "Object" && bs.type === "Object") {
           return { ...p, type: mergeDesiredUnionFields(bs, ds) };
         }
