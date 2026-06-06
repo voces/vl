@@ -191,13 +191,16 @@ Deno.test("a long call-argument list wraps onto continuation lines", () => {
   assert(src.trimEnd().length > 80, "test input must exceed the 80-col target");
   const out = format(src);
   assert(out.includes("\n"), "long call did not wrap");
-  // One argument per continuation line, indented two spaces, no trailing comma
-  // (VL call lists reject one), and the close paren back at column 0.
+  // One argument per continuation line, indented two spaces, a trailing comma
+  // after the last argument, and the close paren back at column 0.
   assert(
     out.includes("\n  argumentNumberOneHere,"),
     `unexpected wrap layout:\n${out}`,
   );
-  assert(!/,\n\)/.test(out), "emitted a trailing comma before the close paren");
+  assert(
+    /argFour,\n\)/.test(out),
+    `wrapped call must carry a trailing comma:\n${out}`,
+  );
   // The wrapped form must still parse (only a semantic `undeclared`, no syntax).
   assert(!hasSyntaxError(out), `wrapped call does not re-parse:\n${out}`);
   // And it must be idempotent.
@@ -222,6 +225,7 @@ Deno.test("a long array literal wraps and collapses back when short", () => {
   assert(long.trimEnd().length > 80, "test input must exceed the 80-col target");
   const out = format(long);
   assert(out.includes("\n  elementOneHere,"), `long array did not wrap:\n${out}`);
+  assert(/fifth,\n\]/.test(out), `wrapped array must carry a trailing comma:\n${out}`);
   assert(!hasSyntaxError(out), "wrapped array does not re-parse");
 });
 
@@ -245,4 +249,60 @@ Deno.test("a `type` alias declaration is preserved verbatim", () => {
   const out = format(src);
   assert(out.includes("type Pair = { a: i32, b: string }"), `alias lost:\n${out}`);
   assertEquals(format(out), out, "type alias formatting is not idempotent");
+});
+
+// --- trailing commas in multi-line reflow ----------------------------------
+
+Deno.test("a wrapped call emits a trailing comma; collapsed does not", () => {
+  // Collapsed (fits): no trailing comma.
+  assertEquals(format("foo(a, b, c)\n"), "foo(a, b, c)\n");
+  // Wrapped (exceeds 80 cols): trailing comma after the last argument.
+  const long =
+    "foo(argumentNumberOneHere, argumentNumberTwoHere, argumentNumberThreeHere, argFour)\n";
+  const out = format(long);
+  assert(out.includes("\n  argFour,\n)"), `no trailing comma in wrapped call:\n${out}`);
+  assert(!hasSyntaxError(out), `wrapped call does not re-parse:\n${out}`);
+  assertEquals(format(out), out, "wrapped call is not idempotent");
+});
+
+Deno.test("a wrapped array literal emits a trailing comma; collapsed does not", () => {
+  assertEquals(format("let a = [1, 2, 3]\n"), "let a = [1, 2, 3]\n");
+  const long =
+    "let a = [elementOneHere, elementTwoHere, elementThreeHere, elementFourHere, fifth]\n";
+  const out = format(long);
+  assert(out.includes("\n  fifth,\n]"), `no trailing comma in wrapped array:\n${out}`);
+  assert(!hasSyntaxError(out), `wrapped array does not re-parse:\n${out}`);
+  assertEquals(format(out), out, "wrapped array is not idempotent");
+});
+
+Deno.test("a wrapped object literal emits a trailing comma; collapsed does not", () => {
+  assertEquals(format("let o = { a: 1, b: 2 }\n"), "let o = { a: 1, b: 2 }\n");
+  const long =
+    "let o = { firstKeyHere: 111111, secondKeyHere: 222222, thirdKeyHere: 333333, fk: 4 }\n";
+  const out = format(long);
+  assert(out.includes("\n  fk: 4,\n}"), `no trailing comma in wrapped object:\n${out}`);
+  assert(!hasSyntaxError(out), `wrapped object does not re-parse:\n${out}`);
+  assertEquals(format(out), out, "wrapped object is not idempotent");
+});
+
+Deno.test("a wrapped parameter list emits a trailing comma; collapsed does not", () => {
+  assertEquals(
+    format("function f(a: i32, b: i32): i32 {\n  return a\n}\n"),
+    "function f(a: i32, b: i32): i32 {\n  return a\n}\n",
+  );
+  const long =
+    "function longFunctionNameHere(paramOneHereXX: i32, paramTwoHereXX: i32, p3: i32): i32 {\n  return 1\n}\n";
+  const out = format(long);
+  assert(out.includes("\n  p3: i32,\n): i32"), `no trailing comma in wrapped params:\n${out}`);
+  assert(!hasSyntaxError(out), `wrapped params do not re-parse:\n${out}`);
+  assertEquals(format(out), out, "wrapped params are not idempotent");
+});
+
+Deno.test("an already-wrapped list with a trailing comma re-formats unchanged", () => {
+  // Feeding wrapped trailing-comma source back through the formatter is a no-op
+  // (idempotency + round-trip on the new emission), for every list kind.
+  const wrapped =
+    "foo(\n  argumentNumberOneHere,\n  argumentNumberTwoHere,\n  argumentNumberThreeHere,\n  argFour,\n)\n";
+  assertEquals(format(wrapped), wrapped, "wrapped call not stable");
+  assertEquals(astShape(format(wrapped)), astShape(wrapped), "wrapped call round-trip");
 });
