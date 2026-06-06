@@ -266,6 +266,11 @@ D1/D2.*
 - ⬜ **F7. Fix the `paramater` misspelling** project-wide (optional; currently consistent).
 - ✅ **F8. Dropped the binaryen patch + `patch-package`** (LSP server is ESM, where binaryen's TLA is
   legal). REMAINING (F5-adjacent): confirm vscode-languageclient forking the ESM server in VS Code.
+- 🟡 **F9. Perf baseline** (`deno task perf`) — compile-time (front/codegen split) + emitted wasm size over
+  the corpus + synthetic stress programs; best-of-N, standalone (not in CI). Headline finding:
+  **literal-union compilation is ~cubic** in member count (200 → ~2s) — bootstrap-relevant (token/AST-kind
+  unions). REMAINING: a *runtime* benchmark (run compiled `.vl` programs, e.g. the selfhost lexer, on large
+  inputs); investigate the cubic union (A16).
 
 ---
 
