@@ -235,12 +235,19 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   in xs { if test(x) { break x } }` → `Nullable<elem>`). Three layers: grammar → types (mirror the
   `returnTypes` mechanism) → codegen (`__brk` block gets a result type). Labels need a per-loop
   break-value collector stack.
-- ⬜ **B-debug. Name section + source maps + trap-to-source diagnostics.** First emit the wasm **name
-  section** (VL function names show in traces), then a **source map** (wasm offset → VL line/col) so a
-  trap becomes a VL-source-located runtime error instead of a raw wasm abort. Leverages the Track G
-  spans; unblocks browser-DevTools source-level stepping later (DAP / native DWARF are further future).
-  A **REPL** is feasible on this wasm architecture (accumulate-session-source + recompile-per-entry +
-  show-new-output) as a possible future CLI item.
+- 🟡 **B-debug. Name section + source maps + trap-to-source diagnostics.** Done (#76): emits the wasm
+  **name section** + a **Source Map v3** (binaryen debug locations threaded from Track G spans; survives
+  `optimize()` via `setDebugInfo(true)`), and `runWasm`/CLI catch a trap and report a **line-and-column
+  precise** VL-source error (`runtime error at file:L:C — <reason>`) instead of a raw wasm abort.
+  REMAINING (owner-approved follow-ups): (1) **full source-mapped stack traces** — map *every* wasm frame
+  in the trap's stack → VL `function (file:L:C)`, not just the top frame; (2) **value-rich panic messages**
+  — a host `panic(msg)` abort path that formats the offending values (e.g. `index 7 out of bounds
+  (length 3)`), with a stable structured shape for human + LLM readability; (3) an index-assignment LHS
+  has no parser span yet, so an OOB *write* falls back to the statement line — broaden parser span coverage.
+  Unblocks browser-DevTools source-level stepping later (DAP / native DWARF further future). A **REPL** is
+  feasible on this wasm architecture (accumulate-session-source + recompile-per-entry + show-new-output) as
+  a possible future CLI item. (Integer divide-by-zero stays a **trap** — the universal convention; a
+  `divChecked: i32|null` dual is a possible future opt-in.)
 
 ---
 
