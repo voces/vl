@@ -10,8 +10,8 @@ import {
   orderArgumentsByParameters,
   placeKey,
   postGuardNarrowings,
-  thenNarrowings,
   softenImplicitType,
+  thenNarrowings,
   validateType,
   VLExpression,
   VLFunctionCallNode,
@@ -67,13 +67,30 @@ export const toWasm = async (ast: VLProgramNode) => {
   // signed (`div_s`/`rem_s`/`gt_s`/…); floats use the unsuffixed forms. Applied
   // as `m[wasmType][method]` (e.g. `m.i64.add`, `m.f32.lt`).
   const INT_BINOPS: Record<string, string> = {
-    "+": "add", "-": "sub", "*": "mul", "/": "div_s", "%": "rem_s",
-    "==": "eq", "!=": "ne", ">": "gt_s", "<": "lt_s", ">=": "ge_s",
-    "<=": "le_s", "&&": "and",
+    "+": "add",
+    "-": "sub",
+    "*": "mul",
+    "/": "div_s",
+    "%": "rem_s",
+    "==": "eq",
+    "!=": "ne",
+    ">": "gt_s",
+    "<": "lt_s",
+    ">=": "ge_s",
+    "<=": "le_s",
+    "&&": "and",
   };
   const FLOAT_BINOPS: Record<string, string> = {
-    "+": "add", "-": "sub", "*": "mul", "/": "div",
-    "==": "eq", "!=": "ne", ">": "gt", "<": "lt", ">=": "ge", "<=": "le",
+    "+": "add",
+    "-": "sub",
+    "*": "mul",
+    "/": "div",
+    "==": "eq",
+    "!=": "ne",
+    ">": "gt",
+    "<": "lt",
+    ">=": "ge",
+    "<=": "le",
   };
 
   type ScopeEntry = [type: VLType, index: number];
@@ -361,7 +378,10 @@ export const toWasm = async (ast: VLProgramNode) => {
     // Only that group needs a shared WasmGC rec group with forward references; a
     // non-recursive nested struct is built independently (keeping its own
     // identity, so identical shapes still share one type across the module).
-    const nodes = new Map<string, { fields: { name: string; type: VLType }[]; targets: string[] }>();
+    const nodes = new Map<
+      string,
+      { fields: { name: string; type: VLType }[]; targets: string[] }
+    >();
     const visit = (t: VLObjectType) => {
       const s = structSig(t);
       if (objectStructs.has(s) || nodes.has(s)) return;
@@ -412,7 +432,10 @@ export const toWasm = async (ast: VLProgramNode) => {
       if (idx !== undefined && idx !== null) {
         let nt = softenImplicitType(ft);
         while (nt.type === "Infer") nt = softenImplicitType(nt.subType);
-        return tb.getTempRefType(tb.getTempHeapType(idx), nt.type === "Nullable");
+        return tb.getTempRefType(
+          tb.getTempHeapType(idx),
+          nt.type === "Nullable",
+        );
       }
       return toWasmType(ft);
     };
@@ -1001,7 +1024,9 @@ export const toWasm = async (ast: VLProgramNode) => {
 
     const count = instanceCounts[resolvedName] ?? 0;
     instanceCounts[resolvedName] = count + 1;
-    const instanceName = count === 0 ? resolvedName : `${resolvedName}$${count}`;
+    const instanceName = count === 0
+      ? resolvedName
+      : `${resolvedName}$${count}`;
     // Register before compiling the body so recursive self-calls resolve here.
     instances.set(key, instanceName);
 
@@ -1086,9 +1111,7 @@ export const toWasm = async (ast: VLProgramNode) => {
   // Reserve a table slot for an already-instantiated function, by its index.
   const tableIndexOf = (instanceName: string) => {
     const existing = functionTable.indexOf(instanceName);
-    return existing === -1
-      ? functionTable.push(instanceName) - 1
-      : existing;
+    return existing === -1 ? functionTable.push(instanceName) - 1 : existing;
   };
 
   // `base` object shape with each field overridden by `desired`'s field type
@@ -1219,7 +1242,12 @@ export const toWasm = async (ast: VLProgramNode) => {
   ): number => {
     const clo = closureStruct().refType;
     const cloLocal = newLocal(clo);
-    const idx = m.struct.get(0, m.local.get(cloLocal, clo), binaryen.i32, false);
+    const idx = m.struct.get(
+      0,
+      m.local.get(cloLocal, clo),
+      binaryen.i32,
+      false,
+    );
     const env = m.struct.get(
       1,
       m.local.get(cloLocal, clo),
@@ -1381,23 +1409,28 @@ export const toWasm = async (ast: VLProgramNode) => {
       case "Is": {
         const checksNull = node.checkType.type === "Alias" &&
           node.checkType.name === "null";
+        // `x !is T` (A4) is the boolean negation of `x is T`; compute `is`, then
+        // `eqz` the result.
+        const negate = (e: number) => node.negated ? m.i32.eqz(e) : e;
         // A boxed value union discriminates on its tag: `x is T` compares the
         // tag field to T's tag (`null` included).
         let t = softenImplicitType(codegenType(node.value));
         while (t.type === "Infer") t = softenImplicitType(t.subType);
         const info = unionInfo(t);
         if (info) {
-          const tag = checksNull ? info.nullTag : variantTag(info, node.checkType);
-          return m.i32.eq(
+          const tag = checksNull
+            ? info.nullTag
+            : variantTag(info, node.checkType);
+          return negate(m.i32.eq(
             m.struct.get(0, toExpression(node.value), binaryen.i32, false),
             m.i32.const(tag),
-          );
+          ));
         }
         // A niche / reference nullable: `x is null` → null test; `x is T` (T the
         // non-null variant) → its negation.
         if (t.type === "Nullable") {
           const isNull = nullnessTest(node.value);
-          return checksNull ? isNull : m.i32.eqz(isNull);
+          return negate(checksNull ? isNull : m.i32.eqz(isNull));
         }
         // A monomorphic concrete type (e.g. an un-annotated param specialized to
         // `i32` per call): `x is T` is statically decidable — a value of type `t`
@@ -1408,14 +1441,19 @@ export const toWasm = async (ast: VLProgramNode) => {
           validateType(node.checkType, t);
         return m.block(
           null,
-          [m.drop(toExpression(node.value)), m.i32.const(matches ? 1 : 0)],
+          [
+            m.drop(toExpression(node.value)),
+            m.i32.const((matches !== !!node.negated) ? 1 : 0),
+          ],
           binaryen.i32,
         );
       }
       case "StringLiteral": {
         // A string literal is a WasmGC i32-array of its code points.
         const at = arrayType(i32Type);
-        const chars = [...node.value].map((c) => m.i32.const(c.codePointAt(0)!));
+        const chars = [...node.value].map((c) =>
+          m.i32.const(c.codePointAt(0)!)
+        );
         return m.array.new_fixed(at.heapType, chars);
       }
       case "RealLiteral": {
@@ -1640,7 +1678,9 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (info && node.name in narrowed) {
           const nt = narrowed[node.name];
           const member = findVariant(info, nt);
-          if (member && variantTag(info, nt) !== info.nullTag && !unionInfo(nt)) {
+          if (
+            member && variantTag(info, nt) !== info.nullTag && !unionInfo(nt)
+          ) {
             const payload = m.struct.get(
               1,
               m.local.get(entry[1], info.refType),
@@ -1669,7 +1709,9 @@ export const toWasm = async (ast: VLProgramNode) => {
         // the *pointee* object, whose union-typed fields need their boxed
         // representation — otherwise `{ y: 5 }` for a `{ y: string | i32 } | null`
         // param builds `{ y: i32 }` and mismatches the niche struct.
-        while (dt && dt.type === "Nullable") dt = softenImplicitType(dt.subType);
+        while (dt && dt.type === "Nullable") {
+          dt = softenImplicitType(dt.subType);
+        }
         if (dt && dt.type === "Object" && dt.name === undefined) {
           shape = mergeDesiredUnionFields(shape, dt);
         }
@@ -1681,7 +1723,9 @@ export const toWasm = async (ast: VLProgramNode) => {
             (p.name.type === "Name" && p.name.name === f.name) ||
             (p.name.type === "StringLiteral" && p.name.value === f.name)
           );
-          if (!prop) throw new Error(`Object literal missing field "${f.name}"`);
+          if (!prop) {
+            throw new Error(`Object literal missing field "${f.name}"`);
+          }
           return withDesiredType(f.type, () => toExpression(prop.value));
         });
         return m.struct.new(operands, struct.heapType);
@@ -1773,7 +1817,9 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (info) {
           const nt = narrowed[key!];
           const member = findVariant(info, nt);
-          if (member && variantTag(info, nt) !== info.nullTag && !unionInfo(nt)) {
+          if (
+            member && variantTag(info, nt) !== info.nullTag && !unionInfo(nt)
+          ) {
             const payload = m.struct.get(1, read, info.payloadWasm, false);
             return unboxPayload(info, member, payload);
           }
@@ -1785,7 +1831,9 @@ export const toWasm = async (ast: VLProgramNode) => {
         // The temp is bound in scope and (in the non-null arm) narrowed to the
         // non-null object, so the member read + boxing reuse the normal paths.
         let objType = softenImplicitType(codegenType(node.object));
-        while (objType.type === "Infer") objType = softenImplicitType(objType.subType);
+        while (objType.type === "Infer") {
+          objType = softenImplicitType(objType.subType);
+        }
         const objWasm = toWasmType(objType);
         const index = _locals.push(objWasm) - 1 + (_locals.params ?? 0);
         const tmpName = `$opt${index}`;
@@ -1794,7 +1842,10 @@ export const toWasm = async (ast: VLProgramNode) => {
         let R = softenImplicitType(codegenType(node));
         while (R.type === "Infer") R = softenImplicitType(R.subType);
         const setTmp = m.local.set(index, toExpression(node.object));
-        const nullArm = withDesiredType(R, () => toExpression({ type: "NullLiteral" }));
+        const nullArm = withDesiredType(
+          R,
+          () => toExpression({ type: "NullLiteral" }),
+        );
         const memberArm = withDesiredType(
           R,
           () =>
@@ -1819,7 +1870,9 @@ export const toWasm = async (ast: VLProgramNode) => {
         // `x ?? y` ≡ eval `x` once into a temp; `x` (narrowed non-null) if it's
         // non-null, else `y`. Both arms coerced to the result union.
         let leftType = softenImplicitType(codegenType(node.left));
-        while (leftType.type === "Infer") leftType = softenImplicitType(leftType.subType);
+        while (leftType.type === "Infer") {
+          leftType = softenImplicitType(leftType.subType);
+        }
         const leftWasm = toWasmType(leftType);
         const index = _locals.push(leftWasm) - 1 + (_locals.params ?? 0);
         const tmpName = `$coal${index}`;
@@ -1830,7 +1883,12 @@ export const toWasm = async (ast: VLProgramNode) => {
         const setTmp = m.local.set(index, toExpression(node.left));
         const leftArm = withDesiredType(
           R,
-          () => withNarrowed(tmpName, nonNullable(leftType), () => toExpression(tmpRef)),
+          () =>
+            withNarrowed(
+              tmpName,
+              nonNullable(leftType),
+              () => toExpression(tmpRef),
+            ),
         );
         const rightArm = withDesiredType(R, () => toExpression(node.right));
         return m.block(
@@ -2230,7 +2288,9 @@ export const toWasm = async (ast: VLProgramNode) => {
           } catch {
             const tail = stmts[stmts.length - 1];
             const t = tail !== undefined ? binaryen.getExpressionType(tail) : 0;
-            if (t !== binaryen.none && t !== binaryen.unreachable) blockType = t;
+            if (t !== binaryen.none && t !== binaryen.unreachable) {
+              blockType = t;
+            }
           }
         }
         return m.block(null, stmts, blockType);
@@ -2342,8 +2402,14 @@ export const toWasm = async (ast: VLProgramNode) => {
         const step = () => m.local.get(stepLocal, binaryen.i32);
         const loop = m.block(brk, [
           declare,
-          m.local.set(toLocal, withDesiredType(i32Type, () => toExpression(node.to))),
-          m.local.set(stepLocal, withDesiredType(i32Type, () => toExpression(stepExpr))),
+          m.local.set(
+            toLocal,
+            withDesiredType(i32Type, () => toExpression(node.to)),
+          ),
+          m.local.set(
+            stepLocal,
+            withDesiredType(i32Type, () => toExpression(stepExpr)),
+          ),
           m.loop(
             loopLabel,
             m.block(null, [
@@ -2461,7 +2527,9 @@ export const toWasm = async (ast: VLProgramNode) => {
         );
       default:
         throw new Error(
-          `Unhandled AST -> WASM "${(node as { type: string }).type}" expression`,
+          `Unhandled AST -> WASM "${
+            (node as { type: string }).type
+          }" expression`,
         );
     }
   };
@@ -2655,7 +2723,10 @@ export const toWasm = async (ast: VLProgramNode) => {
   };
   // Intern the one-field `{ rep }` box that wraps a value member inside a boxed
   // union's `anyref` payload (keyed by rep).
-  const valueBoxStructs = new Map<number, { heapType: number; refType: number }>();
+  const valueBoxStructs = new Map<
+    number,
+    { heapType: number; refType: number }
+  >();
   const valueBoxStruct = (rep: number) => {
     let cached = valueBoxStructs.get(rep);
     if (!cached) {
@@ -2723,7 +2794,9 @@ export const toWasm = async (ast: VLProgramNode) => {
     const nullTag = hasNull ? tagOf("null") : -1;
     // "value" kind when every member is a scalar of one shared rep; else "boxed".
     const names = variants.map(valueTypeName);
-    const reps = names.map((n, i) => n !== null ? repWasm(n) : toWasmType(variants[i]));
+    const reps = names.map((n, i) =>
+      n !== null ? repWasm(n) : toWasmType(variants[i])
+    );
     const sameValueRep = names.every((n) => n !== null) &&
       reps.every((r) => r === reps[0]);
     const payloadWasm = sameValueRep ? reps[0] : binaryen.anyref;
@@ -2776,7 +2849,12 @@ export const toWasm = async (ast: VLProgramNode) => {
     const vn = valueTypeName(variantType);
     if (vn === null) return m.ref.cast(payload, toWasmType(variantType));
     const box = valueBoxStruct(repWasm(vn));
-    return m.struct.get(0, m.ref.cast(payload, box.refType), repWasm(vn), false);
+    return m.struct.get(
+      0,
+      m.ref.cast(payload, box.refType),
+      repWasm(vn),
+      false,
+    );
   };
   // A typed zero, for the value-kind payload slot of a boxed `null` (unread).
   const wasmZero = (wasm: number): number => {
@@ -2939,4 +3017,3 @@ export const toWasm = async (ast: VLProgramNode) => {
   if (!m.validate()) throw new Error("validation error");
   return m.emitBinary();
 };
-

@@ -202,9 +202,12 @@ connection.onHover(async (params): Promise<Hover | null> => {
 connection.languages.inlayHint.on((params): InlayHint[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
-  const symbols = parseSymbols(doc.getText());
+  const text = doc.getText();
+  const symbols = parseSymbols(text);
   const range: LspRange = params.range;
-  return deriveInlayHints(symbols, stringifyType, range).map((h) => ({
+  // Pass the source so annotated declarations are suppressed — only *inferred*
+  // positions are hinted, never an annotation the user already wrote.
+  return deriveInlayHints(symbols, stringifyType, range, text).map((h) => ({
     position: { line: h.line, character: h.char },
     label: h.label, // `: <type>`
     kind: InlayHintKind.Type,

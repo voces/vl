@@ -941,7 +941,9 @@ export const containsInfer = (
     case "Infer":
       return true;
     case "Function":
-      return type.paramaters.some((p) => containsInfer(p.paramaterType, seen)) ||
+      return type.paramaters.some((p) =>
+        containsInfer(p.paramaterType, seen)
+      ) ||
         containsInfer(type.return, seen);
     case "Object":
       return type.properties.some((p) => containsInfer(p.type, seen));
@@ -1177,11 +1179,16 @@ export const conditionNarrowing = (
     if (key === null) return null;
     const checksNull = cond.checkType.type === "Alias" &&
       cond.checkType.name === "null";
+    // `!is` flips which branch sees the non-null/refined view (and a negated
+    // guard has no single positive `thenType` to narrow to).
+    const nonNullOn = checksNull ? "else" : "then";
     return {
       name: key,
       place: cond.value,
-      nonNullOn: checksNull ? "else" : "then",
-      thenType: checksNull ? undefined : cond.checkType,
+      nonNullOn: cond.negated
+        ? (nonNullOn === "then" ? "else" : "then")
+        : nonNullOn,
+      thenType: checksNull || cond.negated ? undefined : cond.checkType,
     };
   }
   // A call to an inferred type-guard function (A6b): `if present(v) { … }`
@@ -1350,14 +1357,18 @@ const atomFact = (cond: VLExpression): AtomFact | null => {
     const checksNull = cond.checkType.type === "Alias" &&
       cond.checkType.name === "null";
     if (checksNull) {
-      return { name: key, place: cond.value, then: null, else: nonNullable };
+      const f = { name: key, place: cond.value, then: null, else: nonNullable };
+      return cond.negated ? { ...f, then: f.else, else: f.then } : f;
     }
     const checkType = cond.checkType;
+    const intersect = (cur: VLType) => intersectType(cur, checkType);
+    const subtract = (cur: VLType) => subtractType(cur, checkType);
+    // `!is` swaps the branches: then-branch subtracts `T`, else intersects it.
     return {
       name: key,
       place: cond.value,
-      then: (cur) => intersectType(cur, checkType),
-      else: (cur) => subtractType(cur, checkType),
+      then: cond.negated ? subtract : intersect,
+      else: cond.negated ? intersect : subtract,
     };
   }
   // Inferred type-guard call (A6b): narrow the argument by the guard's fact.
@@ -1523,7 +1534,8 @@ export const divergesStatement = (s: VLStatement): boolean => {
         s.conditionals.every((c) => divergesStatement(c.statement)) &&
         divergesStatement(s.else);
     case "While":
-      return isConstTrue(s.condition) && !hasEscapingBreak(s.statement, s.label);
+      return isConstTrue(s.condition) &&
+        !hasEscapingBreak(s.statement, s.label);
     default:
       return false;
   }
@@ -1971,4 +1983,3 @@ export const validateParameters = (
   errors.splice(0, Infinity, ...oldErrors);
   return ret;
 };
-
