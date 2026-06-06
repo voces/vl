@@ -8,6 +8,8 @@
 //   deno task check <dir>              # recursively check every *.vl under dir
 //   deno task check                    # no path → check the cwd (like `check .`)
 //   deno task check --concise <path>   # one terse line per diagnostic (grep-safe)
+//   deno task run help / --help / -h    # list commands (also shown when the
+//                                       # binary is run with no args in a TTY)
 //
 // `check` prints rich, rustc/Deno-style diagnostics by default (header line,
 // the offending source line, a caret/tilde underline, and an `at file:L:C`
@@ -191,7 +193,9 @@ const readSource = async (args: string[]): Promise<string> => {
 const run = async (args: string[]): Promise<void> => {
   const source = await readSource(args);
   if (source.trim() === "") {
-    console.error("usage: deno task run <file.vl> | -e <source> | < stdin");
+    console.error(
+      "usage: vl <file.vl> | -e <source> | < stdin   (vl help for more)",
+    );
     Deno.exit(2);
   }
 
@@ -364,8 +368,60 @@ const check = async (args: string[]): Promise<void> => {
 
 // --- dispatch -------------------------------------------------------------
 
+// Program name in help/usage. The shipped binary is `vl` (see
+// `scripts/build-binary.ts`); when run via `deno task run` the wrapper still
+// forwards args unchanged, so `vl` reads correctly as the logical command.
+const HELP = `vl — the Vital compiler & runner
+
+Usage:
+  vl <file.vl>                 compile and run a file
+  vl -e "<source>"             compile and run an inline snippet
+  cmd | vl   ·   vl < file.vl   compile and run stdin
+  vl build <file.vl> [options] compile to WebAssembly
+  vl check [path] [--concise]  report diagnostics only (no run); CI exit code
+  vl help  ·  --help  ·  -h     show this help
+
+build options:
+  -o, --out <file.wasm>        output path (default: <file>.wasm)
+  --wat                        also write a .wat text dump alongside the .wasm
+
+check:
+  path                         a .vl file, or a directory checked recursively
+                               (default: the current directory)
+  --concise                    one terse line per diagnostic (grep-safe)
+
+examples:
+  vl hello.vl
+  vl -e 'print(1 + 2)'
+  vl build hello.vl --wat
+  vl check .`;
+
+const stdinIsTerminal = (): boolean => {
+  try {
+    return Deno.stdin.isTerminal();
+  } catch {
+    return false;
+  }
+};
+
 const main = async (): Promise<void> => {
   const [maybeCmd, ...rest] = Deno.args;
+
+  // Explicit help request.
+  if (maybeCmd === "help" || maybeCmd === "--help" || maybeCmd === "-h") {
+    console.log(HELP);
+    return;
+  }
+
+  // Bare invocation in an interactive terminal: show help instead of silently
+  // blocking on `Deno.stdin` (a TTY has nothing piped to read). Redirected or
+  // piped stdin still falls through to `run`, so `echo … | vl` and
+  // `vl < file.vl` keep working unchanged.
+  if (Deno.args.length === 0 && stdinIsTerminal()) {
+    console.log(HELP);
+    return;
+  }
+
   // An unknown/absent leading word is treated as `run` (back-compat), with all
   // args forwarded; a real subcommand consumes the leading word.
   const cmd = maybeCmd !== undefined && SUBCOMMANDS.has(maybeCmd)
