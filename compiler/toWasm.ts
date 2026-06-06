@@ -969,6 +969,108 @@ export const toWasm = async (ast: VLProgramNode) => {
     return name;
   };
 
+  // `__i32_to_string__(n)`: render a signed i32 as a VL string (WasmGC i32-array
+  // of digit char codes), handling 0 and negatives. Standard itoa: digits are
+  // extracted from the NEGATIVE magnitude (`n <= 0`) so INT_MIN doesn't overflow
+  // a sign flip, written into a fixed 11-slot scratch from the right, then the
+  // used suffix (plus a leading '-' for negatives) is copied into an
+  // exact-length result array. Backs `toString(i32)`.
+  const i32ToStringFn = (): string => {
+    const name = "__i32_to_string__";
+    if (!_helpers.has(name)) {
+      _helpers.add(name);
+      const at = arrayType(i32Type);
+      // Locals: 0 = value (param); 1 = scratch array; 2 = write pos; 3 = neg
+      // flag; 4 = working magnitude (<= 0); 5 = result array; 6 = result length.
+      const value = () => m.local.get(0, binaryen.i32);
+      const scratch = () => m.local.get(1, at.refType);
+      const p = () => m.local.get(2, binaryen.i32);
+      const neg = () => m.local.get(3, binaryen.i32);
+      const n = () => m.local.get(4, binaryen.i32);
+      const result = () => m.local.get(5, at.refType);
+      const rlen = () => m.local.get(6, binaryen.i32);
+      const body = m.block(null, [
+        // scratch = new i32[11] (max "-2147483648" is 11 chars)
+        m.local.set(1, m.array.new(at.heapType, m.i32.const(11), m.i32.const(0))),
+        m.local.set(2, m.i32.const(11)),
+        m.local.set(3, m.i32.lt_s(value(), m.i32.const(0))),
+        // n = value <= 0 ? value : -value  (magnitude as a non-positive number)
+        m.local.set(
+          4,
+          m.if(
+            neg(),
+            value(),
+            m.i32.sub(m.i32.const(0), value()),
+            binaryen.i32,
+          ),
+        ),
+        m.loop(
+          "itoa_loop",
+          m.block(null, [
+            m.local.set(2, m.i32.sub(p(), m.i32.const(1))),
+            // digit code = 48 + (0 - (n % 10)); n <= 0 so n % 10 is in -9..0
+            m.array.set(
+              scratch(),
+              p(),
+              m.i32.add(
+                m.i32.const(48),
+                m.i32.sub(m.i32.const(0), m.i32.rem_s(n(), m.i32.const(10))),
+              ),
+            ),
+            m.local.set(4, m.i32.div_s(n(), m.i32.const(10))),
+            m.br("itoa_loop", m.i32.ne(n(), m.i32.const(0))),
+          ]),
+        ),
+        // Prepend '-' (45) for negatives.
+        m.if(
+          neg(),
+          m.block(null, [
+            m.local.set(2, m.i32.sub(p(), m.i32.const(1))),
+            m.array.set(scratch(), p(), m.i32.const(45)),
+          ]),
+        ),
+        m.local.set(6, m.i32.sub(m.i32.const(11), p())),
+        m.local.set(5, m.array.new(at.heapType, rlen(), m.i32.const(0))),
+        m.array.copy(result(), m.i32.const(0), scratch(), p(), rlen()),
+        result(),
+      ], at.refType);
+      m.addFunction(
+        name,
+        binaryen.createType([binaryen.i32]),
+        at.refType,
+        [at.refType, binaryen.i32, binaryen.i32, binaryen.i32, at.refType, binaryen.i32],
+        body,
+      );
+    }
+    return name;
+  };
+
+  // `__bool_to_string__(b)`: render a boolean as the VL string `"true"`/`"false"`
+  // (a WasmGC i32-array of char codes). Backs `toString(boolean)`.
+  const boolToStringFn = (): string => {
+    const name = "__bool_to_string__";
+    if (!_helpers.has(name)) {
+      _helpers.add(name);
+      const at = arrayType(i32Type);
+      const lit = (s: string) =>
+        m.array.new_fixed(at.heapType, [...s].map((c) => m.i32.const(c.charCodeAt(0))));
+      const body = m.if(
+        m.local.get(0, binaryen.i32),
+        lit("true"),
+        lit("false"),
+        at.refType,
+      );
+      m.addFunction(
+        name,
+        binaryen.createType([binaryen.i32]),
+        at.refType,
+        [],
+        body,
+      );
+    }
+    return name;
+  };
+
   // Reference equality of two function values (fat-pointer closures): same
   // function (table index) AND same captured environment (`ref.eq`). Each operand
   // is a thunk re-read per use (binaryen wants trees, not shared refs).
@@ -2050,6 +2152,33 @@ export const toWasm = async (ast: VLProgramNode) => {
           throw new Error(
             `print: unsupported argument type "${name ?? t.type}" ` +
               "(only numerics, boolean, and string are supported so far)",
+          );
+        }
+        // `toString(x)` is a compiler builtin (H2): render a number/boolean as a
+        // VL string (WasmGC i32-array of char codes). We branch on the argument's
+        // emitted wasm type — a boolean (an i32 whose VL type is `boolean`) uses
+        // the literal "true"/"false" helper; any other i32 uses the signed itoa
+        // helper. f64/i64 stringification is a deliberate follow-up.
+        if (node.function === "toString") {
+          const arg = node.arguments[0].value;
+          let t = softenImplicitType(codegenType(arg));
+          while (t.type === "Infer") t = softenImplicitType(t.subType);
+          const name = t.type === "Object" || t.type === "Alias"
+            ? t.name
+            : undefined;
+          const value = withDesiredType(t, () => toExpression(arg));
+          const wt = binaryen.getExpressionType(value);
+          if (wt === binaryen.i32) {
+            const at = arrayType(i32Type);
+            return m.call(
+              name === "boolean" ? boolToStringFn() : i32ToStringFn(),
+              [value],
+              at.refType,
+            );
+          }
+          throw new Error(
+            `toString: unsupported argument type "${name ?? t.type}" ` +
+              "(only i32 and boolean are supported so far)",
           );
         }
         // `Map()` / `Set()` builtin constructors (B6a): allocate an empty hash
