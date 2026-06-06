@@ -2016,12 +2016,34 @@ export const toWasm = async (ast: VLProgramNode) => {
     const out: number[] = [];
     for (let i = 0; i < statements.length; i++) {
       const stmt = statements[i];
+      const isTail = i === tail;
+      // A statement in non-tail position is evaluated for effect: its value is
+      // discarded, so it carries no desired type (so its own inferred type
+      // drives lowering, never a spurious numeric default) and any value left on
+      // the stack must be `drop`-ed. The tail keeps the ambient desired type — it
+      // supplies the block's value when one is wanted; in a void context
+      // (`__program__`, a void block) the ambient is undefined, so it too is an
+      // unconsumed statement and its value is dropped.
       const v = stmt.type === "FunctionDeclaration"
         ? handleFunctionDecl(stmt)
-        : i === tail
+        : isTail
         ? toExpression(stmt)
         : withDesiredType(undefined, () => toExpression(stmt));
-      if (typeof v === "number") out.push(v);
+      if (typeof v === "number") {
+        // Drop a value left on the stack by an expression used purely as a
+        // statement (e.g. `arr.pop()` returning `T | null`, or any non-`void`
+        // call for its effect): a non-final block element that returns a value is
+        // invalid wasm. Skip the tail when a value is wanted (a desired type is
+        // set); skip results already `none`/`unreachable` (void calls, an
+        // already-dropped call, a diverging statement).
+        const wt = binaryen.getExpressionType(v);
+        const wants = isTail && hasDesiredType();
+        out.push(
+          !wants && wt !== binaryen.none && wt !== binaryen.unreachable
+            ? m.drop(v)
+            : v,
+        );
+      }
       // Post-guard narrowing (A5): after a divergent guard (`if x == null
       // { return }`, or `|| `-chained), narrow each guarded place for the rest of
       // this block. Names resolve via `lookupName`; paths read the narrowed type.
