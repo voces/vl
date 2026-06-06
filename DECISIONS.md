@@ -76,7 +76,10 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
   through brew; versionless for now. Chosen over hand-rolling a wasm-native bundle so distribution
   ships now, decoupled from self-hosting (H-M2). Verified: `npm:binaryen@130` is a single-file
   Emscripten build with the wasm inlined as base64, so it instantiates inside the compiled binary with
-  no special flags. Tooling: `scripts/build-binary.ts`, `scripts/smoke-binary.ts`. (C5)
+  no special flags. Tooling: `scripts/build-binary.ts`, `scripts/smoke-binary.ts`. Compile with
+  `--node-modules-dir=none --no-lock` so the binary embeds only cli.ts's import graph (binaryen),
+  not the local node_modules trees (incl. `lsp/node_modules`) nor the lsp deps in the shared
+  `deno.lock` — without those flags the binary balloons by ~2MB of unused vscode-language* packages. (C5)
 - **Self-hosted WASM emission: emit bytes directly + optional `wasm-opt`.** binaryen's npm build is
   JS-bound (Emscripten glue, not a standalone WASI module), so the self-hosted compiler emits the wasm
   binary encoding itself and treats `wasm-opt` (native CLI) as an *optional* optimizer rather than

@@ -33,7 +33,28 @@ const artifactName = (target: Target): string =>
   `vl-${target}${isWindows(target) ? ".exe" : ""}`;
 
 const compile = async (output: string, target?: Target): Promise<void> => {
-  const args = ["compile", "-A", "--no-check", "--output", output];
+  // Trim the embedded npm payload to exactly what the CLI imports (binaryen).
+  //
+  //  --node-modules-dir=none  resolve npm from Deno's global cache, not the
+  //      on-disk local `node_modules`. Without it Deno embeds the local
+  //      node-modules trees wholesale — including `lsp/node_modules`
+  //      (vscode-languageserver/-client, never imported by the CLI).
+  //  --no-lock  embed only the packages in cli.ts's import graph (binaryen),
+  //      not every package in the shared root `deno.lock`. With the lockfile in
+  //      play Deno also embeds the lsp deps (vscode-*, semver, minimatch) that
+  //      live in the lock but aren't imported here. binaryen is pinned to @130
+  //      in deno.json's imports, so resolution stays deterministic without it.
+  //
+  // (Deno 2 spelling for the dir flag; Deno 1 used `--node-modules-dir=false`.)
+  const args = [
+    "compile",
+    "-A",
+    "--no-check",
+    "--node-modules-dir=none",
+    "--no-lock",
+    "--output",
+    output,
+  ];
   if (target) args.push("--target", target);
   args.push(ENTRY);
 
