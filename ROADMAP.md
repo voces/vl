@@ -103,7 +103,11 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ✅ **B1. Allocation strategy = WasmGC** (binaryen 116→130 for the GC API). → `DECISIONS.md`.
 - 🟡 **B2. Numeric codegen.** Done: i64 & f32 arithmetic + float `/` & comparisons; i64/f32 type
   mappings; range-aware integer-literal defaults. REMAINING: explicit value casting/coercion between
-  numeric types (today only literals coerce).
+  numeric types (today only literals coerce); **`0x` hex / `0o` octal / `0b` binary integer literals
+  + digit separators** (`1_000`, `0xFF_FF`) — a lexer/parser add the self-host lexer flagged (it does
+  hex via `* 16` for lack of the literal); **arbitrary-precision `BigInt` / `BigDecimal`** as future
+  ***`std`-library*** types (not primitives — wasm has only `i32`/`i64`/`f32`/`f64` — for unbounded
+  integers / exact decimal; rides the module/`std` work).
 - ✅ **B3. First-class functions / indirect calls + per-shape monomorphization.** A function value is
   a fat-pointer closure `{ tableIndex, env }`; each call site instantiates a fresh signature, keyed in
   codegen by wasm param signature. (See `vl-monomorphization` memo; folds into A10.)
@@ -156,8 +160,10 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
   `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.
-  **Strings direction (design/research; not before bootstrap):** `docs/strings-design.md` (being
-  written) — long-term UTF-8 internal storage, non-code-point-indexed API, ASCII fast-path. Ties A7.
+  **Strings direction (design/research; not before bootstrap):** `docs/strings-design.md` —
+  long-term UTF-8 internal storage, **code-point-indexed API** (`s[i]` = code point) made O(1) for the
+  ASCII common case by an **ASCII fast-path** flag, no UTF-8-validity guarantee (Go-style), graphemes
+  in an opt-in `std/unicode` module; strings immutable. Ties A7.
 - 🟡 **B8. Loops.** Done: `for…in` over arrays, direction-aware `step`, single-line block bodies,
   empty-range warning. REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
   destructuring forms.
