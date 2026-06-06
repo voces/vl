@@ -23,6 +23,7 @@ import {
   getChildType,
   getConcreteType,
   getType,
+  instantiateAlias,
   instantiateFunctionType,
   makeExact,
   nonNullable,
@@ -51,6 +52,7 @@ import type {
   VLFunctionDeclarationNode,
   VLFunctionType,
   VLIfNode,
+  VLInferType,
   VLIsNode,
   VLNullCoalesceNode,
   VLObjectLiteralNode,
@@ -60,6 +62,7 @@ import type {
   VLReturnNode,
   VLStatement,
   VLType,
+  VLTypeType,
   VLUnaryOperationNode,
   VLVariableDeclarationNode,
 } from "./ast.ts";
@@ -249,6 +252,71 @@ export const parseProgram = (
     return t;
   };
 
+  // Parse the `<arg, arg, …>` of a generic alias application. The `<` is
+  // unambiguous in type position (no less-than operator here). `>>` closing a
+  // nested application (`Box<Pair<i32, string>>`) lexes as two GREATER_THAN
+  // tokens, so each level consumes its own `>` cleanly.
+  const parseTypeArgs = (): VLType[] => {
+    expect("LESS_THAN");
+    skipNewlines();
+    const args: VLType[] = [];
+    if (!at("GREATER_THAN")) {
+      for (;;) {
+        skipNewlines();
+        args.push(parseType());
+        skipNewlines();
+        if (at("COMMA")) {
+          next();
+          continue;
+        }
+        break;
+      }
+    }
+    skipNewlines();
+    expect("GREATER_THAN");
+    return args;
+  };
+
+  // Apply a generic `type` alias to its type arguments (`Box<i32>`). A bare
+  // reference with no `<args>` is an error (the alias needs its params); a
+  // mismatched count is an arity error. Otherwise `instantiateAlias` substitutes
+  // each argument for its param hole in a fresh copy of the body.
+  const applyGenericAlias = (
+    name: string,
+    entry: VLTypeType,
+    ctx: Context,
+  ): VLType => {
+    const arity = entry.params?.length ?? 0;
+    if (!at("LESS_THAN")) {
+      errors.push({
+        type: "Syntax",
+        message:
+          `Generic type \`${name}\` expects ${arity} type argument${
+            arity === 1 ? "" : "s"
+          } but was used without any`,
+        ctx,
+        code: 0,
+      });
+      return { type: "Never" };
+    }
+    const argsStart = peek();
+    const args = parseTypeArgs();
+    const ctxWithArgs = spanFrom(argsStart);
+    if (args.length !== arity) {
+      errors.push({
+        type: "Syntax",
+        message:
+          `Generic type \`${name}\` expects ${arity} type argument${
+            arity === 1 ? "" : "s"
+          } but got ${args.length}`,
+        ctx: { start: ctx.start, stop: ctxWithArgs.stop },
+        code: 0,
+      });
+      return { type: "Never" };
+    }
+    return instantiateAlias(entry, args);
+  };
+
   const parseTypePrimary = (): VLType => {
     const t = peek();
     const ctx = spanOf(t);
@@ -261,12 +329,21 @@ export const parseProgram = (
       // expanded forever.
       if (typeBuilding.has(name)) {
         recordUse(name, ctx);
+        // A recursive reference inside a generic alias's own body still carries
+        // its arguments (`Box<T>` referencing `Box`); consume them so parsing
+        // stays in sync (the lazy `Alias` leaf is resolved on demand).
+        if (at("LESS_THAN")) parseTypeArgs();
         return { type: "Alias", name };
       }
       for (let i = scopes.length - 1; i >= 0; i--) {
         if (name in scopes[i]) {
           recordUse(name, ctx);
           const type = scopes[i][name];
+          // Generic type alias (`type Box<T> = …`). Application is substitution:
+          // require `<args>`, arity-check, then substitute them into the body.
+          if (type.type === "Type" && type.params && type.params.length > 0) {
+            return applyGenericAlias(name, type, ctx);
+          }
           if (type.type === "Type") return getConcreteType(type.subType, ctx);
           return getConcreteType(type, ctx);
         }
@@ -1598,6 +1675,17 @@ export const parseProgram = (
     expect("TYPE");
     const id = expect("ID");
     const name = id.text;
+    // Generic type parameters (`type Box<T> = …`): a `<` after the name can only
+    // be type params here (no less-than operator in type position). Each name
+    // binds to ONE shared `{Infer, Unknown}` hole, pushed in a transient scope so
+    // every reference to `T` inside the body resolves to that same hole (mirrors
+    // the function type-param approach). Applying the alias clones the body with
+    // those holes and unifies them against the arguments (see `instantiateAlias`).
+    const typeParams: string[] = at("LESS_THAN") ? parseTypeParams() : [];
+    const paramHoles: VLInferType[] = typeParams.map(() => ({
+      type: "Infer",
+      subType: { type: "Unknown" },
+    }));
     const hasBody = at("EQUAL");
     if (name in scopes[scopes.length - 1]) {
       errors.push({ type: "Redeclaration", name, ctx: spanOf(id), code: 11 });
@@ -1605,7 +1693,16 @@ export const parseProgram = (
       if (hasBody) {
         next();
         skipNewlines();
-        parseType();
+        if (typeParams.length > 0) {
+          scopes.push(Object.fromEntries(
+            typeParams.map((n, i) => [n, paramHoles[i]]),
+          ));
+        }
+        try {
+          parseType();
+        } finally {
+          if (typeParams.length > 0) scopes.pop();
+        }
       }
       return { type: "Block", label: `__type_${name}__`, statements: [] };
     }
@@ -1613,10 +1710,11 @@ export const parseProgram = (
     // inside it resolves (to a lazy `Alias` leaf, via `typeBuilding`). The
     // bodyless form (`type Point`, no `=`) aliases the name to itself — a
     // degenerate self-cycle `getConcreteType` reports cleanly when used (A14).
-    const entry: { type: "Type"; subType: VLType } = {
+    const entry: VLTypeType = {
       type: "Type",
       subType: { type: "Alias", name },
     };
+    if (typeParams.length > 0) entry.params = paramHoles;
     const typeScope = scopes[scopes.length - 1];
     typeScope[name] = entry;
     declareBinding(typeScope, name, "type", spanOf(id), entry);
@@ -1624,9 +1722,17 @@ export const parseProgram = (
       next();
       skipNewlines();
       typeBuilding.add(name);
+      // Bind the param holes only while parsing the body; pop afterwards so the
+      // names don't leak into the surrounding type scope.
+      if (typeParams.length > 0) {
+        scopes.push(Object.fromEntries(
+          typeParams.map((n, i) => [n, paramHoles[i]]),
+        ));
+      }
       try {
         entry.subType = parseType();
       } finally {
+        if (typeParams.length > 0) scopes.pop();
         typeBuilding.delete(name);
       }
     }

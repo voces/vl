@@ -62,6 +62,10 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
   argument's element type (the checker unifies index-signature *value* types, not just keys), so
   `first<T>(xs: T[])` resolves `T` per call. Read-side only for now — building a new array of an
   inferred element type (`map`/`filter`) waits on growable lists (B6 tier-2). (A10)
+- **Generic type aliases are substitution, not a new nominal kind.** `type Box<T>` stores the body
+  plus its param holes; applying `Box<i32>` clones the body, mapping each hole directly to its
+  argument — so a concrete application is a concrete object and `Box<T>` in a generic fn keeps `T`
+  linked to the function's hole (correlation flows through the existing monomorphization). (A10)
 
 ## Parser, distribution & bootstrapping
 
