@@ -111,15 +111,16 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   member-call. REMAINING: methods via `self`+UFCS (B14); method-shorthand `{ add(a,b) … }` (parser);
   typed literals in object values (`{n: 4<i64>}`); Exact-by-default for values (A8).
 - 🟡 **B6. Collections — one user-facing collection, spelled `T[]`** (WasmGC; design + rationale:
-  `docs/collections-design.md`). MVP done: the raw fixed-length array (literal/`a[i]`/`a[i]=v`/`a.length`,
-  bounds-trap) is now the substrate, not a separate user tier. DECIDED: one growable collection **spelled
-  `T[]`** with `[...]` its literal (scripting-feel default), `{backing,len,cap}` rep, 2× growth,
-  monomorphized-not-boxed; **indexing traps on OOB** (`a[i]: T`) with **`.get(i): T | null`** the safe
-  accessor, while **`Map[k]: V | null`** (Rust/Swift split — sequence index traps, map lookup is optional);
-  and **representation is inferred** — the compiler lowers never-grown values to a header-less fixed array
-  (a safe optimization, degrades to the growable rep when unproven). **The names `List`/`Array` are
-  UNCOMMITTED** (design vocabulary only; `T[]` + inference is the whole committed surface — no user-facing
-  way to force a representation yet). `DECISIONS.md` entry lands with implementation.
+  `docs/collections-design.md`). DONE (core rep): `T[]` is now a growable `{backing,len,cap}` WasmGC struct
+  (per element wasm type), monomorphized-not-boxed, 2× growth (floor 4) — via compiler-emitted per-element
+  helpers (`compiler/builtins/lists.ts`, à la `__string_eq__`). `[...]` seeds `len=cap=N`; `a[i]`/`a[i]=v`
+  **trap on OOB** (bound = `len`); `.length`/`.capacity`/`.get(i): T|null`/`push`/`pop`/`clear`/`+`/`extend`
+  implemented; for-in + structural equality updated; strings stay on the raw-array path (`isListType`
+  excludes them). **`Map[k]: V | null`** is the Rust/Swift split (map lookup optional; sequence index traps).
+  REMAINING: representation inference (§VL.7 — lower never-grown values to a header-less fixed array; a safe
+  optimization); `map`/`filter` build-side generics (A10); `.vl`-std migration once a module system exists
+  (the helpers are compiler-internal for now). **The names `List`/`Array` stay UNCOMMITTED** (`T[]` +
+  inference is the whole committed surface — no user-facing way to force a representation).
 - ⬜ **B6a. `Map` + `Set`** — the "usable for modding" trio with `T[]` (a scripting language needs all
   three). `T[]` lands first; `Map`/`Set` ride the same intrinsic floor. `Map[k]: V | null` (missing key =
   normal absence). **Deterministic insertion-order iteration** (multiplayer/replay reproducibility).
