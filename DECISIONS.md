@@ -64,7 +64,14 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
   self-hosted compiler). Chose hand-written (Pratt) over peggy/parser-combinators for error quality
   and bootstrappability. (Track G)
 - **Distribute via `deno compile`.** A single native `vl` binary (V8 + the TS compiler + binaryen.js)
-  through brew; versionless for now. (C5)
+  through brew; versionless for now. (C5) **Verified:** binaryen.js loads and runs *inside* the
+  compiled binary with **no special flags** — `deno compile -A --no-check compiler/cli.ts` embeds the
+  `npm:binaryen@130` module, which is a single-file Emscripten build with the wasm inlined as
+  base64 (no out-of-band `.wasm` asset to resolve), so V8's `WebAssembly` instantiates it directly.
+  run / build / check all work in the compiled binary (`deno task smoke`). The Node-only
+  `import("node:module")` branch in binaryen's loader is guarded and skipped under Deno. Build tooling:
+  `scripts/build-binary.ts` (`deno task compile`), smoke test `scripts/smoke-binary.ts`
+  (`deno task smoke`), cross-compile workflow `.github/workflows/release.yml`, draft `Formula/vl.rb`.
 - **Self-hosted WASM emission: emit bytes directly + optional `wasm-opt`.** binaryen's npm build is
   JS-bound (Emscripten glue, not a standalone WASI module), so the self-hosted compiler emits the wasm
   binary encoding itself and treats `wasm-opt` (native CLI) as an *optional* optimizer rather than

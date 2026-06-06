@@ -164,9 +164,11 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   Code Run-Current-File command.
 - ✅ **C3. `vl build <file> [-o out.wasm] [--wat]`** — emit wasm bytes (and optional `.wat`).
 - ✅ **C4. `vl check <file>`** — diagnostics only, non-zero exit on errors (CI gate).
-- 🟡 **C5. Distribution — DECIDED: `deno compile`** single binary via brew, versionless for now (→
-  `DECISIONS.md`; the wasm-native end-state is Track H). REMAINING: the build/release pipeline + brew
-  formula; verify binaryen.js loads inside a compiled binary.
+- 🟡 **C5. Distribution via `deno compile`** — native `vl` binary builds (`deno task compile` →
+  `scripts/build-binary.ts`) and **binaryen.js verified to run inside the compiled binary, no flags**
+  (`deno task smoke`); cross-compile workflow `.github/workflows/release.yml` + draft `Formula/vl.rb`
+  (→ `DECISIONS.md`). REMAINING: an actual public release (tag/tap, sha256 bump) once H5 versioning
+  lands — pipeline drafts carry the TODO markers.
 
 ---
 
@@ -224,9 +226,9 @@ antlr/Java generator) retires; the compiler becomes VL→wasm on a generic wasm 
 corpus (A12) is the host-agnostic oracle — the same tests pass whichever compiler runs them.
 **Distribution does NOT require self-hosting** (the two timelines below are independent).*
 
-- 🟡 **H-M1. Distribute now via `deno compile` (= C5).** A native `vl` binary (V8 + TS compiler +
-  binaryen.js) via brew, versionless. Decoupled from everything below; today's compiler unchanged.
-  Trade-off: chunky and Deno-under-the-hood.
+- 🟡 **H-M1. Distribute now via `deno compile` (= C5).** Native `vl` binary builds and runs with
+  binaryen embedded (no flags) — see C5. ~187MB binary (V8 + TS compiler + binaryen). Decoupled from
+  everything below; today's compiler unchanged. REMAINING == C5's: an actual published release.
 - ✅ **H1. Parser self-hostable (= Track G).** The one piece that categorically can't live in a
   VL-in-VL compiler is gone.
 - ⬜ **H2. Make VL expressive enough to write a compiler.** Recursive tree types (**A11 ✅**), generic
