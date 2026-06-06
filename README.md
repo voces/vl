@@ -39,3 +39,27 @@ Run with `deno task <name>`.
 The shipped CLI binary is `vl`; `vl help` lists its commands. CI runs
 `deno check compiler/*.ts tests/cases_test.ts`, `deno lint`, `deno task test`, and the
 LSP build.
+
+## Building the Native Binary
+
+`deno task compile` produces a standalone `vl` binary in `dist/` via `deno compile`. The binary
+embeds the compiler, the `npm:binaryen@130` wasm toolchain (a ~92 MB Emscripten build with the
+wasm payload inlined as base64), and all TypeScript sources — no Deno or network access is needed
+at runtime.
+
+```sh
+deno task compile          # build dist/vl (host platform)
+deno task smoke            # verify: run, build, check all work inside the binary
+./dist/vl hello.vl         # use the compiled binary directly
+```
+
+Cross-compilation (for release artifacts):
+
+```sh
+deno run -A scripts/build-binary.ts --target x86_64-apple-darwin
+deno run -A scripts/build-binary.ts --all     # all five supported targets
+```
+
+The `dist/` directory is `.gitignore`d — don't commit the built binary. See `DECISIONS.md`
+("Parser, distribution & bootstrapping") for the flag rationale (`--node-modules-dir=none
+--no-lock` keeps the binary from embedding unused LSP packages).
