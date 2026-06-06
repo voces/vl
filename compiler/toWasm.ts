@@ -1741,6 +1741,20 @@ export const toWasm = async (ast: VLProgramNode) => {
       captureCollector = collector;
       currentEnv = env;
       functionBoundaries.push(scopes.length);
+      // SOUNDNESS (function-local narrowing): the `narrowed` overlay is keyed by
+      // bare NAME, so it must not leak across a function boundary. A function body
+      // is instantiated LAZILY at its first call site (`getOrInstantiate`), which
+      // can fire from *inside* a narrowed branch of another function — e.g. a
+      // mutually-recursive visitor `checkExpr`/`checkStmt`, where each narrows its
+      // own `n` and calls the other. Without this reset the callee's body would be
+      // compiled while the caller's `narrowed["n"]` (a DIFFERENT, same-named
+      // local, narrowed to a DIFFERENT variant) is still in scope, so the callee's
+      // `n` would lower against the wrong variant — a `ref.cast`/`struct.get` to
+      // the wrong struct ("Object has no field …"). Snapshot, clear, and restore
+      // around the body so each function starts from a clean overlay; captures and
+      // module globals don't use this overlay, so clearing it is safe.
+      const savedNarrowed = { ...narrowed };
+      for (const k in narrowed) delete narrowed[k];
       const body = withScope(
         Object.fromEntries(
           declaration.parameters.map((
@@ -1758,6 +1772,8 @@ export const toWasm = async (ast: VLProgramNode) => {
       functionBoundaries.pop();
       captureCollector = oldCollector;
       currentEnv = oldEnv;
+      for (const k in narrowed) delete narrowed[k];
+      Object.assign(narrowed, savedNarrowed);
       return { body, locals };
     };
 
@@ -2603,14 +2619,31 @@ export const toWasm = async (ast: VLProgramNode) => {
         // An empty `[]` has no value to pin its element from (its element type is
         // an empty union), so take the element from the desired type instead
         // (`let xs: i32[] = []`, a list-typed argument, etc.).
+        //
+        // SOUNDNESS (union elements): a `[{x:1}]` literal infers its element from
+        // the VALUES (`{x:i32}`, a bare variant), but a desired `(A|B)[]` element
+        // is the BOXED union (`{tag,value}`). The backing array — and each
+        // element's `desiredType`-driven boxing — must use the boxed union element,
+        // not the narrower inferred variant; otherwise the slot stores an unboxed
+        // variant while a later `arr[i]` read (and any `is`-narrowing of it)
+        // expects the box, producing a wasm `struct.get`/`ref.cast` type mismatch
+        // ("Object has no field …"). So prefer the desired element when it is a
+        // union/nullable that boxes (`unionInfo` non-null). For non-boxing desired
+        // elements the value-inferred element stays authoritative (it already
+        // matches and may be more concrete).
         let info = node.values.length === 0 ? null : listTypeOf(node);
-        if (!info && desiredType) {
+        if (desiredType) {
           let dt = softenImplicitType(desiredType);
           while (dt.type === "Nullable") dt = softenImplicitType(dt.subType);
           const dtElem = arrayElementType(dt);
           if (dtElem) {
             const soft = softenImplicitType(dtElem);
-            info = { lt: listType(soft), element: soft };
+            // Empty literal: nothing to infer from, take the desired element.
+            // Non-empty: only override when the desired element is a boxed
+            // union/nullable (so variant values get boxed into its rep).
+            if (!info || unionInfo(soft)) {
+              info = { lt: listType(soft), element: soft };
+            }
           }
         }
         if (!info) info = listTypeOf(node);
