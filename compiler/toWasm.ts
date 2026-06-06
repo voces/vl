@@ -654,6 +654,11 @@ export const toWasm = async (ast: VLProgramNode) => {
         heapType,
         refType: binaryen.getTypeFromHeapType(heapType, false),
         element: soft,
+        // Map backing arrays store the (nullable) ref element directly, so the
+        // slot type and the logical element type coincide — `arrayReadCast` is a
+        // no-op (no `ref.as_non_null` narrowing, unlike list backings, B6a/gap-1).
+        elemWasm,
+        backingWasm: elemWasm,
       };
       mapArrayTypes.set(elemWasm, cached);
     }
