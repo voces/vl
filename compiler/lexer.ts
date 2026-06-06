@@ -348,15 +348,127 @@ export const tokenize = (source: string): LexResult => {
       continue;
     }
 
-    // Number: `[0-9]+ ('.' [0-9]+)?`. The fractional part is only taken when a
-    // digit follows the dot, so `a.5` and `p.x` keep `.` as a separate DOT.
+    // Number. Three integer bases plus decimal, all with optional `_` digit
+    // separators that group digits for readability (`1_000`, `0xFF_FF`):
+    //   - hex     `0x`/`0X`  digits `[0-9a-fA-F]`
+    //   - octal   `0o`/`0O`  digits `[0-7]`
+    //   - binary  `0b`/`0B`  digits `[01]`
+    //   - decimal `[0-9]+ ('.' [0-9]+)?` — the fractional part is only taken when
+    //     a digit follows the dot, so `a.5` and `p.x` keep `.` as a separate DOT.
+    // A `_` is allowed only BETWEEN digits — never leading, trailing, doubled, or
+    // adjacent to the `0x`/`0o`/`0b` prefix (mirrors Rust/JS/Java). The NUMBER
+    // token's `text` is NORMALIZED to a plain decimal string (separators stripped,
+    // any base folded to base-10) so every downstream consumer — the parser's
+    // integer/float split, `BigInt(text)` widening, i64 codegen, negation that
+    // prepends `-` — keeps working unchanged; the raw source form is still
+    // recoverable from the token span (used by the formatter for reprint).
     if (isDigit(c)) {
-      let text = "";
-      while (i < len && isDigit(source[i])) text += advance();
-      if (source[i] === "." && isDigit(source[i + 1])) {
-        text += advance(); // '.'
-        while (i < len && isDigit(source[i])) text += advance();
+      const prefix = source[i] === "0" ? (source[i + 1] ?? "") : "";
+      let base: 16 | 8 | 2 | undefined;
+      let baseName = "";
+      if (prefix === "x" || prefix === "X") {
+        base = 16;
+        baseName = "hex";
+      } else if (prefix === "o" || prefix === "O") {
+        base = 8;
+        baseName = "octal";
+      } else if (prefix === "b" || prefix === "B") {
+        base = 2;
+        baseName = "binary";
       }
+
+      if (base !== undefined) {
+        advance(); // '0'
+        advance(); // base letter
+        const isBaseDigit = (ch: string): boolean => {
+          if (base === 16) {
+            return (ch >= "0" && ch <= "9") || (ch >= "a" && ch <= "f") ||
+              (ch >= "A" && ch <= "F");
+          }
+          if (base === 8) return ch >= "0" && ch <= "7";
+          return ch === "0" || ch === "1";
+        };
+        // Collect digits and separators verbatim, then validate separator
+        // placement; `digits` holds the digits with separators stripped.
+        let raw = "";
+        let digits = "";
+        let badSeparator = false;
+        // A `_` immediately after the prefix is illegal (`0x_FF`).
+        if (source[i] === "_") badSeparator = true;
+        while (i < len && (isBaseDigit(source[i]) || source[i] === "_")) {
+          const ch = advance();
+          raw += ch;
+          if (ch === "_") {
+            // Doubled (`1__0`) or trailing (`FF_`, checked after the loop) — a
+            // `_` must sit strictly between two digits.
+            if (raw.length >= 2 && raw[raw.length - 2] === "_") badSeparator = true;
+          } else {
+            digits += ch;
+          }
+        }
+        if (raw.endsWith("_")) badSeparator = true; // trailing separator
+        const stop = pos();
+        if (digits.length === 0) {
+          diagnostics.push({
+            message:
+              `Syntax error: ${baseName} literal has no digits after \`0${prefix}\``,
+            severity: "error",
+            source: "vital",
+            range: { start: shift(start), end: shift(stop) },
+          });
+          // Emit a recoverable `0` so the parser can continue.
+          push("NUMBER", "0", start);
+          continue;
+        }
+        if (badSeparator) {
+          diagnostics.push({
+            message:
+              `Syntax error: \`_\` may only separate digits in a numeric literal`,
+            severity: "error",
+            source: "vital",
+            range: { start: shift(start), end: shift(stop) },
+          });
+        }
+        // Normalize to decimal. BigInt parses the prefixed, separator-free form.
+        const decimal = BigInt(`0${prefix}${digits}`).toString();
+        push("NUMBER", decimal, start);
+        continue;
+      }
+
+      // Decimal (possibly with a fractional part), with `_` digit separators.
+      let raw = "";
+      let badSeparator = false;
+      const takeDigits = () => {
+        while (i < len && (isDigit(source[i]) || source[i] === "_")) {
+          const ch = advance();
+          raw += ch;
+          if (ch === "_" && raw.length >= 2 && raw[raw.length - 2] === "_") {
+            badSeparator = true; // doubled `1__0`
+          }
+        }
+      };
+      // A decimal literal can't start with `_` (the lexer only enters this branch
+      // on a digit), so we only need to guard the integer part's trailing `_` and
+      // the fractional part's leading/trailing `_`.
+      takeDigits();
+      if (raw.endsWith("_")) badSeparator = true; // trailing before `.`/end
+      if (source[i] === "." && isDigit(source[i + 1])) {
+        raw += advance(); // '.'
+        // `_` right after the dot (`1._5`) is illegal — must follow a digit.
+        if (source[i] === "_") badSeparator = true;
+        takeDigits();
+        if (raw.endsWith("_")) badSeparator = true; // trailing fractional `_`
+      }
+      if (badSeparator) {
+        diagnostics.push({
+          message:
+            `Syntax error: \`_\` may only separate digits in a numeric literal`,
+          severity: "error",
+          source: "vital",
+          range: { start: shift(start), end: shift(pos()) },
+        });
+      }
+      const text = raw.replace(/_/g, "");
       push("NUMBER", text, start);
       continue;
     }
