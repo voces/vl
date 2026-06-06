@@ -1179,6 +1179,30 @@ export const parseProgram = (
       nameCtx = spanOf(op);
     }
 
+    // Capture the enclosing scope BEFORE pushing the type-param scope so that
+    // the forward self-registration (below) and the final-type refinement land
+    // in the real enclosing scope, not the transient type-param scope.
+    const enclosing = scopes[scopes.length - 1];
+
+    // Type parameters (`function foo<T>(...)`): a `<` right after the name can
+    // only be type params (the operator-overload name `function <(...)` already
+    // consumed `<` as the name, leaving `(`). Each name binds to ONE shared
+    // `{Infer, Unknown}` hole in a pushed scope so that param annotations, the
+    // return annotation, AND the body all resolve `T` to that same hole via the
+    // existing `parseTypePrimary` scope lookup — keeping the positions correlated
+    // per call site (the existing monomorphization machinery does the rest).
+    const typeParams: string[] = at("LESS_THAN") ? parseTypeParams() : [];
+    const pushedTypeScope = typeParams.length > 0;
+    if (pushedTypeScope) {
+      scopes.push(
+        Object.fromEntries(
+          typeParams.map((
+            n,
+          ) => [n, { type: "Infer", subType: { type: "Unknown" } }]),
+        ),
+      );
+    }
+
     expect("LPAREN");
     const parameters = parseParams();
     expect("RPAREN");
@@ -1193,7 +1217,6 @@ export const parseProgram = (
 
     // Forward-register in the enclosing scope BEFORE walking the body so
     // recursive calls resolve (the return is refined in place once inferred).
-    const enclosing = scopes[scopes.length - 1];
     const selfType: VLFunctionType = {
       type: "Function",
       paramaters: parameters,
@@ -1259,11 +1282,20 @@ export const parseProgram = (
         body,
         returnType: functionReturnType,
       };
+      if (typeParams.length > 0) node.typeParameters = typeParams;
       scopes.pop();
     } catch (err) {
       scopes.pop();
+      // Per-statement recovery in `parseProgram` resumes after a throw, so a
+      // leaked type-param scope would corrupt later parsing — pop it here too.
+      if (pushedTypeScope) scopes.pop();
       throw err;
     }
+
+    // Drop the type-param scope on the success path. The remaining work
+    // (`typeFromExpression`, guard detection) reads only `node` fields and the
+    // already-captured `enclosing`, so the type-param scope is no longer needed.
+    if (pushedTypeScope) scopes.pop();
 
     const ctx = spanFrom(fnTok);
     record(node, ctx);
@@ -1292,6 +1324,28 @@ export const parseProgram = (
     }
 
     return node;
+  };
+
+  const parseTypeParams = (): string[] => {
+    expect("LESS_THAN");
+    skipNewlines();
+    const names: string[] = [];
+    if (!at("GREATER_THAN")) {
+      for (;;) {
+        skipNewlines();
+        const id = expect("ID");
+        names.push(id.text);
+        skipNewlines();
+        if (at("COMMA")) {
+          next();
+          continue;
+        }
+        break;
+      }
+    }
+    skipNewlines();
+    expect("GREATER_THAN");
+    return names;
   };
 
   const parseParams = (): VLParameterNode[] => {
