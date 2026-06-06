@@ -672,11 +672,11 @@ export const isListType = (type: VLType): boolean =>
   type.type === "Object" && type.name === undefined &&
   arrayElementType(type) !== null;
 
-// The intrinsic *list* members (`T[]`'s `.capacity` / `.get`), special-cased
-// here because a `T[]` is an anonymous structural type — it has no nominal
-// `name` to hang these on in `defaultScope` the way `string` does. Codegen
-// lowers each by name. `.length` stays handled at its existing sites (shared
-// with strings). `.push`/`.pop`/`.clear` are added with their codegen (slice 3).
+// The intrinsic *list* members (`T[]`'s `.capacity` / `.get` / `.push` / `.pop`
+// / `.clear`), special-cased here because a `T[]` is an anonymous structural
+// type — it has no nominal `name` to hang these on in `defaultScope` the way
+// `string` does. Codegen lowers each by name. `.length` stays handled at its
+// existing sites (shared with strings).
 export const listMemberType = (
   element: VLType,
 ): Record<string, VLType> => ({
@@ -691,6 +691,24 @@ export const listMemberType = (
       paramaterType: { type: "Alias", name: "i32" },
     }],
     return: { type: "Nullable", subType: element },
+  },
+  // Append (amortized O(1)); grows the backing 2× on full.
+  push: {
+    type: "Function",
+    paramaters: [{ type: "Parameter", name: "x", paramaterType: element }],
+    return: { type: "Alias", name: "null" },
+  },
+  // Remove+return the last element, or `null` on empty (normal absence).
+  pop: {
+    type: "Function",
+    paramaters: [],
+    return: { type: "Nullable", subType: element },
+  },
+  // Reset to empty, retaining capacity (`len = 0`, no realloc).
+  clear: {
+    type: "Function",
+    paramaters: [],
+    return: { type: "Alias", name: "null" },
   },
 });
 

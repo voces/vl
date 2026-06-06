@@ -1689,10 +1689,23 @@ export const toWasm = async (ast: VLProgramNode) => {
       case "ArrayLiteral": {
         // A `[...]` literal is always a list (anonymous `[i32]:T`): build the
         // backing via `array.new_fixed`, then wrap it `{ backing, len=N, cap=N }`.
-        const info = listTypeOf(node);
+        // An empty `[]` has no value to pin its element from (its element type is
+        // an empty union), so take the element from the desired type instead
+        // (`let xs: i32[] = []`, a list-typed argument, etc.).
+        let info = node.values.length === 0 ? null : listTypeOf(node);
+        if (!info && desiredType) {
+          let dt = softenImplicitType(desiredType);
+          while (dt.type === "Nullable") dt = softenImplicitType(dt.subType);
+          const dtElem = arrayElementType(dt);
+          if (dtElem) {
+            const soft = softenImplicitType(dtElem);
+            info = { lt: listType(soft), element: soft };
+          }
+        }
+        if (!info) info = listTypeOf(node);
         if (!info) throw new Error("Array literal did not resolve to a list");
         const values = node.values.map((v) =>
-          withDesiredType(info.element, () => toExpression(v))
+          withDesiredType(info!.element, () => toExpression(v))
         );
         const backing = m.array.new_fixed(info.lt.backing.heapType, values);
         const n = m.i32.const(values.length);
@@ -2838,7 +2851,6 @@ export const toWasm = async (ast: VLProgramNode) => {
     i32Type,
     listTypeOf,
     toWasmType,
-    newLocal,
     helpers: _helpers,
     toExpression,
     withDesiredType,

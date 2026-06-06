@@ -10,7 +10,7 @@
 // accessors / array intrinsics supplied on the context. Growth is 2×, floor 4
 // (collections-design §VL.2); `pop`/`get` return `T | null` (normal absence,
 // §VL.6) built through the context's nullable encoders.
-import { softenImplicitType, VLCallNode, VLExpression, VLType } from "../toAST.ts";
+import { VLCallNode, VLExpression, VLType } from "../toAST.ts";
 
 /** A WasmGC array type, as interned by toWasm's `arrayType`. */
 type ArrayType = { heapType: number; refType: number; element: VLType };
@@ -41,8 +41,6 @@ export type ListBuiltinContext = {
   ) => { lt: ListType; element: VLType } | null;
   /** Lower a node's VL→wasm type (the element wasm type). */
   toWasmType: (type: VLType) => number;
-  /** Allocate a fresh local of a wasm type in the current function. */
-  newLocal: (wasmType: number) => number;
   /** The shared lazily-emitted helper-name set (added once each). */
   helpers: Set<string>;
   /** Lower an expression node to a binaryen expression ref. */
@@ -81,7 +79,6 @@ const listGrowFn = (ctx: ListBuiltinContext, lt: ListType): string => {
   const name = `__list_grow_${ctx.tagOf(lt)}__`;
   if (helpers.has(name)) return name;
   helpers.add(name);
-  const elemWasm = ctx.toWasmType(lt.element);
   const list = () => m.local.get(0, lt.refType);
   const newCap = () => m.local.get(1, binaryen.i32);
   const newBacking = () => m.local.get(2, lt.backing.refType);
@@ -121,8 +118,6 @@ const listGrowFn = (ctx: ListBuiltinContext, lt: ListType): string => {
     [binaryen.i32, lt.backing.refType],
     body,
   );
-  // Reference elemWasm so a future change can't silently drop element typing.
-  void elemWasm;
   return name;
 };
 
@@ -287,7 +282,3 @@ export const lowerListMethodCall = (
   }
   return null;
 };
-
-// Keep imports referenced for the bundler/`deno check` (used in JSDoc shapes).
-void softenImplicitType;
-void LIST_BACKING;
