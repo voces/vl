@@ -319,7 +319,7 @@ export const _typeFromExpression = (
     }
     case "Name":
       for (let i = scopes.length - 1; i >= 0; i--) {
-        if (expr.name in scopes[i]) return scopes[i][expr.name];
+        if (Object.hasOwn(scopes[i], expr.name)) return scopes[i][expr.name];
       }
       return { type: "Never" };
     case "IntegerLiteral":
@@ -468,7 +468,7 @@ export const _typeFromExpression = (
       // return may still hold an inference hole pinned by another call site.
       if (expr.functionType) return expr.functionType.return;
       for (let i = scopes.length - 1; i >= 0; i--) {
-        if (expr.function in scopes[i]) {
+        if (Object.hasOwn(scopes[i], expr.function)) {
           const funcType = scopes[i][expr.function];
           if (funcType.type === "Function") return funcType.return;
           return { type: "Never" };
@@ -564,7 +564,7 @@ export const typeFromExpression = (
     seen.add(name);
     let resolved: VLType | undefined;
     for (let i = scopes.length - 1; i >= 0; i--) {
-      if (name in scopes[i]) {
+      if (Object.hasOwn(scopes[i], name)) {
         resolved = scopes[i][name];
         break;
       }
@@ -1179,7 +1179,7 @@ export const getConcreteType = (
   seen.add(type.name);
 
   for (let i = scopes.length - 1; i >= 0; i--) {
-    if (type.name in scopes[i]) {
+    if (Object.hasOwn(scopes[i], type.name)) {
       type = scopes[i][type.name];
       if (type.type === "Type") return getConcreteType(type.subType, ctx, seen);
       return getConcreteType(type, ctx, seen);
@@ -1352,7 +1352,7 @@ export const instantiateAlias = (
 
 export const getType = (name: string, ctx: Context): VLType => {
   for (let i = scopes.length - 1; i >= 0; i--) {
-    if (name in scopes[i]) return scopes[i][name];
+    if (Object.hasOwn(scopes[i], name)) return scopes[i][name];
   }
   errors.push({ type: "Undeclared", name, ctx, code: "undeclared-type" });
   return { type: "Unknown" };
@@ -1557,7 +1557,7 @@ const resolvesToTypeWrapper = (t: VLType, depth = 0): boolean => {
   while (t.type === "Alias") {
     let next: VLType | undefined;
     for (let i = scopes.length - 1; i >= 0; i--) {
-      if (t.name in scopes[i]) {
+      if (Object.hasOwn(scopes[i], t.name)) {
         next = scopes[i][t.name];
         break;
       }
@@ -1784,7 +1784,7 @@ const placeCurrentType = (
 ): VLType | undefined => {
   if (place.type === "Name") {
     for (let i = scopes.length - 1; i >= 0; i--) {
-      if (place.name in scopes[i]) return scopes[i][place.name];
+      if (Object.hasOwn(scopes[i], place.name)) return scopes[i][place.name];
     }
     return undefined;
   }
@@ -1872,7 +1872,7 @@ export const ensureType = (
 
   outer: while (left.type === "Alias") {
     for (let i = scopes.length - 1; i >= 0; i--) {
-      if (left.name in scopes[i]) {
+      if (Object.hasOwn(scopes[i], left.name)) {
         left = scopes[i][left.name];
         continue outer;
       }
@@ -1882,7 +1882,7 @@ export const ensureType = (
 
   outer: while (right.type === "Alias") {
     for (let i = scopes.length - 1; i >= 0; i--) {
-      if (right.name in scopes[i]) {
+      if (Object.hasOwn(scopes[i], right.name)) {
         right = scopes[i][right.name];
         continue outer;
       }
@@ -1933,7 +1933,7 @@ export const ensureType = (
       } else {
         let type: VLType | undefined = undefined;
         for (let i = scopes.length - 1; i >= 0; i--) {
-          if (left.name in scopes[i]) {
+          if (Object.hasOwn(scopes[i], left.name)) {
             type = scopes[i][left.name];
             break;
           }

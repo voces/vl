@@ -482,6 +482,31 @@ export const defaultScope = () => {
       }],
       return: { type: "Alias", name: "string" },
     };
+
+    // `fromCharCode(code: i32): string` — construct a single-character VL string
+    // from a char code. A VL string is a WasmGC i32-array of char codes, so this
+    // allocates a length-1 array holding `code`. Bootstrap-critical for the
+    // self-hosted lexer, which must materialize the value of a decoded `\xXX` /
+    // `\uXXXX` escape. Mirrors `toString`: an i32 (or an integer literal) is
+    // accepted, and toWasm lowers the call by name to an inline length-1 array.
+    scope["fromCharCode"] = {
+      type: "Function",
+      paramaters: [{
+        type: "Parameter",
+        name: "code",
+        paramaterType: {
+          type: "Custom",
+          validate: namedFunc(
+            "i32",
+            (right: VLType) =>
+              right === scope.i32 || isNominal(right, "i32") ||
+              right.type === "IntegerLiteral" ||
+              (right.type === "Alias" && right.name === "i32"),
+          ),
+        },
+      }],
+      return: { type: "Alias", name: "string" },
+    };
   });
 
   return scope;
