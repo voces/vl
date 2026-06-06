@@ -4,7 +4,18 @@
 // Significant newlines are handled cleanly downstream: NEWLINE is emitted as a
 // real token and the parser treats it as a statement terminator, transparently
 // skipping it inside brackets/objects/args where a `NEWLINE*` used to be
-// sprinkled in the grammar. WS and `//` comments are dropped here.
+// sprinkled in the grammar. WS is dropped here.
+//
+// Comments are RETAINED as trivia, but kept OUT of the token stream: every `//`
+// line comment (doc `///` or plain) is collected into `LexResult.comments` with
+// its source span, and also attached to the adjacent real token as
+// `leadingComments` / `trailingComments` (a "trailing" comment is one that sits
+// on the same source line, after the token, before the next newline). Because
+// comments never enter `tokens[]`, the parser's peek/lookahead is untouched —
+// they are metadata for the formatter / doc cross-refs, not grammar tokens. The
+// pre-existing `///` doc-comment attachment (a markdown run handed to a following
+// declaration's token as `docComment`, consumed by the symbol table for LSP
+// hover) is preserved unchanged.
 //
 // Positions follow the diagnostics convention: 1-based line, 0-based column.
 // Each token carries `start` (first char) and `stop` (one past the last char).
@@ -76,6 +87,21 @@ export type TokenKind =
   | "NEWLINE"
   | "EOF";
 
+/**
+ * A retained source comment (trivia). Kept out of the token stream; collected
+ * into `LexResult.comments` and cross-linked onto adjacent tokens. `kind`
+ * distinguishes a doc comment (`///`, but not `////`) from a plain line comment
+ * (`//`, or `////+`). `text` is the verbatim comment lexeme including its `//`
+ * prefix (no trailing newline). The span follows the token convention: `start`
+ * is the first `/`, `stop` is one past the last character on the line.
+ */
+export type Comment = {
+  kind: "line" | "doc";
+  text: string;
+  start: Position;
+  stop: Position;
+};
+
 export type Token = {
   kind: TokenKind;
   text: string;
@@ -90,6 +116,20 @@ export type Token = {
    * association. Plain `//` comments never set this. Undefined when absent.
    */
   docComment?: string;
+  /**
+   * Comments (doc or plain) that immediately precede this token, in source
+   * order, since the previous real token / line content. Trivia only — the
+   * parser never reads these; they exist for the formatter and doc cross-refs.
+   * Undefined when there are none. NEWLINE tokens never carry comments.
+   */
+  leadingComments?: Comment[];
+  /**
+   * A comment that sits on the SAME source line as this token, after it, before
+   * the next newline (e.g. `let x = 1 // count`). Attached to the preceding real
+   * token rather than the next so a formatter can keep it on its line. Trivia
+   * only; undefined when absent.
+   */
+  trailingComments?: Comment[];
 };
 
 const KEYWORDS: Record<string, TokenKind> = {
@@ -122,11 +162,22 @@ const isIdStart = (c: string) =>
 const isIdPart = (c: string) => isIdStart(c) || (c >= "0" && c <= "9");
 const isDigit = (c: string) => c >= "0" && c <= "9";
 
-export type LexResult = { tokens: Token[]; diagnostics: VLDiagnostic[] };
+export type LexResult = {
+  tokens: Token[];
+  diagnostics: VLDiagnostic[];
+  /**
+   * Every comment in the source, in order, with spans. A superset of the
+   * per-token `leadingComments`/`trailingComments` (the same `Comment` objects
+   * are shared by identity), exposed as a flat list for consumers that want all
+   * comments without walking the token stream.
+   */
+  comments: Comment[];
+};
 
 export const tokenize = (source: string): LexResult => {
   const tokens: Token[] = [];
   const diagnostics: VLDiagnostic[] = [];
+  const comments: Comment[] = [];
   let i = 0;
   let line = 1;
   let column = 0;
@@ -153,6 +204,19 @@ export const tokenize = (source: string): LexResult => {
   let docLines: string[] = [];
   let lastLineWasDoc = false;
 
+  // Comments lexed since the last real token, awaiting attachment as the next
+  // real token's `leadingComments`. (A comment that turns out to be trailing —
+  // same line, after a token — is instead attached to that preceding token at
+  // lex time and never enters this buffer.) NEWLINE tokens are transparent here.
+  let pendingComments: Comment[] = [];
+  // Whether a NEWLINE has been emitted since the last real (non-NEWLINE,
+  // non-comment) token. Drives the leading-vs-trailing decision for a comment:
+  // a comment with no intervening newline since a real token is trailing.
+  let newlineSinceToken = true;
+  // The most recently pushed real token, so a trailing comment can be hung off
+  // it. Reset by EOF handling implicitly (no token follows).
+  let lastRealToken: Token | undefined;
+
   const push = (kind: TokenKind, text: string, start: Position) => {
     const token: Token = { kind, text, start, stop: pos() };
     // Attach (and consume) a pending `///` run to the first real token after it.
@@ -161,6 +225,19 @@ export const tokenize = (source: string): LexResult => {
     if (kind !== "NEWLINE" && docLines.length > 0) {
       token.docComment = docLines.join("\n");
       docLines = [];
+    }
+    // Hand any buffered comments to the first real token after them. NEWLINE is
+    // transparent (it never carries comments), so leading comments survive the
+    // blank lines between them and the declaration they precede.
+    if (kind !== "NEWLINE") {
+      if (pendingComments.length > 0) {
+        token.leadingComments = pendingComments;
+        pendingComments = [];
+      }
+      lastRealToken = token;
+      newlineSinceToken = false;
+    } else {
+      newlineSinceToken = true;
     }
     tokens.push(token);
   };
@@ -190,14 +267,33 @@ export const tokenize = (source: string): LexResult => {
     }
 
     // Line comment `// …`. A `///` (but not `////`) line is a doc-comment: its
-    // text is captured and later attached to the following declaration's token.
-    // Plain `//` (and `////+`) comments are dropped as trivia, exactly as before.
+    // text is captured and later attached to the following declaration's token
+    // (the `docComment` markdown path). ALL comments — doc and plain — are
+    // additionally retained as trivia: collected into `comments` with their span
+    // and cross-linked onto the adjacent token (leading, or trailing if on the
+    // same line after a token). They stay OUT of `tokens[]`, so parsing is
+    // unaffected.
     if (c === "/" && source[i + 1] === "/") {
       let text = "";
       while (i < len && source[i] !== "\n" && source[i] !== "\r") {
         text += advance();
       }
       const isDoc = text.startsWith("///") && text[3] !== "/";
+      const comment: Comment = {
+        kind: isDoc ? "doc" : "line",
+        text,
+        start,
+        stop: pos(),
+      };
+      comments.push(comment);
+      // Trailing comment: same source line, after a real token, with no NEWLINE
+      // between. Attach to that token so a formatter keeps it on its line.
+      // Otherwise it's a leading comment for the next real token.
+      if (!newlineSinceToken && lastRealToken !== undefined) {
+        (lastRealToken.trailingComments ??= []).push(comment);
+      } else {
+        pendingComments.push(comment);
+      }
       if (isDoc) {
         // Strip the `///` and one optional leading space; keep the rest verbatim
         // so authored markdown (lists, code, blank-ish lines) survives.
@@ -291,8 +387,12 @@ export const tokenize = (source: string): LexResult => {
     });
   }
 
-  tokens.push({ kind: "EOF", text: "", start: pos(), stop: pos() });
-  return { tokens, diagnostics };
+  const eof: Token = { kind: "EOF", text: "", start: pos(), stop: pos() };
+  // A trailing run of comments at end-of-file (no following real token) attaches
+  // to EOF so it's reachable as token trivia too — it's already in `comments`.
+  if (pendingComments.length > 0) eof.leadingComments = pendingComments;
+  tokens.push(eof);
+  return { tokens, diagnostics, comments };
 };
 
 // A diagnostic range uses 0-based lines; tokens use 1-based. Shift on emit.

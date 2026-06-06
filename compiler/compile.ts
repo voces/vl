@@ -10,7 +10,13 @@
 // adapts these to vscode-languageserver Diagnostics; everyone else consumes
 // them directly.
 
-import type { Context, ParseErrors, VLProgramNode, VLType } from "./ast.ts";
+import type {
+  Context,
+  NodeSpans,
+  ParseErrors,
+  VLProgramNode,
+  VLType,
+} from "./ast.ts";
 import { tokenize } from "./lexer.ts";
 import { parseProgram } from "./parser.ts";
 import { defaultScope } from "./defaultScope.ts";
@@ -52,6 +58,14 @@ export type CompileResult = {
    * convention as `Context` (shift to LSP 0-based with `rangeFromCtx`).
    */
   symbols: SymbolTable;
+  /**
+   * Source spans for AST nodes, keyed by node identity (Track G). Query with
+   * `spanOf(spans, node)` (re-exported from `./toAST.ts`). Lets AST consumers —
+   * a formatter, inlay-hint `annotated` flags, doc-comment cross-refs — recover
+   * any node's source extent. `undefined` only if AST construction threw (same
+   * condition as `ast`).
+   */
+  spans: NodeSpans | undefined;
 };
 
 // A source span (`Context`) carries 1-based lines / 0-based columns, with `stop`
@@ -202,6 +216,8 @@ export type CheckResult = {
   ast: VLProgramNode;
   diagnostics: VLDiagnostic[];
   symbols: SymbolTable;
+  /** Source spans for AST nodes, keyed by node identity. See `CompileResult`. */
+  spans: NodeSpans;
 };
 
 /**
@@ -218,9 +234,9 @@ export type CheckResult = {
  */
 export const checkOnly = (source: string): CheckResult => {
   const { tokens, diagnostics } = tokenize(source);
-  const [ast, errors, symbols] = parseProgram(tokens, defaultScope());
+  const [ast, errors, symbols, spans] = parseProgram(tokens, defaultScope());
   for (const error of errors) diagnostics.push(diagnosticFromError(error));
-  return { ast, diagnostics, symbols };
+  return { ast, diagnostics, symbols, spans };
 };
 
 /**
@@ -231,7 +247,7 @@ export const checkOnly = (source: string): CheckResult => {
  * only loaded when codegen actually runs.
  */
 export const compile = async (source: string): Promise<CompileResult> => {
-  const { ast, diagnostics, symbols } = checkOnly(source);
+  const { ast, diagnostics, symbols, spans } = checkOnly(source);
 
   let wasm: Uint8Array | undefined;
   if (!diagnostics.some((d) => d.severity === "error")) {
@@ -256,7 +272,7 @@ export const compile = async (source: string): Promise<CompileResult> => {
     }
   }
 
-  return { ast, diagnostics, wasm, symbols };
+  return { ast, diagnostics, wasm, symbols, spans };
 };
 
 /**
