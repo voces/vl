@@ -686,9 +686,32 @@ export const isListType = (type: VLType): boolean =>
 // type — it has no nominal `name` to hang these on in `defaultScope` the way
 // `string` does. Codegen lowers each by name. `.length` stays handled at its
 // existing sites (shared with strings).
+// Build a list (`T[]`) type from an element type — an anonymous structural
+// object carrying the `i32`-keyed index signature `{[i32]: T}` that
+// `arrayElementType` / `isListType` recognise (no nominal `name`, so it reads as
+// a list, not a `string`). The shape mirrors what `ArrayLiteral` produces.
+const listOf = (element: VLType): VLType => ({
+  type: "Object",
+  properties: [{
+    name: { type: "Alias", name: "i32" },
+    type: element,
+  }],
+});
+
 export const listMemberType = (
   element: VLType,
-): Record<string, VLType> => ({
+): Record<string, VLType> => {
+  // `map`'s result element type `U` is the callback's return type. We pin it
+  // with a single shared inference hole referenced in BOTH the callback's
+  // `return` and the method's result `U[]`: `instantiateFunctionType` clones the
+  // signature (`cloneTypeFresh` preserves the sharing, so the two stay one cell),
+  // unifies the cloned callback param against the actual `f` argument — which
+  // flows `f`'s concrete return into the hole (`ensureType`'s Function case
+  // unifies returns) — then `makeExact` collapses the now-resolved `U[]`. The
+  // callback param is named `"_"` so `ensureType`'s param-name check is waived
+  // (a synthetic callback accepts a lambda/function whose param has any name).
+  const mapResultElement: VLType = { type: "Infer", subType: { type: "Unknown" } };
+  return {
   // O(1) sibling of `.length` (property syntax, read-only): allocated slots.
   capacity: { type: "Alias", name: "i32" },
   // Safe, checked accessor: `T | null` (null when `i` is out of range).
@@ -719,7 +742,39 @@ export const listMemberType = (
     paramaters: [],
     return: { type: "Alias", name: "null" },
   },
-});
+  // `map(f)` — build a NEW `U[]` of the same length, `out[i] = f(xs[i])`. `U` is
+  // the callback's return type, inferred via the shared `mapResultElement` hole
+  // (see above). The callback param is `(_: T)`; its return is the `U` hole.
+  map: {
+    type: "Function",
+    paramaters: [{
+      type: "Parameter",
+      name: "f",
+      paramaterType: {
+        type: "Function",
+        paramaters: [{ type: "Parameter", name: "_", paramaterType: element }],
+        return: mapResultElement,
+      },
+    }],
+    return: listOf(mapResultElement),
+  },
+  // `filter(f)` — build a NEW `T[]` of the elements where `f(xs[i])` is true.
+  // The callback is `(_: T) -> boolean`; the result element type is just `T`.
+  filter: {
+    type: "Function",
+    paramaters: [{
+      type: "Parameter",
+      name: "f",
+      paramaterType: {
+        type: "Function",
+        paramaters: [{ type: "Parameter", name: "_", paramaterType: element }],
+        return: { type: "Alias", name: "boolean" },
+      },
+    }],
+    return: listOf(element),
+  },
+  };
+};
 
 // A literal `true` loop condition (`while true`) — the loop never exits by
 // failing its test, so it only leaves via `break` or `return`.
@@ -1647,8 +1702,14 @@ export const ensureType = (
       for (let i = 0; i < left.paramaters.length; i++) {
         // TODO: eventually should support specifying a function's parameters
         // as position or positional+named, as it's annoying to have the name
-        // be part of the signature
-        if (left.paramaters[i].name !== right.paramaters[i].name) {
+        // be part of the signature. A `"_"` expected-param name is the
+        // positional wildcard: it waives the name match, so a synthetic callback
+        // type (e.g. `map`/`filter`'s `f`) accepts a lambda/function whose
+        // parameter is named anything.
+        if (
+          left.paramaters[i].name !== "_" &&
+          left.paramaters[i].name !== right.paramaters[i].name
+        ) {
           return pushError("different-parameter-names");
         }
         if (
