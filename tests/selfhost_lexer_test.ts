@@ -1,6 +1,6 @@
-// Runs the VL-in-VL lexer (`selfhost/lexer.vl`) through the real VL toolchain and
+// Runs the VL-in-VL lexer (`compiler/lexer.vl`) through the real VL toolchain and
 // checks the token stream it produces. VL has no module system yet, so the lexer
-// source is concatenated ahead of a `.vl` driver (`selfhost/harness.vl`, which
+// source is concatenated ahead of a `.vl` driver (`tests/selfhost/lexer_harness.vl`, which
 // embeds a representative sample and prints one `KIND|text|value|line:col` line
 // per token), the whole thing is compiled to wasm and run, and the captured log
 // is diffed against the expected token list.
@@ -21,7 +21,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
 const read = (rel: string) =>
   Deno.readTextFileSync(new URL(rel, import.meta.url));
 
-const lexer = read("../selfhost/lexer.vl");
+const lexer = read("../compiler/lexer.vl");
 
 // Compile `lexer.vl ++ driver`, run it, return the captured log lines.
 const runDriver = async (driver: string): Promise<string[]> => {
@@ -38,7 +38,7 @@ const runDriver = async (driver: string): Promise<string[]> => {
 };
 
 Deno.test("self-hosted lexer compiles, runs, and tokenizes the sample", async () => {
-  const logs = await runDriver(read("../selfhost/harness.vl"));
+  const logs = await runDriver(read("./selfhost/lexer_harness.vl"));
   // The harness prints every token then a diagnostics summary. Assert the whole
   // ordered stream — an extra/missing/misplaced token fails. `\n` newline-token
   // text and decoded escape values appear verbatim in the log lines.
