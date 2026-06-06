@@ -75,6 +75,29 @@ export const rangeFromCtx = (ctx: Context): VLRange => ({
   end: { line: ctx.stop.line - 1, character: ctx.stop.column },
 });
 
+// Re-escape a string-literal type's value for display: literal values are now
+// decoded by the lexer (`"a\nb"` holds a real newline), so rendering them raw in
+// hover/diagnostics would emit literal control chars. Mirror the source spelling.
+const escapeStringLiteral = (s: string): string =>
+  s.replace(/[\x00-\x1f"\\]/g, (c) => {
+    switch (c) {
+      case "\\":
+        return "\\\\";
+      case '"':
+        return '\\"';
+      case "\n":
+        return "\\n";
+      case "\t":
+        return "\\t";
+      case "\r":
+        return "\\r";
+      case "\0":
+        return "\\0";
+      default:
+        return "\\x" + c.charCodeAt(0).toString(16).padStart(2, "0");
+    }
+  });
+
 export const stringifyType = (type: VLType, seen: Set<VLType> = new Set()): string => {
   if (type.type === "Alias") return type.name;
   if (type.type === "Union") {
@@ -108,7 +131,9 @@ export const stringifyType = (type: VLType, seen: Set<VLType> = new Set()): stri
       ).join(", ")
     }}`;
   }
-  if (type.type === "StringLiteral") return `"${type.value}"`;
+  if (type.type === "StringLiteral") {
+    return `"${escapeStringLiteral(type.value)}"`;
+  }
   if (type.type === "IntegerLiteral") return type.value.toString();
   if (type.type === "RealLiteral") {
     return Number.isInteger(type.value)
