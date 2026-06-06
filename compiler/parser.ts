@@ -1156,6 +1156,13 @@ export const parseProgram = (
     // `ID` (shorthand) or `ID: expr`.
     const id = expect("ID");
     const name = { type: "Name", name: id.text } as const;
+    // Method shorthand `add(a, b) { … }` → `add: function(a, b) { … }`. The
+    // `(` immediately following the key (no `:`) marks the shorthand; the value
+    // is parsed as an anonymous function starting at the key token.
+    if (at("LPAREN")) {
+      const value = parseFunctionDeclaration(id);
+      return { type: "PropertyLiteral", name, value };
+    }
     if (at("COLON") || (skipNewlines(), at("COLON"))) {
       next(); // COLON
       skipNewlines();
@@ -1210,7 +1217,39 @@ export const parseProgram = (
       let j = i + 1;
       while (kind(j) === "NEWLINE") j++;
       const nk = kind(j);
-      return nk === "COLON" || nk === "COMMA" || nk === "RBRACE";
+      if (nk === "COLON" || nk === "COMMA" || nk === "RBRACE") return true;
+      // Method shorthand `{ add(a,b){…} }`: an `ID` directly followed by a
+      // balanced `( … )` and then a `{` body — distinguishes it from a block
+      // whose first statement is a call like `{ foo() }`.
+      if (nk === "LPAREN") {
+        let depth = 0;
+        let k = j;
+        do {
+          const t = kind(k);
+          if (t === "LPAREN") depth++;
+          else if (t === "RPAREN") depth--;
+          else if (t === "EOF") return false;
+          k++;
+        } while (depth > 0);
+        while (kind(k) === "NEWLINE") k++;
+        // Optional return-type annotation `add(a): T { … }`. Scan past the type
+        // to the body `{`, tracking `{`/`[`/`(` depth so an object/array type in
+        // the annotation (e.g. `: { x: i32 }`) doesn't swallow the body brace.
+        if (kind(k) === "COLON") {
+          k++;
+          let d = 0;
+          for (;;) {
+            const t = kind(k);
+            if (t === "EOF") return false;
+            if (d === 0 && t === "LBRACE") break;
+            if (t === "LBRACE" || t === "LBRACK" || t === "LPAREN") d++;
+            else if (t === "RBRACE" || t === "RBRACK" || t === "RPAREN") d--;
+            k++;
+          }
+        }
+        return kind(k) === "LBRACE";
+      }
+      return false;
     }
     if (first === "STRING") {
       let j = i + 1;
@@ -1366,13 +1405,23 @@ export const parseProgram = (
     }
   };
 
-  const parseFunctionDeclaration = (): VLFunctionDeclarationNode => {
-    const fnTok = expect("FUNCTION");
+  // `anonAt` desugars method-shorthand object fields (`{ add(a,b){…} }`): the
+  // caller has already consumed the method name (used as the property key) and
+  // passes that name token here so the value's span starts there. The parsed
+  // value is an *anonymous* FunctionDeclaration, identical to the longhand
+  // `{ add: function(a,b){…} }`, so typecheck/codegen need no changes.
+  const parseFunctionDeclaration = (
+    anonAt?: Token,
+  ): VLFunctionDeclarationNode => {
+    const fnTok = anonAt ?? expect("FUNCTION");
 
     // funcName: an identifier or an operator symbol (`function +(self, b)`).
     let name: string | undefined;
     let nameCtx: Context | undefined;
-    if (at("ID")) {
+    if (anonAt) {
+      // Method-shorthand: the field value is an anonymous function, so skip
+      // name parsing — `(` already follows the consumed method name.
+    } else if (at("ID")) {
       const id = next();
       name = id.text;
       nameCtx = spanOf(id);
