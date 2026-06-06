@@ -203,6 +203,15 @@ export const parseProgram = (
    * carried by the name, resolved on demand (A11).
    */
   const typeBuilding = new Set<string>();
+  /**
+   * Top-level function names whose *signature* was hoisted into the module scope
+   * by the forward-reference pre-pass (see `preRegisterTopLevelFunctions`), so a
+   * call to a function declared later in the file — or a mutually-recursive cycle
+   * (`isEven` ↔ `isOdd`) — resolves. The set lets the real `parseFunctionDeclaration`
+   * pass distinguish "already in scope because I hoisted it" from a genuine B16
+   * redeclaration, and avoids re-erroring on the hoisted entry.
+   */
+  const preregistered = new Set<string>();
 
   // A fresh bare `return` node — the fallback body for a malformed statement.
   // A factory (not a shared constant) so each use is a distinct AST node.
@@ -1663,7 +1672,14 @@ export const parseProgram = (
     let registered = false;
     let fnBinding: Binding | undefined;
     if (name) {
-      if (name in enclosing) {
+      // This top-level name is already in scope because the forward-reference
+      // pre-pass hoisted its signature. That is NOT a redeclaration — it is this
+      // very declaration's own hoisted entry. Consume the marker (so a genuine
+      // *second* `function name` later still errors B16) and fall through to
+      // register the real binding, overwriting the placeholder signature.
+      const hoisted = enclosing === program.scope && preregistered.has(name);
+      if (hoisted) preregistered.delete(name);
+      if (name in enclosing && !hoisted) {
         errors.push({
           type: "Redeclaration",
           name,
@@ -2329,6 +2345,120 @@ export const parseProgram = (
     }
   };
 
+  // ---- forward-reference pre-pass ------------------------------------------
+
+  /**
+   * Hoist every top-level function *signature* into the module scope BEFORE any
+   * body is parsed, so a call can resolve a function declared later in the file,
+   * and two top-level functions can be mutually recursive
+   * (`isEven` ↔ `isOdd`). VL's parser resolves names eagerly in a single
+   * top-to-bottom pass, so without this a forward/mutual call hit `getType` while
+   * the callee was not yet in scope and failed with "undeclared".
+   *
+   * This is a SIGNATURE-only scout pass: it parses each top-level
+   * `function NAME <T>? ( params ) (: ret)?` and registers a `Function` type into
+   * `program.scope`, then rewinds the cursor so the real pass parses everything
+   * (including the bodies) normally. The real pass detects the hoisted entry via
+   * `preregistered` and adopts it instead of re-erroring as a redeclaration.
+   *
+   * ANNOTATION RULE: a hoisted signature with no `: returnType` annotation gets an
+   * `Infer/Unknown` return hole (exactly like the existing self-recursion path).
+   * A forward/mutual *call* therefore sees an unresolved return until the callee's
+   * body is checked — which, for a forward reference, has not happened yet. So
+   * **a function that is called before (or mutually with) its own definition must
+   * declare its return type**; otherwise the call resolves against the hole and
+   * reports a clean type error (`expected …, got any`) rather than crashing. This
+   * mirrors how an un-annotated *self*-recursive function already behaves today.
+   *
+   * Side effects (parse errors, symbol-table bindings, scope mutations from
+   * `parseParams`/`parseType`) are reverted: the real pass re-parses the same
+   * signatures and is the single source of truth for diagnostics and symbols.
+   */
+  function preRegisterTopLevelFunctions(): void {
+    const savedPos = pos;
+    const savedErrors = errors.length;
+    // Trivia kinds that do not count as the "previous real token" when deciding
+    // whether a `function` sits in statement position.
+    let depth = 0; // paren + brace + bracket nesting
+    let prevReal: TokenKind | undefined; // last non-newline token kind at depth 0
+    while (!atEnd()) {
+      const k = peek().kind;
+      if (k === "NEWLINE") {
+        next();
+        continue;
+      }
+      if (
+        depth === 0 && k === "FUNCTION" && peek(1).kind === "ID" &&
+        (prevReal === undefined || prevReal === "RBRACE")
+      ) {
+        scoutSignature();
+        prevReal = "RBRACE"; // a declaration ends like a block: next is stmt-pos
+        continue;
+      }
+      if (k === "LPAREN" || k === "LBRACE" || k === "LBRACK") depth++;
+      else if (k === "RPAREN" || k === "RBRACE" || k === "RBRACK") {
+        if (depth > 0) depth--;
+      }
+      if (depth === 0) prevReal = k;
+      next();
+    }
+    // Revert every side effect of the scout pass; the real pass owns diagnostics
+    // and symbols. The signatures we registered into `program.scope` stay.
+    errors.length = savedErrors;
+    pos = savedPos;
+  }
+
+  /**
+   * Scout a single top-level `function NAME <T>? ( params ) (: ret)?` and register
+   * its `Function` type into the module scope. Leaves the cursor just past the
+   * signature (the real pass rewinds anyway). Best-effort: a malformed signature
+   * simply isn't hoisted (the real pass will report the syntax error in place).
+   */
+  function scoutSignature(): void {
+    try {
+      next(); // FUNCTION
+      const name = next().text; // ID (guaranteed by caller)
+      const typeParams: string[] = at("LESS_THAN") ? parseTypeParams() : [];
+      const pushedTypeScope = typeParams.length > 0;
+      if (pushedTypeScope) {
+        scopes.push(
+          Object.fromEntries(
+            typeParams.map((
+              n,
+            ) => [n, { type: "Infer", subType: { type: "Unknown" } }]),
+          ),
+        );
+      }
+      try {
+        if (!at("LPAREN")) return;
+        next(); // LPAREN
+        const { params } = parseParams();
+        if (at("RPAREN")) next();
+        let annotatedReturn: VLType | undefined;
+        if (at("COLON")) {
+          next();
+          skipNewlines();
+          annotatedReturn = parseType();
+        }
+        // First top-level declaration of a given name wins the hoist slot; a
+        // genuine duplicate is left for the real pass to flag as a redeclaration.
+        if (!(name in program.scope)) {
+          program.scope[name] = {
+            type: "Function",
+            paramaters: params,
+            return: annotatedReturn ??
+              { type: "Infer", subType: { type: "Unknown" } },
+          };
+          preregistered.add(name);
+        }
+      } finally {
+        if (pushedTypeScope) scopes.pop();
+      }
+    } catch {
+      // Malformed signature: skip hoisting it. The real pass reports the error.
+    }
+  }
+
   // ---- program -------------------------------------------------------------
 
   const program: VLProgramNode = {
@@ -2337,6 +2467,8 @@ export const parseProgram = (
     scope: initialScope,
   };
   scopes.push(program.scope);
+
+  preRegisterTopLevelFunctions();
 
   skipNewlines();
   while (!atEnd()) {
