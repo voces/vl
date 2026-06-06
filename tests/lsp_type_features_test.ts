@@ -12,6 +12,7 @@ import { parseSymbols, stringifyType } from "../compiler/compile.ts";
 import {
   classifyTokens,
   deriveInlayHints,
+  docMarkdown,
   encodeSemanticTokens,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
@@ -174,4 +175,31 @@ Deno.test("deriveInlayHints: only declaration occurrences produce hints", () => 
   assertEquals(xs.length, 1);
   // Label uses the injected stringifier output.
   assertEquals(labels(hints).sort(), ["x: i32", "y: i32"]);
+});
+
+// ---- combined doc + type markdown (hover / completion documentation) --------
+
+Deno.test("docMarkdown: doc prose renders above the type fence", () => {
+  assertEquals(
+    docMarkdown("add: (a: i32) => i32", "vital", "Adds numbers."),
+    "Adds numbers.\n\n```vital\nadd: (a: i32) => i32\n```",
+  );
+});
+
+Deno.test("docMarkdown: no doc collapses to the bare type fence", () => {
+  assertEquals(
+    docMarkdown("x: i32", "vital", undefined),
+    "```vital\nx: i32\n```",
+  );
+});
+
+Deno.test("docMarkdown: a blank-only doc collapses to the bare type fence", () => {
+  assertEquals(
+    docMarkdown("x: i32", "vital", "   \n  "),
+    "```vital\nx: i32\n```",
+  );
+});
+
+Deno.test("docMarkdown: empty type returns just the doc prose", () => {
+  assertEquals(docMarkdown("", "vital", "Just docs."), "Just docs.");
 });

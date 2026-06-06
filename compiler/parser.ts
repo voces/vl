@@ -140,10 +140,11 @@ export const parseProgram = (
     kind: BindingKind,
     decl: Context,
     type?: VLType,
+    doc?: string,
   ): Binding => {
     let map = scopeBindings.get(scope);
     if (!map) scopeBindings.set(scope, map = new Map());
-    const binding: Binding = { name, kind, decl, type };
+    const binding: Binding = { name, kind, decl, type, doc };
     map.set(name, binding);
     symbols.declare(binding);
     return binding;
@@ -160,6 +161,20 @@ export const parseProgram = (
   const recordUse = (name: string, span: Context): void => {
     const binding = resolveBinding(name);
     if (binding) symbols.use(binding, span);
+  };
+  /**
+   * Stamp every `Binding` declared in `scope` with `span`, the source extent over
+   * which those bindings are visible (roadmap D3 scope-aware completion — see
+   * `Binding.scope`). Called as each binding-bearing scope closes (block end,
+   * function span, program end), once the closing position is known. Idempotent
+   * and additive: scopes with no bindings (e.g. transient type-param scopes) are
+   * no-ops, and re-stamping is harmless. Leaves `binding.scope` untouched for
+   * scopes that error out before this runs (the field stays optional).
+   */
+  const stampScope = (scope: Scope, span: Context): void => {
+    const map = scopeBindings.get(scope);
+    if (!map) return;
+    for (const binding of map.values()) binding.scope = span;
   };
 
   /** Implicit return types collected from the current function body. */
@@ -726,6 +741,18 @@ export const parseProgram = (
         const close = expect("RBRACK");
         const arrayCtx = ctxOf(left);
         const indexCtx = ctxOf(index);
+        const ctx = between(arrayCtx, spanOf(close));
+        // Index trap (B13): a user object that carries a `"[]"` method handles
+        // `o[k]` itself — dispatch through it as a member call `o."[]"(k)`,
+        // reusing the field-method call path (the same shape as a `"+"` operator
+        // field). A native array (i32 index signature → WasmGC array) keeps the
+        // fast native `array.get`; the trap fires only for non-array objects that
+        // actually declare `"[]"`.
+        const trapped = indexTrap(left, [index], "[]", arrayCtx, ctx);
+        if (trapped) {
+          left = trapped;
+          continue;
+        }
         getChildType(
           typeFromExpression(left, arrayCtx),
           typeFromExpression(index, indexCtx),
@@ -733,7 +760,7 @@ export const parseProgram = (
           indexCtx,
         );
         const node = { type: "IndexAccess", array: left, index } as const;
-        left = record(node, between(arrayCtx, spanOf(close)));
+        left = record(node, ctx);
         continue;
       }
       // Postfix `++` / `--`.
@@ -842,6 +869,54 @@ export const parseProgram = (
       ),
       arguments: args,
       functionType: undefined,
+    };
+    return record(node, ctx);
+  };
+
+  /**
+   * Index trap (B13): if `object` is a user object that declares an index method
+   * (`"[]"` for a read, `"[]="` for a write) and is NOT a native array, dispatch
+   * `o[k]` / `o[k] = v` through it as a field-method call `o."[]"(k)` /
+   * `o."[]="(k, v)` — reusing the existing `Call` lowering (the same shape as a
+   * `"+"` operator field). Returns the call node, or `undefined` to keep the
+   * native array / index-signature path. The method's parameter types are
+   * verified by `instantiateFunctionType`, so a wrong key/value type is rejected.
+   */
+  const indexTrap = (
+    object: VLExpression,
+    args: VLExpression[],
+    method: "[]" | "[]=",
+    objCtx: Context,
+    ctx: Context,
+  ): VLExpression | undefined => {
+    let shape = typeFromExpression(object, objCtx);
+    if (shape.type === "Infer") shape = shape.subType;
+    // Only a user object (no nominal name like `string`) that is not a native
+    // i32-keyed array can carry an index trap — native arrays/strings keep the
+    // fast `array.get`/`array.set` path.
+    if (
+      shape.type !== "Object" || shape.name !== undefined ||
+      arrayElementType(shape) !== null
+    ) {
+      return undefined;
+    }
+    const methodType = shape.properties.find((p) =>
+      validateType(p.name, { type: "StringLiteral", value: method })
+    )?.type;
+    if (methodType?.type !== "Function") return undefined;
+    const callArgs = args.map((a) => makeArgument(undefined, a, ctxOf(a)));
+    const node: VLCallNode = {
+      type: "Call",
+      callee: record(
+        { type: "PropertyAccess", object, property: method } as const,
+        objCtx,
+      ),
+      arguments: callArgs,
+      functionType: instantiateFunctionType(
+        methodType,
+        callArgs,
+        ctx,
+      ) as VLFunctionType,
     };
     return record(node, ctx);
   };
@@ -1281,7 +1356,11 @@ export const parseProgram = (
         statements: statements.map((s) => s[1]),
         valueType,
       };
-      return record(node, between(spanOf(open), spanOf(close)));
+      const span = between(spanOf(open), spanOf(close));
+      // Stamp the block's locals with the block's `{ … }` extent (D3 scope-aware
+      // completion) before the scope is popped in `finally`.
+      stampScope(blockScope, span);
+      return record(node, span);
     } finally {
       scopes.pop();
     }
@@ -1359,7 +1438,14 @@ export const parseProgram = (
       } else {
         enclosing[name] = selfType;
         if (nameCtx) {
-          fnBinding = declareBinding(enclosing, name, "function", nameCtx, selfType);
+          fnBinding = declareBinding(
+            enclosing,
+            name,
+            "function",
+            nameCtx,
+            selfType,
+            fnTok.docComment,
+          );
         }
         registered = true;
       }
@@ -1435,6 +1521,10 @@ export const parseProgram = (
     if (pushedTypeScope) scopes.pop();
 
     const ctx = spanFrom(fnTok);
+    // Parameters are visible across the whole function (D3 scope-aware
+    // completion). The body's block scope already carries the body's tighter
+    // extent, so a param shadowed by a body local still resolves correctly.
+    stampScope(scope, ctx);
     record(node, ctx);
     // Memoize the node's final type and refine the forward-registered entry.
     const finalType = typeFromExpression(node, ctx);
@@ -1559,6 +1649,42 @@ export const parseProgram = (
       }, wholeCtx);
     }
 
+    // Index-trap write (B13): `o[k] = v` on a user object with a `"[]="` method.
+    // The LHS was already turned into a `"[]"` read-trap `Call` by `parsePostfix`
+    // (the index trap fires during postfix parsing); recover the object + key and
+    // re-dispatch as `o."[]="(k, v)`, reusing the field-method `Call` lowering.
+    // The method's value-param type checks `v` (and the key-param type checks
+    // `k`). A native array keeps the `IndexAccess` branch below (no `"[]="`).
+    if (
+      left.type === "Call" && left.callee.type === "PropertyAccess" &&
+      left.callee.property === "[]" && left.arguments.length === 1
+    ) {
+      const object = left.callee.object;
+      const key = left.arguments[0].value;
+      const objCtx = ctxOf(object);
+      // `o[k] += v` desugars to `o[k] = o[k] + v`; the read side reuses the
+      // already-built `"[]"` read-trap call as the operator's left operand.
+      const right: VLExpression = operator
+        ? { type: "BinaryOperation", left, right: rawRight, operator }
+        : rawRight;
+      const trapped = indexTrap(object, [key, right], "[]=", objCtx, wholeCtx);
+      if (trapped) return trapped;
+      // The object had `"[]"` but no `"[]="` — assignment isn't supported. Report
+      // through getChildType against `"[]="` so the error names the missing method.
+      getChildType(
+        typeFromExpression(object, objCtx),
+        { type: "StringLiteral", value: "[]=" },
+        objCtx,
+        objCtx,
+      );
+      return record({
+        type: "BinaryOperation",
+        left,
+        right,
+        operator: "=",
+      }, wholeCtx);
+    }
+
     if (left.type === "IndexAccess") {
       const array = left.array;
       const index = left.index;
@@ -1666,13 +1792,20 @@ export const parseProgram = (
     } else {
       const scope = scopes[scopes.length - 1];
       scope[node.name] = node.variableType;
-      declareBinding(scope, node.name, "variable", spanOf(id), node.variableType);
+      declareBinding(
+        scope,
+        node.name,
+        "variable",
+        spanOf(id),
+        node.variableType,
+        kw.docComment,
+      );
     }
     return record(node, spanFrom(kw));
   };
 
   const parseTypeStatement = (): VLStatement => {
-    expect("TYPE");
+    const typeTok = expect("TYPE");
     const id = expect("ID");
     const name = id.text;
     // Generic type parameters (`type Box<T> = …`): a `<` after the name can only
@@ -1717,7 +1850,7 @@ export const parseProgram = (
     if (typeParams.length > 0) entry.params = paramHoles;
     const typeScope = scopes[scopes.length - 1];
     typeScope[name] = entry;
-    declareBinding(typeScope, name, "type", spanOf(id), entry);
+    declareBinding(typeScope, name, "type", spanOf(id), entry, typeTok.docComment);
     if (hasBody) {
       next();
       skipNewlines();
@@ -1949,6 +2082,17 @@ export const parseProgram = (
     if (peek() === startTok) next(); // ensure progress
     skipNewlines();
   }
+
+  // Stamp top-level bindings (functions, types, module-level vars) with a span
+  // covering the whole document so they're "in scope" everywhere for D3
+  // completion. Builtins from `defaultScope` live in `program.scope` too but are
+  // never `declareBinding`'d, so `stampScope` leaves them alone (the LSP folds
+  // builtins in separately).
+  const programSpan: Context = {
+    start: { line: 1, column: 0 },
+    stop: peek().stop, // the EOF token's position
+  };
+  stampScope(program.scope, programSpan);
 
   return [program, errors, symbols];
 };

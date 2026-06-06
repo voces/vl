@@ -23,7 +23,13 @@
 // stdout. `Deno`/`process` usage is confined to this CLI entry point — the
 // shared compiler core (compile.ts) stays side-effect-free and runtime-agnostic.
 
-import { compile, runWasm, type VLDiagnostic, wasmToWat } from "./compile.ts";
+import {
+  checkOnly,
+  compile,
+  runWasm,
+  type VLDiagnostic,
+  wasmToWat,
+} from "./compile.ts";
 
 const SUBCOMMANDS = new Set(["run", "build", "check"]);
 
@@ -285,7 +291,13 @@ const checkFile = async (
   tally: CheckTally,
 ): Promise<void> => {
   const source = await Deno.readTextFile(file);
-  const { diagnostics } = await compile(source);
+  // `check` only needs diagnostics, so use the codegen-free front end: it skips
+  // binaryen codegen entirely (faster, and never even loads the binaryen
+  // toolchain). Trade-off: codegen-only diagnostics — the `Codegen error:` line,
+  // e.g. the array-element-recursion stack overflow — are not produced by
+  // `check`. That is acceptable here: `check` is a parse/type gate, and
+  // `build`/`run` (which do run codegen) still surface those errors.
+  const { diagnostics } = checkOnly(source);
   if (diagnostics.length === 0) return;
 
   if (concise) {

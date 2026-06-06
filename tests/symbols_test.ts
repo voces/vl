@@ -122,3 +122,60 @@ Deno.test("cursor off any symbol yields no definition", () => {
   const symbols = parseSymbols(src);
   assertEquals(symbols.definitionAt({ line: 1, column: 0 }), undefined);
 });
+
+// ---- `///` doc-comments (markdown doc-comments) -----------------------------
+//
+// A run of consecutive `///` lines immediately above a declaration is captured
+// as the binding's `doc` (markdown). Resolve the declaration via its name and
+// assert the carried doc.
+
+const docOf = (src: string, needle: string, nth = 0): string | undefined =>
+  parseSymbols(src).occurrenceAt(cursorOn(src, needle, nth))?.binding.doc;
+
+Deno.test("doc-comment: attaches to a function declaration", () => {
+  const src = "/// Adds two numbers.\nfunction add(a: i32, b: i32) a + b\n";
+  assertEquals(docOf(src, "add"), "Adds two numbers.");
+});
+
+Deno.test("doc-comment: attaches to a `let` binding", () => {
+  const src = "/// The answer.\nlet x = 42\n";
+  assertEquals(docOf(src, "x"), "The answer.");
+});
+
+Deno.test("doc-comment: attaches to a `type` alias", () => {
+  const src = "/// A 2D point.\ntype Point = { x: i32, y: i32 }\n";
+  assertEquals(docOf(src, "Point"), "A 2D point.");
+});
+
+Deno.test("doc-comment: multi-line run concatenates with newlines", () => {
+  const src =
+    "/// Adds two numbers.\n/// Returns their sum.\nfunction add(a: i32, b: i32) a + b\n";
+  assertEquals(docOf(src, "add"), "Adds two numbers.\nReturns their sum.");
+});
+
+Deno.test("doc-comment: a blank line breaks the association", () => {
+  const src = "/// Not attached.\n\nfunction add(a: i32, b: i32) a + b\n";
+  assertEquals(docOf(src, "add"), undefined);
+});
+
+Deno.test("doc-comment: a plain `//` comment is not captured", () => {
+  const src = "// Just a comment.\nfunction add(a: i32, b: i32) a + b\n";
+  assertEquals(docOf(src, "add"), undefined);
+});
+
+Deno.test("doc-comment: `////` is not a doc-comment", () => {
+  const src = "//// banner\nfunction add(a: i32, b: i32) a + b\n";
+  assertEquals(docOf(src, "add"), undefined);
+});
+
+Deno.test("doc-comment: one leading space is stripped, the rest kept", () => {
+  // First `/// ` → one space stripped. Second `///  ` → keeps one space (markdown
+  // indentation the author wrote stays intact after the single-space strip).
+  const src = "///A\n///  B\nlet x = 1\n";
+  assertEquals(docOf(src, "x"), "A\n B");
+});
+
+Deno.test("doc-comment: undocumented declaration has no doc", () => {
+  const src = "function add(a: i32, b: i32) a + b\n";
+  assertEquals(docOf(src, "add"), undefined);
+});

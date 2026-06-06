@@ -1,4 +1,6 @@
 import {
+  CompletionItem,
+  CompletionItemKind,
   createConnection,
   Diagnostic,
   DiagnosticSeverity,
@@ -6,6 +8,7 @@ import {
   InlayHint,
   InlayHintKind,
   Location,
+  MarkupKind,
   Position,
   ProposedFeatures,
   Range,
@@ -24,10 +27,17 @@ import {
 } from "../../compiler/compile.ts";
 import type { Context } from "../../compiler/ast.ts";
 import {
+  type Completion,
+  type CompletionKind,
   deriveInlayHints,
+  docMarkdown,
+  identifierCompletions,
   type LspRange,
+  memberCompletions,
+  receiverObjectType,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
+  typeLabelDetail,
 } from "./typeFeatures.ts";
 
 // The language id the extension registers (`package.json` → contributes.languages,
@@ -158,10 +168,18 @@ connection.onHover(async (params): Promise<Hover | null> => {
     // out of scope here (compiler/*.ts is owned by other agents). When it lands,
     // render both via separate labelled markdown sections — the LSP convention
     // for two types in one hover — e.g. "declared `T`" then "narrowed `U`".
+    // Render the authored `///` doc (if any) as markdown above the type block.
+    // `docMarkdown` collapses to the bare type fence when there's no doc, so
+    // undocumented bindings hover exactly as before.
     return {
-      contents: hoverMarkdown(
-        `${occ.binding.name}: ${stringifyType(occ.binding.type)}`,
-      ),
+      contents: {
+        kind: "markdown",
+        value: docMarkdown(
+          `${occ.binding.name}: ${stringifyType(occ.binding.type)}`,
+          VL_LANGUAGE_ID,
+          occ.binding.doc,
+        ),
+      },
     };
   }
 
@@ -205,6 +223,105 @@ connection.languages.semanticTokens.on((params): SemanticTokens => {
   return { data: semanticTokensData(symbols) };
 });
 
+// Map a neutral completion kind (from `typeFeatures.ts`) to the LSP enum. A VL
+// `type` alias / builtin type maps to `Struct` (VL types are structural objects,
+// not nominal classes) — the closest fit and what semantic tokens treat as a
+// "type". Locals/params are `Variable`; callables are `Function`.
+const completionKind: Record<CompletionKind, CompletionItemKind> = {
+  variable: CompletionItemKind.Variable,
+  parameter: CompletionItemKind.Variable,
+  function: CompletionItemKind.Function,
+  type: CompletionItemKind.Struct,
+};
+
+// For items that carry a type we render it in exactly two places, never the same
+// place twice:
+//   - `labelDetails.detail` — a compact `: <type>` shown inline right after the
+//     label (less prominent, no spacing), per the LSP 3.17 field. This is the
+//     at-a-glance type on the suggestion row.
+//   - `documentation` — a markdown `MarkupContent` wrapping the type in a fenced
+//     `vital` block (`typeMarkdown`), which the client renders syntax-highlighted
+//     via the TextMate grammar (matching the hover) in the expanded detail panel.
+// We deliberately do NOT set the top-level `detail`: VS Code echoes `detail` BOTH
+// on the label row AND in the panel header, so combined with the markdown
+// `documentation` the type showed up twice (once unstyled from `detail`, once
+// highlighted from the doc). `labelDetails` gives the inline type WITHOUT
+// populating the panel body, leaving the highlighted `documentation` as the only
+// thing in the panel — type shown once inline, once highlighted, never duplicated.
+// Items without a type omit both.
+//
+// When the declaration carries a `///` doc-comment (`c.doc`), it's rendered as
+// markdown ABOVE the type block in `documentation` via `docMarkdown` — prose
+// first, type beneath. Items with neither a type nor a doc omit `documentation`.
+const toCompletionItem = (c: Completion): CompletionItem => {
+  const item: CompletionItem = { label: c.name, kind: completionKind[c.kind] };
+  if (c.detail !== undefined) {
+    item.labelDetails = { detail: typeLabelDetail(c.detail) };
+  }
+  if (c.detail !== undefined || (c.doc && c.doc.trim() !== "")) {
+    item.documentation = {
+      kind: MarkupKind.Markdown,
+      value: docMarkdown(c.detail ?? "", VL_LANGUAGE_ID, c.doc),
+    };
+  }
+  return item;
+};
+
+// The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`
+// on `line`, or null. Used to find a `<name>.` member-completion receiver: we
+// scan back over `.` then the preceding word. (Cursor-on-word extraction is
+// `wordAt`; this is specifically "the word ending just before the cursor".)
+const wordEndingBefore = (line: string, character: number): string | null => {
+  const isWordChar = (c: string) => /[A-Za-z0-9_]/.test(c);
+  const end = character;
+  let start = end;
+  while (start > 0 && isWordChar(line[start - 1])) start--;
+  if (start === end) return null;
+  const word = line.slice(start, end);
+  return /^[A-Za-z_]/.test(word) ? word : null;
+};
+
+// Completion (D3): scope-aware identifier suggestions everywhere, and structural
+// member suggestions after `.`. Driven by the pure helpers in `typeFeatures.ts`
+// over the compiler's symbol table + program scope (which folds in builtins).
+connection.onCompletion(async (params): Promise<CompletionItem[]> => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+  const text = doc.getText();
+  const vlPos = toVLPosition(params.position);
+
+  // The text on the current line up to the cursor — to detect a `.` trigger and
+  // find the receiver name before it.
+  const linePrefix = doc.getText({
+    start: { line: params.position.line, character: 0 },
+    end: params.position,
+  });
+
+  const symbols = parseSymbols(text);
+  const charBeforeCursor = linePrefix[linePrefix.length - 1];
+
+  // Member completion: cursor follows `<receiver>.`. Only the simple `name.`
+  // receiver is resolved (see `receiverObjectType` / the D3 report); a more
+  // complex receiver yields no member suggestions rather than wrong ones.
+  if (charBeforeCursor === ".") {
+    const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
+    if (!receiver) return [];
+    const { ast } = await compile(text);
+    if (!ast) return [];
+    const objectType = receiverObjectType(receiver, symbols, vlPos, ast.scope);
+    if (!objectType) return [];
+    return memberCompletions(objectType, stringifyType).map(toCompletionItem);
+  }
+
+  // Identifier completion: in-scope names + builtins. `ast.scope` carries the
+  // builtins (from `defaultScope`) plus top-level names; user bindings from the
+  // symbol table override same-named builtins inside `identifierCompletions`.
+  const { ast } = await compile(text);
+  const builtins = ast?.scope ?? {};
+  return identifierCompletions(symbols, vlPos, builtins, stringifyType)
+    .map(toCompletionItem);
+});
+
 documents.listen(connection);
 
 connection.onInitialize((params) => {
@@ -217,6 +334,11 @@ connection.onInitialize((params) => {
       textDocumentSync: {
         openClose: true,
         change: TextDocumentSyncKind.Full,
+      },
+      completionProvider: {
+        // `.` re-triggers completion so member suggestions appear right after a
+        // property access; ordinary identifier completion fires on typing too.
+        triggerCharacters: ["."],
       },
       definitionProvider: true,
       referencesProvider: true,
