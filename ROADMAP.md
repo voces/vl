@@ -63,8 +63,8 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **A10. Parametric types / generics** (`function foo<T>(x: T)`). Stage 1 (function type params),
   Stage 2 (array element inference — `first<T>(xs: T[]): T`), Stage 3 (generic `type` aliases —
   `type Box<T> = {value: T}`, applied in any type position incl. nested/array; `tests/cases/generics/`)
-  done. REMAINING: build-side array generics (`map`/`filter` constructing a new array of inferred
-  element type) — needs growable lists (B6 tier-2) or fixed-size construction.
+  done. REMAINING: build-side array generics (`map`/`filter` constructing a new collection of inferred
+  element type) — needs `List` (B6, the primary collection) or fixed-size construction.
 - 🟢 **A11. Recursive structural types.** Done — `type Tree = { value, left: Tree | null, … }`
   constructs/traverses/compiles (cycle-safe traversals + a self-referential WasmGC struct rec-group;
   `types/recursive-tree.vl`). REMAINING: mutual recursion across *separate* `type` decls; recursion
@@ -110,14 +110,39 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   reassignment, captured-in-closures, excess-property width subtyping, function-valued fields +
   member-call. REMAINING: methods via `self`+UFCS (B14); method-shorthand `{ add(a,b) … }` (parser);
   typed literals in object values (`{n: 4<i64>}`); Exact-by-default for values (A8).
-- 🟡 **B6. Arrays** (WasmGC). MVP done: fixed-length arrays — literal/`a[i]`/`a[i]=v`/`a.length`,
-  bounds-trap. Size-member design DECIDED (→ `DECISIONS.md`). REMAINING: growable list/vector
-  (`{ array, len, cap }`, tier 2).
-- ⬜ **B6a. Maps / non-string keys** (`Map<K,V>` — a separate hash type, not every-object-as-table; →
-  `DECISIONS.md`). Index sigs `{[string]: T}` type-check but are dropped at codegen — this is their
-  codegen. The `"[]"`/`"[]="` traps it rides on are now in place (B13); what remains is the hash
-  representation itself (a nominal `Map<K,V>` shape whose `"[]"`/`"[]="` lower to hashed get/set).
+- 🟡 **B6. Collections — one user-facing collection, spelled `T[]`** (WasmGC; design + rationale:
+  `docs/collections-design.md`). MVP done: the raw fixed-length array (literal/`a[i]`/`a[i]=v`/`a.length`,
+  bounds-trap) is now the substrate, not a separate user tier. DECIDED: one growable collection **spelled
+  `T[]`** with `[...]` its literal (scripting-feel default), `{backing,len,cap}` rep, 2× growth,
+  monomorphized-not-boxed; **indexing traps on OOB** (`a[i]: T`) with **`.get(i): T | null`** the safe
+  accessor, while **`Map[k]: V | null`** (Rust/Swift split — sequence index traps, map lookup is optional);
+  and **representation is inferred** — the compiler lowers never-grown values to a header-less fixed array
+  (a safe optimization, degrades to the growable rep when unproven). **The names `List`/`Array` are
+  UNCOMMITTED** (design vocabulary only; `T[]` + inference is the whole committed surface — no user-facing
+  way to force a representation yet). `DECISIONS.md` entry lands with implementation.
+- ⬜ **B6a. `Map` + `Set`** — the "usable for modding" trio with `T[]` (a scripting language needs all
+  three). `T[]` lands first; `Map`/`Set` ride the same intrinsic floor. `Map[k]: V | null` (missing key =
+  normal absence). **Deterministic insertion-order iteration** (multiplayer/replay reproducibility).
   Deferred.
+- ⬜ **B6b. Collections building blocks & open items** (all detail in `docs/collections-design.md`).
+  - **Prerequisite intrinsics** — the two-primitive floor the collection is built over: dynamic-length
+    `__array_new__`/`__array_new_default__` + bulk `__array_copy__`, thin `defaultScope` intrinsics. The
+    building block before the collection itself.
+  - **Std-over-primitives** — write the collection (and opportunistically `print`) as `.vl` std, not
+    compiler-privileged types (ties to H3). Open dependency: no module system yet.
+  - **Indexing perf** (DECIDED resolutions; sub-choices/analysis open) — native-indexing flag (drops the
+    B13 indirect call; nominal-vs-annotation open), backing-pointer hoisting (LICM), and bounds-narrowing
+    (now an optimization, not a prerequisite, since trap-on-OOB is already a bare `array.get`).
+  - **Representation inference** (DECIDED direction; analysis is new open compiler work) — infer
+    fixed-array vs growable rep from usage; interprocedural + alias-unioned; co-design with variance (A9).
+    Subsumes the old constant-literal optimization and most of the raw-array escape.
+  - **Naming & forcing surface — UNCOMMITTED** — the names `List`/`Array` and any annotation to *force* a
+    representation (vs the inferred default) are deliberately open; `T[]` + inference is the committed surface.
+  - **Language-wide, still open** — value-vs-reference (default reference; also gates the inference
+    analysis), the error model ("results for expected absence, traps for bugs").
+  - **Deferred** — per-frame pooling beyond capacity-retaining `clear()` (kept in v1); a user-facing
+    low-level array escape (only the FFI/SIMD/linear-memory case remains, post-inference).
+  - **Remaining open questions** — capacity/seed construction spelling; `map`/`filter` return type.
 - 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
   `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.
@@ -247,7 +272,7 @@ corpus (A12) is the host-agnostic oracle — the same tests pass whichever compi
 - ✅ **H1. Parser self-hostable (= Track G).** The one piece that categorically can't live in a
   VL-in-VL compiler is gone.
 - ⬜ **H2. Make VL expressive enough to write a compiler.** Recursive tree types (**A11 ✅**), generic
-  collections (**A10**, **B6 tier-2** lists, **B6a** maps), string munging (**A7** methods). A10 +
+  collections (**A10**, **B6** `List`, **B6a** maps), string munging (**A7** methods). A10 +
   collections are the remaining gap — the capability bar for the port.
 - ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
   running the corpus through the VL-written compiler. Incremental; TS and VL compilers cross-checked.
@@ -266,7 +291,7 @@ H2/H3; H1 done, H4 decided.
 
 ## Next (highest leverage)
 
-- **A10 generics + collections (B6 tier-2 lists, B6a maps)** — the H2 capability bar, and the gate on
+- **A10 generics + collections (B6 `List`, B6a maps)** — the H2 capability bar, and the gate on
   self-hosting (H3). The deepest remaining type-system work.
 - **C5 / H-M1** — `deno compile` + brew. Small, decoupled, ships the distribution story now.
 - **D1** — hover types, now that AST nodes carry source spans (D2 go-to-def/refs is done).
