@@ -4,6 +4,7 @@ import {
   createConnection,
   Diagnostic,
   DiagnosticSeverity,
+  DiagnosticTag,
   Hover,
   InlayHint,
   InlayHintKind,
@@ -24,6 +25,7 @@ import {
   rangeFromCtx,
   stringifyType,
   VLDiagnostic,
+  VLDiagnosticTag,
   VLSeverity,
 } from "../../compiler/compile.ts";
 import type { Context } from "../../compiler/ast.ts";
@@ -63,6 +65,14 @@ const severityMap: Record<VLSeverity, DiagnosticSeverity> = {
   error: DiagnosticSeverity.Error,
   warning: DiagnosticSeverity.Warning,
   info: DiagnosticSeverity.Information,
+  // Hint: no squiggle, not in the warning tier. With the `unnecessary` tag this
+  // greys/fades the span (e.g. a `_`-prefixed intentionally-unused binding).
+  hint: DiagnosticSeverity.Hint,
+};
+
+const tagMap: Record<VLDiagnosticTag, DiagnosticTag> = {
+  unnecessary: DiagnosticTag.Unnecessary,
+  deprecated: DiagnosticTag.Deprecated,
 };
 
 const toLspDiagnostic = (d: VLDiagnostic): Diagnostic => ({
@@ -71,6 +81,8 @@ const toLspDiagnostic = (d: VLDiagnostic): Diagnostic => ({
   range: d.range,
   code: d.code,
   source: d.source,
+  // `unnecessary` → VS Code dims/greys the span (unused/unreachable code).
+  tags: d.tags?.map((t) => tagMap[t]),
 });
 
 documents.onDidChangeContent(async (event) => {

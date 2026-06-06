@@ -189,10 +189,20 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ⬜ **B16. Redeclaration / overloading.** Current: same-scope redeclaration errors; nested shadowing
   is allowed (uniquified in codegen). Future: ad-hoc overloading? Default "no, one binding per name
   per scope" (→ `DECISIONS.md`).
-- 🟡 **B17. Diagnostics.** Started: `severity` (error/warning/info), a `@warning` test directive, the
-  empty-range warning. BUILD OUT: thread `severity` through all error variants; stable diagnostic
-  codes; a real lint pass (unused vars, unreachable code, dead branches, `step 0`); LSP quick-fixes;
-  consistent message style.
+- 🟡 **B17. Diagnostics + lint.** Started: `severity` (error/warning/info), a `@warning` test directive,
+  the empty-range warning, stable diagnostic `code`s, and the **lint pass** (`compiler/lint.ts`):
+  unused-variable (function locals + params; `_`-prefix suppresses) and unreachable-code, both tagged
+  `unnecessary` so VS Code greys them out. BUILD OUT — the lint rule backlog (keep it a few at a time):
+  - **`export`-aware top-level unused** — unused top-level bindings are flagged *now* (dead in a
+    whole-program compile). Once an explicit `export` keyword lands, *exported* top-level bindings become
+    exempt (consumer-facing surface, not dead). Lint already suppresses *all* warnings on a file that has
+    error-severity diagnostics (report the real errors first). (Ties into the modules/`export` work.)
+  - **prefer-`const`** — a `let` that is never reassigned should be `const` (info/warning + quick-fix).
+  - **unused function / unused import**; **dead/constant branch** (`if false`); **`step 0`** range loop;
+    **unreachable after a diverging `if/else`** (have the simple after-`return` case).
+  - **LSP quick-fixes** (code actions): "remove unused binding" / "prefix with `_`" / "`let`→`const`".
+    The diagnostics already carry stable `code`s to match on; the LSP has no code-action provider yet.
+  - Cross-cutting: thread `severity` through all remaining error variants; consistent message style.
 - ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
   position and emit it. Deprioritized — correctness is fine; this is a depth/perf optimization.
 - 🐛 **B-bug. `while` as the tail statement of a void function crashes binaryen's Vacuum pass.**

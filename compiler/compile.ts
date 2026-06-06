@@ -22,6 +22,7 @@ import { tokenize } from "./lexer.ts";
 import { parseProgram } from "./parser.ts";
 import { defaultScope } from "./defaultScope.ts";
 import { SymbolTable } from "./symbols.ts";
+import { lint } from "./lint.ts";
 
 // NOTE: binaryen is NOT imported statically here. A top-level `import Binaryen
 // from "binaryen"` would be evaluated whenever this module loads, dragging the
@@ -36,15 +37,25 @@ export type { Binding, BindingKind, SymbolOccurrence } from "./symbols.ts";
 export { SymbolTable } from "./symbols.ts";
 export type { Comment } from "./lexer.ts";
 
-export type VLSeverity = "error" | "warning" | "info";
+// `hint` is the lowest tier: VS Code renders it with NO squiggle and keeps it
+// out of the warning/error count. Combined with the `unnecessary` tag it greys
+// out the span (used for `_`-prefixed intentionally-unused bindings). Hints must
+// never count toward the CLI error/warning tally or fail the test harness.
+export type VLSeverity = "error" | "warning" | "info" | "hint";
 export type VLPosition = { line: number; character: number };
 export type VLRange = { start: VLPosition; end: VLPosition };
+// LSP diagnostic tags (LSP `DiagnosticTag`): `unnecessary` renders the span
+// faded/greyed out (VS Code dims unused/unreachable code rather than only
+// squiggling it); `deprecated` strikes it through. The lint pass tags
+// unused-variable / unreachable-code as `unnecessary`.
+export type VLDiagnosticTag = "unnecessary" | "deprecated";
 export type VLDiagnostic = {
   message: string;
   severity: VLSeverity;
   range: VLRange;
   code?: string | number;
   source: "vital";
+  tags?: VLDiagnosticTag[];
 };
 
 export type CompileResult = {
@@ -281,6 +292,15 @@ export const checkOnly = (source: string): CheckResult => {
   const { tokens, diagnostics, comments } = tokenize(source);
   const [ast, errors, symbols, spans] = parseProgram(tokens, defaultScope());
   for (const error of errors) diagnostics.push(diagnosticFromError(error));
+  // Static lint pass (B17): unused-variable / unreachable-code warnings, derived
+  // from the symbol table + AST the front end already produced. Suppressed when
+  // the file already has *error*-severity diagnostics: a broken file's "unused"
+  // bindings are usually a symptom of the error (the use lives in the code that
+  // failed to parse/type), so we report the real errors first rather than piling
+  // style warnings on top. A diverging parse (no statements) yields none anyway.
+  if (!diagnostics.some((d) => d.severity === "error")) {
+    for (const d of lint(ast.statements, symbols, spans)) diagnostics.push(d);
+  }
   return { ast, diagnostics, symbols, spans, comments };
 };
 
