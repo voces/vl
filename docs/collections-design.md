@@ -37,10 +37,11 @@ Recommendation in one screen:
    pair per concrete `T`: native `array.get`/`array.set`, no `anyref` boxing, no
    unbox-on-read. This matches the soundness contract (no `dynamic`, every value
    pinned to a concrete type) and the existing array performance path. (§VL.3)
-4. **Surface API.** Construct with `List<T>()` (an empty list) and
-   `List(a, b, c)` / a future list literal for seeded lists — kept *visually
-   distinct* from the fixed `[a, b, c]` array literal so the MVP's fixed arrays
-   stay fixed. `push`/`pop`/`map`/`filter` are `self`-methods (parens — they
+4. **Surface API.** Construct with `List<T>()` (empty) and `List<T>(capacity: n)`
+   (named-param, unambiguous vs a positional element); **seed via a list literal**
+   (`[0, 1, 2]`) rather than a variadic `List(...)` — VL has no variadics and no
+   overloading (§VL.4), so an element-seeding constructor can't coexist with the
+   capacity one. `push`/`pop`/`map`/`filter` are `self`-methods (parens — they
    compute, B14). `l[i]` / `l[i] = v` route through the B13 `"[]"`/`"[]="` index
    traps (assumed to land in parallel). `.length` is the O(1) uniform-access
    property (read-only, per DECISIONS B6); `.capacity` is the sibling O(1)
@@ -267,21 +268,56 @@ The guiding constraint: **don't make the fixed-array MVP ambiguous.** `[a, b, c]
 must keep meaning a fixed-length array; a list is a distinct shape with its own
 construction.
 
-- **Construction.** `List<T>()` for an empty typed list; `List(a, b, c)` for a
-  seeded list (element type inferred, monomorphized per call — the same inference
-  that pins `T` in `first<T>(xs: T[])`); `List<T>(capacity: n)` (or a
-  `reserve`) for pre-sizing. `List` is a builtin generic shape resolved by the
-  checker, lowered by name in `toWasm.ts` (the same pattern string methods use —
-  types in defaultScope, lowering in toWasm, *no typecheck special-casing of a
-  keyword*). A dedicated **list literal** (e.g. a sigil-prefixed form) is left as
-  an open question (§OQ) — `List(...)` covers v1 without inventing syntax that
-  competes with `[...]`.
+- **Construction.** `List<T>()` for an empty typed list and `List<T>(capacity: n)`
+  for a pre-sized one; **seed via a list literal** (`[0, 1, 2]`) rather than a
+  variadic constructor. `List` is a builtin generic shape resolved by the checker,
+  lowered by name in `toWasm.ts` (the same pattern string methods use — types in
+  defaultScope, lowering in toWasm, *no typecheck special-casing of a keyword*).
+
+  **The `List(0)` ambiguity the owner raised — "is `0` an element or a capacity?"**
+  VL **has named parameters** (call-site `f(name: value)`; the checker consumes the
+  named arguments first, then the positional ones), so **`List<T>(capacity: n)` is
+  unambiguous** — `capacity:` is spelled at the call site and can never be read as a
+  positional element. So the capacity constructor is safe *on its own*.
+
+  The reason we do **not** *also* offer an element-seeding `List(0, 1, 2)` is not the
+  ambiguity — it is that VL has **no variadics** (every function is fixed-arity) and
+  **no ad-hoc overloading** (one binding per name per scope — DECISIONS B16). An
+  element-seeding `List(...)` would need both: variadic arity *and* a second `List`
+  binding coexisting with the capacity constructor as an overload. Since neither
+  exists, seeded construction goes through a **list literal** (`[0, 1, 2]`) instead
+  — which is a concrete point in favor of **syntax fork (b)** (§LS.4: `[...]` *is*
+  the growable-list literal). The recommended construction surface is therefore:
+  **`List<T>()`** (empty), **`List<T>(capacity: n)`** (named), **seed via literal**.
+
+  (Clarification: `self` is a **first-position positional convention**, *not* a
+  call-site named argument. A function whose first parameter is named `self` is a
+  method — `o.f()` rewrites to `f(o)` via UFCS (B14) — so the receiver must be
+  *first* and positional; you never pass `self:` by name. Named-vs-positional and
+  the `self` receiver are orthogonal mechanisms.)
+
+  A dedicated **list literal** (sigil/`[...]`) is the §LS.4 open question — `List(...)`
+  -free construction above covers v1 without inventing syntax that competes with the
+  fixed `[...]`.
 - **Mutation methods** (compute → parens, B14 `self`-methods):
   `l.push(x)` (append, amortized O(1)), `l.pop()` (remove+return last, `T | null`
   on empty — see §VL.6), and the higher-order producers `l.map(f)` / `l.filter(f)`
   (these are the A10 "build a new array of an inferred element type" use case that
   was waiting on this subsystem). Each is a free `self`-first function
   monomorphized per receiver, reachable as `l.push(x)` via UFCS.
+- **Bulk combine — `concat` and `extend`** (both ride the bulk `array.copy`
+  primitive — see §LS.2 — so neither degrades to a scalar `push` loop):
+  - `a + b` (**concat** → a *new* `List<T>`): allocate one backing sized exactly
+    `len(a) + len(b)` once, then **two bulk `array.copy`s** — `a`'s `len(a)`
+    elements at offset 0 and `b`'s `len(b)` at offset `len(a)`. O(m + n) with **no
+    incremental-growth realloc churn**: the result is sized in a single allocation,
+    not grown one doubling at a time. (`+` dispatches through the B13 operator hook,
+    exactly like string concat.)
+  - `a.extend(b)` (**in-place** append-all): **one grow to fit** `len(a) + len(b)`
+    (a single `array.new` + `array.copy` of the existing elements if a regrow is
+    needed), **one `array.copy`** of `b`'s `len(b)` elements at offset `len(a)`,
+    then bump `a.len`. One copy of `b` regardless of its size — never a per-element
+    `push` loop.
 - **Indexing.** `l[i]` and `l[i] = v` route through the **B13 `"[]"`/`"[]="`
   index traps** (assumed landing in parallel). The `"[]"` lowering is
   `bounds-check i against len, then array.get backing`; `"[]="` is
@@ -347,7 +383,23 @@ new dispatch mechanism or fighting the fixed-array literal.
   COW value semantics for collections is a language-direction question — §OQ.)
 - Equality/hashing of lists (structural `==` over elements) — defer until the
   element-comparison story for the value-eq path is settled.
-- `capacity`-aware bulk ops beyond `reserve` (e.g. `extend`/`concat` fast paths).
+
+**Deferred operations (specified shape, not v1).** Two sub-range operations are
+designed-but-deferred — they are worth pinning now so the surface is coherent:
+- **`slice`** — a *non-mutating* sub-range **copy** into a new list. Cheap: a
+  single bulk `array.copy` of the `[start, end)` window into a freshly-sized
+  backing (the same operation already shipped for **strings** in A7). Deferred only
+  because it is additive over the v1 core.
+- **`splice`** — an *in-place* remove-range / insert, **returning the removed**
+  elements. Heavier: it needs element **shifting** to close the gap (and to open
+  room when inserting), i.e. the same O(n) shift as `insert`/`remove`, plus a
+  `slice`-style copy for the returned removed range.
+- **Naming concern (flag, don't decide).** The JS `slice` (copy) / `splice`
+  (mutate) pair is notoriously confusable — one letter apart, opposite
+  destructiveness. Prefer clearer verbs that make the copy-vs-mutate split obvious:
+  Swift's `removeSubrange` / `insert(contentsOf:)` / sub-range subscript, or Rust's
+  `drain` (remove + yield) / `split_off` (cut in two). The verb choice is part of
+  the deferred decision, not settled here.
 
 ---
 
@@ -367,10 +419,11 @@ here** — this is the plan the design commits to.
    build the `struct { backing: (ref (array mut T)); len; cap }` per element wasm
    type, reusing the existing per-element array interner for the backing.
 3. **Codegen — construction & access.** `List<T>()` → `struct.new` with empty
-   backing + `len=0,cap=0` (or a shared sentinel empty array); `List(a,b,c)` →
-   allocate backing of cap = n, fill, `len=cap=n`. `l[i]`/`l[i]=v` → the
-   `len`-bounded `array.get`/`array.set` lowering through the B13 traps.
-   `.length`/`.capacity` → `struct.get`.
+   backing + `len=0,cap=0` (or a shared sentinel empty array); `List<T>(capacity: n)`
+   → allocate backing of cap = n, `len=0`; a literal-seeded list (`[…]` under fork
+   (b), §LS.4) → allocate backing of cap = element count, fill, `len=cap=n`.
+   `l[i]`/`l[i]=v` → the `len`-bounded `array.get`/`array.set` lowering through the
+   B13 traps. `.length`/`.capacity` → `struct.get`.
 4. **Codegen — push/pop/grow.** A lazily-emitted-per-element-wasm-type helper set
    (à la `__string_eq__`): `__list_push_T__` (the `len==cap` grow-and-copy + write
    + `len++`), `__list_pop_T__` (`len--`, read, `T|null` on empty),
@@ -469,7 +522,7 @@ ordinary VL, then VL is demonstrably expressive enough to write its own collecti
 (an explicit H2 capability bar), and any user can write `RingBuffer`, `Deque`, or
 `SmallVec` the same way without compiler changes. The cost — VL `List` cannot reach
 *below* what the intrinsic floor exposes — is exactly what §LS.2 sizes, and it turns
-out to be one primitive.
+out to be a two-primitive floor.
 
 (Note this does **not** contradict §VL.3's "monomorphize per element type". A `.vl`
 generic `List<T>` is monomorphized by the *existing* A10 machinery exactly like any
@@ -490,41 +543,57 @@ what VL exposes *today*:
 | The slot count of `backing` | ✅ `.length` → `array.len` |
 | Generic over `T`, one concrete layout per element type | ✅ A10 monomorphization + per-element interned array type |
 | `self`-methods (`push`/`pop`/`map`/`filter`) and `[]`/`[]=` traps on the wrapper | ✅ B14 self-methods, B13 index traps |
-| Copy `len` live elements from old backing into a new bigger backing | ✅ expressible as a VL `for` loop over `[0, len)` (binaryen lowers to `array.copy` or leaves the loop; either is fine) |
+| Copy a run of live elements from old backing into a new bigger backing (and for concat/extend/slice/`map`/`filter` fills) | ❌ **not as a bulk op** — expressible as a scalar VL `for` loop over `[0, len)`, but that is element-at-a-time; the bulk memcpy is not VL-reachable |
 | **Allocate a `T[]` of a length known only at runtime** (`new_cap = cap * 2`) | ❌ **missing** |
 
-Everything is already there **except one primitive**: today a `T[]` can only be
-born from a **compile-time-sized literal** (`[a, b, c]` → `array.new_fixed`, whose
-length is the operand count). There is no VL-surface way to say "allocate a `T[]`
-of runtime length `n`". `List` growth fundamentally needs that — `cap * 2` is not a
-compile-time constant.
+Everything else is already there. Two primitives are missing — together they are
+the **minimal intrinsic set** a pure-VL `List` stands on:
 
-**The one missing primitive: dynamic-length array allocation.** WasmGC already has
-the instruction (`array.new <T>` — allocate length `n`, every slot initialized to a
-given value; and `array.new_default <T>` — length `n`, slots default/zeroed). The
-compiler *already emits `array.new` + `array.copy` internally* for string concat
-(`toWasm.ts`), so the backend capability exists and is proven; it is simply not
-reachable from VL source. The fix is to expose it as a **low-level intrinsic in the
-same class as `__store_i32__` / `__load_i32__`** — a `defaultScope` entry the std
-`List` calls, lowered by name in `toWasm.ts`, *not* a new language keyword.
+**(1) Dynamic-length array allocation.** Today a `T[]` can only be born from a
+**compile-time-sized literal** (`[a, b, c]` → `array.new_fixed`, whose length is the
+operand count). There is no VL-surface way to say "allocate a `T[]` of runtime
+length `n`". `List` growth fundamentally needs that — `cap * 2` is not a
+compile-time constant. WasmGC already has the instruction (`array.new <T>` —
+allocate length `n`, every slot initialized to a given value; and
+`array.new_default <T>` — length `n`, slots default/zeroed).
 
-Proposed shape (a sketch for the follow-up PR, not a committed signature):
+**(2) Bulk `array.copy`.** The grow path, `concat`, `extend`, `slice`, and the
+`map`/`filter` backing fills all need to move a *run* of elements from one array to
+another in one operation. WasmGC has the **`array.copy`** instruction for exactly
+this (a bulk, engine-level move — the array equivalent of `memcpy`). Without it
+reachable from VL, every such copy degrades to a **scalar element loop** (`for i in
+[0, n) { dst[i] = src[i] }`), which loses the memcpy: a per-element `array.get` /
+`array.set` with a re-checked bound each iteration instead of one bulk move. So
+`array.copy` is a *core* primitive, not a nice-to-have — it is what keeps grow /
+concat / slice / `map` / `filter` off the scalar path.
+
+**The backend already uses both internally.** The compiler emits `array.new` +
+`array.copy` for **string concat and slice** (`toWasm.ts`), so both capabilities
+exist and are proven — they are simply not reachable from VL source. The fix is to
+expose both as **low-level intrinsics in the same class as `__store_i32__` /
+`__load_i32__`** — `defaultScope` entries the std `List` calls, lowered by name in
+`toWasm.ts`, *not* new language keywords.
+
+Proposed shapes (a sketch for the follow-up PR, not committed signatures):
 
 ```
-// allocate a backing array of `length` slots, each set to `fill`
+// (1) allocate a backing array of `length` slots, each set to `fill`
 __array_new__<T>(length: i32, fill: T): T[]          // → array.new
-// allocate `length` zero/default-initialized slots
+// (1) allocate `length` zero/default-initialized slots
 __array_new_default__<T>(length: i32): T[]           // → array.new_default
+// (2) bulk-copy `count` elements from src[srcAt..] into dst[dstAt..]
+__array_copy__<T>(dst: T[], dstAt: i32, src: T[], srcAt: i32, count: i32): void  // → array.copy
 ```
 
-`__array_new__` is the minimum (it covers both: pass a zero/sentinel `fill`).
-`__array_new_default__` is a cheap convenience that maps to the dedicated
-default-init instruction and avoids materializing a fill value. Both are generic
-over the element type and monomorphize through the existing per-element array
-interner — i.e. they are the *runtime-length* siblings of the array literal, lowered
-to the WasmGC instruction the backend already uses internally. With this single
-addition, the entire §VL.1–VL.6 `List` is writable as a `.vl` module: the struct,
-the 2× grow (`__array_new_default__(cap * 2)` + copy + swap `backing`), `push`/`pop`,
+`__array_new__` is the minimum allocator (it covers both: pass a zero/sentinel
+`fill`); `__array_new_default__` is a cheap convenience mapping to the dedicated
+default-init instruction. `__array_copy__` is the bulk mover. All are generic over
+the element type and monomorphize through the existing per-element array interner —
+i.e. they are the *runtime-length* / *bulk* siblings of the array literal, lowered to
+the WasmGC instructions the backend already uses internally. With these two
+primitives, the entire §VL.1–VL.6 `List` is writable as a `.vl` module: the struct,
+the 2× grow (`__array_new_default__(cap * 2)` + `__array_copy__` + swap `backing`),
+`push`/`pop`, `concat`/`extend` (the two-/one-copy bulk combines of §VL.4),
 the `[]`/`[]=` traps bounded by `len`, `.length`/`.capacity`, `map`/`filter`.
 
 **Secondary perf knobs that *might* later want intrinsics — but are not required for
@@ -541,9 +610,10 @@ v1:**
   GC requires every slot well-typed), so this knob does not exist at the Wasm level
   today — noted only to record that it is *not* available to chase.
 
-**Conclusion: no compiler-intrinsic `List` is needed.** Expose dynamic-length array
-allocation as a thin intrinsic and write `List` in VL. This is strictly smaller
-than baking a privileged `List` into the compiler, and it directly advances H2/H3.
+**Conclusion: no compiler-intrinsic `List` is needed.** Expose the two-primitive
+floor — dynamic-length array allocation + bulk `array.copy` — as thin intrinsics and
+write `List` in VL. This is strictly smaller than baking a privileged `List` into the
+compiler, and it directly advances H2/H3.
 
 ### LS.3 — `print` (and friends) under the same lens
 
@@ -628,12 +698,15 @@ is expensive.
 - **Lang vs std:** write **`List<T>` as a `.vl` standard-library module**, not a
   compiler-privileged type (the Rust/C++/Swift pattern; Go is the outlier). It
   ports for free under self-hosting and proves VL can express its own collections.
-- **Primitive surface:** the *only* thing blocking a pure-VL `List` is
-  **dynamic-length array allocation**. Expose it as a thin intrinsic
-  (`__array_new__` / `__array_new_default__`, same class as `__store_i32__`),
-  lowering to the `array.new` / `array.new_default` the backend already uses
-  internally. No compiler-intrinsic `List` needed. Unchecked-index and
-  uninitialized-backing are *possible later* perf knobs, not v1 needs.
+- **Primitive surface:** blocking a pure-VL `List` is a **two-primitive floor** —
+  **dynamic-length array allocation** *and* **bulk `array.copy`**. Expose both as
+  thin intrinsics (`__array_new__` / `__array_new_default__` and `__array_copy__`,
+  same class as `__store_i32__`), lowering to the `array.new` / `array.new_default`
+  / `array.copy` the backend already uses internally for string concat/slice. Bulk
+  `array.copy` is core, not optional: without it grow/concat/slice/`map`/`filter`
+  fall back to scalar element loops and lose the memcpy. No compiler-intrinsic
+  `List` needed. Unchecked-index and uninitialized-backing are *possible later* perf
+  knobs, not v1 needs.
 - **`print`:** already thin-intrinsics underneath (`__print_T__` sinks); the
   *dispatcher* could become std VL too, but it needs no new primitive — migrate it
   **opportunistically during the H3 port**, low priority.
@@ -646,11 +719,12 @@ This refines the §"Phased implementation outline" ordering with the
 language/std/primitive lens. The first *new building block* is the primitive, not
 the type:
 
-1. **Expose the dynamic-array-allocation intrinsic** (`__array_new__` /
-   `__array_new_default__`) — a small, self-contained addition to `defaultScope`
-   (signature) + `toWasm.ts` (lower to `array.new` / `array.new_default`, reusing
-   the existing per-element array interner). This is the floor everything else
-   stands on, and it is independently testable.
+1. **Expose the two-primitive intrinsic floor** (`__array_new__` /
+   `__array_new_default__` *and* `__array_copy__`) — a small, self-contained
+   addition to `defaultScope` (signatures) + `toWasm.ts` (lower to `array.new` /
+   `array.new_default` / `array.copy`, reusing the existing per-element array
+   interner). This is the floor everything else stands on, and it is independently
+   testable.
 2. **Write `List<T>` as a `.vl` std module** over that intrinsic (the §VL.1–VL.6
    design, now expressed in VL rather than baked into codegen). This is the H2
    capability demonstration.

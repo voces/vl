@@ -116,6 +116,19 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ⬜ **B6a. Maps / non-string keys** (`Map<K,V>` — a separate hash type, not every-object-as-table; →
   `DECISIONS.md`). Index sigs `{[string]: T}` type-check but are dropped at codegen — this is their
   codegen, via B13's `"[]"`/`"[]="` traps. Deferred.
+- ⬜ **B6b. Collections building blocks & open items** (design: `docs/collections-design.md`).
+  - **Prerequisite intrinsics** — expose the two-primitive surface: dynamic-length `array.new`
+    (`__array_new__`/`__array_new_default__`) + bulk `array.copy` (`__array_copy__`), thin
+    `defaultScope` intrinsics lowering to the WasmGC instructions the backend already uses for string
+    concat/slice. The building block before `List`.
+  - **Std-over-primitives direction** — write `List`/collections (and opportunistically `print`) as
+    `.vl` std over those intrinsics, not compiler-privileged types (ties to H3 self-hosting). Open
+    dependency: VL has no module system yet (std-module loading is unresolved).
+  - **`[...]` list-vs-array syntax fork** (open decision) — (a) keep `[...]` fixed + growable via
+    `List(...)`, or (b) make `[...]` the growable `List` with a distinct fixed-array spelling.
+  - **List surface/semantics open questions** — literal syntax; reference vs COW value semantics;
+    empty-`pop` → `T|null`/trap; bounds trap vs `get → T|null`; growth 2× vs taper; `map`/`filter`
+    return type. Tracked in the design doc; decisions still open.
 - 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
   `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.
