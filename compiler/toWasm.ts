@@ -24,6 +24,10 @@ import {
 import { defaultScope } from "./defaultScope.ts";
 import { registerBuiltins } from "./wasmBuiltins.ts";
 import { toWasmType as toWasmTypeOf } from "./wasmType.ts";
+import {
+  lowerStringMethodCall,
+  type StringBuiltinContext,
+} from "./builtins/strings.ts";
 
 const raise = (err?: string | Error): never => {
   if (typeof err === "object" && err instanceof Error) throw err;
@@ -1388,6 +1392,12 @@ export const toWasm = async (ast: VLProgramNode) => {
           : call;
       }
       case "Call": {
+        // Intrinsic string methods (`s.slice`/`s.indexOf`/`s.includes`/
+        // `s.charCodeAt`) lower directly to their wasm helpers; see
+        // `compiler/builtins/strings.ts`. Returns null for any other call so we
+        // fall through to the normal closure dispatch below.
+        const stringMethod = lowerStringMethodCall(stringBuiltinCtx, node);
+        if (stringMethod !== null) return stringMethod;
         // Calling an arbitrary expression value, e.g. `o.f(args)`. The callee
         // evaluates to a closure struct; dispatch through it.
         const functionType = node.functionType;
@@ -2539,6 +2549,18 @@ export const toWasm = async (ast: VLProgramNode) => {
   // Lower an expression, then box it into the desired union if one is wanted.
   const toExpression = (node: VLProgramNode | VLStatement): number =>
     coerceUnion(toExpressionRaw(node), node);
+
+  // Context handed to the extracted string-method codegen (compiler/builtins).
+  const stringBuiltinCtx: StringBuiltinContext = {
+    m,
+    binaryen,
+    i32Type,
+    arrayType,
+    helpers: _helpers,
+    codegenType,
+    withDesiredType,
+    toExpression,
+  };
 
   // console.log(inspect(logSimplified(ast), { depth: Infinity }));
   m.setStart(toExpression(ast));

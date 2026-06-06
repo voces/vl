@@ -55,6 +55,10 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
   Property syntax (no parens) is reserved for O(1) members (`length`/`count`/`capacity`); computing
   ops (`push`/`map`/`slice`) are methods (parens). `length` is read-only; sparse collections use
   distinct `count`/`capacity`/`extent`, never an overloaded `length`. (B6)
+- **String methods follow JS semantics.** `slice(start, end)` is the half-open `[start, end)` range
+  with JS clamping (negative counts from the end, bounds clamp to `[0, len]`, `start >= end` → empty);
+  `indexOf("")` returns 0. Chosen for least-surprise over Python-style slicing; method types live in
+  defaultScope (no typecheck changes), toWasm lowers each by name. (A7)
 - **Maps are a separate hash type, not every-object-as-table.** Three representations under one
   `[]`/`.field` surface: static-string-key structs (fastest), `i32`-key arrays (native, contiguous),
   arbitrary-key maps (hashed, heap) — you pay hashing only when you use a `Map`. (B6a)
