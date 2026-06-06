@@ -157,6 +157,39 @@ const diagnosticFromError = (error: ParseErrors): VLDiagnostic => {
   }
 };
 
+// Render a thrown codegen value as a readable, single-line message. Three cases
+// must be handled robustly, all dual-runtime (no Deno/process/Deno.inspect):
+//   1. A stack overflow (`RangeError: Maximum call stack size exceeded`) from
+//      unguarded recursion — most often the A11 array-element-recursion gap.
+//      Surfaced as a clear, actionable line instead of the raw V8 text. We key
+//      off the message text (not just `RangeError`) so unrelated RangeErrors
+//      keep their own message rather than being mislabeled.
+//   2. A real `Error` — use its `.message`.
+//   3. A non-`Error` throw. Binaryen's optimizer/validator can throw an opaque
+//      internal object (e.g. `{ $B: <ptr> }`), whose `String()` is the useless
+//      `[object Object]`. Try `.message`, then `JSON.stringify` (guarded against
+//      circular refs / BigInt), falling back to `String()`.
+const STACK_OVERFLOW = /maximum call stack size exceeded|stack overflow/i;
+const codegenErrorMessage = (err: unknown): string => {
+  if (err instanceof Error) {
+    if (err instanceof RangeError && STACK_OVERFLOW.test(err.message)) {
+      return "compiler recursion limit exceeded (likely an unsupported " +
+        "recursive type — e.g. recursion through an array element)";
+    }
+    return err.message;
+  }
+  if (typeof err === "object" && err !== null) {
+    const maybe = (err as { message?: unknown }).message;
+    if (typeof maybe === "string" && maybe !== "") return maybe;
+    try {
+      return JSON.stringify(err);
+    } catch {
+      // Circular refs or BigInt make JSON.stringify throw — fall through.
+    }
+  }
+  return String(err);
+};
+
 /**
  * Full pipeline: source -> diagnostics (+ wasm when clean). Codegen only runs
  * when there are no error diagnostics, matching the LSP's behavior. A codegen
@@ -173,11 +206,14 @@ export const compile = async (source: string): Promise<CompileResult> => {
       wasm = await toWasm(ast);
     } catch (err) {
       diagnostics.push({
-        message: `Codegen error: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        message: `Codegen error: ${codegenErrorMessage(err)}`,
         severity: "error",
         source: "vital",
+        // Sentinel range: a codegen throw carries no source span, so it points
+        // at 0:0/0:0 with start == end. The CLI's pretty formatter keys off this
+        // exact shape to skip rendering a bogus source line/caret (see cli.ts). A
+        // genuine diagnostic at the very start of a file is distinguishable
+        // because its `end` is past the start.
         range: {
           start: { line: 0, character: 0 },
           end: { line: 0, character: 0 },

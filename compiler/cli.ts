@@ -5,6 +5,15 @@
 //   echo "..." | deno task run         # compile + run stdin
 //   deno task build <file.vl> [-o out.wasm] [--wat]   # emit a .wasm (+ .wat)
 //   deno task check <file.vl>          # diagnostics only; CI exit code
+//   deno task check <dir>              # recursively check every *.vl under dir
+//   deno task check                    # no path → check the cwd (like `check .`)
+//   deno task check --concise <path>   # one terse line per diagnostic (grep-safe)
+//
+// `check` prints rich, rustc/Deno-style diagnostics by default (header line,
+// the offending source line, a caret/tilde underline, and an `at file:L:C`
+// locator), ending with a `Found N errors.` summary. Pass `--concise` for the
+// legacy one-line-per-diagnostic format. Colors are emitted only when stdout is
+// a TTY and NO_COLOR is unset, and never in concise mode.
 //
 // A missing or unknown leading word falls back to `run`, so the historical
 // bare `deno task run <file>` (and the VS Code "Run Current File" command that
@@ -18,9 +27,146 @@ import { compile, runWasm, type VLDiagnostic, wasmToWat } from "./compile.ts";
 
 const SUBCOMMANDS = new Set(["run", "build", "check"]);
 
+// --- diagnostic rendering -------------------------------------------------
+
+// Concise, one-line-per-diagnostic format — the historical output. Scripts and
+// grep depend on its exact shape, so it stays byte-for-byte stable and never
+// gets colorized. `range.start` is 0-based line/character (see compile.ts);
+// printed as 1-based `L:C` to agree with editors.
 const formatDiagnostic = (d: VLDiagnostic): string => {
   const { line, character } = d.range.start;
   return `${d.severity} [${line + 1}:${character + 1}] ${d.message}`;
+};
+
+// ANSI styling, gated on a single decision made once at startup: only when
+// stdout is a TTY and NO_COLOR is unset (https://no-color.org). When disabled
+// every helper is the identity function, so call sites stay branch-free.
+type Style = (s: string) => string;
+const wrap = (code: string): Style => (s) => `\x1b[${code}m${s}\x1b[0m`;
+const shouldColor = (): boolean => {
+  if (Deno.env.get("NO_COLOR")) return false;
+  try {
+    return Deno.stdout.isTerminal();
+  } catch {
+    return false;
+  }
+};
+const makeColors = (on: boolean) => {
+  const id: Style = (s) => s;
+  if (!on) return { red: id, yellow: id, blue: id, dim: id, bold: id };
+  return {
+    red: wrap("31"),
+    yellow: wrap("33"),
+    blue: wrap("34"),
+    dim: wrap("2"),
+    bold: wrap("1"),
+  };
+};
+type Colors = ReturnType<typeof makeColors>;
+
+const severityColor = (sev: VLDiagnostic["severity"], c: Colors): Style =>
+  sev === "error" ? c.red : sev === "warning" ? c.yellow : c.blue;
+
+// Tabs are expanded to this many columns so carets line up under source that
+// indents with tabs (the source line is detabbed to match).
+const TAB_WIDTH = 4;
+const detab = (s: string): string => {
+  let out = "";
+  for (const ch of s) {
+    if (ch === "\t") out += " ".repeat(TAB_WIDTH - (out.length % TAB_WIDTH));
+    else out += ch;
+  }
+  return out;
+};
+// Width a prefix [0, n) of `raw` occupies once tabs are expanded — used to
+// place the caret/underline under the correct visual column.
+const visualWidth = (raw: string, n: number): number =>
+  detab(raw.slice(0, Math.min(n, raw.length))).length;
+
+// A location-less diagnostic carries the exact sentinel span 0:0–0:0 (start ==
+// end == 0:0) — used by codegen errors, which have no real source span (see
+// compile.ts). The match is on the EXACT sentinel: a genuine diagnostic at the
+// very start of a file still has `end` past the start, so it won't be confused
+// for one of these.
+const isLocationless = (d: VLDiagnostic): boolean => {
+  const { start, end } = d.range;
+  return start.line === 0 && start.character === 0 &&
+    end.line === 0 && end.character === 0;
+};
+
+// Pretty, rustc/Deno-style multi-line rendering for one diagnostic:
+//
+//   [ERROR]: <message>
+//     <offending source line>
+//     ^~~~
+//     at <file>:<line>:<col>
+//
+// `sourceLines` is the file split on newlines; `range.start.line` indexes it
+// (0-based). Guards against an out-of-range line (empty file / synthetic span)
+// by skipping the source/caret block and still emitting header + locator.
+//
+// A location-less diagnostic (the codegen sentinel) is rendered as just the
+// header plus an `at <file>` locator — no source line, no caret, and no
+// misleading `:1:1`, which would otherwise point at the file's first line.
+const formatPretty = (
+  d: VLDiagnostic,
+  file: string,
+  sourceLines: string[],
+  c: Colors,
+): string => {
+  const sevStyle = severityColor(d.severity, c);
+
+  if (isLocationless(d)) {
+    return [
+      `${sevStyle(c.bold(`[${d.severity.toUpperCase()}]`))}: ${d.message}`,
+      c.dim(`  at ${file}`),
+    ].join("\n");
+  }
+
+  const { line, character } = d.range.start;
+  const out: string[] = [];
+  out.push(`${sevStyle(c.bold(`[${d.severity.toUpperCase()}]`))}: ${d.message}`);
+
+  const raw = sourceLines[line];
+  if (raw !== undefined) {
+    const shown = detab(raw);
+    out.push(`  ${shown}`);
+
+    // Caret offset: visual width of the text before the start column. Span: the
+    // visual width covered by [start, end) on this line, clamped to >= 1 and to
+    // what remains of the line.
+    const startCol = visualWidth(raw, character);
+    const sameLine = d.range.end.line === line;
+    const endChar = sameLine ? d.range.end.character : raw.length;
+    const endCol = visualWidth(raw, Math.max(endChar, character + 1));
+    const remaining = Math.max(1, shown.length - startCol);
+    const span = Math.max(1, Math.min(endCol - startCol, remaining));
+    const underline = "^" + "~".repeat(Math.max(0, span - 1));
+    out.push(`  ${" ".repeat(startCol)}${sevStyle(underline)}`);
+  }
+
+  out.push(c.dim(`  at ${file}:${line + 1}:${character + 1}`));
+  return out.join("\n");
+};
+
+// One-line summary for a pretty `check` run, mirroring Deno's `Found N errors.`
+// Counts errors (always) and warnings (when present); a clean run reports the
+// number of files checked.
+const summarize = (
+  errors: number,
+  warnings: number,
+  filesChecked: number,
+  c: Colors,
+): string => {
+  if (errors === 0 && warnings === 0) {
+    const noun = filesChecked === 1 ? "file" : "files";
+    return c.dim(`Checked ${filesChecked} ${noun}, no errors.`);
+  }
+  const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const parts = [plural(errors, "error")];
+  if (warnings > 0) parts.push(plural(warnings, "warning"));
+  const text = `Found ${parts.join(", ")}.`;
+  return errors > 0 ? c.red(text) : c.yellow(text);
 };
 
 // --- run ------------------------------------------------------------------
@@ -97,20 +243,111 @@ const build = async (args: string[]): Promise<void> => {
 
 // --- check ----------------------------------------------------------------
 
+// Directories skipped when walking broadly, so `vl check .` doesn't descend
+// into build output, deps, vendored copies, or the retired ts-interpreter.
+const SKIP_DIRS = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "reference",
+]);
+
+// Recursively collect every `*.vl` file under `dir` (sorted for stable output).
+// Symlinks are not followed (Deno.readDir reports them as neither file nor dir
+// unless resolved) — a sensible default that avoids cycles.
+const collectVlFiles = async (dir: string): Promise<string[]> => {
+  const found: string[] = [];
+  const walk = async (current: string): Promise<void> => {
+    for await (const entry of Deno.readDir(current)) {
+      const path = `${current}/${entry.name}`;
+      if (entry.isDirectory) {
+        if (!SKIP_DIRS.has(entry.name)) await walk(path);
+      } else if (entry.isFile && entry.name.endsWith(".vl")) {
+        found.push(path);
+      }
+    }
+  };
+  await walk(dir);
+  found.sort();
+  return found;
+};
+
+type CheckTally = { errors: number; warnings: number };
+
+// Check one file: compile, print its diagnostics in the requested style, and
+// accumulate error/warning counts into `tally`. Concise mode reproduces the
+// historical `<file>: <severity> [L:C] <message>` line exactly (grep-safe,
+// uncolored); pretty mode renders the rustc/Deno-style block per diagnostic.
+const checkFile = async (
+  file: string,
+  concise: boolean,
+  c: Colors,
+  tally: CheckTally,
+): Promise<void> => {
+  const source = await Deno.readTextFile(file);
+  const { diagnostics } = await compile(source);
+  if (diagnostics.length === 0) return;
+
+  if (concise) {
+    for (const d of diagnostics) {
+      console.error(`${file}: ${formatDiagnostic(d)}`);
+    }
+  } else {
+    const sourceLines = source.split("\n");
+    for (const d of diagnostics) {
+      console.error(formatPretty(d, file, sourceLines, c));
+      console.error("");
+    }
+  }
+
+  for (const d of diagnostics) {
+    if (d.severity === "error") tally.errors++;
+    else if (d.severity === "warning") tally.warnings++;
+  }
+};
+
 const check = async (args: string[]): Promise<void> => {
-  const file = args.find((a) => !a.startsWith("-"));
-  if (!file) {
-    console.error("usage: deno task check <file.vl>");
+  const concise = args.includes("--concise");
+  // No color when piped, when NO_COLOR is set, or in concise mode (kept plain
+  // so scripts/grep see stable bytes).
+  const c = makeColors(!concise && shouldColor());
+
+  // No path argument → default to the current working directory (`vl check .`).
+  const target = args.find((a) => !a.startsWith("-")) ?? ".";
+
+  let info: Deno.FileInfo;
+  try {
+    info = await Deno.stat(target);
+  } catch {
+    console.error(`check: no such file or directory: ${target}`);
     Deno.exit(2);
   }
 
-  const source = await Deno.readTextFile(file);
-  const { diagnostics } = await compile(source);
-  for (const d of diagnostics) console.error(formatDiagnostic(d));
+  // Build the list of files to check: a single file, or every `*.vl` under a dir.
+  let files: string[];
+  if (info.isDirectory) {
+    files = await collectVlFiles(target);
+    if (files.length === 0) {
+      console.error(`check: no .vl files found under ${target}`);
+      Deno.exit(0);
+    }
+  } else {
+    files = [target];
+  }
 
-  // CI gate: never run the program; fail only on ERROR-severity diagnostics.
-  const hasError = diagnostics.some((d) => d.severity === "error");
-  Deno.exit(hasError ? 1 : 0);
+  // CI gate: never run the program; fail only on ERROR-severity diagnostics,
+  // aggregated across every file checked.
+  const tally: CheckTally = { errors: 0, warnings: 0 };
+  for (const file of files) {
+    await checkFile(file, concise, c, tally);
+  }
+
+  // Pretty mode ends with a Deno-style summary; concise stays output-stable.
+  if (!concise) {
+    console.error(summarize(tally.errors, tally.warnings, files.length, c));
+  }
+
+  Deno.exit(tally.errors > 0 ? 1 : 0);
 };
 
 // --- dispatch -------------------------------------------------------------

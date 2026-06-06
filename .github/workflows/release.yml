@@ -1,0 +1,78 @@
+# Release pipeline for the native `vl` binary (roadmap C5 / H-M1).
+#
+# DRAFT — committed but intentionally NOT wired to publish. It cross-compiles
+# the CLI for every supported target via `deno compile --target` and uploads
+# the binaries as workflow artifacts. Promoting these to an actual public
+# release (GitHub Release / Homebrew tap) is left as a deliberate TODO below so
+# nothing ships by accident from this branch.
+#
+# Versionless per the C5 decision (DECISIONS.md). When H5 introduces real
+# versioning, switch the trigger to `on: push: tags: ['v*']` and add the
+# release-publish + Formula/vl.rb sha256-bump steps marked TODO below.
+
+name: release
+
+on:
+  # Manual-only for now: no tag/push trigger, so this never fires unattended.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The five targets deno compile understands. The runner OS only affects
+        # build speed (deno cross-compiles), so a single ubuntu runner suffices.
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # binaryen is an npm dep embedded into the binary by `deno compile`, so we
+      # need node_modules present at compile time.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install node deps
+        run: npm ci
+
+      - name: Compile (${{ matrix.target }})
+        run: deno run -A scripts/build-binary.ts --target ${{ matrix.target }}
+
+      # Record the sha256 of each artifact — these are the values that go into
+      # Formula/vl.rb (TODO_SHA256_* placeholders) when cutting a real release.
+      - name: Checksum
+        run: |
+          cd dist
+          for f in vl-*; do shasum -a 256 "$f" | tee -a "$GITHUB_STEP_SUMMARY"; done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vl-${{ matrix.target }}
+          path: dist/vl-${{ matrix.target }}*
+          if-no-files-found: error
+
+  # TODO(release): a `publish` job, gated on a real tag, would:
+  #   1. `needs: build` and download all artifacts;
+  #   2. create a GitHub Release (softprops/action-gh-release) attaching every
+  #      `vl-<target>` binary as a release asset;
+  #   3. bump Formula/vl.rb: replace each TODO_SHA256_* with the checksum above
+  #      and the `version "rolling"` with the cut tag, then push the formula to
+  #      the tap repo (or commit it here if self-tapped).
+  # Left unimplemented on purpose — it needs a release secret/tap that does not
+  # exist yet, and the C5 decision is versionless until H5.
