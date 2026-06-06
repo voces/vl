@@ -43,6 +43,7 @@ import { errors, flow, guards, narrowedPaths, scopes } from "./state.ts";
 import { type Binding, type BindingKind, SymbolTable } from "./symbols.ts";
 import type {
   Context,
+  NodeSpans,
   ParseErrors,
   Scope,
   VLArgumentNode,
@@ -115,7 +116,7 @@ const ARITH_ASSIGN_OPS: ReadonlySet<TokenKind> = new Set<TokenKind>([
 export const parseProgram = (
   tokens: Token[],
   initialScope: Scope = {},
-): [VLProgramNode, ParseErrors[], SymbolTable] => {
+): [VLProgramNode, ParseErrors[], SymbolTable, NodeSpans] => {
   // Reset the shared pass state (mirrors the old `toAST`).
   scopes.splice(0);
   errors.splice(0);
@@ -123,8 +124,12 @@ export const parseProgram = (
   for (const k in narrowedPaths) delete narrowedPaths[k];
 
   let pos = 0;
-  /** Source span of each AST node, for diagnostics. */
-  const spans = new WeakMap<object, Context>();
+  /**
+   * Source span of each AST node. Populated by `record` as nodes are emitted and
+   * returned to callers (a public `NodeSpans`) so formatter / inlay-hint /
+   * doc-xref consumers can recover any node's source extent. Query via `spanOf`.
+   */
+  const spans: NodeSpans = new WeakMap<object, Context>();
 
   // ---- symbol table (go-to-definition / find-references, D2) ----------------
   // The binding-resolution piggybacks on the live `scopes` stack: each scope
@@ -2244,6 +2249,9 @@ export const parseProgram = (
     stop: peek().stop, // the EOF token's position
   };
   stampScope(program.scope, programSpan);
+  // Record the program node's own span too, so the root is queryable via the
+  // public `NodeSpans` like every other node.
+  record(program, programSpan);
 
-  return [program, errors, symbols];
+  return [program, errors, symbols, spans];
 };

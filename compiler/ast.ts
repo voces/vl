@@ -10,6 +10,28 @@ export type Position = { line: number; column: number };
 // never inspects it — so a plain span is all that is needed.
 export type Context = { start: Position; stop: Position };
 
+/**
+ * Public side-table mapping an AST node (by object identity) to its source span
+ * (`Context`). The parser builds this while emitting the AST and now returns it
+ * (see `parseProgram` / `compile` / `checkOnly`) so consumers — an AST-driven
+ * formatter, real inlay-hint `annotated` flags, doc-comment cross-refs — can
+ * recover the source extent of any node without re-walking tokens. A WeakMap so
+ * it never retains nodes; query it with the `spanOf` accessor exported alongside
+ * the AST. Not every node is guaranteed present (synthesized/desugared nodes may
+ * be absent), so `spanOf` returns `Context | undefined`.
+ */
+export type NodeSpans = WeakMap<object, Context>;
+
+/**
+ * Look up the source span recorded for `node` in `spans`, or `undefined` if the
+ * node carries no recorded span (e.g. a synthesized node). Thin, intentional
+ * indirection so consumers don't depend on the side-table being a WeakMap.
+ */
+export const spanOf = (
+  spans: NodeSpans,
+  node: object,
+): Context | undefined => spans.get(node);
+
 export type VLParameterNode = {
   type: "Parameter";
   name: string;
