@@ -302,6 +302,16 @@ model is what lets those files still become the *one* module H-M2 requires.
   - String utilities beyond the builtin `string` methods; later, math helpers,
     `print`/`println` dispatcher (the §LS.3 opportunistic migration of `print` out
     of codegen into a std `.vl` dispatcher over the existing `__print_T__` sinks).
+  - **`std/testing` — a `.vl` test framework** (`assert`/`expect`, `it`/`describe`).
+    More than ergonomics: it's how a *self-hosted* toolchain tests itself — the
+    `.vl` corpus (A12) becomes the oracle run **by VL**, not the TS harness, which is
+    the H3→H-M2 end-state (no Deno/TS in the loop). Needs little: closures for
+    `it`/`describe` blocks (have — B15), value comparison for assertions (have —
+    structural `==` / `valueEq`, A15), and value→string rendering for failure
+    messages (the one likely gap — a `toString`/stringify capability worth scoping
+    alongside). A minimal `assert` is expressible in `.vl` today; the full framework
+    wants modules (to be importable) + that stringify. Good early "real VL" target
+    once imports land.
 - **How it's bundled / loaded — embedded in the compiler binary.** Std `.vl` source
   is **embedded into the compiler at build time** (a generated source map the
   loader consults for `std/…` specifiers), so a user program needs no std files on
