@@ -31,11 +31,13 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ✅ **A0. Type-algebra inventory.** `Alias`, `Function`, `Object` (structural + index sigs), literal
   types, `Union`, `Nullable`, `Intersection`, `Negation`, `Unknown`/`Infer` (resolving holes),
   `Never`, `Type`, `Custom`.
-- 🟡 **A3. Intersection types** (`A & B`). Done as narrowing algebra (`intersectType`, the then-branch
-  refinement; → `docs/narrowing.md`). REMAINING: surface syntax (`A & B` annotation) + uses beyond
-  narrowing.
-- 🟡 **A4. Negation types** (`not A`). Done as narrowing algebra (`subtractType`, the else-branch).
-  REMAINING: surface syntax (`not A`); full open-world negation tracking (needs A12).
+- 🟡 **A3. Intersection types** (`A & B`). Done: narrowing algebra (`intersectType`; → `docs/narrowing.md`)
+  + **surface syntax `A & B`** (parses, binds tighter than `|`, folds through `intersectType` at parse
+  time). REMAINING: object-type structural intersection (`{x} & {y}` merge — needs `intersectType`/`meet`
+  extension; today distinct objects meet to `Never`).
+- 🟡 **A4. Negation types** (`!A`). Done: narrowing algebra (`subtractType`) + **surface syntax `!A`** and
+  the negated type-guard **`x !is T`** (Kotlin-style; mirrors `is` narrowing inverted; → `DECISIONS.md`).
+  REMAINING: full open-world negation tracking (needs A12).
 - 🟡 **A5. Flow narrowing.** Done broadly — nullness, union-member (then `A` / else `U − A`),
   post-guard guard-clauses, `&&`/`||` chains (short-circuit, multi-place, De Morgan), else-of-else-if
   chaining, literal discrimination, `?.`/`??`. See **`docs/narrowing.md`**. REMAINING: `case`/multi-
