@@ -9,6 +9,7 @@
 // (also included in `deno task test`).
 
 import { parseSymbols, stringifyType } from "../compiler/compile.ts";
+import { tokenize } from "../compiler/lexer.ts";
 import {
   classifyTokens,
   deriveInlayHints,
@@ -101,7 +102,8 @@ Deno.test("classifyTokens: output is sorted by position (required by encoding)",
 });
 
 Deno.test("semanticTokensData: round-trips a real document into valid 5-tuples", () => {
-  const data = semanticTokensData(parseSymbols("let x = 1\nlet y = x\n"));
+  const src = "let x = 1\nlet y = x\n";
+  const data = semanticTokensData(parseSymbols(src), tokenize(src).tokens, src);
   assertEquals(data.length % 5, 0, "data must be groups of five");
   // Decode and check every position is non-decreasing and lands in-bounds.
   let line = 0;
@@ -121,11 +123,19 @@ Deno.test("semanticTokensData: round-trips a real document into valid 5-tuples",
 // ---- legend sanity ----------------------------------------------------------
 
 Deno.test("SEMANTIC_TOKEN_LEGEND: stable, expected order", () => {
+  // Order is the wire contract — encoded token-type indices refer back into this
+  // array, so appending is safe but reordering would mis-colour every token.
   assertEquals(SEMANTIC_TOKEN_LEGEND.tokenTypes, [
     "variable",
     "parameter",
     "function",
     "type",
+    "keyword",
+    "string",
+    "number",
+    "boolean",
+    "operator",
+    "comment",
   ]);
   assertEquals(SEMANTIC_TOKEN_LEGEND.tokenModifiers, ["declaration"]);
 });

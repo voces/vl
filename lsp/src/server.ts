@@ -26,6 +26,7 @@ import {
   VLSeverity,
 } from "../../compiler/compile.ts";
 import type { Context } from "../../compiler/ast.ts";
+import { tokenize } from "../../compiler/lexer.ts";
 import {
   type Completion,
   type CompletionKind,
@@ -215,15 +216,19 @@ connection.languages.inlayHint.on((params): InlayHint[] => {
   }));
 });
 
-// Semantic tokens (D5): classify each identifier by its binding kind (local vs
-// parameter vs function vs type) so the client can color them distinctly — a
-// TextMate grammar can't tell these apart. The `data` array is the delta-encoded
-// form LSP mandates (see `semanticTokensData`).
+// Semantic tokens (D5): richer, semantically-accurate highlighting beyond the
+// TextMate grammar. Identifiers are classified by their resolved binding kind
+// (local vs parameter vs function vs type) via the D2 symbol table — something a
+// grammar can't tell apart — and merged with a lexical pass over the token
+// stream for literals/keywords/operators plus recovered `//` comments. The
+// `data` array is the delta-encoded form LSP mandates (see `semanticTokensData`).
 connection.languages.semanticTokens.on((params): SemanticTokens => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return { data: [] };
-  const symbols = parseSymbols(doc.getText());
-  return { data: semanticTokensData(symbols) };
+  const text = doc.getText();
+  const symbols = parseSymbols(text);
+  const { tokens } = tokenize(text);
+  return { data: semanticTokensData(symbols, tokens, text) };
 });
 
 // Map a neutral completion kind (from `typeFeatures.ts`) to the LSP enum. A VL

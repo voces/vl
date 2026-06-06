@@ -22,6 +22,7 @@ import type {
   VLType,
 } from "../../compiler/ast.ts";
 import type { BindingKind, SymbolTable } from "../../compiler/symbols.ts";
+import type { Token, TokenKind } from "../../compiler/lexer.ts";
 
 // ---- semantic tokens (D5) ---------------------------------------------------
 
@@ -29,11 +30,22 @@ import type { BindingKind, SymbolTable } from "../../compiler/symbols.ts";
 // stream refer back into these arrays, and the same legend is advertised to the
 // client in `onInitialize`. Adding entries is safe (append only); reordering
 // would silently mis-color every token.
+//
+// Most of these are the standard LSP semantic token types; `boolean` is a custom
+// addition (the spec has no boolean type, but the task wants `true`/`false`/
+// `null` literals coloured distinctly — clients fall back to a default colour for
+// types they don't recognise, so a custom name is safe).
 export const SEMANTIC_TOKEN_TYPES = [
   "variable", // a local `let`/`const`
   "parameter", // a function parameter
   "function", // a function declaration / callee
-  "type", // a `type` alias
+  "type", // a `type` alias / type-position name
+  "keyword", // control-flow / declaration keywords
+  "string", // string literal
+  "number", // numeric literal
+  "boolean", // `true` / `false` / `null` literal (custom; not in the LSP spec)
+  "operator", // operators & punctuation operators
+  "comment", // `//` line comment (incl. `///` doc comments)
 ] as const;
 
 export const SEMANTIC_TOKEN_MODIFIERS = [
@@ -45,20 +57,29 @@ export const SEMANTIC_TOKEN_LEGEND = {
   tokenModifiers: [...SEMANTIC_TOKEN_MODIFIERS],
 };
 
+/**
+ * Token-type indices, derived from {@link SEMANTIC_TOKEN_TYPES} so the names and
+ * their encoded indices can never drift apart. `classify*` helpers index in by
+ * name (`TT.keyword`) rather than a magic number.
+ */
+const TT = Object.fromEntries(
+  SEMANTIC_TOKEN_TYPES.map((name, i) => [name, i]),
+) as Record<(typeof SEMANTIC_TOKEN_TYPES)[number], number>;
+
 /** Map a binding kind to its index in {@link SEMANTIC_TOKEN_TYPES}. */
-const tokenTypeIndex: Record<string, number> = {
-  variable: 0,
-  parameter: 1,
-  function: 2,
-  type: 3,
+const bindingTokenType: Record<BindingKind, number> = {
+  variable: TT.variable,
+  parameter: TT.parameter,
+  function: TT.function,
+  type: TT.type,
 };
 
 const DECLARATION_BIT = 1 << 0; // index 0 in SEMANTIC_TOKEN_MODIFIERS
 
 /**
- * One classified identifier span, in 0-based LSP coordinates. Spans are
- * single-line (identifiers don't wrap); a defensive guard in
- * {@link encodeSemanticTokens} drops any that aren't.
+ * One classified token span, in 0-based LSP coordinates. Spans are single-line
+ * (a defensive guard in {@link classifyLexicalTokens} / the symbol-table path
+ * drops any that aren't, since the encoding below assumes one line per token).
  */
 export type ClassifiedToken = {
   line: number; // 0-based
@@ -68,16 +89,15 @@ export type ClassifiedToken = {
   tokenModifiers: number; // bitset over SEMANTIC_TOKEN_MODIFIERS
 };
 
-/** Convert a 1-based VL span start to a 0-based token, if it's classifiable. */
-const classify = (
+/** Convert a 1-based VL span start to a 0-based single-line token, or undefined. */
+const spanToken = (
   span: Context,
-  kind: string,
-  isDecl: boolean,
+  tokenType: number,
+  tokenModifiers: number,
 ): ClassifiedToken | undefined => {
-  const tokenType = tokenTypeIndex[kind];
-  if (tokenType === undefined) return undefined;
-  // Identifiers are single-line; skip anything spanning lines (shouldn't occur
-  // for a name span, but the encoding below assumes one line per token).
+  // Skip anything spanning lines — the relative encoding assumes one line per
+  // token. (Identifiers/keywords/numbers never wrap; a multi-line string is
+  // dropped rather than mis-encoded.)
   if (span.start.line !== span.stop.line) return undefined;
   const length = span.stop.column - span.start.column;
   if (length <= 0) return undefined;
@@ -86,21 +106,202 @@ const classify = (
     char: span.start.column,
     length,
     tokenType,
-    tokenModifiers: isDecl ? DECLARATION_BIT : 0,
+    tokenModifiers,
   };
 };
 
 /**
- * Classify every occurrence in `table` into a {@link ClassifiedToken}. Sorted
- * by (line, char) — the relative encoding {@link encodeSemanticTokens} requires
- * a non-decreasing position order.
+ * Classify identifier occurrences from the symbol table — the semantically
+ * accurate path. A name that resolves to a function declaration becomes a
+ * `function` token, a type-position name a `type`, etc., which a purely lexical
+ * pass (every `ID` looks the same) can't distinguish. Declaration occurrences
+ * carry the `declaration` modifier.
+ *
+ * Returned keyed by an `<line>:<char>` position string so the lexical pass can
+ * defer to these for any identifier the symbol table already resolved (and only
+ * colour the leftover `ID`s — builtins, members — itself).
+ */
+const classifySymbolTokens = (
+  table: SymbolTable,
+): Map<string, ClassifiedToken> => {
+  const byPos = new Map<string, ClassifiedToken>();
+  for (const occ of table.occurrences) {
+    const t = spanToken(
+      occ.span,
+      bindingTokenType[occ.binding.kind],
+      occ.isDecl ? DECLARATION_BIT : 0,
+    );
+    if (t) byPos.set(`${t.line}:${t.char}`, t);
+  }
+  return byPos;
+};
+
+/**
+ * The token type for a lexer {@link TokenKind}, or `undefined` for kinds we
+ * don't colour (whitespace-like structural tokens: `NEWLINE`, `EOF`, brackets,
+ * commas, dots, colons — these are handled fine by the TextMate grammar and
+ * carry no semantic weight). `ID` is intentionally absent: identifiers are
+ * resolved by the symbol-table pass; a leftover `ID` (a builtin like `i32`, a
+ * member name) gets no semantic token and falls back to the grammar.
+ */
+const lexicalTokenType = (kind: TokenKind): number | undefined => {
+  switch (kind) {
+    case "STRING":
+      return TT.string;
+    case "NUMBER":
+      return TT.number;
+    case "TRUE":
+    case "FALSE":
+    case "NULL":
+      return TT.boolean;
+    // Keywords (excluding the literal keywords handled above).
+    case "FUNCTION":
+    case "IF":
+    case "THEN":
+    case "ELSE":
+    case "ELSEIF":
+    case "WHILE":
+    case "FOR":
+    case "TO":
+    case "STEP":
+    case "IN":
+    case "CONST":
+    case "LET":
+    case "RETURN":
+    case "IS":
+    case "AWAIT":
+    case "BREAK":
+    case "CONTINUE":
+    case "FROM":
+    case "TYPE":
+      return TT.keyword;
+    // Operators (arithmetic / logical / comparison / nullish). Pure punctuation
+    // (parens, braces, brackets, comma, dot, colon) is deliberately omitted.
+    case "PLUS":
+    case "MINUS":
+    case "STAR":
+    case "DIV":
+    case "MOD":
+    case "CARET":
+    case "EQUAL":
+    case "PLUSPLUS":
+    case "MINUSMINUS":
+    case "AND":
+    case "OR":
+    case "EXCLAMATION":
+    case "QUESTION_DOT":
+    case "QUESTION_QUESTION":
+    case "EQUAL_TO":
+    case "NOT_EQUAL_TO":
+    case "GREATER_THAN":
+    case "GREATER_THAN_OR_EQUAL_TO":
+    case "LESS_THAN":
+    case "LESS_THAN_OR_EQUAL_TO":
+    case "PIPE":
+    case "AMPERSAND":
+      return TT.operator;
+    default:
+      return undefined;
+  }
+};
+
+/**
+ * Classify the lexer token stream into {@link ClassifiedToken}s for literals,
+ * keywords, and operators. Identifiers are skipped here — the symbol-table pass
+ * ({@link classifySymbolTokens}) classifies them more accurately. Comments are
+ * recovered separately ({@link commentTokens}) because the lexer drops them as
+ * trivia.
+ */
+const classifyLexicalTokens = (tokens: Token[]): ClassifiedToken[] => {
+  const out: ClassifiedToken[] = [];
+  for (const tok of tokens) {
+    const tokenType = lexicalTokenType(tok.kind);
+    if (tokenType === undefined) continue;
+    const t = spanToken(tok, tokenType, 0);
+    if (t) out.push(t);
+  }
+  return out;
+};
+
+/**
+ * Recover `//` line comments as `comment` tokens by scanning the source — the
+ * lexer drops them as trivia (and never records doc comments' spans), so they're
+ * not in the token stream. We scan line-by-line for `//` that is NOT inside a
+ * string literal, colouring from the `//` to end of line. This is a lightweight
+ * heuristic: it tracks single/double-quoted string state on each line so a `//`
+ * inside `"http://…"` isn't mistaken for a comment, but it does not handle a
+ * string that spans multiple lines (rare; a worst case mis-colours a comment-
+ * like run inside such a string, never breaks encoding).
+ */
+const commentTokens = (source: string): ClassifiedToken[] => {
+  const out: ClassifiedToken[] = [];
+  const lines = source.split("\n");
+  for (let line = 0; line < lines.length; line++) {
+    const text = lines[line];
+    let quote: string | null = null;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (quote) {
+        if (c === "\\") {
+          i++; // skip the escaped char
+        } else if (c === quote) {
+          quote = null;
+        }
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        quote = c;
+        continue;
+      }
+      if (c === "/" && text[i + 1] === "/") {
+        out.push({
+          line,
+          char: i,
+          length: text.length - i,
+          tokenType: TT.comment,
+          tokenModifiers: 0,
+        });
+        break; // rest of line is the comment
+      }
+    }
+  }
+  return out;
+};
+
+/**
+ * Classify a whole document into {@link ClassifiedToken}s, merging the
+ * semantically-accurate symbol-table pass (identifiers → variable/parameter/
+ * function/type) with the lexical pass (literals/keywords/operators) and
+ * recovered comments. Where both passes cover the same position the symbol-table
+ * classification wins (it carries the real binding kind + declaration modifier).
+ *
+ * Sorted by (line, char) — the relative encoding {@link encodeSemanticTokens}
+ * requires a non-decreasing position order.
+ */
+export const classifyDocument = (
+  table: SymbolTable,
+  tokens: Token[],
+  source: string,
+): ClassifiedToken[] => {
+  const symbolTokens = classifySymbolTokens(table);
+  const merged: ClassifiedToken[] = [...symbolTokens.values()];
+  for (const t of classifyLexicalTokens(tokens)) {
+    // A symbol-table classification at this exact position takes precedence.
+    if (!symbolTokens.has(`${t.line}:${t.char}`)) merged.push(t);
+  }
+  merged.push(...commentTokens(source));
+  merged.sort((a, b) => a.line - b.line || a.char - b.char);
+  return merged;
+};
+
+/**
+ * Classify only the symbol-table identifier occurrences (variable/parameter/
+ * function/type). Retained for the focused unit tests and as the
+ * semantically-accurate core; full-document classification is
+ * {@link classifyDocument}.
  */
 export const classifyTokens = (table: SymbolTable): ClassifiedToken[] => {
-  const tokens: ClassifiedToken[] = [];
-  for (const occ of table.occurrences) {
-    const t = classify(occ.span, occ.binding.kind, occ.isDecl);
-    if (t) tokens.push(t);
-  }
+  const tokens = [...classifySymbolTokens(table).values()];
   tokens.sort((a, b) => a.line - b.line || a.char - b.char);
   return tokens;
 };
@@ -130,9 +331,17 @@ export const encodeSemanticTokens = (tokens: ClassifiedToken[]): number[] => {
   return data;
 };
 
-/** Convenience: classify + encode a whole table in one call. */
-export const semanticTokensData = (table: SymbolTable): number[] =>
-  encodeSemanticTokens(classifyTokens(table));
+/**
+ * Convenience: classify a whole document (symbol-table identifiers + lexical
+ * literals/keywords/operators + comments) and delta-encode it into the flat LSP
+ * `data` array in one call. This is what `server.ts` returns for
+ * `textDocument/semanticTokens/full`.
+ */
+export const semanticTokensData = (
+  table: SymbolTable,
+  tokens: Token[],
+  source: string,
+): number[] => encodeSemanticTokens(classifyDocument(table, tokens, source));
 
 // ---- inlay hints (D6) -------------------------------------------------------
 
