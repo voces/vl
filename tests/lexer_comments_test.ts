@@ -4,8 +4,14 @@
 // them into `tokens[]`, so parsing is unaffected. The pre-existing `///`
 // `docComment` attachment (consumed by the LSP symbol table) is unchanged.
 
-import { assertEquals } from "jsr:@std/assert@1";
 import { type Comment, type Token, tokenize } from "../compiler/lexer.ts";
+
+// Hand-rolled assert (repo convention — no std import map; see symbols_test.ts).
+const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
+  const a = JSON.stringify(actual);
+  const e = JSON.stringify(expected);
+  if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+};
 
 const real = (tokens: Token[]): Token[] =>
   tokens.filter((t) => t.kind !== "NEWLINE" && t.kind !== "EOF");

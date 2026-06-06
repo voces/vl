@@ -4,9 +4,20 @@
 // the `spanOf(spans, node)` accessor re-exported from `./toAST.ts`. Spans use the
 // 1-based-line / 0-based-column / exclusive-stop convention (see `ast.ts`).
 
-import { assertEquals, assertExists } from "jsr:@std/assert@1";
 import { checkOnly } from "../compiler/compile.ts";
 import { spanOf } from "../compiler/toAST.ts";
+
+// Hand-rolled asserts (repo convention — no std import map; see symbols_test.ts).
+const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
+  const a = JSON.stringify(actual);
+  const e = JSON.stringify(expected);
+  if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+};
+const assertExists = <T>(v: T, msg?: string): void => {
+  if (v === null || v === undefined) {
+    throw new Error(`${msg ? msg + ": " : ""}expected a value, got ${v}`);
+  }
+};
 import type {
   Context,
   VLBinaryOperationNode,
