@@ -168,6 +168,54 @@ export const toWasm = async (ast: VLProgramNode) => {
       wt === binaryen.f32 || wt === binaryen.f64;
   };
 
+  // Whether a binding's type lowers to a WasmGC *reference* that can live in a
+  // mutable global cell — a string, a structural object/struct, a list, a map,
+  // or a function/closure. These are exactly the types `refHeapType` resolves a
+  // heap type for, so the global can be declared as the *nullable* ref form and
+  // zero-initialized with `ref.null` (the start function then `global.set`s the
+  // real initializer, like the scalar path). Reads cast the nullable cell back
+  // to the non-null value type callers expect. This is the ref counterpart of
+  // `isScalarWasm`: it is what lets a ref-typed module binding (a string-interning
+  // table, the current source string, an accumulator) be reassigned inside one
+  // function and seen by another — the bootstrap motivation (Track H).
+  const isGlobalizableRef = (type: VLType): boolean => {
+    // Nullable / union bindings carry niche / boxed reps the early-returning
+    // global read/write paths don't reproduce — keep them on the local/capture
+    // path, mirroring `isScalarWasm`.
+    const soft = softenImplicitType(type);
+    if (
+      soft.type === "Nullable" || soft.type === "Union" ||
+      soft.type === "Infer"
+    ) return false;
+    try {
+      // `refHeapType` throws for non-reference types; if it resolves, the binding
+      // is a ref we can globalize.
+      refHeapType(type);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // The wasm type of a module global's cell. A scalar rides in its plain value
+  // type; a reference rides in the *nullable* ref form so the cell can be
+  // zero-initialized (`ref.null`) before the start function writes the real
+  // value. Reads of a ref global add `ref.as_non_null` to recover the non-null
+  // type that the rest of codegen expects from `toWasmType`.
+  const globalCellType = (type: VLType): number =>
+    isScalarWasm(type)
+      ? toWasmType(type)
+      : binaryen.getTypeFromHeapType(refHeapType(type), true);
+
+  // Read a module global by name, restoring the binding's non-null value type:
+  // `global.get` yields the cell's (possibly nullable-ref) type, so a ref global
+  // is narrowed with `ref.as_non_null`. The global is always initialized by the
+  // start function before any other code runs, so the cast never traps.
+  const globalRead = (name: string, type: VLType): number => {
+    const get = m.global.get(name, globalCellType(type));
+    return isScalarWasm(type) ? get : m.ref.as_non_null(get);
+  };
+
   // Collect every identifier (`Name` node) referenced inside any function body
   // among `statements` (recursively, including nested functions). A generic
   // tree walk over plain AST objects/arrays — no per-node-type enumeration —
@@ -206,7 +254,7 @@ export const toWasm = async (ast: VLProgramNode) => {
   const ensureGlobal = (name: string, type: VLType): void => {
     if (declaredGlobals.has(name)) return;
     declaredGlobals.add(name);
-    m.addGlobal(name, toWasmType(type), true, zeroOf(type));
+    m.addGlobal(name, globalCellType(type), true, zeroOf(type));
   };
 
   const withScope = <T>(scope: Scope, fn: () => T) => {
@@ -1611,19 +1659,24 @@ export const toWasm = async (ast: VLProgramNode) => {
         ),
       );
     }
-    // A captured object is a struct ref; a null of its (nullable) ref type
-    // suffices for the discarded pass-1 body.
-    if (t.type === "Object" && t.name === undefined) {
-      return m.ref.null(
-        binaryen.getTypeFromHeapType(objectStruct(t).heapType, true),
-      );
-    }
     const wt = toWasmType(type);
     if (wt === binaryen.i64) return m.i64.const(BigInt(0));
     if (wt === binaryen.f32) return m.f32.const(0);
     if (wt === binaryen.f64) return m.f64.const(0);
     if (wt === binaryen.i32) return m.i32.const(0);
-    throw new Error("Cannot capture this value type yet");
+    // Any remaining reference type (a structural object/struct, a string or
+    // other named array, a map, a function/closure) zero-inits as a `ref.null`
+    // of its *nullable* heap type — both for the discarded capture-collection
+    // pass and as the placeholder a ref-typed module global is created with
+    // (the start function then `global.set`s the real value). `refHeapType`
+    // resolves the heap type; anything it can't is genuinely unsupported.
+    try {
+      return m.ref.null(
+        binaryen.getTypeFromHeapType(refHeapType(t), true),
+      );
+    } catch {
+      throw new Error("Cannot capture this value type yet");
+    }
   };
 
   const getResolvedFunctionName = (name: string) => {
@@ -1970,15 +2023,18 @@ export const toWasm = async (ast: VLProgramNode) => {
     // );
     switch (node.type) {
       case "Program": {
-        // A scalar top-level binding becomes a wasm global (shared, mutable),
-        // not a `__program__` local — so functions read/write it through
-        // `global.get`/`global.set` on the one shared cell. Reference-typed
-        // bindings stay locals (the capture path handles them; see
-        // `moduleGlobals`). Register the globals up front so functions compiled
-        // while lowering the body resolve these names to the global.
+        // A top-level binding referenced from inside a function becomes a wasm
+        // global (shared, mutable), not a `__program__` local — so functions
+        // read/write it through `global.get`/`global.set` on the one shared
+        // cell. Scalars ride in their value type; reference types (strings,
+        // structs, lists, maps, closures) ride in the *nullable* ref form and
+        // are read back with `ref.as_non_null` (see `globalCellType` /
+        // `globalRead`), so reassigning a ref binding inside one function is
+        // visible to another. Register the globals up front so functions
+        // compiled while lowering the body resolve these names to the global.
         const topLevel = Object.entries(node.scope)
           .filter(([k, v]) => !ignoredKeys.has(k) && v.type !== "Function");
-        // Globalize only the top-level scalars actually referenced from inside a
+        // Globalize only the top-level bindings actually referenced from inside a
         // function body. A binding used only at module scope can stay a
         // `__program__` local — keeping codegen unchanged for the common case and
         // sidestepping name clashes (e.g. a top-level `for i`/`let i` reusing a
@@ -1986,7 +2042,7 @@ export const toWasm = async (ast: VLProgramNode) => {
         // inside any function are collected by walking the function bodies.
         const usedInFunctions = collectFunctionBodyNames(node.statements);
         for (const [k, v] of topLevel) {
-          if (usedInFunctions.has(k) && isScalarWasm(v)) {
+          if (usedInFunctions.has(k) && (isScalarWasm(v) || isGlobalizableRef(v))) {
             moduleGlobals.set(k, v);
             ensureGlobal(k, v);
           }
@@ -2377,7 +2433,7 @@ export const toWasm = async (ast: VLProgramNode) => {
         // whether referenced at module scope or from inside a function — so a
         // function always sees the current value, not a stale captured copy.
         if (isModuleGlobal(node.name)) {
-          return m.global.get(node.name, toWasmType(moduleGlobals.get(node.name)!));
+          return globalRead(node.name, moduleGlobals.get(node.name)!);
         }
         const found = lookupName(node.name);
         if (found?.capture) {
@@ -2881,16 +2937,19 @@ export const toWasm = async (ast: VLProgramNode) => {
           // visible to the caller and to every other function.
           if (isModuleGlobal(node.left.name)) {
             const type = moduleGlobals.get(node.left.name)!;
-            const wasmType = toWasmType(type);
             const set = m.global.set(
               node.left.name,
               withDesiredType(type, () => toExpression(node.right)),
             );
+            // In value position read the cell back (`global.set` yields nothing).
+            // A ref global reads through `globalRead`'s `ref.as_non_null`, so the
+            // expression's type stays the non-null value type, not the cell's
+            // nullable ref.
             return desiredType
               ? m.block(
                 null,
-                [set, m.global.get(node.left.name, wasmType)],
-                wasmType,
+                [set, globalRead(node.left.name, type)],
+                toWasmType(type),
               )
               : set;
           }
