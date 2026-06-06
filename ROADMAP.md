@@ -219,7 +219,11 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 D1/D2.*
 
 - ✅ **D0. Diagnostics on change.**
-- ⬜ **D1. Hover types** (`stringifyType` exists; map a cursor to a symbol/expression via the new spans).
+- ✅ **D1. Hover types.** `onHover` resolves the cursor: bindings via the D2 symbol table, **and
+  `receiver.member`** (object fields, array/list/string members) by locating the member node via public
+  spans, typing the receiver (`typeFromExpression`), and looking up the member (`listMemberType` / field
+  / string member); rendered via `stringifyType`. REMAINING: flow-narrowed receiver types; Map/Set members
+  (when B6a lands).
 - ✅ **D2. Go-to-definition / find-references.** Parser populates a symbol/binding table
   (`compiler/symbols.ts`) during its scope walk; the LSP queries it by cursor (`textDocument/definition`
   + `textDocument/references`). Locals, params, function decls, type aliases; single-document. → `DECISIONS.md`.
@@ -227,7 +231,8 @@ D1/D2.*
 - ⬜ **D4. Formatter** (+ `vl fmt`).
 - ✅ **D5. Semantic tokens.** `textDocument/semanticTokens/full` — hybrid classifier: identifiers via the
   D2 symbol table (variable/parameter/function/type + `declaration` modifier), literals/keywords/operators
-  via the lexer token stream, comments by source scan. (Full only; `range`/`delta` not yet.)
+  via the lexer token stream, comments by source scan, **and `receiver.member` names** (→ `property` /
+  `method`, typed via the same member resolution as D1). (Full only; `range`/`delta` not yet.)
 - ✅ **D6. Inlay hints** for inferred types — *the* feature for a "types are hidden" language. Inline
   `: <type>` at unannotated `let`/`const`/params and omitted returns; annotated positions and unresolved
   holes are suppressed. (Annotation detection is currently source-text heuristic in `lsp/`; a future
