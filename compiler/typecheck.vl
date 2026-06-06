@@ -1,0 +1,835 @@
+// A type-checker for a meaningful subset of VL, written in VL
+// (Track H / H3 self-hosting — the compiler stage after the lexer and parser).
+//
+// Side-by-side with `compiler/typecheck.ts`, whose SHAPE it follows (a type
+// algebra, a scope chain, inference from initializers, structural assignability,
+// a diagnostics channel) but reimplemented idiomatically for VL — it is NOT a
+// transliteration. VL has no module system yet, so the TS driver
+// (`tests/selfhost_typecheck_test.ts`) concatenates `compiler/ast.vl`,
+// `compiler/parser.vl`, this file, then a `.vl` harness before compiling, so the
+// AST types/constructors, the global parser state `P`, the parse entry points,
+// and `i32ToStr` are already in scope. The checker consumes the REAL parser's
+// node arena (`P.nodes`): it lexes nothing and parses nothing itself, it walks
+// the union AST the parser built.
+//
+// ── Finding 1 — the type algebra is a TYPE ARENA ─────────────────────────────
+// VL's `compiler/typecheck.ts` represents types as a RECURSIVE union `VLType`
+// whose members nest more `VLType`s (an `Object` property's type is a `VLType`, a
+// `Function`'s return is a `VLType`). That encoding is NOT expressible in VL: a
+// `type` union alias cannot self- or forward-reference its own members (the same
+// limitation that forced the AST to use arena indices for child nodes — see
+// `ast.vl`). So types live in their OWN flat arena `T.tys: Ty[]` and every place
+// a type would nest another type holds an `i32` INDEX into that arena instead:
+//   - `TyObj.objFieldTypes : i32[]`  (a field's type is a type-arena index)
+//   - `TyFunc.fnParamTypes : i32[]`, `TyFunc.fnRet : i32`
+//   - `TyUnion.uMembers : i32[]`, `TyNullable.nInner : i32`
+// This is the same workaround the AST node arena uses, applied to the type
+// algebra — the predicted gap, now confirmed (PR gap inventory #1).
+//
+// ── Finding 2 — only ONE function may `is`-narrow the Node union ─────────────
+// The natural shape — a `checkExpr` and a `checkStmt` that each `is`-narrow the
+// `Node` union and call each other (or per-variant helpers `checkBinary(n:
+// BinExpr)` that take a narrowed value and recurse back) — MISCOMPILES. Two
+// distinct functions that `is`-narrow the SAME union and are (mutually or self)
+// recursive through it via direct calls between them produce a WasmGC codegen
+// error ("Object has no field …" / "Cannot read properties of undefined"). The
+// trigger is sharpest when a narrowed multi-field variant carrying an unaccessed
+// array field is read. So ALL `Node` discrimination is funnelled into the single
+// recursive `checkNode` function below, with every per-variant body INLINED
+// (including the nested `TypeRef`/`Param`/`Block` narrowing) — no helper ever
+// receives or re-narrows a `Node`. The TYPE-union (`Ty`) helpers (`tyToStr`,
+// `assignable`, …) stay separate: they narrow a DIFFERENT union and so don't
+// collide. (PR gap inventory #2 — this generalizes the parser spike's
+// mutual-recursion findings; it forces an awkward mega-function on any
+// visitor-style pass.)
+//
+// All checker state lives in the global `T` (a `Checker` struct), reached the way
+// the parser reaches `P` (a struct-typed value passed into a mutually-recursive
+// group still miscompiles, so the recursive functions read/mutate `T` directly).
+
+// ── Type-arena variants ──────────────────────────────────────────────────────
+// One struct per type KIND, prefixed field names so `is` discriminates the union
+// (the AST's convention). A nested type is always an `i32` index into `T.tys`.
+
+// A primitive: `primName` is one of "i32" | "f64" | "bool" | "string" | "void".
+type TyPrim = { primName: string }
+// The error/unknown type — produced on a type failure so checking continues
+// without cascading (akin to TS `Never`/`Unknown`); assignable to/from anything.
+type TyErr = { errKind: string }
+// A structural object: parallel arrays of field names and their type-arena
+// indices. (Constructed by the harness to seed object-typed bindings; the parser
+// subset has no object-type literal syntax yet, so it is not built from source.)
+type TyObj = { objFieldNames: string[], objFieldTypes: i32[] }
+// A function: parameter type indices and a return type index.
+type TyFunc = { fnParamTypes: i32[], fnRet: i32 }
+// A union `A | B | …`: member type-arena indices.
+type TyUnion = { uMembers: i32[] }
+// A nullable `T?` / `T | null`: the inner type-arena index.
+type TyNullable = { nInner: i32 }
+
+// The unified type. Declared after its members (a union alias can't forward-
+// reference). Discriminated with `is`, exactly like the AST `Node`.
+type Ty = TyPrim |
+  TyErr |
+  TyObj |
+  TyFunc |
+  TyUnion |
+  TyNullable
+
+// A type diagnostic: a message plus the AST node index it was raised at. VL has
+// no exceptions, so errors are accumulated on `T.diags`, not thrown.
+type TDiag = { tmsg: string, tat: i32 }
+
+// ── Checker state (one struct, held in the global `T`) ───────────────────────
+// `tys`     — the type arena (every type is an index into it).
+// `scopes`  — the scope chain: an array of `name → type-index` maps. Index 0 is
+//             the global scope; entering a block/function pushes a fresh map,
+//             leaving pops it. Shadowing is innermost-wins lookup.
+// `diags`   — accumulated diagnostics.
+// `curRet`  — the type-arena index of the enclosing function's return type while
+//             checking its body (`-1` outside any function), so `return e` can be
+//             checked against it.
+type Checker = {
+  tys: Ty[],
+  scopes: {[string]: i32}[],
+  diags: TDiag[],
+  curRet: i32,
+}
+
+// The single checker instance. The harness calls `initChecker()` then the entry
+// point `checkProgram(root)` and reads `T.diags`.
+let T: Checker = { tys: [], scopes: [], diags: [], curRet: -1 }
+
+// Well-known primitive type-arena indices, pinned by `initChecker` so the hot
+// primitives are interned once (not re-pushed per use). `-1` until initialized.
+let TY_I32: i32 = -1
+let TY_F64: i32 = -1
+let TY_BOOL: i32 = -1
+let TY_STR: i32 = -1
+let TY_VOID: i32 = -1
+let TY_ERR: i32 = -1
+
+// ── type-arena constructors ──────────────────────────────────────────────────
+// Each appends a variant to `T.tys` and returns its index. (The same shape as the
+// AST's `mk*` constructors, for the parallel arena.)
+
+function addTy(t: Ty): i32 {
+  T.tys.push(t)
+  T.tys.length - 1
+}
+
+function mkPrim(name: string): i32 {
+  let t: Ty = { primName: name }
+  addTy(t)
+}
+
+function mkErrTy(): i32 {
+  let t: Ty = { errKind: "error" }
+  addTy(t)
+}
+
+function mkObjTy(names: string[], typeIxs: i32[]): i32 {
+  let t: Ty = { objFieldNames: names, objFieldTypes: typeIxs }
+  addTy(t)
+}
+
+function mkFuncTy(params: i32[], ret: i32): i32 {
+  let t: Ty = { fnParamTypes: params, fnRet: ret }
+  addTy(t)
+}
+
+function mkUnionTy(members: i32[]): i32 {
+  let t: Ty = { uMembers: members }
+  addTy(t)
+}
+
+function mkNullableTy(inner: i32): i32 {
+  let t: Ty = { nInner: inner }
+  addTy(t)
+}
+
+// Intern the well-known primitives and the global scope. Call once before
+// checking.
+function initChecker(): i32 {
+  T.tys = []
+  T.scopes = []
+  T.diags = []
+  T.curRet = -1
+  TY_I32 = mkPrim("i32")
+  TY_F64 = mkPrim("f64")
+  TY_BOOL = mkPrim("bool")
+  TY_STR = mkPrim("string")
+  TY_VOID = mkPrim("void")
+  TY_ERR = mkErrTy()
+  T.scopes.push(Map())
+  0
+}
+
+// ── scope chain ──────────────────────────────────────────────────────────────
+
+// Enter a new lexical scope (push a fresh name→type map).
+function pushScope(): i32 {
+  T.scopes.push(Map())
+  0
+}
+
+// Leave the innermost scope. GAP: `arr.pop()` in statement position on a
+// STRUCT-FIELD array leaves its return value undropped and fails wasm validation,
+// so the popped scope is captured in a local (`_dropped`) first (PR #4).
+function popScope(): i32 {
+  let _dropped = T.scopes.pop()
+  0
+}
+
+// Bind `name` to type-arena index `ty` in the innermost scope.
+function declare(name: string, ty: i32): i32 {
+  let top = T.scopes.length - 1
+  T.scopes[top][name] = ty
+  0
+}
+
+// Look `name` up through the scope chain, innermost first. Returns its type-arena
+// index, or `-1` if undeclared (innermost-wins, so shadowing works).
+function lookup(name: string): i32 {
+  let i = T.scopes.length - 1
+  while i >= 0 {
+    if T.scopes[i].has(name) {
+      return T.scopes[i][name] ?? -1
+    }
+    i = i - 1
+  }
+  -1
+}
+
+// Raise a diagnostic at AST node `at`.
+function tErr(msg: string, at: i32): i32 {
+  T.diags.push({ tmsg: msg, tat: at })
+  0
+}
+
+// ── small numeric / string helpers (no union narrowing) ──────────────────────
+
+// Is type-arena index `ix` a numeric primitive (i32 or f64)?
+function isNumeric(ix: i32): boolean {
+  if ix < 0 {
+    return false
+  }
+  let t = T.tys[ix]
+  if t is TyErr {
+    return true
+  }
+  if t is TyPrim {
+    return t.primName == "i32" || t.primName == "f64"
+  }
+  false
+}
+
+// Do two numeric type indices denote the SAME numeric type?
+function sameNumeric(a: i32, b: i32): boolean {
+  let ta = T.tys[a]
+  let tb = T.tys[b]
+  if ta is TyErr {
+    return true
+  }
+  if tb is TyErr {
+    return true
+  }
+  if ta is TyPrim {
+    if tb is TyPrim {
+      return ta.primName == tb.primName
+    }
+  }
+  false
+}
+
+// Does `s` contain a "." (so a number literal is a float)? Indexing a string
+// yields the i32 char CODE, so the comparison is against the char literal `'.'`.
+function hasDot(s: string): boolean {
+  let i = 0
+  while i < s.length {
+    if s[i] == '.' {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Map a written type NAME to its type-arena index (a primitive, or TY_ERR for an
+// unknown name). Takes the bare NAME — NOT a `Node` index — so it never narrows
+// the `Node` union (see Finding 2). The single caller (`checkNode`) extracts the
+// `TypeRef`'s name inline before calling this.
+function nameToTy(name: string): i32 {
+  if name == "i32" {
+    return TY_I32
+  }
+  if name == "f64" {
+    return TY_F64
+  }
+  if name == "bool" || name == "boolean" {
+    return TY_BOOL
+  }
+  if name == "string" {
+    return TY_STR
+  }
+  if name == "void" {
+    return TY_VOID
+  }
+  -1
+}
+
+// ── type → string (for diagnostics) ──────────────────────────────────────────
+// Renders a type-arena index as a readable type name. Recurses through the arena
+// for object/function/union/nullable. Narrows the `Ty` union only — never `Node`.
+function tyToStr(ix: i32): string {
+  if ix < 0 {
+    return "<none>"
+  }
+  let t = T.tys[ix]
+  if t is TyPrim {
+    return t.primName
+  } else if t is TyErr {
+    return "<error>"
+  } else if t is TyObj {
+    // GAP: `.length`/index chained directly on an array field of an `is`-narrowed
+    // value miscompiles, so the array fields are bound to locals first (PR #3).
+    let names = t.objFieldNames
+    let ftys = t.objFieldTypes
+    let s = "{"
+    let i = 0
+    while i < names.length {
+      if i > 0 {
+        s = s + ", "
+      }
+      s = s + names[i] + ": " + tyToStr(ftys[i])
+      i = i + 1
+    }
+    return s + "}"
+  } else if t is TyFunc {
+    let ptys = t.fnParamTypes
+    let s = "("
+    let i = 0
+    while i < ptys.length {
+      if i > 0 {
+        s = s + ", "
+      }
+      s = s + tyToStr(ptys[i])
+      i = i + 1
+    }
+    return s + ") -> " + tyToStr(t.fnRet)
+  } else if t is TyUnion {
+    let members = t.uMembers
+    let s = ""
+    let i = 0
+    while i < members.length {
+      if i > 0 {
+        s = s + " | "
+      }
+      s = s + tyToStr(members[i])
+      i = i + 1
+    }
+    return s
+  } else if t is TyNullable {
+    return tyToStr(t.nInner) + "?"
+  }
+  "<?>"
+}
+
+// The type-arena index of object `o`'s field `name`, or `-1` if absent. Takes a
+// concrete `TyObj` (already narrowed by the caller) — `Ty`-union only.
+function objFieldType(o: TyObj, name: string): i32 {
+  let names = o.objFieldNames
+  let ftys = o.objFieldTypes
+  let i = 0
+  while i < names.length {
+    if names[i] == name {
+      return ftys[i]
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// ── structural assignability: is `src` assignable to `dst`? ──────────────────
+// Both are type-arena indices. The error type is assignable in both directions
+// (so one failure doesn't cascade). Primitives match by name. An object is
+// assignable to another when it has (at least) every target field, each field
+// assignable (width + depth subtyping — the structural rule). A function matches
+// on arity then parameter/return assignability (parameters contravariant). A
+// value is assignable to a nullable when it is assignable to the inner type (or
+// is itself nullable). A union source is assignable when EVERY member is; a union
+// target accepts a source assignable to ANY member. Narrows `Ty` only.
+function assignable(src: i32, dst: i32): boolean {
+  if src < 0 || dst < 0 {
+    return true
+  }
+  if src == dst {
+    return true
+  }
+  let s = T.tys[src]
+  let d = T.tys[dst]
+  if s is TyErr {
+    return true
+  }
+  if d is TyErr {
+    return true
+  }
+  // Nullable target: accepts the inner, or another nullable's inner.
+  if d is TyNullable {
+    if s is TyNullable {
+      return assignable(s.nInner, d.nInner)
+    }
+    return assignable(src, d.nInner)
+  }
+  // A nullable source is not assignable to a non-nullable target.
+  if s is TyNullable {
+    return false
+  }
+  // Union source: every member must be assignable to the target.
+  if s is TyUnion {
+    let members = s.uMembers
+    let i = 0
+    let ok = true
+    while i < members.length {
+      if !assignable(members[i], dst) {
+        ok = false
+      }
+      i = i + 1
+    }
+    return ok
+  }
+  // Union target: the source must be assignable to some member.
+  if d is TyUnion {
+    let members = d.uMembers
+    let i = 0
+    let ok = false
+    while i < members.length {
+      if assignable(src, members[i]) {
+        ok = true
+      }
+      i = i + 1
+    }
+    return ok
+  }
+  if s is TyPrim {
+    if d is TyPrim {
+      return s.primName == d.primName
+    }
+    return false
+  }
+  if s is TyObj {
+    if d is TyObj {
+      let dnames = d.objFieldNames
+      let dtys = d.objFieldTypes
+      let i = 0
+      let ok = true
+      while i < dnames.length {
+        let srcIx = objFieldType(s, dnames[i])
+        if srcIx < 0 {
+          ok = false
+        } else if !assignable(srcIx, dtys[i]) {
+          ok = false
+        }
+        i = i + 1
+      }
+      return ok
+    }
+    return false
+  }
+  if s is TyFunc {
+    if d is TyFunc {
+      let sp = s.fnParamTypes
+      let dp = d.fnParamTypes
+      if sp.length != dp.length {
+        return false
+      }
+      let i = 0
+      let ok = assignable(s.fnRet, d.fnRet)
+      while i < sp.length {
+        if !assignable(dp[i], sp[i]) {
+          ok = false
+        }
+        i = i + 1
+      }
+      return ok
+    }
+    return false
+  }
+  false
+}
+
+// ── the single Node visitor (the ONLY function that `is`-narrows `Node`) ──────
+// `checkNode` dispatches EVERY node kind — expressions AND statements — and
+// returns the node's type-arena index (statements yield `TY_VOID`). Every
+// per-variant body is INLINED here, including the nested `TypeRef`/`Param`/`Block`
+// narrowing, because no other function may narrow `Node` (Finding 2). It is the
+// direct analogue of the parser_harness's single `walk`. On a type error it
+// raises a diagnostic and returns `TY_ERR` so checking continues.
+function checkNode(ix: i32): i32 {
+  if ix < 0 {
+    return TY_ERR
+  }
+  let n = P.nodes[ix]
+
+  // ── literals & identifiers ────────────────────────────────────────────────
+  if n is NumLit {
+    // A literal with a "." is f64, else i32 (a deliberately simple rule for the
+    // subset — VL's real checker tracks literal types and softens; see PR note).
+    if hasDot(n.numText) {
+      return TY_F64
+    }
+    return TY_I32
+  } else if n is StrLit {
+    return TY_STR
+  } else if n is CharLit {
+    return TY_STR
+  } else if n is BoolLit {
+    return TY_BOOL
+  } else if n is Ident {
+    let ty = lookup(n.identName)
+    if ty < 0 {
+      tErr("undeclared identifier '" + n.identName + "'", ix)
+      return TY_ERR
+    }
+    return ty
+  } else if n is Paren {
+    return checkNode(n.parInner)
+
+  // ── unary ─────────────────────────────────────────────────────────────────
+  } else if n is Unary {
+    let arg = checkNode(n.unArg)
+    if n.unOp == "!" {
+      if !assignable(arg, TY_BOOL) {
+        tErr("operator '!' expects bool, got " + tyToStr(arg), ix)
+      }
+      return TY_BOOL
+    }
+    // "-"
+    if !isNumeric(arg) {
+      tErr("unary '-' expects a numeric type, got " + tyToStr(arg), ix)
+      return TY_ERR
+    }
+    return arg
+
+  // ── binary ────────────────────────────────────────────────────────────────
+  } else if n is BinExpr {
+    let op = n.binOp
+    let lt = checkNode(n.binLeft)
+    let rt = checkNode(n.binRight)
+    // Assignment: RHS must be assignable to the LHS's (already-bound) type.
+    if op == "=" {
+      if !assignable(rt, lt) {
+        tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(lt), ix)
+      }
+      return lt
+    }
+    // Logical connectives: both sides bool, result bool.
+    if op == "&&" || op == "||" {
+      if !assignable(lt, TY_BOOL) || !assignable(rt, TY_BOOL) {
+        tErr("operator '" + op + "' expects bool operands", ix)
+      }
+      return TY_BOOL
+    }
+    // Equality: result bool; requires mutual compatibility.
+    if op == "==" || op == "!=" {
+      if !assignable(lt, rt) && !assignable(rt, lt) {
+        tErr("cannot compare " + tyToStr(lt) + " with " + tyToStr(rt), ix)
+      }
+      return TY_BOOL
+    }
+    // Ordering comparison: result bool; requires matching numeric types.
+    if op == "<" || op == ">" || op == "<=" || op == ">=" {
+      if !isNumeric(lt) || !isNumeric(rt) {
+        tErr("comparison expects numeric operands, got " +
+          tyToStr(lt) + " and " + tyToStr(rt), ix)
+      } else if !sameNumeric(lt, rt) {
+        tErr("comparison mixes " + tyToStr(lt) + " and " + tyToStr(rt), ix)
+      }
+      return TY_BOOL
+    }
+    // `+` also concatenates strings.
+    if op == "+" {
+      if assignable(lt, TY_STR) && assignable(rt, TY_STR) {
+        return TY_STR
+      }
+    }
+    // Remaining arithmetic: numeric-only, both the SAME numeric type (no implicit
+    // i32 ↔ f64).
+    if !isNumeric(lt) || !isNumeric(rt) {
+      tErr("operator '" + op + "' expects numeric operands, got " +
+        tyToStr(lt) + " and " + tyToStr(rt), ix)
+      return TY_ERR
+    }
+    if !sameNumeric(lt, rt) {
+      tErr("operator '" + op + "' mixes " + tyToStr(lt) + " and " +
+        tyToStr(rt), ix)
+      return TY_ERR
+    }
+    return lt
+
+  // ── call ──────────────────────────────────────────────────────────────────
+  } else if n is Call {
+    let fnTy = checkNode(n.callFn)
+    let args = n.callArgs
+    let ft = T.tys[fnTy]
+    if ft is TyFunc {
+      let params = ft.fnParamTypes
+      if args.length != params.length {
+        tErr("wrong number of arguments: expected " +
+          i32ToStr(params.length) + ", got " + i32ToStr(args.length), ix)
+        return ft.fnRet
+      }
+      let i = 0
+      while i < args.length {
+        let at = checkNode(args[i])
+        if !assignable(at, params[i]) {
+          tErr("argument " + i32ToStr(i + 1) + ": expected " +
+            tyToStr(params[i]) + ", got " + tyToStr(at), ix)
+        }
+        i = i + 1
+      }
+      return ft.fnRet
+    }
+    if ft is TyErr {
+      return TY_ERR
+    }
+    tErr("called value is not a function (" + tyToStr(fnTy) + ")", ix)
+    return TY_ERR
+
+  // ── member access ───────────────────────────────────────────────────────────
+  } else if n is Member {
+    let objTy = checkNode(n.memObj)
+    let ot = T.tys[objTy]
+    if ot is TyObj {
+      let ft = objFieldType(ot, n.memProp)
+      if ft < 0 {
+        tErr("no field '" + n.memProp + "' on " + tyToStr(objTy), ix)
+        return TY_ERR
+      }
+      return ft
+    }
+    if ot is TyErr {
+      return TY_ERR
+    }
+    tErr("member access '." + n.memProp + "' on non-object " +
+      tyToStr(objTy), ix)
+    return TY_ERR
+
+  } else if n is ErrExpr {
+    return TY_ERR
+
+  // ── let / const ─────────────────────────────────────────────────────────────
+  } else if n is LetDecl {
+    // Resolve the annotation (if any) by reading the TypeRef child INLINE.
+    let annot = -1
+    if n.letType >= 0 {
+      let tn = P.nodes[n.letType]
+      if tn is TypeRef {
+        annot = nameToTy(tn.tyName)
+        if annot < 0 {
+          tErr("unknown type '" + tn.tyName + "'", n.letType)
+          annot = TY_ERR
+        }
+      }
+    }
+    let initTy = -1
+    if n.letInit >= 0 {
+      initTy = checkNode(n.letInit)
+    }
+    let bound = TY_ERR
+    if annot >= 0 {
+      bound = annot
+      if initTy >= 0 {
+        if !assignable(initTy, annot) {
+          tErr("cannot assign " + tyToStr(initTy) + " to '" + n.letName +
+            "' of type " + tyToStr(annot), ix)
+        }
+      }
+    } else if initTy >= 0 {
+      bound = initTy
+    } else {
+      tErr("'" + n.letName + "' needs a type annotation or initializer", ix)
+    }
+    declare(n.letName, bound)
+    return TY_VOID
+
+  // ── function declaration ─────────────────────────────────────────────────────
+  } else if n is FuncDecl {
+    // Resolve parameter types (reading each Param + its TypeRef child INLINE).
+    let params = n.fnParams
+    let paramTys: i32[] = []
+    let pi = 0
+    while pi < params.length {
+      let pNode = P.nodes[params[pi]]
+      let pt = TY_ERR
+      if pNode is Param {
+        if pNode.parType >= 0 {
+          let ptn = P.nodes[pNode.parType]
+          if ptn is TypeRef {
+            pt = nameToTy(ptn.tyName)
+            if pt < 0 {
+              tErr("unknown type '" + ptn.tyName + "'", pNode.parType)
+              pt = TY_ERR
+            }
+          }
+        } else {
+          tErr("parameter needs a type annotation", params[pi])
+        }
+      }
+      paramTys.push(pt)
+      pi = pi + 1
+    }
+    // Resolve the return-type annotation (INLINE).
+    let ret = TY_VOID
+    if n.fnRet >= 0 {
+      let rtn = P.nodes[n.fnRet]
+      if rtn is TypeRef {
+        ret = nameToTy(rtn.tyName)
+        if ret < 0 {
+          tErr("unknown type '" + rtn.tyName + "'", n.fnRet)
+          ret = TY_ERR
+        }
+      }
+    }
+    // `f` is hoisted in the outer scope (checkProgram pre-pass), but re-declaring
+    // it here covers nested function decls and is an idempotent rebind otherwise.
+    declare(n.fnName, mkFuncTy(paramTys, ret))
+    // Check the body in a fresh scope sharing the parameters.
+    pushScope()
+    let savedRet = T.curRet
+    T.curRet = ret
+    let dj = 0
+    while dj < params.length {
+      let pNode2 = P.nodes[params[dj]]
+      if pNode2 is Param {
+        declare(pNode2.parName, paramTys[dj])
+      }
+      dj = dj + 1
+    }
+    let body = P.nodes[n.fnBody]
+    if body is Block {
+      let stmts = body.blkStmts
+      let s = 0
+      while s < stmts.length {
+        checkNode(stmts[s])
+        s = s + 1
+      }
+    }
+    T.curRet = savedRet
+    popScope()
+    return TY_VOID
+
+  // ── if / else ─────────────────────────────────────────────────────────────
+  } else if n is IfStmt {
+    let condTy = checkNode(n.ifCond)
+    if !assignable(condTy, TY_BOOL) {
+      tErr("if-condition must be bool, got " + tyToStr(condTy), ix)
+    }
+    checkNode(n.ifThen)
+    if n.ifElse >= 0 {
+      checkNode(n.ifElse)
+    }
+    return TY_VOID
+
+  // ── return ────────────────────────────────────────────────────────────────
+  } else if n is RetStmt {
+    let want = T.curRet
+    if n.retArg < 0 {
+      if want >= 0 && !assignable(TY_VOID, want) {
+        tErr("return needs a value of type " + tyToStr(want), ix)
+      }
+      return TY_VOID
+    }
+    let got = checkNode(n.retArg)
+    if want >= 0 && !assignable(got, want) {
+      tErr("return type mismatch: expected " + tyToStr(want) + ", got " +
+        tyToStr(got), ix)
+    }
+    return TY_VOID
+
+  // ── block ─────────────────────────────────────────────────────────────────
+  } else if n is Block {
+    pushScope()
+    let stmts = n.blkStmts
+    let i = 0
+    while i < stmts.length {
+      checkNode(stmts[i])
+      i = i + 1
+    }
+    popScope()
+    return TY_VOID
+
+  // ── program ───────────────────────────────────────────────────────────────
+  } else if n is Program {
+    let stmts = n.progStmts
+    // Pass 1: hoist top-level function signatures so call-before-decl and mutual
+    // recursion type-check. Reads FuncDecl + its Param/TypeRef children INLINE.
+    let hi = 0
+    while hi < stmts.length {
+      let s = P.nodes[stmts[hi]]
+      if s is FuncDecl {
+        let hp = s.fnParams
+        let hpt: i32[] = []
+        let k = 0
+        while k < hp.length {
+          let hpn = P.nodes[hp[k]]
+          let t = TY_ERR
+          if hpn is Param {
+            if hpn.parType >= 0 {
+              let hptn = P.nodes[hpn.parType]
+              if hptn is TypeRef {
+                let r = nameToTy(hptn.tyName)
+                if r >= 0 {
+                  t = r
+                }
+              }
+            }
+          }
+          hpt.push(t)
+          k = k + 1
+        }
+        let hret = TY_VOID
+        if s.fnRet >= 0 {
+          let hrtn = P.nodes[s.fnRet]
+          if hrtn is TypeRef {
+            let r = nameToTy(hrtn.tyName)
+            if r >= 0 {
+              hret = r
+            }
+          }
+        }
+        declare(s.fnName, mkFuncTy(hpt, hret))
+      }
+      hi = hi + 1
+    }
+    // Pass 2: check every top-level statement (bodies included).
+    let j = 0
+    while j < stmts.length {
+      checkNode(stmts[j])
+      j = j + 1
+    }
+    return TY_VOID
+
+  } else if n is Param {
+    return TY_VOID
+  } else if n is TypeRef {
+    return TY_VOID
+  }
+  TY_ERR
+}
+
+// The public entry point: check the program rooted at node `rootIx`, returning
+// the number of diagnostics raised (diagnostics also accumulate on `T.diags`).
+//
+// GAP (PR #5): the caller MUST consume this return value in an expression
+// position, e.g. `print(i32ToStr(checkProgram(root)))`. Calling it as a bare
+// statement — or even binding it with `let r = checkProgram(root)` — trips a
+// codegen "Expected numeric type" once the module is large enough (the parser +
+// the big `checkNode` + the `Ty` helpers). Consuming the result directly in a
+// builtin call is the only form that compiles. This is the same family as the
+// undropped-`.pop()`-value bug (#4): a discarded/indirected call return is
+// mis-lowered at module scale.
+function checkProgram(rootIx: i32): i32 {
+  let _root = checkNode(rootIx)
+  T.diags.length
+}
