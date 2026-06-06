@@ -126,10 +126,14 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   array; a safe optimization); `map`/`filter` build-side generics (A10); `.vl`-std migration once a module
   system exists (the helpers are compiler-internal for now). **The names `List`/`Array` stay UNCOMMITTED**
   (`T[]` + inference is the whole committed surface — no user-facing way to force a representation).
-- ⬜ **B6a. `Map` + `Set`** — the "usable for modding" trio with `T[]` (a scripting language needs all
-  three). `T[]` lands first; `Map`/`Set` ride the same intrinsic floor. `Map[k]: V | null` (missing key =
-  normal absence). **Deterministic insertion-order iteration** (multiplayer/replay reproducibility).
-  Deferred.
+- 🟡 **B6a. `Map` + `Set`** — completes the "usable for modding" trio with `T[]`. DONE (core): ordered
+  open-addressing hash maps (Python-dict shape) over WasmGC, compiler-emitted per-type helpers
+  (`compiler/builtins/maps.ts`). **string keys**; `Map[k]: V | null` (missing key = normal absence);
+  `m[k]=v`; `.size`/`.get`/`.has`/`.set`/`.delete`/`.keys()`/`.values()`; `Set` `.add`/`.has`/`.delete`.
+  **Deterministic insertion-order iteration** (multiplayer/replay). Delete compacts + sizes the index to
+  the live count (bounded under churn); tombstone-aware probing. REMAINING: **i32-keyed Map/Set** (clean
+  diagnostic for now — i32 keys use `T[]`); `for k in map` direct iteration (parser; use `.keys()` today);
+  `map`/`filter` over Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`.
 - ⬜ **B6b. Collections building blocks & open items** (all detail in `docs/collections-design.md`).
   - **Prerequisite intrinsics** — the two-primitive floor the collection is built over: dynamic-length
     `__array_new__`/`__array_new_default__` + bulk `__array_copy__`, thin `defaultScope` intrinsics. The
