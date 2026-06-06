@@ -110,7 +110,7 @@ Deno.test("hover: parameter binding carries its declared type", () => {
 Deno.test("hover: local resolves a union-typed call result", () => {
   const src =
     'function maybe(b: i32): { x: i32 } | null { if b > 0 { return { x: 7 } } return null }\n' +
-    "function use(b: i32): i32 {\n  let p = maybe(b)\n  if p == null { return 0 - 1 }\n  return p.x\n}\n";
+    "function use(b: i32): i32 {\n  let p = maybe(b)\n  if p == null { return -1 }\n  return p.x\n}\n";
   const symbols = parseSymbols(src);
   const occ = symbols.occurrenceAt(cursorOn(src, "p", 0));
   if (!occ?.binding.type) throw new Error("expected a type on the `p` binding");
