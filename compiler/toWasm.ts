@@ -459,6 +459,63 @@ export const toWasm = async (ast: VLProgramNode) => {
     return cached;
   };
 
+  // --- Lists (the committed growable `T[]` representation, B6) ---
+  // A `T[]` value (a structural object carrying an `[i32]:T` index signature that
+  // is NOT `string`) lowers to a WasmGC struct `{ backing: (ref (array mut T)),
+  // len: i32, cap: i32 }` — the `{ptr,len,cap}` triple (collections-design §VL.1).
+  // `backing` reuses the per-element `arrayType` interner above; `len` is the
+  // user-visible size (`.length`, bounds, iteration), `cap` the allocated slots.
+  // The TYPE-SYSTEM representation of `T[]` stays `{[i32]:T}` (load-bearing for
+  // generic inference / equatability / `.length` typing) — this is a codegen rep.
+  type ListType = {
+    heapType: number;
+    refType: number;
+    element: VLType;
+    backing: ArrayType;
+  };
+  // Struct field indices, fixed by `setStructType` order below.
+  const LIST_BACKING = 0;
+  const LIST_LEN = 1;
+  const LIST_CAP = 2;
+  const listTypes = new Map<number, ListType>();
+  // Intern the list struct type by the backing array's wasm type (so identical
+  // element types share one struct). All three fields mutable: `backing` so a
+  // grow can swap in a larger array, `len`/`cap` for `push`/`pop`/`clear`.
+  const listType = (element: VLType): ListType => {
+    const backing = arrayType(element);
+    let cached = listTypes.get(backing.heapType);
+    if (!cached) {
+      const tb = new binaryen.TypeBuilder(1);
+      tb.setStructType(0, [
+        { type: backing.refType, packedType: binaryen.notPacked, mutable: true },
+        { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+        { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+      ]);
+      const heapType = tb.buildAndDispose()[0];
+      cached = {
+        heapType,
+        refType: binaryen.getTypeFromHeapType(heapType, false),
+        element,
+        backing,
+      };
+      listTypes.set(backing.heapType, cached);
+    }
+    return cached;
+  };
+
+  // Is `t` a *list* (the growable `T[]` rep) rather than a raw i32-array? Both
+  // `string` and `T[]` match `arrayElementType` (a `string` is an Object named
+  // "string" carrying `[i32]:i32`), so the discriminator is the *absence* of a
+  // nominal `name`: an anonymous `[i32]:T` object is a list, a named one (string)
+  // stays on the raw `arrayType` path. EVERY flipped codegen site guards on this,
+  // not bare `arrayElementType`.
+  const isListType = (t: VLType): boolean => {
+    let s = softenImplicitType(t);
+    while (s.type === "Infer") s = softenImplicitType(s.subType);
+    return s.type === "Object" && s.name === undefined &&
+      arrayElementType(s) !== null;
+  };
+
   // Lazily-emitted wasm helper functions (string equality, string→memory copy),
   // each added to the module once on first use. Strings are i32-arrays of char
   // codes, so these are small loops over `array.get`.
