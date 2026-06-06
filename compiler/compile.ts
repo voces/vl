@@ -16,6 +16,10 @@ import { tokenize } from "./lexer.ts";
 import { parseProgram } from "./parser.ts";
 import { toWasm } from "./toWasm.ts";
 import { defaultScope } from "./defaultScope.ts";
+import { SymbolTable } from "./symbols.ts";
+
+export type { Binding, BindingKind, SymbolOccurrence } from "./symbols.ts";
+export { SymbolTable } from "./symbols.ts";
 
 export type VLSeverity = "error" | "warning" | "info";
 export type VLPosition = { line: number; character: number };
@@ -34,6 +38,13 @@ export type CompileResult = {
   diagnostics: VLDiagnostic[];
   /** Present only when there are no error diagnostics. */
   wasm: Uint8Array | undefined;
+  /**
+   * Symbol/binding table for the document (go-to-definition, find-references —
+   * roadmap D2). Always present; empty if nothing resolved. Query by cursor
+   * position; spans use the same 1-based-line / 0-based-column `Position`
+   * convention as `Context` (shift to LSP 0-based with `rangeFromCtx`).
+   */
+  symbols: SymbolTable;
 };
 
 // A source span (`Context`) carries 1-based lines / 0-based columns, with `stop`
@@ -153,7 +164,7 @@ const diagnosticFromError = (error: ParseErrors): VLDiagnostic => {
  */
 export const compile = async (source: string): Promise<CompileResult> => {
   const { tokens, diagnostics } = tokenize(source);
-  const [ast, errors] = parseProgram(tokens, defaultScope());
+  const [ast, errors, symbols] = parseProgram(tokens, defaultScope());
   for (const error of errors) diagnostics.push(diagnosticFromError(error));
 
   let wasm: Uint8Array | undefined;
@@ -175,7 +186,19 @@ export const compile = async (source: string): Promise<CompileResult> => {
     }
   }
 
-  return { ast, diagnostics, wasm };
+  return { ast, diagnostics, wasm, symbols };
+};
+
+/**
+ * Symbol table only, synchronously: tokenize + parse (which resolves scopes and
+ * populates the binding table) without running codegen. The LSP's
+ * go-to-definition / find-references handlers use this — they need symbols, not
+ * wasm, and want a synchronous answer per request (D2).
+ */
+export const parseSymbols = (source: string): SymbolTable => {
+  const { tokens } = tokenize(source);
+  const [, , symbols] = parseProgram(tokens, defaultScope());
+  return symbols;
 };
 
 /**

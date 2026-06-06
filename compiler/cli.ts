@@ -5,6 +5,8 @@
 //   echo "..." | deno task run         # compile + run stdin
 //   deno task build <file.vl> [-o out.wasm] [--wat]   # emit a .wasm (+ .wat)
 //   deno task check <file.vl>          # diagnostics only; CI exit code
+//   deno task check <dir>              # recursively check every *.vl under dir
+//   deno task check                    # no path → check the cwd (like `check .`)
 //
 // A missing or unknown leading word falls back to `run`, so the historical
 // bare `deno task run <file>` (and the VS Code "Run Current File" command that
@@ -97,19 +99,73 @@ const build = async (args: string[]): Promise<void> => {
 
 // --- check ----------------------------------------------------------------
 
+// Directories skipped when walking broadly, so `vl check .` doesn't descend
+// into build output, deps, vendored copies, or the retired ts-interpreter.
+const SKIP_DIRS = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "reference",
+]);
+
+// Recursively collect every `*.vl` file under `dir` (sorted for stable output).
+// Symlinks are not followed (Deno.readDir reports them as neither file nor dir
+// unless resolved) — a sensible default that avoids cycles.
+const collectVlFiles = async (dir: string): Promise<string[]> => {
+  const found: string[] = [];
+  const walk = async (current: string): Promise<void> => {
+    for await (const entry of Deno.readDir(current)) {
+      const path = `${current}/${entry.name}`;
+      if (entry.isDirectory) {
+        if (!SKIP_DIRS.has(entry.name)) await walk(path);
+      } else if (entry.isFile && entry.name.endsWith(".vl")) {
+        found.push(path);
+      }
+    }
+  };
+  await walk(dir);
+  found.sort();
+  return found;
+};
+
+// Check one file: compile, print its diagnostics, report whether it errored.
+const checkFile = async (file: string): Promise<boolean> => {
+  const source = await Deno.readTextFile(file);
+  const { diagnostics } = await compile(source);
+  for (const d of diagnostics) console.error(`${file}: ${formatDiagnostic(d)}`);
+  return diagnostics.some((d) => d.severity === "error");
+};
+
 const check = async (args: string[]): Promise<void> => {
-  const file = args.find((a) => !a.startsWith("-"));
-  if (!file) {
-    console.error("usage: deno task check <file.vl>");
+  // No path argument → default to the current working directory (`vl check .`).
+  const target = args.find((a) => !a.startsWith("-")) ?? ".";
+
+  let info: Deno.FileInfo;
+  try {
+    info = await Deno.stat(target);
+  } catch {
+    console.error(`check: no such file or directory: ${target}`);
     Deno.exit(2);
   }
 
-  const source = await Deno.readTextFile(file);
-  const { diagnostics } = await compile(source);
-  for (const d of diagnostics) console.error(formatDiagnostic(d));
+  // Build the list of files to check: a single file, or every `*.vl` under a dir.
+  let files: string[];
+  if (info.isDirectory) {
+    files = await collectVlFiles(target);
+    if (files.length === 0) {
+      console.error(`check: no .vl files found under ${target}`);
+      Deno.exit(0);
+    }
+  } else {
+    files = [target];
+  }
 
-  // CI gate: never run the program; fail only on ERROR-severity diagnostics.
-  const hasError = diagnostics.some((d) => d.severity === "error");
+  // CI gate: never run the program; fail only on ERROR-severity diagnostics,
+  // aggregated across every file checked.
+  let hasError = false;
+  for (const file of files) {
+    if (await checkFile(file)) hasError = true;
+  }
   Deno.exit(hasError ? 1 : 0);
 };
 

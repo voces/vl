@@ -8,15 +8,19 @@
 //
 // Exits non-zero on the first failed check.
 
-const BIN = Deno.args[0] ??
+// Resolved to an absolute path after the binary is ensured (below), so checks
+// that override the child cwd (the bare `check` cwd-default case) still spawn it.
+let BIN = Deno.args[0] ??
   (Deno.build.os === "windows" ? "dist/vl.exe" : "dist/vl");
 
 const run = async (
   args: string[],
   stdin?: string,
+  cwd?: string,
 ): Promise<{ code: number; stdout: string; stderr: string }> => {
   const cmd = new Deno.Command(BIN, {
     args,
+    cwd,
     stdin: stdin === undefined ? "null" : "piped",
     stdout: "piped",
     stderr: "piped",
@@ -56,6 +60,7 @@ const ensureBinary = async () => {
 };
 
 await ensureBinary();
+BIN = await Deno.realPath(BIN); // absolute, so child-cwd overrides still find it
 console.error(`smoke-testing ${BIN}\n`);
 
 // 1. run an inline snippet — exercises compile + binaryen codegen + runWasm.
@@ -88,6 +93,37 @@ console.error(`smoke-testing ${BIN}\n`);
   const r = await run(["check", "samples/functions.vl"]);
   check("check clean (exit 0)", r.code === 0, `exit ${r.code}`);
 }
+
+// Build a small, self-contained clean tree (with a nested dir + a non-.vl file)
+// for the directory / cwd-default check cases — robust regardless of which
+// corpus files happen to carry intentional error diagnostics.
+const tmpDir = await Deno.makeTempDir();
+await Deno.mkdir(`${tmpDir}/nested`);
+await Deno.writeTextFile(`${tmpDir}/a.vl`, "let x = 1\nprint(x)\n");
+await Deno.writeTextFile(`${tmpDir}/nested/b.vl`, "let y = 2\nprint(y)\n");
+await Deno.writeTextFile(`${tmpDir}/notes.txt`, "skip me\n");
+
+// 5. check a directory — recursively checks every *.vl under it (incl. nested),
+//    skipping non-.vl files. Proves the dir-walk aggregation works (exit 0).
+{
+  const r = await run(["check", tmpDir]);
+  check("check directory recursive (exit 0)", r.code === 0, r.stderr || `exit ${r.code}`);
+}
+
+// 6. check with no path argument — defaults to the cwd (`check .`). Run with the
+//    child cwd set to the clean temp tree so the default is exercised directly.
+{
+  const r = await run(["check"], undefined, tmpDir);
+  check("check cwd default (exit 0)", r.code === 0, r.stderr || `exit ${r.code}`);
+}
+
+// 7. check a non-existent path — clear error, non-zero exit.
+{
+  const r = await run(["check", `${tmpDir}/does-not-exist`]);
+  check("check missing path (exit 2)", r.code === 2, `exit ${r.code}`);
+}
+
+await Deno.remove(tmpDir, { recursive: true }).catch(() => {});
 
 console.error("");
 if (failures > 0) {

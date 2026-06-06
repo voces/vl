@@ -58,6 +58,12 @@ The roadmap is *forward-looking*, not a changelog. When you finish work: set the
 `docs/` only if it genuinely aids future work. **Do not paste implementation narrative into
 `ROADMAP.md`.**
 
+**`DECISIONS.md` entries are terse (≈2–4 lines): the decision plus the "why X over Y" rationale and
+any non-obvious trade-off — *not* an implementation walkthrough.** No code-path or function names, no
+bug narratives, no step-by-step mechanics; those live in the code, the PR description, and git
+history. Litmus: if it would change when the code is refactored (without changing the *decision*), it
+doesn't belong here.
+
 ## Conventions
 
 - End commit messages with: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.

@@ -60,8 +60,11 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ⬜ **A8. Exact / Inexact variance.** Params Inexact by default (accept excess properties), values
   Exact. Guards the `a.foo = b` width footgun. (TODO.md)
 - ⬜ **A9. Readable / Writable variance.** Applied automatically during parameter inference. (TODO.md)
-- ⬜ **A10. Parametric types / generics** (`function foo<T>(x: T)`). Hard (Elixir defers it). Needed
-  for real collections → the main remaining gap for self-hosting (Track H/H2).
+- 🟡 **A10. Parametric types / generics** (`function foo<T>(x: T)`). Stage 1 (explicit function type
+  params) + Stage 2 (generics over array element type — `first<T>(xs: T[]): T`, read-side: index,
+  `.length`, `for x in xs`, passthrough; `tests/cases/generics/`) done. REMAINING: build-side array
+  generics (`map`/`filter` constructing a new array of inferred element type) — needs growable lists
+  (B6 tier-2) or fixed-size construction; generic `type` decls / generic structs.
 - 🟢 **A11. Recursive structural types.** Done — `type Tree = { value, left: Tree | null, … }`
   constructs/traverses/compiles (cycle-safe traversals + a self-referential WasmGC struct rec-group;
   `types/recursive-tree.vl`). REMAINING: mutual recursion across *separate* `type` decls; recursion
@@ -164,11 +167,9 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   Code Run-Current-File command.
 - ✅ **C3. `vl build <file> [-o out.wasm] [--wat]`** — emit wasm bytes (and optional `.wat`).
 - ✅ **C4. `vl check <file>`** — diagnostics only, non-zero exit on errors (CI gate).
-- 🟡 **C5. Distribution via `deno compile`** — native `vl` binary builds (`deno task compile` →
-  `scripts/build-binary.ts`) and **binaryen.js verified to run inside the compiled binary, no flags**
-  (`deno task smoke`); cross-compile workflow `.github/workflows/release.yml` + draft `Formula/vl.rb`
-  (→ `DECISIONS.md`). REMAINING: an actual public release (tag/tap, sha256 bump) once H5 versioning
-  lands — pipeline drafts carry the TODO markers.
+- 🟡 **C5. Distribution via `deno compile`** — native `vl` binary builds + runs binaryen embedded
+  (`deno task compile`/`smoke`); release workflow + brew formula drafted (→ `DECISIONS.md`).
+  REMAINING: an actual public release (tag/tap, sha256 bump).
 
 ---
 
@@ -178,7 +179,9 @@ D1/D2.*
 
 - ✅ **D0. Diagnostics on change.**
 - ⬜ **D1. Hover types** (`stringifyType` exists; map a cursor to a symbol/expression via the new spans).
-- ⬜ **D2. Go-to-definition / find-references** (needs symbol→span tracking — spans now exist).
+- ✅ **D2. Go-to-definition / find-references.** Parser populates a symbol/binding table
+  (`compiler/symbols.ts`) during its scope walk; the LSP queries it by cursor (`textDocument/definition`
+  + `textDocument/references`). Locals, params, function decls, type aliases; single-document. → `DECISIONS.md`.
 - ⬜ **D3. Autocomplete** (scope-aware; structural members).
 - ⬜ **D4. Formatter** (+ `vl fmt`).
 - ⬜ **D5. Semantic tokens.**
@@ -226,9 +229,8 @@ antlr/Java generator) retires; the compiler becomes VL→wasm on a generic wasm 
 corpus (A12) is the host-agnostic oracle — the same tests pass whichever compiler runs them.
 **Distribution does NOT require self-hosting** (the two timelines below are independent).*
 
-- 🟡 **H-M1. Distribute now via `deno compile` (= C5).** Native `vl` binary builds and runs with
-  binaryen embedded (no flags) — see C5. ~187MB binary (V8 + TS compiler + binaryen). Decoupled from
-  everything below; today's compiler unchanged. REMAINING == C5's: an actual published release.
+- 🟡 **H-M1. Distribute now via `deno compile` (= C5).** Native binary builds + runs binaryen
+  embedded — see C5. Decoupled from everything below; today's compiler unchanged.
 - ✅ **H1. Parser self-hostable (= Track G).** The one piece that categorically can't live in a
   VL-in-VL compiler is gone.
 - ⬜ **H2. Make VL expressive enough to write a compiler.** Recursive tree types (**A11 ✅**), generic
@@ -254,5 +256,5 @@ H2/H3; H1 done, H4 decided.
 - **A10 generics + collections (B6 tier-2 lists, B6a maps)** — the H2 capability bar, and the gate on
   self-hosting (H3). The deepest remaining type-system work.
 - **C5 / H-M1** — `deno compile` + brew. Small, decoupled, ships the distribution story now.
-- **D1/D2** — hover + go-to-def, now that AST nodes carry source spans.
+- **D1** — hover types, now that AST nodes carry source spans (D2 go-to-def/refs is done).
 - Smaller/independent: B6 growable lists, B13 callable-objects/index-traps, B17 lint pass, A6b Stage A.

@@ -22,6 +22,13 @@ export type VLFunctionDeclarationNode = {
   parameters: VLParameterNode[];
   body: VLStatement;
   returnType: VLType;
+  /**
+   * Surface names of declared type parameters (`function foo<T>(...)`). Each is
+   * bound to a single shared `{Infer, Unknown}` hole during parsing so that all
+   * annotation positions naming it stay correlated per call (monomorphization).
+   * Additive metadata for LSP/diagnostics; not load-bearing for typechecking.
+   */
+  typeParameters?: string[];
 };
 
 export type VLNameNode = {

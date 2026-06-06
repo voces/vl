@@ -1,7 +1,8 @@
 # VL — Design Decisions
 
 Decisions where the **rationale isn't recoverable from the code**. Implementation detail lives in
-the code, git history, and `docs/`; this file is the "why we chose X over Y." Append new entries
+the code, git history, and `docs/`; this file is the "why we chose X over Y." Keep entries terse
+(≈2–4 lines) — the decision and rationale, not a code walkthrough. Append new entries
 under the relevant section. Roadmap items reference these by their tag (e.g. A15, B14).
 
 *(Consolidated from ROADMAP.md, 2026-06-05.)*
@@ -57,6 +58,10 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
 - **Maps are a separate hash type, not every-object-as-table.** Three representations under one
   `[]`/`.field` surface: static-string-key structs (fastest), `i32`-key arrays (native, contiguous),
   arbitrary-key maps (hashed, heap) — you pay hashing only when you use a `Map`. (B6a)
+- **Generics infer through collections, not just scalars.** A generic element type is pinned from the
+  argument's element type (the checker unifies index-signature *value* types, not just keys), so
+  `first<T>(xs: T[])` resolves `T` per call. Read-side only for now — building a new array of an
+  inferred element type (`map`/`filter`) waits on growable lists (B6 tier-2). (A10)
 
 ## Parser, distribution & bootstrapping
 
@@ -64,14 +69,10 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
   self-hosted compiler). Chose hand-written (Pratt) over peggy/parser-combinators for error quality
   and bootstrappability. (Track G)
 - **Distribute via `deno compile`.** A single native `vl` binary (V8 + the TS compiler + binaryen.js)
-  through brew; versionless for now. (C5) **Verified:** binaryen.js loads and runs *inside* the
-  compiled binary with **no special flags** — `deno compile -A --no-check compiler/cli.ts` embeds the
-  `npm:binaryen@130` module, which is a single-file Emscripten build with the wasm inlined as
-  base64 (no out-of-band `.wasm` asset to resolve), so V8's `WebAssembly` instantiates it directly.
-  run / build / check all work in the compiled binary (`deno task smoke`). The Node-only
-  `import("node:module")` branch in binaryen's loader is guarded and skipped under Deno. Build tooling:
-  `scripts/build-binary.ts` (`deno task compile`), smoke test `scripts/smoke-binary.ts`
-  (`deno task smoke`), cross-compile workflow `.github/workflows/release.yml`, draft `Formula/vl.rb`.
+  through brew; versionless for now. Chosen over hand-rolling a wasm-native bundle so distribution
+  ships now, decoupled from self-hosting (H-M2). Verified: `npm:binaryen@130` is a single-file
+  Emscripten build with the wasm inlined as base64, so it instantiates inside the compiled binary with
+  no special flags. Tooling: `scripts/build-binary.ts`, `scripts/smoke-binary.ts`. (C5)
 - **Self-hosted WASM emission: emit bytes directly + optional `wasm-opt`.** binaryen's npm build is
   JS-bound (Emscripten glue, not a standalone WASI module), so the self-hosted compiler emits the wasm
   binary encoding itself and treats `wasm-opt` (native CLI) as an *optional* optimizer rather than
@@ -80,3 +81,11 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
 - **Versioning (when needed): rustup/Volta model, not nvm.** A launcher that resolves a committed
   project pin and auto-installs the right toolchain — not manual `use`/shims. Deferred until multiple
   releases warrant it. (H5)
+
+## Editor / LSP
+
+- **D2 symbol table reuses the parser's scope walk, not a second resolver.** Go-to-definition /
+  find-references resolve use→declaration, which the parser already does as it walks the live `scopes`
+  stack — so the symbol table is populated during that same walk rather than by a separate post-parse
+  resolver (which would duplicate scope/shadowing logic and drift from the checker). Position-indexed,
+  single-document; cross-file and builtins are out of scope. (D2)
