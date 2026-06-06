@@ -23,6 +23,7 @@ import {
   getChildType,
   getConcreteType,
   getType,
+  instantiateAlias,
   instantiateFunctionType,
   makeExact,
   nonNullable,
@@ -51,6 +52,7 @@ import type {
   VLFunctionDeclarationNode,
   VLFunctionType,
   VLIfNode,
+  VLInferType,
   VLIsNode,
   VLNullCoalesceNode,
   VLObjectLiteralNode,
@@ -60,6 +62,7 @@ import type {
   VLReturnNode,
   VLStatement,
   VLType,
+  VLTypeType,
   VLUnaryOperationNode,
   VLVariableDeclarationNode,
 } from "./ast.ts";
@@ -136,10 +139,11 @@ export const parseProgram = (
     name: string,
     kind: BindingKind,
     decl: Context,
+    type?: VLType,
   ): Binding => {
     let map = scopeBindings.get(scope);
     if (!map) scopeBindings.set(scope, map = new Map());
-    const binding: Binding = { name, kind, decl };
+    const binding: Binding = { name, kind, decl, type };
     map.set(name, binding);
     symbols.declare(binding);
     return binding;
@@ -248,6 +252,71 @@ export const parseProgram = (
     return t;
   };
 
+  // Parse the `<arg, arg, …>` of a generic alias application. The `<` is
+  // unambiguous in type position (no less-than operator here). `>>` closing a
+  // nested application (`Box<Pair<i32, string>>`) lexes as two GREATER_THAN
+  // tokens, so each level consumes its own `>` cleanly.
+  const parseTypeArgs = (): VLType[] => {
+    expect("LESS_THAN");
+    skipNewlines();
+    const args: VLType[] = [];
+    if (!at("GREATER_THAN")) {
+      for (;;) {
+        skipNewlines();
+        args.push(parseType());
+        skipNewlines();
+        if (at("COMMA")) {
+          next();
+          continue;
+        }
+        break;
+      }
+    }
+    skipNewlines();
+    expect("GREATER_THAN");
+    return args;
+  };
+
+  // Apply a generic `type` alias to its type arguments (`Box<i32>`). A bare
+  // reference with no `<args>` is an error (the alias needs its params); a
+  // mismatched count is an arity error. Otherwise `instantiateAlias` substitutes
+  // each argument for its param hole in a fresh copy of the body.
+  const applyGenericAlias = (
+    name: string,
+    entry: VLTypeType,
+    ctx: Context,
+  ): VLType => {
+    const arity = entry.params?.length ?? 0;
+    if (!at("LESS_THAN")) {
+      errors.push({
+        type: "Syntax",
+        message:
+          `Generic type \`${name}\` expects ${arity} type argument${
+            arity === 1 ? "" : "s"
+          } but was used without any`,
+        ctx,
+        code: 0,
+      });
+      return { type: "Never" };
+    }
+    const argsStart = peek();
+    const args = parseTypeArgs();
+    const ctxWithArgs = spanFrom(argsStart);
+    if (args.length !== arity) {
+      errors.push({
+        type: "Syntax",
+        message:
+          `Generic type \`${name}\` expects ${arity} type argument${
+            arity === 1 ? "" : "s"
+          } but got ${args.length}`,
+        ctx: { start: ctx.start, stop: ctxWithArgs.stop },
+        code: 0,
+      });
+      return { type: "Never" };
+    }
+    return instantiateAlias(entry, args);
+  };
+
   const parseTypePrimary = (): VLType => {
     const t = peek();
     const ctx = spanOf(t);
@@ -260,12 +329,21 @@ export const parseProgram = (
       // expanded forever.
       if (typeBuilding.has(name)) {
         recordUse(name, ctx);
+        // A recursive reference inside a generic alias's own body still carries
+        // its arguments (`Box<T>` referencing `Box`); consume them so parsing
+        // stays in sync (the lazy `Alias` leaf is resolved on demand).
+        if (at("LESS_THAN")) parseTypeArgs();
         return { type: "Alias", name };
       }
       for (let i = scopes.length - 1; i >= 0; i--) {
         if (name in scopes[i]) {
           recordUse(name, ctx);
           const type = scopes[i][name];
+          // Generic type alias (`type Box<T> = …`). Application is substitution:
+          // require `<args>`, arity-check, then substitute them into the body.
+          if (type.type === "Type" && type.params && type.params.length > 0) {
+            return applyGenericAlias(name, type, ctx);
+          }
           if (type.type === "Type") return getConcreteType(type.subType, ctx);
           return getConcreteType(type, ctx);
         }
@@ -1269,6 +1347,7 @@ export const parseProgram = (
       return: annotatedReturn ?? { type: "Infer", subType: { type: "Unknown" } },
     };
     let registered = false;
+    let fnBinding: Binding | undefined;
     if (name) {
       if (name in enclosing) {
         errors.push({
@@ -1279,7 +1358,9 @@ export const parseProgram = (
         });
       } else {
         enclosing[name] = selfType;
-        if (nameCtx) declareBinding(enclosing, name, "function", nameCtx);
+        if (nameCtx) {
+          fnBinding = declareBinding(enclosing, name, "function", nameCtx, selfType);
+        }
         registered = true;
       }
     }
@@ -1289,7 +1370,13 @@ export const parseProgram = (
     );
     scopes.push(scope);
     for (let i = 0; i < parameters.length; i++) {
-      declareBinding(scope, parameters[i].name, "parameter", paramSpans[i]);
+      declareBinding(
+        scope,
+        parameters[i].name,
+        "parameter",
+        paramSpans[i],
+        parameters[i].paramaterType,
+      );
     }
     let node: VLFunctionDeclarationNode;
     const bodyStart = peek();
@@ -1352,6 +1439,9 @@ export const parseProgram = (
     // Memoize the node's final type and refine the forward-registered entry.
     const finalType = typeFromExpression(node, ctx);
     if (registered) enclosing[name!] = finalType;
+    // Refine the binding's type to the inferred (post-body) signature so hover
+    // shows the resolved return rather than the pre-inference `Infer` hole.
+    if (fnBinding) fnBinding.type = finalType;
 
     // Inferred type guard (A6b, degenerate case): body is exactly
     // `return <narrowing-predicate-on-a-param>`.
@@ -1576,7 +1666,7 @@ export const parseProgram = (
     } else {
       const scope = scopes[scopes.length - 1];
       scope[node.name] = node.variableType;
-      declareBinding(scope, node.name, "variable", spanOf(id));
+      declareBinding(scope, node.name, "variable", spanOf(id), node.variableType);
     }
     return record(node, spanFrom(kw));
   };
@@ -1585,6 +1675,17 @@ export const parseProgram = (
     expect("TYPE");
     const id = expect("ID");
     const name = id.text;
+    // Generic type parameters (`type Box<T> = …`): a `<` after the name can only
+    // be type params here (no less-than operator in type position). Each name
+    // binds to ONE shared `{Infer, Unknown}` hole, pushed in a transient scope so
+    // every reference to `T` inside the body resolves to that same hole (mirrors
+    // the function type-param approach). Applying the alias clones the body with
+    // those holes and unifies them against the arguments (see `instantiateAlias`).
+    const typeParams: string[] = at("LESS_THAN") ? parseTypeParams() : [];
+    const paramHoles: VLInferType[] = typeParams.map(() => ({
+      type: "Infer",
+      subType: { type: "Unknown" },
+    }));
     const hasBody = at("EQUAL");
     if (name in scopes[scopes.length - 1]) {
       errors.push({ type: "Redeclaration", name, ctx: spanOf(id), code: 11 });
@@ -1592,7 +1693,16 @@ export const parseProgram = (
       if (hasBody) {
         next();
         skipNewlines();
-        parseType();
+        if (typeParams.length > 0) {
+          scopes.push(Object.fromEntries(
+            typeParams.map((n, i) => [n, paramHoles[i]]),
+          ));
+        }
+        try {
+          parseType();
+        } finally {
+          if (typeParams.length > 0) scopes.pop();
+        }
       }
       return { type: "Block", label: `__type_${name}__`, statements: [] };
     }
@@ -1600,20 +1710,29 @@ export const parseProgram = (
     // inside it resolves (to a lazy `Alias` leaf, via `typeBuilding`). The
     // bodyless form (`type Point`, no `=`) aliases the name to itself — a
     // degenerate self-cycle `getConcreteType` reports cleanly when used (A14).
-    const entry: { type: "Type"; subType: VLType } = {
+    const entry: VLTypeType = {
       type: "Type",
       subType: { type: "Alias", name },
     };
+    if (typeParams.length > 0) entry.params = paramHoles;
     const typeScope = scopes[scopes.length - 1];
     typeScope[name] = entry;
-    declareBinding(typeScope, name, "type", spanOf(id));
+    declareBinding(typeScope, name, "type", spanOf(id), entry);
     if (hasBody) {
       next();
       skipNewlines();
       typeBuilding.add(name);
+      // Bind the param holes only while parsing the body; pop afterwards so the
+      // names don't leak into the surrounding type scope.
+      if (typeParams.length > 0) {
+        scopes.push(Object.fromEntries(
+          typeParams.map((n, i) => [n, paramHoles[i]]),
+        ));
+      }
       try {
         entry.subType = parseType();
       } finally {
+        if (typeParams.length > 0) scopes.pop();
         typeBuilding.delete(name);
       }
     }

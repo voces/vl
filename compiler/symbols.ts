@@ -15,7 +15,7 @@
 // defining span of the binding it lands on; `referencesAt` maps it to every
 // occurrence of that binding.
 
-import type { Context, Position } from "./ast.ts";
+import type { Context, Position, VLType } from "./ast.ts";
 
 /** What kind of thing a name binds to (drives nothing yet; useful for clients). */
 export type BindingKind = "variable" | "parameter" | "function" | "type";
@@ -26,6 +26,11 @@ export type Binding = {
   kind: BindingKind;
   /** Span of the declaring identifier (what go-to-definition jumps to). */
   decl: Context;
+  /**
+   * The binding's declared/inferred type — what hover renders; holes
+   * (`Infer`/`Unknown`) may appear for still-generic params.
+   */
+  type?: VLType;
 };
 
 /** One textual appearance of a name, resolved to the binding it refers to. */

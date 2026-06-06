@@ -3,10 +3,13 @@ import {
   Diagnostic,
   DiagnosticSeverity,
   Hover,
+  InlayHint,
+  InlayHintKind,
   Location,
   Position,
   ProposedFeatures,
   Range,
+  SemanticTokens,
   TextDocuments,
   TextDocumentSyncKind,
 } from "vscode-languageserver/node";
@@ -20,6 +23,17 @@ import {
   VLSeverity,
 } from "../../compiler/compile.ts";
 import type { Context } from "../../compiler/ast.ts";
+import {
+  deriveInlayHints,
+  type LspRange,
+  SEMANTIC_TOKEN_LEGEND,
+  semanticTokensData,
+} from "./typeFeatures.ts";
+
+// The language id the extension registers (`package.json` → contributes.languages,
+// id `vital`, scope `source.vital`). Used as the markdown fence info string so
+// hover code blocks render syntax-highlighted via the TextMate grammar.
+const VL_LANGUAGE_ID = "vital";
 
 declare const process: NodeJS.Process;
 
@@ -111,6 +125,14 @@ const wordAt = (line: string, character: number): string | null => {
   return /^[A-Za-z_]/.test(word) ? word : null;
 };
 
+// Render a hover body as a fenced `vital` code block so the client syntax-
+// highlights it via the TextMate grammar (rather than flat inline `code`). The
+// fence info string must match the registered language id (`VL_LANGUAGE_ID`).
+const hoverMarkdown = (code: string): Hover["contents"] => ({
+  kind: "markdown",
+  value: "```" + VL_LANGUAGE_ID + "\n" + code + "\n```",
+});
+
 connection.onHover(async (params): Promise<Hover | null> => {
   const document = documents.get(params.textDocument.uri);
   if (!document) return null;
@@ -119,26 +141,68 @@ connection.onHover(async (params): Promise<Hover | null> => {
     start: { line: params.position.line, character: 0 },
     end: { line: params.position.line + 1, character: 0 },
   });
+  // Hover resolves through the D2 symbol table first: it maps the cursor to its
+  // `Binding` (locals/params/functions/type aliases included) and reads the type
+  // each binding carries. Falls back to the top-level scope lookup below for
+  // anything the symbol table doesn't carry.
+  const symbols = parseSymbols(document.getText());
+  const occ = symbols.occurrenceAt(toVLPosition(params.position));
+  if (occ?.binding.type) {
+    // Feature 1(b) — "declared vs flow-refined type" — is DEFERRED. The symbol
+    // table carries only the binding's *declared/inferred* type (`binding.type`),
+    // shared by all occurrences. Flow narrowing (`if x is T { … }`) lives in the
+    // type checker's transient `narrowedPaths` (compiler/typecheck.ts) and is not
+    // recorded per occurrence, so the *refined* type at this exact cursor isn't
+    // obtainable without a compiler-core change (recording a narrowed type on
+    // each `SymbolOccurrence` during the typecheck/toAST pass). That change is
+    // out of scope here (compiler/*.ts is owned by other agents). When it lands,
+    // render both via separate labelled markdown sections — the LSP convention
+    // for two types in one hover — e.g. "declared `T`" then "narrowed `U`".
+    return {
+      contents: hoverMarkdown(
+        `${occ.binding.name}: ${stringifyType(occ.binding.type)}`,
+      ),
+    };
+  }
+
   const word = wordAt(lineText, params.position.character);
   if (!word) return null;
 
-  // HONEST LIMITATION: this resolves only TOP-LEVEL names (functions,
-  // top-level let/const, types) via `ast.scope`. AST nodes don't yet carry
-  // source ranges, so a cursor can't be mapped to an arbitrary
-  // expression/local — we can only look the bare word up in the program's
-  // top-level scope. Richer hover (locals, expression types, go-to-definition)
-  // needs per-node position tracking, which the in-progress parser rewrite
-  // (Track G) will add — that's a follow-up, not this change.
   const { ast } = await compile(document.getText());
   const type = ast?.scope[word];
   if (!type) return null;
 
   return {
-    contents: {
-      kind: "markdown",
-      value: `\`${word}: ${stringifyType(type)}\``,
-    },
+    contents: hoverMarkdown(`${word}: ${stringifyType(type)}`),
   };
+});
+
+// Inlay hints (D6): for every declaration that *lacks* a visible annotation,
+// surface the inferred type after the identifier (`x: i32`) — the headline
+// feature for a language that otherwise hides its types. Driven by the symbol
+// table (see `deriveInlayHints`); honours the request's `range`.
+connection.languages.inlayHint.on((params): InlayHint[] => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+  const symbols = parseSymbols(doc.getText());
+  const range: LspRange = params.range;
+  return deriveInlayHints(symbols, stringifyType, range).map((h) => ({
+    position: { line: h.line, character: h.char },
+    label: h.label, // `: <type>`
+    kind: InlayHintKind.Type,
+    paddingLeft: true, // keep it unobtrusive: a space before `: type`
+  }));
+});
+
+// Semantic tokens (D5): classify each identifier by its binding kind (local vs
+// parameter vs function vs type) so the client can color them distinctly — a
+// TextMate grammar can't tell these apart. The `data` array is the delta-encoded
+// form LSP mandates (see `semanticTokensData`).
+connection.languages.semanticTokens.on((params): SemanticTokens => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return { data: [] };
+  const symbols = parseSymbols(doc.getText());
+  return { data: semanticTokensData(symbols) };
 });
 
 documents.listen(connection);
@@ -157,6 +221,11 @@ connection.onInitialize((params) => {
       definitionProvider: true,
       referencesProvider: true,
       hoverProvider: true,
+      inlayHintProvider: true,
+      semanticTokensProvider: {
+        legend: SEMANTIC_TOKEN_LEGEND,
+        full: true,
+      },
       workspace: { workspaceFolders: { supported: true } },
     },
   };

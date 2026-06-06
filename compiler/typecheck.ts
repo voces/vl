@@ -9,6 +9,7 @@ import type {
   VLStatement,
   VLStringLiteralNode,
   VLType,
+  VLTypeType,
 } from "./ast.ts";
 import {
   errors,
@@ -973,6 +974,30 @@ export const instantiateFunctionType = (
     })),
     return: makeExact(instance.return),
   };
+};
+
+// Apply a generic `type` alias (`Box<i32>`) to concrete type arguments —
+// application IS substitution. We clone the alias body with the clone map
+// pre-seeded so each param hole maps *directly* to its argument: every `T`
+// occurrence in the body becomes the argument itself, not a fresh hole linked to
+// it. This matters when the argument is still an unresolved hole (`Box<T>` in
+// `unwrap<T>(b: Box<T>): T`) — the body then references the *same* function hole
+// as the return, so `cloneTypeFresh` of the enclosing signature keeps them
+// correlated and inference flows from the call's argument (Stage 1/2 machinery).
+// When the arguments are concrete the result is concrete with no leftover holes.
+// The clone keeps each application independent (a `Box<i32>` and a sibling
+// `Box<string>` get separate object structures). Arity is checked by the caller
+// (the parser, which has the per-argument spans).
+export const instantiateAlias = (
+  entry: VLTypeType,
+  args: VLType[],
+): VLType => {
+  const params = entry.params ?? [];
+  const map = new Map<VLType, VLType>();
+  for (let i = 0; i < params.length && i < args.length; i++) {
+    map.set(params[i], args[i]);
+  }
+  return cloneTypeFresh(entry.subType, map);
 };
 
 export const getType = (name: string, ctx: Context): VLType => {

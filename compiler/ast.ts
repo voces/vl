@@ -274,7 +274,17 @@ export type VLUnionType = { type: "Union"; subTypes: VLType[] };
 export type VLIntersectionType = { type: "Intersection"; subTypes: VLType[] };
 export type VLNegationType = { type: "Negation"; subType: VLType };
 export type VLNeverType = { type: "Never" };
-export type VLTypeType = { type: "Type"; subType: VLType };
+// A `type` alias binding. `params` is present (and non-empty) for a *generic*
+// alias (`type Box<T> = …`): each entry is the shared `{Infer, Unknown}` hole
+// that `T` resolves to inside `subType`. Applying the alias (`Box<i32>`) clones
+// `subType` together with the params, unifies each param hole against a type
+// argument, then collapses to a concrete type (see `instantiateAlias`). A
+// non-generic alias omits `params` and resolves directly through `subType`.
+export type VLTypeType = {
+  type: "Type";
+  subType: VLType;
+  params?: VLInferType[];
+};
 export type VLInferType = { type: "Infer"; subType: VLType };
 export type VLCustomType = {
   type: "Custom";
