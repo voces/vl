@@ -186,6 +186,10 @@ D1/D2.*
 - ⬜ **D4. Formatter** (+ `vl fmt`).
 - ⬜ **D5. Semantic tokens.**
 - ⬜ **D6. Inlay hints** for inferred types — *the* feature for a "types are hidden" language.
+- ⬜ **D7. Cross-references in doc-comments** — expand `///` docs with clickable symbol links following
+  established conventions (JSDoc `{@link Name}` / rustdoc intra-doc `` [`Name`] ``) rather than a bespoke
+  syntax, resolving names via D2's symbol table definition spans for click-to-definition; single-file first,
+  workspace-wide later.
 
 ---
 
