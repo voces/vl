@@ -4,6 +4,7 @@ import {
   createConnection,
   Diagnostic,
   DiagnosticSeverity,
+  DiagnosticTag,
   Hover,
   InlayHint,
   InlayHintKind,
@@ -24,6 +25,7 @@ import {
   rangeFromCtx,
   stringifyType,
   VLDiagnostic,
+  VLDiagnosticTag,
   VLSeverity,
 } from "../../compiler/compile.ts";
 import type { Context } from "../../compiler/ast.ts";
@@ -65,12 +67,19 @@ const severityMap: Record<VLSeverity, DiagnosticSeverity> = {
   info: DiagnosticSeverity.Information,
 };
 
+const tagMap: Record<VLDiagnosticTag, DiagnosticTag> = {
+  unnecessary: DiagnosticTag.Unnecessary,
+  deprecated: DiagnosticTag.Deprecated,
+};
+
 const toLspDiagnostic = (d: VLDiagnostic): Diagnostic => ({
   message: d.message,
   severity: severityMap[d.severity],
   range: d.range,
   code: d.code,
   source: d.source,
+  // `unnecessary` → VS Code dims/greys the span (unused/unreachable code).
+  tags: d.tags?.map((t) => tagMap[t]),
 });
 
 documents.onDidChangeContent(async (event) => {

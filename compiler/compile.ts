@@ -40,12 +40,18 @@ export type { Comment } from "./lexer.ts";
 export type VLSeverity = "error" | "warning" | "info";
 export type VLPosition = { line: number; character: number };
 export type VLRange = { start: VLPosition; end: VLPosition };
+// LSP diagnostic tags (LSP `DiagnosticTag`): `unnecessary` renders the span
+// faded/greyed out (VS Code dims unused/unreachable code rather than only
+// squiggling it); `deprecated` strikes it through. The lint pass tags
+// unused-variable / unreachable-code as `unnecessary`.
+export type VLDiagnosticTag = "unnecessary" | "deprecated";
 export type VLDiagnostic = {
   message: string;
   severity: VLSeverity;
   range: VLRange;
   code?: string | number;
   source: "vital";
+  tags?: VLDiagnosticTag[];
 };
 
 export type CompileResult = {

@@ -104,9 +104,14 @@ const unusedBindings = (
     if (b.kind !== "variable" && b.kind !== "parameter") continue;
     if (b.name.startsWith("_")) continue; // intentionally-unused convention
     if (used.has(b)) continue;
-    // Exempt module-level variables (a parameter is never program-scoped). A
-    // top-level binding's stamped scope is the whole-document span, anchored at
-    // line 1, column 0; locals are stamped with their block's `{ … }` extent.
+    // Module-level variables are NOT flagged *yet*. Under the current module
+    // model (modules-design: top-level bindings are the file's export surface),
+    // every top-level `let` is de-facto exported, so "unused" can't be inferred
+    // from the single file. Once an explicit `export` keyword lands, an unused
+    // *non-exported* top-level binding becomes real dead code and should warn —
+    // tracked in ROADMAP B17. (A parameter is never program-scoped.) A top-level
+    // binding's stamped scope is the whole-document span, anchored at line 1,
+    // column 0; locals are stamped with their block's `{ … }` extent.
     if (
       b.kind === "variable" && b.scope !== undefined &&
       b.scope.start.line === 1 && b.scope.start.column === 0
@@ -121,6 +126,7 @@ const unusedBindings = (
       range: rangeFromCtx(b.decl),
       code: "unused-variable",
       source: "vital",
+      tags: ["unnecessary"],
     });
   }
 };
@@ -230,6 +236,7 @@ const unreachableInBlock = (
         range: rangeFromCtx(span),
         code: "unreachable-code",
         source: "vital",
+        tags: ["unnecessary"],
       });
     }
   }
