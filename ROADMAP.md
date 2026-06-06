@@ -67,7 +67,15 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   `type Box<T> = {value: T}`, applied in any type position incl. nested/array; `tests/cases/generics/`)
   done. **Build-side array generics done:** `xs.map(f)` / `xs.filter(f)` build a new `T[]`/`U[]` over the
   growable rep (B6); `map`'s result element `U` is inferred from the callback's return via a shared `Infer`
-  hole + the existing per-call instantiation. REMAINING: same for `Map`/`Set` when they land (B6a).
+  hole + the existing per-call instantiation. REMAINING: same for `Map`/`Set` when they land (B6a);
+  **annotation-free inference for forward-referenced / mutually-recursive top-level functions** — #67
+  landed mutual recursion via signature *hoisting*, but a fully un-annotated cyclic group still needs a
+  declared return type; closing that needs call-graph **SCC grouping + group unification** (ML
+  `let rec … and …` style: hole the whole cluster's signatures, check bodies together, solve). Matters
+  for VL's inference-first identity (a recursive-descent compiler is one big mutually-recursive cluster).
+  Also REMAINING: **const generics** (numeric/*value* type parameters, e.g. `Decimal<10, 8>` /
+  `Buffer<N>`) — today generics take *type* params only; the enabler for the parameterized fixed-point
+  `Decimal<Backing, Scale>` family (B2) and any fixed-size/parameter-by-value type.
 - 🟢 **A11. Recursive structural types.** Done — `type Tree = { value, left: Tree | null, … }`
   constructs/traverses/compiles (cycle-safe traversals + a self-referential WasmGC struct rec-group;
   `types/recursive-tree.vl`). REMAINING: mutual recursion across *separate* `type` decls; recursion
@@ -103,7 +111,14 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ✅ **B1. Allocation strategy = WasmGC** (binaryen 116→130 for the GC API). → `DECISIONS.md`.
 - 🟡 **B2. Numeric codegen.** Done: i64 & f32 arithmetic + float `/` & comparisons; i64/f32 type
   mappings; range-aware integer-literal defaults. REMAINING: explicit value casting/coercion between
-  numeric types (today only literals coerce).
+  numeric types (today only literals coerce); **`0x` hex / `0o` octal / `0b` binary integer literals
+  + digit separators** (`1_000`, `0xFF_FF`) — a lexer/parser add the self-host lexer flagged (it does
+  hex via `* 16` for lack of the literal); **arbitrary-precision `BigInt` and a `Decimal<Backing, Scale>`
+  family** as future ***`std`-library*** generic types (not primitives — wasm has only
+  `i32`/`i64`/`f32`/`f64`). A decimal is a scaled integer (`mantissa × 10⁻ˢᶜᵃˡᵉ`) parameterized over a
+  backing int (`i64`/`i128` bounded, or `BigInt` unbounded) and a scale: `Decimal<i64,2>` = currency,
+  `Decimal<BigInt,8>` = arbitrary-magnitude, with `BigDecimal` the dynamic-scale member. **Prereq:
+  const generics** (numeric/value type params, e.g. `Decimal<10,8>`) — see A10; rides the module/`std` work.
 - ✅ **B3. First-class functions / indirect calls + per-shape monomorphization.** A function value is
   a fat-pointer closure `{ tableIndex, env }`; each call site instantiates a fresh signature, keyed in
   codegen by wasm param signature. (See `vl-monomorphization` memo; folds into A10.)
@@ -156,8 +171,10 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
   `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.
-  **Strings direction (design/research; not before bootstrap):** `docs/strings-design.md` (being
-  written) — long-term UTF-8 internal storage, non-code-point-indexed API, ASCII fast-path. Ties A7.
+  **Strings direction (design/research; not before bootstrap):** `docs/strings-design.md` —
+  long-term UTF-8 internal storage, **code-point-indexed API** (`s[i]` = code point) made O(1) for the
+  ASCII common case by an **ASCII fast-path** flag, no UTF-8-validity guarantee (Go-style), graphemes
+  in an opt-in `std/unicode` module; strings immutable. Ties A7.
 - 🟡 **B8. Loops.** Done: `for…in` over arrays, direction-aware `step`, single-line block bodies,
   empty-range warning. REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
   destructuring forms.
