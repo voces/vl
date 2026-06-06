@@ -137,6 +137,10 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   `o[k] = v`), dispatched as a field-method call resolved statically; a native i32-keyed array keeps
   its fast `array.get`/`array.set`, so the trap fires only for non-array objects that declare it.
   (→ `DECISIONS.md`.) REMAINING: callable objects (`"()"`).
+- ⬜ **B13a. Multi-index matrix idiom** (low priority). Single-bracket `m[i, j]` (comma-separated
+  indices → multi-arg `"[]"`/`"[]="` traps) plus a flat-backed `Matrix`/`Grid` type (contiguous
+  storage, no array-of-arrays pointer-chase) for cache-friendly numeric work. Nested `m[i][j]`
+  already composes today, so this is the ergonomic/perf matrix sugar, not basic 2D support.
 - 🟡 **B14. Methods via explicit `self` + UFCS (no `this`).** Done (core): a free `self`-first
   function is callable as `o.f(args)` (rewrites to `f(o, args)`, monomorphized per receiver);
   resolution order field-then-self-fn; non-`self` functions aren't instance-reachable. (Full decision
