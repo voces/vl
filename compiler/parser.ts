@@ -320,6 +320,9 @@ export const parseProgram = (
         skipNewlines();
         if (at("COMMA")) {
           next();
+          // Trailing comma: a `,` immediately before `>` closes the list.
+          skipNewlines();
+          if (at("GREATER_THAN")) break;
           continue;
         }
         break;
@@ -1074,7 +1077,11 @@ export const parseProgram = (
     return arg;
   };
 
-  /** `arg (, arg)*`, each `(ID COLON)? expr`. Stops at the closing `)`. */
+  /**
+   * `arg (, arg)*` with an optional trailing comma, each `(ID COLON)? expr`.
+   * Stops at the closing `)`. One trailing comma before `)` is allowed and
+   * ignored (`f(a, b,)`); a doubled `,,` or a lone `,` in `()` still errors.
+   */
   const parseArguments = (): VLArgumentNode[] => {
     const args: VLArgumentNode[] = [];
     skipNewlines();
@@ -1093,6 +1100,9 @@ export const parseProgram = (
       skipNewlines();
       if (at("COMMA")) {
         next();
+        // Trailing comma: a `,` immediately before `)` closes the list.
+        skipNewlines();
+        if (at("RPAREN")) break;
         continue;
       }
       break;
@@ -1791,6 +1801,9 @@ export const parseProgram = (
         skipNewlines();
         if (at("COMMA")) {
           next();
+          // Trailing comma: a `,` immediately before `>` closes the list.
+          skipNewlines();
+          if (at("GREATER_THAN")) break;
           continue;
         }
         break;
@@ -1824,6 +1837,9 @@ export const parseProgram = (
       skipNewlines();
       if (at("COMMA")) {
         next();
+        // Trailing comma: a `,` immediately before `)` closes the list.
+        skipNewlines();
+        if (at("RPAREN")) break;
         continue;
       }
       break;
