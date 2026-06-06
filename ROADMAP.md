@@ -67,7 +67,12 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   `type Box<T> = {value: T}`, applied in any type position incl. nested/array; `tests/cases/generics/`)
   done. **Build-side array generics done:** `xs.map(f)` / `xs.filter(f)` build a new `T[]`/`U[]` over the
   growable rep (B6); `map`'s result element `U` is inferred from the callback's return via a shared `Infer`
-  hole + the existing per-call instantiation. REMAINING: same for `Map`/`Set` when they land (B6a).
+  hole + the existing per-call instantiation. REMAINING: same for `Map`/`Set` when they land (B6a);
+  **annotation-free inference for forward-referenced / mutually-recursive top-level functions** — #67
+  landed mutual recursion via signature *hoisting*, but a fully un-annotated cyclic group still needs a
+  declared return type; closing that needs call-graph **SCC grouping + group unification** (ML
+  `let rec … and …` style: hole the whole cluster's signatures, check bodies together, solve). Matters
+  for VL's inference-first identity (a recursive-descent compiler is one big mutually-recursive cluster).
 - 🟢 **A11. Recursive structural types.** Done — `type Tree = { value, left: Tree | null, … }`
   constructs/traverses/compiles (cycle-safe traversals + a self-referential WasmGC struct rec-group;
   `types/recursive-tree.vl`). REMAINING: mutual recursion across *separate* `type` decls; recursion
