@@ -34,8 +34,9 @@ import {
   type VLSeverity,
   wasmToWat,
 } from "./compile.ts";
+import { format } from "./format.ts";
 
-const SUBCOMMANDS = new Set(["run", "build", "check"]);
+const SUBCOMMANDS = new Set(["run", "build", "check", "fmt"]);
 
 // --- severity ranking -----------------------------------------------------
 
@@ -602,6 +603,102 @@ const check = async (args: string[]): Promise<void> => {
   Deno.exit(tally.gating > 0 ? 1 : 0);
 };
 
+// --- fmt ------------------------------------------------------------------
+
+// The AST-driven formatter (compiler/format.ts) rewrites source into canonical
+// form: it parses to the typed AST and regenerates source from it (spans +
+// comment list + the reprint-fidelity fields), reflowing over-long calls /
+// literals / boolean chains and collapsing them back when they fit. `fmt` is a
+// thin I/O shell around the pure `format()`:
+//
+//   vl fmt <file.vl>        print the formatted source to stdout
+//   vl fmt -w <path>        rewrite the file(s) in place
+//   vl fmt --check <path>   exit non-zero if any file is not already formatted
+//   vl fmt <dir>            recurse over every *.vl under a directory
+//   cmd | vl fmt            format stdin to stdout
+//
+// Self-contained (mirrors `check`'s walk/flags) so it composes with the other
+// in-flight CLI work without touching the run/build/check regions.
+
+type FmtArgs = {
+  write: boolean;
+  check: boolean;
+  paths: string[];
+};
+
+const parseFmtArgs = (args: string[]): FmtArgs => {
+  const parsed: FmtArgs = { write: false, check: false, paths: [] };
+  for (const a of args) {
+    if (a === "-w" || a === "--write") parsed.write = true;
+    else if (a === "--check") parsed.check = true;
+    else if (!a.startsWith("-")) parsed.paths.push(a);
+  }
+  return parsed;
+};
+
+// Format one file. In --check mode, report (don't rewrite) and flag drift; in
+// -w mode, rewrite only when the content actually changes; otherwise print to
+// stdout. Returns whether the file was already formatted (for the --check gate).
+const fmtFile = async (
+  file: string,
+  opts: FmtArgs,
+): Promise<{ changed: boolean }> => {
+  const source = await Deno.readTextFile(file);
+  const formatted = format(source);
+  const changed = formatted !== source;
+
+  if (opts.check) {
+    if (changed) console.error(`${file}: not formatted`);
+    return { changed };
+  }
+  if (opts.write) {
+    if (changed) await Deno.writeFile(file, new TextEncoder().encode(formatted));
+    return { changed };
+  }
+  await Deno.stdout.write(new TextEncoder().encode(formatted));
+  return { changed };
+};
+
+const fmt = async (args: string[]): Promise<void> => {
+  const opts = parseFmtArgs(args);
+
+  // No path: format stdin to stdout (`cmd | vl fmt`). `-w` is meaningless on a
+  // stream, so it is ignored; `--check` reports drift via the exit code.
+  if (opts.paths.length === 0) {
+    const source = await new Response(Deno.stdin.readable).text();
+    const formatted = format(source);
+    if (opts.check) {
+      Deno.exit(formatted === source ? 0 : 1);
+    }
+    await Deno.stdout.write(new TextEncoder().encode(formatted));
+    return;
+  }
+
+  // Expand each path: a file is taken as-is; a directory is walked recursively
+  // (reusing `collectVlFiles`, the same skip-list as `check`).
+  const files: string[] = [];
+  for (const path of opts.paths) {
+    let info: Deno.FileInfo;
+    try {
+      info = await Deno.stat(path);
+    } catch {
+      console.error(`fmt: no such file or directory: ${path}`);
+      Deno.exit(2);
+    }
+    if (info.isDirectory) files.push(...await collectVlFiles(path));
+    else files.push(path);
+  }
+
+  let drift = 0;
+  for (const file of files) {
+    const { changed } = await fmtFile(file, opts);
+    if (changed && (opts.check || opts.write)) drift++;
+  }
+
+  // --check is a CI gate: non-zero exit when any file would change.
+  if (opts.check) Deno.exit(drift > 0 ? 1 : 0);
+};
+
 // --- dispatch -------------------------------------------------------------
 
 // Program name in help/usage. The shipped binary is `vl` (see
@@ -615,6 +712,7 @@ Usage:
   cmd | vl   ·   vl < file.vl   compile and run stdin
   vl build <file.vl> [options]  compile to WebAssembly
   vl check [path] [options]     report diagnostics only (no run); CI exit code
+  vl fmt [path] [-w|--check]    format source (AST-driven); stdout / write / gate
   vl help  ·  --help  ·  -h     show this help
 
 build options:
@@ -636,13 +734,21 @@ check:
                                \`--severity warning\` fails on warnings/errors and
                                hides info/hints
 
+fmt:
+  path                         a .vl file or a directory (recursive); omit to
+                               read stdin and write the result to stdout
+  -w, --write                  rewrite the file(s) in place
+  --check                      don't write; exit non-zero if any file differs
+
 examples:
   vl hello.vl
   vl -e 'print(1 + 2)'
   vl build hello.vl --wat
   vl check .
   vl check . --exclude tests --exclude '*.gen.vl'
-  vl check . --severity warning`;
+  vl check . --severity warning
+  vl fmt -w src/
+  cat hello.vl | vl fmt`;
 
 const main = async (): Promise<void> => {
   const [maybeCmd, ...rest] = Deno.args;
@@ -671,6 +777,7 @@ const main = async (): Promise<void> => {
 
   if (cmd === "build") return await build(args);
   if (cmd === "check") return await check(args);
+  if (cmd === "fmt") return await fmt(args);
   return await run(args);
 };
 

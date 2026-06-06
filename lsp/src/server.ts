@@ -16,6 +16,7 @@ import {
   SemanticTokens,
   TextDocuments,
   TextDocumentSyncKind,
+  TextEdit,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import {
@@ -28,6 +29,7 @@ import {
   VLDiagnosticTag,
   VLSeverity,
 } from "../../compiler/compile.ts";
+import { format } from "../../compiler/format.ts";
 import type { Context } from "../../compiler/ast.ts";
 import { tokenize } from "../../compiler/lexer.ts";
 import {
@@ -362,6 +364,29 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     .map(toCompletionItem);
 });
 
+// Document formatting (D4): rewrite the whole document through the AST-driven
+// formatter (`compiler/format.ts`). Returned as a single full-range TextEdit —
+// the formatter is whole-document and idempotent, so a full replace is correct
+// and lets the editor compute a minimal on-disk diff. A parse/format failure
+// yields no edits rather than a corrupting partial result.
+connection.onDocumentFormatting((params): TextEdit[] => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+  const text = doc.getText();
+  let formatted: string;
+  try {
+    formatted = format(text);
+  } catch {
+    return [];
+  }
+  if (formatted === text) return [];
+  const fullRange: Range = {
+    start: { line: 0, character: 0 },
+    end: doc.positionAt(text.length),
+  };
+  return [{ range: fullRange, newText: formatted }];
+});
+
 documents.listen(connection);
 
 connection.onInitialize((params) => {
@@ -382,6 +407,7 @@ connection.onInitialize((params) => {
       },
       definitionProvider: true,
       referencesProvider: true,
+      documentFormattingProvider: true,
       hoverProvider: true,
       inlayHintProvider: true,
       semanticTokensProvider: {
