@@ -2239,10 +2239,10 @@ export const toWasm = async (ast: VLProgramNode) => {
               "(only i32 and boolean are supported so far)",
           );
         }
-        // `fromCharCode(code)` is a compiler builtin (H2): construct a single-
-        // character VL string from an i32 char code. A VL string is a WasmGC
-        // i32-array of char codes, so this is a length-1 array holding the code.
-        if (node.function === "fromCharCode") {
+        // `fromCodePoint(code)` is a compiler builtin (H2): construct a single-
+        // character VL string from an i32 Unicode code point. A VL string is a
+        // WasmGC i32-array of code points, so this is a length-1 array holding it.
+        if (node.function === "fromCodePoint") {
           const arg = node.arguments[0].value;
           const code = withDesiredType(
             { type: "Alias", name: "i32" },
