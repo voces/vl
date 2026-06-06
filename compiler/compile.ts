@@ -22,6 +22,7 @@ import { tokenize } from "./lexer.ts";
 import { parseProgram } from "./parser.ts";
 import { defaultScope } from "./defaultScope.ts";
 import { SymbolTable } from "./symbols.ts";
+import { lint } from "./lint.ts";
 
 // NOTE: binaryen is NOT imported statically here. A top-level `import Binaryen
 // from "binaryen"` would be evaluated whenever this module loads, dragging the
@@ -281,6 +282,11 @@ export const checkOnly = (source: string): CheckResult => {
   const { tokens, diagnostics, comments } = tokenize(source);
   const [ast, errors, symbols, spans] = parseProgram(tokens, defaultScope());
   for (const error of errors) diagnostics.push(diagnosticFromError(error));
+  // Static lint pass (B17): unused-variable / unreachable-code warnings, derived
+  // from the symbol table + AST the front end already produced. Runs even when
+  // there are errors — lint warnings are independent of codegen and useful while
+  // a file still has type errors. A diverging parse (no statements) yields none.
+  for (const d of lint(ast.statements, symbols, spans)) diagnostics.push(d);
   return { ast, diagnostics, symbols, spans, comments };
 };
 
