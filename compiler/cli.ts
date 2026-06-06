@@ -8,7 +8,7 @@
 //   deno task check <dir>              # recursively check every *.vl under dir
 //   deno task check                    # no path → check the cwd (like `check .`)
 //   deno task check --concise <path>   # one terse line per diagnostic (grep-safe)
-//   deno task check . --severity warning  # also fail the exit code on warnings
+//   deno task check . --severity warning  # fail on warnings AND hide info/hints
 //   deno task run help / --help / -h    # list commands (also shown when the
 //                                       # binary is run with no args in a TTY)
 //
@@ -54,6 +54,13 @@ const SEVERITY_ORDER: readonly VLSeverity[] = [
 
 export const severityRank = (sev: VLSeverity): number =>
   SEVERITY_ORDER.indexOf(sev);
+
+// The lowest severity in the order (`hint`). Used as the default *display
+// floor*: with no explicit `--severity`, every diagnostic is at or above this,
+// so `check` prints all of them (errors + warnings + info + hints) — preserving
+// today's behaviour where the exit gate defaults to `error` but display is
+// unfiltered.
+const LOWEST_SEVERITY: VLSeverity = SEVERITY_ORDER[0];
 
 // True when `sev` is at or above `threshold` in the severity order, i.e. when a
 // diagnostic of that severity should count toward `check`'s non-zero exit.
@@ -417,13 +424,19 @@ type CheckTally = { errors: number; warnings: number; gating: number };
 // historical `<file>: <severity> [L:C] <message>` line exactly (grep-safe,
 // uncolored); pretty mode renders the rustc/Deno-style block per diagnostic.
 // `threshold` decides which diagnostics count toward `tally.gating` (the exit
-// gate); display is unaffected — every diagnostic still prints.
+// gate). `displayFloor` decides which diagnostics are *printed*: only those at
+// or above it appear (in both concise and pretty paths). The floor defaults to
+// the lowest severity (`hint`), so with no `--severity` flag everything shows;
+// passing `--severity L` raises the floor to L so lower-severity diagnostics are
+// hidden as well as un-gated. Counting still walks every diagnostic, so the
+// tally (and the gating exit) is unaffected by what is shown.
 const checkFile = async (
   file: string,
   concise: boolean,
   c: Colors,
   tally: CheckTally,
   threshold: VLSeverity,
+  displayFloor: VLSeverity,
 ): Promise<void> => {
   const source = await Deno.readTextFile(file);
   // `check` only needs diagnostics, so use the codegen-free front end: it skips
@@ -435,22 +448,35 @@ const checkFile = async (
   const { diagnostics } = checkOnly(source);
   if (diagnostics.length === 0) return;
 
+  // Diagnostics to display: only those at or above the display floor. The tally
+  // loop below still walks the full, unfiltered list so hidden diagnostics keep
+  // their effect on the gating exit code.
+  const shown = diagnostics.filter((d) =>
+    meetsThreshold(d.severity, displayFloor)
+  );
+
   if (concise) {
-    for (const d of diagnostics) {
+    for (const d of shown) {
       console.error(`${file}: ${formatDiagnostic(d)}`);
     }
   } else {
     const sourceLines = source.split("\n");
-    for (const d of diagnostics) {
+    for (const d of shown) {
       console.error(formatPretty(d, file, sourceLines, c));
       console.error("");
     }
   }
 
+  // `gating` walks the full list (a hidden diagnostic still gates the exit if it
+  // meets the gate threshold). `errors`/`warnings` feed the summary line, so we
+  // count only *shown* diagnostics — otherwise the summary would advertise
+  // counts the user can no longer see in the output above it.
   for (const d of diagnostics) {
+    if (meetsThreshold(d.severity, threshold)) tally.gating++;
+  }
+  for (const d of shown) {
     if (d.severity === "error") tally.errors++;
     else if (d.severity === "warning") tally.warnings++;
-    if (meetsThreshold(d.severity, threshold)) tally.gating++;
   }
 };
 
@@ -458,7 +484,12 @@ type CheckArgs = {
   target: string;
   concise: boolean;
   excludes: string[];
+  // Exit-code gate threshold. Defaults to `error` (only errors fail).
   severity: VLSeverity;
+  // Display floor: only diagnostics at or above this are printed. Defaults to
+  // the lowest severity (show everything) unless `--severity` is given, in which
+  // case it equals `severity` so the run hides as well as un-gates lower levels.
+  displayFloor: VLSeverity;
 };
 
 // Validate a `--severity` value against the known levels, exiting with a clean
@@ -476,16 +507,23 @@ const parseSeverity = (value: string | undefined): VLSeverity => {
 };
 
 // Parse `check`'s args into a path target, the `--concise` flag, the list of
-// `--exclude`/`--ignore` patterns, and the `--severity` exit-code threshold.
-// Both value forms are accepted for `--exclude`/`--ignore` and `--severity`: a
-// separate value (`--severity warning`) and an inline `=` form
-// (`--severity=warning`). The consumed VALUE is never mistaken for the path
-// target. `--severity` defaults to `error` (today's behaviour: only errors
-// fail).
+// `--exclude`/`--ignore` patterns, and the `--severity` level. Both value forms
+// are accepted for `--exclude`/`--ignore` and `--severity`: a separate value
+// (`--severity warning`) and an inline `=` form (`--severity=warning`). The
+// consumed VALUE is never mistaken for the path target.
+//
+// `--severity` does double duty: it sets the exit-code gate AND the display
+// floor. The gate defaults to `error` (today's behaviour: only errors fail).
+// The display floor, however, defaults to "show everything" — so we track
+// whether `--severity` was *explicitly* given. If it was, the display floor is
+// raised to that level (hiding lower-severity diagnostics too); if not, the
+// floor stays at the lowest severity and every diagnostic still prints.
 const parseCheckArgs = (args: string[]): CheckArgs => {
   let target: string | undefined;
   let concise = false;
   let severity: VLSeverity = "error";
+  // Whether `--severity` was passed. Drives the display floor (see below).
+  let severityGiven = false;
   const excludes: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -498,8 +536,10 @@ const parseCheckArgs = (args: string[]): CheckArgs => {
       excludes.push(...a.slice(a.indexOf("=") + 1).split(","));
     } else if (a === "--severity") {
       severity = parseSeverity(args[++i]);
+      severityGiven = true;
     } else if (a.startsWith("--severity=")) {
       severity = parseSeverity(a.slice(a.indexOf("=") + 1));
+      severityGiven = true;
     } else if (!a.startsWith("-") && target === undefined) {
       target = a;
     }
@@ -510,12 +550,16 @@ const parseCheckArgs = (args: string[]): CheckArgs => {
     concise,
     excludes: excludes.filter((p) => p !== ""),
     severity,
+    // Floor = chosen level when `--severity` is explicit, else show-all.
+    displayFloor: severityGiven ? severity : LOWEST_SEVERITY,
   };
 };
 
 const check = async (args: string[]): Promise<void> => {
   // No path argument → default to the current working directory (`vl check .`).
-  const { target, concise, excludes, severity } = parseCheckArgs(args);
+  const { target, concise, excludes, severity, displayFloor } = parseCheckArgs(
+    args,
+  );
   // No color when piped, when NO_COLOR is set, or in concise mode (kept plain
   // so scripts/grep see stable bytes).
   const c = makeColors(!concise && shouldColor());
@@ -542,10 +586,12 @@ const check = async (args: string[]): Promise<void> => {
 
   // CI gate: never run the program; fail on any diagnostic at or above the
   // `--severity` threshold (default `error`), aggregated across every file
-  // checked. `tally.gating` counts exactly those diagnostics.
+  // checked. `tally.gating` counts exactly those diagnostics. `displayFloor`
+  // controls which diagnostics are printed (everything by default; only ≥ the
+  // chosen level when `--severity` is passed) — independent of the tally.
   const tally: CheckTally = { errors: 0, warnings: 0, gating: 0 };
   for (const file of files) {
-    await checkFile(file, concise, c, tally, severity);
+    await checkFile(file, concise, c, tally, severity, displayFloor);
   }
 
   // Pretty mode ends with a Deno-style summary; concise stays output-stable.
@@ -584,9 +630,11 @@ check:
                                Matches the path relative to <path> and the
                                basename; \`*\` stops at \`/\`, \`**\` crosses it
   --severity <level>           exit non-zero on any diagnostic at or above
-                               <level> (error > warning > info > hint;
-                               default: error). All diagnostics still print;
-                               this only gates the exit code
+                               <level>, AND show only diagnostics at or above
+                               <level> (error > warning > info > hint; default:
+                               error gate, but show everything). E.g.
+                               \`--severity warning\` fails on warnings/errors and
+                               hides info/hints
 
 examples:
   vl hello.vl

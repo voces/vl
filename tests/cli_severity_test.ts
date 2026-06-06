@@ -1,12 +1,16 @@
 // Tests for `vl check --severity <level>`: the severity-rank/threshold helpers
-// in isolation, plus the end-to-end exit-code behaviour driven through the real
-// CLI as a subprocess. The flag only gates the EXIT CODE — every diagnostic
-// still prints — so the subprocess assertions key on `code`, not on output.
+// in isolation, plus the end-to-end behaviour driven through the real CLI as a
+// subprocess. `--severity` does double duty — it both gates the EXIT CODE and
+// filters the DISPLAYED diagnostics (only those at or above the level print).
+// So the exit-code tests key on `code`; the display tests capture stderr and
+// assert a diagnostic's presence/absence in the output.
 //
 // Severity order, high → low: error > warning > info > hint. `check` exits
 // non-zero when ANY diagnostic is at or above the chosen level; default `error`
-// (only errors fail). A `let x = 1` produces a `warning` (unused variable); a
-// `let _x = 1` produces a `hint` (intentionally-unused) — handy severity probes.
+// (only errors fail). Crucially, with NO `--severity` flag the display floor is
+// "show everything" (gate stays `error`), so warnings/hints still print by
+// default. A `let x = 1` produces a `warning` (unused variable); a `let _x = 1`
+// produces a `hint` (intentionally-unused) — handy severity probes.
 //
 // Run with: deno test -A --no-check tests/cli_severity_test.ts
 
@@ -74,6 +78,38 @@ const runCheck = async (
   }
 };
 
+// Like `runCheck`, but capture stderr (where diagnostics print) alongside the
+// exit code, so display-filtering tests can assert what was/wasn't shown. Uses
+// `--concise` for a stable, grep-friendly one-line-per-diagnostic format.
+const runCheckCapture = async (
+  source: string,
+  flags: string[],
+): Promise<{ code: number; stderr: string }> => {
+  const dir = await Deno.makeTempDir({ prefix: "vl_sev_" });
+  const file = `${dir}/probe.vl`;
+  await Deno.writeTextFile(file, source);
+  try {
+    const cmd = new Deno.Command(Deno.execPath(), {
+      args: [
+        "run",
+        "-A",
+        "--no-check",
+        new URL("../compiler/cli.ts", import.meta.url).pathname,
+        "check",
+        file,
+        "--concise",
+        ...flags,
+      ],
+      stdout: "null",
+      stderr: "piped",
+    });
+    const { code, stderr } = await cmd.output();
+    return { code, stderr: new TextDecoder().decode(stderr) };
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+};
+
 const WARNING_SRC = "let x = 1\n"; // unused top-level variable → warning
 const HINT_SRC = "let _x = 1\n"; // intentionally-unused → hint
 const ERROR_SRC = "let x: Int = true\n"; // type mismatch → error
@@ -114,4 +150,64 @@ Deno.test("check: an error always fails, even at --severity hint", async () => {
 Deno.test("check: an unknown --severity level errors cleanly (exit 2)", async () => {
   const code = await runCheck(WARNING_SRC, ["--severity", "bogus"]);
   assert(code === 2, "unknown level is a clean usage error");
+});
+
+// --- display filtering: `--severity` also controls which diagnostics print ---
+
+Deno.test("check: no --severity flag still PRINTS a warning (default shows all)", async () => {
+  const { stderr } = await runCheckCapture(WARNING_SRC, []);
+  assert(
+    stderr.includes("warning") && stderr.includes("Unused"),
+    `default should display the warning, got: ${stderr}`,
+  );
+});
+
+Deno.test("check: no --severity flag still PRINTS a hint (default shows all)", async () => {
+  const { stderr } = await runCheckCapture(HINT_SRC, []);
+  assert(
+    stderr.includes("hint") && stderr.includes("Intentionally-unused"),
+    `default should display the hint, got: ${stderr}`,
+  );
+});
+
+Deno.test("check: --severity warning PRINTS a warning", async () => {
+  const { stderr } = await runCheckCapture(WARNING_SRC, ["--severity", "warning"]);
+  assert(
+    stderr.includes("Unused"),
+    `--severity warning should display the warning, got: ${stderr}`,
+  );
+});
+
+Deno.test("check: --severity warning HIDES an info/hint", async () => {
+  // A hint sits below the `warning` floor, so it must not appear in output.
+  const { stderr } = await runCheckCapture(HINT_SRC, ["--severity", "warning"]);
+  assert(
+    !stderr.includes("Intentionally-unused") && !stderr.includes("hint ["),
+    `--severity warning should hide the hint, got: ${stderr}`,
+  );
+});
+
+Deno.test("check: --severity error PRINTS an error", async () => {
+  const { stderr } = await runCheckCapture(ERROR_SRC, ["--severity", "error"]);
+  assert(
+    stderr.includes("error ["),
+    `--severity error should display the error, got: ${stderr}`,
+  );
+});
+
+Deno.test("check: --severity error HIDES a warning", async () => {
+  // The warning is below the `error` floor: gated out AND filtered from display.
+  const { stderr } = await runCheckCapture(WARNING_SRC, ["--severity", "error"]);
+  assert(
+    !stderr.includes("Unused") && !stderr.includes("warning ["),
+    `--severity error should hide the warning, got: ${stderr}`,
+  );
+});
+
+Deno.test("check: --severity hint shows everything (hint is the floor)", async () => {
+  const { stderr } = await runCheckCapture(HINT_SRC, ["--severity", "hint"]);
+  assert(
+    stderr.includes("Intentionally-unused"),
+    `--severity hint should still display the hint, got: ${stderr}`,
+  );
 });
