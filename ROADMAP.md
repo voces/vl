@@ -303,11 +303,17 @@ corpus (A12) is the host-agnostic oracle — the same tests pass whichever compi
   embedded — see C5. Decoupled from everything below; today's compiler unchanged.
 - ✅ **H1. Parser self-hostable (= Track G).** The one piece that categorically can't live in a
   VL-in-VL compiler is gone.
-- ⬜ **H2. Make VL expressive enough to write a compiler.** Recursive tree types (**A11 ✅**), generic
-  collections (**A10**, **B6** `List`, **B6a** maps), string munging (**A7** methods). A10 +
-  collections are the remaining gap — the capability bar for the port.
+- 🟡 **H2. Make VL expressive enough to write a compiler.** Recursive tree types (**A11 ✅**), generics
+  (**A10 ✅** incl. `map`/`filter`), `List` (**B6 ✅**), maps (**B6a** ⬜), string munging (**A7**).
+  **Gaps a `selfhost/lexer.vl` spike found** (ranked; the concrete H2 to-do list):
+  (1) ⬜ **can't `.push` a non-nullable struct array** (`Tok[]`) — grow path's `array.new_with_default`
+  rejects non-defaultable struct refs → forces `(T|null)[]` for struct accumulators (blocks AST-node lists;
+  **priority fix**); (2) ⬜ **module-level mutable `let` not mutated through a function** (bug/restriction —
+  confirm); (3) ✅ **string escapes** now decoded in the lexer (`\n`/`\t`/`\xXX`/`\uXXXX`/…); plus known:
+  maps (B6a), enum tag for literal-unions (A16), char literals, a `toString`/stringify.
 - ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
   running the corpus through the VL-written compiler. Incremental; TS and VL compilers cross-checked.
+  First slice (lexer) spiked + closed (#37) pending the H2 gap-1 fix; re-lands clean as `selfhost/`.
 - ⬜ **H4. WASM emission — DECIDED: emit bytes directly + optional `wasm-opt`** (binaryen's npm build
   is JS-bound; → `DECISIONS.md`, incl. the Heap2Local caveat). binaryen stays for the TS compiler.
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime (wasmtime —

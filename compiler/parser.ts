@@ -412,7 +412,9 @@ export const parseProgram = (
     if (at("LBRACE")) return parseObjectType();
     if (at("STRING")) {
       next();
-      return { type: "StringLiteral", value: t.text.slice(1, -1) };
+      // `t.value` is the lexer-decoded literal (escapes resolved, quotes
+      // stripped); fall back to slicing the raw lexeme for safety.
+      return { type: "StringLiteral", value: t.value ?? t.text.slice(1, -1) };
     }
     if (at("NUMBER")) {
       next();
@@ -478,7 +480,7 @@ export const parseProgram = (
             keyName = key.text;
           } else if (at("STRING")) {
             next();
-            keyName = key.text.slice(1, -1);
+            keyName = key.value ?? key.text.slice(1, -1);
           } else {
             // Unexpected; report and bail out of the loop.
             errors.push({
@@ -1095,7 +1097,9 @@ export const parseProgram = (
     if (at("STRING")) {
       next();
       return record(
-        { type: "StringLiteral", value: t.text.slice(1, -1) },
+        // `t.value` is the lexer-decoded literal (escapes resolved, quotes
+        // stripped); fall back to slicing the raw lexeme for safety.
+        { type: "StringLiteral", value: t.value ?? t.text.slice(1, -1) },
         spanOf(t),
       );
     }
@@ -1239,10 +1243,11 @@ export const parseProgram = (
       expect("COLON");
       skipNewlines();
       const value = parseExpr();
-      // Strip the quotes so a key like `"+"` matches the operator name `+`.
+      // Use the lexer-decoded value (escapes resolved, quotes stripped) so a
+      // key like `"+"` matches the operator name `+`; fall back to slicing.
       return {
         type: "PropertyLiteral",
-        name: { type: "StringLiteral", value: s.text.slice(1, -1) },
+        name: { type: "StringLiteral", value: s.value ?? s.text.slice(1, -1) },
         value,
       };
     }
