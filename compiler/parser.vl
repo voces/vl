@@ -1,0 +1,398 @@
+// A recursive-descent parser for a meaningful subset of VL, written in VL
+// (Track H / H3 self-hosting — the component after the lexer).
+//
+// Side-by-side with `compiler/parser.ts`, which it will eventually replace. It
+// consumes a token stream (the `Tok[]` on the global `P` — the real lexer is a
+// parallel re-land, out of scope here) and builds the discriminated-union arena
+// AST defined in `compiler/ast.vl`. Grammar covered:
+//
+//   program    := stmt*
+//   stmt       := letDecl | funcDecl | ifStmt | returnStmt | block | exprStmt
+//   letDecl    := ("let" | "const") IDENT (":" type)? ("=" expr)?
+//   funcDecl   := "function" IDENT "(" params? ")" (":" type)? block
+//   params     := param ("," param)*
+//   param      := IDENT (":" type)?
+//   ifStmt     := "if" expr block ("else" (ifStmt | block))?
+//   returnStmt := "return" expr?
+//   block      := "{" stmt* "}"
+//   type       := IDENT                       (a single type-name annotation)
+//   expr       := assignment (precedence climbing, right-assoc "=")
+//   unary      := ("!" | "-") unary | postfix
+//   postfix    := primary ( "(" args? ")" | "." IDENT )*
+//   primary    := NUMBER | STRING | CHAR | "true" | "false" | IDENT | "(" expr ")"
+//
+// ── Idiomatic structure: GENUINE mutual recursion ────────────────────────────
+// Recursive descent is intrinsically mutually recursive — the expression levels
+// re-enter through `(expr)` / call args, and a block re-enters statements. Forward
+// references / mutual recursion across top-level functions work now (gap #67), so
+// these are written as the natural separate functions (`parseExpr` ↔ `parseUnary`
+// ↔ `parsePrimary`, `parseStmt` ↔ `parseBlock`, …), NOT a single `mode`-dispatched
+// mega-function. The one rule: a forward-referenced / mutually-recursive function
+// must DECLARE its return type — so every parser function is annotated `: i32`
+// (the arena index it produces), idiomatic for a parser anyway.
+//
+// All parser state lives in the `Parser` struct fields, reached through the module
+// global `P` (`compiler/ast.vl`): the token stream, the node arena, the
+// diagnostics, and the cursor. Constructors `.push` onto the struct-field arena
+// directly (gap #66). (`P` is a global, not a struct parameter, only because a
+// struct-typed parameter into a mutually-recursive group miscompiles today — see
+// the gap note in `ast.vl`.) Errors append a `Diag` (VL has no exceptions) and the
+// parser recovers by synthesizing an `ErrExpr` leaf or skipping a token, so the
+// walk always terminates (panic-free).
+
+// ── cursor primitives ────────────────────────────────────────────────────────
+
+// The current token. Past the end, returns the EOF token (the stream always ends
+// with one), so callers never index out of range.
+function peekTok(): Tok {
+  if P.pos >= P.toks.length {
+    return P.toks[P.toks.length - 1]
+  }
+  P.toks[P.pos]
+}
+
+// The current token's kind — the common discriminating `==` compare.
+function peekKind(): string {
+  peekTok().kind
+}
+
+// Consume and return the current token.
+function advance(): Tok {
+  let t = peekTok()
+  if P.pos < P.toks.length {
+    P.pos = P.pos + 1
+  }
+  t
+}
+
+// If the current token has `kind`, consume it and return true; else leave the
+// cursor put and return false. (The "match" combinator.)
+function accept(kind: string): boolean {
+  if peekKind() == kind {
+    P.pos = P.pos + 1
+    return true
+  }
+  false
+}
+
+// Consume a token of the expected `kind`; on mismatch record a diagnostic but
+// still advance (so the parser makes progress and never loops on bad input).
+function expect(kind: string): boolean {
+  if peekKind() == kind {
+    P.pos = P.pos + 1
+    return true
+  }
+  P.diags.push({ msg: "expected " + kind + " but found " + peekKind(), at: P.pos })
+  P.pos = P.pos + 1
+  false
+}
+
+// ── operator precedence ──────────────────────────────────────────────────────
+// Binary-operator binding power; higher binds tighter. `0` means "not a binary
+// operator", which is also the loop-terminating sentinel in the climber.
+function binPrec(kind: string): i32 {
+  if kind == "EQUAL" { return 1 }    // assignment (right-associative)
+  if kind == "OR" { return 2 }
+  if kind == "AND" { return 3 }
+  if kind == "EQ" { return 4 }
+  if kind == "NE" { return 4 }
+  if kind == "LT" { return 5 }
+  if kind == "GT" { return 5 }
+  if kind == "LE" { return 5 }
+  if kind == "GE" { return 5 }
+  if kind == "PLUS" { return 6 }
+  if kind == "MINUS" { return 6 }
+  if kind == "STAR" { return 7 }
+  if kind == "SLASH" { return 7 }
+  if kind == "PERCENT" { return 7 }
+  0
+}
+
+// The right-associative operators (assignment): their RHS parses at the SAME
+// precedence, not `prec + 1`, so `a = b = c` nests as `a = (b = c)`.
+function rightAssoc(kind: string): boolean {
+  kind == "EQUAL"
+}
+
+// ── type annotations ─────────────────────────────────────────────────────────
+// A single type-name leaf (`i32`, `string`, a user type).
+function parseType(): i32 {
+  if peekKind() == "IDENT" {
+    return mkTypeRef(advance().text)
+  }
+  expect("IDENT")
+  mkTypeRef("")
+}
+
+// ── expressions ──────────────────────────────────────────────────────────────
+
+// A literal / identifier / parenthesized expression. The recursion base; re-enters
+// `parseExpr` inside parentheses.
+function parsePrimary(): i32 {
+  let k = peekKind()
+  if k == "NUMBER" {
+    return mkNum(advance().text)
+  }
+  if k == "STRING" {
+    return mkStr(advance().text)
+  }
+  if k == "CHAR" {
+    return mkChar(advance().text)
+  }
+  if k == "TRUE" {
+    advance()
+    return mkBool(1)
+  }
+  if k == "FALSE" {
+    advance()
+    return mkBool(0)
+  }
+  if k == "IDENT" {
+    return mkIdent(advance().text)
+  }
+  if k == "LPAREN" {
+    advance()
+    let inner = parseExpr()
+    expect("RPAREN")
+    return mkParen(inner)
+  }
+  P.diags.push({ msg: "expected an expression but found " + k, at: P.pos })
+  advance()
+  mkErr("expr", P.pos)
+}
+
+// A comma-separated argument list, already past the "(". Consumes the ")".
+// Returns the argument node indices. (A string-returning call can't drive a
+// `while` condition directly — a tracked gap — so the comma test is read into a
+// local `more` and re-checked in the body.)
+function parseArgs(): i32[] {
+  let args: i32[] = []
+  if peekKind() != "RPAREN" {
+    args.push(parseExpr())
+    let more = peekKind() == "COMMA"
+    while more {
+      advance()
+      args.push(parseExpr())
+      more = peekKind() == "COMMA"
+    }
+  }
+  expect("RPAREN")
+  args
+}
+
+// `primary` then a chain of call `(args)` / member `.name` postfixes.
+function parsePostfix(): i32 {
+  let node = parsePrimary()
+  let going = true
+  while going {
+    let k = peekKind()
+    if k == "LPAREN" {
+      advance()
+      let args = parseArgs()
+      node = mkCall(node, args)
+    } else if k == "DOT" {
+      advance()
+      let prop = ""
+      if peekKind() == "IDENT" {
+        prop = advance().text
+      } else {
+        expect("IDENT")
+      }
+      node = mkMember(node, prop)
+    } else {
+      going = false
+    }
+  }
+  node
+}
+
+// Prefix `!` / `-`, else fall through to postfix.
+function parseUnary(): i32 {
+  let k = peekKind()
+  if k == "BANG" {
+    advance()
+    return mkUnary("!", parseUnary())
+  }
+  if k == "MINUS" {
+    advance()
+    return mkUnary("-", parseUnary())
+  }
+  parsePostfix()
+}
+
+// Precedence climbing from `minPrec`, seeded by an already-parsed `left`.
+function parseBinary(left: i32, minPrec: i32): i32 {
+  let acc = left
+  let going = true
+  while going {
+    let k = peekKind()
+    let prec = binPrec(k)
+    if prec == 0 || prec < minPrec {
+      going = false
+    } else {
+      let opText = advance().text
+      let nextMin = prec + 1
+      if rightAssoc(k) { nextMin = prec }
+      let right = parseBinary(parseUnary(), nextMin)
+      acc = mkBinary(opText, acc, right)
+    }
+  }
+  acc
+}
+
+// The expression entry point: a unary operand, then binary precedence climbing
+// from the lowest level (assignment).
+function parseExpr(): i32 {
+  parseBinary(parseUnary(), 1)
+}
+
+// ── statements ───────────────────────────────────────────────────────────────
+
+// `("let" | "const") IDENT (":" type)? ("=" expr)?`
+function parseLet(): i32 {
+  let kw = advance().text          // "let" or "const"
+  let name = ""
+  if peekKind() == "IDENT" {
+    name = advance().text
+  } else {
+    expect("IDENT")
+  }
+  let ty = -1
+  if accept("COLON") {
+    ty = parseType()
+  }
+  let init = -1
+  if accept("EQUAL") {
+    init = parseExpr()
+  }
+  mkLet(kw, name, ty, init)
+}
+
+// `IDENT (":" type)?`
+function parseParam(): i32 {
+  let name = ""
+  if peekKind() == "IDENT" {
+    name = advance().text
+  } else {
+    expect("IDENT")
+  }
+  let ty = -1
+  if accept("COLON") {
+    ty = parseType()
+  }
+  mkParam(name, ty)
+}
+
+// `"function" IDENT "(" params? ")" (":" type)? block`
+function parseFunc(): i32 {
+  advance()                        // "function"
+  let name = ""
+  if peekKind() == "IDENT" {
+    name = advance().text
+  } else {
+    expect("IDENT")
+  }
+  expect("LPAREN")
+  let params: i32[] = []
+  if peekKind() != "RPAREN" {
+    params.push(parseParam())
+    let more = peekKind() == "COMMA"
+    while more {
+      advance()
+      params.push(parseParam())
+      more = peekKind() == "COMMA"
+    }
+  }
+  expect("RPAREN")
+  let ret = -1
+  if accept("COLON") {
+    ret = parseType()
+  }
+  let body = parseBlock()
+  mkFunc(name, params, ret, body)
+}
+
+// `"if" expr block ("else" (ifStmt | block))?`
+function parseIf(): i32 {
+  advance()                        // "if"
+  let cond = parseExpr()
+  let thenB = parseBlock()
+  let els = -1
+  if accept("ELSE") {
+    if peekKind() == "IF" {
+      els = parseIf()
+    } else {
+      els = parseBlock()
+    }
+  }
+  mkIf(cond, thenB, els)
+}
+
+// `"return" expr?`
+function parseReturn(): i32 {
+  advance()                        // "return"
+  let arg = -1
+  let k = peekKind()
+  let stops = k == "RBRACE" || k == "NEWLINE" || k == "EOF" || k == "SEMI"
+  if !stops {
+    arg = parseExpr()
+  }
+  mkReturn(arg)
+}
+
+// `"{" stmt* "}"`
+function parseBlock(): i32 {
+  expect("LBRACE")
+  let stmts: i32[] = []
+  let going = true
+  while going {
+    let k = peekKind()
+    if k == "RBRACE" || k == "EOF" {
+      going = false
+    } else if k == "NEWLINE" || k == "SEMI" {
+      advance()
+    } else {
+      stmts.push(parseStmt())
+    }
+  }
+  expect("RBRACE")
+  mkBlock(stmts)
+}
+
+// One statement: dispatch on the leading keyword, else an expression statement.
+function parseStmt(): i32 {
+  let k = peekKind()
+  if k == "LET" || k == "CONST" {
+    return parseLet()
+  }
+  if k == "FUNCTION" {
+    return parseFunc()
+  }
+  if k == "IF" {
+    return parseIf()
+  }
+  if k == "RETURN" {
+    return parseReturn()
+  }
+  if k == "LBRACE" {
+    return parseBlock()
+  }
+  parseExpr()
+}
+
+// The public entry point: parse a whole program, return the root node index.
+function parseProgram(): i32 {
+  let stmts: i32[] = []
+  let going = true
+  while going {
+    let k = peekKind()
+    if k == "EOF" {
+      going = false
+    } else if k == "NEWLINE" || k == "SEMI" {
+      advance()
+    } else {
+      stmts.push(parseStmt())
+    }
+  }
+  mkProgram(stmts)
+}

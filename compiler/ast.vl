@@ -1,0 +1,268 @@
+// AST + token model for the VL-in-VL parser (Track H / H3 self-hosting).
+//
+// Side-by-side with `compiler/ast.ts`, which it will eventually replace. VL has
+// no module system yet, so the TS driver (`tests/selfhost_parser_test.ts`)
+// concatenates this file ahead of `compiler/parser.vl` and a print-driver before
+// compiling. This file is the data layer the parser builds onto.
+//
+// ── A GENUINE discriminated-union AST ────────────────────────────────────────
+// Each node KIND is its own struct `type` (`NumLit`, `BinExpr`, `Call`, …); the
+// `Node` alias unions them, and the parser/printer discriminate with `is` (which
+// is sound over a struct union now — gap #69 is fixed). This replaces the spike's
+// single `Node { kind: string }` wide-row struct: the kind is the runtime VARIANT,
+// not a tag field, so a mis-parse can't silently read the wrong slot.
+//
+// Discrimination is by structural SHAPE (WasmGC erases field names but the variant
+// tag is field-name-aware): two variants tell apart iff their field-name sets
+// differ. So every variant uses a DISTINCT field-name prefix (`num*`, `bin*`,
+// `call*`, …) — no variant's fields are a subset of another's — which keeps `is`
+// unambiguous across all 19 kinds. (A discriminant `tag` field would also work for
+// genuinely same-shape variants; here the natural shapes already differ.)
+//
+// ── Children by ARENA INDEX ──────────────────────────────────────────────────
+// A node references its children by their `i32` position in a flat `Node[]` arena
+// (`-1` == none), and child LISTS by `i32[]`. This is orthogonal to the union: it
+// sidesteps needing a *recursive* type alias (`BinExpr` holding `left: Node`),
+// which VL's alias resolver can't express yet (a union alias can't forward- or
+// self-reference its members), and is how many production self-hosted parsers
+// represent their AST anyway. The arena lives in a STRUCT FIELD (`Parser.nodes`),
+// and constructors `.push` straight onto it (gap #66 is fixed) — no more threading
+// the array as a bare parameter. (The struct is reached via a module GLOBAL rather
+// than a parameter — see the `Parser` note below for why.)
+
+// ── Token ────────────────────────────────────────────────────────────────────
+// A minimal inline token (NOT the real lexer — a parallel agent owns the lexer
+// re-land). `kind` is a plain string tag, matching the convention the self-hosted
+// lexer uses: VL has no enum / closed-literal-union tag representation yet, and a
+// bare `string` compares with `==` and prints directly.
+type Tok = {
+  kind: string,
+  text: string,
+  pos: i32,
+}
+
+// ── AST node variants ──────────────────────────────────────────────────────
+// One struct per kind. `i32` fields holding a child are an arena INDEX (`-1` ==
+// none); `i32[]` fields are a child list. Literal payloads keep their source
+// `text` (the parser has no reason to evaluate a number, and keeping the lexeme
+// also sidesteps int→f64 field coercion). `boolVal` is `0`/`1` (no `boolean`
+// field needed). Field names are per-variant prefixed so `is` discriminates.
+
+// Expressions ----------------------------------------------------------------
+type NumLit = { numText: string }                              // 12, 3.14
+type StrLit = { strText: string }                              // "hi" (raw)
+type CharLit = { charText: string }                            // 'a'  (raw)
+type BoolLit = { boolVal: i32 }                                // true=1 / false=0
+type Ident = { identName: string }                             // x
+type Unary = { unOp: string, unArg: i32 }                      // !x  -x
+type BinExpr = { binOp: string, binLeft: i32, binRight: i32 }  // a + b,  a = b
+type Call = { callFn: i32, callArgs: i32[] }                   // f(a, b)
+type Member = { memObj: i32, memProp: string }                 // o.field
+type Paren = { parInner: i32 }                                 // ( e )
+type ErrExpr = { errWhat: string, errAt: i32 }                 // recovery leaf
+
+// Statements -----------------------------------------------------------------
+type LetDecl = {                                               // let/const x: T = e
+  letKw: string,        // "let" | "const"
+  letName: string,
+  letType: i32,         // type-annotation node, -1 if none
+  letInit: i32,         // initializer node, -1 if none
+}
+type Param = { parName: string, parType: i32 }                 // a: i32
+type TypeRef = { tyName: string }                              // i32 (annotation)
+type FuncDecl = {                                              // function f(..): T {..}
+  fnName: string,
+  fnParams: i32[],
+  fnRet: i32,           // return-type node, -1 if none
+  fnBody: i32,          // block node
+}
+type IfStmt = {                                                // if c {..} else {..}
+  ifCond: i32,
+  ifThen: i32,          // then block
+  ifElse: i32,          // else node (block or nested if), -1 if none
+}
+type RetStmt = { retArg: i32 }                                 // return e?  (-1 bare)
+type Block = { blkStmts: i32[] }                               // { stmt* }
+type Program = { progStmts: i32[] }                            // top-level stmt*
+
+// The unified node type. Declared AFTER its members (a union alias can't forward-
+// reference). Discriminated with `is`.
+type Node = NumLit |
+  StrLit |
+  CharLit |
+  BoolLit |
+  Ident |
+  Unary |
+  BinExpr |
+  Call |
+  Member |
+  Paren |
+  ErrExpr |
+  LetDecl |
+  Param |
+  TypeRef |
+  FuncDecl |
+  IfStmt |
+  RetStmt |
+  Block |
+  Program
+
+// A parse diagnostic: a message plus the token index it was raised at. VL has no
+// exceptions, so errors are accumulated, not thrown.
+type Diag = { msg: string, at: i32 }
+
+// ── Parser state (all in STRUCT FIELDS, held in a module GLOBAL) ──────────────
+// The whole parser state is one struct: the token stream, the node arena, the
+// diagnostics, and the cursor. `.push` onto a struct-field array works now (gap
+// #66), so the arena and diagnostics live in struct fields and the constructors
+// `.push` straight onto them — not threaded as bare array parameters.
+//
+// The struct is reached through a module GLOBAL `P` rather than passed as a
+// parameter, because passing a struct-typed VALUE into a mutually-recursive
+// (forward-referencing) function group miscompiles today (the "Unhandled AST ->
+// WASM Never" gap below). A recursive-descent parser is intrinsically mutually
+// recursive, so the recursive functions read/mutate `P` directly — which also
+// keeps every call site free of the boilerplate state argument.
+type Parser = {
+  toks: Tok[],
+  nodes: Node[],
+  diags: Diag[],
+  pos: i32,
+}
+
+// The single parser instance. The harness fills `P.toks`, runs the parser, and
+// reads `P.nodes` / `P.diags` back out.
+let P: Parser = { toks: [], nodes: [], diags: [], pos: 0 }
+
+// ── Arena constructors ───────────────────────────────────────────────────────
+// Each appends its variant to `P.nodes` and returns the new node's index.
+
+function addNode(n: Node): i32 {
+  P.nodes.push(n)
+  P.nodes.length - 1
+}
+
+function mkNum(text: string): i32 {
+  let n: Node = { numText: text }
+  addNode(n)
+}
+
+function mkStr(text: string): i32 {
+  let n: Node = { strText: text }
+  addNode(n)
+}
+
+function mkChar(text: string): i32 {
+  let n: Node = { charText: text }
+  addNode(n)
+}
+
+function mkBool(v: i32): i32 {
+  let n: Node = { boolVal: v }
+  addNode(n)
+}
+
+function mkIdent(name: string): i32 {
+  let n: Node = { identName: name }
+  addNode(n)
+}
+
+function mkUnary(op: string, arg: i32): i32 {
+  let n: Node = { unOp: op, unArg: arg }
+  addNode(n)
+}
+
+function mkBinary(op: string, left: i32, right: i32): i32 {
+  let n: Node = { binOp: op, binLeft: left, binRight: right }
+  addNode(n)
+}
+
+function mkCall(fn: i32, args: i32[]): i32 {
+  let n: Node = { callFn: fn, callArgs: args }
+  addNode(n)
+}
+
+function mkMember(obj: i32, prop: string): i32 {
+  let n: Node = { memObj: obj, memProp: prop }
+  addNode(n)
+}
+
+function mkParen(inner: i32): i32 {
+  let n: Node = { parInner: inner }
+  addNode(n)
+}
+
+function mkErr(what: string, at: i32): i32 {
+  let n: Node = { errWhat: what, errAt: at }
+  addNode(n)
+}
+
+function mkLet(kw: string, name: string, ty: i32, init: i32): i32 {
+  let n: Node = { letKw: kw, letName: name, letType: ty, letInit: init }
+  addNode(n)
+}
+
+function mkParam(name: string, ty: i32): i32 {
+  let n: Node = { parName: name, parType: ty }
+  addNode(n)
+}
+
+function mkTypeRef(name: string): i32 {
+  let n: Node = { tyName: name }
+  addNode(n)
+}
+
+function mkFunc(name: string, params: i32[], ret: i32, body: i32): i32 {
+  let n: Node = { fnName: name, fnParams: params, fnRet: ret, fnBody: body }
+  addNode(n)
+}
+
+function mkIf(cond: i32, thenB: i32, els: i32): i32 {
+  let n: Node = { ifCond: cond, ifThen: thenB, ifElse: els }
+  addNode(n)
+}
+
+function mkReturn(arg: i32): i32 {
+  let n: Node = { retArg: arg }
+  addNode(n)
+}
+
+function mkBlock(stmts: i32[]): i32 {
+  let n: Node = { blkStmts: stmts }
+  addNode(n)
+}
+
+function mkProgram(stmts: i32[]): i32 {
+  let n: Node = { progStmts: stmts }
+  addNode(n)
+}
+
+// ── int → string ─────────────────────────────────────────────────────────────
+// `toString` still does not resolve inside a function/loop body (a tracked gap),
+// so the harness renders node counts with this hand-rolled converter.
+function digitChar(d: i32): string {
+  if d == 0 { return "0" }
+  if d == 1 { return "1" }
+  if d == 2 { return "2" }
+  if d == 3 { return "3" }
+  if d == 4 { return "4" }
+  if d == 5 { return "5" }
+  if d == 6 { return "6" }
+  if d == 7 { return "7" }
+  if d == 8 { return "8" }
+  "9"
+}
+
+function i32ToStr(n: i32): string {
+  if n == 0 { return "0" }
+  let neg = n < 0
+  let m = n
+  if neg { m = 0 - m }
+  let out = ""
+  while m > 0 {
+    out = digitChar(m % 10) + out
+    m = m / 10
+  }
+  if neg { out = "-" + out }
+  out
+}
