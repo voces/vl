@@ -1,27 +1,34 @@
-# VL collections design — the growable list (B6 tier-2)
+# VL collections design — `List`, VL's one user-facing collection (B6)
 
 > Status: **design / research only.** No compiler code exists for this yet. This
-> document is the mental model and the decision record for VL's growable list /
-> dynamic vector so the follow-up implementation PR can be small and uncontested.
-> It deliberately surveys how other languages do it, then commits to a concrete
-> shape for VL's WasmGC backend with rationale and rejected alternatives.
+> document is the mental model and the decision record for VL's primary
+> collection — the growable `List` — so the follow-up implementation PR can be
+> small and uncontested. It deliberately surveys how other languages do it, then
+> commits to a concrete shape for VL's WasmGC backend with rationale and rejected
+> alternatives.
 
 ## Summary / recommendation
 
-VL needs a growable, ordered, indexable sequence — the substrate for
-`map`/`filter`, builders, and the H2 self-hosting collections work
-(`ROADMAP` A10 + B6 tier-2). The fixed-length array MVP is done; this is the
-tier-2 layer on top of WasmGC's fixed-length `array` heap type.
+**`List` is VL's one user-facing collection** — a growable, ordered, indexable
+sequence, and the substrate for `map`/`filter`, builders, and the H2 self-hosting
+collections work (`ROADMAP` A10 + B6). `[...]` constructs a `List`. The raw
+fixed-length WasmGC `array` is **not** a coexisting everyday type: it is demoted to
+(i) `List`'s internal **substrate** (the `backing` field, allocated/copied via the
+`array.new`/`array.copy` intrinsics) and (ii) an **optional low-level escape** (an
+advanced `Array<T>` / unsafe primitive) for the rare contiguous-memory case. The
+fixed-array MVP is done; this design promotes it into `List` rather than leaving it
+as the default literal.
 
 **Decided this review round** (recorded here; the `DECISIONS.md` entry lands with
-implementation, not before): the type is named **`List`**, the **growth
+implementation, not before): the type is named **`List`**, **`[...]` is a `List`
+literal** (the scripting-feel default — Python/JS/Ruby/Swift), the **growth
 factor is 2×** for v1, and **indexing is result-by-default — `a[i]: T | null`**
-(safe / OOB → `null`) for **both** fixed arrays and `List`, with a trapping
-*asserting* accessor as the discouraged opt-in. Still open: the `[...]` syntax
-fork, value-vs-reference (language-wide), the error model (language-wide),
-indexing perf (the **bounds-narrowing** enabler — see §VL.6/§OQ.4 — that keeps
-result-by-default indexing native-speed), and the capacity/seed surface
-specifics.
+(safe / OOB → `null`) for `List` (and any raw-array escape), with a trapping
+*asserting* accessor as the discouraged opt-in. Still open: value-vs-reference
+(language-wide), the error model (language-wide), indexing perf (the
+**bounds-narrowing** enabler — see §VL.6/§OQ.4 — that keeps result-by-default
+indexing native-speed, plus the **native-indexing flag** of §VL.6 that drops the
+B13 indirect call), and the capacity/seed surface specifics.
 
 Recommendation in one screen:
 
@@ -48,23 +55,27 @@ Recommendation in one screen:
    pair per concrete `T`: native `array.get`/`array.set`, no `anyref` boxing, no
    unbox-on-read. This matches the soundness contract (no `dynamic`, every value
    pinned to a concrete type) and the existing array performance path. (§VL.3)
-4. **Surface API.** Construct with `List<T>()` (empty) and `List<T>(capacity: n)`
-   (named-param, unambiguous vs a positional element); **seed via a list literal**
-   (`[0, 1, 2]`) rather than a variadic `List(...)` — VL has no variadics and no
-   overloading (§VL.4), so an element-seeding constructor can't coexist with the
-   capacity one. `push`/`pop`/`map`/`filter` are `self`-methods (parens — they
-   compute, B14). `l[i]` / `l[i] = v` route through the B13 `"[]"`/`"[]="` index
-   traps (assumed to land in parallel). `.length` is the O(1) uniform-access
-   property (read-only, per DECISIONS B6); `.capacity` is the sibling O(1)
-   property. **Indexing is result-by-default**: `l[i]` (and fixed-array `a[i]`)
-   return **`T | null`** — out-of-bounds yields `null`, not a trap. A trapping
+4. **Surface API.** The **`[...]` literal constructs a `List`** (`[0, 1, 2]` seeds
+   a three-element list — the scripting-feel default). `List<T>()` makes an empty
+   typed list and `List<T>(capacity: n)` a pre-sized one (named-param, unambiguous
+   vs a positional element — VL has no variadics or overloading, §VL.4, so the seed
+   path is the literal, not a variadic `List(...)`). `push`/`pop`/`map`/`filter` are
+   `self`-methods (parens — they compute, B14). `l[i]` / `l[i] = v` route through the
+   B13 `"[]"`/`"[]="` index traps (assumed to land in parallel) — though a
+   **type-level native-indexing flag** (§VL.6) lets `List`'s `[]`/`[]=`/`.length`
+   lower straight to `array.get`/`array.set`/`array.len`, bypassing the dispatch.
+   `.length` is the O(1) uniform-access property (read-only, per DECISIONS B6);
+   `.capacity` is the sibling O(1) property. **Indexing is result-by-default**:
+   `l[i]` returns **`T | null`** — out-of-bounds yields `null`, not a trap. A trapping
    *asserting* accessor (e.g. `a[i]!` / `getUnchecked(i): T`) is the explicit,
    discouraged opt-in for "I know it's in bounds." (§VL.4–6) **This changes
    today's fixed-array behavior** (`a[i]` currently traps on OOB → becomes
-   `T | null`); arrays are early enough to change, and one rule for arrays and
-   lists is the consistent choice. The cost — a null-handle on every access — is
-   paid down by **bounds-narrowing** (§VL.6): inside `for i in 0 to a.length`
-   or after `if i < a.length`, `a[i]` narrows from `T | null` to `T`.
+   `T | null`); the indexing rule is one rule across `List` and any raw-array escape.
+   The cost — a null-handle on every access — is paid down by **bounds-narrowing**
+   (§VL.6): inside `for i in 0 to a.length` or after `if i < a.length`, `a[i]`
+   narrows from `T | null` to `T`. Combined with the native-indexing flag this
+   reaches the ideal — `a[i]` lowers to a bare `array.get` of `T`, codegen identical
+   to a raw array, while `List` stays a `.vl` std type otherwise.
 
 **Language principle — "result by default."** Fallible operations return values,
 not control-flow escapes: absence is `T | null`, "failed with a reason" is
@@ -154,13 +165,15 @@ is opt-in (`shrink_to_fit`, `trimToSize`). The sane default is **grow-only**.
 
 ### Context: what VL already has
 
-- **Fixed arrays (B6 MVP).** A VL array is a contiguous WasmGC `array` (one
-  interned `(array mut T)` heap type **per element wasm type** — `arrayType()` in
-  `toWasm.ts`). `a[i]` → `array.get`, `a[i] = v` → `array.set`, `a.length` →
-  `array.len` (an intrinsic, *not* a stored field). Bounds are trap-checked
-  **today** — but this review flips fixed-array `a[i]` to result-by-default
-  (`T | null`) to share one indexing rule with `List` (§VL.6). The
-  length is fixed at `array.new_fixed` time.
+- **The raw fixed array (B6 MVP) — now `List`'s substrate, not a user-facing tier.**
+  A raw VL array is a contiguous WasmGC `array` (one interned `(array mut T)` heap
+  type **per element wasm type** — `arrayType()` in `toWasm.ts`): `array.get` /
+  `array.set` / `array.len` (the last an intrinsic, *not* a stored field), length
+  fixed at `array.new_fixed` time. This is exactly what `List` is built **over** —
+  it becomes `List`'s `backing` substrate (§VL.1) plus an optional low-level escape
+  (an advanced `Array<T>` primitive, §VL.6/§OQ.7), **not** the everyday collection.
+  The MVP gives us the substrate for free. (`a[i]` traps on OOB **today**; under
+  this design the user-facing `List` indexes result-by-default `T | null`, §VL.6.)
 - **Monomorphization (A10).** Top-level generic functions monomorphize per call
   shape; inference holes collapse to a single concrete type before codegen (the
   soundness contract — no `dynamic`). Generics already infer *through* collections
@@ -204,11 +217,21 @@ List<T>  ≅  (struct
   `len`/`cap` are `mut` for `push`/`pop`.
 
 **Why a struct, not "an array with a header slot".** We could store `len` in
-slot 0 of the backing array (a fat array). Rejected: it fights the existing
-fixed-array representation (which has *no* header and lowers `.length` to
-`array.len`), it complicates indexing (every `[i]` becomes `[i+1]`), and it can't
-hold `cap` separately from the physical length. A distinct struct type keeps
-fixed arrays and lists as cleanly different shapes.
+slot 0 of the backing array (a fat array). Rejected: it fights the raw-array
+substrate (which has *no* header and lowers `.length` to `array.len`), it
+complicates indexing (every `[i]` becomes `[i+1]`), and it can't hold `cap`
+separately from the physical length. A distinct struct wrapping a header-less raw
+`array` keeps the substrate clean and the `List` header explicit.
+
+**The header cost — two i32s + one indirection (the owner's sizing).** A `List`
+carries a per-list header of two i32s (`len`/`cap`) over the bare backing, and a
+read `l[i]` is `list.backing[i]` — a `struct.get` (load `backing`) then an
+`array.get` — vs a raw array's single `array.get`. That extra indirection and the
+8-byte header are the entire cost of making `List` the default over a raw array,
+and both are **negligible** once the **native-indexing flag** (§VL.6) +
+inlining + bounds-narrowing fold the access back to a bare `array.get`. The
+constant/read-only-literal optimization (§VL.6) avoids even the header for
+compile-time-known literals.
 
 ### VL.2 — Growth strategy: 2× (DECIDED)
 
@@ -297,41 +320,37 @@ is the Java mistake (`List<Integer>` boxing) we have the type system to avoid.
 
 ### VL.4 — Surface API / spelling
 
-The guiding constraint: **don't make the fixed-array MVP ambiguous.** `[a, b, c]`
-must keep meaning a fixed-length array; a list is a distinct shape with its own
-construction.
+The guiding decision: **`[...]` is a `List` literal.** `[a, b, c]` constructs a
+three-element `List` — the scripting-feel default (Python/JS/Ruby/Swift). There is
+no coexisting user-facing fixed-array literal; the raw fixed array is `List`'s
+substrate and a low-level escape (§VL.6/§OQ.7), not a thing `[...]` ever means.
 
-- **Construction.** `List<T>()` for an empty typed list and `List<T>(capacity: n)`
-  for a pre-sized one; **seed via a list literal** (`[0, 1, 2]`) rather than a
-  variadic constructor. `List` is a builtin generic shape resolved by the checker,
-  lowered by name in `toWasm.ts` (the same pattern string methods use — types in
-  defaultScope, lowering in toWasm, *no typecheck special-casing of a keyword*).
+- **Construction.** `[0, 1, 2]` (seed via literal) is the everyday form. `List<T>()`
+  makes an empty typed list and `List<T>(capacity: n)` a pre-sized one. `List` is a
+  builtin generic shape resolved by the checker, lowered by name in `toWasm.ts` (the
+  same pattern string methods use — types in defaultScope, lowering in toWasm, *no
+  typecheck special-casing of a keyword*).
 
   **The `List(0)` ambiguity the owner raised — "is `0` an element or a capacity?"**
   VL **has named parameters** (call-site `f(name: value)`; the checker consumes the
   named arguments first, then the positional ones), so **`List<T>(capacity: n)` is
   unambiguous** — `capacity:` is spelled at the call site and can never be read as a
-  positional element. So the capacity constructor is safe *on its own*.
+  positional element. The capacity constructor is safe *on its own*.
 
-  The reason we do **not** *also* offer an element-seeding `List(0, 1, 2)` is not the
-  ambiguity — it is that VL has **no variadics** (every function is fixed-arity) and
-  **no ad-hoc overloading** (one binding per name per scope — DECISIONS B16). An
-  element-seeding `List(...)` would need both: variadic arity *and* a second `List`
-  binding coexisting with the capacity constructor as an overload. Since neither
-  exists, seeded construction goes through a **list literal** (`[0, 1, 2]`) instead
-  — which is a concrete point in favor of **syntax fork (b)** (§LS.4: `[...]` *is*
-  the growable-list literal). The recommended construction surface is therefore:
-  **`List<T>()`** (empty), **`List<T>(capacity: n)`** (named), **seed via literal**.
+  We do **not** *also* offer an element-seeding `List(0, 1, 2)`: VL has **no
+  variadics** (every function is fixed-arity) and **no ad-hoc overloading** (one
+  binding per name per scope — DECISIONS B16), so an element-seeding `List(...)`
+  would need both variadic arity *and* a second `List` binding overloading the
+  capacity constructor — neither exists. Seeded construction is the **`[...]`
+  literal** instead, which is exactly why the literal *is* the `List` literal. The
+  construction surface is therefore: **`[...]`** (seed), **`List<T>()`** (empty),
+  **`List<T>(capacity: n)`** (named).
 
   (Clarification: `self` is a **first-position positional convention**, *not* a
   call-site named argument. A function whose first parameter is named `self` is a
   method — `o.f()` rewrites to `f(o)` via UFCS (B14) — so the receiver must be
   *first* and positional; you never pass `self:` by name. Named-vs-positional and
   the `self` receiver are orthogonal mechanisms.)
-
-  A dedicated **list literal** (sigil/`[...]`) is the §LS.4 open question — `List(...)`
-  -free construction above covers v1 without inventing syntax that competes with the
-  fixed `[...]`.
 - **Mutation methods** (compute → parens, B14 `self`-methods):
   `l.push(x)` (append, amortized O(1)), `l.pop()` (remove+return last, `T | null`
   on empty — see §VL.6), and the higher-order producers `l.map(f)` / `l.filter(f)`
@@ -364,14 +383,16 @@ construction.
     `extend` — same observable result, the new allocation elided.)
 - **Indexing — result by default (`l[i]: T | null`).** `l[i]` and `l[i] = v`
   route through the **B13 `"[]"`/`"[]="` index hooks** (assumed landing in
-  parallel). Reads are **result-oriented**: `l[i]` checks `i` against `len` and
-  yields the element as **`T | null`** — out-of-bounds is `null`, not a trap (the
-  same rule as fixed arrays — see §VL.6). The bound is **`len`, not the backing
-  array's physical length** — the spare capacity slots `[len, cap)` read as `null`
-  just like any other OOB index. The `"[]="` lowering bounds-checks the same way.
-  The trapping form is the explicit *asserting* accessor (§VL.6), not `[i]`.
-  Where the compiler can prove `i` in range, **bounds-narrowing** (§VL.6) drops
-  the `null` and the check, recovering a bare `array.get`.
+  parallel) — or, under the **native-indexing flag** (§VL.6), lower directly to
+  `array.get`/`array.set` on `backing`, bypassing B13 dispatch. Reads are
+  **result-oriented**: `l[i]` checks `i` against `len` and yields the element as
+  **`T | null`** — out-of-bounds is `null`, not a trap (§VL.6). The bound is
+  **`len`, not the backing array's physical length** — the spare capacity slots
+  `[len, cap)` read as `null` just like any other OOB index. The `"[]="` lowering
+  bounds-checks the same way. The trapping form is the explicit *asserting*
+  accessor (§VL.6), not `[i]`. Where the compiler can prove `i` in range,
+  **bounds-narrowing** (§VL.6) drops the `null` and the check, recovering a bare
+  `array.get`.
 - **Size members** (O(1), property syntax, read-only — DECISIONS B6):
   - `l.length` → `struct.get $len` (O(1), the logical size; mirrors arrays'
     `.length` but reads the field instead of `array.len`).
@@ -380,13 +401,14 @@ construction.
 
 This ties into every existing feature (B13 index traps, B14 self-methods,
 DECISIONS B6 uniform-access size members, A10 monomorphization) without adding a
-new dispatch mechanism or fighting the fixed-array literal.
+new dispatch mechanism; `[...]` is now the `List` literal, so there is no
+fixed-array literal to fight.
 
 ### VL.5 — Interaction with `length` and the index traps
 
 - `length` keeps its DECISIONS-B6 contract: O(1), read-only, property syntax. For
-  a fixed array it lowers to `array.len`; for a list it lowers to
-  `struct.get $len`. Same surface, two native lowerings — the uniform-access
+  a `List` it lowers to `struct.get $len`; for the raw-array substrate/escape it
+  lowers to `array.len`. Same surface, two native lowerings — the uniform-access
   principle the decision was made to preserve. A user can read `l.length` but not
   assign it; resizing is via `push`/`pop`, never `l.length = n`.
 - Indexing sees `len`, not `cap`. `l[i]` for `i in [0, len)` returns the element;
@@ -404,22 +426,49 @@ new dispatch mechanism or fighting the fixed-array literal.
 
 - **Bounds behavior: `l[i]` is result-by-default (`T | null`).** Out-of-bounds
   `l[i]` / `l[i] = v` yields **`null`**, *not* a trap — and **the same rule
-  applies to fixed-array `a[i]`** (one shared indexing rule for arrays and lists;
-  see the implication note below). This is the **"result by default"** language
-  principle (Summary; §OQ.3) applied to indexing: absence is a value, not a
-  control-flow abort. The trapping form is an **opt-in *asserting* accessor** for
-  "I know it's in bounds" — named to signal it is unchecked/asserting (e.g.
-  `getUnchecked(i): T` or an `a[i]!` postfix form), **not** plain `get` (which
-  conventionally names the *safe* accessor, so reserving `get` for trapping would
-  invert every reader's expectation). Trapping is the **explicit, discouraged
-  escape hatch**; the safe `T | null` form is the default.
+  applies to the raw-array escape** (one shared indexing rule; see the implication
+  note below). This is the **"result by default"** language principle (Summary;
+  §OQ.3) applied to indexing: absence is a value, not a control-flow abort. The
+  trapping form is an **opt-in *asserting* accessor** for "I know it's in bounds" —
+  named to signal it is unchecked/asserting (e.g. `getUnchecked(i): T` or an `a[i]!`
+  postfix form), **not** plain `get` (which conventionally names the *safe*
+  accessor, so reserving `get` for trapping would invert every reader's
+  expectation). Trapping is the **explicit, discouraged escape hatch**; the safe
+  `T | null` form is the default.
 
-  **Implication — this changes today's fixed-array behavior.** Fixed-array `a[i]`
+  **Implication — this changes today's raw-array behavior.** The raw array `a[i]`
   *currently traps* on OOB (the B6 MVP). Under result-by-default it becomes
   `T | null`, matching `List`. Arrays are early enough that changing this is cheap,
-  and a single rule for both is the cohesive choice — the alternative (lists
-  null-by-default while arrays keep trapping) would be a gratuitous inconsistency
-  between two collections that index identically.
+  and a single rule is the cohesive choice — the alternative (the `List` default
+  null-by-default while the raw-array escape keeps trapping) would be a gratuitous
+  inconsistency between two things that index identically.
+
+- **Native-indexing flag — the resolution to the B13 indirect-call cost.** A
+  pure-VL `List` whose `l[i]` routes through the B13 `"[]"` method pays a
+  **per-access indirect call** — fine for cold code, a real tax in hot loops, and
+  the one place a `.vl` std `List` is slower than a raw array. The resolution is a
+  **type-level native-indexing flag**: `List`'s `"[]"` / `"[]="` / `.length` lower
+  to native `array.get` / `array.set` / `array.len` on the `backing` field,
+  **bypassing B13 dispatch entirely**. Precedent: VL already special-cases nominal
+  builtins (`string`, `i32`) in codegen by the type's `name`, so codegen
+  recognizing one more std type's indexing is in-keeping. Two ways to express the
+  flag (a sub-choice for the implementation PR, §OQ.4):
+  - **Nominal recognition** (simplest): codegen knows `List` by `name` and inlines
+    its indexing, exactly the way `string` is special-cased today.
+  - **Declarative annotation** (more general): mark a `"[]"` method as
+    native-lowered / intrinsic, so *any* std type can opt into native indexing
+    without a hardcoded name in codegen.
+  Combined with **bounds-narrowing**, this yields the ideal: a provably-in-range
+  `a[i]` narrows to `T` (no `null`) **and** the native flag makes it a bare
+  `array.get` (no indirect call) → **codegen identical to a raw array**, while
+  `List` stays an ordinary `.vl` std type everywhere else.
+
+- **Constant / read-only literal optimization.** A compile-time `[1, 2, 3]` (all
+  elements known, never mutated) can emit a **constant backing** — a fixed-size
+  `List` whose `backing` is a `const` array — skipping even the header allocation.
+  This is an **optimization, not a separate user type**: the value is still a
+  `List` to the program; the compiler just proves it constant and lowers it
+  leaner. (See §OQ.7 / ROADMAP.)
 - **Bounds-narrowing — the enabler that makes this practical (key).** The cost of
   `T | null` indexing is real: *every* access forces a null-handle, and for scalar
   elements `i32 | null` is a niche/tagged value, so each read pays a per-access
@@ -470,7 +519,10 @@ new dispatch mechanism or fighting the fixed-array literal.
   discouraged opt-in escape hatch; the safe `a[i]: T | null` is the v1 default.
 - Slicing a list into a view that **aliases** the backing (Go-style shared
   backing); v1 `slice` (if any) copies.
-- A dedicated list **literal** syntax (use `List(...)` for now).
+- The **raw-array low-level escape** (an advanced `Array<T>` / unsafe primitive for
+  header-less contiguous memory — §OQ.7). The raw fixed array exists as `List`'s
+  substrate from day one, but exposing it as a *user-facing* low-level type is a
+  future, deliberately-advanced surface, not v1.
 - Value-semantics / copy-on-write (Swift-style). VL lists are **reference**
   values in v1; `let b = a` shares the same list — **consistent with VL objects,
   which are reference types today**. There is no sound case for collections being
@@ -503,7 +555,7 @@ designed-but-deferred — they are worth pinning now so the surface is coherent:
 
 ## Phased implementation outline (for the follow-up PR)
 
-This is what a tier-2 PR would build, in dependency order. **No code is written
+This is what the `List` PR would build, in dependency order. **No code is written
 here** — this is the plan the design commits to.
 
 1. **Type & checker.** Introduce `List<T>` as a builtin generic shape (defaultScope
@@ -518,17 +570,19 @@ here** — this is the plan the design commits to.
    type, reusing the existing per-element array interner for the backing.
 3. **Codegen — construction & access.** `List<T>()` → `struct.new` with empty
    backing + `len=0,cap=0` (or a shared sentinel empty array); `List<T>(capacity: n)`
-   → allocate backing of cap = n, `len=0`; a literal-seeded list (`[…]` under fork
-   (b), §LS.4) → allocate backing of cap = element count, fill, `len=cap=n`.
-   `l[i]`/`l[i]=v` → the `len`-bounded `array.get`/`array.set` lowering through the
-   B13 traps. `.length`/`.capacity` → `struct.get`.
+   → allocate backing of cap = n, `len=0`; the `[…]` literal → allocate backing of
+   cap = element count, fill, `len=cap=n` (a compile-time-constant `[…]` may emit a
+   `const` backing — the §VL.6 literal optimization). `l[i]`/`l[i]=v` → the
+   `len`-bounded `array.get`/`array.set` lowering, via the B13 traps **or** the
+   native-indexing flag (§VL.6) that bypasses them. `.length`/`.capacity` →
+   `struct.get`.
 4. **Codegen — push/pop/grow.** A lazily-emitted-per-element-wasm-type helper set
    (à la `__string_eq__`): `__list_push_T__` (the `len==cap` grow-and-copy + write
    + `len++`), `__list_pop_T__` (`len--`, read, `T|null` on empty),
    `reserve`/`grow` (`array.new` of new cap + `array.copy` + swap). Growth = 2×,
    floor 4.
 5. **Iteration.** Extend B8 `for…in` to recognize the list shape and iterate
-   `[0, len)` over `backing` (vs `array.len` for fixed arrays).
+   `[0, len)` over `backing` (vs `array.len` for the raw-array substrate).
 6. **Higher-order producers.** `map`/`filter` build a new `List<U>` of the
    inferred result element type — the A10 "build an array of an inferred element
    type" capability this subsystem unblocks.
@@ -539,16 +593,19 @@ here** — this is the plan the design commits to.
    nullable narrowing, plus `xfail-*` files pinning the out-of-scope gaps
    (insert/remove, shrink, the asserting/trapping accessor, COW) per the
    soundness-corpus convention.
-8. **Docs.** Flip `ROADMAP` B6 tier-2 to a one-line done marker; add a terse
-   DECISIONS entry (2× growth + monomorphized-not-boxed + grow-only, with the
+8. **Docs.** Flip `ROADMAP` B6 to a one-line done marker; add a terse
+   DECISIONS entry (`List` is the one user-facing collection + `[...]`=`List` +
+   2× growth + monomorphized-not-boxed + grow-only + native-indexing flag, with the
    "WasmGC has no realloc/free so the golden-ratio argument doesn't apply"
    rationale). This design doc stays as the mental model.
 
 ## Open questions for the owner
 
-1. **List literal syntax.** Ship v1 with only `List(...)` / `List<T>()`, or
-   introduce a distinct list literal now? (Must not collide with the fixed `[...]`
-   array literal — options: a sigil prefix, or a method like `[...].toList()`.)
+1. **List literal syntax — DECIDED this review (no longer open).** `[...]` is the
+   **`List` literal** (the scripting-feel default — Python/JS/Ruby/Swift). The raw
+   fixed array is `List`'s substrate + an optional low-level escape (§OQ.7), not a
+   coexisting `[...]` meaning, so there is no fork left to resolve. (Kept here as a
+   numbered marker; the live questions are §OQ.2 onward.)
 2. **Value vs reference — language-wide (default reference).** Not a
    collections-only question: there is no sound case for `List` being a value
    type while VL objects stay reference. v1 default = **reference everywhere**
@@ -580,28 +637,45 @@ here** — this is the plan the design commits to.
    default indexing as fast as trapping; without it the safe default is *slower*
    than the unsafe one (a safety-vs-speed inversion). It touches the **core
    narrowing engine** (A5, `docs/narrowing.md`), not just `List`. The secondary
-   dispatch question stands underneath it (a pure-VL `List` whose `l[i]` routes
-   through the B13 `"[]"` method is a per-access indirect call; native-speed wants
-   a reliably-inlinable monomorphized `"[]"` or a slice of native indexing
-   lowering) — the one spot `List` likely needs compiler privilege even under
-   "std over primitives."
+   dispatch question — a pure-VL `List` whose `l[i]` routes through the B13 `"[]"`
+   method is a per-access indirect call — is **resolved by the type-level
+   native-indexing flag** (§VL.6): `List`'s `"[]"`/`"[]="`/`.length` lower to native
+   `array.get`/`array.set`/`array.len` on `backing`, bypassing dispatch (precedent:
+   the `string`/`i32` nominal special-casing in codegen). The remaining sub-choice
+   is **how to express the flag**: **nominal recognition** (codegen knows `List` by
+   name, simplest) vs a **declarative native-lowered/intrinsic annotation** on the
+   `"[]"` method (more general — any std type can opt in). With the flag + bounds-
+   narrowing, an in-range `a[i]` is codegen-identical to a raw `array.get`. This is
+   the one spot `List` needs compiler privilege even under "std over primitives."
 5. **Growth taper.** 2× is **decided** for v1 (above). Whether to later add a
    Go-style taper to ~1.25× past a size threshold stays deferred — a
    constant-factor tweak behind the same API, not a representation change.
 6. **`map`/`filter` result type.** Should producers return a `List<U>` (proposed)
-   or a fixed array? Returning a list keeps the chain growable and composable.
+   or a raw array? Returning a `List` keeps the chain growable and composable.
+7. **Raw fixed array as a low-level escape — surface & timing.** The raw fixed
+   array is `List`'s substrate from day one; the open question is whether/when to
+   *also* expose it as a user-facing **low-level escape** — an advanced `Array<T>` /
+   unsafe primitive for **header-less contiguous memory**, which matters for future
+   **FFI / SIMD / linear-memory** targets if VL ever addresses memory directly.
+   Plus the related **constant/read-only-literal optimization** (§VL.6): a
+   compile-time `[1,2,3]` emitting a `const` backing is an optimization (still a
+   `List` to the program), not a separate user type. Both are deliberately
+   advanced/future surfaces, not v1 — but worth naming so the raw array's continued
+   existence (beyond substrate) is on record.
 
 ---
 
 ## Language vs standard library, primitive surface, and syntax
 
 The sections above settle the *representation* of the list (the `{backing, len,
-cap}` struct, 2× growth, monomorphized-not-boxed elements). This section answers a
-deeper set of questions the owner raised: **where** `List` should live (baked into
-the language vs. written in VL over a small intrinsic surface), **what primitive**
-the compiler would have to expose for `List` to be written in VL at all, whether
-`print` belongs in the same bucket, and **what syntax** a growable list should get.
-These are forward-looking; nothing here is decided (no `DECISIONS.md` entry yet).
+cap}` struct, 2× growth, monomorphized-not-boxed elements) and the *syntax*
+(`[...]` = `List`). This section answers a deeper set of questions the owner raised:
+**where** `List` should live (baked into the language vs. written in VL over a small
+intrinsic surface), **what primitive** the compiler would have to expose for `List`
+to be written in VL at all, and whether `print` belongs in the same bucket. LS.4
+records the now-**decided** `[...]`=`List` syntax call and the reasoning behind it.
+These are forward-looking; the lang-vs-std / primitive-surface choices are not yet
+in `DECISIONS.md` (they land with implementation).
 
 The throughline is VL's **self-hosting goal** (ROADMAP Track H — H2 "make VL
 expressive enough to write a compiler", H3 "port the compiler to VL"). Every
@@ -676,13 +750,13 @@ what VL exposes *today*:
 Everything else is already there. Two primitives are missing — together they are
 the **minimal intrinsic set** a pure-VL `List` stands on:
 
-**(1) Dynamic-length array allocation.** Today a `T[]` can only be born from a
-**compile-time-sized literal** (`[a, b, c]` → `array.new_fixed`, whose length is the
-operand count). There is no VL-surface way to say "allocate a `T[]` of runtime
-length `n`". `List` growth fundamentally needs that — `cap * 2` is not a
-compile-time constant. WasmGC already has the instruction (`array.new <T>` —
-allocate length `n`, every slot initialized to a given value; and
-`array.new_default <T>` — length `n`, slots default/zeroed).
+**(1) Dynamic-length array allocation.** Today a raw backing `T[]` can only be born
+from a **compile-time-sized literal** (`array.new_fixed`, whose length is the operand
+count — the mechanism a `[a, b, c]` `List` literal's backing lowers through). There
+is no VL-surface way to say "allocate a `T[]` of runtime length `n`". `List` growth
+fundamentally needs that — `cap * 2` is not a compile-time constant. WasmGC already
+has the instruction (`array.new <T>` — allocate length `n`, every slot initialized to
+a given value; and `array.new_default <T>` — length `n`, slots default/zeroed).
 
 **(2) Bulk `array.copy`.** The grow path, `concat`, `extend`, `slice`, and the
 `map`/`filter` backing fills all need to move a *run* of elements from one array to
@@ -771,55 +845,41 @@ reason to do it now, and the current single dispatch branch is small. Recommende
 posture: migrate `print` to a std VL dispatcher **opportunistically, as part of the
 H3 port** (when the std module exists anyway), not as standalone work.
 
-### LS.4 — Syntax: the fork
+### LS.4 — Syntax: `[...]` is the `List` literal (DECIDED)
 
-VL inherited the **MVP convention that `[...]` is a *fixed-length* array literal**
-(`array.new_fixed`, length = element count). The §VL.4 surface deliberately keeps it
-that way and spells the growable list `List(...)` / `List<T>()` so the fixed-array
-MVP stays unambiguous. But that is the opposite of what most *scripting* languages —
-the family VL is aiming its "scripting feel" at — do:
+VL inherited the **MVP convention that `[...]` was a *fixed-length* array literal**
+(`array.new_fixed`, length = element count). This review **flips it**: `[...]` is the
+**`List` literal**. That matches what the *scripting* languages VL aims its
+"scripting feel" at all do:
 
 - **`[...]` is the growable list** in Python, JavaScript, Ruby, and Swift; the
   *fixed*-size array is the niche case with a distinct, heavier spelling: Rust
   `[T; N]`, Go `[N]T`, C `T[N]`, Swift's fixed buffers. In those languages the
   common, reach-for-it-by-default literal grows.
-- VL today is the inverse: the ergonomic `[...]` is the *fixed* case and the
-  growable case carries the call-like `List(...)` spelling.
+- The old VL MVP was the inverse — the ergonomic `[...]` was the *fixed* case. For a
+  language whose pitch is "scripting feel with hidden types," the growable list is
+  the *common* case, so the common case should get the ergonomic literal.
 
-For a language whose pitch is "scripting feel with hidden types," the growable list
-is almost certainly the *common* case, and forcing it into the heavier spelling
-fights that pitch. Two paths:
+**The decision: `[...]` constructs a `List`** (the scripting-feel default). The raw
+fixed array is **not** a coexisting `[...]` meaning — it is `List`'s substrate and an
+optional low-level escape (§VL.6/§OQ.7). This is the right default-vs-opt-in split
+for a high-level language: the everyday literal grows; reaching *below* `List` to a
+header-less contiguous array is the deliberate, advanced choice (as `[T; N]` /
+`[N]T` are in Rust/Go).
 
-**(a) Keep `[...]` fixed; growable via `List(...)` / `List<T>()`.** (The current
-doc recommendation — §VL.4.)
-- *Pros:* least disruptive — fixed arrays (and the whole B6 MVP, samples, tests)
-  keep their exact meaning; the two collection kinds stay visually distinct; no
-  parser changes; the list ships as pure addition. Easy to do *first*.
-- *Cons:* the common case (a growable list) gets the less-ergonomic spelling; VL
-  reads less like the scripting languages it resembles; if VL later wants `[...]`
-  to mean "list", that is a **breaking** re-interpretation of every existing
-  literal.
+What the decision entails (the implementation work, not a reopening):
+- A compile-time `[1, 2, 3]` lowers to a `List` whose backing is built via
+  `array.new_fixed` (and, when provably constant/read-only, a `const` backing — the
+  §VL.6 optimization). The §LS.2 dynamic-alloc primitive backs the growth path.
+- The empty `[]` literal needs its element type from context (annotation /
+  unification) exactly like any other inference hole — `List<T>()` is the explicit
+  empty form when there is nothing to infer from.
+- If/when a user-facing **low-level escape** is exposed, it gets a distinct,
+  deliberately-heavier spelling (e.g. `[T; N]`-style or `Array<T>`) — not `[...]`
+  (§OQ.7). It is never the default.
 
-**(b) Make `[...]` the growable `List`; give fixed arrays a distinct spelling.**
-(The scripting-feel end-state.)
-- *Pros:* matches Python/JS/Swift intuition — the default literal grows, which is
-  what most code wants; best fit for VL's scripting-feel goal; fixed arrays become
-  the deliberate, annotated choice (as they are in Rust/Go), which is the right
-  default-vs-opt-in split for a high-level language.
-- *Cons:* a **big, hard-to-reverse** change. It needs a new spelling for fixed
-  arrays (e.g. `[T; N]`-style, or a typed `Array<T, N>` / sigil), it changes the
-  meaning of every existing `[...]` (migration of samples/tests/corpus), and it
-  couples list construction to literal syntax (inference of the element type from a
-  possibly-empty `[]` literal, etc.). It also wants the §LS.2 dynamic-alloc
-  primitive in place first so an `[...]` literal can lower to a `List`.
-
-**Posture: (a) as the first cut, (b) as the candidate end-state — owner decides.**
-Ship the additive `List(...)` spelling first (it unblocks `map`/`filter`,
-self-hosting collections, and everything downstream without touching existing
-syntax), and treat "make `[...]` grow" as a deliberate, separately-decided language
-direction once the std `List` exists and has proven out. **Open question** — do not
-pre-commit the literal syntax now; reversing path (b) after the corpus depends on it
-is expensive.
+(This supersedes the earlier "ship `List(...)` first, keep `[...]` fixed" posture:
+the owner has decided to unify on `List` with `[...]` as its literal from the start.)
 
 ### LS.5 — Recommendation summary
 
@@ -838,8 +898,9 @@ is expensive.
 - **`print`:** already thin-intrinsics underneath (`__print_T__` sinks); the
   *dispatcher* could become std VL too, but it needs no new primitive — migrate it
   **opportunistically during the H3 port**, low priority.
-- **Syntax:** ship `List(...)` first (path a, additive); consider making `[...]`
-  the growable list later (path b, scripting-feel end-state) — left open.
+- **Syntax (DECIDED):** `[...]` is the **`List` literal** (scripting-feel default —
+  Python/JS/Ruby/Swift). The raw fixed array is `List`'s substrate + an optional
+  low-level escape (a deliberately-heavier spelling), never the default `[...]`.
 
 ### LS.6 — Updated sequencing note
 
@@ -866,14 +927,12 @@ std-module *loading* mechanism step 2 needs — see open questions).
 
 ### LS.7 — Open questions (still open)
 
-1. **Literal syntax — path (a) vs (b).** Keep `[...]` fixed with `List(...)` for
-   growable (a), or eventually make `[...]` the growable list with a distinct
-   fixed-array spelling (b)? (Reversing (b) later is expensive; decide before the
-   corpus leans on it.)
-2. **Migrate `print` to std VL?** Move the `print` type-dispatcher out of codegen
+(Literal syntax is **no longer open** — `[...]` is the `List` literal, §LS.4.)
+
+1. **Migrate `print` to std VL?** Move the `print` type-dispatcher out of codegen
    into a std VL dispatcher over the existing `__print_T__` sinks — worth the churn,
    or leave it as the one codegen special-case until the H3 port?
-3. **Std-library module layout — where does `.vl` std live, and how is it loaded?**
+2. **Std-library module layout — where does `.vl` std live, and how is it loaded?**
    Writing `List`/`Map` in `.vl` presupposes a place for std modules and a way for
    user programs to pull them in (an implicit prelude that is always in scope? an
    `import`/module system? a bundled-and-embedded std the compiler links

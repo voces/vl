@@ -63,8 +63,8 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **A10. Parametric types / generics** (`function foo<T>(x: T)`). Stage 1 (function type params),
   Stage 2 (array element inference — `first<T>(xs: T[]): T`), Stage 3 (generic `type` aliases —
   `type Box<T> = {value: T}`, applied in any type position incl. nested/array; `tests/cases/generics/`)
-  done. REMAINING: build-side array generics (`map`/`filter` constructing a new array of inferred
-  element type) — needs growable lists (B6 tier-2) or fixed-size construction.
+  done. REMAINING: build-side array generics (`map`/`filter` constructing a new collection of inferred
+  element type) — needs `List` (B6, the primary collection) or fixed-size construction.
 - 🟢 **A11. Recursive structural types.** Done — `type Tree = { value, left: Tree | null, … }`
   constructs/traverses/compiles (cycle-safe traversals + a self-referential WasmGC struct rec-group;
   `types/recursive-tree.vl`). REMAINING: mutual recursion across *separate* `type` decls; recursion
@@ -110,12 +110,17 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   reassignment, captured-in-closures, excess-property width subtyping, function-valued fields +
   member-call. REMAINING: methods via `self`+UFCS (B14); method-shorthand `{ add(a,b) … }` (parser);
   typed literals in object values (`{n: 4<i64>}`); Exact-by-default for values (A8).
-- 🟡 **B6. Arrays** (WasmGC). MVP done: fixed-length arrays — literal/`a[i]`/`a[i]=v`/`a.length`,
-  bounds-trap (today). Size-member design DECIDED (→ `DECISIONS.md`). Indexing design DECIDED:
-  **result-by-default `a[i]: T | null`** (OOB → `null`) for arrays *and* `List` — flips today's
-  fixed-array OOB-trap; trapping becomes an opt-in asserting accessor (→ `docs/collections-design.md`).
-  REMAINING: growable list/vector (`{ array, len, cap }`, tier 2) — design DECIDED on **name `List`**
-  and **2× growth**; `DECISIONS.md` entry lands with implementation.
+- 🟡 **B6. Collections — `List` is THE user-facing collection** (WasmGC). MVP done: the raw
+  fixed-length array — literal/`a[i]`/`a[i]=v`/`a.length`, bounds-trap (today) — now **demoted to
+  `List`'s substrate + an optional low-level escape**, not the everyday type (NOT a coexisting tier).
+  Design DECIDED: **`List` is the primary collection** (a `{ backing, len, cap }` struct, not tier-2),
+  **`[...]` constructs a `List`** (scripting-feel default — Python/JS/Ruby/Swift), **name `List`**,
+  **2× growth**, monomorphized-not-boxed, and a **type-level native-indexing flag** (`List`'s
+  `[]`/`[]=`/`.length` lower to native `array.get`/`array.set`/`array.len`, bypassing B13 — like the
+  `string`/`i32` nominal special-casing). Size-member design DECIDED (→ `DECISIONS.md`). Indexing
+  DECIDED: **result-by-default `a[i]: T | null`** (OOB → `null`) for `List` and the raw-array escape —
+  flips today's OOB-trap; trapping becomes an opt-in asserting accessor (→ `docs/collections-design.md`).
+  `DECISIONS.md` entry lands with implementation.
 - ⬜ **B6a. Maps / non-string keys** (`Map<K,V>` — a separate hash type, not every-object-as-table; →
   `DECISIONS.md`). Index sigs `{[string]: T}` type-check but are dropped at codegen — this is their
   codegen, via B13's `"[]"`/`"[]="` traps. Deferred.
@@ -127,10 +132,19 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   - **Std-over-primitives direction** — write `List`/collections (and opportunistically `print`) as
     `.vl` std over those intrinsics, not compiler-privileged types (ties to H3 self-hosting). Open
     dependency: VL has no module system yet (std-module loading is unresolved).
-  - **`[...]` list-vs-array syntax fork** (open decision) — (a) keep `[...]` fixed + growable via
-    `List(...)`, or (b) make `[...]` the growable `List` with a distinct fixed-array spelling.
-  - **Indexing default — `a[i]: T | null`** (DECIDED) — result-by-default for fixed arrays *and*
-    `List`: OOB reads return `null`, not a trap (one shared rule; flips today's fixed-array OOB-trap).
+  - **`[...]` = `List` literal** (DECIDED) — `[...]` constructs a `List` (scripting-feel default —
+    Python/JS/Ruby/Swift); the syntax fork is resolved. The raw fixed array is `List`'s substrate + an
+    optional low-level escape, never a coexisting `[...]` meaning. Construction: `[...]` (seed),
+    `List<T>()` (empty), `List<T>(capacity: n)` (named).
+  - **Raw fixed array as substrate + low-level escape** (DECIDED direction; surface/timing open) — the
+    raw array is `List`'s `backing` from day one; *also* exposing it as a user-facing low-level escape
+    (advanced `Array<T>` / unsafe primitive for header-less contiguous memory — matters for future
+    FFI/SIMD/linear-memory) is a deliberately-advanced future surface, not v1, not the default.
+  - **Constant-literal optimization** (future) — a compile-time `[1,2,3]` may emit a `const` array
+    backing (a fixed-size `List` whose backing is constant), skipping the header alloc. An
+    optimization, still a `List` to the program — not a separate user type.
+  - **Indexing default — `a[i]: T | null`** (DECIDED) — result-by-default for `List` *and* the
+    raw-array escape: OOB reads return `null`, not a trap (one shared rule; flips today's OOB-trap).
     The trapping form is an opt-in *asserting* accessor (`getUnchecked(i): T` / `a[i]!`), the
     discouraged escape hatch. (→ `docs/collections-design.md` §VL.6.)
   - **Bounds-narrowing — the enabler** (open; **core narrowing engine**, not collections-only) —
@@ -139,11 +153,15 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
     null-handle, no per-access unwrap, a bare `array.get`. This is what makes result-by-default indexing
     safe AND native-speed; without it the safe default is slower than trapping (a safety-vs-speed
     inversion). Headline enabler for the indexing decision.
-  - **Indexing perf — inline-native vs B13 method dispatch** (open, secondary to bounds-narrowing) — a
-    pure-VL `List` whose `l[i]` routes through the B13 `"[]"` method is a per-access (indirect) call; to
-    match native-array speed `l[i]` must inline to a bounds-checked `array.get` (reliably-inlinable
-    monomorphized `"[]"`, or a slice of native indexing lowering). The one spot `List` likely needs
-    compiler privilege under "std over primitives."
+  - **Native-indexing flag — resolves the B13 indirect-call cost** (DECIDED resolution; nominal-vs-
+    annotation sub-choice open) — a pure-VL `List` whose `l[i]` routes through the B13 `"[]"` method is
+    a per-access indirect call. Resolution: a **type-level native-indexing flag** so `List`'s
+    `[]`/`[]=`/`.length` lower to native `array.get`/`array.set`/`array.len` on `backing`, bypassing
+    B13 (precedent: `string`/`i32` nominal special-casing in codegen). Open sub-choice: **nominal
+    recognition** (codegen knows `List` by name, simplest) vs a **declarative native-lowered/intrinsic
+    annotation** (any std type opts in). With this + bounds-narrowing, an in-range `a[i]` is
+    codegen-identical to a raw `array.get` — the one spot `List` needs compiler privilege under "std
+    over primitives."
   - **Value vs reference — language-wide** (open; default **reference**) — not collections-only:
     objects *and* collections decided together. v1 = reference everywhere (consistent with VL objects;
     Python/JS/Java); coherent alternative is Swift-style value-everywhere-with-COW, *only if uniform*.
@@ -152,9 +170,11 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
     reason", over try/catch; **traps reserved for unrecoverable bugs, an explicit discouraged opt-in**.
     Generalizes the errors-as-values direction; indexing (`a[i]: T | null`) and `pop(): T | null` are
     instances. Ties to the AST `// TODO: exceptions` (the broader try/catch question stays open).
-  - **List surface/semantics open questions** — literal syntax; capacity/seed construction specifics;
-    `map`/`filter` return type. DECIDED: name `List`, 2× growth, `pop(): T | null`, **result-by-default
-    `a[i]: T | null`** (opt-in asserting/trapping accessor). Tracked in the design doc.
+  - **List surface/semantics open questions** — capacity/seed construction specifics; `map`/`filter`
+    return type; native-flag nominal-vs-annotation; raw-array-escape surface/timing. DECIDED: `List`
+    is THE user-facing collection, `[...]`=`List`, name `List`, 2× growth, `pop(): T | null`,
+    **result-by-default `a[i]: T | null`** (opt-in asserting/trapping accessor), native-indexing flag.
+    Tracked in the design doc.
 - 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
   `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.
@@ -273,7 +293,7 @@ corpus (A12) is the host-agnostic oracle — the same tests pass whichever compi
 - ✅ **H1. Parser self-hostable (= Track G).** The one piece that categorically can't live in a
   VL-in-VL compiler is gone.
 - ⬜ **H2. Make VL expressive enough to write a compiler.** Recursive tree types (**A11 ✅**), generic
-  collections (**A10**, **B6 tier-2** lists, **B6a** maps), string munging (**A7** methods). A10 +
+  collections (**A10**, **B6** `List`, **B6a** maps), string munging (**A7** methods). A10 +
   collections are the remaining gap — the capability bar for the port.
 - ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
   running the corpus through the VL-written compiler. Incremental; TS and VL compilers cross-checked.
@@ -292,7 +312,7 @@ H2/H3; H1 done, H4 decided.
 
 ## Next (highest leverage)
 
-- **A10 generics + collections (B6 tier-2 lists, B6a maps)** — the H2 capability bar, and the gate on
+- **A10 generics + collections (B6 `List`, B6a maps)** — the H2 capability bar, and the gate on
   self-hosting (H3). The deepest remaining type-system work.
 - **C5 / H-M1** — `deno compile` + brew. Small, decoupled, ships the distribution story now.
 - **D1** — hover types, now that AST nodes carry source spans (D2 go-to-def/refs is done).
