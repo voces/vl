@@ -788,6 +788,272 @@ inference (or even single-representation-first) and tighten later.
 
 ---
 
+## §C2 — Collections as structural interfaces: `{[K]:V}` as interface, `Map`/`List`/`Set` as subtypes
+
+> Status: **design / research only.** This records a decision the owner made this
+> round ("C2") about *what an index-signature type means* and *how the concrete
+> collections relate to it*. As with the rest of this doc, the `DECISIONS.md` entry
+> lands **with implementation, not before** — this section is the mental model and the
+> rationale, not the committed decision record. (The provisional names `List`/`Array`
+> carry their §VL naming caveat here too; the new interface names **`Mapping`** /
+> **`Sequence`** introduced below are *design vocabulary*, uncommitted in exactly the
+> same way.)
+
+**The decision (C2).** The index-signature types — `{[K]:V}` (a thing you can index
+by `K` to get `V`) and its sequence form `{[i32]:T}`, i.e. `T[]` (a thing you can
+index by `i32` to get `T`) — are **structural interfaces**, not concrete collections.
+They describe a *capability* ("indexable by K → V"), nothing about representation. The
+concrete collections — `Map<K,V>`, `List<T>`, `Set<T>` — are **subtypes** of those
+interfaces (structural subtyping), each carrying its own representation: backing
+arrays, a hash index, `len`/`cap` fields. The subtype direction is:
+
+- **`Map<K,V> <: {[K]:V}`** — the concrete map is the *subtype*; the index-sig is the
+  *supertype*.
+- **`List<T> <: {[i32]:T}`** (= `List<T> <: T[]` read as an interface) — the concrete
+  growable sequence is the subtype; the bare indexable-by-`i32` interface is the
+  supertype.
+
+Read this exactly as Python's `dict <: Mapping` / `typing.Dict`: the *concrete* type
+is the subtype, the *interface* is the supertype. A `Map<K,V>` flows into any position
+that asks for a `{[K]:V}`; you never go the other way (a bare `{[K]:V}` is not
+automatically a `Map` — it lacks the representation).
+
+**What C2 was chosen *over*.** The rejected alternative the owner had on the table was
+**"`{[K]:V}` *is* a full `Map`"** — the *index-sig overload*, where writing an
+index-signature type gave you the whole `Map` surface. That produced the concrete bug
+this decision fixes: **a value "declared as something smaller than a map" behaved as a
+full map** (it carried `.set`/`.get`/`.values`/etc. it had no business carrying). C2
+draws the line precisely — the index-sig is *only* the indexable-capability interface;
+the rich `Map` surface lives on the `Map` subtype.
+
+### C2.1 — Methods are self-functions (UFCS, B14), in two layers
+
+A collection method `o.f(a)` is, per **B14 UFCS**, sugar for a free function `f(o, a)`
+whose first parameter is `self` — exactly the §VL.4 framing (`l.push(x)` *is*
+`push(l, x)`). So "collection operations" are just self-functions; the only question
+C2 answers is **on what type the `self` parameter is typed.** There are **two layers**:
+
+- **Interface-level self-functions** — `self` typed at the bare index-sig
+  (`{[K]:V}` / `{[i32]:T}`). These are *generic over representation*: they work on
+  **any** mapping or sequence regardless of how it stores its data — a `Map`, a plain
+  object index-sig, a `List`, an inferred fixed array. The read/index/iterate surface
+  lives here: `get`, `has`, `length`, iteration, and the producers `map`/`filter`. The
+  owner's sketched signature shape — `function add<K,T>(self: {[K]:T}): {[K]:T}` —
+  is exactly this framing: a collection op *is* a self-function on the index-sig. (One
+  precision below on which ops can actually sit at this layer.)
+- **Representation-level operations** — `self` typed at the *concrete* subtype
+  (`Map<K,V>` / `List<T>` / `Set<T>`). These need the concrete fields — the hash
+  index, the `{backing,len,cap}` header — so they cannot be written against the bare
+  interface. Construction, `push`/`pop`/grow (§VL.2), `set`/`delete` that mutate the
+  hash table, and rehash all live here.
+
+**The precision that decides the layer (state it explicitly).** The dividing line is
+**read/index vs. mutate-representation**:
+
+- An op that only **reads or indexes** can live at the **interface level** — it needs
+  nothing but the `{[K]:V}` capability, so it works on any representation. (`get`,
+  `has`, `length`, iteration, `map`/`filter`.)
+- An op that **mutates representation** — grows the backing, rehashes, changes
+  `len`/`cap`, touches the hash index — must be defined on the **concrete subtype**,
+  because it needs the fields the bare interface does not expose. (`push`/`pop`,
+  `set`/`delete`, `reserve`, `clear`.)
+
+So the owner's "`List`/`Map` as self-functions on the index-sig" instinct is **right
+for the read/index/iterate surface** and *only* that surface; the
+mutating/constructing surface is self-functions on the **concrete** type. This is the
+same readable/writable split §VL.7 draws for variance, surfaced here as "which type
+the `self` param wears."
+
+### C2.2 — `Set<T>` is its OWN type — *not* `{[T]:boolean}`
+
+**Decision.** `Set<T>` is a **distinct concrete type** with its own surface — it is
+**not** spelled, and not structurally equal to, `{[T]:boolean}`. Its surface is:
+
+- `.add(x)` — insert membership.
+- `.has(x): boolean` — membership test.
+- `.delete(x)` — remove membership.
+- `.length` — element count (O(1), property syntax — see C2.3).
+- `.values(): T[]` — the elements (or iteration yielding `T`, C2.4).
+
+Conceptually `Set<T>`'s read surface is the **arraylike / `Sequence` core `{[i32]:T}`**
+(C2.5) — *not* `{[T]:boolean}`. A set is, at the read/iterate layer, an **ordered
+sequence of unique `T`**: it has a `.length`, it iterates yielding `T` in insertion
+order, and `.values(): T[]` is exactly the sequence view. So `Set<T> <: {[i32]:T}`
+(arraylike) is the right core — the same `Sequence` interface `List<T>` subtypes — and
+a set gets `length` / iteration / `map` / `filter` *for free* from it, unified with
+lists rather than bolted on via a bespoke membership-only interface. What a set adds
+**on top of** the sequence core is a **membership capability** keyed by *element value*:
+`has(x)` (the value-keyed O(1) "contains", distinct from a positional read), plus the
+mutating `add(x)` / `delete(x)` and the **uniqueness invariant**. A set therefore sits
+at the intersection of two axes — a *positional* axis (sequence: the i-th inserted
+element) and a *value* axis (membership: "is `x` present").
+
+**Open sub-question — does `Set<T>` expose positional subscript `set[i]`?** Subtyping
+the full `{[i32]:T}` *indexable* interface would make `set[i]` mean "the element at
+position `i`". For an ordered set that is well-defined, but it reintroduces the
+index-vs-value tension C2 fought elsewhere: for `Set<i32>`, `set[3]` reads ambiguously
+as "position 3" vs "is/the value 3", and membership is the *primary* lookup, not
+position. So the safe default is that a `Set` subtypes the **iterable/read** part of
+the sequence core (`length`, `for x in set`, `values()`, `map`/`filter`) but **omits
+positional subscript** — value-keyed `has(x)` is its lookup, not `set[i]`. Exposing
+`set[i]` is left open (flagged, not decided).
+
+**Why the old `{[T]:boolean}` spelling was wrong (the bug C2 kills).** Spelling a set
+as `{[T]:boolean}` made it **structurally a map from `T` to `bool`** — and under
+structural typing that means *every `Map` method type-checks on it*. A "set" written
+this way leaks the entire Map surface: `.set(k, v)`, `.get(k): boolean | null`, and
+worst of all `.values(): boolean[]` (the booleans! — when a set's values should be its
+*elements*, `T[]`). That is the same class of bug as the index-sig overload in the
+section opener: a value carries a surface it has no business carrying, because its
+*spelling* accidentally made it a richer type. Making `Set<T>` its own nominal-ish
+concrete type — subtype of the arraylike `Sequence` core plus a membership capability,
+**not** of `{[T]:boolean}` — means the only methods that type-check on it are the set
+and sequence-read methods above, never the map surface. The `boolean` was
+never a real value a user stored; it was a representation artifact of spelling
+membership as a map-to-bool, and it should never have been observable.
+
+### C2.3 — Size unifies on `.length`
+
+**Decision.** Drop `.size` for `Map`/`Set`; use **`.length`** uniformly across
+`List`, `Map`, and `Set`. This is the **DECISIONS B6** member: O(1), read-only,
+property syntax (no parens), uniform-access. It is precisely the "align the method
+names with arrays/lists" the reviewer asked for — and it is *what enables a single
+`Iterable`/`Sequence` surface* (C2.5): if `List`/`Map`/`Set` all expose `.length`
+identically, an interface-level self-function (C2.1) can ask for `.length` on any of
+them.
+
+`.length` **lowers to the field or intrinsic appropriate to each representation** —
+same surface, different native lowering, exactly the §VL.5 pattern:
+
+- `List<T>` → `struct.get $len` (the growable header) or `array.len` (the inferred
+  fixed representation, §VL.7).
+- `Map<K,V>` → `struct.get` of the hash map's stored entry count.
+- `Set<T>` → `struct.get` of the set's stored membership count.
+
+One member, three lowerings; the user never sees the difference. (This deliberately
+retires `.size`/`.count`-style per-type spellings for the membership/mapping
+collections; `count`/`extent` stay reserved for a future *sparse* collection per
+§VL.5, not for `Map`/`Set`.)
+
+### C2.4 — Iteration / `for k, v` (B8)
+
+**Decision.** Iteration ties to **B8** and is uniform across all collections — it is
+the entries/destructuring surface the reviewer asked about (`for index, value in
+foo`), planned via **B8 destructuring**, and it is **not** Map-specific:
+
+- `for v in seq` — a sequence's elements.
+- `for v, i in seq` — element **and** index (the sequence + index form, the same B8
+  destructuring §VL.6 sketches for lists/arrays).
+- `for k, v in map` — a map's entries (key + value).
+- `for x in set` — a set's elements.
+
+This is one destructuring mechanism (B8) pointed at each collection's natural
+"entries" shape; it applies uniformly because all three concrete collections are
+subtypes of the iterable interfaces in C2.5. There is no per-collection iteration
+machinery.
+
+### C2.5 — The surface taxonomy (Mapping / Sequence / Set-membership)
+
+The interface hierarchy C2 implies — **provisional names, uncommitted** (flagged in
+exactly the same spirit as the §VL "names uncommitted" caveat for `List`/`Array`):
+
+- **`Mapping`** — the read-only interface `{[K]:V}`: `get`, `has`, `length`, iterate
+  entries (`for k, v`). **Subtypes:** `Map<K,V>` and the plain **object index-sig**
+  (a struct used as an index-sig also satisfies `Mapping`). This is what lets a
+  function typed `{[K]:V}` accept any mapping regardless of representation.
+- **`Sequence`** — the read-only interface `{[i32]:T}` = `T[]`: index, `length`,
+  iterate (`for v` / `for v, i`). **Subtypes:** `List<T>`, the **inferred fixed-array
+  representation** (§VL.7), **and `Set<T>`** — all are sequences; that they differ in
+  representation is invisible at this interface (the §VL.7 "both representations index
+  identically" point, restated as subtyping). A `Set<T>` is arraylike here because it
+  is an ordered sequence of unique `T` (C2.2); it subtypes the **iterable/read** part
+  of `Sequence` (`length` / `for x` / `values` / `map` / `filter`), with positional
+  subscript `set[i]` an open sub-question (C2.2).
+- **`Set`-membership** — `Set<T>` adds, *on top of* its `Sequence` read core, a
+  **value-keyed membership capability**: `add`/`has`/`delete` (and the uniqueness
+  invariant). This is the *distinguishing* layer, not a from-scratch interface — the
+  read/iterate surface comes from `Sequence`, so a set unifies with lists there rather
+  than duplicating iteration machinery. (Still kept off `Mapping` per C2.2 — a set is
+  *not* a map-to-bool.)
+
+Treat **`Mapping`** / **`Sequence`** as design vocabulary only — no decision is taken
+to expose those names to users, same as `List`/`Array`. They name the *shape* the
+interface-level self-functions (C2.1) are written against.
+
+### C2.6 — Construction is concrete-type creation
+
+**Decision.** You **never construct a bare `{[K]:V}` interface** — there is nothing to
+allocate, it is only a capability. You construct a **concrete** `Map<K,V>` /
+`List<T>` / `Set<T>`:
+
+- Sequences via the **`[...]` literal** (the committed surface, §VL.4 / §LS.4).
+- Maps and sets via the provisional **`Map()` / `Set()`** forms (uncommitted spelling,
+  the §VL.4 named-param construction story).
+
+The interface is only ever a **supertype a concrete value flows into** — e.g. a
+parameter typed `{[K]:V}` accepts *any* `Map<K,V>` (and any object index-sig), but the
+caller always hands it a concrete value. This is the **variance** story (**A9**) again,
+identical to §VL.7's:
+
+- A parameter typed at the **read-only interface level** (`{[K]:V}` / `{[i32]:T}`)
+  accepts **any representation** — it only reads, so any subtype is admissible
+  (readable).
+- A parameter that **mutates representation** requires the **concrete subtype**
+  (`Map<K,V>` / `List<T>`) — it needs the fields, so the bare interface does not
+  satisfy it (writable).
+
+Same readable/writable split as §VL.7's "read-only param accepts either representation;
+growing param requires the growable one" — C2 just generalizes it from
+fixed-vs-growable `List` to interface-vs-concrete across all three collections, and it
+is the same information **A9** needs, so the two should be co-designed.
+
+### C2.7 — Rejected alternatives
+
+- **(A) `{[K]:V}` *is* a full `Map` (index-sig overload).** Rejected. Writing an
+  index-signature type would hand you the entire `Map` surface, so a value "smaller
+  than a map" behaved as a full map (the opening bug), and `Set`-as-`{[T]:boolean}`
+  leaked every Map method (`.set`/`.get`/`.values: boolean[]`, C2.2). It conflates the
+  *capability* with the *concrete type*.
+- **(B) Nominal-only collections with no structural interface.** Rejected. Make
+  `Map`/`List`/`Set` purely nominal and drop `{[K]:V}` as a meaningful type. This
+  loses the "works on *any* mapping/sequence" genericity (C2.1's interface-level
+  self-functions could no longer be written against a representation-neutral shape) and
+  loses **object-index-sig interop** (a plain object used as `{[K]:V}` would no longer
+  satisfy a mapping parameter). Too rigid for a scripting-feel language.
+- **C2 (chosen) — structural interface + concrete subtypes — is the middle.** The
+  index-sig is the structural *capability* interface; the concrete collections are its
+  *subtypes* carrying representation. This keeps the "any mapping/sequence" genericity
+  and the object-index-sig interop of a structural interface, **without** letting a
+  bare index-sig masquerade as a full `Map`/`Set`.
+
+### C2.8 — Where this is hard / honest caveats
+
+- **Method resolution across the two layers (C2.1) needs care.** When `o.f(a)` could
+  resolve to an interface-level `f(self: {[K]:V})` *or* a representation-level
+  `f(self: Map<K,V>)`, the resolver must prefer the most specific applicable `self`
+  type (the concrete subtype when the receiver is concrete) — the standard
+  most-specific-overload question, but VL has **no ad-hoc overloading** (one binding
+  per name per scope, DECISIONS B16), so two self-functions named `f` on different
+  `self` types is *itself* something the binding model has to permit (self-functions
+  are dispatched by receiver type, not overloaded by name in a scope) — flag, don't
+  decide here.
+- **Subtyping + structural typing interaction is unspecified.** "`Map<K,V> <: {[K]:V}`"
+  is a structural-subtyping claim; how it composes with VL's existing structural
+  matching (does a `Map` *structurally* match `{[K]:V}`, or is the subtyping a
+  declared relationship?) is open and ties into the variance work (A9).
+- **The `Set` membership interface name and shape are provisional**, like
+  `Mapping`/`Sequence` — and whether a set should be expressible as "a `Map<T, unit>`"
+  internally (a representation choice) without that leaking to the surface (the C2.2
+  lesson) is a representation question deferred to the `Set` implementation.
+- This section takes the *decision* (interface-as-supertype, concrete-as-subtype; `Set`
+  its own type; `.length` uniform; B8 iteration; construction is concrete). The
+  *checker/resolver work* — structural subtyping for the index-sig, the two-layer
+  self-function dispatch, the `Mapping`/`Sequence` interface plumbing — is **new open
+  compiler work**, co-designed with variance (A9), and lands with implementation. The
+  `DECISIONS.md` entry follows the code, not this doc.
+
+---
+
 ## Phased implementation outline (for the follow-up PR)
 
 This is what the `List` PR would build, in dependency order. **No code is written
