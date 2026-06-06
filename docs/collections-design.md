@@ -875,8 +875,28 @@ the `self` param wears."
 - `.length` — element count (O(1), property syntax — see C2.3).
 - `.values(): T[]` — the elements (or iteration yielding `T`, C2.4).
 
-Conceptually `Set<T>` is a subtype of a **set-membership interface** (C2.5), *not* of
-`{[T]:boolean}`.
+Conceptually `Set<T>`'s read surface is the **arraylike / `Sequence` core `{[i32]:T}`**
+(C2.5) — *not* `{[T]:boolean}`. A set is, at the read/iterate layer, an **ordered
+sequence of unique `T`**: it has a `.length`, it iterates yielding `T` in insertion
+order, and `.values(): T[]` is exactly the sequence view. So `Set<T> <: {[i32]:T}`
+(arraylike) is the right core — the same `Sequence` interface `List<T>` subtypes — and
+a set gets `length` / iteration / `map` / `filter` *for free* from it, unified with
+lists rather than bolted on via a bespoke membership-only interface. What a set adds
+**on top of** the sequence core is a **membership capability** keyed by *element value*:
+`has(x)` (the value-keyed O(1) "contains", distinct from a positional read), plus the
+mutating `add(x)` / `delete(x)` and the **uniqueness invariant**. A set therefore sits
+at the intersection of two axes — a *positional* axis (sequence: the i-th inserted
+element) and a *value* axis (membership: "is `x` present").
+
+**Open sub-question — does `Set<T>` expose positional subscript `set[i]`?** Subtyping
+the full `{[i32]:T}` *indexable* interface would make `set[i]` mean "the element at
+position `i`". For an ordered set that is well-defined, but it reintroduces the
+index-vs-value tension C2 fought elsewhere: for `Set<i32>`, `set[3]` reads ambiguously
+as "position 3" vs "is/the value 3", and membership is the *primary* lookup, not
+position. So the safe default is that a `Set` subtypes the **iterable/read** part of
+the sequence core (`length`, `for x in set`, `values()`, `map`/`filter`) but **omits
+positional subscript** — value-keyed `has(x)` is its lookup, not `set[i]`. Exposing
+`set[i]` is left open (flagged, not decided).
 
 **Why the old `{[T]:boolean}` spelling was wrong (the bug C2 kills).** Spelling a set
 as `{[T]:boolean}` made it **structurally a map from `T` to `bool`** — and under
@@ -886,8 +906,9 @@ worst of all `.values(): boolean[]` (the booleans! — when a set's values shoul
 *elements*, `T[]`). That is the same class of bug as the index-sig overload in the
 section opener: a value carries a surface it has no business carrying, because its
 *spelling* accidentally made it a richer type. Making `Set<T>` its own nominal-ish
-concrete type — subtype of a membership interface, **not** of `{[T]:boolean}` — means
-the only methods that type-check on it are the set methods above. The `boolean` was
+concrete type — subtype of the arraylike `Sequence` core plus a membership capability,
+**not** of `{[T]:boolean}` — means the only methods that type-check on it are the set
+and sequence-read methods above, never the map surface. The `boolean` was
 never a real value a user stored; it was a representation artifact of spelling
 membership as a map-to-bool, and it should never have been observable.
 
@@ -941,13 +962,19 @@ exactly the same spirit as the §VL "names uncommitted" caveat for `List`/`Array
   (a struct used as an index-sig also satisfies `Mapping`). This is what lets a
   function typed `{[K]:V}` accept any mapping regardless of representation.
 - **`Sequence`** — the read-only interface `{[i32]:T}` = `T[]`: index, `length`,
-  iterate (`for v` / `for v, i`). **Subtypes:** `List<T>` *and* the **inferred
-  fixed-array representation** (§VL.7) — both are sequences; that they differ in
+  iterate (`for v` / `for v, i`). **Subtypes:** `List<T>`, the **inferred fixed-array
+  representation** (§VL.7), **and `Set<T>`** — all are sequences; that they differ in
   representation is invisible at this interface (the §VL.7 "both representations index
-  identically" point, restated as subtyping).
-- **`Set`-membership** — the interface `Set<T>` is the subtype of: `add`/`has`/
-  `delete`/`length`/iterate-elements. (Kept distinct from `Mapping` precisely because
-  of C2.2 — a set is *not* a map-to-bool.)
+  identically" point, restated as subtyping). A `Set<T>` is arraylike here because it
+  is an ordered sequence of unique `T` (C2.2); it subtypes the **iterable/read** part
+  of `Sequence` (`length` / `for x` / `values` / `map` / `filter`), with positional
+  subscript `set[i]` an open sub-question (C2.2).
+- **`Set`-membership** — `Set<T>` adds, *on top of* its `Sequence` read core, a
+  **value-keyed membership capability**: `add`/`has`/`delete` (and the uniqueness
+  invariant). This is the *distinguishing* layer, not a from-scratch interface — the
+  read/iterate surface comes from `Sequence`, so a set unifies with lists there rather
+  than duplicating iteration machinery. (Still kept off `Mapping` per C2.2 — a set is
+  *not* a map-to-bool.)
 
 Treat **`Mapping`** / **`Sequence`** as design vocabulary only — no decision is taken
 to expose those names to users, same as `List`/`Array`. They name the *shape* the
