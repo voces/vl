@@ -156,6 +156,8 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
   `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.
+  **Strings direction (design/research; not before bootstrap):** `docs/strings-design.md` (being
+  written) — long-term UTF-8 internal storage, non-code-point-indexed API, ASCII fast-path. Ties A7.
 - 🟡 **B8. Loops.** Done: `for…in` over arrays, direction-aware `step`, single-line block bodies,
   empty-range warning. REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
   destructuring forms.
@@ -216,6 +218,12 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   in xs { if test(x) { break x } }` → `Nullable<elem>`). Three layers: grammar → types (mirror the
   `returnTypes` mechanism) → codegen (`__brk` block gets a result type). Labels need a per-loop
   break-value collector stack.
+- ⬜ **B-debug. Name section + source maps + trap-to-source diagnostics.** First emit the wasm **name
+  section** (VL function names show in traces), then a **source map** (wasm offset → VL line/col) so a
+  trap becomes a VL-source-located runtime error instead of a raw wasm abort. Leverages the Track G
+  spans; unblocks browser-DevTools source-level stepping later (DAP / native DWARF are further future).
+  A **REPL** is feasible on this wasm architecture (accumulate-session-source + recompile-per-entry +
+  show-new-output) as a possible future CLI item.
 
 ---
 
@@ -247,7 +255,22 @@ D1/D2.*
   (`compiler/symbols.ts`) during its scope walk; the LSP queries it by cursor (`textDocument/definition`
   + `textDocument/references`). Locals, params, function decls, type aliases; single-document. → `DECISIONS.md`.
 - ⬜ **D3. Autocomplete** (scope-aware; structural members).
-- ⬜ **D4. Formatter** (+ `vl fmt`).
+- 🟡 **D4. Formatter** (+ `vl fmt`). Done (core): an AST-driven source formatter (`compiler/format.ts`,
+  `vl fmt`, LSP `textDocument/formatting`) — generates source from the AST, idempotent,
+  round-trip-AST-equivalent, comment-preserving, with line reflow (wraps long calls / array & object
+  literals / boolean chains at 80 cols, collapses when they fit). REMAINING (follow-ups):
+  - **Unfaithful-fallback constructs** — reproduced *verbatim from the source span* rather than
+    regenerated: `type` aliases (body & span discarded by the checker), operator-named & method-shorthand
+    functions and operator/index-method call desugars, and leaf statements that enclose an own-line
+    comment. Address so these round-trip through the AST like everything else.
+  - **AST type-syntax fidelity gap** (the root cause of the fallbacks above; → Track G/A) — the
+    typechecker fully RESOLVES every type it records (a tiny `i32` becomes a giant structural `Object`;
+    `type`-alias bodies and their spans are discarded), so surface type syntax (annotations, `is`/`!is`
+    check types, alias references) is NOT reprintable from the AST. Retain the *as-written* type syntax
+    (or its span) so the AST is lossless for types — also benefits hover/inlay rendering (D1/D6/D8).
+  - **Trailing commas** — the reflow doesn't yet emit trailing commas in multi-line literals; a parser
+    change to *accept* them is in flight (`claude/trailing-commas`), after which `fmt` should emit them
+    for cleaner diffs.
 - ✅ **D5. Semantic tokens.** `textDocument/semanticTokens/full` — hybrid classifier: identifiers via the
   D2 symbol table (variable/parameter/function/type + `declaration` modifier), literals/keywords/operators
   via the lexer token stream, comments by source scan, **and `receiver.member` names** (→ `property` /
@@ -351,11 +374,22 @@ corpus (A12) is the host-agnostic oracle — the same tests pass whichever compi
   (unblocks AST-node lists); (2) ✅ **module-level mutable `let` mutated through a function** — a scalar top-level
   binding referenced from inside a function now lowers to a shared wasm `global` (`global.get`/`global.set`),
   so reads/writes from a function hit the one cell, not a captured copy (`tests/cases/globals/`); (3) ✅
-  **string escapes** now decoded in the lexer (`\n`/`\t`/`\xXX`/`\uXXXX`/…); plus known:
-  maps (B6a), enum tag for literal-unions (A16), char literals, a `toString`/stringify.
+  **string escapes** now decoded in the lexer (`\n`/`\t`/`\xXX`/`\uXXXX`/…); (4) ✅ **`toString` resolves in
+  nested scopes** — root cause was a prototype-chain leak in scope lookup (`name in scope` matched
+  `Object.prototype.toString`); fixed by `Object.hasOwn` everywhere (also closes the same hazard for
+  `constructor`/`valueOf`/etc.); (5) ✅ **`fromCodePoint(code): string` builtin** — code-point-named (replaced the
+  JS-ism `fromCharCode`); (6) ✅ **ref/string module-globals through a function** now lower to shared wasm
+  globals (extends gap-2's scalar-only support to ref/string cells); (7) ✅ **one-char string literal `.length`**
+  no longer mis-types as a char — string literals soften to nominal `string`. Remaining known: maps (B6a),
+  enum tag for literal-unions (A16); char literals ✅ and a `toString`/stringify ✅ are now done.
+- 🟡 **H2a. Re-land a clean `selfhost/lexer.vl`** (near-term, now unblocked). The spike PR #54 was closed
+  "fix gaps, re-land clean"; with the H2 gaps above fixed, re-land a lexer that drops the workarounds:
+  hand-rolled `i32ToStr` → real `toString`, raw `\xXX`/`\uXXXX` lexemes → `fromCodePoint`, struct-threaded
+  scanner state → a real ref-typed module global. The first concrete slice of H3.
 - ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
   running the corpus through the VL-written compiler. Incremental; TS and VL compilers cross-checked.
-  First slice (lexer) spiked + closed (#37) pending the H2 gap-1 fix; re-lands clean as `selfhost/`.
+  First slice (lexer) spiked + closed (#37, then #54) pending the H2 gap fixes; re-lands clean as
+  `selfhost/lexer.vl` (H2a).
 - ⬜ **H4. WASM emission — DECIDED: emit bytes directly + optional `wasm-opt`** (binaryen's npm build
   is JS-bound; → `DECISIONS.md`, incl. the Heap2Local caveat). binaryen stays for the TS compiler.
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime (wasmtime —
