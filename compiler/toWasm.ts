@@ -466,7 +466,22 @@ export const toWasm = async (ast: VLProgramNode) => {
   // (`{[i32]: T}` — see `arrayElementType`); that key is what selects the WasmGC-
   // array representation (contiguous, native `array.get` — the performance path)
   // over a struct. `length` rides as an intrinsic lowered to `array.len`.
-  type ArrayType = { heapType: number; refType: number; element: VLType };
+  // `elemWasm` is the *logical* element wasm type (what a read yields to the
+  // surface); `backingWasm` is the wasm type of the array's *slots*. They differ
+  // only when the element is a non-nullable reference (a struct/list/closure/
+  // string ref): a `(ref $t)` array slot is non-defaultable, so `array.new_default`
+  // (used by every allocate-then-fill path — grow, map, filter, `+`) is illegal.
+  // We widen such backings to `(ref null $t)`, whose default is `ref.null`; reads
+  // off `[0, len)` are always populated, so they `ref.as_non_null` back to the
+  // logical type (see `arrayReadCast`). Value/niche/already-nullable elements are
+  // defaultable, so `backingWasm == elemWasm` and the cast is a no-op.
+  type ArrayType = {
+    heapType: number;
+    refType: number;
+    element: VLType;
+    elemWasm: number;
+    backingWasm: number;
+  };
   const arrayTypes = new Map<number, ArrayType>();
   // Intern a WasmGC array type by its element's wasm type (so identical element
   // types share one array type). Mutable so `a[i] = v` can `array.set`.
@@ -474,18 +489,54 @@ export const toWasm = async (ast: VLProgramNode) => {
     const elemWasm = toWasmType(element);
     let cached = arrayTypes.get(elemWasm);
     if (!cached) {
+      const backingWasm = nonNullRefElement(element)
+        ? nullableOf(elemWasm)
+        : elemWasm;
       const tb = new binaryen.TypeBuilder(1);
-      tb.setArrayType(0, elemWasm, binaryen.notPacked, true);
+      tb.setArrayType(0, backingWasm, binaryen.notPacked, true);
       const heapType = tb.buildAndDispose()[0];
       cached = {
         heapType,
         refType: binaryen.getTypeFromHeapType(heapType, false),
         element,
+        elemWasm,
+        backingWasm,
       };
       arrayTypes.set(elemWasm, cached);
     }
     return cached;
   };
+
+  // True when `element` lowers to a *non-nullable* WasmGC reference (struct,
+  // list, closure, named/string array, or a boxed union) — the only elements
+  // whose backing array slot is non-defaultable. Value scalars, niche-nullables
+  // (i32 rep), and already-nullable refs are excluded (their slots default fine).
+  const nonNullRefElement = (element: VLType): boolean => {
+    let t = softenImplicitType(element);
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
+    if (t.type === "Nullable") return false; // already a nullable ref or niche
+    if (valueTypeName(t) !== null) return false; // i32/i64/f32/f64/boolean
+    if (unionInfo(t)) return true; // boxed tagged union (non-null struct)
+    if (t.type === "Function") return true;
+    if (isListType(t)) return true;
+    if (t.type === "Object") {
+      if (arrayElementType(t)) return true; // string / raw array ref
+      if (t.name === undefined) return true; // structural object struct
+    }
+    return false;
+  };
+
+  // The nullable form of an interned non-nullable ref wasm type, by round-tripping
+  // through its heap type (binaryen exposes nullability only via heap-type refs).
+  const nullableOf = (refWasm: number): number =>
+    binaryen.getTypeFromHeapType(binaryen.getHeapType(refWasm), true);
+
+  // Read an element out of a backing slot at its logical (surface) wasm type. When
+  // the backing was widened to nullable (non-null ref element), narrow the slot
+  // back with `ref.as_non_null` — sound because reads only ever touch the
+  // populated `[0, len)` region (the spare `[len, cap)` slots are never read).
+  const arrayReadCast = (at: ArrayType, value: number): number =>
+    at.backingWasm === at.elemWasm ? value : m.ref.as_non_null(value);
 
   // --- Lists (the committed growable `T[]` representation, B6) ---
   // A `T[]` value (a structural object carrying an `[i32]:T` index signature that
@@ -734,7 +785,6 @@ export const toWasm = async (ast: VLProgramNode) => {
     if (existing) return existing;
     const name = `__list_eq_${listEqFns.size}__`;
     listEqFns.set(lt.heapType, name); // before body for cycle safety
-    const elemWasm = toWasmType(lt.element);
     const a = () => m.local.get(0, lt.refType);
     const b = () => m.local.get(1, lt.refType);
     const i = () => m.local.get(2, binaryen.i32);
@@ -754,8 +804,16 @@ export const toWasm = async (ast: VLProgramNode) => {
             m.if(
               m.i32.eqz(valueEq(
                 lt.element,
-                () => m.array.get(listBacking(lt, a()), i(), elemWasm, false),
-                () => m.array.get(listBacking(lt, b()), i(), elemWasm, false),
+                () =>
+                  arrayReadCast(
+                    lt.backing,
+                    m.array.get(listBacking(lt, a()), i(), lt.backing.backingWasm, false),
+                  ),
+                () =>
+                  arrayReadCast(
+                    lt.backing,
+                    m.array.get(listBacking(lt, b()), i(), lt.backing.backingWasm, false),
+                  ),
               )),
               m.return(m.i32.const(0)),
             ),
@@ -972,7 +1030,10 @@ export const toWasm = async (ast: VLProgramNode) => {
       m.local.set(lRef, listExpr),
       m.local.set(iLocal, indexExpr),
       m.if(m.i32.ge_u(i(), listLen(l())), m.unreachable()),
-      m.array.get(listBacking(lt, l()), i(), elemWasm, false),
+      arrayReadCast(
+        lt.backing,
+        m.array.get(listBacking(lt, l()), i(), lt.backing.backingWasm, false),
+      ),
     ], elemWasm);
   };
 
@@ -1002,7 +1063,6 @@ export const toWasm = async (ast: VLProgramNode) => {
     const doneLabel = `__${prop}_done_${tag}__`;
 
     const cb = node.arguments[0].value;
-    const elemWasm = toWasmType(src.element);
     const srcRef = newLocal(src.lt.refType);
     const cloRef = newLocal(closureStruct().refType);
     const nLocal = newLocal(binaryen.i32);
@@ -1015,7 +1075,10 @@ export const toWasm = async (ast: VLProgramNode) => {
     const back = () => m.local.get(backLocal, outLt.backing.refType);
     // `src.backing[i]` (the loop element, read raw — `i` is always in `[0, len)`).
     const elemAt = () =>
-      m.array.get(listBacking(src.lt, s()), i(), elemWasm, false);
+      arrayReadCast(
+        src.lt.backing,
+        m.array.get(listBacking(src.lt, s()), i(), src.lt.backing.backingWasm, false),
+      );
 
     if (prop === "map") {
       const outWasm = toWasmType(outLt.element);
@@ -1880,11 +1943,14 @@ export const toWasm = async (ast: VLProgramNode) => {
         }
         const info = arrayTypeOf(node.array);
         if (!info) throw new Error("Index access on a non-array");
-        return m.array.get(
-          toExpression(node.array),
-          withDesiredType(i32Type, () => toExpression(node.index)),
-          toWasmType(info.element),
-          false,
+        return arrayReadCast(
+          info.at,
+          m.array.get(
+            toExpression(node.array),
+            withDesiredType(i32Type, () => toExpression(node.index)),
+            info.at.backingWasm,
+            false,
+          ),
         );
       }
       case "PropertyAccess": {
@@ -2066,7 +2132,15 @@ export const toWasm = async (ast: VLProgramNode) => {
               return desiredType
                 ? m.block(null, [
                   ...body,
-                  m.array.get(listBacking(list.lt, l()), i(), wasmType, false),
+                  arrayReadCast(
+                    list.lt.backing,
+                    m.array.get(
+                      listBacking(list.lt, l()),
+                      i(),
+                      list.lt.backing.backingWasm,
+                      false,
+                    ),
+                  ),
                 ], wasmType)
                 : m.block(null, body, binaryen.none);
             }
@@ -2090,11 +2164,14 @@ export const toWasm = async (ast: VLProgramNode) => {
             return desiredType
               ? m.block(null, [
                 set,
-                m.array.get(
-                  toExpression(access.array),
-                  withDesiredType(i32Type, () => toExpression(access.index)),
-                  wasmType,
-                  false,
+                arrayReadCast(
+                  info.at,
+                  m.array.get(
+                    toExpression(access.array),
+                    withDesiredType(i32Type, () => toExpression(access.index)),
+                    info.at.backingWasm,
+                    false,
+                  ),
                 ),
               ], wasmType)
               : set;
@@ -2588,7 +2665,13 @@ export const toWasm = async (ast: VLProgramNode) => {
               loopLabel,
               m.block(null, [
                 m.br(brk, m.i32.ge_s(i(), m.local.get(lenLocal, binaryen.i32))),
-                m.local.set(varLocal, m.array.get(back(), i(), elemWasm, false)),
+                m.local.set(
+                  varLocal,
+                  arrayReadCast(
+                    list.lt.backing,
+                    m.array.get(back(), i(), list.lt.backing.backingWasm, false),
+                  ),
+                ),
                 m.block(cont, [toExpression(node.statement)]),
                 m.local.set(iLocal, m.i32.add(i(), m.i32.const(1))),
                 m.br(loopLabel),
@@ -2619,7 +2702,13 @@ export const toWasm = async (ast: VLProgramNode) => {
             loopLabel,
             m.block(null, [
               m.br(brk, m.i32.ge_s(i(), m.local.get(lenLocal, binaryen.i32))),
-              m.local.set(varLocal, m.array.get(arr(), i(), elemWasm, false)),
+              m.local.set(
+                varLocal,
+                arrayReadCast(
+                  info.at,
+                  m.array.get(arr(), i(), info.at.backingWasm, false),
+                ),
+              ),
               m.block(cont, [toExpression(node.statement)]),
               m.local.set(iLocal, m.i32.add(i(), m.i32.const(1))),
               m.br(loopLabel),
@@ -3087,6 +3176,7 @@ export const toWasm = async (ast: VLProgramNode) => {
     toExpression,
     withDesiredType,
     listBacking,
+    arrayReadCast,
     listLen,
     listCap,
     nullableNull,

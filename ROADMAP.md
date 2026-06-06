@@ -306,9 +306,11 @@ corpus (A12) is the host-agnostic oracle — the same tests pass whichever compi
 - 🟡 **H2. Make VL expressive enough to write a compiler.** Recursive tree types (**A11 ✅**), generics
   (**A10 ✅** incl. `map`/`filter`), `List` (**B6 ✅**), maps (**B6a** ⬜), string munging (**A7**).
   **Gaps a `selfhost/lexer.vl` spike found** (ranked; the concrete H2 to-do list):
-  (1) ⬜ **can't `.push` a non-nullable struct array** (`Tok[]`) — grow path's `array.new_with_default`
-  rejects non-defaultable struct refs → forces `(T|null)[]` for struct accumulators (blocks AST-node lists;
-  **priority fix**); (2) ⬜ **module-level mutable `let` not mutated through a function** (bug/restriction —
+  (1) ✅ **`.push` a non-nullable struct array** (`Tok[]`) now works — the backing array's slot type is
+  nullable-widened to `(ref null $T)` for non-defaultable ref elements (so `array.new_default` is legal in
+  every allocate-then-fill path: grow, `map`, `filter`, `+`); reads off the live `[0, len)` region
+  `ref.as_non_null` back to the surface non-null type. Struct accumulators no longer need `(T|null)[]`
+  (unblocks AST-node lists); (2) ⬜ **module-level mutable `let` not mutated through a function** (bug/restriction —
   confirm); (3) ✅ **string escapes** now decoded in the lexer (`\n`/`\t`/`\xXX`/`\uXXXX`/…); plus known:
   maps (B6a), enum tag for literal-unions (A16), char literals, a `toString`/stringify.
 - ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by

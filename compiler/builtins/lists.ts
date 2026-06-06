@@ -13,7 +13,15 @@
 import { VLCallNode, VLExpression, VLType } from "../toAST.ts";
 
 /** A WasmGC array type, as interned by toWasm's `arrayType`. */
-type ArrayType = { heapType: number; refType: number; element: VLType };
+type ArrayType = {
+  heapType: number;
+  refType: number;
+  element: VLType;
+  /** The logical element wasm type (what a read yields to the surface). */
+  elemWasm: number;
+  /** The wasm type of the array's slots — nullable-widened for non-null refs. */
+  backingWasm: number;
+};
 /** The list struct type, as interned by toWasm's `listType`. */
 type ListType = {
   heapType: number;
@@ -49,6 +57,9 @@ export type ListBuiltinContext = {
   withDesiredType: <T>(type: VLType | undefined, fn: () => T) => T;
   /** Field read: `struct.get $backing`. */
   listBacking: (lt: ListType, ref: number) => number;
+  /** Narrow a backing-slot read back to its logical element type (no-op for
+   * defaultable elements; `ref.as_non_null` for nullable-widened ref backings). */
+  arrayReadCast: (at: ArrayType, value: number) => number;
   /** Field read: `struct.get $len`. */
   listLen: (ref: number) => number;
   /** Field read: `struct.get $cap`. */
@@ -151,11 +162,10 @@ const listPushFn = (ctx: ListBuiltinContext, lt: ListType): string => {
 // on empty (normal absence, §VL.6). On non-empty: `len--`, read `backing[len]`.
 // `cap` is retained (grow-only). The result is the union/nullable encoding.
 const listPopFn = (ctx: ListBuiltinContext, lt: ListType): string => {
-  const { m, binaryen, helpers, listBacking, listLen, nullableNull, nullableSome } = ctx;
+  const { m, binaryen, helpers, listBacking, listLen, nullableNull, nullableSome, arrayReadCast } = ctx;
   const name = `__list_pop_${ctx.tagOf(lt)}__`;
   if (helpers.has(name)) return name;
   helpers.add(name);
-  const elemWasm = ctx.toWasmType(lt.element);
   const nullableType: VLType = { type: "Nullable", subType: lt.element };
   const retWasm = ctx.toWasmType(nullableType);
   const list = () => m.local.get(0, lt.refType);
@@ -167,7 +177,10 @@ const listPopFn = (ctx: ListBuiltinContext, lt: ListType): string => {
       nullableSome(
         nullableType,
         lt.element,
-        m.array.get(listBacking(lt, list()), listLen(list()), elemWasm, false),
+        arrayReadCast(
+          lt.backing,
+          m.array.get(listBacking(lt, list()), listLen(list()), lt.backing.backingWasm, false),
+        ),
       ),
     ], retWasm),
   );
@@ -203,11 +216,10 @@ const listClearFn = (ctx: ListBuiltinContext, lt: ListType): string => {
 // in `[0, len)` returns the element (boxed into the nullable rep), else `null`.
 // The unsigned compare folds the `i < 0` check in (`len >= 0`).
 const listGetFn = (ctx: ListBuiltinContext, lt: ListType): string => {
-  const { m, binaryen, helpers, listBacking, listLen, nullableNull, nullableSome } = ctx;
+  const { m, binaryen, helpers, listBacking, listLen, nullableNull, nullableSome, arrayReadCast } = ctx;
   const name = `__list_get_${ctx.tagOf(lt)}__`;
   if (helpers.has(name)) return name;
   helpers.add(name);
-  const elemWasm = ctx.toWasmType(lt.element);
   const nullableType: VLType = { type: "Nullable", subType: lt.element };
   const retWasm = ctx.toWasmType(nullableType);
   const list = () => m.local.get(0, lt.refType);
@@ -217,7 +229,10 @@ const listGetFn = (ctx: ListBuiltinContext, lt: ListType): string => {
     nullableSome(
       nullableType,
       lt.element,
-      m.array.get(listBacking(lt, list()), i(), elemWasm, false),
+      arrayReadCast(
+        lt.backing,
+        m.array.get(listBacking(lt, list()), i(), lt.backing.backingWasm, false),
+      ),
     ),
     nullableNull(nullableType),
     retWasm,
