@@ -101,6 +101,16 @@ export type Comment = {
   text: string;
   start: Position;
   stop: Position;
+  /**
+   * Source line position relative to code, for an AST→source printer (Track G):
+   * `"trailing"` when the comment sits on the SAME line as, and after, a real
+   * token (`let x = 1 // count`), `"own-line"` when it stands alone on its line
+   * (or is the leading comment of the following token). The same distinction that
+   * decides whether the comment is cross-linked as a token's `trailingComments`
+   * vs the next token's `leadingComments` — surfaced here so a printer reading the
+   * flat `comments` list can place it without re-deriving from spans.
+   */
+  placement: "own-line" | "trailing";
 };
 
 export type Token = {
@@ -300,18 +310,20 @@ export const tokenize = (source: string): LexResult => {
         text += advance();
       }
       const isDoc = text.startsWith("///") && text[3] !== "/";
+      // Trailing comment: same source line, after a real token, with no NEWLINE
+      // between. Attach to that token so a formatter keeps it on its line.
+      // Otherwise it's a leading comment for the next real token.
+      const trailing = !newlineSinceToken && lastRealToken !== undefined;
       const comment: Comment = {
         kind: isDoc ? "doc" : "line",
         text,
         start,
         stop: pos(),
+        placement: trailing ? "trailing" : "own-line",
       };
       comments.push(comment);
-      // Trailing comment: same source line, after a real token, with no NEWLINE
-      // between. Attach to that token so a formatter keeps it on its line.
-      // Otherwise it's a leading comment for the next real token.
-      if (!newlineSinceToken && lastRealToken !== undefined) {
-        (lastRealToken.trailingComments ??= []).push(comment);
+      if (trailing) {
+        (lastRealToken!.trailingComments ??= []).push(comment);
       } else {
         pendingComments.push(comment);
       }

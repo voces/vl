@@ -21,9 +21,17 @@ const assertExists = <T>(v: T, msg?: string): void => {
 import type {
   Context,
   VLBinaryOperationNode,
+  VLBlockNode,
+  VLBreakNode,
+  VLContinueNode,
+  VLForInNode,
+  VLForNode,
   VLFunctionDeclarationNode,
+  VLIfNode,
+  VLReturnNode,
   VLStringLiteralNode,
   VLVariableDeclarationNode,
+  VLWhileNode,
 } from "../compiler/ast.ts";
 
 // `start`/`stop` as compact [line, column] pairs for readable assertions.
@@ -110,4 +118,107 @@ Deno.test("spans are exposed identically across multiple statements", () => {
   assertExists(second);
   assertEquals(span(first!), [1, 0, 1, 9]);
   assertEquals(span(second!), [2, 0, 2, 9]);
+});
+
+// ---- Track G gap 1: control-flow statement spans -------------------------
+// `if`/`while`/`for`/`for-in`/`return`/`break`/`continue` are now recorded in
+// the span side-table (previously bare nodes with no span), so a node->source
+// slice can cover control flow. Each is exercised in the smallest source that
+// places it, with the exact [line,col,line,col] extent asserted.
+
+Deno.test("an `if` node spans the whole statement, branches included", () => {
+  const src = "if true { return 1 } else { return 2 }\n";
+  const { ast, spans } = checkOnly(src);
+  const node = ast.statements[0] as VLIfNode;
+  assertEquals(node.type, "If");
+  const ctx = spanOf(spans, node);
+  assertExists(ctx);
+  // `if` at column 0 through the closing `}` of the else branch (column 38).
+  assertEquals(span(ctx!), [1, 0, 1, 38]);
+});
+
+Deno.test("a `while` node spans from `while` through its body close", () => {
+  const src = "while false { break }\n";
+  const { ast, spans } = checkOnly(src);
+  const node = ast.statements[0] as VLWhileNode;
+  assertEquals(node.type, "While");
+  const ctx = spanOf(spans, node);
+  assertExists(ctx);
+  assertEquals(span(ctx!), [1, 0, 1, 21]);
+});
+
+Deno.test("a labelled `while` span starts at the label", () => {
+  const src = "outer: while false { break outer }\n";
+  const { ast, spans } = checkOnly(src);
+  const node = ast.statements[0] as VLWhileNode;
+  assertEquals(node.type, "While");
+  assertEquals(node.label, "outer");
+  const ctx = spanOf(spans, node);
+  assertExists(ctx);
+  // Span begins at the label `outer`, not at `while`.
+  assertEquals(span(ctx!), [1, 0, 1, 34]);
+});
+
+Deno.test("a counted `for` node spans the whole loop", () => {
+  const src = "for i in 0 to 10 { break }\n";
+  const { ast, spans } = checkOnly(src);
+  const node = ast.statements[0] as VLForNode;
+  assertEquals(node.type, "For");
+  const ctx = spanOf(spans, node);
+  assertExists(ctx);
+  assertEquals(span(ctx!), [1, 0, 1, 26]);
+});
+
+Deno.test("a `for-in` node spans the whole loop", () => {
+  const src = "for x in [1, 2, 3] { break }\n";
+  const { ast, spans } = checkOnly(src);
+  const node = ast.statements[0] as VLForInNode;
+  assertEquals(node.type, "ForIn");
+  const ctx = spanOf(spans, node);
+  assertExists(ctx);
+  assertEquals(span(ctx!), [1, 0, 1, 28]);
+});
+
+Deno.test("a `return` node spans the keyword and its value", () => {
+  const src = "function f() { return 1 + 2 }\n";
+  const { ast, spans } = checkOnly(src);
+  const fn = ast.statements[0] as VLFunctionDeclarationNode;
+  const body = fn.body as VLBlockNode;
+  const ret = body.statements[0] as VLReturnNode;
+  assertEquals(ret.type, "Return");
+  const ctx = spanOf(spans, ret);
+  assertExists(ctx);
+  // `return 1 + 2` is columns 15..27.
+  assertEquals(span(ctx!), [1, 15, 1, 27]);
+});
+
+Deno.test("`break` and `continue` nodes carry spans", () => {
+  const src = "while true { break\ncontinue }\n";
+  const { ast, spans } = checkOnly(src);
+  const loop = ast.statements[0] as VLWhileNode;
+  const body = loop.statement as VLBlockNode;
+  const brk = body.statements[0] as VLBreakNode;
+  const cont = body.statements[1] as VLContinueNode;
+  assertEquals(brk.type, "Break");
+  assertEquals(cont.type, "Continue");
+  const brkCtx = spanOf(spans, brk);
+  const contCtx = spanOf(spans, cont);
+  assertExists(brkCtx);
+  assertExists(contCtx);
+  // `break` is columns 13..18 on line 1; `continue` columns 0..8 on line 2.
+  assertEquals(span(brkCtx!), [1, 13, 1, 18]);
+  assertEquals(span(contCtx!), [2, 0, 2, 8]);
+});
+
+Deno.test("a labelled `break` span covers the label", () => {
+  const src = "outer: for i in 0 to 3 { break outer }\n";
+  const { ast, spans } = checkOnly(src);
+  const loop = ast.statements[0] as VLForNode;
+  const body = loop.statement as VLBlockNode;
+  const brk = body.statements[0] as VLBreakNode;
+  assertEquals(brk.label, "outer");
+  const ctx = spanOf(spans, brk);
+  assertExists(ctx);
+  // `break outer` is columns 25..36.
+  assertEquals(span(ctx!), [1, 25, 1, 36]);
 });
