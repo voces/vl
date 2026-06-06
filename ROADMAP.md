@@ -237,10 +237,14 @@ D1/D2.*
 ## Track E — Browser playground + sandbox
 *Depends on C1. The compiler is pure TS + binaryen (wasm), so it runs client-side.*
 
-- ⬜ **E1. Bundle the compiler for the browser** (esbuild browser target).
-- ⬜ **E2. Playground UI** — Monaco editor + output pane.
+- ✅ **E1. Bundle the compiler for the browser** (esbuild + `esbuild-deno-loader`, browser target). binaryen@130
+  runs client-side unmodified (ESM, top-level-await self-init); `deno task playground` builds + serves.
+- 🟡 **E2. Playground UI** — `<textarea>` + Run + diagnostics/log/WAT panes + sample picker (`playground/`).
+  REMAINING: Monaco/CodeMirror editor.
 - ⬜ **E3. Sandboxed execution** — compiled user wasm in a Web Worker, fresh `Memory`, controlled
-  `log` only, enforced limits. The wasm sandbox + worker isolation is the security boundary.
+  `log` only, enforced limits. The wasm sandbox + worker isolation is the security boundary. (Today user
+  wasm runs on the main thread with a fresh `Memory` + `log`-only imports — fine for trusted local use,
+  harden before any public deploy.)
 - ⬜ **E4. Shareable links** (encode source in URL / gist).
 
 ---
