@@ -224,7 +224,9 @@ D1/D2.*
   + `textDocument/references`). Locals, params, function decls, type aliases; single-document. → `DECISIONS.md`.
 - ⬜ **D3. Autocomplete** (scope-aware; structural members).
 - ⬜ **D4. Formatter** (+ `vl fmt`).
-- ⬜ **D5. Semantic tokens.**
+- ✅ **D5. Semantic tokens.** `textDocument/semanticTokens/full` — hybrid classifier: identifiers via the
+  D2 symbol table (variable/parameter/function/type + `declaration` modifier), literals/keywords/operators
+  via the lexer token stream, comments by source scan. (Full only; `range`/`delta` not yet.)
 - ✅ **D6. Inlay hints** for inferred types — *the* feature for a "types are hidden" language. Inline
   `: <type>` at unannotated `let`/`const`/params and omitted returns; annotated positions and unresolved
   holes are suppressed. (Annotation detection is currently source-text heuristic in `lsp/`; a future
