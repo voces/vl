@@ -73,6 +73,9 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   declared return type; closing that needs call-graph **SCC grouping + group unification** (ML
   `let rec … and …` style: hole the whole cluster's signatures, check bodies together, solve). Matters
   for VL's inference-first identity (a recursive-descent compiler is one big mutually-recursive cluster).
+  Also REMAINING: **const generics** (numeric/*value* type parameters, e.g. `Decimal<10, 8>` /
+  `Buffer<N>`) — today generics take *type* params only; the enabler for the parameterized fixed-point
+  `Decimal<Backing, Scale>` family (B2) and any fixed-size/parameter-by-value type.
 - 🟢 **A11. Recursive structural types.** Done — `type Tree = { value, left: Tree | null, … }`
   constructs/traverses/compiles (cycle-safe traversals + a self-referential WasmGC struct rec-group;
   `types/recursive-tree.vl`). REMAINING: mutual recursion across *separate* `type` decls; recursion
@@ -110,9 +113,12 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   mappings; range-aware integer-literal defaults. REMAINING: explicit value casting/coercion between
   numeric types (today only literals coerce); **`0x` hex / `0o` octal / `0b` binary integer literals
   + digit separators** (`1_000`, `0xFF_FF`) — a lexer/parser add the self-host lexer flagged (it does
-  hex via `* 16` for lack of the literal); **arbitrary-precision `BigInt` / `BigDecimal`** as future
-  ***`std`-library*** types (not primitives — wasm has only `i32`/`i64`/`f32`/`f64` — for unbounded
-  integers / exact decimal; rides the module/`std` work).
+  hex via `* 16` for lack of the literal); **arbitrary-precision `BigInt` and a `Decimal<Backing, Scale>`
+  family** as future ***`std`-library*** generic types (not primitives — wasm has only
+  `i32`/`i64`/`f32`/`f64`). A decimal is a scaled integer (`mantissa × 10⁻ˢᶜᵃˡᵉ`) parameterized over a
+  backing int (`i64`/`i128` bounded, or `BigInt` unbounded) and a scale: `Decimal<i64,2>` = currency,
+  `Decimal<BigInt,8>` = arbitrary-magnitude, with `BigDecimal` the dynamic-scale member. **Prereq:
+  const generics** (numeric/value type params, e.g. `Decimal<10,8>`) — see A10; rides the module/`std` work.
 - ✅ **B3. First-class functions / indirect calls + per-shape monomorphization.** A function value is
   a fat-pointer closure `{ tableIndex, env }`; each call site instantiates a fresh signature, keyed in
   codegen by wasm param signature. (See `vl-monomorphization` memo; folds into A10.)
