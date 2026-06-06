@@ -115,7 +115,9 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   (`{ array, len, cap }`, tier 2).
 - ⬜ **B6a. Maps / non-string keys** (`Map<K,V>` — a separate hash type, not every-object-as-table; →
   `DECISIONS.md`). Index sigs `{[string]: T}` type-check but are dropped at codegen — this is their
-  codegen, via B13's `"[]"`/`"[]="` traps. Deferred.
+  codegen. The `"[]"`/`"[]="` traps it rides on are now in place (B13); what remains is the hash
+  representation itself (a nominal `Map<K,V>` shape whose `"[]"`/`"[]="` lower to hashed get/set).
+  Deferred.
 - 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
   `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.
@@ -131,7 +133,10 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **B13. Well-known-symbol dispatch (operator / call / index).** Done: operator overloading — a
   user-shape operand dispatches through its operator method (stored-closure field *or*, for object-
   shaped operands like `vec + vec`, a free `self`-named operator function that monomorphizes per call).
-  (→ `DECISIONS.md`.) REMAINING: callable objects (`"()"`) + index traps (`"[]"`/`"[]="`).
+  Index traps — a user object that declares a `"[]"` method handles `o[k]` (and `"[]="` handles
+  `o[k] = v`), dispatched as a field-method call resolved statically; a native i32-keyed array keeps
+  its fast `array.get`/`array.set`, so the trap fires only for non-array objects that declare it.
+  (→ `DECISIONS.md`.) REMAINING: callable objects (`"()"`).
 - 🟡 **B14. Methods via explicit `self` + UFCS (no `this`).** Done (core): a free `self`-first
   function is callable as `o.f(args)` (rewrites to `f(o, args)`, monomorphized per receiver);
   resolution order field-then-self-fn; non-`self` functions aren't instance-reachable. (Full decision
@@ -257,4 +262,4 @@ H2/H3; H1 done, H4 decided.
   self-hosting (H3). The deepest remaining type-system work.
 - **C5 / H-M1** — `deno compile` + brew. Small, decoupled, ships the distribution story now.
 - **D1** — hover types, now that AST nodes carry source spans (D2 go-to-def/refs is done).
-- Smaller/independent: B6 growable lists, B13 callable-objects/index-traps, B17 lint pass, A6b Stage A.
+- Smaller/independent: B6 growable lists, B13 callable-objects, B17 lint pass, A6b Stage A.
