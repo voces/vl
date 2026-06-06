@@ -110,110 +110,36 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   reassignment, captured-in-closures, excess-property width subtyping, function-valued fields +
   member-call. REMAINING: methods via `self`+UFCS (B14); method-shorthand `{ add(a,b) … }` (parser);
   typed literals in object values (`{n: 4<i64>}`); Exact-by-default for values (A8).
-- 🟡 **B6. Collections — `List` is THE user-facing collection** (WasmGC). MVP done: the raw
-  fixed-length array — literal/`a[i]`/`a[i]=v`/`a.length`, bounds-trap (today) — now **demoted to
-  `List`'s substrate AND its inferred fixed-array representation**, not a separate everyday type (NOT a
-  coexisting tier the programmer picks). Design DECIDED: **`List` is the primary collection** (a
-  `{ backing, len, cap }` struct, not tier-2), **`[...]` constructs a `List`** (scripting-feel default —
-  Python/JS/Ruby/Swift), **name `List`**, **2× growth**, monomorphized-not-boxed, and a **type-level
-  native-indexing flag** (`List`'s `[]`/`[]=`/`.length` lower to native `array.get`/`array.set`/`array.len`,
-  bypassing B13 — like the `string`/`i32` nominal special-casing). Size-member design DECIDED (→
-  `DECISIONS.md`). Indexing DECIDED: **trap-on-OOB `a[i]: T`** (keeps today's behavior — OOB is a bug,
-  surfaced loudly) with **`.get(i): T | null`** the safe checked accessor; **`Map[k]: V | null`** (a
-  missing key is normal absence). This is the Rust/Swift split (sequence index traps, `.get`/dict-subscript
-  returns optional). NEW: **representation is inferred** — `List` is the one semantic model, but the
-  compiler lowers never-grown values to a header-less fixed array (a safe optimization, degrades to `List`
-  when unproven). (→ `docs/collections-design.md`.) `DECISIONS.md` entry lands with implementation.
-- ⬜ **B6a. `Map` + `Set` — the "usable for modding" milestone trio (with `List`).** A scripting
-  language needs `List` + `Map` + `Set` to be practical, so the modding milestone ships all three
-  together (`List` lands first in build order; `Map`/`Set` ride the same intrinsic floor, not gated on
-  each other). `Map<K,V>` is a separate hash type, not every-object-as-table (→ `DECISIONS.md`). Index
-  sigs `{[string]: T}` type-check but are dropped at codegen — this is their codegen. The `"[]"`/`"[]="`
-  traps both ride on are now in place (B13); what remains is the hash representation (nominal `Map<K,V>` /
-  `Set<T>` shapes whose `"[]"`/`"[]="` lower to hashed get/set). Indexing follows the decided split:
-  **`Map[k]: V | null`** (missing key = normal absence, not a trap — unlike sequence `List[i]` which traps
-  on OOB). **Deterministic iteration order** required (insertion-order, à la JS `Map`/`Set` & Python
-  `dict`) — VL targets multiplayer/replay, where map/set iteration feeding game state must be reproducible
-  across runs/machines. Deferred.
-- ⬜ **B6b. Collections building blocks & open items** (design: `docs/collections-design.md`).
-  - **Prerequisite intrinsics** — expose the two-primitive surface: dynamic-length `array.new`
-    (`__array_new__`/`__array_new_default__`) + bulk `array.copy` (`__array_copy__`), thin
-    `defaultScope` intrinsics lowering to the WasmGC instructions the backend already uses for string
-    concat/slice. The building block before `List`.
-  - **Std-over-primitives direction** — write `List`/collections (and opportunistically `print`) as
-    `.vl` std over those intrinsics, not compiler-privileged types (ties to H3 self-hosting). Open
-    dependency: VL has no module system yet (std-module loading is unresolved).
-  - **`[...]` = `List` literal** (DECIDED) — `[...]` constructs a `List` (scripting-feel default —
-    Python/JS/Ruby/Swift); the syntax fork is resolved. The raw fixed array is `List`'s substrate + its
-    inferred representation (§VL.7), never a coexisting `[...]` meaning the programmer picks. Construction:
-    `[...]` (seed), `List<T>()` (empty), `List<T>(capacity: n)` (named).
-  - **Representation inference — fixed-array vs growable `List`, inferred from usage** (DECIDED
-    direction; analysis is new open compiler work — `docs/collections-design.md` §VL.7) — `List` is the
-    one *semantic* model and `[...]` the one literal; the compiler **infers the representation**, lowering
-    a value to a **header-less fixed array** when it can prove it (and all its aliases) is never grown,
-    and to the `{backing,len,cap}` struct otherwise. A **safe optimization**: unproven ⇒ growable `List`,
-    so never observably wrong; ships conservatively, tightens later. Resolves three review concerns at once
-    — the per-access indirection cost (gone for fixed values), the fixed-size-buffer gap (recovered under
-    `[...]`), and the single-literal unification (preserved). Analysis is **interprocedural** (growth via
-    callee/alias propagates back) + **alias-unioned** (aliases share a representation — the cost item,
-    erased by value semantics). Co-design with **variance (A9)**: read-only param accepts either
-    representation, growing param requires the growable one. Subsumes the old "constant-literal
-    optimization" (a compile-time `[1,2,3]` is just one provably-fixed case) and most of the old
-    "raw-array low-level escape" (the common no-header/no-indirection win is now automatic).
-  - **Low-level array escape — only the memory-addressing case remains open** (surface/timing open) — the
-    raw array is `List`'s `backing` and its inferred representation from day one; a *user-facing* low-level
-    escape (advanced `Array<T>` / unsafe primitive) is now only for genuine FFI/SIMD/linear-memory
-    addressing, a deliberately-advanced future surface, not v1, not the default.
-  - **Indexing default — `a[i]: T` trap-on-OOB; `.get(i): T | null` safe** (DECIDED) — sequence indexing
-    traps on OOB (a *bug*, surfaced loudly — keeps today's array behavior rather than reversing it); the
-    safe checked form is the `get(i): T | null` method. **`Map[k]: V | null`** is the deliberate exception
-    (missing key = normal absence). Rust/Swift split. (An earlier round proposed result-by-default
-    `a[i]: T | null`; this round reverses to trap + `.get`.) (→ `docs/collections-design.md` §VL.6.)
-  - **Bounds-narrowing — now an optimization, not a prerequisite** (open; **core narrowing engine**) —
-    extend VL's flow-narrowing (A5) to array bounds so a provably-in-range `a[i]` (inside
-    `for i in 0 to a.length`, after `if i < a.length`, or a guard) elides the redundant compare-and-trap,
-    leaving a bare `array.get`. Under trap-on-OOB the safe default is *already* a bare `array.get` on the
-    happy path, so narrowing only removes the bounds check (a miss costs a check, not a per-access
-    null-unwrap) — worth doing, no longer load-bearing.
-  - **Native-indexing flag — resolves the B13 indirect-call cost** (DECIDED resolution; nominal-vs-
-    annotation sub-choice open) — a pure-VL `List` whose `l[i]` routes through the B13 `"[]"` method is
-    a per-access indirect call. Resolution: a **type-level native-indexing flag** so `List`'s
-    `[]`/`[]=`/`.length` lower to native `array.get`/`array.set`/`array.len` on `backing`, bypassing
-    B13 (precedent: `string`/`i32` nominal special-casing in codegen). Open sub-choice: **nominal
-    recognition** (codegen knows `List` by name, simplest) vs a **declarative native-lowered/intrinsic
-    annotation** (any std type opts in). With this + bounds-narrowing + backing-pointer hoisting
-    (below), an in-range `a[i]` in a loop is codegen-identical to a raw `array.get` — the one spot
-    `List` needs compiler privilege under "std over primitives."
-  - **Backing-pointer hoisting (LICM) — the third indexing-perf enabler** (open; likely VL-explicit) —
-    even with the native flag, `l[i]` is a `struct.get` (load `backing`) then an `array.get` — two
-    loads per element, ~1.5–2× over a raw array in a tight load-bound loop. `backing` is loop-invariant,
-    so hoist its load out of the loop (load once, bare `array.get` in the body — instruction-identical
-    to a raw-array loop; how LLVM gets Rust `Vec`/C++ `std::vector` to native speed). binaryen's LICM
-    over a GC `struct.get` is **not** guaranteed (must prove no `push`/grow/reassign in the loop), so VL
-    likely hoists explicitly for the canonical `for i in 0 to list.length { list[i] }` pattern. All
-    three enablers together make a list loop instruction-identical to a raw-array loop; missing the
-    hoist leaves the per-access `struct.get` cost.
-  - **Value vs reference — language-wide** (open; default **reference**) — not collections-only:
-    objects *and* collections decided together. v1 = reference everywhere (consistent with VL objects;
-    Python/JS/Java); coherent alternative is Swift-style value-everywhere-with-COW, *only if uniform*.
-    Note: this also gates the §VL.7 representation-inference difficulty (value semantics erases the
-    alias-unification step).
-  - **Error model — "results for expected absence, traps for bugs"** (language principle) — *expected,
-    recoverable* outcomes return values (`T | null` for normal absence, `T | E` discriminated with `is`
-    for "failed with a reason"), over try/catch; **unrecoverable *bugs* trap**. The line: normal program
-    state vs programmer error. Indexing instance DECIDED: OOB `a[i]` **traps** (a bug), while
-    `pop(): T | null`, `get(i): T | null`, `Map[k]: V | null` return normal absence. Ties to the AST
-    `// TODO: exceptions` (the broader try/catch question stays open).
-  - **Per-frame allocation — deprioritized for v1; keep cheap `clear()`** — a heavier pooling/reuse story
-    (`retain`, `mapInto(dst)`, free-list pooling) is deferred past v1 (not clearly first-release-critical;
-    §VL.7 representation inference removes per-frame allocation for fixed-size cases for free). v1 keeps
-    only capacity-retaining **`clear()`** (`len = 0`, no realloc) — the building block at ~zero cost.
-  - **List surface/semantics open questions** — capacity/seed construction specifics; `map`/`filter`
-    return type; native-flag nominal-vs-annotation; the §VL.7 inference analysis; low-level-escape
-    surface/timing. DECIDED: `List` is THE user-facing collection, `[...]`=`List`, name `List`, 2×
-    growth, `pop(): T | null`, **trap-on-OOB `a[i]: T` with `.get(i): T | null`** (and `Map[k]: V | null`),
-    **fixed-array as inferred representation**, `clear()` in v1, native-indexing flag. Tracked in the
-    design doc.
+- 🟡 **B6. Collections — `List` is THE user-facing collection** (WasmGC; design + rationale:
+  `docs/collections-design.md`). MVP done: the raw fixed-length array (literal/`a[i]`/`a[i]=v`/`a.length`,
+  bounds-trap) is now `List`'s substrate, not a separate user tier. DECIDED: `List` is the primary
+  collection (a `{backing,len,cap}` struct), `[...]` constructs a `List` (scripting-feel default), 2×
+  growth, monomorphized-not-boxed; **indexing traps on OOB** (`a[i]: T`) with **`.get(i): T | null`** the
+  safe accessor, while **`Map[k]: V | null`** (Rust/Swift split — sequence index traps, map lookup is
+  optional); and **representation is inferred** — `List` is the one semantic model, but the compiler lowers
+  never-grown values to a header-less fixed array (a safe optimization that degrades to `List` when
+  unproven). `DECISIONS.md` entry lands with implementation.
+- ⬜ **B6a. `Map` + `Set`** — the "usable for modding" trio with `List` (a scripting language needs all
+  three). `List` lands first; `Map`/`Set` ride the same intrinsic floor. `Map[k]: V | null` (missing key =
+  normal absence). **Deterministic insertion-order iteration** (multiplayer/replay reproducibility).
+  Deferred.
+- ⬜ **B6b. Collections building blocks & open items** (all detail in `docs/collections-design.md`).
+  - **Prerequisite intrinsics** — the two-primitive floor `List` is built over: dynamic-length
+    `__array_new__`/`__array_new_default__` + bulk `__array_copy__`, thin `defaultScope` intrinsics. The
+    building block before `List`.
+  - **Std-over-primitives** — write `List`/collections (and opportunistically `print`) as `.vl` std, not
+    compiler-privileged types (ties to H3). Open dependency: no module system yet.
+  - **Indexing perf** (DECIDED resolutions; sub-choices/analysis open) — native-indexing flag (drops the
+    B13 indirect call; nominal-vs-annotation open), backing-pointer hoisting (LICM), and bounds-narrowing
+    (now an optimization, not a prerequisite, since trap-on-OOB is already a bare `array.get`).
+  - **Representation inference** (DECIDED direction; analysis is new open compiler work) — infer
+    fixed-array vs growable `List` from usage; interprocedural + alias-unioned; co-design with variance
+    (A9). Subsumes the old constant-literal optimization and most of the raw-array escape.
+  - **Language-wide, still open** — value-vs-reference (default reference; also gates the inference
+    analysis), the error model ("results for expected absence, traps for bugs").
+  - **Deferred** — per-frame pooling beyond capacity-retaining `clear()` (kept in v1); a user-facing
+    low-level array escape (only the FFI/SIMD/linear-memory case remains, post-inference).
+  - **Remaining open questions** — capacity/seed construction; `map`/`filter` return type.
 - 🟡 **B7. Strings.** Done (core): WasmGC i32-array of code points — literal, `.length`/`s[i]`, `+`,
   `==`/`!=`, `print`. REMAINING: switch the backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — what dart2wasm/Kotlin-Wasm do); UTF-8/i8 packing (size); richer methods.
