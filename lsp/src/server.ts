@@ -1,4 +1,6 @@
 import {
+  CodeAction,
+  CodeActionKind,
   CompletionItem,
   CompletionItemKind,
   createConnection,
@@ -30,6 +32,7 @@ import {
   VLSeverity,
 } from "../../compiler/compile.ts";
 import { format } from "../../compiler/format.ts";
+import { quickFixesForDiagnostic } from "./codeActions.ts";
 import type { Context } from "../../compiler/ast.ts";
 import { tokenize } from "../../compiler/lexer.ts";
 import {
@@ -405,6 +408,34 @@ connection.onDocumentFormatting((params): TextEdit[] => {
   return [{ range: fullRange, newText: formatted }];
 });
 
+// Quick-fixes (code actions) for lint diagnostics (B17). The editor passes the
+// diagnostics overlapping the cursor/selection in `params.context.diagnostics`;
+// we key off each diagnostic's stable `code` and precise `range` to compute
+// plain text edits (see `codeActions.ts`), then wrap them in `CodeAction` +
+// `WorkspaceEdit` envelopes. Only `vital`-sourced lint diagnostics with a
+// known code yield actions; everything else is ignored.
+connection.onCodeAction((params): CodeAction[] => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+  const source = doc.getText();
+  const uri = params.textDocument.uri;
+  const actions: CodeAction[] = [];
+  for (const diag of params.context.diagnostics) {
+    if (diag.source !== "vital") continue;
+    const fixes = quickFixesForDiagnostic(source, diag.code, diag.range);
+    for (const fix of fixes) {
+      actions.push({
+        title: fix.title,
+        kind: CodeActionKind.QuickFix,
+        diagnostics: [diag],
+        isPreferred: fix.isPreferred,
+        edit: { changes: { [uri]: fix.edits } },
+      });
+    }
+  }
+  return actions;
+});
+
 documents.listen(connection);
 
 connection.onInitialize((params) => {
@@ -426,6 +457,9 @@ connection.onInitialize((params) => {
       definitionProvider: true,
       referencesProvider: true,
       documentFormattingProvider: true,
+      codeActionProvider: {
+        codeActionKinds: [CodeActionKind.QuickFix],
+      },
       hoverProvider: true,
       inlayHintProvider: true,
       semanticTokensProvider: {

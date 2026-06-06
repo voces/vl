@@ -782,6 +782,10 @@ export const parseProgram = (
           });
         } else checkRebind(operand.name, ctx);
       }
+      // `++x` / `--x` reassign their operand — mark it a write for prefer-const.
+      if ((operator === "++" || operator === "--") && operand.type === "Name") {
+        symbols.markWrite(ctxOf(operand));
+      }
       const node: VLUnaryOperationNode = {
         type: "UnaryOperation",
         operator,
@@ -888,7 +892,12 @@ export const parseProgram = (
             ctx,
             code: 0,
           });
-        } else checkRebind(left.name, ctx);
+        } else {
+          // `x++` / `x--` rebind their operand: enforce const-immutability, and
+          // mark it a write so prefer-const won't suggest `const` for it.
+          checkRebind(left.name, ctx);
+          symbols.markWrite(ctxOf(left));
+        }
         const node: VLUnaryOperationNode = {
           type: "UnaryOperation",
           operator,
@@ -2045,6 +2054,10 @@ export const parseProgram = (
       });
     } else checkRebind(left.name, ctxOf(left));
     const leftCtx = ctxOf(left);
+    // Mark the LHS name's occurrence (recorded as a use during precedence
+    // climbing) as an assignment *write* target, so the lint pass can tell a
+    // never-reassigned `let` (prefer-`const`) from a mutated one.
+    if (left.type === "Name") symbols.markWrite(leftCtx);
     const leftType = typeFromExpression(left, leftCtx);
     const right: VLExpression = operator
       ? { type: "BinaryOperation", left, right: rawRight, operator }
