@@ -65,6 +65,9 @@ const severityMap: Record<VLSeverity, DiagnosticSeverity> = {
   error: DiagnosticSeverity.Error,
   warning: DiagnosticSeverity.Warning,
   info: DiagnosticSeverity.Information,
+  // Hint: no squiggle, not in the warning tier. With the `unnecessary` tag this
+  // greys/fades the span (e.g. a `_`-prefixed intentionally-unused binding).
+  hint: DiagnosticSeverity.Hint,
 };
 
 const tagMap: Record<VLDiagnosticTag, DiagnosticTag> = {

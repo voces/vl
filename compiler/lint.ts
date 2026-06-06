@@ -12,8 +12,9 @@
 // Lints implemented:
 //   1. Unused local variables / parameters — a `let`/`const` binding or a
 //      function parameter that is declared but never read. A leading-underscore
-//      name (`_x`) is the language's "intentionally unused" convention and is
-//      suppressed (mirrors Go / Rust / TS `noUnusedLocals` underscore norms).
+//      name (`_x`) is the language's "intentionally unused" convention: it is
+//      NOT warned but emits a `hint` (greyed/faded, no squiggle, not counted as
+//      a warning), mirroring Go / Rust / TS `noUnusedLocals` underscore norms.
 //   2. Unreachable code — any statement that follows a statement which always
 //      diverges (`return` / `break` / `continue`, or an `if/else` where BOTH the
 //      then- and else-branch diverge) within the same block.
@@ -71,7 +72,9 @@ export const lint = (
  *
  * Underscore convention: a name beginning with `_` is the agreed "intentionally
  * unused" marker (a throwaway loop/destructure slot, an unused-but-required
- * parameter), so it is suppressed even when never read.
+ * parameter). It is NOT a warning — an unread `_x` emits a `hint`-severity,
+ * `unnecessary`-tagged diagnostic instead, so editors grey/fade the span without
+ * a squiggle and without bumping the warning count. A USED `_x` emits nothing.
  *
  * Top-level (program-scope) variables are NOT flagged. A module-level binding is
  * part of the file's surface — it behaves like an export/result and is routinely
@@ -102,17 +105,38 @@ const unusedBindings = (
     const b = occ.binding;
     if (reported.has(b)) continue;
     if (b.kind !== "variable" && b.kind !== "parameter") continue;
-    if (b.name.startsWith("_")) continue; // intentionally-unused convention
     if (used.has(b)) continue;
+
+    const noun = b.kind === "parameter" ? "parameter" : "variable";
+
+    // A leading-underscore name is the "intentionally unused" convention. We no
+    // longer fully suppress it: instead we emit a `hint`-severity diagnostic
+    // (still tagged `unnecessary`) so VS Code GREYS/FADES the span without a
+    // squiggle and without counting it as a warning. This confirms to the reader
+    // that the binding is recognised as deliberately unused. A USED `_x` is
+    // filtered out above by the `used` guard, so only genuinely-unread
+    // underscore bindings reach here.
+    if (b.name.startsWith("_")) {
+      reported.add(b);
+      out.push({
+        message:
+          `Intentionally-unused ${noun} \`${b.name}\` (leading \`_\` marks it unused)`,
+        severity: "hint",
+        range: rangeFromCtx(b.decl),
+        code: "unused-variable",
+        source: "vital",
+        tags: ["unnecessary"],
+      });
+      continue;
+    }
     // Module-level variables ARE flagged: an unused top-level `let` is dead in a
     // whole-program compile. When an explicit `export` keyword lands, an
     // *exported* top-level binding will be exempt (it's consumer-facing surface,
     // not dead) — until then there is no export marker, so every unread top-level
-    // binding is genuinely unused. (`_`-prefix still suppresses; functions are
-    // excluded via the `kind` guard above — unused-function is a future rule.)
+    // binding is genuinely unused. (`_`-prefix downgrades to a hint above;
+    // functions are excluded via the `kind` guard — unused-function is future.)
     reported.add(b);
 
-    const noun = b.kind === "parameter" ? "parameter" : "variable";
     out.push({
       message:
         `Unused ${noun} \`${b.name}\` (prefix with \`_\` to suppress, or remove it)`,

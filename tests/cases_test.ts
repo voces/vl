@@ -12,11 +12,13 @@
 //   // @error-at L:C TEXT expect an error at line L, col C containing TEXT
 //   // @warning TEXT     expect a warning diagnostic containing TEXT
 //   // @info TEXT        expect an info diagnostic containing TEXT
+//   // @hint TEXT        expect a hint diagnostic containing TEXT
 //   // @log TEXT         assert the Nth `log` line equals TEXT (ordered; @run)
 //   // @skip REASON      register the test but skip it (REASON documents why)
 //
 // STRICT BY DEFAULT: a test fails on ANY diagnostic it did not declare — every
-// error, warning, AND info must be matched by a directive of that severity.
+// error, warning, info, AND hint must be matched by a directive of that
+// severity.
 // "Compiles cleanly" is therefore the default contract — a file with no
 // diagnostic directives is asserting it produces zero diagnostics, so there is
 // no @ok / @no-error directive (omitting them IS the must-not-error assertion).
@@ -40,6 +42,7 @@ type Directives = {
   errorsAt: { line: number; col: number; text: string }[];
   warnings: string[];
   infos: string[];
+  hints: string[];
   logs: string[];
   unknown: string[];
   skip: string | null;
@@ -52,6 +55,7 @@ const parseDirectives = (src: string): Directives => {
     errorsAt: [],
     warnings: [],
     infos: [],
+    hints: [],
     logs: [],
     unknown: [],
     skip: null,
@@ -77,6 +81,9 @@ const parseDirectives = (src: string): Directives => {
         break;
       case "info":
         d.infos.push(rest);
+        break;
+      case "hint":
+        d.hints.push(rest);
         break;
       case "error-at": {
         const at = rest.match(/^(\d+):(\d+)\s+(.*)$/);
@@ -130,6 +137,9 @@ const warningMessages = (diags: VLDiagnostic[]) =>
 
 const infoMessages = (diags: VLDiagnostic[]) =>
   diags.filter((d) => d.severity === "info").map((d) => d.message);
+
+const hintMessages = (diags: VLDiagnostic[]) =>
+  diags.filter((d) => d.severity === "hint").map((d) => d.message);
 
 const files: URL[] = [];
 for await (const f of walk(CASES_DIR)) files.push(f);
@@ -187,6 +197,17 @@ for (const file of files) {
         }
       }
 
+      const hints = hintMessages(diagnostics);
+      for (const want of d.hints) {
+        if (!hints.some((m) => m.includes(want))) {
+          throw new Error(
+            `expected a hint containing "${want}", got: ${
+              JSON.stringify(hints)
+            }`,
+          );
+        }
+      }
+
       for (const want of d.errorsAt) {
         const hit = diagnostics.some((di) =>
           di.severity === "error" &&
@@ -236,6 +257,7 @@ for (const file of files) {
       );
       unexpected(warns, (m) => d.warnings.some((w) => m.includes(w)), "warning", "@warning");
       unexpected(infos, (m) => d.infos.some((w) => m.includes(w)), "info", "@info");
+      unexpected(hints, (m) => d.hints.some((w) => m.includes(w)), "hint", "@hint");
 
       if (d.mode === "run") {
         if (!wasm) {

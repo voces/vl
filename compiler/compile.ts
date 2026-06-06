@@ -37,7 +37,11 @@ export type { Binding, BindingKind, SymbolOccurrence } from "./symbols.ts";
 export { SymbolTable } from "./symbols.ts";
 export type { Comment } from "./lexer.ts";
 
-export type VLSeverity = "error" | "warning" | "info";
+// `hint` is the lowest tier: VS Code renders it with NO squiggle and keeps it
+// out of the warning/error count. Combined with the `unnecessary` tag it greys
+// out the span (used for `_`-prefixed intentionally-unused bindings). Hints must
+// never count toward the CLI error/warning tally or fail the test harness.
+export type VLSeverity = "error" | "warning" | "info" | "hint";
 export type VLPosition = { line: number; character: number };
 export type VLRange = { start: VLPosition; end: VLPosition };
 // LSP diagnostic tags (LSP `DiagnosticTag`): `unnecessary` renders the span
