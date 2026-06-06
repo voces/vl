@@ -119,22 +119,39 @@ const escapeStringLiteral = (s: string): string => {
   return out;
 };
 
+// `maxDepth` controls how many *alias-name* layers are peeled (expanded) before
+// falling back to rendering the alias name (D8). A named `Type` node (a resolved
+// `type` alias) at alias-depth >= the cap renders as its NAME; a shallower layer
+// (depth < cap) is peeled — expanded to its body, recursing at depth+1. So:
+//   maxDepth: 0 (default for hover/inlay) — preserve every alias name (`"a" | I32`)
+//   maxDepth: 1                           — peel the outermost alias one layer
+//   maxDepth: 2                           — peel two layers, …
+//   maxDepth: Infinity                    — fully expand (every alias → its body)
+// Only *named* `Type` nodes count toward `depth`; structural types, unions, and
+// the anonymous/internal `Type` wrapper are unaffected (an unnamed `Type` always
+// expands, exactly as before). The default (0) preserves all names — what hover
+// (D1) and inlay (D6) want; type-mismatch errors pass Infinity so the message
+// still explains the concrete incompatibility.
 export const stringifyType = (
   type: VLType,
   seen: Set<VLType> = new Set(),
+  maxDepth: number = 0,
+  depth: number = 0,
 ): string => {
   if (type.type === "Alias") return type.name;
   if (type.type === "Union") {
-    return type.subTypes.map((t) => stringifyType(t, seen)).join(" | ");
+    return type.subTypes.map((t) => stringifyType(t, seen, maxDepth, depth))
+      .join(" | ");
   }
   if (type.type === "Nullable") {
-    return `${stringifyType(type.subType, seen)} | null`;
+    return `${stringifyType(type.subType, seen, maxDepth, depth)} | null`;
   }
   if (type.type === "Intersection") {
-    return type.subTypes.map((t) => stringifyType(t, seen)).join(" & ");
+    return type.subTypes.map((t) => stringifyType(t, seen, maxDepth, depth))
+      .join(" & ");
   }
   if (type.type === "Negation") {
-    return `not ${stringifyType(type.subType, seen)}`;
+    return `not ${stringifyType(type.subType, seen, maxDepth, depth)}`;
   }
   if (type.type === "Object") {
     // Cycle guard: a recursive structural type can be a cyclic object graph
@@ -148,11 +165,15 @@ export const stringifyType = (
       type.properties.length === 1 &&
       type.properties[0].name.type === "Alias" &&
       type.properties[0].name.name === "number"
-    ) return `${stringifyType(type.properties[0].type, seen)}[]`;
+    ) {
+      return `${
+        stringifyType(type.properties[0].type, seen, maxDepth, depth)
+      }[]`;
+    }
     return `{${
       type.properties.map((p) =>
-        `${stringifyType(p.name, seen).replace(/^"(.*)"$/, "$1")}: ${
-          stringifyType(p.type, seen)
+        `${stringifyType(p.name, seen, maxDepth, depth).replace(/^"(.*)"$/, "$1")}: ${
+          stringifyType(p.type, seen, maxDepth, depth)
         }`
       ).join(", ")
     }}`;
@@ -172,16 +193,26 @@ export const stringifyType = (
   if (type.type === "Function") {
     return `(${
       type.paramaters.map((p) =>
-        `${p.name}: ${stringifyType(p.paramaterType, seen)}`
+        `${p.name}: ${stringifyType(p.paramaterType, seen, maxDepth, depth)}`
       )
         .join(", ")
-    }): ${stringifyType(type.return, seen)}`;
+    }): ${stringifyType(type.return, seen, maxDepth, depth)}`;
   }
-  // A `Type` node wraps a named type-alias's body (internal bookkeeping for the
-  // alias-leaf traversal). For display, render the aliased type itself, not the
-  // internal `T<…>` wrapper (`type foo = "ab"` hovers as `"ab"`, not `T<"ab">`).
-  if (type.type === "Type") return stringifyType(type.subType, seen);
-  if (type.type === "Infer") return `I<${stringifyType(type.subType, seen)}>`;
+  // A `Type` node wraps a named type-alias's body. When it carries an alias
+  // `name` (D8) and this layer is at/below the cap, render the NAME — this is the
+  // whole point: with the default cap (0), `type thing = "a" | I32` hovers as
+  // `"a" | I32`, keeping the inner alias `I32` instead of expanding it to `i32`.
+  // A shallower layer (depth < cap) is peeled — expanded to the body, recursing
+  // at depth+1 so nested aliases peel one per step. An unnamed `Type` (the
+  // internal/anonymous wrapper) always expands, exactly as before.
+  if (type.type === "Type") {
+    if (type.name !== undefined && depth >= maxDepth) return type.name;
+    const nextDepth = type.name !== undefined ? depth + 1 : depth;
+    return stringifyType(type.subType, seen, maxDepth, nextDepth);
+  }
+  if (type.type === "Infer") {
+    return `I<${stringifyType(type.subType, seen, maxDepth, depth)}>`;
+  }
   if (type.type === "Custom") return type.validate.toString();
   const exhaustive: never = type;
   return exhaustive;
@@ -201,11 +232,14 @@ const diagnosticFromError = (error: ParseErrors): VLDiagnostic => {
     case "Undeclared":
       return { ...base, message: `Syntax error: undeclared ${error.name}` };
     case "Type":
+      // A type-mismatch message must explain the *concrete* incompatibility, so
+      // fully expand aliases here (maxDepth: Infinity) — `expected i32, got
+      // string`, not `expected I32, got Str`. Hover/inlay keep names (default).
       return {
         ...base,
-        message: `Type error: expected ${stringifyType(error.left)}, got ${
-          stringifyType(error.right)
-        }`,
+        message: `Type error: expected ${
+          stringifyType(error.left, new Set(), Infinity)
+        }, got ${stringifyType(error.right, new Set(), Infinity)}`,
       };
     case "UnmatchedParameter":
       return { ...base, message: `Type error: unmatched parameter` };

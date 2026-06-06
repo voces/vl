@@ -160,6 +160,15 @@ const hoverMarkdown = (code: string): Hover["contents"] => ({
   value: "```" + VL_LANGUAGE_ID + "\n" + code + "\n```",
 });
 
+// D8 stepwise alias expansion (hover verbosity): the renderer (`stringifyType`'s
+// `maxDepth`) supports peeling one alias layer per step, and the per-kind depths
+// below already wire it for the default view. The interactive +/- VERBOSITY
+// controls require the proposed LSP 3.18 hover-verbosity API
+// (`HoverParams.context.verbosityLevel` + `Hover.canIncrease`/`canDecrease`),
+// which is NOT in the `vscode-languageserver@9` / protocol 3.17.5 in use here.
+// REMAINING PIECE (unblocked-by-design): once that protocol lands, read the
+// requested verbosity level off `params.context`, map it to `maxDepth`, and set
+// `canIncrease`/`canDecrease` on the returned `Hover` — no renderer change needed.
 connection.onHover(async (params): Promise<Hover | null> => {
   const document = documents.get(params.textDocument.uri);
   if (!document) return null;
@@ -188,11 +197,20 @@ connection.onHover(async (params): Promise<Hover | null> => {
     // Render the authored `///` doc (if any) as markdown above the type block.
     // `docMarkdown` collapses to the bare type fence when there's no doc, so
     // undocumented bindings hover exactly as before.
+    //
+    // D8 alias display: a *value* binding (`x: thing`) renders at maxDepth 0 —
+    // every alias name preserved (hover `x: thing`, not its body). A *type*
+    // binding (`type thing = …`) peels exactly one layer (maxDepth 1) so hovering
+    // the alias shows its BODY while keeping any inner alias names (`type thing =
+    // "a" | I32` hovers as `"a" | I32`) — otherwise it would render its own name.
+    const aliasDepth = occ.binding.kind === "type" ? 1 : 0;
     return {
       contents: {
         kind: "markdown",
         value: docMarkdown(
-          `${occ.binding.name}: ${stringifyType(occ.binding.type)}`,
+          `${occ.binding.name}: ${
+            stringifyType(occ.binding.type, new Set(), aliasDepth)
+          }`,
           VL_LANGUAGE_ID,
           occ.binding.doc,
         ),

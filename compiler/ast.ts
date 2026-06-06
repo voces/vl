@@ -337,6 +337,13 @@ export type VLTypeType = {
   type: "Type";
   subType: VLType;
   params?: VLInferType[];
+  // The source-level name of the alias this `Type` node stands for (D8). Set
+  // when a named `type` alias is resolved into a `Type` node, so display
+  // (hover/inlay) can render the alias *name* (`I32`) rather than its expanded
+  // body (`i32`) — mirroring TS's `aliasSymbol`. Purely additive: typechecking
+  // already unwraps `Type` nodes transparently, so anything that ignores `name`
+  // behaves exactly as before. Absent for the internal/anonymous `Type` wrapper.
+  name?: string;
 };
 export type VLInferType = {
   type: "Infer";

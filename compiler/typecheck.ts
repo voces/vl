@@ -1167,6 +1167,10 @@ export const getConcreteType = (
   ctx: Context | undefined,
   seen: Set<string> = new Set(),
 ): VLType => {
+  // A named `Type` wrapper (D8) carries an alias name for display but is inert
+  // for type checking — unwrap it to its concrete body so every checker path
+  // (member access, narrowing, union fields, …) sees the real structural type.
+  if (type.type === "Type") return getConcreteType(type.subType, ctx, seen);
   if (type.type !== "Alias") return type; // TODO: Should handle recursiveness (objects, params, etc)
   if (type.name === "null") return type;
 
@@ -1919,7 +1923,19 @@ export const ensureType = (
     [right, left] = [left, right];
   }
 
-  outer: while (left.type === "Alias") {
+  // A resolved `type` alias is now carried as a named `Type` wrapper (D8) so
+  // display can preserve the alias name. The wrapper is purely cosmetic for the
+  // checker — unwrap both sides to their concrete bodies before comparing, so an
+  // annotated `p: Pt` (a `Type` node, or an `Alias` resolving to one) checks
+  // identically to its body.
+  const seenLeft = new Set<VLType>();
+  outer: while (left.type === "Alias" || left.type === "Type") {
+    if (seenLeft.has(left)) break; // self-cyclic alias (e.g. bodyless `type X`)
+    seenLeft.add(left);
+    if (left.type === "Type") {
+      left = left.subType;
+      continue;
+    }
     for (let i = scopes.length - 1; i >= 0; i--) {
       if (Object.hasOwn(scopes[i], left.name)) {
         left = scopes[i][left.name];
@@ -1929,7 +1945,14 @@ export const ensureType = (
     break;
   }
 
-  outer: while (right.type === "Alias") {
+  const seenRight = new Set<VLType>();
+  outer: while (right.type === "Alias" || right.type === "Type") {
+    if (seenRight.has(right)) break;
+    seenRight.add(right);
+    if (right.type === "Type") {
+      right = right.subType;
+      continue;
+    }
     for (let i = scopes.length - 1; i >= 0; i--) {
       if (Object.hasOwn(scopes[i], right.name)) {
         right = scopes[i][right.name];
@@ -2196,12 +2219,11 @@ export const ensureType = (
     //   if (right.type !== "Never") return pushError(29);
     //   return true;
     case "Type":
-      if (right.type !== "Type") return pushError(30);
-      // Compare the *underlying* types — re-calling with the `Type` wrappers
-      // unchanged would loop forever on a recursive alias (A11). The structural
-      // walk below is made cycle-safe by the coinductive guard in the `Object`
-      // case.
-      return ensureType(left.subType, right.subType, ctx);
+      // Both sides are unwrapped past their `Type` wrappers (D8) at the top of
+      // `ensureType`, so a `Type` only survives here on a pathological self-cyclic
+      // alias (a bodyless `type X` that resolves to itself) — already reported by
+      // `getConcreteType`. Bail rather than recurse into the cycle.
+      return false;
     case "Infer": {
       // A `Map()` / `Set()` constructor hole being pinned by an annotation. The
       // annotation must be a (string-keyed) map type; otherwise the construction

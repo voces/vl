@@ -754,6 +754,9 @@ const asObjectType = (
 ): VLObjectType | undefined => {
   if (depth > 8) return undefined; // guard against a cyclic alias chain
   if (type.type === "Object") return type;
+  // A named `Type` wrapper (a resolved `type` alias, D8) carries the alias name
+  // for display but wraps its concrete body — step through it to that body.
+  if (type.type === "Type") return asObjectType(type.subType, scope, depth + 1);
   if (type.type === "Nullable") return asObjectType(type.subType, scope, depth + 1);
   if (type.type === "Alias") {
     const target = scope[type.name];

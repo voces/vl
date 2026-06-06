@@ -416,7 +416,18 @@ export const parseProgram = (
           if (type.type === "Type" && type.params && type.params.length > 0) {
             return applyGenericAlias(name, type, ctx);
           }
-          if (type.type === "Type") return getConcreteType(type.subType, ctx);
+          // A reference to a non-generic alias resolves through to its concrete
+          // body, but we wrap it in a named `Type` node (D8) so display can
+          // render the alias *name* (`I32`) instead of its expansion (`i32`).
+          // Typechecking unwraps `Type` nodes transparently, so this is inert
+          // for everything except `stringifyType`.
+          if (type.type === "Type") {
+            return {
+              type: "Type",
+              subType: getConcreteType(type.subType, ctx),
+              name: type.name ?? name,
+            };
+          }
           return getConcreteType(type, ctx);
         }
       }
@@ -1861,7 +1872,13 @@ export const parseProgram = (
       if (at("COLON")) {
         next();
         skipNewlines();
-        paramaterType = getConcreteType(parseType(), spanOf(id));
+        // Keep a named `Type` wrapper (a resolved `type` alias, D8) intact so the
+        // parameter binding hovers with the alias *name*; only resolve a bare
+        // `Alias` leaf (e.g. a recursive self-reference) through to concrete.
+        const annotated = parseType();
+        paramaterType = annotated.type === "Type" && annotated.name !== undefined
+          ? annotated
+          : getConcreteType(annotated, spanOf(id));
       } else {
         paramaterType = { type: "Infer", subType: { type: "Unknown" } };
       }
@@ -2123,6 +2140,8 @@ export const parseProgram = (
     const entry: VLTypeType = {
       type: "Type",
       subType: { type: "Alias", name },
+      // Carry the alias name on the `Type` node so display preserves it (D8).
+      name,
     };
     if (typeParams.length > 0) entry.params = paramHoles;
     const typeScope = scopes[scopes.length - 1];
