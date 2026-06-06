@@ -161,6 +161,20 @@ export const parseProgram = (
     const binding = resolveBinding(name);
     if (binding) symbols.use(binding, span);
   };
+  /**
+   * Stamp every `Binding` declared in `scope` with `span`, the source extent over
+   * which those bindings are visible (roadmap D3 scope-aware completion — see
+   * `Binding.scope`). Called as each binding-bearing scope closes (block end,
+   * function span, program end), once the closing position is known. Idempotent
+   * and additive: scopes with no bindings (e.g. transient type-param scopes) are
+   * no-ops, and re-stamping is harmless. Leaves `binding.scope` untouched for
+   * scopes that error out before this runs (the field stays optional).
+   */
+  const stampScope = (scope: Scope, span: Context): void => {
+    const map = scopeBindings.get(scope);
+    if (!map) return;
+    for (const binding of map.values()) binding.scope = span;
+  };
 
   /** Implicit return types collected from the current function body. */
   let returnTypes: VLType[] = [];
@@ -1281,7 +1295,11 @@ export const parseProgram = (
         statements: statements.map((s) => s[1]),
         valueType,
       };
-      return record(node, between(spanOf(open), spanOf(close)));
+      const span = between(spanOf(open), spanOf(close));
+      // Stamp the block's locals with the block's `{ … }` extent (D3 scope-aware
+      // completion) before the scope is popped in `finally`.
+      stampScope(blockScope, span);
+      return record(node, span);
     } finally {
       scopes.pop();
     }
@@ -1435,6 +1453,10 @@ export const parseProgram = (
     if (pushedTypeScope) scopes.pop();
 
     const ctx = spanFrom(fnTok);
+    // Parameters are visible across the whole function (D3 scope-aware
+    // completion). The body's block scope already carries the body's tighter
+    // extent, so a param shadowed by a body local still resolves correctly.
+    stampScope(scope, ctx);
     record(node, ctx);
     // Memoize the node's final type and refine the forward-registered entry.
     const finalType = typeFromExpression(node, ctx);
@@ -1949,6 +1971,17 @@ export const parseProgram = (
     if (peek() === startTok) next(); // ensure progress
     skipNewlines();
   }
+
+  // Stamp top-level bindings (functions, types, module-level vars) with a span
+  // covering the whole document so they're "in scope" everywhere for D3
+  // completion. Builtins from `defaultScope` live in `program.scope` too but are
+  // never `declareBinding`'d, so `stampScope` leaves them alone (the LSP folds
+  // builtins in separately).
+  const programSpan: Context = {
+    start: { line: 1, column: 0 },
+    stop: peek().stop, // the EOF token's position
+  };
+  stampScope(program.scope, programSpan);
 
   return [program, errors, symbols];
 };
