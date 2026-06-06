@@ -1158,6 +1158,20 @@ export const parseProgram = (
         spanOf(t),
       );
     }
+    if (at("CHAR")) {
+      next();
+      // A char literal `'a'` is its i32 code point (so `'a'` == 97), composing
+      // with string indexing and arithmetic. Lower it to the existing
+      // IntegerLiteral node carrying that code — typing and codegen then fall out
+      // exactly as for a bare int literal of the same value. `t.value` is the
+      // lexer-decoded single character; an empty value (recovered lex error)
+      // degrades to code 0.
+      const code = t.value ? t.value.codePointAt(0) ?? 0 : 0;
+      return record(
+        { type: "IntegerLiteral", value: code, text: String(code) },
+        spanOf(t),
+      );
+    }
     if (at("TRUE")) {
       next();
       return record({ type: "BooleanLiteral", value: true }, spanOf(t));

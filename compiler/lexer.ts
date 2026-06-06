@@ -50,6 +50,7 @@ export type TokenKind =
   // Values
   | "NUMBER"
   | "STRING"
+  | "CHAR"
   | "ID"
   // Operators / punctuation
   | "PLUS"
@@ -108,12 +109,13 @@ export type Token = {
   start: Position;
   stop: Position;
   /**
-   * For STRING tokens only: the decoded literal value, with the surrounding
+   * For STRING and CHAR tokens: the decoded literal value, with the surrounding
    * quotes removed and escape sequences (`\n`, `\t`, `\\`, `\"`, `\uXXXX`, …)
    * resolved to their actual characters. `text` keeps the raw source lexeme
    * (quotes + backslashes) so the token span still measures source extent;
-   * `value` is what a StringLiteral node should carry. Undefined for non-STRING
-   * tokens.
+   * `value` is what a StringLiteral node should carry. For a CHAR token the
+   * value is exactly one character (the code point that `'x'` denotes); the
+   * parser lowers it to that char's i32 code. Undefined for other tokens.
    */
   value?: string;
   /**
@@ -141,7 +143,11 @@ export type Token = {
   trailingComments?: Comment[];
 };
 
-const KEYWORDS: Record<string, TokenKind> = {
+// Null-prototype so an identifier that collides with an Object.prototype member
+// (e.g. `toString`, `constructor`, `hasOwnProperty`) doesn't accidentally
+// resolve to the inherited method instead of `undefined` in the lookup below —
+// it must lex as a plain `ID`.
+const KEYWORDS: Record<string, TokenKind> = Object.assign(Object.create(null), {
   function: "FUNCTION",
   if: "IF",
   then: "THEN",
@@ -164,7 +170,7 @@ const KEYWORDS: Record<string, TokenKind> = {
   true: "TRUE",
   false: "FALSE",
   null: "NULL",
-};
+});
 
 const isIdStart = (c: string) =>
   (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c === "_";
@@ -343,16 +349,19 @@ export const tokenize = (source: string): LexResult => {
       continue;
     }
 
-    // String: `"…"` or `'…'`, with backslash escapes. May span newlines (the
-    // grammar's char class excludes only the quote and backslash). Escape
-    // sequences are decoded HERE so the STRING token's `value` already holds the
-    // logical characters that flow to the AST and codegen; `text` keeps the raw
-    // source lexeme (quotes + backslashes) so the token span still measures
-    // source extent. Supported escapes: `\n` `\t` `\r` `\\` `\"` `\'` `\0`,
-    // `\b` (8) `\f` (12) `\v` (11), `\xXX` (2 hex), `\uXXXX` (4 hex) and
-    // `\u{…}` (1-6 hex). An unknown escape (e.g. `\q`) or a malformed numeric
-    // escape keeps the character after the backslash verbatim and emits a
-    // warning, so authoring mistakes are visible but never fatal.
+    // String `"…"` or char `'…'`, with backslash escapes. A double-quoted string
+    // may span newlines (the grammar's char class excludes only the quote and
+    // backslash). A single-quoted CHAR literal denotes one (possibly escaped)
+    // character and evaluates to its i32 code point downstream — empty `''` or
+    // multi-char `'ab'` is a lex error. Both share the SAME escape grammar,
+    // decoded HERE so the token's `value` already holds the logical characters
+    // that flow to the AST and codegen; `text` keeps the raw source lexeme
+    // (quotes + backslashes) so the token span still measures source extent.
+    // Supported escapes: `\n` `\t` `\r` `\\` `\"` `\'` `\0`, `\b` (8) `\f` (12)
+    // `\v` (11), `\xXX` (2 hex), `\uXXXX` (4 hex) and `\u{…}` (1-6 hex). An
+    // unknown escape (e.g. `\q`) or a malformed numeric escape keeps the
+    // character after the backslash verbatim and emits a warning, so authoring
+    // mistakes are visible but never fatal.
     if (c === '"' || c === "'") {
       const quote = c;
       let text = advance(); // opening quote
@@ -481,11 +490,31 @@ export const tokenize = (source: string): LexResult => {
       }
       if (!closed) {
         diagnostics.push({
-          message: "Syntax error: unterminated string literal",
+          message: quote === "'"
+            ? "Syntax error: unterminated char literal"
+            : "Syntax error: unterminated string literal",
           severity: "error",
           source: "vital",
           range: { start: shift(start), end: shift(pos()) },
         });
+      }
+      if (quote === "'") {
+        // A char literal must decode to exactly one code point. Empty `''` or
+        // multi-char `'ab'` is a hard error (still emit a CHAR token carrying the
+        // first/zero code point so the parser can recover without cascading).
+        const points = [...value];
+        if (points.length !== 1) {
+          diagnostics.push({
+            message: points.length === 0
+              ? "Syntax error: empty char literal (expected one character)"
+              : "Syntax error: char literal must contain exactly one character",
+            severity: "error",
+            source: "vital",
+            range: { start: shift(start), end: shift(pos()) },
+          });
+        }
+        push("CHAR", text, start, points[0] ?? "");
+        continue;
       }
       push("STRING", text, start, value);
       continue;

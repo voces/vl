@@ -454,6 +454,34 @@ export const defaultScope = () => {
       }],
       return: { type: "Alias", name: "null" },
     };
+
+    // `toString(x): string` — render a number/boolean as a VL string (a WasmGC
+    // i32-array of char codes) for diagnostics/output in the self-hosted
+    // compiler (H2). Accepts an i32 (signed decimal, handling negatives and 0)
+    // or a boolean (`"true"`/`"false"`); an integer/boolean literal validates
+    // too. f64 stringification is a deliberate follow-up (not wired). toWasm
+    // lowers the call by name to a lazily-emitted itoa helper.
+    scope["toString"] = {
+      type: "Function",
+      paramaters: [{
+        type: "Parameter",
+        name: "value",
+        paramaterType: {
+          type: "Custom",
+          validate: namedFunc(
+            "i32 | boolean",
+            (right: VLType) =>
+              right === scope.i32 || isNominal(right, "i32") ||
+              right === scope.boolean || isNominal(right, "boolean") ||
+              right.type === "IntegerLiteral" ||
+              right.type === "BooleanLiteral" ||
+              (right.type === "Alias" &&
+                (right.name === "i32" || right.name === "boolean")),
+          ),
+        },
+      }],
+      return: { type: "Alias", name: "string" },
+    };
   });
 
   return scope;
