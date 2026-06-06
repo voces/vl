@@ -15,6 +15,7 @@ import {
   SemanticTokens,
   TextDocuments,
   TextDocumentSyncKind,
+  TextEdit,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import {
@@ -27,6 +28,7 @@ import {
   VLSeverity,
 } from "../../compiler/compile.ts";
 import type { Context } from "../../compiler/ast.ts";
+import { format } from "../../compiler/format.ts";
 import { tokenize } from "../../compiler/lexer.ts";
 import {
   type Completion,
@@ -350,6 +352,25 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     .map(toCompletionItem);
 });
 
+// Formatting (D4): `vl fmt` over the open document. Returns a single full-range
+// text edit replacing the buffer with its canonical form. A no-op (already
+// formatted) returns no edits so the editor records no change. The edit range
+// spans the whole document; the end position is the document's last line/column.
+connection.onDocumentFormatting((params): TextEdit[] => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+  const text = doc.getText();
+  const formatted = format(text);
+  if (formatted === text) return [];
+  return [{
+    range: {
+      start: { line: 0, character: 0 },
+      end: doc.positionAt(text.length),
+    },
+    newText: formatted,
+  }];
+});
+
 documents.listen(connection);
 
 connection.onInitialize((params) => {
@@ -371,6 +392,7 @@ connection.onInitialize((params) => {
       definitionProvider: true,
       referencesProvider: true,
       hoverProvider: true,
+      documentFormattingProvider: true,
       inlayHintProvider: true,
       semanticTokensProvider: {
         legend: SEMANTIC_TOKEN_LEGEND,

@@ -8,6 +8,9 @@
 //   deno task check <dir>              # recursively check every *.vl under dir
 //   deno task check                    # no path → check the cwd (like `check .`)
 //   deno task check --concise <path>   # one terse line per diagnostic (grep-safe)
+//   deno task fmt <file.vl>            # print canonically-formatted source
+//   deno task fmt -w <path> [...]      # rewrite the file(s)/dir(s) in place
+//   deno task fmt --check <path>       # CI gate: nonzero exit if not formatted
 //
 // `check` prints rich, rustc/Deno-style diagnostics by default (header line,
 // the offending source line, a caret/tilde underline, and an `at file:L:C`
@@ -30,8 +33,9 @@ import {
   type VLDiagnostic,
   wasmToWat,
 } from "./compile.ts";
+import { format } from "./format.ts";
 
-const SUBCOMMANDS = new Set(["run", "build", "check"]);
+const SUBCOMMANDS = new Set(["run", "build", "check", "fmt"]);
 
 // --- diagnostic rendering -------------------------------------------------
 
@@ -362,6 +366,109 @@ const check = async (args: string[]): Promise<void> => {
   Deno.exit(tally.errors > 0 ? 1 : 0);
 };
 
+// --- fmt ------------------------------------------------------------------
+
+// `fmt` has three modes, mirroring `gofmt`/`deno fmt`:
+//   default        print the formatted source of a single file to stdout
+//   -w / --write   rewrite each target file in place (no stdout)
+//   --check        write nothing; exit nonzero if any target is unformatted
+//                  (a CI gate), listing the files that would change
+//
+// A target may be a file or a directory; a directory is walked for `*.vl`
+// (reusing `collectVlFiles`, same SKIP_DIRS). With no target, stdin is read and
+// the formatted result printed (so `cat f.vl | vl fmt` works); stdin is
+// incompatible with -w (nothing to write back to) and is reported as such.
+type FmtArgs = { paths: string[]; write: boolean; check: boolean };
+
+const parseFmtArgs = (args: string[]): FmtArgs => {
+  const parsed: FmtArgs = { paths: [], write: false, check: false };
+  for (const a of args) {
+    if (a === "-w" || a === "--write") parsed.write = true;
+    else if (a === "--check") parsed.check = true;
+    else if (!a.startsWith("-")) parsed.paths.push(a);
+  }
+  return parsed;
+};
+
+const fmt = async (args: string[]): Promise<void> => {
+  const { paths, write, check } = parseFmtArgs(args);
+
+  if (write && check) {
+    console.error("fmt: --write and --check are mutually exclusive");
+    Deno.exit(2);
+  }
+
+  // No path: format stdin → stdout. Only valid for the default (print) mode.
+  if (paths.length === 0) {
+    if (write) {
+      console.error("fmt: -w needs a file argument (cannot rewrite stdin)");
+      Deno.exit(2);
+    }
+    const source = await new Response(Deno.stdin.readable).text();
+    const out = format(source);
+    if (check) {
+      if (out !== source) {
+        console.error("<stdin>");
+        Deno.exit(1);
+      }
+      Deno.exit(0);
+    }
+    await Deno.stdout.write(new TextEncoder().encode(out));
+    return;
+  }
+
+  // Expand each path to a concrete file list (a dir → every `*.vl` under it).
+  const files: string[] = [];
+  for (const target of paths) {
+    let info: Deno.FileInfo;
+    try {
+      info = await Deno.stat(target);
+    } catch {
+      console.error(`fmt: no such file or directory: ${target}`);
+      Deno.exit(2);
+    }
+    if (info.isDirectory) files.push(...await collectVlFiles(target));
+    else files.push(target);
+  }
+
+  if (files.length === 0) {
+    console.error("fmt: no .vl files found");
+    Deno.exit(0);
+  }
+
+  // Default (print) mode formats exactly one file to stdout; refusing multiple
+  // avoids silently concatenating unrelated files. Use -w or --check for many.
+  if (!write && !check && files.length > 1) {
+    console.error(
+      "fmt: refusing to print multiple files to stdout; use -w or --check",
+    );
+    Deno.exit(2);
+  }
+
+  let unformatted = 0;
+  for (const file of files) {
+    const source = await Deno.readTextFile(file);
+    const out = format(source);
+
+    if (check) {
+      if (out !== source) {
+        console.error(file);
+        unformatted++;
+      }
+    } else if (write) {
+      // Only touch the file when the bytes actually change.
+      if (out !== source) {
+        await Deno.writeTextFile(file, out);
+        console.error(`formatted ${file}`);
+      }
+    } else {
+      await Deno.stdout.write(new TextEncoder().encode(out));
+    }
+  }
+
+  if (check) Deno.exit(unformatted > 0 ? 1 : 0);
+};
+
 // --- dispatch -------------------------------------------------------------
 
 const main = async (): Promise<void> => {
@@ -375,6 +482,7 @@ const main = async (): Promise<void> => {
 
   if (cmd === "build") return await build(args);
   if (cmd === "check") return await check(args);
+  if (cmd === "fmt") return await fmt(args);
   return await run(args);
 };
 

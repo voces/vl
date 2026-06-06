@@ -237,7 +237,15 @@ D1/D2.*
   (`compiler/symbols.ts`) during its scope walk; the LSP queries it by cursor (`textDocument/definition`
   + `textDocument/references`). Locals, params, function decls, type aliases; single-document. → `DECISIONS.md`.
 - ⬜ **D3. Autocomplete** (scope-aware; structural members).
-- ⬜ **D4. Formatter** (+ `vl fmt`).
+- ✅ **D4. Formatter** (+ `vl fmt`). A **comment-preserving token reformatter** (`compiler/format.ts`):
+  re-scans source into a comment- and newline-retaining token stream and reprints with canonical
+  whitespace + 4-space indentation, never moving statement-terminating newlines — so output re-parses to
+  the same AST and no comment is ever dropped (not an AST→source printer: the AST flattens compound
+  assignment, loses "no annotation", and `if`/`for`/`while`/`return` carry no span → reprinting would
+  change or delete source; → `DECISIONS.md`). **Idempotent + AST-preserving + comment-preserving**, all
+  asserted over the whole `tests/cases/**` corpus. CLI `vl fmt` (stdout / `-w` write / `--check` CI gate /
+  dir walk / stdin); LSP `textDocument/formatting` wired over `format()`. REMAINING: line reflow/wrapping
+  of over-long lines.
 - ✅ **D5. Semantic tokens.** `textDocument/semanticTokens/full` — hybrid classifier: identifiers via the
   D2 symbol table (variable/parameter/function/type + `declaration` modifier), literals/keywords/operators
   via the lexer token stream, comments by source scan, **and `receiver.member` names** (→ `property` /

@@ -135,3 +135,13 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
   stack — so the symbol table is populated during that same walk rather than by a separate post-parse
   resolver (which would duplicate scope/shadowing logic and drift from the checker). Position-indexed,
   single-document; cross-file and builtins are out of scope. (D2)
+- **`vl fmt` is a comment-preserving token reformatter, not an AST printer** — even though Track G now
+  exposes node spans and comment-carrying tokens. An AST→source printer would still corrupt or drop
+  source: the AST flattens compound assignment (`a += b` → `a = a + b`) and annotation-free `let`s (stores
+  the *inferred* type, not "no annotation"); comments attach only to *tokens*, never to AST nodes; and the
+  parser records spans for expression/declaration/block nodes but **not** for `if`/`for`/`while`/`return`/
+  `break`/`continue`, so a node→source slice can't even cover control flow. Instead the formatter re-scans
+  source into a comment- and newline-retaining token stream and reprints with canonical whitespace/indent,
+  never moving a statement-terminating newline — so `parse(format(src))` re-derives the same AST (asserted
+  over the corpus) and no comment is eaten. It is "AST-driven" via *validation*, not *generation*. Trade-off:
+  normalizes whitespace/indentation but does not reflow/wrap long lines. (D4)
