@@ -65,8 +65,9 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **A10. Parametric types / generics** (`function foo<T>(x: T)`). Stage 1 (function type params),
   Stage 2 (array element inference — `first<T>(xs: T[]): T`), Stage 3 (generic `type` aliases —
   `type Box<T> = {value: T}`, applied in any type position incl. nested/array; `tests/cases/generics/`)
-  done. REMAINING: build-side array generics (`map`/`filter` constructing a new collection of inferred
-  element type) — needs `List` (B6, the primary collection) or fixed-size construction.
+  done. **Build-side array generics done:** `xs.map(f)` / `xs.filter(f)` build a new `T[]`/`U[]` over the
+  growable rep (B6); `map`'s result element `U` is inferred from the callback's return via a shared `Infer`
+  hole + the existing per-call instantiation. REMAINING: same for `Map`/`Set` when they land (B6a).
 - 🟢 **A11. Recursive structural types.** Done — `type Tree = { value, left: Tree | null, … }`
   constructs/traverses/compiles (cycle-safe traversals + a self-referential WasmGC struct rec-group;
   `types/recursive-tree.vl`). REMAINING: mutual recursion across *separate* `type` decls; recursion
