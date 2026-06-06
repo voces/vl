@@ -161,9 +161,18 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
     `[]`/`[]=`/`.length` lower to native `array.get`/`array.set`/`array.len` on `backing`, bypassing
     B13 (precedent: `string`/`i32` nominal special-casing in codegen). Open sub-choice: **nominal
     recognition** (codegen knows `List` by name, simplest) vs a **declarative native-lowered/intrinsic
-    annotation** (any std type opts in). With this + bounds-narrowing, an in-range `a[i]` is
-    codegen-identical to a raw `array.get` — the one spot `List` needs compiler privilege under "std
-    over primitives."
+    annotation** (any std type opts in). With this + bounds-narrowing + backing-pointer hoisting
+    (below), an in-range `a[i]` in a loop is codegen-identical to a raw `array.get` — the one spot
+    `List` needs compiler privilege under "std over primitives."
+  - **Backing-pointer hoisting (LICM) — the third indexing-perf enabler** (open; likely VL-explicit) —
+    even with the native flag, `l[i]` is a `struct.get` (load `backing`) then an `array.get` — two
+    loads per element, ~1.5–2× over a raw array in a tight load-bound loop. `backing` is loop-invariant,
+    so hoist its load out of the loop (load once, bare `array.get` in the body — instruction-identical
+    to a raw-array loop; how LLVM gets Rust `Vec`/C++ `std::vector` to native speed). binaryen's LICM
+    over a GC `struct.get` is **not** guaranteed (must prove no `push`/grow/reassign in the loop), so VL
+    likely hoists explicitly for the canonical `for i in 0 to list.length { list[i] }` pattern. All
+    three enablers together make a list loop instruction-identical to a raw-array loop; missing the
+    hoist leaves the per-access `struct.get` cost.
   - **Value vs reference — language-wide** (open; default **reference**) — not collections-only:
     objects *and* collections decided together. v1 = reference everywhere (consistent with VL objects;
     Python/JS/Java); coherent alternative is Swift-style value-everywhere-with-COW, *only if uniform*.

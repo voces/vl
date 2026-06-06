@@ -25,10 +25,12 @@ literal** (the scripting-feel default — Python/JS/Ruby/Swift), the **growth
 factor is 2×** for v1, and **indexing is result-by-default — `a[i]: T | null`**
 (safe / OOB → `null`) for `List` (and any raw-array escape), with a trapping
 *asserting* accessor as the discouraged opt-in. Still open: value-vs-reference
-(language-wide), the error model (language-wide), indexing perf (the
-**bounds-narrowing** enabler — see §VL.6/§OQ.4 — that keeps result-by-default
-indexing native-speed, plus the **native-indexing flag** of §VL.6 that drops the
-B13 indirect call), and the capacity/seed surface specifics.
+(language-wide), the error model (language-wide), indexing perf (the **three**
+enablers of §VL.6 that together make a list loop instruction-identical to a
+raw-array loop — **bounds-narrowing** (drops the `null` + check, §OQ.4), the
+**native-indexing flag** (drops the B13 indirect call), and **backing-pointer
+hoisting** (loads `backing` once per loop, not per access); missing the hoist
+leaves the per-access `struct.get` cost), and the capacity/seed surface specifics.
 
 Recommendation in one screen:
 
@@ -73,9 +75,10 @@ Recommendation in one screen:
    `T | null`); the indexing rule is one rule across `List` and any raw-array escape.
    The cost — a null-handle on every access — is paid down by **bounds-narrowing**
    (§VL.6): inside `for i in 0 to a.length` or after `if i < a.length`, `a[i]`
-   narrows from `T | null` to `T`. Combined with the native-indexing flag this
-   reaches the ideal — `a[i]` lowers to a bare `array.get` of `T`, codegen identical
-   to a raw array, while `List` stays a `.vl` std type otherwise.
+   narrows from `T | null` to `T`. Combined with the native-indexing flag *and*
+   **backing-pointer hoisting** (§VL.6: load `backing` once per loop, not per
+   access), this reaches the ideal — `a[i]` lowers to a bare `array.get` of `T`,
+   codegen identical to a raw array, while `List` stays a `.vl` std type otherwise.
 
 **Language principle — "result by default."** Fallible operations return values,
 not control-flow escapes: absence is `T | null`, "failed with a reason" is
@@ -226,10 +229,24 @@ separately from the physical length. A distinct struct wrapping a header-less ra
 **The header cost — two i32s + one indirection (the owner's sizing).** A `List`
 carries a per-list header of two i32s (`len`/`cap`) over the bare backing, and a
 read `l[i]` is `list.backing[i]` — a `struct.get` (load `backing`) then an
-`array.get` — vs a raw array's single `array.get`. That extra indirection and the
-8-byte header are the entire cost of making `List` the default over a raw array,
-and both are **negligible** once the **native-indexing flag** (§VL.6) +
-inlining + bounds-narrowing fold the access back to a bare `array.get`. The
+`array.get` — vs a raw array's single `array.get`. The 8-byte header is genuinely
+trivial. **The extra `struct.get` is not — it is a real per-access cost**: an
+extra load *plus* a pointer-chase to a second heap object (the `{len,cap,backing}`
+header is one allocation, the backing array another). In a tight, load-bound loop,
+going from one load to two per element can be **~1.5–2× on that kernel** — *not*
+negligible. **But `backing` is loop-invariant**: the fix is to **hoist it out of
+the loop** (LICM) — load `backing` once before the loop body, leaving a bare
+`array.get` inside, instruction-identical to a raw array. This is exactly how LLVM
+makes Rust `Vec` / C++ `std::vector` indexing reach native speed (it hoists the
+data pointer). **Catch for VL:** binaryen's LICM over a GC `struct.get` across a
+loop is *not* guaranteed — it would have to prove nothing in the loop writes
+`backing` (no `push`/grow/reassign) — so VL likely needs to **explicitly hoist**
+the backing load for the canonical `for i in 0 to list.length { list[i] }` pattern
+rather than relying on binaryen to do it. With the hoist (the **backing-pointer
+hoisting** enabler, §VL.6), plus the **native-indexing flag** (§VL.6) +
+bounds-narrowing, the access folds back to a bare `array.get`; **without the hoist
+the per-access `struct.get` cost remains.** Scattered/random single accesses
+outside any loop still pay one extra (cache-hot) load — minor there. The
 constant/read-only-literal optimization (§VL.6) avoids even the header for
 compile-time-known literals.
 
@@ -458,10 +475,28 @@ fixed-array literal to fight.
   - **Declarative annotation** (more general): mark a `"[]"` method as
     native-lowered / intrinsic, so *any* std type can opt into native indexing
     without a hardcoded name in codegen.
-  Combined with **bounds-narrowing**, this yields the ideal: a provably-in-range
-  `a[i]` narrows to `T` (no `null`) **and** the native flag makes it a bare
-  `array.get` (no indirect call) → **codegen identical to a raw array**, while
-  `List` stays an ordinary `.vl` std type everywhere else.
+  Combined with **bounds-narrowing** *and* **backing-pointer hoisting** (next
+  bullet), this yields the ideal: a provably-in-range `a[i]` narrows to `T` (no
+  `null`), the native flag makes it a bare `array.get` (no indirect call), and the
+  hoist pulls the `backing` load out of the loop → **codegen identical to a raw
+  array**, while `List` stays an ordinary `.vl` std type everywhere else. **All
+  three are needed**: drop the hoist and the per-access `struct.get` (load
+  `backing`) survives — see §VL.1.
+
+- **Backing-pointer hoisting (LICM) — the third enabler.** The native flag turns
+  `l[i]` into `list.backing[i]`, but that is still a `struct.get` (load `backing`)
+  *then* an `array.get` — two loads per element, the second pointer-chasing to a
+  separate heap object (§VL.1). In a tight loop that doubling is ~1.5–2× on a
+  load-bound kernel. `backing` is **loop-invariant**, so the fix is to **load it
+  once before the loop** and leave a bare `array.get` in the body —
+  instruction-identical to a raw-array loop. This is how LLVM gets Rust `Vec` /
+  C++ `std::vector` indexing to native speed (hoist the data pointer). **VL likely
+  has to do this explicitly**: binaryen's LICM over a GC `struct.get` across a loop
+  is *not* guaranteed (it must prove no `push`/grow/reassign in the loop touches
+  `backing`), so VL should hoist the backing load for the canonical
+  `for i in 0 to list.length { list[i] }` pattern rather than rely on binaryen.
+  Without the hoist, bounds-narrowing + the native flag still leave the per-access
+  `struct.get`; with all three, the list loop is the raw-array loop.
 
 - **Constant / read-only literal optimization.** A compile-time `[1, 2, 3]` (all
   elements known, never mutated) can emit a **constant backing** — a fixed-size
@@ -644,9 +679,17 @@ here** — this is the plan the design commits to.
    the `string`/`i32` nominal special-casing in codegen). The remaining sub-choice
    is **how to express the flag**: **nominal recognition** (codegen knows `List` by
    name, simplest) vs a **declarative native-lowered/intrinsic annotation** on the
-   `"[]"` method (more general — any std type can opt in). With the flag + bounds-
-   narrowing, an in-range `a[i]` is codegen-identical to a raw `array.get`. This is
-   the one spot `List` needs compiler privilege even under "std over primitives."
+   `"[]"` method (more general — any std type can opt in). A **third** enabler is
+   needed for a *loop*: **backing-pointer hoisting (LICM)** — `l[i]` is still a
+   `struct.get` (load `backing`) then an `array.get`, two loads per element, and in
+   a tight loop that is ~1.5–2× over a raw array (§VL.1). `backing` is
+   loop-invariant, so hoist its load out of the loop; binaryen's LICM over a GC
+   `struct.get` is not guaranteed (it must prove no `push`/grow/reassign in the
+   loop), so VL likely hoists it explicitly for the canonical `for`-over-index
+   pattern. With all three — bounds-narrowing + native flag + hoist — an in-range
+   `a[i]` in a loop is codegen-identical to a raw `array.get`; missing the hoist
+   leaves the per-access `struct.get`. This is the one spot `List` needs compiler
+   privilege even under "std over primitives."
 5. **Growth taper.** 2× is **decided** for v1 (above). Whether to later add a
    Go-style taper to ~1.25× past a size threshold stays deferred — a
    constant-factor tweak behind the same API, not a representation change.
