@@ -18,7 +18,7 @@ import { format, isFormatted } from "../compiler/format.ts";
 import { checkOnly } from "../compiler/compile.ts";
 
 // Tiny structural-equality assert (the repo has no std import map; the other
-// test files likewise roll their own — see symbols_test.ts / run_test.ts).
+// test files likewise roll their own — see symbols_test.ts / cases_test.ts).
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
   const e = JSON.stringify(expected);
