@@ -153,7 +153,10 @@ export const stringifyType = (
         .join(", ")
     }): ${stringifyType(type.return, seen)}`;
   }
-  if (type.type === "Type") return `T<${stringifyType(type.subType, seen)}>`;
+  // A `Type` node wraps a named type-alias's body (internal bookkeeping for the
+  // alias-leaf traversal). For display, render the aliased type itself, not the
+  // internal `T<…>` wrapper (`type foo = "ab"` hovers as `"ab"`, not `T<"ab">`).
+  if (type.type === "Type") return stringifyType(type.subType, seen);
   if (type.type === "Infer") return `I<${stringifyType(type.subType, seen)}>`;
   if (type.type === "Custom") return type.validate.toString();
   const exhaustive: never = type;

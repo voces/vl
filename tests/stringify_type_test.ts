@@ -31,3 +31,14 @@ Deno.test("stringifyType re-escapes control/quote/backslash in string-literal ty
   assertEquals(stringifyType(lit('x"y')), '"x\\"y"', "quote");
   assertEquals(stringifyType(lit("plain")), '"plain"', "plain text unchanged");
 });
+
+Deno.test("stringifyType renders a Type-alias wrapper as its aliased type, not T<…>", () => {
+  // deno-lint-ignore no-explicit-any
+  const typeWrap = (sub: any): any => ({ type: "Type", subType: sub });
+  assertEquals(stringifyType(typeWrap(lit("ab"))), '"ab"', "type foo = \"ab\"");
+  assertEquals(
+    stringifyType(typeWrap({ type: "Alias", name: "i32" })),
+    "i32",
+    "type foo = i32",
+  );
+});
