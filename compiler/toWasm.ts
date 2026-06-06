@@ -273,7 +273,7 @@ export const toWasm = async (ast: VLProgramNode) => {
   // and dispatch via the table, not the frame) — i.e. a closed-over variable.
   const lookupName = (name: string) => {
     for (let i = scopes.length - 1; i >= 0; i--) {
-      if (name in scopes[i]) {
+      if (Object.hasOwn(scopes[i], name)) {
         const [type, index] = scopes[i][name];
         const boundary = functionBoundaries[functionBoundaries.length - 1] ?? 0;
         return { type, index, capture: i < boundary && index >= 0 };
@@ -1682,7 +1682,9 @@ export const toWasm = async (ast: VLProgramNode) => {
   const getResolvedFunctionName = (name: string) => {
     let i = functionScopes.length - 1;
     while (i >= 0) {
-      if (name in functionScopes[i]) return functionScopes[i][name];
+      if (Object.hasOwn(functionScopes[i], name)) {
+        return functionScopes[i][name];
+      }
       i--;
     }
     throw new Error(`Expected function ${name} to be in scope`);
@@ -2236,6 +2238,18 @@ export const toWasm = async (ast: VLProgramNode) => {
             `toString: unsupported argument type "${name ?? t.type}" ` +
               "(only i32 and boolean are supported so far)",
           );
+        }
+        // `fromCodePoint(code)` is a compiler builtin (H2): construct a single-
+        // character VL string from an i32 Unicode code point. A VL string is a
+        // WasmGC i32-array of code points, so this is a length-1 array holding it.
+        if (node.function === "fromCodePoint") {
+          const arg = node.arguments[0].value;
+          const code = withDesiredType(
+            { type: "Alias", name: "i32" },
+            () => toExpression(arg),
+          );
+          const at = arrayType(i32Type);
+          return m.array.new_fixed(at.heapType, [code]);
         }
         // `Map()` / `Set()` builtin constructors (B6a): allocate an empty hash
         // collection. The concrete map type is the call's resolved return type

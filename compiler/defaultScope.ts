@@ -482,6 +482,33 @@ export const defaultScope = () => {
       }],
       return: { type: "Alias", name: "string" },
     };
+
+    // `fromCodePoint(code: i32): string` — construct a single-character VL string
+    // from a Unicode code point. A VL string is a WasmGC i32-array of code points,
+    // so this allocates a length-1 array holding `code`. Bootstrap-critical for the
+    // self-hosted lexer, which must materialize the value of a decoded `\xXX` /
+    // `\uXXXX`/`\u{…}` escape. Named for the actual number scheme (each element is a
+    // Unicode code point), unlike JS's UTF-16-code-unit `fromCharCode`. Mirrors
+    // `toString`: an i32 (or integer literal) is accepted, and toWasm lowers the
+    // call by name to an inline length-1 array.
+    scope["fromCodePoint"] = {
+      type: "Function",
+      paramaters: [{
+        type: "Parameter",
+        name: "code",
+        paramaterType: {
+          type: "Custom",
+          validate: namedFunc(
+            "i32",
+            (right: VLType) =>
+              right === scope.i32 || isNominal(right, "i32") ||
+              right.type === "IntegerLiteral" ||
+              (right.type === "Alias" && right.name === "i32"),
+          ),
+        },
+      }],
+      return: { type: "Alias", name: "string" },
+    };
   });
 
   return scope;
