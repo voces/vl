@@ -1774,6 +1774,53 @@ export const validateType = (left: VLType, right: VLType): boolean => {
   return ret;
 };
 
+// Reorder call arguments into PARAMETER (declaration) order, mirroring the
+// matching `ensureParameters` performs: first place each *named* argument into
+// the slot of the parameter with that name, then fill the remaining slots, in
+// order, with the *positional* (unnamed) arguments. Returns one entry per
+// parameter — `undefined` where no argument was supplied (an omitted nullable
+// param) — followed by any leftover/unmatched arguments (a named arg with no
+// matching parameter, or surplus positionals) appended in source order so the
+// result never silently drops an argument. This is the single source of truth
+// for argument<->parameter alignment shared by typechecking and codegen.
+//
+// Pure: no shared state, no diagnostics — callers (`ensureParameters` for
+// checking, `toWasm` for emission) handle arity/name errors themselves.
+export const orderArgumentsByParameters = (
+  parameters: VLParameterNode[],
+  args: VLArgumentNode[],
+): (VLArgumentNode | undefined)[] => {
+  const slots: (VLArgumentNode | undefined)[] = parameters.map(() => undefined);
+  const leftover: VLArgumentNode[] = [];
+  const positional: VLArgumentNode[] = [];
+
+  // First place named arguments by parameter name.
+  for (const arg of args) {
+    if (arg.name === undefined) {
+      positional.push(arg);
+      continue;
+    }
+    const paramIndex = parameters.findIndex((p) => p.name === arg.name);
+    if (paramIndex === -1 || slots[paramIndex] !== undefined) {
+      // Unknown name, or a slot already filled (named collision): leave it for
+      // the caller to diagnose rather than overwriting.
+      leftover.push(arg);
+    } else {
+      slots[paramIndex] = arg;
+    }
+  }
+
+  // Then fill the remaining slots, in order, with positional arguments.
+  let next = 0;
+  for (const arg of positional) {
+    while (next < slots.length && slots[next] !== undefined) next++;
+    if (next < slots.length) slots[next++] = arg;
+    else leftover.push(arg);
+  }
+
+  return [...slots, ...leftover];
+};
+
 export const ensureParameters = (
   parameters: VLParameterNode[],
   args: VLArgumentNode[],
