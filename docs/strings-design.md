@@ -308,6 +308,21 @@ string  ≅  (struct (field $bytes  (ref (array i8)))
   literal and a string element are the same kind of thing — an `i32` code point. The
   byte representation is an implementation detail under the code-point-indexed surface.
 
+**Rejected alternative — flexible fixed-width (PEP 393).** The closest contender is
+Python's model: store each string in the narrowest *fixed* width that fits its widest
+code point (`i8` Latin-1 / `i16` UCS-2 / `i32` UCS-4). It buys **O(1) code-point indexing
+*always*** (no §ASCII branch, no O(n) non-ASCII case), is 1 byte/char for ASCII/Latin-1,
+and pairs naturally with a validity-carrying `char` type. **Rejected for VL** because:
+(1) it **transcodes at every host boundary** — incoming UTF-8 must be decoded and
+re-widthed, outgoing re-encoded — and VL's hot boundary *is* UTF-8 I/O (a compiler
+reading source files; a browser app hitting the DOM), exactly where UTF-8 storage is
+zero-copy; (2) a **single** non-Latin-1 code point (one emoji) widens the *whole* string
+to `i32` (4×), whereas UTF-8 pays the multi-byte cost only locally; (3) it needs **three
+backing array types** (i8/i16/i32) threaded through codegen + interning vs UTF-8's single
+`i8`. What it uniquely buys — always-O(1) code-point indexing — the §ASCII flag recovers
+for the common ASCII case, and the residual O(n) non-ASCII indexing rarely sits on a hot
+path (most access is a front check or an already-O(n) scan).
+
 The storage decision is firm. What the *API* over those bytes looks like — the
 identity-defining decision — is next.
 
@@ -927,7 +942,11 @@ Genuinely still open — owner's calls (recommendations given, decision deferred
    - **Recommendation:** keep `s[i]` an `i32` (consistent with the decided char-literal
      model and avoids a new type), and add **one-char-slice sugar `s[0..1]`** as the
      concatenation-friendly accessor. Owner to decide whether the ergonomic gap is worth
-     a dedicated `char` type instead.
+     a dedicated `char` type instead. **The UTF-8 storage decision tilts this toward `i32`:**
+     a validity-carrying `char` type paired most naturally with the (rejected) flexible
+     fixed-width representation, where every element is a fixed-width valid scalar; over
+     UTF-8 the element is a decoded code point, for which a bare `i32` (with `fromCodePoint`
+     / `s[0..1]` to go back to a string) is the more honest fit.
 3. **ASCII-flag constant-propagation aggressiveness** — how far to push
    `ascii(a) && ascii(b) ⇒ ascii(a + b)` (and the slice case) at compile time before
    falling back to the runtime bit. A tuning heuristic, not a correctness question.
