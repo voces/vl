@@ -1630,6 +1630,17 @@ const resolvesToTypeWrapper = (t: VLType, depth = 0): boolean => {
   return false;
 };
 
+// A named `Type` wrapper (D8) is inert for checking. `_flattenType` only peels
+// `Union`/`Nullable`, so an alias resolved to `type N = A | B | C` arrives as a
+// single `Type{Union}` and would flatten to ONE opaque variant — defeating
+// member discrimination. Peel the outer wrapper(s) first so the union's members
+// become separate variants (each member keeps its own `Type{…}` for display;
+// `validateType`, used by `sameVariant`/`meet`, unwraps those transparently).
+const flattenVariants = (type: VLType): VLType[] => {
+  while (type.type === "Type") type = type.subType;
+  return _flattenType(type);
+};
+
 // Remove a variant from a union/nullable, returning the residual type (the other
 // members, re-flattened). Backs else-branch narrowing: in `if x is A { … } else
 // { … }`, `x` is `U − A` in the else branch. `Never` if nothing remains.
@@ -1639,8 +1650,8 @@ const resolvesToTypeWrapper = (t: VLType, depth = 0): boolean => {
 // type like `i32` minus the literal `1`), there's nothing concrete to drop, so
 // the type is returned unchanged — open-world negation isn't tracked (A4 note).
 export const subtractType = (type: VLType, removed: VLType): VLType => {
-  const drop = _flattenType(removed);
-  const kept = _flattenType(type).filter((v) =>
+  const drop = flattenVariants(removed);
+  const kept = flattenVariants(type).filter((v) =>
     !drop.some((d) => sameVariant(v, d))
   );
   if (kept.length === 0) return { type: "Never" };
@@ -1672,7 +1683,7 @@ export const intersectType = (a: VLType, b: VLType): VLType => {
   if (a.type === "Never" || b.type === "Never") return { type: "Never" };
   if (b.type === "Negation") return subtractType(a, b.subType);
   if (a.type === "Negation") return subtractType(b, a.subType);
-  const kept = _flattenType(a)
+  const kept = flattenVariants(a)
     .map((m) => meet(m, b))
     .filter((m): m is VLType => m !== null);
   if (kept.length === 0) return { type: "Never" };
