@@ -44,6 +44,9 @@ Drop a `.vl` file under `tests/cases/<area>/` with `// @directive` comments at t
 diagnostic contains TEXT; `// @error at L:C TEXT` for position), `// @warning TEXT`. The runner is
 strict-by-default (an unexpected error fails the test).
 
+To assert a value, use `print(x)` (logs any printable type; booleans render as `true`/`false`). The
+raw `__store_*__`/`__log__` API is reserved for tests that exercise the memory builtins themselves.
+
 ## Where things live (read these first)
 
 - **`ROADMAP.md`** — the forward plan: what's next, dependencies, what's REMAINING per item.
