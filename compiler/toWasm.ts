@@ -118,6 +118,97 @@ export const toWasm = async (ast: VLProgramNode) => {
   // reference resolving below this belongs to an enclosing frame — i.e. a
   // capture, which closures (not yet implemented) would carry in an environment.
   const functionBoundaries: number[] = [];
+
+  // --- Module globals (mutable module-level state) ---
+  // A top-level mutable binding of *scalar* type (i32/i64/f32/f64) is lowered to
+  // a real wasm `global`, not a `__program__` local. This is what lets a function
+  // read AND write it through the *shared* global (`global.get`/`global.set`)
+  // rather than a private captured copy — the natural compiler idiom of
+  // module-level counters / positions reassigned from inside a function (the
+  // bootstrap motivation, Track H). Reference-typed bindings (objects, lists,
+  // strings, closures) stay on the existing capture path: mutating a *field* of a
+  // global object already works (the captured ref points at shared heap, and
+  // `struct.set` mutates it), so only scalar reassignment-through-a-function was
+  // broken. Keyed by name; the value is the binding's VL type. A global's wasm
+  // type is `toWasmType(type)`; it is created lazily (once) on declaration.
+  const moduleGlobals = new Map<string, VLType>();
+  const declaredGlobals = new Set<string>();
+  // Whether `name` resolves to a module global *here* — i.e. it is registered as
+  // one and not shadowed by a nearer (function-local) binding of the same name.
+  const isModuleGlobal = (name: string): boolean => {
+    if (!moduleGlobals.has(name)) return false;
+    // A function parameter / inner `let` of the same name shadows the global. The
+    // global's scope entry sits at scope index 0 (the program scope), so if
+    // `lookupName` finds the name at a deeper scope it is a shadowing local.
+    for (let i = scopes.length - 1; i >= 1; i--) {
+      if (name in scopes[i]) return false;
+    }
+    return true;
+  };
+  // Whether a binding's type lowers to a wasm scalar (i32/i64/f32/f64) — the
+  // value types that are safely held in a mutable global and reassigned through
+  // `global.set` without nullable-ref complications. Anything that doesn't map
+  // (an inferred/unresolved type) or maps to a ref is not globalized here.
+  const isScalarWasm = (type: VLType): boolean => {
+    // Keep nullable/union bindings on the local/capture path: they carry boxed /
+    // niche representations and per-branch narrowing that the early-returning
+    // global read/write paths don't reproduce. Only plain scalars are globalized.
+    const soft = softenImplicitType(type);
+    if (
+      soft.type === "Nullable" || soft.type === "Union" ||
+      soft.type === "Infer"
+    ) return false;
+    let wt: number;
+    try {
+      wt = toWasmType(type);
+    } catch {
+      return false;
+    }
+    return wt === binaryen.i32 || wt === binaryen.i64 ||
+      wt === binaryen.f32 || wt === binaryen.f64;
+  };
+
+  // Collect every identifier (`Name` node) referenced inside any function body
+  // among `statements` (recursively, including nested functions). A generic
+  // tree walk over plain AST objects/arrays — no per-node-type enumeration —
+  // gathering `{ type: "Name", name }`. Used to decide which top-level scalars
+  // need to be real wasm globals (only those a function reads/writes). Slightly
+  // over-collecting (e.g. a shadowed name) is harmless: it only globalizes a
+  // binding that would otherwise stay a local, and reads/writes still resolve
+  // correctly via `isModuleGlobal`'s shadowing check.
+  const collectFunctionBodyNames = (statements: VLStatement[]): Set<string> => {
+    const names = new Set<string>();
+    const walk = (v: unknown): void => {
+      if (v === null || typeof v !== "object") return;
+      if (Array.isArray(v)) {
+        for (const x of v) walk(x);
+        return;
+      }
+      const node = v as { type?: unknown; name?: unknown };
+      if (node.type === "Name" && typeof node.name === "string") {
+        names.add(node.name);
+      }
+      for (const key in node) {
+        if (key === "scope") continue; // bookkeeping, not AST to descend into
+        walk((node as Record<string, unknown>)[key]);
+      }
+    };
+    for (const stmt of statements) {
+      if (stmt.type === "FunctionDeclaration") walk(stmt.body);
+    }
+    return names;
+  };
+
+  // Ensure the wasm global exists, initialized to a zero/default constant. The
+  // binding's actual initializer runs as a `global.set` in `__program__` (the
+  // start function), which executes before any other function — so reads always
+  // see the initialized value, never the placeholder zero.
+  const ensureGlobal = (name: string, type: VLType): void => {
+    if (declaredGlobals.has(name)) return;
+    declaredGlobals.add(name);
+    m.addGlobal(name, toWasmType(type), true, zeroOf(type));
+  };
+
   const withScope = <T>(scope: Scope, fn: () => T) => {
     scopes.push(scope);
     currentScope = scope;
@@ -1777,9 +1868,30 @@ export const toWasm = async (ast: VLProgramNode) => {
     // );
     switch (node.type) {
       case "Program": {
+        // A scalar top-level binding becomes a wasm global (shared, mutable),
+        // not a `__program__` local — so functions read/write it through
+        // `global.get`/`global.set` on the one shared cell. Reference-typed
+        // bindings stay locals (the capture path handles them; see
+        // `moduleGlobals`). Register the globals up front so functions compiled
+        // while lowering the body resolve these names to the global.
+        const topLevel = Object.entries(node.scope)
+          .filter(([k, v]) => !ignoredKeys.has(k) && v.type !== "Function");
+        // Globalize only the top-level scalars actually referenced from inside a
+        // function body. A binding used only at module scope can stay a
+        // `__program__` local — keeping codegen unchanged for the common case and
+        // sidestepping name clashes (e.g. a top-level `for i`/`let i` reusing a
+        // name that is never touched by a function). Names read or assigned
+        // inside any function are collected by walking the function bodies.
+        const usedInFunctions = collectFunctionBodyNames(node.statements);
+        for (const [k, v] of topLevel) {
+          if (usedInFunctions.has(k) && isScalarWasm(v)) {
+            moduleGlobals.set(k, v);
+            ensureGlobal(k, v);
+          }
+        }
         const modifiedScope = Object.fromEntries(
-          Object.entries(node.scope)
-            .filter(([k, v]) => !ignoredKeys.has(k) && v.type !== "Function")
+          topLevel
+            .filter(([k]) => !moduleGlobals.has(k))
             .map(([k, v], i): [string, ScopeEntry] => [k, [v, i]]),
         );
         const locals: number[] = [];
@@ -2099,6 +2211,21 @@ export const toWasm = async (ast: VLProgramNode) => {
               "(e.g. `let m: {[string]: i32} = Map()`)",
           );
         }
+        // A top-level declaration of a module global: initialize the shared wasm
+        // global with `global.set` (the global itself was created, zero-init, in
+        // the Program case). `functionBoundaries.length === 1` means we're at
+        // module scope; inside a function a same-named `let` is a genuine local
+        // that shadows the global, so it falls through to the local path.
+        if (functionBoundaries.length === 1 && moduleGlobals.has(node.name)) {
+          ensureGlobal(node.name, node.variableType);
+          if (node.value) {
+            return m.global.set(
+              node.name,
+              withDesiredType(node.variableType, () => toExpression(node.value!)),
+            );
+          }
+          return m.nop();
+        }
         const index = _locals.push(toWasmType(node.variableType)) - 1 +
           (_locals.params ?? 0);
         currentScope[node.name] = [node.variableType, index];
@@ -2117,6 +2244,12 @@ export const toWasm = async (ast: VLProgramNode) => {
         return closureValue(registerFunctionDecl(node));
       }
       case "Name": {
+        // A module global reads through the shared wasm cell (`global.get`),
+        // whether referenced at module scope or from inside a function — so a
+        // function always sees the current value, not a stale captured copy.
+        if (isModuleGlobal(node.name)) {
+          return m.global.get(node.name, toWasmType(moduleGlobals.get(node.name)!));
+        }
         const found = lookupName(node.name);
         if (found?.capture) {
           // A closed-over variable: read from the environment (or, during the
@@ -2426,8 +2559,20 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (node.operand.type !== "Name") {
           throw new Error(`${op} requires a variable operand`);
         }
-        const [, idx] = getScopeEntry(node.operand.name);
         const delta = op === "++" ? 1 : -1;
+        // `++`/`--` on a module global mutates the shared wasm cell. binaryen has
+        // no `global.tee`, so in value position read it back explicitly.
+        if (isModuleGlobal(node.operand.name)) {
+          const name = node.operand.name;
+          const next = m.i32.add(m.global.get(name, binaryen.i32), m.i32.const(delta));
+          if (!hasDesiredType()) return m.global.set(name, next);
+          const set = m.global.set(name, next);
+          const read = m.global.get(name, binaryen.i32);
+          return node.prefix
+            ? m.block(null, [set, read], binaryen.i32)
+            : m.block(null, [set, m.i32.sub(read, m.i32.const(delta))], binaryen.i32);
+        }
+        const [, idx] = getScopeEntry(node.operand.name);
         const next = m.i32.add(
           m.local.get(idx, binaryen.i32),
           m.i32.const(delta),
@@ -2601,6 +2746,24 @@ export const toWasm = async (ast: VLProgramNode) => {
           }
           if (node.left.type !== "Name") {
             throw new Error(`binop = for non-names/properties not handled`);
+          }
+          // A module global is written through the shared wasm cell — this is the
+          // write-through path: a function reassigning it mutates the one global,
+          // visible to the caller and to every other function.
+          if (isModuleGlobal(node.left.name)) {
+            const type = moduleGlobals.get(node.left.name)!;
+            const wasmType = toWasmType(type);
+            const set = m.global.set(
+              node.left.name,
+              withDesiredType(type, () => toExpression(node.right)),
+            );
+            return desiredType
+              ? m.block(
+                null,
+                [set, m.global.get(node.left.name, wasmType)],
+                wasmType,
+              )
+              : set;
           }
           const [type, localIndex] = getScopeEntry(node.left.name);
           const wasmType = toWasmType(type);
