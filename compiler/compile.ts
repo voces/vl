@@ -10,13 +10,20 @@
 // adapts these to vscode-languageserver Diagnostics; everyone else consumes
 // them directly.
 
-import Binaryen from "binaryen";
 import type { Context, ParseErrors, VLProgramNode, VLType } from "./ast.ts";
 import { tokenize } from "./lexer.ts";
 import { parseProgram } from "./parser.ts";
-import { toWasm } from "./toWasm.ts";
 import { defaultScope } from "./defaultScope.ts";
 import { SymbolTable } from "./symbols.ts";
+
+// NOTE: binaryen is NOT imported statically here. A top-level `import Binaryen
+// from "binaryen"` would be evaluated whenever this module loads, dragging the
+// whole wasm toolchain into every consumer — including the codegen-free `check`
+// path and the LSP, which only need diagnostics/symbols. Instead `toWasm.ts`
+// (which owns the binaryen import) is loaded via dynamic `import()` only when
+// codegen actually runs (see `compile`), and binaryen itself is loaded lazily
+// inside `wasmToWat`. This keeps `checkOnly` (and `vl check`) entirely
+// binaryen-free. esbuild handles the dynamic import when bundling the LSP.
 
 export type { Binding, BindingKind, SymbolOccurrence } from "./symbols.ts";
 export { SymbolTable } from "./symbols.ts";
@@ -190,19 +197,46 @@ const codegenErrorMessage = (err: unknown): string => {
   return String(err);
 };
 
+/** Result of the codegen-free front end: AST, diagnostics, and symbols. */
+export type CheckResult = {
+  ast: VLProgramNode;
+  diagnostics: VLDiagnostic[];
+  symbols: SymbolTable;
+};
+
 /**
- * Full pipeline: source -> diagnostics (+ wasm when clean). Codegen only runs
- * when there are no error diagnostics, matching the LSP's behavior. A codegen
- * throw is surfaced as a diagnostic rather than escaping.
+ * Front end only, synchronously: tokenize + parse (which resolves scopes,
+ * type-checks, and populates the binding table) without running codegen. Returns
+ * exactly what `compile` does MINUS the `wasm` — i.e. the shared head of the
+ * pipeline. Used by `vl check`, which only needs diagnostics: this path never
+ * loads `toWasm.ts`/binaryen, so it stays binaryen-free and synchronous.
+ *
+ * Trade-off vs `compile`: because codegen does not run, codegen-only diagnostics
+ * (the `Codegen error:` line, e.g. the array-element-recursion stack-overflow)
+ * are NOT produced here. `check` is a parse/type gate; `build`/`run` still run
+ * codegen and surface those errors.
  */
-export const compile = async (source: string): Promise<CompileResult> => {
+export const checkOnly = (source: string): CheckResult => {
   const { tokens, diagnostics } = tokenize(source);
   const [ast, errors, symbols] = parseProgram(tokens, defaultScope());
   for (const error of errors) diagnostics.push(diagnosticFromError(error));
+  return { ast, diagnostics, symbols };
+};
+
+/**
+ * Full pipeline: source -> diagnostics (+ wasm when clean). Runs `checkOnly`,
+ * then codegen — but only when there are no error diagnostics, matching the
+ * LSP's behavior. A codegen throw is surfaced as a diagnostic rather than
+ * escaping. `toWasm` (and thus binaryen) is dynamically imported here so it is
+ * only loaded when codegen actually runs.
+ */
+export const compile = async (source: string): Promise<CompileResult> => {
+  const { ast, diagnostics, symbols } = checkOnly(source);
 
   let wasm: Uint8Array | undefined;
   if (!diagnostics.some((d) => d.severity === "error")) {
     try {
+      const { toWasm } = await import("./toWasm.ts");
       wasm = await toWasm(ast);
     } catch (err) {
       diagnostics.push({
@@ -244,6 +278,9 @@ export const parseSymbols = (source: string): SymbolTable => {
  * runtime globals, so the core stays runtime-agnostic.
  */
 export const wasmToWat = async (wasm: Uint8Array): Promise<string> => {
+  // Loaded lazily (not a top-level import) so the binaryen toolchain stays off
+  // the `check`/LSP path; only `build --wat` reaches here.
+  const Binaryen = (await import("binaryen")).default;
   // Mirror toWasm's tolerance of both binaryen forms (sync object / async init).
   // deno-lint-ignore no-explicit-any
   const _Binaryen = Binaryen as any;
