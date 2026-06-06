@@ -26,6 +26,13 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
   null," never "wrong variant." (A5)
 - **Bodyless `type Point` is a clean error for now.** Real nominal/opaque types come later; today a
   bodyless `type` decl is a diagnostic, not a silent self-referential alias. (A14)
+- **Object-literal field-value mismatches are errors, except behind an alias leaf.** `ensureType`'s
+  `Object` case raises on a wrong-typed field value (`{ value: i32 }` given `"x"`). It stays lenient
+  *only* when the expected/actual field type resolves to a user-`type` alias leaf (a `Type` wrapper) or
+  `Never`: an object literal is a bare `Object`, so checking it against a recursive alias arm
+  (`left: Tree | null`) hits the `Type`-vs-bare-`Object` false-negative the A11 traversal depends on,
+  and `Never` is an upstream-error placeholder. Tightening only the non-alias-leaf case closes the
+  soundness gap without re-introducing infinite recursion on self-references. (A12)
 
 ## Memory, runtime & object model
 
