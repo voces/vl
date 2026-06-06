@@ -1155,6 +1155,45 @@ const isHole = (t: VLType): boolean =>
 const sameVariant = (a: VLType, b: VLType): boolean =>
   !isHole(a) && !isHole(b) && validateType(a, b) && validateType(b, a);
 
+// Does a type resolve (through alias chains, and through the members of a
+// union/nullable) to a `Type` wrapper — the stored form of a user `type` alias,
+// which for a *recursive* alias is the lazy self-referential leaf (A11)?
+//
+// Object literals are bare `Object`s, never `Type`-wrapped, so comparing an
+// alias-typed expected field against a literal hits `ensureType`'s `Type` case,
+// which conservatively rejects `Type` vs non-`Type` (it cannot peel the wrapper
+// without risking infinite recursion on a self-reference). That rejection is a
+// *false-negative*, not a real value mismatch — the structural relation may
+// well hold. The object property loop relies on it to keep recursive aliases
+// (`left: Tree | null`) terminating, so the loop must NOT promote such a
+// rejection to an error. This predicate scopes the field-value error to cases
+// where neither field type is an alias leaf, leaving the recursive path exactly
+// as lenient as before while still catching concrete mismatches.
+const resolvesToTypeWrapper = (t: VLType, depth = 0): boolean => {
+  if (depth > 64) return false; // self-referential alias chain — treat as a leaf
+  while (t.type === "Alias") {
+    let next: VLType | undefined;
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if (t.name in scopes[i]) {
+        next = scopes[i][t.name];
+        break;
+      }
+    }
+    if (next === undefined || next === t) return false;
+    t = next;
+  }
+  // `Never` is a degenerate type left behind by an upstream error (e.g. an
+  // undeclared alias resolves to `Never`). Treat it like an alias leaf so the
+  // field-value loop stays lenient and does not pile a cascade mismatch on top
+  // of the real diagnostic.
+  if (t.type === "Type" || t.type === "Never") return true;
+  if (t.type === "Nullable") return resolvesToTypeWrapper(t.subType, depth + 1);
+  if (t.type === "Union") {
+    return t.subTypes.some((s) => resolvesToTypeWrapper(s, depth + 1));
+  }
+  return false;
+};
+
 // Remove a variant from a union/nullable, returning the residual type (the other
 // members, re-flattened). Backs else-branch narrowing: in `if x is A { … } else
 // { … }`, `x` is `U − A` in the else branch. `Never` if nothing remains.
@@ -1600,7 +1639,21 @@ export const ensureType = (
                   rprops.delete(rprop);
                   continue outer;
                 }
-                return false;
+                // The field values are incompatible. If either side resolves to
+                // a user `type` alias leaf (the recursive-alias case, e.g.
+                // `left: Tree | null` checked against a literal child object),
+                // the failure may be the `Type`-vs-bare-`Object` false-negative
+                // rather than a real mismatch — stay lenient (the prior
+                // behavior) so A11 recursive traversal keeps working. Otherwise
+                // it is a genuine concrete value mismatch (`value: i32` given
+                // `"x"`); raise it so object-literal field types are checked.
+                if (
+                  resolvesToTypeWrapper(lprop.type) ||
+                  resolvesToTypeWrapper(rprop.type)
+                ) {
+                  return false;
+                }
+                return pushError("prop-value-mismatch");
               }
             }
             return pushError("missing-prop");
