@@ -87,6 +87,18 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
   plus its param holes; applying `Box<i32>` clones the body, mapping each hole directly to its
   argument — so a concrete application is a concrete object and `Box<T>` in a generic fn keeps `T`
   linked to the function's hole (correlation flows through the existing monomorphization). (A10)
+- **Growable `T[]` ships as compiler-emitted helpers, not a `.vl` std module (yet).** The design's
+  end-state is to write the collection in `.vl` over an intrinsic floor (ports for free under
+  self-hosting), but that needs a module system VL doesn't have. So v1 lowers `T[]` to a
+  `{backing,len,cap}` WasmGC struct with lazily-emitted **per-element-wasm-type helpers** in
+  `compiler/builtins/lists.ts` — exactly how strings already work (`__string_eq__`). Migrate to `.vl`-std
+  when modules land. The *type* representation stays `{[i32]:T}` (so generic inference/equality/`.length`
+  are untouched — it is purely a codegen change); `string` is excluded from the struct rep via
+  `isListType = arrayElementType(t) && t.name===undefined`. (B6)
+- **Sequence indexing traps; `.get`/map-lookup return `T|null`.** `a[i]`/`a[i]=v` trap on out-of-bounds
+  (a bug, bound = `len`), matching the raw-array MVP; the safe checked accessor is `.get(i): T|null`, and
+  `pop()` on empty is `T|null` (normal absence). A sentinel-encoded scalar nullable (`boolean|null`) builds
+  its `null` from the i32 sentinel, not `ref.null`. (B6, §VL.6)
 
 ## Parser, distribution & bootstrapping
 

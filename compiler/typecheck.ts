@@ -230,6 +230,15 @@ export const _typeFromExpression = (
         }
       }
       if (leftType.type !== "Object") return missingOpFunc("left-not-object");
+      // List concat `a + b`: a *new* `T[]` (collections-design §VL.4). A `T[]` is
+      // anonymous and carries no `+` operator field, so it is typed here — the
+      // right operand must be a list assignable to the left, the result is the
+      // left list type. (`==`/`!=` on lists are handled by the structural branch
+      // above via `isEquatable`.) `string +` still flows through `opFunc` below.
+      if (op === "+" && isListType(leftType)) {
+        if (!ensureType(leftType, rightType, ctx)) return { type: "Never" };
+        return leftType;
+      }
       const opFunc = leftType.properties.find((p) =>
         validateType(p.name, { type: "StringLiteral", value: op })
       )?.type;
@@ -348,6 +357,11 @@ export const _typeFromExpression = (
       // `array.length` is an intrinsic i32 (not a structural member).
       if (expr.property === "length" && arrayElementType(objType)) {
         return { type: "Alias", name: "i32" };
+      }
+      // Intrinsic list members (`.capacity`, `.get`, …).
+      if (isListType(objType)) {
+        const member = listMemberType(arrayElementType(objType)!)[expr.property];
+        if (member) return member;
       }
       const propType: VLStringLiteralNode = {
         type: "StringLiteral",
@@ -658,6 +672,54 @@ export const arrayElementType = (type: VLType): VLType | null => {
   });
   return prop ? prop.type : null;
 };
+
+// Is `type` a *list* (the growable `T[]` rep), not a raw i32-array `string`?
+// Both match `arrayElementType` (a `string` is an Object named "string" carrying
+// `[i32]:i32`); the discriminator is the absence of a nominal `name`. Mirrors the
+// codegen-side `isListType` in `toWasm.ts`.
+export const isListType = (type: VLType): boolean =>
+  type.type === "Object" && type.name === undefined &&
+  arrayElementType(type) !== null;
+
+// The intrinsic *list* members (`T[]`'s `.capacity` / `.get` / `.push` / `.pop`
+// / `.clear`), special-cased here because a `T[]` is an anonymous structural
+// type — it has no nominal `name` to hang these on in `defaultScope` the way
+// `string` does. Codegen lowers each by name. `.length` stays handled at its
+// existing sites (shared with strings).
+export const listMemberType = (
+  element: VLType,
+): Record<string, VLType> => ({
+  // O(1) sibling of `.length` (property syntax, read-only): allocated slots.
+  capacity: { type: "Alias", name: "i32" },
+  // Safe, checked accessor: `T | null` (null when `i` is out of range).
+  get: {
+    type: "Function",
+    paramaters: [{
+      type: "Parameter",
+      name: "i",
+      paramaterType: { type: "Alias", name: "i32" },
+    }],
+    return: { type: "Nullable", subType: element },
+  },
+  // Append (amortized O(1)); grows the backing 2× on full.
+  push: {
+    type: "Function",
+    paramaters: [{ type: "Parameter", name: "x", paramaterType: element }],
+    return: { type: "Alias", name: "null" },
+  },
+  // Remove+return the last element, or `null` on empty (normal absence).
+  pop: {
+    type: "Function",
+    paramaters: [],
+    return: { type: "Nullable", subType: element },
+  },
+  // Reset to empty, retaining capacity (`len = 0`, no realloc).
+  clear: {
+    type: "Function",
+    paramaters: [],
+    return: { type: "Alias", name: "null" },
+  },
+});
 
 // A literal `true` loop condition (`while true`) — the loop never exits by
 // failing its test, so it only leaves via `break` or `return`.
@@ -1044,6 +1106,13 @@ export const getChildType = (
     arrayElementType(object)
   ) {
     return { type: "Alias", name: "i32" };
+  }
+
+  // Intrinsic list members (`.capacity`, `.get`, …) — a `T[]` is anonymous, so
+  // these are special-cased here rather than declared on a scope object.
+  if (property.type === "StringLiteral" && isListType(object)) {
+    const member = listMemberType(arrayElementType(object)!)[property.value];
+    if (member) return member;
   }
 
   let propertyType = object.properties.find((p) =>

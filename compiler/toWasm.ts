@@ -29,6 +29,10 @@ import {
   lowerStringMethodCall,
   type StringBuiltinContext,
 } from "./builtins/strings.ts";
+import {
+  type ListBuiltinContext,
+  lowerListMethodCall,
+} from "./builtins/lists.ts";
 
 const raise = (err?: string | Error): never => {
   if (typeof err === "object" && err instanceof Error) throw err;
@@ -482,6 +486,63 @@ export const toWasm = async (ast: VLProgramNode) => {
     return cached;
   };
 
+  // --- Lists (the committed growable `T[]` representation, B6) ---
+  // A `T[]` value (a structural object carrying an `[i32]:T` index signature that
+  // is NOT `string`) lowers to a WasmGC struct `{ backing: (ref (array mut T)),
+  // len: i32, cap: i32 }` — the `{ptr,len,cap}` triple (collections-design §VL.1).
+  // `backing` reuses the per-element `arrayType` interner above; `len` is the
+  // user-visible size (`.length`, bounds, iteration), `cap` the allocated slots.
+  // The TYPE-SYSTEM representation of `T[]` stays `{[i32]:T}` (load-bearing for
+  // generic inference / equatability / `.length` typing) — this is a codegen rep.
+  type ListType = {
+    heapType: number;
+    refType: number;
+    element: VLType;
+    backing: ArrayType;
+  };
+  // Struct field indices, fixed by `setStructType` order below.
+  const LIST_BACKING = 0;
+  const LIST_LEN = 1;
+  const LIST_CAP = 2;
+  const listTypes = new Map<number, ListType>();
+  // Intern the list struct type by the backing array's wasm type (so identical
+  // element types share one struct). All three fields mutable: `backing` so a
+  // grow can swap in a larger array, `len`/`cap` for `push`/`pop`/`clear`.
+  const listType = (element: VLType): ListType => {
+    const backing = arrayType(element);
+    let cached = listTypes.get(backing.heapType);
+    if (!cached) {
+      const tb = new binaryen.TypeBuilder(1);
+      tb.setStructType(0, [
+        { type: backing.refType, packedType: binaryen.notPacked, mutable: true },
+        { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+        { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+      ]);
+      const heapType = tb.buildAndDispose()[0];
+      cached = {
+        heapType,
+        refType: binaryen.getTypeFromHeapType(heapType, false),
+        element,
+        backing,
+      };
+      listTypes.set(backing.heapType, cached);
+    }
+    return cached;
+  };
+
+  // Is `t` a *list* (the growable `T[]` rep) rather than a raw i32-array? Both
+  // `string` and `T[]` match `arrayElementType` (a `string` is an Object named
+  // "string" carrying `[i32]:i32`), so the discriminator is the *absence* of a
+  // nominal `name`: an anonymous `[i32]:T` object is a list, a named one (string)
+  // stays on the raw `arrayType` path. EVERY flipped codegen site guards on this,
+  // not bare `arrayElementType`.
+  const isListType = (t: VLType): boolean => {
+    let s = softenImplicitType(t);
+    while (s.type === "Infer") s = softenImplicitType(s.subType);
+    return s.type === "Object" && s.name === undefined &&
+      arrayElementType(s) !== null;
+  };
+
   // Lazily-emitted wasm helper functions (string equality, string→memory copy),
   // each added to the module once on first use. Strings are i32-arrays of char
   // codes, so these are small loops over `array.get`.
@@ -650,36 +711,39 @@ export const toWasm = async (ast: VLProgramNode) => {
       return m.call(stringEqFn(), [a(), b()], binaryen.i32);
     }
     if (ft.type === "Function") return closureRefEq(a, b);
-    const element = ft.type === "Object" ? arrayElementType(ft) : undefined;
-    if (element) return m.call(arrayEqFn(element), [a(), b()], binaryen.i32);
+    // An anonymous `[i32]:T` element is a *list* (struct rep) — compare via the
+    // per-element list-eq helper (a string was already handled above by name).
+    if (isListType(ft)) {
+      return m.call(listEqFn(arrayElementType(ft)!), [a(), b()], binaryen.i32);
+    }
     if (ft.type === "Object" && ft.name === undefined) {
       return m.call(objectEqFn(ft), [a(), b()], binaryen.i32);
     }
     return m.i32.eq(a(), b()); // i32 / boolean
   };
 
-  // Per-element-type array equality: `__arr_eq_<n>__(a, b)` returns 1 iff the two
-  // arrays have equal length and equal elements (each compared via `valueEq`, so
-  // arrays of strings/structs/arrays recurse). `__string_eq__` is the same shape
-  // specialized to i32 char codes.
-  const arrayEqFns = new Map<number, string>();
-  const arrayEqFn = (element: VLType): string => {
-    const at = arrayType(element);
-    const existing = arrayEqFns.get(at.heapType);
+  // Per-element-type list equality: `__list_eq_<n>__(a, b)` returns 1 iff the two
+  // lists have equal `len` and equal elements over `[0, len)` of `backing` (each
+  // compared via `valueEq`, so lists of strings/structs/lists recurse). The list
+  // analogue of `__string_eq__` (i32 char codes) on the struct rep.
+  const listEqFns = new Map<number, string>();
+  const listEqFn = (element: VLType): string => {
+    const lt = listType(softenImplicitType(element));
+    const existing = listEqFns.get(lt.heapType);
     if (existing) return existing;
-    const name = `__arr_eq_${arrayEqFns.size}__`;
-    arrayEqFns.set(at.heapType, name); // before body for cycle safety
-    const elemWasm = toWasmType(element);
-    const a = () => m.local.get(0, at.refType);
-    const b = () => m.local.get(1, at.refType);
+    const name = `__list_eq_${listEqFns.size}__`;
+    listEqFns.set(lt.heapType, name); // before body for cycle safety
+    const elemWasm = toWasmType(lt.element);
+    const a = () => m.local.get(0, lt.refType);
+    const b = () => m.local.get(1, lt.refType);
     const i = () => m.local.get(2, binaryen.i32);
     const len = () => m.local.get(3, binaryen.i32);
     const body = m.block(null, [
       m.if(
-        m.i32.ne(m.array.len(a()), m.array.len(b())),
+        m.i32.ne(listLen(a()), listLen(b())),
         m.return(m.i32.const(0)),
       ),
-      m.local.set(3, m.array.len(a())),
+      m.local.set(3, listLen(a())),
       m.local.set(2, m.i32.const(0)),
       m.block("aeq_brk", [
         m.loop(
@@ -688,9 +752,9 @@ export const toWasm = async (ast: VLProgramNode) => {
             m.br("aeq_brk", m.i32.ge_s(i(), len())),
             m.if(
               m.i32.eqz(valueEq(
-                element,
-                () => m.array.get(a(), i(), elemWasm, false),
-                () => m.array.get(b(), i(), elemWasm, false),
+                lt.element,
+                () => m.array.get(listBacking(lt, a()), i(), elemWasm, false),
+                () => m.array.get(listBacking(lt, b()), i(), elemWasm, false),
               )),
               m.return(m.i32.const(0)),
             ),
@@ -703,7 +767,7 @@ export const toWasm = async (ast: VLProgramNode) => {
     ], binaryen.i32);
     m.addFunction(
       name,
-      binaryen.createType([at.refType, at.refType]),
+      binaryen.createType([lt.refType, lt.refType]),
       binaryen.i32,
       [binaryen.i32, binaryen.i32],
       body,
@@ -858,10 +922,72 @@ export const toWasm = async (ast: VLProgramNode) => {
     return { at: arrayType(soft), element: soft };
   };
 
+  // Resolve an expression's *list* struct type + (softened) element type, or null
+  // if it isn't a list (a raw i32-array `string`, or a non-array). The list sites
+  // (ArrayLiteral, IndexAccess, `a[i]=v`, `.length`, ForIn, `==`) call this and
+  // fall back to the raw `arrayTypeOf` path only for strings.
+  const listTypeOf = (
+    node: VLProgramNode | VLStatement,
+  ): { lt: ListType; element: VLType } | null => {
+    const objType = objectTypeOf(node);
+    if (!isListType(objType)) return null;
+    const element = arrayElementType(objType);
+    if (!element) return null;
+    const soft = softenImplicitType(element);
+    return { lt: listType(soft), element: soft };
+  };
+
+  // Field reads on a list struct (thunks: binaryen wants fresh trees per use).
+  const listBacking = (lt: ListType, ref: number): number =>
+    m.struct.get(LIST_BACKING, ref, lt.backing.refType, false);
+  const listLen = (ref: number): number =>
+    m.struct.get(LIST_LEN, ref, binaryen.i32, false);
+  const listCap = (ref: number): number =>
+    m.struct.get(LIST_CAP, ref, binaryen.i32, false);
+
+  // A stable per-module suffix for a list type's emitted helper names, keyed on
+  // the list heap type (the `arrayEqFns`-style cache pattern).
+  const listHelperTags = new Map<number, number>();
+  const listHelperTag = (lt: ListType): number => {
+    let t = listHelperTags.get(lt.heapType);
+    if (t === undefined) {
+      t = listHelperTags.size;
+      listHelperTags.set(lt.heapType, t);
+    }
+    return t;
+  };
+
+  // A bounds-checked element read `l[i]` (trap on OOB — collections-design §VL.6):
+  // stash the list ref and index in locals, trap when `(unsigned) i >= len` (which
+  // covers `i < 0` too, since `len >= 0`), else `array.get(backing, i)`. The bound
+  // is `len`, so the spare-capacity slots `[len, cap)` trap like any other OOB.
+  const listGet = (lt: ListType, listExpr: number, indexExpr: number): number => {
+    const elemWasm = toWasmType(lt.element);
+    const lRef = newLocal(lt.refType);
+    const iLocal = newLocal(binaryen.i32);
+    const l = () => m.local.get(lRef, lt.refType);
+    const i = () => m.local.get(iLocal, binaryen.i32);
+    return m.block(null, [
+      m.local.set(lRef, listExpr),
+      m.local.set(iLocal, indexExpr),
+      m.if(m.i32.ge_u(i(), listLen(l())), m.unreachable()),
+      m.array.get(listBacking(lt, l()), i(), elemWasm, false),
+    ], elemWasm);
+  };
+
   // A placeholder value of a captured variable's wasm type, used during the
   // capture-collection pass (whose body is discarded once captures are known).
   const zeroOf = (type: VLType): number => {
     const t = softenImplicitType(type);
+    // A captured list is a null of its (nullable) list-struct ref type.
+    if (isListType(t)) {
+      return m.ref.null(
+        binaryen.getTypeFromHeapType(
+          listType(softenImplicitType(arrayElementType(t)!)).heapType,
+          true,
+        ),
+      );
+    }
     // A captured object is a struct ref; a null of its (nullable) ref type
     // suffices for the discarded pass-1 body.
     if (t.type === "Object" && t.name === undefined) {
@@ -1452,6 +1578,10 @@ export const toWasm = async (ast: VLProgramNode) => {
         // fall through to the normal closure dispatch below.
         const stringMethod = lowerStringMethodCall(stringBuiltinCtx, node);
         if (stringMethod !== null) return stringMethod;
+        // Intrinsic list methods (`l.get`/`l.push`/`l.pop`/`l.clear`) lower to
+        // their per-element wasm helpers; see `compiler/builtins/lists.ts`.
+        const listMethod = lowerListMethodCall(listBuiltinCtx, node);
+        if (listMethod !== null) return listMethod;
         // Calling an arbitrary expression value, e.g. `o.f(args)`. The callee
         // evaluates to a closure struct; dispatch through it.
         const functionType = node.functionType;
@@ -1601,14 +1731,41 @@ export const toWasm = async (ast: VLProgramNode) => {
         return m.struct.new(operands, struct.heapType);
       }
       case "ArrayLiteral": {
-        const info = arrayTypeOf(node);
-        if (!info) throw new Error("Array literal did not resolve to an array");
+        // A `[...]` literal is always a list (anonymous `[i32]:T`): build the
+        // backing via `array.new_fixed`, then wrap it `{ backing, len=N, cap=N }`.
+        // An empty `[]` has no value to pin its element from (its element type is
+        // an empty union), so take the element from the desired type instead
+        // (`let xs: i32[] = []`, a list-typed argument, etc.).
+        let info = node.values.length === 0 ? null : listTypeOf(node);
+        if (!info && desiredType) {
+          let dt = softenImplicitType(desiredType);
+          while (dt.type === "Nullable") dt = softenImplicitType(dt.subType);
+          const dtElem = arrayElementType(dt);
+          if (dtElem) {
+            const soft = softenImplicitType(dtElem);
+            info = { lt: listType(soft), element: soft };
+          }
+        }
+        if (!info) info = listTypeOf(node);
+        if (!info) throw new Error("Array literal did not resolve to a list");
         const values = node.values.map((v) =>
-          withDesiredType(info.element, () => toExpression(v))
+          withDesiredType(info!.element, () => toExpression(v))
         );
-        return m.array.new_fixed(info.at.heapType, values);
+        const backing = m.array.new_fixed(info.lt.backing.heapType, values);
+        const n = m.i32.const(values.length);
+        return m.struct.new([backing, n, m.i32.const(values.length)], info.lt.heapType);
       }
       case "IndexAccess": {
+        // A list `l[i]` is a bounds-checked (trap-on-OOB) read off `backing`; a
+        // raw i32-array (string) keeps the native `array.get` (it traps natively).
+        const list = listTypeOf(node.array);
+        if (list) {
+          return listGet(
+            list.lt,
+            toExpression(node.array),
+            withDesiredType(i32Type, () => toExpression(node.index)),
+          );
+        }
         const info = arrayTypeOf(node.array);
         if (!info) throw new Error("Index access on a non-array");
         return m.array.get(
@@ -1620,7 +1777,19 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "PropertyAccess": {
         const objType = objectTypeOf(node.object);
-        // `array.length` is intrinsic — lower it to `array.len` (no stored field).
+        // List size members are intrinsic struct reads: `.length` → `len`,
+        // `.capacity` → `cap` (both O(1)). A raw i32-array (string) keeps
+        // `.length` → `array.len`.
+        if (isListType(objType)) {
+          const ref = toExpression(node.object);
+          if (node.property === "length") {
+            return m.struct.get(LIST_LEN, ref, binaryen.i32, false);
+          }
+          if (node.property === "capacity") {
+            return m.struct.get(LIST_CAP, ref, binaryen.i32, false);
+          }
+          throw new Error(`List has no member "${node.property}"`);
+        }
         if (arrayElementType(objType)) {
           if (node.property === "length") {
             return m.array.len(toExpression(node.object));
@@ -1759,6 +1928,36 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (op === "=") {
           if (node.left.type === "IndexAccess") {
             const access = node.left;
+            const list = listTypeOf(access.array);
+            if (list) {
+              // `l[i] = v` on a list: bounds-check `i` against `len` (trap on OOB
+              // — the spare `[len, cap)` slots are not addressable), then
+              // `array.set(backing, i, v)`. In value position read back the slot.
+              const wasmType = toWasmType(list.element);
+              const lRef = newLocal(list.lt.refType);
+              const iLocal = newLocal(binaryen.i32);
+              const l = () => m.local.get(lRef, list.lt.refType);
+              const i = () => m.local.get(iLocal, binaryen.i32);
+              const value = withDesiredType(
+                list.element,
+                () => toExpression(node.right),
+              );
+              const body = [
+                m.local.set(lRef, toExpression(access.array)),
+                m.local.set(
+                  iLocal,
+                  withDesiredType(i32Type, () => toExpression(access.index)),
+                ),
+                m.if(m.i32.ge_u(i(), listLen(l())), m.unreachable()),
+                m.array.set(listBacking(list.lt, l()), i(), value),
+              ];
+              return desiredType
+                ? m.block(null, [
+                  ...body,
+                  m.array.get(listBacking(list.lt, l()), i(), wasmType, false),
+                ], wasmType)
+                : m.block(null, body, binaryen.none);
+            }
             const info = arrayTypeOf(access.array);
             if (!info) throw new Error("Index assignment on a non-array");
             const index = withDesiredType(
@@ -1881,9 +2080,10 @@ export const toWasm = async (ast: VLProgramNode) => {
             )?.type;
             rightType = opFunc?.type === "Function"
               ? opFunc.paramaters[0].paramaterType ?? raise("op missing param")
-              // Structural `==`/`!=` has no operator method — the right operand
-              // is just the same object type.
-              : (op === "==" || op === "!=")
+              // Structural `==`/`!=`, and list `==`/`!=`/`+` (concat), have no
+              // operator method — the right operand is just the same list/object
+              // type.
+              : (op === "==" || op === "!=" || (op === "+" && isListType(leftType)))
               ? leftType
               : raise("op not function");
           }
@@ -1904,22 +2104,54 @@ export const toWasm = async (ast: VLProgramNode) => {
             op === "==" ? eq : m.i32.eqz(eq),
           ], binaryen.i32);
         }
-        // Array `==`/`!=`: length + element compare via a per-element-type
-        // helper (recurses through `valueEq`). Must precede the structural-struct
-        // branch below, which would otherwise treat the array as a struct.
-        if (
-          leftType.type === "Object" && leftType.name === undefined &&
-          (op === "==" || op === "!=")
-        ) {
-          const element = arrayElementType(leftType);
-          if (element) {
-            const eq = m.call(
-              arrayEqFn(element),
-              [toExpression(node.left), toExpression(node.right)],
-              binaryen.i32,
-            );
-            return op === "==" ? eq : m.i32.eqz(eq);
-          }
+        // List `==`/`!=`: length + element compare via a per-element-type helper
+        // (recurses through `valueEq`). `isListType` excludes `string` (handled
+        // below by name). Must precede the structural-struct branch, which would
+        // otherwise treat the list struct as a plain data struct.
+        if (isListType(leftType) && (op === "==" || op === "!=")) {
+          const element = arrayElementType(leftType)!;
+          const eq = m.call(
+            listEqFn(element),
+            [toExpression(node.left), toExpression(node.right)],
+            binaryen.i32,
+          );
+          return op === "==" ? eq : m.i32.eqz(eq);
+        }
+        // List concat `a + b` → a *new* `T[]` (collections-design §VL.4): size
+        // one backing exactly `lenA + lenB`, then two bulk `array.copy`s (a at
+        // offset 0, b at offset lenA) — no incremental-growth churn — and wrap it
+        // `{ backing, len = cap = lenA + lenB }`. Must precede the string branch.
+        if (isListType(leftType) && op === "+") {
+          const lt = listType(softenImplicitType(arrayElementType(leftType)!));
+          const aLocal = newLocal(lt.refType);
+          const bLocal = newLocal(lt.refType);
+          const outLocal = newLocal(lt.backing.refType);
+          const nLocal = newLocal(binaryen.i32);
+          const a = () => m.local.get(aLocal, lt.refType);
+          const b = () => m.local.get(bLocal, lt.refType);
+          const out = () => m.local.get(outLocal, lt.backing.refType);
+          const n = () => m.local.get(nLocal, binaryen.i32);
+          return m.block(null, [
+            m.local.set(aLocal, toExpression(node.left)),
+            m.local.set(bLocal, toExpression(node.right)),
+            m.local.set(nLocal, m.i32.add(listLen(a()), listLen(b()))),
+            m.local.set(outLocal, m.array.new_default(lt.backing.heapType, n())),
+            m.array.copy(
+              out(),
+              m.i32.const(0),
+              listBacking(lt, a()),
+              m.i32.const(0),
+              listLen(a()),
+            ),
+            m.array.copy(
+              out(),
+              listLen(a()),
+              listBacking(lt, b()),
+              m.i32.const(0),
+              listLen(b()),
+            ),
+            m.struct.new([out(), n(), n()], lt.heapType),
+          ], lt.refType);
         }
         // String operators (strings are WasmGC i32-arrays of char codes):
         // `==`/`!=` element-compare via the `__string_eq__` helper; `+`
@@ -2221,6 +2453,40 @@ export const toWasm = async (ast: VLProgramNode) => {
         const brk = brkLabel(cont);
         loopLabels.push(cont);
 
+        // A list iterates `[0, len)` over its `backing` (load `backing` once,
+        // hoisted before the loop); a raw i32-array (string) over `array.len`.
+        const list = listTypeOf(node.iterable);
+        if (list) {
+          const elemWasm = toWasmType(list.element);
+          const listLocal = newLocal(list.lt.refType);
+          const backLocal = newLocal(list.lt.backing.refType);
+          const lenLocal = newLocal(binaryen.i32);
+          const iLocal = newLocal(binaryen.i32);
+          const varLocal = newLocal(elemWasm);
+          currentScope[node.variable] = [list.element, varLocal];
+          const lref = () => m.local.get(listLocal, list.lt.refType);
+          const back = () => m.local.get(backLocal, list.lt.backing.refType);
+          const i = () => m.local.get(iLocal, binaryen.i32);
+          const loop = m.block(brk, [
+            m.local.set(listLocal, toExpression(node.iterable)),
+            m.local.set(lenLocal, listLen(lref())),
+            m.local.set(backLocal, listBacking(list.lt, lref())),
+            m.local.set(iLocal, m.i32.const(0)),
+            m.loop(
+              loopLabel,
+              m.block(null, [
+                m.br(brk, m.i32.ge_s(i(), m.local.get(lenLocal, binaryen.i32))),
+                m.local.set(varLocal, m.array.get(back(), i(), elemWasm, false)),
+                m.block(cont, [toExpression(node.statement)]),
+                m.local.set(iLocal, m.i32.add(i(), m.i32.const(1))),
+                m.br(loopLabel),
+              ]),
+            ),
+          ]);
+          loopLabels.pop();
+          return loop;
+        }
+
         const info = arrayTypeOf(node.iterable);
         if (!info) throw new Error("for…in over a non-array");
         const elemWasm = toWasmType(info.element);
@@ -2276,6 +2542,11 @@ export const toWasm = async (ast: VLProgramNode) => {
     let t = softenImplicitType(node);
     while (t.type === "Infer") t = softenImplicitType(t.subType);
     if (t.type === "Function") return closureStruct().heapType;
+    // A list (`T[] | null`, and the `.get`/`pop` nullable payload) is the list
+    // struct heap type; a named array (string) stays the raw array heap type.
+    if (isListType(t)) {
+      return listType(softenImplicitType(arrayElementType(t)!)).heapType;
+    }
     if (t.type === "Object") {
       const element = arrayElementType(t);
       if (element) return arrayType(element).heapType;
@@ -2335,10 +2606,16 @@ export const toWasm = async (ast: VLProgramNode) => {
       if (nullSentinel(t.subType) !== null) return binaryen.i32;
       return binaryen.getTypeFromHeapType(refHeapType(t.subType), true);
     }
+    // A list (`T[]`, anonymous `[i32]:T`) is the `{backing,len,cap}` struct rep.
+    // THE central switch: this flips the wasm type of every `T[]` value. A named
+    // `[i32]:T` object (`string`) stays a raw WasmGC array below.
+    if (isListType(t)) {
+      return listType(softenImplicitType(arrayElementType(t)!)).refType;
+    }
     if (t.type === "Object") {
-      // An `i32`-index-sig object is a WasmGC array — this covers `[i32]`-arrays
-      // and `string` (an i32-array of char codes). A *structural* object (no
-      // builtin `name`) without an index sig is a WasmGC struct.
+      // An `i32`-index-sig object is a WasmGC array — this covers `string` (an
+      // i32-array of char codes). A *structural* object (no builtin `name`)
+      // without an index sig is a WasmGC struct.
       const element = arrayElementType(t);
       if (element) return arrayType(element).refType;
       if (t.name === undefined) return objectStruct(t).refType;
@@ -2630,6 +2907,31 @@ export const toWasm = async (ast: VLProgramNode) => {
     // literal `5` has type `IntegerLiteral`, which `boxPayload` can't classify).
     return boxUnion(info, tag, findVariant(info, nt) ?? null, value);
   };
+  // Build a `null` value in the representation of nullable `nullableType`
+  // (`T | null`): a boxed-union null tag, or a `ref.null` for a niche nullable
+  // reference (so `T[].get`/`pop` can yield absence in the union return rep).
+  const nullableNull = (nullableType: VLType): number => {
+    const info = unionInfo(nullableType);
+    if (info) return boxUnion(info, info.nullTag, null, null);
+    // A sentinel-encoded scalar nullable (`boolean | null`) is an i32 whose
+    // `null` is the out-of-range sentinel — not a ref. Mirror the NullLiteral
+    // lowering before falling through to the niche-`ref.null` path.
+    const sentinel = nullSentinel(nonNullable(nullableType));
+    if (sentinel !== null) return m.i32.const(sentinel);
+    // `ref.null` takes a nullable ref *type* (not a bare heap type).
+    return m.ref.null(
+      binaryen.getTypeFromHeapType(refHeapType(nonNullable(nullableType)), true),
+    );
+  };
+  // Build a *present* value of nullable `nullableType` from a non-null `value`
+  // of element type `element`: box it into the union (scalar element), or pass
+  // the reference through (niche nullable ref).
+  const nullableSome = (
+    nullableType: VLType,
+    element: VLType,
+    value: number,
+  ): number => coerceToUnion(value, element, nullableType);
+
   const coerceUnion = (
     value: number,
     node: VLProgramNode | VLStatement,
@@ -2660,6 +2962,24 @@ export const toWasm = async (ast: VLProgramNode) => {
     codegenType,
     withDesiredType,
     toExpression,
+  };
+
+  // Context handed to the extracted list-method codegen (compiler/builtins).
+  const listBuiltinCtx: ListBuiltinContext = {
+    m,
+    binaryen,
+    i32Type,
+    listTypeOf,
+    toWasmType,
+    helpers: _helpers,
+    toExpression,
+    withDesiredType,
+    listBacking,
+    listLen,
+    listCap,
+    nullableNull,
+    nullableSome,
+    tagOf: listHelperTag,
   };
 
   // console.log(inspect(logSimplified(ast), { depth: Infinity }));

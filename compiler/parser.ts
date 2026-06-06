@@ -26,6 +26,8 @@ import {
   instantiateAlias,
   instantiateFunctionType,
   intersectType,
+  isListType,
+  listMemberType,
   makeExact,
   nonNullable,
   postGuardNarrowings,
@@ -882,6 +884,29 @@ export const parseProgram = (
         ) as VLFunctionType,
       };
       return record(node, ctx);
+    }
+
+    // 1b. Intrinsic list method (`l.get(i)`, `l.push(x)`, …): a `T[]` is an
+    // anonymous structural type, so these aren't scope/field methods — resolve
+    // their type here (`listMemberType`) and emit a `Call` toWasm lowers by name.
+    if (isListType(shape)) {
+      const member = listMemberType(arrayElementType(shape)!)[property];
+      if (member?.type === "Function") {
+        const node: VLCallNode = {
+          type: "Call",
+          callee: record(
+            { type: "PropertyAccess", object, property } as const,
+            between(objCtx, spanOf(id)),
+          ),
+          arguments: args,
+          functionType: instantiateFunctionType(
+            member,
+            args,
+            ctx,
+          ) as VLFunctionType,
+        };
+        return record(node, ctx);
+      }
     }
 
     // 2. UFCS method: a free `self`-function. `o.f(args)` → `f(o, args)`.
