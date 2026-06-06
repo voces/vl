@@ -277,8 +277,19 @@ import { distance as dist } from "./geometry"        // rename (in v1)
   without a prelude and a user may still define their own `List`. Every *named*
   library value (`print`/a real `std:fmt`, math helpers, …) is an **explicit
   `import` from `std:`** — keeping each module's namespace clean and shadow-free.
-  (A single *shadowable* convenience name could be reintroduced later if
-  scripting-feel demands; the lean is explicit.)
+- **No *default* prelude, but a *configurable* one — with a built-in test prelude.**
+  The point above is specifically about the *default*: normal code imports its
+  named values explicitly. But preludes shouldn't be all-or-nothing — make them
+  **configurable per file-set** (à la tsconfig `types`/`lib`): declare which
+  modules are ambient for "all files", "test files", or a glob; default empty.
+  The first concrete consumer is a **test prelude** — `*test*` files auto-get
+  `std:testing` (`assert`/`it`/`describe`) ambient, exactly like Jest/Vitest
+  globals (`vitest globals: true`), since *every* test uses them and the boilerplate
+  is pure noise; normal code stays explicit. Constraints: a local definition still
+  **shadows** a prelude name (B16); the **LSP must know the active prelude per file**
+  (completion/hover/"unresolved name" all depend on it); and the prelude is **data**
+  (config), not hardcoded, so it composes with the resolver. (A custom non-test
+  prelude is the same mechanism; the lean stays "empty by default, opt in".)
 
 **Interaction with the current `compile()` entry.** Today `compile(source: string)`
 is single-input. The proposal makes it **graph-aware** without changing the *shape*
