@@ -60,8 +60,11 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ⬜ **A8. Exact / Inexact variance.** Params Inexact by default (accept excess properties), values
   Exact. Guards the `a.foo = b` width footgun. (TODO.md)
 - ⬜ **A9. Readable / Writable variance.** Applied automatically during parameter inference. (TODO.md)
-- ⬜ **A10. Parametric types / generics** (`function foo<T>(x: T)`). Hard (Elixir defers it). Needed
-  for real collections → the main remaining gap for self-hosting (Track H/H2).
+- 🟡 **A10. Parametric types / generics** (`function foo<T>(x: T)`). Stage 1 (explicit function type
+  params) + Stage 2 (generics over array element type — `first<T>(xs: T[]): T`, read-side: index,
+  `.length`, `for x in xs`, passthrough; `tests/cases/generics/`) done. REMAINING: build-side array
+  generics (`map`/`filter` constructing a new array of inferred element type) — needs growable lists
+  (B6 tier-2) or fixed-size construction; generic `type` decls / generic structs.
 - 🟢 **A11. Recursive structural types.** Done — `type Tree = { value, left: Tree | null, … }`
   constructs/traverses/compiles (cycle-safe traversals + a self-referential WasmGC struct rec-group;
   `types/recursive-tree.vl`). REMAINING: mutual recursion across *separate* `type` decls; recursion

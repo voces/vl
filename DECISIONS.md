@@ -57,6 +57,17 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
 - **Maps are a separate hash type, not every-object-as-table.** Three representations under one
   `[]`/`.field` surface: static-string-key structs (fastest), `i32`-key arrays (native, contiguous),
   arbitrary-key maps (hashed, heap) — you pay hashing only when you use a `Map`. (B6a)
+- **Generic array inference unifies index-signature VALUE types, not just keys.** An array `T[]` is the
+  structural object `{[i32]: T}`. At a call, the Object-case unification in `ensureType` matched
+  literal-named props and only checked index-sig *keys* for excess-prop coverage — the value type was
+  never unified, so a generic element hole (`T`) never got pinned and `first([1,2,3])` left `T`
+  unresolved (codegen saw `Unknown`). Fix: when both sides carry a compatible index-sig key, recurse
+  `ensureType` on the value types too, so `T` flows from the argument's element type and monomorphizes
+  per call. Scoped to read-side array generics (index/`.length`/`for x in xs`/passthrough); building a
+  new array of inferred element type (`map`/`filter`) is deferred to growable lists (B6 tier-2). The
+  recursion is skipped for an empty right value union (`[]`) so an empty literal leaves the hole open
+  rather than pinning it to `never`; permissive object width-subtyping is untouched (non-array objects
+  have no matching `i32` index sig on the right). (A10 stage 2)
 
 ## Parser, distribution & bootstrapping
 
