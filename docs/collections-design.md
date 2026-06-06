@@ -411,6 +411,275 @@ here** — this is the plan the design commits to.
 6. **`map`/`filter` result type.** Should producers return a `List<U>` (proposed)
    or a fixed array? Returning a list keeps the chain growable and composable.
 
+---
+
+## Language vs standard library, primitive surface, and syntax
+
+The sections above settle the *representation* of the list (the `{backing, len,
+cap}` struct, 2× growth, monomorphized-not-boxed elements). This section answers a
+deeper set of questions the owner raised: **where** `List` should live (baked into
+the language vs. written in VL over a small intrinsic surface), **what primitive**
+the compiler would have to expose for `List` to be written in VL at all, whether
+`print` belongs in the same bucket, and **what syntax** a growable list should get.
+These are forward-looking; nothing here is decided (no `DECISIONS.md` entry yet).
+
+The throughline is VL's **self-hosting goal** (ROADMAP Track H — H2 "make VL
+expressive enough to write a compiler", H3 "port the compiler to VL"). Every
+collection type or builtin that lives *inside the compiler as privileged machinery*
+is something the VL-in-VL compiler must re-implement and re-harden from scratch.
+The cheapest path to H3 keeps the **language core small** and pushes everything that
+*can* be ordinary VL into ordinary VL — on top of a thin, well-defined intrinsic
+floor.
+
+### LS.1 — Language-built-in vs standard-library: the cross-language pattern
+
+Where does the growable sequence live in mainstream languages — is it part of the
+*language* (special syntax, magic compiler functions, privileged types) or part of
+a *standard library* (an ordinary type written in the language over lower-level
+primitives)?
+
+| Language | Lives in | Built over | Compiler-privileged? |
+|---|---|---|---|
+| **Rust `Vec<T>`** | std library — the `alloc` crate | `RawVec<T, A>` → the `Allocator` trait (`Global`) | No. Ordinary generic struct; `vec!` is a macro, not a keyword |
+| **C++ `std::vector`** | std library (`<vector>`) | `operator new[]` / an `Allocator` | No. A class template; the language knows nothing about it |
+| **Java `ArrayList`** | std library (`java.util`) | `Object[]` + `System.arraycopy` | No. Plain class; type-erased generics force boxing |
+| **Swift `Array`** | std library (`Swift` module) | a managed class buffer; the `Builtin` module | **Partly** — COW uniqueness (`isKnownUniquelyReferenced` → `Builtin.isUnique`) and buffer intrinsics are compiler-provided, but `Array` itself is `.swift` source |
+| **Python `list`** | core runtime builtin | C `PyObject**` over `PyMem` (`Objects/listobject.c`) | **Yes** — a built-in type compiled into the interpreter |
+| **Go slices** | **the language itself** | a compiler-known header + magic `make`/`append`/`copy` builtins | **Yes** — `[]T`, `make`, `append`, `copy` are spec-level language features, not a package |
+| **JS arrays** | engine builtin | engine-internal backing stores (V8 elements kinds) | **Yes** — `Array` is provided by the runtime, `[...]` is syntax |
+
+**The pattern: stdlib-over-primitives is dominant; Go is the outlier.** The
+systems languages that *can* express their own collection (Rust, C++, Swift, and to
+a large degree Java) write the growable sequence as an ordinary library type over a
+small allocation/raw-buffer primitive — the compiler does not know it is special.
+The ones that bake it into the language/runtime (Go, Python, JS) do so for reasons
+VL does not share: Go deliberately froze its language tiny and *had no generics* for
+a decade, so `make`/`append`/`copy` were the only way to offer a typed growable
+sequence; Python and JS ship a single privileged dynamic type because the whole
+runtime is the "standard library".
+
+**Recommendation for VL: a `.vl` standard-library `List<T>` over a minimal
+intrinsic surface — the Rust/C++/Swift model, not the Go model.** The decisive
+argument is self-hosting. A Go-style compiler-privileged `List` (a magic header
+type plus magic `push`/`grow` builtins hardcoded in `toWasm.ts`) is machinery the
+VL-in-VL compiler (H3) must re-implement and re-harden. A `List<T>` written in
+`.vl` is, by construction, just VL code the self-hosted compiler already compiles —
+it ports *for free*. It also keeps `List` honest: if `List<T>` can be expressed in
+ordinary VL, then VL is demonstrably expressive enough to write its own collections
+(an explicit H2 capability bar), and any user can write `RingBuffer`, `Deque`, or
+`SmallVec` the same way without compiler changes. The cost — VL `List` cannot reach
+*below* what the intrinsic floor exposes — is exactly what §LS.2 sizes, and it turns
+out to be one primitive.
+
+(Note this does **not** contradict §VL.3's "monomorphize per element type". A `.vl`
+generic `List<T>` is monomorphized by the *existing* A10 machinery exactly like any
+other VL generic — "stdlib type" and "monomorphized" are orthogonal. The struct
+layout of §VL.1 is then just the layout the VL source compiles to, not a privileged
+compiler-internal type.)
+
+### LS.2 — Primitive surface: can `List` be written in pure VL today?
+
+Take the §VL.1 design — `struct { backing: T[]; len: i32; cap: i32 }` with
+grow-by-allocate-a-bigger-array-and-copy — and check each thing it needs against
+what VL exposes *today*:
+
+| `List` needs | VL has it? |
+|---|---|
+| A struct with mutable fields holding `backing`/`len`/`cap` | ✅ objects with mutable fields |
+| `backing[i]` read / `backing[i] = v` write on the slots | ✅ `a[i]` → `array.get`, `a[i] = v` → `array.set` |
+| The slot count of `backing` | ✅ `.length` → `array.len` |
+| Generic over `T`, one concrete layout per element type | ✅ A10 monomorphization + per-element interned array type |
+| `self`-methods (`push`/`pop`/`map`/`filter`) and `[]`/`[]=` traps on the wrapper | ✅ B14 self-methods, B13 index traps |
+| Copy `len` live elements from old backing into a new bigger backing | ✅ expressible as a VL `for` loop over `[0, len)` (binaryen lowers to `array.copy` or leaves the loop; either is fine) |
+| **Allocate a `T[]` of a length known only at runtime** (`new_cap = cap * 2`) | ❌ **missing** |
+
+Everything is already there **except one primitive**: today a `T[]` can only be
+born from a **compile-time-sized literal** (`[a, b, c]` → `array.new_fixed`, whose
+length is the operand count). There is no VL-surface way to say "allocate a `T[]`
+of runtime length `n`". `List` growth fundamentally needs that — `cap * 2` is not a
+compile-time constant.
+
+**The one missing primitive: dynamic-length array allocation.** WasmGC already has
+the instruction (`array.new <T>` — allocate length `n`, every slot initialized to a
+given value; and `array.new_default <T>` — length `n`, slots default/zeroed). The
+compiler *already emits `array.new` + `array.copy` internally* for string concat
+(`toWasm.ts`), so the backend capability exists and is proven; it is simply not
+reachable from VL source. The fix is to expose it as a **low-level intrinsic in the
+same class as `__store_i32__` / `__load_i32__`** — a `defaultScope` entry the std
+`List` calls, lowered by name in `toWasm.ts`, *not* a new language keyword.
+
+Proposed shape (a sketch for the follow-up PR, not a committed signature):
+
+```
+// allocate a backing array of `length` slots, each set to `fill`
+__array_new__<T>(length: i32, fill: T): T[]          // → array.new
+// allocate `length` zero/default-initialized slots
+__array_new_default__<T>(length: i32): T[]           // → array.new_default
+```
+
+`__array_new__` is the minimum (it covers both: pass a zero/sentinel `fill`).
+`__array_new_default__` is a cheap convenience that maps to the dedicated
+default-init instruction and avoids materializing a fill value. Both are generic
+over the element type and monomorphize through the existing per-element array
+interner — i.e. they are the *runtime-length* siblings of the array literal, lowered
+to the WasmGC instruction the backend already uses internally. With this single
+addition, the entire §VL.1–VL.6 `List` is writable as a `.vl` module: the struct,
+the 2× grow (`__array_new_default__(cap * 2)` + copy + swap `backing`), `push`/`pop`,
+the `[]`/`[]=` traps bounded by `len`, `.length`/`.capacity`, `map`/`filter`.
+
+**Secondary perf knobs that *might* later want intrinsics — but are not required for
+v1:**
+- **Eliding redundant bounds checks.** Every `backing[i]` inside `List` re-checks
+  `i` against `array.len`, even though `push`/`pop` have already proven `i < cap`.
+  Mature vector implementations use an *unchecked* index in their internal hot path
+  (Rust's `get_unchecked`). VL could later expose an unchecked-index intrinsic for
+  std internals — but binaryen may already hoist/fold many of these, so this is a
+  profile-driven optimization, not a correctness or v1 need.
+- **Zeroed vs. uninitialized backing.** `array.new_default` zeroes the spare
+  `[len, cap)` slots; a list never reads them before writing, so the zeroing is
+  pure overhead at grow time. WasmGC has no "uninitialized array" instruction (the
+  GC requires every slot well-typed), so this knob does not exist at the Wasm level
+  today — noted only to record that it is *not* available to chase.
+
+**Conclusion: no compiler-intrinsic `List` is needed.** Expose dynamic-length array
+allocation as a thin intrinsic and write `List` in VL. This is strictly smaller
+than baking a privileged `List` into the compiler, and it directly advances H2/H3.
+
+### LS.3 — `print` (and friends) under the same lens
+
+`print` is instructive because it is the *only* general-purpose builtin VL has
+today that is **not** a one-to-one host import. Its `defaultScope` entry accepts any
+type, and `toWasm.ts` **dispatches on the argument's wasm/VL type** to a *per-type*
+host sink that already exists as a plain intrinsic: `__print_i32__`, `__print_i64__`,
+`__print_f32__`, `__print_f64__`, `__print_bool__`, and the string path
+(`__print_string__` streaming char codes). So `print` is "a compiler builtin"
+**only** because the *type-dispatch* lives in `toWasm.ts` — the actual sinks are
+already the thin-intrinsic layer.
+
+That means `print` fits the exact same "thin intrinsics + std VL" pattern as
+`List`: the per-type `__print_*__` sinks stay intrinsics (they must — they are the
+host boundary), and the *dispatcher* `print(value)` **could** be ordinary VL — a set
+of overloaded/`self`-method `print` functions, one per printable type, each calling
+its `__print_T__` sink, resolved by the normal type machinery instead of a hardcoded
+`if (node.function === "print")` branch in codegen. The same applies to any future
+`println`/`debug`/`assert`-style helper.
+
+**Is it worth doing?** Tie it to self-hosting, and treat it as **low priority.**
+Moving `print` to std VL removes one special-case from the codegen the H3 port must
+reproduce, and it makes "how do I add a printable type" a library change rather than
+a compiler change — both nice. But unlike `List`, `print` needs **no new
+primitive** (the `__print_*__` sinks already exist), so there is no *blocking*
+reason to do it now, and the current single dispatch branch is small. Recommended
+posture: migrate `print` to a std VL dispatcher **opportunistically, as part of the
+H3 port** (when the std module exists anyway), not as standalone work.
+
+### LS.4 — Syntax: the fork
+
+VL inherited the **MVP convention that `[...]` is a *fixed-length* array literal**
+(`array.new_fixed`, length = element count). The §VL.4 surface deliberately keeps it
+that way and spells the growable list `List(...)` / `List<T>()` so the fixed-array
+MVP stays unambiguous. But that is the opposite of what most *scripting* languages —
+the family VL is aiming its "scripting feel" at — do:
+
+- **`[...]` is the growable list** in Python, JavaScript, Ruby, and Swift; the
+  *fixed*-size array is the niche case with a distinct, heavier spelling: Rust
+  `[T; N]`, Go `[N]T`, C `T[N]`, Swift's fixed buffers. In those languages the
+  common, reach-for-it-by-default literal grows.
+- VL today is the inverse: the ergonomic `[...]` is the *fixed* case and the
+  growable case carries the call-like `List(...)` spelling.
+
+For a language whose pitch is "scripting feel with hidden types," the growable list
+is almost certainly the *common* case, and forcing it into the heavier spelling
+fights that pitch. Two paths:
+
+**(a) Keep `[...]` fixed; growable via `List(...)` / `List<T>()`.** (The current
+doc recommendation — §VL.4.)
+- *Pros:* least disruptive — fixed arrays (and the whole B6 MVP, samples, tests)
+  keep their exact meaning; the two collection kinds stay visually distinct; no
+  parser changes; the list ships as pure addition. Easy to do *first*.
+- *Cons:* the common case (a growable list) gets the less-ergonomic spelling; VL
+  reads less like the scripting languages it resembles; if VL later wants `[...]`
+  to mean "list", that is a **breaking** re-interpretation of every existing
+  literal.
+
+**(b) Make `[...]` the growable `List`; give fixed arrays a distinct spelling.**
+(The scripting-feel end-state.)
+- *Pros:* matches Python/JS/Swift intuition — the default literal grows, which is
+  what most code wants; best fit for VL's scripting-feel goal; fixed arrays become
+  the deliberate, annotated choice (as they are in Rust/Go), which is the right
+  default-vs-opt-in split for a high-level language.
+- *Cons:* a **big, hard-to-reverse** change. It needs a new spelling for fixed
+  arrays (e.g. `[T; N]`-style, or a typed `Array<T, N>` / sigil), it changes the
+  meaning of every existing `[...]` (migration of samples/tests/corpus), and it
+  couples list construction to literal syntax (inference of the element type from a
+  possibly-empty `[]` literal, etc.). It also wants the §LS.2 dynamic-alloc
+  primitive in place first so an `[...]` literal can lower to a `List`.
+
+**Posture: (a) as the first cut, (b) as the candidate end-state — owner decides.**
+Ship the additive `List(...)` spelling first (it unblocks `map`/`filter`,
+self-hosting collections, and everything downstream without touching existing
+syntax), and treat "make `[...]` grow" as a deliberate, separately-decided language
+direction once the std `List` exists and has proven out. **Open question** — do not
+pre-commit the literal syntax now; reversing path (b) after the corpus depends on it
+is expensive.
+
+### LS.5 — Recommendation summary
+
+- **Lang vs std:** write **`List<T>` as a `.vl` standard-library module**, not a
+  compiler-privileged type (the Rust/C++/Swift pattern; Go is the outlier). It
+  ports for free under self-hosting and proves VL can express its own collections.
+- **Primitive surface:** the *only* thing blocking a pure-VL `List` is
+  **dynamic-length array allocation**. Expose it as a thin intrinsic
+  (`__array_new__` / `__array_new_default__`, same class as `__store_i32__`),
+  lowering to the `array.new` / `array.new_default` the backend already uses
+  internally. No compiler-intrinsic `List` needed. Unchecked-index and
+  uninitialized-backing are *possible later* perf knobs, not v1 needs.
+- **`print`:** already thin-intrinsics underneath (`__print_T__` sinks); the
+  *dispatcher* could become std VL too, but it needs no new primitive — migrate it
+  **opportunistically during the H3 port**, low priority.
+- **Syntax:** ship `List(...)` first (path a, additive); consider making `[...]`
+  the growable list later (path b, scripting-feel end-state) — left open.
+
+### LS.6 — Updated sequencing note
+
+This refines the §"Phased implementation outline" ordering with the
+language/std/primitive lens. The first *new building block* is the primitive, not
+the type:
+
+1. **Expose the dynamic-array-allocation intrinsic** (`__array_new__` /
+   `__array_new_default__`) — a small, self-contained addition to `defaultScope`
+   (signature) + `toWasm.ts` (lower to `array.new` / `array.new_default`, reusing
+   the existing per-element array interner). This is the floor everything else
+   stands on, and it is independently testable.
+2. **Write `List<T>` as a `.vl` std module** over that intrinsic (the §VL.1–VL.6
+   design, now expressed in VL rather than baked into codegen). This is the H2
+   capability demonstration.
+3. **Then `Map<K, V>`** (B6a) over the same intrinsic floor (its backing buckets
+   are dynamic-length arrays too) — likewise a `.vl` std module.
+
+This re-frames the prior outline's "type & checker / WasmGC types / codegen" steps:
+with `List` living in VL, most of that collapses into "compile an ordinary VL
+generic," and the genuinely new compiler work shrinks to **step 1** (plus whatever
+std-module *loading* mechanism step 2 needs — see open questions).
+
+### LS.7 — Open questions (still open)
+
+1. **Literal syntax — path (a) vs (b).** Keep `[...]` fixed with `List(...)` for
+   growable (a), or eventually make `[...]` the growable list with a distinct
+   fixed-array spelling (b)? (Reversing (b) later is expensive; decide before the
+   corpus leans on it.)
+2. **Migrate `print` to std VL?** Move the `print` type-dispatcher out of codegen
+   into a std VL dispatcher over the existing `__print_T__` sinks — worth the churn,
+   or leave it as the one codegen special-case until the H3 port?
+3. **Std-library module layout — where does `.vl` std live, and how is it loaded?**
+   Writing `List`/`Map` in `.vl` presupposes a place for std modules and a way for
+   user programs to pull them in (an implicit prelude that is always in scope? an
+   `import`/module system? a bundled-and-embedded std the compiler links
+   automatically?). VL has **no module system today**; the std-`List` direction
+   forces this question, and its answer also gates §LS.3's std-`print` and any
+   future `.vl` std growth. This is the largest unresolved dependency behind the
+   whole "std over intrinsics" recommendation.
+
 ## Sources
 
 - Rust `Vec` — growth & no-shrink / `RawVec`:
@@ -438,3 +707,24 @@ here** — this is the plan the design commits to.
   [V8 blog: WasmGC porting](https://v8.dev/blog/wasm-gc-porting),
   [Chrome: WasmGC by default](https://developer.chrome.com/blog/wasmgc),
   [dart2wasm WasmArray discussion](https://github.com/dart-lang/sdk/issues/54961).
+
+Lang-vs-std & primitive surface (§LS.1–LS.4):
+
+- Rust `Vec` is a std-library type over `RawVec` + the `Allocator` trait (not a
+  language builtin):
+  [`alloc::vec`](https://doc.rust-lang.org/alloc/vec/),
+  [`Vec` source](https://github.com/rust-lang/rust/blob/main/library/alloc/src/vec/mod.rs),
+  [`RawVec`](https://stdrs.dev/nightly/x86_64-pc-windows-gnu/alloc/raw_vec/struct.RawVec.html).
+- Go makes the growable sequence a **language** feature — `make`/`append`/`copy`
+  are spec-level builtins, not a package:
+  [Go `builtin` package](https://pkg.go.dev/builtin),
+  [Go blog: Slices](https://go.dev/blog/slices-intro).
+- Swift `Array` is `.swift` stdlib source but COW uniqueness/buffer ops are
+  compiler-provided (`Builtin.isUnique`):
+  [`swiftlang/swift` `Array.swift`](https://github.com/swiftlang/swift/blob/main/stdlib/public/core/Array.swift),
+  [COW internals](https://blog.jacobstechtavern.com/p/copy-on-write-swift-internals).
+- Python `list` is a core runtime builtin implemented in C:
+  [CPython `Objects/listobject.c`](https://github.com/python/cpython/blob/main/Objects/listobject.c).
+- WasmGC array construction instructions (`array.new` runtime-length + fill,
+  `array.new_default` default-init, `array.new_fixed` compile-time operands):
+  [WebAssembly/gc MVP](https://github.com/WebAssembly/gc/blob/main/proposals/gc/MVP.md).
