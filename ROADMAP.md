@@ -55,8 +55,8 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   if f is null` narrows x) — needs binding tracking + invalidation (a lightweight borrow). Stage B
   also subsumes per-call tight return types (the forward direction of the same correlation).
 - 🟡 **A7. Real `string` type.** Done (core): a proper Object (`{[i32]: i32}` index sig → i32-array of
-  char codes, `.length`/`s[i]`/`+`/`==`). REMAINING: richer methods (slice, indexOf); `boolean`-where-
-  `i32`-expected coercion. (UTF-16 backing is B7.)
+  char codes, `.length`/`s[i]`/`+`/`==`/`slice`/`indexOf`/`includes`/`charCodeAt`). REMAINING:
+  `boolean`-where-`i32`-expected coercion. (UTF-16 backing is B7.)
 - ⬜ **A8. Exact / Inexact variance.** Params Inexact by default (accept excess properties), values
   Exact. Guards the `a.foo = b` width footgun. (TODO.md)
 - ⬜ **A9. Readable / Writable variance.** Applied automatically during parameter inference. (TODO.md)

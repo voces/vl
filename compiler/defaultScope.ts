@@ -177,6 +177,77 @@ export const defaultScope = () => {
             return: { type: "Alias", name: "boolean" },
           },
         },
+        // Richer string methods (ROADMAP A7). Declared as function-typed
+        // properties so member-call dispatch resolves them through the normal
+        // object machinery; toWasm lowers each by name. A `string` argument
+        // validates nominally (another string or a string literal).
+        {
+          name: { type: "StringLiteral", value: "slice" },
+          type: {
+            type: "Function",
+            paramaters: [
+              {
+                type: "Parameter",
+                name: "start",
+                paramaterType: { type: "Alias", name: "i32" },
+              },
+              {
+                type: "Parameter",
+                name: "end",
+                paramaterType: { type: "Alias", name: "i32" },
+              },
+            ],
+            return: { type: "Alias", name: "string" },
+          },
+        },
+        {
+          name: { type: "StringLiteral", value: "indexOf" },
+          type: {
+            type: "Function",
+            paramaters: [{
+              type: "Parameter",
+              name: "sub",
+              paramaterType: {
+                type: "Custom",
+                validate: namedFunc("string", (right: VLType) =>
+                  right === scope.string || isNominal(right, "string") ||
+                  right.type === "StringLiteral"),
+                name: "string",
+              },
+            }],
+            return: { type: "Alias", name: "i32" },
+          },
+        },
+        {
+          name: { type: "StringLiteral", value: "includes" },
+          type: {
+            type: "Function",
+            paramaters: [{
+              type: "Parameter",
+              name: "sub",
+              paramaterType: {
+                type: "Custom",
+                validate: namedFunc("string", (right: VLType) =>
+                  right === scope.string || isNominal(right, "string") ||
+                  right.type === "StringLiteral"),
+                name: "string",
+              },
+            }],
+            return: { type: "Alias", name: "boolean" },
+          },
+        },
+        {
+          name: { type: "StringLiteral", value: "charCodeAt" },
+          type: {
+            type: "Function",
+            paramaters: [{
+              type: "Parameter",
+              name: "index",
+              paramaterType: { type: "Alias", name: "i32" },
+            }],
+            return: { type: "Alias", name: "i32" },
+          },
+        },
       ],
     },
     boolean: {
