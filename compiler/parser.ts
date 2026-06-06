@@ -29,8 +29,12 @@ import {
   isListType,
   listMemberType,
   makeExact,
+  mapKeyValueType,
+  mapMemberType,
   nonNullable,
   postGuardNarrowings,
+  setElementType,
+  setMemberType,
   softenImplicitType,
   thenNarrowings,
   typeFromExpression,
@@ -914,6 +918,57 @@ export const parseProgram = (
         };
         return record(node, ctx);
       }
+    }
+
+    // 1c. Intrinsic map/set method (`m.set`/`m.get`/`m.has`/…, `s.add`/`s.has`/…).
+    // A `Map<K,V>` / `Set<T>` is an anonymous structural `{[K]:V}`, so its methods
+    // aren't scope/field methods — resolve their type here. Crucially, a method
+    // *call* on a map/set must resolve to a real intrinsic method: it must NOT be
+    // swallowed by the string index-signature (which would read `m."method"` as a
+    // `m[k]` value access and silently type-check). So when the receiver is a
+    // map/set but the property is not one of its intrinsic methods, report an
+    // explicit "Unknown property" error (C2.2: a `Set<T>` does NOT expose the Map
+    // surface — `s.set`/`s.get`/`s.keys()` are rejected here).
+    const mapKV = mapKeyValueType(shape);
+    if (mapKV) {
+      const setEl = setElementType(shape);
+      const member = setEl !== null
+        ? setMemberType(setEl)[property]
+        : mapMemberType(mapKV.key, mapKV.value)[property];
+      if (member?.type === "Function") {
+        const node: VLCallNode = {
+          type: "Call",
+          callee: record(
+            { type: "PropertyAccess", object, property } as const,
+            between(objCtx, spanOf(id)),
+          ),
+          arguments: args,
+          functionType: instantiateFunctionType(
+            member,
+            args,
+            ctx,
+          ) as VLFunctionType,
+        };
+        return record(node, ctx);
+      }
+      // A map/set receiver with an unknown method name — reject explicitly rather
+      // than letting the index-signature swallow it as a value read.
+      errors.push({
+        type: "Property",
+        property: { type: "StringLiteral", value: property },
+        ctx: spanOf(id),
+        code: 5,
+      });
+      const node: VLCallNode = {
+        type: "Call",
+        callee: record(
+          { type: "PropertyAccess", object, property } as const,
+          between(objCtx, spanOf(id)),
+        ),
+        arguments: args,
+        functionType: undefined,
+      };
+      return record(node, ctx);
     }
 
     // 2. UFCS method: a free `self`-function. `o.f(args)` → `f(o, args)`.

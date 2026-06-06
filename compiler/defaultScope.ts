@@ -422,6 +422,25 @@ export const defaultScope = () => {
       return: { type: "Alias", name: "null" },
     };
 
+    // `Map()` / `Set()`: builtin constructors for the hash collections (B6a).
+    // Construction spelling is PROVISIONAL (uncommitted, mirroring how List's
+    // construction is uncommitted) — a no-arg builtin call whose result type is
+    // pinned from the binding's annotation (`let m: {[string]: i32} = Map()`),
+    // exactly like an empty `[]` takes its element type from the desired type.
+    // The return is a fresh inference hole; `ensureType` against the annotation
+    // resolves it to the concrete `{[K]:V}` map type. toWasm lowers the call to
+    // an empty-map allocation by name.
+    scope.Map = {
+      type: "Function",
+      paramaters: [],
+      return: { type: "Infer", subType: { type: "Unknown" } },
+    };
+    scope.Set = {
+      type: "Function",
+      paramaters: [],
+      return: { type: "Infer", subType: { type: "Unknown" } },
+    };
+
     // `print(value)`: a built-in that logs a value of any printable type. The
     // parameter accepts anything (codegen in toWasm dispatches on the argument's
     // type to a type-specific host sink); supported today are numerics, boolean,

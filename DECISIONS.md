@@ -79,6 +79,12 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
 - **Maps are a separate hash type, not every-object-as-table.** Three representations under one
   `[]`/`.field` surface: static-string-key structs (fastest), `i32`-key arrays (native, contiguous),
   arbitrary-key maps (hashed, heap) — you pay hashing only when you use a `Map`. (B6a)
+- **`Map`/`Set` are ordered open-addressing hash maps (Python-dict shape).** A `{keys,vals,live,index,
+  count,size}` struct: insertion-ordered entry arrays + a hash index → entry; iteration walks entries in
+  order (deterministic, for multiplayer/replay). **Delete tombstones + compacts** (rebuild from live
+  entries, index sized to the live count, not unconditionally doubled) — the first cut doubled on every
+  delete and OOM-trapped under add/delete churn. Spelled with the index-sig syntax (`{[string]:V}` map,
+  `{[T]:boolean}` set), `string` keys only for now (i32 keys stay the native `T[]` path). (B6a)
 - **Generics infer through collections, not just scalars.** A generic element type is pinned from the
   argument's element type (the checker unifies index-signature *value* types, not just keys), so
   `first<T>(xs: T[])` resolves `T` per call. Read-side only for now — building a new array of an

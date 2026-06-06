@@ -6,6 +6,9 @@ import {
   distinctScalars,
   elseNarrowings,
   getConcreteType,
+  isMapType,
+  isSetType,
+  mapKeyValueType,
   nonNullable,
   orderArgumentsByParameters,
   placeKey,
@@ -34,6 +37,19 @@ import {
   type ListBuiltinContext,
   lowerListMethodCall,
 } from "./builtins/lists.ts";
+import {
+  type MapBuiltinContext,
+  type MapType as MapTypeInfo,
+  lowerMapMethodCall,
+  MAP_COUNT,
+  MAP_KEYS,
+  MAP_LIVE,
+  MAP_SIZE,
+  MAP_VALS,
+  mapGetFn,
+  mapNewFn,
+  mapSetFn,
+} from "./builtins/maps.ts";
 
 const raise = (err?: string | Error): never => {
   if (typeof err === "object" && err instanceof Error) throw err;
@@ -595,6 +611,132 @@ export const toWasm = async (ast: VLProgramNode) => {
       arrayElementType(s) !== null;
   };
 
+  // --- Maps (the separate hash type, B6a) ---
+  // A `Map<K,V>` (a `{[K]:V}` index-sig object with a NON-i32 key — `string` for
+  // now) lowers to an ordered open-addressing hash struct (see builtins/maps.ts):
+  // `{ keys, vals, live, index, count, size }`. Iteration walks `keys`/`vals` in
+  // insertion order (DETERMINISTIC — the replay requirement) skipping tombstones.
+  // The TYPE-SYSTEM representation stays `{[K]:V}` (generic inference / member
+  // typing unaffected) — this is purely a codegen rep.
+  // Is `t` a reference (non-defaultable) wasm type? `array.new_default` requires a
+  // defaultable element, so a map's key/val arrays storing refs must use a
+  // *nullable* element ref (null is the default). Scalars are defaultable as-is.
+  const isRefElement = (t: VLType): boolean => {
+    let s = softenImplicitType(t);
+    while (s.type === "Infer") s = softenImplicitType(s.subType);
+    if (s.type === "Function") return true;
+    if (s.type === "Object") return s.name === "string" || (s.name === undefined);
+    if (s.type === "Nullable" || s.type === "Union") return true;
+    return false;
+  };
+  // The wasm type stored in a map's key/val array slot: a *nullable* ref for a
+  // reference element (so `array.new_default` null-inits and the helper signatures
+  // match), else the plain scalar wasm type.
+  const mapElemWasm = (element: VLType): number => {
+    const soft = softenImplicitType(element);
+    return isRefElement(soft)
+      ? binaryen.getTypeFromHeapType(refHeapType(soft), true)
+      : toWasmType(soft);
+  };
+  // An array type whose element is a *nullable* ref when the element is a
+  // reference (so `array.new_default` can null-init), else the plain scalar array.
+  const mapArrayTypes = new Map<number, ArrayType>();
+  const mapArrayType = (element: VLType): ArrayType => {
+    const soft = softenImplicitType(element);
+    if (!isRefElement(soft)) return arrayType(soft);
+    const elemWasm = binaryen.getTypeFromHeapType(refHeapType(soft), true);
+    let cached = mapArrayTypes.get(elemWasm);
+    if (!cached) {
+      const tb = new binaryen.TypeBuilder(1);
+      tb.setArrayType(0, elemWasm, binaryen.notPacked, true);
+      const heapType = tb.buildAndDispose()[0];
+      cached = {
+        heapType,
+        refType: binaryen.getTypeFromHeapType(heapType, false),
+        element: soft,
+      };
+      mapArrayTypes.set(elemWasm, cached);
+    }
+    return cached;
+  };
+
+  const mapTypes = new Map<string, MapTypeInfo>();
+  const mapType = (key: VLType, value: VLType): MapTypeInfo => {
+    const keys = mapArrayType(softenImplicitType(key));
+    const vals = mapArrayType(softenImplicitType(value));
+    const flags = arrayType(i32Type);
+    const cacheKey = `${keys.heapType}:${vals.heapType}`;
+    let cached = mapTypes.get(cacheKey);
+    if (!cached) {
+      const tb = new binaryen.TypeBuilder(1);
+      tb.setStructType(0, [
+        { type: keys.refType, packedType: binaryen.notPacked, mutable: true },
+        { type: vals.refType, packedType: binaryen.notPacked, mutable: true },
+        { type: flags.refType, packedType: binaryen.notPacked, mutable: true },
+        { type: flags.refType, packedType: binaryen.notPacked, mutable: true },
+        { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+        { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+      ]);
+      const heapType = tb.buildAndDispose()[0];
+      cached = {
+        heapType,
+        refType: binaryen.getTypeFromHeapType(heapType, false),
+        key: softenImplicitType(key),
+        value: softenImplicitType(value),
+        keys,
+        vals,
+        flags,
+        keyElemWasm: mapElemWasm(key),
+        valElemWasm: mapElemWasm(value),
+        keyIsRef: isRefElement(softenImplicitType(key)),
+        valIsRef: isRefElement(softenImplicitType(value)),
+      };
+      mapTypes.set(cacheKey, cached);
+    }
+    return cached;
+  };
+
+  // Is `t` a map (a `{[K]:V}` with a non-i32 key)? Mirrors the typecheck-side
+  // `isMapType`. Every flipped codegen site guards on this.
+  const isMapTypeCodegen = (t: VLType): boolean => {
+    let s = softenImplicitType(t);
+    while (s.type === "Infer") s = softenImplicitType(s.subType);
+    return isMapType(s);
+  };
+
+  // Is `t` a `Set<T>` (the boolean-valued `{[T]:boolean}` representation)? Used to
+  // route a set's `.values()` to its element (key) array. Mirrors `isSetType`.
+  const isSetTypeCodegen = (t: VLType): boolean => {
+    let s = softenImplicitType(t);
+    while (s.type === "Infer") s = softenImplicitType(s.subType);
+    return isSetType(s);
+  };
+
+  // Resolve an expression's map struct type + key/value types, or null.
+  const mapTypeOf = (
+    node: VLProgramNode | VLStatement,
+  ): { mt: MapTypeInfo; key: VLType; value: VLType } | null => {
+    const objType = softenImplicitType(codegenType(node));
+    let s = objType;
+    while (s.type === "Infer") s = softenImplicitType(s.subType);
+    const kv = mapKeyValueType(s);
+    if (!kv) return null;
+    const key = softenImplicitType(kv.key);
+    const value = softenImplicitType(kv.value);
+    return { mt: mapType(key, value), key, value };
+  };
+
+  // A stable per-module suffix for a map type's emitted helper names.
+  const mapHelperTags = new Map<number, number>();
+  const mapHelperTag = (mt: MapTypeInfo): number => {
+    let t = mapHelperTags.get(mt.heapType);
+    if (t === undefined) {
+      t = mapHelperTags.size;
+      mapHelperTags.set(mt.heapType, t);
+    }
+    return t;
+  };
+
   // Lazily-emitted wasm helper functions (string equality, string→memory copy),
   // each added to the module once on first use. Strings are i32-arrays of char
   // codes, so these are small loops over `array.get`.
@@ -1146,6 +1288,118 @@ export const toWasm = async (ast: VLProgramNode) => {
     return body;
   };
 
+  // `m.keys()` / `m.values()`: build a fresh `K[]` / `V[]` list of the map's live
+  // entries IN INSERTION ORDER (walk `[0, count)` skipping tombstones, append the
+  // live keys/values). This is the map iteration surface (`for k in m.keys()`),
+  // since the parser's `for…in` only admits i32-keyed arrays/lists. Returns the
+  // binaryen expr, or null when `node` isn't such a call.
+  let mapKVCounter = 0;
+  const lowerMapKeysValues = (node: VLCallNode): number | null => {
+    if (node.callee.type !== "PropertyAccess") return null;
+    const prop = node.callee.property;
+    if (prop !== "keys" && prop !== "values") return null;
+    const recv = node.callee.object;
+    const src = mapTypeOf(recv);
+    if (!src) return null;
+    const mt = src.mt;
+    // A `Set<T>` stores its elements as the map KEYS (the value slot is the
+    // unused membership boolean). A set exposes only `.values(): T[]` — its
+    // elements — so a set's `.values()` materializes the KEYS, not the booleans.
+    // (Sets never expose `.keys()`.) A map's `.keys()`/`.values()` are unchanged.
+    const isSet = isSetTypeCodegen(softenImplicitType(codegenType(recv)));
+    const wantKeys = isSet ? true : prop === "keys";
+    const element = wantKeys ? mt.key : mt.value;
+    const outLt = listType(softenImplicitType(element));
+    const srcArrRef = wantKeys ? mt.keys.refType : mt.vals.refType;
+    const srcField = wantKeys ? MAP_KEYS : MAP_VALS;
+    const srcElemWasm = wantKeys ? mt.keyElemWasm : mt.valElemWasm;
+    const srcIsRef = wantKeys ? mt.keyIsRef : mt.valIsRef;
+
+    const id = mapKVCounter++;
+    const loopLabel = `mkv_loop${id}`;
+    const doneLabel = `mkv_done${id}`;
+    const mapLocal = newLocal(mt.refType);
+    const entriesLocal = newLocal(srcArrRef);
+    const liveLocal = newLocal(mt.flags.refType);
+    const backLocal = newLocal(outLt.backing.refType);
+    const nLocal = newLocal(binaryen.i32); // size (out length)
+    const cntLocal = newLocal(binaryen.i32); // entry count (incl tombstones)
+    const iLocal = newLocal(binaryen.i32);
+    const jLocal = newLocal(binaryen.i32);
+    const map = () => m.local.get(mapLocal, mt.refType);
+    const entries = () => m.local.get(entriesLocal, srcArrRef);
+    const live = () => m.local.get(liveLocal, mt.flags.refType);
+    const back = () => m.local.get(backLocal, outLt.backing.refType);
+    const n = () => m.local.get(nLocal, binaryen.i32);
+    const cnt = () => m.local.get(cntLocal, binaryen.i32);
+    const i = () => m.local.get(iLocal, binaryen.i32);
+    const j = () => m.local.get(jLocal, binaryen.i32);
+    const stored = () => {
+      const read = m.array.get(entries(), i(), srcElemWasm, false);
+      return srcIsRef ? m.ref.as_non_null(read) : read;
+    };
+    return m.block(null, [
+      m.local.set(mapLocal, toExpression(recv)),
+      m.local.set(entriesLocal, m.struct.get(srcField, map(), srcArrRef, false)),
+      m.local.set(
+        liveLocal,
+        m.struct.get(MAP_LIVE, map(), mt.flags.refType, false),
+      ),
+      m.local.set(nLocal, m.struct.get(MAP_SIZE, map(), binaryen.i32, false)),
+      m.local.set(cntLocal, m.struct.get(MAP_COUNT, map(), binaryen.i32, false)),
+      // Allocate the backing. A list backing has a NON-nullable element, so for a
+      // reference element `array.new_default` (null init) is invalid; instead fill
+      // with a known non-null entry (a stored key/value is never nulled — even a
+      // tombstone keeps it — so `entries[0]` is non-null whenever count > 0). An
+      // empty map uses a zero-length fixed array. Scalar elements default-init.
+      srcIsRef
+        ? m.if(
+          m.i32.eqz(cnt()),
+          m.local.set(
+            backLocal,
+            m.array.new_fixed(outLt.backing.heapType, []),
+          ),
+          m.local.set(
+            backLocal,
+            m.array.new(
+              outLt.backing.heapType,
+              n(),
+              m.ref.as_non_null(
+                m.array.get(entries(), m.i32.const(0), srcElemWasm, false),
+              ),
+            ),
+          ),
+        )
+        : m.local.set(
+          backLocal,
+          m.array.new_default(outLt.backing.heapType, n()),
+        ),
+      m.local.set(iLocal, m.i32.const(0)),
+      m.local.set(jLocal, m.i32.const(0)),
+      m.block(doneLabel, [
+        m.loop(
+          loopLabel,
+          m.block(null, [
+            m.br(doneLabel, m.i32.ge_u(i(), cnt())),
+            m.if(
+              m.i32.ne(
+                m.array.get(live(), i(), binaryen.i32, false),
+                m.i32.const(0),
+              ),
+              m.block(null, [
+                m.array.set(back(), j(), stored()),
+                m.local.set(jLocal, m.i32.add(j(), m.i32.const(1))),
+              ]),
+            ),
+            m.local.set(iLocal, m.i32.add(i(), m.i32.const(1))),
+            m.br(loopLabel),
+          ]),
+        ),
+      ]),
+      m.struct.new([back(), n(), n()], outLt.heapType),
+    ], outLt.refType);
+  };
+
   // A placeholder value of a captured variable's wasm type, used during the
   // capture-collection pass (whose body is discarded once captures are known).
   const zeroOf = (type: VLType): number => {
@@ -1681,6 +1935,34 @@ export const toWasm = async (ast: VLProgramNode) => {
               "(only numerics, boolean, and string are supported so far)",
           );
         }
+        // `Map()` / `Set()` builtin constructors (B6a): allocate an empty hash
+        // collection. The concrete map type is the call's resolved return type
+        // (pinned from the binding annotation), or — when the call is itself the
+        // RHS being coerced — the desired type.
+        if (node.function === "Map" || node.function === "Set") {
+          let rt = node.functionType?.return;
+          if (rt) {
+            let s = softenImplicitType(rt);
+            while (s.type === "Infer") s = softenImplicitType(s.subType);
+            rt = s;
+          }
+          if (!rt || !isMapType(rt)) {
+            const dt = desiredType ? softenImplicitType(desiredType) : undefined;
+            if (dt && isMapType(dt)) rt = dt;
+          }
+          if (!rt || !isMapType(rt)) {
+            throw new Error(
+              `${node.function}() needs a map type annotation ` +
+                "(e.g. `let m: {[string]: i32} = Map()`)",
+            );
+          }
+          const kv = mapKeyValueType(rt)!;
+          const mt = mapType(
+            softenImplicitType(kv.key),
+            softenImplicitType(kv.value),
+          );
+          return m.call(mapNewFn(mapBuiltinCtx, mt), [], mt.refType);
+        }
         const func = getFunction(node) as unknown as string | number;
         // For an indirect call the callee is a value whose concrete signature
         // is bound in scope by the current monomorphization (more precise than
@@ -1753,10 +2035,19 @@ export const toWasm = async (ast: VLProgramNode) => {
         // list via an inline loop that calls the closure indirectly.
         const mapFilter = lowerListMapFilter(node);
         if (mapFilter !== null) return mapFilter;
+        // `m.keys()` / `m.values()` materialize an insertion-ordered `K[]`/`V[]`
+        // list (the iteration surface). Built inline because they allocate a list
+        // (listType/newLocal aren't in the maps builtin context).
+        const mapKV = lowerMapKeysValues(node);
+        if (mapKV !== null) return mapKV;
         // Intrinsic list methods (`l.get`/`l.push`/`l.pop`/`l.clear`) lower to
         // their per-element wasm helpers; see `compiler/builtins/lists.ts`.
         const listMethod = lowerListMethodCall(listBuiltinCtx, node);
         if (listMethod !== null) return listMethod;
+        // Intrinsic map/set methods (`.get`/`.has`/`.set`/`.add`/`.delete`) lower
+        // to their per-(key,value) wasm helpers; see `compiler/builtins/maps.ts`.
+        const mapMethod = lowerMapMethodCall(mapBuiltinCtx, node);
+        if (mapMethod !== null) return mapMethod;
         // Calling an arbitrary expression value, e.g. `o.f(args)`. The callee
         // evaluates to a closure struct; dispatch through it.
         const functionType = node.functionType;
@@ -1787,6 +2078,22 @@ export const toWasm = async (ast: VLProgramNode) => {
           : call;
       }
       case "VariableDeclaration": {
+        // A `Map()` / `Set()` with no annotation to pin its type leaves an
+        // unresolved constructor hole (B6a). The type checker reports this when
+        // the declaration is in a block it type-infers; at module top level
+        // (which isn't body-inferred) it reaches here — surface the same clear
+        // message rather than the opaque "Unhandled Unknown type" from
+        // `toWasmType`.
+        if (
+          node.variableType.type === "Infer" &&
+          node.variableType.mapCtor &&
+          node.variableType.subType.type === "Unknown"
+        ) {
+          throw new Error(
+            `${node.variableType.mapCtor}() needs a map type annotation ` +
+              "(e.g. `let m: {[string]: i32} = Map()`)",
+          );
+        }
         const index = _locals.push(toWasmType(node.variableType)) - 1 +
           (_locals.params ?? 0);
         currentScope[node.name] = [node.variableType, index];
@@ -1931,6 +2238,20 @@ export const toWasm = async (ast: VLProgramNode) => {
         return m.struct.new([backing, n, m.i32.const(values.length)], info.lt.heapType);
       }
       case "IndexAccess": {
+        // A map `m[k]` is a hash lookup yielding `V | null` (normal absence —
+        // the deliberate exception to sequence indexing). Lowered to the `.get`
+        // helper.
+        const map = mapTypeOf(node.array);
+        if (map) {
+          return m.call(
+            mapGetFn(mapBuiltinCtx, map.mt),
+            [
+              toExpression(node.array),
+              withDesiredType(map.key, () => toExpression(node.index)),
+            ],
+            toWasmType({ type: "Nullable", subType: map.value }),
+          );
+        }
         // A list `l[i]` is a bounds-checked (trap-on-OOB) read off `backing`; a
         // raw i32-array (string) keeps the native `array.get` (it traps natively).
         const list = listTypeOf(node.array);
@@ -1967,6 +2288,21 @@ export const toWasm = async (ast: VLProgramNode) => {
             return m.struct.get(LIST_CAP, ref, binaryen.i32, false);
           }
           throw new Error(`List has no member "${node.property}"`);
+        }
+        // Map/Set size member: `.length` → `struct.get $size` (O(1) live count).
+        // Unified on `.length` across List/Map/Set (C2.3); both maps and sets use
+        // the same hash-map struct, so both read the stored live-entry/membership
+        // count from `MAP_SIZE`.
+        if (isMapTypeCodegen(objType)) {
+          if (node.property === "length") {
+            return m.struct.get(
+              MAP_SIZE,
+              toExpression(node.object),
+              binaryen.i32,
+              false,
+            );
+          }
+          throw new Error(`Map has no member "${node.property}"`);
         }
         if (arrayElementType(objType)) {
           if (node.property === "length") {
@@ -2106,6 +2442,58 @@ export const toWasm = async (ast: VLProgramNode) => {
         if (op === "=") {
           if (node.left.type === "IndexAccess") {
             const access = node.left;
+            // `m[k] = v` on a map: hash insert/overwrite via the `.set` helper.
+            const map = mapTypeOf(access.array);
+            if (map) {
+              // Statement position: just set (no read-back).
+              if (!desiredType) {
+                return m.call(
+                  mapSetFn(mapBuiltinCtx, map.mt),
+                  [
+                    toExpression(access.array),
+                    withDesiredType(map.key, () => toExpression(access.index)),
+                    withDesiredType(map.value, () => toExpression(node.right)),
+                  ],
+                  binaryen.none,
+                );
+              }
+              // Value position: the assignment expression evaluates to the set
+              // value. Mirror the list path — hoist the receiver and key into
+              // locals so each subexpression (and any side effect) is evaluated
+              // ONCE, then set and read back. The result type is `V | null` (the
+              // map's read shape); the just-set key is always present, so the
+              // read-back is the live value.
+              const mapRef = newLocal(map.mt.refType);
+              const keyWasm = toWasmType(map.key);
+              const keyLocal = newLocal(keyWasm);
+              const mRef = () => m.local.get(mapRef, map.mt.refType);
+              const kRef = () => m.local.get(keyLocal, keyWasm);
+              const retWasm = toWasmType({
+                type: "Nullable",
+                subType: map.value,
+              });
+              return m.block(null, [
+                m.local.set(mapRef, toExpression(access.array)),
+                m.local.set(
+                  keyLocal,
+                  withDesiredType(map.key, () => toExpression(access.index)),
+                ),
+                m.call(
+                  mapSetFn(mapBuiltinCtx, map.mt),
+                  [
+                    mRef(),
+                    kRef(),
+                    withDesiredType(map.value, () => toExpression(node.right)),
+                  ],
+                  binaryen.none,
+                ),
+                m.call(
+                  mapGetFn(mapBuiltinCtx, map.mt),
+                  [mRef(), kRef()],
+                  retWasm,
+                ),
+              ], retWasm);
+            }
             const list = listTypeOf(access.array);
             if (list) {
               // `l[i] = v` on a list: bounds-check `i` against `len` (trap on OOB
@@ -2642,6 +3030,10 @@ export const toWasm = async (ast: VLProgramNode) => {
         const brk = brkLabel(cont);
         loopLabels.push(cont);
 
+        // (Map iteration is via `m.keys()` / `m.values()` — which return ordered
+        // `K[]`/`V[]` lists — because the parser's `for…in` only admits i32-keyed
+        // arrays/lists. Insertion order is materialized in those helpers below.)
+
         // A list iterates `[0, len)` over its `backing` (load `backing` once,
         // hoisted before the loop); a raw i32-array (string) over `array.len`.
         const list = listTypeOf(node.iterable);
@@ -2748,6 +3140,10 @@ export const toWasm = async (ast: VLProgramNode) => {
     if (isListType(t)) {
       return listType(softenImplicitType(arrayElementType(t)!)).heapType;
     }
+    if (isMapType(t)) {
+      const kv = mapKeyValueType(t)!;
+      return mapType(kv.key, kv.value).heapType;
+    }
     if (t.type === "Object") {
       const element = arrayElementType(t);
       if (element) return arrayType(element).heapType;
@@ -2812,6 +3208,11 @@ export const toWasm = async (ast: VLProgramNode) => {
     // `[i32]:T` object (`string`) stays a raw WasmGC array below.
     if (isListType(t)) {
       return listType(softenImplicitType(arrayElementType(t)!)).refType;
+    }
+    // A map (`{[K]:V}` non-i32 key) is the hash struct rep.
+    if (isMapType(t)) {
+      const kv = mapKeyValueType(t)!;
+      return mapType(kv.key, kv.value).refType;
     }
     if (t.type === "Object") {
       // An `i32`-index-sig object is a WasmGC array — this covers `string` (an
@@ -3163,6 +3564,21 @@ export const toWasm = async (ast: VLProgramNode) => {
     codegenType,
     withDesiredType,
     toExpression,
+  };
+
+  // Context handed to the extracted map-method codegen (compiler/builtins).
+  const mapBuiltinCtx: MapBuiltinContext = {
+    m,
+    binaryen,
+    mapTypeOf,
+    toWasmType,
+    helpers: _helpers,
+    toExpression,
+    withDesiredType,
+    nullableNull,
+    nullableSome,
+    stringEqFn,
+    tagOf: mapHelperTag,
   };
 
   // Context handed to the extracted list-method codegen (compiler/builtins).
