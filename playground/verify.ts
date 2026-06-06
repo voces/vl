@@ -25,14 +25,18 @@ const binaryenEntry = (): string =>
     "index.js",
   );
 
-const bundleCore = async (): Promise<string> => {
+// Bundle a single DOM-free browser entry with the real build's settings and
+// return its JS text (no `write`). Used for the modules we can evaluate headless
+// (the compiler core and the pure LSP adapter); the full DOM bundle (main.ts +
+// Monaco) is only *built*, not evaluated (see `verifyFullBundleBuilds`).
+const bundleCore = async (entry: string): Promise<string> => {
   const out = await esbuild.build({
     plugins: [
       {
         name: "binaryen-esm",
         setup(build) {
-          const entry = binaryenEntry();
-          build.onResolve({ filter: /^binaryen$/ }, () => ({ path: entry }));
+          const e = binaryenEntry();
+          build.onResolve({ filter: /^binaryen$/ }, () => ({ path: e }));
         },
       },
       {
@@ -50,7 +54,7 @@ const bundleCore = async (): Promise<string> => {
       }),
     ],
     absWorkingDir: ROOT.pathname,
-    entryPoints: [new URL("src/playground.ts", HERE).pathname],
+    entryPoints: [new URL(entry, HERE).pathname],
     bundle: true,
     format: "esm",
     platform: "browser",
@@ -61,6 +65,72 @@ const bundleCore = async (): Promise<string> => {
   return out.outputFiles[0].text;
 };
 
+// Build the FULL playground bundle the page loads (main.ts → Monaco + the
+// compiler + the LSP adapter). We don't evaluate it (Monaco needs the DOM), but
+// building it confirms Monaco bundles through the deno-loader pipeline with the
+// CSS/`.ttf` loaders — the headline E/Monaco integration risk. Asserts the JS +
+// the sibling CSS (Monaco's styles) are both emitted.
+const verifyFullBundleBuilds = async (): Promise<void> => {
+  const out = await esbuild.build({
+    plugins: [
+      {
+        name: "binaryen-esm",
+        setup(build) {
+          const e = binaryenEntry();
+          build.onResolve({ filter: /^binaryen$/ }, () => ({ path: e }));
+        },
+      },
+      {
+        name: "node-builtins-external",
+        setup(build) {
+          build.onResolve(
+            { filter: /^node:/ },
+            (a) => ({ path: a.path, external: true }),
+          );
+        },
+      },
+      ...denoPlugins({
+        configPath: new URL("deno.json", ROOT).pathname,
+        nodeModulesDir: "manual",
+      }),
+    ],
+    absWorkingDir: ROOT.pathname,
+    entryPoints: [new URL("src/main.ts", HERE).pathname],
+    bundle: true,
+    format: "esm",
+    platform: "browser",
+    conditions: ["browser"],
+    target: "es2022",
+    loader: { ".ttf": "dataurl" },
+    // An `outdir` (vs an `outfile`) is needed so esbuild has an output path for
+    // the CSS asset Monaco's imports produce; `write: false` keeps it in memory.
+    outdir: new URL("dist", HERE).pathname,
+    write: false,
+  });
+  const js = out.outputFiles.find((f) => f.path.endsWith(".js"));
+  const css = out.outputFiles.find((f) => f.path.endsWith(".css"));
+  if (!js || js.text.length === 0) fail("full bundle emitted no JS");
+  if (!css || css.text.length === 0) {
+    fail("full bundle emitted no CSS (Monaco styles missing)");
+  }
+  // The page must register the `vital` language + the LSP providers.
+  for (const needle of [
+    "registerHoverProvider",
+    "registerDocumentSemanticTokensProvider",
+    "setModelMarkers",
+    "registerInlayHintsProvider",
+    "registerDefinitionProvider",
+  ]) {
+    if (!js!.text.includes(needle)) {
+      fail(`full bundle is missing the \`${needle}\` wiring`);
+    }
+  }
+  console.error(
+    `OK: full bundle builds (js ${(js!.text.length / 1e6).toFixed(1)}MB, ` +
+      `css ${(css!.text.length / 1e3).toFixed(0)}KB) with all LSP providers wired`,
+  );
+};
+
 const fail = (msg: string): never => {
   console.error(`FAIL: ${msg}`);
   esbuild.stop();
@@ -69,7 +139,7 @@ const fail = (msg: string): never => {
 
 const main = async (): Promise<void> => {
   console.error("bundling DOM-free core (browser settings)…");
-  const code = await bundleCore();
+  const code = await bundleCore("src/playground.ts");
 
   // Import the freshly built browser bundle. Evaluating it runs binaryen's
   // top-level await — the same instantiation a page performs on load. Write it to
@@ -116,8 +186,65 @@ const main = async (): Promise<void> => {
     } "${err!.message}"`,
   );
 
+  // 3. The browser-side LSP adapter (pure, DOM-free) — bundle + evaluate it the
+  // same way, then exercise the providers the page wires onto Monaco. This is the
+  // "language server" running client-side: diagnostics, semantic tokens, hover.
+  console.error("\nbundling the browser LSP adapter (DOM-free)…");
+  const lspCode = await bundleCore("src/lspAdapter.ts");
+  const lspTmp = await Deno.makeTempFile({ suffix: ".mjs" });
+  await Deno.writeTextFile(lspTmp, lspCode);
+  const lsp = await import(
+    new URL(`file://${lspTmp}`).href
+  ) as typeof import("./src/lspAdapter.ts");
+
+  const src = `let x = 41\nlet _unused = 1\nprint(x + 1)\n`;
+
+  // Diagnostics: the unused `_unused` binding is a B17 lint hint tagged
+  // `unnecessary` (the greyed-out lint the editor surfaces).
+  const diags = lsp.diagnostics(src);
+  const unused = diags.find((d) => d.tags?.includes("unnecessary"));
+  if (!unused) {
+    fail(`no \`unnecessary\`-tagged lint produced: ${JSON.stringify(diags)}`);
+  }
+  console.error(`OK: diagnostics -> B17 lint "${unused!.message}" (unnecessary)`);
+
+  // Semantic tokens: a non-empty, well-formed (multiple-of-5) delta stream.
+  const tokens = lsp.semanticTokens(src);
+  if (tokens.length === 0 || tokens.length % 5 !== 0) {
+    fail(`malformed semantic-token data (len ${tokens.length})`);
+  }
+  console.error(`OK: semantic tokens -> ${tokens.length / 5} tokens`);
+
+  // Hover: the type of `x` (line 0, on the `x`) is `i32`.
+  const hov = lsp.hover(src, { line: 0, character: 4 });
+  if (!hov || !hov.contents.includes("x: i32")) {
+    fail(`hover did not resolve x: i32 (got ${JSON.stringify(hov)})`);
+  }
+  console.error(`OK: hover -> "${hov!.contents}"`);
+
+  // Stretch: inlay hints (inferred `: i32` for the unannotated `x`) and
+  // go-to-definition (a use of `x` jumps to its declaration on line 0).
+  const hints = lsp.inlayHints(src, {
+    start: { line: 0, character: 0 },
+    end: { line: 10, character: 0 },
+  });
+  if (!hints.some((h) => h.label.includes("i32"))) {
+    fail(`no inlay hint with an inferred type: ${JSON.stringify(hints)}`);
+  }
+  const def = lsp.definition(src, { line: 2, character: 6 }); // the `x` in print
+  if (!def || def.start.line !== 0) {
+    fail(`go-to-definition did not jump to the decl: ${JSON.stringify(def)}`);
+  }
   console.error(
-    "\nALL CHECKS PASSED — binaryen runs client-side via the bundle.",
+    `OK: inlay hints -> ${hints.length}, definition -> line ${def!.start.line + 1}`,
+  );
+
+  // 4. The full page bundle (main.ts + Monaco) builds with the LSP wiring.
+  console.error("\nbuilding the full page bundle (Monaco + providers)…");
+  await verifyFullBundleBuilds();
+
+  console.error(
+    "\nALL CHECKS PASSED — binaryen + the client-side LSP run via the bundle.",
   );
   esbuild.stop();
 };
