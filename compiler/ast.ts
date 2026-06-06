@@ -163,6 +163,18 @@ export type VLBinaryOperationNode = {
   left: VLExpression;
   right: VLExpression;
   operator: string;
+  /**
+   * Reprint fidelity (Track G, gap 3): the surface compound-assignment operator a
+   * `=` assignment was written with, e.g. `"+"` for `a += b`. The parser desugars
+   * `a += b` to `a = a + b` (an `operator: "="` node whose `right` is itself a
+   * `BinaryOperation`), which loses the `+=` spelling. This field records it on
+   * the outer assignment node so an AST→source printer can reprint `a += b`
+   * rather than `a = a + b`. Present ONLY on the outer assignment node of a
+   * compound assignment; absent for a plain `a = b` and for every non-assignment
+   * binary op. Additive metadata: typecheck/codegen ignore it (they read the
+   * already-desugared `right`).
+   */
+  compoundOperator?: string;
 };
 
 // Unary operators: logical not (`!`) and in/decrement (`++` / `--`).
@@ -194,6 +206,17 @@ export type VLVariableDeclarationNode = {
   variableType: VLType;
   value: VLExpression | undefined;
   mutable: boolean;
+  /**
+   * Reprint fidelity (Track G, gap 4): whether the binding was written with an
+   * explicit type annotation (`let x: T = …`) vs. left to inference (`let x =
+   * …`). When inferred, `variableType` holds the *inferred* type, which is
+   * indistinguishable from an explicit annotation — so an AST→source printer
+   * would otherwise synthesize a `: T` the user never wrote. `true` only when a
+   * `:` annotation was actually present in source. Also lets inlay hints (D6)
+   * show an inferred-type hint exactly where no annotation exists. Additive
+   * metadata: typecheck/codegen ignore it.
+   */
+  annotated: boolean;
 };
 
 export type VLIfNode = {

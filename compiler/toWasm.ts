@@ -3269,6 +3269,9 @@ export const toWasm = async (ast: VLProgramNode) => {
           variableType,
           value: node.from,
           mutable: true,
+          // Synthesized loop-counter binding (no source); reprint metadata is
+          // irrelevant here, so it carries no explicit annotation.
+          annotated: false,
         });
         const [, varIndex] = getScopeEntry(node.variable);
         const i = () => m.local.get(varIndex, binaryen.i32);

@@ -17,6 +17,7 @@ import type {
   VLProgramNode,
   VLType,
 } from "./ast.ts";
+import type { Comment } from "./lexer.ts";
 import { tokenize } from "./lexer.ts";
 import { parseProgram } from "./parser.ts";
 import { defaultScope } from "./defaultScope.ts";
@@ -33,6 +34,7 @@ import { SymbolTable } from "./symbols.ts";
 
 export type { Binding, BindingKind, SymbolOccurrence } from "./symbols.ts";
 export { SymbolTable } from "./symbols.ts";
+export type { Comment } from "./lexer.ts";
 
 export type VLSeverity = "error" | "warning" | "info";
 export type VLPosition = { line: number; character: number };
@@ -66,6 +68,17 @@ export type CompileResult = {
    * condition as `ast`).
    */
   spans: NodeSpans | undefined;
+  /**
+   * Every source comment (trivia), in source order, each with its span and `kind`
+   * (`"line"` for `//`, `"doc"` for `///`). Comments are NOT AST nodes — they are
+   * retained out of the token stream (see `lexer.ts`) — so an AST→source printer
+   * (Track G) places them by position: each comment's span, paired with node
+   * spans from `spans`, tells the printer which node a comment leads/trails and
+   * whether it sits on its own line or after code. The per-token
+   * `leadingComments`/`trailingComments` carry the same `Comment` objects by
+   * identity for consumers that walk tokens. Empty when the source has none.
+   */
+  comments: Comment[];
 };
 
 // A source span (`Context`) carries 1-based lines / 0-based columns, with `stop`
@@ -248,6 +261,8 @@ export type CheckResult = {
   symbols: SymbolTable;
   /** Source spans for AST nodes, keyed by node identity. See `CompileResult`. */
   spans: NodeSpans;
+  /** Every source comment, in order, with span + kind. See `CompileResult`. */
+  comments: Comment[];
 };
 
 /**
@@ -263,10 +278,10 @@ export type CheckResult = {
  * codegen and surface those errors.
  */
 export const checkOnly = (source: string): CheckResult => {
-  const { tokens, diagnostics } = tokenize(source);
+  const { tokens, diagnostics, comments } = tokenize(source);
   const [ast, errors, symbols, spans] = parseProgram(tokens, defaultScope());
   for (const error of errors) diagnostics.push(diagnosticFromError(error));
-  return { ast, diagnostics, symbols, spans };
+  return { ast, diagnostics, symbols, spans, comments };
 };
 
 /**
@@ -277,7 +292,7 @@ export const checkOnly = (source: string): CheckResult => {
  * only loaded when codegen actually runs.
  */
 export const compile = async (source: string): Promise<CompileResult> => {
-  const { ast, diagnostics, symbols, spans } = checkOnly(source);
+  const { ast, diagnostics, symbols, spans, comments } = checkOnly(source);
 
   let wasm: Uint8Array | undefined;
   if (!diagnostics.some((d) => d.severity === "error")) {
@@ -302,7 +317,7 @@ export const compile = async (source: string): Promise<CompileResult> => {
     }
   }
 
-  return { ast, diagnostics, wasm, symbols, spans };
+  return { ast, diagnostics, wasm, symbols, spans, comments };
 };
 
 /**

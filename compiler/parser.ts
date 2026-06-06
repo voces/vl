@@ -54,7 +54,9 @@ import type {
   VLArrayLiteralNode,
   VLBinaryOperationNode,
   VLBlockNode,
+  VLBreakNode,
   VLCallNode,
+  VLContinueNode,
   VLExpression,
   VLFunctionCallNode,
   VLFunctionDeclarationNode,
@@ -1444,7 +1446,7 @@ export const parseProgram = (
   };
 
   const parseIf = (): VLIfNode => {
-    expect("IF");
+    const ifTok = expect("IF");
     skipNewlines();
 
     // `elseAcc` accumulates the negations of every condition seen so far (A5),
@@ -1503,7 +1505,10 @@ export const parseProgram = (
       break;
     }
 
-    return { type: "If", conditionals, else: elseStmt };
+    return record(
+      { type: "If", conditionals, else: elseStmt },
+      spanFrom(ifTok),
+    );
   };
 
   const parseBlock = (label: string | undefined): VLBlockNode => {
@@ -1864,6 +1869,7 @@ export const parseProgram = (
         left: { type: "PropertyAccess", object, property },
         right,
         operator: "=",
+        ...(operator ? { compoundOperator: operator } : {}),
       }, wholeCtx);
     }
 
@@ -1900,6 +1906,7 @@ export const parseProgram = (
         left,
         right,
         operator: "=",
+        ...(operator ? { compoundOperator: operator } : {}),
       }, wholeCtx);
     }
 
@@ -1937,6 +1944,7 @@ export const parseProgram = (
         left: { type: "IndexAccess", array, index },
         right,
         operator: "=",
+        ...(operator ? { compoundOperator: operator } : {}),
       }, wholeCtx);
     }
 
@@ -1962,6 +1970,7 @@ export const parseProgram = (
       left,
       right,
       operator: "=",
+      ...(operator ? { compoundOperator: operator } : {}),
     }, wholeCtx);
   };
 
@@ -1993,6 +2002,7 @@ export const parseProgram = (
       variableType: annotated ?? { type: "Unknown" },
       value,
       mutable,
+      annotated: annotated !== undefined,
     };
     if (node.value) {
       const valType = typeFromExpression(node.value, valueCtx ?? spanOf(id));
@@ -2097,7 +2107,10 @@ export const parseProgram = (
     return { type: "Block", label: `__type_${name}__`, statements: [] };
   };
 
-  const parseWhile = (label: string | undefined): VLStatement => {
+  const parseWhile = (
+    label: string | undefined,
+    startTok: Token,
+  ): VLStatement => {
     expect("WHILE");
     skipNewlines();
     const condStart = peek();
@@ -2109,10 +2122,16 @@ export const parseProgram = (
     );
     skipNewlines();
     const statement = parseStatement() ?? emptyReturn();
-    return { type: "While", label, condition, statement };
+    return record(
+      { type: "While", label, condition, statement },
+      spanFrom(startTok),
+    );
   };
 
-  const parseFor = (label: string | undefined): VLStatement => {
+  const parseFor = (
+    label: string | undefined,
+    startTok: Token,
+  ): VLStatement => {
     const forTok = expect("FOR");
     skipNewlines();
     const variable = expect("ID").text;
@@ -2154,7 +2173,10 @@ export const parseProgram = (
         scopes.pop();
         throw err;
       }
-      return { type: "ForIn", label, variable, iterable: first, statement };
+      return record(
+        { type: "ForIn", label, variable, iterable: first, statement },
+        spanFrom(startTok),
+      );
     }
 
     // `for x in from to to (step step)?`.
@@ -2220,7 +2242,10 @@ export const parseProgram = (
       }
     }
 
-    return { type: "For", label, variable, from: first, to, step, statement };
+    return record(
+      { type: "For", label, variable, from: first, to, step, statement },
+      spanFrom(startTok),
+    );
   };
 
   const parseReturn = (): VLStatement => {
@@ -2236,7 +2261,7 @@ export const parseProgram = (
       if (flow.desiredType) ensureType(flow.desiredType, type, ctx);
       returnTypes.push(type);
     }
-    return { type: "Return", value };
+    return record({ type: "Return", value }, ctx);
   };
 
   const parseStatement = (): VLStatement | undefined => {
@@ -2250,32 +2275,35 @@ export const parseProgram = (
       case "TYPE":
         return parseTypeStatement();
       case "WHILE":
-        return parseWhile(undefined);
+        return parseWhile(undefined, t);
       case "FOR":
-        return parseFor(undefined);
+        return parseFor(undefined, t);
       case "BREAK": {
-        next();
+        const kw = next();
         const label = at("ID") ? next().text : undefined;
-        return { type: "Break", label };
+        const node: VLBreakNode = { type: "Break", label };
+        return record(node, spanFrom(kw));
       }
       case "CONTINUE": {
-        next();
+        const kw = next();
         const label = at("ID") ? next().text : undefined;
-        return { type: "Continue", label };
+        const node: VLContinueNode = { type: "Continue", label };
+        return record(node, spanFrom(kw));
       }
       case "ID": {
-        // Labelled loop `name: while …` / `name: for …`.
+        // Labelled loop `name: while …` / `name: for …`. The recorded span
+        // starts at the label so it covers `name: while …` in full.
         if (peek(1).kind === "COLON") {
           const k = peek(2).kind;
           if (k === "WHILE") {
             const label = next().text;
             next(); // COLON
-            return parseWhile(label);
+            return parseWhile(label, t);
           }
           if (k === "FOR") {
             const label = next().text;
             next(); // COLON
-            return parseFor(label);
+            return parseFor(label, t);
           }
         }
         return parseExpr();
