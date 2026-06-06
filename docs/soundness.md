@@ -61,6 +61,21 @@ is declared is an error.
 - rejected (missing case ⇒ nullable): `exhaustive-missing-literal-case.vl`,
   `exhaustive-missing-is-case.vl`
 
+### Struct-union discrimination & shared fields
+`v is A` over a union of **struct** types is correct — true iff the runtime value
+really is an `A`. Each struct variant carries a distinct runtime tag keyed on its
+field-name-aware **shape** (WasmGC erases field names, so the tag, not the wasm
+type, is what tells `{tag,x}` from `{tag,y}` apart). Discrimination is by
+structural shape: two same-shape `type` aliases are the same variant (a `B` value
+IS an `A`), so a same-shape union needs an explicit discriminant field. A field
+present on **every** member with the **same** type is readable on the union
+directly, without narrowing (`(A | B).tag`); an unshared field still requires an
+`is`/`==` narrowing.
+
+- sound: `is-struct-union-sound.vl`, `is-struct-union-dispatch.vl`,
+  `struct-union-shared-field.vl`
+- rejected (unshared field ⇒ narrow first): `struct-union-unshared-field-reject.vl`
+
 ### Literal unions are closed sets
 A literal union (`"a" | "b"`, `0 | 1 | 2`) accepts only its listed members, on
 argument-passing, assignment, **and** comparison. `"c"` is never a `"a" | "b"`.

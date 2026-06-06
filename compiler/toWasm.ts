@@ -1307,6 +1307,16 @@ export const toWasm = async (ast: VLProgramNode) => {
       // stored field type within the branch.
       const key = placeKey(node);
       if (key !== null && key in narrowed) return narrowed[key];
+      // Shared-field access over a struct union (`(A | B).tag`): the result type
+      // is the union of the field's type across members (`sharedUnionField` in
+      // typecheck mirrors this). Resolve it here so `objectTypeOf` isn't asked to
+      // treat a union as a single struct.
+      let ot = softenImplicitType(codegenType(node.object));
+      while (ot.type === "Infer") ot = softenImplicitType(ot.subType);
+      if (ot.type === "Union" || ot.type === "Nullable") {
+        const shared = unionFieldType(ot, node.property);
+        if (shared) return shared;
+      }
       const obj = objectTypeOf(node.object);
       const field = obj.properties.find((p) =>
         p.name.type === "StringLiteral" && p.name.value === node.property
@@ -2612,6 +2622,17 @@ export const toWasm = async (ast: VLProgramNode) => {
         );
       }
       case "PropertyAccess": {
+        // Shared-field access over a struct union (`(A | B).tag`): the field is
+        // present on every member but the object's static type is a union, not a
+        // single struct. Recover each member's payload (by tag) and read the
+        // field at THAT member's own index — members may store a shared field at
+        // different indices, so we dispatch on the tag rather than assume a common
+        // layout. Sound because the type-checker already proved every member
+        // carries the field (see `sharedUnionField` in typecheck.ts).
+        {
+          const shared = sharedUnionFieldRead(node);
+          if (shared !== null) return shared;
+        }
         const objType = objectTypeOf(node.object);
         // List size members are intrinsic struct reads: `.length` → `len`,
         // `.capacity` → `cap` (both O(1)). A raw i32-array (string) keeps
@@ -3647,9 +3668,21 @@ export const toWasm = async (ast: VLProgramNode) => {
       : binaryen.i32;
   // A stable discriminant key for a variant — a value member by (rep, boolean?)
   // so `boolean` and `i32` (same rep) stay distinct while an `i32` *literal*
-  // still matches the `i32` member; a reference member by its interned wasm ref
-  // type so distinct shapes get distinct tags. Used both to order variants
+  // still matches the `i32` member; a reference member by its STRUCTURAL shape
+  // signature so distinct shapes get distinct tags. Used both to order variants
   // canonically and to map a checked/assigned type back to its tag.
+  //
+  // SOUNDNESS: a struct member keys on `structSig` (field names + recursive
+  // shape), NOT on `toWasmType`. WasmGC erases field names — `{tag,x}` and
+  // `{tag,y}` both lower to `(struct i32 i32)` and binaryen interns them to ONE
+  // heap type — so a wasm-type key would give two distinct struct variants the
+  // SAME tag, making `v is A` return true for a `B` value (a wrong `is` answer).
+  // Keying on the field-name-aware `structSig` keeps them apart, so the tag a
+  // value is boxed with at a flow boundary matches the tag `is A` tests.
+  // Discrimination is therefore by STRUCTURAL shape: two `type` aliases with the
+  // *same* field shape are the same variant (under structural typing a `B` value
+  // genuinely IS an `A`), and a union of same-shape members needs an explicit
+  // discriminant field to tell its variants apart.
   const variantKey = (type: VLType): string => {
     let t = softenImplicitType(type);
     while (t.type === "Infer") t = softenImplicitType(t.subType);
@@ -3659,7 +3692,11 @@ export const toWasm = async (ast: VLProgramNode) => {
     // A bare numeric literal carries no scalar `name`, but its rep is fixed.
     if (t.type === "IntegerLiteral") return `v:${binaryen.i32}:n`;
     if (t.type === "RealLiteral") return `v:${binaryen.f64}:n`;
-    return `r:${toWasmType(t)}`;
+    // A struct keys on its field-name-aware shape (see SOUNDNESS note); other
+    // reference types (string, list, map, closure) have no field-name shape, so
+    // `structSig` falls back to their interned wasm ref type — which IS a sound
+    // discriminant for them (distinct wasm reps ⇒ distinct keys).
+    return `r:${structSig(t)}`;
   };
   // A *globally* stable tag per variant key (and for `null`). Tags must agree
   // across every union a value flows through — in particular a value boxed as
@@ -3829,6 +3866,121 @@ export const toWasm = async (ast: VLProgramNode) => {
       m.ref.cast(payload, box.refType),
       repWasm(vn),
       false,
+    );
+  };
+  // The type of a field shared by every member of a struct union/nullable, or
+  // null if some member lacks it (or isn't a struct) — the codegen-side mirror of
+  // typecheck's `sharedUnionField`, used to type a `(A | B).tag` access.
+  const unionFieldType = (
+    union: VLType,
+    property: string,
+  ): VLType | null => {
+    const members = union.type === "Union"
+      ? union.subTypes
+      : union.type === "Nullable"
+      ? [union.subType]
+      : [union];
+    const fieldTypes: VLType[] = [];
+    for (const member of members) {
+      let m2 = softenImplicitType(member);
+      while (m2.type === "Infer") m2 = softenImplicitType(m2.subType);
+      if (m2.type !== "Object") return null;
+      const field = m2.properties.find((p) =>
+        p.name.type === "StringLiteral" && p.name.value === property
+      );
+      if (!field) return null;
+      fieldTypes.push(field.type);
+    }
+    if (fieldTypes.length === 0) return null;
+    // Dedupe structurally-equal field types (the common case — every member's
+    // shared field has the SAME type, e.g. `tag: i32`) so we return that single
+    // type rather than a `T | T` union; otherwise a real `Union` of the variants.
+    const unique: VLType[] = [];
+    for (const ft of fieldTypes) {
+      if (!unique.some((u) => structSig(u) === structSig(ft))) unique.push(ft);
+    }
+    return unique.length === 1
+      ? unique[0]
+      : { type: "Union", subTypes: unique };
+  };
+  // Read a field shared by every member of a struct union directly off the
+  // union value, without narrowing — `(A | B).tag`. Returns null when `node`
+  // isn't such an access (a non-union object, or a field not on every member),
+  // leaving the normal single-struct path to handle it.
+  //
+  // SOUNDNESS: every union member is a distinct struct that may store the shared
+  // field at a DIFFERENT index (`{a, z}` vs `{z}`), so we dispatch on the box's
+  // tag, recover that member's payload (`ref.cast` to its struct via
+  // `unboxPayload`), and read the field at that member's own index. The branches
+  // are exhaustive over the union's variants — the type-checker proved the field
+  // is present on all of them — so the final fall-through is unreachable.
+  const sharedUnionFieldRead = (
+    node: { object: VLExpression; property: string },
+  ): number | null => {
+    let objType = softenImplicitType(codegenType(node.object));
+    while (objType.type === "Infer") objType = softenImplicitType(objType.subType);
+    const info = unionInfo(objType);
+    if (!info) return null;
+    // Only all-struct members carry named fields; bail if any member is a scalar
+    // or other reference (a string/list has no user field), or lacks the field.
+    type Hit = { tag: number; member: VLObjectType; index: number; wasm: number };
+    const hits: Hit[] = [];
+    for (const member of info.variants) {
+      let m2 = softenImplicitType(member);
+      while (m2.type === "Infer") m2 = softenImplicitType(m2.subType);
+      if (!isStructObject(m2)) return null;
+      const struct = objectStruct(m2);
+      const field = struct.fields.find((f) => f.name === node.property);
+      if (!field) return null;
+      hits.push({
+        tag: variantTag(info, member),
+        member: m2,
+        index: field.index,
+        wasm: toWasmType(field.type),
+      });
+    }
+    if (hits.length === 0) return null;
+    // SOUNDNESS: every member must store the shared field with the SAME wasm rep,
+    // or a single `struct.get` rep would misread one variant (an i32 read off a
+    // ref field). If reps differ, bail — the access then requires an `is`/`==`
+    // narrowing (the type-checker's `sharedUnionField` mirrors this).
+    const fieldWasm = hits[0].wasm;
+    if (hits.some((h) => h.wasm !== fieldWasm)) return null;
+    // Evaluate the union value once into a local: we read its tag, then its
+    // payload, in the dispatch chain below.
+    const unionWasm = info.refType;
+    const idx = _locals.push(unionWasm) - 1 + (_locals.params ?? 0);
+    const tagOfBox = m.struct.get(
+      0,
+      m.local.get(idx, unionWasm),
+      binaryen.i32,
+      false,
+    );
+    const payloadOf = () =>
+      m.struct.get(1, m.local.get(idx, unionWasm), info.payloadWasm, false);
+    // Fold the members into a tag-dispatched read. The LAST member is the
+    // unconditional fall-through (the chain is exhaustive — the type-checker
+    // proved every variant carries the field), so it needs no tag guard; every
+    // earlier member is selected by a `tag ==` test.
+    const readMember = (h: Hit): number =>
+      m.struct.get(
+        h.index,
+        m.ref.cast(payloadOf(), objectStruct(h.member).refType),
+        h.wasm,
+        false,
+      );
+    let chain: number = readMember(hits[hits.length - 1]);
+    for (let i = hits.length - 2; i >= 0; i--) {
+      chain = m.if(
+        m.i32.eq(tagOfBox, m.i32.const(hits[i].tag)),
+        readMember(hits[i]),
+        chain,
+      );
+    }
+    return m.block(
+      null,
+      [m.local.set(idx, toExpression(node.object)), chain],
+      binaryen.auto,
     );
   };
   // A typed zero, for the value-kind payload slot of a boxed `null` (unread).

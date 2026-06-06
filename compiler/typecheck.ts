@@ -366,6 +366,16 @@ export const _typeFromExpression = (
       // type; soften it to the nominal `string` array Object so its intrinsic
       // members resolve like a bound `string` (see `getChildType`).
       if (objType.type === "StringLiteral") objType = softenImplicitType(objType);
+      // Shared-field access over a struct union (`(A | B).tag`): a field on every
+      // member is readable on the union directly (see `sharedUnionField`).
+      if (objType.type === "Union") {
+        const shared = sharedUnionField(objType, {
+          type: "StringLiteral",
+          value: expr.property,
+        });
+        if (shared) return shared;
+        return { type: "Never" };
+      }
       if (objType.type !== "Object") return { type: "Never" };
       // `array.length` is an intrinsic i32 (not a structural member).
       if (expr.property === "length" && arrayElementType(objType)) {
@@ -1358,6 +1368,33 @@ export const getType = (name: string, ctx: Context): VLType => {
   return { type: "Unknown" };
 };
 
+// A field shared by every member of a struct union: its type, or undefined if a
+// member is not a struct carrying the field, or the members disagree on its
+// type. Backs shared-field access (`(A | B).tag`). The rule is deliberately
+// strict — EVERY member must have the field with the SAME type — so codegen can
+// read it with one `struct.get` rep (a differing-rep field would misread a
+// variant). A field that is not shared, or shared with differing types, still
+// requires an `is`/`==` narrowing (the caller falls through to the normal error).
+const sharedUnionField = (
+  union: VLType & { type: "Union" },
+  property: VLStringLiteralNode,
+): VLType | undefined => {
+  let shared: VLType | undefined;
+  for (const member of union.subTypes) {
+    let m = softenImplicitType(member);
+    while (m.type === "Infer") m = softenImplicitType(m.subType);
+    if (m.type !== "Object") return undefined;
+    const field = m.properties.find((p) => validateType(p.name, property));
+    if (!field) return undefined;
+    // Require a single, mutually-assignable field type across the members.
+    if (shared === undefined) shared = field.type;
+    else if (
+      !(validateType(shared, field.type) && validateType(field.type, shared))
+    ) return undefined;
+  }
+  return shared;
+};
+
 export const getChildType = (
   object: VLType,
   property: VLType,
@@ -1379,6 +1416,18 @@ export const getChildType = (
   // (A char literal `'a'` is an IntegerLiteral, never a StringLiteral, so it is
   // unaffected and correctly carries no members.)
   if (object.type === "StringLiteral") object = softenImplicitType(object);
+  // SHARED-FIELD ACCESS over a struct union: a field present on EVERY member
+  // with the SAME type is readable on the union directly, without narrowing —
+  // `(A | B).tag` when both `A` and `B` carry `tag: i32`. Codegen dispatches on
+  // the variant tag and reads the field at that member's own struct index (see
+  // `sharedUnionFieldRead` in `toWasm.ts`). If any member lacks the field (or
+  // they disagree on its type), this falls through to the normal error below — a
+  // union is otherwise NOT an `Object`, so an unshared field still requires an
+  // `is`/`==` narrowing.
+  if (object.type === "Union" && property.type === "StringLiteral") {
+    const memberFields = sharedUnionField(object, property);
+    if (memberFields) return memberFields;
+  }
   if (object.type !== "Object") {
     errors.push({
       type: "Type",
