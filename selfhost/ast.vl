@@ -1,0 +1,163 @@
+// AST + token model for the VL-in-VL parser (H3 self-hosting, slice 2).
+//
+// This is the data layer shared by `selfhost/parser.vl`. VL has no module system
+// yet, so the TS harness (`tests/selfhost_parser_test.ts`) concatenates this file
+// ahead of the parser and a print-driver before compiling.
+//
+// ── Why an ARENA (flat `Node[]`, children by `i32` index) ────────────────────
+// The natural AST encoding — a recursive struct with `left: Node | null` child
+// refs, or a `NumLit | BinExpr | …` union narrowed with `is` — both miscompile or
+// misbehave on master today (see the gap inventory in the PR). So nodes live in a
+// flat array and reference each other by INDEX (`-1` == none). This sidesteps
+// recursive struct reps and `is`-over-struct-union discrimination entirely, and
+// is in fact how many production self-hosted parsers represent their AST.
+//
+// One consequence drives the whole shape of `parser.vl`: `.push` onto an array
+// that is a STRUCT FIELD crashes codegen, but `.push` onto an array PARAMETER (or
+// a plain local) works and the mutation propagates (arrays are WasmGC refs). So
+// the arena (`Node[]`) and the token list (`Tok[]`) are threaded as explicit
+// array parameters, never wrapped in a parser-state struct. Only the scalar
+// cursor lives in a struct (`Cur`), because a struct's scalar field CAN be
+// mutated in place.
+
+// ── Token ────────────────────────────────────────────────────────────────────
+// A minimal inline token (NOT the real lexer — a parallel agent owns that). The
+// `kind` is a plain string tag, matching the convention the self-hosted lexer
+// already uses: VL has no enum / closed-literal-union tag representation (A16),
+// and a bare `string` compares with `==` and prints directly.
+type Tok = {
+  kind: string,
+  text: string,
+  pos: i32
+}
+
+// ── AST node ───────────────────────────────────────────────────────────────
+// A single struct for every node KIND, discriminated by the `kind` string field.
+// Fields are a union of everything any kind needs (a "wide row"); a given kind
+// uses the subset that applies and leaves the rest at their zero value:
+//
+//   kind        meaning of the fields
+//   ─────────── ───────────────────────────────────────────────────────────────
+//   "num"       text = literal lexeme
+//   "str"       text = literal lexeme (raw, quotes kept)
+//   "char"      text = literal lexeme (raw, quotes kept)
+//   "bool"      text = "true" | "false"
+//   "ident"     text = identifier name
+//   "binary"    op = operator lexeme,  a = left node,  b = right node
+//   "unary"     op = operator lexeme,  a = operand node
+//   "call"      a = callee node,  kids = argument nodes
+//   "member"    a = object node,   text = property name
+//   "paren"     a = inner node
+//   "let"       text = name, op = "let"|"const", b = type-annotation node (-1 if
+//               none), a = initializer node (-1 if none)
+//   "param"     text = name, b = type-annotation node (-1 if none)
+//   "typeref"   text = type name (annotation leaf)
+//   "function"  text = name, kids = param nodes, a = body block node
+//   "if"        a = condition, b = then-branch, c = else-branch (-1 if none)
+//   "return"    a = argument node (-1 if bare `return`)
+//   "block"     kids = statement nodes
+//   "program"   kids = top-level statement nodes
+//
+// `a`/`b`/`c` are positional child indices; `kids` is a child LIST. `-1` is the
+// null child. Keeping literal VALUES as their source `text` (rather than a parsed
+// `f64`) is also a deliberate workaround: an integer literal used as an `f64`
+// STRUCT FIELD is not coerced and miscompiles today, and the parser has no reason
+// to evaluate numbers anyway.
+type Node = {
+  kind: string,
+  text: string,
+  op: string,
+  a: i32,
+  b: i32,
+  c: i32,
+  kids: i32[]
+}
+
+// The parser cursor. A one-field struct so the position can be mutated in place
+// and shared across recursive-descent calls (a struct's scalar field is mutable;
+// an array field is not push-able — hence the arena travels separately).
+type Cur = {
+  pos: i32
+}
+
+// ── Arena constructors ───────────────────────────────────────────────────────
+// Every constructor appends to the `nodes` arena (an array PARAMETER, so the push
+// propagates to the caller) and returns the new node's index.
+
+// The general constructor. `kids` must be a local/parameter array — an inline
+// `[]` or a call result used directly as the `kids:` field value crashes codegen.
+function makeNode(
+  nodes: Node[],
+  kind: string,
+  text: string,
+  op: string,
+  a: i32,
+  b: i32,
+  c: i32,
+  kids: i32[]
+): i32 {
+  nodes.push({ kind: kind, text: text, op: op, a: a, b: b, c: c, kids: kids })
+  nodes.length - 1
+}
+
+// A childless node (literals, identifiers, type refs). Builds the empty `kids`
+// list as a local first (an inline `[]` field value miscompiles).
+function makeLeaf(nodes: Node[], kind: string, text: string): i32 {
+  let none: i32[] = []
+  makeNode(nodes, kind, text, "", -1, -1, -1, none)
+}
+
+function makeUnary(nodes: Node[], op: string, operand: i32): i32 {
+  let none: i32[] = []
+  makeNode(nodes, "unary", "", op, operand, -1, -1, none)
+}
+
+function makeBinary(nodes: Node[], op: string, left: i32, right: i32): i32 {
+  let none: i32[] = []
+  makeNode(nodes, "binary", "", op, left, right, -1, none)
+}
+
+function makeMember(nodes: Node[], obj: i32, prop: string): i32 {
+  let none: i32[] = []
+  makeNode(nodes, "member", prop, "", obj, -1, -1, none)
+}
+
+function makeParen(nodes: Node[], inner: i32): i32 {
+  let none: i32[] = []
+  makeNode(nodes, "paren", "", "", inner, -1, -1, none)
+}
+
+function makeCall(nodes: Node[], callee: i32, args: i32[]): i32 {
+  makeNode(nodes, "call", "", "", callee, -1, -1, args)
+}
+
+// ── int → string ─────────────────────────────────────────────────────────────
+// The `toString` builtin still does not resolve inside a function / loop body
+// today (the gap the lexer spike found), so the harness renders node indices and
+// counts with this hand-rolled converter, built from single-char digit literals.
+function digitChar(d: i32): string {
+  if d == 0 { return "0" }
+  if d == 1 { return "1" }
+  if d == 2 { return "2" }
+  if d == 3 { return "3" }
+  if d == 4 { return "4" }
+  if d == 5 { return "5" }
+  if d == 6 { return "6" }
+  if d == 7 { return "7" }
+  if d == 8 { return "8" }
+  "9"
+}
+
+function i32ToStr(n: i32): string {
+  if n == 0 { return "0" }
+  let neg = n < 0
+  let m = n
+  if neg { m = 0 - m }
+  let out = ""
+  while m > 0 {
+    out = digitChar(m % 10) + out
+    m = m / 10
+  }
+  if neg { out = "-" + out }
+  out
+}

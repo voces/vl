@@ -1,0 +1,425 @@
+// A recursive-descent parser for a meaningful subset of VL, written in VL
+// (H3 self-hosting, slice 2 — the component after the lexer).
+//
+// It consumes a token stream (a `Tok[]`, built by the harness — this is the
+// PARSER, not an integrated pipeline, so the real lexer is out of scope) and
+// builds an arena AST (see `selfhost/ast.vl`). Grammar covered:
+//
+//   program    := stmt*
+//   stmt       := letDecl | funcDecl | ifStmt | returnStmt | block | exprStmt
+//   letDecl    := ("let" | "const") IDENT (":" type)? ("=" expr)?
+//   funcDecl   := "function" IDENT "(" params? ")" (":" type)? block
+//   params     := param ("," param)*
+//   param      := IDENT (":" type)?
+//   ifStmt     := "if" expr block ("else" (ifStmt | block))?
+//   returnStmt := "return" expr?
+//   block      := "{" stmt* "}"
+//   type       := IDENT                       (a single type-name annotation)
+//   expr       := binary (precedence climbing)
+//   binary     := unary (BINOP unary)*        (precedence by `binPrec`)
+//   unary      := ("!" | "-") unary | postfix
+//   postfix    := primary ( "(" args? ")" | "." IDENT )*
+//   primary    := NUMBER | STRING | CHAR | "true" | "false" | IDENT | "(" expr ")"
+//
+// ── Structure: two self-recursive dispatchers (a forced VL workaround) ────────
+// A recursive-descent parser is intrinsically MUTUALLY recursive: the expression
+// levels call each other and re-enter through `(expr)` / call args, and a block
+// re-enters statements. VL has no forward references / mutual recursion across
+// top-level functions today — a function may only call a function declared ABOVE
+// it (self-recursion is fine; cross-function back-edges are not). The two cyclic
+// clusters are therefore each folded into ONE self-recursive function with a
+// `mode` string parameter — `pExpr(mode, minPrec, …)` and `pStmt(mode, …)` — that
+// dispatches to the right production and re-enters itself. This is the single
+// biggest expressiveness tax in the file; see the gap inventory.
+//
+// The token list and the node arena are threaded as explicit array PARAMETERS
+// (push-onto-a-struct-field crashes codegen — see the gap inventory); the cursor
+// is a mutable `Cur` box. Errors append a `Diag` (VL has no exceptions) and the
+// parser recovers by synthesizing an "error" leaf so the walk always terminates.
+
+// A parse diagnostic: a message plus the token index it was raised at.
+type Diag = {
+  msg: string,
+  at: i32
+}
+
+// ── cursor primitives ────────────────────────────────────────────────────────
+
+// The current token. Past the end, returns the EOF token (the harness always
+// terminates the stream with one), so callers never index out of range.
+function peekTok(toks: Tok[], c: Cur): Tok {
+  if c.pos >= toks.length {
+    return toks[toks.length - 1]
+  }
+  toks[c.pos]
+}
+
+// The current token's kind (the common case: a discriminating `==` compare).
+function peekKind(toks: Tok[], c: Cur): string {
+  peekTok(toks, c).kind
+}
+
+// Consume and return the current token.
+function advance(toks: Tok[], c: Cur): Tok {
+  let t = peekTok(toks, c)
+  if c.pos < toks.length {
+    c.pos = c.pos + 1
+  }
+  t
+}
+
+// If the current token has `kind`, consume it and return true; else leave the
+// cursor put and return false. (The "match" combinator of a hand-written parser.)
+function accept(toks: Tok[], c: Cur, kind: string): boolean {
+  if peekKind(toks, c) == kind {
+    c.pos = c.pos + 1
+    return true
+  }
+  false
+}
+
+// Consume a token of the expected `kind`; on mismatch, record a diagnostic but
+// still advance (so the parser makes progress and doesn't loop on bad input).
+function expect(toks: Tok[], c: Cur, kind: string, diags: Diag[]): boolean {
+  if peekKind(toks, c) == kind {
+    c.pos = c.pos + 1
+    return true
+  }
+  diags.push({ msg: "expected " + kind + " but found " + peekKind(toks, c), at: c.pos })
+  c.pos = c.pos + 1
+  false
+}
+
+// ── operator precedence ──────────────────────────────────────────────────────
+// Binary-operator binding power. Higher binds tighter. `0` means "not a binary
+// operator", which is also the loop-terminating sentinel in the binary climber.
+function binPrec(kind: string): i32 {
+  if kind == "EQUAL" { return 1 }    // assignment (right-associative)
+  if kind == "OR" { return 2 }
+  if kind == "AND" { return 3 }
+  if kind == "EQ" { return 4 }
+  if kind == "NE" { return 4 }
+  if kind == "LT" { return 5 }
+  if kind == "GT" { return 5 }
+  if kind == "LE" { return 5 }
+  if kind == "GE" { return 5 }
+  if kind == "PLUS" { return 6 }
+  if kind == "MINUS" { return 6 }
+  if kind == "STAR" { return 7 }
+  if kind == "SLASH" { return 7 }
+  if kind == "PERCENT" { return 7 }
+  0
+}
+
+// True for the right-associative operators (assignment): their RHS is parsed at
+// the SAME precedence, not `prec + 1`, so `a = b = c` nests as `a = (b = c)`.
+function rightAssoc(kind: string): boolean {
+  kind == "EQUAL"
+}
+
+// ── type annotations ─────────────────────────────────────────────────────────
+// A single type-name leaf (e.g. `i32`, `string`, a user type). Out of the
+// expression/statement cycles, so it can stand alone above its callers.
+function parseType(toks: Tok[], c: Cur, nodes: Node[], diags: Diag[]): i32 {
+  if peekKind(toks, c) == "IDENT" {
+    return makeLeaf(nodes, "typeref", advance(toks, c).text)
+  }
+  expect(toks, c, "IDENT", diags)
+  makeLeaf(nodes, "typeref", "")
+}
+
+// ── expressions (one self-recursive dispatcher) ──────────────────────────────
+// `mode` selects the production; the function re-enters itself for the next
+// level / a nested expression. `minPrec` only matters for "binary".
+//
+//   mode        production
+//   ─────────── ─────────────────────────────────────────────
+//   "expr"      top-level entry → binary at precedence 1
+//   "binary"    precedence climbing from `minPrec`, seeding from a prior `left`
+//   "unary"     prefix `!` / `-`, else postfix
+//   "postfix"   primary then `(args)` / `.member` chains
+//   "primary"   a literal / identifier / `(expr)`
+//
+// `minPrec` is only consulted by "binary". "binary" seeds its accumulator from
+// `seed` (the already-parsed left operand) — folded into the same function so the
+// climber and the level functions form ONE self-recursion group (a separate
+// `pExpr2` would be a forward reference back into `pExpr`, which VL rejects).
+function pExpr(
+  toks: Tok[],
+  c: Cur,
+  nodes: Node[],
+  diags: Diag[],
+  mode: string,
+  minPrec: i32,
+  seed: i32
+): i32 {
+  if mode == "expr" {
+    let left = pExpr(toks, c, nodes, diags, "unary", 0, -1)
+    return pExpr(toks, c, nodes, diags, "binary", 1, left)
+  }
+  if mode == "binary" {
+    let acc = seed
+    let going = true
+    while going {
+      let k = peekKind(toks, c)
+      let prec = binPrec(k)
+      if prec == 0 || prec < minPrec {
+        going = false
+      } else {
+        let opKind = peekKind(toks, c)
+        let opText = advance(toks, c).text
+        let nextMin = prec + 1
+        if rightAssoc(opKind) { nextMin = prec }
+        let right = pExpr(toks, c, nodes, diags, "unary", 0, -1)
+        right = pExpr(toks, c, nodes, diags, "binary", nextMin, right)
+        acc = makeBinary(nodes, opText, acc, right)
+      }
+    }
+    return acc
+  }
+  if mode == "unary" {
+    let k = peekKind(toks, c)
+    if k == "BANG" {
+      advance(toks, c)
+      return makeUnary(nodes, "!", pExpr(toks, c, nodes, diags, "unary", 0, -1))
+    }
+    if k == "MINUS" {
+      advance(toks, c)
+      return makeUnary(nodes, "-", pExpr(toks, c, nodes, diags, "unary", 0, -1))
+    }
+    return pExpr(toks, c, nodes, diags, "postfix", 0, -1)
+  }
+  if mode == "postfix" {
+    let node = pExpr(toks, c, nodes, diags, "primary", 0, -1)
+    let going = true
+    while going {
+      let k = peekKind(toks, c)
+      if k == "LPAREN" {
+        advance(toks, c)
+        let args: i32[] = []
+        if peekKind(toks, c) != "RPAREN" {
+          args.push(pExpr(toks, c, nodes, diags, "expr", 0, -1))
+          // A call's string-compare can't drive the `while` directly (a
+          // string-returning call in a loop condition miscompiles — see gaps), so
+          // the comma test is read into a local and dispatched in the body.
+          let more = peekKind(toks, c) == "COMMA"
+          while more {
+            advance(toks, c)
+            args.push(pExpr(toks, c, nodes, diags, "expr", 0, -1))
+            more = peekKind(toks, c) == "COMMA"
+          }
+        }
+        expect(toks, c, "RPAREN", diags)
+        node = makeCall(nodes, node, args)
+      } else {
+        if k == "DOT" {
+          advance(toks, c)
+          let prop = ""
+          if peekKind(toks, c) == "IDENT" {
+            prop = advance(toks, c).text
+          } else {
+            expect(toks, c, "IDENT", diags)
+          }
+          node = makeMember(nodes, node, prop)
+        } else {
+          going = false
+        }
+      }
+    }
+    return node
+  }
+  // mode == "primary"
+  let k = peekKind(toks, c)
+  if k == "NUMBER" {
+    return makeLeaf(nodes, "num", advance(toks, c).text)
+  }
+  if k == "STRING" {
+    return makeLeaf(nodes, "str", advance(toks, c).text)
+  }
+  if k == "CHAR" {
+    return makeLeaf(nodes, "char", advance(toks, c).text)
+  }
+  if k == "TRUE" {
+    advance(toks, c)
+    return makeLeaf(nodes, "bool", "true")
+  }
+  if k == "FALSE" {
+    advance(toks, c)
+    return makeLeaf(nodes, "bool", "false")
+  }
+  if k == "IDENT" {
+    return makeLeaf(nodes, "ident", advance(toks, c).text)
+  }
+  if k == "LPAREN" {
+    advance(toks, c)
+    let inner = pExpr(toks, c, nodes, diags, "expr", 0, -1)
+    expect(toks, c, "RPAREN", diags)
+    return makeParen(nodes, inner)
+  }
+  diags.push({ msg: "expected an expression but found " + k, at: c.pos })
+  advance(toks, c)
+  makeLeaf(nodes, "error", "")
+}
+
+// ── statements (one self-recursive dispatcher) ───────────────────────────────
+// `mode` selects the production; the function re-enters itself for nested
+// statements (a block's body, an `else` arm). Each production reads exactly the
+// child slots `ast.vl` documents for its node kind.
+//
+//   mode         production
+//   ──────────── ──────────────────────────────────────────────
+//   "program"    stmt* until EOF
+//   "stmt"       dispatch on the leading keyword
+//   "block"      "{" stmt* "}"
+//   "let"        ("let"|"const") IDENT (":" type)? ("=" expr)?
+//   "function"   "function" IDENT "(" params ")" (":" type)? block
+//   "param"      IDENT (":" type)?
+//   "if"         "if" expr block ("else" (if | block))?
+//   "return"     "return" expr?
+function pStmt(toks: Tok[], c: Cur, nodes: Node[], diags: Diag[], mode: string): i32 {
+  if mode == "program" {
+    let stmts: i32[] = []
+    let going = true
+    while going {
+      let k = peekKind(toks, c)
+      if k == "EOF" {
+        going = false
+      } else {
+        if k == "NEWLINE" || k == "SEMI" {
+          advance(toks, c)
+        } else {
+          stmts.push(pStmt(toks, c, nodes, diags, "stmt"))
+        }
+      }
+    }
+    return makeNode(nodes, "program", "", "", -1, -1, -1, stmts)
+  }
+  if mode == "block" {
+    expect(toks, c, "LBRACE", diags)
+    let stmts: i32[] = []
+    let going = true
+    while going {
+      let k = peekKind(toks, c)
+      if k == "RBRACE" || k == "EOF" {
+        going = false
+      } else {
+        if k == "NEWLINE" || k == "SEMI" {
+          advance(toks, c)
+        } else {
+          stmts.push(pStmt(toks, c, nodes, diags, "stmt"))
+        }
+      }
+    }
+    expect(toks, c, "RBRACE", diags)
+    return makeNode(nodes, "block", "", "", -1, -1, -1, stmts)
+  }
+  if mode == "let" {
+    let kw = advance(toks, c).text  // "let" or "const"
+    let name = ""
+    if peekKind(toks, c) == "IDENT" {
+      name = advance(toks, c).text
+    } else {
+      expect(toks, c, "IDENT", diags)
+    }
+    let typeNode = -1
+    if accept(toks, c, "COLON") {
+      typeNode = parseType(toks, c, nodes, diags)
+    }
+    let initNode = -1
+    if accept(toks, c, "EQUAL") {
+      initNode = pExpr(toks, c, nodes, diags, "expr", 0, -1)
+    }
+    let none: i32[] = []
+    return makeNode(nodes, "let", name, kw, initNode, typeNode, -1, none)
+  }
+  if mode == "param" {
+    let name = ""
+    if peekKind(toks, c) == "IDENT" {
+      name = advance(toks, c).text
+    } else {
+      expect(toks, c, "IDENT", diags)
+    }
+    let typeNode = -1
+    if accept(toks, c, "COLON") {
+      typeNode = parseType(toks, c, nodes, diags)
+    }
+    let none: i32[] = []
+    return makeNode(nodes, "param", name, "", -1, typeNode, -1, none)
+  }
+  if mode == "function" {
+    advance(toks, c)  // "function"
+    let name = ""
+    if peekKind(toks, c) == "IDENT" {
+      name = advance(toks, c).text
+    } else {
+      expect(toks, c, "IDENT", diags)
+    }
+    expect(toks, c, "LPAREN", diags)
+    let params: i32[] = []
+    if peekKind(toks, c) != "RPAREN" {
+      params.push(pStmt(toks, c, nodes, diags, "param"))
+      let more = peekKind(toks, c) == "COMMA"
+      while more {
+        advance(toks, c)
+        params.push(pStmt(toks, c, nodes, diags, "param"))
+        more = peekKind(toks, c) == "COMMA"
+      }
+    }
+    expect(toks, c, "RPAREN", diags)
+    let retType = -1
+    if accept(toks, c, "COLON") {
+      retType = parseType(toks, c, nodes, diags)
+    }
+    let body = pStmt(toks, c, nodes, diags, "block")
+    return makeNode(nodes, "function", name, "", body, retType, -1, params)
+  }
+  if mode == "if" {
+    advance(toks, c)  // "if"
+    let cond = pExpr(toks, c, nodes, diags, "expr", 0, -1)
+    let thenBlock = pStmt(toks, c, nodes, diags, "block")
+    let elseNode = -1
+    if accept(toks, c, "ELSE") {
+      if peekKind(toks, c) == "IF" {
+        elseNode = pStmt(toks, c, nodes, diags, "if")
+      } else {
+        elseNode = pStmt(toks, c, nodes, diags, "block")
+      }
+    }
+    let none: i32[] = []
+    return makeNode(nodes, "if", "", "", cond, thenBlock, elseNode, none)
+  }
+  if mode == "return" {
+    advance(toks, c)  // "return"
+    let arg = -1
+    let k = peekKind(toks, c)
+    let stops = k == "RBRACE" || k == "NEWLINE" || k == "EOF" || k == "SEMI"
+    if !stops {
+      arg = pExpr(toks, c, nodes, diags, "expr", 0, -1)
+    }
+    let none: i32[] = []
+    return makeNode(nodes, "return", "", "", arg, -1, -1, none)
+  }
+  // mode == "stmt": dispatch on the leading token.
+  let k = peekKind(toks, c)
+  if k == "LET" || k == "CONST" {
+    return pStmt(toks, c, nodes, diags, "let")
+  }
+  if k == "FUNCTION" {
+    return pStmt(toks, c, nodes, diags, "function")
+  }
+  if k == "IF" {
+    return pStmt(toks, c, nodes, diags, "if")
+  }
+  if k == "RETURN" {
+    return pStmt(toks, c, nodes, diags, "return")
+  }
+  if k == "LBRACE" {
+    return pStmt(toks, c, nodes, diags, "block")
+  }
+  pExpr(toks, c, nodes, diags, "expr", 0, -1)
+}
+
+// The public entry point: parse a whole program, return the root node index.
+function parseProgram(toks: Tok[], c: Cur, nodes: Node[], diags: Diag[]): i32 {
+  pStmt(toks, c, nodes, diags, "program")
+}

@@ -1,0 +1,260 @@
+// Print-driver for the VL-in-VL parser. VL has no module system yet, so the TS
+// test runner (`tests/selfhost_parser_test.ts`) concatenates `ast.vl`, then
+// `parser.vl`, then this file before compiling. It therefore assumes the AST
+// constructors, the parser entry points, the `Tok`/`Node`/`Cur`/`Diag` types,
+// and `i32ToStr` are already in scope.
+//
+// It hand-builds a token stream for a representative VL snippet (the PARSER is
+// the subject under test, not an integrated lexer pipeline), runs `parseProgram`,
+// and prints the AST as an indented tree — one `<indent><kind> <detail>` line per
+// node — plus a diagnostics summary. The TS runner diffs the whole output.
+
+// Append a token to the stream. `toks` is an array parameter, so the push
+// propagates back to the caller (push onto a struct-field array crashes codegen,
+// so the stream is always a plain local threaded by reference).
+function tok(toks: Tok[], kind: string, text: string): i32 {
+  toks.push({ kind: kind, text: text, pos: toks.length })
+  toks.length - 1
+}
+
+// Build the token stream for this source (a lexer would produce it):
+//
+//   function add(a: i32, b: i32): i32 {
+//     let sum = a + b * 2
+//     if sum >= 10 {
+//       return sum
+//     } else {
+//       return -sum
+//     }
+//   }
+//   const ok = add(1, 2) || flag
+//   result = obj.field.method(x)
+//
+// It exercises: function decl with typed params + return type, a block, a
+// let-decl with a binary expr (precedence: `*` over `+`), an if/else with a
+// comparison and a unary minus, a const-decl with `||` and a call, and a bare
+// expression statement with chained member access + a call.
+function buildTokens(toks: Tok[]): i32 {
+  // function add(a: i32, b: i32): i32 {
+  tok(toks, "FUNCTION", "function")
+  tok(toks, "IDENT", "add")
+  tok(toks, "LPAREN", "(")
+  tok(toks, "IDENT", "a")
+  tok(toks, "COLON", ":")
+  tok(toks, "IDENT", "i32")
+  tok(toks, "COMMA", ",")
+  tok(toks, "IDENT", "b")
+  tok(toks, "COLON", ":")
+  tok(toks, "IDENT", "i32")
+  tok(toks, "RPAREN", ")")
+  tok(toks, "COLON", ":")
+  tok(toks, "IDENT", "i32")
+  tok(toks, "LBRACE", "{")
+  tok(toks, "NEWLINE", "\n")
+  //   let sum = a + b * 2
+  tok(toks, "LET", "let")
+  tok(toks, "IDENT", "sum")
+  tok(toks, "EQUAL", "=")
+  tok(toks, "IDENT", "a")
+  tok(toks, "PLUS", "+")
+  tok(toks, "IDENT", "b")
+  tok(toks, "STAR", "*")
+  tok(toks, "NUMBER", "2")
+  tok(toks, "NEWLINE", "\n")
+  //   if sum >= 10 {
+  tok(toks, "IF", "if")
+  tok(toks, "IDENT", "sum")
+  tok(toks, "GE", ">=")
+  tok(toks, "NUMBER", "10")
+  tok(toks, "LBRACE", "{")
+  tok(toks, "NEWLINE", "\n")
+  //     return sum
+  tok(toks, "RETURN", "return")
+  tok(toks, "IDENT", "sum")
+  tok(toks, "NEWLINE", "\n")
+  //   } else {
+  tok(toks, "RBRACE", "}")
+  tok(toks, "ELSE", "else")
+  tok(toks, "LBRACE", "{")
+  tok(toks, "NEWLINE", "\n")
+  //     return -sum
+  tok(toks, "RETURN", "return")
+  tok(toks, "MINUS", "-")
+  tok(toks, "IDENT", "sum")
+  tok(toks, "NEWLINE", "\n")
+  //   }
+  tok(toks, "RBRACE", "}")
+  tok(toks, "NEWLINE", "\n")
+  // }
+  tok(toks, "RBRACE", "}")
+  tok(toks, "NEWLINE", "\n")
+  // const ok = add(1, 2) || flag
+  tok(toks, "CONST", "const")
+  tok(toks, "IDENT", "ok")
+  tok(toks, "EQUAL", "=")
+  tok(toks, "IDENT", "add")
+  tok(toks, "LPAREN", "(")
+  tok(toks, "NUMBER", "1")
+  tok(toks, "COMMA", ",")
+  tok(toks, "NUMBER", "2")
+  tok(toks, "RPAREN", ")")
+  tok(toks, "OR", "||")
+  tok(toks, "IDENT", "flag")
+  tok(toks, "NEWLINE", "\n")
+  // result = obj.field.method(x)   (expression statement: an assignment binary)
+  tok(toks, "IDENT", "result")
+  tok(toks, "EQUAL", "=")
+  tok(toks, "IDENT", "obj")
+  tok(toks, "DOT", ".")
+  tok(toks, "IDENT", "field")
+  tok(toks, "DOT", ".")
+  tok(toks, "IDENT", "method")
+  tok(toks, "LPAREN", "(")
+  tok(toks, "IDENT", "x")
+  tok(toks, "RPAREN", ")")
+  tok(toks, "NEWLINE", "\n")
+  tok(toks, "EOF", "")
+  toks.length
+}
+
+// Render `n` spaces of indentation.
+function indent(depth: i32): string {
+  let s = ""
+  let i = 0
+  while i < depth {
+    s = s + "  "
+    i = i + 1
+  }
+  s
+}
+
+// Print the AST as an indented tree, one `<indent><kind> <detail>` line per node;
+// `detail` surfaces the discriminating payload so the diff catches a mis-parse
+// (wrong operator, swapped operands, a lost child).
+//
+// Folded into ONE self-recursive function because, like the parser, a tree walk
+// is mutually recursive (a node prints its children; a child list prints nodes)
+// and VL has no forward references / mutual recursion between top-level functions.
+// `mode` selects the shape:
+//   "node" — print node `i` and recurse into its child slots / kids list.
+//   "list" — print `kids[listIdx]` then tail-recurse to `listIdx + 1`.
+// A child slot of `-1` (absent) is a no-op, so optional children need no guard at
+// the call site.
+function walk(nodes: Node[], i: i32, kids: i32[], listIdx: i32, depth: i32, mode: string): i32 {
+  if mode == "list" {
+    if listIdx < kids.length {
+      walk(nodes, kids[listIdx], kids, 0, depth, "node")
+      walk(nodes, -1, kids, listIdx + 1, depth, "list")
+    }
+    return 0
+  }
+  // mode == "node"
+  if i < 0 {
+    return 0
+  }
+  let n = nodes[i]
+  let pad = indent(depth)
+  let k = n.kind
+  let d1 = depth + 1
+
+  if k == "program" {
+    print(pad + "program")
+    return walk(nodes, -1, n.kids, 0, d1, "list")
+  }
+  if k == "function" {
+    print(pad + "function " + n.text)
+    walk(nodes, -1, n.kids, 0, d1, "list")
+    return walk(nodes, n.a, n.kids, 0, d1, "node")
+  }
+  if k == "param" {
+    print(pad + "param " + n.text)
+    return walk(nodes, n.b, n.kids, 0, d1, "node")
+  }
+  if k == "typeref" {
+    print(pad + "type " + n.text)
+    return 0
+  }
+  if k == "block" {
+    print(pad + "block")
+    return walk(nodes, -1, n.kids, 0, d1, "list")
+  }
+  if k == "let" {
+    print(pad + n.op + " " + n.text)
+    walk(nodes, n.b, n.kids, 0, d1, "node")
+    return walk(nodes, n.a, n.kids, 0, d1, "node")
+  }
+  if k == "if" {
+    print(pad + "if")
+    walk(nodes, n.a, n.kids, 0, d1, "node")
+    walk(nodes, n.b, n.kids, 0, d1, "node")
+    return walk(nodes, n.c, n.kids, 0, d1, "node")
+  }
+  if k == "return" {
+    print(pad + "return")
+    return walk(nodes, n.a, n.kids, 0, d1, "node")
+  }
+  if k == "binary" {
+    print(pad + "binary " + n.op)
+    walk(nodes, n.a, n.kids, 0, d1, "node")
+    return walk(nodes, n.b, n.kids, 0, d1, "node")
+  }
+  if k == "unary" {
+    print(pad + "unary " + n.op)
+    return walk(nodes, n.a, n.kids, 0, d1, "node")
+  }
+  if k == "call" {
+    print(pad + "call")
+    walk(nodes, n.a, n.kids, 0, d1, "node")
+    return walk(nodes, -1, n.kids, 0, d1, "list")
+  }
+  if k == "member" {
+    print(pad + "member ." + n.text)
+    return walk(nodes, n.a, n.kids, 0, d1, "node")
+  }
+  if k == "paren" {
+    print(pad + "paren")
+    return walk(nodes, n.a, n.kids, 0, d1, "node")
+  }
+  if k == "num" {
+    print(pad + "num " + n.text)
+    return 0
+  }
+  if k == "str" {
+    print(pad + "str " + n.text)
+    return 0
+  }
+  if k == "char" {
+    print(pad + "char " + n.text)
+    return 0
+  }
+  if k == "bool" {
+    print(pad + "bool " + n.text)
+    return 0
+  }
+  if k == "ident" {
+    print(pad + "ident " + n.text)
+    return 0
+  }
+  print(pad + k + " " + n.text)
+  0
+}
+
+// ── run ──────────────────────────────────────────────────────────────────────
+let toks: Tok[] = []
+buildTokens(toks)
+
+let nodes: Node[] = []
+let diags: Diag[] = []
+let c: Cur = { pos: 0 }
+let root = parseProgram(toks, c, nodes, diags)
+
+let noKids: i32[] = []
+walk(nodes, root, noKids, 0, 0, "node")
+
+print("== nodes: " + i32ToStr(nodes.length) + " ==")
+print("== diagnostics: " + i32ToStr(diags.length) + " ==")
+let di = 0
+while di < diags.length {
+  print(diags[di].msg + " @ " + i32ToStr(diags[di].at))
+  di = di + 1
+}
