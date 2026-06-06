@@ -136,6 +136,8 @@ Deno.test("SEMANTIC_TOKEN_LEGEND: stable, expected order", () => {
     "boolean",
     "operator",
     "comment",
+    "property",
+    "method",
   ]);
   assertEquals(SEMANTIC_TOKEN_LEGEND.tokenModifiers, ["declaration"]);
 });
