@@ -217,7 +217,11 @@ D1/D2.*
   (`compiler/symbols.ts`) during its scope walk; the LSP queries it by cursor (`textDocument/definition`
   + `textDocument/references`). Locals, params, function decls, type aliases; single-document. → `DECISIONS.md`.
 - ⬜ **D3. Autocomplete** (scope-aware; structural members).
-- ⬜ **D4. Formatter** (+ `vl fmt`).
+- 🟡 **D4. Formatter** (+ `vl fmt`). Done (CLI): `vl fmt` (stdout / `-w` write / `--check` gate / dir walk
+  / stdin) — a **comment-preserving token reformatter** (canonical whitespace/indent), not an AST printer
+  (the lexer drops `//` comments and the AST is span-less → an AST printer would eat comments; → `DECISIONS.md`).
+  Idempotent + AST-preserving (corpus round-trip tested). REMAINING: line reflow/wrapping; LSP
+  `textDocument/formatting` wiring (deferred to avoid the D6 PR).
 - ⬜ **D5. Semantic tokens.**
 - ⬜ **D6. Inlay hints** for inferred types — *the* feature for a "types are hidden" language.
 - ⬜ **D7. Cross-references in doc-comments** — expand `///` docs with clickable symbol links following

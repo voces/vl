@@ -107,3 +107,11 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
   stack — so the symbol table is populated during that same walk rather than by a separate post-parse
   resolver (which would duplicate scope/shadowing logic and drift from the checker). Position-indexed,
   single-document; cross-file and builtins are out of scope. (D2)
+- **`vl fmt` is a comment-preserving token reformatter, not an AST printer.** The lexer drops plain `//`
+  comments (no token/span; only `///` doc-comments survive) and the public AST is span-less and lossy for
+  some surface forms — so an AST→source printer would silently delete every comment (and every corpus file
+  + the test `// @directive` lines rely on them). Instead the formatter re-scans source into a comment- and
+  newline-retaining token stream and reprints with canonical whitespace, never moving statement-terminating
+  newlines — so output re-parses to the same AST and no comment is ever eaten. Trade-off: it normalizes
+  whitespace/indentation but does not reflow/wrap lines. A faithful AST printer would require
+  comment-carrying tokens + AST spans first. (D4)
