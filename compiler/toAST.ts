@@ -15,6 +15,8 @@ export {
   distinctScalars,
   elseNarrowings,
   getConcreteType,
+  isMapType,
+  mapKeyValueType,
   nonNullable,
   orderArgumentsByParameters,
   placeKey,

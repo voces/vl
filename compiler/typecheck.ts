@@ -301,6 +301,11 @@ export const _typeFromExpression = (
     case "IndexAccess": {
       const objType = typeFromExpression(expr.array, ctx);
       if (objType.type !== "Object") return { type: "Never" };
+      // `Map[k]` is the deliberate exception to sequence indexing: a missing key
+      // is NORMAL ABSENCE, so it yields `V | null` (not a trap). `List[i]`/string
+      // indexing keep their trap-on-OOB `T` result below.
+      const kv = mapKeyValueType(objType);
+      if (kv) return { type: "Nullable", subType: kv.value };
       const propType = typeFromExpression(expr.index, ctx);
       const property = objType.properties.find((p) =>
         validateType(p.name, propType)
@@ -363,6 +368,14 @@ export const _typeFromExpression = (
         const member = listMemberType(arrayElementType(objType)!)[expr.property];
         if (member) return member;
       }
+      // Intrinsic map members (`.size`, `.get`, `.has`, `.set`, `.delete`).
+      {
+        const kv = mapKeyValueType(objType);
+        if (kv) {
+          const member = mapMemberType(kv.key, kv.value)[expr.property];
+          if (member) return member;
+        }
+      }
       const propType: VLStringLiteralNode = {
         type: "StringLiteral",
         value: expr.property,
@@ -423,6 +436,21 @@ export const _typeFromExpression = (
       return { type: "Alias", name: "boolean" };
     }
     case "FunctionCall":
+      // `Map()` / `Set()` builtin constructors (B6a): construction takes its type
+      // from context (the binding annotation), exactly like an empty `[]`. Return
+      // a FRESH inference hole so the surrounding `ensureType(annotation, …)` pins
+      // it to the concrete `{[K]:V}` map type (the swap at ensureType's head makes
+      // an `Infer` actual the inference target). Codegen reads the resolved type
+      // back off the call's `functionType.return` (or the desired type).
+      if (expr.function === "Map" || expr.function === "Set") {
+        const hole: VLType = {
+          type: "Infer",
+          subType: { type: "Unknown" },
+          mapCtor: expr.function,
+        };
+        if (expr.functionType) expr.functionType.return = hole;
+        return hole;
+      }
       // Prefer the per-call instantiated signature (its return is resolved to a
       // concrete type for this call's arguments); the shared scope entry's
       // return may still hold an inference hole pinned by another call site.
@@ -435,8 +463,23 @@ export const _typeFromExpression = (
         }
       }
       return { type: "Never" };
-    case "Call":
-      return expr.functionType?.return ?? { type: "Never" };
+    case "Call": {
+      if (expr.functionType) return expr.functionType.return;
+      // An intrinsic map/set method call (`m.has(k)`, `m.get(k)`, …) parses as a
+      // `Call` with no `functionType` (a `Map` is anonymous, so it isn't a scope
+      // method). Resolve its return from the map member here so `let b = m.has(k)`
+      // infers a concrete type rather than `Never`. Codegen lowers it by name.
+      if (expr.callee.type === "PropertyAccess") {
+        let obj = typeFromExpression(expr.callee.object, ctx);
+        if (obj.type === "Infer") obj = obj.subType;
+        const kv = mapKeyValueType(obj);
+        if (kv) {
+          const member = mapMemberType(kv.key, kv.value)[expr.callee.property];
+          if (member?.type === "Function") return member.return;
+        }
+      }
+      return { type: "Never" };
+    }
     case "If": {
       // Flatten the else-if chain — `else if` parses as a nested `if` in the
       // `else`, so follow those too — into the full condition + branch lists and
@@ -681,6 +724,113 @@ export const isListType = (type: VLType): boolean =>
   type.type === "Object" && type.name === undefined &&
   arrayElementType(type) !== null;
 
+// A `Map<K,V>` is a separate hash type (DECISIONS B6a), spelled with a *non-i32*
+// index signature `{[K]: V}` — an i32-key `{[i32]:T}` stays the native list/array
+// path, so a map's key is `string` (the supported hash-key type) for now. Returns
+// `{ key, value }` or null. The discriminator is an anonymous (no `name`) object
+// whose sole index-signature key is a non-i32 type.
+export const mapKeyValueType = (
+  type: VLType,
+): { key: VLType; value: VLType } | null => {
+  if (type.type !== "Object" || type.name !== undefined) return null;
+  const prop = type.properties.find((p) => {
+    // An index-signature key is a *type* node (`{type:"Alias",name:"string"}` /
+    // the `string` Object), NOT a `StringLiteral` (which is a named struct
+    // field). Only soften an already-type-shaped name, so a field literally named
+    // `"string"` never reads as a string-keyed index signature.
+    if (p.name.type === "StringLiteral") return false;
+    const name = softenImplicitType(p.name);
+    return name.type === "Object" && name.name === "string";
+  });
+  if (!prop) return null;
+  return { key: softenImplicitType(prop.name), value: prop.type };
+};
+
+export const isMapType = (type: VLType): boolean =>
+  mapKeyValueType(type) !== null;
+
+// A `Set<T>` is spelled as a boolean-valued map `{[T]: boolean}` (uncommitted,
+// provisional surface) — the value carries presence; `.add(x)` sets it, `.has` /
+// `.delete` / `.size` / `.keys()` work as the map members. So a set IS a map, with
+// an extra `.add` member exposed when the value type is boolean.
+export const isSetType = (type: VLType): boolean => {
+  const kv = mapKeyValueType(type);
+  if (!kv) return false;
+  const v = softenImplicitType(kv.value);
+  return v.type === "Object" && v.name === "boolean";
+};
+
+// The intrinsic `Map<K,V>` members (`.size` / `.get` / `.has` / `.set` /
+// `.delete`). A `Map` is an anonymous structural `{[K]:V}` object, so — like list
+// members — these are special-cased here rather than declared on a scope object.
+// `m[k]` (index access) yields `V | null` (normal absence) and `m[k] = v` sets;
+// those are handled at the index-access sites.
+export const mapMemberType = (
+  key: VLType,
+  value: VLType,
+): Record<string, VLType> => {
+  const v = softenImplicitType(value);
+  const isSet = v.type === "Object" && v.name === "boolean";
+  return {
+  // `Set<T>.add(x)`: insert `x` (presence). Exposed only on a boolean-valued map
+  // (the Set spelling). Returns null.
+  ...(isSet
+    ? {
+      add: {
+        type: "Function" as const,
+        paramaters: [{
+          type: "Parameter" as const,
+          name: "value",
+          paramaterType: key,
+        }],
+        return: { type: "Alias" as const, name: "null" },
+      },
+    }
+    : {}),
+  // O(1) live entry count (property syntax, read-only).
+  size: { type: "Alias", name: "i32" },
+  // Lookup: `V | null` (null on a missing key — normal absence, not a trap).
+  get: {
+    type: "Function",
+    paramaters: [{ type: "Parameter", name: "key", paramaterType: key }],
+    return: { type: "Nullable", subType: value },
+  },
+  // Membership test.
+  has: {
+    type: "Function",
+    paramaters: [{ type: "Parameter", name: "key", paramaterType: key }],
+    return: { type: "Alias", name: "boolean" },
+  },
+  // Insert or overwrite; returns null.
+  set: {
+    type: "Function",
+    paramaters: [
+      { type: "Parameter", name: "key", paramaterType: key },
+      { type: "Parameter", name: "value", paramaterType: value },
+    ],
+    return: { type: "Alias", name: "null" },
+  },
+  // Remove a key; returns whether it was present.
+  delete: {
+    type: "Function",
+    paramaters: [{ type: "Parameter", name: "key", paramaterType: key }],
+    return: { type: "Alias", name: "boolean" },
+  },
+  // Insertion-ordered snapshot lists — the iteration surface (`for k in
+  // m.keys()`), since the parser's `for…in` only admits i32-keyed arrays/lists.
+  keys: {
+    type: "Function",
+    paramaters: [],
+    return: listOf(key),
+  },
+  values: {
+    type: "Function",
+    paramaters: [],
+    return: listOf(value),
+  },
+  };
+};
+
 // The intrinsic *list* members (`T[]`'s `.capacity` / `.get` / `.push` / `.pop`
 // / `.clear`), special-cased here because a `T[]` is an anonymous structural
 // type — it has no nominal `name` to hang these on in `defaultScope` the way
@@ -817,8 +967,28 @@ export const typeFromStatement = (
       return stmt.value
         ? typeFromExpression(stmt.value, ctx)
         : { type: "Alias", name: "null" };
-    case "VariableDeclaration":
+    case "VariableDeclaration": {
+      // A `Map()` / `Set()` with no annotation to pin its type: the constructor
+      // hole was never run through `ensureType`, so it stays an unresolved
+      // `Infer<Unknown>` carrying its `mapCtor` tag. Report a clear error (it
+      // would otherwise die in codegen as a bare `Unknown` type). Clearing the
+      // tag makes this fire exactly once even if the statement is re-typed.
+      const vt = stmt.variableType;
+      if (
+        vt.type === "Infer" && vt.mapCtor && vt.subType.type === "Unknown"
+      ) {
+        errors.push({
+          type: "Syntax",
+          message:
+            `${vt.mapCtor}() needs a map type annotation ` +
+            "(e.g. `let m: {[string]: i32} = Map()`)",
+          ctx,
+          code: 0,
+        });
+        vt.mapCtor = undefined;
+      }
       return stmt.variableType;
+    }
     case "While":
       // A `while true` with no `break` escaping it diverges: it never fails its
       // test, and `return` leaves the whole function — so it never falls through
@@ -1168,6 +1338,15 @@ export const getChildType = (
   if (property.type === "StringLiteral" && isListType(object)) {
     const member = listMemberType(arrayElementType(object)!)[property.value];
     if (member) return member;
+  }
+
+  // Intrinsic map members (`.size`, `.get`, `.has`, `.set`, `.delete`).
+  if (property.type === "StringLiteral") {
+    const kv = mapKeyValueType(object);
+    if (kv) {
+      const member = mapMemberType(kv.key, kv.value)[property.value];
+      if (member) return member;
+    }
   }
 
   let propertyType = object.properties.find((p) =>
@@ -1757,6 +1936,24 @@ export const ensureType = (
       }
 
       if (right.type !== "Object") return pushError(25);
+      // A `Map<K,V>` is a distinct hash type, not a plain object: an object
+      // literal coerced to a map type (`let o: {[string]: i32} = {}`) is a
+      // category error (and would hard-fail in codegen — the struct shapes
+      // differ). Reject it with a clear message. Map-to-map assignment is fine
+      // (both sides are map types), so only block a non-map object value flowing
+      // into a map-typed slot.
+      if (isMapType(left) && !isMapType(right)) {
+        errors.push({
+          type: "Syntax",
+          message:
+            "An object literal isn't a map value — construct a map with " +
+            "`Map()` (or a set with `Set()`), e.g. " +
+            "`let m: {[string]: i32} = Map()`",
+          ctx,
+          code: 0,
+        });
+        return false;
+      }
       // Coinductive guard: while already comparing this exact pair (a recursive
       // type reached through its own fields), assume the relation holds so the
       // structural walk terminates (A11).
@@ -1884,6 +2081,36 @@ export const ensureType = (
       // case.
       return ensureType(left.subType, right.subType, ctx);
     case "Infer": {
+      // A `Map()` / `Set()` constructor hole being pinned by an annotation. The
+      // annotation must be a (string-keyed) map type; otherwise the construction
+      // is ill-formed and would only fail opaquely later (codegen / a missing
+      // `.add` member). Report a clear diagnostic now (B6a).
+      if (left.mapCtor && !isMapType(right)) {
+        if (arrayElementType(right)) {
+          // An i32-keyed `{[i32]: T}` is the native list/array path, not a hash
+          // map — i32-key Map/Set support is a deliberate follow-up.
+          errors.push({
+            type: "Syntax",
+            message:
+              `An i32-keyed ${left.mapCtor} isn't supported yet — i32 keys use ` +
+              "a list/array (`T[]`); `Map`/`Set` keys must be `string` for now",
+            ctx,
+            code: 0,
+          });
+        } else {
+          errors.push({
+            type: "Syntax",
+            message:
+              `${left.mapCtor}() needs a map type annotation ` +
+              "(e.g. `let m: {[string]: i32} = Map()`)",
+            ctx,
+            code: 0,
+          });
+        }
+        // Pin the hole so downstream codegen doesn't see a bare `Unknown`.
+        updateType(left.subType, softenImplicitType(right));
+        return false;
+      }
       if (!validateType(left.subType, right)) {
         if (left.subType.type === "Unknown") updateType(left.subType, right);
         else if (left.subType.type === "Union") {

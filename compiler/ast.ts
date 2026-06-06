@@ -315,7 +315,15 @@ export type VLTypeType = {
   subType: VLType;
   params?: VLInferType[];
 };
-export type VLInferType = { type: "Infer"; subType: VLType };
+export type VLInferType = {
+  type: "Infer";
+  subType: VLType;
+  // Set when this hole is the return of a `Map()` / `Set()` constructor whose
+  // concrete type is to be pinned from context (B6a). Lets the diagnostic checks
+  // recognize an unpinned / wrongly-pinned map constructor and report a clear
+  // error instead of failing opaquely in codegen.
+  mapCtor?: "Map" | "Set";
+};
 export type VLCustomType = {
   type: "Custom";
   validate: (right: VLType) => boolean;
