@@ -18,6 +18,18 @@
 //   2. Unreachable code — any statement that follows a statement which always
 //      diverges (`return` / `break` / `continue`, or an `if/else` where BOTH the
 //      then- and else-branch diverge) within the same block.
+//   3. prefer-`const` — a `let` (VL's reassignable keyword) binding that is
+//      never reassigned should be the immutable `const`. VL matches TS/JS:
+//      `const` is immutable and `let` is the reassignable cell, so the "prefer
+//      the more restrictive form" lint flags an unmutated `let` and suggests
+//      `const`. Underscore bindings are skipped, and an unused binding is left
+//      to the unused-variable rule (more specific).
+//   4. Dead / constant branch — a literal-boolean `if` condition makes a branch
+//      dead: `if false { … }` (dead then-branch) or `if true { … } else { … }`
+//      (dead else-branch); a `while false { … }` body never runs. Flagged from
+//      the literal boolean only — no general constant folding.
+//   5. Degenerate `for` step — a range `for` with a literal `step 0` never makes
+//      progress (an infinite/degenerate loop); flagged as an error.
 //
 // Pure data + AST/span lookups, no runtime globals — bundled into both the Deno
 // CLI and the Node LSP (dual-runtime constraint, see AGENTS.md).
@@ -27,8 +39,10 @@ import type {
   NodeSpans,
   VLBlockNode,
   VLExpression,
+  VLForNode,
   VLIfNode,
   VLStatement,
+  VLWhileNode,
 } from "./ast.ts";
 import { spanOf } from "./ast.ts";
 import type { SymbolTable } from "./symbols.ts";
@@ -55,7 +69,12 @@ export const lint = (
 ): VLDiagnostic[] => {
   const diagnostics: VLDiagnostic[] = [];
   unusedBindings(symbols, diagnostics);
-  for (const stmt of programStatements) unreachableInStatement(stmt, spans, diagnostics);
+  preferConst(symbols, diagnostics);
+  for (const stmt of programStatements) {
+    unreachableInStatement(stmt, spans, diagnostics);
+    constantBranchInStatement(stmt, spans, diagnostics);
+    degenerateStepInStatement(stmt, spans, diagnostics);
+  }
   return diagnostics;
 };
 
@@ -150,7 +169,293 @@ const unusedBindings = (
 };
 
 // ---------------------------------------------------------------------------
-// 2. Unreachable code
+// 2. prefer-`const` (a never-reassigned `let` should be `const`)
+// ---------------------------------------------------------------------------
+
+/**
+ * A `let` binding (VL's reassignable keyword — `Binding.mutable === true`) that
+ * is never the target of an assignment can be the immutable `const` form
+ * instead. The standard "prefer the more restrictive declaration" lint; VL's
+ * `const`/`let` match JS/TS (`const` immutable, `let` reassignable).
+ *
+ * "Reassigned" = the binding has at least one occurrence flagged `isWrite` (an
+ * `x = …` / `x += …` / `x++` target — the parser stamps these). A binding with
+ * no write occurrence is a prefer-`const` candidate.
+ *
+ * Interactions / exemptions:
+ *   - Only `variable` bindings with `mutable === true` (declared `let`).
+ *   - `_`-prefixed names are skipped (intentional, like unused-variable).
+ *   - An *unused* binding (no non-decl occurrence at all) is reported by the
+ *     unused-variable rule instead — the more specific diagnostic — so we skip
+ *     it here to avoid double-flagging the same span.
+ *
+ * Emitted as `info` (a style nudge, not a correctness problem) tagged
+ * `code: "prefer-const"`.
+ */
+const preferConst = (symbols: SymbolTable, out: VLDiagnostic[]): void => {
+  // Per binding: does it have any non-decl occurrence (a use), and any write?
+  const used = new Set<unknown>();
+  const written = new Set<unknown>();
+  for (const occ of symbols.occurrences) {
+    if (occ.isDecl) continue;
+    used.add(occ.binding);
+    if (occ.isWrite) written.add(occ.binding);
+  }
+
+  const reported = new Set<unknown>();
+  for (const occ of symbols.occurrences) {
+    if (!occ.isDecl) continue;
+    const b = occ.binding;
+    if (reported.has(b)) continue;
+    if (b.kind !== "variable" || b.mutable !== true) continue;
+    if (b.name.startsWith("_")) continue;
+    // Unused → unused-variable owns it (more specific); don't also prefer-const.
+    if (!used.has(b)) continue;
+    if (written.has(b)) continue;
+    reported.add(b);
+    out.push({
+      message:
+        `\`${b.name}\` is never reassigned; use \`const\` instead of \`let\``,
+      severity: "info",
+      range: rangeFromCtx(b.decl),
+      code: "prefer-const",
+      source: "vital",
+    });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// 3. Dead / constant branch (literal-boolean condition)
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect statically-dead branches driven by a *literal* boolean condition (no
+ * general constant folding — only a `BooleanLiteral` in condition position):
+ *   - `if false { … }`            → the then-branch is dead.
+ *   - `if true { … } else { … }`  → the else-branch is dead.
+ *   - `while false { … }`         → the body never runs.
+ * One warning per dead construct, pointing at the dead branch/body. Recurses so
+ * nested constructs are still scanned (including the live branch's contents).
+ */
+const constantBranchInStatement = (
+  stmt: VLStatement,
+  spans: NodeSpans,
+  out: VLDiagnostic[],
+): void => {
+  switch (stmt.type) {
+    case "If":
+      reportConstantIf(stmt, spans, out);
+      for (const c of stmt.conditionals) {
+        constantBranchInStatement(c.statement, spans, out);
+      }
+      if (stmt.else) constantBranchInStatement(stmt.else, spans, out);
+      break;
+    case "While":
+      reportConstantWhile(stmt, spans, out);
+      constantBranchInStatement(stmt.statement, spans, out);
+      break;
+    case "Block":
+      for (const s of stmt.statements) {
+        constantBranchInStatement(s, spans, out);
+      }
+      break;
+    case "For":
+    case "ForIn":
+      constantBranchInStatement(stmt.statement, spans, out);
+      break;
+    case "Return":
+      if (stmt.value) constantBranchInExpr(stmt.value, spans, out);
+      break;
+    case "VariableDeclaration":
+      if (stmt.value) constantBranchInExpr(stmt.value, spans, out);
+      break;
+    default:
+      constantBranchInExpr(stmt as VLExpression, spans, out);
+      break;
+  }
+};
+
+/** Descend expressions that can host statements (blocks-as-values, fn bodies). */
+const constantBranchInExpr = (
+  expr: VLExpression,
+  spans: NodeSpans,
+  out: VLDiagnostic[],
+): void => {
+  switch (expr.type) {
+    case "Block":
+      for (const s of expr.statements) constantBranchInStatement(s, spans, out);
+      break;
+    case "If":
+      constantBranchInStatement(expr as VLIfNode, spans, out);
+      break;
+    case "FunctionDeclaration":
+      constantBranchInStatement(expr.body, spans, out);
+      break;
+    default:
+      break;
+  }
+};
+
+/** The literal boolean a condition is, or undefined if it is not a literal. */
+const literalBool = (expr: VLExpression): boolean | undefined =>
+  expr.type === "BooleanLiteral" ? expr.value : undefined;
+
+const reportConstantIf = (
+  node: VLIfNode,
+  spans: NodeSpans,
+  out: VLDiagnostic[],
+): void => {
+  // Only the leading `if`/`else if` chain head carries a meaningful literal; we
+  // check each conditional, but a dead branch only makes sense for the first
+  // (a chained `else if false` body is dead too — flag any literal-false arm).
+  for (let i = 0; i < node.conditionals.length; i++) {
+    const cond = node.conditionals[i];
+    const lit = literalBool(cond.condition);
+    if (lit === false) {
+      const span = spanOf(spans, cond.statement);
+      if (span) {
+        out.push({
+          message:
+            "This branch is never taken: its condition is always `false`",
+          severity: "warning",
+          range: rangeFromCtx(span),
+          code: "constant-condition",
+          source: "vital",
+          tags: ["unnecessary"],
+        });
+      }
+    } else if (lit === true) {
+      // `if true { … } else { … }`: the else (and any later arms) is dead.
+      const deadStmt = node.conditionals[i + 1]?.statement ?? node.else;
+      if (deadStmt) {
+        const span = spanOf(spans, deadStmt);
+        if (span) {
+          out.push({
+            message:
+              "This branch is never taken: a preceding condition is always `true`",
+            severity: "warning",
+            range: rangeFromCtx(span),
+            code: "constant-condition",
+            source: "vital",
+            tags: ["unnecessary"],
+          });
+        }
+      }
+      // A `true` arm short-circuits the rest of the chain — stop scanning.
+      break;
+    }
+  }
+};
+
+const reportConstantWhile = (
+  node: VLWhileNode,
+  spans: NodeSpans,
+  out: VLDiagnostic[],
+): void => {
+  if (literalBool(node.condition) !== false) return;
+  const span = spanOf(spans, node.statement);
+  if (!span) return;
+  out.push({
+    message: "This loop body never runs: its condition is always `false`",
+    severity: "warning",
+    range: rangeFromCtx(span),
+    code: "constant-condition",
+    source: "vital",
+    tags: ["unnecessary"],
+  });
+};
+
+// ---------------------------------------------------------------------------
+// 4. Degenerate `for` step (literal `step 0`)
+// ---------------------------------------------------------------------------
+
+/**
+ * A range `for` written with a literal `step 0` never advances its loop
+ * variable — a degenerate / infinite loop. The parser already warns on a
+ * provably-EMPTY range (`for i = 5 to 0` etc.) but deliberately excludes step 0
+ * (an empty-range check can't fire when the step is zero); this rule covers it.
+ * Reported as an ERROR — unlike an empty range (which is a harmless no-op), a
+ * zero step that the program reaches loops forever. Recurses into nested bodies.
+ */
+const degenerateStepInStatement = (
+  stmt: VLStatement,
+  spans: NodeSpans,
+  out: VLDiagnostic[],
+): void => {
+  switch (stmt.type) {
+    case "For":
+      reportDegenerateStep(stmt, spans, out);
+      degenerateStepInStatement(stmt.statement, spans, out);
+      break;
+    case "ForIn":
+    case "While":
+      degenerateStepInStatement(stmt.statement, spans, out);
+      break;
+    case "If":
+      for (const c of stmt.conditionals) {
+        degenerateStepInStatement(c.statement, spans, out);
+      }
+      if (stmt.else) degenerateStepInStatement(stmt.else, spans, out);
+      break;
+    case "Block":
+      for (const s of stmt.statements) {
+        degenerateStepInStatement(s, spans, out);
+      }
+      break;
+    case "Return":
+      if (stmt.value) degenerateStepInExpr(stmt.value, spans, out);
+      break;
+    case "VariableDeclaration":
+      if (stmt.value) degenerateStepInExpr(stmt.value, spans, out);
+      break;
+    default:
+      degenerateStepInExpr(stmt as VLExpression, spans, out);
+      break;
+  }
+};
+
+const degenerateStepInExpr = (
+  expr: VLExpression,
+  spans: NodeSpans,
+  out: VLDiagnostic[],
+): void => {
+  switch (expr.type) {
+    case "Block":
+      for (const s of expr.statements) degenerateStepInStatement(s, spans, out);
+      break;
+    case "If":
+      degenerateStepInStatement(expr as VLIfNode, spans, out);
+      break;
+    case "FunctionDeclaration":
+      degenerateStepInStatement(expr.body, spans, out);
+      break;
+    default:
+      break;
+  }
+};
+
+const reportDegenerateStep = (
+  node: VLForNode,
+  spans: NodeSpans,
+  out: VLDiagnostic[],
+): void => {
+  const step = node.step;
+  if (!step || step.type !== "IntegerLiteral" || step.value !== 0) return;
+  // Point at the `step 0` expression where possible, else the whole loop.
+  const span = spanOf(spans, step) ?? spanOf(spans, node);
+  if (!span) return;
+  out.push({
+    message:
+      "`for` step is 0: the loop variable never advances (degenerate/infinite loop)",
+    severity: "error",
+    range: rangeFromCtx(span),
+    code: "for-step-zero",
+    source: "vital",
+  });
+};
+
+// ---------------------------------------------------------------------------
+// 5. Unreachable code
 // ---------------------------------------------------------------------------
 
 /**

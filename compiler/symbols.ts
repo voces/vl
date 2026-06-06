@@ -57,6 +57,8 @@ export type Binding = {
    * variables. Governs only rebind/reassignment of the name (`x = …`, `x++`),
    * NOT mutation of the data behind it (`obj.x = …` / `a[i] = …` stay legal
    * regardless — that's the separate A9 readonly / immutable-value-type axis).
+   * The lint pass's prefer-`const` rule pairs this with occurrence `isWrite`
+   * flags to flag a `let` that is never reassigned (it should be a `const`).
    * Undefined for kinds where it doesn't apply (functions, types).
    */
   mutable?: boolean;
@@ -69,6 +71,15 @@ export type SymbolOccurrence = {
   binding: Binding;
   /** True for the declaration's own identifier; false for a use. */
   isDecl: boolean;
+  /**
+   * True when this occurrence is the *target* of an assignment (`x = …`,
+   * `x += …`, `x++`) rather than a read. The lint pass uses this to tell a
+   * never-reassigned `let` (a prefer-`const` candidate) from a `let` that is
+   * mutated. A write occurrence is still a (non-decl) occurrence, so it also
+   * counts as a "use" for the unused-variable rule — assigning to a binding
+   * keeps it from being reported unused. Absent/`false` is a plain read.
+   */
+  isWrite?: boolean;
 };
 
 /**
@@ -88,6 +99,31 @@ export class SymbolTable {
   /** Record a use of `binding` at `span`. */
   use(binding: Binding, span: Context): void {
     this.occurrences.push({ span, binding, isDecl: false });
+  }
+
+  /**
+   * Mark an already-recorded use occurrence at `span` as an assignment *write*
+   * target (`x = …`). The parser records the LHS name as an ordinary use first
+   * (while precedence-climbing the expression), then — once it knows the
+   * expression is an assignment — calls this to upgrade that occurrence's
+   * `isWrite` flag. Matches by the exact span of the most recent occurrence so it
+   * touches only the LHS name, not an unrelated same-name read elsewhere. No-op
+   * if no matching occurrence is found (defensive).
+   */
+  markWrite(span: Context): void {
+    for (let i = this.occurrences.length - 1; i >= 0; i--) {
+      const occ = this.occurrences[i];
+      if (
+        !occ.isDecl &&
+        occ.span.start.line === span.start.line &&
+        occ.span.start.column === span.start.column &&
+        occ.span.stop.line === span.stop.line &&
+        occ.span.stop.column === span.stop.column
+      ) {
+        occ.isWrite = true;
+        return;
+      }
+    }
   }
 
   /** The occurrence whose span contains `pos`, if any (innermost wins). */
