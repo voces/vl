@@ -158,8 +158,10 @@ const classifySymbolTokens = (
  */
 const lexicalTokenType = (kind: TokenKind): number | undefined => {
   switch (kind) {
-    case "STRING":
-      return TT.string;
+    // Strings (and their escapes) are intentionally left to the TextMate grammar:
+    // a whole-literal `string` semantic token overrides the grammar's finer
+    // `constant.character.escape` scope, so `\n`/`\t` etc. would stop being
+    // highlighted in source. The grammar already colors strings + escapes.
     case "NUMBER":
       return TT.number;
     case "TRUE":
