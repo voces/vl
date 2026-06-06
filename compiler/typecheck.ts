@@ -299,7 +299,11 @@ export const _typeFromExpression = (
         return: expr.returnType,
       };
     case "IndexAccess": {
-      const objType = typeFromExpression(expr.array, ctx);
+      let objType = typeFromExpression(expr.array, ctx);
+      // A directly-used string literal (`"ab"[0]`) keeps its `StringLiteral`
+      // type; soften it to the nominal `string` array Object so indexing yields
+      // an i32 char code like a bound `string`.
+      if (objType.type === "StringLiteral") objType = softenImplicitType(objType);
       if (objType.type !== "Object") return { type: "Never" };
       // `Map[k]` is the deliberate exception to sequence indexing: a missing key
       // is NORMAL ABSENCE, so it yields `V | null` (not a trap). `List[i]`/string
@@ -358,6 +362,10 @@ export const _typeFromExpression = (
       if (key !== null && key in narrowedPaths) return narrowedPaths[key];
       let objType = typeFromExpression(expr.object, ctx);
       if (objType.type === "Infer") objType = objType.subType;
+      // A directly-used string literal (`"a".length`) keeps its `StringLiteral`
+      // type; soften it to the nominal `string` array Object so its intrinsic
+      // members resolve like a bound `string` (see `getChildType`).
+      if (objType.type === "StringLiteral") objType = softenImplicitType(objType);
       if (objType.type !== "Object") return { type: "Never" };
       // `array.length` is an intrinsic i32 (not a structural member).
       if (expr.property === "length" && arrayElementType(objType)) {
@@ -1364,6 +1372,13 @@ export const getChildType = (
       updateType(object, { type: "Object", properties: [] });
     }
   }
+  // A directly-used (un-bound) string literal keeps its `StringLiteral` type
+  // (e.g. `"a".length`); soften it to the nominal `string` Object — an
+  // i32-indexed array — so a one-char string isn't mistaken for a char and its
+  // intrinsic members (`.length`, indexing) resolve like a bound `string` does.
+  // (A char literal `'a'` is an IntegerLiteral, never a StringLiteral, so it is
+  // unaffected and correctly carries no members.)
+  if (object.type === "StringLiteral") object = softenImplicitType(object);
   if (object.type !== "Object") {
     errors.push({
       type: "Type",
