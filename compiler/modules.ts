@@ -78,6 +78,16 @@ type LoadedModule = {
   symbols: SymbolTable;
 };
 
+/**
+ * One ENTRY-module `export function` that becomes a host-callable wasm export.
+ * `exportName` is the original (un-mangled) export name the host calls by;
+ * `internalName` is the entry module's whole-program-mangled codegen name (what
+ * the merged AST / `toWasm` actually emit the function under). Only the entry
+ * module contributes these — imported modules' exports stay intra-program
+ * linkage (still tree-shakeable). See `loadProgram`.
+ */
+export type HostExport = { exportName: string; internalName: string };
+
 /** Result of the multi-file front end (mirrors the single-file shape we merge into). */
 export type ProgramResult = {
   /** The merged whole-program AST, or `undefined` if the entry could not load. */
@@ -85,6 +95,14 @@ export type ProgramResult = {
   diagnostics: VLDiagnostic[];
   /** Combined symbol table (per-module tables concatenated). */
   symbols: SymbolTable;
+  /**
+   * The ENTRY module's `export function`s, to be emitted as host-callable wasm
+   * exports (binaryen treats an export as a DCE root, so this both keeps the
+   * function and exposes it). Empty when the entry has no exported functions —
+   * in which case codegen behaves exactly as the legacy start/script model. Only
+   * functions are exported in v1 (exported `let`/`const` globals are deferred).
+   */
+  hostExports: HostExport[];
 };
 
 // --- specifier resolution --------------------------------------------------
@@ -178,6 +196,12 @@ export const loadProgram = async (
   const loaded = new Map<ModuleKey, LoadedModule>();
   // Keys currently on the load stack — a re-entry is an import cycle.
   const loading = new Set<ModuleKey>();
+  // The ENTRY module's `export function`s, captured at merge time. Only the entry
+  // (module index 0) contributes host exports; imported modules' `export`s stay
+  // intra-program linkage. `exported` on a decl ALONE can't tell entry from
+  // non-entry (every exported decl keeps `exported: true` after merge), so we
+  // record the entry's exports explicitly here rather than re-deriving later.
+  const hostExports: HostExport[] = [];
   // Monotonic module index → the mangling suffix (`$m0`, `$m1`, …). The entry is
   // index 0; the index is purely for unique, debuggable names.
   let moduleIndex = 0;
@@ -307,6 +331,34 @@ export const loadProgram = async (
       exp.mangledName = rename.get(exp.name) ?? exp.name;
     }
 
+    // Entry-only host exports: the ENTRY module (index 0) is the only one whose
+    // `export function`s become host-callable wasm exports. Imported modules'
+    // exports remain tree-shakeable intra-program linkage, so DCE is preserved
+    // (a no-export driver entry — the self-host build — emits ZERO host exports
+    // and behaves exactly as today). v1 exports FUNCTIONS only; exported
+    // `let`/`const` globals are filtered out (a possible follow-up).
+    if (myIndex === 0) {
+      const seen = new Set<string>();
+      for (const exp of Object.values(program.moduleExports ?? {})) {
+        if (exp.type.type !== "Function") continue; // v1: functions only
+        // Defensive: two host exports sharing an `exportName` would collide as
+        // wasm export names. Normally unreachable — re-exporting a name within one
+        // module is already a parser redeclaration error, and `moduleExports` is
+        // keyed by export name, so this loop visits each name once. Kept as a
+        // cheap guard against future merge/parser changes.
+        if (seen.has(exp.name)) {
+          throw new Error(
+            `Duplicate host export name "${exp.name}" in entry module`,
+          );
+        }
+        seen.add(exp.name);
+        hostExports.push({
+          exportName: exp.name,
+          internalName: rename.get(exp.name) ?? exp.name,
+        });
+      }
+    }
+
     const mod: LoadedModule = {
       key,
       program,
@@ -329,7 +381,7 @@ export const loadProgram = async (
     for (const occ of mod.symbols.occurrences) symbols.occurrences.push(occ);
   }
   if (!entry) {
-    return { ast: undefined, diagnostics, symbols };
+    return { ast: undefined, diagnostics, symbols, hostExports };
   }
 
   // Merge: rewrite each module's AST names through its rename map, then
@@ -360,7 +412,7 @@ export const loadProgram = async (
     scope: mergedScope,
   };
 
-  return { ast, diagnostics, symbols };
+  return { ast, diagnostics, symbols, hostExports };
 };
 
 // --- helpers ---------------------------------------------------------------
