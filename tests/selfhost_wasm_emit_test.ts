@@ -1,10 +1,7 @@
 // Runs the VL-in-VL wasm emitter (`compiler/wasmEmit.vl`) through the real VL
-// toolchain and proves the bytes it emits are VALID WebAssembly. VL has no module
-// system yet, so the sources are concatenated ahead of a `.vl` print-driver,
-// compiled to wasm by the TS `compile()`, and run; the captured log is the
-// emitted module as a comma-joined decimal byte string.
+// module-graph toolchain and proves the bytes it emits are VALID WebAssembly.
 //
-// The proof (Track H4 spike): the round-trip VL emits bytes -> real
+// The proof (Track H4 spike): the round-trip VL emits bytes → real
 // `WebAssembly.instantiate` runs them. The TS test parses the byte string back
 // into a `Uint8Array`, instantiates it, and asserts the exported function
 // behaves as designed (`main() === 42`; `id(x) === x`).
@@ -14,36 +11,117 @@
 // byte-array machinery a full codegen port will need. It does NOT consume the AST
 // arena yet. Language/codegen gaps surfaced are in `docs/selfhost-gaps.md` under
 // "Codegen self-host (H4)".
+//
+// REAL MODULES (H0): `ast.vl` `export`s its public surface, and the on-disk
+// `compiler/wasmEmit.vl` is inlined into the in-memory DRIVER module that
+// `import`s `P`/`i32ToStr` from `./ast`. The old glue — string-concatenating
+// `ast.vl ++ wasmEmit.vl ++ driver` and caching via `compileCached` — is GONE:
+// per-module name isolation means the driver's private names no longer need the
+// whole-compile cache tier, and `compileProgram` drives the module graph.
+//
+// PERF (compile-once): both test cases drive the IDENTICAL module; the driver is
+// compiled and run ONCE (memoized). The logs carry a `const:` line and an `id:`
+// line; each `Deno.test` pulls its own line. binaryen `optimize()` still runs
+// once — the `optimizeCache` is passed through.
 
-import { runWasm } from "../compiler/compile.ts";
-import { compileCached } from "./_selfhost_cache.ts";
+import { compileProgram, runWasm } from "../compiler/compile.ts";
+import { createOptimizeCache } from "../compiler/buildCache.ts";
 
-const read = (rel: string) =>
-  Deno.readTextFileSync(new URL(rel, import.meta.url));
+// Reuse binaryen's `optimize()` output across runs for any module whose
+// pre-optimize bytes are unchanged (~40% of a compile). Keyed on unoptimized
+// bytes + binaryen version; a compiler change busts only the modules whose
+// codegen output changed.
+const optimizeCache = createOptimizeCache();
 
-const ast = read("../compiler/ast.vl");
-const wasmEmit = read("../compiler/wasmEmit.vl");
+// Resolved keys for the on-disk modules and the in-memory driver.
+const compilerUrl = (name: string) =>
+  new URL(`../compiler/${name}`, import.meta.url).pathname;
+const AST = compilerUrl("ast.vl");
+const WASM_EMIT = compilerUrl("wasmEmit.vl");
 
-// Compile `ast.vl ++ wasmEmit.vl ++ driver`, run it, return the logs.
-const runDriver = async (driver: string): Promise<string[]> => {
-  const source = ast + "\n" + wasmEmit + "\n" + driver;
-  const { wasm, diagnostics } = await compileCached(source);
-  const errors = diagnostics.filter((d) => d.severity === "error");
-  if (errors.length > 0 || !wasm) {
-    throw new Error(
-      "self-hosted wasm emitter failed to compile: " +
-        errors.map((d) => d.message).join("; "),
-    );
-  }
-  const { logs } = await runWasm(wasm);
-  return logs;
-};
+// The synthetic entry: the driver module. Its `./ast` specifier resolves to the
+// real on-disk `compiler/ast.vl`; the body of `wasmEmit.vl` is inlined because
+// `wasmEmit.vl` does not yet export its functions (it is pre-module-system code
+// that uses `P`/`i32ToStr` from `ast.vl` implicitly). Inlining it here gives the
+// merged compiler a single compilation unit with `import { P, i32ToStr } from
+// "./ast"` at the top, which is exactly the shape `compileProgram` expects.
+const DRIVER = compilerUrl("__wasm_emit_driver__.vl");
 
-// Both tests drive the IDENTICAL fixture; compile + run it ONCE and share the
-// logs (the two tests just assert different emitted modules from the same run).
+// Compile the driver module ONCE (memoized), returning the log lines from the run.
+// The driver invokes `reportConst()` and `reportId()` to print two log lines:
+//   const: <comma-joined decimal bytes>
+//   id:    <comma-joined decimal bytes>
 let fixtureLogs: Promise<string[]> | undefined;
 const runFixture = (): Promise<string[]> =>
-  fixtureLogs ??= runDriver(read("./selfhost/wasm_emit_harness.vl"));
+  fixtureLogs ??= (async () => {
+    const wasmEmitSrc = Deno.readTextFileSync(WASM_EMIT);
+    // The driver: import the public surface of ast.vl, then the wasmEmit body
+    // (all its functions/globals use P and i32ToStr via the import above), then
+    // the two reporter functions and their calls.
+    // Import P, i32ToStr (values) plus all node-variant types that wasmEmit.vl
+    // narrows with `is` checks — the module system resolves these to ast.vl's
+    // exported surface.
+    const driverSrc =
+      `import { P, i32ToStr } from "./ast"\n` +
+      `import {\n` +
+      `  ArrayLit,\n` +
+      `  BinExpr,\n` +
+      `  Block,\n` +
+      `  BoolLit,\n` +
+      `  Call,\n` +
+      `  CharLit,\n` +
+      `  FieldDef,\n` +
+      `  FieldInit,\n` +
+      `  FuncDecl,\n` +
+      `  Ident,\n` +
+      `  IfStmt,\n` +
+      `  Index,\n` +
+      `  LetDecl,\n` +
+      `  Member,\n` +
+      `  NumLit,\n` +
+      `  ObjLit,\n` +
+      `  Param,\n` +
+      `  Paren,\n` +
+      `  Program,\n` +
+      `  RetStmt,\n` +
+      `  StrLit,\n` +
+      `  TypeDecl,\n` +
+      `  TypeRef,\n` +
+      `  Unary,\n` +
+      `  WhileStmt,\n` +
+      `} from "./ast"\n\n` +
+      wasmEmitSrc +
+      `\nfunction reportConst(): i32 {\n` +
+      `  buildConstModule()\n` +
+      `  print("const: " + bytesToStr())\n` +
+      `  0\n` +
+      `}\n` +
+      `function reportId(): i32 {\n` +
+      `  buildIdentityModule()\n` +
+      `  print("id: " + bytesToStr())\n` +
+      `  0\n` +
+      `}\n` +
+      `reportConst()\n` +
+      `reportId()\n`;
+
+    const sources: Record<string, string> = {
+      [DRIVER]: driverSrc,
+      [AST]: Deno.readTextFileSync(AST),
+    };
+    const read = (key: string): string | undefined => sources[key];
+    const { wasm, diagnostics } = await compileProgram(DRIVER, read, DRIVER, {
+      optimizeCache: await optimizeCache,
+    });
+    const errors = diagnostics.filter((d) => d.severity === "error");
+    if (errors.length > 0 || !wasm) {
+      throw new Error(
+        "self-hosted wasm emitter failed to compile: " +
+          errors.map((d) => d.message).join("; "),
+      );
+    }
+    const { logs } = await runWasm(wasm);
+    return logs;
+  })();
 
 // Parse one `name: b0,b1,...` log line into [name, Uint8Array].
 const parseLine = (line: string): [string, Uint8Array<ArrayBuffer>] => {
