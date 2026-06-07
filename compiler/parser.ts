@@ -33,6 +33,7 @@ import {
   mapMemberType,
   nonNullable,
   postGuardNarrowings,
+  reportUninferredBinding,
   setElementType,
   setMemberType,
   softenImplicitType,
@@ -2359,6 +2360,16 @@ export const parseProgram = (
       const valType = typeFromExpression(node.value, valueCtx ?? spanOf(id));
       if (!annotated) {
         node.variableType = softenImplicitType(valType);
+        // No annotation AND no resolving context: a construct whose type is taken
+        // from context (an empty `[]`, a `Map()`/`Set()`) left an unresolved
+        // inference hole. Report it as a clean "cannot infer … annotate" error
+        // now, during the parse/type gate, instead of crashing or surfacing the
+        // opaque codegen `Unhandled AST -> WASM "Unknown" type` later.
+        reportUninferredBinding(
+          node.name,
+          node.variableType,
+          valueCtx ?? spanOf(id),
+        );
       } else ensureType(node.variableType, valType, valueCtx ?? spanOf(id));
     }
     if (node.name in scopes[scopes.length - 1]) {

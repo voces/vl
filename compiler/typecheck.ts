@@ -695,6 +695,15 @@ export const _softenImplicitType = (type: VLType): VLType => {
     return type;
   }
   if (type.type === "Union") {
+    // An EMPTY union has no members to collapse to — this is the element type of
+    // an un-annotated empty `[]` (`ArrayLiteral` over zero values). Soften it to a
+    // fresh inference hole rather than `undefined`/`Never`: the hole flows through
+    // `ensureType` so a binding annotation (`let xs: i32[] = []`) still pins it,
+    // and an UNpinned hole is caught by the "cannot infer" diagnostic at the
+    // declaration instead of crashing later code that dereferences the element.
+    if (type.subTypes.length === 0) {
+      return { type: "Infer", subType: { type: "Unknown" } };
+    }
     const hasSubUnions = type.subTypes.some((s) => s.type === "Union");
     if (hasSubUnions) {
       return softenImplicitType({
@@ -1048,6 +1057,85 @@ const hasEscapingBreak = (
   }
 };
 
+// Does `type` still reach an UNRESOLVED inference hole — an `Infer<Unknown>` that
+// was never pinned, or a bare `Unknown`? This is the residue of a construct whose
+// type is taken from context (an empty `[]`, a `Map()`/`Set()`) when no context
+// (an annotation / a resolving use) ever supplied it. It is the signal that the
+// binding "cannot be inferred" and needs an annotation. Distinct from
+// `containsInfer`, which asks whether a *generic signature* has holes to clone;
+// here we only care about an unpinned `Unknown` leaf. A guard handles a missing
+// sub-type (the element of an un-annotated empty `[]`).
+const containsUnresolvedHole = (
+  type: VLType | undefined,
+  seen = new Set<VLType>(),
+): boolean => {
+  if (!type) return false;
+  if (seen.has(type)) return false;
+  seen.add(type);
+  switch (type.type) {
+    case "Unknown":
+      return true;
+    case "Infer":
+      // A pinned hole (`Infer<i32>`) is resolved; only `Infer<Unknown>` is open.
+      return containsUnresolvedHole(type.subType, seen);
+    case "Function":
+      return type.paramaters.some((p) =>
+        containsUnresolvedHole(p.paramaterType, seen)
+      ) || containsUnresolvedHole(type.return, seen);
+    case "Object":
+      return type.properties.some((p) => containsUnresolvedHole(p.type, seen));
+    case "Union":
+      return type.subTypes.some((s) => containsUnresolvedHole(s, seen));
+    case "Nullable":
+    case "Negation":
+      return containsUnresolvedHole(type.subType, seen);
+    case "Intersection":
+      return type.subTypes.some((s) => containsUnresolvedHole(s, seen));
+    case "Type":
+      return containsUnresolvedHole(type.subType, seen);
+    default:
+      return false;
+  }
+};
+
+// One clean, source-located diagnostic for a binding whose type can't be inferred
+// — instead of either a crash or the opaque codegen `Unhandled AST -> WASM
+// "Unknown" type`. Fires only for a genuinely UNPINNED binding (an un-annotated
+// empty `[]` / `Map()` / `Set()` with no resolving context); a `mapCtor` tag
+// tailors the suggested annotation. Returns whether a diagnostic was raised so
+// callers can avoid a duplicate. Idempotent: a `WeakSet` keys off the binding's
+// type object so it fires once even if reached from two paths.
+const reportedUninferred = new WeakSet<VLType>();
+export const reportUninferredBinding = (
+  name: string,
+  type: VLType,
+  ctx: Context,
+): boolean => {
+  // Fire exactly once per binding even when both the parser (at the declaration)
+  // and `typeFromStatement` (body inference, when the decl is a tail statement)
+  // reach the same `variableType` object.
+  if (reportedUninferred.has(type)) return false;
+  if (!containsUnresolvedHole(type)) return false;
+  reportedUninferred.add(type);
+  let example = `let ${name}: i32[] = []`;
+  if (type.type === "Infer" && type.mapCtor === "Map") {
+    example = `let ${name}: {[string]: i32} = Map()`;
+    type.mapCtor = undefined;
+  } else if (type.type === "Infer" && type.mapCtor === "Set") {
+    example = `let ${name}: {[string]: boolean} = Set()`;
+    type.mapCtor = undefined;
+  }
+  errors.push({
+    type: "Syntax",
+    message:
+      `cannot infer a type for \`${name}\` — add a type annotation ` +
+      `(e.g. \`${example}\`)`,
+    ctx,
+    code: 0,
+  });
+  return true;
+};
+
 export const typeFromStatement = (
   stmt: VLStatement,
   ctx: Context,
@@ -1058,25 +1146,13 @@ export const typeFromStatement = (
         ? typeFromExpression(stmt.value, ctx)
         : { type: "Alias", name: "null" };
     case "VariableDeclaration": {
-      // A `Map()` / `Set()` with no annotation to pin its type: the constructor
-      // hole was never run through `ensureType`, so it stays an unresolved
-      // `Infer<Unknown>` carrying its `mapCtor` tag. Report a clear error (it
-      // would otherwise die in codegen as a bare `Unknown` type). Clearing the
-      // tag makes this fire exactly once even if the statement is re-typed.
-      const vt = stmt.variableType;
-      if (
-        vt.type === "Infer" && vt.mapCtor && vt.subType.type === "Unknown"
-      ) {
-        errors.push({
-          type: "Syntax",
-          message:
-            `${vt.mapCtor}() needs a map type annotation ` +
-            "(e.g. `let m: {[string]: i32} = Map()`)",
-          ctx,
-          code: 0,
-        });
-        vt.mapCtor = undefined;
-      }
+      // A binding whose type was never pinned — an un-annotated empty `[]`, or a
+      // `Map()`/`Set()` with no annotation to take its type from — still carries
+      // an unresolved `Infer<Unknown>` (it never ran through `ensureType`). Report
+      // one clear, source-located error here, BEFORE codegen (where it would
+      // otherwise die as an opaque `Unhandled AST -> WASM "Unknown" type`). The
+      // shared helper fires exactly once (it clears any `mapCtor` tag).
+      reportUninferredBinding(stmt.name, stmt.variableType, ctx);
       // A declaration in statement/tail position binds a name but yields no
       // value — its contribution to the enclosing block's/function's value type
       // is void, not the variable's type. (In expression position a `let` is
@@ -1272,6 +1348,11 @@ export const containsInfer = (
   type: VLType,
   seen = new Set<VLType>(),
 ): boolean => {
+  // A missing sub-type (e.g. the element of an empty, un-annotated `[]` before it
+  // is pinned) is not itself an inference hole to instantiate — treat it as
+  // hole-free here. The "cannot infer" diagnostic is raised at the declaration
+  // (see `typeFromStatement`/the parser), not by this generic walk.
+  if (!type) return false;
   if (seen.has(type)) return false;
   seen.add(type);
   switch (type.type) {
@@ -1973,6 +2054,11 @@ export const ensureType = (
   right: VLType,
   ctx: Context,
 ): boolean => {
+  // Defensive: a missing side (e.g. the still-unpinned element of an empty,
+  // un-annotated `[]`) has no constraint to check yet — treat it like `Unknown`
+  // and accept, so a robustness hole can never crash here. The real "cannot
+  // infer" diagnostic is raised at the binding (see `reportUninferredBinding`).
+  if (!left || !right) return true;
   if (right.type === "Infer" && left.type !== "Infer") {
     [right, left] = [left, right];
   }

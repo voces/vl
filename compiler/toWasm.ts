@@ -2817,20 +2817,24 @@ export const toWasm = async (
           : call;
       }
       case "VariableDeclaration": {
-        // A `Map()` / `Set()` with no annotation to pin its type leaves an
-        // unresolved constructor hole (B6a). The type checker reports this when
-        // the declaration is in a block it type-infers; at module top level
-        // (which isn't body-inferred) it reaches here — surface the same clear
-        // message rather than the opaque "Unhandled Unknown type" from
-        // `toWasmType`.
+        // An un-annotated `Map()`/`Set()` (or empty `[]`) with no resolving
+        // context leaves an unresolved constructor hole (B6a). The parser/type
+        // checker already reports this as a clean "cannot infer … annotate"
+        // diagnostic before codegen runs, so this is a BACKSTOP — surface a
+        // consistent, located message rather than the opaque "Unhandled Unknown
+        // type" from `toWasmType` if one ever slips through.
         if (
           node.variableType.type === "Infer" &&
-          node.variableType.mapCtor &&
           node.variableType.subType.type === "Unknown"
         ) {
+          const ctorExample = node.variableType.mapCtor === "Set"
+            ? `let ${node.name}: {[string]: boolean} = Set()`
+            : node.variableType.mapCtor === "Map"
+            ? `let ${node.name}: {[string]: i32} = Map()`
+            : `let ${node.name}: i32[] = []`;
           throw new Error(
-            `${node.variableType.mapCtor}() needs a map type annotation ` +
-              "(e.g. `let m: {[string]: i32} = Map()`)",
+            `cannot infer a type for \`${node.name}\` — add a type annotation ` +
+              `(e.g. \`${ctorExample}\`)`,
           );
         }
         // A top-level declaration of a module global: initialize the shared wasm
