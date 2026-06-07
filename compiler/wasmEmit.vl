@@ -370,6 +370,176 @@ function paramIndexOf(fnIx: i32, name: string): i32 {
   0 - 1
 }
 
+// ── declared-local map ───────────────────────────────────────────────────────
+// A `let`/`const` inside a function body allocates a wasm local whose index comes
+// AFTER the params: params occupy locals `0..p-1`, the i-th declared local gets
+// `p + i` (declaration order). Wasm locals are function-scoped (not block-scoped),
+// and the code body's locals vector is fixed up-front, so EVERY `LetDecl` in the
+// body — including those nested in `if` branches — must be collected before any
+// instruction is emitted.
+//
+// `localNames` is a top-level `let` array (it lowers to a wasm global) holding the
+// declared-local names of the function currently being emitted, in declaration
+// order; the i-th name's wasm local index is `p + i` (with `p` the param count).
+// It is rebuilt per function by `buildLocals` before that function's body is
+// lowered, so only one function's locals are live at a time.
+let localNames: string[] = []
+
+// Append the declared-local name `name` to `localNames` if not already present.
+// A re-`let` of the same name (legal as a typecheck concern, not here) would only
+// ever reuse the same slot — keeping names unique keeps slot assignment stable.
+function addLocalName(name: string): i32 {
+  let i = 0
+  while i < localNames.length {
+    if localNames[i] == name {
+      return 0
+    }
+    i = i + 1
+  }
+  localNames.push(name)
+  0
+}
+
+// Recursively collect the declared-local names of the block at `blockIx` into
+// `localNames`, descending into `if` then/else branches (wasm locals span the whole
+// function, so a local declared inside a branch still needs a slot). Each declared
+// local's init type is validated as i32-compatible here, so a non-i32 local fails
+// loudly BEFORE any bytes are emitted. Returns 0, or -1 (via `emitFail`) on a
+// non-block node, an out-of-scope statement (e.g. a loop), or a non-i32 local.
+function collectLocals(blockIx: i32, fnIx: i32): i32 {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        if checkLocalI32(stmts[i]) < 0 { return 0 - 1 }
+        addLocalName(s.letName)
+      } else if s is IfStmt {
+        if collectLocals(s.ifThen, fnIx) < 0 { return 0 - 1 }
+        if s.ifElse >= 0 {
+          let els = P.nodes[s.ifElse]
+          if els is Block {
+            if collectLocals(s.ifElse, fnIx) < 0 { return 0 - 1 }
+          } else if els is IfStmt {
+            // `else if` — wrap the nested if in a one-statement scan via its branches.
+            if collectLocals(els.ifThen, fnIx) < 0 { return 0 - 1 }
+            if els.ifElse >= 0 {
+              let els2 = P.nodes[els.ifElse]
+              if els2 is Block {
+                if collectLocals(els.ifElse, fnIx) < 0 { return 0 - 1 }
+              }
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+    return 0
+  }
+  emitFail("emitProgram: function has no block body")
+}
+
+// Validate the `LetDecl` at `letIx`: its initializer must exist and be an i32 value
+// (this slice has i32 locals only). A missing init, or an init whose type annotation
+// names a non-i32 type, fails loudly. Without a per-expr type checker the init's
+// VALUE-type is approximated: a `let x: T = …` annotation must be `i32` if present;
+// init expressions outside the i32 vocabulary (string/char/bool/float literals)
+// fail loudly. Returns 0, or -1 (via `emitFail`).
+function checkLocalI32(letIx: i32): i32 {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 {
+      return emitFail("emitProgram: local declaration needs an initializer")
+    }
+    if d.letType >= 0 {
+      let ty = P.nodes[d.letType]
+      if ty is TypeRef {
+        if ty.tyName != "i32" {
+          return emitFail("emitProgram: only i32 locals are supported")
+        }
+      } else {
+        return emitFail("emitProgram: local type is not a type name")
+      }
+    }
+    return checkExprI32(d.letInit)
+  }
+  emitFail("emitProgram: not a local declaration")
+}
+
+// Reject init expressions that cannot yield an i32: a non-i32 literal (string, char,
+// bool, or a float `NumLit` whose lexeme has a `.`) fails loudly. i32 literals,
+// identifiers, parens, unary/binary arithmetic and calls are all i32 in this slice,
+// so they pass (the per-node emitters re-check operand shapes). Returns 0, or -1.
+function checkExprI32(exprIx: i32): i32 {
+  if exprIx < 0 {
+    return emitFail("emitProgram: missing local initializer expression")
+  }
+  let e = P.nodes[exprIx]
+  if e is StrLit {
+    return emitFail("emitProgram: only i32 locals are supported")
+  }
+  if e is CharLit {
+    return emitFail("emitProgram: only i32 locals are supported")
+  }
+  if e is BoolLit {
+    return emitFail("emitProgram: only i32 locals are supported")
+  }
+  if e is NumLit {
+    // A float literal carries a "." in its lexeme — out of scope (i32 only).
+    let i = 0
+    while i < e.numText.length {
+      if e.numText[i] == '.' {
+        return emitFail("emitProgram: only i32 locals are supported")
+      }
+      i = i + 1
+    }
+    return 0
+  }
+  0
+}
+
+// Rebuild `localNames` for the function at `fnIx`: clear it, then collect every
+// declared-local name in the body (validating each as i32). Returns 0 on success,
+// or -1 (via `emitFail`) on any unsupported local. Must run before lowering the
+// body so identifier resolution and the locals vector see the full set.
+function buildLocals(fnIx: i32): i32 {
+  localNames = []
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    return collectLocals(fn.fnBody, fnIx)
+  }
+  emitFail("emitProgram: not a function declaration")
+}
+
+// The wasm local index of declared local `name`, or -1 if it is not a declared
+// local. Declared locals sit AFTER the params, so the slot is `paramCount + pos`
+// where `pos` is the name's position in `localNames`.
+function declaredIndexOf(fnIx: i32, name: string): i32 {
+  let pos = 0
+  while pos < localNames.length {
+    if localNames[pos] == name {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl {
+        return fn.fnParams.length + pos
+      }
+    }
+    pos = pos + 1
+  }
+  0 - 1
+}
+
+// Resolve an identifier `name` to its wasm local index for function `fnIx`: a param
+// first (locals 0..p-1), else a declared local (locals p..). Returns -1 if neither.
+function localIndexOf(fnIx: i32, name: string): i32 {
+  let pIx = paramIndexOf(fnIx, name)
+  if pIx >= 0 {
+    return pIx
+  }
+  declaredIndexOf(fnIx, name)
+}
+
 // Map a binary operator lexeme to its i32 wasm opcode, or -1 if unsupported. The
 // three arithmetic ops and the six signed i32 comparisons are recognized; anything
 // else (`/`, `%`, `=`, logical `&&`/`||`, …) falls through to -1 so the caller
@@ -425,9 +595,10 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     return 0
   }
   if e is Ident {
-    let idx = paramIndexOf(fnIx, e.identName)
+    // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
+    let idx = localIndexOf(fnIx, e.identName)
     if idx < 0 {
-      return emitFail("emitProgram: identifier is not a parameter")
+      return emitFail("emitProgram: identifier is not a parameter or local")
     }
     body.push(32)            // 0x20 local.get
     appendAll(body, ulebToArr(idx))
@@ -451,6 +622,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     return emitCall(body, exprIx, fnIx)
   }
   if e is BinExpr {
+    // Assignment (`=`) is a STATEMENT, not a value expression in this slice: it has
+    // no result on the stack (it `local.set`s). It is lowered by `emitAssign` from
+    // `emitStmt`, so seeing it as an operand here is an unsupported nested-assignment.
+    if e.binOp == "=" {
+      return emitFail("emitProgram: assignment is not a value expression")
+    }
     let opcode = binOpcode(e.binOp)
     if opcode < 0 {
       return emitFail("emitProgram: unsupported binary operator")
@@ -504,18 +681,71 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
 // `if` is a VOID structured block (blocktype 0x40) whose branches `return` on their
 // own — so the `if` never has to yield a value, and no block result type is needed.
 
+// Lower an assignment `target = value` (a `BinExpr` whose `binOp` is `"="`) onto
+// `body`: emit the value expression, then `local.set <index>` for the target local.
+// The target must be a bare `Ident` naming a param or declared local (no member /
+// indexed assignment in this slice). `local.set` consumes the value and leaves no
+// result, so an assignment statement contributes nothing to the stack. Returns 0,
+// or -1 (via `emitFail`) on a non-local / unsupported target.
+//
+// Node shapes read: BinExpr { binOp, binLeft, binRight }, target Ident { identName }.
+function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
+  let a = P.nodes[binIx]
+  if a is BinExpr {
+    let target = P.nodes[a.binLeft]
+    if target is Ident {
+      let idx = localIndexOf(fnIx, target.identName)
+      if idx < 0 {
+        return emitFail("emitProgram: assignment target is not a parameter or local")
+      }
+      // Value first, then store it into the local's slot.
+      if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+      body.push(33)          // 0x21 local.set
+      appendAll(body, ulebToArr(idx))
+      return 0
+    }
+    return emitFail("emitProgram: assignment target is not a simple name")
+  }
+  emitFail("emitProgram: expected an assignment expression")
+}
+
 // Lower a single statement at `stmtIx` onto `body`, resolving identifiers/params
 // against function `fnIx`. Returns 0, or -1 (via `emitFail`) on an unsupported shape.
 //
 // Node shapes read (all from `compiler/ast.vl`):
+//   LetDecl { letName, letType, letInit }         — `let`/`const` local declaration.
 //   RetStmt { retArg: i32 }                       — `retArg` -1 means a bare return.
 //   IfStmt  { ifCond: i32, ifThen: i32, ifElse: i32 }
+//   BinExpr { binOp, binLeft, binRight }          — an assignment expression statement.
 //   Block   { blkStmts: i32[] }
 function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
   if stmtIx < 0 {
     return emitFail("emitProgram: missing statement")
   }
   let s = P.nodes[stmtIx]
+  if s is LetDecl {
+    // `let x = <expr>` / `const x = <expr>`: emit the init, then store it into the
+    // local's slot (already allocated by `buildLocals`, init type already validated).
+    let idx = declaredIndexOf(fnIx, s.letName)
+    if idx < 0 {
+      return emitFail("emitProgram: local declaration has no allocated slot")
+    }
+    if s.letInit < 0 {
+      return emitFail("emitProgram: local declaration needs an initializer")
+    }
+    if emitExpr(body, s.letInit, fnIx) < 0 { return 0 - 1 }
+    body.push(33)            // 0x21 local.set
+    appendAll(body, ulebToArr(idx))
+    return 0
+  }
+  if s is BinExpr {
+    // A bare `BinExpr` statement is an assignment (`x = <expr>`); any other operator
+    // in statement position is a discarded value, which this slice does not emit.
+    if s.binOp == "=" {
+      return emitAssign(body, stmtIx, fnIx)
+    }
+    return emitFail("emitProgram: expression statement is not an assignment")
+  }
   if s is RetStmt {
     if s.retArg < 0 {
       return emitFail("emitProgram: bare return is not supported")
@@ -598,18 +828,35 @@ function checkParams(fnIx: i32): i32 {
   emitFail("emitProgram: not a function declaration")
 }
 
-// Build the size-prefixed code-section body for the FuncDecl at `fnIx`: no declared
-// locals (params occupy locals 0..n-1, never local DECLS in this slice), the body's
-// statement instructions, then `end`. The framed bytes are appended onto `out`.
-// Returns 0, or -1 (via `emitFail`) on any unsupported shape.
+// Build the size-prefixed code-section body for the FuncDecl at `fnIx`: the locals
+// vector (declared locals, all i32 — see `buildLocals`), the body's statement
+// instructions, then `end`. The framed bytes are appended onto `out`. Returns 0, or
+// -1 (via `emitFail`) on any unsupported shape.
+//
+// The locals vector groups consecutive locals of the same type into (count, valtype)
+// runs. Every declared local is i32 here, so it is a single run `(L, 0x7f)` for
+// `L = localNames.length` declared locals (or an empty vector `0` when there are
+// none). Params are NOT counted here — they are encoded in the functype, not the
+// code body's locals vector.
 function emitFuncCode(out: i32[], fnIx: i32): i32 {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
+    // Collect + validate declared locals BEFORE lowering, so identifier resolution
+    // and the locals vector both see the full per-function set.
+    if buildLocals(fnIx) < 0 { return 0 - 1 }
+
     let bodyExpr: i32[] = []
     if emitStmts(bodyExpr, fn.fnBody, fnIx) < 0 { return 0 - 1 }
 
     let body: i32[] = []
-    body.push(0)             // 0 local declarations
+    let nLocals = localNames.length
+    if nLocals == 0 {
+      body.push(0)           // empty locals vector
+    } else {
+      body.push(1)           // one (count, valtype) run
+      appendAll(body, ulebToArr(nLocals))   // count of i32 locals
+      body.push(127)         // 0x7f i32
+    }
     appendAll(body, bodyExpr)
     body.push(11)            // 0x0b end
     appendAll(out, ulebToArr(body.length))
@@ -701,11 +948,13 @@ function emitModule(stmts: i32[]): i32 {
 //
 //   function NAME(p0: i32, …): i32 { <stmt>* }
 //
-// where each <stmt> is a `return <expr>` or an `if <cond> { <stmt>* } [else …]`, and
-// <expr> is built from integer literals, parameter references, calls to any top-
-// level function (recursion included), the `+`/`-`/`*` arithmetic operators, the six
-// signed i32 comparisons, and unary negation. Each function is exported under its own
-// NAME. Returns 0 on success; on any unsupported shape it calls `emitFail` (leaving
+// where each <stmt> is a `let`/`const` i32 local declaration, an assignment
+// `x = <expr>`, a `return <expr>`, or an `if <cond> { <stmt>* } [else …]`, and
+// <expr> is built from integer literals, parameter / local references, calls to any
+// top-level function (recursion included), the `+`/`-`/`*` arithmetic operators, the
+// six signed i32 comparisons, and unary negation. Declared locals get wasm slots
+// AFTER the params (see `buildLocals`). Each function is exported under its own NAME.
+// Returns 0 on success; on any unsupported shape it calls `emitFail` (leaving
 // `emitErr` set and the buffer empty) and returns -1.
 //
 // Node shapes read (all from `compiler/ast.vl`):
@@ -713,7 +962,9 @@ function emitModule(stmts: i32[]): i32 {
 //   FuncDecl { fnName, fnParams: i32[], fnRet: i32, fnBody: i32 }
 //   Param    { parName: string, parType: i32 }
 //   Block    { blkStmts: i32[] }    — a function body / branch.
+//   LetDecl  { letName, letType, letInit }   — a local declaration.
 //   RetStmt  { retArg: i32 } ; IfStmt { ifCond, ifThen, ifElse }
+//   BinExpr  { binOp, binLeft, binRight }    — `binOp == "="` is an assignment.
 function emitProgram(rootIx: i32): i32 {
   emitFailed = false
   emitErr = ""

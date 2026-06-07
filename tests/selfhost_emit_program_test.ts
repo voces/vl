@@ -219,6 +219,66 @@ Deno.test("self-hosted emit-program: a non-recursive `if` branch picks a sign", 
   if (pos !== 1) throw new Error(`sign(5) returned ${pos}, expected 1`);
 });
 
+Deno.test("self-hosted emit-program: `let`/`const` locals + assignment compile to wasm locals", async () => {
+  // The slice's headline shape: a `let` initialized from an arithmetic expr over a
+  // param, a `const`, then a reassignment that reads both — each lowering to a wasm
+  // local (index after the param) via `local.set`/`local.get`.
+  const logs = await runFor(
+    "function f(n: i32): i32 {\n  let acc = n * 2\n  const bonus = 5\n  acc = acc + bonus\n  return acc\n}\n",
+  );
+  const got = await runExport(bytesFromLog(logs), "f", 10);
+  if (got !== 25) throw new Error(`f(10) returned ${got}, expected 25`);
+});
+
+Deno.test("self-hosted emit-program: a local reused/reassigned across several statements", async () => {
+  // `sum` accumulates across three reassignments — proves a single local slot is
+  // read-modified-written repeatedly (local.get then local.set to the same index).
+  const logs = await runFor(
+    "function acc3(a: i32, b: i32, c: i32): i32 {\n  let sum = a\n  sum = sum + b\n  sum = sum + c\n  return sum\n}\n",
+  );
+  const got = await runExport(bytesFromLog(logs), "acc3", 4, 5, 6);
+  if (got !== 15) throw new Error(`acc3(4, 5, 6) returned ${got}, expected 15`);
+});
+
+Deno.test("self-hosted emit-program: a local feeds a call argument", async () => {
+  // A local computed in `main`, then passed to `inc` — the local.get supplies the
+  // call argument across the function-index map.
+  const logs = await runFor(
+    "function inc(x: i32): i32 {\n  return x + 1\n}\nfunction main(): i32 {\n  let base = 40\n  let plus = base + 1\n  return inc(plus)\n}\n",
+  );
+  const got = await runExport(bytesFromLog(logs), "main");
+  if (got !== 42) throw new Error(`main() returned ${got}, expected 42`);
+});
+
+Deno.test("self-hosted emit-program: a local drives an `if` condition", async () => {
+  // The local `t` (a comparison against the param) is read into the void `if`'s
+  // condition; the then-branch returns one value, the fall-through another.
+  const logs = await runFor(
+    "function clamp(n: i32): i32 {\n  let over = n > 100\n  if over { return 100 }\n  return n\n}\n",
+  );
+  const bytes = bytesFromLog(logs);
+  const hi = await runExport(bytes, "clamp", 250);
+  if (hi !== 100) throw new Error(`clamp(250) returned ${hi}, expected 100`);
+  const lo = await runExport(bytes, "clamp", 7);
+  if (lo !== 7) throw new Error(`clamp(7) returned ${lo}, expected 7`);
+});
+
+Deno.test("self-hosted emit-program: a non-i32 local init fails loudly, not with garbage bytes", async () => {
+  // A `let` whose initializer is a string literal is outside this slice (i32 locals
+  // only): `emitProgram` must take the unsupported path (set `emitErr`, emit no
+  // bytes) rather than emit a wrong local type.
+  const logs = await runFor(
+    'function bad(): i32 {\n  let s = "hi"\n  return 0\n}\n',
+  );
+  const errLine = logs.find((l) => l.startsWith("err: "));
+  if (!errLine) {
+    throw new Error(`expected an \`err:\` line for the non-i32 local; got ${JSON.stringify(logs)}`);
+  }
+  if (!errLine.includes("i32 locals")) {
+    throw new Error(`unexpected emitter error message: ${errLine}`);
+  }
+});
+
 Deno.test("self-hosted emit-program: an unsupported shape fails loudly, not with garbage bytes", async () => {
   // Division is outside this slice (only `+`/`-`/`*`): `emitProgram` must take
   // the unsupported path (set `emitErr`, emit no bytes) rather than produce a
