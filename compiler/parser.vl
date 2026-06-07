@@ -69,6 +69,8 @@ import {
   mkTypeDecl,
   mkFieldInit,
   mkObjLit,
+  mkArrayLit,
+  mkIndex,
 } from "./ast"
 
 // ── cursor primitives ────────────────────────────────────────────────────────
@@ -146,13 +148,27 @@ function rightAssoc(kind: string): boolean {
 }
 
 // ── type annotations ─────────────────────────────────────────────────────────
-// A single type-name leaf (`i32`, `string`, a user type).
+// A type-name leaf (`i32`, `string`, a user type), optionally followed by one or
+// more `[]` array suffixes (`i32[]`, `i32[][]`). Each `[]` appends the literal
+// chars to the type-name, so an array type is a `TypeRef` whose name carries the
+// brackets (e.g. `"i32[]"`) — the emitter discriminates an array annotation by that
+// `[]` suffix, needing no separate annotation node. Single-token lookahead only:
+// after a base name, an `LBRACK` must be immediately followed by `RBRACK`.
 function parseType(): i32 {
+  let name = ""
   if peekKind() == "IDENT" {
-    return mkTypeRef(advance().text)
+    name = advance().text
+  } else {
+    expect("IDENT")
   }
-  expect("IDENT")
-  mkTypeRef("")
+  let going = peekKind() == "LBRACK"
+  while going {
+    advance()                        // "["
+    expect("RBRACK")                 // "]"
+    name = name + "[]"
+    going = peekKind() == "LBRACK"
+  }
+  mkTypeRef(name)
 }
 
 // ── expressions ──────────────────────────────────────────────────────────────
@@ -193,6 +209,13 @@ function parsePrimary(): i32 {
     // any expression is parsed, so a `{` ever reaching `parsePrimary` — an
     // expression context — is unambiguously an object literal, never a block.)
     return parseObjLit()
+  }
+  if k == "LBRACK" {
+    // A `[` in EXPRESSION position is an array literal `[e, e, ...]`. (Index
+    // access `a[i]` is a POSTFIX in `parsePostfix`, where the `[` follows an
+    // already-parsed expression — so a `[` reaching `parsePrimary` always starts
+    // a literal.)
+    return parseArrayLit()
   }
   P.diags.push({ msg: "expected an expression but found " + k, at: P.pos })
   advance()
@@ -247,7 +270,28 @@ function parseObjLit(): i32 {
   mkObjLit(fields)
 }
 
-// `primary` then a chain of call `(args)` / member `.name` postfixes.
+// An array literal `[e, e, ...]`, the cursor on the leading `[`. Elements are
+// comma-separated expressions (a trailing comma is tolerated), or empty `[]`.
+// Returns an `ArrayLit` whose `arrElems` are the element node indices in source
+// order — that order IS the fixed array's element order for `array.new_fixed`.
+function parseArrayLit(): i32 {
+  expect("LBRACK")
+  let elems: i32[] = []
+  let going = peekKind() != "RBRACK"
+  while going {
+    elems.push(parseExpr())
+    if peekKind() == "COMMA" {
+      advance()
+      going = peekKind() != "RBRACK"
+    } else {
+      going = false
+    }
+  }
+  expect("RBRACK")
+  mkArrayLit(elems)
+}
+
+// `primary` then a chain of call `(args)` / member `.name` / index `[i]` postfixes.
 function parsePostfix(): i32 {
   let node = parsePrimary()
   let going = true
@@ -266,6 +310,11 @@ function parsePostfix(): i32 {
         expect("IDENT")
       }
       node = mkMember(node, prop)
+    } else if k == "LBRACK" {
+      advance()
+      let index = parseExpr()
+      expect("RBRACK")
+      node = mkIndex(node, index)
     } else {
       going = false
     }

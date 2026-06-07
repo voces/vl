@@ -308,6 +308,10 @@ let fnStmts: i32[] = []
 // struct, else `0`. Populated by `buildFnMap` so `fnRetStruct` is a flat lookup.
 let fRetRef: i32[] = []
 
+// Parallel to `fnNames`: `1` if the i-th function's declared RETURN type is an array
+// (`i32[]`), else `0`. Populated by `buildFnMap` so `fnRetArray` is a flat lookup.
+let fRetArr: i32[] = []
+
 // Scan the program's top-level statements into `fnStmts` (FuncDecls only, in order),
 // skipping `TypeDecl`s. Any other top-level statement fails loudly. Returns the
 // function count, or -1 (via `emitFail`).
@@ -333,6 +337,7 @@ function buildFnMap(stmts: i32[]): i32 {
   fnNames = []
   fnIndices = []
   fRetRef = []
+  fRetArr = []
   let i = 0
   while i < fnStmts.length {
     let s = P.nodes[fnStmts[i]]
@@ -340,6 +345,7 @@ function buildFnMap(stmts: i32[]): i32 {
       fnNames.push(s.fnName)
       fnIndices.push(i)
       fRetRef.push(retTRFlag(s.fnRet))
+      fRetArr.push(retArrFlag(s.fnRet))
     }
     i = i + 1
   }
@@ -411,9 +417,10 @@ function paramIndexOf(fnIx: i32, name: string): i32 {
 // It is rebuilt per function by `buildLocals` before that function's body is
 // lowered, so only one function's locals are live at a time.
 let localNames: string[] = []
-// Parallel to `localNames`: the i-th declared local's value type — `1` for a struct
-// `(ref $0)` local, `0` for an i32 local. The locals vector and identifier resolution
-// consult this so a struct-typed local gets the ref valtype, not i32.
+// Parallel to `localNames`: the i-th declared local's value-type CODE — `1` for a
+// struct `(ref $0)` local, `2` for an i32-array `(ref $aTypeIdx)` local, `0` for an
+// i32 local. The locals vector (`pushVT`) and identifier resolution consult this so a
+// ref-typed local gets the correct ref valtype, not i32.
 let localIsRef: i32[] = []
 
 // ── struct-type table (one struct per program, i32 fields only) ───────────────
@@ -427,6 +434,18 @@ let localIsRef: i32[] = []
 let sDeclared: boolean = false
 let sName: string = ""
 let sFields: string[] = []
+
+// ── array-type table (one i32 array type per program) ─────────────────────────
+// This slice supports a single element type — `i32` — so ALL array values share one
+// WasmGC array heap type `(array (mut i32))`. It is emitted only when the program
+// actually uses arrays (`aUsed`), placed in the type section right AFTER the struct
+// type (if any), so its type index is `structOffset` (0 when no struct, 1 with one).
+// `aUsed` is a presence flag set by `collectA`'s up-front arena scan; `aTypeIdx` is
+// the resolved heap-type index, computed in `emitModule`. WasmGC arrays are
+// FIXED-LENGTH, so this slice covers literal construction + index read/write + length
+// only — a growable `.push` needs a separate length+capacity wrapper (deferred).
+let aUsed: boolean = false
+let aTypeIdx: i32 = 0
 
 // Append the declared-local name `name` to `localNames` if not already present.
 function addLocalName(name: string, isRef: i32): i32 {
@@ -458,6 +477,8 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
       if s is LetDecl {
         if letIsStruct(stmts[i], fnIx) {
           addLocalName(s.letName, 1)
+        } else if letIsArray(stmts[i], fnIx) {
+          addLocalName(s.letName, 2)
         } else {
           if checkLocalI32(stmts[i]) < 0 { return 0 - 1 }
           addLocalName(s.letName, 0)
@@ -729,6 +750,75 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected a field access")
 }
 
+// Lower an array literal `[e, e, ...]` onto `body`: push each element value in source
+// order (all i32 in this slice), then `array.new_fixed $aTypeIdx <count>`
+// (`0xfb 0x08 <typeidx> <count>`, derived from binaryen's `fb 08 00 03`). The
+// element count is the operand the engine pops that many values for. An element that
+// is itself an array (nested) is out of scope — fails loudly.
+function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
+  if !aUsed {
+    return emitFail("emitProgram: array literal but array type not collected")
+  }
+  let a = P.nodes[arrIx]
+  if a is ArrayLit {
+    let elems = a.arrElems
+    let i = 0
+    while i < elems.length {
+      if exprArray(elems[i], fnIx) {
+        return emitFail("emitProgram: nested arrays are not supported")
+      }
+      if exprStruct(elems[i], fnIx) {
+        return emitFail("emitProgram: struct array elements are not supported")
+      }
+      if emitExpr(body, elems[i], fnIx) < 0 { return 0 - 1 }
+      i = i + 1
+    }
+    body.push(251)           // 0xfb GC prefix
+    body.push(8)             // array.new_fixed
+    appendAll(body, ulebToArr(aTypeIdx))    // array type index
+    appendAll(body, ulebToArr(elems.length))   // element count
+    return 0
+  }
+  emitFail("emitProgram: expected an array literal")
+}
+
+// Lower an index READ `a[i]` onto `body`: evaluate the array (receiver, must be an
+// array), then the index (an i32), then `array.get $aTypeIdx`
+// (`0xfb 0x0b <typeidx>`, derived from binaryen's `fb 0b 00`; the `_s/_u` signed
+// forms `0x0c/0x0d` are only for PACKED arrays — an unpacked i32 array uses `0x0b`).
+function emitIndex(body: i32[], idxIx: i32, fnIx: i32): i32 {
+  if !aUsed {
+    return emitFail("emitProgram: index access but array type not collected")
+  }
+  let nd = P.nodes[idxIx]
+  if nd is Index {
+    if !exprArray(nd.idxArr, fnIx) {
+      return emitFail("emitProgram: index receiver is not an array")
+    }
+    if emitExpr(body, nd.idxArr, fnIx) < 0 { return 0 - 1 }
+    if emitExpr(body, nd.idxIndex, fnIx) < 0 { return 0 - 1 }
+    body.push(251)           // 0xfb GC prefix
+    body.push(11)            // 0x0b array.get
+    appendAll(body, ulebToArr(aTypeIdx))    // array type index
+    return 0
+  }
+  emitFail("emitProgram: expected an index access")
+}
+
+// Lower an array length `a.length` onto `body`: evaluate the array (receiver), then
+// `array.len` (`0xfb 0x0f`, derived from binaryen's `fb 0f` — note `array.len` takes
+// NO type-index operand, unlike `array.get`/`array.set`). Yields an i32.
+function emitArrLen(body: i32[], memIx: i32, fnIx: i32): i32 {
+  let m = P.nodes[memIx]
+  if m is Member {
+    if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
+    body.push(251)           // 0xfb GC prefix
+    body.push(15)            // 0x0f array.len (no type-index operand)
+    return 0
+  }
+  emitFail("emitProgram: expected a length access")
+}
+
 function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 {
     return emitFail("emitProgram: missing expression")
@@ -769,7 +859,21 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
   if e is ObjLit {
     return emitObj(body, exprIx, fnIx)
   }
+  if e is ArrayLit {
+    return emitArr(body, exprIx, fnIx)
+  }
+  if e is Index {
+    return emitIndex(body, exprIx, fnIx)
+  }
   if e is Member {
+    // `a.length` on an array receiver is `array.len`; every other member access is a
+    // struct field read. `length` over a non-array receiver falls through to the
+    // struct path (which fails loudly if no such field), matching the slice's scope.
+    if e.memProp == "length" {
+      if exprArray(e.memObj, fnIx) {
+        return emitArrLen(body, exprIx, fnIx)
+      }
+    }
     return emitMem(body, exprIx, fnIx)
   }
   if e is BinExpr {
@@ -853,6 +957,24 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
       body.push(33)          // 0x21 local.set
       appendAll(body, ulebToArr(idx))
+      return 0
+    }
+    if target is Index {
+      // Indexed store `a[i] = v`: push the array ref, the index, then the value, then
+      // `array.set $aTypeIdx` (`0xfb 0x0e <typeidx>`, derived from binaryen's
+      // `fb 0e 00`). The receiver must be an array; the value is an i32.
+      if !aUsed {
+        return emitFail("emitProgram: indexed assignment but array type not collected")
+      }
+      if !exprArray(target.idxArr, fnIx) {
+        return emitFail("emitProgram: indexed-assignment target is not an array")
+      }
+      if emitExpr(body, target.idxArr, fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, target.idxIndex, fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+      body.push(251)         // 0xfb GC prefix
+      body.push(14)          // 0x0e array.set
+      appendAll(body, ulebToArr(aTypeIdx))    // array type index
       return 0
     }
     return emitFail("emitProgram: assignment target is not a simple name")
@@ -984,10 +1106,13 @@ function checkParams(fnIx: i32): i32 {
         }
         let ty = P.nodes[p.parType]
         if ty is TypeRef {
-          // i32 or the declared struct type are allowed; anything else fails.
+          // i32, the declared struct type, or an array (`i32[]`) are allowed; anything
+          // else fails. (`collectA` already validated every array annotation is i32[].)
           if ty.tyName != "i32" {
             if !isSName(ty.tyName) {
-              return emitFail("emitProgram: only i32 or struct parameters are supported")
+              if !nameIsArray(ty.tyName) {
+                return emitFail("emitProgram: only i32, struct, or array parameters are supported")
+              }
             }
           }
         } else {
@@ -1066,12 +1191,60 @@ function paramTRFlag(paramIx: i32): i32 {
   0
 }
 
-// Push a wasm value type onto `payload`: `(ref $0)` (`0x64 0x00`, non-null ref to the
-// struct type) when `isRef == 1`, else i32 (`0x7f`).
-function pushVT(payload: i32[], isRef: i32): i32 {
-  if isRef == 1 {
+// `1` if the type-annotation node at `tyIx` is an array type (`i32[]`), else `0`.
+// The functype/local valtype layer multiplexes the struct/array/i32 cases through one
+// `kind` code, so this flat flag feeds the `kind == 2` (array) branch of `pushVT`.
+function retArrFlag(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if nameIsArray(ty.tyName) { return 1 }
+    }
+  }
+  0
+}
+
+// `1` if the parameter node at `paramIx` is an array type, else `0`.
+function paramArrFlag(paramIx: i32): i32 {
+  let p = P.nodes[paramIx]
+  if p is Param {
+    return retArrFlag(p.parType)
+  }
+  0
+}
+
+// Combine the struct/array flags for a type-annotation node at `tyIx` into the single
+// `pushVT` `kind` code: `1` struct, `2` array, `0` i32. (Struct wins if a name were
+// somehow both — it cannot be, the suffixes are disjoint.)
+function vtKindOfType(tyIx: i32): i32 {
+  if retTRFlag(tyIx) == 1 { return 1 }
+  if retArrFlag(tyIx) == 1 { return 2 }
+  0
+}
+
+// The `pushVT` `kind` for a parameter node at `paramIx` (`1` struct, `2` array, `0`
+// i32).
+function vtKindOfParam(paramIx: i32): i32 {
+  let p = P.nodes[paramIx]
+  if p is Param {
+    return vtKindOfType(p.parType)
+  }
+  0
+}
+
+// Push a wasm value type onto `payload`. The `kind` tag selects the encoding:
+//   1 → struct ref `(ref $0)` (`0x64 0x00`, non-null ref to the struct type, index 0)
+//   2 → array  ref `(ref $aTypeIdx)` (`0x64 <aTypeIdx>`, non-null ref to the i32 array)
+//   else → i32 (`0x7f`)
+// A ref is always non-null (`0x64`), matching binaryen's `(ref $T)` for a value that
+// is statically known to be present (a constructed array / struct, never `null`).
+function pushVT(payload: i32[], kind: i32): i32 {
+  if kind == 1 {
     payload.push(100)          // 0x64 (ref ht) — non-null ref
     payload.push(0)            // heap type index 0 (the struct type)
+  } else if kind == 2 {
+    payload.push(100)          // 0x64 (ref ht) — non-null ref
+    appendAll(payload, ulebToArr(aTypeIdx))   // the i32 array heap-type index
   } else {
     payload.push(127)          // 0x7f i32
   }
@@ -1091,16 +1264,24 @@ function emitModule(stmts: i32[]): i32 {
 
   let n = fnStmts.length
 
-  // `structOffset` is the type-index shift the struct (when present) introduces:
-  // the GC struct type is type 0, so func types start at index 1 (else at 0).
+  // Heap-type indices: the GC struct type (if any) is type 0, the i32 array type (if
+  // used) follows, and the functypes follow those. `structOffset`/`arrayOffset` are
+  // each 0 or 1; `typeOffset` is their sum — the index the first functype lands at.
+  // `aTypeIdx` (the array heap-type index) is `structOffset`, recorded for `pushVT`.
   let structOffset = 0
   if sDeclared { structOffset = 1 }
+  let arrayOffset = 0
+  if aUsed { arrayOffset = 1 }
+  aTypeIdx = structOffset
+  let typeOffset = structOffset + arrayOffset
 
   // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
-  // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`) —
-  // then one functype per function (`(i32|ref $0)* -> i32|ref $0`).
+  // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`);
+  // the i32 array type (if used) next — `0x5e` array form, `0x7f` i32 storagetype,
+  // `0x01` mutable (derived from binaryen: `5e 7f 01`); then one functype per
+  // function (`(i32|ref)* -> i32|ref`).
   let typePayload: i32[] = []
-  appendAll(typePayload, ulebToArr(n + structOffset))   // total type count
+  appendAll(typePayload, ulebToArr(n + typeOffset))   // total type count
   if sDeclared {
     typePayload.push(95)         // 0x5f struct
     appendAll(typePayload, ulebToArr(sFields.length))
@@ -1110,6 +1291,11 @@ function emitModule(stmts: i32[]): i32 {
       typePayload.push(1)        // mutable
       sf = sf + 1
     }
+  }
+  if aUsed {
+    typePayload.push(94)         // 0x5e array
+    typePayload.push(127)        // 0x7f i32 storagetype
+    typePayload.push(1)          // mutable
   }
   let ti = 0
   while ti < n {
@@ -1121,22 +1307,22 @@ function emitModule(stmts: i32[]): i32 {
       appendAll(typePayload, ulebToArr(nParams))   // param count
       let pi = 0
       while pi < nParams {
-        pushVT(typePayload, paramTRFlag(params[pi]))
+        pushVT(typePayload, vtKindOfParam(params[pi]))
         pi = pi + 1
       }
       typePayload.push(1)        // 1 result
-      pushVT(typePayload, retTRFlag(fn.fnRet))
+      pushVT(typePayload, vtKindOfType(fn.fnRet))
     }
     ti = ti + 1
   }
   emitSection(1, typePayload)
 
-  // Function section (id 3): N functions; func i uses functype `structOffset + i`.
+  // Function section (id 3): N functions; func i uses functype `typeOffset + i`.
   let funcPayload: i32[] = []
   appendAll(funcPayload, ulebToArr(n))
   let fi = 0
   while fi < n {
-    appendAll(funcPayload, ulebToArr(structOffset + fi))   // functype index
+    appendAll(funcPayload, ulebToArr(typeOffset + fi))   // functype index
     fi = fi + 1
   }
   emitSection(3, funcPayload)
@@ -1206,6 +1392,49 @@ function emitModule(stmts: i32[]): i32 {
 // True if the type-name `name` refers to the declared struct type.
 function isSName(name: string): boolean {
   sDeclared && name == sName
+}
+
+// True if the type-name `name` is an ARRAY type — its lexeme ends in `[]` (the
+// suffix `parseType` appends for every `T[]` annotation). Only `i32[]` is emittable
+// in this slice; a non-i32 element array is rejected by `checkArrName`.
+function nameIsArray(name: string): boolean {
+  let n = name.length
+  if n < 2 { return false }
+  if name[n - 2] != '[' { return false }
+  if name[n - 1] != ']' { return false }
+  true
+}
+
+// Validate an array type-name as the single supported element type: exactly `i32[]`
+// (one `[]` over an `i32` base). A nested `i32[][]` or non-i32 element fails loudly.
+// Returns 0 on success, or -1 (via `emitFail`).
+function checkArrName(name: string): i32 {
+  if name == "i32[]" { return 0 }
+  emitFail("emitProgram: only i32[] arrays are supported")
+}
+
+// Scan the whole arena for any array use — an `ArrayLit` expression or an array type
+// annotation (`TypeRef` whose name ends in `[]`) — setting `aUsed`. A single linear
+// pass over `P.nodes` is exhaustive (every node, reachable or not, is checked) and
+// stable: it fixes whether the program needs the array heap type BEFORE the type
+// section is emitted. Each array annotation is validated as `i32[]` here, so a
+// non-i32 element array fails loudly up-front. Returns 0, or -1 (via `emitFail`).
+function collectA(stmts: i32[]): i32 {
+  aUsed = false
+  let i = 0
+  while i < P.nodes.length {
+    let nd = P.nodes[i]
+    if nd is ArrayLit {
+      aUsed = true
+    } else if nd is TypeRef {
+      if nameIsArray(nd.tyName) {
+        if checkArrName(nd.tyName) < 0 { return 0 - 1 }
+        aUsed = true
+      }
+    }
+    i = i + 1
+  }
+  0
 }
 
 // True if the node at `ix` is a struct `type` declaration (a single-level narrowing
@@ -1342,6 +1571,93 @@ function letIsStruct(letIx: i32, fnIx: i32): boolean {
   false
 }
 
+// ── array-typedness of expressions ───────────────────────────────────────────
+// Parallel to the struct family above: decide whether an expression / param / local
+// PRODUCES the i32 array (a `(ref $aTypeIdx)`) rather than an i32. An index read
+// `a[i]` and `a.length` are i32 (NOT arrays), so they are deliberately absent here.
+
+// True if the function `name` declares an array (`i32[]`) as its return type.
+function fnRetArray(name: string): boolean {
+  let i = 0
+  while i < fnNames.length {
+    if fnNames[i] == name { return fRetArr[i] == 1 }
+    i = i + 1
+  }
+  false
+}
+
+// True if the parameter `name` of function `fnIx` is an array type.
+function paramArray(fnIx: i32, name: string): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef { return nameIsArray(ty.tyName) }
+          }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the already-collected declared local `name` is an array ref (code `2`).
+function declaredArray(name: string): boolean {
+  let i = 0
+  while i < localNames.length {
+    if localNames[i] == name {
+      return localIsRef[i] == 2
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True if evaluating the expression at `exprIx` yields the i32 array: an array
+// literal, an array-returning call, an array param/local reference, or a parenthesized
+// array expression. An index read / `.length` yields an i32, so neither counts.
+function exprArray(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is ArrayLit { return true }
+  if e is Paren { return exprArray(e.parInner, fnIx) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident { return fnRetArray(callee.identName) }
+    return false
+  }
+  if e is Ident {
+    if paramArray(fnIx, e.identName) { return true }
+    return declaredArray(e.identName)
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` declares an array-typed local: its annotation is an
+// array type (`i32[]`), OR its initializer produces an array. Picks the local's
+// valtype (`(ref $aTypeIdx)` vs i32) in `collectLocals`.
+function letIsArray(letIx: i32, fnIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if nameIsArray(lt.tyName) { return true }
+      }
+    }
+    return exprArray(d.letInit, fnIx)
+  }
+  false
+}
+
 function emitProgram(rootIx: i32): i32 {
   emitFailed = false
   emitErr = ""
@@ -1359,6 +1675,7 @@ function emitProgram(rootIx: i32): i32 {
     // map. Forward references and recursion resolve because every name is mapped
     // before any body is emitted.
     if collectS(stmts) < 0 { return 0 - 1 }
+    if collectA(stmts) < 0 { return 0 - 1 }
     if collectFns(stmts) < 0 { return 0 - 1 }
     if fnStmts.length < 1 {
       return emitFail("emitProgram: expected at least one top-level function")
