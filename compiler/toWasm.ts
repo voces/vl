@@ -70,18 +70,46 @@ const ignoredKeys = new Set(Object.keys(defaultScope()));
  */
 export type WasmEmit = { binary: Uint8Array; sourceMap?: string };
 
+/**
+ * A cache for the binaryen `optimize()` stage — the single most expensive step
+ * (~40% of a large compile). `optimize()` is a pure transform whose only
+ * dependency is the binaryen version, so its result can be keyed on the
+ * UNOPTIMIZED module bytes (the actual IR fed to it) plus a `salt` (file name /
+ * debug flag, which affect the emitted form). Content-addressing on the real
+ * pre-optimize bytes makes it robust to *which* compiler change produced them.
+ *
+ * Injected by a Deno entry point (see `compiler/buildCache.ts`) so the
+ * runtime-agnostic core never imports the filesystem cache itself; left
+ * `undefined` everywhere else, in which case `optimize()` simply runs as before.
+ */
+export type OptimizeCache = {
+  /** Cached optimized result for these unoptimized bytes + salt, or undefined. */
+  get(
+    unoptimized: Uint8Array,
+    salt: string,
+  ): WasmEmit | undefined | Promise<WasmEmit | undefined>;
+  /** Store the optimized result for these unoptimized bytes + salt. */
+  put(
+    unoptimized: Uint8Array,
+    salt: string,
+    optimized: WasmEmit,
+  ): void | Promise<void>;
+};
+
 export type ToWasmOptions = {
   /** AST node → source span side-table (Track G), threaded into debug locations. */
   spans?: NodeSpans;
   /** Logical source file name recorded in the source map (e.g. `main.vl`). */
   fileName?: string;
+  /** Optional cache for the binaryen `optimize()` stage. See {@link OptimizeCache}. */
+  optimizeCache?: OptimizeCache;
 };
 
 export const toWasm = async (
   ast: VLProgramNode,
   options: ToWasmOptions = {},
 ): Promise<WasmEmit> => {
-  const { spans, fileName = "source.vl" } = options;
+  const { spans, fileName = "source.vl", optimizeCache } = options;
   // binaryen's default export is a synchronous module object (plain npm), or,
   // when the binaryen patch is applied (patch-package, used by the bundled
   // extension), an async init function returning that object. Support both so
@@ -4676,19 +4704,17 @@ export const toWasm = async (
     console.log("result");
     console.log(m.emitText());
   }
-  // if (!m.validate()) throw new Error("validation error");
-  m.optimize();
-  if (debug) {
-    console.log("optimized");
-    console.log(m.emitText());
-  }
-  if (!m.validate()) throw new Error("validation error");
-  // With debug info on, emit the binary together with its Source Map v3 (offset
-  // → file:line:col). `emitBinary(url)` returns `{ binary, sourceMap }`; the URL
-  // is only the map's `file` field — `runWasm` consumes the map text directly,
-  // not via a fetched URL. Restore the global debug flag so a later no-spans
-  // compile on the same binaryen object emits no debug sections.
-  try {
+
+  // Optimize + emit. With debug info on, emit the binary together with its
+  // Source Map v3 (offset → file:line:col); `emitBinary(url)` returns
+  // `{ binary, sourceMap }`, the URL being only the map's `file` field.
+  const optimizeAndEmit = (): WasmEmit => {
+    m.optimize();
+    if (debug) {
+      console.log("optimized");
+      console.log(m.emitText());
+    }
+    if (!m.validate()) throw new Error("validation error");
     if (debugEnabled) {
       const out = m.emitBinary(`${fileName}.map`) as {
         binary: Uint8Array;
@@ -4697,6 +4723,31 @@ export const toWasm = async (
       return { binary: out.binary, sourceMap: out.sourceMap };
     }
     return { binary: m.emitBinary() };
+  };
+
+  // Restore the global debug flag so a later no-spans compile on the same
+  // binaryen object emits no debug sections.
+  try {
+    // With an optimize cache: the UNOPTIMIZED binary is the key (it captures the
+    // full pre-optimize module — debug sections included when `debugEnabled`),
+    // and `fileName`/`debugEnabled` salt it because they affect the emitted form
+    // (the map's `file` field / debug sections) without changing the unopt bytes.
+    // A hit returns the stored optimized result and skips `optimize()` entirely;
+    // a miss optimizes, emits, and stores it.
+    if (optimizeCache) {
+      const unoptimized = m.emitBinary();
+      // NUL-delimited so the salt components can't collide (e.g. a fileName that
+      // contains a space). The feature set (GC | ReferenceTypes) is fixed and the
+      // optimizer runs at binaryen's default level — if either ever becomes
+      // configurable, add it here, since neither is captured by the unopt bytes.
+      const salt = `${fileName}\0${debugEnabled}`;
+      const hit = await optimizeCache.get(unoptimized, salt);
+      if (hit) return hit;
+      const result = optimizeAndEmit();
+      await optimizeCache.put(unoptimized, salt, result);
+      return result;
+    }
+    return optimizeAndEmit();
   } finally {
     if (debugEnabled && typeof binaryen.setDebugInfo === "function") {
       binaryen.setDebugInfo(oldDebugInfo);

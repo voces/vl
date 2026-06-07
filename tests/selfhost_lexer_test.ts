@@ -10,7 +10,8 @@
 // workarounds directly: positions are rendered with the real `toString`, and the
 // `\x41` / `\u{…}` escapes decode via `fromCodePoint`.
 
-import { compile, runWasm } from "../compiler/compile.ts";
+import { runWasm } from "../compiler/compile.ts";
+import { compileCached } from "./_selfhost_cache.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
@@ -25,7 +26,7 @@ const lexer = read("../compiler/lexer.vl");
 
 // Compile `lexer.vl ++ driver`, run it, return the captured log lines.
 const runDriver = async (driver: string): Promise<string[]> => {
-  const { wasm, diagnostics } = await compile(lexer + "\n" + driver);
+  const { wasm, diagnostics } = await compileCached(lexer + "\n" + driver);
   const errors = diagnostics.filter((d) => d.severity === "error");
   if (errors.length > 0 || !wasm) {
     throw new Error(

@@ -15,7 +15,8 @@
 // arena yet. Language/codegen gaps surfaced are in `docs/selfhost-gaps.md` under
 // "Codegen self-host (H4)".
 
-import { compile, runWasm } from "../compiler/compile.ts";
+import { runWasm } from "../compiler/compile.ts";
+import { compileCached } from "./_selfhost_cache.ts";
 
 const read = (rel: string) =>
   Deno.readTextFileSync(new URL(rel, import.meta.url));
@@ -26,7 +27,7 @@ const wasmEmit = read("../compiler/wasmEmit.vl");
 // Compile `ast.vl ++ wasmEmit.vl ++ driver`, run it, return the logs.
 const runDriver = async (driver: string): Promise<string[]> => {
   const source = ast + "\n" + wasmEmit + "\n" + driver;
-  const { wasm, diagnostics } = await compile(source);
+  const { wasm, diagnostics } = await compileCached(source);
   const errors = diagnostics.filter((d) => d.severity === "error");
   if (errors.length > 0 || !wasm) {
     throw new Error(

@@ -19,7 +19,8 @@
 // The token-`kind` spellings now agree between the lexer and parser (gap #2
 // resolved in `compiler/lexer.vl`), so no `mapKind` translation is needed.
 
-import { compile, runWasm } from "../compiler/compile.ts";
+import { runWasm } from "../compiler/compile.ts";
+import { compileCached } from "./_selfhost_cache.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
@@ -50,7 +51,7 @@ const typecheck = read("../compiler/typecheck.vl");
 const runDriver = async (driver: string): Promise<string[]> => {
   const source = lexer + "\n" + ast + "\n" + parser + "\n" + typecheck + "\n" +
     driver;
-  const { wasm, diagnostics } = await compile(source);
+  const { wasm, diagnostics } = await compileCached(source);
   const errors = diagnostics.filter((d) => d.severity === "error");
   if (errors.length > 0 || !wasm) {
     throw new Error(

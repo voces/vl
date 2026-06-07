@@ -13,7 +13,8 @@
 // `mode`-dispatched mega-function), and a struct-field arena pushed onto directly
 // (not threaded as bare array parameters).
 
-import { compile, runWasm } from "../compiler/compile.ts";
+import { runWasm } from "../compiler/compile.ts";
+import { compileCached } from "./_selfhost_cache.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
@@ -30,7 +31,7 @@ const parser = read("../compiler/parser.vl");
 // Compile `ast.vl ++ parser.vl ++ driver`, run it, return the captured log lines.
 const runDriver = async (driver: string): Promise<string[]> => {
   const source = ast + "\n" + parser + "\n" + driver;
-  const { wasm, diagnostics } = await compile(source);
+  const { wasm, diagnostics } = await compileCached(source);
   const errors = diagnostics.filter((d) => d.severity === "error");
   if (errors.length > 0 || !wasm) {
     throw new Error(
