@@ -428,6 +428,7 @@ export const compileProgram = async (
   entryKey: string,
   read: (key: string) => string | undefined | Promise<string | undefined>,
   fileName = entryKey,
+  options: CompileOptions = {},
 ): Promise<CompileResult> => {
   // Loaded lazily so `compile.ts`'s existing consumers don't pull the resolver.
   const { loadProgram } = await import("./modules.ts");
@@ -438,7 +439,12 @@ export const compileProgram = async (
   if (ast && !diagnostics.some((d) => d.severity === "error")) {
     try {
       const { toWasm } = await import("./toWasm.ts");
-      const emit = await toWasm(ast, { fileName });
+      // Forward the optimize cache so multi-file builds get the same optimize()
+      // reuse as the single-file path (it was previously only wired into compile()).
+      const emit = await toWasm(ast, {
+        fileName,
+        optimizeCache: options.optimizeCache,
+      });
       wasm = emit.binary;
       sourceMap = emit.sourceMap;
     } catch (err) {

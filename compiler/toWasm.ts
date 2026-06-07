@@ -4732,7 +4732,11 @@ export const toWasm = async (
     // a miss optimizes, emits, and stores it.
     if (optimizeCache) {
       const unoptimized = m.emitBinary();
-      const salt = `${fileName} ${debugEnabled}`;
+      // NUL-delimited so the salt components can't collide (e.g. a fileName that
+      // contains a space). The feature set (GC | ReferenceTypes) is fixed and the
+      // optimizer runs at binaryen's default level — if either ever becomes
+      // configurable, add it here, since neither is captured by the unopt bytes.
+      const salt = `${fileName}\0${debugEnabled}`;
       const hit = await optimizeCache.get(unoptimized, salt);
       if (hit) return hit;
       const result = optimizeAndEmit();

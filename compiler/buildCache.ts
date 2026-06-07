@@ -54,17 +54,27 @@ const walkTs = (dir: URL): string[] => {
   return out.sort();
 };
 
-// Fingerprint = hash of the compiler's own source + dependency pins. Memoized
-// per process: it never changes within a single run. Reading the ~20 compiler
-// files costs a few ms once; a cache hit it enables saves ~1.4 s.
+// Fingerprint = hash of the compiler's own source + dependency pins + the
+// toolchain identity. Memoized per process: it never changes within a single
+// run. Reading the ~20 compiler files costs a few ms once; a cache hit it
+// enables saves ~1.4 s.
+//
+// Paths are folded in RELATIVE to the compiler dir (not absolute) so the
+// fingerprint is identical across machines/checkouts — a prerequisite for ever
+// sharing the cache between a dev box and CI. The Deno version + target (os/arch)
+// are included because the emitted wasm is, in principle, a function of the whole
+// toolchain, and a shared CI cache must not serve blobs across Deno upgrades or
+// architectures.
 let fingerprintPromise: Promise<string> | undefined;
 export const compilerFingerprint = (): Promise<string> => {
   if (fingerprintPromise) return fingerprintPromise;
   fingerprintPromise = (async () => {
     const enc = new TextEncoder();
     const parts: Uint8Array[] = [];
+    const base = COMPILER_DIR.pathname;
     for (const file of walkTs(COMPILER_DIR)) {
-      parts.push(enc.encode(file + "\0" + Deno.readTextFileSync(file) + "\0"));
+      const rel = file.startsWith(base) ? file.slice(base.length) : file;
+      parts.push(enc.encode(rel + "\0" + Deno.readTextFileSync(file) + "\0"));
     }
     // Dependency pins (binaryen version etc.) affect codegen output too.
     for (const rel of ["deno.json", "deno.lock"]) {
@@ -76,6 +86,8 @@ export const compilerFingerprint = (): Promise<string> => {
         );
       } catch { /* deno.lock may be absent — skip */ }
     }
+    // Toolchain identity: Deno version + os/arch target.
+    parts.push(enc.encode(`deno\0${Deno.version.deno}\0${Deno.build.target}\0`));
     let total = 0;
     for (const p of parts) total += p.length;
     const joined = new Uint8Array(total);
@@ -141,22 +153,53 @@ export const writeCachedBlob = (key: string, bytes: Uint8Array): void => {
 // moved. (It still costs IR-build to produce those bytes — it saves the
 // ~40%-of-compile optimize pass, not the whole compile.)
 
-// Just the binaryen pin from deno.json/deno.lock (version + integrity), so this
-// fingerprint changes when binaryen does and at no other time.
+// Identity of the binaryen the optimize() output depends on. We trust the
+// `deno.lock` integrity hash — it IS binaryen's package content hash, and the
+// Deno path (the only cache consumer) runs binaryen unpatched straight from the
+// lock (patch-package only affects the bundled LSP, which never uses this cache),
+// so hashing the installed binary would buy nothing. We parse the lock as JSON
+// (by key) rather than grepping lines, so the integrity — which lives on its own
+// line, NOT a line containing "binaryen" — is actually captured. `Deno.build.target`
+// is folded in so a shared CI cache can't serve optimize blobs across
+// architectures. Falls back to a line scan if the lock can't be parsed.
 let binaryenFpPromise: Promise<string> | undefined;
 export const binaryenFingerprint = (): Promise<string> => {
   if (binaryenFpPromise) return binaryenFpPromise;
   binaryenFpPromise = (async () => {
-    const lines: string[] = [];
-    for (const rel of ["deno.json", "deno.lock"]) {
-      try {
-        const text = Deno.readTextFileSync(new URL(rel, REPO_ROOT));
-        for (const line of text.split("\n")) {
-          if (line.includes("binaryen")) lines.push(line.trim());
+    const fields: string[] = [`target\0${Deno.build.target}`];
+    try {
+      const json = Deno.readTextFileSync(new URL("deno.json", REPO_ROOT));
+      const m = json.match(/"binaryen"\s*:\s*"([^"]+)"/);
+      if (m) fields.push(`spec\0${m[1]}`);
+    } catch { /* deno.json absent */ }
+    let parsedLock = false;
+    try {
+      const lock = JSON.parse(
+        Deno.readTextFileSync(new URL("deno.lock", REPO_ROOT)),
+      ) as {
+        npm?: Record<string, { integrity?: string }>;
+        specifiers?: Record<string, string>;
+      };
+      for (const [key, entry] of Object.entries(lock.npm ?? {})) {
+        if (key.startsWith("binaryen@")) {
+          fields.push(`npm\0${key}\0${entry.integrity ?? ""}`);
+          parsedLock = true;
         }
-      } catch { /* file may be absent */ }
+      }
+      for (const [key, ver] of Object.entries(lock.specifiers ?? {})) {
+        if (key.includes("binaryen")) fields.push(`specifier\0${key}\0${ver}`);
+      }
+    } catch { /* fall through to line scan */ }
+    if (!parsedLock) {
+      // Defensive fallback: lock missing or unparseable — scan for binaryen lines.
+      try {
+        const text = Deno.readTextFileSync(new URL("deno.lock", REPO_ROOT));
+        for (const line of text.split("\n")) {
+          if (line.includes("binaryen")) fields.push(line.trim());
+        }
+      } catch { /* absent */ }
     }
-    return await sha256Hex(new TextEncoder().encode(lines.join("\n")));
+    return await sha256Hex(new TextEncoder().encode(fields.join("\n")));
   })();
   return binaryenFpPromise;
 };
