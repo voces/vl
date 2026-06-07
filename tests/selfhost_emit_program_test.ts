@@ -172,6 +172,53 @@ Deno.test("self-hosted emit-program: nested params + ops `return a * b - c` eval
   if (got !== 17) throw new Error(`f(5, 4, 3) returned ${got}, expected 17`);
 });
 
+Deno.test("self-hosted emit-program: a recursive `fib` compiles, calls itself, and runs", async () => {
+  // Forces the full slice at once: an `if n < 2 { return n }` guard (comparison +
+  // structured void `if` + `return`), then `return fib(n-1) + fib(n-2)` — two
+  // recursive calls whose own index is resolved through the function-index map.
+  const logs = await runFor(
+    "function fib(n: i32): i32 {\n  if n < 2 { return n }\n  return fib(n - 1) + fib(n - 2)\n}\n",
+  );
+  const bytes = bytesFromLog(logs);
+  const got = await runExport(bytes, "fib", 10);
+  if (got !== 55) throw new Error(`fib(10) returned ${got}, expected 55`);
+});
+
+Deno.test("self-hosted emit-program: a recursive `fact` multiplies down to the base case", async () => {
+  const logs = await runFor(
+    "function fact(n: i32): i32 {\n  if n <= 1 { return 1 }\n  return n * fact(n - 1)\n}\n",
+  );
+  const got = await runExport(bytesFromLog(logs), "fact", 5);
+  if (got !== 120) throw new Error(`fact(5) returned ${got}, expected 120`);
+});
+
+Deno.test("self-hosted emit-program: a two-function call chain links `main` to a helper", async () => {
+  // Two top-level functions in one module: `main` calls `inc`. The export section
+  // carries both, and the call resolves `inc` through the name→index map.
+  const logs = await runFor(
+    "function inc(x: i32): i32 {\n  return x + 1\n}\nfunction main(): i32 {\n  return inc(41)\n}\n",
+  );
+  const bytes = bytesFromLog(logs);
+  const main = await runExport(bytes, "main");
+  if (main !== 42) throw new Error(`main() returned ${main}, expected 42`);
+  // Both functions are exported under their own names — `inc` is callable too.
+  const inc = await runExport(bytes, "inc", 9);
+  if (inc !== 10) throw new Error(`inc(9) returned ${inc}, expected 10`);
+});
+
+Deno.test("self-hosted emit-program: a non-recursive `if` branch picks a sign", async () => {
+  // A void `if` whose then-branch `return`s `-1` (unary negation), with a fall-
+  // through `return 1` — no recursion, no block result type.
+  const logs = await runFor(
+    "function sign(n: i32): i32 {\n  if n < 0 { return -1 }\n  return 1\n}\n",
+  );
+  const bytes = bytesFromLog(logs);
+  const neg = await runExport(bytes, "sign", -5);
+  if (neg !== -1) throw new Error(`sign(-5) returned ${neg}, expected -1`);
+  const pos = await runExport(bytes, "sign", 5);
+  if (pos !== 1) throw new Error(`sign(5) returned ${pos}, expected 1`);
+});
+
 Deno.test("self-hosted emit-program: an unsupported shape fails loudly, not with garbage bytes", async () => {
   // Division is outside this slice (only `+`/`-`/`*`): `emitProgram` must take
   // the unsupported path (set `emitErr`, emit no bytes) rather than produce a
