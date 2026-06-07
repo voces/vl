@@ -375,6 +375,14 @@ export const compile = async (
   if (!diagnostics.some((d) => d.severity === "error")) {
     try {
       const { toWasm } = await import("./toWasm.ts");
+      // A single compiled file IS its own entry module (index 0), so its
+      // `export function`s become host-callable wasm exports — same entry-only
+      // semantics as the multi-file path, just with no name mangling, so the
+      // exported (host-facing) name and the internal codegen name coincide. Only
+      // FUNCTIONS export in v1 (exported `let`/`const` globals are filtered out).
+      const hostExports = Object.values(ast.moduleExports ?? {})
+        .filter((e) => e.type.type === "Function")
+        .map((e) => ({ exportName: e.name, internalName: e.name }));
       // Thread the AST spans + file name into codegen so the emitted module
       // carries debug locations (a source map) and the name section — additive
       // metadata only; the executable behavior is unchanged. `optimizeCache`, when
@@ -384,6 +392,7 @@ export const compile = async (
         spans,
         fileName,
         optimizeCache: options.optimizeCache,
+        hostExports,
       });
       wasm = emit.binary;
       sourceMap = emit.sourceMap;
@@ -432,7 +441,10 @@ export const compileProgram = async (
 ): Promise<CompileResult> => {
   // Loaded lazily so `compile.ts`'s existing consumers don't pull the resolver.
   const { loadProgram } = await import("./modules.ts");
-  const { ast, diagnostics, symbols } = await loadProgram(entryKey, read);
+  const { ast, diagnostics, symbols, hostExports } = await loadProgram(
+    entryKey,
+    read,
+  );
 
   let wasm: Uint8Array | undefined;
   let sourceMap: string | undefined;
@@ -440,10 +452,14 @@ export const compileProgram = async (
     try {
       const { toWasm } = await import("./toWasm.ts");
       // Forward the optimize cache so multi-file builds get the same optimize()
-      // reuse as the single-file path (it was previously only wired into compile()).
+      // reuse as the single-file path (it was previously only wired into
+      // compile()). `hostExports` carries the ENTRY module's `export function`s
+      // (mangled internal names) so they become host-callable wasm exports;
+      // imported modules' exports stay tree-shakeable (entry-only semantics).
       const emit = await toWasm(ast, {
         fileName,
         optimizeCache: options.optimizeCache,
+        hostExports,
       });
       wasm = emit.binary;
       sourceMap = emit.sourceMap;

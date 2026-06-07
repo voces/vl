@@ -96,6 +96,15 @@ export type OptimizeCache = {
   ): void | Promise<void>;
 };
 
+/**
+ * One host-callable wasm export request: emit the entry-module function
+ * `internalName` (the merged AST's mangled codegen name) under the host-facing
+ * name `exportName`. Mirrors `modules.ts`'s `HostExport` (kept structurally
+ * identical here to avoid a `compile.ts`→`modules.ts` import cycle through
+ * `toWasm.ts`).
+ */
+export type HostExportRequest = { exportName: string; internalName: string };
+
 export type ToWasmOptions = {
   /** AST node → source span side-table (Track G), threaded into debug locations. */
   spans?: NodeSpans;
@@ -103,13 +112,27 @@ export type ToWasmOptions = {
   fileName?: string;
   /** Optional cache for the binaryen `optimize()` stage. See {@link OptimizeCache}. */
   optimizeCache?: OptimizeCache;
+  /**
+   * ENTRY-module `export function`s to expose as host-callable wasm exports
+   * (binaryen treats an export as a DCE root, so listing one here both KEEPS the
+   * function — overriding the unused→DCE'd default — and exposes it). Empty/unset
+   * (the legacy single-string path, and any entry with no exported functions)
+   * emits ZERO exports, so the start/`__program__` script model is unchanged.
+   *
+   * ABI: a scalar signature (i32/i64/f32/f64 params + return) is directly
+   * host-callable — `instance.exports.fn(args)` works. A GC-typed param/return
+   * (string/struct/array) still exports as VALID wasm but isn't host-ergonomic
+   * yet (the host would need to construct/read a WasmGC ref); that's fine for v1.
+   */
+  hostExports?: HostExportRequest[];
 };
 
 export const toWasm = async (
   ast: VLProgramNode,
   options: ToWasmOptions = {},
 ): Promise<WasmEmit> => {
-  const { spans, fileName = "source.vl", optimizeCache } = options;
+  const { spans, fileName = "source.vl", optimizeCache, hostExports = [] } =
+    options;
   // binaryen's default export is a synchronous module object (plain npm), or,
   // when the binaryen patch is applied (patch-package, used by the bundled
   // extension), an async init function returning that object. Support both so
@@ -200,6 +223,16 @@ export const toWasm = async (
   };
 
   registerBuiltins(m, binaryen);
+
+  // Host-export instances reified while lowering the entry Program (where the
+  // top-level function scope is still active, so recursive self-calls resolve).
+  // Drained after `setStart` to emit each export's wrapper (see below).
+  const hostExportInstances: {
+    exportName: string;
+    instanceName: string;
+    wasmParams: number[];
+    resultType: number;
+  }[] = [];
 
   let loopIndex = 0;
   // A reusable i32 desired-type, e.g. for array indices.
@@ -2426,6 +2459,33 @@ export const toWasm = async (
             modifiedScope,
             () => {
               const body = m.block(null, lowerStatements(node.statements));
+              // Reify the entry's host-export functions HERE — inside the program
+              // scope, so a recursive `export function fib` resolves its own name
+              // through the active function scope (instantiating after `setStart`
+              // would fail: the scope is popped by then). We only INSTANTIATE here;
+              // the export wrapper + `addFunctionExport` are emitted after
+              // `setStart` (they need no scope). The top-level mangled names are
+              // unique, so each instance keeps its resolved name (`internalName`).
+              for (const { exportName, internalName } of hostExports) {
+                const fn = functions[internalName];
+                if (!fn) {
+                  throw new Error(
+                    `Host export "${exportName}" -> "${internalName}" has no ` +
+                      `registered function`,
+                  );
+                }
+                const declParamTypes = fn.declaration.parameters.map((p) =>
+                  p.paramaterType
+                );
+                const instanceName = instantiate(internalName, declParamTypes);
+                hostExportInstances.push({
+                  exportName,
+                  instanceName,
+                  wasmParams: declParamTypes.map(toWasmType),
+                  resultType: instanceResult[instanceName] ??
+                    toWasmType(fn.declaration.returnType),
+                });
+              }
               const funcRef = m.addFunction(
                 "__program__",
                 binaryen.none,
@@ -4714,6 +4774,50 @@ export const toWasm = async (
 
   // console.log(inspect(logSimplified(ast), { depth: Infinity }));
   m.setStart(toExpression(ast));
+
+  // --- Host-callable exports (entry-module `export function`s) --------------
+  //
+  // The merged AST inlines/DCE's any top-level function with no caller, so an
+  // unused `export function fib` would otherwise vanish. The functions were
+  // INSTANTIATED while lowering the Program (above, in scope) into
+  // `hostExportInstances`; here we emit, for each, a thin EXPORT WRAPPER and the
+  // wasm export itself.
+  //
+  // Why a wrapper: every VL function carries a leading `structref` environment
+  // parameter (closures), so the raw instance's signature is `(structref, …)` —
+  // a host calling `exports.fib(10)` would otherwise have to pass an env. The
+  // wrapper has the host-facing signature (params only, no env), forwards a null
+  // env, and is the thing actually exported. Adding the export makes binaryen
+  // treat the wrapper (and transitively the instance) a DCE root, so it's kept.
+  const seenExportNames = new Set<string>();
+  for (
+    const { exportName, instanceName, wasmParams, resultType }
+      of hostExportInstances
+  ) {
+    // Defensive: a duplicate `exportName` would make `addFunctionExport` clash.
+    // Normally unreachable (re-exporting a name in one module is a parser
+    // redeclaration error, and the resolver de-dupes), but cheap to guard.
+    if (seenExportNames.has(exportName)) {
+      throw new Error(`Duplicate host export name "${exportName}"`);
+    }
+    seenExportNames.add(exportName);
+
+    // Wrapper signature: declared params only (no leading env). Forward a null
+    // env plus each param local through to the real instance.
+    const wrapperName = `__export_${exportName}__`;
+    const operands = [
+      m.ref.null(binaryen.structref),
+      ...wasmParams.map((t, i) => m.local.get(i, t)),
+    ];
+    m.addFunction(
+      wrapperName,
+      binaryen.createType(wasmParams),
+      resultType,
+      [],
+      m.call(instanceName, operands, resultType),
+    );
+    m.addFunctionExport(wrapperName, exportName);
+  }
 
   // Functions referenced as values were collected into `functionTable` during
   // codegen; lay them out in a wasm table so `call_indirect` can dispatch.
