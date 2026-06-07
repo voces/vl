@@ -1249,6 +1249,26 @@ const scalarName = (type: VLType): string | undefined => {
     : undefined;
   return n && SCALARS.includes(n) ? n : undefined;
 };
+// The builtin NUMERIC scalar a type resolves to (`i32`/`i64`/`f32`/`f64`), or
+// undefined for `boolean`/non-scalars. `boolean` is excluded: it shares the i32
+// representation but is not part of the numeric widening lattice.
+const NUMERIC_SCALARS = ["i32", "i64", "f32", "f64"];
+const numericScalarName = (type: VLType): string | undefined => {
+  const n = scalarName(type);
+  return n !== undefined && NUMERIC_SCALARS.includes(n) ? n : undefined;
+};
+// The LOSSLESS numeric widenings — a value of `from` fits a slot of `to` without
+// loss, so the conversion is implicit (codegen inserts the wasm instruction):
+// `i32` → `i64`/`f32`/`f64`, `i64` → `f64`, `f32` → `f64`. Every other pair of
+// distinct numeric scalars is a lossy narrowing and is rejected.
+const NUMERIC_WIDENINGS: Record<string, string[]> = {
+  i32: ["i64", "f32", "f64"],
+  i64: ["f64"],
+  f32: ["f64"],
+};
+const canWidenNumeric = (from: string, to: string): boolean =>
+  NUMERIC_WIDENINGS[from]?.includes(to) ?? false;
+
 // Two *different* builtin scalars (`i32` vs `f64`). Numeric coercion makes one
 // assignable to a wider one (`i32` ⊑ `f64`), but in a union they are distinct
 // runtime variants — they must not collapse into each other.
@@ -2156,6 +2176,35 @@ export const ensureType = (
       return pushError("union");
     }
     return true;
+  }
+
+  // Numeric scalar coercion between two DISTINCT numeric *types* (`i32`/`i64`/
+  // `f32`/`f64`). LOSSLESS widening is implicit — a narrower value fits a wider
+  // slot (`i32` ⊑ `i64`/`f32`/`f64`, `i64`/`f32` ⊑ `f64`) and codegen inserts
+  // the matching conversion. LOSSY narrowing (`f64` → `i32`, `i64` → `i32`,
+  // `f64` → `f32`, …) would truncate, so it is REJECTED here with a clear
+  // diagnostic — never silently truncated, never reaching codegen.
+  //
+  // A numeric LITERAL on the right is left to the literal cases below, which
+  // coerce it by VALUE (an integer literal fits any numeric type; a real literal
+  // fits only floats — `for i in 0 to 1.5` still rejects `1.5` as an i32 bound).
+  // Only a runtime value of a genuine scalar type reaches this widening rule.
+  // (Same-named scalars also fall through to the ordinary structural check.)
+  if (right.type !== "IntegerLiteral" && right.type !== "RealLiteral") {
+    const ln = numericScalarName(left);
+    const rn = numericScalarName(right);
+    if (ln && rn && ln !== rn) {
+      if (canWidenNumeric(rn, ln)) return true;
+      errors.push({
+        type: "Syntax",
+        message:
+          `${rn} doesn't fit in ${ln} — the conversion is lossy and must be ` +
+          `made explicit (narrowing truncates the value)`,
+        ctx,
+        code: 0,
+      });
+      return false;
+    }
   }
 
   switch (left.type) {

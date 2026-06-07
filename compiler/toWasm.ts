@@ -4623,6 +4623,40 @@ export const toWasm = async (
     ) return value;
     return coerceToUnion(value, codegenType(node), desiredType!);
   };
+  // Insert a LOSSLESS numeric widening when a narrower numeric value flows into
+  // a wider numeric slot the context wants (`i32` value into an `f64` parameter,
+  // `f32` into `f64`, …). Every value-wanted boundary — binding, argument,
+  // return, operand — sets `desiredType`, so wrapping `toExpression` here covers
+  // them all. A literal already lowers directly to the desired type (its const
+  // takes the wanted wasm type), so its `wt` equals `target` and no conversion is
+  // emitted; only runtime values of a genuinely narrower type are converted. Only
+  // WIDENING is reached — narrowing (`f64` → `i32`) is rejected at typecheck and
+  // never gets here. Signed conversions, matching VL's signed integer semantics.
+  const numericWiden = (value: number): number => {
+    if (!hasDesiredType()) return value;
+    let target: number;
+    try {
+      target = toWasmType(desiredType!);
+    } catch {
+      // A non-concrete desired type (an unresolved inference hole, a union/ref):
+      // nothing to widen toward.
+      return value;
+    }
+    const wt = binaryen.getExpressionType(value);
+    if (wt === target) return value;
+    if (wt === binaryen.i32) {
+      if (target === binaryen.i64) return m.i64.extend_s(value);
+      if (target === binaryen.f32) return m.f32.convert_s.i32(value);
+      if (target === binaryen.f64) return m.f64.convert_s.i32(value);
+    } else if (wt === binaryen.i64) {
+      if (target === binaryen.f64) return m.f64.convert_s.i64(value);
+    } else if (wt === binaryen.f32) {
+      if (target === binaryen.f64) return m.f64.promote(value);
+    }
+    // Same width, or a non-widening pair (a reference value, a narrowing the
+    // typechecker already rejected): pass the value through untouched.
+    return value;
+  };
   // Lower an expression, then box it into the desired union if one is wanted.
   const toExpression = (node: VLProgramNode | VLStatement): number =>
     // Attach the node's source span to its emitted expression (statement- and
@@ -4630,7 +4664,7 @@ export const toWasm = async (
     // trapping sub-expression (the bounds-check `unreachable`, `array.get`,
     // division) below — that finer location wins for the trap offset, while this
     // gives a sensible fallback for everything else.
-    recordDebug(coerceUnion(toExpressionRaw(node), node), node);
+    recordDebug(numericWiden(coerceUnion(toExpressionRaw(node), node)), node);
 
   // Context handed to the extracted string-method codegen (compiler/builtins).
   const stringBuiltinCtx: StringBuiltinContext = {
