@@ -487,6 +487,149 @@ const CASES: Case[] = [
       }
     },
   },
+  // ── WasmGC arrays ──────────────────────────────────────────────────────────
+  // An array literal lowers to `array.new_fixed` over the i32 array heap type, an
+  // index read to `array.get`, `.length` to `array.len`, and `a[i] = v` to
+  // `array.set`. These prove real `WebAssembly.instantiate` over the VL-emitted GC
+  // bytes — source → arena → bytes → engine — for construction, indexing, length,
+  // and indexed store. WasmGC arrays are FIXED-LENGTH; growable `.push` is deferred.
+  {
+    name: "construct an array literal and read an element (`a[1]` => 20)",
+    src: [
+      "function main(): i32 {",
+      "  let a: i32[] = [10, 20, 30]",
+      "  return a[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 20) throw new Error(`main() returned ${got}, expected 20`);
+    },
+  },
+  {
+    name: "read the first and last elements summed (`a[0] + a[2]` => 40)",
+    src: [
+      "function main(): i32 {",
+      "  let a: i32[] = [10, 20, 30]",
+      "  return a[0] + a[2]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 40) throw new Error(`main() returned ${got}, expected 40`);
+    },
+  },
+  {
+    name: "`a.length` of a 3-element array => 3",
+    src: [
+      "function main(): i32 {",
+      "  let a: i32[] = [10, 20, 30]",
+      "  return a.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
+  {
+    name: "index assignment then read (`a[1] = 99; return a[1]` => 99)",
+    src: [
+      "function main(): i32 {",
+      "  let a: i32[] = [10, 20, 30]",
+      "  a[1] = 99",
+      "  return a[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 99) throw new Error(`main() returned ${got}, expected 99`);
+    },
+  },
+  {
+    name:
+      "a computed index + value (`a[i] = a[0] + p` then read) instantiates",
+    src: [
+      "function build(p: i32, q: i32): i32 {",
+      "  let a: i32[] = [p, q, p + q]",
+      "  a[1] = a[0] + p",
+      "  return a[1] + a[2] + a.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      // a = [3, 5, 8]; a[1] = a[0] + 3 = 6; return 6 + 8 + 3 = 17.
+      const got = await runExport(bytes, "build", 3, 5);
+      if (got !== 17) {
+        throw new Error(`build(3, 5) returned ${got}, expected 17`);
+      }
+    },
+  },
+  {
+    name: "sum array elements in a `while` loop (drives array in a loop) => 60",
+    src: [
+      "function main(): i32 {",
+      "  let a: i32[] = [10, 20, 30]",
+      "  let sum = 0",
+      "  let i = 0",
+      "  while i < a.length {",
+      "    sum = sum + a[i]",
+      "    i = i + 1",
+      "  }",
+      "  return sum",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 60) throw new Error(`main() returned ${got}, expected 60`);
+    },
+  },
+  {
+    name: "an array passed INTO a helper, summed through the param => 6",
+    src: [
+      "function sum3(a: i32[]): i32 {",
+      "  return a[0] + a[1] + a[2]",
+      "}",
+      "function main(): i32 {",
+      "  let xs: i32[] = [1, 2, 3]",
+      "  return sum3(xs)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 6) throw new Error(`main() returned ${got}, expected 6`);
+    },
+  },
+  {
+    name: "a non-i32 array element type (`string[]`) fails loudly",
+    src: [
+      "function main(): i32 {",
+      "  let a: string[] = []",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: (logs) => {
+      const errLine = logs.find((l) => l.startsWith("err: "));
+      if (!errLine) {
+        throw new Error(
+          `expected an \`err:\` line for the non-i32 array; got ${
+            JSON.stringify(logs)
+          }`,
+        );
+      }
+      if (!errLine.includes("i32[] arrays")) {
+        throw new Error(`unexpected emitter error message: ${errLine}`);
+      }
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
