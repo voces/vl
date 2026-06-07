@@ -316,6 +316,17 @@ export const toWasm = async (ast: VLProgramNode) => {
   // `isSomething`: a function with an inferred (still-`Infer`) return type has a
   // desired type that is wanted but not yet concrete.
   const hasDesiredType = () => desiredType !== undefined;
+  // Whether the current desired type resolves to VOID — the `null` alias, which
+  // a void function's (inferred or annotated) return type carries. Such a type
+  // *is set* (so `hasDesiredType` is true), but its value is discarded, not
+  // returned: a tail expression in this context must still be `drop`-ed.
+  // (Unwrap inference holes first; an unresolved `Infer<Unknown>` is not void.)
+  const desiredTypeIsVoid = () => {
+    if (desiredType === undefined) return false;
+    let dt = softenImplicitType(desiredType);
+    while (dt.type === "Infer") dt = softenImplicitType(dt.subType);
+    return dt.type === "Alias" && dt.name === "null";
+  };
 
   // A loop's `break` target — the outer block wrapping the loop. `loopLabels`
   // holds the matching `continue` (loop) labels; appending here keeps the
@@ -2053,7 +2064,10 @@ export const toWasm = async (ast: VLProgramNode) => {
         // set); skip results already `none`/`unreachable` (void calls, an
         // already-dropped call, a diverging statement).
         const wt = binaryen.getExpressionType(v);
-        const wants = isTail && hasDesiredType();
+        // A void desired type (the `null` alias of a void function) is *set* but
+        // discards its tail value — treat it like the non-tail/no-desired case
+        // so the leftover is dropped, not left on the stack.
+        const wants = isTail && hasDesiredType() && !desiredTypeIsVoid();
         out.push(
           !wants && wt !== binaryen.none && wt !== binaryen.unreachable
             ? m.drop(v)
@@ -3336,10 +3350,36 @@ export const toWasm = async (ast: VLProgramNode) => {
       }
       case "If": {
         const cond = node.conditionals[0].condition;
+        // Whether this `if`'s value is wanted here. It is *not* wanted when no
+        // desired type is set (statement position) or when the desired type
+        // resolves to void/`none` (a void function whose tail is an else-less
+        // `if`, or `null`-aliased context). In that case a then-branch that
+        // happens to produce a value (`if (c) 1 + 1`) would leave it on the
+        // stack with no matching `else` → invalid wasm; we must `drop` it and
+        // build a `none`-typed `if` instead. When a value IS wanted we keep the
+        // current behaviour so value-if-expressions still type-check.
+        //
+        // A value is wanted when a desired type is set AND it isn't void (the
+        // `null` alias). This is detected structurally (see `desiredTypeIsVoid`)
+        // rather than via `toWasmType`, which would throw on a still-unresolved
+        // `Infer<Unknown>` return — an unresolved hole counts as value-wanted.
+        const valueWanted = hasDesiredType() && !desiredTypeIsVoid();
+        // Drop a concrete leftover so a void-context branch contributes `none`
+        // (a `none`/`unreachable` result is already fine to leave as-is).
+        const voidify = (v: number | undefined): number | undefined => {
+          if (typeof v !== "number") return v;
+          const wt = binaryen.getExpressionType(v);
+          return wt !== binaryen.none && wt !== binaryen.unreachable
+            ? m.drop(v)
+            : v;
+        };
         // Flow narrowing (A5): the then-branch sees the condition's
         // then-narrowings (a `&&` narrows several places at once), the else side
         // its else-narrowings. Uses the function-level `withNarrowedList`.
-        const thenStmt = () => toExpression(node.conditionals[0].statement);
+        const thenStmt = () => {
+          const v = toExpression(node.conditionals[0].statement);
+          return valueWanted ? v : voidify(v);
+        };
         const thenBranch = () =>
           withNarrowedList(thenNarrowings(cond), thenStmt);
         // The else side (a further `else if` chain, or the `else`). Its own
@@ -3353,7 +3393,14 @@ export const toWasm = async (ast: VLProgramNode) => {
               conditionals: node.conditionals.slice(1),
             });
           }
-          if (node.else) return toExpression(node.else);
+          if (node.else) {
+            const v = toExpression(node.else);
+            return valueWanted ? v : voidify(v);
+          }
+          // No `else`, and the value isn't wanted (void/statement position): the
+          // then-branch already contributes `none`, so omit the else entirely —
+          // a `none`-typed `if` with an optional else is valid wasm.
+          if (!valueWanted) return undefined;
           // No `else`. If the `if`'s value is wanted as a *non-nullable* type,
           // the type checker proved the conditions exhaustive (an else-less `if`
           // with a reachable fall-through would type as nullable) — so the

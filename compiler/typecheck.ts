@@ -1058,7 +1058,20 @@ export const typeFromStatement = (
         });
         vt.mapCtor = undefined;
       }
-      return stmt.variableType;
+      // A declaration in statement/tail position binds a name but yields no
+      // value — its contribution to the enclosing block's/function's value type
+      // is void, not the variable's type. (In expression position a `let` is
+      // not a value at all, so this path is only reached for tail statements.)
+      return { type: "Alias", name: "null" };
+    }
+    case "If": {
+      // An `if` in statement/tail position is executed for effect. Without a
+      // final `else` it has no value on the fall-through path → void. With a
+      // final `else` it is a genuine value-producing if-expression (every path
+      // covered), so delegate to the expression inference to recover its branch
+      // value type (e.g. `function f() { if (c) 5 else 6 }` infers `i32`).
+      if (!stmt.else) return { type: "Alias", name: "null" };
+      return typeFromExpression(stmt, ctx);
     }
     case "While":
       // A `while true` with no `break` escaping it diverges: it never fails its
