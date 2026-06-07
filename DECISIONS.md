@@ -136,6 +136,28 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
 - **Versioning (when needed): rustup/Volta model, not nvm.** A launcher that resolves a committed
   project pin and auto-installs the right toolchain — not manual `use`/shims. Deferred until multiple
   releases warrant it. (H5)
+- **Modules: whole-program merge to ONE wasm module, not separate compilation/linking.** N `.vl` files
+  resolve into a single `VLProgramNode` the existing `toWasm` compiles unchanged — the natural fit for
+  VL's monomorphization + single-wasm output and the H-M2 end-state (one module). Rejected wasm-linking
+  (cross-module ABI + linker, fights monomorphization). Syntax: explicit `export` modifier on
+  `function`/`let`/`const`/`type` (greppable public surface, not Go capitalization or Python
+  export-all); named `import { a, b as c } from "./util"` only, relative specifiers with the `.vl`
+  extension OMITTED (resolution appends it, no index guessing). Per-module name isolation by **mangling**
+  every module's top-level value names (`name$mN`) and rewriting references — so two files' private
+  `helper`/`Tok` coexist (self-host gap #1) and an `import` rewrites to the exporter's mangled target;
+  user `type`s are already structural at codegen so only value names need it. The single-string
+  `compile(source)` is untouched (back-compat); the graph driver is `compileProgram`/`checkProgram` over
+  an injected file reader (runtime-agnostic, like the rest of the core). Phase 1 = relative user-file
+  imports only; the `std:` scheme + embedded std (phase 2) and cross-file LSP (phase 3) are deferred, as
+  are import maps / namespace+default imports / re-exports. Design + full rationale:
+  `docs/modules-design.md`. (H0)
+  - *Sub-questions resolved at implementation:* (a) the entry module is mangled uniformly like every
+    other (simpler rule, debuggable names) rather than kept verbatim; (b) modules merge in
+    dependency-first (import topological) order so a dependency's top-level initializers run before its
+    dependents' — the design's open cross-module `let`-init-order question is answered as "import order,
+    cycle = error" for phase 1; (c) a file compiled single-string with a stray `import` is harmless (the
+    names just don't bind) rather than a hard error — imports are only meaningful through the graph
+    driver; (d) `export` keyword spelling chosen over `pub` (matches the `import`/ES family).
 
 ## Editor / LSP
 

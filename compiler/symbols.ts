@@ -62,6 +62,14 @@ export type Binding = {
    * Undefined for kinds where it doesn't apply (functions, types).
    */
   mutable?: boolean;
+  /**
+   * Module system (phase 1): `true` when this top-level binding carried an
+   * `export` modifier. An exported binding is consumer-facing surface, not dead
+   * code, so the unused-variable lint exempts it (an exported top-level `let`
+   * unread *within* its own module is still part of the module's public API).
+   * Undefined for non-exported / nested bindings.
+   */
+  exported?: boolean;
 };
 
 /** One textual appearance of a name, resolved to the binding it refers to. */

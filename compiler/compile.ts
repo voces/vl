@@ -391,6 +391,83 @@ export const compile = async (
 };
 
 /**
+ * Multi-file pipeline (module system, phase 1): resolve the `import` graph from
+ * an ENTRY module, merge every reachable module into one whole-program AST with
+ * per-module name isolation, then run codegen to emit ONE wasm module — exactly
+ * the single-module output `compile` produces, just fed the merged program.
+ *
+ * `read(key)` returns a module's source by its resolved key, or `undefined` when
+ * it doesn't exist. `entryKey` is the entry module's key (the CLI passes the
+ * entry file path; tests pass an in-memory map key). The resolver appends `.vl`
+ * to relative specifiers, so module KEYS carry the extension while specifiers in
+ * source do not (`import … from "./util"` → key `…/util.vl`).
+ *
+ * Back-compat: the existing single-string `compile(source)` is unchanged and
+ * stays the path for a file with no imports (a one-module graph is just this with
+ * a synthetic entry). All current tests/LSP keep using `compile`.
+ */
+export const compileProgram = async (
+  entryKey: string,
+  read: (key: string) => string | undefined | Promise<string | undefined>,
+  fileName = entryKey,
+): Promise<CompileResult> => {
+  // Loaded lazily so `compile.ts`'s existing consumers don't pull the resolver.
+  const { loadProgram } = await import("./modules.ts");
+  const { ast, diagnostics, symbols } = await loadProgram(entryKey, read);
+
+  let wasm: Uint8Array | undefined;
+  let sourceMap: string | undefined;
+  if (ast && !diagnostics.some((d) => d.severity === "error")) {
+    try {
+      const { toWasm } = await import("./toWasm.ts");
+      const emit = await toWasm(ast, { fileName });
+      wasm = emit.binary;
+      sourceMap = emit.sourceMap;
+    } catch (err) {
+      diagnostics.push({
+        message: `Codegen error: ${codegenErrorMessage(err)}`,
+        severity: "error",
+        source: "vital",
+        range: {
+          start: { line: 0, character: 0 },
+          end: { line: 0, character: 0 },
+        },
+      });
+    }
+  }
+
+  // The merged program has no single comment list / span map (those are
+  // per-module); the multi-file path is a build/run driver, not an LSP surface
+  // (cross-file LSP is phase 3). Return empty trivia rather than fabricating it.
+  return {
+    ast,
+    diagnostics,
+    wasm,
+    sourceMap,
+    symbols,
+    spans: ast ? new WeakMap() : undefined,
+    comments: [],
+  };
+};
+
+/**
+ * Multi-file front end WITHOUT codegen: resolve + parse + type-check the import
+ * graph from `entryKey`, returning diagnostics (including import/export errors).
+ * This is the graph-aware analogue of `checkOnly` — `vl check` on a file with
+ * imports uses it so cross-module references and bad imports surface as
+ * diagnostics rather than spurious "undeclared" errors. Codegen-only diagnostics
+ * are not produced (same trade-off as `checkOnly`).
+ */
+export const checkProgram = async (
+  entryKey: string,
+  read: (key: string) => string | undefined | Promise<string | undefined>,
+): Promise<{ diagnostics: VLDiagnostic[] }> => {
+  const { loadProgram } = await import("./modules.ts");
+  const { diagnostics } = await loadProgram(entryKey, read);
+  return { diagnostics };
+};
+
+/**
  * Symbol table only, synchronously: tokenize + parse (which resolves scopes and
  * populates the binding table) without running codegen. The LSP's
  * go-to-definition / find-references handlers use this — they need symbols, not

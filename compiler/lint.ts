@@ -125,6 +125,9 @@ const unusedBindings = (
     if (reported.has(b)) continue;
     if (b.kind !== "variable" && b.kind !== "parameter") continue;
     if (used.has(b)) continue;
+    // An `export`ed top-level binding is public surface, not dead code — exempt
+    // it even if nothing in its own module reads it (module system, phase 1).
+    if (b.exported) continue;
 
     const noun = b.kind === "parameter" ? "parameter" : "variable";
 
