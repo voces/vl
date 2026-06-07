@@ -610,7 +610,28 @@ export const toWasm = async (
   // structurally equal (however derived) get the same signature and share one
   // WasmGC struct. A non-struct leaf falls back to its wasm type (no struct
   // cycle possible), matching the pre-recursion interning.
+  // structSig canonicalizes a type into a string that two structurally-identical
+  // types share, so they collapse to one WasmGC struct. It recurses fully through
+  // a type's field graph and is called many thousands of times during codegen
+  // (objectStruct discovery, field lowering, return/param sigs); on the self-host
+  // compiler — a single module with hundreds of large, deeply-nested AST/arena
+  // object types — the unmemoized walk dominated IR-build time (~6 s, the bulk of
+  // a self-host compile). The signature is a pure function of the type node, so
+  // cache it keyed on the node's identity.
+  //
+  // Caching is restricted to the top-level (`nameStack` empty) call: only the
+  // recursive-alias branch reads `nameStack` (the de Bruijn back-ref), so a
+  // signature computed under a non-empty stack is *context-dependent* and must not
+  // be cached. The shared field recursion keeps the stack empty until an alias is
+  // crossed, so every non-alias-descended subtree is still cached — which is the
+  // hot path. A WeakMap keys on node identity (type nodes are immutable here).
+  const structSigCache = new WeakMap<VLType, string>();
   const structSig = (type: VLType, nameStack: string[] = []): string => {
+    const cacheable = nameStack.length === 0;
+    if (cacheable) {
+      const hit = structSigCache.get(type);
+      if (hit !== undefined) return hit;
+    }
     let t = type;
     while (t.type === "Infer") t = t.subType;
     let prefix = "";
@@ -619,6 +640,7 @@ export const toWasm = async (
       t = t.subType;
       while (t.type === "Infer") t = t.subType;
     }
+    let result: string;
     if (t.type === "Alias" && t.name !== "null") {
       // A recursive reference: close the cycle with a *relative-depth* back-ref
       // (de Bruijn style) rather than the name, so two structurally-identical
@@ -627,18 +649,22 @@ export const toWasm = async (
       // pushing the name so its own self-references resolve to this depth.
       const i = nameStack.indexOf(t.name);
       if (i >= 0) return `${prefix}@${nameStack.length - i}`;
-      return prefix +
+      result = prefix +
         structSig(getConcreteType(t, undefined), [...nameStack, t.name]);
+    } else {
+      const soft = softenImplicitType(t);
+      if (isStructObject(soft)) {
+        result = prefix + `{${
+          structFields(soft)
+            .map((f) => `${f.name}:${structSig(f.type, nameStack)}`)
+            .join(",")
+        }}`;
+      } else {
+        result = prefix + `#${toWasmType(t)}`;
+      }
     }
-    const soft = softenImplicitType(t);
-    if (isStructObject(soft)) {
-      return prefix + `{${
-        structFields(soft)
-          .map((f) => `${f.name}:${structSig(f.type, nameStack)}`)
-          .join(",")
-      }}`;
-    }
-    return prefix + `#${toWasmType(t)}`;
+    if (cacheable) structSigCache.set(type, result);
+    return result;
   };
 
   const objectStruct = (type: VLObjectType): ObjectStruct => {

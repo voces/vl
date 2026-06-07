@@ -228,6 +228,11 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **F9. Perf baseline.** REMAINING: a *runtime* benchmark (run compiled `.vl` programs on large
   inputs); investigate the cubic literal-union compile (A16).
   **Perf wins identified (detail: `docs/perf-findings.md`):**
+  - ✅ **F9c. Memoize `structSig` in `toWasm.ts`** — the structural-signature walk was uncached and
+    dominated IR-build on the self-host module (~6 s of a ~7.7 s compile; 268k calls). Caching by
+    type-node identity (empty `nameStack` only) cut selfhost-suite wall time ~107 s → ~30 s with
+    byte-identical wasm. NOTE: `optimize()` is NOT the dominant cost on this module (~0.8 s);
+    revisit F9a's premise. (Earlier `~4 s optimize` figure predates current codegen.)
   - ⬜ **F9a. Skip `optimize()` in test compiles (`VL_NO_OPT`)** — binaryen `m.optimize()` is the
     dominant cost (~4 s per selfhost sub-test vs ~0.14 s without it). A `noOptimize` option (or
     `VL_NO_OPT=1` env var) in `toWasm()` would cut total test time by ~20–25 s. Change touches
