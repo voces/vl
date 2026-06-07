@@ -95,7 +95,7 @@ export const isEquatable = (
 // `null`). Only the simple single-place case (`if x == a … else if x == b …` /
 // `is`); a compound condition (`&&`/`||`, or a different place) is conservatively
 // non-exhaustive. Uses the same else-narrowings the runtime branches do.
-const conditionsExhaust = (
+export const conditionsExhaust = (
   conditionals: { condition: VLExpression }[],
   ctx: Context,
 ): boolean => {

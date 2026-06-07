@@ -16,6 +16,7 @@ import { Narrowing } from "./typecheck.ts";
 import {
   arrayElementType,
   conditionNarrowing,
+  conditionsExhaust,
   defaultIntegerType,
   elseNarrowings,
   ensureType,
@@ -1760,6 +1761,8 @@ export const parseProgram = (
     // `(NEWLINE* elseIf)* (NEWLINE* else)?` — newlines before else/elseif are
     // only consumed when an else/elseif actually follows.
     let elseStmt: VLStatement | undefined;
+    // Span of the trailing `else` arm (for the exhaustive-chain dead-arm lint).
+    let elseCtx: Context | undefined;
     for (;;) {
       let look = pos;
       while (tokens[look].kind === "NEWLINE") look++;
@@ -1781,8 +1784,30 @@ export const parseProgram = (
           spanOf(eStart),
           () => parseStatement() ?? emptyReturn(),
         );
+        elseCtx = spanFrom(eStart);
       }
       break;
+    }
+
+    // Dead-arm lint (B17): when the `is`/`==` chain already exhausts its
+    // discriminated union (every variant subtracted to `Never`), the trailing
+    // `else` is unreachable — the prior arms already cover every input. Reuses
+    // `conditionsExhaust` (the same machinery the no-`else` path uses to decide a
+    // chain needs no `| null`), read against the place's fresh declared type now
+    // that the per-arm narrowings have unwound. Reported as `info` (greyed,
+    // unnecessary) so it never fails a build — only nudges removal of a dead arm.
+    if (
+      elseStmt && elseCtx &&
+      conditionsExhaust(conditionals, spanFrom(ifTok))
+    ) {
+      errors.push({
+        type: "Syntax",
+        severity: "info",
+        message:
+          "unreachable: the preceding `is` arms are exhaustive, so this `else` is never taken",
+        ctx: elseCtx,
+        code: 0,
+      });
     }
 
     return record(

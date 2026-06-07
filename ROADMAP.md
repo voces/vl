@@ -102,11 +102,13 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ⬜ **A-infer-params. Top-level function param inference.** Infer named-function param types from
   usage constraints (HM / the existing A13 row-poly inference path), consistent with "hide types where
   possible." Requiring annotations on all named-fn params is NOT VL's stated stance.
-- ⬜ **A-exhaust. Exhaustiveness analysis for `is`-chains.** Three sub-items all reuse the existing
-  `conditionsExhaust` helper: (a) flag a **dead arm / dead `else`** after an already-exhaustive chain;
-  (b) recognize exhaustiveness for return-coverage so the trailing `else` can be **omitted** (the
-  checker sees the chain as covering); (c) **codegen**: elide the provably-true final discriminant test
-  + drop the dead arm — a type-driven optimization binaryen cannot do (it lacks union exhaustiveness).
+- 🟡 **A-exhaust. Exhaustiveness analysis for `is`-chains.** Three sub-items all reuse the existing
+  `conditionsExhaust` helper: (a) ✅ flag a **dead arm / dead `else`** after an already-exhaustive chain
+  (`info` "unreachable: the preceding `is` arms are exhaustive"); (b) ✅ recognize exhaustiveness for
+  return-coverage so the trailing `else` can be **omitted** (the checker sees the chain as covering);
+  (c) ⬜ **codegen**: elide the provably-true final discriminant test + drop the dead arm — a type-driven
+  optimization binaryen cannot do (it lacks union exhaustiveness). Runtime is already correct (the
+  no-`else` fall-through lowers to `unreachable`); (c) is a pure size/speed optimization, deferred.
 - ⬜ **A-robust. Robustness floor.** An unresolved `Infer`/`Unknown` type must produce a clear
   **"cannot infer — annotate"** diagnostic; it must NEVER surface as a cryptic `Unhandled "Unknown"
   type` codegen error or a `containsInfer` TypeError crash. Repro: `const xs = []; xs.push(1)`.
