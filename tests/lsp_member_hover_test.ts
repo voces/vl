@@ -87,12 +87,33 @@ Deno.test("resolveMemberAt: array `.length` resolves to the intrinsic i32", () =
 
 Deno.test("resolveMemberAt: string member `s.slice` resolves to a method", () => {
   // A reassignable `let` widens its inferred literal to the `string` base, whose
-  // intrinsic members the hover resolves. (An immutable `const s = "hi"` keeps
-  // the narrow `"hi"` literal type — resolving members on a literal receiver is
-  // an LSP-side follow-up that mirrors the compiler's literal-receiver softening.)
+  // intrinsic members the hover resolves.
   const src = 'let s = "hi"\nconst u = s.slice(0, 1)\n';
   const member = memberAt(src, 2, ".slice");
   if (!member) throw new Error("expected a resolved member for `s.slice`");
+  assertEquals(member.name, "slice");
+  assertEquals(member.kind, "method");
+  assertEquals(stringifyType(member.type), "(start: i32, end: i32): string");
+});
+
+Deno.test("resolveMemberAt: member on a `const` string literal receiver softens to `string` (mirrors compiler #119)", () => {
+  // An immutable `const s = "hi"` keeps the narrow `"hi"` literal type. The
+  // member lookup softens the literal receiver to its `string` base before the
+  // intrinsic lookup, so `.slice` resolves instead of yielding `never`.
+  const src = 'const s = "hi"\nconst u = s.slice(0, 1)\n';
+  const member = memberAt(src, 2, ".slice");
+  if (!member) throw new Error("expected a resolved member for `s.slice`");
+  assertEquals(member.name, "slice");
+  assertEquals(member.kind, "method");
+  assertEquals(stringifyType(member.type), "(start: i32, end: i32): string");
+});
+
+Deno.test("resolveMemberAt: member on a literal string receiver `\"hi\".slice` resolves", () => {
+  // The literal expression itself (`"hi".slice(…)`) is a literal receiver too;
+  // it softens to `string` for the member lookup.
+  const src = 'const u = "hi".slice(0, 1)\n';
+  const member = memberAt(src, 1, ".slice");
+  if (!member) throw new Error("expected a resolved member for `\"hi\".slice`");
   assertEquals(member.name, "slice");
   assertEquals(member.kind, "method");
   assertEquals(stringifyType(member.type), "(start: i32, end: i32): string");
