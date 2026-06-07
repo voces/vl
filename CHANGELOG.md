@@ -99,6 +99,7 @@ see **`DECISIONS.md`**.
 - **H2 gap-6 Ref/string module-globals through a function** — extends gap-2's scalar-only support to ref/string cells.
 - **H2 gap-7 One-char string literal `.length`** — string literals soften to nominal `string`; no longer mis-types as a char.
 - **H2 char literals + `toString`/stringify** — both landed as part of H2 gap work.
+- **H3-gap3 `checkProgram` in value position** — resolved by #89 (void/statement-position value drop); a discarded value is dropped in statement position, so `checkProgram(...)` as a bare statement (or `let r = ...`) no longer hits "Expected numeric type" in codegen. (detail: `docs/selfhost-gaps.md` §3)
 - **H4.2 Value-level bitwise/shift operators** — shipped in #99 (see B2 above).
 - **H4.3 Unsigned right-shift** (`>>>`) — resolved by #99 (`>>>` is now a native operator); `ulebToArr` in `wasmEmit.vl` uses `v >>> 7` for all i32 values including those with bit 31 set. (detail: `docs/selfhost-gaps.md` §H4.3)
 - **H4.4 Signed `%` sign fix** — resolved via H4.2 (#99): `& 0x7f` / `& 0xff` bitwise masks replace the arithmetic correction branches; naturally unsigned, no special-casing needed. (detail: `docs/selfhost-gaps.md` §H4.4)
