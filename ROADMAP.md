@@ -258,7 +258,7 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ✅ **C2. `vl run`** — compile + run a file / `-e` snippet / stdin (`deno task run`). Drives the VS
   Code Run-Current-File command.
 - ✅ **C3. `vl build <file> [-o out.wasm] [--wat]`** — emit wasm bytes (and optional `.wat`).
-- ✅ **C4. `vl check <file>`** — diagnostics only, non-zero exit on errors (CI gate).
+- ✅ **C4. `vl check <file>`** — diagnostics only, non-zero exit on errors (CI gate). `--codegen` opt-in runs the full binaryen pipeline so codegen-only errors (e.g. recursion limit exceeded) are also caught.
 - ✅ **C5. Distribution via `deno compile`** — native `vl` binary builds + runs binaryen embedded
   (`deno task compile`/`smoke`; all 11 smoke checks pass). See `README.md` "Building the Native
   Binary" and `DECISIONS.md` "Parser, distribution & bootstrapping". REMAINING: public release
