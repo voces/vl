@@ -6,7 +6,15 @@ compiler to investigate.
 
 ---
 
-## struct-union-null-is-chain
+## struct-union-null-is-chain — RESOLVED
+
+**Status:** RESOLVED. `is` discriminates on the value's *representation* type (its
+declared union/nullable layout), not the flow-narrowed type. In an `else if v is
+B` arm `v` has narrowed to `B | null` (whose own layout would be a niche nullable
+ref) but is still the boxed `{tag, anyref}` union it was passed as — so the test
+reads the box tag instead of emitting a niche null test on the boxed struct.
+Fixed in `compiler/toWasm.ts` (`Is` case + `unnarrowedType` helper). Pinned by
+`tests/cases/soundness/struct-union-null-is-chain-sound.vl` (+ `-multi`).
 
 **Severity:** runtime trap / illegal cast (valid program crashes at runtime)
 
@@ -50,7 +58,15 @@ is fixed.
 
 ---
 
-## literal-is-always-false
+## literal-is-always-false — RESOLVED
+
+**Status:** RESOLVED. `is <literal>` is now a runtime VALUE test (same answer as
+`== <literal>`): literal variants sharing a representation share a tag, so the
+codegen compares the value, not just the tag. Scalar/narrowed operands compare
+directly; a boxed-union operand checks tag (for the rep) then the unboxed payload.
+Fixed in `compiler/toWasm.ts` (`Is` case + `literalCheckExpr` helper). Pinned by
+`tests/cases/soundness/literal-is-runtime-value.vl` and
+`literal-is-union-param-dispatch.vl`.
 
 **Severity:** silent wrong result (codegen bug — `is <literal>` always evaluates false)
 
@@ -85,7 +101,16 @@ and `tests/cases/soundness/union-four-variant-exhaustive.vl` use `==` instead of
 
 ---
 
-## optional-chain-named-alias
+## optional-chain-named-alias — RESOLVED
+
+**Status:** RESOLVED. `getChildType` now unwraps a named `type` alias (`Type`
+node) via `getConcreteType` before the field lookup — the `?.` path passes
+`nonNullable(...)`, which could leave the alias wrapper in place. The
+`OptionalAccess` result-type path unwraps it too. So `Config | null`'s `?.port`
+type-checks (and runs) exactly like the inline `{ port: i32 } | null` form,
+including chained `o?.inner?.v` over nested aliases. Fixed in
+`compiler/typecheck.ts`. Pinned by
+`tests/cases/soundness/optional-chain-coalesce-sound.vl`.
 
 **Severity:** type-checker false positive (valid program wrongly rejected)
 

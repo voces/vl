@@ -1299,6 +1299,32 @@ export const toWasm = async (
     return m.i32.eq(a(), b()); // i32 / boolean
   };
 
+  // The literal *expression* equivalent of a literal *type* used as an `is`
+  // check type (`x is 0`, `x is "a"`, `x is true`), or null when the check type
+  // is not a literal. The literal type nodes carry the same `value`/`text` fields
+  // as their expression-node counterparts, so `toExpression` can lower them into
+  // a scalar of the operand's rep for a runtime value comparison.
+  const literalCheckExpr = (
+    checkType: VLType,
+  ): VLExpression | null => {
+    switch (checkType.type) {
+      case "IntegerLiteral":
+        return {
+          type: "IntegerLiteral",
+          value: checkType.value,
+          text: checkType.text,
+        };
+      case "RealLiteral":
+        return { type: "RealLiteral", value: checkType.value };
+      case "StringLiteral":
+        return { type: "StringLiteral", value: checkType.value };
+      case "BooleanLiteral":
+        return { type: "BooleanLiteral", value: checkType.value };
+      default:
+        return null;
+    }
+  };
+
   // Per-element-type list equality: `__list_eq_<n>__(a, b)` returns 1 iff the two
   // lists have equal `len` and equal elements over `[0, len)` of `backing` (each
   // compared via `valueEq`, so lists of strings/structs/lists recurse). The list
@@ -1503,6 +1529,35 @@ export const toWasm = async (
     ) return node;
     if (node.type === "NullLiteral") return { type: "Alias", name: "null" };
     return vlType(node as Parameters<typeof vlType>[0]);
+  };
+
+  // The DECLARED type of a narrowable place (`Name`, `PropertyAccess`), ignoring
+  // the flow-narrowing overlay — i.e. the type that fixed the value's runtime
+  // REPRESENTATION (how it was boxed). Null for a non-place expression. Used by
+  // the `is` discriminator: narrowing changes a value's static type but not its
+  // layout, so `is` must read the box of the place's original union/nullable type
+  // rather than re-deriving a (possibly different) layout from the narrowed type.
+  const unnarrowedType = (
+    node: VLProgramNode | VLStatement,
+  ): VLType | null => {
+    if (node.type === "Name") {
+      const found = lookupName(node.name);
+      return found ? found.type : null;
+    }
+    if (node.type === "PropertyAccess") {
+      let ot = softenImplicitType(codegenType(node.object));
+      while (ot.type === "Infer") ot = softenImplicitType(ot.subType);
+      if (ot.type === "Union" || ot.type === "Nullable") {
+        const shared = unionFieldType(ot, node.property);
+        if (shared) return shared;
+      }
+      if (ot.type !== "Object") return null;
+      const field = ot.properties.find((p) =>
+        p.name.type === "StringLiteral" && p.name.value === node.property
+      );
+      return field ? field.type : null;
+    }
+    return null;
   };
 
   // Resolve an expression's structural object type (soften + unwrap an Infer).
@@ -2378,7 +2433,86 @@ export const toWasm = async (
         // tag field to T's tag (`null` included).
         let t = softenImplicitType(codegenType(node.value));
         while (t.type === "Infer") t = softenImplicitType(t.subType);
-        const info = unionInfo(t);
+        // The value's *representation* type — its DECLARED type, ignoring flow
+        // narrowing. Narrowing does not change how a value is laid out: a value
+        // boxed as `A | B | null` keeps that `{tag, anyref}` box even inside an
+        // `else if` arm where its static type has narrowed to `B | null` (whose
+        // own `unionInfo` would be a *niche* nullable ref — a DIFFERENT layout).
+        // Discrimination must therefore read the box of the representation type,
+        // not re-derive a layout from the narrowed type (which traps: a niche
+        // null test on the boxed struct is always "non-null"). (struct-union-
+        // null-is-chain soundness fix.)
+        let reprT = t;
+        const reprSource = unnarrowedType(node.value);
+        if (reprSource) {
+          let r = softenImplicitType(reprSource);
+          while (r.type === "Infer") r = softenImplicitType(r.subType);
+          reprT = r;
+        }
+        const reprInfo = unionInfo(reprT);
+        // Does `toExpression(node.value)` actually yield the representation box?
+        // The narrowed-place read (the `Name`/`PropertyAccess` cases) UNBOXES a
+        // value only when narrowing has pinned it to a single non-null member; a
+        // value narrowed to a sub-union or nullable (`B | null`) stays the box.
+        // So the box-tag discriminator is valid iff the operand is still that box
+        // — otherwise we'd `struct.get` an already-unboxed scalar/ref (a crash).
+        const narrowedToBareMember = (() => {
+          if (!reprInfo) return false;
+          const member = findVariant(reprInfo, t);
+          return !!member && variantTag(reprInfo, t) !== reprInfo.nullTag &&
+            !unionInfo(t);
+        })();
+        const operandIsBox = !!reprInfo && !narrowedToBareMember;
+        // Discriminate against the box when the operand is still one; otherwise
+        // fall back to the narrowed type's own representation.
+        const info = operandIsBox ? reprInfo : unionInfo(t);
+        // `x is <literal>` (a numeric/string/boolean literal check type) is a
+        // RUNTIME VALUE test, not just a tag test: literal variants that share a
+        // representation share a tag (`0`/`1` both ride the i32 tag, `"a"`/`"b"`
+        // both ride the string tag), so the tag alone cannot tell them apart —
+        // only the value does, exactly like `x == <literal>`.
+        const litExpr = !checksNull ? literalCheckExpr(node.checkType) : null;
+        if (litExpr) {
+          // The literal's own (member) type, lowered into the operand's rep.
+          const litType = softenImplicitType(node.checkType);
+          const lit = () => withDesiredType(t, () => toExpressionRaw(litExpr));
+          if (!info) {
+            // Scalar / monomorphic operand (`0 | 1` collapses to bare `i32`): a
+            // direct value compare.
+            return negate(valueEq(t, () => toExpression(node.value), lit));
+          }
+          // A tagged union operand: the literal narrows to one variant. Require
+          // BOTH the variant's tag (to pick the right rep among mixed members)
+          // AND the unboxed payload value to equal the literal.
+          const member = findVariant(info, litType);
+          if (member) {
+            const tag = tagOf(variantKey(litType));
+            const boxed = () => toExpression(node.value);
+            const tagEq = m.i32.eq(
+              m.struct.get(0, boxed(), binaryen.i32, false),
+              m.i32.const(tag),
+            );
+            const payload = () =>
+              unboxPayload(
+                info,
+                member,
+                m.struct.get(1, boxed(), info.payloadWasm, false),
+              );
+            // SHORT-CIRCUIT on the tag: the payload unbox (`ref.cast` of the
+            // boxed kind) would trap on a wrong-rep variant, so only reach it
+            // when the tag already matched.
+            return negate(
+              m.if(tagEq, valueEq(member, payload, lit), m.i32.const(0)),
+            );
+          }
+          // The literal isn't a member of the union — statically false (eval for
+          // side effects, then yield the constant).
+          return m.block(
+            null,
+            [m.drop(toExpression(node.value)), m.i32.const(node.negated ? 1 : 0)],
+            binaryen.i32,
+          );
+        }
         if (info) {
           const tag = checksNull
             ? info.nullTag
@@ -2389,8 +2523,9 @@ export const toWasm = async (
           ));
         }
         // A niche / reference nullable: `x is null` → null test; `x is T` (T the
-        // non-null variant) → its negation.
-        if (t.type === "Nullable") {
+        // non-null variant) → its negation. Only when the operand is genuinely a
+        // niche nullable at runtime (not a boxed union — that took the tag path).
+        if (!operandIsBox && reprT.type === "Nullable") {
           const isNull = nullnessTest(node.value);
           return negate(checksNull ? isNull : m.i32.eqz(isNull));
         }
