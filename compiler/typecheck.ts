@@ -1098,6 +1098,11 @@ export const typeFromStatement = (
     case "Break":
     case "Continue":
       return { type: "Never" };
+    case "Import":
+      // An `import { … } from "…"` statement is a binding directive, not a value
+      // — it has no runtime type (the cross-module binding/type-resolution is the
+      // resolver's job; see `compiler/modules.ts`).
+      return { type: "Never" };
     default:
       return typeFromExpression(stmt, ctx);
   }

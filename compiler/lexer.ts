@@ -42,6 +42,13 @@ export type TokenKind =
   | "BREAK"
   | "CONTINUE"
   | "FROM"
+  // Module-system keywords (phase 1): `import`/`export` for cross-file
+  // import/export, `as` for the `import { x as y }` rename. `from` already
+  // existed. The lexer reserves them as keywords unconditionally, matching how
+  // `from`/`type` are already unconditional keywords.
+  | "IMPORT"
+  | "EXPORT"
+  | "AS"
   | "TYPE"
   // Literal keywords
   | "TRUE"
@@ -176,6 +183,9 @@ const KEYWORDS: Record<string, TokenKind> = Object.assign(Object.create(null), {
   break: "BREAK",
   continue: "CONTINUE",
   from: "FROM",
+  import: "IMPORT",
+  export: "EXPORT",
+  as: "AS",
   type: "TYPE",
   true: "TRUE",
   false: "FALSE",

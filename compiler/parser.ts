@@ -62,6 +62,7 @@ import type {
   VLFunctionDeclarationNode,
   VLFunctionType,
   VLIfNode,
+  VLImportNode,
   VLInferType,
   VLIsNode,
   VLNullCoalesceNode,
@@ -2386,6 +2387,107 @@ export const parseProgram = (
     return record({ type: "Return", value }, ctx);
   };
 
+  // ---- module system (phase 1): import / export ----------------------------
+
+  /**
+   * Record an `export`ed top-level binding on the program node so the multi-file
+   * resolver can satisfy a cross-module `import { name }`. The binding's resolved
+   * type is read from the module scope (`program.scope`) — for a `function` or
+   * `variable` that is the value type; for a `type` it is the `Type` alias entry.
+   * Re-exporting a name already exported is a redeclaration the underlying decl
+   * parser already flagged (B16), so this just overwrites the last seen record.
+   */
+  const recordExport = (
+    name: string,
+    kind: "function" | "variable" | "type",
+  ): void => {
+    const type = program.scope[name] ?? { type: "Unknown" };
+    (program.moduleExports ??= {})[name] = { name, kind, type };
+    // Mark the symbol-table binding exported so the unused-variable lint exempts
+    // an exported-but-locally-unread top-level binding (it's public surface).
+    const binding = scopeBindings.get(program.scope)?.get(name);
+    if (binding) binding.exported = true;
+  };
+
+  /**
+   * Parse `import { a, b as c } from "<specifier>"` (phase 1: named imports
+   * only, relative `./`/`../` specifiers, NO `.vl` extension — resolution
+   * appends it). Records a `VLImportNode` and returns it as a statement; the
+   * actual cross-module binding/type-resolution is the resolver's job
+   * (`compiler/modules.ts`), which pre-seeds this module's `initialScope` with
+   * the imported names so references type-check. Newline-delimited, no
+   * semicolons, matching VL style.
+   */
+  const parseImport = (): VLImportNode => {
+    const kw = expect("IMPORT");
+    expect("LBRACE");
+    skipNewlines();
+    const specifiers: { name: string; local: string }[] = [];
+    if (!at("RBRACE")) {
+      for (;;) {
+        skipNewlines();
+        if (at("RBRACE")) break;
+        const nameTok = expect("ID");
+        let local = nameTok.text;
+        if (at("AS")) {
+          next();
+          skipNewlines();
+          local = expect("ID").text;
+        }
+        specifiers.push({ name: nameTok.text, local });
+        skipNewlines();
+        if (at("COMMA")) {
+          next();
+          skipNewlines();
+          if (at("RBRACE")) break;
+          continue;
+        }
+        break;
+      }
+    }
+    skipNewlines();
+    expect("RBRACE");
+    skipNewlines();
+    expect("FROM");
+    skipNewlines();
+    const specTok = peek();
+    let specifier = "";
+    if (at("STRING")) {
+      next();
+      specifier = specTok.value ?? specTok.text.slice(1, -1);
+    } else {
+      errors.push({
+        type: "Syntax",
+        message:
+          `Syntax error: expected a module specifier string after \`from\` but found ${
+            JSON.stringify(specTok.text)
+          }`,
+        ctx: spanOf(specTok),
+        code: 0,
+      });
+    }
+    const node: VLImportNode = { type: "Import", specifier, specifiers };
+    // Record the local-name uses as symbol-table declarations IF the resolver
+    // pre-seeded their bindings into the module scope (it injects each imported
+    // name's type before parsing). Without the graph driver the names aren't in
+    // scope; the import is still recorded so the resolver/LSP can read it, and
+    // bare references will surface as undeclared (single-file compile of a file
+    // with imports is meaningful only through the resolver).
+    for (const s of specifiers) {
+      if (s.local in program.scope) {
+        declareBinding(
+          program.scope,
+          s.local,
+          program.scope[s.local].type === "Type" ? "type" : "variable",
+          spanOf(kw),
+          program.scope[s.local],
+        );
+      }
+    }
+    (program.moduleImports ??= []).push(node);
+    return record(node, spanFrom(kw));
+  };
+
   const parseStatement = (): VLStatement | undefined => {
     const t = peek();
     switch (t.kind) {
@@ -2477,6 +2579,24 @@ export const parseProgram = (
         next();
         continue;
       }
+      // `export` is a transparent top-level modifier: a following `function`
+      // still hoists. Consume it without disturbing `prevReal` so the next token
+      // is judged as if `export` weren't there.
+      if (depth === 0 && k === "EXPORT") {
+        next();
+        continue;
+      }
+      // An `import { … } from "…"` statement carries no hoistable signature; skip
+      // it wholesale (through its specifier string) and treat the line as ending
+      // in statement position so a following `function` still hoists.
+      if (depth === 0 && k === "IMPORT") {
+        next();
+        while (!atEnd() && peek().kind !== "FROM") next();
+        if (at("FROM")) next();
+        if (at("STRING")) next();
+        prevReal = "RBRACE";
+        continue;
+      }
       if (
         depth === 0 && k === "FUNCTION" && peek(1).kind === "ID" &&
         (prevReal === undefined || prevReal === "RBRACE")
@@ -2560,6 +2680,64 @@ export const parseProgram = (
 
   preRegisterTopLevelFunctions();
 
+  /**
+   * Parse one top-level item, handling the module-system surface that is only
+   * legal at the top level: an `import { … } from "…"` statement and an `export`
+   * modifier on a `function` / `let` / `const` / `type` declaration. Everything
+   * else delegates to the ordinary `parseStatement`. The `export` path parses the
+   * underlying declaration, sets its `exported` flag, and records the public
+   * binding on the program node (`recordExport`) so the resolver can satisfy a
+   * cross-module import.
+   */
+  const parseTopLevelStatement = (): VLStatement | undefined => {
+    if (at("IMPORT")) return parseImport();
+    if (at("EXPORT")) {
+      const kw = next(); // EXPORT
+      skipNewlines();
+      // `export function f(…)` — register + flag + record.
+      if (at("FUNCTION")) {
+        const fn = parseFunctionDeclaration();
+        if (fn.name) {
+          fn.exported = true;
+          recordExport(fn.name, "function");
+        } else {
+          errors.push({
+            type: "Syntax",
+            message: "Syntax error: cannot export an anonymous function",
+            ctx: spanFrom(kw),
+            code: 0,
+          });
+        }
+        return fn;
+      }
+      // `export let x = …` / `export const x = …`.
+      if (at("LET") || at("CONST")) {
+        const decl = parseVariableDeclaration();
+        decl.exported = true;
+        recordExport(decl.name, "variable");
+        return decl;
+      }
+      // `export type T = …`. The type-statement parser registers the alias and
+      // returns a placeholder `Block`; recover the name from the next token
+      // (already consumed by the parser, so peek before delegating).
+      if (at("TYPE")) {
+        const nameTok = peek(1);
+        const decl = parseTypeStatement();
+        if (nameTok.kind === "ID") recordExport(nameTok.text, "type");
+        return decl;
+      }
+      errors.push({
+        type: "Syntax",
+        message:
+          "Syntax error: `export` must precede a `function`, `let`, `const`, or `type` declaration",
+        ctx: spanFrom(kw),
+        code: 0,
+      });
+      return parseStatement();
+    }
+    return parseStatement();
+  };
+
   skipNewlines();
   while (!atEnd()) {
     if (at("NEWLINE")) {
@@ -2568,7 +2746,7 @@ export const parseProgram = (
     }
     const startTok = peek();
     try {
-      const stmt = parseStatement();
+      const stmt = parseTopLevelStatement();
       if (stmt !== undefined) program.statements.push(stmt);
     } catch (err) {
       console.error(err);

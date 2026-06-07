@@ -28,7 +28,10 @@
 
 import {
   checkOnly,
+  checkProgram,
   compile,
+  compileProgram,
+  type CompileResult,
   runWasm,
   type VLDiagnostic,
   VLRuntimeError,
@@ -38,6 +41,43 @@ import {
 import { format } from "./format.ts";
 
 const SUBCOMMANDS = new Set(["run", "build", "check", "fmt"]);
+
+// --- module system (phase 1): multi-file dispatch -------------------------
+//
+// A `.vl` file may now `import` from other files. When it does, compilation must
+// resolve the whole import graph (see `compileProgram`) rather than the single
+// source string. We detect imports with a cheap textual check and, on a hit,
+// drive the graph from the file's path with a filesystem reader; otherwise the
+// existing single-string `compile` path is used unchanged (preserving exact
+// behaviour — and the source map / trivia — for the overwhelmingly common
+// import-free case). Kept self-contained here so a later rebase stays clean.
+
+/** A leading `import {` (after optional whitespace/comments) on any line. */
+const IMPORT_RE = /^\s*import\s*\{/m;
+const hasImports = (source: string): boolean => IMPORT_RE.test(source);
+
+/** Read a module's source by path for the graph resolver; `undefined` if absent. */
+const fsRead = (key: string): string | undefined => {
+  try {
+    return Deno.readTextFileSync(key);
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Compile a file by path, choosing the multi-file graph driver when it imports
+ * and the single-string path otherwise. `source` is the already-read text (so
+ * callers don't read twice). The single-string path keeps the source map; the
+ * graph path returns one wasm module for the whole program.
+ */
+const compileFile = (
+  file: string,
+  source: string,
+): Promise<CompileResult> =>
+  hasImports(source)
+    ? compileProgram(file, fsRead, file)
+    : compile(source, file);
 
 // --- severity ranking -----------------------------------------------------
 
@@ -279,12 +319,13 @@ const run = async (args: string[]): Promise<void> => {
   }
 
   // Use the source file's name in the source map / trap messages when running a
-  // file; inline / stdin snippets fall back to the default.
+  // file; inline / stdin snippets fall back to the default. A file that `import`s
+  // drives the multi-file graph resolver; inline/stdin and import-free files use
+  // the single-string path unchanged.
   const file = args.find((a) => !a.startsWith("-"));
-  const { diagnostics, wasm, sourceMap } = await compile(
-    source,
-    file ?? "source.vl",
-  );
+  const { diagnostics, wasm, sourceMap } = file
+    ? await compileFile(file, source)
+    : await compile(source, "source.vl");
   for (const d of diagnostics) console.error(formatDiagnostic(d));
 
   if (!wasm) Deno.exit(1);
@@ -327,7 +368,7 @@ const build = async (args: string[]): Promise<void> => {
   }
 
   const source = await Deno.readTextFile(file);
-  const { diagnostics, wasm } = await compile(source);
+  const { diagnostics, wasm } = await compileFile(file, source);
   for (const d of diagnostics) console.error(formatDiagnostic(d));
 
   if (!wasm) {
@@ -464,14 +505,21 @@ const checkFile = async (
   codegen: boolean,
 ): Promise<void> => {
   const source = await Deno.readTextFile(file);
-  // Fast path: codegen-free front end — skips binaryen entirely (no toolchain
-  // load). Codegen-only diagnostics (e.g. "Codegen error: recursion limit
-  // exceeded") are NOT produced here; `build`/`run` surface those instead.
-  // Full path (--codegen): run the complete compile() pipeline including
-  // binaryen codegen. Wasm bytes are discarded — we only want the diagnostics.
+  // Pick the diagnostics source on two axes:
+  //  - `--codegen` runs the FULL pipeline (incl. binaryen codegen) so codegen-only
+  //    errors (e.g. "Codegen error: recursion limit exceeded") surface here;
+  //    without it, the codegen-free front end is used (faster; never loads the
+  //    binaryen toolchain — `build`/`run` still surface codegen errors).
+  //  - a file that `import`s is resolved through the whole-program graph resolver
+  //    (cross-module references + bad imports) rather than the single-file path.
+  // Both program paths discard any wasm — we only want the diagnostics.
   const { diagnostics } = codegen
-    ? await compile(source)
-    : checkOnly(source);
+    ? (hasImports(source)
+      ? await compileProgram(file, fsRead, file)
+      : await compile(source))
+    : (hasImports(source)
+      ? await checkProgram(file, fsRead)
+      : checkOnly(source));
   if (diagnostics.length === 0) return;
 
   // Diagnostics to display: only those at or above the display floor. The tally

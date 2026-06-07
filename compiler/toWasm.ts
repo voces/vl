@@ -3834,6 +3834,12 @@ export const toWasm = async (
         return m.br(
           brkLabel(node.label ?? loopLabels[loopLabels.length - 1]),
         );
+      case "Import":
+        // An `import { … } from "…"` statement emits no code: the multi-file
+        // resolver (`compiler/modules.ts`) has already bound the imported names
+        // to their (mangled) exporting declarations in the merged program, so the
+        // import directive itself is a no-op at the top level.
+        return m.nop();
       default:
         throw new Error(
           `Unhandled AST -> WASM "${

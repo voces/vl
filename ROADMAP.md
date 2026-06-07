@@ -154,7 +154,8 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
     `__array_new__`/`__array_new_default__` + bulk `__array_copy__`, thin `defaultScope` intrinsics. The
     building block before the collection itself.
   - **Std-over-primitives** — write the collection (and opportunistically `print`) as `.vl` std, not
-    compiler-privileged types (ties to H3). Open dependency: no module system yet.
+    compiler-privileged types (ties to H3). The module-system substrate now exists (H0 phase 1 —
+    user-file `import`/`export`); the `.vl`-std delivery via the `std:` scheme is H0 phase 2.
   - **Indexing perf** (DECIDED resolutions; sub-choices/analysis open) — native-indexing flag (drops the
     B13 indirect call; nominal-vs-annotation open), backing-pointer hoisting (LICM), and bounds-narrowing
     (now an optimization, not a prerequisite, since trap-on-OOB is already a bare `array.get`).
@@ -212,10 +213,10 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   the empty-range warning, stable diagnostic `code`s, and the **lint pass** (`compiler/lint.ts`):
   unused-variable (function locals + params; `_`-prefix suppresses) and unreachable-code, both tagged
   `unnecessary` so VS Code greys them out. BUILD OUT — the lint rule backlog (keep it a few at a time):
-  - **`export`-aware top-level unused** — unused top-level bindings are flagged *now* (dead in a
-    whole-program compile). Once an explicit `export` keyword lands, *exported* top-level bindings become
-    exempt (consumer-facing surface, not dead). Lint already suppresses *all* warnings on a file that has
-    error-severity diagnostics (report the real errors first). (Ties into the modules/`export` work.)
+  - ✅ **`export`-aware top-level unused** — unused top-level bindings are flagged (dead in a
+    whole-program compile), but an *exported* top-level binding is now exempt (consumer-facing surface,
+    not dead) — landed with the `export` keyword (H0 phase 1). Lint still suppresses *all* warnings on a
+    file with error-severity diagnostics (report the real errors first).
   - **prefer-`const`** — a `let` that is never reassigned should be `const` (info/warning + quick-fix).
   - **unused function / unused import**; **dead/constant branch** (`if false`); **`step 0`** range loop;
     **unreachable after a diverging `if/else`** (have the simple after-`return` case).
@@ -388,6 +389,17 @@ antlr/Java generator) retires; the compiler becomes VL→wasm on a generic wasm 
 corpus (A12) is the host-agnostic oracle — the same tests pass whichever compiler runs them.
 **Distribution does NOT require self-hosting** (the two timelines below are independent).*
 
+- 🟡 **H0. Module system (`import`/`export` across `.vl` files).** The substrate under the H3 port and
+  the `.vl`-std plan (design + decided directions: `docs/modules-design.md`; choices → `DECISIONS.md`).
+  **Phase 1 DONE:** relative-path named imports (`import { a, b as c } from "./util"`, no `.vl`
+  extension) + an `export` modifier on `function`/`let`/`const`/`type`; a whole-program resolver
+  (`compiler/modules.ts`) that walks the import graph, detects cycles, type-checks across modules, and
+  merges everything into ONE wasm module with per-module name isolation (mangling — fixes the self-host
+  `Tok`/`advance` collision, gap #1). `compileProgram`/`checkProgram` drive it; the single-string
+  `compile(source)` is unchanged. Tests: `tests/modules_test.ts`. **Phase 2 (⬜):** the `std:` scheme +
+  embedded `.vl` std over the two-primitive intrinsic floor (collections, `std:fmt`, `std:testing`).
+  **Phase 3 (⬜):** cross-file / std LSP. **Deferred:** import maps, namespace/default imports,
+  export-all, re-exports.
 - ✅ **H-M1. Distribute now via `deno compile` (= C5).** Done — see C5. Native binary ships binaryen
   embedded; `deno task compile` + `smoke` verified. Decoupled from everything below.
 - ✅ **H1. Parser self-hostable (= Track G).** The one piece that categorically can't live in a
@@ -422,6 +434,10 @@ corpus (A12) is the host-agnostic oracle — the same tests pass whichever compi
   `tests/selfhost_pipeline_test.ts` + `tests/selfhost/pipeline_harness.vl`), proving the whole front
   end self-hosts — no hand-built token streams. The lexer↔parser token-kind/name divergences are
   reconciled in the driver glue (no `.vl` compiler edits); gaps catalogued in `docs/selfhost-gaps.md`.
+  The multi-file substrate the port needs now exists (H0 phase 1): the self-hosted compiler can be many
+  `.vl` files with real `import`/`export`, compiled into one wasm module — same-named privates across
+  files no longer collide (the gap-#1 blocker). Migrating the H3 `.vl` files onto real imports is a
+  separate follow-up.
 - ⬜ **H4. WASM emission — DECIDED: emit bytes directly + optional `wasm-opt`** (binaryen's npm build
   is JS-bound; → `DECISIONS.md`, incl. the Heap2Local caveat). binaryen stays for the TS compiler.
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime (wasmtime —

@@ -51,6 +51,14 @@ export type VLFunctionDeclarationNode = {
    * Additive metadata for LSP/diagnostics; not load-bearing for typechecking.
    */
   typeParameters?: string[];
+  /**
+   * Module system (phase 1): `true` when this top-level declaration carried an
+   * `export` modifier (`export function f …`). Marks the name as part of the
+   * module's public surface; the multi-file resolver reads it to decide whether
+   * an `import { f }` may bind. Only meaningful at the top level; ignored for
+   * nested/anonymous functions. Absent/`false` = module-private.
+   */
+  exported?: boolean;
 };
 
 export type VLNameNode = {
@@ -217,6 +225,12 @@ export type VLVariableDeclarationNode = {
    * metadata: typecheck/codegen ignore it.
    */
   annotated: boolean;
+  /**
+   * Module system (phase 1): `true` when this top-level `let`/`const` carried an
+   * `export` modifier. See `VLFunctionDeclarationNode.exported`. Absent/`false` =
+   * module-private.
+   */
+  exported?: boolean;
 };
 
 export type VLIfNode = {
@@ -286,6 +300,37 @@ export type VLBreakNode = {
   label: string | undefined;
 };
 
+// ---- module system (phase 1) ----------------------------------------------
+
+/**
+ * One named import in an `import { a, b as c } from "./m"` statement. `name` is
+ * the EXPORTED name in the source module; `local` is the name it binds to in the
+ * importing module (equal to `name` unless renamed with `as`). For `b as c`,
+ * `name` is `"b"` and `local` is `"c"`.
+ */
+export type VLImportSpecifier = {
+  /** The name exported by the source module. */
+  name: string;
+  /** The local binding name in the importing module (== name unless `as`). */
+  local: string;
+};
+
+/**
+ * An `import { … } from "<specifier>"` statement (phase 1: named imports only,
+ * relative specifiers, no `.vl` extension). This is a *statement* the parser
+ * emits at the top level; the multi-file resolver (`compiler/modules.ts`) reads
+ * the recorded `specifiers`/`specifier` to build the import graph and to bind
+ * each local name to the exporting declaration. Standalone single-file
+ * compilation (`compile(source)`) treats an unresolved import as a diagnostic —
+ * imports are only meaningful through the graph driver.
+ */
+export type VLImportNode = {
+  type: "Import";
+  /** The raw module specifier string (e.g. `"./util"`); no `.vl` extension. */
+  specifier: string;
+  specifiers: VLImportSpecifier[];
+};
+
 export type VLContinueNode = {
   type: "Continue";
   label: string | undefined;
@@ -299,7 +344,8 @@ export type VLStatement =
   | VLForNode
   | VLForInNode
   | VLBreakNode
-  | VLContinueNode;
+  | VLContinueNode
+  | VLImportNode;
 
 export type VLAliasType = { type: "Alias"; name: string };
 // TODO: exceptions
@@ -379,10 +425,42 @@ export type VLType =
 
 export type Scope = Record<string, VLType>;
 
+/**
+ * Module system (phase 1): one `export`ed top-level binding's public record. The
+ * multi-file resolver (`compiler/modules.ts`) reads these to satisfy an
+ * `import { name }` in another module — `kind` decides how the name binds in the
+ * importer's scope (a `type` binds as an alias, a `function`/`variable` as a
+ * value), and `type` is the resolved binding type injected so the importer
+ * type-checks cross-module. `mangledName` is the unique codegen name the
+ * resolver assigns this binding (so two modules' same-named privates/exports do
+ * not collide in the single output module); it is filled in during the merge.
+ */
+export type VLModuleExport = {
+  name: string;
+  kind: "function" | "variable" | "type";
+  type: VLType;
+  /** Set by the merge pass to the unique whole-program codegen name. */
+  mangledName?: string;
+};
+
 export type VLProgramNode = {
   type: "Program";
   statements: VLStatement[];
   scope: Scope;
+  /**
+   * Module system (phase 1): the public surface of this module — every
+   * `export`ed top-level binding, by its exported name. Populated by the parser
+   * when it sees an `export` modifier; consumed by the multi-file resolver.
+   * Absent for code with no exports (and for the legacy single-string path).
+   */
+  moduleExports?: Record<string, VLModuleExport>;
+  /**
+   * Module system (phase 1): the `import { … } from "…"` statements at this
+   * module's top level, in source order. Populated by the parser; consumed by
+   * the resolver to build the import graph. Absent when the module has no
+   * imports.
+   */
+  moduleImports?: VLImportNode[];
 };
 
 export type VLNode = VLProgramNode;
