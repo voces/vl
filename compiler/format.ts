@@ -558,6 +558,13 @@ class Printer {
   }
 
   private emitIf(node: VLIfNode, indent: number): void {
+    // An `if … else if … [else]` chain (an `else` branch that is itself an
+    // `If`) whose every branch is a brace block renders as a sequence of
+    // clauses: one line when the whole chain fits, otherwise one clause per
+    // line broken at each `else` / `else if` boundary — keeping each clause's
+    // `{ … }` body inline when it is short. (The plain `if`/`if … else` block
+    // form falls through to the per-line layout below.)
+    if (this.emitIfChain(node, indent)) return;
     // Block form when every branch is a brace block; otherwise the inline
     // `then`/`else` form (preserving the bare-statement AST shape).
     const allBlocks = node.conditionals.every((c) => this.isBlock(c.statement)) &&
@@ -598,6 +605,120 @@ class Printer {
         this.line(indent, `else ${this.statementInline(node.else, indent)}`);
       }
     }
+  }
+
+  // A clause of an `if … else if … else` chain: a condition (absent for the
+  // trailing `else`) and a brace-block body.
+  private flattenIfChain(
+    node: VLIfNode,
+  ): { cond: VLExpression | null; body: VLBlockNode }[] {
+    const clauses: { cond: VLExpression | null; body: VLBlockNode }[] = [];
+    let cur: VLIfNode | undefined = node;
+    while (cur) {
+      for (const c of cur.conditionals) {
+        clauses.push({ cond: c.condition, body: c.statement as VLBlockNode });
+      }
+      const tail: VLStatement | undefined = cur.else;
+      if (tail === undefined) return clauses;
+      if (tail.type === "If") {
+        cur = tail; // `else if` — keep walking the chain.
+        continue;
+      }
+      clauses.push({ cond: null, body: tail as VLBlockNode });
+      return clauses;
+    }
+    return clauses;
+  }
+
+  /**
+   * Render an `if … else if … [else]` chain (an `else` branch that is itself an
+   * `If`) whose every branch is a brace block. Returns `false` when the node is
+   * not such a chain (no `else if`, or some branch is not a block), leaving it
+   * to the caller's plain block / inline forms.
+   *
+   * Layout: collapse the whole chain to one line when it fits; otherwise break
+   * at each `else` / `else if` boundary onto its own line, keeping each clause's
+   * `{ … }` body inline when it is short and block-broken when it is not. The
+   * AST is unchanged either way — `else if` re-parses to a nested `If` and the
+   * inline brace block re-parses to the same single-statement `Block`.
+   */
+  private emitIfChain(node: VLIfNode, indent: number): boolean {
+    if (node.else === undefined || node.else.type !== "If") return false;
+    const clauses = this.flattenIfChain(node);
+    if (!clauses.every((cl) => this.isBlock(cl.body))) return false;
+
+    const head = (cond: VLExpression | null, first: boolean): string => {
+      if (cond === null) return "else";
+      const kw = first ? "if" : "else if";
+      return `${kw} ${this.expr(cond, indent)}`;
+    };
+
+    // Try the inline body for every clause; a `null` from any clause (an
+    // interior comment, or a body that is not a single simple statement) means
+    // the chain cannot collapse and that clause must block-break when wrapped.
+    const inlineBodies = clauses.map((cl) => this.inlineBlockBody(cl.body, indent));
+
+    // One line when every body inlines and the whole chain fits the width.
+    if (inlineBodies.every((b) => b !== undefined)) {
+      const oneLine = clauses
+        .map((cl, i) => `${head(cl.cond, i === 0)} ${inlineBodies[i]}`)
+        .join(" ");
+      if (indent * INDENT.length + oneLine.length <= this.width) {
+        this.line(indent, oneLine);
+        return true;
+      }
+    }
+
+    // Wrapped: one clause per line, aligned under the `if`.
+    clauses.forEach((cl, i) => {
+      const h = head(cl.cond, i === 0);
+      const inline = inlineBodies[i];
+      if (inline !== undefined &&
+        indent * INDENT.length + h.length + 1 + inline.length <= this.width
+      ) {
+        this.line(indent, `${h} ${inline}`);
+      } else {
+        this.line(indent, `${h} {`);
+        this.emitBlockBody(cl.body, indent);
+        this.line(indent, "}");
+      }
+    });
+    return true;
+  }
+
+  /**
+   * Render a brace block with a single simple statement as inline `{ stmt }`,
+   * or `{}` when empty. Returns `undefined` when the body cannot be kept inline:
+   * it holds more than one statement, a compound statement (a nested block /
+   * control-flow), or an own-line comment that would be orphaned by collapsing.
+   */
+  private inlineBlockBody(
+    block: VLBlockNode,
+    indent: number,
+  ): string | undefined {
+    const ctx = this.span(block);
+    // Any pending comment that overlaps the block (interior own-line, or a
+    // trailing comment on a single-line body) would be orphaned or relocated by
+    // collapsing — keep the body block-broken so it is emitted in place.
+    if (ctx && this.commentInSpan(ctx)) return undefined;
+    if (block.statements.length === 0) return "{}";
+    if (block.statements.length !== 1) return undefined;
+    const stmt = block.statements[0];
+    // Only simple leaf statements collapse cleanly to one line.
+    if (!isLeafStatement(stmt)) return undefined;
+    const inner = this.statementInline(stmt, indent);
+    if (inner.includes("\n")) return undefined;
+    return `{ ${inner} }`;
+  }
+
+  /** Whether any pending comment starts on a line covered by `ctx`. */
+  private commentInSpan(ctx: Context): boolean {
+    for (const c of this.pending) {
+      if (c.start.line < ctx.start.line) continue;
+      if (c.start.line > ctx.stop.line) break;
+      return true;
+    }
+    return false;
   }
 
   // ===================================================================
