@@ -159,6 +159,10 @@ under the relevant section. Roadmap items reference these by their tag (e.g. A15
     names just don't bind) rather than a hard error — imports are only meaningful through the graph
     driver; (d) `export` keyword spelling chosen over `pub` (matches the `import`/ES family).
 
+- **Integer divide-by-zero stays a trap.** The universal wasm/hardware convention; no checked
+  division by default. A `divChecked: i32|null` dual is a possible future opt-in but not planned
+  for v1. (B-debug)
+
 ## Editor / LSP
 
 - **D2 symbol table reuses the parser's scope walk, not a second resolver.** Go-to-definition /
