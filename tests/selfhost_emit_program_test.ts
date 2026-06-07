@@ -292,3 +292,100 @@ Deno.test("self-hosted emit-program: an unsupported shape fails loudly, not with
     throw new Error(`unexpected emitter error message: ${errLine}`);
   }
 });
+
+Deno.test("self-hosted emit-program: while loop counts up to 5", async () => {
+  // A simple count-up loop: `i` starts at 0 and is incremented until i < 5 is false.
+  const src = [
+    "function main(): i32 {",
+    "  let i = 0",
+    "  while i < 5 { i = i + 1 }",
+    "  return i",
+    "}",
+    "",
+  ].join("\n");
+  const logs = await runFor(src);
+  const got = await runMain(bytesFromLog(logs));
+  if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+});
+
+Deno.test("self-hosted emit-program: while loop accumulates a sum (0+1+2+3 = 6)", async () => {
+  // A sum loop over two locals — proves loop body can read/write multiple locals.
+  const src = [
+    "function main(): i32 {",
+    "  let i = 0",
+    "  let sum = 0",
+    "  while i < 4 {",
+    "    sum = sum + i",
+    "    i = i + 1",
+    "  }",
+    "  return sum",
+    "}",
+    "",
+  ].join("\n");
+  const logs = await runFor(src);
+  const got = await runMain(bytesFromLog(logs));
+  if (got !== 6) throw new Error(`main() returned ${got}, expected 6`);
+});
+
+Deno.test("self-hosted emit-program: while-false loop runs zero iterations", async () => {
+  // The condition is always false; the body must not execute, leaving x unchanged.
+  const src = [
+    "function main(): i32 {",
+    "  let x = 42",
+    "  while x < 0 { x = x + 1 }",
+    "  return x",
+    "}",
+    "",
+  ].join("\n");
+  const logs = await runFor(src);
+  const got = await runMain(bytesFromLog(logs));
+  if (got !== 42) throw new Error(`main() returned ${got}, expected 42`);
+});
+
+Deno.test("self-hosted emit-program: while loop with local declared inside the body", async () => {
+  // `delta` is declared inside the loop body — wasm locals are function-scoped, so
+  // `collectLocals` must recurse into the while body to allocate its slot.
+  // total = 3*2 + 2*2 + 1*2 = 6 + 4 + 2 = 12
+  const src = [
+    "function main(): i32 {",
+    "  let total = 0",
+    "  let n = 3",
+    "  while n > 0 {",
+    "    let delta = n * 2",
+    "    total = total + delta",
+    "    n = n - 1",
+    "  }",
+    "  return total",
+    "}",
+    "",
+  ].join("\n");
+  const logs = await runFor(src);
+  const got = await runMain(bytesFromLog(logs));
+  if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
+});
+
+Deno.test("self-hosted emit-program: while loop in helper called from main (sum 0..10 = 55)", async () => {
+  // A `sum` helper accumulates 0..n with a while loop; `main` calls it.
+  // Proves while loops work in multi-function modules with params.
+  const src = [
+    "function sum(n: i32): i32 {",
+    "  let i = 0",
+    "  let acc = 0",
+    "  while i <= n {",
+    "    acc = acc + i",
+    "    i = i + 1",
+    "  }",
+    "  return acc",
+    "}",
+    "function main(): i32 {",
+    "  return sum(10)",
+    "}",
+    "",
+  ].join("\n");
+  const logs = await runFor(src);
+  const bytes = bytesFromLog(logs);
+  const got = await runMain(bytes);
+  if (got !== 55) throw new Error(`main() returned ${got}, expected 55`);
+  const direct = await runExport(bytes, "sum", 10);
+  if (direct !== 55) throw new Error(`sum(10) returned ${direct}, expected 55`);
+});
