@@ -424,7 +424,13 @@ export const _typeFromExpression = (
     case "OptionalAccess": {
       // `x?.y`: look up `y` on the *non-null* part of `x`; the result is
       // `(member) | null` — null when `x` is null, else the member's type.
-      const objType = nonNullable(typeFromExpression(expr.object, ctx));
+      // `getConcreteType` unwraps a named `type` alias (`Config | null` →
+      // `{port: i32} | null`) so the field lookup sees the underlying struct,
+      // exactly like the inline-struct form (optional-chain-named-alias fix).
+      const objType = getConcreteType(
+        nonNullable(typeFromExpression(expr.object, ctx)),
+        ctx,
+      );
       if (objType.type !== "Object") return { type: "Never" };
       const property = objType.properties.find((p) =>
         validateType(p.name, { type: "StringLiteral", value: expr.property })
@@ -1444,6 +1450,12 @@ export const getChildType = (
       updateType(object, { type: "Object", properties: [] });
     }
   }
+  // Unwrap a named `type` alias (`Config` → `{port: i32}`) so member access sees
+  // the underlying struct. The regular `o.x` path receives an already-concrete
+  // type, but the `o?.x` path passes `nonNullable(...)` which can leave the alias
+  // `Type` wrapper in place — without this it reports a spurious "expected
+  // {x: any}" on a perfectly valid receiver (optional-chain-named-alias fix).
+  if (object.type === "Type") object = getConcreteType(object, objectCtx);
   // A directly-used (un-bound) string literal keeps its `StringLiteral` type
   // (e.g. `"a".length`); soften it to the nominal `string` Object — an
   // i32-indexed array — so a one-char string isn't mistaken for a char and its

@@ -29,9 +29,6 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - **A17 — forward / mutual-reference return-type inference** — removes the ergonomic wart where a
   function calling a later-defined function (or mutual recursion) infers `any`. High value for the
   inference-first identity of the language and for self-hosting a recursive-descent compiler.
-- **A12 soundness bugs** — three confirmed, `xfail`-pinned runtime bugs (literal `is` always-false;
-  `A|B|null` illegal-cast trap; `?.field` alias false error); small, targeted fixes with real user
-  impact. (detail: `docs/soundness-findings.md`)
 - **H4.1 / H4.3–H4.6** — remaining self-host codegen gaps before VL-in-VL can emit wasm.
 - **H2a Re-land clean `selfhost/lexer.vl`** — now unblocked by H2 gap fixes; first concrete H3 slice.
 - **F9a `VL_NO_OPT`** — single-file `toWasm.ts` change, cuts test suite wall time by ~20–25 s.
@@ -72,18 +69,13 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   recursion through an **array** element (`{ rest: [List] }`).
 - 🟡 **A12. Soundness corpus.** REMAINING: keep growing it; the known-unsound corners are
   `xfail`-marked (e.g. the permissive `i32 + string` hole rule, A13).
-  **Known bugs (confirmed, `xfail`-pinned — fix when each is addressed):**
-  - 🐛 **A12-bug1. `is <literal>` always-false on literal-unions** — `n is 0` / `s is "a"` always
-    evaluates false at runtime; `==` works correctly and is the interim idiom.
-    (`xfail-literal-is-always-false.vl`; detail: `docs/soundness-findings.md` §literal-is-always-false)
-  - 🐛 **A12-bug2. Flat `A|B|null` `is`-chain "illegal cast" trap** — a flat struct-union with
-    `null` as a peer variant traps at runtime when `null` is passed to an `is A` arm; null is not
-    null-checked before unboxing. Workaround: guard `null` first.
-    (`xfail-struct-union-null-is-chain.vl`; detail: `docs/soundness-findings.md` §struct-union-null-is-chain)
-  - 🐛 **A12-bug3. `x?.field` false error when `x` is typed via a named alias** — `cfg?.port`
-    where `cfg: Config | null` errors "expected {port: any}, got {port: i32}"; the `?.` lowering
-    does not unwrap the alias before the field lookup. Fix: call `getConcreteType` on the receiver
-    in the optional-chain path. (detail: `docs/soundness-findings.md` §optional-chain-named-alias)
+  **Known bugs (all RESOLVED; pinned by passing cases):**
+  - ✅ **A12-bug1. `is <literal>` always-false on literal-unions** — RESOLVED.
+    (`literal-is-runtime-value.vl`; detail: `docs/soundness-findings.md` §literal-is-always-false)
+  - ✅ **A12-bug2. Flat `A|B|null` `is`-chain "illegal cast" trap** — RESOLVED.
+    (`struct-union-null-is-chain-sound.vl`; detail: `docs/soundness-findings.md` §struct-union-null-is-chain)
+  - ✅ **A12-bug3. `x?.field` false error when `x` is typed via a named alias** — RESOLVED.
+    (`optional-chain-coalesce-sound.vl`; detail: `docs/soundness-findings.md` §optional-chain-named-alias)
 - 🟡 **A13. Operator-constraint inference.** REMAINING: the hole-operand rule is permissive (doesn't
   reject `i32 + string` yet); the *stored-closure* operator case (`vec + vec` via a `"+"` field)
   still hits the WasmGC width wall (B13).

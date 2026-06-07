@@ -84,20 +84,18 @@ the new kind spellings. `compiler/parser.vl` was not touched.
 
 ---
 
-## 3. `checkProgram` must be called in value-consuming position (PRE-EXISTING, re-confirmed)
+## 3. `checkProgram` must be called in value-consuming position — RESOLVED
 
-**Repro.** In any driver, `checkProgram(parseProgram())` as a bare statement, or
+**Status.** RESOLVED (fixed by #89, the void/statement-position value drop).
+Verified by repro: a bare discarded non-void call (`compute()` returning `i32`),
+`let r = compute()`, a discarded ref-returning call (`makeStr()` → `string`), and
+a discarded-plus-indirected `checkProgram`-shaped call (`check(5)` discarded +
+`let _x = check(-1)`) all compile and run cleanly — no "Expected numeric type".
+A discarded value is dropped in statement position; no further codegen change was
+needed.
+
+**Original repro.** `checkProgram(parseProgram())` as a bare statement, or
 `let r = checkProgram(...)`, instead of `print(i32ToStr(checkProgram(...)))`.
-
-**What failed.** A codegen "Expected numeric type" at module scale (documented in
-`compiler/typecheck.vl` near `checkProgram`). The pipeline module is even larger
-than the typecheck-only module (it also carries the full lexer), and re-confirms
-the limit: the only form that compiles is consuming the result directly in a
-builtin call. The harness/prelude `report()` already follows this rule.
-
-**Suggested fix location.** `compiler/toWasm.ts` — lowering of a discarded /
-indirected call return value (same family as the undropped-`.pop()`-value bug).
-NOT fixed here (TS compiler is owned by another agent).
 
 ---
 
