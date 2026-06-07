@@ -14,6 +14,7 @@
 // 0-based column positions, matching `Context`.
 
 import { compile, parseSymbols, stringifyType } from "../compiler/compile.ts";
+import type { Scope } from "../compiler/ast.ts";
 import {
   type Completion,
   identifierCompletions,
@@ -123,14 +124,14 @@ Deno.test("identifierCompletions: folds in builtins, user bindings shadow them",
   const src = "let myVar = 1\n";
   const table = parseSymbols(src);
   // A tiny stand-in builtins scope: a type (`i32`) and a function (`print`).
-  const builtins = {
-    i32: { type: "Object", name: "i32", properties: [] } as const,
+  const builtins: Scope = {
+    i32: { type: "Object", name: "i32", properties: [] },
     print: {
       type: "Function",
       paramaters: [],
       return: { type: "Unknown" },
-    } as const,
-    myVar: { type: "Alias", name: "string" } as const, // collides with the local
+    },
+    myVar: { type: "Alias", name: "string" }, // collides with the local
   };
   const cs = identifierCompletions(
     table,

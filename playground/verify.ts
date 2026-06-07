@@ -36,7 +36,7 @@ const bundleCore = async (entry: string): Promise<string> => {
         name: "binaryen-esm",
         setup(build) {
           const e = binaryenEntry();
-          build.onResolve({ filter: /^binaryen$/ }, () => ({ path: e }));
+          build.onResolve({ filter: /^binaryen$/ }, () => Promise.resolve({ path: e }));
         },
       },
       {
@@ -44,7 +44,7 @@ const bundleCore = async (entry: string): Promise<string> => {
         setup(build) {
           build.onResolve(
             { filter: /^node:/ },
-            (a) => ({ path: a.path, external: true }),
+            (a) => Promise.resolve({ path: a.path, external: true }),
           );
         },
       },
@@ -77,7 +77,7 @@ const verifyFullBundleBuilds = async (): Promise<void> => {
         name: "binaryen-esm",
         setup(build) {
           const e = binaryenEntry();
-          build.onResolve({ filter: /^binaryen$/ }, () => ({ path: e }));
+          build.onResolve({ filter: /^binaryen$/ }, () => Promise.resolve({ path: e }));
         },
       },
       {
@@ -85,7 +85,7 @@ const verifyFullBundleBuilds = async (): Promise<void> => {
         setup(build) {
           build.onResolve(
             { filter: /^node:/ },
-            (a) => ({ path: a.path, external: true }),
+            (a) => Promise.resolve({ path: a.path, external: true }),
           );
         },
       },
