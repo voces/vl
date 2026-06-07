@@ -33,7 +33,7 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   never a cryptic codegen crash (repro: `const xs = []; xs.push(1)`).
 - **Exhaustiveness analysis for `is`-chains (A-exhaust)** — flag dead arms, enable omitting the
   final `else`, elide provably-true discriminants in codegen.
-- **H4.1 / H4.5–H4.6** — remaining self-host codegen gaps before VL-in-VL can emit wasm.
+- **H4.1 / H4.5–H4.6** — remaining (worked-around) self-host codegen gaps for a full `vl build` path.
 - **H2a Re-land clean `selfhost/lexer.vl`** — now unblocked; first concrete H3 slice.
 - **C5 / H-M1** — `deno compile` + brew tap. Small, decoupled; ships the distribution story now.
 - Smaller/independent: B6b collections building blocks, B13 callable objects, B17 lint backlog,
@@ -293,21 +293,30 @@ independent).*
   struct-threaded scanner state → a real ref-typed module global. First concrete slice of H3.
 - ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
   running the corpus through the VL-written compiler. Incremental; TS and VL compilers cross-checked.
+  The front end self-hosts **from raw source text** today — `lexer.vl → parser.vl → typecheck.vl` is
+  wired and test-validated (`tests/selfhost_pipeline_test.ts`) for a language **subset**. Remaining
+  bootstrap work:
+  - **(a) wasm-emit consuming the AST arena.** `compiler/wasmEmit.vl` is a fixed-bytes spike that
+    hand-builds two modules and never reads `compiler/ast.vl`; a full codegen port must drive the arena.
+  - **(b) Grow the `.vl` parser/typecheck subset.** `parseStmt` handles `let`/`const`/`function`/`if`
+    (incl. `else if` chains)/`return`/block/expr but **no `while`/`for` statements yet**; widen toward
+    the full language.
+  - **(c) Land the `.vl` files on real import/export** to retire the concat + symbol-rename glue
+    (the runner renames the lexer's colliding `Tok`/`Diag`/`advance`; detail: `docs/selfhost-gaps.md`
+    §1). The multi-file substrate now exists (H0 phase 1).
   First slice (lexer) spiked + closed (#37, then #54) pending the H2 gap fixes; re-lands clean as
-  `selfhost/lexer.vl` (H2a). The multi-file substrate now exists (H0 phase 1).
-  Migrating the H3 `.vl` files onto real imports is a separate follow-up.
-  **Open self-host codegen limits (re-confirmed at pipeline scale; detail: `docs/selfhost-gaps.md`):**
-  - ✅ **H3-gap3. `checkProgram` value-position** — resolved (#89, void/statement-position value drop);
-    see `docs/selfhost-gaps.md` §3.
-  **Codegen capabilities needed before VL-in-VL can emit wasm (H4 sub-items):**
-  - ⬜ **H4.1. No `byte`/`u8` type** — the self-hosted wasm emitter needs a byte type for binary
-    output; VL has no unsigned 8-bit integer primitive today. (detail: `docs/selfhost-gaps.md` §H4.1)
-  - ✅ **H4.3 / H4.4** — resolved via bitwise/shift ops (#99); see `CHANGELOG.md`.
-  - ⬜ **H4.5. In-VL byte→host handoff** — no mechanism to pass a raw byte buffer from VL code to
-    the host; linear-memory FFI or a `bytes()` builtin needed. (detail: `docs/selfhost-gaps.md` §H4.5)
-  - ⬜ **H4.6. Array spread / concat in call position** — the self-hosted emitter needs to accumulate
-    byte sequences with spread or bulk-append; `xs.push(...ys)` / spread-into-call not yet supported.
-    (detail: `docs/selfhost-gaps.md` §H4.6)
+  `selfhost/lexer.vl` (H2a).
+  **Codegen self-host status (detail: `docs/selfhost-gaps.md`):** the `wasmEmit.vl` spike is GREEN —
+  LEB128 + section framing emit valid bytes that the real `WebAssembly` engine instantiates. H3-gap3,
+  H4.2/H4.3/H4.4 are resolved (see `CHANGELOG.md`). Remaining sub-items:
+  - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
+    represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
+    packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/selfhost-gaps.md` §H4.1)
+  - ⬜ **H4.5. In-VL byte→host handoff (worked around).** Bytes are serialized via a decimal-join
+    string (`bytesToStr()`); the real fix (linear-memory/`(array i8)` return or a host sink) only
+    matters for a standalone `vl build`, not for proving self-host. (detail: `docs/selfhost-gaps.md` §H4.5)
+  - ⬜ **H4.6. Array spread / concat in call position (worked around).** A small `appendAll()` loop
+    helper covers bulk-append today; `xs.push(...ys)` lands with variadics (B6). (detail: `docs/selfhost-gaps.md` §H4.6)
 - ⬜ **H4. WASM emission — DECIDED: emit bytes directly + optional `wasm-opt`** (binaryen's npm
   build is JS-bound). → `DECISIONS.md`. binaryen stays for the TS compiler.
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime
