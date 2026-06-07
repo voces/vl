@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as os from "node:os";
 import { writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import {
   commands as Commands,
   ExtensionContext,
@@ -80,15 +81,37 @@ const createClient = (
   return client;
 };
 
+// Walks up from `startDir` to the nearest ancestor holding a `deno.json` (the
+// compiler project root, which defines the `run` task + binaryen import map).
+// Returns undefined if none is found before the filesystem root.
+const findProjectRoot = (startDir: string): string | undefined => {
+  let dir = startDir;
+  for (;;) {
+    if (existsSync(path.join(dir, "deno.json"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+};
+
 // Runs the active `.vl` file in an integrated terminal via the compiler's
 // `deno task run` CLI (compile + run, streaming diagnostics and program output).
-// The terminal is reused across runs. `cwd` is the compiler project root — the
-// parent of the extension dir (`<root>/lsp`) — so deno finds `<root>/deno.json`
-// (the `run` task + the binaryen import map).
+// The terminal is reused across runs. `cwd` is the compiler project root, found
+// by walking up from the file (or its workspace folder) to the nearest
+// `deno.json` — robust to how the extension itself is installed (symlinked dev
+// install, dev host, or packaged), which `context.extensionPath` is not.
 const registerRunCommand = (context: ExtensionContext) => {
   let terminal: Terminal | undefined;
+  // Track the cwd the terminal was opened in: the terminal's working directory
+  // is fixed at creation time, so if the resolved project root changes (e.g.
+  // the user switches to a file from a different vl repo), we must dispose and
+  // recreate the terminal rather than reusing one anchored to the wrong root.
+  let terminalCwd: string | undefined;
   Window.onDidCloseTerminal((closed) => {
-    if (closed === terminal) terminal = undefined;
+    if (closed === terminal) {
+      terminal = undefined;
+      terminalCwd = undefined;
+    }
   });
 
   const run = async () => {
@@ -98,6 +121,25 @@ const registerRunCommand = (context: ExtensionContext) => {
       return;
     }
     const doc = editor.document;
+    // Resolve the project root from the document's real location *before* any
+    // temp mirroring (a temp file under os.tmpdir() has no deno.json above it).
+    // Prefer walking up from the file; fall back to its workspace folder, then
+    // to the extension's parent dir for an in-tree (dev-host) install.
+    const docDir = doc.uri.scheme === "file"
+      ? path.dirname(doc.uri.fsPath)
+      : undefined;
+    const folder = Workspace.getWorkspaceFolder(doc.uri)?.uri.fsPath;
+    const cwd = (docDir && findProjectRoot(docDir)) ??
+      (folder && findProjectRoot(folder)) ??
+      path.dirname(context.extensionPath);
+    // If the resolved root changed, the existing terminal is anchored to the
+    // wrong directory — dispose it so the recreate branch below runs with the
+    // correct cwd.
+    if (terminal && terminalCwd !== cwd) {
+      terminal.dispose();
+      terminal = undefined;
+      terminalCwd = undefined;
+    }
     // Run the buffer as-is, with no save side effect: an untitled or unsaved
     // (dirty) document has no usable on-disk path, so mirror its current text to
     // a reused temp file. A clean, saved file runs by its real path (accurate
@@ -109,8 +151,10 @@ const registerRunCommand = (context: ExtensionContext) => {
     } else {
       file = doc.uri.fsPath;
     }
-    const cwd = path.dirname(context.extensionPath);
-    if (!terminal) terminal = Window.createTerminal({ name: "Vital", cwd });
+    if (!terminal) {
+      terminal = Window.createTerminal({ name: "Vital", cwd });
+      terminalCwd = cwd;
+    }
     terminal.show(true);
     terminal.sendText(`deno task run "${file}"`);
   };
