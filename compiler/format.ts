@@ -357,7 +357,7 @@ class Printer {
     // `mutable` is true for `let` (reassignable), false for `const` (immutable
     // binding) — JS/TS semantics (parser: let => mutable).
     const kw = node.mutable ? "let" : "const";
-    let head = `${kw} ${node.name}`;
+    let head = `${node.exported ? "export " : ""}${kw} ${node.name}`;
     if (node.annotated) {
       const annotation = this.recoverVarAnnotation(node);
       if (annotation !== undefined) head += `: ${annotation}`;
@@ -617,7 +617,7 @@ class Printer {
       );
       return;
     }
-    const header = this.functionHeader(node);
+    const header = (node.exported ? "export " : "") + this.functionHeader(node);
     const body = node.body;
     if (this.isBlock(body)) {
       // An empty body renders inline as `{}` (a void function) — keeping it on
