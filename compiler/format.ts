@@ -783,7 +783,12 @@ class Printer {
   private emitFunction(node: VLFunctionDeclarationNode, indent: number): void {
     const ctx = this.span(node);
     // Operator-named or otherwise un-faithful function: reproduce verbatim.
-    if (ctx && (node.name === undefined || !isIdentifier(node.name))) {
+    // Also verbatim when the body is a single expression (not a Block) that spans
+    // multiple lines and contains an own-line comment — re-laying it out would
+    // displace the comment to after the closing brace.
+    const bodyIsExpr = ctx && !this.isBlock(node.body) &&
+      this.hasInteriorComment(ctx);
+    if (ctx && (node.name === undefined || !isIdentifier(node.name) || bodyIsExpr)) {
       this.consumeInterior(ctx);
       const lines = this.slice(ctx).replace(/[ \t]+\n/g, "\n").split("\n");
       lines.forEach((l, i) =>
