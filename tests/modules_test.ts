@@ -60,6 +60,30 @@ Deno.test("imports an exported function AND type; compiles + runs", async () => 
   assertEquals(logs, ["7", "0"], "program output");
 });
 
+Deno.test("exports need no annotations — inferred types resolve across modules", async () => {
+  // `add` has no return-type annotation (inferred from `a + b`) and `SEED` is an
+  // inferred `const`; the importer must still type-check and run. Exported members
+  // are typed exactly as they would be locally — the module boundary adds no
+  // annotation requirement; cross-module resolution uses the inferred type.
+  const files = {
+    "util.vl": [
+      "export function add(a: i32, b: i32) { return a + b }",
+      "export const SEED = 41",
+    ].join("\n"),
+    "main.vl": [
+      'import { add, SEED } from "./util"',
+      "print(add(SEED, 1))",
+    ].join("\n"),
+  };
+  const r = await compileProgram("main.vl", memReader(files));
+  assert(
+    noErrors(r.diagnostics),
+    `unexpected errors: ${errorMessages(r.diagnostics)}`,
+  );
+  const { logs } = await runWasm(r.wasm!);
+  assertEquals(logs, ["42"], "inferred-export program output");
+});
+
 Deno.test("rename: `import { add as plus }`", async () => {
   const files = {
     "util.vl": "export function add(a: i32, b: i32): i32 { return a + b }",
