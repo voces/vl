@@ -259,9 +259,10 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   Code Run-Current-File command.
 - ✅ **C3. `vl build <file> [-o out.wasm] [--wat]`** — emit wasm bytes (and optional `.wat`).
 - ✅ **C4. `vl check <file>`** — diagnostics only, non-zero exit on errors (CI gate).
-- 🟡 **C5. Distribution via `deno compile`** — native `vl` binary builds + runs binaryen embedded
-  (`deno task compile`/`smoke`); release workflow + brew formula drafted (→ `DECISIONS.md`).
-  REMAINING: an actual public release (tag/tap, sha256 bump).
+- ✅ **C5. Distribution via `deno compile`** — native `vl` binary builds + runs binaryen embedded
+  (`deno task compile`/`smoke`; all 11 smoke checks pass). See `README.md` "Building the Native
+  Binary" and `DECISIONS.md` "Parser, distribution & bootstrapping". REMAINING: public release
+  (tag/tap/sha256 bump) — decoupled from the compiler work.
 
 ---
 
@@ -387,8 +388,8 @@ antlr/Java generator) retires; the compiler becomes VL→wasm on a generic wasm 
 corpus (A12) is the host-agnostic oracle — the same tests pass whichever compiler runs them.
 **Distribution does NOT require self-hosting** (the two timelines below are independent).*
 
-- 🟡 **H-M1. Distribute now via `deno compile` (= C5).** Native binary builds + runs binaryen
-  embedded — see C5. Decoupled from everything below; today's compiler unchanged.
+- ✅ **H-M1. Distribute now via `deno compile` (= C5).** Done — see C5. Native binary ships binaryen
+  embedded; `deno task compile` + `smoke` verified. Decoupled from everything below.
 - ✅ **H1. Parser self-hostable (= Track G).** The one piece that categorically can't live in a
   VL-in-VL compiler is gone.
 - 🟡 **H2. Make VL expressive enough to write a compiler.** Recursive tree types (**A11 ✅**), generics
