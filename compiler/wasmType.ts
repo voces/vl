@@ -31,11 +31,25 @@ export const toWasmType = (binaryen: any, node: VLType): number => {
       case "Function":
         // A function value is an i32 index into the function table.
         return binaryen.i32;
+      case "Unknown":
+      case "Infer":
+        // An UNRESOLVED inference hole reached codegen. This is normally caught
+        // earlier as a clean "cannot infer … annotate" diagnostic (see
+        // `reportUninferredBinding` in typecheck.ts); this is the BACKSTOP so a
+        // missed case surfaces as a clear, actionable message rather than the
+        // opaque `Unhandled AST -> WASM "Unknown" type`. Still thrown (not logged)
+        // so `instantiate`'s inferred-return-type path can catch it and read the
+        // result type off the compiled body — on that expected path this message
+        // never reaches the user; it only surfaces (via `compile`'s catch) for a
+        // genuinely un-inferable value.
+        throw new Error(
+          "cannot infer a type — add a type annotation " +
+            "(e.g. `let xs: i32[] = []`)",
+        );
       default:
-        // Thrown (not logged): an inferred return type (`Unknown`/`Infer`) has
-        // no wasm mapping, and `instantiate` deliberately catches this to read
-        // the result type off the compiled body instead. Logging here would
-        // leak to stdout on that expected path.
+        // Thrown (not logged): any other type with no wasm mapping. `instantiate`
+        // deliberately catches this to read the result type off the compiled body
+        // instead. Logging here would leak to stdout on that expected path.
         throw new Error(`Unhandled AST -> WASM "${type.type}" type`);
     }
 };
