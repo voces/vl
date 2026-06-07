@@ -168,6 +168,8 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
     loop; **unreachable after a diverging `if/else`** (have the simple after-`return` case).
   - **LSP quick-fixes** (code actions): "remove unused binding" / "prefix with `_`" / "`let`→`const`".
     Diagnostics already carry stable `code`s; the LSP has no code-action provider yet.
+  - ✅ **`vl check --fix`** — apply the provably-safe lint fixes from the CLI (`let`→`const`,
+    unused→`_`-prefix), reusing `codeActions.ts`; idempotent, clean-file no-op.
   - Cross-cutting: thread `severity` through all remaining error variants; consistent message style.
 - ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
   position and emit it.

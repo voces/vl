@@ -71,9 +71,12 @@ export const removeBindingFix = (
 
 /**
  * Quick-fix for a `prefer-const` diagnostic: a never-reassigned `let` should be
- * `const`. The diagnostic range is the identifier; we find the `let` keyword
- * preceding it on the same line and replace it with `const`. Returns `null` if
- * no `let` keyword is found there.
+ * `const`. We find the `let` keyword on the diagnostic's line and replace it with
+ * `const`. This works regardless of whether the diagnostic range points at the
+ * `let` keyword itself (the lint's current behaviour — the actionable token) or
+ * at the variable identifier (its historical position): in both cases the first
+ * `let` word on the line is the declaration keyword. Returns `null` if no `let`
+ * keyword is found at/before the diagnostic range start.
  */
 export const letToConstFix = (
   source: string,
@@ -83,10 +86,11 @@ export const letToConstFix = (
   const line = range.start.line;
   if (line < 0 || line >= lines.length) return null;
   const text = lines[line];
-  // Match `let` as a whole word at/before the identifier — the first `let` word
-  // on the line is the declaration keyword.
+  // Match `let` as a whole word at/before the diagnostic start — the first `let`
+  // word on the line is the declaration keyword. `>` (not `>=`) so a range that
+  // starts exactly ON the `let` keyword (the lint's current range) is accepted.
   const m = /\blet\b/.exec(text);
-  if (!m || m.index >= range.start.character) return null;
+  if (!m || m.index > range.start.character) return null;
   return {
     title: "Change `let` to `const`",
     kind: "quickfix",

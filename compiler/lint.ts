@@ -220,7 +220,11 @@ const preferConst = (symbols: SymbolTable, out: VLDiagnostic[]): void => {
       message:
         `\`${b.name}\` is never reassigned; use \`const\` instead of \`let\``,
       severity: "info",
-      range: rangeFromCtx(b.decl),
+      // Point at the `let` keyword — that is the token the fix changes
+      // (`let`→`const`), so the squiggle lands on the actionable word rather than
+      // the variable name. Falls back to the identifier span if the parser didn't
+      // stamp a keyword span (defensive; always present for `let` decls today).
+      range: rangeFromCtx(b.declKeyword ?? b.decl),
       code: "prefer-const",
       source: "vital",
     });

@@ -27,6 +27,15 @@ export type Binding = {
   /** Span of the declaring identifier (what go-to-definition jumps to). */
   decl: Context;
   /**
+   * For a `variable` binding, the span of its declaration KEYWORD (`let` /
+   * `const`). The prefer-`const` lint points its diagnostic here — the keyword is
+   * the actionable token (`let`→`const`), not the variable name. Stamped by the
+   * parser at the variable-declaration site; undefined for kinds with no such
+   * keyword (parameters, functions, types) and for bindings created before this
+   * field existed.
+   */
+  declKeyword?: Context;
+  /**
    * The binding's declared/inferred type — what hover renders; holes
    * (`Infer`/`Unknown`) may appear for still-generic params.
    */
