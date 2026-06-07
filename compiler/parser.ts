@@ -2645,13 +2645,29 @@ export const parseProgram = (
       }
       return { type: "Block", label: `__type_${name}__`, statements: [] };
     }
+    // A type alias requires a body (`type Foo = …`). The bodyless form
+    // (`type Foo`, no `=`) has no meaning today — opaque/recursive aliases are
+    // unsupported (A14) — so report it clearly at the declaration, naming the
+    // alias and suggesting the fix, instead of letting it become a degenerate
+    // self-cycle whose only signal is a confusing "refers to itself" error at
+    // each use site. The alias is still registered below (with a `Never` body)
+    // so references resolve quietly rather than piling on cascade errors.
+    if (!hasBody) {
+      errors.push({
+        type: "Syntax",
+        message:
+          `A type alias requires a body; write \`type ${name} = …\` to define \`${name}\``,
+        ctx: spanOf(id),
+        code: 0,
+      });
+    }
     // Register the alias *before* parsing its body so a recursive reference
-    // inside it resolves (to a lazy `Alias` leaf, via `typeBuilding`). The
-    // bodyless form (`type Point`, no `=`) aliases the name to itself — a
-    // degenerate self-cycle `getConcreteType` reports cleanly when used (A14).
+    // inside it resolves (to a lazy `Alias` leaf, via `typeBuilding`). A bodyless
+    // declaration (already reported above) binds to `Never` so its use sites
+    // resolve without crashing and without a duplicate diagnostic.
     const entry: VLTypeType = {
       type: "Type",
-      subType: { type: "Alias", name },
+      subType: hasBody ? { type: "Alias", name } : { type: "Never" },
       // Carry the alias name on the `Type` node so display preserves it (D8).
       name,
     };
