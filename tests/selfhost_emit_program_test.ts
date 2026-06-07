@@ -245,7 +245,10 @@ const CASES: Case[] = [
   },
   {
     name: "a non-i32 local init fails loudly, not with garbage bytes",
-    src: 'function bad(): i32 {\n  let s = "hi"\n  return 0\n}\n',
+    // A float local is neither i32 nor a supported ref type (string locals ARE now
+    // supported — see the STRINGS cases below — so the old `let s = "hi"` no longer
+    // fails; a float literal stays out of scope).
+    src: "function bad(): i32 {\n  let s = 3.14\n  return 0\n}\n",
     check: (logs) => {
       const errLine = logs.find((l) => l.startsWith("err: "));
       if (!errLine) {
@@ -628,6 +631,130 @@ const CASES: Case[] = [
       if (!errLine.includes("i32[] arrays")) {
         throw new Error(`unexpected emitter error message: ${errLine}`);
       }
+    },
+  },
+  // ── strings ────────────────────────────────────────────────────────────────
+  // A VL string is CURRENTLY a WasmGC `array i32` of Unicode CODE POINTS (per
+  // `docs/strings-design.md`), so it REUSES the array slice's machinery: a string
+  // literal lowers to `array.new_fixed` over the SAME i32 array heap type, `.length`
+  // to `array.len` (a code-point count), and `s[i]` to `array.get` (an i32 code
+  // point). These prove real `WebAssembly.instantiate` over the VL-emitted GC bytes —
+  // source → arena → bytes → engine. A string value is a `(ref $array)`, so (like
+  // structs/arrays) it is NOT directly JS-callable; the proofs return i32s.
+  // Concatenation (`+`), equality (`==`), `slice`/`indexOf`, and the UTF-8 `array i8`
+  // storage migration (B7) are DEFERRED — out of scope for this slice.
+  {
+    name: 'a string literal\'s `.length` ("abc".length => 3)',
+    src: [
+      "function main(): i32 {",
+      '  let s = "abc"',
+      "  return s.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
+  {
+    name: 'indexing a string yields a code point ("abc"[1] => 98)',
+    src: [
+      "function main(): i32 {",
+      '  let s = "abc"',
+      "  return s[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 'b' is U+0062 = 98.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 98) throw new Error(`main() returned ${got}, expected 98`);
+    },
+  },
+  {
+    name: "a string-typed annotation (`let s: string = …`) indexes to a code point",
+    src: [
+      "function main(): i32 {",
+      '  let s: string = "VL"',
+      "  return s[0]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 'V' is U+0056 = 86.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 86) throw new Error(`main() returned ${got}, expected 86`);
+    },
+  },
+  {
+    name: "an escape decodes to its code point (`\"a\\nb\"[1]` => 10)",
+    src: [
+      "function main(): i32 {",
+      '  let s = "a\\nb"',
+      "  return s[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `\n` is U+000A = 10, and the literal has length 3 (a, newline, b).
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 10) throw new Error(`main() returned ${got}, expected 10`);
+    },
+  },
+  {
+    name: "sum a string's code points in a `while` loop (`\"abc\"` => 97+98+99 = 294)",
+    src: [
+      "function main(): i32 {",
+      '  let s = "abc"',
+      "  let sum = 0",
+      "  let i = 0",
+      "  while i < s.length {",
+      "    sum = sum + s[i]",
+      "    i = i + 1",
+      "  }",
+      "  return sum",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 294) throw new Error(`main() returned ${got}, expected 294`);
+    },
+  },
+  {
+    name: "a string passed INTO a helper, indexed through the param => 100",
+    src: [
+      "function firstCp(s: string): i32 {",
+      "  return s[0]",
+      "}",
+      "function main(): i32 {",
+      '  let g = "dog"',
+      "  return firstCp(g)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 'd' is U+0064 = 100.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 100) throw new Error(`main() returned ${got}, expected 100`);
+    },
+  },
+  {
+    name: "a string returned from a helper, then `.length` read => 5",
+    src: [
+      "function greet(): string {",
+      '  return "hello"',
+      "}",
+      "function main(): i32 {",
+      "  let s = greet()",
+      "  return s.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
     },
   },
 ];
