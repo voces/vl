@@ -274,6 +274,17 @@ export const parseProgram = (
    */
   const onInferredCycle = new Set<string>();
 
+  // ---- contextual parameter inference --------------------------------------
+  // A function-literal argument (`xs.map(function(n) n * 2)`) is parsed — and its
+  // body type-checked — eagerly, BEFORE the surrounding call resolves which
+  // parameter it fills. To type an UN-annotated lambda param from the expected
+  // callback type (`map` over `i32[]` expects `(i32) => U`), the call site
+  // resolves the callee/method signature FIRST, then publishes the per-argument
+  // expected types here so `parseFunctionDeclaration` can seed its unannotated
+  // params before walking the body. The hint is consumed (single-shot) by the
+  // very next function-literal parsed, so it does not leak into nested lambdas.
+  let expectedFnArgType: VLType | undefined;
+
   // A fresh bare `return` node — the fallback body for a malformed statement.
   // A factory (not a shared constant) so each use is a distinct AST node.
   const emptyReturn = (): VLReturnNode => ({
@@ -1029,6 +1040,54 @@ export const parseProgram = (
     return left;
   };
 
+  // Resolve the function signature a member call `o.<property>(…)` will dispatch
+  // to, following the SAME precedence the call uses (callable field → intrinsic
+  // list/map/set method → UFCS `self`-method). Returns the un-instantiated
+  // signature so its parameter types can drive contextual inference of a
+  // function-literal argument before the arguments are parsed. Returns undefined
+  // when no candidate matches (the call's own error path then handles it).
+  const memberCallSignature = (
+    objectType: VLType,
+    property: string,
+  ): VLType | undefined => {
+    let shape = objectType;
+    if (shape.type === "Infer") shape = shape.subType;
+    const field = shape.type === "Object"
+      ? shape.properties.find((p) =>
+        validateType(p.name, { type: "StringLiteral", value: property })
+      )?.type
+      : undefined;
+    if (field?.type === "Function") return field;
+    if (isListType(shape)) {
+      const member = listMemberType(arrayElementType(shape)!)[property];
+      if (member?.type === "Function") return member;
+    }
+    const kv = mapKeyValueType(shape);
+    if (kv) {
+      const setEl = setElementType(shape);
+      const member = setEl !== null
+        ? setMemberType(setEl)[property]
+        : mapMemberType(kv.key, kv.value)[property];
+      if (member?.type === "Function") return member;
+    }
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if (property in scopes[i]) {
+        const fn = scopes[i][property];
+        // UFCS shifts the explicit args by one: the receiver fills `self`, so the
+        // expected types for the parenthesised args start at index 1.
+        if (fn?.type === "Function" && fn.paramaters[0]?.name === "self") {
+          return {
+            type: "Function",
+            paramaters: fn.paramaters.slice(1),
+            return: fn.return,
+          };
+        }
+        break;
+      }
+    }
+    return undefined;
+  };
+
   /** `o.f(args)` — a callable field, a UFCS `self`-method, or an error. */
   const parseMemberCall = (object: VLExpression): VLExpression => {
     const objCtx = ctxOf(object);
@@ -1036,11 +1095,16 @@ export const parseProgram = (
     const id = next(); // ID
     const property = id.text;
     expect("LPAREN");
-    const args = parseArguments();
+    // Resolve the dispatched signature FIRST (the receiver is already parsed) so
+    // a function-literal argument can infer its param types from the expected
+    // callback type — contextual parameter inference for `xs.map(function(n) …)`.
+    const objectType = typeFromExpression(object, objCtx);
+    const expectedSig = memberCallSignature(objectType, property);
+    const args = parseArguments(
+      expectedSig?.type === "Function" ? expectedSig.paramaters : undefined,
+    );
     const close = expect("RPAREN");
     const ctx = between(objCtx, spanOf(close));
-
-    const objectType = typeFromExpression(object, objCtx);
 
     // 1. Field method (container/data): a callable field wins, no receiver.
     let shape = objectType;
@@ -1242,15 +1306,40 @@ export const parseProgram = (
     return arg;
   };
 
+  // The Function type expected at a given positional argument index, drawn from
+  // an already-resolved callee/method signature. Used for contextual parameter
+  // inference: when the argument is itself a function-literal, this is the
+  // expected callback type whose param types seed the lambda's unannotated holes.
+  // `undefined` means "no contextual hint for this position".
+  const expectedFnAt = (
+    params: VLParameterNode[] | undefined,
+    index: number,
+  ): VLType | undefined => {
+    if (!params) return undefined;
+    const p = params[index];
+    if (!p) return undefined;
+    let t = p.paramaterType;
+    while (t.type === "Infer") t = t.subType;
+    return t.type === "Function" ? t : undefined;
+  };
+
   /**
    * `arg (, arg)*` with an optional trailing comma, each `(ID COLON)? expr`.
    * Stops at the closing `)`. One trailing comma before `)` is allowed and
    * ignored (`f(a, b,)`); a doubled `,,` or a lone `,` in `()` still errors.
+   *
+   * `expectedParams` (when supplied) is the resolved callee/method parameter
+   * list; for each POSITIONAL argument we publish the matching Function-typed
+   * parameter via `expectedFnArgType` so a function-literal argument can infer
+   * its unannotated param types from the expected callback (contextual typing).
    */
-  const parseArguments = (): VLArgumentNode[] => {
+  const parseArguments = (
+    expectedParams?: VLParameterNode[],
+  ): VLArgumentNode[] => {
     const args: VLArgumentNode[] = [];
     skipNewlines();
     if (at("RPAREN")) return args;
+    let positional = 0;
     for (;;) {
       skipNewlines();
       const startTok = peek();
@@ -1260,8 +1349,15 @@ export const parseProgram = (
         next(); // COLON
         skipNewlines();
       }
+      // Contextual hint for an un-annotated function-literal argument: only for
+      // POSITIONAL args (a named arg's expected param is matched by name later,
+      // not by position — leaving the common case correct without that lookup).
+      const prevExpected = expectedFnArgType;
+      if (!name) expectedFnArgType = expectedFnAt(expectedParams, positional);
       const value = parseExpr();
+      expectedFnArgType = prevExpected;
       args.push(makeArgument(name, value, spanFrom(startTok)));
+      if (!name) positional++;
       skipNewlines();
       if (at("COMMA")) {
         next();
@@ -1389,7 +1485,17 @@ export const parseProgram = (
     const id = next(); // ID
     const name = id.text;
     expect("LPAREN");
-    const args = parseArguments();
+
+    // Forward/mutual call (A17): if `name` is a top-level function whose return
+    // is still an unresolved hole, infer its body on demand so this call sees the
+    // real return type rather than an `any`-collapsing empty hole. Resolved
+    // BEFORE the arguments so a function-literal argument can infer its param
+    // types from the expected parameter (contextual parameter inference).
+    const fnType = withResolvedReturn(name, getType(name, spanOf(id)));
+    recordUse(name, spanOf(id));
+    const args = parseArguments(
+      fnType.type === "Function" ? fnType.paramaters : undefined,
+    );
     const close = expect("RPAREN");
     const ctx = between(spanOf(id), spanOf(close));
 
@@ -1400,11 +1506,6 @@ export const parseProgram = (
       functionType: undefined,
     };
 
-    // Forward/mutual call (A17): if `name` is a top-level function whose return
-    // is still an unresolved hole, infer its body on demand so this call sees the
-    // real return type rather than an `any`-collapsing empty hole.
-    const fnType = withResolvedReturn(name, getType(name, spanOf(id)));
-    recordUse(name, spanOf(id));
     // Calling an unresolved inference hole infers the value is a function.
     if (fnType.type === "Infer" && fnType.subType.type === "Unknown") {
       const inferred: VLFunctionType = {
@@ -1823,9 +1924,40 @@ export const parseProgram = (
       );
     }
 
+    // Consume the contextual hint published by the surrounding call/assignment
+    // BEFORE walking params (so it is not re-applied to nested lambdas in this
+    // body or in a parameter default). `expected` is the expected callback type
+    // for THIS function-literal, or undefined when there is no context.
+    const expected = expectedFnArgType;
+    expectedFnArgType = undefined;
+
     expect("LPAREN");
     const { params: parameters, spans: paramSpans } = parseParams();
     expect("RPAREN");
+
+    // Contextual parameter inference (TS-style callback typing): seed any
+    // UN-annotated lambda param (`{Infer, Unknown}`) from the expected callback's
+    // param at the same position, so the body type-checks/codegens against the
+    // real type (`function(n) n * 2` over an `i32[]` → `n: i32`). An annotated
+    // param is left untouched; a missing expected param leaves the hole alone
+    // (reported below). Arity beyond the expected callback is simply not seeded.
+    if (expected?.type === "Function") {
+      for (let i = 0; i < parameters.length; i++) {
+        const p = parameters[i];
+        if (
+          p.paramaterType.type === "Infer" &&
+          p.paramaterType.subType.type === "Unknown"
+        ) {
+          const want = expected.paramaters[i]?.paramaterType;
+          if (want && want.type !== "Unknown") {
+            // Replace the hole with the expected concrete param type so the body
+            // walk (and codegen) see it. Use a fresh `Infer` wrapper carrying the
+            // expected subtype, matching how an annotated param is represented.
+            p.paramaterType = makeExact(want);
+          }
+        }
+      }
+    }
 
     let annotatedReturn: VLType | undefined;
     if (at("COLON")) {
@@ -1977,12 +2109,39 @@ export const parseProgram = (
         }
       }
 
-      for (const param of parameters) {
+      for (let i = 0; i < parameters.length; i++) {
+        const param = parameters[i];
         if (
           param.paramaterType.type === "Infer" &&
           param.paramaterType.subType.type !== "Unknown"
         ) {
           updateType(param.paramaterType, makeExact(param.paramaterType));
+        } else if (
+          // An ANONYMOUS function literal (a value, not a named declaration)
+          // whose param stayed an unresolved `Unknown` hole — no annotation and
+          // no contextual callback type to seed it. A named function's Unknown
+          // params are fine: they are first-class/polymorphic and monomorphized
+          // per call site (`function apply(fn, x) fn(x)`). An anonymous literal
+          // used as a value cannot be specialized that way, so its `Unknown`
+          // would reach codegen as the cryptic "Unhandled Unknown type" crash —
+          // report a clear, actionable error here instead. (Generic literals
+          // carry `typeParams`, whose holes are intentionally `Unknown`.)
+          name === undefined &&
+          typeParams.length === 0 &&
+          param.paramaterType.type === "Infer" &&
+          param.paramaterType.subType.type === "Unknown"
+        ) {
+          errors.push({
+            type: "Syntax",
+            message: `cannot infer a type for parameter \`${param.name}\`: no ` +
+              `contextual type is available here — annotate it (\`${param.name}` +
+              `: <type>\`)`,
+            ctx: paramSpans[i] ?? spanFrom(fnTok),
+            code: 0,
+          });
+          // Pin to a concrete placeholder so a downstream codegen of the
+          // error-laden program does not crash on the bare `Unknown`.
+          updateType(param.paramaterType, { type: "Never" });
         }
       }
 
