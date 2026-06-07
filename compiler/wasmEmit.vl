@@ -248,6 +248,182 @@ function buildIdentityModule(): i32 {
   0
 }
 
+// ── AST-driven back end ──────────────────────────────────────────────────────
+// The fixed-module builders above prove the byte machinery on hand-built bytes.
+// `emitProgram` is the first slice that actually READS the parsed arena
+// (`P.nodes`, the `Node[]` from `compiler/ast.vl` that `parser.vl` fills) and
+// emits a real module from it — reusing every section / LEB / encoding helper.
+//
+// It handles exactly the trivial shape and nothing else:
+//
+//   function main(): i32 { return <integer literal> }
+//
+// Anything outside that shape is a HARD STOP: `emitFail` records a message and
+// clears the buffer, so the driver/test sees an empty module (which never
+// instantiates) plus an explanation — never silently-wrong bytes. Richer codegen
+// (params, locals, real expressions, multiple functions) is the next slice.
+
+// The unsupported-shape state. `emitFailed` is the set flag (a `boolean`, which
+// widens on reassignment the way `true`/`false`-toggled flags do throughout the
+// parser; a bare-`0`/`1` i32 global pins to the literal type and won't reassign);
+// `emitErr` carries the first message. Both are top-level mutable `let`s — they
+// lower to wasm globals readable from any helper.
+let emitFailed = false
+let emitErr = ""
+
+// Record an unsupported-shape failure: keep the first message and drop any bytes
+// emitted so far, so a partial/garbage module can never reach instantiation.
+// Returns -1, the sentinel `emitProgram` propagates so callers can branch on it.
+function emitFail(msg: string): i32 {
+  if !emitFailed {
+    emitFailed = true
+    emitErr = msg
+  }
+  W.bytes = []
+  0 - 1
+}
+
+// Parse a non-negative decimal integer lexeme (a `NumLit.numText`) into its i32
+// value. The lexer only ever stores digit runs in `numText` for an integer
+// literal, so each `text[i]` is a `'0'`..`'9'` char code; `text[i] - '0'` is its
+// digit value (the same idiom `lexer.vl` uses to classify digits).
+function parseI32(text: string): i32 {
+  let v = 0
+  let i = 0
+  while i < text.length {
+    v = v * 10 + (text[i] - '0')
+    i = i + 1
+  }
+  v
+}
+
+// Emit a complete `() -> i32` module exporting `name`, whose body is the single
+// instruction `i32.const value`. This is `buildConstModule` generalized over the
+// export name and the constant — every section is framed through the SAME helpers
+// the fixed builders use; only the name bytes and the literal differ.
+function emitConstFunc(name: string, value: i32): i32 {
+  emitReset()
+  emitHeader()
+
+  // Type section (id 1): one functype () -> i32.
+  let typePayload: i32[] = []
+  typePayload.push(1)      // 1 type
+  typePayload.push(96)     // 0x60 func
+  typePayload.push(0)      // 0 params
+  typePayload.push(1)      // 1 result
+  typePayload.push(127)    // 0x7f i32
+  emitSection(1, typePayload)
+
+  // Function section (id 3): one function, type index 0.
+  let funcPayload: i32[] = []
+  funcPayload.push(1)      // 1 function
+  funcPayload.push(0)      // type index 0
+  emitSection(3, funcPayload)
+
+  // Export section (id 7): export `name` as func 0. The name is a UTF-8 byte vec;
+  // for an ASCII identifier each `name[i]` char code IS its single UTF-8 byte.
+  let exportPayload: i32[] = []
+  exportPayload.push(1)            // 1 export
+  exportPayload.push(name.length)  // name length
+  let ci = 0
+  while ci < name.length {
+    exportPayload.push(name[ci])
+    ci = ci + 1
+  }
+  exportPayload.push(0)    // export kind: func
+  exportPayload.push(0)    // func index 0
+  emitSection(7, exportPayload)
+
+  // Code section (id 10): one body — no locals, `i32.const value`, `end`.
+  let body: i32[] = []
+  body.push(0)             // 0 local declarations
+  body.push(65)            // 0x41 i32.const
+  appendAll(body, slebToArr(value))
+  body.push(11)            // 0x0b end
+
+  let codePayload: i32[] = []
+  codePayload.push(1)      // 1 code entry
+  appendAll(codePayload, ulebToArr(body.length))
+  appendAll(codePayload, body)
+  emitSection(10, codePayload)
+  0
+}
+
+// Walk the arena from `rootIx` and emit the module for `function main(): i32 {
+// return <integer literal> }`. Returns 0 on success; on any unsupported shape it
+// calls `emitFail` (leaving `emitErr` set and the buffer empty) and returns -1.
+//
+// Node shapes read (all from `compiler/ast.vl`):
+//   Program  { progStmts: i32[] }   — top-level statements; scanned for `main`.
+//   FuncDecl { fnName, fnParams: i32[], fnRet: i32, fnBody: i32 }
+//   Block    { blkStmts: i32[] }    — the function body.
+//   RetStmt  { retArg: i32 }        — the single statement; its arg is the value.
+//   NumLit   { numText: string }    — the integer literal returned.
+function emitProgram(rootIx: i32): i32 {
+  emitFailed = false
+  emitErr = ""
+  if rootIx < 0 {
+    return emitFail("emitProgram: empty arena (root index < 0)")
+  }
+  let root = P.nodes[rootIx]
+  if root is Program {
+    // Find the `main` FuncDecl among the top-level statements. (`is`-narrowing
+    // is sound only in the positive arm, so every shape check is a positive
+    // `is` test with the unsupported case in its `else`.)
+    let stmts = root.progStmts
+    let mainIx = -1
+    let si = 0
+    while si < stmts.length {
+      let s = P.nodes[stmts[si]]
+      if s is FuncDecl {
+        if s.fnName == "main" {
+          mainIx = stmts[si]
+        }
+      }
+      si = si + 1
+    }
+    if mainIx < 0 {
+      return emitFail("emitProgram: no top-level function named 'main'")
+    }
+    return emitMain(mainIx)
+  }
+  emitFail("emitProgram: root node is not a Program")
+}
+
+// Emit the module for the `main` FuncDecl at `fnIx` (already located). Split out
+// so each nested shape check narrows in its own positive `is` arm.
+function emitMain(fnIx: i32): i32 {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    // Trivial slice only: no parameters.
+    if fn.fnParams.length != 0 {
+      return emitFail("emitProgram: 'main' must take no parameters")
+    }
+    let body = P.nodes[fn.fnBody]
+    if body is Block {
+      // Exactly one statement: a `return <NumLit>`.
+      if body.blkStmts.length != 1 {
+        return emitFail("emitProgram: 'main' body must be a single statement")
+      }
+      let stmt = P.nodes[body.blkStmts[0]]
+      if stmt is RetStmt {
+        if stmt.retArg < 0 {
+          return emitFail("emitProgram: 'main' return needs a value")
+        }
+        let arg = P.nodes[stmt.retArg]
+        if arg is NumLit {
+          emitConstFunc("main", parseI32(arg.numText))
+          return 0
+        }
+        return emitFail("emitProgram: 'main' must return an integer literal")
+      }
+      return emitFail("emitProgram: 'main' body must be a return statement")
+    }
+    return emitFail("emitProgram: 'main' has no block body")
+  }
+  emitFail("emitProgram: 'main' is not a function declaration")
+}
+
 // Render the current buffer as a comma-joined decimal string (the round-trip
 // wire format the TS test parses back into a Uint8Array).
 function bytesToStr(): string {
