@@ -31,10 +31,15 @@ const splitLines = (source: string): string[] => source.split("\n");
  * Quick-fix for an `unused-variable` diagnostic: insert a leading `_` at the
  * identifier start, marking it intentionally unused. The diagnostic `range`
  * starts at the identifier, so a zero-width insert there is exact and robust.
+ *
+ * This is the SAFE default for an unused binding (it never deletes code), so it
+ * is the `isPreferred` fix — the one VS Code's "Auto Fix" command applies — while
+ * `removeBindingFix` stays a non-preferred, manually-chosen alternative.
  */
 export const prefixWithUnderscoreFix = (range: LspRange): QuickFix => ({
   title: "Prefix with `_`",
   kind: "quickfix",
+  isPreferred: true,
   edits: [{
     range: { start: range.start, end: range.start },
     newText: "_",
@@ -103,6 +108,56 @@ export const letToConstFix = (
       newText: "const",
     }],
   };
+};
+
+/**
+ * A lint diagnostic reduced to the fields code-action discovery needs: its
+ * stable `code`, `source`, and `range`. Both the editor-supplied diagnostics and
+ * the server's cached `VLDiagnostic`s structurally satisfy this shape.
+ */
+export type FixableDiagnostic = {
+  code?: string | number;
+  source?: string;
+  range: LspRange;
+};
+
+/** Whether two ranges share any physical line. */
+const rangeLinesOverlap = (a: LspRange, b: LspRange): boolean =>
+  a.start.line <= b.end.line && a.end.line >= b.start.line;
+
+/**
+ * The set of `vital` lint diagnostics to offer fixes for in `onCodeAction`,
+ * given the editor-supplied diagnostics (pre-filtered to the requested range)
+ * and the server's most-recently-cached diagnostics for the document.
+ *
+ * The editor-supplied set is primary; we additionally surface any cached `vital`
+ * diagnostic whose range line overlaps `requestRange`, so a fix is still offered
+ * when the cursor sits on the binding's line but off the diagnostic's exact range
+ * (e.g. on the variable name while `prefer-const` points at the `let` keyword).
+ * De-duplicated by `code` + range so a diagnostic in both sources is offered once.
+ */
+export const fixableDiagnosticsForRange = <D extends FixableDiagnostic>(
+  contextDiagnostics: D[],
+  cachedDiagnostics: D[],
+  requestRange: LspRange,
+): D[] => {
+  const result: D[] = [];
+  const seen = new Set<string>();
+  const key = (d: D) =>
+    `${d.code}:${d.range.start.line}:${d.range.start.character}:` +
+    `${d.range.end.line}:${d.range.end.character}`;
+  const add = (d: D) => {
+    if (d.source !== "vital") return;
+    const k = key(d);
+    if (seen.has(k)) return;
+    seen.add(k);
+    result.push(d);
+  };
+  for (const d of contextDiagnostics) add(d);
+  for (const d of cachedDiagnostics) {
+    if (rangeLinesOverlap(d.range, requestRange)) add(d);
+  }
+  return result;
 };
 
 /**

@@ -32,7 +32,10 @@ import {
   VLSeverity,
 } from "../../compiler/compile.ts";
 import { format } from "../../compiler/format.ts";
-import { quickFixesForDiagnostic } from "./codeActions.ts";
+import {
+  fixableDiagnosticsForRange,
+  quickFixesForDiagnostic,
+} from "./codeActions.ts";
 import type { Context } from "../../compiler/ast.ts";
 import { tokenize } from "../../compiler/lexer.ts";
 import {
@@ -80,6 +83,16 @@ const tagMap: Record<VLDiagnosticTag, DiagnosticTag> = {
   deprecated: DiagnosticTag.Deprecated,
 };
 
+// Most-recently-computed VL lint diagnostics per document URI. `onCodeAction`
+// only receives the diagnostics VS Code pre-filtered to the requested range in
+// `params.context.diagnostics`; when the cursor sits off a diagnostic's exact
+// range (e.g. on the variable name while the `prefer-const` range is on the `let`
+// keyword) that diagnostic is absent and no fix would be offered. We cache the
+// diagnostics here as they're published so `onCodeAction` can additionally
+// surface fixes for any cached `vital` diagnostic on a line overlapping the
+// request — purely additive discoverability over the editor-supplied set.
+const diagnosticsByUri = new Map<string, VLDiagnostic[]>();
+
 const toLspDiagnostic = (d: VLDiagnostic): Diagnostic => ({
   message: d.message,
   severity: severityMap[d.severity],
@@ -100,6 +113,11 @@ documents.onDidChangeContent(async (event) => {
   // change executed arbitrary program logic on each keystroke — e.g. an infinite
   // loop would hang the server.)
   const { diagnostics } = await compile(event.document.getText());
+
+  // Cache the raw VL diagnostics (which carry `code`/`range`/`source`) so
+  // `onCodeAction` can offer fixes by line overlap, not just for the exact
+  // diagnostics VS Code passes back.
+  diagnosticsByUri.set(event.document.uri, diagnostics);
 
   connection.sendDiagnostics({
     uri: event.document.uri,
@@ -412,16 +430,25 @@ connection.onDocumentFormatting((params): TextEdit[] => {
 // diagnostics overlapping the cursor/selection in `params.context.diagnostics`;
 // we key off each diagnostic's stable `code` and precise `range` to compute
 // plain text edits (see `codeActions.ts`), then wrap them in `CodeAction` +
-// `WorkspaceEdit` envelopes. Only `vital`-sourced lint diagnostics with a
-// known code yield actions; everything else is ignored.
+// `WorkspaceEdit` envelopes. We also fold in cached `vital` diagnostics on an
+// overlapping line, so a fix is still offered when the cursor sits off the
+// diagnostic's exact range. Only `vital`-sourced lint diagnostics with a known
+// code yield actions; everything else is ignored.
 connection.onCodeAction((params): CodeAction[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const source = doc.getText();
   const uri = params.textDocument.uri;
+
+  const cached = (diagnosticsByUri.get(uri) ?? []).map(toLspDiagnostic);
+  const diagnostics = fixableDiagnosticsForRange(
+    params.context.diagnostics,
+    cached,
+    params.range,
+  );
+
   const actions: CodeAction[] = [];
-  for (const diag of params.context.diagnostics) {
-    if (diag.source !== "vital") continue;
+  for (const diag of diagnostics) {
     const fixes = quickFixesForDiagnostic(source, diag.code, diag.range);
     for (const fix of fixes) {
       actions.push({
