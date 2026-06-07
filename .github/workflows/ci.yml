@@ -10,14 +10,65 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Fetch enough history for `git diff` to compare against the base.
+          # On push events base_sha is available; on PRs we need the base ref.
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------------------
+      # Docs-only gate
+      #
+      # Detect whether every changed file matches *.md or docs/**. If so, the
+      # heavy steps below are skipped and the job still exits green — which keeps
+      # any required "ci" status check satisfied without blocking merges.
+      #
+      # We intentionally do NOT use top-level `paths`/`paths-ignore` to skip the
+      # whole workflow: that would leave the required check in a permanent "pending"
+      # state for docs-only PRs and block merges. The in-job conditional approach
+      # keeps the job name stable so branch protection is never broken.
+      #
+      # On `pull_request` events we diff the PR head against its base branch.
+      # On `push` events we diff against the previous commit (BEFORE~1..AFTER).
+      # ---------------------------------------------------------------------------
+      - name: Detect docs-only change
+        id: docs_check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.event.after }}"
+          fi
+
+          # Fall back to HEAD~1 if before-sha is the all-zeros sha (first push
+          # to a new branch) or empty.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE="HEAD~1"
+          fi
+
+          # List files changed between base and head. Filter to only non-docs files.
+          NON_DOCS=$(git diff --name-only "$BASE" "$HEAD" \
+            | grep -Ev '^(docs/|.*\.md$)' || true)
+
+          if [ -z "$NON_DOCS" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "Docs-only change detected — heavy steps will be skipped."
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Non-docs files changed:"
+            echo "$NON_DOCS"
+          fi
 
       - uses: denoland/setup-deno@v2
+        if: steps.docs_check.outputs.docs_only != 'true'
         with:
           deno-version: v2.x
 
       # The LSP bundle is built with esbuild over node-resolved deps (binaryen,
       # vscode-languageserver*), so Node + node_modules are needed for that step.
       - uses: actions/setup-node@v5
+        if: steps.docs_check.outputs.docs_only != 'true'
         with:
           node-version: 22
           cache: npm
@@ -25,6 +76,7 @@ jobs:
       # Deno's module cache (esbuild, the jsr loader, std) — keyed on the lockfile
       # so it's reused until a dependency moves.
       - name: Cache Deno modules
+        if: steps.docs_check.outputs.docs_only != 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/deno
@@ -41,6 +93,7 @@ jobs:
       # so a feature-add PR reuses master's optimize results for every module whose
       # output is unchanged — the bulk of the self-host test cost.
       - name: Cache VL build cache
+        if: steps.docs_check.outputs.docs_only != 'true'
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/vl-cache
@@ -49,15 +102,19 @@ jobs:
             vl-cache-${{ runner.os }}-
 
       - name: Install node deps
+        if: steps.docs_check.outputs.docs_only != 'true'
         run: npm ci
 
       - name: Type-check (compiler + test runner)
+        if: steps.docs_check.outputs.docs_only != 'true'
         run: deno check compiler/*.ts tests/cases_test.ts
 
       - name: Lint
+        if: steps.docs_check.outputs.docs_only != 'true'
         run: deno lint
 
       - name: Test (.vl corpus)
+        if: steps.docs_check.outputs.docs_only != 'true'
         run: deno task test
         # `runner.temp` is a step-level context, so set the cache dir here (not in
         # job-level env, where the runner context isn't available).
@@ -65,5 +122,6 @@ jobs:
           VL_CACHE_DIR: ${{ runner.temp }}/vl-cache
 
       - name: Build LSP bundle (verify it compiles)
+        if: steps.docs_check.outputs.docs_only != 'true'
         run: deno task build
         working-directory: lsp
