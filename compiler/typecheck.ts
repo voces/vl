@@ -1239,15 +1239,43 @@ export const _flattenType = (type: VLType): VLType[] => {
 };
 
 // The builtin scalar name a type resolves to (`i32`/`f64`/`boolean`/…), or
-// undefined for a non-scalar.
+// undefined for a non-scalar. Memoized by type-node identity: it is a pure
+// function of the node, and it is on the hot path of `ensureType` (the numeric
+// coercion check softens BOTH operands of every assignability test). Softening
+// rebuilds object/alias structure, so re-running it on the same shared type nodes
+// dominated typecheck time (~3× on the self-host module) until this cache.
 const SCALARS = ["i32", "i64", "f32", "f64", "boolean"];
+const scalarNameCache = new WeakMap<VLType, string | null>();
 const scalarName = (type: VLType): string | undefined => {
+  // Fast path: the structural compounds never resolve to a builtin scalar name —
+  // skip the (allocating, structure-rebuilding) soften entirely.
+  if (
+    type.type === "Union" || type.type === "Nullable" ||
+    type.type === "Function" || type.type === "Intersection" ||
+    type.type === "Negation"
+  ) {
+    return undefined;
+  }
+  // Cache by node identity — but NOT for inference holes (`Unknown`/`Infer`):
+  // those resolve through `getConcreteType` differently as inference progresses
+  // (an `Unknown` can later become `f64`), so a cached early "not a scalar" would
+  // wrongly stick and skip a numeric narrowing check. Named/structural nodes
+  // (`Alias`/`Object`/`Custom`/`Type`/literals) are stable — and the expensive
+  // case (softening a big `Object`) is exactly one of those, so the cache still
+  // removes the hot cost while staying sound.
+  const cacheable = type.type !== "Unknown" && type.type !== "Infer";
+  if (cacheable) {
+    const hit = scalarNameCache.get(type);
+    if (hit !== undefined) return hit === null ? undefined : hit;
+  }
   let t = softenImplicitType(type);
   while (t.type === "Infer") t = softenImplicitType(t.subType);
   const n = (t.type === "Object" || t.type === "Alias" || t.type === "Custom")
     ? t.name
     : undefined;
-  return n && SCALARS.includes(n) ? n : undefined;
+  const result = n && SCALARS.includes(n) ? n : undefined;
+  if (cacheable) scalarNameCache.set(type, result ?? null);
+  return result;
 };
 // The builtin NUMERIC scalar a type resolves to (`i32`/`i64`/`f32`/`f64`), or
 // undefined for `boolean`/non-scalars. `boolean` is excluded: it shares the i32
