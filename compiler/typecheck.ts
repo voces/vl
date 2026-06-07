@@ -756,6 +756,31 @@ export const _softenImplicitType = (type: VLType): VLType => {
 export const softenImplicitType = (type: VLType): VLType =>
   getConcreteType(_softenImplicitType(type), undefined);
 
+// A literal type carries a single inhabitant: `0` (IntegerLiteral), `"x"`
+// (StringLiteral), `3.14` (RealLiteral), `true` (BooleanLiteral).
+const isLiteralType = (type: VLType): boolean =>
+  type.type === "IntegerLiteral" || type.type === "StringLiteral" ||
+  type.type === "RealLiteral" || type.type === "BooleanLiteral";
+
+// The inferred type of an un-annotated binding, given the binding's mutability.
+//
+// A `let` (mutable) binding is reassignable, so its initializer's *literal* type
+// widens to the literal's base (`0` → `i32`, `""` → `string`, `true` →
+// `boolean`): a later `n = 1` must type-check against the cell, not against the
+// initializer's singleton. This matches the JS/TS binding semantics this
+// language adopted (`const` immutable, `let` reassignable).
+//
+// A `const` (immutable) binding cannot be rebound, so it KEEPS the narrow
+// literal type (`const n = 0` stays `0`) — the value is exactly known. Non-
+// literal inferred types (an empty `[]`, a `Map()`/`Set()` hole, a structural
+// object whose field literals widen) still soften, so the "cannot infer …
+// annotate" diagnostic and nested widening behave identically for both keywords.
+//
+// Annotated bindings never reach here — an explicit annotation is the declared
+// type verbatim and is never silently widened.
+export const widenBindingType = (type: VLType, mutable: boolean): VLType =>
+  mutable || !isLiteralType(type) ? softenImplicitType(type) : type;
+
 // If `type` is an array — a structural object carrying an `i32`-keyed index
 // signature (`{[i32]: T}`) — return its element type `T`, else null. This is
 // what marks a value as an array (→ WasmGC array) rather than a struct, shared
@@ -1944,6 +1969,12 @@ export const thenNarrowings = (cond: VLExpression): Narrowing[] => {
     return [...thenNarrowings(cond.left), ...thenNarrowings(cond.right)];
   }
   if (cond.type === "BinaryOperation" && cond.operator === "||") return [];
+  // `!(c)` is true exactly when `c` is false — its then-facts are `c`'s
+  // else-facts (De Morgan). This lets a negated guard (`!(x is T)`) narrow the
+  // same way `x is T`'s else branch would, for any guard atom.
+  if (cond.type === "UnaryOperation" && cond.operator === "!") {
+    return elseNarrowings(cond.operand);
+  }
   const f = atomFact(cond);
   if (!f) return [];
   return [...optionalChainThenFacts(f.place), ...factNarrowing(f, "then")];
@@ -1958,6 +1989,12 @@ export const elseNarrowings = (cond: VLExpression): Narrowing[] => {
     return [...elseNarrowings(cond.left), ...elseNarrowings(cond.right)];
   }
   if (cond.type === "BinaryOperation" && cond.operator === "&&") return [];
+  // `!(c)` is false exactly when `c` is true — its else-facts are `c`'s
+  // then-facts (De Morgan). So the fall-through after `if !(x is T) { return }`
+  // narrows `x` to `T`, mirroring the positive `if x is T { … }` branch.
+  if (cond.type === "UnaryOperation" && cond.operator === "!") {
+    return thenNarrowings(cond.operand);
+  }
   const f = atomFact(cond);
   if (!f || isOptionalChain(f.place)) return [];
   return factNarrowing(f, "else");

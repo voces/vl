@@ -39,7 +39,10 @@ Deno.test("inlay: an annotated let gets NO hint", () => {
 });
 
 Deno.test("inlay: a const annotation is suppressed too", () => {
-  assertEquals(hintsFor("const a = 1\nconst b: i32 = 2\n"), ["a: i32"]);
+  // `const a` is inferred — an immutable binding keeps the narrow literal type
+  // (`1`, not the widened `i32` a reassignable `let` would get); `b` is
+  // annotated, so its hint is suppressed.
+  assertEquals(hintsFor("const a = 1\nconst b: i32 = 2\n"), ["a: 1"]);
 });
 
 Deno.test("inlay: whitespace before the annotation colon is still detected", () => {

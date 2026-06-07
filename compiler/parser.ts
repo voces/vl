@@ -43,6 +43,7 @@ import {
   typeFromStatement,
   updateType,
   validateType,
+  widenBindingType,
   withNarrowings,
 } from "./typecheck.ts";
 import { errors, flow, guards, narrowedPaths, scopes } from "./state.ts";
@@ -190,7 +191,7 @@ export const parseProgram = (
    * mutability only — mutating the data behind the name (`o.x = …`, `a[i] = …`)
    * is a separate axis and stays legal regardless of how the name was declared.
    */
-  const checkRebind = (name: string, ctx: Context): void => {
+  const checkRebind = (name: string, ctx: Context): boolean => {
     const binding = resolveBinding(name);
     if (binding && binding.kind === "variable" && binding.mutable === false) {
       errors.push({
@@ -200,7 +201,9 @@ export const parseProgram = (
         ctx,
         code: 0,
       });
+      return true;
     }
+    return false;
   };
   /** Record a use of `name` at `span`, resolved through the scope stack. */
   const recordUse = (name: string, span: Context): void => {
@@ -1120,6 +1123,17 @@ export const parseProgram = (
     // 1. Field method (container/data): a callable field wins, no receiver.
     let shape = objectType;
     if (shape.type === "Infer") shape = shape.subType;
+    // A literal receiver (`"hi".slice(…)`, or a `const s = "hi"` binding that
+    // kept its narrow `StringLiteral` type) dispatches like its base type: a
+    // literal carries no methods of its own, but its base (`string`, `i32`, …)
+    // does. Soften it so the intrinsic method resolves — mirroring `getChildType`
+    // and the `PropertyAccess` member-read path, which already soften here.
+    if (
+      shape.type === "StringLiteral" || shape.type === "IntegerLiteral" ||
+      shape.type === "RealLiteral" || shape.type === "BooleanLiteral"
+    ) {
+      shape = softenImplicitType(shape);
+    }
     const fieldType = shape.type === "Object"
       ? shape.properties.find((p) =>
         validateType(p.name, { type: "StringLiteral", value: property })
@@ -2488,6 +2502,7 @@ export const parseProgram = (
     }
 
     // Simple `name = …`.
+    let constRebind = false;
     if (left.type !== "Name") {
       errors.push({
         type: "Syntax",
@@ -2495,7 +2510,7 @@ export const parseProgram = (
         ctx: ctxOf(left),
         code: 0,
       });
-    } else checkRebind(left.name, ctxOf(left));
+    } else constRebind = checkRebind(left.name, ctxOf(left));
     const leftCtx = ctxOf(left);
     // Mark the LHS name's occurrence (recorded as a use during precedence
     // climbing) as an assignment *write* target, so the lint pass can tell a
@@ -2506,7 +2521,11 @@ export const parseProgram = (
       ? { type: "BinaryOperation", left, right: rawRight, operator }
       : rawRight;
     const rightType = typeFromExpression(right, rightCtx);
-    ensureType(leftType, rightType, rightCtx);
+    // A `const` rebind is already rejected on the mutability axis — the binding
+    // keeps its narrow inferred type (`const x = 1` is `1`), so an additional
+    // "expected 1, got 2" on the RHS would be redundant noise on code that is
+    // illegal regardless of the value. Report the rebind alone.
+    if (!constRebind) ensureType(leftType, rightType, rightCtx);
     if (leftType.type === "Infer") updateType(leftType, makeExact(leftType));
     return record({
       type: "BinaryOperation",
@@ -2552,7 +2571,7 @@ export const parseProgram = (
     if (node.value) {
       const valType = typeFromExpression(node.value, valueCtx ?? spanOf(id));
       if (!annotated) {
-        node.variableType = softenImplicitType(valType);
+        node.variableType = widenBindingType(valType, mutable);
         // No annotation AND no resolving context: a construct whose type is taken
         // from context (an empty `[]`, a `Map()`/`Set()`) left an unresolved
         // inference hole. Report it as a clean "cannot infer … annotate" error
