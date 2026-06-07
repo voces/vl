@@ -102,8 +102,16 @@ const findProjectRoot = (startDir: string): string | undefined => {
 // install, dev host, or packaged), which `context.extensionPath` is not.
 const registerRunCommand = (context: ExtensionContext) => {
   let terminal: Terminal | undefined;
+  // Track the cwd the terminal was opened in: the terminal's working directory
+  // is fixed at creation time, so if the resolved project root changes (e.g.
+  // the user switches to a file from a different vl repo), we must dispose and
+  // recreate the terminal rather than reusing one anchored to the wrong root.
+  let terminalCwd: string | undefined;
   Window.onDidCloseTerminal((closed) => {
-    if (closed === terminal) terminal = undefined;
+    if (closed === terminal) {
+      terminal = undefined;
+      terminalCwd = undefined;
+    }
   });
 
   const run = async () => {
@@ -124,6 +132,14 @@ const registerRunCommand = (context: ExtensionContext) => {
     const cwd = (docDir && findProjectRoot(docDir)) ??
       (folder && findProjectRoot(folder)) ??
       path.dirname(context.extensionPath);
+    // If the resolved root changed, the existing terminal is anchored to the
+    // wrong directory — dispose it so the recreate branch below runs with the
+    // correct cwd.
+    if (terminal && terminalCwd !== cwd) {
+      terminal.dispose();
+      terminal = undefined;
+      terminalCwd = undefined;
+    }
     // Run the buffer as-is, with no save side effect: an untitled or unsaved
     // (dirty) document has no usable on-disk path, so mirror its current text to
     // a reused temp file. A clean, saved file runs by its real path (accurate
@@ -135,7 +151,10 @@ const registerRunCommand = (context: ExtensionContext) => {
     } else {
       file = doc.uri.fsPath;
     }
-    if (!terminal) terminal = Window.createTerminal({ name: "Vital", cwd });
+    if (!terminal) {
+      terminal = Window.createTerminal({ name: "Vital", cwd });
+      terminalCwd = cwd;
+    }
     terminal.show(true);
     terminal.sendText(`deno task run "${file}"`);
   };
