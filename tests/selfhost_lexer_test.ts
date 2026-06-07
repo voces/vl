@@ -1,32 +1,43 @@
 // Runs the VL-in-VL lexer (`compiler/lexer.vl`) through the real VL toolchain and
-// checks the token stream it produces. VL has no module system yet, so the lexer
-// source is concatenated ahead of a `.vl` driver, compiled to wasm and run, and the
-// captured log is diffed against the expected token list.
+// checks the token stream it produces.
 //
 // This is the proof the self-hosted lexer compiles and runs end to end. It exercises
 // the dropped H2 workarounds directly: positions render with the real `toString`, and
 // `\x41` / `\u{…}` escapes decode via `fromCodePoint`.
 //
-// PERF (compile-once): the cases all compile the same `lexer.vl` base and differ only
-// in their driver. Rather than recompile per case, they share ONE compile: each case
-// runs in its own function (so its `let`s don't collide), `tokenize` is stateless so
-// no reset is needed, and a `@@N` sentinel line separates cases in the log for the
-// host to split. The sample case reads its driver from the standalone fixture
+// REAL MODULES: `lexer.vl` `export`s `tokenize`, so this harness drives it through the
+// module graph driver (`compileProgram`) instead of concatenating the source. An in-
+// memory DRIVER module imports `tokenize` from `./lexer`.
+//
+// PERF (compile-once): the cases all compile the same module graph and differ only in
+// their driver. Rather than recompile per case, they share ONE compile: each case runs
+// in its own function (so its `let`s don't collide), `tokenize` is stateless so no
+// reset is needed, and a `@@N` sentinel line separates cases in the log for the host
+// to split. The sample case reads its driver from the standalone fixture
 // (`tests/selfhost/lexer_harness.vl`) verbatim at runtime.
 
-import { runWasm } from "../compiler/compile.ts";
-import { compileCached } from "./_selfhost_cache.ts";
+import { compileProgram, runWasm } from "../compiler/compile.ts";
+import { createOptimizeCache } from "../compiler/buildCache.ts";
+
+const optimizeCache = createOptimizeCache();
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
   const e = JSON.stringify(expected, null, 2);
-  if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+  if (a !== e) {
+    throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+  }
 };
 
 const read = (rel: string) =>
   Deno.readTextFileSync(new URL(rel, import.meta.url));
 
-const lexer = read("../compiler/lexer.vl");
+// Resolved keys for the on-disk lexer module + the in-memory driver (its `./lexer`
+// specifier resolves to the real `…/lexer.vl` sibling).
+const compilerUrl = (name: string) =>
+  new URL(`../compiler/${name}`, import.meta.url).pathname;
+const LEXER = compilerUrl("lexer.vl");
+const DRIVER = compilerUrl("__lexer_driver__.vl");
 
 type Case = { name: string; body: string; expected: string[] };
 
@@ -179,16 +190,31 @@ print(uc.diags[0].msg)
   },
 ];
 
-// One compile: each case runs in its own function (scopes its `let`s); a `@@N`
-// sentinel precedes each case's output so the host can split the shared log.
-const driver = CASES.map((c, i) => `function lcase${i}(): i32 {\n${c.body}\n0\n}`)
-  .join("\n") + "\n" +
+// One compile: the driver module opens with `import { tokenize } from "./lexer"`, then
+// each case runs in its own function (scopes its `let`s); a `@@N` sentinel precedes
+// each case's output so the host can split the shared log.
+const driver = `import { tokenize } from "./lexer"\n\n` +
+  CASES.map((c, i) => `function lcase${i}(): i32 {\n${c.body}\n0\n}`)
+    .join("\n") +
+  "\n" +
   CASES.map((_, i) => `print("@@${i}")\nlcase${i}()`).join("\n") + "\n";
 
 let allLogs: Promise<Map<number, string[]>> | undefined;
 const runAll = (): Promise<Map<number, string[]>> =>
   allLogs ??= (async () => {
-    const { wasm, diagnostics } = await compileCached(lexer + "\n" + driver);
+    const sources: Record<string, string> = {
+      [DRIVER]: driver,
+      [LEXER]: Deno.readTextFileSync(LEXER),
+    };
+    const readSource = (key: string): string | undefined => sources[key];
+    const { wasm, diagnostics } = await compileProgram(
+      DRIVER,
+      readSource,
+      DRIVER,
+      {
+        optimizeCache: await optimizeCache,
+      },
+    );
     const errors = diagnostics.filter((d) => d.severity === "error");
     if (errors.length > 0 || !wasm) {
       throw new Error(

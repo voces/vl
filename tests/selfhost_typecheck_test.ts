@@ -1,12 +1,19 @@
 // Runs the VL-in-VL type-checker (`compiler/typecheck.vl`, over the `compiler/ast.vl`
 // node arena built by `compiler/parser.vl`) through the real VL toolchain and checks
-// the diagnostics it produces. VL has no module system yet, so the sources are
-// concatenated ahead of a `.vl` print-driver, compiled to wasm, and run; the captured
-// log is diffed against the expected diagnostics.
+// the diagnostics it produces.
 //
 // This is the proof the self-hosted type-checker actually compiles and runs end to
 // end: it consumes the REAL parser's arena AST (a genuine parser → typecheck
 // pipeline, not a hand-built AST) and reports the expected errors.
+//
+// REAL MODULES: the `.vl` front-end files `export` their public surface and `import`
+// cross-module references, so this harness drives them through the module graph driver
+// (`compileProgram`) instead of string-concatenating the sources. The old glue —
+// dependency-ordered concatenation of `ast.vl ++ parser.vl ++ typecheck.vl ++ driver`
+// — is GONE. An in-memory DRIVER module is the graph entry point: it `import`s
+// `P`/`i32ToStr` from `./ast`, `parseProgram` from `./parser`, and `checkProgram`/
+// `initChecker`/`T` (plus `declare`/`mkObjTy`/`TY_I32`, which the member-access case
+// uses to seed a struct-typed binding through the checker API) from `./typecheck`.
 //
 // The checker covers: a type ARENA (i32/f64/bool/string/void primitives, plus
 // Object / Function / Union / Nullable encoded by arena index); a Map-based scope
@@ -14,39 +21,49 @@
 // (arity + arg/param compatibility); binary numeric ops and comparisons; if/return;
 // member access on objects; and structural assignability.
 //
-// PERF (compile-once): the inline seeded-error cases all compile the SAME base
-// (ast + parser + typecheck) and differ only in their hand-built token stream — so
-// recompiling the base once per case was the dominant cost (and is NOT cacheable for
-// compiler-change PRs, which change the very code under test). They are batched into
-// ONE module whose driver runs each case in turn, resetting the parser arena (`P`)
-// and checker (`initChecker`) between them and printing label-prefixed output; the
-// host splits the logs per label. Same coverage (real parser→typecheck on every
-// case; binaryen optimize() still runs, once). The well-typed case keeps its own
-// compile because its `tests/selfhost/typecheck_harness.vl` fixture carries its own
-// (colliding) `tok`/`report` glue.
+// PERF (compile-once): the cases all compile the SAME module graph and differ only in
+// their hand-built token stream — so recompiling the graph once per case was the
+// dominant cost (and is NOT cacheable for compiler-change PRs, which change the very
+// code under test). They are batched into ONE compile whose driver runs each case in
+// turn, resetting the parser arena (`P`) and checker (`initChecker`) between them and
+// printing label-prefixed output; the host splits the logs per label. The well-typed
+// case folds in too: its token-builder (`buildWellTyped`) is lifted verbatim from
+// `tests/selfhost/typecheck_harness.vl` (already valid VL source) into the driver, so
+// it shares the single compile rather than paying its own.
 
-import { runWasm } from "../compiler/compile.ts";
-import { compileCached } from "./_selfhost_cache.ts";
+import { compileProgram, runWasm } from "../compiler/compile.ts";
+import { createOptimizeCache } from "../compiler/buildCache.ts";
+
+const optimizeCache = createOptimizeCache();
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
   const e = JSON.stringify(expected, null, 2);
-  if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+  if (a !== e) {
+    throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+  }
 };
 
 const read = (rel: string) =>
   Deno.readTextFileSync(new URL(rel, import.meta.url));
 
-const ast = read("../compiler/ast.vl");
-const parser = read("../compiler/parser.vl");
-const typecheck = read("../compiler/typecheck.vl");
-const base = ast + "\n" + parser + "\n" + typecheck + "\n";
+// Resolved keys for the on-disk front-end modules (the resolver appends `.vl` to a
+// relative specifier, so a `./ast` import resolves to this `…/ast.vl` key).
+const compilerUrl = (name: string) =>
+  new URL(`../compiler/${name}`, import.meta.url).pathname;
+const AST = compilerUrl("ast.vl");
+const PARSER = compilerUrl("parser.vl");
+const TYPECHECK = compilerUrl("typecheck.vl");
+
+// The synthetic entry: the driver module. Its `./ast`/`./parser`/`./typecheck`
+// specifiers resolve to the real on-disk `compiler/*.vl` siblings.
+const DRIVER = compilerUrl("__typecheck_driver__.vl");
 
 // The well-typed fixture's token-builder (`buildWellTyped`), lifted VERBATIM from
 // `tests/selfhost/typecheck_harness.vl` — it is already valid VL source, so no
-// re-escaping is needed — and injected into the shared driver so the well-typed
-// case folds into the one batched compile instead of paying its own. (The fixture
-// file still stands alone; we reuse only its token-builder here.)
+// re-escaping is needed — and injected into the shared driver so the well-typed case
+// folds into the one batched compile. (The fixture file still stands alone; we reuse
+// only its token-builder here.)
 const harness = read("./selfhost/typecheck_harness.vl");
 const buildWellTypedStart = harness.indexOf("function buildWellTyped");
 const buildWellTyped = harness.slice(
@@ -132,9 +149,10 @@ tok("EOF","")`,
   },
   {
     label: "member-access",
-    // Seed `p : {x: i32, y: i32}` (no object-type syntax in the parser subset), then
-    // check `p.x + 1` (ok) and `p.z` (no such field). The `declare` runs after
-    // `initChecker` (which the per-case runner calls first).
+    // Seed `p : {x: i32, y: i32}` through the checker API (`declare`/`mkObjTy`/`TY_I32`
+    // — there is no object-type syntax in the parsed subset), then check `p.x + 1` (ok)
+    // and `p.z` (no such field). The seeding runs after the tokens are built and before
+    // `checkProgram` (which `reportLabeled` calls).
     body: `
 tok("IDENT","p") tok("DOT",".") tok("IDENT","x") tok("PLUS","+") tok("NUMBER","1") tok("NEWLINE","\\n")
 tok("IDENT","p") tok("DOT",".") tok("IDENT","z") tok("NEWLINE","\\n")
@@ -159,9 +177,14 @@ tok("EOF","")`,
   },
 ];
 
-// Shared glue + a per-case block (reset → initChecker → body → labeled report),
-// concatenated into one module run at instantiation.
-const driver = `
+// The driver module body: the import header, the shared `tok` helper, the lifted
+// `buildWellTyped`, `reportLabeled`, then a per-case block (reset → initChecker →
+// body → labeled report). All of it runs in ONE compiled module.
+const driverHeader = `
+import { P, i32ToStr } from "./ast"
+import { parseProgram } from "./parser"
+import { checkProgram, declare, initChecker, mkObjTy, T, TY_I32 } from "./typecheck"
+
 function tok(kind: string, text: string): i32 {
   P.toks.push({ kind: kind, text: text, pos: P.toks.length })
   P.toks.length - 1
@@ -176,22 +199,37 @@ function reportLabeled(label: string): i32 {
   }
   0
 }
-` +
-  CASES.map((c) =>
-    `
+`;
+
+// Compile + run the driver module ONCE (memoized), returning the per-label logs. The
+// driver's imports resolve to the on-disk `compiler/*.vl` siblings; only the driver is
+// in memory. Its tail runs every case in turn.
+let allLogs: Promise<Map<string, string[]>> | undefined;
+const runAll = (): Promise<Map<string, string[]>> =>
+  allLogs ??= (async () => {
+    const driverBody = CASES.map((c) => `
 P.toks = []
 P.nodes = []
 P.diags = []
 P.pos = 0
 initChecker()
 ${c.body}
-reportLabeled(${JSON.stringify(c.label)})`
-  ).join("\n") + "\n";
-
-let allLogs: Promise<Map<string, string[]>> | undefined;
-const runAll = (): Promise<Map<string, string[]>> =>
-  allLogs ??= (async () => {
-    const { wasm, diagnostics } = await compileCached(base + driver);
+reportLabeled(${JSON.stringify(c.label)})`).join("\n") + "\n";
+    const sources: Record<string, string> = {
+      [DRIVER]: driverHeader + driverBody,
+      [AST]: Deno.readTextFileSync(AST),
+      [PARSER]: Deno.readTextFileSync(PARSER),
+      [TYPECHECK]: Deno.readTextFileSync(TYPECHECK),
+    };
+    const readSource = (key: string): string | undefined => sources[key];
+    const { wasm, diagnostics } = await compileProgram(
+      DRIVER,
+      readSource,
+      DRIVER,
+      {
+        optimizeCache: await optimizeCache,
+      },
+    );
     const errors = diagnostics.filter((d) => d.severity === "error");
     if (errors.length > 0 || !wasm) {
       throw new Error(
