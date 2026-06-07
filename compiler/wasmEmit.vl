@@ -14,7 +14,7 @@
 //
 // Output representation: a VL `i32[]` of byte values 0..255. WasmGC has no `u8`;
 // `i32[]` is what VL can express today (see docs/selfhost-gaps.md, Codegen
-// self-host (H4)). Bytes are masked to the low 8 bits on emit.
+// self-host (H4)). Bytes are masked to the low 8 bits on emit (`& 0xff`).
 
 // ── emit state ───────────────────────────────────────────────────────────────
 // A single growable byte buffer. Top-level mutable `let` mutated through a
@@ -30,11 +30,7 @@ function emitReset(): i32 {
 
 // Append one byte (low 8 bits) to the buffer.
 function emitByte(b: i32): i32 {
-  // GAP: no `u8`/byte type and no bitwise `&` operator surfaced in this spike;
-  // mask to 0..255 with arithmetic ( ((b % 256) + 256) % 256 ) to stay in range.
-  let m = b % 256
-  if m < 0 { m = m + 256 }
-  W.bytes.push(m)
+  W.bytes.push(b & 0xff)
   0
 }
 
@@ -51,9 +47,9 @@ function emitBytes(bs: i32[]): i32 {
 // ── LEB128 encoders ──────────────────────────────────────────────────────────
 // The canonical encoders return a fresh `i32[]` (so they compose into nested
 // payloads); the streaming `emitULEB`/`emitSLEB` append straight to `W.bytes`.
-// GAP: VL i32 is signed; for the small sizes this spike emits, values stay well
-// under 2^31 so plain division/modulo by 128 behaves as the unsigned shift/mask.
-// A real codegen needs an unsigned-right-shift or `& 0x7f` (see gaps doc).
+// Bitwise/shift operators now exist in VL (H4.2 resolved): `& 0x7f` extracts
+// the low 7 bits, `>>> 7` does the unsigned shift for ULEB, `>> 7` does the
+// arithmetic shift for SLEB, and `| 0x80` sets the continuation bit.
 
 // Unsigned LEB128: 7 bits per byte, low-to-high, high bit set while more remain.
 function ulebToArr(value: i32): i32[] {
@@ -61,14 +57,13 @@ function ulebToArr(value: i32): i32[] {
   let v = value
   let more = true
   while more {
-    let byte = v % 128
-    if byte < 0 { byte = byte + 128 }
-    v = v / 128
+    let byte = v & 0x7f
+    v = v >>> 7
     if v == 0 {
       out.push(byte)
       more = false
     } else {
-      out.push(byte + 128)
+      out.push(byte | 0x80)
     }
   }
   out
@@ -80,21 +75,16 @@ function slebToArr(value: i32): i32[] {
   let v = value
   let more = true
   while more {
-    let byte = v % 128
-    if byte < 0 { byte = byte + 128 }
-    let next = v / 128
-    if v < 0 {
-      if v % 128 != 0 { next = next - 1 }
-    }
-    v = next
+    let byte = v & 0x7f
+    v = v >> 7
     let signBit = 0
-    if byte >= 64 { signBit = 1 }
+    if (byte & 0x40) != 0 { signBit = 1 }
     if v == 0 {
       if signBit == 0 {
         out.push(byte)
         more = false
       } else {
-        out.push(byte + 128)
+        out.push(byte | 0x80)
       }
     } else {
       if v == 0 - 1 {
@@ -102,10 +92,10 @@ function slebToArr(value: i32): i32[] {
           out.push(byte)
           more = false
         } else {
-          out.push(byte + 128)
+          out.push(byte | 0x80)
         }
       } else {
-        out.push(byte + 128)
+        out.push(byte | 0x80)
       }
     }
   }
