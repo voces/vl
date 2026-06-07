@@ -2235,6 +2235,31 @@ export const ensureType = (
     }
   }
 
+  // `boolean`-where-`i32`-expected coercion (A7). A `boolean`-typed VALUE flows
+  // into an `i32` slot as 1/0 — boolean already rides in an i32 at runtime, so
+  // the coercion is a no-op in codegen (`numericWiden` sees equal wasm reps and
+  // passes the value through). The motivating case is storing/returning a
+  // comparison result (A15). The coercion is ONE-directional: an arbitrary `i32`
+  // is not a `boolean` (only 0/1 would be), so `boolean := i32` keeps failing the
+  // structural check below.
+  //
+  // Two deliberate guards keep it bounded and sound:
+  //  - `ctx` must be present. `validateType` runs `ensureType` with a null `ctx`
+  //    for membership/narrowing QUERIES (e.g. the `is`-variant check, union
+  //    flattening). Those must NOT see `boolean` as an `i32`, or `x is boolean`
+  //    on a `string | i32` value would wrongly read as a real variant. Only a
+  //    genuine, diagnostic-producing ASSIGNMENT boundary (binding / argument /
+  //    return — all pass a real `ctx`) gets the coercion.
+  //  - a boolean LITERAL (`true`/`false`) is excluded: a literal in an `i32` slot
+  //    (`let x: i32 = true`) is more likely a mistake than a coercion — write
+  //    `1`/`0`. Only a `boolean`-*typed* runtime value coerces.
+  if (
+    ctx && right.type !== "BooleanLiteral" &&
+    scalarName(right) === "boolean" && scalarName(left) === "i32"
+  ) {
+    return true;
+  }
+
   switch (left.type) {
     // Unknown is inferrable
     case "Unknown": {
