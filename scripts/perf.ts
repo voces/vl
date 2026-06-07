@@ -37,6 +37,66 @@ const ITERATIONS = 5;
 
 const CASES_DIR = new URL("../tests/cases/", import.meta.url);
 
+// ---------------------------------------------------------------------------
+// Self-host source: the concatenated compiler front end used by the self-host
+// pipeline test (`tests/selfhost_pipeline_test.ts`). This is the slowest real
+// compile the test suite exercises — four `.vl` compiler source files joined
+// with the same name-collision renaming the pipeline test applies, so the
+// measurement matches what the CI pipeline actually compiles through binaryen.
+// ---------------------------------------------------------------------------
+const COMPILER_DIR = new URL("../compiler/", import.meta.url);
+
+const readCompilerVl = (name: string): string =>
+  Deno.readTextFileSync(new URL(name, COMPILER_DIR));
+
+/** Build the concatenated self-host source (lexer + ast + parser + typecheck).
+ *  The three name-collision renames mirror `selfhost_pipeline_test.ts` exactly.
+ *
+ *  Two variants:
+ *   - withDriver=false (default): the raw library concat, no top-level calls.
+ *     All definitions are dead-code-eliminated; wasm is a near-empty 48-byte
+ *     stub. Useful for measuring front-end scaling on a large source.
+ *   - withDriver=true: appends a minimal `print(0)` driver so the optimizer
+ *     has live code to work with. This exercises the full binaryen IR build +
+ *     optimize() path and matches what `selfhost_pipeline_test.ts` actually does
+ *     (each test appends a driver before calling `compile`).
+ */
+const buildSelfHostSource = (withDriver = false): string => {
+  const lexer = readCompilerVl("lexer.vl")
+    .replace(/\bTok\b/g, "LexTok")
+    .replace(/\bDiag\b/g, "LexDiag")
+    .replace(/\badvance\b/g, "lexAdvance");
+  const ast = readCompilerVl("ast.vl");
+  const parser = readCompilerVl("parser.vl");
+  const typecheck = readCompilerVl("typecheck.vl");
+  const base = lexer + "\n" + ast + "\n" + parser + "\n" + typecheck;
+  if (!withDriver) return base;
+  // Minimal driver: same shape as the pipeline test's `driverFor()` function —
+  // calls `tokenize`, `parseProgram`, `checkProgram`, and prints the diag count.
+  // This keeps enough live code to exercise real binaryen IR construction +
+  // optimize() without adding further VL semantics complexity.
+  const minimalDriver = `
+function mapKind(k: string): string {
+  if k == "ID" { return "IDENT" }
+  k
+}
+function loadToks(src: string): i32 {
+  let r = tokenize(src)
+  let i = 0
+  while i < r.tokens.length {
+    let t = r.tokens[i]
+    P.toks.push({ kind: mapKind(t.kind), text: t.text, pos: i })
+    i = i + 1
+  }
+  P.toks.length
+}
+loadToks("let x = 1")
+initChecker()
+print(i32ToStr(checkProgram(parseProgram())))
+`;
+  return base + "\n" + minimalDriver;
+};
+
 type Sample = {
   name: string;
   group: "corpus" | "synthetic";
@@ -302,14 +362,162 @@ const main = async (): Promise<void> => {
     synthRows.push(s);
   }
 
+  // Self-host pipeline: the concatenated compiler front-end sources that the
+  // test suite's `selfhost_pipeline_test.ts` compiles. This is the single
+  // largest input VL processes, and is where most CI time is spent. We measure
+  // it separately so the bottleneck analysis (front end vs codegen/binaryen) is
+  // clearly attributed.
+  //
+  // Two variants:
+  //  A) library-only (no driver): front-end scales with source size; binaryen
+  //     IR is built for all ~800 declarations but optimizer has no live code so
+  //     the emitted wasm is a near-empty stub (~48 bytes). Front-end time is
+  //     accurate; codegen is dominated by IR construction, not optimize().
+  //  B) with driver: adds minimal top-level calls so the optimizer has live
+  //     code to work on. This closely mirrors what the pipeline test does for
+  //     each of its 5 sub-tests. Codegen time here includes real optimize() work
+  //     on the full self-hosted module.
+  //
+  // We run 2 timed iterations (instead of ITERATIONS=5) to keep `deno task perf`
+  // reasonably fast while still getting a useful best-of measurement.
+  const SELFHOST_ITERATIONS = 2;
+
+  const measureSelfHost = async (
+    label: string,
+    source: string,
+  ): Promise<Sample> => {
+    const bytes = new TextEncoder().encode(source).length;
+    console.log(`\n[self-host] ${label}: ${fmtBytes(bytes)} bytes source`);
+    console.log("[self-host] warming up (1 compile)...");
+    checkOnly(source);
+    const warmR = await quiet(() => compile(source));
+    if (warmR.diagnostics.some((d) => d.severity === "error")) {
+      console.error(`[self-host] ERROR in ${label}:`);
+      for (const d of warmR.diagnostics.filter((d) => d.severity === "error")) {
+        console.error("  " + d.message);
+      }
+    }
+    console.log(`[self-host] timing (${SELFHOST_ITERATIONS} iterations)...`);
+    let frontMs = Infinity;
+    let totalMs = Infinity;
+    let lastWasm: Uint8Array | undefined = warmR.wasm;
+    for (let i = 0; i < SELFHOST_ITERATIONS; i++) {
+      const t0 = performance.now();
+      checkOnly(source);
+      const t1 = performance.now();
+      const r = await quiet(() => compile(source));
+      const t2 = performance.now();
+      frontMs = Math.min(frontMs, t1 - t0);
+      totalMs = Math.min(totalMs, t2 - t1);
+      lastWasm = r.wasm ?? lastWasm;
+    }
+    return {
+      name: label,
+      group: "synthetic",
+      bytesSource: bytes,
+      frontMs,
+      totalMs,
+      codegenMs: Math.max(0, totalMs - frontMs),
+      wasmBytes: lastWasm?.byteLength ?? 0,
+    };
+  };
+
+  console.log("\n[self-host] building concatenated compiler source...");
+  const shLibrarySource = buildSelfHostSource(false);
+  const shDriverSource = buildSelfHostSource(true);
+
+  const shLibraryRow = await measureSelfHost(
+    "selfhost: library-only (no driver, dead-code-elim)",
+    shLibrarySource,
+  );
+  const shDriverRow = await measureSelfHost(
+    "selfhost: with driver (mirrors pipeline-test compile)",
+    shDriverSource,
+  );
+
+  const selfHostRows: Sample[] = [shLibraryRow, shDriverRow];
+
   printTable(
     `CORPUS  (tests/cases/**; ${corpusRows.length} compiled, ${skipped} error/skip fixtures excluded)`,
     corpusRows,
   );
   printTable("SYNTHETIC  (generated stress programs)", synthRows);
+  printTable(
+    "SELF-HOST  (compiler front-end — the slow pipeline-test input)",
+    selfHostRows,
+  );
+
+  // Bottleneck analysis for the self-host module.
+  // Use the driver variant (shDriverRow) as the representative slow case —
+  // it exercises full binaryen IR construction + optimize() + emit, which is
+  // what the pipeline test does for each of its 5 sub-tests.
+  const rep = shDriverRow;
+  const shFrontPct = rep.frontMs / rep.totalMs * 100;
+  const shCodegenPct = rep.codegenMs / rep.totalMs * 100;
+  console.log("\nSELF-HOST BOTTLENECK ANALYSIS (driver variant — mirrors pipeline test)");
+  console.log("-".repeat(70));
+  console.log(
+    `  source input   : ${fmtBytes(rep.bytesSource)} bytes`,
+  );
+  console.log(
+    `  wasm output    : ${fmtBytes(rep.wasmBytes)} bytes`,
+  );
+  console.log(
+    `  front end      : ${ms(rep.frontMs)} ms  (${shFrontPct.toFixed(1)}% of total)` +
+      `  [checkOnly: lex+parse+typecheck, no binaryen]`,
+  );
+  console.log(
+    `  codegen+opt    : ${ms(rep.codegenMs)} ms  (${shCodegenPct.toFixed(1)}% of total)` +
+      `  [toWasm IR build + binaryen optimize() + emit]`,
+  );
+  console.log(
+    `  total (best-of ${SELFHOST_ITERATIONS}) : ${ms(rep.totalMs)} ms`,
+  );
+  console.log(
+    `\n  library-only variant (no driver, dead-code elim):`,
+  );
+  console.log(
+    `    front end: ${ms(shLibraryRow.frontMs)} ms | codegen: ${
+      ms(shLibraryRow.codegenMs)
+    } ms | total: ${ms(shLibraryRow.totalMs)} ms | wasm: ${
+      fmtBytes(shLibraryRow.wasmBytes)
+    } bytes`,
+  );
+  console.log(
+    `    (codegen time here = IR build for all declarations; optimize() trivial` +
+      ` because no live code)`,
+  );
+  if (shCodegenPct > 66) {
+    console.log(
+      `\n  FINDING: codegen/binaryen dominates (${shCodegenPct.toFixed(0)}% of compile time` +
+        ` in the driver variant).`,
+    );
+    console.log(
+      `           The IR build + binaryen optimize() on the live self-host module`,
+    );
+    console.log(
+      `           accounts for the bulk of each pipeline-test compile (~4-8 s per test).`,
+    );
+    console.log(
+      `  RECOMMENDATION: add a --no-optimize / skip-optimize test mode to binaryen`,
+    );
+    console.log(
+      `           codegen so tests can skip the slow optimize() pass (correctness`,
+    );
+    console.log(
+      `           is unaffected — the wasm still runs; only size/speed differ).`,
+    );
+  } else if (shFrontPct > 50) {
+    console.log(
+      `\n  FINDING: front end dominates (${shFrontPct.toFixed(0)}% of compile time).`,
+    );
+    console.log(`           Optimize large source files or cache front-end results.`);
+  } else {
+    console.log(`\n  FINDING: front end and codegen are roughly balanced.`);
+  }
 
   // Summary: slowest + biggest, plus grand totals.
-  const all = [...corpusRows, ...synthRows];
+  const all = [...corpusRows, ...synthRows, ...selfHostRows];
   const slowest = [...all].sort((a, b) => b.totalMs - a.totalMs).slice(0, 5);
   const biggest = [...all].sort((a, b) => b.wasmBytes - a.wasmBytes).slice(0, 5);
 
