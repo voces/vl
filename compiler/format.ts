@@ -620,6 +620,13 @@ class Printer {
     const header = this.functionHeader(node);
     const body = node.body;
     if (this.isBlock(body)) {
+      // An empty body renders inline as `{}` (a void function) — keeping it on
+      // one line is also format-idempotent: re-parsing `{}` yields the same
+      // empty Block, whereas `{\n}` would round-trip back to `{}`.
+      if (body.statements.length === 0) {
+        this.line(indent, `${header} {}`);
+        return;
+      }
       this.line(indent, `${header} {`);
       this.emitStatements(body.statements, indent + 1);
       this.line(indent, "}");

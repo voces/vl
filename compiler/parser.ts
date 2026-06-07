@@ -1785,7 +1785,24 @@ export const parseProgram = (
       const oldReturnType = returnType;
       returnType = functionReturnType;
 
-      const body = parseStatement() ?? emptyReturn();
+      // An empty `{}` function body is a block (a void function), NOT an empty
+      // object literal. `looksLikeObject` treats `{}` as an object (the ANTLR
+      // tie-break for expression position), which would give `function f() {}`
+      // a spurious `{}` struct return type and crash codegen. A non-empty body
+      // keeps the normal block/object-ambiguous path — an object-literal body
+      // like `function add(s, b) { x: s.x + b.x }` must still parse as an
+      // object. Force the block only for the empty-braces case (skipping any
+      // newlines between the braces, so `function f() {\n}` is treated the same
+      // as `function f() {}`).
+      const emptyBraces = () => {
+        if (!at("LBRACE")) return false;
+        let k = 1;
+        while (peek(k).kind === "NEWLINE") k++;
+        return peek(k).kind === "RBRACE";
+      };
+      const body = emptyBraces()
+        ? parseBlock(undefined)
+        : (parseStatement() ?? emptyReturn());
       const bodyType = typeFromStatement(body, spanFrom(bodyStart));
 
       const subTypes = returnTypes;
