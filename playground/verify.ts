@@ -239,7 +239,32 @@ const main = async (): Promise<void> => {
     `OK: inlay hints -> ${hints.length}, definition -> line ${def!.start.line + 1}`,
   );
 
-  // 4. The full page bundle (main.ts + Monaco) builds with the LSP wiring.
+  // 4. The shareable-link encode/decode round-trip (E4).
+  // `share.ts` uses only built-in browser APIs (CompressionStream / btoa / atob)
+  // that Deno also exposes natively — no bundling needed; import it directly.
+  console.error("\nchecking shareable-link round-trip…");
+  const share = await import("./src/share.ts");
+  const testSrc = `print(42)\nlet x = 1\nprint(x)\n`;
+  const hash = await share.encodeSource(testSrc);
+  if (!hash.startsWith("#v1:") && !hash.startsWith("#v0:")) {
+    fail(`encodeSource produced unexpected prefix: ${hash.slice(0, 20)}`);
+  }
+  const decoded = await share.decodeHash(hash);
+  if (decoded !== testSrc) {
+    fail(
+      `round-trip mismatch:\n  want: ${JSON.stringify(testSrc)}\n  got:  ${JSON.stringify(decoded)}`,
+    );
+  }
+  // Malformed hash must return null, not throw.
+  const bad1 = await share.decodeHash("#v1:!!!not_base64!!!!");
+  if (bad1 !== null) fail(`malformed hash decoded to non-null: ${bad1}`);
+  const bad2 = await share.decodeHash("");
+  if (bad2 !== null) fail(`empty hash decoded to non-null: ${bad2}`);
+  console.error(
+    `OK: share round-trip -> hash length ${hash.length}, decoded matches source`,
+  );
+
+  // 5. The full page bundle (main.ts + Monaco) builds with the LSP wiring.
   console.error("\nbuilding the full page bundle (Monaco + providers)…");
   await verifyFullBundleBuilds();
 

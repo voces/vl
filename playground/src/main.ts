@@ -29,6 +29,7 @@ import * as monaco from "monaco-editor";
 import { runProgram, type VLDiagnostic } from "./playground.ts";
 import { SAMPLES } from "./samples.ts";
 import * as lsp from "./lspAdapter.ts";
+import { decodeHash, encodeSource } from "./share.ts";
 
 const VL_LANGUAGE_ID = "vital";
 
@@ -55,6 +56,7 @@ const $ = <T extends HTMLElement>(id: string): T => {
 
 const editorHost = $<HTMLDivElement>("editor");
 const runBtn = $<HTMLButtonElement>("run");
+const shareBtn = $<HTMLButtonElement>("share");
 const sampleSelect = $<HTMLSelectElement>("samples");
 const watToggle = $<HTMLInputElement>("wat-toggle");
 const status = $<HTMLDivElement>("status");
@@ -212,9 +214,23 @@ monaco.languages.registerDefinitionProvider(VL_LANGUAGE_ID, {
   },
 });
 
+// --- shareable links (E4) ---------------------------------------------------
+//
+// On load, attempt to decode the URL hash into the initial source (takes
+// precedence over the default sample). On every (debounced) content change,
+// update the hash so the URL always reflects the current source. The hash
+// never hits the server — it's purely client-side state.
+
+// Attempt to restore source from the URL hash; returns null on any error or
+// when the hash is absent, in which case we fall back to SAMPLES[0].
+const sourceFromHash = await decodeHash(location.hash).catch(() => null);
+
 // --- editor instance --------------------------------------------------------
 
-const model = monaco.editor.createModel(SAMPLES[0]?.source ?? "", VL_LANGUAGE_ID);
+const model = monaco.editor.createModel(
+  sourceFromHash ?? SAMPLES[0]?.source ?? "",
+  VL_LANGUAGE_ID,
+);
 const editor = monaco.editor.create(editorHost, {
   model,
   theme: "vital-dark",
@@ -270,9 +286,19 @@ const refreshDiagnostics = () => {
 };
 
 let debounce: ReturnType<typeof setTimeout> | undefined;
+// `hashDebounce` is kept separate so diagnostics and URL updates don't
+// interfere with each other's timers.
+let hashDebounce: ReturnType<typeof setTimeout> | undefined;
 model.onDidChangeContent(() => {
   if (debounce !== undefined) clearTimeout(debounce);
   debounce = setTimeout(refreshDiagnostics, 200);
+
+  if (hashDebounce !== undefined) clearTimeout(hashDebounce);
+  hashDebounce = setTimeout(() => {
+    encodeSource(model.getValue()).then((fragment) => {
+      history.replaceState(null, "", fragment);
+    }).catch(() => { /* hash update is best-effort */ });
+  }, 600);
 });
 
 // --- sample picker ----------------------------------------------------------
@@ -280,6 +306,33 @@ model.onDidChangeContent(() => {
 sampleSelect.addEventListener("change", () => {
   const i = Number(sampleSelect.value);
   model.setValue(SAMPLES[i]?.source ?? "");
+});
+
+// --- share / copy-link button (E4) ------------------------------------------
+//
+// Encodes the current source into the URL hash, writes the full URL to the
+// clipboard, and briefly changes the button label to confirm the copy.
+
+let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
+shareBtn.addEventListener("click", () => {
+  encodeSource(model.getValue()).then(async (fragment) => {
+    history.replaceState(null, "", fragment);
+    const url = location.href;
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      // Clipboard API may be unavailable (non-HTTPS, blocked by permissions).
+      // The hash is already in the address bar; the user can copy it manually.
+    }
+    // Brief visual confirmation: "Copied!" for 2 s.
+    shareBtn.textContent = "Copied!";
+    shareBtn.classList.add("copied");
+    if (copyResetTimer !== undefined) clearTimeout(copyResetTimer);
+    copyResetTimer = setTimeout(() => {
+      shareBtn.textContent = "Copy link";
+      shareBtn.classList.remove("copied");
+    }, 2000);
+  }).catch(() => { /* encoding failure is silent — button stays as-is */ });
 });
 
 // --- diagnostics pane rendering ---------------------------------------------
