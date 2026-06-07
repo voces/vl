@@ -26,14 +26,10 @@ export type TokenKind =
   // Keywords
   | "FUNCTION"
   | "IF"
-  | "THEN"
   | "ELSE"
   | "ELSEIF"
   | "WHILE"
   | "FOR"
-  | "TO"
-  | "STEP"
-  | "IN"
   | "CONST"
   | "LET"
   | "RETURN"
@@ -41,14 +37,12 @@ export type TokenKind =
   | "AWAIT"
   | "BREAK"
   | "CONTINUE"
-  | "FROM"
   // Module-system keywords (phase 1): `import`/`export` for cross-file
-  // import/export, `as` for the `import { x as y }` rename. `from` already
-  // existed. The lexer reserves them as keywords unconditionally, matching how
-  // `from`/`type` are already unconditional keywords.
+  // import/export. The lexer reserves them as keywords unconditionally, matching
+  // how `type` is already an unconditional keyword. (`as`/`from` are contextual
+  // soft keywords recognized by the parser by text, so they lex as plain `ID`.)
   | "IMPORT"
   | "EXPORT"
-  | "AS"
   | "TYPE"
   // Literal keywords
   | "TRUE"
@@ -168,14 +162,10 @@ export type Token = {
 const KEYWORDS: Record<string, TokenKind> = Object.assign(Object.create(null), {
   function: "FUNCTION",
   if: "IF",
-  then: "THEN",
   else: "ELSE",
   elseif: "ELSEIF",
   while: "WHILE",
   for: "FOR",
-  to: "TO",
-  step: "STEP",
-  in: "IN",
   const: "CONST",
   let: "LET",
   return: "RETURN",
@@ -183,10 +173,8 @@ const KEYWORDS: Record<string, TokenKind> = Object.assign(Object.create(null), {
   await: "AWAIT",
   break: "BREAK",
   continue: "CONTINUE",
-  from: "FROM",
   import: "IMPORT",
   export: "EXPORT",
-  as: "AS",
   type: "TYPE",
   true: "TRUE",
   false: "FALSE",
@@ -412,7 +400,9 @@ export const tokenize = (source: string): LexResult => {
           if (ch === "_") {
             // Doubled (`1__0`) or trailing (`FF_`, checked after the loop) — a
             // `_` must sit strictly between two digits.
-            if (raw.length >= 2 && raw[raw.length - 2] === "_") badSeparator = true;
+            if (raw.length >= 2 && raw[raw.length - 2] === "_") {
+              badSeparator = true;
+            }
           } else {
             digits += ch;
           }

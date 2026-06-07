@@ -16,7 +16,9 @@ import { compileCached } from "./_selfhost_cache.ts";
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
   const e = JSON.stringify(expected, null, 2);
-  if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+  if (a !== e) {
+    throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+  }
 };
 
 const read = (rel: string) =>
@@ -119,11 +121,11 @@ Deno.test("self-hosted lexer compiles, runs, and tokenizes the sample", async ()
     "NEWLINE|\n||11:19",
     "FOR|for||12:0",
     "IDENT|i||12:4",
-    "IN|in||12:6",
+    "IDENT|in||12:6",
     "NUMBER|0||12:9",
-    "TO|to||12:11",
+    "IDENT|to||12:11",
     "NUMBER|10||12:14",
-    "STEP|step||12:17",
+    "IDENT|step||12:17",
     "NUMBER|2||12:22",
     "LBRACE|{||12:24",
     "IDENT|i||12:26",

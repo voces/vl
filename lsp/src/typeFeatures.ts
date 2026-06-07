@@ -172,14 +172,10 @@ const lexicalTokenType = (kind: TokenKind): number | undefined => {
     // Keywords (excluding the literal keywords handled above).
     case "FUNCTION":
     case "IF":
-    case "THEN":
     case "ELSE":
     case "ELSEIF":
     case "WHILE":
     case "FOR":
-    case "TO":
-    case "STEP":
-    case "IN":
     case "CONST":
     case "LET":
     case "RETURN":
@@ -187,7 +183,6 @@ const lexicalTokenType = (kind: TokenKind): number | undefined => {
     case "AWAIT":
     case "BREAK":
     case "CONTINUE":
-    case "FROM":
     case "TYPE":
       return TT.keyword;
     // Operators (arithmetic / logical / comparison / nullish). Pure punctuation
@@ -522,7 +517,11 @@ export const deriveInlayHints = (
   const lines = source !== undefined ? splitLines(source) : undefined;
   const hints: TypeInlayHint[] = [];
 
-  const push = (pos: { line: number; char: number }, label: string, name: string) => {
+  const push = (
+    pos: { line: number; char: number },
+    label: string,
+    name: string,
+  ) => {
     if (range && !posInRange(pos.line, pos.char, range)) return;
     hints.push({ line: pos.line, char: pos.char, label, name });
   };
@@ -677,7 +676,11 @@ export const identifierCompletions = (
   for (const name of Object.keys(builtins)) {
     if (name.startsWith("__")) continue;
     const type = builtins[name];
-    byName.set(name, { name, kind: builtinKind(type), detail: stringify(type) });
+    byName.set(name, {
+      name,
+      kind: builtinKind(type),
+      detail: stringify(type),
+    });
   }
   for (const binding of table.bindingsInScopeAt(pos)) {
     byName.set(binding.name, {
@@ -758,7 +761,9 @@ const asObjectType = (
   // A named `Type` wrapper (a resolved `type` alias, D8) carries the alias name
   // for display but wraps its concrete body — step through it to that body.
   if (type.type === "Type") return asObjectType(type.subType, scope, depth + 1);
-  if (type.type === "Nullable") return asObjectType(type.subType, scope, depth + 1);
+  if (type.type === "Nullable") {
+    return asObjectType(type.subType, scope, depth + 1);
+  }
   if (type.type === "Alias") {
     const target = scope[type.name];
     return target ? asObjectType(target, scope, depth + 1) : undefined;
