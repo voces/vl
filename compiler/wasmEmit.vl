@@ -298,25 +298,52 @@ function emitFail(msg: string): i32 {
 let fnNames: string[] = []
 let fnIndices: i32[] = []
 
-// Reset the map to empty, then scan `stmts` (a Program's top-level statements) for
-// `FuncDecl`s, registering each name at its sequential function index. Returns the
-// number of functions registered, or -1 (via `emitFail`) if a top-level statement
-// is not a function — this slice's modules are functions only.
-function buildFnMap(stmts: i32[]): i32 {
-  fnNames = []
-  fnIndices = []
+// The node-arena indices of the top-level `FuncDecl`s, in order. The i-th entry is
+// wasm function index i — the order all of function/export/code sections follow.
+// Built by `collectFns` (a single `is FuncDecl` scan); `TypeDecl`s are skipped, any
+// other top-level statement fails loudly there.
+let fnStmts: i32[] = []
+
+// Parallel to `fnNames`: `1` if the i-th function's declared RETURN type is the
+// struct, else `0`. Populated by `buildFnMap` so `fnRetStruct` is a flat lookup.
+let fRetRef: i32[] = []
+
+// Scan the program's top-level statements into `fnStmts` (FuncDecls only, in order),
+// skipping `TypeDecl`s. Any other top-level statement fails loudly. Returns the
+// function count, or -1 (via `emitFail`).
+function collectFns(stmts: i32[]): i32 {
+  fnStmts = []
   let i = 0
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
     if s is FuncDecl {
-      fnNames.push(s.fnName)
-      fnIndices.push(i)
+      fnStmts.push(stmts[i])
+    } else if nodeIsTypeDecl(stmts[i]) {
     } else {
-      return emitFail("emitProgram: top-level statement is not a function")
+      return emitFail("emitProgram: top-level statement is not a function or type")
     }
     i = i + 1
   }
-  stmts.length
+  fnStmts.length
+}
+
+// Map each function NAME to its wasm function index (its position in `fnStmts`), and
+// record whether it returns the struct. Returns the function count.
+function buildFnMap(stmts: i32[]): i32 {
+  fnNames = []
+  fnIndices = []
+  fRetRef = []
+  let i = 0
+  while i < fnStmts.length {
+    let s = P.nodes[fnStmts[i]]
+    if s is FuncDecl {
+      fnNames.push(s.fnName)
+      fnIndices.push(i)
+      fRetRef.push(retTRFlag(s.fnRet))
+    }
+    i = i + 1
+  }
+  fnStmts.length
 }
 
 // Look up the wasm function index for `name`, or -1 if no such top-level function
@@ -384,11 +411,25 @@ function paramIndexOf(fnIx: i32, name: string): i32 {
 // It is rebuilt per function by `buildLocals` before that function's body is
 // lowered, so only one function's locals are live at a time.
 let localNames: string[] = []
+// Parallel to `localNames`: the i-th declared local's value type — `1` for a struct
+// `(ref $0)` local, `0` for an i32 local. The locals vector and identifier resolution
+// consult this so a struct-typed local gets the ref valtype, not i32.
+let localIsRef: i32[] = []
+
+// ── struct-type table (one struct per program, i32 fields only) ───────────────
+// This slice supports exactly ONE struct `type` per module; its WasmGC type lives at
+// type index 0 (func types follow at 1..N — see `emitModule`). `sDeclared` is a
+// separate presence flag rather than `sName != ""` because reading the string global
+// in a comparison before its first write would pin it to the `""` literal type and
+// reject a later wider-`string` assignment. `sFields` holds the field names in
+// declaration order — a field's position IS its wasm struct field index. All fields
+// are i32. These are rebuilt per program by `collectS`.
+let sDeclared: boolean = false
+let sName: string = ""
+let sFields: string[] = []
 
 // Append the declared-local name `name` to `localNames` if not already present.
-// A re-`let` of the same name (legal as a typecheck concern, not here) would only
-// ever reuse the same slot — keeping names unique keeps slot assignment stable.
-function addLocalName(name: string): i32 {
+function addLocalName(name: string, isRef: i32): i32 {
   let i = 0
   while i < localNames.length {
     if localNames[i] == name {
@@ -397,6 +438,7 @@ function addLocalName(name: string): i32 {
     i = i + 1
   }
   localNames.push(name)
+  localIsRef.push(isRef)
   0
 }
 
@@ -414,8 +456,12 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
     while i < stmts.length {
       let s = P.nodes[stmts[i]]
       if s is LetDecl {
-        if checkLocalI32(stmts[i]) < 0 { return 0 - 1 }
-        addLocalName(s.letName)
+        if letIsStruct(stmts[i], fnIx) {
+          addLocalName(s.letName, 1)
+        } else {
+          if checkLocalI32(stmts[i]) < 0 { return 0 - 1 }
+          addLocalName(s.letName, 0)
+        }
       } else if s is IfStmt {
         if collectLocals(s.ifThen, fnIx) < 0 { return 0 - 1 }
         if s.ifElse >= 0 {
@@ -509,6 +555,7 @@ function checkExprI32(exprIx: i32): i32 {
 // body so identifier resolution and the locals vector see the full set.
 function buildLocals(fnIx: i32): i32 {
   localNames = []
+  localIsRef = []
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     return collectLocals(fn.fnBody, fnIx)
@@ -587,6 +634,101 @@ function binOpcode(op: string): i32 {
 //   BinExpr { binOp: string, binLeft: i32, binRight: i32 }
 //   Call    { callFn: i32, callArgs: i32[] }
 //   Paren   { parInner: i32 }
+// The wasm struct field index of `name` in the declared struct, or -1 if absent.
+function sFieldIndex(name: string): i32 {
+  let i = 0
+  while i < sFields.length {
+    if sFields[i] == name { return i }
+    i = i + 1
+  }
+  0 - 1
+}
+
+// Find the value-expr index for declared field `fieldName` in the object literal at
+// `objIx`, or -1 if the literal does not set that field.
+function objFieldVal(objIx: i32, fieldName: string): i32 {
+  let o = P.nodes[objIx]
+  if o is ObjLit {
+    let fields = o.objFields
+    let i = 0
+    while i < fields.length {
+      let f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if f.fiName == fieldName { return f.fiValue }
+      }
+      i = i + 1
+    }
+  }
+  0 - 1
+}
+
+// Lower an object literal `{ f: v, ... }` onto `body`: push each field's value IN
+// DECLARED FIELD ORDER, then `struct.new $0` (`0xfb 0x00 0x00`). The literal must set
+// exactly the struct's fields (no missing/extra/non-i32 field) — else fails loudly.
+function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
+  if !sDeclared {
+    return emitFail("emitProgram: object literal but no struct type declared")
+  }
+  let o = P.nodes[objIx]
+  if o is ObjLit {
+    if o.objFields.length != sFields.length {
+      return emitFail("emitProgram: object literal field count does not match struct")
+    }
+    let li = 0
+    while li < o.objFields.length {
+      let f = P.nodes[o.objFields[li]]
+      if f is FieldInit {
+        if sFieldIndex(f.fiName) < 0 {
+          return emitFail("emitProgram: object literal has a field not in the struct")
+        }
+      }
+      li = li + 1
+    }
+    let fi = 0
+    while fi < sFields.length {
+      let valIx = objFieldVal(objIx, sFields[fi])
+      if valIx < 0 {
+        return emitFail("emitProgram: object literal is missing a struct field")
+      }
+      if exprStruct(valIx, fnIx) {
+        return emitFail("emitProgram: nested struct fields are not supported")
+      }
+      if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+      fi = fi + 1
+    }
+    body.push(251)           // 0xfb GC prefix
+    body.push(0)             // struct.new
+    body.push(0)             // type index 0
+    return 0
+  }
+  emitFail("emitProgram: expected an object literal")
+}
+
+// Lower a field read `recv.field` onto `body`: evaluate the receiver (must be a
+// struct), then `struct.get $0 <fieldidx>` (`0xfb 0x02 0x00 idx`).
+function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
+  if !sDeclared {
+    return emitFail("emitProgram: field access but no struct type declared")
+  }
+  let m = P.nodes[memIx]
+  if m is Member {
+    if !exprStruct(m.memObj, fnIx) {
+      return emitFail("emitProgram: field access receiver is not a struct")
+    }
+    let idx = sFieldIndex(m.memProp)
+    if idx < 0 {
+      return emitFail("emitProgram: unknown struct field in field access")
+    }
+    if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
+    body.push(251)           // 0xfb GC prefix
+    body.push(2)             // struct.get
+    body.push(0)             // type index 0
+    appendAll(body, ulebToArr(idx))   // field index
+    return 0
+  }
+  emitFail("emitProgram: expected a field access")
+}
+
 function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 {
     return emitFail("emitProgram: missing expression")
@@ -623,6 +765,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
   }
   if e is Call {
     return emitCall(body, exprIx, fnIx)
+  }
+  if e is ObjLit {
+    return emitObj(body, exprIx, fnIx)
+  }
+  if e is Member {
+    return emitMem(body, exprIx, fnIx)
   }
   if e is BinExpr {
     // Assignment (`=`) is a STATEMENT, not a value expression in this slice: it has
@@ -836,8 +984,11 @@ function checkParams(fnIx: i32): i32 {
         }
         let ty = P.nodes[p.parType]
         if ty is TypeRef {
+          // i32 or the declared struct type are allowed; anything else fails.
           if ty.tyName != "i32" {
-            return emitFail("emitProgram: only i32 parameters are supported")
+            if !isSName(ty.tyName) {
+              return emitFail("emitProgram: only i32 or struct parameters are supported")
+            }
           }
         } else {
           return emitFail("emitProgram: parameter type is not a type name")
@@ -874,12 +1025,14 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
 
     let body: i32[] = []
     let nLocals = localNames.length
-    if nLocals == 0 {
-      body.push(0)           // empty locals vector
-    } else {
-      body.push(1)           // one (count, valtype) run
-      appendAll(body, ulebToArr(nLocals))   // count of i32 locals
-      body.push(127)         // 0x7f i32
+    // One (count=1, valtype) run per local, in index order: a struct local is
+    // `(ref $0)` (`0x64 0x00`), an i32 local is `0x7f`.
+    appendAll(body, ulebToArr(nLocals))
+    let li = 0
+    while li < nLocals {
+      body.push(1)
+      pushVT(body, localIsRef[li])
+      li = li + 1
     }
     appendAll(body, bodyExpr)
     body.push(11)            // 0x0b end
@@ -890,45 +1043,100 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
   emitFail("emitProgram: not a function declaration")
 }
 
-// Emit the complete module for the top-level functions `stmts` (each a FuncDecl,
-// already validated by `buildFnMap`/`checkParams`). One functype PER function
-// (arities differ), the function section binding func i to type i, an export per
-// function under its own name, and one code body per function. Every section is
-// framed through the SAME LEB/section helpers the fixed builders use.
+// `1` if the type-annotation node at `tyIx` names the struct, else `0` (i32 / none).
+// Used for functype param/result valtypes and the `fRetRef` table. Returning the
+// flag (not pushing bytes) keeps each call free of a `0→1` local reassignment, which
+// pins a `let x = 0` to the literal `0` type and fails to typecheck.
+function retTRFlag(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if isSName(ty.tyName) { return 1 }
+    }
+  }
+  0
+}
+
+// `1` if the parameter node at `paramIx` is the struct type, else `0`.
+function paramTRFlag(paramIx: i32): i32 {
+  let p = P.nodes[paramIx]
+  if p is Param {
+    return retTRFlag(p.parType)
+  }
+  0
+}
+
+// Push a wasm value type onto `payload`: `(ref $0)` (`0x64 0x00`, non-null ref to the
+// struct type) when `isRef == 1`, else i32 (`0x7f`).
+function pushVT(payload: i32[], isRef: i32): i32 {
+  if isRef == 1 {
+    payload.push(100)          // 0x64 (ref ht) — non-null ref
+    payload.push(0)            // heap type index 0 (the struct type)
+  } else {
+    payload.push(127)          // 0x7f i32
+  }
+  0
+}
+
+// Emit the complete module for the top-level functions in `fnStmts` (each a FuncDecl,
+// validated by `collectFns`/`buildFnMap`/`checkParams`). If a struct `type` was
+// declared, its WasmGC struct type is emitted FIRST (type index 0) and the functypes
+// follow (1..N); otherwise functypes start at 0. Struct-typed params/results encode
+// as `(ref $0)`. The function section binds func i to its functype, an export per
+// function under its own name, and one code body per function — every section framed
+// through the SAME LEB/section helpers the fixed builders use.
 function emitModule(stmts: i32[]): i32 {
   emitReset()
   emitHeader()
 
-  let n = stmts.length
+  let n = fnStmts.length
 
-  // Type section (id 1): N functypes, the i-th being `(i32 * arity_i) -> i32`.
+  // `structOffset` is the type-index shift the struct (when present) introduces:
+  // the GC struct type is type 0, so func types start at index 1 (else at 0).
+  let structOffset = 0
+  if sDeclared { structOffset = 1 }
+
+  // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
+  // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`) —
+  // then one functype per function (`(i32|ref $0)* -> i32|ref $0`).
   let typePayload: i32[] = []
-  appendAll(typePayload, ulebToArr(n))   // type count
+  appendAll(typePayload, ulebToArr(n + structOffset))   // total type count
+  if sDeclared {
+    typePayload.push(95)         // 0x5f struct
+    appendAll(typePayload, ulebToArr(sFields.length))
+    let sf = 0
+    while sf < sFields.length {
+      typePayload.push(127)      // 0x7f i32 storagetype
+      typePayload.push(1)        // mutable
+      sf = sf + 1
+    }
+  }
   let ti = 0
   while ti < n {
-    let fn = P.nodes[stmts[ti]]
+    let fn = P.nodes[fnStmts[ti]]
     if fn is FuncDecl {
-      let nParams = fn.fnParams.length
+      let params = fn.fnParams
+      let nParams = params.length
       typePayload.push(96)       // 0x60 func
       appendAll(typePayload, ulebToArr(nParams))   // param count
       let pi = 0
       while pi < nParams {
-        typePayload.push(127)    // 0x7f i32 param
+        pushVT(typePayload, paramTRFlag(params[pi]))
         pi = pi + 1
       }
       typePayload.push(1)        // 1 result
-      typePayload.push(127)      // 0x7f i32 result
+      pushVT(typePayload, retTRFlag(fn.fnRet))
     }
     ti = ti + 1
   }
   emitSection(1, typePayload)
 
-  // Function section (id 3): N functions, func i uses type i.
+  // Function section (id 3): N functions; func i uses functype `structOffset + i`.
   let funcPayload: i32[] = []
   appendAll(funcPayload, ulebToArr(n))
   let fi = 0
   while fi < n {
-    appendAll(funcPayload, ulebToArr(fi))   // type index = function index
+    appendAll(funcPayload, ulebToArr(structOffset + fi))   // functype index
     fi = fi + 1
   }
   emitSection(3, funcPayload)
@@ -939,7 +1147,7 @@ function emitModule(stmts: i32[]): i32 {
   appendAll(exportPayload, ulebToArr(n))
   let ei = 0
   while ei < n {
-    let fn = P.nodes[stmts[ei]]
+    let fn = P.nodes[fnStmts[ei]]
     if fn is FuncDecl {
       let name = fn.fnName
       appendAll(exportPayload, ulebToArr(name.length))
@@ -960,7 +1168,7 @@ function emitModule(stmts: i32[]): i32 {
   appendAll(codePayload, ulebToArr(n))
   let ci = 0
   while ci < n {
-    if emitFuncCode(codePayload, stmts[ci]) < 0 { return 0 - 1 }
+    if emitFuncCode(codePayload, fnStmts[ci]) < 0 { return 0 - 1 }
     ci = ci + 1
   }
   emitSection(10, codePayload)
@@ -989,6 +1197,151 @@ function emitModule(stmts: i32[]): i32 {
 //   LetDecl  { letName, letType, letInit }   — a local declaration.
 //   RetStmt  { retArg: i32 } ; IfStmt { ifCond, ifThen, ifElse }
 //   BinExpr  { binOp, binLeft, binRight }    — `binOp == "="` is an assignment.
+
+// ── struct-type collection + struct-typedness of expressions ─────────────────
+// `isSName` tells whether a type-name refers to the declared struct; `collectS`
+// records the program's single struct type; the rest decide whether a given
+// expression / param / local PRODUCES the struct (a `(ref $0)`) rather than an i32.
+
+// True if the type-name `name` refers to the declared struct type.
+function isSName(name: string): boolean {
+  sDeclared && name == sName
+}
+
+// True if the node at `ix` is a struct `type` declaration (a single-level narrowing
+// helper, so callers avoid an inline `is TypeDecl` on the wide `Node` union).
+function nodeIsTypeDecl(ix: i32): boolean {
+  let s = P.nodes[ix]
+  if s is TypeDecl { return true }
+  false
+}
+
+// Scan the top-level statements for the program's struct `type` declaration and
+// record its name + i32 field names (declaration order = wasm field index). This
+// slice supports exactly ONE struct type: a second `TypeDecl` fails loudly, as does
+// any non-i32 field. Returns 0 on success, or -1 (via `emitFail`).
+function collectS(stmts: i32[]): i32 {
+  sDeclared = false
+  sFields = []
+  let i = 0
+  while i < stmts.length {
+    let s = P.nodes[stmts[i]]
+    if s is TypeDecl {
+      if sDeclared {
+        return emitFail("emitProgram: only one struct type per program is supported")
+      }
+      sName = s.tdName
+      sDeclared = true
+      let fields = s.tdFields
+      let fi = 0
+      while fi < fields.length {
+        let fnode = P.nodes[fields[fi]]
+        if fnode is FieldDef {
+          if fnode.fdType < 0 {
+            return emitFail("emitProgram: only i32 struct fields are supported")
+          }
+          let ty = P.nodes[fnode.fdType]
+          if ty is TypeRef {
+            if ty.tyName != "i32" {
+              return emitFail("emitProgram: only i32 struct fields are supported")
+            }
+          } else {
+            return emitFail("emitProgram: struct field type is not a type name")
+          }
+          sFields.push(fnode.fdName)
+        } else {
+          return emitFail("emitProgram: malformed struct field")
+        }
+        fi = fi + 1
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// True if the function `name` declares the struct as its return type (flat lookup
+// over the `fRetRef` flags `buildFnMap` recorded — no arena rescan).
+function fnRetStruct(name: string): boolean {
+  let i = 0
+  while i < fnNames.length {
+    if fnNames[i] == name { return fRetRef[i] == 1 }
+    i = i + 1
+  }
+  false
+}
+
+// True if the parameter `name` of function `fnIx` is the struct type.
+function paramStruct(fnIx: i32, name: string): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef { return isSName(ty.tyName) }
+          }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// True if evaluating the expression at `exprIx` yields the struct (a `(ref $0)`):
+// an object literal (constructs it), a struct-returning call, a struct param/local
+// reference, or a parenthesized struct expression. Anything else is an i32 value.
+function exprStruct(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is ObjLit { return true }
+  if e is Paren { return exprStruct(e.parInner, fnIx) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident { return fnRetStruct(callee.identName) }
+    return false
+  }
+  if e is Ident {
+    if paramStruct(fnIx, e.identName) { return true }
+    return declaredStruct(e.identName)
+  }
+  false
+}
+
+// True if the already-collected declared local `name` is a struct ref.
+function declaredStruct(name: string): boolean {
+  let i = 0
+  while i < localNames.length {
+    if localNames[i] == name {
+      return localIsRef[i] == 1
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` declares a struct-typed local: its annotation
+// names the struct, OR its initializer produces the struct. Picks the local's
+// valtype (`(ref $0)` vs i32) in `collectLocals`.
+function letIsStruct(letIx: i32, fnIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if isSName(lt.tyName) { return true }
+      }
+    }
+    return exprStruct(d.letInit, fnIx)
+  }
+  false
+}
+
 function emitProgram(rootIx: i32): i32 {
   emitFailed = false
   emitErr = ""
@@ -999,15 +1352,22 @@ function emitProgram(rootIx: i32): i32 {
   if root is Program {
     let stmts = root.progStmts
     if stmts.length < 1 {
+      return emitFail("emitProgram: expected at least one top-level statement")
+    }
+    // Collect the (single) struct type FIRST so param/return/local checks can
+    // recognize its name, then the function list (FuncDecls only), then the name→index
+    // map. Forward references and recursion resolve because every name is mapped
+    // before any body is emitted.
+    if collectS(stmts) < 0 { return 0 - 1 }
+    if collectFns(stmts) < 0 { return 0 - 1 }
+    if fnStmts.length < 1 {
       return emitFail("emitProgram: expected at least one top-level function")
     }
-    // Map every function NAME to its index BEFORE emitting any body, so forward
-    // references and recursion resolve (`buildFnMap` also rejects non-functions).
     if buildFnMap(stmts) < 0 { return 0 - 1 }
-    // Every function's parameters must all be i32 before we commit to emitting.
+    // Every function's parameters must be i32 or the struct type before we commit.
     let i = 0
-    while i < stmts.length {
-      if checkParams(stmts[i]) < 0 { return 0 - 1 }
+    while i < fnStmts.length {
+      if checkParams(fnStmts[i]) < 0 { return 0 - 1 }
       i = i + 1
     }
     return emitModule(stmts)

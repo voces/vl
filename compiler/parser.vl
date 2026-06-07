@@ -65,6 +65,10 @@ import {
   mkReturn,
   mkBlock,
   mkProgram,
+  mkFieldDef,
+  mkTypeDecl,
+  mkFieldInit,
+  mkObjLit,
 } from "./ast"
 
 // ── cursor primitives ────────────────────────────────────────────────────────
@@ -183,6 +187,13 @@ function parsePrimary(): i32 {
     expect("RPAREN")
     return mkParen(inner)
   }
+  if k == "LBRACE" {
+    // A `{` in EXPRESSION position is an object literal `{ name: value, ... }`.
+    // (A block statement is dispatched by `parseStmt`'s `LBRACE` case BEFORE
+    // any expression is parsed, so a `{` ever reaching `parsePrimary` — an
+    // expression context — is unambiguously an object literal, never a block.)
+    return parseObjLit()
+  }
   P.diags.push({ msg: "expected an expression but found " + k, at: P.pos })
   advance()
   mkErr("expr", P.pos)
@@ -205,6 +216,35 @@ function parseArgs(): i32[] {
   }
   expect("RPAREN")
   args
+}
+
+// An object literal `{ name: value, ... }`, the cursor on the leading `{`. Each
+// field is `IDENT ":" expr`, comma-separated (a trailing comma is tolerated).
+// Returns an `ObjLit` whose `objFields` are the `FieldInit` node indices in source
+// order — the emitter relies on that order to bind values to the declared fields.
+function parseObjLit(): i32 {
+  expect("LBRACE")
+  let fields: i32[] = []
+  let going = peekKind() != "RBRACE"
+  while going {
+    let name = ""
+    if peekKind() == "IDENT" {
+      name = advance().text
+    } else {
+      expect("IDENT")
+    }
+    expect("COLON")
+    let value = parseExpr()
+    fields.push(mkFieldInit(name, value))
+    if peekKind() == "COMMA" {
+      advance()
+      going = peekKind() != "RBRACE"
+    } else {
+      going = false
+    }
+  }
+  expect("RBRACE")
+  mkObjLit(fields)
 }
 
 // `primary` then a chain of call `(args)` / member `.name` postfixes.
@@ -293,6 +333,43 @@ function parseLet(): i32 {
     init = parseExpr()
   }
   mkLet(kw, name, ty, init)
+}
+
+// `"type" IDENT "=" "{" (IDENT ":" type ("," IDENT ":" type)*)? "}"`
+// A struct type declaration. Each field is `IDENT ":" type` (the `type` reuses the
+// single-name `parseType`); fields are comma-separated with a tolerated trailing
+// comma. Returns a `TypeDecl` whose `tdFields` are the `FieldDef` indices in order.
+function parseTypeDecl(): i32 {
+  advance()                        // "type"
+  let name = ""
+  if peekKind() == "IDENT" {
+    name = advance().text
+  } else {
+    expect("IDENT")
+  }
+  expect("EQUAL")
+  expect("LBRACE")
+  let fields: i32[] = []
+  let going = peekKind() != "RBRACE"
+  while going {
+    let fname = ""
+    if peekKind() == "IDENT" {
+      fname = advance().text
+    } else {
+      expect("IDENT")
+    }
+    expect("COLON")
+    let fty = parseType()
+    fields.push(mkFieldDef(fname, fty))
+    if peekKind() == "COMMA" {
+      advance()
+      going = peekKind() != "RBRACE"
+    } else {
+      going = false
+    }
+  }
+  expect("RBRACE")
+  mkTypeDecl(name, fields)
 }
 
 // `IDENT (":" type)?`
@@ -402,6 +479,9 @@ function parseStmt(): i32 {
   }
   if k == "FUNCTION" {
     return parseFunc()
+  }
+  if k == "TYPE" {
+    return parseTypeDecl()
   }
   if k == "IF" {
     return parseIf()
