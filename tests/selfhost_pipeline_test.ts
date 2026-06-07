@@ -50,7 +50,12 @@ const typecheck = read("../compiler/typecheck.vl");
 const runDriver = async (driver: string): Promise<string[]> => {
   const source = lexer + "\n" + ast + "\n" + parser + "\n" + typecheck + "\n" +
     driver;
-  const { wasm, diagnostics } = await compile(source);
+  // `optimize: false`: this test only runs the module and diffs its printed
+  // diagnostics, which binaryen's optimize() pass cannot change. Skipping it
+  // roughly halves the per-sub-test compile time on this large self-host module.
+  const { wasm, diagnostics } = await compile(source, "source.vl", {
+    optimize: false,
+  });
   const errors = diagnostics.filter((d) => d.severity === "error");
   if (errors.length > 0 || !wasm) {
     throw new Error(

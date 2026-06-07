@@ -25,7 +25,11 @@ const lexer = read("../compiler/lexer.vl");
 
 // Compile `lexer.vl ++ driver`, run it, return the captured log lines.
 const runDriver = async (driver: string): Promise<string[]> => {
-  const { wasm, diagnostics } = await compile(lexer + "\n" + driver);
+  // `optimize: false`: only the run output is asserted, which optimize() cannot
+  // change — skip it to compile this self-host module faster.
+  const { wasm, diagnostics } = await compile(lexer + "\n" + driver, "source.vl", {
+    optimize: false,
+  });
   const errors = diagnostics.filter((d) => d.severity === "error");
   if (errors.length > 0 || !wasm) {
     throw new Error(

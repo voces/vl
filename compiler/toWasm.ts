@@ -75,13 +75,21 @@ export type ToWasmOptions = {
   spans?: NodeSpans;
   /** Logical source file name recorded in the source map (e.g. `main.vl`). */
   fileName?: string;
+  /**
+   * Run binaryen's `optimize()` pass (default `true`). It is the single biggest
+   * codegen cost on large modules (~40% of a self-host compile) and only affects
+   * the emitted wasm's *size/speed*, never its observable behavior — so a caller
+   * that merely runs the module and asserts its output (e.g. the self-host
+   * tests) can pass `false` to skip it. The CLI/build/playground leave it on.
+   */
+  optimize?: boolean;
 };
 
 export const toWasm = async (
   ast: VLProgramNode,
   options: ToWasmOptions = {},
 ): Promise<WasmEmit> => {
-  const { spans, fileName = "source.vl" } = options;
+  const { spans, fileName = "source.vl", optimize = true } = options;
   // binaryen's default export is a synchronous module object (plain npm), or,
   // when the binaryen patch is applied (patch-package, used by the bundled
   // extension), an async init function returning that object. Support both so
@@ -4673,7 +4681,12 @@ export const toWasm = async (
     console.log(m.emitText());
   }
   // if (!m.validate()) throw new Error("validation error");
-  m.optimize();
+  // binaryen's optimize() is the single biggest codegen cost on large modules
+  // (~40% of a self-host compile). It only affects the emitted wasm's size/speed,
+  // never its observable behavior, so a caller that just runs the module and
+  // checks its output (the self-host tests) can skip it to cut compile time.
+  // Default stays on — the CLI/build/playground always optimize.
+  if (optimize) m.optimize();
   if (debug) {
     console.log("optimized");
     console.log(m.emitText());
