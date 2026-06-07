@@ -268,7 +268,7 @@ Deno.test("a trailing comment on a `type` alias stays on the same line (D4)", ()
   const out2 = format(src2);
   const aLine = out2.split("\n").find((l) => l.startsWith("type A"));
   const bLine = out2.split("\n").find((l) => l.startsWith("type B"));
-  assert(aLine?.includes("// type A"), `type A trailing comment lost:\n${out2}`);
+  assert((aLine?.includes("// type A")) ?? false, `type A trailing comment lost:\n${out2}`);
   assert(!bLine?.includes("// type A"), `type A comment leaked onto type B:\n${out2}`);
   // Idempotent: format(format(s)) === format(s).
   assertEquals(format(out), out, "type alias with trailing comment not idempotent");
@@ -430,4 +430,39 @@ Deno.test("a bare-`then` if is not converted to brace form", () => {
   assert(!/if r > 0 \{/.test(out), `bare then forced to braces:\n${out}`);
   assertEquals(format(out), out, "bare then if is not idempotent");
   assertEquals(astShape(out), astShape(src), "bare then changed the AST");
+});
+
+// --- function with expression-body that encloses an own-line comment (D4) ---
+//
+// A function whose body is a single expression (e.g. an object literal)
+// can span multiple source lines when it is long or multi-keyed.  When the
+// body contains an own-line comment the formatter must not displace it to
+// after the closing brace — the verbatim-fallback path already used for
+// operator-named functions is extended to cover this case too.
+
+Deno.test("a fn with an expression body enclosing an own-line comment is reproduced verbatim (D4)", () => {
+  // The body `{ // comment\n  x: x, y: y }` is an ObjectLiteral, not a Block.
+  // An interior own-line comment must NOT be displaced to after the closing brace.
+  const src =
+    "function makeVec(x: i32, y: i32) {\n" +
+    "  // The coordinates\n" +
+    "  x: x,\n" +
+    "  y: y\n" +
+    "}\n";
+  const out = format(src);
+  // Comment is preserved inside the function, not expelled after it.
+  assert(
+    out.includes("// The coordinates"),
+    `interior comment lost:\n${out}`,
+  );
+  assert(
+    !out.endsWith("// The coordinates\n"),
+    `interior comment displaced to after the function:\n${out}`,
+  );
+  // The formatted output must re-parse without new syntax errors.
+  assert(!hasSyntaxError(out), `formatted fn does not re-parse:\n${out}`);
+  // Idempotent.
+  assertEquals(format(out), out, "fn with commented expression body is not idempotent");
+  // AST shape preserved.
+  assertEquals(astShape(out), astShape(src), "fn expression-body comment changed the AST");
 });

@@ -217,14 +217,14 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **D4. Formatter.** REMAINING:
   - **Unfaithful-fallback constructs** — reproduced verbatim from the source span rather than
     regenerated: `type` aliases (body & span discarded by the checker), operator-named &
-    method-shorthand functions, operator/index-method call desugars, leaf statements that enclose
-    an own-line comment. (Trailing comments on `type` aliases now stay on their line — #146 narrows
-    this gap.)
+    method-shorthand functions, operator/index-method call desugars. (Trailing comments on `type`
+    aliases now stay on their line — #146; functions with a commented expression body now fall back
+    to verbatim correctly — this PR.)
   - **AST type-syntax fidelity gap** — the typechecker fully resolves every type it records (a tiny
     `i32` annotation becomes a giant structural `Object`; `type`-alias bodies and spans are
     discarded). Retain the *as-written* type syntax (or its span) so the AST is lossless for
     types — also benefits hover/inlay rendering (D1/D6/D8).
-  - **Trailing commas** — reflow doesn't yet emit trailing commas in multi-line literals.
+  - ~~**Trailing commas**~~ — multi-line wrapped lists emit trailing commas; already shipped.
 - 🟡 **D7. Cross-references in doc-comments** — rustdoc-style `` [`Name`] `` / `[Name]` intra-doc
   links in `///` comments; resolved via D2's symbol table; rewritten to clickable markdown links in
   hover and completion `documentation`. REMAINING: cross-import resolution (a `Name` that is an
