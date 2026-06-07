@@ -297,27 +297,121 @@ function parseI32(text: string): i32 {
   v
 }
 
-// Emit a complete `() -> i32` module exporting `name`, whose body is the single
-// instruction `i32.const value`. This is `buildConstModule` generalized over the
-// export name and the constant — every section is framed through the SAME helpers
-// the fixed builders use; only the name bytes and the literal differ.
-function emitConstFunc(name: string, value: i32): i32 {
+// ── parameter resolution ─────────────────────────────────────────────────────
+// A returned `Ident` is a parameter reference; its wasm `local.get` index is the
+// param's position in `fnParams` (params occupy locals 0..n-1, before any declared
+// locals). `paramIndexOf` scans the FuncDecl's `fnParams` for the param whose
+// `parName` matches `name`, returning its 0-based position or -1 if not a param.
+// Only i32 params exist in this slice, so position == local index directly.
+function paramIndexOf(fnIx: i32, name: string): i32 {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          return i
+        }
+      }
+      i = i + 1
+    }
+  }
+  0 - 1
+}
+
+// Map a binary operator lexeme to its i32 wasm opcode, or -1 if unsupported. Only
+// the three integer arithmetic ops this slice handles are recognized; everything
+// else (comparisons, `/`, `%`, `=`, …) falls through to -1 so the caller fails
+// loudly rather than emitting a wrong opcode.
+//   `+` -> i32.add (0x6a)   `-` -> i32.sub (0x6b)   `*` -> i32.mul (0x6c)
+function binOpcode(op: string): i32 {
+  if op == "+" { return 106 }   // 0x6a i32.add
+  if op == "-" { return 107 }   // 0x6b i32.sub
+  if op == "*" { return 108 }   // 0x6c i32.mul
+  0 - 1
+}
+
+// Emit the instructions for the returned expression at `exprIx` onto `body`, in
+// stack order, resolving identifiers against function `fnIx`'s params. Returns 0
+// on success, or calls `emitFail` and returns -1 on any unsupported shape.
+//
+// Supported operands (any of which may nest as `+`/`-`/`*` children):
+//   NumLit  -> i32.const <value>           (the literal, via parseI32 + slebToArr)
+//   Ident   -> local.get <param index>     (a parameter reference)
+//   BinExpr -> emit(left), emit(right), <opcode>   (operands first, then the op,
+//              the natural wasm post-order stack encoding)
+//   Paren   -> the inner expression (parentheses carry no runtime instruction)
+//
+// Node shapes read (all from `compiler/ast.vl`):
+//   NumLit  { numText: string }
+//   Ident   { identName: string }
+//   BinExpr { binOp: string, binLeft: i32, binRight: i32 }
+//   Paren   { parInner: i32 }
+function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 {
+    return emitFail("emitProgram: missing expression")
+  }
+  let e = P.nodes[exprIx]
+  if e is NumLit {
+    body.push(65)            // 0x41 i32.const
+    appendAll(body, slebToArr(parseI32(e.numText)))
+    return 0
+  }
+  if e is Ident {
+    let idx = paramIndexOf(fnIx, e.identName)
+    if idx < 0 {
+      return emitFail("emitProgram: identifier is not a parameter")
+    }
+    body.push(32)            // 0x20 local.get
+    appendAll(body, ulebToArr(idx))
+    return 0
+  }
+  if e is Paren {
+    return emitExpr(body, e.parInner, fnIx)
+  }
+  if e is BinExpr {
+    let opcode = binOpcode(e.binOp)
+    if opcode < 0 {
+      return emitFail("emitProgram: unsupported binary operator")
+    }
+    // Operands first (left then right), then the operator — wasm's stack order.
+    if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }
+    if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+    body.push(opcode)
+    return 0
+  }
+  emitFail("emitProgram: unsupported expression in return")
+}
+
+// Emit a complete `(i32 * nParams) -> i32` module exporting `name`, whose body is
+// the size-prefixed `bodyExpr` instructions (already built by `emitExpr`) followed
+// by `end`. Generalizes `buildConstModule`/`buildIdentityModule` over the export
+// name, the parameter count, and the body instructions — every section is framed
+// through the SAME helpers the fixed builders use.
+function emitFunc(name: string, nParams: i32, bodyExpr: i32[]): i32 {
   emitReset()
   emitHeader()
 
-  // Type section (id 1): one functype () -> i32.
+  // Type section (id 1): one functype (i32 * nParams) -> i32.
   let typePayload: i32[] = []
-  typePayload.push(1)      // 1 type
-  typePayload.push(96)     // 0x60 func
-  typePayload.push(0)      // 0 params
-  typePayload.push(1)      // 1 result
-  typePayload.push(127)    // 0x7f i32
+  typePayload.push(1)            // 1 type
+  typePayload.push(96)           // 0x60 func
+  typePayload.push(nParams)      // param count
+  let pi = 0
+  while pi < nParams {
+    typePayload.push(127)        // 0x7f i32 param
+    pi = pi + 1
+  }
+  typePayload.push(1)            // 1 result
+  typePayload.push(127)          // 0x7f i32 result
   emitSection(1, typePayload)
 
   // Function section (id 3): one function, type index 0.
   let funcPayload: i32[] = []
-  funcPayload.push(1)      // 1 function
-  funcPayload.push(0)      // type index 0
+  funcPayload.push(1)            // 1 function
+  funcPayload.push(0)            // type index 0
   emitSection(3, funcPayload)
 
   // Export section (id 7): export `name` as func 0. The name is a UTF-8 byte vec;
@@ -334,11 +428,12 @@ function emitConstFunc(name: string, value: i32): i32 {
   exportPayload.push(0)    // func index 0
   emitSection(7, exportPayload)
 
-  // Code section (id 10): one body — no locals, `i32.const value`, `end`.
+  // Code section (id 10): one body — no declared locals (params aren't local decls
+  // here), the expression instructions, then `end`. The result of `bodyExpr` is the
+  // value left on the stack, which is the function's return value.
   let body: i32[] = []
   body.push(0)             // 0 local declarations
-  body.push(65)            // 0x41 i32.const
-  appendAll(body, slebToArr(value))
+  appendAll(body, bodyExpr)
   body.push(11)            // 0x0b end
 
   let codePayload: i32[] = []
@@ -349,16 +444,22 @@ function emitConstFunc(name: string, value: i32): i32 {
   0
 }
 
-// Walk the arena from `rootIx` and emit the module for `function main(): i32 {
-// return <integer literal> }`. Returns 0 on success; on any unsupported shape it
-// calls `emitFail` (leaving `emitErr` set and the buffer empty) and returns -1.
+// Walk the arena from `rootIx` and emit the module for a single top-level function
+// of the form:
+//
+//   function NAME(p0: i32, …): i32 { return <expr> }
+//
+// where <expr> is built from integer literals, parameter references, and the
+// `+`/`-`/`*` operators. The function is exported under its own NAME. Returns 0 on
+// success; on any unsupported shape it calls `emitFail` (leaving `emitErr` set and
+// the buffer empty) and returns -1.
 //
 // Node shapes read (all from `compiler/ast.vl`):
-//   Program  { progStmts: i32[] }   — top-level statements; scanned for `main`.
+//   Program  { progStmts: i32[] }   — top-level statements; the lone function.
 //   FuncDecl { fnName, fnParams: i32[], fnRet: i32, fnBody: i32 }
+//   Param    { parName: string, parType: i32 }
 //   Block    { blkStmts: i32[] }    — the function body.
 //   RetStmt  { retArg: i32 }        — the single statement; its arg is the value.
-//   NumLit   { numText: string }    — the integer literal returned.
 function emitProgram(rootIx: i32): i32 {
   emitFailed = false
   emitErr = ""
@@ -367,61 +468,77 @@ function emitProgram(rootIx: i32): i32 {
   }
   let root = P.nodes[rootIx]
   if root is Program {
-    // Find the `main` FuncDecl among the top-level statements. (`is`-narrowing
-    // is sound only in the positive arm, so every shape check is a positive
-    // `is` test with the unsupported case in its `else`.)
+    // Locate the single top-level function. (`is`-narrowing is sound only in the
+    // positive arm, so every shape check is a positive `is` test with the
+    // unsupported case in its `else`.) More than one top-level statement is out
+    // of this slice's scope (no multi-function / helper support yet).
     let stmts = root.progStmts
-    let mainIx = -1
-    let si = 0
-    while si < stmts.length {
-      let s = P.nodes[stmts[si]]
-      if s is FuncDecl {
-        if s.fnName == "main" {
-          mainIx = stmts[si]
-        }
-      }
-      si = si + 1
+    if stmts.length != 1 {
+      return emitFail("emitProgram: expected exactly one top-level function")
     }
-    if mainIx < 0 {
-      return emitFail("emitProgram: no top-level function named 'main'")
+    let fnIx = stmts[0]
+    let s = P.nodes[fnIx]
+    if s is FuncDecl {
+      return emitFunctionDecl(fnIx)
     }
-    return emitMain(mainIx)
+    return emitFail("emitProgram: top-level statement is not a function")
   }
   emitFail("emitProgram: root node is not a Program")
 }
 
-// Emit the module for the `main` FuncDecl at `fnIx` (already located). Split out
-// so each nested shape check narrows in its own positive `is` arm.
-function emitMain(fnIx: i32): i32 {
+// Emit the module for the FuncDecl at `fnIx` (already located). Split out so each
+// nested shape check narrows in its own positive `is` arm. Only i32 params and an
+// i32 return of a single `return <expr>` statement are handled here; `emitExpr`
+// lowers the returned expression and fails loudly on anything richer.
+function emitFunctionDecl(fnIx: i32): i32 {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    // Trivial slice only: no parameters.
-    if fn.fnParams.length != 0 {
-      return emitFail("emitProgram: 'main' must take no parameters")
+    // Every parameter must be typed `i32` — the only type this slice emits.
+    let params = fn.fnParams
+    let pi = 0
+    while pi < params.length {
+      let p = P.nodes[params[pi]]
+      if p is Param {
+        if p.parType < 0 {
+          return emitFail("emitProgram: parameter needs an i32 type")
+        }
+        let ty = P.nodes[p.parType]
+        if ty is TypeRef {
+          if ty.tyName != "i32" {
+            return emitFail("emitProgram: only i32 parameters are supported")
+          }
+        } else {
+          return emitFail("emitProgram: parameter type is not a type name")
+        }
+      } else {
+        return emitFail("emitProgram: malformed parameter")
+      }
+      pi = pi + 1
     }
     let body = P.nodes[fn.fnBody]
     if body is Block {
-      // Exactly one statement: a `return <NumLit>`.
+      // Exactly one statement: a `return <expr>`.
       if body.blkStmts.length != 1 {
-        return emitFail("emitProgram: 'main' body must be a single statement")
+        return emitFail("emitProgram: body must be a single statement")
       }
       let stmt = P.nodes[body.blkStmts[0]]
       if stmt is RetStmt {
         if stmt.retArg < 0 {
-          return emitFail("emitProgram: 'main' return needs a value")
+          return emitFail("emitProgram: return needs a value")
         }
-        let arg = P.nodes[stmt.retArg]
-        if arg is NumLit {
-          emitConstFunc("main", parseI32(arg.numText))
-          return 0
+        // Build the returned expression's instructions, then frame the module.
+        let bodyExpr: i32[] = []
+        if emitExpr(bodyExpr, stmt.retArg, fnIx) < 0 {
+          return 0 - 1
         }
-        return emitFail("emitProgram: 'main' must return an integer literal")
+        emitFunc(fn.fnName, params.length, bodyExpr)
+        return 0
       }
-      return emitFail("emitProgram: 'main' body must be a return statement")
+      return emitFail("emitProgram: body must be a return statement")
     }
-    return emitFail("emitProgram: 'main' has no block body")
+    return emitFail("emitProgram: function has no block body")
   }
-  emitFail("emitProgram: 'main' is not a function declaration")
+  emitFail("emitProgram: not a function declaration")
 }
 
 // Render the current buffer as a comma-joined decimal string (the round-trip

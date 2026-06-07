@@ -98,13 +98,21 @@ const bytesFromLog = (logs: string[]): Uint8Array<ArrayBuffer> => {
   return new Uint8Array(nums);
 };
 
-// Instantiate the VL-emitted bytes and call the exported `main()`.
-const runMain = async (bytes: Uint8Array<ArrayBuffer>): Promise<number> => {
+// Instantiate the VL-emitted bytes and call the export `name` with `args`.
+const runExport = async (
+  bytes: Uint8Array<ArrayBuffer>,
+  name: string,
+  ...args: number[]
+): Promise<number> => {
   const module = await WebAssembly.compile(bytes);
   const instance = await WebAssembly.instantiate(module, {});
-  const main = instance.exports.main as () => number;
-  return main();
+  const fn = instance.exports[name] as (...a: number[]) => number;
+  return fn(...args);
 };
+
+// Convenience for the zero-arg `main` export used by the trivial cases.
+const runMain = (bytes: Uint8Array<ArrayBuffer>): Promise<number> =>
+  runExport(bytes, "main");
 
 Deno.test("self-hosted emit-program: arena walk of `main(): i32 { return 42 }` instantiates to main()===42", async () => {
   const logs = await runFor("function main(): i32 {\n  return 42\n}\n");
@@ -121,15 +129,59 @@ Deno.test("self-hosted emit-program: a different literal flows from source throu
   if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
 });
 
-Deno.test("self-hosted emit-program: an unsupported shape fails loudly, not with garbage bytes", async () => {
-  // No `main`: `emitProgram` must take the unsupported path (set `emitErr`,
-  // emit no bytes) rather than produce a wrong module.
+Deno.test("self-hosted emit-program: a non-`main` function exports under its own name", async () => {
+  // The export name is the source function's name, generalized beyond `main`.
   const logs = await runFor("function other(): i32 {\n  return 1\n}\n");
+  const got = await runExport(bytesFromLog(logs), "other");
+  if (got !== 1) throw new Error(`other() returned ${got}, expected 1`);
+});
+
+Deno.test("self-hosted emit-program: `return x` of an i32 param lowers to local.get", async () => {
+  const logs = await runFor("function id(x: i32): i32 {\n  return x\n}\n");
+  const got = await runExport(bytesFromLog(logs), "id", 7);
+  if (got !== 7) throw new Error(`id(7) returned ${got}, expected 7`);
+});
+
+Deno.test("self-hosted emit-program: `return a + b` over two params lowers to i32.add", async () => {
+  const logs = await runFor(
+    "function add(a: i32, b: i32): i32 {\n  return a + b\n}\n",
+  );
+  const got = await runExport(bytesFromLog(logs), "add", 2, 3);
+  if (got !== 5) throw new Error(`add(2, 3) returned ${got}, expected 5`);
+});
+
+Deno.test("self-hosted emit-program: `return x + x` reuses the same param twice", async () => {
+  const logs = await runFor(
+    "function double(x: i32): i32 {\n  return x + x\n}\n",
+  );
+  const got = await runExport(bytesFromLog(logs), "double", 21);
+  if (got !== 42) throw new Error(`double(21) returned ${got}, expected 42`);
+});
+
+Deno.test("self-hosted emit-program: literal arithmetic `return 6 * 7` folds at runtime to 42", async () => {
+  const logs = await runFor("function lit(): i32 {\n  return 6 * 7\n}\n");
+  const got = await runExport(bytesFromLog(logs), "lit");
+  if (got !== 42) throw new Error(`lit() returned ${got}, expected 42`);
+});
+
+Deno.test("self-hosted emit-program: nested params + ops `return a * b - c` evaluates correctly", async () => {
+  const logs = await runFor(
+    "function f(a: i32, b: i32, c: i32): i32 {\n  return a * b - c\n}\n",
+  );
+  const got = await runExport(bytesFromLog(logs), "f", 5, 4, 3);
+  if (got !== 17) throw new Error(`f(5, 4, 3) returned ${got}, expected 17`);
+});
+
+Deno.test("self-hosted emit-program: an unsupported shape fails loudly, not with garbage bytes", async () => {
+  // Division is outside this slice (only `+`/`-`/`*`): `emitProgram` must take
+  // the unsupported path (set `emitErr`, emit no bytes) rather than produce a
+  // wrong module.
+  const logs = await runFor("function bad(a: i32): i32 {\n  return a / 2\n}\n");
   const errLine = logs.find((l) => l.startsWith("err: "));
   if (!errLine) {
     throw new Error(`expected an \`err:\` line for the unsupported shape; got ${JSON.stringify(logs)}`);
   }
-  if (!errLine.includes("main")) {
+  if (!errLine.includes("operator")) {
     throw new Error(`unexpected emitter error message: ${errLine}`);
   }
 });
