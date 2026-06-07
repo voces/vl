@@ -8,6 +8,7 @@
 //   deno task check <dir>              # recursively check every *.vl under dir
 //   deno task check                    # no path → check the cwd (like `check .`)
 //   deno task check --concise <path>   # one terse line per diagnostic (grep-safe)
+//   deno task check --fix <path>       # write provably-safe lint fixes to disk
 //   deno task check . --severity warning  # fail on warnings AND hide info/hints
 //   deno task run help / --help / -h    # list commands (also shown when the
 //                                       # binary is run with no args in a TTY)
@@ -39,6 +40,11 @@ import {
   wasmToWat,
 } from "./compile.ts";
 import { format } from "./format.ts";
+import {
+  letToConstFix,
+  type LspTextEdit,
+  prefixWithUnderscoreFix,
+} from "../lsp/src/codeActions.ts";
 
 const SUBCOMMANDS = new Set(["run", "build", "check", "fmt"]);
 
@@ -554,6 +560,140 @@ const checkFile = async (
   }
 };
 
+// --- check --fix ----------------------------------------------------------
+//
+// `vl check --fix` writes the *provably-safe* lint auto-fixes back to disk
+// (eslint-`--fix` / `cargo fix` style), reusing the pure quick-fix edit logic in
+// `lsp/src/codeActions.ts` (no duplication — the same `{range,newText}` edits the
+// LSP offers). Only fixes that cannot change program behaviour are applied:
+//
+//   - `prefer-const`  → `let` becomes `const` (the lint already proved the
+//                       binding is never reassigned, so the rename is inert).
+//   - `unused-variable` → prefix the name with `_` (purely additive — it only
+//                       silences the warning; the binding/initializer is kept).
+//
+// Deliberately NOT auto-applied (left as LSP-only suggestions): the
+// `unused-variable` *remove-binding* fix (could delete a side-effecting
+// initializer) and every dead-branch / constant-condition / `for`-step-0 fix
+// (those need human judgement about which arm to keep).
+
+// The lint rule `code`s whose fixes are safe to apply automatically. A diagnostic
+// whose `code` isn't here is never touched by `--fix`.
+const SAFE_FIX_CODES = new Set(["prefer-const", "unused-variable"]);
+
+// Compute the single safe auto-fix edit for one diagnostic, or `null` when the
+// diagnostic has no safe fix. Each branch picks ONLY the behaviour-preserving
+// quick-fix from `codeActions.ts` (e.g. unused-variable yields the `_`-prefix
+// edit, never the remove-binding edit). Returns the rule `code` alongside the
+// edit so the caller can tally fixes per rule.
+const safeFixForDiagnostic = (
+  source: string,
+  d: VLDiagnostic,
+): { code: string; edit: LspTextEdit } | null => {
+  switch (d.code) {
+    case "prefer-const": {
+      const fix = letToConstFix(source, d.range);
+      return fix ? { code: "prefer-const", edit: fix.edits[0] } : null;
+    }
+    case "unused-variable": {
+      // ONLY the additive `_`-prefix — never the remove-binding fix (it could
+      // drop a side-effecting initializer). A `_`-prefixed binding already emits
+      // a `hint` (not a warning) and would re-prefix to `__`, so skip those: the
+      // `prefixWithUnderscoreFix` is offered for the warning-severity case only.
+      if (d.severity !== "warning") return null;
+      const fix = prefixWithUnderscoreFix(d.range);
+      return { code: "unused-variable", edit: fix.edits[0] };
+    }
+    default:
+      return null;
+  }
+};
+
+// Convert an LSP line/character position into an absolute offset into `source`.
+// `lineStarts[i]` is the offset where line `i` begins (0-based line index); an
+// out-of-range line falls back to the last known line start so a stray position
+// never yields NaN (defensive — the lint always points at a real line).
+const offsetOf = (
+  lineStarts: number[],
+  pos: { line: number; character: number },
+): number =>
+  (lineStarts[pos.line] ?? lineStarts[lineStarts.length - 1] ?? 0) +
+  pos.character;
+
+// Precompute the absolute start offset of every line in `source`.
+const computeLineStarts = (source: string): number[] => {
+  const starts = [0];
+  for (let i = 0; i < source.length; i++) {
+    if (source[i] === "\n") starts.push(i + 1);
+  }
+  return starts;
+};
+
+// Apply a set of text edits to `source`, returning the rewritten text. Edits are
+// applied from the LAST source position to the FIRST so that earlier offsets stay
+// valid as later text is spliced (no offset recomputation needed). The safe lint
+// fixes never overlap (each touches a distinct declaration), so a simple
+// position sort is sufficient.
+const applyEdits = (source: string, edits: LspTextEdit[]): string => {
+  const lineStarts = computeLineStarts(source);
+  const resolved = edits
+    .map((e) => ({
+      start: offsetOf(lineStarts, e.range.start),
+      end: offsetOf(lineStarts, e.range.end),
+      newText: e.newText,
+    }))
+    .sort((a, b) => b.start - a.start); // last edit first
+  let out = source;
+  for (const e of resolved) {
+    out = out.slice(0, e.start) + e.newText + out.slice(e.end);
+  }
+  return out;
+};
+
+// Per-rule fix counts for one `--fix` run (drives the report line).
+type FixCounts = Map<string, number>;
+
+// Apply every safe lint fix to one file's `source`. Returns the rewritten text
+// (unchanged when nothing matched) and the per-rule counts. Pure — does no I/O.
+const computeFixes = (
+  source: string,
+  diagnostics: VLDiagnostic[],
+): { fixed: string; counts: FixCounts } => {
+  const counts: FixCounts = new Map();
+  const edits: LspTextEdit[] = [];
+  for (const d of diagnostics) {
+    if (d.code === undefined || !SAFE_FIX_CODES.has(String(d.code))) continue;
+    const fix = safeFixForDiagnostic(source, d);
+    if (!fix) continue;
+    edits.push(fix.edit);
+    counts.set(fix.code, (counts.get(fix.code) ?? 0) + 1);
+  }
+  if (edits.length === 0) return { fixed: source, counts };
+  return { fixed: applyEdits(source, edits), counts };
+};
+
+// Fix one file in place: read it, collect front-end diagnostics, apply the safe
+// fixes, and write the file back only when something changed. A clean file (or a
+// file with only un-fixable diagnostics) is left untouched. Re-running is
+// idempotent: a fixed `const`/`_x` no longer produces the diagnostic, so the
+// second pass finds nothing to do. Returns the per-rule counts for this file.
+//
+// We always use the single-file `checkOnly` so every diagnostic `range` indexes
+// exactly THIS file's text (the offsets we splice into). The multi-file graph
+// (`checkProgram`) merges modules and loses per-file range provenance, so editing
+// the entry text from merged ranges would be unsafe; for a file that `import`s,
+// the unresolved cross-module names surface as errors which suppress the lint
+// pass anyway (so `--fix` is a safe no-op there rather than a wrong edit).
+const fixFile = async (file: string): Promise<FixCounts> => {
+  const source = await Deno.readTextFile(file);
+  const { diagnostics } = checkOnly(source);
+  const { fixed, counts } = computeFixes(source, diagnostics);
+  if (fixed !== source) {
+    await Deno.writeFile(file, new TextEncoder().encode(fixed));
+  }
+  return counts;
+};
+
 type CheckArgs = {
   target: string;
   concise: boolean;
@@ -568,6 +708,10 @@ type CheckArgs = {
   // that codegen-only errors (e.g. recursion limit exceeded) are also reported.
   // By default `check` uses the faster codegen-free `checkOnly()` path.
   codegen: boolean;
+  // When true, write the provably-safe lint auto-fixes back to disk before
+  // reporting (eslint-`--fix` style). Only `prefer-const` (`let`→`const`) and
+  // `unused-variable` (`_`-prefix) are applied; see `safeFixForDiagnostic`.
+  fix: boolean;
 };
 
 // Validate a `--severity` value against the known levels, exiting with a clean
@@ -602,6 +746,7 @@ const parseCheckArgs = (args: string[]): CheckArgs => {
   let target: string | undefined;
   let concise = false;
   let codegen = false;
+  let fix = false;
   let severity: VLSeverity = "error";
   // Whether `--severity` was passed. Drives the display floor (see below).
   let severityGiven = false;
@@ -612,6 +757,8 @@ const parseCheckArgs = (args: string[]): CheckArgs => {
       concise = true;
     } else if (a === "--codegen") {
       codegen = true;
+    } else if (a === "--fix") {
+      fix = true;
     } else if (a === "--exclude" || a === "--ignore") {
       const value = args[++i];
       if (value !== undefined) excludes.push(...value.split(","));
@@ -636,12 +783,40 @@ const parseCheckArgs = (args: string[]): CheckArgs => {
     // Floor = chosen level when `--severity` is explicit, else show-all.
     displayFloor: severityGiven ? severity : LOWEST_SEVERITY,
     codegen,
+    fix,
   };
+};
+
+// Render the `--fix` summary line(s): one line per file that changed, listing the
+// per-rule counts, plus a trailing total. Returns the lines (empty when nothing
+// was fixed). Kept separate so the wording stays in one place.
+const summarizeFixes = (
+  perFile: { file: string; counts: FixCounts }[],
+  c: Colors,
+): string[] => {
+  const RULE_LABEL: Record<string, string> = {
+    "prefer-const": "let→const",
+    "unused-variable": "_-prefix",
+  };
+  const lines: string[] = [];
+  let total = 0;
+  for (const { file, counts } of perFile) {
+    const parts = [...counts.entries()].map(([code, n]) => {
+      total += n;
+      return `${n} ${RULE_LABEL[code] ?? code}`;
+    });
+    if (parts.length > 0) lines.push(c.dim(`fixed ${file}: ${parts.join(", ")}`));
+  }
+  if (total > 0) {
+    const noun = total === 1 ? "fix" : "fixes";
+    lines.push(c.dim(`Applied ${total} ${noun}.`));
+  }
+  return lines;
 };
 
 const check = async (args: string[]): Promise<void> => {
   // No path argument → default to the current working directory (`vl check .`).
-  const { target, concise, excludes, severity, displayFloor, codegen } =
+  const { target, concise, excludes, severity, displayFloor, codegen, fix } =
     parseCheckArgs(args);
   // No color when piped, when NO_COLOR is set, or in concise mode (kept plain
   // so scripts/grep see stable bytes).
@@ -665,6 +840,19 @@ const check = async (args: string[]): Promise<void> => {
     }
   } else {
     files = [target];
+  }
+
+  // `--fix`: write the provably-safe lint auto-fixes back to disk BEFORE the
+  // report runs, so the diagnostics printed below reflect the post-fix state (a
+  // fixed `let`→`const` / `_`-prefix no longer warns). Each file is fixed in
+  // place; a clean file is untouched, and re-running is idempotent. We then fall
+  // through to the normal check loop, which re-reads the (now-fixed) files.
+  if (fix) {
+    const perFile: { file: string; counts: FixCounts }[] = [];
+    for (const file of files) {
+      perFile.push({ file, counts: await fixFile(file) });
+    }
+    for (const line of summarizeFixes(perFile, c)) console.error(line);
   }
 
   // CI gate: never run the program; fail on any diagnostic at or above the
@@ -807,6 +995,13 @@ check:
   path                         a .vl file, or a directory checked recursively
                                (default: the current directory)
   --concise                    one terse line per diagnostic (grep-safe)
+  --fix                        write the provably-safe lint auto-fixes back to
+                               disk (eslint --fix style), then report what
+                               remains. Applies only behaviour-preserving fixes:
+                               prefer-const (\`let\`→\`const\`) and unused-variable
+                               (prefix the name with \`_\`). Removing a binding and
+                               dead-branch fixes are left as editor suggestions.
+                               Idempotent; a clean file is untouched
   --codegen                    also run binaryen codegen and report codegen
                                errors (e.g. recursion limit exceeded); slower
                                but catches issues that only surface at codegen
@@ -834,6 +1029,7 @@ examples:
   vl check .
   vl check . --exclude tests --exclude '*.gen.vl'
   vl check . --severity warning
+  vl check --fix src/
   vl fmt -w src/
   cat hello.vl | vl fmt`;
 

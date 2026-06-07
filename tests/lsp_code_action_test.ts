@@ -10,6 +10,8 @@
 // Run with: deno test -A --no-check tests/lsp_code_action_test.ts
 
 import {
+  type FixableDiagnostic,
+  fixableDiagnosticsForRange,
   letToConstFix,
   type LspRange,
   type LspTextEdit,
@@ -64,6 +66,21 @@ Deno.test("prefixWithUnderscoreFix inserts a leading `_` at the identifier", () 
     applyEdit(src, edit) === "let _y = 1\n",
     `applied: ${JSON.stringify(applyEdit(src, edit))}`,
   );
+});
+
+Deno.test("prefixWithUnderscoreFix is the preferred unused-variable fix", () => {
+  // VS Code's "Auto Fix" command applies only the `isPreferred` quick-fix, so
+  // the SAFE underscore-prefix fix must be preferred for an unused binding.
+  const fix = prefixWithUnderscoreFix(rangeOf(0, 4, 5));
+  assert(fix.isPreferred === true, "prefix-with-underscore is preferred");
+});
+
+Deno.test("removeBindingFix is NOT preferred (destructive alternative)", () => {
+  // The line-deleting fix must stay a non-preferred, manually-chosen quick-fix so
+  // "Auto Fix" never silently removes code.
+  const fix = removeBindingFix("let b = 2\n", rangeOf(0, 4, 5));
+  assert(fix !== null, "fix produced");
+  assert(fix!.isPreferred !== true, "remove-binding is not preferred");
 });
 
 Deno.test("removeBindingFix deletes the whole declaration line", () => {
@@ -151,4 +168,63 @@ Deno.test("quickFixesForDiagnostic dispatches on diagnostic code", () => {
   // Unknown code -> no fixes.
   const none = quickFixesForDiagnostic(src, "unreachable-code", rangeOf(0, 0, 1));
   assert(none.length === 0, `expected no fixes for unknown code, got ${none.length}`);
+});
+
+// `prefer-const`'s diagnostic range sits on the `let` keyword (cols 0..3). A
+// natural cursor lands on the variable name instead, so VS Code does not include
+// the diagnostic in `context.diagnostics`. The server folds in cached `vital`
+// diagnostics whose range line overlaps the request to keep the fix discoverable.
+const preferConstDiag = (line: number): FixableDiagnostic => ({
+  code: "prefer-const",
+  source: "vital",
+  range: rangeOf(line, 0, 3), // the `let` keyword
+});
+
+Deno.test("fixableDiagnosticsForRange surfaces a cached fix on the cursor's line", () => {
+  // `let total = 1` — cursor on `total` (cols 6..6, a collapsed selection), the
+  // diagnostic is on `let` (cols 0..3) so VS Code passes no context diagnostics.
+  const cursor = rangeOf(0, 6, 6);
+  const got = fixableDiagnosticsForRange([], [preferConstDiag(0)], cursor);
+  assert(got.length === 1, `expected the cached fix, got ${got.length}`);
+  assert(got[0].code === "prefer-const", `code: ${got[0].code}`);
+});
+
+Deno.test("fixableDiagnosticsForRange ignores cached diagnostics on other lines", () => {
+  // Cursor on line 2; the only cached diagnostic is on line 0 — no overlap.
+  const got = fixableDiagnosticsForRange([], [preferConstDiag(0)], rangeOf(2, 0, 0));
+  assert(got.length === 0, `expected no fixes off-line, got ${got.length}`);
+});
+
+Deno.test("fixableDiagnosticsForRange de-duplicates context vs cached", () => {
+  // The same diagnostic in both the editor-supplied and cached sets is offered
+  // once (keyed by code + range).
+  const diag = preferConstDiag(0);
+  const got = fixableDiagnosticsForRange([diag], [diag], rangeOf(0, 0, 0));
+  assert(got.length === 1, `expected dedup to one, got ${got.length}`);
+});
+
+Deno.test("fixableDiagnosticsForRange only surfaces `vital` diagnostics", () => {
+  const foreign: FixableDiagnostic = {
+    code: "prefer-const",
+    source: "eslint",
+    range: rangeOf(0, 0, 3),
+  };
+  const fromContext = fixableDiagnosticsForRange([foreign], [], rangeOf(0, 0, 0));
+  const fromCache = fixableDiagnosticsForRange([], [foreign], rangeOf(0, 0, 0));
+  assert(fromContext.length === 0, "non-vital context diagnostic ignored");
+  assert(fromCache.length === 0, "non-vital cached diagnostic ignored");
+});
+
+Deno.test("cached prefer-const diagnostic yields the let->const fix end to end", () => {
+  // The full discoverability path: cursor on the variable name, diagnostic cached
+  // on the `let` keyword → the diagnostic surfaces and produces the const fix.
+  const src = "let total = 1\n";
+  const cursor = rangeOf(0, 6, 6); // on `total`
+  const surfaced = fixableDiagnosticsForRange([], [preferConstDiag(0)], cursor);
+  assert(surfaced.length === 1, "diagnostic surfaced");
+  const fixes = quickFixesForDiagnostic(src, surfaced[0].code, rangeOf(0, 4, 9));
+  assert(
+    fixes.length === 1 && fixes[0].title === "Change `let` to `const`",
+    `fixes: ${JSON.stringify(fixes.map((f) => f.title))}`,
+  );
 });

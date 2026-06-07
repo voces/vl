@@ -159,10 +159,19 @@ export const parseProgram = (
     type?: VLType,
     doc?: string,
     mutable?: boolean,
+    declKeyword?: Context,
   ): Binding => {
     let map = scopeBindings.get(scope);
     if (!map) scopeBindings.set(scope, map = new Map());
-    const binding: Binding = { name, kind, decl, type, doc, mutable };
+    const binding: Binding = {
+      name,
+      kind,
+      decl,
+      type,
+      doc,
+      mutable,
+      declKeyword,
+    };
     map.set(name, binding);
     symbols.declare(binding);
     return binding;
@@ -2574,6 +2583,9 @@ export const parseProgram = (
         node.variableType,
         kw.docComment,
         mutable,
+        // The `let`/`const` keyword's own span — the prefer-`const` lint points
+        // its diagnostic here (the actionable `let`→`const` token), not the name.
+        spanOf(kw),
       );
     }
     return record(node, spanFrom(kw));
