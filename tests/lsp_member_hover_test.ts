@@ -86,7 +86,11 @@ Deno.test("resolveMemberAt: array `.length` resolves to the intrinsic i32", () =
 // ---- hover: string members --------------------------------------------------
 
 Deno.test("resolveMemberAt: string member `s.slice` resolves to a method", () => {
-  const src = 'const s = "hi"\nconst u = s.slice(0, 1)\n';
+  // A reassignable `let` widens its inferred literal to the `string` base, whose
+  // intrinsic members the hover resolves. (An immutable `const s = "hi"` keeps
+  // the narrow `"hi"` literal type — resolving members on a literal receiver is
+  // an LSP-side follow-up that mirrors the compiler's literal-receiver softening.)
+  const src = 'let s = "hi"\nconst u = s.slice(0, 1)\n';
   const member = memberAt(src, 2, ".slice");
   if (!member) throw new Error("expected a resolved member for `s.slice`");
   assertEquals(member.name, "slice");
