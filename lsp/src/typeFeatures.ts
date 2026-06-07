@@ -566,8 +566,10 @@ export const deriveInlayHints = (
  * module stays free of the `vscode-languageserver` enums — `server.ts` maps these
  * to `CompletionItemKind`). `"variable"` covers locals; `"parameter"` function
  * params; `"function"` callables; `"type"` `type` aliases and builtin types.
+ * `"keyword"` covers reserved words and soft keywords. `"snippet"` covers
+ * multi-token skeleton expansions.
  */
-export type CompletionKind = BindingKind;
+export type CompletionKind = BindingKind | "keyword" | "snippet";
 
 /** One completion candidate, runtime-agnostic; `server.ts` wraps it for LSP. */
 export type Completion = {
@@ -583,6 +585,13 @@ export type Completion = {
    * members (no source binding to read a doc from).
    */
   doc?: string;
+  /**
+   * For snippet completions: the LSP snippet insert text (tab-stop syntax,
+   * `${1:placeholder}`). When present, `server.ts` sets `insertText` to this
+   * and `insertTextFormat` to `InsertTextFormat.Snippet`. Absent for plain
+   * identifier/keyword items whose `name` is the insert text.
+   */
+  insertText?: string;
 };
 
 /**
@@ -691,6 +700,144 @@ export const identifierCompletions = (
     });
   }
   return [...byName.values()];
+};
+
+// VL keywords: hard keywords (reserved by the lexer) plus soft keywords
+// (contextual — lexed as `ID` but given syntactic meaning by the parser). We
+// enumerate them statically rather than importing the lexer's `KEYWORDS` map so
+// this module stays free of runtime dependencies on the compiler internals.
+//
+// Hard keywords (from lexer.ts `KEYWORDS` map):
+//   function if else elseif while for const let return is await break continue
+//   import export type true false null
+// Soft keywords (recognized by text in parser.ts via `atSoft`):
+//   as from in step to then
+const VL_HARD_KEYWORDS: readonly string[] = [
+  "function",
+  "if",
+  "else",
+  "elseif",
+  "while",
+  "for",
+  "const",
+  "let",
+  "return",
+  "is",
+  "await",
+  "break",
+  "continue",
+  "import",
+  "export",
+  "type",
+  "true",
+  "false",
+  "null",
+];
+
+const VL_SOFT_KEYWORDS: readonly string[] = [
+  "as",
+  "from",
+  "in",
+  "step",
+  "to",
+  "then",
+];
+
+/**
+ * Keyword completions for VL: all hard keywords (reserved by the lexer) plus
+ * the contextual soft keywords (`as`, `from`, `in`, `step`, `to`, `then`).
+ * Each item carries `kind: "keyword"` so `server.ts` maps it to
+ * `CompletionItemKind.Keyword`. These are returned as plain text items (no
+ * `insertText`); clients filter the list against the typed prefix, so the full
+ * list is always returned and narrowing happens client-side.
+ *
+ * Returns an empty list when `afterDot` is `true` — keywords are never valid
+ * as member names after a `.` receiver.
+ */
+export const keywordCompletions = (afterDot: boolean): Completion[] => {
+  if (afterDot) return [];
+  return [...VL_HARD_KEYWORDS, ...VL_SOFT_KEYWORDS].map((kw) => ({
+    name: kw,
+    kind: "keyword" as const,
+  }));
+};
+
+/**
+ * Common structural snippet completions for VL — skeleton expansions for the
+ * most-typed declaration and control-flow forms. Each item uses LSP tab-stop
+ * syntax (`${N:placeholder}`) in `insertText`. The label (`name`) is the
+ * trigger keyword so the item appears alongside the regular keyword suggestion;
+ * `kind: "snippet"` distinguishes it (maps to `CompletionItemKind.Snippet`).
+ *
+ * Returns an empty list when `afterDot` is `true` — snippets are never valid
+ * after a `.` receiver.
+ *
+ * Snippet set (idiomatic VL syntax — braces on same line, no semicolons):
+ *   function …  →  function ${1:name}(${2:params}): ${3:T} {\n\t${0}\n}
+ *   if …        →  if ${1:cond} {\n\t${0}\n}
+ *   elseif …    →  elseif ${1:cond} {\n\t${0}\n}
+ *   else { }    →  else {\n\t${0}\n}
+ *   while …     →  while ${1:cond} {\n\t${0}\n}
+ *   for … in …  →  for ${1:item} in ${2:collection} {\n\t${0}\n}
+ *   type …      →  type ${1:Name} = ${0}
+ *   let …       →  let ${1:name} = ${0}
+ *   const …     →  const ${1:name} = ${0}
+ *   return …    →  return ${0}
+ */
+export const snippetCompletions = (afterDot: boolean): Completion[] => {
+  if (afterDot) return [];
+  return [
+    {
+      name: "function",
+      kind: "snippet" as const,
+      insertText: "function ${1:name}(${2:params}): ${3:T} {\n\t${0}\n}",
+    },
+    {
+      name: "if",
+      kind: "snippet" as const,
+      insertText: "if ${1:cond} {\n\t${0}\n}",
+    },
+    {
+      name: "elseif",
+      kind: "snippet" as const,
+      insertText: "elseif ${1:cond} {\n\t${0}\n}",
+    },
+    {
+      name: "else",
+      kind: "snippet" as const,
+      insertText: "else {\n\t${0}\n}",
+    },
+    {
+      name: "while",
+      kind: "snippet" as const,
+      insertText: "while ${1:cond} {\n\t${0}\n}",
+    },
+    {
+      name: "for",
+      kind: "snippet" as const,
+      insertText: "for ${1:item} in ${2:collection} {\n\t${0}\n}",
+    },
+    {
+      name: "type",
+      kind: "snippet" as const,
+      insertText: "type ${1:Name} = ${0}",
+    },
+    {
+      name: "let",
+      kind: "snippet" as const,
+      insertText: "let ${1:name} = ${0}",
+    },
+    {
+      name: "const",
+      kind: "snippet" as const,
+      insertText: "const ${1:name} = ${0}",
+    },
+    {
+      name: "return",
+      kind: "snippet" as const,
+      insertText: "return ${0}",
+    },
+  ];
 };
 
 /**

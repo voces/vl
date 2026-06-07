@@ -10,6 +10,7 @@ import {
   Hover,
   InlayHint,
   InlayHintKind,
+  InsertTextFormat,
   Location,
   MarkupKind,
   Position,
@@ -44,12 +45,14 @@ import {
   deriveInlayHints,
   docMarkdown,
   identifierCompletions,
+  keywordCompletions,
   type LspRange,
   memberCompletions,
   receiverObjectType,
   resolveMemberAt,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
+  snippetCompletions,
   typeLabelDetail,
 } from "./typeFeatures.ts";
 
@@ -307,12 +310,15 @@ connection.languages.semanticTokens.on((params): SemanticTokens => {
 // Map a neutral completion kind (from `typeFeatures.ts`) to the LSP enum. A VL
 // `type` alias / builtin type maps to `Struct` (VL types are structural objects,
 // not nominal classes) — the closest fit and what semantic tokens treat as a
-// "type". Locals/params are `Variable`; callables are `Function`.
+// "type". Locals/params are `Variable`; callables are `Function`. `keyword`
+// maps to `Keyword`; `snippet` maps to `Snippet`.
 const completionKind: Record<CompletionKind, CompletionItemKind> = {
   variable: CompletionItemKind.Variable,
   parameter: CompletionItemKind.Variable,
   function: CompletionItemKind.Function,
   type: CompletionItemKind.Struct,
+  keyword: CompletionItemKind.Keyword,
+  snippet: CompletionItemKind.Snippet,
 };
 
 // For items that carry a type we render it in exactly two places, never the same
@@ -345,6 +351,11 @@ const toCompletionItem = (c: Completion): CompletionItem => {
       value: docMarkdown(c.detail ?? "", VL_LANGUAGE_ID, c.doc),
     };
   }
+  // Snippet items: set the insert text + format so the editor expands tab-stops.
+  if (c.insertText !== undefined) {
+    item.insertText = c.insertText;
+    item.insertTextFormat = InsertTextFormat.Snippet;
+  }
   return item;
 };
 
@@ -362,8 +373,9 @@ const wordEndingBefore = (line: string, character: number): string | null => {
   return /^[A-Za-z_]/.test(word) ? word : null;
 };
 
-// Completion (D3): scope-aware identifier suggestions everywhere, and structural
-// member suggestions after `.`. Driven by the pure helpers in `typeFeatures.ts`
+// Completion (D3): scope-aware identifier suggestions everywhere, structural
+// member suggestions after `.`, plus keyword and snippet completions for
+// statement-position typing. Driven by the pure helpers in `typeFeatures.ts`
 // over the compiler's symbol table + program scope (which folds in builtins).
 connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const doc = documents.get(params.textDocument.uri);
@@ -384,6 +396,7 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   // Member completion: cursor follows `<receiver>.`. Only the simple `name.`
   // receiver is resolved (see `receiverObjectType` / the D3 report); a more
   // complex receiver yields no member suggestions rather than wrong ones.
+  // Keywords and snippets are suppressed after `.` (never valid as member names).
   if (charBeforeCursor === ".") {
     const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
     if (!receiver) return [];
@@ -397,10 +410,14 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   // Identifier completion: in-scope names + builtins. `ast.scope` carries the
   // builtins (from `defaultScope`) plus top-level names; user bindings from the
   // symbol table override same-named builtins inside `identifierCompletions`.
+  // Keyword and snippet completions are appended for statement-position typing.
   const { ast } = await compile(text);
   const builtins = ast?.scope ?? {};
-  return identifierCompletions(symbols, vlPos, builtins, stringifyType)
+  const identifiers = identifierCompletions(symbols, vlPos, builtins, stringifyType)
     .map(toCompletionItem);
+  const keywords = keywordCompletions(false).map(toCompletionItem);
+  const snippets = snippetCompletions(false).map(toCompletionItem);
+  return [...identifiers, ...keywords, ...snippets];
 });
 
 // Document formatting (D4): rewrite the whole document through the AST-driven
