@@ -195,6 +195,14 @@ export const toWasm = async (
     ">=": "ge_s",
     "<=": "le_s",
     "&&": "and",
+    // Bitwise / shift (integer-only — the type checker rejects float operands).
+    // `>>` is the signed (arithmetic) shift, `>>>` the unsigned (logical) one.
+    "&": "and",
+    "|": "or",
+    "^": "xor",
+    "<<": "shl",
+    ">>": "shr_s",
+    ">>>": "shr_u",
   };
   const FLOAT_BINOPS: Record<string, string> = {
     "+": "add",
@@ -3043,6 +3051,15 @@ export const toWasm = async (
         // Logical not on a boolean (an i32 0/1): eqz maps 0→1, nonzero→0.
         if (op === "!") {
           return m.i32.eqz(toExpression(node.operand));
+        }
+        // Bitwise NOT `~x` = `x ^ -1` (flip every bit), at the operand's integer
+        // width (i32/i64). The type checker has already rejected non-integers.
+        if (op === "~") {
+          const operand = toExpression(node.operand);
+          const wt = binaryen.getExpressionType(operand);
+          return wt === binaryen.i64
+            ? m.i64.xor(operand, m.i64.const(BigInt(-1)))
+            : m.i32.xor(operand, m.i32.const(-1));
         }
         // `++` / `--` mutate a variable (the AST guards non-Name operands).
         if (node.operand.type !== "Name") {

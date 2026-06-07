@@ -564,6 +564,36 @@ export const parseProgram = (
   // Precedence-climbing binding powers (higher binds tighter). A compound-assign
   // operator (`+=`) is detected here and excluded so it falls through to
   // `parseExpr`'s assignment handling.
+  // Binding powers follow C/JS precedence so a mixed expression parses the way
+  // a C/JS reader expects. Bitwise `| ^ &` sit BELOW equality/relational (so
+  // `a & b == c` is `a & (b == c)`); shifts `<< >> >>>` sit BETWEEN relational
+  // and additive (so `a + b << c` is `(a + b) << c` — shifts looser than `+`).
+  // Among the new operators, looser→tighter: `|` < `^` < `&` < shifts. Note
+  // bitwise binds tighter than the logical `&&`/`||`, matching C. `~` (bitwise
+  // NOT) is a unary prefix handled in `parseUnary`, not here.
+  //
+  // The shift operators are NOT single lexer tokens: `>>`/`>>>` would collide
+  // with the `>>` that closes nested generics (`Box<Pair<T, U>>`), so the lexer
+  // keeps emitting individual `<`/`>` tokens and `parseBinary` recombines a run
+  // of *adjacent* `<<`/`>>`/`>>>` only in expression position. `shiftAt` reports
+  // the shift starting at the current token (and how many tokens it spans).
+  const SHIFT_BP = 13;
+  const shiftAt = (): { op: string; width: number } | undefined => {
+    const a = peek();
+    const b = peek(1);
+    const adj = (x: Token, y: Token) =>
+      x.stop.line === y.start.line && x.stop.column === y.start.column;
+    if (a.kind === "GREATER_THAN" && b.kind === "GREATER_THAN" && adj(a, b)) {
+      const c = peek(2);
+      if (c.kind === "GREATER_THAN" && adj(b, c)) return { op: ">>>", width: 3 };
+      return { op: ">>", width: 2 };
+    }
+    if (a.kind === "LESS_THAN" && b.kind === "LESS_THAN" && adj(a, b)) {
+      return { op: "<<", width: 2 };
+    }
+    return undefined;
+  };
+
   const infixBp = (t: Token): number => {
     if (ARITH_ASSIGN_OPS.has(t.kind) && peek(1).kind === "EQUAL") return 0;
     switch (t.kind) {
@@ -573,16 +603,23 @@ export const parseProgram = (
         return 4;
       case "AND":
         return 6;
-      case "IS":
+      case "PIPE": // bitwise OR (value position)
+        return 7;
+      case "CARET": // bitwise XOR
         return 8;
+      case "AMPERSAND": // bitwise AND (value position)
+        return 9;
+      case "IS":
+        return 10;
       case "EQUAL_TO":
       case "NOT_EQUAL_TO":
-        return 10;
+        return 11;
       case "GREATER_THAN":
       case "GREATER_THAN_OR_EQUAL_TO":
       case "LESS_THAN":
       case "LESS_THAN_OR_EQUAL_TO":
         return 12;
+      // shifts (`<< >> >>>`) bind at SHIFT_BP (13) — see `shiftAt`.
       case "PLUS":
       case "MINUS":
         return 14;
@@ -590,8 +627,6 @@ export const parseProgram = (
       case "DIV":
       case "MOD":
         return 16;
-      case "CARET":
-        return 18;
       default:
         return 0;
     }
@@ -613,6 +648,27 @@ export const parseProgram = (
     let left = parseUnary();
     for (;;) {
       const opTok = peek();
+      // Shift `<< >> >>>` — recombined here from adjacent `<`/`>` tokens (the
+      // lexer can't, lest it break nested-generic `>>`). Checked before the
+      // single-token operator path so a `<<`/`>>` run isn't mistaken for two
+      // relational `<`/`>`. Left-associative, like the other binary operators.
+      const shift = shiftAt();
+      if (shift && SHIFT_BP > minBp) {
+        for (let k = 0; k < shift.width; k++) next();
+        skipNewlines();
+        const right = parseBinary(SHIFT_BP);
+        const ctx = between(ctxOf(left), ctxOf(right));
+        const node: VLBinaryOperationNode = {
+          type: "BinaryOperation",
+          left,
+          right,
+          operator: shift.op,
+        };
+        record(node, ctx);
+        typeFromExpression(node, ctx);
+        left = node;
+        continue;
+      }
       // `expr !is Type` (A4) — negated type guard, Kotlin-style. Two tokens
       // (`!` `is`) rather than a dedicated lexeme; shares `is`'s binding power so
       // `x !is T` precedence matches `x is T`. Detected before `infixBp` because
@@ -761,6 +817,23 @@ export const parseProgram = (
         left: zero,
         right: operand,
         operator: "-",
+      };
+      record(node, ctx);
+      typeFromExpression(node, ctx);
+      return node;
+    }
+
+    // Bitwise NOT `~x`: a prefix unary at the same level as `!`/unary `-`,
+    // integer-only, lowered in codegen as `x ^ -1`.
+    if (at("TILDE")) {
+      next();
+      const operand = parseUnary();
+      const ctx = spanFrom(t);
+      const node: VLUnaryOperationNode = {
+        type: "UnaryOperation",
+        operator: "~",
+        operand,
+        prefix: true,
       };
       record(node, ctx);
       typeFromExpression(node, ctx);

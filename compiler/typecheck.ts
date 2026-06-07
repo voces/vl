@@ -279,6 +279,19 @@ export const _typeFromExpression = (
         );
         return { type: "Alias", name: "boolean" };
       }
+      // Bitwise NOT (`~`): integer-only (i32/i64), yielding the same (softened)
+      // integer type. Lowered in codegen as `x ^ -1`. A float operand is rejected
+      // here (it isn't assignable to the integer requirement).
+      if (expr.operator === "~") {
+        const soft = softenImplicitType(operandType);
+        const isInt = soft.type === "Object" &&
+          (soft.name === "i32" || soft.name === "i64");
+        if (!isInt) {
+          ensureType({ type: "Alias", name: "i32" }, operandType, ctx);
+          return { type: "Never" };
+        }
+        return soft;
+      }
       // `++` / `--`: in/decrement a numeric, yielding the same (softened) type.
       ensureType({ type: "Alias", name: "i32" }, operandType, ctx);
       return softenImplicitType(operandType);

@@ -91,6 +91,7 @@ export type TokenKind =
   | "COLON"
   | "PIPE"
   | "AMPERSAND"
+  | "TILDE"
   // Structural
   | "NEWLINE"
   | "EOF";
@@ -727,4 +728,5 @@ const ONE_CHAR: Record<string, TokenKind> = {
   ":": "COLON",
   "|": "PIPE",
   "&": "AMPERSAND",
+  "~": "TILDE",
 };
