@@ -71,7 +71,8 @@ doesn't belong here.
 
 - End commit messages with: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
 - Branch from `master` (CI runs the gate + LSP build on PRs and on push to `master`).
-- **Auto-watch every PR you open** — subscribe to its activity and follow it through
+- **Always open a PR for work you push, and auto-watch it** — don't leave finished work
+  on an un-PR'd branch. Open the PR, subscribe to its activity, and follow it through
   until it is merged or closed (investigate CI failures and review comments; fix the
   small/clear ones, ask on anything ambiguous).
 
