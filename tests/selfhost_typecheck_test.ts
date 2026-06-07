@@ -17,7 +17,8 @@
 // (arity + arg/param compatibility); binary numeric ops and comparisons; if/return;
 // member access on objects; and structural assignability.
 
-import { compile, runWasm } from "../compiler/compile.ts";
+import { runWasm } from "../compiler/compile.ts";
+import { compileCached } from "./_selfhost_cache.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
@@ -35,12 +36,7 @@ const typecheck = read("../compiler/typecheck.vl");
 // Compile `ast.vl ++ parser.vl ++ typecheck.vl ++ driver`, run it, return the logs.
 const runDriver = async (driver: string): Promise<string[]> => {
   const source = ast + "\n" + parser + "\n" + typecheck + "\n" + driver;
-  // `optimize: false`: this test only runs the module and diffs its printed
-  // diagnostics, which binaryen's optimize() pass cannot change. Skipping it
-  // roughly halves the per-sub-test compile time on this large self-host module.
-  const { wasm, diagnostics } = await compile(source, "source.vl", {
-    optimize: false,
-  });
+  const { wasm, diagnostics } = await compileCached(source);
   const errors = diagnostics.filter((d) => d.severity === "error");
   if (errors.length > 0 || !wasm) {
     throw new Error(

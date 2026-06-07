@@ -355,7 +355,6 @@ export const checkOnly = (source: string): CheckResult => {
 export const compile = async (
   source: string,
   fileName = "source.vl",
-  options: { optimize?: boolean } = {},
 ): Promise<CompileResult> => {
   const { ast, diagnostics, symbols, spans, comments } = checkOnly(source);
 
@@ -366,14 +365,8 @@ export const compile = async (
       const { toWasm } = await import("./toWasm.ts");
       // Thread the AST spans + file name into codegen so the emitted module
       // carries debug locations (a source map) and the name section — additive
-      // metadata only; the executable behavior is unchanged. `optimize` defaults
-      // to true; a caller that only runs+asserts output (the self-host tests)
-      // may pass `false` to skip binaryen's optimize() pass and compile faster.
-      const emit = await toWasm(ast, {
-        spans,
-        fileName,
-        optimize: options.optimize,
-      });
+      // metadata only; the executable behavior is unchanged.
+      const emit = await toWasm(ast, { spans, fileName });
       wasm = emit.binary;
       sourceMap = emit.sourceMap;
     } catch (err) {
