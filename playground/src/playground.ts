@@ -13,7 +13,9 @@
 // bundles it into this module and the TLA runs at module-eval time in the page.
 
 import {
+  checkProgram,
   compile,
+  compileProgram,
   runWasm,
   type VLDiagnostic,
   wasmToWat,
@@ -29,6 +31,8 @@ export type PlaygroundResult = {
   wat?: string;
   /** True when codegen produced a module (no error diagnostics). */
   compiled: boolean;
+  /** Size in bytes of the emitted wasm module, when one was produced. */
+  wasmBytes?: number;
 };
 
 /**
@@ -43,11 +47,59 @@ export const runProgram = async (
   opts: { wat?: boolean } = {},
 ): Promise<PlaygroundResult> => {
   const { diagnostics, wasm } = await compile(source);
+  return finishRun(diagnostics, wasm, opts);
+};
 
+/**
+ * Multi-file (whole-program) variant of {@link runProgram}. `files` is the
+ * project: filename → source. `entry` is the entry module (the first file,
+ * `main.vl`), from which the import graph is resolved. The whole graph is
+ * compiled to ONE wasm module via `compileProgram` (compiler/compile.ts),
+ * matching VL's model: `N files → 1 module`. A single-file project is just this
+ * with a one-entry graph — but `runProgram` stays the path for the no-import
+ * case so existing callers/tests are untouched.
+ */
+export const runProject = async (
+  files: Record<string, string>,
+  entry: string,
+  opts: { wat?: boolean } = {},
+): Promise<PlaygroundResult> => {
+  const { diagnostics, wasm } = await compileProgram(
+    entry,
+    (key) => files[key],
+    entry,
+  );
+  return finishRun(diagnostics, wasm, opts);
+};
+
+/**
+ * Whole-program (codegen-free) front end for a project: resolve + parse +
+ * type-check the import graph from `entry`, returning the aggregated diagnostics
+ * (parse/type errors PLUS cross-module import-resolution errors). This is the
+ * graph-aware analogue of the single-file `lsp.diagnostics` — `main.ts` uses it
+ * so a multi-file project surfaces real import errors (bad path, name not
+ * exported) instead of single-file "undeclared <imported-name>" noise.
+ */
+export const checkProject = async (
+  files: Record<string, string>,
+  entry: string,
+): Promise<VLDiagnostic[]> => {
+  const { diagnostics } = await checkProgram(entry, (key) => files[key]);
+  return diagnostics;
+};
+
+// Shared tail: optionally emit WAT, then instantiate + capture `log` output.
+const finishRun = async (
+  diagnostics: VLDiagnostic[],
+  wasm: Uint8Array | undefined,
+  opts: { wat?: boolean },
+): Promise<PlaygroundResult> => {
   // No module means error diagnostics (or codegen failed) — nothing to run.
   if (!wasm) {
     return { diagnostics, logs: [], compiled: false };
   }
+
+  const wasmBytes = wasm.length;
 
   let wat: string | undefined;
   if (opts.wat) {
@@ -63,7 +115,7 @@ export const runProgram = async (
 
   try {
     const { logs } = await runWasm(wasm);
-    return { diagnostics, logs, wat, compiled: true };
+    return { diagnostics, logs, wat, compiled: true, wasmBytes };
   } catch (err) {
     // A runtime trap (e.g. an out-of-bounds access) escapes WebAssembly
     // instantiation. Surface it as an error diagnostic with no source span so
@@ -79,6 +131,6 @@ export const runProgram = async (
         end: { line: 0, character: 0 },
       },
     });
-    return { diagnostics, logs: [], wat, compiled: true };
+    return { diagnostics, logs: [], wat, compiled: true, wasmBytes };
   }
 };
