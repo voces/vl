@@ -5,6 +5,15 @@
 // implementation-agnostic: the same files will validate a future self-hosted
 // compiler unchanged.
 //
+// MULTI-FILE ("module") CASES: a directory that contains an `entry.vl` is ONE
+// case — a multi-file program whose entry point is `entry.vl`. It is compiled
+// with `compileProgram` and an on-disk reader so `import "./util"` resolves to
+// the sibling file. Directives live on `entry.vl` and are asserted with the
+// SAME logic as a single-file case (diagnostics vs. directives; @run diffs the
+// log). The harness does NOT descend into such a directory, so the sibling
+// `.vl` files are never run as standalone single-file cases. Directories
+// WITHOUT an `entry.vl` keep the plain file-per-test behavior.
+//
 // Directives:
 //   // @check            type-check only, no run (default)
 //   // @run              compile, then instantiate + run, capturing `log` output
@@ -34,6 +43,8 @@
 
 import {
   compile,
+  compileProgram,
+  type CompileResult,
   runWasm,
   type VLDiagnostic,
   VLRuntimeError,
@@ -137,13 +148,49 @@ const quiet = async <T>(fn: () => Promise<T>): Promise<T> => {
   }
 };
 
-const walk = async function* (dir: URL): AsyncGenerator<URL> {
+/**
+ * A discovered test case. A single-file case is one `.vl` file compiled
+ * standalone. A module case is a DIRECTORY that contains an `entry.vl`; it is
+ * compiled as a multi-file program rooted at that `entry.vl`, with siblings
+ * resolved on disk. The directives always come from `srcUrl`.
+ */
+type Case =
+  | { kind: "single"; url: URL }
+  | { kind: "module"; dir: URL; entry: URL };
+
+/** True if `dir` directly contains an `entry.vl` (→ it is a single module case). */
+const hasEntry = async (dir: URL): Promise<boolean> => {
+  try {
+    const st = await Deno.stat(new URL("entry.vl", dir));
+    return st.isFile;
+  } catch {
+    return false;
+  }
+};
+
+const walk = async function* (dir: URL): AsyncGenerator<Case> {
+  // A directory holding an `entry.vl` is ONE multi-file case; do not descend
+  // into it, so its sibling `.vl` files are never run as single-file cases.
+  if (await hasEntry(dir)) {
+    yield { kind: "module", dir, entry: new URL("entry.vl", dir) };
+    return;
+  }
   for await (const entry of Deno.readDir(dir)) {
     const child = new URL(entry.name + (entry.isDirectory ? "/" : ""), dir);
     if (entry.isDirectory) yield* walk(child);
-    else if (entry.name.endsWith(".vl")) yield child;
+    else if (entry.name.endsWith(".vl")) yield { kind: "single", url: child };
   }
 };
+
+/**
+ * Reads a `.vl` module given its resolved key for `compileProgram`. Keys are
+ * absolute, `/`-separated filesystem paths (NOT `file://` URLs — the resolver's
+ * pure string-math normalization would mangle a scheme), so the reader reads the
+ * path directly. Returns `undefined` for a missing path (an unresolvable
+ * import).
+ */
+const diskReader = (key: string): Promise<string | undefined> =>
+  Deno.readTextFile(key).catch(() => undefined);
 
 const errorMessages = (diags: VLDiagnostic[]) =>
   diags.filter((d) => d.severity === "error").map((d) => d.message);
@@ -157,187 +204,201 @@ const infoMessages = (diags: VLDiagnostic[]) =>
 const hintMessages = (diags: VLDiagnostic[]) =>
   diags.filter((d) => d.severity === "hint").map((d) => d.message);
 
-const files: URL[] = [];
-for await (const f of walk(CASES_DIR)) files.push(f);
-files.sort((a, b) => a.href.localeCompare(b.href));
+/**
+ * Run the directive assertions against a compile result. This is shared by both
+ * the single-file path (`compile`) and the module path (`compileProgram`) so
+ * they enforce IDENTICAL semantics: declared diagnostics must appear, strict-by-
+ * default rejects any undeclared diagnostic, and @run diffs the captured log.
+ */
+const assertCase = async (
+  d: Directives,
+  { diagnostics, wasm, sourceMap }: CompileResult,
+): Promise<void> => {
+  if (d.unknown.length) {
+    throw new Error(
+      `unrecognized directive(s): ${d.unknown.map((k) => `@${k}`).join(", ")}`,
+    );
+  }
 
-for (const file of files) {
-  const name = file.href.slice(CASES_DIR.href.length);
-  const src = await Deno.readTextFile(file);
+  const errs = errorMessages(diagnostics);
+
+  for (const want of d.errors) {
+    if (!errs.some((m) => m.includes(want))) {
+      throw new Error(
+        `expected an error containing "${want}", got: ${JSON.stringify(errs)}`,
+      );
+    }
+  }
+
+  const warns = warningMessages(diagnostics);
+  for (const want of d.warnings) {
+    if (!warns.some((m) => m.includes(want))) {
+      throw new Error(
+        `expected a warning containing "${want}", got: ${
+          JSON.stringify(warns)
+        }`,
+      );
+    }
+  }
+
+  const infos = infoMessages(diagnostics);
+  for (const want of d.infos) {
+    if (!infos.some((m) => m.includes(want))) {
+      throw new Error(
+        `expected an info containing "${want}", got: ${JSON.stringify(infos)}`,
+      );
+    }
+  }
+
+  const hints = hintMessages(diagnostics);
+  for (const want of d.hints) {
+    if (!hints.some((m) => m.includes(want))) {
+      throw new Error(
+        `expected a hint containing "${want}", got: ${JSON.stringify(hints)}`,
+      );
+    }
+  }
+
+  for (const want of d.errorsAt) {
+    const hit = diagnostics.some((di) =>
+      di.severity === "error" &&
+      di.range.start.line === want.line &&
+      di.range.start.character === want.col &&
+      di.message.includes(want.text)
+    );
+    if (!hit) {
+      const got = diagnostics
+        .filter((di) => di.severity === "error")
+        .map((di) =>
+          `${di.range.start.line}:${di.range.start.character} ${di.message}`
+        );
+      throw new Error(
+        `expected an error at ${want.line}:${want.col} containing ` +
+          `"${want.text}", got: ${JSON.stringify(got)}`,
+      );
+    }
+  }
+
+  // Strict by default: EVERY diagnostic must have been declared, at every
+  // severity. A diagnostic is "expected" if a directive of its severity
+  // matches its message (errors also via @error-at). Anything left over is
+  // an unexpected regression and fails — so omitting the directives is
+  // itself the must-not-error assertion (no @ok needed).
+  const unexpected = (
+    actual: string[],
+    expected: (m: string) => boolean,
+    severity: string,
+    directive: string,
+  ) => {
+    const extra = actual.filter((m) => !expected(m));
+    if (extra.length) {
+      throw new Error(
+        `unexpected ${severity}(s) (declare with ${directive} if ` +
+          `intended): ${JSON.stringify(extra)}`,
+      );
+    }
+  };
+  unexpected(
+    errs,
+    (m) =>
+      d.errors.some((w) => m.includes(w)) ||
+      d.errorsAt.some((w) => m.includes(w.text)),
+    "error",
+    "@error",
+  );
+  unexpected(
+    warns,
+    (m) => d.warnings.some((w) => m.includes(w)),
+    "warning",
+    "@warning",
+  );
+  unexpected(
+    infos,
+    (m) => d.infos.some((w) => m.includes(w)),
+    "info",
+    "@info",
+  );
+  unexpected(
+    hints,
+    (m) => d.hints.some((w) => m.includes(w)),
+    "hint",
+    "@hint",
+  );
+
+  if (d.mode === "run") {
+    if (!wasm) {
+      throw new Error(
+        `@run but no wasm was produced; errors: ${JSON.stringify(errs)}`,
+      );
+    }
+    if (d.trap.length) {
+      // Expect a runtime trap whose VL-located message contains every
+      // declared substring. Run with the source map so the message is
+      // mapped to `file:line:column` (roadmap B-debug).
+      let thrown: unknown;
+      try {
+        await quiet(() => runWasm(wasm, sourceMap));
+      } catch (err) {
+        thrown = err;
+      }
+      if (!(thrown instanceof VLRuntimeError)) {
+        throw new Error(
+          `@trap expected a runtime trap, but the program ` +
+            (thrown
+              ? `threw ${(thrown as Error).name}: ${(thrown as Error).message}`
+              : `ran without trapping`),
+        );
+      }
+      for (const want of d.trap) {
+        if (!thrown.message.includes(want)) {
+          throw new Error(
+            `@trap message mismatch\n  expected to contain: ${
+              JSON.stringify(want)
+            }\n` +
+              `  actual:              ${JSON.stringify(thrown.message)}`,
+          );
+        }
+      }
+    } else {
+      const { logs } = await quiet(() => runWasm(wasm, sourceMap));
+      if (JSON.stringify(logs) !== JSON.stringify(d.logs)) {
+        throw new Error(
+          `log mismatch\n  expected: ${JSON.stringify(d.logs)}\n` +
+            `  actual:   ${JSON.stringify(logs)}`,
+        );
+      }
+    }
+  }
+};
+
+const cases: Case[] = [];
+for await (const c of walk(CASES_DIR)) cases.push(c);
+const caseName = (c: Case): string =>
+  (c.kind === "single" ? c.url.href : c.dir.href).slice(CASES_DIR.href.length);
+cases.sort((a, b) => caseName(a).localeCompare(caseName(b)));
+
+for (const c of cases) {
+  const name = caseName(c);
+  // Directives always come from the case's primary file: the lone `.vl` for a
+  // single-file case, or `entry.vl` for a module case.
+  const srcUrl = c.kind === "single" ? c.url : c.entry;
+  const src = await Deno.readTextFile(srcUrl);
   const d = parseDirectives(src);
 
   Deno.test({
     name,
     ignore: d.skip != null,
     fn: async () => {
-      if (d.unknown.length) {
-        throw new Error(
-          `unrecognized directive(s): ${
-            d.unknown.map((k) => `@${k}`).join(", ")
-          }`,
-        );
-      }
-
-      const { diagnostics, wasm, sourceMap } = await quiet(() =>
-        compile(src, name)
-      );
-      const errs = errorMessages(diagnostics);
-
-      for (const want of d.errors) {
-        if (!errs.some((m) => m.includes(want))) {
-          throw new Error(
-            `expected an error containing "${want}", got: ${
-              JSON.stringify(errs)
-            }`,
-          );
-        }
-      }
-
-      const warns = warningMessages(diagnostics);
-      for (const want of d.warnings) {
-        if (!warns.some((m) => m.includes(want))) {
-          throw new Error(
-            `expected a warning containing "${want}", got: ${
-              JSON.stringify(warns)
-            }`,
-          );
-        }
-      }
-
-      const infos = infoMessages(diagnostics);
-      for (const want of d.infos) {
-        if (!infos.some((m) => m.includes(want))) {
-          throw new Error(
-            `expected an info containing "${want}", got: ${
-              JSON.stringify(infos)
-            }`,
-          );
-        }
-      }
-
-      const hints = hintMessages(diagnostics);
-      for (const want of d.hints) {
-        if (!hints.some((m) => m.includes(want))) {
-          throw new Error(
-            `expected a hint containing "${want}", got: ${
-              JSON.stringify(hints)
-            }`,
-          );
-        }
-      }
-
-      for (const want of d.errorsAt) {
-        const hit = diagnostics.some((di) =>
-          di.severity === "error" &&
-          di.range.start.line === want.line &&
-          di.range.start.character === want.col &&
-          di.message.includes(want.text)
-        );
-        if (!hit) {
-          const got = diagnostics
-            .filter((di) => di.severity === "error")
-            .map((di) =>
-              `${di.range.start.line}:${di.range.start.character} ${di.message}`
-            );
-          throw new Error(
-            `expected an error at ${want.line}:${want.col} containing ` +
-              `"${want.text}", got: ${JSON.stringify(got)}`,
-          );
-        }
-      }
-
-      // Strict by default: EVERY diagnostic must have been declared, at every
-      // severity. A diagnostic is "expected" if a directive of its severity
-      // matches its message (errors also via @error-at). Anything left over is
-      // an unexpected regression and fails — so omitting the directives is
-      // itself the must-not-error assertion (no @ok needed).
-      const unexpected = (
-        actual: string[],
-        expected: (m: string) => boolean,
-        severity: string,
-        directive: string,
-      ) => {
-        const extra = actual.filter((m) => !expected(m));
-        if (extra.length) {
-          throw new Error(
-            `unexpected ${severity}(s) (declare with ${directive} if ` +
-              `intended): ${JSON.stringify(extra)}`,
-          );
-        }
-      };
-      unexpected(
-        errs,
-        (m) =>
-          d.errors.some((w) => m.includes(w)) ||
-          d.errorsAt.some((w) => m.includes(w.text)),
-        "error",
-        "@error",
-      );
-      unexpected(
-        warns,
-        (m) => d.warnings.some((w) => m.includes(w)),
-        "warning",
-        "@warning",
-      );
-      unexpected(
-        infos,
-        (m) => d.infos.some((w) => m.includes(w)),
-        "info",
-        "@info",
-      );
-      unexpected(
-        hints,
-        (m) => d.hints.some((w) => m.includes(w)),
-        "hint",
-        "@hint",
-      );
-
-      if (d.mode === "run") {
-        if (!wasm) {
-          throw new Error(
-            `@run but no wasm was produced; errors: ${JSON.stringify(errs)}`,
-          );
-        }
-        if (d.trap.length) {
-          // Expect a runtime trap whose VL-located message contains every
-          // declared substring. Run with the source map so the message is
-          // mapped to `file:line:column` (roadmap B-debug).
-          let thrown: unknown;
-          try {
-            await quiet(() => runWasm(wasm, sourceMap));
-          } catch (err) {
-            thrown = err;
-          }
-          if (!(thrown instanceof VLRuntimeError)) {
-            throw new Error(
-              `@trap expected a runtime trap, but the program ` +
-                (thrown
-                  ? `threw ${(thrown as Error).name}: ${
-                    (thrown as Error).message
-                  }`
-                  : `ran without trapping`),
-            );
-          }
-          for (const want of d.trap) {
-            if (!thrown.message.includes(want)) {
-              throw new Error(
-                `@trap message mismatch\n  expected to contain: ${
-                  JSON.stringify(want)
-                }\n` +
-                  `  actual:              ${JSON.stringify(thrown.message)}`,
-              );
-            }
-          }
-        } else {
-          const { logs } = await quiet(() => runWasm(wasm, sourceMap));
-          if (JSON.stringify(logs) !== JSON.stringify(d.logs)) {
-            throw new Error(
-              `log mismatch\n  expected: ${JSON.stringify(d.logs)}\n` +
-                `  actual:   ${JSON.stringify(logs)}`,
-            );
-          }
-        }
-      }
+      const result = await quiet(() => {
+        if (c.kind === "single") return compile(src, name);
+        // Module case: compile the multi-file program rooted at `entry.vl`,
+        // reading siblings on disk so `import "./util"` resolves. The entry key
+        // is the absolute filesystem path (not a `file://` URL — the resolver's
+        // pure string normalization would mangle a scheme).
+        const entryKey = c.entry.pathname;
+        return compileProgram(entryKey, diskReader, name);
+      });
+      await assertCase(d, result);
     },
   });
 }
