@@ -240,7 +240,13 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 ## Track E — Browser playground + sandbox
 *Depends on C1. The compiler is pure TS + binaryen (wasm), so it runs client-side.*
 
-- 🟡 **E2. Playground UI.** REMAINING: Monaco/CodeMirror editor.
+- 🟢 **E2. Playground UI.** Monaco editor + client-side LSP, branded light/dark theme pair
+  (persisted; lock-step `data-mode` ↔ `monaco.editor.setTheme`), results-as-tabs
+  (Output / WAT-with-size-badge / Diagnostics-with-count-badge), multi-file projects
+  (one model per file, `inmemory://` URIs; per-file squiggles, aggregated Diagnostics that
+  jump to file+line; whole-program Run/WAT via `compileProgram` → `N files → 1 module`),
+  opt-in auto-run (always-on debounced diagnostics+WAT; opt-in execution), full-width status
+  bar, real Share + Format wiring. (Sandboxed-Worker execution is E3.)
 - ⬜ **E3. Sandboxed execution** — compiled user wasm in a Web Worker, fresh `Memory`, controlled
   `log` only, enforced limits. (Today user wasm runs on the main thread — fine for local use,
   harden before any public deploy.)
