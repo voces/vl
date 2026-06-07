@@ -1969,6 +1969,12 @@ export const thenNarrowings = (cond: VLExpression): Narrowing[] => {
     return [...thenNarrowings(cond.left), ...thenNarrowings(cond.right)];
   }
   if (cond.type === "BinaryOperation" && cond.operator === "||") return [];
+  // `!(c)` is true exactly when `c` is false — its then-facts are `c`'s
+  // else-facts (De Morgan). This lets a negated guard (`!(x is T)`) narrow the
+  // same way `x is T`'s else branch would, for any guard atom.
+  if (cond.type === "UnaryOperation" && cond.operator === "!") {
+    return elseNarrowings(cond.operand);
+  }
   const f = atomFact(cond);
   if (!f) return [];
   return [...optionalChainThenFacts(f.place), ...factNarrowing(f, "then")];
@@ -1983,6 +1989,12 @@ export const elseNarrowings = (cond: VLExpression): Narrowing[] => {
     return [...elseNarrowings(cond.left), ...elseNarrowings(cond.right)];
   }
   if (cond.type === "BinaryOperation" && cond.operator === "&&") return [];
+  // `!(c)` is false exactly when `c` is true — its else-facts are `c`'s
+  // then-facts (De Morgan). So the fall-through after `if !(x is T) { return }`
+  // narrows `x` to `T`, mirroring the positive `if x is T { … }` branch.
+  if (cond.type === "UnaryOperation" && cond.operator === "!") {
+    return thenNarrowings(cond.operand);
+  }
   const f = atomFact(cond);
   if (!f || isOptionalChain(f.place)) return [];
   return factNarrowing(f, "else");
