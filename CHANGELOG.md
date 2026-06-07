@@ -22,6 +22,7 @@ see **`DECISIONS.md`**.
 - **A14 Named/opaque type crash fix** — bodyless-`type Point` infinite-recursion crash fixed (cycle-guarded `getConcreteType`; now errors cleanly). → `DECISIONS.md`
 - **A15 Structural equality** — `==`/`!=` by value; functions by reference; arrays + nested structs recurse via `valueEq`/`isEquatable`. → `DECISIONS.md`
 - **A16 Literal-union types (type-level)** — annotations constrain (`"a"|"b"` rejects `"c"`); `==`/`!=` discriminate + narrow; covering `if/else if` chain exhaustive.
+- **A17 Forward / mutual-reference return-type inference** — demand-driven (lazy + memoized, cycle-detected) return-type inference; a function calling a later-defined or mutually-recursive function no longer infers `any`; only a genuinely base-case-less inferred cycle still needs an explicit annotation. (#105; detail: `docs/selfhost-gaps.md` §A17)
 
 ## Codegen, memory & runtime (Track B)
 
@@ -77,6 +78,7 @@ see **`DECISIONS.md`**.
 - **F3 Retired `ts-interpreter/` → `reference/`.**
 - **F8 Dropped binaryen patch + `patch-package`** — LSP server is ESM; binaryen's TLA is legal there.
 - **F9 Perf baseline** — `deno task perf`; compile-time (front/codegen split) + wasm size over corpus; best-of-N. Finding: literal-union compilation is ~cubic in member count (200 → ~2 s). (→ `docs/perf-findings.md`)
+- **F9c Memoize `structSig` in `toWasm.ts`** — the structural-signature walk was uncached and dominated IR-build on the self-host module (~6 s of ~7.7 s total; 268k calls). Caching by type-node identity (empty `nameStack` only) cut selfhost-suite wall time ~107 s → ~30 s with byte-identical wasm. Post-fix: binaryen `optimize()` is only ~0.8 s on this module, not the bottleneck. (#107; detail: `docs/perf-findings.md`)
 
 ## Parser (Track G — complete)
 
@@ -98,4 +100,6 @@ see **`DECISIONS.md`**.
 - **H2 gap-7 One-char string literal `.length`** — string literals soften to nominal `string`; no longer mis-types as a char.
 - **H2 char literals + `toString`/stringify** — both landed as part of H2 gap work.
 - **H4.2 Value-level bitwise/shift operators** — shipped in #99 (see B2 above).
+- **H4.3 Unsigned right-shift** (`>>>`) — resolved by #99 (`>>>` is now a native operator); `ulebToArr` in `wasmEmit.vl` uses `v >>> 7` for all i32 values including those with bit 31 set. (detail: `docs/selfhost-gaps.md` §H4.3)
+- **H4.4 Signed `%` sign fix** — resolved via H4.2 (#99): `& 0x7f` / `& 0xff` bitwise masks replace the arithmetic correction branches; naturally unsigned, no special-casing needed. (detail: `docs/selfhost-gaps.md` §H4.4)
 - **H-pipeline VL-in-VL front end end-to-end** — `lexer.vl → parser.vl → typecheck.vl` chain driving source text through a wired pipeline; proves the front end self-hosts. (`tests/selfhost_pipeline_test.ts` + `tests/selfhost/pipeline_harness.vl`)

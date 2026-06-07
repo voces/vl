@@ -26,13 +26,15 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 
 ## Next (highest leverage)
 
-- **A17 — forward / mutual-reference return-type inference** — removes the ergonomic wart where a
-  function calling a later-defined function (or mutual recursion) infers `any`. High value for the
-  inference-first identity of the language and for self-hosting a recursive-descent compiler.
-- **H4.1 / H4.3–H4.6** — remaining self-host codegen gaps before VL-in-VL can emit wasm.
-- **H2a Re-land clean `selfhost/lexer.vl`** — now unblocked by H2 gap fixes; first concrete H3 slice.
-- **F9a `VL_NO_OPT`** — single-file `toWasm.ts` change, cuts test suite wall time by ~20–25 s.
-  (detail: `docs/perf-findings.md`)
+- **Contextual parameter inference (A-infer-ctx)** — infer lambda param types from the expected
+  function type at the call site (`xs.map(function(n) n*2)`). 🟡 In-progress
+  (`claude/contextual-param-inference`).
+- **Robustness floor (A-robust)** — an unresolved `Infer`/`Unknown` must yield a clear diagnostic,
+  never a cryptic codegen crash (repro: `const xs = []; xs.push(1)`).
+- **Exhaustiveness analysis for `is`-chains (A-exhaust)** — flag dead arms, enable omitting the
+  final `else`, elide provably-true discriminants in codegen.
+- **H4.1 / H4.5–H4.6** — remaining self-host codegen gaps before VL-in-VL can emit wasm.
+- **H2a Re-land clean `selfhost/lexer.vl`** — now unblocked; first concrete H3 slice.
 - **C5 / H-M1** — `deno compile` + brew tap. Small, decoupled; ships the distribution story now.
 - Smaller/independent: B6b collections building blocks, B13 callable objects, B17 lint backlog,
   A6b Stage A, A3 structural intersection merge.
@@ -60,11 +62,10 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   Exact. Guards the `a.foo = b` width footgun. (TODO.md)
 - ⬜ **A9. Readable / Writable variance.** Applied automatically during parameter inference. (TODO.md)
 - 🟡 **A10. Parametric types / generics.** REMAINING: same `map`/`filter` generics for `Map`/`Set`
-  (B6a); **annotation-free inference for forward-referenced / mutually-recursive top-level functions**
-  — closing that needs call-graph **SCC grouping + group unification** (ML `let rec … and …` style).
-  Also REMAINING: **const generics** (numeric/value type parameters, e.g. `Decimal<10, 8>` /
+  (B6a); **const generics** (numeric/value type parameters, e.g. `Decimal<10, 8>` /
   `Buffer<N>`) — today generics take *type* params only; enabler for the parameterized
   `Decimal<Backing, Scale>` family (B2) and any fixed-size/parameter-by-value type.
+  (Forward/mutual-reference return-type inference: shipped as A17 — see `CHANGELOG.md`.)
 - 🟡 **A11. Recursive structural types.** REMAINING: mutual recursion across *separate* `type` decls;
   recursion through an **array** element (`{ rest: [List] }`).
 - 🟡 **A12. Soundness corpus.** REMAINING: keep growing it; the known-unsound corners are
@@ -85,16 +86,31 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **A16. Literal-union types.** REMAINING: the **enum representation** (i32 tag for a closed
   literal union — see `docs/unions.md`); a literal union read *inside* a body softens to base
   (coarser member-narrowing there than at the call boundary).
-- ⬜ **A17. Forward / mutual-reference return-type inference.** Today return types are inferred inline
-  in source order: a function that calls another defined later (or a mutually-recursive pair) sees an
-  unresolved `Infer` hole (`any`) for the callee's return type. The fix is to **decouple return-type
-  inference from source order** — demand-driven (lazy + memoized, inferring a callee's body on first
-  use, cycle-detected so a mutual group is inferred together) or SCC dependency-ordered inference
-  (ML `let rec … and …` style). Generalises self-recursion resolution to cross-function and
-  mutual-recursive cases; only a genuinely base-case-less inferred cycle still needs an explicit
-  annotation. High value: removes a real ergonomic wart and unblocks idiomatic inference-first `.vl`
-  (a recursive-descent compiler is one big mutually-recursive cluster). Ties A10 (SCC grouping noted
-  there). (detail: `docs/selfhost-gaps.md` §A17)
+- ⬜ **A17 follow-up: `never` inference + `unconditional-recursion` lint.** A17 demand-driven inference
+  is shipped. REMAINING: (a) infer `never` for a genuinely base-case-less divergent recursive cycle
+  (currently a stopgap "annotate a return type" error); (b) an `unconditional-recursion` lint that fires
+  even when the return type is explicitly annotated (catches accidental infinite loops).
+- 🟡 **A-infer-ctx. Contextual parameter inference.** In-progress (`claude/contextual-param-inference`).
+  Infer lambda/callback param types from the **expected function type** at the call site, e.g.
+  `xs.map(function(n) n*2)` infers `n: i32` from `T[]`'s element type. Consistent with the
+  "hide types where possible" identity; today untyped lambda params are a type error. Ties A10 (generic
+  element type) and B15 (untyped lambdas).
+- ⬜ **A-infer-empty. Usage-based inference for empty collections.** Infer `Map()`/`Set()`/`[]` element
+  / key / value types from **later usage** (`m.set(k,v)`, `xs.push(x)`) — like evolving-array
+  inference. Today `const xs = []` then `xs.push(1)` crashes with an `Infer`/`Unknown` codegen error
+  rather than inferring `xs: i32[]` from the `push` constraint.
+- ⬜ **A-infer-params. Top-level function param inference.** Infer named-function param types from
+  usage constraints (HM / the existing A13 row-poly inference path), consistent with "hide types where
+  possible." Requiring annotations on all named-fn params is NOT VL's stated stance.
+- ⬜ **A-exhaust. Exhaustiveness analysis for `is`-chains.** Three sub-items all reuse the existing
+  `conditionsExhaust` helper: (a) flag a **dead arm / dead `else`** after an already-exhaustive chain;
+  (b) recognize exhaustiveness for return-coverage so the trailing `else` can be **omitted** (the
+  checker sees the chain as covering); (c) **codegen**: elide the provably-true final discriminant test
+  + drop the dead arm — a type-driven optimization binaryen cannot do (it lacks union exhaustiveness).
+- ⬜ **A-robust. Robustness floor.** An unresolved `Infer`/`Unknown` type must produce a clear
+  **"cannot infer — annotate"** diagnostic; it must NEVER surface as a cryptic `Unhandled "Unknown"
+  type` codegen error or a `containsInfer` TypeError crash. Repro: `const xs = []; xs.push(1)`.
+  Ties A-infer-empty (fixing that removes the main trigger).
 
 ---
 
@@ -159,9 +175,20 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   A `while` loop in *tail position* of a `void`-returning function body aborts inside binaryen
   optimization. Workaround: don't end a void function on a bare `while`. Fix: investigate the
   Vacuum-pass input for a result-less loop in tail position (likely a malformed/None-typed block tail).
+- ⬜ **B-validwasm. Codegen must emit valid wasm WITHOUT relying on binaryen `optimize()`.** Some
+  constructs (nullable-ref narrowing after null-checks, divergent loops, maps/sets, recursive types)
+  currently produce valid wasm only after `optimize()` runs. The H4 self-hosted emitter path has no
+  binaryen, so codegen must produce valid wasm pre-optimize. Surfaced by the `VL_NO_OPT` experiment;
+  prerequisite for H4 / H-M2 (emit-bytes-directly). Audit each construct that relies on binaryen to
+  legalize its output and fix the IR-builder to emit legal wasm directly.
 - ⬜ **B20. Loops as expressions + `break <value>`.** Lift `for`/`while` into expression position;
   a loop evaluates to its `break` value or `null`. Three layers: grammar → types (mirror the
   `returnTypes` mechanism) → codegen (`__brk` block gets a result type).
+- ⬜ **B21. `match` construct.** A `match` expression with **exhaustiveness-by-default**: a missing
+  arm is a hard error (à la Rust/Swift), not a silent fall-through. The proper language home for
+  enforced exhaustiveness on union/literal discrimination — complements the if-chain coverage check
+  (A-exhaust) with structured syntax and compiler-enforced completeness. Design: arms match on type
+  or literal; each arm is an expression; the `match` evaluates to the arm's type (union of arms).
 - 🟡 **B-debug. Source maps + trap diagnostics follow-ups.** REMAINING: (1) **full source-mapped
   stack traces** — map every wasm frame in the trap's stack → VL `function (file:L:C)`, not just
   the top frame; (2) **value-rich panic messages** — a host `panic(msg)` abort path that formats
@@ -228,19 +255,18 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **F9. Perf baseline.** REMAINING: a *runtime* benchmark (run compiled `.vl` programs on large
   inputs); investigate the cubic literal-union compile (A16).
   **Perf wins identified (detail: `docs/perf-findings.md`):**
-  - ✅ **F9c. Memoize `structSig` in `toWasm.ts`** — the structural-signature walk was uncached and
-    dominated IR-build on the self-host module (~6 s of a ~7.7 s compile; 268k calls). Caching by
-    type-node identity (empty `nameStack` only) cut selfhost-suite wall time ~107 s → ~30 s with
-    byte-identical wasm. NOTE: `optimize()` is NOT the dominant cost on this module (~0.8 s);
-    revisit F9a's premise. (Earlier `~4 s optimize` figure predates current codegen.)
-  - ⬜ **F9a. Skip `optimize()` in test compiles (`VL_NO_OPT`)** — binaryen `m.optimize()` is the
-    dominant cost (~4 s per selfhost sub-test vs ~0.14 s without it). A `noOptimize` option (or
-    `VL_NO_OPT=1` env var) in `toWasm()` would cut total test time by ~20–25 s. Change touches
-    only `toWasm.ts`. (detail: `docs/perf-findings.md` §Part 3 — High-Impact)
+  - ✅ **F9c. Memoize `structSig`** — shipped (#107); see `CHANGELOG.md`. Post-fix: binaryen
+    `optimize()` costs only ~0.8 s on the self-host module — NOT the bottleneck.
+  - 🚫 **F9a. `VL_NO_OPT` / skip `optimize()` in tests — ABANDONED / SUPERSEDED.** The original
+    premise was that `optimize()` dominates self-host compile time (~4 s/test). After the F9c
+    `structSig` memoize fix (#107) the true bottleneck was eliminated: optimize is only ~0.8 s.
+    F9a's projected ~20–25 s saving no longer applies. Keeping `VL_NO_OPT` as a "someday" option
+    (LOW priority) if a future regression makes optimize a bottleneck again; not a near-term action.
+    (detail: `docs/perf-findings.md`)
   - ⬜ **F9b. Cache / clone binaryen IR across selfhost sub-tests** — each of the 5
-    `selfhost_pipeline_test.ts` sub-tests recompiles the same base source. Caching and cloning
-    the binaryen IR for the shared base would reduce 5×4 s to ~1×4 s + 4×driver-only compiles.
-    More involved than F9a (binaryen modules are not trivially cloneable).
+    `selfhost_pipeline_test.ts` sub-tests recompiles the same base source. Caching the binaryen IR
+    for the shared base is more involved (binaryen modules are not trivially cloneable); LOW priority
+    now that F9c removed the dominant cost.
     (detail: `docs/perf-findings.md` §Part 3 — Medium-Impact)
 
 ---
@@ -271,17 +297,12 @@ independent).*
   `selfhost/lexer.vl` (H2a). The multi-file substrate now exists (H0 phase 1).
   Migrating the H3 `.vl` files onto real imports is a separate follow-up.
   **Open self-host codegen limits (re-confirmed at pipeline scale; detail: `docs/selfhost-gaps.md`):**
-  - ⬜ **H3-gap3. `checkProgram` must be consumed in value position** — calling `checkProgram(...)`
-    as a bare statement or `let r = ...` hits "Expected numeric type" in codegen; only consuming
-    the result directly in a builtin call compiles. Fix in `toWasm.ts` — discarded / indirected
-    call return value lowering. (detail: `docs/selfhost-gaps.md` §3)
+  - ✅ **H3-gap3. `checkProgram` value-position** — resolved (#89, void/statement-position value drop);
+    see `docs/selfhost-gaps.md` §3.
   **Codegen capabilities needed before VL-in-VL can emit wasm (H4 sub-items):**
   - ⬜ **H4.1. No `byte`/`u8` type** — the self-hosted wasm emitter needs a byte type for binary
     output; VL has no unsigned 8-bit integer primitive today. (detail: `docs/selfhost-gaps.md` §H4.1)
-  - ⬜ **H4.3. Unsigned right-shift** (`>>>`) — wasm LEB128 encoding requires logical (unsigned) shift.
-    (detail: `docs/selfhost-gaps.md` §H4.3)
-  - ⬜ **H4.4. Signed `%` (modulo)** — for some encoding patterns an unsigned or floored modulo is
-    needed. (detail: `docs/selfhost-gaps.md` §H4.4)
+  - ✅ **H4.3 / H4.4** — resolved via bitwise/shift ops (#99); see `CHANGELOG.md`.
   - ⬜ **H4.5. In-VL byte→host handoff** — no mechanism to pass a raw byte buffer from VL code to
     the host; linear-memory FFI or a `bytes()` builtin needed. (detail: `docs/selfhost-gaps.md` §H4.5)
   - ⬜ **H4.6. Array spread / concat in call position** — the self-hosted emitter needs to accumulate
