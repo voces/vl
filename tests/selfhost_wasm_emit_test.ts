@@ -39,6 +39,12 @@ const runDriver = async (driver: string): Promise<string[]> => {
   return logs;
 };
 
+// Both tests drive the IDENTICAL fixture; compile + run it ONCE and share the
+// logs (the two tests just assert different emitted modules from the same run).
+let fixtureLogs: Promise<string[]> | undefined;
+const runFixture = (): Promise<string[]> =>
+  fixtureLogs ??= runDriver(read("./selfhost/wasm_emit_harness.vl"));
+
 // Parse one `name: b0,b1,...` log line into [name, Uint8Array].
 const parseLine = (line: string): [string, Uint8Array<ArrayBuffer>] => {
   const idx = line.indexOf(": ");
@@ -55,7 +61,7 @@ const parseLine = (line: string): [string, Uint8Array<ArrayBuffer>] => {
 };
 
 Deno.test("self-hosted wasm emit: VL emits a () -> i32 module that returns 42", async () => {
-  const logs = await runDriver(read("./selfhost/wasm_emit_harness.vl"));
+  const logs = await runFixture();
   const byName = new Map(logs.map(parseLine));
 
   const constBytes = byName.get("const");
@@ -84,7 +90,7 @@ Deno.test("self-hosted wasm emit: VL emits a () -> i32 module that returns 42", 
 });
 
 Deno.test("self-hosted wasm emit: VL emits an (i32) -> i32 identity module", async () => {
-  const logs = await runDriver(read("./selfhost/wasm_emit_harness.vl"));
+  const logs = await runFixture();
   const byName = new Map(logs.map(parseLine));
 
   const idBytes = byName.get("id");
