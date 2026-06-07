@@ -22,6 +22,7 @@ see **`DECISIONS.md`**.
 - **A14 Named/opaque type crash fix** — bodyless-`type Point` infinite-recursion crash fixed (cycle-guarded `getConcreteType`; now errors cleanly). → `DECISIONS.md`
 - **A15 Structural equality** — `==`/`!=` by value; functions by reference; arrays + nested structs recurse via `valueEq`/`isEquatable`. → `DECISIONS.md`
 - **A16 Literal-union types (type-level)** — annotations constrain (`"a"|"b"` rejects `"c"`); `==`/`!=` discriminate + narrow; covering `if/else if` chain exhaustive.
+- **A7b `boolean`-where-`i32`-expected coercion** — a `boolean`-typed VALUE coerces to `i32` (true→1, false→0) at an assignment boundary (binding/argument/return); no-op in codegen (shared i32 rep). One-directional (`i32` ⊄ `boolean`); excludes a bare boolean literal and membership/narrowing queries (`x is boolean` on `string | i32` still rejected).
 - **A17 Forward / mutual-reference return-type inference** — demand-driven (lazy + memoized, cycle-detected) return-type inference; a function calling a later-defined or mutually-recursive function no longer infers `any`; only a genuinely base-case-less inferred cycle still needs an explicit annotation. (#105; detail: `docs/selfhost-gaps.md` §A17)
 
 ## Codegen, memory & runtime (Track B)
