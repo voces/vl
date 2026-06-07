@@ -63,3 +63,27 @@ deno run -A scripts/build-binary.ts --all     # all five supported targets
 The `dist/` directory is `.gitignore`d — don't commit the built binary. See `DECISIONS.md`
 ("Parser, distribution & bootstrapping") for the flag rationale (`--node-modules-dir=none
 --no-lock` keeps the binary from embedding unused LSP packages).
+
+## GitHub Syntax Highlighting
+
+`.vl` files are highlighted on GitHub as **TypeScript** via a `.gitattributes`
+`linguist-language` override (VL is not a registered Linguist language).
+
+**Why TypeScript?** VL's token set is closest to TypeScript: shared keywords
+(`function`, `let`, `const`, `type`), generic angle-brackets (`<T>`), union
+types (`A | B`), intersection (`A & B`), negation (`!A`), optional chaining
+(`?.`), null-coalesce (`??`), `//`/`///` comments, double-quoted strings,
+single-quoted char literals, `0x`/`0b`/`0o` numeric prefixes with `_`
+digit-separators, and `is`-narrowing that reads like a TS type predicate.
+
+**Runner-up:** Kotlin — also has `fun`-adjacent `function`-like declarations and
+structural types, but its object/lambda syntax and comment conventions diverge
+more from VL than TypeScript's do.
+
+**Stats note:** `.vl` is also marked `linguist-detectable=false` so the
+TypeScript percentage in the repo stats bar is not inflated by VL sources.
+Remove that line in `.gitattributes` if you want `.vl` counted in the bar.
+
+To switch to a different base grammar, change the `linguist-language=TypeScript`
+line in `.gitattributes` — the [Linguist language list](https://github.com/github-linguist/linguist/blob/main/lib/linguist/languages.yml)
+has the canonical names. Reference: [github-linguist/linguist docs/overrides.md](https://github.com/github-linguist/linguist/blob/main/docs/overrides.md).
