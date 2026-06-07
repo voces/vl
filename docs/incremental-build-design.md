@@ -1,15 +1,16 @@
 # VL incremental builds & caching
 
-> Status: **design — open for review.** One piece is already implemented and
-> landed (L0: the content-addressed build-cache primitive + the self-host test
-> cache that rides on it); everything past L1 is proposal. This doc is the place
-> to weigh alternatives before committing — the final word lands in
-> `DECISIONS.md` at implementation time (same convention as
-> `docs/modules-design.md` / `docs/collections-design.md`).
+> Status: **partially landed; rest open for review.** Landed: L0 (the
+> content-addressed build-cache primitive), the **binaryen-`optimize()` stage
+> cache**, and **L1** (CI caching). L2–L4 are still proposal. This doc weighs the
+> alternatives before committing further — the final word lands in `DECISIONS.md`
+> at implementation time (same convention as `docs/modules-design.md` /
+> `docs/collections-design.md`).
 >
-> Reviewed leanings so far: **L4 should be a dev-vs-release split** (incremental
-> per-module dev builds; whole-program optimized release builds). Priorities
-> across the other layers are still open.
+> Reviewed leanings: **L4 should be a dev-vs-release split** (incremental
+> per-module dev builds; whole-program optimized release builds). Priorities for
+> L2/L3 are still open — and per the insight below, currently *low* (see
+> "Why the optimize stage is the sweet spot").
 
 ## Why this exists
 
@@ -75,10 +76,10 @@ Two distinct levers follow from that table:
 5. **Dev vs release.** Fast/incremental is the *dev* default; maximal/whole-program
    optimization is an explicit *release* mode. (Decided direction for L4.)
 
-## What's already landed (L0)
+## What's already landed
 
-`compiler/buildCache.ts` — a Deno-only dev/build layer (peer to `cli.ts`; the
-runtime-agnostic core stays Deno-free):
+**L0 — the cache primitive.** `compiler/buildCache.ts`, a Deno-only dev/build
+layer (peer to `cli.ts`; the runtime-agnostic core stays Deno-free):
 
 - `compilerFingerprint()` — memoized SHA-256 of every `compiler/**/*.ts` plus the
   `deno.json`/`deno.lock` dependency pins.
@@ -86,13 +87,55 @@ runtime-agnostic core stays Deno-free):
 - `readCachedBlob` / `writeCachedBlob` — atomic content-addressed blob store under
   `<tmpdir>/vl-cache` (`VL_CACHE_DIR` override, `VL_NO_CACHE` bypass).
 
-`tests/_selfhost_cache.ts` rides on it: warm `deno task test` ≈ 5 s (vs ~16 s),
-suite green; a one-line edit to any `compiler/*.ts` busts the cache (verified).
+The whole-compile cache for the self-host tests (`tests/_selfhost_cache.ts`) rides
+on it: warm `deno task test` ≈ 5 s (vs ~16 s), suite green; a one-line edit to any
+`compiler/*.ts` busts it (verified). Its fingerprint is coarse by design — *any*
+compiler edit invalidates *every* entry — which is exactly why it doesn't help the
+develop-VL loop on its own (see the next section).
 
-**Known limitation by design:** the fingerprint is coarse — *any* compiler edit
-invalidates *every* entry. Fine for the test loop; the motivation for finer keys
-(L3/L4) is precisely to stop a `toWasm.ts` edit from re-doing front-end work that
-didn't depend on it.
+**Optimize-stage cache.** A second, finer tier (`toWasm` `OptimizeCache` seam +
+`createOptimizeCache()` in `buildCache.ts`). It keys the binaryen `optimize()`
+result on the **unoptimized module bytes** + a fingerprint of **just the binaryen
+pin** — see why this is the sweet spot below. Verified byte-identical (no-cache ==
+cache-miss == cache-hit) and: a compiler edit that doesn't change emitted output
+busts the whole-compile tier but *hits* the optimize cache (`selfhost_typecheck`
+~9 s full → ~6 s optimize-cached).
+
+**L1 — CI caching.** `ci.yml` now caches `~/.cache/deno` (keyed on `deno.lock`)
+and persists `.vl-cache` (the build cache) with a rolling key. Because the
+optimize blobs survive compiler changes, a feature-add PR reuses master's
+`optimize()` results.
+
+## Why the optimize stage is the sweet spot
+
+The decisive observation (owner, during review): **near-term commits almost all
+change the compiler, but mostly *add features* rather than change the output of
+existing programs.** That has two consequences:
+
+1. Any cache keyed on a **compiler source fingerprint** — the whole-compile tier,
+   and any hypothetical front-end or IR-build cache — is **invalidated on nearly
+   every commit**, because the key includes the file you just edited. So those
+   tiers are *low immediate value* for the develop-VL loop. (They still pay off
+   for non-compiler PRs and re-runs, which is why the whole-compile tier stays.)
+2. But the **emitted bytes** of existing programs (the corpus, the fixed `.vl`
+   self-host sources) are usually *unchanged* by a feature-add. So a cache
+   **content-addressed on those bytes** hits — *if* its transform's fingerprint
+   is stable.
+
+`optimize()` is the one stage whose transform depends on **nothing in
+`compiler/*.ts`** — only on binaryen, an external, rarely-moving dep. So keying it
+on `(unoptimized bytes ⊕ binaryen pin)` gives a cache that is **sound** (binaryen
+in the key) *and* **survives compiler churn** (nothing else in the key), hitting
+exactly when a module's codegen output is unchanged. That is the combination no
+source-fingerprinted tier can achieve, and `optimize()` is also the single most
+expensive stage (~40%). Hence: cache it.
+
+**The floor.** You must still run IR-build (~780 ms) to *produce* the bytes that
+form the key, so the optimize cache saves the optimize pass (~40%), not the whole
+compile. Caching IR-build would need its transform (`toWasm`) in the key — which
+churns on most commits — so it is **deprioritized**; the only way to make
+IR-build incremental under constant `toWasm` edits is per-function/module codegen
+(L4). This is why L2/L3 are currently low priority and L4 is the real lever.
 
 ---
 
@@ -100,30 +143,28 @@ didn't depend on it.
 
 Each layer is independently shippable and built on L0.
 
-### L1 — CI plumbing (cheap, no architecture change)
+### L1 — CI plumbing (LANDED)
 
 **Goal:** stop CI starting cold.
 
-**Approach.** `.github/workflows/ci.yml` today caches *npm* (via `setup-node`) but
-not Deno's module cache, and keeps nothing between runs:
+**What shipped** (`.github/workflows/ci.yml`):
 
-- Cache `DENO_DIR` (`~/.cache/deno`) keyed on `deno.lock` — avoids re-downloading
-  esbuild, the jsr loader, and re-resolving `npm:binaryen` every run.
-- Persist the build cache (`<tmpdir>/vl-cache`) via `actions/cache`, keyed on the
-  compiler fingerprint with a restore-key prefix so a partial/older cache can
-  still seed a run.
+- Cache `~/.cache/deno` keyed on `deno.lock` — avoids re-downloading esbuild, the
+  jsr loader, and std each run. (`npm` was already cached via `setup-node`.)
+- Persist `.vl-cache` (the build cache, via `VL_CACHE_DIR`) with `actions/cache`
+  under a **rolling key** (`vl-cache-<os>-<run_id>` + a `vl-cache-<os>-`
+  restore-key): each run restores the most recent prior cache and saves an updated
+  one. Safe because the cache is content-addressed internally.
 
-**Alternatives.**
-- *`denoland/setup-deno` built-in cache* vs *manual `actions/cache` on `DENO_DIR`.*
-  Built-in is less config; manual gives explicit key control. Lean: built-in for
-  deps, manual `actions/cache` for the VL build cache.
-- *Cache key = fingerprint* (busts on any compiler change → compiler PRs get no
-  test speedup) vs *finer keys* (needs L3/L4). For L1, accept the coarse key; it
-  still helps the large fraction of PRs that touch only corpus/docs/tests.
+**Why the rolling key (not a fingerprint key).** The blobs already carry their
+own fingerprints, so the `actions/cache` key only needs to maximise reuse, not
+correctness. Critically, the **optimize blobs survive compiler changes**, so a
+feature-add PR that restores master's `.vl-cache` reuses master's `optimize()`
+results for every unchanged-output module — the bulk of self-host test cost — even
+though that PR changed the compiler.
 
-**Effort:** low. **Risk:** low (cache is advisory). **Payoff:** every
-compiler-unchanged PR + all of `master` CI goes warm; meaningful wall-clock and
-runner-minute savings.
+**Payoff:** master CI and every PR run go warm; feature-add PRs get the optimize
+reuse described above.
 
 ### L2 — `vl build` / `vl run` artifact cache
 
@@ -246,10 +287,17 @@ one module, rebuild only it + dependents.
    types)? Shared with `docs/modules-design.md`.
 3. **Cache home for `vl`** — project-local `.vl/cache` vs user cache dir vs tmp;
    gitignore + docs implications.
-4. **Priority order** — L1 (CI) and L2 (CLI) are the cheapest big wins; L3 helps
-   the editor; L4 is the architecture. Sequence TBD.
+4. **Priority order** — L0, the optimize-stage cache, and L1 have landed. L2/L3
+   are deprioritized (their keys churn with the compiler — see "Why the optimize
+   stage is the sweet spot"); L4 is the real next lever but the big one.
 
 ## Decision log
 
+- **Landed:** L0 cache primitive; binaryen-`optimize()` stage cache (keyed on
+  unopt bytes + binaryen pin); L1 CI caching.
+- **Deprioritized:** whole-compile-fingerprint and front-end/IR-build caches as
+  dev-loop accelerators — near-term commits change the compiler, so source-
+  fingerprinted keys nearly always miss. Kept only where they still pay (re-runs,
+  non-compiler PRs).
 - *(pending)* L4 direction: **dev-vs-release modes** (reviewed leaning) — exact
   module model (a/b/c) still open.
