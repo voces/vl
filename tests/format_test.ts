@@ -306,3 +306,104 @@ Deno.test("an already-wrapped list with a trailing comma re-formats unchanged", 
   assertEquals(format(wrapped), wrapped, "wrapped call not stable");
   assertEquals(astShape(format(wrapped)), astShape(wrapped), "wrapped call round-trip");
 });
+
+// --- inline-short-ifs (D4) -------------------------------------------------
+//
+// A plain single `if cond { stmt }` and `if cond { a } else { b }` collapse to
+// one line when they fit the 80-col width and each brace body is a single
+// simple leaf statement with no overlapping comment. Multi-statement bodies,
+// bodies with comments, or anything that exceeds the width keep their
+// multi-line block layout. Brace form is preserved (never forced to `then`),
+// and `elseif` chains keep their existing `} elseif … {` layout.
+
+// One statement per `if` body lives inside a function so the body is parseable
+// (`r` is declared); a semantic `undeclared` would still be fine.
+const wrapFn = (body: string): string =>
+  `function f() {\n  let r = 0\n${body}}\n`;
+
+Deno.test("a short single `if cond { stmt }` collapses to one line", () => {
+  const src = wrapFn("  if r > 0 {\n    r = 1\n  }\n");
+  const out = format(src);
+  // The whole `if` is on one line.
+  assert(
+    out.includes("  if r > 0 { r = 1 }\n"),
+    `single if did not collapse:\n${out}`,
+  );
+  // Brace form preserved — never converted to `then`.
+  assert(!out.includes("then"), `collapse forced a \`then\`:\n${out}`);
+  assert(!hasSyntaxError(out), `collapsed if does not re-parse:\n${out}`);
+  assertEquals(format(out), out, "collapsed single if is not idempotent");
+  assertEquals(astShape(out), astShape(src), "collapse changed the AST");
+});
+
+Deno.test("a short `if cond { a } else { b }` collapses to one line", () => {
+  const src = wrapFn("  if r > 0 {\n    r = 1\n  } else {\n    r = 2\n  }\n");
+  const out = format(src);
+  assert(
+    out.includes("  if r > 0 { r = 1 } else { r = 2 }\n"),
+    `if/else did not collapse:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `collapsed if/else does not re-parse:\n${out}`);
+  assertEquals(format(out), out, "collapsed if/else is not idempotent");
+  assertEquals(astShape(out), astShape(src), "collapse changed the AST");
+});
+
+Deno.test("an `if` with a two-statement body stays multi-line", () => {
+  const src = wrapFn("  if r > 0 {\n    r = 1\n    r = 2\n  }\n");
+  const out = format(src);
+  // Stays broken across lines — the opening brace ends its line.
+  assert(out.includes("  if r > 0 {\n"), `two-statement if collapsed:\n${out}`);
+  assert(!/if r > 0 \{ /.test(out), `two-statement if inlined a body:\n${out}`);
+  assert(!hasSyntaxError(out), `multi-line if does not re-parse:\n${out}`);
+  assertEquals(format(out), out, "multi-line if is not idempotent");
+});
+
+Deno.test("an `if` with an interior comment stays multi-line, comment in place", () => {
+  const src = wrapFn("  if r > 0 {\n    // keep me here\n    r = 1\n  }\n");
+  const out = format(src);
+  // Not collapsed: the opening brace still ends its line.
+  assert(out.includes("  if r > 0 {\n"), `commented if collapsed:\n${out}`);
+  // The comment is NOT relocated onto the `if` line.
+  assert(
+    !/if r > 0 \{.*keep me here/.test(out),
+    `comment moved onto the if line:\n${out}`,
+  );
+  // The comment survives, on its own line inside the block.
+  assert(out.includes("// keep me here"), `comment lost:\n${out}`);
+  assert(!hasSyntaxError(out), `commented if does not re-parse:\n${out}`);
+  assertEquals(format(out), out, "commented if is not idempotent");
+});
+
+Deno.test("a single `if` that exceeds 80 cols stays multi-line block form", () => {
+  const body =
+    "  if r > 0 {\n    r = rrrrrrrrrrrrrrr + rrrrrrrrrrrrrrr + rrrrrrrrrrrrrrr + rrrrrrrrrrr\n  }\n";
+  const src = `function f() {\n  let rrrrrrrrrrrrrrr = 0\n  let r = 0\n${body}}\n`;
+  const out = format(src);
+  // Did not collapse onto one `if … { … }` line.
+  assert(!/if r > 0 \{ r = /.test(out), `over-width if collapsed:\n${out}`);
+  assert(out.includes("  if r > 0 {\n"), `over-width if not block form:\n${out}`);
+  assert(!hasSyntaxError(out), `over-width if does not re-parse:\n${out}`);
+  assertEquals(format(out), out, "over-width if is not idempotent");
+});
+
+Deno.test("an `elseif` chain keeps its `} elseif … {` block layout", () => {
+  const src = wrapFn(
+    "  if r > 0 {\n    r = 1\n  } elseif r > 5 {\n    r = 2\n  } else {\n    r = 3\n  }\n",
+  );
+  const out = format(src);
+  // The multi-conditional chain is untouched — not routed through the collapse.
+  assert(out.includes("  } elseif r > 5 {\n"), `elseif chain reflowed:\n${out}`);
+  assert(out.includes("  } else {\n"), `elseif chain else reflowed:\n${out}`);
+  assert(!hasSyntaxError(out), `elseif chain does not re-parse:\n${out}`);
+  assertEquals(format(out), out, "elseif chain is not idempotent");
+  assertEquals(astShape(out), astShape(src), "elseif chain changed the AST");
+});
+
+Deno.test("a bare-`then` if is not converted to brace form", () => {
+  const src = wrapFn("  if r > 0 then r = 1\n");
+  const out = format(src);
+  assert(out.includes("if r > 0 then r = 1"), `bare then form changed:\n${out}`);
+  assert(!/if r > 0 \{/.test(out), `bare then forced to braces:\n${out}`);
+  assertEquals(format(out), out, "bare then if is not idempotent");
+  assertEquals(astShape(out), astShape(src), "bare then changed the AST");
+});

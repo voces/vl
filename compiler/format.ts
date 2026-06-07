@@ -570,6 +570,20 @@ class Printer {
     const allBlocks = node.conditionals.every((c) => this.isBlock(c.statement)) &&
       (node.else === undefined || this.isBlock(node.else));
     if (allBlocks) {
+      // One-line collapse (D4): a plain single `if cond { stmt }` or
+      // `if cond { a } else { b }` renders on one line when it fits the width
+      // and each brace body inlines (a single simple leaf statement with no
+      // overlapping comment). Only the single-conditional form is collapsed;
+      // multi-`elseif` chains keep their `} elseif … {` layout. When the
+      // collapse does not apply the code falls through to the byte-identical
+      // multi-line layout below — never reflowing existing multi-line blocks.
+      if (node.conditionals.length === 1) {
+        const oneLine = this.collapseSingleIf(node, indent);
+        if (oneLine !== undefined) {
+          this.line(indent, oneLine);
+          return;
+        }
+      }
       node.conditionals.forEach((c, i) => {
         const cond = this.expr(c.condition, indent);
         this.line(indent, i === 0 ? `if ${cond} {` : `} elseif ${cond} {`);
@@ -605,6 +619,33 @@ class Printer {
         this.line(indent, `else ${this.statementInline(node.else, indent)}`);
       }
     }
+  }
+
+  /**
+   * One-line rendering of a plain single-conditional `if` whose every brace
+   * body is inlinable — `if cond { stmt }` or `if cond { a } else { b }` —
+   * when the whole line fits the width. Returns `undefined` when the body (or
+   * else body) cannot inline (multi-statement, compound, or an overlapping
+   * comment that would be orphaned) or the line is too wide, so the caller
+   * keeps the existing multi-line block layout byte-for-byte. The node is
+   * known to have exactly one conditional with a block body and, if present,
+   * a block `else`.
+   */
+  private collapseSingleIf(node: VLIfNode, indent: number): string | undefined {
+    const cond = this.expr(node.conditionals[0].condition, indent);
+    const thenBody = this.inlineBlockBody(
+      node.conditionals[0].statement as VLBlockNode,
+      indent,
+    );
+    if (thenBody === undefined) return undefined;
+    let line = `if ${cond} ${thenBody}`;
+    if (node.else !== undefined) {
+      const elseBody = this.inlineBlockBody(node.else as VLBlockNode, indent);
+      if (elseBody === undefined) return undefined;
+      line += ` else ${elseBody}`;
+    }
+    if (indent * INDENT.length + line.length > this.width) return undefined;
+    return line;
   }
 
   // A clause of an `if … else if … else` chain: a condition (absent for the
