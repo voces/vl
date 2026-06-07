@@ -229,6 +229,13 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
     error — imports are only meaningful through the graph driver; (d) `export`
     keyword spelling chosen over `pub` (matches the `import`/ES family).
 
+- **Host-callable wasm exports: entry-module only, thin scalar wrapper.**
+  Entry-module only because binaryen treats exports as DCE roots — non-entry
+  exports would pin otherwise tree-shakeable functions. Thin wrapper because
+  every VL function carries a leading `structref` closure-env param; the wrapper
+  drops that param and forwards a null env, giving hosts a clean scalar ABI
+  (scalar params/returns only for v1). (H6, PR #141)
+
 - **Integer divide-by-zero stays a trap.** The universal wasm/hardware
   convention; no checked division by default. A `divChecked: i32|null` dual is a
   possible future opt-in but not planned for v1. (B-debug)
