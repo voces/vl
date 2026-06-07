@@ -20,6 +20,8 @@
 //   VL_CACHE_DIR   override the cache location (default <tmpdir>/vl-cache)
 //   VL_NO_CACHE=1  bypass entirely (every read misses, every write is a no-op)
 
+import type { OptimizeCache, WasmEmit } from "./toWasm.ts";
+
 const NO_CACHE = !!Deno.env.get("VL_NO_CACHE");
 
 const CACHE_DIR = Deno.env.get("VL_CACHE_DIR") ??
@@ -127,4 +129,84 @@ export const writeCachedBlob = (key: string, bytes: Uint8Array): void => {
   const tmp = `${path}.${Deno.pid}.${Math.random().toString(36).slice(2)}.tmp`;
   Deno.writeFileSync(tmp, bytes);
   Deno.renameSync(tmp, path);
+};
+
+// --- optimize-stage cache -------------------------------------------------
+//
+// Unlike the whole-compile cache, the binaryen `optimize()` stage depends ONLY
+// on binaryen — not on any compiler/*.ts. So it is keyed on the UNOPTIMIZED
+// module bytes (the actual IR handed to optimize) plus a fingerprint of just the
+// binaryen pin. That key survives every compiler change: it hits whenever a
+// module's pre-optimize bytes are unchanged, regardless of which compiler file
+// moved. (It still costs IR-build to produce those bytes — it saves the
+// ~40%-of-compile optimize pass, not the whole compile.)
+
+// Just the binaryen pin from deno.json/deno.lock (version + integrity), so this
+// fingerprint changes when binaryen does and at no other time.
+let binaryenFpPromise: Promise<string> | undefined;
+export const binaryenFingerprint = (): Promise<string> => {
+  if (binaryenFpPromise) return binaryenFpPromise;
+  binaryenFpPromise = (async () => {
+    const lines: string[] = [];
+    for (const rel of ["deno.json", "deno.lock"]) {
+      try {
+        const text = Deno.readTextFileSync(new URL(rel, REPO_ROOT));
+        for (const line of text.split("\n")) {
+          if (line.includes("binaryen")) lines.push(line.trim());
+        }
+      } catch { /* file may be absent */ }
+    }
+    return await sha256Hex(new TextEncoder().encode(lines.join("\n")));
+  })();
+  return binaryenFpPromise;
+};
+
+// SHA-256 over (binaryen fp ⊕ salt ⊕ unoptimized bytes). A cryptographic hash
+// (not a rolling hash) so a collision can't silently swap in the wrong optimized
+// module. The unopt module is large but digesting it is a few ms — negligible
+// against the ~600 ms optimize() pass a hit avoids.
+const optimizeKey = async (
+  binaryenFp: string,
+  salt: string,
+  unoptimized: Uint8Array,
+): Promise<string> => {
+  const header = new TextEncoder().encode(`${binaryenFp}\0${salt}\0`);
+  const buf = new Uint8Array(header.length + unoptimized.length);
+  buf.set(header, 0);
+  buf.set(unoptimized, header.length);
+  return `opt-${await sha256Hex(buf)}`;
+};
+
+/**
+ * Build an {@link OptimizeCache} backed by the on-disk blob store, keyed on the
+ * binaryen pin + the unoptimized module bytes. The binaryen fingerprint is
+ * resolved once at creation; `get`/`put` are async (the toWasm seam awaits them)
+ * so the per-call SHA-256 stays off any hot synchronous path.
+ */
+export const createOptimizeCache = async (): Promise<OptimizeCache> => {
+  const binaryenFp = await binaryenFingerprint();
+  return {
+    async get(unoptimized: Uint8Array, salt: string): Promise<WasmEmit | undefined> {
+      const key = await optimizeKey(binaryenFp, salt, unoptimized);
+      const binary = readCachedBlob(`${key}.opt.wasm`);
+      if (!binary) return undefined;
+      const mapBytes = readCachedBlob(`${key}.opt.map`);
+      const sourceMap = mapBytes ? new TextDecoder().decode(mapBytes) : undefined;
+      return { binary, sourceMap };
+    },
+    async put(
+      unoptimized: Uint8Array,
+      salt: string,
+      optimized: WasmEmit,
+    ): Promise<void> {
+      const key = await optimizeKey(binaryenFp, salt, unoptimized);
+      writeCachedBlob(`${key}.opt.wasm`, optimized.binary);
+      if (optimized.sourceMap !== undefined) {
+        writeCachedBlob(
+          `${key}.opt.map`,
+          new TextEncoder().encode(optimized.sourceMap),
+        );
+      }
+    },
+  };
 };

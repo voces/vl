@@ -18,6 +18,7 @@ import type {
   VLType,
 } from "./ast.ts";
 import type { Comment } from "./lexer.ts";
+import type { OptimizeCache } from "./toWasm.ts";
 import { tokenize } from "./lexer.ts";
 import { parseProgram } from "./parser.ts";
 import { defaultScope } from "./defaultScope.ts";
@@ -345,6 +346,16 @@ export const checkOnly = (source: string): CheckResult => {
   return { ast, diagnostics, symbols, spans, comments };
 };
 
+/** Optional knobs for {@link compile}; all default to off/none. */
+export type CompileOptions = {
+  /**
+   * Cache for the binaryen `optimize()` stage. Injected by a Deno entry point
+   * (the CLI, the test suite) via `compiler/buildCache.ts`; leaving it unset
+   * keeps the core free of any filesystem cache and runs `optimize()` normally.
+   */
+  optimizeCache?: OptimizeCache;
+};
+
 /**
  * Full pipeline: source -> diagnostics (+ wasm when clean). Runs `checkOnly`,
  * then codegen — but only when there are no error diagnostics, matching the
@@ -355,6 +366,7 @@ export const checkOnly = (source: string): CheckResult => {
 export const compile = async (
   source: string,
   fileName = "source.vl",
+  options: CompileOptions = {},
 ): Promise<CompileResult> => {
   const { ast, diagnostics, symbols, spans, comments } = checkOnly(source);
 
@@ -365,8 +377,14 @@ export const compile = async (
       const { toWasm } = await import("./toWasm.ts");
       // Thread the AST spans + file name into codegen so the emitted module
       // carries debug locations (a source map) and the name section — additive
-      // metadata only; the executable behavior is unchanged.
-      const emit = await toWasm(ast, { spans, fileName });
+      // metadata only; the executable behavior is unchanged. `optimizeCache`, when
+      // a Deno entry point injects one, lets codegen reuse a prior binaryen
+      // `optimize()` result for an unchanged module (see `OptimizeCache`).
+      const emit = await toWasm(ast, {
+        spans,
+        fileName,
+        optimizeCache: options.optimizeCache,
+      });
       wasm = emit.binary;
       sourceMap = emit.sourceMap;
     } catch (err) {
