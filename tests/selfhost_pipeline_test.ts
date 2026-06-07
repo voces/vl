@@ -9,50 +9,57 @@
 // HAND-BUILD their `P.toks` with a `tok(kind, text)` helper; here the genuine lexer
 // produces the tokens, so a real `lexer.vl → parser.vl → typecheck.vl` pipeline runs.
 //
-// VL has no module system yet, so the sources are concatenated ahead of a `.vl`
-// print-driver, compiled to wasm, and run; the captured log is diffed against the
-// expected diagnostics. One reconciliation is needed because the lexer and parser
-// were ported separately:
-//   1. NAME collisions — `lexer.vl` and `ast.vl`/`parser.vl` each define `Tok`,
-//      `Diag`, and `advance`. We rename the lexer's three colliding symbols in its
-//      SOURCE TEXT before concatenation (glue only — no `.vl` compiler file edited).
-// The token-`kind` spellings now agree between the lexer and parser (gap #2
-// resolved in `compiler/lexer.vl`), so no `mapKind` translation is needed.
+// REAL MODULES (H0): the four `.vl` front-end files `export` their public surface and
+// `import` cross-module references, so this harness drives them through the module
+// graph driver (`compileProgram`) instead of string-concatenating the sources. The old
+// glue — a regex rename of the lexer's `Tok`/`Diag`/`advance` (which collided with
+// `ast.vl`'s under concatenation) plus dependency-ordered concatenation — is GONE: per-
+// module name isolation means the lexer's private `Tok`/`Diag`/`advance` no longer
+// collide with `ast.vl`'s, and `import`/`export` wire the pieces together. The on-disk
+// `compiler/*.vl` files are the real modules (no per-test source munging). An in-memory
+// DRIVER module is the graph entry point: it `import`s `tokenize` from `./lexer`, `P`/
+// `i32ToStr` from `./ast`, `parseProgram` from `./parser`, and `checkProgram`/
+// `initChecker`/`T` from `./typecheck`.
 //
-// PERF (compile-once): every case compiles the SAME ~3k-line base (lexer + ast +
-// parser + typecheck); only the driven source differs. Rather than recompile the
-// base once per sub-test (N full pipeline compiles, the dominant CI cost), we build
-// ONE module whose driver runs every case in turn — resetting the parser/checker
-// state between them — and prints label-prefixed output. One compile + one run, the
-// logs are split per label, and each `Deno.test` asserts its slice. Same coverage
-// (the real lexer→parser→typecheck runs on every case, and binaryen `optimize()`
-// still runs — once), a fraction of the time.
+// PERF (compile-once): every case drives the SAME ~3k-line module graph; only the
+// source text differs. Rather than recompile the graph once per sub-test (N full
+// pipeline compiles, the dominant CI cost), the driver module runs every case in turn
+// — resetting the parser arena (`P`) and the checker (`initChecker`) between them — and
+// prints label-prefixed output. One compile + one run, the logs are split per label,
+// and each `Deno.test` asserts its slice. Same coverage (the real lexer→parser→
+// typecheck runs on every case, and binaryen `optimize()` still runs — once), a
+// fraction of the time.
 
-import { runWasm } from "../compiler/compile.ts";
-import { compileCached } from "./_selfhost_cache.ts";
+import { compileProgram, runWasm } from "../compiler/compile.ts";
+import { createOptimizeCache } from "../compiler/buildCache.ts";
+
+// Reuse binaryen's `optimize()` output across runs for any module whose pre-optimize
+// bytes are unchanged (optimize is ~40% of a compile). The graph driver path takes
+// the same optimize cache the single-string self-host tests use; whole-compile
+// caching does not apply here (that tier is keyed on a single source string).
+const optimizeCache = createOptimizeCache();
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
   const e = JSON.stringify(expected, null, 2);
-  if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+  if (a !== e) {
+    throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+  }
 };
 
-const read = (rel: string) =>
-  Deno.readTextFileSync(new URL(rel, import.meta.url));
+// Resolved keys for the on-disk front-end modules (the resolver appends `.vl` to a
+// relative specifier, so a `./lexer` import resolves to this `…/lexer.vl` key).
+const compilerUrl = (name: string) =>
+  new URL(`../compiler/${name}`, import.meta.url).pathname;
+const LEXER = compilerUrl("lexer.vl");
+const AST = compilerUrl("ast.vl");
+const PARSER = compilerUrl("parser.vl");
+const TYPECHECK = compilerUrl("typecheck.vl");
 
-// The lexer, with its three names that collide with `ast.vl`/`parser.vl` renamed in
-// the SOURCE TEXT (the parser only sees `tokenize`/`LexResult`, never these). Pure
-// glue: the on-disk `lexer.vl` is untouched, so the lexer self-host test still uses
-// the unmodified source. `\b…\b` keeps `Tok` from matching `tokens`/`toks` and
-// `Diag` from matching `diags`/`gDiags`; `advance` is its own word everywhere.
-const lexer = read("../compiler/lexer.vl")
-  .replace(/\bTok\b/g, "LexTok")
-  .replace(/\bDiag\b/g, "LexDiag")
-  .replace(/\badvance\b/g, "lexAdvance");
-
-const ast = read("../compiler/ast.vl");
-const parser = read("../compiler/parser.vl");
-const typecheck = read("../compiler/typecheck.vl");
+// The synthetic entry: the driver module. It is the only in-memory module; its
+// `./lexer`/`./ast`/`./parser`/`./typecheck` specifiers resolve to the real on-disk
+// `compiler/*.vl` files (siblings of this key).
+const DRIVER = compilerUrl("__pipeline_driver__.vl");
 
 // Each case: a label, the VL SOURCE TEXT to drive through lexer→parser→typecheck,
 // and the expected diagnostic lines (count line first, then each message in order).
@@ -105,12 +112,21 @@ const CASES: Case[] = [
   },
 ];
 
-// The combined driver: shared glue + a per-case runner that RESETS the parser arena
-// (`P`) and the checker (`initChecker`) before each case, then prints each output
-// line prefixed with `<label>\t` so the host can split them. `checkProgram` is always
+// The driver module body opens with the import header — the public surface the
+// pipeline drives — then a per-case runner. `loadToks` feeds the real lexer's tokens
+// into the parser's `P.toks` (the `ast.vl` `Tok = {kind, text, pos}` model; the parser
+// reads `kind`/`text` and uses `pos` as the cursor index). `runCase` RESETS the parser
+// arena (`P`) and the checker (`initChecker`) before each case, then prints each output
+// line prefixed with `<label>\t` so the host can split them. `checkProgram` is ALWAYS
 // consumed in an expression (`i32ToStr(checkProgram(...))`) — calling it bare trips a
-// codegen gap at module scale (see the gap note in `compiler/typecheck.vl`).
-const driver = `
+// codegen gap at module scale (see the gap note in `compiler/typecheck.vl`). The kind
+// spellings already agree between the lexer and parser, so no `mapKind` is needed.
+const driverHeader = `
+import { tokenize } from "./lexer"
+import { P, i32ToStr } from "./ast"
+import { parseProgram } from "./parser"
+import { checkProgram, initChecker, T } from "./typecheck"
+
 function loadToks(src: string): i32 {
   let r = tokenize(src)
   let i = 0
@@ -136,17 +152,28 @@ function runCase(label: string, src: string): i32 {
   }
   0
 }
-` +
-  CASES.map((c) => `runCase(${JSON.stringify(c.label)}, ${JSON.stringify(c.src)})`)
-    .join("\n") + "\n";
+`;
 
-// Compile + run the combined module ONCE (memoized), returning the per-label logs.
+// Compile + run the driver module ONCE (memoized), returning the per-label logs. The
+// driver imports resolve to the on-disk `compiler/*.vl` siblings; only the driver is
+// in memory. Its tail invokes `runCase` for every case in turn.
 let allLogs: Promise<Map<string, string[]>> | undefined;
 const runAll = (): Promise<Map<string, string[]>> =>
   allLogs ??= (async () => {
-    const source = lexer + "\n" + ast + "\n" + parser + "\n" + typecheck + "\n" +
-      driver;
-    const { wasm, diagnostics } = await compileCached(source);
+    const driverBody = CASES.map((c) =>
+      `runCase(${JSON.stringify(c.label)}, ${JSON.stringify(c.src)})`
+    ).join("\n") + "\n";
+    const sources: Record<string, string> = {
+      [DRIVER]: driverHeader + driverBody,
+      [LEXER]: Deno.readTextFileSync(LEXER),
+      [AST]: Deno.readTextFileSync(AST),
+      [PARSER]: Deno.readTextFileSync(PARSER),
+      [TYPECHECK]: Deno.readTextFileSync(TYPECHECK),
+    };
+    const read = (key: string): string | undefined => sources[key];
+    const { wasm, diagnostics } = await compileProgram(DRIVER, read, DRIVER, {
+      optimizeCache: await optimizeCache,
+    });
     const errors = diagnostics.filter((d) => d.severity === "error");
     if (errors.length > 0 || !wasm) {
       throw new Error(
