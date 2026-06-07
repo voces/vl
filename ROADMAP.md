@@ -110,7 +110,9 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ✅ **B0. Numeric literals, i32/f64 arithmetic, if/while, direct calls, start fn, memory builtins.**
 - ✅ **B1. Allocation strategy = WasmGC** (binaryen 116→130 for the GC API). → `DECISIONS.md`.
 - 🟡 **B2. Numeric codegen.** Done: i64 & f32 arithmetic + float `/` & comparisons; i64/f32 type
-  mappings; range-aware integer-literal defaults. REMAINING: explicit value casting/coercion between
+  mappings; range-aware integer-literal defaults; **value-level bitwise/shift operators** (`& | ^ ~
+  << >> >>>`, integer-only, i32/i64 → `i32.*`/`i64.*` and/or/xor/shl/shr_s/shr_u; H4.2 self-host gap).
+  REMAINING: explicit value casting/coercion between
   numeric types (today only literals coerce); **`0x` hex / `0o` octal / `0b` binary integer literals
   + digit separators** (`1_000`, `0xFF_FF`) — a lexer/parser add the self-host lexer flagged (it does
   hex via `* 16` for lack of the literal); **arbitrary-precision `BigInt` and a `Decimal<Backing, Scale>`

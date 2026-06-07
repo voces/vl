@@ -39,6 +39,33 @@ const symmetricOps = (
   },
 }];
 
+// Bitwise / shift operator methods (`& | ^ << >> >>>`), defined ONLY on the
+// integer types (i32/i64) — not on f32/f64, so a float operand (`1.0 & 2`) fails
+// to find the operator method and is rejected. The result is the integer type
+// itself, mirroring `+`/`%`. The unary `~` (bitwise NOT) is lowered in codegen
+// as `xor -1` and never resolves through a method field, so it needs no entry.
+const integerOps = (
+  name: string,
+  paramaterType: VLType,
+): VLObjectType["properties"] => [{
+  name: {
+    type: "Union",
+    subTypes: [
+      { type: "StringLiteral", value: "&" },
+      { type: "StringLiteral", value: "|" },
+      { type: "StringLiteral", value: "^" },
+      { type: "StringLiteral", value: "<<" },
+      { type: "StringLiteral", value: ">>" },
+      { type: "StringLiteral", value: ">>>" },
+    ],
+  },
+  type: {
+    type: "Function",
+    paramaters: [{ type: "Parameter", name: "right", paramaterType }],
+    return: { type: "Alias", name },
+  },
+}];
+
 // deno-lint-ignore no-explicit-any
 const namedFunc = <F extends (...args: any[]) => unknown>(
   name: string,
@@ -63,30 +90,54 @@ export const defaultScope = () => {
   const scope: Scope = {
     i32: {
       type: "Object",
-      properties: symmetricOps("i32", {
-        type: "Custom",
-        validate: namedFunc("i32", (right: VLType) =>
-          right === scope.i32 || isNominal(right, "i32") ||
-          right.type === "IntegerLiteral"),
-        name: "i32",
-      }),
+      properties: [
+        ...symmetricOps("i32", {
+          type: "Custom",
+          validate: namedFunc("i32", (right: VLType) =>
+            right === scope.i32 || isNominal(right, "i32") ||
+            right.type === "IntegerLiteral"),
+          name: "i32",
+        }),
+        ...integerOps("i32", {
+          type: "Custom",
+          validate: namedFunc("i32", (right: VLType) =>
+            right === scope.i32 || isNominal(right, "i32") ||
+            right.type === "IntegerLiteral"),
+          name: "i32",
+        }),
+      ],
       name: "i32",
     },
     i64: {
       type: "Object",
-      properties: symmetricOps("i64", {
-        type: "Union",
-        subTypes: [{ type: "Alias", name: "i32" }, {
-          type: "Custom",
-          validate: namedFunc(
-            "i64",
-            (right: VLType) =>
-              right === scope.i64 || isNominal(right, "i64") ||
-              right.type === "IntegerLiteral",
-          ),
-          name: "i64",
-        }],
-      }),
+      properties: [
+        ...symmetricOps("i64", {
+          type: "Union",
+          subTypes: [{ type: "Alias", name: "i32" }, {
+            type: "Custom",
+            validate: namedFunc(
+              "i64",
+              (right: VLType) =>
+                right === scope.i64 || isNominal(right, "i64") ||
+                right.type === "IntegerLiteral",
+            ),
+            name: "i64",
+          }],
+        }),
+        ...integerOps("i64", {
+          type: "Union",
+          subTypes: [{ type: "Alias", name: "i32" }, {
+            type: "Custom",
+            validate: namedFunc(
+              "i64",
+              (right: VLType) =>
+                right === scope.i64 || isNominal(right, "i64") ||
+                right.type === "IntegerLiteral",
+            ),
+            name: "i64",
+          }],
+        }),
+      ],
       name: "i64",
     },
     f32: {

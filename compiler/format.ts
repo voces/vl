@@ -1188,26 +1188,35 @@ class Printer {
 
 // ---- precedence helpers ----------------------------------------------------
 
+// Mirrors the parser's `infixBp` ordering (C/JS precedence) so the formatter
+// inserts the minimal parentheses needed to preserve meaning. Bitwise `| ^ &`
+// sit below equality/relational; shifts `<< >> >>>` between relational and
+// additive. All binary operators are left-associative.
 const PRECEDENCE: Record<string, number> = {
   "||": 4,
   "&&": 6,
-  "==": 8,
-  "!=": 8,
-  "<": 10,
-  "<=": 10,
-  ">": 10,
-  ">=": 10,
-  "+": 12,
-  "-": 12,
-  "*": 14,
-  "/": 14,
-  "%": 14,
-  "^": 16,
+  "|": 7,
+  "^": 8,
+  "&": 9,
+  "==": 10,
+  "!=": 10,
+  "<": 12,
+  "<=": 12,
+  ">": 12,
+  ">=": 12,
+  "<<": 13,
+  ">>": 13,
+  ">>>": 13,
+  "+": 14,
+  "-": 14,
+  "*": 16,
+  "/": 16,
+  "%": 16,
 };
 
 const binPrec = (op: string): number => PRECEDENCE[op] ?? 0;
 
-const leftAssoc = (op: string): boolean => op !== "^";
+const leftAssoc = (_op: string): boolean => true;
 
 const isIdentifier = (s: string): boolean => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(s);
 
