@@ -225,8 +225,11 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
     discarded). Retain the *as-written* type syntax (or its span) so the AST is lossless for
     types — also benefits hover/inlay rendering (D1/D6/D8).
   - **Trailing commas** — reflow doesn't yet emit trailing commas in multi-line literals.
-- ⬜ **D7. Cross-references in doc-comments** — expand `///` docs with clickable symbol links
-  (`{@link Name}` / `` [`Name`] `` conventions), resolving via D2's symbol table; single-file first.
+- 🟡 **D7. Cross-references in doc-comments** — rustdoc-style `` [`Name`] `` / `[Name]` intra-doc
+  links in `///` comments; resolved via D2's symbol table; rewritten to clickable markdown links in
+  hover and completion `documentation`. REMAINING: cross-import resolution (a `Name` that is an
+  imported binding resolves to the imported symbol's source location) — needs the module graph /
+  import table reachable from the LSP's `parseSymbols` path (H0 phase 3 prerequisite).
 - ⬜ **D8. Preserve type-alias names in display (the "`aliasSymbol`" gap).** Today a reference to
   an alias resolves *through* to its body before rendering (e.g. hover on `type thing = "a" | I32`
   shows `"a" | i32`). Fix: carry the alias name on the resolved type and let the renderer choose

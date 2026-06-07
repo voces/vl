@@ -69,6 +69,7 @@ see **`DECISIONS.md`**.
 - **D3 Keyword + snippet completions** — 26 keywords + 10 snippet skeletons with tab-stops; after-dot completions suppress keywords/snippets; trigger-character tuning. (#143)
 - **D4 Formatter: collapse short if/if-else** — a single-conditional `if { stmt }` or `if { a } else { b }` that fits 80 cols folds to one line; comments/multi-statement bodies stay block. (#138)
 - **D4 Formatter: trailing comment on `type` alias** — a trailing comment on a `type X = …` line now stays on that line instead of being displaced. (#146)
+- **D7 Doc-comment cross-references (single-file)** — `` [`Name`] `` / `[Name]` rustdoc-style intra-doc links in `///` comments resolve via D2's symbol table and render as clickable markdown links in hover and completion `documentation`; unresolved names left verbatim; cross-import resolution deferred (needs H0 phase 3 module graph).
 
 ## Browser playground (Track E)
 

@@ -44,6 +44,7 @@ import {
   type CompletionKind,
   deriveInlayHints,
   docMarkdown,
+  type DocRefResolver,
   identifierCompletions,
   keywordCompletions,
   type LspRange,
@@ -60,6 +61,59 @@ import {
 // id `vital`, scope `source.vital`). Used as the markdown fence info string so
 // hover code blocks render syntax-highlighted via the TextMate grammar.
 const VL_LANGUAGE_ID = "vital";
+
+// ---- D7: doc-comment cross-reference resolver --------------------------------
+
+/**
+ * Build a {@link DocRefResolver} for a document's symbol table (D7). The
+ * resolver maps a symbol name to a markdown link URL that jumps to that
+ * symbol's definition inside `documentUri`.
+ *
+ * Resolution scope (single-file): we collect every top-level declaration from
+ * the symbol table — any `isDecl` occurrence whose binding's `scope` is the
+ * widest-reaching span (the whole file). A top-level `let`/`const`, `function`
+ * declaration, or `type` alias all have the whole-file span as their scope.
+ * The outermost scope has the maximum line span, so we select declarations
+ * whose scope length equals the maximum across all observed scopes.
+ *
+ * Link format: `documentUri#L<1-based line>` — the convention LSP clients
+ * (VS Code) honour for `file://` URIs; clicking the link in a hover panel
+ * navigates to the definition line.
+ *
+ * TODO (cross-import): resolve imported names to their source module's URI.
+ * This requires the module graph / import resolution to be reachable from the
+ * LSP's current single-file `parseSymbols` path. When the module graph lands,
+ * look `name` up in the import table first and, if found, return a
+ * `file://…#L…` URI for the imported file's definition line.
+ */
+const buildDocRefResolver = (
+  symbols: ReturnType<typeof parseSymbols>,
+  documentUri: string,
+): DocRefResolver => {
+  // Walk all declaration occurrences and record each name's definition line.
+  // For a given name, prefer the binding with the widest scope span (most
+  // lines) — that is the outermost (top-level) declaration when nesting exists.
+  // We avoid the O(n²) re-scan by tracking the max scope width seen per name.
+  const byName = new Map<string, { line: number; scopeLines: number }>();
+  for (const occ of symbols.occurrences) {
+    if (!occ.isDecl) continue;
+    const { binding } = occ;
+    const declLine = occ.span.start.line; // 1-based VL line
+    const scopeLines = binding.scope
+      ? binding.scope.stop.line - binding.scope.start.line
+      : 0;
+    const existing = byName.get(binding.name);
+    if (existing === undefined || scopeLines > existing.scopeLines) {
+      byName.set(binding.name, { line: declLine, scopeLines });
+    }
+  }
+  return (name: string): string | undefined => {
+    const entry = byName.get(name);
+    if (entry === undefined) return undefined;
+    // `file://path#Lline` is the VS Code convention for "jump to line".
+    return `${documentUri}#L${entry.line}`;
+  };
+};
 
 declare const process: NodeJS.Process;
 
@@ -206,6 +260,10 @@ connection.onHover(async (params): Promise<Hover | null> => {
   // each binding carries. Falls back to the top-level scope lookup below for
   // anything the symbol table doesn't carry.
   const symbols = parseSymbols(document.getText());
+  // D7: build the doc-comment cross-reference resolver for this document. It is
+  // used by `docMarkdown` to rewrite `` [`Name`] `` / `[Name]` spans in `///`
+  // doc-comments into clickable links to the named symbol's definition.
+  const docResolver = buildDocRefResolver(symbols, params.textDocument.uri);
   const occ = symbols.occurrenceAt(toVLPosition(params.position));
   if (occ?.binding.type) {
     // Feature 1(b) — "declared vs flow-refined type" — is DEFERRED. The symbol
@@ -220,7 +278,8 @@ connection.onHover(async (params): Promise<Hover | null> => {
     // for two types in one hover — e.g. "declared `T`" then "narrowed `U`".
     // Render the authored `///` doc (if any) as markdown above the type block.
     // `docMarkdown` collapses to the bare type fence when there's no doc, so
-    // undocumented bindings hover exactly as before.
+    // undocumented bindings hover exactly as before. Pass `docResolver` so any
+    // `` [`Name`] `` / `[Name]` spans in the doc are linkified (D7).
     //
     // D8 alias display: a *value* binding (`x: thing`) renders at maxDepth 0 —
     // every alias name preserved (hover `x: thing`, not its body). A *type*
@@ -237,6 +296,7 @@ connection.onHover(async (params): Promise<Hover | null> => {
           }`,
           VL_LANGUAGE_ID,
           occ.binding.doc,
+          docResolver,
         ),
       },
     };
@@ -340,7 +400,12 @@ const completionKind: Record<CompletionKind, CompletionItemKind> = {
 // When the declaration carries a `///` doc-comment (`c.doc`), it's rendered as
 // markdown ABOVE the type block in `documentation` via `docMarkdown` — prose
 // first, type beneath. Items with neither a type nor a doc omit `documentation`.
-const toCompletionItem = (c: Completion): CompletionItem => {
+// `resolve` (D7): when present, `` [`Name`] `` / `[Name]` spans in the doc are
+// rewritten as clickable links to the named symbol's definition.
+const toCompletionItem = (
+  c: Completion,
+  resolve?: DocRefResolver,
+): CompletionItem => {
   const item: CompletionItem = { label: c.name, kind: completionKind[c.kind] };
   if (c.detail !== undefined) {
     item.labelDetails = { detail: typeLabelDetail(c.detail) };
@@ -348,7 +413,7 @@ const toCompletionItem = (c: Completion): CompletionItem => {
   if (c.detail !== undefined || (c.doc && c.doc.trim() !== "")) {
     item.documentation = {
       kind: MarkupKind.Markdown,
-      value: docMarkdown(c.detail ?? "", VL_LANGUAGE_ID, c.doc),
+      value: docMarkdown(c.detail ?? "", VL_LANGUAGE_ID, c.doc, resolve),
     };
   }
   // Snippet items: set the insert text + format so the editor expands tab-stops.
@@ -391,6 +456,9 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   });
 
   const symbols = parseSymbols(text);
+  // D7: build the doc-comment resolver once for all completion items in this
+  // request — identifier completions carry `///` docs that may contain xrefs.
+  const docResolver = buildDocRefResolver(symbols, params.textDocument.uri);
   const charBeforeCursor = linePrefix[linePrefix.length - 1];
 
   // Member completion: cursor follows `<receiver>.`. Only the simple `name.`
@@ -404,7 +472,11 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     if (!ast) return [];
     const objectType = receiverObjectType(receiver, symbols, vlPos, ast.scope);
     if (!objectType) return [];
-    return memberCompletions(objectType, stringifyType).map(toCompletionItem);
+    // Member completions don't carry source `///` docs (no source binding), so
+    // passing the resolver is a no-op but keeps the call shape consistent.
+    return memberCompletions(objectType, stringifyType).map((c) =>
+      toCompletionItem(c, docResolver)
+    );
   }
 
   // Identifier completion: in-scope names + builtins. `ast.scope` carries the
@@ -414,9 +486,9 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const { ast } = await compile(text);
   const builtins = ast?.scope ?? {};
   const identifiers = identifierCompletions(symbols, vlPos, builtins, stringifyType)
-    .map(toCompletionItem);
-  const keywords = keywordCompletions(false).map(toCompletionItem);
-  const snippets = snippetCompletions(false).map(toCompletionItem);
+    .map((c) => toCompletionItem(c, docResolver));
+  const keywords = keywordCompletions(false).map((c) => toCompletionItem(c));
+  const snippets = snippetCompletions(false).map((c) => toCompletionItem(c));
   return [...identifiers, ...keywords, ...snippets];
 });
 

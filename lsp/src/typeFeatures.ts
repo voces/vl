@@ -622,6 +622,88 @@ export const typeLabelDetail = (typeStr: string): string => `: ${typeStr}`;
 export const typeMarkdown = (typeStr: string, languageId: string): string =>
   "```" + languageId + "\n" + typeStr + "\n```";
 
+// ---- D7: intra-doc cross-references ----------------------------------------
+//
+// A `[Name]` or `` [`Name`] `` span in a `///` doc-comment is a rustdoc-style
+// intra-doc link. When `Name` resolves to a known symbol we rewrite it into a
+// clickable markdown link to that symbol's definition location. A `[Name]` that
+// does NOT resolve is left UNTOUCHED — it may be a real markdown link-reference
+// or literal bracket text.
+
+/**
+ * Given a symbol name, returns the markdown link URL (e.g. `file:///…#L5`) for
+ * its definition location, or `undefined` when the name is unknown. Injected by
+ * `server.ts` so this module stays runtime-agnostic and purely testable with a
+ * simple stub.
+ */
+export type DocRefResolver = (name: string) => string | undefined;
+
+/**
+ * Rewrite rustdoc-style intra-doc links in a doc-comment markdown string (D7).
+ *
+ * Recognised forms:
+ *   - `` [`Name`] `` — code-span shorthand reference
+ *   - `[Name]`       — plain shorthand reference
+ *
+ * Where `Name` is an identifier (`[A-Za-z_][A-Za-z0-9_]*`). When `resolve(Name)`
+ * returns a URL the span is rewritten into a standard markdown inline link:
+ *   - `` [`Name`](url) `` (backtick preserved when the original had one)
+ *   - `[Name](url)`
+ *
+ * Unresolved names and any other bracket syntax (full markdown links `[text](url)`,
+ * `[ref][id]`, etc.) are left UNTOUCHED — we only rewrite the shorthand forms
+ * where the bracket content is exactly an identifier (possibly backtick-wrapped)
+ * and there is NO trailing `(…)` or `[…]` (which would mark an already-formed
+ * link).
+ *
+ * Spans inside code fences (lines starting with ` ``` `) are left verbatim so
+ * doc-comment examples don't have their identifiers linkified.
+ *
+ * @param doc     The doc-comment prose (already stripped of `/// ` prefixes).
+ * @param resolve Called with each candidate name; return a URL string to linkify,
+ *                or `undefined` to leave the span untouched.
+ */
+export const linkifyDocRefs = (
+  doc: string,
+  resolve: DocRefResolver,
+): string => {
+  // Process line-by-line so fence state is tracked without complex look-behind.
+  const lines = doc.split("\n");
+  let insideFence = false;
+  const out: string[] = [];
+  for (const line of lines) {
+    // A line starting with ``` toggles fence state (open or close).
+    if (/^```/.test(line)) {
+      insideFence = !insideFence;
+      out.push(line);
+      continue;
+    }
+    if (insideFence) {
+      out.push(line);
+      continue;
+    }
+    // Prose line: rewrite [`Name`] and [Name] where Name is an identifier and
+    // there is no existing `(url)` or `[ref]` suffix — those mark full links.
+    //
+    // Regex:
+    //   \[(`?)                      opening `[`, capture optional backtick
+    //   ([A-Za-z_][A-Za-z0-9_]*)   identifier (the symbol name to resolve)
+    //   \1                          matching backtick (or empty if none)
+    //   \]                          closing `]`
+    //   (?![([\]])                  NOT followed by `(`, `[`, `]` (full link)
+    const processed = line.replace(
+      /\[(`?)([A-Za-z_][A-Za-z0-9_]*)\1\](?![([\]])/g,
+      (match, tick: string, name: string) => {
+        const url = resolve(name);
+        if (url === undefined) return match; // unknown — leave untouched
+        return `[${tick}${name}${tick}](${url})`;
+      },
+    );
+    out.push(processed);
+  }
+  return out.join("\n");
+};
+
 /**
  * The markdown body shown in hover and in completion `documentation`: the
  * declaration's authored `///` doc-comment (rendered as markdown by the client),
@@ -630,6 +712,10 @@ export const typeMarkdown = (typeStr: string, languageId: string): string =>
  * the bare type block ({@link typeMarkdown}), so undocumented declarations render
  * identically to before. When `typeStr` is empty (a documented binding with no
  * known type) the type fence is omitted and just the doc prose is returned.
+ *
+ * When `resolve` is provided (D7), any `` [`Name`] `` / `[Name]` spans in `doc`
+ * that resolve to a known symbol are rewritten as clickable markdown links before
+ * the prose is assembled. Unresolved spans and full markdown links are left alone.
  *
  * Returns the markdown *string* only — LSP-enum-free like the rest of this
  * module; `server.ts` wraps it in a `MarkupContent`. Factored out (and unit
@@ -640,11 +726,13 @@ export const docMarkdown = (
   typeStr: string,
   languageId: string,
   doc?: string,
+  resolve?: DocRefResolver,
 ): string => {
   const fence = typeStr === "" ? "" : typeMarkdown(typeStr, languageId);
   const trimmed = doc?.trim();
   if (!trimmed) return fence;
-  return fence ? `${trimmed}\n\n${fence}` : trimmed;
+  const linked = resolve ? linkifyDocRefs(trimmed, resolve) : trimmed;
+  return fence ? `${linked}\n\n${fence}` : linked;
 };
 
 /**
