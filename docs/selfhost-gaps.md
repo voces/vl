@@ -145,46 +145,49 @@ handed to `WebAssembly` from inside VL — see H4.5.
 (already on the strings roadmap) would give a real byte buffer; expose a
 `u8`/byte element type or at least an `i8`-backed array the codegen can fill.
 
-## H4.2. No value-level bitwise / shift operators (WORKED AROUND)
+## H4.2. No value-level bitwise / shift operators (RESOLVED)
 
-**Repro.** LEB128 is defined in terms of `& 0x7f`, `>> 7`, `>>> 7`. VL has no
+**Repro.** LEB128 is defined in terms of `& 0x7f`, `>> 7`, `>>> 7`. VL had no
 value-level `&` (the `&` token is intersection *types* only), no `|`, `^`, `~`,
-`<<`, `>>`, `>>>` (confirmed: none in `compiler/typecheck.ts`).
+`<<`, `>>`, `>>>` (confirmed: none in `compiler/typecheck.ts` at spike time).
 
-**What we did.** Emulate with arithmetic: `byte = v % 128`, `v = v / 128`,
+**What we did (before).** Emulate with arithmetic: `byte = v % 128`, `v = v / 128`,
 continuation bit via `byte + 128`. For signed LEB, emulate arithmetic-shift-right
 (floor division) by subtracting 1 when `v < 0 && v % 128 != 0`, since VL `/`
 truncates toward zero.
 
-**Suggested fix location.** `compiler/lexer.ts` + `compiler/parser.ts` +
-`compiler/typecheck.ts` + `compiler/toWasm.ts` — add the integer bitwise/shift
-operator family (wasm has `i32.and/or/xor/shl/shr_s/shr_u` natively, so codegen is
-a direct mapping). High value: any byte/binary-format codegen is painful without
-it, and the LEB workaround silently relies on small inputs (H4.3).
+**Resolution.** Merged in #99 (`feat(numerics): value-level bitwise & shift
+operators`). `compiler/wasmEmit.vl` now uses the real operators throughout:
+`& 0x7f` / `| 0x80` for the LEB bit manipulation, `>>> 7` for unsigned-LEB shift,
+`>> 7` for signed-LEB shift, and `& 0xff` in `emitByte`. The arithmetic workarounds
+and all `// GAP:` comments referencing this item have been removed. The byte stream
+is identical (pinned by `tests/selfhost_wasm_emit_test.ts`).
 
-## H4.3. No unsigned-right-shift → LEB only correct for small values (WORKED AROUND)
+## H4.3. No unsigned-right-shift → LEB only correct for small values (RESOLVED)
 
 **Repro.** A real ULEB of a value with bit 31 set needs an *unsigned* `>>> 7`.
-VL i32 is signed and `/ 128` is a signed (arithmetic, truncating) divide, so
+VL i32 is signed and `/ 128` was a signed (arithmetic, truncating) divide, so
 `ulebToArr` would loop/sign-extend wrongly for values >= 2^31.
 
-**What we did.** Rely on the fact that every length/index this spike emits is far
-below 2^31, so signed `/ 128` matches `>>> 7`. Left a `// GAP:` note. A full
+**What we did (before).** Rely on the fact that every length/index this spike emits is far
+below 2^31, so signed `/ 128` matched `>>> 7`. Left a `// GAP:` note. A full
 codegen emitting large `i32.const`/offsets MUST get this right.
 
-**Suggested fix location.** Same as H4.2 (the `>>>` operator), or an i64 widening
-path for the encoder. Until then any ULEB/SLEB over large magnitudes is unsound.
+**Resolution.** The `>>>` operator now exists (merged in #99, same as H4.2).
+`compiler/wasmEmit.vl` uses `v >>> 7` in `ulebToArr` — the unsigned shift is now
+correct for all i32 values, including those with bit 31 set.
 
-## H4.4. Signed `%` can be negative — masking needed (WORKED AROUND)
+## H4.4. Signed `%` can be negative — masking needed (RESOLVED via H4.2)
 
 **Repro.** `v % 128` is negative when `v < 0` (VL `%` follows the sign of the
 dividend, like wasm `i32.rem_s`). A LEB "low 7 bits" must be 0..127.
 
-**What we did.** `if byte < 0 { byte = byte + 128 }` after every `% 128`, and the
-analogous `((b % 256) + 256) % 256` in `emitByte`.
+**What we did (before).** `if byte < 0 { byte = byte + 128 }` after every `% 128`,
+and the analogous `((b % 256) + 256) % 256` in `emitByte`.
 
-**Suggested fix location.** Not a bug — documents that there is no unsigned
-modulo / `rem_u` exposed; the bitwise `& 0x7f`/`& 0xff` (H4.2) is the clean fix.
+**Resolution.** The bitwise `& 0x7f` / `& 0xff` ops from H4.2 (#99) are the clean
+fix. `compiler/wasmEmit.vl` now uses `v & 0x7f` for the low-7-bit extract and
+`b & 0xff` in `emitByte` — both naturally unsigned, no sign-fix branches needed.
 
 ## H4.5. No in-VL handoff of bytes to `WebAssembly` — serialize via decimal string (WORKED AROUND)
 
@@ -221,6 +224,11 @@ The vertical slice is **GREEN**: `compiler/wasmEmit.vl` emits valid wasm bytes f
 both fixed modules; `tests/selfhost_wasm_emit_test.ts` (2 cases) instantiates them
 with the real `WebAssembly` engine and asserts `main() === 42` and `id(x) === x`.
 LEB128 (unsigned + signed) and section-length framing are implemented and proven
-by a byte-exact pin plus live execution. The blocking gaps for a *full* codegen
-port (beyond fixed modules) are H4.2/H4.3 (bitwise + unsigned shift, for sound
-large-value LEB) and H4.1/H4.5 (a real byte buffer + host handoff).
+by a byte-exact pin plus live execution.
+
+H4.2, H4.3, and H4.4 are now **RESOLVED**: the bitwise/shift operator family
+(`& | ^ ~ << >> >>>`) was added in #99, and `compiler/wasmEmit.vl` has been
+updated to use the real operators throughout — `& 0x7f` / `| 0x80` / `>>> 7` /
+`>> 7` / `& 0xff` — replacing all arithmetic emulation. The byte stream is
+unchanged (verified by the exact-pin test). The remaining gaps for a *full* codegen
+port (beyond fixed modules) are H4.1/H4.5 (a real byte buffer + host handoff).

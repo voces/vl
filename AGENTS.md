@@ -71,3 +71,9 @@ doesn't belong here.
 
 - End commit messages with: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
 - Branch from `master` (CI runs the gate + LSP build on PRs and on push to `master`).
+
+### Comments
+
+Comments are **evergreen** — write them for a future reader of the current code. Do **not** put
+history or changelog in comments: no "now exists", "previously", "was changed to", "temporary
+until", or PR/issue references. That belongs in commits, the PR description, or `CHANGELOG.md`.

@@ -1,25 +1,22 @@
-// VL-in-VL wasm emitter — Track H4 spike.
+// VL-in-VL wasm emitter — self-hosted codegen spike.
 //
 // A `.vl` program that produces RAW WebAssembly *bytes* for a minimal but valid
-// module. This is the first vertical slice of self-hosted codegen: it proves VL
-// can emit a wasm byte stream that a real `WebAssembly` engine instantiates and
-// runs. It does NOT consume the AST arena yet (that is the full codegen port);
-// it hand-builds the byte sequence for two fixed modules to surface the
-// LEB128/byte-array/section-framing machinery a real codegen will need.
+// module. It does NOT consume the AST arena (that is the full codegen port);
+// instead it hand-builds the byte sequence for two fixed modules to exercise the
+// LEB128/byte-array/section-framing machinery that a real codegen requires.
 //
 // VL has NO module system, so the TS runner concatenates `compiler/ast.vl`
 // (for `i32ToStr`) ahead of this file and a print driver. Mind name collisions:
 // names here (`W`, `emit*`, `leb*`, `buildConstModule`, …) must not clash with
 // ast.vl. `i32ToStr` is reused from ast.vl.
 //
-// Output representation: a VL `i32[]` of byte values 0..255. WasmGC has no `u8`;
-// `i32[]` is what VL can express today (see docs/selfhost-gaps.md, Codegen
-// self-host (H4)). Bytes are masked to the low 8 bits on emit.
+// Output representation: a VL `i32[]` of byte values 0..255. WasmGC has no `u8`,
+// so `i32[]` is used (see docs/selfhost-gaps.md). Bytes are masked to the low
+// 8 bits on emit (`& 0xff`).
 
 // ── emit state ───────────────────────────────────────────────────────────────
 // A single growable byte buffer. Top-level mutable `let` mutated through a
-// function lowers to a wasm global (H2 gap #2, already fixed), so helpers can
-// append to `W.bytes` directly.
+// function lowers to a wasm global, so helpers can append to `W.bytes` directly.
 type Emitter = { bytes: i32[] }
 let W: Emitter = { bytes: [] }
 
@@ -30,11 +27,7 @@ function emitReset(): i32 {
 
 // Append one byte (low 8 bits) to the buffer.
 function emitByte(b: i32): i32 {
-  // GAP: no `u8`/byte type and no bitwise `&` operator surfaced in this spike;
-  // mask to 0..255 with arithmetic ( ((b % 256) + 256) % 256 ) to stay in range.
-  let m = b % 256
-  if m < 0 { m = m + 256 }
-  W.bytes.push(m)
+  W.bytes.push(b & 0xff)
   0
 }
 
@@ -49,11 +42,13 @@ function emitBytes(bs: i32[]): i32 {
 }
 
 // ── LEB128 encoders ──────────────────────────────────────────────────────────
-// The canonical encoders return a fresh `i32[]` (so they compose into nested
-// payloads); the streaming `emitULEB`/`emitSLEB` append straight to `W.bytes`.
-// GAP: VL i32 is signed; for the small sizes this spike emits, values stay well
-// under 2^31 so plain division/modulo by 128 behaves as the unsigned shift/mask.
-// A real codegen needs an unsigned-right-shift or `& 0x7f` (see gaps doc).
+// Each encoder stores 7 data bits per output byte; the high bit (0x80) is the
+// continuation flag, set on every byte except the last. `& 0x7f` extracts the
+// low 7 bits, `>>> 7` does the unsigned right-shift for ULEB, `>> 7` does the
+// arithmetic right-shift for SLEB (preserving sign), and `| 0x80` sets the
+// continuation bit. The canonical `*ToArr` forms return a fresh `i32[]` so
+// they compose into nested payload builders; `emitULEB` appends straight to
+// `W.bytes` for section-length framing.
 
 // Unsigned LEB128: 7 bits per byte, low-to-high, high bit set while more remain.
 function ulebToArr(value: i32): i32[] {
@@ -61,14 +56,13 @@ function ulebToArr(value: i32): i32[] {
   let v = value
   let more = true
   while more {
-    let byte = v % 128
-    if byte < 0 { byte = byte + 128 }
-    v = v / 128
+    let byte = v & 0x7f
+    v = v >>> 7
     if v == 0 {
       out.push(byte)
       more = false
     } else {
-      out.push(byte + 128)
+      out.push(byte | 0x80)
     }
   }
   out
@@ -80,21 +74,16 @@ function slebToArr(value: i32): i32[] {
   let v = value
   let more = true
   while more {
-    let byte = v % 128
-    if byte < 0 { byte = byte + 128 }
-    let next = v / 128
-    if v < 0 {
-      if v % 128 != 0 { next = next - 1 }
-    }
-    v = next
+    let byte = v & 0x7f
+    v = v >> 7
     let signBit = 0
-    if byte >= 64 { signBit = 1 }
+    if (byte & 0x40) != 0 { signBit = 1 }
     if v == 0 {
       if signBit == 0 {
         out.push(byte)
         more = false
       } else {
-        out.push(byte + 128)
+        out.push(byte | 0x80)
       }
     } else {
       if v == 0 - 1 {
@@ -102,10 +91,10 @@ function slebToArr(value: i32): i32[] {
           out.push(byte)
           more = false
         } else {
-          out.push(byte + 128)
+          out.push(byte | 0x80)
         }
       } else {
-        out.push(byte + 128)
+        out.push(byte | 0x80)
       }
     }
   }
@@ -213,7 +202,7 @@ function buildConstModule(): i32 {
 // (module
 //   (func $id (param i32) (result i32) (local.get 0))
 //   (export "id" (func $id)))
-// Exercises param/local encoding (the optional stretch slice).
+// Exercises param encoding (non-empty param vec) and local.get.
 function buildIdentityModule(): i32 {
   emitReset()
   emitHeader()
