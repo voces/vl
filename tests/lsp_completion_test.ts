@@ -18,8 +18,10 @@ import type { Scope } from "../compiler/ast.ts";
 import {
   type Completion,
   identifierCompletions,
+  keywordCompletions,
   memberCompletions,
   receiverObjectType,
+  snippetCompletions,
   typeLabelDetail,
   typeMarkdown,
 } from "../lsp/src/typeFeatures.ts";
@@ -294,4 +296,90 @@ Deno.test("a typed binding renders its type once inline and once highlighted, ne
   // No duplication: the highlighted panel markdown contains the type exactly once.
   const occurrences = md.split(detail!).length - 1;
   assertEquals(occurrences, 1, "type appears exactly once in the panel markdown");
+});
+
+// ---- (4) keyword completions (D3 remaining) ---------------------------------
+
+Deno.test("keywordCompletions: returns all hard and soft keywords with kind=keyword", () => {
+  const cs = keywordCompletions(false);
+  const kwNames = cs.map((c) => c.name);
+  // Spot-check a selection of hard keywords.
+  for (const kw of ["let", "const", "function", "return", "if", "else", "elseif", "while", "type", "import", "export", "true", "false", "null"]) {
+    if (!kwNames.includes(kw)) throw new Error(`keyword "${kw}" missing`);
+  }
+  // Soft keywords.
+  for (const kw of ["as", "from", "in", "step", "to", "then"]) {
+    if (!kwNames.includes(kw)) throw new Error(`soft keyword "${kw}" missing`);
+  }
+  // Every item has kind "keyword" and no insertText.
+  for (const c of cs) {
+    assertEquals(c.kind, "keyword" as const, `"${c.name}" should have kind "keyword"`);
+    assertEquals(c.insertText, undefined, `"${c.name}" should have no insertText`);
+  }
+});
+
+Deno.test("keywordCompletions: returns empty list after a dot (member position)", () => {
+  const cs = keywordCompletions(true);
+  assertEquals(cs, [], "no keywords after a dot");
+});
+
+// ---- (5) snippet completions (D3 remaining) ---------------------------------
+
+Deno.test("snippetCompletions: returns items with kind=snippet and tab-stop insertText", () => {
+  const cs = snippetCompletions(false);
+  if (cs.length === 0) throw new Error("expected at least one snippet");
+  for (const c of cs) {
+    assertEquals(c.kind, "snippet" as const, `"${c.name}" should have kind "snippet"`);
+    if (!c.insertText) throw new Error(`snippet "${c.name}" missing insertText`);
+    // All snippet insertTexts must contain at least one tab-stop marker.
+    if (!c.insertText.includes("${")) {
+      throw new Error(`snippet "${c.name}" insertText has no tab-stop: ${c.insertText}`);
+    }
+  }
+});
+
+Deno.test("snippetCompletions: covers the common VL skeleton forms", () => {
+  const cs = snippetCompletions(false);
+  const names = cs.map((c) => c.name);
+  for (const expected of ["function", "if", "while", "for", "let", "const", "return"]) {
+    if (!names.includes(expected)) throw new Error(`snippet for "${expected}" missing`);
+  }
+  // function snippet includes parameter and return-type placeholders.
+  const fnSnippet = cs.find((c) => c.name === "function");
+  if (!fnSnippet?.insertText?.includes("params")) {
+    throw new Error("function snippet should contain a params placeholder");
+  }
+});
+
+Deno.test("snippetCompletions: returns empty list after a dot (member position)", () => {
+  const cs = snippetCompletions(true);
+  assertEquals(cs, [], "no snippets after a dot");
+});
+
+// ---- (6) member-access trigger still yields member (not keyword) completions -
+
+Deno.test("memberCompletions used in dot context: no keywords or snippets mixed in", () => {
+  // When the trigger character is `.`, only member completions are returned —
+  // keywordCompletions(true) and snippetCompletions(true) both return []. This
+  // test confirms those guards work and that real members are still surfaced.
+  const objectType = {
+    type: "Object" as const,
+    name: "Vec",
+    properties: [
+      {
+        name: { type: "StringLiteral" as const, value: "x" },
+        type: { type: "Alias" as const, name: "f64" },
+      },
+    ],
+  };
+  const members = memberCompletions(objectType, stringifyType);
+  const noKeywordsInMembers = members.every((c) => c.kind !== "keyword");
+  if (!noKeywordsInMembers) throw new Error("member completions must not have keyword kind");
+  const noSnippetsInMembers = members.every((c) => c.kind !== "snippet");
+  if (!noSnippetsInMembers) throw new Error("member completions must not have snippet kind");
+  // Guard function confirms afterDot suppresses keyword/snippet completions.
+  assertEquals(keywordCompletions(true), [], "keywords suppressed after dot");
+  assertEquals(snippetCompletions(true), [], "snippets suppressed after dot");
+  // Member completions still appear.
+  assertEquals(members.map((c) => c.name), ["x"]);
 });
