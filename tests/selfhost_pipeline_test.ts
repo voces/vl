@@ -18,6 +18,15 @@
 //      SOURCE TEXT before concatenation (glue only — no `.vl` compiler file edited).
 // The token-`kind` spellings now agree between the lexer and parser (gap #2
 // resolved in `compiler/lexer.vl`), so no `mapKind` translation is needed.
+//
+// PERF (compile-once): every case compiles the SAME ~3k-line base (lexer + ast +
+// parser + typecheck); only the driven source differs. Rather than recompile the
+// base once per sub-test (N full pipeline compiles, the dominant CI cost), we build
+// ONE module whose driver runs every case in turn — resetting the parser/checker
+// state between them — and prints label-prefixed output. One compile + one run, the
+// logs are split per label, and each `Deno.test` asserts its slice. Same coverage
+// (the real lexer→parser→typecheck runs on every case, and binaryen `optimize()`
+// still runs — once), a fraction of the time.
 
 import { runWasm } from "../compiler/compile.ts";
 import { compileCached } from "./_selfhost_cache.ts";
@@ -45,31 +54,63 @@ const ast = read("../compiler/ast.vl");
 const parser = read("../compiler/parser.vl");
 const typecheck = read("../compiler/typecheck.vl");
 
-// Compile `lexer.vl ++ ast.vl ++ parser.vl ++ typecheck.vl ++ driver`, run it, and
-// return the logs. (The order matters: `ast.vl` defines `P`/`Tok`/`mk*` the parser
-// needs; `typecheck.vl` reads `P.nodes`; the lexer is independent and goes first.)
-const runDriver = async (driver: string): Promise<string[]> => {
-  const source = lexer + "\n" + ast + "\n" + parser + "\n" + typecheck + "\n" +
-    driver;
-  const { wasm, diagnostics } = await compileCached(source);
-  const errors = diagnostics.filter((d) => d.severity === "error");
-  if (errors.length > 0 || !wasm) {
-    throw new Error(
-      "self-hosted pipeline failed to compile: " +
-        errors.map((d) => d.message).join("; "),
-    );
-  }
-  const { logs } = await runWasm(wasm);
-  return logs;
-};
+// Each case: a label, the VL SOURCE TEXT to drive through lexer→parser→typecheck,
+// and the expected diagnostic lines (count line first, then each message in order).
+type Case = { label: string; src: string; expected: string[] };
 
-// The source→tokens loader + the diagnostic printer, shared by the inline
-// seeded-error drivers. (The shared fixture `tests/selfhost/pipeline_harness.vl`
-// carries its own copy of this glue so it also runs standalone.) `checkProgram` is
-// ALWAYS consumed in an expression (`i32ToStr(checkProgram(...))`) — calling it bare
-// trips a codegen gap at module scale (see the gap note in `compiler/typecheck.vl`).
-// No `mapKind` needed: the lexer now uses the same kind spellings as the parser.
-const prelude = `
+const CASES: Case[] = [
+  {
+    // Mirrors `tests/selfhost/pipeline_harness.vl`: a well-typed program — a
+    // function decl with typed params + return, an inferred `let`, a call, a
+    // comparison yielding bool, an annotated string binding, and an `if`.
+    label: "well-typed",
+    src: "function add(a: i32, b: i32): i32 {\n" +
+      "  let sum = a + b\n" +
+      "  return sum\n" +
+      "}\n" +
+      "let r: i32 = add(1, 2)\n" +
+      "let ok: bool = r >= 2\n" +
+      "if ok {\n" +
+      '  let msg: string = "hi"\n' +
+      "}\n",
+    expected: ["diags: 0"],
+  },
+  {
+    label: "let-mismatch",
+    src: 'let x: i32 = "s"\n',
+    expected: ["diags: 1", "cannot assign string to 'x' of type i32"],
+  },
+  {
+    label: "call-errors",
+    src: "function f(a: i32): i32 { return a }\n" +
+      'f("hi")\n' + // wrong arg type
+      "f(1, 2)\n" + // wrong arity
+      "g(1)\n", // undeclared callee
+    expected: [
+      "diags: 3",
+      "argument 1: expected i32, got string",
+      "wrong number of arguments: expected 1, got 2",
+      "undeclared identifier 'g'",
+    ],
+  },
+  {
+    label: "non-bool-if",
+    src: "let n: i32 = 0\nif n { }\n",
+    expected: ["diags: 1", "if-condition must be bool, got i32"],
+  },
+  {
+    label: "mixed-numeric",
+    src: "let a: i32 = 1\nlet b: f64 = 2.0\nlet c: i32 = a + b\n",
+    expected: ["diags: 1", "operator '+' mixes i32 and f64"],
+  },
+];
+
+// The combined driver: shared glue + a per-case runner that RESETS the parser arena
+// (`P`) and the checker (`initChecker`) before each case, then prints each output
+// line prefixed with `<label>\t` so the host can split them. `checkProgram` is always
+// consumed in an expression (`i32ToStr(checkProgram(...))`) — calling it bare trips a
+// codegen gap at module scale (see the gap note in `compiler/typecheck.vl`).
+const driver = `
 function loadToks(src: string): i32 {
   let r = tokenize(src)
   let i = 0
@@ -80,65 +121,55 @@ function loadToks(src: string): i32 {
   }
   P.toks.length
 }
-function report(): i32 {
-  print("diags: " + i32ToStr(checkProgram(parseProgram())))
+function runCase(label: string, src: string): i32 {
+  P.toks = []
+  P.nodes = []
+  P.diags = []
+  P.pos = 0
+  loadToks(src)
+  initChecker()
+  print(label + "\\tdiags: " + i32ToStr(checkProgram(parseProgram())))
   let i = 0
   while i < T.diags.length {
-    print(T.diags[i].tmsg)
+    print(label + "\\t" + T.diags[i].tmsg)
     i = i + 1
   }
   0
 }
-`;
+` +
+  CASES.map((c) => `runCase(${JSON.stringify(c.label)}, ${JSON.stringify(c.src)})`)
+    .join("\n") + "\n";
 
-// Build a driver that lexes `src`, parses, checks, and prints diagnostics.
-const driverFor = (src: string): string =>
-  prelude + `\nloadToks(${JSON.stringify(src)})\ninitChecker()\nreport()\n`;
+// Compile + run the combined module ONCE (memoized), returning the per-label logs.
+let allLogs: Promise<Map<string, string[]>> | undefined;
+const runAll = (): Promise<Map<string, string[]>> =>
+  allLogs ??= (async () => {
+    const source = lexer + "\n" + ast + "\n" + parser + "\n" + typecheck + "\n" +
+      driver;
+    const { wasm, diagnostics } = await compileCached(source);
+    const errors = diagnostics.filter((d) => d.severity === "error");
+    if (errors.length > 0 || !wasm) {
+      throw new Error(
+        "self-hosted pipeline failed to compile: " +
+          errors.map((d) => d.message).join("; "),
+      );
+    }
+    const { logs } = await runWasm(wasm);
+    const byLabel = new Map<string, string[]>();
+    for (const line of logs) {
+      const tab = line.indexOf("\t");
+      const label = tab < 0 ? "" : line.slice(0, tab);
+      const payload = tab < 0 ? line : line.slice(tab + 1);
+      const arr = byLabel.get(label) ?? [];
+      arr.push(payload);
+      byLabel.set(label, arr);
+    }
+    return byLabel;
+  })();
 
-Deno.test("self-hosted pipeline: a well-typed program from source reports no diagnostics", async () => {
-  // Runs the shared `tests/selfhost/pipeline_harness.vl` fixture: raw source for a
-  // function decl with typed params + return, an inferred `let`, a call, a
-  // comparison yielding bool, an annotated string binding, and an `if` — all driven
-  // through the real lexer → parser → typecheck chain.
-  const logs = await runDriver(read("./selfhost/pipeline_harness.vl"));
-  assertEquals(logs, ["diags: 0"]);
-});
-
-Deno.test("self-hosted pipeline: a let-annotation mismatch from source is reported", async () => {
-  const logs = await runDriver(driverFor('let x: i32 = "s"\n'));
-  assertEquals(logs, [
-    "diags: 1",
-    "cannot assign string to 'x' of type i32",
-  ]);
-});
-
-Deno.test("self-hosted pipeline: call arity, arg-type, and undeclared errors from source", async () => {
-  const src = "function f(a: i32): i32 { return a }\n" +
-    'f("hi")\n' + // wrong arg type
-    "f(1, 2)\n" + // wrong arity
-    "g(1)\n"; // undeclared callee
-  const logs = await runDriver(driverFor(src));
-  assertEquals(logs, [
-    "diags: 3",
-    "argument 1: expected i32, got string",
-    "wrong number of arguments: expected 1, got 2",
-    "undeclared identifier 'g'",
-  ]);
-});
-
-Deno.test("self-hosted pipeline: a non-bool if-condition from source is reported", async () => {
-  const logs = await runDriver(driverFor("let n: i32 = 0\nif n { }\n"));
-  assertEquals(logs, [
-    "diags: 1",
-    "if-condition must be bool, got i32",
-  ]);
-});
-
-Deno.test("self-hosted pipeline: mixed-numeric arithmetic from source is reported", async () => {
-  const src = "let a: i32 = 1\nlet b: f64 = 2.0\nlet c: i32 = a + b\n";
-  const logs = await runDriver(driverFor(src));
-  assertEquals(logs, [
-    "diags: 1",
-    "operator '+' mixes i32 and f64",
-  ]);
-});
+for (const c of CASES) {
+  Deno.test(`self-hosted pipeline: ${c.label}`, async () => {
+    const logs = (await runAll()).get(c.label) ?? [];
+    assertEquals(logs, c.expected);
+  });
+}
