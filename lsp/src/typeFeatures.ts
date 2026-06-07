@@ -31,6 +31,7 @@ import {
   arrayElementType,
   isListType,
   listMemberType,
+  softenImplicitType,
   typeFromExpression,
 } from "../../compiler/typecheck.ts";
 
@@ -975,6 +976,17 @@ const memberTypeOf = (
   let objType = typeFromExpression(object, sentinel);
   if (objType.type === "Infer") objType = objType.subType;
   if (objType.type === "Nullable") objType = objType.subType; // `x?.y` receiver
+  // A literal receiver (`"hi".slice(…)`, or a `const s = "hi"` binding that kept
+  // its narrow `StringLiteral` type) dispatches like its base type: a literal
+  // carries no members of its own, but its base (`string`, `i32`, …) does. Soften
+  // it so the intrinsic member resolves instead of yielding `never` — mirroring
+  // the compiler's method-dispatch and property-read paths (PR #119).
+  if (
+    objType.type === "StringLiteral" || objType.type === "IntegerLiteral" ||
+    objType.type === "RealLiteral" || objType.type === "BooleanLiteral"
+  ) {
+    objType = softenImplicitType(objType);
+  }
   if (objType.type !== "Object") return undefined;
 
   // `.length` on an array/string is an intrinsic i32 (not a structural field).
