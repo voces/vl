@@ -3165,15 +3165,12 @@ export const toWasm = async (
         }
         const objType = objectTypeOf(node.object);
         // List size members are intrinsic struct reads: `.length` → `len`,
-        // `.capacity` → `cap` (both O(1)). A raw i32-array (string) keeps
+        // `.length` → `len` (O(1)). A raw i32-array (string) keeps
         // `.length` → `array.len`.
         if (isListType(objType)) {
           const ref = toExpression(node.object);
           if (node.property === "length") {
             return m.struct.get(LIST_LEN, ref, binaryen.i32, false);
-          }
-          if (node.property === "capacity") {
-            return m.struct.get(LIST_CAP, ref, binaryen.i32, false);
           }
           throw new Error(`List has no member "${node.property}"`);
         }
