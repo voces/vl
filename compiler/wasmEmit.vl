@@ -1,0 +1,273 @@
+// VL-in-VL wasm emitter — Track H4 spike.
+//
+// A `.vl` program that produces RAW WebAssembly *bytes* for a minimal but valid
+// module. This is the first vertical slice of self-hosted codegen: it proves VL
+// can emit a wasm byte stream that a real `WebAssembly` engine instantiates and
+// runs. It does NOT consume the AST arena yet (that is the full codegen port);
+// it hand-builds the byte sequence for two fixed modules to surface the
+// LEB128/byte-array/section-framing machinery a real codegen will need.
+//
+// VL has NO module system, so the TS runner concatenates `compiler/ast.vl`
+// (for `i32ToStr`) ahead of this file and a print driver. Mind name collisions:
+// names here (`W`, `emit*`, `leb*`, `buildConstModule`, …) must not clash with
+// ast.vl. `i32ToStr` is reused from ast.vl.
+//
+// Output representation: a VL `i32[]` of byte values 0..255. WasmGC has no `u8`;
+// `i32[]` is what VL can express today (see docs/selfhost-gaps.md, Codegen
+// self-host (H4)). Bytes are masked to the low 8 bits on emit.
+
+// ── emit state ───────────────────────────────────────────────────────────────
+// A single growable byte buffer. Top-level mutable `let` mutated through a
+// function lowers to a wasm global (H2 gap #2, already fixed), so helpers can
+// append to `W.bytes` directly.
+type Emitter = { bytes: i32[] }
+let W: Emitter = { bytes: [] }
+
+function emitReset(): i32 {
+  W.bytes = []
+  0
+}
+
+// Append one byte (low 8 bits) to the buffer.
+function emitByte(b: i32): i32 {
+  // GAP: no `u8`/byte type and no bitwise `&` operator surfaced in this spike;
+  // mask to 0..255 with arithmetic ( ((b % 256) + 256) % 256 ) to stay in range.
+  let m = b % 256
+  if m < 0 { m = m + 256 }
+  W.bytes.push(m)
+  0
+}
+
+// Append every byte of `bs` in order.
+function emitBytes(bs: i32[]): i32 {
+  let i = 0
+  while i < bs.length {
+    emitByte(bs[i])
+    i = i + 1
+  }
+  0
+}
+
+// ── LEB128 encoders ──────────────────────────────────────────────────────────
+// The canonical encoders return a fresh `i32[]` (so they compose into nested
+// payloads); the streaming `emitULEB`/`emitSLEB` append straight to `W.bytes`.
+// GAP: VL i32 is signed; for the small sizes this spike emits, values stay well
+// under 2^31 so plain division/modulo by 128 behaves as the unsigned shift/mask.
+// A real codegen needs an unsigned-right-shift or `& 0x7f` (see gaps doc).
+
+// Unsigned LEB128: 7 bits per byte, low-to-high, high bit set while more remain.
+function ulebToArr(value: i32): i32[] {
+  let out: i32[] = []
+  let v = value
+  let more = true
+  while more {
+    let byte = v % 128
+    if byte < 0 { byte = byte + 128 }
+    v = v / 128
+    if v == 0 {
+      out.push(byte)
+      more = false
+    } else {
+      out.push(byte + 128)
+    }
+  }
+  out
+}
+
+// SLEB-encode `value` into a fresh `i32[]`.
+function slebToArr(value: i32): i32[] {
+  let out: i32[] = []
+  let v = value
+  let more = true
+  while more {
+    let byte = v % 128
+    if byte < 0 { byte = byte + 128 }
+    let next = v / 128
+    if v < 0 {
+      if v % 128 != 0 { next = next - 1 }
+    }
+    v = next
+    let signBit = 0
+    if byte >= 64 { signBit = 1 }
+    if v == 0 {
+      if signBit == 0 {
+        out.push(byte)
+        more = false
+      } else {
+        out.push(byte + 128)
+      }
+    } else {
+      if v == 0 - 1 {
+        if signBit == 1 {
+          out.push(byte)
+          more = false
+        } else {
+          out.push(byte + 128)
+        }
+      } else {
+        out.push(byte + 128)
+      }
+    }
+  }
+  out
+}
+
+// Append all of `src` onto `dst` (in place) and return `dst`.
+function appendAll(dst: i32[], src: i32[]): i32[] {
+  let i = 0
+  while i < src.length {
+    dst.push(src[i])
+    i = i + 1
+  }
+  dst
+}
+
+// Streaming unsigned-LEB: append straight to the output buffer (used for
+// section-length framing). The signed encoder is only needed for `i32.const`
+// operands, which are built into a body array — so it stays the array form
+// `slebToArr` rather than a streaming wrapper.
+function emitULEB(value: i32): i32 {
+  emitBytes(ulebToArr(value))
+  0
+}
+
+// ── section framing ──────────────────────────────────────────────────────────
+// A section is: id byte, then ULEB(byte-length of payload), then payload. The
+// payload is built into a temporary `i32[]`, then framed. (No closures/builder
+// objects needed — payloads are constructed eagerly into arrays.)
+function emitSection(id: i32, payload: i32[]): i32 {
+  emitByte(id)
+  emitULEB(payload.length)
+  emitBytes(payload)
+  0
+}
+
+// ── module header ────────────────────────────────────────────────────────────
+function emitHeader(): i32 {
+  // "\0asm" magic + version 1
+  emitByte(0)
+  emitByte(97)   // 'a'
+  emitByte(115)  // 's'
+  emitByte(109)  // 'm'
+  emitByte(1)
+  emitByte(0)
+  emitByte(0)
+  emitByte(0)
+  0
+}
+
+// ── full module: () -> i32 returning 42 ──────────────────────────────────────
+// (module
+//   (func $main (result i32) (i32.const 42))
+//   (export "main" (func $main)))
+function buildConstModule(): i32 {
+  emitReset()
+  emitHeader()
+
+  // Type section (id 1): one functype () -> i32
+  // payload = vec(functype): count=1, 0x60, params vec(0), results vec(1, 0x7f)
+  let typePayload: i32[] = []
+  typePayload.push(1)      // 1 type
+  typePayload.push(96)     // 0x60 func
+  typePayload.push(0)      // 0 params
+  typePayload.push(1)      // 1 result
+  typePayload.push(127)    // 0x7f i32
+  emitSection(1, typePayload)
+
+  // Function section (id 3): one function, type index 0
+  let funcPayload: i32[] = []
+  funcPayload.push(1)      // 1 function
+  funcPayload.push(0)      // type index 0
+  emitSection(3, funcPayload)
+
+  // Export section (id 7): export "main" as func 0
+  let exportPayload: i32[] = []
+  exportPayload.push(1)    // 1 export
+  exportPayload.push(4)    // name length 4
+  exportPayload.push(109)  // 'm'
+  exportPayload.push(97)   // 'a'
+  exportPayload.push(105)  // 'i'
+  exportPayload.push(110)  // 'n'
+  exportPayload.push(0)    // export kind: func
+  exportPayload.push(0)    // func index 0
+  emitSection(7, exportPayload)
+
+  // Code section (id 10): one function body
+  // body = vec(locals)=0, i32.const 42 (0x41 + SLEB 42), end (0x0b)
+  let body: i32[] = []
+  body.push(0)             // 0 local declarations
+  body.push(65)            // 0x41 i32.const
+  appendAll(body, slebToArr(42))
+  body.push(11)            // 0x0b end
+
+  // code payload = count=1, then size-prefixed body
+  let codePayload: i32[] = []
+  codePayload.push(1)      // 1 code entry
+  appendAll(codePayload, ulebToArr(body.length))
+  appendAll(codePayload, body)
+  emitSection(10, codePayload)
+  0
+}
+
+// ── full module: (i32) -> i32 returning its param (local.get 0) ──────────────
+// (module
+//   (func $id (param i32) (result i32) (local.get 0))
+//   (export "id" (func $id)))
+// Exercises param/local encoding (the optional stretch slice).
+function buildIdentityModule(): i32 {
+  emitReset()
+  emitHeader()
+
+  // Type section: (i32) -> i32
+  let typePayload: i32[] = []
+  typePayload.push(1)      // 1 type
+  typePayload.push(96)     // 0x60 func
+  typePayload.push(1)      // 1 param
+  typePayload.push(127)    // 0x7f i32 param
+  typePayload.push(1)      // 1 result
+  typePayload.push(127)    // 0x7f i32 result
+  emitSection(1, typePayload)
+
+  // Function section
+  let funcPayload: i32[] = []
+  funcPayload.push(1)
+  funcPayload.push(0)
+  emitSection(3, funcPayload)
+
+  // Export "id"
+  let exportPayload: i32[] = []
+  exportPayload.push(1)
+  exportPayload.push(2)    // name length 2
+  exportPayload.push(105)  // 'i'
+  exportPayload.push(100)  // 'd'
+  exportPayload.push(0)    // func kind
+  exportPayload.push(0)    // func index 0
+  emitSection(7, exportPayload)
+
+  // Code: local.get 0 ; end
+  let body: i32[] = []
+  body.push(0)             // 0 local declarations (params aren't locals here)
+  body.push(32)            // 0x20 local.get
+  appendAll(body, ulebToArr(0))
+  body.push(11)            // 0x0b end
+
+  let codePayload: i32[] = []
+  codePayload.push(1)
+  appendAll(codePayload, ulebToArr(body.length))
+  appendAll(codePayload, body)
+  emitSection(10, codePayload)
+  0
+}
+
+// Render the current buffer as a comma-joined decimal string (the round-trip
+// wire format the TS test parses back into a Uint8Array).
+function bytesToStr(): string {
+  let out = ""
+  let i = 0
+  while i < W.bytes.length {
+    if i > 0 { out = out + "," }
+    out = out + i32ToStr(W.bytes[i])
+    i = i + 1
+  }
+  out
+}
