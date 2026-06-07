@@ -1,31 +1,49 @@
 // Runs the VL-in-VL parser (`compiler/parser.vl`, over `compiler/ast.vl`) through
-// the real VL toolchain and checks the AST it builds. VL has no module system yet,
-// so the sources are concatenated ahead of a `.vl` print-driver, compiled to wasm
-// and run, and the captured log is diffed against the expected tree.
+// the real VL toolchain and checks the AST it builds.
 //
 // This is the proof the self-hosted parser compiles and runs end to end: a genuine
 // discriminated-union AST (discriminated with `is`), mutually-recursive
 // recursive-descent functions, and a struct-field arena pushed onto directly.
 //
-// PERF (compile-once): both cases compile the same `ast.vl ++ parser.vl` base. The
-// fixture's helper functions are lifted into the shared driver once; each case runs
-// in its own function (resetting the parser arena `P` first) behind a `@@N` sentinel
-// so the host can split the single run's log.
+// REAL MODULES: `ast.vl`/`parser.vl` `export` their public surface, so this harness
+// drives them through the module graph driver (`compileProgram`) instead of
+// concatenating the sources. An in-memory DRIVER module imports `P`/`i32ToStr` and the
+// `Node` variant types (which the fixture's tree-walkers `is`-narrow) from `./ast`, and
+// `parseProgram` from `./parser`.
+//
+// PERF (compile-once): both cases compile the same module graph. The fixture's helper
+// functions are lifted into the shared driver once; each case runs in its own function
+// (resetting the parser arena `P` first) behind a `@@N` sentinel so the host can split
+// the single run's log.
 
-import { runWasm } from "../compiler/compile.ts";
-import { compileCached } from "./_selfhost_cache.ts";
+import { compileProgram, runWasm } from "../compiler/compile.ts";
+import { createOptimizeCache } from "../compiler/buildCache.ts";
+
+const optimizeCache = createOptimizeCache();
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
   const e = JSON.stringify(expected, null, 2);
-  if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+  if (a !== e) {
+    throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
+  }
 };
 
 const read = (rel: string) =>
   Deno.readTextFileSync(new URL(rel, import.meta.url));
 
-const ast = read("../compiler/ast.vl");
-const parser = read("../compiler/parser.vl");
+// Resolved keys for the on-disk modules + the in-memory driver (its `./ast`/`./parser`
+// specifiers resolve to the real `compiler/*.vl` siblings).
+const compilerUrl = (name: string) =>
+  new URL(`../compiler/${name}`, import.meta.url).pathname;
+const AST = compilerUrl("ast.vl");
+const PARSER = compilerUrl("parser.vl");
+const DRIVER = compilerUrl("__parser_driver__.vl");
+
+// The import header the driver module opens with — wires it to the real modules. The
+// fixture's tree-walkers `is`-narrow the `Node` union, so every variant is imported.
+const driverHeader =
+  `import { P, i32ToStr, NumLit, StrLit, CharLit, BoolLit, Ident, Unary, BinExpr, Call, Member, Paren, ErrExpr, LetDecl, Param, TypeRef, FuncDecl, IfStmt, WhileStmt, RetStmt, Block, Program } from "./ast"\nimport { parseProgram } from "./parser"\n\n`;
 
 // Split the standalone fixture into its helper DEFS (functions: tok, buildTokens,
 // the AST tree-walkers) and its RUN section (build tokens → parseProgram → walk).
@@ -118,16 +136,28 @@ while i < P.diags.length {
 
 // One compile: fixture defs + a per-case function (reset → body) behind a `@@N`
 // sentinel.
-const driver = parserDefs + "\n" +
+const driver = driverHeader + parserDefs + "\n" +
   CASES.map((c, i) => `function pcase${i}(): i32 {\n${RESET}${c.body}\n0\n}`)
-    .join("\n") + "\n" +
+    .join("\n") +
+  "\n" +
   CASES.map((_, i) => `print("@@${i}")\npcase${i}()`).join("\n") + "\n";
 
 let allLogs: Promise<Map<number, string[]>> | undefined;
 const runAll = (): Promise<Map<number, string[]>> =>
   allLogs ??= (async () => {
-    const { wasm, diagnostics } = await compileCached(
-      ast + "\n" + parser + "\n" + driver,
+    const sources: Record<string, string> = {
+      [DRIVER]: driver,
+      [AST]: Deno.readTextFileSync(AST),
+      [PARSER]: Deno.readTextFileSync(PARSER),
+    };
+    const readSource = (key: string): string | undefined => sources[key];
+    const { wasm, diagnostics } = await compileProgram(
+      DRIVER,
+      readSource,
+      DRIVER,
+      {
+        optimizeCache: await optimizeCache,
+      },
     );
     const errors = diagnostics.filter((d) => d.severity === "error");
     if (errors.length > 0 || !wasm) {
