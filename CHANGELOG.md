@@ -72,6 +72,7 @@ see **`DECISIONS.md`**.
 - **D4 Formatter: trailing comment on `type` alias** — a trailing comment on a `type X = …` line now stays on that line instead of being displaced. (#146)
 - **D4 Formatter: verbatim-fallback for fn with commented expression body** — a function whose body is a single expression spanning multiple lines with an own-line comment is reproduced verbatim, preventing the comment from being displaced after the closing brace.
 - **D7 Doc-comment cross-references (single-file)** — `` [`Name`] `` / `[Name]` rustdoc-style intra-doc links in `///` comments resolve via D2's symbol table and render as clickable markdown links in hover and completion `documentation`; unresolved names left verbatim; cross-import resolution deferred (needs H0 phase 3 module graph).
+- **Module-aware diagnostics (H0 phase 3)** — the open file is analyzed as the entry module through a workspace `ModuleReader` (open buffers + disk, `lsp/src/moduleGraph.ts`): `import`ed names resolve to their real types instead of flagging "undeclared", and genuine import errors (bad path / not-exported / cycle) surface on the import line; hover/completion seed the same imported-name types; no-import files unchanged.
 
 ## Browser playground (Track E)
 

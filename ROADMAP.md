@@ -290,7 +290,12 @@ independent).*
 - 🟡 **H0. Module system.** Phase 1 done — see `CHANGELOG.md`.
   - **Phase 2 (⬜):** the `std:` scheme + embedded `.vl` std over the two-primitive intrinsic floor
     (collections, `std:fmt`, `std:testing`).
-  - **Phase 3 (⬜):** cross-file / std LSP.
+  - **Phase 3 (🟡):** cross-file / std LSP. Module-aware DIAGNOSTICS landed (`lsp/src/moduleGraph.ts`):
+    the open file is analyzed as the entry module — its imports resolve through a workspace
+    `ModuleReader` (open buffers + disk), so imported names no longer flag "undeclared" and genuine
+    import errors (bad path / not-exported / cycle) surface on the import line. Hover/completion seed
+    the same imported-name types (real types, no squiggle). REMAINING: cross-file go-to-definition /
+    find-references / doc-xref into sibling modules; the `std:` scheme (phase 2).
   - **Deferred:** import maps, namespace/default imports, export-all, re-exports.
 - 🟡 **H2. Make VL expressive enough to write a compiler.** All H2 gaps fixed — see `CHANGELOG.md`.
   REMAINING: maps (B6a), enum tag for literal-unions (A16).
