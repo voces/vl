@@ -251,6 +251,30 @@ Deno.test("a `type` alias declaration is preserved verbatim", () => {
   assertEquals(format(out), out, "type alias formatting is not idempotent");
 });
 
+Deno.test("a trailing comment on a `type` alias stays on the same line (D4)", () => {
+  // A trailing comment on a `type` alias must remain on the alias line — NOT
+  // displaced onto its own line before the following statement.
+  const src = "type Point = { x: i32, y: i32 } // a struct-like type\nlet p: Point = { x: 1, y: 2 }\n";
+  const out = format(src);
+  // The comment stays on the `type` line.
+  assert(
+    out.includes("type Point = { x: i32, y: i32 } // a struct-like type"),
+    `trailing comment on type alias was relocated:\n${out}`,
+  );
+  // The following statement is still on its own line (comment not merged with it).
+  assert(out.includes("\nlet p: Point"), `let statement lost:\n${out}`);
+  // Multiple type aliases: each alias's trailing comment stays with that alias.
+  const src2 = "type A = { x: i32 } // type A\ntype B = { y: i32 }\nlet a: A = { x: 1 }\nlet b: B = { y: 2 }\n";
+  const out2 = format(src2);
+  const aLine = out2.split("\n").find((l) => l.startsWith("type A"));
+  const bLine = out2.split("\n").find((l) => l.startsWith("type B"));
+  assert(aLine?.includes("// type A"), `type A trailing comment lost:\n${out2}`);
+  assert(!bLine?.includes("// type A"), `type A comment leaked onto type B:\n${out2}`);
+  // Idempotent: format(format(s)) === format(s).
+  assertEquals(format(out), out, "type alias with trailing comment not idempotent");
+  assertEquals(format(out2), out2, "multiple type aliases not idempotent");
+});
+
 // --- trailing commas in multi-line reflow ----------------------------------
 
 Deno.test("a wrapped call emits a trailing comma; collapsed does not", () => {
