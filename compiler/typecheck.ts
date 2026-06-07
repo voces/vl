@@ -986,8 +986,6 @@ export const listMemberType = (
   // (a synthetic callback accepts a lambda/function whose param has any name).
   const mapResultElement: VLType = { type: "Infer", subType: { type: "Unknown" } };
   return {
-  // O(1) sibling of `.length` (property syntax, read-only): allocated slots.
-  capacity: { type: "Alias", name: "i32" },
   // Safe, checked accessor: `T | null` (null when `i` is out of range).
   get: {
     type: "Function",

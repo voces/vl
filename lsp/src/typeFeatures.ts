@@ -1233,7 +1233,7 @@ const memberTypeOf = (
   if (property === "length" && arrayElementType(objType)) {
     return { type: "Alias", name: "i32" };
   }
-  // Intrinsic list members (`.capacity`, `.get`, `.push`, …) on a `T[]`.
+  // Intrinsic list members (`.get`, `.push`, `.pop`, …) on a `T[]`.
   if (isListType(objType)) {
     const member = listMemberType(arrayElementType(objType)!)[property];
     if (member) return member;

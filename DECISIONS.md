@@ -101,10 +101,24 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 - **Size members follow the uniform-access principle.** `length` is a contract
   member via property syntax, dispatched to a native lowering (not a structural
   field — that broke index-sig subtyping). Property syntax (no parens) is
-  reserved for O(1) members (`length`/`count`/`capacity`); computing ops
+  reserved for O(1) members (`length`/`count`); computing ops
   (`push`/`map`/`slice`) are methods (parens). `length` is read-only; sparse
-  collections use distinct `count`/`capacity`/`extent`, never an overloaded
+  collections use distinct `count`/`extent`, never an overloaded
   `length`. (B6)
+- **No public `.capacity`.** Capacity exposes the growth strategy — a leaky
+  detail scripting languages (Python/JS/Ruby/Lua) hide and only systems
+  languages surface; VL is scripting-feel. The `cap` field stays internal (push
+  needs it). Removing it also lets build-loop fusion pick any representation
+  without an observable contract. (B6)
+- **Build-loop fusion: pre-sized indexed fill, not per-element push.**
+  `const a = [..seed]` immediately followed by `for i in A to B { a.push(e) }`
+  (bare push, step-1 range, `e` not referencing `a`) lowers to one pre-sized
+  backing + an in-range fill loop. A frontier `array.set` at the moving `len`
+  carries a bounds check the engine can't elide (~3.8x a sequential in-range
+  write it can); fusion turns the former into the latter. Sound because the
+  result is bit-identical to the push build and the guards forbid any mid-build
+  observation; anything unproven falls back to push. `while`/stepped-range/
+  `for…in` are out of v1. (B6b)
 - **String methods follow JS semantics.** `slice(start, end)` is the half-open
   `[start, end)` range with JS clamping (negative counts from the end, bounds
   clamp to `[0, len]`, `start >= end` → empty); `indexOf("")` returns 0. Chosen

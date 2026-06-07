@@ -415,6 +415,26 @@ export const toWasm = async (
     return names;
   };
 
+  // Does any `Name` node anywhere under `v` refer to `name`? Used by build-loop
+  // fusion to prove the loop neither reads nor depends on the list it is building.
+  // Deliberately STRUCTURE-AGNOSTIC (descends every key) so it can never miss a
+  // reference — and conservative: it over-approximates (e.g. a shadowing lambda
+  // param of the same name also counts), which only ever suppresses the
+  // optimization, never enables an unsound one.
+  const referencesName = (v: unknown, name: string): boolean => {
+    if (v === null || typeof v !== "object") return false;
+    if (Array.isArray(v)) return v.some((x) => referencesName(x, name));
+    const node = v as { type?: unknown; name?: unknown };
+    if (node.type === "Name" && node.name === name) return true;
+    for (const key in node) {
+      if (key === "scope") continue;
+      if (referencesName((node as Record<string, unknown>)[key], name)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   // Ensure the wasm global exists, initialized to a zero/default constant. The
   // binding's actual initializer runs as a `global.set` in `__program__` (the
   // start function), which executes before any other function — so reads always
@@ -2341,6 +2361,133 @@ export const toWasm = async (
     registerFunctionDecl(node);
   };
 
+  // Build-loop fusion. The idiom `const a = [..seed]` immediately followed by a
+  // `for i in A to B { a.push(e) }` whose body is exactly that one push lowers to a
+  // pre-sized indexed fill instead of `count` per-element pushes. Per-push cost
+  // (capacity-check branch + a frontier `array.set` whose bound the engine cannot
+  // prove) is ~3.8x a sequential in-range write, which the engine elides — so this
+  // is the append-path's main win. The fused list is bit-for-bit what push would
+  // build (same `{backing,len,cap}`, same values), only faster.
+  //
+  // Soundness: the result must be indistinguishable from the push build, so we fuse
+  // only when nothing can observe the list mid-build and the push count is exactly
+  // the (step-1) range size. The guards below each rule out a way that could fail;
+  // anything unproven falls back to the ordinary push lowering (`null`). The
+  // `tests/cases/lists/build-fusion-*` corpus pins both the equivalence and the
+  // must-not-fuse cases. Returns a void block, or null to fall back.
+  let buildLoopId = 0;
+  const tryLowerBuildLoop = (
+    decl: VLStatement,
+    loop: VLStatement,
+  ): number | null => {
+    if (decl.type !== "VariableDeclaration") return null;
+    // The initializer must be an array literal (empty, or a seed prefix to keep).
+    if (!decl.value || decl.value.type !== "ArrayLiteral") return null;
+    if (!isListType(decl.variableType)) return null;
+    // A module global takes the global.set path, not a local — don't fuse it.
+    if (functionBoundaries.length === 1 && moduleGlobals.has(decl.name)) {
+      return null;
+    }
+    // Step-1 ascending/inclusive range only (count is exactly `to - from + 1`);
+    // `while`, stepped ranges, and `for…in` are deliberately out of scope.
+    if (loop.type !== "For" || loop.step) return null;
+    if (loop.variable === decl.name) return null; // would shadow the list name
+    // Body must be EXACTLY one statement: `a.push(e)` (a bare, unconditional push —
+    // no `if`, no `break`, no second statement, no other method).
+    const body = loop.statement;
+    const stmts = body.type === "Block" ? body.statements : [body];
+    if (stmts.length !== 1) return null;
+    const push = stmts[0];
+    if (
+      push.type !== "Call" || push.callee.type !== "PropertyAccess" ||
+      push.callee.property !== "push" || push.callee.object.type !== "Name" ||
+      push.callee.object.name !== decl.name || push.arguments.length !== 1
+    ) return null;
+    const elemExpr = push.arguments[0].value;
+    // Nothing in the loop may reference the list being built: the pushed value must
+    // not read `a` (e.g. `a.push(a.length)`), and the bounds must not either. With
+    // the body a bare push of an `a`-free expression, the list is never observed at
+    // a partial state, so pre-setting its length is invisible.
+    if (
+      referencesName(elemExpr, decl.name) ||
+      referencesName(loop.from, decl.name) || referencesName(loop.to, decl.name)
+    ) return null;
+
+    const element = softenImplicitType(arrayElementType(decl.variableType)!);
+    const lt = listType(element);
+    const seed = decl.value.values;
+    const seedLen = seed.length;
+
+    const aIndex = _locals.push(toWasmType(decl.variableType)) - 1 +
+      (_locals.params ?? 0);
+    currentScope[decl.name] = [decl.variableType, aIndex];
+    const varType = softenImplicitType(vlType(loop.from));
+    const iIndex = _locals.push(toWasmType(varType)) - 1 + (_locals.params ?? 0);
+    currentScope[loop.variable] = [varType, iIndex];
+
+    const backLocal = newLocal(lt.backing.refType);
+    const fromLocal = newLocal(binaryen.i32);
+    const toLocal = newLocal(binaryen.i32);
+    const cntLocal = newLocal(binaryen.i32);
+    const wLocal = newLocal(binaryen.i32);
+    const back = () => m.local.get(backLocal, lt.backing.refType);
+    const from = () => m.local.get(fromLocal, binaryen.i32);
+    const cnt = () => m.local.get(cntLocal, binaryen.i32);
+    const w = () => m.local.get(wLocal, binaryen.i32);
+    const needed = () => m.i32.add(m.i32.const(seedLen), cnt());
+
+    const id = buildLoopId++;
+    const loopLabel = `__build_loop_${id}__`;
+    const doneLabel = `__build_done_${id}__`;
+
+    return m.block(null, [
+      m.local.set(fromLocal, withDesiredType(i32Type, () => toExpression(loop.from))),
+      m.local.set(toLocal, withDesiredType(i32Type, () => toExpression(loop.to))),
+      // count = max(0, to - from + 1) — an empty (descending) range yields 0.
+      m.local.set(
+        cntLocal,
+        m.i32.add(
+          m.i32.sub(m.local.get(toLocal, binaryen.i32), from()),
+          m.i32.const(1),
+        ),
+      ),
+      m.if(
+        m.i32.lt_s(cnt(), m.i32.const(0)),
+        m.local.set(cntLocal, m.i32.const(0)),
+      ),
+      // Pre-size the backing to the exact final length and bind `a` to the list
+      // struct now; the fill writes through the shared backing array.
+      m.local.set(backLocal, m.array.new_default(lt.backing.heapType, needed())),
+      ...seed.map((value, k) =>
+        m.array.set(
+          back(),
+          m.i32.const(k),
+          withDesiredType(element, () => toExpression(value)),
+        )
+      ),
+      m.local.set(aIndex, m.struct.new([back(), needed(), needed()], lt.heapType)),
+      // Fill loop keyed on `w` in [0, count): the write index `seedLen + w` is
+      // provably < the backing's length, so the engine elides the bounds check.
+      m.local.set(wLocal, m.i32.const(0)),
+      m.block(doneLabel, [
+        m.loop(
+          loopLabel,
+          m.block(null, [
+            m.br(doneLabel, m.i32.ge_s(w(), cnt())),
+            m.local.set(iIndex, m.i32.add(from(), w())),
+            m.array.set(
+              back(),
+              m.i32.add(m.i32.const(seedLen), w()),
+              withDesiredType(element, () => toExpression(elemExpr)),
+            ),
+            m.local.set(wLocal, m.i32.add(w(), m.i32.const(1))),
+            m.br(loopLabel),
+          ]),
+        ),
+      ]),
+    ], binaryen.none);
+  };
+
   // Lower a statement list to wasm expressions. Nested function declarations
   // register lazily (emitting nothing); the tail (last non-declaration) keeps the
   // ambient desired type — so a value-producing block returns it, while a void
@@ -2360,6 +2507,18 @@ export const toWasm = async (
     const out: number[] = [];
     for (let i = 0; i < statements.length; i++) {
       const stmt = statements[i];
+      // Build-loop fusion: a list declaration immediately followed by a build loop
+      // collapses into one pre-sized indexed fill (skips the loop statement). Only
+      // fires when the loop provably reproduces the push build (see
+      // `tryLowerBuildLoop`); otherwise both statements lower normally.
+      if (stmt.type === "VariableDeclaration" && i + 1 < statements.length) {
+        const fused = tryLowerBuildLoop(stmt, statements[i + 1]);
+        if (fused !== null) {
+          out.push(fused);
+          i++; // consume the loop statement too
+          continue;
+        }
+      }
       const isTail = i === tail;
       // A statement in non-tail position is evaluated for effect: its value is
       // discarded, so it carries no desired type (so its own inferred type
@@ -3165,15 +3324,12 @@ export const toWasm = async (
         }
         const objType = objectTypeOf(node.object);
         // List size members are intrinsic struct reads: `.length` → `len`,
-        // `.capacity` → `cap` (both O(1)). A raw i32-array (string) keeps
+        // `.length` → `len` (O(1)). A raw i32-array (string) keeps
         // `.length` → `array.len`.
         if (isListType(objType)) {
           const ref = toExpression(node.object);
           if (node.property === "length") {
             return m.struct.get(LIST_LEN, ref, binaryen.i32, false);
-          }
-          if (node.property === "capacity") {
-            return m.struct.get(LIST_CAP, ref, binaryen.i32, false);
           }
           throw new Error(`List has no member "${node.property}"`);
         }
