@@ -416,7 +416,11 @@ corpus (A12) is the host-agnostic oracle — the same tests pass whichever compi
 - ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
   running the corpus through the VL-written compiler. Incremental; TS and VL compilers cross-checked.
   First slice (lexer) spiked + closed (#37, then #54) pending the H2 gap fixes; re-lands clean as
-  `selfhost/lexer.vl` (H2a).
+  `selfhost/lexer.vl` (H2a). Front end now wired **end to end from source text**: a raw VL string
+  runs through the real `lexer.vl → parser.vl → typecheck.vl` chain (driver
+  `tests/selfhost_pipeline_test.ts` + `tests/selfhost/pipeline_harness.vl`), proving the whole front
+  end self-hosts — no hand-built token streams. The lexer↔parser token-kind/name divergences are
+  reconciled in the driver glue (no `.vl` compiler edits); gaps catalogued in `docs/selfhost-gaps.md`.
 - ⬜ **H4. WASM emission — DECIDED: emit bytes directly + optional `wasm-opt`** (binaryen's npm build
   is JS-bound; → `DECISIONS.md`, incl. the Heap2Local caveat). binaryen stays for the TS compiler.
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime (wasmtime —
