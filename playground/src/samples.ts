@@ -23,17 +23,17 @@ export const SAMPLES: Sample[] = [
         `// The \`print(x)\` builtin logs a value of any printable type. Codegen dispatches
 // on the argument's type to a type-specific host sink.
 print(42)
-let x = 10
-let y = 20
+const x = 10
+const y = 20
 print(x + y)
 print(3.5)
-let big: i64 = 9000000000
+const big: i64 = 9000000000
 print(big)
-let f: f32 = 2.25
+const f: f32 = 2.25
 print(f)
 print(true)
 print(false)
-let s = "hello"
+const s = "hello"
 print(s)
 print("foo" + "bar")
 `,
@@ -54,7 +54,7 @@ while i < 5 {
 print(s)
 
 // for…in over an array binds each element in turn.
-let a = [10, 20, 30, 40]
+const a = [10, 20, 30, 40]
 let t = 0
 for x in a {
   t = t + x
