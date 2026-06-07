@@ -42,31 +42,19 @@ const parser = read("../compiler/parser.vl");
 const typecheck = read("../compiler/typecheck.vl");
 const base = ast + "\n" + parser + "\n" + typecheck + "\n";
 
-// --- the well-typed fixture: its own compile (self-contained glue) ----------
-let wellTyped: Promise<string[]> | undefined;
-const runWellTyped = (): Promise<string[]> =>
-  wellTyped ??= (async () => {
-    const { wasm, diagnostics } = await compileCached(
-      base + read("./selfhost/typecheck_harness.vl"),
-    );
-    const errors = diagnostics.filter((d) => d.severity === "error");
-    if (errors.length > 0 || !wasm) {
-      throw new Error(
-        "self-hosted typecheck (well-typed) failed to compile: " +
-          errors.map((d) => d.message).join("; "),
-      );
-    }
-    return (await runWasm(wasm)).logs;
-  })();
+// The well-typed fixture's token-builder (`buildWellTyped`), lifted VERBATIM from
+// `tests/selfhost/typecheck_harness.vl` — it is already valid VL source, so no
+// re-escaping is needed — and injected into the shared driver so the well-typed
+// case folds into the one batched compile instead of paying its own. (The fixture
+// file still stands alone; we reuse only its token-builder here.)
+const harness = read("./selfhost/typecheck_harness.vl");
+const buildWellTypedStart = harness.indexOf("function buildWellTyped");
+const buildWellTyped = harness.slice(
+  buildWellTypedStart,
+  harness.indexOf("\n}\n", buildWellTypedStart) + 2,
+);
 
-Deno.test("self-hosted typecheck: a well-typed program reports no diagnostics", async () => {
-  // Runs the shared `tests/selfhost/typecheck_harness.vl` fixture: a function decl
-  // with typed params + return, an inferred `let`, a call (arity + arg types), a
-  // comparison yielding bool, an annotated string binding, and an `if`.
-  assertEquals(await runWellTyped(), ["diags: 0"]);
-});
-
-// --- the seeded-error cases: one shared compile -----------------------------
+// --- all cases: one shared compile ------------------------------------------
 // Each case is a `body` of hand-built `tok(kind, text)` calls (and, for the member-
 // access case, a seeded binding) run after a fresh `initChecker()`. `checkProgram` is
 // always consumed in an expression (`i32ToStr(checkProgram(...))`) — calling it bare
@@ -74,6 +62,13 @@ Deno.test("self-hosted typecheck: a well-typed program reports no diagnostics", 
 type Case = { label: string; body: string; expected: string[] };
 
 const CASES: Case[] = [
+  {
+    label: "well-typed",
+    // The fixture's representative well-typed program (function decl + typed
+    // params/return, inferred `let`, call, comparison, annotated string, `if`).
+    body: "buildWellTyped()",
+    expected: ["diags: 0"],
+  },
   {
     label: "let-mismatch",
     // let x: i32 = "s"
@@ -171,6 +166,7 @@ function tok(kind: string, text: string): i32 {
   P.toks.push({ kind: kind, text: text, pos: P.toks.length })
   P.toks.length - 1
 }
+${buildWellTyped}
 function reportLabeled(label: string): i32 {
   print(label + "\\tdiags: " + i32ToStr(checkProgram(parseProgram())))
   let i = 0
