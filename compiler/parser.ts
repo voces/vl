@@ -328,6 +328,26 @@ export const parseProgram = (
     return t;
   };
 
+  // Contextual ("soft") keywords: `step`, `to`, `in`, `then`, `as`, `from` lex
+  // as plain `ID` and are recognized by text only in their one parse position,
+  // so they remain usable as ordinary identifiers everywhere else.
+  const atSoft = (text: string): boolean =>
+    peek().kind === "ID" && peek().text === text;
+
+  const expectSoft = (text: string): Token => {
+    if (atSoft(text)) return next();
+    const t = peek();
+    errors.push({
+      type: "Syntax",
+      message: `Syntax error: expected ${text} but found ${
+        t.kind === "EOF" ? "end of input" : JSON.stringify(t.text)
+      }`,
+      ctx: spanOf(t),
+      code: 0,
+    });
+    return t;
+  };
+
   const skipNewlines = () => {
     while (at("NEWLINE")) pos++;
   };
@@ -651,7 +671,9 @@ export const parseProgram = (
       x.stop.line === y.start.line && x.stop.column === y.start.column;
     if (a.kind === "GREATER_THAN" && b.kind === "GREATER_THAN" && adj(a, b)) {
       const c = peek(2);
-      if (c.kind === "GREATER_THAN" && adj(b, c)) return { op: ">>>", width: 3 };
+      if (c.kind === "GREATER_THAN" && adj(b, c)) {
+        return { op: ">>>", width: 3 };
+      }
       return { op: ">>", width: 2 };
     }
     if (a.kind === "LESS_THAN" && b.kind === "LESS_THAN" && adj(a, b)) {
@@ -1760,7 +1782,7 @@ export const parseProgram = (
 
     const buildConditional = (cond: VLExpression, condCtx: Context) => {
       skipNewlines();
-      if (at("THEN")) next();
+      if (atSoft("then")) next();
       skipNewlines();
       const stmtStart = peek();
       const statement = withNarrowings(
@@ -1921,7 +1943,9 @@ export const parseProgram = (
     // triggered it). When source order reaches it, reuse that node and skip the
     // cursor past the already-consumed body instead of parsing it twice (which
     // would duplicate diagnostics/bindings and reset the now-filled return hole).
-    if (!anonAt && scopes[scopes.length - 1] === program.scope && at("FUNCTION")) {
+    if (
+      !anonAt && scopes[scopes.length - 1] === program.scope && at("FUNCTION")
+    ) {
       const nameTok = peek(1);
       const cached = nameTok.kind === "ID"
         ? resolvedFns.get(nameTok.text)
@@ -2182,7 +2206,8 @@ export const parseProgram = (
         ) {
           errors.push({
             type: "Syntax",
-            message: `cannot infer a type for parameter \`${param.name}\`: no ` +
+            message:
+              `cannot infer a type for parameter \`${param.name}\`: no ` +
               `contextual type is available here — annotate it (\`${param.name}` +
               `: <type>\`)`,
             ctx: paramSpans[i] ?? spanFrom(fnTok),
@@ -2363,9 +2388,10 @@ export const parseProgram = (
         // parameter binding hovers with the alias *name*; only resolve a bare
         // `Alias` leaf (e.g. a recursive self-reference) through to concrete.
         const annotated = parseType();
-        paramaterType = annotated.type === "Type" && annotated.name !== undefined
-          ? annotated
-          : getConcreteType(annotated, spanOf(id));
+        paramaterType =
+          annotated.type === "Type" && annotated.name !== undefined
+            ? annotated
+            : getConcreteType(annotated, spanOf(id));
       } else {
         paramaterType = { type: "Infer", subType: { type: "Unknown" } };
       }
@@ -2716,14 +2742,14 @@ export const parseProgram = (
     skipNewlines();
     const variable = expect("ID").text;
     skipNewlines();
-    expect("IN");
+    expectSoft("in");
     skipNewlines();
     const firstStart = peek();
     const first = parseBinary(0);
     const firstCtx = spanFrom(firstStart);
 
     // `for x in arr` (no `to`) — collection iteration.
-    if (!at("TO")) {
+    if (!atSoft("to")) {
       const iterableType = typeFromExpression(first, firstCtx);
       const element = arrayElementType(iterableType);
       if (!element) {
@@ -2763,7 +2789,7 @@ export const parseProgram = (
     const fromType = typeFromExpression(first, firstCtx);
     ensureType({ type: "Alias", name: "i32" }, fromType, firstCtx);
 
-    next(); // TO
+    next(); // to
     skipNewlines();
     const toStart = peek();
     const to = parseBinary(0);
@@ -2778,7 +2804,7 @@ export const parseProgram = (
     scopes.push({ [variable]: softenImplicitType(fromType) });
     let statement: VLStatement;
     try {
-      if (at("STEP")) {
+      if (atSoft("step")) {
         next();
         skipNewlines();
         const stepStart = peek();
@@ -2886,7 +2912,7 @@ export const parseProgram = (
         if (at("RBRACE")) break;
         const nameTok = expect("ID");
         let local = nameTok.text;
-        if (at("AS")) {
+        if (atSoft("as")) {
           next();
           skipNewlines();
           local = expect("ID").text;
@@ -2905,7 +2931,7 @@ export const parseProgram = (
     skipNewlines();
     expect("RBRACE");
     skipNewlines();
-    expect("FROM");
+    expectSoft("from");
     skipNewlines();
     const specTok = peek();
     let specifier = "";
@@ -3048,8 +3074,8 @@ export const parseProgram = (
       // in statement position so a following `function` still hoists.
       if (depth === 0 && k === "IMPORT") {
         next();
-        while (!atEnd() && peek().kind !== "FROM") next();
-        if (at("FROM")) next();
+        while (!atEnd() && !atSoft("from")) next();
+        if (atSoft("from")) next();
         if (at("STRING")) next();
         prevReal = "RBRACE";
         continue;
