@@ -213,13 +213,13 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 *Mostly independent; benefits from Track A. AST nodes carry source spans (Track G).*
 
 - 🟡 **D1. Hover types.** REMAINING: flow-narrowed receiver types; Map/Set members (when B6a fully lands).
-- 🟡 **D3. Autocomplete.** REMAINING: keyword/snippet completions, trigger-character tuning, wiring
-  a completion provider into the Monaco playground (E).
+- 🟡 **D3. Autocomplete.** REMAINING: wiring a completion provider into the Monaco playground (E).
 - 🟡 **D4. Formatter.** REMAINING:
   - **Unfaithful-fallback constructs** — reproduced verbatim from the source span rather than
     regenerated: `type` aliases (body & span discarded by the checker), operator-named &
     method-shorthand functions, operator/index-method call desugars, leaf statements that enclose
-    an own-line comment.
+    an own-line comment. (Trailing comments on `type` aliases now stay on their line — #146 narrows
+    this gap.)
   - **AST type-syntax fidelity gap** — the typechecker fully resolves every type it records (a tiny
     `i32` annotation becomes a giant structural `Object`; `type`-alias bodies and spans are
     discarded). Retain the *as-written* type syntax (or its span) so the AST is lossless for
@@ -312,7 +312,9 @@ independent).*
   `selfhost/lexer.vl` (H2a).
   **Codegen self-host status (detail: `docs/selfhost-gaps.md`):** the `wasmEmit.vl` spike is GREEN —
   LEB128 + section framing emit valid bytes that the real `WebAssembly` engine instantiates. H3-gap3,
-  H4.2/H4.3/H4.4 are resolved (see `CHANGELOG.md`). Remaining sub-items:
+  H4.2/H4.3/H4.4 are resolved (see `CHANGELOG.md`). The `emitProgram` frontier has advanced through
+  **params, arithmetic, comparisons, calls/recursion, if/return, locals, while, structs (#137), and
+  arrays (#145)**; strings + `.push` (growable arrays) remain ahead. Remaining sub-items:
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/selfhost-gaps.md` §H4.1)

@@ -65,6 +65,9 @@ see **`DECISIONS.md`**.
 - **D4 Formatter (core)** — AST-driven source formatter (`compiler/format.ts`, `vl fmt`, LSP `textDocument/formatting`); idempotent, round-trip-AST-equivalent, comment-preserving, 80-col reflow.
 - **D5 Semantic tokens** — `textDocument/semanticTokens/full`: identifiers via D2 table, literals/keywords/operators via lexer, comments by source scan, `receiver.member` names (→ `property`/`method`).
 - **D6 Inlay hints** — inline `: <type>` at unannotated `let`/`const`/params and omitted returns; annotated positions and unresolved holes suppressed.
+- **D3 Keyword + snippet completions** — 26 keywords + 10 snippet skeletons with tab-stops; after-dot completions suppress keywords/snippets; trigger-character tuning. (#143)
+- **D4 Formatter: collapse short if/if-else** — a single-conditional `if { stmt }` or `if { a } else { b }` that fits 80 cols folds to one line; comments/multi-statement bodies stay block. (#138)
+- **D4 Formatter: trailing comment on `type` alias** — a trailing comment on a `type X = …` line now stays on that line instead of being displaced. (#146)
 
 ## Browser playground (Track E)
 
@@ -79,6 +82,8 @@ see **`DECISIONS.md`**.
 - **F8 Dropped binaryen patch + `patch-package`** — LSP server is ESM; binaryen's TLA is legal there.
 - **F9 Perf baseline** — `deno task perf`; compile-time (front/codegen split) + wasm size over corpus; best-of-N. Finding: literal-union compilation is ~cubic in member count (200 → ~2 s). (→ `docs/perf-findings.md`)
 - **F9c Memoize `structSig` in `toWasm.ts`** — the structural-signature walk was uncached and dominated IR-build on the self-host module (~6 s of ~7.7 s total; 268k calls). Caching by type-node identity (empty `nameStack` only) cut selfhost-suite wall time ~107 s → ~30 s with byte-identical wasm. Post-fix: binaryen `optimize()` is only ~0.8 s on this module, not the bottleneck. (#107; detail: `docs/perf-findings.md`)
+- **F10 Bare `deno check` passes** — lsp sub-project excluded; playground + lsp-test type errors fixed so top-level `deno check` exits clean. (#140)
+- **F11 CI skips heavy suite for docs-only changes** — an in-job `git diff` gate (not a workflow-level `paths` filter) `if`-guards the heavy steps, so docs-only PRs go green fast while the `ci` check still reports. (#142)
 
 ## Parser (Track G — complete)
 
@@ -104,3 +109,6 @@ see **`DECISIONS.md`**.
 - **H4.3 Unsigned right-shift** (`>>>`) — resolved by #99 (`>>>` is now a native operator); `ulebToArr` in `wasmEmit.vl` uses `v >>> 7` for all i32 values including those with bit 31 set. (detail: `docs/selfhost-gaps.md` §H4.3)
 - **H4.4 Signed `%` sign fix** — resolved via H4.2 (#99): `& 0x7f` / `& 0xff` bitwise masks replace the arithmetic correction branches; naturally unsigned, no special-casing needed. (detail: `docs/selfhost-gaps.md` §H4.4)
 - **H-pipeline VL-in-VL front end end-to-end** — `lexer.vl → parser.vl → typecheck.vl` chain driving source text through a wired pipeline; proves the front end self-hosts. (`tests/selfhost_pipeline_test.ts` + `tests/selfhost/pipeline_harness.vl`)
+- **H-emitProgram structs** — `emitProgram` parses + emits WasmGC struct types, `struct.new`, and `struct.get`; construct + field-read proven by real `WebAssembly.instantiate`. (#137)
+- **H-emitProgram arrays** — `emitProgram` parses + emits WasmGC array ops: literal (`array.new_fixed`), index read/set, `.length`; 8 new live-instantiation cases. (#145)
+- **H-exports Host-callable wasm exports** — entry-module `export function`s become host-callable wasm exports via a thin scalar no-env wrapper; non-entry exports remain DCE-able. (#141; → `DECISIONS.md`)
