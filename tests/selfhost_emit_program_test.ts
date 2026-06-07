@@ -48,7 +48,9 @@ const wasmEmit = read("../compiler/wasmEmit.vl");
 const bytesFromLog = (logs: string[]): Uint8Array<ArrayBuffer> => {
   const line = logs.find((l) => l.startsWith("main: "));
   if (!line) {
-    throw new Error(`emitter did not print a \`main:\` line; got ${JSON.stringify(logs)}`);
+    throw new Error(
+      `emitter did not print a \`main:\` line; got ${JSON.stringify(logs)}`,
+    );
   }
   const nums = line.slice("main: ".length).split(",").map((s) => {
     const n = Number(s);
@@ -88,7 +90,8 @@ type Case = {
 
 const CASES: Case[] = [
   {
-    name: "arena walk of `main(): i32 { return 42 }` instantiates to main()===42",
+    name:
+      "arena walk of `main(): i32 { return 42 }` instantiates to main()===42",
     src: "function main(): i32 {\n  return 42\n}\n",
     check: async (logs) => {
       const got = await runMain(bytesFromLog(logs));
@@ -132,7 +135,9 @@ const CASES: Case[] = [
     src: "function double(x: i32): i32 {\n  return x + x\n}\n",
     check: async (logs) => {
       const got = await runExport(bytesFromLog(logs), "double", 21);
-      if (got !== 42) throw new Error(`double(21) returned ${got}, expected 42`);
+      if (got !== 42) {
+        throw new Error(`double(21) returned ${got}, expected 42`);
+      }
     },
   },
   {
@@ -148,7 +153,9 @@ const CASES: Case[] = [
     src: "function f(a: i32, b: i32, c: i32): i32 {\n  return a * b - c\n}\n",
     check: async (logs) => {
       const got = await runExport(bytesFromLog(logs), "f", 5, 4, 3);
-      if (got !== 17) throw new Error(`f(5, 4, 3) returned ${got}, expected 17`);
+      if (got !== 17) {
+        throw new Error(`f(5, 4, 3) returned ${got}, expected 17`);
+      }
     },
   },
   {
@@ -183,7 +190,8 @@ const CASES: Case[] = [
   },
   {
     name: "a non-recursive `if` branch picks a sign",
-    src: "function sign(n: i32): i32 {\n  if n < 0 { return -1 }\n  return 1\n}\n",
+    src:
+      "function sign(n: i32): i32 {\n  if n < 0 { return -1 }\n  return 1\n}\n",
     check: async (logs) => {
       const bytes = bytesFromLog(logs);
       const neg = await runExport(bytes, "sign", -5);
@@ -207,7 +215,9 @@ const CASES: Case[] = [
       "function acc3(a: i32, b: i32, c: i32): i32 {\n  let sum = a\n  sum = sum + b\n  sum = sum + c\n  return sum\n}\n",
     check: async (logs) => {
       const got = await runExport(bytesFromLog(logs), "acc3", 4, 5, 6);
-      if (got !== 15) throw new Error(`acc3(4, 5, 6) returned ${got}, expected 15`);
+      if (got !== 15) {
+        throw new Error(`acc3(4, 5, 6) returned ${got}, expected 15`);
+      }
     },
   },
   {
@@ -226,7 +236,9 @@ const CASES: Case[] = [
     check: async (logs) => {
       const bytes = bytesFromLog(logs);
       const hi = await runExport(bytes, "clamp", 250);
-      if (hi !== 100) throw new Error(`clamp(250) returned ${hi}, expected 100`);
+      if (hi !== 100) {
+        throw new Error(`clamp(250) returned ${hi}, expected 100`);
+      }
       const lo = await runExport(bytes, "clamp", 7);
       if (lo !== 7) throw new Error(`clamp(7) returned ${lo}, expected 7`);
     },
@@ -237,7 +249,11 @@ const CASES: Case[] = [
     check: (logs) => {
       const errLine = logs.find((l) => l.startsWith("err: "));
       if (!errLine) {
-        throw new Error(`expected an \`err:\` line for the non-i32 local; got ${JSON.stringify(logs)}`);
+        throw new Error(
+          `expected an \`err:\` line for the non-i32 local; got ${
+            JSON.stringify(logs)
+          }`,
+        );
       }
       if (!errLine.includes("i32 locals")) {
         throw new Error(`unexpected emitter error message: ${errLine}`);
@@ -250,7 +266,11 @@ const CASES: Case[] = [
     check: (logs) => {
       const errLine = logs.find((l) => l.startsWith("err: "));
       if (!errLine) {
-        throw new Error(`expected an \`err:\` line for the unsupported shape; got ${JSON.stringify(logs)}`);
+        throw new Error(
+          `expected an \`err:\` line for the unsupported shape; got ${
+            JSON.stringify(logs)
+          }`,
+        );
       }
       if (!errLine.includes("operator")) {
         throw new Error(`unexpected emitter error message: ${errLine}`);
@@ -349,7 +369,122 @@ const CASES: Case[] = [
       const got = await runMain(bytes);
       if (got !== 55) throw new Error(`main() returned ${got}, expected 55`);
       const direct = await runExport(bytes, "sum", 10);
-      if (direct !== 55) throw new Error(`sum(10) returned ${direct}, expected 55`);
+      if (direct !== 55) {
+        throw new Error(`sum(10) returned ${direct}, expected 55`);
+      }
+    },
+  },
+  // ── WasmGC structs ─────────────────────────────────────────────────────────
+  // A `type` declaration lowers to a GC struct type (type index 0); an object
+  // literal lowers to `struct.new`, a field read to `struct.get`. These prove real
+  // `WebAssembly.instantiate` over the VL-emitted GC bytes — source → arena → bytes
+  // → engine — for construction, field indexing, and structs across function calls.
+  {
+    name: "construct a struct and read its first field (`p.x` => 7)",
+    src: [
+      "type P = { x: i32, y: i32 }",
+      "function main(): i32 {",
+      "  let p = { x: 7, y: 9 }",
+      "  return p.x",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    name: "read a non-first struct field (`p.y` => 9) proves field indexing",
+    src: [
+      "type P = { x: i32, y: i32 }",
+      "function main(): i32 {",
+      "  let p = { x: 7, y: 9 }",
+      "  return p.y",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 9) throw new Error(`main() returned ${got}, expected 9`);
+    },
+  },
+  {
+    name:
+      "a struct-typed annotation (`let p: Point = …`) + both fields summed => 43",
+    src: [
+      "type Point = { x: i32, y: i32 }",
+      "function main(): i32 {",
+      "  let p: Point = { x: 3, y: 40 }",
+      "  return p.x + p.y",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 43) throw new Error(`main() returned ${got}, expected 43`);
+    },
+  },
+  {
+    name: "a struct returned from a helper, then read field-by-field => 42",
+    src: [
+      "type P = { x: i32, y: i32 }",
+      "function mk(a: i32, b: i32): P {",
+      "  return { x: a, y: b }",
+      "}",
+      "function main(): i32 {",
+      "  let p = mk(20, 22)",
+      "  return p.x + p.y",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const main = await runMain(bytes);
+      if (main !== 42) throw new Error(`main() returned ${main}, expected 42`);
+      // `mk` returns a `(ref $0)`, so it is NOT callable directly from JS; the proof
+      // is that `main` constructs through it and reads the fields back correctly.
+    },
+  },
+  {
+    name: "a struct passed INTO a helper, read through the param => 11",
+    src: [
+      "type P = { x: i32, y: i32 }",
+      "function sumXY(p: P): i32 {",
+      "  return p.x + p.y",
+      "}",
+      "function main(): i32 {",
+      "  let q = { x: 5, y: 6 }",
+      "  return sumXY(q)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 11) throw new Error(`main() returned ${got}, expected 11`);
+    },
+  },
+  {
+    name: "a non-i32 struct field fails loudly, not with garbage bytes",
+    src: [
+      "type P = { x: f64 }",
+      "function main(): i32 {",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: (logs) => {
+      const errLine = logs.find((l) => l.startsWith("err: "));
+      if (!errLine) {
+        throw new Error(
+          `expected an \`err:\` line for the non-i32 struct field; got ${
+            JSON.stringify(logs)
+          }`,
+        );
+      }
+      if (!errLine.includes("i32 struct fields")) {
+        throw new Error(`unexpected emitter error message: ${errLine}`);
+      }
     },
   },
 ];
