@@ -83,6 +83,19 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - 🟡 **A12. Soundness corpus.** Done (started): a must-error / must-not-error `.vl` corpus under
   `tests/cases/soundness/`; the runner is strict-by-default. REMAINING: keep growing it; the
   known-unsound corners are `xfail`-marked (e.g. the permissive `i32 + string` hole rule, A13).
+  **Known bugs (confirmed, `xfail`-pinned — fix when each is addressed):**
+  - 🐛 **A12-bug1. `is <literal>` always-false on literal-unions** — `n is 0` / `s is "a"` always
+    evaluates false at runtime; `==` works correctly and is the interim idiom. Codegen emits a
+    constant-false for the literal `is` path. (`xfail-literal-is-always-false.vl`; detail:
+    `docs/soundness-findings.md` §literal-is-always-false)
+  - 🐛 **A12-bug2. Flat `A|B|null` `is`-chain "illegal cast" trap** — a flat struct-union with
+    `null` as a peer variant traps at runtime when `null` is passed to an `is A` arm; null is not
+    null-checked before unboxing. Workaround: guard `null` first. (`xfail-struct-union-null-is-chain.vl`;
+    detail: `docs/soundness-findings.md` §struct-union-null-is-chain)
+  - 🐛 **A12-bug3. `x?.field` false error when `x` is typed via a named alias** — `cfg?.port`
+    where `cfg: Config | null` errors "expected {port: any}, got {port: i32}"; the `?.` lowering
+    does not unwrap the alias before the field lookup. Fix: call `getConcreteType` on the receiver
+    in the optional-chain path. (detail: `docs/soundness-findings.md` §optional-chain-named-alias)
 - 🟡 **A13. Operator-constraint inference (row-polymorphic generics).** Done (core): a fully-inferred
   structural function (`add(self, b) { x: self.x + b.x, … }`) monomorphizes per call shape (i32 & f64
   from two call sites). REMAINING: the hole-operand rule is permissive (doesn't reject `i32 + string`
@@ -101,6 +114,18 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   `DECISIONS.md`.) REMAINING: the **enum representation** (i32 tag for a closed literal union — see
   `docs/unions.md`); a literal union read *inside* a body softens to base (coarser member-narrowing
   there than at the call boundary).
+- ⬜ **A17. Forward / mutual-reference return-type inference.** Today return types are inferred inline
+  in source order: a function that calls another defined later (or a mutually-recursive pair) sees an
+  unresolved `Infer` hole (`any`) for the callee's return type. Self-recursion works only because the
+  body's base-case path fills the hole before the recursive call is typed. The fix is to **decouple
+  return-type inference from source order** — demand-driven (lazy + memoized, inferring a callee's
+  body on first use, cycle-detected so a mutual group is inferred together) or SCC
+  dependency-ordered inference (ML `let rec … and …` style: hole the whole cluster's signatures,
+  check bodies together, solve). This generalises the self-recursion resolution to the
+  cross-function and mutual-recursive case; only a genuinely base-case-less inferred cycle would
+  still need an explicit return-type annotation. High value: removes a real ergonomic wart and
+  unblocks idiomatic inference-first `.vl` (a recursive-descent compiler is one big
+  mutually-recursive cluster). Ties A10 (SCC grouping noted there).
 
 ---
 
@@ -366,6 +391,17 @@ D1/D2.*
   **literal-union compilation is ~cubic** in member count (200 → ~2s) — bootstrap-relevant (token/AST-kind
   unions). REMAINING: a *runtime* benchmark (run compiled `.vl` programs, e.g. the selfhost lexer, on large
   inputs); investigate the cubic union (A16).
+  **Perf wins identified (detail: `docs/perf-findings.md`):**
+  - ⬜ **F9a. Skip `optimize()` in test compiles (`VL_NO_OPT`)** — binaryen `m.optimize()` is the
+    dominant cost: ~4 s per selfhost sub-test vs ~0.14 s without it. Adding a `noOptimize` option
+    (or `VL_NO_OPT=1` env var) to `toWasm()` would cut total test time by ~20–25 s (wasm output is
+    functionally correct without optimization). Change touches only `toWasm.ts`. (detail:
+    `docs/perf-findings.md` §Part 3 — High-Impact)
+  - ⬜ **F9b. Cache / clone binaryen IR across selfhost sub-tests** — each of the 5 `selfhost_pipeline_test.ts`
+    sub-tests recompiles the same base source (lexer + ast + parser + typecheck) with only the driver
+    suffix differing. Caching and cloning the binaryen IR for the shared base would reduce the 5×4 s
+    to roughly 1×4 s + 4×driver-only compiles (~44× speedup on the remainder). More involved than F9a
+    (binaryen modules are not trivially cloneable). (detail: `docs/perf-findings.md` §Part 3 — Medium-Impact)
 
 ---
 
@@ -436,8 +472,29 @@ corpus (A12) is the host-agnostic oracle — the same tests pass whichever compi
   reconciled in the driver glue (no `.vl` compiler edits); gaps catalogued in `docs/selfhost-gaps.md`.
   The multi-file substrate the port needs now exists (H0 phase 1): the self-hosted compiler can be many
   `.vl` files with real `import`/`export`, compiled into one wasm module — same-named privates across
-  files no longer collide (the gap-#1 blocker). Migrating the H3 `.vl` files onto real imports is a
-  separate follow-up.
+  files no longer collide (the gap-#1 blocker — resolved by modules; see `docs/selfhost-gaps.md` §1).
+  Migrating the H3 `.vl` files onto real imports is a separate follow-up.
+  **Open self-host codegen limits (re-confirmed at pipeline scale; detail: `docs/selfhost-gaps.md`):**
+  - ⬜ **H3-gap3. `checkProgram` must be consumed in value position** — calling `checkProgram(...)` as
+    a bare statement or `let r = ...` hits "Expected numeric type" in codegen; only consuming the result
+    directly in a builtin call compiles. Fix in `toWasm.ts` — discarded / indirected call return value
+    lowering. (detail: `docs/selfhost-gaps.md` §3)
+  **Codegen capabilities needed before the VL-in-VL compiler can emit wasm (H4 sub-items):**
+  - ⬜ **H4.1. No `byte`/`u8` type** — the self-hosted wasm emitter needs a byte type for binary output;
+    VL has no unsigned 8-bit integer primitive today. (detail: `docs/selfhost-gaps.md` §H4.1)
+  - 🟡 **H4.2. Value-level bitwise / shift operators** (`&`, `|`, `^`, `<<`, `>>`) — needed for wasm
+    encoding (LEB128, bit packing). Implementation in progress on branch `claude/h42-bitwise-ops`.
+    (detail: `docs/selfhost-gaps.md` §H4.2)
+  - ⬜ **H4.3. Unsigned right-shift** (`>>>`) — wasm LEB128 encoding requires logical (unsigned) shift;
+    today only arithmetic `>>` is available. (detail: `docs/selfhost-gaps.md` §H4.3)
+  - ⬜ **H4.4. Signed `%` (modulo)** — VL's `%` follows wasm's signed truncating remainder; for some
+    encoding patterns an unsigned or floored modulo is needed. (detail: `docs/selfhost-gaps.md` §H4.4)
+  - ⬜ **H4.5. In-VL byte→host handoff** — no mechanism to pass a raw byte buffer from VL code to the
+    host (e.g. write compiled wasm bytes to stdout / a file); linear-memory FFI or a `bytes()` builtin
+    needed. (detail: `docs/selfhost-gaps.md` §H4.5)
+  - ⬜ **H4.6. Array spread / concat in call position** — the self-hosted emitter needs to accumulate
+    byte sequences with spread or bulk-append; `xs.push(...ys)` / spread-into-call not yet supported.
+    (detail: `docs/selfhost-gaps.md` §H4.6)
 - ⬜ **H4. WASM emission — DECIDED: emit bytes directly + optional `wasm-opt`** (binaryen's npm build
   is JS-bound; → `DECISIONS.md`, incl. the Heap2Local caveat). binaryen stays for the TS compiler.
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime (wasmtime —
@@ -455,6 +512,17 @@ H2/H3; H1 done, H4 decided.
 
 - **A10 generics + collections (B6 `List`, B6a maps)** — the H2 capability bar, and the gate on
   self-hosting (H3). The deepest remaining type-system work.
+- **A17 — forward / mutual-reference return-type inference** — removes the ergonomic wart where a
+  function calling a later-defined function (or mutual recursion) infers `any`; the fix is
+  demand-driven / SCC-grouped inference (ties A10's mutual-recursion note). High value for the
+  inference-first identity of the language and for self-hosting a recursive-descent compiler.
+- **H4.2 bitwise/shift operators** — in progress (`claude/h42-bitwise-ops`); unblocks LEB128
+  encoding in the self-hosted wasm emitter (H4), needed before H3 can emit wasm.
+- **A12 soundness bugs** — three confirmed, `xfail`-pinned runtime bugs (literal `is` always-false;
+  `A|B|null` illegal-cast trap; `?.field` alias false error); small, targeted fixes with real user
+  impact. (detail: `docs/soundness-findings.md`)
+- **F9a `VL_NO_OPT`** — single-line `toWasm.ts` change, cuts test suite wall time by ~20–25 s.
+  (detail: `docs/perf-findings.md`)
 - **C5 / H-M1** — `deno compile` + brew. Small, decoupled, ships the distribution story now.
 - **D1** — hover types, now that AST nodes carry source spans (D2 go-to-def/refs is done).
 - Smaller/independent: B6 growable lists, B13 callable-objects, B17 lint pass, A6b Stage A.
