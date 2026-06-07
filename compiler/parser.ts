@@ -233,6 +233,47 @@ export const parseProgram = (
    */
   const preregistered = new Set<string>();
 
+  // ---- demand-driven return-type inference (A17) ----------------------------
+  // VL infers an un-annotated function's return type from its body, but the
+  // parse/infer pass runs strictly top-to-bottom. A forward or mutual call
+  // therefore hit the callee's *un-filled* `Infer` return hole and froze it to
+  // `any` (`instantiateFunctionType` clones-and-collapses an Infer signature, so
+  // the later body that fills the original hole never reaches the call site).
+  //
+  // The fix decouples return-type inference from source order: a top-level named
+  // function's body is parsed through a single MEMOIZED resolver. When a call
+  // needs the callee's return type and it is still an unresolved hole, we drive
+  // that callee's body inference *on demand* (jumping the cursor to its
+  // signature, parsing it, then restoring), fill the hole, and reuse the
+  // produced node when source order later reaches it. A function being resolved
+  // is marked "in progress", so a mutual-recursion cycle is detected and left to
+  // resolve through its base-case return paths via the existing unification —
+  // exactly how an un-annotated *self*-recursive function already resolves today.
+  //
+  // The only residual case needing an annotation is a genuinely base-case-less
+  // inferred cycle (no concrete return path anywhere in the group): the holes
+  // stay `Unknown` and the call surfaces a clean "annotate a return type" error.
+
+  /** Token index of the `function` keyword for each top-level named function. */
+  const deferredFnStart = new Map<string, number>();
+  /** Memoized result of a top-level named function's body parse+inference. */
+  const resolvedFns = new Map<
+    string,
+    { node: VLFunctionDeclarationNode; endPos: number }
+  >();
+  /** Top-level functions whose body is currently being inferred (cycle guard). */
+  const fnInProgress = new Set<string>();
+  /** Names already flagged as base-case-less cycles (dedup the diagnostic). */
+  const baseCaseLessReported = new Set<string>();
+  /**
+   * Functions that were called recursively (directly or through the group) while
+   * their own return hole was still unfilled — i.e. they sit on an inferred
+   * recursion cycle. Only such a function may legitimately fail with the
+   * base-case-less diagnostic; a non-recursive function whose return infers to
+   * `Unknown` (e.g. a generic `function double(n) { return n * 2 }`) must not.
+   */
+  const onInferredCycle = new Set<string>();
+
   // A fresh bare `return` node — the fallback body for a malformed statement.
   // A factory (not a shared constant) so each use is a distinct AST node.
   const emptyReturn = (): VLReturnNode => ({
@@ -1359,7 +1400,10 @@ export const parseProgram = (
       functionType: undefined,
     };
 
-    const fnType = getType(name, spanOf(id));
+    // Forward/mutual call (A17): if `name` is a top-level function whose return
+    // is still an unresolved hole, infer its body on demand so this call sees the
+    // real return type rather than an `any`-collapsing empty hole.
+    const fnType = withResolvedReturn(name, getType(name, spanOf(id)));
     recordUse(name, spanOf(id));
     // Calling an unresolved inference hole infers the value is a function.
     if (fnType.type === "Infer" && fnType.subType.type === "Unknown") {
@@ -1722,6 +1766,21 @@ export const parseProgram = (
   const parseFunctionDeclaration = (
     anonAt?: Token,
   ): VLFunctionDeclarationNode => {
+    // Demand-driven memoization (A17): a top-level named function may have
+    // already been parsed+inferred out of source order (a forward/mutual call
+    // triggered it). When source order reaches it, reuse that node and skip the
+    // cursor past the already-consumed body instead of parsing it twice (which
+    // would duplicate diagnostics/bindings and reset the now-filled return hole).
+    if (!anonAt && scopes[scopes.length - 1] === program.scope && at("FUNCTION")) {
+      const nameTok = peek(1);
+      const cached = nameTok.kind === "ID"
+        ? resolvedFns.get(nameTok.text)
+        : undefined;
+      if (cached) {
+        pos = cached.endPos;
+        return cached.node;
+      }
+    }
     const fnTok = anonAt ?? expect("FUNCTION");
 
     // funcName: an identifier or an operator symbol (`function +(self, b)`).
@@ -1847,6 +1906,13 @@ export const parseProgram = (
         parameters[i].paramaterType,
       );
     }
+    // A top-level named function is the unit of demand-driven inference. Mark it
+    // "in progress" across its body parse so a forward/mutual call that loops
+    // back to it (directly or through the group) is detected as a cycle and reads
+    // the live return hole instead of re-entering the parse — letting a base-case
+    // return path fill the hole via the existing unification (A17).
+    const isTopLevelNamed = !!name && enclosing === program.scope;
+    if (isTopLevelNamed) fnInProgress.add(name!);
     let node: VLFunctionDeclarationNode;
     const bodyStart = peek();
     try {
@@ -1887,6 +1953,28 @@ export const parseProgram = (
       if (!functionReturnType) {
         if (bodyType.type !== "Never") subTypes.push(bodyType);
         functionReturnType = softenImplicitType({ type: "Union", subTypes });
+        // Base-case-less inferred cycle (A17): the inferred return collapsed to
+        // `Unknown` because every return path runs through a recursive call whose
+        // own return is still an unresolved hole — there is no concrete return
+        // anywhere in the group for inference to latch onto. This is a genuine
+        // limitation (not a source-order artifact), so ask the user to annotate.
+        let r: VLType = functionReturnType;
+        while (r.type === "Infer") r = r.subType;
+        if (
+          r.type === "Unknown" && name && onInferredCycle.has(name) &&
+          !baseCaseLessReported.has(name)
+        ) {
+          baseCaseLessReported.add(name);
+          errors.push({
+            type: "Syntax",
+            message:
+              `cannot infer a return type for \`${name}\`: its return paths form ` +
+              `a cycle with no concrete base case — annotate a return type on ` +
+              `\`${name}\` (or another function in the cycle) to break it`,
+            ctx: nameCtx ?? spanFrom(fnTok),
+            code: 0,
+          });
+        }
       }
 
       for (const param of parameters) {
@@ -1912,6 +2000,8 @@ export const parseProgram = (
       // Per-statement recovery in `parseProgram` resumes after a throw, so a
       // leaked type-param scope would corrupt later parsing — pop it here too.
       if (pushedTypeScope) scopes.pop();
+      // Drop the in-progress mark so a recovered later pass can retry this name.
+      if (isTopLevelNamed) fnInProgress.delete(name!);
       throw err;
     }
 
@@ -1951,7 +2041,75 @@ export const parseProgram = (
       }
     }
 
+    // Memoize so a later source-order encounter (or another forward caller)
+    // reuses this node instead of re-parsing the body. The cursor now sits just
+    // past the body, which is the resume point either pass needs.
+    if (isTopLevelNamed) {
+      fnInProgress.delete(name!);
+      resolvedFns.set(name!, { node, endPos: pos });
+    }
+
     return node;
+  };
+
+  /**
+   * Demand-driven return-type inference (A17). Given a top-level function `name`
+   * whose hoisted signature still has an UNRESOLVED `Infer` return hole, drive
+   * its body inference *now* — out of source order — so a forward/mutual caller
+   * sees the inferred return instead of an empty hole that freezes to `any`.
+   *
+   * - Already resolved → nothing to do (the hole was filled; memoized node ready).
+   * - In progress (we are inside its own body, i.e. a recursion cycle) → leave the
+   *   live hole alone; a base-case return path elsewhere in the cycle fills it via
+   *   the normal unification (this is exactly the self-recursion behaviour).
+   * - Otherwise → jump the cursor to the function's signature, parse it through
+   *   `parseFunctionDeclaration` (which memoizes the node + fills the hole), then
+   *   restore the cursor so the in-flight caller parse continues unperturbed.
+   *
+   * All shared parse state that the nested body parse mutates and leaves dangling
+   * (`returnType`, `returnTypes`, `flow.desiredType`) is saved/restored by
+   * `parseFunctionDeclaration` itself; only the cursor must be restored here.
+   */
+  const resolveDeferredReturn = (name: string): void => {
+    if (resolvedFns.has(name) || fnInProgress.has(name)) return;
+    const start = deferredFnStart.get(name);
+    if (start === undefined) return;
+    const savedPos = pos;
+    try {
+      pos = start;
+      parseFunctionDeclaration();
+    } catch {
+      // A malformed body can't be inferred on demand; the natural-order pass
+      // reports it in place. Leave the hole as-is and recover the cursor.
+    } finally {
+      pos = savedPos;
+    }
+  };
+
+  /**
+   * If `fnType` is a top-level function whose return is still an unresolved
+   * inference hole, trigger its demand-driven inference and hand back the (now
+   * possibly resolved) scope entry. Used at call sites before instantiating the
+   * signature, so a forward/mutual call resolves against the inferred return.
+   */
+  const withResolvedReturn = (name: string, fnType: VLType): VLType => {
+    if (
+      fnType.type === "Function" && fnType.return.type === "Infer" &&
+      fnType.return.subType.type === "Unknown"
+    ) {
+      // A call into a function whose body is still being inferred is a recursion
+      // cycle: note every member so a base-case-less group can be reported.
+      if (fnInProgress.has(name)) {
+        onInferredCycle.add(name);
+        for (const inFlight of fnInProgress) onInferredCycle.add(inFlight);
+      }
+      resolveDeferredReturn(name);
+      // The resolver overwrites the scope entry with the inferred signature.
+      for (let i = scopes.length - 1; i >= 0; i--) {
+        if (Object.hasOwn(scopes[i], name)) return scopes[i][name];
+      }
+    }
+    return fnType;
   };
 
   const parseTypeParams = (): string[] => {
@@ -2699,6 +2857,7 @@ export const parseProgram = (
    */
   function scoutSignature(): void {
     try {
+      const fnStart = pos; // token index of the `function` keyword
       next(); // FUNCTION
       const name = next().text; // ID (guaranteed by caller)
       const typeParams: string[] = at("LESS_THAN") ? parseTypeParams() : [];
@@ -2733,6 +2892,12 @@ export const parseProgram = (
               { type: "Infer", subType: { type: "Unknown" } },
           };
           preregistered.add(name);
+          // Remember where this function's signature begins so the demand-driven
+          // resolver can jump back and infer its body out of source order. Only
+          // un-annotated functions can need it (an annotated return is already
+          // concrete), but recording every one keeps the natural-order parse and
+          // the on-demand parse going through the same memoized entry point.
+          deferredFnStart.set(name, fnStart);
         }
       } finally {
         if (pushedTypeScope) scopes.pop();
