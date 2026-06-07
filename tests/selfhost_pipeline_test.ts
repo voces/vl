@@ -11,13 +11,13 @@
 //
 // VL has no module system yet, so the sources are concatenated ahead of a `.vl`
 // print-driver, compiled to wasm, and run; the captured log is diffed against the
-// expected diagnostics. Two reconciliations are needed because the lexer and parser
+// expected diagnostics. One reconciliation is needed because the lexer and parser
 // were ported separately:
 //   1. NAME collisions — `lexer.vl` and `ast.vl`/`parser.vl` each define `Tok`,
 //      `Diag`, and `advance`. We rename the lexer's three colliding symbols in its
 //      SOURCE TEXT before concatenation (glue only — no `.vl` compiler file edited).
-//   2. KIND-spelling divergence — the lexer emits `ID`/`GE`/… spellings the parser
-//      spells `IDENT`/`GE`/…; the `.vl` driver's `mapKind` reconciles them.
+// The token-`kind` spellings now agree between the lexer and parser (gap #2
+// resolved in `compiler/lexer.vl`), so no `mapKind` translation is needed.
 
 import { compile, runWasm } from "../compiler/compile.ts";
 
@@ -62,32 +62,19 @@ const runDriver = async (driver: string): Promise<string[]> => {
   return logs;
 };
 
-// The lexer-kind → parser-kind reconciliation + the source→tokens loader + the
-// diagnostic printer, shared by the inline seeded-error drivers. (The shared
-// fixture `tests/selfhost/pipeline_harness.vl` carries its own copy of this glue so
-// it also runs standalone.) `checkProgram` is ALWAYS consumed in an expression
-// (`i32ToStr(checkProgram(...))`) — calling it bare trips a codegen gap at module
-// scale (see the gap note in `compiler/typecheck.vl`).
+// The source→tokens loader + the diagnostic printer, shared by the inline
+// seeded-error drivers. (The shared fixture `tests/selfhost/pipeline_harness.vl`
+// carries its own copy of this glue so it also runs standalone.) `checkProgram` is
+// ALWAYS consumed in an expression (`i32ToStr(checkProgram(...))`) — calling it bare
+// trips a codegen gap at module scale (see the gap note in `compiler/typecheck.vl`).
+// No `mapKind` needed: the lexer now uses the same kind spellings as the parser.
 const prelude = `
-function mapKind(k: string): string {
-  if k == "ID" { return "IDENT" }
-  if k == "EQUAL_TO" { return "EQ" }
-  if k == "NOT_EQUAL_TO" { return "NE" }
-  if k == "LESS_THAN" { return "LT" }
-  if k == "GREATER_THAN" { return "GT" }
-  if k == "LESS_THAN_OR_EQUAL_TO" { return "LE" }
-  if k == "GREATER_THAN_OR_EQUAL_TO" { return "GE" }
-  if k == "DIV" { return "SLASH" }
-  if k == "MOD" { return "PERCENT" }
-  if k == "EXCLAMATION" { return "BANG" }
-  k
-}
 function loadToks(src: string): i32 {
   let r = tokenize(src)
   let i = 0
   while i < r.tokens.length {
     let t = r.tokens[i]
-    P.toks.push({ kind: mapKind(t.kind), text: t.text, pos: i })
+    P.toks.push({ kind: t.kind, text: t.text, pos: i })
     i = i + 1
   }
   P.toks.length

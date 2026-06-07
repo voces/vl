@@ -46,16 +46,16 @@ ONE shared token model (see gap #2) and a non-colliding cursor name.
 
 ---
 
-## 2. Lexer ↔ parser token-`kind` spelling divergence (WORKED AROUND)
+## 2. Lexer ↔ parser token-`kind` spelling divergence (RESOLVED)
 
 **Repro.** Feed real lexer output straight into the parser without remapping; e.g.
-the lexer emits `kind == "ID"` for identifiers and `"GREATER_THAN_OR_EQUAL_TO"`
+the lexer emitted `kind == "ID"` for identifiers and `"GREATER_THAN_OR_EQUAL_TO"`
 for `>=`, but the parser's `peekKind()`/`binPrec()` compare against `"IDENT"` and
-`"GE"`. Every identifier becomes an "expected an expression" error; `>=` never
-parses as a binary operator.
+`"GE"`. Every identifier became an "expected an expression" error; `>=` never
+parsed as a binary operator.
 
 **What failed.** The two components were ported separately and chose different
-`kind` string tags. Full divergence list (lexer → parser):
+`kind` string tags. Full divergence list (old lexer → parser):
 
 | lexer kind                  | parser kind |
 | --------------------------- | ----------- |
@@ -70,25 +70,17 @@ parses as a binary operator.
 | `MOD`                       | `PERCENT`   |
 | `EXCLAMATION`               | `BANG`      |
 
-Everything else already agrees verbatim (all keywords, `NUMBER`/`STRING`/`CHAR`,
+Everything else already agreed verbatim (all keywords, `NUMBER`/`STRING`/`CHAR`,
 the brackets/punctuation, `PLUS`/`MINUS`/`STAR`, `AND`/`OR`, `NEWLINE`/`EOF`, …).
 
-**Workaround.** A `mapKind(k: string): string` in the driver translates the ten
-divergent kinds; unmapped kinds pass through. The adapter (`loadToks`) also bridges
-the token *shape*: the lexer's `LexTok` is `{kind, text, value, start, stop, line,
-col}` while the parser reads `Tok = {kind, text, pos}` from `ast.vl` — but the
-parser only ever reads `kind` + `text` and uses `pos` as the cursor index, so the
-adapter copies `text` verbatim and sets `pos` to the stream position. The lexer
-already EOF-terminates the stream, which is exactly the terminator the parser's
-cursor primitives (`peekTok`) expect.
-
-**Suggested fix location.** Align the two `.vl` files on ONE token-kind vocabulary
-and ONE token struct. Lowest-churn: rename the lexer's ten divergent kinds to the
-parser's terse spellings in `compiler/lexer.vl` (and update the lexer self-host
-fixture's expected output in `tests/selfhost_lexer_test.ts`). Bigger but cleaner:
-have `parser.vl` consume the lexer's `Tok` shape directly once a module system
-lets them share one definition. Deferred to avoid touching files another agent /
-the existing lexer fixture depends on.
+**Resolution.** Renamed the ten divergent kinds in `compiler/lexer.vl` to the
+parser's terse spellings (`ID`→`IDENT`, `EQUAL_TO`→`EQ`, `NOT_EQUAL_TO`→`NE`,
+`LESS_THAN`→`LT`, `GREATER_THAN`→`GT`, `LESS_THAN_OR_EQUAL_TO`→`LE`,
+`GREATER_THAN_OR_EQUAL_TO`→`GE`, `DIV`→`SLASH`, `MOD`→`PERCENT`,
+`EXCLAMATION`→`BANG`). The `mapKind` translation table was removed from
+`tests/selfhost/pipeline_harness.vl` and `tests/selfhost_pipeline_test.ts`. The
+lexer self-host fixture in `tests/selfhost_lexer_test.ts` was updated to expect
+the new kind spellings. `compiler/parser.vl` was not touched.
 
 ---
 
@@ -114,5 +106,8 @@ NOT fixed here (TS compiler is owned by another agent).
 The front end self-hosts **fully end to end from source text**: the 5 cases in
 `tests/selfhost_pipeline_test.ts` (one well-typed program + four seeded type
 errors) all drive the genuine `lexer.vl → parser.vl → typecheck.vl` chain and
-produce the expected diagnostics, with the gaps above handled entirely in
-driver/harness glue. No TS-compiler change was required to land the pipeline.
+produce the expected diagnostics. Gap #2 (token-kind divergence) is now resolved
+at the source, so no `mapKind` translation is needed in the pipeline glue. Gap #1
+(name collisions) is still worked around in the runner via source-text rename; the
+real fix awaits a module system. No TS-compiler change was required to land the
+pipeline.
