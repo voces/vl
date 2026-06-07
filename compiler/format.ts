@@ -429,9 +429,18 @@ class Printer {
     // body and span are discarded by the parser, so recover the whole `type …`
     // declaration verbatim from source.
     if (node.label && node.label.startsWith("__type_")) {
-      const text = this.takeTypeAlias(node.label);
-      if (text !== undefined) {
-        for (const part of text.split("\n")) this.line(indent, part);
+      const result = this.takeTypeAlias(node.label);
+      if (result !== undefined) {
+        const { text, stopLine } = result;
+        const parts = text.split("\n");
+        // Attach a trailing comment on the alias's last source line to the final
+        // emitted line (it would otherwise be displaced onto its own line).
+        const trailer = this.trailingOn(stopLine);
+        const suffix = trailer ? ` ${trailer.text}` : "";
+        parts.forEach((part, i) => {
+          const last = i === parts.length - 1;
+          this.line(indent, part + (last ? suffix : ""));
+        });
         return;
       }
     }
@@ -448,7 +457,7 @@ class Printer {
    * its body. Type aliases are consumed in order so repeated names still match.
    */
   private typeCursor = 0;
-  private takeTypeAlias(label: string): string | undefined {
+  private takeTypeAlias(label: string): { text: string; stopLine: number } | undefined {
     const name = label.slice("__type_".length, -"__".length);
     for (let i = this.typeCursor; i < this.tokens.length - 1; i++) {
       if (this.tokens[i].kind !== "TYPE") continue;
@@ -461,10 +470,11 @@ class Printer {
   }
 
   /** Slice from the `type` token at index `ti` to the end of the alias body. */
-  private sliceTypeAlias(ti: number): string {
+  private sliceTypeAlias(ti: number): { text: string; stopLine: number } {
     const start = this.offset(this.tokens[ti].start);
     let depth = 0; // `<`/`{`/`[`/`(` nesting (so a body brace/newline is kept)
     let end = this.offset(this.tokens[ti].stop);
+    let stopLine = this.tokens[ti].start.line; // line of the last content token
     for (let j = ti + 1; j < this.tokens.length; j++) {
       const t = this.tokens[j];
       if (t.kind === "EOF") {
@@ -487,8 +497,12 @@ class Printer {
         t.kind === "GREATER_THAN"
       ) depth--;
       end = this.offset(t.stop);
+      stopLine = t.start.line;
     }
-    return this.source.slice(start, end).replace(/[ \t]+\n/g, "\n").trimEnd();
+    return {
+      text: this.source.slice(start, end).replace(/[ \t]+\n/g, "\n").trimEnd(),
+      stopLine,
+    };
   }
 
   // ===================================================================
@@ -1292,8 +1306,8 @@ class Printer {
 
   private blockExpr(node: VLBlockNode, indent: number): string {
     if (node.label?.startsWith("__type_")) {
-      const text = this.takeTypeAlias(node.label);
-      return text ?? "";
+      const result = this.takeTypeAlias(node.label);
+      return result?.text ?? "";
     }
     const lines: string[] = ["{"];
     const saved = this.out;
