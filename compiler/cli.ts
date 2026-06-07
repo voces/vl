@@ -451,6 +451,9 @@ type CheckTally = { errors: number; warnings: number; gating: number };
 // passing `--severity L` raises the floor to L so lower-severity diagnostics are
 // hidden as well as un-gated. Counting still walks every diagnostic, so the
 // tally (and the gating exit) is unaffected by what is shown.
+// When `codegen` is true, use the full `compile()` pipeline (including binaryen
+// codegen) so that codegen-only errors are also reported; otherwise the faster
+// codegen-free `checkOnly()` path is used.
 const checkFile = async (
   file: string,
   concise: boolean,
@@ -458,15 +461,17 @@ const checkFile = async (
   tally: CheckTally,
   threshold: VLSeverity,
   displayFloor: VLSeverity,
+  codegen: boolean,
 ): Promise<void> => {
   const source = await Deno.readTextFile(file);
-  // `check` only needs diagnostics, so use the codegen-free front end: it skips
-  // binaryen codegen entirely (faster, and never even loads the binaryen
-  // toolchain). Trade-off: codegen-only diagnostics — the `Codegen error:` line,
-  // e.g. the array-element-recursion stack overflow — are not produced by
-  // `check`. That is acceptable here: `check` is a parse/type gate, and
-  // `build`/`run` (which do run codegen) still surface those errors.
-  const { diagnostics } = checkOnly(source);
+  // Fast path: codegen-free front end — skips binaryen entirely (no toolchain
+  // load). Codegen-only diagnostics (e.g. "Codegen error: recursion limit
+  // exceeded") are NOT produced here; `build`/`run` surface those instead.
+  // Full path (--codegen): run the complete compile() pipeline including
+  // binaryen codegen. Wasm bytes are discarded — we only want the diagnostics.
+  const { diagnostics } = codegen
+    ? await compile(source)
+    : checkOnly(source);
   if (diagnostics.length === 0) return;
 
   // Diagnostics to display: only those at or above the display floor. The tally
@@ -511,6 +516,10 @@ type CheckArgs = {
   // the lowest severity (show everything) unless `--severity` is given, in which
   // case it equals `severity` so the run hides as well as un-gates lower levels.
   displayFloor: VLSeverity;
+  // When true, run the full compile() pipeline (including binaryen codegen) so
+  // that codegen-only errors (e.g. recursion limit exceeded) are also reported.
+  // By default `check` uses the faster codegen-free `checkOnly()` path.
+  codegen: boolean;
 };
 
 // Validate a `--severity` value against the known levels, exiting with a clean
@@ -544,6 +553,7 @@ const parseSeverity = (value: string | undefined): VLSeverity => {
 const parseCheckArgs = (args: string[]): CheckArgs => {
   let target: string | undefined;
   let concise = false;
+  let codegen = false;
   let severity: VLSeverity = "error";
   // Whether `--severity` was passed. Drives the display floor (see below).
   let severityGiven = false;
@@ -552,6 +562,8 @@ const parseCheckArgs = (args: string[]): CheckArgs => {
     const a = args[i];
     if (a === "--concise") {
       concise = true;
+    } else if (a === "--codegen") {
+      codegen = true;
     } else if (a === "--exclude" || a === "--ignore") {
       const value = args[++i];
       if (value !== undefined) excludes.push(...value.split(","));
@@ -575,14 +587,14 @@ const parseCheckArgs = (args: string[]): CheckArgs => {
     severity,
     // Floor = chosen level when `--severity` is explicit, else show-all.
     displayFloor: severityGiven ? severity : LOWEST_SEVERITY,
+    codegen,
   };
 };
 
 const check = async (args: string[]): Promise<void> => {
   // No path argument → default to the current working directory (`vl check .`).
-  const { target, concise, excludes, severity, displayFloor } = parseCheckArgs(
-    args,
-  );
+  const { target, concise, excludes, severity, displayFloor, codegen } =
+    parseCheckArgs(args);
   // No color when piped, when NO_COLOR is set, or in concise mode (kept plain
   // so scripts/grep see stable bytes).
   const c = makeColors(!concise && shouldColor());
@@ -614,7 +626,7 @@ const check = async (args: string[]): Promise<void> => {
   // chosen level when `--severity` is passed) — independent of the tally.
   const tally: CheckTally = { errors: 0, warnings: 0, gating: 0 };
   for (const file of files) {
-    await checkFile(file, concise, c, tally, severity, displayFloor);
+    await checkFile(file, concise, c, tally, severity, displayFloor, codegen);
   }
 
   // Pretty mode ends with a Deno-style summary; concise stays output-stable.
@@ -747,6 +759,9 @@ check:
   path                         a .vl file, or a directory checked recursively
                                (default: the current directory)
   --concise                    one terse line per diagnostic (grep-safe)
+  --codegen                    also run binaryen codegen and report codegen
+                               errors (e.g. recursion limit exceeded); slower
+                               but catches issues that only surface at codegen
   --exclude, --ignore <glob>   skip paths matching <glob> when walking a
                                directory; repeatable, or comma-separated.
                                Matches the path relative to <path> and the
