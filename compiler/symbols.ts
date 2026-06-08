@@ -79,6 +79,18 @@ export type Binding = {
    * Undefined for non-exported / nested bindings.
    */
   exported?: boolean;
+  /**
+   * Module system: `true` when this binding was introduced by an `import { … }`
+   * specifier (stamped in `parseImport`). The unused-variable lint treats an
+   * unused IMPORT differently from an unused local/parameter: there is no
+   * meaningful `_`-prefix suppression for an import (prefixing the local would
+   * have to go through aliasing — `{ x as _x }` — which is not what a bare
+   * `_`-insert does), so the rule emits an "Unused import … (remove it)" message
+   * under the distinct `unused-import` code, and the quick-fix removes the
+   * specifier (and the whole `import` line when it was the only one) rather than
+   * offering a `_`-prefix. Undefined for ordinary (non-import) bindings.
+   */
+  isImport?: boolean;
 };
 
 /** One textual appearance of a name, resolved to the binding it refers to. */

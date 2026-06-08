@@ -3038,13 +3038,17 @@ export const parseProgram = (
         // Use the local-identifier span so the unused-variable lint squiggle lands
         // on the imported NAME (e.g. `a` or `y` in `{ x as y }`), not `import`.
         const declSpan = localSpans.get(s.local) ?? spanOf(kw);
-        declareBinding(
+        const binding = declareBinding(
           program.scope,
           s.local,
           program.scope[s.local].type === "Type" ? "type" : "variable",
           declSpan,
           program.scope[s.local],
         );
+        // Mark the binding as import-origin so the unused-variable lint emits the
+        // import-specific "remove it" message + `unused-import` code (no `_`-prefix
+        // suggestion — prefixing an import would require aliasing, not a bare `_`).
+        binding.isImport = true;
       }
     }
     (program.moduleImports ??= []).push(node);

@@ -74,6 +74,131 @@ export const removeBindingFix = (
   };
 };
 
+/** One `import` specifier located on the line: its content's [start, end) cols. */
+type ImportSpecifierSpan = { contentStart: number; contentEnd: number };
+
+/**
+ * Parse the specifier list of an `import { … } from "…"` line into the content
+ * span (leading/trailing whitespace trimmed) of each comma-separated specifier.
+ * Returns `null` if the line has no `{ … }` clause. A trailing comma yields no
+ * extra (empty) specifier. Columns are 0-based offsets into `line`.
+ *
+ * Specifiers are simple (`name` or `name as local`) with no nesting, so a flat
+ * comma split is exact — there are no commas inside a specifier to escape.
+ */
+const importSpecifierSpans = (line: string): ImportSpecifierSpan[] | null => {
+  const lbrace = line.indexOf("{");
+  const rbrace = line.indexOf("}", lbrace + 1);
+  if (lbrace < 0 || rbrace < 0) return null;
+  const spans: ImportSpecifierSpan[] = [];
+  // Walk each comma-delimited segment in (lbrace, rbrace), trimming whitespace to
+  // get the actual content span. An all-whitespace segment (e.g. after a trailing
+  // comma) is skipped so it never becomes a phantom specifier.
+  let segStart = lbrace + 1;
+  const pushSeg = (from: number, to: number): void => {
+    let s = from;
+    let e = to;
+    while (s < e && /\s/.test(line[s])) s++;
+    while (e > s && /\s/.test(line[e - 1])) e--;
+    if (e > s) spans.push({ contentStart: s, contentEnd: e });
+  };
+  for (let i = lbrace + 1; i < rbrace; i++) {
+    if (line[i] === ",") {
+      pushSeg(segStart, i);
+      segStart = i + 1;
+    }
+  }
+  pushSeg(segStart, rbrace);
+  return spans;
+};
+
+/**
+ * Quick-fix for an `unused-import` diagnostic: remove the unused import. The
+ * diagnostic range starts at the imported LOCAL name (`a`, or the `as`-alias `y`
+ * in `{ x as y }`), which sits inside exactly one specifier of the `import { … }`
+ * clause on that line.
+ *
+ *   - Only specifier (`import { a } from "./x"`) → delete the ENTIRE import line,
+ *     including its trailing newline (nothing is left to import).
+ *   - Otherwise delete just that specifier and one adjacent comma so no dangling
+ *     or leading comma remains:
+ *       · not the last specifier → delete from its content start up to the next
+ *         specifier's content start (drops `a, ` → `{ b }` from `{ a, b }`).
+ *       · the last specifier      → delete from the previous specifier's content
+ *         end through this one's end (drops `, b` → `{ a }` from `{ a, b }`).
+ *     For `{ x as y }` the whole `x as y` specifier is the content span, so the
+ *     entire alias clause is removed.
+ *
+ * Returns `null` when the line is out of range or has no `{ … }` clause / no
+ * specifier under the diagnostic range (defensive — the lint always points at a
+ * real import local).
+ *
+ * Like `removeBindingFix` this DELETES code, so it is not `isPreferred` (Auto Fix
+ * never silently removes an import); but it is the ONLY fix offered for an unused
+ * import — there is no `_`-prefix alternative (prefixing would require aliasing).
+ */
+export const removeImportFix = (
+  source: string,
+  range: LspRange,
+): QuickFix | null => {
+  const lines = splitLines(source);
+  const lineIdx = range.start.line;
+  if (lineIdx < 0 || lineIdx >= lines.length) return null;
+  const line = lines[lineIdx];
+  const specs = importSpecifierSpans(line);
+  if (!specs || specs.length === 0) return null;
+
+  // The target specifier is the one whose content span covers the diagnostic
+  // start column (the local-identifier position).
+  const col = range.start.character;
+  const target = specs.findIndex(
+    (s) => col >= s.contentStart && col <= s.contentEnd,
+  );
+  if (target < 0) return null;
+
+  // Only specifier → remove the whole import line (incl. its trailing newline,
+  // or to end-of-line when it is the last line of the file).
+  if (specs.length === 1) {
+    const end: LspPosition = lineIdx + 1 < lines.length
+      ? { line: lineIdx + 1, character: 0 }
+      : { line: lineIdx, character: line.length };
+    return {
+      title: "Remove unused import",
+      kind: "quickfix",
+      edits: [{
+        range: { start: { line: lineIdx, character: 0 }, end },
+        newText: "",
+      }],
+    };
+  }
+
+  // Multi-specifier: drop this specifier plus exactly one neighbouring comma.
+  let delStart: number;
+  let delEnd: number;
+  if (target < specs.length - 1) {
+    // Not the last: delete up to the next specifier's content start (its comma
+    // and the whitespace after it go too).
+    delStart = specs[target].contentStart;
+    delEnd = specs[target + 1].contentStart;
+  } else {
+    // Last specifier: delete back from the previous specifier's content end
+    // (taking the comma before this one and the whitespace around it).
+    delStart = specs[target - 1].contentEnd;
+    delEnd = specs[target].contentEnd;
+  }
+  return {
+    title: "Remove unused import",
+    kind: "quickfix",
+    edits: [{
+      range: {
+        start: { line: lineIdx, character: delStart },
+        end: { line: lineIdx, character: delEnd },
+      },
+      newText: "",
+    }],
+  };
+};
+
 /**
  * Quick-fix for a `prefer-const` diagnostic: a never-reassigned `let` should be
  * `const`. We find the `let` keyword on the diagnostic's line and replace it with
@@ -177,6 +302,13 @@ export const quickFixesForDiagnostic = (
       if (remove) fixes.push(remove);
       fixes.push(prefixWithUnderscoreFix(range));
       return fixes;
+    }
+    case "unused-import": {
+      // Imports get ONLY the remove-import fix — no `_`-prefix (that would need
+      // aliasing, not a bare `_`-insert). Removes the specifier, or the whole
+      // `import` line when it was the only one.
+      const remove = removeImportFix(source, range);
+      return remove ? [remove] : [];
     }
     case "prefer-const": {
       const fix = letToConstFix(source, range);

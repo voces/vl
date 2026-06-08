@@ -26,8 +26,11 @@ const assert = (cond: boolean, msg: string): void => {
 const memReader = (files: Record<string, string>): ModuleReader =>
   (key: string) => files[key];
 
+// An unused IMPORT now carries the dedicated `unused-import` code (distinct from
+// the local/parameter `unused-variable` code) so the quick-fix dispatches to the
+// remove-import edit; match that here.
 const unusedDiag = (diags: VLDiagnostic[]): VLDiagnostic | undefined =>
-  diags.find((d) => d.code === "unused-variable");
+  diags.find((d) => d.code === "unused-import");
 
 // ---- (1) plain `import { a }` — squiggle on `a`, not `import` ---------------
 
@@ -62,6 +65,16 @@ Deno.test(
     assert(
       end.line === 0 && end.character === 12,
       `expected end 0:12, got ${end.line}:${end.character}`,
+    );
+    // Message is the import-specific "remove it" wording — NOT the local/parameter
+    // "prefix with `_`" wording (prefixing an import would require aliasing).
+    assert(
+      d!.message === "Unused import `add` (remove it)",
+      `unexpected message: ${d!.message}`,
+    );
+    assert(
+      !d!.message.includes("prefix with `_`"),
+      `import message must not suggest a \`_\`-prefix: ${d!.message}`,
     );
   },
 );
