@@ -2361,69 +2361,181 @@ export const toWasm = async (
     registerFunctionDecl(node);
   };
 
-  // Build-loop fusion. The idiom `const a = [..seed]` immediately followed by a
-  // `for i in A to B { a.push(e) }` whose body is exactly that one push lowers to a
-  // pre-sized indexed fill instead of `count` per-element pushes. Per-push cost
-  // (capacity-check branch + a frontier `array.set` whose bound the engine cannot
-  // prove) is ~3.8x a sequential in-range write, which the engine elides — so this
-  // is the append-path's main win. The fused list is bit-for-bit what push would
-  // build (same `{backing,len,cap}`, same values), only faster.
+  // Build-loop fusion (general). A loop that builds a FRESH local list by pushing
+  // once per iteration lowers to ONE pre-sized indexed fill instead of `count`
+  // per-element pushes. Two shapes are recognized:
+  //   for i in A to B [step S] { a.push(e) }
+  //   let i = …; while i <cmp> N { a.push(e); i = i ± C }   (counter-while)
+  // A push writes at the moving frontier `len`, whose bound the engine cannot
+  // prove, so it pays a non-elidable bounds check + the capacity branch (~3.8x a
+  // sequential in-range write the engine DOES elide); fusion turns the former into
+  // the latter. The fused list is bit-for-bit what push builds (same backing, len,
+  // values), only faster.
   //
-  // Soundness: the result must be indistinguishable from the push build, so we fuse
-  // only when nothing can observe the list mid-build and the push count is exactly
-  // the (step-1) range size. The guards below each rule out a way that could fail;
-  // anything unproven falls back to the ordinary push lowering (`null`). The
-  // `tests/cases/lists/build-fusion-*` corpus pins both the equivalence and the
-  // must-not-fuse cases. Returns a void block, or null to fall back.
+  // Soundness: fuse only when the result is indistinguishable from the push build.
+  // The list must be FRESH — declared via an array literal in this block and not
+  // referenced between its declaration and this loop, so it is the untouched
+  // literal at loop entry — and never observed mid-build (the loop body is exactly
+  // one `a.push(e)`, with `e` and the bounds free of `a`); and the push count must
+  // be exactly the loop's iteration count. A counter-while is exactly a for-range
+  // (`i < N` ⇔ `i ≤ N-1` for integers), so both reduce to one (from, inclusive-to,
+  // const-step) descriptor feeding one fill core; `step` must be a compile-time
+  // integer constant (its sign selects the count formula), and the while's counter
+  // is restored to its post-loop value. Anything unproven falls back (`null`). The
+  // `tests/cases/lists/build-fusion-*` corpus pins equivalence + must-not-fuse.
   let buildLoopId = 0;
+  const constInt = (n: VLExpression): number | null => {
+    if (n.type === "IntegerLiteral") return n.value;
+    if (n.type === "UnaryOperation" && n.operator === "-") {
+      const inner = constInt(n.operand);
+      return inner === null ? null : -inner;
+    }
+    return null;
+  };
   const tryLowerBuildLoop = (
-    decl: VLStatement,
-    loop: VLStatement,
+    statements: VLStatement[],
+    loopIdx: number,
   ): number | null => {
-    if (decl.type !== "VariableDeclaration") return null;
-    // The initializer must be an array literal (empty, or a seed prefix to keep).
-    if (!decl.value || decl.value.type !== "ArrayLiteral") return null;
-    if (!isListType(decl.variableType)) return null;
-    // A module global takes the global.set path, not a local — don't fuse it.
-    if (functionBoundaries.length === 1 && moduleGlobals.has(decl.name)) {
+    const loop = statements[loopIdx];
+
+    // The single bare `a.push(e)` that must be the (only) list-affecting work.
+    const pushOf = (
+      s: VLStatement,
+    ): { list: string; e: VLExpression } | null => {
+      if (
+        s.type !== "Call" || s.callee.type !== "PropertyAccess" ||
+        s.callee.property !== "push" || s.callee.object.type !== "Name" ||
+        s.arguments.length !== 1
+      ) return null;
+      return { list: s.callee.object.name, e: s.arguments[0].value };
+    };
+
+    // --- 1. classify the loop → (listName, var, from, inclusive-to, step, e) ---
+    let listName: string;
+    let varName: string;
+    let varExternal: boolean; // true: an existing local (while counter) to restore
+    let fromAst: VLExpression;
+    let toInclAst: VLExpression; // inclusive bound, with For `to` semantics
+    let step: number;
+    let elemExpr: VLExpression;
+
+    if (loop.type === "For") {
+      const body = loop.statement;
+      const stmts = body.type === "Block" ? body.statements : [body];
+      if (stmts.length !== 1) return null;
+      const p = pushOf(stmts[0]);
+      if (!p) return null;
+      const s = loop.step ? constInt(loop.step) : 1;
+      if (s === null || s === 0) return null;
+      listName = p.list;
+      varName = loop.variable;
+      varExternal = false;
+      fromAst = loop.from;
+      toInclAst = loop.to;
+      step = s;
+      elemExpr = p.e;
+    } else if (loop.type === "While") {
+      // counter-while: `while i <cmp> N { a.push(e); i = i ± C }`.
+      const cond = loop.condition;
+      if (cond.type !== "BinaryOperation" || cond.left.type !== "Name") {
+        return null;
+      }
+      const cmp = cond.operator;
+      if (cmp !== "<" && cmp !== "<=" && cmp !== ">" && cmp !== ">=") return null;
+      const counter = cond.left.name;
+      const boundAst = cond.right;
+      const body = loop.statement;
+      const stmts = body.type === "Block" ? body.statements : [body];
+      if (stmts.length !== 2) return null; // exactly [push, increment]
+      const p = pushOf(stmts[0]);
+      if (!p) return null;
+      // Second statement must be exactly `i = i ± C` — the only counter mutation.
+      const inc = stmts[1];
+      if (
+        inc.type !== "BinaryOperation" || inc.operator !== "=" ||
+        inc.left.type !== "Name" || inc.left.name !== counter ||
+        inc.right.type !== "BinaryOperation" ||
+        (inc.right.operator !== "+" && inc.right.operator !== "-") ||
+        inc.right.left.type !== "Name" || inc.right.left.name !== counter
+      ) return null;
+      const mag = constInt(inc.right.right);
+      if (mag === null || mag === 0) return null;
+      const s = inc.right.operator === "+" ? mag : -mag;
+      // Direction must drive toward the exit, else the loop is degenerate (e.g.
+      // non-terminating) and the count is not the simple range size — fall back.
+      if ((cmp === "<" || cmp === "<=") && s <= 0) return null;
+      if ((cmp === ">" || cmp === ">=") && s >= 0) return null;
+      if (counter === p.list) return null;
+      if (referencesName(boundAst, counter)) return null;
+      const one: VLExpression = { type: "IntegerLiteral", value: 1, text: "1" };
+      listName = p.list;
+      varName = counter;
+      varExternal = true;
+      fromAst = { type: "Name", name: counter };
+      // Inclusive bound matching the while exit for integers: `< N`→N-1, `> N`→N+1,
+      // `<= N`/`>= N`→N.
+      toInclAst = cmp === "<"
+        ? { type: "BinaryOperation", left: boundAst, right: one, operator: "-" }
+        : cmp === ">"
+        ? { type: "BinaryOperation", left: boundAst, right: one, operator: "+" }
+        : boundAst;
+      step = s;
+      elemExpr = p.e;
+    } else {
       return null;
     }
-    // Step-1 ascending/inclusive range only (count is exactly `to - from + 1`);
-    // `while`, stepped ranges, and `for…in` are deliberately out of scope.
-    if (loop.type !== "For" || loop.step) return null;
-    if (loop.variable === decl.name) return null; // would shadow the list name
-    // Body must be EXACTLY one statement: `a.push(e)` (a bare, unconditional push —
-    // no `if`, no `break`, no second statement, no other method).
-    const body = loop.statement;
-    const stmts = body.type === "Block" ? body.statements : [body];
-    if (stmts.length !== 1) return null;
-    const push = stmts[0];
+
+    // The pushed value and the bounds must not reference the list — otherwise the
+    // loop could observe it at a partial state (e.g. `a.push(a.length)`).
     if (
-      push.type !== "Call" || push.callee.type !== "PropertyAccess" ||
-      push.callee.property !== "push" || push.callee.object.type !== "Name" ||
-      push.callee.object.name !== decl.name || push.arguments.length !== 1
-    ) return null;
-    const elemExpr = push.arguments[0].value;
-    // Nothing in the loop may reference the list being built: the pushed value must
-    // not read `a` (e.g. `a.push(a.length)`), and the bounds must not either. With
-    // the body a bare push of an `a`-free expression, the list is never observed at
-    // a partial state, so pre-setting its length is invisible.
-    if (
-      referencesName(elemExpr, decl.name) ||
-      referencesName(loop.from, decl.name) || referencesName(loop.to, decl.name)
+      referencesName(elemExpr, listName) ||
+      referencesName(fromAst, listName) || referencesName(toInclAst, listName)
     ) return null;
 
-    const element = softenImplicitType(arrayElementType(decl.variableType)!);
+    // --- 2. the list must be a fresh array-literal local of this block ---
+    const a = lookupName(listName);
+    if (!a || a.index < 0 || a.capture || !isListType(a.type)) return null;
+    if (functionBoundaries.length === 1 && moduleGlobals.has(listName)) {
+      return null;
+    }
+    let declIdx = -1;
+    for (let k = loopIdx - 1; k >= 0; k--) {
+      const s = statements[k];
+      if (s.type === "VariableDeclaration" && s.name === listName) {
+        declIdx = k;
+        break;
+      }
+    }
+    if (declIdx < 0) return null;
+    const decl = statements[declIdx];
+    if (
+      decl.type !== "VariableDeclaration" || !decl.value ||
+      decl.value.type !== "ArrayLiteral"
+    ) return null;
+    // Freshness: nothing between the declaration and the loop touches the list, so
+    // it is still exactly the literal (its seed) at loop entry.
+    for (let k = declIdx + 1; k < loopIdx; k++) {
+      if (referencesName(statements[k], listName)) return null;
+    }
+    const seedLen = decl.value.values.length;
+
+    // --- 3. codegen: pre-size, copy the seed, rebind `a`, fill in range ---
+    const element = softenImplicitType(arrayElementType(a.type)!);
     const lt = listType(element);
-    const seed = decl.value.values;
-    const seedLen = seed.length;
+    const aIndex = a.index;
+    const aRef = () => m.local.get(aIndex, lt.refType);
 
-    const aIndex = _locals.push(toWasmType(decl.variableType)) - 1 +
-      (_locals.params ?? 0);
-    currentScope[decl.name] = [decl.variableType, aIndex];
-    const varType = softenImplicitType(vlType(loop.from));
-    const iIndex = _locals.push(toWasmType(varType)) - 1 + (_locals.params ?? 0);
-    currentScope[loop.variable] = [varType, iIndex];
+    // Loop variable local: an existing one (while counter) or a fresh one (range).
+    let varIndex: number;
+    if (varExternal) {
+      const v = lookupName(varName);
+      if (!v || v.index < 0 || v.capture) return null;
+      varIndex = v.index;
+    } else {
+      const varType = softenImplicitType(vlType(fromAst));
+      varIndex = _locals.push(toWasmType(varType)) - 1 + (_locals.params ?? 0);
+      currentScope[varName] = [varType, varIndex];
+    }
 
     const backLocal = newLocal(lt.backing.refType);
     const fromLocal = newLocal(binaryen.i32);
@@ -2432,39 +2544,57 @@ export const toWasm = async (
     const wLocal = newLocal(binaryen.i32);
     const back = () => m.local.get(backLocal, lt.backing.refType);
     const from = () => m.local.get(fromLocal, binaryen.i32);
+    const to = () => m.local.get(toLocal, binaryen.i32);
     const cnt = () => m.local.get(cntLocal, binaryen.i32);
     const w = () => m.local.get(wLocal, binaryen.i32);
     const needed = () => m.i32.add(m.i32.const(seedLen), cnt());
+
+    // count, with a real For loop's semantics for a constant step:
+    //   step>0: from>to ? 0 : (to-from)/step + 1
+    //   step<0: from<to ? 0 : (from-to)/(-step) + 1
+    const countExpr = step > 0
+      ? m.i32.add(
+        m.i32.div_s(m.i32.sub(to(), from()), m.i32.const(step)),
+        m.i32.const(1),
+      )
+      : m.i32.add(
+        m.i32.div_s(m.i32.sub(from(), to()), m.i32.const(-step)),
+        m.i32.const(1),
+      );
+    const emptyCond = step > 0 ? m.i32.gt_s(from(), to()) : m.i32.lt_s(from(), to());
+    // i = from + w*step (constant step).
+    const ithVar = () =>
+      step === 1
+        ? m.i32.add(from(), w())
+        : m.i32.add(from(), m.i32.mul(w(), m.i32.const(step)));
 
     const id = buildLoopId++;
     const loopLabel = `__build_loop_${id}__`;
     const doneLabel = `__build_done_${id}__`;
 
-    return m.block(null, [
-      m.local.set(fromLocal, withDesiredType(i32Type, () => toExpression(loop.from))),
-      m.local.set(toLocal, withDesiredType(i32Type, () => toExpression(loop.to))),
-      // count = max(0, to - from + 1) — an empty (descending) range yields 0.
+    const block: number[] = [
+      m.local.set(fromLocal, withDesiredType(i32Type, () => toExpression(fromAst))),
       m.local.set(
-        cntLocal,
-        m.i32.add(
-          m.i32.sub(m.local.get(toLocal, binaryen.i32), from()),
-          m.i32.const(1),
-        ),
+        toLocal,
+        withDesiredType(i32Type, () => toExpression(toInclAst)),
       ),
-      m.if(
-        m.i32.lt_s(cnt(), m.i32.const(0)),
-        m.local.set(cntLocal, m.i32.const(0)),
-      ),
-      // Pre-size the backing to the exact final length and bind `a` to the list
-      // struct now; the fill writes through the shared backing array.
+      m.local.set(cntLocal, m.select(emptyCond, m.i32.const(0), countExpr)),
       m.local.set(backLocal, m.array.new_default(lt.backing.heapType, needed())),
-      ...seed.map((value, k) =>
-        m.array.set(
+    ];
+    // Copy the literal seed prefix from the original (now-discarded) backing, so the
+    // seed expressions are evaluated exactly once (at the declaration), not again.
+    if (seedLen > 0) {
+      block.push(
+        m.array.copy(
           back(),
-          m.i32.const(k),
-          withDesiredType(element, () => toExpression(value)),
-        )
-      ),
+          m.i32.const(0),
+          listBacking(lt, aRef()),
+          m.i32.const(0),
+          m.i32.const(seedLen),
+        ),
+      );
+    }
+    block.push(
       m.local.set(aIndex, m.struct.new([back(), needed(), needed()], lt.heapType)),
       // Fill loop keyed on `w` in [0, count): the write index `seedLen + w` is
       // provably < the backing's length, so the engine elides the bounds check.
@@ -2474,7 +2604,7 @@ export const toWasm = async (
           loopLabel,
           m.block(null, [
             m.br(doneLabel, m.i32.ge_s(w(), cnt())),
-            m.local.set(iIndex, m.i32.add(from(), w())),
+            m.local.set(varIndex, ithVar()),
             m.array.set(
               back(),
               m.i32.add(m.i32.const(seedLen), w()),
@@ -2485,7 +2615,18 @@ export const toWasm = async (
           ]),
         ),
       ]),
-    ], binaryen.none);
+    );
+    // Restore a while counter to its post-loop value (`from + count*step`); a
+    // for-range variable is loop-scoped, so it needs no fixup.
+    if (varExternal) {
+      block.push(
+        m.local.set(
+          varIndex,
+          m.i32.add(from(), m.i32.mul(cnt(), m.i32.const(step))),
+        ),
+      );
+    }
+    return m.block(null, block, binaryen.none);
   };
 
   // Lower a statement list to wasm expressions. Nested function declarations
@@ -2507,15 +2648,14 @@ export const toWasm = async (
     const out: number[] = [];
     for (let i = 0; i < statements.length; i++) {
       const stmt = statements[i];
-      // Build-loop fusion: a list declaration immediately followed by a build loop
-      // collapses into one pre-sized indexed fill (skips the loop statement). Only
-      // fires when the loop provably reproduces the push build (see
-      // `tryLowerBuildLoop`); otherwise both statements lower normally.
-      if (stmt.type === "VariableDeclaration" && i + 1 < statements.length) {
-        const fused = tryLowerBuildLoop(stmt, statements[i + 1]);
+      // Build-loop fusion: a `for`/`while` that builds a fresh list declared
+      // earlier in this block collapses into one pre-sized indexed fill. Only fires
+      // when the loop provably reproduces the push build (see `tryLowerBuildLoop`);
+      // otherwise it lowers normally.
+      if (stmt.type === "For" || stmt.type === "While") {
+        const fused = tryLowerBuildLoop(statements, i);
         if (fused !== null) {
           out.push(fused);
-          i++; // consume the loop statement too
           continue;
         }
       }

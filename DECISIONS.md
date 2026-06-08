@@ -111,14 +111,20 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   needs it). Removing it also lets build-loop fusion pick any representation
   without an observable contract. (B6)
 - **Build-loop fusion: pre-sized indexed fill, not per-element push.**
-  `const a = [..seed]` immediately followed by `for i in A to B { a.push(e) }`
-  (bare push, step-1 range, `e` not referencing `a`) lowers to one pre-sized
-  backing + an in-range fill loop. A frontier `array.set` at the moving `len`
-  carries a bounds check the engine can't elide (~3.8x a sequential in-range
-  write it can); fusion turns the former into the latter. Sound because the
-  result is bit-identical to the push build and the guards forbid any mid-build
-  observation; anything unproven falls back to push. `while`/stepped-range/
-  `for…in` are out of v1. (B6b)
+  A loop building a fresh local list by one push per iteration — `for i in A to B
+  [step S] { a.push(e) }` or the counter-`while` `while i <cmp> N { a.push(e);
+  i = i ± C }` — lowers to one pre-sized backing + an in-range fill loop. A
+  frontier `array.set` at the moving `len` carries a bounds check the engine
+  can't elide (~3.8x a sequential in-range write it can); fusion turns the former
+  into the latter. A counter-while IS a for-range (`i < N` ⇔ `i ≤ N-1` for
+  integers), so both feed one (from, inclusive-to, const-step) descriptor → one
+  fill core, rather than per-shape matchers. Sound because the result is
+  bit-identical to the push build and the guards forbid any mid-build observation
+  (fresh array-literal local, untouched until the loop; body exactly one push;
+  `e`/bounds free of `a`); anything unproven falls back to push. The list is
+  rebound at the loop (the tiny initial backing is discarded) so the recognizer
+  can sit at the loop and tolerate an intervening counter declaration.
+  Field-target lists, multi-loop builds, and `for…in` are not yet covered. (B6b)
 - **String methods follow JS semantics.** `slice(start, end)` is the half-open
   `[start, end)` range with JS clamping (negative counts from the end, bounds
   clamp to `[0, len]`, `start >= end` → empty); `indexOf("")` returns 0. Chosen
