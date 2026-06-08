@@ -37,6 +37,8 @@ import {
   checkDocument,
   crossFileReferences,
   type CrossFileSource,
+  detectProjectRoot,
+  enumerateWorkspaceFiles,
   importedNameSource,
   importedNameSources,
   makeWorkspaceReader,
@@ -308,11 +310,12 @@ connection.onDefinition(async (params): Promise<Location | null> => {
 
 // Find-references: every occurrence (declaration + uses) of the binding under
 // the cursor. For a CROSS-MODULE symbol (a name that is imported here, or an
-// exported local declaration), references are gathered across the current file
-// plus every OTHER OPEN document via the module graph (H0 phase 3). The search
-// is scoped to OPEN documents — see `crossFileReferences`' scope note + ROADMAP;
-// a reference in an unopened on-disk sibling is not reported. A purely-local
-// (non-exported, non-imported) symbol falls back to the single-file path below.
+// exported local declaration), references are gathered across the current file,
+// every OTHER OPEN document, AND every `.vl` file on disk under the project root
+// that is not already open (the on-disk sibling crawl — H0 phase 3 complete).
+// The crawl is scoped and capped: see `crossFileReferences` + ROADMAP for the
+// root-detection strategy, the MAX_DISK_FILES cap, and the excluded dirs. A
+// purely-local (non-exported, non-imported) symbol falls back to single-file.
 connection.onReferences(async (params): Promise<Location[] | null> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return null;
@@ -330,13 +333,24 @@ connection.onReferences(async (params): Promise<Location[] | null> => {
       uri: d.uri,
       text: d.getText(),
     }));
+
+    // Determine the project root for the on-disk crawl. Prefer the LSP workspace
+    // folder root (set during `onInitialize`); fall back to detecting it by
+    // walking up from the current file's path.
+    const entryKey = entryKeyOf(params.textDocument.uri);
+    const crawlRoot = workspaceFolder
+      ? uriToPath(workspaceFolder)
+      : detectProjectRoot(entryKey);
+    const diskFiles = enumerateWorkspaceFiles(crawlRoot);
+
     const crossRefs = await crossFileReferences(
       word,
       text,
-      entryKeyOf(params.textDocument.uri),
+      entryKey,
       openDocs,
       workspaceReader,
       includeDeclaration,
+      diskFiles,
     );
     // A defined (possibly empty) result means the symbol is cross-module: use it.
     // `undefined` means a purely-local symbol → fall through to single-file.

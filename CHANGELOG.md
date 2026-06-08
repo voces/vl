@@ -16,7 +16,7 @@ see **`DECISIONS.md`**.
 - **A6b Proof-carrying narrowing (degenerate)** — a body that is exactly `return <predicate-on-a-param>` is an inferred guard; guard-clause `if absent(v) { return }` supported.
 - **A7 Real `string` type (core)** — proper Object (`{[i32]: i32}` index sig → i32-array of char codes), `.length`/`s[i]`/`+`/`==`/`slice`/`indexOf`/`includes`/`charCodeAt`.
 - **A10 Parametric types / generics** — Stage 1 (function type params), Stage 2 (array element inference), Stage 3 (generic `type` aliases incl. nested/array); `map`/`filter` build-side generics over growable `T[]`. (`tests/cases/generics/`)
-- **A11 Recursive structural types** — `type Tree = { value, left: Tree | null, … }` constructs/traverses/compiles (cycle-safe traversals + self-referential WasmGC rec-group). Mutual recursion across *separate* `type` decls (`type A = { b: B | null }` ↔ `type B = { a: A | null }`) now resolves: a top-level type-name pre-pass hoists every `type` name before any body is parsed, so a forward/mutual reference stays a lazy `Alias` leaf and both aliases tie into one rec-group. (`tests/cases/types/mutual-recursive-type.vl`)
+- **A11 Recursive structural types** — `type Tree = { value, left: Tree | null, … }` constructs/traverses/compiles (cycle-safe traversals + self-referential WasmGC rec-group).
 - **A12 Soundness corpus (started)** — must-error/must-not-error corpus under `tests/cases/soundness/`; strict by default; known-unsound corners `xfail`-marked.
 - **A13 Operator-constraint inference (core)** — fully-inferred structural functions monomorphize per call shape (i32 & f64 from two call sites).
 - **A14 Named/opaque type crash fix** — bodyless-`type Point` infinite-recursion crash fixed (cycle-guarded `getConcreteType`; now errors cleanly). → `DECISIONS.md`
@@ -38,7 +38,6 @@ see **`DECISIONS.md`**.
 - **B6b Build-loop fusion** — a loop building a fresh local list by one push per iteration — `for i in A to B [step S] { a.push(e) }` or the counter-`while` `while i <cmp> N { a.push(e); i = i ± C }` — lowers to a pre-sized indexed fill, ~3–4× faster than per-element push (elides the frontier bounds-check the engine can't); unified recognizer → one fill core, guard-gated, falls back to push otherwise. (`tests/cases/lists/build-fusion-*`; → `DECISIONS.md`)
 - **B6a `Map` + `Set` (core)** — ordered open-addressing hash maps (Python-dict shape) over WasmGC; string keys; `Map[k]: V|null`; `.size`/`.get`/`.has`/`.set`/`.delete`/`.keys()`/`.values()`; `Set` `.add`/`.has`/`.delete`; deterministic insertion-order iteration; tombstone-aware probing + compaction. (`compiler/builtins/maps.ts`)
 - **B7 Strings (core)** — WasmGC i32-array of code points; literal, `.length`/`s[i]`, `+`, `==`/`!=`, `print`.
-- **B7b String-accumulation fusion** — `let s = ""` built purely by `s = s + e` appends in a loop (incl. conditional / multi-piece `+`-chains, e.g. a serializer) lowers to a growable char buffer materialized once — O(n²)→O(n) (~55–70× on a 4k-element serializer / 10k-concat), idiom unchanged, no string-representation change (the in-place/builder optimization of `docs/strings-design.md` §Mutability + OQ-A perf half). Guard-gated, falls back to per-append concat otherwise. (`tests/cases/strings/accum-*`; → `DECISIONS.md`)
 - **B8 Loops (core)** — `for…in` over arrays, direction-aware `step`, single-line block bodies, empty-range warning.
 - **B9 `break` / `continue` in codegen** (incl. labelled `break outer`).
 - **B10 Unary / prefix / postfix ops** — `-`, `++`/`--`, `!`. → `DECISIONS.md` for `!`-not-`not`.
@@ -50,7 +49,6 @@ see **`DECISIONS.md`**.
 - **B17 Export-aware top-level unused** — exported top-level bindings exempt from unused-variable lint; landed with `export` keyword (H0 phase 1).
 - **B19 `return` / early returns** — early, from loops, fall-through; bare `return` yields null.
 - **B-debug Name section + source maps + trap-to-source** — wasm name section + Source Map v3 (binaryen debug locations, survives `optimize()`); trap → precise VL `file:L:C` error message. (#76)
-- **B regression guard — unused-param inline call** — pinned `print(ignore(42))` (callee's parameter never read): the TS host (`toWasm.ts`) passes a null env + the plain argument and the module validates; argument is NOT mis-boxed into a closure-env struct. (`tests/cases/functions/unused-param-inline-call.vl`)
 
 ## CLI (Track C)
 
@@ -77,6 +75,7 @@ see **`DECISIONS.md`**.
 - **D7 Doc-comment cross-references (single-file)** — `` [`Name`] `` / `[Name]` rustdoc-style intra-doc links in `///` comments resolve via D2's symbol table and render as clickable markdown links in hover and completion `documentation`; unresolved names left verbatim; cross-import resolution deferred (needs H0 phase 3 module graph).
 - **Module-aware diagnostics (H0 phase 3)** — the open file is analyzed as the entry module through a workspace `ModuleReader` (open buffers + disk, `lsp/src/moduleGraph.ts`): `import`ed names resolve to their real types instead of flagging "undeclared", and genuine import errors (bad path / not-exported / cycle) surface on the import line; hover/completion seed the same imported-name types; no-import files unchanged.
 - **Cross-file navigation (H0 phase 3)** — go-to-definition and doc-comment `` [`Name`] `` xrefs on an imported name jump to the EXPORTING sibling module's declaration (`lsp/src/moduleGraph.ts` resolves an imported local name → exporting module + the export's decl span via the symbol table); find-references gathers a symbol's occurrences across the current file + other OPEN documents (graph-seeded so importer uses are recorded); single-file go-to-def/refs/doc-xref unchanged; refs over unopened on-disk siblings deferred.
+- **Find-references: unopened on-disk sibling modules (H0 phase 3)** — find-references now crawls `.vl` files on disk that are not open in the editor: project root is detected from the LSP workspace folder or by walking up to the nearest `deno.json`/`package.json`/`.git` ancestor (max 6 levels); `.git`, `node_modules`, `dist`, `.claude`, `reference` dirs are skipped; at most 500 files per request; open-buffer text wins over disk; on-disk results are deduplicated against already-found open-doc refs by URI.
 
 ## Browser playground (Track E)
 
