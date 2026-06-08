@@ -526,3 +526,85 @@ Deno.test("trailing comment on a bare-body `for-in` header stays on that line (D
   assertEquals(format(out), out, "for-in bare-body trailing comment not idempotent");
   assertEquals(astShape(out), astShape(src), "for-in bare-body trailing comment changed AST");
 });
+
+// --- trailing comment on the closing `}` of block-body constructs (D4) ------
+//
+// A trailing comment written on the same source line as a closing `}` — e.g.
+// `while x < 10 { … } // done` or `function f() { … } // end of f` — must
+// remain on the closing-brace line in the formatted output.  The bug: the
+// formatter was calling `this.line(indent, "}")` unconditionally without
+// consuming the trailing comment, so the comment was left in the pending queue
+// and later flushed as an own-line comment before the next statement (displacing
+// it from its source position and breaking idempotency on the `if` case).
+
+Deno.test("trailing comment on the closing `}` of an `if` block stays on that line (D4)", () => {
+  // `} // end if` must stay on the closing-brace line, not become an own-line
+  // comment before the following statement.  This was also NOT idempotent: the
+  // displaced comment was on the next statement's leading line, causing a second
+  // format pass to move it again.
+  const src =
+    "function f() {\n  let x = 0\n  if x > 0 {\n    x = 1\n  } // end if\n  return x\n}\n";
+  const out = format(src);
+  assert(
+    out.includes("} // end if"),
+    `trailing comment on if closing brace was displaced:\n${out}`,
+  );
+  assert(
+    !out.includes("}\n  // end if"),
+    `trailing comment moved to own line before return:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `formatted output has syntax errors:\n${out}`);
+  assertEquals(format(out), out, "if closing-brace trailing comment not idempotent");
+  assertEquals(astShape(out), astShape(src), "if closing-brace trailing comment changed AST");
+});
+
+Deno.test("trailing comment on the closing `}` of a `while` block stays on that line (D4)", () => {
+  const src =
+    "function f() {\n  let x = 0\n  while x < 10 {\n    x = x + 1\n  } // done looping\n  return x\n}\n";
+  const out = format(src);
+  assert(
+    out.includes("} // done looping"),
+    `trailing comment on while closing brace was displaced:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `formatted output has syntax errors:\n${out}`);
+  assertEquals(format(out), out, "while closing-brace trailing comment not idempotent");
+  assertEquals(astShape(out), astShape(src), "while closing-brace trailing comment changed AST");
+});
+
+Deno.test("trailing comment on the closing `}` of a `for` block stays on that line (D4)", () => {
+  const src =
+    "function f() {\n  let sum = 0\n  for i in 0 to 10 {\n    sum = sum + i\n  } // done summing\n  return sum\n}\n";
+  const out = format(src);
+  assert(
+    out.includes("} // done summing"),
+    `trailing comment on for closing brace was displaced:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `formatted output has syntax errors:\n${out}`);
+  assertEquals(format(out), out, "for closing-brace trailing comment not idempotent");
+  assertEquals(astShape(out), astShape(src), "for closing-brace trailing comment changed AST");
+});
+
+Deno.test("trailing comment on the closing `}` of a `for-in` block stays on that line (D4)", () => {
+  const src =
+    "function f() {\n  const xs = [1, 2, 3]\n  let sum = 0\n  for x in xs {\n    sum = sum + x\n  } // done for-in\n  return sum\n}\n";
+  const out = format(src);
+  assert(
+    out.includes("} // done for-in"),
+    `trailing comment on for-in closing brace was displaced:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `formatted output has syntax errors:\n${out}`);
+  assertEquals(format(out), out, "for-in closing-brace trailing comment not idempotent");
+  assertEquals(astShape(out), astShape(src), "for-in closing-brace trailing comment changed AST");
+});
+
+Deno.test("trailing comment on the closing `}` of a function block stays on that line (D4)", () => {
+  const src = "function f() {\n  return 1\n} // end of f\n";
+  const out = format(src);
+  assert(
+    out.includes("} // end of f"),
+    `trailing comment on function closing brace was displaced:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `formatted output has syntax errors:\n${out}`);
+  assertEquals(format(out), out, "function closing-brace trailing comment not idempotent");
+  assertEquals(astShape(out), astShape(src), "function closing-brace trailing comment changed AST");
+});

@@ -447,7 +447,7 @@ class Printer {
     // A free-standing block `{ … }`.
     this.line(indent, node.label ? `${node.label}: {` : "{");
     this.emitStatements(node.statements, indent + 1);
-    this.line(indent, "}");
+    this.closingBrace(indent, this.span(node)?.stop.line);
   }
 
   /**
@@ -519,6 +519,18 @@ class Printer {
     this.emitStatements(stmt.statements, indent + 1);
   }
 
+  /**
+   * Emit a closing `}` at `indent`, consuming any trailing comment that the
+   * source wrote on the same line as the closing brace (e.g. `} // done`).
+   * `stopLine` is the 1-based source line where the closing `}` appears
+   * (typically `this.span(block)?.stop.line`); when 0 or absent no comment
+   * look-up is attempted.
+   */
+  private closingBrace(indent: number, stopLine = 0): void {
+    const trailer = stopLine ? this.trailingOn(stopLine) : undefined;
+    this.line(indent, `}${trailer ? ` ${trailer.text}` : ""}`);
+  }
+
   // A loop / `if` body is rendered either as a brace block (when the source
   // wrote one) or as an indented bare statement on the following line (the
   // block-less form) — preserving the AST shape exactly (a brace block parses
@@ -530,7 +542,7 @@ class Printer {
     if (this.isBlock(node.statement)) {
       this.line(indent, `${label}while ${cond} {`);
       this.emitBlockBody(node.statement, indent);
-      this.line(indent, "}");
+      this.closingBrace(indent, this.span(node.statement)?.stop.line);
     } else {
       // Consume any trailing comment on the header line so it stays attached
       // to the `while …` line rather than being displaced to after the enclosing
@@ -573,7 +585,7 @@ class Printer {
     if (this.isBlock(body)) {
       this.line(indent, `${head} {`);
       this.emitBlockBody(body, indent);
-      this.line(indent, "}");
+      this.closingBrace(indent, this.span(body)?.stop.line);
     } else {
       // Consume any trailing comment on the header line so it stays attached
       // to the loop-header line rather than being displaced to after the
@@ -620,7 +632,8 @@ class Printer {
         this.line(indent, "} else {");
         this.emitBlockBody(node.else as VLBlockNode, indent);
       }
-      this.line(indent, "}");
+      const closeLine = this.span(node)?.stop.line;
+      this.closingBrace(indent, closeLine);
       return;
     }
     // Inline form: each conditional `if/elseif cond then <stmt>`, branches that
@@ -631,7 +644,7 @@ class Printer {
       if (this.isBlock(c.statement)) {
         this.line(indent, `${kw} ${cond} {`);
         this.emitBlockBody(c.statement, indent);
-        this.line(indent, "}");
+        this.closingBrace(indent, this.span(c.statement)?.stop.line);
       } else {
         const body = this.statementInline(c.statement, indent);
         this.line(indent, `${kw} ${cond} then ${body}`);
@@ -641,7 +654,7 @@ class Printer {
       if (this.isBlock(node.else)) {
         this.line(indent, "else {");
         this.emitBlockBody(node.else, indent);
-        this.line(indent, "}");
+        this.closingBrace(indent, this.span(node.else)?.stop.line);
       } else {
         this.line(indent, `else ${this.statementInline(node.else, indent)}`);
       }
@@ -748,7 +761,7 @@ class Printer {
       } else {
         this.line(indent, `${h} {`);
         this.emitBlockBody(cl.body, indent);
-        this.line(indent, "}");
+        this.closingBrace(indent, this.span(cl.body)?.stop.line);
       }
     });
     return true;
@@ -823,7 +836,7 @@ class Printer {
       }
       this.line(indent, `${header} {`);
       this.emitStatements(body.statements, indent + 1);
-      this.line(indent, "}");
+      this.closingBrace(indent, this.span(body)?.stop.line);
     } else {
       // Single-expression / single-statement body.
       const rendered = this.statementInline(body, indent);
