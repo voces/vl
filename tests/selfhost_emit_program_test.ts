@@ -3554,6 +3554,41 @@ const CASES: Case[] = [
       if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
     },
   },
+  {
+    // The scope-chain keystone: an ARRAY whose element is a Map (`{[string]:i32}[]`).
+    // Push two fresh maps, length reflects the pushes.
+    name: "scope-chain: {[string]:i32}[] empty, push two Map()s, .length => 2",
+    src: [
+      "function main(): i32 {",
+      "  let scopes: {[string]: i32}[] = []",
+      "  scopes.push(Map())",
+      "  scopes.push(Map())",
+      "  return scopes.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 2) throw new Error(`main() returned ${got}, expected 2`);
+    },
+  },
+  {
+    // Index an element (a Map ref), set a key in it, read it back with `?? d`.
+    name: "scope-chain: index a pushed map, set + get a key => 7",
+    src: [
+      "function main(): i32 {",
+      "  let scopes: {[string]: i32}[] = []",
+      "  scopes.push(Map())",
+      '  scopes[0]["x"] = 7',
+      '  return scopes[0]["x"] ?? -1',
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the

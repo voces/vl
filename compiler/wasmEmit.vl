@@ -4750,19 +4750,26 @@ function emitModule(stmts: i32[]): i32 {
   // `rlBackIdx`/`rlWrapIdx` are the assigned heap indices. The legacy singletons
   // `raTypeIdx`/`rlTypeIdx` alias SLOT 0 for any not-yet-migrated site.
   let refPairBase = preTypes + arrayOffset + listOffset
+  // The map struct heap index is needed BELOW to resolve a map-array ref-list element
+  // (kind 3) — and `mStructIdx` itself lands AFTER the ref pairs. It is computable up
+  // front: `mStructIdx = preMap + 2` where `preMap = refPairBase + refPairsTotal`.
+  let refPairsTotal = rlElemName.length * 2
+  let mStructIdxPre = refPairBase + refPairsTotal + 2
   let rs = 0
   while rs < rlElemName.length {
     rlBackIdx[rs] = refPairBase + rs * 2
     rlWrapIdx[rs] = refPairBase + rs * 2 + 1
     if rlElemKindTbl[rs] == 2 {
       rlElemHeap[rs] = uBoxIdx
+    } else if rlElemKindTbl[rs] == 3 {
+      // A map-struct element (`{[string]:i32}[]`): the backing holds `(ref null $mStructIdx)`.
+      rlElemHeap[rs] = mStructIdxPre
     } else {
       let esi = structIndexByName(rlElemName[rs])
       if esi >= 0 { rlElemHeap[rs] = sHeapIdx[esi] } else { rlElemHeap[rs] = 0 }
     }
     rs = rs + 1
   }
-  let refPairsTotal = rlElemName.length * 2
   if rlElemName.length >= 1 {
     raTypeIdx = rlBackIdx[0]
     rlTypeIdx = rlWrapIdx[0]
@@ -5090,12 +5097,25 @@ function nameIsMap(name: string): boolean {
   true
 }
 
+// True if the array type-name `name` is a string-keyed-MAP list `{[string]:i32}[]` —
+// a ref list whose ELEMENT is the map struct (`mStructIdx`). It is a `nameIsMap` name
+// with a trailing `[]`. The scope chain (`typecheck.vl`'s `scopes: {[string]:i32}[]`)
+// is exactly this. Routed through the ref-list machinery as element-kind `3`.
+function nameIsMapArray(name: string): boolean {
+  let n = name.length
+  if n < 2 { return false }
+  if name[n - 2] != '[' { return false }
+  if name[n - 1] != ']' { return false }
+  // The bare element (without the trailing `[]`) must be a map name.
+  nameIsMap(name.slice(0, n - 2))
+}
+
 // True if the array type-name `name` is a REF-element list — `S[]` over a declared
-// struct, or `N[]` over the declared union alias (the box-ref element). Either lowers
-// to the `{ backing: (ref $raTypeIdx), len, cap }` wrapper over a `(ref null $elem)`
-// backing (G7-ref). A non-`[]` name or an `i32[]` is NOT a ref array. The element name
-// is recovered by checking each declared struct/union name + `"[]"` (a `string +
-// string` concat; a `string + i32` would be a type error).
+// struct, `N[]` over the declared union alias (the box-ref element), or `{[string]:i32}[]`
+// (a map-struct element). Either lowers to the `{ backing: (ref $raTypeIdx), len, cap }`
+// wrapper over a `(ref null $elem)` backing (G7-ref). A non-`[]` name or an `i32[]` is
+// NOT a ref array. The element name is recovered by checking each declared struct/union
+// name + `"[]"` (a `string + string` concat; a `string + i32` would be a type error).
 function nameIsRefArray(name: string): boolean {
   let i = 0
   while i < sNames.length {
@@ -5107,12 +5127,15 @@ function nameIsRefArray(name: string): boolean {
     if name == unNames[u] + "[]" { return true }
     u = u + 1
   }
+  if nameIsMapArray(name) { return true }
   false
 }
 
 // The ref-element kind for an array type-name (assumes `nameIsRefArray(name)`):
-// `1` = a struct element, `2` = a union-box element (`uBoxIdx`).
+// `1` = a struct element, `2` = a union-box element (`uBoxIdx`), `3` = a map-struct
+// element (`mStructIdx`, the scope-chain `{[string]:i32}[]`).
 function refArrElemKind(name: string): i32 {
+  if nameIsMapArray(name) { return 3 }
   let u = 0
   while u < unNames.length {
     if name == unNames[u] + "[]" { return 2 }
@@ -5252,10 +5275,17 @@ function collectA(stmts: i32[]): i32 {
         aUsed = true
       } else if nameIsRefArray(nd.tyName) {
         // A `S[]`/`N[]` annotation is a ref list (wrapper + `(ref null $elem)` backing).
+        // A `{[string]:i32}[]` (map-array) ALSO forces the map struct + its keys/vals
+        // list types (the element is `(ref $mStructIdx)`).
         rlUsed = true
         raUsed = true
         rElemKind = refArrElemKind(nd.tyName)
         rlInternName(refArrElemName(nd.tyName), refArrElemKind(nd.tyName))
+        if nameIsMapArray(nd.tyName) {
+          mUsed = true
+          lUsed = true
+          aUsed = true
+        }
       } else if nameIsArray(nd.tyName) {
         if checkArrName(nd.tyName) < 0 { return 0 - 1 }
         // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
@@ -5344,6 +5374,7 @@ function arrLitElemName(arrIx: i32): string {
 // element is `name` with the trailing `"[]"` removed — i.e. the struct / union alias
 // name. Mirrors `refArrElemKind` but yields the table key.
 function refArrElemName(name: string): string {
+  if nameIsMapArray(name) { return name.slice(0, name.length - 2) }
   let u = 0
   while u < unNames.length {
     if name == unNames[u] + "[]" { return unNames[u] }
@@ -6337,7 +6368,13 @@ function letAnnRefListKind(letIx: i32): i32 {
     if d.letType >= 0 {
       let lt = P.nodes[d.letType]
       if lt is TypeRef {
-        if nameIsRefArray(lt.tyName) { return refArrElemKind(lt.tyName) }
+        // `pendingListKind` semantics: 1 = struct/MAP ref list (use `pendingListSlot`),
+        // 2 = union box ref list, 3 = string list. A map-array (`refArrElemKind` 3) is a
+        // ref list disambiguated by its slot, so it threads kind 1 (NOT the string-3).
+        if nameIsRefArray(lt.tyName) {
+          if refArrElemKind(lt.tyName) == 2 { return 2 }
+          return 1
+        }
         if nameIsStringArray(lt.tyName) { return 3 }
       }
     }
