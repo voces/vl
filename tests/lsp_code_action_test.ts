@@ -18,6 +18,7 @@ import {
   prefixWithUnderscoreFix,
   quickFixesForDiagnostic,
   removeBindingFix,
+  removeImportFix,
 } from "../lsp/src/codeActions.ts";
 
 const assert = (cond: boolean, msg: string): void => {
@@ -103,6 +104,104 @@ Deno.test("removeBindingFix on the last line deletes its content", () => {
   assert(
     applyEdit(src, fix!.edits[0]) === "let a = 1\n",
     `applied: ${JSON.stringify(applyEdit(src, fix!.edits[0]))}`,
+  );
+});
+
+// --- removeImportFix: unused import (remove specifier / whole line) ----------
+
+Deno.test("removeImportFix deletes the whole line for a sole specifier", () => {
+  // `import { add } from "./util"` — `add` at cols 9..12; it is the only
+  // specifier, so the entire import line (and its trailing newline) is removed.
+  const src = 'import { add } from "./util"\nprint(1)\n';
+  const fix = removeImportFix(src, rangeOf(0, 9, 12));
+  assert(fix !== null, "fix produced");
+  assert(fix!.title === "Remove unused import", `title: ${fix!.title}`);
+  assert(fix!.isPreferred !== true, "remove-import is not preferred (destructive)");
+  assert(
+    applyEdit(src, fix!.edits[0]) === "print(1)\n",
+    `applied: ${JSON.stringify(applyEdit(src, fix!.edits[0]))}`,
+  );
+});
+
+Deno.test("removeImportFix on the file's last line deletes its content", () => {
+  const src = 'print(1)\nimport { add } from "./util"';
+  const fix = removeImportFix(src, rangeOf(1, 9, 12));
+  assert(fix !== null, "fix produced");
+  assert(
+    applyEdit(src, fix!.edits[0]) === "print(1)\n",
+    `applied: ${JSON.stringify(applyEdit(src, fix!.edits[0]))}`,
+  );
+});
+
+Deno.test("removeImportFix removes the FIRST of two specifiers", () => {
+  // `import { a, b } from "./x"` — remove `a` (cols 9..10) → `{ b }`.
+  const src = 'import { a, b } from "./x"\n';
+  const fix = removeImportFix(src, rangeOf(0, 9, 10));
+  assert(fix !== null, "fix produced");
+  assert(
+    applyEdit(src, fix!.edits[0]) === 'import { b } from "./x"\n',
+    `applied: ${JSON.stringify(applyEdit(src, fix!.edits[0]))}`,
+  );
+});
+
+Deno.test("removeImportFix removes the LAST of two specifiers", () => {
+  // `import { a, b } from "./x"` — remove `b` (cols 12..13) → `{ a }`.
+  const src = 'import { a, b } from "./x"\n';
+  const fix = removeImportFix(src, rangeOf(0, 12, 13));
+  assert(fix !== null, "fix produced");
+  assert(
+    applyEdit(src, fix!.edits[0]) === 'import { a } from "./x"\n',
+    `applied: ${JSON.stringify(applyEdit(src, fix!.edits[0]))}`,
+  );
+});
+
+Deno.test("removeImportFix removes a MIDDLE specifier (no dangling comma)", () => {
+  // `import { a, b, c } from "./x"` — remove `b` (cols 12..13) → `{ a, c }`.
+  const src = 'import { a, b, c } from "./x"\n';
+  const fix = removeImportFix(src, rangeOf(0, 12, 13));
+  assert(fix !== null, "fix produced");
+  assert(
+    applyEdit(src, fix!.edits[0]) === 'import { a, c } from "./x"\n',
+    `applied: ${JSON.stringify(applyEdit(src, fix!.edits[0]))}`,
+  );
+});
+
+Deno.test("removeImportFix removes the whole `x as y` alias specifier", () => {
+  // `import { add as fn } from "./util"` — `fn` at cols 16..18; the only
+  // specifier, so the whole line goes (and the `add as ` prefix with it).
+  const src = 'import { add as fn } from "./util"\n';
+  const fix = removeImportFix(src, rangeOf(0, 16, 18));
+  assert(fix !== null, "fix produced");
+  assert(
+    applyEdit(src, fix!.edits[0]) === "",
+    `applied: ${JSON.stringify(applyEdit(src, fix!.edits[0]))}`,
+  );
+});
+
+Deno.test("removeImportFix removes an alias specifier among others", () => {
+  // `import { a, x as y } from "./m"` — remove the alias `y` (cols 14..15) →
+  // `{ a }`; the entire `x as y` specifier (cols 11..18) is dropped.
+  const src = 'import { a, x as y } from "./m"\n';
+  const fix = removeImportFix(src, rangeOf(0, 17, 18));
+  assert(fix !== null, "fix produced");
+  assert(
+    applyEdit(src, fix!.edits[0]) === 'import { a } from "./m"\n',
+    `applied: ${JSON.stringify(applyEdit(src, fix!.edits[0]))}`,
+  );
+});
+
+Deno.test("unused-import dispatches ONLY the remove-import fix (no `_`-prefix)", () => {
+  const src = 'import { a } from "./x"\n';
+  const fixes = quickFixesForDiagnostic(src, "unused-import", rangeOf(0, 9, 10));
+  assert(fixes.length === 1, `expected exactly one import fix, got ${fixes.length}`);
+  assert(
+    fixes[0].title === "Remove unused import",
+    `unexpected fix title: ${fixes[0].title}`,
+  );
+  // Crucially: no `_`-prefix fix is offered for an import.
+  assert(
+    !fixes.some((f) => f.title === "Prefix with `_`"),
+    "an unused import must NOT offer a `_`-prefix fix",
   );
 });
 

@@ -2984,18 +2984,25 @@ export const parseProgram = (
     expect("LBRACE");
     skipNewlines();
     const specifiers: { name: string; local: string }[] = [];
+    // Parallel map: local name → the span of the LOCAL identifier token (either
+    // `nameTok` for `{ a }` or the `as`-target token for `{ x as y }`). Used
+    // below to point the unused-variable lint at the imported NAME, not `import`.
+    const localSpans = new Map<string, Context>();
     if (!at("RBRACE")) {
       for (;;) {
         skipNewlines();
         if (at("RBRACE")) break;
         const nameTok = expect("ID");
         let local = nameTok.text;
+        let localTok = nameTok;
         if (atSoft("as")) {
           next();
           skipNewlines();
-          local = expect("ID").text;
+          localTok = expect("ID");
+          local = localTok.text;
         }
         specifiers.push({ name: nameTok.text, local });
+        localSpans.set(local, spanOf(localTok));
         skipNewlines();
         if (at("COMMA")) {
           next();
@@ -3036,13 +3043,20 @@ export const parseProgram = (
     // with imports is meaningful only through the resolver).
     for (const s of specifiers) {
       if (s.local in program.scope) {
-        declareBinding(
+        // Use the local-identifier span so the unused-variable lint squiggle lands
+        // on the imported NAME (e.g. `a` or `y` in `{ x as y }`), not `import`.
+        const declSpan = localSpans.get(s.local) ?? spanOf(kw);
+        const binding = declareBinding(
           program.scope,
           s.local,
           program.scope[s.local].type === "Type" ? "type" : "variable",
-          spanOf(kw),
+          declSpan,
           program.scope[s.local],
         );
+        // Mark the binding as import-origin so the unused-variable lint emits the
+        // import-specific "remove it" message + `unused-import` code (no `_`-prefix
+        // suggestion — prefixing an import would require aliasing, not a bare `_`).
+        binding.isImport = true;
       }
     }
     (program.moduleImports ??= []).push(node);

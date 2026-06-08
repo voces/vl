@@ -15,6 +15,9 @@
 //      name (`_x`) is the language's "intentionally unused" convention: it is
 //      NOT warned but emits a `hint` (greyed/faded, no squiggle, not counted as
 //      a warning), mirroring Go / Rust / TS `noUnusedLocals` underscore norms.
+//      An unused IMPORT binding is reported separately (code `unused-import`,
+//      "remove it" message) — there is no `_`-prefix suppression for an import,
+//      so its quick-fix removes the specifier (or the whole `import` line).
 //   2. Unreachable code — any statement that follows a statement which always
 //      diverges (`return` / `break` / `continue`, or an `if/else` where BOTH the
 //      then- and else-branch diverge) within the same block.
@@ -128,6 +131,26 @@ const unusedBindings = (
     // An `export`ed top-level binding is public surface, not dead code — exempt
     // it even if nothing in its own module reads it (module system, phase 1).
     if (b.exported) continue;
+
+    // An unused IMPORT binding is its own case. Unlike a local/parameter there is
+    // no meaningful `_`-prefix suppression — prefixing the local would have to go
+    // through aliasing (`{ x as _x }`), which a bare `_`-insert does not do — so
+    // we do NOT offer the underscore option. The actionable fix is to remove the
+    // specifier (and the whole `import` line when it was the only one). Emitted
+    // under the distinct `unused-import` code so the quick-fix (LSP) dispatches to
+    // the remove-import edit instead of the prefix/remove-binding pair.
+    if (b.isImport) {
+      reported.add(b);
+      out.push({
+        message: `Unused import \`${b.name}\` (remove it)`,
+        severity: "warning",
+        range: rangeFromCtx(b.decl),
+        code: "unused-import",
+        source: "vital",
+        tags: ["unnecessary"],
+      });
+      continue;
+    }
 
     const noun = b.kind === "parameter" ? "parameter" : "variable";
 
