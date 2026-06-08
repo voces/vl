@@ -2918,6 +2918,43 @@ const CASES: Case[] = [
     },
   },
   {
+    // `typecheck.vl`'s `tyToStr`/`assignable` shape: BIND a narrowed union-variant's
+    // ARRAY field to a LOCAL first (`let ftys = t.objFieldTypes`), THEN read
+    // `.length`/index off that local. `collectLocals` runs as a pre-pass OUTSIDE the
+    // narrowing context, so it could not see the variant field's array type and
+    // mis-classified the local as a scalar i32 — `ftys.length` then fell through to
+    // the struct-field path and failed ("field access but no struct type declared").
+    // `collectLocalsIf` now narrows across the then-branch (mirroring `emitStmt`), so
+    // both the `i32[]` and `string[]` variant-field binds type as array locals.
+    name:
+      "G5: bind a narrowed union-variant's `i32[]`/`string[]` field to a local, read it => 12",
+    src: [
+      "type TyObj = { objFieldNames: string[], objFieldTypes: i32[] }",
+      "type TyPrim = { primName: string }",
+      "type Ty = TyObj | TyPrim",
+      "function f(t: Ty): i32 {",
+      "  if t is TyObj {",
+      "    let names = t.objFieldNames",
+      "    let ftys = t.objFieldTypes",
+      "    return names.length + ftys.length + ftys[0]",
+      "  }",
+      "  return 0",
+      "}",
+      "function mk(): Ty {",
+      '  return { objFieldNames: ["a"], objFieldTypes: [9, 2] }',
+      "}",
+      "function main(): i32 {",
+      "  return f(mk())",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // names.length 1 + ftys.length 2 + ftys[0] 9 = 12.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
+    },
+  },
+  {
     // A `string[]` field ALONGSIDE a map in the same program: both want the string-ref
     // list types (keys backing + wrapper) — they SHARE `mkArrIdx`/`mkListIdx` (the map
     // struct adds one more type), so the type-section offsets must stay consistent.
@@ -3377,6 +3414,144 @@ const CASES: Case[] = [
       // a.pos(0) + b.pos(1) + nodes.length(1) + diags.length(1) = 3.
       const got = await runExport(bytesFromLog(logs), "main");
       if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
+  {
+    // KEYSTONE (multi-union): TWO distinct union types declared in one program —
+    // `Node` (Lit|Var) and `Ty` (TyInt|TyStr). Construct a value of EACH union, box it,
+    // and narrow it back with `is`, reading a variant field of each. Mirrors `ast.vl`'s
+    // `Node` coexisting with `typecheck.vl`'s `Ty`. Proves the per-union table accepts a
+    // 2nd union and the shared box + globally-unique tags discriminate both.
+    name:
+      "multi-union: TWO unions construct + narrow + variant-field-read each => 7",
+    src: [
+      "type Lit = { val: i32 }",
+      "type Var = { vname: string }",
+      "type Node = Lit | Var",
+      "type TyInt = { width: i32 }",
+      "type TyStr = { len: i32 }",
+      "type Ty = TyInt | TyStr",
+      "function nodeVal(): i32 {",
+      "  let n: Node = { val: 3 }",
+      "  if n is Lit { return n.val }",
+      "  return 0",
+      "}",
+      "function tyVal(): i32 {",
+      "  let t: Ty = { width: 4 }",
+      "  if t is TyInt { return t.width }",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  return nodeVal() + tyVal()",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // nodeVal()=3 (Lit.val) + tyVal()=4 (TyInt.width) → 7.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    // The OTHER variant of each union — narrow to the 2nd variant of `Node` (Var) and the
+    // 2nd of `Ty` (TyStr), reading their distinct fields. Confirms each union's full
+    // variant set is reachable, not just the first variant.
+    name:
+      "multi-union: narrow to the SECOND variant of each of two unions => 11",
+    src: [
+      "type Lit = { val: i32 }",
+      "type Var = { tag: i32 }",
+      "type Node = Lit | Var",
+      "type TyInt = { width: i32 }",
+      "type TyStr = { len: i32 }",
+      "type Ty = TyInt | TyStr",
+      "function nodeTag(): i32 {",
+      "  let n: Node = { tag: 5 }",
+      "  if n is Var { return n.tag }",
+      "  return 0",
+      "}",
+      "function tyLen(): i32 {",
+      "  let t: Ty = { len: 6 }",
+      "  if t is TyStr { return t.len }",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  return nodeTag() + tyLen()",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // nodeTag()=5 (Var.tag) + tyLen()=6 (TyStr.len) → 11.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 11) throw new Error(`main() returned ${got}, expected 11`);
+    },
+  },
+  {
+    // A union-typed PARAM + RETURN of each of two unions threaded through a call: a
+    // function takes a `Node`, narrows it, and another takes a `Ty`. Proves the valtype
+    // layer (`pushVT` kind 4) types params/returns of EITHER union (shared box ref).
+    name:
+      "multi-union: union-typed param of each of two unions => 30",
+    src: [
+      "type Lit = { val: i32 }",
+      "type Var = { vname: string }",
+      "type Node = Lit | Var",
+      "type TyInt = { width: i32 }",
+      "type TyStr = { len: i32 }",
+      "type Ty = TyInt | TyStr",
+      "function readNode(n: Node): i32 {",
+      "  if n is Lit { return n.val }",
+      "  return 0",
+      "}",
+      "function readTy(t: Ty): i32 {",
+      "  if t is TyInt { return t.width }",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  let n: Node = { val: 10 }",
+      "  let t: Ty = { width: 20 }",
+      "  return readNode(n) + readTy(t)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // readNode(Lit{val:10})=10 + readTy(TyInt{width:20})=20 → 30.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 30) throw new Error(`main() returned ${got}, expected 30`);
+    },
+  },
+  {
+    // KEYSTONE (ref-lists of two unions): a struct holds a `Node[]` AND a `Ty[]` — two
+    // distinct union ref-lists coexisting. Push variants onto each, pull one back out of
+    // each list, narrow it, and read a variant field. Mirrors the multi-ref-list table
+    // interning each union list as its OWN slot.
+    name:
+      "multi-union: a Node[] AND a Ty[] coexist, narrow an element of each => 12",
+    src: [
+      "type Lit = { val: i32 }",
+      "type Var = { vname: string }",
+      "type Node = Lit | Var",
+      "type TyInt = { width: i32 }",
+      "type TyStr = { len: i32 }",
+      "type Ty = TyInt | TyStr",
+      "type Bag = { nodes: Node[], tys: Ty[] }",
+      "let B: Bag = { nodes: [], tys: [] }",
+      "function main(): i32 {",
+      "  B.nodes.push({ val: 8 })",
+      "  B.tys.push({ width: 4 })",
+      "  let n = B.nodes[0]",
+      "  let t = B.tys[0]",
+      "  let acc = 0",
+      "  if n is Lit { acc = acc + n.val }",
+      "  if t is TyInt { acc = acc + t.width }",
+      "  return acc",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // nodes[0]=Lit{val:8} → 8, tys[0]=TyInt{width:4} → 4, total 12.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
     },
   },
 ];
