@@ -2725,6 +2725,51 @@ const CASES: Case[] = [
       if (got !== 4) throw new Error(`main() returned ${got}, expected 4`);
     },
   },
+  // ── G3: `.push` onto a struct-FIELD array ──────────────────────────────────
+  // `b.items.push(x)` resolves the receiver to the struct field's i32-list wrapper ref
+  // (loaded once into a scratch local), then runs the existing list grow/append against
+  // it — the wrapper is mutated in place by reference, so the field sees the appended
+  // element. This is the `P.nodes.push(n)` arena-mutation shape `parser.vl` needs.
+  {
+    name: "G3: push onto a struct `i32[]` field grows it; read length + element => 33",
+    src: [
+      "type Box = { items: i32[] }",
+      "function f(): i32 {",
+      "  let b: Box = { items: [] }",
+      "  b.items.push(10)",
+      "  b.items.push(20)",
+      "  b.items.push(30)",
+      "  return b.items.length + b.items[2]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // length 3 + items[2] (30) = 33.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 33) throw new Error(`f() returned ${got}, expected 33`);
+    },
+  },
+  {
+    // The core arena shape: a GLOBAL struct with a `Node[]`-style ref-list field, mutated
+    // through `.push`. Here `Item[]` (struct-element ref list) stands in for `Node[]`.
+    name: "G3: push onto a GLOBAL struct's ref-list field, read back => 12",
+    src: [
+      "type Item = { v: i32 }",
+      "type Arena = { items: Item[] }",
+      "let A: Arena = { items: [ { v: 1 } ] }",
+      "function f(): i32 {",
+      "  A.items.push({ v: 5 })",
+      "  A.items.push({ v: 9 })",
+      "  return A.items.length + A.items[2].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // items starts [{v:1}], push {v:5},{v:9} → length 3 + items[2].v (9) = 12.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 12) throw new Error(`f() returned ${got}, expected 12`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the

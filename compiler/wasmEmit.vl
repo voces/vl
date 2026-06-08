@@ -3384,29 +3384,48 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
     let callee = P.nodes[c.callFn]
     if callee is Member {
       let recv = P.nodes[callee.memObj]
+      // The receiver must PRODUCE a list — either a bare list local/param (`xs.push`) or
+      // a struct-FIELD array read (`P.nodes.push`, gap #3). Both `exprArray`/`exprRefArray`
+      // already classify a `Member` array-field read, so the only extra work for a field
+      // receiver is to materialize its wrapper ref into the `recvRef` scratch slot.
+      let isRef = exprRefArray(callee.memObj, fnIx)
+      if !isRef && !exprArray(callee.memObj, fnIx) {
+        return emitFail("emitProgram: .push receiver is not a list")
+      }
+      // Pick the list/backing type indices + scratch base for this push kind.
+      let lTy = lTypeIdx
+      let aTy = aTypeIdx
+      let base = pushScratchBase
+      if isRef {
+        if !rlUsed {
+          return emitFail("emitProgram: ref .push but ref list type not collected")
+        }
+        lTy = rlTypeIdx
+        aTy = raTypeIdx
+        base = refPushScratchBase
+      } else if !lUsed {
+        return emitFail("emitProgram: .push but list type not collected")
+      }
+      // Resolve the receiver to a wasm local index holding the list-wrapper ref. A bare
+      // identifier IS such a local. A struct-FIELD receiver (`P.nodes`) is evaluated once
+      // into the `recvRef` scratch slot (`base + 3`); because the wrapper is mutated IN
+      // PLACE by reference, pushing through the scratch local also mutates the field's
+      // list — no write-back needed.
+      let lIdx = 0 - 1
       if recv is Ident {
-        let isRef = exprRefArray(callee.memObj, fnIx)
-        if !isRef && !exprArray(callee.memObj, fnIx) {
-          return emitFail("emitProgram: .push receiver is not a list")
-        }
-        // Pick the list/backing type indices + scratch base for this push kind.
-        let lTy = lTypeIdx
-        let aTy = aTypeIdx
-        let base = pushScratchBase
-        if isRef {
-          if !rlUsed {
-            return emitFail("emitProgram: ref .push but ref list type not collected")
-          }
-          lTy = rlTypeIdx
-          aTy = raTypeIdx
-          base = refPushScratchBase
-        } else if !lUsed {
-          return emitFail("emitProgram: .push but list type not collected")
-        }
-        let lIdx = localIndexOf(fnIx, recv.identName)
+        lIdx = localIndexOf(fnIx, recv.identName)
         if lIdx < 0 {
           return emitFail("emitProgram: .push receiver is not a list local")
         }
+      } else if recv is Member {
+        if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+        body.push(33)          // local.set recvRef
+        appendAll(body, ulebToArr(base + 3))
+        lIdx = base + 3
+      } else {
+        return emitFail("emitProgram: .push receiver must be a local or struct field")
+      }
+      if true {
         if c.callArgs.length != 1 {
           return emitFail("emitProgram: .push takes exactly one argument")
         }
@@ -3499,7 +3518,6 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         body.push(1)           // field 1: len
         return 0
       }
-      return emitFail("emitProgram: .push receiver must be a simple name")
     }
   }
   emitFail("emitProgram: expected a .push call")
@@ -3866,13 +3884,18 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     fnUsesMap = fnHasMap(fnIx)
     let nLocals = localNames.length
     pushScratchBase = fn.fnParams.length + nLocals
-    // The ref-push scratch triple (if any) follows the i32 triple.
+    // The ref-push scratch frame (if any) follows the i32 frame. Each push frame is FOUR
+    // slots: the grow triple (val/cap/backing) PLUS a 4th `recvRef` slot that holds the
+    // list-wrapper ref when the `.push` receiver is a STRUCT FIELD (gap #3) rather than a
+    // bare local — the field ref is loaded into it once, then the grow/append run against
+    // it exactly as for a local. (The slot is unused, but harmlessly reserved, when every
+    // push in the function has a local receiver.)
     let i32Scratch = 0
-    if fnUsesPush { i32Scratch = 3 }
+    if fnUsesPush { i32Scratch = 4 }
     refPushScratchBase = fn.fnParams.length + nLocals + i32Scratch
-    // The string-op scratch frame (if any) follows BOTH push triples.
+    // The string-op scratch frame (if any) follows BOTH push frames.
     let refScratch = 0
-    if fnUsesRefPush { refScratch = 3 }
+    if fnUsesRefPush { refScratch = 4 }
     strScratchBase = fn.fnParams.length + nLocals + i32Scratch + refScratch
     // The G8 map scratch frame (if any) follows the string-op frame.
     let strScratch = 0
@@ -3891,8 +3914,8 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     // `(ref $raTypeIdx)`). Each scratch is non-defaultable but always `local.set` before
     // read, which wasm validation accepts.
     let nRuns = nLocals
-    if fnUsesPush { nRuns = nRuns + 3 }
-    if fnUsesRefPush { nRuns = nRuns + 3 }
+    if fnUsesPush { nRuns = nRuns + 4 }
+    if fnUsesRefPush { nRuns = nRuns + 4 }
     // The G6 string-op frame: 3 non-null string refs + 4 i32 temporaries.
     if fnUsesStrOp { nRuns = nRuns + 7 }
     // The G8 map frame: 12 slots (see the map scratch layout / the probe + rehash).
@@ -3912,6 +3935,9 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(1)
       body.push(100)         // pushNewBacking: 0x64 (ref ht) — non-null, matches the
       appendAll(body, ulebToArr(aTypeIdx))   // struct's non-null backing field.
+      body.push(1)
+      body.push(100)         // pushRecvRef: 0x64 (ref $lTypeIdx) — the i32-list wrapper
+      appendAll(body, ulebToArr(lTypeIdx))   // ref for a struct-FIELD receiver (gap #3).
     }
     if fnUsesRefPush {
       body.push(1)
@@ -3922,6 +3948,9 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(1)
       body.push(100)         // pushRefBacking: 0x64 (ref $raTypeIdx) — non-null ref backing
       appendAll(body, ulebToArr(raTypeIdx))
+      body.push(1)
+      body.push(100)         // pushRefRecvRef: 0x64 (ref $rlTypeIdx) — the ref-list wrapper
+      appendAll(body, ulebToArr(rlTypeIdx))  // ref for a struct-FIELD receiver (gap #3).
     }
     if fnUsesStrOp {
       // strScrA / strScrB / strScrOut: 3 non-null `(ref $aTypeIdx)` string refs.
