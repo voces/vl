@@ -1442,6 +1442,69 @@ const CASES: Case[] = [
     },
   },
   {
+    // Nested simultaneous narrowing of TWO distinct union locals (`if ta is A { if tb is
+    // A { ta.av + tb.av } }`) — `typecheck.vl`'s `sameNumeric` shape. The narrowing state
+    // is a STACK, so the inner guard does not clobber the outer: both `ta` and `tb` stay
+    // narrowed and each `.field` read downcasts to ITS variant.
+    name: "nested narrowing of two distinct union locals (ta.av + tb.av => 16)",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type U = A | B",
+      "function sumTwo(x: U, y: U): i32 {",
+      "  if x is A {",
+      "    if y is A {",
+      "      return x.av + y.av",
+      "    }",
+      "  }",
+      "  return 0",
+      "}",
+      "function mkA(n: i32): U {",
+      "  return { av: n }",
+      "}",
+      "function main(): i32 {",
+      "  return sumTwo(mkA(7), mkA(9))",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 16) throw new Error(`main() returned ${got}, expected 16`);
+    },
+  },
+  {
+    // Nested narrowing where the inner branch compares two narrowed STRING fields
+    // (`ta.primName == tb.primName`) — exactly `typecheck.vl`'s `sameNumeric`. The string
+    // `==` scratch frame must be reserved even though both operands are narrowed-variant
+    // string-field reads (the detection pass narrows as it descends).
+    name: "nested narrowing comparing two narrowed string fields (sameNumeric => 1)",
+    src: [
+      "type P = { pn: string }",
+      "type E = { ed: i32 }",
+      "type Ty = P | E",
+      "function sameP(x: Ty, y: Ty): boolean {",
+      "  if x is P {",
+      "    if y is P {",
+      "      return x.pn == y.pn",
+      "    }",
+      "  }",
+      "  return false",
+      "}",
+      "function mkP(): Ty {",
+      '  return { pn: "i32" }',
+      "}",
+      "function main(): i32 {",
+      "  if sameP(mkP(), mkP()) { return 1 }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
     // gap #2: a function takes a union-VARIANT struct as a param (`o: TyObj`), reads its
     // ARRAY fields (`o.names` a `string[]`, `o.tys` an `i32[]`) directly off the unboxed
     // variant struct — the shape of `typecheck.vl`'s `objFieldType(o: TyObj, …)`. The

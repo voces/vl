@@ -823,12 +823,45 @@ let uFieldElemName: string[] = []
 // ── active `is`-narrowing scope ───────────────────────────────────────────────
 // When emitting the THEN-branch of `if n is A { … }`, the union-typed identifier
 // `n` is narrowed to variant `A`, so a field read `n.f` in that branch lowers to
-// the downcast. `narrowName`/`narrowVariant` hold the single active narrowing (one
-// at a time is enough for the slice's `if n is A { return n.f }` shape); they are
-// saved/restored around the branch so nesting and the else-branch see the right
-// scope.
-let narrowName: string = ""
-let narrowVariant: string = ""
+// the downcast. The active narrowings are a STACK (parallel `narrowNames` /
+// `narrowVariants`): nested guards over DISTINCT union locals (`if ta is TyPrim { if
+// tb is TyPrim { … ta.primName … tb.primName … } }`, the `sameNumeric` shape) each
+// push a binding, so BOTH `ta` and `tb` stay narrowed in the inner branch — a single
+// slot would lose the outer one. A branch saves the stack LENGTH and truncates back
+// on exit, so nesting + the else-branch see the right scope. `narrowVariantFor`
+// resolves a receiver name to its INNERMOST active variant (shadowing-correct).
+// `narrowTop` is the logical stack DEPTH: only `narrowNames[0 .. narrowTop-1]` are
+// active. Entries are appended on push; on branch exit the depth is rewound (the arrays
+// keep their slots — no `.pop()`, so no global-list-pop self-host dependency). A push
+// past the current length appends; a push within reuses/overwrites the slot.
+let narrowNames: string[] = []
+let narrowVariants: string[] = []
+let narrowTop: i32 = 0
+
+// The variant a union local `name` is narrowed to in the current scope (the innermost
+// active binding within `narrowTop`), or "" if `name` is not currently narrowed.
+function narrowVariantFor(name: string): string {
+  let i = narrowTop - 1
+  while i >= 0 {
+    if narrowNames[i] == name { return narrowVariants[i] }
+    i = i - 1
+  }
+  ""
+}
+
+// Push an active narrowing `name → variant`, growing the stack arrays if needed. Returns
+// the new depth.
+function pushNarrow(name: string, variant: string): i32 {
+  if narrowTop < narrowNames.length {
+    narrowNames[narrowTop] = name
+    narrowVariants[narrowTop] = variant
+  } else {
+    narrowNames.push(name)
+    narrowVariants.push(variant)
+  }
+  narrowTop = narrowTop + 1
+  narrowTop
+}
 
 // Append the declared-local name `name` to `localNames` if not already present.
 // `structIdx` is the local's struct table index when it is a struct ref (`isRef == 1`),
@@ -907,13 +940,11 @@ function collectLocalsIf(ifIx: i32, fnIx: i32): i32 {
     // an array local here — `exprArray`/`memFieldTypeCode` resolve the variant field
     // type only while narrowing is active. Save/restore so the else-branch + nesting
     // are unaffected.
-    let savedName = narrowName
-    let savedVariant = narrowVariant
+    let savedTop = narrowTop
     let narrowed = setNarrowFromCond(s.ifCond, fnIx)
     let trc = collectLocals(s.ifThen, fnIx)
     if narrowed {
-      narrowName = savedName
-      narrowVariant = savedVariant
+      restoreNarrow(savedTop)
     }
     if trc < 0 { return 0 - 1 }
     if s.ifElse >= 0 {
@@ -1487,7 +1518,15 @@ function ifChainHasStrOp(ifIx: i32, fnIx: i32): boolean {
   let s = P.nodes[ifIx]
   if s is IfStmt {
     if exprHasStrOp(s.ifCond, fnIx) { return true }
-    if blockHasStrOp(s.ifThen, fnIx) { return true }
+    // Narrow across the THEN-branch (mirroring `emitStmt`/`collectLocalsIf`) so a string
+    // op over a NARROWED variant field (`if n is A { … n.strField == x … }`, and nested
+    // guards over distinct locals) is detected — `exprString` resolves a variant field's
+    // string type only while the receiver's narrowing is active. Save/restore the depth.
+    let savedTop = narrowTop
+    let narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    let hit = blockHasStrOp(s.ifThen, fnIx)
+    if narrowed { restoreNarrow(savedTop) }
+    if hit { return true }
     if s.ifElse >= 0 {
       let els = P.nodes[s.ifElse]
       if els is Block {
@@ -1858,7 +1897,12 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
 function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   let m = P.nodes[memIx]
   if m is Member {
-    let vi = variantIndexOf(narrowVariant)
+    // Resolve the variant from the RECEIVER's own active narrowing (not a global slot) —
+    // so two simultaneously-narrowed locals each downcast to THEIR variant.
+    let recvVar = ""
+    let recvN = P.nodes[m.memObj]
+    if recvN is Ident { recvVar = narrowVariantFor(recvN.identName) }
+    let vi = variantIndexOf(recvVar)
     if vi < 0 {
       return emitFail("emitProgram: narrowed receiver names no union variant")
     }
@@ -1883,18 +1927,32 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected a field access")
 }
 
-// True if the member access at `memIx` reads a field of the currently-narrowed union
-// identifier (`recv` is the bare `Ident narrowName`, narrowed to `narrowVariant`).
+// True if the member access at `memIx` reads a field of a CURRENTLY-narrowed union
+// identifier (the receiver `Ident` has an active binding on the narrowing stack).
 function memIsNarrowed(memIx: i32): boolean {
-  if narrowName == "" { return false }
+  if narrowTop == 0 { return false }
   let m = P.nodes[memIx]
   if m is Member {
     let recv = P.nodes[m.memObj]
     if recv is Ident {
-      if recv.identName == narrowName { return true }
+      if narrowVariantFor(recv.identName) != "" { return true }
     }
   }
   false
+}
+
+// The variant table index the Member `memIx`'s receiver is currently narrowed to, or -1
+// if its receiver is not a narrowed union identifier. Resolves each receiver's OWN active
+// narrowing — so simultaneously-narrowed locals each map to their own variant.
+function memNarrowVariantIndex(memIx: i32): i32 {
+  let m = P.nodes[memIx]
+  if m is Member {
+    let recv = P.nodes[m.memObj]
+    if recv is Ident {
+      return variantIndexOf(narrowVariantFor(recv.identName))
+    }
+  }
+  0 - 1
 }
 
 // Lower a field read `recv.field` onto `body`: evaluate the receiver (must be a
@@ -4282,23 +4340,30 @@ function pushListBacking(body: i32[], lIdx: i32, lTy: i32): i32 {
 }
 
 // If the `if` condition at `condIx` is `n is Variant` over a bare union identifier
-// `n`, set the active narrowing (`narrowName`/`narrowVariant`) so the then-branch's
+// `n`, PUSH the narrowing (`narrowNames`/`narrowVariants`) so the then-branch's
 // `n.field` reads downcast through the box, and return true. Otherwise leave the
-// narrowing untouched and return false. A non-identifier receiver (e.g. `f(x) is A`)
-// is not narrowable (no stable name to re-read) and is left un-narrowed.
+// narrowing stack untouched and return false. A non-identifier receiver (e.g. `f(x) is
+// A`) is not narrowable (no stable name to re-read) and is left un-narrowed. The caller
+// saves the stack length and truncates back on branch exit (`restoreNarrow`).
 function setNarrowFromCond(condIx: i32, fnIx: i32): boolean {
   let c = P.nodes[condIx]
   if c is IsExpr {
     let recv = P.nodes[c.isObj]
     if recv is Ident {
       if exprUnion(c.isObj, fnIx) {
-        narrowName = recv.identName
-        narrowVariant = c.isVariant
+        pushNarrow(recv.identName, c.isVariant)
         return true
       }
     }
   }
   false
+}
+
+// Rewind the narrowing stack depth back to `n` (drop bindings a branch pushed). The
+// arrays keep their backing slots — only the logical depth changes, so no `.pop()`.
+function restoreNarrow(n: i32): i32 {
+  narrowTop = n
+  0
 }
 
 // Lower a single statement at `stmtIx` onto `body`, resolving identifiers/params
@@ -4393,13 +4458,11 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
     // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
     // outer narrowing around the branch so nesting and the else-branch are unaffected.
-    let savedName = narrowName
-    let savedVariant = narrowVariant
+    let savedTop = narrowTop
     let narrowed = setNarrowFromCond(s.ifCond, fnIx)
     if emitStmts(body, s.ifThen, fnIx) < 0 { return 0 - 1 }
     if narrowed {
-      narrowName = savedName
-      narrowVariant = savedVariant
+      restoreNarrow(savedTop)
     }
     if s.ifElse >= 0 {
       body.push(5)           // 0x05 else
@@ -6501,7 +6564,7 @@ function memFieldTypeCode(memIx: i32, fnIx: i32): i32 {
   let e = P.nodes[memIx]
   if e is Member {
     if memIsNarrowed(memIx) {
-      let vi = variantIndexOf(narrowVariant)
+      let vi = memNarrowVariantIndex(memIx)
       if vi >= 0 {
         let vfi = variantFieldIndex(vi, e.memProp)
         if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
@@ -6728,7 +6791,7 @@ function refListElemNameOfExpr(exprIx: i32, fnIx: i32): string {
     // A `recv.field` ref-list field read — the field's element name from the receiver's
     // struct / narrowed variant.
     if memIsNarrowed(exprIx) {
-      let vi = variantIndexOf(narrowVariant)
+      let vi = memNarrowVariantIndex(exprIx)
       if vi >= 0 {
         let vfi = variantFieldIndex(vi, e.memProp)
         if vfi >= 0 { return uFieldElemName[uFieldStart[vi] + vfi] }
@@ -7097,7 +7160,7 @@ function exprString(exprIx: i32, fnIx: i32): boolean {
     // A field read on a NARROWED union identifier (`if n is A { … n.f … }`) reads the
     // variant field; a string variant field yields a string ref.
     if memIsNarrowed(exprIx) {
-      let vi = variantIndexOf(narrowVariant)
+      let vi = memNarrowVariantIndex(exprIx)
       if vi >= 0 {
         let vfi = variantFieldIndex(vi, e.memProp)
         if vfi >= 0 {
@@ -7137,8 +7200,9 @@ function letIsString(letIx: i32, fnIx: i32): boolean {
 function emitProgram(rootIx: i32): i32 {
   emitFailed = false
   emitErr = ""
-  narrowName = ""
-  narrowVariant = ""
+  narrowNames = []
+  narrowVariants = []
+  narrowTop = 0
   if rootIx < 0 {
     return emitFail("emitProgram: empty arena (root index < 0)")
   }
