@@ -340,6 +340,51 @@ const CASES: Case[] = [
     },
   },
   {
+    // A function whose body ENDS in an `if/else` where both arms `return` falls
+    // through (structurally) to the function `end` with an empty stack. emitProgram
+    // now emits an `unreachable` before the `end` so the module validates; the arms'
+    // `return`s do the real work.
+    name: "if/else both-arms-return as the body tail validates (`>0 ? 1 : 2`)",
+    src: [
+      "function f(n: i32): i32 {",
+      "  if n > 0 {",
+      "    return 1",
+      "  } else {",
+      "    return 2",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const pos = await runExport(bytes, "f", 5);
+      if (pos !== 1) throw new Error(`f(5) returned ${pos}, expected 1`);
+      const nonpos = await runExport(bytes, "f", -5);
+      if (nonpos !== 2) throw new Error(`f(-5) returned ${nonpos}, expected 2`);
+    },
+  },
+  {
+    name: "else-if chain as the body tail (all arms return) => 3/2/1",
+    src: [
+      "function f(n: i32): i32 {",
+      "  if n > 10 {",
+      "    return 3",
+      "  } else if n > 5 {",
+      "    return 2",
+      "  } else {",
+      "    return 1",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      if (await runExport(bytes, "f", 20) !== 3) throw new Error("f(20) != 3");
+      if (await runExport(bytes, "f", 7) !== 2) throw new Error("f(7) != 2");
+      if (await runExport(bytes, "f", 1) !== 1) throw new Error("f(1) != 1");
+    },
+  },
+  {
     // The REAL `i32ToStr` + `digitChar` from the self-host front end (`ast.vl`),
     // verbatim. It exercises `/`, `%`, the implicit return, string `+`, a `while`
     // loop, and string-returning helpers all at once — and now compiles + runs

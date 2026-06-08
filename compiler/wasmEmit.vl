@@ -3655,6 +3655,31 @@ function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: function has no block body")
 }
 
+// True if the function's TOP-LEVEL body block at `blockIx` ends in an instruction
+// that the wasm validator treats as making the function's fallthrough UNREACHABLE —
+// i.e. its last statement is an explicit `return` (`RetStmt`) or a bare tail value
+// (lowered by `emitFuncBody` as `emitExpr` + `return`). In those cases the function's
+// trailing `end` is reached only via the polymorphic post-`return` stack, so no
+// padding is needed. Otherwise (the body ends in an `if`/`while`/assignment/`.push`
+// whose own `return`s exit from INSIDE a structured block) control structurally falls
+// through to `end` with an empty stack — which fails the result-type check unless an
+// explicit `unreachable` precedes the `end`. The typechecker has already proven such
+// a fallthrough is dynamically dead (every path returns), so the `unreachable` is
+// sound padding, never executed.
+function bodyEndsInReturn(blockIx: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let n = stmts.length
+    if n == 0 { return false }
+    let last = stmts[n - 1]
+    let s = P.nodes[last]
+    if s is RetStmt { return true }
+    return stmtIsTailValue(last)
+  }
+  false
+}
+
 // Lower every statement of the block at `blockIx` onto `body`, in order. Returns 0,
 // or -1 (via `emitFail`) on a non-block node or an unsupported statement within.
 function emitStmts(body: i32[], blockIx: i32, fnIx: i32): i32 {
@@ -3868,6 +3893,15 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(127)         // 11 rslot: i32
     }
     appendAll(body, bodyExpr)
+    // If the body does NOT end in an explicit `return` / tail value, control
+    // structurally falls through to the function `end` with an empty stack (e.g. a
+    // body ending in `if c { return a } else { return b }`, whose `return`s exit from
+    // inside the structured `if`). The validator requires the function's result type
+    // at fallthrough, so emit an `unreachable` (0x00) — the typechecker has proven
+    // this fallthrough is dead, so it is sound padding, never executed.
+    if !bodyEndsInReturn(fn.fnBody) {
+      body.push(0)           // 0x00 unreachable
+    }
     body.push(11)            // 0x0b end
     appendAll(out, ulebToArr(body.length))
     appendAll(out, body)
