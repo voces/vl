@@ -120,6 +120,7 @@ const verifyFullBundleBuilds = async (): Promise<void> => {
     "setModelMarkers",
     "registerInlayHintsProvider",
     "registerDefinitionProvider",
+    "registerCodeActionProvider",
   ]) {
     if (!js!.text.includes(needle)) {
       fail(`full bundle is missing the \`${needle}\` wiring`);
@@ -324,7 +325,64 @@ const main = async (): Promise<void> => {
     `OK: share round-trip -> hash length ${hash.length}, decoded matches source`,
   );
 
-  // 5. The full page bundle (main.ts + Monaco) builds with the LSP wiring.
+  // 5. User-project persistence (save / rename / delete + last-session restore).
+  // `projects.ts` touches only `localStorage` (which Deno exposes), so import it
+  // directly — no bundling — like `share.ts`.
+  console.error("\nchecking user-project persistence…");
+  const proj = await import("./src/projects.ts");
+  // Start clean so prior runs don't skew the assertions.
+  for (const p of proj.listProjects()) proj.deleteProject(p.id);
+  proj.clearLastSession();
+
+  const created = proj.createProject("My First", [
+    { name: "main.vl", source: "print(1)\n" },
+  ]);
+  if (proj.listProjects().length !== 1) fail("createProject did not persist one project");
+  if (!proj.getProject(created.id)) fail("getProject could not find the saved project");
+
+  // Save (update in place) preserves the id but changes the files.
+  const updated = proj.updateProject(created.id, [
+    { name: "main.vl", source: "print(2)\n" },
+  ]);
+  if (!updated || updated.id !== created.id) fail("updateProject changed the id");
+  if (proj.getProject(created.id)!.files[0].source !== "print(2)\n") {
+    fail("updateProject did not persist new file contents");
+  }
+
+  // Rename keeps id + files, changes the name.
+  const renamed = proj.renameProject(created.id, "Renamed");
+  if (!renamed || renamed.name !== "Renamed") fail("renameProject did not rename");
+  if (!proj.nameExists("Renamed")) fail("nameExists did not see the renamed project");
+
+  // Save As (a new project) gets a distinct id and leaves the original intact.
+  const copy = proj.createProject("Renamed copy", proj.getProject(created.id)!.files);
+  if (copy.id === created.id) fail("createProject (Save As) reused an id");
+  if (proj.listProjects().length !== 2) fail("Save As did not add a second project");
+
+  // Last-session round-trip: the open project + its LIVE (unsaved) buffers.
+  proj.saveLastSession({
+    ref: { kind: "user", id: created.id },
+    files: [{ name: "main.vl", source: "print(3) // unsaved edit\n" }],
+  });
+  const restored = proj.loadLastSession();
+  if (!restored || restored.ref.kind !== "user") fail("loadLastSession lost the ref");
+  if (restored!.files[0].source !== "print(3) // unsaved edit\n") {
+    fail("loadLastSession did not restore the live (unsaved) buffer");
+  }
+
+  // Delete removes only the target.
+  proj.deleteProject(created.id);
+  if (proj.getProject(created.id)) fail("deleteProject did not remove the project");
+  if (proj.listProjects().length !== 1) fail("deleteProject removed the wrong count");
+
+  // Clean up so a verify run leaves no residue.
+  for (const p of proj.listProjects()) proj.deleteProject(p.id);
+  proj.clearLastSession();
+  console.error(
+    "OK: persistence -> create/update/rename/save-as/delete + last-session restore",
+  );
+
+  // 6. The full page bundle (main.ts + Monaco) builds with the LSP wiring.
   console.error("\nbuilding the full page bundle (Monaco + providers)…");
   await verifyFullBundleBuilds();
 
