@@ -30,7 +30,8 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   function type at the call site (`xs.map(function(n) n*2)`). 🟡 In-progress
   (`claude/contextual-param-inference`).
 - **Robustness floor (A-robust)** — an unresolved `Infer`/`Unknown` must yield a clear diagnostic,
-  never a cryptic codegen crash (repro: `const xs = []; xs.push(1)`).
+  never a cryptic codegen crash. The main trigger (`const xs = []; xs.push(1)`) is fixed via
+  A-infer-empty; REMAINING is the same guarantee for the other holes (`Map()`/`Set()` empties, generics).
 - **Exhaustiveness analysis for `is`-chains (A-exhaust)** — flag dead arms, enable omitting the
   final `else`, elide provably-true discriminants in codegen.
 - **H4.1 / H4.5–H4.6** — remaining (worked-around) self-host codegen gaps for a full `vl build` path.
@@ -98,10 +99,11 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   `xs.map(function(n) n*2)` infers `n: i32` from `T[]`'s element type. Consistent with the
   "hide types where possible" identity; today untyped lambda params are a type error. Ties A10 (generic
   element type) and B15 (untyped lambdas).
-- ⬜ **A-infer-empty. Usage-based inference for empty collections.** Infer `Map()`/`Set()`/`[]` element
-  / key / value types from **later usage** (`m.set(k,v)`, `xs.push(x)`) — like evolving-array
-  inference. Today `const xs = []` then `xs.push(1)` crashes with an `Infer`/`Unknown` codegen error
-  rather than inferring `xs: i32[]` from the `push` constraint.
+- 🟡 **A-infer-empty. Usage-based inference for empty collections.** Empty ARRAY `[]` inference shipped
+  (see `CHANGELOG.md`): `const xs = []; xs.push(1)` infers `xs: i32[]` from downstream usage (push /
+  `T[]` param / annotated assignment / `T[]`-returning tail / index-set). REMAINING: the same for
+  `Map()`/`Set()` — infer key/value/element from `m.set(k,v)` / `.add(x)` later usage; the `Map()`/`Set()`
+  hole isn't yet materialised into a `{[K]:V}` object by `.set`/`.add`.
 - ⬜ **A-infer-null. `let x = null` as a nullable hole.** Treat `let x = null` like `[]`: infer the `T`
   in `T | null` from later usage (`x = 5` ⇒ `i32 | null`), the initializer contributing `| null`, with
   flow-narrowing stripping the `| null` on definitely-assigned paths (no null tax on the straight line);
@@ -109,12 +111,10 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   type, so `let x = null; x = 5` errors. Distinct from a pin violation — `null` is hole-bearing, not a
   complete type. Ties A-infer-empty (same usage-driven hole-filling) and A-definite-assign (shared flow
   machinery). (Rationale: DECISIONS "`let x = null` is a nullable hole".)
-- ⬜ **A-definite-assign. Definite assignment for uninitialized locals.** A read of `let x` / `let x: T`
-  not provably written on every preceding path is a "used before assigned" error; non-null (NOT
-  implicitly nullable). Closes a live soundness gap — today `let x: i32; return x` compiles and returns
-  a silent `0`. Flow analysis over the CFG the `is`-guards already walk (branch joins, loops, early
-  exits, `&&`/`||`); the declaration is fine, the **reads** are gated. (Rationale: DECISIONS
-  "uninitialized `let x` is non-null + definite-assignment-checked".)
+- ✅ **A-definite-assign. Definite assignment for uninitialized locals.** Shipped — see `CHANGELOG.md`.
+  An uninitialized `let x` / `let x: T` starts unassigned + non-null; a read on a path where it is not
+  provably written is a "used before assigned" error (closed the silent-`0` soundness gap), via the
+  parser's single-pass flow machinery (fork/join through `if`/`else`/`while`, diverging branches drop).
 - ⬜ **A-infer-params. Top-level function param inference.** Infer named-function param types from
   usage constraints (HM / the existing A13 row-poly inference path), consistent with "hide types where
   possible." Requiring annotations on all named-fn params is NOT VL's stated stance.
@@ -125,10 +125,12 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   (c) ⬜ **codegen**: elide the provably-true final discriminant test + drop the dead arm — a type-driven
   optimization binaryen cannot do (it lacks union exhaustiveness). Runtime is already correct (the
   no-`else` fall-through lowers to `unreachable`); (c) is a pure size/speed optimization, deferred.
-- ⬜ **A-robust. Robustness floor.** An unresolved `Infer`/`Unknown` type must produce a clear
+- 🟡 **A-robust. Robustness floor.** An unresolved `Infer`/`Unknown` type must produce a clear
   **"cannot infer — annotate"** diagnostic; it must NEVER surface as a cryptic `Unhandled "Unknown"
-  type` codegen error or a `containsInfer` TypeError crash. Repro: `const xs = []; xs.push(1)`.
-  Ties A-infer-empty (fixing that removes the main trigger).
+  type` codegen error or a `containsInfer` TypeError crash. The main trigger — `const xs = []; xs.push(1)`
+  — is fixed (A-infer-empty now infers it, and the "cannot infer — annotate" floor is deferred to
+  scope-close so it fires only for a genuinely-unconstrained empty). REMAINING: audit the other holes
+  (`Map()`/`Set()` empties, unresolved generic params) for the same clean-diagnostic-not-crash guarantee.
 
 ---
 
@@ -182,10 +184,11 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   one signature — needs pinning-by-use or boxing).
 - ⬜ **B16. Redeclaration / overloading.** Current: same-scope redeclaration errors; nested shadowing
   allowed (uniquified in codegen). Future: ad-hoc overloading? Default "no" → `DECISIONS.md`.
-- 🟡 **B17. Diagnostics + lint.** BUILD OUT — the lint rule backlog (a few at a time):
-  - **prefer-`const`** — a `let` that is never reassigned should be `const` (info/warning + quick-fix).
-  - **unused function / unused import**; **dead/constant branch** (`if false`); **`step 0`** range
-    loop; **unreachable after a diverging `if/else`** (have the simple after-`return` case).
+- 🟡 **B17. Diagnostics + lint.** BUILD OUT — the lint rule backlog (a few at a time). Shipped (see
+  `CHANGELOG.md`): prefer-`const`, unused-import, dead/constant branch (`constant-condition`), `step 0`
+  (`for-step-zero`), unreachable-after-return / -break / -diverging-if/else. REMAINING:
+  - **unused function** — a never-referenced (non-exported) top-level function (today only unused
+    variables/params/imports are flagged; functions are excluded via the `kind` guard).
   - **LSP quick-fixes** (code actions): "remove unused binding" / "prefix with `_`" / "`let`→`const`".
     Diagnostics already carry stable `code`s; the LSP has no code-action provider yet.
   - ✅ **`vl check --fix`** — apply the provably-safe lint fixes from the CLI (`let`→`const`,
@@ -388,13 +391,15 @@ independent).*
     insertion-ordered entry lists (reusing the `{backing,len,cap}` wrapper) and `index` is an i32 hash-slot array.
     `Map()` allocates an 8-slot index; every op hashes the key + probes to a free-or-matching slot (element-wise `==`);
     set overwrites-or-appends + links the slot + resizes at load factor 1/2; `m[k] ?? d` / `.has` read the probe.
-    DELETE/tombstones deferred (no delete in the op set). With G8 the **full annotated self-host front end is now
-    emitProgram-compilable** — G9 inference is a NON-GAP
-    (the sources are fully annotated), so next is an **end-to-end self-host-compile attempt** (drive `lexer`+`ast`+
-    `parser`+`typecheck` through `emitProgram` itself). Further ahead (only as the source vocabulary widens): unions
-    mixing scalars + structs, `!is`/negated guards, non-i32-value element lists, list `pop`/`+`/equality, string
-    `.indexOf`/`.includes`/`.charCodeAt`, map iteration/`delete`, and `for`/`match`. (The fixed-bytes spike that
-    hand-built two modules without reading `compiler/ast.vl` is retired.)
+    DELETE/tombstones deferred (no delete in the op set). The **end-to-end self-host-compile attempt** is now
+    UNDERWAY (real `ast.vl`/`parser.vl` source flowing through the pipeline, 151 green; see `CHANGELOG.md`):
+    `/`/`%` operators, implicit trailing-expression return, and multiline `type`/union parsing landed (the
+    front-end-attempt slice); the AST ARENA's field vocabulary is now fully expressible — multiple struct types,
+    string struct/variant fields, array (`i32[]`/`T[]`) struct/variant fields + `.push`, `string[]` fields +
+    `.push`, and struct-typed params across mutually-recursive groups. REMAINING (as the source vocabulary
+    widens): unions mixing scalars + structs, `!is`/negated guards, non-i32-value element lists, list
+    `pop`/`+`/equality, string `.indexOf`/`.includes`/`.charCodeAt`, map iteration/`delete`, and `for`/`match`.
+    (The fixed-bytes spike that hand-built two modules without reading `compiler/ast.vl` is retired.)
   - **(b) Grow the `.vl` parser/typecheck subset.** `parseStmt` handles `let`/`const`/`function`/`if`
     (incl. `else if` chains)/`return`/block/expr but **no `while`/`for` statements yet**; widen toward
     the full language.
