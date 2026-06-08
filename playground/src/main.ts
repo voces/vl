@@ -322,6 +322,68 @@ monaco.languages.registerDefinitionProvider(VL_LANGUAGE_ID, {
   },
 });
 
+// --- code action (quick-fix) provider ----------------------------------------
+//
+// Mirrors `server.ts`'s `onCodeAction`: for the lint diagnostics overlapping the
+// cursor/selection, compute the applicable quick-fixes (`lspAdapter.codeActions`
+// → `lsp/src/codeActions.ts`) and wrap each as a Monaco `CodeAction` with a
+// `WorkspaceEdit` against the current model. Monaco's "Auto Fix" lightbulb then
+// applies the `isPreferred` fix. The context markers Monaco passes carry the
+// diagnostic `code` (we stash it on each marker in `toMarker`), so the dispatch
+// picks the right fix — exactly the `code`-keyed mapping the editor uses.
+
+monaco.languages.registerCodeActionProvider(VL_LANGUAGE_ID, {
+  provideCodeActions: (model, range, context) => {
+    // Monaco markers → the `VLDiagnostic`-shaped context (0-based LSP coords)
+    // `lspAdapter.codeActions` expects. The `code`/`source` carry the fields the
+    // fix dispatch keys off; Monaco markers store `code` as a string or
+    // `{ value }` object, so normalise both.
+    const contextDiagnostics: lsp.VLDiagnostic[] = context.markers
+      .map((m) => ({
+        message: m.message,
+        severity: "warning" as const,
+        source: "vital" as const,
+        code: typeof m.code === "object" ? m.code?.value : m.code,
+        range: {
+          start: { line: m.startLineNumber - 1, character: m.startColumn - 1 },
+          end: { line: m.endLineNumber - 1, character: m.endColumn - 1 },
+        },
+      }));
+
+    const fixes = lsp.codeActions(
+      model.getValue(),
+      {
+        start: { line: range.startLineNumber - 1, character: range.startColumn - 1 },
+        end: { line: range.endLineNumber - 1, character: range.endColumn - 1 },
+      },
+      contextDiagnostics,
+    );
+
+    const actions: monaco.languages.CodeAction[] = fixes.map((fix) => ({
+      title: fix.title,
+      kind: "quickfix",
+      isPreferred: fix.isPreferred,
+      edit: {
+        edits: fix.edits.map((e) => ({
+          resource: model.uri,
+          textEdit: {
+            range: new monaco.Range(
+              e.range.start.line + 1,
+              e.range.start.character + 1,
+              e.range.end.line + 1,
+              e.range.end.character + 1,
+            ),
+            text: e.newText,
+          },
+          versionId: model.getVersionId(),
+        })),
+      },
+    }));
+
+    return { actions, dispose: () => {} };
+  },
+});
+
 // --- theme management --------------------------------------------------------
 //
 // Tri-state: AUTO (follow OS) by default; clicking pins an explicit override;
@@ -467,6 +529,9 @@ const toMarker = (d: VLDiagnostic): monaco.editor.IMarkerData => {
     endLineNumber: end.line + 1,
     endColumn: empty ? start.character + 2 : end.character + 1,
     source: d.source,
+    // Stash the stable lint `code` so the code-action provider can pick the right
+    // quick-fix from the marker Monaco hands back (mirrors `server.ts`'s cache).
+    code: d.code !== undefined ? String(d.code) : undefined,
     tags,
   };
 };
