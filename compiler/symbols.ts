@@ -80,6 +80,16 @@ export type Binding = {
    */
   exported?: boolean;
   /**
+   * The span of the `export` keyword token for this binding, when it was declared
+   * with an explicit `export` modifier. Stamped by the parser alongside
+   * `binding.exported = true`. Used by the LSP unused-export pass to range the
+   * "redundant export" hint on the keyword itself (not the name) — when an export
+   * is used only within its own module but never imported by another module, the
+   * hint greys the `export` keyword to signal it can be dropped.
+   * Undefined for non-exported bindings or bindings created before this field.
+   */
+  exportKeywordSpan?: Context;
+  /**
    * Module system: `true` when this binding was introduced by an `import { … }`
    * specifier (stamped in `parseImport`). The unused-variable lint treats an
    * unused IMPORT differently from an unused local/parameter: there is no
@@ -260,3 +270,4 @@ const scopeTighter = (a: Context, b: Context): boolean => {
   if (aEnclosesB && !bEnclosesA) return false;
   return spanShorter(a, b);
 };
+
