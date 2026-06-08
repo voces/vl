@@ -5254,6 +5254,182 @@ function fbValtype(kind: i32, structIdx: i32): i32 {
   0
 }
 
+// ── type interning (Phase G — replaces emitModule's offset arithmetic) ────────
+// The heap-type index allocator. Every type the module emits (standalone structs,
+// union variants + box, the raw i32 array, the i32-list wrapper, each ref-list
+// (backing, wrapper) pair, the string-list (backing, wrapper) pair, the map struct,
+// and the functypes) occupies one slot in the single rec group, in EMIT ORDER.
+// `mNextType` is the running counter; `mAllocType` hands out the next index. This
+// centralizes the running-sum invariant the old parallel `*Offset` formulas
+// open-coded ("a type that references a later type still goes in the one rec
+// group, so all indices are mutually visible"). Reset per program by
+// `mResetTypeIntern`, driven in declaration order by `mAssignTypeIndices`.
+let mNextType: i32 = 0
+
+// Reset the interning counter (call once per module, before assigning indices).
+function mResetTypeIntern(): i32 {
+  mNextType = 0
+  0
+}
+
+// Allocate the next heap-type index (interning in emit order): return the current
+// counter, then advance it by one. This is the single auditable place a type index
+// is minted — every `mIntern*` below funnels through here.
+function mAllocType(): i32 {
+  let idx = mNextType
+  mNextType = mNextType + 1
+  idx
+}
+
+// The Phase-G safety assert (risk R2): the interned index MUST equal the value the
+// old offset formula computes. On divergence, fail loudly (drops the buffer so a
+// mis-indexed module never reaches instantiation) — never silence it. Retained as
+// a cheap debug check for one release after the old arithmetic is deleted.
+function mAssertIdx(got: i32, want: i32, who: string): i32 {
+  if got != want {
+    return emitFail("emitProgram: Phase G type-index drift in " + who)
+  }
+  0
+}
+
+// Walk the type-section emit order with the `mAllocType` counter, assigning each
+// type's heap index into the module-global index state (`sHeapIdx`/`uVarIdx`/
+// `uBoxIdx`/`aTypeIdx`/`lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`mkArrIdx`/`mkListIdx`/
+// `mStructIdx`) and asserting each equals the old offset formula. Returns the
+// functype base index (`typeOffset` — where the first functype lands), or -1 on a
+// drift (via `mAssertIdx`/`emitFail`). The order MUST match the type-section
+// emission below EXACTLY: standalone structs → union variants → union box → raw
+// i32 array → i32-list wrapper → ref-list (backing, wrapper) pairs → string-list
+// (backing, wrapper) → map struct → functypes.
+function mAssignTypeIndices(n: i32): i32 {
+  mResetTypeIntern()
+
+  // ── the OLD offset formulas (kept as the Phase-G debug-assert oracle) ──
+  let structOffset = sNames.length
+  let oldUnionOffset = 0
+  let oldUVarIdx = structOffset
+  let oldUBoxIdx = structOffset + uVariants.length
+  if uDeclared { oldUnionOffset = uVariants.length + 1 }
+  let preTypes = structOffset + oldUnionOffset
+  let arrayOffset = 0
+  if aUsed { arrayOffset = 1 }
+  let listOffset = 0
+  if lUsed { listOffset = 1 }
+  let oldATypeIdx = preTypes
+  let oldLTypeIdx = preTypes + arrayOffset
+  let refPairBase = preTypes + arrayOffset + listOffset
+  let refPairsTotal = rlElemName.length * 2
+  let preMap = refPairBase + refPairsTotal
+  let oldMkArrIdx = preMap
+  let oldMkListIdx = preMap + 1
+  let oldMStructIdx = preMap + 2
+
+  // ── the NEW interned assignment (the single auditable counter) ──
+  // Standalone structs occupy the first `sNames.length` indices (decl order).
+  sHeapIdx = []
+  let shi = 0
+  while shi < sNames.length {
+    let si = mAllocType()
+    if mAssertIdx(si, shi, "struct") < 0 { return 0 - 1 }
+    sHeapIdx.push(si)
+    shi = shi + 1
+  }
+  // Union variant structs (nv of them) then the union box.
+  if uDeclared {
+    uVarIdx = mNextType
+    if mAssertIdx(uVarIdx, oldUVarIdx, "uVarIdx") < 0 { return 0 - 1 }
+    let vi = 0
+    while vi < uVariants.length {
+      mAllocType()
+      vi = vi + 1
+    }
+    uBoxIdx = mAllocType()
+    if mAssertIdx(uBoxIdx, oldUBoxIdx, "uBoxIdx") < 0 { return 0 - 1 }
+  }
+  // The raw i32 array (string rep + list/map backing), then the i32-list wrapper.
+  if aUsed {
+    aTypeIdx = mAllocType()
+    if mAssertIdx(aTypeIdx, oldATypeIdx, "aTypeIdx") < 0 { return 0 - 1 }
+  } else {
+    aTypeIdx = oldATypeIdx
+  }
+  if lUsed {
+    lTypeIdx = mAllocType()
+    if mAssertIdx(lTypeIdx, oldLTypeIdx, "lTypeIdx") < 0 { return 0 - 1 }
+  } else {
+    lTypeIdx = oldLTypeIdx
+  }
+  // The map struct index is needed BELOW to resolve a map-array ref-list element
+  // (it references `(ref null $mStructIdx)`), yet the map struct lands AFTER the ref
+  // pairs + string-list. It is computable up front from the counter: it follows the
+  // `refPairsTotal` ref-pair slots plus the 2 string-list slots.
+  let mStructIdxPre = mNextType + refPairsTotal + 2
+  // One (backing, wrapper) pair per distinct ref-list element type, interleaved.
+  let rs = 0
+  while rs < rlElemName.length {
+    let back = mAllocType()
+    let wrap = mAllocType()
+    if mAssertIdx(back, refPairBase + rs * 2, "rlBackIdx") < 0 { return 0 - 1 }
+    if mAssertIdx(wrap, refPairBase + rs * 2 + 1, "rlWrapIdx") < 0 { return 0 - 1 }
+    rlBackIdx[rs] = back
+    rlWrapIdx[rs] = wrap
+    if rlElemKindTbl[rs] == 2 {
+      rlElemHeap[rs] = uBoxIdx
+    } else if rlElemKindTbl[rs] == 3 {
+      rlElemHeap[rs] = mStructIdxPre
+    } else {
+      let esi = structIndexByName(rlElemName[rs])
+      if esi >= 0 { rlElemHeap[rs] = sHeapIdx[esi] } else { rlElemHeap[rs] = 0 }
+    }
+    rs = rs + 1
+  }
+  // The legacy singletons alias slot 0 (or the next index when no ref list).
+  if rlElemName.length >= 1 {
+    raTypeIdx = rlBackIdx[0]
+    rlTypeIdx = rlWrapIdx[0]
+  } else {
+    raTypeIdx = mNextType
+    rlTypeIdx = mNextType
+    if mAssertIdx(raTypeIdx, refPairBase, "raTypeIdx") < 0 { return 0 - 1 }
+  }
+  // The string-ref list (keys backing + keys wrapper), shared by the map's keys
+  // list AND any `string[]` field (present when `slUsed || mUsed`).
+  if slUsed || mUsed {
+    mkArrIdx = mAllocType()
+    mkListIdx = mAllocType()
+    if mAssertIdx(mkArrIdx, oldMkArrIdx, "mkArrIdx") < 0 { return 0 - 1 }
+    if mAssertIdx(mkListIdx, oldMkListIdx, "mkListIdx") < 0 { return 0 - 1 }
+  } else {
+    mkArrIdx = oldMkArrIdx
+    mkListIdx = oldMkListIdx
+  }
+  // The map struct (present only when `mUsed`).
+  if mUsed {
+    mStructIdx = mAllocType()
+    if mAssertIdx(mStructIdx, oldMStructIdx, "mStructIdx") < 0 { return 0 - 1 }
+    if mAssertIdx(mStructIdx, mStructIdxPre, "mStructIdxPre") < 0 { return 0 - 1 }
+  } else {
+    mStructIdx = oldMStructIdx
+  }
+  // The functypes follow; the first lands at the current counter (`typeOffset`).
+  let typeOffset = mNextType
+  let oldTypeOffset = preMap + strListOffsetOf() + mapStructOffsetOf()
+  if mAssertIdx(typeOffset, oldTypeOffset, "typeOffset") < 0 { return 0 - 1 }
+  typeOffset
+}
+
+// The string-list type count (keys backing + wrapper): 2 when present, else 0.
+function strListOffsetOf(): i32 {
+  if slUsed || mUsed { return 2 }
+  0
+}
+
+// The map-struct type count: 1 when a map is used, else 0.
+function mapStructOffsetOf(): i32 {
+  if mUsed { return 1 }
+  0
+}
+
 // Emit the complete module for the top-level functions in `fnStmts` (each a FuncDecl,
 // validated by `collectFns`/`buildFnMap`/`checkParams`). If a struct `type` was
 // declared, its WasmGC struct type is emitted FIRST (type index 0) and the functypes
@@ -5356,6 +5532,17 @@ function emitModule(stmts: i32[]): i32 {
   mkListIdx = preMap + 1
   mStructIdx = preMap + 2
   let typeOffset = preMap + mapOffset
+
+  // Phase G: re-derive every heap-type index through the centralized `mIntern*`
+  // counter and ASSERT each equals the old offset formula above (risk R2 — index
+  // drift). `mAssignTypeIndices` overwrites the same globals with values it asserts
+  // are identical, so live emission is unchanged; a divergence fails loudly here
+  // (never silenced). The old arithmetic above is retained as the assert oracle.
+  let internOffset = mAssignTypeIndices(n)
+  if internOffset < 0 { return 0 - 1 }
+  if internOffset != typeOffset {
+    return emitFail("emitProgram: Phase G typeOffset drift")
+  }
 
   // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
   // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`);
