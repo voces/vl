@@ -368,7 +368,7 @@ model is what lets those files still become the *one* module H-M2 requires.
 ### 2.4 `.vl` standard-library layout
 
 - **Where it lives.** A `std/` directory of `.vl` source in the repo (sibling to
-  `compiler/` and `samples/`). Source-controlled, testable with the existing `.vl`
+  `compiler/`). Source-controlled, testable with the existing `.vl`
   corpus (A12), and — critically for self-hosting — *just VL code the compiler
   already compiles*.
 - **Granularity — fine-grained `std:` modules, one per concern.** `std:list`,

@@ -2,7 +2,7 @@
 //
 // The formatter parses source to the typed AST and regenerates canonical source
 // from it. These tests assert its three core guarantees over the whole corpus
-// (tests/cases/**/*.vl + samples/), plus targeted reflow behavior:
+// (tests/cases/**/*.vl), plus targeted reflow behavior:
 //
 //   1. Idempotent:        format(format(s)) === format(s).
 //   2. Round-trip (AST):  the AST of format(s) is structurally equivalent to the
@@ -83,7 +83,6 @@ const hasSyntaxError = (source: string): boolean =>
 
 const CORPUS_DIRS = [
   new URL("./cases/", import.meta.url),
-  new URL("../samples/", import.meta.url),
 ];
 
 const walk = async function* (dir: URL): AsyncGenerator<URL> {
@@ -106,7 +105,7 @@ const corpusFiles = async (): Promise<URL[]> => {
 // One Deno.test per file keeps failures pinpointed to the offending source.
 const files = await corpusFiles();
 for (const file of files) {
-  const m = file.href.match(/\/(cases|samples)\/.*$/);
+  const m = file.href.match(/\/(cases)\/.*$/);
   const name = "corpus: " + (m ? m[0].slice(1) : file.href);
   const src = await Deno.readTextFile(file);
 
