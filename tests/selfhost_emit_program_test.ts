@@ -1219,6 +1219,147 @@ const CASES: Case[] = [
       if (got !== 32) throw new Error(`main() returned ${got}, expected 32`);
     },
   },
+  // ── G7-ref: ref-element growable lists (arrays of structs / unions) ─────────
+  // A growable list whose ELEMENT is a reference — `T[]` (a struct ref) or `N[]`
+  // (the union box ref) — reuses the `{ backing, len, cap }` wrapper, but its backing
+  // array slot is `(ref null $elem)` (nullable-widened so `array.new_default` defaults
+  // spare slots to null); an index READ `array.get`s then `ref.as_non_null`s the slot
+  // back to the non-null element. `.push`/index-set reuse the i32-list grow/store over
+  // the ref backing. These prove real `WebAssembly.instantiate` over the VL-emitted GC
+  // bytes — source → arena → bytes → engine — for the `Node[]`/`Tok[]` arena shapes.
+  // (Struct/union lists ride in GC refs, so the proofs construct + read internally and
+  // return i32s.)
+  {
+    name: "G7-ref: push structs onto a `T[]`, index a field + length => 18",
+    src: [
+      "type T = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: T[] = []",
+      "  xs.push({ v: 7 })",
+      "  xs.push({ v: 9 })",
+      "  return xs[0].v + xs[1].v + xs.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 7 + 9 + 2 = 18.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 18) throw new Error(`main() returned ${got}, expected 18`);
+    },
+  },
+  {
+    name: "G7-ref: build a `T[]` in a `while` loop, then sum a field => 16",
+    src: [
+      "type T = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: T[] = []",
+      "  let i = 0",
+      "  while i < 4 {",
+      "    xs.push({ v: i * 2 })",
+      "    i = i + 1",
+      "  }",
+      "  let s = 0",
+      "  let j = 0",
+      "  while j < xs.length {",
+      "    s = s + xs[j].v",
+      "    j = j + 1",
+      "  }",
+      "  return s + xs.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // elements v = 0,2,4,6 → sum 12; + length 4 = 16.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 16) throw new Error(`main() returned ${got}, expected 16`);
+    },
+  },
+  {
+    name: "G7-ref: a `T[]` literal with elements, then index + length => 25",
+    src: [
+      "type T = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: T[] = [{ v: 10 }, { v: 13 }]",
+      "  return xs[0].v + xs[1].v + xs.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 10 + 13 + 2 = 25.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 25) throw new Error(`main() returned ${got}, expected 25`);
+    },
+  },
+  {
+    name: "G7-ref: index-set a `T[]` element field, read it back => 42",
+    src: [
+      "type T = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: T[] = []",
+      "  xs.push({ v: 1 })",
+      "  xs[0] = { v: 42 }",
+      "  return xs[0].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 42) throw new Error(`main() returned ${got}, expected 42`);
+    },
+  },
+  {
+    name:
+      "G7-ref: push two union variants onto `N[]`, index one + `is`-narrow => 7",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type N = A | B",
+      "function main(): i32 {",
+      "  let ns: N[] = []",
+      "  ns.push({ av: 5 })",
+      "  ns.push({ bv: 8 })",
+      "  let n0 = ns[0]",
+      "  let r = 0",
+      "  if n0 is A { r = n0.av }",
+      "  return r + ns.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // n0 is A → r = 5; + length 2 = 7.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    name:
+      "G7-ref: `N[]` arena — push A & B, narrow each element to read its field => 17",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type N = A | B",
+      "function main(): i32 {",
+      "  let ns: N[] = []",
+      "  ns.push({ av: 9 })",
+      "  ns.push({ bv: 8 })",
+      "  let s = 0",
+      "  let i = 0",
+      "  while i < ns.length {",
+      "    let n = ns[i]",
+      "    if n is A { s = s + n.av }",
+      "    if n is B { s = s + n.bv }",
+      "    i = i + 1",
+      "  }",
+      "  return s",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // A.av 9 + B.bv 8 = 17.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 17) throw new Error(`main() returned ${got}, expected 17`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the

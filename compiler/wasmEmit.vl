@@ -322,6 +322,10 @@ let fRetStr: i32[] = []
 // alias, else `0`. Populated by `buildFnMap` so `fnRetUnion` is a flat lookup.
 let fRetUni: i32[] = []
 
+// Parallel to `fnNames`: `1` if the i-th function's declared RETURN type is a REF array
+// (`S[]`/`N[]`), else `0`. Populated by `buildFnMap` so `fnRetRefArray` is a flat lookup.
+let fRetRArr: i32[] = []
+
 // ── module-level GLOBALS (G2b) ────────────────────────────────────────────────
 // A top-level `let`/`const` (`LetDecl`) lowers to a wasm module GLOBAL (mutable),
 // emitted in the global section (id 6). Its wasm GLOBAL INDEX is its position among
@@ -397,6 +401,11 @@ function globalIsString(name: string): boolean {
   if li < 0 { return false }
   letIsString(li, 0 - 1)
 }
+function globalIsRefArray(name: string): boolean {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsRefArray(li, 0 - 1)
+}
 
 // Map each function NAME to its wasm function index (its position in `fnStmts`), and
 // record whether it returns the struct. Returns the function count.
@@ -407,6 +416,7 @@ function buildFnMap(stmts: i32[]): i32 {
   fRetArr = []
   fRetStr = []
   fRetUni = []
+  fRetRArr = []
   let i = 0
   while i < fnStmts.length {
     let s = P.nodes[fnStmts[i]]
@@ -417,6 +427,7 @@ function buildFnMap(stmts: i32[]): i32 {
       fRetArr.push(retArrFlag(s.fnRet))
       fRetStr.push(retStrFlag(s.fnRet))
       fRetUni.push(retUnionFlag(s.fnRet))
+      fRetRArr.push(retRefArrFlag(s.fnRet))
     }
     i = i + 1
   }
@@ -509,6 +520,13 @@ let localIsRef: i32[] = []
 let fnUsesPush: boolean = false
 let pushScratchBase: i32 = 0
 
+// The ref-list `.push` scratch triple (G7-ref): `pushRefVal` (the element ref),
+// `pushRefCap` (i32), `pushRefBacking` (a non-null `(ref $raTypeIdx)`). Allocated AFTER
+// the i32 triple (if any), only in a function that pushes onto a ref list. `fnUsesRefPush`
+// records whether this function reserved them; `refPushScratchBase` is `pushRefVal`'s index.
+let fnUsesRefPush: boolean = false
+let refPushScratchBase: i32 = 0
+
 // ── struct-type table (one struct per program, i32 fields only) ───────────────
 // This slice supports exactly ONE struct `type` per module; its WasmGC type lives at
 // type index 0 (func types follow at 1..N — see `emitModule`). `sDeclared` is a
@@ -548,6 +566,47 @@ let aTypeIdx: i32 = 0
 // `lTypeIdx` is the resolved heap-type index, computed in `emitModule`.
 let lUsed: boolean = false
 let lTypeIdx: i32 = 0
+
+// ── ref-element list-type table (G7-ref: arrays of structs / unions) ──────────
+// A growable list whose ELEMENT is a REFERENCE — `Tok[]` (a struct ref) or `Node[]`
+// (the union box ref) — uses the SAME `{ backing, len, cap }` wrapper shape as the
+// i32 list, but its backing array's element slot is a ref, not an i32. Mirroring
+// `toWasm.ts`'s `arraySlotWasmType`/`arrayReadCast` (verified empirically against the
+// TS compiler's emitted module for `T[]`/`N[]`):
+//
+//   • the BACKING array is `(array (mut (ref null $elem)))` — the element ref is
+//     NULLABLE-WIDENED so `array.new_default` (used by grow) can default the spare
+//     slots to `ref.null`. `$elem` is the struct type (heap-type 0) for a struct
+//     list, or the union BOX (`uBoxIdx`) for a union list. Its heap-type index is
+//     `raTypeIdx`.
+//   • the LIST WRAPPER is `{ backing: (ref $raTypeIdx), len: i32, cap: i32 }` — the
+//     identical triple, just over the ref backing. Its heap-type index is `rlTypeIdx`.
+//
+// A READ `xs[i]` is `array.get $raTypeIdx (backing) i` then `ref.as_non_null`
+// (`0xd4`) to surface the non-null element type (slots in `[0,len)` are always
+// populated, so the cast never traps) — that yields the struct ref / union box.
+// `.push`/index-set reuse the i32-list grow/store machinery, just over the ref
+// backing (`array.new_default`/`array.copy`/`array.set` over `$raTypeIdx`, and a
+// ref scratch backing local).
+//
+// `rElemKind` records the element kind: `1` = a struct ref (heap-type 0), `2` = the
+// union box ref (`uBoxIdx`). `raUsed`/`rlUsed` are presence flags (set by `collectA`);
+// `raTypeIdx`/`rlTypeIdx` are resolved in `emitModule`. ONE ref-element list type per
+// program (struct OR union element), alongside the existing i32 list — enough for the
+// `Tok[]` / `Node[]` arenas this slice targets.
+let raUsed: boolean = false
+let rlUsed: boolean = false
+let raTypeIdx: i32 = 0
+let rlTypeIdx: i32 = 0
+let rElemKind: i32 = 0
+
+// The kind an EMPTY `[]` literal constructs, set by the binding site (a `let`/global
+// whose declared type is a ref array `S[]`/`N[]`) just before its initializer is
+// lowered: `0` = i32 list (the default), `1` = struct-ref list, `2` = union-ref list.
+// `emitArr` consults this ONLY for an empty literal (a non-empty literal's kind comes
+// from its elements). Saved/restored is unnecessary — it is overwritten at each binding
+// and only read by the immediately-following empty-literal lowering.
+let pendingListKind: i32 = 0
 
 // ── discriminated-union table (G1: struct unions + `is`-narrowing) ────────────
 // A program may declare ONE union alias `type N = A | B | …` (a `UnionDecl`) whose
@@ -631,7 +690,9 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
     while i < stmts.length {
       let s = P.nodes[stmts[i]]
       if s is LetDecl {
-        if letIsUnion(stmts[i], fnIx) {
+        if letIsRefArray(stmts[i], fnIx) {
+          addLocalName(s.letName, 5)
+        } else if letIsUnion(stmts[i], fnIx) {
           addLocalName(s.letName, 4)
         } else if letIsStruct(stmts[i], fnIx) {
           addLocalName(s.letName, 1)
@@ -745,48 +806,54 @@ function buildLocals(fnIx: i32): i32 {
 }
 
 // True if the statement at `stmtIx` is a `recv.push(x)` member-call (the `Call` whose
-// `callFn` is a `Member` with property `push`). Used to detect whether a function needs
-// the inline-push scratch locals.
-function stmtIsPush(stmtIx: i32): boolean {
+// `callFn` is a `Member` with property `push`) whose RECEIVER's list kind matches
+// `wantRef` — `wantRef = false` selects an i32-list push, `true` a ref-list push (G7-ref).
+// Used to detect which inline-push scratch locals (i32 triple / ref triple) a function
+// needs; the two kinds get DISTINCT scratch slots so a function may push onto both.
+function stmtIsPushKind(stmtIx: i32, fnIx: i32, wantRef: boolean): boolean {
   let s = P.nodes[stmtIx]
   if s is Call {
     let callee = P.nodes[s.callFn]
     if callee is Member {
-      if callee.memProp == "push" { return true }
+      if callee.memProp == "push" {
+        let isRef = exprRefArray(callee.memObj, fnIx)
+        if wantRef { return isRef }
+        return !isRef
+      }
     }
   }
   false
 }
 
 // True if the block at `blockIx` (descending into `if` branches and `while` bodies, the
-// same scopes `collectLocals` walks) contains any `.push` call statement. A function
-// with a push reserves three scratch locals after its declared locals.
-function blockHasPush(blockIx: i32): boolean {
+// same scopes `collectLocals` walks) contains a `.push` of kind `wantRef`. A function
+// with such a push reserves the matching three scratch locals after its declared locals.
+function blockHasPushKind(blockIx: i32, fnIx: i32, wantRef: boolean): boolean {
   let b = P.nodes[blockIx]
   if b is Block {
     let stmts = b.blkStmts
     let i = 0
     while i < stmts.length {
-      if stmtIsPush(stmts[i]) { return true }
+      if stmtIsPushKind(stmts[i], fnIx, wantRef) { return true }
       let s = P.nodes[stmts[i]]
       if s is IfStmt {
-        if blockHasPush(s.ifThen) { return true }
+        if blockHasPushKind(s.ifThen, fnIx, wantRef) { return true }
         if s.ifElse >= 0 {
           let els = P.nodes[s.ifElse]
           if els is Block {
-            if blockHasPush(s.ifElse) { return true }
+            if blockHasPushKind(s.ifElse, fnIx, wantRef) { return true }
           } else if els is IfStmt {
-            if blockHasPush(els.ifThen) { return true }
+            if blockHasPushKind(els.ifThen, fnIx, wantRef) { return true }
             if els.ifElse >= 0 {
               let els2 = P.nodes[els.ifElse]
               if els2 is Block {
-                if blockHasPush(els.ifElse) { return true }
+                if blockHasPushKind(els.ifElse, fnIx, wantRef) { return true }
               }
             }
           }
         }
       } else if s is WhileStmt {
-        if blockHasPush(s.whileBody) { return true }
+        if blockHasPushKind(s.whileBody, fnIx, wantRef) { return true }
       }
       i = i + 1
     }
@@ -794,11 +861,20 @@ function blockHasPush(blockIx: i32): boolean {
   false
 }
 
-// True if the FuncDecl at `fnIx` contains a `.push` anywhere in its body.
+// True if the FuncDecl at `fnIx` contains an i32-list `.push` anywhere in its body.
 function fnHasPush(fnIx: i32): boolean {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    return blockHasPush(fn.fnBody)
+    return blockHasPushKind(fn.fnBody, fnIx, false)
+  }
+  false
+}
+
+// True if the FuncDecl at `fnIx` contains a ref-list `.push` anywhere in its body.
+function fnHasRefPush(fnIx: i32): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    return blockHasPushKind(fn.fnBody, fnIx, true)
   }
   false
 }
@@ -1271,15 +1347,48 @@ function emitStr(body: i32[], strIx: i32, fnIx: i32): i32 {
 // `array.new_fixed` of count 0 wrapped with len 0 / cap 0. An element that is itself an
 // array (nested) is out of scope — fails loudly.
 function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
-  if !lUsed {
-    return emitFail("emitProgram: array literal but list type not collected")
-  }
   let a = P.nodes[arrIx]
   if a is ArrayLit {
     let elems = a.arrElems
+    // A REF list literal — ref ELEMENTS, OR an empty `[]` whose binding annotation is a
+    // ref array (`pendingListKind` 1/2). The element store is `(ref null $elem)`; each
+    // element lowers via `emitExpr` (an objlit → struct.new / union box). Otherwise the
+    // i32 list path.
+    let isRefLit = arrLitIsRef(arrIx)
+    if elems.length == 0 {
+      if pendingListKind != 0 { isRefLit = true }
+    }
+    if isRefLit {
+      if !rlUsed {
+        return emitFail("emitProgram: ref array literal but ref list type not collected")
+      }
+      let i = 0
+      while i < elems.length {
+        if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
+          return emitFail("emitProgram: nested arrays are not supported")
+        }
+        if emitExpr(body, elems[i], fnIx) < 0 { return 0 - 1 }
+        i = i + 1
+      }
+      body.push(251)           // 0xfb GC prefix
+      body.push(8)             // array.new_fixed (builds the ref backing)
+      appendAll(body, ulebToArr(raTypeIdx))      // ref backing array type index
+      appendAll(body, ulebToArr(elems.length))   // element count
+      body.push(65)            // 0x41 i32.const (len)
+      appendAll(body, slebToArr(elems.length))
+      body.push(65)            // 0x41 i32.const (cap)
+      appendAll(body, slebToArr(elems.length))
+      body.push(251)           // 0xfb GC prefix
+      body.push(0)             // struct.new
+      appendAll(body, ulebToArr(rlTypeIdx))      // ref list wrapper struct type index
+      return 0
+    }
+    if !lUsed {
+      return emitFail("emitProgram: array literal but list type not collected")
+    }
     let i = 0
     while i < elems.length {
-      if exprArray(elems[i], fnIx) {
+      if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
         return emitFail("emitProgram: nested arrays are not supported")
       }
       if exprStruct(elems[i], fnIx) {
@@ -1314,11 +1423,31 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
 // `array.get` is `0xfb 0x0b <typeidx>` (the `_s/_u` forms `0x0c/0x0d` are only for
 // PACKED arrays; an unpacked i32 array uses `0x0b`).
 function emitIndex(body: i32[], idxIx: i32, fnIx: i32): i32 {
-  if !aUsed {
-    return emitFail("emitProgram: index access but array type not collected")
-  }
   let nd = P.nodes[idxIx]
   if nd is Index {
+    // A REF list `xs[i]` → unwrap to its `(ref null $elem)` backing, `array.get`, then
+    // `ref.as_non_null` (`0xd4`) to surface the non-null element (a struct ref / union
+    // box) — slots in `[0,len)` are always populated, so the cast never traps. (Checked
+    // BEFORE the `aUsed` guard: a pure ref-list program uses no i32 array.)
+    if exprRefArray(nd.idxArr, fnIx) {
+      if !raUsed {
+        return emitFail("emitProgram: ref index access but ref array type not collected")
+      }
+      if emitExpr(body, nd.idxArr, fnIx) < 0 { return 0 - 1 }
+      body.push(251)         // 0xfb GC prefix
+      body.push(2)           // struct.get (unwrap to backing)
+      appendAll(body, ulebToArr(rlTypeIdx))  // ref list wrapper struct type index
+      body.push(0)           // field 0: backing
+      if emitExpr(body, nd.idxIndex, fnIx) < 0 { return 0 - 1 }
+      body.push(251)         // 0xfb GC prefix
+      body.push(11)          // 0x0b array.get
+      appendAll(body, ulebToArr(raTypeIdx))  // ref backing array type index
+      body.push(212)         // 0xd4 ref.as_non_null (recover the non-null element)
+      return 0
+    }
+    if !aUsed {
+      return emitFail("emitProgram: index access but array type not collected")
+    }
     let isList = exprArray(nd.idxArr, fnIx)
     if !isList && !exprString(nd.idxArr, fnIx) {
       return emitFail("emitProgram: index receiver is not an array or string")
@@ -1349,6 +1478,15 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32): i32 {
 function emitArrLen(body: i32[], memIx: i32, fnIx: i32): i32 {
   let m = P.nodes[memIx]
   if m is Member {
+    // A REF list's `.length` is its wrapper's `len` field (`struct.get $rlTypeIdx 1`).
+    if exprRefArray(m.memObj, fnIx) {
+      if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
+      body.push(251)         // 0xfb GC prefix
+      body.push(2)           // struct.get
+      appendAll(body, ulebToArr(rlTypeIdx))  // ref list wrapper struct type index
+      body.push(1)           // field 1: len
+      return 0
+    }
     let isList = exprArray(m.memObj, fnIx)
     if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
     if isList {
@@ -1436,7 +1574,7 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // receiver falls through to the struct path (which fails loudly if no such field),
     // matching the slice's scope.
     if e.memProp == "length" {
-      if exprArray(e.memObj, fnIx) || exprString(e.memObj, fnIx) {
+      if exprArray(e.memObj, fnIx) || exprString(e.memObj, fnIx) || exprRefArray(e.memObj, fnIx) {
         return emitArrLen(body, exprIx, fnIx)
       }
     }
@@ -1534,25 +1672,37 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       return 0
     }
     if target is Index {
-      // Indexed store `a[i] = v`: unwrap the list to its backing (`struct.get
-      // $lTypeIdx 0`), push the index, then the value, then `array.set $aTypeIdx`
-      // (`0xfb 0x0e <typeidx>`). The receiver must be a list; the value is an i32.
-      if !lUsed {
-        return emitFail("emitProgram: indexed assignment but list type not collected")
-      }
-      if !exprArray(target.idxArr, fnIx) {
-        return emitFail("emitProgram: indexed-assignment target is not an array")
+      // Indexed store `a[i] = v`: unwrap the list to its backing (`struct.get $lTy 0`),
+      // push the index, then the value, then `array.set $aTy` (`0xfb 0x0e <typeidx>`). A
+      // REF list (G7-ref) stores a struct ref / union box (a subtype of the `(ref null
+      // $elem)` slot) over the ref list/backing indices; an i32 list stores an i32.
+      let isRef = exprRefArray(target.idxArr, fnIx)
+      let lTy = lTypeIdx
+      let aTy = aTypeIdx
+      if isRef {
+        if !rlUsed {
+          return emitFail("emitProgram: ref indexed assignment but ref list type not collected")
+        }
+        lTy = rlTypeIdx
+        aTy = raTypeIdx
+      } else {
+        if !lUsed {
+          return emitFail("emitProgram: indexed assignment but list type not collected")
+        }
+        if !exprArray(target.idxArr, fnIx) {
+          return emitFail("emitProgram: indexed-assignment target is not an array")
+        }
       }
       if emitExpr(body, target.idxArr, fnIx) < 0 { return 0 - 1 }
       body.push(251)         // 0xfb GC prefix
       body.push(2)           // struct.get (unwrap to backing)
-      appendAll(body, ulebToArr(lTypeIdx))    // list wrapper struct type index
+      appendAll(body, ulebToArr(lTy))         // list wrapper struct type index
       body.push(0)           // field 0: backing
       if emitExpr(body, target.idxIndex, fnIx) < 0 { return 0 - 1 }
       if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
       body.push(251)         // 0xfb GC prefix
       body.push(14)          // 0x0e array.set
-      appendAll(body, ulebToArr(aTypeIdx))    // raw array type index
+      appendAll(body, ulebToArr(aTy))         // backing array type index
       return 0
     }
     if target is Member {
@@ -1600,20 +1750,38 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
 //   }
 //   backing(L)[len(L)] = V                             ; write at the end
 //   L.len = len(L) + 1                                 ; bump the length
-// `len`/`cap`/`backing` are `struct.get $lTypeIdx` of fields 1/2/0; the field setters are
-// `struct.set $lTypeIdx`. `array.copy` is `0xfb 0x11 <dest> <src>` (both the raw array).
+// `len`/`cap`/`backing` are `struct.get $lTy` of fields 1/2/0; the field setters are
+// `struct.set $lTy`. `array.copy` is `0xfb 0x11 <dest> <src>` (both the backing array).
+//
+// G7-ref: a REF-list `.push` runs the IDENTICAL sequence over the ref list/backing type
+// indices + ref scratch triple (`lTy = rlTypeIdx`, `aTy = raTypeIdx`, scratch base
+// `refPushScratchBase`). The value is a struct ref / union box (emitted by the SAME
+// `emitExpr`); `array.new_default` over the `(ref null $elem)` backing zero-inits spare
+// slots to null, and `array.set` writes the non-null value (a subtype of the slot).
 function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
-  if !lUsed {
-    return emitFail("emitProgram: .push but list type not collected")
-  }
   let c = P.nodes[callIx]
   if c is Call {
     let callee = P.nodes[c.callFn]
     if callee is Member {
       let recv = P.nodes[callee.memObj]
       if recv is Ident {
-        if !exprArray(callee.memObj, fnIx) {
+        let isRef = exprRefArray(callee.memObj, fnIx)
+        if !isRef && !exprArray(callee.memObj, fnIx) {
           return emitFail("emitProgram: .push receiver is not a list")
+        }
+        // Pick the list/backing type indices + scratch base for this push kind.
+        let lTy = lTypeIdx
+        let aTy = aTypeIdx
+        let base = pushScratchBase
+        if isRef {
+          if !rlUsed {
+            return emitFail("emitProgram: ref .push but ref list type not collected")
+          }
+          lTy = rlTypeIdx
+          aTy = raTypeIdx
+          base = refPushScratchBase
+        } else if !lUsed {
+          return emitFail("emitProgram: .push but list type not collected")
         }
         let lIdx = localIndexOf(fnIx, recv.identName)
         if lIdx < 0 {
@@ -1622,40 +1790,40 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         if c.callArgs.length != 1 {
           return emitFail("emitProgram: .push takes exactly one argument")
         }
-        let valIdx = pushScratchBase
-        let capIdx = pushScratchBase + 1
-        let backIdx = pushScratchBase + 2
+        let valIdx = base
+        let capIdx = base + 1
+        let backIdx = base + 2
         // V = x
         if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
         body.push(33)          // local.set
         appendAll(body, ulebToArr(valIdx))
         // if len(L) == cap(L)
-        pushListLen(body, lIdx)
-        pushListCap(body, lIdx)
+        pushListLen(body, lIdx, lTy)
+        pushListCap(body, lIdx, lTy)
         body.push(70)          // 0x46 i32.eq
         body.push(4)           // 0x04 if
         body.push(64)          // 0x40 void blocktype
         // NC = (cap(L) == 0) ? 4 : cap(L) * 2   — via if/else yielding i32
-        pushListCap(body, lIdx)
+        pushListCap(body, lIdx, lTy)
         body.push(69)          // 0x45 i32.eqz  (cap == 0)
         body.push(4)           // 0x04 if
         body.push(127)         // 0x7f i32 blocktype (yields an i32)
         body.push(65)          // i32.const 4
         appendAll(body, slebToArr(4))
         body.push(5)           // 0x05 else
-        pushListCap(body, lIdx)
+        pushListCap(body, lIdx, lTy)
         body.push(65)          // i32.const 2
         appendAll(body, slebToArr(2))
         body.push(108)         // 0x6c i32.mul
         body.push(11)          // 0x0b end (if/else)
         body.push(33)          // local.set NC
         appendAll(body, ulebToArr(capIdx))
-        // NB = array.new_default $aTypeIdx NC
+        // NB = array.new_default $aTy NC
         body.push(32)          // local.get NC
         appendAll(body, ulebToArr(capIdx))
         body.push(251)         // 0xfb
         body.push(7)           // array.new_default
-        appendAll(body, ulebToArr(aTypeIdx))
+        appendAll(body, ulebToArr(aTy))
         body.push(33)          // local.set NB
         appendAll(body, ulebToArr(backIdx))
         // array.copy NB 0 backing(L) 0 len(L)
@@ -1663,14 +1831,14 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         appendAll(body, ulebToArr(backIdx))
         body.push(65)          // i32.const 0 (dest offset)
         appendAll(body, slebToArr(0))
-        pushListBacking(body, lIdx)   // src
+        pushListBacking(body, lIdx, lTy)   // src
         body.push(65)          // i32.const 0 (src offset)
         appendAll(body, slebToArr(0))
-        pushListLen(body, lIdx)       // count
+        pushListLen(body, lIdx, lTy)       // count
         body.push(251)         // 0xfb
         body.push(17)          // 0x11 array.copy
-        appendAll(body, ulebToArr(aTypeIdx))   // dest type
-        appendAll(body, ulebToArr(aTypeIdx))   // src type
+        appendAll(body, ulebToArr(aTy))    // dest type
+        appendAll(body, ulebToArr(aTy))    // src type
         // L.backing = NB
         body.push(32)          // local.get L
         appendAll(body, ulebToArr(lIdx))
@@ -1678,7 +1846,7 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         appendAll(body, ulebToArr(backIdx))
         body.push(251)         // 0xfb
         body.push(5)           // struct.set
-        appendAll(body, ulebToArr(lTypeIdx))
+        appendAll(body, ulebToArr(lTy))
         body.push(0)           // field 0: backing
         // L.cap = NC
         body.push(32)          // local.get L
@@ -1687,27 +1855,27 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         appendAll(body, ulebToArr(capIdx))
         body.push(251)         // 0xfb
         body.push(5)           // struct.set
-        appendAll(body, ulebToArr(lTypeIdx))
+        appendAll(body, ulebToArr(lTy))
         body.push(2)           // field 2: cap
         body.push(11)          // 0x0b end (if)
         // backing(L)[len(L)] = V
-        pushListBacking(body, lIdx)
-        pushListLen(body, lIdx)
+        pushListBacking(body, lIdx, lTy)
+        pushListLen(body, lIdx, lTy)
         body.push(32)          // local.get V
         appendAll(body, ulebToArr(valIdx))
         body.push(251)         // 0xfb
         body.push(14)          // 0x0e array.set
-        appendAll(body, ulebToArr(aTypeIdx))
+        appendAll(body, ulebToArr(aTy))
         // L.len = len(L) + 1
         body.push(32)          // local.get L
         appendAll(body, ulebToArr(lIdx))
-        pushListLen(body, lIdx)
+        pushListLen(body, lIdx, lTy)
         body.push(65)          // i32.const 1
         appendAll(body, slebToArr(1))
         body.push(106)         // 0x6a i32.add
         body.push(251)         // 0xfb
         body.push(5)           // struct.set
-        appendAll(body, ulebToArr(lTypeIdx))
+        appendAll(body, ulebToArr(lTy))
         body.push(1)           // field 1: len
         return 0
       }
@@ -1717,35 +1885,35 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected a .push call")
 }
 
-// `local.get L ; struct.get $lTypeIdx 1` — push the list's `len` field onto `body`.
-function pushListLen(body: i32[], lIdx: i32): i32 {
+// `local.get L ; struct.get $lTy 1` — push the list's `len` field onto `body`.
+function pushListLen(body: i32[], lIdx: i32, lTy: i32): i32 {
   body.push(32)              // local.get
   appendAll(body, ulebToArr(lIdx))
   body.push(251)             // 0xfb
   body.push(2)               // struct.get
-  appendAll(body, ulebToArr(lTypeIdx))
+  appendAll(body, ulebToArr(lTy))
   body.push(1)               // field 1: len
   0
 }
 
-// `local.get L ; struct.get $lTypeIdx 2` — push the list's `cap` field onto `body`.
-function pushListCap(body: i32[], lIdx: i32): i32 {
+// `local.get L ; struct.get $lTy 2` — push the list's `cap` field onto `body`.
+function pushListCap(body: i32[], lIdx: i32, lTy: i32): i32 {
   body.push(32)              // local.get
   appendAll(body, ulebToArr(lIdx))
   body.push(251)             // 0xfb
   body.push(2)               // struct.get
-  appendAll(body, ulebToArr(lTypeIdx))
+  appendAll(body, ulebToArr(lTy))
   body.push(2)               // field 2: cap
   0
 }
 
-// `local.get L ; struct.get $lTypeIdx 0` — push the list's `backing` ref onto `body`.
-function pushListBacking(body: i32[], lIdx: i32): i32 {
+// `local.get L ; struct.get $lTy 0` — push the list's `backing` ref onto `body`.
+function pushListBacking(body: i32[], lIdx: i32, lTy: i32): i32 {
   body.push(32)              // local.get
   appendAll(body, ulebToArr(lIdx))
   body.push(251)             // 0xfb
   body.push(2)               // struct.get
-  appendAll(body, ulebToArr(lTypeIdx))
+  appendAll(body, ulebToArr(lTy))
   body.push(0)               // field 0: backing
   0
 }
@@ -1795,7 +1963,11 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     if s.letInit < 0 {
       return emitFail("emitProgram: local declaration needs an initializer")
     }
+    // An empty `[]` initializer over a ref-array annotation (`let xs: T[] = []`) needs
+    // the element kind to pick the ref-list construction — record it for `emitArr`.
+    pendingListKind = letAnnRefListKind(stmtIx)
     if emitExpr(body, s.letInit, fnIx) < 0 { return 0 - 1 }
+    pendingListKind = 0
     body.push(33)            // 0x21 local.set
     appendAll(body, ulebToArr(idx))
     return 0
@@ -1976,19 +2148,28 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     // inline-push sequence reads `pushScratchBase`+0/+1/+2. Set BEFORE `emitStmts` so a
     // `.push` can resolve its scratch slots.
     fnUsesPush = fnHasPush(fnIx)
+    fnUsesRefPush = fnHasRefPush(fnIx)
     let nLocals = localNames.length
     pushScratchBase = fn.fnParams.length + nLocals
+    // The ref-push scratch triple (if any) follows the i32 triple.
+    let i32Scratch = 0
+    if fnUsesPush { i32Scratch = 3 }
+    refPushScratchBase = fn.fnParams.length + nLocals + i32Scratch
 
     let bodyExpr: i32[] = []
     if emitStmts(bodyExpr, fn.fnBody, fnIx) < 0 { return 0 - 1 }
 
     let body: i32[] = []
-    // Locals vector: one (count=1, valtype) run per DECLARED local (a struct/list/string
-    // ref or i32 — see `pushVT`), then — when this function pushes — three scratch runs:
-    // `pushVal` i32 (`0x7f`), `pushNewCap` i32 (`0x7f`), `pushNewBacking` nullable raw-
-    // array ref (`0x63 <aTypeIdx>`, defaultable to null).
+    // Locals vector: one (count=1, valtype) run per DECLARED local (a struct/list/string/
+    // ref-list ref or i32 — see `pushVT`), then — when this function pushes — three scratch
+    // runs PER push kind: the i32 triple (`pushVal` i32, `pushNewCap` i32, `pushNewBacking`
+    // non-null `(ref $aTypeIdx)`), then — for a ref-list push (G7-ref) — the ref triple
+    // (`pushRefVal` non-null `(ref $elem)`, `pushRefCap` i32, `pushRefBacking` non-null
+    // `(ref $raTypeIdx)`). Each scratch is non-defaultable but always `local.set` before
+    // read, which wasm validation accepts.
     let nRuns = nLocals
     if fnUsesPush { nRuns = nRuns + 3 }
+    if fnUsesRefPush { nRuns = nRuns + 3 }
     appendAll(body, ulebToArr(nRuns))
     let li = 0
     while li < nLocals {
@@ -2003,9 +2184,17 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(127)         // pushNewCap: 0x7f i32
       body.push(1)
       body.push(100)         // pushNewBacking: 0x64 (ref ht) — non-null, matches the
-      appendAll(body, ulebToArr(aTypeIdx))   // struct's non-null backing field; the
-      // local is non-defaultable but always `local.set` (from `array.new_default`)
-      // before any read inside the grow branch, which wasm validation accepts.
+      appendAll(body, ulebToArr(aTypeIdx))   // struct's non-null backing field.
+    }
+    if fnUsesRefPush {
+      body.push(1)
+      body.push(100)         // pushRefVal: 0x64 (ref $elem) — non-null element ref
+      appendAll(body, ulebToArr(refElemHeapType()))
+      body.push(1)
+      body.push(127)         // pushRefCap: 0x7f i32
+      body.push(1)
+      body.push(100)         // pushRefBacking: 0x64 (ref $raTypeIdx) — non-null ref backing
+      appendAll(body, ulebToArr(raTypeIdx))
     }
     appendAll(body, bodyExpr)
     body.push(11)            // 0x0b end
@@ -2039,14 +2228,27 @@ function paramTRFlag(paramIx: i32): i32 {
   0
 }
 
-// `1` if the type-annotation node at `tyIx` is an array type (`i32[]`), else `0`.
+// `1` if the type-annotation node at `tyIx` is the i32 array type (`i32[]`), else `0`.
 // The functype/local valtype layer multiplexes the struct/array/i32 cases through one
-// `kind` code, so this flat flag feeds the `kind == 2` (array) branch of `pushVT`.
+// `kind` code, so this flat flag feeds the `kind == 2` (array) branch of `pushVT`. A REF
+// array (`S[]`/`N[]`) is NOT this — it feeds `kind == 5` via `retRefArrFlag`.
 function retArrFlag(tyIx: i32): i32 {
   if tyIx >= 0 {
     let ty = P.nodes[tyIx]
     if ty is TypeRef {
-      if nameIsArray(ty.tyName) { return 1 }
+      if nameIsI32Array(ty.tyName) { return 1 }
+    }
+  }
+  0
+}
+
+// `1` if the type-annotation node at `tyIx` is a REF array (`S[]`/`N[]`), else `0`.
+// Feeds the `kind == 5` (ref list) branch of `pushVT` and the `fRetRArr` table.
+function retRefArrFlag(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if nameIsRefArray(ty.tyName) { return 1 }
     }
   }
   0
@@ -2080,6 +2282,7 @@ function retStrFlag(tyIx: i32): i32 {
 // is a distinct code from array purely for typedness clarity; `pushVT` emits the SAME
 // array ref valtype for both, since a string IS the i32-array type here.
 function vtKindOfType(tyIx: i32): i32 {
+  if retRefArrFlag(tyIx) == 1 { return 5 }
   if retUnionFlag(tyIx) == 1 { return 4 }
   if retTRFlag(tyIx) == 1 { return 1 }
   if retArrFlag(tyIx) == 1 { return 2 }
@@ -2123,8 +2326,22 @@ function globalKind(initIx: i32): i32 {
     if uDeclared { return 4 }
     return 1
   }
-  if e is ArrayLit { return 2 }
+  if e is ArrayLit {
+    // A ref-element array literal is a ref list (kind 5); an i32/empty literal is the
+    // i32 list (kind 2). A module-global empty `[]` over a ref type is out of scope
+    // (a global ref-list constexpr needs the binding annotation — deferred).
+    if arrLitIsRef(initIx) { return 5 }
+    return 2
+  }
   if e is StrLit { return 3 }
+  0
+}
+
+// The heap-type index of a ref list's ELEMENT: the struct (heap-type 0) when
+// `rElemKind == 1`, or the union box (`uBoxIdx`) when `rElemKind == 2`. Used for the
+// ref backing's element ref, the index-read `ref.cast`/result, and the push value.
+function refElemHeapType(): i32 {
+  if rElemKind == 2 { return uBoxIdx }
   0
 }
 
@@ -2152,6 +2369,9 @@ function pushVT(payload: i32[], kind: i32): i32 {
   } else if kind == 4 {
     payload.push(100)          // 0x64 (ref ht) — non-null ref
     appendAll(payload, ulebToArr(uBoxIdx))    // the union box `{tag, value}` heap-type index
+  } else if kind == 5 {
+    payload.push(100)          // 0x64 (ref ht) — non-null ref
+    appendAll(payload, ulebToArr(rlTypeIdx))  // the REF-list wrapper struct heap-type index
   } else {
     payload.push(127)          // 0x7f i32
   }
@@ -2196,7 +2416,17 @@ function emitModule(stmts: i32[]): i32 {
   if lUsed { listOffset = 1 }
   aTypeIdx = preTypes
   lTypeIdx = preTypes + arrayOffset
-  let typeOffset = preTypes + arrayOffset + listOffset
+  // The REF-element backing array + list wrapper (G7-ref) follow the i32 array/list, so
+  // each REFERENCES an already-emitted earlier type: the ref backing's element is the
+  // struct (heap-type 0) / union box (`uBoxIdx`), and the ref-list wrapper references the
+  // ref backing. `raTypeIdx`/`rlTypeIdx` are 0 or 1 each.
+  let refArrOffset = 0
+  if raUsed { refArrOffset = 1 }
+  let refListOffset = 0
+  if rlUsed { refListOffset = 1 }
+  raTypeIdx = preTypes + arrayOffset + listOffset
+  rlTypeIdx = preTypes + arrayOffset + listOffset + refArrOffset
+  let typeOffset = preTypes + arrayOffset + listOffset + refArrOffset + refListOffset
 
   // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
   // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`);
@@ -2254,6 +2484,29 @@ function emitModule(stmts: i32[]): i32 {
     typePayload.push(3)          // 3 fields
     typePayload.push(100)        // field 0 backing: 0x64 (ref ht) — non-null
     appendAll(typePayload, ulebToArr(aTypeIdx))   // ...to the raw array heap type
+    typePayload.push(1)          // mutable
+    typePayload.push(127)        // field 1 len: 0x7f i32
+    typePayload.push(1)          // mutable
+    typePayload.push(127)        // field 2 cap: 0x7f i32
+    typePayload.push(1)          // mutable
+  }
+  if raUsed {
+    // The REF backing array `(array (mut (ref null $elem)))` (G7-ref). Its element is a
+    // NULLABLE ref (`0x63 <elem>` — `(ref null ht)`) so `array.new_default` can default
+    // the spare slots to null; reads `ref.as_non_null` it back. `$elem` is the struct
+    // (heap-type 0) for a struct list, or the union box (`uBoxIdx`) for a union list.
+    typePayload.push(94)         // 0x5e array
+    typePayload.push(99)         // 0x63 (ref null ht) — nullable element ref
+    appendAll(typePayload, ulebToArr(refElemHeapType()))
+    typePayload.push(1)          // mutable
+  }
+  if rlUsed {
+    // The REF-list wrapper `{ backing: (ref $raTypeIdx), len: i32, cap: i32 }` — the same
+    // triple as the i32 list, over the ref backing.
+    typePayload.push(95)         // 0x5f struct
+    typePayload.push(3)          // 3 fields
+    typePayload.push(100)        // field 0 backing: 0x64 (ref ht) — non-null
+    appendAll(typePayload, ulebToArr(raTypeIdx))   // ...to the ref backing array
     typePayload.push(1)          // mutable
     typePayload.push(127)        // field 1 len: 0x7f i32
     typePayload.push(1)          // mutable
@@ -2397,6 +2650,37 @@ function nameIsArray(name: string): boolean {
   true
 }
 
+// True if the array type-name `name` is `i32[]` (the value-element list whose backing
+// is the raw `(array (mut i32))`). A `T[]`/`N[]` (struct/union element) is NOT this.
+function nameIsI32Array(name: string): boolean {
+  name == "i32[]"
+}
+
+// True if the array type-name `name` is a REF-element list — `S[]` over the declared
+// struct, or `N[]` over the declared union alias (the box-ref element). Either lowers
+// to the `{ backing: (ref $raTypeIdx), len, cap }` wrapper over a `(ref null $elem)`
+// backing (G7-ref). A non-`[]` name or an `i32[]` is NOT a ref array. The element name
+// is recovered by string concat — `S[]` IS `sName + "[]"` — avoiding a char-by-char
+// substring (a `string + i32` is a type error; a `string + string` is fine).
+function nameIsRefArray(name: string): boolean {
+  if sDeclared {
+    if name == sName + "[]" { return true }
+  }
+  if uDeclared {
+    if name == uName + "[]" { return true }
+  }
+  false
+}
+
+// The ref-element kind for an array type-name (assumes `nameIsRefArray(name)`):
+// `1` = a struct element (heap-type 0), `2` = a union-box element (`uBoxIdx`).
+function refArrElemKind(name: string): i32 {
+  if uDeclared {
+    if name == uName + "[]" { return 2 }
+  }
+  1
+}
+
 // True if the type-name `name` is exactly `string`. A VL string is CURRENTLY an
 // `array i32` of code points (`docs/strings-design.md`), so it shares the array heap
 // type — hence string use also sets `aUsed` and string valtypes reuse the array ref.
@@ -2406,12 +2690,14 @@ function nameIsString(name: string): boolean {
   name == "string"
 }
 
-// Validate an array type-name as the single supported element type: exactly `i32[]`
-// (one `[]` over an `i32` base). A nested `i32[][]` or non-i32 element fails loudly.
-// Returns 0 on success, or -1 (via `emitFail`).
+// Validate an array type-name as a supported element type: `i32[]` (the value list),
+// or a REF list `S[]`/`N[]` over the declared struct / union alias (G7-ref). A nested
+// `i32[][]` or an array of an unknown / unsupported element fails loudly. Returns 0 on
+// success, or -1 (via `emitFail`).
 function checkArrName(name: string): i32 {
   if name == "i32[]" { return 0 }
-  emitFail("emitProgram: only i32[] arrays are supported")
+  if nameIsRefArray(name) { return 0 }
+  emitFail("emitProgram: only i32[] arrays and struct/union element arrays are supported")
 }
 
 // Scan the whole arena for any use of the shared `(array (mut i32))` heap type — an
@@ -2426,17 +2712,35 @@ function checkArrName(name: string): i32 {
 function collectA(stmts: i32[]): i32 {
   aUsed = false
   lUsed = false
+  raUsed = false
+  rlUsed = false
+  rElemKind = 0
   let i = 0
   while i < P.nodes.length {
     let nd = P.nodes[i]
     if nd is ArrayLit {
-      // A `[…]` literal is a growable list; its backing is the raw array.
-      lUsed = true
-      aUsed = true
+      // A `[…]` literal is a growable list. A literal with struct/union-variant
+      // elements is a REF list (its backing is `(ref null $elem)`); an i32-element
+      // or EMPTY literal contributes the i32 list (an empty `[]` over a REF type is
+      // typed by its binding's annotation, collected via the TypeRef branch — so the
+      // i32 list types it also forces are harmless presence, never wrong bytes).
+      if arrLitIsRef(i) {
+        rlUsed = true
+        raUsed = true
+        rElemKind = arrLitElemKind(i)
+      } else {
+        lUsed = true
+        aUsed = true
+      }
     } else if nd is StrLit {
       aUsed = true
     } else if nd is TypeRef {
-      if nameIsArray(nd.tyName) {
+      if nameIsRefArray(nd.tyName) {
+        // A `S[]`/`N[]` annotation is a ref list (wrapper + `(ref null $elem)` backing).
+        rlUsed = true
+        raUsed = true
+        rElemKind = refArrElemKind(nd.tyName)
+      } else if nameIsArray(nd.tyName) {
         if checkArrName(nd.tyName) < 0 { return 0 - 1 }
         // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
         lUsed = true
@@ -2448,6 +2752,28 @@ function collectA(stmts: i32[]): i32 {
     i = i + 1
   }
   0
+}
+
+// True if the array literal at `arrIx` has ref ELEMENTS — its first element is a
+// struct object literal (a `T[]` element) or a union-variant object literal (an
+// `N[]` element). An empty literal is NOT detectable here (it has no elements); its
+// kind comes from the binding annotation (`pendingListKind`).
+function arrLitIsRef(arrIx: i32): boolean {
+  let a = P.nodes[arrIx]
+  if a is ArrayLit {
+    if a.arrElems.length < 1 { return false }
+    let e0 = P.nodes[a.arrElems[0]]
+    if e0 is ObjLit { return true }
+  }
+  false
+}
+
+// The ref-element kind of the array literal at `arrIx` (assumes `arrLitIsRef`): `2`
+// when the program declares a union (every objlit element boxes into the union), else
+// `1` (a direct struct element).
+function arrLitElemKind(arrIx: i32): i32 {
+  if uDeclared { return 2 }
+  1
 }
 
 // True if the node at `ix` is a struct `type` declaration (a single-level narrowing
@@ -2729,6 +3055,10 @@ function exprStruct(exprIx: i32, fnIx: i32): boolean {
     if declaredStruct(e.identName) { return true }
     return globalIsStruct(e.identName)
   }
+  // `xs[i]` over a STRUCT-element ref list yields the struct (G7-ref).
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) { return rElemKind == 1 }
+  }
   false
 }
 
@@ -2830,6 +3160,11 @@ function exprUnion(exprIx: i32, fnIx: i32): boolean {
     if paramUnion(fnIx, e.identName) { return true }
     return declaredUnion(e.identName)
   }
+  // `ns[i]` over a UNION-element ref list yields the union box (G7-ref) — so the value
+  // is usable with `is`-narrowing (a `let n0 = ns[i]` is a union local).
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) { return rElemKind == 2 }
+  }
   false
 }
 
@@ -2903,7 +3238,7 @@ function paramArray(fnIx: i32, name: string): boolean {
         if p.parName == name {
           if p.parType >= 0 {
             let ty = P.nodes[p.parType]
-            if ty is TypeRef { return nameIsArray(ty.tyName) }
+            if ty is TypeRef { return nameIsI32Array(ty.tyName) }
           }
           return false
         }
@@ -2914,7 +3249,7 @@ function paramArray(fnIx: i32, name: string): boolean {
   false
 }
 
-// True if the already-collected declared local `name` is an array ref (code `2`).
+// True if the already-collected declared local `name` is an i32-array ref (code `2`).
 function declaredArray(name: string): boolean {
   let i = 0
   while i < localNames.length {
@@ -2927,12 +3262,13 @@ function declaredArray(name: string): boolean {
 }
 
 // True if evaluating the expression at `exprIx` yields the i32 array: an array
-// literal, an array-returning call, an array param/local reference, or a parenthesized
-// array expression. An index read / `.length` yields an i32, so neither counts.
+// literal (with i32 / no elements — a ref-element literal is NOT this), an
+// array-returning call, an array param/local reference, or a parenthesized array
+// expression. An index read / `.length` yields an i32, so neither counts.
 function exprArray(exprIx: i32, fnIx: i32): boolean {
   if exprIx < 0 { return false }
   let e = P.nodes[exprIx]
-  if e is ArrayLit { return true }
+  if e is ArrayLit { return !arrLitIsRef(exprIx) }
   if e is Paren { return exprArray(e.parInner, fnIx) }
   if e is Call {
     let callee = P.nodes[e.callFn]
@@ -2956,12 +3292,117 @@ function letIsArray(letIx: i32, fnIx: i32): boolean {
     if d.letType >= 0 {
       let lt = P.nodes[d.letType]
       if lt is TypeRef {
-        if nameIsArray(lt.tyName) { return true }
+        if nameIsI32Array(lt.tyName) { return true }
       }
     }
     return exprArray(d.letInit, fnIx)
   }
   false
+}
+
+// ── ref-array-typedness of expressions (G7-ref) ───────────────────────────────
+// Parallel to the i32-array family: decide whether an expression / param / local
+// PRODUCES a REF list — `Tok[]` / `Node[]`, a `(ref $rlTypeIdx)`. Its receiver shapes
+// mirror `exprArray` but for `S[]`/`N[]` annotations (the index/`.length` reads still
+// yield i32 / the element, not the list). `localIsRef` code `5` flags a ref-list local.
+
+// True if function `name` declares a ref array (`S[]`/`N[]`) as its return type.
+function fnRetRefArray(name: string): boolean {
+  let i = 0
+  while i < fnNames.length {
+    if fnNames[i] == name { return fRetRArr[i] == 1 }
+    i = i + 1
+  }
+  false
+}
+
+// True if the parameter `name` of function `fnIx` is a ref-array type.
+function paramRefArray(fnIx: i32, name: string): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef { return nameIsRefArray(ty.tyName) }
+          }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the already-collected declared local `name` is a ref-list ref (code `5`).
+function declaredRefArray(name: string): boolean {
+  let i = 0
+  while i < localNames.length {
+    if localNames[i] == name {
+      return localIsRef[i] == 5
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True if evaluating the expression at `exprIx` yields a ref list: a ref-element array
+// literal, a ref-array-returning call, a ref-array param/local reference, or a
+// parenthesized ref-array expression. An index read / `.length` is NOT a list.
+function exprRefArray(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is ArrayLit { return arrLitIsRef(exprIx) }
+  if e is Paren { return exprRefArray(e.parInner, fnIx) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident { return fnRetRefArray(callee.identName) }
+    return false
+  }
+  if e is Ident {
+    if paramRefArray(fnIx, e.identName) { return true }
+    if declaredRefArray(e.identName) { return true }
+    return globalIsRefArray(e.identName)
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` declares a ref-list local: its annotation is a ref
+// array (`S[]`/`N[]`), OR its initializer produces a ref list. Picks the local's valtype
+// (`(ref $rlTypeIdx)`) and the code-`5` flag in `collectLocals`.
+function letIsRefArray(letIx: i32, fnIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if nameIsRefArray(lt.tyName) { return true }
+      }
+    }
+    return exprRefArray(d.letInit, fnIx)
+  }
+  false
+}
+
+// The ref-list element kind a `LetDecl`'s ANNOTATION declares (`S[]` → 1, `N[]` → 2),
+// or `0` when it is not a ref-array annotation. Used to type an empty `[]` initializer
+// (a non-empty literal types itself from its elements).
+function letAnnRefListKind(letIx: i32): i32 {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if nameIsRefArray(lt.tyName) { return refArrElemKind(lt.tyName) }
+      }
+    }
+  }
+  0
 }
 
 // ── string-typedness of expressions ──────────────────────────────────────────

@@ -344,9 +344,13 @@ independent).*
     `s.field = v` → `struct.set`, and top-level `let`/`const` lower to a wasm global section (id 6, mutable,
     constexpr init) with bare-identifier reads/writes routed to `global.get`/`global.set` — together these
     make the `P`/`T`/`g*` checker/parser state + struct-field mutation emittable (constexpr-init globals
-    only; the start-fn fallback for non-constexpr inits is deferred). Ahead: arrays-of-unions (`Node[]`,
-    G7-ref), G3 boolean values, G4 logical `&&`/`||`, G6 string concat/equality, G8 maps, unions mixing
-    scalars + structs, `!is`/negated guards, non-i32 element lists, list `pop`/`+`/equality, and the broader
+    only; the start-fn fallback for non-constexpr inits is deferred). **Ref-element growable lists** (G7-ref)
+    now land too: arrays-of-structs (`Tok[]`) and arrays-of-unions (`Node[]`) — the self-host parser's
+    `P.nodes: Node[]` arena + token stream — emit via the `{backing,len,cap}` wrapper over a `(ref null
+    $elem)` backing (nullable-widened so `array.new_default` defaults spare slots to null; an index read
+    `array.get`s then `ref.as_non_null`s back), with `.push`/index-set/`.length`/`is`-narrow over the element
+    refs. Ahead: G3 boolean values, G4 logical `&&`/`||`, G6 string concat/equality, G8 maps, unions mixing
+    scalars + structs, `!is`/negated guards, non-i32-value element lists, list `pop`/`+`/equality, and the broader
     self-host source vocabulary (`for`, `match`, nested arrays/maps). (The fixed-bytes spike that
     hand-built two modules without reading `compiler/ast.vl` is retired.)
   - **(b) Grow the `.vl` parser/typecheck subset.** `parseStmt` handles `let`/`const`/`function`/`if`
@@ -363,10 +367,11 @@ independent).*
   **params, arithmetic, comparisons, calls/recursion, if/return, locals, while, structs (#137), arrays (#145),
   strings** (literal, `.length`, index — lowered to the array-i32 code-point representation), **growable
   `i32[]` + `.push`** (the `{backing,len,cap}` wrapper struct with grow-on-full), **discriminated unions +
-  `is` (G1)**, and **struct field write + module globals (G2)** (`struct.set`; global section + `global.get`/
-  `global.set`, constexpr inits); ahead are arrays-of-unions (G7-ref), G3 boolean, G4 logical, G6 string
-  concat/equality, G8 maps, non-i32 element lists, list `pop`/`+`/equality, and the wider self-host source
-  vocabulary. Remaining sub-items:
+  `is` (G1)**, **struct field write + module globals (G2)** (`struct.set`; global section + `global.get`/
+  `global.set`, constexpr inits), and **ref-element lists — arrays of structs + unions (G7-ref)** (`Node[]`/
+  `Tok[]` arenas now emittable: a `(ref null $elem)` backing, `ref.as_non_null` on read, `is`-narrow over
+  elements); ahead are G3 boolean, G4 logical, G6 string concat/equality, G8 maps, non-i32-value element
+  lists, list `pop`/`+`/equality, and the wider self-host source vocabulary. Remaining sub-items:
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/selfhost-gaps.md` §H4.1)
