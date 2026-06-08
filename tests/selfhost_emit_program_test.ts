@@ -3203,6 +3203,50 @@ const CASES: Case[] = [
       if (got !== 9) throw new Error(`f() returned ${got}, expected 9`);
     },
   },
+  {
+    // PROBE: a realistic multi-function parser excerpt over the real `Parser` shape —
+    // `peekTok`/`advance` returning a struct pulled from a ref list, mutating cursor,
+    // plus a union-node push. Mirrors the actual `parser.vl` recursive-descent shape.
+    name:
+      "G7-multi PROBE: parser-shaped peek/advance + union push over the Parser struct",
+    src: [
+      "type Tok = { kind: string, text: string, pos: i32 }",
+      "type Lit = { val: i32 }",
+      "type Var = { vname: string }",
+      "type Node = Lit | Var",
+      "type Diag = { msg: string, at: i32 }",
+      "type Parser = { toks: Tok[], nodes: Node[], diags: Diag[], pos: i32 }",
+      "let P: Parser = { toks: [], nodes: [], diags: [], pos: 0 }",
+      "function peekTok(): Tok {",
+      "  if P.pos >= P.toks.length {",
+      "    return P.toks[P.toks.length - 1]",
+      "  }",
+      "  return P.toks[P.pos]",
+      "}",
+      "function advance(): Tok {",
+      "  let t = peekTok()",
+      "  if P.pos < P.toks.length {",
+      "    P.pos = P.pos + 1",
+      "  }",
+      "  return t",
+      "}",
+      "function main(): i32 {",
+      "  P.toks.push({ kind: \"NUM\", text: \"9\", pos: 0 })",
+      "  P.toks.push({ kind: \"ID\", text: \"x\", pos: 1 })",
+      "  P.nodes.push({ val: 9 })",
+      "  P.diags.push({ msg: \"e\", at: 0 })",
+      "  let a = advance()",
+      "  let b = advance()",
+      "  return a.pos + b.pos + P.nodes.length + P.diags.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // a.pos(0) + b.pos(1) + nodes.length(1) + diags.length(1) = 3.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
