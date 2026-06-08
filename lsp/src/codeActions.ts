@@ -303,6 +303,18 @@ export const quickFixesForDiagnostic = (
       fixes.push(prefixWithUnderscoreFix(range));
       return fixes;
     }
+    case "unused-function": {
+      // A clean mirror of the unused-variable underscore fix: insert a leading
+      // `_` at the function name to mark it intentionally unused (the rule then
+      // downgrades it to a hint). The diagnostic range starts at the identifier,
+      // so a zero-width insert there is exact. We do NOT offer a "remove" fix:
+      // `removeBindingFix` deletes a single physical line, but a function spans
+      // multiple lines, so a clean removal would need the full declaration span
+      // (not tracked here) — the safe, never-deletes underscore fix is the only
+      // one offered (also the `export it` alternative is a manual edit, not a
+      // mechanical fix).
+      return [prefixWithUnderscoreFix(range)];
+    }
     case "unused-import": {
       // Imports get ONLY the remove-import fix — no `_`-prefix (that would need
       // aliasing, not a bare `_`-insert). Removes the specifier, or the whole

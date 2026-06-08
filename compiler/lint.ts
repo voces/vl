@@ -18,6 +18,13 @@
 //      An unused IMPORT binding is reported separately (code `unused-import`,
 //      "remove it" message) — there is no `_`-prefix suppression for an import,
 //      so its quick-fix removes the specifier (or the whole `import` line).
+//   1b. Unused functions — a top-level `function` that is never referenced
+//      anywhere in the file and is NOT exported is dead code in a whole-program
+//      compile. It reuses the SAME reference tracking as the unused-binding rule
+//      (the symbol table's non-decl occurrences), so a function called, passed by
+//      value, or named in a type counts as used. Exported functions are public
+//      surface and never flagged; a `_`-prefixed name is the "intentionally
+//      unused" marker and is downgraded to a `hint` just like a binding.
 //   2. Unreachable code — any statement that follows a statement which always
 //      diverges (`return` / `break` / `continue`, or an `if/else` where BOTH the
 //      then- and else-branch diverge) within the same block.
@@ -80,6 +87,7 @@ export const lint = (
 ): VLDiagnostic[] => {
   const diagnostics: VLDiagnostic[] = [];
   unusedBindings(symbols, diagnostics);
+  unusedFunctions(symbols, programStatements, diagnostics);
   preferConst(symbols, diagnostics);
   emptyIntersections(symbols, diagnostics);
   for (const stmt of programStatements) {
@@ -197,6 +205,145 @@ const unusedBindings = (
       severity: "warning",
       range: rangeFromCtx(b.decl),
       code: "unused-variable",
+      source: "vital",
+      tags: ["unnecessary"],
+    });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// 1b. Unused functions (a non-exported top-level function with no reference)
+// ---------------------------------------------------------------------------
+
+/**
+ * Collect every name that appears in a *reference* position anywhere in the
+ * program AST: the callee of a `FunctionCall` (`f(…)`) and any bare `Name` value
+ * reference (`g` passed as a value). The parser desugars EVERY call form into a
+ * `FunctionCall` whose `function` field is the resolved callee name — a plain
+ * `f(…)`, a UFCS method call `x.m(…)` (→ `FunctionCall "m"`), and an operator
+ * method `a + b` (→ `FunctionCall "+"`) all land here — so collecting these names
+ * captures references the symbol table misses (see `unusedFunctions`).
+ *
+ * Generic structural walk: recurse over every array/object field, recording a
+ * name only at the two precise node shapes above (never an arbitrary string
+ * property), so the set is exactly "names used as a call target or value", with
+ * no false members.
+ */
+const collectReferencedNames = (root: unknown): Set<string> => {
+  const names = new Set<string>();
+  const seen = new Set<object>();
+  const visit = (node: unknown): void => {
+    if (node === null || typeof node !== "object") return;
+    if (seen.has(node)) return;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    const rec = node as Record<string, unknown>;
+    if (rec.type === "FunctionCall" && typeof rec.function === "string") {
+      names.add(rec.function);
+    } else if (rec.type === "Name" && typeof rec.name === "string") {
+      names.add(rec.name);
+    }
+    for (const key of Object.keys(rec)) visit(rec[key]);
+  };
+  visit(root);
+  return names;
+};
+
+/**
+ * A top-level `function` that is declared but never referenced anywhere in its
+ * file is dead code. This mirrors {@link unusedBindings} for functions and reuses
+ * its reference model — a binding is "used" iff the symbol table records a
+ * non-decl occurrence of it (a call, a value reference, a use in a type) — as the
+ * primary signal.
+ *
+ * It additionally consults an AST-level reference-name set
+ * ({@link collectReferencedNames}) because the symbol table's parse-time `use`
+ * recording does NOT capture two call forms relevant here: a FORWARD/mutually-
+ * recursive call (resolved against a signature hoisted by the forward-reference
+ * pre-pass, before the real binding the lint walks is declared) and a UFCS /
+ * operator method call (`x.m(…)`, `a + b`, dispatched without a bare-name
+ * resolution). The parser desugars all of these into a `FunctionCall` whose
+ * `function` field is the callee name, so the AST set covers them. A function is
+ * treated as used when EITHER signal marks it — keeping the rule exact and
+ * conservative (any reference at all spares it), so a forward-referenced,
+ * mutually-recursive, or method-dispatched function is never falsely flagged.
+ *
+ * Critical exemptions (avoid false positives):
+ *   - EXPORTED functions are NEVER flagged. `export function f()` is public API;
+ *     in VL's multi-file module system it may be imported and called by another
+ *     module, so an in-file lack of references says nothing about its use. (This
+ *     is the key difference from a naive single-file dead-code scan.)
+ *   - A `_`-prefixed name is the language's "intentionally unused" convention
+ *     (same as bindings). An unreferenced `_helper` is not warned — it emits a
+ *     `hint`-severity, `unnecessary`-tagged diagnostic so editors grey/fade it
+ *     without a squiggle and without bumping the warning count.
+ *
+ * There is no program-entry convention to exempt (a VL script runs its top-level
+ * statements directly — there is no `main`), so no entry special-case is needed:
+ * a genuinely-unreferenced, non-exported top-level function is dead.
+ *
+ * Reported under `code: "unused-function"` (distinct from `unused-variable` so a
+ * client can offer the function-shaped quick-fix), `source: "vital"`, tagged
+ * `unnecessary` to match the unused-binding style.
+ */
+const unusedFunctions = (
+  symbols: SymbolTable,
+  programStatements: VLStatement[],
+  out: VLDiagnostic[],
+): void => {
+  // Reuse the unused-binding reference model: a binding is used iff some non-decl
+  // occurrence names it. A single walk seeds the used set (every call / value
+  // reference / type use the parser recorded counts).
+  const used = new Set<unknown>();
+  for (const occ of symbols.occurrences) {
+    if (!occ.isDecl) used.add(occ.binding);
+  }
+  // Supplement with AST-level call/value references to cover forward-reference
+  // and UFCS/operator-method calls the parser doesn't record as occurrences.
+  const referencedNames = collectReferencedNames(programStatements);
+
+  const reported = new Set<unknown>();
+  for (const occ of symbols.occurrences) {
+    if (!occ.isDecl) continue;
+    const b = occ.binding;
+    if (reported.has(b)) continue;
+    if (b.kind !== "function") continue;
+    // Referenced anywhere in the file (called, passed as a value, used in a type)
+    // — not dead. Either reference signal spares it: the symbol-table `used` set
+    // (the same signal the unused-binding rule uses) OR the AST reference-name
+    // set (forward/mutual calls + UFCS/operator dispatch the parser misses).
+    if (used.has(b)) continue;
+    if (referencedNames.has(b.name)) continue;
+    // An exported function is public surface — it may be imported and called by
+    // another module — so it is never dead even with no in-file reference.
+    if (b.exported) continue;
+    reported.add(b);
+
+    // A leading-underscore name marks an intentionally-unused function (same
+    // convention as bindings): downgrade to a `hint` (greyed/faded, not a
+    // warning) instead of warning.
+    if (b.name.startsWith("_")) {
+      out.push({
+        message:
+          `Intentionally-unused function \`${b.name}\` (leading \`_\` marks it unused)`,
+        severity: "hint",
+        range: rangeFromCtx(b.decl),
+        code: "unused-function",
+        source: "vital",
+        tags: ["unnecessary"],
+      });
+      continue;
+    }
+
+    out.push({
+      message:
+        `Unused function \`${b.name}\` (prefix with \`_\` to suppress, remove it, or \`export\` it)`,
+      severity: "warning",
+      range: rangeFromCtx(b.decl),
+      code: "unused-function",
       source: "vital",
       tags: ["unnecessary"],
     });
