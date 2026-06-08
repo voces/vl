@@ -48,6 +48,7 @@ see **`DECISIONS.md`**.
 - **B15 Lambdas / declaration-vs-value (typed)** — `FunctionDeclaration` in value position lowers to its closure value (let-bound, capturing, higher-order, inline object fields). → `DECISIONS.md`
 - **B17 Diagnostics + lint (started)** — `severity`, `@warning` directive, empty-range warning, stable `code`s; lint pass (`compiler/lint.ts`): unused-variable, unreachable-code (`unnecessary` tag = VS Code grey-out).
 - **B17 Export-aware top-level unused** — exported top-level bindings exempt from unused-variable lint; landed with `export` keyword (H0 phase 1).
+- **B17 fix: unused-import diagnostic range** — the unused-variable lint for an imported name now squiggles the imported NAME (`a`, or the `as`-alias `y` in `{ x as y }`), not the `import` keyword; `parseImport` captures each specifier's local-identifier token span and threads it to `declareBinding`.
 - **B19 `return` / early returns** — early, from loops, fall-through; bare `return` yields null.
 - **B-debug Name section + source maps + trap-to-source** — wasm name section + Source Map v3 (binaryen debug locations, survives `optimize()`); trap → precise VL `file:L:C` error message. (#76)
 - **B regression guard — unused-param inline call** — pinned `print(ignore(42))` (callee's parameter never read): the TS host (`toWasm.ts`) passes a null env + the plain argument and the module validates; argument is NOT mis-boxed into a closure-env struct. (`tests/cases/functions/unused-param-inline-call.vl`)
