@@ -781,11 +781,26 @@ let pendingStructIdx: i32 = 0 - 1
 // representation is faithful; since there is no cross-module value flow here, any
 // stable order would also be self-consistent.
 //
-// `uVariants` holds the variant struct NAMES in source (declaration) order, which
-// is ALSO the heap-type order (`uVarIdx + i`). `uTags[i]` is the global tag of the
-// i-th variant. The variant structs' fields live in the flat struct table below.
+// `uVariants` holds the variant struct NAMES across ALL declared unions, flattened in
+// source (declaration) order, which is ALSO the heap-type order (`uVarIdx + i`).
+// `uTags[i]` is the GLOBALLY-UNIQUE tag of the i-th variant (ranked across every
+// variant of every union, so a single tag compare discriminates a variant regardless of
+// which union it belongs to). The variant structs' fields live in the flat struct table
+// below.
+//
+// MULTIPLE UNIONS — a per-union interning TABLE (mirroring the multi-struct `sNames`
+// table and the multi-ref-list `rlElemName` table): `unNames[u]` is the u-th declared
+// union's alias name; its variants occupy the contiguous slice `uVariants[unVarStart[u]
+// .. unVarStart[u] + unVarCount[u]]`. All unions SHARE one box heap type (`uBoxIdx`) —
+// the box `{ tag: i32, value: anyref }` is structurally identical for every union, and
+// globally-unique tags make narrowing unambiguous — so only the union-NAME identity
+// (for `isUName`, ref-lists-of-union interning, and param/return/local valtypes) needs
+// the table; construction / `is`-narrowing / variant-field reads already key off the
+// global variant index. `uDeclared` means "at least one union is declared".
 let uDeclared: boolean = false
-let uName: string = ""
+let unNames: string[] = []
+let unVarStart: i32[] = []
+let unVarCount: i32[] = []
 let uVariants: string[] = []
 let uTags: i32[] = []
 let uBoxIdx: i32 = 0
@@ -5087,8 +5102,10 @@ function nameIsRefArray(name: string): boolean {
     if name == sNames[i] + "[]" { return true }
     i = i + 1
   }
-  if uDeclared {
-    if name == uName + "[]" { return true }
+  let u = 0
+  while u < unNames.length {
+    if name == unNames[u] + "[]" { return true }
+    u = u + 1
   }
   false
 }
@@ -5096,8 +5113,10 @@ function nameIsRefArray(name: string): boolean {
 // The ref-element kind for an array type-name (assumes `nameIsRefArray(name)`):
 // `1` = a struct element, `2` = a union-box element (`uBoxIdx`).
 function refArrElemKind(name: string): i32 {
-  if uDeclared {
-    if name == uName + "[]" { return 2 }
+  let u = 0
+  while u < unNames.length {
+    if name == unNames[u] + "[]" { return 2 }
+    u = u + 1
   }
   1
 }
@@ -5310,7 +5329,8 @@ function arrLitElemName(arrIx: i32): string {
       let e0 = P.nodes[a.arrElems[0]]
       if e0 is ObjLit {
         if uDeclared {
-          if objVariantName(a.arrElems[0]) != "" { return uName }
+          let vn = objVariantName(a.arrElems[0])
+          if vn != "" { return unionNameOfVariant(variantIndexOf(vn)) }
         }
         let si = structIndexOfObj(a.arrElems[0])
         if si >= 0 { return sNames[si] }
@@ -5324,8 +5344,10 @@ function arrLitElemName(arrIx: i32): string {
 // element is `name` with the trailing `"[]"` removed — i.e. the struct / union alias
 // name. Mirrors `refArrElemKind` but yields the table key.
 function refArrElemName(name: string): string {
-  if uDeclared {
-    if name == uName + "[]" { return uName }
+  let u = 0
+  while u < unNames.length {
+    if name == unNames[u] + "[]" { return unNames[u] }
+    u = u + 1
   }
   let i = 0
   while i < sNames.length {
@@ -5533,12 +5555,17 @@ function assignTags(): i32 {
   0
 }
 
-// Scan the top-level statements for a union alias `type N = A | B | …` (a
-// `UnionDecl`); if found, record its name + variant struct names, collect each
-// variant's i32 fields into the flat table, and assign global tags. At most one union
-// per program (a second fails loudly). Returns 0, or -1 (via `emitFail`).
+// Scan the top-level statements for EVERY union alias `type N = A | B | …` (a
+// `UnionDecl`); for each, record its name + variant-slice range in the per-union table
+// (`unNames`/`unVarStart`/`unVarCount`), append its variant struct names to the GLOBAL
+// `uVariants` list, collect each variant's i32 fields into the flat table, and finally
+// assign globally-unique tags across all variants of all unions. Multiple unions
+// coexist (mirroring the multi-struct table). Returns 0, or -1 (via `emitFail`).
 function collectU(stmts: i32[]): i32 {
   uDeclared = false
+  unNames = []
+  unVarStart = []
+  unVarCount = []
   uVariants = []
   uFieldNames = []
   uFieldStart = []
@@ -5549,15 +5576,14 @@ function collectU(stmts: i32[]): i32 {
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
     if s is UnionDecl {
-      if uDeclared {
-        return emitFail("emitProgram: only one union type per program is supported")
-      }
-      uName = s.udName
       uDeclared = true
       let vs = s.udVariants
       if vs.length < 1 {
         return emitFail("emitProgram: union must have at least one variant")
       }
+      unNames.push(s.udName)
+      unVarStart.push(uVariants.length)
+      unVarCount.push(vs.length)
       let vi = 0
       while vi < vs.length {
         uVariants.push(vs[vi])
@@ -5573,6 +5599,18 @@ function collectU(stmts: i32[]): i32 {
   0
 }
 
+// The per-union table index that OWNS global variant `vi` (the union whose variant
+// slice contains it), or -1. Mirrors the `structIndexByName`-style resolver.
+function unionOfVariant(vi: i32): i32 {
+  let u = 0
+  while u < unNames.length {
+    let start = unVarStart[u]
+    if vi >= start && vi < start + unVarCount[u] { return u }
+    u = u + 1
+  }
+  0 - 1
+}
+
 // The position of variant struct `name` in `uVariants` (its heap-type is `uVarIdx +
 // pos`), or -1 if `name` is not a variant of the declared union.
 function variantIndexOf(name: string): i32 {
@@ -5584,9 +5622,23 @@ function variantIndexOf(name: string): i32 {
   0 - 1
 }
 
-// True if the type-name `name` is the declared union alias.
+// True if the type-name `name` is ANY declared union alias.
 function isUName(name: string): boolean {
-  uDeclared && name == uName
+  let u = 0
+  while u < unNames.length {
+    if unNames[u] == name { return true }
+    u = u + 1
+  }
+  false
+}
+
+// The union alias name that owns global variant `vi` (assumes `vi` is a variant of some
+// declared union), or "" if none. Used to intern a ref-list-of-union by the SPECIFIC
+// union (so `Node[]` and `Ty[]` are distinct table slots).
+function unionNameOfVariant(vi: i32): string {
+  let u = unionOfVariant(vi)
+  if u >= 0 { return unNames[u] }
+  ""
 }
 
 // The wasm struct field index of `field` within variant `vi` (declaration order), or
