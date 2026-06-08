@@ -356,8 +356,10 @@ independent).*
     `array.get`s then `ref.as_non_null`s back), with `.push`/index-set/`.length`/`is`-narrow over the element
     refs. **Boolean values + bool/char literals** (G3) now land too: `boolean` params/locals/returns ride in the
     SAME i32 valtype (0/1, no separate boolean valtype), `BoolLit` → `i32.const 1`/`0`, `CharLit` → `i32.const
-    <code point>` — unblocking the ~40+ self-host predicates that return `boolean`. Ahead: G4 logical `&&`/`||`
-    + value-if, G6 string concat/equality, G8 maps, unions mixing
+    <code point>` — unblocking the ~40+ self-host predicates that return `boolean`. **Logical `&&`/`||`/`!`**
+    (G4) now land too, introducing the first VALUE-TYPED `if` (blocktype `0x7f`): `a && b` ≡ `if(a){b}else{0}`,
+    `a || b` ≡ `if(a){1}else{b}` (the RHS genuinely short-circuits), `!a` → `i32.eqz` — heavy in the lexer's
+    char-class predicates. Ahead: G6 string concat/equality, G8 maps, G9 return/local inference, unions mixing
     scalars + structs, `!is`/negated guards, non-i32-value element lists, list `pop`/`+`/equality, and the broader
     self-host source vocabulary (`for`, `match`, nested arrays/maps). (The fixed-bytes spike that
     hand-built two modules without reading `compiler/ast.vl` is retired.)
@@ -378,9 +380,10 @@ independent).*
   `is` (G1)**, **struct field write + module globals (G2)** (`struct.set`; global section + `global.get`/
   `global.set`, constexpr inits), **ref-element lists — arrays of structs + unions (G7-ref)** (`Node[]`/
   `Tok[]` arenas now emittable: a `(ref null $elem)` backing, `ref.as_non_null` on read, `is`-narrow over
-  elements), and **boolean params/locals/returns + bool/char literals (G3)** (`boolean` rides in i32; `BoolLit`
-  → `i32.const 1`/`0`, `CharLit` → `i32.const <code point>`); ahead are G4 logical/value-if, G6 string
-  concat/equality, G8 maps, non-i32-value element
+  elements), **boolean params/locals/returns + bool/char literals (G3)** (`boolean` rides in i32; `BoolLit`
+  → `i32.const 1`/`0`, `CharLit` → `i32.const <code point>`), and **logical `&&`/`||`/`!` + the first value-typed
+  `if` (G4)** (`&&`/`||` → short-circuit `if` with i32 result-type blocktype `0x7f`, `!` → `i32.eqz`); ahead are
+  G6 string concat/equality, G8 maps, G9 return/local inference, non-i32-value element
   lists, list `pop`/`+`/equality, and the wider self-host source vocabulary. Remaining sub-items:
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real

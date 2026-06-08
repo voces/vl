@@ -935,8 +935,10 @@ function binOpcode(op: string): i32 {
 //   NumLit  -> i32.const <value>           (the literal, via parseI32 + slebToArr)
 //   Ident   -> local.get <param index>     (a parameter reference)
 //   BinExpr -> emit(left), emit(right), <opcode>   (operands first, then the op,
-//              the natural wasm post-order stack encoding; arithmetic OR comparison)
-//   Unary   -> negation `-x` as i32.const 0, emit(x), i32.sub (`!` is out of scope)
+//              the natural wasm post-order stack encoding; arithmetic OR comparison).
+//              Logical `&&`/`||` instead lower to a SHORT-CIRCUIT value-typed `if`
+//              (blocktype 0x7f): `a && b` ≡ if(a){b}else{0}, `a || b` ≡ if(a){1}else{b}.
+//   Unary   -> negation `-x` as i32.const 0, emit(x), i32.sub; logical `!a` as eqz (0x45)
 //   Call    -> emit each arg left-to-right, then `call <funcIndex>` (the callee is
 //              an `Ident` resolved through the function-index map; recursion works
 //              because the function's own name is mapped before its body is emitted)
@@ -1552,7 +1554,14 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     return emitExpr(body, e.parInner, fnIx)
   }
   if e is Unary {
-    // Only integer negation: `-x` == `0 - x`, so push 0, the operand, then sub.
+    // Logical not `!a`: a boolean rides in an i32 (0/1), so `i32.eqz` (0x45) maps
+    // 0→1 and any non-zero→0 — exactly `a == 0`. Push the operand, then eqz.
+    if e.unOp == "!" {
+      if emitExpr(body, e.unArg, fnIx) < 0 { return 0 - 1 }
+      body.push(69)          // 0x45 i32.eqz
+      return 0
+    }
+    // Integer negation: `-x` == `0 - x`, so push 0, the operand, then sub.
     if e.unOp != "-" {
       return emitFail("emitProgram: unsupported unary operator")
     }
@@ -1604,6 +1613,32 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // `emitStmt`, so seeing it as an operand here is an unsupported nested-assignment.
     if e.binOp == "=" {
       return emitFail("emitProgram: assignment is not a value expression")
+    }
+    // Short-circuit logical operators lower to a VALUE-TYPED `if` (blocktype 0x7f),
+    // an `if` expression that leaves one i32 on the stack — both arms push an i32:
+    //   `a && b`  ≡  if (a) { b } else { 0 }   (skip b when a is false → 0)
+    //   `a || b`  ≡  if (a) { 1 } else { b }   (skip b when a is true  → 1)
+    // The condition `a` is evaluated first, then `if 0x04` with i32 result-type
+    // blocktype `0x7f`; the then-branch, `else 0x05`, the else-branch, then `end 0x0b`.
+    if e.binOp == "&&" || e.binOp == "||" {
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }   // condition `a`
+      body.push(4)             // 0x04 if
+      body.push(127)           // 0x7f i32 result-type blocktype (yields an i32)
+      if e.binOp == "&&" {
+        // then = b, else = 0
+        if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+        body.push(5)           // 0x05 else
+        body.push(65)          // 0x41 i32.const
+        appendAll(body, slebToArr(0))
+      } else {
+        // then = 1, else = b
+        body.push(65)          // 0x41 i32.const
+        appendAll(body, slebToArr(1))
+        body.push(5)           // 0x05 else
+        if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+      }
+      body.push(11)            // 0x0b end
+      return 0
     }
     let opcode = binOpcode(e.binOp)
     if opcode < 0 {

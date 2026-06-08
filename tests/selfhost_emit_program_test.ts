@@ -78,6 +78,20 @@ const runExport = async (
 const runMain = (bytes: Uint8Array<ArrayBuffer>): Promise<number> =>
   runExport(bytes, "main");
 
+// Instantiate ONCE and return a caller bound to that single instance, so calls
+// SHARE module state (mutable globals persist across them) — needed to OBSERVE a
+// short-circuited side effect (a global a skipped helper would have written).
+const instanceOf = async (
+  bytes: Uint8Array<ArrayBuffer>,
+): Promise<(name: string, ...args: number[]) => number> => {
+  const module = await WebAssembly.compile(bytes);
+  const instance = await WebAssembly.instantiate(module, {});
+  return (name: string, ...args: number[]): number => {
+    const fn = instance.exports[name] as (...a: number[]) => number;
+    return fn(...args);
+  };
+};
+
 // Each case: a name, the VL SOURCE TEXT to drive through lexer→parser→emitProgram,
 // and a `check` over that case's log lines (`["main: b0,b1,..."]` on success, an
 // `["err: <msg>"]` line on an unsupported shape) — exactly what the old per-test
@@ -1473,6 +1487,183 @@ const CASES: Case[] = [
       // 'A' is U+0041 = 65, + 1 = 66.
       const got = await runMain(bytesFromLog(logs));
       if (got !== 66) throw new Error(`main() returned ${got}, expected 66`);
+    },
+  },
+
+  // ── G4: logical `&&` / `||` / `!` via the first VALUE-TYPED `if` ─────────────
+  // `&&`/`||` are short-circuit EXPRESSIONS that yield an i32, so they lower to an
+  // `if` with an i32 RESULT-TYPE blocktype `0x7f` (both arms leave one i32):
+  //   `a && b` ≡ if(a){b}else{0},  `a || b` ≡ if(a){1}else{b}.
+  // `!a` is `i32.eqz` (0x45). These prove real `WebAssembly.instantiate` over the
+  // VL-emitted bytes AND the correct truth-table + short-circuit (skip) semantics.
+  {
+    name: "G4: `a && b` truth table (1&1=1, 1&0=0, 0&1=0, 0&0=0)",
+    src: [
+      "function and(a: boolean, b: boolean): boolean {",
+      "  return a && b",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const tt = await runExport(bytes, "and", 1, 1);
+      if (tt !== 1) throw new Error(`and(1,1) returned ${tt}, expected 1`);
+      const tf = await runExport(bytes, "and", 1, 0);
+      if (tf !== 0) throw new Error(`and(1,0) returned ${tf}, expected 0`);
+      const ft = await runExport(bytes, "and", 0, 1);
+      if (ft !== 0) throw new Error(`and(0,1) returned ${ft}, expected 0`);
+      const ff = await runExport(bytes, "and", 0, 0);
+      if (ff !== 0) throw new Error(`and(0,0) returned ${ff}, expected 0`);
+    },
+  },
+  {
+    name: "G4: `a || b` truth table (1|1=1, 1|0=1, 0|1=1, 0|0=0)",
+    src: [
+      "function or(a: boolean, b: boolean): boolean {",
+      "  return a || b",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const tt = await runExport(bytes, "or", 1, 1);
+      if (tt !== 1) throw new Error(`or(1,1) returned ${tt}, expected 1`);
+      const tf = await runExport(bytes, "or", 1, 0);
+      if (tf !== 1) throw new Error(`or(1,0) returned ${tf}, expected 1`);
+      const ft = await runExport(bytes, "or", 0, 1);
+      if (ft !== 1) throw new Error(`or(0,1) returned ${ft}, expected 1`);
+      const ff = await runExport(bytes, "or", 0, 0);
+      if (ff !== 0) throw new Error(`or(0,0) returned ${ff}, expected 0`);
+    },
+  },
+  {
+    name: "G4: `!a` logical not via i32.eqz (!0=1, !1=0)",
+    src: [
+      "function not(a: boolean): boolean {",
+      "  return !a",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const n0 = await runExport(bytes, "not", 0);
+      if (n0 !== 1) throw new Error(`not(0) returned ${n0}, expected 1`);
+      const n1 = await runExport(bytes, "not", 1);
+      if (n1 !== 0) throw new Error(`not(1) returned ${n1}, expected 0`);
+    },
+  },
+  {
+    name: "G4: `&&` SHORT-CIRCUITS the RHS — false LHS skips the call (global stays 0)",
+    src: [
+      // `mark()` records that it ran by setting `hit`; in `a && mark()` it must be
+      // SKIPPED when `a` is false. After `test(false)` the global `hit` is still 0.
+      "let hit = 0",
+      "function mark(): boolean {",
+      "  hit = 1",
+      "  return true",
+      "}",
+      "function test(a: boolean): boolean {",
+      "  return a && mark()",
+      "}",
+      "function probe(): i32 {",
+      "  return hit",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // ONE shared instance so the global `hit` persists across calls.
+      const call = await instanceOf(bytesFromLog(logs));
+      // a = false: RHS `mark()` must be skipped → result 0 AND `hit` untouched.
+      const r = call("test", 0);
+      if (r !== 0) throw new Error(`test(false) returned ${r}, expected 0`);
+      const skipped = call("probe");
+      if (skipped !== 0) {
+        throw new Error(`&& did not short-circuit: hit=${skipped}, expected 0`);
+      }
+      // a = true: RHS runs → result 1 AND `hit` becomes 1.
+      const r2 = call("test", 1);
+      if (r2 !== 1) throw new Error(`test(true) returned ${r2}, expected 1`);
+      const ran = call("probe");
+      if (ran !== 1) throw new Error(`&& did not run RHS: hit=${ran}, expected 1`);
+    },
+  },
+  {
+    name: "G4: `||` SHORT-CIRCUITS the RHS — true LHS skips the call (global stays 0)",
+    src: [
+      "let hit = 0",
+      "function mark(): boolean {",
+      "  hit = 1",
+      "  return false",
+      "}",
+      "function test(a: boolean): boolean {",
+      "  return a || mark()",
+      "}",
+      "function probe(): i32 {",
+      "  return hit",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // ONE shared instance so the global `hit` persists across calls.
+      const call = await instanceOf(bytesFromLog(logs));
+      // a = true: RHS `mark()` must be skipped → result 1 AND `hit` untouched.
+      const r = call("test", 1);
+      if (r !== 1) throw new Error(`test(true) returned ${r}, expected 1`);
+      const skipped = call("probe");
+      if (skipped !== 0) {
+        throw new Error(`|| did not short-circuit: hit=${skipped}, expected 0`);
+      }
+      // a = false: RHS runs → result 0 AND `hit` becomes 1.
+      const r2 = call("test", 0);
+      if (r2 !== 0) throw new Error(`test(false) returned ${r2}, expected 0`);
+      const ran = call("probe");
+      if (ran !== 1) throw new Error(`|| did not run RHS: hit=${ran}, expected 1`);
+    },
+  },
+  {
+    name: "G4: char-class predicate `(x > 0) && (x < 10)` drives a branch",
+    src: [
+      // The lexer-style combined predicate: a value-typed `&&` of two comparisons,
+      // driving a (void statement) `if` — exactly the char-class shape G4 unblocks.
+      "function inRange(x: i32): i32 {",
+      "  if (x > 0) && (x < 10) {",
+      "    return 1",
+      "  }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const inside = await runExport(bytes, "inRange", 5);
+      if (inside !== 1) throw new Error(`inRange(5) returned ${inside}, expected 1`);
+      const low = await runExport(bytes, "inRange", 0);
+      if (low !== 0) throw new Error(`inRange(0) returned ${low}, expected 0`);
+      const high = await runExport(bytes, "inRange", 10);
+      if (high !== 0) throw new Error(`inRange(10) returned ${high}, expected 0`);
+      const neg = await runExport(bytes, "inRange", -3);
+      if (neg !== 0) throw new Error(`inRange(-3) returned ${neg}, expected 0`);
+    },
+  },
+  {
+    name: "G4: combined `!(a && b) || c` exercises all three operators",
+    src: [
+      "function f(a: boolean, b: boolean, c: boolean): boolean {",
+      "  return !(a && b) || c",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      // !(a&&b) || c.  a=1,b=1,c=0 → !(1)||0 = 0||0 = 0.
+      const r1 = await runExport(bytes, "f", 1, 1, 0);
+      if (r1 !== 0) throw new Error(`f(1,1,0) returned ${r1}, expected 0`);
+      // a=1,b=1,c=1 → !(1)||1 = 0||1 = 1.
+      const r2 = await runExport(bytes, "f", 1, 1, 1);
+      if (r2 !== 1) throw new Error(`f(1,1,1) returned ${r2}, expected 1`);
+      // a=1,b=0,c=0 → !(0)||0 = 1||0 = 1.
+      const r3 = await runExport(bytes, "f", 1, 0, 0);
+      if (r3 !== 1) throw new Error(`f(1,0,0) returned ${r3}, expected 1`);
     },
   },
 ];
