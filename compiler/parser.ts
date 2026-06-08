@@ -19,6 +19,7 @@ import {
   conditionsExhaust,
   constrainElementHole,
   defaultIntegerType,
+  divergesStatement,
   elseNarrowings,
   emptyIntersectionInfo,
   ensureType,
@@ -211,6 +212,64 @@ export const parseProgram = (
   const recordUse = (name: string, span: Context): void => {
     const binding = resolveBinding(name);
     if (binding) symbols.use(binding, span);
+  };
+
+  // ---- definite-assignment flow (A-definite-assign) ------------------------
+  // An uninitialized `let x` / `let x: T` starts UNassigned and is NON-null: a
+  // read where `x` is not provably written on every preceding path is a "used
+  // before assigned" error (closing the silent-`0` soundness gap). This is the
+  // SAME shape of flow analysis the `is`-narrowing already does — track a
+  // per-binding "definitely assigned" bit through `if`/`else`/`while`, join at
+  // merge points, let a diverging branch (`return`/`break`/`continue`) drop out
+  // — but the join semantics differ from `withNarrowings`' lexical push/pop: an
+  // assignment INSIDE a branch must PERSIST past the branch when every path
+  // assigns. So this carries its own live-path state (`unassigned`) keyed by
+  // `Binding` identity (not name, so shadowing is exact) and joins explicitly,
+  // modelled on `divergesStatement`.
+  //
+  // `unassigned` holds the bindings that are still un-written on the CURRENT
+  // path. A `let x` with no initializer adds its binding; `x = …` removes it; a
+  // read of a still-present binding errors (then removes it, to avoid a cascade
+  // of duplicate diagnostics on the same hole).
+  const unassigned = new Set<Binding>();
+
+  /** Mark `binding` definitely assigned on the current path. */
+  const markAssigned = (binding: Binding): void => {
+    unassigned.delete(binding);
+  };
+
+  /**
+   * Check a READ of `name` (a bare-name use, an argument, `x.f`, `x[i]`, a
+   * compound `x += …`, etc.) for use-before-assignment. If the resolved binding
+   * is still unassigned on this path, report it and drop it from the set so the
+   * same hole doesn't re-fire on every later read.
+   */
+  const checkRead = (name: string, span: Context): void => {
+    const binding = resolveBinding(name);
+    if (!binding || !unassigned.has(binding)) return;
+    unassigned.delete(binding);
+    errors.push({
+      type: "Syntax",
+      message: `\`${name}\` is used before it is assigned`,
+      ctx: span,
+      code: 0,
+    });
+  };
+
+  // Snapshot / restore the live unassigned-set, for forking and joining paths.
+  const snapshotFlow = (): Set<Binding> => new Set(unassigned);
+  const restoreFlow = (snap: Set<Binding>): void => {
+    unassigned.clear();
+    for (const b of snap) unassigned.add(b);
+  };
+  // Join `paths` (one unassigned-set per surviving branch) into the live set: a
+  // binding is assigned-after-the-merge only if it is assigned on EVERY surviving
+  // path — equivalently, it is STILL unassigned after the merge if it is
+  // unassigned on ANY one path. The union of the per-path unassigned-sets is
+  // exactly that "unassigned on some surviving path".
+  const joinFlow = (paths: Set<Binding>[]): void => {
+    unassigned.clear();
+    for (const p of paths) for (const b of p) unassigned.add(b);
   };
   /**
    * Stamp every `Binding` declared in `scope` with `span`, the source extent over
@@ -1593,6 +1652,12 @@ export const parseProgram = (
       const ctx = spanOf(t);
       getType(t.text, ctx);
       recordUse(t.text, ctx);
+      // Definite-assignment read gate (A-definite-assign). A bare name that is
+      // immediately the LHS of a plain `=` is a pure WRITE, not a read, so it
+      // must not trip use-before-assign (the assignment is what assigns it).
+      // A compound `x += …` / `x++` DOES read first — those are checked here.
+      // `==` lexes as `EQUAL_TO`, so a comparison is never mistaken for a write.
+      if (peek().kind !== "EQUAL") checkRead(t.text, ctx);
       return record({ type: "Name", name: t.text }, ctx);
     }
 
@@ -1861,16 +1926,26 @@ export const parseProgram = (
     let elseAcc: Narrowing[] = [];
     const conditionals: VLIfNode["conditionals"] = [];
 
+    // Definite-assignment (A-definite-assign): each branch is a separate path
+    // forked off the if-entry state; after the chain they JOIN. A branch that
+    // diverges (`return`/`break`/…) contributes nothing to the merge (its end is
+    // unreachable). Snapshot the entry once; parse every branch from a fresh
+    // copy; collect each NON-diverging branch's end-state to join below.
+    const flowEntry = snapshotFlow();
+    const branchEnds: Set<Binding>[] = [];
+
     const buildConditional = (cond: VLExpression, condCtx: Context) => {
       skipNewlines();
       if (atSoft("then")) next();
       skipNewlines();
       const stmtStart = peek();
+      restoreFlow(flowEntry);
       const statement = withNarrowings(
         [...elseAcc, ...thenNarrowings(cond)],
         spanOf(stmtStart),
         () => parseStatement() ?? emptyReturn(),
       );
+      if (!divergesStatement(statement)) branchEnds.push(snapshotFlow());
       elseAcc = [...elseAcc, ...elseNarrowings(cond)];
       ensureType(
         { type: "Nullable", subType: { type: "Alias", name: "boolean" } },
@@ -1905,15 +1980,26 @@ export const parseProgram = (
         pos = look + 1;
         skipNewlines();
         const eStart = peek();
+        restoreFlow(flowEntry);
         elseStmt = withNarrowings(
           elseAcc,
           spanOf(eStart),
           () => parseStatement() ?? emptyReturn(),
         );
+        if (!divergesStatement(elseStmt)) branchEnds.push(snapshotFlow());
         elseCtx = spanFrom(eStart);
       }
       break;
     }
+
+    // Join the surviving branch paths (A-definite-assign). With NO `else`, the
+    // implicit fall-through (every condition false) is its own surviving path
+    // that assigns nothing — seed it with the entry state so a binding written
+    // only in `if c { x = 1 }` is NOT considered assigned afterwards. With an
+    // `else`, that branch already covers the fall-through, so the entry path is
+    // not separately live.
+    if (!elseStmt) branchEnds.push(flowEntry);
+    joinFlow(branchEnds);
 
     // Dead-arm lint (B17): when the `is`/`==` chain already exhausts its
     // discriminated union (every variant subtracted to `Never`), the trailing
@@ -2223,6 +2309,13 @@ export const parseProgram = (
       flow.desiredType = annotatedReturn ? functionReturnType : undefined;
       const oldReturnType = returnType;
       returnType = functionReturnType;
+      // Definite-assignment (A-definite-assign): a function body is its OWN flow
+      // context — it runs at call time, not at the declaration site, so a NESTED
+      // function that captures an outer `let x` still pending assignment must not
+      // be flagged (the call may happen after `x` is written). Save and clear the
+      // live unassigned-set for the body, then restore the enclosing path.
+      const oldUnassigned = snapshotFlow();
+      unassigned.clear();
 
       // An empty `{}` function body is a block (a void function), NOT an empty
       // object literal. `looksLikeObject` treats `{}` as an object (the ANTLR
@@ -2248,6 +2341,7 @@ export const parseProgram = (
       returnTypes = oldReturnTypes;
       flow.desiredType = oldDesiredType;
       returnType = oldReturnType;
+      restoreFlow(oldUnassigned);
 
       if (!functionReturnType) {
         if (bodyType.type !== "Never") subTypes.push(bodyType);
@@ -2635,7 +2729,14 @@ export const parseProgram = (
     // Mark the LHS name's occurrence (recorded as a use during precedence
     // climbing) as an assignment *write* target, so the lint pass can tell a
     // never-reassigned `let` (prefer-`const`) from a mutated one.
-    if (left.type === "Name") symbols.markWrite(leftCtx);
+    if (left.type === "Name") {
+      symbols.markWrite(leftCtx);
+      // Definite-assignment: this write makes the binding assigned on the
+      // current path. (A compound `x += …` is parsed as `operator` set — the
+      // read on the RHS already ran through `checkRead`; the write still counts.)
+      const binding = resolveBinding(left.name);
+      if (binding) markAssigned(binding);
+    }
     const leftType = typeFromExpression(left, leftCtx);
     const right: VLExpression = operator
       ? { type: "BinaryOperation", left, right: rawRight, operator }
@@ -2713,7 +2814,7 @@ export const parseProgram = (
     } else {
       const scope = scopes[scopes.length - 1];
       scope[node.name] = node.variableType;
-      declareBinding(
+      const binding = declareBinding(
         scope,
         node.name,
         "variable",
@@ -2725,6 +2826,11 @@ export const parseProgram = (
         // its diagnostic here (the actionable `let`→`const` token), not the name.
         spanOf(kw),
       );
+      // Definite-assignment (A-definite-assign): an uninitialized `let x` /
+      // `let x: T` starts UNassigned — a subsequent read before it is written is
+      // an error. An initialized `let x = …` (and any `const`, which must have a
+      // value) is assigned from the start, so it is never tracked here.
+      if (node.value === undefined) unassigned.add(binding);
     }
     return record(node, spanFrom(kw));
   };
@@ -2922,7 +3028,13 @@ export const parseProgram = (
       spanFrom(condStart),
     );
     skipNewlines();
+    // Definite-assignment (A-definite-assign): a loop body may run ZERO times,
+    // so an assignment inside it is NOT guaranteed to reach code after the loop.
+    // Parse the body with the live state (so a read AFTER an in-body assignment
+    // is fine), then restore the pre-loop state for the fall-through.
+    const flowEntry = snapshotFlow();
     const statement = parseStatement() ?? emptyReturn();
+    restoreFlow(flowEntry);
     return record(
       { type: "While", label, condition, statement },
       spanFrom(startTok),
@@ -2966,6 +3078,8 @@ export const parseProgram = (
       scopes.push({
         [variable]: softenImplicitType(element ?? { type: "Never" }),
       });
+      // Loop body may run zero times — see `parseWhile` (A-definite-assign).
+      const flowEntry = snapshotFlow();
       let statement: VLStatement;
       try {
         statement = parseStatement() ?? emptyReturn();
@@ -2974,6 +3088,7 @@ export const parseProgram = (
         scopes.pop();
         throw err;
       }
+      restoreFlow(flowEntry);
       return record(
         { type: "ForIn", label, variable, iterable: first, statement },
         spanFrom(startTok),
@@ -2997,6 +3112,8 @@ export const parseProgram = (
 
     let step: VLExpression | undefined;
     scopes.push({ [variable]: softenImplicitType(fromType) });
+    // Loop body may run zero times — see `parseWhile` (A-definite-assign).
+    const flowEntry = snapshotFlow();
     let statement: VLStatement;
     try {
       if (atSoft("step")) {
@@ -3018,6 +3135,7 @@ export const parseProgram = (
       scopes.pop();
       throw err;
     }
+    restoreFlow(flowEntry);
 
     // Warn on a provably-empty literal range.
     if (first.type === "IntegerLiteral" && to.type === "IntegerLiteral") {
