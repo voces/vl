@@ -1208,6 +1208,72 @@ export const constrainElementHole = (
   return true;
 };
 
+// USAGE-DRIVEN INFERENCE of a `Map()` / `Set()` constructor's key/value (or set
+// element) type — the map/set analogue of `constrainElementHole`. An un-annotated
+// `const m = Map()` binds a bare `Infer<Unknown, mapCtor>` hole (the SAME hole
+// object the binding holds), exactly like an empty `[]`. A downstream `m.set(k,v)`
+// (or `s.add(x)`) MATERIALISES that hole IN PLACE into the concrete map/set
+// representation the rest of the compiler already uses: the anonymous,
+// string-keyed index-signature object `{[K]: V}` (a Set is `{[T]: boolean}`, the
+// boolean carrying membership — `setElementType` reads the element back off the
+// key). This is byte-for-byte the shape an ANNOTATED `const m: {[string]: i32} =
+// Map()` produces, so `.get`/`.has`/`.size`/iteration/codegen all work unchanged.
+//
+// Subsequent `.set`/`.add` calls re-enter here, but the hole is now a concrete
+// `Object` (no longer an `Infer` with `mapCtor`), so they fall through to the
+// normal intrinsic-method path and type-check their args STRICTLY against the
+// pinned key/value — a conflicting `m.set("b", "x")` after `m.set("a", 1)` then
+// errors soundly (value `string` not assignable to the pinned `i32`), never a
+// crash. Returns true when it materialised the hole.
+//
+// `key`/`value`: the constraint types flowing in (a `.set` key+value, or a `.add`
+// element with an implicit `boolean` membership value). Both are softened to their
+// base (`"a"` → `string`, `1` → `i32`). Map keys must be `string` (the only hash
+// key the rep supports today); an i32 (or other) key is rejected with the same
+// clear message the annotated i32-key path uses, rather than producing an invalid
+// `{[i32]: V}` array-shaped codegen.
+export const constrainMapHole = (
+  hole: VLType,
+  key: VLType,
+  value: VLType,
+  ctx: Context,
+): boolean => {
+  if (hole.type !== "Infer" || !hole.mapCtor) return false;
+  const softKey = softenImplicitType(key);
+  // Only a `string`-keyed map/set is representable today (an i32 key is the native
+  // list/array path). Reject anything else cleanly — same wording as the annotated
+  // `{[i32]: …}` path — instead of materialising an invalid shape.
+  if (!(softKey.type === "Object" && softKey.name === "string")) {
+    errors.push({
+      type: "Syntax",
+      message:
+        `An i32-keyed ${hole.mapCtor} isn't supported yet — i32 keys use ` +
+        "a list/array (`T[]`); `Map`/`Set` keys must be `string` for now",
+      ctx,
+      code: 0,
+    });
+    // Pin the hole to a string-keyed shape anyway so downstream codegen doesn't
+    // trip over a bare `Unknown` after the (already-reported) error.
+    updateType(hole, {
+      type: "Object",
+      properties: [
+        { name: { type: "Alias", name: "string" }, type: softenImplicitType(value) },
+      ],
+    });
+    return true;
+  }
+  // Materialise into the canonical anonymous string-keyed index-signature object —
+  // identical to what an annotated `{[string]: V}` (or `{[string]: boolean}` set)
+  // parses to, so `mapKeyValueType`/`setElementType`/codegen recognise it.
+  updateType(hole, {
+    type: "Object",
+    properties: [
+      { name: { type: "Alias", name: "string" }, type: softenImplicitType(value) },
+    ],
+  });
+  return true;
+};
+
 // One clean, source-located diagnostic for a binding whose type can't be inferred
 // — instead of either a crash or the opaque codegen `Unhandled AST -> WASM
 // "Unknown" type`. Fires only for a genuinely UNPINNED binding (an un-annotated

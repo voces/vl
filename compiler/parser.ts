@@ -18,6 +18,7 @@ import {
   conditionNarrowing,
   conditionsExhaust,
   constrainElementHole,
+  constrainMapHole,
   defaultIntegerType,
   divergesStatement,
   elseNarrowings,
@@ -1272,6 +1273,40 @@ export const parseProgram = (
     );
     const close = expect("RPAREN");
     const ctx = between(objCtx, spanOf(close));
+
+    // USAGE-DRIVEN INFERENCE of a `Map()` / `Set()` element type: an un-annotated
+    // `const m = Map()` binds a bare `Infer<Unknown, mapCtor>` hole (the same hole
+    // object reachable here as `objectType`). The FIRST `m.set(k, v)` (Map) or
+    // `s.add(x)` (Set) MATERIALISES that hole IN PLACE into the concrete
+    // `{[string]: V}` (resp. `{[string]: boolean}`) index-signature object — the
+    // identical representation an annotated `{[string]: i32} = Map()` produces — so
+    // the very same call (and every later one) then resolves through the normal
+    // intrinsic map/set member path below against the now-pinned key/value. A
+    // conflicting later `.set`/`.add` type-checks strictly against the pinned types
+    // and errors soundly. Must run BEFORE the `Infer` unwrap (which would discard
+    // the `mapCtor` tag) and before the method resolution that reads `mapKV`. The
+    // membership value of a set's `.add(x)` is the implicit `boolean`.
+    if (
+      objectType.type === "Infer" && objectType.mapCtor === "Map" &&
+      property === "set" && args.length >= 2
+    ) {
+      constrainMapHole(
+        objectType,
+        typeFromExpression(args[0].value, args[0].context),
+        typeFromExpression(args[1].value, args[1].context),
+        ctx,
+      );
+    } else if (
+      objectType.type === "Infer" && objectType.mapCtor === "Set" &&
+      property === "add" && args.length >= 1
+    ) {
+      constrainMapHole(
+        objectType,
+        typeFromExpression(args[0].value, args[0].context),
+        { type: "Alias", name: "boolean" },
+        ctx,
+      );
+    }
 
     // 1. Field method (container/data): a callable field wins, no receiver.
     let shape = objectType;
