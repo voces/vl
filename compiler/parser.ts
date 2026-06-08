@@ -2054,8 +2054,10 @@ export const parseProgram = (
         if (stmt !== undefined) {
           const ctx = spanFrom(startTok);
           statements.push([ctx, stmt]);
-          // Post-guard narrowing (A5): `if x == null { return }` narrows `x` for
-          // the rest of the block. Names narrow into the block scope.
+          // Rest-of-block narrowing: a post-guard (A5) `if x == null { return }`,
+          // OR a straight-line assignment `x = <non-null>` (A-infer-null), narrows
+          // `x` for the rest of the block. Both flow through `postGuardNarrowings`;
+          // names narrow into the block scope.
           for (const n of postGuardNarrowings(stmt)) {
             if (n.place.type !== "Name") continue;
             for (let i = scopes.length - 1; i >= 0; i--) {
@@ -2749,6 +2751,20 @@ export const parseProgram = (
       ? { type: "BinaryOperation", left, right: rawRight, operator }
       : rawRight;
     const rightType = typeFromExpression(right, rightCtx);
+    // USAGE-DRIVEN NULLABLE HOLE (A-infer-null): a reassignment `x = <expr>` is a
+    // constraint source for a `let x = null` binding whose `T` is still an open
+    // hole (`Nullable<Infer<Unknown>>`). Pin that shared inner hole to the RHS
+    // type IN PLACE — exactly as `xs.push(v)` pins an empty array's element — so
+    // the binding becomes `typeof <expr> | null` (`x = 5` ⇒ `i32 | null`). The
+    // `| null` (the `Nullable` wrapper) is left intact: it is sticky, reflecting
+    // that `x` really was null. Must run BEFORE the `ensureType` below so the RHS
+    // checks against the now-pinned `T`, not the open hole.
+    if (
+      left.type === "Name" && leftType.type === "Nullable" &&
+      leftType.subType.type === "Infer"
+    ) {
+      constrainElementHole(leftType.subType, rightType, rightCtx);
+    }
     // A `const` rebind is already rejected on the mutability axis — the binding
     // keeps its narrow inferred type (`const x = 1` is `1`), so an additional
     // "expected 1, got 2" on the RHS would be redundant noise on code that is
@@ -2798,7 +2814,26 @@ export const parseProgram = (
     };
     if (node.value) {
       const valType = typeFromExpression(node.value, valueCtx ?? spanOf(id));
-      if (!annotated) {
+      if (!annotated && mutable && node.value.type === "NullLiteral") {
+        // USAGE-DRIVEN NULLABLE HOLE (A-infer-null): a `let x = null` with no
+        // annotation is NOT pinned to the exact `null` type — `null` is hole-
+        // bearing (it inhabits every `T | null`). Bind `x` to `T | null` where
+        // `T` is a fresh, shared inference hole, exactly the empty-`[]` element
+        // hole shape (`Infer<Unknown>`). The `| null` is contributed by this
+        // initializer (and is sticky — `x` really was null); the hole's `T` is
+        // filled from downstream usage (a `x = <expr>` reassignment, a `T | null`
+        // param, an annotated assignment), via `constrainElementHole` on the
+        // shared cell — the same machinery the empty array uses. An unconstrained
+        // `let x = null` (no use that pins `T`) is NOT un-inferable: a lone `null`
+        // IS fully determined, so the floor (`reportUninferredBinding`) resolves
+        // it to the plain `null` type rather than erroring. A `const x = null`
+        // (immutable, never reassignable) can't be filled, so it keeps the exact
+        // `null` type below.
+        node.variableType = {
+          type: "Nullable",
+          subType: { type: "Infer", subType: { type: "Unknown" }, nullHole: true },
+        };
+      } else if (!annotated) {
         node.variableType = widenBindingType(valType, mutable);
         // No annotation: a construct whose type is taken from context (an empty
         // `[]`, a `Map()`/`Set()`) leaves an unresolved inference hole HERE — but
@@ -3681,7 +3716,20 @@ export const parseProgram = (
     const startTok = peek();
     try {
       const stmt = parseTopLevelStatement();
-      if (stmt !== undefined) program.statements.push(stmt);
+      if (stmt !== undefined) {
+        program.statements.push(stmt);
+        // Straight-line assignment narrowing (A-infer-null) for module-level
+        // statements too, so a top-level `let x = null; x = 5; print(x + 1)`
+        // carries no null tax — `x` is non-null for the rest of the module after
+        // the write. Same `postGuardNarrowings` entry point as the block loop,
+        // overlaying the module scope directly.
+        for (const n of postGuardNarrowings(stmt)) {
+          if (n.place.type !== "Name") continue;
+          if (n.name in program.scope) {
+            program.scope[n.name] = n.apply(program.scope[n.name]);
+          }
+        }
+      }
     } catch (err) {
       console.error(err);
       // Recover: skip to the next line so the pass makes progress.

@@ -399,6 +399,11 @@ export type VLInferType = {
   // recognize an unpinned / wrongly-pinned map constructor and report a clear
   // error instead of failing opaquely in codegen.
   mapCtor?: "Map" | "Set";
+  // Set when this hole is the `T` of a `let x = null` nullable hole (A-infer-null):
+  // the binding is `Nullable<Infer{nullHole}<Unknown>>`. Lets the inference floor
+  // (`reportUninferredBinding`) resolve an unconstrained one to the plain `null`
+  // type — a lone `null` IS fully determined — rather than reporting "cannot infer".
+  nullHole?: boolean;
 };
 export type VLCustomType = {
   type: "Custom";
