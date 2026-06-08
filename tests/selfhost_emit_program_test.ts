@@ -1796,6 +1796,59 @@ const CASES: Case[] = [
     },
   },
 
+  // ── G1-strfield: STRING fields on UNION variants ────────────────────────────
+  // `ast.vl`'s `Node` union has variants with string fields (`NumLit = { numText:
+  // string }`). A string variant field lowers to a non-null `(ref $aTypeIdx)` in the
+  // variant struct; a narrowed read (`if n is A { … n.s … }`) surfaces the string ref
+  // for the G6 `==`. Proves a mixed/string-field union variant constructs + reads back.
+  {
+    name: "G1-strfield: a union variant's string field reads back equal after narrowing => 1",
+    src: [
+      "type A = { numText: string }",
+      "type B = { bv: i32 }",
+      "type Node = A | B",
+      "function f(n: Node): i32 {",
+      "  if n is A {",
+      '    if n.numText == "42" { return 1 }',
+      "    return 0",
+      "  }",
+      "  return 9",
+      "}",
+      "function main(): i32 {",
+      '  return f({ numText: "42" })',
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    // A union variant mixing an i32 + a string field, both read after narrowing.
+    name: "G1-strfield: mixed i32+string union variant, both fields read => 8",
+    src: [
+      "type Tk = { tkKind: string, tkPos: i32 }",
+      "type Other = { ov: i32 }",
+      "type Node = Tk | Other",
+      "function f(n: Node): i32 {",
+      "  if n is Tk {",
+      '    if n.tkKind == \"id\" { return n.tkPos }',
+      "    return 0",
+      "  }",
+      "  return 99",
+      "}",
+      "function main(): i32 {",
+      '  return f({ tkKind: \"id\", tkPos: 8 })',
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 8) throw new Error(`main() returned ${got}, expected 8`);
+    },
+  },
+
   // ── G2b: module-level mutable GLOBALS (global.get / global.set) ─────────────
   {
     name: "G2b: an i32 global read+written within one function (`g=g+1` => 1)",

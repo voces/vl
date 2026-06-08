@@ -716,6 +716,9 @@ let uVarIdx: i32 = 0
 let uFieldNames: string[] = []
 let uFieldStart: i32[] = []
 let uFieldCount: i32[] = []
+// Parallel to `uFieldNames`: each variant field's wasm-type code (`0` = i32/boolean,
+// `3` = string). A string variant field lowers to a non-null `(ref $aTypeIdx)`.
+let uFieldTypes: i32[] = []
 
 // ── active `is`-narrowing scope ───────────────────────────────────────────────
 // When emitting the THEN-branch of `if n is A { … }`, the union-typed identifier
@@ -4301,7 +4304,12 @@ function emitModule(stmts: i32[]): i32 {
       appendAll(typePayload, ulebToArr(cnt))
       let fj = 0
       while fj < cnt {
-        typePayload.push(127)    // 0x7f i32 storagetype
+        if variantFieldTypeAt(vi, fj) == 3 {
+          typePayload.push(100)  // 0x64 (ref ht) — non-null string ref
+          appendAll(typePayload, ulebToArr(aTypeIdx))
+        } else {
+          typePayload.push(127)  // 0x7f i32 storagetype
+        }
         typePayload.push(1)      // mutable
         fj = fj + 1
       }
@@ -4753,10 +4761,11 @@ function collectS(stmts: i32[]): i32 {
 }
 
 // ── union collection (G1) ─────────────────────────────────────────────────────
-// The struct field names of the `TypeDecl` named `name` are recorded into the flat
-// `uFieldNames`/`uFieldStart`/`uFieldCount` table (declaration order, all i32). The
-// struct must exist among the top-level statements and carry only i32 fields, else
-// fails loudly. Returns 0, or -1 (via `emitFail`).
+// The struct field names + per-field wasm-type codes (`0` i32/boolean, `3` string) of
+// the `TypeDecl` named `name` are recorded into the flat
+// `uFieldNames`/`uFieldStart`/`uFieldCount`/`uFieldTypes` table (declaration order =
+// wasm field index). The struct must exist among the top-level statements and carry
+// only i32/boolean/string fields, else fails loudly. Returns 0, or -1 (via `emitFail`).
 function collectVariantFields(stmts: i32[], name: string): i32 {
   let i = 0
   while i < stmts.length {
@@ -4775,7 +4784,13 @@ function collectVariantFields(stmts: i32[], name: string): i32 {
             }
             let ty = P.nodes[fnode.fdType]
             if ty is TypeRef {
-              if ty.tyName != "i32" {
+              if ty.tyName == "i32" {
+                uFieldTypes.push(0)
+              } else if ty.tyName == "boolean" {
+                uFieldTypes.push(0)
+              } else if nameIsString(ty.tyName) {
+                uFieldTypes.push(3)
+              } else {
                 return emitFail("emitProgram: only i32 union-variant fields are supported")
               }
             } else {
@@ -4795,6 +4810,11 @@ function collectVariantFields(stmts: i32[], name: string): i32 {
     i = i + 1
   }
   emitFail("emitProgram: union variant names an unknown struct type")
+}
+
+// The wasm-type code (`0` i32, `3` string) of variant `vi`'s field at field index `fi`.
+function variantFieldTypeAt(vi: i32, fi: i32): i32 {
+  uFieldTypes[uFieldStart[vi] + fi]
 }
 
 // The structural signature of variant `vi` — its field names joined with `,` (a
@@ -4865,6 +4885,7 @@ function collectU(stmts: i32[]): i32 {
   uFieldNames = []
   uFieldStart = []
   uFieldCount = []
+  uFieldTypes = []
   let i = 0
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
@@ -5593,6 +5614,18 @@ function exprString(exprIx: i32, fnIx: i32): boolean {
   // A field read `p.f` where `f` is a STRING struct field yields a string ref (gap #2:
   // `let k = t.kind` must give `k` the string type, not i32).
   if e is Member {
+    // A field read on a NARROWED union identifier (`if n is A { … n.f … }`) reads the
+    // variant field; a string variant field yields a string ref.
+    if memIsNarrowed(exprIx) {
+      let vi = variantIndexOf(narrowVariant)
+      if vi >= 0 {
+        let vfi = variantFieldIndex(vi, e.memProp)
+        if vfi >= 0 {
+          if variantFieldTypeAt(vi, vfi) == 3 { return true }
+        }
+      }
+      return false
+    }
     let si = structIndexOfExpr(e.memObj, fnIx)
     if si >= 0 {
       let fi = sFieldIndex(si, e.memProp)
