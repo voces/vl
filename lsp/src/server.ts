@@ -34,6 +34,15 @@ import {
 } from "../../compiler/compile.ts";
 import { format } from "../../compiler/format.ts";
 import {
+  checkDocument,
+  makeWorkspaceReader,
+  uriToPath,
+} from "./moduleGraph.ts";
+import { parseProgram } from "../../compiler/parser.ts";
+import { defaultScope } from "../../compiler/defaultScope.ts";
+import { tokenize as tokenizeSource } from "../../compiler/lexer.ts";
+import { SymbolTable } from "../../compiler/symbols.ts";
+import {
   fixableDiagnosticsForRange,
   quickFixesForDiagnostic,
 } from "./codeActions.ts";
@@ -123,6 +132,50 @@ const connection = createConnection(ProposedFeatures.all);
 // Create a manager for open text documents
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
 
+// Module-aware analysis reads sibling `.vl` files: it prefers the open document
+// buffers (so unsaved edits are seen) and falls back to disk. Keyed on the
+// open-document URIs the manager tracks (see `makeWorkspaceReader`).
+const workspaceReader = makeWorkspaceReader({
+  get: (uri: string) => documents.get(uri),
+});
+
+// The current document's module key: its filesystem path (resolveSpecifier
+// resolves relative imports against this). Falls back to a synthetic key for a
+// non-`file:` URI (e.g. untitled buffers) — such a doc has no resolvable
+// relative imports, so analysis degrades to single-file, which is correct.
+const entryKeyOf = (uri: string): string => uriToPath(uri);
+
+/**
+ * Imported names' resolved types for the document at `uri`, seeded so the
+ * synchronous symbol/AST helpers (`parseSymbols`/`checkOnly`) resolve imported
+ * references instead of flagging them undeclared. Returns an empty scope for a
+ * file with no (resolvable) imports — the common case behaves exactly as before.
+ */
+const importedScopeFor = async (
+  uri: string,
+  text: string,
+): Promise<Record<string, ReturnType<typeof defaultScope>[string]>> => {
+  const { importedScope } = await checkDocument(text, entryKeyOf(uri), workspaceReader);
+  return importedScope;
+};
+
+/**
+ * `parseSymbols` SEEDED with imported names' types — so a symbol-table query over
+ * an imported name resolves to its real type (hover) instead of nothing. Mirrors
+ * `parseSymbols` but threads a non-empty initial scope.
+ */
+const parseSymbolsSeeded = (
+  text: string,
+  importedScope: Record<string, ReturnType<typeof defaultScope>[string]>,
+): SymbolTable => {
+  const { tokens } = tokenizeSource(text);
+  const [, , symbols] = parseProgram(tokens, {
+    ...defaultScope(),
+    ...importedScope,
+  });
+  return symbols;
+};
+
 // The workspace folder this server is operating on
 let workspaceFolder: string | null;
 
@@ -169,7 +222,19 @@ documents.onDidChangeContent(async (event) => {
   // command / Ctrl+F5), never a side effect of editing. (Auto-running on every
   // change executed arbitrary program logic on each keystroke — e.g. an infinite
   // loop would hang the server.)
-  const { diagnostics } = await compile(event.document.getText());
+  //
+  // Module-aware: the current file is the ENTRY module, parsed against a scope
+  // seeded with its imports' resolved types, so `import { foo } from "./x"`
+  // resolves (no spurious "undeclared") and genuine import errors (bad path,
+  // not-exported, cycle) surface, attributed to the current file's import
+  // statements. A file with no imports analyzes exactly as the single-file
+  // `checkOnly` path did. Codegen-only diagnostics (the rare `Codegen error:`)
+  // aren't produced here, same trade-off as `vl check`.
+  const { diagnostics } = await checkDocument(
+    event.document.getText(),
+    entryKeyOf(event.document.uri),
+    workspaceReader,
+  );
 
   // Cache the raw VL diagnostics (which carry `code`/`range`/`source`) so
   // `onCodeAction` can offer fixes by line overlap, not just for the exact
@@ -259,7 +324,15 @@ connection.onHover(async (params): Promise<Hover | null> => {
   // `Binding` (locals/params/functions/type aliases included) and reads the type
   // each binding carries. Falls back to the top-level scope lookup below for
   // anything the symbol table doesn't carry.
-  const symbols = parseSymbols(document.getText());
+  //
+  // Module-aware: seed the parse with imported names' resolved types so a hover
+  // over an imported name (`foo` from `./x`) shows its REAL type rather than
+  // resolving to nothing. A no-import file seeds an empty scope (unchanged).
+  const importedScope = await importedScopeFor(
+    params.textDocument.uri,
+    document.getText(),
+  );
+  const symbols = parseSymbolsSeeded(document.getText(), importedScope);
   // D7: build the doc-comment cross-reference resolver for this document. It is
   // used by `docMarkdown` to rewrite `` [`Name`] `` / `[Name]` spans in `///`
   // doc-comments into clickable links to the named symbol's definition.
@@ -320,6 +393,14 @@ connection.onHover(async (params): Promise<Hover | null> => {
   const word = wordAt(lineText, params.position.character);
   if (!word) return null;
 
+  // An imported name resolves through the graph-seeded scope first (its REAL
+  // type), then through the program scope (builtins + top-level names). The
+  // single-file `compile`/`checkOnly` AST scope doesn't carry imports, so the
+  // seeded `importedScope` is consulted explicitly here.
+  const importedType = importedScope[word];
+  if (importedType) {
+    return { contents: hoverMarkdown(`${word}: ${stringifyType(importedType)}`) };
+  }
   const { ast } = await compile(document.getText());
   const type = ast?.scope[word];
   if (!type) return null;
@@ -455,7 +536,10 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     end: params.position,
   });
 
-  const symbols = parseSymbols(text);
+  // Module-aware: seed the parse with imported names' resolved types so imported
+  // names appear as completions with their real types (and resolve as receivers).
+  const importedScope = await importedScopeFor(params.textDocument.uri, text);
+  const symbols = parseSymbolsSeeded(text, importedScope);
   // D7: build the doc-comment resolver once for all completion items in this
   // request — identifier completions carry `///` docs that may contain xrefs.
   const docResolver = buildDocRefResolver(symbols, params.textDocument.uri);
@@ -470,7 +554,9 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     if (!receiver) return [];
     const { ast } = await compile(text);
     if (!ast) return [];
-    const objectType = receiverObjectType(receiver, symbols, vlPos, ast.scope);
+    // Fold imported names in so an imported object can be a member receiver.
+    const scope = { ...ast.scope, ...importedScope };
+    const objectType = receiverObjectType(receiver, symbols, vlPos, scope);
     if (!objectType) return [];
     // Member completions don't carry source `///` docs (no source binding), so
     // passing the resolver is a no-op but keeps the call shape consistent.
@@ -484,7 +570,9 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   // symbol table override same-named builtins inside `identifierCompletions`.
   // Keyword and snippet completions are appended for statement-position typing.
   const { ast } = await compile(text);
-  const builtins = ast?.scope ?? {};
+  // Fold imported names into the completion scope so they're suggested with
+  // their real types alongside builtins + top-level names.
+  const builtins = { ...(ast?.scope ?? {}), ...importedScope };
   const identifiers = identifierCompletions(symbols, vlPos, builtins, stringifyType)
     .map((c) => toCompletionItem(c, docResolver));
   const keywords = keywordCompletions(false).map((c) => toCompletionItem(c));
