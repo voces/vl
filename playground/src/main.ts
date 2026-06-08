@@ -373,6 +373,11 @@ export const nextThemeState = (
 
 const applyMode = (mode: Mode) => {
   appEl.dataset.mode = mode;
+  // Keep <html>'s data-mode (seeded synchronously by the inline head script to
+  // kill the load flash) in lock-step — the `html[data-mode] .app` flash-guard
+  // selector outranks `.app[data-mode]`, so a stale value here would override a
+  // toggle.
+  document.documentElement.dataset.mode = mode;
   themeBtn.innerHTML = mode === "dark" ? SUN : MOON;
   monaco.editor.setTheme(mode === "dark" ? "vital-dark" : "vital-light");
 };
