@@ -330,6 +330,10 @@ let fRetUni: i32[] = []
 // Parallel to `fnNames`: `1` if the i-th function's declared RETURN type is a REF array
 // (`S[]`/`N[]`), else `0`. Populated by `buildFnMap` so `fnRetRefArray` is a flat lookup.
 let fRetRArr: i32[] = []
+// Parallel to `fnNames`: the ref-list element type-NAME the i-th function returns (its
+// `S[]`/`N[]` return annotation's element), or "". Lets a ref-list-returning call resolve
+// its distinct element-type table slot.
+let fRetRArrElem: string[] = []
 
 // ── module-level GLOBALS (G2b) ────────────────────────────────────────────────
 // A top-level `let`/`const` (`LetDecl`) lowers to a wasm module GLOBAL (mutable),
@@ -423,6 +427,7 @@ function buildFnMap(stmts: i32[]): i32 {
   fRetStr = []
   fRetUni = []
   fRetRArr = []
+  fRetRArrElem = []
   let i = 0
   while i < fnStmts.length {
     let s = P.nodes[fnStmts[i]]
@@ -435,6 +440,7 @@ function buildFnMap(stmts: i32[]): i32 {
       fRetStr.push(retStrFlag(s.fnRet))
       fRetUni.push(retUnionFlag(s.fnRet))
       fRetRArr.push(retRefArrFlag(s.fnRet))
+      fRetRArrElem.push(retRefArrElemName(s.fnRet))
     }
     i = i + 1
   }
@@ -538,6 +544,25 @@ let pushScratchBase: i32 = 0
 // records whether this function reserved them; `refPushScratchBase` is `pushRefVal`'s index.
 let fnUsesRefPush: boolean = false
 let refPushScratchBase: i32 = 0
+
+// Per-element-type ref-push scratch frames (slice 4): a function that pushes onto
+// DISTINCT ref-list element types needs a separately-TYPED 4-slot frame per element type
+// (the backing/wrapper/value locals are typed per element). `fnRefPushSlots` lists the
+// table slots this function pushes onto (in first-seen order); `refPushBaseBySlot[k]` is
+// the wasm local base of the k-th such frame. `refPushScratchBaseFor` maps a table slot
+// to its frame base.
+let fnRefPushSlots: i32[] = []
+let refPushBaseBySlot: i32[] = []
+
+// The wasm local base of the ref-push scratch frame for ref-list table slot `slot`.
+function refPushScratchBaseFor(slot: i32): i32 {
+  let i = 0
+  while i < fnRefPushSlots.length {
+    if fnRefPushSlots[i] == slot { return refPushBaseBySlot[i] }
+    i = i + 1
+  }
+  refPushScratchBase
+}
 
 // The string-list `.push` scratch quad (`string[]` field append): `pushStrVal` (a
 // non-null `(ref $aTypeIdx)` string), `pushStrCap` (i32), `pushStrBacking` (a non-null
@@ -826,7 +851,7 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
         } else if letIsStringArray(stmts[i], fnIx) {
           addLocalName(s.letName, 7, 0 - 1)
         } else if letIsRefArray(stmts[i], fnIx) {
-          addLocalName(s.letName, 5, 0 - 1)
+          addLocalName(s.letName, 5, letRefListSlot(stmts[i], fnIx))
         } else if letIsUnion(stmts[i], fnIx) {
           addLocalName(s.letName, 4, 0 - 1)
         } else if letIsStruct(stmts[i], fnIx) {
@@ -2782,15 +2807,16 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32): i32 {
       if !raUsed {
         return emitFail("emitProgram: ref index access but ref array type not collected")
       }
+      let rslot = refListSlotOfExpr(nd.idxArr, fnIx)
       if emitExpr(body, nd.idxArr, fnIx) < 0 { return 0 - 1 }
       body.push(251)         // 0xfb GC prefix
       body.push(2)           // struct.get (unwrap to backing)
-      appendAll(body, ulebToArr(rlTypeIdx))  // ref list wrapper struct type index
+      appendAll(body, ulebToArr(rlWrapIdx[rslot]))  // this slot's ref-list wrapper
       body.push(0)           // field 0: backing
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return 0 - 1 }
       body.push(251)         // 0xfb GC prefix
       body.push(11)          // 0x0b array.get
-      appendAll(body, ulebToArr(raTypeIdx))  // ref backing array type index
+      appendAll(body, ulebToArr(rlBackIdx[rslot]))  // this slot's ref backing array
       body.push(212)         // 0xd4 ref.as_non_null (recover the non-null element)
       return 0
     }
@@ -2846,12 +2872,13 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32): i32 {
 function emitArrLen(body: i32[], memIx: i32, fnIx: i32): i32 {
   let m = P.nodes[memIx]
   if m is Member {
-    // A REF list's `.length` is its wrapper's `len` field (`struct.get $rlTypeIdx 1`).
+    // A REF list's `.length` is its wrapper's `len` field (`struct.get $wrap 1`).
     if exprRefArray(m.memObj, fnIx) {
+      let rslot = refListSlotOfExpr(m.memObj, fnIx)
       if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
       body.push(251)         // 0xfb GC prefix
       body.push(2)           // struct.get
-      appendAll(body, ulebToArr(rlTypeIdx))  // ref list wrapper struct type index
+      appendAll(body, ulebToArr(rlWrapIdx[rslot]))  // this slot's ref-list wrapper
       body.push(1)           // field 1: len
       return 0
     }
@@ -3512,8 +3539,9 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
         if !rlUsed {
           return emitFail("emitProgram: ref indexed assignment but ref list type not collected")
         }
-        lTy = rlTypeIdx
-        aTy = raTypeIdx
+        let rslot = refListSlotOfExpr(target.idxArr, fnIx)
+        lTy = rlWrapIdx[rslot]
+        aTy = rlBackIdx[rslot]
       } else {
         if !lUsed {
           return emitFail("emitProgram: indexed assignment but list type not collected")
@@ -3631,9 +3659,10 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         if !rlUsed {
           return emitFail("emitProgram: ref .push but ref list type not collected")
         }
-        lTy = rlTypeIdx
-        aTy = raTypeIdx
-        base = refPushScratchBase
+        let rslot = refListSlotOfExpr(callee.memObj, fnIx)
+        lTy = rlWrapIdx[rslot]
+        aTy = rlBackIdx[rslot]
+        base = refPushScratchBaseFor(rslot)
       } else if isStr {
         if !slUsed {
           return emitFail("emitProgram: string .push but string list type not collected")
@@ -4360,6 +4389,18 @@ function retRefArrFlag(tyIx: i32): i32 {
     }
   }
   0
+}
+
+// The ref-list element type-NAME of a function RETURN type node `tyIx` (an `S[]`/`N[]`),
+// or "". Populates `fRetRArrElem`.
+function retRefArrElemName(tyIx: i32): string {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if nameIsRefArray(ty.tyName) { return refArrElemName(ty.tyName) }
+    }
+  }
+  ""
 }
 
 // `1` if the parameter node at `paramIx` is an array type, else `0`.
@@ -5940,6 +5981,117 @@ function exprRefArray(exprIx: i32, fnIx: i32): boolean {
   false
 }
 
+// The ref-list ELEMENT type-NAME a ref-array param `name` of function `fnIx` declares
+// (`p: Tok[]` → `Tok`), or "" if not a ref-array param.
+function paramRefArrayName(fnIx: i32, name: string): string {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef {
+              if nameIsRefArray(ty.tyName) { return refArrElemName(ty.tyName) }
+            }
+          }
+          return ""
+        }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// The ref-list ELEMENT type-NAME a function `name` returns (from its `S[]`/`N[]` return
+// annotation, recorded in `fRetRArrElem`), or "".
+function fnRetRefArrayName(name: string): string {
+  let i = 0
+  while i < fnNames.length {
+    if fnNames[i] == name { return fRetRArrElem[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// The ref-list ELEMENT type-NAME of the declared local `name` (recorded in
+// `localStructIdx` as its table SLOT for code-5 locals), or "".
+function declaredRefArrayName(name: string): string {
+  let i = 0
+  while i < localNames.length {
+    if localNames[i] == name {
+      if localIsRef[i] == 5 {
+        let slot = localStructIdx[i]
+        if slot >= 0 { if slot < rlElemName.length { return rlElemName[slot] } }
+      }
+      return ""
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The ref-list ELEMENT type-NAME a module global `name` declares (`S[]`/`N[]`), or "".
+function globalRefArrayName(name: string): string {
+  let li = globalLetOf(name)
+  if li < 0 { return "" }
+  letRefListElemName(li, 0 - 1)
+}
+
+// The ref-list ELEMENT type-NAME the expression at `exprIx` produces, or "" if it is not
+// a ref list. Mirrors `exprRefArray`'s receiver shapes — used to resolve the per-element-
+// type table SLOT (`refListSlotOfExpr`) at every push / index / `.length` / store site.
+function refListElemNameOfExpr(exprIx: i32, fnIx: i32): string {
+  if exprIx < 0 { return "" }
+  let e = P.nodes[exprIx]
+  if e is ArrayLit { return arrLitElemName(exprIx) }
+  if e is Paren { return refListElemNameOfExpr(e.parInner, fnIx) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident { return fnRetRefArrayName(callee.identName) }
+    return ""
+  }
+  if e is Ident {
+    let pn = paramRefArrayName(fnIx, e.identName)
+    if pn != "" { return pn }
+    let dn = declaredRefArrayName(e.identName)
+    if dn != "" { return dn }
+    return globalRefArrayName(e.identName)
+  }
+  if e is Member {
+    // A `recv.field` ref-list field read — the field's element name from the receiver's
+    // struct / narrowed variant.
+    if memIsNarrowed(exprIx) {
+      let vi = variantIndexOf(narrowVariant)
+      if vi >= 0 {
+        let vfi = variantFieldIndex(vi, e.memProp)
+        if vfi >= 0 { return uFieldElemName[uFieldStart[vi] + vfi] }
+      }
+      return ""
+    }
+    let si = structIndexOfExpr(e.memObj, fnIx)
+    if si >= 0 {
+      let fi = sFieldIndex(si, e.memProp)
+      if fi >= 0 { return sFieldElemNameAt(si, fi) }
+    }
+  }
+  ""
+}
+
+// The per-element-type ref-list table SLOT the expression at `exprIx` produces, or 0
+// (slot fallback) if the element type can't be resolved — every migrated site uses this
+// to pick the right backing/wrapper/element indices.
+function refListSlotOfExpr(exprIx: i32, fnIx: i32): i32 {
+  let nm = refListElemNameOfExpr(exprIx, fnIx)
+  let s = rlSlotByName(nm)
+  if s < 0 { return 0 }
+  s
+}
+
 // True if the `LetDecl` at `letIx` declares a ref-list local: its annotation is a ref
 // array (`S[]`/`N[]`), OR its initializer produces a ref list. Picks the local's valtype
 // (`(ref $rlTypeIdx)`) and the code-`5` flag in `collectLocals`.
@@ -5955,6 +6107,29 @@ function letIsRefArray(letIx: i32, fnIx: i32): boolean {
     return exprRefArray(d.letInit, fnIx)
   }
   false
+}
+
+// The ref-list ELEMENT type-NAME a ref-list `LetDecl` binds: from its `S[]`/`N[]`
+// annotation if present, else inferred from its initializer (`refListElemNameOfExpr`).
+// "" if not a ref-list local.
+function letRefListElemName(letIx: i32, fnIx: i32): string {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if nameIsRefArray(lt.tyName) { return refArrElemName(lt.tyName) }
+      }
+    }
+    return refListElemNameOfExpr(d.letInit, fnIx)
+  }
+  ""
+}
+
+// The ref-list TABLE SLOT a ref-list `LetDecl` binds (stored in `localStructIdx` for a
+// code-5 local so `declaredRefArrayName` can recover its element type), or -1.
+function letRefListSlot(letIx: i32, fnIx: i32): i32 {
+  rlSlotByName(letRefListElemName(letIx, fnIx))
 }
 
 // The ref-list element kind a `LetDecl`'s ANNOTATION declares (`S[]` → 1, `N[]` → 2),
