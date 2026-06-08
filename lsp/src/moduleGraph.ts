@@ -528,7 +528,7 @@ export const importedNameSources = async (
       const depSource = await read(depKey);
       exported = depSource === undefined
         ? {}
-        : exportedDeclRanges(depSource);
+        : exportedDeclRanges(depKey, depSource);
       exportsByKey.set(depKey, exported);
     }
     for (const spec of imp.specifiers) {
@@ -564,8 +564,29 @@ export const importedNameSource = async (
  * declaration occurrence (`isDecl`) so the range points at the definition, not a
  * later use.
  */
-const exportedDeclRanges = (source: string): Record<string, VLRange> => {
+// Cross-call cache of single-file symbol tables, keyed on module path with a
+// source-equality check. `parseSymbols` is a pure function of source (single-file —
+// imports are not resolved into it), so an unchanged source yields an identical
+// table; reusing it is sound for the on-demand sibling-parsing paths that
+// re-`parseSymbols` the same unchanged files (go-to-definition's `exportedDeclRanges`,
+// the debounced unused-export workspace pass — which also parses each file's symbols
+// twice, decls then refs, now served from one parse). The table is read-only for
+// these consumers. Bounded by project file count; an entry is overwritten when the
+// file's source changes.
+const symbolsCache = new Map<string, { source: string; symbols: SymbolTable }>();
+const cachedParseSymbols = (key: string, source: string): SymbolTable => {
+  const hit = symbolsCache.get(key);
+  if (hit && hit.source === source) return hit.symbols;
   const symbols = parseSymbols(source);
+  symbolsCache.set(key, { source, symbols });
+  return symbols;
+};
+
+const exportedDeclRanges = (
+  key: string,
+  source: string,
+): Record<string, VLRange> => {
+  const symbols = cachedParseSymbols(key, source);
   const out: Record<string, VLRange> = {};
   for (const occ of symbols.occurrences) {
     if (!occ.isDecl) continue;
@@ -1004,7 +1025,7 @@ export const buildUnusedExportUseMap = async (
   // records `binding.exported === true` for top-level `export`-modifier bindings
   // regardless of whether imports are seeded into scope.
   for (const [filePath, source] of sources) {
-    const symbols = parseSymbols(source);
+    const symbols = cachedParseSymbols(filePath, source);
     for (const occ of symbols.occurrences) {
       if (!occ.isDecl) continue;
       if (!occ.binding.exported) continue;
@@ -1034,7 +1055,7 @@ export const buildUnusedExportUseMap = async (
     // function, or a value the file also uses) is counted here. `parseSymbols`
     // resolves local bindings (declared in this file) fine — only imported
     // bindings are unresolved, which 2a already handles.
-    const symbols = parseSymbols(source);
+    const symbols = cachedParseSymbols(filePath, source);
     for (const occ of symbols.occurrences) {
       if (occ.isDecl) continue;
       if (!occ.binding.exported) continue;
