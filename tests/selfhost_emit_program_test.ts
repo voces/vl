@@ -716,7 +716,7 @@ const CASES: Case[] = [
           }`,
         );
       }
-      if (!errLine.includes("i32 struct fields")) {
+      if (!errLine.includes("struct fields are supported")) {
         throw new Error(`unexpected emitter error message: ${errLine}`);
       }
     },
@@ -2608,6 +2608,166 @@ const CASES: Case[] = [
       // 40 + 80 + 1 + 1000 (default for missing) + 1 (has k5) = 1122.
       const got = await runExport(bytesFromLog(logs), "f");
       if (got !== 1122) throw new Error(`f() returned ${got}, expected 1122`);
+    },
+  },
+  // ── G5: array-typed struct / union-variant fields ──────────────────────────
+  // A struct field whose type is `i32[]` stores a REF to the growable i32-list wrapper
+  // (`(ref $lTypeIdx)`) — the same wrapper an `i32[]` local/param uses. Construction
+  // assigns the list, a field read `b.items` yields the list ref (so `.length` /
+  // indexing work), and a field write `b.items = …` stores a new list ref.
+  {
+    name: "G5: struct with an `i32[]` field — construct, read `.length` + an element => 30",
+    src: [
+      "type Box = { tag: i32, items: i32[] }",
+      "function f(): i32 {",
+      "  let b: Box = { tag: 7, items: [10, 20, 30] }",
+      "  return b.tag + b.items.length + b.items[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 7 (tag) + 3 (length) + 20 (items[1]) = 30.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 30) throw new Error(`f() returned ${got}, expected 30`);
+    },
+  },
+  {
+    name: "G5: WRITE a struct `i32[]` field then read it back (`b.items = xs` => 200)",
+    src: [
+      "type Box = { tag: i32, items: i32[] }",
+      "function f(): i32 {",
+      "  let b: Box = { tag: 0, items: [1] }",
+      "  let xs: i32[] = [100, 200, 300]",
+      "  b.items = xs",
+      "  return b.items[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 200) throw new Error(`f() returned ${got}, expected 200`);
+    },
+  },
+  {
+    name: "G5: build a struct `i32[]` field in a loop via a local, read back => 45",
+    src: [
+      "type Box = { items: i32[] }",
+      "function f(): i32 {",
+      "  let xs: i32[] = []",
+      "  let i = 0",
+      "  while i < 10 {",
+      "    xs.push(i)",
+      "    i = i + 1",
+      "  }",
+      "  let b: Box = { items: xs }",
+      "  let sum = 0",
+      "  let j = 0",
+      "  while j < b.items.length {",
+      "    sum = sum + b.items[j]",
+      "    j = j + 1",
+      "  }",
+      "  return sum",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 0+1+...+9 = 45.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 45) throw new Error(`f() returned ${got}, expected 45`);
+    },
+  },
+  {
+    // A REF-element array field `Tok[]` over a declared struct stores a REF to the
+    // ref-list wrapper (`(ref $rlTypeIdx)`). Construction assigns a ref list, a field
+    // read yields the ref-list ref (so `.length` and ref-indexing — which recovers the
+    // non-null struct element — work).
+    name: "G5: struct with a `Tok[]` (ref-element) field — read length + element field => 22",
+    src: [
+      "type Tok = { kind: i32, val: i32 }",
+      "type Arena = { toks: Tok[] }",
+      "function f(): i32 {",
+      "  let a: Arena = { toks: [ { kind: 1, val: 10 }, { kind: 2, val: 20 } ] }",
+      "  return a.toks.length + a.toks[1].val",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // length 2 + toks[1].val (20) = 22.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 22) throw new Error(`f() returned ${got}, expected 22`);
+    },
+  },
+  {
+    // A UNION-VARIANT field of array type (`Call.args: i32[]`). The variant struct
+    // stores the i32-list wrapper ref; after `is`-narrowing, the field read recovers
+    // the list ref (downcast through the box) so `.length` / indexing apply — this is
+    // the shape `ast.vl`'s `Node` variants (`Call.callArgs: Node[]`, …) need.
+    name: "G5: union-variant with an `i32[]` field — narrow then read length + element => 4",
+    src: [
+      "type Call = { args: i32[] }",
+      "type Lit = { val: i32 }",
+      "type Node = Call | Lit",
+      "function f(n: Node): i32 {",
+      "  if n is Call { return n.args.length + n.args[0] }",
+      "  return 0",
+      "}",
+      "function mk(): Node {",
+      "  return { args: [2, 9] }",
+      "}",
+      "function main(): i32 {",
+      "  return f(mk())",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // args = [2, 9]; length (2) + args[0] (2) = 4.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 4) throw new Error(`main() returned ${got}, expected 4`);
+    },
+  },
+  // ── G3: `.push` onto a struct-FIELD array ──────────────────────────────────
+  // `b.items.push(x)` resolves the receiver to the struct field's i32-list wrapper ref
+  // (loaded once into a scratch local), then runs the existing list grow/append against
+  // it — the wrapper is mutated in place by reference, so the field sees the appended
+  // element. This is the `P.nodes.push(n)` arena-mutation shape `parser.vl` needs.
+  {
+    name: "G3: push onto a struct `i32[]` field grows it; read length + element => 33",
+    src: [
+      "type Box = { items: i32[] }",
+      "function f(): i32 {",
+      "  let b: Box = { items: [] }",
+      "  b.items.push(10)",
+      "  b.items.push(20)",
+      "  b.items.push(30)",
+      "  return b.items.length + b.items[2]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // length 3 + items[2] (30) = 33.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 33) throw new Error(`f() returned ${got}, expected 33`);
+    },
+  },
+  {
+    // The core arena shape: a GLOBAL struct with a `Node[]`-style ref-list field, mutated
+    // through `.push`. Here `Item[]` (struct-element ref list) stands in for `Node[]`.
+    name: "G3: push onto a GLOBAL struct's EMPTY ref-list field, read back => 11",
+    src: [
+      "type Item = { v: i32 }",
+      "type Arena = { items: Item[] }",
+      "let A: Arena = { items: [] }",
+      "function f(): i32 {",
+      "  A.items.push({ v: 5 })",
+      "  A.items.push({ v: 9 })",
+      "  return A.items.length + A.items[1].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // items starts empty, push {v:5},{v:9} → length 2 + items[1].v (9) = 11.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 11) throw new Error(`f() returned ${got}, expected 11`);
     },
   },
 ];
