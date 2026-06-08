@@ -163,9 +163,46 @@ binaryen optimize() within each file, not cross-file concurrency.
 ### Front-End Scaling (Future)
 
 The front end (lex + parse + typecheck) is ~53 ms for the 67 KB self-host source —
-well within acceptable range. The `big-literal-union (120)` synthetic shows the
-front end at 1.2 s (superlinear in union size); that is a separate algorithmic issue
-in typecheck narrowing, not relevant to the selfhost pipeline tests.
+well within acceptable range. The `big-literal-union (120)` synthetic showed the
+front end as superlinear — **RESOLVED** (see the 2026-06-08 section below).
+
+---
+
+## Compile-time follow-ups (2026-06-08)
+
+A second compile-time pass, with the bootstrapping lens: only fixes to **shared
+front-end / algorithm logic** carry to the eventual `typecheck.vl`; binaryen-specific
+costs do not (though per ROADMAP H4 the optimize step persists at self-host as
+external `wasm-opt`, so it isn't pure throwaway either).
+
+- **Literal-union cubic — FIXED.** `flattenType` deduped union variants pairwise
+  (O(n²)) while the parser folds `|` left-associatively (re-flatten per `|`) → O(n³).
+  An all-literal value-key dedup fast path makes it O(n²): 160 members 485 ms →
+  3.8 ms. Shared logic — carries to `typecheck.vl`. (CHANGELOG A16; `tests/cases/
+  types/literal-union-dedup.vl`.)
+- **Front end is otherwise linear.** Scaling compiler-shaped patterns (many
+  functions / type aliases / locals / object fields / statements / calls / nesting)
+  at N vs 2N shows ~linear growth; the only superlinear cases — long if/else-if
+  chains (O(n^1.4)) and deeply-nested object types — only bite at unrealistic sizes
+  (hundreds of arms / 150+ nesting). No remaining front-end cliff.
+- **Leaner-IR (feed binaryen smaller IR) — INVESTIGATED, NOT WORTH IT.** binaryen
+  `optimize()` removes 2.4–6.8× of our emitted IR, but that is its *designed* job
+  (block / temp-local cleanup, Heap2Local); pre-empting it reimplements binaryen
+  passes (against the "don't step on binaryen's feet" stance). Our own `toWasm` IR
+  build is **linear** (no quadratic to fix). The optimize-time superlinearity on a
+  large function is **binaryen-internal** — it scales with function body size, not
+  with any specific IR pattern (verified: many-distinct-locals vs few-reused-locals
+  optimize identically). No clean leaner-emission win. Don't re-investigate without
+  a profiler pointing at a specific binaryen pass our IR shape pessimizes.
+- **~400 ms per light test = the binaryen bundle load, not the compile.** The first
+  `compile()` in a worker pays ~333 ms (≈240 ms to instantiate the 13 MB `binaryen`
+  npm bundle — already V8-code-cached; ~379 ms with `--no-code-cache` — plus ~20 ms
+  Module/optimize/emit); subsequent compiles are ~0.9 ms. Under `--parallel` the
+  concurrent per-worker inits saturate cores and inflate every light test's reported
+  wall time. Paid once per worker that runs a codegen (`@run`) case; `checkOnly` and
+  front-end-error cases never load binaryen (`toWasm` is a lazy dynamic import). Near
+  the floor (the bundle size is the cost) and it disappears at self-host (binaryen.js
+  → external `wasm-opt`). Not worth chasing.
 
 ---
 
