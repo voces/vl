@@ -2790,6 +2790,7 @@ export const parseProgram = (
     if (hasBody) {
       next();
       skipNewlines();
+      const bodyStart = peek();
       typeBuilding.add(name);
       // Bind the param holes only while parsing the body; pop afterwards so the
       // names don't leak into the surrounding type scope.
@@ -2803,6 +2804,28 @@ export const parseProgram = (
       } finally {
         if (typeParams.length > 0) scopes.pop();
         typeBuilding.delete(name);
+      }
+      // A DEGENERATE self-cycle — `type D = D` — parses to a body that is nothing
+      // but a lazy self-`Alias` leaf (the back-edge carried by `typeBuilding`),
+      // with no structural base in between. That's nonsense: an alias defined
+      // purely in terms of itself has no base case, so nothing can inhabit it.
+      // Report it HERE, at the declaration, so an UNUSED `type D = D` still flags
+      // (the use-site check in `getConcreteType` only fires when the alias is
+      // referenced) — then bind `Never` so any use sites resolve quietly instead
+      // of piling on a duplicate "defined in terms of itself" error. Legitimate
+      // recursion (`type List = { rest: List[] }`, mutual recursion) resolves to a
+      // real structural body (an `Object`/array/map carrying the back-edge inside
+      // a field), never a bare self-`Alias`, so it does NOT take this branch.
+      if (entry.subType.type === "Alias" && entry.subType.name === name) {
+        errors.push({
+          type: "Syntax",
+          message:
+            `Type \`${name}\` is defined in terms of itself with no base ` +
+            `type, so it can never have a value`,
+          ctx: spanFrom(bodyStart),
+          code: 1,
+        });
+        entry.subType = { type: "Never" };
       }
     }
     return { type: "Block", label: `__type_${name}__`, statements: [] };
