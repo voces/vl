@@ -5102,6 +5102,20 @@ export const toWasm = async (
     }
     // A function value is a fat-pointer closure struct.
     if (t.type === "Function") return closureStruct().refType;
+    // Defensive backstop: a `Never`-typed value should never reach codegen — a
+    // value can't inhabit the empty type, and the type-check pass now rejects
+    // forming one (the never-value error in `ensureType`). If one slips through,
+    // surface a clear compiler diagnostic instead of the opaque
+    // `Unhandled AST -> WASM "Never" type` from `wasmType.ts`. This is
+    // unreachable in practice given the type-check fix; it exists so a future
+    // regression fails loudly and legibly.
+    if (t.type === "Never") {
+      throw new Error(
+        "internal: a `never`-typed value reached codegen — `never` is the " +
+          "empty type and has no values (this should have been rejected at " +
+          "type-check; please report it)",
+      );
+    }
     return toWasmTypeOf(binaryen, t);
   };
 

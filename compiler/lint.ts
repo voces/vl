@@ -33,6 +33,12 @@
 //      the literal boolean only — no general constant folding.
 //   5. Degenerate `for` step — a range `for` with a literal `step 0` never makes
 //      progress (an infinite/degenerate loop); flagged as an error.
+//   6. Empty intersection — a `type X = A & B` (or a binding so annotated) whose
+//      two CONCRETE operands share no values, so the intersection folds to
+//      `never`. A real value can never have this type (forming one is a separate
+//      error); the declaration is flagged as a warning. Scoped to concrete
+//      operands — a generic `T & U` (empty only for some instantiation) is not
+//      flagged.
 //
 // Pure data + AST/span lookups, no runtime globals — bundled into both the Deno
 // CLI and the Node LSP (dual-runtime constraint, see AGENTS.md).
@@ -45,9 +51,11 @@ import type {
   VLForNode,
   VLIfNode,
   VLStatement,
+  VLType,
   VLWhileNode,
 } from "./ast.ts";
 import { spanOf } from "./ast.ts";
+import { emptyIntersectionInfo } from "./typecheck.ts";
 import type { SymbolTable } from "./symbols.ts";
 import type { VLDiagnostic } from "./compile.ts";
 
@@ -73,6 +81,7 @@ export const lint = (
   const diagnostics: VLDiagnostic[] = [];
   unusedBindings(symbols, diagnostics);
   preferConst(symbols, diagnostics);
+  emptyIntersections(symbols, diagnostics);
   for (const stmt of programStatements) {
     unreachableInStatement(stmt, spans, diagnostics);
     constantBranchInStatement(stmt, spans, diagnostics);
@@ -249,6 +258,83 @@ const preferConst = (symbols: SymbolTable, out: VLDiagnostic[]): void => {
       // stamp a keyword span (defensive; always present for `let` decls today).
       range: rangeFromCtx(b.declKeyword ?? b.decl),
       code: "prefer-const",
+      source: "vital",
+    });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// 6. Empty intersection (a concrete `A & B` that folds to `never`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Find the empty-intersection record on a `never` reachable inside `type` — its
+ * own node, the body of a `Type` wrapper, the operand of a `Nullable`, or a
+ * member of a `Union`. The record is attached by `intersectType` (typecheck.ts)
+ * ONLY when two CONCRETE, non-`never` operands fold to `never`, so a generic
+ * `T & U` (which may be non-empty for some instantiation) carries no record and
+ * is never reported here. Returns the human-readable text/reason or undefined.
+ */
+const findEmptyIntersection = (
+  type: VLType | undefined,
+  seen = new Set<VLType>(),
+): ReturnType<typeof emptyIntersectionInfo> => {
+  if (!type || seen.has(type)) return undefined;
+  seen.add(type);
+  const direct = emptyIntersectionInfo(type);
+  if (direct) return direct;
+  if (type.type === "Type" || type.type === "Nullable") {
+    return findEmptyIntersection(type.subType, seen);
+  }
+  if (type.type === "Union") {
+    for (const s of type.subTypes) {
+      const hit = findEmptyIntersection(s, seen);
+      if (hit) return hit;
+    }
+  }
+  return undefined;
+};
+
+/**
+ * Flag a `type X = A & B` (or a binding annotated with such an intersection)
+ * whose two CONCRETE operands share no values, so the intersection is `never`.
+ * A real value can never have this type — the binding-site `ensureType` already
+ * errors if you try to *form* one — but the declaration itself is almost always
+ * a mistake, so a `warning` at the declaration points it out even when no value
+ * is constructed. Walks the symbol table's `type`/`variable` declarations (so it
+ * sees ONLY annotated, source-level intersections, never a transient `never`
+ * from narrowing). De-duplicated by binding identity.
+ */
+const emptyIntersections = (
+  symbols: SymbolTable,
+  out: VLDiagnostic[],
+): void => {
+  const reported = new Set<unknown>();
+  for (const occ of symbols.occurrences) {
+    if (!occ.isDecl) continue;
+    const b = occ.binding;
+    if (reported.has(b)) continue;
+    if (b.kind !== "type" && b.kind !== "variable") continue;
+    const info = findEmptyIntersection(b.type);
+    if (!info) continue;
+    reported.add(b);
+    // A self-referential definition (`type E = A & E`) collapses to `never`
+    // because the alias is defined in terms of itself — an honest, self-cycle
+    // message rather than the disjoint-operands wording. Otherwise it's a
+    // genuinely disjoint concrete pair (`A & B`).
+    const message = info.selfRef
+      ? `Type \`${info.selfRef}\` refers to itself inside an intersection ` +
+        `(\`${info.text}\`), so it reduces to \`never\``
+      : `Intersection \`${info.text}\` is empty (\`never\`) — ${info.reason}`;
+    out.push({
+      message,
+      severity: "warning",
+      // Range the warning on the `A & B` intersection EXPRESSION (the type
+      // annotation span captured by the parser), not the alias name — matching
+      // the never-value error. Fall back to the declaration span if no
+      // annotation span was threaded.
+      range: rangeFromCtx(info.span ?? b.decl),
+      code: "empty-intersection",
       source: "vital",
     });
   }

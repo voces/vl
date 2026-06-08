@@ -19,6 +19,7 @@ import {
   conditionsExhaust,
   defaultIntegerType,
   elseNarrowings,
+  emptyIntersectionInfo,
   ensureType,
   flattenType,
   getChildType,
@@ -411,17 +412,34 @@ export const parseProgram = (
   // array suffix. Flattened so `A & B & C` is one `Intersection` node; a single
   // operand passes through unwrapped.
   const parseIntersectionType = (): VLType => {
+    // Token at the start of the whole `A & B [& …]` expression, so the span we
+    // attach to an empty-intersection fold covers the intersection EXPRESSION
+    // (not just one operand, and not the alias name). `record`ed nodes elsewhere
+    // use `spans`, but a folded `Never` has no stable node to key, so we thread
+    // the span explicitly to `intersectType`.
+    const startTok = peek();
+    // A reference to the alias being defined right now (`type E = A & E`) parses
+    // to a lazy self-`Alias` leaf because the name is in `typeBuilding` (see the
+    // ID branch of `parseTypePrimary`). If such an operand participates in a fold
+    // to `never`, it's a degenerate self-cycle — capture its name so the
+    // diagnostics can say so honestly instead of treating it as a disjoint pair.
+    const selfRefOf = (t: VLType): string | undefined =>
+      t.type === "Alias" && typeBuilding.has(t.name) ? t.name : undefined;
     let left = parseArrayType();
+    let selfRef = selfRefOf(left);
     while (at("AMPERSAND")) {
       next();
       skipNewlines();
       const right = parseArrayType();
+      selfRef = selfRef ?? selfRefOf(right);
       // Fold through the existing algebra so a finite annotation simplifies to a
       // concrete type for codegen (`(0|1|2) & !2` → `0 | 1`; `A & !B` is the
       // common "A but not B"). `intersectType` keeps an irreducible open-world
       // pair as a residual `Intersection`/`Negation` node, which `ensureType`
-      // still validates as an assignment target.
-      left = intersectType(left, right);
+      // still validates as an assignment target. The span (start of the whole
+      // expr through the last operand) and any self-reference are threaded so a
+      // fold to `never` can be ranged and explained precisely.
+      left = intersectType(left, right, spanFrom(startTok), selfRef);
       skipNewlines();
     }
     return left;
@@ -2773,6 +2791,7 @@ export const parseProgram = (
     if (hasBody) {
       next();
       skipNewlines();
+      const bodyStart = peek();
       typeBuilding.add(name);
       // Bind the param holes only while parsing the body; pop afterwards so the
       // names don't leak into the surrounding type scope.
@@ -2786,6 +2805,60 @@ export const parseProgram = (
       } finally {
         if (typeParams.length > 0) scopes.pop();
         typeBuilding.delete(name);
+      }
+      // A DEGENERATE self-cycle — `type D = D` — parses to a body that is nothing
+      // but a lazy self-`Alias` leaf (the back-edge carried by `typeBuilding`),
+      // with no structural base in between. That's nonsense: an alias defined
+      // purely in terms of itself has no base case, so nothing can inhabit it.
+      // Report it HERE, at the declaration, so an UNUSED `type D = D` still flags
+      // (the use-site check in `getConcreteType` only fires when the alias is
+      // referenced) — then bind `Never` so any use sites resolve quietly instead
+      // of piling on a duplicate "defined in terms of itself" error. Legitimate
+      // recursion (`type List = { rest: List[] }`, mutual recursion) resolves to a
+      // real structural body (an `Object`/array/map carrying the back-edge inside
+      // a field), never a bare self-`Alias`, so it does NOT take this branch.
+      if (entry.subType.type === "Alias" && entry.subType.name === name) {
+        errors.push({
+          type: "Syntax",
+          message:
+            `Type \`${name}\` is defined in terms of itself with no base ` +
+            `type, so it can never have a value`,
+          ctx: spanFrom(bodyStart),
+          code: 1,
+        });
+        entry.subType = { type: "Never" };
+      }
+      // An EMPTY-INTERSECTION alias — `type C = A & B` whose two concrete
+      // operands share no values — folds to a tagged `Never` (see
+      // `intersectType`/`tagEmptyIntersection` in typecheck.ts). Like the
+      // degenerate self-cycle above, the alias resolves lazily, so the use-site
+      // never-value error in `ensureType` only fires when the alias is
+      // REFERENCED — an UNUSED `type C = A & B` would otherwise surface nothing
+      // (PR #189 review: "same issue of not error until used"). Report the
+      // never-value error HERE, at the declaration, ranged on the `A & B`
+      // expression, so it flags regardless of use — mirroring `type D = D`. The
+      // message is the SAME wording the use-site `ensureType` produces, so the
+      // two paths agree. We then rebind to an UNTAGGED `Never` (exactly as the
+      // self-cycle branch above does): with the tag gone, the use-site
+      // `ensureType` lookup returns nothing and resolves quietly (no duplicate at
+      // the use site), and the `empty-intersection` LINT — which keys off the
+      // same tag — finds nothing on this alias, so it doesn't add a redundant
+      // warning on top of the error. Exactly ONE diagnostic per such alias,
+      // whether used or not. Only a `type` alias body is affected; an inline
+      // `let x: A & B` carries its own tagged `Never` and keeps its use-site error.
+      const emptyInfo = emptyIntersectionInfo(entry.subType);
+      if (emptyInfo) {
+        errors.push({
+          type: "Syntax",
+          message: emptyInfo.selfRef
+            ? `Type \`${emptyInfo.selfRef}\` refers to itself inside an ` +
+              `intersection (\`${emptyInfo.text}\`), so it reduces to \`never\``
+            : `Type \`${name}\` is \`never\` (an empty type — ` +
+              `\`${emptyInfo.text}\`, ${emptyInfo.reason}), so it has no values`,
+          ctx: emptyInfo.span ?? spanFrom(bodyStart),
+          code: 0,
+        });
+        entry.subType = { type: "Never" };
       }
     }
     return { type: "Block", label: `__type_${name}__`, statements: [] };
