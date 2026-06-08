@@ -120,6 +120,7 @@ const verifyFullBundleBuilds = async (): Promise<void> => {
     "setModelMarkers",
     "registerInlayHintsProvider",
     "registerDefinitionProvider",
+    "registerCodeActionProvider",
   ]) {
     if (!js!.text.includes(needle)) {
       fail(`full bundle is missing the \`${needle}\` wiring`);
@@ -239,6 +240,66 @@ const main = async (): Promise<void> => {
     `OK: inlay hints -> ${hints.length}, definition -> line ${def!.start.line + 1}`,
   );
 
+  // Quick-fixes (code actions / B17): the unused `x` binding on line 0 offers the
+  // `_`-prefix (preferred) + remove-binding fixes; an unused import offers a
+  // remove-import fix. Mirrors the editor's "Auto Fix" lightbulb.
+  const unusedSrc = `let x = 1\nprint(1)\n`;
+  const varFixes = lsp.codeActions(unusedSrc, {
+    start: { line: 0, character: 4 },
+    end: { line: 0, character: 4 },
+  });
+  const preferred = varFixes.find((f) => f.isPreferred);
+  if (!preferred || !preferred.title.includes("_")) {
+    fail(`unused-variable did not offer the preferred \`_\`-prefix fix: ${JSON.stringify(varFixes)}`);
+  }
+  if (!varFixes.some((f) => f.title.toLowerCase().includes("remove"))) {
+    fail(`unused-variable did not offer a remove-binding fix: ${JSON.stringify(varFixes)}`);
+  }
+  // `unused-import` only fires through the graph-aware front end (it needs module
+  // resolution to seed the import binding), which the playground's single-file
+  // diagnostics path doesn't run — same as the real single-file LSP. So feed the
+  // diagnostic explicitly (as an editor marker would carry it) to prove the
+  // remove-import dispatch in the adapter is wired, mirroring `server.ts`.
+  const importSrc = `import { add } from "./mathx"\nprint(1)\n`;
+  const importRange = {
+    start: { line: 0, character: 9 },
+    end: { line: 0, character: 12 },
+  };
+  const importFixes = lsp.codeActions(importSrc, importRange, [{
+    message: "Unused import `add` (remove it)",
+    severity: "warning",
+    source: "vital",
+    code: "unused-import",
+    range: importRange,
+  }]);
+  if (!importFixes.some((f) => f.title.toLowerCase().includes("import"))) {
+    fail(`unused-import did not offer a remove-import fix: ${JSON.stringify(importFixes)}`);
+  }
+
+  // A never-reassigned `let` offers the `let`→`const` fix (also fed as a marker,
+  // since `prefer-const` likewise comes from a path the single-file pass may not
+  // surface here — the dispatch is what we're verifying).
+  const constSrc = `let y = 1\nprint(y)\n`;
+  const constRange = {
+    start: { line: 0, character: 0 },
+    end: { line: 0, character: 3 },
+  };
+  const constFixes = lsp.codeActions(constSrc, constRange, [{
+    message: "`let y` is never reassigned; prefer `const`",
+    severity: "info",
+    source: "vital",
+    code: "prefer-const",
+    range: constRange,
+  }]);
+  if (!constFixes.some((f) => f.title.toLowerCase().includes("const"))) {
+    fail(`prefer-const did not offer a let→const fix: ${JSON.stringify(constFixes)}`);
+  }
+  console.error(
+    `OK: quick-fixes -> var [${varFixes.map((f) => f.title).join(", ")}], ` +
+      `import [${importFixes.map((f) => f.title).join(", ")}], ` +
+      `const [${constFixes.map((f) => f.title).join(", ")}]`,
+  );
+
   // 4. The shareable-link encode/decode round-trip (E4).
   // `share.ts` uses only built-in browser APIs (CompressionStream / btoa / atob)
   // that Deno also exposes natively — no bundling needed; import it directly.
@@ -264,7 +325,59 @@ const main = async (): Promise<void> => {
     `OK: share round-trip -> hash length ${hash.length}, decoded matches source`,
   );
 
-  // 5. The full page bundle (main.ts + Monaco) builds with the LSP wiring.
+  // 5. Last-session persistence ("remember what we did last"). `projects.ts`
+  // touches only `localStorage` (which Deno exposes), so import it directly — no
+  // bundling — like `share.ts`. There is ONE remembered session, not a list.
+  console.error("\nchecking last-session persistence…");
+  const proj = await import("./src/projects.ts");
+  // Start clean so prior runs don't skew the assertions.
+  proj.clearLastSession();
+  if (proj.loadLastSession() !== null) fail("loadLastSession should be null when empty");
+
+  // Round-trip: saving the LIVE (modified) buffers and reloading restores them
+  // into the same sample context — a refresh/return keeps your edits.
+  proj.saveLastSession({
+    sampleIndex: 1,
+    files: [{ name: "main.vl", source: "print(1) // my modified edit\n" }],
+  });
+  const restored = proj.loadLastSession();
+  if (!restored) fail("loadLastSession did not restore the saved session");
+  if (restored!.sampleIndex !== 1) fail("loadLastSession lost the sample index");
+  if (restored!.files[0].source !== "print(1) // my modified edit\n") {
+    fail("loadLastSession did not restore the live (modified) buffer");
+  }
+
+  // Switching to another sample loads it FRESH and OVERWRITES the last session —
+  // the previous edits are gone forever. There is no list: a second save replaces
+  // the first.
+  proj.saveLastSession({
+    sampleIndex: 2,
+    files: [{ name: "main.vl", source: "print(2) // a fresh, different sample\n" }],
+  });
+  const afterSwitch = proj.loadLastSession();
+  if (!afterSwitch || afterSwitch.sampleIndex !== 2) {
+    fail("switching samples did not overwrite the last session's index");
+  }
+  if (afterSwitch!.files[0].source !== "print(2) // a fresh, different sample\n") {
+    fail("switching samples did not replace the buffers with the fresh sample");
+  }
+  if (afterSwitch!.files[0].source.includes("my modified edit")) {
+    fail("switching samples should discard the previous edits, but they survived");
+  }
+
+  // A malformed record decodes to null (defensive), not a throw.
+  try {
+    localStorage.setItem("vl-last-session", "{not json");
+  } catch { /* storage may be unavailable; that's fine */ }
+  if (proj.loadLastSession() !== null) fail("malformed session did not decode to null");
+
+  // Clean up so a verify run leaves no residue.
+  proj.clearLastSession();
+  console.error(
+    "OK: last-session -> save/restore round-trip + sample-switch overwrite (edits discarded)",
+  );
+
+  // 6. The full page bundle (main.ts + Monaco) builds with the LSP wiring.
   console.error("\nbuilding the full page bundle (Monaco + providers)…");
   await verifyFullBundleBuilds();
 

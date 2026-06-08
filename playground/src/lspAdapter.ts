@@ -29,8 +29,14 @@ import {
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
 } from "../../lsp/src/typeFeatures.ts";
+import {
+  fixableDiagnosticsForRange,
+  type LspTextEdit,
+  type QuickFix,
+  quickFixesForDiagnostic,
+} from "../../lsp/src/codeActions.ts";
 
-export type { VLDiagnostic };
+export type { LspTextEdit, QuickFix, VLDiagnostic };
 export { SEMANTIC_TOKEN_LEGEND };
 
 /** LSP 0-based line / 0-based character — the wire form `server.ts` speaks. */
@@ -184,4 +190,36 @@ export const definition = (
 ): { start: LspPosition; end: LspPosition } | null => {
   const decl = parseSymbols(text).definitionAt(toVLPosition(pos));
   return decl ? ctxToLspRange(decl) : null;
+};
+
+// ---- quick-fixes (code actions / B17) --------------------------------------
+
+/**
+ * Quick-fixes for the lint diagnostics overlapping `range`, mirroring
+ * `server.ts`'s `onCodeAction` exactly. The editor passes the markers it holds
+ * (`contextDiagnostics`) AND we re-derive the current diagnostics (`text`'s own
+ * `vital` lints) as the "cached" set — the equivalent of `server.ts`'s
+ * `diagnosticsByUri` cache. `fixableDiagnosticsForRange` keeps only `vital`-sourced
+ * diagnostics, de-dupes them, and folds in any cached one on an overlapping line
+ * (so a fix is still offered when the cursor sits on the binding line but off the
+ * diagnostic's exact span — e.g. on the name while `prefer-const` points at `let`).
+ * `quickFixesForDiagnostic` then dispatches on each diagnostic's `code`:
+ *   - `unused-variable` → remove-binding (alt) + prefix-`_` (preferred)
+ *   - `unused-import`   → remove-import
+ *   - `prefer-const`    → `let`→`const`
+ * Each returned `QuickFix` carries plain 0-based LSP text edits; `main.ts` wraps
+ * them into Monaco `CodeAction`s (1-based) with a `WorkspaceEdit`.
+ */
+export const codeActions = (
+  text: string,
+  range: LspRange,
+  contextDiagnostics: VLDiagnostic[] = [],
+): QuickFix[] => {
+  const cached = diagnostics(text);
+  const fixable = fixableDiagnosticsForRange(contextDiagnostics, cached, range);
+  const fixes: QuickFix[] = [];
+  for (const d of fixable) {
+    fixes.push(...quickFixesForDiagnostic(text, d.code, d.range));
+  }
+  return fixes;
 };
