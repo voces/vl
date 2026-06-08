@@ -278,8 +278,11 @@ const CASES: Case[] = [
     },
   },
   {
-    name: "an unsupported shape fails loudly, not with garbage bytes",
-    src: "function bad(a: i32): i32 {\n  return a / 2\n}\n",
+    // `??` outside a map index get still fails loudly — keeps the "garbage bytes are
+    // never emitted for an unsupported operator" coverage now that `/` and `%` are
+    // genuine i32 operators (see the div/rem cases below).
+    name: "an unsupported operator shape fails loudly, not with garbage bytes",
+    src: "function bad(a: i32): i32 {\n  return a ?? 2\n}\n",
     check: (logs) => {
       const errLine = logs.find((l) => l.startsWith("err: "));
       if (!errLine) {
@@ -289,9 +292,174 @@ const CASES: Case[] = [
           }`,
         );
       }
-      if (!errLine.includes("operator")) {
+      if (!errLine.includes("??") && !errLine.includes("operator")) {
         throw new Error(`unexpected emitter error message: ${errLine}`);
       }
+    },
+  },
+  {
+    // VL functions IMPLICITLY return their last expression (no `return` keyword) — the
+    // idiom every `ast.vl` constructor uses (`addNode(n)` / `out` as the final line).
+    // emitProgram now lowers a trailing bare value-expression statement as the return.
+    name: "implicit return: a trailing bare expression is the return value (`n + 1`)",
+    src: "function f(n: i32): i32 {\n  n + 1\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f", 41);
+      if (got !== 42) throw new Error(`f(41) returned ${got}, expected 42`);
+    },
+  },
+  {
+    name: "implicit return: a trailing local reference (`let s = a+b; s`)",
+    src:
+      "function g(a: i32, b: i32): i32 {\n  let s = a + b\n  s\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "g", 20, 22);
+      if (got !== 42) throw new Error(`g(20, 22) returned ${got}, expected 42`);
+    },
+  },
+  {
+    name:
+      "implicit return: an explicit early `return` then a trailing implicit one => 84",
+    src:
+      "function h(n: i32): i32 {\n  if n < 0 { return 0 }\n  n * 2\n}\n",
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const pos = await runExport(bytes, "h", 42);
+      if (pos !== 84) throw new Error(`h(42) returned ${pos}, expected 84`);
+      const neg = await runExport(bytes, "h", -1);
+      if (neg !== 0) throw new Error(`h(-1) returned ${neg}, expected 0`);
+    },
+  },
+  {
+    name: "implicit return: a trailing value-returning CALL (`addOne(n)`)",
+    src:
+      "function addOne(x: i32): i32 {\n  x + 1\n}\nfunction f(n: i32): i32 {\n  addOne(n)\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f", 9);
+      if (got !== 10) throw new Error(`f(9) returned ${got}, expected 10`);
+    },
+  },
+  {
+    // A function whose body ENDS in an `if/else` where both arms `return` falls
+    // through (structurally) to the function `end` with an empty stack. emitProgram
+    // now emits an `unreachable` before the `end` so the module validates; the arms'
+    // `return`s do the real work.
+    name: "if/else both-arms-return as the body tail validates (`>0 ? 1 : 2`)",
+    src: [
+      "function f(n: i32): i32 {",
+      "  if n > 0 {",
+      "    return 1",
+      "  } else {",
+      "    return 2",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const pos = await runExport(bytes, "f", 5);
+      if (pos !== 1) throw new Error(`f(5) returned ${pos}, expected 1`);
+      const nonpos = await runExport(bytes, "f", -5);
+      if (nonpos !== 2) throw new Error(`f(-5) returned ${nonpos}, expected 2`);
+    },
+  },
+  {
+    name: "else-if chain as the body tail (all arms return) => 3/2/1",
+    src: [
+      "function f(n: i32): i32 {",
+      "  if n > 10 {",
+      "    return 3",
+      "  } else if n > 5 {",
+      "    return 2",
+      "  } else {",
+      "    return 1",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      if (await runExport(bytes, "f", 20) !== 3) throw new Error("f(20) != 3");
+      if (await runExport(bytes, "f", 7) !== 2) throw new Error("f(7) != 2");
+      if (await runExport(bytes, "f", 1) !== 1) throw new Error("f(1) != 1");
+    },
+  },
+  {
+    // The REAL `i32ToStr` + `digitChar` from the self-host front end (`ast.vl`),
+    // verbatim. It exercises `/`, `%`, the implicit return, string `+`, a `while`
+    // loop, and string-returning helpers all at once — and now compiles + runs
+    // end-to-end through the real lexer→parser→emitProgram pipeline. `main` calls it
+    // on -405 and folds the result string's code points so the proof is an i32:
+    // "-405" → '-'(45)+'4'(52)+'0'(48)+'5'(53) = 198, length 4 → 198*100+4 = 19804.
+    name: "ast.vl's REAL `i32ToStr(-405)` compiles + runs (code-point fold => 19804)",
+    src: [
+      "function digitChar(d: i32): string {",
+      '  if d == 0 { return "0" }',
+      '  if d == 1 { return "1" }',
+      '  if d == 2 { return "2" }',
+      '  if d == 3 { return "3" }',
+      '  if d == 4 { return "4" }',
+      '  if d == 5 { return "5" }',
+      '  if d == 6 { return "6" }',
+      '  if d == 7 { return "7" }',
+      '  if d == 8 { return "8" }',
+      '  "9"',
+      "}",
+      "function i32ToStr(n: i32): string {",
+      '  if n == 0 { return "0" }',
+      "  let neg = n < 0",
+      "  let m = n",
+      "  if neg { m = 0 - m }",
+      '  let out = ""',
+      "  while m > 0 {",
+      "    out = digitChar(m % 10) + out",
+      "    m = m / 10",
+      "  }",
+      '  if neg { out = "-" + out }',
+      "  out",
+      "}",
+      "function main(): i32 {",
+      "  let s = i32ToStr(-405)",
+      "  let sum = 0",
+      "  let i = 0",
+      "  while i < s.length {",
+      "    sum = sum + s[i]",
+      "    i = i + 1",
+      "  }",
+      "  return sum * 100 + s.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 19804) {
+        throw new Error(`main() returned ${got}, expected 19804`);
+      }
+    },
+  },
+  {
+    name: "`/` lowers to i32.div_s (`a / b`): 17 / 5 => 3 (truncating)",
+    src: "function divv(a: i32, b: i32): i32 {\n  return a / b\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "divv", 17, 5);
+      if (got !== 3) throw new Error(`divv(17, 5) returned ${got}, expected 3`);
+    },
+  },
+  {
+    name: "`%` lowers to i32.rem_s (`a % b`): 17 % 5 => 2",
+    src: "function modv(a: i32, b: i32): i32 {\n  return a % b\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "modv", 17, 5);
+      if (got !== 2) throw new Error(`modv(17, 5) returned ${got}, expected 2`);
+    },
+  },
+  {
+    name: "`/` and `%` combine — `(a / b) * b + a % b` reconstructs a => 17",
+    src:
+      "function f(a: i32, b: i32): i32 {\n  return (a / b) * b + a % b\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f", 17, 5);
+      if (got !== 17) throw new Error(`f(17, 5) returned ${got}, expected 17`);
     },
   },
   {
@@ -403,6 +571,55 @@ const CASES: Case[] = [
       "function main(): i32 {",
       "  let p = { x: 7, y: 9 }",
       "  return p.x",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    // The self-host front end (`ast.vl`) declares every `type` over SEVERAL lines
+    // with a trailing comma. The parser now skips the NEWLINE tokens inside a braced
+    // field list, so a multiline + trailing-comma struct decl parses and lowers the
+    // same as the single-line form. Drives the real lexer→parser→emitProgram path.
+    name: "a MULTILINE struct decl with a trailing comma parses + lowers (`p.x+p.y` => 30)",
+    src: [
+      "type P = {",
+      "  x: i32,",
+      "  y: i32,",
+      "}",
+      "function main(): i32 {",
+      "  let p: P = { x: 10, y: 20 }",
+      "  return p.x + p.y",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 30) throw new Error(`main() returned ${got}, expected 30`);
+    },
+  },
+  {
+    // `ast.vl`'s `Node` union spans 28 lines with each `|` at the start of a line.
+    // The parser now skips NEWLINEs around the `|` separators in a union-variant
+    // list, so a multiline union alias discriminates the same as the single-line form.
+    name: "a MULTILINE union alias (`A |\\n B`) parses + `is`-narrows => 7",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type Node = A |",
+      "  B",
+      "function f(n: Node): i32 {",
+      "  if n is A { return n.av }",
+      "  return 0",
+      "}",
+      "function mkA(x: i32): Node {",
+      "  return { av: x }",
+      "}",
+      "function main(): i32 {",
+      "  return f(mkA(7))",
       "}",
       "",
     ].join("\n"),

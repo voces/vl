@@ -1121,6 +1121,8 @@ function binOpcode(op: string): i32 {
   if op == "+" { return 106 }   // 0x6a i32.add
   if op == "-" { return 107 }   // 0x6b i32.sub
   if op == "*" { return 108 }   // 0x6c i32.mul
+  if op == "/" { return 109 }   // 0x6d i32.div_s (signed; VL `i32` division is signed)
+  if op == "%" { return 111 }   // 0x6f i32.rem_s (signed remainder)
   if op == "==" { return 70 }   // 0x46 i32.eq
   if op == "!=" { return 71 }   // 0x47 i32.ne
   if op == "<" { return 72 }    // 0x48 i32.lt_s
@@ -3588,6 +3590,96 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: unsupported statement in body")
 }
 
+// True if the statement at `stmtIx` is a BARE VALUE EXPRESSION usable as an IMPLICIT
+// RETURN — a VL function whose last statement is an expression (no `return` keyword)
+// yields that expression's value (the idiom every `ast.vl` constructor uses:
+// `addNode(n)` / `out` as the final line). Recognized: literals, an identifier, a
+// unary, a non-assignment `BinExpr`, a paren, a member / index access, an `is` guard,
+// an object / array literal, and a value-returning CALL (`f(..)` whose callee is an
+// Ident — NOT a `recv.push(x)` member-call, which is void). A `LetDecl`/`RetStmt`/
+// `IfStmt`/`WhileStmt`/assignment/`.push` is a STATEMENT, not a tail value, so it is
+// lowered normally by `emitStmt`.
+function stmtIsTailValue(stmtIx: i32): boolean {
+  let s = P.nodes[stmtIx]
+  if s is NumLit { return true }
+  if s is StrLit { return true }
+  if s is CharLit { return true }
+  if s is BoolLit { return true }
+  if s is Ident { return true }
+  if s is Unary { return true }
+  if s is Paren { return true }
+  if s is Member { return true }
+  if s is Index { return true }
+  if s is IsExpr { return true }
+  if s is ObjLit { return true }
+  if s is ArrayLit { return true }
+  if s is BinExpr {
+    // An assignment statement is NOT a value; any other binary op is.
+    return s.binOp != "="
+  }
+  if s is Call {
+    // A value-returning call `f(..)` is a tail value; a `recv.push(x)` member-call is
+    // a void statement, so it is NOT.
+    let callee = P.nodes[s.callFn]
+    if callee is Ident { return true }
+    return false
+  }
+  false
+}
+
+// Lower a function's TOP-LEVEL body block at `blockIx`: every statement but the last
+// is lowered normally; if the LAST statement is a bare value expression (no `return`
+// keyword), it is lowered as the function's return value (`emitExpr` + `return`) —
+// VL's implicit-return idiom. A last statement that is itself a real statement (a
+// `return`, `if`, `while`, assignment, `.push`, or `let`) is lowered unchanged. An
+// empty body is left to the existing validation. Returns 0, or -1 (via `emitFail`).
+function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32): i32 {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let n = stmts.length
+    let i = 0
+    while i < n {
+      let isLast = i == n - 1
+      if isLast && stmtIsTailValue(stmts[i]) {
+        // Implicit return: push the value, then `return` (0x0f).
+        if emitExpr(body, stmts[i], fnIx) < 0 { return 0 - 1 }
+        body.push(15)          // 0x0f return
+      } else {
+        if emitStmt(body, stmts[i], fnIx) < 0 { return 0 - 1 }
+      }
+      i = i + 1
+    }
+    return 0
+  }
+  emitFail("emitProgram: function has no block body")
+}
+
+// True if the function's TOP-LEVEL body block at `blockIx` ends in an instruction
+// that the wasm validator treats as making the function's fallthrough UNREACHABLE —
+// i.e. its last statement is an explicit `return` (`RetStmt`) or a bare tail value
+// (lowered by `emitFuncBody` as `emitExpr` + `return`). In those cases the function's
+// trailing `end` is reached only via the polymorphic post-`return` stack, so no
+// padding is needed. Otherwise (the body ends in an `if`/`while`/assignment/`.push`
+// whose own `return`s exit from INSIDE a structured block) control structurally falls
+// through to `end` with an empty stack — which fails the result-type check unless an
+// explicit `unreachable` precedes the `end`. The typechecker has already proven such
+// a fallthrough is dynamically dead (every path returns), so the `unreachable` is
+// sound padding, never executed.
+function bodyEndsInReturn(blockIx: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let n = stmts.length
+    if n == 0 { return false }
+    let last = stmts[n - 1]
+    let s = P.nodes[last]
+    if s is RetStmt { return true }
+    return stmtIsTailValue(last)
+  }
+  false
+}
+
 // Lower every statement of the block at `blockIx` onto `body`, in order. Returns 0,
 // or -1 (via `emitFail`) on a non-block node or an unsupported statement within.
 function emitStmts(body: i32[], blockIx: i32, fnIx: i32): i32 {
@@ -3690,7 +3782,7 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     mapScratchBase = fn.fnParams.length + nLocals + i32Scratch + refScratch + strScratch
 
     let bodyExpr: i32[] = []
-    if emitStmts(bodyExpr, fn.fnBody, fnIx) < 0 { return 0 - 1 }
+    if emitFuncBody(bodyExpr, fn.fnBody, fnIx) < 0 { return 0 - 1 }
 
     let body: i32[] = []
     // Locals vector: one (count=1, valtype) run per DECLARED local (a struct/list/string/
@@ -3801,6 +3893,15 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(127)         // 11 rslot: i32
     }
     appendAll(body, bodyExpr)
+    // If the body does NOT end in an explicit `return` / tail value, control
+    // structurally falls through to the function `end` with an empty stack (e.g. a
+    // body ending in `if c { return a } else { return b }`, whose `return`s exit from
+    // inside the structured `if`). The validator requires the function's result type
+    // at fallthrough, so emit an `unreachable` (0x00) — the typechecker has proven
+    // this fallthrough is dead, so it is sound padding, never executed.
+    if !bodyEndsInReturn(fn.fnBody) {
+      body.push(0)           // 0x00 unreachable
+    }
     body.push(11)            // 0x0b end
     appendAll(out, ulebToArr(body.length))
     appendAll(out, body)
