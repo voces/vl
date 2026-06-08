@@ -665,11 +665,15 @@ export const toWasm = async (
       )
       .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
 
-  // A structural struct: an anonymous object that isn't an array (a builtin like
-  // `i32`/`string` carries a `name`; an array carries an `i32` index sig). Only
-  // these can be (mutually) recursive, so they drive the cycle handling below.
+  // A structural struct: an anonymous object that isn't an array OR a map (a
+  // builtin like `i32`/`string` carries a `name`; an array carries an `i32` index
+  // sig; a map carries a `string`/non-i32 index sig — its own WasmGC hash rep, not
+  // a plain field struct). Only these plain structs can be (mutually) recursive
+  // *through their fields*, so they drive the struct-field cycle handling below;
+  // a map's own recursion (through its VALUE type) is handled on the map path.
   const isStructObject = (t: VLType): t is VLObjectType =>
-    t.type === "Object" && t.name === undefined && !arrayElementType(t);
+    t.type === "Object" && t.name === undefined && !arrayElementType(t) &&
+    !isMapType(t);
 
   // Follow a (possibly nullable) field/type to the struct it denotes, or null —
   // used to walk recursive edges. A recursive self-reference is an `Alias` leaf
@@ -748,6 +752,19 @@ export const toWasm = async (
         // re-enter the whole type build on a still-unfinished struct and loop.
         result = prefix +
           `[${structSig(arrayElementType(soft)!, nameStack)}]`;
+      } else if (isMapType(soft)) {
+        // A map (`{[K]:V}`) field can carry the recursion through its VALUE
+        // type (`type Tree = { children: {[string]: Tree} }`). Recurse into the
+        // value (RAW, so a self-reference stays an `Alias` leaf and closes the
+        // de Bruijn cycle here) with the same `nameStack`, instead of bailing to
+        // `toWasmType` — which would `mapType`→`mapArrayType`→`refHeapType` back
+        // into the still-unfinished struct and loop. The key never recurses (it
+        // is `string`/`i32`), so lower it normally.
+        const kv = mapKeyValueType(soft)!;
+        result = prefix +
+          `{[${structSig(kv.key, nameStack)}]:${
+            structSig(kv.value, nameStack)
+          }}`;
       } else {
         result = prefix + `#${toWasmType(t)}`;
       }
@@ -784,6 +801,32 @@ export const toWasm = async (
     return { node: t as VLObjectType, element, nullable };
   };
 
+  // Follow a (possibly nullable) field/type to the MAP it denotes whose VALUE is
+  // a recursive struct, or null — the map-value analogue of `asListTarget`. A
+  // field `children: {[string]: Tree}` carries the recursion through the map's
+  // value type, so the recursion group must pull in the map's hash struct and its
+  // `vals` backing array (which forward-references the recursive value struct).
+  // Only a map whose value is a struct (the only shape that can close a struct
+  // cycle) joins the group; everything else stays on the standalone `mapType`
+  // path. The value is kept RAW (`mapKeyValueType` preserves the `Alias` leaf) so
+  // softening never expands a self-reference into the cyclic struct.
+  const asMapTarget = (
+    type: VLType,
+  ): { key: VLType; value: VLType; nullable: boolean } | null => {
+    let t = softenImplicitType(type);
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
+    let nullable = false;
+    if (t.type === "Nullable") {
+      nullable = true;
+      t = softenImplicitType(t.subType);
+      while (t.type === "Infer") t = softenImplicitType(t.subType);
+    }
+    const kv = mapKeyValueType(t);
+    if (!kv) return null;
+    if (!asStructTarget(kv.value)) return null;
+    return { key: kv.key, value: kv.value, nullable };
+  };
+
   const objectStruct = (type: VLObjectType): ObjectStruct => {
     const sig = structSig(type);
     const cached = objectStructs.get(sig);
@@ -801,15 +844,28 @@ export const toWasm = async (
     // three node kinds — a structural `struct`, the `{backing,len,cap}` `list`
     // struct, and its backing `array` — and a recursive list field threads them
     // all into the one rec group (list -> array -> element struct -> list …).
+    //
+    // Map-value recursion (`type Tree = { children: {[string]: Tree} }`): the
+    // cycle can also pass through a MAP's VALUE type. A map adds two more node
+    // kinds — the hash `map` struct and its `vals` backing array (`maparray`) —
+    // and a recursive map field threads them in the same way (map -> vals array
+    // -> value struct -> map …). The map's `keys`/`live`/`index` arrays never
+    // recurse (key is `string`/`i32`), so they stay on the standalone path.
     type Node =
       | { kind: "struct"; obj: VLObjectType; targets: string[] }
       | { kind: "list"; element: VLType; targets: string[] }
-      | { kind: "array"; element: VLType; targets: string[] };
+      | { kind: "array"; element: VLType; targets: string[] }
+      | { kind: "map"; key: VLType; value: VLType; targets: string[] }
+      | { kind: "maparray"; element: VLType; targets: string[] };
     const nodes = new Map<string, Node>();
-    // Distinct sig namespaces so a struct, the list wrapping it, and the array
-    // backing that list never collide on one key.
+    // Distinct sig namespaces so a struct, the list wrapping it, the array
+    // backing that list, the map, and the map's vals array never collide on one
+    // key. The map keys on key+value; its vals array keys on the value alone.
     const listSig = (element: VLType) => `[list]${structSig(element)}`;
     const arraySig = (element: VLType) => `[array]${structSig(element)}`;
+    const mapSig = (key: VLType, value: VLType) =>
+      `[map]${structSig(key)}=>${structSig(value)}`;
+    const mapArraySig = (value: VLType) => `[maparray]${structSig(value)}`;
 
     const visitStruct = (t: VLObjectType) => {
       const s = structSig(t);
@@ -828,6 +884,12 @@ export const toWasm = async (
         if (listTarget) {
           targets.push(listSig(listTarget.element));
           visitList(listTarget.element);
+          continue;
+        }
+        const mapTarget = asMapTarget(f.type);
+        if (mapTarget) {
+          targets.push(mapSig(mapTarget.key, mapTarget.value));
+          visitMap(mapTarget.key, mapTarget.value);
         }
       }
     };
@@ -850,6 +912,29 @@ export const toWasm = async (
         if (elemStruct) {
           aTargets.push(structSig(elemStruct));
           visitStruct(elemStruct);
+        }
+      }
+    };
+    // A map-value field joins the group as two nodes: the hash `map` struct
+    // (whose `vals` field refers to its backing array) and that `maparray` (whose
+    // element refers to the value struct). `asMapTarget` only matches when the
+    // value is a struct, so the array element is always an in-group struct ref;
+    // the map's `keys`/`live`/`index` arrays are non-recursive and built on the
+    // standalone path.
+    const visitMap = (key: VLType, value: VLType) => {
+      const ms = mapSig(key, value);
+      if (nodes.has(ms)) return;
+      const mTargets: string[] = [];
+      nodes.set(ms, { kind: "map", key, value, targets: mTargets });
+      const vas = mapArraySig(value);
+      mTargets.push(vas);
+      if (!nodes.has(vas)) {
+        const vaTargets: string[] = [];
+        nodes.set(vas, { kind: "maparray", element: value, targets: vaTargets });
+        const valStruct = asStructTarget(value);
+        if (valStruct) {
+          vaTargets.push(structSig(valStruct));
+          visitStruct(valStruct);
         }
       }
     };
@@ -903,6 +988,14 @@ export const toWasm = async (
         const ref = tempRef(listSig(listTarget.element), listTarget.nullable);
         if (ref !== null) return ref;
       }
+      const mapTarget = asMapTarget(ft);
+      if (mapTarget) {
+        const ref = tempRef(
+          mapSig(mapTarget.key, mapTarget.value),
+          mapTarget.nullable,
+        );
+        if (ref !== null) return ref;
+      }
       return toWasmType(ft);
     };
     // The backing array's slot wasm type: a *nullable* forward ref to the
@@ -937,6 +1030,28 @@ export const toWasm = async (
           binaryen.notPacked,
           true,
         );
+      } else if (node.kind === "maparray") {
+        // The map's `vals` backing array. Its element is always an in-group value
+        // struct (`asMapTarget` only matched a struct value), stored as a
+        // *nullable* ref so `array.new_default` null-inits (matching
+        // `mapArrayType`'s ref-element widening).
+        const ref = tempRef(structSig(asStructTarget(node.element)!), true)!;
+        tb.setArrayType(i, ref, binaryen.notPacked, true);
+      } else if (node.kind === "map") {
+        // hash struct: { keys, vals, live, index, count, size }. Only `vals`
+        // recurses (its element is the value struct); `keys`/`live`/`index` are
+        // non-recursive arrays built on the standalone path.
+        const keys = mapArrayType(softenImplicitType(node.key)).refType;
+        const vals = tempRef(mapArraySig(node.value), false)!;
+        const flags = arrayType(i32Type).refType;
+        tb.setStructType(i, [
+          { type: keys, packedType: binaryen.notPacked, mutable: true },
+          { type: vals, packedType: binaryen.notPacked, mutable: true },
+          { type: flags, packedType: binaryen.notPacked, mutable: true },
+          { type: flags, packedType: binaryen.notPacked, mutable: true },
+          { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+          { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+        ]);
       } else {
         // list struct: { backing: (ref $array), len: i32, cap: i32 }
         const backing = tempRef(arraySig(node.element), false) ??
@@ -995,6 +1110,48 @@ export const toWasm = async (
           refType: refOf(s),
           element: node.element,
           backing,
+        });
+      }
+    }
+    // The map's `vals` backing array, registered under `mapArrayType`'s key (the
+    // nullable-ref `valElemWasm`) so later map read/construct sites reuse it. Its
+    // element struct is registered above, so its slot wasm type resolves cleanly.
+    for (const s of byKind("maparray")) {
+      const node = nodes.get(s)! as Extract<Node, { kind: "maparray" }>;
+      const valElemWasm = mapElemWasm(node.element);
+      if (!mapArrayTypes.has(valElemWasm)) {
+        mapArrayTypes.set(valElemWasm, {
+          heapType: heapTypes[sigToIndex.get(s)!],
+          refType: refOf(s),
+          element: softenImplicitType(node.element),
+          // Map backing slots store the nullable ref directly (no read-cast).
+          elemWasm: valElemWasm,
+          backingWasm: valElemWasm,
+        });
+      }
+    }
+    // The map hash struct, registered under `mapType`'s key so later sites reuse
+    // it. `keys`/`flags` are the non-recursive standalone arrays; `vals` is the
+    // in-group array registered just above.
+    for (const s of byKind("map")) {
+      const node = nodes.get(s)! as Extract<Node, { kind: "map" }>;
+      const keys = mapArrayType(softenImplicitType(node.key));
+      const vals = mapArrayType(softenImplicitType(node.value));
+      const flags = arrayType(i32Type);
+      const cacheKey = `${keys.heapType}:${vals.heapType}`;
+      if (!mapTypes.has(cacheKey)) {
+        mapTypes.set(cacheKey, {
+          heapType: heapTypes[sigToIndex.get(s)!],
+          refType: refOf(s),
+          key: softenImplicitType(node.key),
+          value: softenImplicitType(node.value),
+          keys,
+          vals,
+          flags,
+          keyElemWasm: mapElemWasm(node.key),
+          valElemWasm: mapElemWasm(node.value),
+          keyIsRef: isRefElement(softenImplicitType(node.key)),
+          valIsRef: isRefElement(softenImplicitType(node.value)),
         });
       }
     }
