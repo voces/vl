@@ -1038,9 +1038,9 @@ export const toWasm = async (
         const ref = tempRef(structSig(asStructTarget(node.element)!), true)!;
         tb.setArrayType(i, ref, binaryen.notPacked, true);
       } else if (node.kind === "map") {
-        // hash struct: { keys, vals, live, index, count, size }. Only `vals`
-        // recurses (its element is the value struct); `keys`/`live`/`index` are
-        // non-recursive arrays built on the standalone path.
+        // hash struct: { keys, vals, live, index, count, size, hashes }. Only
+        // `vals` recurses (its element is the value struct); `keys`/`live`/`index`/
+        // `hashes` are non-recursive i32/ref arrays built on the standalone path.
         const keys = mapArrayType(softenImplicitType(node.key)).refType;
         const vals = tempRef(mapArraySig(node.value), false)!;
         const flags = arrayType(i32Type).refType;
@@ -1051,6 +1051,7 @@ export const toWasm = async (
           { type: flags, packedType: binaryen.notPacked, mutable: true },
           { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
           { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+          { type: flags, packedType: binaryen.notPacked, mutable: true },
         ]);
       } else {
         // list struct: { backing: (ref $array), len: i32, cap: i32 }
@@ -1368,6 +1369,9 @@ export const toWasm = async (
         { type: flags.refType, packedType: binaryen.notPacked, mutable: true },
         { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
         { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+        // hashes: per-entry FNV hash (short-circuits key-compare on probe + skips
+        // re-hash on resize). Same i32-array type as `live`/`index`.
+        { type: flags.refType, packedType: binaryen.notPacked, mutable: true },
       ]);
       const heapType = tb.buildAndDispose()[0];
       cached = {

@@ -88,6 +88,10 @@ const MAP_LIVE = 2;
 const MAP_INDEX = 3;
 const MAP_COUNT = 4;
 const MAP_SIZE = 5;
+// Per-entry FNV hash, parallel to `keys`/`vals`/`live` (entry-indexed). Lets a
+// probe short-circuit the (string) key comparison on a hash mismatch, and lets a
+// resize re-place entries without re-hashing keys. Same i32-array type as `live`.
+const MAP_HASHES = 6;
 
 const INITIAL_CAP = 8; // initial entries capacity / index slot count
 
@@ -184,6 +188,7 @@ const mapNewFn = (ctx: MapBuiltinContext, mt: MapType): string => {
     m.array.new_default(mt.flags.heapType, m.i32.const(INITIAL_CAP * 2)),
     m.i32.const(0),
     m.i32.const(0),
+    m.array.new_default(mt.flags.heapType, m.i32.const(INITIAL_CAP)), // hashes
   ], mt.heapType);
   m.addFunction(name, binaryen.createType([]), mt.refType, [], body);
   return name;
@@ -205,15 +210,18 @@ const mapSlotFn = (ctx: MapBuiltinContext, mt: MapType): string => {
   const idx = () => m.struct.get(MAP_INDEX, map(), mt.flags.refType, false);
   const keysArr = () => m.struct.get(MAP_KEYS, map(), mt.keys.refType, false);
   const live = () => m.struct.get(MAP_LIVE, map(), mt.flags.refType, false);
+  const hashesArr = () => m.struct.get(MAP_HASHES, map(), mt.flags.refType, false);
   const slot = () => m.local.get(2, binaryen.i32);
   const cap = () => m.local.get(3, binaryen.i32);
   const entry = () => m.local.get(4, binaryen.i32);
+  const keyHash = () => m.local.get(5, binaryen.i32);
+  const ent0 = () => m.i32.sub(entry(), m.i32.const(1)); // entry index (0-based)
   const body = m.block(null, [
+    // Hash the key ONCE, here — reused for the initial slot and to gate the
+    // key comparison on every probed slot (below).
+    m.local.set(5, m.call(hash, [key()], binaryen.i32)),
     m.local.set(3, m.array.len(idx())),
-    m.local.set(
-      2,
-      m.i32.rem_u(m.call(hash, [key()], binaryen.i32), cap()),
-    ),
+    m.local.set(2, m.i32.rem_u(keyHash(), cap())),
     m.block("s_brk", [
       m.loop(
         "s_loop",
@@ -227,33 +235,35 @@ const mapSlotFn = (ctx: MapBuiltinContext, mt: MapType): string => {
           // clear it, so deletes don't break chains between compactions. A
           // re-added key appends a fresh entry/slot further along the chain; the
           // stale dead slot is reclaimed by the next compaction.
+          //
+          // The stored per-entry hash gates the (string) key comparison: a probe
+          // only runs the expensive `keyEq` when the slot's hash matches AND the
+          // entry is live (`i32.and` is unconditional, so the `keyEq` is guarded
+          // by an `if` to keep it off the mismatch path).
           m.br(
             "s_brk",
-            m.i32.and(
+            m.if(
+              m.i32.and(
+                m.i32.eq(
+                  m.array.get(hashesArr(), ent0(), binaryen.i32, false),
+                  keyHash(),
+                ),
+                m.i32.ne(
+                  m.array.get(live(), ent0(), binaryen.i32, false),
+                  m.i32.const(0),
+                ),
+              ),
               keyEq(
                 ctx,
                 mt,
                 nn(
                   ctx,
                   mt.keyIsRef,
-                  m.array.get(
-                    keysArr(),
-                    m.i32.sub(entry(), m.i32.const(1)),
-                    mt.keyElemWasm,
-                    false,
-                  ),
+                  m.array.get(keysArr(), ent0(), mt.keyElemWasm, false),
                 ),
                 key(),
               ),
-              m.i32.ne(
-                m.array.get(
-                  live(),
-                  m.i32.sub(entry(), m.i32.const(1)),
-                  binaryen.i32,
-                  false,
-                ),
-                m.i32.const(0),
-              ),
+              m.i32.const(0),
             ),
           ),
           // Collision (or a tombstoned slot): probe the next slot (wrap).
@@ -268,7 +278,7 @@ const mapSlotFn = (ctx: MapBuiltinContext, mt: MapType): string => {
     name,
     binaryen.createType([mt.refType, keyWasm]),
     binaryen.i32,
-    [binaryen.i32, binaryen.i32, binaryen.i32],
+    [binaryen.i32, binaryen.i32, binaryen.i32, binaryen.i32],
     body,
   );
   return name;
@@ -287,13 +297,12 @@ const mapRehashFn = (ctx: MapBuiltinContext, mt: MapType): string => {
   const name = `__map_rehash_${ctx.tagOf(mt)}__`;
   if (helpers.has(name)) return name;
   helpers.add(name);
-  const hash = mapHashFn(ctx, mt);
   const map = () => m.local.get(0, mt.refType);
   const newCap = () => m.local.get(1, binaryen.i32);
   const newIdx = () => m.local.get(2, mt.flags.refType);
   const i = () => m.local.get(3, binaryen.i32);
   const slot = () => m.local.get(4, binaryen.i32);
-  const keysArr = () => m.struct.get(MAP_KEYS, map(), mt.keys.refType, false);
+  const hashesArr = () => m.struct.get(MAP_HASHES, map(), mt.flags.refType, false);
   const live = () => m.struct.get(MAP_LIVE, map(), mt.flags.refType, false);
   const count = () => m.struct.get(MAP_COUNT, map(), binaryen.i32, false);
   const body = m.block(null, [
@@ -309,18 +318,9 @@ const mapRehashFn = (ctx: MapBuiltinContext, mt: MapType): string => {
             m.block(null, [
               m.local.set(
                 4,
+                // Re-place from the STORED hash — no key re-hashing on resize.
                 m.i32.rem_u(
-                  m.call(
-                    hash,
-                    [
-                      nn(
-                        ctx,
-                        mt.keyIsRef,
-                        m.array.get(keysArr(), i(), mt.keyElemWasm, false),
-                      ),
-                    ],
-                    binaryen.i32,
-                  ),
+                  m.array.get(hashesArr(), i(), binaryen.i32, false),
                   newCap(),
                 ),
               ),
@@ -385,6 +385,8 @@ const mapCompactFn = (ctx: MapBuiltinContext, mt: MapType): string => {
   const live = () => m.struct.get(MAP_LIVE, map(), mt.flags.refType, false);
   const count = () => m.struct.get(MAP_COUNT, map(), binaryen.i32, false);
   const size = () => m.struct.get(MAP_SIZE, map(), binaryen.i32, false);
+  const nh = () => m.local.get(7, mt.flags.refType);
+  const hashesArr = () => m.struct.get(MAP_HASHES, map(), mt.flags.refType, false);
   const body = m.block(null, [
     // Fresh entry arrays sized to the OLD entry capacity (keeps spare room so an
     // immediate re-insert doesn't reallocate; `set`'s grow handles further
@@ -392,6 +394,7 @@ const mapCompactFn = (ctx: MapBuiltinContext, mt: MapType): string => {
     m.local.set(1, m.array.new_default(mt.keys.heapType, m.array.len(keysArr()))),
     m.local.set(2, m.array.new_default(mt.vals.heapType, m.array.len(valsArr()))),
     m.local.set(3, m.array.new_default(mt.flags.heapType, m.array.len(live()))),
+    m.local.set(7, m.array.new_default(mt.flags.heapType, m.array.len(hashesArr()))),
     // Copy the live entries down, compacting out the tombstones (order kept).
     m.local.set(4, m.i32.const(0)),
     m.local.set(5, m.i32.const(0)),
@@ -409,6 +412,7 @@ const mapCompactFn = (ctx: MapBuiltinContext, mt: MapType): string => {
               m.array.set(nk(), j(), m.array.get(keysArr(), i(), mt.keyElemWasm, false)),
               m.array.set(nv(), j(), m.array.get(valsArr(), i(), mt.valElemWasm, false)),
               m.array.set(nl(), j(), m.i32.const(1)),
+              m.array.set(nh(), j(), m.array.get(hashesArr(), i(), binaryen.i32, false)),
               m.local.set(5, m.i32.add(j(), m.i32.const(1))),
             ]),
           ),
@@ -420,6 +424,7 @@ const mapCompactFn = (ctx: MapBuiltinContext, mt: MapType): string => {
     m.struct.set(MAP_KEYS, map(), nk()),
     m.struct.set(MAP_VALS, map(), nv()),
     m.struct.set(MAP_LIVE, map(), nl()),
+    m.struct.set(MAP_HASHES, map(), nh()),
     // No tombstones remain: count == size == j.
     m.struct.set(MAP_COUNT, map(), size()),
     // Target index cap: next pow2 ≥ 2×size, floored at the initial cap.
@@ -450,6 +455,7 @@ const mapCompactFn = (ctx: MapBuiltinContext, mt: MapType): string => {
       binaryen.i32,
       binaryen.i32,
       binaryen.i32,
+      mt.flags.refType, // nh: the rebuilt hashes array
     ],
     body,
   );
@@ -467,9 +473,11 @@ const mapGrowEntriesFn = (ctx: MapBuiltinContext, mt: MapType): string => {
   const nk = () => m.local.get(2, mt.keys.refType);
   const nv = () => m.local.get(3, mt.vals.refType);
   const nl = () => m.local.get(4, mt.flags.refType);
+  const nh = () => m.local.get(5, mt.flags.refType);
   const keysArr = () => m.struct.get(MAP_KEYS, map(), mt.keys.refType, false);
   const valsArr = () => m.struct.get(MAP_VALS, map(), mt.vals.refType, false);
   const live = () => m.struct.get(MAP_LIVE, map(), mt.flags.refType, false);
+  const hashesArr = () => m.struct.get(MAP_HASHES, map(), mt.flags.refType, false);
   const count = () => m.struct.get(MAP_COUNT, map(), binaryen.i32, false);
   const body = m.block(null, [
     m.if(
@@ -479,12 +487,15 @@ const mapGrowEntriesFn = (ctx: MapBuiltinContext, mt: MapType): string => {
         m.local.set(2, m.array.new_default(mt.keys.heapType, newCap())),
         m.local.set(3, m.array.new_default(mt.vals.heapType, newCap())),
         m.local.set(4, m.array.new_default(mt.flags.heapType, newCap())),
+        m.local.set(5, m.array.new_default(mt.flags.heapType, newCap())),
         m.array.copy(nk(), m.i32.const(0), keysArr(), m.i32.const(0), count()),
         m.array.copy(nv(), m.i32.const(0), valsArr(), m.i32.const(0), count()),
         m.array.copy(nl(), m.i32.const(0), live(), m.i32.const(0), count()),
+        m.array.copy(nh(), m.i32.const(0), hashesArr(), m.i32.const(0), count()),
         m.struct.set(MAP_KEYS, map(), nk()),
         m.struct.set(MAP_VALS, map(), nv()),
         m.struct.set(MAP_LIVE, map(), nl()),
+        m.struct.set(MAP_HASHES, map(), nh()),
       ]),
     ),
   ], binaryen.none);
@@ -492,7 +503,13 @@ const mapGrowEntriesFn = (ctx: MapBuiltinContext, mt: MapType): string => {
     name,
     binaryen.createType([mt.refType]),
     binaryen.none,
-    [binaryen.i32, mt.keys.refType, mt.vals.refType, mt.flags.refType],
+    [
+      binaryen.i32,
+      mt.keys.refType,
+      mt.vals.refType,
+      mt.flags.refType,
+      mt.flags.refType, // nh: the grown hashes array
+    ],
     body,
   );
   return name;
@@ -509,6 +526,7 @@ const mapSetFn = (ctx: MapBuiltinContext, mt: MapType): string => {
   const slotFn = mapSlotFn(ctx, mt);
   const grow = mapGrowEntriesFn(ctx, mt);
   const rehash = mapRehashFn(ctx, mt);
+  const hash = mapHashFn(ctx, mt);
   const map = () => m.local.get(0, mt.refType);
   const key = () => m.local.get(1, keyWasm);
   const value = () => m.local.get(2, valWasm);
@@ -518,6 +536,7 @@ const mapSetFn = (ctx: MapBuiltinContext, mt: MapType): string => {
   const keysArr = () => m.struct.get(MAP_KEYS, map(), mt.keys.refType, false);
   const valsArr = () => m.struct.get(MAP_VALS, map(), mt.vals.refType, false);
   const live = () => m.struct.get(MAP_LIVE, map(), mt.flags.refType, false);
+  const hashesArr = () => m.struct.get(MAP_HASHES, map(), mt.flags.refType, false);
   const count = () => m.struct.get(MAP_COUNT, map(), binaryen.i32, false);
   const size = () => m.struct.get(MAP_SIZE, map(), binaryen.i32, false);
   const body = m.block(null, [
@@ -533,6 +552,9 @@ const mapSetFn = (ctx: MapBuiltinContext, mt: MapType): string => {
         m.array.set(keysArr(), count(), key()),
         m.array.set(valsArr(), count(), value()),
         m.array.set(live(), count(), m.i32.const(1)),
+        // Store the key's hash parallel to the entry (re-hashed here; cheaper than
+        // re-hashing every key on each resize, which the stored hash now avoids).
+        m.array.set(hashesArr(), count(), m.call(hash, [key()], binaryen.i32)),
         // `grow` may have reallocated entry arrays but never the index; the slot
         // stays valid. Link slot -> (entry index + 1).
         m.array.set(idx(), slot(), m.i32.add(count(), m.i32.const(1))),
