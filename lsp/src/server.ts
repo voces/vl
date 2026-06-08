@@ -35,6 +35,10 @@ import {
 import { format } from "../../compiler/format.ts";
 import {
   checkDocument,
+  crossFileReferences,
+  type CrossFileSource,
+  importedNameSource,
+  importedNameSources,
   makeWorkspaceReader,
   uriToPath,
 } from "./moduleGraph.ts";
@@ -89,15 +93,19 @@ const VL_LANGUAGE_ID = "vital";
  * (VS Code) honour for `file://` URIs; clicking the link in a hover panel
  * navigates to the definition line.
  *
- * TODO (cross-import): resolve imported names to their source module's URI.
- * This requires the module graph / import resolution to be reachable from the
- * LSP's current single-file `parseSymbols` path. When the module graph lands,
- * look `name` up in the import table first and, if found, return a
- * `file://…#L…` URI for the imported file's definition line.
+ * Cross-import (H0 phase 3): when `name` is an IMPORTED binding rather than a
+ * local declaration, it resolves through `importedSources` — the imported
+ * name → exporting-sibling source map produced by the module graph
+ * (`importedNameSources`). An imported `` [`Name`] `` then links to the SIBLING
+ * module's definition line (`siblingUri#L…`) instead of the local import line.
+ * A local declaration of the same name takes precedence (it's the in-file
+ * definition the reader means). `importedSources` is empty for a no-import file,
+ * so single-file behaviour is unchanged.
  */
 const buildDocRefResolver = (
   symbols: ReturnType<typeof parseSymbols>,
   documentUri: string,
+  importedSources: Record<string, CrossFileSource> = {},
 ): DocRefResolver => {
   // Walk all declaration occurrences and record each name's definition line.
   // For a given name, prefer the binding with the widest scope span (most
@@ -117,10 +125,17 @@ const buildDocRefResolver = (
     }
   }
   return (name: string): string | undefined => {
+    // A local declaration is the in-file definition the reader means.
     const entry = byName.get(name);
-    if (entry === undefined) return undefined;
-    // `file://path#Lline` is the VS Code convention for "jump to line".
-    return `${documentUri}#L${entry.line}`;
+    if (entry !== undefined) {
+      // `file://path#Lline` is the VS Code convention for "jump to line".
+      return `${documentUri}#L${entry.line}`;
+    }
+    // Otherwise, an imported name links to its exporting sibling's definition.
+    // `range.start.line` is 0-based (LSP); the `#L` anchor is 1-based.
+    const imported = importedSources[name];
+    if (imported) return `${imported.uri}#L${imported.range.start.line + 1}`;
+    return undefined;
   };
 };
 
@@ -254,26 +269,85 @@ const toVLPosition = (p: Position) => ({ line: p.line + 1, column: p.character }
 const ctxToRange = (ctx: Context): Range => rangeFromCtx(ctx);
 
 // Go-to-definition: map the cursor to the binding it lands on, return that
-// binding's declaring span (D2). Single-document; cross-file is out of scope.
-connection.onDefinition((params) => {
+// binding's declaring span (D2). When the cursor lands on an IMPORTED name
+// (resolved via the module graph), jump CROSS-FILE to the export's declaration
+// in the exporting sibling module instead (H0 phase 3).
+//
+// Order matters: the single-file symbol table seeds imported names into scope
+// (so they're not "undeclared"), but their `Binding.decl` is the IMPORT
+// statement, not the real definition. So we check the imported-name resolution
+// FIRST for a name that is genuinely imported, and fall back to the single-file
+// declaration for everything local. A no-import file never hits the graph path.
+connection.onDefinition(async (params): Promise<Location | null> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return null;
-  const symbols = parseSymbols(doc.getText());
+  const text = doc.getText();
+
+  // Is the cursor on an imported name? If so, resolve cross-file.
+  const lineText = doc.getText({
+    start: { line: params.position.line, character: 0 },
+    end: { line: params.position.line + 1, character: 0 },
+  });
+  const word = wordAt(lineText, params.position.character);
+  if (word) {
+    const source = await importedNameSource(
+      word,
+      text,
+      entryKeyOf(params.textDocument.uri),
+      workspaceReader,
+    );
+    if (source) return Location.create(source.uri, source.range);
+  }
+
+  // Local definition (single-file, unchanged).
+  const symbols = parseSymbols(text);
   const decl = symbols.definitionAt(toVLPosition(params.position));
   if (!decl) return null;
   return Location.create(params.textDocument.uri, ctxToRange(decl));
 });
 
 // Find-references: every occurrence (declaration + uses) of the binding under
-// the cursor, within this document.
-connection.onReferences((params) => {
+// the cursor. For a CROSS-MODULE symbol (a name that is imported here, or an
+// exported local declaration), references are gathered across the current file
+// plus every OTHER OPEN document via the module graph (H0 phase 3). The search
+// is scoped to OPEN documents — see `crossFileReferences`' scope note + ROADMAP;
+// a reference in an unopened on-disk sibling is not reported. A purely-local
+// (non-exported, non-imported) symbol falls back to the single-file path below.
+connection.onReferences(async (params): Promise<Location[] | null> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return null;
-  const symbols = parseSymbols(doc.getText());
-  const spans = symbols.referencesAt(
-    toVLPosition(params.position),
-    params.context?.includeDeclaration ?? true,
-  );
+  const text = doc.getText();
+  const includeDeclaration = params.context?.includeDeclaration ?? true;
+
+  // Cross-file: only attempt when the cursor sits on an identifier.
+  const lineText = doc.getText({
+    start: { line: params.position.line, character: 0 },
+    end: { line: params.position.line + 1, character: 0 },
+  });
+  const word = wordAt(lineText, params.position.character);
+  if (word) {
+    const openDocs = documents.all().map((d) => ({
+      uri: d.uri,
+      text: d.getText(),
+    }));
+    const crossRefs = await crossFileReferences(
+      word,
+      text,
+      entryKeyOf(params.textDocument.uri),
+      openDocs,
+      workspaceReader,
+      includeDeclaration,
+    );
+    // A defined (possibly empty) result means the symbol is cross-module: use it.
+    // `undefined` means a purely-local symbol → fall through to single-file.
+    if (crossRefs !== undefined) {
+      return crossRefs.map((r) => Location.create(r.uri, r.range));
+    }
+  }
+
+  // Single-file references (a local binding), unchanged.
+  const symbols = parseSymbols(text);
+  const spans = symbols.referencesAt(toVLPosition(params.position), includeDeclaration);
   return spans.map((ctx) =>
     Location.create(params.textDocument.uri, ctxToRange(ctx))
   );
@@ -336,7 +410,17 @@ connection.onHover(async (params): Promise<Hover | null> => {
   // D7: build the doc-comment cross-reference resolver for this document. It is
   // used by `docMarkdown` to rewrite `` [`Name`] `` / `[Name]` spans in `///`
   // doc-comments into clickable links to the named symbol's definition.
-  const docResolver = buildDocRefResolver(symbols, params.textDocument.uri);
+  // H0 phase 3: imported names link cross-file to their exporting sibling.
+  const importedSources = await importedNameSources(
+    document.getText(),
+    entryKeyOf(params.textDocument.uri),
+    workspaceReader,
+  );
+  const docResolver = buildDocRefResolver(
+    symbols,
+    params.textDocument.uri,
+    importedSources,
+  );
   const occ = symbols.occurrenceAt(toVLPosition(params.position));
   if (occ?.binding.type) {
     // Feature 1(b) — "declared vs flow-refined type" — is DEFERRED. The symbol
@@ -542,7 +626,17 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const symbols = parseSymbolsSeeded(text, importedScope);
   // D7: build the doc-comment resolver once for all completion items in this
   // request — identifier completions carry `///` docs that may contain xrefs.
-  const docResolver = buildDocRefResolver(symbols, params.textDocument.uri);
+  // H0 phase 3: imported names link cross-file to their exporting sibling.
+  const importedSources = await importedNameSources(
+    text,
+    entryKeyOf(params.textDocument.uri),
+    workspaceReader,
+  );
+  const docResolver = buildDocRefResolver(
+    symbols,
+    params.textDocument.uri,
+    importedSources,
+  );
   const charBeforeCursor = linePrefix[linePrefix.length - 1];
 
   // Member completion: cursor follows `<receiver>.`. Only the simple `name.`
