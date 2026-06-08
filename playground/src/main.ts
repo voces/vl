@@ -323,23 +323,78 @@ monaco.languages.registerDefinitionProvider(VL_LANGUAGE_ID, {
 });
 
 // --- theme management --------------------------------------------------------
+//
+// Tri-state: AUTO (follow OS) by default; clicking pins an explicit override;
+// a second click that would match the OS reverts back to AUTO.
+//
+// Storage key "vl-theme":
+//   absent / "system"  → AUTO (follow OS via matchMedia)
+//   "light" | "dark"   → explicit override
 
 const SUN =
   '<svg width="17" height="17" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="3.1"/><path d="M8 1v1.6M8 13.4V15M15 8h-1.6M2.6 8H1M12.95 3.05l-1.13 1.13M4.18 11.82l-1.13 1.13M12.95 12.95l-1.13-1.13M4.18 4.18L3.05 3.05"/></svg>';
 const MOON =
   '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 9.5A5.5 5.5 0 0 1 6.5 2.5a5.5 5.5 0 1 0 7 7z"/></svg>';
 
-type Mode = "light" | "dark";
+export type Mode = "light" | "dark";
+
+/** Returns the current OS color-scheme preference. */
+export const systemMode = (): Mode =>
+  matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+
+/** Returns the stored explicit override, or null when in AUTO mode. */
+export const storedOverride = (): Mode | null => {
+  const v = localStorage.getItem("vl-theme");
+  return v === "light" || v === "dark" ? v : null;
+};
+
+/** The mode that is actually rendered (override ?? OS). */
+export const effectiveMode = (): Mode => storedOverride() ?? systemMode();
+
+/**
+ * Pure decision function for a toggle click.
+ * Given the current effective mode and the current OS mode, returns what the
+ * new state should be: an explicit override to store, or null to go AUTO.
+ *
+ * Exported for unit tests; DOM wiring happens below.
+ */
+export const nextThemeState = (
+  current: Mode,
+  system: Mode,
+): { override: Mode | null; mode: Mode } => {
+  const next: Mode = current === "dark" ? "light" : "dark";
+  if (next === system) {
+    // Clicking back to what the OS already is → revert to AUTO.
+    return { override: null, mode: system };
+  }
+  return { override: next, mode: next };
+};
+
 const applyMode = (mode: Mode) => {
   appEl.dataset.mode = mode;
-  localStorage.setItem("vl-theme", mode);
   themeBtn.innerHTML = mode === "dark" ? SUN : MOON;
   monaco.editor.setTheme(mode === "dark" ? "vital-dark" : "vital-light");
 };
 const currentMode = (): Mode => (appEl.dataset.mode === "dark" ? "dark" : "light");
-applyMode((localStorage.getItem("vl-theme") as Mode) === "dark" ? "dark" : "light");
-themeBtn.addEventListener("click", () =>
-  applyMode(currentMode() === "dark" ? "light" : "dark"));
+
+// Initial load: apply the effective mode (override if set, else OS).
+applyMode(effectiveMode());
+
+// Track OS changes live; only acts when in AUTO mode (no stored override).
+const osMediaQuery = matchMedia("(prefers-color-scheme: dark)");
+osMediaQuery.addEventListener("change", () => {
+  if (storedOverride() === null) applyMode(systemMode());
+});
+
+themeBtn.addEventListener("click", () => {
+  const { override, mode } = nextThemeState(currentMode(), systemMode());
+  if (override === null) {
+    localStorage.removeItem("vl-theme");
+  } else {
+    localStorage.setItem("vl-theme", override);
+  }
+  applyMode(mode);
+});
 
 // --- file models -------------------------------------------------------------
 //

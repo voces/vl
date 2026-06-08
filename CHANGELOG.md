@@ -78,7 +78,7 @@ see **`DECISIONS.md`**.
 
 - **E1 Browser bundle** — esbuild + `esbuild-deno-loader`; binaryen@130 runs client-side ESM; `deno task playground`.
 - **E2 Playground UI (core)** — `<textarea>` + Run + diagnostics/log/WAT panes + sample picker (`playground/`).
-- **E2 Playground redesign** — branded light/dark theme pair (persisted, lock-step Monaco theme), results-as-tabs (Output/WAT/Diagnostics + size/count badges), multi-file projects (per-file diagnostics, whole-program `compileProgram` run/WAT), opt-in auto-run (always-on debounced analysis), full-width status bar, real Share + Format wiring.
+- **E2 Playground redesign** — branded light/dark theme pair (system-default with revert-to-system toggle, lock-step Monaco theme), results-as-tabs (Output/WAT/Diagnostics + size/count badges), multi-file projects (per-file diagnostics, whole-program `compileProgram` run/WAT), opt-in auto-run (always-on debounced analysis), full-width status bar, real Share + Format wiring.
 - **E4 Shareable links** — source encoded in URL hash (#94).
 
 ## Infrastructure (Track F)
