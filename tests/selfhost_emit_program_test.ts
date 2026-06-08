@@ -3092,6 +3092,117 @@ const CASES: Case[] = [
       if (got !== 2) throw new Error(`f() returned ${got}, expected 2`);
     },
   },
+  {
+    // THE KEYSTONE: a struct holding TWO DISTINCT struct ref-list fields at once
+    // (`toks: Tok[]`, `diags: Diag[]`) — the `parser.vl` `Parser` shape. Each field
+    // must intern its OWN backing+wrapper heap type; a single program-global ref-list
+    // type made `P.diags.push(...)` fail validation (`expected (ref 0), found (ref 1)`).
+    // Push onto each, read each length back, sum.
+    name:
+      "G7-multi: TWO distinct struct ref-list fields (Tok[] + Diag[]) push + read each => 3",
+    src: [
+      "type Tok = { kind: string, pos: i32 }",
+      "type Diag = { msg: string, at: i32 }",
+      "type Parser = { toks: Tok[], diags: Diag[], pos: i32 }",
+      "let P: Parser = { toks: [], diags: [], pos: 0 }",
+      "function f(): i32 {",
+      "  P.toks.push({ kind: \"A\", pos: 0 })",
+      "  P.toks.push({ kind: \"B\", pos: 1 })",
+      "  P.diags.push({ msg: \"x\", at: 0 })",
+      "  return P.toks.length + P.diags.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 2 toks + 1 diag → 3.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 3) throw new Error(`f() returned ${got}, expected 3`);
+    },
+  },
+  {
+    // Read an ELEMENT back out of each distinct ref-list field and use its i32 field —
+    // proves the per-slot `array.get` + `ref.as_non_null` recover the RIGHT element
+    // struct type for each of the two distinct lists.
+    name:
+      "G7-multi: read an element field from each of two distinct ref-list fields => 30",
+    src: [
+      "type Tok = { kind: string, pos: i32 }",
+      "type Diag = { msg: string, at: i32 }",
+      "type Parser = { toks: Tok[], diags: Diag[], pos: i32 }",
+      "let P: Parser = { toks: [], diags: [], pos: 0 }",
+      "function f(): i32 {",
+      "  P.toks.push({ kind: \"A\", pos: 10 })",
+      "  P.diags.push({ msg: \"x\", at: 20 })",
+      "  return P.toks[0].pos + P.diags[0].at",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // toks[0].pos (10) + diags[0].at (20) → 30.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 30) throw new Error(`f() returned ${got}, expected 30`);
+    },
+  },
+  {
+    // THREE distinct ref-list element types at once: two STRUCT lists (Tok[], Diag[])
+    // AND a UNION list (Node[]) in the same struct — the full `parser.vl` `Parser`
+    // shape. A union list's element is the box ref (a distinct slot from either struct
+    // backing). Push onto all three, read each length.
+    name:
+      "G7-multi: two struct ref-lists + a union ref-list in one struct => 6",
+    src: [
+      "type Lit = { val: i32 }",
+      "type Var = { name: string }",
+      "type Node = Lit | Var",
+      "type Tok = { kind: string, pos: i32 }",
+      "type Diag = { msg: string, at: i32 }",
+      "type Parser = { toks: Tok[], nodes: Node[], diags: Diag[], pos: i32 }",
+      "let P: Parser = { toks: [], nodes: [], diags: [], pos: 0 }",
+      "function f(): i32 {",
+      "  P.toks.push({ kind: \"A\", pos: 0 })",
+      "  P.toks.push({ kind: \"B\", pos: 1 })",
+      "  P.nodes.push({ val: 9 })",
+      "  P.nodes.push({ name: \"y\" })",
+      "  P.nodes.push({ val: 7 })",
+      "  P.diags.push({ msg: \"x\", at: 0 })",
+      "  return P.toks.length + P.nodes.length + P.diags.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 2 toks + 3 nodes + 1 diag → 6.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 6) throw new Error(`f() returned ${got}, expected 6`);
+    },
+  },
+  {
+    // Narrow a union element read back out of the union ref-list (alongside the two
+    // struct ref-lists) and read its variant field — proves the union list's element is
+    // the box and `is`-narrowing works on an element pulled from a multi-ref-list struct.
+    name:
+      "G7-multi: narrow a union element pulled from a multi-ref-list struct => 9",
+    src: [
+      "type Lit = { val: i32 }",
+      "type Var = { name: string }",
+      "type Node = Lit | Var",
+      "type Tok = { kind: string, pos: i32 }",
+      "type Parser = { toks: Tok[], nodes: Node[], pos: i32 }",
+      "let P: Parser = { toks: [], nodes: [], pos: 0 }",
+      "function f(): i32 {",
+      "  P.toks.push({ kind: \"A\", pos: 5 })",
+      "  P.nodes.push({ val: 9 })",
+      "  let n = P.nodes[0]",
+      "  if n is Lit { return n.val }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // nodes[0] is a Lit with val 9 → 9.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 9) throw new Error(`f() returned ${got}, expected 9`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
