@@ -327,10 +327,15 @@ independent).*
   - **(a) wasm-emit consuming the AST arena.** `emitProgram` now drives the real arena — i32
     params/arithmetic, calls/comparisons/`if`/`return`, `while` loops, `let`/`const` locals + assignment,
     structs (#137), arrays (#145), strings (literal, `.length`, index — lowered to the array-i32
-    code-point representation), and **growable `i32[]` + `.push`** (the `{backing,len,cap}` wrapper struct,
-    grow-on-full mirroring `toWasm.ts`'s list rep). Ahead: non-i32 element lists, list `pop`/`+`/equality,
-    and the broader self-host source vocabulary (`for`, `match`, nested arrays/maps). (The fixed-bytes
-    spike that hand-built two modules without reading `compiler/ast.vl` is retired.)
+    code-point representation), **growable `i32[]` + `.push`** (the `{backing,len,cap}` wrapper struct,
+    grow-on-full mirroring `toWasm.ts`'s list rep), and **discriminated `type N = A | B` struct unions
+    with `is`-narrowing** (G1, the bootstrap keystone the self-host AST `type Node` + the checker's
+    `type Ty` depend on): the boxed `{tag, value:anyref}` tagged-struct rep, multiple variant struct
+    heap types, `is` tag-discrimination, and the narrowing `ref.cast`+`struct.get` downcast — proven by
+    real `WebAssembly.instantiate`. Ahead: arrays-of-unions (`Node[]`, G7-ref), unions mixing scalars +
+    structs, `!is`/negated guards, non-i32 element lists, list `pop`/`+`/equality, and the broader
+    self-host source vocabulary (`for`, `match`, nested arrays/maps). (The fixed-bytes spike that
+    hand-built two modules without reading `compiler/ast.vl` is retired.)
   - **(b) Grow the `.vl` parser/typecheck subset.** `parseStmt` handles `let`/`const`/`function`/`if`
     (incl. `else if` chains)/`return`/block/expr but **no `while`/`for` statements yet**; widen toward
     the full language.

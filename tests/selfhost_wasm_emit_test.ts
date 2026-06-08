@@ -76,6 +76,7 @@ const runFixture = (): Promise<string[]> =>
       `  Ident,\n` +
       `  IfStmt,\n` +
       `  Index,\n` +
+      `  IsExpr,\n` +
       `  LetDecl,\n` +
       `  Member,\n` +
       `  NumLit,\n` +
@@ -88,6 +89,7 @@ const runFixture = (): Promise<string[]> =>
       `  TypeDecl,\n` +
       `  TypeRef,\n` +
       `  Unary,\n` +
+      `  UnionDecl,\n` +
       `  WhileStmt,\n` +
       `} from "./ast"\n\n` +
       wasmEmitSrc +

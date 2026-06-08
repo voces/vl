@@ -71,6 +71,8 @@ import {
   mkObjLit,
   mkArrayLit,
   mkIndex,
+  mkUnionDecl,
+  mkIsExpr,
 } from "./ast"
 
 // ── cursor primitives ────────────────────────────────────────────────────────
@@ -322,7 +324,10 @@ function parsePostfix(): i32 {
   node
 }
 
-// Prefix `!` / `-`, else fall through to postfix.
+// Prefix `!` / `-`, else fall through to postfix, then an optional trailing type
+// guard `<postfix> is TypeName` (A6). `is` binds looser than the postfix operators
+// (so `n.x is A` is `(n.x) is A`) but tighter than the binary operators, matching
+// its use as an `if` condition `if n is A {`. The RHS is a bare type NAME.
 function parseUnary(): i32 {
   let k = peekKind()
   if k == "BANG" {
@@ -333,7 +338,20 @@ function parseUnary(): i32 {
     advance()
     return mkUnary("-", parseUnary())
   }
-  parsePostfix()
+  let node = parsePostfix()
+  let pk = peekKind()
+  if pk == "IS" {
+    advance()                        // "is"
+    let vname = ""
+    let vk = peekKind()
+    if vk == "IDENT" {
+      vname = advance().text
+    } else {
+      expect("IDENT")
+    }
+    return mkIsExpr(node, vname)
+  }
+  node
 }
 
 // Precedence climbing from `minPrec`, seeded by an already-parsed `left`.
@@ -397,6 +415,31 @@ function parseTypeDecl(): i32 {
     expect("IDENT")
   }
   expect("EQUAL")
+  // `type N = A | B | C` — a discriminated-union ALIAS (the RHS is a type name, not
+  // a `{`). Parse the `IDENT (PIPE IDENT)*` member list into a `UnionDecl`. A
+  // single bare name `type N = A` (no `|`) is also accepted as a one-member union.
+  let afterEq = peekKind()
+  if afterEq != "LBRACE" {
+    let variants: string[] = []
+    let vk = peekKind()
+    if vk == "IDENT" {
+      variants.push(advance().text)
+    } else {
+      expect("IDENT")
+    }
+    let more = peekKind() == "PIPE"
+    while more {
+      advance()                      // "|"
+      let nk = peekKind()
+      if nk == "IDENT" {
+        variants.push(advance().text)
+      } else {
+        expect("IDENT")
+      }
+      more = peekKind() == "PIPE"
+    }
+    return mkUnionDecl(name, variants)
+  }
   expect("LBRACE")
   let fields: i32[] = []
   let going = peekKind() != "RBRACE"
