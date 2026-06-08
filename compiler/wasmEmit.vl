@@ -4837,12 +4837,16 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     // The G8 map frame: 12 slots (see the map scratch layout / the probe + rehash).
     if fnUsesMap { nRuns = nRuns + 12 }
     appendAll(body, ulebToArr(nRuns))
+    // Bind the writer at `body` so `fbValtype` streams each declared local's
+    // valtype here, interleaved with the surrounding raw `body.push(1)` run counts.
+    let lvPrev = wTarget(body)
     let li = 0
     while li < nLocals {
       body.push(1)
-      pushVT(body, localIsRef[li], localStructIdx[li])
+      fbValtype(localIsRef[li], localStructIdx[li])
       li = li + 1
     }
+    wTarget(lvPrev)
     if fnUsesPush {
       body.push(1)
       body.push(127)         // pushVal: 0x7f i32
@@ -5201,45 +5205,228 @@ function refElemHeapType(): i32 {
   0
 }
 
-// Push a wasm value type onto `payload`. The `kind` tag selects the encoding:
-//   1 → struct ref `(ref $0)` (`0x64 0x00`, non-null ref to the struct type, index 0)
-//   2 → list  ref `(ref $lTypeIdx)` (`0x64 <lTypeIdx>`, the growable `i32[]` wrapper
-//       struct `{ backing, len, cap }` — NOT the raw array; an `i32[]` value IS that
-//       wrapper)
-//   3 → string ref `(ref $aTypeIdx)` — the RAW `(array (mut i32))` of code points, since
-//       a VL string stays the fixed array rep (`docs/strings-design.md`)
-//   else → i32 (`0x7f`)
-// A ref is always non-null (`0x64`), matching binaryen's `(ref $T)` for a value that
-// is statically known to be present (a constructed list / struct / string, never
-// `null`).
-function pushVT(payload: i32[], kind: i32, structIdx: i32): i32 {
+// ── valtype emission (Phase G — was `pushVT`) ─────────────────────────────────
+// Write a wasm value type onto the CURRENT buffer (`curBuf`). The `kind` tag
+// selects the encoding (the valtype ladder formerly in `pushVT`):
+//   0    → i32 (`0x7f`)
+//   1    → struct ref `(ref $sHeapIdx[structIdx])` — a standalone struct
+//   2    → i32-list ref `(ref $lTypeIdx)` (the growable `i32[]` wrapper struct)
+//   3    → string ref `(ref $aTypeIdx)` — the raw `(array (mut i32))` of code points
+//   4    → union-box ref `(ref $uBoxIdx)` — the `{tag, value}` box
+//   5    → ref-list ref `(ref $rlTypeIdx)` — the ref-element list wrapper
+//   6    → map ref `(ref $mStructIdx)` — the string-keyed map struct
+//   7    → string-list ref `(ref $mkListIdx)` — the string-list wrapper
+//   8    → concrete union-variant ref `(ref $uVarIdx+structIdx)` (gap #2)
+// A ref is always non-null (`0x64`), matching binaryen's `(ref $T)` for a value
+// statically known present (a constructed list / struct / string, never `null`).
+// The kind→heap-index resolution reads the interned indices (`sHeapIdx`/`lTypeIdx`/
+// `aTypeIdx`/… — assigned by `emitModule`'s type-index pass). Replaces `pushVT`;
+// callers `wTarget(buf)` the destination buffer first (the writer streams to
+// `curBuf`), matching every other `fb*` method.
+function fbValtype(kind: i32, structIdx: i32): i32 {
   if kind == 1 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(sHeapIdx[structIdx]))   // this struct's heap-type index
+    wU8(100)             // 0x64 (ref ht) — non-null ref
+    wULEB(sHeapIdx[structIdx])   // this struct's heap-type index
   } else if kind == 2 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(lTypeIdx))   // the list wrapper struct heap-type index
+    wU8(100)
+    wULEB(lTypeIdx)      // the i32-list wrapper struct heap-type index
   } else if kind == 3 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(aTypeIdx))   // the raw i32 array heap-type index (string)
+    wU8(100)
+    wULEB(aTypeIdx)      // the raw i32 array heap-type index (string)
   } else if kind == 4 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(uBoxIdx))    // the union box `{tag, value}` heap-type index
+    wU8(100)
+    wULEB(uBoxIdx)       // the union box `{tag, value}` heap-type index
   } else if kind == 5 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(rlTypeIdx))  // the REF-list wrapper struct heap-type index
+    wU8(100)
+    wULEB(rlTypeIdx)     // the REF-list wrapper struct heap-type index
   } else if kind == 6 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(mStructIdx)) // the string-keyed MAP struct heap-type index (G8)
+    wU8(100)
+    wULEB(mStructIdx)    // the string-keyed MAP struct heap-type index (G8)
   } else if kind == 7 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(mkListIdx))  // the STRING-LIST wrapper struct heap-type index
+    wU8(100)
+    wULEB(mkListIdx)     // the STRING-LIST wrapper struct heap-type index
   } else if kind == 8 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(uVarIdx + structIdx)) // the CONCRETE union-variant struct heap-type index (gap #2)
+    wU8(100)
+    wULEB(uVarIdx + structIdx)   // the CONCRETE union-variant struct heap-type index (gap #2)
   } else {
-    payload.push(127)          // 0x7f i32
+    wU8(127)             // 0x7f i32
   }
+  0
+}
+
+// ── type interning (Phase G — replaces emitModule's offset arithmetic) ────────
+// The heap-type index allocator. Every type the module emits (standalone structs,
+// union variants + box, the raw i32 array, the i32-list wrapper, each ref-list
+// (backing, wrapper) pair, the string-list (backing, wrapper) pair, the map struct,
+// and the functypes) occupies one slot in the single rec group, in EMIT ORDER.
+// `mNextType` is the running counter; `mAllocType` hands out the next index. This
+// centralizes the running-sum invariant the old parallel `*Offset` formulas
+// open-coded ("a type that references a later type still goes in the one rec
+// group, so all indices are mutually visible"). Reset per program by
+// `mResetTypeIntern`, driven in declaration order by `mAssignTypeIndices`.
+let mNextType: i32 = 0
+
+// Reset the interning counter (call once per module, before assigning indices).
+function mResetTypeIntern(): i32 {
+  mNextType = 0
+  0
+}
+
+// Allocate the next heap-type index (interning in emit order): return the current
+// counter, then advance it by one. This is the single auditable place a type index
+// is minted — every `mIntern*` below funnels through here.
+function mAllocType(): i32 {
+  let idx = mNextType
+  mNextType = mNextType + 1
+  idx
+}
+
+// The Phase-G safety assert (risk R2): the interned index MUST equal the value the
+// old offset formula computes. On divergence, fail loudly (drops the buffer so a
+// mis-indexed module never reaches instantiation) — never silence it. Retained as
+// a cheap debug check for one release after the old arithmetic is deleted.
+function mAssertIdx(got: i32, want: i32, who: string): i32 {
+  if got != want {
+    return emitFail("emitProgram: Phase G type-index drift in " + who)
+  }
+  0
+}
+
+// Walk the type-section emit order with the `mAllocType` counter, assigning each
+// type's heap index into the module-global index state (`sHeapIdx`/`uVarIdx`/
+// `uBoxIdx`/`aTypeIdx`/`lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`mkArrIdx`/`mkListIdx`/
+// `mStructIdx`) and asserting each equals the old offset formula. Returns the
+// functype base index (`typeOffset` — where the first functype lands), or -1 on a
+// drift (via `mAssertIdx`/`emitFail`). The order MUST match the type-section
+// emission below EXACTLY: standalone structs → union variants → union box → raw
+// i32 array → i32-list wrapper → ref-list (backing, wrapper) pairs → string-list
+// (backing, wrapper) → map struct → functypes.
+function mAssignTypeIndices(n: i32): i32 {
+  mResetTypeIntern()
+
+  // ── the OLD offset formulas (kept as the Phase-G debug-assert oracle) ──
+  let structOffset = sNames.length
+  let oldUnionOffset = 0
+  let oldUVarIdx = structOffset
+  let oldUBoxIdx = structOffset + uVariants.length
+  if uDeclared { oldUnionOffset = uVariants.length + 1 }
+  let preTypes = structOffset + oldUnionOffset
+  let arrayOffset = 0
+  if aUsed { arrayOffset = 1 }
+  let listOffset = 0
+  if lUsed { listOffset = 1 }
+  let oldATypeIdx = preTypes
+  let oldLTypeIdx = preTypes + arrayOffset
+  let refPairBase = preTypes + arrayOffset + listOffset
+  let refPairsTotal = rlElemName.length * 2
+  let preMap = refPairBase + refPairsTotal
+  let oldMkArrIdx = preMap
+  let oldMkListIdx = preMap + 1
+  let oldMStructIdx = preMap + 2
+
+  // ── the NEW interned assignment (the single auditable counter) ──
+  // Standalone structs occupy the first `sNames.length` indices (decl order).
+  sHeapIdx = []
+  let shi = 0
+  while shi < sNames.length {
+    let si = mAllocType()
+    if mAssertIdx(si, shi, "struct") < 0 { return 0 - 1 }
+    sHeapIdx.push(si)
+    shi = shi + 1
+  }
+  // Union variant structs (nv of them) then the union box.
+  if uDeclared {
+    uVarIdx = mNextType
+    if mAssertIdx(uVarIdx, oldUVarIdx, "uVarIdx") < 0 { return 0 - 1 }
+    let vi = 0
+    while vi < uVariants.length {
+      mAllocType()
+      vi = vi + 1
+    }
+    uBoxIdx = mAllocType()
+    if mAssertIdx(uBoxIdx, oldUBoxIdx, "uBoxIdx") < 0 { return 0 - 1 }
+  }
+  // The raw i32 array (string rep + list/map backing), then the i32-list wrapper.
+  if aUsed {
+    aTypeIdx = mAllocType()
+    if mAssertIdx(aTypeIdx, oldATypeIdx, "aTypeIdx") < 0 { return 0 - 1 }
+  } else {
+    aTypeIdx = oldATypeIdx
+  }
+  if lUsed {
+    lTypeIdx = mAllocType()
+    if mAssertIdx(lTypeIdx, oldLTypeIdx, "lTypeIdx") < 0 { return 0 - 1 }
+  } else {
+    lTypeIdx = oldLTypeIdx
+  }
+  // The map struct index is needed BELOW to resolve a map-array ref-list element
+  // (it references `(ref null $mStructIdx)`), yet the map struct lands AFTER the ref
+  // pairs + string-list. It is computable up front from the counter: it follows the
+  // `refPairsTotal` ref-pair slots plus the 2 string-list slots.
+  let mStructIdxPre = mNextType + refPairsTotal + 2
+  // One (backing, wrapper) pair per distinct ref-list element type, interleaved.
+  let rs = 0
+  while rs < rlElemName.length {
+    let back = mAllocType()
+    let wrap = mAllocType()
+    if mAssertIdx(back, refPairBase + rs * 2, "rlBackIdx") < 0 { return 0 - 1 }
+    if mAssertIdx(wrap, refPairBase + rs * 2 + 1, "rlWrapIdx") < 0 { return 0 - 1 }
+    rlBackIdx[rs] = back
+    rlWrapIdx[rs] = wrap
+    if rlElemKindTbl[rs] == 2 {
+      rlElemHeap[rs] = uBoxIdx
+    } else if rlElemKindTbl[rs] == 3 {
+      rlElemHeap[rs] = mStructIdxPre
+    } else {
+      let esi = structIndexByName(rlElemName[rs])
+      if esi >= 0 { rlElemHeap[rs] = sHeapIdx[esi] } else { rlElemHeap[rs] = 0 }
+    }
+    rs = rs + 1
+  }
+  // The legacy singletons alias slot 0 (or the next index when no ref list).
+  if rlElemName.length >= 1 {
+    raTypeIdx = rlBackIdx[0]
+    rlTypeIdx = rlWrapIdx[0]
+  } else {
+    raTypeIdx = mNextType
+    rlTypeIdx = mNextType
+    if mAssertIdx(raTypeIdx, refPairBase, "raTypeIdx") < 0 { return 0 - 1 }
+  }
+  // The string-ref list (keys backing + keys wrapper), shared by the map's keys
+  // list AND any `string[]` field (present when `slUsed || mUsed`).
+  if slUsed || mUsed {
+    mkArrIdx = mAllocType()
+    mkListIdx = mAllocType()
+    if mAssertIdx(mkArrIdx, oldMkArrIdx, "mkArrIdx") < 0 { return 0 - 1 }
+    if mAssertIdx(mkListIdx, oldMkListIdx, "mkListIdx") < 0 { return 0 - 1 }
+  } else {
+    mkArrIdx = oldMkArrIdx
+    mkListIdx = oldMkListIdx
+  }
+  // The map struct (present only when `mUsed`).
+  if mUsed {
+    mStructIdx = mAllocType()
+    if mAssertIdx(mStructIdx, oldMStructIdx, "mStructIdx") < 0 { return 0 - 1 }
+    if mAssertIdx(mStructIdx, mStructIdxPre, "mStructIdxPre") < 0 { return 0 - 1 }
+  } else {
+    mStructIdx = oldMStructIdx
+  }
+  // The functypes follow; the first lands at the current counter (`typeOffset`).
+  let typeOffset = mNextType
+  let oldTypeOffset = preMap + strListOffsetOf() + mapStructOffsetOf()
+  if mAssertIdx(typeOffset, oldTypeOffset, "typeOffset") < 0 { return 0 - 1 }
+  typeOffset
+}
+
+// The string-list type count (keys backing + wrapper): 2 when present, else 0.
+function strListOffsetOf(): i32 {
+  if slUsed || mUsed { return 2 }
+  0
+}
+
+// The map-struct type count: 1 when a map is used, else 0.
+function mapStructOffsetOf(): i32 {
+  if mUsed { return 1 }
   0
 }
 
@@ -5256,95 +5443,21 @@ function emitModule(stmts: i32[]): i32 {
 
   let n = fnStmts.length
 
-  // Heap-type indices, in type-section order: the GC struct type (if any) at 0, the raw
-  // i32 array type (if used) next, the growable-list wrapper struct (if used) next, then
-  // the functypes. `structOffset`/`arrayOffset`/`listOffset` are each 0 or 1; `typeOffset`
-  // is their sum — the index the first functype lands at. `aTypeIdx` (the raw array
-  // heap-type index) is `structOffset`; `lTypeIdx` (the list wrapper struct, which
-  // REFERENCES the raw array, so it MUST follow it) is `structOffset + arrayOffset`.
-  // The union path (mutually exclusive with the single-struct path: `sDeclared` is
-  // false when `uDeclared`). When a union is declared, its `nv` variant structs occupy
-  // the FIRST `nv` heap-type indices (`uVarIdx = 0`), the union box `{tag, value}`
-  // follows at `uBoxIdx = nv`, and any array/list/functypes come after.
-  // The standalone (non-variant) structs occupy the FIRST `sNames.length` heap-type
-  // indices (0..ns-1), in declaration order; `sHeapIdx[i] = i`. The union types (if
-  // any) follow: the `nv` variant structs at `structOffset .. structOffset+nv-1`, the
-  // union box at `structOffset+nv` — matching the type-section emission order below
-  // (standalone structs, then union variants + box). A string struct/variant field
-  // references the raw array type at `aTypeIdx` which lands later — resolved by the
-  // single recursion group wrapping all types.
-  let structOffset = sNames.length
-  sHeapIdx = []
-  let shi = 0
-  while shi < sNames.length {
-    sHeapIdx.push(shi)
-    shi = shi + 1
-  }
-  let unionOffset = 0
-  if uDeclared {
-    uVarIdx = structOffset
-    uBoxIdx = structOffset + uVariants.length
-    unionOffset = uVariants.length + 1   // nv variant structs + 1 union box
-  }
-  let preTypes = structOffset + unionOffset
-  let arrayOffset = 0
-  if aUsed { arrayOffset = 1 }
-  let listOffset = 0
-  if lUsed { listOffset = 1 }
-  aTypeIdx = preTypes
-  lTypeIdx = preTypes + arrayOffset
-  // The REF-element backing arrays + list wrappers (G7-ref) follow the i32 array/list.
-  // ONE distinct (backing, wrapper) PAIR per distinct element type (`rlElemName`), laid
-  // out interleaved: back0, wrap0, back1, wrap1, … so each wrapper immediately follows
-  // (and references) its own backing. Each backing's element is the struct's heap idx
-  // (`sHeapIdx`) or the union box (`uBoxIdx`), resolved per slot here into `rlElemHeap`;
-  // `rlBackIdx`/`rlWrapIdx` are the assigned heap indices. The legacy singletons
-  // `raTypeIdx`/`rlTypeIdx` alias SLOT 0 for any not-yet-migrated site.
-  let refPairBase = preTypes + arrayOffset + listOffset
-  // The map struct heap index is needed BELOW to resolve a map-array ref-list element
-  // (kind 3) — and `mStructIdx` itself lands AFTER the ref pairs. It is computable up
-  // front: `mStructIdx = preMap + 2` where `preMap = refPairBase + refPairsTotal`.
-  let refPairsTotal = rlElemName.length * 2
-  let mStructIdxPre = refPairBase + refPairsTotal + 2
-  let rs = 0
-  while rs < rlElemName.length {
-    rlBackIdx[rs] = refPairBase + rs * 2
-    rlWrapIdx[rs] = refPairBase + rs * 2 + 1
-    if rlElemKindTbl[rs] == 2 {
-      rlElemHeap[rs] = uBoxIdx
-    } else if rlElemKindTbl[rs] == 3 {
-      // A map-struct element (`{[string]:i32}[]`): the backing holds `(ref null $mStructIdx)`.
-      rlElemHeap[rs] = mStructIdxPre
-    } else {
-      let esi = structIndexByName(rlElemName[rs])
-      if esi >= 0 { rlElemHeap[rs] = sHeapIdx[esi] } else { rlElemHeap[rs] = 0 }
-    }
-    rs = rs + 1
-  }
-  if rlElemName.length >= 1 {
-    raTypeIdx = rlBackIdx[0]
-    rlTypeIdx = rlWrapIdx[0]
-  } else {
-    raTypeIdx = refPairBase
-    rlTypeIdx = refPairBase
-  }
-  // The string-ref list types follow the ref-list types: the keys backing
-  // `(array (mut (ref null $aTypeIdx)))`, then the keys list wrapper `{ backing:
-  // (ref $mkArr), len, cap }`. These two are shared by the map's keys list AND any
-  // `string[]` field, so they are present when `slUsed || mUsed`. The map STRUCT
-  // `{ keys, vals, … }` follows them and is present only when `mUsed`. Each type
-  // REFERENCES an already-emitted earlier type (string array / keys backing /
-  // keys wrapper + i32-list `lTypeIdx`).
-  let strListOffset = 0
-  if slUsed || mUsed { strListOffset = 2 }
-  let mapStructOffset = 0
-  if mUsed { mapStructOffset = 1 }
-  let mapOffset = strListOffset + mapStructOffset
-  let preMap = preTypes + arrayOffset + listOffset + refPairsTotal
-  mkArrIdx = preMap
-  mkListIdx = preMap + 1
-  mStructIdx = preMap + 2
-  let typeOffset = preMap + mapOffset
+  // Heap-type indices, in type-section order: standalone structs at 0..ns-1, then
+  // (for the union path) the variant structs + box, then the raw i32 array, the
+  // i32-list wrapper, each ref-list (backing, wrapper) pair, the string-list
+  // (backing, wrapper), the map struct, and finally the functypes. Every index is
+  // minted by the centralized `mIntern*` counter inside `mAssignTypeIndices`, which
+  // assigns the module-global index state (`sHeapIdx`/`uVarIdx`/`uBoxIdx`/`aTypeIdx`/
+  // `lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`raTypeIdx`/`rlTypeIdx`/`mkArrIdx`/`mkListIdx`/
+  // `mStructIdx`) in that order and ALSO asserts each equals the old offset formula
+  // (risk R2 — index drift; the formulas survive as the assert oracle, scheduled for
+  // deletion one release after Phase G). It returns the functype base index
+  // (`typeOffset` — where the first functype lands), or -1 on a drift. All types are
+  // emitted inside ONE recursion group below, so a type may reference one that lands
+  // later (a string field's `(ref $aTypeIdx)`).
+  let typeOffset = mAssignTypeIndices(n)
+  if typeOffset < 0 { return 0 - 1 }
 
   // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
   // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`);
@@ -5488,6 +5601,10 @@ function emitModule(stmts: i32[]): i32 {
     typePayload.push(127)        // field 4 size: 0x7f i32
     typePayload.push(1)          // mutable
   }
+  // Bind the writer at `typePayload` so `fbValtype` (which streams to `curBuf`)
+  // writes the functype param/result valtypes here, interleaved identically with
+  // the surrounding raw `typePayload.push(...)` framing bytes.
+  let tyPrev = wTarget(typePayload)
   let ti = 0
   while ti < n {
     let fn = P.nodes[fnStmts[ti]]
@@ -5498,14 +5615,15 @@ function emitModule(stmts: i32[]): i32 {
       appendAll(typePayload, ulebToArr(nParams))   // param count
       let pi = 0
       while pi < nParams {
-        pushVT(typePayload, vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
+        fbValtype(vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
         pi = pi + 1
       }
       typePayload.push(1)        // 1 result
-      pushVT(typePayload, vtKindOfType(fn.fnRet), retStructIndex(fn.fnRet))
+      fbValtype(vtKindOfType(fn.fnRet), retStructIndex(fn.fnRet))
     }
     ti = ti + 1
   }
+  wTarget(tyPrev)
   wSection(1, typePayload)
 
   // Function section (id 3): N functions; func i uses functype `typeOffset + i`.
@@ -5539,11 +5657,12 @@ function emitModule(stmts: i32[]): i32 {
         if g.letInit < 0 {
           return emitFail("emitProgram: module global has no initializer")
         }
-        pushVT(globalPayload, globalKind(g.letInit), structIndexOfExpr(g.letInit, 0 - 1))   // valtype
-        globalPayload.push(1)                          // 0x01 mutable
-        // Bind the writer at `globalPayload` so the init constexpr's `fb*` opcodes
-        // (i32.const, struct.new, …) write here, not the (default) module buffer.
+        // Bind the writer at `globalPayload` so the valtype (`fbValtype`) and the
+        // init constexpr's `fb*` opcodes (i32.const, struct.new, …) write here, not
+        // the (default) module buffer.
         let gPrev = wTarget(globalPayload)
+        fbValtype(globalKind(g.letInit), structIndexOfExpr(g.letInit, 0 - 1))   // valtype
+        globalPayload.push(1)                          // 0x01 mutable
         if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
         fbEnd()                                         // 0x0b end of init expr
         wTarget(gPrev)
