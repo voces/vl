@@ -1693,6 +1693,36 @@ function pushMapVals(body: i32[]): i32 {
   0
 }
 
+// `M.index` (the i32 hash-slot array): `local.get mapRef ; struct.get $mStructIdx 2`.
+function pushMapIndex(body: i32[]): i32 {
+  pushMapScr(body, 0)
+  body.push(251)             // 0xfb
+  body.push(2)               // struct.get
+  appendAll(body, ulebToArr(mStructIdx))
+  body.push(2)               // field 2: index
+  0
+}
+
+// `M.count` (entries appended): `local.get mapRef ; struct.get $mStructIdx 3`.
+function pushMapCount(body: i32[]): i32 {
+  pushMapScr(body, 0)
+  body.push(251)
+  body.push(2)
+  appendAll(body, ulebToArr(mStructIdx))
+  body.push(3)               // field 3: count
+  0
+}
+
+// `M.size` (live entry count): `local.get mapRef ; struct.get $mStructIdx 4`.
+function pushMapSize(body: i32[]): i32 {
+  pushMapScr(body, 0)
+  body.push(251)
+  body.push(2)
+  appendAll(body, ulebToArr(mStructIdx))
+  body.push(4)               // field 4: size
+  0
+}
+
 // Element-wise string equality of the two refs in map scratch slots `aSlot`/`bSlot`,
 // leaving a 0/1 on the stack. A SELF-CONTAINED port of `emitStrEq`'s compare core
 // (no operands consumed; reads the two scratch string locals directly) so the map
@@ -1766,6 +1796,132 @@ function emitMapKeyEq(body: i32[], aSlot: i32, bSlot: i32): i32 {
   body.push(65)
   appendAll(body, slebToArr(1))
   body.push(11)              // 0x0b end (block)
+  0
+}
+
+// FNV-1a hash of the string in scratch slot `strSlot`, leaving a NON-NEGATIVE i32
+// hash on the stack. `h = 2166136261; for c in str { h = (h ^ c) * 16777619 };
+// h & 0x7fffffff`. Uses slot 9 (accumulator `h`) and slot 8 (char cursor `i`). The
+// 32-bit wasm `i32.mul` wraps exactly as the host's hash does.
+function emitMapHashOf(body: i32[], strSlot: i32): i32 {
+  // h = 2166136261 (0x811c9dc5 — the FNV offset basis, as a signed i32 constant).
+  body.push(65)              // i32.const
+  appendAll(body, slebToArr(0 - 2128831035))   // 2166136261 as signed = -2128831035
+  setMapScr(body, 9)         // h
+  // i = 0
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  setMapScr(body, 8)         // i
+  // loop { if i >= len(str) {} else { h = (h ^ str[i]) * 16777619 ; i++ ; br } }
+  body.push(3)               // 0x03 loop
+  body.push(64)              // void
+  pushMapScr(body, 8)        // i
+  pushMapScr(body, strSlot)
+  body.push(251)
+  body.push(15)              // array.len
+  body.push(78)              // i32.ge_s (i >= len → done)
+  body.push(4)               // if
+  body.push(64)              // void
+  // then: done (empty)
+  body.push(5)               // else
+  // h = (h ^ str[i]) * 16777619
+  pushMapScr(body, 9)        // h
+  pushMapScr(body, strSlot)
+  pushMapScr(body, 8)        // i
+  body.push(251)
+  body.push(11)              // array.get
+  appendAll(body, ulebToArr(aTypeIdx))
+  body.push(115)             // 0x73 i32.xor
+  body.push(65)              // i32.const 16777619
+  appendAll(body, slebToArr(16777619))
+  body.push(108)             // 0x6c i32.mul
+  setMapScr(body, 9)         // h
+  // i = i + 1
+  pushMapScr(body, 8)
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add
+  setMapScr(body, 8)
+  body.push(12)              // br
+  body.push(1)               // → loop header
+  body.push(11)              // end (ge_s if)
+  body.push(11)              // end (loop)
+  // h & 0x7fffffff  — force non-negative (left on the stack).
+  pushMapScr(body, 9)
+  body.push(65)
+  appendAll(body, slebToArr(2147483647))   // 0x7fffffff
+  body.push(113)             // 0x71 i32.and
+  0
+}
+
+// PROBE: with `mapRef` (slot 0) and the target `keyRef` (slot 1) set, hash the key
+// into `M.index` and linear-probe (wrapping) to the slot holding either the matching
+// key's entry or a free (0) slot. Leaves `slot` (slot 3) = that probe slot and `entry`
+// (slot 5) = `index[slot]` (0 = miss; else entry-position + 1). Shared by get / has /
+// set. The index load factor is kept < 1/2, so a free slot is always reached.
+function emitMapProbe(body: i32[]): i32 {
+  // cap = array.len(index)
+  pushMapIndex(body)
+  body.push(251)
+  body.push(15)              // array.len
+  setMapScr(body, 4)         // cap
+  // slot = hash(keyRef) % cap
+  if emitMapHashOf(body, 1) < 0 { return 0 - 1 }
+  pushMapScr(body, 4)        // cap
+  body.push(112)             // 0x70 i32.rem_u
+  setMapScr(body, 3)         // slot
+  // loop { entry = index[slot]
+  //        if entry == 0 { break(miss) }
+  //        curRef = keys.backing[entry-1]
+  //        if keyEq(curRef, keyRef) { break(hit) }
+  //        slot = (slot + 1) % cap ; br loop }
+  body.push(2)               // 0x02 block  (probe break target)
+  body.push(64)              // void
+  body.push(3)               // 0x03 loop
+  body.push(64)              // void
+  // entry = index[slot]
+  pushMapIndex(body)
+  pushMapScr(body, 3)        // slot
+  body.push(251)
+  body.push(11)              // array.get
+  appendAll(body, ulebToArr(aTypeIdx))
+  setMapScr(body, 5)         // entry
+  // if entry == 0 { br 2 → out of the probe block (miss) }
+  pushMapScr(body, 5)
+  body.push(69)              // i32.eqz
+  body.push(13)              // 0x0d br_if
+  body.push(1)               // depth 1 → out of the probe block
+  // curRef = keys.backing[entry-1]  (ref.as_non_null — a stored slot is populated)
+  pushMapKeys(body)
+  body.push(251)
+  body.push(2)               // struct.get (keys backing)
+  appendAll(body, ulebToArr(mkListIdx))
+  body.push(0)               // field 0: backing
+  pushMapScr(body, 5)        // entry
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(107)             // 0x6b i32.sub  (entry - 1)
+  body.push(251)
+  body.push(11)              // array.get
+  appendAll(body, ulebToArr(mkArrIdx))
+  body.push(212)             // 0xd4 ref.as_non_null
+  setMapScr(body, 2)         // curRef
+  // if keyEq(curRef, keyRef) { br 2 → out of the probe block (hit) }
+  if emitMapKeyEq(body, 2, 1) < 0 { return 0 - 1 }
+  body.push(13)              // 0x0d br_if
+  body.push(1)               // depth 1 → out of the probe block
+  // slot = (slot + 1) % cap
+  pushMapScr(body, 3)
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add
+  pushMapScr(body, 4)        // cap
+  body.push(112)             // i32.rem_u
+  setMapScr(body, 3)         // slot
+  body.push(12)              // br
+  body.push(0)               // → loop header
+  body.push(11)              // end (loop)
+  body.push(11)              // end (probe block)
   0
 }
 
@@ -3451,8 +3607,8 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     if fnUsesRefPush { nRuns = nRuns + 3 }
     // The G6 string-op frame: 3 non-null string refs + 4 i32 temporaries.
     if fnUsesStrOp { nRuns = nRuns + 7 }
-    // The G8 map frame: 9 slots (see `emitMapScan`/the map scratch layout).
-    if fnUsesMap { nRuns = nRuns + 9 }
+    // The G8 map frame: 12 slots (see the map scratch layout / the probe + rehash).
+    if fnUsesMap { nRuns = nRuns + 12 }
     appendAll(body, ulebToArr(nRuns))
     let li = 0
     while li < nLocals {
@@ -3501,16 +3657,20 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(127)
     }
     if fnUsesMap {
-      // The G8 map scratch frame, in slot order (see the map scratch layout):
-      //   0 mapRef  : (ref $mStructIdx)
-      //   1 keyRef  : (ref $aTypeIdx)   — target key string
-      //   2 curRef  : (ref $aTypeIdx)   — current scanned key string
-      //   3 idx     : i32               — outer scan cursor
-      //   4 cnt     : i32               — keys.len / newCap
-      //   5 hit     : i32               — found index (-1 absent)
-      //   6 keysBk  : (ref $mkArrIdx)   — grown keys backing
-      //   7 valsBk  : (ref $aTypeIdx)   — grown vals backing
-      //   8 chr     : i32               — inner char cursor (key compare)
+      // The G8 hash-map scratch frame, in slot order (see the map scratch layout
+      // and the hash / probe / rehash helpers):
+      //   0 mapRef : (ref $mStructIdx)
+      //   1 keyRef : (ref $aTypeIdx)   — target key string
+      //   2 curRef : (ref $aTypeIdx)   — current probed key string
+      //   3 slot   : i32               — probe slot offset into `index`
+      //   4 cap    : i32               — index length (slot count)
+      //   5 entry  : i32               — index[slot] (entry+1; 0 = empty)
+      //   6 keysBk : (ref $mkArrIdx)   — grown keys backing
+      //   7 valsBk : (ref $aTypeIdx)   — grown vals backing
+      //   8 chr    : i32               — inner char cursor (key compare)
+      //   9 hcur   : i32               — hash accumulator / rehash entry cursor
+      //  10 idxBk  : (ref $aTypeIdx)   — fresh `index` backing (rehash)
+      //  11 rslot  : i32               — rehash inner probe slot
       body.push(1)
       body.push(100)         // 0x64 (ref $mStructIdx) — non-null map ref
       appendAll(body, ulebToArr(mStructIdx))
@@ -3521,11 +3681,11 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(100)         // 0x64 (ref $aTypeIdx) — non-null current key ref
       appendAll(body, ulebToArr(aTypeIdx))
       body.push(1)
-      body.push(127)         // idx: i32
+      body.push(127)         // 3 slot: i32
       body.push(1)
-      body.push(127)         // cnt: i32
+      body.push(127)         // 4 cap: i32
       body.push(1)
-      body.push(127)         // hit: i32
+      body.push(127)         // 5 entry: i32
       body.push(1)
       body.push(100)         // 0x64 (ref $mkArrIdx) — non-null keys backing
       appendAll(body, ulebToArr(mkArrIdx))
@@ -3533,7 +3693,14 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(100)         // 0x64 (ref $aTypeIdx) — non-null vals backing
       appendAll(body, ulebToArr(aTypeIdx))
       body.push(1)
-      body.push(127)         // chr: i32
+      body.push(127)         // 8 chr: i32
+      body.push(1)
+      body.push(127)         // 9 hcur: i32
+      body.push(1)
+      body.push(100)         // 0x64 (ref $aTypeIdx) — non-null new index backing
+      appendAll(body, ulebToArr(aTypeIdx))
+      body.push(1)
+      body.push(127)         // 11 rslot: i32
     }
     appendAll(body, bodyExpr)
     body.push(11)            // 0x0b end
