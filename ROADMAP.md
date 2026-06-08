@@ -37,15 +37,15 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - **H2a Re-land clean `selfhost/lexer.vl`** — now unblocked; first concrete H3 slice.
 - **C5 / H-M1** — `deno compile` + brew tap. Small, decoupled; ships the distribution story now.
 - Smaller/independent: B6b collections building blocks, B13 callable objects, B17 lint backlog,
-  A6b Stage A, A3 structural intersection merge.
+  A6b Stage A.
 
 ---
 
 ## Track A — Type system (`typecheck.ts`)
 *Blueprint: Elixir v1.20 set-theoretic types, fully-typed (no gradual escape hatch).*
 
-- 🟡 **A3. Intersection types** (`A & B`). REMAINING: object-type structural intersection
-  (`{x} & {y}` merge — needs `intersectType`/`meet` extension; today distinct objects meet to `Never`).
+- 🟢 **A3. Intersection types** (`A & B`). Done: surface syntax, narrowing algebra, AND
+  object-type structural intersection (`{x} & {y}` merges field-wise to `{x, y}` via `meet`).
 - 🟡 **A4. Negation types** (`!A`). REMAINING: full open-world negation tracking (needs A12).
 - 🟡 **A5. Flow narrowing.** REMAINING: `case`/multi-guard (no grammar); stored-witness (A6b Stage B);
   optional *call* `x?.f()` + chain short-circuit `x?.y.z` (use `x?.y?.z`); per-call

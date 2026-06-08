@@ -5,6 +5,7 @@ import type {
   Context,
   VLArgumentNode,
   VLExpression,
+  VLObjectType,
   VLParameterNode,
   VLStatement,
   VLStringLiteralNode,
@@ -1873,6 +1874,41 @@ export const subtractType = (type: VLType, removed: VLType): VLType => {
   return flattenType({ type: "Union", subTypes: kept });
 };
 
+// A plain field record eligible for structural-intersection merging (A3): an
+// anonymous-or-named `Object` whose properties are all named fields. Maps/sets
+// and i32-keyed arrays/lists carry an *index signature* (a non-StringLiteral
+// key) and the builtin scalars (`i32`, `string`, …) are themselves `Object`s —
+// none of those merge field-wise, so they're excluded and fall through to the
+// ordinary `meet` (yielding `Never` for a disjoint pair, as before).
+const isPlainRecord = (t: VLType): t is VLObjectType =>
+  t.type === "Object" && scalarName(t) === undefined &&
+  arrayElementType(t) === null && !isMapType(t) &&
+  t.properties.every((p) => p.name.type === "StringLiteral");
+
+// Merge two plain field records into the wider `{…a, …b}` (A3). A field present
+// on both sides is refined to the per-field `meet`; if that meet is empty the
+// whole record is impossible, so `null` propagates. Returns `undefined` when the
+// pair isn't two mergeable records, so `meet` keeps its prior disjoint→`Never`
+// behavior for everything else (maps, arrays, scalars, functions).
+const mergeRecords = (a: VLType, b: VLType): VLType | null | undefined => {
+  if (!isPlainRecord(a) || !isPlainRecord(b)) return undefined;
+  const fieldName = (p: { name: VLType }) =>
+    (p.name as VLStringLiteralNode).value;
+  // Copy each property object — never mutate `a`'s shared field nodes in place.
+  const properties = a.properties.map((p) => ({ ...p }));
+  for (const bp of b.properties) {
+    const existing = properties.find((ap) => fieldName(ap) === fieldName(bp));
+    if (existing === undefined) {
+      properties.push({ ...bp });
+      continue;
+    }
+    const fieldMeet = meet(existing.type, bp.type);
+    if (fieldMeet === null) return null; // a shared field can't hold both → ∅
+    existing.type = fieldMeet;
+  }
+  return { type: "Object", properties };
+};
+
 // The more specific of two overlapping types (the refinement `a & b`), or null
 // if they're disjoint. `distinctScalars` first: `i32` and `f64` overlap under
 // coercion (`i32 ⊑ f64`) but are distinct *variants*, so their meet is empty.
@@ -1884,6 +1920,13 @@ const meet = (a: VLType, b: VLType): VLType | null => {
   if (distinctScalars(a, b)) return null;
   if (validateType(b, a)) return a; // a ⊑ b → a is the refinement
   if (validateType(a, b)) return b; // b ⊑ a → b is the refinement
+  // Object-type structural intersection (A3): two plain field records that
+  // neither subsumes the other (`{a} & {b}`) merge field-wise into the wider
+  // `{a, b}` — a value that is *both* must carry every field of each side.
+  // Shared fields refine to their per-field meet (disjoint → the whole merge is
+  // `Never`, signalled by null).
+  const merged = mergeRecords(a, b);
+  if (merged !== undefined) return merged;
   return null;
 };
 
