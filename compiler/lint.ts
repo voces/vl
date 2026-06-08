@@ -318,11 +318,22 @@ const emptyIntersections = (
     const info = findEmptyIntersection(b.type);
     if (!info) continue;
     reported.add(b);
+    // A self-referential definition (`type E = A & E`) collapses to `never`
+    // because the alias is defined in terms of itself — an honest, self-cycle
+    // message rather than the disjoint-operands wording. Otherwise it's a
+    // genuinely disjoint concrete pair (`A & B`).
+    const message = info.selfRef
+      ? `Type \`${info.selfRef}\` refers to itself inside an intersection ` +
+        `(\`${info.text}\`), so it reduces to \`never\``
+      : `Intersection \`${info.text}\` is empty (\`never\`) — ${info.reason}`;
     out.push({
-      message:
-        `Intersection \`${info.text}\` is empty (\`never\`) — ${info.reason}`,
+      message,
       severity: "warning",
-      range: rangeFromCtx(b.decl),
+      // Range the warning on the `A & B` intersection EXPRESSION (the type
+      // annotation span captured by the parser), not the alias name — matching
+      // the never-value error. Fall back to the declaration span if no
+      // annotation span was threaded.
+      range: rangeFromCtx(info.span ?? b.decl),
       code: "empty-intersection",
       source: "vital",
     });

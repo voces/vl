@@ -411,17 +411,34 @@ export const parseProgram = (
   // array suffix. Flattened so `A & B & C` is one `Intersection` node; a single
   // operand passes through unwrapped.
   const parseIntersectionType = (): VLType => {
+    // Token at the start of the whole `A & B [& …]` expression, so the span we
+    // attach to an empty-intersection fold covers the intersection EXPRESSION
+    // (not just one operand, and not the alias name). `record`ed nodes elsewhere
+    // use `spans`, but a folded `Never` has no stable node to key, so we thread
+    // the span explicitly to `intersectType`.
+    const startTok = peek();
+    // A reference to the alias being defined right now (`type E = A & E`) parses
+    // to a lazy self-`Alias` leaf because the name is in `typeBuilding` (see the
+    // ID branch of `parseTypePrimary`). If such an operand participates in a fold
+    // to `never`, it's a degenerate self-cycle — capture its name so the
+    // diagnostics can say so honestly instead of treating it as a disjoint pair.
+    const selfRefOf = (t: VLType): string | undefined =>
+      t.type === "Alias" && typeBuilding.has(t.name) ? t.name : undefined;
     let left = parseArrayType();
+    let selfRef = selfRefOf(left);
     while (at("AMPERSAND")) {
       next();
       skipNewlines();
       const right = parseArrayType();
+      selfRef = selfRef ?? selfRefOf(right);
       // Fold through the existing algebra so a finite annotation simplifies to a
       // concrete type for codegen (`(0|1|2) & !2` → `0 | 1`; `A & !B` is the
       // common "A but not B"). `intersectType` keeps an irreducible open-world
       // pair as a residual `Intersection`/`Negation` node, which `ensureType`
-      // still validates as an assignment target.
-      left = intersectType(left, right);
+      // still validates as an assignment target. The span (start of the whole
+      // expr through the last operand) and any self-reference are threaded so a
+      // fold to `never` can be ranged and explained precisely.
+      left = intersectType(left, right, spanFrom(startTok), selfRef);
       skipNewlines();
     }
     return left;

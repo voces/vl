@@ -1379,16 +1379,24 @@ export const getConcreteType = (
   if (type.type !== "Alias") return type; // TODO: Should handle recursiveness (objects, params, etc)
   if (type.name === "null") return type;
 
-  // A self-referential alias chain (e.g. the bodyless `type Point`, whose grammar
-  // alt `TYPE ID` aliases the name to itself) would otherwise recurse forever and
-  // stack-overflow. Opaque/recursive type aliases aren't supported yet (A14):
-  // report it cleanly and bail instead of crashing.
+  // A DEGENERATE self-referential alias chain (`type D = D`) — the name resolves
+  // straight back to itself with no structural body in between. This isn't a
+  // "not-yet-supported feature"; it's nonsense: an alias defined purely in terms
+  // of itself has no base case, so nothing can ever inhabit it. Report that
+  // honestly and bail with `never` (which is what it reduces to) instead of
+  // recursing forever / stack-overflowing.
+  //
+  // LEGITIMATE recursion (`type List = { rest: List[] }`, mutual recursion) does
+  // NOT reach here: those aliases resolve to a real structural body (an `Object`)
+  // and return above before the name is ever chased a second time — the back-edge
+  // lives inside a field/element type, a finite `Alias` leaf, not the alias body.
   if (seen.has(type.name)) {
     if (ctx) {
       errors.push({
         type: "Syntax",
         message:
-          `Type \`${type.name}\` refers to itself; opaque/recursive type aliases are not yet supported`,
+          `Type \`${type.name}\` is defined in terms of itself with no base ` +
+          `type, so it can never have a value`,
         ctx,
         code: 1,
       });
@@ -1942,6 +1950,16 @@ export type EmptyIntersection = {
   /** A prose description of why they're disjoint, e.g. "an object and a
    * string literal, have no common values". */
   reason: string;
+  /** Source span of the `A & B` intersection *expression* (the type
+   * annotation), captured by the parser when it folds the `&`. Used as the
+   * diagnostic RANGE for BOTH the empty-intersection lint and the never-value
+   * error, so they highlight the intersection itself, not the alias name. */
+  span?: Context;
+  /** When the intersection is empty because it refers to the very alias being
+   * defined (`type E = A & E`), the alias name `E`. A degenerate self-cycle
+   * that collapses to `never` — distinct from a disjoint-concrete pair
+   * (`A & B`). Drives a clearer, self-reference-specific message. */
+  selfRef?: string;
 };
 const emptyIntersections = new WeakMap<VLType, EmptyIntersection>();
 
@@ -2013,12 +2031,28 @@ const concreteOperand = (t: VLType): boolean =>
 // error and the lint can explain it. Scoped to CONCRETE operands (see
 // `concreteOperand`): a `Never` that came from narrowing or from a generic
 // instantiation carries no record and is treated as a legitimate empty type.
-const tagEmptyIntersection = (never: VLType, a: VLType, b: VLType): VLType => {
+//
+// `span` is the source extent of the `a & b` annotation as written (threaded
+// from the parser's fold site); it becomes the diagnostic RANGE so both the
+// lint and the never-value error point at the intersection expression, not the
+// alias name. `selfRef` names the alias currently being defined when one operand
+// is a back-reference to it (`type E = A & E`): a degenerate self-cycle that
+// reduces to `never`, reported with its own clearer message rather than the
+// disjoint-operands wording.
+const tagEmptyIntersection = (
+  never: VLType,
+  a: VLType,
+  b: VLType,
+  span?: Context,
+  selfRef?: string,
+): VLType => {
   if (!concreteOperand(a) || !concreteOperand(b)) return never;
   if (emptyIntersections.has(never)) return never;
   emptyIntersections.set(never, {
     text: `${stringifyKind(a)} & ${stringifyKind(b)}`,
     reason: `${operandKind(a)} and ${operandKind(b)}, have no common values`,
+    span,
+    selfRef,
   });
   return never;
 };
@@ -2055,7 +2089,17 @@ const stringifyKind = (t: VLType): string => {
 // other side; a `Negation` becomes a subtraction; otherwise each member of `a`
 // that overlaps `b` is refined to the meet, and disjoint members drop (so
 // `(string | i32) & i32` is `i32`, and an impossible refinement is `Never`).
-export const intersectType = (a: VLType, b: VLType): VLType => {
+export const intersectType = (
+  a: VLType,
+  b: VLType,
+  // Parse-time only: the source span of the `a & b` annotation, and the name of
+  // the alias being defined when an operand back-references it (`type E = A & E`).
+  // Both feed the empty-intersection tag so a fold to `never` can be explained
+  // and located precisely. Narrowing/other callers omit them (no source span,
+  // no self-reference) and an untagged `never` results.
+  span?: Context,
+  selfRef?: string,
+): VLType => {
   if (a.type === "Unknown" || a.type === "Infer") return b;
   if (b.type === "Unknown" || b.type === "Infer") return a;
   if (a.type === "Never" || b.type === "Never") return { type: "Never" };
@@ -2068,7 +2112,9 @@ export const intersectType = (a: VLType, b: VLType): VLType => {
   // so the binding-site error and the `empty-intersection` lint can explain the
   // impossibility in source terms. A generic/holey pair is left untagged (it may
   // be non-empty for some instantiation).
-  if (kept.length === 0) return tagEmptyIntersection({ type: "Never" }, a, b);
+  if (kept.length === 0) {
+    return tagEmptyIntersection({ type: "Never" }, a, b, span, selfRef);
+  }
   return flattenType({ type: "Union", subTypes: kept });
 };
 
@@ -2408,13 +2454,25 @@ export const ensureType = (
     // branch, an `import` placeholder — is left to its existing handling so we
     // never double-report or break a legitimate `never`.
     if (ctx && info && right.type !== "Never") {
-      const name = leftAliasName ? `Type \`${leftAliasName}\` is ` : "This is ";
+      // Range the diagnostic on the `A & B` intersection EXPRESSION (the type
+      // annotation captured by the parser), not the value/binding site — so the
+      // squiggle lands on the impossible type itself. Fall back to the binding
+      // `ctx` if no annotation span was threaded.
+      const at = info.span ?? ctx;
+      const message = info.selfRef
+        // A self-referential definition (`type E = A & E`) that collapses to
+        // `never`: an honest, self-cycle-specific message rather than the
+        // disjoint-operands wording (`A` is not really "disjoint" from `E` — the
+        // intersection is empty because `E` is defined in terms of itself).
+        ? `Type \`${info.selfRef}\` refers to itself inside an intersection ` +
+          `(\`${info.text}\`), so it reduces to \`never\``
+        : `${leftAliasName ? `Type \`${leftAliasName}\` is ` : "This is "}` +
+          `\`never\` (an empty type — \`${info.text}\`, ${info.reason}), ` +
+          `so it has no values`;
       errors.push({
         type: "Syntax",
-        message:
-          `${name}\`never\` (an empty type — \`${info.text}\`, ${info.reason}), ` +
-          `so it has no values`,
-        ctx,
+        message,
+        ctx: at,
         code: 0,
       });
       return false;
