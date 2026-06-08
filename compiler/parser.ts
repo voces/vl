@@ -2961,13 +2961,19 @@ export const parseProgram = (
   const recordExport = (
     name: string,
     kind: "function" | "variable" | "type",
+    exportKwSpan?: Context,
   ): void => {
     const type = program.scope[name] ?? { type: "Unknown" };
     (program.moduleExports ??= {})[name] = { name, kind, type };
     // Mark the symbol-table binding exported so the unused-variable lint exempts
     // an exported-but-locally-unread top-level binding (it's public surface).
+    // Also stamp the `export` keyword span so the LSP unused-export pass can range
+    // the "redundant export" hint on the keyword token, not the name.
     const binding = scopeBindings.get(program.scope)?.get(name);
-    if (binding) binding.exported = true;
+    if (binding) {
+      binding.exported = true;
+      if (exportKwSpan !== undefined) binding.exportKeywordSpan = exportKwSpan;
+    }
   };
 
   /**
@@ -3378,13 +3384,14 @@ export const parseProgram = (
     if (at("IMPORT")) return parseImport();
     if (at("EXPORT")) {
       const kw = next(); // EXPORT
+      const kwSpan = spanOf(kw); // captured for redundant-export LSP hint
       skipNewlines();
       // `export function f(…)` — register + flag + record.
       if (at("FUNCTION")) {
         const fn = parseFunctionDeclaration();
         if (fn.name) {
           fn.exported = true;
-          recordExport(fn.name, "function");
+          recordExport(fn.name, "function", kwSpan);
         } else {
           errors.push({
             type: "Syntax",
@@ -3399,7 +3406,7 @@ export const parseProgram = (
       if (at("LET") || at("CONST")) {
         const decl = parseVariableDeclaration();
         decl.exported = true;
-        recordExport(decl.name, "variable");
+        recordExport(decl.name, "variable", kwSpan);
         return decl;
       }
       // `export type T = …`. The type-statement parser registers the alias and
@@ -3408,7 +3415,7 @@ export const parseProgram = (
       if (at("TYPE")) {
         const nameTok = peek(1);
         const decl = parseTypeStatement();
-        if (nameTok.kind === "ID") recordExport(nameTok.text, "type");
+        if (nameTok.kind === "ID") recordExport(nameTok.text, "type", kwSpan);
         return decl;
       }
       errors.push({

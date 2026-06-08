@@ -836,3 +836,251 @@ export const crossFileReferences = async (
   }
   return refs;
 };
+
+// ---- project-wide unused-export hints ---------------------------------------
+//
+// A debounced workspace pass (triggered on document save, NOT per-keystroke)
+// builds a global USE-MAP in one crawl: enumerate every .vl file under the
+// project root, parse each, and record every REFERENCE to every exported symbol
+// `(exportingModuleKey, exportedName)`.
+//
+// For each exported symbol in the document being checked: if it has ZERO
+// references anywhere in the project (local uses + cross-module uses), emit a
+// `hint`-severity diagnostic tagged `unnecessary` on the export's name — VS Code
+// will grey/fade it without a squiggle.
+//
+// Design decisions:
+//   • "Used locally but not imported" = NOT unused. An export that the exporting
+//     module itself references (e.g. a recursive function, or a value used in the
+//     same file) is not dead code — only flag exports with zero references
+//     ANYWHERE (local + cross-module). The goal is "never imported or used", not
+//     "never imported".
+//   • Struct FIELDS are out of scope. VL's structural typing makes field-level
+//     usage analysis fuzzy (a type `{x: i32}` matches ANY struct with an `x`
+//     field, so a field could be "used" via a widened receiver without an explicit
+//     import). Field-level unused hints are deferred.
+//   • Exports are already exempt from the normal unused-variable lint (`b.exported`
+//     check in `lint.ts`). These hints are purely additive and do not double-warn.
+//   • The 500-file cap (`MAX_DISK_FILES`) is reused from `crossFileReferences`.
+
+/**
+ * Reference counts for a single exported symbol, split by origin:
+ *   `cross` — how many OTHER modules import this symbol (cross-module count).
+ *   `local` — how many non-declaration occurrences appear within the exporting
+ *              module itself (same-file local uses, e.g. a recursive call).
+ *
+ * Decision matrix in `unusedExportHints`:
+ *   cross == 0 && local == 0  → fully dead   → grey the export NAME (existing hint)
+ *   cross == 0 && local  > 0  → redundant    → grey the `export` KEYWORD (new hint)
+ *   cross  > 0               → real export  → no hint
+ */
+export type ExportRefCounts = { cross: number; local: number };
+
+/**
+ * The use-map produced by a single project-wide pass: for each
+ * `(exportingModuleKey, exportedName)` pair, the split reference counts
+ * (`cross` = cross-module imports, `local` = same-file uses).
+ * Both counts zero means the export is never referenced anywhere.
+ */
+export type UnusedExportUseMap = Map<string, Map<string, ExportRefCounts>>;
+
+/**
+ * Build a project-wide use-map in ONE pass over every `.vl` file in `allFiles`.
+ *
+ * Two kinds of references are counted:
+ *
+ * 1. CROSS-MODULE: Any `import { name } from "./sibling"` statement is a
+ *    reference to `sibling.vl`'s `name` export. We do NOT require that the
+ *    importer actually USES the name after importing it (if it doesn't, the
+ *    existing `unused-import` lint flags the importer). Counting the import
+ *    statement itself avoids needing graph-seeded parsing just to resolve uses of
+ *    imported bindings (which `parseSymbols` alone can't do — an unresolved
+ *    import binding has no symbol-table occurrences in the single-file parse).
+ *
+ * 2. SAME-FILE: An exported binding that the exporting module itself references
+ *    (e.g. a recursive function, or a `const` exported AND used in the same file)
+ *    is NOT dead — the symbol table non-decl occurrences of that binding name
+ *    in the same file count as local uses (no seeding needed; the binding is
+ *    declared locally and resolves fine in a single-file parse).
+ *
+ * `read` is the workspace reader (open buffers + disk). `allFiles` is the
+ * pre-enumerated list of `.vl` paths to scan (from `enumerateWorkspaceFiles`).
+ */
+export const buildUnusedExportUseMap = async (
+  allFiles: string[],
+  read: ModuleReader,
+): Promise<UnusedExportUseMap> => {
+  const useMap: UnusedExportUseMap = new Map();
+
+  // Ensure a (moduleKey, exportName) entry exists (both counts at 0).
+  const ensureEntry = (moduleKey: string, exportName: string): void => {
+    let inner = useMap.get(moduleKey);
+    if (inner === undefined) {
+      inner = new Map();
+      useMap.set(moduleKey, inner);
+    }
+    if (!inner.has(exportName)) inner.set(exportName, { cross: 0, local: 0 });
+  };
+
+  // Increment the cross-module import count for a (moduleKey, exportName) pair.
+  const addCrossRef = (moduleKey: string, exportName: string): void => {
+    const inner = useMap.get(moduleKey);
+    if (inner === undefined) return; // exporter not yet seeded
+    const counts = inner.get(exportName);
+    if (counts === undefined) return;
+    inner.set(exportName, { cross: counts.cross + 1, local: counts.local });
+  };
+
+  // Increment the same-file local use count for a (moduleKey, exportName) pair.
+  const addLocalRef = (moduleKey: string, exportName: string): void => {
+    const inner = useMap.get(moduleKey);
+    if (inner === undefined) return; // exporter not yet seeded
+    const counts = inner.get(exportName);
+    if (counts === undefined) return;
+    inner.set(exportName, { cross: counts.cross, local: counts.local + 1 });
+  };
+
+  // Read all sources up front (one async pass over the file list).
+  const sources = new Map<string, string>();
+  for (const filePath of allFiles) {
+    const src = await read(filePath);
+    if (src !== undefined) sources.set(filePath, src);
+  }
+
+  // ── PASS 1: seed the use-map with every export declaration (counts {0,0}). ─
+  // `parseSymbols` is used because: it's synchronous, cheap, and correctly
+  // records `binding.exported === true` for top-level `export`-modifier bindings
+  // regardless of whether imports are seeded into scope.
+  for (const [filePath, source] of sources) {
+    const symbols = parseSymbols(source);
+    for (const occ of symbols.occurrences) {
+      if (!occ.isDecl) continue;
+      if (!occ.binding.exported) continue;
+      ensureEntry(filePath, occ.binding.name);
+    }
+  }
+
+  // ── PASS 2: count references. ──────────────────────────────────────────────
+  for (const [filePath, source] of sources) {
+    const { tokens } = tokenize(source);
+    const [program] = parseProgram(tokens, defaultScope());
+
+    // ── 2a. Cross-module refs via import statements. ─────────────────────────
+    // Each `import { name as local } from "./sibling"` is a reference to
+    // `sibling.vl`'s `name` export, regardless of whether `local` is later used.
+    // (Unused-import lint handles the "imported but never used" case.)
+    for (const imp of program.moduleImports ?? []) {
+      const depKey = resolveSpecifier(imp.specifier, filePath);
+      if (depKey === undefined || depKey === filePath) continue;
+      for (const spec of imp.specifiers) {
+        addCrossRef(depKey, spec.name);
+      }
+    }
+
+    // ── 2b. Same-file refs via symbol-table non-decl occurrences. ────────────
+    // An exported binding used WITHIN the same file (e.g. a recursive exported
+    // function, or a value the file also uses) is counted here. `parseSymbols`
+    // resolves local bindings (declared in this file) fine — only imported
+    // bindings are unresolved, which 2a already handles.
+    const symbols = parseSymbols(source);
+    for (const occ of symbols.occurrences) {
+      if (occ.isDecl) continue;
+      if (!occ.binding.exported) continue;
+      addLocalRef(filePath, occ.binding.name);
+    }
+  }
+
+  return useMap;
+};
+
+/**
+ * Produce hint diagnostics for every exported symbol in `entrySource` (at
+ * `entryKey`) whose reference counts indicate it is dead or redundant, per
+ * `useMap`.
+ *
+ * Two distinct hint kinds:
+ *
+ * 1. **Fully dead** (`cross == 0 && local == 0`): the export is never
+ *    referenced anywhere — not imported by any other module, and not used
+ *    within the exporting file itself. Hints on the export **NAME**.
+ *    Code: `unused-export`. Message: "Exported `foo` is never used in the project".
+ *
+ * 2. **Redundant export** (`cross == 0 && local > 0`): the symbol IS used
+ *    within its own module (e.g. a recursive function, or a value also consumed
+ *    locally) but no other module ever imports it — so the `export` modifier
+ *    is superfluous. Hints on the **`export` keyword** token.
+ *    Code: `redundant-export`. Message: "`export` is redundant — `foo` is only
+ *    used within this module, never imported".
+ *
+ * 3. **Real export** (`cross > 0`): used by at least one other module — no hint.
+ *
+ * Severity: `hint` (no squiggle). Tag: `unnecessary` (VS Code greys the span).
+ * Source: `"vital"`.
+ *
+ * Struct fields are NOT checked here (structural typing makes field-level
+ * usage analysis too fuzzy — see module-level comment). Only function and value
+ * exports are flagged.
+ *
+ * These hints are designed to be MERGED with the file's regular diagnostics
+ * (e.g. lint/type diagnostics from `checkDocument`); they do not replace them.
+ */
+export const unusedExportHints = (
+  entrySource: string,
+  entryKey: string,
+  useMap: UnusedExportUseMap,
+): VLDiagnostic[] => {
+  const hints: VLDiagnostic[] = [];
+  const fileExports = useMap.get(entryKey);
+  if (fileExports === undefined || fileExports.size === 0) return hints;
+
+  const symbols = parseSymbols(entrySource);
+  // Build a map from exported name → { nameRange, exportKwRange? } for this file.
+  const declRanges = new Map<string, VLRange>();
+  const exportKwRanges = new Map<string, VLRange>();
+  for (const occ of symbols.occurrences) {
+    if (!occ.isDecl) continue;
+    if (!occ.binding.exported) continue;
+    const name = occ.binding.name;
+    if (!declRanges.has(name)) {
+      declRanges.set(name, rangeFromCtx(occ.binding.decl));
+      if (occ.binding.exportKeywordSpan !== undefined) {
+        exportKwRanges.set(name, rangeFromCtx(occ.binding.exportKeywordSpan));
+      }
+    }
+  }
+
+  for (const [exportName, counts] of fileExports) {
+    const { cross, local } = counts;
+
+    if (cross > 0) continue; // real export — used by another module, no hint
+
+    if (local === 0) {
+      // ── Fully dead: not imported, not locally used → grey the NAME. ─────────
+      const range = declRanges.get(exportName);
+      if (range === undefined) continue; // shouldn't happen; defensive
+      hints.push({
+        message: `Exported \`${exportName}\` is never used in the project`,
+        severity: "hint",
+        range,
+        code: "unused-export",
+        source: "vital",
+        tags: ["unnecessary"],
+      });
+    } else {
+      // ── Redundant export: locally used but never imported → grey the KEYWORD.
+      const kwRange = exportKwRanges.get(exportName);
+      if (kwRange === undefined) continue; // no keyword span captured; skip
+      hints.push({
+        message:
+          `\`export\` is redundant — \`${exportName}\` is only used within this module, never imported`,
+        severity: "hint",
+        range: kwRange,
+        code: "redundant-export",
+        source: "vital",
+        tags: ["unnecessary"],
+      });
+    }
+  }
+
+  return hints;
+};
