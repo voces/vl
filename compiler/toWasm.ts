@@ -4495,6 +4495,158 @@ export const toWasm = async (
           }
         }
 
+        // Structural `==`/`!=` with a value-union operand. `==`/`!=` are
+        // structural by value, so `v == 7` (where `v: "x" | 7`) is true iff the
+        // box `v` currently holds a value structurally equal to `7`. We reuse the
+        // `is`-literal machinery: a boxed union is `{ tag: i32, value }`, so the
+        // comparison is "does the tag select the arm whose rep matches the other
+        // operand's type, AND does the unboxed arm value structurally-equal it".
+        //
+        // Handles both operand orders and both union==concrete (the common case)
+        // and union==union. The branch fires only when at least one operand is a
+        // *boxing* union (`unionInfo` non-null) and the comparison is `==`/`!=`.
+        if (op === "==" || op === "!=") {
+          // The box an operand actually evaluates to. `toExpression` keeps a value
+          // boxed *unless* flow narrowing pinned it to a single non-null member
+          // (then it unboxes to a scalar/ref). Mirror the `is` discrimination: read
+          // the representation (unnarrowed) type's box, and detect that unbox so we
+          // don't `struct.get` an already-scalar value. Returns the box `UnionInfo`
+          // plus a flag for whether the operand is still a box, or null when this
+          // operand isn't a boxed union here.
+          const unionOperand = (
+            node2: VLExpression,
+          ): { info: UnionInfo; isBox: boolean } | null => {
+            let t = softenImplicitType(codegenType(node2));
+            while (t.type === "Infer") t = softenImplicitType(t.subType);
+            let reprT = t;
+            const reprSource = unnarrowedType(node2);
+            if (reprSource) {
+              let r = softenImplicitType(reprSource);
+              while (r.type === "Infer") r = softenImplicitType(r.subType);
+              reprT = r;
+            }
+            const reprInfo = unionInfo(reprT);
+            if (!reprInfo) {
+              // No box at the representation level (a niche nullable, or a plain
+              // narrowed scalar/ref): nothing union-specific to do here.
+              const info = unionInfo(t);
+              return info ? { info, isBox: true } : null;
+            }
+            // Has narrowing pinned it to one bare non-null member (then unboxed)?
+            const member = findVariant(reprInfo, t);
+            const narrowedToBareMember = !!member &&
+              variantTag(reprInfo, t) !== reprInfo.nullTag && !unionInfo(t);
+            return { info: reprInfo, isBox: !narrowedToBareMember };
+          };
+          const leftU = unionOperand(node.left);
+          const rightU = unionOperand(node.right);
+          // Pick the box side that is still a runtime box. (A narrowed-to-bare
+          // operand has `isBox: false`; treat it as the concrete side.)
+          const leftIsBox = !!leftU && leftU.isBox;
+          const rightIsBox = !!rightU && rightU.isBox;
+          if (leftIsBox || rightIsBox) {
+            const neg = (e: number) => op === "==" ? e : m.i32.eqz(e);
+            // --- union == concrete (either order) ---
+            if (leftIsBox !== rightIsBox) {
+              const boxNode = leftIsBox ? node.left : node.right;
+              const otherNode = leftIsBox ? node.right : node.left;
+              const info = (leftIsBox ? leftU! : rightU!).info;
+              const otherType = softenImplicitType(codegenType(otherNode));
+              const member = findVariant(info, otherType);
+              if (!member) {
+                // No arm has the other operand's rep: the box can never hold a
+                // value of that type, so the comparison is statically false (`==`)
+                // / true (`!=`). Evaluate both operands for side effects.
+                return m.block(null, [
+                  m.drop(toExpression(boxNode)),
+                  m.drop(toExpression(otherNode)),
+                  m.i32.const(op === "==" ? 0 : 1),
+                ], binaryen.i32);
+              }
+              const tag = tagOf(variantKey(otherType));
+              const boxLocal = newLocal(info.refType);
+              const box = () => m.local.get(boxLocal, info.refType);
+              const tagEq = m.i32.eq(
+                m.struct.get(0, box(), binaryen.i32, false),
+                m.i32.const(tag),
+              );
+              const payload = () =>
+                unboxPayload(
+                  info,
+                  member,
+                  m.struct.get(1, box(), info.payloadWasm, false),
+                );
+              const other = () =>
+                withDesiredType(member, () => toExpression(otherNode));
+              // SHORT-CIRCUIT on the tag — the unbox (`ref.cast` for the boxed
+              // kind) would trap on a wrong-rep arm, so only reach the value
+              // compare once the tag matched. Hoist the box into a local so the
+              // tag read and the payload read share one evaluation.
+              return m.block(null, [
+                m.local.set(boxLocal, toExpression(boxNode)),
+                neg(m.if(
+                  tagEq,
+                  valueEq(member, payload, other),
+                  m.i32.const(0),
+                )),
+              ], binaryen.i32);
+            }
+            // --- union == union ---
+            // Equal iff same arm (tag) AND the unboxed payloads compare equal per
+            // that arm. Both operands are boxes here.
+            const lInfo = leftU!.info;
+            const rInfo = rightU!.info;
+            const lLocal = newLocal(lInfo.refType);
+            const rLocal = newLocal(rInfo.refType);
+            const lBox = () => m.local.get(lLocal, lInfo.refType);
+            const rBox = () => m.local.get(rLocal, rInfo.refType);
+            const lTag = () => m.struct.get(0, lBox(), binaryen.i32, false);
+            const rTag = () => m.struct.get(0, rBox(), binaryen.i32, false);
+            // Per shared variant (matched by tag) compare the unboxed payloads with
+            // `valueEq`; a null arm has no payload, so tag equality alone decides
+            // it (same tag ⇒ both null ⇒ equal).
+            const arms = lInfo.variants.filter((lv) =>
+              rInfo.variants.some((rv) => variantKey(rv) === variantKey(lv))
+            );
+            // Fold the arms into a nested `if (lTag == armTag) <payload-eq> else …`,
+            // bottoming out at the tag-equality result (covers the `null` arm and
+            // any non-shared arm: distinct tags ⇒ unequal, equal null tags ⇒ equal).
+            let chain = m.i32.eq(lTag(), rTag());
+            for (const arm of arms) {
+              const tag = tagOf(variantKey(arm));
+              const lPayload = () =>
+                unboxPayload(
+                  lInfo,
+                  arm,
+                  m.struct.get(1, lBox(), lInfo.payloadWasm, false),
+                );
+              const rPayload = () =>
+                unboxPayload(
+                  rInfo,
+                  arm,
+                  m.struct.get(1, rBox(), rInfo.payloadWasm, false),
+                );
+              chain = m.if(
+                m.i32.eq(lTag(), m.i32.const(tag)),
+                // left holds this arm: equal iff the right holds the same arm and
+                // the payloads match. SHORT-CIRCUIT on the right tag too — the
+                // payload unbox (`ref.cast`) would trap on a wrong-rep arm, so only
+                // reach `valueEq` (which reads both payloads) when both tags match.
+                m.if(
+                  m.i32.eq(rTag(), m.i32.const(tag)),
+                  valueEq(arm, lPayload, rPayload),
+                  m.i32.const(0),
+                ),
+                chain,
+              );
+            }
+            return m.block(null, [
+              m.local.set(lLocal, toExpression(node.left)),
+              m.local.set(rLocal, toExpression(node.right)),
+              neg(chain),
+            ], binaryen.i32);
+          }
+        }
         // Function values compare by reference (same function + same env).
         if (leftType.type === "Function" && (op === "==" || op === "!=")) {
           const clo = closureStruct().refType;
