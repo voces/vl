@@ -148,6 +148,13 @@ export const _typeFromExpression = (
       // operand so both type-checking and codegen see the concrete type.
       // TODO: when there's a concrete flow.desiredType, prefer it over the default
       // (so `f64 x = 2 + 3` makes the literals f64) with range checking.
+      //
+      // Keep the un-softened left type for the structural `==`/`!=` union check
+      // below: `7 == v` softens the literal `7` to `i32`, which is no longer
+      // assignable to a single arm of `v`'s union — so the comparability test
+      // must see the original literal (the right operand is never softened, which
+      // is why the mirror case `v == 7` already works).
+      const rawLeftType = leftType;
       if (
         leftType.type === "IntegerLiteral" || leftType.type === "RealLiteral" ||
         leftType.type === "StringLiteral"
@@ -213,10 +220,21 @@ export const _typeFromExpression = (
       // other — e.g. discriminating `s == "expense"`). Codegen lowers it through
       // the softened base type's equality (numeric / string / struct), and the
       // literal narrowing (`atomFact`) refines the place in the branch.
+      //
+      // Equality is symmetric, so the union may sit on EITHER side: `v == 7` and
+      // `7 == v` are both accepted (a value-union vs. a value matching some arm).
+      // Codegen handles both orders (PR #200); the comparability test below is
+      // already order-independent.
+      const isValueUnion = (t: VLType) =>
+        t.type === "Union" || t.type === "Nullable";
       if (
         (op === "==" || op === "!=") &&
-        (leftType.type === "Union" || leftType.type === "Nullable") &&
-        (validateType(leftType, rightType) || validateType(rightType, leftType))
+        (isValueUnion(leftType) || isValueUnion(rightType)) &&
+        (validateType(leftType, rightType) ||
+          validateType(rightType, leftType) ||
+          // Reversed form `7 == v`: test the union (right) against the original,
+          // un-softened left operand so a literal still matches one of its arms.
+          validateType(rightType, rawLeftType))
       ) {
         return { type: "Alias", name: "boolean" };
       }
