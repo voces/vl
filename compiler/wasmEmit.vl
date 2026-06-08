@@ -318,6 +318,10 @@ let fRetArr: i32[] = []
 // `docs/strings-design.md`), so a string return reuses the array ref valtype.
 let fRetStr: i32[] = []
 
+// Parallel to `fnNames`: `1` if the i-th function's declared RETURN type is the union
+// alias, else `0`. Populated by `buildFnMap` so `fnRetUnion` is a flat lookup.
+let fRetUni: i32[] = []
+
 // Scan the program's top-level statements into `fnStmts` (FuncDecls only, in order),
 // skipping `TypeDecl`s. Any other top-level statement fails loudly. Returns the
 // function count, or -1 (via `emitFail`).
@@ -329,6 +333,8 @@ function collectFns(stmts: i32[]): i32 {
     if s is FuncDecl {
       fnStmts.push(stmts[i])
     } else if nodeIsTypeDecl(stmts[i]) {
+    } else if s is UnionDecl {
+      // A `type N = A | B` union alias — collected by `collectU`, skipped here.
     } else {
       return emitFail("emitProgram: top-level statement is not a function or type")
     }
@@ -345,6 +351,7 @@ function buildFnMap(stmts: i32[]): i32 {
   fRetRef = []
   fRetArr = []
   fRetStr = []
+  fRetUni = []
   let i = 0
   while i < fnStmts.length {
     let s = P.nodes[fnStmts[i]]
@@ -354,6 +361,7 @@ function buildFnMap(stmts: i32[]): i32 {
       fRetRef.push(retTRFlag(s.fnRet))
       fRetArr.push(retArrFlag(s.fnRet))
       fRetStr.push(retStrFlag(s.fnRet))
+      fRetUni.push(retUnionFlag(s.fnRet))
     }
     i = i + 1
   }
@@ -486,6 +494,60 @@ let aTypeIdx: i32 = 0
 let lUsed: boolean = false
 let lTypeIdx: i32 = 0
 
+// ── discriminated-union table (G1: struct unions + `is`-narrowing) ────────────
+// A program may declare ONE union alias `type N = A | B | …` (a `UnionDecl`) whose
+// members are struct `type`s (each a `TypeDecl`). When a union IS declared, the
+// emitter switches off the single-struct path above and instead lowers, mirroring
+// `toWasm.ts`'s boxed-union encoding (`docs/unions.md` §boxed tagged struct):
+//
+//   • the UNION BOX `{ tag: i32, value: anyref }` — a 2-field GC struct (tag
+//     immutable, value immutable `anyref`). A union VALUE is one of these. Its
+//     heap-type index is `uBoxIdx`.
+//   • one VARIANT STRUCT per member — a GC struct of the member's i32 fields in
+//     DECLARATION order (NOT sorted: this emitter owns BOTH construction and
+//     access, so a self-consistent order is sufficient and avoids a separate
+//     sorted payload-box type). The i-th variant struct's heap-type index is
+//     `uVarIdx + i`.
+//
+// Construction of variant A: `struct.new $box (i32.const tagOf(A)) (struct.new $A
+// <fields…>)` — the variant payload boxed into the `anyref` slot. `n is A` reads
+// the box tag (`struct.get $box 0`) and `i32.eq tagOf(A)`. A narrowed field read
+// `n.f` (inside `if n is A`) is `struct.get $A <fieldIdx> (ref.cast (ref $A)
+// (struct.get $box 1 n))` — recover the payload from `anyref`, cast to the
+// variant, read the field. Tags are assigned by SORTED structural signature
+// (sorted field-name list), matching `toWasm.ts`'s `variantKey` ordering so the
+// representation is faithful; since there is no cross-module value flow here, any
+// stable order would also be self-consistent.
+//
+// `uVariants` holds the variant struct NAMES in source (declaration) order, which
+// is ALSO the heap-type order (`uVarIdx + i`). `uTags[i]` is the global tag of the
+// i-th variant. The variant structs' fields live in the flat struct table below.
+let uDeclared: boolean = false
+let uName: string = ""
+let uVariants: string[] = []
+let uTags: i32[] = []
+let uBoxIdx: i32 = 0
+let uVarIdx: i32 = 0
+
+// ── flat multi-struct field table (union variant structs) ─────────────────────
+// Parallel to `uVariants`: variant struct `i` owns the field names
+// `uFieldNames[uFieldStart[i] .. uFieldStart[i] + uFieldCount[i]]`, all i32, in
+// declaration order (= wasm struct field index). A flat backing store sidesteps a
+// `string[][]` (which the codebase avoids). Built by `collectU`.
+let uFieldNames: string[] = []
+let uFieldStart: i32[] = []
+let uFieldCount: i32[] = []
+
+// ── active `is`-narrowing scope ───────────────────────────────────────────────
+// When emitting the THEN-branch of `if n is A { … }`, the union-typed identifier
+// `n` is narrowed to variant `A`, so a field read `n.f` in that branch lowers to
+// the downcast. `narrowName`/`narrowVariant` hold the single active narrowing (one
+// at a time is enough for the slice's `if n is A { return n.f }` shape); they are
+// saved/restored around the branch so nesting and the else-branch see the right
+// scope.
+let narrowName: string = ""
+let narrowVariant: string = ""
+
 // Append the declared-local name `name` to `localNames` if not already present.
 function addLocalName(name: string, isRef: i32): i32 {
   let i = 0
@@ -514,7 +576,9 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
     while i < stmts.length {
       let s = P.nodes[stmts[i]]
       if s is LetDecl {
-        if letIsStruct(stmts[i], fnIx) {
+        if letIsUnion(stmts[i], fnIx) {
+          addLocalName(s.letName, 4)
+        } else if letIsStruct(stmts[i], fnIx) {
           addLocalName(s.letName, 1)
         } else if letIsArray(stmts[i], fnIx) {
           addLocalName(s.letName, 2)
@@ -825,9 +889,133 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected an object literal")
 }
 
+// ── union value construction + discrimination + narrowing (G1) ────────────────
+
+// Lower the VARIANT-PAYLOAD struct for an object literal `{ f: v, … }` matching union
+// variant `vi`: push each field value in the variant's DECLARATION field order, then
+// `struct.new $<uVarIdx + vi>`. (No box yet — `emitUnionBox` wraps this.)
+function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32): i32 {
+  let start = uFieldStart[vi]
+  let cnt = uFieldCount[vi]
+  let fj = 0
+  while fj < cnt {
+    let valIx = objFieldVal(objIx, uFieldNames[start + fj])
+    if valIx < 0 {
+      return emitFail("emitProgram: object literal is missing a union-variant field")
+    }
+    if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+    fj = fj + 1
+  }
+  body.push(251)             // 0xfb GC prefix
+  body.push(0)               // struct.new
+  appendAll(body, ulebToArr(uVarIdx + vi))   // variant struct heap-type index
+  0
+}
+
+// Lower an object literal `{ f: v, … }` BOXED into the declared union onto `body`:
+//   struct.new $box (i32.const tagOf(variant)) (struct.new $variant <fields…>)
+// i.e. push the variant's global tag, build the variant payload struct, then
+// `struct.new $uBoxIdx` to wrap `{ tag, value }`. The literal must match exactly one
+// union variant's field-name set, else fails loudly.
+function emitUnionBox(body: i32[], objIx: i32, fnIx: i32): i32 {
+  let vname = objVariantName(objIx)
+  if vname == "" {
+    return emitFail("emitProgram: object literal matches no union variant")
+  }
+  let vi = variantIndexOf(vname)
+  // tag first (struct field 0 of the box), then the boxed payload (field 1).
+  body.push(65)              // 0x41 i32.const
+  appendAll(body, slebToArr(uTags[vi]))
+  if emitVariantStruct(body, objIx, vi, fnIx) < 0 { return 0 - 1 }
+  body.push(251)             // 0xfb GC prefix
+  body.push(0)               // struct.new
+  appendAll(body, ulebToArr(uBoxIdx))        // union box heap-type index
+  0
+}
+
+// Lower a type guard `recv is Variant` onto `body` as the box-tag compare (mirroring
+// `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag),
+// then `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
+function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
+  if !uDeclared {
+    return emitFail("emitProgram: `is` test but no union type declared")
+  }
+  let nd = P.nodes[isIx]
+  if nd is IsExpr {
+    let vi = variantIndexOf(nd.isVariant)
+    if vi < 0 {
+      return emitFail("emitProgram: `is` names a type that is not a union variant")
+    }
+    if !exprUnion(nd.isObj, fnIx) {
+      return emitFail("emitProgram: `is` receiver is not a union value")
+    }
+    if emitExpr(body, nd.isObj, fnIx) < 0 { return 0 - 1 }
+    body.push(251)           // 0xfb GC prefix
+    body.push(2)             // struct.get
+    appendAll(body, ulebToArr(uBoxIdx))      // union box heap-type index
+    body.push(0)             // field 0: tag
+    body.push(65)            // 0x41 i32.const
+    appendAll(body, slebToArr(uTags[vi]))
+    body.push(70)            // 0x46 i32.eq
+    return 0
+  }
+  emitFail("emitProgram: expected an `is` expression")
+}
+
+// Lower a narrowed field read `recv.field` where `recv` is a union value narrowed (by
+// an enclosing `if recv is Variant`) to `narrowVariant`. The downcast mirrors
+// `toWasm.ts`: evaluate the box, `struct.get $box 1` (the `anyref` value), `ref.cast
+// (ref $variant)` to recover the payload, then `struct.get $variant <fieldIdx>`.
+//   ref.cast is `0xfb 0x16 <heaptype>` (non-null target — the box value is never null).
+function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32): i32 {
+  let m = P.nodes[memIx]
+  if m is Member {
+    let vi = variantIndexOf(narrowVariant)
+    if vi < 0 {
+      return emitFail("emitProgram: narrowed receiver names no union variant")
+    }
+    let idx = variantFieldIndex(vi, m.memProp)
+    if idx < 0 {
+      return emitFail("emitProgram: unknown variant field in narrowed field access")
+    }
+    if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
+    body.push(251)           // 0xfb GC prefix
+    body.push(2)             // struct.get
+    appendAll(body, ulebToArr(uBoxIdx))      // union box heap-type index
+    body.push(1)             // field 1: value (anyref)
+    body.push(251)           // 0xfb GC prefix
+    body.push(22)            // 0x16 ref.cast (non-null)
+    appendAll(body, ulebToArr(uVarIdx + vi)) // cast target: the variant struct
+    body.push(251)           // 0xfb GC prefix
+    body.push(2)             // struct.get
+    appendAll(body, ulebToArr(uVarIdx + vi)) // variant struct heap-type index
+    appendAll(body, ulebToArr(idx))          // field index
+    return 0
+  }
+  emitFail("emitProgram: expected a field access")
+}
+
+// True if the member access at `memIx` reads a field of the currently-narrowed union
+// identifier (`recv` is the bare `Ident narrowName`, narrowed to `narrowVariant`).
+function memIsNarrowed(memIx: i32): boolean {
+  if narrowName == "" { return false }
+  let m = P.nodes[memIx]
+  if m is Member {
+    let recv = P.nodes[m.memObj]
+    if recv is Ident {
+      if recv.identName == narrowName { return true }
+    }
+  }
+  false
+}
+
 // Lower a field read `recv.field` onto `body`: evaluate the receiver (must be a
 // struct), then `struct.get $0 <fieldidx>` (`0xfb 0x02 0x00 idx`).
 function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
+  // A field read on a NARROWED union identifier downcasts through the box (G1).
+  if memIsNarrowed(memIx) {
+    return emitNarrowedMem(body, memIx, fnIx)
+  }
   if !sDeclared {
     return emitFail("emitProgram: field access but no struct type declared")
   }
@@ -1159,7 +1347,15 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
   if e is Call {
     return emitCall(body, exprIx, fnIx)
   }
+  if e is IsExpr {
+    return emitIs(body, exprIx, fnIx)
+  }
   if e is ObjLit {
+    // In a union program every object literal is a union variant: box it `{tag, value}`.
+    // Otherwise it constructs the single direct struct.
+    if uDeclared {
+      return emitUnionBox(body, exprIx, fnIx)
+    }
     return emitObj(body, exprIx, fnIx)
   }
   if e is StrLit {
@@ -1460,6 +1656,26 @@ function pushListBacking(body: i32[], lIdx: i32): i32 {
   0
 }
 
+// If the `if` condition at `condIx` is `n is Variant` over a bare union identifier
+// `n`, set the active narrowing (`narrowName`/`narrowVariant`) so the then-branch's
+// `n.field` reads downcast through the box, and return true. Otherwise leave the
+// narrowing untouched and return false. A non-identifier receiver (e.g. `f(x) is A`)
+// is not narrowable (no stable name to re-read) and is left un-narrowed.
+function setNarrowFromCond(condIx: i32, fnIx: i32): boolean {
+  let c = P.nodes[condIx]
+  if c is IsExpr {
+    let recv = P.nodes[c.isObj]
+    if recv is Ident {
+      if exprUnion(c.isObj, fnIx) {
+        narrowName = recv.identName
+        narrowVariant = c.isVariant
+        return true
+      }
+    }
+  }
+  false
+}
+
 // Lower a single statement at `stmtIx` onto `body`, resolving identifiers/params
 // against function `fnIx`. Returns 0, or -1 (via `emitFail`) on an unsupported shape.
 //
@@ -1528,11 +1744,22 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     if emitExpr(body, s.ifCond, fnIx) < 0 { return 0 - 1 }
     body.push(4)             // 0x04 if
     body.push(64)            // 0x40 void blocktype
+    // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
+    // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
+    // outer narrowing around the branch so nesting and the else-branch are unaffected.
+    let savedName = narrowName
+    let savedVariant = narrowVariant
+    let narrowed = setNarrowFromCond(s.ifCond, fnIx)
     if emitStmts(body, s.ifThen, fnIx) < 0 { return 0 - 1 }
+    if narrowed {
+      narrowName = savedName
+      narrowVariant = savedVariant
+    }
     if s.ifElse >= 0 {
       body.push(5)           // 0x05 else
       // The else may be a Block or a nested IfStmt (`else if`); both go through
-      // `emitStmt` (a lone statement) — a Block re-enters `emitStmts`.
+      // `emitStmt` (a lone statement) — a Block re-enters `emitStmts`. The narrowing
+      // does NOT hold in the else-branch (the guard was false there).
       let els = P.nodes[s.ifElse]
       if els is Block {
         if emitStmts(body, s.ifElse, fnIx) < 0 { return 0 - 1 }
@@ -1603,9 +1830,11 @@ function checkParams(fnIx: i32): i32 {
           // already validated every array annotation is i32[].)
           if ty.tyName != "i32" {
             if !isSName(ty.tyName) {
-              if !nameIsArray(ty.tyName) {
-                if !nameIsString(ty.tyName) {
-                  return emitFail("emitProgram: only i32, struct, array, or string parameters are supported")
+              if !isUName(ty.tyName) {
+                if !nameIsArray(ty.tyName) {
+                  if !nameIsString(ty.tyName) {
+                    return emitFail("emitProgram: only i32, struct, union, array, or string parameters are supported")
+                  }
                 }
               }
             }
@@ -1749,9 +1978,22 @@ function retStrFlag(tyIx: i32): i32 {
 // is a distinct code from array purely for typedness clarity; `pushVT` emits the SAME
 // array ref valtype for both, since a string IS the i32-array type here.
 function vtKindOfType(tyIx: i32): i32 {
+  if retUnionFlag(tyIx) == 1 { return 4 }
   if retTRFlag(tyIx) == 1 { return 1 }
   if retArrFlag(tyIx) == 1 { return 2 }
   if retStrFlag(tyIx) == 1 { return 3 }
+  0
+}
+
+// `1` if the type-annotation node at `tyIx` names the declared union alias, else `0`.
+// Feeds the `kind == 4` (union box) branch of `pushVT`.
+function retUnionFlag(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if isUName(ty.tyName) { return 1 }
+    }
+  }
   0
 }
 
@@ -1786,6 +2028,9 @@ function pushVT(payload: i32[], kind: i32): i32 {
   } else if kind == 3 {
     payload.push(100)          // 0x64 (ref ht) — non-null ref
     appendAll(payload, ulebToArr(aTypeIdx))   // the raw i32 array heap-type index (string)
+  } else if kind == 4 {
+    payload.push(100)          // 0x64 (ref ht) — non-null ref
+    appendAll(payload, ulebToArr(uBoxIdx))    // the union box `{tag, value}` heap-type index
   } else {
     payload.push(127)          // 0x7f i32
   }
@@ -1811,15 +2056,26 @@ function emitModule(stmts: i32[]): i32 {
   // is their sum — the index the first functype lands at. `aTypeIdx` (the raw array
   // heap-type index) is `structOffset`; `lTypeIdx` (the list wrapper struct, which
   // REFERENCES the raw array, so it MUST follow it) is `structOffset + arrayOffset`.
+  // The union path (mutually exclusive with the single-struct path: `sDeclared` is
+  // false when `uDeclared`). When a union is declared, its `nv` variant structs occupy
+  // the FIRST `nv` heap-type indices (`uVarIdx = 0`), the union box `{tag, value}`
+  // follows at `uBoxIdx = nv`, and any array/list/functypes come after.
   let structOffset = 0
   if sDeclared { structOffset = 1 }
+  let unionOffset = 0
+  if uDeclared {
+    uVarIdx = 0
+    uBoxIdx = uVariants.length
+    unionOffset = uVariants.length + 1   // nv variant structs + 1 union box
+  }
+  let preTypes = structOffset + unionOffset
   let arrayOffset = 0
   if aUsed { arrayOffset = 1 }
   let listOffset = 0
   if lUsed { listOffset = 1 }
-  aTypeIdx = structOffset
-  lTypeIdx = structOffset + arrayOffset
-  let typeOffset = structOffset + arrayOffset + listOffset
+  aTypeIdx = preTypes
+  lTypeIdx = preTypes + arrayOffset
+  let typeOffset = preTypes + arrayOffset + listOffset
 
   // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
   // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`);
@@ -1839,6 +2095,33 @@ function emitModule(stmts: i32[]): i32 {
       typePayload.push(1)        // mutable
       sf = sf + 1
     }
+  }
+  if uDeclared {
+    // The `nv` variant structs FIRST (heap types 0..nv-1), each a struct of its i32
+    // fields in declaration order (`0x5f` struct, count, then `0x7f 0x01` per field —
+    // mutable i32). Then the union BOX `{ tag: i32, value: anyref }` at index `nv`:
+    // `0x5f` struct, 2 fields — `0x7f 0x00` (i32, IMMUTABLE tag) and `0x6e 0x00`
+    // (`anyref` abbreviation, IMMUTABLE value) — mirroring binaryen's `5f 02 7f 00
+    // 6e 00` (verified against `toWasm.ts`'s `unionStruct`).
+    let vi = 0
+    while vi < uVariants.length {
+      typePayload.push(95)       // 0x5f struct
+      let cnt = uFieldCount[vi]
+      appendAll(typePayload, ulebToArr(cnt))
+      let fj = 0
+      while fj < cnt {
+        typePayload.push(127)    // 0x7f i32 storagetype
+        typePayload.push(1)      // mutable
+        fj = fj + 1
+      }
+      vi = vi + 1
+    }
+    typePayload.push(95)         // 0x5f struct (union box)
+    typePayload.push(2)          // 2 fields
+    typePayload.push(127)        // field 0 tag: 0x7f i32
+    typePayload.push(0)          // immutable
+    typePayload.push(110)        // field 1 value: 0x6e anyref
+    typePayload.push(0)          // immutable
   }
   if aUsed {
     typePayload.push(94)         // 0x5e array
@@ -2032,6 +2315,12 @@ function nodeIsTypeDecl(ix: i32): boolean {
 function collectS(stmts: i32[]): i32 {
   sDeclared = false
   sFields = []
+  // When the program declares a union, every struct `type` is a union variant and
+  // is collected by `collectU` into the multi-struct table instead — so the
+  // single-struct path stays off (and the one-struct cap does not apply).
+  if uDeclared {
+    return 0
+  }
   let i = 0
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
@@ -2067,6 +2356,176 @@ function collectS(stmts: i32[]): i32 {
     i = i + 1
   }
   0
+}
+
+// ── union collection (G1) ─────────────────────────────────────────────────────
+// The struct field names of the `TypeDecl` named `name` are recorded into the flat
+// `uFieldNames`/`uFieldStart`/`uFieldCount` table (declaration order, all i32). The
+// struct must exist among the top-level statements and carry only i32 fields, else
+// fails loudly. Returns 0, or -1 (via `emitFail`).
+function collectVariantFields(stmts: i32[], name: string): i32 {
+  let i = 0
+  while i < stmts.length {
+    let s = P.nodes[stmts[i]]
+    if s is TypeDecl {
+      if s.tdName == name {
+        uFieldStart.push(uFieldNames.length)
+        let fields = s.tdFields
+        let cnt = 0
+        let fi = 0
+        while fi < fields.length {
+          let fnode = P.nodes[fields[fi]]
+          if fnode is FieldDef {
+            if fnode.fdType < 0 {
+              return emitFail("emitProgram: only i32 union-variant fields are supported")
+            }
+            let ty = P.nodes[fnode.fdType]
+            if ty is TypeRef {
+              if ty.tyName != "i32" {
+                return emitFail("emitProgram: only i32 union-variant fields are supported")
+              }
+            } else {
+              return emitFail("emitProgram: union-variant field type is not a type name")
+            }
+            uFieldNames.push(fnode.fdName)
+            cnt = cnt + 1
+          } else {
+            return emitFail("emitProgram: malformed union-variant field")
+          }
+          fi = fi + 1
+        }
+        uFieldCount.push(cnt)
+        return 0
+      }
+    }
+    i = i + 1
+  }
+  emitFail("emitProgram: union variant names an unknown struct type")
+}
+
+// The structural signature of variant `vi` — its field names joined with `,` (a
+// stable per-shape key). Two variants with the same field-name set share a sig (and
+// so, under structural typing, are the same variant — `docs/unions.md`); the slice's
+// AST-style unions use DISTINCT field-name prefixes per variant, so every sig differs.
+function variantSig(vi: i32): string {
+  let out = ""
+  let start = uFieldStart[vi]
+  let cnt = uFieldCount[vi]
+  let j = 0
+  while j < cnt {
+    if j > 0 { out = out + "," }
+    out = out + uFieldNames[start + j]
+    j = j + 1
+  }
+  out
+}
+
+// Lexicographic `a < b` over two strings by code point (VL has no `<` on `string`).
+// Compares char-by-char: at the first differing position the smaller code point wins;
+// if one is a prefix of the other, the shorter is smaller. Equal strings are NOT `<`.
+function strLess(a: string, b: string): boolean {
+  let i = 0
+  let na = a.length
+  let nb = b.length
+  while i < na && i < nb {
+    let ca = a[i]
+    let cb = b[i]
+    if ca < cb { return true }
+    if ca > cb { return false }
+    i = i + 1
+  }
+  na < nb
+}
+
+// Assign each variant its GLOBAL tag = its rank when the variants are ordered by
+// structural signature (mirroring `toWasm.ts`'s sorted `variantKey` tag assignment).
+// `uTags[i]` is variant i's tag: the number of variants whose sig sorts strictly
+// before variant i's (sigs are distinct, so this is a dense 0..n-1 permutation).
+function assignTags(): i32 {
+  uTags = []
+  let i = 0
+  while i < uVariants.length {
+    let sigI = variantSig(i)
+    let rank = 0
+    let j = 0
+    while j < uVariants.length {
+      if j != i {
+        let sigJ = variantSig(j)
+        if strLess(sigJ, sigI) { rank = rank + 1 }
+      }
+      j = j + 1
+    }
+    uTags.push(rank)
+    i = i + 1
+  }
+  0
+}
+
+// Scan the top-level statements for a union alias `type N = A | B | …` (a
+// `UnionDecl`); if found, record its name + variant struct names, collect each
+// variant's i32 fields into the flat table, and assign global tags. At most one union
+// per program (a second fails loudly). Returns 0, or -1 (via `emitFail`).
+function collectU(stmts: i32[]): i32 {
+  uDeclared = false
+  uVariants = []
+  uFieldNames = []
+  uFieldStart = []
+  uFieldCount = []
+  let i = 0
+  while i < stmts.length {
+    let s = P.nodes[stmts[i]]
+    if s is UnionDecl {
+      if uDeclared {
+        return emitFail("emitProgram: only one union type per program is supported")
+      }
+      uName = s.udName
+      uDeclared = true
+      let vs = s.udVariants
+      if vs.length < 1 {
+        return emitFail("emitProgram: union must have at least one variant")
+      }
+      let vi = 0
+      while vi < vs.length {
+        uVariants.push(vs[vi])
+        if collectVariantFields(stmts, vs[vi]) < 0 { return 0 - 1 }
+        vi = vi + 1
+      }
+    }
+    i = i + 1
+  }
+  if uDeclared {
+    if assignTags() < 0 { return 0 - 1 }
+  }
+  0
+}
+
+// The position of variant struct `name` in `uVariants` (its heap-type is `uVarIdx +
+// pos`), or -1 if `name` is not a variant of the declared union.
+function variantIndexOf(name: string): i32 {
+  let i = 0
+  while i < uVariants.length {
+    if uVariants[i] == name { return i }
+    i = i + 1
+  }
+  0 - 1
+}
+
+// True if the type-name `name` is the declared union alias.
+function isUName(name: string): boolean {
+  uDeclared && name == uName
+}
+
+// The wasm struct field index of `field` within variant `vi` (declaration order), or
+// -1 if that variant has no such field.
+function variantFieldIndex(vi: i32, field: string): i32 {
+  let start = uFieldStart[vi]
+  let cnt = uFieldCount[vi]
+  let j = 0
+  while j < cnt {
+    if uFieldNames[start + j] == field { return j }
+    j = j + 1
+  }
+  0 - 1
 }
 
 // True if the function `name` declares the struct as its return type (flat lookup
@@ -2149,6 +2608,121 @@ function letIsStruct(letIx: i32, fnIx: i32): boolean {
     return exprStruct(d.letInit, fnIx)
   }
   false
+}
+
+// ── union-typedness of expressions (G1) ───────────────────────────────────────
+// Parallel to the struct family: decide whether an expression / param / local / let
+// is the declared UNION (a `(ref $uBoxIdx)` boxed value). Unlike structs, an object
+// literal's INTRINSIC type is its variant struct, NOT the union — boxing happens at a
+// flow boundary (a `let n: U = …`, a union-returning `return`, a union-typed arg). So
+// `exprUnion` is true for a union-returning call / union param / union local, but NOT
+// a bare object literal (its boxing is driven by the EXPECTED type at the boundary).
+
+// True if function `name` declares the union as its return type.
+function fnRetUnion(name: string): boolean {
+  let i = 0
+  while i < fnNames.length {
+    if fnNames[i] == name { return fRetUni[i] == 1 }
+    i = i + 1
+  }
+  false
+}
+
+// True if the parameter `name` of function `fnIx` is the union type.
+function paramUnion(fnIx: i32, name: string): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef { return isUName(ty.tyName) }
+          }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the already-collected declared local `name` is a union ref (code `4`).
+function declaredUnion(name: string): boolean {
+  let i = 0
+  while i < localNames.length {
+    if localNames[i] == name {
+      return localIsRef[i] == 4
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True if evaluating the expression at `exprIx` yields the union box: a union-returning
+// call, a union param/local reference, or a parenthesized union expression. (A bare
+// object literal is NOT a union here — see the family note.)
+function exprUnion(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Paren { return exprUnion(e.parInner, fnIx) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident { return fnRetUnion(callee.identName) }
+    return false
+  }
+  if e is Ident {
+    if paramUnion(fnIx, e.identName) { return true }
+    return declaredUnion(e.identName)
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` declares a union-typed local: its annotation names
+// the union, OR its initializer produces the union (a union-returning call etc.). An
+// object-literal init under a union annotation is BOXED as the union (`emitStmt`).
+function letIsUnion(letIx: i32, fnIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if isUName(lt.tyName) { return true }
+      }
+    }
+    return exprUnion(d.letInit, fnIx)
+  }
+  false
+}
+
+// The variant struct name an object literal at `objIx` matches: the union variant
+// whose field-name set EQUALS the literal's field names (order-independent), or "" if
+// none. Used to pick the tag + variant struct when boxing an object literal into the
+// union.
+function objVariantName(objIx: i32): string {
+  let o = P.nodes[objIx]
+  if o is ObjLit {
+    let vi = 0
+    while vi < uVariants.length {
+      let cnt = uFieldCount[vi]
+      if cnt == o.objFields.length {
+        let start = uFieldStart[vi]
+        let allMatch = true
+        let fj = 0
+        while fj < cnt {
+          if objFieldVal(objIx, uFieldNames[start + fj]) < 0 { allMatch = false }
+          fj = fj + 1
+        }
+        if allMatch { return uVariants[vi] }
+      }
+      vi = vi + 1
+    }
+  }
+  ""
 }
 
 // ── array-typedness of expressions ───────────────────────────────────────────
@@ -2333,6 +2907,8 @@ function letIsString(letIx: i32, fnIx: i32): boolean {
 function emitProgram(rootIx: i32): i32 {
   emitFailed = false
   emitErr = ""
+  narrowName = ""
+  narrowVariant = ""
   if rootIx < 0 {
     return emitFail("emitProgram: empty arena (root index < 0)")
   }
@@ -2342,10 +2918,12 @@ function emitProgram(rootIx: i32): i32 {
     if stmts.length < 1 {
       return emitFail("emitProgram: expected at least one top-level statement")
     }
-    // Collect the (single) struct type FIRST so param/return/local checks can
-    // recognize its name, then the function list (FuncDecls only), then the name→index
-    // map. Forward references and recursion resolve because every name is mapped
-    // before any body is emitted.
+    // Collect the union alias FIRST (so `collectS` knows whether the program's
+    // structs are union variants vs a single direct struct), then the (single)
+    // struct type, so param/return/local checks can recognize its name, then the
+    // function list (FuncDecls only), then the name→index map. Forward references and
+    // recursion resolve because every name is mapped before any body is emitted.
+    if collectU(stmts) < 0 { return 0 - 1 }
     if collectS(stmts) < 0 { return 0 - 1 }
     if collectA(stmts) < 0 { return 0 - 1 }
     if collectFns(stmts) < 0 { return 0 - 1 }

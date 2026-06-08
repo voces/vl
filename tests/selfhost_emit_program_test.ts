@@ -885,6 +885,178 @@ const CASES: Case[] = [
       if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
     },
   },
+  // ── discriminated unions + `is`-narrowing (G1) ─────────────────────────────
+  // A `type N = A | B | …` union alias lowers to the BOXED tagged-struct rep
+  // (mirroring `toWasm.ts`/`docs/unions.md`): a union VALUE is a `{ tag: i32, value:
+  // anyref }` box wrapping the variant payload struct; `is A` is a box-tag compare;
+  // a narrowed field read `n.f` (inside `if n is A`) recovers + `ref.cast`s the
+  // payload then `struct.get`s the field. These prove real `WebAssembly.instantiate`
+  // over the VL-emitted GC bytes — source → arena → bytes → engine — for construction,
+  // discrimination, narrowing, and union values across locals/params/returns. Variant
+  // structs are NOT directly JS-callable (they ride in a `(ref $box)`), so the proofs
+  // construct + discriminate internally and return i32s.
+  {
+    name: "construct a variant, `is`-narrow it, read a variant field => 7",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type Node = A | B",
+      "function f(n: Node): i32 {",
+      "  if n is A { return n.av }",
+      "  return 0",
+      "}",
+      "function mkA(x: i32): Node {",
+      "  return { av: x }",
+      "}",
+      "function main(): i32 {",
+      "  return f(mkA(7))",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    name: "a false `is` takes the other branch (B value through `is A` => 0)",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type Node = A | B",
+      "function f(n: Node): i32 {",
+      "  if n is A { return n.av }",
+      "  return 99",
+      "}",
+      "function mkB(x: i32): Node {",
+      "  return { bv: x }",
+      "}",
+      "function main(): i32 {",
+      "  return f(mkB(5))",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `mkB(5)` is tagged B, so `is A` is false and the function returns 99.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 99) throw new Error(`main() returned ${got}, expected 99`);
+    },
+  },
+  {
+    name: "two variants discriminated, each reads its own field (7 + 9 => 16)",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type Node = A | B",
+      "function val(n: Node): i32 {",
+      "  if n is A { return n.av }",
+      "  if n is B { return n.bv }",
+      "  return 0",
+      "}",
+      "function mkA(x: i32): Node {",
+      "  return { av: x }",
+      "}",
+      "function mkB(x: i32): Node {",
+      "  return { bv: x }",
+      "}",
+      "function main(): i32 {",
+      "  return val(mkA(7)) + val(mkB(9))",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 16) throw new Error(`main() returned ${got}, expected 16`);
+    },
+  },
+  {
+    name: "a 3-variant union dispatches to the right arm (C => 300)",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type C = { cv: i32 }",
+      "type Node = A | B | C",
+      "function tag(n: Node): i32 {",
+      "  if n is A { return 100 }",
+      "  if n is B { return 200 }",
+      "  if n is C { return 300 }",
+      "  return 0",
+      "}",
+      "function mkC(x: i32): Node {",
+      "  return { cv: x }",
+      "}",
+      "function main(): i32 {",
+      "  return tag(mkC(1))",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 300) throw new Error(`main() returned ${got}, expected 300`);
+    },
+  },
+  {
+    name: "a multi-field variant reads both fields after narrowing (3 + 4 => 7)",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32, bw: i32 }",
+      "type Node = A | B",
+      "function sumB(n: Node): i32 {",
+      "  if n is B { return n.bv + n.bw }",
+      "  return 0",
+      "}",
+      "function mkB(p: i32, q: i32): Node {",
+      "  return { bv: p, bw: q }",
+      "}",
+      "function main(): i32 {",
+      "  return sumB(mkB(3, 4))",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    name: "a union value stored in a local, then discriminated => 42",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type Node = A | B",
+      "function f(n: Node): i32 {",
+      "  if n is A { return n.av }",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  let n: Node = { av: 42 }",
+      "  return f(n)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 42) throw new Error(`main() returned ${got}, expected 42`);
+    },
+  },
+  {
+    name: "a union local discriminated in the SAME function (no helper) => 8",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type Node = A | B",
+      "function main(): i32 {",
+      "  let n: Node = { bv: 8 }",
+      "  if n is B { return n.bv }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 8) throw new Error(`main() returned ${got}, expected 8`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
