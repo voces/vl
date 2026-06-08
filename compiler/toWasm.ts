@@ -1863,6 +1863,20 @@ export const toWasm = async (
     return { lt: listType(soft), element: soft };
   };
 
+  // Coerce a list-header expression to the NON-NULL `(ref $list)` rep before it's
+  // stashed in a non-null local. A nullable-narrowed list (`T[] | null` narrowed
+  // to `T[]` inside an `if xs != null { … }`) keeps its nullable *wasm* slot —
+  // narrowing is type-level only — so a bare read emits `(ref null $list)`. Storing
+  // that into the non-null `lt.refType` local that `listGet`/concat/ForIn allocate
+  // is an `isSubType` violation that crashes binaryen's `LocalSubtyping` pass.
+  // `ref.as_non_null` reconciles the rep (and traps on null, which the narrowing
+  // guarantees can't happen). On an already-non-null ref it's a sound no-op, so
+  // callers can apply it unconditionally. Mirrors `globalRead`'s nullable-ref read.
+  const listRefNonNull = (lt: ListType, listExpr: number): number =>
+    binaryen.getExpressionType(listExpr) === lt.refType
+      ? listExpr
+      : m.ref.as_non_null(listExpr);
+
   // Field reads on a list struct (thunks: binaryen wants fresh trees per use).
   const listBacking = (lt: ListType, ref: number): number =>
     m.struct.get(LIST_BACKING, ref, lt.backing.refType, false);
@@ -1905,7 +1919,7 @@ export const toWasm = async (
     const trap = m.unreachable();
     if (sourceNode) recordDebugAt(trap, sourceNode);
     return m.block(null, [
-      m.local.set(lRef, listExpr),
+      m.local.set(lRef, listRefNonNull(lt, listExpr)),
       m.local.set(iLocal, indexExpr),
       m.if(m.i32.ge_u(i(), listLen(l())), trap),
       arrayReadCast(
@@ -1967,7 +1981,7 @@ export const toWasm = async (
       const outWasm = toWasmType(outLt.element);
       // out[i] = f(src[i]); same length, sized once.
       const body = m.block(null, [
-        m.local.set(srcRef, toExpression(recv)),
+        m.local.set(srcRef, listRefNonNull(src.lt, toExpression(recv))),
         m.local.set(cloRef, toExpression(cb)),
         m.local.set(nLocal, listLen(s())),
         m.local.set(
@@ -2001,7 +2015,7 @@ export const toWasm = async (
     const jLocal = newLocal(binaryen.i32);
     const j = () => m.local.get(jLocal, binaryen.i32);
     const body = m.block(null, [
-      m.local.set(srcRef, toExpression(recv)),
+      m.local.set(srcRef, listRefNonNull(src.lt, toExpression(recv))),
       m.local.set(cloRef, toExpression(cb)),
       m.local.set(nLocal, listLen(s())),
       m.local.set(backLocal, m.array.new_default(outLt.backing.heapType, n())),
@@ -4138,7 +4152,10 @@ export const toWasm = async (
               // enclosing assignment node so the trap still maps to line 3.
               recordDebugAt(storeTrap, access, node);
               const body = [
-                m.local.set(lRef, toExpression(access.array)),
+                m.local.set(
+                  lRef,
+                  listRefNonNull(list.lt, toExpression(access.array)),
+                ),
                 m.local.set(
                   iLocal,
                   withDesiredType(i32Type, () => toExpression(access.index)),
@@ -4360,8 +4377,8 @@ export const toWasm = async (
           const out = () => m.local.get(outLocal, lt.backing.refType);
           const n = () => m.local.get(nLocal, binaryen.i32);
           return m.block(null, [
-            m.local.set(aLocal, toExpression(node.left)),
-            m.local.set(bLocal, toExpression(node.right)),
+            m.local.set(aLocal, listRefNonNull(lt, toExpression(node.left))),
+            m.local.set(bLocal, listRefNonNull(lt, toExpression(node.right))),
             m.local.set(nLocal, m.i32.add(listLen(a()), listLen(b()))),
             m.local.set(
               outLocal,
@@ -4739,7 +4756,10 @@ export const toWasm = async (
           const back = () => m.local.get(backLocal, list.lt.backing.refType);
           const i = () => m.local.get(iLocal, binaryen.i32);
           const loop = m.block(brk, [
-            m.local.set(listLocal, toExpression(node.iterable)),
+            m.local.set(
+              listLocal,
+              listRefNonNull(list.lt, toExpression(node.iterable)),
+            ),
             m.local.set(lenLocal, listLen(lref())),
             m.local.set(backLocal, listBacking(list.lt, lref())),
             m.local.set(iLocal, m.i32.const(0)),
