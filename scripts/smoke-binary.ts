@@ -168,14 +168,15 @@ await Deno.writeTextFile(badFile, `let a = 1\na = "x"\n`);
 await Deno.remove(badFile).catch(() => {});
 
 // A file that type-checks cleanly but throws in codegen: `Tree` recurses through
-// a MAP value (`{ [string]: Tree }`), overflowing the stack at codegen. Used to
-// assert codegen-error rendering, NOT to claim the gap is fixed. (Recursion
-// through an *array* element — `{ [i32]: Tree }` — now compiles via the WasmGC
-// rec-group, A11; the map hash rep remains the stable codegen-error shape.)
+// a MAP value that is itself a LIST of Tree (`{ [string]: Tree[] }`), so the cycle
+// passes through TWO nested collections, overflowing the stack at codegen. Used to
+// assert codegen-error rendering, NOT to claim the gap is fixed. (The
+// single-collection forms `{ [i32]: Tree }` and `{ [string]: Tree }` now compile
+// via the WasmGC rec-group; this nested-collection rep is the stable error shape.)
 const codegenFile = await Deno.makeTempFile({ suffix: ".vl" });
 await Deno.writeTextFile(
   codegenFile,
-  `type Tree = { value: i32, kids: { [string]: Tree } | null }\n` +
+  `type Tree = { value: i32, kids: { [string]: Tree[] } | null }\n` +
     `let t: Tree = { value: 1, kids: null }\n` +
     `print(t.value)\n`,
 );

@@ -10,11 +10,12 @@
 //   - A normal, fully valid file passes both paths (exit 0 each).
 //
 // The codegen-erroring fixture is a `Tree` type whose `kids` field holds a MAP
-// of `Tree` values (`{ [string]: Tree }`), which causes binaryen to exceed its
-// recursion limit during type layout. (Recursion through an *array* element —
-// `{ [i32]: Tree }` — is now supported via the WasmGC rec-group; the map hash
-// rep remains a distinct, still-unsupported recursion shape, so it is the stable
-// codegen-error fixture here.)
+// whose VALUE is a LIST of `Tree` (`{ [string]: Tree[] }`), which causes binaryen
+// to exceed its recursion limit during type layout. (Recursion through a struct
+// field, an *array* element — `{ [i32]: Tree }` — and a *map value* —
+// `{ [string]: Tree }` — are now supported via the WasmGC rec-group; the cycle
+// passing through a NESTED collection, a map-of-lists here, remains a distinct
+// still-unsupported recursion shape, so it is the stable codegen-error fixture.)
 //
 // Run with: deno test -A --no-check tests/cli_codegen_test.ts
 
@@ -54,12 +55,13 @@ const runCheckCapture = async (
 };
 
 // A file that type-checks cleanly but triggers "recursion limit exceeded" in
-// binaryen codegen: the `Tree` type recurses through a MAP value (kids: a map of
-// Tree, `{ [string]: Tree }`), which causes binaryen to overflow its stack during
-// type layout. (The array-element form `{ [i32]: Tree }` now compiles, so the map
-// rep is the stable codegen-error fixture.)
+// binaryen codegen: the `Tree` type recurses through a MAP value that is itself a
+// LIST of Tree (kids: `{ [string]: Tree[] }`), so the cycle passes through TWO
+// nested collections, which overflows binaryen's stack during type layout. (The
+// single-collection forms `{ [i32]: Tree }` and `{ [string]: Tree }` now compile,
+// so this nested-collection rep is the stable codegen-error fixture.)
 const CODEGEN_ERROR_SRC =
-  `type Tree = { value: i32, kids: { [string]: Tree } | null }\n` +
+  `type Tree = { value: i32, kids: { [string]: Tree[] } | null }\n` +
   `let t: Tree = { value: 1, kids: null }\n` +
   `print(t.value)\n`;
 
