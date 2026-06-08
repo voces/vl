@@ -3065,6 +3065,33 @@ const CASES: Case[] = [
       if (got !== 22) throw new Error(`main() returned ${got}, expected 22`);
     },
   },
+  {
+    // WRITE an EMPTY `[]` to a struct REF-LIST field via FIELD ASSIGNMENT
+    // (`P.toks = []`), with a SECOND struct type declared so the element type is
+    // not heap-type 0. The empty literal must adopt the field's declared ref-list
+    // wrapper — the field-assignment path threads `pendingListKind` from the field
+    // type (the `parser.vl` cursor reset `P.toks = []` shape). Without it the empty
+    // `[]` defaults to the i32-list wrapper and the `struct.set` rejects it.
+    name:
+      "G5: field-assign an EMPTY `[]` to a struct ref-list field, then push + read => 2",
+    src: [
+      "type Tok = { kind: string, text: string, pos: i32 }",
+      "type Parser = { toks: Tok[], pos: i32 }",
+      "let P: Parser = { toks: [], pos: 0 }",
+      "function f(): i32 {",
+      "  P.toks = []",
+      "  P.toks.push({ kind: \"A\", text: \"a\", pos: 0 })",
+      "  P.toks.push({ kind: \"B\", text: \"b\", pos: 1 })",
+      "  return P.toks.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // toks reset to empty, then 2 pushed → length 2.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 2) throw new Error(`f() returned ${got}, expected 2`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
