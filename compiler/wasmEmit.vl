@@ -426,12 +426,25 @@ function paramIndexOf(fnIx: i32, name: string): i32 {
 // lowered, so only one function's locals are live at a time.
 let localNames: string[] = []
 // Parallel to `localNames`: the i-th declared local's value-type CODE — `1` for a
-// struct `(ref $0)` local, `2` for an i32-array `(ref $aTypeIdx)` local, `3` for a
-// `string` local (CURRENTLY the SAME `(array (mut i32))` of code points as an array —
-// see `docs/strings-design.md`), `0` for an i32 local. The locals vector (`pushVT`)
+// struct `(ref $0)` local, `2` for a list `(ref $lTypeIdx)` local (the growable `i32[]`
+// wrapper struct), `3` for a `string` local (the raw `(array (mut i32))` of code points
+// — see `docs/strings-design.md`), `0` for an i32 local. The locals vector (`pushVT`)
 // and identifier resolution consult this so a ref-typed local gets the correct ref
 // valtype, not i32.
 let localIsRef: i32[] = []
+
+// ── per-function `.push` scratch locals ──────────────────────────────────────
+// `.push(x)` lowers inline to a grow-if-full + write + len-bump sequence that needs
+// three temporaries: `pushVal` (the value to append, i32), `pushNewCap` (the doubled
+// capacity, i32), and `pushNewBacking` (the freshly-allocated larger backing, a non-null
+// `(ref $aTypeIdx)` — it matches the struct's non-null backing field, and is always
+// `local.set` before read inside the grow branch, which wasm validation accepts for a
+// non-defaultable local). They are allocated AFTER the declared locals, only in a
+// function that actually contains a `.push` (detected by `fnHasPush`). `pushScratchBase`
+// is the wasm local index of `pushVal`; the other two follow at +1/+2. `fnUsesPush`
+// records whether this function reserved them.
+let fnUsesPush: boolean = false
+let pushScratchBase: i32 = 0
 
 // ── struct-type table (one struct per program, i32 fields only) ───────────────
 // This slice supports exactly ONE struct `type` per module; its WasmGC type lives at
@@ -445,17 +458,33 @@ let sDeclared: boolean = false
 let sName: string = ""
 let sFields: string[] = []
 
-// ── array-type table (one i32 array type per program) ─────────────────────────
-// This slice supports a single element type — `i32` — so ALL array values share one
-// WasmGC array heap type `(array (mut i32))`. It is emitted only when the program
-// actually uses arrays (`aUsed`), placed in the type section right AFTER the struct
-// type (if any), so its type index is `structOffset` (0 when no struct, 1 with one).
-// `aUsed` is a presence flag set by `collectA`'s up-front arena scan; `aTypeIdx` is
-// the resolved heap-type index, computed in `emitModule`. WasmGC arrays are
-// FIXED-LENGTH, so this slice covers literal construction + index read/write + length
-// only — a growable `.push` needs a separate length+capacity wrapper (deferred).
+// ── array-type table (the raw `(array (mut i32))` heap type) ──────────────────
+// A single element type — `i32` — so ALL raw arrays share one WasmGC array heap type
+// `(array (mut i32))`. This raw array now serves TWO roles: it is the `string` rep
+// (an `array i32` of code points — unchanged), AND it is the BACKING store of a
+// growable `i32[]` list (see the list-struct table below). It is emitted whenever the
+// program uses a string OR a list (a list needs a backing), placed in the type section
+// right AFTER the struct type (if any), so its index is `structOffset`. `aUsed` is a
+// presence flag set by `collectA`'s up-front arena scan; `aTypeIdx` is the resolved
+// heap-type index, computed in `emitModule`.
 let aUsed: boolean = false
 let aTypeIdx: i32 = 0
+
+// ── list-type table (the growable `i32[]` wrapper struct) ─────────────────────
+// A growable `i32[]` value lowers to a WasmGC struct `{ backing: (ref $aTypeIdx),
+// len: i32, cap: i32 }` — the `{ptr,len,cap}` triple (collections-design §VL.1,
+// mirroring `toWasm.ts`'s `listType`). `backing` is the raw `(array (mut i32))` above
+// (so a grow can swap in a larger one); `len` is the user-visible size (`.length`,
+// bounds, iteration); `cap` the allocated slot count. WasmGC arrays are FIXED-LENGTH,
+// so the wrapper is what makes `.push` grow: when `len == cap`, allocate a backing of
+// `cap == 0 ? 4 : cap * 2`, `array.copy` the live `len` elements in, swap in the new
+// backing + cap, then write at `[len]` and bump `len` (§VL.2). The struct's three
+// fields are ALL mutable. Field indices are fixed by the type-section order below:
+// backing=0, len=1, cap=2. `lUsed` is set by `collectA` whenever a list is used (an
+// array literal, an `i32[]` annotation); a list use also sets `aUsed` (the backing).
+// `lTypeIdx` is the resolved heap-type index, computed in `emitModule`.
+let lUsed: boolean = false
+let lTypeIdx: i32 = 0
 
 // Append the declared-local name `name` to `localNames` if not already present.
 function addLocalName(name: string, isRef: i32): i32 {
@@ -594,6 +623,65 @@ function buildLocals(fnIx: i32): i32 {
     return collectLocals(fn.fnBody, fnIx)
   }
   emitFail("emitProgram: not a function declaration")
+}
+
+// True if the statement at `stmtIx` is a `recv.push(x)` member-call (the `Call` whose
+// `callFn` is a `Member` with property `push`). Used to detect whether a function needs
+// the inline-push scratch locals.
+function stmtIsPush(stmtIx: i32): boolean {
+  let s = P.nodes[stmtIx]
+  if s is Call {
+    let callee = P.nodes[s.callFn]
+    if callee is Member {
+      if callee.memProp == "push" { return true }
+    }
+  }
+  false
+}
+
+// True if the block at `blockIx` (descending into `if` branches and `while` bodies, the
+// same scopes `collectLocals` walks) contains any `.push` call statement. A function
+// with a push reserves three scratch locals after its declared locals.
+function blockHasPush(blockIx: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      if stmtIsPush(stmts[i]) { return true }
+      let s = P.nodes[stmts[i]]
+      if s is IfStmt {
+        if blockHasPush(s.ifThen) { return true }
+        if s.ifElse >= 0 {
+          let els = P.nodes[s.ifElse]
+          if els is Block {
+            if blockHasPush(s.ifElse) { return true }
+          } else if els is IfStmt {
+            if blockHasPush(els.ifThen) { return true }
+            if els.ifElse >= 0 {
+              let els2 = P.nodes[els.ifElse]
+              if els2 is Block {
+                if blockHasPush(els.ifElse) { return true }
+              }
+            }
+          }
+        }
+      } else if s is WhileStmt {
+        if blockHasPush(s.whileBody) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the FuncDecl at `fnIx` contains a `.push` anywhere in its body.
+function fnHasPush(fnIx: i32): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    return blockHasPush(fn.fnBody)
+  }
+  false
 }
 
 // The wasm local index of declared local `name`, or -1 if it is not a declared
@@ -932,14 +1020,16 @@ function emitStr(body: i32[], strIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected a string literal")
 }
 
-// Lower an array literal `[e, e, ...]` onto `body`: push each element value in source
-// order (all i32 in this slice), then `array.new_fixed $aTypeIdx <count>`
-// (`0xfb 0x08 <typeidx> <count>`, derived from binaryen's `fb 08 00 03`). The
-// element count is the operand the engine pops that many values for. An element that
-// is itself an array (nested) is out of scope — fails loudly.
+// Lower an array literal `[e, e, ...]` onto `body` as a GROWABLE list value (mirroring
+// `toWasm.ts`'s `ArrayLiteral` case): push each element value in source order (all i32),
+// then `array.new_fixed $aTypeIdx <count>` to build the raw backing (`0xfb 0x08 <typeidx>
+// <count>`), then push `count` (len) and `count` (cap), then `struct.new $lTypeIdx`
+// (`0xfb 0x00 <lTypeIdx>`) to wrap them into `{ backing, len, cap }`. An empty `[]` is
+// `array.new_fixed` of count 0 wrapped with len 0 / cap 0. An element that is itself an
+// array (nested) is out of scope — fails loudly.
 function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
-  if !aUsed {
-    return emitFail("emitProgram: array literal but array type not collected")
+  if !lUsed {
+    return emitFail("emitProgram: array literal but list type not collected")
   }
   let a = P.nodes[arrIx]
   if a is ArrayLit {
@@ -956,45 +1046,75 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
       i = i + 1
     }
     body.push(251)           // 0xfb GC prefix
-    body.push(8)             // array.new_fixed
-    appendAll(body, ulebToArr(aTypeIdx))    // array type index
+    body.push(8)             // array.new_fixed (builds the raw backing)
+    appendAll(body, ulebToArr(aTypeIdx))       // raw array type index
     appendAll(body, ulebToArr(elems.length))   // element count
+    // Wrap { backing, len = count, cap = count } via struct.new.
+    body.push(65)            // 0x41 i32.const (len)
+    appendAll(body, slebToArr(elems.length))
+    body.push(65)            // 0x41 i32.const (cap)
+    appendAll(body, slebToArr(elems.length))
+    body.push(251)           // 0xfb GC prefix
+    body.push(0)             // struct.new
+    appendAll(body, ulebToArr(lTypeIdx))       // list wrapper struct type index
     return 0
   }
   emitFail("emitProgram: expected an array literal")
 }
 
-// Lower an index READ `a[i]` onto `body`: evaluate the receiver (an array OR a string
-// — both are the SAME `(array (mut i32))`, so `s[i]` yields the i32 CODE POINT), then
-// the index (an i32), then `array.get $aTypeIdx` (`0xfb 0x0b <typeidx>`, derived from
-// binaryen's `fb 0b 00`; the `_s/_u` signed forms `0x0c/0x0d` are only for PACKED
-// arrays — an unpacked i32 array uses `0x0b`).
+// Lower an index READ `a[i]` onto `body`. The element store is the raw `(array (mut
+// i32))` in BOTH cases, but a list receiver carries it inside the wrapper struct:
+//   list `a[i]`   → eval `a` (a wrapper ref), `struct.get $lTypeIdx 0` (backing), eval
+//                   `i`, then `array.get $aTypeIdx` — the element i32.
+//   string `s[i]` → eval `s` (a raw array ref), eval `i`, `array.get $aTypeIdx` — the
+//                   i32 CODE POINT (unchanged from the fixed-array string rep).
+// `array.get` is `0xfb 0x0b <typeidx>` (the `_s/_u` forms `0x0c/0x0d` are only for
+// PACKED arrays; an unpacked i32 array uses `0x0b`).
 function emitIndex(body: i32[], idxIx: i32, fnIx: i32): i32 {
   if !aUsed {
     return emitFail("emitProgram: index access but array type not collected")
   }
   let nd = P.nodes[idxIx]
   if nd is Index {
-    if !exprArray(nd.idxArr, fnIx) && !exprString(nd.idxArr, fnIx) {
+    let isList = exprArray(nd.idxArr, fnIx)
+    if !isList && !exprString(nd.idxArr, fnIx) {
       return emitFail("emitProgram: index receiver is not an array or string")
     }
     if emitExpr(body, nd.idxArr, fnIx) < 0 { return 0 - 1 }
+    if isList {
+      // Unwrap the list to its backing before indexing.
+      body.push(251)         // 0xfb GC prefix
+      body.push(2)           // struct.get
+      appendAll(body, ulebToArr(lTypeIdx))   // list wrapper struct type index
+      body.push(0)           // field 0: backing
+    }
     if emitExpr(body, nd.idxIndex, fnIx) < 0 { return 0 - 1 }
     body.push(251)           // 0xfb GC prefix
     body.push(11)            // 0x0b array.get
-    appendAll(body, ulebToArr(aTypeIdx))    // array type index
+    appendAll(body, ulebToArr(aTypeIdx))    // raw array type index
     return 0
   }
   emitFail("emitProgram: expected an index access")
 }
 
-// Lower an array length `a.length` onto `body`: evaluate the array (receiver), then
-// `array.len` (`0xfb 0x0f`, derived from binaryen's `fb 0f` — note `array.len` takes
-// NO type-index operand, unlike `array.get`/`array.set`). Yields an i32.
+// Lower a `.length` onto `body`. A list's length is its wrapper's `len` field (NOT the
+// backing's physical length, which is `cap`); a string's length is the raw array's
+// physical length:
+//   list `a.length`   → eval `a`, `struct.get $lTypeIdx 1` (the `len` field) — i32.
+//   string `s.length` → eval `s`, `array.len` (`0xfb 0x0f`, NO type-index operand,
+//                        unlike `array.get`/`array.set`) — the code-point count.
 function emitArrLen(body: i32[], memIx: i32, fnIx: i32): i32 {
   let m = P.nodes[memIx]
   if m is Member {
+    let isList = exprArray(m.memObj, fnIx)
     if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
+    if isList {
+      body.push(251)         // 0xfb GC prefix
+      body.push(2)           // struct.get
+      appendAll(body, ulebToArr(lTypeIdx))   // list wrapper struct type index
+      body.push(1)           // field 1: len
+      return 0
+    }
     body.push(251)           // 0xfb GC prefix
     body.push(15)            // 0x0f array.len (no type-index operand)
     return 0
@@ -1148,26 +1268,196 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       return 0
     }
     if target is Index {
-      // Indexed store `a[i] = v`: push the array ref, the index, then the value, then
-      // `array.set $aTypeIdx` (`0xfb 0x0e <typeidx>`, derived from binaryen's
-      // `fb 0e 00`). The receiver must be an array; the value is an i32.
-      if !aUsed {
-        return emitFail("emitProgram: indexed assignment but array type not collected")
+      // Indexed store `a[i] = v`: unwrap the list to its backing (`struct.get
+      // $lTypeIdx 0`), push the index, then the value, then `array.set $aTypeIdx`
+      // (`0xfb 0x0e <typeidx>`). The receiver must be a list; the value is an i32.
+      if !lUsed {
+        return emitFail("emitProgram: indexed assignment but list type not collected")
       }
       if !exprArray(target.idxArr, fnIx) {
         return emitFail("emitProgram: indexed-assignment target is not an array")
       }
       if emitExpr(body, target.idxArr, fnIx) < 0 { return 0 - 1 }
+      body.push(251)         // 0xfb GC prefix
+      body.push(2)           // struct.get (unwrap to backing)
+      appendAll(body, ulebToArr(lTypeIdx))    // list wrapper struct type index
+      body.push(0)           // field 0: backing
       if emitExpr(body, target.idxIndex, fnIx) < 0 { return 0 - 1 }
       if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
       body.push(251)         // 0xfb GC prefix
       body.push(14)          // 0x0e array.set
-      appendAll(body, ulebToArr(aTypeIdx))    // array type index
+      appendAll(body, ulebToArr(aTypeIdx))    // raw array type index
       return 0
     }
     return emitFail("emitProgram: assignment target is not a simple name")
   }
   emitFail("emitProgram: expected an assignment expression")
+}
+
+// Lower a `recv.push(x)` member-call statement onto `body` — the growable-list append
+// (mirroring `toWasm.ts`'s `__list_grow__`/`__list_push__`, but INLINED). `recv` must be
+// a bare `Ident` naming a LIST local/param (so its `local.get` is side-effect-free and
+// can be re-read), and the call takes exactly one i32 argument.
+//
+// The sequence, with `L` = the list local index and scratch locals `pushVal` (V),
+// `pushNewCap` (NC), `pushNewBacking` (NB):
+//   V = x                                              ; stash the value
+//   if len(L) == cap(L) {                              ; grow when full
+//     NC = (cap(L) == 0) ? 4 : cap(L) * 2              ; 2× growth, floor 4 (§VL.2)
+//     NB = array.new_default $aTypeIdx NC              ; zero-init spare slots
+//     array.copy NB 0 backing(L) 0 len(L)              ; copy the live elements
+//     L.backing = NB ; L.cap = NC                      ; swap in the larger backing
+//   }
+//   backing(L)[len(L)] = V                             ; write at the end
+//   L.len = len(L) + 1                                 ; bump the length
+// `len`/`cap`/`backing` are `struct.get $lTypeIdx` of fields 1/2/0; the field setters are
+// `struct.set $lTypeIdx`. `array.copy` is `0xfb 0x11 <dest> <src>` (both the raw array).
+function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
+  if !lUsed {
+    return emitFail("emitProgram: .push but list type not collected")
+  }
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      let recv = P.nodes[callee.memObj]
+      if recv is Ident {
+        if !exprArray(callee.memObj, fnIx) {
+          return emitFail("emitProgram: .push receiver is not a list")
+        }
+        let lIdx = localIndexOf(fnIx, recv.identName)
+        if lIdx < 0 {
+          return emitFail("emitProgram: .push receiver is not a list local")
+        }
+        if c.callArgs.length != 1 {
+          return emitFail("emitProgram: .push takes exactly one argument")
+        }
+        let valIdx = pushScratchBase
+        let capIdx = pushScratchBase + 1
+        let backIdx = pushScratchBase + 2
+        // V = x
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        body.push(33)          // local.set
+        appendAll(body, ulebToArr(valIdx))
+        // if len(L) == cap(L)
+        pushListLen(body, lIdx)
+        pushListCap(body, lIdx)
+        body.push(70)          // 0x46 i32.eq
+        body.push(4)           // 0x04 if
+        body.push(64)          // 0x40 void blocktype
+        // NC = (cap(L) == 0) ? 4 : cap(L) * 2   — via if/else yielding i32
+        pushListCap(body, lIdx)
+        body.push(69)          // 0x45 i32.eqz  (cap == 0)
+        body.push(4)           // 0x04 if
+        body.push(127)         // 0x7f i32 blocktype (yields an i32)
+        body.push(65)          // i32.const 4
+        appendAll(body, slebToArr(4))
+        body.push(5)           // 0x05 else
+        pushListCap(body, lIdx)
+        body.push(65)          // i32.const 2
+        appendAll(body, slebToArr(2))
+        body.push(108)         // 0x6c i32.mul
+        body.push(11)          // 0x0b end (if/else)
+        body.push(33)          // local.set NC
+        appendAll(body, ulebToArr(capIdx))
+        // NB = array.new_default $aTypeIdx NC
+        body.push(32)          // local.get NC
+        appendAll(body, ulebToArr(capIdx))
+        body.push(251)         // 0xfb
+        body.push(7)           // array.new_default
+        appendAll(body, ulebToArr(aTypeIdx))
+        body.push(33)          // local.set NB
+        appendAll(body, ulebToArr(backIdx))
+        // array.copy NB 0 backing(L) 0 len(L)
+        body.push(32)          // local.get NB (dest)
+        appendAll(body, ulebToArr(backIdx))
+        body.push(65)          // i32.const 0 (dest offset)
+        appendAll(body, slebToArr(0))
+        pushListBacking(body, lIdx)   // src
+        body.push(65)          // i32.const 0 (src offset)
+        appendAll(body, slebToArr(0))
+        pushListLen(body, lIdx)       // count
+        body.push(251)         // 0xfb
+        body.push(17)          // 0x11 array.copy
+        appendAll(body, ulebToArr(aTypeIdx))   // dest type
+        appendAll(body, ulebToArr(aTypeIdx))   // src type
+        // L.backing = NB
+        body.push(32)          // local.get L
+        appendAll(body, ulebToArr(lIdx))
+        body.push(32)          // local.get NB
+        appendAll(body, ulebToArr(backIdx))
+        body.push(251)         // 0xfb
+        body.push(5)           // struct.set
+        appendAll(body, ulebToArr(lTypeIdx))
+        body.push(0)           // field 0: backing
+        // L.cap = NC
+        body.push(32)          // local.get L
+        appendAll(body, ulebToArr(lIdx))
+        body.push(32)          // local.get NC
+        appendAll(body, ulebToArr(capIdx))
+        body.push(251)         // 0xfb
+        body.push(5)           // struct.set
+        appendAll(body, ulebToArr(lTypeIdx))
+        body.push(2)           // field 2: cap
+        body.push(11)          // 0x0b end (if)
+        // backing(L)[len(L)] = V
+        pushListBacking(body, lIdx)
+        pushListLen(body, lIdx)
+        body.push(32)          // local.get V
+        appendAll(body, ulebToArr(valIdx))
+        body.push(251)         // 0xfb
+        body.push(14)          // 0x0e array.set
+        appendAll(body, ulebToArr(aTypeIdx))
+        // L.len = len(L) + 1
+        body.push(32)          // local.get L
+        appendAll(body, ulebToArr(lIdx))
+        pushListLen(body, lIdx)
+        body.push(65)          // i32.const 1
+        appendAll(body, slebToArr(1))
+        body.push(106)         // 0x6a i32.add
+        body.push(251)         // 0xfb
+        body.push(5)           // struct.set
+        appendAll(body, ulebToArr(lTypeIdx))
+        body.push(1)           // field 1: len
+        return 0
+      }
+      return emitFail("emitProgram: .push receiver must be a simple name")
+    }
+  }
+  emitFail("emitProgram: expected a .push call")
+}
+
+// `local.get L ; struct.get $lTypeIdx 1` — push the list's `len` field onto `body`.
+function pushListLen(body: i32[], lIdx: i32): i32 {
+  body.push(32)              // local.get
+  appendAll(body, ulebToArr(lIdx))
+  body.push(251)             // 0xfb
+  body.push(2)               // struct.get
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(1)               // field 1: len
+  0
+}
+
+// `local.get L ; struct.get $lTypeIdx 2` — push the list's `cap` field onto `body`.
+function pushListCap(body: i32[], lIdx: i32): i32 {
+  body.push(32)              // local.get
+  appendAll(body, ulebToArr(lIdx))
+  body.push(251)             // 0xfb
+  body.push(2)               // struct.get
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(2)               // field 2: cap
+  0
+}
+
+// `local.get L ; struct.get $lTypeIdx 0` — push the list's `backing` ref onto `body`.
+function pushListBacking(body: i32[], lIdx: i32): i32 {
+  body.push(32)              // local.get
+  appendAll(body, ulebToArr(lIdx))
+  body.push(251)             // 0xfb
+  body.push(2)               // struct.get
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(0)               // field 0: backing
+  0
 }
 
 // Lower a single statement at `stmtIx` onto `body`, resolving identifiers/params
@@ -1178,6 +1468,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
 //   RetStmt { retArg: i32 }                       — `retArg` -1 means a bare return.
 //   IfStmt  { ifCond: i32, ifThen: i32, ifElse: i32 }
 //   BinExpr { binOp, binLeft, binRight }          — an assignment expression statement.
+//   Call    { callFn, callArgs }                  — a `recv.push(x)` member-call.
 //   Block   { blkStmts: i32[] }
 function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
   if stmtIx < 0 {
@@ -1206,6 +1497,19 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       return emitAssign(body, stmtIx, fnIx)
     }
     return emitFail("emitProgram: expression statement is not an assignment")
+  }
+  if s is Call {
+    // The only call STATEMENT this slice lowers is a list append `recv.push(x)` (a
+    // `Call` whose `callFn` is a `Member`). A bare top-level call statement (a function
+    // call whose value is discarded) is out of scope.
+    let callee = P.nodes[s.callFn]
+    if callee is Member {
+      if callee.memProp == "push" {
+        return emitPush(body, stmtIx, fnIx)
+      }
+      return emitFail("emitProgram: unsupported member-call statement")
+    }
+    return emitFail("emitProgram: bare call statement is not supported")
   }
   if s is RetStmt {
     if s.retArg < 0 {
@@ -1336,19 +1640,41 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     // and the locals vector both see the full per-function set.
     if buildLocals(fnIx) < 0 { return 0 - 1 }
 
+    // If this function pushes, reserve three scratch locals after the declared ones.
+    // `pushScratchBase` is their first wasm index (= params + declared locals); the
+    // inline-push sequence reads `pushScratchBase`+0/+1/+2. Set BEFORE `emitStmts` so a
+    // `.push` can resolve its scratch slots.
+    fnUsesPush = fnHasPush(fnIx)
+    let nLocals = localNames.length
+    pushScratchBase = fn.fnParams.length + nLocals
+
     let bodyExpr: i32[] = []
     if emitStmts(bodyExpr, fn.fnBody, fnIx) < 0 { return 0 - 1 }
 
     let body: i32[] = []
-    let nLocals = localNames.length
-    // One (count=1, valtype) run per local, in index order: a struct local is
-    // `(ref $0)` (`0x64 0x00`), an i32 local is `0x7f`.
-    appendAll(body, ulebToArr(nLocals))
+    // Locals vector: one (count=1, valtype) run per DECLARED local (a struct/list/string
+    // ref or i32 — see `pushVT`), then — when this function pushes — three scratch runs:
+    // `pushVal` i32 (`0x7f`), `pushNewCap` i32 (`0x7f`), `pushNewBacking` nullable raw-
+    // array ref (`0x63 <aTypeIdx>`, defaultable to null).
+    let nRuns = nLocals
+    if fnUsesPush { nRuns = nRuns + 3 }
+    appendAll(body, ulebToArr(nRuns))
     let li = 0
     while li < nLocals {
       body.push(1)
       pushVT(body, localIsRef[li])
       li = li + 1
+    }
+    if fnUsesPush {
+      body.push(1)
+      body.push(127)         // pushVal: 0x7f i32
+      body.push(1)
+      body.push(127)         // pushNewCap: 0x7f i32
+      body.push(1)
+      body.push(100)         // pushNewBacking: 0x64 (ref ht) — non-null, matches the
+      appendAll(body, ulebToArr(aTypeIdx))   // struct's non-null backing field; the
+      // local is non-defaultable but always `local.set` (from `array.new_default`)
+      // before any read inside the grow branch, which wasm validation accepts.
     }
     appendAll(body, bodyExpr)
     body.push(11)            // 0x0b end
@@ -1441,20 +1767,25 @@ function vtKindOfParam(paramIx: i32): i32 {
 
 // Push a wasm value type onto `payload`. The `kind` tag selects the encoding:
 //   1 → struct ref `(ref $0)` (`0x64 0x00`, non-null ref to the struct type, index 0)
-//   2 → array  ref `(ref $aTypeIdx)` (`0x64 <aTypeIdx>`, non-null ref to the i32 array)
-//   3 → string ref — the SAME `(ref $aTypeIdx)` as an array, because a VL string is
-//       CURRENTLY an `array i32` of code points (`docs/strings-design.md`).
+//   2 → list  ref `(ref $lTypeIdx)` (`0x64 <lTypeIdx>`, the growable `i32[]` wrapper
+//       struct `{ backing, len, cap }` — NOT the raw array; an `i32[]` value IS that
+//       wrapper)
+//   3 → string ref `(ref $aTypeIdx)` — the RAW `(array (mut i32))` of code points, since
+//       a VL string stays the fixed array rep (`docs/strings-design.md`)
 //   else → i32 (`0x7f`)
 // A ref is always non-null (`0x64`), matching binaryen's `(ref $T)` for a value that
-// is statically known to be present (a constructed array / struct / string, never
+// is statically known to be present (a constructed list / struct / string, never
 // `null`).
 function pushVT(payload: i32[], kind: i32): i32 {
   if kind == 1 {
     payload.push(100)          // 0x64 (ref ht) — non-null ref
     payload.push(0)            // heap type index 0 (the struct type)
-  } else if kind == 2 || kind == 3 {
+  } else if kind == 2 {
     payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(aTypeIdx))   // the i32 array heap-type index (shared)
+    appendAll(payload, ulebToArr(lTypeIdx))   // the list wrapper struct heap-type index
+  } else if kind == 3 {
+    payload.push(100)          // 0x64 (ref ht) — non-null ref
+    appendAll(payload, ulebToArr(aTypeIdx))   // the raw i32 array heap-type index (string)
   } else {
     payload.push(127)          // 0x7f i32
   }
@@ -1474,22 +1805,29 @@ function emitModule(stmts: i32[]): i32 {
 
   let n = fnStmts.length
 
-  // Heap-type indices: the GC struct type (if any) is type 0, the i32 array type (if
-  // used) follows, and the functypes follow those. `structOffset`/`arrayOffset` are
-  // each 0 or 1; `typeOffset` is their sum — the index the first functype lands at.
-  // `aTypeIdx` (the array heap-type index) is `structOffset`, recorded for `pushVT`.
+  // Heap-type indices, in type-section order: the GC struct type (if any) at 0, the raw
+  // i32 array type (if used) next, the growable-list wrapper struct (if used) next, then
+  // the functypes. `structOffset`/`arrayOffset`/`listOffset` are each 0 or 1; `typeOffset`
+  // is their sum — the index the first functype lands at. `aTypeIdx` (the raw array
+  // heap-type index) is `structOffset`; `lTypeIdx` (the list wrapper struct, which
+  // REFERENCES the raw array, so it MUST follow it) is `structOffset + arrayOffset`.
   let structOffset = 0
   if sDeclared { structOffset = 1 }
   let arrayOffset = 0
   if aUsed { arrayOffset = 1 }
+  let listOffset = 0
+  if lUsed { listOffset = 1 }
   aTypeIdx = structOffset
-  let typeOffset = structOffset + arrayOffset
+  lTypeIdx = structOffset + arrayOffset
+  let typeOffset = structOffset + arrayOffset + listOffset
 
   // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
   // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`);
-  // the i32 array type (if used) next — `0x5e` array form, `0x7f` i32 storagetype,
-  // `0x01` mutable (derived from binaryen: `5e 7f 01`); then one functype per
-  // function (`(i32|ref)* -> i32|ref`).
+  // the raw i32 array type (if used) next — `0x5e` array form, `0x7f` i32 storagetype,
+  // `0x01` mutable (derived from binaryen: `5e 7f 01`); the growable-list wrapper struct
+  // (if used) next — `0x5f` struct of three mutable fields `{ backing: (ref $aTypeIdx),
+  // len: i32, cap: i32 }` (verified against binaryen's `listType`); then one functype
+  // per function (`(i32|ref)* -> i32|ref`).
   let typePayload: i32[] = []
   appendAll(typePayload, ulebToArr(n + typeOffset))   // total type count
   if sDeclared {
@@ -1505,6 +1843,17 @@ function emitModule(stmts: i32[]): i32 {
   if aUsed {
     typePayload.push(94)         // 0x5e array
     typePayload.push(127)        // 0x7f i32 storagetype
+    typePayload.push(1)          // mutable
+  }
+  if lUsed {
+    typePayload.push(95)         // 0x5f struct
+    typePayload.push(3)          // 3 fields
+    typePayload.push(100)        // field 0 backing: 0x64 (ref ht) — non-null
+    appendAll(typePayload, ulebToArr(aTypeIdx))   // ...to the raw array heap type
+    typePayload.push(1)          // mutable
+    typePayload.push(127)        // field 1 len: 0x7f i32
+    typePayload.push(1)          // mutable
+    typePayload.push(127)        // field 2 cap: 0x7f i32
     typePayload.push(1)          // mutable
   }
   let ti = 0
@@ -1643,16 +1992,21 @@ function checkArrName(name: string): i32 {
 // `emitFail`).
 function collectA(stmts: i32[]): i32 {
   aUsed = false
+  lUsed = false
   let i = 0
   while i < P.nodes.length {
     let nd = P.nodes[i]
     if nd is ArrayLit {
+      // A `[…]` literal is a growable list; its backing is the raw array.
+      lUsed = true
       aUsed = true
     } else if nd is StrLit {
       aUsed = true
     } else if nd is TypeRef {
       if nameIsArray(nd.tyName) {
         if checkArrName(nd.tyName) < 0 { return 0 - 1 }
+        // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
+        lUsed = true
         aUsed = true
       } else if nameIsString(nd.tyName) {
         aUsed = true

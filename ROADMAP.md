@@ -323,9 +323,11 @@ independent).*
   bootstrap work:
   - **(a) wasm-emit consuming the AST arena.** `emitProgram` now drives the real arena — i32
     params/arithmetic, calls/comparisons/`if`/`return`, `while` loops, `let`/`const` locals + assignment,
-    structs (#137), arrays (#145), and strings (literal, `.length`, index — lowered to the array-i32
-    code-point representation); `.push` (growable arrays) remains ahead. (The fixed-bytes spike that
-    hand-built two modules without reading `compiler/ast.vl` is retired.)
+    structs (#137), arrays (#145), strings (literal, `.length`, index — lowered to the array-i32
+    code-point representation), and **growable `i32[]` + `.push`** (the `{backing,len,cap}` wrapper struct,
+    grow-on-full mirroring `toWasm.ts`'s list rep). Ahead: non-i32 element lists, list `pop`/`+`/equality,
+    and the broader self-host source vocabulary (`for`, `match`, nested arrays/maps). (The fixed-bytes
+    spike that hand-built two modules without reading `compiler/ast.vl` is retired.)
   - **(b) Grow the `.vl` parser/typecheck subset.** `parseStmt` handles `let`/`const`/`function`/`if`
     (incl. `else if` chains)/`return`/block/expr but **no `while`/`for` statements yet**; widen toward
     the full language.
@@ -338,8 +340,9 @@ independent).*
   LEB128 + section framing emit valid bytes that the real `WebAssembly` engine instantiates. H3-gap3,
   H4.2/H4.3/H4.4 are resolved (see `CHANGELOG.md`). The `emitProgram` frontier has advanced through
   **params, arithmetic, comparisons, calls/recursion, if/return, locals, while, structs (#137), arrays (#145),
-  and strings** (literal, `.length`, index — lowered to the array-i32 code-point representation);
-  `.push` (growable arrays) remains ahead. Remaining sub-items:
+  strings** (literal, `.length`, index — lowered to the array-i32 code-point representation), **and growable
+  `i32[]` + `.push`** (the `{backing,len,cap}` wrapper struct with grow-on-full); ahead are non-i32 element
+  lists, list `pop`/`+`/equality, and the wider self-host source vocabulary. Remaining sub-items:
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/selfhost-gaps.md` §H4.1)
