@@ -1122,6 +1122,49 @@ const containsUnresolvedHole = (
   }
 };
 
+export { containsUnresolvedHole };
+
+// USAGE-DRIVEN INFERENCE of an empty collection's element type (the headline of
+// the `A-infer-empty` track). When a value's element type is still an unresolved
+// `Infer<Unknown>` hole — the element of an un-annotated empty `[]` — a downstream
+// use that *constrains* it should pin that hole IN PLACE, exactly the way a
+// generic type arg is resolved from a call's arguments. The catch: a list method
+// like `push` is instantiated via `instantiateFunctionType`, which CLONES the
+// signature (fresh holes) before unifying — so unifying the clone's param leaves
+// the shared element cell (the one the *binding* holds) untouched. So here we
+// unify the ORIGINAL shared `element` hole directly against the constraint type,
+// mutating it in place; the binding sees the resolved element, and the subsequent
+// normal instantiation then type-checks the call strictly against the now-pinned
+// element. A no-op once the element is concrete (the binding is already inferred)
+// or when there is nothing to learn from this use.
+//
+// `element` is the live element-type node shared between the array's `{[i32]:T}`
+// index signature and its intrinsic-method signatures (`listMemberType` closes
+// over it). `constraint` is the type flowing in (a `push` argument, an index-set
+// RHS). Returns true when it pinned the hole.
+export const constrainElementHole = (
+  element: VLType | undefined,
+  constraint: VLType,
+  ctx: Context,
+): boolean => {
+  if (!element || element.type !== "Infer" || !containsUnresolvedHole(element)) {
+    return false;
+  }
+  // `ensureType` swaps an `Infer` actual to the target side and pins its
+  // `Unknown` sub-type in place (the same machinery a binding annotation uses),
+  // softening a literal constraint to its base (`1` → `i32`, `"a"` → `string`).
+  ensureType(element, softenImplicitType(constraint), ctx);
+  // COLLAPSE the now-resolved `Infer<T>` wrapper to a plain `T` in place. Leaving
+  // the `Infer` on would make the element a re-inference TARGET for every later
+  // use: `ensureType`'s head swaps an `Infer` actual to the target side, so e.g.
+  // `print(xs[0])` (its param is a permissive `Custom`) would widen the resolved
+  // element into a spurious `i32 | <custom>` union. Once pinned, the element is an
+  // ordinary concrete type — `makeExact` strips the hole so codegen sees a normal
+  // typed array and downstream checks treat it as the fixed element type.
+  updateType(element, makeExact(element));
+  return true;
+};
+
 // One clean, source-located diagnostic for a binding whose type can't be inferred
 // — instead of either a crash or the opaque codegen `Unhandled AST -> WASM
 // "Unknown" type`. Fires only for a genuinely UNPINNED binding (an un-annotated
