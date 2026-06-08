@@ -716,7 +716,7 @@ const CASES: Case[] = [
           }`,
         );
       }
-      if (!errLine.includes("i32 struct fields")) {
+      if (!errLine.includes("struct fields are supported")) {
         throw new Error(`unexpected emitter error message: ${errLine}`);
       }
     },
@@ -2608,6 +2608,93 @@ const CASES: Case[] = [
       // 40 + 80 + 1 + 1000 (default for missing) + 1 (has k5) = 1122.
       const got = await runExport(bytesFromLog(logs), "f");
       if (got !== 1122) throw new Error(`f() returned ${got}, expected 1122`);
+    },
+  },
+  // ── G5: array-typed struct / union-variant fields ──────────────────────────
+  // A struct field whose type is `i32[]` stores a REF to the growable i32-list wrapper
+  // (`(ref $lTypeIdx)`) — the same wrapper an `i32[]` local/param uses. Construction
+  // assigns the list, a field read `b.items` yields the list ref (so `.length` /
+  // indexing work), and a field write `b.items = …` stores a new list ref.
+  {
+    name: "G5: struct with an `i32[]` field — construct, read `.length` + an element => 30",
+    src: [
+      "type Box = { tag: i32, items: i32[] }",
+      "function f(): i32 {",
+      "  let b: Box = { tag: 7, items: [10, 20, 30] }",
+      "  return b.tag + b.items.length + b.items[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 7 (tag) + 3 (length) + 20 (items[1]) = 30.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 30) throw new Error(`f() returned ${got}, expected 30`);
+    },
+  },
+  {
+    name: "G5: WRITE a struct `i32[]` field then read it back (`b.items = xs` => 200)",
+    src: [
+      "type Box = { tag: i32, items: i32[] }",
+      "function f(): i32 {",
+      "  let b: Box = { tag: 0, items: [1] }",
+      "  let xs: i32[] = [100, 200, 300]",
+      "  b.items = xs",
+      "  return b.items[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 200) throw new Error(`f() returned ${got}, expected 200`);
+    },
+  },
+  {
+    name: "G5: build a struct `i32[]` field in a loop via a local, read back => 45",
+    src: [
+      "type Box = { items: i32[] }",
+      "function f(): i32 {",
+      "  let xs: i32[] = []",
+      "  let i = 0",
+      "  while i < 10 {",
+      "    xs.push(i)",
+      "    i = i + 1",
+      "  }",
+      "  let b: Box = { items: xs }",
+      "  let sum = 0",
+      "  let j = 0",
+      "  while j < b.items.length {",
+      "    sum = sum + b.items[j]",
+      "    j = j + 1",
+      "  }",
+      "  return sum",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 0+1+...+9 = 45.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 45) throw new Error(`f() returned ${got}, expected 45`);
+    },
+  },
+  {
+    // A REF-element array field `Tok[]` over a declared struct stores a REF to the
+    // ref-list wrapper (`(ref $rlTypeIdx)`). Construction assigns a ref list, a field
+    // read yields the ref-list ref (so `.length` and ref-indexing — which recovers the
+    // non-null struct element — work).
+    name: "G5: struct with a `Tok[]` (ref-element) field — read length + element field => 22",
+    src: [
+      "type Tok = { kind: i32, val: i32 }",
+      "type Arena = { toks: Tok[] }",
+      "function f(): i32 {",
+      "  let a: Arena = { toks: [ { kind: 1, val: 10 }, { kind: 2, val: 20 } ] }",
+      "  return a.toks.length + a.toks[1].val",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // length 2 + toks[1].val (20) = 22.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 22) throw new Error(`f() returned ${got}, expected 22`);
     },
   },
 ];

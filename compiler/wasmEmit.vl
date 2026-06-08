@@ -1195,9 +1195,33 @@ function sFieldIndex(si: i32, name: string): i32 {
   0 - 1
 }
 
-// The wasm-type code (`0` i32, `3` string) of struct `si`'s field at field index `fi`.
+// The wasm-type code (`0` i32, `3` string, `4` i32-list, `5` ref-list) of struct `si`'s
+// field at field index `fi`.
 function sFieldTypeAt(si: i32, fi: i32): i32 {
   sFieldTypes[sFieldStart[si] + fi]
+}
+
+// Push the STORAGETYPE bytes (NOT the trailing mutability flag) for a struct / variant
+// field whose wasm-type `code` is one of `0` i32, `3` string, `4` i32-list, `5` ref-list.
+// Each array-typed field stores a non-null REF to the corresponding list wrapper struct
+// (`0x64 <heap-type-index>`): `lTypeIdx` for `i32[]`, `rlTypeIdx` for a `T[]`/`N[]` ref
+// list — exactly the wrappers the map's `keys`/`vals` fields already reference. The
+// referenced wrapper types are interned in the SAME rec group (forced present by
+// `collectA`), so the forward index resolves. Used by the type-section struct emission.
+function pushFieldStorage(out: i32[], code: i32): i32 {
+  if code == 3 {
+    out.push(100)              // 0x64 (ref ht) — non-null string ref
+    appendAll(out, ulebToArr(aTypeIdx))
+  } else if code == 4 {
+    out.push(100)              // 0x64 (ref ht) — non-null i32-list wrapper ref
+    appendAll(out, ulebToArr(lTypeIdx))
+  } else if code == 5 {
+    out.push(100)              // 0x64 (ref ht) — non-null ref-list wrapper ref
+    appendAll(out, ulebToArr(rlTypeIdx))
+  } else {
+    out.push(127)              // 0x7f i32 storagetype
+  }
+  0
 }
 
 // The struct table index whose name is `name`, or -1 if `name` is not a declared
@@ -4286,12 +4310,7 @@ function emitModule(stmts: i32[]): i32 {
       appendAll(typePayload, ulebToArr(cnt))
       let fj = 0
       while fj < cnt {
-        if sFieldTypeAt(si, fj) == 3 {
-          typePayload.push(100)  // 0x64 (ref ht) — non-null string ref
-          appendAll(typePayload, ulebToArr(aTypeIdx))
-        } else {
-          typePayload.push(127)  // 0x7f i32 storagetype
-        }
+        pushFieldStorage(typePayload, sFieldTypeAt(si, fj))
         typePayload.push(1)      // mutable
         fj = fj + 1
       }
@@ -4312,12 +4331,7 @@ function emitModule(stmts: i32[]): i32 {
       appendAll(typePayload, ulebToArr(cnt))
       let fj = 0
       while fj < cnt {
-        if variantFieldTypeAt(vi, fj) == 3 {
-          typePayload.push(100)  // 0x64 (ref ht) — non-null string ref
-          appendAll(typePayload, ulebToArr(aTypeIdx))
-        } else {
-          typePayload.push(127)  // 0x7f i32 storagetype
-        }
+        pushFieldStorage(typePayload, variantFieldTypeAt(vi, fj))
         typePayload.push(1)      // mutable
         fj = fj + 1
       }
@@ -4603,6 +4617,38 @@ function nameIsString(name: string): boolean {
   name == "string"
 }
 
+// The per-field wasm-type code for a struct / union-variant field whose type node is
+// `tyIx` (a `TypeRef`). Mirrors the inline classifier `collectS`/`collectVariantFields`
+// used to use, EXTENDED with array-typed fields (gap #5): a field of array type stores a
+// REF to a list wrapper, so its code records WHICH wrapper:
+//   `0` = i32 / boolean   (`0x7f`)
+//   `3` = string          (`(ref $aTypeIdx)`)
+//   `4` = i32 list  `i32[]`         (`(ref $lTypeIdx)`)
+//   `5` = ref list  `T[]` / `N[]`   (`(ref $rlTypeIdx)`)
+// An `X[]` whose element `X` is not `i32` is a REF list (`5`) — its element is a struct
+// or the union box; the element-kind (`rElemKind`) is fixed globally by `collectA`, so it
+// is not stored per-field. An unsupported field type yields `-1` (caller fails loudly).
+// (`string[]` is NOT yet supported — it would need a string-ref list distinct from the
+// struct/union ref backing — so it falls through to `-1`.)
+function fieldTypeCode(tyIx: i32): i32 {
+  if tyIx < 0 { return 0 - 1 }
+  let ty = P.nodes[tyIx]
+  if ty is TypeRef {
+    if ty.tyName == "i32" { return 0 }
+    if ty.tyName == "boolean" { return 0 }
+    if nameIsString(ty.tyName) { return 3 }
+    if nameIsArray(ty.tyName) {
+      if nameIsI32Array(ty.tyName) { return 4 }
+      // An `X[]` over a non-i32 element. `string[]` has no list type yet → reject.
+      let nm = ty.tyName
+      if nm == "string[]" { return 0 - 1 }
+      return 5
+    }
+    return 0 - 1
+  }
+  0 - 1
+}
+
 // Validate an array type-name as a supported element type: `i32[]` (the value list),
 // or a REF list `S[]`/`N[]` over the declared struct / union alias (G7-ref). A nested
 // `i32[][]` or an array of an unknown / unsupported element fails loudly. Returns 0 on
@@ -4737,23 +4783,11 @@ function collectS(stmts: i32[]): i32 {
         while fi < fields.length {
           let fnode = P.nodes[fields[fi]]
           if fnode is FieldDef {
-            if fnode.fdType < 0 {
-              return emitFail("emitProgram: only i32 struct fields are supported")
+            let code = fieldTypeCode(fnode.fdType)
+            if code < 0 {
+              return emitFail("emitProgram: only i32 / boolean / string / array struct fields are supported")
             }
-            let ty = P.nodes[fnode.fdType]
-            if ty is TypeRef {
-              if ty.tyName == "i32" {
-                sFieldTypes.push(0)
-              } else if ty.tyName == "boolean" {
-                sFieldTypes.push(0)
-              } else if nameIsString(ty.tyName) {
-                sFieldTypes.push(3)
-              } else {
-                return emitFail("emitProgram: only i32 struct fields are supported")
-              }
-            } else {
-              return emitFail("emitProgram: struct field type is not a type name")
-            }
+            sFieldTypes.push(code)
             sFieldNames.push(fnode.fdName)
             cnt = cnt + 1
           } else {
@@ -4788,23 +4822,11 @@ function collectVariantFields(stmts: i32[], name: string): i32 {
         while fi < fields.length {
           let fnode = P.nodes[fields[fi]]
           if fnode is FieldDef {
-            if fnode.fdType < 0 {
-              return emitFail("emitProgram: only i32 union-variant fields are supported")
+            let code = fieldTypeCode(fnode.fdType)
+            if code < 0 {
+              return emitFail("emitProgram: only i32 / boolean / string / array union-variant fields are supported")
             }
-            let ty = P.nodes[fnode.fdType]
-            if ty is TypeRef {
-              if ty.tyName == "i32" {
-                uFieldTypes.push(0)
-              } else if ty.tyName == "boolean" {
-                uFieldTypes.push(0)
-              } else if nameIsString(ty.tyName) {
-                uFieldTypes.push(3)
-              } else {
-                return emitFail("emitProgram: only i32 union-variant fields are supported")
-              }
-            } else {
-              return emitFail("emitProgram: union-variant field type is not a type name")
-            }
+            uFieldTypes.push(code)
             uFieldNames.push(fnode.fdName)
             cnt = cnt + 1
           } else {
@@ -5320,6 +5342,32 @@ function declaredArray(name: string): boolean {
 // True if evaluating the expression at `exprIx` yields the i32 array: an array
 // literal (with i32 / no elements — a ref-element literal is NOT this), an
 // array-returning call, an array param/local reference, or a parenthesized array
+// The wasm-type code of the struct / variant FIELD a `Member` expression at `memIx`
+// reads (`0` i32, `3` string, `4` i32-list, `5` ref-list), or `-1` if `memIx` is not a
+// field read of a known struct/variant field. Mirrors `exprString`'s Member dispatch:
+// a read on a NARROWED union identifier reads the variant field's type; otherwise the
+// receiver's struct field's type. Used by `exprArray`/`exprRefArray` to type array-field
+// reads (gap #5) so `.length` / indexing / assignment treat the result as a list.
+function memFieldTypeCode(memIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[memIx]
+  if e is Member {
+    if memIsNarrowed(memIx) {
+      let vi = variantIndexOf(narrowVariant)
+      if vi >= 0 {
+        let vfi = variantFieldIndex(vi, e.memProp)
+        if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
+      }
+      return 0 - 1
+    }
+    let si = structIndexOfExpr(e.memObj, fnIx)
+    if si >= 0 {
+      let fi = sFieldIndex(si, e.memProp)
+      if fi >= 0 { return sFieldTypeAt(si, fi) }
+    }
+  }
+  0 - 1
+}
+
 // expression. An index read / `.length` yields an i32, so neither counts.
 function exprArray(exprIx: i32, fnIx: i32): boolean {
   if exprIx < 0 { return false }
@@ -5335,6 +5383,11 @@ function exprArray(exprIx: i32, fnIx: i32): boolean {
     if paramArray(fnIx, e.identName) { return true }
     if declaredArray(e.identName) { return true }
     return globalIsArray(e.identName)
+  }
+  // A field read `p.items` whose struct field is an `i32[]` (code `4`) yields the i32
+  // list wrapper ref — so `.length` / indexing / assignment treat it as a list (gap #5).
+  if e is Member {
+    if memFieldTypeCode(exprIx, fnIx) == 4 { return true }
   }
   false
 }
@@ -5424,6 +5477,11 @@ function exprRefArray(exprIx: i32, fnIx: i32): boolean {
     if paramRefArray(fnIx, e.identName) { return true }
     if declaredRefArray(e.identName) { return true }
     return globalIsRefArray(e.identName)
+  }
+  // A field read `p.items` whose struct field is a `T[]`/`N[]` (code `5`) yields the ref
+  // list wrapper ref — so `.length` / indexing / assignment treat it as a ref list.
+  if e is Member {
+    if memFieldTypeCode(exprIx, fnIx) == 5 { return true }
   }
   false
 }
