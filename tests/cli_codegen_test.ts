@@ -9,9 +9,12 @@
 //         and stderr contains "Codegen error:"
 //   - A normal, fully valid file passes both paths (exit 0 each).
 //
-// The codegen-erroring fixture mirrors the one used in scripts/smoke-binary.ts:
-// a `Tree` type whose `kids` field holds a map of `Tree` values, which causes
-// binaryen to exceed its recursion limit during type layout.
+// The codegen-erroring fixture is a `Tree` type whose `kids` field holds a MAP
+// of `Tree` values (`{ [string]: Tree }`), which causes binaryen to exceed its
+// recursion limit during type layout. (Recursion through an *array* element —
+// `{ [i32]: Tree }` — is now supported via the WasmGC rec-group; the map hash
+// rep remains a distinct, still-unsupported recursion shape, so it is the stable
+// codegen-error fixture here.)
 //
 // Run with: deno test -A --no-check tests/cli_codegen_test.ts
 
@@ -51,11 +54,12 @@ const runCheckCapture = async (
 };
 
 // A file that type-checks cleanly but triggers "recursion limit exceeded" in
-// binaryen codegen: the `Tree` type recurses through a map element (kids: a map
-// of Tree), which causes binaryen to overflow its stack during type layout.
-// This is the same pattern used by scripts/smoke-binary.ts check #11.
+// binaryen codegen: the `Tree` type recurses through a MAP value (kids: a map of
+// Tree, `{ [string]: Tree }`), which causes binaryen to overflow its stack during
+// type layout. (The array-element form `{ [i32]: Tree }` now compiles, so the map
+// rep is the stable codegen-error fixture.)
 const CODEGEN_ERROR_SRC =
-  `type Tree = { value: i32, kids: { [i32]: Tree } | null }\n` +
+  `type Tree = { value: i32, kids: { [string]: Tree } | null }\n` +
   `let t: Tree = { value: 1, kids: null }\n` +
   `print(t.value)\n`;
 

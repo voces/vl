@@ -740,12 +740,48 @@ export const toWasm = async (
             .map((f) => `${f.name}:${structSig(f.type, nameStack)}`)
             .join(",")
         }}`;
+      } else if (isListType(soft)) {
+        // A list (`T[]`) field can carry the recursion through its ELEMENT
+        // type (A11: `type List = { rest: List[] }`). Recurse into the element
+        // with the same `nameStack` so a self-reference inside it closes the
+        // de Bruijn cycle here, instead of bailing to `toWasmType` — which would
+        // re-enter the whole type build on a still-unfinished struct and loop.
+        result = prefix +
+          `[${structSig(arrayElementType(soft)!, nameStack)}]`;
       } else {
         result = prefix + `#${toWasmType(t)}`;
       }
     }
     if (cacheable) structSigCache.set(type, result);
     return result;
+  };
+
+  // Follow a (possibly nullable) field/type to the LIST it denotes, or null —
+  // the array-element analogue of `asStructTarget`. A field `rest: List[]`
+  // carries the recursion through its element type, not through a struct edge,
+  // so the recursion group must also pull in the list's `{backing,len,cap}`
+  // struct and its backing array (each forward-referencing the recursive
+  // element struct). A non-list (or a list of a non-struct element, which can
+  // never close a struct cycle) returns null and stays on the independent
+  // `listType`/`arrayType` interner path.
+  const asListTarget = (
+    type: VLType,
+  ): { node: VLObjectType; element: VLType; nullable: boolean } | null => {
+    let t = softenImplicitType(type);
+    while (t.type === "Infer") t = softenImplicitType(t.subType);
+    let nullable = false;
+    if (t.type === "Nullable") {
+      nullable = true;
+      t = softenImplicitType(t.subType);
+      while (t.type === "Infer") t = softenImplicitType(t.subType);
+    }
+    if (!isListType(t)) return null;
+    // Keep the element as its RAW (possibly lazy `Alias`) leaf — softening it
+    // here would `getConcreteType`-expand a recursive self-reference into the
+    // cyclic struct and loop. `asStructTarget` does the bounded one-level
+    // expansion where a struct edge is actually needed.
+    const element = arrayElementType(t as VLObjectType)!;
+    return { node: t as VLObjectType, element, nullable };
   };
 
   const objectStruct = (type: VLObjectType): ObjectStruct => {
@@ -759,25 +795,65 @@ export const toWasm = async (
     // Only that group needs a shared WasmGC rec group with forward references; a
     // non-recursive nested struct is built independently (keeping its own
     // identity, so identical shapes still share one type across the module).
-    const nodes = new Map<
-      string,
-      { fields: { name: string; type: VLType }[]; targets: string[] }
-    >();
-    const visit = (t: VLObjectType) => {
+    //
+    // A11 array-element recursion (`type List = { rest: List[] }`): the cycle
+    // can pass through a LIST field, not just a struct field. So the graph holds
+    // three node kinds — a structural `struct`, the `{backing,len,cap}` `list`
+    // struct, and its backing `array` — and a recursive list field threads them
+    // all into the one rec group (list -> array -> element struct -> list …).
+    type Node =
+      | { kind: "struct"; obj: VLObjectType; targets: string[] }
+      | { kind: "list"; element: VLType; targets: string[] }
+      | { kind: "array"; element: VLType; targets: string[] };
+    const nodes = new Map<string, Node>();
+    // Distinct sig namespaces so a struct, the list wrapping it, and the array
+    // backing that list never collide on one key.
+    const listSig = (element: VLType) => `[list]${structSig(element)}`;
+    const arraySig = (element: VLType) => `[array]${structSig(element)}`;
+
+    const visitStruct = (t: VLObjectType) => {
       const s = structSig(t);
       if (objectStructs.has(s) || nodes.has(s)) return;
-      const fields = structFields(t);
       const targets: string[] = [];
-      nodes.set(s, { fields, targets });
-      for (const f of fields) {
-        const target = asStructTarget(f.type);
-        if (target) {
-          targets.push(structSig(target));
-          visit(target);
+      const node: Node = { kind: "struct", obj: t, targets };
+      nodes.set(s, node);
+      for (const f of structFields(t)) {
+        const structTarget = asStructTarget(f.type);
+        if (structTarget) {
+          targets.push(structSig(structTarget));
+          visitStruct(structTarget);
+          continue;
+        }
+        const listTarget = asListTarget(f.type);
+        if (listTarget) {
+          targets.push(listSig(listTarget.element));
+          visitList(listTarget.element);
         }
       }
     };
-    visit(type);
+    // A list field joins the group as two nodes: the list struct (which refers
+    // to its backing array) and the array (which refers to the element struct,
+    // if the element is itself a struct in the cycle). The array always keeps a
+    // *nullable* element ref backing (`nonNullRefElement` widening), so a struct
+    // element is reachable but defaultable.
+    const visitList = (element: VLType) => {
+      const ls = listSig(element);
+      if (nodes.has(ls)) return;
+      const lTargets: string[] = [];
+      nodes.set(ls, { kind: "list", element, targets: lTargets });
+      const as = arraySig(element);
+      lTargets.push(as);
+      if (!nodes.has(as)) {
+        const aTargets: string[] = [];
+        nodes.set(as, { kind: "array", element, targets: aTargets });
+        const elemStruct = asStructTarget(element);
+        if (elemStruct) {
+          aTargets.push(structSig(elemStruct));
+          visitStruct(elemStruct);
+        }
+      }
+    };
+    visitStruct(type);
 
     // The SCC of `sig`: every reachable node is reachable *from* `sig` (we walked
     // from it), so a node shares `sig`'s component iff it can reach `sig` back.
@@ -804,40 +880,124 @@ export const toWasm = async (
       nodes.get(s)!.targets.some((t) => sigToIndex.has(t))
     );
     if (recursive) tb.createRecGroup(0, group.length);
-    // A field's wasm type: a forward (builder-local) reference for an in-group
-    // (recursive) struct, else normal lowering — which builds and caches a
-    // non-recursive nested struct independently, referenced as a finalized type.
+    // A builder-local forward ref to an in-group member, or `null` if `target`
+    // sig is not part of this rec group (it was built/finalized elsewhere).
+    const tempRef = (targetSig: string, nullable: boolean): number | null => {
+      const idx = sigToIndex.get(targetSig);
+      if (idx === undefined) return null;
+      return tb.getTempRefType(tb.getTempHeapType(idx), nullable);
+    };
+    // A struct field's wasm type: a forward (builder-local) reference for an
+    // in-group (recursive) struct or list, else normal lowering — which builds
+    // and caches a non-recursive nested type independently.
     const fieldWasmType = (ft: VLType): number => {
-      const target = asStructTarget(ft);
-      const idx = target && sigToIndex.get(structSig(target));
-      if (idx !== undefined && idx !== null) {
+      const structTarget = asStructTarget(ft);
+      if (structTarget) {
         let nt = softenImplicitType(ft);
         while (nt.type === "Infer") nt = softenImplicitType(nt.subType);
-        return tb.getTempRefType(
-          tb.getTempHeapType(idx),
-          nt.type === "Nullable",
-        );
+        const ref = tempRef(structSig(structTarget), nt.type === "Nullable");
+        if (ref !== null) return ref;
+      }
+      const listTarget = asListTarget(ft);
+      if (listTarget) {
+        const ref = tempRef(listSig(listTarget.element), listTarget.nullable);
+        if (ref !== null) return ref;
       }
       return toWasmType(ft);
     };
-    group.forEach((s, i) => {
-      tb.setStructType(
-        i,
-        nodes.get(s)!.fields.map((f) => ({
-          type: fieldWasmType(f.type),
-          packedType: binaryen.notPacked,
-          mutable: true,
-        })),
-      );
-    });
+    // The backing array's slot wasm type: a *nullable* forward ref to the
+    // in-group element struct (matching `arrayType`'s `nonNullRefElement`
+    // widening — null is the defaultable fill), else normal element lowering.
+    const arraySlotWasmType = (element: VLType): number => {
+      const elemStruct = asStructTarget(element);
+      if (elemStruct) {
+        const ref = tempRef(structSig(elemStruct), true);
+        if (ref !== null) return ref;
+      }
+      return nonNullRefElement(element)
+        ? nullableOf(toWasmType(element))
+        : toWasmType(element);
+    };
+    for (const s of group) {
+      const i = sigToIndex.get(s)!;
+      const node = nodes.get(s)!;
+      if (node.kind === "struct") {
+        tb.setStructType(
+          i,
+          structFields(node.obj).map((f) => ({
+            type: fieldWasmType(f.type),
+            packedType: binaryen.notPacked,
+            mutable: true,
+          })),
+        );
+      } else if (node.kind === "array") {
+        tb.setArrayType(
+          i,
+          arraySlotWasmType(node.element),
+          binaryen.notPacked,
+          true,
+        );
+      } else {
+        // list struct: { backing: (ref $array), len: i32, cap: i32 }
+        const backing = tempRef(arraySig(node.element), false) ??
+          arrayType(node.element).refType;
+        tb.setStructType(i, [
+          { type: backing, packedType: binaryen.notPacked, mutable: true },
+          { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+          { type: binaryen.i32, packedType: binaryen.notPacked, mutable: true },
+        ]);
+      }
+    }
     const heapTypes = tb.buildAndDispose();
-    group.forEach((s, i) => {
+    const refOf = (s: string) =>
+      binaryen.getTypeFromHeapType(heapTypes[sigToIndex.get(s)!], false);
+    // Register in a fixed kind order — structs, then arrays, then lists — so each
+    // later kind can resolve `toWasmType`/`arrayType` of an element it depends on
+    // against an already-registered earlier kind (no re-entrant rebuild).
+    const byKind = (k: Node["kind"]) =>
+      group.filter((s) => nodes.get(s)!.kind === k);
+    for (const s of byKind("struct")) {
+      const i = sigToIndex.get(s)!;
+      const node = nodes.get(s)! as Extract<Node, { kind: "struct" }>;
       objectStructs.set(s, {
         heapType: heapTypes[i],
-        refType: binaryen.getTypeFromHeapType(heapTypes[i], false),
-        fields: nodes.get(s)!.fields.map((f, index) => ({ ...f, index })),
+        refType: refOf(s),
+        fields: structFields(node.obj).map((f, index) => ({ ...f, index })),
       });
-    });
+    }
+    // Safe now that group structs are registered (a recursive struct element
+    // resolves `toWasmType` to its built type, no re-entrant rebuild).
+    for (const s of byKind("array")) {
+      const node = nodes.get(s)! as Extract<Node, { kind: "array" }>;
+      const heapType = heapTypes[sigToIndex.get(s)!];
+      // Register under `arrayType`'s key so later read/construct sites reuse it.
+      const elemWasm = toWasmType(node.element);
+      if (!arrayTypes.has(elemWasm)) {
+        arrayTypes.set(elemWasm, {
+          heapType,
+          refType: refOf(s),
+          element: node.element,
+          elemWasm,
+          backingWasm: nonNullRefElement(node.element)
+            ? nullableOf(elemWasm)
+            : elemWasm,
+        });
+      }
+    }
+    for (const s of byKind("list")) {
+      const node = nodes.get(s)! as Extract<Node, { kind: "list" }>;
+      // The backing array — the in-group one we registered above (now found via
+      // `arrayType`'s cache), keyed the same way the standalone `listType` keys.
+      const backing = arrayType(node.element);
+      if (!listTypes.has(backing.heapType)) {
+        listTypes.set(backing.heapType, {
+          heapType: heapTypes[sigToIndex.get(s)!],
+          refType: refOf(s),
+          element: node.element,
+          backing,
+        });
+      }
+    }
     return objectStructs.get(sig)!;
   };
 
@@ -3611,7 +3771,7 @@ export const toWasm = async (
         // union/nullable that boxes (`unionInfo` non-null). For non-boxing desired
         // elements the value-inferred element stays authoritative (it already
         // matches and may be more concrete).
-        let info = node.values.length === 0 ? null : listTypeOf(node);
+        let info: { lt: ListType; element: VLType } | null = null;
         if (desiredType) {
           let dt = softenImplicitType(desiredType);
           while (dt.type === "Nullable") dt = softenImplicitType(dt.subType);
@@ -3619,14 +3779,25 @@ export const toWasm = async (
           if (dtElem) {
             const soft = softenImplicitType(dtElem);
             // Empty literal: nothing to infer from, take the desired element.
-            // Non-empty: only override when the desired element is a boxed
-            // union/nullable (so variant values get boxed into its rep).
-            if (!info || unionInfo(soft)) {
+            // Non-empty: override when the desired element is a boxed
+            // union/nullable (so variant values get boxed into its rep), OR a
+            // structural struct whose inferred-from-values shape may be LESS
+            // pinned than the annotation. The latter is the A11 array-element
+            // recursion case (`List[]` whose element `{ value, rest: List[] }`
+            // nests an empty `rest: []` that the value-inferred element leaves as
+            // a degenerate empty list); taking the annotated struct element lets
+            // each value's nested empties pin via the object-literal merge.
+            // We resolve this BEFORE the inferred `listTypeOf` so a degenerate
+            // empty nested element never reaches `structSig` (it would throw
+            // "cannot infer" on the empty-union slot).
+            const structElem = soft.type === "Object" &&
+              soft.name === undefined && arrayElementType(soft) === null;
+            if (node.values.length === 0 || unionInfo(soft) || structElem) {
               info = { lt: listType(soft), element: soft };
             }
           }
         }
-        if (!info) info = listTypeOf(node);
+        if (!info && node.values.length > 0) info = listTypeOf(node);
         if (!info) throw new Error("Array literal did not resolve to a list");
         const values = node.values.map((v) =>
           withDesiredType(info!.element, () => toExpression(v))

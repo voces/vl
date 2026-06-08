@@ -66,8 +66,9 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   `Buffer<N>`) — today generics take *type* params only; enabler for the parameterized
   `Decimal<Backing, Scale>` family (B2) and any fixed-size/parameter-by-value type.
   (Forward/mutual-reference return-type inference: shipped as A17 — see `CHANGELOG.md`.)
-- 🟡 **A11. Recursive structural types.** REMAINING: mutual recursion across *separate* `type` decls;
-  recursion through an **array** element (`{ rest: [List] }`).
+- 🟢 **A11. Recursive structural types.** Done: self-recursion, mutual recursion across *separate*
+  `type` decls, AND recursion through an **array** element (`type List = { rest: List[] }` — the
+  element struct, its list wrapper, and the backing array build in one WasmGC rec group). See `CHANGELOG.md`.
 - 🟡 **A12. Soundness corpus.** REMAINING: keep growing it; the known-unsound corners are
   `xfail`-marked (e.g. the permissive `i32 + string` hole rule, A13).
   **Known bugs (all RESOLVED; pinned by passing cases):**
