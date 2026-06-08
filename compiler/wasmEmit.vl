@@ -539,6 +539,15 @@ let pushScratchBase: i32 = 0
 let fnUsesRefPush: boolean = false
 let refPushScratchBase: i32 = 0
 
+// The string-list `.push` scratch quad (`string[]` field append): `pushStrVal` (a
+// non-null `(ref $aTypeIdx)` string), `pushStrCap` (i32), `pushStrBacking` (a non-null
+// `(ref $mkArrIdx)` string backing), `pushStrRecvRef` (a non-null `(ref $mkListIdx)`
+// wrapper, for a struct-FIELD receiver). Allocated AFTER the ref-push frame, only in a
+// function that pushes onto a `string[]`. `fnUsesStrPush` records the reservation;
+// `strPushScratchBase` is `pushStrVal`'s index.
+let fnUsesStrPush: boolean = false
+let strPushScratchBase: i32 = 0
+
 // ── per-function string-op scratch locals (G6: `+` / `==`/`!=` / `.slice`) ────
 // String concatenation, value-equality, and slice all lower INLINE (no helper
 // functions in this emitter), and each needs temporaries to stash the operand
@@ -889,18 +898,20 @@ function buildLocals(fnIx: i32): i32 {
 
 // True if the statement at `stmtIx` is a `recv.push(x)` member-call (the `Call` whose
 // `callFn` is a `Member` with property `push`) whose RECEIVER's list kind matches
-// `wantRef` — `wantRef = false` selects an i32-list push, `true` a ref-list push (G7-ref).
-// Used to detect which inline-push scratch locals (i32 triple / ref triple) a function
-// needs; the two kinds get DISTINCT scratch slots so a function may push onto both.
-function stmtIsPushKind(stmtIx: i32, fnIx: i32, wantRef: boolean): boolean {
+// `kind` — `0` selects an i32-list push, `1` a ref-list push (G7-ref), `2` a string-list
+// push (`string[]`). Used to detect which inline-push scratch locals a function needs;
+// the three kinds get DISTINCT scratch frames so a function may push onto any mix.
+function stmtIsPushKind(stmtIx: i32, fnIx: i32, kind: i32): boolean {
   let s = P.nodes[stmtIx]
   if s is Call {
     let callee = P.nodes[s.callFn]
     if callee is Member {
       if callee.memProp == "push" {
         let isRef = exprRefArray(callee.memObj, fnIx)
-        if wantRef { return isRef }
-        return !isRef
+        let isStr = exprStringArray(callee.memObj, fnIx)
+        if kind == 1 { return isRef }
+        if kind == 2 { return isStr }
+        return !isRef && !isStr
       }
     }
   }
@@ -910,32 +921,32 @@ function stmtIsPushKind(stmtIx: i32, fnIx: i32, wantRef: boolean): boolean {
 // True if the block at `blockIx` (descending into `if` branches and `while` bodies, the
 // same scopes `collectLocals` walks) contains a `.push` of kind `wantRef`. A function
 // with such a push reserves the matching three scratch locals after its declared locals.
-function blockHasPushKind(blockIx: i32, fnIx: i32, wantRef: boolean): boolean {
+function blockHasPushKind(blockIx: i32, fnIx: i32, kind: i32): boolean {
   let b = P.nodes[blockIx]
   if b is Block {
     let stmts = b.blkStmts
     let i = 0
     while i < stmts.length {
-      if stmtIsPushKind(stmts[i], fnIx, wantRef) { return true }
+      if stmtIsPushKind(stmts[i], fnIx, kind) { return true }
       let s = P.nodes[stmts[i]]
       if s is IfStmt {
-        if blockHasPushKind(s.ifThen, fnIx, wantRef) { return true }
+        if blockHasPushKind(s.ifThen, fnIx, kind) { return true }
         if s.ifElse >= 0 {
           let els = P.nodes[s.ifElse]
           if els is Block {
-            if blockHasPushKind(s.ifElse, fnIx, wantRef) { return true }
+            if blockHasPushKind(s.ifElse, fnIx, kind) { return true }
           } else if els is IfStmt {
-            if blockHasPushKind(els.ifThen, fnIx, wantRef) { return true }
+            if blockHasPushKind(els.ifThen, fnIx, kind) { return true }
             if els.ifElse >= 0 {
               let els2 = P.nodes[els.ifElse]
               if els2 is Block {
-                if blockHasPushKind(els.ifElse, fnIx, wantRef) { return true }
+                if blockHasPushKind(els.ifElse, fnIx, kind) { return true }
               }
             }
           }
         }
       } else if s is WhileStmt {
-        if blockHasPushKind(s.whileBody, fnIx, wantRef) { return true }
+        if blockHasPushKind(s.whileBody, fnIx, kind) { return true }
       }
       i = i + 1
     }
@@ -947,7 +958,7 @@ function blockHasPushKind(blockIx: i32, fnIx: i32, wantRef: boolean): boolean {
 function fnHasPush(fnIx: i32): boolean {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    return blockHasPushKind(fn.fnBody, fnIx, false)
+    return blockHasPushKind(fn.fnBody, fnIx, 0)
   }
   false
 }
@@ -956,7 +967,16 @@ function fnHasPush(fnIx: i32): boolean {
 function fnHasRefPush(fnIx: i32): boolean {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    return blockHasPushKind(fn.fnBody, fnIx, true)
+    return blockHasPushKind(fn.fnBody, fnIx, 1)
+  }
+  false
+}
+
+// True if the FuncDecl at `fnIx` contains a string-list (`string[]`) `.push` anywhere.
+function fnHasStrPush(fnIx: i32): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    return blockHasPushKind(fn.fnBody, fnIx, 2)
   }
   false
 }
@@ -3480,10 +3500,15 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
       // already classify a `Member` array-field read, so the only extra work for a field
       // receiver is to materialize its wrapper ref into the `recvRef` scratch slot.
       let isRef = exprRefArray(callee.memObj, fnIx)
-      if !isRef && !exprArray(callee.memObj, fnIx) {
+      let isStr = exprStringArray(callee.memObj, fnIx)
+      if !isRef && !isStr && !exprArray(callee.memObj, fnIx) {
         return emitFail("emitProgram: .push receiver is not a list")
       }
-      // Pick the list/backing type indices + scratch base for this push kind.
+      // Pick the list/backing type indices + scratch base for this push kind. A string
+      // list (`string[]`) runs the IDENTICAL grow/append sequence over its wrapper/backing
+      // (`mkListIdx`/`mkArrIdx`) + the string-push quad: `array.new_default` over the
+      // `(ref null $aTypeIdx)` backing zero-inits spare slots to null, and `array.set`
+      // writes the non-null string ref (a subtype of the slot).
       let lTy = lTypeIdx
       let aTy = aTypeIdx
       let base = pushScratchBase
@@ -3494,6 +3519,13 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         lTy = rlTypeIdx
         aTy = raTypeIdx
         base = refPushScratchBase
+      } else if isStr {
+        if !slUsed {
+          return emitFail("emitProgram: string .push but string list type not collected")
+        }
+        lTy = mkListIdx
+        aTy = mkArrIdx
+        base = strPushScratchBase
       } else if !lUsed {
         return emitFail("emitProgram: .push but list type not collected")
       }
@@ -3971,6 +4003,7 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     // `.push` can resolve its scratch slots.
     fnUsesPush = fnHasPush(fnIx)
     fnUsesRefPush = fnHasRefPush(fnIx)
+    fnUsesStrPush = fnHasStrPush(fnIx)
     fnUsesStrOp = fnHasStrOp(fnIx)
     fnUsesMap = fnHasMap(fnIx)
     let nLocals = localNames.length
@@ -3984,14 +4017,19 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     let i32Scratch = 0
     if fnUsesPush { i32Scratch = 4 }
     refPushScratchBase = fn.fnParams.length + nLocals + i32Scratch
-    // The string-op scratch frame (if any) follows BOTH push frames.
+    // The string-list push frame (if any) follows the ref-push frame — also FOUR slots
+    // (string val / cap / string backing / wrapper recvRef).
     let refScratch = 0
     if fnUsesRefPush { refScratch = 4 }
-    strScratchBase = fn.fnParams.length + nLocals + i32Scratch + refScratch
+    strPushScratchBase = fn.fnParams.length + nLocals + i32Scratch + refScratch
+    // The string-op scratch frame (if any) follows ALL THREE push frames.
+    let strPushScratch = 0
+    if fnUsesStrPush { strPushScratch = 4 }
+    strScratchBase = fn.fnParams.length + nLocals + i32Scratch + refScratch + strPushScratch
     // The G8 map scratch frame (if any) follows the string-op frame.
     let strScratch = 0
     if fnUsesStrOp { strScratch = 7 }
-    mapScratchBase = fn.fnParams.length + nLocals + i32Scratch + refScratch + strScratch
+    mapScratchBase = fn.fnParams.length + nLocals + i32Scratch + refScratch + strPushScratch + strScratch
 
     let bodyExpr: i32[] = []
     if emitFuncBody(bodyExpr, fn.fnBody, fnIx) < 0 { return 0 - 1 }
@@ -4007,6 +4045,8 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     let nRuns = nLocals
     if fnUsesPush { nRuns = nRuns + 4 }
     if fnUsesRefPush { nRuns = nRuns + 4 }
+    // The string-list push frame: 4 slots (string val / cap / string backing / wrapper).
+    if fnUsesStrPush { nRuns = nRuns + 4 }
     // The G6 string-op frame: 3 non-null string refs + 4 i32 temporaries.
     if fnUsesStrOp { nRuns = nRuns + 7 }
     // The G8 map frame: 12 slots (see the map scratch layout / the probe + rehash).
@@ -4042,6 +4082,22 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(1)
       body.push(100)         // pushRefRecvRef: 0x64 (ref $rlTypeIdx) — the ref-list wrapper
       appendAll(body, ulebToArr(rlTypeIdx))  // ref for a struct-FIELD receiver (gap #3).
+    }
+    if fnUsesStrPush {
+      // The string-list push quad: pushStrVal (a non-null string), pushStrCap (i32),
+      // pushStrBacking (a non-null `(ref $mkArrIdx)`), pushStrRecvRef (a non-null
+      // `(ref $mkListIdx)` wrapper, for a struct-FIELD receiver).
+      body.push(1)
+      body.push(100)         // pushStrVal: 0x64 (ref $aTypeIdx) — non-null string ref
+      appendAll(body, ulebToArr(aTypeIdx))
+      body.push(1)
+      body.push(127)         // pushStrCap: 0x7f i32
+      body.push(1)
+      body.push(100)         // pushStrBacking: 0x64 (ref $mkArrIdx) — non-null string backing
+      appendAll(body, ulebToArr(mkArrIdx))
+      body.push(1)
+      body.push(100)         // pushStrRecvRef: 0x64 (ref $mkListIdx) — the string-list wrapper
+      appendAll(body, ulebToArr(mkListIdx))
     }
     if fnUsesStrOp {
       // strScrA / strScrB / strScrOut: 3 non-null `(ref $aTypeIdx)` string refs.
