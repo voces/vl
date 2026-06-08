@@ -4809,6 +4809,125 @@ function fbBeginFunc(nParams: i32, nLocals: i32): i32 {
   fbScratchCur
 }
 
+// ── locals-vector emission (derived, never separately counted) ────────────────
+// The locals vector is a sequence of (count, valtype) runs. This emitter uses a
+// count of 1 per local — one run per declared local and per scratch slot — so the
+// run total equals the local count. The run helpers below stream straight to
+// `curBuf` (bind it with `wTarget` first); each emits the `1` count then a valtype.
+
+// One (1, i32) run — `0x7f`.
+function fbI32Run(): i32 {
+  wU8(1)
+  wU8(127)                 // 0x7f i32
+  0
+}
+
+// One (1, (ref ht)) run — non-null `0x64 <uleb heapIdx>`.
+function fbRefRun(heapIdx: i32): i32 {
+  wU8(1)
+  wU8(100)                 // 0x64 (ref ht) — non-null ref
+  wULEB(heapIdx)
+  0
+}
+
+// One (1, valtype) run for a DECLARED local, via the shared `fbValtype` switch
+// (`kind`/`structIdx` are the `localIsRef`/`localStructIdx` codes).
+function fbLocalRun(kind: i32, structIdx: i32): i32 {
+  wU8(1)
+  fbValtype(kind, structIdx)
+  0
+}
+
+// The number of (count=1) runs this function's locals vector holds: one per declared
+// local plus the slot count of every reserved scratch frame. DERIVED from the same
+// `fnUses*` flags + `fnRefPushSlots` that drove `fbBeginFunc`, so it cannot desync
+// from the actual layout.
+function fbLocalsCount(nLocals: i32): i32 {
+  let n = nLocals
+  if fnUsesPush { n = n + 4 }
+  n = n + fnRefPushSlots.length * 4
+  if fnUsesStrPush { n = n + 4 }
+  if fnUsesStrOp { n = n + 7 }
+  if fnUsesMap { n = n + 12 }
+  n
+}
+
+// Emit the full locals vector onto `body`: the run count, then one (1, valtype) run
+// per declared local, then the scratch frames in `fbBeginFunc`'s layout order
+// (i32-push quad, per-slot ref-push quads, string-push quad, string-op frame, map
+// frame). Byte-identical to the old hand-written block; derived from the local set
+// and scratch flags rather than separately counted. Returns 0.
+function fbEmitLocalsVec(body: i32[], nLocals: i32): i32 {
+  let prev = wTarget(body)
+  wULEB(fbLocalsCount(nLocals))
+  // Declared locals (struct / list / string / ref-list ref or i32 — see `fbValtype`).
+  let li = 0
+  while li < nLocals {
+    fbLocalRun(localIsRef[li], localStructIdx[li])
+    li = li + 1
+  }
+  // i32-list push grow quad: pushVal i32, pushNewCap i32, pushNewBacking (ref $aTypeIdx),
+  // pushRecvRef (ref $lTypeIdx) — the wrapper ref for a struct-FIELD receiver (gap #3).
+  if fnUsesPush {
+    fbI32Run()
+    fbI32Run()
+    fbRefRun(aTypeIdx)
+    fbRefRun(lTypeIdx)
+  }
+  // One typed 4-slot ref-push frame per distinct pushed element-type slot, in
+  // `fnRefPushSlots` order: pushRefVal (ref $elem), pushRefCap i32,
+  // pushRefBacking (ref $back), pushRefRecvRef (ref $wrap).
+  let rfk = 0
+  while rfk < fnRefPushSlots.length {
+    let rfs = fnRefPushSlots[rfk]
+    fbRefRun(rlElemHeap[rfs])
+    fbI32Run()
+    fbRefRun(rlBackIdx[rfs])
+    fbRefRun(rlWrapIdx[rfs])
+    rfk = rfk + 1
+  }
+  // String-list push quad: pushStrVal (ref $aTypeIdx), pushStrCap i32,
+  // pushStrBacking (ref $mkArrIdx), pushStrRecvRef (ref $mkListIdx).
+  if fnUsesStrPush {
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbRefRun(mkArrIdx)
+    fbRefRun(mkListIdx)
+  }
+  // String-op frame: strScrA/B/Out (3 non-null `(ref $aTypeIdx)` string refs),
+  // then strScrI0..strScrI3 (4 i32 temporaries).
+  if fnUsesStrOp {
+    fbRefRun(aTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbI32Run()
+    fbI32Run()
+    fbI32Run()
+  }
+  // G8 map scratch frame, in slot order (see the map scratch layout / probe + rehash):
+  //   0 mapRef (ref $mStructIdx), 1 keyRef (ref $aTypeIdx), 2 curRef (ref $aTypeIdx),
+  //   3 slot i32, 4 cap i32, 5 entry i32, 6 keysBk (ref $mkArrIdx),
+  //   7 valsBk (ref $aTypeIdx), 8 chr i32, 9 hcur i32, 10 idxBk (ref $aTypeIdx),
+  //   11 rslot i32.
+  if fnUsesMap {
+    fbRefRun(mStructIdx)
+    fbRefRun(aTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbI32Run()
+    fbI32Run()
+    fbRefRun(mkArrIdx)
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbI32Run()
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+  }
+  wTarget(prev)
+  0
+}
+
 // Build the size-prefixed code-section body for the FuncDecl at `fnIx`: the locals
 // vector (declared locals, all i32 — see `buildLocals`), the body's statement
 // instructions, then `end`. The framed bytes are appended onto `out`. Returns 0, or
@@ -4880,148 +4999,11 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     wTarget(exprPrev)
 
     let body: i32[] = []
-    // Locals vector: one (count=1, valtype) run per DECLARED local (a struct/list/string/
-    // ref-list ref or i32 — see `pushVT`), then — when this function pushes — three scratch
-    // runs PER push kind: the i32 triple (`pushVal` i32, `pushNewCap` i32, `pushNewBacking`
-    // non-null `(ref $aTypeIdx)`), then — for a ref-list push (G7-ref) — the ref triple
-    // (`pushRefVal` non-null `(ref $elem)`, `pushRefCap` i32, `pushRefBacking` non-null
-    // `(ref $raTypeIdx)`). Each scratch is non-defaultable but always `local.set` before
-    // read, which wasm validation accepts.
-    let nRuns = nLocals
-    if fnUsesPush { nRuns = nRuns + 4 }
-    nRuns = nRuns + refScratch
-    // The string-list push frame: 4 slots (string val / cap / string backing / wrapper).
-    if fnUsesStrPush { nRuns = nRuns + 4 }
-    // The G6 string-op frame: 3 non-null string refs + 4 i32 temporaries.
-    if fnUsesStrOp { nRuns = nRuns + 7 }
-    // The G8 map frame: 12 slots (see the map scratch layout / the probe + rehash).
-    if fnUsesMap { nRuns = nRuns + 12 }
-    appendAll(body, ulebToArr(nRuns))
-    // Bind the writer at `body` so `fbValtype` streams each declared local's
-    // valtype here, interleaved with the surrounding raw `body.push(1)` run counts.
-    let lvPrev = wTarget(body)
-    let li = 0
-    while li < nLocals {
-      body.push(1)
-      fbValtype(localIsRef[li], localStructIdx[li])
-      li = li + 1
-    }
-    wTarget(lvPrev)
-    if fnUsesPush {
-      body.push(1)
-      body.push(127)         // pushVal: 0x7f i32
-      body.push(1)
-      body.push(127)         // pushNewCap: 0x7f i32
-      body.push(1)
-      body.push(100)         // pushNewBacking: 0x64 (ref ht) — non-null, matches the
-      appendAll(body, ulebToArr(aTypeIdx))   // struct's non-null backing field.
-      body.push(1)
-      body.push(100)         // pushRecvRef: 0x64 (ref $lTypeIdx) — the i32-list wrapper
-      appendAll(body, ulebToArr(lTypeIdx))   // ref for a struct-FIELD receiver (gap #3).
-    }
-    // One typed 4-slot ref-push frame per distinct pushed element-type slot, in
-    // `fnRefPushSlots` order (matching `refPushBaseBySlot`): pushRefVal `(ref $elem)`,
-    // pushRefCap i32, pushRefBacking `(ref $back)`, pushRefRecvRef `(ref $wrap)` — each
-    // typed to THAT slot's element/backing/wrapper heap indices.
-    let rfk = 0
-    while rfk < fnRefPushSlots.length {
-      let rfs = fnRefPushSlots[rfk]
-      body.push(1)
-      body.push(100)         // pushRefVal: 0x64 (ref $elem) — non-null element ref
-      appendAll(body, ulebToArr(rlElemHeap[rfs]))
-      body.push(1)
-      body.push(127)         // pushRefCap: 0x7f i32
-      body.push(1)
-      body.push(100)         // pushRefBacking: 0x64 (ref $back) — non-null ref backing
-      appendAll(body, ulebToArr(rlBackIdx[rfs]))
-      body.push(1)
-      body.push(100)         // pushRefRecvRef: 0x64 (ref $wrap) — the ref-list wrapper
-      appendAll(body, ulebToArr(rlWrapIdx[rfs]))
-      rfk = rfk + 1
-    }
-    if fnUsesStrPush {
-      // The string-list push quad: pushStrVal (a non-null string), pushStrCap (i32),
-      // pushStrBacking (a non-null `(ref $mkArrIdx)`), pushStrRecvRef (a non-null
-      // `(ref $mkListIdx)` wrapper, for a struct-FIELD receiver).
-      body.push(1)
-      body.push(100)         // pushStrVal: 0x64 (ref $aTypeIdx) — non-null string ref
-      appendAll(body, ulebToArr(aTypeIdx))
-      body.push(1)
-      body.push(127)         // pushStrCap: 0x7f i32
-      body.push(1)
-      body.push(100)         // pushStrBacking: 0x64 (ref $mkArrIdx) — non-null string backing
-      appendAll(body, ulebToArr(mkArrIdx))
-      body.push(1)
-      body.push(100)         // pushStrRecvRef: 0x64 (ref $mkListIdx) — the string-list wrapper
-      appendAll(body, ulebToArr(mkListIdx))
-    }
-    if fnUsesStrOp {
-      // strScrA / strScrB / strScrOut: 3 non-null `(ref $aTypeIdx)` string refs.
-      body.push(1)
-      body.push(100)         // 0x64 (ref $aTypeIdx) — non-null string ref
-      appendAll(body, ulebToArr(aTypeIdx))
-      body.push(1)
-      body.push(100)
-      appendAll(body, ulebToArr(aTypeIdx))
-      body.push(1)
-      body.push(100)
-      appendAll(body, ulebToArr(aTypeIdx))
-      // strScrI0..strScrI3: 4 i32 temporaries.
-      body.push(1)
-      body.push(127)         // 0x7f i32
-      body.push(1)
-      body.push(127)
-      body.push(1)
-      body.push(127)
-      body.push(1)
-      body.push(127)
-    }
-    if fnUsesMap {
-      // The G8 hash-map scratch frame, in slot order (see the map scratch layout
-      // and the hash / probe / rehash helpers):
-      //   0 mapRef : (ref $mStructIdx)
-      //   1 keyRef : (ref $aTypeIdx)   — target key string
-      //   2 curRef : (ref $aTypeIdx)   — current probed key string
-      //   3 slot   : i32               — probe slot offset into `index`
-      //   4 cap    : i32               — index length (slot count)
-      //   5 entry  : i32               — index[slot] (entry+1; 0 = empty)
-      //   6 keysBk : (ref $mkArrIdx)   — grown keys backing
-      //   7 valsBk : (ref $aTypeIdx)   — grown vals backing
-      //   8 chr    : i32               — inner char cursor (key compare)
-      //   9 hcur   : i32               — hash accumulator / rehash entry cursor
-      //  10 idxBk  : (ref $aTypeIdx)   — fresh `index` backing (rehash)
-      //  11 rslot  : i32               — rehash inner probe slot
-      body.push(1)
-      body.push(100)         // 0x64 (ref $mStructIdx) — non-null map ref
-      appendAll(body, ulebToArr(mStructIdx))
-      body.push(1)
-      body.push(100)         // 0x64 (ref $aTypeIdx) — non-null key string ref
-      appendAll(body, ulebToArr(aTypeIdx))
-      body.push(1)
-      body.push(100)         // 0x64 (ref $aTypeIdx) — non-null current key ref
-      appendAll(body, ulebToArr(aTypeIdx))
-      body.push(1)
-      body.push(127)         // 3 slot: i32
-      body.push(1)
-      body.push(127)         // 4 cap: i32
-      body.push(1)
-      body.push(127)         // 5 entry: i32
-      body.push(1)
-      body.push(100)         // 0x64 (ref $mkArrIdx) — non-null keys backing
-      appendAll(body, ulebToArr(mkArrIdx))
-      body.push(1)
-      body.push(100)         // 0x64 (ref $aTypeIdx) — non-null vals backing
-      appendAll(body, ulebToArr(aTypeIdx))
-      body.push(1)
-      body.push(127)         // 8 chr: i32
-      body.push(1)
-      body.push(127)         // 9 hcur: i32
-      body.push(1)
-      body.push(100)         // 0x64 (ref $aTypeIdx) — non-null new index backing
-      appendAll(body, ulebToArr(aTypeIdx))
-      body.push(1)
-      body.push(127)         // 11 rslot: i32
-    }
+    // Locals vector: one (count=1, valtype) run per DECLARED local, then the scratch
+    // frames in `fbBeginFunc`'s layout order. Derived from the local set + scratch
+    // flags by the FuncBuilder (Phase H) — the run count and every valtype come from
+    // ONE place, so they cannot desync from the frame layout above.
+    if fbEmitLocalsVec(body, nLocals) < 0 { return 0 - 1 }
     appendAll(body, bodyExpr)
     // Bind the writer at `body` (the framed code entry) for the trailing padding/end
     // opcodes emitted via the `fb*` methods.
