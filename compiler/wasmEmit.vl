@@ -1025,6 +1025,110 @@ function stmtIsPushKind(stmtIx: i32, fnIx: i32, kind: i32): boolean {
   false
 }
 
+// True if `callIx` is a `recv.pop()` whose receiver is a struct-FIELD / global-field
+// array read (a `Member`, e.g. `T.scopes.pop()`) of list kind `kind` (`0` i32-list, `1`
+// ref-list, `2` string-list). A bare-LOCAL pop needs NO scratch (it references the local
+// in place), so it is NOT counted — only a Member receiver, which must be materialized
+// into the push frame's `recvRef` scratch slot. Lets a `.pop`-on-field function reserve
+// the same scratch frame a `.push`-on-field one does.
+function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: i32): boolean {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "pop" {
+        let recv = P.nodes[callee.memObj]
+        if recv is Member {
+          let isRef = exprRefArray(callee.memObj, fnIx)
+          let isStr = exprStringArray(callee.memObj, fnIx)
+          if kind == 1 { return isRef }
+          if kind == 2 { return isStr }
+          return !isRef && !isStr
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if any expression at `exprIx` (or a sub-expression) is a Member-receiver `.pop`
+// of `kind` — a `.pop` appears in VALUE position (`let x = T.scopes.pop()`), so the
+// reservation walk must descend expressions, not just statement receivers.
+function exprHasMemberPopKind(exprIx: i32, fnIx: i32, kind: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Call {
+    if callIsMemberPopKind(exprIx, fnIx, kind) { return true }
+    let args = e.callArgs
+    let i = 0
+    while i < args.length {
+      if exprHasMemberPopKind(args[i], fnIx, kind) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if e is BinExpr {
+    if exprHasMemberPopKind(e.binLeft, fnIx, kind) { return true }
+    return exprHasMemberPopKind(e.binRight, fnIx, kind)
+  }
+  if e is Member { return exprHasMemberPopKind(e.memObj, fnIx, kind) }
+  if e is Index {
+    if exprHasMemberPopKind(e.idxArr, fnIx, kind) { return true }
+    return exprHasMemberPopKind(e.idxIndex, fnIx, kind)
+  }
+  if e is Unary { return exprHasMemberPopKind(e.unArg, fnIx, kind) }
+  if e is Paren { return exprHasMemberPopKind(e.parInner, fnIx, kind) }
+  false
+}
+
+// True if the block at `blockIx` (descending into if/else + while, the scopes
+// `collectLocals` walks) contains a Member-receiver `.pop` of `kind` in any statement or
+// let-init / return / while-cond expression.
+function blockHasMemberPopKind(blockIx: i32, fnIx: i32, kind: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        if exprHasMemberPopKind(s.letInit, fnIx, kind) { return true }
+      } else if s is RetStmt {
+        if exprHasMemberPopKind(s.retArg, fnIx, kind) { return true }
+      } else if s is BinExpr {
+        if exprHasMemberPopKind(stmts[i], fnIx, kind) { return true }
+      } else if s is Call {
+        if exprHasMemberPopKind(stmts[i], fnIx, kind) { return true }
+      } else if s is IfStmt {
+        if ifChainHasMemberPopKind(stmts[i], fnIx, kind) { return true }
+      } else if s is WhileStmt {
+        if exprHasMemberPopKind(s.whileCond, fnIx, kind) { return true }
+        if blockHasMemberPopKind(s.whileBody, fnIx, kind) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if any arm of the `if` / `else if` chain at `ifIx` contains a Member-receiver
+// `.pop` of `kind` (then-branch, `else` block, or recursively a chained `else if`).
+function ifChainHasMemberPopKind(ifIx: i32, fnIx: i32, kind: i32): boolean {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if blockHasMemberPopKind(s.ifThen, fnIx, kind) { return true }
+    if s.ifElse >= 0 {
+      let els = P.nodes[s.ifElse]
+      if els is Block {
+        if blockHasMemberPopKind(s.ifElse, fnIx, kind) { return true }
+      } else if els is IfStmt {
+        if ifChainHasMemberPopKind(s.ifElse, fnIx, kind) { return true }
+      }
+    }
+  }
+  false
+}
+
 // True if the block at `blockIx` (descending into `if` branches and `while` bodies, the
 // same scopes `collectLocals` walks) contains a `.push` of kind `wantRef`. A function
 // with such a push reserves the matching three scratch locals after its declared locals.
@@ -1131,29 +1235,118 @@ function collectRefPushSlotsIf(ifIx: i32, fnIx: i32): i32 {
   0
 }
 
-// True if the FuncDecl at `fnIx` contains an i32-list `.push` anywhere in its body.
+// Record the ref-list table slot of every Member-receiver ref-list `.pop` in expression
+// `exprIx` into `fnRefPushSlots` (so its typed scratch frame is reserved) — the pop-side
+// analogue of `collectRefPushSlots`, descending VALUE positions (a `.pop` is a value).
+function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 }
+  let e = P.nodes[exprIx]
+  if e is Call {
+    if callIsMemberPopKind(exprIx, fnIx, 1) {
+      let callee = P.nodes[e.callFn]
+      if callee is Member {
+        recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
+      }
+    }
+    let args = e.callArgs
+    let i = 0
+    while i < args.length {
+      collectMemberPopRefSlotsExpr(args[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  if e is BinExpr {
+    collectMemberPopRefSlotsExpr(e.binLeft, fnIx)
+    collectMemberPopRefSlotsExpr(e.binRight, fnIx)
+    return 0
+  }
+  if e is Member { return collectMemberPopRefSlotsExpr(e.memObj, fnIx) }
+  if e is Index {
+    collectMemberPopRefSlotsExpr(e.idxArr, fnIx)
+    collectMemberPopRefSlotsExpr(e.idxIndex, fnIx)
+    return 0
+  }
+  if e is Unary { return collectMemberPopRefSlotsExpr(e.unArg, fnIx) }
+  if e is Paren { return collectMemberPopRefSlotsExpr(e.parInner, fnIx) }
+  0
+}
+
+// Walk the block at `blockIx` (if/else + while) collecting Member-receiver ref-list
+// `.pop` slots from statements + let-inits / returns / while-conds.
+function collectMemberPopRefSlots(blockIx: i32, fnIx: i32): i32 {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        collectMemberPopRefSlotsExpr(s.letInit, fnIx)
+      } else if s is RetStmt {
+        collectMemberPopRefSlotsExpr(s.retArg, fnIx)
+      } else if s is BinExpr {
+        collectMemberPopRefSlotsExpr(stmts[i], fnIx)
+      } else if s is Call {
+        collectMemberPopRefSlotsExpr(stmts[i], fnIx)
+      } else if s is IfStmt {
+        collectMemberPopRefSlotsIf(stmts[i], fnIx)
+      } else if s is WhileStmt {
+        collectMemberPopRefSlotsExpr(s.whileCond, fnIx)
+        collectMemberPopRefSlots(s.whileBody, fnIx)
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Collect Member-receiver ref-list `.pop` slots from every arm of the `if` chain.
+function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32): i32 {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    collectMemberPopRefSlots(s.ifThen, fnIx)
+    if s.ifElse >= 0 {
+      let els = P.nodes[s.ifElse]
+      if els is Block {
+        collectMemberPopRefSlots(s.ifElse, fnIx)
+      } else if els is IfStmt {
+        collectMemberPopRefSlotsIf(s.ifElse, fnIx)
+      }
+    }
+  }
+  0
+}
+
+// True if the FuncDecl at `fnIx` contains an i32-list `.push` anywhere in its body — OR
+// a Member-receiver i32-list `.pop` (which reuses the same scratch frame's `recvRef`).
 function fnHasPush(fnIx: i32): boolean {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    return blockHasPushKind(fn.fnBody, fnIx, 0)
+    if blockHasPushKind(fn.fnBody, fnIx, 0) { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, 0)
   }
   false
 }
 
-// True if the FuncDecl at `fnIx` contains a ref-list `.push` anywhere in its body.
+// True if the FuncDecl at `fnIx` contains a ref-list `.push` anywhere — OR a
+// Member-receiver ref-list `.pop` (which reuses the ref-push frame's `recvRef`).
 function fnHasRefPush(fnIx: i32): boolean {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    return blockHasPushKind(fn.fnBody, fnIx, 1)
+    if blockHasPushKind(fn.fnBody, fnIx, 1) { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, 1)
   }
   false
 }
 
-// True if the FuncDecl at `fnIx` contains a string-list (`string[]`) `.push` anywhere.
+// True if the FuncDecl at `fnIx` contains a string-list (`string[]`) `.push` — OR a
+// Member-receiver string-list `.pop`.
 function fnHasStrPush(fnIx: i32): boolean {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    return blockHasPushKind(fn.fnBody, fnIx, 2)
+    if blockHasPushKind(fn.fnBody, fnIx, 2) { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, 2)
   }
   false
 }
@@ -3982,9 +4175,12 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
         return emitFail("emitProgram: .pop receiver is not a list")
       }
       // The popped element is a REF (struct / union box / map struct / string) for a
-      // ref or string list — surface it non-null; an i32 list yields a raw i32.
+      // ref or string list — surface it non-null; an i32 list yields a raw i32. `base` is
+      // the scratch frame whose `+3` `recvRef` slot holds a struct-FIELD receiver's wrapper
+      // ref (same frame `.push` uses) — used only for a Member receiver.
       let lTy = lTypeIdx
       let aTy = aTypeIdx
+      let base = pushScratchBase
       let elemIsRef = false
       if isRef {
         if !rlUsed {
@@ -3993,6 +4189,7 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
         let rslot = refListSlotOfExpr(callee.memObj, fnIx)
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
+        base = refPushScratchBaseFor(rslot)
         elemIsRef = true
       } else if isStr {
         if !slUsed {
@@ -4000,15 +4197,30 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
         }
         lTy = mkListIdx
         aTy = mkArrIdx
+        base = strPushScratchBase
         elemIsRef = true
       } else if !lUsed {
         return emitFail("emitProgram: .pop but list type not collected")
       }
+      // Resolve the receiver to a wasm local holding the list-wrapper ref. A bare local IS
+      // that local; a struct-FIELD receiver (`T.scopes`) is evaluated ONCE into the frame's
+      // `recvRef` scratch (`base + 3`) — the wrapper is mutated in place by reference, so no
+      // write-back is needed (mirrors `emitPush`).
+      let lIdx = 0 - 1
       if recv is Ident {
-        let lIdx = localIndexOf(fnIx, recv.identName)
+        lIdx = localIndexOf(fnIx, recv.identName)
         if lIdx < 0 {
           return emitFail("emitProgram: .pop receiver is not a list local")
         }
+      } else if recv is Member {
+        if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+        body.push(33)            // local.set recvRef
+        appendAll(body, ulebToArr(base + 3))
+        lIdx = base + 3
+      } else {
+        return emitFail("emitProgram: .pop receiver must be a local or struct field")
+      }
+      if true {
         // L.len = len - 1
         body.push(32)          // local.get L
         appendAll(body, ulebToArr(lIdx))
@@ -4031,7 +4243,6 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
         }
         return 0
       }
-      return emitFail("emitProgram: .pop receiver must be a list local")
     }
   }
   emitFail("emitProgram: expected a .pop call")
@@ -4413,6 +4624,10 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     fnRefPushSlots = []
     refPushBaseBySlot = []
     collectRefPushSlots(fn.fnBody, fnIx)
+    // A Member-receiver ref-list `.pop` (`T.scopes.pop()`) needs the SAME typed scratch
+    // frame as a ref `.push` onto that slot — record its slot too, so a pop-only function
+    // reserves the frame whose `recvRef` holds the field's wrapper ref.
+    collectMemberPopRefSlots(fn.fnBody, fnIx)
     let nLocals = localNames.length
     pushScratchBase = fn.fnParams.length + nLocals
     // The ref-push scratch frame (if any) follows the i32 frame. Each push frame is FOUR

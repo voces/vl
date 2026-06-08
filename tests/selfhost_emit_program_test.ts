@@ -3699,6 +3699,37 @@ const CASES: Case[] = [
       if (got !== 104) throw new Error(`main() returned ${got}, expected 104`);
     },
   },
+  {
+    // `.pop()` on a STRUCT-FIELD ref-list receiver (`T.scopes.pop()`) — typecheck.vl's
+    // `popScope` shape. The field's wrapper ref is evaluated once into the push frame's
+    // `recvRef` scratch (reserved for a pop-only function), then the in-place len-decrement
+    // + element-read run against it. Mirrors a map ref-list field (`{[string]:i32}[]`).
+    name: "scope-chain: `.pop()` on a STRUCT-FIELD ref-list (popScope shape) => 1",
+    src: [
+      "type Checker = { scopes: {[string]: i32}[] }",
+      "let C: Checker = { scopes: [] }",
+      "function pushScope(): i32 {",
+      "  C.scopes.push(Map())",
+      "  0",
+      "}",
+      "function popScope(): i32 {",
+      "  let dropped = C.scopes.pop()",
+      "  0",
+      "}",
+      "function main(): i32 {",
+      "  pushScope()",
+      "  pushScope()",
+      "  popScope()",
+      "  return C.scopes.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // Two pushes then one pop leaves one scope on the chain.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
