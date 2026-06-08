@@ -322,25 +322,80 @@ let fRetStr: i32[] = []
 // alias, else `0`. Populated by `buildFnMap` so `fnRetUnion` is a flat lookup.
 let fRetUni: i32[] = []
 
+// ── module-level GLOBALS (G2b) ────────────────────────────────────────────────
+// A top-level `let`/`const` (`LetDecl`) lowers to a wasm module GLOBAL (mutable),
+// emitted in the global section (id 6). Its wasm GLOBAL INDEX is its position among
+// the top-level `LetDecl`s in declaration order — that order IS the index a
+// `global.get`/`global.set` references. `globalStmts` holds the arena indices of those
+// `LetDecl`s (declaration order); `globalNames` the parallel names (name→index lookup).
+// A bare `Ident` that is not a param/local but matches a `globalName` reads/writes the
+// global (`0x23`/`0x24`) instead of a local (`0x20`/`0x21`).
+let globalStmts: i32[] = []
+let globalNames: string[] = []
+
 // Scan the program's top-level statements into `fnStmts` (FuncDecls only, in order),
-// skipping `TypeDecl`s. Any other top-level statement fails loudly. Returns the
-// function count, or -1 (via `emitFail`).
+// skipping `TypeDecl`s and gathering top-level `LetDecl`s into `globalStmts` (module
+// globals, declaration order = global index). Any other top-level statement fails
+// loudly. Returns the function count, or -1 (via `emitFail`).
 function collectFns(stmts: i32[]): i32 {
   fnStmts = []
+  globalStmts = []
+  globalNames = []
   let i = 0
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
     if s is FuncDecl {
       fnStmts.push(stmts[i])
+    } else if s is LetDecl {
+      // A top-level `let`/`const` — a module global; its position here is its index.
+      globalStmts.push(stmts[i])
+      globalNames.push(s.letName)
     } else if nodeIsTypeDecl(stmts[i]) {
     } else if s is UnionDecl {
       // A `type N = A | B` union alias — collected by `collectU`, skipped here.
     } else {
-      return emitFail("emitProgram: top-level statement is not a function or type")
+      return emitFail("emitProgram: top-level statement is not a function, type, or global")
     }
     i = i + 1
   }
   fnStmts.length
+}
+
+// The wasm global index for `name`, or -1 if no top-level global has that name.
+function globalIndexOf(name: string): i32 {
+  let i = 0
+  while i < globalNames.length {
+    if globalNames[i] == name { return i }
+    i = i + 1
+  }
+  0 - 1
+}
+
+// The arena index of the `LetDecl` for the global `name`, or -1 if not a global.
+function globalLetOf(name: string): i32 {
+  let gi = globalIndexOf(name)
+  if gi < 0 { return 0 - 1 }
+  globalStmts[gi]
+}
+
+// Whether the global `name` is a struct/array/string ref (so a bare reference to it in
+// an `exprStruct`/`exprArray`/`exprString` check is recognized as that ref type). The
+// global's valtype follows its `LetDecl` annotation or literal initializer, evaluated as
+// a top-level constexpr (`fnIx = -1`), mirroring the local `letIsX` predicates.
+function globalIsStruct(name: string): boolean {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsStruct(li, 0 - 1)
+}
+function globalIsArray(name: string): boolean {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsArray(li, 0 - 1)
+}
+function globalIsString(name: string): boolean {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsString(li, 0 - 1)
 }
 
 // Map each function NAME to its wasm function index (its position in `fnStmts`), and
@@ -1324,7 +1379,14 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
     let idx = localIndexOf(fnIx, e.identName)
     if idx < 0 {
-      return emitFail("emitProgram: identifier is not a parameter or local")
+      // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
+      let gIdx = globalIndexOf(e.identName)
+      if gIdx >= 0 {
+        body.push(35)        // 0x23 global.get
+        appendAll(body, ulebToArr(gIdx))
+        return 0
+      }
+      return emitFail("emitProgram: identifier is not a parameter, local, or global")
     }
     body.push(32)            // 0x20 local.get
     appendAll(body, ulebToArr(idx))
@@ -1455,7 +1517,15 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
     if target is Ident {
       let idx = localIndexOf(fnIx, target.identName)
       if idx < 0 {
-        return emitFail("emitProgram: assignment target is not a parameter or local")
+        // Not a local — a module global? Store with `global.set` (0x24 <globalidx>).
+        let gIdx = globalIndexOf(target.identName)
+        if gIdx >= 0 {
+          if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+          body.push(36)        // 0x24 global.set
+          appendAll(body, ulebToArr(gIdx))
+          return 0
+        }
+        return emitFail("emitProgram: assignment target is not a parameter, local, or global")
       }
       // Value first, then store it into the local's slot.
       if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
@@ -1483,6 +1553,30 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       body.push(251)         // 0xfb GC prefix
       body.push(14)          // 0x0e array.set
       appendAll(body, ulebToArr(aTypeIdx))    // raw array type index
+      return 0
+    }
+    if target is Member {
+      // Field WRITE `recv.field = v` → `struct.set $0 <fieldidx>` (`0xfb 0x05`). The
+      // single declared struct lives at WasmGC type index 0 (matching `emitMem`'s read
+      // path). Operand order is load-bearing: push the struct REF first, then the value,
+      // then the `fb 05` opcode pops `[ref, value]` (same shape `emitPush` uses for the
+      // list `backing`/`len`/`cap` field stores).
+      if !sDeclared {
+        return emitFail("emitProgram: field assignment but no struct type declared")
+      }
+      if !exprStruct(target.memObj, fnIx) {
+        return emitFail("emitProgram: field-assignment receiver is not a struct")
+      }
+      let fieldIdx = sFieldIndex(target.memProp)
+      if fieldIdx < 0 {
+        return emitFail("emitProgram: unknown struct field in field assignment")
+      }
+      if emitExpr(body, target.memObj, fnIx) < 0 { return 0 - 1 }   // struct ref first
+      if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }      // then the value
+      body.push(251)         // 0xfb GC prefix
+      body.push(5)           // 0x05 struct.set
+      body.push(0)           // type index 0 (the single struct)
+      appendAll(body, ulebToArr(fieldIdx))    // field index
       return 0
     }
     return emitFail("emitProgram: assignment target is not a simple name")
@@ -1724,6 +1818,14 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
         return emitPush(body, stmtIx, fnIx)
       }
       return emitFail("emitProgram: unsupported member-call statement")
+    }
+    if callee is Ident {
+      // A bare top-level call whose RESULT is discarded (e.g. a helper invoked for its
+      // global side effects): emit the call, then `drop` the single value it leaves on
+      // the stack (every function returns one value here).
+      if emitCall(body, stmtIx, fnIx) < 0 { return 0 - 1 }
+      body.push(26)            // 0x1a drop
+      return 0
     }
     return emitFail("emitProgram: bare call statement is not supported")
   }
@@ -2007,6 +2109,25 @@ function vtKindOfParam(paramIx: i32): i32 {
   0
 }
 
+// The `pushVT` `kind` for a module global from its literal INITIALIZER at `initIx`:
+// `1` struct ref (object literal), `2` list ref (array literal), `3` string ref (string
+// literal), else `0` i32. The global's valtype must match the init's wasm type so the
+// constexpr validates; the literal cases are the only ones in scope (a non-literal init
+// fails loudly when `emitExpr` lowers it as a constexpr with `fnIx = -1`).
+function globalKind(initIx: i32): i32 {
+  if initIx < 0 { return 0 }
+  let e = P.nodes[initIx]
+  if e is ObjLit {
+    // In a union program an object literal lowers to the union box (`emitUnionBox`),
+    // so its valtype is the box ref (kind 4); otherwise the single struct (kind 1).
+    if uDeclared { return 4 }
+    return 1
+  }
+  if e is ArrayLit { return 2 }
+  if e is StrLit { return 3 }
+  0
+}
+
 // Push a wasm value type onto `payload`. The `kind` tag selects the encoding:
 //   1 → struct ref `(ref $0)` (`0x64 0x00`, non-null ref to the struct type, index 0)
 //   2 → list  ref `(ref $lTypeIdx)` (`0x64 <lTypeIdx>`, the growable `i32[]` wrapper
@@ -2168,6 +2289,35 @@ function emitModule(stmts: i32[]): i32 {
     fi = fi + 1
   }
   emitSection(3, funcPayload)
+
+  // Global section (id 6): one mutable global per top-level `let`/`const`, in
+  // declaration order (that order IS the global index `global.get`/`global.set` use).
+  // Each entry is `<valtype> 0x01 <init constexpr> 0x0b`. The valtype mirrors `pushVT`'s
+  // kind for the initializer (i32 / struct ref / list ref / string ref); the init reuses
+  // the ordinary `emitExpr` literal lowering — `i32.const`, `struct.new`, and
+  // `array.new_fixed` are all valid WasmGC constant expressions, so no start function is
+  // needed for the literal initializers in scope. A non-constexpr init (a reference to a
+  // local/param) fails loudly via `emitExpr(fnIx = -1)` (start-fn fallback deferred).
+  let ng = globalStmts.length
+  if ng > 0 {
+    let globalPayload: i32[] = []
+    appendAll(globalPayload, ulebToArr(ng))
+    let gi = 0
+    while gi < ng {
+      let g = P.nodes[globalStmts[gi]]
+      if g is LetDecl {
+        if g.letInit < 0 {
+          return emitFail("emitProgram: module global has no initializer")
+        }
+        pushVT(globalPayload, globalKind(g.letInit))   // valtype
+        globalPayload.push(1)                          // 0x01 mutable
+        if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
+        globalPayload.push(11)                         // 0x0b end of init expr
+      }
+      gi = gi + 1
+    }
+    emitSection(6, globalPayload)
+  }
 
   // Export section (id 7): export each function under its own name. A name is a
   // UTF-8 byte vec; for an ASCII identifier each `name[i]` char code IS its byte.
@@ -2576,7 +2726,8 @@ function exprStruct(exprIx: i32, fnIx: i32): boolean {
   }
   if e is Ident {
     if paramStruct(fnIx, e.identName) { return true }
-    return declaredStruct(e.identName)
+    if declaredStruct(e.identName) { return true }
+    return globalIsStruct(e.identName)
   }
   false
 }
@@ -2790,7 +2941,8 @@ function exprArray(exprIx: i32, fnIx: i32): boolean {
   }
   if e is Ident {
     if paramArray(fnIx, e.identName) { return true }
-    return declaredArray(e.identName)
+    if declaredArray(e.identName) { return true }
+    return globalIsArray(e.identName)
   }
   false
 }
@@ -2882,7 +3034,8 @@ function exprString(exprIx: i32, fnIx: i32): boolean {
   }
   if e is Ident {
     if paramString(fnIx, e.identName) { return true }
-    return declaredString(e.identName)
+    if declaredString(e.identName) { return true }
+    return globalIsString(e.identName)
   }
   false
 }
