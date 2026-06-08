@@ -83,6 +83,45 @@ Deno.test("resolveMemberAt: array `.length` resolves to the intrinsic i32", () =
   assertEquals(member.kind, "property");
 });
 
+// ---- hover: Set / Map intrinsic members -------------------------------------
+//
+// A `Set<T>` / `Map<K,V>` receiver routes through the checker's OWN member
+// surfaces (`setMemberType` / `mapMemberType`) — the same branch the checker's
+// `PropertyAccess` case uses — so `.add`/`.set`/`.get` resolve to their intrinsic
+// method signatures instead of coming back empty.
+
+Deno.test("resolveMemberAt: Set member `.add` resolves to its intrinsic method", () => {
+  const src = "const s = Set([1, 2])\nconst v = s.add(3)\n";
+  const member = memberAt(src, 2, ".add");
+  if (!member) throw new Error("expected a resolved member for `s.add`");
+  assertEquals(member.name, "add");
+  assertEquals(member.kind, "method");
+  if (member.type.type !== "Function") {
+    throw new Error("Set `.add` should resolve to a Function type");
+  }
+});
+
+Deno.test("resolveMemberAt: Map member `.set` resolves to its intrinsic method", () => {
+  const src = 'const m = Map([["a", 1]])\nconst v = m.set("b", 2)\n';
+  const member = memberAt(src, 2, ".set");
+  if (!member) throw new Error("expected a resolved member for `m.set`");
+  assertEquals(member.name, "set");
+  assertEquals(member.kind, "method");
+  if (member.type.type !== "Function") {
+    throw new Error("Map `.set` should resolve to a Function type");
+  }
+});
+
+Deno.test("resolveMemberAt: Map member `.get` resolves via the map member surface", () => {
+  // `.get` is reached through `mapMemberType` (the Map branch). Its *kind* depends
+  // on the inferred value type, so we assert the member resolves (the branch is
+  // taken) rather than pinning a fragile inferred signature.
+  const src = 'const m = Map([["a", 1]])\nconst v = m.get("a")\n';
+  const member = memberAt(src, 2, ".get");
+  if (!member) throw new Error("expected a resolved member for `m.get`");
+  assertEquals(member.name, "get");
+});
+
 // ---- hover: string members --------------------------------------------------
 
 Deno.test("resolveMemberAt: string member `s.slice` resolves to a method", () => {

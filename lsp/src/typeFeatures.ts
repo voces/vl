@@ -31,6 +31,10 @@ import {
   arrayElementType,
   isListType,
   listMemberType,
+  mapKeyValueType,
+  mapMemberType,
+  setElementType,
+  setMemberType,
   softenImplicitType,
   typeFromExpression,
 } from "../../compiler/typecheck.ts";
@@ -1237,6 +1241,22 @@ const memberTypeOf = (
   if (isListType(objType)) {
     const member = listMemberType(arrayElementType(objType)!)[property];
     if (member) return member;
+  }
+  // Intrinsic map/set members — the same branch the checker's `PropertyAccess`
+  // case uses (typecheck.ts): a `Set<T>` (boolean-valued `{[T]:boolean}`) routes
+  // to its OWN surface (`setMemberType` — `.add`/`.has`/`.delete`/`.length`),
+  // while a `Map<K,V>` routes to `mapMemberType` (`.set`/`.get`/`.has`/…). The
+  // discriminator (`setElementType`) is the checker's, so a member resolves here
+  // exactly as it types at the access site.
+  {
+    const kv = mapKeyValueType(objType);
+    if (kv) {
+      const setEl = setElementType(objType);
+      const member = setEl !== null
+        ? setMemberType(setEl)[property]
+        : mapMemberType(kv.key, kv.value)[property];
+      if (member) return member;
+    }
   }
   // Structural field — covers user-object fields AND string members (which live
   // as properties on the nominal `string` object in `defaultScope`).

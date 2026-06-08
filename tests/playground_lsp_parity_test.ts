@@ -134,6 +134,16 @@ const FEATURES: Parity[] = [
     adapterExport: "codeActions",
     mainMarker: "registerCodeActionProvider",
   },
+  {
+    // Completion (D3): scope-aware identifiers + structural member completion
+    // after `.` + keyword/snippet items. The playground mirrors it via the
+    // `completion` adapter export and a Monaco `CompletionItemProvider`
+    // (`.`-triggered), matching the server's `completionProvider.triggerCharacters`.
+    feature: "completion",
+    serverMarker: "connection.onCompletion",
+    adapterExport: "completion",
+    mainMarker: "registerCompletionItemProvider",
+  },
 
   // ---- KNOWN PARITY GAPS (LSP exposes it; playground does NOT wire it) -------
   //
@@ -152,18 +162,6 @@ const FEATURES: Parity[] = [
     adapterExport: "references", // ← missing in lspAdapter.ts
     mainMarker: "registerReferenceProvider", // ← missing in main.ts
     knownGap: "no references adapter export and no registerReferenceProvider",
-  },
-  {
-    // TODO parity: the LSP exposes completion (`onCompletion` — identifier +
-    // member + keyword/snippet), but the playground has neither an `lspAdapter`
-    // `completion` binding nor a Monaco `CompletionItemProvider`. Add both, then
-    // move this row up and drop `knownGap`.
-    feature: "completion",
-    serverMarker: "connection.onCompletion",
-    adapterExport: "completion", // ← missing in lspAdapter.ts
-    mainMarker: "registerCompletionItemProvider", // ← missing in main.ts
-    knownGap:
-      "no completion adapter export and no registerCompletionItemProvider",
   },
 ];
 

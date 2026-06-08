@@ -23,11 +23,20 @@ import {
 } from "../../compiler/compile.ts";
 import { tokenize } from "../../compiler/lexer.ts";
 import {
+  type Completion,
+  type CompletionKind,
   deriveInlayHints,
+  docMarkdown,
+  identifierCompletions,
+  keywordCompletions,
   type LspRange,
+  memberCompletions,
+  receiverObjectType,
   resolveMemberAt,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
+  snippetCompletions,
+  typeLabelDetail,
 } from "../../lsp/src/typeFeatures.ts";
 import {
   fixableDiagnosticsForRange,
@@ -222,4 +231,109 @@ export const codeActions = (
     fixes.push(...quickFixesForDiagnostic(text, d.code, d.range));
   }
   return fixes;
+};
+
+// ---- completion (D3) -------------------------------------------------------
+
+/**
+ * One completion item in playground (Monaco-free) form — the browser mirror of
+ * the LSP `CompletionItem` `server.ts`'s `toCompletionItem` builds. `main.ts`
+ * maps each onto a Monaco `CompletionItem`. The render decisions (inline label
+ * detail + highlighted `documentation` panel, snippet flag) are made HERE so the
+ * Monaco provider stays a thin shape-mapper, exactly as `server.ts` keeps them in
+ * `toCompletionItem`.
+ */
+export type CompletionItem = {
+  /** The text inserted / the label shown. */
+  label: string;
+  /** The completion's binding-flavoured kind; `main.ts` maps it to a Monaco kind. */
+  kind: CompletionKind;
+  /** Compact inline `: <type>` shown on the label row (`labelDetails.detail`). */
+  labelDetail?: string;
+  /** A fenced `vital` markdown block (type + any `///` doc) for the detail panel. */
+  documentation?: string;
+  /** LSP snippet insert text (tab-stops) for snippet items; identifier/keyword
+   * items insert their `label` and leave this unset. */
+  insertText?: string;
+};
+
+/** The fence language id the playground hover/completion code blocks use. */
+const VL_LANGUAGE_ID = "vital";
+
+// One pure `Completion` (typeFeatures.ts) → the playground `CompletionItem`,
+// mirroring `server.ts`'s `toCompletionItem`: a typed item renders its type once
+// inline (`labelDetail`) and once highlighted (`documentation`), never the
+// top-level `detail` (which would duplicate it). A snippet carries its insert
+// text + the snippet kind. (No `///` doc resolver in the single-file playground —
+// `docMarkdown` collapses to the bare type fence, matching the server with no
+// resolver passed.)
+const toCompletionItem = (c: Completion): CompletionItem => {
+  const item: CompletionItem = { label: c.name, kind: c.kind };
+  if (c.detail !== undefined) item.labelDetail = typeLabelDetail(c.detail);
+  if (c.detail !== undefined || (c.doc && c.doc.trim() !== "")) {
+    item.documentation = docMarkdown(c.detail ?? "", VL_LANGUAGE_ID, c.doc);
+  }
+  if (c.insertText !== undefined) item.insertText = c.insertText;
+  return item;
+};
+
+/**
+ * Completion candidates at `pos`, mirroring `server.ts`'s `onCompletion`:
+ *   - after a `.` receiver (`triggerChar === "."` or the char before the cursor
+ *     is `.`): resolve the `<name>.` receiver's object type and return ONLY its
+ *     members (struct fields + built-in methods) — keywords/snippets suppressed.
+ *   - otherwise: scope-aware identifiers (locals/params/functions/types +
+ *     builtins) plus keyword and snippet completions for statement-position typing.
+ *
+ * The receiver/member typing reuses the checker's resolution: `checkOnly`'s
+ * program `scope` (which folds in `defaultScope`'s builtins, so a list/string/Map
+ * receiver carries its intrinsic members) feeds `receiverObjectType`. The
+ * playground is single-file, so there's no imported-scope seeding — the rest is
+ * identical to the server.
+ */
+export const completion = (
+  text: string,
+  pos: LspPosition,
+  triggerChar?: string,
+): CompletionItem[] => {
+  const vlPos = toVLPosition(pos);
+  const symbols = parseSymbols(text);
+
+  // The text on the current line up to the cursor — to detect a `.` trigger and
+  // find the receiver name before it (matches `server.ts`'s `linePrefix`).
+  const line = text.split("\n")[pos.line] ?? "";
+  const linePrefix = line.slice(0, pos.character);
+  const charBeforeCursor = linePrefix[linePrefix.length - 1];
+
+  // Member completion: cursor follows `<receiver>.`.
+  if (triggerChar === "." || charBeforeCursor === ".") {
+    const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
+    if (!receiver) return [];
+    const { ast } = checkOnly(text);
+    if (!ast) return [];
+    const objectType = receiverObjectType(receiver, symbols, vlPos, ast.scope);
+    if (!objectType) return [];
+    return memberCompletions(objectType, stringifyType).map(toCompletionItem);
+  }
+
+  // Identifier completion: in-scope names + builtins, plus keyword/snippet items.
+  const { ast } = checkOnly(text);
+  const builtins = ast?.scope ?? {};
+  const identifiers = identifierCompletions(symbols, vlPos, builtins, stringifyType);
+  const keywords = keywordCompletions(false);
+  const snippets = snippetCompletions(false);
+  return [...identifiers, ...keywords, ...snippets].map(toCompletionItem);
+};
+
+// The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`
+// on `line`, or null — the `<name>.` member-completion receiver. Mirrors
+// `server.ts`'s `wordEndingBefore`.
+const wordEndingBefore = (line: string, character: number): string | null => {
+  const isWordChar = (c: string) => /[A-Za-z0-9_]/.test(c);
+  const end = character;
+  let start = end;
+  while (start > 0 && isWordChar(line[start - 1])) start--;
+  if (start === end) return null;
+  const word = line.slice(start, end);
+  return /^[A-Za-z_]/.test(word) ? word : null;
 };

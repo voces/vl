@@ -383,6 +383,62 @@ monaco.languages.registerCodeActionProvider(VL_LANGUAGE_ID, {
   },
 });
 
+// --- completion provider -----------------------------------------------------
+//
+// Mirrors `server.ts`'s `onCompletion` (D3): scope-aware identifier suggestions
+// everywhere, structural MEMBER suggestions after a `.` receiver (struct fields +
+// the receiver type's built-in methods), plus keyword and snippet completions for
+// statement-position typing. `lspAdapter.completion` makes all the render
+// decisions (inline label detail, highlighted `documentation` panel, snippet
+// flag) so this provider is a thin Monaco shape-mapper. `triggerCharacters: ["."]`
+// re-fires completion right after a property access, matching the server's
+// `completionProvider.triggerCharacters`.
+const COMPLETION_KIND: Record<lsp.CompletionItem["kind"], monaco.languages.CompletionItemKind> = {
+  variable: monaco.languages.CompletionItemKind.Variable,
+  parameter: monaco.languages.CompletionItemKind.Variable,
+  function: monaco.languages.CompletionItemKind.Function,
+  type: monaco.languages.CompletionItemKind.Struct,
+  keyword: monaco.languages.CompletionItemKind.Keyword,
+  snippet: monaco.languages.CompletionItemKind.Snippet,
+};
+
+monaco.languages.registerCompletionItemProvider(VL_LANGUAGE_ID, {
+  triggerCharacters: ["."],
+  provideCompletionItems: (model, position, context) => {
+    const items = lsp.completion(
+      model.getValue(),
+      { line: position.lineNumber - 1, character: position.column - 1 },
+      context.triggerCharacter,
+    );
+    // The word under the cursor is the replacement range; after a `.` Monaco gives
+    // an empty word at the cursor, so members insert just past the dot.
+    const word = model.getWordUntilPosition(position);
+    const range = new monaco.Range(
+      position.lineNumber,
+      word.startColumn,
+      position.lineNumber,
+      word.endColumn,
+    );
+    return {
+      suggestions: items.map((c) => {
+        const isSnippet = c.insertText !== undefined;
+        return {
+          label: c.labelDetail ? { label: c.label, detail: c.labelDetail } : c.label,
+          kind: COMPLETION_KIND[c.kind],
+          insertText: c.insertText ?? c.label,
+          insertTextRules: isSnippet
+            ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
+            : undefined,
+          documentation: c.documentation
+            ? { value: c.documentation }
+            : undefined,
+          range,
+        };
+      }),
+    };
+  },
+});
+
 // --- theme management --------------------------------------------------------
 //
 // Tri-state: AUTO (follow OS) by default; clicking pins an explicit override;

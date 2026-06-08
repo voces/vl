@@ -240,6 +240,23 @@ const main = async (): Promise<void> => {
     `OK: inlay hints -> ${hints.length}, definition -> line ${def!.start.line + 1}`,
   );
 
+  // Completion (D3): scope-aware identifiers at a non-member position, and
+  // structural member completion after a `.` receiver — the two halves the Monaco
+  // `CompletionItemProvider` (`.`-triggered) wires.
+  const idItems = lsp.completion(src, { line: 2, character: 9 }); // inside print(x + |)
+  if (!idItems.some((c) => c.label === "x")) {
+    fail(`identifier completion missing in-scope \`x\`: ${JSON.stringify(idItems.map((c) => c.label))}`);
+  }
+  const memberSrc = `let p = { x: 1, y: 2 }\nprint(p.)\n`;
+  const memberItems = lsp.completion(memberSrc, { line: 1, character: 8 }, ".");
+  const memberLabels = memberItems.map((c) => c.label).sort();
+  if (memberLabels.join(",") !== "x,y") {
+    fail(`member completion after \`p.\` did not list x,y: ${JSON.stringify(memberLabels)}`);
+  }
+  console.error(
+    `OK: completion -> ${idItems.length} identifiers, members after \`.\` -> [${memberLabels.join(", ")}]`,
+  );
+
   // Quick-fixes (code actions / B17): the unused `x` binding on line 0 offers the
   // `_`-prefix (preferred) + remove-binding fixes; an unused import offers a
   // remove-import fix. Mirrors the editor's "Auto Fix" lightbulb.
