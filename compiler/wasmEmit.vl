@@ -527,6 +527,23 @@ let pushScratchBase: i32 = 0
 let fnUsesRefPush: boolean = false
 let refPushScratchBase: i32 = 0
 
+// ── per-function string-op scratch locals (G6: `+` / `==`/`!=` / `.slice`) ────
+// String concatenation, value-equality, and slice all lower INLINE (no helper
+// functions in this emitter), and each needs temporaries to stash the operand
+// strings (so an operand expression is evaluated ONCE — no re-eval of a side-
+// effecting call) and to drive an element loop. One shared scratch frame covers
+// all three, reserved AFTER the push scratch triples in a function that uses ANY
+// string op (detected by `fnHasStrOp`):
+//   strScrA/strScrB/strScrOut : 3 NON-NULL `(ref $aTypeIdx)` string refs — the two
+//                               operands + the freshly-allocated result.
+//   strScrI0..strScrI3        : 4 i32 temporaries — loop index, length, clamped
+//                               start/end (slice), running result (equality).
+// `strScratchBase` is the wasm local index of `strScrA`; the other six follow at
+// +1..+6. `fnUsesStrOp` records whether this function reserved them. Each is non-
+// defaultable but always `local.set` before read, which wasm validation accepts.
+let fnUsesStrOp: boolean = false
+let strScratchBase: i32 = 0
+
 // ── struct-type table (one struct per program, i32 fields only) ───────────────
 // This slice supports exactly ONE struct `type` per module; its WasmGC type lives at
 // type index 0 (func types follow at 1..N — see `emitModule`). `sDeclared` is a
@@ -874,6 +891,161 @@ function fnHasRefPush(fnIx: i32): boolean {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     return blockHasPushKind(fn.fnBody, fnIx, true)
+  }
+  false
+}
+
+// ── string-op detection (G6: which functions need the string scratch frame) ───
+// A function reserves the shared string scratch frame iff it uses ANY string `+`,
+// string `==`/`!=`, or `.slice` anywhere in an expression — so the walk below
+// descends through EVERY expression position (return values, let inits, conditions,
+// call args, operands, members, indices), unlike the push detection which only
+// needs statement-level receivers. `exprIsStrConcat`/`exprIsStrEq`/`exprIsStrSlice`
+// each classify a single node; `exprHasStrOp` recurses; `blockHasStrOp` walks
+// statements. `exprString` (defined later) resolves operand string-typedness from
+// the already-built `localNames`/`localIsRef` (so this runs AFTER `buildLocals`).
+
+// True if `binIx` is a `+` whose operands are strings (string concatenation).
+function exprIsStrConcat(binIx: i32, fnIx: i32): boolean {
+  let e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "+" {
+      return exprString(e.binLeft, fnIx) || exprString(e.binRight, fnIx)
+    }
+  }
+  false
+}
+
+// True if `binIx` is `==`/`!=` whose operands are strings (string value-equality).
+function exprIsStrEq(binIx: i32, fnIx: i32): boolean {
+  let e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      return exprString(e.binLeft, fnIx) || exprString(e.binRight, fnIx)
+    }
+  }
+  false
+}
+
+// True if `callIx` is a `recv.slice(start, end)` over a STRING receiver.
+function exprIsStrSlice(callIx: i32, fnIx: i32): boolean {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "slice" {
+        return exprString(callee.memObj, fnIx)
+      }
+    }
+  }
+  false
+}
+
+// True if the expression at `exprIx` (or any sub-expression) is a string `+`,
+// string `==`/`!=`, or string `.slice`.
+function exprHasStrOp(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is BinExpr {
+    if exprIsStrConcat(exprIx, fnIx) { return true }
+    if exprIsStrEq(exprIx, fnIx) { return true }
+    if exprHasStrOp(e.binLeft, fnIx) { return true }
+    return exprHasStrOp(e.binRight, fnIx)
+  }
+  if e is Call {
+    if exprIsStrSlice(exprIx, fnIx) { return true }
+    if exprHasStrOp(e.callFn, fnIx) { return true }
+    let args = e.callArgs
+    let i = 0
+    while i < args.length {
+      if exprHasStrOp(args[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if e is Member { return exprHasStrOp(e.memObj, fnIx) }
+  if e is Index {
+    if exprHasStrOp(e.idxArr, fnIx) { return true }
+    return exprHasStrOp(e.idxIndex, fnIx)
+  }
+  if e is Unary { return exprHasStrOp(e.unArg, fnIx) }
+  if e is Paren { return exprHasStrOp(e.parInner, fnIx) }
+  if e is IsExpr { return exprHasStrOp(e.isObj, fnIx) }
+  if e is ObjLit {
+    let fields = e.objFields
+    let i = 0
+    while i < fields.length {
+      let f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if exprHasStrOp(f.fiValue, fnIx) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  if e is ArrayLit {
+    let elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      if exprHasStrOp(elems[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+// True if any statement in the block at `blockIx` (descending into if/else branches
+// and while bodies, the scopes `collectLocals` walks) contains a string op.
+function blockHasStrOp(blockIx: i32, fnIx: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        if exprHasStrOp(s.letInit, fnIx) { return true }
+      } else if s is RetStmt {
+        if exprHasStrOp(s.retArg, fnIx) { return true }
+      } else if s is BinExpr {
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is Call {
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is IfStmt {
+        if exprHasStrOp(s.ifCond, fnIx) { return true }
+        if blockHasStrOp(s.ifThen, fnIx) { return true }
+        if s.ifElse >= 0 {
+          let els = P.nodes[s.ifElse]
+          if els is Block {
+            if blockHasStrOp(s.ifElse, fnIx) { return true }
+          } else if els is IfStmt {
+            if exprHasStrOp(els.ifCond, fnIx) { return true }
+            if blockHasStrOp(els.ifThen, fnIx) { return true }
+            if els.ifElse >= 0 {
+              let els2 = P.nodes[els.ifElse]
+              if els2 is Block {
+                if blockHasStrOp(els.ifElse, fnIx) { return true }
+              }
+            }
+          }
+        }
+      } else if s is WhileStmt {
+        if exprHasStrOp(s.whileCond, fnIx) { return true }
+        if blockHasStrOp(s.whileBody, fnIx) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the FuncDecl at `fnIx` uses any string op (`+`/`==`/`!=`/`.slice`) — so it
+// reserves the shared string scratch frame.
+function fnHasStrOp(fnIx: i32): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    return blockHasStrOp(fn.fnBody, fnIx)
   }
   false
 }
@@ -1504,6 +1676,325 @@ function emitArrLen(body: i32[], memIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected a length access")
 }
 
+// ── G6: string concatenation / value-equality / slice ────────────────────────
+// Strings are WasmGC `(array (mut i32))` of code points, so all three lower to the
+// same array machinery the list `.push` uses (`array.new_default`/`array.copy`/
+// `array.get`/`array.len`), INLINE — no helper functions. Each routine evaluates
+// BOTH operands onto the stack FIRST, then stashes them into the shared string
+// scratch frame (`strScratchBase`+0/+1/+2 = string refs A/B/Out; +3/+4/+5/+6 = i32
+// temps) — so a NESTED string op (an operand that is itself a `+`/`==`/`.slice`)
+// fully completes and leaves its result on the stack BEFORE any scratch `local.set`,
+// and the single frame is safe to share. Mirrors `toWasm.ts`'s string `+`/`==`/
+// `__string_slice__` shapes, just without the named helper functions.
+
+// `local.get` of string scratch local `n` (0=A, 1=B, 2=Out).
+function pushStrScrRef(body: i32[], n: i32): i32 {
+  body.push(32)              // 0x20 local.get
+  appendAll(body, ulebToArr(strScratchBase + n))
+  0
+}
+
+// `local.get` of i32 scratch temp `n` (0..3 → frame slots +3..+6).
+function pushStrScrI(body: i32[], n: i32): i32 {
+  body.push(32)              // 0x20 local.get
+  appendAll(body, ulebToArr(strScratchBase + 3 + n))
+  0
+}
+
+// `local.set` of i32 scratch temp `n`.
+function setStrScrI(body: i32[], n: i32): i32 {
+  body.push(33)              // 0x21 local.set
+  appendAll(body, ulebToArr(strScratchBase + 3 + n))
+  0
+}
+
+// Lower a string concatenation `a + b` onto `body`, leaving the new string ref on
+// the stack. Allocate a fresh `(array i32)` of `len(a)+len(b)` (`array.new_default`,
+// which zero-inits — every slot is then overwritten), `array.copy` a's code points
+// into `[0,lenA)` and b's into `[lenA, lenA+lenB)`. Both operands are evaluated
+// first, then stashed (nested-op-safe). `array.copy` is `0xfb 0x11 <dest> <src>`.
+function emitStrConcat(body: i32[], binIx: i32, fnIx: i32): i32 {
+  if !aUsed {
+    return emitFail("emitProgram: string concat but array type not collected")
+  }
+  let e = P.nodes[binIx]
+  if e is BinExpr {
+    // Eval BOTH operands onto the stack first (nested string ops complete here),
+    // then pop into the scratch refs (B first — it is on top).
+    if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }
+    if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+    body.push(33)            // local.set strScrB
+    appendAll(body, ulebToArr(strScratchBase + 1))
+    body.push(33)            // local.set strScrA
+    appendAll(body, ulebToArr(strScratchBase + 0))
+    // I0 = lenA = array.len(A)
+    pushStrScrRef(body, 0)
+    body.push(251)           // 0xfb
+    body.push(15)            // 0x0f array.len
+    setStrScrI(body, 0)
+    // I1 = lenB = array.len(B)
+    pushStrScrRef(body, 1)
+    body.push(251)
+    body.push(15)            // array.len
+    setStrScrI(body, 1)
+    // Out = array.new_default $aTypeIdx (lenA + lenB)
+    pushStrScrI(body, 0)
+    pushStrScrI(body, 1)
+    body.push(106)           // 0x6a i32.add
+    body.push(251)           // 0xfb
+    body.push(7)             // array.new_default
+    appendAll(body, ulebToArr(aTypeIdx))
+    body.push(33)            // local.set strScrOut
+    appendAll(body, ulebToArr(strScratchBase + 2))
+    // array.copy Out 0 A 0 lenA
+    pushStrScrRef(body, 2)   // dest
+    body.push(65)            // i32.const 0 (dest offset)
+    appendAll(body, slebToArr(0))
+    pushStrScrRef(body, 0)   // src A
+    body.push(65)            // i32.const 0 (src offset)
+    appendAll(body, slebToArr(0))
+    pushStrScrI(body, 0)     // count lenA
+    body.push(251)           // 0xfb
+    body.push(17)            // 0x11 array.copy
+    appendAll(body, ulebToArr(aTypeIdx))   // dest type
+    appendAll(body, ulebToArr(aTypeIdx))   // src type
+    // array.copy Out lenA B 0 lenB
+    pushStrScrRef(body, 2)   // dest
+    pushStrScrI(body, 0)     // dest offset = lenA
+    pushStrScrRef(body, 1)   // src B
+    body.push(65)            // i32.const 0 (src offset)
+    appendAll(body, slebToArr(0))
+    pushStrScrI(body, 1)     // count lenB
+    body.push(251)
+    body.push(17)            // array.copy
+    appendAll(body, ulebToArr(aTypeIdx))
+    appendAll(body, ulebToArr(aTypeIdx))
+    // Result: the new string ref.
+    pushStrScrRef(body, 2)
+    return 0
+  }
+  emitFail("emitProgram: expected a string concatenation")
+}
+
+// Lower a string VALUE-equality `a == b` (or `a != b`) onto `body`, leaving a 0/1
+// i32 on the stack. This is ELEMENT-WISE, NOT ref identity: `false` if the lengths
+// differ, else loop `i in [0,len)` comparing `a[i] == b[i]`; all-equal → 1. `!=`
+// negates the result with `i32.eqz`. Lowered as a value-typed `block`/`loop`:
+//   block i32 {                 ; yields the 0/1 result
+//     A=..; B=..                 ; stash operands (nested-op-safe)
+//     I0 = len(A)
+//     if I0 != len(B) { (i32.const 0) br 0 }   ; length mismatch → 0
+//     I1 = 0                                     ; loop index
+//     loop {                                     ; void loop
+//       if I1 >= I0 { }            ; fall through past loop when done
+//       else {
+//         if A[I1] != B[I1] { (i32.const 0) br 1 }   ; mismatch → 0, exit block
+//         I1 = I1 + 1
+//         br <loop>
+//       }
+//     }
+//     (i32.const 1)               ; every element matched
+//   }
+function emitStrEq(body: i32[], binIx: i32, fnIx: i32): i32 {
+  if !aUsed {
+    return emitFail("emitProgram: string equality but array type not collected")
+  }
+  let e = P.nodes[binIx]
+  if e is BinExpr {
+    let isNe = e.binOp == "!="
+    // Eval both operands, then stash (B on top → set B first).
+    if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }
+    if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+    body.push(33)            // local.set strScrB
+    appendAll(body, ulebToArr(strScratchBase + 1))
+    body.push(33)            // local.set strScrA
+    appendAll(body, ulebToArr(strScratchBase + 0))
+    // block i32 { ... }  — yields the 0/1 result.
+    body.push(2)             // 0x02 block
+    body.push(127)           // 0x7f i32 blocktype
+    // I0 = len(A)
+    pushStrScrRef(body, 0)
+    body.push(251)
+    body.push(15)            // array.len
+    setStrScrI(body, 0)
+    // if I0 != len(B) { push 0 ; br 0 (out of block) }
+    pushStrScrI(body, 0)
+    pushStrScrRef(body, 1)
+    body.push(251)
+    body.push(15)            // array.len(B)
+    body.push(71)            // 0x47 i32.ne
+    body.push(4)             // 0x04 if
+    body.push(64)            // 0x40 void blocktype
+    body.push(65)            // i32.const 0
+    appendAll(body, slebToArr(0))
+    body.push(12)            // 0x0c br
+    body.push(1)             // depth 1 → out of the i32 block (this `if` is depth 0)
+    body.push(11)            // 0x0b end (if)
+    // I1 = 0
+    body.push(65)
+    appendAll(body, slebToArr(0))
+    setStrScrI(body, 1)
+    // loop (void) { if I1 >= I0 {} else { compare; I1++; br loop } }
+    body.push(3)             // 0x03 loop
+    body.push(64)            // 0x40 void blocktype
+    pushStrScrI(body, 1)     // I1
+    pushStrScrI(body, 0)     // I0
+    body.push(78)            // 0x4e i32.ge_s  (I1 >= I0 → done)
+    body.push(4)             // 0x04 if
+    body.push(64)            // 0x40 void blocktype
+    // then: done — fall through (empty)
+    body.push(5)             // 0x05 else
+    // A[I1] != B[I1] ?
+    pushStrScrRef(body, 0)
+    pushStrScrI(body, 1)
+    body.push(251)
+    body.push(11)            // 0x0b array.get
+    appendAll(body, ulebToArr(aTypeIdx))
+    pushStrScrRef(body, 1)
+    pushStrScrI(body, 1)
+    body.push(251)
+    body.push(11)            // array.get
+    appendAll(body, ulebToArr(aTypeIdx))
+    body.push(71)            // 0x47 i32.ne
+    body.push(4)             // 0x04 if  (mismatch → 0, exit block)
+    body.push(64)            // 0x40 void blocktype
+    body.push(65)            // i32.const 0
+    appendAll(body, slebToArr(0))
+    body.push(12)            // 0x0c br
+    body.push(3)             // depth 3 → out of: if(0)·else(1)·loop(2)·block(3)
+    body.push(11)            // 0x0b end (mismatch if)
+    // I1 = I1 + 1
+    pushStrScrI(body, 1)
+    body.push(65)
+    appendAll(body, slebToArr(1))
+    body.push(106)           // i32.add
+    setStrScrI(body, 1)
+    body.push(12)            // 0x0c br
+    body.push(1)             // depth 1 → back to the loop header (else=0, loop=1)
+    body.push(11)            // 0x0b end (else's if — i.e. the ge_s if)
+    body.push(11)            // 0x0b end (loop)
+    // Every element matched → 1.
+    body.push(65)            // i32.const 1
+    appendAll(body, slebToArr(1))
+    body.push(11)            // 0x0b end (block) — leaves the 0/1 result
+    if isNe {
+      body.push(69)          // 0x45 i32.eqz  (`!=` negates value-equality)
+    }
+    return 0
+  }
+  emitFail("emitProgram: expected a string equality")
+}
+
+// Emit `clamp(idx, len)` where `idx` is in i32 temp `idxSlot` and `len` in temp
+// `lenSlot`, leaving the clamped value on the stack. JS slice semantics: a negative
+// index counts from the end (`len + idx`, floored at 0), a non-negative index is
+// capped at `len` — `idx < 0 ? max(len+idx, 0) : min(idx, len)`. Built from `select`
+// (`0x1b`: `[a, b, cond] -> a if cond else b`).
+function emitClampIdx(body: i32[], idxSlot: i32, lenSlot: i32): i32 {
+  // negCase = max(len+idx, 0) = select( len+idx, 0, (len+idx) > 0 )
+  pushStrScrI(body, lenSlot)
+  pushStrScrI(body, idxSlot)
+  body.push(106)             // i32.add → (len+idx)  [the `a` value]
+  body.push(65)              // i32.const 0          [the `b` value]
+  appendAll(body, slebToArr(0))
+  pushStrScrI(body, lenSlot)
+  pushStrScrI(body, idxSlot)
+  body.push(106)             // i32.add → (len+idx)
+  body.push(65)              // i32.const 0
+  appendAll(body, slebToArr(0))
+  body.push(74)              // 0x4a i32.gt_s → (len+idx) > 0   [cond]
+  body.push(27)              // 0x1b select → negCase on stack
+  // nonNegCase = min(idx, len) = select( idx, len, idx < len )
+  pushStrScrI(body, idxSlot)         // a = idx
+  pushStrScrI(body, lenSlot)         // b = len
+  pushStrScrI(body, idxSlot)
+  pushStrScrI(body, lenSlot)
+  body.push(72)              // 0x48 i32.lt_s → idx < len   [cond]
+  body.push(27)              // select → nonNegCase on stack
+  // result = select( negCase, nonNegCase, idx < 0 )
+  // Stack currently: [negCase, nonNegCase]; push cond then select.
+  pushStrScrI(body, idxSlot)
+  body.push(65)              // i32.const 0
+  appendAll(body, slebToArr(0))
+  body.push(72)              // 0x48 i32.lt_s → idx < 0
+  body.push(27)              // select → clamped value
+  0
+}
+
+// Lower a string `s.slice(start, end)` onto `body`, leaving the new string ref on
+// the stack — a fresh `(array i32)` over the half-open clamped range `[start, end)`.
+// JS semantics (mirroring `__string_slice__`): each bound clamps via `emitClampIdx`,
+// the out length is `max(end - start, 0)`, then one `array.copy` from `s[start]`.
+// i32 temps: I0 = clamped start, I1 = clamped end, I2 = len(s), I3 = out length.
+function emitStrSlice(body: i32[], callIx: i32, fnIx: i32): i32 {
+  if !aUsed {
+    return emitFail("emitProgram: string slice but array type not collected")
+  }
+  let c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 2 {
+      return emitFail("emitProgram: string .slice takes exactly two arguments (start, end)")
+    }
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      // Eval receiver + both args onto the stack first (nested string ops complete),
+      // then stash: end on top → I1, then start → I0, then receiver → strScrA.
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, c.callArgs[1], fnIx) < 0 { return 0 - 1 }
+      setStrScrI(body, 1)    // raw end → I1
+      setStrScrI(body, 0)    // raw start → I0
+      body.push(33)          // local.set strScrA (receiver)
+      appendAll(body, ulebToArr(strScratchBase + 0))
+      // I2 = len(s)
+      pushStrScrRef(body, 0)
+      body.push(251)
+      body.push(15)          // array.len
+      setStrScrI(body, 2)
+      // I0 = clamp(rawStart, len)
+      if emitClampIdx(body, 0, 2) < 0 { return 0 - 1 }
+      setStrScrI(body, 0)
+      // I1 = clamp(rawEnd, len)
+      if emitClampIdx(body, 1, 2) < 0 { return 0 - 1 }
+      setStrScrI(body, 1)
+      // I3 = out length = max(end - start, 0) = select( end-start, 0, end > start )
+      pushStrScrI(body, 1)
+      pushStrScrI(body, 0)
+      body.push(107)         // 0x6b i32.sub → end - start   [a]
+      body.push(65)          // i32.const 0                  [b]
+      appendAll(body, slebToArr(0))
+      pushStrScrI(body, 1)
+      pushStrScrI(body, 0)
+      body.push(74)          // 0x4a i32.gt_s → end > start  [cond]
+      body.push(27)          // 0x1b select
+      setStrScrI(body, 3)
+      // Out = array.new_default $aTypeIdx I3
+      pushStrScrI(body, 3)
+      body.push(251)
+      body.push(7)           // array.new_default
+      appendAll(body, ulebToArr(aTypeIdx))
+      body.push(33)          // local.set strScrOut
+      appendAll(body, ulebToArr(strScratchBase + 2))
+      // array.copy Out 0 s start n
+      pushStrScrRef(body, 2) // dest
+      body.push(65)          // i32.const 0 (dest offset)
+      appendAll(body, slebToArr(0))
+      pushStrScrRef(body, 0) // src s
+      pushStrScrI(body, 0)   // src offset = clamped start
+      pushStrScrI(body, 3)   // count = n
+      body.push(251)
+      body.push(17)          // array.copy
+      appendAll(body, ulebToArr(aTypeIdx))
+      appendAll(body, ulebToArr(aTypeIdx))
+      // Result: the new string ref.
+      pushStrScrRef(body, 2)
+      return 0
+    }
+    return emitFail("emitProgram: string .slice receiver is not a member access")
+  }
+  emitFail("emitProgram: expected a string slice call")
+}
+
 function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 {
     return emitFail("emitProgram: missing expression")
@@ -1572,6 +2063,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     return 0
   }
   if e is Call {
+    // G6: `s.slice(start, end)` over a string receiver is an intrinsic — a new
+    // `(array i32)` over the clamped half-open range. Other member-calls in value
+    // position are out of scope (the only member-call STATEMENT is `.push`).
+    if exprIsStrSlice(exprIx, fnIx) {
+      return emitStrSlice(body, exprIx, fnIx)
+    }
     return emitCall(body, exprIx, fnIx)
   }
   if e is IsExpr {
@@ -1639,6 +2136,17 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       }
       body.push(11)            // 0x0b end
       return 0
+    }
+    // G6 string operators (a string is a `(array i32)` of code points): `+` is a NEW
+    // concatenated array; `==`/`!=` are ELEMENT-WISE value-equality, NOT ref identity
+    // — so they take their own inline lowering BEFORE the i32 `binOpcode` path (which
+    // would emit `i32.eq` = ref identity, the WRONG answer for strings). Only string-
+    // typed operands route here; i32/other-type `+`/`==`/`!=` are unchanged.
+    if exprIsStrConcat(exprIx, fnIx) {
+      return emitStrConcat(body, exprIx, fnIx)
+    }
+    if exprIsStrEq(exprIx, fnIx) {
+      return emitStrEq(body, exprIx, fnIx)
     }
     let opcode = binOpcode(e.binOp)
     if opcode < 0 {
@@ -2205,12 +2713,17 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     // `.push` can resolve its scratch slots.
     fnUsesPush = fnHasPush(fnIx)
     fnUsesRefPush = fnHasRefPush(fnIx)
+    fnUsesStrOp = fnHasStrOp(fnIx)
     let nLocals = localNames.length
     pushScratchBase = fn.fnParams.length + nLocals
     // The ref-push scratch triple (if any) follows the i32 triple.
     let i32Scratch = 0
     if fnUsesPush { i32Scratch = 3 }
     refPushScratchBase = fn.fnParams.length + nLocals + i32Scratch
+    // The string-op scratch frame (if any) follows BOTH push triples.
+    let refScratch = 0
+    if fnUsesRefPush { refScratch = 3 }
+    strScratchBase = fn.fnParams.length + nLocals + i32Scratch + refScratch
 
     let bodyExpr: i32[] = []
     if emitStmts(bodyExpr, fn.fnBody, fnIx) < 0 { return 0 - 1 }
@@ -2226,6 +2739,8 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     let nRuns = nLocals
     if fnUsesPush { nRuns = nRuns + 3 }
     if fnUsesRefPush { nRuns = nRuns + 3 }
+    // The G6 string-op frame: 3 non-null string refs + 4 i32 temporaries.
+    if fnUsesStrOp { nRuns = nRuns + 7 }
     appendAll(body, ulebToArr(nRuns))
     let li = 0
     while li < nLocals {
@@ -2251,6 +2766,27 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(1)
       body.push(100)         // pushRefBacking: 0x64 (ref $raTypeIdx) — non-null ref backing
       appendAll(body, ulebToArr(raTypeIdx))
+    }
+    if fnUsesStrOp {
+      // strScrA / strScrB / strScrOut: 3 non-null `(ref $aTypeIdx)` string refs.
+      body.push(1)
+      body.push(100)         // 0x64 (ref $aTypeIdx) — non-null string ref
+      appendAll(body, ulebToArr(aTypeIdx))
+      body.push(1)
+      body.push(100)
+      appendAll(body, ulebToArr(aTypeIdx))
+      body.push(1)
+      body.push(100)
+      appendAll(body, ulebToArr(aTypeIdx))
+      // strScrI0..strScrI3: 4 i32 temporaries.
+      body.push(1)
+      body.push(127)         // 0x7f i32
+      body.push(1)
+      body.push(127)
+      body.push(1)
+      body.push(127)
+      body.push(1)
+      body.push(127)
     }
     appendAll(body, bodyExpr)
     body.push(11)            // 0x0b end
@@ -3525,9 +4061,17 @@ function exprString(exprIx: i32, fnIx: i32): boolean {
   if e is StrLit { return true }
   if e is Paren { return exprString(e.parInner, fnIx) }
   if e is Call {
+    // G6: `s.slice(...)` over a string receiver produces a string. Otherwise a
+    // bare call produces a string iff the callee declares a `string` return.
+    if exprIsStrSlice(exprIx, fnIx) { return true }
     let callee = P.nodes[e.callFn]
     if callee is Ident { return fnRetString(callee.identName) }
     return false
+  }
+  if e is BinExpr {
+    // G6: string concatenation `a + b` produces a string; no other binary operator
+    // does (`==`/`!=` yield an i32).
+    return exprIsStrConcat(exprIx, fnIx)
   }
   if e is Ident {
     if paramString(fnIx, e.identName) { return true }

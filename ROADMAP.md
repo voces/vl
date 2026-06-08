@@ -359,8 +359,13 @@ independent).*
     <code point>` — unblocking the ~40+ self-host predicates that return `boolean`. **Logical `&&`/`||`/`!`**
     (G4) now land too, introducing the first VALUE-TYPED `if` (blocktype `0x7f`): `a && b` ≡ `if(a){b}else{0}`,
     `a || b` ≡ `if(a){1}else{b}` (the RHS genuinely short-circuits), `!a` → `i32.eqz` — heavy in the lexer's
-    char-class predicates. Ahead: G6 string concat/equality, G8 maps, G9 return/local inference, unions mixing
-    scalars + structs, `!is`/negated guards, non-i32-value element lists, list `pop`/`+`/equality, and the broader
+    char-class predicates. **String `+`/`==`/`.slice`** (G6) now land too: a string is the SAME `(array i32)` of
+    code points, so all three lower INLINE — `+` allocates `len(a)+len(b)` and `array.copy`s both in, `==`/`!=`
+    are ELEMENT-WISE value-equality (a length check then a per-code-point loop — NOT ref identity, a correctness
+    fix), `.slice` clamps JS-style + `array.copy`s the range — the operators diagnostics (`+`), the lexer
+    keyword tables (`==`), and lexeme extraction (`gSrc.slice`) lean on. Ahead: G8 maps, G9 return/local inference,
+    unions mixing scalars + structs, `!is`/negated guards, non-i32-value element lists, list `pop`/`+`/equality,
+    string `.indexOf`/`.includes`/`.charCodeAt`, and the broader
     self-host source vocabulary (`for`, `match`, nested arrays/maps). (The fixed-bytes spike that
     hand-built two modules without reading `compiler/ast.vl` is retired.)
   - **(b) Grow the `.vl` parser/typecheck subset.** `parseStmt` handles `let`/`const`/`function`/`if`
@@ -381,10 +386,12 @@ independent).*
   `global.set`, constexpr inits), **ref-element lists — arrays of structs + unions (G7-ref)** (`Node[]`/
   `Tok[]` arenas now emittable: a `(ref null $elem)` backing, `ref.as_non_null` on read, `is`-narrow over
   elements), **boolean params/locals/returns + bool/char literals (G3)** (`boolean` rides in i32; `BoolLit`
-  → `i32.const 1`/`0`, `CharLit` → `i32.const <code point>`), and **logical `&&`/`||`/`!` + the first value-typed
-  `if` (G4)** (`&&`/`||` → short-circuit `if` with i32 result-type blocktype `0x7f`, `!` → `i32.eqz`); ahead are
-  G6 string concat/equality, G8 maps, G9 return/local inference, non-i32-value element
-  lists, list `pop`/`+`/equality, and the wider self-host source vocabulary. Remaining sub-items:
+  → `i32.const 1`/`0`, `CharLit` → `i32.const <code point>`), **logical `&&`/`||`/`!` + the first value-typed
+  `if` (G4)** (`&&`/`||` → short-circuit `if` with i32 result-type blocktype `0x7f`, `!` → `i32.eqz`), and
+  **string `+`/`==`/`.slice` (G6)** (inline over the `(array i32)` code-point rep: `+` = `array.new_default` +
+  two `array.copy`s, `==`/`!=` = element-wise value-equality NOT ref identity, `.slice` = JS-clamped `array.copy`);
+  ahead are G8 maps, G9 return/local inference, non-i32-value element
+  lists, list `pop`/`+`/equality, string `.indexOf`/`.includes`/`.charCodeAt`, and the wider self-host source vocabulary. Remaining sub-items:
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/selfhost-gaps.md` §H4.1)
