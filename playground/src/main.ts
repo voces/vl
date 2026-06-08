@@ -46,7 +46,7 @@ import {
 import { SAMPLES, type Sample } from "./samples.ts";
 import * as lsp from "./lspAdapter.ts";
 import * as projects from "./projects.ts";
-import type { ProjectFile, UserProject } from "./projects.ts";
+import type { ProjectFile } from "./projects.ts";
 import { decodeHash, encodeSource } from "./share.ts";
 import { format } from "../../compiler/format.ts";
 
