@@ -271,8 +271,9 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 - ⬜ **F6. Document the build** (`deno task build`/`test`; the antlr/gradle gen step is gone).
 - ⬜ **F7. Fix the `paramater` misspelling** project-wide (optional; currently consistent).
 - 🟡 **F8.** REMAINING (F5-adjacent): confirm vscode-languageclient forking the ESM server in VS Code.
-- 🟡 **F9. Perf baseline.** REMAINING: a *runtime* benchmark (run compiled `.vl` programs on large
-  inputs); investigate the cubic literal-union compile (A16).
+- 🟡 **F9. Perf baseline.** Runtime benchmark shipped (`scripts/perf-runtime.ts` / `perf-compare.ts`).
+  Cubic literal-union compile RESOLVED — `flattenType` all-literal dedup is now O(n)-per-flatten
+  (O(n²) overall, was O(n³)); see CHANGELOG A16.
   **Perf wins identified (detail: `docs/perf-findings.md`):**
   - ✅ **F9c. Memoize `structSig`** — shipped (#107); see `CHANGELOG.md`. Post-fix: binaryen
     `optimize()` costs only ~0.8 s on the self-host module — NOT the bottleneck.
