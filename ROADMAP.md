@@ -237,13 +237,14 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   hover and completion `documentation`. Cross-import resolution now done (H0 phase 3): a `Name` that
   is an imported binding links to the exporting sibling module's source location (`siblingUri#L…`),
   via the module graph's imported-name → source resolution (`lsp/src/moduleGraph.ts`).
-- ⬜ **D8. Preserve type-alias names in display (the "`aliasSymbol`" gap).** Today a reference to
-  an alias resolves *through* to its body before rendering (e.g. hover on `type thing = "a" | I32`
-  shows `"a" | i32`). Fix: carry the alias name on the resolved type and let the renderer choose
-  per context — **preserve** in hovers/inlay, **expand** in type-mismatch errors.
-  **Manual step-expansion (owner ask):** expand one depth level at a time, on demand, via VS Code
-  hover verbosity levels (`+`/`−` controls). Needs `stringifyType` to grow a `maxDepth` parameter;
-  default hover = depth 0 (all names preserved); stepping reveals structure progressively.
+- ⬜ **D8. Hover verbosity step-expansion.** Alias-name preservation is done (see `CHANGELOG.md`).
+  REMAINING: the interactive shallow↔deep verbosity stepper — expand one alias layer at a time
+  on demand via the proposed LSP 3.18 hover-verbosity API (`HoverParams.context.verbosityLevel`
+  + `Hover.canIncrease`/`canDecrease`). The renderer (`stringifyType` `maxDepth`) is ready;
+  blocked on the protocol landing in `vscode-languageserver` (currently 3.17.5). When it lands:
+  deps/min-version bump + map `params.context.verbosityLevel` → `maxDepth`, set
+  `canIncrease`/`canDecrease` on the returned `Hover` — no renderer change needed (see comment
+  in `lsp/src/server.ts` ~L394).
 
 ---
 
