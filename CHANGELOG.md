@@ -101,6 +101,7 @@ see **`DECISIONS.md`**.
 - **G Hand-written parser** — replaced antlr4 with hand-written TS lexer + recursive-descent/Pratt parser emitting the typed AST directly; antlr4/Gradle/generated dirs gone. → `DECISIONS.md`
 - **G AST source spans** — `NodeSpans` + `spanOf` publicly exposed via `toAST`/`compile`; unblocks D4/D6/D7.
 - **G Comment-carrying tokens** — comments retained with spans (flat `comments` list + per-token `leading`/`trailing` trivia) without entering the grammar stream; unblocks AST-driven formatter.
+- **G8 Soft-newline statement boundaries** — newlines are never force-required; statements abut on one line. Fixed `return <expr>` followed by a same-line statement (`return 1 print(9)`): the trailing dead statement was mistaken for the block's implicit return value and spuriously checked against an annotated return type (`expected i32, got null`) — now `return 1` carries the value and the trailing statement is left for the next position (flagged by the unreachable-code lint). → `DECISIONS.md` (G8)
 
 ## Self-hosting & modules (Track H)
 
