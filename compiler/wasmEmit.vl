@@ -645,6 +645,24 @@ let raTypeIdx: i32 = 0
 let rlTypeIdx: i32 = 0
 let rElemKind: i32 = 0
 
+// ── per-element-type ref-list table (MULTIPLE distinct ref lists program-wide) ─
+// `parser.vl`'s `Parser` holds THREE distinct ref-list element types at once —
+// `toks: Tok[]`, `nodes: Node[]`, `diags: Diag[]` — so a single program-global
+// `raTypeIdx`/`rlTypeIdx`/`rElemKind` is not enough. This flat table interns a
+// backing array + list wrapper heap type PER DISTINCT element type, keyed by the
+// element type-NAME (a declared struct name, or the union alias name). `collectA`
+// fills `rlElemName` with the distinct names; `emitModule` resolves the parallel
+// heap indices (`rlElemHeap` = the struct's heap idx / `uBoxIdx`; `rlBackIdx` =
+// its `(array (mut (ref null $elem)))` backing; `rlWrapIdx` = its `{backing,len,
+// cap}` wrapper). `rlElemKind[s]` is `1` (struct element) or `2` (union box).
+// Every site that assumed the singletons resolves a SLOT from the receiver's
+// element type-name (`refListSlotOfExpr`) and consults the table at that slot.
+let rlElemName: string[] = []
+let rlElemHeap: i32[] = []
+let rlBackIdx: i32[] = []
+let rlWrapIdx: i32[] = []
+let rlElemKindTbl: i32[] = []
+
 // ── string-keyed map table (G8: `{[string]: i32}` open-addressing hash map) ────
 // A string-keyed map `{[string]: i32}` lowers to a REAL ordered open-addressing
 // hash map (mirroring the host's `compiler/builtins/maps.ts`), a 5-field WasmGC
@@ -4487,16 +4505,34 @@ function emitModule(stmts: i32[]): i32 {
   if lUsed { listOffset = 1 }
   aTypeIdx = preTypes
   lTypeIdx = preTypes + arrayOffset
-  // The REF-element backing array + list wrapper (G7-ref) follow the i32 array/list, so
-  // each REFERENCES an already-emitted earlier type: the ref backing's element is the
-  // struct (heap-type 0) / union box (`uBoxIdx`), and the ref-list wrapper references the
-  // ref backing. `raTypeIdx`/`rlTypeIdx` are 0 or 1 each.
-  let refArrOffset = 0
-  if raUsed { refArrOffset = 1 }
-  let refListOffset = 0
-  if rlUsed { refListOffset = 1 }
-  raTypeIdx = preTypes + arrayOffset + listOffset
-  rlTypeIdx = preTypes + arrayOffset + listOffset + refArrOffset
+  // The REF-element backing arrays + list wrappers (G7-ref) follow the i32 array/list.
+  // ONE distinct (backing, wrapper) PAIR per distinct element type (`rlElemName`), laid
+  // out interleaved: back0, wrap0, back1, wrap1, … so each wrapper immediately follows
+  // (and references) its own backing. Each backing's element is the struct's heap idx
+  // (`sHeapIdx`) or the union box (`uBoxIdx`), resolved per slot here into `rlElemHeap`;
+  // `rlBackIdx`/`rlWrapIdx` are the assigned heap indices. The legacy singletons
+  // `raTypeIdx`/`rlTypeIdx` alias SLOT 0 for any not-yet-migrated site.
+  let refPairBase = preTypes + arrayOffset + listOffset
+  let rs = 0
+  while rs < rlElemName.length {
+    rlBackIdx[rs] = refPairBase + rs * 2
+    rlWrapIdx[rs] = refPairBase + rs * 2 + 1
+    if rlElemKindTbl[rs] == 2 {
+      rlElemHeap[rs] = uBoxIdx
+    } else {
+      let esi = structIndexByName(rlElemName[rs])
+      if esi >= 0 { rlElemHeap[rs] = sHeapIdx[esi] } else { rlElemHeap[rs] = 0 }
+    }
+    rs = rs + 1
+  }
+  let refPairsTotal = rlElemName.length * 2
+  if rlElemName.length >= 1 {
+    raTypeIdx = rlBackIdx[0]
+    rlTypeIdx = rlWrapIdx[0]
+  } else {
+    raTypeIdx = refPairBase
+    rlTypeIdx = refPairBase
+  }
   // The string-ref list types follow the ref-list types: the keys backing
   // `(array (mut (ref null $aTypeIdx)))`, then the keys list wrapper `{ backing:
   // (ref $mkArr), len, cap }`. These two are shared by the map's keys list AND any
@@ -4509,7 +4545,7 @@ function emitModule(stmts: i32[]): i32 {
   let mapStructOffset = 0
   if mUsed { mapStructOffset = 1 }
   let mapOffset = strListOffset + mapStructOffset
-  let preMap = preTypes + arrayOffset + listOffset + refArrOffset + refListOffset
+  let preMap = preTypes + arrayOffset + listOffset + refPairsTotal
   mkArrIdx = preMap
   mkListIdx = preMap + 1
   mStructIdx = preMap + 2
@@ -4595,28 +4631,26 @@ function emitModule(stmts: i32[]): i32 {
     typePayload.push(127)        // field 2 cap: 0x7f i32
     typePayload.push(1)          // mutable
   }
-  if raUsed {
-    // The REF backing array `(array (mut (ref null $elem)))` (G7-ref). Its element is a
-    // NULLABLE ref (`0x63 <elem>` — `(ref null ht)`) so `array.new_default` can default
-    // the spare slots to null; reads `ref.as_non_null` it back. `$elem` is the struct
-    // (heap-type 0) for a struct list, or the union box (`uBoxIdx`) for a union list.
-    typePayload.push(94)         // 0x5e array
+  // One (backing, wrapper) PAIR per distinct ref-list element type, interleaved so each
+  // wrapper immediately follows (and references) its own backing — the heap indices laid
+  // out above. Each backing is `(array (mut (ref null $elem)))` over the slot's element
+  // (struct heap idx / union box); each wrapper is `{ backing: (ref $back), len, cap }`.
+  let rti = 0
+  while rti < rlElemName.length {
+    typePayload.push(94)         // 0x5e array (ref backing)
     typePayload.push(99)         // 0x63 (ref null ht) — nullable element ref
-    appendAll(typePayload, ulebToArr(refElemHeapType()))
+    appendAll(typePayload, ulebToArr(rlElemHeap[rti]))
     typePayload.push(1)          // mutable
-  }
-  if rlUsed {
-    // The REF-list wrapper `{ backing: (ref $raTypeIdx), len: i32, cap: i32 }` — the same
-    // triple as the i32 list, over the ref backing.
-    typePayload.push(95)         // 0x5f struct
+    typePayload.push(95)         // 0x5f struct (ref-list wrapper)
     typePayload.push(3)          // 3 fields
     typePayload.push(100)        // field 0 backing: 0x64 (ref ht) — non-null
-    appendAll(typePayload, ulebToArr(raTypeIdx))   // ...to the ref backing array
+    appendAll(typePayload, ulebToArr(rlBackIdx[rti]))   // ...to THIS slot's ref backing
     typePayload.push(1)          // mutable
     typePayload.push(127)        // field 1 len: 0x7f i32
     typePayload.push(1)          // mutable
     typePayload.push(127)        // field 2 cap: 0x7f i32
     typePayload.push(1)          // mutable
+    rti = rti + 1
   }
   if slUsed || mUsed {
     // The STRING-REF list types, shared by the map's keys list and any `string[]`
@@ -4919,6 +4953,11 @@ function collectA(stmts: i32[]): i32 {
   raUsed = false
   rlUsed = false
   rElemKind = 0
+  rlElemName = []
+  rlElemHeap = []
+  rlBackIdx = []
+  rlWrapIdx = []
+  rlElemKindTbl = []
   mUsed = false
   slUsed = false
   let i = 0
@@ -4934,6 +4973,7 @@ function collectA(stmts: i32[]): i32 {
         rlUsed = true
         raUsed = true
         rElemKind = arrLitElemKind(i)
+        rlInternName(arrLitElemName(i), arrLitElemKind(i))
       } else {
         lUsed = true
         aUsed = true
@@ -4960,6 +5000,7 @@ function collectA(stmts: i32[]): i32 {
         rlUsed = true
         raUsed = true
         rElemKind = refArrElemKind(nd.tyName)
+        rlInternName(refArrElemName(nd.tyName), refArrElemKind(nd.tyName))
       } else if nameIsArray(nd.tyName) {
         if checkArrName(nd.tyName) < 0 { return 0 - 1 }
         // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
@@ -5002,11 +5043,88 @@ function arrLitIsStr(arrIx: i32, fnIx: i32): boolean {
 }
 
 // The ref-element kind of the array literal at `arrIx` (assumes `arrLitIsRef`): `2`
-// when the program declares a union (every objlit element boxes into the union), else
-// `1` (a direct struct element).
+// when the FIRST element is a union variant (boxes into the union), else `1` (a direct
+// struct element). Per-element-type: a `Tok[]` literal whose element is a plain struct
+// is kind `1` even in a program that ALSO declares a union (which `Node[]` uses).
 function arrLitElemKind(arrIx: i32): i32 {
+  let a = P.nodes[arrIx]
+  if a is ArrayLit {
+    if a.arrElems.length >= 1 {
+      let e0 = P.nodes[a.arrElems[0]]
+      if e0 is ObjLit {
+        // A union-variant element boxes into the union (kind 2); a plain struct is kind 1.
+        if uDeclared {
+          if objVariantName(a.arrElems[0]) != "" { return 2 }
+        }
+        return 1
+      }
+    }
+  }
   if uDeclared { return 2 }
   1
+}
+
+// The ref-list ELEMENT type-NAME of the array literal at `arrIx` (assumes `arrLitIsRef`):
+// the union alias name for a union-variant element, else the matched struct's name. This
+// is the table key (`rlElemName`) the per-element-type interning uses.
+function arrLitElemName(arrIx: i32): string {
+  let a = P.nodes[arrIx]
+  if a is ArrayLit {
+    if a.arrElems.length >= 1 {
+      let e0 = P.nodes[a.arrElems[0]]
+      if e0 is ObjLit {
+        if uDeclared {
+          if objVariantName(a.arrElems[0]) != "" { return uName }
+        }
+        let si = structIndexOfObj(a.arrElems[0])
+        if si >= 0 { return sNames[si] }
+      }
+    }
+  }
+  ""
+}
+
+// The element type-NAME for a ref-array type-name (assumes `nameIsRefArray(name)`): the
+// element is `name` with the trailing `"[]"` removed — i.e. the struct / union alias
+// name. Mirrors `refArrElemKind` but yields the table key.
+function refArrElemName(name: string): string {
+  if uDeclared {
+    if name == uName + "[]" { return uName }
+  }
+  let i = 0
+  while i < sNames.length {
+    if name == sNames[i] + "[]" { return sNames[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// Intern a ref-list element type-NAME into the per-element-type table, returning its
+// SLOT index (existing slot if already present). `kind` is 1 (struct) or 2 (union box).
+// Heap/backing/wrapper indices are filled later in `emitModule`.
+function rlInternName(name: string, kind: i32): i32 {
+  if name == "" { return 0 - 1 }
+  let i = 0
+  while i < rlElemName.length {
+    if rlElemName[i] == name { return i }
+    i = i + 1
+  }
+  rlElemName.push(name)
+  rlElemHeap.push(0)
+  rlBackIdx.push(0)
+  rlWrapIdx.push(0)
+  rlElemKindTbl.push(kind)
+  rlElemName.length - 1
+}
+
+// The table SLOT for a ref-list element type-NAME, or -1 if not interned.
+function rlSlotByName(name: string): i32 {
+  let i = 0
+  while i < rlElemName.length {
+    if rlElemName[i] == name { return i }
+    i = i + 1
+  }
+  0 - 1
 }
 
 // True if the node at `ix` is a struct `type` declaration (a single-level narrowing
