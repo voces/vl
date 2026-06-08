@@ -2033,6 +2033,82 @@ const CASES: Case[] = [
       if (got !== 25) throw new Error(`lookup() returned ${got}, expected 25`);
     },
   },
+  {
+    // PROVES the open-addressing RESIZE/REHASH path: cap 8, load-factor 1/2 grows
+    // at the 4th entry (and again at the 8th), so inserting 10 keys forces TWO
+    // rehashes. Every key is then looked up — if a rehash dropped/mis-placed any
+    // entry (or the probe couldn't find a free slot post-grow), the sum is wrong.
+    // Values 1..10 sum to 55.
+    name: "G8: ten keys force two index resizes; every key still round-trips (sum => 55)",
+    src: [
+      "function manykeys(): i32 {",
+      "  let m: {[string]: i32} = Map()",
+      '  m["k0"] = 1',
+      '  m["k1"] = 2',
+      '  m["k2"] = 3',
+      '  m["k3"] = 4',
+      '  m["k4"] = 5',
+      '  m["k5"] = 6',
+      '  m["k6"] = 7',
+      '  m["k7"] = 8',
+      '  m["k8"] = 9',
+      '  m["k9"] = 10',
+      "  let sum = 0",
+      '  sum = sum + (m["k0"] ?? -1)',
+      '  sum = sum + (m["k1"] ?? -1)',
+      '  sum = sum + (m["k2"] ?? -1)',
+      '  sum = sum + (m["k3"] ?? -1)',
+      '  sum = sum + (m["k4"] ?? -1)',
+      '  sum = sum + (m["k5"] ?? -1)',
+      '  sum = sum + (m["k6"] ?? -1)',
+      '  sum = sum + (m["k7"] ?? -1)',
+      '  sum = sum + (m["k8"] ?? -1)',
+      '  sum = sum + (m["k9"] ?? -1)',
+      "  return sum",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "manykeys");
+      if (got !== 55) throw new Error(`manykeys() returned ${got}, expected 55`);
+    },
+  },
+  {
+    // Resize interleaved with OVERWRITES and a MISSING-key probe: grow the map past
+    // its initial cap while overwriting some keys, then confirm overwrites stuck,
+    // an absent key still misses (the post-resize probe terminates on a free slot),
+    // and `.has` agrees. k3 overwritten 4→40; k7 overwritten 8→80; absent "nope".
+    name: "G8: resize with interleaved overwrites + a missing-key probe",
+    src: [
+      "function f(): i32 {",
+      "  let m: {[string]: i32} = Map()",
+      '  m["k0"] = 1',
+      '  m["k1"] = 2',
+      '  m["k2"] = 3',
+      '  m["k3"] = 4',
+      '  m["k4"] = 5',
+      '  m["k5"] = 6',
+      '  m["k6"] = 7',
+      '  m["k7"] = 8',
+      '  m["k3"] = 40',
+      '  m["k7"] = 80',
+      "  let r = 0",
+      '  r = r + (m["k3"] ?? -1)',
+      '  r = r + (m["k7"] ?? -1)',
+      '  r = r + (m["k0"] ?? -1)',
+      '  r = r + (m["nope"] ?? 1000)',
+      '  if m.has("k5") { r = r + 1 }',
+      '  if m.has("nope") { r = r + 100000 }',
+      "  return r",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 40 + 80 + 1 + 1000 (default for missing) + 1 (has k5) = 1122.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 1122) throw new Error(`f() returned ${got}, expected 1122`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the

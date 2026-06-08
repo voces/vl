@@ -2060,11 +2060,123 @@ function emitMapHas(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
 }
 
 // Resize the `index` when the load factor (size / cap) crosses 1/2: allocate a fresh
-// `index` of `2*cap` slots and REBUILD it from the ordered entries (probe each key's
-// hash into the new index, writing entry+1). The ordered keys/vals lists are untouched
-// — only `index` is rebuilt, so insertion order is preserved. (Implemented in the
-// resize slice; a temporary no-op keeps the small-key tests green meanwhile.)
+// `index` of `2*cap` slots and REBUILD it from the ordered entries — for each entry
+// `i` in `[0, count)`, hash `keys[i]` into the new index and linear-probe to a free
+// slot, writing `i+1`. The ordered keys/vals lists are UNTOUCHED (insertion order
+// preserved); only `index` is rebuilt. `mapRef` is in slot 0. Scratch use (all free
+// after the probe/append): 4 newCap, 3 entry cursor `i`, 10 new index backing, 11
+// inner probe slot; `emitMapHashOf` uses 9/8 internally (disjoint from these).
 function emitMapResize(body: i32[]): i32 {
+  // if size * 2 >= len(index) { rehash to 2 * len(index) }
+  pushMapSize(body)
+  body.push(65)
+  appendAll(body, slebToArr(2))
+  body.push(108)             // i32.mul (size * 2)
+  pushMapIndex(body)
+  body.push(251)
+  body.push(15)              // array.len
+  body.push(79)              // 0x4f i32.ge_u (size*2 >= cap)
+  body.push(4)               // if
+  body.push(64)              // void
+  // newCap = 2 * len(index)
+  pushMapIndex(body)
+  body.push(251)
+  body.push(15)              // array.len
+  body.push(65)
+  appendAll(body, slebToArr(2))
+  body.push(108)             // i32.mul
+  setMapScr(body, 4)         // newCap (slot 4)
+  // idxBk = array.new_default $aTypeIdx newCap  (zero-filled)
+  pushMapScr(body, 4)
+  body.push(251)
+  body.push(7)               // array.new_default
+  appendAll(body, ulebToArr(aTypeIdx))
+  setMapScr(body, 10)        // idxBk (slot 10)
+  // i = 0
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  setMapScr(body, 3)         // i (slot 3)
+  // loop { if i >= count {} else { rebuild entry i ; i++ ; br } }
+  body.push(3)               // loop
+  body.push(64)              // void
+  pushMapScr(body, 3)        // i
+  pushMapCount(body)
+  body.push(78)              // i32.ge_s (i >= count → done)
+  body.push(4)               // if
+  body.push(64)              // void
+  // then: done (empty)
+  body.push(5)               // else
+  // curRef = keys.backing[i]  (ref.as_non_null — entries are populated)
+  pushMapKeys(body)
+  body.push(251)
+  body.push(2)               // struct.get (keys backing)
+  appendAll(body, ulebToArr(mkListIdx))
+  body.push(0)               // field 0: backing
+  pushMapScr(body, 3)        // i
+  body.push(251)
+  body.push(11)              // array.get
+  appendAll(body, ulebToArr(mkArrIdx))
+  body.push(212)             // 0xd4 ref.as_non_null
+  setMapScr(body, 2)         // curRef
+  // rslot = hash(curRef) % newCap
+  if emitMapHashOf(body, 2) < 0 { return 0 - 1 }
+  pushMapScr(body, 4)        // newCap
+  body.push(112)             // i32.rem_u
+  setMapScr(body, 11)        // rslot
+  // while idxBk[rslot] != 0 { rslot = (rslot + 1) % newCap }
+  body.push(2)               // block (inner probe break)
+  body.push(64)
+  body.push(3)               // loop
+  body.push(64)
+  // if idxBk[rslot] == 0 { br 1 → out of inner block }
+  pushMapScr(body, 10)       // idxBk
+  pushMapScr(body, 11)       // rslot
+  body.push(251)
+  body.push(11)              // array.get
+  appendAll(body, ulebToArr(aTypeIdx))
+  body.push(69)              // i32.eqz
+  body.push(13)              // br_if
+  body.push(1)               // depth 1 → out of inner block
+  // rslot = (rslot + 1) % newCap
+  pushMapScr(body, 11)
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add
+  pushMapScr(body, 4)        // newCap
+  body.push(112)             // i32.rem_u
+  setMapScr(body, 11)
+  body.push(12)              // br
+  body.push(0)               // → inner loop header
+  body.push(11)              // end (inner loop)
+  body.push(11)              // end (inner block)
+  // idxBk[rslot] = i + 1
+  pushMapScr(body, 10)       // idxBk
+  pushMapScr(body, 11)       // rslot
+  pushMapScr(body, 3)        // i
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add (i + 1)
+  body.push(251)
+  body.push(14)              // array.set
+  appendAll(body, ulebToArr(aTypeIdx))
+  // i = i + 1
+  pushMapScr(body, 3)
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add
+  setMapScr(body, 3)
+  body.push(12)              // br
+  body.push(1)               // → outer loop header
+  body.push(11)              // end (ge_s if)
+  body.push(11)              // end (outer loop)
+  // M.index = idxBk
+  pushMapScr(body, 0)        // mapRef
+  pushMapScr(body, 10)       // idxBk
+  body.push(251)
+  body.push(5)               // struct.set
+  appendAll(body, ulebToArr(mStructIdx))
+  body.push(2)               // field 2: index
+  body.push(11)              // end (resize if)
   0
 }
 
