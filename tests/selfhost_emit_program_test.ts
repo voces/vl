@@ -1849,6 +1849,59 @@ const CASES: Case[] = [
     },
   },
 
+  // ── G4-coexist: STANDALONE structs alongside a UNION (the ast.vl shape) ─────
+  // `ast.vl` declares standalone structs (`Tok`, `Diag`, `Parser`) RIGHT ALONGSIDE
+  // the `Node` discriminated union. emitProgram now interns the standalone structs
+  // (those NOT union variants) as their own heap types AFTER the union's variants +
+  // box, routing an object literal to the standalone struct when its field-set matches
+  // one (else to the union box). These prove a mixed struct+union program — the core
+  // arena shape — constructs + reads back through real lexer→parser→emitProgram→engine.
+  {
+    name: "G4-coexist: a standalone Tok struct coexists with a Node union, read its i32 field => 3",
+    src: [
+      "type Tok = { kind: string, pos: i32 }",
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type Node = A | B",
+      "function main(): i32 {",
+      '  let t: Tok = { kind: "x", pos: 3 }',
+      "  return t.pos",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
+  {
+    // Use BOTH the standalone struct (string field == + i32 field) AND the union
+    // (`is`-narrow + variant field) in one function — proves the two paths coexist
+    // and dispatch correctly within a single program.
+    name: "G4-coexist: use a standalone struct + a union value in one program => 12",
+    src: [
+      "type Tok = { kind: string, pos: i32 }",
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type Node = A | B",
+      "function classify(n: Node): i32 {",
+      "  if n is A { return n.av }",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      '  let t: Tok = { kind: "id", pos: 7 }',
+      "  let c = classify({ av: 5 })",
+      '  if t.kind == "id" { return t.pos + c }',
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
+    },
+  },
+
   // ── G2b: module-level mutable GLOBALS (global.get / global.set) ─────────────
   {
     name: "G2b: an i32 global read+written within one function (`g=g+1` => 1)",

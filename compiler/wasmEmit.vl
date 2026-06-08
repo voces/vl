@@ -3082,8 +3082,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     return emitIs(body, exprIx, fnIx)
   }
   if e is ObjLit {
-    // In a union program every object literal is a union variant: box it `{tag, value}`.
-    // Otherwise it constructs the single direct struct.
+    // A literal whose field-set matches a STANDALONE struct constructs that struct
+    // directly (even alongside a union — `ast.vl`'s `Tok`/`Diag` coexist with `Node`).
+    // Otherwise, in a union program, it is a union variant: box it `{tag, value}`.
+    if structIndexOfObj(exprIx) >= 0 {
+      return emitObj(body, exprIx, fnIx)
+    }
     if uDeclared {
       return emitUnionBox(body, exprIx, fnIx)
     }
@@ -4118,8 +4122,9 @@ function globalKind(initIx: i32): i32 {
   if initIx < 0 { return 0 }
   let e = P.nodes[initIx]
   if e is ObjLit {
-    // In a union program an object literal lowers to the union box (`emitUnionBox`),
-    // so its valtype is the box ref (kind 4); otherwise the single struct (kind 1).
+    // A literal matching a standalone struct is that struct ref (kind 1) — even in a
+    // union program. Otherwise, in a union program it boxes into the union (kind 4).
+    if structIndexOfObj(initIx) >= 0 { return 1 }
     if uDeclared { return 4 }
     return 1
   }
@@ -4201,10 +4206,13 @@ function emitModule(stmts: i32[]): i32 {
   // false when `uDeclared`). When a union is declared, its `nv` variant structs occupy
   // the FIRST `nv` heap-type indices (`uVarIdx = 0`), the union box `{tag, value}`
   // follows at `uBoxIdx = nv`, and any array/list/functypes come after.
-  // The declared structs occupy the FIRST `sNames.length` heap-type indices (0..ns-1),
-  // in declaration order; `sHeapIdx[i] = i`. (A string struct field references the raw
-  // i32 array type at `aTypeIdx`, which lands AFTER the structs — a forward type-index
-  // reference, which the wasm binary format resolves globally across the type section.)
+  // The standalone (non-variant) structs occupy the FIRST `sNames.length` heap-type
+  // indices (0..ns-1), in declaration order; `sHeapIdx[i] = i`. The union types (if
+  // any) follow: the `nv` variant structs at `structOffset .. structOffset+nv-1`, the
+  // union box at `structOffset+nv` — matching the type-section emission order below
+  // (standalone structs, then union variants + box). A string struct/variant field
+  // references the raw array type at `aTypeIdx` which lands later — resolved by the
+  // single recursion group wrapping all types.
   let structOffset = sNames.length
   sHeapIdx = []
   let shi = 0
@@ -4214,8 +4222,8 @@ function emitModule(stmts: i32[]): i32 {
   }
   let unionOffset = 0
   if uDeclared {
-    uVarIdx = 0
-    uBoxIdx = uVariants.length
+    uVarIdx = structOffset
+    uBoxIdx = structOffset + uVariants.length
     unionOffset = uVariants.length + 1   // nv variant structs + 1 union box
   }
   let preTypes = structOffset + unionOffset
@@ -4710,50 +4718,51 @@ function collectS(stmts: i32[]): i32 {
   sFieldStart = []
   sFieldCount = []
   sFieldTypes = []
-  // When the program declares a union, every struct `type` is a union variant and is
-  // collected by `collectU` into its own variant table instead — so this struct path
-  // stays off.
-  if uDeclared {
-    return 0
-  }
+  // A `type X = {…}` that is a UNION VARIANT is collected by `collectU` into its own
+  // variant table — it is NOT a standalone struct, so skip it here. Any OTHER struct
+  // `type` (e.g. `ast.vl`'s `Tok`/`Diag`, declared alongside the `Node` union) IS a
+  // standalone struct and is interned here, so standalone structs coexist with a union.
   let i = 0
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
+    // A union variant `TypeDecl` is owned by the variant table, NOT a standalone struct.
     if s is TypeDecl {
-      sDeclared = true
-      sNames.push(s.tdName)
-      sFieldStart.push(sFieldNames.length)
-      let fields = s.tdFields
-      let cnt = 0
-      let fi = 0
-      while fi < fields.length {
-        let fnode = P.nodes[fields[fi]]
-        if fnode is FieldDef {
-          if fnode.fdType < 0 {
-            return emitFail("emitProgram: only i32 struct fields are supported")
-          }
-          let ty = P.nodes[fnode.fdType]
-          if ty is TypeRef {
-            if ty.tyName == "i32" {
-              sFieldTypes.push(0)
-            } else if ty.tyName == "boolean" {
-              sFieldTypes.push(0)
-            } else if nameIsString(ty.tyName) {
-              sFieldTypes.push(3)
-            } else {
+      if variantIndexOf(s.tdName) < 0 {
+        sDeclared = true
+        sNames.push(s.tdName)
+        sFieldStart.push(sFieldNames.length)
+        let fields = s.tdFields
+        let cnt = 0
+        let fi = 0
+        while fi < fields.length {
+          let fnode = P.nodes[fields[fi]]
+          if fnode is FieldDef {
+            if fnode.fdType < 0 {
               return emitFail("emitProgram: only i32 struct fields are supported")
             }
+            let ty = P.nodes[fnode.fdType]
+            if ty is TypeRef {
+              if ty.tyName == "i32" {
+                sFieldTypes.push(0)
+              } else if ty.tyName == "boolean" {
+                sFieldTypes.push(0)
+              } else if nameIsString(ty.tyName) {
+                sFieldTypes.push(3)
+              } else {
+                return emitFail("emitProgram: only i32 struct fields are supported")
+              }
+            } else {
+              return emitFail("emitProgram: struct field type is not a type name")
+            }
+            sFieldNames.push(fnode.fdName)
+            cnt = cnt + 1
           } else {
-            return emitFail("emitProgram: struct field type is not a type name")
+            return emitFail("emitProgram: malformed struct field")
           }
-          sFieldNames.push(fnode.fdName)
-          cnt = cnt + 1
-        } else {
-          return emitFail("emitProgram: malformed struct field")
+          fi = fi + 1
         }
-        fi = fi + 1
+        sFieldCount.push(cnt)
       }
-      sFieldCount.push(cnt)
     }
     i = i + 1
   }
