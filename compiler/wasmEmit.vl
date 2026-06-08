@@ -823,12 +823,45 @@ let uFieldElemName: string[] = []
 // ── active `is`-narrowing scope ───────────────────────────────────────────────
 // When emitting the THEN-branch of `if n is A { … }`, the union-typed identifier
 // `n` is narrowed to variant `A`, so a field read `n.f` in that branch lowers to
-// the downcast. `narrowName`/`narrowVariant` hold the single active narrowing (one
-// at a time is enough for the slice's `if n is A { return n.f }` shape); they are
-// saved/restored around the branch so nesting and the else-branch see the right
-// scope.
-let narrowName: string = ""
-let narrowVariant: string = ""
+// the downcast. The active narrowings are a STACK (parallel `narrowNames` /
+// `narrowVariants`): nested guards over DISTINCT union locals (`if ta is TyPrim { if
+// tb is TyPrim { … ta.primName … tb.primName … } }`, the `sameNumeric` shape) each
+// push a binding, so BOTH `ta` and `tb` stay narrowed in the inner branch — a single
+// slot would lose the outer one. A branch saves the stack LENGTH and truncates back
+// on exit, so nesting + the else-branch see the right scope. `narrowVariantFor`
+// resolves a receiver name to its INNERMOST active variant (shadowing-correct).
+// `narrowTop` is the logical stack DEPTH: only `narrowNames[0 .. narrowTop-1]` are
+// active. Entries are appended on push; on branch exit the depth is rewound (the arrays
+// keep their slots — no `.pop()`, so no global-list-pop self-host dependency). A push
+// past the current length appends; a push within reuses/overwrites the slot.
+let narrowNames: string[] = []
+let narrowVariants: string[] = []
+let narrowTop: i32 = 0
+
+// The variant a union local `name` is narrowed to in the current scope (the innermost
+// active binding within `narrowTop`), or "" if `name` is not currently narrowed.
+function narrowVariantFor(name: string): string {
+  let i = narrowTop - 1
+  while i >= 0 {
+    if narrowNames[i] == name { return narrowVariants[i] }
+    i = i - 1
+  }
+  ""
+}
+
+// Push an active narrowing `name → variant`, growing the stack arrays if needed. Returns
+// the new depth.
+function pushNarrow(name: string, variant: string): i32 {
+  if narrowTop < narrowNames.length {
+    narrowNames[narrowTop] = name
+    narrowVariants[narrowTop] = variant
+  } else {
+    narrowNames.push(name)
+    narrowVariants.push(variant)
+  }
+  narrowTop = narrowTop + 1
+  narrowTop
+}
 
 // Append the declared-local name `name` to `localNames` if not already present.
 // `structIdx` is the local's struct table index when it is a struct ref (`isRef == 1`),
@@ -907,13 +940,11 @@ function collectLocalsIf(ifIx: i32, fnIx: i32): i32 {
     // an array local here — `exprArray`/`memFieldTypeCode` resolve the variant field
     // type only while narrowing is active. Save/restore so the else-branch + nesting
     // are unaffected.
-    let savedName = narrowName
-    let savedVariant = narrowVariant
+    let savedTop = narrowTop
     let narrowed = setNarrowFromCond(s.ifCond, fnIx)
     let trc = collectLocals(s.ifThen, fnIx)
     if narrowed {
-      narrowName = savedName
-      narrowVariant = savedVariant
+      restoreNarrow(savedTop)
     }
     if trc < 0 { return 0 - 1 }
     if s.ifElse >= 0 {
@@ -1019,6 +1050,110 @@ function stmtIsPushKind(stmtIx: i32, fnIx: i32, kind: i32): boolean {
         if kind == 1 { return isRef }
         if kind == 2 { return isStr }
         return !isRef && !isStr
+      }
+    }
+  }
+  false
+}
+
+// True if `callIx` is a `recv.pop()` whose receiver is a struct-FIELD / global-field
+// array read (a `Member`, e.g. `T.scopes.pop()`) of list kind `kind` (`0` i32-list, `1`
+// ref-list, `2` string-list). A bare-LOCAL pop needs NO scratch (it references the local
+// in place), so it is NOT counted — only a Member receiver, which must be materialized
+// into the push frame's `recvRef` scratch slot. Lets a `.pop`-on-field function reserve
+// the same scratch frame a `.push`-on-field one does.
+function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: i32): boolean {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "pop" {
+        let recv = P.nodes[callee.memObj]
+        if recv is Member {
+          let isRef = exprRefArray(callee.memObj, fnIx)
+          let isStr = exprStringArray(callee.memObj, fnIx)
+          if kind == 1 { return isRef }
+          if kind == 2 { return isStr }
+          return !isRef && !isStr
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if any expression at `exprIx` (or a sub-expression) is a Member-receiver `.pop`
+// of `kind` — a `.pop` appears in VALUE position (`let x = T.scopes.pop()`), so the
+// reservation walk must descend expressions, not just statement receivers.
+function exprHasMemberPopKind(exprIx: i32, fnIx: i32, kind: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Call {
+    if callIsMemberPopKind(exprIx, fnIx, kind) { return true }
+    let args = e.callArgs
+    let i = 0
+    while i < args.length {
+      if exprHasMemberPopKind(args[i], fnIx, kind) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if e is BinExpr {
+    if exprHasMemberPopKind(e.binLeft, fnIx, kind) { return true }
+    return exprHasMemberPopKind(e.binRight, fnIx, kind)
+  }
+  if e is Member { return exprHasMemberPopKind(e.memObj, fnIx, kind) }
+  if e is Index {
+    if exprHasMemberPopKind(e.idxArr, fnIx, kind) { return true }
+    return exprHasMemberPopKind(e.idxIndex, fnIx, kind)
+  }
+  if e is Unary { return exprHasMemberPopKind(e.unArg, fnIx, kind) }
+  if e is Paren { return exprHasMemberPopKind(e.parInner, fnIx, kind) }
+  false
+}
+
+// True if the block at `blockIx` (descending into if/else + while, the scopes
+// `collectLocals` walks) contains a Member-receiver `.pop` of `kind` in any statement or
+// let-init / return / while-cond expression.
+function blockHasMemberPopKind(blockIx: i32, fnIx: i32, kind: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        if exprHasMemberPopKind(s.letInit, fnIx, kind) { return true }
+      } else if s is RetStmt {
+        if exprHasMemberPopKind(s.retArg, fnIx, kind) { return true }
+      } else if s is BinExpr {
+        if exprHasMemberPopKind(stmts[i], fnIx, kind) { return true }
+      } else if s is Call {
+        if exprHasMemberPopKind(stmts[i], fnIx, kind) { return true }
+      } else if s is IfStmt {
+        if ifChainHasMemberPopKind(stmts[i], fnIx, kind) { return true }
+      } else if s is WhileStmt {
+        if exprHasMemberPopKind(s.whileCond, fnIx, kind) { return true }
+        if blockHasMemberPopKind(s.whileBody, fnIx, kind) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if any arm of the `if` / `else if` chain at `ifIx` contains a Member-receiver
+// `.pop` of `kind` (then-branch, `else` block, or recursively a chained `else if`).
+function ifChainHasMemberPopKind(ifIx: i32, fnIx: i32, kind: i32): boolean {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if blockHasMemberPopKind(s.ifThen, fnIx, kind) { return true }
+    if s.ifElse >= 0 {
+      let els = P.nodes[s.ifElse]
+      if els is Block {
+        if blockHasMemberPopKind(s.ifElse, fnIx, kind) { return true }
+      } else if els is IfStmt {
+        if ifChainHasMemberPopKind(s.ifElse, fnIx, kind) { return true }
       }
     }
   }
@@ -1131,29 +1266,118 @@ function collectRefPushSlotsIf(ifIx: i32, fnIx: i32): i32 {
   0
 }
 
-// True if the FuncDecl at `fnIx` contains an i32-list `.push` anywhere in its body.
+// Record the ref-list table slot of every Member-receiver ref-list `.pop` in expression
+// `exprIx` into `fnRefPushSlots` (so its typed scratch frame is reserved) — the pop-side
+// analogue of `collectRefPushSlots`, descending VALUE positions (a `.pop` is a value).
+function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 }
+  let e = P.nodes[exprIx]
+  if e is Call {
+    if callIsMemberPopKind(exprIx, fnIx, 1) {
+      let callee = P.nodes[e.callFn]
+      if callee is Member {
+        recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
+      }
+    }
+    let args = e.callArgs
+    let i = 0
+    while i < args.length {
+      collectMemberPopRefSlotsExpr(args[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  if e is BinExpr {
+    collectMemberPopRefSlotsExpr(e.binLeft, fnIx)
+    collectMemberPopRefSlotsExpr(e.binRight, fnIx)
+    return 0
+  }
+  if e is Member { return collectMemberPopRefSlotsExpr(e.memObj, fnIx) }
+  if e is Index {
+    collectMemberPopRefSlotsExpr(e.idxArr, fnIx)
+    collectMemberPopRefSlotsExpr(e.idxIndex, fnIx)
+    return 0
+  }
+  if e is Unary { return collectMemberPopRefSlotsExpr(e.unArg, fnIx) }
+  if e is Paren { return collectMemberPopRefSlotsExpr(e.parInner, fnIx) }
+  0
+}
+
+// Walk the block at `blockIx` (if/else + while) collecting Member-receiver ref-list
+// `.pop` slots from statements + let-inits / returns / while-conds.
+function collectMemberPopRefSlots(blockIx: i32, fnIx: i32): i32 {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        collectMemberPopRefSlotsExpr(s.letInit, fnIx)
+      } else if s is RetStmt {
+        collectMemberPopRefSlotsExpr(s.retArg, fnIx)
+      } else if s is BinExpr {
+        collectMemberPopRefSlotsExpr(stmts[i], fnIx)
+      } else if s is Call {
+        collectMemberPopRefSlotsExpr(stmts[i], fnIx)
+      } else if s is IfStmt {
+        collectMemberPopRefSlotsIf(stmts[i], fnIx)
+      } else if s is WhileStmt {
+        collectMemberPopRefSlotsExpr(s.whileCond, fnIx)
+        collectMemberPopRefSlots(s.whileBody, fnIx)
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Collect Member-receiver ref-list `.pop` slots from every arm of the `if` chain.
+function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32): i32 {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    collectMemberPopRefSlots(s.ifThen, fnIx)
+    if s.ifElse >= 0 {
+      let els = P.nodes[s.ifElse]
+      if els is Block {
+        collectMemberPopRefSlots(s.ifElse, fnIx)
+      } else if els is IfStmt {
+        collectMemberPopRefSlotsIf(s.ifElse, fnIx)
+      }
+    }
+  }
+  0
+}
+
+// True if the FuncDecl at `fnIx` contains an i32-list `.push` anywhere in its body — OR
+// a Member-receiver i32-list `.pop` (which reuses the same scratch frame's `recvRef`).
 function fnHasPush(fnIx: i32): boolean {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    return blockHasPushKind(fn.fnBody, fnIx, 0)
+    if blockHasPushKind(fn.fnBody, fnIx, 0) { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, 0)
   }
   false
 }
 
-// True if the FuncDecl at `fnIx` contains a ref-list `.push` anywhere in its body.
+// True if the FuncDecl at `fnIx` contains a ref-list `.push` anywhere — OR a
+// Member-receiver ref-list `.pop` (which reuses the ref-push frame's `recvRef`).
 function fnHasRefPush(fnIx: i32): boolean {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    return blockHasPushKind(fn.fnBody, fnIx, 1)
+    if blockHasPushKind(fn.fnBody, fnIx, 1) { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, 1)
   }
   false
 }
 
-// True if the FuncDecl at `fnIx` contains a string-list (`string[]`) `.push` anywhere.
+// True if the FuncDecl at `fnIx` contains a string-list (`string[]`) `.push` — OR a
+// Member-receiver string-list `.pop`.
 function fnHasStrPush(fnIx: i32): boolean {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    return blockHasPushKind(fn.fnBody, fnIx, 2)
+    if blockHasPushKind(fn.fnBody, fnIx, 2) { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, 2)
   }
   false
 }
@@ -1294,7 +1518,15 @@ function ifChainHasStrOp(ifIx: i32, fnIx: i32): boolean {
   let s = P.nodes[ifIx]
   if s is IfStmt {
     if exprHasStrOp(s.ifCond, fnIx) { return true }
-    if blockHasStrOp(s.ifThen, fnIx) { return true }
+    // Narrow across the THEN-branch (mirroring `emitStmt`/`collectLocalsIf`) so a string
+    // op over a NARROWED variant field (`if n is A { … n.strField == x … }`, and nested
+    // guards over distinct locals) is detected — `exprString` resolves a variant field's
+    // string type only while the receiver's narrowing is active. Save/restore the depth.
+    let savedTop = narrowTop
+    let narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    let hit = blockHasStrOp(s.ifThen, fnIx)
+    if narrowed { restoreNarrow(savedTop) }
+    if hit { return true }
     if s.ifElse >= 0 {
       let els = P.nodes[s.ifElse]
       if els is Block {
@@ -1665,7 +1897,12 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
 function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   let m = P.nodes[memIx]
   if m is Member {
-    let vi = variantIndexOf(narrowVariant)
+    // Resolve the variant from the RECEIVER's own active narrowing (not a global slot) —
+    // so two simultaneously-narrowed locals each downcast to THEIR variant.
+    let recvVar = ""
+    let recvN = P.nodes[m.memObj]
+    if recvN is Ident { recvVar = narrowVariantFor(recvN.identName) }
+    let vi = variantIndexOf(recvVar)
     if vi < 0 {
       return emitFail("emitProgram: narrowed receiver names no union variant")
     }
@@ -1690,18 +1927,32 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected a field access")
 }
 
-// True if the member access at `memIx` reads a field of the currently-narrowed union
-// identifier (`recv` is the bare `Ident narrowName`, narrowed to `narrowVariant`).
+// True if the member access at `memIx` reads a field of a CURRENTLY-narrowed union
+// identifier (the receiver `Ident` has an active binding on the narrowing stack).
 function memIsNarrowed(memIx: i32): boolean {
-  if narrowName == "" { return false }
+  if narrowTop == 0 { return false }
   let m = P.nodes[memIx]
   if m is Member {
     let recv = P.nodes[m.memObj]
     if recv is Ident {
-      if recv.identName == narrowName { return true }
+      if narrowVariantFor(recv.identName) != "" { return true }
     }
   }
   false
+}
+
+// The variant table index the Member `memIx`'s receiver is currently narrowed to, or -1
+// if its receiver is not a narrowed union identifier. Resolves each receiver's OWN active
+// narrowing — so simultaneously-narrowed locals each map to their own variant.
+function memNarrowVariantIndex(memIx: i32): i32 {
+  let m = P.nodes[memIx]
+  if m is Member {
+    let recv = P.nodes[m.memObj]
+    if recv is Ident {
+      return variantIndexOf(narrowVariantFor(recv.identName))
+    }
+  }
+  0 - 1
 }
 
 // Lower a field read `recv.field` onto `body`: evaluate the receiver (must be a
@@ -1710,6 +1961,26 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   // A field read on a NARROWED union identifier downcasts through the box (G1).
   if memIsNarrowed(memIx) {
     return emitNarrowedMem(body, memIx, fnIx)
+  }
+  // A field read on a VARIANT-typed param `o.field` (`o: TyObj`) reads the variant
+  // struct directly — the param already IS the unboxed variant ref, so there is NO box
+  // unwrap / cast (gap #2). Evaluate the receiver (`local.get o`), then `struct.get
+  // $<uVarIdx + vi> <fieldIdx>`.
+  let m0 = P.nodes[memIx]
+  if m0 is Member {
+    let pvi = exprVariantIndex(m0.memObj, fnIx)
+    if pvi >= 0 {
+      let pvfi = variantFieldIndex(pvi, m0.memProp)
+      if pvfi < 0 {
+        return emitFail("emitProgram: unknown variant field in field access")
+      }
+      if emitExpr(body, m0.memObj, fnIx) < 0 { return 0 - 1 }
+      body.push(251)           // 0xfb GC prefix
+      body.push(2)             // struct.get
+      appendAll(body, ulebToArr(uVarIdx + pvi))  // concrete variant struct heap-type index
+      appendAll(body, ulebToArr(pvfi))           // field index
+      return 0
+    }
   }
   if !sDeclared {
     return emitFail("emitProgram: field access but no struct type declared")
@@ -3587,15 +3858,36 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         // callee's struct index (consumed by the immediately-following object-literal
         // lowering; a non-literal argument simply ignores it). Default -1 = infer.
         pendingStructIdx = 0 - 1
+        // A VARIANT-typed param position (kind 8): the callee wants the CONCRETE variant
+        // struct ref, but a union-valued argument (a narrowed local/param, a union-
+        // returning call) is the BOX `{tag, value}`. Bridge the boundary by unboxing the
+        // arg to the param's variant struct — `struct.get $box 1 ; ref.cast (ref $var)`
+        // (gap #2). The cast is statically safe: control reached this call only with the
+        // arg narrowed to this variant.
+        let cVi = 0 - 1
         if cFn is FuncDecl {
           let cParams = cFn.fnParams
           if i < cParams.length {
             if vtKindOfParam(cParams[i]) == 1 {
               pendingStructIdx = paramStructIdxOf(cParams[i])
             }
+            if vtKindOfParam(cParams[i]) == 8 {
+              cVi = paramStructIdxOf(cParams[i])
+            }
           }
         }
         if emitExpr(body, args[i], fnIx) < 0 { return 0 - 1 }
+        if cVi >= 0 {
+          if exprUnion(args[i], fnIx) {
+            body.push(251)       // 0xfb GC prefix
+            body.push(2)         // struct.get
+            appendAll(body, ulebToArr(uBoxIdx))  // union box heap-type index
+            body.push(1)         // field 1: value (anyref)
+            body.push(251)       // 0xfb GC prefix
+            body.push(22)        // 0x16 ref.cast (non-null)
+            appendAll(body, ulebToArr(uVarIdx + cVi))  // target: the variant struct
+          }
+        }
         pendingStructIdx = 0 - 1
         i = i + 1
       }
@@ -3941,9 +4233,12 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
         return emitFail("emitProgram: .pop receiver is not a list")
       }
       // The popped element is a REF (struct / union box / map struct / string) for a
-      // ref or string list — surface it non-null; an i32 list yields a raw i32.
+      // ref or string list — surface it non-null; an i32 list yields a raw i32. `base` is
+      // the scratch frame whose `+3` `recvRef` slot holds a struct-FIELD receiver's wrapper
+      // ref (same frame `.push` uses) — used only for a Member receiver.
       let lTy = lTypeIdx
       let aTy = aTypeIdx
+      let base = pushScratchBase
       let elemIsRef = false
       if isRef {
         if !rlUsed {
@@ -3952,6 +4247,7 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
         let rslot = refListSlotOfExpr(callee.memObj, fnIx)
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
+        base = refPushScratchBaseFor(rslot)
         elemIsRef = true
       } else if isStr {
         if !slUsed {
@@ -3959,15 +4255,30 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
         }
         lTy = mkListIdx
         aTy = mkArrIdx
+        base = strPushScratchBase
         elemIsRef = true
       } else if !lUsed {
         return emitFail("emitProgram: .pop but list type not collected")
       }
+      // Resolve the receiver to a wasm local holding the list-wrapper ref. A bare local IS
+      // that local; a struct-FIELD receiver (`T.scopes`) is evaluated ONCE into the frame's
+      // `recvRef` scratch (`base + 3`) — the wrapper is mutated in place by reference, so no
+      // write-back is needed (mirrors `emitPush`).
+      let lIdx = 0 - 1
       if recv is Ident {
-        let lIdx = localIndexOf(fnIx, recv.identName)
+        lIdx = localIndexOf(fnIx, recv.identName)
         if lIdx < 0 {
           return emitFail("emitProgram: .pop receiver is not a list local")
         }
+      } else if recv is Member {
+        if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+        body.push(33)            // local.set recvRef
+        appendAll(body, ulebToArr(base + 3))
+        lIdx = base + 3
+      } else {
+        return emitFail("emitProgram: .pop receiver must be a local or struct field")
+      }
+      if true {
         // L.len = len - 1
         body.push(32)          // local.get L
         appendAll(body, ulebToArr(lIdx))
@@ -3990,7 +4301,6 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
         }
         return 0
       }
-      return emitFail("emitProgram: .pop receiver must be a list local")
     }
   }
   emitFail("emitProgram: expected a .pop call")
@@ -4030,23 +4340,30 @@ function pushListBacking(body: i32[], lIdx: i32, lTy: i32): i32 {
 }
 
 // If the `if` condition at `condIx` is `n is Variant` over a bare union identifier
-// `n`, set the active narrowing (`narrowName`/`narrowVariant`) so the then-branch's
+// `n`, PUSH the narrowing (`narrowNames`/`narrowVariants`) so the then-branch's
 // `n.field` reads downcast through the box, and return true. Otherwise leave the
-// narrowing untouched and return false. A non-identifier receiver (e.g. `f(x) is A`)
-// is not narrowable (no stable name to re-read) and is left un-narrowed.
+// narrowing stack untouched and return false. A non-identifier receiver (e.g. `f(x) is
+// A`) is not narrowable (no stable name to re-read) and is left un-narrowed. The caller
+// saves the stack length and truncates back on branch exit (`restoreNarrow`).
 function setNarrowFromCond(condIx: i32, fnIx: i32): boolean {
   let c = P.nodes[condIx]
   if c is IsExpr {
     let recv = P.nodes[c.isObj]
     if recv is Ident {
       if exprUnion(c.isObj, fnIx) {
-        narrowName = recv.identName
-        narrowVariant = c.isVariant
+        pushNarrow(recv.identName, c.isVariant)
         return true
       }
     }
   }
   false
+}
+
+// Rewind the narrowing stack depth back to `n` (drop bindings a branch pushed). The
+// arrays keep their backing slots — only the logical depth changes, so no `.pop()`.
+function restoreNarrow(n: i32): i32 {
+  narrowTop = n
+  0
 }
 
 // Lower a single statement at `stmtIx` onto `body`, resolving identifiers/params
@@ -4141,13 +4458,11 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
     // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
     // outer narrowing around the branch so nesting and the else-branch are unaffected.
-    let savedName = narrowName
-    let savedVariant = narrowVariant
+    let savedTop = narrowTop
     let narrowed = setNarrowFromCond(s.ifCond, fnIx)
     if emitStmts(body, s.ifThen, fnIx) < 0 { return 0 - 1 }
     if narrowed {
-      narrowName = savedName
-      narrowVariant = savedVariant
+      restoreNarrow(savedTop)
     }
     if s.ifElse >= 0 {
       body.push(5)           // 0x05 else
@@ -4317,9 +4632,11 @@ function checkParams(fnIx: i32): i32 {
             if ty.tyName != "boolean" {
               if !isSName(ty.tyName) {
                 if !isUName(ty.tyName) {
-                  if !nameIsArray(ty.tyName) {
-                    if !nameIsString(ty.tyName) {
-                      return emitFail("emitProgram: only i32, boolean, struct, union, array, or string parameters are supported")
+                  if variantIndexOf(ty.tyName) < 0 {
+                    if !nameIsArray(ty.tyName) {
+                      if !nameIsString(ty.tyName) {
+                        return emitFail("emitProgram: only i32, boolean, struct, union, array, or string parameters are supported")
+                      }
                     }
                   }
                 }
@@ -4370,6 +4687,10 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     fnRefPushSlots = []
     refPushBaseBySlot = []
     collectRefPushSlots(fn.fnBody, fnIx)
+    // A Member-receiver ref-list `.pop` (`T.scopes.pop()`) needs the SAME typed scratch
+    // frame as a ref `.push` onto that slot — record its slot too, so a pop-only function
+    // reserves the frame whose `recvRef` holds the field's wrapper ref.
+    collectMemberPopRefSlots(fn.fnBody, fnIx)
     let nLocals = localNames.length
     pushScratchBase = fn.fnParams.length + nLocals
     // The ref-push scratch frame (if any) follows the i32 frame. Each push frame is FOUR
@@ -4580,7 +4901,11 @@ function retStructIndex(tyIx: i32): i32 {
   if tyIx >= 0 {
     let ty = P.nodes[tyIx]
     if ty is TypeRef {
-      return structIndexByName(ty.tyName)
+      let si = structIndexByName(ty.tyName)
+      if si >= 0 { return si }
+      // A union-variant name carries its VARIANT index here (consumed by `pushVT`'s
+      // `kind == 8` variant-struct case); not a standalone struct, so it is -1 above.
+      return variantIndexOf(ty.tyName)
     }
   }
   0 - 1
@@ -4664,10 +4989,37 @@ function vtKindOfType(tyIx: i32): i32 {
   if retStrArrFlag(tyIx) == 1 { return 7 }
   if retRefArrFlag(tyIx) == 1 { return 5 }
   if retUnionFlag(tyIx) == 1 { return 4 }
+  if retVariantFlag(tyIx) == 1 { return 8 }
   if retTRFlag(tyIx) == 1 { return 1 }
   if retArrFlag(tyIx) == 1 { return 2 }
   if retStrFlag(tyIx) == 1 { return 3 }
   0
+}
+
+// `1` if the type-annotation node at `tyIx` names a union VARIANT struct (e.g. `TyObj`
+// of `Ty`), else `0`. Feeds the `kind == 8` (concrete variant struct ref) branch of
+// `pushVT`. A variant-struct param/result is the unboxed variant ref directly — gap #2.
+function retVariantFlag(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if variantIndexOf(ty.tyName) >= 0 { return 1 }
+    }
+  }
+  0
+}
+
+// The union-variant table index named by the type-annotation node at `tyIx`, or -1.
+// Supplies the `structIdx` argument to `pushVT`'s `kind == 8` (variant struct ref) case
+// (its heap type is `uVarIdx + vi`).
+function retVariantIndex(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      return variantIndexOf(ty.tyName)
+    }
+  }
+  0 - 1
 }
 
 // `1` if the type-annotation node at `tyIx` is a `string[]` (string-ref list), else `0`.
@@ -4783,6 +5135,9 @@ function pushVT(payload: i32[], kind: i32, structIdx: i32): i32 {
   } else if kind == 7 {
     payload.push(100)          // 0x64 (ref ht) — non-null ref
     appendAll(payload, ulebToArr(mkListIdx))  // the STRING-LIST wrapper struct heap-type index
+  } else if kind == 8 {
+    payload.push(100)          // 0x64 (ref ht) — non-null ref
+    appendAll(payload, ulebToArr(uVarIdx + structIdx)) // the CONCRETE union-variant struct heap-type index (gap #2)
   } else {
     payload.push(127)          // 0x7f i32
   }
@@ -5902,6 +6257,44 @@ function paramStructIndex(fnIx: i32, name: string): i32 {
   0 - 1
 }
 
+// The union-variant table index of the param `name` of function `fnIx` (when its
+// annotation names a VARIANT struct of the declared union, e.g. `o: TyObj`), or -1.
+// A variant-struct param's value IS the concrete variant struct ref `(ref $(uVarIdx +
+// vi))` — already narrowed/unboxed by the caller — so a field read on it reads the
+// variant struct directly (no box unwrap), the gap-#2 boundary.
+function paramVariantIndex(fnIx: i32, name: string): i32 {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef { return variantIndexOf(ty.tyName) }
+          }
+          return 0 - 1
+        }
+      }
+      i = i + 1
+    }
+  }
+  0 - 1
+}
+
+// The union-variant table index an expression at `exprIx` yields a CONCRETE variant
+// struct ref for (a variant-typed param reference, or a parenthesized one), or -1. The
+// receiver shape for a gap-#2 field read `o.field` where `o: TyObj`.
+function exprVariantIndex(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 - 1 }
+  let e = P.nodes[exprIx]
+  if e is Paren { return exprVariantIndex(e.parInner, fnIx) }
+  if e is Ident { return paramVariantIndex(fnIx, e.identName) }
+  0 - 1
+}
+
 // The struct table index of the declared local `name` (recorded in `localStructIdx`),
 // or -1 if `name` is not a struct local.
 function declaredStructIndex(name: string): i32 {
@@ -6171,12 +6564,20 @@ function memFieldTypeCode(memIx: i32, fnIx: i32): i32 {
   let e = P.nodes[memIx]
   if e is Member {
     if memIsNarrowed(memIx) {
-      let vi = variantIndexOf(narrowVariant)
+      let vi = memNarrowVariantIndex(memIx)
       if vi >= 0 {
         let vfi = variantFieldIndex(vi, e.memProp)
         if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
       }
       return 0 - 1
+    }
+    // A field read on a VARIANT-typed param `o.field` (`o: TyObj`) reads the variant
+    // struct's field type directly (gap #2) — same table as a narrowed read, but the
+    // receiver is the unboxed param, not a `narrowName` ident.
+    let pvi = exprVariantIndex(e.memObj, fnIx)
+    if pvi >= 0 {
+      let pvfi = variantFieldIndex(pvi, e.memProp)
+      if pvfi >= 0 { return variantFieldTypeAt(pvi, pvfi) }
     }
     let si = structIndexOfExpr(e.memObj, fnIx)
     if si >= 0 {
@@ -6390,7 +6791,7 @@ function refListElemNameOfExpr(exprIx: i32, fnIx: i32): string {
     // A `recv.field` ref-list field read — the field's element name from the receiver's
     // struct / narrowed variant.
     if memIsNarrowed(exprIx) {
-      let vi = variantIndexOf(narrowVariant)
+      let vi = memNarrowVariantIndex(exprIx)
       if vi >= 0 {
         let vfi = variantFieldIndex(vi, e.memProp)
         if vfi >= 0 { return uFieldElemName[uFieldStart[vi] + vfi] }
@@ -6759,7 +7160,7 @@ function exprString(exprIx: i32, fnIx: i32): boolean {
     // A field read on a NARROWED union identifier (`if n is A { … n.f … }`) reads the
     // variant field; a string variant field yields a string ref.
     if memIsNarrowed(exprIx) {
-      let vi = variantIndexOf(narrowVariant)
+      let vi = memNarrowVariantIndex(exprIx)
       if vi >= 0 {
         let vfi = variantFieldIndex(vi, e.memProp)
         if vfi >= 0 {
@@ -6799,8 +7200,9 @@ function letIsString(letIx: i32, fnIx: i32): boolean {
 function emitProgram(rootIx: i32): i32 {
   emitFailed = false
   emitErr = ""
-  narrowName = ""
-  narrowVariant = ""
+  narrowNames = []
+  narrowVariants = []
+  narrowTop = 0
   if rootIx < 0 {
     return emitFail("emitProgram: empty arena (root index < 0)")
   }

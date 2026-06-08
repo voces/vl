@@ -1442,6 +1442,113 @@ const CASES: Case[] = [
     },
   },
   {
+    // Nested simultaneous narrowing of TWO distinct union locals (`if ta is A { if tb is
+    // A { ta.av + tb.av } }`) — `typecheck.vl`'s `sameNumeric` shape. The narrowing state
+    // is a STACK, so the inner guard does not clobber the outer: both `ta` and `tb` stay
+    // narrowed and each `.field` read downcasts to ITS variant.
+    name: "nested narrowing of two distinct union locals (ta.av + tb.av => 16)",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type U = A | B",
+      "function sumTwo(x: U, y: U): i32 {",
+      "  if x is A {",
+      "    if y is A {",
+      "      return x.av + y.av",
+      "    }",
+      "  }",
+      "  return 0",
+      "}",
+      "function mkA(n: i32): U {",
+      "  return { av: n }",
+      "}",
+      "function main(): i32 {",
+      "  return sumTwo(mkA(7), mkA(9))",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 16) throw new Error(`main() returned ${got}, expected 16`);
+    },
+  },
+  {
+    // Nested narrowing where the inner branch compares two narrowed STRING fields
+    // (`ta.primName == tb.primName`) — exactly `typecheck.vl`'s `sameNumeric`. The string
+    // `==` scratch frame must be reserved even though both operands are narrowed-variant
+    // string-field reads (the detection pass narrows as it descends).
+    name: "nested narrowing comparing two narrowed string fields (sameNumeric => 1)",
+    src: [
+      "type P = { pn: string }",
+      "type E = { ed: i32 }",
+      "type Ty = P | E",
+      "function sameP(x: Ty, y: Ty): boolean {",
+      "  if x is P {",
+      "    if y is P {",
+      "      return x.pn == y.pn",
+      "    }",
+      "  }",
+      "  return false",
+      "}",
+      "function mkP(): Ty {",
+      '  return { pn: "i32" }',
+      "}",
+      "function main(): i32 {",
+      "  if sameP(mkP(), mkP()) { return 1 }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    // gap #2: a function takes a union-VARIANT struct as a param (`o: TyObj`), reads its
+    // ARRAY fields (`o.names` a `string[]`, `o.tys` an `i32[]`) directly off the unboxed
+    // variant struct — the shape of `typecheck.vl`'s `objFieldType(o: TyObj, …)`. The
+    // caller narrows a union value to the variant and passes it; the call boundary
+    // unboxes the box to the concrete variant struct ref (no narrowing inside the callee).
+    name: "a union-variant struct param reads its array fields (objFieldType shape) => 2",
+    src: [
+      "type TyObj = { names: string[], tys: i32[] }",
+      "type TyNum = { nv: i32 }",
+      "type Ty = TyObj | TyNum",
+      "function objFieldType(o: TyObj, name: string): i32 {",
+      "  let names = o.names",
+      "  let ftys = o.tys",
+      "  let i = 0",
+      "  while i < names.length {",
+      "    if names[i] == name {",
+      "      return ftys[i]",
+      "    }",
+      "    i = i + 1",
+      "  }",
+      "  return 0 - 1",
+      "}",
+      "function lookup(t: Ty, name: string): i32 {",
+      "  if t is TyObj {",
+      "    return objFieldType(t, name)",
+      "  }",
+      "  return 0 - 99",
+      "}",
+      "function mkObj(): Ty {",
+      "  return { names: [\"a\", \"bb\"], tys: [7, 2] }",
+      "}",
+      "function main(): i32 {",
+      "  return lookup(mkObj(), \"bb\")",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `mkObj()` builds a `TyObj` boxed in `Ty`; `lookup` narrows to `TyObj` and passes
+      // it to `objFieldType`, which finds `"bb"` at index 1 and returns `tys[1] === 2`.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 2) throw new Error(`main() returned ${got}, expected 2`);
+    },
+  },
+  {
     name: "a false `is` takes the other branch (B value through `is A` => 0)",
     src: [
       "type A = { av: i32 }",
@@ -3653,6 +3760,37 @@ const CASES: Case[] = [
       // x=2, g=1, missing default=100, after pop length=1 → 2+1+100+1 = 104.
       const got = await runExport(bytesFromLog(logs), "main");
       if (got !== 104) throw new Error(`main() returned ${got}, expected 104`);
+    },
+  },
+  {
+    // `.pop()` on a STRUCT-FIELD ref-list receiver (`T.scopes.pop()`) — typecheck.vl's
+    // `popScope` shape. The field's wrapper ref is evaluated once into the push frame's
+    // `recvRef` scratch (reserved for a pop-only function), then the in-place len-decrement
+    // + element-read run against it. Mirrors a map ref-list field (`{[string]:i32}[]`).
+    name: "scope-chain: `.pop()` on a STRUCT-FIELD ref-list (popScope shape) => 1",
+    src: [
+      "type Checker = { scopes: {[string]: i32}[] }",
+      "let C: Checker = { scopes: [] }",
+      "function pushScope(): i32 {",
+      "  C.scopes.push(Map())",
+      "  0",
+      "}",
+      "function popScope(): i32 {",
+      "  let dropped = C.scopes.pop()",
+      "  0",
+      "}",
+      "function main(): i32 {",
+      "  pushScope()",
+      "  pushScope()",
+      "  popScope()",
+      "  return C.scopes.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // Two pushes then one pop leaves one scope on the chain.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
     },
   },
 ];
