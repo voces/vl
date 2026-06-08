@@ -2918,6 +2918,43 @@ const CASES: Case[] = [
     },
   },
   {
+    // `typecheck.vl`'s `tyToStr`/`assignable` shape: BIND a narrowed union-variant's
+    // ARRAY field to a LOCAL first (`let ftys = t.objFieldTypes`), THEN read
+    // `.length`/index off that local. `collectLocals` runs as a pre-pass OUTSIDE the
+    // narrowing context, so it could not see the variant field's array type and
+    // mis-classified the local as a scalar i32 — `ftys.length` then fell through to
+    // the struct-field path and failed ("field access but no struct type declared").
+    // `collectLocalsIf` now narrows across the then-branch (mirroring `emitStmt`), so
+    // both the `i32[]` and `string[]` variant-field binds type as array locals.
+    name:
+      "G5: bind a narrowed union-variant's `i32[]`/`string[]` field to a local, read it => 12",
+    src: [
+      "type TyObj = { objFieldNames: string[], objFieldTypes: i32[] }",
+      "type TyPrim = { primName: string }",
+      "type Ty = TyObj | TyPrim",
+      "function f(t: Ty): i32 {",
+      "  if t is TyObj {",
+      "    let names = t.objFieldNames",
+      "    let ftys = t.objFieldTypes",
+      "    return names.length + ftys.length + ftys[0]",
+      "  }",
+      "  return 0",
+      "}",
+      "function mk(): Ty {",
+      '  return { objFieldNames: ["a"], objFieldTypes: [9, 2] }',
+      "}",
+      "function main(): i32 {",
+      "  return f(mk())",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // names.length 1 + ftys.length 2 + ftys[0] 9 = 12.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
+    },
+  },
+  {
     // A `string[]` field ALONGSIDE a map in the same program: both want the string-ref
     // list types (keys backing + wrapper) — they SHARE `mkArrIdx`/`mkListIdx` (the map
     // struct adds one more type), so the type-section offsets must stay consistent.
