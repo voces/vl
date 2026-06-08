@@ -633,6 +633,134 @@ const CASES: Case[] = [
       }
     },
   },
+  // ── growable arrays + `.push` ──────────────────────────────────────────────
+  // An `i32[]` is now the growable `{ backing, len, cap }` wrapper struct (mirroring
+  // `toWasm.ts`'s list rep). `[…]` literals build it (len=cap=N); `.push(x)` grows the
+  // backing (2× / floor 4) when full, then writes + bumps `len`; `.length` reads the
+  // `len` field; `a[i]`/`a[i]=v` go through the backing. These force a real grow (past
+  // the initial capacity), a `while`-loop build, an empty-`[]` start, and push→set→read.
+  {
+    name: "push past initial capacity forces a grow (`[]` then 5 pushes => 50)",
+    src: [
+      "function main(): i32 {",
+      "  let a: i32[] = []",
+      "  a.push(10)",
+      "  a.push(20)",
+      "  a.push(30)",
+      "  a.push(40)",
+      "  a.push(50)",
+      "  return a[4]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 50) throw new Error(`main() returned ${got}, expected 50`);
+    },
+  },
+  {
+    name: "push past a non-empty literal's capacity (`[1,2]` + 2 pushes, len => 4)",
+    src: [
+      "function main(): i32 {",
+      "  let a: i32[] = [1, 2]",
+      "  a.push(3)",
+      "  a.push(4)",
+      "  return a.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 4) throw new Error(`main() returned ${got}, expected 4`);
+    },
+  },
+  {
+    name: "build an array in a `while` loop then sum it (0+1+...+9 = 45)",
+    src: [
+      "function main(): i32 {",
+      "  let a: i32[] = []",
+      "  let i = 0",
+      "  while i < 10 {",
+      "    a.push(i)",
+      "    i = i + 1",
+      "  }",
+      "  let sum = 0",
+      "  let j = 0",
+      "  while j < a.length {",
+      "    sum = sum + a[j]",
+      "    j = j + 1",
+      "  }",
+      "  return sum",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 45) throw new Error(`main() returned ${got}, expected 45`);
+    },
+  },
+  {
+    name: "`[]` + push + `.length` (empty literal grows to len 3)",
+    src: [
+      "function main(): i32 {",
+      "  let a: i32[] = []",
+      "  a.push(7)",
+      "  a.push(8)",
+      "  a.push(9)",
+      "  return a.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
+  {
+    name: "push then index-set then read (`push 5; a[0] = 99; a[0]` => 99)",
+    src: [
+      "function main(): i32 {",
+      "  let a: i32[] = []",
+      "  a.push(5)",
+      "  a[0] = 99",
+      "  return a[0]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 99) throw new Error(`main() returned ${got}, expected 99`);
+    },
+  },
+  {
+    name: "push in a helper, summed by the caller (build 1..4, sum => 10)",
+    src: [
+      "function build(n: i32): i32[] {",
+      "  let a: i32[] = []",
+      "  let i = 1",
+      "  while i <= n {",
+      "    a.push(i)",
+      "    i = i + 1",
+      "  }",
+      "  return a",
+      "}",
+      "function main(): i32 {",
+      "  let a: i32[] = build(4)",
+      "  let sum = 0",
+      "  let i = 0",
+      "  while i < a.length {",
+      "    sum = sum + a[i]",
+      "    i = i + 1",
+      "  }",
+      "  return sum",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 10) throw new Error(`main() returned ${got}, expected 10`);
+    },
+  },
   // ── strings ────────────────────────────────────────────────────────────────
   // A VL string is CURRENTLY a WasmGC `array i32` of Unicode CODE POINTS (per
   // `docs/strings-design.md`), so it REUSES the array slice's machinery: a string
