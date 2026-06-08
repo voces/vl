@@ -230,3 +230,232 @@ updated to use the real operators throughout — `& 0x7f` / `| 0x80` / `>>> 7` /
 `>> 7` / `& 0xff` — replacing all arithmetic emulation. The byte stream is
 unchanged (verified by the exact-pin test). The remaining gaps for a *full* codegen
 port (beyond fixed modules) are H4.1/H4.5 (a real byte buffer + host handoff).
+
+---
+
+# emitProgram bootstrap gaps (prioritized path to self-hosting)
+
+The end goal of the codegen self-host is **bootstrapping**: having the VL-in-VL
+emitter (`compiler/wasmEmit.vl`'s `emitProgram`) compile the self-host compiler
+SOURCES themselves — `compiler/lexer.vl`, `compiler/ast.vl`, `compiler/parser.vl`,
+`compiler/typecheck.vl`, and `wasmEmit.vl` — so the TS host (`toWasm.ts` et al.)
+can be retired.
+
+`emitProgram` today is an i32-centric slice (frontier: params · arithmetic · the
+six signed comparisons · calls/recursion · `if`/`return` · `let`/`const`/assign
+locals · `while` · ONE struct type (construct + field READ) · fixed i32 arrays
+(literal/index/`.length`/index-set) · string literals + `.length` + index read as
+code-point `array i32`). A growable `.push` slice is in flight separately. Note
+`emitProgram` is **parser-gated**: it only sees what the self-hosted
+`parser.vl`/`ast.vl` can parse, so any gap below is also a parser/AST gap where
+marked.
+
+This section inventories what the real sources USE that `emitProgram` does **not**
+yet emit, ranked by how blocking each is. Every "missing"/"supported" claim was
+checked against the current `wasmEmit.vl` (the line refs are to that file). The
+gaps are ordered so that resolving them top-to-bottom unblocks the most downstream
+code first.
+
+### G1. Discriminated UNIONS + `is`-narrowing — the keystone (LARGE / HIGH risk)
+
+**What's missing.** `emitProgram` has NO notion of a union value. It supports
+**exactly one struct `type` per module** (`sDeclared`/`sName`/`sFields`, `collectS`
+fails loudly on a second `TypeDecl`, line ~1686) at WasmGC type index 0, all-i32
+fields, and it never emits an `is` test, a union valtype, or a downcast. It reads
+unions in its OWN source via `is FuncDecl` / `is Block` / … but cannot *emit* code
+that does so.
+
+**Who needs it + example.** This is the spine of the AST/typechecker:
+- `compiler/ast.vl`: `type Node = NumLit | StrLit | … | Index` (26 variants,
+  ast.vl:112), the `Node[]` arena, and every `mk*` constructor builds a variant
+  via an untyped object literal widened to `Node` (e.g. `let n: Node = { numText: text }`).
+- `compiler/parser.vl` + `compiler/typecheck.vl`: discriminate constantly —
+  `typecheck.vl` alone has **61** `is`-narrowing sites (`if t is TyPrim`, `if n is
+  FuncDecl`, …), plus its own `type Ty = TyPrim | TyErr | … | TyNullable` union.
+
+**Size/risk.** The single largest item by far. Requires: multiple struct types in
+the type section (today hard-capped at one); a union-value representation +
+valtype (WasmGC `(ref $common)` / `anyref` + per-variant downcast); lowering `x is
+T` to a runtime type test (`ref.test`/`ref.cast` over the variant heap type, the
+mechanism the TS `toWasm.ts` already uses); and widening an object literal to a
+union member. HIGH risk because the **rest of the back end cannot be exercised on
+the real sources until this exists** — almost every function takes/returns a
+`Node`-arena index and immediately `is`-narrows.
+
+**Dependency ordering.** Strict prerequisite for G2–G4 to matter at module scale.
+The TS compiler already supports user unions + `is` (gap #69 fixed), so the parser
+*parses* these sources — the gap is purely in `emitProgram`'s codegen.
+
+### G2. Multiple struct types + struct field WRITE / mutation (MEDIUM)
+
+**What's missing.** Two sub-gaps:
+(a) **More than one struct type.** Hard-capped at one (`collectS`). The sources
+declare many: `Tok`, `LexResult`, `Diag` (lexer); `Tok`, `Parser`, and 26 node
+variants (ast); `Checker`, `TDiag`, and 6 `Ty` variants (typecheck).
+(b) **Struct field assignment.** `emitAssign` (line ~1135) lowers a target that is
+a bare `Ident` (`local.set`) or an `Index` (`array.set`) ONLY — a `Member` target
+(`recv.field = v`, i.e. `struct.set`) is NOT handled and falls into "assignment
+target is not a simple name". Field READ (`struct.get`) IS supported (`emitMem`).
+
+**Who needs it + example.** Mutation through the module-global state structs is
+pervasive: `P.pos = P.pos + 1` (parser.vl:96, the token cursor), `T.curRet = ret`
+(typecheck.vl:727), `gPos = gPos + 1` is a global not a field but the `P.*`/`T.*`
+writes are struct-field stores. (Mostly via the module-global `P`/`T`/`gSrc`
+state — see G5.)
+
+**Size/risk.** MEDIUM. (a) is mechanical once G1 lifts the one-struct cap (it's the
+same cap). (b) is a focused addition to `emitAssign`: resolve the receiver struct
+type, find the field index (machinery already exists in `sFieldIndex`/`emitMem`),
+emit `struct.set` (`0xfb 0x05 <typeidx> <fieldidx>`). Fields must also become
+mutable (already emitted mutable, line ~1501).
+
+### G3. Non-i32 scalar valtypes: `boolean` (and `f64`) params/locals/returns (MEDIUM)
+
+**What's missing.** `emitProgram` is i32-only for scalars. A `boolean` param fails
+loudly in `checkParams` ("only i32, struct, array, or string parameters", line
+~1304); a `boolean`/`bool` local fails in `checkLocalI32` ("only i32 locals", line
+~542); `BoolLit`/`CharLit` initializers are rejected by `checkExprI32` (line ~565).
+A `boolean` RETURN type isn't rejected but silently lowers to i32 via `pushVT`'s
+`else` branch (wrong-but-not-failing). `f64` is entirely absent.
+
+**Who needs it + example.** `boolean` is everywhere: `function isDigit(c: i32):
+boolean { c >= '0' && c <= '9' }` (lexer.vl:84) and ~40 other predicates across all
+three sources return `boolean`; `let going = peekKind() == "LBRACK"` (parser.vl:164)
+is a `boolean` local. `f64` is only *named* by the typechecker's primitive table
+(`mkPrim("f64")`, typecheck.vl:186) — no source does float arithmetic — so f64
+codegen is **not** required for bootstrap, only `boolean` is.
+
+**Size/risk.** MEDIUM-LOW. `boolean` is already i32 0/1 at the wasm level, so this
+is mostly *bookkeeping*: accept `bool`/`boolean` annotations as an i32 valtype in
+`checkParams`/`checkLocalI32`/`vtKindOfType`, and let `BoolLit` lower to `i32.const
+0/1`. The comparison ops already yield i32 0/1. CharLit→i32 code-point is the same
+trivial lowering as in `decodeStr`. Low risk; no new valtype actually needed.
+
+### G4. Logical `&&` / `||` (short-circuit) and `!` (SMALL / MEDIUM risk)
+
+**What's missing.** `binOpcode` (line ~635) maps `+ - * == != < > <= >=` only and
+returns -1 for everything else, so `&&`/`||` hit "unsupported binary operator".
+Unary `emitExpr` (line ~1028) accepts only `-`; `!x` hits "unsupported unary
+operator".
+
+**Who needs it + example.** Heavily used in the lexer's char classes:
+`(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'` (lexer.vl:89);
+~32 `&&`/`||` sites in lexer, 13 in typecheck, 6 in parser. `!` appears in
+predicates and `if !emitFailed`-style guards.
+
+**Size/risk.** SMALL surface, MEDIUM risk because of **short-circuit semantics** —
+`&&`/`||` are not plain `i32.and`/`i32.or`; they must lower to an `if`/`else`
+producing an i32 result (the RHS only evaluates when needed), i.e. a value-typed
+`if` (blocktype `i32`, `0x7f`). The current `if` lowering is VOID-only (`0x40`,
+relies on inner `return`s, line ~1225), so this also needs the first **value-typed
+`if`** in the emitter. `!x` is `i32.eqz` (one opcode).
+
+### G5. Module-level mutable globals beyond the single emit-state pattern (MEDIUM)
+
+**What's missing.** `emitProgram` only emits the program's TOP-LEVEL statements
+that are `FuncDecl` or `TypeDecl`; `collectFns` (line ~324) fails loudly on ANY
+other top-level statement. So a top-level `let`/`const` (a module global, whether
+i32 or ref-typed) is unsupported — there is no global section emission at all.
+
+**Who needs it + example.** The sources lean on module globals for state:
+`let gSrc = ""`, `let gPos = 0`, `let gDiags: Diag[] = []` (lexer.vl:76–80);
+`export let P: Parser = { … }` (ast.vl:164); `export let T: Checker = { … }` and
+`export let TY_I32: i32 = -1` plus five more interned-primitive globals
+(typecheck.vl:128–137). The whole recursive-descent design deliberately holds state
+in globals (`P`/`T`) rather than threaded params (ast.vl:143–160).
+
+**Size/risk.** MEDIUM. Needs a wasm **global section** (id 6): emit each top-level
+`let` as a `(global (mut T) <init>)`, route bare-`Ident` reads/writes to
+`global.get`/`global.set` when the name resolves to a module global (not a local).
+Ref-typed global initializers (`[]`, `{ … }`) need a constant/`start`-function init
+path. Interacts with G1/G2 (the globals are union/struct/array-typed).
+
+### G6. String concatenation `+`, equality `==`, and `.slice` (MEDIUM-LARGE)
+
+**What's missing.** Strings are read-only in `emitProgram`: literal construction,
+`.length`, and index read (as code points), all over the `array i32` representation.
+There is NO string `+` (concat), NO string `==` (the `==` opcode is `i32.eq` over
+scalars — comparing two array refs would be reference identity, wrong), and NO
+`.slice`/`indexOf`/`substring`. `emitStr`'s own comment notes concat/eq/slice are
+DEFERRED (line ~1893).
+
+**Who needs it + example.** Diagnostics + token classification + mangling:
+- concat: `"expected " + kind + " but found " + peekKind()` (parser.vl:118),
+  `out = digitChar(m % 10) + out` (ast.vl:327, the i32→string the harness needs),
+  `name = name + "[]"` (parser.vl:168).
+- equality: `if text == "function"` (lexer.vl:154) and the entire keyword/operator
+  `==`-chain tables; `if kind == "LBRACK"` everywhere in the parser.
+- slice: `text: gSrc.slice(start, gPos)` (lexer.vl:249), `gSrc.slice(gPos, gPos+1)`
+  (lexer.vl:348) — the lexer cannot extract a lexeme without it.
+
+**Size/risk.** MEDIUM-LARGE. String `==` is a code-point loop (compare lengths, then
+element-by-element) — emittable today as a helper but `emitProgram` must recognize
+`==` over string operands and emit the loop instead of `i32.eq`. Concat (`+` over
+strings) needs allocation + copy into a fresh `array i32` (ties to the growable/B6
+work). `.slice` is a bounded copy. These are method/operator-overload-on-string
+lowerings the emitter has no framework for yet; the representation (`array i32`)
+already exists, so it's codegen, not a new type. Depends on G3-style operand
+type-classification to know `+`/`==` is over strings not i32.
+
+### G7. `.push` on arrays / struct-field arrays (MEDIUM — IN FLIGHT)
+
+**What's missing.** Growable `.push`. `emitProgram`'s arrays are FIXED-LENGTH
+WasmGC arrays (`array.new_fixed`); the type-section array is `(array (mut i32))` but
+there is no length+capacity wrapper and no `.push` lowering (the "coming" slice).
+
+**Who needs it + example.** Arena/diag building is all `.push`: `P.nodes.push(n)`
+(ast.vl:170), `gDiags.push({ … })` (lexer.vl:144), `out.push(byte)` (used in
+wasmEmit.vl itself, line ~62), `T.tys.push(t)` (typecheck.vl:144). ~27 `.push`
+sites across the sources. Many push onto **struct-field** arrays (`P.nodes`,
+`T.tys`) and arrays **of structs/unions** (`Node[]`, `Ty[]`).
+
+**Size/risk.** MEDIUM, already being addressed by the separate growable-`.push`
+lane. Once it lands for plain i32 arrays, it must extend to arrays of refs
+(`Node[]`/`Ty[]`) — which depends on G1 (a union element valtype).
+
+### G8. Maps (`{[string]: i32}`, `Map()`, `.pop`) (MEDIUM — typecheck-only)
+
+**What's missing.** No map type, no `Map()` constructor, no `.pop`. `emitProgram`
+knows only struct / fixed-array / string valtypes.
+
+**Who needs it + example.** ONLY the typechecker: `scopes: {[string]: i32}[]`
+(typecheck.vl:121, an array of maps for the scope chain), `T.scopes.push(Map())`
+(typecheck.vl:191), and scope-array `.pop()` (typecheck.vl:207, already a documented
+wasm-validation gap there). The lexer, ast, and parser do NOT use maps (they use
+linear `==`-chains, lexer.vl:149).
+
+**Size/risk.** MEDIUM, but **typecheck-only** — it does not block compiling
+lexer/ast/parser/wasmEmit. Can be deferred to the very end (or the checker can be
+refactored to parallel arrays, as its own comment hints). `.pop` already has a
+known statement-position drop gap noted in `popScope`.
+
+### G9. Function return-type INFERENCE coverage (SMALL — verify)
+
+**What's missing / state.** Nearly all source functions ARE annotated (every
+`function` in the three checked sources has an explicit `: T` return), so this is
+mostly a non-gap — but a few return-type *result valtypes* are non-i32 (`boolean`,
+`string`) and route through `pushVT`; once G3/G6 land this is covered. No separate
+inference engine is required for these sources. Listed only so a later lane does not
+re-discover it as a surprise.
+
+### Suggested slice order (to bootstrapping)
+
+1. **G1 — unions + `is`** (and the multi-struct cap it shares with G2a). Nothing
+   downstream runs on the real AST/checker sources without this; do it first and
+   biggest.
+2. **G2b — struct field WRITE** (`struct.set`) and **G5 — module globals**
+   (global section + `global.get/set`). Together these make the `P`/`T`/`g*` state
+   machine emittable — the substrate the lexer/parser/checker mutate.
+3. **G3 — `boolean` params/locals/returns** + **G4 — `&&`/`||`/`!`** (with the
+   value-typed `if` G4 forces). Cheap, and unblocks every predicate in the lexer.
+4. **G7 — growable `.push`** (already in flight) extended to ref-element arrays —
+   unblocks all arena/diag building.
+5. **G6 — string `==` then `+` then `.slice`** — unblocks the lexer's lexeme
+   extraction and all diagnostics/keyword tables.
+6. **G8 — maps** (or a parallel-array refactor of the checker) — LAST; isolated to
+   `typecheck.vl`.
+
+After 1–5 the lexer, ast, parser, and wasmEmit sources are within reach; 6 closes
+the typechecker. f64 is NOT on the path (no source needs float codegen). Each step
+should pin its new shape through a `tests/selfhost_emit_program_test.ts`-style
+SOURCE→arena→bytes→real-engine round-trip, the same harness this slice uses.
