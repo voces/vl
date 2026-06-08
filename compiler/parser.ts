@@ -17,6 +17,7 @@ import {
   arrayElementType,
   conditionNarrowing,
   conditionsExhaust,
+  constrainElementHole,
   defaultIntegerType,
   elseNarrowings,
   emptyIntersectionInfo,
@@ -224,6 +225,29 @@ export const parseProgram = (
     const map = scopeBindings.get(scope);
     if (!map) return;
     for (const binding of map.values()) binding.scope = span;
+  };
+
+  /**
+   * The FLOOR for usage-driven inference: once a binding-bearing scope has been
+   * fully parsed, any `variable` binding still carrying an unresolved inference
+   * hole — an un-annotated empty `[]` / `Map()` / `Set()` whose element/key/value
+   * type was never pinned by downstream usage (a `.push`/index-set, a `T[]` param,
+   * an annotated assignment, a `T[]`-returning tail) — is genuinely un-inferable.
+   * Report the clean, source-located "cannot infer … annotate" diagnostic now,
+   * keyed off the binding's own declaration span. Deferring it to scope-close (vs.
+   * the declaration) is what lets the *later* statements in the same scope resolve
+   * the hole first: in `const xs = []; xs.push(1)` the push pins `xs`'s element to
+   * `i32` before we ever look. `reportUninferredBinding` is idempotent (it keys a
+   * `WeakSet` off the type node), so a binding reached from both here and a tail
+   * `typeFromStatement` fires once.
+   */
+  const reportUnresolvedBindings = (scope: Scope): void => {
+    const map = scopeBindings.get(scope);
+    if (!map) return;
+    for (const binding of map.values()) {
+      if (binding.kind !== "variable" || !binding.type) continue;
+      reportUninferredBinding(binding.name, binding.type, binding.decl);
+    }
   };
 
   /** Implicit return types collected from the current function body. */
@@ -1223,6 +1247,22 @@ export const parseProgram = (
     // anonymous structural type, so these aren't scope/field methods — resolve
     // their type here (`listMemberType`) and emit a `Call` toWasm lowers by name.
     if (isListType(shape)) {
+      const element = arrayElementType(shape)!;
+      // USAGE-DRIVEN INFERENCE: a `push(v)` (or any element-typed setter) on a
+      // list whose element type is still an unresolved hole — an un-annotated
+      // empty `[]` — pins that shared element hole to the argument's type IN
+      // PLACE, so the binding infers `typeof v []`. Must run BEFORE
+      // `instantiateFunctionType`, which clones the signature (losing the shared
+      // cell) and would otherwise type-check `v` against an open hole. `get`/`pop`/
+      // `clear`/`map`/`filter` take no element-typed value argument, so only the
+      // appending methods carry a constraint here.
+      if (property === "push" && args.length > 0) {
+        constrainElementHole(
+          element,
+          typeFromExpression(args[0].value, args[0].context),
+          ctx,
+        );
+      }
       const member = listMemberType(arrayElementType(shape)!)[property];
       if (member?.type === "Function") {
         const node: VLCallNode = {
@@ -1970,6 +2010,11 @@ export const parseProgram = (
         valueType,
       };
       const span = between(spanOf(open), spanOf(close));
+      // All of this block's statements have now been parsed, so any downstream use
+      // that could pin an un-annotated empty `[]`/`Map()`/`Set()` has run. Report
+      // any binding whose hole is STILL open (the un-inferable floor) before the
+      // scope is popped.
+      reportUnresolvedBindings(blockScope);
       // Stamp the block's locals with the block's `{ … }` extent (D3 scope-aware
       // completion) before the scope is popped in `finally`.
       stampScope(blockScope, span);
@@ -2647,16 +2692,15 @@ export const parseProgram = (
       const valType = typeFromExpression(node.value, valueCtx ?? spanOf(id));
       if (!annotated) {
         node.variableType = widenBindingType(valType, mutable);
-        // No annotation AND no resolving context: a construct whose type is taken
-        // from context (an empty `[]`, a `Map()`/`Set()`) left an unresolved
-        // inference hole. Report it as a clean "cannot infer … annotate" error
-        // now, during the parse/type gate, instead of crashing or surfacing the
-        // opaque codegen `Unhandled AST -> WASM "Unknown" type` later.
-        reportUninferredBinding(
-          node.name,
-          node.variableType,
-          valueCtx ?? spanOf(id),
-        );
+        // No annotation: a construct whose type is taken from context (an empty
+        // `[]`, a `Map()`/`Set()`) leaves an unresolved inference hole HERE — but
+        // VL infers the element/key/value type from *downstream usage* (`xs.push(v)`,
+        // `xs[i] = v`, passing `xs` to a `T[]` param, etc.), which this single-pass
+        // parser hasn't seen yet. So we do NOT report "cannot infer" now; the hole
+        // is shared with the binding and gets pinned in place as later statements
+        // unify against it. Any binding still carrying an unresolved hole once its
+        // enclosing scope closes is genuinely un-inferable — that clean diagnostic
+        // is raised by `reportUnresolvedBindings` at block/program end (the floor).
       } else ensureType(node.variableType, valType, valueCtx ?? spanOf(id));
     }
     if (node.name in scopes[scopes.length - 1]) {
@@ -3531,6 +3575,9 @@ export const parseProgram = (
     start: { line: 1, column: 0 },
     stop: peek().stop, // the EOF token's position
   };
+  // The whole module has been parsed — report any top-level binding still holding
+  // an unresolved inference hole (the un-inferable floor), keyed off its decl span.
+  reportUnresolvedBindings(program.scope);
   stampScope(program.scope, programSpan);
   // Record the program node's own span too, so the root is queryable via the
   // public `NodeSpans` like every other node.
