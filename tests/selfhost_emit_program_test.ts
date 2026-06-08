@@ -298,6 +298,48 @@ const CASES: Case[] = [
     },
   },
   {
+    // VL functions IMPLICITLY return their last expression (no `return` keyword) — the
+    // idiom every `ast.vl` constructor uses (`addNode(n)` / `out` as the final line).
+    // emitProgram now lowers a trailing bare value-expression statement as the return.
+    name: "implicit return: a trailing bare expression is the return value (`n + 1`)",
+    src: "function f(n: i32): i32 {\n  n + 1\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f", 41);
+      if (got !== 42) throw new Error(`f(41) returned ${got}, expected 42`);
+    },
+  },
+  {
+    name: "implicit return: a trailing local reference (`let s = a+b; s`)",
+    src:
+      "function g(a: i32, b: i32): i32 {\n  let s = a + b\n  s\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "g", 20, 22);
+      if (got !== 42) throw new Error(`g(20, 22) returned ${got}, expected 42`);
+    },
+  },
+  {
+    name:
+      "implicit return: an explicit early `return` then a trailing implicit one => 84",
+    src:
+      "function h(n: i32): i32 {\n  if n < 0 { return 0 }\n  n * 2\n}\n",
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const pos = await runExport(bytes, "h", 42);
+      if (pos !== 84) throw new Error(`h(42) returned ${pos}, expected 84`);
+      const neg = await runExport(bytes, "h", -1);
+      if (neg !== 0) throw new Error(`h(-1) returned ${neg}, expected 0`);
+    },
+  },
+  {
+    name: "implicit return: a trailing value-returning CALL (`addOne(n)`)",
+    src:
+      "function addOne(x: i32): i32 {\n  x + 1\n}\nfunction f(n: i32): i32 {\n  addOne(n)\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f", 9);
+      if (got !== 10) throw new Error(`f(9) returned ${got}, expected 10`);
+    },
+  },
+  {
     name: "`/` lowers to i32.div_s (`a / b`): 17 / 5 => 3 (truncating)",
     src: "function divv(a: i32, b: i32): i32 {\n  return a / b\n}\n",
     check: async (logs) => {
