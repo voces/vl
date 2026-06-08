@@ -246,6 +246,26 @@ export const parseProgram = (
    * redeclaration, and avoids re-erroring on the hoisted entry.
    */
   const preregistered = new Set<string>();
+  /**
+   * Top-level `type` names whose entry was hoisted into the module scope by the
+   * forward-reference pre-pass (see `preRegisterTopLevelTypes`), so a `type` whose
+   * body references another `type` declared LATER in the file — including a mutual
+   * cycle (`type A = { b: B | null }` ↔ `type B = { a: A | null }`) — resolves to a
+   * lazy `Alias` leaf instead of an "undeclared" error (A11). Like `preregistered`
+   * for functions, this lets the real `parseTypeStatement` pass adopt its own
+   * hoisted entry rather than re-erroring as a B16 redeclaration.
+   */
+  const preregisteredTypes = new Set<string>();
+  /**
+   * Top-level `type` names that have been HOISTED but whose body has not yet been
+   * parsed (or is being parsed). A reference to one of these — from another type's
+   * body, the way `B` appears inside `type A`'s body — resolves to a lazy `Alias`
+   * leaf, exactly like a self-reference via `typeBuilding`, so a mutual cycle stays
+   * a finite structure carried by the name rather than expanding forever or
+   * tripping the `getConcreteType` cycle guard (A11). A name is removed once its
+   * body finishes parsing, after which references inline normally.
+   */
+  const pendingTypes = new Set<string>();
 
   // ---- demand-driven return-type inference (A17) ----------------------------
   // VL infers an un-annotated function's return type from its body, but the
@@ -504,8 +524,11 @@ export const parseProgram = (
       // A self-reference inside a recursive `type`'s own body resolves to a lazy
       // alias leaf — the recursion is carried by the name (see `typeBuilding`),
       // so the body is a finite structure resolved on demand instead of being
-      // expanded forever.
-      if (typeBuilding.has(name)) {
+      // expanded forever. `pendingTypes` extends this to a reference to ANOTHER
+      // top-level `type` whose body has not been parsed yet (forward / mutual
+      // recursion across separate decls, A11): keep it a lazy `Alias` leaf so the
+      // cycle stays finite and `getConcreteType`'s name cycle-guard never trips.
+      if (typeBuilding.has(name) || pendingTypes.has(name)) {
         recordUse(name, ctx);
         // A recursive reference inside a generic alias's own body still carries
         // its arguments (`Box<T>` referencing `Box`); consume them so parsing
@@ -2652,7 +2675,14 @@ export const parseProgram = (
       subType: { type: "Unknown" },
     }));
     const hasBody = at("EQUAL");
-    if (name in scopes[scopes.length - 1]) {
+    // A name already in the module scope because the forward-reference pre-pass
+    // hoisted THIS declaration's own entry (see `preRegisterTopLevelTypes`) is not
+    // a redeclaration — adopt the hoisted entry below. Consume the marker so a
+    // genuine duplicate `type` still trips the redeclaration check.
+    const hoisted = scopes[scopes.length - 1] === program.scope &&
+      preregisteredTypes.has(name);
+    if (hoisted) preregisteredTypes.delete(name);
+    if (name in scopes[scopes.length - 1] && !hoisted) {
       errors.push({ type: "Redeclaration", name, ctx: spanOf(id), code: 11 });
       // Still consume the body so parsing resumes cleanly after a redeclaration.
       if (hasBody) {
@@ -2690,16 +2720,34 @@ export const parseProgram = (
     // Register the alias *before* parsing its body so a recursive reference
     // inside it resolves (to a lazy `Alias` leaf, via `typeBuilding`). A bodyless
     // declaration (already reported above) binds to `Never` so its use sites
-    // resolve without crashing and without a duplicate diagnostic.
-    const entry: VLTypeType = {
-      type: "Type",
-      subType: hasBody ? { type: "Alias", name } : { type: "Never" },
-      // Carry the alias name on the `Type` node so display preserves it (D8).
-      name,
-    };
-    if (typeParams.length > 0) entry.params = paramHoles;
+    // resolve without crashing and without a duplicate diagnostic. When the
+    // pre-pass already hoisted this name, REUSE its entry (it is already in scope
+    // and may be referenced as an `Alias` leaf by an earlier type's body) and just
+    // fill in the body below, so the two passes share one object (A11).
     const typeScope = scopes[scopes.length - 1];
-    typeScope[name] = entry;
+    const entry: VLTypeType = hoisted
+      ? (typeScope[name] as VLTypeType)
+      : {
+        type: "Type",
+        subType: hasBody ? { type: "Alias", name } : { type: "Never" },
+        // Carry the alias name on the `Type` node so display preserves it (D8).
+        name,
+      };
+    // Whether the entry is freshly made or adopted from the hoist, the params
+    // used while parsing the body (`paramHoles`) must be the SAME holes the entry
+    // carries, so a generic forward reference (`Box<T>`) stays consistent. The
+    // scout seeded placeholder holes; overwrite them with the real ones here.
+    if (typeParams.length > 0) entry.params = paramHoles;
+    else if (hoisted) delete entry.params;
+    // A bodyless `type Foo` binds `Never` (the error is reported above). The scout
+    // hoisted it with a self-`Alias` body, so reset an adopted entry to `Never`
+    // here — otherwise a later use would chase the self-alias and mis-report
+    // "refers to itself" instead of resolving quietly (A14 / bodyless-alias).
+    if (hoisted && !hasBody) entry.subType = { type: "Never" };
+    if (!hoisted) typeScope[name] = entry;
+    // Register the symbol binding (decl span + doc comment) in the real pass even
+    // when the entry was hoisted — the scout reverts its symbol-table writes, so
+    // this is the single source of go-to-definition / hover for the alias.
     declareBinding(
       typeScope,
       name,
@@ -2708,6 +2756,12 @@ export const parseProgram = (
       entry,
       typeTok.docComment,
     );
+    // This declaration is now being processed, so it is no longer "pending": a
+    // self-reference within its body is handled by `typeBuilding`, while a forward
+    // reference to a LATER type stays pending until that type is reached. Cleared
+    // unconditionally (incl. the bodyless `Never` case) so a later use resolves to
+    // the real entry, not a stale lazy `Alias` leaf.
+    pendingTypes.delete(name);
     if (hasBody) {
       next();
       skipNewlines();
@@ -3118,6 +3172,108 @@ export const parseProgram = (
   }
 
   /**
+   * Hoist every top-level `type NAME` into the module scope BEFORE any type body
+   * is parsed, so a `type` whose body references another top-level `type` —
+   * including a mutual cycle (`type A = { b: B | null }` ↔
+   * `type B = { a: A | null }`) — resolves the forward reference to a lazy `Alias`
+   * leaf instead of an "undeclared" error (A11). VL's parser resolves type names
+   * eagerly in a single top-to-bottom pass, so without this a forward/mutual type
+   * reference hit `parseTypePrimary` while the referent was not yet in scope.
+   *
+   * This is a NAME-only scout pass: it registers, for each `type NAME`, a lazy
+   * `Type` entry whose body is a self-`Alias` leaf (the real pass overwrites it
+   * with the parsed body), and records the name in `preregisteredTypes` (so the
+   * real `parseTypeStatement` adopts its own hoisted entry instead of re-erroring
+   * as a redeclaration) and `pendingTypes` (so a cross-reference stays a lazy
+   * leaf until that type's own body is parsed). Generic type params are scouted
+   * into `entry.params` so a forward `Box<T>` application arity-checks. Side
+   * effects are reverted; the real pass is the single source of truth for
+   * diagnostics, symbols, and the final bodies.
+   */
+  function preRegisterTopLevelTypes(): void {
+    const savedPos = pos;
+    const savedErrors = errors.length;
+    const savedSymbolsLen = symbols.occurrences.length;
+    let depth = 0; // paren + brace + bracket nesting
+    let prevReal: TokenKind | undefined; // last non-newline token kind at depth 0
+    while (!atEnd()) {
+      const k = peek().kind;
+      if (k === "NEWLINE") {
+        next();
+        continue;
+      }
+      // `export type …` still hoists: `export` is a transparent modifier.
+      if (depth === 0 && k === "EXPORT") {
+        next();
+        continue;
+      }
+      if (depth === 0 && k === "IMPORT") {
+        next();
+        while (!atEnd() && !atSoft("from")) next();
+        if (atSoft("from")) next();
+        if (at("STRING")) next();
+        prevReal = "RBRACE";
+        continue;
+      }
+      if (
+        depth === 0 && k === "TYPE" && peek(1).kind === "ID" &&
+        (prevReal === undefined || prevReal === "RBRACE")
+      ) {
+        scoutTypeName();
+        prevReal = "RBRACE"; // a declaration ends like a block: next is stmt-pos
+        continue;
+      }
+      if (k === "LPAREN" || k === "LBRACE" || k === "LBRACK") depth++;
+      else if (k === "RPAREN" || k === "RBRACE" || k === "RBRACK") {
+        if (depth > 0) depth--;
+      }
+      if (depth === 0) prevReal = k;
+      next();
+    }
+    // Revert every side effect of the scout pass; the real pass owns diagnostics,
+    // symbols, and the final bodies. The hoisted entries stay in `program.scope`.
+    symbols.occurrences.length = savedSymbolsLen;
+    errors.length = savedErrors;
+    pos = savedPos;
+  }
+
+  /**
+   * Scout a single top-level `type NAME <T>?` and register a lazy `Type` entry
+   * (self-`Alias` body) into the module scope, tracked in `preregisteredTypes` and
+   * `pendingTypes`. Leaves the cursor just past the type params (the real pass
+   * rewinds anyway). Best-effort: a malformed header simply isn't hoisted.
+   */
+  function scoutTypeName(): void {
+    try {
+      next(); // TYPE
+      const id = peek();
+      if (id.kind !== "ID") return;
+      next(); // ID
+      const name = id.text;
+      // First top-level declaration of a name wins the hoist slot; a genuine
+      // duplicate is left for the real pass to flag as a redeclaration.
+      if (name in program.scope) return;
+      const typeParams: string[] = at("LESS_THAN") ? parseTypeParams() : [];
+      const entry: VLTypeType = {
+        type: "Type",
+        subType: { type: "Alias", name },
+        name,
+      };
+      if (typeParams.length > 0) {
+        entry.params = typeParams.map(() => ({
+          type: "Infer",
+          subType: { type: "Unknown" },
+        }));
+      }
+      program.scope[name] = entry;
+      preregisteredTypes.add(name);
+      pendingTypes.add(name);
+    } catch {
+      // Malformed header: skip hoisting it. The real pass reports the error.
+    }
+  }
+
+  /**
    * Scout a single top-level `function NAME <T>? ( params ) (: ret)?` and register
    * its `Function` type into the module scope. Leaves the cursor just past the
    * signature (the real pass rewinds anyway). Best-effort: a malformed signature
@@ -3184,6 +3340,7 @@ export const parseProgram = (
   };
   scopes.push(program.scope);
 
+  preRegisterTopLevelTypes();
   preRegisterTopLevelFunctions();
 
   /**
