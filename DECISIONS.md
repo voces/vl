@@ -24,6 +24,31 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 - **Bare literals default to their base type.** `let x = 0` is `i32`, not the
   singleton `0`; the literal type survives only via an explicit annotation
   (`let x: 0 | 1`). (A16)
+- **`let x = null` is a nullable hole, not the `null` type.** `null` is
+  hole-bearing like `[]` (it inhabits every `T | null`), so its `T` is inferred
+  from later usage and the initializer contributes the `| null`: `let x = null;
+  x = 5` ⇒ `x: i32 | null`. This fills an open hole — NOT a pin violation: VL
+  pins _complete_ types (`let x = 7; x = "foo"` errors, no `i32 | string`
+  widening), but `null` isn't complete, so assigning into it selects its `T`
+  rather than conflicting. Flow-narrowing strips the `| null` on paths where `x`
+  is definitely assigned (no null tax on the straight-line case); an
+  unconstrained `let x = null` resolves to `null`. Chosen over the
+  consistent-but-annotation-heavy alternative (exact `null` type, write
+  `let x: T | null = null`) so the conditional-assign idiom
+  (`let x = null; if c { x = f() }`) works annotation-free. `null` is the one
+  scalar literal treated as hole-bearing. (A-infer-null)
+- **Uninitialized `let x` / `let x: T` is non-null + definite-assignment-checked,
+  not implicitly null.** A read where `x` is not provably written on every
+  preceding path is an error ("used before assigned"); the declaration itself is
+  fine — the _reads_ are gated. Chosen over implicit-null (which would tax every
+  declare-then-assign binding with a sticky `| null` and null-check noise) and
+  over mandatory initializers (a dummy `= 0` masks the forgot-to-assign bug that
+  definite assignment catches). Closes a live soundness gap: today
+  `let x: i32; return x` compiles and returns a silent `0`. Reuses the
+  CFG/narrowing machinery the `is`-guards already need. So the three let-forms
+  are distinct: `let x = null` (nullable, initialized), `let x` / `let x: T`
+  (non-null, must-write-before-read), `let x = expr` (type from `expr`).
+  (A-definite-assign)
 - **Literal unions are the enum idiom — no separate `enum` construct.**
   `0 | 1 | 2`, `"expense" | "reimbursement"`. (A16)
 - **`?.` is null-only.** Optional chaining guards `null`, not a union variant —
