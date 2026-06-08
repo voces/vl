@@ -125,6 +125,22 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   rebound at the loop (the tiny initial backing is discarded) so the recognizer
   can sit at the loop and tolerate an intervening counter declaration.
   Field-target lists, multi-loop builds, and `for…in` are not yet covered. (B6b)
+- **String-accumulation fusion: buffer-and-materialize, not per-`+` concat.**
+  `let s = ""` built purely by `s = s + e` appends in a loop (any number, incl.
+  conditional and multi-piece `+`-chains) lowers to a growable char buffer with
+  amortized appends, materialized to one new immutable string after the loop —
+  O(n²)→O(n). This is the sanctioned in-place/builder optimization of
+  `docs/strings-design.md` (§Mutability: in-place when the value is provably
+  unaliased/dead; OQ-A's perf half), and it does NOT change string storage (still
+  `array i32` of code points — frozen until self-hosting), only how a recognized
+  accumulation loop lowers. Sound because the accumulator is fresh, never read
+  mid-loop, and only appended (so its old value is dead), and the result is a new
+  string identical to the concat build; the guards (statement-position appends
+  reconciled against every `name` occurrence, pieces free of the accumulator,
+  freshness) fall back to per-`+` concat on anything unproven. The piece is
+  lowered with a string desired type so a value-returning call isn't dropped (the
+  normal assignment sets that; the early interception bypasses it). A builder
+  type + interpolation sugar remain OQ-A's open ergonomic halves. (B7b)
 - **String methods follow JS semantics.** `slice(start, end)` is the half-open
   `[start, end)` range with JS clamping (negative counts from the end, bounds
   clamp to `[0, len]`, `start >= end` → empty); `indexOf("")` returns 0. Chosen
