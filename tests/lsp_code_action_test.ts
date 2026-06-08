@@ -205,6 +205,23 @@ Deno.test("unused-import dispatches ONLY the remove-import fix (no `_`-prefix)",
   );
 });
 
+Deno.test("unused-function dispatches ONLY the `_`-prefix fix", () => {
+  // `function dead(...)` — diagnostic range starts at the name `dead` (col 9).
+  const src = "function dead(n: i32): i32 {\n  return n\n}\n";
+  const fixes = quickFixesForDiagnostic(src, "unused-function", rangeOf(0, 9, 13));
+  assert(fixes.length === 1, `expected exactly one fn fix, got ${fixes.length}`);
+  assert(
+    fixes[0].title === "Prefix with `_`",
+    `unexpected fix title: ${fixes[0].title}`,
+  );
+  // A zero-width `_` insert at the name start; no multi-line removal is offered.
+  assert(
+    applyEdit(src, fixes[0].edits[0]) ===
+      "function _dead(n: i32): i32 {\n  return n\n}\n",
+    `applied: ${JSON.stringify(applyEdit(src, fixes[0].edits[0]))}`,
+  );
+});
+
 Deno.test("letToConstFix rewrites `let` to `const` before the identifier", () => {
   // `let total = 1` — diagnostic range covers `total` (cols 4..9).
   const src = "let total = 1\n";
