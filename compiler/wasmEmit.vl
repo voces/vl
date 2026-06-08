@@ -14,28 +14,50 @@
 // so `i32[]` is used (see docs/selfhost-gaps.md). Bytes are masked to the low
 // 8 bits on emit (`& 0xff`).
 
-// ── emit state ───────────────────────────────────────────────────────────────
-// A single growable byte buffer. Top-level mutable `let` mutated through a
-// function lowers to a wasm global, so helpers can append to `W.bytes` directly.
+// ── BinaryWriter (Layer 1) ───────────────────────────────────────────────────
+// The one place bytes are appended. State lives in module-global `let`s (no
+// closures, so the emitter stays self-compilable). `W.bytes` is the module
+// output buffer; `curBuf` is the "current target" the streaming primitives
+// (`wU8`/`wBytes`/`wULEB`/`wSLEB`/`wName`) append to. By default `curBuf` IS
+// `W.bytes`; lowering that builds a section payload into a fresh `i32[]`
+// redirects the writer with `wTarget(buf)` (save the returned previous buffer,
+// restore it with a second `wTarget(prev)` when done). This threads "which
+// buffer" without passing it to every helper and without a closure.
+//
+// Output representation: a VL `i32[]` of byte values 0..255 (WasmGC has no `u8`);
+// bytes are masked to the low 8 bits on emit.
 type Emitter = { bytes: i32[] }
 let W: Emitter = { bytes: [] }
+// The buffer the streaming writer currently appends to. Initialized to the
+// module output buffer; rebound by `wTarget`, reset by `emitReset`.
+let curBuf: i32[] = W.bytes
 
 function emitReset(): i32 {
   W.bytes = []
+  curBuf = W.bytes
   0
 }
 
-// Append one byte (low 8 bits) to the buffer.
-function emitByte(b: i32): i32 {
-  W.bytes.push(b & 0xff)
+// Redirect the writer at `buf`; return the PREVIOUS current buffer so the caller
+// can restore it (closure-free save/restore — replaces threading `body`/`payload`
+// through every helper).
+function wTarget(buf: i32[]): i32[] {
+  let prev = curBuf
+  curBuf = buf
+  prev
+}
+
+// Append one byte (low 8 bits) to the current buffer.
+function wU8(b: i32): i32 {
+  curBuf.push(b & 0xff)
   0
 }
 
-// Append every byte of `bs` in order.
-function emitBytes(bs: i32[]): i32 {
+// Append every byte of `bs` in order to the current buffer.
+function wBytes(bs: i32[]): i32 {
   let i = 0
   while i < bs.length {
-    emitByte(bs[i])
+    wU8(bs[i])
     i = i + 1
   }
   0
@@ -47,8 +69,8 @@ function emitBytes(bs: i32[]): i32 {
 // low 7 bits, `>>> 7` does the unsigned right-shift for ULEB, `>> 7` does the
 // arithmetic right-shift for SLEB (preserving sign), and `| 0x80` sets the
 // continuation bit. The canonical `*ToArr` forms return a fresh `i32[]` so
-// they compose into nested payload builders; `emitULEB` appends straight to
-// `W.bytes` for section-length framing.
+// they compose into nested payload builders; `wULEB`/`wSLEB` append straight to
+// the current buffer (`curBuf`) for section-length framing and operands.
 
 // Unsigned LEB128: 7 bits per byte, low-to-high, high bit set while more remain.
 function ulebToArr(value: i32): i32[] {
@@ -111,37 +133,56 @@ function appendAll(dst: i32[], src: i32[]): i32[] {
   dst
 }
 
-// Streaming unsigned-LEB: append straight to the output buffer (used for
-// section-length framing). The signed encoder is only needed for `i32.const`
-// operands, which are built into a body array — so it stays the array form
-// `slebToArr` rather than a streaming wrapper.
-function emitULEB(value: i32): i32 {
-  emitBytes(ulebToArr(value))
+// Streaming unsigned-LEB: append straight to the current buffer (used for
+// section-length framing and operand encoding). The `*ToArr` array forms are
+// retained for the few sites that genuinely compose a fresh payload array.
+function wULEB(value: i32): i32 {
+  wBytes(ulebToArr(value))
+  0
+}
+
+// Streaming signed-LEB: append straight to the current buffer.
+function wSLEB(value: i32): i32 {
+  wBytes(slebToArr(value))
+  0
+}
+
+// Write a name: ULEB(byte length) followed by its UTF-8 bytes. For an ASCII
+// identifier each `s[i]` char code IS its byte. Dedupes the hand-rolled
+// length-prefix + char-loop in the export/field-name emission.
+function wName(s: string): i32 {
+  wULEB(s.length)
+  let i = 0
+  while i < s.length {
+    wU8(s[i])
+    i = i + 1
+  }
   0
 }
 
 // ── section framing ──────────────────────────────────────────────────────────
 // A section is: id byte, then ULEB(byte-length of payload), then payload. The
-// payload is built into a temporary `i32[]`, then framed. (No closures/builder
-// objects needed — payloads are constructed eagerly into arrays.)
-function emitSection(id: i32, payload: i32[]): i32 {
-  emitByte(id)
-  emitULEB(payload.length)
-  emitBytes(payload)
+// payload is built eagerly into a temporary `i32[]`, then framed onto the
+// current buffer. (No closures/builder objects — payloads are constructed
+// eagerly into arrays; no backpatching.)
+function wSection(id: i32, payload: i32[]): i32 {
+  wU8(id)
+  wULEB(payload.length)
+  wBytes(payload)
   0
 }
 
 // ── module header ────────────────────────────────────────────────────────────
 function emitHeader(): i32 {
   // "\0asm" magic + version 1
-  emitByte(0)
-  emitByte(97)   // 'a'
-  emitByte(115)  // 's'
-  emitByte(109)  // 'm'
-  emitByte(1)
-  emitByte(0)
-  emitByte(0)
-  emitByte(0)
+  wU8(0)
+  wU8(97)   // 'a'
+  wU8(115)  // 's'
+  wU8(109)  // 'm'
+  wU8(1)
+  wU8(0)
+  wU8(0)
+  wU8(0)
   0
 }
 
@@ -161,13 +202,13 @@ function buildConstModule(): i32 {
   typePayload.push(0)      // 0 params
   typePayload.push(1)      // 1 result
   typePayload.push(127)    // 0x7f i32
-  emitSection(1, typePayload)
+  wSection(1, typePayload)
 
   // Function section (id 3): one function, type index 0
   let funcPayload: i32[] = []
   funcPayload.push(1)      // 1 function
   funcPayload.push(0)      // type index 0
-  emitSection(3, funcPayload)
+  wSection(3, funcPayload)
 
   // Export section (id 7): export "main" as func 0
   let exportPayload: i32[] = []
@@ -179,22 +220,26 @@ function buildConstModule(): i32 {
   exportPayload.push(110)  // 'n'
   exportPayload.push(0)    // export kind: func
   exportPayload.push(0)    // func index 0
-  emitSection(7, exportPayload)
+  wSection(7, exportPayload)
 
   // Code section (id 10): one function body
   // body = vec(locals)=0, i32.const 42 (0x41 + SLEB 42), end (0x0b)
   let body: i32[] = []
-  body.push(0)             // 0 local declarations
-  body.push(65)            // 0x41 i32.const
-  appendAll(body, slebToArr(42))
-  body.push(11)            // 0x0b end
+  let bPrev = wTarget(body)
+  wU8(0)             // 0 local declarations
+  wU8(65)            // 0x41 i32.const
+  wSLEB(42)
+  wU8(11)            // 0x0b end
+  wTarget(bPrev)
 
   // code payload = count=1, then size-prefixed body
   let codePayload: i32[] = []
-  codePayload.push(1)      // 1 code entry
-  appendAll(codePayload, ulebToArr(body.length))
-  appendAll(codePayload, body)
-  emitSection(10, codePayload)
+  let cPrev = wTarget(codePayload)
+  wU8(1)             // 1 code entry
+  wULEB(body.length)
+  wBytes(body)
+  wTarget(cPrev)
+  wSection(10, codePayload)
   0
 }
 
@@ -215,13 +260,13 @@ function buildIdentityModule(): i32 {
   typePayload.push(127)    // 0x7f i32 param
   typePayload.push(1)      // 1 result
   typePayload.push(127)    // 0x7f i32 result
-  emitSection(1, typePayload)
+  wSection(1, typePayload)
 
   // Function section
   let funcPayload: i32[] = []
   funcPayload.push(1)
   funcPayload.push(0)
-  emitSection(3, funcPayload)
+  wSection(3, funcPayload)
 
   // Export "id"
   let exportPayload: i32[] = []
@@ -231,20 +276,24 @@ function buildIdentityModule(): i32 {
   exportPayload.push(100)  // 'd'
   exportPayload.push(0)    // func kind
   exportPayload.push(0)    // func index 0
-  emitSection(7, exportPayload)
+  wSection(7, exportPayload)
 
   // Code: local.get 0 ; end
   let body: i32[] = []
-  body.push(0)             // 0 local declarations (params aren't locals here)
-  body.push(32)            // 0x20 local.get
-  appendAll(body, ulebToArr(0))
-  body.push(11)            // 0x0b end
+  let bPrev = wTarget(body)
+  wU8(0)             // 0 local declarations (params aren't locals here)
+  wU8(32)            // 0x20 local.get
+  wULEB(0)
+  wU8(11)            // 0x0b end
+  wTarget(bPrev)
 
   let codePayload: i32[] = []
-  codePayload.push(1)
-  appendAll(codePayload, ulebToArr(body.length))
-  appendAll(codePayload, body)
-  emitSection(10, codePayload)
+  let cPrev = wTarget(codePayload)
+  wU8(1)
+  wULEB(body.length)
+  wBytes(body)
+  wTarget(cPrev)
+  wSection(10, codePayload)
   0
 }
 
@@ -5534,17 +5583,19 @@ function emitModule(stmts: i32[]): i32 {
     }
     ti = ti + 1
   }
-  emitSection(1, typePayload)
+  wSection(1, typePayload)
 
   // Function section (id 3): N functions; func i uses functype `typeOffset + i`.
   let funcPayload: i32[] = []
-  appendAll(funcPayload, ulebToArr(n))
+  let fnPrev = wTarget(funcPayload)
+  wULEB(n)
   let fi = 0
   while fi < n {
-    appendAll(funcPayload, ulebToArr(typeOffset + fi))   // functype index
+    wULEB(typeOffset + fi)   // functype index
     fi = fi + 1
   }
-  emitSection(3, funcPayload)
+  wTarget(fnPrev)
+  wSection(3, funcPayload)
 
   // Global section (id 6): one mutable global per top-level `let`/`const`, in
   // declaration order (that order IS the global index `global.get`/`global.set` use).
@@ -5572,40 +5623,38 @@ function emitModule(stmts: i32[]): i32 {
       }
       gi = gi + 1
     }
-    emitSection(6, globalPayload)
+    wSection(6, globalPayload)
   }
 
   // Export section (id 7): export each function under its own name. A name is a
   // UTF-8 byte vec; for an ASCII identifier each `name[i]` char code IS its byte.
   let exportPayload: i32[] = []
-  appendAll(exportPayload, ulebToArr(n))
+  let exPrev = wTarget(exportPayload)
+  wULEB(n)
   let ei = 0
   while ei < n {
     let fn = P.nodes[fnStmts[ei]]
     if fn is FuncDecl {
-      let name = fn.fnName
-      appendAll(exportPayload, ulebToArr(name.length))
-      let ci = 0
-      while ci < name.length {
-        exportPayload.push(name[ci])
-        ci = ci + 1
-      }
-      exportPayload.push(0)      // export kind: func
-      appendAll(exportPayload, ulebToArr(ei))   // func index
+      wName(fn.fnName)
+      wU8(0)         // export kind: func
+      wULEB(ei)      // func index
     }
     ei = ei + 1
   }
-  emitSection(7, exportPayload)
+  wTarget(exPrev)
+  wSection(7, exportPayload)
 
   // Code section (id 10): one size-prefixed body per function, in index order.
   let codePayload: i32[] = []
-  appendAll(codePayload, ulebToArr(n))
+  let codePrev = wTarget(codePayload)
+  wULEB(n)
+  wTarget(codePrev)
   let ci = 0
   while ci < n {
     if emitFuncCode(codePayload, fnStmts[ci]) < 0 { return 0 - 1 }
     ci = ci + 1
   }
-  emitSection(10, codePayload)
+  wSection(10, codePayload)
   0
 }
 
