@@ -1711,6 +1711,26 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   if memIsNarrowed(memIx) {
     return emitNarrowedMem(body, memIx, fnIx)
   }
+  // A field read on a VARIANT-typed param `o.field` (`o: TyObj`) reads the variant
+  // struct directly — the param already IS the unboxed variant ref, so there is NO box
+  // unwrap / cast (gap #2). Evaluate the receiver (`local.get o`), then `struct.get
+  // $<uVarIdx + vi> <fieldIdx>`.
+  let m0 = P.nodes[memIx]
+  if m0 is Member {
+    let pvi = exprVariantIndex(m0.memObj, fnIx)
+    if pvi >= 0 {
+      let pvfi = variantFieldIndex(pvi, m0.memProp)
+      if pvfi < 0 {
+        return emitFail("emitProgram: unknown variant field in field access")
+      }
+      if emitExpr(body, m0.memObj, fnIx) < 0 { return 0 - 1 }
+      body.push(251)           // 0xfb GC prefix
+      body.push(2)             // struct.get
+      appendAll(body, ulebToArr(uVarIdx + pvi))  // concrete variant struct heap-type index
+      appendAll(body, ulebToArr(pvfi))           // field index
+      return 0
+    }
+  }
   if !sDeclared {
     return emitFail("emitProgram: field access but no struct type declared")
   }
@@ -3587,15 +3607,36 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         // callee's struct index (consumed by the immediately-following object-literal
         // lowering; a non-literal argument simply ignores it). Default -1 = infer.
         pendingStructIdx = 0 - 1
+        // A VARIANT-typed param position (kind 8): the callee wants the CONCRETE variant
+        // struct ref, but a union-valued argument (a narrowed local/param, a union-
+        // returning call) is the BOX `{tag, value}`. Bridge the boundary by unboxing the
+        // arg to the param's variant struct — `struct.get $box 1 ; ref.cast (ref $var)`
+        // (gap #2). The cast is statically safe: control reached this call only with the
+        // arg narrowed to this variant.
+        let cVi = 0 - 1
         if cFn is FuncDecl {
           let cParams = cFn.fnParams
           if i < cParams.length {
             if vtKindOfParam(cParams[i]) == 1 {
               pendingStructIdx = paramStructIdxOf(cParams[i])
             }
+            if vtKindOfParam(cParams[i]) == 8 {
+              cVi = paramStructIdxOf(cParams[i])
+            }
           }
         }
         if emitExpr(body, args[i], fnIx) < 0 { return 0 - 1 }
+        if cVi >= 0 {
+          if exprUnion(args[i], fnIx) {
+            body.push(251)       // 0xfb GC prefix
+            body.push(2)         // struct.get
+            appendAll(body, ulebToArr(uBoxIdx))  // union box heap-type index
+            body.push(1)         // field 1: value (anyref)
+            body.push(251)       // 0xfb GC prefix
+            body.push(22)        // 0x16 ref.cast (non-null)
+            appendAll(body, ulebToArr(uVarIdx + cVi))  // target: the variant struct
+          }
+        }
         pendingStructIdx = 0 - 1
         i = i + 1
       }
@@ -4317,9 +4358,11 @@ function checkParams(fnIx: i32): i32 {
             if ty.tyName != "boolean" {
               if !isSName(ty.tyName) {
                 if !isUName(ty.tyName) {
-                  if !nameIsArray(ty.tyName) {
-                    if !nameIsString(ty.tyName) {
-                      return emitFail("emitProgram: only i32, boolean, struct, union, array, or string parameters are supported")
+                  if variantIndexOf(ty.tyName) < 0 {
+                    if !nameIsArray(ty.tyName) {
+                      if !nameIsString(ty.tyName) {
+                        return emitFail("emitProgram: only i32, boolean, struct, union, array, or string parameters are supported")
+                      }
                     }
                   }
                 }
@@ -4580,7 +4623,11 @@ function retStructIndex(tyIx: i32): i32 {
   if tyIx >= 0 {
     let ty = P.nodes[tyIx]
     if ty is TypeRef {
-      return structIndexByName(ty.tyName)
+      let si = structIndexByName(ty.tyName)
+      if si >= 0 { return si }
+      // A union-variant name carries its VARIANT index here (consumed by `pushVT`'s
+      // `kind == 8` variant-struct case); not a standalone struct, so it is -1 above.
+      return variantIndexOf(ty.tyName)
     }
   }
   0 - 1
@@ -4664,10 +4711,37 @@ function vtKindOfType(tyIx: i32): i32 {
   if retStrArrFlag(tyIx) == 1 { return 7 }
   if retRefArrFlag(tyIx) == 1 { return 5 }
   if retUnionFlag(tyIx) == 1 { return 4 }
+  if retVariantFlag(tyIx) == 1 { return 8 }
   if retTRFlag(tyIx) == 1 { return 1 }
   if retArrFlag(tyIx) == 1 { return 2 }
   if retStrFlag(tyIx) == 1 { return 3 }
   0
+}
+
+// `1` if the type-annotation node at `tyIx` names a union VARIANT struct (e.g. `TyObj`
+// of `Ty`), else `0`. Feeds the `kind == 8` (concrete variant struct ref) branch of
+// `pushVT`. A variant-struct param/result is the unboxed variant ref directly — gap #2.
+function retVariantFlag(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if variantIndexOf(ty.tyName) >= 0 { return 1 }
+    }
+  }
+  0
+}
+
+// The union-variant table index named by the type-annotation node at `tyIx`, or -1.
+// Supplies the `structIdx` argument to `pushVT`'s `kind == 8` (variant struct ref) case
+// (its heap type is `uVarIdx + vi`).
+function retVariantIndex(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      return variantIndexOf(ty.tyName)
+    }
+  }
+  0 - 1
 }
 
 // `1` if the type-annotation node at `tyIx` is a `string[]` (string-ref list), else `0`.
@@ -4783,6 +4857,9 @@ function pushVT(payload: i32[], kind: i32, structIdx: i32): i32 {
   } else if kind == 7 {
     payload.push(100)          // 0x64 (ref ht) — non-null ref
     appendAll(payload, ulebToArr(mkListIdx))  // the STRING-LIST wrapper struct heap-type index
+  } else if kind == 8 {
+    payload.push(100)          // 0x64 (ref ht) — non-null ref
+    appendAll(payload, ulebToArr(uVarIdx + structIdx)) // the CONCRETE union-variant struct heap-type index (gap #2)
   } else {
     payload.push(127)          // 0x7f i32
   }
@@ -5902,6 +5979,44 @@ function paramStructIndex(fnIx: i32, name: string): i32 {
   0 - 1
 }
 
+// The union-variant table index of the param `name` of function `fnIx` (when its
+// annotation names a VARIANT struct of the declared union, e.g. `o: TyObj`), or -1.
+// A variant-struct param's value IS the concrete variant struct ref `(ref $(uVarIdx +
+// vi))` — already narrowed/unboxed by the caller — so a field read on it reads the
+// variant struct directly (no box unwrap), the gap-#2 boundary.
+function paramVariantIndex(fnIx: i32, name: string): i32 {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef { return variantIndexOf(ty.tyName) }
+          }
+          return 0 - 1
+        }
+      }
+      i = i + 1
+    }
+  }
+  0 - 1
+}
+
+// The union-variant table index an expression at `exprIx` yields a CONCRETE variant
+// struct ref for (a variant-typed param reference, or a parenthesized one), or -1. The
+// receiver shape for a gap-#2 field read `o.field` where `o: TyObj`.
+function exprVariantIndex(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 - 1 }
+  let e = P.nodes[exprIx]
+  if e is Paren { return exprVariantIndex(e.parInner, fnIx) }
+  if e is Ident { return paramVariantIndex(fnIx, e.identName) }
+  0 - 1
+}
+
 // The struct table index of the declared local `name` (recorded in `localStructIdx`),
 // or -1 if `name` is not a struct local.
 function declaredStructIndex(name: string): i32 {
@@ -6177,6 +6292,14 @@ function memFieldTypeCode(memIx: i32, fnIx: i32): i32 {
         if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
       }
       return 0 - 1
+    }
+    // A field read on a VARIANT-typed param `o.field` (`o: TyObj`) reads the variant
+    // struct's field type directly (gap #2) — same table as a narrowed read, but the
+    // receiver is the unboxed param, not a `narrowName` ident.
+    let pvi = exprVariantIndex(e.memObj, fnIx)
+    if pvi >= 0 {
+      let pvfi = variantFieldIndex(pvi, e.memProp)
+      if pvfi >= 0 { return variantFieldTypeAt(pvi, pvfi) }
     }
     let si = structIndexOfExpr(e.memObj, fnIx)
     if si >= 0 {

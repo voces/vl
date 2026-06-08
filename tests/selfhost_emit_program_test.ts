@@ -1442,6 +1442,50 @@ const CASES: Case[] = [
     },
   },
   {
+    // gap #2: a function takes a union-VARIANT struct as a param (`o: TyObj`), reads its
+    // ARRAY fields (`o.names` a `string[]`, `o.tys` an `i32[]`) directly off the unboxed
+    // variant struct — the shape of `typecheck.vl`'s `objFieldType(o: TyObj, …)`. The
+    // caller narrows a union value to the variant and passes it; the call boundary
+    // unboxes the box to the concrete variant struct ref (no narrowing inside the callee).
+    name: "a union-variant struct param reads its array fields (objFieldType shape) => 2",
+    src: [
+      "type TyObj = { names: string[], tys: i32[] }",
+      "type TyNum = { nv: i32 }",
+      "type Ty = TyObj | TyNum",
+      "function objFieldType(o: TyObj, name: string): i32 {",
+      "  let names = o.names",
+      "  let ftys = o.tys",
+      "  let i = 0",
+      "  while i < names.length {",
+      "    if names[i] == name {",
+      "      return ftys[i]",
+      "    }",
+      "    i = i + 1",
+      "  }",
+      "  return 0 - 1",
+      "}",
+      "function lookup(t: Ty, name: string): i32 {",
+      "  if t is TyObj {",
+      "    return objFieldType(t, name)",
+      "  }",
+      "  return 0 - 99",
+      "}",
+      "function mkObj(): Ty {",
+      "  return { names: [\"a\", \"bb\"], tys: [7, 2] }",
+      "}",
+      "function main(): i32 {",
+      "  return lookup(mkObj(), \"bb\")",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `mkObj()` builds a `TyObj` boxed in `Ty`; `lookup` narrows to `TyObj` and passes
+      // it to `objFieldType`, which finds `"bb"` at index 1 and returns `tys[1] === 2`.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 2) throw new Error(`main() returned ${got}, expected 2`);
+    },
+  },
+  {
     name: "a false `is` takes the other branch (B value through `is A` => 0)",
     src: [
       "type A = { av: i32 }",
