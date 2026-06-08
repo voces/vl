@@ -689,6 +689,18 @@ let slUsed: boolean = false
 // and only read by the immediately-following empty-literal lowering.
 let pendingListKind: i32 = 0
 
+// The struct-table index an object literal MUST construct as, set by the binding /
+// argument site just before the literal is lowered, or `-1` for "infer from fields".
+// `emitObj` consults this to OVERRIDE the field-name match (`structIndexOfObj`): a
+// literal passed as a struct-typed call argument must be the CALLEE PARAMETER's struct
+// type, not whichever declared struct happens to match its field names first — those
+// differ when two structs share a field-name set (e.g. the natural `parseExpr(p)` /
+// `parseStmt(p)` recursive-descent shape where every parser-state struct looks alike).
+// Like `pendingListKind`, it is overwritten at each use and read by the immediately-
+// following literal lowering; `emitObj` clears it back to `-1` once consumed so a NESTED
+// literal does not inherit the outer hint.
+let pendingStructIdx: i32 = 0 - 1
+
 // ── discriminated-union table (G1: struct unions + `is`-narrowing) ────────────
 // A program may declare ONE union alias `type N = A | B | …` (a `UnionDecl`) whose
 // members are struct `type`s (each a `TypeDecl`). When a union IS declared, the
@@ -1325,7 +1337,15 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
   }
   let o = P.nodes[objIx]
   if o is ObjLit {
-    let si = structIndexOfObj(objIx)
+    // An EXPECTED struct index from the binding/argument site (`pendingStructIdx`) wins
+    // over the field-name match: a struct-typed call argument must be the callee
+    // parameter's type even when another struct shares its field names. Consume the hint
+    // (reset to -1) so a nested literal value falls back to inference.
+    let si = pendingStructIdx
+    pendingStructIdx = 0 - 1
+    if si < 0 {
+      si = structIndexOfObj(objIx)
+    }
     if si < 0 {
       return emitFail("emitProgram: object literal field count does not match struct")
     }
@@ -3340,10 +3360,29 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
       if target < 0 {
         return emitFail("emitProgram: call to unknown function")
       }
+      // The callee's FuncDecl lives at `fnStmts[target]` (the function index IS the
+      // fnStmts position). Its parameter list lets a struct-literal argument construct as
+      // the callee's DECLARED param struct type rather than a field-name guess — the fix
+      // for passing a struct value into a forward-referenced / mutually-recursive callee
+      // whose param struct shares field names with another struct.
+      let cFn = P.nodes[fnStmts[target]]
       let args = c.callArgs
       let i = 0
       while i < args.length {
+        // If this argument position is a struct-typed parameter, hint `emitObj` with the
+        // callee's struct index (consumed by the immediately-following object-literal
+        // lowering; a non-literal argument simply ignores it). Default -1 = infer.
+        pendingStructIdx = 0 - 1
+        if cFn is FuncDecl {
+          let cParams = cFn.fnParams
+          if i < cParams.length {
+            if vtKindOfParam(cParams[i]) == 1 {
+              pendingStructIdx = paramStructIdxOf(cParams[i])
+            }
+          }
+        }
         if emitExpr(body, args[i], fnIx) < 0 { return 0 - 1 }
+        pendingStructIdx = 0 - 1
         i = i + 1
       }
       body.push(16)          // 0x10 call

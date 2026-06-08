@@ -2902,6 +2902,169 @@ const CASES: Case[] = [
       if (got !== 7) throw new Error(`f() returned ${got}, expected 7`);
     },
   },
+  // ── struct-typed params in a mutually-recursive / forward-referencing group (#6) ──
+  // Passing a struct VALUE into a forward-referenced / mutually-recursive callee whose
+  // param is a struct type. The keystone was a literal argument constructing as a
+  // FIELD-NAME guess (`structIndexOfObj`, always the first matching struct) instead of
+  // the callee parameter's DECLARED struct type — so when two structs share a field set
+  // (the natural `parseExpr(p)`/`parseStmt(p)` recursive-descent shape, where every
+  // parser-state struct looks alike) the `struct.new` produced `(ref 0)` where the call
+  // wanted `(ref 1)` and the module failed to validate. `emitCall` now hints `emitObj`
+  // with the callee param's struct index. Each proves real `WebAssembly.instantiate`.
+  {
+    name:
+      "#6: mutually-recursive group passing a struct param (single type) => 5",
+    src: [
+      "type S = { n: i32 }",
+      "function a(s: S): i32 {",
+      "  if s.n <= 0 { return 0 }",
+      "  return b({ n: s.n - 1 })",
+      "}",
+      "function b(s: S): i32 {",
+      "  return a({ n: s.n }) + 1",
+      "}",
+      "function main(): i32 {",
+      "  return a({ n: 5 })",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  {
+    name:
+      "#6: a struct param forwarded ONWARD (`b(s)`) into the recursive callee => 5",
+    src: [
+      "type S = { n: i32 }",
+      "function a(s: S): i32 {",
+      "  if s.n <= 0 { return 0 }",
+      "  return b(s)",
+      "}",
+      "function b(s: S): i32 {",
+      "  return a({ n: s.n - 1 }) + 1",
+      "}",
+      "function main(): i32 {",
+      "  return a({ n: 5 })",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  {
+    // The keystone: two structs with the SAME field name (`n`). The literal passed to
+    // `b` must construct as `T` (the callee param's type, index 1), NOT `S` (index 0,
+    // the first field-name match) — pre-fix this emitted `struct.new $0` against a
+    // `(ref 1)` call and failed validation.
+    name:
+      "#6: ambiguous field-name structs (S/T both `{ n }`) resolve to the CALLEE's type => 5",
+    src: [
+      "type S = { n: i32 }",
+      "type T = { n: i32 }",
+      "function a(s: S): i32 {",
+      "  if s.n <= 0 { return 0 }",
+      "  return b({ n: s.n - 1 })",
+      "}",
+      "function b(t: T): i32 {",
+      "  return a({ n: t.n }) + 1",
+      "}",
+      "function main(): i32 {",
+      "  return a({ n: 5 })",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  {
+    // Three distinct ambiguous structs across a 3-way mutually-recursive cycle.
+    // fa(3)→fb(2)→fc(2)→fa(2)+10→fb(1)→fc(1)→fa(1)+10→fb(0)→fc(0)→fa(0)+10
+    // fa(0)=0; each fc adds 10, each fb adds 1: returns 33.
+    name:
+      "#6: three ambiguous structs in a 3-way mutual-recursion cycle => 33",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "type C = { v: i32 }",
+      "function fa(x: A): i32 {",
+      "  if x.v <= 0 { return 0 }",
+      "  return fb({ v: x.v - 1 })",
+      "}",
+      "function fb(x: B): i32 {",
+      "  return fc({ v: x.v }) + 1",
+      "}",
+      "function fc(x: C): i32 {",
+      "  return fa({ v: x.v }) + 10",
+      "}",
+      "function main(): i32 {",
+      "  return fa({ v: 3 })",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 33) throw new Error(`main() returned ${got}, expected 33`);
+    },
+  },
+  {
+    // Two DISTINCT struct types (different field sets) passed across the group, each
+    // callee reading its own fields — a wrong type-index would mis-offset the field
+    // read. f({a:2,b:7})→g({x:1,y:7,z:100})→f({a:1,b:7})+100→g({x:0,..})→f(0)+100→0
+    // f(0)=0; g returns 0+100=100; f returns 100; g returns 100+100=200.
+    name: "#6: two distinct struct types across the group, distinct field reads => 200",
+    src: [
+      "type S = { a: i32, b: i32 }",
+      "type T = { x: i32, y: i32, z: i32 }",
+      "function f(s: S): i32 {",
+      "  if s.a <= 0 { return 0 }",
+      "  return g({ x: s.a - 1, y: s.b, z: 100 })",
+      "}",
+      "function g(t: T): i32 {",
+      "  return f({ a: t.x, b: t.y }) + t.z",
+      "}",
+      "function main(): i32 {",
+      "  return f({ a: 2, b: 7 })",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 200) throw new Error(`main() returned ${got}, expected 200`);
+    },
+  },
+  {
+    // The natural `parseExpr(p)`/`parseStmt(p)` recursive-descent shape: a struct param
+    // whose FIELD is read, then a NEW struct constructed and passed onward to the
+    // mutually-recursive callee — exactly why `parser.vl` had to thread state via the
+    // global `P`. parseExpr(0,3)→parseStmt(1,2)→parseExpr(11,1)→parseStmt(12,0)→
+    // parseExpr(22,0): depth<=0 → return pos = 22.
+    name:
+      "#6: parseX(p)-shape — read a struct-param field, build a NEW struct, pass on => 22",
+    src: [
+      "type Parser = { pos: i32, depth: i32 }",
+      "function parseExpr(p: Parser): i32 {",
+      "  if p.depth <= 0 { return p.pos }",
+      "  return parseStmt({ pos: p.pos + 1, depth: p.depth - 1 })",
+      "}",
+      "function parseStmt(p: Parser): i32 {",
+      "  return parseExpr({ pos: p.pos + 10, depth: p.depth - 1 })",
+      "}",
+      "function main(): i32 {",
+      "  return parseExpr({ pos: 0, depth: 3 })",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 22) throw new Error(`main() returned ${got}, expected 22`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
