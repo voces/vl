@@ -110,6 +110,21 @@ function accept(kind: string): boolean {
   false
 }
 
+// Skip any run of NEWLINE / SEMI tokens at the cursor. Used inside the BRACED
+// constructs (type-decl field lists, union-variant lists) that may span several
+// source lines — a multiline `type N = {\n f: T,\n ... }` carries NEWLINE tokens
+// between fields, and a multiline `type N = A\n | B\n | C` carries them before
+// each `|`. Statement-sequence parsers (`parseBlock`, `parseProgram`) already skip
+// newlines in their own loops; this gives the brace/`|` parsers the same tolerance.
+function skipNewlines(): i32 {
+  let going = peekKind() == "NEWLINE" || peekKind() == "SEMI"
+  while going {
+    P.pos = P.pos + 1
+    going = peekKind() == "NEWLINE" || peekKind() == "SEMI"
+  }
+  0
+}
+
 // Consume a token of the expected `kind`; on mismatch record a diagnostic but
 // still advance (so the parser makes progress and never loops on bad input).
 function expect(kind: string): boolean {
@@ -454,21 +469,27 @@ function parseTypeDecl(): i32 {
     } else {
       expect("IDENT")
     }
+    // A multiline union puts each `|` on its own line, so a NEWLINE may precede
+    // the next `|` — skip newlines before testing for the pipe.
+    skipNewlines()
     let more = peekKind() == "PIPE"
     while more {
       advance()                      // "|"
+      skipNewlines()                 // and after it, before the variant name
       let nk = peekKind()
       if nk == "IDENT" {
         variants.push(advance().text)
       } else {
         expect("IDENT")
       }
+      skipNewlines()
       more = peekKind() == "PIPE"
     }
     return mkUnionDecl(name, variants)
   }
   expect("LBRACE")
   let fields: i32[] = []
+  skipNewlines()                     // a multiline `{` puts the first field on the next line
   let going = peekKind() != "RBRACE"
   while going {
     let fname = ""
@@ -480,8 +501,10 @@ function parseTypeDecl(): i32 {
     expect("COLON")
     let fty = parseType()
     fields.push(mkFieldDef(fname, fty))
+    skipNewlines()                   // a field may be followed by a NEWLINE before the `,`/`}`
     if peekKind() == "COMMA" {
       advance()
+      skipNewlines()                 // and the `,` by a NEWLINE before the next field / `}`
       going = peekKind() != "RBRACE"
     } else {
       going = false

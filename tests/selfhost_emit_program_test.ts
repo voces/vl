@@ -440,6 +440,55 @@ const CASES: Case[] = [
     },
   },
   {
+    // The self-host front end (`ast.vl`) declares every `type` over SEVERAL lines
+    // with a trailing comma. The parser now skips the NEWLINE tokens inside a braced
+    // field list, so a multiline + trailing-comma struct decl parses and lowers the
+    // same as the single-line form. Drives the real lexer→parser→emitProgram path.
+    name: "a MULTILINE struct decl with a trailing comma parses + lowers (`p.x+p.y` => 30)",
+    src: [
+      "type P = {",
+      "  x: i32,",
+      "  y: i32,",
+      "}",
+      "function main(): i32 {",
+      "  let p: P = { x: 10, y: 20 }",
+      "  return p.x + p.y",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 30) throw new Error(`main() returned ${got}, expected 30`);
+    },
+  },
+  {
+    // `ast.vl`'s `Node` union spans 28 lines with each `|` at the start of a line.
+    // The parser now skips NEWLINEs around the `|` separators in a union-variant
+    // list, so a multiline union alias discriminates the same as the single-line form.
+    name: "a MULTILINE union alias (`A |\\n B`) parses + `is`-narrows => 7",
+    src: [
+      "type A = { av: i32 }",
+      "type B = { bv: i32 }",
+      "type Node = A |",
+      "  B",
+      "function f(n: Node): i32 {",
+      "  if n is A { return n.av }",
+      "  return 0",
+      "}",
+      "function mkA(x: i32): Node {",
+      "  return { av: x }",
+      "}",
+      "function main(): i32 {",
+      "  return f(mkA(7))",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
     name: "read a non-first struct field (`p.y` => 9) proves field indexing",
     src: [
       "type P = { x: i32, y: i32 }",
