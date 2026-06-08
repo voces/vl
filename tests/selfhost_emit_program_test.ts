@@ -719,6 +719,53 @@ const CASES: Case[] = [
     },
   },
   {
+    // A binary operator at the END of a line continues the expression onto the next
+    // line — the shape `typecheck.vl` uses pervasively to break a long `+`-concatenated
+    // diagnostic message across lines (`tErr("…" +\n  tyToStr(x) + "…", ix)`). The
+    // parser now skips the NEWLINE after a binary operator, so the continuation parses
+    // as one expression (it used to terminate the statement at the line break, leaving
+    // a stray `BinExpr` statement that emitProgram rejected). Both a string `+` chain
+    // and the more general numeric case are exercised. Drives real lexer->parser->
+    // emitProgram->engine.
+    name: "a binary `+` broken across a line continues the expression (`a +\\n b`)",
+    src: [
+      "function add4(a: i32, b: i32, c: i32, d: i32): i32 {",
+      "  return a + b +",
+      "    c + d",
+      "}",
+      "function main(): i32 {",
+      "  return add4(10, 20, 3, 9)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      if (await runMain(bytes) !== 42) throw new Error("main() != 42");
+      if (await runExport(bytes, "add4", 1, 2, 3, 4) !== 10) {
+        throw new Error("add4(1,2,3,4) != 10");
+      }
+    },
+  },
+  {
+    // The string analogue: a `+` string-concatenation broken across a line (the exact
+    // `typecheck.vl` diagnostic-message idiom), folded to an i32 via `.length`.
+    name: "a string `+` broken across a line concatenates (`\"ab\" +\\n \"cde\"` => len 5)",
+    src: [
+      "function msg(): string {",
+      '  "ab" +',
+      '    "cde"',
+      "}",
+      "function main(): i32 {",
+      "  return msg().length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  {
     name: "read a non-first struct field (`p.y` => 9) proves field indexing",
     src: [
       "type P = { x: i32, y: i32 }",
