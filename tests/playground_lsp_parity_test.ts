@@ -128,6 +128,12 @@ const FEATURES: Parity[] = [
     adapterExport: null,
     mainMarker: "format(model.getValue())",
   },
+  {
+    feature: "code actions (quick-fix / Auto Fix)",
+    serverMarker: "connection.onCodeAction",
+    adapterExport: "codeActions",
+    mainMarker: "registerCodeActionProvider",
+  },
 
   // ---- KNOWN PARITY GAPS (LSP exposes it; playground does NOT wire it) -------
   //
@@ -136,18 +142,6 @@ const FEATURES: Parity[] = [
   // (adding the adapter export + Monaco provider) will FAIL the matching
   // assertion below, prompting you to delete the TODO and convert the row into
   // a real in-parity row above.
-  {
-    // TODO parity: the LSP exposes `onCodeAction` AND `lspAdapter.ts` already
-    // exports `codeActions`, but `main.ts` never registers a Monaco
-    // `CodeActionProvider` — so the playground's "Auto Fix" lightbulb is
-    // silently missing. Wire `registerCodeActionProvider` in `main.ts`, then
-    // move this row up and drop `knownGap`.
-    feature: "code actions (quick-fix / Auto Fix)",
-    serverMarker: "connection.onCodeAction",
-    adapterExport: "codeActions", // adapter binding already exists
-    mainMarker: "registerCodeActionProvider", // ← missing in main.ts
-    knownGap: "main.ts has no registerCodeActionProvider (Auto Fix unwired)",
-  },
   {
     // TODO parity: the LSP exposes find-all-references (`onReferences`,
     // cross-file aware), but the playground has neither an `lspAdapter`
