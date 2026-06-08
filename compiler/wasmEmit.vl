@@ -2047,6 +2047,13 @@ function fnHasMap(fnIx: i32): boolean {
   let i = 0
   while i < localNames.length {
     if localIsRef[i] == 6 { return true }
+    // A map-ARRAY local (`{[string]:i32}[]`, code 5 with element kind 3) lets map ops
+    // run on an indexed element (`scopes[i][k]`) — so the function needs the map scratch
+    // frame even though no bare map local is declared.
+    if localIsRef[i] == 5 {
+      let s = localStructIdx[i]
+      if s >= 0 { if s < rlElemKindTbl.length { if rlElemKindTbl[s] == 3 { return true } } }
+    }
     i = i + 1
   }
   let fn = P.nodes[fnIx]
@@ -3433,6 +3440,10 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
           return emitMapHas(body, callee.memObj, e.callArgs[0], fnIx)
         }
       }
+      // `xs.pop()` removes + returns the last list element (any list kind).
+      if callee.memProp == "pop" {
+        return emitPop(body, exprIx, fnIx)
+      }
     }
     return emitCall(body, exprIx, fnIx)
   }
@@ -3906,6 +3917,85 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected a .push call")
 }
 
+// Lower a `.pop()` value-position call onto `body`: remove + return the list's last
+// element. Generic over the list kind — picks the wrapper/backing type indices the same
+// way `.push` does (i32 list, REF list `T[]`/`N[]`/`{[string]:i32}[]`, or string list).
+// Sequence (no scratch — the receiver is a bare local, referenced repeatedly):
+//   L.len = len - 1            (decrement first, so the new len IS the popped index)
+//   push backing[L.len]        (the removed element; `ref.as_non_null` for a ref/string
+//                               element so a non-null struct/union/map/string surfaces)
+// The receiver must be a bare list local. An empty-list pop is the caller's contract
+// (reading `backing[-1]` would trap) — matched to the host semantics of `.pop()`.
+function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      let recv = P.nodes[callee.memObj]
+      if c.callArgs.length != 0 {
+        return emitFail("emitProgram: .pop takes no arguments")
+      }
+      let isRef = exprRefArray(callee.memObj, fnIx)
+      let isStr = exprStringArray(callee.memObj, fnIx)
+      if !isRef && !isStr && !exprArray(callee.memObj, fnIx) {
+        return emitFail("emitProgram: .pop receiver is not a list")
+      }
+      // The popped element is a REF (struct / union box / map struct / string) for a
+      // ref or string list — surface it non-null; an i32 list yields a raw i32.
+      let lTy = lTypeIdx
+      let aTy = aTypeIdx
+      let elemIsRef = false
+      if isRef {
+        if !rlUsed {
+          return emitFail("emitProgram: ref .pop but ref list type not collected")
+        }
+        let rslot = refListSlotOfExpr(callee.memObj, fnIx)
+        lTy = rlWrapIdx[rslot]
+        aTy = rlBackIdx[rslot]
+        elemIsRef = true
+      } else if isStr {
+        if !slUsed {
+          return emitFail("emitProgram: string .pop but string list type not collected")
+        }
+        lTy = mkListIdx
+        aTy = mkArrIdx
+        elemIsRef = true
+      } else if !lUsed {
+        return emitFail("emitProgram: .pop but list type not collected")
+      }
+      if recv is Ident {
+        let lIdx = localIndexOf(fnIx, recv.identName)
+        if lIdx < 0 {
+          return emitFail("emitProgram: .pop receiver is not a list local")
+        }
+        // L.len = len - 1
+        body.push(32)          // local.get L
+        appendAll(body, ulebToArr(lIdx))
+        pushListLen(body, lIdx, lTy)
+        body.push(65)          // i32.const 1
+        appendAll(body, slebToArr(1))
+        body.push(107)         // 0x6b i32.sub
+        body.push(251)         // 0xfb
+        body.push(5)           // struct.set
+        appendAll(body, ulebToArr(lTy))
+        body.push(1)           // field 1: len
+        // backing[L.len]  (the just-decremented len is the popped element's index)
+        pushListBacking(body, lIdx, lTy)
+        pushListLen(body, lIdx, lTy)
+        body.push(251)         // 0xfb
+        body.push(11)          // 0x0b array.get
+        appendAll(body, ulebToArr(aTy))
+        if elemIsRef {
+          body.push(212)       // 0xd4 ref.as_non_null
+        }
+        return 0
+      }
+      return emitFail("emitProgram: .pop receiver must be a list local")
+    }
+  }
+  emitFail("emitProgram: expected a .pop call")
+}
+
 // `local.get L ; struct.get $lTy 1` — push the list's `len` field onto `body`.
 function pushListLen(body: i32[], lIdx: i32, lTy: i32): i32 {
   body.push(32)              // local.get
@@ -4011,6 +4101,13 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     if callee is Member {
       if callee.memProp == "push" {
         return emitPush(body, stmtIx, fnIx)
+      }
+      // A `.pop()` STATEMENT discards the popped element — emit the pop, then `drop`
+      // the value it leaves on the stack.
+      if callee.memProp == "pop" {
+        if emitPop(body, stmtIx, fnIx) < 0 { return 0 - 1 }
+        body.push(26)          // 0x1a drop
+        return 0
       }
       return emitFail("emitProgram: unsupported member-call statement")
     }
@@ -4750,19 +4847,26 @@ function emitModule(stmts: i32[]): i32 {
   // `rlBackIdx`/`rlWrapIdx` are the assigned heap indices. The legacy singletons
   // `raTypeIdx`/`rlTypeIdx` alias SLOT 0 for any not-yet-migrated site.
   let refPairBase = preTypes + arrayOffset + listOffset
+  // The map struct heap index is needed BELOW to resolve a map-array ref-list element
+  // (kind 3) — and `mStructIdx` itself lands AFTER the ref pairs. It is computable up
+  // front: `mStructIdx = preMap + 2` where `preMap = refPairBase + refPairsTotal`.
+  let refPairsTotal = rlElemName.length * 2
+  let mStructIdxPre = refPairBase + refPairsTotal + 2
   let rs = 0
   while rs < rlElemName.length {
     rlBackIdx[rs] = refPairBase + rs * 2
     rlWrapIdx[rs] = refPairBase + rs * 2 + 1
     if rlElemKindTbl[rs] == 2 {
       rlElemHeap[rs] = uBoxIdx
+    } else if rlElemKindTbl[rs] == 3 {
+      // A map-struct element (`{[string]:i32}[]`): the backing holds `(ref null $mStructIdx)`.
+      rlElemHeap[rs] = mStructIdxPre
     } else {
       let esi = structIndexByName(rlElemName[rs])
       if esi >= 0 { rlElemHeap[rs] = sHeapIdx[esi] } else { rlElemHeap[rs] = 0 }
     }
     rs = rs + 1
   }
-  let refPairsTotal = rlElemName.length * 2
   if rlElemName.length >= 1 {
     raTypeIdx = rlBackIdx[0]
     rlTypeIdx = rlWrapIdx[0]
@@ -5090,12 +5194,25 @@ function nameIsMap(name: string): boolean {
   true
 }
 
+// True if the array type-name `name` is a string-keyed-MAP list `{[string]:i32}[]` —
+// a ref list whose ELEMENT is the map struct (`mStructIdx`). It is a `nameIsMap` name
+// with a trailing `[]`. The scope chain (`typecheck.vl`'s `scopes: {[string]:i32}[]`)
+// is exactly this. Routed through the ref-list machinery as element-kind `3`.
+function nameIsMapArray(name: string): boolean {
+  let n = name.length
+  if n < 2 { return false }
+  if name[n - 2] != '[' { return false }
+  if name[n - 1] != ']' { return false }
+  // The bare element (without the trailing `[]`) must be a map name.
+  nameIsMap(name.slice(0, n - 2))
+}
+
 // True if the array type-name `name` is a REF-element list — `S[]` over a declared
-// struct, or `N[]` over the declared union alias (the box-ref element). Either lowers
-// to the `{ backing: (ref $raTypeIdx), len, cap }` wrapper over a `(ref null $elem)`
-// backing (G7-ref). A non-`[]` name or an `i32[]` is NOT a ref array. The element name
-// is recovered by checking each declared struct/union name + `"[]"` (a `string +
-// string` concat; a `string + i32` would be a type error).
+// struct, `N[]` over the declared union alias (the box-ref element), or `{[string]:i32}[]`
+// (a map-struct element). Either lowers to the `{ backing: (ref $raTypeIdx), len, cap }`
+// wrapper over a `(ref null $elem)` backing (G7-ref). A non-`[]` name or an `i32[]` is
+// NOT a ref array. The element name is recovered by checking each declared struct/union
+// name + `"[]"` (a `string + string` concat; a `string + i32` would be a type error).
 function nameIsRefArray(name: string): boolean {
   let i = 0
   while i < sNames.length {
@@ -5107,12 +5224,15 @@ function nameIsRefArray(name: string): boolean {
     if name == unNames[u] + "[]" { return true }
     u = u + 1
   }
+  if nameIsMapArray(name) { return true }
   false
 }
 
 // The ref-element kind for an array type-name (assumes `nameIsRefArray(name)`):
-// `1` = a struct element, `2` = a union-box element (`uBoxIdx`).
+// `1` = a struct element, `2` = a union-box element (`uBoxIdx`), `3` = a map-struct
+// element (`mStructIdx`, the scope-chain `{[string]:i32}[]`).
 function refArrElemKind(name: string): i32 {
+  if nameIsMapArray(name) { return 3 }
   let u = 0
   while u < unNames.length {
     if name == unNames[u] + "[]" { return 2 }
@@ -5252,10 +5372,17 @@ function collectA(stmts: i32[]): i32 {
         aUsed = true
       } else if nameIsRefArray(nd.tyName) {
         // A `S[]`/`N[]` annotation is a ref list (wrapper + `(ref null $elem)` backing).
+        // A `{[string]:i32}[]` (map-array) ALSO forces the map struct + its keys/vals
+        // list types (the element is `(ref $mStructIdx)`).
         rlUsed = true
         raUsed = true
         rElemKind = refArrElemKind(nd.tyName)
         rlInternName(refArrElemName(nd.tyName), refArrElemKind(nd.tyName))
+        if nameIsMapArray(nd.tyName) {
+          mUsed = true
+          lUsed = true
+          aUsed = true
+        }
       } else if nameIsArray(nd.tyName) {
         if checkArrName(nd.tyName) < 0 { return 0 - 1 }
         // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
@@ -5344,6 +5471,7 @@ function arrLitElemName(arrIx: i32): string {
 // element is `name` with the trailing `"[]"` removed — i.e. the struct / union alias
 // name. Mirrors `refArrElemKind` but yields the table key.
 function refArrElemName(name: string): string {
+  if nameIsMapArray(name) { return name.slice(0, name.length - 2) }
   let u = 0
   while u < unNames.length {
     if name == unNames[u] + "[]" { return unNames[u] }
@@ -6337,7 +6465,13 @@ function letAnnRefListKind(letIx: i32): i32 {
     if d.letType >= 0 {
       let lt = P.nodes[d.letType]
       if lt is TypeRef {
-        if nameIsRefArray(lt.tyName) { return refArrElemKind(lt.tyName) }
+        // `pendingListKind` semantics: 1 = struct/MAP ref list (use `pendingListSlot`),
+        // 2 = union box ref list, 3 = string list. A map-array (`refArrElemKind` 3) is a
+        // ref list disambiguated by its slot, so it threads kind 1 (NOT the string-3).
+        if nameIsRefArray(lt.tyName) {
+          if refArrElemKind(lt.tyName) == 2 { return 2 }
+          return 1
+        }
         if nameIsStringArray(lt.tyName) { return 3 }
       }
     }
@@ -6494,11 +6628,29 @@ function exprMap(exprIx: i32, fnIx: i32): boolean {
   if e is Call {
     let callee = P.nodes[e.callFn]
     if callee is Ident { return callee.identName == "Map" }
+    // `scopes.pop()` over a map ref list (`{[string]:i32}[]`) yields a Map ref.
+    if callee is Member {
+      if callee.memProp == "pop" {
+        if exprRefArray(callee.memObj, fnIx) {
+          let slot = refListSlotOfExpr(callee.memObj, fnIx)
+          if slot >= 0 { return rlElemKindTbl[slot] == 3 }
+        }
+      }
+    }
     return false
   }
   if e is Ident {
     if paramMap(fnIx, e.identName) { return true }
     return declaredMap(e.identName)
+  }
+  // `scopes[i]` over a MAP ref list (`{[string]:i32}[]`, element kind 3) yields a Map ref
+  // — so map member/index ops on it route to the existing map lowering. Per-slot: the
+  // element kind comes from the receiver's distinct ref-list slot.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      let slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 { return rlElemKindTbl[slot] == 3 }
+    }
   }
   false
 }

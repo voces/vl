@@ -3554,6 +3554,107 @@ const CASES: Case[] = [
       if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
     },
   },
+  {
+    // The scope-chain keystone: an ARRAY whose element is a Map (`{[string]:i32}[]`).
+    // Push two fresh maps, length reflects the pushes.
+    name: "scope-chain: {[string]:i32}[] empty, push two Map()s, .length => 2",
+    src: [
+      "function main(): i32 {",
+      "  let scopes: {[string]: i32}[] = []",
+      "  scopes.push(Map())",
+      "  scopes.push(Map())",
+      "  return scopes.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 2) throw new Error(`main() returned ${got}, expected 2`);
+    },
+  },
+  {
+    // Index an element (a Map ref), set a key in it, read it back with `?? d`.
+    name: "scope-chain: index a pushed map, set + get a key => 7",
+    src: [
+      "function main(): i32 {",
+      "  let scopes: {[string]: i32}[] = []",
+      "  scopes.push(Map())",
+      '  scopes[0]["x"] = 7',
+      '  return scopes[0]["x"] ?? -1',
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    // `.pop()` on a plain i32 list: returns the last element + shrinks the length.
+    name: "pop: i32[] pop returns last + decrements length (3 then len 2 => 5)",
+    src: [
+      "function main(): i32 {",
+      "  let xs: i32[] = [1, 2, 3]",
+      "  let last = xs.pop()",
+      "  return last + xs.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // last = 3, remaining length = 2, 3 + 2 = 5.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  {
+    // `.pop()` on the map-array scope chain: pop the last scope, the popped Map is a
+    // usable Map ref (read a key out of it), and the stack shrinks.
+    name: "scope-chain: pop the last map, read a key from the popped map => 9",
+    src: [
+      "function main(): i32 {",
+      "  let scopes: {[string]: i32}[] = []",
+      "  scopes.push(Map())",
+      "  scopes.push(Map())",
+      '  scopes[1]["k"] = 9',
+      "  let top = scopes.pop()",
+      '  let v = top["k"] ?? -1',
+      "  return v + scopes.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // popped map has k=9, remaining length = 1 → 9 + 1 = 10.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 10) throw new Error(`main() returned ${got}, expected 10`);
+    },
+  },
+  {
+    // End-to-end scope chain: push scopes, set keys in DIFFERENT scopes, has/get-with-
+    // default lookups across the stack, then pop. Mirrors typecheck.vl's scope handling.
+    name: "scope-chain: push/set-across-scopes/has/get-default/pop end-to-end => 1",
+    src: [
+      "function main(): i32 {",
+      "  let scopes: {[string]: i32}[] = []",
+      "  scopes.push(Map())",
+      '  scopes[0]["g"] = 1',
+      "  scopes.push(Map())",
+      '  scopes[1]["x"] = 2',
+      "  let acc = 0",
+      '  if scopes[1].has("x") { acc = acc + (scopes[1]["x"] ?? -1) }',
+      '  if scopes[0].has("g") { acc = acc + (scopes[0]["g"] ?? -1) }',
+      '  acc = acc + (scopes[1]["missing"] ?? 100)',
+      "  scopes.pop()",
+      "  acc = acc + scopes.length",
+      "  return acc",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // x=2, g=1, missing default=100, after pop length=1 → 2+1+100+1 = 104.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 104) throw new Error(`main() returned ${got}, expected 104`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
