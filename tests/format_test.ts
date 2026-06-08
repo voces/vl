@@ -466,3 +466,63 @@ Deno.test("a fn with an expression body enclosing an own-line comment is reprodu
   // AST shape preserved.
   assertEquals(astShape(out), astShape(src), "fn expression-body comment changed the AST");
 });
+
+// --- trailing comment on a bare-body loop header (D4) ----------------------
+//
+// A `while`, `for`, or `for-in` with a bare (brace-less) body and a trailing
+// comment on the header line — e.g. `while r < 10 // cond` — must keep the
+// comment attached to the header line in the output.  The bug: the formatter
+// was consuming no trailing comment for the header, so the pending comment was
+// flushed AFTER the enclosing construct (e.g. after the function's closing `}`)
+// instead of staying on the header line.
+
+Deno.test("trailing comment on a bare-body `while` header stays on that line (D4)", () => {
+  // `while r < 10 // cond comment` — bare (no braces) body.
+  const src = "function f() {\n  let r = 0\n  while r < 10 // cond comment\n    r = r + 1\n}\n";
+  const out = format(src);
+  // The comment must not be displaced OUTSIDE the function (after its `}`).
+  assert(
+    !out.includes("}\n// cond comment"),
+    `trailing comment on while header was expelled outside the function:\n${out}`,
+  );
+  // The comment must appear on the header line.
+  assert(
+    out.includes("while r < 10 // cond comment"),
+    `trailing comment on while header lost or misplaced:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `formatted output has syntax errors:\n${out}`);
+  assertEquals(format(out), out, "while bare-body trailing comment not idempotent");
+  assertEquals(astShape(out), astShape(src), "while bare-body trailing comment changed AST");
+});
+
+Deno.test("trailing comment on a bare-body `for` header stays on that line (D4)", () => {
+  const src = "function f() {\n  let r = 0\n  for i in 0 to 10 // loop comment\n    r = i\n}\n";
+  const out = format(src);
+  assert(
+    !out.includes("}\n// loop comment"),
+    `trailing comment on for header was expelled outside the function:\n${out}`,
+  );
+  assert(
+    out.includes("for i in 0 to 10 // loop comment"),
+    `trailing comment on for header lost or misplaced:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `formatted output has syntax errors:\n${out}`);
+  assertEquals(format(out), out, "for bare-body trailing comment not idempotent");
+  assertEquals(astShape(out), astShape(src), "for bare-body trailing comment changed AST");
+});
+
+Deno.test("trailing comment on a bare-body `for-in` header stays on that line (D4)", () => {
+  const src = "function f() {\n  let xs = [1, 2, 3]\n  for x in xs // iterating\n    print(x)\n}\n";
+  const out = format(src);
+  assert(
+    !out.includes("}\n// iterating"),
+    `trailing comment on for-in header was expelled outside the function:\n${out}`,
+  );
+  assert(
+    out.includes("for x in xs // iterating"),
+    `trailing comment on for-in header lost or misplaced:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `formatted output has syntax errors:\n${out}`);
+  assertEquals(format(out), out, "for-in bare-body trailing comment not idempotent");
+  assertEquals(astShape(out), astShape(src), "for-in bare-body trailing comment changed AST");
+});

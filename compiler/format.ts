@@ -532,7 +532,12 @@ class Printer {
       this.emitBlockBody(node.statement, indent);
       this.line(indent, "}");
     } else {
-      this.line(indent, `${label}while ${cond}`);
+      // Consume any trailing comment on the header line so it stays attached
+      // to the `while …` line rather than being displaced to after the enclosing
+      // construct by `flushRemaining`.
+      const headerLine = this.span(node)?.start.line ?? 0;
+      const trailer = this.trailingOn(headerLine);
+      this.line(indent, `${label}while ${cond}${trailer ? ` ${trailer.text}` : ""}`);
       this.emitStatement(node.statement, indent + 1);
     }
   }
@@ -543,16 +548,19 @@ class Printer {
     const to = this.expr(node.to, indent);
     let head = `${label}for ${node.variable} in ${from} to ${to}`;
     if (node.step !== undefined) head += ` step ${this.expr(node.step, indent)}`;
-    this.emitLoopBody(head, node.statement, indent);
+    const headerLine = this.span(node)?.start.line ?? 0;
+    this.emitLoopBody(head, node.statement, indent, headerLine);
   }
 
   private emitForIn(node: VLForInNode, indent: number): void {
     const label = node.label ? `${node.label}: ` : "";
     const iter = this.expr(node.iterable, indent);
+    const headerLine = this.span(node)?.start.line ?? 0;
     this.emitLoopBody(
       `${label}for ${node.variable} in ${iter}`,
       node.statement,
       indent,
+      headerLine,
     );
   }
 
@@ -560,13 +568,18 @@ class Printer {
     head: string,
     body: VLStatement,
     indent: number,
+    headerLine = 0,
   ): void {
     if (this.isBlock(body)) {
       this.line(indent, `${head} {`);
       this.emitBlockBody(body, indent);
       this.line(indent, "}");
     } else {
-      this.line(indent, head);
+      // Consume any trailing comment on the header line so it stays attached
+      // to the loop-header line rather than being displaced to after the
+      // enclosing construct by `flushRemaining`.
+      const trailer = headerLine ? this.trailingOn(headerLine) : undefined;
+      this.line(indent, `${head}${trailer ? ` ${trailer.text}` : ""}`);
       this.emitStatement(body, indent + 1);
     }
   }
