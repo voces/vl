@@ -914,8 +914,16 @@ Genuinely still open — owner's calls (recommendations given, decision deferred
 
 1. **String building / interpolation / formatting — RECOMMENDATION, owner decides.**
    The gap: `s = s + piece` in a loop is **O(n²)** (each `+` copies the whole
-   accumulator), and there is no `f"…"` / format story at all. Options, not mutually
-   exclusive:
+   accumulator), and there is no `f"…"` / format story at all.
+   > **Perf half — DONE (B7b string-accumulation fusion).** The O(n²) build loop is
+   > fixed *without* a surface change: a fresh `let s = ""` built purely by `s = s + e`
+   > appends in a loop lowers to a growable char buffer materialized once (O(n)),
+   > keeping the `s = s + x` idiom. This is the §Mutability "in-place when
+   > unaliased/dead" optimization (the accumulator is provably fresh / append-only /
+   > unread), and changes no string storage. Still open below: the *ergonomic* halves —
+   > an explicit builder type for cases fusion can't see, interpolation syntax, and
+   > `std:fmt`. (→ `DECISIONS.md` B7b; `tests/cases/strings/accum-*`)
+   Options, not mutually exclusive:
    - **A buffer / `StringBuilder` type** — an explicit mutable accumulator (amortized
      O(1) append, one final `.toString()`), the standard fix for the O(n²) build loop.
    - **Interpolation syntax** — `f"Hello {name}"` (or `` `Hello ${name}` ``) lowering to

@@ -2629,6 +2629,232 @@ export const toWasm = async (
     return m.block(null, block, binaryen.none);
   };
 
+  // --- String-accumulation fusion (the in-place/builder optimization of
+  // docs/strings-design.md §Mutability + OQ-A) -------------------------------
+  // `let s = ""` (or any string seed) built purely by `s = s + e` appends in a
+  // loop is O(n^2) — each `+` copies the whole accumulator. When the accumulator
+  // is fresh, never read mid-loop, and only ever appended (so its old value is
+  // provably dead/unaliased), the loop lowers to a growable char buffer with
+  // amortized-O(1) appends, materialized to a NEW immutable string once after the
+  // loop — O(n), idiom unchanged. This does NOT touch string storage (still
+  // `array i32` of code points, frozen until self-hosting per the design doc); it
+  // only changes how a recognized accumulation loop lowers. Falls back (`null`)
+  // on anything unproven. Corpus: `tests/cases/strings/accum-*`.
+  type StrBuf = {
+    bufLocal: number;
+    lenLocal: number;
+    heapType: number;
+    refType: number;
+    strType: VLType;
+  };
+  const stringAccum = new Map<string, StrBuf>();
+  const isStringTypeVL = (t: VLType): boolean => {
+    const s = softenImplicitType(t);
+    return s.type === "Object" && s.name === "string";
+  };
+  // `((name + a) + b) + c` → [a, b, c]; null if the chain's leftmost leaf isn't
+  // `name` (e.g. `"x" + name` prepend, or `name = "y"` reset).
+  const appendChainPieces = (
+    rhs: VLExpression,
+    name: string,
+  ): VLExpression[] | null => {
+    const pieces: VLExpression[] = [];
+    let cur: VLExpression = rhs;
+    while (cur.type === "BinaryOperation" && cur.operator === "+") {
+      pieces.unshift(cur.right);
+      cur = cur.left;
+    }
+    return cur.type === "Name" && cur.name === name && pieces.length > 0
+      ? pieces
+      : null;
+  };
+  // Count `Name` nodes referring to `name` anywhere under `v` (structure-agnostic,
+  // can't miss one — the counting twin of `referencesName`).
+  const countName = (v: unknown, name: string): number => {
+    if (v === null || typeof v !== "object") return 0;
+    if (Array.isArray(v)) {
+      let n = 0;
+      for (const x of v) n += countName(x, name);
+      return n;
+    }
+    const node = v as { type?: unknown; name?: unknown };
+    let n = node.type === "Name" && node.name === name ? 1 : 0;
+    for (const k in node) {
+      if (k === "scope") continue;
+      n += countName((node as Record<string, unknown>)[k], name);
+    }
+    return n;
+  };
+  // Count STATEMENT-position appends `name = <chain rooted at name>` (pieces free
+  // of name) in a loop body, recursing through control-flow but NOT into
+  // value-position expressions — so an assignment used as a value (`f(s = s + e)`)
+  // is excluded, and its extra `name` occurrences make `countName` exceed
+  // `2 * appends`, forcing a fall-back.
+  const countStmtAppends = (stmt: VLStatement, name: string): number => {
+    if (stmt.type === "Block") {
+      let n = 0;
+      for (const s of stmt.statements) n += countStmtAppends(s, name);
+      return n;
+    }
+    if (stmt.type === "If") {
+      let n = 0;
+      for (const c of stmt.conditionals) n += countStmtAppends(c.statement, name);
+      if (stmt.else) n += countStmtAppends(stmt.else, name);
+      return n;
+    }
+    if (stmt.type === "For" || stmt.type === "While") {
+      return countStmtAppends(stmt.statement, name);
+    }
+    if (
+      stmt.type === "BinaryOperation" && stmt.operator === "=" &&
+      stmt.left.type === "Name" && stmt.left.name === name
+    ) {
+      const pieces = appendChainPieces(stmt.right, name);
+      if (pieces && pieces.every((p) => !referencesName(p, name))) return 1;
+    }
+    return 0;
+  };
+  // Collect every name that has at least one statement-position append in `stmt`.
+  const accumCandidates = (stmt: VLStatement, into: Set<string>): void => {
+    if (stmt.type === "Block") {
+      for (const s of stmt.statements) accumCandidates(s, into);
+      return;
+    }
+    if (stmt.type === "If") {
+      for (const c of stmt.conditionals) accumCandidates(c.statement, into);
+      if (stmt.else) accumCandidates(stmt.else, into);
+      return;
+    }
+    if (stmt.type === "For" || stmt.type === "While") {
+      accumCandidates(stmt.statement, into);
+      return;
+    }
+    if (
+      stmt.type === "BinaryOperation" && stmt.operator === "=" &&
+      stmt.left.type === "Name"
+    ) {
+      const nm = stmt.left.name;
+      const pieces = appendChainPieces(stmt.right, nm);
+      if (pieces && pieces.every((p) => !referencesName(p, nm))) into.add(nm);
+    }
+  };
+  // Emit one append of a string `piece` into the growable buffer (grow geometrically
+  // to fit, then bulk `array.copy`). Shared by the seed append and the per-`+`
+  // appends emitted by the assignment interception.
+  const emitStrAppend = (buf: StrBuf, piece: VLExpression): number => {
+    const eLocal = newLocal(buf.refType);
+    const eLenLocal = newLocal(binaryen.i32);
+    const ncLocal = newLocal(binaryen.i32);
+    const nbLocal = newLocal(buf.refType);
+    const e = () => m.local.get(eLocal, buf.refType);
+    const eLen = () => m.local.get(eLenLocal, binaryen.i32);
+    const nc = () => m.local.get(ncLocal, binaryen.i32);
+    const nb = () => m.local.get(nbLocal, buf.refType);
+    const ba = () => m.local.get(buf.bufLocal, buf.refType);
+    const len = () => m.local.get(buf.lenLocal, binaryen.i32);
+    const need = () => m.i32.add(len(), eLen());
+    return m.block(null, [
+      // The piece is a string value; lower it with a string desired type so a
+      // value-returning call isn't dropped as a statement (the normal `s = …`
+      // assignment sets this desired type, which our early interception bypasses).
+      m.local.set(eLocal, withDesiredType(buf.strType, () => toExpression(piece))),
+      m.local.set(eLenLocal, m.array.len(e())),
+      m.if(
+        m.i32.lt_s(m.array.len(ba()), need()),
+        m.block(null, [
+          m.local.set(ncLocal, m.i32.mul(m.array.len(ba()), m.i32.const(2))),
+          m.if(m.i32.lt_s(nc(), need()), m.local.set(ncLocal, need())),
+          m.if(m.i32.lt_s(nc(), m.i32.const(8)), m.local.set(ncLocal, m.i32.const(8))),
+          m.local.set(nbLocal, m.array.new(buf.heapType, nc(), m.i32.const(0))),
+          m.array.copy(nb(), m.i32.const(0), ba(), m.i32.const(0), len()),
+          m.local.set(buf.bufLocal, nb()),
+        ]),
+      ),
+      m.array.copy(ba(), len(), e(), m.i32.const(0), eLen()),
+      m.local.set(buf.lenLocal, need()),
+    ], binaryen.none);
+  };
+  const tryLowerStringAccum = (
+    statements: VLStatement[],
+    loopIdx: number,
+  ): number | null => {
+    const loop = statements[loopIdx];
+    if (loop.type !== "For" && loop.type !== "While") return null;
+    const body = loop.statement;
+    const candidates = new Set<string>();
+    accumCandidates(body, candidates);
+    for (const name of candidates) {
+      if (stringAccum.has(name)) continue; // already accumulated by an outer loop
+      const b = lookupName(name);
+      if (!b || b.index < 0 || b.capture || !isStringTypeVL(b.type)) continue;
+      if (functionBoundaries.length === 1 && moduleGlobals.has(name)) continue;
+      // Every `name` reference in the loop body must be a statement-position append
+      // (each contributes exactly the LHS Name + the chain-root Name = 2).
+      if (countName(body, name) !== 2 * countStmtAppends(body, name)) continue;
+      // Freshness: a string declaration earlier in this block, untouched until the
+      // loop (so the accumulator is exactly its seed at loop entry, unaliased).
+      let declIdx = -1;
+      for (let k = loopIdx - 1; k >= 0; k--) {
+        const s = statements[k];
+        if (s.type === "VariableDeclaration" && s.name === name) {
+          declIdx = k;
+          break;
+        }
+      }
+      if (declIdx < 0) continue;
+      const decl = statements[declIdx];
+      if (
+        decl.type !== "VariableDeclaration" || !decl.value ||
+        !isStringTypeVL(decl.variableType)
+      ) continue;
+      let fresh = true;
+      for (let k = declIdx + 1; k < loopIdx; k++) {
+        if (referencesName(statements[k], name)) {
+          fresh = false;
+          break;
+        }
+      }
+      if (!fresh) continue;
+
+      // Codegen: buffer seeded from the accumulator's current value, fill via the
+      // interception during loop lowering, materialize a new string after.
+      const at = arrayType(i32Type);
+      const buf: StrBuf = {
+        bufLocal: newLocal(at.refType),
+        lenLocal: newLocal(binaryen.i32),
+        heapType: at.heapType,
+        refType: at.refType,
+        strType: b.type,
+      };
+      const sLocal = b.index;
+      const out: number[] = [
+        m.local.set(buf.bufLocal, m.array.new(at.heapType, m.i32.const(8), m.i32.const(0))),
+        m.local.set(buf.lenLocal, m.i32.const(0)),
+        emitStrAppend(buf, { type: "Name", name }),
+      ];
+      stringAccum.set(name, buf);
+      out.push(toExpression(loop));
+      stringAccum.delete(name);
+      const outLocal = newLocal(at.refType);
+      out.push(
+        m.local.set(
+          outLocal,
+          m.array.new(at.heapType, m.local.get(buf.lenLocal, binaryen.i32), m.i32.const(0)),
+        ),
+        m.array.copy(
+          m.local.get(outLocal, at.refType),
+          m.i32.const(0),
+          m.local.get(buf.bufLocal, at.refType),
+          m.i32.const(0),
+          m.local.get(buf.lenLocal, binaryen.i32),
+        ),
+        m.local.set(sLocal, m.local.get(outLocal, at.refType)),
+      );
+      return m.block(null, out, binaryen.none);
+    }
+    return null;
+  };
+
   // Lower a statement list to wasm expressions. Nested function declarations
   // register lazily (emitting nothing); the tail (last non-declaration) keeps the
   // ambient desired type — so a value-producing block returns it, while a void
@@ -2653,7 +2879,8 @@ export const toWasm = async (
       // when the loop provably reproduces the push build (see `tryLowerBuildLoop`);
       // otherwise it lowers normally.
       if (stmt.type === "For" || stmt.type === "While") {
-        const fused = tryLowerBuildLoop(statements, i);
+        const fused = tryLowerBuildLoop(statements, i) ??
+          tryLowerStringAccum(statements, i);
         if (fused !== null) {
           out.push(fused);
           continue;
@@ -3652,6 +3879,21 @@ export const toWasm = async (
         // LHS (a Name or `obj.field`) is not a value to evaluate, and an object
         // type carries no `=` method to look up.
         if (op === "=") {
+          // String-accumulation fusion: `s = s + e…` where `s` is in buffer mode
+          // appends each `+` piece to the growable buffer instead of allocating a
+          // new string. Guaranteed statement-position + chain-rooted by the
+          // analysis in `tryLowerStringAccum`, so the value is discarded.
+          if (node.left.type === "Name" && stringAccum.has(node.left.name)) {
+            const buf = stringAccum.get(node.left.name)!;
+            const pieces = appendChainPieces(node.right, node.left.name);
+            if (pieces) {
+              return m.block(
+                null,
+                pieces.map((p) => emitStrAppend(buf, p)),
+                binaryen.none,
+              );
+            }
+          }
           if (node.left.type === "IndexAccess") {
             const access = node.left;
             // `m[k] = v` on a map: hash insert/overwrite via the `.set` helper.
