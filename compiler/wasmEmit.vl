@@ -308,6 +308,11 @@ let fnStmts: i32[] = []
 // struct, else `0`. Populated by `buildFnMap` so `fnRetStruct` is a flat lookup.
 let fRetRef: i32[] = []
 
+// Parallel to `fnNames`: the STRUCT TABLE INDEX the i-th function returns (when
+// `fRetRef[i] == 1`), else `-1`. Populated by `buildFnMap` so `fnRetStructIndex` is a
+// flat lookup.
+let fRetStructIdx: i32[] = []
+
 // Parallel to `fnNames`: `1` if the i-th function's declared RETURN type is an array
 // (`i32[]`), else `0`. Populated by `buildFnMap` so `fnRetArray` is a flat lookup.
 let fRetArr: i32[] = []
@@ -413,6 +418,7 @@ function buildFnMap(stmts: i32[]): i32 {
   fnNames = []
   fnIndices = []
   fRetRef = []
+  fRetStructIdx = []
   fRetArr = []
   fRetStr = []
   fRetUni = []
@@ -424,6 +430,7 @@ function buildFnMap(stmts: i32[]): i32 {
       fnNames.push(s.fnName)
       fnIndices.push(i)
       fRetRef.push(retTRFlag(s.fnRet))
+      fRetStructIdx.push(retStructIndex(s.fnRet))
       fRetArr.push(retArrFlag(s.fnRet))
       fRetStr.push(retStrFlag(s.fnRet))
       fRetUni.push(retUnionFlag(s.fnRet))
@@ -506,6 +513,11 @@ let localNames: string[] = []
 // and identifier resolution consult this so a ref-typed local gets the correct ref
 // valtype, not i32.
 let localIsRef: i32[] = []
+// Parallel to `localNames`: when the i-th local is a STRUCT ref (`localIsRef[i] == 1`),
+// `localStructIdx[i]` is its struct table index (so a field read/write on the local
+// resolves to the right heap type + field layout). For non-struct locals the slot is
+// unused (`-1`). Rebuilt alongside `localNames` by `buildLocals`.
+let localStructIdx: i32[] = []
 
 // ── per-function `.push` scratch locals ──────────────────────────────────────
 // `.push(x)` lowers inline to a grow-if-full + write + len-bump sequence that needs
@@ -544,17 +556,24 @@ let refPushScratchBase: i32 = 0
 let fnUsesStrOp: boolean = false
 let strScratchBase: i32 = 0
 
-// ── struct-type table (one struct per program, i32 fields only) ───────────────
-// This slice supports exactly ONE struct `type` per module; its WasmGC type lives at
-// type index 0 (func types follow at 1..N — see `emitModule`). `sDeclared` is a
-// separate presence flag rather than `sName != ""` because reading the string global
-// in a comparison before its first write would pin it to the `""` literal type and
-// reject a later wider-`string` assignment. `sFields` holds the field names in
-// declaration order — a field's position IS its wasm struct field index. All fields
-// are i32. These are rebuilt per program by `collectS`.
+// ── struct-type table (MULTIPLE structs per program) ──────────────────────────
+// A program may declare MANY struct `type`s. Mirroring the union variant table, the
+// struct table is a FLAT store keyed by struct index (declaration order): struct `i`
+// is named `sNames[i]`, owns the field names `sFieldNames[sFieldStart[i] ..
+// sFieldStart[i] + sFieldCount[i]]` (declaration order = wasm struct field index),
+// with parallel per-field wasm-type codes `sFieldTypes[...]` (`0` = i32, `3` = string
+// — the `pushVT` kind), and its WasmGC struct heap-type index is `sHeapIdx[i]`
+// (resolved in `emitModule`; the structs occupy the first `sNames.length` heap types).
+// `sDeclared` is true when at least one struct is declared. These are rebuilt per
+// program by `collectS`. When a UNION is declared, the union path owns the struct
+// `type`s instead (its variant table) and this table stays empty.
 let sDeclared: boolean = false
-let sName: string = ""
-let sFields: string[] = []
+let sNames: string[] = []
+let sFieldNames: string[] = []
+let sFieldStart: i32[] = []
+let sFieldCount: i32[] = []
+let sFieldTypes: i32[] = []
+let sHeapIdx: i32[] = []
 
 // ── array-type table (the raw `(array (mut i32))` heap type) ──────────────────
 // A single element type — `i32` — so ALL raw arrays share one WasmGC array heap type
@@ -709,7 +728,9 @@ let narrowName: string = ""
 let narrowVariant: string = ""
 
 // Append the declared-local name `name` to `localNames` if not already present.
-function addLocalName(name: string, isRef: i32): i32 {
+// `structIdx` is the local's struct table index when it is a struct ref (`isRef == 1`),
+// else `-1`.
+function addLocalName(name: string, isRef: i32, structIdx: i32): i32 {
   let i = 0
   while i < localNames.length {
     if localNames[i] == name {
@@ -719,6 +740,7 @@ function addLocalName(name: string, isRef: i32): i32 {
   }
   localNames.push(name)
   localIsRef.push(isRef)
+  localStructIdx.push(structIdx)
   0
 }
 
@@ -737,20 +759,20 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
       let s = P.nodes[stmts[i]]
       if s is LetDecl {
         if letIsMap(stmts[i], fnIx) {
-          addLocalName(s.letName, 6)
+          addLocalName(s.letName, 6, 0 - 1)
         } else if letIsRefArray(stmts[i], fnIx) {
-          addLocalName(s.letName, 5)
+          addLocalName(s.letName, 5, 0 - 1)
         } else if letIsUnion(stmts[i], fnIx) {
-          addLocalName(s.letName, 4)
+          addLocalName(s.letName, 4, 0 - 1)
         } else if letIsStruct(stmts[i], fnIx) {
-          addLocalName(s.letName, 1)
+          addLocalName(s.letName, 1, structIndexOfLet(stmts[i], fnIx))
         } else if letIsArray(stmts[i], fnIx) {
-          addLocalName(s.letName, 2)
+          addLocalName(s.letName, 2, 0 - 1)
         } else if letIsString(stmts[i], fnIx) {
-          addLocalName(s.letName, 3)
+          addLocalName(s.letName, 3, 0 - 1)
         } else {
           if checkLocalI32(stmts[i]) < 0 { return 0 - 1 }
-          addLocalName(s.letName, 0)
+          addLocalName(s.letName, 0, 0 - 1)
         }
       } else if s is IfStmt {
         if collectLocals(s.ifThen, fnIx) < 0 { return 0 - 1 }
@@ -845,6 +867,7 @@ function checkExprI32(exprIx: i32): i32 {
 function buildLocals(fnIx: i32): i32 {
   localNames = []
   localIsRef = []
+  localStructIdx = []
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     return collectLocals(fn.fnBody, fnIx)
@@ -1156,12 +1179,61 @@ function binOpcode(op: string): i32 {
 //   BinExpr { binOp: string, binLeft: i32, binRight: i32 }
 //   Call    { callFn: i32, callArgs: i32[] }
 //   Paren   { parInner: i32 }
-// The wasm struct field index of `name` in the declared struct, or -1 if absent.
-function sFieldIndex(name: string): i32 {
+// The wasm struct field index of `name` within struct `si` (declaration order), or
+// -1 if that struct has no such field.
+function sFieldIndex(si: i32, name: string): i32 {
+  let start = sFieldStart[si]
+  let cnt = sFieldCount[si]
+  let j = 0
+  while j < cnt {
+    if sFieldNames[start + j] == name { return j }
+    j = j + 1
+  }
+  0 - 1
+}
+
+// The wasm-type code (`0` i32, `3` string) of struct `si`'s field at field index `fi`.
+function sFieldTypeAt(si: i32, fi: i32): i32 {
+  sFieldTypes[sFieldStart[si] + fi]
+}
+
+// The struct table index whose name is `name`, or -1 if `name` is not a declared
+// struct type.
+function structIndexByName(name: string): i32 {
   let i = 0
-  while i < sFields.length {
-    if sFields[i] == name { return i }
+  while i < sNames.length {
+    if sNames[i] == name { return i }
     i = i + 1
+  }
+  0 - 1
+}
+
+// The struct table index whose field-name SET matches the object literal at `objIx`
+// EXACTLY (same count, every literal field present in the struct), or -1 if no struct
+// matches. With distinct field-name sets across structs this disambiguates which
+// struct an `{ … }` literal constructs (the struct analogue of `objVariantName`).
+function structIndexOfObj(objIx: i32): i32 {
+  let o = P.nodes[objIx]
+  if o is ObjLit {
+    let nf = o.objFields.length
+    let si = 0
+    while si < sNames.length {
+      if sFieldCount[si] == nf {
+        let ok = true
+        let k = 0
+        while k < nf {
+          let f = P.nodes[o.objFields[k]]
+          if f is FieldInit {
+            if sFieldIndex(si, f.fiName) < 0 { ok = false }
+          } else {
+            ok = false
+          }
+          k = k + 1
+        }
+        if ok { return si }
+      }
+      si = si + 1
+    }
   }
   0 - 1
 }
@@ -1184,31 +1256,24 @@ function objFieldVal(objIx: i32, fieldName: string): i32 {
   0 - 1
 }
 
-// Lower an object literal `{ f: v, ... }` onto `body`: push each field's value IN
-// DECLARED FIELD ORDER, then `struct.new $0` (`0xfb 0x00 0x00`). The literal must set
-// exactly the struct's fields (no missing/extra/non-i32 field) — else fails loudly.
+// Lower an object literal `{ f: v, ... }` onto `body`: resolve WHICH struct the
+// literal's field-name set names, push each field's value IN THAT STRUCT'S DECLARED
+// FIELD ORDER, then `struct.new $<heapIdx>` (`0xfb 0x00 <heapIdx>`). The literal must
+// match exactly one struct's fields (no missing/extra field) — else fails loudly.
 function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
   if !sDeclared {
     return emitFail("emitProgram: object literal but no struct type declared")
   }
   let o = P.nodes[objIx]
   if o is ObjLit {
-    if o.objFields.length != sFields.length {
+    let si = structIndexOfObj(objIx)
+    if si < 0 {
       return emitFail("emitProgram: object literal field count does not match struct")
     }
-    let li = 0
-    while li < o.objFields.length {
-      let f = P.nodes[o.objFields[li]]
-      if f is FieldInit {
-        if sFieldIndex(f.fiName) < 0 {
-          return emitFail("emitProgram: object literal has a field not in the struct")
-        }
-      }
-      li = li + 1
-    }
+    let cnt = sFieldCount[si]
     let fi = 0
-    while fi < sFields.length {
-      let valIx = objFieldVal(objIx, sFields[fi])
+    while fi < cnt {
+      let valIx = objFieldVal(objIx, sFieldNames[sFieldStart[si] + fi])
       if valIx < 0 {
         return emitFail("emitProgram: object literal is missing a struct field")
       }
@@ -1220,7 +1285,7 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
     }
     body.push(251)           // 0xfb GC prefix
     body.push(0)             // struct.new
-    body.push(0)             // type index 0
+    appendAll(body, ulebToArr(sHeapIdx[si]))   // this struct's heap-type index
     return 0
   }
   emitFail("emitProgram: expected an object literal")
@@ -1358,18 +1423,19 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   }
   let m = P.nodes[memIx]
   if m is Member {
-    if !exprStruct(m.memObj, fnIx) {
+    let si = structIndexOfExpr(m.memObj, fnIx)
+    if si < 0 {
       return emitFail("emitProgram: field access receiver is not a struct")
     }
-    let idx = sFieldIndex(m.memProp)
+    let idx = sFieldIndex(si, m.memProp)
     if idx < 0 {
       return emitFail("emitProgram: unknown struct field in field access")
     }
     if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
     body.push(251)           // 0xfb GC prefix
     body.push(2)             // struct.get
-    body.push(0)             // type index 0
-    appendAll(body, ulebToArr(idx))   // field index
+    appendAll(body, ulebToArr(sHeapIdx[si]))   // this struct's heap-type index
+    appendAll(body, ulebToArr(idx))            // field index
     return 0
   }
   emitFail("emitProgram: expected a field access")
@@ -3236,10 +3302,11 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       if !sDeclared {
         return emitFail("emitProgram: field assignment but no struct type declared")
       }
-      if !exprStruct(target.memObj, fnIx) {
+      let si = structIndexOfExpr(target.memObj, fnIx)
+      if si < 0 {
         return emitFail("emitProgram: field-assignment receiver is not a struct")
       }
-      let fieldIdx = sFieldIndex(target.memProp)
+      let fieldIdx = sFieldIndex(si, target.memProp)
       if fieldIdx < 0 {
         return emitFail("emitProgram: unknown struct field in field assignment")
       }
@@ -3247,8 +3314,8 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }      // then the value
       body.push(251)         // 0xfb GC prefix
       body.push(5)           // 0x05 struct.set
-      body.push(0)           // type index 0 (the single struct)
-      appendAll(body, ulebToArr(fieldIdx))    // field index
+      appendAll(body, ulebToArr(sHeapIdx[si]))   // this struct's heap-type index
+      appendAll(body, ulebToArr(fieldIdx))       // field index
       return 0
     }
     return emitFail("emitProgram: assignment target is not a simple name")
@@ -3803,7 +3870,7 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     let li = 0
     while li < nLocals {
       body.push(1)
-      pushVT(body, localIsRef[li])
+      pushVT(body, localIsRef[li], localStructIdx[li])
       li = li + 1
     }
     if fnUsesPush {
@@ -3924,6 +3991,18 @@ function retTRFlag(tyIx: i32): i32 {
   0
 }
 
+// The struct table index named by the type-annotation node at `tyIx`, or -1 if it
+// names no declared struct.
+function retStructIndex(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      return structIndexByName(ty.tyName)
+    }
+  }
+  0 - 1
+}
+
 // `1` if the parameter node at `paramIx` is the struct type, else `0`.
 function paramTRFlag(paramIx: i32): i32 {
   let p = P.nodes[paramIx]
@@ -4017,6 +4096,16 @@ function vtKindOfParam(paramIx: i32): i32 {
   0
 }
 
+// The struct table index of the parameter node at `paramIx` (from its annotation), or
+// -1 — feeds `pushVT`'s `kind == 1` struct case for a function param's valtype.
+function paramStructIdxOf(paramIx: i32): i32 {
+  let p = P.nodes[paramIx]
+  if p is Param {
+    return retStructIndex(p.parType)
+  }
+  0 - 1
+}
+
 // The `pushVT` `kind` for a module global from its literal INITIALIZER at `initIx`:
 // `1` struct ref (object literal), `2` list ref (array literal), `3` string ref (string
 // literal), else `0` i32. The global's valtype must match the init's wasm type so the
@@ -4061,10 +4150,10 @@ function refElemHeapType(): i32 {
 // A ref is always non-null (`0x64`), matching binaryen's `(ref $T)` for a value that
 // is statically known to be present (a constructed list / struct / string, never
 // `null`).
-function pushVT(payload: i32[], kind: i32): i32 {
+function pushVT(payload: i32[], kind: i32, structIdx: i32): i32 {
   if kind == 1 {
     payload.push(100)          // 0x64 (ref ht) — non-null ref
-    payload.push(0)            // heap type index 0 (the struct type)
+    appendAll(payload, ulebToArr(sHeapIdx[structIdx]))   // this struct's heap-type index
   } else if kind == 2 {
     payload.push(100)          // 0x64 (ref ht) — non-null ref
     appendAll(payload, ulebToArr(lTypeIdx))   // the list wrapper struct heap-type index
@@ -4109,8 +4198,17 @@ function emitModule(stmts: i32[]): i32 {
   // false when `uDeclared`). When a union is declared, its `nv` variant structs occupy
   // the FIRST `nv` heap-type indices (`uVarIdx = 0`), the union box `{tag, value}`
   // follows at `uBoxIdx = nv`, and any array/list/functypes come after.
-  let structOffset = 0
-  if sDeclared { structOffset = 1 }
+  // The declared structs occupy the FIRST `sNames.length` heap-type indices (0..ns-1),
+  // in declaration order; `sHeapIdx[i] = i`. (A string struct field references the raw
+  // i32 array type at `aTypeIdx`, which lands AFTER the structs — a forward type-index
+  // reference, which the wasm binary format resolves globally across the type section.)
+  let structOffset = sNames.length
+  sHeapIdx = []
+  let shi = 0
+  while shi < sNames.length {
+    sHeapIdx.push(shi)
+    shi = shi + 1
+  }
   let unionOffset = 0
   if uDeclared {
     uVarIdx = 0
@@ -4157,13 +4255,27 @@ function emitModule(stmts: i32[]): i32 {
   let typePayload: i32[] = []
   appendAll(typePayload, ulebToArr(n + typeOffset))   // total type count
   if sDeclared {
-    typePayload.push(95)         // 0x5f struct
-    appendAll(typePayload, ulebToArr(sFields.length))
-    let sf = 0
-    while sf < sFields.length {
-      typePayload.push(127)      // 0x7f i32 storagetype
-      typePayload.push(1)        // mutable
-      sf = sf + 1
+    // One `0x5f` struct per declared type (declaration order = heap-type index),
+    // each a struct of its fields in declaration order. A field is `0x7f` i32
+    // (`sFieldTypes == 0`) or, for a string field (`== 3`), a non-null `(ref
+    // $aTypeIdx)` (`0x64 <aTypeIdx>` — the raw `(array i32)` string rep); both mutable.
+    let si = 0
+    while si < sNames.length {
+      typePayload.push(95)       // 0x5f struct
+      let cnt = sFieldCount[si]
+      appendAll(typePayload, ulebToArr(cnt))
+      let fj = 0
+      while fj < cnt {
+        if sFieldTypeAt(si, fj) == 3 {
+          typePayload.push(100)  // 0x64 (ref ht) — non-null string ref
+          appendAll(typePayload, ulebToArr(aTypeIdx))
+        } else {
+          typePayload.push(127)  // 0x7f i32 storagetype
+        }
+        typePayload.push(1)      // mutable
+        fj = fj + 1
+      }
+      si = si + 1
     }
   }
   if uDeclared {
@@ -4280,11 +4392,11 @@ function emitModule(stmts: i32[]): i32 {
       appendAll(typePayload, ulebToArr(nParams))   // param count
       let pi = 0
       while pi < nParams {
-        pushVT(typePayload, vtKindOfParam(params[pi]))
+        pushVT(typePayload, vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
         pi = pi + 1
       }
       typePayload.push(1)        // 1 result
-      pushVT(typePayload, vtKindOfType(fn.fnRet))
+      pushVT(typePayload, vtKindOfType(fn.fnRet), retStructIndex(fn.fnRet))
     }
     ti = ti + 1
   }
@@ -4319,7 +4431,7 @@ function emitModule(stmts: i32[]): i32 {
         if g.letInit < 0 {
           return emitFail("emitProgram: module global has no initializer")
         }
-        pushVT(globalPayload, globalKind(g.letInit))   // valtype
+        pushVT(globalPayload, globalKind(g.letInit), structIndexOfExpr(g.letInit, 0 - 1))   // valtype
         globalPayload.push(1)                          // 0x01 mutable
         if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
         globalPayload.push(11)                         // 0x0b end of init expr
@@ -4391,9 +4503,9 @@ function emitModule(stmts: i32[]): i32 {
 // records the program's single struct type; the rest decide whether a given
 // expression / param / local PRODUCES the struct (a `(ref $0)`) rather than an i32.
 
-// True if the type-name `name` refers to the declared struct type.
+// True if the type-name `name` refers to one of the declared struct types.
 function isSName(name: string): boolean {
-  sDeclared && name == sName
+  structIndexByName(name) >= 0
 }
 
 // True if the type-name `name` is an ARRAY type — its lexeme ends in `[]` (the
@@ -4430,15 +4542,17 @@ function nameIsMap(name: string): boolean {
   true
 }
 
-// True if the array type-name `name` is a REF-element list — `S[]` over the declared
+// True if the array type-name `name` is a REF-element list — `S[]` over a declared
 // struct, or `N[]` over the declared union alias (the box-ref element). Either lowers
 // to the `{ backing: (ref $raTypeIdx), len, cap }` wrapper over a `(ref null $elem)`
 // backing (G7-ref). A non-`[]` name or an `i32[]` is NOT a ref array. The element name
-// is recovered by string concat — `S[]` IS `sName + "[]"` — avoiding a char-by-char
-// substring (a `string + i32` is a type error; a `string + string` is fine).
+// is recovered by checking each declared struct/union name + `"[]"` (a `string +
+// string` concat; a `string + i32` would be a type error).
 function nameIsRefArray(name: string): boolean {
-  if sDeclared {
-    if name == sName + "[]" { return true }
+  let i = 0
+  while i < sNames.length {
+    if name == sNames[i] + "[]" { return true }
+    i = i + 1
   }
   if uDeclared {
     if name == uName + "[]" { return true }
@@ -4447,7 +4561,7 @@ function nameIsRefArray(name: string): boolean {
 }
 
 // The ref-element kind for an array type-name (assumes `nameIsRefArray(name)`):
-// `1` = a struct element (heap-type 0), `2` = a union-box element (`uBoxIdx`).
+// `1` = a struct element, `2` = a union-box element (`uBoxIdx`).
 function refArrElemKind(name: string): i32 {
   if uDeclared {
     if name == uName + "[]" { return 2 }
@@ -4567,16 +4681,21 @@ function nodeIsTypeDecl(ix: i32): boolean {
   false
 }
 
-// Scan the top-level statements for the program's struct `type` declaration and
-// record its name + i32 field names (declaration order = wasm field index). This
-// slice supports exactly ONE struct type: a second `TypeDecl` fails loudly, as does
-// any non-i32 field. Returns 0 on success, or -1 (via `emitFail`).
+// Scan the top-level statements for EVERY struct `type` declaration and record each
+// into the flat multi-struct table (name + field names in declaration order, plus a
+// per-field wasm-type code: `0` = i32 / boolean, `3` = string). Each `type X = {…}`
+// interns its own WasmGC struct heap type. A field whose type is neither i32/boolean
+// nor string fails loudly. Returns 0 on success, or -1 (via `emitFail`).
 function collectS(stmts: i32[]): i32 {
   sDeclared = false
-  sFields = []
-  // When the program declares a union, every struct `type` is a union variant and
-  // is collected by `collectU` into the multi-struct table instead — so the
-  // single-struct path stays off (and the one-struct cap does not apply).
+  sNames = []
+  sFieldNames = []
+  sFieldStart = []
+  sFieldCount = []
+  sFieldTypes = []
+  // When the program declares a union, every struct `type` is a union variant and is
+  // collected by `collectU` into its own variant table instead — so this struct path
+  // stays off.
   if uDeclared {
     return 0
   }
@@ -4584,12 +4703,11 @@ function collectS(stmts: i32[]): i32 {
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
     if s is TypeDecl {
-      if sDeclared {
-        return emitFail("emitProgram: only one struct type per program is supported")
-      }
-      sName = s.tdName
       sDeclared = true
+      sNames.push(s.tdName)
+      sFieldStart.push(sFieldNames.length)
       let fields = s.tdFields
+      let cnt = 0
       let fi = 0
       while fi < fields.length {
         let fnode = P.nodes[fields[fi]]
@@ -4599,18 +4717,26 @@ function collectS(stmts: i32[]): i32 {
           }
           let ty = P.nodes[fnode.fdType]
           if ty is TypeRef {
-            if ty.tyName != "i32" {
+            if ty.tyName == "i32" {
+              sFieldTypes.push(0)
+            } else if ty.tyName == "boolean" {
+              sFieldTypes.push(0)
+            } else if nameIsString(ty.tyName) {
+              sFieldTypes.push(3)
+            } else {
               return emitFail("emitProgram: only i32 struct fields are supported")
             }
           } else {
             return emitFail("emitProgram: struct field type is not a type name")
           }
-          sFields.push(fnode.fdName)
+          sFieldNames.push(fnode.fdName)
+          cnt = cnt + 1
         } else {
           return emitFail("emitProgram: malformed struct field")
         }
         fi = fi + 1
       }
+      sFieldCount.push(cnt)
     }
     i = i + 1
   }
@@ -4872,6 +4998,114 @@ function letIsStruct(letIx: i32, fnIx: i32): boolean {
     return exprStruct(d.letInit, fnIx)
   }
   false
+}
+
+// ── multi-struct index resolution ─────────────────────────────────────────────
+// Parallel to the boolean `exprStruct` family, these return the STRUCT TABLE INDEX a
+// struct-typed expression / param / local / return produces, so a field read/write
+// can resolve the right heap type + field layout. Return -1 when not a struct.
+
+// The struct table index of the param `name` of function `fnIx` (from its annotation),
+// or -1.
+function paramStructIndex(fnIx: i32, name: string): i32 {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef { return structIndexByName(ty.tyName) }
+          }
+          return 0 - 1
+        }
+      }
+      i = i + 1
+    }
+  }
+  0 - 1
+}
+
+// The struct table index of the declared local `name` (recorded in `localStructIdx`),
+// or -1 if `name` is not a struct local.
+function declaredStructIndex(name: string): i32 {
+  let i = 0
+  while i < localNames.length {
+    if localNames[i] == name {
+      if localIsRef[i] == 1 { return localStructIdx[i] }
+      return 0 - 1
+    }
+    i = i + 1
+  }
+  0 - 1
+}
+
+// The struct table index a function `name` returns (recorded in `fRetStructIdx`), or -1.
+function fnRetStructIndex(name: string): i32 {
+  let i = 0
+  while i < fnNames.length {
+    if fnNames[i] == name { return fRetStructIdx[i] }
+    i = i + 1
+  }
+  0 - 1
+}
+
+// The struct table index of a module global `name` (from its annotation/initializer),
+// or -1.
+function globalStructIndex(name: string): i32 {
+  let li = globalLetOf(name)
+  if li < 0 { return 0 - 1 }
+  structIndexOfLet(li, 0 - 1)
+}
+
+// The struct table index that the expression at `exprIx` produces, or -1 if it is not
+// a struct value. Mirrors `exprStruct`'s cases.
+function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 - 1 }
+  let e = P.nodes[exprIx]
+  if e is ObjLit { return structIndexOfObj(exprIx) }
+  if e is Paren { return structIndexOfExpr(e.parInner, fnIx) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident { return fnRetStructIndex(callee.identName) }
+    return 0 - 1
+  }
+  if e is Ident {
+    let pi = paramStructIndex(fnIx, e.identName)
+    if pi >= 0 { return pi }
+    let di = declaredStructIndex(e.identName)
+    if di >= 0 { return di }
+    return globalStructIndex(e.identName)
+  }
+  // `xs[i]` over a STRUCT-element ref list yields a struct (G7-ref). The ref-list
+  // element is the FIRST declared struct (heap-type via `refElemHeapType`), so its
+  // table index is 0 — the existing single-struct G7-ref behavior.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      if rElemKind == 1 { return 0 }
+    }
+  }
+  0 - 1
+}
+
+// The struct table index a struct-typed `LetDecl` binds: from its annotation if
+// present, else inferred from its initializer. -1 if not a struct local.
+function structIndexOfLet(letIx: i32, fnIx: i32): i32 {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        let si = structIndexByName(lt.tyName)
+        if si >= 0 { return si }
+      }
+    }
+    return structIndexOfExpr(d.letInit, fnIx)
+  }
+  0 - 1
 }
 
 // ── union-typedness of expressions (G1) ───────────────────────────────────────
