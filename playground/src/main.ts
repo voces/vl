@@ -46,6 +46,7 @@ import {
 import { SAMPLES, type Sample } from "./samples.ts";
 import * as lsp from "./lspAdapter.ts";
 import { decodeHash, encodeSource } from "./share.ts";
+import { loadLastSession, saveLastSession } from "./projects.ts";
 import { format } from "../../compiler/format.ts";
 
 const VL_LANGUAGE_ID = "vital";
@@ -772,6 +773,23 @@ const projectFiles = (): Record<string, string> => {
   return out;
 };
 
+// --- last-session persistence ------------------------------------------------
+//
+// "Remember what we did last": persist the LIVE buffer(s) plus which sample they
+// were based on, under a single localStorage key. A refresh/return restores the
+// modified buffers (see the load precedence at the bottom of this file); SWITCHING
+// to another sample loads it FRESH (discarding edits) and overwrites this record.
+
+const persistSession = (): void => {
+  saveLastSession({
+    sampleIndex: activeSample,
+    files: files.map((f) => ({
+      name: f.name,
+      source: models.get(f.name)?.getValue() ?? "",
+    })),
+  });
+};
+
 // --- run ---------------------------------------------------------------------
 //
 // EXECUTION NOTE (roadmap E3): user wasm runs on the MAIN THREAD here, so an
@@ -869,6 +887,7 @@ let autoRun = localStorage.getItem("vl-autorun") === "1";
 let autoTimer: ReturnType<typeof setTimeout> | undefined;
 let diagTimer: ReturnType<typeof setTimeout> | undefined;
 let hashTimer: ReturnType<typeof setTimeout> | undefined;
+let sessionTimer: ReturnType<typeof setTimeout> | undefined;
 
 const setAutoRun = (on: boolean) => {
   autoRun = on;
@@ -898,6 +917,9 @@ const onEdit = () => {
       history.replaceState(null, "", fragment);
     }).catch(() => {/* hash update is best-effort */});
   }, 600);
+
+  if (sessionTimer !== undefined) clearTimeout(sessionTimer);
+  sessionTimer = setTimeout(() => persistSession(), 600);
 
   if (autoRun && compilerReady) {
     setStatus("Editing…", "busy");
@@ -967,6 +989,9 @@ const loadSample = (i: number) => {
   setTab("out");
   refreshDiagnostics();
   setStatus("Ready");
+  // Switching to a sample loads it FRESH (the previous edits are gone) and this
+  // fresh sample becomes the new last session.
+  persistSession();
   encodeSource(models.get(ENTRY_FILE)?.getValue() ?? "").then((fragment) => {
     history.replaceState(null, "", fragment);
   }).catch(() => {});
@@ -1033,22 +1058,43 @@ formatBtn.addEventListener("click", () => {
 
 faddBtn.addEventListener("click", () => addFile());
 
-// --- shareable links on load -------------------------------------------------
+// --- initial buffers on load -------------------------------------------------
 //
-// Decode the URL hash into the initial entry-module source (takes precedence
-// over the default sample's main.vl).
+// Load precedence: URL share hash > last session > default sample 0.
+//   - A share hash reproduces a link's source as the current buffer (entry only,
+//     the share format is single-source) and becomes the new last session.
+//   - Otherwise the last remembered session restores the modified buffers into
+//     the sample context they were based on, so a refresh/return keeps your edits.
+//   - Failing both, the default sample 0 loads fresh.
 const sourceFromHash = await decodeHash(location.hash).catch(() => null);
+const lastSession = sourceFromHash ? null : loadLastSession();
 
 // --- editor instance ---------------------------------------------------------
 
-// Seed the model set from SAMPLES[0] (or the share hash for the entry module).
-const firstSample = SAMPLES[0]!;
-files = firstSample.files.map((f) => ({ name: f.name }));
-for (const f of firstSample.files) {
-  makeModel(f.name, f.name === ENTRY_FILE && sourceFromHash ? sourceFromHash : f.source);
+// Resolve the sample context (which built-in the buffers belong to) and the
+// initial per-file sources, applying the precedence above.
+const baseSample = SAMPLES[lastSession?.sampleIndex ?? 0] ?? SAMPLES[0]!;
+activeSample = lastSession?.sampleIndex ?? 0;
+if (!SAMPLES[activeSample]) activeSample = 0;
+
+if (lastSession) {
+  files = lastSession.files.map((f) => ({ name: f.name }));
+  for (const f of lastSession.files) makeModel(f.name, f.source);
+} else {
+  files = baseSample.files.map((f) => ({ name: f.name }));
+  for (const f of baseSample.files) {
+    makeModel(
+      f.name,
+      f.name === ENTRY_FILE && sourceFromHash ? sourceFromHash : f.source,
+    );
+  }
 }
 activeFile = ENTRY_FILE;
-pickerName.textContent = firstSample.name;
+pickerName.textContent = SAMPLES[activeSample]!.name;
+
+// Persist whatever we loaded so the current buffers are the remembered session
+// (a shared link or a fresh default becomes the new last session).
+persistSession();
 
 const editor = monaco.editor.create(editorHost, {
   model: models.get(ENTRY_FILE)!,

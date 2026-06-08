@@ -325,61 +325,56 @@ const main = async (): Promise<void> => {
     `OK: share round-trip -> hash length ${hash.length}, decoded matches source`,
   );
 
-  // 5. User-project persistence (save / rename / delete + last-session restore).
-  // `projects.ts` touches only `localStorage` (which Deno exposes), so import it
-  // directly — no bundling — like `share.ts`.
-  console.error("\nchecking user-project persistence…");
+  // 5. Last-session persistence ("remember what we did last"). `projects.ts`
+  // touches only `localStorage` (which Deno exposes), so import it directly — no
+  // bundling — like `share.ts`. There is ONE remembered session, not a list.
+  console.error("\nchecking last-session persistence…");
   const proj = await import("./src/projects.ts");
   // Start clean so prior runs don't skew the assertions.
-  for (const p of proj.listProjects()) proj.deleteProject(p.id);
   proj.clearLastSession();
+  if (proj.loadLastSession() !== null) fail("loadLastSession should be null when empty");
 
-  const created = proj.createProject("My First", [
-    { name: "main.vl", source: "print(1)\n" },
-  ]);
-  if (proj.listProjects().length !== 1) fail("createProject did not persist one project");
-  if (!proj.getProject(created.id)) fail("getProject could not find the saved project");
-
-  // Save (update in place) preserves the id but changes the files.
-  const updated = proj.updateProject(created.id, [
-    { name: "main.vl", source: "print(2)\n" },
-  ]);
-  if (!updated || updated.id !== created.id) fail("updateProject changed the id");
-  if (proj.getProject(created.id)!.files[0].source !== "print(2)\n") {
-    fail("updateProject did not persist new file contents");
-  }
-
-  // Rename keeps id + files, changes the name.
-  const renamed = proj.renameProject(created.id, "Renamed");
-  if (!renamed || renamed.name !== "Renamed") fail("renameProject did not rename");
-  if (!proj.nameExists("Renamed")) fail("nameExists did not see the renamed project");
-
-  // Save As (a new project) gets a distinct id and leaves the original intact.
-  const copy = proj.createProject("Renamed copy", proj.getProject(created.id)!.files);
-  if (copy.id === created.id) fail("createProject (Save As) reused an id");
-  if (proj.listProjects().length !== 2) fail("Save As did not add a second project");
-
-  // Last-session round-trip: the open project + its LIVE (unsaved) buffers.
+  // Round-trip: saving the LIVE (modified) buffers and reloading restores them
+  // into the same sample context — a refresh/return keeps your edits.
   proj.saveLastSession({
-    ref: { kind: "user", id: created.id },
-    files: [{ name: "main.vl", source: "print(3) // unsaved edit\n" }],
+    sampleIndex: 1,
+    files: [{ name: "main.vl", source: "print(1) // my modified edit\n" }],
   });
   const restored = proj.loadLastSession();
-  if (!restored || restored.ref.kind !== "user") fail("loadLastSession lost the ref");
-  if (restored!.files[0].source !== "print(3) // unsaved edit\n") {
-    fail("loadLastSession did not restore the live (unsaved) buffer");
+  if (!restored) fail("loadLastSession did not restore the saved session");
+  if (restored!.sampleIndex !== 1) fail("loadLastSession lost the sample index");
+  if (restored!.files[0].source !== "print(1) // my modified edit\n") {
+    fail("loadLastSession did not restore the live (modified) buffer");
   }
 
-  // Delete removes only the target.
-  proj.deleteProject(created.id);
-  if (proj.getProject(created.id)) fail("deleteProject did not remove the project");
-  if (proj.listProjects().length !== 1) fail("deleteProject removed the wrong count");
+  // Switching to another sample loads it FRESH and OVERWRITES the last session —
+  // the previous edits are gone forever. There is no list: a second save replaces
+  // the first.
+  proj.saveLastSession({
+    sampleIndex: 2,
+    files: [{ name: "main.vl", source: "print(2) // a fresh, different sample\n" }],
+  });
+  const afterSwitch = proj.loadLastSession();
+  if (!afterSwitch || afterSwitch.sampleIndex !== 2) {
+    fail("switching samples did not overwrite the last session's index");
+  }
+  if (afterSwitch!.files[0].source !== "print(2) // a fresh, different sample\n") {
+    fail("switching samples did not replace the buffers with the fresh sample");
+  }
+  if (afterSwitch!.files[0].source.includes("my modified edit")) {
+    fail("switching samples should discard the previous edits, but they survived");
+  }
+
+  // A malformed record decodes to null (defensive), not a throw.
+  try {
+    localStorage.setItem("vl-last-session", "{not json");
+  } catch { /* storage may be unavailable; that's fine */ }
+  if (proj.loadLastSession() !== null) fail("malformed session did not decode to null");
 
   // Clean up so a verify run leaves no residue.
-  for (const p of proj.listProjects()) proj.deleteProject(p.id);
   proj.clearLastSession();
   console.error(
-    "OK: persistence -> create/update/rename/save-as/delete + last-session restore",
+    "OK: last-session -> save/restore round-trip + sample-switch overwrite (edits discarded)",
   );
 
   // 6. The full page bundle (main.ts + Monaco) builds with the LSP wiring.
