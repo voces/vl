@@ -1308,18 +1308,38 @@ export const flattenType = (type: VLType): VLType => {
   const flattened = _flattenType(type);
   if (flattened.length === 1 && flattened[0] === type) return type;
 
-  const deduped: VLType[] = [flattened[0]];
-  outer: for (let i = 1; i < flattened.length; i++) {
-    for (let n = 0; n < deduped.length; n++) {
-      // Distinct scalars never subsume one another — keep both as variants.
-      if (distinctScalars(deduped[n], flattened[i])) continue;
-      if (validateType(deduped[n], flattened[i])) continue outer;
-      if (validateType(flattened[i], deduped[n])) {
-        deduped.splice(n, 1, flattened[i]);
-        continue outer;
-      }
+  // Dedup the variants. When EVERY variant is a literal — the common case, e.g. a
+  // large `"a" | "b" | …` union, which the parser folds left-associatively so this
+  // runs once per `|` over a growing accumulator — distinct literals never subsume
+  // one another, so an exact value-key set dedups in O(n) (first-seen order) rather
+  // than the O(n²) pairwise `validateType` scan. That drops a left-folded N-member
+  // literal union from O(n³) to O(n²) to type-check. The pairwise scan still runs
+  // for any union containing a non-literal (where subsumption like `"a" | string →
+  // string` applies); both paths produce identical results for their inputs.
+  let deduped: VLType[];
+  if (flattened.every(isLiteralType)) {
+    deduped = [];
+    const seen = new Set<string>();
+    for (const t of flattened) {
+      const key = `${t.type} ${(t as { value: unknown }).value}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(t);
     }
-    deduped.push(flattened[i]);
+  } else {
+    deduped = [flattened[0]];
+    outer: for (let i = 1; i < flattened.length; i++) {
+      for (let n = 0; n < deduped.length; n++) {
+        // Distinct scalars never subsume one another — keep both as variants.
+        if (distinctScalars(deduped[n], flattened[i])) continue;
+        if (validateType(deduped[n], flattened[i])) continue outer;
+        if (validateType(flattened[i], deduped[n])) {
+          deduped.splice(n, 1, flattened[i]);
+          continue outer;
+        }
+      }
+      deduped.push(flattened[i]);
+    }
   }
 
   if (deduped.length === 1) return deduped[0];
