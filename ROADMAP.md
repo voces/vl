@@ -220,9 +220,12 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
     method-shorthand functions, operator/index-method call desugars. (Trailing comments on `type`
     aliases now stay on their line — #146; functions with a commented expression body now fall back
     to verbatim correctly — #154; trailing comments on bare-body loop headers (`while`/`for`/`for-in`)
-    now stay on the header line — this PR.)
+    now stay on the header line — #165; trailing comments on block closing braces now stay on that
+    line — this PR.)
   - ~~**Trailing comment on bare-body loop header**~~ — `while cond // note` / `for … // note` (bare
     body): comment now stays on the header line, not expelled outside the enclosing function. Shipped.
+  - ~~**Trailing comment on block closing brace**~~ — `} // note` on the closing `}` of `if`/`while`/
+    `for`/`for-in`/function/free-standing blocks now stays on that line. Shipped.
   - **AST type-syntax fidelity gap** — the typechecker fully resolves every type it records (a tiny
     `i32` annotation becomes a giant structural `Object`; `type`-alias bodies and spans are
     discarded). Retain the *as-written* type syntax (or its span) so the AST is lossless for
