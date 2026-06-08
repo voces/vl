@@ -366,10 +366,19 @@ independent).*
     code points, so all three lower INLINE — `+` allocates `len(a)+len(b)` and `array.copy`s both in, `==`/`!=`
     are ELEMENT-WISE value-equality (a length check then a per-code-point loop — NOT ref identity, a correctness
     fix), `.slice` clamps JS-style + `array.copy`s the range — the operators diagnostics (`+`), the lexer
-    keyword tables (`==`), and lexeme extraction (`gSrc.slice`) lean on. Ahead: G8 maps, G9 return/local inference,
-    unions mixing scalars + structs, `!is`/negated guards, non-i32-value element lists, list `pop`/`+`/equality,
-    string `.indexOf`/`.includes`/`.charCodeAt`, and the broader
-    self-host source vocabulary (`for`, `match`, nested arrays/maps). (The fixed-bytes spike that
+    keyword tables (`==`), and lexeme extraction (`gSrc.slice`) lean on. **String-keyed maps `{[string]: i32}`**
+    (G8) now land too — the checker's scope chain (`Map()`, `m[k]=v`, `m.has(k)`, `m[k] ?? -1`) — as a REAL ordered
+    open-addressing HASH MAP (FNV-1a + linear probing + load-factor-1/2 resize), mirroring the host's
+    `compiler/builtins/maps.ts`: a 5-field `{keys, vals, index, count, size}` struct where `keys`/`vals` are the
+    insertion-ordered entry lists (reusing the `{backing,len,cap}` wrapper) and `index` is an i32 hash-slot array.
+    `Map()` allocates an 8-slot index; every op hashes the key + probes to a free-or-matching slot (element-wise `==`);
+    set overwrites-or-appends + links the slot + resizes at load factor 1/2; `m[k] ?? d` / `.has` read the probe.
+    DELETE/tombstones deferred (no delete in the op set). With G8 the **full annotated self-host front end is now
+    emitProgram-compilable** — G9 inference is a NON-GAP
+    (the sources are fully annotated), so next is an **end-to-end self-host-compile attempt** (drive `lexer`+`ast`+
+    `parser`+`typecheck` through `emitProgram` itself). Further ahead (only as the source vocabulary widens): unions
+    mixing scalars + structs, `!is`/negated guards, non-i32-value element lists, list `pop`/`+`/equality, string
+    `.indexOf`/`.includes`/`.charCodeAt`, map iteration/`delete`, and `for`/`match`. (The fixed-bytes spike that
     hand-built two modules without reading `compiler/ast.vl` is retired.)
   - **(b) Grow the `.vl` parser/typecheck subset.** `parseStmt` handles `let`/`const`/`function`/`if`
     (incl. `else if` chains)/`return`/block/expr but **no `while`/`for` statements yet**; widen toward
@@ -392,9 +401,14 @@ independent).*
   → `i32.const 1`/`0`, `CharLit` → `i32.const <code point>`), **logical `&&`/`||`/`!` + the first value-typed
   `if` (G4)** (`&&`/`||` → short-circuit `if` with i32 result-type blocktype `0x7f`, `!` → `i32.eqz`), and
   **string `+`/`==`/`.slice` (G6)** (inline over the `(array i32)` code-point rep: `+` = `array.new_default` +
-  two `array.copy`s, `==`/`!=` = element-wise value-equality NOT ref identity, `.slice` = JS-clamped `array.copy`);
-  ahead are G8 maps, G9 return/local inference, non-i32-value element
-  lists, list `pop`/`+`/equality, string `.indexOf`/`.includes`/`.charCodeAt`, and the wider self-host source vocabulary. Remaining sub-items:
+  two `array.copy`s, `==`/`!=` = element-wise value-equality NOT ref identity, `.slice` = JS-clamped `array.copy`),
+  and **string-keyed maps `{[string]: i32}` (G8)** — a REAL ordered open-addressing hash map (FNV-1a + linear probing +
+  load-factor-1/2 resize, a 5-field `{keys, vals, index, count, size}` struct), superseding the earlier parallel-lists/
+  linear-scan placeholder: `Map()`, `m[k]=v` hash-probe overwrite-or-append + resize, `m[k] ?? d` get-with-default,
+  `.has` → 1/0; delete/tombstones deferred. With G8 the full annotated self-host front end is emitProgram-compilable and
+  **G9 inference is a non-gap** (sources are annotated), so next is an **end-to-end self-host-compile attempt**;
+  further ahead are non-i32-value element lists, list `pop`/`+`/equality, string `.indexOf`/`.includes`/`.charCodeAt`,
+  map iteration/`delete` (the deferred tombstone path), and the wider self-host source vocabulary. Remaining sub-items:
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/selfhost-gaps.md` §H4.1)
