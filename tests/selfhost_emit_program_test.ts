@@ -842,10 +842,13 @@ const CASES: Case[] = [
     },
   },
   {
-    name: "a non-i32 array element type (`string[]`) fails loudly",
+    // A nested array element type that is genuinely unsupported (`i32[][]`) still fails
+    // loudly — the `string[]` element type is now supported (see the G5/G3 string-list
+    // tests below), but an array-of-arrays element has no list type.
+    name: "a nested array element type (`i32[][]`) fails loudly",
     src: [
       "function main(): i32 {",
-      "  let a: string[] = []",
+      "  let a: i32[][] = []",
       "  return 0",
       "}",
       "",
@@ -854,13 +857,10 @@ const CASES: Case[] = [
       const errLine = logs.find((l) => l.startsWith("err: "));
       if (!errLine) {
         throw new Error(
-          `expected an \`err:\` line for the non-i32 array; got ${
+          `expected an \`err:\` line for the nested array; got ${
             JSON.stringify(logs)
           }`,
         );
-      }
-      if (!errLine.includes("i32[] arrays")) {
-        throw new Error(`unexpected emitter error message: ${errLine}`);
       }
     },
   },
@@ -2768,6 +2768,116 @@ const CASES: Case[] = [
       // items starts empty, push {v:5},{v:9} → length 2 + items[1].v (9) = 11.
       const got = await runExport(bytesFromLog(logs), "f");
       if (got !== 11) throw new Error(`f() returned ${got}, expected 11`);
+    },
+  },
+  // ── G5/G3: `string[]` struct / union-variant fields ─────────────────────────
+  // A `string[]` field is a string-ref list — the SAME `{backing,len,cap}` wrapper the
+  // map keys list uses, over a `(ref null $aTypeIdx)` string backing. Construction
+  // assigns the list, a field read yields the wrapper ref (so `.length`, indexing — which
+  // recovers a non-null string for `==` — apply), a field write stores a list ref, and
+  // `.push` of a string appends. This is the `UnionDecl.udVariants: string[]` shape — the
+  // last array-field gap before the front-end arena is fully expressible.
+  {
+    name: "G5: struct with a `string[]` field — construct, read `.length` + an element via `==` => 3",
+    src: [
+      "type Box = { tag: i32, names: string[] }",
+      "function f(): i32 {",
+      "  let b: Box = { tag: 1, names: [\"hi\", \"yo\", \"zz\"] }",
+      "  let n = 0",
+      "  if b.names[1] == \"yo\" { n = 2 }",
+      "  return b.tag + b.names.length - n",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 1 (tag) + 3 (length) - 2 (matched "yo") = 2... recompute: 1 + 3 - 2 = 2.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 2) throw new Error(`f() returned ${got}, expected 2`);
+    },
+  },
+  {
+    name: "G5: construct a struct `string[]` field EMPTY (`{ names: [] }`), read `.length` => 0",
+    src: [
+      "type Box = { names: string[] }",
+      "function f(): i32 {",
+      "  let b: Box = { names: [] }",
+      "  return b.names.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 0) throw new Error(`f() returned ${got}, expected 0`);
+    },
+  },
+  {
+    name: "G5: WRITE a struct `string[]` field then read it back (`b.names = xs` => 1)",
+    src: [
+      "type Box = { names: string[] }",
+      "function f(): i32 {",
+      "  let b: Box = { names: [\"a\"] }",
+      "  let xs: string[] = [\"p\", \"q\", \"r\"]",
+      "  b.names = xs",
+      "  let n = 0",
+      "  if b.names[2] == \"r\" { n = 1 }",
+      "  return n",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 1) throw new Error(`f() returned ${got}, expected 1`);
+    },
+  },
+  {
+    name: "G3: push a string onto a struct `string[]` field, read it back => 2",
+    src: [
+      "type Box = { names: string[] }",
+      "function f(): i32 {",
+      "  let b: Box = { names: [] }",
+      "  b.names.push(\"x\")",
+      "  b.names.push(\"y\")",
+      "  let n = b.names.length",
+      "  if b.names[1] == \"y\" { n = n + 0 } else { n = 0 }",
+      "  return n",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // length 2, names[1] == "y" → 2.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 2) throw new Error(`f() returned ${got}, expected 2`);
+    },
+  },
+  {
+    // The `UnionDecl.udVariants: string[]` shape: a union variant with a `string[]` field.
+    // After `is`-narrowing the variant, the field read recovers the string-list ref
+    // (downcast through the box) so `.length` / indexing / `==` apply.
+    name: "G5: union-variant with a `string[]` field — narrow then read length + element => 4",
+    src: [
+      "type UnionDecl = { udName: string, udVariants: string[] }",
+      "type Other = { v: i32 }",
+      "type Decl = UnionDecl | Other",
+      "function f(d: Decl): i32 {",
+      "  if d is UnionDecl {",
+      "    let n = d.udVariants.length",
+      "    if d.udVariants[0] == \"A\" { n = n + 2 }",
+      "    return n",
+      "  }",
+      "  return 0",
+      "}",
+      "function mk(): Decl {",
+      "  return { udName: \"E\", udVariants: [\"A\", \"B\"] }",
+      "}",
+      "function main(): i32 {",
+      "  return f(mk())",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // length 2 + 2 (udVariants[0] == "A") = 4.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 4) throw new Error(`main() returned ${got}, expected 4`);
     },
   },
 ];

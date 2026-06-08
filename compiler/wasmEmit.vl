@@ -664,6 +664,13 @@ let mUsed: boolean = false
 let mkArrIdx: i32 = 0
 let mkListIdx: i32 = 0
 let mStructIdx: i32 = 0
+// `slUsed` is set by `collectA` when a `string[]` struct/union-variant field appears.
+// A `string[]` reuses the SAME string-ref list types as the map's keys list (the
+// `{ backing: (ref $mkArrIdx), len, cap }` wrapper over a `(ref null $aTypeIdx)`
+// backing) — so the keys backing + wrapper types are emitted whenever `slUsed || mUsed`,
+// while the map STRUCT (`mStructIdx`) stays gated on `mUsed` alone. `string[]` fields
+// thus need no new heap type; they share `mkArrIdx`/`mkListIdx`.
+let slUsed: boolean = false
 
 // The kind an EMPTY `[]` literal constructs, set by the binding site (a `let`/global
 // whose declared type is a ref array `S[]`/`N[]`) just before its initializer is
@@ -763,6 +770,8 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
       if s is LetDecl {
         if letIsMap(stmts[i], fnIx) {
           addLocalName(s.letName, 6, 0 - 1)
+        } else if letIsStringArray(stmts[i], fnIx) {
+          addLocalName(s.letName, 7, 0 - 1)
         } else if letIsRefArray(stmts[i], fnIx) {
           addLocalName(s.letName, 5, 0 - 1)
         } else if letIsUnion(stmts[i], fnIx) {
@@ -1218,6 +1227,9 @@ function pushFieldStorage(out: i32[], code: i32): i32 {
   } else if code == 5 {
     out.push(100)              // 0x64 (ref ht) — non-null ref-list wrapper ref
     appendAll(out, ulebToArr(rlTypeIdx))
+  } else if code == 6 {
+    out.push(100)              // 0x64 (ref ht) — non-null string-list wrapper ref
+    appendAll(out, ulebToArr(mkListIdx))
   } else {
     out.push(127)              // 0x7f i32 storagetype
   }
@@ -1312,8 +1324,11 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
       // way a `let xs: T[] = []` annotation threads `pendingListKind`. The element kind
       // is global (union box `2` when a union is declared, else a struct `1`).
       pendingListKind = 0
-      if sFieldTypeAt(si, fi) == 5 {
+      let scode = sFieldTypeAt(si, fi)
+      if scode == 5 {
         if uDeclared { pendingListKind = 2 } else { pendingListKind = 1 }
+      } else if scode == 6 {
+        pendingListKind = 3
       }
       if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
       pendingListKind = 0
@@ -1341,7 +1356,18 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32): i32 {
     if valIx < 0 {
       return emitFail("emitProgram: object literal is missing a union-variant field")
     }
+    // An empty `[]` literal for a ref-list (code 5) / string-list (code 6) variant field
+    // needs its element kind threaded (the same `pendingListKind` an annotated `let`
+    // uses): a struct/union ref list (1/2) or a string list (3).
+    pendingListKind = 0
+    let vcode = variantFieldTypeAt(vi, fj)
+    if vcode == 5 {
+      if uDeclared { pendingListKind = 2 } else { pendingListKind = 1 }
+    } else if vcode == 6 {
+      pendingListKind = 3
+    }
     if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+    pendingListKind = 0
     fj = fj + 1
   }
   body.push(251)             // 0xfb GC prefix
@@ -1663,8 +1689,36 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
     // element lowers via `emitExpr` (an objlit → struct.new / union box). Otherwise the
     // i32 list path.
     let isRefLit = arrLitIsRef(arrIx)
+    // A `string[]` literal — string ELEMENTS, OR an empty `[]` whose binding/field is a
+    // `string[]` (`pendingListKind == 3`). Its backing is `(ref null $aTypeIdx)` (string
+    // refs) wrapped in the string-list wrapper (`mkListIdx`). Checked before the i32/ref
+    // paths since a string element is neither i32 nor a struct/union ref.
+    let isStrLit = arrLitIsStr(arrIx, fnIx)
     if elems.length == 0 {
-      if pendingListKind != 0 { isRefLit = true }
+      if pendingListKind == 3 { isStrLit = true }
+      else { if pendingListKind != 0 { isRefLit = true } }
+    }
+    if isStrLit {
+      if !slUsed {
+        return emitFail("emitProgram: string array literal but string list type not collected")
+      }
+      let i = 0
+      while i < elems.length {
+        if emitExpr(body, elems[i], fnIx) < 0 { return 0 - 1 }
+        i = i + 1
+      }
+      body.push(251)           // 0xfb GC prefix
+      body.push(8)             // array.new_fixed (builds the string-ref backing)
+      appendAll(body, ulebToArr(mkArrIdx))       // string backing array type index
+      appendAll(body, ulebToArr(elems.length))   // element count
+      body.push(65)            // 0x41 i32.const (len)
+      appendAll(body, slebToArr(elems.length))
+      body.push(65)            // 0x41 i32.const (cap)
+      appendAll(body, slebToArr(elems.length))
+      body.push(251)           // 0xfb GC prefix
+      body.push(0)             // struct.new
+      appendAll(body, ulebToArr(mkListIdx))      // string-list wrapper struct type index
+      return 0
     }
     if isRefLit {
       if !rlUsed {
@@ -2640,6 +2694,25 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32): i32 {
       body.push(212)         // 0xd4 ref.as_non_null (recover the non-null element)
       return 0
     }
+    // A STRING list `xs[i]` → unwrap to its `(ref null $aTypeIdx)` string backing,
+    // `array.get $mkArrIdx`, then `ref.as_non_null` to surface the non-null string ref.
+    // (Checked before the i32 path: a string element is not an i32.)
+    if exprStringArray(nd.idxArr, fnIx) {
+      if !slUsed {
+        return emitFail("emitProgram: string index access but string list type not collected")
+      }
+      if emitExpr(body, nd.idxArr, fnIx) < 0 { return 0 - 1 }
+      body.push(251)         // 0xfb GC prefix
+      body.push(2)           // struct.get (unwrap to backing)
+      appendAll(body, ulebToArr(mkListIdx))  // string-list wrapper struct type index
+      body.push(0)           // field 0: backing
+      if emitExpr(body, nd.idxIndex, fnIx) < 0 { return 0 - 1 }
+      body.push(251)         // 0xfb GC prefix
+      body.push(11)          // 0x0b array.get
+      appendAll(body, ulebToArr(mkArrIdx))   // string backing array type index
+      body.push(212)         // 0xd4 ref.as_non_null (recover the non-null string)
+      return 0
+    }
     if !aUsed {
       return emitFail("emitProgram: index access but array type not collected")
     }
@@ -2679,6 +2752,15 @@ function emitArrLen(body: i32[], memIx: i32, fnIx: i32): i32 {
       body.push(251)         // 0xfb GC prefix
       body.push(2)           // struct.get
       appendAll(body, ulebToArr(rlTypeIdx))  // ref list wrapper struct type index
+      body.push(1)           // field 1: len
+      return 0
+    }
+    // A STRING list's `.length` is its wrapper's `len` field (`struct.get $mkListIdx 1`).
+    if exprStringArray(m.memObj, fnIx) {
+      if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
+      body.push(251)         // 0xfb GC prefix
+      body.push(2)           // struct.get
+      appendAll(body, ulebToArr(mkListIdx)) // string-list wrapper struct type index
       body.push(1)           // field 1: len
       return 0
     }
@@ -3147,7 +3229,7 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // receiver falls through to the struct path (which fails loudly if no such field),
     // matching the slice's scope.
     if e.memProp == "length" {
-      if exprArray(e.memObj, fnIx) || exprString(e.memObj, fnIx) || exprRefArray(e.memObj, fnIx) {
+      if exprArray(e.memObj, fnIx) || exprString(e.memObj, fnIx) || exprRefArray(e.memObj, fnIx) || exprStringArray(e.memObj, fnIx) {
         return emitArrLen(body, exprIx, fnIx)
       }
     }
@@ -4239,6 +4321,9 @@ function pushVT(payload: i32[], kind: i32, structIdx: i32): i32 {
   } else if kind == 6 {
     payload.push(100)          // 0x64 (ref ht) — non-null ref
     appendAll(payload, ulebToArr(mStructIdx)) // the string-keyed MAP struct heap-type index (G8)
+  } else if kind == 7 {
+    payload.push(100)          // 0x64 (ref ht) — non-null ref
+    appendAll(payload, ulebToArr(mkListIdx))  // the STRING-LIST wrapper struct heap-type index
   } else {
     payload.push(127)          // 0x7f i32
   }
@@ -4305,13 +4390,18 @@ function emitModule(stmts: i32[]): i32 {
   if rlUsed { refListOffset = 1 }
   raTypeIdx = preTypes + arrayOffset + listOffset
   rlTypeIdx = preTypes + arrayOffset + listOffset + refArrOffset
-  // The string-keyed MAP types (G8) follow the ref-list types: the keys backing
+  // The string-ref list types follow the ref-list types: the keys backing
   // `(array (mut (ref null $aTypeIdx)))`, then the keys list wrapper `{ backing:
-  // (ref $mkArr), len, cap }`, then the map struct `{ keys, vals }` — each
+  // (ref $mkArr), len, cap }`. These two are shared by the map's keys list AND any
+  // `string[]` field, so they are present when `slUsed || mUsed`. The map STRUCT
+  // `{ keys, vals, … }` follows them and is present only when `mUsed`. Each type
   // REFERENCES an already-emitted earlier type (string array / keys backing /
-  // keys wrapper + i32-list `lTypeIdx`). Each offset is 0 or 1 (`mUsed`).
-  let mapOffset = 0
-  if mUsed { mapOffset = 3 }
+  // keys wrapper + i32-list `lTypeIdx`).
+  let strListOffset = 0
+  if slUsed || mUsed { strListOffset = 2 }
+  let mapStructOffset = 0
+  if mUsed { mapStructOffset = 1 }
+  let mapOffset = strListOffset + mapStructOffset
   let preMap = preTypes + arrayOffset + listOffset + refArrOffset + refListOffset
   mkArrIdx = preMap
   mkListIdx = preMap + 1
@@ -4421,20 +4511,18 @@ function emitModule(stmts: i32[]): i32 {
     typePayload.push(127)        // field 2 cap: 0x7f i32
     typePayload.push(1)          // mutable
   }
-  if mUsed {
-    // G8 map types, in dependency order. (1) the KEYS backing array `(array (mut
-    // (ref null $aTypeIdx)))` — element is a NULLABLE string ref (`0x63 <aTypeIdx>`)
-    // so `array.new_default` defaults spare slots to null; a key read recovers the
-    // non-null string. (2) the KEYS list wrapper `{ backing: (ref $mkArrIdx), len,
-    // cap }` — the same `{backing,len,cap}` triple as the i32 list, over the string
-    // backing. (3) the MAP struct `{ keys: (ref $mkListIdx), vals: (ref $lTypeIdx) }`
-    // — two non-null list refs (keys + the i32 vals list), the i32 `index` hash-slot
-    // array `(ref $aTypeIdx)`, and the `count`/`size` i32 counters.
-    typePayload.push(94)         // 0x5e array (keys backing)
+  if slUsed || mUsed {
+    // The STRING-REF list types, shared by the map's keys list and any `string[]`
+    // field. (1) the backing array `(array (mut (ref null $aTypeIdx)))` — element is a
+    // NULLABLE string ref (`0x63 <aTypeIdx>`) so `array.new_default` defaults spare
+    // slots to null; an element read recovers the non-null string. (2) the list wrapper
+    // `{ backing: (ref $mkArrIdx), len, cap }` — the same `{backing,len,cap}` triple as
+    // the i32 list, over the string backing.
+    typePayload.push(94)         // 0x5e array (keys/string backing)
     typePayload.push(99)         // 0x63 (ref null ht) — nullable string ref
     appendAll(typePayload, ulebToArr(aTypeIdx))
     typePayload.push(1)          // mutable
-    typePayload.push(95)         // 0x5f struct (keys list wrapper)
+    typePayload.push(95)         // 0x5f struct (string-list wrapper)
     typePayload.push(3)          // 3 fields
     typePayload.push(100)        // field 0 backing: 0x64 (ref ht) — non-null
     appendAll(typePayload, ulebToArr(mkArrIdx))
@@ -4443,6 +4531,11 @@ function emitModule(stmts: i32[]): i32 {
     typePayload.push(1)          // mutable
     typePayload.push(127)        // field 2 cap: 0x7f i32
     typePayload.push(1)          // mutable
+  }
+  if mUsed {
+    // The MAP struct `{ keys: (ref $mkListIdx), vals: (ref $lTypeIdx), index, count,
+    // size }` — two non-null list refs (the keys string-list + the i32 vals list), the
+    // i32 `index` hash-slot array `(ref $aTypeIdx)`, and the `count`/`size` counters.
     typePayload.push(95)         // 0x5f struct (map)
     typePayload.push(5)          // 5 fields (open-addressing hash map)
     typePayload.push(100)        // field 0 keys: 0x64 (ref $mkListIdx) — non-null
@@ -4655,6 +4748,13 @@ function nameIsString(name: string): boolean {
   name == "string"
 }
 
+// True if the type-name `name` is exactly `string[]` — a growable list whose elements
+// are string refs. It reuses the map keys list types (the `{backing,len,cap}` wrapper
+// over a `(ref null $aTypeIdx)` string backing); field code `6`.
+function nameIsStringArray(name: string): boolean {
+  name == "string[]"
+}
+
 // The per-field wasm-type code for a struct / union-variant field whose type node is
 // `tyIx` (a `TypeRef`). Mirrors the inline classifier `collectS`/`collectVariantFields`
 // used to use, EXTENDED with array-typed fields (gap #5): a field of array type stores a
@@ -4677,9 +4777,9 @@ function fieldTypeCode(tyIx: i32): i32 {
     if nameIsString(ty.tyName) { return 3 }
     if nameIsArray(ty.tyName) {
       if nameIsI32Array(ty.tyName) { return 4 }
-      // An `X[]` over a non-i32 element. `string[]` has no list type yet → reject.
-      let nm = ty.tyName
-      if nm == "string[]" { return 0 - 1 }
+      // A `string[]` field is a string-ref list (code `6`) — it reuses the map keys
+      // list types (`mkListIdx`/`mkArrIdx`). Any OTHER `X[]` is a struct/union ref list.
+      if nameIsStringArray(ty.tyName) { return 6 }
       return 5
     }
     return 0 - 1
@@ -4713,6 +4813,7 @@ function collectA(stmts: i32[]): i32 {
   rlUsed = false
   rElemKind = 0
   mUsed = false
+  slUsed = false
   let i = 0
   while i < P.nodes.length {
     let nd = P.nodes[i]
@@ -4740,6 +4841,12 @@ function collectA(stmts: i32[]): i32 {
         // and `lUsed` (the vals wrapper) alongside the three dedicated map types.
         mUsed = true
         lUsed = true
+        aUsed = true
+      } else if nameIsStringArray(nd.tyName) {
+        // A `string[]` annotation is a string-ref list — the SAME wrapper/backing as
+        // the map keys list. Force the keys list types (`slUsed`) + the string backing
+        // (`aUsed`, since the elements are `(ref null $aTypeIdx)`).
+        slUsed = true
         aUsed = true
       } else if nameIsRefArray(nd.tyName) {
         // A `S[]`/`N[]` annotation is a ref list (wrapper + `(ref null $elem)` backing).
@@ -4770,6 +4877,19 @@ function arrLitIsRef(arrIx: i32): boolean {
     if a.arrElems.length < 1 { return false }
     let e0 = P.nodes[a.arrElems[0]]
     if e0 is ObjLit { return true }
+  }
+  false
+}
+
+// True if the array literal at `arrIx` has STRING elements — its first element is a
+// string-typed expression (a `"…"` literal, or a string-returning call / string
+// param/local). An empty literal is NOT detectable here; its kind comes from the
+// binding/field annotation (`pendingListKind == 3`).
+function arrLitIsStr(arrIx: i32, fnIx: i32): boolean {
+  let a = P.nodes[arrIx]
+  if a is ArrayLit {
+    if a.arrElems.length < 1 { return false }
+    return exprString(a.arrElems[0], fnIx)
   }
   false
 }
@@ -5551,10 +5671,89 @@ function letAnnRefListKind(letIx: i32): i32 {
       let lt = P.nodes[d.letType]
       if lt is TypeRef {
         if nameIsRefArray(lt.tyName) { return refArrElemKind(lt.tyName) }
+        if nameIsStringArray(lt.tyName) { return 3 }
       }
     }
   }
   0
+}
+
+// ── string-array-typedness of expressions (`string[]`) ────────────────────────
+// Parallel to the ref-array family: decide whether an expression / param / local
+// PRODUCES a string list — a `(ref $mkListIdx)`. Receiver shapes: a `string[]` literal,
+// a `string[]` param/local, a parenthesized string-array, or a `string[]` FIELD read
+// (code `6`). An index read `xs[i]` (a string) / `.length` (i32) is NOT a list.
+
+// True if the parameter `name` of function `fnIx` is a `string[]` type.
+function paramStringArray(fnIx: i32, name: string): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef { return nameIsStringArray(ty.tyName) }
+          }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the already-collected declared local `name` is a string-list ref (code `7`).
+function declaredStringArray(name: string): boolean {
+  let i = 0
+  while i < localNames.length {
+    if localNames[i] == name {
+      return localIsRef[i] == 7
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True if evaluating the expression at `exprIx` yields a string list: a string-element
+// array literal, a `string[]` param/local reference, a parenthesized string-array, or a
+// `string[]` field read (code `6`). An index read / `.length` is NOT a list.
+function exprStringArray(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is ArrayLit { return arrLitIsStr(exprIx, fnIx) }
+  if e is Paren { return exprStringArray(e.parInner, fnIx) }
+  if e is Ident {
+    if paramStringArray(fnIx, e.identName) { return true }
+    return declaredStringArray(e.identName)
+  }
+  // A field read `p.names` whose field is a `string[]` (code `6`) yields the string-list
+  // wrapper ref — so `.length` / indexing / assignment / `.push` treat it as a string list.
+  if e is Member {
+    if memFieldTypeCode(exprIx, fnIx) == 6 { return true }
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` declares a `string[]` local: its annotation is
+// `string[]`, OR its initializer produces a string list. Picks the local's valtype
+// (`(ref $mkListIdx)`) and the code-`7` flag in `collectLocals`.
+function letIsStringArray(letIx: i32, fnIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if nameIsStringArray(lt.tyName) { return true }
+      }
+    }
+    return exprStringArray(d.letInit, fnIx)
+  }
+  false
 }
 
 // ── map-typedness of expressions (G8: `{[string]: i32}`) ──────────────────────
