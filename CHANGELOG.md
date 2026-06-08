@@ -49,6 +49,7 @@ see **`DECISIONS.md`**.
 - **B17 Export-aware top-level unused** — exported top-level bindings exempt from unused-variable lint; landed with `export` keyword (H0 phase 1).
 - **B19 `return` / early returns** — early, from loops, fall-through; bare `return` yields null.
 - **B-debug Name section + source maps + trap-to-source** — wasm name section + Source Map v3 (binaryen debug locations, survives `optimize()`); trap → precise VL `file:L:C` error message. (#76)
+- **B regression guard — unused-param inline call** — pinned `print(ignore(42))` (callee's parameter never read): the TS host (`toWasm.ts`) passes a null env + the plain argument and the module validates; argument is NOT mis-boxed into a closure-env struct. (`tests/cases/functions/unused-param-inline-call.vl`)
 
 ## CLI (Track C)
 
