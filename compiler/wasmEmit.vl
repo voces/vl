@@ -4837,12 +4837,16 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     // The G8 map frame: 12 slots (see the map scratch layout / the probe + rehash).
     if fnUsesMap { nRuns = nRuns + 12 }
     appendAll(body, ulebToArr(nRuns))
+    // Bind the writer at `body` so `fbValtype` streams each declared local's
+    // valtype here, interleaved with the surrounding raw `body.push(1)` run counts.
+    let lvPrev = wTarget(body)
     let li = 0
     while li < nLocals {
       body.push(1)
-      pushVT(body, localIsRef[li], localStructIdx[li])
+      fbValtype(localIsRef[li], localStructIdx[li])
       li = li + 1
     }
+    wTarget(lvPrev)
     if fnUsesPush {
       body.push(1)
       body.push(127)         // pushVal: 0x7f i32
@@ -5201,44 +5205,51 @@ function refElemHeapType(): i32 {
   0
 }
 
-// Push a wasm value type onto `payload`. The `kind` tag selects the encoding:
-//   1 → struct ref `(ref $0)` (`0x64 0x00`, non-null ref to the struct type, index 0)
-//   2 → list  ref `(ref $lTypeIdx)` (`0x64 <lTypeIdx>`, the growable `i32[]` wrapper
-//       struct `{ backing, len, cap }` — NOT the raw array; an `i32[]` value IS that
-//       wrapper)
-//   3 → string ref `(ref $aTypeIdx)` — the RAW `(array (mut i32))` of code points, since
-//       a VL string stays the fixed array rep (`docs/strings-design.md`)
-//   else → i32 (`0x7f`)
-// A ref is always non-null (`0x64`), matching binaryen's `(ref $T)` for a value that
-// is statically known to be present (a constructed list / struct / string, never
-// `null`).
-function pushVT(payload: i32[], kind: i32, structIdx: i32): i32 {
+// ── valtype emission (Phase G — was `pushVT`) ─────────────────────────────────
+// Write a wasm value type onto the CURRENT buffer (`curBuf`). The `kind` tag
+// selects the encoding (the valtype ladder formerly in `pushVT`):
+//   0    → i32 (`0x7f`)
+//   1    → struct ref `(ref $sHeapIdx[structIdx])` — a standalone struct
+//   2    → i32-list ref `(ref $lTypeIdx)` (the growable `i32[]` wrapper struct)
+//   3    → string ref `(ref $aTypeIdx)` — the raw `(array (mut i32))` of code points
+//   4    → union-box ref `(ref $uBoxIdx)` — the `{tag, value}` box
+//   5    → ref-list ref `(ref $rlTypeIdx)` — the ref-element list wrapper
+//   6    → map ref `(ref $mStructIdx)` — the string-keyed map struct
+//   7    → string-list ref `(ref $mkListIdx)` — the string-list wrapper
+//   8    → concrete union-variant ref `(ref $uVarIdx+structIdx)` (gap #2)
+// A ref is always non-null (`0x64`), matching binaryen's `(ref $T)` for a value
+// statically known present (a constructed list / struct / string, never `null`).
+// The kind→heap-index resolution reads the interned indices (`sHeapIdx`/`lTypeIdx`/
+// `aTypeIdx`/… — assigned by `emitModule`'s type-index pass). Replaces `pushVT`;
+// callers `wTarget(buf)` the destination buffer first (the writer streams to
+// `curBuf`), matching every other `fb*` method.
+function fbValtype(kind: i32, structIdx: i32): i32 {
   if kind == 1 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(sHeapIdx[structIdx]))   // this struct's heap-type index
+    wU8(100)             // 0x64 (ref ht) — non-null ref
+    wULEB(sHeapIdx[structIdx])   // this struct's heap-type index
   } else if kind == 2 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(lTypeIdx))   // the list wrapper struct heap-type index
+    wU8(100)
+    wULEB(lTypeIdx)      // the i32-list wrapper struct heap-type index
   } else if kind == 3 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(aTypeIdx))   // the raw i32 array heap-type index (string)
+    wU8(100)
+    wULEB(aTypeIdx)      // the raw i32 array heap-type index (string)
   } else if kind == 4 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(uBoxIdx))    // the union box `{tag, value}` heap-type index
+    wU8(100)
+    wULEB(uBoxIdx)       // the union box `{tag, value}` heap-type index
   } else if kind == 5 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(rlTypeIdx))  // the REF-list wrapper struct heap-type index
+    wU8(100)
+    wULEB(rlTypeIdx)     // the REF-list wrapper struct heap-type index
   } else if kind == 6 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(mStructIdx)) // the string-keyed MAP struct heap-type index (G8)
+    wU8(100)
+    wULEB(mStructIdx)    // the string-keyed MAP struct heap-type index (G8)
   } else if kind == 7 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(mkListIdx))  // the STRING-LIST wrapper struct heap-type index
+    wU8(100)
+    wULEB(mkListIdx)     // the STRING-LIST wrapper struct heap-type index
   } else if kind == 8 {
-    payload.push(100)          // 0x64 (ref ht) — non-null ref
-    appendAll(payload, ulebToArr(uVarIdx + structIdx)) // the CONCRETE union-variant struct heap-type index (gap #2)
+    wU8(100)
+    wULEB(uVarIdx + structIdx)   // the CONCRETE union-variant struct heap-type index (gap #2)
   } else {
-    payload.push(127)          // 0x7f i32
+    wU8(127)             // 0x7f i32
   }
   0
 }
@@ -5488,6 +5499,10 @@ function emitModule(stmts: i32[]): i32 {
     typePayload.push(127)        // field 4 size: 0x7f i32
     typePayload.push(1)          // mutable
   }
+  // Bind the writer at `typePayload` so `fbValtype` (which streams to `curBuf`)
+  // writes the functype param/result valtypes here, interleaved identically with
+  // the surrounding raw `typePayload.push(...)` framing bytes.
+  let tyPrev = wTarget(typePayload)
   let ti = 0
   while ti < n {
     let fn = P.nodes[fnStmts[ti]]
@@ -5498,14 +5513,15 @@ function emitModule(stmts: i32[]): i32 {
       appendAll(typePayload, ulebToArr(nParams))   // param count
       let pi = 0
       while pi < nParams {
-        pushVT(typePayload, vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
+        fbValtype(vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
         pi = pi + 1
       }
       typePayload.push(1)        // 1 result
-      pushVT(typePayload, vtKindOfType(fn.fnRet), retStructIndex(fn.fnRet))
+      fbValtype(vtKindOfType(fn.fnRet), retStructIndex(fn.fnRet))
     }
     ti = ti + 1
   }
+  wTarget(tyPrev)
   wSection(1, typePayload)
 
   // Function section (id 3): N functions; func i uses functype `typeOffset + i`.
@@ -5539,11 +5555,12 @@ function emitModule(stmts: i32[]): i32 {
         if g.letInit < 0 {
           return emitFail("emitProgram: module global has no initializer")
         }
-        pushVT(globalPayload, globalKind(g.letInit), structIndexOfExpr(g.letInit, 0 - 1))   // valtype
-        globalPayload.push(1)                          // 0x01 mutable
-        // Bind the writer at `globalPayload` so the init constexpr's `fb*` opcodes
-        // (i32.const, struct.new, …) write here, not the (default) module buffer.
+        // Bind the writer at `globalPayload` so the valtype (`fbValtype`) and the
+        // init constexpr's `fb*` opcodes (i32.const, struct.new, …) write here, not
+        // the (default) module buffer.
         let gPrev = wTarget(globalPayload)
+        fbValtype(globalKind(g.letInit), structIndexOfExpr(g.letInit, 0 - 1))   // valtype
+        globalPayload.push(1)                          // 0x01 mutable
         if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
         fbEnd()                                         // 0x0b end of init expr
         wTarget(gPrev)
