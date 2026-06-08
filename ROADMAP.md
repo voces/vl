@@ -366,10 +366,17 @@ independent).*
     code points, so all three lower INLINE — `+` allocates `len(a)+len(b)` and `array.copy`s both in, `==`/`!=`
     are ELEMENT-WISE value-equality (a length check then a per-code-point loop — NOT ref identity, a correctness
     fix), `.slice` clamps JS-style + `array.copy`s the range — the operators diagnostics (`+`), the lexer
-    keyword tables (`==`), and lexeme extraction (`gSrc.slice`) lean on. Ahead: G8 maps, G9 return/local inference,
-    unions mixing scalars + structs, `!is`/negated guards, non-i32-value element lists, list `pop`/`+`/equality,
-    string `.indexOf`/`.includes`/`.charCodeAt`, and the broader
-    self-host source vocabulary (`for`, `match`, nested arrays/maps). (The fixed-bytes spike that
+    keyword tables (`==`), and lexeme extraction (`gSrc.slice`) lean on. **String-keyed maps `{[string]: i32}`**
+    (G8) now land too — the checker's scope chain (`Map()`, `m[k]=v`, `m.has(k)`, `m[k] ?? -1`) — as the SIMPLEST
+    correct rep, NOT a hash map: two PARALLEL growable lists + LINEAR SCAN (a `{keys, vals}` struct reusing the
+    `{backing,len,cap}` wrapper twice — a string-ref keys list + the i32 vals list — with element-wise string `==`,
+    NO hashing/probing/new primitives). `Map()` builds two empty lists; set scans + overwrites-or-appends; `m[k] ?? d`
+    is a fused scan-then-value-or-default; `.has` scans → 1/0; absent-key semantics match the checker's `?? -1`-guarded
+    reads. With G8 the **full annotated self-host front end is now emitProgram-compilable** — G9 inference is a NON-GAP
+    (the sources are fully annotated), so next is an **end-to-end self-host-compile attempt** (drive `lexer`+`ast`+
+    `parser`+`typecheck` through `emitProgram` itself). Further ahead (only as the source vocabulary widens): unions
+    mixing scalars + structs, `!is`/negated guards, non-i32-value element lists, list `pop`/`+`/equality, string
+    `.indexOf`/`.includes`/`.charCodeAt`, map iteration/`delete`, and `for`/`match`. (The fixed-bytes spike that
     hand-built two modules without reading `compiler/ast.vl` is retired.)
   - **(b) Grow the `.vl` parser/typecheck subset.** `parseStmt` handles `let`/`const`/`function`/`if`
     (incl. `else if` chains)/`return`/block/expr but **no `while`/`for` statements yet**; widen toward
@@ -392,9 +399,13 @@ independent).*
   → `i32.const 1`/`0`, `CharLit` → `i32.const <code point>`), **logical `&&`/`||`/`!` + the first value-typed
   `if` (G4)** (`&&`/`||` → short-circuit `if` with i32 result-type blocktype `0x7f`, `!` → `i32.eqz`), and
   **string `+`/`==`/`.slice` (G6)** (inline over the `(array i32)` code-point rep: `+` = `array.new_default` +
-  two `array.copy`s, `==`/`!=` = element-wise value-equality NOT ref identity, `.slice` = JS-clamped `array.copy`);
-  ahead are G8 maps, G9 return/local inference, non-i32-value element
-  lists, list `pop`/`+`/equality, string `.indexOf`/`.includes`/`.charCodeAt`, and the wider self-host source vocabulary. Remaining sub-items:
+  two `array.copy`s, `==`/`!=` = element-wise value-equality NOT ref identity, `.slice` = JS-clamped `array.copy`),
+  and **string-keyed maps `{[string]: i32}` (G8)** (the SIMPLEST correct rep — two parallel `{backing,len,cap}` lists
+  + linear scan via element-wise string `==`, NOT a hash map: `Map()`, `m[k]=v` overwrite-or-append, `m[k] ?? d`
+  fused get-with-default, `.has` → 1/0). With G8 the full annotated self-host front end is emitProgram-compilable and
+  **G9 inference is a non-gap** (sources are annotated), so next is an **end-to-end self-host-compile attempt**;
+  further ahead are non-i32-value element lists, list `pop`/`+`/equality, string `.indexOf`/`.includes`/`.charCodeAt`,
+  map iteration/`delete`, and the wider self-host source vocabulary. Remaining sub-items:
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/selfhost-gaps.md` §H4.1)

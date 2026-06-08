@@ -1921,6 +1921,118 @@ const CASES: Case[] = [
       if (r3 !== 1) throw new Error(`f(1,0,0) returned ${r3}, expected 1`);
     },
   },
+  {
+    name: "G8: empty map, set then get (`m[\"a\"]=1; m[\"a\"] ?? -1` => 1)",
+    src: [
+      "function main(): i32 {",
+      "  let m: {[string]: i32} = Map()",
+      '  m["a"] = 1',
+      '  return m["a"] ?? -1',
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    name: "G8: two distinct keys both round-trip (`a`=>1, `b`=>2, sum => 3)",
+    src: [
+      "function main(): i32 {",
+      "  let m: {[string]: i32} = Map()",
+      '  m["a"] = 1',
+      '  m["b"] = 2',
+      '  let x = m["a"] ?? -1',
+      '  let y = m["b"] ?? -1',
+      "  return x + y",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
+  {
+    name: "G8: overwriting a key updates in place (`m[\"a\"]=1; m[\"a\"]=2` => 2)",
+    src: [
+      "function main(): i32 {",
+      "  let m: {[string]: i32} = Map()",
+      '  m["a"] = 1',
+      '  m["a"] = 2',
+      '  return m["a"] ?? -1',
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 2) throw new Error(`main() returned ${got}, expected 2`);
+    },
+  },
+  {
+    name: "G8: a missing key falls back to the `??` default (`m[\"z\"] ?? 99` => 99)",
+    src: [
+      "function main(): i32 {",
+      "  let m: {[string]: i32} = Map()",
+      '  m["a"] = 1',
+      '  return m["z"] ?? 99',
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 99) throw new Error(`main() returned ${got}, expected 99`);
+    },
+  },
+  {
+    name: "G8: `.has(k)` is 1 for a present key and 0 for an absent one",
+    src: [
+      "function present(): i32 {",
+      "  let m: {[string]: i32} = Map()",
+      '  m["a"] = 5',
+      '  if m.has("a") { return 1 }',
+      "  return 0",
+      "}",
+      "function absent(): i32 {",
+      "  let m: {[string]: i32} = Map()",
+      '  m["a"] = 5',
+      '  if m.has("b") { return 1 }',
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const p = await runExport(bytes, "present");
+      if (p !== 1) throw new Error(`present() returned ${p}, expected 1`);
+      const a = await runExport(bytes, "absent");
+      if (a !== 0) throw new Error(`absent() returned ${a}, expected 0`);
+    },
+  },
+  {
+    name:
+      "G8: scope-chain pattern — several string->i32 bindings, set then looked up via has+get",
+    src: [
+      // Mirrors `typecheck.vl`'s scope map: declare bindings, then look one up the way",
+      // `lookup` does — `if m.has(name) { return m[name] ?? -1 }`.
+      "function lookup(): i32 {",
+      "  let m: {[string]: i32} = Map()",
+      '  m["x"] = 10',
+      '  m["y"] = 20',
+      '  m["z"] = 30',
+      '  m["y"] = 25',
+      '  if m.has("y") { return m["y"] ?? -1 }',
+      "  return -1",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // x,y,z bound; y overwritten 20→25; has("y") true → m["y"] = 25.
+      const got = await runExport(bytesFromLog(logs), "lookup");
+      if (got !== 25) throw new Error(`lookup() returned ${got}, expected 25`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the

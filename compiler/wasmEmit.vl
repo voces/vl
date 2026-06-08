@@ -617,6 +617,29 @@ let raTypeIdx: i32 = 0
 let rlTypeIdx: i32 = 0
 let rElemKind: i32 = 0
 
+// ── string-keyed map table (G8: `{[string]: i32}` via parallel lists) ─────────
+// A string-keyed map `{[string]: i32}` lowers to the SIMPLEST correct rep — two
+// PARALLEL growable lists + linear scan (NO hashing/probing): a 2-field WasmGC
+// struct `MAP = { keys: (ref $mkList), vals: (ref $lTypeIdx) }` where
+//   • `keys` is a growable list of STRING refs — the wrapper `{ backing: (ref
+//     $mkArr), len, cap }` over a backing `(array (mut (ref null $aTypeIdx)))`
+//     (a string IS the raw `(array i32)` at `aTypeIdx`, so a keys element is a
+//     nullable ref to that array); its wrapper heap-type index is `mkListIdx`,
+//     its backing `mkArrIdx`.
+//   • `vals` is the EXISTING growable i32 list (`lTypeIdx` over `aTypeIdx`) — a
+//     map's value type in the self-host checker is always `i32` (a type-arena
+//     index), so the value list reuses the i32-list machinery unchanged.
+// The map struct's heap-type index is `mStructIdx`. Operations are O(n) linear
+// scans over `keys` (string `==`, the G6 element-wise compare): set overwrites
+// `vals[i]` on a hit else appends to both lists; get/`??` returns `vals[i]` or
+// the default; `.has`/`in` returns 1/0. The checker's scopes are small, so the
+// scan is correct and fast enough. A map forces `aUsed`+`lUsed` (the vals list +
+// the string backing) plus these three dedicated types.
+let mUsed: boolean = false
+let mkArrIdx: i32 = 0
+let mkListIdx: i32 = 0
+let mStructIdx: i32 = 0
+
 // The kind an EMPTY `[]` literal constructs, set by the binding site (a `let`/global
 // whose declared type is a ref array `S[]`/`N[]`) just before its initializer is
 // lowered: `0` = i32 list (the default), `1` = struct-ref list, `2` = union-ref list.
@@ -707,7 +730,9 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
     while i < stmts.length {
       let s = P.nodes[stmts[i]]
       if s is LetDecl {
-        if letIsRefArray(stmts[i], fnIx) {
+        if letIsMap(stmts[i], fnIx) {
+          addLocalName(s.letName, 6)
+        } else if letIsRefArray(stmts[i], fnIx) {
           addLocalName(s.letName, 5)
         } else if letIsUnion(stmts[i], fnIx) {
           addLocalName(s.letName, 4)
@@ -1587,6 +1612,634 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected an array literal")
 }
 
+// ── G8: string-keyed maps (`{[string]: i32}`) via parallel lists + linear scan ─
+// A map is `MAP = { keys: (ref $mkListIdx), vals: (ref $lTypeIdx) }`: a string-keys
+// list + an i32-vals list, kept PARALLEL (entry `i` is `keys[i] -> vals[i]`). Every
+// operation is an O(n) linear scan over `keys` with the G6 ELEMENT-WISE string `==`
+// — NO hashing, NO probing. A function that touches a map reserves a small scratch
+// frame (`mapScratchBase` + 0..5):
+//   +0 mapRef  : (ref $mStructIdx)  — the map value
+//   +1 keyRef  : (ref $aTypeIdx)    — the target key string
+//   +2 curRef  : (ref $aTypeIdx)    — the current scanned key string
+//   +3 idx     : i32                — scan cursor
+//   +4 cnt     : i32                — keys.len (scan bound)
+//   +5 hit     : i32                — found index (-1 if absent)
+// The scan leaves `hit` = the matching entry index, or -1. Built once and reused by
+// set / get / `??` / `.has`.
+
+let fnUsesMap: boolean = false
+let mapScratchBase: i32 = 0
+
+// True if function `fnIx` operates on a map — it has a map PARAM, or `buildLocals`
+// flagged a map LOCAL (code `6`). Drives the map scratch-frame reservation. (Run
+// AFTER `buildLocals`, so `localIsRef` is populated.)
+function fnHasMap(fnIx: i32): boolean {
+  let i = 0
+  while i < localNames.length {
+    if localIsRef[i] == 6 { return true }
+    i = i + 1
+  }
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let pj = 0
+    while pj < params.length {
+      let p = P.nodes[params[pj]]
+      if p is Param {
+        if p.parType >= 0 {
+          let ty = P.nodes[p.parType]
+          if ty is TypeRef {
+            if nameIsMap(ty.tyName) { return true }
+          }
+        }
+      }
+      pj = pj + 1
+    }
+  }
+  false
+}
+
+// `local.get` of map scratch slot `n`.
+function pushMapScr(body: i32[], n: i32): i32 {
+  body.push(32)              // 0x20 local.get
+  appendAll(body, ulebToArr(mapScratchBase + n))
+  0
+}
+
+// `local.set` of map scratch slot `n`.
+function setMapScr(body: i32[], n: i32): i32 {
+  body.push(33)              // 0x21 local.set
+  appendAll(body, ulebToArr(mapScratchBase + n))
+  0
+}
+
+// `M.keys` (the keys list wrapper ref): `local.get mapRef ; struct.get $mStructIdx 0`.
+function pushMapKeys(body: i32[]): i32 {
+  pushMapScr(body, 0)
+  body.push(251)             // 0xfb
+  body.push(2)               // struct.get
+  appendAll(body, ulebToArr(mStructIdx))
+  body.push(0)               // field 0: keys
+  0
+}
+
+// `M.vals` (the i32 vals list wrapper ref): `local.get mapRef ; struct.get $mStructIdx 1`.
+function pushMapVals(body: i32[]): i32 {
+  pushMapScr(body, 0)
+  body.push(251)             // 0xfb
+  body.push(2)               // struct.get
+  appendAll(body, ulebToArr(mStructIdx))
+  body.push(1)               // field 1: vals
+  0
+}
+
+// Element-wise string equality of the two refs in map scratch slots `aSlot`/`bSlot`,
+// leaving a 0/1 on the stack. A SELF-CONTAINED port of `emitStrEq`'s compare core
+// (no operands consumed; reads the two scratch string locals directly) so the map
+// scan can compare a stored key against the target key WITHOUT the str-op frame.
+function emitMapKeyEq(body: i32[], aSlot: i32, bSlot: i32): i32 {
+  // block i32 { ... } — yields the 0/1 result.
+  body.push(2)               // 0x02 block
+  body.push(127)             // 0x7f i32 blocktype
+  // if len(A) != len(B) { push 0 ; br 1 }
+  pushMapScr(body, aSlot)
+  body.push(251)
+  body.push(15)              // array.len(A)
+  pushMapScr(body, bSlot)
+  body.push(251)
+  body.push(15)              // array.len(B)
+  body.push(71)              // 0x47 i32.ne
+  body.push(4)               // 0x04 if
+  body.push(64)              // 0x40 void blocktype
+  body.push(65)              // i32.const 0
+  appendAll(body, slebToArr(0))
+  body.push(12)              // 0x0c br
+  body.push(1)               // depth 1 → out of the i32 block
+  body.push(11)              // 0x0b end (if)
+  // I = 0  (slot 8, the dedicated char cursor — distinct from the OUTER scan's `idx`
+  // in slot 3, which must survive across the key compare to set `hit = idx`)
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  setMapScr(body, 8)
+  // loop { if I >= len(A) {} else { A[I] != B[I] ? 0,br : I++ , br loop } }
+  body.push(3)               // 0x03 loop
+  body.push(64)              // 0x40 void blocktype
+  pushMapScr(body, 8)        // I
+  pushMapScr(body, aSlot)
+  body.push(251)
+  body.push(15)              // array.len(A)
+  body.push(78)              // 0x4e i32.ge_s  (I >= len → done)
+  body.push(4)               // 0x04 if
+  body.push(64)              // void
+  // then: done (empty)
+  body.push(5)               // 0x05 else
+  // A[I] != B[I] ?
+  pushMapScr(body, aSlot)
+  pushMapScr(body, 8)
+  body.push(251)
+  body.push(11)              // array.get
+  appendAll(body, ulebToArr(aTypeIdx))
+  pushMapScr(body, bSlot)
+  pushMapScr(body, 8)
+  body.push(251)
+  body.push(11)              // array.get
+  appendAll(body, ulebToArr(aTypeIdx))
+  body.push(71)              // 0x47 i32.ne
+  body.push(4)               // 0x04 if  (mismatch → 0, exit block)
+  body.push(64)              // void
+  body.push(65)              // i32.const 0
+  appendAll(body, slebToArr(0))
+  body.push(12)              // 0x0c br
+  body.push(3)               // depth 3 → out of: if(0)·else(1)·loop(2)·block(3)
+  body.push(11)              // 0x0b end (mismatch if)
+  // I = I + 1
+  pushMapScr(body, 8)
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add
+  setMapScr(body, 8)
+  body.push(12)              // 0x0c br
+  body.push(1)               // depth 1 → loop header
+  body.push(11)              // 0x0b end (ge_s if)
+  body.push(11)              // 0x0b end (loop)
+  // All chars matched → 1.
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(11)              // 0x0b end (block)
+  0
+}
+
+// Emit the linear SCAN: with `mapRef` (slot 0) and the target `keyRef` (slot 1)
+// already set, walk `keys[0..len)`, comparing each with `keyRef`; leave `hit` (slot
+// 5) = the matching entry index, or -1 if no key matched. The shared core of get /
+// set / `.has`.
+function emitMapScan(body: i32[]): i32 {
+  // hit = -1
+  body.push(65)
+  appendAll(body, slebToArr(0 - 1))
+  setMapScr(body, 5)
+  // cnt = keys.len
+  pushMapKeys(body)
+  body.push(251)
+  body.push(2)               // struct.get
+  appendAll(body, ulebToArr(mkListIdx))
+  body.push(1)               // field 1: len
+  setMapScr(body, 4)
+  // idx = 0
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  setMapScr(body, 3)
+  // loop { if idx >= cnt {} else { if hit < 0 { curRef = keys[idx]; if eq { hit=idx } } ; idx++; br } }
+  body.push(3)               // 0x03 loop
+  body.push(64)              // void
+  pushMapScr(body, 3)        // idx
+  pushMapScr(body, 4)        // cnt
+  body.push(78)              // i32.ge_s (idx >= cnt → done)
+  body.push(4)               // if
+  body.push(64)              // void
+  // then: done (empty)
+  body.push(5)               // else
+  // if hit < 0 { ... }  — stop comparing once found (first match wins)
+  pushMapScr(body, 5)
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  body.push(72)              // 0x48 i32.lt_s (hit < 0)
+  body.push(4)               // if
+  body.push(64)              // void
+  // curRef = keys.backing[idx]  (ref.as_non_null — slot is populated in [0,len))
+  pushMapKeys(body)
+  body.push(251)
+  body.push(2)               // struct.get (keys backing)
+  appendAll(body, ulebToArr(mkListIdx))
+  body.push(0)               // field 0: backing
+  pushMapScr(body, 3)        // idx
+  body.push(251)
+  body.push(11)              // array.get
+  appendAll(body, ulebToArr(mkArrIdx))
+  body.push(212)             // 0xd4 ref.as_non_null
+  setMapScr(body, 2)         // curRef
+  // if keyEq(curRef, keyRef) { hit = idx }
+  if emitMapKeyEq(body, 2, 1) < 0 { return 0 - 1 }
+  body.push(4)               // if
+  body.push(64)              // void
+  pushMapScr(body, 3)        // idx
+  setMapScr(body, 5)         // hit = idx
+  body.push(11)              // end (eq if)
+  body.push(11)              // end (hit<0 if)
+  // idx = idx + 1
+  pushMapScr(body, 3)
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add
+  setMapScr(body, 3)
+  body.push(12)              // br
+  body.push(1)               // → loop header
+  body.push(11)              // end (ge_s if)
+  body.push(11)              // end (loop)
+  0
+}
+
+// Construct an EMPTY map `Map()` onto `body`: two empty lists (each `array.new_fixed`
+// count 0, wrapped `{ backing, len=0, cap=0 }`), boxed into the map struct.
+function emitMapNew(body: i32[]): i32 {
+  if !mUsed {
+    return emitFail("emitProgram: Map() but map type not collected")
+  }
+  // keys list: empty string-ref backing → wrapper.
+  body.push(251)             // 0xfb
+  body.push(8)               // array.new_fixed
+  appendAll(body, ulebToArr(mkArrIdx))
+  appendAll(body, ulebToArr(0))            // 0 elements
+  body.push(65)              // len = 0
+  appendAll(body, slebToArr(0))
+  body.push(65)              // cap = 0
+  appendAll(body, slebToArr(0))
+  body.push(251)
+  body.push(0)               // struct.new
+  appendAll(body, ulebToArr(mkListIdx))
+  // vals list: empty i32 backing → wrapper.
+  body.push(251)
+  body.push(8)               // array.new_fixed
+  appendAll(body, ulebToArr(aTypeIdx))
+  appendAll(body, ulebToArr(0))
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  body.push(251)
+  body.push(0)               // struct.new
+  appendAll(body, ulebToArr(lTypeIdx))
+  // map struct { keys, vals }.
+  body.push(251)
+  body.push(0)               // struct.new
+  appendAll(body, ulebToArr(mStructIdx))
+  0
+}
+
+// Load the map receiver + key into the scratch frame (slots 0/1) and run the scan,
+// leaving `hit` (slot 5) set. `recvIx`/`keyIx` are arena indices; `recvIx` must be a
+// map-typed expression and `keyIx` a string.
+function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
+  if !mUsed {
+    return emitFail("emitProgram: map op but map type not collected")
+  }
+  if !exprMap(recvIx, fnIx) {
+    return emitFail("emitProgram: map op receiver is not a map")
+  }
+  if !exprString(keyIx, fnIx) {
+    return emitFail("emitProgram: map key is not a string")
+  }
+  if emitExpr(body, recvIx, fnIx) < 0 { return 0 - 1 }
+  setMapScr(body, 0)         // mapRef
+  if emitExpr(body, keyIx, fnIx) < 0 { return 0 - 1 }
+  setMapScr(body, 1)         // keyRef
+  emitMapScan(body)
+}
+
+// Lower a map GET `m[k]` with a DEFAULT (`m[k] ?? d`) onto `body`: scan, then if the
+// key was found push `vals[hit]`, else push the default `d`. The self-host checker
+// ALWAYS reads a map through `?? -1` (a total fallback), so this is the primary get.
+function emitMapGetOr(body: i32[], recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32): i32 {
+  if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
+  // if hit >= 0 { vals.backing[hit] } else { d }   — a value-typed if yielding i32.
+  pushMapScr(body, 5)        // hit
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  body.push(78)              // i32.ge_s (hit >= 0 → found)
+  body.push(4)               // if
+  body.push(127)             // 0x7f i32 blocktype
+  // vals.backing[hit]
+  pushMapVals(body)
+  body.push(251)
+  body.push(2)               // struct.get (vals backing)
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(0)               // field 0: backing
+  pushMapScr(body, 5)        // hit
+  body.push(251)
+  body.push(11)              // array.get
+  appendAll(body, ulebToArr(aTypeIdx))
+  body.push(5)               // else
+  if emitExpr(body, defIx, fnIx) < 0 { return 0 - 1 }
+  body.push(11)              // end (if)
+  0
+}
+
+// Lower a bare map GET `m[k]` (no `??`) onto `body`: scan, return `vals[hit]` or `0`
+// when absent. The checker never uses a bare map get (always `?? -1`); provided for
+// completeness so `m[k]` in value position is total (0 default).
+function emitMapGet(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
+  if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
+  pushMapScr(body, 5)        // hit
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  body.push(78)              // i32.ge_s
+  body.push(4)               // if
+  body.push(127)             // i32 blocktype
+  pushMapVals(body)
+  body.push(251)
+  body.push(2)
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(0)
+  pushMapScr(body, 5)
+  body.push(251)
+  body.push(11)
+  appendAll(body, ulebToArr(aTypeIdx))
+  body.push(5)               // else
+  body.push(65)              // i32.const 0
+  appendAll(body, slebToArr(0))
+  body.push(11)              // end
+  0
+}
+
+// Lower a map HAS `m.has(k)` / `k in m` onto `body`: scan, push 1 if found else 0.
+function emitMapHas(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
+  if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
+  pushMapScr(body, 5)        // hit
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  body.push(78)              // i32.ge_s (hit >= 0 → 1, else 0)
+  0
+}
+
+// Lower a map SET `m[k] = v` onto `body`: scan; on a HIT overwrite `vals[hit] = v`,
+// else `keys.push(k); vals.push(v)`. The append reuses the inline list-grow push over
+// the keys (string-ref) and vals (i32) lists. Run from `emitAssign` (a statement).
+function emitMapSet(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32): i32 {
+  if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
+  // if hit >= 0 { vals.backing[hit] = v } else { keys.push(k) ; vals.push(v) }
+  pushMapScr(body, 5)        // hit
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  body.push(78)              // i32.ge_s
+  body.push(4)               // if
+  body.push(64)              // void
+  // OVERWRITE: vals.backing[hit] = v
+  pushMapVals(body)
+  body.push(251)
+  body.push(2)               // struct.get (vals backing)
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(0)               // field 0: backing
+  pushMapScr(body, 5)        // hit (index)
+  if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }   // value
+  body.push(251)
+  body.push(14)              // 0x0e array.set
+  appendAll(body, ulebToArr(aTypeIdx))
+  body.push(5)               // else
+  // APPEND: keys.push(keyRef) ; vals.push(v)
+  if emitMapPushKey(body) < 0 { return 0 - 1 }
+  if emitMapPushVal(body, valIx, fnIx) < 0 { return 0 - 1 }
+  body.push(11)              // end (if)
+  0
+}
+
+// Inline list-grow append of the scratch `keyRef` (slot 1) onto `M.keys` (the
+// string-ref list). The keys list backing is `(array (mut (ref null $aTypeIdx)))`,
+// so grow uses `array.new_default`/`array.copy` over `$mkArrIdx`, and the value
+// written is the (non-null) key string ref — reusing the map scratch frame's spare
+// i32 slots (4 = newCap, 3 = char cursor is free here) and a fresh backing local.
+// To keep it self-contained, the new backing is built/stored via `M.keys.backing`
+// directly (no extra ref local): grow path mirrors `emitPush`.
+function emitMapPushKey(body: i32[]): i32 {
+  // if keys.len == keys.cap { grow }
+  pushMapKeysLen(body)
+  pushMapKeysCap(body)
+  body.push(70)              // i32.eq
+  body.push(4)               // if
+  body.push(64)              // void
+  // newCap = cap == 0 ? 4 : cap*2   (slot 4)
+  pushMapKeysCap(body)
+  body.push(69)              // i32.eqz
+  body.push(4)               // if
+  body.push(127)             // i32 blocktype
+  body.push(65)
+  appendAll(body, slebToArr(4))
+  body.push(5)               // else
+  pushMapKeysCap(body)
+  body.push(65)
+  appendAll(body, slebToArr(2))
+  body.push(108)             // i32.mul
+  body.push(11)              // end
+  setMapScr(body, 4)         // newCap
+  // keys.backing = copy of old into a fresh array.new_default(newCap), keys.cap=newCap
+  // newBacking on stack: array.new_default $mkArrIdx newCap
+  pushMapScr(body, 4)        // newCap
+  body.push(251)
+  body.push(7)               // array.new_default
+  appendAll(body, ulebToArr(mkArrIdx))
+  // stash newBacking into curRef? curRef is a (ref $aTypeIdx) string ref — WRONG type.
+  // Instead copy directly: keep newBacking on stack, but array.copy needs it as an
+  // operand twice (dest for copy, then store into keys.backing). Use the keys list:
+  // 1) set keys.backing = newBacking, 2) array.copy newBacking 0 (re-read old via a
+  // saved ref). Simpler: array.copy first (dest = newBacking on stack is consumed),
+  // so duplicate by storing into keys.backing FIRST, then copy from a SECOND fresh
+  // read of the (now-updated) backing — but the old elements are gone. So we must
+  // copy BEFORE swapping. We therefore need a ref local for newBacking.
+  // Store newBacking into keys.backing AFTER copying from the OLD backing. To do that
+  // without a typed ref local, we copy old→new while new is still only on the stack is
+  // impossible (copy consumes operands). Fall back: set keys.backing, copy old→new is
+  // lost. ==> use the dedicated newKeysBacking local (slot 6).
+  setMapScrKB(body)          // newKeysBacking (slot 6)
+  // array.copy newBacking 0 oldBacking 0 len
+  pushMapScrKB(body)         // dest
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  pushMapKeysBacking(body)   // src (old)
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  pushMapKeysLen(body)       // count
+  body.push(251)
+  body.push(17)              // array.copy
+  appendAll(body, ulebToArr(mkArrIdx))   // dest type
+  appendAll(body, ulebToArr(mkArrIdx))   // src type
+  // keys.backing = newBacking
+  pushMapKeys(body)
+  pushMapScrKB(body)
+  body.push(251)
+  body.push(5)               // struct.set
+  appendAll(body, ulebToArr(mkListIdx))
+  body.push(0)               // field 0: backing
+  // keys.cap = newCap
+  pushMapKeys(body)
+  pushMapScr(body, 4)
+  body.push(251)
+  body.push(5)
+  appendAll(body, ulebToArr(mkListIdx))
+  body.push(2)               // field 2: cap
+  body.push(11)              // end (grow if)
+  // keys.backing[keys.len] = keyRef
+  pushMapKeysBacking(body)
+  pushMapKeysLen(body)
+  pushMapScr(body, 1)        // keyRef
+  body.push(251)
+  body.push(14)              // array.set
+  appendAll(body, ulebToArr(mkArrIdx))
+  // keys.len = keys.len + 1
+  pushMapKeys(body)
+  pushMapKeysLen(body)
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add
+  body.push(251)
+  body.push(5)
+  appendAll(body, ulebToArr(mkListIdx))
+  body.push(1)               // field 1: len
+  0
+}
+
+// Inline list-grow append of value `v` (arena `valIx`) onto `M.vals` (the i32 list).
+// Mirrors `emitPush` over the i32 list, but the wrapper ref is `M.vals` (not a local)
+// and the grow uses the map scratch i32 slots + the vals-backing ref local (slot 7).
+function emitMapPushVal(body: i32[], valIx: i32, fnIx: i32): i32 {
+  // newVal first (slot 3 — free after the scan/keys push)
+  if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+  setMapScr(body, 3)
+  // if vals.len == vals.cap { grow }
+  pushMapValsLen(body)
+  pushMapValsCap(body)
+  body.push(70)              // i32.eq
+  body.push(4)               // if
+  body.push(64)              // void
+  // newCap (slot 4)
+  pushMapValsCap(body)
+  body.push(69)              // i32.eqz
+  body.push(4)               // if
+  body.push(127)
+  body.push(65)
+  appendAll(body, slebToArr(4))
+  body.push(5)               // else
+  pushMapValsCap(body)
+  body.push(65)
+  appendAll(body, slebToArr(2))
+  body.push(108)             // i32.mul
+  body.push(11)              // end
+  setMapScr(body, 4)
+  // newBacking = array.new_default $aTypeIdx newCap  → slot 7 (i32 vals backing)
+  pushMapScr(body, 4)
+  body.push(251)
+  body.push(7)               // array.new_default
+  appendAll(body, ulebToArr(aTypeIdx))
+  setMapScrVB(body)          // newValsBacking (slot 7)
+  // array.copy newBacking 0 oldBacking 0 len
+  pushMapScrVB(body)
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  pushMapValsBacking(body)
+  body.push(65)
+  appendAll(body, slebToArr(0))
+  pushMapValsLen(body)
+  body.push(251)
+  body.push(17)              // array.copy
+  appendAll(body, ulebToArr(aTypeIdx))
+  appendAll(body, ulebToArr(aTypeIdx))
+  // vals.backing = newBacking
+  pushMapVals(body)
+  pushMapScrVB(body)
+  body.push(251)
+  body.push(5)
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(0)               // field 0: backing
+  // vals.cap = newCap
+  pushMapVals(body)
+  pushMapScr(body, 4)
+  body.push(251)
+  body.push(5)
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(2)               // field 2: cap
+  body.push(11)              // end (grow if)
+  // vals.backing[vals.len] = newVal
+  pushMapValsBacking(body)
+  pushMapValsLen(body)
+  pushMapScr(body, 3)        // newVal
+  body.push(251)
+  body.push(14)              // array.set
+  appendAll(body, ulebToArr(aTypeIdx))
+  // vals.len = vals.len + 1
+  pushMapVals(body)
+  pushMapValsLen(body)
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add
+  body.push(251)
+  body.push(5)
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(1)               // field 1: len
+  0
+}
+
+// `M.keys.len` / `.cap` / `.backing` field reads (struct.get $mkListIdx 1/2/0).
+function pushMapKeysLen(body: i32[]): i32 {
+  pushMapKeys(body)
+  body.push(251)
+  body.push(2)
+  appendAll(body, ulebToArr(mkListIdx))
+  body.push(1)
+  0
+}
+function pushMapKeysCap(body: i32[]): i32 {
+  pushMapKeys(body)
+  body.push(251)
+  body.push(2)
+  appendAll(body, ulebToArr(mkListIdx))
+  body.push(2)
+  0
+}
+function pushMapKeysBacking(body: i32[]): i32 {
+  pushMapKeys(body)
+  body.push(251)
+  body.push(2)
+  appendAll(body, ulebToArr(mkListIdx))
+  body.push(0)
+  0
+}
+// `M.vals.len` / `.cap` / `.backing` field reads (struct.get $lTypeIdx 1/2/0).
+function pushMapValsLen(body: i32[]): i32 {
+  pushMapVals(body)
+  body.push(251)
+  body.push(2)
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(1)
+  0
+}
+function pushMapValsCap(body: i32[]): i32 {
+  pushMapVals(body)
+  body.push(251)
+  body.push(2)
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(2)
+  0
+}
+function pushMapValsBacking(body: i32[]): i32 {
+  pushMapVals(body)
+  body.push(251)
+  body.push(2)
+  appendAll(body, ulebToArr(lTypeIdx))
+  body.push(0)
+  0
+}
+
+// The two ref scratch locals beyond the 6-slot core frame: a non-null keys backing
+// ref (slot 6) and a non-null vals backing ref (slot 7), used by the two grows.
+function setMapScrKB(body: i32[]): i32 {
+  body.push(33)
+  appendAll(body, ulebToArr(mapScratchBase + 6))
+  0
+}
+function pushMapScrKB(body: i32[]): i32 {
+  body.push(32)
+  appendAll(body, ulebToArr(mapScratchBase + 6))
+  0
+}
+function setMapScrVB(body: i32[]): i32 {
+  body.push(33)
+  appendAll(body, ulebToArr(mapScratchBase + 7))
+  0
+}
+function pushMapScrVB(body: i32[]): i32 {
+  body.push(32)
+  appendAll(body, ulebToArr(mapScratchBase + 7))
+  0
+}
+
 // Lower an index READ `a[i]` onto `body`. The element store is the raw `(array (mut
 // i32))` in BOTH cases, but a list receiver carries it inside the wrapper struct:
 //   list `a[i]`   → eval `a` (a wrapper ref), `struct.get $lTypeIdx 0` (backing), eval
@@ -2069,6 +2722,24 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     if exprIsStrSlice(exprIx, fnIx) {
       return emitStrSlice(body, exprIx, fnIx)
     }
+    // G8: the `Map()` builtin constructs an empty string-keyed map.
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      if callee.identName == "Map" {
+        return emitMapNew(body)
+      }
+    }
+    // G8: a map `m.has(k)` member-call yields a 0/1 i32 (linear scan).
+    if callee is Member {
+      if callee.memProp == "has" {
+        if exprMap(callee.memObj, fnIx) {
+          if e.callArgs.length != 1 {
+            return emitFail("emitProgram: .has takes exactly one argument")
+          }
+          return emitMapHas(body, callee.memObj, e.callArgs[0], fnIx)
+        }
+      }
+    }
     return emitCall(body, exprIx, fnIx)
   }
   if e is IsExpr {
@@ -2089,6 +2760,11 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     return emitArr(body, exprIx, fnIx)
   }
   if e is Index {
+    // G8: a map GET `m[k]` (no `??`) — scan, value or 0. A `??` get is fused in the
+    // BinExpr branch below (it carries the default).
+    if exprMap(e.idxArr, fnIx) {
+      return emitMapGet(body, e.idxArr, e.idxIndex, fnIx)
+    }
     return emitIndex(body, exprIx, fnIx)
   }
   if e is Member {
@@ -2110,6 +2786,18 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // `emitStmt`, so seeing it as an operand here is an unsupported nested-assignment.
     if e.binOp == "=" {
       return emitFail("emitProgram: assignment is not a value expression")
+    }
+    // G8: nullish-coalescing `m[k] ?? d` — a FUSED map get-with-default: scan `m` for
+    // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
+    // every scope map through `?? -1`. The LHS must be a map index in this slice.
+    if e.binOp == "??" {
+      let lhs = P.nodes[e.binLeft]
+      if lhs is Index {
+        if exprMap(lhs.idxArr, fnIx) {
+          return emitMapGetOr(body, lhs.idxArr, lhs.idxIndex, e.binRight, fnIx)
+        }
+      }
+      return emitFail("emitProgram: `??` is only supported on a map index get")
     }
     // Short-circuit logical operators lower to a VALUE-TYPED `if` (blocktype 0x7f),
     // an `if` expression that leaves one i32 on the stack — both arms push an i32:
@@ -2233,6 +2921,12 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       return 0
     }
     if target is Index {
+      // G8: a map store `m[k] = v` — scan for `k`; overwrite `vals[hit]` on a hit, else
+      // append `keys.push(k); vals.push(v)`. Checked BEFORE the list path (a map index
+      // is not an array index).
+      if exprMap(target.idxArr, fnIx) {
+        return emitMapSet(body, target.idxArr, target.idxIndex, a.binRight, fnIx)
+      }
       // Indexed store `a[i] = v`: unwrap the list to its backing (`struct.get $lTy 0`),
       // push the index, then the value, then `array.set $aTy` (`0xfb 0x0e <typeidx>`). A
       // REF list (G7-ref) stores a struct ref / union box (a subtype of the `(ref null
@@ -2714,6 +3408,7 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     fnUsesPush = fnHasPush(fnIx)
     fnUsesRefPush = fnHasRefPush(fnIx)
     fnUsesStrOp = fnHasStrOp(fnIx)
+    fnUsesMap = fnHasMap(fnIx)
     let nLocals = localNames.length
     pushScratchBase = fn.fnParams.length + nLocals
     // The ref-push scratch triple (if any) follows the i32 triple.
@@ -2724,6 +3419,10 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     let refScratch = 0
     if fnUsesRefPush { refScratch = 3 }
     strScratchBase = fn.fnParams.length + nLocals + i32Scratch + refScratch
+    // The G8 map scratch frame (if any) follows the string-op frame.
+    let strScratch = 0
+    if fnUsesStrOp { strScratch = 7 }
+    mapScratchBase = fn.fnParams.length + nLocals + i32Scratch + refScratch + strScratch
 
     let bodyExpr: i32[] = []
     if emitStmts(bodyExpr, fn.fnBody, fnIx) < 0 { return 0 - 1 }
@@ -2741,6 +3440,8 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     if fnUsesRefPush { nRuns = nRuns + 3 }
     // The G6 string-op frame: 3 non-null string refs + 4 i32 temporaries.
     if fnUsesStrOp { nRuns = nRuns + 7 }
+    // The G8 map frame: 9 slots (see `emitMapScan`/the map scratch layout).
+    if fnUsesMap { nRuns = nRuns + 9 }
     appendAll(body, ulebToArr(nRuns))
     let li = 0
     while li < nLocals {
@@ -2787,6 +3488,41 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(127)
       body.push(1)
       body.push(127)
+    }
+    if fnUsesMap {
+      // The G8 map scratch frame, in slot order (see the map scratch layout):
+      //   0 mapRef  : (ref $mStructIdx)
+      //   1 keyRef  : (ref $aTypeIdx)   — target key string
+      //   2 curRef  : (ref $aTypeIdx)   — current scanned key string
+      //   3 idx     : i32               — outer scan cursor
+      //   4 cnt     : i32               — keys.len / newCap
+      //   5 hit     : i32               — found index (-1 absent)
+      //   6 keysBk  : (ref $mkArrIdx)   — grown keys backing
+      //   7 valsBk  : (ref $aTypeIdx)   — grown vals backing
+      //   8 chr     : i32               — inner char cursor (key compare)
+      body.push(1)
+      body.push(100)         // 0x64 (ref $mStructIdx) — non-null map ref
+      appendAll(body, ulebToArr(mStructIdx))
+      body.push(1)
+      body.push(100)         // 0x64 (ref $aTypeIdx) — non-null key string ref
+      appendAll(body, ulebToArr(aTypeIdx))
+      body.push(1)
+      body.push(100)         // 0x64 (ref $aTypeIdx) — non-null current key ref
+      appendAll(body, ulebToArr(aTypeIdx))
+      body.push(1)
+      body.push(127)         // idx: i32
+      body.push(1)
+      body.push(127)         // cnt: i32
+      body.push(1)
+      body.push(127)         // hit: i32
+      body.push(1)
+      body.push(100)         // 0x64 (ref $mkArrIdx) — non-null keys backing
+      appendAll(body, ulebToArr(mkArrIdx))
+      body.push(1)
+      body.push(100)         // 0x64 (ref $aTypeIdx) — non-null vals backing
+      appendAll(body, ulebToArr(aTypeIdx))
+      body.push(1)
+      body.push(127)         // chr: i32
     }
     appendAll(body, bodyExpr)
     body.push(11)            // 0x0b end
@@ -2964,6 +3700,9 @@ function pushVT(payload: i32[], kind: i32): i32 {
   } else if kind == 5 {
     payload.push(100)          // 0x64 (ref ht) — non-null ref
     appendAll(payload, ulebToArr(rlTypeIdx))  // the REF-list wrapper struct heap-type index
+  } else if kind == 6 {
+    payload.push(100)          // 0x64 (ref ht) — non-null ref
+    appendAll(payload, ulebToArr(mStructIdx)) // the string-keyed MAP struct heap-type index (G8)
   } else {
     payload.push(127)          // 0x7f i32
   }
@@ -3018,7 +3757,18 @@ function emitModule(stmts: i32[]): i32 {
   if rlUsed { refListOffset = 1 }
   raTypeIdx = preTypes + arrayOffset + listOffset
   rlTypeIdx = preTypes + arrayOffset + listOffset + refArrOffset
-  let typeOffset = preTypes + arrayOffset + listOffset + refArrOffset + refListOffset
+  // The string-keyed MAP types (G8) follow the ref-list types: the keys backing
+  // `(array (mut (ref null $aTypeIdx)))`, then the keys list wrapper `{ backing:
+  // (ref $mkArr), len, cap }`, then the map struct `{ keys, vals }` — each
+  // REFERENCES an already-emitted earlier type (string array / keys backing /
+  // keys wrapper + i32-list `lTypeIdx`). Each offset is 0 or 1 (`mUsed`).
+  let mapOffset = 0
+  if mUsed { mapOffset = 3 }
+  let preMap = preTypes + arrayOffset + listOffset + refArrOffset + refListOffset
+  mkArrIdx = preMap
+  mkListIdx = preMap + 1
+  mStructIdx = preMap + 2
+  let typeOffset = preMap + mapOffset
 
   // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
   // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`);
@@ -3103,6 +3853,36 @@ function emitModule(stmts: i32[]): i32 {
     typePayload.push(127)        // field 1 len: 0x7f i32
     typePayload.push(1)          // mutable
     typePayload.push(127)        // field 2 cap: 0x7f i32
+    typePayload.push(1)          // mutable
+  }
+  if mUsed {
+    // G8 map types, in dependency order. (1) the KEYS backing array `(array (mut
+    // (ref null $aTypeIdx)))` — element is a NULLABLE string ref (`0x63 <aTypeIdx>`)
+    // so `array.new_default` defaults spare slots to null; a key read recovers the
+    // non-null string. (2) the KEYS list wrapper `{ backing: (ref $mkArrIdx), len,
+    // cap }` — the same `{backing,len,cap}` triple as the i32 list, over the string
+    // backing. (3) the MAP struct `{ keys: (ref $mkListIdx), vals: (ref $lTypeIdx) }`
+    // — two non-null list refs (keys + the i32 vals list).
+    typePayload.push(94)         // 0x5e array (keys backing)
+    typePayload.push(99)         // 0x63 (ref null ht) — nullable string ref
+    appendAll(typePayload, ulebToArr(aTypeIdx))
+    typePayload.push(1)          // mutable
+    typePayload.push(95)         // 0x5f struct (keys list wrapper)
+    typePayload.push(3)          // 3 fields
+    typePayload.push(100)        // field 0 backing: 0x64 (ref ht) — non-null
+    appendAll(typePayload, ulebToArr(mkArrIdx))
+    typePayload.push(1)          // mutable
+    typePayload.push(127)        // field 1 len: 0x7f i32
+    typePayload.push(1)          // mutable
+    typePayload.push(127)        // field 2 cap: 0x7f i32
+    typePayload.push(1)          // mutable
+    typePayload.push(95)         // 0x5f struct (map)
+    typePayload.push(2)          // 2 fields
+    typePayload.push(100)        // field 0 keys: 0x64 (ref $mkListIdx) — non-null
+    appendAll(typePayload, ulebToArr(mkListIdx))
+    typePayload.push(1)          // mutable
+    typePayload.push(100)        // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
+    appendAll(typePayload, ulebToArr(lTypeIdx))
     typePayload.push(1)          // mutable
   }
   let ti = 0
@@ -3248,6 +4028,23 @@ function nameIsI32Array(name: string): boolean {
   name == "i32[]"
 }
 
+// True if the type-name `name` is a string-keyed MAP `{[string]: i32}` (G8) — the
+// synthetic name `parseType` builds for an index-signature type, which starts with
+// `"{["`. Only `{[string]: i32}` is emittable in this slice (the self-host checker's
+// scope-chain element); any other index signature still parses to this shape but the
+// map lowering assumes string keys + i32 values. A trailing `[]` (a list-of-maps
+// `{[string]:i32}[]`) is NOT a bare map — that is handled by the ref-array path.
+function nameIsMap(name: string): boolean {
+  if name.length < 2 { return false }
+  // A trailing `[]` makes it a LIST of maps, not a bare map.
+  if name[name.length - 1] == ']' {
+    if name[name.length - 2] == '[' { return false }
+  }
+  if name[0] != '{' { return false }
+  if name[1] != '[' { return false }
+  true
+}
+
 // True if the array type-name `name` is a REF-element list — `S[]` over the declared
 // struct, or `N[]` over the declared union alias (the box-ref element). Either lowers
 // to the `{ backing: (ref $raTypeIdx), len, cap }` wrapper over a `(ref null $elem)`
@@ -3307,6 +4104,7 @@ function collectA(stmts: i32[]): i32 {
   raUsed = false
   rlUsed = false
   rElemKind = 0
+  mUsed = false
   let i = 0
   while i < P.nodes.length {
     let nd = P.nodes[i]
@@ -3327,7 +4125,15 @@ function collectA(stmts: i32[]): i32 {
     } else if nd is StrLit {
       aUsed = true
     } else if nd is TypeRef {
-      if nameIsRefArray(nd.tyName) {
+      if nameIsMap(nd.tyName) {
+        // A `{[string]: i32}` annotation (G8) is a string-keyed map: the map struct
+        // + the keys list (string-ref backing) + the i32 VALS list (the existing
+        // `lTypeIdx`/`aTypeIdx`). So it forces `aUsed` (string backing + vals backing)
+        // and `lUsed` (the vals wrapper) alongside the three dedicated map types.
+        mUsed = true
+        lUsed = true
+        aUsed = true
+      } else if nameIsRefArray(nd.tyName) {
         // A `S[]`/`N[]` annotation is a ref list (wrapper + `(ref null $elem)` backing).
         rlUsed = true
         raUsed = true
@@ -3995,6 +4801,84 @@ function letAnnRefListKind(letIx: i32): i32 {
     }
   }
   0
+}
+
+// ── map-typedness of expressions (G8: `{[string]: i32}`) ──────────────────────
+// Parallel to the array family: decide whether an expression / param / local PRODUCES
+// a string-keyed MAP — a `(ref $mStructIdx)`. The receiver shapes that matter for the
+// self-host checker are a map LOCAL (`let m: {[string]: i32} = Map()` → code `6`), a
+// map PARAM, and `Map()` itself (the empty-map constructor). An index read `m[k]` /
+// `m.has(k)` yields an i32, NOT a map, so neither counts here.
+
+// True if the parameter `name` of function `fnIx` is a map type.
+function paramMap(fnIx: i32, name: string): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef { return nameIsMap(ty.tyName) }
+          }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the already-collected declared local `name` is a map ref (code `6`).
+function declaredMap(name: string): boolean {
+  let i = 0
+  while i < localNames.length {
+    if localNames[i] == name {
+      return localIsRef[i] == 6
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True if evaluating the expression at `exprIx` yields a string-keyed map: the
+// `Map()` constructor call, a map param/local reference, or a parenthesized map
+// expression.
+function exprMap(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Paren { return exprMap(e.parInner, fnIx) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident { return callee.identName == "Map" }
+    return false
+  }
+  if e is Ident {
+    if paramMap(fnIx, e.identName) { return true }
+    return declaredMap(e.identName)
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` declares a map-typed local: its annotation is a map
+// type (`{[string]: i32}`), OR its initializer produces a map (`Map()`). Picks the
+// local's valtype (`(ref $mStructIdx)`) and the code-`6` flag in `collectLocals`.
+function letIsMap(letIx: i32, fnIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if nameIsMap(lt.tyName) { return true }
+      }
+    }
+    return exprMap(d.letInit, fnIx)
+  }
+  false
 }
 
 // ── string-typedness of expressions ──────────────────────────────────────────
