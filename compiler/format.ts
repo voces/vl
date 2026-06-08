@@ -817,11 +817,16 @@ class Printer {
     if (ctx && (node.name === undefined || !isIdentifier(node.name) || bodyIsExpr)) {
       this.consumeInterior(ctx);
       const lines = this.slice(ctx).replace(/[ \t]+\n/g, "\n").split("\n");
-      lines.forEach((l, i) =>
-        i === 0
-          ? this.line(indent, l.trimStart())
-          : this.push(l.replace(/\s+$/, "") + "\n")
-      );
+      // Consume any trailing comment on the last source line of the function
+      // (e.g. `} // operator +`) so it stays attached to that line rather than
+      // being flushed as an own-line comment before the next statement.
+      const trailer = this.trailingOn(ctx.stop.line);
+      const suffix = trailer ? ` ${trailer.text}` : "";
+      lines.forEach((l, i) => {
+        const last = i === lines.length - 1;
+        if (i === 0) this.line(indent, l.trimStart() + (last ? suffix : ""));
+        else this.push(l.replace(/\s+$/, "") + (last ? suffix : "") + "\n");
+      });
       return;
     }
     const header = (node.exported ? "export " : "") + this.functionHeader(node);

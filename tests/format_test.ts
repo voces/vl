@@ -608,3 +608,74 @@ Deno.test("trailing comment on the closing `}` of a function block stays on that
   assertEquals(format(out), out, "function closing-brace trailing comment not idempotent");
   assertEquals(astShape(out), astShape(src), "function closing-brace trailing comment changed AST");
 });
+
+// --- trailing comment on operator-named / verbatim-fallback functions (D4) --
+//
+// An operator-named function (`function +(self, b) { … }`) or a function whose
+// body contains a method-shorthand (e.g. `"*": function(s) { … }`) is
+// reproduced verbatim from source because the AST discards the surface syntax
+// for those constructs.  A trailing comment on the function's *last source
+// line* (the closing `}`, or the closing `}` of a single-line body) must stay
+// on that line in the output — it was being displaced onto its own line
+// (before the following statement) because the verbatim path in `emitFunction`
+// was not consuming the trailing comment for the stop line.
+
+Deno.test("trailing comment on closing `}` of an operator-named fn stays on that line (D4)", () => {
+  // Multi-line operator-named function: comment on the closing brace line.
+  const src =
+    "function +(self, b) {\n  x: self.x + b.x,\n  y: self.y + b.y\n} // add two vecs\n" +
+    "const a = { x: 1, y: 2 }\nconst b = { x: 3, y: 4 }\nconst c = a + b\nprint(c.x)\n";
+  const out = format(src);
+  assert(
+    out.includes("} // add two vecs"),
+    `trailing comment on operator-named fn closing brace was displaced:\n${out}`,
+  );
+  // Comment must NOT appear as its own line before `const a`.
+  assert(
+    !out.includes("}\n// add two vecs"),
+    `trailing comment became an own-line comment:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `formatted output has syntax errors:\n${out}`);
+  assertEquals(format(out), out, "operator-named fn trailing comment not idempotent");
+  assertEquals(astShape(out), astShape(src), "operator-named fn trailing comment changed AST");
+});
+
+Deno.test("trailing comment on single-line operator-named fn stays on that line (D4)", () => {
+  // Single-line form: comment on the only line of the function.
+  const src =
+    "function +(self, b) { x: self.x + b.x, y: self.y + b.y } // operator +\n" +
+    "const a = { x: 1, y: 2 }\nconst b = { x: 3, y: 4 }\nconst c = a + b\nprint(c.x)\n";
+  const out = format(src);
+  assert(
+    out.includes("} // operator +"),
+    `trailing comment on single-line operator-named fn was displaced:\n${out}`,
+  );
+  assert(
+    !out.includes("}\n// operator +"),
+    `trailing comment became an own-line comment:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `formatted output has syntax errors:\n${out}`);
+  assertEquals(format(out), out, "single-line operator-named fn trailing comment not idempotent");
+  assertEquals(astShape(out), astShape(src), "single-line op fn trailing comment changed AST");
+});
+
+Deno.test("trailing comment on closing `}` of a method-shorthand fn stays on that line (D4)", () => {
+  // A function whose body is an object literal containing a method-shorthand field
+  // (`"*": function(s) { … }`) — the `containsHard` path forces verbatim output.
+  const src =
+    "function vec(x: i32, y: i32) {\n  \"*\": function(s: i32) { x: x * s, y: y * s },\n" +
+    "  x: x,\n  y: y\n} // make a vector\n" +
+    "const a = vec(6, 9)\nprint(a.x)\n";
+  const out = format(src);
+  assert(
+    out.includes("} // make a vector"),
+    `trailing comment on method-shorthand fn closing brace was displaced:\n${out}`,
+  );
+  assert(
+    !out.includes("}\n// make a vector"),
+    `trailing comment became an own-line comment:\n${out}`,
+  );
+  assert(!hasSyntaxError(out), `formatted output has syntax errors:\n${out}`);
+  assertEquals(format(out), out, "method-shorthand fn trailing comment not idempotent");
+  assertEquals(astShape(out), astShape(src), "method-shorthand fn trailing comment changed AST");
+});
