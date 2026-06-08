@@ -340,6 +340,59 @@ const CASES: Case[] = [
     },
   },
   {
+    // The REAL `i32ToStr` + `digitChar` from the self-host front end (`ast.vl`),
+    // verbatim. It exercises `/`, `%`, the implicit return, string `+`, a `while`
+    // loop, and string-returning helpers all at once — and now compiles + runs
+    // end-to-end through the real lexer→parser→emitProgram pipeline. `main` calls it
+    // on -405 and folds the result string's code points so the proof is an i32:
+    // "-405" → '-'(45)+'4'(52)+'0'(48)+'5'(53) = 198, length 4 → 198*100+4 = 19804.
+    name: "ast.vl's REAL `i32ToStr(-405)` compiles + runs (code-point fold => 19804)",
+    src: [
+      "function digitChar(d: i32): string {",
+      '  if d == 0 { return "0" }',
+      '  if d == 1 { return "1" }',
+      '  if d == 2 { return "2" }',
+      '  if d == 3 { return "3" }',
+      '  if d == 4 { return "4" }',
+      '  if d == 5 { return "5" }',
+      '  if d == 6 { return "6" }',
+      '  if d == 7 { return "7" }',
+      '  if d == 8 { return "8" }',
+      '  "9"',
+      "}",
+      "function i32ToStr(n: i32): string {",
+      '  if n == 0 { return "0" }',
+      "  let neg = n < 0",
+      "  let m = n",
+      "  if neg { m = 0 - m }",
+      '  let out = ""',
+      "  while m > 0 {",
+      "    out = digitChar(m % 10) + out",
+      "    m = m / 10",
+      "  }",
+      '  if neg { out = "-" + out }',
+      "  out",
+      "}",
+      "function main(): i32 {",
+      "  let s = i32ToStr(-405)",
+      "  let sum = 0",
+      "  let i = 0",
+      "  while i < s.length {",
+      "    sum = sum + s[i]",
+      "    i = i + 1",
+      "  }",
+      "  return sum * 100 + s.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 19804) {
+        throw new Error(`main() returned ${got}, expected 19804`);
+      }
+    },
+  },
+  {
     name: "`/` lowers to i32.div_s (`a / b`): 17 / 5 => 3 (truncating)",
     src: "function divv(a: i32, b: i32): i32 {\n  return a / b\n}\n",
     check: async (logs) => {
