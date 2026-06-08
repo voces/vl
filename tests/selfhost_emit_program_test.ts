@@ -1057,6 +1057,168 @@ const CASES: Case[] = [
       if (got !== 8) throw new Error(`main() returned ${got}, expected 8`);
     },
   },
+
+  // ── G2a: struct field WRITE (`s.field = v` → struct.set) ────────────────────
+  {
+    name: "G2a: write a struct field then read it back (`p.x = 5; p.x` => 5)",
+    src: [
+      "type Point = { x: i32, y: i32 }",
+      "function main(): i32 {",
+      "  let p: Point = { x: 0, y: 0 }",
+      "  p.x = 5",
+      "  return p.x",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  {
+    name:
+      "G2a: write both struct fields, read both back (`p.x=3; p.y=40` => 43)",
+    src: [
+      "type Point = { x: i32, y: i32 }",
+      "function main(): i32 {",
+      "  let p: Point = { x: 0, y: 0 }",
+      "  p.x = 3",
+      "  p.y = 40",
+      "  return p.x + p.y",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 43) throw new Error(`main() returned ${got}, expected 43`);
+    },
+  },
+  {
+    name: "G2a: read-modify-write a field (`p.x = p.x + 10` => 17)",
+    src: [
+      "type Point = { x: i32, y: i32 }",
+      "function bump(a: i32, b: i32): i32 {",
+      "  let p: Point = { x: a, y: b }",
+      "  p.x = p.x + 10",
+      "  return p.x + p.y",
+      "}",
+      "function main(): i32 {",
+      "  return bump(5, 2)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 17) throw new Error(`main() returned ${got}, expected 17`);
+    },
+  },
+  {
+    name: "G2a: mutate a struct field inside a `while` loop (sum 1..5 => 15)",
+    src: [
+      "type Acc = { total: i32, i: i32 }",
+      "function main(): i32 {",
+      "  let a: Acc = { total: 0, i: 1 }",
+      "  while a.i <= 5 {",
+      "    a.total = a.total + a.i",
+      "    a.i = a.i + 1",
+      "  }",
+      "  return a.total",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 15) throw new Error(`main() returned ${got}, expected 15`);
+    },
+  },
+
+  // ── G2b: module-level mutable GLOBALS (global.get / global.set) ─────────────
+  {
+    name: "G2b: an i32 global read+written within one function (`g=g+1` => 1)",
+    src: [
+      "let g = 0",
+      "function inc(): i32 {",
+      "  g = g + 1",
+      "  return g",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "inc");
+      if (got !== 1) throw new Error(`inc() returned ${got}, expected 1`);
+    },
+  },
+  {
+    name:
+      "G2b: a global counter bumped by a helper, read by main, across calls => 3",
+    src: [
+      "let g = 0",
+      "function bump(): i32 {",
+      "  g = g + 1",
+      "  return g",
+      "}",
+      "function main(): i32 {",
+      "  bump()",
+      "  bump()",
+      "  bump()",
+      "  return g",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
+  {
+    name:
+      "G2b: two globals, one seeded non-zero (`a=10`), summed after a write => 17",
+    src: [
+      "let a = 10",
+      "let b = 0",
+      "function main(): i32 {",
+      "  b = 7",
+      "  return a + b",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 17) throw new Error(`main() returned ${got}, expected 17`);
+    },
+  },
+  {
+    name:
+      "G2b: a module-level struct global, field-mutated then read back => 9",
+    src: [
+      "type Box = { v: i32 }",
+      "let bx: Box = { v: 0 }",
+      "function main(): i32 {",
+      "  bx.v = 9",
+      "  return bx.v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 9) throw new Error(`main() returned ${got}, expected 9`);
+    },
+  },
+  {
+    name: "G2b: a module-level array global, indexed and `.length` read => 32",
+    src: [
+      "let xs: i32[] = [10, 20]",
+      "function main(): i32 {",
+      "  return xs[0] + xs[1] + xs.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // xs[0] + xs[1] + length = 10 + 20 + 2 = 32.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 32) throw new Error(`main() returned ${got}, expected 32`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
@@ -1084,6 +1246,8 @@ function runCase(key: string, src: string): i32 {
   fnNames = []
   fnIndices = []
   localNames = []
+  globalStmts = []
+  globalNames = []
   loadToks(src)
   let root = parseProgram()
   let rc = emitProgram(root)
