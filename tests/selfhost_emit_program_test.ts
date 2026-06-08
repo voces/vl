@@ -2939,6 +2939,62 @@ const CASES: Case[] = [
       if (got !== 7) throw new Error(`f() returned ${got}, expected 7`);
     },
   },
+  {
+    // CONSTRUCTION-side counterpart: a struct `string[]` field built from a `string[]`
+    // SOURCE local (not a literal / not empty) — the `mkUnionDecl { udVariants: variants }`
+    // shape in `ast.vl`. The `i32[]` analogue (`{ items: xs }`) already works; this proves
+    // the string-list wrapper ref is supplied for the field value (not a bare i32).
+    name: "G5: construct a struct `string[]` field from a `string[]` SOURCE local => 3",
+    src: [
+      "type UnionDecl = { udName: string, udVariants: string[] }",
+      "function f(): i32 {",
+      "  let variants: string[] = [\"A\", \"B\", \"C\"]",
+      "  let n: UnionDecl = { udName: \"E\", udVariants: variants }",
+      "  let r = n.udVariants.length",
+      "  if n.udVariants[2] == \"C\" { r = r + 0 } else { r = 0 }",
+      "  return r",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // udVariants = ["A","B","C"]; length 3, udVariants[2]=="C" → 3.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 3) throw new Error(`f() returned ${got}, expected 3`);
+    },
+  },
+  {
+    // The EXACT `ast.vl` `mkUnionDecl` shape: a UNION-VARIANT `string[]` field built from
+    // a `string[]` PARAMETER (not a local, not a literal). This is the real instantiation
+    // blocker — the variant-struct construction supplies an i32 where the string-list
+    // wrapper ref is expected.
+    name: "G5: construct a UNION-VARIANT `string[]` field from a `string[]` PARAM => 3",
+    src: [
+      "type UnionDecl = { udName: string, udVariants: string[] }",
+      "type Other = { v: i32 }",
+      "type Node = UnionDecl | Other",
+      "function mkUnionDecl(name: string, variants: string[]): Node {",
+      "  let n: Node = { udName: name, udVariants: variants }",
+      "  return n",
+      "}",
+      "function f(d: Node): i32 {",
+      "  if d is UnionDecl {",
+      "    let r = d.udVariants.length",
+      "    if d.udVariants[2] == \"C\" { r = r + 0 } else { r = 0 }",
+      "    return r",
+      "  }",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  let variants: string[] = [\"A\", \"B\", \"C\"]",
+      "  return f(mkUnionDecl(\"E\", variants))",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
   // ── struct-typed params in a mutually-recursive / forward-referencing group (#6) ──
   // Passing a struct VALUE into a forward-referenced / mutually-recursive callee whose
   // param is a struct type. The keystone was a literal argument constructing as a
