@@ -783,8 +783,9 @@ const CASES: Case[] = [
   // point). These prove real `WebAssembly.instantiate` over the VL-emitted GC bytes —
   // source → arena → bytes → engine. A string value is a `(ref $array)`, so (like
   // structs/arrays) it is NOT directly JS-callable; the proofs return i32s.
-  // Concatenation (`+`), equality (`==`), `slice`/`indexOf`, and the UTF-8 `array i8`
-  // storage migration (B7) are DEFERRED — out of scope for this slice.
+  // Concatenation (`+`), value-equality (`==`/`!=`), and `.slice` land in G6 (the
+  // block below). `.indexOf`/`.includes`/`.charCodeAt`/`fromCodePoint` and the UTF-8
+  // `array i8` storage migration (B7) remain DEFERRED — out of scope for this slice.
   {
     name: 'a string literal\'s `.length` ("abc".length => 3)',
     src: [
@@ -897,6 +898,260 @@ const CASES: Case[] = [
     check: async (logs) => {
       const got = await runMain(bytesFromLog(logs));
       if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  // ── string `+` / `==`/`!=` / `.slice` (G6) ──────────────────────────────────
+  // A string is the SAME `(array (mut i32))` of code points, so all three lower to
+  // the array machinery INLINE (no helper functions): `+` allocates a new array of
+  // `len(a)+len(b)` and `array.copy`s both operands in; `==`/`!=` are ELEMENT-WISE
+  // value-equality (a length check then a per-code-point loop — NOT ref identity);
+  // `.slice(start,end)` allocates a new array over the clamped half-open range and
+  // `array.copy`s it. These are load-bearing for the self-host sources (diagnostics
+  // build messages with `+`, the lexer keyword tables compare with `==`, lexeme
+  // extraction uses `gSrc.slice(start, end)`). Each proves real `WebAssembly.
+  // instantiate` over the VL-emitted GC bytes — source → arena → bytes → engine.
+  {
+    name: 'G6: `"ab" + "cd"` concatenates — `.length` => 4',
+    src: [
+      "function main(): i32 {",
+      '  let s = "ab" + "cd"',
+      "  return s.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 4) throw new Error(`main() returned ${got}, expected 4`);
+    },
+  },
+  {
+    name: 'G6: `"ab" + "cd"` — index checks (s[0]=a, s[2]=c, s[3]=d)',
+    src: [
+      "function main(): i32 {",
+      '  let s = "ab" + "cd"',
+      // 'a'=97, 'c'=99, 'd'=100 → 97 + 99 + 100 = 296
+      "  return s[0] + s[2] + s[3]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 296) throw new Error(`main() returned ${got}, expected 296`);
+    },
+  },
+  {
+    name: "G6: concat of two string LOCALS (`a + b`) => length 5",
+    src: [
+      "function main(): i32 {",
+      '  let a = "ab"',
+      '  let b = "cde"',
+      "  let c = a + b",
+      "  return c.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  {
+    name: "G6: `==` value-equality of SAME content (`\"foo\" == \"foo\"` => 1)",
+    src: [
+      "function main(): i32 {",
+      '  if "foo" == "foo" {',
+      "    return 1",
+      "  }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    name:
+      "G6: `==` of DIFFERENT content, SAME length (`\"foo\" == \"bar\"` => 0)",
+    src: [
+      "function main(): i32 {",
+      '  if "foo" == "bar" {',
+      "    return 1",
+      "  }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 0) throw new Error(`main() returned ${got}, expected 0`);
+    },
+  },
+  {
+    name: "G6: `==` of DIFFERENT length (`\"ab\" == \"abc\"` => 0)",
+    src: [
+      "function main(): i32 {",
+      '  if "ab" == "abc" {',
+      "    return 1",
+      "  }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 0) throw new Error(`main() returned ${got}, expected 0`);
+    },
+  },
+  {
+    name:
+      "G6: `==` is VALUE equality, not ref identity — two BUILT-UP strings compare equal",
+    src: [
+      "function main(): i32 {",
+      // `"ab"+"cd"` and `"ab"+"cd"` are distinct array refs but equal content.
+      '  let a = "ab" + "cd"',
+      '  let b = "ab" + "cd"',
+      "  if a == b {",
+      "    return 1",
+      "  }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    name: "G6: `!=` negates value-equality (equal => 0, unequal => 1, summed => 1)",
+    src: [
+      "function main(): i32 {",
+      "  let x = 0",
+      '  if "foo" != "foo" {',
+      "    x = x + 10",
+      "  }",
+      '  if "foo" != "bar" {',
+      "    x = x + 1",
+      "  }",
+      "  return x",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    name: 'G6: `.slice(1, 3)` of `"hello"` yields `"el"` — compared with `==` => 1',
+    src: [
+      "function main(): i32 {",
+      '  if "hello".slice(1, 3) == "el" {',
+      "    return 1",
+      "  }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    name: 'G6: `.slice(1, 3)` — `.length` => 2, and indices (s[0]=e=101, s[1]=l=108)',
+    src: [
+      "function main(): i32 {",
+      '  let s = "hello".slice(1, 3)',
+      // length 2; s[0]='e'=101, s[1]='l'=108 → 2 + 101 + 108 = 211
+      "  return s.length + s[0] + s[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 211) throw new Error(`main() returned ${got}, expected 211`);
+    },
+  },
+  {
+    name: "G6: `.slice` clamps an out-of-range end (`\"hi\".slice(0, 99)` => length 2)",
+    src: [
+      "function main(): i32 {",
+      '  let s = "hi".slice(0, 99)',
+      "  return s.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 2) throw new Error(`main() returned ${got}, expected 2`);
+    },
+  },
+  {
+    name:
+      "G6: keyword-table dispatch — `if word == \"let\"` selects the right arm => 7",
+    src: [
+      "function classify(word: string): i32 {",
+      '  if word == "let" {',
+      "    return 7",
+      "  }",
+      '  if word == "const" {',
+      "    return 9",
+      "  }",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      '  return classify("let")',
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    name:
+      "G6: keyword-table dispatch — a NON-keyword falls through to the default => 0",
+    src: [
+      "function classify(word: string): i32 {",
+      '  if word == "let" {',
+      "    return 7",
+      "  }",
+      '  if word == "const" {',
+      "    return 9",
+      "  }",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      '  return classify("xyz")',
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 0) throw new Error(`main() returned ${got}, expected 0`);
+    },
+  },
+  {
+    name: "G6: a string concat built in a `while` loop (3 iterations => length 6)",
+    src: [
+      "function main(): i32 {",
+      '  let s = ""',
+      "  let i = 0",
+      "  while i < 3 {",
+      '    s = s + "ab"',
+      "    i = i + 1",
+      "  }",
+      "  return s.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 6) throw new Error(`main() returned ${got}, expected 6`);
     },
   },
   // ── discriminated unions + `is`-narrowing (G1) ─────────────────────────────
