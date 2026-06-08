@@ -5443,106 +5443,21 @@ function emitModule(stmts: i32[]): i32 {
 
   let n = fnStmts.length
 
-  // Heap-type indices, in type-section order: the GC struct type (if any) at 0, the raw
-  // i32 array type (if used) next, the growable-list wrapper struct (if used) next, then
-  // the functypes. `structOffset`/`arrayOffset`/`listOffset` are each 0 or 1; `typeOffset`
-  // is their sum — the index the first functype lands at. `aTypeIdx` (the raw array
-  // heap-type index) is `structOffset`; `lTypeIdx` (the list wrapper struct, which
-  // REFERENCES the raw array, so it MUST follow it) is `structOffset + arrayOffset`.
-  // The union path (mutually exclusive with the single-struct path: `sDeclared` is
-  // false when `uDeclared`). When a union is declared, its `nv` variant structs occupy
-  // the FIRST `nv` heap-type indices (`uVarIdx = 0`), the union box `{tag, value}`
-  // follows at `uBoxIdx = nv`, and any array/list/functypes come after.
-  // The standalone (non-variant) structs occupy the FIRST `sNames.length` heap-type
-  // indices (0..ns-1), in declaration order; `sHeapIdx[i] = i`. The union types (if
-  // any) follow: the `nv` variant structs at `structOffset .. structOffset+nv-1`, the
-  // union box at `structOffset+nv` — matching the type-section emission order below
-  // (standalone structs, then union variants + box). A string struct/variant field
-  // references the raw array type at `aTypeIdx` which lands later — resolved by the
-  // single recursion group wrapping all types.
-  let structOffset = sNames.length
-  sHeapIdx = []
-  let shi = 0
-  while shi < sNames.length {
-    sHeapIdx.push(shi)
-    shi = shi + 1
-  }
-  let unionOffset = 0
-  if uDeclared {
-    uVarIdx = structOffset
-    uBoxIdx = structOffset + uVariants.length
-    unionOffset = uVariants.length + 1   // nv variant structs + 1 union box
-  }
-  let preTypes = structOffset + unionOffset
-  let arrayOffset = 0
-  if aUsed { arrayOffset = 1 }
-  let listOffset = 0
-  if lUsed { listOffset = 1 }
-  aTypeIdx = preTypes
-  lTypeIdx = preTypes + arrayOffset
-  // The REF-element backing arrays + list wrappers (G7-ref) follow the i32 array/list.
-  // ONE distinct (backing, wrapper) PAIR per distinct element type (`rlElemName`), laid
-  // out interleaved: back0, wrap0, back1, wrap1, … so each wrapper immediately follows
-  // (and references) its own backing. Each backing's element is the struct's heap idx
-  // (`sHeapIdx`) or the union box (`uBoxIdx`), resolved per slot here into `rlElemHeap`;
-  // `rlBackIdx`/`rlWrapIdx` are the assigned heap indices. The legacy singletons
-  // `raTypeIdx`/`rlTypeIdx` alias SLOT 0 for any not-yet-migrated site.
-  let refPairBase = preTypes + arrayOffset + listOffset
-  // The map struct heap index is needed BELOW to resolve a map-array ref-list element
-  // (kind 3) — and `mStructIdx` itself lands AFTER the ref pairs. It is computable up
-  // front: `mStructIdx = preMap + 2` where `preMap = refPairBase + refPairsTotal`.
-  let refPairsTotal = rlElemName.length * 2
-  let mStructIdxPre = refPairBase + refPairsTotal + 2
-  let rs = 0
-  while rs < rlElemName.length {
-    rlBackIdx[rs] = refPairBase + rs * 2
-    rlWrapIdx[rs] = refPairBase + rs * 2 + 1
-    if rlElemKindTbl[rs] == 2 {
-      rlElemHeap[rs] = uBoxIdx
-    } else if rlElemKindTbl[rs] == 3 {
-      // A map-struct element (`{[string]:i32}[]`): the backing holds `(ref null $mStructIdx)`.
-      rlElemHeap[rs] = mStructIdxPre
-    } else {
-      let esi = structIndexByName(rlElemName[rs])
-      if esi >= 0 { rlElemHeap[rs] = sHeapIdx[esi] } else { rlElemHeap[rs] = 0 }
-    }
-    rs = rs + 1
-  }
-  if rlElemName.length >= 1 {
-    raTypeIdx = rlBackIdx[0]
-    rlTypeIdx = rlWrapIdx[0]
-  } else {
-    raTypeIdx = refPairBase
-    rlTypeIdx = refPairBase
-  }
-  // The string-ref list types follow the ref-list types: the keys backing
-  // `(array (mut (ref null $aTypeIdx)))`, then the keys list wrapper `{ backing:
-  // (ref $mkArr), len, cap }`. These two are shared by the map's keys list AND any
-  // `string[]` field, so they are present when `slUsed || mUsed`. The map STRUCT
-  // `{ keys, vals, … }` follows them and is present only when `mUsed`. Each type
-  // REFERENCES an already-emitted earlier type (string array / keys backing /
-  // keys wrapper + i32-list `lTypeIdx`).
-  let strListOffset = 0
-  if slUsed || mUsed { strListOffset = 2 }
-  let mapStructOffset = 0
-  if mUsed { mapStructOffset = 1 }
-  let mapOffset = strListOffset + mapStructOffset
-  let preMap = preTypes + arrayOffset + listOffset + refPairsTotal
-  mkArrIdx = preMap
-  mkListIdx = preMap + 1
-  mStructIdx = preMap + 2
-  let typeOffset = preMap + mapOffset
-
-  // Phase G: re-derive every heap-type index through the centralized `mIntern*`
-  // counter and ASSERT each equals the old offset formula above (risk R2 — index
-  // drift). `mAssignTypeIndices` overwrites the same globals with values it asserts
-  // are identical, so live emission is unchanged; a divergence fails loudly here
-  // (never silenced). The old arithmetic above is retained as the assert oracle.
-  let internOffset = mAssignTypeIndices(n)
-  if internOffset < 0 { return 0 - 1 }
-  if internOffset != typeOffset {
-    return emitFail("emitProgram: Phase G typeOffset drift")
-  }
+  // Heap-type indices, in type-section order: standalone structs at 0..ns-1, then
+  // (for the union path) the variant structs + box, then the raw i32 array, the
+  // i32-list wrapper, each ref-list (backing, wrapper) pair, the string-list
+  // (backing, wrapper), the map struct, and finally the functypes. Every index is
+  // minted by the centralized `mIntern*` counter inside `mAssignTypeIndices`, which
+  // assigns the module-global index state (`sHeapIdx`/`uVarIdx`/`uBoxIdx`/`aTypeIdx`/
+  // `lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`raTypeIdx`/`rlTypeIdx`/`mkArrIdx`/`mkListIdx`/
+  // `mStructIdx`) in that order and ALSO asserts each equals the old offset formula
+  // (risk R2 — index drift; the formulas survive as the assert oracle, scheduled for
+  // deletion one release after Phase G). It returns the functype base index
+  // (`typeOffset` — where the first functype lands), or -1 on a drift. All types are
+  // emitted inside ONE recursion group below, so a type may reference one that lands
+  // later (a string field's `(ref $aTypeIdx)`).
+  let typeOffset = mAssignTypeIndices(n)
+  if typeOffset < 0 { return 0 - 1 }
 
   // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
   // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`);
