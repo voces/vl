@@ -3866,14 +3866,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
   }
   let e = P.nodes[exprIx]
   if e is NumLit {
-    body.push(65)            // 0x41 i32.const
-    appendAll(body, slebToArr(parseI32(e.numText)))
+    fbI32Const(parseI32(e.numText))
     return 0
   }
   if e is BoolLit {
     // `boolean` rides in an i32: true=1, false=0 (already decoded into `boolVal`).
-    body.push(65)            // 0x41 i32.const
-    appendAll(body, slebToArr(e.boolVal))
+    fbI32Const(e.boolVal)
     return 0
   }
   if e is CharLit {
@@ -3885,8 +3883,7 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     if cps.length != 1 {
       return emitFail("emitProgram: char literal must denote exactly one code point")
     }
-    body.push(65)            // 0x41 i32.const
-    appendAll(body, slebToArr(cps[0]))
+    fbI32Const(cps[0])
     return 0
   }
   if e is Ident {
@@ -3896,14 +3893,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
       let gIdx = globalIndexOf(e.identName)
       if gIdx >= 0 {
-        body.push(35)        // 0x23 global.get
-        appendAll(body, ulebToArr(gIdx))
+        fbGlobalGet(gIdx)
         return 0
       }
       return emitFail("emitProgram: identifier is not a parameter, local, or global")
     }
-    body.push(32)            // 0x20 local.get
-    appendAll(body, ulebToArr(idx))
+    fbLocalGet(idx)
     return 0
   }
   if e is Paren {
@@ -3914,17 +3909,16 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // 0→1 and any non-zero→0 — exactly `a == 0`. Push the operand, then eqz.
     if e.unOp == "!" {
       if emitExpr(body, e.unArg, fnIx) < 0 { return 0 - 1 }
-      body.push(69)          // 0x45 i32.eqz
+      fbI32Eqz()             // 0x45 i32.eqz
       return 0
     }
     // Integer negation: `-x` == `0 - x`, so push 0, the operand, then sub.
     if e.unOp != "-" {
       return emitFail("emitProgram: unsupported unary operator")
     }
-    body.push(65)            // 0x41 i32.const
-    appendAll(body, slebToArr(0))
+    fbI32Const(0)
     if emitExpr(body, e.unArg, fnIx) < 0 { return 0 - 1 }
-    body.push(107)           // 0x6b i32.sub
+    fbI32Bin(107)            // 0x6b i32.sub
     return 0
   }
   if e is Call {
@@ -4027,22 +4021,19 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // blocktype `0x7f`; the then-branch, `else 0x05`, the else-branch, then `end 0x0b`.
     if e.binOp == "&&" || e.binOp == "||" {
       if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }   // condition `a`
-      body.push(4)             // 0x04 if
-      body.push(127)           // 0x7f i32 result-type blocktype (yields an i32)
+      fbIf(127)                // 0x04 if, 0x7f i32 result-type blocktype (yields an i32)
       if e.binOp == "&&" {
         // then = b, else = 0
         if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
-        body.push(5)           // 0x05 else
-        body.push(65)          // 0x41 i32.const
-        appendAll(body, slebToArr(0))
+        fbElse()               // 0x05 else
+        fbI32Const(0)
       } else {
         // then = 1, else = b
-        body.push(65)          // 0x41 i32.const
-        appendAll(body, slebToArr(1))
-        body.push(5)           // 0x05 else
+        fbI32Const(1)
+        fbElse()               // 0x05 else
         if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
       }
-      body.push(11)            // 0x0b end
+      fbEnd()                  // 0x0b end
       return 0
     }
     // G6 string operators (a string is a `(array i32)` of code points): `+` is a NEW
@@ -4063,7 +4054,7 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // Operands first (left then right), then the operator — wasm's stack order.
     if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }
     if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
-    body.push(opcode)
+    fbI32Bin(opcode)
     return 0
   }
   emitFail("emitProgram: unsupported expression in return")
@@ -4131,8 +4122,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         pendingStructIdx = 0 - 1
         i = i + 1
       }
-      body.push(16)          // 0x10 call
-      appendAll(body, ulebToArr(target))
+      fbCall(target)         // 0x10 call
       return 0
     }
     return emitFail("emitProgram: callee is not a function name")
@@ -4168,16 +4158,14 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
         let gIdx = globalIndexOf(target.identName)
         if gIdx >= 0 {
           if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
-          body.push(36)        // 0x24 global.set
-          appendAll(body, ulebToArr(gIdx))
+          fbGlobalSet(gIdx)    // 0x24 global.set
           return 0
         }
         return emitFail("emitProgram: assignment target is not a parameter, local, or global")
       }
       // Value first, then store it into the local's slot.
       if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
-      body.push(33)          // 0x21 local.set
-      appendAll(body, ulebToArr(idx))
+      fbLocalSet(idx)        // 0x21 local.set
       return 0
     }
     if target is Index {
@@ -4638,8 +4626,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     if emitExpr(body, s.letInit, fnIx) < 0 { return 0 - 1 }
     pendingListKind = 0
     pendingListSlot = 0
-    body.push(33)            // 0x21 local.set
-    appendAll(body, ulebToArr(idx))
+    fbLocalSet(idx)          // 0x21 local.set
     return 0
   }
   if s is BinExpr {
@@ -4663,7 +4650,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       // the value it leaves on the stack.
       if callee.memProp == "pop" {
         if emitPop(body, stmtIx, fnIx) < 0 { return 0 - 1 }
-        body.push(26)          // 0x1a drop
+        fbDrop()               // 0x1a drop
         return 0
       }
       return emitFail("emitProgram: unsupported member-call statement")
@@ -4673,7 +4660,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       // global side effects): emit the call, then `drop` the single value it leaves on
       // the stack (every function returns one value here).
       if emitCall(body, stmtIx, fnIx) < 0 { return 0 - 1 }
-      body.push(26)            // 0x1a drop
+      fbDrop()                 // 0x1a drop
       return 0
     }
     return emitFail("emitProgram: bare call statement is not supported")
@@ -4684,7 +4671,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     }
     // Push the return value, then the `return` instruction.
     if emitExpr(body, s.retArg, fnIx) < 0 { return 0 - 1 }
-    body.push(15)            // 0x0f return
+    fbReturn()               // 0x0f return
     return 0
   }
   if s is IfStmt {
@@ -4693,8 +4680,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     // non-zero; an optional `else 0x05` branch runs otherwise; `end 0x0b` closes it.
     // Both branches `return` on their own, so the `if` yields no value.
     if emitExpr(body, s.ifCond, fnIx) < 0 { return 0 - 1 }
-    body.push(4)             // 0x04 if
-    body.push(64)            // 0x40 void blocktype
+    fbIf(64)                 // 0x04 if, 0x40 void blocktype
     // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
     // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
     // outer narrowing around the branch so nesting and the else-branch are unaffected.
@@ -4705,7 +4691,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       restoreNarrow(savedTop)
     }
     if s.ifElse >= 0 {
-      body.push(5)           // 0x05 else
+      fbElse()               // 0x05 else
       // The else may be a Block or a nested IfStmt (`else if`); both go through
       // `emitStmt` (a lone statement) — a Block re-enters `emitStmts`. The narrowing
       // does NOT hold in the else-branch (the guard was false there).
@@ -4716,28 +4702,24 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
         if emitStmt(body, s.ifElse, fnIx) < 0 { return 0 - 1 }
       }
     }
-    body.push(11)            // 0x0b end
+    fbEnd()                  // 0x0b end
     return 0
   }
   if s is WhileStmt {
     // Structured while loop: block (void) wrapping a loop (void).
     // The condition is checked at the top; if false (eqz), br_if 1 exits the block;
     // body runs, then br 0 continues the loop. Two `end` bytes close loop then block.
-    body.push(2)             // 0x02 block (void)
-    body.push(64)            // 0x40 void blocktype
-    body.push(3)             // 0x03 loop (void)
-    body.push(64)            // 0x40 void blocktype
+    fbBlock(64)              // 0x02 block, 0x40 void blocktype
+    fbLoop(64)               // 0x03 loop, 0x40 void blocktype
     // condition + eqz: if condition is false (zero), exit block
     if emitExpr(body, s.whileCond, fnIx) < 0 { return 0 - 1 }
-    body.push(69)            // 0x45 i32.eqz (invert: exit if condition was false)
-    body.push(13)            // 0x0d br_if
-    body.push(1)             // depth 1 = break out of block
+    fbI32Eqz()               // 0x45 i32.eqz (invert: exit if condition was false)
+    fbBrIf(1)                // 0x0d br_if, depth 1 = break out of block
     // body statements
     if emitStmts(body, s.whileBody, fnIx) < 0 { return 0 - 1 }
-    body.push(12)            // 0x0c br
-    body.push(0)             // depth 0 = continue loop
-    body.push(11)            // 0x0b end (loop)
-    body.push(11)            // 0x0b end (block)
+    fbBr(0)                  // 0x0c br, depth 0 = continue loop
+    fbEnd()                  // 0x0b end (loop)
+    fbEnd()                  // 0x0b end (block)
     return 0
   }
   emitFail("emitProgram: unsupported statement in body")
@@ -4844,7 +4826,7 @@ function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32): i32 {
       if isLast && stmtIsTailValue(stmts[i]) {
         // Implicit return: push the value, then `return` (0x0f).
         if emitExpr(body, stmts[i], fnIx) < 0 { return 0 - 1 }
-        body.push(15)          // 0x0f return
+        fbReturn()             // 0x0f return
       } else if isLast && lastStmtIsValueIf(stmts[i]) {
         // The body ends in an `if`/`else` whose arms each yield a value (implicit
         // return) rather than `return`ing — lower it tail-aware so each arm's trailing
@@ -4937,7 +4919,7 @@ function emitStmtTail(body: i32[], stmtIx: i32, fnIx: i32): i32 {
   }
   if stmtIsTailValue(stmtIx) {
     if emitExpr(body, stmtIx, fnIx) < 0 { return 0 - 1 }
-    body.push(15)            // 0x0f return
+    fbReturn()               // 0x0f return
     return 0
   }
   emitStmt(body, stmtIx, fnIx)
@@ -4952,8 +4934,7 @@ function emitIfTail(body: i32[], stmtIx: i32, fnIx: i32): i32 {
   let s = P.nodes[stmtIx]
   if s is IfStmt {
     if emitExpr(body, s.ifCond, fnIx) < 0 { return 0 - 1 }
-    body.push(4)             // 0x04 if
-    body.push(64)            // 0x40 void blocktype
+    fbIf(64)                 // 0x04 if, 0x40 void blocktype
     let savedTop = narrowTop
     let narrowed = setNarrowFromCond(s.ifCond, fnIx)
     if emitStmtsTail(body, s.ifThen, fnIx) < 0 { return 0 - 1 }
@@ -4961,7 +4942,7 @@ function emitIfTail(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       restoreNarrow(savedTop)
     }
     if s.ifElse >= 0 {
-      body.push(5)           // 0x05 else
+      fbElse()               // 0x05 else
       let els = P.nodes[s.ifElse]
       if els is Block {
         if emitStmtsTail(body, s.ifElse, fnIx) < 0 { return 0 - 1 }
@@ -4970,7 +4951,7 @@ function emitIfTail(body: i32[], stmtIx: i32, fnIx: i32): i32 {
         if emitStmtTail(body, s.ifElse, fnIx) < 0 { return 0 - 1 }
       }
     }
-    body.push(11)            // 0x0b end
+    fbEnd()                  // 0x0b end
     return 0
   }
   emitFail("emitProgram: emitIfTail: not an if statement")
@@ -5089,7 +5070,14 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     mapScratchBase = fn.fnParams.length + nLocals + i32Scratch + refScratch + strPushScratch + strScratch
 
     let bodyExpr: i32[] = []
+    // Bind the writer at `bodyExpr` so the `fb*` opcode methods (which append to
+    // `curBuf`) write the function-body instructions; the recursive lowering threads
+    // the SAME `bodyExpr` as its `body` arg, so `curBuf == body` throughout and the
+    // not-yet-converted raw `body.push(...)` sites interleave identically. Restore
+    // the previous target afterwards.
+    let exprPrev = wTarget(bodyExpr)
     if emitFuncBody(bodyExpr, fn.fnBody, fnIx) < 0 { return 0 - 1 }
+    wTarget(exprPrev)
 
     let body: i32[] = []
     // Locals vector: one (count=1, valtype) run per DECLARED local (a struct/list/string/
@@ -5231,6 +5219,9 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
       body.push(127)         // 11 rslot: i32
     }
     appendAll(body, bodyExpr)
+    // Bind the writer at `body` (the framed code entry) for the trailing padding/end
+    // opcodes emitted via the `fb*` methods.
+    let endPrev = wTarget(body)
     // If the body does NOT end in an explicit `return` / tail value, control
     // structurally falls through to the function `end` with an empty stack (e.g. a
     // body ending in `if c { return a } else { return b }`, whose `return`s exit from
@@ -5238,9 +5229,10 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     // at fallthrough, so emit an `unreachable` (0x00) — the typechecker has proven
     // this fallthrough is dead, so it is sound padding, never executed.
     if !bodyEndsInReturn(fn.fnBody) {
-      body.push(0)           // 0x00 unreachable
+      fbUnreachable()        // 0x00 unreachable
     }
-    body.push(11)            // 0x0b end
+    fbEnd()                  // 0x0b end
+    wTarget(endPrev)
     appendAll(out, ulebToArr(body.length))
     appendAll(out, body)
     return 0
@@ -5809,8 +5801,12 @@ function emitModule(stmts: i32[]): i32 {
         }
         pushVT(globalPayload, globalKind(g.letInit), structIndexOfExpr(g.letInit, 0 - 1))   // valtype
         globalPayload.push(1)                          // 0x01 mutable
+        // Bind the writer at `globalPayload` so the init constexpr's `fb*` opcodes
+        // (i32.const, struct.new, …) write here, not the (default) module buffer.
+        let gPrev = wTarget(globalPayload)
         if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
-        globalPayload.push(11)                         // 0x0b end of init expr
+        fbEnd()                                         // 0x0b end of init expr
+        wTarget(gPrev)
       }
       gi = gi + 1
     }
