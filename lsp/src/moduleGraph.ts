@@ -291,21 +291,72 @@ const resolveModuleExports = async (
   key: string,
   read: ModuleReader,
   onPath: Set<string>,
-): Promise<Record<string, VLType>> => {
-  const source = await read(key);
-  if (source === undefined) return {};
+): Promise<Record<string, VLType>> =>
+  (await resolveModuleExportsCached(key, read, onPath)).exports;
 
+// Cross-keystroke cache of resolved module exports. `checkDocument` runs on every
+// edit and walks the entry's whole transitive import closure; without this, each
+// keystroke re-tokenizes + re-parses every sibling (O(closure) per keystroke —
+// ~26 ms on a 3-module chain). A module's exports are reused only when its source
+// AND every transitive dependency are unchanged, so editing one file never
+// re-parses the rest of the closure. Soundness rides on `read(key)` reflecting the
+// current content (open buffer or disk), so a string-equal source means an
+// unchanged module; `changed` propagates a dependency edit up to its dependents.
+// Lives for the server's lifetime, bounded by the project's file count; a deleted
+// module's entry is dropped when its read returns `undefined`.
+type ExportCacheEntry = {
+  source: string;
+  depKeys: string[];
+  exports: Record<string, VLType>;
+};
+const exportCache = new Map<string, ExportCacheEntry>();
+
+const resolveModuleExportsCached = async (
+  key: string,
+  read: ModuleReader,
+  onPath: Set<string>,
+): Promise<{ exports: Record<string, VLType>; changed: boolean }> => {
+  const source = await read(key);
+  if (source === undefined) {
+    exportCache.delete(key);
+    return { exports: {}, changed: true };
+  }
+  // A cyclic re-entry resolves against an empty import scope (the original
+  // behavior) and is never cached — its truncated result isn't the module's
+  // canonical export surface.
+  const cyclic = onPath.has(key);
+  const cached = exportCache.get(key);
+
+  // Fast path: same source AND no dependency changed → reuse without re-parsing.
+  // The deps are still walked (cheaply, hitting their caches) to detect a
+  // transitive edit; only the PARSE is skipped.
+  if (cached && cached.source === source && !cyclic) {
+    const nextPath = new Set(onPath).add(key);
+    let depChanged = false;
+    for (const depKey of cached.depKeys) {
+      if (onPath.has(depKey)) continue;
+      if ((await resolveModuleExportsCached(depKey, read, nextPath)).changed) {
+        depChanged = true;
+      }
+    }
+    if (!depChanged) return { exports: cached.exports, changed: false };
+  }
+
+  // Slow path: (re)parse. Tokenize once and reuse for both the import-discovery
+  // probe and the real (import-seeded) parse.
   const { tokens } = tokenize(source);
-  // First pass against a bare scope to discover this module's imports.
   const [probe] = parseProgram(tokens, defaultScope());
 
   const initialScope = defaultScope();
-  if (!onPath.has(key)) {
+  const depKeys: string[] = [];
+  if (!cyclic) {
     const nextPath = new Set(onPath).add(key);
     for (const imp of probe.moduleImports ?? []) {
       const depKey = resolveSpecifier(imp.specifier, key);
       if (depKey === undefined || onPath.has(depKey)) continue;
-      const depExports = await resolveModuleExports(depKey, read, nextPath);
+      depKeys.push(depKey);
+      const depExports =
+        (await resolveModuleExportsCached(depKey, read, nextPath)).exports;
       for (const spec of imp.specifiers) {
         const t = depExports[spec.name];
         if (t) initialScope[spec.local] = t;
@@ -313,12 +364,13 @@ const resolveModuleExports = async (
     }
   }
 
-  const [program] = parseProgram(tokenize(source).tokens, initialScope);
+  const [program] = parseProgram(tokens, initialScope);
   const out: Record<string, VLType> = {};
   for (const exp of Object.values(program.moduleExports ?? {})) {
     out[exp.name] = exp.type;
   }
-  return out;
+  if (!cyclic) exportCache.set(key, { source, depKeys, exports: out });
+  return { exports: out, changed: true };
 };
 
 // ---- graph-aware check (the diagnostics + AST/symbols the LSP needs) ---------
