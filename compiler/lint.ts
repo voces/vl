@@ -561,7 +561,7 @@ const unreachableInBlock = (
     const span = spanOf(spans, node);
     if (span) {
       out.push({
-        message: "Unreachable code: this statement can never execute",
+        message: "Unreachable code: this can never execute",
         severity: "warning",
         range: rangeFromCtx(span),
         code: "unreachable-code",
