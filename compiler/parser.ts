@@ -533,9 +533,16 @@ export const parseProgram = (
     while (at("LBRACK") && peek(1).kind === "RBRACK") {
       next();
       next();
+      // The `T[]` suffix builds the CANONICAL array shape: a single index
+      // signature keyed by `number` (the i32-width array-index alias). This is
+      // the SAME shape an array literal (`[1, 2]`) and `listOf` produce, so all
+      // three render `T[]` in hover/inlay (see `stringifyType`'s array case).
+      // An explicit `{[i32]: V}` index-signature annotation keeps its `i32` key
+      // — still recognised as an array by `arrayElementType`, but rendered
+      // `{i32: V}` since it was written index-signature-style.
       t = {
         type: "Object",
-        properties: [{ name: { type: "Alias", name: "i32" }, type: t }],
+        properties: [{ name: { type: "Alias", name: "number" }, type: t }],
       };
     }
     return t;
