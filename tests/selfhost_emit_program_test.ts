@@ -278,8 +278,11 @@ const CASES: Case[] = [
     },
   },
   {
-    name: "an unsupported shape fails loudly, not with garbage bytes",
-    src: "function bad(a: i32): i32 {\n  return a / 2\n}\n",
+    // `??` outside a map index get still fails loudly — keeps the "garbage bytes are
+    // never emitted for an unsupported operator" coverage now that `/` and `%` are
+    // genuine i32 operators (see the div/rem cases below).
+    name: "an unsupported operator shape fails loudly, not with garbage bytes",
+    src: "function bad(a: i32): i32 {\n  return a ?? 2\n}\n",
     check: (logs) => {
       const errLine = logs.find((l) => l.startsWith("err: "));
       if (!errLine) {
@@ -289,9 +292,34 @@ const CASES: Case[] = [
           }`,
         );
       }
-      if (!errLine.includes("operator")) {
+      if (!errLine.includes("??") && !errLine.includes("operator")) {
         throw new Error(`unexpected emitter error message: ${errLine}`);
       }
+    },
+  },
+  {
+    name: "`/` lowers to i32.div_s (`a / b`): 17 / 5 => 3 (truncating)",
+    src: "function divv(a: i32, b: i32): i32 {\n  return a / b\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "divv", 17, 5);
+      if (got !== 3) throw new Error(`divv(17, 5) returned ${got}, expected 3`);
+    },
+  },
+  {
+    name: "`%` lowers to i32.rem_s (`a % b`): 17 % 5 => 2",
+    src: "function modv(a: i32, b: i32): i32 {\n  return a % b\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "modv", 17, 5);
+      if (got !== 2) throw new Error(`modv(17, 5) returned ${got}, expected 2`);
+    },
+  },
+  {
+    name: "`/` and `%` combine — `(a / b) * b + a % b` reconstructs a => 17",
+    src:
+      "function f(a: i32, b: i32): i32 {\n  return (a / b) * b + a % b\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f", 17, 5);
+      if (got !== 17) throw new Error(`f(17, 5) returned ${got}, expected 17`);
     },
   },
   {
