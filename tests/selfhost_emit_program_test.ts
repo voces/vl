@@ -2697,6 +2697,34 @@ const CASES: Case[] = [
       if (got !== 22) throw new Error(`f() returned ${got}, expected 22`);
     },
   },
+  {
+    // A UNION-VARIANT field of array type (`Call.args: i32[]`). The variant struct
+    // stores the i32-list wrapper ref; after `is`-narrowing, the field read recovers
+    // the list ref (downcast through the box) so `.length` / indexing apply — this is
+    // the shape `ast.vl`'s `Node` variants (`Call.callArgs: Node[]`, …) need.
+    name: "G5: union-variant with an `i32[]` field — narrow then read length + element => 4",
+    src: [
+      "type Call = { args: i32[] }",
+      "type Lit = { val: i32 }",
+      "type Node = Call | Lit",
+      "function f(n: Node): i32 {",
+      "  if n is Call { return n.args.length + n.args[0] }",
+      "  return 0",
+      "}",
+      "function mk(): Node {",
+      "  return { args: [2, 9] }",
+      "}",
+      "function main(): i32 {",
+      "  return f(mk())",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // args = [2, 9]; length (2) + args[0] (2) = 4.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 4) throw new Error(`main() returned ${got}, expected 4`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
