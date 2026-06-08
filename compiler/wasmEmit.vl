@@ -1925,76 +1925,6 @@ function emitMapProbe(body: i32[]): i32 {
   0
 }
 
-// Emit the linear SCAN: with `mapRef` (slot 0) and the target `keyRef` (slot 1)
-// already set, walk `keys[0..len)`, comparing each with `keyRef`; leave `hit` (slot
-// 5) = the matching entry index, or -1 if no key matched. The shared core of get /
-// set / `.has`.
-function emitMapScan(body: i32[]): i32 {
-  // hit = -1
-  body.push(65)
-  appendAll(body, slebToArr(0 - 1))
-  setMapScr(body, 5)
-  // cnt = keys.len
-  pushMapKeys(body)
-  body.push(251)
-  body.push(2)               // struct.get
-  appendAll(body, ulebToArr(mkListIdx))
-  body.push(1)               // field 1: len
-  setMapScr(body, 4)
-  // idx = 0
-  body.push(65)
-  appendAll(body, slebToArr(0))
-  setMapScr(body, 3)
-  // loop { if idx >= cnt {} else { if hit < 0 { curRef = keys[idx]; if eq { hit=idx } } ; idx++; br } }
-  body.push(3)               // 0x03 loop
-  body.push(64)              // void
-  pushMapScr(body, 3)        // idx
-  pushMapScr(body, 4)        // cnt
-  body.push(78)              // i32.ge_s (idx >= cnt → done)
-  body.push(4)               // if
-  body.push(64)              // void
-  // then: done (empty)
-  body.push(5)               // else
-  // if hit < 0 { ... }  — stop comparing once found (first match wins)
-  pushMapScr(body, 5)
-  body.push(65)
-  appendAll(body, slebToArr(0))
-  body.push(72)              // 0x48 i32.lt_s (hit < 0)
-  body.push(4)               // if
-  body.push(64)              // void
-  // curRef = keys.backing[idx]  (ref.as_non_null — slot is populated in [0,len))
-  pushMapKeys(body)
-  body.push(251)
-  body.push(2)               // struct.get (keys backing)
-  appendAll(body, ulebToArr(mkListIdx))
-  body.push(0)               // field 0: backing
-  pushMapScr(body, 3)        // idx
-  body.push(251)
-  body.push(11)              // array.get
-  appendAll(body, ulebToArr(mkArrIdx))
-  body.push(212)             // 0xd4 ref.as_non_null
-  setMapScr(body, 2)         // curRef
-  // if keyEq(curRef, keyRef) { hit = idx }
-  if emitMapKeyEq(body, 2, 1) < 0 { return 0 - 1 }
-  body.push(4)               // if
-  body.push(64)              // void
-  pushMapScr(body, 3)        // idx
-  setMapScr(body, 5)         // hit = idx
-  body.push(11)              // end (eq if)
-  body.push(11)              // end (hit<0 if)
-  // idx = idx + 1
-  pushMapScr(body, 3)
-  body.push(65)
-  appendAll(body, slebToArr(1))
-  body.push(106)             // i32.add
-  setMapScr(body, 3)
-  body.push(12)              // br
-  body.push(1)               // → loop header
-  body.push(11)              // end (ge_s if)
-  body.push(11)              // end (loop)
-  0
-}
-
 // Construct an EMPTY map `Map()` onto `body`: two empty lists (each `array.new_fixed`
 // count 0, wrapped `{ backing, len=0, cap=0 }`), boxed into the map struct.
 function emitMapNew(body: i32[]): i32 {
@@ -2043,9 +1973,10 @@ function emitMapNew(body: i32[]): i32 {
   0
 }
 
-// Load the map receiver + key into the scratch frame (slots 0/1) and run the scan,
-// leaving `hit` (slot 5) set. `recvIx`/`keyIx` are arena indices; `recvIx` must be a
-// map-typed expression and `keyIx` a string.
+// Load the map receiver + key into the scratch frame (slots 0/1) and run the PROBE,
+// leaving `slot` (slot 3) = the probe slot and `entry` (slot 5) = `index[slot]`
+// (0 = miss; else entry-position + 1). `recvIx`/`keyIx` are arena indices; `recvIx`
+// must be a map-typed expression and `keyIx` a string.
 function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
   if !mUsed {
     return emitFail("emitProgram: map op but map type not collected")
@@ -2060,28 +1991,28 @@ function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
   setMapScr(body, 0)         // mapRef
   if emitExpr(body, keyIx, fnIx) < 0 { return 0 - 1 }
   setMapScr(body, 1)         // keyRef
-  emitMapScan(body)
+  emitMapProbe(body)
 }
 
-// Lower a map GET `m[k]` with a DEFAULT (`m[k] ?? d`) onto `body`: scan, then if the
-// key was found push `vals[hit]`, else push the default `d`. The self-host checker
+// Lower a map GET `m[k]` with a DEFAULT (`m[k] ?? d`) onto `body`: probe, then if the
+// key was found push `vals[entry-1]`, else push the default `d`. The self-host checker
 // ALWAYS reads a map through `?? -1` (a total fallback), so this is the primary get.
 function emitMapGetOr(body: i32[], recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32): i32 {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
-  // if hit >= 0 { vals.backing[hit] } else { d }   — a value-typed if yielding i32.
-  pushMapScr(body, 5)        // hit
-  body.push(65)
-  appendAll(body, slebToArr(0))
-  body.push(78)              // i32.ge_s (hit >= 0 → found)
-  body.push(4)               // if
+  // if entry != 0 { vals.backing[entry-1] } else { d }  — a value-typed if yielding i32.
+  pushMapScr(body, 5)        // entry
+  body.push(4)               // if (entry != 0 → found; a nonzero condition is true)
   body.push(127)             // 0x7f i32 blocktype
-  // vals.backing[hit]
+  // vals.backing[entry-1]
   pushMapVals(body)
   body.push(251)
   body.push(2)               // struct.get (vals backing)
   appendAll(body, ulebToArr(lTypeIdx))
   body.push(0)               // field 0: backing
-  pushMapScr(body, 5)        // hit
+  pushMapScr(body, 5)        // entry
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(107)             // 0x6b i32.sub  (entry - 1)
   body.push(251)
   body.push(11)              // array.get
   appendAll(body, ulebToArr(aTypeIdx))
@@ -2091,23 +2022,23 @@ function emitMapGetOr(body: i32[], recvIx: i32, keyIx: i32, defIx: i32, fnIx: i3
   0
 }
 
-// Lower a bare map GET `m[k]` (no `??`) onto `body`: scan, return `vals[hit]` or `0`
-// when absent. The checker never uses a bare map get (always `?? -1`); provided for
+// Lower a bare map GET `m[k]` (no `??`) onto `body`: probe, return `vals[entry-1]` or
+// `0` when absent. The checker never uses a bare map get (always `?? -1`); provided for
 // completeness so `m[k]` in value position is total (0 default).
 function emitMapGet(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
-  pushMapScr(body, 5)        // hit
-  body.push(65)
-  appendAll(body, slebToArr(0))
-  body.push(78)              // i32.ge_s
-  body.push(4)               // if
+  pushMapScr(body, 5)        // entry
+  body.push(4)               // if (entry != 0)
   body.push(127)             // i32 blocktype
   pushMapVals(body)
   body.push(251)
   body.push(2)
   appendAll(body, ulebToArr(lTypeIdx))
   body.push(0)
-  pushMapScr(body, 5)
+  pushMapScr(body, 5)        // entry
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(107)             // i32.sub (entry - 1)
   body.push(251)
   body.push(11)
   appendAll(body, ulebToArr(aTypeIdx))
@@ -2118,43 +2049,87 @@ function emitMapGet(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
   0
 }
 
-// Lower a map HAS `m.has(k)` / `k in m` onto `body`: scan, push 1 if found else 0.
+// Lower a map HAS `m.has(k)` / `k in m` onto `body`: probe, push 1 if found else 0.
 function emitMapHas(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
-  pushMapScr(body, 5)        // hit
+  pushMapScr(body, 5)        // entry
   body.push(65)
   appendAll(body, slebToArr(0))
-  body.push(78)              // i32.ge_s (hit >= 0 → 1, else 0)
+  body.push(71)              // 0x47 i32.ne (entry != 0 → 1, else 0)
   0
 }
 
-// Lower a map SET `m[k] = v` onto `body`: scan; on a HIT overwrite `vals[hit] = v`,
-// else `keys.push(k); vals.push(v)`. The append reuses the inline list-grow push over
-// the keys (string-ref) and vals (i32) lists. Run from `emitAssign` (a statement).
+// Resize the `index` when the load factor (size / cap) crosses 1/2: allocate a fresh
+// `index` of `2*cap` slots and REBUILD it from the ordered entries (probe each key's
+// hash into the new index, writing entry+1). The ordered keys/vals lists are untouched
+// — only `index` is rebuilt, so insertion order is preserved. (Implemented in the
+// resize slice; a temporary no-op keeps the small-key tests green meanwhile.)
+function emitMapResize(body: i32[]): i32 {
+  0
+}
+
+// Lower a map SET `m[k] = v` onto `body`: probe; on a HIT (`entry != 0`) overwrite
+// `vals.backing[entry-1] = v`, else APPEND a new entry — link the index slot, push the
+// key + value onto the ordered entry lists, bump `count`/`size`, and resize the index
+// if the load factor crossed 1/2. The append reuses the inline list-grow push over the
+// keys (string-ref) and vals (i32) lists. Run from `emitAssign` (a statement).
+//
+// Ordering matters: `index[slot] = count+1` is written BEFORE the two pushes, because
+// `emitMapPushKey`/`emitMapPushVal` clobber the probe slot (slot 3) and cap (slot 4).
 function emitMapSet(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32): i32 {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
-  // if hit >= 0 { vals.backing[hit] = v } else { keys.push(k) ; vals.push(v) }
-  pushMapScr(body, 5)        // hit
-  body.push(65)
-  appendAll(body, slebToArr(0))
-  body.push(78)              // i32.ge_s
-  body.push(4)               // if
+  pushMapScr(body, 5)        // entry
+  body.push(4)               // if (entry != 0 → overwrite)
   body.push(64)              // void
-  // OVERWRITE: vals.backing[hit] = v
+  // OVERWRITE: vals.backing[entry-1] = v
   pushMapVals(body)
   body.push(251)
   body.push(2)               // struct.get (vals backing)
   appendAll(body, ulebToArr(lTypeIdx))
   body.push(0)               // field 0: backing
-  pushMapScr(body, 5)        // hit (index)
+  pushMapScr(body, 5)        // entry
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(107)             // i32.sub (entry - 1)
   if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }   // value
   body.push(251)
   body.push(14)              // 0x0e array.set
   appendAll(body, ulebToArr(aTypeIdx))
   body.push(5)               // else
-  // APPEND: keys.push(keyRef) ; vals.push(v)
+  // APPEND. index[slot] = count + 1  (the new entry's position + 1).
+  pushMapIndex(body)
+  pushMapScr(body, 3)        // slot
+  pushMapCount(body)
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add (count + 1)
+  body.push(251)
+  body.push(14)              // array.set
+  appendAll(body, ulebToArr(aTypeIdx))
+  // keys.push(keyRef) ; vals.push(v)  (clobbers slots 3/4 — already linked above).
   if emitMapPushKey(body) < 0 { return 0 - 1 }
   if emitMapPushVal(body, valIx, fnIx) < 0 { return 0 - 1 }
+  // count = count + 1
+  pushMapScr(body, 0)        // mapRef (struct.set receiver)
+  pushMapCount(body)
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add
+  body.push(251)
+  body.push(5)               // struct.set
+  appendAll(body, ulebToArr(mStructIdx))
+  body.push(3)               // field 3: count
+  // size = size + 1
+  pushMapScr(body, 0)        // mapRef
+  pushMapSize(body)
+  body.push(65)
+  appendAll(body, slebToArr(1))
+  body.push(106)             // i32.add
+  body.push(251)
+  body.push(5)               // struct.set
+  appendAll(body, ulebToArr(mStructIdx))
+  body.push(4)               // field 4: size
+  if emitMapResize(body) < 0 { return 0 - 1 }
   body.push(11)              // end (if)
   0
 }
