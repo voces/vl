@@ -12,13 +12,15 @@
 // emitter renders `W.bytes` as a comma-joined decimal string via `bytesToStr()`;
 // the runner parses that back (the `bytesFromLog` wire format) into a byte array.
 //
-// The goldens are stored as plain text under `tests/golden/<name>.bytes` (one
-// comma-joined decimal byte string per file) so a byte diff is a readable line
-// diff in review. A guarded `UPDATE_GOLDEN=1` regenerate path rewrites them — a
-// DELIBERATE, reviewed act: during a pure-factoring refactor the goldens must
-// NEVER change, so a non-empty `tests/golden/*.bytes` diff in a refactor PR is a
-// red flag. Belt-and-braces: each golden is also `WebAssembly.compile`d so a
-// wrongly-regenerated golden can't lock in INVALID bytes.
+// The goldens are stored as raw binary wasm under `tests/golden/<name>.wasm`
+// (git-tracked as binary via `.gitattributes`, so they don't pollute text diffs
+// and can be inspected with standard wasm tooling). On drift the test reports the
+// exact first differing BYTE INDEX (no readable line diff needed). A guarded
+// `UPDATE_GOLDEN=1` regenerate path rewrites them — a DELIBERATE, reviewed act:
+// during a pure-factoring refactor the goldens must NEVER change, so a non-empty
+// `tests/golden/*.wasm` diff in a refactor PR is a red flag. Belt-and-braces:
+// each golden is also `WebAssembly.compile`d so a wrongly-regenerated golden
+// can't lock in INVALID bytes.
 
 import { compileCached } from "./_selfhost_cache.ts";
 import { runWasm } from "../compiler/compile.ts";
@@ -435,11 +437,7 @@ const runAll = (): Promise<Map<string, string[]>> =>
   })();
 
 const goldenPath = (name: string) =>
-  new URL(`./golden/${name}.bytes`, import.meta.url);
-
-// The comma-joined decimal wire format, exactly as the emitter prints it.
-const toWire = (bytes: Uint8Array<ArrayBuffer>): string =>
-  Array.from(bytes).join(",");
+  new URL(`./golden/${name}.wasm`, import.meta.url);
 
 // The first index at which two byte arrays differ (or the shorter length if one
 // is a prefix of the other), plus a windowed context for the diagnostic message.
@@ -481,26 +479,23 @@ GOLDENS.forEach((g) => {
     await WebAssembly.compile(actual);
 
     if (UPDATE) {
-      // Deliberate, reviewed regenerate path. Writes the comma-joined decimal
-      // wire string (the format the emitter prints and this test parses back).
+      // Deliberate, reviewed regenerate path. Writes the raw wasm bytes as a
+      // binary `.wasm` fixture (git-tracked as binary via .gitattributes).
       Deno.mkdirSync(new URL("./golden/", import.meta.url), { recursive: true });
-      Deno.writeTextFileSync(goldenPath(g.name), toWire(actual) + "\n");
+      Deno.writeFileSync(goldenPath(g.name), actual);
       return;
     }
 
-    let expectedText: string;
+    let expected: Uint8Array<ArrayBuffer>;
     try {
-      expectedText = Deno.readTextFileSync(goldenPath(g.name));
+      expected = Deno.readFileSync(goldenPath(g.name));
     } catch {
       throw new Error(
-        `missing golden tests/golden/${g.name}.bytes — ` +
+        `missing golden tests/golden/${g.name}.wasm — ` +
           `regenerate deliberately with UPDATE_GOLDEN=1 deno test -A --no-check ` +
           `tests/selfhost_emit_golden_test.ts`,
       );
     }
-    const expected: Uint8Array<ArrayBuffer> = new Uint8Array(
-      expectedText.trim().split(",").map((s) => Number(s)),
-    );
 
     const diff = firstDiff(expected, actual);
     if (diff) {
@@ -512,9 +507,12 @@ GOLDENS.forEach((g) => {
       );
     }
     // Final exact assert (a clear single source of truth alongside the windowed
-    // first-diff above).
-    if (toWire(actual) !== toWire(expected)) {
-      throw new Error(`GOLDEN DRIFT in ${g.name}: byte strings differ`);
+    // first-diff above): identical length, identical bytes.
+    if (
+      expected.length !== actual.length ||
+      !actual.every((b, i) => b === expected[i])
+    ) {
+      throw new Error(`GOLDEN DRIFT in ${g.name}: bytes differ`);
     }
   });
 });
