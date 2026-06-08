@@ -225,11 +225,11 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
     discarded). Retain the *as-written* type syntax (or its span) so the AST is lossless for
     types — also benefits hover/inlay rendering (D1/D6/D8).
   - ~~**Trailing commas**~~ — multi-line wrapped lists emit trailing commas; already shipped.
-- 🟡 **D7. Cross-references in doc-comments** — rustdoc-style `` [`Name`] `` / `[Name]` intra-doc
+- ✅ **D7. Cross-references in doc-comments** — rustdoc-style `` [`Name`] `` / `[Name]` intra-doc
   links in `///` comments; resolved via D2's symbol table; rewritten to clickable markdown links in
-  hover and completion `documentation`. REMAINING: cross-import resolution (a `Name` that is an
-  imported binding resolves to the imported symbol's source location) — needs the module graph /
-  import table reachable from the LSP's `parseSymbols` path (H0 phase 3 prerequisite).
+  hover and completion `documentation`. Cross-import resolution now done (H0 phase 3): a `Name` that
+  is an imported binding links to the exporting sibling module's source location (`siblingUri#L…`),
+  via the module graph's imported-name → source resolution (`lsp/src/moduleGraph.ts`).
 - ⬜ **D8. Preserve type-alias names in display (the "`aliasSymbol`" gap).** Today a reference to
   an alias resolves *through* to its body before rendering (e.g. hover on `type thing = "a" | I32`
   shows `"a" | i32`). Fix: carry the alias name on the resolved type and let the renderer choose
@@ -300,8 +300,15 @@ independent).*
     the open file is analyzed as the entry module — its imports resolve through a workspace
     `ModuleReader` (open buffers + disk), so imported names no longer flag "undeclared" and genuine
     import errors (bad path / not-exported / cycle) surface on the import line. Hover/completion seed
-    the same imported-name types (real types, no squiggle). REMAINING: cross-file go-to-definition /
-    find-references / doc-xref into sibling modules; the `std:` scheme (phase 2).
+    the same imported-name types (real types, no squiggle). Cross-file NAVIGATION now landed:
+    go-to-definition and doc-comment xrefs on an imported name jump to the EXPORTING sibling's
+    declaration (resolved by reading the sibling through the workspace reader and locating the
+    exported binding's decl span via the symbol table); find-references gathers occurrences across
+    the current file + other OPEN documents (a name's canonical `(exportingKey, exportedName)` is
+    matched per open doc; the importer's symbol table is graph-seeded so imported-name uses are
+    recorded). REMAINING: find-references over UNOPENED on-disk siblings (needs a scoped workspace
+    crawl — a project-root manifest to bound the `.vl` walk; today bounded to open documents, which
+    is sound + cheap); the `std:` scheme (phase 2).
   - **Deferred:** import maps, namespace/default imports, export-all, re-exports.
 - 🟡 **H2. Make VL expressive enough to write a compiler.** All H2 gaps fixed — see `CHANGELOG.md`.
   REMAINING: maps (B6a), enum tag for literal-unions (A16).

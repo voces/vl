@@ -38,10 +38,12 @@ import { tokenize } from "../../compiler/lexer.ts";
 import { parseProgram } from "../../compiler/parser.ts";
 import { defaultScope } from "../../compiler/defaultScope.ts";
 import {
+  parseSymbols,
   rangeFromCtx,
   stringifyType,
   type SymbolTable,
   type VLDiagnostic,
+  type VLRange,
 } from "../../compiler/compile.ts";
 import { lint } from "../../compiler/lint.ts";
 import type {
@@ -412,4 +414,260 @@ export const checkDocument = async (
   }
 
   return { ast, diagnostics, symbols, spans, importedScope };
+};
+
+// ---- cross-file name → source resolution -----------------------------------
+//
+// Powers cross-file go-to-definition (`onDefinition`) and cross-import doc-xref
+// links (`buildDocRefResolver`): given a LOCAL name used in the current file,
+// decide whether it is an IMPORTED binding and, if so, locate the EXPORTING
+// sibling module + the span of the export's declaration there.
+//
+// Why the symbol table (not `VLModuleExport`): a `VLModuleExport` carries the
+// export's resolved TYPE but not the span of its declaring identifier. The
+// declaration span lives in the symbol table (`Binding.decl`), stamped with
+// `binding.exported === true` for an `export`ed top-level binding. So we parse
+// the sibling with `parseSymbols` and find the exported binding whose name
+// matches the import's EXPORTED name (the `name` side of a `{ name as local }`
+// specifier — `local` is what the importer sees, `name` is what the sibling
+// declares).
+
+/** A resolved cross-file source location: the exporting module + decl range. */
+export type CrossFileSource = {
+  /** The exporting module's filesystem key (what `resolveSpecifier` produced). */
+  key: string;
+  /** The exporting module's `file://` URI (for an LSP `Location` / xref link). */
+  uri: string;
+  /** The export declaration's range, in 0-based LSP coordinates. */
+  range: VLRange;
+};
+
+/**
+ * For each LOCAL imported name in `entrySource`, the sibling source location of
+ * its export declaration — i.e. `{ add: <util.vl#decl-of-add> }`. Names whose
+ * import is unresolvable (bad specifier, missing module, not-exported) are
+ * omitted. The current file's own (non-imported) bindings are NOT included; the
+ * single-file symbol table already resolves those.
+ *
+ * `entryKey` is the current file's filesystem path; `read` resolves siblings
+ * (open buffer or disk). One level deep — exactly the imports written in the
+ * current file — which is all go-to-def / doc-xref on an imported name needs.
+ */
+export const importedNameSources = async (
+  entrySource: string,
+  entryKey: string,
+  read: ModuleReader,
+): Promise<Record<string, CrossFileSource>> => {
+  const out: Record<string, CrossFileSource> = {};
+  const { tokens } = tokenize(entrySource);
+  const [program] = parseProgram(tokens, defaultScope());
+  const imports = program.moduleImports ?? [];
+  if (imports.length === 0) return out;
+
+  // Cache a sibling's exported-name → decl range so several imports from the
+  // same module parse it once.
+  const exportsByKey = new Map<string, Record<string, VLRange>>();
+
+  for (const imp of imports) {
+    const depKey = resolveSpecifier(imp.specifier, entryKey);
+    if (depKey === undefined || depKey === entryKey) continue;
+    let exported = exportsByKey.get(depKey);
+    if (exported === undefined) {
+      const depSource = await read(depKey);
+      exported = depSource === undefined
+        ? {}
+        : exportedDeclRanges(depSource);
+      exportsByKey.set(depKey, exported);
+    }
+    for (const spec of imp.specifiers) {
+      const range = exported[spec.name];
+      if (range === undefined) continue; // not-exported / unresolvable
+      out[spec.local] = { key: depKey, uri: pathToUri(depKey), range };
+    }
+  }
+  return out;
+};
+
+/**
+ * Resolve ONE local imported name to its sibling source location, or `undefined`
+ * when the name isn't an (resolvable) imported binding. Thin convenience over
+ * {@link importedNameSources} for a single lookup.
+ */
+export const importedNameSource = async (
+  name: string,
+  entrySource: string,
+  entryKey: string,
+  read: ModuleReader,
+): Promise<CrossFileSource | undefined> =>
+  (await importedNameSources(entrySource, entryKey, read))[name];
+
+/**
+ * The exported-name → declaration range map for a module's source: every
+ * top-level binding that carried an `export` modifier, keyed by its declared
+ * (exported) name, valued by the 0-based LSP range of its declaring identifier.
+ *
+ * Driven by the symbol table's `exported` bindings: `parseSymbols` records a
+ * `Binding` per declaration with `binding.exported === true` for an `export`ed
+ * top-level binding and `binding.decl` the span of its name. We pick the
+ * declaration occurrence (`isDecl`) so the range points at the definition, not a
+ * later use.
+ */
+const exportedDeclRanges = (source: string): Record<string, VLRange> => {
+  const symbols = parseSymbols(source);
+  const out: Record<string, VLRange> = {};
+  for (const occ of symbols.occurrences) {
+    if (!occ.isDecl) continue;
+    const { binding } = occ;
+    if (!binding.exported) continue;
+    // First decl wins (a redeclaration is a separate error surfaced elsewhere).
+    if (out[binding.name] === undefined) out[binding.name] = rangeFromCtx(binding.decl);
+  }
+  return out;
+};
+
+// ---- cross-file find-references --------------------------------------------
+//
+// Scope (deliberately bounded — DOCUMENTED, not a full-disk crawl): references to
+// a symbol are searched in the CURRENT file plus every OTHER OPEN document. We do
+// NOT crawl the whole workspace from disk: that would require enumerating and
+// parsing every `.vl` file (an unbounded, potentially slow filesystem walk with
+// no project-root manifest to scope it), and the LSP only holds authoritative,
+// unsaved-edit-aware text for the documents the editor has OPEN. Searching open
+// documents is sound (their text is current) and cheap (bounded by the editor
+// session). A reference in an unopened sibling on disk is not reported; the plan
+// to extend to a disk crawl is recorded in ROADMAP.
+//
+// A symbol's identity across files is its CANONICAL export: the
+// `(exportingKey, exportedName)` pair. Within the exporting module the symbol is
+// the local declaration of `exportedName`; in an importing module it's whatever
+// LOCAL name aliases that export (`import { exportedName as local }`). So we
+// resolve the cursor to a canonical export, then, per open document, find the
+// local name that denotes it and collect that binding's occurrences.
+
+/** A located reference: the document URI + the occurrence's 0-based range. */
+export type CrossFileReference = { uri: string; range: VLRange };
+
+/** One open document the references search ranges over. */
+export type OpenDocument = { uri: string; text: string };
+
+/**
+ * The canonical export a symbol denotes: the module that DECLARES it and the
+ * name it's exported under. `undefined` when the symbol isn't a cross-module
+ * symbol (a purely-local binding, or an unresolvable import) — the caller then
+ * stays single-file.
+ */
+type CanonicalExport = { key: string; exportedName: string };
+
+/**
+ * Resolve the symbol named `local` (used in the document at `entryKey`) to its
+ * canonical export, or `undefined`. Two cases:
+ *   - `local` is IMPORTED here → `(resolvedSpecifierKey, importedExportName)`.
+ *   - `local` is a local binding declared+EXPORTED here → `(entryKey, local)`.
+ * A purely-local (non-exported) binding has no cross-module identity → undefined
+ * (the caller reports only same-file references for it).
+ *
+ * Synchronous: it only inspects the CURRENT file's own import/export surface
+ * (`entrySource`), never a sibling, so it needs no `ModuleReader`.
+ */
+const canonicalExportOf = (
+  local: string,
+  entrySource: string,
+  entryKey: string,
+): CanonicalExport | undefined => {
+  const { tokens } = tokenize(entrySource);
+  const [program] = parseProgram(tokens, defaultScope());
+
+  // Imported here? Find the import specifier whose LOCAL name is `local`.
+  for (const imp of program.moduleImports ?? []) {
+    const spec = imp.specifiers.find((s) => s.local === local);
+    if (!spec) continue;
+    const depKey = resolveSpecifier(imp.specifier, entryKey);
+    if (depKey === undefined || depKey === entryKey) return undefined;
+    return { key: depKey, exportedName: spec.name };
+  }
+
+  // Locally declared AND exported here?
+  if ((program.moduleExports ?? {})[local]) {
+    return { key: entryKey, exportedName: local };
+  }
+  return undefined;
+};
+
+/**
+ * The LOCAL name that denotes the canonical export `(target.key/exportedName)`
+ * inside the document at `docKey`, or `undefined` when this document neither
+ * declares nor imports it. In the exporting module the local name IS the
+ * exported name; in an importer it's the import specifier's `local`.
+ */
+const localNameForExport = (
+  docKey: string,
+  docSource: string,
+  target: CanonicalExport,
+): string | undefined => {
+  if (docKey === target.key) return target.exportedName; // the declaring module
+  const { tokens } = tokenize(docSource);
+  const [program] = parseProgram(tokens, defaultScope());
+  for (const imp of program.moduleImports ?? []) {
+    const depKey = resolveSpecifier(imp.specifier, docKey);
+    if (depKey !== target.key) continue;
+    const spec = imp.specifiers.find((s) => s.name === target.exportedName);
+    if (spec) return spec.local;
+  }
+  return undefined;
+};
+
+/**
+ * Cross-file find-references (H0 phase 3). Given the cursor on a name in the
+ * current file, return every reference to that symbol's canonical export across
+ * the current file and the supplied OPEN documents (see the scope note above).
+ *
+ * Returns `undefined` when the symbol has no cross-module identity (a purely
+ * local binding); the caller then falls back to the single-file references path.
+ *
+ * `name` is the identifier under the cursor; `entrySource`/`entryKey` the current
+ * document; `openDocs` the other open documents (the current file may be included
+ * or not — it's de-duplicated by key); `includeDeclaration` mirrors the LSP flag.
+ */
+export const crossFileReferences = async (
+  name: string,
+  entrySource: string,
+  entryKey: string,
+  openDocs: OpenDocument[],
+  read: ModuleReader,
+  includeDeclaration = true,
+): Promise<CrossFileReference[] | undefined> => {
+  const target = canonicalExportOf(name, entrySource, entryKey);
+  if (target === undefined) return undefined;
+
+  // The current file plus the open documents, de-duplicated by module key.
+  const docsByKey = new Map<string, OpenDocument>();
+  docsByKey.set(entryKey, { uri: pathToUri(entryKey), text: entrySource });
+  for (const d of openDocs) {
+    const key = uriToPath(d.uri);
+    if (!docsByKey.has(key)) docsByKey.set(key, d);
+  }
+
+  const refs: CrossFileReference[] = [];
+  for (const [docKey, doc] of docsByKey) {
+    const localName = localNameForExport(docKey, doc.text, target);
+    if (localName === undefined) continue;
+    // Use the GRAPH-SEEDED symbol table: in an importing module a use of the
+    // imported `localName` only resolves to a binding (and is recorded as an
+    // occurrence) when the parse scope is seeded with the import's type — exactly
+    // what `checkDocument` does. In the exporting module the binding is its real
+    // local declaration; a no-import seed leaves that path unchanged.
+    const { symbols } = await checkDocument(doc.text, docKey, read);
+    for (const occ of symbols.occurrences) {
+      if (occ.binding.name !== localName) continue;
+      // In an importing module the synthesized declaration occurrence points at
+      // the import statement (not a real definition); skip it when the client
+      // excludes declarations, OR when it's an importer (the canonical decl lives
+      // in the exporting module, reported there). In the exporting module the
+      // declaration IS the real definition.
+      const isImporter = docKey !== target.key;
+      if (occ.isDecl && (isImporter || !includeDeclaration)) continue;
+      refs.push({ uri: doc.uri, range: rangeFromCtx(occ.span) });
+    }
+  }
+  return refs;
 };
