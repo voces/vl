@@ -617,24 +617,30 @@ let raTypeIdx: i32 = 0
 let rlTypeIdx: i32 = 0
 let rElemKind: i32 = 0
 
-// ── string-keyed map table (G8: `{[string]: i32}` via parallel lists) ─────────
-// A string-keyed map `{[string]: i32}` lowers to the SIMPLEST correct rep — two
-// PARALLEL growable lists + linear scan (NO hashing/probing): a 2-field WasmGC
-// struct `MAP = { keys: (ref $mkList), vals: (ref $lTypeIdx) }` where
+// ── string-keyed map table (G8: `{[string]: i32}` open-addressing hash map) ────
+// A string-keyed map `{[string]: i32}` lowers to a REAL ordered open-addressing
+// hash map (mirroring the host's `compiler/builtins/maps.ts`), a 5-field WasmGC
+// struct `MAP = { keys, vals, index, count, size }` where
 //   • `keys` is a growable list of STRING refs — the wrapper `{ backing: (ref
 //     $mkArr), len, cap }` over a backing `(array (mut (ref null $aTypeIdx)))`
 //     (a string IS the raw `(array i32)` at `aTypeIdx`, so a keys element is a
 //     nullable ref to that array); its wrapper heap-type index is `mkListIdx`,
-//     its backing `mkArrIdx`.
-//   • `vals` is the EXISTING growable i32 list (`lTypeIdx` over `aTypeIdx`) — a
-//     map's value type in the self-host checker is always `i32` (a type-arena
-//     index), so the value list reuses the i32-list machinery unchanged.
-// The map struct's heap-type index is `mStructIdx`. Operations are O(n) linear
-// scans over `keys` (string `==`, the G6 element-wise compare): set overwrites
-// `vals[i]` on a hit else appends to both lists; get/`??` returns `vals[i]` or
-// the default; `.has`/`in` returns 1/0. The checker's scopes are small, so the
-// scan is correct and fast enough. A map forces `aUsed`+`lUsed` (the vals list +
-// the string backing) plus these three dedicated types.
+//     its backing `mkArrIdx`. Holds the INSERTION-ORDERED entry keys.
+//   • `vals` is the EXISTING growable i32 list (`lTypeIdx` over `aTypeIdx`) — the
+//     insertion-ordered entry values; the checker's map value type is always i32.
+//   • `index` is a raw i32 array `(ref $aTypeIdx)` of hash slots → entry-position
+//     + 1 (0 = empty). Initial capacity 8, doubled on load factor 1/2.
+//   • `count` = entries appended; `size` = live entry count. (No delete in the op
+//     set, so count == size always; both kept for forward-compatibility — a `live`
+//     tombstone array can be added later — and to drive the resize threshold.)
+// The map struct's heap-type index is `mStructIdx`. Operations hash the key
+// (FNV-1a, `emitMapHashOf`) into `index` and LINEAR-PROBE (`emitMapProbe`) to a
+// free-or-matching slot, comparing keys with the G6 element-wise string `==`: set
+// overwrites `vals[entry-1]` on a hit else appends an ordered entry + links the
+// index slot + bumps count/size + resizes (`emitMapResize`); get/`??` returns
+// `vals[entry-1]` or the default; `.has`/`in` returns 1/0. DELETE/tombstones are
+// DEFERRED (the checker's op set has none). A map forces `aUsed`+`lUsed` (the vals
+// list + the string backing) plus these three dedicated types.
 let mUsed: boolean = false
 let mkArrIdx: i32 = 0
 let mkListIdx: i32 = 0
@@ -1612,20 +1618,25 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected an array literal")
 }
 
-// ── G8: string-keyed maps (`{[string]: i32}`) via parallel lists + linear scan ─
-// A map is `MAP = { keys: (ref $mkListIdx), vals: (ref $lTypeIdx) }`: a string-keys
-// list + an i32-vals list, kept PARALLEL (entry `i` is `keys[i] -> vals[i]`). Every
-// operation is an O(n) linear scan over `keys` with the G6 ELEMENT-WISE string `==`
-// — NO hashing, NO probing. A function that touches a map reserves a small scratch
-// frame (`mapScratchBase` + 0..5):
-//   +0 mapRef  : (ref $mStructIdx)  — the map value
-//   +1 keyRef  : (ref $aTypeIdx)    — the target key string
-//   +2 curRef  : (ref $aTypeIdx)    — the current scanned key string
-//   +3 idx     : i32                — scan cursor
-//   +4 cnt     : i32                — keys.len (scan bound)
-//   +5 hit     : i32                — found index (-1 if absent)
-// The scan leaves `hit` = the matching entry index, or -1. Built once and reused by
-// set / get / `??` / `.has`.
+// ── G8: string-keyed maps (`{[string]: i32}`) — open-addressing hash map ───────
+// A map is the 5-field `MAP = { keys, vals, index, count, size }` (see the map-table
+// section above for the full representation). Operations HASH the key (FNV-1a) into
+// `index` and LINEAR-PROBE to a free-or-matching slot — NO O(n) scan. A function that
+// touches a map reserves a 12-slot scratch frame (`mapScratchBase` + 0..11):
+//   +0  mapRef : (ref $mStructIdx)  — the map value
+//   +1  keyRef : (ref $aTypeIdx)    — the target key string
+//   +2  curRef : (ref $aTypeIdx)    — the current probed key string
+//   +3  slot   : i32                — probe slot offset into `index`
+//   +4  cap    : i32                — index length / newCap (resize)
+//   +5  entry  : i32                — index[slot] (entry+1; 0 = miss)
+//   +6  keysBk : (ref $mkArrIdx)    — grown keys backing
+//   +7  valsBk : (ref $aTypeIdx)    — grown vals backing
+//   +8  chr    : i32                — inner char cursor (key compare / hash)
+//   +9  hcur   : i32                — FNV hash accumulator
+//   +10 idxBk  : (ref $aTypeIdx)    — fresh `index` backing (resize)
+//   +11 rslot  : i32                — inner probe slot (resize)
+// `emitMapProbe` leaves `slot` = the probe slot and `entry` = index[slot]; reused by
+// set / get / `??` / `.has`. `emitMapResize` rehashes at load factor 1/2.
 
 let fnUsesMap: boolean = false
 let mapScratchBase: i32 = 0
