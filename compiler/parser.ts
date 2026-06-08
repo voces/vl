@@ -1922,8 +1922,16 @@ export const parseProgram = (
 
       // The block's value type is its last statement's type — derive it now,
       // while this block's scope (and any nested declarations) is still live.
+      // A statement that follows an explicit `return` in the same block is dead
+      // code (newlines are soft boundaries, so `return 1 print(9)` is two
+      // statements): it is NOT the block's implicit return value, and the
+      // explicit `return` already carried/checked the result. Treating it as the
+      // implicit value would spuriously check e.g. `print(9): null` against the
+      // annotated `i32` return type. The unreachable-code lint flags such code.
       let valueType: VLType | undefined;
-      if (statements.length > 0) {
+      const tailReturns = statements.length > 1 &&
+        statements.slice(0, -1).some(([, s]) => s.type === "Return");
+      if (statements.length > 0 && !tailReturns) {
         const [lctx, lstmt] = statements[statements.length - 1];
         valueType = typeFromStatement(lstmt, lctx);
       }

@@ -194,6 +194,13 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   step; can't be part of a self-hosted compiler). Chose hand-written (Pratt)
   over peggy/parser-combinators for error quality and bootstrappability. (Track
   G)
+- **Newlines are SOFT statement boundaries.** Never force-required — statements
+  abut freely on one line (`let a = 1 let b = 2`, `return 1 print(9)`). A newline
+  is load-bearing only where omitting it is genuinely ambiguous (a leading
+  `+`/`-` that would otherwise continue the previous expression: `a` ⏎ `-b` is
+  two statements, `a - b` is subtraction) or carries a real perf cost. Applies to
+  both the TS parser and the self-hosted `parser.vl` being built for the
+  bootstrap. (G8)
 - **Distribute via `deno compile`.** A single native `vl` binary (V8 + the TS
   compiler + binaryen.js) through brew; versionless for now. Chosen over
   hand-rolling a wasm-native bundle so distribution ships now, decoupled from
