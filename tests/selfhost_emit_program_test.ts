@@ -385,6 +385,59 @@ const CASES: Case[] = [
     },
   },
   {
+    // The VL implicit-return idiom INSIDE an `if`/`else` that is the function body
+    // tail: each arm ends in a bare VALUE expression (no `return` keyword), so the
+    // arm's value IS the function's return. This is the shape `typecheck.vl` uses
+    // pervasively (e.g. `digitChar`-style dispatchers, `assignable` arms). emitProgram
+    // now lowers the body-tail `if`/`else` tail-aware so each arm's trailing value
+    // expression becomes the return. Drives real lexer->parser->emitProgram->engine.
+    name: "implicit-return tail VALUE inside an if/else body tail (`if c { a } else { b }`)",
+    src: [
+      "function pick(n: i32): i32 {",
+      "  if n > 0 {",
+      "    n + 1",
+      "  } else {",
+      "    n - 1",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      if (await runExport(bytes, "pick", 41) !== 42) {
+        throw new Error("pick(41) != 42");
+      }
+      if (await runExport(bytes, "pick", -5) !== -6) {
+        throw new Error("pick(-5) != -6");
+      }
+    },
+  },
+  {
+    // A body-tail else-if chain where each arm ends in a bare value (implicit return),
+    // MIXED with an explicit `return` in one arm — the tail path lowers a value arm as
+    // a return and leaves an explicit `return` arm unchanged. `g(20)=>21`, `g(7)=>14`
+    // (explicit return), `g(1)=>0` (1-1).
+    name: "implicit-return value arms mixed with an explicit return in an else-if tail",
+    src: [
+      "function g(n: i32): i32 {",
+      "  if n > 10 {",
+      "    n + 1",
+      "  } else if n > 5 {",
+      "    return n * 2",
+      "  } else {",
+      "    n - 1",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      if (await runExport(bytes, "g", 20) !== 21) throw new Error("g(20) != 21");
+      if (await runExport(bytes, "g", 7) !== 14) throw new Error("g(7) != 14");
+      if (await runExport(bytes, "g", 1) !== 0) throw new Error("g(1) != 0");
+    },
+  },
+  {
     // REGRESSION: a `let` buried in the THIRD arm of a long `if / else if / else if
     // / else` chain INSIDE a while body. `collectLocals` used to hand-unroll only the
     // FIRST nested `else if`, so the slot for `c` (and `d`) was never allocated and
