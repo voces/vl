@@ -2939,6 +2939,101 @@ const CASES: Case[] = [
       if (got !== 7) throw new Error(`f() returned ${got}, expected 7`);
     },
   },
+  {
+    // A `.push` buried under 2+ `else if` arms (the `parseProgram` / `parseStmt`
+    // recursive-descent dispatch shape: `if k=="EOF" {} else if k=="NL" { adv() }
+    // else if k=="IMPORT" { skip() } else { stmts.push(parseStmt()) }`). The
+    // scratch-reservation walkers (`blockHasPushKind`/`blockHasStrOp`/the ref-push
+    // slot collector) used a HAND-UNROLLED one-level else-if descent, so a push (or
+    // string op) under the SECOND-or-later `else if` was missed — the function then
+    // reserved no push scratch and the append wrote into local 0, failing to validate
+    // (`local.set[0] expected (ref N), found call of type i32`). Now they recurse the
+    // whole else-if chain. Drives real lexer->parser->emitProgram->engine.
+    name: "G3: `.push` under 2+ `else if` arms reserves scratch correctly => 4",
+    src: [
+      "function f(): i32 {",
+      "  let stmts: i32[] = []",
+      "  let i = 0",
+      "  while i < 8 {",
+      "    let k = i % 4",
+      "    if k == 0 {",
+      "      i = i + 1",
+      "    } else if k == 1 {",
+      "      i = i + 1",
+      "    } else if k == 2 {",
+      "      i = i + 1",
+      "    } else {",
+      "      stmts.push(i)",
+      "      i = i + 1",
+      "    }",
+      "  }",
+      "  return stmts.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // i in 0..7; k==3 at i=3 and i=7 → 2 pushes → length 2... recompute: k=i%4==3
+      // when i==3 and i==7 → 2 elements. Expect 2.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 2) throw new Error(`f() returned ${got}, expected 2`);
+    },
+  },
+  {
+    // CONSTRUCTION-side counterpart: a struct `string[]` field built from a `string[]`
+    // SOURCE local (not a literal / not empty) — the `mkUnionDecl { udVariants: variants }`
+    // shape in `ast.vl`. The `i32[]` analogue (`{ items: xs }`) already works; this proves
+    // the string-list wrapper ref is supplied for the field value (not a bare i32).
+    name: "G5: construct a struct `string[]` field from a `string[]` SOURCE local => 3",
+    src: [
+      "type UnionDecl = { udName: string, udVariants: string[] }",
+      "function f(): i32 {",
+      "  let variants: string[] = [\"A\", \"B\", \"C\"]",
+      "  let n: UnionDecl = { udName: \"E\", udVariants: variants }",
+      "  let r = n.udVariants.length",
+      "  if n.udVariants[2] == \"C\" { r = r + 0 } else { r = 0 }",
+      "  return r",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // udVariants = ["A","B","C"]; length 3, udVariants[2]=="C" → 3.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 3) throw new Error(`f() returned ${got}, expected 3`);
+    },
+  },
+  {
+    // The EXACT `ast.vl` `mkUnionDecl` shape: a UNION-VARIANT `string[]` field built from
+    // a `string[]` PARAMETER (not a local, not a literal). This is the real instantiation
+    // blocker — the variant-struct construction supplies an i32 where the string-list
+    // wrapper ref is expected.
+    name: "G5: construct a UNION-VARIANT `string[]` field from a `string[]` PARAM => 3",
+    src: [
+      "type UnionDecl = { udName: string, udVariants: string[] }",
+      "type Other = { v: i32 }",
+      "type Node = UnionDecl | Other",
+      "function mkUnionDecl(name: string, variants: string[]): Node {",
+      "  let n: Node = { udName: name, udVariants: variants }",
+      "  return n",
+      "}",
+      "function f(d: Node): i32 {",
+      "  if d is UnionDecl {",
+      "    let r = d.udVariants.length",
+      "    if d.udVariants[2] == \"C\" { r = r + 0 } else { r = 0 }",
+      "    return r",
+      "  }",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  let variants: string[] = [\"A\", \"B\", \"C\"]",
+      "  return f(mkUnionDecl(\"E\", variants))",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
   // ── struct-typed params in a mutually-recursive / forward-referencing group (#6) ──
   // Passing a struct VALUE into a forward-referenced / mutually-recursive callee whose
   // param is a struct type. The keystone was a literal argument constructing as a
