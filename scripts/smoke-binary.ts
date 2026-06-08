@@ -68,6 +68,16 @@ await ensureBinary();
 BIN = await Deno.realPath(BIN); // absolute, so child-cwd overrides still find it
 console.error(`smoke-testing ${BIN}\n`);
 
+// A small, self-contained clean program used by the build/check smoke checks
+// (formerly samples/functions.vl, since removed). Kept trivial on purpose —
+// these checks exercise the binary's compile/build/check plumbing, not any
+// particular language feature.
+const cleanFile = await Deno.makeTempFile({ suffix: ".vl" });
+await Deno.writeTextFile(
+  cleanFile,
+  "function add(a: i32, b: i32) a + b\nprint(add(1, 2))\n",
+);
+
 // 1. run an inline snippet — exercises compile + binaryen codegen + runWasm.
 {
   const r = await run(["-e", "print(1 + 2)"]);
@@ -83,7 +93,7 @@ console.error(`smoke-testing ${BIN}\n`);
 // 3. build to a .wasm (+ .wat) — exercises binaryen emit + wasmToWat read-back.
 {
   const out = await Deno.makeTempFile({ suffix: ".wasm" });
-  const r = await run(["build", "samples/functions.vl", "-o", out, "--wat"]);
+  const r = await run(["build", cleanFile, "-o", out, "--wat"]);
   let wasmOk = false;
   try {
     wasmOk = (await Deno.stat(out)).size > 0;
@@ -95,7 +105,7 @@ console.error(`smoke-testing ${BIN}\n`);
 
 // 4. check a clean file — exit 0.
 {
-  const r = await run(["check", "samples/functions.vl"]);
+  const r = await run(["check", cleanFile]);
   check("check clean (exit 0)", r.code === 0, `exit ${r.code}`);
 }
 
@@ -160,12 +170,13 @@ await Deno.writeTextFile(badFile, `let a = 1\na = "x"\n`);
 
 // 10. clean single-file pretty check — exit 0 with the no-errors summary.
 {
-  const r = await run(["check", "samples/functions.vl"]);
+  const r = await run(["check", cleanFile]);
   const ok = r.code === 0 && /no errors\./.test(r.stderr);
   check("check pretty clean summary (exit 0)", ok, r.stderr || `exit ${r.code}`);
 }
 
 await Deno.remove(badFile).catch(() => {});
+await Deno.remove(cleanFile).catch(() => {});
 
 // A file that type-checks cleanly but throws in codegen: `Tree` recurses through
 // a MAP value that is itself a LIST of Tree (`{ [string]: Tree[] }`), so the cycle

@@ -10,7 +10,7 @@ Status: 🟡 partial · ⬜ not started.
 
 **Repo layout:** `compiler/` — the language core (compile, toAST, typecheck, toWasm, defaultScope) ·
 `lsp/` — the VS Code extension + LSP server over the core · `grammar/` — the `.g4` spec (reference
-only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + runner · `docs/` ·
+only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs/` ·
 `reference/` — retired ts-interpreter. Tracks are **independent** unless a dependency is called out.
 
 > **Maintaining this file.** The roadmap is *forward-looking* — what to do next, why, dependencies,
@@ -169,7 +169,9 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   code-point-indexed API made O(1) for the ASCII common case via an ASCII fast-path flag; strings
   immutable. Ties A7.
 - 🟡 **B8. Loops.** REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
-  destructuring forms.
+  destructuring forms; **expression `step`** on a counter range (`for i = 1 to 5 step i * 2` — a
+  multiplicative/variable step, not just a const increment), distinct from the const-step
+  build-loop-fusion descriptor (DECISIONS) and the `step 0` lint (B17).
 - ⬜ **B12. `async`/`await`.** Keywords lexed; no semantics/codegen. Large; likely last.
 - 🟡 **B13. Well-known-symbol dispatch.** REMAINING: callable objects (`"()"`).
 - ⬜ **B13a. Multi-index matrix idiom** (low priority). Single-bracket `m[i, j]` → multi-arg

@@ -13,7 +13,7 @@ toWasm.ts (binaryen WasmGC codegen) → wasm`. The headless entry point is `comp
 - `compiler/` — the language core (compile, the parser, toAST, typecheck, toWasm, defaultScope).
 - `lsp/` — VS Code extension + LSP server over the core (`lsp/src/server.ts`).
 - `tests/` — the `.vl` corpus (`tests/cases/**`) + the runner (`tests/run.ts`).
-- `samples/`, `docs/`, `reference/` (retired ts-interpreter, excluded from lint/test).
+- `docs/`, `reference/` (retired ts-interpreter, excluded from lint/test).
 
 The parser is **hand-written** (`compiler/lexer.ts` + `compiler/parser.ts`) — no antlr, no grammar
 file; the lexer/parser are the grammar.
