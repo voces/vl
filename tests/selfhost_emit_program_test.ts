@@ -2880,6 +2880,28 @@ const CASES: Case[] = [
       if (got !== 4) throw new Error(`main() returned ${got}, expected 4`);
     },
   },
+  {
+    // A `string[]` field ALONGSIDE a map in the same program: both want the string-ref
+    // list types (keys backing + wrapper) — they SHARE `mkArrIdx`/`mkListIdx` (the map
+    // struct adds one more type), so the type-section offsets must stay consistent.
+    name: "G5: a `string[]` field and a map coexist (shared string-list types) => 7",
+    src: [
+      "type Box = { names: string[] }",
+      "function f(): i32 {",
+      "  let b: Box = { names: [\"a\", \"b\"] }",
+      "  b.names.push(\"c\")",
+      "  let m: {[string]: i32} = Map()",
+      "  m[\"x\"] = 4",
+      "  return b.names.length + m[\"x\"]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // names length 3 + m["x"] (4) = 7.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 7) throw new Error(`f() returned ${got}, expected 7`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
