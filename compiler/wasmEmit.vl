@@ -747,8 +747,11 @@ function checkLocalI32(letIx: i32): i32 {
     if d.letType >= 0 {
       let ty = P.nodes[d.letType]
       if ty is TypeRef {
+        // `boolean` rides in an i32 (0/1), so a `boolean` local is the SAME i32 slot.
         if ty.tyName != "i32" {
-          return emitFail("emitProgram: only i32 locals are supported")
+          if ty.tyName != "boolean" {
+            return emitFail("emitProgram: only i32 locals are supported")
+          }
         }
       } else {
         return emitFail("emitProgram: local type is not a type name")
@@ -759,22 +762,18 @@ function checkLocalI32(letIx: i32): i32 {
   emitFail("emitProgram: not a local declaration")
 }
 
-// Reject init expressions that cannot yield an i32: a non-i32 literal (string, char,
-// bool, or a float `NumLit` whose lexeme has a `.`) fails loudly. i32 literals,
-// identifiers, parens, unary/binary arithmetic and calls are all i32 in this slice,
-// so they pass (the per-node emitters re-check operand shapes). Returns 0, or -1.
+// Reject init expressions that cannot yield an i32: a string literal, or a float
+// `NumLit` whose lexeme has a `.`, fails loudly. `BoolLit` (true=1 / false=0) and
+// `CharLit` (a code point) ARE i32 values — they ride in an i32 — so they pass. i32
+// literals, identifiers, parens, unary/binary arithmetic and calls are all i32 in
+// this slice, so they pass too (the per-node emitters re-check operand shapes).
+// Returns 0, or -1.
 function checkExprI32(exprIx: i32): i32 {
   if exprIx < 0 {
     return emitFail("emitProgram: missing local initializer expression")
   }
   let e = P.nodes[exprIx]
   if e is StrLit {
-    return emitFail("emitProgram: only i32 locals are supported")
-  }
-  if e is CharLit {
-    return emitFail("emitProgram: only i32 locals are supported")
-  }
-  if e is BoolLit {
     return emitFail("emitProgram: only i32 locals are supported")
   }
   if e is NumLit {
@@ -1513,6 +1512,25 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     appendAll(body, slebToArr(parseI32(e.numText)))
     return 0
   }
+  if e is BoolLit {
+    // `boolean` rides in an i32: true=1, false=0 (already decoded into `boolVal`).
+    body.push(65)            // 0x41 i32.const
+    appendAll(body, slebToArr(e.boolVal))
+    return 0
+  }
+  if e is CharLit {
+    // A char literal IS its single Unicode code point as an i32. `charText` is the RAW
+    // lexeme (quotes kept, escapes unresolved), so decode it the SAME way string
+    // literals decode (`decodeStr` strips the quotes + resolves escapes); a well-formed
+    // char yields exactly one code point.
+    let cps = decodeStr(strToCps(e.charText))
+    if cps.length != 1 {
+      return emitFail("emitProgram: char literal must denote exactly one code point")
+    }
+    body.push(65)            // 0x41 i32.const
+    appendAll(body, slebToArr(cps[0]))
+    return 0
+  }
   if e is Ident {
     // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
     let idx = localIndexOf(fnIx, e.identName)
@@ -2099,15 +2117,18 @@ function checkParams(fnIx: i32): i32 {
         }
         let ty = P.nodes[p.parType]
         if ty is TypeRef {
-          // i32, the declared struct type, an array (`i32[]`), or `string` (the SAME
-          // `array i32` of code points) are allowed; anything else fails. (`collectA`
-          // already validated every array annotation is i32[].)
+          // i32, `boolean` (which rides in an i32, 0/1 — encoded as the SAME 0x7f
+          // valtype), the declared struct type, an array (`i32[]`), or `string` (the
+          // SAME `array i32` of code points) are allowed; anything else fails.
+          // (`collectA` already validated every array annotation is i32[].)
           if ty.tyName != "i32" {
-            if !isSName(ty.tyName) {
-              if !isUName(ty.tyName) {
-                if !nameIsArray(ty.tyName) {
-                  if !nameIsString(ty.tyName) {
-                    return emitFail("emitProgram: only i32, struct, union, array, or string parameters are supported")
+            if ty.tyName != "boolean" {
+              if !isSName(ty.tyName) {
+                if !isUName(ty.tyName) {
+                  if !nameIsArray(ty.tyName) {
+                    if !nameIsString(ty.tyName) {
+                      return emitFail("emitProgram: only i32, boolean, struct, union, array, or string parameters are supported")
+                    }
                   }
                 }
               }

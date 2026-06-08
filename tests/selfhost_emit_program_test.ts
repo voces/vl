@@ -1360,6 +1360,121 @@ const CASES: Case[] = [
       if (got !== 17) throw new Error(`main() returned ${got}, expected 17`);
     },
   },
+  // ── G3: boolean params/locals/returns + BoolLit/CharLit ─────────────────────
+  // `boolean` rides in an i32 (true=1 / false=0), so it reuses the i32 valtype (0x7f)
+  // everywhere — boolean params/locals/returns are i32 slots, `BoolLit` lowers to
+  // `i32.const 1`/`0`, and `CharLit` to `i32.const <code point>`. These prove real
+  // `WebAssembly.instantiate` over the VL-emitted bytes — source → arena → bytes →
+  // engine — and the correct runtime VALUES (true=1, false=0, char code correct).
+  {
+    name: "G3: a `boolean` param is returned (true => 1, false => 0)",
+    src: [
+      "function id(b: boolean): boolean {",
+      "  return b",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const t = await runExport(bytes, "id", 1);
+      if (t !== 1) throw new Error(`id(true) returned ${t}, expected 1`);
+      const f = await runExport(bytes, "id", 0);
+      if (f !== 0) throw new Error(`id(false) returned ${f}, expected 0`);
+    },
+  },
+  {
+    name: "G3: a `BoolLit` condition (`if true { return 1 }`) => 1",
+    src: [
+      "function main(): i32 {",
+      "  if true { return 1 }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    name: "G3: `false` in a condition takes the other branch => 9",
+    src: [
+      "function main(): i32 {",
+      "  if false { return 0 }",
+      "  return 9",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 9) throw new Error(`main() returned ${got}, expected 9`);
+    },
+  },
+  {
+    name: "G3: a function returning `boolean` (a comparison) => 1",
+    src: [
+      "function gt(a: i32, b: i32): boolean {",
+      "  return a > b",
+      "}",
+      "function main(): i32 {",
+      "  if gt(5, 3) { return 1 }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      const main = await runMain(bytes);
+      if (main !== 1) throw new Error(`main() returned ${main}, expected 1`);
+      const t = await runExport(bytes, "gt", 5, 3);
+      if (t !== 1) throw new Error(`gt(5, 3) returned ${t}, expected 1`);
+      const f = await runExport(bytes, "gt", 2, 8);
+      if (f !== 0) throw new Error(`gt(2, 8) returned ${f}, expected 0`);
+    },
+  },
+  {
+    name: "G3: a `boolean` local drives an `if`, then is returned => 1",
+    src: [
+      "function main(): i32 {",
+      "  let ok: boolean = true",
+      "  if ok { return 1 }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    name: "G3: a `CharLit` (`'a'`) lowers to its code point => 97",
+    src: [
+      "function main(): i32 {",
+      "  return 'a'",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 97) throw new Error(`main() returned ${got}, expected 97`);
+    },
+  },
+  {
+    name: "G3: a `CharLit` local + arithmetic (`'A' + 1` => 66)",
+    src: [
+      "function main(): i32 {",
+      "  let c = 'A'",
+      "  return c + 1",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 'A' is U+0041 = 65, + 1 = 66.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 66) throw new Error(`main() returned ${got}, expected 66`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
