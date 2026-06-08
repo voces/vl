@@ -24,7 +24,6 @@ import {
 import { TextDocument } from "vscode-languageserver-textdocument";
 import {
   checkOnly,
-  compile,
   parseSymbols,
   rangeFromCtx,
   stringifyType,
@@ -599,7 +598,7 @@ connection.onHover(async (params): Promise<Hover | null> => {
   if (importedType) {
     return { contents: hoverMarkdown(`${word}: ${stringifyType(importedType)}`) };
   }
-  const { ast } = await compile(document.getText());
+  const { ast } = checkOnly(document.getText());
   const type = ast?.scope[word];
   if (!type) return null;
 
@@ -760,7 +759,7 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   if (charBeforeCursor === ".") {
     const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
     if (!receiver) return [];
-    const { ast } = await compile(text);
+    const { ast } = checkOnly(text);
     if (!ast) return [];
     // Fold imported names in so an imported object can be a member receiver.
     const scope = { ...ast.scope, ...importedScope };
@@ -777,7 +776,7 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   // builtins (from `defaultScope`) plus top-level names; user bindings from the
   // symbol table override same-named builtins inside `identifierCompletions`.
   // Keyword and snippet completions are appended for statement-position typing.
-  const { ast } = await compile(text);
+  const { ast } = checkOnly(text);
   // Fold imported names into the completion scope so they're suggested with
   // their real types alongside builtins + top-level names.
   const builtins = { ...(ast?.scope ?? {}), ...importedScope };
