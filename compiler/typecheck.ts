@@ -141,6 +141,15 @@ export const _typeFromExpression = (
           () => typeFromExpression(expr.right, ctx),
         )
         : typeFromExpression(expr.right, ctx);
+      // An ASSIGNMENT expression `x = v` (a plain `=`, reached only when its value
+      // is USED — e.g. a block-tail `{ x = v }`) yields the assigned value; the
+      // write itself was already checked in `finishAssignment`. Routing it through
+      // the scalar `=` operator-method below works for a scalar cell but
+      // spuriously fails for a `T | null` target (`let x = null; x = 5` ⇒ `x: i32
+      // | null`, or an annotated `let n: i32 | null`): a `Nullable` carries no `=`
+      // method and softens to a `Nullable`, not a scalar `Object`, so the lookup
+      // misses. Short-circuit to the right operand's (already-checked) type.
+      if (op === "=") return rightType;
       // Operators live on the numeric object types (i32/f64/...), not on the
       // literal types, so a bare literal operand (e.g. `2` in `2 + 3`) has no
       // operator methods. Default an unconstrained numeric literal to its soft
@@ -1217,6 +1226,21 @@ export const reportUninferredBinding = (
   // reach the same `variableType` object.
   if (reportedUninferred.has(type)) return false;
   if (!containsUnresolvedHole(type)) return false;
+  // A-infer-null: an UNCONSTRAINED `let x = null` nullable hole
+  // (`Nullable<Infer{nullHole}<Unknown>>` whose `T` was never pinned by a later
+  // `x = <expr>` / `T | null` param / annotated assignment) is NOT un-inferable
+  // — a lone `null` IS fully determined. Resolve the binding to the plain `null`
+  // type IN PLACE (so the scope entry / codegen see a concrete type) and emit NO
+  // diagnostic. A constrained hole has already collapsed its `Infer` to a concrete
+  // `T` (via `constrainElementHole`), so it no longer reaches here.
+  if (
+    type.type === "Nullable" && type.subType.type === "Infer" &&
+    type.subType.nullHole && type.subType.subType.type === "Unknown"
+  ) {
+    reportedUninferred.add(type);
+    updateType(type, { type: "Alias", name: "null" });
+    return false;
+  }
   reportedUninferred.add(type);
   let example = `let ${name}: i32[] = []`;
   if (type.type === "Infer" && type.mapCtor === "Map") {
@@ -2439,16 +2463,52 @@ export const divergesStatement = (s: VLStatement): boolean => {
   }
 };
 
+// ASSIGNMENT NARROWING (A-infer-null): a straight-line `x = <expr>` whose RHS is
+// non-null makes `x` provably non-null for the REST of the enclosing block — no
+// null tax on the straight line after `let x = null; x = 5` (the binding is `i32
+// | null`, but `x + 1` on the straight line sees `i32`). Returns a name narrowing
+// whose `apply` strips the `| null` (`nonNullable`); emitted only when the RHS
+// itself is non-null (a `x = maybeNull()` leaves `x` nullable) and the write is a
+// plain `=` to a bare name (a compound `x += …` already needs non-null). Shared
+// by every pass that walks a statement list (the parser's scope overlay and
+// codegen's `narrowed` overlay both fold these in alongside `postGuardNarrowings`),
+// so the narrowing is path-correct for free: an assignment inside an `if` branch
+// is in that branch's own list and doesn't leak past the join.
+const assignmentNarrowing = (stmt: VLStatement): Narrowing[] => {
+  if (
+    stmt.type !== "BinaryOperation" || stmt.operator !== "=" ||
+    stmt.compoundOperator || stmt.left.type !== "Name"
+  ) return [];
+  // Type the RHS to decide nullness — read-only: stash and restore `errors` so a
+  // re-query of an already-checked RHS can never double-report (mirrors
+  // `validateType`). A nullable RHS contributes no narrowing.
+  const oldErrors = errors.splice(0, Infinity);
+  const rhsT = typeFromExpression(stmt.right, null as unknown as Context);
+  errors.splice(0, Infinity, ...oldErrors);
+  if (rhsT.type === "Nullable" || nonNullable(rhsT).type === "Never") return [];
+  const place = stmt.left;
+  return [{
+    name: place.name,
+    place,
+    apply: (current: VLType) =>
+      current.type === "Nullable" ? nonNullable(current) : current,
+  }];
+};
+
 // Post-guard narrowing (A5): a guard clause `if x == null { return }` (a single
 // conditional, no else, whose then-branch diverges) leaves `x` narrowed for the
 // REST of the enclosing block. The fall-through *is* the condition's else side,
 // so the narrowings are exactly its `elseNarrowings` — which generalizes to
 // `||` guards (`if x == null || y == null { return }` narrows both x and y).
+// Also folds in the straight-line ASSIGNMENT narrowing (A-infer-null) so every
+// statement-list walker (parser + codegen) strips a freshly-assigned local's
+// `| null` for the rest of the block through this one shared entry point.
 export const postGuardNarrowings = (stmt: VLStatement): Narrowing[] => {
-  if (stmt.type !== "If") return [];
-  if (stmt.conditionals.length !== 1 || stmt.else) return [];
-  if (!divergesStatement(stmt.conditionals[0].statement)) return [];
-  return elseNarrowings(stmt.conditionals[0].condition);
+  const assign = assignmentNarrowing(stmt);
+  if (stmt.type !== "If") return assign;
+  if (stmt.conditionals.length !== 1 || stmt.else) return assign;
+  if (!divergesStatement(stmt.conditionals[0].statement)) return assign;
+  return [...elseNarrowings(stmt.conditionals[0].condition), ...assign];
 };
 
 /** Registers diagnostics automatically */
