@@ -525,17 +525,158 @@ const exportedDeclRanges = (source: string): Record<string, VLRange> => {
   return out;
 };
 
+// ---- workspace .vl file enumeration ----------------------------------------
+//
+// Supports the on-disk sibling crawl in `crossFileReferences`.
+//
+// Cap: at most MAX_DISK_FILES `.vl` files are read per request. This bounds
+// memory and parse time for very large repos while still covering all realistic
+// VL projects. The cap is documented in ROADMAP (cross-file refs / H0 phase 3).
+//
+// Excluded dirs (never descended): `.git`, `node_modules`, `dist`, `.claude`,
+// `reference`. These directories are always irrelevant to VL source search and
+// can be large or contain generated code.
+//
+// Project-root detection: the LSP server passes its workspace root when
+// available (the `rootUri` from `onInitialize`). When the caller passes no root,
+// `detectProjectRoot` walks UP from `fromPath` (the key of the symbol's defining
+// module) looking for the nearest ancestor that contains `deno.json`,
+// `package.json`, or `.git`; it stops after at most ROOT_WALK_LIMIT levels to
+// avoid climbing out of the project in monorepo structures. Falls back to the
+// immediate parent directory of `fromPath` if no sentinel is found.
+
+/** Maximum `.vl` files read in a single on-disk crawl (cost bound). */
+export const MAX_DISK_FILES = 500;
+
+/** Dirs never descended during the workspace crawl. */
+const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".claude", "reference"]);
+
+/**
+ * The sentinel file names whose presence in a directory marks it as a project
+ * root during the upward walk in {@link detectProjectRoot}.
+ */
+const ROOT_SENTINELS = ["deno.json", "package.json", ".git"];
+
+/** Maximum number of directory levels to walk up when detecting the project root. */
+const ROOT_WALK_LIMIT = 6;
+
+/**
+ * Walk up from the directory containing `fromPath` until a directory that
+ * contains one of the {@link ROOT_SENTINELS} is found, or {@link ROOT_WALK_LIMIT}
+ * levels are exhausted. Returns that directory's path (no trailing slash).
+ *
+ * `listDir` is injectable so tests can supply a synthetic directory listing
+ * without touching the real filesystem.
+ */
+export const detectProjectRoot = (
+  fromPath: string,
+  listDir: (dir: string) => string[] = defaultListDir,
+): string => {
+  // Start from the directory containing `fromPath`.
+  let dir = fromPath.includes("/") ? fromPath.slice(0, fromPath.lastIndexOf("/")) : fromPath;
+  for (let i = 0; i < ROOT_WALK_LIMIT; i++) {
+    const entries = listDir(dir);
+    if (ROOT_SENTINELS.some((s) => entries.includes(s))) return dir;
+    // Walk up one level.
+    const parent = dir.includes("/") ? dir.slice(0, dir.lastIndexOf("/")) : dir;
+    if (parent === dir) break; // filesystem root — stop
+    dir = parent;
+  }
+  // No sentinel found: use the immediate parent of `fromPath`.
+  return fromPath.includes("/") ? fromPath.slice(0, fromPath.lastIndexOf("/")) : fromPath;
+};
+
+/**
+ * Enumerate all `.vl` files under `root` (recursive), skipping
+ * {@link SKIP_DIRS}, and returning at most {@link MAX_DISK_FILES} paths.
+ *
+ * `listDir` and `isDir` are injectable so tests can avoid touching the real
+ * filesystem. Both default to the `node:fs`-based implementations used in
+ * production.
+ */
+export const enumerateWorkspaceFiles = (
+  root: string,
+  listDir: (dir: string) => string[] = defaultListDir,
+  isDir: (path: string) => boolean = defaultIsDir,
+): string[] => {
+  const results: string[] = [];
+  const stack: string[] = [root];
+  while (stack.length > 0 && results.length < MAX_DISK_FILES) {
+    const dir = stack.pop()!;
+    let entries: string[];
+    try {
+      entries = listDir(dir);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (results.length >= MAX_DISK_FILES) break;
+      const fullPath = `${dir}/${entry}`;
+      if (isDir(fullPath)) {
+        if (!SKIP_DIRS.has(entry)) stack.push(fullPath);
+      } else if (entry.endsWith(".vl")) {
+        results.push(fullPath);
+      }
+    }
+  }
+  return results;
+};
+
+// Node:fs helpers for directory listing and stat, loaded lazily via the same
+// `createRequire`-based `require` that `defaultReadDisk` uses (see above).
+type FsModuleExt = FsModule & {
+  readdirSync(path: string): string[];
+  statSync(path: string): { isDirectory(): boolean };
+};
+let fsModuleExt: FsModuleExt | undefined;
+const loadFsExt = (): FsModuleExt | undefined => {
+  if (fsModuleExt) return fsModuleExt;
+  if (typeof require !== "function") return undefined;
+  try {
+    const spec = "node:" + "fs";
+    fsModuleExt = require(spec) as FsModuleExt;
+    return fsModuleExt;
+  } catch {
+    return undefined;
+  }
+};
+
+const defaultListDir = (dir: string): string[] => {
+  try {
+    const fs = loadFsExt();
+    return fs ? fs.readdirSync(dir) : [];
+  } catch {
+    return [];
+  }
+};
+
+const defaultIsDir = (path: string): boolean => {
+  try {
+    const fs = loadFsExt();
+    return fs ? fs.statSync(path).isDirectory() : false;
+  } catch {
+    return false;
+  }
+};
+
 // ---- cross-file find-references --------------------------------------------
 //
-// Scope (deliberately bounded — DOCUMENTED, not a full-disk crawl): references to
-// a symbol are searched in the CURRENT file plus every OTHER OPEN document. We do
-// NOT crawl the whole workspace from disk: that would require enumerating and
-// parsing every `.vl` file (an unbounded, potentially slow filesystem walk with
-// no project-root manifest to scope it), and the LSP only holds authoritative,
-// unsaved-edit-aware text for the documents the editor has OPEN. Searching open
-// documents is sound (their text is current) and cheap (bounded by the editor
-// session). A reference in an unopened sibling on disk is not reported; the plan
-// to extend to a disk crawl is recorded in ROADMAP.
+// Scope: references to a symbol are searched in the CURRENT file, every OTHER
+// OPEN document, AND every `.vl` file reachable from the project root that is
+// NOT already in the open-documents set (the on-disk sibling crawl).
+//
+// The crawl is bounded:
+//   • Root detection: use the LSP workspace-folder root when available; otherwise
+//     walk up from the symbol's defining-module path to the nearest ancestor that
+//     contains `deno.json`, `package.json`, or `.git` (at most ROOT_WALK_LIMIT
+//     levels); falls back to the immediate parent directory.
+//   • File cap: at most MAX_DISK_FILES `.vl` files are read per request.
+//   • Excluded dirs: `.git`, `node_modules`, `dist`, `.claude`, `reference`.
+//   • The crawl is only triggered when the symbol has cross-module identity
+//     (same gate as the open-docs path) — purely-local symbols short-circuit
+//     before any disk I/O.
+//   • Open-document text takes priority over disk (unsaved edits win); on-disk
+//     results are deduplicated against already-found open-doc refs by URI.
 //
 // A symbol's identity across files is its CANONICAL export: the
 // `(exportingKey, exportedName)` pair. Within the exporting module the symbol is
@@ -617,16 +758,27 @@ const localNameForExport = (
 };
 
 /**
- * Cross-file find-references (H0 phase 3). Given the cursor on a name in the
- * current file, return every reference to that symbol's canonical export across
- * the current file and the supplied OPEN documents (see the scope note above).
+ * Cross-file find-references (H0 phase 3, extended). Given the cursor on a name
+ * in the current file, return every reference to that symbol's canonical export
+ * across:
+ *   1. The current file.
+ *   2. Every other OPEN document (`openDocs`).
+ *   3. Every `.vl` file discovered by the on-disk sibling crawl (`diskFiles`)
+ *      that is NOT already covered by the open-documents set.
  *
  * Returns `undefined` when the symbol has no cross-module identity (a purely
  * local binding); the caller then falls back to the single-file references path.
  *
  * `name` is the identifier under the cursor; `entrySource`/`entryKey` the current
  * document; `openDocs` the other open documents (the current file may be included
- * or not — it's de-duplicated by key); `includeDeclaration` mirrors the LSP flag.
+ * or not — it's de-duplicated by key); `diskFiles` is the pre-enumerated list of
+ * on-disk `.vl` paths (from {@link enumerateWorkspaceFiles} or an injected list in
+ * tests — empty for single-file / no-crawl callers); `includeDeclaration` mirrors
+ * the LSP flag.
+ *
+ * De-duplication: a file that appears in BOTH `openDocs` and `diskFiles` is
+ * searched exactly once (the open-buffer text wins, so the user's unsaved edits
+ * are seen). Locations are not duplicated.
  */
 export const crossFileReferences = async (
   name: string,
@@ -635,6 +787,7 @@ export const crossFileReferences = async (
   openDocs: OpenDocument[],
   read: ModuleReader,
   includeDeclaration = true,
+  diskFiles: string[] = [],
 ): Promise<CrossFileReference[] | undefined> => {
   const target = canonicalExportOf(name, entrySource, entryKey);
   if (target === undefined) return undefined;
@@ -645,6 +798,18 @@ export const crossFileReferences = async (
   for (const d of openDocs) {
     const key = uriToPath(d.uri);
     if (!docsByKey.has(key)) docsByKey.set(key, d);
+  }
+
+  // Add on-disk files that are NOT already in the open-documents set.
+  // The workspace reader (`read`) is used to fetch their text — it will return
+  // the open-buffer text if the file happens to be open (consistent view), or
+  // fall back to disk. We only skip keys already in `docsByKey` to avoid
+  // double-counting a file that is both listed in `diskFiles` and in `openDocs`.
+  for (const diskPath of diskFiles) {
+    if (docsByKey.has(diskPath)) continue; // already covered by an open buffer
+    const text = await read(diskPath);
+    if (text === undefined) continue; // unreadable — skip
+    docsByKey.set(diskPath, { uri: pathToUri(diskPath), text });
   }
 
   const refs: CrossFileReference[] = [];

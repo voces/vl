@@ -66,8 +66,8 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   `Buffer<N>`) — today generics take *type* params only; enabler for the parameterized
   `Decimal<Backing, Scale>` family (B2) and any fixed-size/parameter-by-value type.
   (Forward/mutual-reference return-type inference: shipped as A17 — see `CHANGELOG.md`.)
-- 🟡 **A11. Recursive structural types.** REMAINING: recursion through an **array** element
-  (`{ rest: [List] }`). (Mutual recursion across *separate* `type` decls: shipped — see `CHANGELOG.md`.)
+- 🟡 **A11. Recursive structural types.** REMAINING: mutual recursion across *separate* `type` decls;
+  recursion through an **array** element (`{ rest: [List] }`).
 - 🟡 **A12. Soundness corpus.** REMAINING: keep growing it; the known-unsound corners are
   `xfail`-marked (e.g. the permissive `i32 + string` hole rule, A13).
   **Known bugs (all RESOLVED; pinned by passing cases):**
@@ -311,11 +311,14 @@ independent).*
     go-to-definition and doc-comment xrefs on an imported name jump to the EXPORTING sibling's
     declaration (resolved by reading the sibling through the workspace reader and locating the
     exported binding's decl span via the symbol table); find-references gathers occurrences across
-    the current file + other OPEN documents (a name's canonical `(exportingKey, exportedName)` is
-    matched per open doc; the importer's symbol table is graph-seeded so imported-name uses are
-    recorded). REMAINING: find-references over UNOPENED on-disk siblings (needs a scoped workspace
-    crawl — a project-root manifest to bound the `.vl` walk; today bounded to open documents, which
-    is sound + cheap); the `std:` scheme (phase 2).
+    the current file + other OPEN documents + UNOPENED on-disk siblings (a name's canonical
+    `(exportingKey, exportedName)` is matched per document; the importer's symbol table is
+    graph-seeded so imported-name uses are recorded). On-disk crawl is scoped: project root detected
+    from the LSP workspace-folder root, or by walking up to the nearest ancestor containing
+    `deno.json`, `package.json`, or `.git` (at most 6 levels); `.git`, `node_modules`, `dist`,
+    `.claude`, `reference` dirs are skipped; at most 500 `.vl` files read per request
+    (`MAX_DISK_FILES`); open-buffer text wins over disk for any file open in the editor.
+    REMAINING: the `std:` scheme (phase 2).
   - **Deferred:** import maps, namespace/default imports, export-all, re-exports.
 - 🟡 **H2. Make VL expressive enough to write a compiler.** All H2 gaps fixed — see `CHANGELOG.md`.
   REMAINING: maps (B6a), enum tag for literal-unions (A16).

@@ -3,7 +3,8 @@
 // Builds on the module-graph foundation (`lsp/src/moduleGraph.ts`): when the
 // symbol under the cursor is an IMPORTED name, go-to-definition and doc-comment
 // xrefs resolve to the EXPORTING sibling module's declaration; find-references
-// gathers occurrences across the current file plus other open documents.
+// gathers occurrences across the current file plus other open documents, AND
+// across unopened on-disk siblings (the disk-crawl extension).
 //
 // Like `lsp_module_diagnostics_test.ts`, these drive the PURE module-graph
 // helpers with an injected in-memory `ModuleReader` (no filesystem / cwd), since
@@ -14,6 +15,8 @@
 import type { ModuleReader } from "../compiler/modules.ts";
 import {
   crossFileReferences,
+  detectProjectRoot,
+  enumerateWorkspaceFiles,
   importedNameSource,
   importedNameSources,
   pathToUri,
@@ -226,5 +229,220 @@ Deno.test("regression: a no-import file exposes no cross-file sources", async ()
   assert(
     Object.keys(sources).length === 0,
     `a no-import file has no cross-file sources; got ${JSON.stringify(sources)}`,
+  );
+});
+
+// ---- (5) on-disk sibling crawl (H0 phase 3 extension) ----------------------
+//
+// These tests inject a `diskFiles` list and an in-memory reader to simulate the
+// workspace crawl without touching the filesystem.
+
+Deno.test("on-disk find-refs: a symbol referenced in an UNOPENED on-disk sibling is included", async () => {
+  // util.vl exports `add`; main.vl (the entry, treated as open) imports it.
+  // consumer.vl also imports and uses `add` but is NOT in the openDocs set —
+  // only on the injected reader (simulating an on-disk-only file).
+  const util = "export function add(a: i32, b: i32) {\n  return a + b\n}\n";
+  const main = 'import { add } from "./util"\n\nprint(add(1, 2))\n';
+  const consumer = 'import { add } from "./util"\n\nprint(add(10, 20))\nprint(add(30, 40))\n';
+  const files = {
+    "/proj/util.vl": util,
+    "/proj/main.vl": main,
+    "/proj/consumer.vl": consumer,
+  };
+  const read = memoryReader(files);
+
+  // openDocs includes only main.vl (open in editor); consumer.vl is on-disk only.
+  const openDocs = [{ uri: pathToUri("/proj/main.vl"), text: main }];
+  // diskFiles lists all three files (as enumerateWorkspaceFiles would), including
+  // consumer.vl which is not in openDocs.
+  const diskFiles = ["/proj/util.vl", "/proj/main.vl", "/proj/consumer.vl"];
+
+  const refs = await crossFileReferences(
+    "add",
+    main,
+    "/proj/main.vl",
+    openDocs,
+    read,
+    true,
+    diskFiles,
+  );
+
+  assert(refs !== undefined, "imported `add` must resolve cross-module");
+  const byUri = new Map<string, number>();
+  for (const r of refs!) byUri.set(r.uri, (byUri.get(r.uri) ?? 0) + 1);
+
+  // util.vl: the declaration of `add`.
+  assert(
+    (byUri.get(pathToUri("/proj/util.vl")) ?? 0) >= 1,
+    `util.vl should hold the declaration; got ${JSON.stringify([...byUri])}`,
+  );
+  // main.vl: one use (the import-statement synthetic decl is excluded).
+  assert(
+    (byUri.get(pathToUri("/proj/main.vl")) ?? 0) >= 1,
+    `main.vl should hold a use; got ${JSON.stringify([...byUri])}`,
+  );
+  // consumer.vl: two uses — this file was NOT open, only on disk.
+  assert(
+    (byUri.get(pathToUri("/proj/consumer.vl")) ?? 0) === 2,
+    `consumer.vl (on-disk only) should hold two uses; got ${JSON.stringify([...byUri])}`,
+  );
+});
+
+Deno.test("on-disk find-refs: a file in BOTH openDocs and diskFiles is NOT double-counted", async () => {
+  // main.vl is in both openDocs and diskFiles — it must appear exactly once.
+  const util = "export function add(a: i32, b: i32) {\n  return a + b\n}\n";
+  const main = 'import { add } from "./util"\n\nprint(add(1, 2))\n';
+  const files = { "/proj/util.vl": util, "/proj/main.vl": main };
+  const read = memoryReader(files);
+
+  const openDocs = [
+    { uri: pathToUri("/proj/util.vl"), text: util },
+    { uri: pathToUri("/proj/main.vl"), text: main },
+  ];
+  // diskFiles also lists both files — duplicates must be de-duped.
+  const diskFiles = ["/proj/util.vl", "/proj/main.vl"];
+
+  const refs = await crossFileReferences(
+    "add",
+    main,
+    "/proj/main.vl",
+    openDocs,
+    read,
+    true,
+    diskFiles,
+  );
+
+  assert(refs !== undefined, "imported `add` must resolve cross-module");
+  // Count total refs per URI; each file should appear at most the right number
+  // of times (not doubled because it was in both lists).
+  const byUri = new Map<string, number>();
+  for (const r of refs!) byUri.set(r.uri, (byUri.get(r.uri) ?? 0) + 1);
+
+  const mainCount = byUri.get(pathToUri("/proj/main.vl")) ?? 0;
+  assert(
+    mainCount === 1,
+    `main.vl must appear exactly once (no double-count); got ${mainCount}`,
+  );
+  const utilCount = byUri.get(pathToUri("/proj/util.vl")) ?? 0;
+  assert(
+    utilCount >= 1,
+    `util.vl should appear (declaration); got ${utilCount}`,
+  );
+});
+
+Deno.test("on-disk find-refs: empty diskFiles list behaves like the open-docs-only path", async () => {
+  // Without diskFiles the behaviour must be identical to the pre-extension path.
+  const util = "export function add(a: i32, b: i32) {\n  return a + b\n}\n";
+  const main = 'import { add } from "./util"\n\nprint(add(2, 3))\nprint(add(4, 5))\n';
+  const files = { "/proj/util.vl": util, "/proj/main.vl": main };
+  const read = memoryReader(files);
+
+  const openDocs = [
+    { uri: pathToUri("/proj/util.vl"), text: util },
+    { uri: pathToUri("/proj/main.vl"), text: main },
+  ];
+
+  const refs = await crossFileReferences(
+    "add",
+    main,
+    "/proj/main.vl",
+    openDocs,
+    read,
+    true,
+    [], // empty — no on-disk crawl
+  );
+
+  assert(refs !== undefined, "imported `add` must resolve cross-module");
+  const byUri = new Map<string, number>();
+  for (const r of refs!) byUri.set(r.uri, (byUri.get(r.uri) ?? 0) + 1);
+  assert(
+    (byUri.get(pathToUri("/proj/util.vl")) ?? 0) >= 1,
+    `util.vl should hold the declaration`,
+  );
+  assert(
+    (byUri.get(pathToUri("/proj/main.vl")) ?? 0) === 2,
+    `main.vl should hold two uses; got ${byUri.get(pathToUri("/proj/main.vl"))}`,
+  );
+});
+
+// ---- (6) workspace enumeration helpers --------------------------------------
+
+Deno.test("enumerateWorkspaceFiles: lists .vl files and skips excluded dirs", () => {
+  // Simulate a directory tree:
+  //   /proj/
+  //     main.vl
+  //     util.vl
+  //     node_modules/   ← skipped
+  //       lib.vl
+  //     sub/
+  //       helper.vl
+  const tree: Record<string, string[]> = {
+    "/proj": ["main.vl", "util.vl", "node_modules", "sub"],
+    "/proj/node_modules": ["lib.vl"],
+    "/proj/sub": ["helper.vl"],
+  };
+  const listDir = (dir: string): string[] => tree[dir] ?? [];
+  const isDir = (path: string): boolean => path in tree;
+
+  const files = enumerateWorkspaceFiles("/proj", listDir, isDir);
+  const names = files.map((f) => f.replace("/proj/", "")).sort();
+
+  assert(names.includes("main.vl"), "main.vl should be found");
+  assert(names.includes("util.vl"), "util.vl should be found");
+  assert(names.includes("sub/helper.vl"), "sub/helper.vl should be found");
+  assert(
+    !names.some((n) => n.includes("node_modules")),
+    "node_modules must be skipped",
+  );
+});
+
+Deno.test("detectProjectRoot: walks up to the directory containing deno.json", () => {
+  // Simulate:
+  //   /workspace/           ← has deno.json
+  //     src/
+  //       module.vl         ← fromPath
+  const tree: Record<string, string[]> = {
+    "/workspace": ["deno.json", "src"],
+    "/workspace/src": ["module.vl"],
+  };
+  const listDir = (dir: string): string[] => tree[dir] ?? [];
+
+  const root = detectProjectRoot("/workspace/src/module.vl", listDir);
+  assert(
+    root === "/workspace",
+    `should detect /workspace as root; got ${root}`,
+  );
+});
+
+Deno.test("detectProjectRoot: falls back to immediate parent when no sentinel found", () => {
+  // No deno.json / package.json / .git anywhere in the walk.
+  const listDir = (_dir: string): string[] => [];
+
+  const root = detectProjectRoot("/a/b/c/file.vl", listDir);
+  assert(
+    root === "/a/b/c",
+    `should fall back to immediate parent /a/b/c; got ${root}`,
+  );
+});
+
+// ---- (7) REGRESSION: single-file find-refs unchanged after extension ---------
+
+Deno.test("regression: single-file find-refs (no exports) unchanged with disk extension", async () => {
+  // A purely-local symbol must still return undefined (triggering single-file
+  // fallback in the caller), even when diskFiles is supplied.
+  const main = "let only = 1\nprint(only)\nprint(only)\n";
+  const files = { "/proj/main.vl": main };
+  const refs = await crossFileReferences(
+    "only",
+    main,
+    "/proj/main.vl",
+    [{ uri: pathToUri("/proj/main.vl"), text: main }],
+    memoryReader(files),
+    true,
+    ["/proj/main.vl"], // diskFiles supplied but symbol is purely local
+  );
+  assert(
+    refs === undefined,
+    "a non-exported local must still defer to single-file even with diskFiles",
   );
 });
