@@ -385,6 +385,43 @@ const CASES: Case[] = [
     },
   },
   {
+    // REGRESSION: a `let` buried in the THIRD arm of a long `if / else if / else if
+    // / else` chain INSIDE a while body. `collectLocals` used to hand-unroll only the
+    // FIRST nested `else if`, so the slot for `c` (and `d`) was never allocated and
+    // `emitStmt` failed with "local declaration has no allocated slot". The `else if`
+    // walk is now recursive (`collectLocalsIf`), so every arm at any depth is walked.
+    // `count(4)` runs i=0..3, taking each arm once: 10+20+30+40 = 100.
+    name: "nested `let` in a deep else-if chain inside a while body (slot at every arm)",
+    src: [
+      "function count(n: i32): i32 {",
+      "  let total = 0",
+      "  let i = 0",
+      "  while i < n {",
+      "    if i == 0 {",
+      "      let a = 10",
+      "      total = total + a",
+      "    } else if i == 1 {",
+      "      let b = 20",
+      "      total = total + b",
+      "    } else if i == 2 {",
+      "      let c = 30",
+      "      total = total + c",
+      "    } else {",
+      "      let d = 40",
+      "      total = total + d",
+      "    }",
+      "    i = i + 1",
+      "  }",
+      "  return total",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "count", 4);
+      if (got !== 100) throw new Error(`count(4) returned ${got}, expected 100`);
+    },
+  },
+  {
     // The REAL `i32ToStr` + `digitChar` from the self-host front end (`ast.vl`),
     // verbatim. It exercises `/`, `%`, the implicit return, string `+`, a `while`
     // loop, and string-returning helpers all at once — and now compiles + runs
