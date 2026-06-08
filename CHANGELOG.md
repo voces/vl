@@ -100,6 +100,7 @@ see **`DECISIONS.md`**.
 - **E2 Playground UI (core)** — `<textarea>` + Run + diagnostics/log/WAT panes + sample picker (`playground/`).
 - **E2 Playground redesign** — branded light/dark theme pair (system-default with revert-to-system toggle, lock-step Monaco theme), results-as-tabs (Output/WAT/Diagnostics + size/count badges), multi-file projects (per-file diagnostics, whole-program `compileProgram` run/WAT), opt-in auto-run (always-on debounced analysis), full-width status bar, real Share + Format wiring.
 - **E4 Shareable links** — source encoded in URL hash (#94).
+- **Playground↔LSP parity test** — `tests/playground_lsp_parity_test.ts` enumerates the language features `lsp/src/server.ts` exposes (handlers self-validated against the live source) and asserts, per feature, that `playground/src/lspAdapter.ts` exports the pure binding AND `playground/src/main.ts` wires the matching Monaco provider — so an LSP feature can't be added without wiring the playground (the gap that left "Auto Fix" silently missing). Three current gaps are documented as asserted known-TODOs: code actions (`registerCodeActionProvider` unwired in `main.ts` though the `codeActions` adapter binding exists), find-references, and completion.
 
 ## Infrastructure (Track F)
 
