@@ -102,6 +102,19 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   / key / value types from **later usage** (`m.set(k,v)`, `xs.push(x)`) — like evolving-array
   inference. Today `const xs = []` then `xs.push(1)` crashes with an `Infer`/`Unknown` codegen error
   rather than inferring `xs: i32[]` from the `push` constraint.
+- ⬜ **A-infer-null. `let x = null` as a nullable hole.** Treat `let x = null` like `[]`: infer the `T`
+  in `T | null` from later usage (`x = 5` ⇒ `i32 | null`), the initializer contributing `| null`, with
+  flow-narrowing stripping the `| null` on definitely-assigned paths (no null tax on the straight line);
+  an unconstrained `let x = null` resolves to `null`. Today `let x = null` pins `x` to the exact `null`
+  type, so `let x = null; x = 5` errors. Distinct from a pin violation — `null` is hole-bearing, not a
+  complete type. Ties A-infer-empty (same usage-driven hole-filling) and A-definite-assign (shared flow
+  machinery). (Rationale: DECISIONS "`let x = null` is a nullable hole".)
+- ⬜ **A-definite-assign. Definite assignment for uninitialized locals.** A read of `let x` / `let x: T`
+  not provably written on every preceding path is a "used before assigned" error; non-null (NOT
+  implicitly nullable). Closes a live soundness gap — today `let x: i32; return x` compiles and returns
+  a silent `0`. Flow analysis over the CFG the `is`-guards already walk (branch joins, loops, early
+  exits, `&&`/`||`); the declaration is fine, the **reads** are gated. (Rationale: DECISIONS
+  "uninitialized `let x` is non-null + definite-assignment-checked".)
 - ⬜ **A-infer-params. Top-level function param inference.** Infer named-function param types from
   usage constraints (HM / the existing A13 row-poly inference path), consistent with "hide types where
   possible." Requiring annotations on all named-fn params is NOT VL's stated stance.
