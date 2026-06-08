@@ -19,6 +19,7 @@ import {
   conditionsExhaust,
   defaultIntegerType,
   elseNarrowings,
+  emptyIntersectionInfo,
   ensureType,
   flattenType,
   getChildType,
@@ -2824,6 +2825,38 @@ export const parseProgram = (
             `type, so it can never have a value`,
           ctx: spanFrom(bodyStart),
           code: 1,
+        });
+        entry.subType = { type: "Never" };
+      }
+      // An EMPTY-INTERSECTION alias — `type C = A & B` whose two concrete
+      // operands share no values — folds to a tagged `Never` (see
+      // `intersectType`/`tagEmptyIntersection` in typecheck.ts). Like the
+      // degenerate self-cycle above, the alias resolves lazily, so the use-site
+      // never-value error in `ensureType` only fires when the alias is
+      // REFERENCED — an UNUSED `type C = A & B` would otherwise surface nothing
+      // (PR #189 review: "same issue of not error until used"). Report the
+      // never-value error HERE, at the declaration, ranged on the `A & B`
+      // expression, so it flags regardless of use — mirroring `type D = D`. The
+      // message is the SAME wording the use-site `ensureType` produces, so the
+      // two paths agree. We then rebind to an UNTAGGED `Never` (exactly as the
+      // self-cycle branch above does): with the tag gone, the use-site
+      // `ensureType` lookup returns nothing and resolves quietly (no duplicate at
+      // the use site), and the `empty-intersection` LINT — which keys off the
+      // same tag — finds nothing on this alias, so it doesn't add a redundant
+      // warning on top of the error. Exactly ONE diagnostic per such alias,
+      // whether used or not. Only a `type` alias body is affected; an inline
+      // `let x: A & B` carries its own tagged `Never` and keeps its use-site error.
+      const emptyInfo = emptyIntersectionInfo(entry.subType);
+      if (emptyInfo) {
+        errors.push({
+          type: "Syntax",
+          message: emptyInfo.selfRef
+            ? `Type \`${emptyInfo.selfRef}\` refers to itself inside an ` +
+              `intersection (\`${emptyInfo.text}\`), so it reduces to \`never\``
+            : `Type \`${name}\` is \`never\` (an empty type — ` +
+              `\`${emptyInfo.text}\`, ${emptyInfo.reason}), so it has no values`,
+          ctx: emptyInfo.span ?? spanFrom(bodyStart),
+          code: 0,
         });
         entry.subType = { type: "Never" };
       }
