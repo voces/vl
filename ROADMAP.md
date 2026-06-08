@@ -46,6 +46,8 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
 
 - 🟢 **A3. Intersection types** (`A & B`). Done: surface syntax, narrowing algebra, AND
   object-type structural intersection (`{x} & {y}` merges field-wise to `{x, y}` via `meet`).
+  A concrete `A & B` that folds to `never` now warns at the declaration (`empty-intersection`)
+  and rejects forming a value cleanly (never-value type error) instead of crashing codegen.
 - 🟡 **A4. Negation types** (`!A`). REMAINING: full open-world negation tracking (needs A12).
 - 🟡 **A5. Flow narrowing.** REMAINING: `case`/multi-guard (no grammar); stored-witness (A6b Stage B);
   optional *call* `x?.f()` + chain short-circuit `x?.y.z` (use `x?.y?.z`); per-call
