@@ -296,6 +296,20 @@ const readSource = async (args: string[]): Promise<string> => {
 const RUN_USAGE =
   "usage: vl <file.vl> | -e <source> | < stdin   (vl help for more)";
 
+// `run`/`build` surface errors and warnings (correctness signals — a wasm trap
+// waiting to happen, dead code, an empty intersection) but stay QUIET about
+// info/hint-level advisories (style lints like const-over-let): those are the
+// job of `check` and the editor, not noise on every execution. Errors still
+// block separately (the compile produces no `wasm`); `vl check` shows the full
+// set, including the hidden advisories.
+const printRunDiagnostics = (diagnostics: readonly VLDiagnostic[]): void => {
+  for (const d of diagnostics) {
+    if (meetsThreshold(d.severity, "warning")) {
+      console.error(formatDiagnostic(d));
+    }
+  }
+};
+
 const run = async (args: string[]): Promise<void> => {
   // Only fall through to stdin when it is actually piped/redirected. With no
   // file and no `-e`, an interactive terminal has nothing to read, so blocking
@@ -332,7 +346,7 @@ const run = async (args: string[]): Promise<void> => {
   const { diagnostics, wasm, sourceMap } = file
     ? await compileFile(file, source)
     : await compile(source, "source.vl");
-  for (const d of diagnostics) console.error(formatDiagnostic(d));
+  printRunDiagnostics(diagnostics);
 
   if (!wasm) Deno.exit(1);
 
@@ -375,7 +389,7 @@ const build = async (args: string[]): Promise<void> => {
 
   const source = await Deno.readTextFile(file);
   const { diagnostics, wasm } = await compileFile(file, source);
-  for (const d of diagnostics) console.error(formatDiagnostic(d));
+  printRunDiagnostics(diagnostics);
 
   if (!wasm) {
     console.error("build failed: compilation produced errors");

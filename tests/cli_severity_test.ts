@@ -211,3 +211,68 @@ Deno.test("check: --severity hint shows everything (hint is the floor)", async (
     `--severity hint should still display the hint, got: ${stderr}`,
   );
 });
+
+// --- `run`/`build` quiet advisories: errors + warnings print, info/hints don't -
+// Unlike `check` (a diagnostics command — shows everything by default), `run` and
+// `build` exist to execute/compile, so they apply a `warning` display floor:
+// style lints (const-over-let, intentionally-unused hints) are suppressed, while
+// correctness signals (errors, dead code) still surface.
+
+// Run `vl run <file>` and capture stderr (diagnostics) + exit code.
+const runRunCapture = async (
+  source: string,
+): Promise<{ code: number; stderr: string }> => {
+  const dir = await Deno.makeTempDir({ prefix: "vl_run_" });
+  const file = `${dir}/probe.vl`;
+  await Deno.writeTextFile(file, source);
+  try {
+    const cmd = new Deno.Command(Deno.execPath(), {
+      args: [
+        "run",
+        "-A",
+        "--no-check",
+        new URL("../compiler/cli.ts", import.meta.url).pathname,
+        "run",
+        file,
+      ],
+      stdout: "null",
+      stderr: "piped",
+    });
+    const { code, stderr } = await cmd.output();
+    return { code, stderr: new TextDecoder().decode(stderr) };
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+};
+
+// A runnable program whose only diagnostic is a const-over-let INFO.
+const RUN_INFO_SRC = "function f(): i32 {\n  let t = 5\n  return t\n}\nprint(f())\n";
+// A runnable program with a dead-code WARNING (still executes).
+const RUN_WARNING_SRC =
+  "function f(): i32 {\n  return 1\n  return 2\n}\nprint(f())\n";
+// A program with a type ERROR (must not run).
+const RUN_ERROR_SRC = "function f(): i32 {\n  return \"oops\"\n}\nprint(f())\n";
+
+Deno.test("run: HIDES an info-level advisory (const-over-let)", async () => {
+  const { stderr } = await runRunCapture(RUN_INFO_SRC);
+  assert(
+    !stderr.includes("info ") && !stderr.includes("const"),
+    `run should suppress the const-over-let info, got: ${stderr}`,
+  );
+});
+
+Deno.test("run: still PRINTS a warning (dead code)", async () => {
+  const { stderr } = await runRunCapture(RUN_WARNING_SRC);
+  assert(
+    stderr.includes("warning ") && stderr.includes("Unreachable"),
+    `run should still surface warnings, got: ${stderr}`,
+  );
+});
+
+Deno.test("run: still PRINTS an error", async () => {
+  const { code, stderr } = await runRunCapture(RUN_ERROR_SRC);
+  assert(
+    stderr.includes("error ") && code !== 0,
+    `run should surface the error and fail, got code=${code}: ${stderr}`,
+  );
+});
