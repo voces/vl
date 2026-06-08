@@ -45,8 +45,6 @@ import {
 } from "./playground.ts";
 import { SAMPLES, type Sample } from "./samples.ts";
 import * as lsp from "./lspAdapter.ts";
-import * as projects from "./projects.ts";
-import type { ProjectFile } from "./projects.ts";
 import { decodeHash, encodeSource } from "./share.ts";
 import { format } from "../../compiler/format.ts";
 
@@ -84,11 +82,6 @@ const faddBtn = $<HTMLButtonElement>("fadd");
 const pickerBtn = $<HTMLButtonElement>("pickerBtn");
 const menuEl = $<HTMLDivElement>("menu");
 const pickerName = $<HTMLSpanElement>("pickerName");
-const projNameInput = $<HTMLInputElement>("projName");
-const saveBtn = $<HTMLButtonElement>("save");
-const saveAsBtn = $<HTMLButtonElement>("saveAs");
-const renameBtn = $<HTMLButtonElement>("rename");
-const delBtn = $<HTMLButtonElement>("del");
 const ftabsEl = $<HTMLDivElement>("ftabs");
 const editorMeta = $<HTMLSpanElement>("editorMeta");
 const tabMeta = $<HTMLSpanElement>("tabMeta");
@@ -329,68 +322,6 @@ monaco.languages.registerDefinitionProvider(VL_LANGUAGE_ID, {
   },
 });
 
-// --- code action (quick-fix) provider ----------------------------------------
-//
-// Mirrors `server.ts`'s `onCodeAction`: for the lint diagnostics overlapping the
-// cursor/selection, compute the applicable quick-fixes (`lspAdapter.codeActions`
-// → `lsp/src/codeActions.ts`) and wrap each as a Monaco `CodeAction` with a
-// `WorkspaceEdit` against the current model. Monaco's "Auto Fix" lightbulb then
-// applies the `isPreferred` fix. The context markers Monaco passes carry the
-// diagnostic `code` (we stash it on each marker in `toMarker`), so the dispatch
-// picks the right fix — exactly the `code`-keyed mapping the editor uses.
-
-monaco.languages.registerCodeActionProvider(VL_LANGUAGE_ID, {
-  provideCodeActions: (model, range, context) => {
-    // Monaco markers → the `VLDiagnostic`-shaped context (0-based LSP coords)
-    // `lspAdapter.codeActions` expects. The `code`/`source` carry the fields the
-    // fix dispatch keys off; Monaco markers store `code` as a string or
-    // `{ value }` object, so normalise both.
-    const contextDiagnostics: lsp.VLDiagnostic[] = context.markers
-      .map((m) => ({
-        message: m.message,
-        severity: "warning" as const,
-        source: "vital" as const,
-        code: typeof m.code === "object" ? m.code?.value : m.code,
-        range: {
-          start: { line: m.startLineNumber - 1, character: m.startColumn - 1 },
-          end: { line: m.endLineNumber - 1, character: m.endColumn - 1 },
-        },
-      }));
-
-    const fixes = lsp.codeActions(
-      model.getValue(),
-      {
-        start: { line: range.startLineNumber - 1, character: range.startColumn - 1 },
-        end: { line: range.endLineNumber - 1, character: range.endColumn - 1 },
-      },
-      contextDiagnostics,
-    );
-
-    const actions: monaco.languages.CodeAction[] = fixes.map((fix) => ({
-      title: fix.title,
-      kind: "quickfix",
-      isPreferred: fix.isPreferred,
-      edit: {
-        edits: fix.edits.map((e) => ({
-          resource: model.uri,
-          textEdit: {
-            range: new monaco.Range(
-              e.range.start.line + 1,
-              e.range.start.character + 1,
-              e.range.end.line + 1,
-              e.range.end.character + 1,
-            ),
-            text: e.newText,
-          },
-          versionId: model.getVersionId(),
-        })),
-      },
-    }));
-
-    return { actions, dispose: () => {} };
-  },
-});
-
 // --- theme management --------------------------------------------------------
 //
 // Tri-state: AUTO (follow OS) by default; clicking pins an explicit override;
@@ -536,9 +467,6 @@ const toMarker = (d: VLDiagnostic): monaco.editor.IMarkerData => {
     endLineNumber: end.line + 1,
     endColumn: empty ? start.character + 2 : end.character + 1,
     source: d.source,
-    // Stash the stable lint `code` so the code-action provider can pick the right
-    // quick-fix from the marker Monaco hands back (mirrors `server.ts`'s cache).
-    code: d.code !== undefined ? String(d.code) : undefined,
     tags,
   };
 };
@@ -765,7 +693,6 @@ const addFile = () => {
   switchFile(name);
   editor.focus();
   refreshDiagnostics();
-  rememberSession();
 };
 
 const closeFile = (name: string) => {
@@ -779,7 +706,6 @@ const closeFile = (name: string) => {
   else renderFileTabs();
   refreshDiagnostics();
   updateEditorMeta();
-  rememberSession();
 };
 
 // --- results tabs ------------------------------------------------------------
@@ -943,7 +869,6 @@ let autoRun = localStorage.getItem("vl-autorun") === "1";
 let autoTimer: ReturnType<typeof setTimeout> | undefined;
 let diagTimer: ReturnType<typeof setTimeout> | undefined;
 let hashTimer: ReturnType<typeof setTimeout> | undefined;
-let sessionTimer: ReturnType<typeof setTimeout> | undefined;
 
 const setAutoRun = (on: boolean) => {
   autoRun = on;
@@ -974,10 +899,6 @@ const onEdit = () => {
     }).catch(() => {/* hash update is best-effort */});
   }, 600);
 
-  // Persist the live buffers (debounced) so a reload restores unsaved edits.
-  if (sessionTimer !== undefined) clearTimeout(sessionTimer);
-  sessionTimer = setTimeout(() => rememberSession(), 500);
-
   if (autoRun && compilerReady) {
     setStatus("Editing…", "busy");
     if (autoTimer !== undefined) clearTimeout(autoTimer);
@@ -992,107 +913,24 @@ const FILE_ICON =
 const FILES_ICON =
   '<svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M5 4h4l2.5 2.5V13H5z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M3.5 2.5H7L9 4.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 4v9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
 
-// What's currently loaded into the buffers. `sample`/`user` re-highlight the
-// selector and drive Save semantics (a built-in sample's "Save" forks to a new
-// user project; a user project's "Save" updates it in place). `scratch` is an
-// unnamed buffer (a share-link import or a fresh edit with no project) — its
-// "Save" always prompts for a name.
-type CurrentProject =
-  | { kind: "sample"; index: number }
-  | { kind: "user"; id: string }
-  | { kind: "scratch" };
-let current: CurrentProject = { kind: "sample", index: 0 };
-
-// The display name of whatever's open, for the picker button + name field.
-const currentDisplayName = (): string => {
-  if (current.kind === "sample") return SAMPLES[current.index]?.name ?? "Scratch";
-  if (current.kind === "user") {
-    return projects.getProject(current.id)?.name ?? "Scratch";
-  }
-  return "";
-};
-
-const lineCountOf = (fs: { source: string }[]): number =>
-  fs.reduce((n, f) => n + f.source.split("\n").length, 0);
-
-const menuRow = (
-  name: string,
-  fileCount: number,
-  lines: number,
-  selected: boolean,
-  onClick: () => void,
-  onDelete?: () => void,
-): HTMLDivElement => {
-  const item = document.createElement("div");
-  item.className = "menu-item" + (selected ? " sel" : "");
-  const multi = fileCount > 1;
-  const sub = multi ? `${fileCount} files · ${lines} lines` : `${lines} lines`;
-  item.innerHTML = `<span class="mi-ic">${multi ? FILES_ICON : FILE_ICON}</span>` +
-    `<span class="mi-tx"><span class="mi-nm">${escapeHtml(name)}</span>` +
-    `<span class="mi-sub">${sub}</span></span>`;
-  item.addEventListener("click", onClick);
-  if (onDelete) {
-    const del = document.createElement("button");
-    del.className = "mi-del";
-    del.type = "button";
-    del.title = "Delete";
-    del.innerHTML = X_ICON;
-    del.addEventListener("click", (e) => {
-      e.stopPropagation();
-      onDelete();
-    });
-    item.append(del);
-  }
-  return item;
-};
+let activeSample = 0;
 
 const buildMenu = () => {
   menuEl.replaceChildren();
-
-  // Saved (user) projects first, clearly grouped above the built-in examples.
-  const saved = projects.listProjects();
-  const savedHead = document.createElement("div");
-  savedHead.className = "menu-group";
-  savedHead.textContent = "Saved";
-  menuEl.append(savedHead);
-  if (saved.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "menu-empty";
-    empty.textContent = "No saved projects yet";
-    menuEl.append(empty);
-  } else {
-    for (const p of saved) {
-      const sel = current.kind === "user" && current.id === p.id;
-      menuEl.append(menuRow(
-        p.name,
-        p.files.length,
-        lineCountOf(p.files),
-        sel,
-        () => {
-          loadUserProject(p.id);
-          closeMenu();
-        },
-        () => deleteCurrentOrProject(p.id),
-      ));
-    }
-  }
-
-  const exHead = document.createElement("div");
-  exHead.className = "menu-group";
-  exHead.textContent = "Examples";
-  menuEl.append(exHead);
   SAMPLES.forEach((s, i) => {
-    const sel = current.kind === "sample" && current.index === i;
-    menuEl.append(menuRow(
-      s.name,
-      s.files.length,
-      lineCountOf(s.files),
-      sel,
-      () => {
-        loadSample(i);
-        closeMenu();
-      },
-    ));
+    const item = document.createElement("div");
+    item.className = "menu-item" + (i === activeSample ? " sel" : "");
+    const multi = s.files.length > 1;
+    const lines = s.files.reduce((n, f) => n + f.source.split("\n").length, 0);
+    const sub = multi ? `${s.files.length} files · ${lines} lines` : `${lines} lines`;
+    item.innerHTML = `<span class="mi-ic">${multi ? FILES_ICON : FILE_ICON}</span>` +
+      `<span class="mi-tx"><span class="mi-nm">${escapeHtml(s.name)}</span>` +
+      `<span class="mi-sub">${sub}</span></span>`;
+    item.addEventListener("click", () => {
+      loadSample(i);
+      closeMenu();
+    });
+    menuEl.append(item);
   });
 };
 const openMenu = () => {
@@ -1108,21 +946,17 @@ pickerBtn.addEventListener("click", (e) => {
 document.addEventListener("click", () => closeMenu());
 menuEl.addEventListener("click", (e) => e.stopPropagation());
 
-// Replace all buffers with `projectFiles` and reset the results panes. Shared by
-// the sample loader, the user-project loader, and the share-link / restore paths.
-const loadFiles = (
-  projectFiles: ProjectFile[],
-  displayName: string,
-  updateHash: boolean,
-) => {
+const loadSample = (i: number) => {
+  const sample: Sample | undefined = SAMPLES[i];
+  if (!sample) return;
+  activeSample = i;
+  pickerName.textContent = sample.name;
   disposeAllModels();
   untitledSeq = 0;
-  const seed = projectFiles.length > 0 ? projectFiles : [{ name: ENTRY_FILE, source: "" }];
-  files = seed.map((f) => ({ name: f.name }));
-  for (const f of seed) makeModel(f.name, f.source);
+  files = sample.files.map((f) => ({ name: f.name }));
+  for (const f of sample.files) makeModel(f.name, f.source);
   activeFile = files[0]?.name ?? ENTRY_FILE;
   editor.setModel(models.get(activeFile)!);
-  pickerName.textContent = displayName || "Scratch";
   renderFileTabs();
   updateEditorMeta();
   statusFile.textContent = activeFile;
@@ -1133,172 +967,11 @@ const loadFiles = (
   setTab("out");
   refreshDiagnostics();
   setStatus("Ready");
-  syncProjectControls();
-  if (updateHash) {
-    encodeSource(models.get(ENTRY_FILE)?.getValue() ?? "").then((fragment) => {
-      history.replaceState(null, "", fragment);
-    }).catch(() => {});
-  }
-  rememberSession();
+  encodeSource(models.get(ENTRY_FILE)?.getValue() ?? "").then((fragment) => {
+    history.replaceState(null, "", fragment);
+  }).catch(() => {});
   if (autoRun && compilerReady) run();
 };
-
-const loadSample = (i: number) => {
-  const sample: Sample | undefined = SAMPLES[i];
-  if (!sample) return;
-  current = { kind: "sample", index: i };
-  loadFiles(
-    sample.files.map((f) => ({ name: f.name, source: f.source })),
-    sample.name,
-    true,
-  );
-};
-
-const loadUserProject = (id: string) => {
-  const p = projects.getProject(id);
-  if (!p) return;
-  current = { kind: "user", id };
-  loadFiles(p.files, p.name, true);
-};
-
-// --- project save / rename / delete ------------------------------------------
-//
-// localStorage schema (see projects.ts):
-//   "vl-projects"      → UserProject[]  (id, name, files[], timestamps)
-//   "vl-last-session"  → { ref, files } (what was open + live buffers, for restore)
-//
-// Save semantics (owner-specified): "Save" on a BUILT-IN sample never overwrites
-// it — it forks to a NEW named user project (Save As). "Save" on a user project
-// updates it in place. "Save As" always creates a new named copy. Rename/Delete
-// act on the open user project. Built-in samples stay pristine.
-
-// The live buffer contents of every file, as persistable project files.
-const currentFiles = (): ProjectFile[] =>
-  files.map((f) => ({ name: f.name, source: models.get(f.name)?.getValue() ?? "" }));
-
-// Reflect the open project in the name field + button enablement. Rename/Delete
-// only apply to a saved user project; Save/Save As are always available.
-const syncProjectControls = () => {
-  projNameInput.value = currentDisplayName();
-  const isUser = current.kind === "user";
-  renameBtn.disabled = !isUser;
-  delBtn.disabled = !isUser;
-  renameBtn.style.opacity = isUser ? "" : "0.45";
-  delBtn.style.opacity = isUser ? "" : "0.45";
-};
-
-// Persist "what's open + the live buffers" so a reload restores in-progress work.
-const rememberSession = () => {
-  const ref = current.kind === "sample"
-    ? { kind: "sample" as const, index: current.index }
-    : current.kind === "user"
-    ? { kind: "user" as const, id: current.id }
-    : { kind: "scratch" as const };
-  projects.saveLastSession({ ref, files: currentFiles() });
-};
-
-let saveFlashTimer: ReturnType<typeof setTimeout> | undefined;
-const flashSave = (text: string) => {
-  const label = saveBtn.querySelector<HTMLSpanElement>(".save-label")!;
-  label.textContent = text;
-  if (saveFlashTimer !== undefined) clearTimeout(saveFlashTimer);
-  saveFlashTimer = setTimeout(() => {
-    label.textContent = "Save";
-  }, 1500);
-};
-
-// Prompt for a fresh name (defaulting to the field/typed value), creating a new
-// user project from the current buffers. Used by Save-As and by Save-over-a-sample.
-const saveAsNew = (defaultName: string) => {
-  const suggested = defaultName.trim() || "My Project";
-  const name = prompt("Save project as:", suggested);
-  if (name === null) return; // cancelled
-  const trimmed = name.trim();
-  if (trimmed === "") {
-    setStatus("Project name cannot be empty", "error");
-    return;
-  }
-  if (
-    projects.nameExists(trimmed) &&
-    !confirm(`A project named "${trimmed}" already exists. Save another copy?`)
-  ) {
-    return;
-  }
-  const p = projects.createProject(trimmed, currentFiles());
-  current = { kind: "user", id: p.id };
-  pickerName.textContent = p.name;
-  syncProjectControls();
-  rememberSession();
-  setStatus(`Saved "${p.name}"`);
-  flashSave("Saved");
-};
-
-const doSave = () => {
-  if (current.kind === "user") {
-    // Update the open user project in place.
-    const updated = projects.updateProject(current.id, currentFiles());
-    if (!updated) {
-      // It was deleted out from under us — fall back to a fresh save.
-      saveAsNew(projNameInput.value);
-      return;
-    }
-    pickerName.textContent = updated.name;
-    rememberSession();
-    setStatus(`Saved "${updated.name}"`);
-    flashSave("Saved");
-    return;
-  }
-  // A built-in sample (or scratch buffer): saving forks to a NEW named copy so
-  // the sample stays pristine.
-  saveAsNew(projNameInput.value || currentDisplayName());
-};
-
-const doRename = () => {
-  if (current.kind !== "user") return;
-  const existing = projects.getProject(current.id);
-  const name = prompt("Rename project:", existing?.name ?? projNameInput.value);
-  if (name === null) return;
-  const trimmed = name.trim();
-  if (trimmed === "") {
-    setStatus("Project name cannot be empty", "error");
-    return;
-  }
-  const updated = projects.renameProject(current.id, trimmed);
-  if (!updated) return;
-  pickerName.textContent = updated.name;
-  syncProjectControls();
-  rememberSession();
-  setStatus(`Renamed to "${updated.name}"`);
-};
-
-// Delete a saved project. If it's the one currently open, fall back to the first
-// built-in sample.
-const deleteCurrentOrProject = (id: string) => {
-  const p = projects.getProject(id);
-  if (!p) return;
-  if (!confirm(`Delete project "${p.name}"? This cannot be undone.`)) return;
-  projects.deleteProject(id);
-  if (current.kind === "user" && current.id === id) {
-    loadSample(0);
-  } else {
-    buildMenu();
-  }
-  setStatus(`Deleted "${p.name}"`);
-};
-
-saveBtn.addEventListener("click", () => doSave());
-saveAsBtn.addEventListener("click", () => saveAsNew(projNameInput.value || currentDisplayName()));
-renameBtn.addEventListener("click", () => doRename());
-delBtn.addEventListener("click", () => {
-  if (current.kind === "user") deleteCurrentOrProject(current.id);
-});
-// Enter in the name field saves.
-projNameInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") {
-    e.preventDefault();
-    doSave();
-  }
-});
 
 // --- share / copy-link -------------------------------------------------------
 //
@@ -1360,54 +1033,25 @@ formatBtn.addEventListener("click", () => {
 
 faddBtn.addEventListener("click", () => addFile());
 
-// --- initial state on load ---------------------------------------------------
+// --- shareable links on load -------------------------------------------------
 //
-// Precedence: a share-link hash (E4) wins — a shared URL must reproduce its
-// source exactly, as an unnamed `scratch` buffer. Otherwise restore the LAST
-// SESSION (the open project + its live, possibly-unsaved buffers) so a refresh
-// never loses work. Failing both, seed the first built-in sample.
+// Decode the URL hash into the initial entry-module source (takes precedence
+// over the default sample's main.vl).
 const sourceFromHash = await decodeHash(location.hash).catch(() => null);
-
-// Compute the initial files + `current` ref. Models are seeded here (the editor
-// needs one to construct); the project chrome is synced after the editor exists.
-let initialFiles: ProjectFile[];
-if (sourceFromHash !== null) {
-  // A shared link: a single entry module, not tied to any saved project.
-  current = { kind: "scratch" };
-  initialFiles = [{ name: ENTRY_FILE, source: sourceFromHash }];
-  pickerName.textContent = "Shared snippet";
-} else {
-  const last = projects.loadLastSession();
-  if (last) {
-    // Restore the open project ref (so the selector re-highlights it) AND its
-    // live buffer contents. A `user` ref whose project was deleted still restores
-    // the buffers — just as a `scratch`.
-    current = last.ref.kind === "user" && projects.getProject(last.ref.id)
-      ? { kind: "user", id: last.ref.id }
-      : last.ref.kind === "sample"
-      ? { kind: "sample", index: last.ref.index }
-      : { kind: "scratch" };
-    initialFiles = last.files.map((f) => ({ name: f.name, source: f.source }));
-    pickerName.textContent = current.kind === "scratch"
-      ? "Restored draft"
-      : currentDisplayName() || "Restored";
-  } else {
-    const firstSample = SAMPLES[0]!;
-    current = { kind: "sample", index: 0 };
-    initialFiles = firstSample.files.map((f) => ({ name: f.name, source: f.source }));
-    pickerName.textContent = firstSample.name;
-  }
-}
 
 // --- editor instance ---------------------------------------------------------
 
-const seed = initialFiles.length > 0 ? initialFiles : [{ name: ENTRY_FILE, source: "" }];
-files = seed.map((f) => ({ name: f.name }));
-for (const f of seed) makeModel(f.name, f.source);
-activeFile = files[0]?.name ?? ENTRY_FILE;
+// Seed the model set from SAMPLES[0] (or the share hash for the entry module).
+const firstSample = SAMPLES[0]!;
+files = firstSample.files.map((f) => ({ name: f.name }));
+for (const f of firstSample.files) {
+  makeModel(f.name, f.name === ENTRY_FILE && sourceFromHash ? sourceFromHash : f.source);
+}
+activeFile = ENTRY_FILE;
+pickerName.textContent = firstSample.name;
 
 const editor = monaco.editor.create(editorHost, {
-  model: models.get(activeFile) ?? models.get(ENTRY_FILE)!,
+  model: models.get(ENTRY_FILE)!,
   theme: currentMode() === "dark" ? "vital-dark" : "vital-light",
   automaticLayout: true,
   fontFamily: "Geist Mono, ui-monospace, monospace",
@@ -1431,6 +1075,22 @@ const editor = monaco.editor.create(editorHost, {
   contextmenu: false,
 });
 
+// Monaco measures and CACHES the monospace glyph width at creation time. The
+// editor font (Geist Mono) is a Google web font loaded with `display=swap`, so
+// at creation the browser is still painting the FALLBACK face — Monaco captures
+// the fallback's char width, and once Geist Mono swaps in the glyphs no longer
+// line up with the cached metric, drifting the caret and selection box (visible
+// as the cursor sitting off from the text). Remeasure once the real face has
+// actually loaded so Monaco's metrics match what's painted. `remeasureFonts` is
+// idempotent, so firing on both the explicit face load and `fonts.ready` is safe.
+if (document.fonts) {
+  Promise.all([
+    document.fonts.load('400 14px "Geist Mono"'),
+    document.fonts.load('500 14px "Geist Mono"'),
+  ]).then(() => monaco.editor.remeasureFonts()).catch(() => {});
+  document.fonts.ready.then(() => monaco.editor.remeasureFonts());
+}
+
 editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => run());
 editor.onDidChangeCursorPosition((e) => {
   statusFile.textContent = activeFile;
@@ -1444,8 +1104,6 @@ statusFile.textContent = activeFile;
 setCursor(1, 1);
 renderOutputEmpty();
 renderWat(undefined, undefined);
-syncProjectControls();
-rememberSession();
 
 // --- compiler readiness ------------------------------------------------------
 //
