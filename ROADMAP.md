@@ -237,6 +237,7 @@ only; the parser is hand-written) · `samples/` · `tests/` — `.vl` corpus + r
   hover and completion `documentation`. Cross-import resolution now done (H0 phase 3): a `Name` that
   is an imported binding links to the exporting sibling module's source location (`siblingUri#L…`),
   via the module graph's imported-name → source resolution (`lsp/src/moduleGraph.ts`).
+- 🟡 **D — Project-wide unused-export hints.** Core shipped: debounced workspace pass on save (+ 3 s idle), use-map over ≤500 `.vl` files, `hint`/`unnecessary` diagnostics for zero-reference exports. REMAINING: **struct field–level unused-export analysis** — deferred because VL's structural typing makes field-level usage tracking fuzzy (a field could be "used" via a widened receiver type without any import); a future refinement could cross-check field names against known call sites once structural subtyping is tightened.
 - ⬜ **D8. Hover verbosity step-expansion.** Alias-name preservation is done (see `CHANGELOG.md`).
   REMAINING: the interactive shallow↔deep verbosity stepper — expand one alias layer at a time
   on demand via the proposed LSP 3.18 hover-verbosity API (`HoverParams.context.verbosityLevel`

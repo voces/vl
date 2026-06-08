@@ -34,6 +34,7 @@ import {
 } from "../../compiler/compile.ts";
 import { format } from "../../compiler/format.ts";
 import {
+  buildUnusedExportUseMap,
   checkDocument,
   crossFileReferences,
   type CrossFileSource,
@@ -42,6 +43,8 @@ import {
   importedNameSource,
   importedNameSources,
   makeWorkspaceReader,
+  type UnusedExportUseMap,
+  unusedExportHints,
   uriToPath,
 } from "./moduleGraph.ts";
 import { parseProgram } from "../../compiler/parser.ts";
@@ -230,6 +233,72 @@ const toLspDiagnostic = (d: VLDiagnostic): Diagnostic => ({
   tags: d.tags?.map((t) => tagMap[t]),
 });
 
+// ---- Project-wide unused-export hints (debounced workspace pass) ------------
+//
+// A debounced workspace crawl runs on document SAVE (and on a 3-second idle
+// after edits). The crawl is NOT per-keystroke — it enumerates up to 500 .vl
+// files, parses each to build a project-wide USE-MAP, and publishes `hint`
+// diagnostics for exported symbols that have zero references anywhere in the
+// project. These hints are merged with the file's regular lint/type diagnostics
+// when the workspace pass completes.
+//
+// Cost profile: the pass runs only on save (or after a 3-second idle timer
+// fires). Each file is parsed once (via `parseSymbols`, not full graph-seeded
+// `checkDocument`), so the crawl is lightweight. The 500-file cap from
+// `crossFileReferences` / `MAX_DISK_FILES` is reused.
+//
+// The most-recent use-map is stored here; open documents are re-published
+// whenever a new map is computed (so their hints update after every save).
+
+let lastUseMap: UnusedExportUseMap = new Map();
+
+// Debounce timer handle (Node-style number; cleared on each new edit or save).
+let useMapDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+
+// Delay (ms) between the last edit and a debounced workspace pass. A save
+// triggers the pass immediately (the timer is cleared); idling for 3 seconds
+// after the last keystroke also triggers it.
+const UNUSED_EXPORT_DEBOUNCE_MS = 3000;
+
+/**
+ * Run the project-wide unused-export workspace pass: enumerate all .vl files,
+ * build the use-map, re-publish diagnostics for every open document (merging
+ * the updated hints with the cached lint/type diagnostics).
+ *
+ * Called on document SAVE (immediate) and by the idle debounce timer.
+ */
+const runUnusedExportPass = async (): Promise<void> => {
+  // Determine the project root (same logic as onReferences).
+  const openUris = documents.all().map((d) => d.uri);
+  // Use the first open document's key to detect the root; fall back to an
+  // empty crawl if there are no open documents.
+  if (openUris.length === 0) return;
+  const firstKey = uriToPath(openUris[0]);
+  const crawlRoot = workspaceFolder
+    ? uriToPath(workspaceFolder)
+    : detectProjectRoot(firstKey);
+  const diskFiles = enumerateWorkspaceFiles(crawlRoot);
+
+  // Build the use-map over all project files (open buffers + disk).
+  const useMap = await buildUnusedExportUseMap(diskFiles, workspaceReader);
+  lastUseMap = useMap;
+
+  // Re-publish diagnostics for every open document so hints update atomically.
+  for (const doc of documents.all()) {
+    const cached = diagnosticsByUri.get(doc.uri) ?? [];
+    const hints = unusedExportHints(
+      doc.getText(),
+      uriToPath(doc.uri),
+      useMap,
+    );
+    connection.sendDiagnostics({
+      uri: doc.uri,
+      version: doc.version,
+      diagnostics: [...cached, ...hints].map(toLspDiagnostic),
+    });
+  }
+};
+
 documents.onDidChangeContent(async (event) => {
   connection.console.log(
     `[Server(${process.pid}) ${workspaceFolder}] Document changed: ${event.document.uri}`,
@@ -258,11 +327,42 @@ documents.onDidChangeContent(async (event) => {
   // diagnostics VS Code passes back.
   diagnosticsByUri.set(event.document.uri, diagnostics);
 
+  // Merge the most-recently-computed unused-export hints (from the last
+  // workspace pass) with the per-file lint/type diagnostics. The hints are
+  // stale relative to this edit — they will be refreshed by the debounce
+  // timer that fires after idle. Publishing the stale hints avoids losing
+  // them entirely on every keystroke.
+  const hints = unusedExportHints(
+    event.document.getText(),
+    entryKeyOf(event.document.uri),
+    lastUseMap,
+  );
+
   connection.sendDiagnostics({
     uri: event.document.uri,
     version: event.document.version,
-    diagnostics: diagnostics.map(toLspDiagnostic),
+    diagnostics: [...diagnostics, ...hints].map(toLspDiagnostic),
   });
+
+  // Arm the idle debounce timer: after UNUSED_EXPORT_DEBOUNCE_MS of no edits,
+  // trigger a fresh workspace pass. A subsequent edit or a save resets the timer.
+  if (useMapDebounceTimer !== undefined) clearTimeout(useMapDebounceTimer);
+  useMapDebounceTimer = setTimeout(() => {
+    useMapDebounceTimer = undefined;
+    runUnusedExportPass().catch(() => {});
+  }, UNUSED_EXPORT_DEBOUNCE_MS);
+});
+
+// On document SAVE: trigger the workspace pass immediately (clear the debounce
+// timer so the idle pass doesn't duplicate work). This is the primary trigger —
+// saves are intentional "I'm done with this file" signals, a natural point to
+// pay the crawl cost. NOT every keystroke.
+documents.onDidSave(async (_event) => {
+  if (useMapDebounceTimer !== undefined) {
+    clearTimeout(useMapDebounceTimer);
+    useMapDebounceTimer = undefined;
+  }
+  await runUnusedExportPass().catch(() => {});
 });
 
 // LSP positions are 0-based line / 0-based character; VL's `Position` (and the
@@ -760,6 +860,9 @@ connection.onInitialize((params) => {
       textDocumentSync: {
         openClose: true,
         change: TextDocumentSyncKind.Full,
+        // Enable save notifications so the server can trigger the
+        // project-wide unused-export workspace pass on document save.
+        save: true,
       },
       completionProvider: {
         // `.` re-triggers completion so member suggestions appear right after a
