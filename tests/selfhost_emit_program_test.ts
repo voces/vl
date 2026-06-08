@@ -2940,6 +2940,45 @@ const CASES: Case[] = [
     },
   },
   {
+    // A `.push` buried under 2+ `else if` arms (the `parseProgram` / `parseStmt`
+    // recursive-descent dispatch shape: `if k=="EOF" {} else if k=="NL" { adv() }
+    // else if k=="IMPORT" { skip() } else { stmts.push(parseStmt()) }`). The
+    // scratch-reservation walkers (`blockHasPushKind`/`blockHasStrOp`/the ref-push
+    // slot collector) used a HAND-UNROLLED one-level else-if descent, so a push (or
+    // string op) under the SECOND-or-later `else if` was missed — the function then
+    // reserved no push scratch and the append wrote into local 0, failing to validate
+    // (`local.set[0] expected (ref N), found call of type i32`). Now they recurse the
+    // whole else-if chain. Drives real lexer->parser->emitProgram->engine.
+    name: "G3: `.push` under 2+ `else if` arms reserves scratch correctly => 4",
+    src: [
+      "function f(): i32 {",
+      "  let stmts: i32[] = []",
+      "  let i = 0",
+      "  while i < 8 {",
+      "    let k = i % 4",
+      "    if k == 0 {",
+      "      i = i + 1",
+      "    } else if k == 1 {",
+      "      i = i + 1",
+      "    } else if k == 2 {",
+      "      i = i + 1",
+      "    } else {",
+      "      stmts.push(i)",
+      "      i = i + 1",
+      "    }",
+      "  }",
+      "  return stmts.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // i in 0..7; k==3 at i=3 and i=7 → 2 pushes → length 2... recompute: k=i%4==3
+      // when i==3 and i==7 → 2 elements. Expect 2.
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 2) throw new Error(`f() returned ${got}, expected 2`);
+    },
+  },
+  {
     // CONSTRUCTION-side counterpart: a struct `string[]` field built from a `string[]`
     // SOURCE local (not a literal / not empty) — the `mkUnionDecl { udVariants: variants }`
     // shape in `ast.vl`. The `i32[]` analogue (`{ items: xs }`) already works; this proves
