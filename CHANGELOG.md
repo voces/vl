@@ -90,6 +90,7 @@ see **`DECISIONS.md`**.
 - **F9c Memoize `structSig` in `toWasm.ts`** — the structural-signature walk was uncached and dominated IR-build on the self-host module (~6 s of ~7.7 s total; 268k calls). Caching by type-node identity (empty `nameStack` only) cut selfhost-suite wall time ~107 s → ~30 s with byte-identical wasm. Post-fix: binaryen `optimize()` is only ~0.8 s on this module, not the bottleneck. (#107; detail: `docs/perf-findings.md`)
 - **F10 Bare `deno check` passes** — lsp sub-project excluded; playground + lsp-test type errors fixed so top-level `deno check` exits clean. (#140)
 - **F11 CI skips heavy suite for docs-only changes** — an in-job `git diff` gate (not a workflow-level `paths` filter) `if`-guards the heavy steps, so docs-only PRs go green fast while the `ci` check still reports. (#142)
+- **F12 GitHub Pages deploy** — `.github/workflows/pages.yml` builds the playground (`deno task playground:build`) and deploys the static bundle to `https://voces.github.io/vl/` on every master push that touches `playground/`, `compiler/`, or build-config files.
 
 ## Parser (Track G — complete)
 

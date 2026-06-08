@@ -1,0 +1,94 @@
+name: Deploy Playground
+
+# Triggers:
+#   - push to master when playground, compiler, or build-config files change
+#   - manual dispatch (workflow_dispatch) for on-demand redeploys
+on:
+  push:
+    branches: [master]
+    paths:
+      - "playground/**"
+      - "compiler/**"
+      - "deno.json"
+      - "deno.lock"
+      - "package.json"
+      - "package-lock.json"
+  workflow_dispatch:
+
+# Required by actions/deploy-pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deploy runs at a time. Setting cancel-in-progress: false means
+# a queued deploy waits for the in-flight one to finish rather than clobbering it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # Node is needed by `npm install` (part of playground:build) and esbuild's
+      # native binary. Cache npm to skip re-downloading on repeated runs.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      # Install node_modules (binaryen, esbuild, monaco-editor, etc.) so that
+      # `deno task playground:build` finds them without re-downloading from npm.
+      - name: Install node deps
+        run: npm ci
+
+      # Configure the Pages deployment so upload-pages-artifact can stamp the
+      # correct base URL metadata into the artifact.
+      - uses: actions/configure-pages@v5
+
+      # Build: esbuild bundles playground/src/main.ts → playground/dist/playground.js
+      # (ESM, ~21 MB self-contained) + playground/dist/playground.css (~260 KB).
+      # binaryen's wasm is inlined into the JS; the codicon font is a data: URL.
+      # playground/dist/ is gitignored — we build it fresh on every deploy.
+      - name: Build playground
+        run: deno task playground:build
+
+      # Assemble the deployable static site under _site/:
+      #
+      #   _site/index.html        — references ./dist/playground.{js,css}
+      #   _site/dist/             — the esbuild output (js + css + maps)
+      #   _site/.nojekyll         — suppresses GitHub Pages' Jekyll post-processing,
+      #                             which would otherwise filter out bundle files
+      #                             whose names start with underscores or that
+      #                             contain raw binary/base64 data.
+      #
+      # index.html uses RELATIVE paths (./dist/…), so the site works at the
+      # subpath https://voces.github.io/vl/ with no path rewriting needed.
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp playground/index.html _site/index.html
+          cp -r playground/dist _site/dist
+          touch _site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
