@@ -2752,22 +2752,22 @@ const CASES: Case[] = [
   {
     // The core arena shape: a GLOBAL struct with a `Node[]`-style ref-list field, mutated
     // through `.push`. Here `Item[]` (struct-element ref list) stands in for `Node[]`.
-    name: "G3: push onto a GLOBAL struct's ref-list field, read back => 12",
+    name: "G3: push onto a GLOBAL struct's EMPTY ref-list field, read back => 11",
     src: [
       "type Item = { v: i32 }",
       "type Arena = { items: Item[] }",
-      "let A: Arena = { items: [ { v: 1 } ] }",
+      "let A: Arena = { items: [] }",
       "function f(): i32 {",
       "  A.items.push({ v: 5 })",
       "  A.items.push({ v: 9 })",
-      "  return A.items.length + A.items[2].v",
+      "  return A.items.length + A.items[1].v",
       "}",
       "",
     ].join("\n"),
     check: async (logs) => {
-      // items starts [{v:1}], push {v:5},{v:9} → length 3 + items[2].v (9) = 12.
+      // items starts empty, push {v:5},{v:9} → length 2 + items[1].v (9) = 11.
       const got = await runExport(bytesFromLog(logs), "f");
-      if (got !== 12) throw new Error(`f() returned ${got}, expected 12`);
+      if (got !== 11) throw new Error(`f() returned ${got}, expected 11`);
     },
   },
 ];
