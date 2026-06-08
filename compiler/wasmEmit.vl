@@ -172,6 +172,197 @@ function wSection(id: i32, payload: i32[]): i32 {
   0
 }
 
+// ── FuncBuilder opcode methods (Layer 2 — typed instruction emission) ─────────
+// One top-level, closure-free function per opcode (or opcode family) VL emits. Each
+// writes EXACTLY the bytes the corresponding raw `body.push(<opcode>)` (+ any LEB
+// operands) emitted before, straight through the BinaryWriter (`wU8`/`wULEB`/`wSLEB`)
+// onto the CURRENT buffer (`curBuf`). The lowering sets `curBuf` to the buffer it is
+// filling (the function body, or a global-init constexpr) via `wTarget`, so these
+// methods need no `body` parameter — they are the single place each magic opcode byte
+// lives. Every method returns `0` (a side-effecting builder; statement sequencing
+// replaces method chaining). The opcode set is small and closed (~40); this phase
+// (Phase B) DEFINES the whole set's control/locals/consts family with real bodies and
+// converts its call sites, leaving the struct / array / map / string families to land
+// in Phases C–F.
+
+// ── control flow / locals / consts (the universal base — Phase B) ─────────────
+// local.get / local.set / local.tee: 0x20/0x21/0x22 <localidx-uleb>.
+function fbLocalGet(i: i32): i32 {
+  wU8(32)            // 0x20 local.get
+  wULEB(i)
+  0
+}
+function fbLocalSet(i: i32): i32 {
+  wU8(33)            // 0x21 local.set
+  wULEB(i)
+  0
+}
+function fbLocalTee(i: i32): i32 {
+  wU8(34)            // 0x22 local.tee
+  wULEB(i)
+  0
+}
+// global.get / global.set: 0x23/0x24 <globalidx-uleb>.
+function fbGlobalGet(i: i32): i32 {
+  wU8(35)            // 0x23 global.get
+  wULEB(i)
+  0
+}
+function fbGlobalSet(i: i32): i32 {
+  wU8(36)            // 0x24 global.set
+  wULEB(i)
+  0
+}
+// i32.const: 0x41 <value-sleb>.
+function fbI32Const(v: i32): i32 {
+  wU8(65)            // 0x41 i32.const
+  wSLEB(v)
+  0
+}
+// if: 0x04 <blocktype>. `blockType` is a single byte (0x40 void, or a valtype byte).
+function fbIf(blockType: i32): i32 {
+  wU8(4)             // 0x04 if
+  wU8(blockType)
+  0
+}
+function fbElse(): i32 {
+  wU8(5)             // 0x05 else
+  0
+}
+// block / loop: 0x02/0x03 <blocktype> (single byte, as `fbIf`).
+function fbBlock(blockType: i32): i32 {
+  wU8(2)             // 0x02 block
+  wU8(blockType)
+  0
+}
+function fbLoop(blockType: i32): i32 {
+  wU8(3)             // 0x03 loop
+  wU8(blockType)
+  0
+}
+// br / br_if: 0x0c/0x0d <depth-uleb>.
+function fbBr(depth: i32): i32 {
+  wU8(12)            // 0x0c br
+  wULEB(depth)
+  0
+}
+function fbBrIf(depth: i32): i32 {
+  wU8(13)            // 0x0d br_if
+  wULEB(depth)
+  0
+}
+function fbEnd(): i32 {
+  wU8(11)            // 0x0b end
+  0
+}
+function fbDrop(): i32 {
+  wU8(26)            // 0x1a drop
+  0
+}
+function fbUnreachable(): i32 {
+  wU8(0)             // 0x00 unreachable
+  0
+}
+function fbReturn(): i32 {
+  wU8(15)            // 0x0f return
+  0
+}
+// call: 0x10 <funcidx-uleb>.
+function fbCall(fnIdx: i32): i32 {
+  wU8(16)            // 0x10 call
+  wULEB(fnIdx)
+  0
+}
+// i32.eqz: 0x45 (used for `!a` and the while-condition inversion).
+function fbI32Eqz(): i32 {
+  wU8(69)            // 0x45 i32.eqz
+  0
+}
+// One i32 arithmetic / comparison opcode (the `binOpcode` set: 0x6a add, 0x6b sub,
+// 0x6c mul, 0x6d div_s, 0x6f rem_s, 0x46 eq, 0x47 ne, 0x48 lt_s, 0x4a gt_s, 0x4c le_s,
+// 0x4e ge_s). The opcode byte is resolved by `binOpcode`; this just writes it.
+function fbI32Bin(op: i32): i32 {
+  wU8(op)
+  0
+}
+
+// ── opcode-method STUBS for the later families (Phases C–F) ───────────────────
+// Names declared now so the closed ~40-method set is coherent and self-documenting;
+// their CALL SITES (in `emitObj`/`emitArr`/`emitMap*`/string ops) are NOT converted in
+// this phase — they still push raw bytes. Each stub already emits the exact bytes its
+// family's sites emit, so converting those sites in C–F is a pure call-site swap.
+// GC struct ops (Phase C):
+function fbStructNew(heapIdx: i32): i32 {
+  wU8(251)           // 0xfb GC prefix
+  wU8(0)             // struct.new
+  wULEB(heapIdx)
+  0
+}
+function fbStructNewDefault(heapIdx: i32): i32 {
+  wU8(251)           // 0xfb GC prefix
+  wU8(1)             // struct.new_default
+  wULEB(heapIdx)
+  0
+}
+function fbStructGet(heapIdx: i32, field: i32): i32 {
+  wU8(251)           // 0xfb GC prefix
+  wU8(2)             // struct.get
+  wULEB(heapIdx)
+  wULEB(field)
+  0
+}
+function fbStructSet(heapIdx: i32, field: i32): i32 {
+  wU8(251)           // 0xfb GC prefix
+  wU8(5)             // struct.set
+  wULEB(heapIdx)
+  wULEB(field)
+  0
+}
+// GC array ops (Phase D):
+function fbArrayNew(heapIdx: i32): i32 {
+  wU8(251)           // 0xfb GC prefix
+  wU8(6)             // array.new
+  wULEB(heapIdx)
+  0
+}
+function fbArrayNewDefault(heapIdx: i32): i32 {
+  wU8(251)           // 0xfb GC prefix
+  wU8(7)             // array.new_default
+  wULEB(heapIdx)
+  0
+}
+function fbArrayNewFixed(heapIdx: i32, n: i32): i32 {
+  wU8(251)           // 0xfb GC prefix
+  wU8(8)             // array.new_fixed
+  wULEB(heapIdx)
+  wULEB(n)
+  0
+}
+function fbArrayGet(heapIdx: i32): i32 {
+  wU8(251)           // 0xfb GC prefix
+  wU8(11)            // 0x0b array.get
+  wULEB(heapIdx)
+  0
+}
+function fbArraySet(heapIdx: i32): i32 {
+  wU8(251)           // 0xfb GC prefix
+  wU8(14)            // 0x0e array.set
+  wULEB(heapIdx)
+  0
+}
+function fbArrayLen(): i32 {
+  wU8(251)           // 0xfb GC prefix
+  wU8(15)            // 0x0f array.len
+  0
+}
+// GC ref ops (Phases C/D/F):
+function fbRefCast(heapIdx: i32): i32 {
+  wU8(251)           // 0xfb GC prefix
+  wU8(22)            // 0x16 ref.cast (non-null)
+  wULEB(heapIdx)
+  0
+}
+
 // ── module header ────────────────────────────────────────────────────────────
 function emitHeader(): i32 {
   // "\0asm" magic + version 1
