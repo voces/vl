@@ -1618,6 +1618,184 @@ const CASES: Case[] = [
     },
   },
 
+  // ── G4 (arena keystone): MULTIPLE distinct struct types per program ─────────
+  // `ast.vl` declares 32 struct `type`s; emitProgram now interns a SEPARATE WasmGC
+  // struct heap type per declared `type`, dispatching construction / field read /
+  // field write to the right heap index by the literal's field-set (or the binding's
+  // annotation / param / return type). These prove two-plus distinct structs coexist,
+  // each constructed + field-accessed, through real lexer→parser→emitProgram→engine.
+  {
+    name: "G4-struct: two distinct struct types coexist, each constructed + read => 12",
+    src: [
+      "type A = { x: i32, y: i32 }",
+      "type B = { p: i32, q: i32, r: i32 }",
+      "function main(): i32 {",
+      "  let a = { x: 7, y: 9 }",
+      "  let b = { p: 1, q: 2, r: 3 }",
+      "  return a.y + b.r",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
+    },
+  },
+  {
+    // Distinct structs with an OVERLAPPING-arity but distinct field-name set; a field
+    // index that differs between the two (`A.b` is field 1, `C.b` is field 0) proves
+    // the read resolves the per-struct layout, not a shared one.
+    name: "G4-struct: same-arity structs with different field order resolve correctly => 50",
+    src: [
+      "type A = { a: i32, b: i32 }",
+      "type C = { b: i32, c: i32 }",
+      "function main(): i32 {",
+      "  let x = { a: 10, b: 20 }",
+      "  let y = { b: 4, c: 30 }",
+      "  return x.b + y.c",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 50) throw new Error(`main() returned ${got}, expected 50`);
+    },
+  },
+  {
+    // A struct flows through a typed helper param + a struct-returning helper, each a
+    // DIFFERENT struct type — the functype valtype + the field reads must each pick
+    // the right heap index.
+    name: "G4-struct: two struct types across helpers (param + return) => 30",
+    src: [
+      "type P = { x: i32, y: i32 }",
+      "type Q = { m: i32, n: i32 }",
+      "function mkQ(a: i32, b: i32): Q {",
+      "  return { m: a, n: b }",
+      "}",
+      "function sumP(p: P): i32 {",
+      "  return p.x + p.y",
+      "}",
+      "function main(): i32 {",
+      "  let p = { x: 3, y: 7 }",
+      "  let q = mkQ(8, 12)",
+      "  return sumP(p) + q.m + q.n",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 30) throw new Error(`main() returned ${got}, expected 30`);
+    },
+  },
+  {
+    // Field WRITE across two struct types: each `s.f = v` must resolve to its own
+    // struct's heap index + field index.
+    name: "G4-struct: field writes across two struct types => 9",
+    src: [
+      "type A = { x: i32, y: i32 }",
+      "type B = { p: i32, q: i32, r: i32 }",
+      "function main(): i32 {",
+      "  let a = { x: 0, y: 0 }",
+      "  let b = { p: 0, q: 0, r: 0 }",
+      "  a.y = 4",
+      "  b.r = 5",
+      "  return a.y + b.r",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 9) throw new Error(`main() returned ${got}, expected 9`);
+    },
+  },
+
+  // ── G2-strfield: STRING struct fields (mixed i32 + string layout) ───────────
+  // `ast.vl`'s `Tok`/`Diag` mix i32 + string fields. A string field lowers to a
+  // non-null `(ref $aTypeIdx)` (the code-point array string rep); reading it back
+  // surfaces a string ref that the G6 element-wise `==` can compare. These prove a
+  // mixed-field struct constructs + round-trips a string field through the engine.
+  {
+    name: "G2-strfield: a Tok-like struct's string field reads back equal (`t.kind == \"id\"` => 1)",
+    src: [
+      "type Tok = { kind: string, start: i32, end: i32 }",
+      "function main(): i32 {",
+      "  let t: Tok = { kind: \"id\", start: 3, end: 7 }",
+      "  if t.kind == \"id\" {",
+      "    return 1",
+      "  }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    // The string field is NOT the first field — a mixed layout where the i32 fields
+    // surround the string field proves the field-type list, not a uniform assumption,
+    // drives the struct shape + the per-field read typing.
+    name: "G2-strfield: string field in the middle round-trips + i32 fields read => 11",
+    src: [
+      "type Tok = { start: i32, kind: string, end: i32 }",
+      "function main(): i32 {",
+      "  let t: Tok = { start: 4, kind: \"let\", end: 7 }",
+      "  if t.kind == \"let\" {",
+      "    return t.start + t.end",
+      "  }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 11) throw new Error(`main() returned ${got}, expected 11`);
+    },
+  },
+  {
+    // Bind the string field to a `let` then compare — proves local-type inference gives
+    // the binding the string ref type (not i32), so the `==` typechecks + runs.
+    name: "G2-strfield: bind a struct string field to a local, compare => 1",
+    src: [
+      "type Tok = { kind: string, n: i32 }",
+      "function main(): i32 {",
+      "  let t: Tok = { kind: \"num\", n: 5 }",
+      "  let k = t.kind",
+      "  if k == \"num\" {",
+      "    return 1",
+      "  }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    // A mixed i32+string struct WRITE: overwrite the string field, then read it back
+    // and compare — proves the field-write operand typing accepts a string value.
+    name: "G2-strfield: write a struct string field then read it back equal => 1",
+    src: [
+      "type Tok = { kind: string, n: i32 }",
+      "function main(): i32 {",
+      "  let t: Tok = { kind: \"a\", n: 0 }",
+      "  t.kind = \"xyz\"",
+      "  if t.kind == \"xyz\" {",
+      "    return 1",
+      "  }",
+      "  return 0",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+
   // ── G2b: module-level mutable GLOBALS (global.get / global.set) ─────────────
   {
     name: "G2b: an i32 global read+written within one function (`g=g+1` => 1)",
