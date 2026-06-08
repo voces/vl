@@ -105,6 +105,32 @@ Deno.test("inlay: a let bound to an object literal is still hinted", () => {
   assertEquals(hints, ["o: {x: i32, y: i32}"]);
 });
 
+// ---- arrays render `T[]`, not the raw `{i32: T}` index signature ------------
+// An array is internally an `{[i32]: T}` index-signature object; an array LITERAL
+// (and the `A-infer-empty` empty `[]`) used to be keyed by the integer type
+// `i32` and so fell through to the generic object render `{i32: i32}`. They now
+// build the CANONICAL `number`-keyed shape — identical to what a `T[]`
+// annotation produces — so all three render `T[]`. Regression guard.
+
+Deno.test("inlay: an array literal is hinted as `T[]`, not `{i32: T}`", () => {
+  assertEquals(hintsFor("let a = [1, 2]\n"), ["a: i32[]"]);
+});
+
+Deno.test("inlay: a string array literal renders `string[]`", () => {
+  assertEquals(hintsFor(`let a = ["x"]\n`), ["a: string[]"]);
+});
+
+Deno.test("inlay: a nested array literal renders `i32[][]`", () => {
+  assertEquals(hintsFor("let a = [[1]]\n"), ["a: i32[][]"]);
+});
+
+Deno.test("inlay: an inferred-empty array (`[]` + push) renders `i32[]`", () => {
+  // The element hole is pinned by the `.push(1)` and collapses into the binding
+  // type, so the display is `i32[]` (no leftover `I<any>`/Infer), matching an
+  // explicit `i32[]` annotation byte-for-byte.
+  assertEquals(hintsFor("let c = []\nc.push(1)\n"), ["c: i32[]"]);
+});
+
 // ---- range filtering still applies with source ------------------------------
 
 Deno.test("inlay: a requested range still filters source-aware hints", () => {

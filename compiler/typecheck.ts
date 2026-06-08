@@ -362,7 +362,11 @@ export const _typeFromExpression = (
       return {
         type: "Object",
         properties: [{
-          name: { type: "Alias", name: "i32" },
+          // Canonical array key: `number` (the i32-width array-index alias) —
+          // the SAME shape `parseArrayType` (the `T[]` suffix) and `listOf`
+          // build, so a literal, an annotation, and an inferred-empty array all
+          // render `T[]` (see `stringifyType`'s array case).
+          name: { type: "Alias", name: "number" },
           type: {
             type: "Union",
             subTypes: expr.values.map((v) => typeFromExpression(v, ctx)),
@@ -786,12 +790,23 @@ export const widenBindingType = (type: VLType, mutable: boolean): VLType =>
 // signature (`{[i32]: T}`) — return its element type `T`, else null. This is
 // what marks a value as an array (→ WasmGC array) rather than a struct, shared
 // by the type checker (here) and codegen (`toWasm.ts`).
+// The index-signature key of an array `{[i32]: T}`. An array LITERAL, the
+// `T[]` annotation suffix, and `listOf` all build the CANONICAL `number`-keyed
+// form (`number` is the i32-width array-index alias) so they share ONE type
+// shape that the printer renders `T[]`. The legacy `i32` key — produced only by
+// an explicit `{[i32]: V}` index-signature annotation, which VL treats as the
+// SAME native list/array type — is still accepted here so that form keeps
+// reading as an array (it just renders `{i32: V}` rather than `[]`, since it was
+// written index-signature-style). Both soften to the `i32` Object.
+export const isArrayKey = (name: VLType): boolean => {
+  if (name.type === "Alias" && name.name === "number") return true;
+  const soft = softenImplicitType(name);
+  return soft.type === "Object" && soft.name === "i32";
+};
+
 export const arrayElementType = (type: VLType): VLType | null => {
   if (type.type !== "Object") return null;
-  const prop = type.properties.find((p) => {
-    const name = softenImplicitType(p.name);
-    return name.type === "Object" && name.name === "i32";
-  });
+  const prop = type.properties.find((p) => isArrayKey(p.name));
   return prop ? prop.type : null;
 };
 
@@ -929,7 +944,8 @@ export const mapMemberType = (
 const listOf = (element: VLType): VLType => ({
   type: "Object",
   properties: [{
-    name: { type: "Alias", name: "i32" },
+    // Canonical array key: `number` — see `parseArrayType` / `ArrayLiteral`.
+    name: { type: "Alias", name: "number" },
     type: element,
   }],
 });
@@ -1421,6 +1437,16 @@ export const getConcreteType = (
   if (type.type === "Type") return getConcreteType(type.subType, ctx, seen);
   if (type.type !== "Alias") return type; // TODO: Should handle recursiveness (objects, params, etc)
   if (type.name === "null") return type;
+  // `number` is the array-index alias — the canonical key of an array's `{[i32]:
+  // T}` index signature (see `ArrayLiteral` / `parseArrayType` / `listOf`). It is
+  // NOT a user-facing builtin in `defaultScope` (so it never appears in
+  // completion / nominal lookups), so resolve it here, the same way `wasmType.ts`
+  // and `stringifyType` special-case it: it denotes the i32-width index, i.e. the
+  // concrete `i32` type. Without this, softening an array's key would throw
+  // "alias number not resolveable" (it isn't in scope).
+  if (type.name === "number") {
+    return getConcreteType({ type: "Alias", name: "i32" }, ctx, seen);
+  }
 
   // A DEGENERATE self-referential alias chain (`type D = D`) — the name resolves
   // straight back to itself with no structural body in between. This isn't a
@@ -2428,6 +2454,19 @@ export const ensureType = (
     : undefined;
   if (right.type === "Infer" && left.type !== "Infer") {
     [right, left] = [left, right];
+  }
+
+  // `number` is the array-index alias (the canonical key of an array's `{[i32]:
+  // T}` index signature — see `arrayElementType`). It is NOT a `defaultScope`
+  // builtin, so the scope-driven alias unwrap below can't resolve it; normalize
+  // it to its concrete `i32` here so two array keys (`{[number]:T}` vs
+  // `{[number]:T}`) validate as equal and an `i32`-keyed `{[i32]:T}` annotation
+  // stays assignment-compatible with the canonical array shape.
+  if (left.type === "Alias" && left.name === "number") {
+    left = { type: "Alias", name: "i32" };
+  }
+  if (right.type === "Alias" && right.name === "number") {
+    right = { type: "Alias", name: "i32" };
   }
 
   // A resolved `type` alias is now carried as a named `Type` wrapper (D8) so
