@@ -9,7 +9,7 @@ see **`DECISIONS.md`**.
 ## Type system (Track A)
 
 - **A0 Type-algebra inventory** — `Alias`, `Function`, `Object` (structural + index sigs), literal types, `Union`, `Nullable`, `Intersection`, `Negation`, `Unknown`/`Infer`, `Never`, `Type`, `Custom`.
-- **A3 Intersection surface syntax** — `A & B` parses, binds tighter than `|`, folds through `intersectType` at parse time; narrowing algebra (`intersectType`) done.
+- **A3 Intersection surface syntax** — `A & B` parses, binds tighter than `|`, folds through `intersectType` at parse time; narrowing algebra (`intersectType`) done. Object-type structural intersection: `{a} & {b}` now merges field-wise to `{a, b}` (shared fields refine to their per-field meet; an impossible field → `Never`).
 - **A4 Negation surface syntax** — `!A` and `x !is T` (Kotlin-style negated guard); `subtractType` narrowing algebra. → `DECISIONS.md`
 - **A5 Flow narrowing (broad)** — nullness, union-member, post-guard clauses, `&&`/`||` chains, De Morgan, else-of-else-if, literal discrimination, `?.`/`??`. (→ `docs/narrowing.md`)
 - **A6 `is` operator + tagged unions** — `x is T` discriminates a value union at runtime (niche/value-kind/boxed encodings, global tag registry, `coerceUnion`). (→ `docs/unions.md`)
