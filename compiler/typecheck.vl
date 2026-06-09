@@ -76,6 +76,8 @@ import {
   FieldDef,
   ObjLit,
   FieldInit,
+  UnionDecl,
+  IsExpr,
 } from "./ast"
 
 // ── Type-arena variants ──────────────────────────────────────────────────────
@@ -675,6 +677,17 @@ function checkNode(ix: i32): i32 {
     }
     return mkObjTy(fnames, ftys)
 
+  // ── type guard `x is T` ─────────────────────────────────────────────────────
+  // Always a `bool`. Checks the operand and that `T` names a known type. The actual
+  // narrowing of `x` to `T` happens in the THEN branch of an enclosing `if` (see the
+  // IfStmt case); used elsewhere it is just a boolean test.
+  } else if n is IsExpr {
+    let _objTy = checkNode(n.isObj)
+    if nameToTy(n.isVariant) < 0 {
+      tErr("unknown type '" + n.isVariant + "' in 'is'", ix)
+    }
+    return TY_BOOL
+
   } else if n is ErrExpr {
     return TY_ERR
 
@@ -785,7 +798,26 @@ function checkNode(ix: i32): i32 {
     if !assignable(condTy, TY_BOOL) {
       tErr("if-condition must be bool, got " + tyToStr(condTy), ix)
     }
+    // Positive `is`-narrowing: `if x is T { … }` refines a simple identifier `x` to
+    // the variant type `T` for the THEN branch only, via a pushed scope that shadows
+    // `x`'s binding. Reads the IsExpr + its Ident operand INLINE (mono-visitor).
+    let narrowed = 0
+    let cond = P.nodes[n.ifCond]
+    if cond is IsExpr {
+      let obj = P.nodes[cond.isObj]
+      if obj is Ident {
+        let tIdx = nameToTy(cond.isVariant)
+        if tIdx >= 0 {
+          pushScope()
+          declare(obj.identName, tIdx)
+          narrowed = 1
+        }
+      }
+    }
     checkNode(n.ifThen)
+    if narrowed == 1 {
+      popScope()
+    }
     if n.ifElse >= 0 {
       checkNode(n.ifElse)
     }
@@ -857,6 +889,23 @@ function checkNode(ix: i32): i32 {
           fi = fi + 1
         }
         T.userTypes[sd.tdName] = mkObjTy(fnames, ftys)
+      } else if sd is UnionDecl {
+        // A union's variants are type NAMES; resolve each (its variant structs
+        // register earlier in source order) into the member type-arena indices.
+        let variants = sd.udVariants
+        let members: i32[] = []
+        let vi = 0
+        while vi < variants.length {
+          let m = nameToTy(variants[vi])
+          if m >= 0 {
+            members.push(m)
+          } else {
+            tErr("unknown type '" + variants[vi] + "' in union '" +
+              sd.udName + "'", stmts[ti])
+          }
+          vi = vi + 1
+        }
+        T.userTypes[sd.udName] = mkUnionTy(members)
       }
       ti = ti + 1
     }
@@ -913,6 +962,9 @@ function checkNode(ix: i32): i32 {
   } else if n is TypeRef {
     return TY_VOID
   } else if n is TypeDecl {
+    // Registered by the Program pass-0 pre-pass; nothing to do when visited.
+    return TY_VOID
+  } else if n is UnionDecl {
     // Registered by the Program pass-0 pre-pass; nothing to do when visited.
     return TY_VOID
   }
