@@ -4818,6 +4818,35 @@ const CASES: Case[] = [
       if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
     },
   },
+  {
+    // REGRESSION (assignment to a list-typed GLOBAL): `g = []` where `g: string[]` must
+    // build a STRING-list wrapper, not the default i32-list — the `collectFns` shape
+    // (`globalNames = []`). emitAssign's global-store path must seed the global's declared
+    // list/struct context before lowering the RHS, like the global-INIT path does.
+    name: "assignment to a string[] global reseeds the list type (`g = []`) => 1",
+    src: [
+      "let g: string[] = []",
+      "function clear(): i32 {",
+      "  g = []",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  g.push(\"a\")",
+      "  g.push(\"b\")",
+      "  clear()",
+      "  g.push(\"c\")",
+      "  return g.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // clear() reassigns g to a FRESH string-list (`g = []`); the reassigned cell must
+      // have the correct string-list wrapper type for the later push to validate. After
+      // clear there is one element => length 1 (3 if the reassignment were dropped).
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
