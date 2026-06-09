@@ -23,7 +23,7 @@
 //
 // GROWING THE WHITELIST: re-run the runtime sweep as the emitter/checker/parser
 // gain coverage and promote newly-passing files. Current buckets of the 304 @run
-// files: 28 PASS; 70 emit gaps (lambdas/for-in/…), 77 checker false-rejects, 76 parse
+// files: 54 PASS; 70 emit gaps (lambdas/for-in/…), 77 checker false-rejects, 76 parse
 // gaps, 28 scratch-needing top-level statements (emit validly only inside
 // functions today), 11 emitter traps (real bugs to pin), 4 log diffs (bool prints
 // as 1/0 — needs bool-ness threading per the plan's step 3).
@@ -48,6 +48,8 @@ const WHITELIST = [
   "arith/ops.vl",
   "arith/typed-add.vl",
   "arrays/basics.vl",
+  "arrays/infer-empty-index-set.vl",
+  "arrays/infer-empty-push.vl",
   "chars/literals.vl",
   "functions/calls.vl",
   "functions/forward-call-inferred.vl",
@@ -55,6 +57,7 @@ const WHITELIST = [
   "functions/forward-reference-struct-param.vl",
   "functions/forward-reference.vl",
   "functions/mutual-recursion-struct-param.vl",
+  "functions/mutual-recursion.vl",
   "functions/return-then-statement-same-line.vl",
   "functions/struct-param-mutual-recursion-global.vl",
   "functions/trailing-comma-params.vl",
@@ -64,12 +67,35 @@ const WHITELIST = [
   "lint/called-function-no-warn.vl",
   "lint/mutual-recursion-no-warn.vl",
   "lint/reachable-no-warn.vl",
+  "lists/build-fusion-adv-break.vl",
+  "lists/build-fusion-adv-conditional.vl",
+  "lists/build-fusion-adv-multipush.vl",
+  "lists/build-fusion-adv-reads-a.vl",
+  "lists/build-fusion-continue.vl",
+  "lists/build-fusion-cw-adv-bound-mutated.vl",
+  "lists/build-fusion-cw-adv-break.vl",
+  "lists/build-fusion-cw-adv-double-incr.vl",
+  "lists/build-fusion-cw-adv-reads-a.vl",
+  "lists/build-fusion-cw-asc.vl",
+  "lists/build-fusion-cw-desc.vl",
+  "lists/build-fusion-cw-empty.vl",
+  "lists/build-fusion-cw-seeded.vl",
+  "lists/build-fusion-cw-step2.vl",
+  "lists/build-fusion-empty-count.vl",
+  "lists/build-fusion-range.vl",
+  "lists/build-fusion-seeded.vl",
+  "lists/push-struct.vl",
+  "lists/struct-field-push-regrow.vl",
+  "lists/struct-field-push.vl",
   "loops/for-range-bound-named-step.vl",
   "loops/for-step.vl",
   "loops/for-sum.vl",
   "loops/while-sum.vl",
+  "soundness/equality-boolean-sound.vl",
   "statements/discarded-call-return.vl",
   "statements/struct-call-as-statement.vl",
+  "types/union-narrowed-helper-recursion.vl",
+  "types/union-two-visitors.vl",
   "variables/definite-assign-initialized-ok.vl",
   "variables/let-reassign-ok.vl",
 ];

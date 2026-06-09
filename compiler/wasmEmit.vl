@@ -4005,6 +4005,57 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
 // its index comes from the function-index map, so a recursive call resolves to the
 // enclosing function's own already-mapped index.
 //
+// Is the expression BOOLEAN-producing? Drives the `print` import choice
+// (`__print_bool__` renders true/false; everything else prints as i32). A bool
+// rides in an i32 at the wasm level, so this is a SYNTACTIC classification:
+// bool literals, comparisons, logical connectives, `!`, `is` guards, and calls
+// to a function whose return annotation is `boolean`/`bool`. Identifiers are NOT
+// classified (a bool-typed local prints as 0/1 for now — annotation threading
+// through the local registry is a later slice).
+function exprIsBool(ix: i32, fnIx: i32): boolean {
+  if ix < 0 {
+    return false
+  }
+  let e = P.nodes[ix]
+  if e is BoolLit {
+    return true
+  }
+  if e is IsExpr {
+    return true
+  }
+  if e is Paren {
+    return exprIsBool(e.parInner, fnIx)
+  }
+  if e is Unary {
+    return e.unOp == "!"
+  }
+  if e is BinExpr {
+    let op = e.binOp
+    if op == "==" || op == "!=" { return true }
+    if op == "<" || op == ">" || op == "<=" || op == ">=" { return true }
+    if op == "&&" || op == "||" { return true }
+    return false
+  }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      let target = fnIndexOf(callee.identName)
+      if target >= 0 {
+        let fn = P.nodes[fnStmts[target]]
+        if fn is FuncDecl {
+          if fn.fnRet >= 0 {
+            let rt = P.nodes[fn.fnRet]
+            if rt is TypeRef {
+              return rt.tyName == "boolean" || rt.tyName == "bool"
+            }
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
 // Node shapes read: Call { callFn: i32, callArgs: i32[] }, callee Ident { identName }.
 function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
   let c = P.nodes[callIx]
@@ -4027,9 +4078,11 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         fbArrayNewFixed(aTypeIdx, 1)  // 0xfb 0x08 <typeidx> 1; type shared with i32[]
         return 0
       }
-      // `print(x)` is a compiler builtin lowered to the host's import family
-      // (`__print_i32__` at import index 0). Strings/bools are later slices. The
-      // call yields NOTHING (void import) — the statement path knows not to drop.
+      // `print(x)` is a compiler builtin lowered to the host's import family:
+      // a BOOLEAN-classified arg calls `__print_bool__` (import 1, renders
+      // true/false), anything else i32-ish calls `__print_i32__` (import 0).
+      // Strings are a later slice. The call yields NOTHING (void import) — the
+      // statement path knows not to drop.
       if callee.identName == "print" {
         if c.callArgs.length != 1 {
           return emitFail("emitProgram: print takes exactly one argument")
@@ -4038,7 +4091,11 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
           return emitFail("emitProgram: print(string) is not emittable yet")
         }
         if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
-        fbCall(0)              // 0x10 call __print_i32__ (import index 0)
+        if exprIsBool(c.callArgs[0], fnIx) {
+          fbCall(1)            // 0x10 call __print_bool__ (import index 1)
+        } else {
+          fbCall(0)            // 0x10 call __print_i32__ (import index 0)
+        }
         return 0
       }
       let target = fnIndexOf(callee.identName)
@@ -6106,6 +6163,21 @@ function mapStructOffsetOf(): i32 {
 // does, so the shared `fbBeginFunc`/`fbEmitLocalsVec` lay out an identical frame. For
 // the common `curBuf = W.bytes` shape (a plain `global.get`+`struct.get`) every flag is
 // false and the locals vector is empty.
+// Record the ref-list slot of a bare top-level `recv.push(x)` statement (the
+// block-level collector handles pushes nested in loop/if bodies).
+function recordStartRefPushSlot(stmtIx: i32): i32 {
+  let s = P.nodes[stmtIx]
+  if s is Call {
+    let callee = P.nodes[s.callFn]
+    if callee is Member {
+      if callee.memProp == "push" {
+        recordRefPushSlot(refListSlotOfExpr(callee.memObj, 0 - 1))
+      }
+    }
+  }
+  0
+}
+
 function startFnDetectScratch(): i32 {
   fnUsesPush = false
   fnUsesRefPush = false
@@ -6137,26 +6209,42 @@ function startFnDetectScratch(): i32 {
   while si < startStmts.length {
     let st = P.nodes[startStmts[si]]
     if st is ForRange {
+      // BOTH walkers feed the push flags, mirroring `fnHasPush`: a `.push` (the
+      // push walker) and a Member-receiver `.pop` (the pop walker, which reuses
+      // the push frame's slots) each need the scratch quad.
+      if blockHasPushKind(st.frBody, 0 - 1, 0) { fnUsesPush = true }
+      if blockHasPushKind(st.frBody, 0 - 1, 1) { fnUsesRefPush = true }
+      if blockHasPushKind(st.frBody, 0 - 1, 2) { fnUsesStrPush = true }
       if blockHasMemberPopKind(st.frBody, 0 - 1, 0) { fnUsesPush = true }
       if blockHasMemberPopKind(st.frBody, 0 - 1, 1) { fnUsesRefPush = true }
       if blockHasMemberPopKind(st.frBody, 0 - 1, 2) { fnUsesStrPush = true }
       if blockHasStrOp(st.frBody, 0 - 1) { fnUsesStrOp = true }
       if blockHasMapOp(st.frBody, 0 - 1) { fnUsesMap = true }
+      collectRefPushSlots(st.frBody, 0 - 1)
       collectMemberPopRefSlots(st.frBody, 0 - 1)
     } else if st is WhileStmt {
+      if blockHasPushKind(st.whileBody, 0 - 1, 0) { fnUsesPush = true }
+      if blockHasPushKind(st.whileBody, 0 - 1, 1) { fnUsesRefPush = true }
+      if blockHasPushKind(st.whileBody, 0 - 1, 2) { fnUsesStrPush = true }
       if blockHasMemberPopKind(st.whileBody, 0 - 1, 0) { fnUsesPush = true }
       if blockHasMemberPopKind(st.whileBody, 0 - 1, 1) { fnUsesRefPush = true }
       if blockHasMemberPopKind(st.whileBody, 0 - 1, 2) { fnUsesStrPush = true }
       if blockHasStrOp(st.whileBody, 0 - 1) { fnUsesStrOp = true }
       if blockHasMapOp(st.whileBody, 0 - 1) { fnUsesMap = true }
+      collectRefPushSlots(st.whileBody, 0 - 1)
       collectMemberPopRefSlots(st.whileBody, 0 - 1)
     } else {
-      // expression statements (a bare call / assignment): the expr walkers
+      // expression statements (a bare call / assignment): the per-statement push
+      // detector plus the expr walkers
+      if stmtIsPushKind(startStmts[si], 0 - 1, 0) { fnUsesPush = true }
+      if stmtIsPushKind(startStmts[si], 0 - 1, 1) { fnUsesRefPush = true }
+      if stmtIsPushKind(startStmts[si], 0 - 1, 2) { fnUsesStrPush = true }
       if exprHasMemberPopKind(startStmts[si], 0 - 1, 0) { fnUsesPush = true }
       if exprHasMemberPopKind(startStmts[si], 0 - 1, 1) { fnUsesRefPush = true }
       if exprHasMemberPopKind(startStmts[si], 0 - 1, 2) { fnUsesStrPush = true }
       if exprHasStrOp(startStmts[si], 0 - 1) { fnUsesStrOp = true }
       if exprHasMapOp(startStmts[si], 0 - 1) { fnUsesMap = true }
+      if stmtIsPushKind(startStmts[si], 0 - 1, 1) { recordStartRefPushSlot(startStmts[si]) }
       collectMemberPopRefSlotsExpr(startStmts[si], 0 - 1)
     }
     si = si + 1
