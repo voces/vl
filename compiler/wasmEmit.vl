@@ -5446,40 +5446,59 @@ function globalNameIsNonConst(name: string): boolean {
   globalIsNonConst(globalLetOf(name))
 }
 
-// The `fbValtype` kind for a module global's CELL. For a const init, the kind comes
-// from the literal initializer (`globalKind`) exactly as before (preserves goldens).
-// For a NON-const init, the literal kind is meaningless (the init is a member/index/
-// call), so the cell kind is derived from the binding's TYPE ANNOTATION via the
-// `globalIs*` predicates — `curBuf: i32[]` → kind 2 (the i32 list), the shape this
-// model unblocks. Mirrors `buildLocals`' annotation→kind ladder (map 6, string-array
-// 7, ref-array 5, struct 1, array 2, string 3, else i32 0).
+// True if the module global `LetDecl` at `letIx` carries a TYPE ANNOTATION (`let g: T
+// = …`). When it does, the cell's wasm type must come from that annotation — exactly as
+// a local/param resolves its valtype — so a global agrees with a same-typed local/param/
+// field on the struct table index (otherwise a `global.get g` of an init-inferred struct
+// type mismatches a `local.set`/call of the annotation's struct type).
+function globalHasTypeAnn(letIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    return d.letType >= 0
+  }
+  false
+}
+
+// The `fbValtype` kind for a module global's CELL. When the binding has a TYPE
+// ANNOTATION (const init OR not), the kind is derived from that annotation via the
+// `letIs*` ladder — so a global agrees with a same-typed local/param/field on its
+// valtype (kind + struct index). Only an UN-annotated const global (`let g = { … }`,
+// no `: T`) falls back to the literal-initializer kind (`globalKind`); the `g_globals`
+// golden's struct global IS annotated, and its annotation names the SAME struct its
+// literal infers, so the emitted bytes are unchanged. A non-const init's literal kind is
+// meaningless (member/index/call), so it likewise rides the annotation ladder. Mirrors
+// `buildLocals`' annotation→kind ladder (map 6, string-array 7, ref-array 5, struct 1,
+// array 2, string 3, else i32 0).
 function globalCellKind(letIx: i32): i32 {
   let d = P.nodes[letIx]
   if d is LetDecl {
-    if !globalIsNonConst(letIx) {
-      return globalKind(d.letInit)
+    if globalHasTypeAnn(letIx) {
+      if letIsMap(letIx, 0 - 1) { return 6 }
+      if letIsStringArray(letIx, 0 - 1) { return 7 }
+      if letIsRefArray(letIx, 0 - 1) { return 5 }
+      if letIsStruct(letIx, 0 - 1) { return 1 }
+      if letIsArray(letIx, 0 - 1) { return 2 }
+      if letIsString(letIx, 0 - 1) { return 3 }
+      return 0
     }
-    if letIsMap(letIx, 0 - 1) { return 6 }
-    if letIsStringArray(letIx, 0 - 1) { return 7 }
-    if letIsRefArray(letIx, 0 - 1) { return 5 }
-    if letIsStruct(letIx, 0 - 1) { return 1 }
-    if letIsArray(letIx, 0 - 1) { return 2 }
-    if letIsString(letIx, 0 - 1) { return 3 }
-    return 0
+    // No annotation: a const literal init types itself; a non-const un-annotated init is
+    // out of scope (no annotation to derive from) and `globalKind` returns its best guess.
+    return globalKind(d.letInit)
   }
   0
 }
 
-// The struct table index for a global cell of kind 1 (struct ref), else -1. For a
-// const init this reuses `structIndexOfExpr` over the literal (as before); for a
-// non-const struct global it comes from the annotation (`structIndexOfLet`).
+// The struct table index for a global cell of kind 1 (struct ref), else -1. When the
+// binding has a struct ANNOTATION the index comes from THAT annotation (`structIndexOfLet`,
+// which prefers the annotation over the init) — so a struct global agrees with a same-
+// typed local/param/field. An un-annotated const struct global infers from its literal.
 function globalCellStructIdx(letIx: i32): i32 {
   let d = P.nodes[letIx]
   if d is LetDecl {
-    if !globalIsNonConst(letIx) {
-      return structIndexOfExpr(d.letInit, 0 - 1)
+    if globalHasTypeAnn(letIx) {
+      return structIndexOfLet(letIx, 0 - 1)
     }
-    return structIndexOfLet(letIx, 0 - 1)
+    return structIndexOfExpr(d.letInit, 0 - 1)
   }
   0 - 1
 }
@@ -6155,9 +6174,24 @@ function emitModule(stmts: i32[]): i32 {
           }
           fbEnd()                                       // 0x0b end of init expr
         } else {
-          fbValtype(globalKind(g.letInit), structIndexOfExpr(g.letInit, 0 - 1))   // valtype
+          // The cell's valtype comes from the binding's ANNOTATION when present (so a
+          // global agrees with a same-typed local/param/field on its struct table index),
+          // falling back to the literal-init kind for an un-annotated global. The init
+          // constexpr (`emitExpr`) lowers the literal — and must build the SAME wasm type:
+          // `pendingStructIdx` seeds an `ObjLit` to the annotated struct (not the first
+          // field-name match), and `pendingListKind`/`pendingListSlot` seed an empty `[]`
+          // to the annotation's ref/string list (not the i32-list the bare literal infers),
+          // exactly as the local-`let` path threads them.
+          let gck = globalCellKind(globalStmts[gi])
+          let gcs = globalCellStructIdx(globalStmts[gi])
+          if gck == 1 { pendingStructIdx = gcs }
+          pendingListKind = letAnnRefListKind(globalStmts[gi])
+          pendingListSlot = letAnnRefListSlot(globalStmts[gi])
+          fbValtype(gck, gcs)                            // valtype
           wU8(1)                                         // 0x01 mutable
           if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
+          pendingListKind = 0
+          pendingListSlot = 0
           fbEnd()                                         // 0x0b end of init expr
         }
       }

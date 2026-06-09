@@ -4483,6 +4483,70 @@ const CASES: Case[] = [
       if (got !== 90) throw new Error(`main() returned ${got}, expected 90`);
     },
   },
+  // ── annotation-aware module-global struct/list typing ───────────────────────
+  // A module GLOBAL's emitted valtype must come from its DECLARED ANNOTATION (exactly
+  // as a local/param/field does), NOT from its initializer literal — otherwise a
+  // `global.get g` of an init-inferred type mismatches a `local.set`/call/field of the
+  // annotation's type. Before this fix `globalKind`/`structIndexOfExpr(init)` typed the
+  // global cell from the literal, so a struct global read into a same-typed local (or a
+  // global whose literal matched a DIFFERENT same-shape struct than its annotation) failed
+  // `WebAssembly.compile` with `expected (ref A), found global.get of type (ref B)`.
+  {
+    name: "global-ann: struct global read into annotated local (`let loc: S = g`) => 5",
+    src: [
+      "type S = { x: i32 }",
+      "let g: S = { x: 5 }",
+      "function main(): i32 {",
+      "  let loc: S = g",
+      "  return loc.x",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  {
+    // Two same-SHAPE structs: the global's literal `{ v: 9 }` field-name-matches the
+    // FIRST declared struct (A), but its annotation names B. The init-derived struct
+    // index (A) and the annotation-derived index (B) differ, so passing the global to a
+    // `B`-typed param reproduced the exact (ref A)/(ref B) mismatch.
+    name: "global-ann: two same-shape structs, global annotated B, passed to B param => 9",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "let g: B = { v: 9 }",
+      "function take(b: B): i32 {",
+      "  return b.v",
+      "}",
+      "function main(): i32 {",
+      "  return take(g)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 9) throw new Error(`main() returned ${got}, expected 9`);
+    },
+  },
+  {
+    // A `string[]` const global: its annotation must type the cell as the string-list
+    // wrapper (kind 7), NOT the i32-list (kind 2) the empty-`[]` literal would infer —
+    // the gap flagged in the global-push NOTE. `.length` of the empty list => 0.
+    name: "global-ann: `string[]` const global types as a string list (`.length` => 0)",
+    src: [
+      "let names: string[] = []",
+      "function main(): i32 {",
+      "  return names.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 0) throw new Error(`main() returned ${got}, expected 0`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
