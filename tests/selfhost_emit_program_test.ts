@@ -3893,6 +3893,83 @@ const CASES: Case[] = [
       if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
     },
   },
+  {
+    // Per-block scoping: the same name `s` is a STRUCT local in the then-branch and an
+    // i32 local in the disjoint else-branch. Under the old name-dedupe these collapsed
+    // onto ONE wasm slot with ONE valtype — a type conflict that failed to emit. Each
+    // disjoint binding must now get its OWN slot with its OWN valtype.
+    name:
+      "block-scope: same-named `s` is a STRUCT in one branch, an i32 in the disjoint other => 42",
+    src: [
+      "type Box = { v: i32 }",
+      "function pick(c: i32): i32 {",
+      "  if c == 0 {",
+      "    let s: Box = { v: 42 }",
+      "    return s.v",
+      "  } else {",
+      "    let s = c + 1",
+      "    return s",
+      "  }",
+      "}",
+      "function main(): i32 {",
+      "  return pick(0)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 42) throw new Error(`main() returned ${got}, expected 42`);
+    },
+  },
+  {
+    // Per-block scoping (the OTHER arm): the i32 `s` branch returns `c + 1`. Proves both
+    // distinct-typed `s` slots are individually live + correctly typed.
+    name: "block-scope: the i32-branch `s = c + 1` resolves to its OWN slot => 6",
+    src: [
+      "type Box = { v: i32 }",
+      "function pick(c: i32): i32 {",
+      "  if c == 0 {",
+      "    let s: Box = { v: 42 }",
+      "    return s.v",
+      "  } else {",
+      "    let s = c + 1",
+      "    return s",
+      "  }",
+      "}",
+      "function main(): i32 {",
+      "  return pick(5)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 6) throw new Error(`main() returned ${got}, expected 6`);
+    },
+  },
+  {
+    // Lexical shadowing: an inner-block `let x` shadows an outer `let x` of the same name
+    // only WITHIN the inner block; after the block the outer binding is back in scope.
+    name: "block-scope: inner `let x` shadows outer, outer restored after the block => 11",
+    src: [
+      "function f(): i32 {",
+      "  let x = 1",
+      "  if x == 1 {",
+      "    let x = 10",
+      "    x = x + 1",
+      "  }",
+      "  return x + 10",
+      "}",
+      "function main(): i32 {",
+      "  return f()",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // Inner `x` (10→11) is discarded at block exit; outer `x` stays 1, so 1+10 = 11.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 11) throw new Error(`main() returned ${got}, expected 11`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
