@@ -816,7 +816,15 @@ export const runWasm = async (
         // assembles and emits the accumulated line.
         __print_char__: (code: number) => printChars.push(code),
         __print_str_flush__: () => {
-          logs.push(String.fromCodePoint(...printChars));
+          // Chunk the code-point→string conversion: `String.fromCodePoint(...spread)`
+          // blows the JS call-argument limit (RangeError: Maximum call stack size
+          // exceeded) on very large prints — e.g. a self-compiled module serialized to
+          // a decimal string. Build the line in bounded slices instead.
+          let s = "";
+          for (let i = 0; i < printChars.length; i += 8192) {
+            s += String.fromCodePoint(...printChars.slice(i, i + 8192));
+          }
+          logs.push(s);
           printChars.length = 0;
         },
       },
