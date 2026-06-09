@@ -23,7 +23,7 @@
 //
 // GROWING THE WHITELIST: re-run the runtime sweep as the emitter/checker/parser
 // gain coverage and promote newly-passing files. Current buckets of the 304 @run
-// files: 58 PASS; 70 emit gaps (lambdas/for-in/…), 77 checker false-rejects, 76 parse
+// files: 60 PASS; 70 emit gaps (lambdas/for-in/…), 77 checker false-rejects, 76 parse
 // gaps, 28 scratch-needing top-level statements (emit validly only inside
 // functions today), 11 emitter traps (real bugs to pin), 4 log diffs (bool prints
 // as 1/0 — needs bool-ness threading per the plan's step 3).
@@ -94,8 +94,10 @@ const WHITELIST = [
   "functions/trailing-comma-params.vl",
   "functions/unused-param-inline-call.vl",
   "globals/cross-function.vl",
+  "globals/mutate-in-fn-loop.vl",
   "globals/mutate-in-loop.vl",
   "globals/mutate-through-fn.vl",
+  "globals/read-through.vl",
   "lexer/soft-keywords-as-function-names.vl",
   "lexer/soft-keywords-as-identifiers.vl",
   "lint/called-function-no-warn.vl",
