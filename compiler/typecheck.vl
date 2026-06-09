@@ -78,6 +78,8 @@ import {
   FieldInit,
   UnionDecl,
   IsExpr,
+  ArrayLit,
+  Index,
 } from "./ast"
 
 // ── Type-arena variants ──────────────────────────────────────────────────────
@@ -99,6 +101,9 @@ type TyFunc = { fnParamTypes: i32[], fnRet: i32 }
 type TyUnion = { uMembers: i32[] }
 // A nullable `T?` / `T | null`: the inner type-arena index.
 type TyNullable = { nInner: i32 }
+// A growable array `T[]`: the element type-arena index (`-1` for an empty `[]`
+// whose element is not yet known — assignable to any array, like a hole).
+type TyArray = { aElem: i32 }
 
 // The unified type. Declared after its members (a union alias can't forward-
 // reference). Discriminated with `is`, exactly like the AST `Node`.
@@ -107,7 +112,8 @@ type Ty = TyPrim |
   TyObj |
   TyFunc |
   TyUnion |
-  TyNullable
+  TyNullable |
+  TyArray
 
 // A type diagnostic: a message plus the AST node index it was raised at. VL has
 // no exceptions, so errors are accumulated on `T.diags`, not thrown.
@@ -182,6 +188,11 @@ function mkUnionTy(members: i32[]): i32 {
 
 function mkNullableTy(inner: i32): i32 {
   let t: Ty = { nInner: inner }
+  addTy(t)
+}
+
+function mkArrayTy(elem: i32): i32 {
+  let t: Ty = { aElem: elem }
   addTy(t)
 }
 
@@ -313,7 +324,15 @@ function nameToTy(name: string): i32 {
   if name == "void" {
     return TY_VOID
   }
-  // A declared struct type (registered by the program's TypeDecl pre-pass).
+  // An array type `T[]`: the parser appends a literal `[]` per array suffix to the
+  // type NAME (`i32[]`, `Tok[]`, `i32[][]`). Strip one suffix and wrap the element.
+  let nlen = name.length
+  if nlen >= 2 {
+    if name[nlen - 2] == '[' && name[nlen - 1] == ']' {
+      return mkArrayTy(nameToTy(name.slice(0, nlen - 2)))
+    }
+  }
+  // A declared struct/union type (registered by the program's pre-pass).
   if T.userTypes.has(name) {
     return T.userTypes[name] ?? -1
   }
@@ -373,6 +392,8 @@ function tyToStr(ix: i32): string {
     return s
   } else if t is TyNullable {
     return tyToStr(t.nInner) + "?"
+  } else if t is TyArray {
+    return tyToStr(t.aElem) + "[]"
   }
   "<?>"
 }
@@ -475,6 +496,14 @@ function assignable(src: i32, dst: i32): boolean {
         i = i + 1
       }
       return ok
+    }
+    return false
+  }
+  if s is TyArray {
+    if d is TyArray {
+      // An empty `[]` (element `-1`) is assignable to any array; otherwise the
+      // element types must be assignable.
+      return assignable(s.aElem, d.aElem)
     }
     return false
   }
@@ -611,6 +640,31 @@ function checkNode(ix: i32): i32 {
 
   // ── call ──────────────────────────────────────────────────────────────────
   } else if n is Call {
+    // Array method call `xs.push(e)`: when the callee is a member access whose
+    // receiver is an array, type it as a builtin (NOT a struct field). Reads the
+    // Member callee INLINE (mono-visitor); only fires for an array receiver, so a
+    // plain `f(…)` / non-array method falls through to the generic path below.
+    let cfn = P.nodes[n.callFn]
+    if cfn is Member {
+      let recvTy = checkNode(cfn.memObj)
+      let rt = T.tys[recvTy]
+      if rt is TyArray {
+        let margs = n.callArgs
+        if cfn.memProp == "push" {
+          if margs.length != 1 {
+            tErr("push expects 1 argument, got " + i32ToStr(margs.length), ix)
+          } else {
+            let pat = checkNode(margs[0])
+            if !assignable(pat, rt.aElem) {
+              tErr("push: cannot add " + tyToStr(pat) + " to " + tyToStr(recvTy), ix)
+            }
+          }
+          return TY_I32
+        }
+        tErr("no method '." + cfn.memProp + "' on array " + tyToStr(recvTy), ix)
+        return TY_ERR
+      }
+    }
     let fnTy = checkNode(n.callFn)
     let args = n.callArgs
     let ft = T.tys[fnTy]
@@ -653,8 +707,70 @@ function checkNode(ix: i32): i32 {
     if ot is TyErr {
       return TY_ERR
     }
+    // `.length` on an array or a string is an i32.
+    if ot is TyArray {
+      if n.memProp == "length" {
+        return TY_I32
+      }
+      tErr("no field '" + n.memProp + "' on array " + tyToStr(objTy), ix)
+      return TY_ERR
+    }
+    if ot is TyPrim {
+      if ot.primName == "string" {
+        if n.memProp == "length" {
+          return TY_I32
+        }
+        tErr("no field '" + n.memProp + "' on string", ix)
+        return TY_ERR
+      }
+    }
     tErr("member access '." + n.memProp + "' on non-object " +
       tyToStr(objTy), ix)
+    return TY_ERR
+
+  // ── array literal ───────────────────────────────────────────────────────────
+  // `[e, e, …]` types as `T[]` where `T` is the first element's type (the rest must
+  // be assignable to it). An empty `[]` is `T[]` with an unknown element (`-1`),
+  // assignable to any array — its concrete element is pinned by the binding's
+  // annotation (`let a: i32[] = []`).
+  } else if n is ArrayLit {
+    let elems = n.arrElems
+    if elems.length < 1 {
+      return mkArrayTy(0 - 1)
+    }
+    let elemTy = checkNode(elems[0])
+    let ei = 1
+    while ei < elems.length {
+      let et = checkNode(elems[ei])
+      if !assignable(et, elemTy) {
+        tErr("array element " + i32ToStr(ei) + " is " + tyToStr(et) +
+          ", expected " + tyToStr(elemTy), ix)
+      }
+      ei = ei + 1
+    }
+    return mkArrayTy(elemTy)
+
+  // ── index `a[i]` ────────────────────────────────────────────────────────────
+  } else if n is Index {
+    let arrTy = checkNode(n.idxArr)
+    let idxTy = checkNode(n.idxIndex)
+    if !assignable(idxTy, TY_I32) {
+      tErr("array index must be i32, got " + tyToStr(idxTy), ix)
+    }
+    let at = T.tys[arrTy]
+    if at is TyArray {
+      return at.aElem
+    }
+    if at is TyErr {
+      return TY_ERR
+    }
+    // Indexing a string yields the i32 code point at that position.
+    if at is TyPrim {
+      if at.primName == "string" {
+        return TY_I32
+      }
+    }
+    tErr("cannot index non-array " + tyToStr(arrTy), ix)
     return TY_ERR
 
   // ── object literal ──────────────────────────────────────────────────────────

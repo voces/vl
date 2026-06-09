@@ -217,6 +217,50 @@ const CASES: Case[] = [
     errSubstr: "unknown type",
   },
   {
+    // Arrays (Phase 2.3): `i32[]` annotation, empty `[]` literal typed by it,
+    // `.push`, index read + write, `.length`. (No `while` — loops are a later step.)
+    key: "t_array_i32",
+    kind: "emit",
+    src:
+      "function main(): i32 {\n" +
+      "  let a: i32[] = []\n" +
+      "  a.push(10)\n  a.push(20)\n  a.push(30)\n" +
+      "  a[1] = 99\n" +
+      "  return a[0] + a[1] + a[2] + a.length\n" +
+      "}\n",
+    run: async (call) => assertEq(await call("main"), 142, "10+99+30+3"),
+  },
+  {
+    // Arrays of structs (`Tok[]`): push object literals, index + field read.
+    key: "t_array_struct",
+    kind: "emit",
+    src:
+      "type Tok = { kind: string, pos: i32 }\n" +
+      "function main(): i32 {\n" +
+      "  let xs: Tok[] = []\n" +
+      "  xs.push({ kind: \"a\", pos: 10 })\n" +
+      "  xs.push({ kind: \"b\", pos: 20 })\n" +
+      "  return xs[0].pos + xs[1].pos + xs.length\n" +
+      "}\n",
+    run: async (call) => assertEq(await call("main"), 32, "10+20+2"),
+  },
+  {
+    // `.push` of the wrong element type → rejected.
+    key: "r_array_elem_type",
+    kind: "reject",
+    src:
+      "function main(): i32 {\n  let a: i32[] = []\n  a.push(\"hi\")\n  return a.length\n}\n",
+    errSubstr: "push:",
+  },
+  {
+    // Indexing a non-array → rejected.
+    key: "r_index_non_array",
+    kind: "reject",
+    src:
+      "function main(): i32 {\n  let x: i32 = 5\n  return x[0]\n}\n",
+    errSubstr: "cannot index non-array",
+  },
+  {
     key: "r_struct_field_type",
     kind: "reject",
     src:
