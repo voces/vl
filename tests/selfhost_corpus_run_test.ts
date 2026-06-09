@@ -23,7 +23,7 @@
 //
 // GROWING THE WHITELIST: re-run the runtime sweep as the emitter/checker/parser
 // gain coverage and promote newly-passing files. Current buckets of the 304 @run
-// files: 24 PASS; 84 emit gaps (for/lambdas/…), 77 checker false-rejects, 76 parse
+// files: 28 PASS; 70 emit gaps (lambdas/for-in/…), 77 checker false-rejects, 76 parse
 // gaps, 28 scratch-needing top-level statements (emit validly only inside
 // functions today), 11 emitter traps (real bugs to pin), 4 log diffs (bool prints
 // as 1/0 — needs bool-ness threading per the plan's step 3).
@@ -47,6 +47,7 @@ const WHITELIST = [
   "arith/literal-add.vl",
   "arith/ops.vl",
   "arith/typed-add.vl",
+  "arrays/basics.vl",
   "chars/literals.vl",
   "functions/calls.vl",
   "functions/forward-call-inferred.vl",
@@ -63,6 +64,9 @@ const WHITELIST = [
   "lint/called-function-no-warn.vl",
   "lint/mutual-recursion-no-warn.vl",
   "lint/reachable-no-warn.vl",
+  "loops/for-range-bound-named-step.vl",
+  "loops/for-step.vl",
+  "loops/for-sum.vl",
   "loops/while-sum.vl",
   "statements/discarded-call-return.vl",
   "statements/struct-call-as-statement.vl",
