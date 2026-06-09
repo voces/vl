@@ -52,6 +52,7 @@ import {
   StrLit,
   CharLit,
   BoolLit,
+  NullLit,
   Ident,
   Unary,
   BinExpr,
@@ -158,6 +159,7 @@ let TY_BOOL: i32 = -1
 let TY_STR: i32 = -1
 let TY_VOID: i32 = -1
 let TY_ERR: i32 = -1
+let TY_NULL: i32 = -1
 
 // ── type-arena constructors ──────────────────────────────────────────────────
 // Each appends a variant to `T.tys` and returns its index. (The same shape as the
@@ -238,6 +240,7 @@ export function initChecker(): i32 {
   TY_STR = mkPrim("string")
   TY_VOID = mkPrim("void")
   TY_ERR = mkErrTy()
+  TY_NULL = mkPrim("null")
   T.scopes.push(Map())
   0
 }
@@ -336,11 +339,19 @@ function hasDot(s: string): boolean {
 // unknown name). Takes the bare NAME — NOT a `Node` index — so it never narrows
 // the `Node` union (see Finding 2). The single caller (`checkNode`) extracts the
 // `TypeRef`'s name inline before calling this.
-// True if the type name contains a `|` (an inline-union synthetic name `A|B|null`).
+// True if the type name contains a TOP-LEVEL `|` (an inline-union synthetic name
+// `A|B|null`). Depth-aware: a `|` inside `{…}`/`[…]` (an inline-object field's own
+// union type, a map value) does NOT make the whole name a union.
 function nameHasPipe(name: string): boolean {
+  let depth = 0
   let i = 0
   while i < name.length {
-    if name[i] == '|' {
+    let c = name[i]
+    if c == '{' || c == '[' {
+      depth = depth + 1
+    } else if c == '}' || c == ']' {
+      depth = depth - 1
+    } else if c == '|' && depth == 0 {
       return true
     }
     i = i + 1
@@ -350,16 +361,28 @@ function nameHasPipe(name: string): boolean {
 
 function nameToTy(name: string): i32 {
   // An inline UNION `A | B | null` — the parser joins the members with `|` into one
-  // synthetic name. Split on `|`, resolve each member, and build the union (a `null`
-  // member makes it NULLABLE). Checked FIRST so a member's `[]`/map shape isn't read
-  // as a suffix of the whole union name.
+  // synthetic name. Split on TOP-LEVEL `|`s (depth-aware), resolve each member, and
+  // build the union (a `null` member makes it NULLABLE). Checked FIRST so a member's
+  // `[]`/map shape isn't read as a suffix of the whole union name.
   if nameHasPipe(name) {
     let members: i32[] = []
     let hasNull = false
+    let depth = 0
     let start = 0
     let i = 0
     while i <= name.length {
-      if i == name.length || name[i] == '|' {
+      let atSplit = i == name.length
+      if !atSplit {
+        let c = name[i]
+        if c == '{' || c == '[' {
+          depth = depth + 1
+        } else if c == '}' || c == ']' {
+          depth = depth - 1
+        } else if c == '|' && depth == 0 {
+          atSplit = true
+        }
+      }
+      if atSplit {
         let part = name.slice(start, i)
         if part == "null" {
           hasNull = true
@@ -422,6 +445,59 @@ function nameToTy(name: string): i32 {
         }
         mi = mi + 1
       }
+    }
+  }
+  // An INLINE OBJECT type `{x:T,y:U}` (the parser's synthetic anonymous-struct
+  // name — starts `{` but not `{[`). Split the TOP-LEVEL commas (depth-aware: a
+  // field's own map/object/array commas don't split), then each field at its first
+  // top-level `:`, and build the structural TyObj.
+  if nlen >= 2 {
+    if name[0] == '{' && name[nlen - 1] == '}' {
+      let fnames: string[] = []
+      let ftys: i32[] = []
+      let fdepth = 0
+      let fstart = 1
+      let fi = 1
+      while fi <= nlen - 1 {
+        let fSplit = fi == nlen - 1
+        if !fSplit {
+          let fc = name[fi]
+          if fc == '{' || fc == '[' {
+            fdepth = fdepth + 1
+          } else if fc == '}' || fc == ']' {
+            fdepth = fdepth - 1
+          } else if fc == ',' && fdepth == 0 {
+            fSplit = true
+          }
+        }
+        if fSplit {
+          let field = name.slice(fstart, fi)
+          if field.length > 0 {
+            // split `fname:ftype` at the first top-level `:`
+            let cdepth = 0
+            let ci = 0
+            let colonAt = 0 - 1
+            while ci < field.length {
+              let cc = field[ci]
+              if cc == '{' || cc == '[' {
+                cdepth = cdepth + 1
+              } else if cc == '}' || cc == ']' {
+                cdepth = cdepth - 1
+              } else if cc == ':' && cdepth == 0 && colonAt < 0 {
+                colonAt = ci
+              }
+              ci = ci + 1
+            }
+            if colonAt > 0 {
+              fnames.push(field.slice(0, colonAt))
+              ftys.push(nameToTy(field.slice(colonAt + 1, field.length)))
+            }
+          }
+          fstart = fi + 1
+        }
+        fi = fi + 1
+      }
+      return mkObjTy(fnames, ftys)
     }
   }
   // A declared struct/union type (registered by the program's pre-pass).
@@ -531,8 +607,11 @@ function assignable(src: i32, dst: i32): boolean {
   if d is TyErr {
     return true
   }
-  // Nullable target: accepts the inner, or another nullable's inner.
+  // Nullable target: accepts `null` itself, the inner, or another nullable's inner.
   if d is TyNullable {
+    if src == TY_NULL {
+      return true
+    }
     if s is TyNullable {
       return assignable(s.nInner, d.nInner)
     }
@@ -1202,6 +1281,8 @@ function checkNode(ix: i32): i32 {
     return TY_STR
   } else if n is BoolLit {
     return TY_BOOL
+  } else if n is NullLit {
+    return TY_NULL
   } else if n is Ident {
     let ty = lookup(n.identName)
     if ty < 0 {
@@ -1548,12 +1629,14 @@ function checkNode(ix: i32): i32 {
     if !assignable(condTy, TY_BOOL) {
       tErr("if-condition must be bool, got " + tyToStr(condTy), ix)
     }
-    // Positive `is`-narrowing: `if x is T { … }` refines a simple identifier `x` to
-    // the variant type `T` for the THEN branch only, via a pushed scope that shadows
-    // `x`'s binding. Reads the IsExpr + its Ident operand INLINE (mono-visitor).
-    // (Negative/complement narrowing after a diverging then was tried but regressed
-    // verdict conformance — plain `is T` complement made VL MISS real errors in
-    // soundness files that need richer narrowing — so it is deliberately not done.)
+    // Narrowing over a simple identifier:
+    //  - `if x is T { … }` refines `x` to the variant `T` in the THEN branch.
+    //  - `if x != null { … }` refines a nullable `x` to its inner type in the THEN.
+    //  - `if x == null { … } else { … }` refines `x` to inner in the ELSE; and when
+    //    the THEN always exits (a guard clause), `x` is inner AFTER the `if` too.
+    // Branch narrowing rides a pushed scope that shadows `x`. (Union-complement
+    // narrowing after `is T` was tried and REVERTED — it made VL miss real errors;
+    // null-stripping is the well-defined core and is what the corpus leans on.)
     let narrowed = 0
     let cond = P.nodes[n.ifCond]
     if cond is IsExpr {
@@ -1567,12 +1650,84 @@ function checkNode(ix: i32): i32 {
         }
       }
     }
+    // Null-comparison narrowing: `x == null` / `x != null` (either operand order)
+    // over an identifier whose current type is nullable.
+    let nullName = ""
+    let nullInner = -1
+    let nullIsEq = 0
+    if cond is BinExpr {
+      if cond.binOp == "==" || cond.binOp == "!=" {
+        let identName = ""
+        let lhs = P.nodes[cond.binLeft]
+        let rhs = P.nodes[cond.binRight]
+        if rhs is NullLit {
+          if lhs is Ident {
+            identName = lhs.identName
+          }
+        } else if lhs is NullLit {
+          if rhs is Ident {
+            identName = rhs.identName
+          }
+        }
+        if identName != "" {
+          let curTy = lookup(identName)
+          if curTy >= 0 {
+            let ct = T.tys[curTy]
+            if ct is TyNullable {
+              nullName = identName
+              nullInner = ct.nInner
+              if cond.binOp == "==" {
+                nullIsEq = 1
+              }
+            }
+          }
+        }
+      }
+    }
+    // THEN: `x != null` means x is non-null inside.
+    if nullName != "" && nullIsEq == 0 {
+      pushScope()
+      declare(nullName, nullInner)
+      narrowed = 1
+    }
     checkNode(n.ifThen)
     if narrowed == 1 {
       popScope()
     }
+    // ELSE: `x == null` means x is non-null in the else branch.
     if n.ifElse >= 0 {
+      let elseNarrowed = 0
+      if nullName != "" && nullIsEq == 1 {
+        pushScope()
+        declare(nullName, nullInner)
+        elseNarrowed = 1
+      }
       checkNode(n.ifElse)
+      if elseNarrowed == 1 {
+        popScope()
+      }
+    }
+    // GUARD CLAUSE: `if x == null { …return/break/continue }` — x is non-null for
+    // the rest of the enclosing block.
+    if nullName != "" && nullIsEq == 1 {
+      let tn2 = P.nodes[n.ifThen]
+      if tn2 is Block {
+        let tst = tn2.blkStmts
+        if tst.length > 0 {
+          let last = P.nodes[tst[tst.length - 1]]
+          let diverges = false
+          if last is RetStmt {
+            diverges = true
+          } else if last is BreakStmt {
+            diverges = true
+          } else if last is ContinueStmt {
+            diverges = true
+          }
+          if diverges {
+            declare(nullName, nullInner)
+          }
+        }
+      }
     }
     return TY_VOID
 
