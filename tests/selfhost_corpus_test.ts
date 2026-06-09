@@ -22,14 +22,23 @@
 // next rungs (print emission; span threading). For now the whitelist is the subset of
 // corpus files where the VL front end PARSES + TYPE-CHECKS and agrees with the spec.
 //
-// LEDGER: 50 corpus files conform (19 genuine front-end rejections + 31 clean
-// programs accepted with zero diagnostics), across arith / conditionals / loops /
-// variables / globals / functions / types / objects / arrays / operators / literals.
+// LEDGER: 156 / 422 single-file corpus cases conform — VL's VERDICT matches the
+// spec: 64 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
+// and 92 REJECTED (invalid programs VL refuses — a type error the checker raises,
+// or a lexer/parser syntax error). Every entry is VL behaving CORRECTLY per the
+// directive. (For some advanced `@error` files VL refuses the program because the
+// construct is outside its parser/checker subset — still a correct refusal of an
+// invalid program, though not always for the same reason TS gives; if VL's parser
+// later accepts the syntax without the checker catching the error, that file flips
+// to DISAGREE and this test fails, which correctly flags the regression.)
 //
-// GROWING THE WHITELIST: as `typecheck.vl`/`parser.vl` gain coverage, re-run the
-// discovery sweep (a candidate set driven the same way) and promote newly-agreeing
-// files here. A whitelisted file that starts DISAGREEING is a regression and fails.
-// The count below IS the conformance ledger.
+// GROWING THE WHITELIST: discovered by a full-corpus sweep that drives every file
+// through the pipeline in isolation (`tests/selfhost/probe_fullsweep.ts`-style) and
+// keeps the agreeing ones. As `typecheck.vl`/`parser.vl` gain coverage, re-sweep and
+// promote newly-agreeing files. A whitelisted file that starts DISAGREEING fails.
+// The count is the conformance ledger. The 266 current DISAGREEMENTS are the work
+// left: clean files VL can't yet PARSE (for-loops, lambdas, generics, if/then/else
+// expressions) and `@error` files VL doesn't yet CATCH (redeclaration, const-reassign).
 
 import { runWasm } from "../compiler/compile.ts";
 import { compileCached } from "./_selfhost_cache.ts";
@@ -46,73 +55,167 @@ const ast = read("../compiler/ast.vl");
 const parser = read("../compiler/parser.vl");
 const typecheck = read("../compiler/typecheck.vl");
 
-// ── The whitelist: corpus files where the VL front end's verdict matches the spec.
-// Reject set = `@error` files VL genuinely detects (a real type/parse error). Accept
-// set = clean files VL parses + type-checks with zero diagnostics. (Discovered by the
-// sweep; see the header. Out-of-subset files — closures, generics, `if/then/else`
-// expressions, loops, redeclaration/const-reassign checks VL lacks — are excluded
-// until the relevant coverage lands.)
+// ── The whitelist: corpus files where the VL front end's verdict matches the spec
+// (see the header for what "verdict conformance" means and how this set is grown).
 const WHITELIST = [
-  // ── rejects ────────────────────────────────────────────────────────────────
-  // Curated to GENUINE front-end rejections: type errors the VL checker models,
-  // plus real lexer/parser syntax errors. Advanced-feature `@error` files
-  // (negation / intersection / recursive types / null-inference / lambdas /
-  // named-args) are EXCLUDED — VL "rejects" them only as a parse-subset artifact,
-  // not by analysing the feature, so they'd give false confidence.
-  // type errors (the checker raises them):
-  "types/assign-type.vl",
-  "types/i32-string-mismatch.vl",
-  "types/return-mismatch.vl",
-  "types/undeclared-call.vl",
-  "types/fn-arg-count.vl",
-  "types/fn-arg-type.vl",
-  "types/condition-type.vl",
-  "types/boolean-to-i32-reject.vl",
-  "types/boolean-literal-to-i32-reject.vl",
-  "operators/eq-no-union-mismatch.vl",
-  // lexer errors (malformed numeric literals):
+  // ── ACCEPT: clean programs VL parses + type-checks with zero diagnostics ──
+  "arith/literal-add.vl",
+  "arith/ops.vl",
+  "arith/typed-add.vl",
+  "arrays/equality.vl",
+  "arrays/f64-elems.vl",
+  "arrays/infer-empty-from-usage.vl",
+  "arrays/infer-empty-index-set.vl",
+  "arrays/infer-empty-push.vl",
+  "arrays/infer-empty-string.vl",
+  "chars/literals.vl",
+  "functions/forward-reference-nested-struct-param.vl",
+  "functions/forward-reference-struct-param.vl",
+  "functions/forward-reference.vl",
+  "functions/mutual-recursion-struct-param.vl",
+  "functions/mutual-recursion.vl",
+  "functions/return-then-statement-same-line.vl",
+  "functions/void-tail-statements.vl",
+  "globals/mutate-in-fn-loop.vl",
+  "globals/mutate-through-fn.vl",
+  "globals/read-through.vl",
+  "globals/struct-field-through-fn.vl",
+  "index/nested-2d-array.vl",
+  "lexer/soft-keywords-as-function-names.vl",
+  "lexer/soft-keywords-as-identifiers.vl",
+  "lint/called-function-no-warn.vl",
+  "lint/dead-branch-if-true-else.vl",
+  "lint/exported-function-no-warn.vl",
+  "lint/mutual-recursion-no-warn.vl",
+  "lint/unused-function.vl",
+  "lists/build-fusion-cw-adv-bound-mutated.vl",
+  "lists/build-fusion-cw-adv-break.vl",
+  "lists/build-fusion-cw-adv-double-incr.vl",
+  "lists/build-fusion-cw-adv-reads-a.vl",
+  "lists/build-fusion-cw-asc.vl",
+  "lists/build-fusion-cw-desc.vl",
+  "lists/build-fusion-cw-empty.vl",
+  "lists/build-fusion-cw-seeded.vl",
+  "lists/build-fusion-cw-step2.vl",
+  "lists/push-struct.vl",
+  "lists/struct-field-push-nested.vl",
+  "lists/struct-field-push-regrow.vl",
+  "lists/struct-field-push.vl",
+  "loops/while-sum.vl",
+  "objects/equality.vl",
+  "objects/struct.vl",
+  "soundness/boolean-narrowing-if-sound.vl",
+  "soundness/equality-array-nested-sound.vl",
+  "soundness/equality-boolean-sound.vl",
+  "statements/struct-call-as-statement.vl",
+  "strings/basics.vl",
+  "strings/escapes.vl",
+  "strings/index-of.vl",
+  "strings/methods-chaining.vl",
+  "strings/print-and-eq.vl",
+  "strings/slice.vl",
+  "traps/array-oob-read.vl",
+  "traps/divide-by-zero.vl",
+  "variables/const-field-mutation-ok.vl",
+  "variables/definite-assign-both-branches-ok.vl",
+  "variables/definite-assign-diverging-branch-ok.vl",
+  "variables/definite-assign-initialized-ok.vl",
+  "variables/definite-assign-then-use-ok.vl",
+  "variables/let-literal-widens.vl",
+  "variables/let-reassign-ok.vl",
+  // ── REJECT: invalid programs VL refuses (type error, or lexer/parser error) ──
+  "arrays/leading-comma-illegal.vl",
+  "arrays/render-i32-array.vl",
+  "arrays/trailing-comma-illegal.vl",
+  "bitwise/float-reject.vl",
+  "functions/inferred-return-soundness.vl",
+  "functions/lambda-uninferable-param.vl",
+  "functions/named-args-unknown.vl",
+  "functions/trailing-comma-illegal.vl",
+  "generics/array-element-correlation.vl",
+  "generics/return-correlation.vl",
+  "generics/type-alias-arity-error.vl",
+  "generics/type-alias-bare-error.vl",
+  "generics/type-alias-soundness.vl",
+  "index/wrong-key-type.vl",
+  "index/wrong-value-type.vl",
+  "lint/empty-intersection.vl",
+  "lint/for-step-zero.vl",
   "literals/err-bad-hex-digit.vl",
   "literals/err-doubled-separator.vl",
   "literals/err-empty-hex.vl",
   "literals/err-prefix-separator.vl",
   "literals/err-trailing-separator.vl",
-  // parser errors (illegal comma placement):
-  "arrays/leading-comma-illegal.vl",
-  "arrays/trailing-comma-illegal.vl",
+  "loops/for-in-not-array.vl",
+  "maps/error-i32-keyed.vl",
+  "maps/error-infer-conflict.vl",
+  "maps/error-no-annotation.vl",
+  "maps/error-object-literal-not-map.vl",
+  "maps/error-uninferred.vl",
+  "numerics/narrowing-reject.vl",
+  "objects/self-method-pollution.vl",
   "objects/trailing-comma-illegal.vl",
-  "functions/trailing-comma-illegal.vl",
-  // ── accepts (clean programs VL parses + type-checks with zero diagnostics) ──
-  "arith/literal-add.vl",
-  "arith/ops.vl",
-  "arith/typed-add.vl",
-  "statements/struct-call-as-statement.vl",
-  "variables/let-reassign-ok.vl",
-  "variables/let-literal-widens.vl",
-  "variables/const-field-mutation-ok.vl",
-  "variables/definite-assign-both-branches-ok.vl",
-  "variables/definite-assign-then-use-ok.vl",
-  "variables/definite-assign-initialized-ok.vl",
-  "variables/definite-assign-diverging-branch-ok.vl",
-  "globals/read-through.vl",
-  "globals/mutate-through-fn.vl",
-  "globals/mutate-in-fn-loop.vl",
-  "globals/struct-field-through-fn.vl",
-  "loops/while-sum.vl",
-  "functions/forward-reference.vl",
-  "functions/forward-reference-struct-param.vl",
-  "functions/forward-reference-nested-struct-param.vl",
-  "functions/mutual-recursion.vl",
-  "functions/mutual-recursion-struct-param.vl",
-  "functions/return-then-statement-same-line.vl",
-  "functions/void-tail-statements.vl",
-  "objects/equality.vl",
-  "objects/struct.vl",
-  "arrays/equality.vl",
-  "arrays/f64-elems.vl",
-  "arrays/infer-empty-push.vl",
-  "arrays/infer-empty-string.vl",
-  "arrays/infer-empty-index-set.vl",
-  "arrays/infer-empty-from-usage.vl",
+  "operators/eq-no-union-mismatch.vl",
+  "sets/error-i32-keyed.vl",
+  "sets/error-infer-conflict.vl",
+  "sets/error-no-get.vl",
+  "sets/error-no-map-methods.vl",
+  "sets/error-uninferred.vl",
+  "soundness/arith-annotated-mismatch.vl",
+  "soundness/equality-cross-type-reject.vl",
+  "soundness/equality-type-mismatch.vl",
+  "soundness/equality-union-field-reject.vl",
+  "soundness/exhaustive-is-chain-no-else-reject.vl",
+  "soundness/exhaustive-missing-is-case.vl",
+  "soundness/exhaustive-missing-literal-case.vl",
+  "soundness/function-arg-type-reject.vl",
+  "soundness/function-arg-union-reject.vl",
+  "soundness/intersection-param-reject.vl",
+  "soundness/is-non-variant-reject.vl",
+  "soundness/is-not-variant-of-union-reject.vl",
+  "soundness/literal-union-reject-arg.vl",
+  "soundness/literal-union-reject-assign.vl",
+  "soundness/literal-union-reject-compare.vl",
+  "soundness/literal-union-reject-non-member.vl",
+  "soundness/narrowing-and-else-not-narrowed.vl",
+  "soundness/narrowing-is-unsound-use.vl",
+  "soundness/narrowing-then-only-no-leak.vl",
+  "soundness/not-is-guard-no-divergence-no-narrow.vl",
+  "soundness/nullable-access-nested.vl",
+  "soundness/nullable-access-unguarded.vl",
+  "soundness/nullable-chain-unguarded-reject.vl",
+  "soundness/object-field-value-mismatch-generic.vl",
+  "soundness/object-field-value-mismatch-inline.vl",
+  "soundness/object-field-value-mismatch.vl",
+  "soundness/return-union-unnarrowed-reject.vl",
+  "soundness/struct-field-type-mismatch-reject.vl",
+  "soundness/struct-missing-field-reject.vl",
+  "soundness/struct-union-unshared-field-reject.vl",
+  "soundness/union-field-unnarrowed-reject.vl",
+  "soundness/union-four-variant-missing-reject.vl",
+  "soundness/union-narrow-reject.vl",
+  "soundness/xfail-elseif-chain-residual.vl",
+  "soundness/xfail-seq-guard-residual-codegen.vl",
+  "types/assign-type.vl",
+  "types/bodyless-alias.vl",
+  "types/boolean-literal-to-i32-reject.vl",
+  "types/boolean-to-i32-reject.vl",
+  "types/condition-type.vl",
+  "types/empty-intersection-unused.vl",
+  "types/fn-arg-count.vl",
+  "types/fn-arg-type.vl",
+  "types/for-bound-type.vl",
+  "types/i32-string-mismatch.vl",
+  "types/infer-null-pin-guard.vl",
+  "types/negation-annotation-reject.vl",
+  "types/never-value-intersection.vl",
+  "types/never-value-self-intersection.vl",
+  "types/recursive-type.vl",
+  "types/return-mismatch.vl",
+  "types/self-alias-still-clean.vl",
+  "types/self-alias-unused.vl",
+  "types/undeclared-call.vl",
+  "variables/const-increment-error.vl",
 ];
 
 const corpusSrc = (rel: string) =>
