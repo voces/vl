@@ -22,9 +22,9 @@
 // next rungs (print emission; span threading). For now the whitelist is the subset of
 // corpus files where the VL front end PARSES + TYPE-CHECKS and agrees with the spec.
 //
-// LEDGER: 179 / 422 single-file corpus cases conform — VL's VERDICT matches the
-// spec: 87 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
-// and 92 REJECTED (invalid programs VL refuses — a type error the checker raises,
+// LEDGER: 182 / 422 single-file corpus cases conform — VL's VERDICT matches the
+// spec: 93 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
+// and 89 REJECTED (invalid programs VL refuses — a type error the checker raises,
 // or a lexer/parser syntax error). Every entry is VL behaving CORRECTLY per the
 // directive. (For some advanced `@error` files VL refuses the program because the
 // construct is outside its parser/checker subset — still a correct refusal of an
@@ -36,7 +36,7 @@
 // through the pipeline in isolation (`tests/selfhost/probe_fullsweep.ts`-style) and
 // keeps the agreeing ones. As `typecheck.vl`/`parser.vl` gain coverage, re-sweep and
 // promote newly-agreeing files. A whitelisted file that starts DISAGREEING fails.
-// The count is the conformance ledger. The 243 current DISAGREEMENTS are the work
+// The count is the conformance ledger. The 240 current DISAGREEMENTS are the work
 // left: clean files VL can't yet PARSE (lambdas, generics, if/then/else
 // expressions) and `@error` files VL doesn't yet CATCH (redeclaration, const-reassign).
 
@@ -125,6 +125,12 @@ const WHITELIST = [
   "soundness/boolean-narrowing-if-sound.vl",
   "soundness/equality-array-nested-sound.vl",
   "soundness/equality-boolean-sound.vl",
+  "soundness/exhaustive-union-sound.vl",
+  "soundness/is-across-boundary-sound.vl",
+  "soundness/return-union-narrowed-at-call-site.vl",
+  "soundness/union-triple-variant-boundary-sound.vl",
+  "soundness/union-widen-ok.vl",
+  "soundness/union-widen-via-return-sound.vl",
   "statements/struct-call-as-statement.vl",
   "strings/accum-adv-other-read.vl",
   "strings/accum-adv-reset.vl",
@@ -189,13 +195,10 @@ const WHITELIST = [
   "soundness/equality-type-mismatch.vl",
   "soundness/equality-union-field-reject.vl",
   "soundness/exhaustive-is-chain-no-else-reject.vl",
-  "soundness/exhaustive-missing-is-case.vl",
   "soundness/exhaustive-missing-literal-case.vl",
   "soundness/function-arg-type-reject.vl",
   "soundness/function-arg-union-reject.vl",
   "soundness/intersection-param-reject.vl",
-  "soundness/is-non-variant-reject.vl",
-  "soundness/is-not-variant-of-union-reject.vl",
   "soundness/literal-union-reject-arg.vl",
   "soundness/literal-union-reject-assign.vl",
   "soundness/literal-union-reject-compare.vl",
