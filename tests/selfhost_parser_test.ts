@@ -132,6 +132,107 @@ while i < P.diags.length {
       "expected RPAREN but found EOF",
     ],
   },
+  {
+    // P1 — multiline function signature: `function f(` NEWLINE `a: i32,` NEWLINE
+    // `b: i32` NEWLINE `)` NEWLINE `{ }`. The param-list loop must skip NEWLINEs
+    // after `(`, around the `,`, and before `)`. (Mirrors host `parseParams`.)
+    name: "parses a multiline function signature",
+    body: `
+tok("FUNCTION", "function")
+tok("IDENT", "f")
+tok("LPAREN", "(")
+tok("NEWLINE", "\\n")
+tok("IDENT", "a")
+tok("COLON", ":")
+tok("IDENT", "i32")
+tok("COMMA", ",")
+tok("NEWLINE", "\\n")
+tok("IDENT", "b")
+tok("COLON", ":")
+tok("IDENT", "i32")
+tok("NEWLINE", "\\n")
+tok("RPAREN", ")")
+tok("LBRACE", "{")
+tok("RBRACE", "}")
+tok("EOF", "")
+let _root = parseProgram()
+walk(_root, 0)
+print("diags: " + i32ToStr(P.diags.length))
+`,
+    expected: [
+      "program",
+      "  function f",
+      "    param a",
+      "      type i32",
+      "    param b",
+      "      type i32",
+      "    block",
+      "diags: 0",
+    ],
+  },
+  {
+    // P3 — bare object literal as a statement: `{ k: v, j: w }` at statement
+    // position must parse as an object-literal EXPRESSION (implicit return),
+    // NOT a block. Multiline too: `{` NEWLINE field NEWLINE `}`.
+    name: "parses a bare object literal statement (incl. multiline)",
+    body: `
+tok("LBRACE", "{")
+tok("IDENT", "k")
+tok("COLON", ":")
+tok("IDENT", "v")
+tok("COMMA", ",")
+tok("IDENT", "j")
+tok("COLON", ":")
+tok("IDENT", "w")
+tok("RBRACE", "}")
+tok("NEWLINE", "\\n")
+tok("LBRACE", "{")
+tok("NEWLINE", "\\n")
+tok("IDENT", "m")
+tok("COLON", ":")
+tok("IDENT", "n")
+tok("NEWLINE", "\\n")
+tok("RBRACE", "}")
+tok("EOF", "")
+let _root = parseProgram()
+walk(_root, 0)
+print("diags: " + i32ToStr(P.diags.length))
+`,
+    expected: [
+      "program",
+      "  ??",
+      "  ??",
+      "diags: 0",
+    ],
+  },
+  {
+    // P5 — newline before `else`: `if x { } ` NEWLINE ` else { }`. `parseIf`
+    // must skip NEWLINEs before looking for `else` (only consuming them when an
+    // `else` actually follows). (Mirrors host `parseIf`'s else lookahead.)
+    name: "parses an if with a newline before else",
+    body: `
+tok("IF", "if")
+tok("IDENT", "x")
+tok("LBRACE", "{")
+tok("RBRACE", "}")
+tok("NEWLINE", "\\n")
+tok("ELSE", "else")
+tok("LBRACE", "{")
+tok("RBRACE", "}")
+tok("EOF", "")
+let _root = parseProgram()
+walk(_root, 0)
+print("diags: " + i32ToStr(P.diags.length))
+`,
+    expected: [
+      "program",
+      "  if",
+      "    ident x",
+      "    block",
+      "    block",
+      "diags: 0",
+    ],
+  },
 ];
 
 // One compile: fixture defs + a per-case function (reset → body) behind a `@@N`

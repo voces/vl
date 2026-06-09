@@ -100,6 +100,20 @@ function advance(): Tok {
   t
 }
 
+// The kind of the token `i` positions from the stream START (absolute index),
+// clamped to the trailing EOF so a lookahead never indexes out of range. Unlike
+// `peekKind` (cursor-relative), this reads an ABSOLUTE index WITHOUT moving the
+// cursor — the multi-token lookaheads (`looksLikeObject`, the newline-tolerant
+// `else` scan in `parseIf`) scan ahead with raw indices. Mirrors the host's
+// `kind(j)` closure.
+function kindAt(i: i32): string {
+  let j = i
+  if j >= P.toks.length {
+    j = P.toks.length - 1
+  }
+  P.toks[j].kind
+}
+
 // If the current token has `kind`, consume it and return true; else leave the
 // cursor put and return false. (The "match" combinator.)
 function accept(kind: string): boolean {
@@ -291,6 +305,11 @@ function parseArgs(): i32[] {
 // order — the emitter relies on that order to bind values to the declared fields.
 function parseObjLit(): i32 {
   expect("LBRACE")
+  // An object literal may span several source lines (`{` NEWLINE `k: v,` NEWLINE
+  // `}`). Mirror the host's `parseObjectLiteral`: skip NEWLINEs after `{`, before
+  // each field, after each field (before the `,`/`}`), after the `,`, and before
+  // the closing `}` so a field/`,`/`}` may sit on any line.
+  skipNewlines()
   let fields: i32[] = []
   let going = peekKind() != "RBRACE"
   while going {
@@ -303,8 +322,10 @@ function parseObjLit(): i32 {
     expect("COLON")
     let value = parseExpr()
     fields.push(mkFieldInit(name, value))
+    skipNewlines()
     if peekKind() == "COMMA" {
       advance()
+      skipNewlines()
       going = peekKind() != "RBRACE"
     } else {
       going = false
@@ -546,14 +567,27 @@ function parseFunc(): i32 {
     expect("IDENT")
   }
   expect("LPAREN")
+  // A function signature may span several source lines (`function f(` NEWLINE
+  // `a: T,` NEWLINE `b: U` NEWLINE `)`). Mirror the host's `parseParams`: skip
+  // NEWLINEs after `(`, around each `,`, and before `)` so the param list
+  // tolerates line breaks anywhere a separator may appear.
+  skipNewlines()
   let params: i32[] = []
   if peekKind() != "RPAREN" {
     params.push(parseParam())
+    skipNewlines()
     let more = peekKind() == "COMMA"
     while more {
-      advance()
-      params.push(parseParam())
-      more = peekKind() == "COMMA"
+      advance()                        // ","
+      skipNewlines()
+      // Trailing comma: a `,` immediately before `)` closes the list.
+      if peekKind() == "RPAREN" {
+        more = false
+      } else {
+        params.push(parseParam())
+        skipNewlines()
+        more = peekKind() == "COMMA"
+      }
     }
   }
   expect("RPAREN")
@@ -571,7 +605,19 @@ function parseIf(): i32 {
   let cond = parseExpr()
   let thenB = parseBlock()
   let els = -1
-  if accept("ELSE") {
+  // The `else` may sit on a new line after the then-block's `}` (`}` NEWLINE
+  // `else {`). Mirror the host: scan PAST any NEWLINEs to look for `else`, but
+  // only CONSUME them if an `else` actually follows — a trailing block whose `}`
+  // is merely followed by a newline (no else) must leave the cursor on that
+  // newline so the enclosing statement loop sees the next statement.
+  let look = P.pos
+  let scanning = kindAt(look) == "NEWLINE" || kindAt(look) == "SEMI"
+  while scanning {
+    look = look + 1
+    scanning = kindAt(look) == "NEWLINE" || kindAt(look) == "SEMI"
+  }
+  if kindAt(look) == "ELSE" {
+    P.pos = look + 1                  // consume the skipped newlines and the `else`
     if peekKind() == "IF" {
       els = parseIf()
     } else {
@@ -620,6 +666,58 @@ function parseBlock(): i32 {
   mkBlock(stmts)
 }
 
+// The statement-leading keywords: a `{` whose first token (after newlines) is
+// one of these is a BLOCK, never an object literal (mirrors the host's
+// `STATEMENT_KEYWORDS` set, consulted by `looksLikeObject`).
+function isStmtKeyword(kind: string): boolean {
+  kind == "LET" || kind == "CONST" || kind == "RETURN" || kind == "IF" ||
+    kind == "WHILE" || kind == "FOR" || kind == "BREAK" || kind == "CONTINUE" ||
+    kind == "TYPE" || kind == "FUNCTION"
+}
+
+// Decide whether the `{` at absolute token index `bracePos` opens an OBJECT
+// LITERAL (an expression) rather than a BLOCK. At statement position a `{` is
+// otherwise dispatched as a block, so this lookahead recovers the bare
+// object-literal / implicit-return case (`{ tokens: toks, diags: gDiags }`).
+//
+// Mirrors `parser.ts`'s `looksLikeObject`: skip NEWLINEs after `{`, then
+//   • `}`            ⇒ object  (empty `{}`, ANTLR order)
+//   • a stmt keyword ⇒ block
+//   • IDENT then (past newlines) `:` / `,` / `}`  ⇒ object
+//   • STRING then (past newlines) `:`             ⇒ object
+//   • otherwise      ⇒ block
+// (The host's method-shorthand `{ f(){…} }` and computed-key `{ [e]: v }` forms
+// don't occur in the self-host sources, so they're omitted here.)
+function looksLikeObject(bracePos: i32): boolean {
+  let i = bracePos + 1
+  let going = kindAt(i) == "NEWLINE"
+  while going {
+    i = i + 1
+    going = kindAt(i) == "NEWLINE"
+  }
+  let first = kindAt(i)
+  if first == "RBRACE" {
+    return true
+  }
+  if isStmtKeyword(first) {
+    return false
+  }
+  if first == "IDENT" || first == "STRING" {
+    let j = i + 1
+    let g = kindAt(j) == "NEWLINE"
+    while g {
+      j = j + 1
+      g = kindAt(j) == "NEWLINE"
+    }
+    let nk = kindAt(j)
+    if first == "STRING" {
+      return nk == "COLON"
+    }
+    return nk == "COLON" || nk == "COMMA" || nk == "RBRACE"
+  }
+  false
+}
+
 // One statement: dispatch on the leading keyword, else an expression statement.
 function parseStmt(): i32 {
   // `export` is a top-level visibility MODIFIER — the back end exports every
@@ -648,6 +746,13 @@ function parseStmt(): i32 {
     return parseReturn()
   }
   if k == "LBRACE" {
+    // A `{` at statement position is a BLOCK, UNLESS it shapes up as an object
+    // literal (`{ k: v, … }` — an expression statement / implicit return).
+    // Mirror the host: disambiguate with `looksLikeObject`, parsing the object
+    // form as an expression (which re-enters `parseObjLit` via `parsePrimary`).
+    if looksLikeObject(P.pos) {
+      return parseExpr()
+    }
     return parseBlock()
   }
   parseExpr()
