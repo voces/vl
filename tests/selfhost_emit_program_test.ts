@@ -26,9 +26,46 @@
 // each `Deno.test` pulls its case's bytes and runs its own (cheap) instantiate +
 // assertions. Same coverage (real lexer→parser→emitProgram on every case; binaryen
 // optimize() still runs, once) at a fraction of the time.
+//
+// ── BYTE-EXACT GOLDEN PIN (formerly selfhost_emit_golden_test.ts) ──────────────
+// Phase 0 of the codegen-builder migration (docs/codegen-builder-migration-plan.md
+// §3): the BYTE-EXACT golden pin. This is the load-bearing safety net for every
+// later phase of the `emitProgram` refactor — it captures the emitter's exact
+// output bytes for a representative set of `.vl` modules ONCE (the "golden"), then
+// asserts on every run that the current emitter reproduces those bytes
+// BYTE-FOR-BYTE. Any factoring step that perturbs a byte fails loudly here.
+//
+// It drives source → arena → bytes through the SAME real pipeline the behavioral
+// suite uses above: the genuine lexer tokenizes, the genuine parser builds the
+// `ast.vl` arena, and `emitProgram` reads that arena to produce the module bytes.
+// The emitter renders `W.bytes` as a comma-joined decimal string via `bytesToStr()`;
+// the runner parses that back (the `bytesFromLog` wire format) into a byte array.
+//
+// The goldens are stored as raw binary wasm under `tests/golden/<name>.wasm`
+// (git-tracked as binary via `.gitattributes`, so they don't pollute text diffs
+// and can be inspected with standard wasm tooling). On drift the test reports the
+// exact first differing BYTE INDEX (no readable line diff needed). A guarded
+// `UPDATE_GOLDEN=1` regenerate path rewrites them — a DELIBERATE, reviewed act:
+// during a pure-factoring refactor the goldens must NEVER change, so a non-empty
+// `tests/golden/*.wasm` diff in a refactor PR is a red flag. Belt-and-braces:
+// each golden is also `WebAssembly.compile`d so a wrongly-regenerated golden
+// can't lock in INVALID bytes.
+//
+// The golden module set (coverage matrix) and its `Golden` type live in
+// `tests/selfhost/goldens.ts`, single-sourced so the byte-exact pin here and
+// the self-hosting fixpoint proof (`selfhost_emit_fixpoint_test.ts`) drive the
+// IDENTICAL source set.
+//
+// CONSOLIDATION NOTE: the golden cases ride the SAME single compiled module as the
+// behavioral CASES above — they share the `runCase` driver and the `runAll()` log
+// cache. The keys are prefixed `g_` (matching the golden names from goldens.ts) to
+// distinguish them from the behavioral `c<N>` keys. This eliminates one expensive
+// (~50s) cold base compile from the CI critical path vs. running the two files
+// separately (2 compiles → 1).
 
 import { runWasm } from "../compiler/compile.ts";
 import { compileCached } from "./_selfhost_cache.ts";
+import { GOLDENS } from "./selfhost/goldens.ts";
 
 const read = (rel: string) =>
   Deno.readTextFileSync(new URL(rel, import.meta.url));
@@ -91,6 +128,39 @@ const instanceOf = async (
     return fn(...args);
   };
 };
+
+// The first index at which two byte arrays differ (or the shorter length if one
+// is a prefix of the other), plus a windowed context for the diagnostic message.
+const firstDiff = (
+  expected: Uint8Array<ArrayBuffer>,
+  actual: Uint8Array<ArrayBuffer>,
+): { index: number; window: string } | undefined => {
+  const n = Math.min(expected.length, actual.length);
+  for (let i = 0; i < n; i++) {
+    if (expected[i] !== actual[i]) {
+      const lo = Math.max(0, i - 4);
+      const hi = i + 5;
+      return {
+        index: i,
+        window:
+          `  expected … ${Array.from(expected.slice(lo, hi)).join(", ")} …\n` +
+          `  actual   … ${Array.from(actual.slice(lo, hi)).join(", ")} …`,
+      };
+    }
+  }
+  if (expected.length !== actual.length) {
+    return {
+      index: n,
+      window: `  (one is a prefix of the other; lengths differ at index ${n})`,
+    };
+  }
+  return undefined;
+};
+
+const goldenPath = (name: string) =>
+  new URL(`./golden/${name}.wasm`, import.meta.url);
+
+const UPDATE_GOLDEN = Deno.env.get("UPDATE_GOLDEN") === "1";
 
 // Each case: a name, the VL SOURCE TEXT to drive through lexer→parser→emitProgram,
 // and a `check` over that case's log lines (`["main: b0,b1,..."]` on success, an
@@ -4916,6 +4986,10 @@ function runCase(key: string, src: string): i32 {
 }
 ` +
   CASES.map((c, i) => `runCase("c${i}", ${JSON.stringify(c.src)})`).join("\n") +
+  "\n" +
+  // The 14 golden cases ride the SAME driver with `g_<name>` keys so their
+  // emitted bytes are parsed from the shared log map alongside the behavioral cases.
+  GOLDENS.map((g) => `runCase(${JSON.stringify(g.name)}, ${JSON.stringify(g.src)})`).join("\n") +
   "\n";
 
 // Compile + run the combined module ONCE (memoized); return the per-key logs.
@@ -4949,5 +5023,78 @@ CASES.forEach((c, i) => {
   Deno.test(`self-hosted emit-program: ${c.name}`, async () => {
     const logs = (await runAll()).get(`c${i}`) ?? [];
     await c.check(logs);
+  });
+});
+
+// ── BYTE-EXACT GOLDEN TESTS ───────────────────────────────────────────────────
+// Each golden case was registered as a `runCase(<name>, <src>)` call in the
+// driver above (keyed by the golden's own name, e.g. `g_min`). The log map
+// already contains the emitted bytes string under that key. We parse bytes,
+// WebAssembly.compile for validity, then byte-compare against the fixture.
+// The UPDATE_GOLDEN=1 regenerate path writes the bytes back to the fixture.
+GOLDENS.forEach((g) => {
+  Deno.test(`emit-golden: ${g.name} — ${g.covers}`, async () => {
+    const lines = (await runAll()).get(g.name) ?? [];
+    const errLine = lines.find((l) => l.startsWith("err: "));
+    if (errLine) {
+      throw new Error(`golden "${g.name}" failed to emit: ${errLine}`);
+    }
+    const line = lines.find((l) => l.startsWith("main: "));
+    if (!line) {
+      throw new Error(
+        `golden "${g.name}": emitter did not print a \`main:\` line; got ${
+          JSON.stringify(lines)
+        }`,
+      );
+    }
+    const nums = line.slice("main: ".length).split(",").map((s) => {
+      const n = Number(s);
+      if (!Number.isInteger(n) || n < 0 || n > 255) {
+        throw new Error(`byte out of range in emitter output: ${s}`);
+      }
+      return n;
+    });
+    const actual = new Uint8Array(nums);
+
+    // Belt-and-braces: the emitted bytes must still be a VALID wasm module, not
+    // just byte-stable — so a wrongly-regenerated golden can't lock in garbage.
+    await WebAssembly.compile(actual);
+
+    if (UPDATE_GOLDEN) {
+      // Deliberate, reviewed regenerate path. Writes the raw wasm bytes as a
+      // binary `.wasm` fixture (git-tracked as binary via .gitattributes).
+      Deno.mkdirSync(new URL("./golden/", import.meta.url), { recursive: true });
+      Deno.writeFileSync(goldenPath(g.name), actual);
+      return;
+    }
+
+    let expected: Uint8Array<ArrayBuffer>;
+    try {
+      expected = Deno.readFileSync(goldenPath(g.name));
+    } catch {
+      throw new Error(
+        `missing golden tests/golden/${g.name}.wasm — ` +
+          `regenerate deliberately with UPDATE_GOLDEN=1 deno test -A --no-check ` +
+          `tests/selfhost_emit_program_test.ts`,
+      );
+    }
+
+    const diff = firstDiff(expected, actual);
+    if (diff) {
+      throw new Error(
+        `GOLDEN DRIFT in ${g.name} at byte ${diff.index} ` +
+          `(expected length ${expected.length}, actual length ${actual.length}):\n` +
+          diff.window + "\n" +
+          `Re-run with UPDATE_GOLDEN=1 ONLY if this byte change is intended.`,
+      );
+    }
+    // Final exact assert (a clear single source of truth alongside the windowed
+    // first-diff above): identical length, identical bytes.
+    if (
+      expected.length !== actual.length ||
+      !actual.every((b, i) => b === expected[i])
+    ) {
+      throw new Error(`GOLDEN DRIFT in ${g.name}: bytes differ`);
+    }
   });
 });
