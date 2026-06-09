@@ -4922,6 +4922,9 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     fnUsesStrPush = fnHasStrPush(fnIx)
     fnUsesStrOp = fnHasStrOp(fnIx)
     fnUsesMap = fnHasMap(fnIx)
+    // `fnHasMap` only scans LOCALS/params; also reserve the frame when a map op runs
+    // on a GLOBAL struct-field map-array element (e.g. `T.scopes[top][k] = v`).
+    if !fnUsesMap { fnUsesMap = fnHasGlobalMapOp(fnIx) }
     // Collect the DISTINCT ref-list element-type slots this function pushes onto (each
     // gets its own typed 4-slot scratch frame). Empty unless `fnUsesRefPush`.
     fnRefPushSlots = []
@@ -7244,6 +7247,162 @@ function exprMap(exprIx: i32, fnIx: i32): boolean {
       let slot = refListSlotOfExpr(e.idxArr, fnIx)
       if slot >= 0 { return rlElemKindTbl[slot] == 3 }
     }
+  }
+  false
+}
+
+// ── G8: map ops on a GLOBAL struct-field map-array element ─────────────────────
+// `fnHasMap` (above) reserves the map scratch frame from map PARAMS / map LOCALS /
+// map-array LOCALS (code 5 + element kind 3). But a map op can also run on an
+// element of a GLOBAL struct-field map-array — e.g. `T.scopes[top][name] = v` in the
+// self-host checker's `declare`, where `T` is a module global struct and `scopes` is
+// a `{[string]:i32}[]` field. Such a function has NO map local, so the local scan
+// misses it and `mapScratchBase` points past the locals → `invalid local index`.
+//
+// This walk fires on EXACTLY the four shapes `emitExpr`/`emitStmt` lower as map ops —
+// each gated by `exprMap` on the same receiver (`exprMap` already resolves a
+// global-field map-array element via `exprRefArray`→`memFieldTypeCode`==5 +
+// `rlElemKindTbl`==3): the map GET `recv[k]`, the fused `recv[k] ?? d`, the
+// `.has(k)` member-call, and the map SET `recv[k] = v`. Matching the lowered set
+// EXACTLY means it never over-reserves: a function with no map-op shape stays
+// byte-identical. The map LOCAL / param cases are already handled by `fnHasMap`, so
+// this is OR'd in only as the additional global-field coverage.
+//
+// (No narrowing is applied here — a global-field map-array receiver resolves through
+// `structIndexOfExpr` on a global ident, independent of any active variant narrowing,
+// and this helper must stay declare-before-use-safe relative to the narrow stack.)
+
+// True if the expression at `exprIx` (recursively) contains a map-op shape whose
+// receiver `exprMap` resolves — i.e. a shape the emitter lowers via the map scratch
+// frame.
+function exprHasMapOp(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Index {
+    // Map GET `recv[k]`.
+    if exprMap(e.idxArr, fnIx) { return true }
+    if exprHasMapOp(e.idxArr, fnIx) { return true }
+    return exprHasMapOp(e.idxIndex, fnIx)
+  }
+  if e is BinExpr {
+    // Fused map get-with-default `recv[k] ?? d`.
+    if e.binOp == "??" {
+      let lhs = P.nodes[e.binLeft]
+      if lhs is Index {
+        if exprMap(lhs.idxArr, fnIx) { return true }
+      }
+    }
+    // Map SET `recv[k] = v` (an assignment is a statement, but walk it defensively).
+    if e.binOp == "=" {
+      let target = P.nodes[e.binLeft]
+      if target is Index {
+        if exprMap(target.idxArr, fnIx) { return true }
+      }
+    }
+    if exprHasMapOp(e.binLeft, fnIx) { return true }
+    return exprHasMapOp(e.binRight, fnIx)
+  }
+  if e is Call {
+    // `recv.has(k)` map membership.
+    let callee = P.nodes[e.callFn]
+    if callee is Member {
+      if callee.memProp == "has" {
+        if exprMap(callee.memObj, fnIx) { return true }
+      }
+    }
+    if exprHasMapOp(e.callFn, fnIx) { return true }
+    let args = e.callArgs
+    let i = 0
+    while i < args.length {
+      if exprHasMapOp(args[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if e is Member { return exprHasMapOp(e.memObj, fnIx) }
+  if e is Unary { return exprHasMapOp(e.unArg, fnIx) }
+  if e is Paren { return exprHasMapOp(e.parInner, fnIx) }
+  if e is IsExpr { return exprHasMapOp(e.isObj, fnIx) }
+  if e is ObjLit {
+    let fields = e.objFields
+    let i = 0
+    while i < fields.length {
+      let f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if exprHasMapOp(f.fiValue, fnIx) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  if e is ArrayLit {
+    let elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      if exprHasMapOp(elems[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+// True if any statement in the block at `blockIx` (descending into if/else branches
+// and while bodies) contains a map op. An assignment statement (`recv[k] = v`) is a
+// bare `BinExpr` with `binOp == "="` — `exprHasMapOp` recognizes its SET shape.
+function blockHasMapOp(blockIx: i32, fnIx: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        if exprHasMapOp(s.letInit, fnIx) { return true }
+      } else if s is RetStmt {
+        if exprHasMapOp(s.retArg, fnIx) { return true }
+      } else if s is BinExpr {
+        if exprHasMapOp(stmts[i], fnIx) { return true }
+      } else if s is Call {
+        if exprHasMapOp(stmts[i], fnIx) { return true }
+      } else if s is IfStmt {
+        if ifChainHasMapOp(stmts[i], fnIx) { return true }
+      } else if s is WhileStmt {
+        if exprHasMapOp(s.whileCond, fnIx) { return true }
+        if blockHasMapOp(s.whileBody, fnIx) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if any arm of the `if` / `else if` chain at `ifIx` contains a map op — its
+// condition, then-branch, `else` block, OR (recursively) a chained `else if`.
+function ifChainHasMapOp(ifIx: i32, fnIx: i32): boolean {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if exprHasMapOp(s.ifCond, fnIx) { return true }
+    if blockHasMapOp(s.ifThen, fnIx) { return true }
+    if s.ifElse >= 0 {
+      let els = P.nodes[s.ifElse]
+      if els is Block {
+        if blockHasMapOp(s.ifElse, fnIx) { return true }
+      } else if els is IfStmt {
+        if ifChainHasMapOp(s.ifElse, fnIx) { return true }
+      }
+    }
+  }
+  false
+}
+
+// True if the FuncDecl at `fnIx` performs a map op on a GLOBAL struct-field map-array
+// element (or any map-op shape `fnHasMap`'s local scan does not already cover) — so it
+// reserves the shared 12-slot map scratch frame. OR'd into `fnUsesMap`.
+function fnHasGlobalMapOp(fnIx: i32): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    return blockHasMapOp(fn.fnBody, fnIx)
   }
   false
 }

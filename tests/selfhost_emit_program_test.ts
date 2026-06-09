@@ -3894,6 +3894,53 @@ const CASES: Case[] = [
     },
   },
   {
+    // REGRESSION (global-field map-array map op): a map SET/GET/has on an element of a
+    // module-GLOBAL struct-field map-array (`C.scopes[top][name] = ty`) — EXACTLY
+    // typecheck.vl's `declare`/`lookup` over its global checker `T`. The function has NO
+    // map LOCAL, so `fnHasMap`'s local scan missed it and reserved no 12-slot map scratch
+    // frame; `mapScratchBase` pointed past the locals and INSTANTIATE failed with
+    // `invalid local index`. `fnHasGlobalMapOp` now body-walks the lowered map-op shapes
+    // (set / get / `??` / `.has`) gated by the same `exprMap` the lowering uses, so the
+    // frame is reserved. Drives real lexer->parser->emitProgram->engine.
+    name:
+      "global-field map-array: `C.scopes[top][k] = v` + has/get on the global checker => 13",
+    src: [
+      "type Checker = { scopes: {[string]: i32}[] }",
+      "let C: Checker = { scopes: [] }",
+      "function pushScope(): i32 {",
+      "  C.scopes.push(Map())",
+      "  0",
+      "}",
+      "function declare(name: string, ty: i32): i32 {",
+      "  let top = C.scopes.length - 1",
+      "  C.scopes[top][name] = ty",
+      "  0",
+      "}",
+      "function lookup(name: string): i32 {",
+      "  let i = C.scopes.length - 1",
+      "  while i >= 0 {",
+      '    if C.scopes[i].has(name) { return C.scopes[i][name] ?? -1 }',
+      "    i = i - 1",
+      "  }",
+      "  return -1",
+      "}",
+      "function main(): i32 {",
+      "  pushScope()",
+      '  declare("x", 5)',
+      "  pushScope()",
+      '  declare("y", 7)',
+      // y in the inner scope => 7; x found via the chain => 5; missing => -1; two scopes
+      // remain => length 2. 7 + 5 + (-1) + 2 = 13.
+      '  return (lookup("y")) + (lookup("x")) + (lookup("z")) + C.scopes.length',
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 13) throw new Error(`main() returned ${got}, expected 13`);
+    },
+  },
+  {
     // Per-block scoping: the same name `s` is a STRUCT local in the then-branch and an
     // i32 local in the disjoint else-branch. Under the old name-dedupe these collapsed
     // onto ONE wasm slot with ONE valtype — a type conflict that failed to emit. Each
