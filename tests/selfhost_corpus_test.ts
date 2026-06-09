@@ -22,8 +22,8 @@
 // next rungs (print emission; span threading). For now the whitelist is the subset of
 // corpus files where the VL front end PARSES + TYPE-CHECKS and agrees with the spec.
 //
-// LEDGER: 245 / 422 single-file corpus cases conform — VL's VERDICT matches the
-// spec: 160 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
+// LEDGER: 251 / 422 single-file corpus cases conform — VL's VERDICT matches the
+// spec: 166 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
 // and 85 REJECTED (invalid programs VL refuses — a type error the checker raises,
 // or a lexer/parser syntax error). Every entry is VL behaving CORRECTLY per the
 // directive. (For some advanced `@error` files VL refuses the program because the
@@ -36,7 +36,7 @@
 // through the pipeline in isolation (`tests/selfhost/probe_fullsweep.ts`-style) and
 // keeps the agreeing ones. As `typecheck.vl`/`parser.vl` gain coverage, re-sweep and
 // promote newly-agreeing files. A whitelisted file that starts DISAGREEING fails.
-// The count is the conformance ledger. The 177 current DISAGREEMENTS are the work
+// The count is the conformance ledger. The 171 current DISAGREEMENTS are the work
 // left: clean files VL can't yet PARSE (lambdas, generics, if/then/else
 // expressions) and `@error` files VL doesn't yet CATCH (redeclaration, const-reassign).
 
@@ -90,6 +90,12 @@ const WHITELIST = [
   "functions/trailing-comma-params.vl",
   "functions/unused-param-inline-call.vl",
   "functions/void-tail-statements.vl",
+  "generics/first.vl",
+  "generics/generic-array-foreach.vl",
+  "generics/generic-array-passthrough.vl",
+  "generics/generic-is.vl",
+  "generics/identity.vl",
+  "generics/last.vl",
   "globals/cross-function.vl",
   "globals/mutate-in-fn-loop.vl",
   "globals/mutate-in-loop.vl",

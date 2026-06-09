@@ -112,6 +112,10 @@ type TyArray = { aElem: i32 }
 // is internally a boolean-valued map but exposes ONLY `.add`/`.has`/`.delete`/
 // `.length`/`.values()` (the Map surface — `.set`/`.get`/`.keys` — must not leak).
 type TyMap = { mKey: i32, mVal: i32, mSet: i32 }
+// A generic TYPE PARAMETER (`T` in `function id<T>(x: T): T`): opaque inside the
+// generic body (assignable both ways, like the err hole); at a CALL site each
+// TyVar param BINDS to its argument's type and the return substitutes through.
+type TyVar = { tvName: string }
 
 // The unified type. Declared after its members (a union alias can't forward-
 // reference). Discriminated with `is`, exactly like the AST `Node`.
@@ -122,7 +126,8 @@ type Ty = TyPrim |
   TyUnion |
   TyNullable |
   TyArray |
-  TyMap
+  TyMap |
+  TyVar
 
 // A type diagnostic: a message plus the AST node index it was raised at. VL has
 // no exceptions, so errors are accumulated on `T.diags`, not thrown.
@@ -208,6 +213,11 @@ function mkArrayTy(elem: i32): i32 {
 
 function mkMapTy(key: i32, val: i32, isSet: i32): i32 {
   let t: Ty = { mKey: key, mVal: val, mSet: isSet }
+  addTy(t)
+}
+
+function mkTyVar(name: string): i32 {
+  let t: Ty = { tvName: name }
   addTy(t)
 }
 
@@ -299,6 +309,9 @@ function isNumeric(ix: i32): boolean {
   if t is TyErr {
     return true
   }
+  if t is TyVar {
+    return true
+  }
   if t is TyPrim {
     return t.primName == "i32" || t.primName == "f64"
   }
@@ -313,6 +326,12 @@ function sameNumeric(a: i32, b: i32): boolean {
     return true
   }
   if tb is TyErr {
+    return true
+  }
+  if ta is TyVar {
+    return true
+  }
+  if tb is TyVar {
     return true
   }
   if ta is TyPrim {
@@ -565,6 +584,8 @@ function tyToStr(ix: i32): string {
     return tyToStr(t.aElem) + "[]"
   } else if t is TyMap {
     return "{[" + tyToStr(t.mKey) + "]: " + tyToStr(t.mVal) + "}"
+  } else if t is TyVar {
+    return t.tvName
   }
   "<?>"
 }
@@ -606,6 +627,12 @@ function assignable(src: i32, dst: i32): boolean {
     return true
   }
   if d is TyErr {
+    return true
+  }
+  if s is TyVar {
+    return true
+  }
+  if d is TyVar {
     return true
   }
   // Nullable target: accepts `null` itself, the inner, or another nullable's inner.
@@ -716,6 +743,18 @@ function assignable(src: i32, dst: i32): boolean {
 // exact shape "Finding 2" historically prohibited. The miscompile is fixed in the
 // host (pinned by `tests/cases/types/union-two-visitors.vl` and
 // `union-narrowed-helper-recursion.vl`), so the visitor can be factored naturally.
+
+// Look up a generic binding by type-param name in the parallel bind arrays.
+function bindOf(bNames: string[], bTys: i32[], name: string): i32 {
+  let i = 0
+  while i < bNames.length {
+    if bNames[i] == name {
+      return bTys[i]
+    }
+    i = i + 1
+  }
+  -1
+}
 
 // A call expression: array-method builtins (`xs.push`), string-method builtins
 // (`.slice`/`.indexOf`/`.includes`/`.charCodeAt`), the `print`/`fromCodePoint`
@@ -952,14 +991,71 @@ function checkCallNode(n: Call, ix: i32): i32 {
         i32ToStr(params.length) + ", got " + i32ToStr(args.length), ix)
       return retTy
     }
+    // Generic CALL-SITE inference: a TyVar param (or `T[]`) BINDS its type-param to
+    // the argument's type (first use wins; later uses must agree), and the return
+    // type substitutes through the binding — so `id("s")` is `string`, and
+    // `let n: i32 = id("s")` is a genuine type error downstream.
+    let bNames: string[] = []
+    let bTys: i32[] = []
     let i = 0
     while i < args.length {
       let at = checkNode(args[i])
-      if !assignable(at, params[i]) {
+      let expected = params[i]
+      let pt2 = T.tys[expected]
+      if pt2 is TyVar {
+        let b0 = bindOf(bNames, bTys, pt2.tvName)
+        if b0 >= 0 {
+          expected = b0
+        } else {
+          bNames.push(pt2.tvName)
+          bTys.push(at)
+          expected = at
+        }
+      } else if pt2 is TyArray {
+        let elemIx = pt2.aElem
+        if elemIx >= 0 {
+          let et2 = T.tys[elemIx]
+          if et2 is TyVar {
+            let at2 = T.tys[at]
+            if at2 is TyArray {
+              let b1 = bindOf(bNames, bTys, et2.tvName)
+              if b1 >= 0 {
+                expected = mkArrayTy(b1)
+              } else {
+                bNames.push(et2.tvName)
+                bTys.push(at2.aElem)
+                expected = at
+              }
+            }
+          }
+        }
+      }
+      if !assignable(at, expected) {
         tErr("argument " + i32ToStr(i + 1) + ": expected " +
-          tyToStr(params[i]) + ", got " + tyToStr(at), ix)
+          tyToStr(expected) + ", got " + tyToStr(at), ix)
       }
       i = i + 1
+    }
+    // Substitute the binding into a generic return type.
+    if bNames.length > 0 {
+      let rt3 = T.tys[retTy]
+      if rt3 is TyVar {
+        let rb = bindOf(bNames, bTys, rt3.tvName)
+        if rb >= 0 {
+          retTy = rb
+        }
+      } else if rt3 is TyArray {
+        let re = rt3.aElem
+        if re >= 0 {
+          let re2 = T.tys[re]
+          if re2 is TyVar {
+            let rb2 = bindOf(bNames, bTys, re2.tvName)
+            if rb2 >= 0 {
+              retTy = mkArrayTy(rb2)
+            }
+          }
+        }
+      }
     }
     return retTy
   }
@@ -968,6 +1064,33 @@ function checkCallNode(n: Call, ix: i32): i32 {
   }
   tErr("called value is not a function (" + tyToStr(fnTy) + ")", ix)
   TY_ERR
+}
+
+// Resolve a written annotation NAME in the context of generic type-parameter
+// names: a bare type-param resolves to its TyVar, `T[]` to an array of it; any
+// other name falls through to `nameToTy`.
+function resolveAnnot(name: string, typarams: string[]): i32 {
+  let i = 0
+  while i < typarams.length {
+    if typarams[i] == name {
+      return mkTyVar(name)
+    }
+    i = i + 1
+  }
+  let nlen = name.length
+  if nlen >= 2 {
+    if name[nlen - 2] == '[' && name[nlen - 1] == ']' {
+      let base = name.slice(0, nlen - 2)
+      let j = 0
+      while j < typarams.length {
+        if typarams[j] == base {
+          return mkArrayTy(mkTyVar(base))
+        }
+        j = j + 1
+      }
+    }
+  }
+  nameToTy(name)
 }
 
 // Is `name` currently being inferred (on the in-progress stack)?
@@ -1043,7 +1166,7 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
       if pNode.parType >= 0 {
         let ptn = P.nodes[pNode.parType]
         if ptn is TypeRef {
-          pt = nameToTy(ptn.tyName)
+          pt = resolveAnnot(ptn.tyName, n.fnTyParams)
           if pt < 0 {
             tErr("unknown type '" + ptn.tyName + "'", pNode.parType)
             pt = TY_ERR
@@ -1062,7 +1185,7 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
     ret = TY_VOID
     let rtn = P.nodes[n.fnRet]
     if rtn is TypeRef {
-      ret = nameToTy(rtn.tyName)
+      ret = resolveAnnot(rtn.tyName, n.fnTyParams)
       if ret < 0 {
         tErr("unknown type '" + rtn.tyName + "'", n.fnRet)
         ret = TY_ERR
@@ -1216,7 +1339,7 @@ function checkProgramNode(n: Program): i32 {
           if hpn.parType >= 0 {
             let hptn = P.nodes[hpn.parType]
             if hptn is TypeRef {
-              let r = nameToTy(hptn.tyName)
+              let r = resolveAnnot(hptn.tyName, s.fnTyParams)
               if r >= 0 {
                 t = r
               }
@@ -1233,7 +1356,7 @@ function checkProgramNode(n: Program): i32 {
       if s.fnRet >= 0 {
         let hrtn = P.nodes[s.fnRet]
         if hrtn is TypeRef {
-          let r = nameToTy(hrtn.tyName)
+          let r = resolveAnnot(hrtn.tyName, s.fnTyParams)
           if r >= 0 {
             hret = r
           } else {
