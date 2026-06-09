@@ -184,7 +184,7 @@ const compileBase = async (source: string, what: string): Promise<Uint8Array> =>
 // Instantiate a host-compiled emitter module and drive its `runEmitFull`, reading the
 // emitted bytes back through `rbyteLen`/`rbyteAt`.
 const driveFull = async (bytes: Uint8Array): Promise<Uint8Array> => {
-  const module = await WebAssembly.compile(bytes);
+  const module = await WebAssembly.compile(bytes as BufferSource);
   const instance = await WebAssembly.instantiate(module, {});
   const exp = instance.exports as Record<string, (...a: number[]) => number>;
   for (const name of ["runEmitFull", "rbyteLen", "rbyteAt"]) {
@@ -266,6 +266,6 @@ Deno.test({
   ignore: !RUN,
   fn: async () => {
     const { self } = await compute();
-    await WebAssembly.instantiate(await WebAssembly.compile(self), {});
+    await WebAssembly.instantiate(await WebAssembly.compile(self as BufferSource), {});
   },
 });
