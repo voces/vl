@@ -151,6 +151,29 @@ print("diags: " + toString(r.diags.length))
     expected: ["STRING=ABC", "diags: 0"],
   },
   {
+    // P6: `0xff` / `0b1010` each scan as ONE NUMBER token carrying the raw lexeme
+    // (prefix kept). Before the fix `0xff` split into NUMBER `0` + IDENT `ff`.
+    // The `0x40&0x41` run also proves the `&` does not get glued into the literal.
+    name: "scans 0x hex and 0b binary integer literals as single NUMBER tokens",
+    body: `
+let r = tokenize("a = 0xff + 0b1010 + 0x40 & 0x41")
+let i = 0
+while i < r.tokens.length {
+  let t = r.tokens[i]
+  if t.kind == "NUMBER" { print("NUMBER=" + t.text) }
+  i = i + 1
+}
+print("diags: " + toString(r.diags.length))
+`,
+    expected: [
+      "NUMBER=0xff",
+      "NUMBER=0b1010",
+      "NUMBER=0x40",
+      "NUMBER=0x41",
+      "diags: 0",
+    ],
+  },
+  {
     name: "reports unterminated string and bad char literals",
     body: `
 let bad = tokenize("x = \\"oops")

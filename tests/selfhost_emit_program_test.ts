@@ -4173,6 +4173,47 @@ const CASES: Case[] = [
       if (got !== 1) throw new Error(`f(1, 5, 5) returned ${got}, expected 1`);
     },
   },
+  {
+    // P6: a `0x…` hex literal lexes as ONE NUMBER token and `parseI32` folds it to
+    // its decimal value, so `0xff` is the `i32.const 255` operand. Before the fix
+    // the lexer split `0xff` into `0` (NUMBER) + `ff` (IDENT), derailing the parse.
+    name: "hex literal: `0xff` is 255",
+    src: "function f(): i32 {\n  return 0xff\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 255) throw new Error(`f() returned ${got}, expected 255`);
+    },
+  },
+  {
+    // Hex operands flow through the bitwise ops exactly like the LEB encoders use
+    // them: `0x80 | 0x7f` = 128 | 127 = 255 (the continuation-flag + low-7 mask).
+    name: "hex literal: `0x80 | 0x7f` is 255 (LEB flag|mask idiom)",
+    src: "function f(): i32 {\n  return 0x80 | 0x7f\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 255) throw new Error(`f() returned ${got}, expected 255`);
+    },
+  },
+  {
+    // `0x40 & 0x41` = 64 & 65 = 64 — the `byte & 0x40` sign-bit probe used by the
+    // SLEB encoder. Uppercase-letter and mixed-case hex digits also lex.
+    name: "hex literal: `0x40 & 0x41` is 64 (SLEB sign-bit probe)",
+    src: "function f(): i32 {\n  return 0x40 & 0x41\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 64) throw new Error(`f() returned ${got}, expected 64`);
+    },
+  },
+  {
+    // Binary `0b…` literal: `0b1010` is 10. Lexes as one NUMBER token; `parseI32`
+    // folds base-2. (Host scans `0b`/`0B` too — we mirror that base set.)
+    name: "binary literal: `0b1010` is 10",
+    src: "function f(): i32 {\n  return 0b1010\n}\n",
+    check: async (logs) => {
+      const got = await runExport(bytesFromLog(logs), "f");
+      if (got !== 10) throw new Error(`f() returned ${got}, expected 10`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
