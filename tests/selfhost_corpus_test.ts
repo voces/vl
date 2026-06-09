@@ -22,8 +22,8 @@
 // next rungs (print emission; span threading). For now the whitelist is the subset of
 // corpus files where the VL front end PARSES + TYPE-CHECKS and agrees with the spec.
 //
-// LEDGER: 182 / 422 single-file corpus cases conform — VL's VERDICT matches the
-// spec: 93 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
+// LEDGER: 219 / 422 single-file corpus cases conform — VL's VERDICT matches the
+// spec: 130 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
 // and 89 REJECTED (invalid programs VL refuses — a type error the checker raises,
 // or a lexer/parser syntax error). Every entry is VL behaving CORRECTLY per the
 // directive. (For some advanced `@error` files VL refuses the program because the
@@ -36,7 +36,7 @@
 // through the pipeline in isolation (`tests/selfhost/probe_fullsweep.ts`-style) and
 // keeps the agreeing ones. As `typecheck.vl`/`parser.vl` gain coverage, re-sweep and
 // promote newly-agreeing files. A whitelisted file that starts DISAGREEING fails.
-// The count is the conformance ledger. The 240 current DISAGREEMENTS are the work
+// The count is the conformance ledger. The 203 current DISAGREEMENTS are the work
 // left: clean files VL can't yet PARSE (lambdas, generics, if/then/else
 // expressions) and `@error` files VL doesn't yet CATCH (redeclaration, const-reassign).
 
@@ -70,27 +70,55 @@ const WHITELIST = [
   "arrays/infer-empty-push.vl",
   "arrays/infer-empty-string.vl",
   "chars/literals.vl",
+  "functions/calls.vl",
+  "functions/closure.vl",
+  "functions/early-return.vl",
+  "functions/escaping.vl",
+  "functions/forward-call-inferred.vl",
+  "functions/forward-reference-needs-return-type.vl",
   "functions/forward-reference-nested-struct-param.vl",
   "functions/forward-reference-struct-array-param.vl",
   "functions/forward-reference-struct-param.vl",
   "functions/forward-reference.vl",
+  "functions/function-equality.vl",
+  "functions/mutual-recursion-inferred.vl",
   "functions/mutual-recursion-struct-param.vl",
   "functions/mutual-recursion.vl",
+  "functions/nested.vl",
   "functions/return-then-statement-same-line.vl",
+  "functions/struct-param-mutual-recursion-global.vl",
+  "functions/trailing-comma-params.vl",
+  "functions/unused-param-inline-call.vl",
   "functions/void-tail-statements.vl",
+  "globals/cross-function.vl",
   "globals/mutate-in-fn-loop.vl",
   "globals/mutate-in-loop.vl",
   "globals/mutate-through-fn.vl",
   "globals/read-through.vl",
+  "globals/string-accumulator-through-fn.vl",
+  "globals/string-read-through.vl",
+  "globals/string-reassign-cross-function.vl",
   "globals/struct-field-through-fn.vl",
   "index/nested-2d-array.vl",
   "lexer/soft-keywords-as-function-names.vl",
   "lexer/soft-keywords-as-identifiers.vl",
   "lint/called-function-no-warn.vl",
+  "lint/dead-branch-if-false.vl",
   "lint/dead-branch-if-true-else.vl",
+  "lint/dead-branch-while-false.vl",
   "lint/exported-function-no-warn.vl",
   "lint/mutual-recursion-no-warn.vl",
+  "lint/prefer-const-unmutated-let.vl",
+  "lint/reachable-no-warn.vl",
+  "lint/read-local-no-warn.vl",
+  "lint/underscore-suppressed.vl",
+  "lint/unreachable-after-break.vl",
+  "lint/unreachable-after-if-else.vl",
+  "lint/unreachable-after-return.vl",
   "lint/unused-function.vl",
+  "lint/unused-local.vl",
+  "lint/unused-param.vl",
+  "lint/unused-toplevel.vl",
   "lists/build-fusion-adv-break.vl",
   "lists/build-fusion-adv-conditional.vl",
   "lists/build-fusion-adv-multipush.vl",
@@ -119,7 +147,9 @@ const WHITELIST = [
   "loops/for-sum.vl",
   "loops/single-line-block.vl",
   "loops/while-sum.vl",
+  "objects/equality-function-field.vl",
   "objects/equality.vl",
+  "objects/member-call.vl",
   "objects/struct.vl",
   "soundness/README.vl",
   "soundness/boolean-narrowing-if-sound.vl",
@@ -131,6 +161,8 @@ const WHITELIST = [
   "soundness/union-triple-variant-boundary-sound.vl",
   "soundness/union-widen-ok.vl",
   "soundness/union-widen-via-return-sound.vl",
+  "statements/call-result-still-consumable.vl",
+  "statements/discarded-call-return.vl",
   "statements/struct-call-as-statement.vl",
   "strings/accum-adv-other-read.vl",
   "strings/accum-adv-reset.vl",
@@ -138,12 +170,17 @@ const WHITELIST = [
   "strings/accum-empty.vl",
   "strings/basics.vl",
   "strings/escapes.vl",
+  "strings/from-code-point.vl",
   "strings/index-of.vl",
   "strings/methods-chaining.vl",
   "strings/print-and-eq.vl",
   "strings/slice.vl",
   "traps/array-oob-read.vl",
   "traps/divide-by-zero.vl",
+  "types/literal-narrowing.vl",
+  "types/struct-union-same-shape.vl",
+  "types/union-narrowed-helper-recursion.vl",
+  "types/union-two-visitors.vl",
   "variables/const-field-mutation-ok.vl",
   "variables/definite-assign-both-branches-ok.vl",
   "variables/definite-assign-diverging-branch-ok.vl",
@@ -157,6 +194,7 @@ const WHITELIST = [
   "arrays/render-i32-array.vl",
   "arrays/trailing-comma-illegal.vl",
   "bitwise/float-reject.vl",
+  "functions/inferred-cycle-no-base-case.vl",
   "functions/inferred-return-soundness.vl",
   "functions/lambda-uninferable-param.vl",
   "functions/named-args-unknown.vl",
@@ -169,7 +207,6 @@ const WHITELIST = [
   "index/wrong-key-type.vl",
   "index/wrong-value-type.vl",
   "lint/empty-intersection.vl",
-  "lint/for-step-zero.vl",
   "literals/err-bad-hex-digit.vl",
   "literals/err-doubled-separator.vl",
   "literals/err-empty-hex.vl",
