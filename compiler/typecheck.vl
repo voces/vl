@@ -313,7 +313,51 @@ function hasDot(s: string): boolean {
 // unknown name). Takes the bare NAME — NOT a `Node` index — so it never narrows
 // the `Node` union (see Finding 2). The single caller (`checkNode`) extracts the
 // `TypeRef`'s name inline before calling this.
+// True if the type name contains a `|` (an inline-union synthetic name `A|B|null`).
+function nameHasPipe(name: string): boolean {
+  let i = 0
+  while i < name.length {
+    if name[i] == '|' {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
 function nameToTy(name: string): i32 {
+  // An inline UNION `A | B | null` — the parser joins the members with `|` into one
+  // synthetic name. Split on `|`, resolve each member, and build the union (a `null`
+  // member makes it NULLABLE). Checked FIRST so a member's `[]`/map shape isn't read
+  // as a suffix of the whole union name.
+  if nameHasPipe(name) {
+    let members: i32[] = []
+    let hasNull = false
+    let start = 0
+    let i = 0
+    while i <= name.length {
+      if i == name.length || name[i] == '|' {
+        let part = name.slice(start, i)
+        if part == "null" {
+          hasNull = true
+        } else if part.length > 0 {
+          members.push(nameToTy(part))
+        }
+        start = i + 1
+      }
+      i = i + 1
+    }
+    let inner = TY_ERR
+    if members.length == 1 {
+      inner = members[0]
+    } else if members.length > 1 {
+      inner = mkUnionTy(members)
+    }
+    if hasNull {
+      return mkNullableTy(inner)
+    }
+    return inner
+  }
   if name == "i32" {
     return TY_I32
   }
@@ -1064,6 +1108,9 @@ function checkNode(ix: i32): i32 {
     // Positive `is`-narrowing: `if x is T { … }` refines a simple identifier `x` to
     // the variant type `T` for the THEN branch only, via a pushed scope that shadows
     // `x`'s binding. Reads the IsExpr + its Ident operand INLINE (mono-visitor).
+    // (Negative/complement narrowing after a diverging then was tried but regressed
+    // verdict conformance — plain `is T` complement made VL MISS real errors in
+    // soundness files that need richer narrowing — so it is deliberately not done.)
     let narrowed = 0
     let cond = P.nodes[n.ifCond]
     if cond is IsExpr {
