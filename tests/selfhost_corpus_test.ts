@@ -22,6 +22,10 @@
 // next rungs (print emission; span threading). For now the whitelist is the subset of
 // corpus files where the VL front end PARSES + TYPE-CHECKS and agrees with the spec.
 //
+// LEDGER: 50 corpus files conform (19 genuine front-end rejections + 31 clean
+// programs accepted with zero diagnostics), across arith / conditionals / loops /
+// variables / globals / functions / types / objects / arrays / operators / literals.
+//
 // GROWING THE WHITELIST: as `typecheck.vl`/`parser.vl` gain coverage, re-run the
 // discovery sweep (a candidate set driven the same way) and promote newly-agreeing
 // files here. A whitelisted file that starts DISAGREEING is a regression and fails.
@@ -49,7 +53,13 @@ const typecheck = read("../compiler/typecheck.vl");
 // expressions, loops, redeclaration/const-reassign checks VL lacks — are excluded
 // until the relevant coverage lands.)
 const WHITELIST = [
-  // rejects (type errors the VL checker raises)
+  // ── rejects ────────────────────────────────────────────────────────────────
+  // Curated to GENUINE front-end rejections: type errors the VL checker models,
+  // plus real lexer/parser syntax errors. Advanced-feature `@error` files
+  // (negation / intersection / recursive types / null-inference / lambdas /
+  // named-args) are EXCLUDED — VL "rejects" them only as a parse-subset artifact,
+  // not by analysing the feature, so they'd give false confidence.
+  // type errors (the checker raises them):
   "types/assign-type.vl",
   "types/i32-string-mismatch.vl",
   "types/return-mismatch.vl",
@@ -57,17 +67,52 @@ const WHITELIST = [
   "types/fn-arg-count.vl",
   "types/fn-arg-type.vl",
   "types/condition-type.vl",
-  "variables/const-increment-error.vl",
-  // accepts (clean programs VL checks with no diagnostics)
+  "types/boolean-to-i32-reject.vl",
+  "types/boolean-literal-to-i32-reject.vl",
+  "operators/eq-no-union-mismatch.vl",
+  // lexer errors (malformed numeric literals):
+  "literals/err-bad-hex-digit.vl",
+  "literals/err-doubled-separator.vl",
+  "literals/err-empty-hex.vl",
+  "literals/err-prefix-separator.vl",
+  "literals/err-trailing-separator.vl",
+  // parser errors (illegal comma placement):
+  "arrays/leading-comma-illegal.vl",
+  "arrays/trailing-comma-illegal.vl",
+  "objects/trailing-comma-illegal.vl",
+  "functions/trailing-comma-illegal.vl",
+  // ── accepts (clean programs VL parses + type-checks with zero diagnostics) ──
   "arith/literal-add.vl",
   "arith/ops.vl",
   "arith/typed-add.vl",
-  "functions/mutual-recursion.vl",
-  "functions/forward-reference.vl",
+  "statements/struct-call-as-statement.vl",
   "variables/let-reassign-ok.vl",
   "variables/let-literal-widens.vl",
+  "variables/const-field-mutation-ok.vl",
+  "variables/definite-assign-both-branches-ok.vl",
+  "variables/definite-assign-then-use-ok.vl",
+  "variables/definite-assign-initialized-ok.vl",
+  "variables/definite-assign-diverging-branch-ok.vl",
   "globals/read-through.vl",
   "globals/mutate-through-fn.vl",
+  "globals/mutate-in-fn-loop.vl",
+  "globals/struct-field-through-fn.vl",
+  "loops/while-sum.vl",
+  "functions/forward-reference.vl",
+  "functions/forward-reference-struct-param.vl",
+  "functions/forward-reference-nested-struct-param.vl",
+  "functions/mutual-recursion.vl",
+  "functions/mutual-recursion-struct-param.vl",
+  "functions/return-then-statement-same-line.vl",
+  "functions/void-tail-statements.vl",
+  "objects/equality.vl",
+  "objects/struct.vl",
+  "arrays/equality.vl",
+  "arrays/f64-elems.vl",
+  "arrays/infer-empty-push.vl",
+  "arrays/infer-empty-string.vl",
+  "arrays/infer-empty-index-set.vl",
+  "arrays/infer-empty-from-usage.vl",
 ];
 
 const corpusSrc = (rel: string) =>
