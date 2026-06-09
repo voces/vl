@@ -2443,6 +2443,31 @@ const CASES: Case[] = [
       if (got !== 11) throw new Error(`main() returned ${got}, expected 11`);
     },
   },
+  {
+    name:
+      "global-pop: `.pop()` on a bare module-GLOBAL list ident => 32",
+    src: [
+      "let buf: i32[] = []",
+      "function fill(): i32 {",
+      "  buf.push(10)",
+      "  buf.push(20)",
+      "  buf.push(30)",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  fill()",
+      "  let last = buf.pop()",
+      "  return last + buf.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `.pop()` on a global list returns the last element (30) and shrinks the global
+      // (length 3 -> 2), mirroring the global-push receiver resolution => 30 + 2 = 32.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 32) throw new Error(`main() returned ${got}, expected 32`);
+    },
+  },
   // NOTE: string-list / ref-list module globals are NOT covered here because a const
   // empty `[]` (or even a non-empty `string[]`/`T[]`) global is currently typed by
   // `globalKind` as an i32-list wrapper (it is not annotation-aware) — a SEPARATE,

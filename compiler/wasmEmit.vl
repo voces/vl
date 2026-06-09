@@ -1466,7 +1466,19 @@ function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: i32): boolean {
     if callee is Member {
       if callee.memProp == "pop" {
         let recv = P.nodes[callee.memObj]
+        // A struct-FIELD / global-field Member receiver, OR a bare module-GLOBAL list
+        // ident — both materialize the wrapper ref into the `recvRef` scratch slot, so
+        // both need the push frame reserved. A bare LOCAL pop references the local in
+        // place and needs no scratch, so it is NOT counted.
+        let needsScratch = false
         if recv is Member {
+          needsScratch = true
+        } else if recv is Ident {
+          if localIndexOf(fnIx, recv.identName) < 0 {
+            if globalIndexOf(recv.identName) >= 0 { needsScratch = true }
+          }
+        }
+        if needsScratch {
           let isRef = exprRefArray(callee.memObj, fnIx)
           let isStr = exprStringArray(callee.memObj, fnIx)
           if kind == 1 { return isRef }
@@ -4328,7 +4340,16 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
       if recv is Ident {
         lIdx = localIndexOf(fnIx, recv.identName)
         if lIdx < 0 {
-          return emitFail("emitProgram: .pop receiver is not a list local")
+          // Not a local — a module-GLOBAL list ident? Materialize its wrapper ref into
+          // the `recvRef` scratch slot (`base + 3`), IDENTICALLY to the Member path (and
+          // to `emitPush`): `emitExpr` runs the existing Ident→global read; the wrapper is
+          // mutated in place by reference, so no write-back to the global is needed.
+          if globalIndexOf(recv.identName) < 0 {
+            return emitFail("emitProgram: .pop receiver is not a list local")
+          }
+          if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+          fbLocalSet(base + 3)     // local.set recvRef
+          lIdx = base + 3
         }
       } else if recv is Member {
         if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
