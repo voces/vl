@@ -2283,6 +2283,89 @@ const CASES: Case[] = [
       if (got !== 32) throw new Error(`main() returned ${got}, expected 32`);
     },
   },
+  // ── start-fn: NON-CONST module-global initializers ─────────────────────────
+  // A module global whose init is NOT a WasmGC constant expression (a member access,
+  // a reference to another global, …) cannot be emitted inline in the global section.
+  // `emitProgram` zero-initializes the cell (nullable `ref.null` / `i32.const 0`) and
+  // synthesizes ONE start function (the LAST function index, so user indices don't
+  // shift) that runs each such init via `global.set` before any other code. These
+  // cases PROVE the start fn ran: before this work they trapped / produced invalid wasm.
+  {
+    name:
+      "start-fn: non-const scalar + ref globals from member access (curBuf shape) => 7",
+    src: [
+      "type Box = { n: i32, items: i32[] }",
+      "let b: Box = { n: 7, items: [] }",
+      "let val: i32 = b.n",
+      "let alias: i32[] = b.items",
+      "function main(): i32 {",
+      "  return val + alias.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `val` (= b.n = 7, scalar) and `alias` (= b.items, a ref list) are BOTH non-const
+      // member-access inits set by the start fn; alias.length = 0, so 7 + 0 = 7. Proves
+      // the start fn set the scalar AND the (nullable→non-null) ref global.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    name:
+      "start-fn: a global initialized from another global IDENT (`bb = a`) => 5",
+    src: [
+      "let a: i32 = 5",
+      "let bb: i32 = a",
+      "function main(): i32 {",
+      "  return bb",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `bb`'s init is a bare Ident reference to the global `a` — a `global.get`, NOT a
+      // constexpr — so it rides the start fn. `a` is const (0-const path). bb === a === 5.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  {
+    name:
+      "start-fn: a non-const REF global aliased from another global (ref ident) => 30",
+    src: [
+      "let xs: i32[] = [10, 20]",
+      "let ys: i32[] = xs",
+      "function main(): i32 {",
+      "  return ys[0] + ys[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `ys = xs` aliases a ref global (a `global.get` of the const list `xs`), so `ys`
+      // is a nullable cell set by the start fn; reads add `ref.as_non_null`. Both index
+      // through the SAME backing: 10 + 20 = 30.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 30) throw new Error(`main() returned ${got}, expected 30`);
+    },
+  },
+  {
+    name:
+      "start-fn sanity: a module with ONLY const globals emits NO start section => 32",
+    src: [
+      "let xs: i32[] = [10, 20]",
+      "function main(): i32 {",
+      "  return xs[0] + xs[1] + xs.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // All-const globals: no start fn, no start section — the global section is the
+      // inline-constexpr path (this case is byte-identical to the G2b array global).
+      // Still instantiates: 10 + 20 + 2 = 32.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 32) throw new Error(`main() returned ${got}, expected 32`);
+    },
+  },
   // ── G7-ref: ref-element growable lists (arrays of structs / unions) ─────────
   // A growable list whose ELEMENT is a reference — `T[]` (a struct ref) or `N[]`
   // (the union box ref) — reuses the `{ backing, len, cap }` wrapper, but its backing

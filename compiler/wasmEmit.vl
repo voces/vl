@@ -3730,6 +3730,17 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       let gIdx = globalIndexOf(e.identName)
       if gIdx >= 0 {
         fbGlobalGet(gIdx)
+        // A NON-const ref global rides in a NULLABLE cell (zero-initialized with
+        // `ref.null`, set by the start function before any code runs). Recover the
+        // non-null value type the rest of codegen expects with `ref.as_non_null`
+        // (0xd4); the cell is always initialized first, so the cast never traps. A
+        // const global keeps its non-null cell, so no cast (goldens unchanged). A
+        // scalar (i32/boolean) global needs no cast either.
+        if globalNameIsNonConst(e.identName) {
+          if globalCellKind(globalLetOf(e.identName)) != 0 {
+            wU8(212)         // 0xd4 ref.as_non_null
+          }
+        }
         return 0
       }
       return emitFail("emitProgram: identifier is not a parameter, local, or global")
@@ -5319,6 +5330,166 @@ function globalKind(initIx: i32): i32 {
   0
 }
 
+// Whether the initializer expression at `exprIx` is a valid WasmGC *constant
+// expression* — the forms `emitProgram` already lowers inline in the global section
+// (`i32.const`, `struct.new`, `array.new_fixed`, the string array). Const forms:
+// `NumLit` / `CharLit` / `BoolLit` (an `i32.const`), `StrLit` (a constant `array.new_fixed`
+// over the code points), an `ArrayLit` whose elements are ALL const, an `ObjLit` whose
+// field values are ALL const, and a `Paren` wrapping a const. EVERYTHING ELSE is
+// non-const: an `Ident` (a `global.get` of another global), a `Member` / `Index` (a
+// `struct.get` / `array.get` — the `curBuf = W.bytes` shape), a `Call`, a `BinExpr` /
+// `Unary` (computed), an `IsExpr`. CONSERVATIVE by construction: an unrecognized node
+// falls through to the non-const `false`, so a form we have not proven const-safe is
+// initialized via the start function rather than emitted as an invalid constexpr.
+function isConstInit(exprIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is NumLit { return true }
+  if e is CharLit { return true }
+  if e is BoolLit { return true }
+  if e is StrLit { return true }
+  if e is Paren { return isConstInit(e.parInner) }
+  if e is ArrayLit {
+    let i = 0
+    while i < e.arrElems.length {
+      if !isConstInit(e.arrElems[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  if e is ObjLit {
+    let i = 0
+    while i < e.objFields.length {
+      let f = P.nodes[e.objFields[i]]
+      if f is FieldInit {
+        if !isConstInit(f.fiValue) { return false }
+      } else {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether the module global declared by the `LetDecl` at `letIx` has a non-const
+// initializer (so its cell is zero-initialized and set by the synthetic start
+// function). False for a non-`LetDecl` or a missing init.
+function globalIsNonConst(letIx: i32): boolean {
+  if letIx < 0 { return false }
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 { return false }
+    return !isConstInit(d.letInit)
+  }
+  false
+}
+
+// Whether the module global `name` has a non-const initializer — used at READ sites
+// (`global.get`) to decide whether the (nullable) cell needs a `ref.as_non_null`.
+function globalNameIsNonConst(name: string): boolean {
+  globalIsNonConst(globalLetOf(name))
+}
+
+// The `fbValtype` kind for a module global's CELL. For a const init, the kind comes
+// from the literal initializer (`globalKind`) exactly as before (preserves goldens).
+// For a NON-const init, the literal kind is meaningless (the init is a member/index/
+// call), so the cell kind is derived from the binding's TYPE ANNOTATION via the
+// `globalIs*` predicates — `curBuf: i32[]` → kind 2 (the i32 list), the shape this
+// model unblocks. Mirrors `buildLocals`' annotation→kind ladder (map 6, string-array
+// 7, ref-array 5, struct 1, array 2, string 3, else i32 0).
+function globalCellKind(letIx: i32): i32 {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if !globalIsNonConst(letIx) {
+      return globalKind(d.letInit)
+    }
+    if letIsMap(letIx, 0 - 1) { return 6 }
+    if letIsStringArray(letIx, 0 - 1) { return 7 }
+    if letIsRefArray(letIx, 0 - 1) { return 5 }
+    if letIsStruct(letIx, 0 - 1) { return 1 }
+    if letIsArray(letIx, 0 - 1) { return 2 }
+    if letIsString(letIx, 0 - 1) { return 3 }
+    return 0
+  }
+  0
+}
+
+// The struct table index for a global cell of kind 1 (struct ref), else -1. For a
+// const init this reuses `structIndexOfExpr` over the literal (as before); for a
+// non-const struct global it comes from the annotation (`structIndexOfLet`).
+function globalCellStructIdx(letIx: i32): i32 {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if !globalIsNonConst(letIx) {
+      return structIndexOfExpr(d.letInit, 0 - 1)
+    }
+    return structIndexOfLet(letIx, 0 - 1)
+  }
+  0 - 1
+}
+
+// Emit `ref.null <heaptype>` (0xd0 <heaptype-sleb>) for a global cell of ref `kind`,
+// the zero initializer that lets the cell be declared NULLABLE before the start
+// function `global.set`s the real value. The heap type mirrors `fbValtype`'s kind→
+// heap-index map (struct / i32-list / string array / union box / ref-list / map /
+// string-list). A scalar global (kind 0) never reaches here — it zero-inits with
+// `i32.const 0`.
+function fbRefNullForKind(kind: i32, structIdx: i32): i32 {
+  wU8(208)                     // 0xd0 ref.null
+  if kind == 1 {
+    wSLEB(sHeapIdx[structIdx])
+  } else if kind == 2 {
+    wSLEB(lTypeIdx)
+  } else if kind == 3 {
+    wSLEB(aTypeIdx)
+  } else if kind == 4 {
+    wSLEB(uBoxIdx)
+  } else if kind == 5 {
+    wSLEB(rlTypeIdx)
+  } else if kind == 6 {
+    wSLEB(mStructIdx)
+  } else if kind == 7 {
+    wSLEB(mkListIdx)
+  } else {
+    wSLEB(aTypeIdx)
+  }
+  0
+}
+
+// Emit a global cell valtype, NULLABLE for refs (`0x63` instead of `0x64`) so a
+// non-const ref cell can be `ref.null`-initialized. The scalar case (kind 0) is the
+// same `0x7f` i32 as `fbValtype`. Only used for NON-const globals; const globals keep
+// the non-null `fbValtype` (so goldens are unchanged).
+function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
+  if kind == 1 {
+    wU8(99)                    // 0x63 (ref null ht)
+    wULEB(sHeapIdx[structIdx])
+  } else if kind == 2 {
+    wU8(99)
+    wULEB(lTypeIdx)
+  } else if kind == 3 {
+    wU8(99)
+    wULEB(aTypeIdx)
+  } else if kind == 4 {
+    wU8(99)
+    wULEB(uBoxIdx)
+  } else if kind == 5 {
+    wU8(99)
+    wULEB(rlTypeIdx)
+  } else if kind == 6 {
+    wU8(99)
+    wULEB(mStructIdx)
+  } else if kind == 7 {
+    wU8(99)
+    wULEB(mkListIdx)
+  } else {
+    wU8(127)                   // 0x7f i32
+  }
+  0
+}
+
 // The heap-type index of a ref list's ELEMENT: the struct (heap-type 0) when
 // `rElemKind == 1`, or the union box (`uBoxIdx`) when `rElemKind == 2`. Used for the
 // ref backing's element ref, the index-read `ref.cast`/result, and the push value.
@@ -5552,6 +5723,97 @@ function mapStructOffsetOf(): i32 {
   0
 }
 
+// Detect, over the SET of non-const global init expressions, the scratch frames the
+// start function's body needs — the start-fn analogue of `emitFuncCode`'s per-function
+// `fnHas*` detection. A `.push` is a statement-level void call (never in an init VALUE
+// position), so the i32/ref/string-push frames are driven by Member-receiver `.pop`s
+// (which DO appear in value position, `let x = T.scopes.pop()` shape) via
+// `exprHasMemberPopKind`; string ops and map ops are detected over the same exprs. Sets
+// the `fnUses*` flags + `fnRefPushSlots`/`refPushBaseBySlot` exactly as `emitFuncCode`
+// does, so the shared `fbBeginFunc`/`fbEmitLocalsVec` lay out an identical frame. For
+// the common `curBuf = W.bytes` shape (a plain `global.get`+`struct.get`) every flag is
+// false and the locals vector is empty.
+function startFnDetectScratch(): i32 {
+  fnUsesPush = false
+  fnUsesRefPush = false
+  fnUsesStrPush = false
+  fnUsesStrOp = false
+  fnUsesMap = false
+  fnRefPushSlots = []
+  refPushBaseBySlot = []
+  let gi = 0
+  while gi < globalStmts.length {
+    if globalIsNonConst(globalStmts[gi]) {
+      let g = P.nodes[globalStmts[gi]]
+      if g is LetDecl {
+        let ix = g.letInit
+        if exprHasMemberPopKind(ix, 0 - 1, 0) { fnUsesPush = true }
+        if exprHasMemberPopKind(ix, 0 - 1, 1) { fnUsesRefPush = true }
+        if exprHasMemberPopKind(ix, 0 - 1, 2) { fnUsesStrPush = true }
+        if exprHasStrOp(ix, 0 - 1) { fnUsesStrOp = true }
+        if exprHasMapOp(ix, 0 - 1) { fnUsesMap = true }
+        collectMemberPopRefSlotsExpr(ix, 0 - 1)
+      }
+    }
+    gi = gi + 1
+  }
+  0
+}
+
+// Emit the synthetic start function's size-prefixed code entry onto `out` (the code
+// section payload). The body runs every NON-const global initializer in declaration
+// order — `emitExpr(body, letInit, -1)` (module scope, `fnIx = -1`) then `global.set gi`
+// — so each cell holds its real value before any other code runs. Mirrors
+// `emitFuncCode`'s framing: detect scratch frames, lay out locals via `fbBeginFunc`,
+// emit the locals vector (`fbEmitLocalsVec`) with NO declared locals, then the body and
+// the `end`, size-prefixed. Returns 0, or -1 (via `emitFail`).
+function emitStartFnCode(out: i32[]): i32 {
+  // Scratch detection + layout: the start fn has no params and no declared locals, so
+  // the cursor starts at 0 and only reserved scratch frames advance it.
+  startFnDetectScratch()
+  fbBeginFunc(0, 0)
+
+  let bodyExpr: i32[] = []
+  let exprPrev = wTarget(bodyExpr)
+  // Reset the emit-time scope/loop bookkeeping (the start fn has its own empty frame),
+  // mirroring `emitFuncCode` — no leak from the last user function.
+  scopeNames = []
+  scopeSlots = []
+  scopeFrames = []
+  emitLetCursor = 0
+  ctrlDepth = 0
+  loopContDepth = []
+  loopBrkDepth = []
+  let gi = 0
+  while gi < globalStmts.length {
+    if globalIsNonConst(globalStmts[gi]) {
+      let g = P.nodes[globalStmts[gi]]
+      if g is LetDecl {
+        if emitExpr(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+        let setPrev = wTarget(bodyExpr)
+        fbGlobalSet(gi)
+        wTarget(setPrev)
+      }
+    }
+    gi = gi + 1
+  }
+  wTarget(exprPrev)
+
+  let body: i32[] = []
+  // Locals vector: no declared locals, just the (possibly empty) scratch frames.
+  if fbEmitLocalsVec(body, 0) < 0 { return 0 - 1 }
+  appendAll(body, bodyExpr)
+  let endPrev = wTarget(body)
+  fbEnd()                  // 0x0b end (void → void: stack already empty)
+  wTarget(endPrev)
+
+  let outPrev = wTarget(out)
+  wULEB(body.length)
+  wBytes(body)
+  wTarget(outPrev)
+  0
+}
+
 // Emit the complete module for the top-level functions in `fnStmts` (each a FuncDecl,
 // validated by `collectFns`/`buildFnMap`/`checkParams`). If a struct `type` was
 // declared, its WasmGC struct type is emitted FIRST (type index 0) and the functypes
@@ -5564,6 +5826,28 @@ function emitModule(stmts: i32[]): i32 {
   emitHeader()
 
   let n = fnStmts.length
+
+  // ── Start-function model (non-const module-global initializers) ──────────────
+  // A module global whose initializer is NOT a WasmGC constant expression (a member
+  // access like `curBuf = W.bytes`, a reference to another global, a call, …) cannot
+  // be emitted inline in the global section. Its cell is zero-initialized there
+  // (nullable `ref.null` / `i32.const 0`) and a SINGLE synthetic start function — the
+  // LAST function index, so no user index shifts — runs every such init via
+  // `global.set` before any other code. Count them up front; the count drives one
+  // extra `()->()` functype, one extra function-section + code-section entry, and the
+  // start section (id 8). When zero (the case for EVERY golden), nothing below
+  // changes, so the module stays byte-identical.
+  let nNonConst = 0
+  let gci = 0
+  while gci < globalStmts.length {
+    if globalIsNonConst(globalStmts[gci]) { nNonConst = nNonConst + 1 }
+    gci = gci + 1
+  }
+  let hasStart = 0
+  if nNonConst > 0 { hasStart = 1 }
+  // The synthetic start function's index (last, after all `n` user functions) and its
+  // `()->()` functype index (one past the user functypes). Both unused when no start.
+  let startFnIdx = n
 
   // Heap-type indices, in type-section order: standalone structs at 0..ns-1, then
   // (for the union path) the variant structs + box, then the raw i32 array, the
@@ -5602,7 +5886,7 @@ function emitModule(stmts: i32[]): i32 {
   let tyPrev = wTarget(typePayload)
   wU8(1)                                 // one rectype: the rec group
   wU8(78)                                // 0x4e rec group
-  wULEB(n + typeOffset)                  // types inside the rec group
+  wULEB(n + typeOffset + hasStart)       // types inside the rec group (+1 for start fn)
   if sDeclared {
     // One `0x5f` struct per declared type (declaration order = heap-type index),
     // each a struct of its fields in declaration order. A field is `0x7f` i32
@@ -5748,17 +6032,30 @@ function emitModule(stmts: i32[]): i32 {
     }
     ti = ti + 1
   }
+  // The synthetic start function's `()->()` functype (lands at index `typeOffset + n`,
+  // AFTER every user functype — so no user type index shifts and the Phase-G assert is
+  // untouched). `0x60` func, 0 params, 0 results.
+  if hasStart == 1 {
+    wU8(96)                      // 0x60 func
+    wU8(0)                       // 0 params
+    wU8(0)                       // 0 results
+  }
   wTarget(tyPrev)
   wSection(1, typePayload)
 
-  // Function section (id 3): N functions; func i uses functype `typeOffset + i`.
+  // Function section (id 3): N functions; func i uses functype `typeOffset + i`. The
+  // synthetic start function (if any) is the LAST entry — function index `n` — using
+  // the `()->()` functype at index `typeOffset + n`.
   let funcPayload: i32[] = []
   let fnPrev = wTarget(funcPayload)
-  wULEB(n)
+  wULEB(n + hasStart)
   let fi = 0
   while fi < n {
     wULEB(typeOffset + fi)   // functype index
     fi = fi + 1
+  }
+  if hasStart == 1 {
+    wULEB(typeOffset + n)    // start fn functype index
   }
   wTarget(fnPrev)
   wSection(3, funcPayload)
@@ -5786,10 +6083,29 @@ function emitModule(stmts: i32[]): i32 {
         if g.letInit < 0 {
           return emitFail("emitProgram: module global has no initializer")
         }
-        fbValtype(globalKind(g.letInit), structIndexOfExpr(g.letInit, 0 - 1))   // valtype
-        wU8(1)                                         // 0x01 mutable
-        if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
-        fbEnd()                                         // 0x0b end of init expr
+        if globalIsNonConst(globalStmts[gi]) {
+          // A non-constexpr init (`curBuf = W.bytes` — a `global.get`+`struct.get`, a
+          // reference to another global, a call, etc.) cannot be a WasmGC constant
+          // expression. Declare the cell NULLABLE and zero-init it (`i32.const 0` for a
+          // scalar, `ref.null` for a ref); the synthetic start function below runs the
+          // real init via `global.set` before any other code, so reads never see the
+          // zero. The cell stays mutable.
+          let ck = globalCellKind(globalStmts[gi])
+          let cs = globalCellStructIdx(globalStmts[gi])
+          fbValtypeNullable(ck, cs)                     // nullable valtype
+          wU8(1)                                        // 0x01 mutable
+          if ck == 0 {
+            fbI32Const(0)                               // scalar zero
+          } else {
+            fbRefNullForKind(ck, cs)                    // ref.null zero
+          }
+          fbEnd()                                       // 0x0b end of init expr
+        } else {
+          fbValtype(globalKind(g.letInit), structIndexOfExpr(g.letInit, 0 - 1))   // valtype
+          wU8(1)                                         // 0x01 mutable
+          if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
+          fbEnd()                                         // 0x0b end of init expr
+        }
       }
       gi = gi + 1
     }
@@ -5815,15 +6131,32 @@ function emitModule(stmts: i32[]): i32 {
   wTarget(exPrev)
   wSection(7, exportPayload)
 
-  // Code section (id 10): one size-prefixed body per function, in index order.
+  // Start section (id 8): names the function the runtime invokes once at instantiation,
+  // before any export is callable — here the synthetic start fn that runs the non-const
+  // global initializers. Per the section-id order it sits AFTER the export section (7)
+  // and BEFORE the code section (10). Omitted entirely when no non-const global exists
+  // (so EVERY golden, which has only const globals, emits no start section).
+  if hasStart == 1 {
+    let startPayload: i32[] = []
+    let stPrev = wTarget(startPayload)
+    wULEB(startFnIdx)
+    wTarget(stPrev)
+    wSection(8, startPayload)
+  }
+
+  // Code section (id 10): one size-prefixed body per function, in index order, then
+  // (if any) the synthetic start function's body LAST.
   let codePayload: i32[] = []
   let codePrev = wTarget(codePayload)
-  wULEB(n)
+  wULEB(n + hasStart)
   wTarget(codePrev)
   let ci = 0
   while ci < n {
     if emitFuncCode(codePayload, fnStmts[ci]) < 0 { return 0 - 1 }
     ci = ci + 1
+  }
+  if hasStart == 1 {
+    if emitStartFnCode(codePayload) < 0 { return 0 - 1 }
   }
   wSection(10, codePayload)
   0
@@ -6497,6 +6830,7 @@ function fnRetStruct(name: string): boolean {
 
 // True if the parameter `name` of function `fnIx` is the struct type.
 function paramStruct(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -6738,6 +7072,7 @@ function fnRetUnion(name: string): boolean {
 
 // True if the parameter `name` of function `fnIx` is the union type.
 function paramUnion(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -6854,6 +7189,7 @@ function fnRetArray(name: string): boolean {
 
 // True if the parameter `name` of function `fnIx` is an array type.
 function paramArray(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -6978,6 +7314,7 @@ function fnRetRefArray(name: string): boolean {
 
 // True if the parameter `name` of function `fnIx` is a ref-array type.
 function paramRefArray(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -7035,6 +7372,7 @@ function exprRefArray(exprIx: i32, fnIx: i32): boolean {
 // The ref-list ELEMENT type-NAME a ref-array param `name` of function `fnIx` declares
 // (`p: Tok[]` → `Tok`), or "" if not a ref-array param.
 function paramRefArrayName(fnIx: i32, name: string): string {
+  if fnIx < 0 { return "" }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -7229,6 +7567,7 @@ function letAnnRefListSlot(letIx: i32): i32 {
 
 // True if the parameter `name` of function `fnIx` is a `string[]` type.
 function paramStringArray(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -7303,6 +7642,7 @@ function letIsStringArray(letIx: i32, fnIx: i32): boolean {
 
 // True if the parameter `name` of function `fnIx` is a map type.
 function paramMap(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -7563,6 +7903,7 @@ function fnRetString(name: string): boolean {
 
 // True if the parameter `name` of function `fnIx` is `string`-typed.
 function paramString(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
