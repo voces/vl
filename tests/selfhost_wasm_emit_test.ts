@@ -68,6 +68,8 @@ const runFixture = (): Promise<string[]> =>
       `  BinExpr,\n` +
       `  Block,\n` +
       `  BoolLit,\n` +
+      `  BreakStmt,\n` +
+      `  ContinueStmt,\n` +
       `  Call,\n` +
       `  CharLit,\n` +
       `  FieldDef,\n` +

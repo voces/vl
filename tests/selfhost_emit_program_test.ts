@@ -649,6 +649,56 @@ const CASES: Case[] = [
       }
     },
   },
+  // ── break / continue (loop control) ──────────────────────────────────────────
+  // `break` lowers to a `br` out of the loop's wrapping BLOCK; `continue` to a `br`
+  // back to the LOOP header. The asserted result differs from the no-branch value,
+  // so each test would FAIL if the branch were dropped or targeted the wrong depth.
+  {
+    // Without the `break` the loop would run to i==10 and sum 0..9 = 45; the early
+    // exit at i==5 sums only 0..4 = 10. The `break` sits one `if` frame deep, so its
+    // `br` operand must account for that nesting (block at frame-distance 2 here).
+    name: "while loop with a `break` early-exits (sum 0..4 = 10, not 0..9 = 45)",
+    src: [
+      "function main(): i32 {",
+      "  let i = 0",
+      "  let sum = 0",
+      "  while i < 10 {",
+      "    if i == 5 { break }",
+      "    sum = sum + i",
+      "    i = i + 1",
+      "  }",
+      "  return sum",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 10) throw new Error(`main() returned ${got}, expected 10`);
+    },
+  },
+  {
+    // `continue` skips the odd-`i` accumulation: i is bumped FIRST, then evens are
+    // summed. 2+4+6+8+10 = 30. Dropping the `continue` (or mistargeting its `br`)
+    // would sum every i (1..10 = 55) or hang, so 30 proves it branched to the header.
+    name: "while loop with a `continue` skips odd iterations (sum of evens 1..10 = 30)",
+    src: [
+      "function main(): i32 {",
+      "  let i = 0",
+      "  let sum = 0",
+      "  while i < 10 {",
+      "    i = i + 1",
+      "    if i % 2 == 1 { continue }",
+      "    sum = sum + i",
+      "  }",
+      "  return sum",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 30) throw new Error(`main() returned ${got}, expected 30`);
+    },
+  },
   // ── WasmGC structs ─────────────────────────────────────────────────────────
   // A `type` declaration lowers to a GC struct type (type index 0); an object
   // literal lowers to `struct.new`, a field read to `struct.get`. These prove real
