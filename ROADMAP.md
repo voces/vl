@@ -189,6 +189,11 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   (`for-step-zero`), unreachable-after-return / -break / -diverging-if/else. REMAINING:
   - **unused function** — a never-referenced (non-exported) top-level function (today only unused
     variables/params/imports are flagged; functions are excluded via the `kind` guard).
+  - **discarded call result** — a non-void call whose result is silently dropped at statement
+    position (`work()` for an `(): i32`) is likely a bug; warn (with an explicit-discard escape
+    hatch TBD, e.g. `_ = work()`). Codegen correctly emits `drop` today
+    (`tests/cases/statements/discarded-call-return.vl`); eliding a provably-pure dropped call is
+    binaryen `optimize()`'s job, not ours. (Very low priority.)
   - **LSP quick-fixes** (code actions): "remove unused binding" / "prefix with `_`" / "`let`→`const`".
     Diagnostics already carry stable `code`s; the LSP has no code-action provider yet.
   - ✅ **`vl check --fix`** — apply the provably-safe lint fixes from the CLI (`let`→`const`,

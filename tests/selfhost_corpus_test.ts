@@ -22,9 +22,9 @@
 // next rungs (print emission; span threading). For now the whitelist is the subset of
 // corpus files where the VL front end PARSES + TYPE-CHECKS and agrees with the spec.
 //
-// LEDGER: 219 / 422 single-file corpus cases conform — VL's VERDICT matches the
-// spec: 130 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
-// and 89 REJECTED (invalid programs VL refuses — a type error the checker raises,
+// LEDGER: 229 / 422 single-file corpus cases conform — VL's VERDICT matches the
+// spec: 143 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
+// and 86 REJECTED (invalid programs VL refuses — a type error the checker raises,
 // or a lexer/parser syntax error). Every entry is VL behaving CORRECTLY per the
 // directive. (For some advanced `@error` files VL refuses the program because the
 // construct is outside its parser/checker subset — still a correct refusal of an
@@ -36,7 +36,7 @@
 // through the pipeline in isolation (`tests/selfhost/probe_fullsweep.ts`-style) and
 // keeps the agreeing ones. As `typecheck.vl`/`parser.vl` gain coverage, re-sweep and
 // promote newly-agreeing files. A whitelisted file that starts DISAGREEING fails.
-// The count is the conformance ledger. The 203 current DISAGREEMENTS are the work
+// The count is the conformance ledger. The 193 current DISAGREEMENTS are the work
 // left: clean files VL can't yet PARSE (lambdas, generics, if/then/else
 // expressions) and `@error` files VL doesn't yet CATCH (redeclaration, const-reassign).
 
@@ -147,10 +147,23 @@ const WHITELIST = [
   "loops/for-sum.vl",
   "loops/single-line-block.vl",
   "loops/while-sum.vl",
+  "maps/annotated-empty-ok.vl",
+  "maps/basics.vl",
+  "maps/churn-reuse-correct.vl",
+  "maps/delete-distinct-churn.vl",
+  "maps/delete-same-key-churn.vl",
+  "maps/delete.vl",
+  "maps/infer-from-set.vl",
+  "maps/iteration-order.vl",
+  "maps/length-unified.vl",
+  "maps/many-keys.vl",
+  "maps/string-values.vl",
   "objects/equality-function-field.vl",
   "objects/equality.vl",
   "objects/member-call.vl",
   "objects/struct.vl",
+  "sets/basics.vl",
+  "sets/infer-from-add.vl",
   "soundness/README.vl",
   "soundness/boolean-narrowing-if-sound.vl",
   "soundness/equality-array-nested-sound.vl",
@@ -215,9 +228,7 @@ const WHITELIST = [
   "loops/for-in-not-array.vl",
   "maps/error-i32-keyed.vl",
   "maps/error-infer-conflict.vl",
-  "maps/error-no-annotation.vl",
   "maps/error-object-literal-not-map.vl",
-  "maps/error-uninferred.vl",
   "numerics/narrowing-reject.vl",
   "objects/self-method-pollution.vl",
   "objects/trailing-comma-illegal.vl",
@@ -226,7 +237,6 @@ const WHITELIST = [
   "sets/error-infer-conflict.vl",
   "sets/error-no-get.vl",
   "sets/error-no-map-methods.vl",
-  "sets/error-uninferred.vl",
   "soundness/arith-annotated-mismatch.vl",
   "soundness/equality-cross-type-reject.vl",
   "soundness/equality-type-mismatch.vl",
