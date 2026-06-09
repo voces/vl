@@ -3924,6 +3924,22 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
   if c is Call {
     let callee = P.nodes[c.callFn]
     if callee is Ident {
+      // `fromCodePoint(code)` is a compiler builtin (H2): construct a single-character
+      // VL string from an i32 code point. A VL string IS the shared `(array i32)` of
+      // code points (`aTypeIdx`), so this is a length-1 array — push the one i32 arg,
+      // then `array.new_fixed $aTypeIdx 1`. Mirrors toWasm's `fromCodePoint` lowering.
+      // BEFORE the `fnIndexOf` lookup, which would fail ("unknown function").
+      if callee.identName == "fromCodePoint" {
+        if !aUsed {
+          return emitFail("emitProgram: fromCodePoint but array type not collected")
+        }
+        if c.callArgs.length != 1 {
+          return emitFail("emitProgram: fromCodePoint takes exactly one argument")
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        fbArrayNewFixed(aTypeIdx, 1)  // 0xfb 0x08 <typeidx> 1; type shared with i32[]
+        return 0
+      }
       let target = fnIndexOf(callee.identName)
       if target < 0 {
         return emitFail("emitProgram: call to unknown function")
@@ -6407,6 +6423,16 @@ function collectA(stmts: i32[]): i32 {
       }
     } else if nd is StrLit {
       aUsed = true
+    } else if nd is Call {
+      // A `fromCodePoint(code)` call (H2) constructs a length-1 VL string — the shared
+      // `(array i32)` heap type — so it forces `aUsed` just like a string literal, even
+      // in a program with no other string. The callee is a bare `Ident`.
+      let cf = P.nodes[nd.callFn]
+      if cf is Ident {
+        if cf.identName == "fromCodePoint" {
+          aUsed = true
+        }
+      }
     } else if nd is TypeRef {
       if nameIsMap(nd.tyName) {
         // A `{[string]: i32}` annotation (G8) is a string-keyed map: the map struct
@@ -7909,8 +7935,14 @@ function letIsMap(letIx: i32, fnIx: i32): boolean {
 // (this slice covers only literal construction + `.length` + index read), so no
 // binary/call op below produces a string except a `string`-returning call.
 
-// True if the function `name` declares `string` as its return type.
+// True if the function `name` declares `string` as its return type. The `fromCodePoint`
+// compiler builtin (H2) constructs a single-character VL string, so it is `string`-
+// returning too — classifying it here (the single chokepoint `exprString` consults for
+// a named call) routes `value + fromCodePoint(cp)` to string concat, flags
+// `let s = fromCodePoint(n)` as a string local, etc., exactly as a user `string`-
+// returning function would be.
 function fnRetString(name: string): boolean {
+  if name == "fromCodePoint" { return true }
   let i = 0
   while i < fnNames.length {
     if fnNames[i] == name { return fRetStr[i] == 1 }

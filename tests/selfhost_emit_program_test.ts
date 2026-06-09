@@ -4382,6 +4382,82 @@ const CASES: Case[] = [
       if (got !== 10) throw new Error(`f() returned ${got}, expected 10`);
     },
   },
+  // ── `fromCodePoint` compiler builtin (H2) ───────────────────────────────────
+  // `fromCodePoint(code)` constructs a single-character VL string (a length-1
+  // `(array i32)` of the code point) — lowered inline by `emitCall` to the one i32
+  // arg + `array.new_fixed $aTypeIdx 1`, and classified as `string`-returning by
+  // `fnRetString` so concat/return-type/let-typing all treat it as a string. As with
+  // every string case, the property is asserted from VL: `main` folds the string to an
+  // i32 via `.length` or an index read. Bootstrap-critical for the self-host lexer's
+  // escape decoding (`value = value + fromCodePoint(cp)`, `return fromCodePoint(...)`).
+  {
+    name: "H2: `fromCodePoint(65)` is a length-1 string whose [0] is 65 ('A')",
+    src: [
+      "function main(): i32 {",
+      "  let s = fromCodePoint(65)",
+      "  return s.length * 1000 + s[0]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // length 1, [0] == 65 → 1*1000 + 65 = 1065.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1065) throw new Error(`main() returned ${got}, expected 1065`);
+    },
+  },
+  {
+    name: 'H2: concat with `fromCodePoint` (`"" + fromCodePoint(66)`) => length 1, [0]=66',
+    src: [
+      "function main(): i32 {",
+      '  let s = "" + fromCodePoint(66)',
+      "  return s.length * 1000 + s[0]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // proves concat classification: length 1, [0]=='B'==66 → 1066.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1066) throw new Error(`main() returned ${got}, expected 1066`);
+    },
+  },
+  {
+    name:
+      "H2: `fromCodePoint(72) + fromCodePoint(73)` => length 2, [0]=72, [1]=73",
+    src: [
+      "function main(): i32 {",
+      "  let s = fromCodePoint(72) + fromCodePoint(73)",
+      "  return s.length * 1000000 + s[0] * 1000 + s[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // both operands classify as strings → concat: length 2, [0]=72 ('H'), [1]=73 ('I').
+      // 2*1000000 + 72*1000 + 73 = 2072073.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 2072073) {
+        throw new Error(`main() returned ${got}, expected 2072073`);
+      }
+    },
+  },
+  {
+    name:
+      "H2: a helper `return fromCodePoint(90)` is string-returning, called + indexed => 90",
+    src: [
+      "function mk(): string {",
+      "  return fromCodePoint(90)",
+      "}",
+      "function main(): i32 {",
+      "  let s = mk()",
+      "  return s[0]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 'Z' is U+005A = 90; proves the return-type machinery threads the string out.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 90) throw new Error(`main() returned ${got}, expected 90`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
