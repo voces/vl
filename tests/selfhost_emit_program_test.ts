@@ -4847,6 +4847,34 @@ const CASES: Case[] = [
       if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
     },
   },
+  {
+    // REGRESSION (indexed assignment into a STRING list): `xs[i] = s` where `xs: string[]`
+    // must unwrap via the STRING-list wrapper (`mkListIdx`), not the i32-list wrapper —
+    // the `pushNarrow` shape (`narrowNames[i] = name`). emitAssign's index path had no
+    // string-list branch, so it `struct.get`-ed the wrong wrapper type.
+    name: "indexed assignment into a string[] (`xs[i] = s`) validates => 2",
+    src: [
+      "let g: string[] = []",
+      "function setup(): i32 {",
+      "  g.push(\"a\")",
+      "  g.push(\"b\")",
+      "  g[0] = \"zzz\"",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  setup()",
+      "  return g.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // The point is that `g[0] = \"zzz\"` (string-list index store) INSTANTIATES — before
+      // the fix it struct.get-ed the i32-list wrapper and wasm validation rejected it.
+      // g = [\"zzz\", \"b\"] => length 2.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 2) throw new Error(`main() returned ${got}, expected 2`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
