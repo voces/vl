@@ -26,26 +26,21 @@
 // This is the same workaround the AST node arena uses, applied to the type
 // algebra — the predicted gap, now confirmed (PR gap inventory #1).
 //
-// ── Finding 2 — only ONE function may `is`-narrow the Node union ─────────────
-// The natural shape — a `checkExpr` and a `checkStmt` that each `is`-narrow the
-// `Node` union and call each other (or per-variant helpers `checkBinary(n:
-// BinExpr)` that take a narrowed value and recurse back) — MISCOMPILES. Two
-// distinct functions that `is`-narrow the SAME union and are (mutually or self)
-// recursive through it via direct calls between them produce a WasmGC codegen
-// error ("Object has no field …" / "Cannot read properties of undefined"). The
-// trigger is sharpest when a narrowed multi-field variant carrying an unaccessed
-// array field is read. So ALL `Node` discrimination is funnelled into the single
-// recursive `checkNode` function below, with every per-variant body INLINED
-// (including the nested `TypeRef`/`Param`/`Block` narrowing) — no helper ever
-// receives or re-narrows a `Node`. The TYPE-union (`Ty`) helpers (`tyToStr`,
-// `assignable`, …) stay separate: they narrow a DIFFERENT union and so don't
-// collide. (PR gap inventory #2 — this generalizes the parser spike's
-// mutual-recursion findings; it forces an awkward mega-function on any
-// visitor-style pass.)
+// ── Finding 2 (RESOLVED) — the mono-visitor constraint is lifted ─────────────
+// Historically, two distinct functions that `is`-narrowed the SAME union and were
+// mutually recursive through it MISCOMPILED ("Object has no field …"), which forced
+// every per-variant body to be INLINED into the single `checkNode` mega-function.
+// That host bug is FIXED — pinned by `tests/cases/types/union-two-visitors.vl` and
+// `union-narrowed-helper-recursion.vl` — so the visitor is now factored naturally:
+// per-kind helpers (`checkCallNode`, `checkFuncDeclNode`, `checkProgramNode`) take
+// the NARROWED variant as a struct parameter, narrow further `Node` children
+// themselves, and recurse back through `checkNode`. Remaining small arms stay
+// inline in `checkNode` for readability, not out of necessity.
 //
-// All checker state lives in the global `T` (a `Checker` struct), reached the way
-// the parser reaches `P` (a struct-typed value passed into a mutually-recursive
-// group still miscompiles, so the recursive functions read/mutate `T` directly).
+// Checker state lives in the global `T` (a `Checker` struct), like the parser's
+// `P` — a style choice for call-site brevity. (The old struct-param-into-recursive-
+// group miscompile is also fixed, pinned by
+// `tests/cases/functions/struct-param-mutual-recursion-global.vl`.)
 
 // The AST data layer (`compiler/ast.vl`): the global parser state `P` (whose
 // `P.nodes` arena the checker walks), the int→string helper, and every `Node`
@@ -227,11 +222,11 @@ function pushScope(): i32 {
   0
 }
 
-// Leave the innermost scope. GAP: `arr.pop()` in statement position on a
-// STRUCT-FIELD array leaves its return value undropped and fails wasm validation,
-// so the popped scope is captured in a local (`_dropped`) first (PR #4).
+// Leave the innermost scope. (`.pop()` in statement position drops its return
+// value correctly now — the old PR #4 wasm-validation gap is fixed and pinned by
+// `tests/cases/lists/struct-field-pop-statement.vl`.)
 function popScope(): i32 {
-  let _dropped = T.scopes.pop()
+  T.scopes.pop()
   0
 }
 
@@ -578,7 +573,330 @@ function assignable(src: i32, dst: i32): boolean {
   false
 }
 
-// ── the single Node visitor (the ONLY function that `is`-narrows `Node`) ──────
+// ── per-kind helpers (take a NARROWED variant; recurse back through checkNode) ──
+// These helpers receive an already-narrowed `Node` variant as a STRUCT PARAMETER,
+// narrow further `Node` children themselves, and call back into `checkNode` — the
+// exact shape "Finding 2" historically prohibited. The miscompile is fixed in the
+// host (pinned by `tests/cases/types/union-two-visitors.vl` and
+// `union-narrowed-helper-recursion.vl`), so the visitor can be factored naturally.
+
+// A call expression: array-method builtins (`xs.push`), string-method builtins
+// (`.slice`/`.indexOf`/`.includes`/`.charCodeAt`), the `print`/`fromCodePoint`
+// builtins, then the generic function-call path (arity + per-arg assignability).
+function checkCallNode(n: Call, ix: i32): i32 {
+  // Array method call `xs.push(e)`: when the callee is a member access whose
+  // receiver is an array, type it as a builtin (NOT a struct field). Only fires for
+  // an array receiver, so a plain `f(…)` / non-array method falls through.
+  let cfn = P.nodes[n.callFn]
+  if cfn is Member {
+    let recvTy = checkNode(cfn.memObj)
+    let rt = T.tys[recvTy]
+    if rt is TyArray {
+      let margs = n.callArgs
+      if cfn.memProp == "push" {
+        if margs.length != 1 {
+          tErr("push expects 1 argument, got " + i32ToStr(margs.length), ix)
+        } else {
+          let pat = checkNode(margs[0])
+          if !assignable(pat, rt.aElem) {
+            tErr("push: cannot add " + tyToStr(pat) + " to " + tyToStr(recvTy), ix)
+          }
+        }
+        return TY_I32
+      }
+      tErr("no method '." + cfn.memProp + "' on array " + tyToStr(recvTy), ix)
+      return TY_ERR
+    }
+    // String methods: `.slice(i32,i32)->string`, `.indexOf(string)->i32`,
+    // `.includes(string)->bool`, `.charCodeAt(i32)->i32`. (`.length` is a Member,
+    // handled there; `s[i]` is an Index.) Element types are checked.
+    if rt is TyPrim {
+      if rt.primName == "string" {
+        let sp = cfn.memProp
+        let sargs = n.callArgs
+        if sp == "slice" {
+          if sargs.length != 2 {
+            tErr("slice expects 2 arguments, got " + i32ToStr(sargs.length), ix)
+          } else {
+            let s0 = checkNode(sargs[0])
+            let s1 = checkNode(sargs[1])
+            if !assignable(s0, TY_I32) || !assignable(s1, TY_I32) {
+              tErr("slice expects i32 bounds, got " + tyToStr(s0) + " and " + tyToStr(s1), ix)
+            }
+          }
+          return TY_STR
+        }
+        if sp == "indexOf" {
+          if sargs.length != 1 {
+            tErr("indexOf expects 1 argument, got " + i32ToStr(sargs.length), ix)
+          } else {
+            let a0 = checkNode(sargs[0])
+            if !assignable(a0, TY_STR) {
+              tErr("indexOf expects a string, got " + tyToStr(a0), ix)
+            }
+          }
+          return TY_I32
+        }
+        if sp == "includes" {
+          if sargs.length != 1 {
+            tErr("includes expects 1 argument, got " + i32ToStr(sargs.length), ix)
+          } else {
+            let a0 = checkNode(sargs[0])
+            if !assignable(a0, TY_STR) {
+              tErr("includes expects a string, got " + tyToStr(a0), ix)
+            }
+          }
+          return TY_BOOL
+        }
+        if sp == "charCodeAt" {
+          if sargs.length != 1 {
+            tErr("charCodeAt expects 1 argument, got " + i32ToStr(sargs.length), ix)
+          } else {
+            let a0 = checkNode(sargs[0])
+            if !assignable(a0, TY_I32) {
+              tErr("charCodeAt expects an i32 index, got " + tyToStr(a0), ix)
+            }
+          }
+          return TY_I32
+        }
+        tErr("no method '." + sp + "' on string", ix)
+        return TY_ERR
+      }
+    }
+  }
+  // `print(x)` is a compiler builtin (no module/import system yet): it accepts a
+  // single value of any printable type and yields void. Special-cased so a program
+  // that prints does not trip "undeclared identifier 'print'". Each argument is
+  // still checked so a type error inside it surfaces.
+  if cfn is Ident {
+    if cfn.identName == "print" {
+      let pargs = n.callArgs
+      let pj = 0
+      while pj < pargs.length {
+        checkNode(pargs[pj])
+        pj = pj + 1
+      }
+      return TY_VOID
+    }
+    // `fromCodePoint(code)` is a builtin: an i32 code point -> a length-1 string.
+    if cfn.identName == "fromCodePoint" {
+      let fargs = n.callArgs
+      if fargs.length != 1 {
+        tErr("fromCodePoint expects 1 argument, got " + i32ToStr(fargs.length), ix)
+      } else {
+        let f0 = checkNode(fargs[0])
+        if !assignable(f0, TY_I32) {
+          tErr("fromCodePoint expects an i32, got " + tyToStr(f0), ix)
+        }
+      }
+      return TY_STR
+    }
+  }
+  let fnTy = checkNode(n.callFn)
+  let args = n.callArgs
+  let ft = T.tys[fnTy]
+  if ft is TyFunc {
+    let params = ft.fnParamTypes
+    if args.length != params.length {
+      tErr("wrong number of arguments: expected " +
+        i32ToStr(params.length) + ", got " + i32ToStr(args.length), ix)
+      return ft.fnRet
+    }
+    let i = 0
+    while i < args.length {
+      let at = checkNode(args[i])
+      if !assignable(at, params[i]) {
+        tErr("argument " + i32ToStr(i + 1) + ": expected " +
+          tyToStr(params[i]) + ", got " + tyToStr(at), ix)
+      }
+      i = i + 1
+    }
+    return ft.fnRet
+  }
+  if ft is TyErr {
+    return TY_ERR
+  }
+  tErr("called value is not a function (" + tyToStr(fnTy) + ")", ix)
+  TY_ERR
+}
+
+// A function declaration: resolve param/return annotations (narrowing the Param/
+// TypeRef children), bind the signature, and check the body in a fresh scope.
+function checkFuncDeclNode(n: FuncDecl): i32 {
+  let params = n.fnParams
+  let paramTys: i32[] = []
+  let pi = 0
+  while pi < params.length {
+    let pNode = P.nodes[params[pi]]
+    let pt = TY_ERR
+    if pNode is Param {
+      if pNode.parType >= 0 {
+        let ptn = P.nodes[pNode.parType]
+        if ptn is TypeRef {
+          pt = nameToTy(ptn.tyName)
+          if pt < 0 {
+            tErr("unknown type '" + ptn.tyName + "'", pNode.parType)
+            pt = TY_ERR
+          }
+        }
+      } else {
+        tErr("parameter needs a type annotation", params[pi])
+      }
+    }
+    paramTys.push(pt)
+    pi = pi + 1
+  }
+  // Resolve the return-type annotation.
+  let ret = TY_VOID
+  if n.fnRet >= 0 {
+    let rtn = P.nodes[n.fnRet]
+    if rtn is TypeRef {
+      ret = nameToTy(rtn.tyName)
+      if ret < 0 {
+        tErr("unknown type '" + rtn.tyName + "'", n.fnRet)
+        ret = TY_ERR
+      }
+    }
+  }
+  // `f` is hoisted in the outer scope (checkProgram pre-pass), but re-declaring
+  // it here covers nested function decls and is an idempotent rebind otherwise.
+  declare(n.fnName, mkFuncTy(paramTys, ret))
+  // Check the body in a fresh scope sharing the parameters.
+  pushScope()
+  let savedRet = T.curRet
+  T.curRet = ret
+  let dj = 0
+  while dj < params.length {
+    let pNode2 = P.nodes[params[dj]]
+    if pNode2 is Param {
+      declare(pNode2.parName, paramTys[dj])
+    }
+    dj = dj + 1
+  }
+  let body = P.nodes[n.fnBody]
+  if body is Block {
+    let stmts = body.blkStmts
+    let s = 0
+    while s < stmts.length {
+      checkNode(stmts[s])
+      s = s + 1
+    }
+  }
+  T.curRet = savedRet
+  popScope()
+  TY_VOID
+}
+
+// The program root: pass 0 registers `type` declarations (structs, then unions over
+// them), pass 1 hoists function signatures (call-before-decl + mutual recursion),
+// pass 2 checks every top-level statement.
+function checkProgramNode(n: Program): i32 {
+  let stmts = n.progStmts
+  // Pass 0: register top-level struct `type` declarations BEFORE anything else, so
+  // a struct name in a param/return/let annotation (pass 1/2) or in a later struct's
+  // field resolves via `nameToTy`. Types register in source order, so a field may
+  // reference an EARLIER struct; a forward reference to a later struct reports
+  // "unknown type" (deferred).
+  let ti = 0
+  while ti < stmts.length {
+    let sd = P.nodes[stmts[ti]]
+    if sd is TypeDecl {
+      let dfields = sd.tdFields
+      let fnames: string[] = []
+      let ftys: i32[] = []
+      let fi = 0
+      while fi < dfields.length {
+        let fd = P.nodes[dfields[fi]]
+        if fd is FieldDef {
+          fnames.push(fd.fdName)
+          let fty = TY_ERR
+          if fd.fdType >= 0 {
+            let ftn = P.nodes[fd.fdType]
+            if ftn is TypeRef {
+              let r = nameToTy(ftn.tyName)
+              if r >= 0 {
+                fty = r
+              } else {
+                tErr("unknown type '" + ftn.tyName + "' for field '" +
+                  fd.fdName + "'", dfields[fi])
+              }
+            }
+          }
+          ftys.push(fty)
+        }
+        fi = fi + 1
+      }
+      T.userTypes[sd.tdName] = mkObjTy(fnames, ftys)
+    } else if sd is UnionDecl {
+      // A union's variants are type NAMES; resolve each (its variant structs
+      // register earlier in source order) into the member type-arena indices.
+      let variants = sd.udVariants
+      let members: i32[] = []
+      let vi = 0
+      while vi < variants.length {
+        let m = nameToTy(variants[vi])
+        if m >= 0 {
+          members.push(m)
+        } else {
+          tErr("unknown type '" + variants[vi] + "' in union '" +
+            sd.udName + "'", stmts[ti])
+        }
+        vi = vi + 1
+      }
+      T.userTypes[sd.udName] = mkUnionTy(members)
+    }
+    ti = ti + 1
+  }
+  // Pass 1: hoist top-level function signatures so call-before-decl and mutual
+  // recursion type-check.
+  let hi = 0
+  while hi < stmts.length {
+    let s = P.nodes[stmts[hi]]
+    if s is FuncDecl {
+      let hp = s.fnParams
+      let hpt: i32[] = []
+      let k = 0
+      while k < hp.length {
+        let hpn = P.nodes[hp[k]]
+        let t = TY_ERR
+        if hpn is Param {
+          if hpn.parType >= 0 {
+            let hptn = P.nodes[hpn.parType]
+            if hptn is TypeRef {
+              let r = nameToTy(hptn.tyName)
+              if r >= 0 {
+                t = r
+              }
+            }
+          }
+        }
+        hpt.push(t)
+        k = k + 1
+      }
+      let hret = TY_VOID
+      if s.fnRet >= 0 {
+        let hrtn = P.nodes[s.fnRet]
+        if hrtn is TypeRef {
+          let r = nameToTy(hrtn.tyName)
+          if r >= 0 {
+            hret = r
+          }
+        }
+      }
+      declare(s.fnName, mkFuncTy(hpt, hret))
+    }
+    hi = hi + 1
+  }
+  // Pass 2: check every top-level statement (bodies included).
+  let j = 0
+  while j < stmts.length {
+    checkNode(stmts[j])
+    j = j + 1
+  }
+  TY_VOID
+}
+
+// ── the Node visitor (dispatch; per-kind helpers above take narrowed variants) ──
 // `checkNode` dispatches EVERY node kind — expressions AND statements — and
 // returns the node's type-arena index (statements yield `TY_VOID`). Every
 // per-variant body is INLINED here, including the nested `TypeRef`/`Param`/`Block`
@@ -689,141 +1007,7 @@ function checkNode(ix: i32): i32 {
 
   // ── call ──────────────────────────────────────────────────────────────────
   } else if n is Call {
-    // Array method call `xs.push(e)`: when the callee is a member access whose
-    // receiver is an array, type it as a builtin (NOT a struct field). Reads the
-    // Member callee INLINE (mono-visitor); only fires for an array receiver, so a
-    // plain `f(…)` / non-array method falls through to the generic path below.
-    let cfn = P.nodes[n.callFn]
-    if cfn is Member {
-      let recvTy = checkNode(cfn.memObj)
-      let rt = T.tys[recvTy]
-      if rt is TyArray {
-        let margs = n.callArgs
-        if cfn.memProp == "push" {
-          if margs.length != 1 {
-            tErr("push expects 1 argument, got " + i32ToStr(margs.length), ix)
-          } else {
-            let pat = checkNode(margs[0])
-            if !assignable(pat, rt.aElem) {
-              tErr("push: cannot add " + tyToStr(pat) + " to " + tyToStr(recvTy), ix)
-            }
-          }
-          return TY_I32
-        }
-        tErr("no method '." + cfn.memProp + "' on array " + tyToStr(recvTy), ix)
-        return TY_ERR
-      }
-      // String methods: `.slice(i32,i32)->string`, `.indexOf(string)->i32`,
-      // `.includes(string)->bool`, `.charCodeAt(i32)->i32`. (`.length` is a Member,
-      // handled there; `s[i]` is an Index.) Element types are checked.
-      if rt is TyPrim {
-        if rt.primName == "string" {
-          let sp = cfn.memProp
-          let sargs = n.callArgs
-          if sp == "slice" {
-            if sargs.length != 2 {
-              tErr("slice expects 2 arguments, got " + i32ToStr(sargs.length), ix)
-            } else {
-              let s0 = checkNode(sargs[0])
-              let s1 = checkNode(sargs[1])
-              if !assignable(s0, TY_I32) || !assignable(s1, TY_I32) {
-                tErr("slice expects i32 bounds, got " + tyToStr(s0) + " and " + tyToStr(s1), ix)
-              }
-            }
-            return TY_STR
-          }
-          if sp == "indexOf" {
-            if sargs.length != 1 {
-              tErr("indexOf expects 1 argument, got " + i32ToStr(sargs.length), ix)
-            } else {
-              let a0 = checkNode(sargs[0])
-              if !assignable(a0, TY_STR) {
-                tErr("indexOf expects a string, got " + tyToStr(a0), ix)
-              }
-            }
-            return TY_I32
-          }
-          if sp == "includes" {
-            if sargs.length != 1 {
-              tErr("includes expects 1 argument, got " + i32ToStr(sargs.length), ix)
-            } else {
-              let a0 = checkNode(sargs[0])
-              if !assignable(a0, TY_STR) {
-                tErr("includes expects a string, got " + tyToStr(a0), ix)
-              }
-            }
-            return TY_BOOL
-          }
-          if sp == "charCodeAt" {
-            if sargs.length != 1 {
-              tErr("charCodeAt expects 1 argument, got " + i32ToStr(sargs.length), ix)
-            } else {
-              let a0 = checkNode(sargs[0])
-              if !assignable(a0, TY_I32) {
-                tErr("charCodeAt expects an i32 index, got " + tyToStr(a0), ix)
-              }
-            }
-            return TY_I32
-          }
-          tErr("no method '." + sp + "' on string", ix)
-          return TY_ERR
-        }
-      }
-    }
-    // `print(x)` is a compiler builtin (no module/import system yet): it accepts a
-    // single value of any printable type and yields void. Special-cased so a program
-    // that prints does not trip "undeclared identifier 'print'". Each argument is
-    // still checked so a type error inside it surfaces.
-    if cfn is Ident {
-      if cfn.identName == "print" {
-        let pargs = n.callArgs
-        let pj = 0
-        while pj < pargs.length {
-          checkNode(pargs[pj])
-          pj = pj + 1
-        }
-        return TY_VOID
-      }
-      // `fromCodePoint(code)` is a builtin: an i32 code point -> a length-1 string.
-      if cfn.identName == "fromCodePoint" {
-        let fargs = n.callArgs
-        if fargs.length != 1 {
-          tErr("fromCodePoint expects 1 argument, got " + i32ToStr(fargs.length), ix)
-        } else {
-          let f0 = checkNode(fargs[0])
-          if !assignable(f0, TY_I32) {
-            tErr("fromCodePoint expects an i32, got " + tyToStr(f0), ix)
-          }
-        }
-        return TY_STR
-      }
-    }
-    let fnTy = checkNode(n.callFn)
-    let args = n.callArgs
-    let ft = T.tys[fnTy]
-    if ft is TyFunc {
-      let params = ft.fnParamTypes
-      if args.length != params.length {
-        tErr("wrong number of arguments: expected " +
-          i32ToStr(params.length) + ", got " + i32ToStr(args.length), ix)
-        return ft.fnRet
-      }
-      let i = 0
-      while i < args.length {
-        let at = checkNode(args[i])
-        if !assignable(at, params[i]) {
-          tErr("argument " + i32ToStr(i + 1) + ": expected " +
-            tyToStr(params[i]) + ", got " + tyToStr(at), ix)
-        }
-        i = i + 1
-      }
-      return ft.fnRet
-    }
-    if ft is TyErr {
-      return TY_ERR
-    }
-    tErr("called value is not a function (" + tyToStr(fnTy) + ")", ix)
-    return TY_ERR
+    return checkCallNode(n, ix)
 
   // ── member access ───────────────────────────────────────────────────────────
   } else if n is Member {
@@ -977,69 +1161,7 @@ function checkNode(ix: i32): i32 {
 
   // ── function declaration ─────────────────────────────────────────────────────
   } else if n is FuncDecl {
-    // Resolve parameter types (reading each Param + its TypeRef child INLINE).
-    let params = n.fnParams
-    let paramTys: i32[] = []
-    let pi = 0
-    while pi < params.length {
-      let pNode = P.nodes[params[pi]]
-      let pt = TY_ERR
-      if pNode is Param {
-        if pNode.parType >= 0 {
-          let ptn = P.nodes[pNode.parType]
-          if ptn is TypeRef {
-            pt = nameToTy(ptn.tyName)
-            if pt < 0 {
-              tErr("unknown type '" + ptn.tyName + "'", pNode.parType)
-              pt = TY_ERR
-            }
-          }
-        } else {
-          tErr("parameter needs a type annotation", params[pi])
-        }
-      }
-      paramTys.push(pt)
-      pi = pi + 1
-    }
-    // Resolve the return-type annotation (INLINE).
-    let ret = TY_VOID
-    if n.fnRet >= 0 {
-      let rtn = P.nodes[n.fnRet]
-      if rtn is TypeRef {
-        ret = nameToTy(rtn.tyName)
-        if ret < 0 {
-          tErr("unknown type '" + rtn.tyName + "'", n.fnRet)
-          ret = TY_ERR
-        }
-      }
-    }
-    // `f` is hoisted in the outer scope (checkProgram pre-pass), but re-declaring
-    // it here covers nested function decls and is an idempotent rebind otherwise.
-    declare(n.fnName, mkFuncTy(paramTys, ret))
-    // Check the body in a fresh scope sharing the parameters.
-    pushScope()
-    let savedRet = T.curRet
-    T.curRet = ret
-    let dj = 0
-    while dj < params.length {
-      let pNode2 = P.nodes[params[dj]]
-      if pNode2 is Param {
-        declare(pNode2.parName, paramTys[dj])
-      }
-      dj = dj + 1
-    }
-    let body = P.nodes[n.fnBody]
-    if body is Block {
-      let stmts = body.blkStmts
-      let s = 0
-      while s < stmts.length {
-        checkNode(stmts[s])
-        s = s + 1
-      }
-    }
-    T.curRet = savedRet
-    popScope()
-    return TY_VOID
+    return checkFuncDeclNode(n)
 
   // ── while ─────────────────────────────────────────────────────────────────
   } else if n is WhileStmt {
@@ -1163,109 +1285,7 @@ function checkNode(ix: i32): i32 {
 
   // ── program ───────────────────────────────────────────────────────────────
   } else if n is Program {
-    let stmts = n.progStmts
-    // Pass 0: register top-level struct `type` declarations BEFORE anything else, so
-    // a struct name in a param/return/let annotation (pass 1/2) or in a later struct's
-    // field resolves via `nameToTy`. Reads TypeDecl + FieldDef + TypeRef INLINE. Types
-    // register in source order, so a field may reference an EARLIER struct; a forward
-    // reference to a later struct reports "unknown type" (deferred).
-    let ti = 0
-    while ti < stmts.length {
-      let sd = P.nodes[stmts[ti]]
-      if sd is TypeDecl {
-        let dfields = sd.tdFields
-        let fnames: string[] = []
-        let ftys: i32[] = []
-        let fi = 0
-        while fi < dfields.length {
-          let fd = P.nodes[dfields[fi]]
-          if fd is FieldDef {
-            fnames.push(fd.fdName)
-            let fty = TY_ERR
-            if fd.fdType >= 0 {
-              let ftn = P.nodes[fd.fdType]
-              if ftn is TypeRef {
-                let r = nameToTy(ftn.tyName)
-                if r >= 0 {
-                  fty = r
-                } else {
-                  tErr("unknown type '" + ftn.tyName + "' for field '" +
-                    fd.fdName + "'", dfields[fi])
-                }
-              }
-            }
-            ftys.push(fty)
-          }
-          fi = fi + 1
-        }
-        T.userTypes[sd.tdName] = mkObjTy(fnames, ftys)
-      } else if sd is UnionDecl {
-        // A union's variants are type NAMES; resolve each (its variant structs
-        // register earlier in source order) into the member type-arena indices.
-        let variants = sd.udVariants
-        let members: i32[] = []
-        let vi = 0
-        while vi < variants.length {
-          let m = nameToTy(variants[vi])
-          if m >= 0 {
-            members.push(m)
-          } else {
-            tErr("unknown type '" + variants[vi] + "' in union '" +
-              sd.udName + "'", stmts[ti])
-          }
-          vi = vi + 1
-        }
-        T.userTypes[sd.udName] = mkUnionTy(members)
-      }
-      ti = ti + 1
-    }
-    // Pass 1: hoist top-level function signatures so call-before-decl and mutual
-    // recursion type-check. Reads FuncDecl + its Param/TypeRef children INLINE.
-    let hi = 0
-    while hi < stmts.length {
-      let s = P.nodes[stmts[hi]]
-      if s is FuncDecl {
-        let hp = s.fnParams
-        let hpt: i32[] = []
-        let k = 0
-        while k < hp.length {
-          let hpn = P.nodes[hp[k]]
-          let t = TY_ERR
-          if hpn is Param {
-            if hpn.parType >= 0 {
-              let hptn = P.nodes[hpn.parType]
-              if hptn is TypeRef {
-                let r = nameToTy(hptn.tyName)
-                if r >= 0 {
-                  t = r
-                }
-              }
-            }
-          }
-          hpt.push(t)
-          k = k + 1
-        }
-        let hret = TY_VOID
-        if s.fnRet >= 0 {
-          let hrtn = P.nodes[s.fnRet]
-          if hrtn is TypeRef {
-            let r = nameToTy(hrtn.tyName)
-            if r >= 0 {
-              hret = r
-            }
-          }
-        }
-        declare(s.fnName, mkFuncTy(hpt, hret))
-      }
-      hi = hi + 1
-    }
-    // Pass 2: check every top-level statement (bodies included).
-    let j = 0
-    while j < stmts.length {
-      checkNode(stmts[j])
-      j = j + 1
-    }
-    return TY_VOID
+    return checkProgramNode(n)
 
   } else if n is Param {
     return TY_VOID
@@ -1283,16 +1303,11 @@ function checkNode(ix: i32): i32 {
 
 // The public entry point: check the program rooted at node `rootIx`, returning
 // the number of diagnostics raised (diagnostics also accumulate on `T.diags`).
-//
-// GAP (PR #5): the caller MUST consume this return value in an expression
-// position, e.g. `print(i32ToStr(checkProgram(root)))`. Calling it as a bare
-// statement — or even binding it with `let r = checkProgram(root)` — trips a
-// codegen "Expected numeric type" once the module is large enough (the parser +
-// the big `checkNode` + the `Ty` helpers). Consuming the result directly in a
-// builtin call is the only form that compiles. This is the same family as the
-// undropped-`.pop()`-value bug (#4): a discarded/indirected call return is
-// mis-lowered at module scale.
+// (The old PR #5 gap — a discarded/`let`-bound call return mis-lowering at module
+// scale, which forced callers into expression position — is fixed and pinned by
+// `tests/cases/statements/discarded-call-return.vl`; the discarded `checkNode`
+// below exercises it in this very module.)
 export function checkProgram(rootIx: i32): i32 {
-  let _root = checkNode(rootIx)
+  checkNode(rootIx)
   T.diags.length
 }
