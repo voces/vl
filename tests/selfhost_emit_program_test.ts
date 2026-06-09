@@ -2366,6 +2366,91 @@ const CASES: Case[] = [
       if (got !== 32) throw new Error(`main() returned ${got}, expected 32`);
     },
   },
+  // ── global-list `.push`: a bare module-GLOBAL list ident as the receiver ─────
+  // `curBuf.push(byte)` where `curBuf` is a module-global `i32[]` — the core writer
+  // append op. The receiver resolves via the existing Ident→global read (`global.get`
+  // + `ref.as_non_null` for the non-const cell) materialized into the push frame's
+  // `recvRef` scratch slot; pushing through that scratch mutates the global's wrapper
+  // (and growth swaps its backing) IN PLACE, so no write-back to the global is needed.
+  {
+    name:
+      "global-push: i32-list global pushed in a helper, length read in main => 3",
+    src: [
+      "let buf: i32[] = []",
+      "function w(x: i32): i32 {",
+      "  buf.push(x)",
+      "  return buf.length",
+      "}",
+      "function main(): i32 {",
+      "  w(10)",
+      "  w(20)",
+      "  w(30)",
+      "  return buf.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // Three pushes onto the SAME global wrapper across calls: length === 3, proving
+      // the helper's push mutated the global (not a local copy).
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
+  {
+    name:
+      "global-push: i32-list global, first pushed element read back => 10",
+    src: [
+      "let buf: i32[] = []",
+      "function w(x: i32): i32 {",
+      "  buf.push(x)",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  w(10)",
+      "  w(20)",
+      "  return buf[0]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // buf[0] is the FIRST pushed value, proving the append wrote into the global's
+      // backing through the scratch ref (and survived a growth realloc).
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 10) throw new Error(`main() returned ${got}, expected 10`);
+    },
+  },
+  {
+    name:
+      "global-push: a function pushing to BOTH a global list and a LOCAL list => 11",
+    src: [
+      "let g: i32[] = []",
+      "function f(x: i32): i32 {",
+      "  let loc: i32[] = []",
+      "  g.push(x)",
+      "  loc.push(x + 1)",
+      "  return g[0] + loc[0]",
+      "}",
+      "function main(): i32 {",
+      "  return f(5)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // Mixed receivers in one function: the global push (g[0]=5) and the local push
+      // (loc[0]=6) both work => 5 + 6 = 11. Proves the global branch didn't break the
+      // bare-local path and both share the one i32 push frame correctly.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 11) throw new Error(`main() returned ${got}, expected 11`);
+    },
+  },
+  // NOTE: string-list / ref-list module globals are NOT covered here because a const
+  // empty `[]` (or even a non-empty `string[]`/`T[]`) global is currently typed by
+  // `globalKind` as an i32-list wrapper (it is not annotation-aware) — a SEPARATE,
+  // pre-existing const-global typing gap, independent of the push-receiver shape. The
+  // push lowering itself is kind-generic (`exprStringArray`/`exprRefArray` now classify
+  // global idents, and `refListSlotOfExpr` resolves a global ref-list element via
+  // `globalRefArrayName`), so once those globals can be emitted with the correct wrapper
+  // type, string/ref global pushes will work with no further change to `emitPush`.
   // ── G7-ref: ref-element growable lists (arrays of structs / unions) ─────────
   // A growable list whose ELEMENT is a reference — `T[]` (a struct ref) or `N[]`
   // (the union box ref) — reuses the `{ backing, len, cap }` wrapper, but its backing

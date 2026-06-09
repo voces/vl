@@ -662,6 +662,11 @@ function globalIsRefArray(name: string): boolean {
   if li < 0 { return false }
   letIsRefArray(li, 0 - 1)
 }
+function globalIsStringArray(name: string): boolean {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsStringArray(li, 0 - 1)
+}
 
 // Map each function NAME to its wasm function index (its position in `fnStmts`), and
 // record whether it returns the struct. Returns the function count.
@@ -4163,7 +4168,19 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
       if recv is Ident {
         lIdx = localIndexOf(fnIx, recv.identName)
         if lIdx < 0 {
-          return emitFail("emitProgram: .push receiver is not a list local")
+          // Not a local — a module-GLOBAL list ident? Materialize its wrapper ref into
+          // the `recvRef` scratch slot (`base + 3`), IDENTICALLY to the Member path:
+          // `emitExpr` on the receiver runs the existing Ident→global read (`global.get`
+          // + `ref.as_non_null` for a non-const ref cell). Because the list wrapper is
+          // mutated IN PLACE by reference, pushing through the scratch local also mutates
+          // the global's list — and growth swaps the backing on the shared wrapper — so
+          // no write-back to the global is needed.
+          if globalIndexOf(recv.identName) < 0 {
+            return emitFail("emitProgram: .push receiver is not a list local")
+          }
+          if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+          fbLocalSet(base + 3)   // local.set recvRef
+          lIdx = base + 3
         }
       } else if recv is Member {
         if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
@@ -7606,7 +7623,8 @@ function exprStringArray(exprIx: i32, fnIx: i32): boolean {
   if e is Paren { return exprStringArray(e.parInner, fnIx) }
   if e is Ident {
     if paramStringArray(fnIx, e.identName) { return true }
-    return declaredStringArray(e.identName)
+    if declaredStringArray(e.identName) { return true }
+    return globalIsStringArray(e.identName)
   }
   // A field read `p.names` whose field is a `string[]` (code `6`) yields the string-list
   // wrapper ref — so `.length` / indexing / assignment / `.push` treat it as a string list.
