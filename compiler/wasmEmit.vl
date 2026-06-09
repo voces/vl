@@ -797,6 +797,116 @@ function computeVoidFns(): i32 {
   0
 }
 
+// The arena index of the expression an UN-ANNOTATED function returns: the body's
+// trailing tail-value statement, or the first valued `return`'s argument (walking
+// into if/while/for bodies). -1 when the function yields nothing (void).
+function fnRetExprOf(fnIx: i32): i32 {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let b = P.nodes[fn.fnBody]
+    if b is Block {
+      let stmts = b.blkStmts
+      if stmts.length > 0 {
+        let last = stmts[stmts.length - 1]
+        if stmtIsTailValue(last) {
+          return last
+        }
+      }
+    }
+    return firstValuedReturn(fn.fnBody)
+  }
+  0 - 1
+}
+
+function firstValuedReturn(blockIx: i32): i32 {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let st = P.nodes[stmts[i]]
+      if st is RetStmt {
+        if st.retArg >= 0 { return st.retArg }
+      } else if st is IfStmt {
+        let r = firstValuedReturnIf(stmts[i])
+        if r >= 0 { return r }
+      } else if st is WhileStmt {
+        let r = firstValuedReturn(st.whileBody)
+        if r >= 0 { return r }
+      } else if st is ForRange {
+        let r = firstValuedReturn(st.frBody)
+        if r >= 0 { return r }
+      }
+      i = i + 1
+    }
+  }
+  0 - 1
+}
+
+function firstValuedReturnIf(ifIx: i32): i32 {
+  let st = P.nodes[ifIx]
+  if st is IfStmt {
+    let r = firstValuedReturn(st.ifThen)
+    if r >= 0 { return r }
+    if st.ifElse >= 0 {
+      let els = P.nodes[st.ifElse]
+      if els is Block {
+        return firstValuedReturn(st.ifElse)
+      }
+      if els is IfStmt {
+        return firstValuedReturnIf(st.ifElse)
+      }
+    }
+  }
+  0 - 1
+}
+
+// Infer the RETURN KIND of every un-annotated, non-void function from its return
+// expression, SETTING the same fRet* tables the annotation path fills — so the
+// functype result valtype AND every call-site classification (exprString's Call
+// case reads fRetStr, …) follow from one place. Iterated to a fixed point like
+// voidness: `function outer() { return inner() }` needs inner's inferred kind.
+function computeRetInference(): i32 {
+  let changed = true
+  while changed {
+    changed = false
+    let i = 0
+    while i < fnStmts.length {
+      let fn = P.nodes[fnStmts[i]]
+      if fn is FuncDecl {
+        if fn.fnRet < 0 && fRetVoid[i] == 0 {
+          let rx = fnRetExprOf(fnStmts[i])
+          if rx >= 0 {
+            if fRetStr[i] == 0 && exprString(rx, fnStmts[i]) {
+              fRetStr[i] = 1
+              changed = true
+            }
+            if fRetRArr[i] == 0 && exprRefArray(rx, fnStmts[i]) {
+              fRetRArr[i] = 1
+              changed = true
+            }
+            if fRetArr[i] == 0 && exprArray(rx, fnStmts[i]) {
+              fRetArr[i] = 1
+              changed = true
+            }
+            if fRetUni[i] == 0 && exprUnion(rx, fnStmts[i]) {
+              fRetUni[i] = 1
+              changed = true
+            }
+            if fRetRef[i] == 0 && exprStruct(rx, fnStmts[i]) {
+              fRetRef[i] = 1
+              fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
+              changed = true
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
 // Look up the wasm function index for `name`, or -1 if no such top-level function
 // exists (an undefined callee — the caller fails loudly).
 function fnIndexOf(name: string): i32 {
@@ -1968,6 +2078,16 @@ function exprHasStrOp(exprIx: i32, fnIx: i32): boolean {
   }
   if e is Call {
     if exprIsStrSlice(exprIx, fnIx) { return true }
+    // `print(<string>)` rides the string-op scratch frame (the streaming loop's
+    // string ref + cursor + length live there).
+    let pcal = P.nodes[e.callFn]
+    if pcal is Ident {
+      if pcal.identName == "print" {
+        if e.callArgs.length == 1 {
+          if exprString(e.callArgs[0], fnIx) { return true }
+        }
+      }
+    }
     if exprHasStrOp(e.callFn, fnIx) { return true }
     let args = e.callArgs
     let i = 0
@@ -4176,7 +4296,40 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
           return emitFail("emitProgram: print takes exactly one argument")
         }
         if exprString(c.callArgs[0], fnIx) {
-          return emitFail("emitProgram: print(string) is not emittable yet")
+          // print(string): stream each code point through __print_char__ (import 2),
+          // then one __print_str_flush__ (import 3) — the host's streaming contract.
+          // Rides the string-op scratch frame: A = the string ref, I0 = cursor,
+          // I1 = length (`fnUsesStrOp` is forced by the print-detection walkers).
+          if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+          fbLocalSet(strScratchBase + 0)   // strScrA = the string
+          fbI32Const(0)
+          setStrScrI(body, 0)              // I0 = 0
+          pushStrScrRef(body, 0)
+          fbArrayLen()                     // array.len
+          setStrScrI(body, 1)              // I1 = len
+          fbBlock(64)                      // block (void)
+          ctrlEnter()
+          fbLoop(64)                       // loop (void)
+          ctrlEnter()
+          pushStrScrI(body, 0)
+          pushStrScrI(body, 1)
+          fbI32Bin(78)                     // 0x4e i32.ge_s — cursor >= len?
+          fbBrIf(1)                        // exit
+          pushStrScrRef(body, 0)
+          pushStrScrI(body, 0)
+          fbArrayGet(aTypeIdx)             // array.get -> the code point
+          fbCall(2)                        // __print_char__
+          pushStrScrI(body, 0)
+          fbI32Const(1)
+          fbI32Bin(106)                    // i32.add
+          setStrScrI(body, 0)              // I0++
+          fbBr(0)
+          fbEnd()                          // end loop
+          ctrlLeave()
+          fbEnd()                          // end block
+          ctrlLeave()
+          fbCall(3)                        // __print_str_flush__
+          return 0
         }
         if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
         if exprIsBool(c.callArgs[0], fnIx) {
@@ -6693,6 +6846,21 @@ function emitModule(stmts: i32[]): i32 {
       }
       if fRetVoid[ti] == 1 {
         wU8(0)                   // 0 results — a VOID function (`()->()`)
+      } else if fn.fnRet < 0 {
+        // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
+        // fRet* tables the annotation path fills). i32 when nothing matched.
+        wU8(1)                   // 1 result
+        let infKind = 0
+        let infSlot = 0 - 1
+        if fRetStr[ti] == 1 { infKind = 3 }
+        if fRetArr[ti] == 1 { infKind = 2 }
+        if fRetUni[ti] == 1 { infKind = 4 }
+        if fRetRef[ti] == 1 {
+          infKind = 1
+          infSlot = fRetStructIdx[ti]
+        }
+        if fRetRArr[ti] == 1 { infKind = 5 }
+        fbValtype(infKind, infSlot)
       } else {
         wU8(1)                   // 1 result
         // A `T[]` return is kind 5 — its second `fbValtype` arg is the ref-list TABLE
@@ -8791,6 +8959,7 @@ function emitProgram(rootIx: i32): i32 {
     }
     if buildFnMap(stmts) < 0 { return 0 - 1 }
     computeVoidFns()
+    computeRetInference()
     // Detect `print(...)` anywhere in the program: any use pulls in the 4-import
     // print family (imports shift every local function's wasm index, so this is
     // decided up front; a print-free program emits no import section at all).
