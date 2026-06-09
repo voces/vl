@@ -317,3 +317,13 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   (which would duplicate scope/shadowing logic and drift from the checker).
   Position-indexed, single-document; cross-file and builtins are out of scope.
   (D2)
+
+## Assignment is an expression yielding its right-hand side
+
+`x = e` evaluates to `e`'s value (so `b = (a = 5)` gives 5, `while (line = next()) != ""`
+works, and a function whose trailing statement is an assignment returns the assigned value
+via the trailing-expression rule — `function bump() { count = count + 1 }` returns the new
+count). Confirmed deliberate (2026-06): the classic `if (x = 5)` C foot-gun is mostly
+defused by VL's mandatory-`bool` conditions; the residual hole — `if x = true` with a
+boolean `x` — is handled by LINT, not semantics (an assignment whose RHS is a LITERAL in
+condition position warns; see ROADMAP B17), keeping the expression semantics uniform.
