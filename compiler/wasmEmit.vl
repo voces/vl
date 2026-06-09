@@ -1908,24 +1908,25 @@ function sFieldRefSlot(si: i32, fi: i32): i32 {
 // referenced wrapper types are interned in the SAME rec group (forced present by
 // `collectA`), so the forward index resolves. Used by the type-section struct emission.
 // For a ref-list field (code 5) `refSlot` is the field's per-element-type table slot
-// (its wrapper is `rlWrapIdx[refSlot]`); ignored for other codes.
-function pushFieldStorage(out: i32[], code: i32, refSlot: i32): i32 {
+// (its wrapper is `rlWrapIdx[refSlot]`); ignored for other codes. Streams to the
+// current target (`curBuf`) — the caller binds it at the type-section payload.
+function pushFieldStorage(code: i32, refSlot: i32): i32 {
   if code == 3 {
-    out.push(100)              // 0x64 (ref ht) — non-null string ref
-    appendAll(out, ulebToArr(aTypeIdx))
+    wU8(100)                   // 0x64 (ref ht) — non-null string ref
+    wULEB(aTypeIdx)
   } else if code == 4 {
-    out.push(100)              // 0x64 (ref ht) — non-null i32-list wrapper ref
-    appendAll(out, ulebToArr(lTypeIdx))
+    wU8(100)                   // 0x64 (ref ht) — non-null i32-list wrapper ref
+    wULEB(lTypeIdx)
   } else if code == 5 {
-    out.push(100)              // 0x64 (ref ht) — non-null ref-list wrapper ref
+    wU8(100)                   // 0x64 (ref ht) — non-null ref-list wrapper ref
     let s = refSlot
     if s < 0 { s = 0 }
-    appendAll(out, ulebToArr(rlWrapIdx[s]))   // THIS field's distinct ref-list wrapper
+    wULEB(rlWrapIdx[s])        // THIS field's distinct ref-list wrapper
   } else if code == 6 {
-    out.push(100)              // 0x64 (ref ht) — non-null string-list wrapper ref
-    appendAll(out, ulebToArr(mkListIdx))
+    wU8(100)                   // 0x64 (ref ht) — non-null string-list wrapper ref
+    wULEB(mkListIdx)
   } else {
-    out.push(127)              // 0x7f i32 storagetype
+    wU8(127)                   // 0x7f i32 storagetype
   }
   0
 }
@@ -5342,9 +5343,13 @@ function emitModule(stmts: i32[]): i32 {
   // So the section's rectype count is 1 (the rec group), and the rec group holds the
   // `n + typeOffset` actual type definitions.
   let typePayload: i32[] = []
-  typePayload.push(1)                                 // one rectype: the rec group
-  typePayload.push(78)                                // 0x4e rec group
-  appendAll(typePayload, ulebToArr(n + typeOffset))   // types inside the rec group
+  // Bind the writer at `typePayload` for the WHOLE type-section payload build, so the
+  // raw framing bytes, `pushFieldStorage`, and `fbValtype` all stream to `curBuf ==
+  // typePayload` identically. Restored just before `wSection` frames it (below).
+  let tyPrev = wTarget(typePayload)
+  wU8(1)                                 // one rectype: the rec group
+  wU8(78)                                // 0x4e rec group
+  wULEB(n + typeOffset)                  // types inside the rec group
   if sDeclared {
     // One `0x5f` struct per declared type (declaration order = heap-type index),
     // each a struct of its fields in declaration order. A field is `0x7f` i32
@@ -5352,13 +5357,13 @@ function emitModule(stmts: i32[]): i32 {
     // $aTypeIdx)` (`0x64 <aTypeIdx>` — the raw `(array i32)` string rep); both mutable.
     let si = 0
     while si < sNames.length {
-      typePayload.push(95)       // 0x5f struct
+      wU8(95)                    // 0x5f struct
       let cnt = sFieldCount[si]
-      appendAll(typePayload, ulebToArr(cnt))
+      wULEB(cnt)
       let fj = 0
       while fj < cnt {
-        pushFieldStorage(typePayload, sFieldTypeAt(si, fj), sFieldRefSlot(si, fj))
-        typePayload.push(1)      // mutable
+        pushFieldStorage(sFieldTypeAt(si, fj), sFieldRefSlot(si, fj))
+        wU8(1)                   // mutable
         fj = fj + 1
       }
       si = si + 1
@@ -5373,39 +5378,39 @@ function emitModule(stmts: i32[]): i32 {
     // 6e 00` (verified against `toWasm.ts`'s `unionStruct`).
     let vi = 0
     while vi < uVariants.length {
-      typePayload.push(95)       // 0x5f struct
+      wU8(95)                    // 0x5f struct
       let cnt = uFieldCount[vi]
-      appendAll(typePayload, ulebToArr(cnt))
+      wULEB(cnt)
       let fj = 0
       while fj < cnt {
-        pushFieldStorage(typePayload, variantFieldTypeAt(vi, fj), variantFieldRefSlot(vi, fj))
-        typePayload.push(1)      // mutable
+        pushFieldStorage(variantFieldTypeAt(vi, fj), variantFieldRefSlot(vi, fj))
+        wU8(1)                   // mutable
         fj = fj + 1
       }
       vi = vi + 1
     }
-    typePayload.push(95)         // 0x5f struct (union box)
-    typePayload.push(2)          // 2 fields
-    typePayload.push(127)        // field 0 tag: 0x7f i32
-    typePayload.push(0)          // immutable
-    typePayload.push(110)        // field 1 value: 0x6e anyref
-    typePayload.push(0)          // immutable
+    wU8(95)                      // 0x5f struct (union box)
+    wU8(2)                       // 2 fields
+    wU8(127)                     // field 0 tag: 0x7f i32
+    wU8(0)                       // immutable
+    wU8(110)                     // field 1 value: 0x6e anyref
+    wU8(0)                       // immutable
   }
   if aUsed {
-    typePayload.push(94)         // 0x5e array
-    typePayload.push(127)        // 0x7f i32 storagetype
-    typePayload.push(1)          // mutable
+    wU8(94)                      // 0x5e array
+    wU8(127)                     // 0x7f i32 storagetype
+    wU8(1)                       // mutable
   }
   if lUsed {
-    typePayload.push(95)         // 0x5f struct
-    typePayload.push(3)          // 3 fields
-    typePayload.push(100)        // field 0 backing: 0x64 (ref ht) — non-null
-    appendAll(typePayload, ulebToArr(aTypeIdx))   // ...to the raw array heap type
-    typePayload.push(1)          // mutable
-    typePayload.push(127)        // field 1 len: 0x7f i32
-    typePayload.push(1)          // mutable
-    typePayload.push(127)        // field 2 cap: 0x7f i32
-    typePayload.push(1)          // mutable
+    wU8(95)                      // 0x5f struct
+    wU8(3)                       // 3 fields
+    wU8(100)                     // field 0 backing: 0x64 (ref ht) — non-null
+    wULEB(aTypeIdx)              // ...to the raw array heap type
+    wU8(1)                       // mutable
+    wU8(127)                     // field 1 len: 0x7f i32
+    wU8(1)                       // mutable
+    wU8(127)                     // field 2 cap: 0x7f i32
+    wU8(1)                       // mutable
   }
   // One (backing, wrapper) PAIR per distinct ref-list element type, interleaved so each
   // wrapper immediately follows (and references) its own backing — the heap indices laid
@@ -5413,19 +5418,19 @@ function emitModule(stmts: i32[]): i32 {
   // (struct heap idx / union box); each wrapper is `{ backing: (ref $back), len, cap }`.
   let rti = 0
   while rti < rlElemName.length {
-    typePayload.push(94)         // 0x5e array (ref backing)
-    typePayload.push(99)         // 0x63 (ref null ht) — nullable element ref
-    appendAll(typePayload, ulebToArr(rlElemHeap[rti]))
-    typePayload.push(1)          // mutable
-    typePayload.push(95)         // 0x5f struct (ref-list wrapper)
-    typePayload.push(3)          // 3 fields
-    typePayload.push(100)        // field 0 backing: 0x64 (ref ht) — non-null
-    appendAll(typePayload, ulebToArr(rlBackIdx[rti]))   // ...to THIS slot's ref backing
-    typePayload.push(1)          // mutable
-    typePayload.push(127)        // field 1 len: 0x7f i32
-    typePayload.push(1)          // mutable
-    typePayload.push(127)        // field 2 cap: 0x7f i32
-    typePayload.push(1)          // mutable
+    wU8(94)                      // 0x5e array (ref backing)
+    wU8(99)                      // 0x63 (ref null ht) — nullable element ref
+    wULEB(rlElemHeap[rti])
+    wU8(1)                       // mutable
+    wU8(95)                      // 0x5f struct (ref-list wrapper)
+    wU8(3)                       // 3 fields
+    wU8(100)                     // field 0 backing: 0x64 (ref ht) — non-null
+    wULEB(rlBackIdx[rti])        // ...to THIS slot's ref backing
+    wU8(1)                       // mutable
+    wU8(127)                     // field 1 len: 0x7f i32
+    wU8(1)                       // mutable
+    wU8(127)                     // field 2 cap: 0x7f i32
+    wU8(1)                       // mutable
     rti = rti + 1
   }
   if slUsed || mUsed {
@@ -5435,58 +5440,57 @@ function emitModule(stmts: i32[]): i32 {
     // slots to null; an element read recovers the non-null string. (2) the list wrapper
     // `{ backing: (ref $mkArrIdx), len, cap }` — the same `{backing,len,cap}` triple as
     // the i32 list, over the string backing.
-    typePayload.push(94)         // 0x5e array (keys/string backing)
-    typePayload.push(99)         // 0x63 (ref null ht) — nullable string ref
-    appendAll(typePayload, ulebToArr(aTypeIdx))
-    typePayload.push(1)          // mutable
-    typePayload.push(95)         // 0x5f struct (string-list wrapper)
-    typePayload.push(3)          // 3 fields
-    typePayload.push(100)        // field 0 backing: 0x64 (ref ht) — non-null
-    appendAll(typePayload, ulebToArr(mkArrIdx))
-    typePayload.push(1)          // mutable
-    typePayload.push(127)        // field 1 len: 0x7f i32
-    typePayload.push(1)          // mutable
-    typePayload.push(127)        // field 2 cap: 0x7f i32
-    typePayload.push(1)          // mutable
+    wU8(94)                      // 0x5e array (keys/string backing)
+    wU8(99)                      // 0x63 (ref null ht) — nullable string ref
+    wULEB(aTypeIdx)
+    wU8(1)                       // mutable
+    wU8(95)                      // 0x5f struct (string-list wrapper)
+    wU8(3)                       // 3 fields
+    wU8(100)                     // field 0 backing: 0x64 (ref ht) — non-null
+    wULEB(mkArrIdx)
+    wU8(1)                       // mutable
+    wU8(127)                     // field 1 len: 0x7f i32
+    wU8(1)                       // mutable
+    wU8(127)                     // field 2 cap: 0x7f i32
+    wU8(1)                       // mutable
   }
   if mUsed {
     // The MAP struct `{ keys: (ref $mkListIdx), vals: (ref $lTypeIdx), index, count,
     // size }` — two non-null list refs (the keys string-list + the i32 vals list), the
     // i32 `index` hash-slot array `(ref $aTypeIdx)`, and the `count`/`size` counters.
-    typePayload.push(95)         // 0x5f struct (map)
-    typePayload.push(5)          // 5 fields (open-addressing hash map)
-    typePayload.push(100)        // field 0 keys: 0x64 (ref $mkListIdx) — non-null
-    appendAll(typePayload, ulebToArr(mkListIdx))
-    typePayload.push(1)          // mutable
-    typePayload.push(100)        // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
-    appendAll(typePayload, ulebToArr(lTypeIdx))
-    typePayload.push(1)          // mutable
-    typePayload.push(100)        // field 2 index: 0x64 (ref $aTypeIdx) — non-null i32 array
-    appendAll(typePayload, ulebToArr(aTypeIdx))
-    typePayload.push(1)          // mutable
-    typePayload.push(127)        // field 3 count: 0x7f i32
-    typePayload.push(1)          // mutable
-    typePayload.push(127)        // field 4 size: 0x7f i32
-    typePayload.push(1)          // mutable
+    wU8(95)                      // 0x5f struct (map)
+    wU8(5)                       // 5 fields (open-addressing hash map)
+    wU8(100)                     // field 0 keys: 0x64 (ref $mkListIdx) — non-null
+    wULEB(mkListIdx)
+    wU8(1)                       // mutable
+    wU8(100)                     // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
+    wULEB(lTypeIdx)
+    wU8(1)                       // mutable
+    wU8(100)                     // field 2 index: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wULEB(aTypeIdx)
+    wU8(1)                       // mutable
+    wU8(127)                     // field 3 count: 0x7f i32
+    wU8(1)                       // mutable
+    wU8(127)                     // field 4 size: 0x7f i32
+    wU8(1)                       // mutable
   }
-  // Bind the writer at `typePayload` so `fbValtype` (which streams to `curBuf`)
-  // writes the functype param/result valtypes here, interleaved identically with
-  // the surrounding raw `typePayload.push(...)` framing bytes.
-  let tyPrev = wTarget(typePayload)
+  // The functype param/result valtypes (`fbValtype`) stream to `curBuf == typePayload`,
+  // interleaved identically with the surrounding raw framing bytes (the `wTarget` bind
+  // covering this whole payload build was established above).
   let ti = 0
   while ti < n {
     let fn = P.nodes[fnStmts[ti]]
     if fn is FuncDecl {
       let params = fn.fnParams
       let nParams = params.length
-      typePayload.push(96)       // 0x60 func
-      appendAll(typePayload, ulebToArr(nParams))   // param count
+      wU8(96)                    // 0x60 func
+      wULEB(nParams)             // param count
       let pi = 0
       while pi < nParams {
         fbValtype(vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
         pi = pi + 1
       }
-      typePayload.push(1)        // 1 result
+      wU8(1)                     // 1 result
       fbValtype(vtKindOfType(fn.fnRet), retStructIndex(fn.fnRet))
     }
     ti = ti + 1
