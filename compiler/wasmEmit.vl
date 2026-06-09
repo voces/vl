@@ -662,6 +662,11 @@ function globalIsRefArray(name: string): boolean {
   if li < 0 { return false }
   letIsRefArray(li, 0 - 1)
 }
+function globalIsStringArray(name: string): boolean {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsStringArray(li, 0 - 1)
+}
 
 // Map each function NAME to its wasm function index (its position in `fnStmts`), and
 // record whether it returns the struct. Returns the function count.
@@ -759,6 +764,7 @@ function parseI32(text: string): i32 {
 // `parName` matches `name`, returning its 0-based position or -1 if not a param.
 // Only i32 params exist in this slice, so position == local index directly.
 function paramIndexOf(fnIx: i32, name: string): i32 {
+  if fnIx < 0 { return 0 - 1 }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -1460,7 +1466,19 @@ function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: i32): boolean {
     if callee is Member {
       if callee.memProp == "pop" {
         let recv = P.nodes[callee.memObj]
+        // A struct-FIELD / global-field Member receiver, OR a bare module-GLOBAL list
+        // ident — both materialize the wrapper ref into the `recvRef` scratch slot, so
+        // both need the push frame reserved. A bare LOCAL pop references the local in
+        // place and needs no scratch, so it is NOT counted.
+        let needsScratch = false
         if recv is Member {
+          needsScratch = true
+        } else if recv is Ident {
+          if localIndexOf(fnIx, recv.identName) < 0 {
+            if globalIndexOf(recv.identName) >= 0 { needsScratch = true }
+          }
+        }
+        if needsScratch {
           let isRef = exprRefArray(callee.memObj, fnIx)
           let isStr = exprStringArray(callee.memObj, fnIx)
           if kind == 1 { return isRef }
@@ -1890,6 +1908,11 @@ function blockHasStrOp(blockIx: i32, fnIx: i32): boolean {
         if exprHasStrOp(stmts[i], fnIx) { return true }
       } else if s is Call {
         if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is ObjLit {
+        // A bare trailing object-literal statement is a function's implicit-return value
+        // (e.g. `mkTok` returns `{ …, text: gSrc.slice(…), … }`). Its field initializers
+        // can contain string ops, so descend — `exprHasStrOp` walks `objFields`.
+        if exprHasStrOp(stmts[i], fnIx) { return true }
       } else if s is IfStmt {
         if ifChainHasStrOp(stmts[i], fnIx) { return true }
       } else if s is WhileStmt {
@@ -1964,6 +1987,7 @@ function declaredSlotOf(name: string): i32 {
 // local. Declared locals sit AFTER the params, so the slot is `paramCount + pos`
 // where `pos` is the name's resolved declared-local position (`declaredSlotOf`).
 function declaredIndexOf(fnIx: i32, name: string): i32 {
+  if fnIx < 0 { return 0 - 1 }   // module-scope initializer (no enclosing function)
   let pos = declaredSlotOf(name)
   if pos < 0 {
     return 0 - 1
@@ -2609,23 +2633,41 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
         return emitFail("emitProgram: ref array literal but ref list type not collected")
       }
       // The element type determines WHICH (backing, wrapper) pair this literal builds.
-      // A non-empty literal types itself from its first element; an EMPTY `[]` (no
-      // elements) takes the slot the binding site threaded via `pendingListSlot`.
+      // A binding/field site that threaded a ref-list annotation (`pendingListKind` 1/2,
+      // `pendingListSlot` the element slot) is AUTHORITATIVE — its declared element type
+      // wins over the first-element field-shape guess so a `B[] = [{…}]` literal of a
+      // struct sharing field names with another struct still builds B's list. Only a
+      // literal WITHOUT a threaded annotation types itself from its first element. An
+      // EMPTY `[]` (no elements) always takes the threaded slot.
+      let annKind = pendingListKind
+      let annSlot = pendingListSlot
       let rslot = 0
-      if elems.length >= 1 {
+      if annKind == 1 || annKind == 2 {
+        rslot = annSlot
+      } else if elems.length >= 1 {
         rslot = rlSlotByName(arrLitElemName(arrIx))
       } else {
-        rslot = pendingListSlot
+        rslot = annSlot
       }
       if rslot < 0 { rslot = 0 }
+      // A STRUCT-element list (kind 1, NOT a union box) types each element literal as the
+      // list's declared element struct — seed `pendingStructIdx` (consumed by `emitObj`)
+      // so a same-field-name sibling struct does not win the field-shape match. A union
+      // list (kind 2) boxes by variant name and needs no struct hint.
+      let elemStructIdx = 0 - 1
+      if rlElemKindTbl[rslot] == 1 {
+        elemStructIdx = structIndexByName(rlElemName[rslot])
+      }
       let i = 0
       while i < elems.length {
         if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
           return emitFail("emitProgram: nested arrays are not supported")
         }
+        pendingStructIdx = elemStructIdx
         if emitExpr(body, elems[i], fnIx) < 0 { return 0 - 1 }
         i = i + 1
       }
+      pendingStructIdx = 0 - 1
       fbArrayNewFixed(rlBackIdx[rslot], elems.length)  // 0xfb 0x08; builds the ref backing
       fbI32Const(elems.length) // 0x41 i32.const (len)
       fbI32Const(elems.length) // 0x41 i32.const (cap)
@@ -3728,6 +3770,17 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       let gIdx = globalIndexOf(e.identName)
       if gIdx >= 0 {
         fbGlobalGet(gIdx)
+        // A NON-const ref global rides in a NULLABLE cell (zero-initialized with
+        // `ref.null`, set by the start function before any code runs). Recover the
+        // non-null value type the rest of codegen expects with `ref.as_non_null`
+        // (0xd4); the cell is always initialized first, so the cast never traps. A
+        // const global keeps its non-null cell, so no cast (goldens unchanged). A
+        // scalar (i32/boolean) global needs no cast either.
+        if globalNameIsNonConst(e.identName) {
+          if globalCellKind(globalLetOf(e.identName)) != 0 {
+            wU8(212)         // 0xd4 ref.as_non_null
+          }
+        }
         return 0
       }
       return emitFail("emitProgram: identifier is not a parameter, local, or global")
@@ -3906,6 +3959,22 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
   if c is Call {
     let callee = P.nodes[c.callFn]
     if callee is Ident {
+      // `fromCodePoint(code)` is a compiler builtin (H2): construct a single-character
+      // VL string from an i32 code point. A VL string IS the shared `(array i32)` of
+      // code points (`aTypeIdx`), so this is a length-1 array — push the one i32 arg,
+      // then `array.new_fixed $aTypeIdx 1`. Mirrors toWasm's `fromCodePoint` lowering.
+      // BEFORE the `fnIndexOf` lookup, which would fail ("unknown function").
+      if callee.identName == "fromCodePoint" {
+        if !aUsed {
+          return emitFail("emitProgram: fromCodePoint but array type not collected")
+        }
+        if c.callArgs.length != 1 {
+          return emitFail("emitProgram: fromCodePoint takes exactly one argument")
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        fbArrayNewFixed(aTypeIdx, 1)  // 0xfb 0x08 <typeidx> 1; type shared with i32[]
+        return 0
+      }
       let target = fnIndexOf(callee.identName)
       if target < 0 {
         return emitFail("emitProgram: call to unknown function")
@@ -3923,6 +3992,8 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         // callee's struct index (consumed by the immediately-following object-literal
         // lowering; a non-literal argument simply ignores it). Default -1 = infer.
         pendingStructIdx = 0 - 1
+        pendingListKind = 0
+        pendingListSlot = 0
         // A VARIANT-typed param position (kind 8): the callee wants the CONCRETE variant
         // struct ref, but a union-valued argument (a narrowed local/param, a union-
         // returning call) is the BOX `{tag, value}`. Bridge the boundary by unboxing the
@@ -3939,6 +4010,15 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
             if vtKindOfParam(cParams[i]) == 8 {
               cVi = paramStructIdxOf(cParams[i])
             }
+            // A ref-array param position (`take(xs: B[])`): seed the list context from the
+            // param's annotation so a non-empty `B[]` LITERAL argument builds the param's
+            // declared element type, not the first-element field-shape guess. Mirrors the
+            // let / return / global seeding (consumed by `emitArr`).
+            let cp = P.nodes[cParams[i]]
+            if cp is Param {
+              pendingListKind = tyAnnRefListKind(cp.parType)
+              pendingListSlot = tyAnnRefListSlot(cp.parType)
+            }
           }
         }
         if emitExpr(body, args[i], fnIx) < 0 { return 0 - 1 }
@@ -3949,6 +4029,8 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
           }
         }
         pendingStructIdx = 0 - 1
+        pendingListKind = 0
+        pendingListSlot = 0
         i = i + 1
       }
       fbCall(target)         // 0x10 call
@@ -3986,7 +4068,17 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
         // Not a local — a module global? Store with `global.set` (0x24 <globalidx>).
         let gIdx = globalIndexOf(target.identName)
         if gIdx >= 0 {
+          // Seed the assigned global's declared type context so the RHS literal builds the
+          // SAME wasm type the cell expects (e.g. `globalNames = []` builds a STRING-list
+          // wrapper, not the default i32-list; a struct global gets its annotated struct) —
+          // mirroring the global-INIT seeding in the global section.
+          let gLet = globalStmts[gIdx]
+          if globalCellKind(gLet) == 1 { pendingStructIdx = globalCellStructIdx(gLet) }
+          pendingListKind = letAnnRefListKind(gLet)
+          pendingListSlot = letAnnRefListSlot(gLet)
           if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+          pendingListKind = 0
+          pendingListSlot = 0
           fbGlobalSet(gIdx)    // 0x24 global.set
           return 0
         }
@@ -4009,8 +4101,13 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       // REF list (G7-ref) stores a struct ref / union box (a subtype of the `(ref null
       // $elem)` slot) over the ref list/backing indices; an i32 list stores an i32.
       let isRef = exprRefArray(target.idxArr, fnIx)
+      let isStr = exprStringArray(target.idxArr, fnIx)
       let lTy = lTypeIdx
       let aTy = aTypeIdx
+      // A ref list of STRUCT elements (kind 1) types the stored value literal as the
+      // list's declared element struct — seed `pendingStructIdx` (consumed by `emitObj`)
+      // so `xs[i] = { … }` builds the element struct over a first-field-name match.
+      let storeStructIdx = 0 - 1
       if isRef {
         if !rlUsed {
           return emitFail("emitProgram: ref indexed assignment but ref list type not collected")
@@ -4018,6 +4115,20 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
         let rslot = refListSlotOfExpr(target.idxArr, fnIx)
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
+        if rlElemKindTbl[rslot] == 1 {
+          storeStructIdx = structIndexByName(rlElemName[rslot])
+        }
+      } else if isStr {
+        // A STRING list `xs[i] = s`: unwrap to its `(ref null $aTypeIdx)` string backing
+        // (`mkListIdx`/`mkArrIdx`) and store the string ref — mirroring `emitIndex`'s
+        // string path. Without this branch a string-list target (e.g. the `string[]`
+        // global `narrowNames[i] = name`) falls into the i32-list case below and
+        // `struct.get`s the WRONG wrapper type (`lTypeIdx` instead of `mkListIdx`).
+        if !slUsed {
+          return emitFail("emitProgram: string indexed assignment but string list type not collected")
+        }
+        lTy = mkListIdx
+        aTy = mkArrIdx
       } else {
         if !lUsed {
           return emitFail("emitProgram: indexed assignment but list type not collected")
@@ -4029,7 +4140,9 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       if emitExpr(body, target.idxArr, fnIx) < 0 { return 0 - 1 }
       fbStructGet(lTy, 0)    // 0xfb 0x02 <list wrapper struct type index> field 0: backing
       if emitExpr(body, target.idxIndex, fnIx) < 0 { return 0 - 1 }
+      pendingStructIdx = storeStructIdx
       if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+      pendingStructIdx = 0 - 1
       fbArraySet(aTy)        // 0xfb 0x0e <backing array type index>
       return 0
     }
@@ -4123,6 +4236,10 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
       let lTy = lTypeIdx
       let aTy = aTypeIdx
       let base = pushScratchBase
+      // A ref list of STRUCT elements (kind 1) types the pushed value literal as the
+      // list's declared element struct — seed `pendingStructIdx` (consumed by `emitObj`)
+      // so `xs.push({ … })` builds the element struct over a first-field-name match.
+      let pushStructIdx = 0 - 1
       if isRef {
         if !rlUsed {
           return emitFail("emitProgram: ref .push but ref list type not collected")
@@ -4131,6 +4248,9 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
         base = refPushScratchBaseFor(rslot)
+        if rlElemKindTbl[rslot] == 1 {
+          pushStructIdx = structIndexByName(rlElemName[rslot])
+        }
       } else if isStr {
         if !slUsed {
           return emitFail("emitProgram: string .push but string list type not collected")
@@ -4150,7 +4270,19 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
       if recv is Ident {
         lIdx = localIndexOf(fnIx, recv.identName)
         if lIdx < 0 {
-          return emitFail("emitProgram: .push receiver is not a list local")
+          // Not a local — a module-GLOBAL list ident? Materialize its wrapper ref into
+          // the `recvRef` scratch slot (`base + 3`), IDENTICALLY to the Member path:
+          // `emitExpr` on the receiver runs the existing Ident→global read (`global.get`
+          // + `ref.as_non_null` for a non-const ref cell). Because the list wrapper is
+          // mutated IN PLACE by reference, pushing through the scratch local also mutates
+          // the global's list — and growth swaps the backing on the shared wrapper — so
+          // no write-back to the global is needed.
+          if globalIndexOf(recv.identName) < 0 {
+            return emitFail("emitProgram: .push receiver is not a list local")
+          }
+          if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+          fbLocalSet(base + 3)   // local.set recvRef
+          lIdx = base + 3
         }
       } else if recv is Member {
         if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
@@ -4167,7 +4299,9 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         let capIdx = base + 1
         let backIdx = base + 2
         // V = x
+        pendingStructIdx = pushStructIdx
         if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        pendingStructIdx = 0 - 1
         fbLocalSet(valIdx)     // local.set
         // if len(L) == cap(L)
         pushListLen(body, lIdx, lTy)
@@ -4282,7 +4416,16 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
       if recv is Ident {
         lIdx = localIndexOf(fnIx, recv.identName)
         if lIdx < 0 {
-          return emitFail("emitProgram: .pop receiver is not a list local")
+          // Not a local — a module-GLOBAL list ident? Materialize its wrapper ref into
+          // the `recvRef` scratch slot (`base + 3`), IDENTICALLY to the Member path (and
+          // to `emitPush`): `emitExpr` runs the existing Ident→global read; the wrapper is
+          // mutated in place by reference, so no write-back to the global is needed.
+          if globalIndexOf(recv.identName) < 0 {
+            return emitFail("emitProgram: .pop receiver is not a list local")
+          }
+          if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+          fbLocalSet(base + 3)     // local.set recvRef
+          lIdx = base + 3
         }
       } else if recv is Member {
         if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
@@ -4394,7 +4537,15 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     // the element kind to pick the ref-list construction — record it for `emitArr`.
     pendingListKind = letAnnRefListKind(stmtIx)
     pendingListSlot = letAnnRefListSlot(stmtIx)
+    // A `let b: B = { … }` struct LITERAL must build the annotation's struct, not a
+    // first-field-name match — seed `pendingStructIdx` (consumed by `emitObj`) from the
+    // annotation when it names a standalone struct, so a same-field-name sibling struct
+    // does not win. Mirrors the call-arg / element / return / global seeding. A union
+    // annotation names no `sNames` entry (`letAnnStructIdx` is -1) so a variant literal
+    // still boxes; a non-struct-literal init ignores the hint.
+    pendingStructIdx = letAnnStructIdx(stmtIx)
     if emitExpr(body, s.letInit, fnIx) < 0 { return 0 - 1 }
+    pendingStructIdx = 0 - 1
     pendingListKind = 0
     pendingListSlot = 0
     fbLocalSet(idx)          // 0x21 local.set
@@ -4444,8 +4595,29 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     if s.retArg < 0 {
       return emitFail("emitProgram: bare return is not supported")
     }
+    // A `return { … }` struct LITERAL must build the function's DECLARED return struct,
+    // not a first-field-name match — seed `pendingStructIdx` (consumed by `emitObj`) from
+    // the enclosing function's return annotation so a same-field-name sibling struct does
+    // not win. Mirrors how a call-arg / element / global seeds the literal's context. A
+    // non-struct-literal return ignores the hint. Reset after the value lowers.
+    let fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      let rsi = retStructIndex(fn.fnRet)
+      if rsi >= 0 {
+        if retTRFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
+      }
+      // A `return [{ … }]` ref-list LITERAL must build the function's DECLARED return
+      // list element type, not a first-element field-shape match — seed the list context
+      // from the return annotation exactly as the let / global path does (consumed by
+      // `emitArr`). A non-list return ignores it.
+      pendingListKind = tyAnnRefListKind(fn.fnRet)
+      pendingListSlot = tyAnnRefListSlot(fn.fnRet)
+    }
     // Push the return value, then the `return` instruction.
     if emitExpr(body, s.retArg, fnIx) < 0 { return 0 - 1 }
+    pendingStructIdx = 0 - 1
+    pendingListKind = 0
+    pendingListSlot = 0
     fbReturn()               // 0x0f return
     return 0
   }
@@ -5134,6 +5306,43 @@ function retStructIndex(tyIx: i32): i32 {
   0 - 1
 }
 
+// The `pendingListKind` a type-annotation node at `tyIx` names (1 = struct/MAP ref list,
+// 2 = union box ref list, 3 = string list), or 0 when it is not a list annotation. Shared
+// by the let / return / call-arg / global seeding so each position threads the SAME
+// annotation-derived list context into `emitArr` (so a non-empty `B[]` literal in a return
+// or argument position builds B's list, not the first-element field-shape guess). A
+// `LetDecl`-specific wrapper (`letAnnRefListKind`) forwards its `letType` here.
+function tyAnnRefListKind(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let lt = P.nodes[tyIx]
+    if lt is TypeRef {
+      if nameIsRefArray(lt.tyName) {
+        if refArrElemKind(lt.tyName) == 2 { return 2 }
+        return 1
+      }
+      if nameIsStringArray(lt.tyName) { return 3 }
+    }
+  }
+  0
+}
+
+// The ref-list TABLE SLOT a type-annotation node at `tyIx` names (`Tok[]` → the `Tok`
+// slot), or 0 when it is not a ref-array annotation. Mirror of `tyAnnRefListKind` for the
+// slot; threads `pendingListSlot` so a ref-list literal builds the annotation's distinct
+// element type.
+function tyAnnRefListSlot(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let lt = P.nodes[tyIx]
+    if lt is TypeRef {
+      if nameIsRefArray(lt.tyName) {
+        let s = rlSlotByName(refArrElemName(lt.tyName))
+        if s >= 0 { return s }
+      }
+    }
+  }
+  0
+}
+
 // `1` if the parameter node at `paramIx` is the struct type, else `0`.
 function paramTRFlag(paramIx: i32): i32 {
   let p = P.nodes[paramIx]
@@ -5281,11 +5490,15 @@ function vtKindOfParam(paramIx: i32): i32 {
   0
 }
 
-// The struct table index of the parameter node at `paramIx` (from its annotation), or
-// -1 — feeds `pushVT`'s `kind == 1` struct case for a function param's valtype.
+// The second `fbValtype` arg for the parameter node at `paramIx` (from its annotation).
+// For a STRUCT param (kind 1) this is its struct table index (or -1); for a REF-ARRAY
+// param (kind 5) it is the ref-list TABLE SLOT for the element type (`B[]` → B's slot)
+// — `fbValtype`'s kind-5 arm now indexes `rlWrapIdx[slot]`, so it must NOT collapse to
+// -1/slot 0. Mirrors `tyAnnRefListSlot` (how `let`/return annotations resolve `T[]`).
 function paramStructIdxOf(paramIx: i32): i32 {
   let p = P.nodes[paramIx]
   if p is Param {
+    if retRefArrFlag(p.parType) == 1 { return tyAnnRefListSlot(p.parType) }
     return retStructIndex(p.parType)
   }
   0 - 1
@@ -5317,6 +5530,185 @@ function globalKind(initIx: i32): i32 {
   0
 }
 
+// Whether the initializer expression at `exprIx` is a valid WasmGC *constant
+// expression* — the forms `emitProgram` already lowers inline in the global section
+// (`i32.const`, `struct.new`, `array.new_fixed`, the string array). Const forms:
+// `NumLit` / `CharLit` / `BoolLit` (an `i32.const`), `StrLit` (a constant `array.new_fixed`
+// over the code points), an `ArrayLit` whose elements are ALL const, an `ObjLit` whose
+// field values are ALL const, and a `Paren` wrapping a const. EVERYTHING ELSE is
+// non-const: an `Ident` (a `global.get` of another global), a `Member` / `Index` (a
+// `struct.get` / `array.get` — the `curBuf = W.bytes` shape), a `Call`, a `BinExpr` /
+// `Unary` (computed), an `IsExpr`. CONSERVATIVE by construction: an unrecognized node
+// falls through to the non-const `false`, so a form we have not proven const-safe is
+// initialized via the start function rather than emitted as an invalid constexpr.
+function isConstInit(exprIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is NumLit { return true }
+  if e is CharLit { return true }
+  if e is BoolLit { return true }
+  if e is StrLit { return true }
+  if e is Paren { return isConstInit(e.parInner) }
+  if e is ArrayLit {
+    let i = 0
+    while i < e.arrElems.length {
+      if !isConstInit(e.arrElems[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  if e is ObjLit {
+    let i = 0
+    while i < e.objFields.length {
+      let f = P.nodes[e.objFields[i]]
+      if f is FieldInit {
+        if !isConstInit(f.fiValue) { return false }
+      } else {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether the module global declared by the `LetDecl` at `letIx` has a non-const
+// initializer (so its cell is zero-initialized and set by the synthetic start
+// function). False for a non-`LetDecl` or a missing init.
+function globalIsNonConst(letIx: i32): boolean {
+  if letIx < 0 { return false }
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 { return false }
+    return !isConstInit(d.letInit)
+  }
+  false
+}
+
+// Whether the module global `name` has a non-const initializer — used at READ sites
+// (`global.get`) to decide whether the (nullable) cell needs a `ref.as_non_null`.
+function globalNameIsNonConst(name: string): boolean {
+  globalIsNonConst(globalLetOf(name))
+}
+
+// True if the module global `LetDecl` at `letIx` carries a TYPE ANNOTATION (`let g: T
+// = …`). When it does, the cell's wasm type must come from that annotation — exactly as
+// a local/param resolves its valtype — so a global agrees with a same-typed local/param/
+// field on the struct table index (otherwise a `global.get g` of an init-inferred struct
+// type mismatches a `local.set`/call of the annotation's struct type).
+function globalHasTypeAnn(letIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    return d.letType >= 0
+  }
+  false
+}
+
+// The `fbValtype` kind for a module global's CELL. When the binding has a TYPE
+// ANNOTATION (const init OR not), the kind is derived from that annotation via the
+// `letIs*` ladder — so a global agrees with a same-typed local/param/field on its
+// valtype (kind + struct index). Only an UN-annotated const global (`let g = { … }`,
+// no `: T`) falls back to the literal-initializer kind (`globalKind`); the `g_globals`
+// golden's struct global IS annotated, and its annotation names the SAME struct its
+// literal infers, so the emitted bytes are unchanged. A non-const init's literal kind is
+// meaningless (member/index/call), so it likewise rides the annotation ladder. Mirrors
+// `buildLocals`' annotation→kind ladder (map 6, string-array 7, ref-array 5, struct 1,
+// array 2, string 3, else i32 0).
+function globalCellKind(letIx: i32): i32 {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if globalHasTypeAnn(letIx) {
+      if letIsMap(letIx, 0 - 1) { return 6 }
+      if letIsStringArray(letIx, 0 - 1) { return 7 }
+      if letIsRefArray(letIx, 0 - 1) { return 5 }
+      if letIsStruct(letIx, 0 - 1) { return 1 }
+      if letIsArray(letIx, 0 - 1) { return 2 }
+      if letIsString(letIx, 0 - 1) { return 3 }
+      return 0
+    }
+    // No annotation: a const literal init types itself; a non-const un-annotated init is
+    // out of scope (no annotation to derive from) and `globalKind` returns its best guess.
+    return globalKind(d.letInit)
+  }
+  0
+}
+
+// The struct table index for a global cell of kind 1 (struct ref), else -1. When the
+// binding has a struct ANNOTATION the index comes from THAT annotation (`structIndexOfLet`,
+// which prefers the annotation over the init) — so a struct global agrees with a same-
+// typed local/param/field. An un-annotated const struct global infers from its literal.
+function globalCellStructIdx(letIx: i32): i32 {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if globalHasTypeAnn(letIx) {
+      return structIndexOfLet(letIx, 0 - 1)
+    }
+    return structIndexOfExpr(d.letInit, 0 - 1)
+  }
+  0 - 1
+}
+
+// Emit `ref.null <heaptype>` (0xd0 <heaptype-sleb>) for a global cell of ref `kind`,
+// the zero initializer that lets the cell be declared NULLABLE before the start
+// function `global.set`s the real value. The heap type mirrors `fbValtype`'s kind→
+// heap-index map (struct / i32-list / string array / union box / ref-list / map /
+// string-list). A scalar global (kind 0) never reaches here — it zero-inits with
+// `i32.const 0`.
+function fbRefNullForKind(kind: i32, structIdx: i32): i32 {
+  wU8(208)                     // 0xd0 ref.null
+  if kind == 1 {
+    wSLEB(sHeapIdx[structIdx])
+  } else if kind == 2 {
+    wSLEB(lTypeIdx)
+  } else if kind == 3 {
+    wSLEB(aTypeIdx)
+  } else if kind == 4 {
+    wSLEB(uBoxIdx)
+  } else if kind == 5 {
+    wSLEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
+  } else if kind == 6 {
+    wSLEB(mStructIdx)
+  } else if kind == 7 {
+    wSLEB(mkListIdx)
+  } else {
+    wSLEB(aTypeIdx)
+  }
+  0
+}
+
+// Emit a global cell valtype, NULLABLE for refs (`0x63` instead of `0x64`) so a
+// non-const ref cell can be `ref.null`-initialized. The scalar case (kind 0) is the
+// same `0x7f` i32 as `fbValtype`. Only used for NON-const globals; const globals keep
+// the non-null `fbValtype` (so goldens are unchanged).
+function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
+  if kind == 1 {
+    wU8(99)                    // 0x63 (ref null ht)
+    wULEB(sHeapIdx[structIdx])
+  } else if kind == 2 {
+    wU8(99)
+    wULEB(lTypeIdx)
+  } else if kind == 3 {
+    wU8(99)
+    wULEB(aTypeIdx)
+  } else if kind == 4 {
+    wU8(99)
+    wULEB(uBoxIdx)
+  } else if kind == 5 {
+    wU8(99)
+    wULEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
+  } else if kind == 6 {
+    wU8(99)
+    wULEB(mStructIdx)
+  } else if kind == 7 {
+    wU8(99)
+    wULEB(mkListIdx)
+  } else {
+    wU8(127)                   // 0x7f i32
+  }
+  0
+}
+
 // The heap-type index of a ref list's ELEMENT: the struct (heap-type 0) when
 // `rElemKind == 1`, or the union box (`uBoxIdx`) when `rElemKind == 2`. Used for the
 // ref backing's element ref, the index-read `ref.cast`/result, and the push value.
@@ -5333,7 +5725,11 @@ function refElemHeapType(): i32 {
 //   2    → i32-list ref `(ref $lTypeIdx)` (the growable `i32[]` wrapper struct)
 //   3    → string ref `(ref $aTypeIdx)` — the raw `(array (mut i32))` of code points
 //   4    → union-box ref `(ref $uBoxIdx)` — the `{tag, value}` box
-//   5    → ref-list ref `(ref $rlTypeIdx)` — the ref-element list wrapper
+//   5    → ref-list ref `(ref $rlWrapIdx[structIdx])` — the ref-element list wrapper
+//          for THIS slot. For kind 5, `structIdx` is the ref-list TABLE SLOT (NOT a
+//          struct index): the self-host program has many distinct ref-list element
+//          types, each with its own wrapper, so the valtype must select the caller's
+//          slot — not collapse to slot 0 (`rlTypeIdx == rlWrapIdx[0]`).
 //   6    → map ref `(ref $mStructIdx)` — the string-keyed map struct
 //   7    → string-list ref `(ref $mkListIdx)` — the string-list wrapper
 //   8    → concrete union-variant ref `(ref $uVarIdx+structIdx)` (gap #2)
@@ -5358,7 +5754,7 @@ function fbValtype(kind: i32, structIdx: i32): i32 {
     wULEB(uBoxIdx)       // the union box `{tag, value}` heap-type index
   } else if kind == 5 {
     wU8(100)
-    wULEB(rlTypeIdx)     // the REF-list wrapper struct heap-type index
+    wULEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
   } else if kind == 6 {
     wU8(100)
     wULEB(mStructIdx)    // the string-keyed MAP struct heap-type index (G8)
@@ -5550,6 +5946,97 @@ function mapStructOffsetOf(): i32 {
   0
 }
 
+// Detect, over the SET of non-const global init expressions, the scratch frames the
+// start function's body needs — the start-fn analogue of `emitFuncCode`'s per-function
+// `fnHas*` detection. A `.push` is a statement-level void call (never in an init VALUE
+// position), so the i32/ref/string-push frames are driven by Member-receiver `.pop`s
+// (which DO appear in value position, `let x = T.scopes.pop()` shape) via
+// `exprHasMemberPopKind`; string ops and map ops are detected over the same exprs. Sets
+// the `fnUses*` flags + `fnRefPushSlots`/`refPushBaseBySlot` exactly as `emitFuncCode`
+// does, so the shared `fbBeginFunc`/`fbEmitLocalsVec` lay out an identical frame. For
+// the common `curBuf = W.bytes` shape (a plain `global.get`+`struct.get`) every flag is
+// false and the locals vector is empty.
+function startFnDetectScratch(): i32 {
+  fnUsesPush = false
+  fnUsesRefPush = false
+  fnUsesStrPush = false
+  fnUsesStrOp = false
+  fnUsesMap = false
+  fnRefPushSlots = []
+  refPushBaseBySlot = []
+  let gi = 0
+  while gi < globalStmts.length {
+    if globalIsNonConst(globalStmts[gi]) {
+      let g = P.nodes[globalStmts[gi]]
+      if g is LetDecl {
+        let ix = g.letInit
+        if exprHasMemberPopKind(ix, 0 - 1, 0) { fnUsesPush = true }
+        if exprHasMemberPopKind(ix, 0 - 1, 1) { fnUsesRefPush = true }
+        if exprHasMemberPopKind(ix, 0 - 1, 2) { fnUsesStrPush = true }
+        if exprHasStrOp(ix, 0 - 1) { fnUsesStrOp = true }
+        if exprHasMapOp(ix, 0 - 1) { fnUsesMap = true }
+        collectMemberPopRefSlotsExpr(ix, 0 - 1)
+      }
+    }
+    gi = gi + 1
+  }
+  0
+}
+
+// Emit the synthetic start function's size-prefixed code entry onto `out` (the code
+// section payload). The body runs every NON-const global initializer in declaration
+// order — `emitExpr(body, letInit, -1)` (module scope, `fnIx = -1`) then `global.set gi`
+// — so each cell holds its real value before any other code runs. Mirrors
+// `emitFuncCode`'s framing: detect scratch frames, lay out locals via `fbBeginFunc`,
+// emit the locals vector (`fbEmitLocalsVec`) with NO declared locals, then the body and
+// the `end`, size-prefixed. Returns 0, or -1 (via `emitFail`).
+function emitStartFnCode(out: i32[]): i32 {
+  // Scratch detection + layout: the start fn has no params and no declared locals, so
+  // the cursor starts at 0 and only reserved scratch frames advance it.
+  startFnDetectScratch()
+  fbBeginFunc(0, 0)
+
+  let bodyExpr: i32[] = []
+  let exprPrev = wTarget(bodyExpr)
+  // Reset the emit-time scope/loop bookkeeping (the start fn has its own empty frame),
+  // mirroring `emitFuncCode` — no leak from the last user function.
+  scopeNames = []
+  scopeSlots = []
+  scopeFrames = []
+  emitLetCursor = 0
+  ctrlDepth = 0
+  loopContDepth = []
+  loopBrkDepth = []
+  let gi = 0
+  while gi < globalStmts.length {
+    if globalIsNonConst(globalStmts[gi]) {
+      let g = P.nodes[globalStmts[gi]]
+      if g is LetDecl {
+        if emitExpr(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+        let setPrev = wTarget(bodyExpr)
+        fbGlobalSet(gi)
+        wTarget(setPrev)
+      }
+    }
+    gi = gi + 1
+  }
+  wTarget(exprPrev)
+
+  let body: i32[] = []
+  // Locals vector: no declared locals, just the (possibly empty) scratch frames.
+  if fbEmitLocalsVec(body, 0) < 0 { return 0 - 1 }
+  appendAll(body, bodyExpr)
+  let endPrev = wTarget(body)
+  fbEnd()                  // 0x0b end (void → void: stack already empty)
+  wTarget(endPrev)
+
+  let outPrev = wTarget(out)
+  wULEB(body.length)
+  wBytes(body)
+  wTarget(outPrev)
+  0
+}
+
 // Emit the complete module for the top-level functions in `fnStmts` (each a FuncDecl,
 // validated by `collectFns`/`buildFnMap`/`checkParams`). If a struct `type` was
 // declared, its WasmGC struct type is emitted FIRST (type index 0) and the functypes
@@ -5562,6 +6049,28 @@ function emitModule(stmts: i32[]): i32 {
   emitHeader()
 
   let n = fnStmts.length
+
+  // ── Start-function model (non-const module-global initializers) ──────────────
+  // A module global whose initializer is NOT a WasmGC constant expression (a member
+  // access like `curBuf = W.bytes`, a reference to another global, a call, …) cannot
+  // be emitted inline in the global section. Its cell is zero-initialized there
+  // (nullable `ref.null` / `i32.const 0`) and a SINGLE synthetic start function — the
+  // LAST function index, so no user index shifts — runs every such init via
+  // `global.set` before any other code. Count them up front; the count drives one
+  // extra `()->()` functype, one extra function-section + code-section entry, and the
+  // start section (id 8). When zero (the case for EVERY golden), nothing below
+  // changes, so the module stays byte-identical.
+  let nNonConst = 0
+  let gci = 0
+  while gci < globalStmts.length {
+    if globalIsNonConst(globalStmts[gci]) { nNonConst = nNonConst + 1 }
+    gci = gci + 1
+  }
+  let hasStart = 0
+  if nNonConst > 0 { hasStart = 1 }
+  // The synthetic start function's index (last, after all `n` user functions) and its
+  // `()->()` functype index (one past the user functypes). Both unused when no start.
+  let startFnIdx = n
 
   // Heap-type indices, in type-section order: standalone structs at 0..ns-1, then
   // (for the union path) the variant structs + box, then the raw i32 array, the
@@ -5600,7 +6109,7 @@ function emitModule(stmts: i32[]): i32 {
   let tyPrev = wTarget(typePayload)
   wU8(1)                                 // one rectype: the rec group
   wU8(78)                                // 0x4e rec group
-  wULEB(n + typeOffset)                  // types inside the rec group
+  wULEB(n + typeOffset + hasStart)       // types inside the rec group (+1 for start fn)
   if sDeclared {
     // One `0x5f` struct per declared type (declaration order = heap-type index),
     // each a struct of its fields in declaration order. A field is `0x7f` i32
@@ -5742,21 +6251,39 @@ function emitModule(stmts: i32[]): i32 {
         pi = pi + 1
       }
       wU8(1)                     // 1 result
-      fbValtype(vtKindOfType(fn.fnRet), retStructIndex(fn.fnRet))
+      // A `T[]` return is kind 5 — its second `fbValtype` arg is the ref-list TABLE SLOT
+      // for the element type (`retStructIndex` is -1 for a ref array), so the result
+      // valtype selects THIS function's element wrapper, not slot 0's.
+      let retSlot = retStructIndex(fn.fnRet)
+      if retRefArrFlag(fn.fnRet) == 1 { retSlot = tyAnnRefListSlot(fn.fnRet) }
+      fbValtype(vtKindOfType(fn.fnRet), retSlot)
     }
     ti = ti + 1
+  }
+  // The synthetic start function's `()->()` functype (lands at index `typeOffset + n`,
+  // AFTER every user functype — so no user type index shifts and the Phase-G assert is
+  // untouched). `0x60` func, 0 params, 0 results.
+  if hasStart == 1 {
+    wU8(96)                      // 0x60 func
+    wU8(0)                       // 0 params
+    wU8(0)                       // 0 results
   }
   wTarget(tyPrev)
   wSection(1, typePayload)
 
-  // Function section (id 3): N functions; func i uses functype `typeOffset + i`.
+  // Function section (id 3): N functions; func i uses functype `typeOffset + i`. The
+  // synthetic start function (if any) is the LAST entry — function index `n` — using
+  // the `()->()` functype at index `typeOffset + n`.
   let funcPayload: i32[] = []
   let fnPrev = wTarget(funcPayload)
-  wULEB(n)
+  wULEB(n + hasStart)
   let fi = 0
   while fi < n {
     wULEB(typeOffset + fi)   // functype index
     fi = fi + 1
+  }
+  if hasStart == 1 {
+    wULEB(typeOffset + n)    // start fn functype index
   }
   wTarget(fnPrev)
   wSection(3, funcPayload)
@@ -5784,10 +6311,52 @@ function emitModule(stmts: i32[]): i32 {
         if g.letInit < 0 {
           return emitFail("emitProgram: module global has no initializer")
         }
-        fbValtype(globalKind(g.letInit), structIndexOfExpr(g.letInit, 0 - 1))   // valtype
-        wU8(1)                                         // 0x01 mutable
-        if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
-        fbEnd()                                         // 0x0b end of init expr
+        if globalIsNonConst(globalStmts[gi]) {
+          // A non-constexpr init (`curBuf = W.bytes` — a `global.get`+`struct.get`, a
+          // reference to another global, a call, etc.) cannot be a WasmGC constant
+          // expression. Declare the cell NULLABLE and zero-init it (`i32.const 0` for a
+          // scalar, `ref.null` for a ref); the synthetic start function below runs the
+          // real init via `global.set` before any other code, so reads never see the
+          // zero. The cell stays mutable.
+          let ck = globalCellKind(globalStmts[gi])
+          // For a ref-array cell (kind 5) the second `fbValtype`/`fbRefNullForKind` arg is
+          // the ref-list TABLE SLOT (`globalCellStructIdx` is -1 for a ref array), so the
+          // cell valtype and its `ref.null` zero select THIS global's element wrapper.
+          let cs = globalCellStructIdx(globalStmts[gi])
+          if ck == 5 { cs = letAnnRefListSlot(globalStmts[gi]) }
+          fbValtypeNullable(ck, cs)                     // nullable valtype
+          wU8(1)                                        // 0x01 mutable
+          if ck == 0 {
+            fbI32Const(0)                               // scalar zero
+          } else {
+            fbRefNullForKind(ck, cs)                    // ref.null zero
+          }
+          fbEnd()                                       // 0x0b end of init expr
+        } else {
+          // The cell's valtype comes from the binding's ANNOTATION when present (so a
+          // global agrees with a same-typed local/param/field on its struct table index),
+          // falling back to the literal-init kind for an un-annotated global. The init
+          // constexpr (`emitExpr`) lowers the literal — and must build the SAME wasm type:
+          // `pendingStructIdx` seeds an `ObjLit` to the annotated struct (not the first
+          // field-name match), and `pendingListKind`/`pendingListSlot` seed an empty `[]`
+          // to the annotation's ref/string list (not the i32-list the bare literal infers),
+          // exactly as the local-`let` path threads them.
+          let gck = globalCellKind(globalStmts[gi])
+          let gcs = globalCellStructIdx(globalStmts[gi])
+          if gck == 1 { pendingStructIdx = gcs }
+          pendingListKind = letAnnRefListKind(globalStmts[gi])
+          pendingListSlot = letAnnRefListSlot(globalStmts[gi])
+          // A ref-array cell (kind 5) passes the ref-list TABLE SLOT as `fbValtype`'s
+          // second arg (`globalCellStructIdx` is -1 for a ref array) so the cell valtype
+          // selects THIS global's element wrapper, not slot 0's.
+          if gck == 5 { gcs = letAnnRefListSlot(globalStmts[gi]) }
+          fbValtype(gck, gcs)                            // valtype
+          wU8(1)                                         // 0x01 mutable
+          if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
+          pendingListKind = 0
+          pendingListSlot = 0
+          fbEnd()                                         // 0x0b end of init expr
+        }
       }
       gi = gi + 1
     }
@@ -5813,15 +6382,32 @@ function emitModule(stmts: i32[]): i32 {
   wTarget(exPrev)
   wSection(7, exportPayload)
 
-  // Code section (id 10): one size-prefixed body per function, in index order.
+  // Start section (id 8): names the function the runtime invokes once at instantiation,
+  // before any export is callable — here the synthetic start fn that runs the non-const
+  // global initializers. Per the section-id order it sits AFTER the export section (7)
+  // and BEFORE the code section (10). Omitted entirely when no non-const global exists
+  // (so EVERY golden, which has only const globals, emits no start section).
+  if hasStart == 1 {
+    let startPayload: i32[] = []
+    let stPrev = wTarget(startPayload)
+    wULEB(startFnIdx)
+    wTarget(stPrev)
+    wSection(8, startPayload)
+  }
+
+  // Code section (id 10): one size-prefixed body per function, in index order, then
+  // (if any) the synthetic start function's body LAST.
   let codePayload: i32[] = []
   let codePrev = wTarget(codePayload)
-  wULEB(n)
+  wULEB(n + hasStart)
   wTarget(codePrev)
   let ci = 0
   while ci < n {
     if emitFuncCode(codePayload, fnStmts[ci]) < 0 { return 0 - 1 }
     ci = ci + 1
+  }
+  if hasStart == 1 {
+    if emitStartFnCode(codePayload) < 0 { return 0 - 1 }
   }
   wSection(10, codePayload)
   0
@@ -6055,6 +6641,16 @@ function collectA(stmts: i32[]): i32 {
       }
     } else if nd is StrLit {
       aUsed = true
+    } else if nd is Call {
+      // A `fromCodePoint(code)` call (H2) constructs a length-1 VL string — the shared
+      // `(array i32)` heap type — so it forces `aUsed` just like a string literal, even
+      // in a program with no other string. The callee is a bare `Ident`.
+      let cf = P.nodes[nd.callFn]
+      if cf is Ident {
+        if cf.identName == "fromCodePoint" {
+          aUsed = true
+        }
+      }
     } else if nd is TypeRef {
       if nameIsMap(nd.tyName) {
         // A `{[string]: i32}` annotation (G8) is a string-keyed map: the map struct
@@ -6495,6 +7091,7 @@ function fnRetStruct(name: string): boolean {
 
 // True if the parameter `name` of function `fnIx` is the struct type.
 function paramStruct(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -6578,6 +7175,7 @@ function letIsStruct(letIx: i32, fnIx: i32): boolean {
 // The struct table index of the param `name` of function `fnIx` (from its annotation),
 // or -1.
 function paramStructIndex(fnIx: i32, name: string): i32 {
+  if fnIx < 0 { return 0 - 1 }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -6605,6 +7203,7 @@ function paramStructIndex(fnIx: i32, name: string): i32 {
 // vi))` — already narrowed/unboxed by the caller — so a field read on it reads the
 // variant struct directly (no box unwrap), the gap-#2 boundary.
 function paramVariantIndex(fnIx: i32, name: string): i32 {
+  if fnIx < 0 { return 0 - 1 }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -6734,6 +7333,7 @@ function fnRetUnion(name: string): boolean {
 
 // True if the parameter `name` of function `fnIx` is the union type.
 function paramUnion(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -6850,6 +7450,7 @@ function fnRetArray(name: string): boolean {
 
 // True if the parameter `name` of function `fnIx` is an array type.
 function paramArray(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -6974,6 +7575,7 @@ function fnRetRefArray(name: string): boolean {
 
 // True if the parameter `name` of function `fnIx` is a ref-array type.
 function paramRefArray(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -7031,6 +7633,7 @@ function exprRefArray(exprIx: i32, fnIx: i32): boolean {
 // The ref-list ELEMENT type-NAME a ref-array param `name` of function `fnIx` declares
 // (`p: Tok[]` → `Tok`), or "" if not a ref-array param.
 function paramRefArrayName(fnIx: i32, name: string): string {
+  if fnIx < 0 { return "" }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -7179,21 +7782,12 @@ function letRefListSlot(letIx: i32, fnIx: i32): i32 {
 // or `0` when it is not a ref-array annotation. Used to type an empty `[]` initializer
 // (a non-empty literal types itself from its elements).
 function letAnnRefListKind(letIx: i32): i32 {
+  // `pendingListKind` semantics: 1 = struct/MAP ref list (use `pendingListSlot`),
+  // 2 = union box ref list, 3 = string list. Delegates to the shared `tyAnnRefListKind`
+  // over the let's `letType` so the let / return / call-arg / global seeds agree.
   let d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 {
-      let lt = P.nodes[d.letType]
-      if lt is TypeRef {
-        // `pendingListKind` semantics: 1 = struct/MAP ref list (use `pendingListSlot`),
-        // 2 = union box ref list, 3 = string list. A map-array (`refArrElemKind` 3) is a
-        // ref list disambiguated by its slot, so it threads kind 1 (NOT the string-3).
-        if nameIsRefArray(lt.tyName) {
-          if refArrElemKind(lt.tyName) == 2 { return 2 }
-          return 1
-        }
-        if nameIsStringArray(lt.tyName) { return 3 }
-      }
-    }
+    return tyAnnRefListKind(d.letType)
   }
   0
 }
@@ -7204,17 +7798,27 @@ function letAnnRefListKind(letIx: i32): i32 {
 function letAnnRefListSlot(letIx: i32): i32 {
   let d = P.nodes[letIx]
   if d is LetDecl {
+    return tyAnnRefListSlot(d.letType)
+  }
+  0
+}
+
+// The STRUCT TABLE INDEX a `LetDecl`'s annotation names (`let b: B = { … }` → B's index),
+// or -1 when the let is un-annotated OR its annotation names a non-struct (a union alias,
+// `i32`, an array). Threads `pendingStructIdx` so an annotated struct literal builds the
+// annotation's struct over a first-field-name match. An un-annotated `let` is left to the
+// literal's own field-shape (-1).
+function letAnnStructIdx(letIx: i32): i32 {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
     if d.letType >= 0 {
       let lt = P.nodes[d.letType]
       if lt is TypeRef {
-        if nameIsRefArray(lt.tyName) {
-          let s = rlSlotByName(refArrElemName(lt.tyName))
-          if s >= 0 { return s }
-        }
+        return structIndexByName(lt.tyName)
       }
     }
   }
-  0
+  0 - 1
 }
 
 // ── string-array-typedness of expressions (`string[]`) ────────────────────────
@@ -7225,6 +7829,7 @@ function letAnnRefListSlot(letIx: i32): i32 {
 
 // True if the parameter `name` of function `fnIx` is a `string[]` type.
 function paramStringArray(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -7263,7 +7868,8 @@ function exprStringArray(exprIx: i32, fnIx: i32): boolean {
   if e is Paren { return exprStringArray(e.parInner, fnIx) }
   if e is Ident {
     if paramStringArray(fnIx, e.identName) { return true }
-    return declaredStringArray(e.identName)
+    if declaredStringArray(e.identName) { return true }
+    return globalIsStringArray(e.identName)
   }
   // A field read `p.names` whose field is a `string[]` (code `6`) yields the string-list
   // wrapper ref — so `.length` / indexing / assignment / `.push` treat it as a string list.
@@ -7299,6 +7905,7 @@ function letIsStringArray(letIx: i32, fnIx: i32): boolean {
 
 // True if the parameter `name` of function `fnIx` is a map type.
 function paramMap(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams
@@ -7547,8 +8154,14 @@ function letIsMap(letIx: i32, fnIx: i32): boolean {
 // (this slice covers only literal construction + `.length` + index read), so no
 // binary/call op below produces a string except a `string`-returning call.
 
-// True if the function `name` declares `string` as its return type.
+// True if the function `name` declares `string` as its return type. The `fromCodePoint`
+// compiler builtin (H2) constructs a single-character VL string, so it is `string`-
+// returning too — classifying it here (the single chokepoint `exprString` consults for
+// a named call) routes `value + fromCodePoint(cp)` to string concat, flags
+// `let s = fromCodePoint(n)` as a string local, etc., exactly as a user `string`-
+// returning function would be.
 function fnRetString(name: string): boolean {
+  if name == "fromCodePoint" { return true }
   let i = 0
   while i < fnNames.length {
     if fnNames[i] == name { return fRetStr[i] == 1 }
@@ -7559,6 +8172,7 @@ function fnRetString(name: string): boolean {
 
 // True if the parameter `name` of function `fnIx` is `string`-typed.
 function paramString(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }   // module-scope initializer (no enclosing function)
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     let params = fn.fnParams

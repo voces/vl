@@ -2283,6 +2283,199 @@ const CASES: Case[] = [
       if (got !== 32) throw new Error(`main() returned ${got}, expected 32`);
     },
   },
+  // ── start-fn: NON-CONST module-global initializers ─────────────────────────
+  // A module global whose init is NOT a WasmGC constant expression (a member access,
+  // a reference to another global, …) cannot be emitted inline in the global section.
+  // `emitProgram` zero-initializes the cell (nullable `ref.null` / `i32.const 0`) and
+  // synthesizes ONE start function (the LAST function index, so user indices don't
+  // shift) that runs each such init via `global.set` before any other code. These
+  // cases PROVE the start fn ran: before this work they trapped / produced invalid wasm.
+  {
+    name:
+      "start-fn: non-const scalar + ref globals from member access (curBuf shape) => 7",
+    src: [
+      "type Box = { n: i32, items: i32[] }",
+      "let b: Box = { n: 7, items: [] }",
+      "let val: i32 = b.n",
+      "let alias: i32[] = b.items",
+      "function main(): i32 {",
+      "  return val + alias.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `val` (= b.n = 7, scalar) and `alias` (= b.items, a ref list) are BOTH non-const
+      // member-access inits set by the start fn; alias.length = 0, so 7 + 0 = 7. Proves
+      // the start fn set the scalar AND the (nullable→non-null) ref global.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    name:
+      "start-fn: a global initialized from another global IDENT (`bb = a`) => 5",
+    src: [
+      "let a: i32 = 5",
+      "let bb: i32 = a",
+      "function main(): i32 {",
+      "  return bb",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `bb`'s init is a bare Ident reference to the global `a` — a `global.get`, NOT a
+      // constexpr — so it rides the start fn. `a` is const (0-const path). bb === a === 5.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  {
+    name:
+      "start-fn: a non-const REF global aliased from another global (ref ident) => 30",
+    src: [
+      "let xs: i32[] = [10, 20]",
+      "let ys: i32[] = xs",
+      "function main(): i32 {",
+      "  return ys[0] + ys[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `ys = xs` aliases a ref global (a `global.get` of the const list `xs`), so `ys`
+      // is a nullable cell set by the start fn; reads add `ref.as_non_null`. Both index
+      // through the SAME backing: 10 + 20 = 30.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 30) throw new Error(`main() returned ${got}, expected 30`);
+    },
+  },
+  {
+    name:
+      "start-fn sanity: a module with ONLY const globals emits NO start section => 32",
+    src: [
+      "let xs: i32[] = [10, 20]",
+      "function main(): i32 {",
+      "  return xs[0] + xs[1] + xs.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // All-const globals: no start fn, no start section — the global section is the
+      // inline-constexpr path (this case is byte-identical to the G2b array global).
+      // Still instantiates: 10 + 20 + 2 = 32.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 32) throw new Error(`main() returned ${got}, expected 32`);
+    },
+  },
+  // ── global-list `.push`: a bare module-GLOBAL list ident as the receiver ─────
+  // `curBuf.push(byte)` where `curBuf` is a module-global `i32[]` — the core writer
+  // append op. The receiver resolves via the existing Ident→global read (`global.get`
+  // + `ref.as_non_null` for the non-const cell) materialized into the push frame's
+  // `recvRef` scratch slot; pushing through that scratch mutates the global's wrapper
+  // (and growth swaps its backing) IN PLACE, so no write-back to the global is needed.
+  {
+    name:
+      "global-push: i32-list global pushed in a helper, length read in main => 3",
+    src: [
+      "let buf: i32[] = []",
+      "function w(x: i32): i32 {",
+      "  buf.push(x)",
+      "  return buf.length",
+      "}",
+      "function main(): i32 {",
+      "  w(10)",
+      "  w(20)",
+      "  w(30)",
+      "  return buf.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // Three pushes onto the SAME global wrapper across calls: length === 3, proving
+      // the helper's push mutated the global (not a local copy).
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
+  {
+    name:
+      "global-push: i32-list global, first pushed element read back => 10",
+    src: [
+      "let buf: i32[] = []",
+      "function w(x: i32): i32 {",
+      "  buf.push(x)",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  w(10)",
+      "  w(20)",
+      "  return buf[0]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // buf[0] is the FIRST pushed value, proving the append wrote into the global's
+      // backing through the scratch ref (and survived a growth realloc).
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 10) throw new Error(`main() returned ${got}, expected 10`);
+    },
+  },
+  {
+    name:
+      "global-push: a function pushing to BOTH a global list and a LOCAL list => 11",
+    src: [
+      "let g: i32[] = []",
+      "function f(x: i32): i32 {",
+      "  let loc: i32[] = []",
+      "  g.push(x)",
+      "  loc.push(x + 1)",
+      "  return g[0] + loc[0]",
+      "}",
+      "function main(): i32 {",
+      "  return f(5)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // Mixed receivers in one function: the global push (g[0]=5) and the local push
+      // (loc[0]=6) both work => 5 + 6 = 11. Proves the global branch didn't break the
+      // bare-local path and both share the one i32 push frame correctly.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 11) throw new Error(`main() returned ${got}, expected 11`);
+    },
+  },
+  {
+    name:
+      "global-pop: `.pop()` on a bare module-GLOBAL list ident => 32",
+    src: [
+      "let buf: i32[] = []",
+      "function fill(): i32 {",
+      "  buf.push(10)",
+      "  buf.push(20)",
+      "  buf.push(30)",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  fill()",
+      "  let last = buf.pop()",
+      "  return last + buf.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // `.pop()` on a global list returns the last element (30) and shrinks the global
+      // (length 3 -> 2), mirroring the global-push receiver resolution => 30 + 2 = 32.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 32) throw new Error(`main() returned ${got}, expected 32`);
+    },
+  },
+  // NOTE: string-list / ref-list module globals are NOT covered here because a const
+  // empty `[]` (or even a non-empty `string[]`/`T[]`) global is currently typed by
+  // `globalKind` as an i32-list wrapper (it is not annotation-aware) — a SEPARATE,
+  // pre-existing const-global typing gap, independent of the push-receiver shape. The
+  // push lowering itself is kind-generic (`exprStringArray`/`exprRefArray` now classify
+  // global idents, and `refListSlotOfExpr` resolves a global ref-list element via
+  // `globalRefArrayName`), so once those globals can be emitted with the correct wrapper
+  // type, string/ref global pushes will work with no further change to `emitPush`.
   // ── G7-ref: ref-element growable lists (arrays of structs / unions) ─────────
   // A growable list whose ELEMENT is a reference — `T[]` (a struct ref) or `N[]`
   // (the union box ref) — reuses the `{ backing, len, cap }` wrapper, but its backing
@@ -3674,6 +3867,44 @@ const CASES: Case[] = [
     },
   },
   {
+    // KEYSTONE (ref-list VALTYPE): a `T[]` used as a function PARAM, a function RETURN,
+    // and a module GLOBAL must each select ITS OWN ref-list wrapper heap type — NOT
+    // collapse to the first ref-list slot. With two distinct ref-list types (A[] at
+    // slot 0, B[] at slot 1), the SECOND (non-slot-0) type is used in all three broken
+    // positions: `takeB(xs: B[])` (param), `mkB(): B[]` (return), and `gB: B[]` (global).
+    // Before the fix `fbValtype`/`fbValtypeNullable` emitted `rlWrapIdx[0]` (A[]'s
+    // wrapper) for the B[] param/return/global, so `WebAssembly.compile` rejected the
+    // module with `type error … (expected (ref N), got (ref M))`. The fix indexes
+    // `rlWrapIdx[slot]`, so each position types as B[].
+    name:
+      "ref-list valtype: a non-slot-0 `B[]` as param + return + global selects its own wrapper => 3",
+    src: [
+      "type A = { a: i32 }",
+      "type B = { b: i32 }",
+      "let gA: A[] = []",
+      "let gB: B[] = []",
+      "function takeB(xs: B[]): i32 {",
+      "  return xs.length",
+      "}",
+      "function mkB(): B[] {",
+      "  return []",
+      "}",
+      "function main(): i32 {",
+      "  gB.push({ b: 7 })",
+      "  gB.push({ b: 8 })",
+      "  gA.push({ a: 1 })",
+      "  return takeB(gB) + mkB().length + gA.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // gB has 2 elements (push {b:7}, {b:8}); gA has 1 element (push {a:1}); mkB() is empty.
+      // takeB(gB) = 2, mkB().length = 0, gA.length = 1 → 2 + 0 + 1 = 3.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
+  {
     // KEYSTONE (multi-union): TWO distinct union types declared in one program —
     // `Node` (Lit|Var) and `Ty` (TyInt|TyStr). Construct a value of EACH union, box it,
     // and narrow it back with `is`, reading a variant field of each. Mirrors `ast.vl`'s
@@ -4212,6 +4443,436 @@ const CASES: Case[] = [
     check: async (logs) => {
       const got = await runExport(bytesFromLog(logs), "f");
       if (got !== 10) throw new Error(`f() returned ${got}, expected 10`);
+    },
+  },
+  // ── `fromCodePoint` compiler builtin (H2) ───────────────────────────────────
+  // `fromCodePoint(code)` constructs a single-character VL string (a length-1
+  // `(array i32)` of the code point) — lowered inline by `emitCall` to the one i32
+  // arg + `array.new_fixed $aTypeIdx 1`, and classified as `string`-returning by
+  // `fnRetString` so concat/return-type/let-typing all treat it as a string. As with
+  // every string case, the property is asserted from VL: `main` folds the string to an
+  // i32 via `.length` or an index read. Bootstrap-critical for the self-host lexer's
+  // escape decoding (`value = value + fromCodePoint(cp)`, `return fromCodePoint(...)`).
+  {
+    name: "H2: `fromCodePoint(65)` is a length-1 string whose [0] is 65 ('A')",
+    src: [
+      "function main(): i32 {",
+      "  let s = fromCodePoint(65)",
+      "  return s.length * 1000 + s[0]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // length 1, [0] == 65 → 1*1000 + 65 = 1065.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1065) throw new Error(`main() returned ${got}, expected 1065`);
+    },
+  },
+  {
+    name: 'H2: concat with `fromCodePoint` (`"" + fromCodePoint(66)`) => length 1, [0]=66',
+    src: [
+      "function main(): i32 {",
+      '  let s = "" + fromCodePoint(66)',
+      "  return s.length * 1000 + s[0]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // proves concat classification: length 1, [0]=='B'==66 → 1066.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1066) throw new Error(`main() returned ${got}, expected 1066`);
+    },
+  },
+  {
+    name:
+      "H2: `fromCodePoint(72) + fromCodePoint(73)` => length 2, [0]=72, [1]=73",
+    src: [
+      "function main(): i32 {",
+      "  let s = fromCodePoint(72) + fromCodePoint(73)",
+      "  return s.length * 1000000 + s[0] * 1000 + s[1]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // both operands classify as strings → concat: length 2, [0]=72 ('H'), [1]=73 ('I').
+      // 2*1000000 + 72*1000 + 73 = 2072073.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 2072073) {
+        throw new Error(`main() returned ${got}, expected 2072073`);
+      }
+    },
+  },
+  {
+    name:
+      "H2: a helper `return fromCodePoint(90)` is string-returning, called + indexed => 90",
+    src: [
+      "function mk(): string {",
+      "  return fromCodePoint(90)",
+      "}",
+      "function main(): i32 {",
+      "  let s = mk()",
+      "  return s[0]",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // 'Z' is U+005A = 90; proves the return-type machinery threads the string out.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 90) throw new Error(`main() returned ${got}, expected 90`);
+    },
+  },
+  // ── annotation-aware module-global struct/list typing ───────────────────────
+  // A module GLOBAL's emitted valtype must come from its DECLARED ANNOTATION (exactly
+  // as a local/param/field does), NOT from its initializer literal — otherwise a
+  // `global.get g` of an init-inferred type mismatches a `local.set`/call/field of the
+  // annotation's type. Before this fix `globalKind`/`structIndexOfExpr(init)` typed the
+  // global cell from the literal, so a struct global read into a same-typed local (or a
+  // global whose literal matched a DIFFERENT same-shape struct than its annotation) failed
+  // `WebAssembly.compile` with `expected (ref A), found global.get of type (ref B)`.
+  {
+    name: "global-ann: struct global read into annotated local (`let loc: S = g`) => 5",
+    src: [
+      "type S = { x: i32 }",
+      "let g: S = { x: 5 }",
+      "function main(): i32 {",
+      "  let loc: S = g",
+      "  return loc.x",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 5) throw new Error(`main() returned ${got}, expected 5`);
+    },
+  },
+  {
+    // Two same-SHAPE structs: the global's literal `{ v: 9 }` field-name-matches the
+    // FIRST declared struct (A), but its annotation names B. The init-derived struct
+    // index (A) and the annotation-derived index (B) differ, so passing the global to a
+    // `B`-typed param reproduced the exact (ref A)/(ref B) mismatch.
+    name: "global-ann: two same-shape structs, global annotated B, passed to B param => 9",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "let g: B = { v: 9 }",
+      "function take(b: B): i32 {",
+      "  return b.v",
+      "}",
+      "function main(): i32 {",
+      "  return take(g)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 9) throw new Error(`main() returned ${got}, expected 9`);
+    },
+  },
+  {
+    // A `string[]` const global: its annotation must type the cell as the string-list
+    // wrapper (kind 7), NOT the i32-list (kind 2) the empty-`[]` literal would infer —
+    // the gap flagged in the global-push NOTE. `.length` of the empty list => 0.
+    name: "global-ann: `string[]` const global types as a string list (`.length` => 0)",
+    src: [
+      "let names: string[] = []",
+      "function main(): i32 {",
+      "  return names.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 0) throw new Error(`main() returned ${got}, expected 0`);
+    },
+  },
+  // ── context-aware struct-literal typing (struct-type-identity disambiguation) ──
+  // A struct literal `{ … }`'s wasm type was resolved by FIELD-SHAPE matching to the
+  // FIRST declared struct sharing its field names — ambiguous when two structs declare
+  // the SAME fields. Each literal must instead be typed by its CONTEXT (the array element
+  // type / let or return annotation / list-element type). These cases declare two same-
+  // shape structs `A`/`B` so the field-shape guess (A) DIFFERS from the context (B); each
+  // failed `WebAssembly.compile` with a `(ref A)`/`(ref B)` mismatch before the fix.
+  {
+    // Array ELEMENT context: a `B[]` literal's element must build B, not the first same-
+    // shape struct A. Before: `local.set expected (ref B-list), found (ref A-list)`.
+    name: "struct-ctx: `B[]` literal element typed by the array element type => 9",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: B[] = [{ v: 9 }]",
+      "  return xs[0].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 9) throw new Error(`main() returned ${got}, expected 9`);
+    },
+  },
+  {
+    // A multi-element `B[]` literal — every element is typed as B (not just the first).
+    name: "struct-ctx: multi-element `B[]` literal, both elements typed B => 15",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: B[] = [{ v: 6 }, { v: 9 }]",
+      "  return xs[0].v + xs[1].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 15) throw new Error(`main() returned ${got}, expected 15`);
+    },
+  },
+  {
+    // LET-annotation context: `let b: B = { … }` must build B over the first same-shape
+    // struct A. Before: `local.set expected (ref B), found struct.new (ref A)`.
+    name: "struct-ctx: `let b: B = { … }` typed by the let annotation => 6",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function take(b: B): i32 {",
+      "  return b.v",
+      "}",
+      "function main(): i32 {",
+      "  let b: B = { v: 6 }",
+      "  return take(b)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 6) throw new Error(`main() returned ${got}, expected 6`);
+    },
+  },
+  {
+    // RETURN context: `function mk(): B { return { … } }` must build B over A. Before:
+    // `type error in return[0] (expected (ref B), got (ref A))`.
+    name: "struct-ctx: `return { … }` typed by the function return type => 7",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function mk(): B {",
+      "  return { v: 7 }",
+      "}",
+      "function main(): i32 {",
+      "  let b: B = mk()",
+      "  return b.v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    // PUSH context: `xs.push({ … })` onto a `B[]` must build the list's element struct B.
+    name: "struct-ctx: `.push({ … })` onto a `B[]` typed by the element struct => 8",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: B[] = []",
+      "  xs.push({ v: 8 })",
+      "  return xs[0].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 8) throw new Error(`main() returned ${got}, expected 8`);
+    },
+  },
+  {
+    // INDEX-SET context: `xs[0] = { … }` over a `B[]` must build the element struct B.
+    name: "struct-ctx: `xs[0] = { … }` over a `B[]` typed by the element struct => 4",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: B[] = []",
+      "  xs.push({ v: 1 })",
+      "  xs[0] = { v: 4 }",
+      "  return xs[0].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 4) throw new Error(`main() returned ${got}, expected 4`);
+    },
+  },
+  // ── non-empty ref-list literals honor the SEEDED list slot (wrapper + element) ──
+  // A NON-EMPTY ref-list literal `[{…}]` used to resolve its wrapper/backing/element
+  // struct type from the FIRST element's field-shape (`arrLitElemName` → ambiguous among
+  // same-shape structs), ignoring a seeded `pendingListSlot`/`pendingListKind`. With a
+  // same-shape `A` declared before `B`, a `B[] = [{…}]` literal then built an A-list (the
+  // first field-name match), so the annotated cell — wanting a B-list — failed wasm
+  // validation with `expected (ref B-list), got (ref A-list)`. Each position that seeds
+  // the list context (GLOBAL init, function RETURN, call ARGUMENT — the let / array-element
+  // cases above already covered local lets) must now win over the field-shape guess.
+  {
+    // GLOBAL init context: a module-global `let xs: B[] = [{…}]` constexpr init builds the
+    // annotation's B-list, not the first same-shape struct A's list. Before: the global
+    // init failed `WebAssembly.compile` with `type error in constant expression[0]
+    // (expected (ref B-list), got (ref A-list))`.
+    name: "reflist-seed: GLOBAL non-empty `B[]` literal builds the annotated B-list => 7",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "let xs: B[] = [{ v: 7 }]",
+      "function main(): i32 {",
+      "  return xs[0].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    // GLOBAL init, MULTI-element: every element builds B (not just the first).
+    name: "reflist-seed: GLOBAL multi-element `B[]` literal, both elements B => 12",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "let xs: B[] = [{ v: 7 }, { v: 5 }]",
+      "function main(): i32 {",
+      "  return xs[0].v + xs[1].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
+    },
+  },
+  {
+    // RETURN context: `function mk(): B[] { return [{…}] }` must build the declared return
+    // B-list. Before: `type error in return[0] (expected (ref B-list), got (ref A-list))`.
+    name: "reflist-seed: `return [{…}]` typed by the function return list type => 12",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function mk(): B[] {",
+      "  return [{ v: 7 }, { v: 5 }]",
+      "}",
+      "function main(): i32 {",
+      "  let xs: B[] = mk()",
+      "  return xs[0].v + xs[1].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
+    },
+  },
+  {
+    // CALL-ARGUMENT context: `take([{…}])` into a `B[]` param must build the param's
+    // element struct B. Before: `call[0] expected (ref B-list), found struct.new of type
+    // (ref A)`.
+    name: "reflist-seed: `take([{…}])` typed by the `B[]` param element struct => 7",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function take(xs: B[]): i32 {",
+      "  return xs[0].v",
+      "}",
+      "function main(): i32 {",
+      "  return take([{ v: 7 }])",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    // REGRESSION (str-op scratch in a returned object literal): a function whose body is
+    // a bare implicit-return `{ … }` with a `.slice` in a FIELD (the `mkTok` shape). The
+    // str-op scratch-frame detection must descend into the object-literal's fields, or the
+    // slice's scratch slots fall past the declared locals → `invalid local index`.
+    name: "str-op scratch reserved for a .slice inside a returned object literal => 7",
+    src: [
+      "type T = { s: string, n: i32 }",
+      "function mk(src: string): T {",
+      "  { s: src.slice(1, 3), n: 5 }",
+      "}",
+      "function main(): i32 {",
+      "  let t = mk(\"hello\")",
+      "  return t.s.length + t.n",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // src.slice(1,3) of "hello" = "el" (length 2); 2 + 5 = 7. Before the fix the str-op
+      // frame is unreserved and instantiation fails with an invalid local index.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    // REGRESSION (assignment to a list-typed GLOBAL): `g = []` where `g: string[]` must
+    // build a STRING-list wrapper, not the default i32-list — the `collectFns` shape
+    // (`globalNames = []`). emitAssign's global-store path must seed the global's declared
+    // list/struct context before lowering the RHS, like the global-INIT path does.
+    name: "assignment to a string[] global reseeds the list type (`g = []`) => 1",
+    src: [
+      "let g: string[] = []",
+      "function clear(): i32 {",
+      "  g = []",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  g.push(\"a\")",
+      "  g.push(\"b\")",
+      "  clear()",
+      "  g.push(\"c\")",
+      "  return g.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // clear() reassigns g to a FRESH string-list (`g = []`); the reassigned cell must
+      // have the correct string-list wrapper type for the later push to validate. After
+      // clear there is one element => length 1 (3 if the reassignment were dropped).
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 1) throw new Error(`main() returned ${got}, expected 1`);
+    },
+  },
+  {
+    // REGRESSION (indexed assignment into a STRING list): `xs[i] = s` where `xs: string[]`
+    // must unwrap via the STRING-list wrapper (`mkListIdx`), not the i32-list wrapper —
+    // the `pushNarrow` shape (`narrowNames[i] = name`). emitAssign's index path had no
+    // string-list branch, so it `struct.get`-ed the wrong wrapper type.
+    name: "indexed assignment into a string[] (`xs[i] = s`) validates => 2",
+    src: [
+      "let g: string[] = []",
+      "function setup(): i32 {",
+      "  g.push(\"a\")",
+      "  g.push(\"b\")",
+      "  g[0] = \"zzz\"",
+      "  return 0",
+      "}",
+      "function main(): i32 {",
+      "  setup()",
+      "  return g.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // The point is that `g[0] = \"zzz\"` (string-list index store) INSTANTIATES — before
+      // the fix it struct.get-ed the i32-list wrapper and wasm validation rejected it.
+      // g = [\"zzz\", \"b\"] => length 2.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 2) throw new Error(`main() returned ${got}, expected 2`);
     },
   },
 ];
