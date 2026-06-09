@@ -3938,7 +3938,19 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // no result on the stack (it `local.set`s). It is lowered by `emitAssign` from
     // `emitStmt`, so seeing it as an operand here is an unsupported nested-assignment.
     if e.binOp == "=" {
-      return emitFail("emitProgram: assignment is not a value expression")
+      // Assignment is an EXPRESSION yielding its right-hand side (DECISIONS:
+      // assignment-as-expression): `b = (a = 5)`, `while (a = a - 1) > 0`, and a
+      // trailing `count = count + 1` returning the new value. Lowered as
+      // STORE-then-RE-READ — `emitAssign` stores, then the target re-reads through
+      // the normal Ident path (which carries the non-const-ref re-cast logic).
+      // Ident targets only (a local or module global); an Index/Member assignment
+      // in VALUE position is out of this slice.
+      let tgt = P.nodes[e.binLeft]
+      if tgt is Ident {
+        if emitAssign(body, exprIx, fnIx) < 0 { return 0 - 1 }
+        return emitExpr(body, e.binLeft, fnIx)
+      }
+      return emitFail("emitProgram: only an identifier assignment is a value expression")
     }
     // G8: nullish-coalescing `m[k] ?? d` — a FUSED map get-with-default: scan `m` for
     // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
@@ -4942,8 +4954,16 @@ function stmtIsTailValue(stmtIx: i32): boolean {
   if s is ObjLit { return true }
   if s is ArrayLit { return true }
   if s is BinExpr {
-    // An assignment statement is NOT a value; any other binary op is.
-    return s.binOp != "="
+    if s.binOp == "=" {
+      // A trailing assignment over an IDENT target IS a tail value — assignment
+      // yields its RHS (DECISIONS: assignment-as-expression), so
+      // `function bump() { count = count + 1 }` returns the new count. Index/
+      // Member-target assignments stay statements (value form not lowered yet).
+      let tgt = P.nodes[s.binLeft]
+      if tgt is Ident { return true }
+      return false
+    }
+    return true
   }
   if s is Call {
     // A value-returning call `f(..)` is a tail value; a `recv.push(x)` member-call is
