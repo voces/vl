@@ -74,6 +74,7 @@ const runFixture = (): Promise<string[]> =>
       `  CharLit,\n` +
       `  FieldDef,\n` +
       `  FieldInit,\n` +
+      `  ForRange,\n` +
       `  FuncDecl,\n` +
       `  Ident,\n` +
       `  IfStmt,\n` +

@@ -1330,6 +1330,14 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
       } else if s is WhileStmt {
         // Wasm locals are function-scoped, so collect locals from the while body too.
         if collectLocals(s.whileBody, fnIx) < 0 { scopePop() return 0 - 1 }
+      } else if s is ForRange {
+        // A range `for` introduces TWO i32 slots in pre-order: the loop variable and
+        // a synthetic bound temp (the `to` expression is evaluated ONCE). The temp's
+        // name carries a `#` so it can never collide with a user identifier.
+        let fvSlot = addLocalName(s.frVar, 0, 0 - 1)
+        scopeBind(s.frVar, fvSlot)
+        addLocalName(s.frVar + "#b", 0, 0 - 1)
+        if collectLocals(s.frBody, fnIx) < 0 { scopePop() return 0 - 1 }
       }
       i = i + 1
     }
@@ -1566,6 +1574,10 @@ function blockHasMemberPopKind(blockIx: i32, fnIx: i32, kind: i32): boolean {
       } else if s is WhileStmt {
         if exprHasMemberPopKind(s.whileCond, fnIx, kind) { return true }
         if blockHasMemberPopKind(s.whileBody, fnIx, kind) { return true }
+      } else if s is ForRange {
+        if exprHasMemberPopKind(s.frFrom, fnIx, kind) { return true }
+        if exprHasMemberPopKind(s.frTo, fnIx, kind) { return true }
+        if blockHasMemberPopKind(s.frBody, fnIx, kind) { return true }
       }
       i = i + 1
     }
@@ -1606,6 +1618,8 @@ function blockHasPushKind(blockIx: i32, fnIx: i32, kind: i32): boolean {
         if ifChainHasPushKind(stmts[i], fnIx, kind) { return true }
       } else if s is WhileStmt {
         if blockHasPushKind(s.whileBody, fnIx, kind) { return true }
+      } else if s is ForRange {
+        if blockHasPushKind(s.frBody, fnIx, kind) { return true }
       }
       i = i + 1
     }
@@ -1671,6 +1685,8 @@ function collectRefPushSlots(blockIx: i32, fnIx: i32): i32 {
         collectRefPushSlotsIf(stmts[i], fnIx)
       } else if s is WhileStmt {
         collectRefPushSlots(s.whileBody, fnIx)
+      } else if s is ForRange {
+        collectRefPushSlots(s.frBody, fnIx)
       }
       i = i + 1
     }
@@ -1756,6 +1772,10 @@ function collectMemberPopRefSlots(blockIx: i32, fnIx: i32): i32 {
       } else if s is WhileStmt {
         collectMemberPopRefSlotsExpr(s.whileCond, fnIx)
         collectMemberPopRefSlots(s.whileBody, fnIx)
+      } else if s is ForRange {
+        collectMemberPopRefSlotsExpr(s.frFrom, fnIx)
+        collectMemberPopRefSlotsExpr(s.frTo, fnIx)
+        collectMemberPopRefSlots(s.frBody, fnIx)
       }
       i = i + 1
     }
@@ -1940,6 +1960,10 @@ function blockHasStrOp(blockIx: i32, fnIx: i32): boolean {
       } else if s is WhileStmt {
         if exprHasStrOp(s.whileCond, fnIx) { return true }
         if blockHasStrOp(s.whileBody, fnIx) { return true }
+      } else if s is ForRange {
+        if exprHasStrOp(s.frFrom, fnIx) { return true }
+        if exprHasStrOp(s.frTo, fnIx) { return true }
+        if blockHasStrOp(s.frBody, fnIx) { return true }
       }
       i = i + 1
     }
@@ -2009,10 +2033,16 @@ function declaredSlotOf(name: string): i32 {
 // local. Declared locals sit AFTER the params, so the slot is `paramCount + pos`
 // where `pos` is the name's resolved declared-local position (`declaredSlotOf`).
 function declaredIndexOf(fnIx: i32, name: string): i32 {
-  if fnIx < 0 { return 0 - 1 }   // module-scope initializer (no enclosing function)
   let pos = declaredSlotOf(name)
   if pos < 0 {
     return 0 - 1
+  }
+  if fnIx < 0 {
+    // Module scope = the START FUNCTION's body (top-level statements — a `for`
+    // loop's var/bound live here). It has no params, so the local index IS the
+    // slot. (A global-section constexpr init also runs with fnIx -1, but the
+    // scope stack is empty there, so `declaredSlotOf` already returned -1.)
+    return pos
   }
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
@@ -4724,6 +4754,87 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     loopBrkDepth.pop()
     return 0
   }
+  if s is ForRange {
+    // `for v in A to B [step K] { body }` — an INCLUSIVE numeric range, lowered to
+    // the same block/loop shape as `while`. The loop var `v` and a synthetic bound
+    // temp own the next TWO cursor slots (collectLocals allocated them in this same
+    // pre-order). The step must be a CONSTANT integer literal (optionally negated);
+    // its SIGN picks the exit comparison: ascending exits when v > bound (i32.le_s
+    // + eqz), descending when v < bound (i32.ge_s + eqz). The bound is evaluated
+    // ONCE into the temp.
+    let vSlot = emitLetCursor
+    emitLetCursor = emitLetCursor + 1
+    let bSlot = emitLetCursor
+    emitLetCursor = emitLetCursor + 1
+    let paramN = 0
+    if fnIx >= 0 {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl { paramN = fn.fnParams.length }
+    }
+    let vIdx = paramN + vSlot
+    let bIdx = paramN + bSlot
+    // Static step: default +1; `step <int>` / `step -<int>`.
+    let stepK = 1
+    if s.frStep >= 0 {
+      let st = P.nodes[s.frStep]
+      if st is NumLit {
+        stepK = parseI32(st.numText)
+      } else if st is Unary {
+        if st.unOp == "-" {
+          let inner = P.nodes[st.unArg]
+          if inner is NumLit {
+            stepK = 0 - parseI32(inner.numText)
+          } else {
+            return emitFail("emitProgram: for-range step must be a constant integer")
+          }
+        } else {
+          return emitFail("emitProgram: for-range step must be a constant integer")
+        }
+      } else {
+        return emitFail("emitProgram: for-range step must be a constant integer")
+      }
+    }
+    if stepK == 0 {
+      return emitFail("emitProgram: for-range step must not be zero")
+    }
+    // v = A; bound = B (each evaluated once, in source order)
+    if emitExpr(body, s.frFrom, fnIx) < 0 { return 0 - 1 }
+    fbLocalSet(vIdx)
+    if emitExpr(body, s.frTo, fnIx) < 0 { return 0 - 1 }
+    fbLocalSet(bIdx)
+    // Bind the loop var for the body (mirrors the collect pass's scopeBind).
+    scopeBind(s.frVar, vSlot)
+    fbBlock(64)              // 0x02 block, void
+    ctrlEnter()
+    loopBrkDepth.push(ctrlDepth)
+    fbLoop(64)               // 0x03 loop, void
+    ctrlEnter()
+    loopContDepth.push(ctrlDepth)
+    // continue-condition: le_s (ascending) / ge_s (descending), inverted to exit
+    fbLocalGet(vIdx)
+    fbLocalGet(bIdx)
+    if stepK > 0 {
+      fbI32Bin(76)           // 0x4c i32.le_s
+    } else {
+      fbI32Bin(78)           // 0x4e i32.ge_s
+    }
+    fbI32Eqz()               // 0x45 invert: exit when out of range
+    fbBrIf(1)                // 0x0d br_if -> break out of block
+    if emitStmts(body, s.frBody, fnIx) < 0 { return 0 - 1 }
+    // v = v + K
+    fbLocalGet(vIdx)
+    fbI32Const(stepK)
+    fbI32Bin(106)            // 0x6a i32.add
+    fbLocalSet(vIdx)
+    fbBr(0)                  // continue loop
+    fbEnd()                  // end loop
+    ctrlLeave()
+    loopContDepth.pop()
+    fbEnd()                  // end block
+    ctrlLeave()
+    loopBrkDepth.pop()
+    return 0
+  }
   if s is BreakStmt {
     // `break`: branch out of the innermost loop's wrapping BLOCK, so control resumes
     // after the whole loop. No loop labels in the self-host AST, so always the
@@ -6019,6 +6130,37 @@ function startFnDetectScratch(): i32 {
     }
     gi = gi + 1
   }
+  // Top-level STATEMENTS may also need scratch (a `.push` / string op / map op in a
+  // top-level `for`/`while` body or a bare call). Scan each through the same
+  // walkers (which recurse into for/while/if bodies).
+  let si = 0
+  while si < startStmts.length {
+    let st = P.nodes[startStmts[si]]
+    if st is ForRange {
+      if blockHasMemberPopKind(st.frBody, 0 - 1, 0) { fnUsesPush = true }
+      if blockHasMemberPopKind(st.frBody, 0 - 1, 1) { fnUsesRefPush = true }
+      if blockHasMemberPopKind(st.frBody, 0 - 1, 2) { fnUsesStrPush = true }
+      if blockHasStrOp(st.frBody, 0 - 1) { fnUsesStrOp = true }
+      if blockHasMapOp(st.frBody, 0 - 1) { fnUsesMap = true }
+      collectMemberPopRefSlots(st.frBody, 0 - 1)
+    } else if st is WhileStmt {
+      if blockHasMemberPopKind(st.whileBody, 0 - 1, 0) { fnUsesPush = true }
+      if blockHasMemberPopKind(st.whileBody, 0 - 1, 1) { fnUsesRefPush = true }
+      if blockHasMemberPopKind(st.whileBody, 0 - 1, 2) { fnUsesStrPush = true }
+      if blockHasStrOp(st.whileBody, 0 - 1) { fnUsesStrOp = true }
+      if blockHasMapOp(st.whileBody, 0 - 1) { fnUsesMap = true }
+      collectMemberPopRefSlots(st.whileBody, 0 - 1)
+    } else {
+      // expression statements (a bare call / assignment): the expr walkers
+      if exprHasMemberPopKind(startStmts[si], 0 - 1, 0) { fnUsesPush = true }
+      if exprHasMemberPopKind(startStmts[si], 0 - 1, 1) { fnUsesRefPush = true }
+      if exprHasMemberPopKind(startStmts[si], 0 - 1, 2) { fnUsesStrPush = true }
+      if exprHasStrOp(startStmts[si], 0 - 1) { fnUsesStrOp = true }
+      if exprHasMapOp(startStmts[si], 0 - 1) { fnUsesMap = true }
+      collectMemberPopRefSlotsExpr(startStmts[si], 0 - 1)
+    }
+    si = si + 1
+  }
   0
 }
 
@@ -6029,11 +6171,44 @@ function startFnDetectScratch(): i32 {
 // `emitFuncCode`'s framing: detect scratch frames, lay out locals via `fbBeginFunc`,
 // emit the locals vector (`fbEmitLocalsVec`) with NO declared locals, then the body and
 // the `end`, size-prefixed. Returns 0, or -1 (via `emitFail`).
+// Collect the start function's DECLARED locals from the top-level statements: a
+// `for` range loop's var+bound pair (and any `let`s nested in loop/if bodies, via
+// the same collectLocals walkers user functions use, with the module-level
+// `fnIx = -1`). Resets the local registry + scope stack like `buildLocals`.
+function collectStartLocals(): i32 {
+  localNames = []
+  localIsRef = []
+  localStructIdx = []
+  scopeNames = []
+  scopeSlots = []
+  scopeFrames = []
+  scopePush()
+  let i = 0
+  while i < startStmts.length {
+    let s = P.nodes[startStmts[i]]
+    if s is ForRange {
+      let fvSlot = addLocalName(s.frVar, 0, 0 - 1)
+      scopeBind(s.frVar, fvSlot)
+      addLocalName(s.frVar + "#b", 0, 0 - 1)
+      if collectLocals(s.frBody, 0 - 1) < 0 { scopePop() return 0 - 1 }
+    } else if s is WhileStmt {
+      if collectLocals(s.whileBody, 0 - 1) < 0 { scopePop() return 0 - 1 }
+    } else if s is IfStmt {
+      if collectLocalsIf(startStmts[i], 0 - 1) < 0 { scopePop() return 0 - 1 }
+    }
+    i = i + 1
+  }
+  scopePop()
+  localNames.length
+}
+
 function emitStartFnCode(out: i32[]): i32 {
-  // Scratch detection + layout: the start fn has no params and no declared locals, so
-  // the cursor starts at 0 and only reserved scratch frames advance it.
+  // Scratch detection + layout: declared locals come from the top-level statements
+  // (a `for`'s var/bound pair); the scratch frames follow them.
   startFnDetectScratch()
-  fbBeginFunc(0, 0)
+  let nStartLocals = collectStartLocals()
+  if nStartLocals < 0 { return 0 - 1 }
+  fbBeginFunc(0, nStartLocals)
 
   let bodyExpr: i32[] = []
   let exprPrev = wTarget(bodyExpr)
@@ -6073,8 +6248,8 @@ function emitStartFnCode(out: i32[]): i32 {
   wTarget(exprPrev)
 
   let body: i32[] = []
-  // Locals vector: no declared locals, just the (possibly empty) scratch frames.
-  if fbEmitLocalsVec(body, 0) < 0 { return 0 - 1 }
+  // Locals vector: the start fn's declared locals (for-loop vars), then the scratch frames.
+  if fbEmitLocalsVec(body, nStartLocals) < 0 { return 0 - 1 }
   appendAll(body, bodyExpr)
   let endPrev = wTarget(body)
   fbEnd()                  // 0x0b end (void → void: stack already empty)
@@ -8187,6 +8362,10 @@ function blockHasMapOp(blockIx: i32, fnIx: i32): boolean {
       } else if s is WhileStmt {
         if exprHasMapOp(s.whileCond, fnIx) { return true }
         if blockHasMapOp(s.whileBody, fnIx) { return true }
+      } else if s is ForRange {
+        if exprHasMapOp(s.frFrom, fnIx) { return true }
+        if exprHasMapOp(s.frTo, fnIx) { return true }
+        if blockHasMapOp(s.frBody, fnIx) { return true }
       }
       i = i + 1
     }
