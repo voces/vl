@@ -4668,6 +4668,94 @@ const CASES: Case[] = [
       if (got !== 4) throw new Error(`main() returned ${got}, expected 4`);
     },
   },
+  // ── non-empty ref-list literals honor the SEEDED list slot (wrapper + element) ──
+  // A NON-EMPTY ref-list literal `[{…}]` used to resolve its wrapper/backing/element
+  // struct type from the FIRST element's field-shape (`arrLitElemName` → ambiguous among
+  // same-shape structs), ignoring a seeded `pendingListSlot`/`pendingListKind`. With a
+  // same-shape `A` declared before `B`, a `B[] = [{…}]` literal then built an A-list (the
+  // first field-name match), so the annotated cell — wanting a B-list — failed wasm
+  // validation with `expected (ref B-list), got (ref A-list)`. Each position that seeds
+  // the list context (GLOBAL init, function RETURN, call ARGUMENT — the let / array-element
+  // cases above already covered local lets) must now win over the field-shape guess.
+  {
+    // GLOBAL init context: a module-global `let xs: B[] = [{…}]` constexpr init builds the
+    // annotation's B-list, not the first same-shape struct A's list. Before: the global
+    // init failed `WebAssembly.compile` with `type error in constant expression[0]
+    // (expected (ref B-list), got (ref A-list))`.
+    name: "reflist-seed: GLOBAL non-empty `B[]` literal builds the annotated B-list => 7",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "let xs: B[] = [{ v: 7 }]",
+      "function main(): i32 {",
+      "  return xs[0].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    // GLOBAL init, MULTI-element: every element builds B (not just the first).
+    name: "reflist-seed: GLOBAL multi-element `B[]` literal, both elements B => 12",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "let xs: B[] = [{ v: 7 }, { v: 5 }]",
+      "function main(): i32 {",
+      "  return xs[0].v + xs[1].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
+    },
+  },
+  {
+    // RETURN context: `function mk(): B[] { return [{…}] }` must build the declared return
+    // B-list. Before: `type error in return[0] (expected (ref B-list), got (ref A-list))`.
+    name: "reflist-seed: `return [{…}]` typed by the function return list type => 12",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function mk(): B[] {",
+      "  return [{ v: 7 }, { v: 5 }]",
+      "}",
+      "function main(): i32 {",
+      "  let xs: B[] = mk()",
+      "  return xs[0].v + xs[1].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 12) throw new Error(`main() returned ${got}, expected 12`);
+    },
+  },
+  {
+    // CALL-ARGUMENT context: `take([{…}])` into a `B[]` param must build the param's
+    // element struct B. Before: `call[0] expected (ref B-list), found struct.new of type
+    // (ref A)`.
+    name: "reflist-seed: `take([{…}])` typed by the `B[]` param element struct => 7",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function take(xs: B[]): i32 {",
+      "  return xs[0].v",
+      "}",
+      "function main(): i32 {",
+      "  return take([{ v: 7 }])",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the

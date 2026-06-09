@@ -3987,6 +3987,8 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         // callee's struct index (consumed by the immediately-following object-literal
         // lowering; a non-literal argument simply ignores it). Default -1 = infer.
         pendingStructIdx = 0 - 1
+        pendingListKind = 0
+        pendingListSlot = 0
         // A VARIANT-typed param position (kind 8): the callee wants the CONCRETE variant
         // struct ref, but a union-valued argument (a narrowed local/param, a union-
         // returning call) is the BOX `{tag, value}`. Bridge the boundary by unboxing the
@@ -4003,6 +4005,15 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
             if vtKindOfParam(cParams[i]) == 8 {
               cVi = paramStructIdxOf(cParams[i])
             }
+            // A ref-array param position (`take(xs: B[])`): seed the list context from the
+            // param's annotation so a non-empty `B[]` LITERAL argument builds the param's
+            // declared element type, not the first-element field-shape guess. Mirrors the
+            // let / return / global seeding (consumed by `emitArr`).
+            let cp = P.nodes[cParams[i]]
+            if cp is Param {
+              pendingListKind = tyAnnRefListKind(cp.parType)
+              pendingListSlot = tyAnnRefListSlot(cp.parType)
+            }
           }
         }
         if emitExpr(body, args[i], fnIx) < 0 { return 0 - 1 }
@@ -4013,6 +4024,8 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
           }
         }
         pendingStructIdx = 0 - 1
+        pendingListKind = 0
+        pendingListSlot = 0
         i = i + 1
       }
       fbCall(target)         // 0x10 call
@@ -4566,10 +4579,18 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       if rsi >= 0 {
         if retTRFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
       }
+      // A `return [{ … }]` ref-list LITERAL must build the function's DECLARED return
+      // list element type, not a first-element field-shape match — seed the list context
+      // from the return annotation exactly as the let / global path does (consumed by
+      // `emitArr`). A non-list return ignores it.
+      pendingListKind = tyAnnRefListKind(fn.fnRet)
+      pendingListSlot = tyAnnRefListSlot(fn.fnRet)
     }
     // Push the return value, then the `return` instruction.
     if emitExpr(body, s.retArg, fnIx) < 0 { return 0 - 1 }
     pendingStructIdx = 0 - 1
+    pendingListKind = 0
+    pendingListSlot = 0
     fbReturn()               // 0x0f return
     return 0
   }
@@ -5256,6 +5277,43 @@ function retStructIndex(tyIx: i32): i32 {
     }
   }
   0 - 1
+}
+
+// The `pendingListKind` a type-annotation node at `tyIx` names (1 = struct/MAP ref list,
+// 2 = union box ref list, 3 = string list), or 0 when it is not a list annotation. Shared
+// by the let / return / call-arg / global seeding so each position threads the SAME
+// annotation-derived list context into `emitArr` (so a non-empty `B[]` literal in a return
+// or argument position builds B's list, not the first-element field-shape guess). A
+// `LetDecl`-specific wrapper (`letAnnRefListKind`) forwards its `letType` here.
+function tyAnnRefListKind(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let lt = P.nodes[tyIx]
+    if lt is TypeRef {
+      if nameIsRefArray(lt.tyName) {
+        if refArrElemKind(lt.tyName) == 2 { return 2 }
+        return 1
+      }
+      if nameIsStringArray(lt.tyName) { return 3 }
+    }
+  }
+  0
+}
+
+// The ref-list TABLE SLOT a type-annotation node at `tyIx` names (`Tok[]` → the `Tok`
+// slot), or 0 when it is not a ref-array annotation. Mirror of `tyAnnRefListKind` for the
+// slot; threads `pendingListSlot` so a ref-list literal builds the annotation's distinct
+// element type.
+function tyAnnRefListSlot(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let lt = P.nodes[tyIx]
+    if lt is TypeRef {
+      if nameIsRefArray(lt.tyName) {
+        let s = rlSlotByName(refArrElemName(lt.tyName))
+        if s >= 0 { return s }
+      }
+    }
+  }
+  0
 }
 
 // `1` if the parameter node at `paramIx` is the struct type, else `0`.
@@ -7676,21 +7734,12 @@ function letRefListSlot(letIx: i32, fnIx: i32): i32 {
 // or `0` when it is not a ref-array annotation. Used to type an empty `[]` initializer
 // (a non-empty literal types itself from its elements).
 function letAnnRefListKind(letIx: i32): i32 {
+  // `pendingListKind` semantics: 1 = struct/MAP ref list (use `pendingListSlot`),
+  // 2 = union box ref list, 3 = string list. Delegates to the shared `tyAnnRefListKind`
+  // over the let's `letType` so the let / return / call-arg / global seeds agree.
   let d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 {
-      let lt = P.nodes[d.letType]
-      if lt is TypeRef {
-        // `pendingListKind` semantics: 1 = struct/MAP ref list (use `pendingListSlot`),
-        // 2 = union box ref list, 3 = string list. A map-array (`refArrElemKind` 3) is a
-        // ref list disambiguated by its slot, so it threads kind 1 (NOT the string-3).
-        if nameIsRefArray(lt.tyName) {
-          if refArrElemKind(lt.tyName) == 2 { return 2 }
-          return 1
-        }
-        if nameIsStringArray(lt.tyName) { return 3 }
-      }
-    }
+    return tyAnnRefListKind(d.letType)
   }
   0
 }
@@ -7701,15 +7750,7 @@ function letAnnRefListKind(letIx: i32): i32 {
 function letAnnRefListSlot(letIx: i32): i32 {
   let d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 {
-      let lt = P.nodes[d.letType]
-      if lt is TypeRef {
-        if nameIsRefArray(lt.tyName) {
-          let s = rlSlotByName(refArrElemName(lt.tyName))
-          if s >= 0 { return s }
-        }
-      }
-    }
+    return tyAnnRefListSlot(d.letType)
   }
   0
 }
