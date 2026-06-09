@@ -780,6 +780,37 @@ function checkCallNode(n: Call, ix: i32): i32 {
         }
         return TY_I32
       }
+      // `.map(fn)` / `.filter(pred)`: the callback is a 1-arg function over the
+      // element type; map yields an array of the callback's return, filter the
+      // same array type (its predicate must yield bool).
+      if cfn.memProp == "map" || cfn.memProp == "filter" {
+        let cargs = n.callArgs
+        if cargs.length != 1 {
+          tErr(cfn.memProp + " expects 1 argument, got " + i32ToStr(cargs.length), ix)
+          return TY_ERR
+        }
+        let cbTy = checkNode(cargs[0])
+        let cb = T.tys[cbTy]
+        if cb is TyFunc {
+          let cbParams = cb.fnParamTypes
+          if cbParams.length != 1 {
+            tErr(cfn.memProp + " callback expects 1 parameter, got " +
+              i32ToStr(cbParams.length), ix)
+          } else if !assignable(rt.aElem, cbParams[0]) {
+            tErr(cfn.memProp + " callback: parameter expects " +
+              tyToStr(cbParams[0]) + ", got " + tyToStr(rt.aElem), ix)
+          }
+          if cfn.memProp == "filter" {
+            if !assignable(cb.fnRet, TY_BOOL) {
+              tErr("filter predicate must yield bool, got " + tyToStr(cb.fnRet), ix)
+            }
+            return recvTy
+          }
+          return mkArrayTy(cb.fnRet)
+        }
+        tErr(cfn.memProp + " expects a function, got " + tyToStr(cbTy), ix)
+        return TY_ERR
+      }
       tErr("no method '." + cfn.memProp + "' on array " + tyToStr(recvTy), ix)
       return TY_ERR
     }
@@ -1193,7 +1224,10 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
     }
     // `f` is hoisted in the outer scope (checkProgram pre-pass), but re-declaring
     // it here covers nested function decls and is an idempotent rebind otherwise.
-    declare(n.fnName, mkFuncTy(paramTys, ret))
+    // (An anonymous function EXPRESSION has no name to bind.)
+    if n.fnName != "" {
+      declare(n.fnName, mkFuncTy(paramTys, ret))
+    }
   }
   // Save the inference accumulators (a demand-inference can nest inside another
   // function's body check) and the enclosing return type.
@@ -1243,24 +1277,30 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
         "' — annotate a return type", n.fnBody)
       inferred = TY_ERR
     }
+    ret = inferred
     // Patch the hoisted TyFunc IN PLACE so existing references see the result;
-    // a nested (un-hoisted) function declares fresh.
-    let bound = lookup(n.fnName)
-    let patched = false
-    if bound >= 0 {
-      let bt = T.tys[bound]
-      if bt is TyFunc {
-        bt.fnRet = inferred
-        patched = true
+    // a nested (un-hoisted) NAMED function declares fresh; an anonymous lambda
+    // just carries its type as the expression value.
+    if n.fnName != "" {
+      let bound = lookup(n.fnName)
+      let patched = false
+      if bound >= 0 {
+        let bt = T.tys[bound]
+        if bt is TyFunc {
+          bt.fnRet = inferred
+          patched = true
+        }
       }
-    }
-    if !patched {
-      declare(n.fnName, mkFuncTy(paramTys, inferred))
+      if !patched {
+        declare(n.fnName, mkFuncTy(paramTys, inferred))
+      }
     }
     inferObserved = savedObserved
     inferSawErr = savedSawErr
   }
-  TY_VOID
+  // The function's own type — a FuncDecl in EXPRESSION position (a lambda, or a
+  // named function referenced as a value) evaluates to it.
+  mkFuncTy(paramTys, ret)
 }
 
 // The program root: pass 0 registers `type` declarations (structs, then unions over

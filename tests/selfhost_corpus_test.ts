@@ -22,8 +22,8 @@
 // next rungs (print emission; span threading). For now the whitelist is the subset of
 // corpus files where the VL front end PARSES + TYPE-CHECKS and agrees with the spec.
 //
-// LEDGER: 251 / 422 single-file corpus cases conform — VL's VERDICT matches the
-// spec: 166 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
+// LEDGER: 255 / 422 single-file corpus cases conform — VL's VERDICT matches the
+// spec: 170 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
 // and 85 REJECTED (invalid programs VL refuses — a type error the checker raises,
 // or a lexer/parser syntax error). Every entry is VL behaving CORRECTLY per the
 // directive. (For some advanced `@error` files VL refuses the program because the
@@ -36,7 +36,7 @@
 // through the pipeline in isolation (`tests/selfhost/probe_fullsweep.ts`-style) and
 // keeps the agreeing ones. As `typecheck.vl`/`parser.vl` gain coverage, re-sweep and
 // promote newly-agreeing files. A whitelisted file that starts DISAGREEING fails.
-// The count is the conformance ledger. The 171 current DISAGREEMENTS are the work
+// The count is the conformance ledger. The 167 current DISAGREEMENTS are the work
 // left: clean files VL can't yet PARSE (lambdas, generics, if/then/else
 // expressions) and `@error` files VL doesn't yet CATCH (redeclaration, const-reassign).
 
@@ -69,6 +69,8 @@ const WHITELIST = [
   "arrays/infer-empty-index-set.vl",
   "arrays/infer-empty-push.vl",
   "arrays/infer-empty-string.vl",
+  "arrays/map-filter-f64.vl",
+  "arrays/map-filter.vl",
   "chars/literals.vl",
   "functions/calls.vl",
   "functions/closure.vl",
@@ -81,6 +83,7 @@ const WHITELIST = [
   "functions/forward-reference-struct-param.vl",
   "functions/forward-reference.vl",
   "functions/function-equality.vl",
+  "functions/lambda.vl",
   "functions/mutual-recursion-inferred.vl",
   "functions/mutual-recursion-struct-param.vl",
   "functions/mutual-recursion.vl",
@@ -168,6 +171,7 @@ const WHITELIST = [
   "maps/string-values.vl",
   "objects/equality-function-field.vl",
   "objects/equality.vl",
+  "objects/inline-method.vl",
   "objects/member-call.vl",
   "objects/struct.vl",
   "objects/trailing-comma.vl",
