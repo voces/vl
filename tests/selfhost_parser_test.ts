@@ -43,7 +43,7 @@ const DRIVER = compilerUrl("__parser_driver__.vl");
 // The import header the driver module opens with — wires it to the real modules. The
 // fixture's tree-walkers `is`-narrow the `Node` union, so every variant is imported.
 const driverHeader =
-  `import { P, i32ToStr, NumLit, StrLit, CharLit, BoolLit, Ident, Unary, BinExpr, Call, Member, Paren, ErrExpr, LetDecl, Param, TypeRef, FuncDecl, IfStmt, WhileStmt, RetStmt, Block, Program } from "./ast"\nimport { parseProgram } from "./parser"\n\n`;
+  `import { P, i32ToStr, NumLit, StrLit, CharLit, BoolLit, Ident, Unary, BinExpr, Call, Member, Paren, ErrExpr, LetDecl, Param, TypeRef, FuncDecl, IfStmt, WhileStmt, BreakStmt, ContinueStmt, RetStmt, Block, Program } from "./ast"\nimport { parseProgram } from "./parser"\n\n`;
 
 // Split the standalone fixture into its helper DEFS (functions: tok, buildTokens,
 // the AST tree-walkers) and its RUN section (build tokens → parseProgram → walk).
@@ -231,6 +231,54 @@ print("diags: " + i32ToStr(P.diags.length))
       "    block",
       "    block",
       "diags: 0",
+    ],
+  },
+  {
+    // `while x { break }` parses with NO diagnostics: the BREAK keyword is a bare
+    // loop-control statement (`parseBreak` -> `mkBreak`). Five arena nodes, pushed
+    // bottom-up: [0] the `x` condition ident, [1] the `break`, [2] its block, [3]
+    // the while, [4] the program — so node 1 is the `BreakStmt`. Real parseProgram.
+    name: "parses a bare `break` inside a while with no diagnostics",
+    body: `
+P.toks.push({ kind: "WHILE", text: "while", pos: 0 })
+P.toks.push({ kind: "IDENT", text: "x", pos: 6 })
+P.toks.push({ kind: "LBRACE", text: "{", pos: 8 })
+P.toks.push({ kind: "BREAK", text: "break", pos: 10 })
+P.toks.push({ kind: "RBRACE", text: "}", pos: 16 })
+P.toks.push({ kind: "EOF", text: "", pos: 17 })
+let _root = parseProgram()
+print("nodes: " + i32ToStr(P.nodes.length))
+print("diags: " + i32ToStr(P.diags.length))
+let stmt = P.nodes[1]
+if stmt is BreakStmt { print("kind: break") }
+`,
+    expected: [
+      "nodes: 5",
+      "diags: 0",
+      "kind: break",
+    ],
+  },
+  {
+    // `while x { continue }` — the symmetric `continue` parse: `parseContinue` ->
+    // `mkContinue`, no diagnostics, the body statement is a `ContinueStmt`.
+    name: "parses a bare `continue` inside a while with no diagnostics",
+    body: `
+P.toks.push({ kind: "WHILE", text: "while", pos: 0 })
+P.toks.push({ kind: "IDENT", text: "x", pos: 6 })
+P.toks.push({ kind: "LBRACE", text: "{", pos: 8 })
+P.toks.push({ kind: "CONTINUE", text: "continue", pos: 10 })
+P.toks.push({ kind: "RBRACE", text: "}", pos: 19 })
+P.toks.push({ kind: "EOF", text: "", pos: 20 })
+let _root = parseProgram()
+print("nodes: " + i32ToStr(P.nodes.length))
+print("diags: " + i32ToStr(P.diags.length))
+let stmt = P.nodes[1]
+if stmt is ContinueStmt { print("kind: continue") }
+`,
+    expected: [
+      "nodes: 5",
+      "diags: 0",
+      "kind: continue",
     ],
   },
 ];

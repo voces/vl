@@ -845,6 +845,36 @@ function scopeSlotOf(name: string): i32 {
   0 - 1
 }
 
+// ── loop control-frame tracking (for `break` / `continue`) ───────────────────
+// wasm branch targets are RELATIVE depths, so to lower `break`/`continue` to a
+// `br <depth>` the emitter must know how many control frames sit between the
+// branch site and the loop it targets. `ctrlDepth` counts the control frames
+// (block / loop / if) currently open at the emit cursor — incremented when a
+// frame is opened, decremented at its matching `end`. A `while` opens a `block`
+// then a `loop` (mirroring the host's outer-block-wraps-loop structure — see
+// `loopLabels`/`brkLabel` in `toWasm.ts`): on entry it pushes the ABSOLUTE
+// `ctrlDepth` of the loop frame onto `loopContDepth` (the `continue` target) and
+// of the block frame onto `loopBrkDepth` (the `break` target). At a `break`/
+// `continue` site the relative `br` operand is `ctrlDepth - <stack top>`. The
+// stacks are popped when the `while` closes. All reset per function in the body
+// emit. (The self-host AST carries no loop labels, so only the INNERMOST loop is
+// ever targeted — `loop*Depth[length-1]`.)
+let ctrlDepth: i32 = 0
+let loopContDepth: i32[] = []
+let loopBrkDepth: i32[] = []
+
+// Opening a control frame: bump the running depth. Returns 0.
+function ctrlEnter(): i32 {
+  ctrlDepth = ctrlDepth + 1
+  0
+}
+
+// Closing a control frame (its matching `end`): drop the running depth. Returns 0.
+function ctrlLeave(): i32 {
+  ctrlDepth = ctrlDepth - 1
+  0
+}
+
 // ── per-function `.push` scratch locals ──────────────────────────────────────
 // `.push(x)` lowers inline to a grow-if-full + write + len-bump sequence that needs
 // three temporaries: `pushVal` (the value to append, i32), `pushNewCap` (the doubled
@@ -4395,6 +4425,9 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     // Both branches `return` on their own, so the `if` yields no value.
     if emitExpr(body, s.ifCond, fnIx) < 0 { return 0 - 1 }
     fbIf(64)                 // 0x04 if, 0x40 void blocktype
+    // The `if` opens ONE control frame (the `else` reuses it, `end` closes it), so a
+    // `break`/`continue` nested in either arm sees the right relative `br` depth.
+    ctrlEnter()
     // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
     // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
     // outer narrowing around the branch so nesting and the else-branch are unaffected.
@@ -4417,14 +4450,23 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       }
     }
     fbEnd()                  // 0x0b end
+    ctrlLeave()
     return 0
   }
   if s is WhileStmt {
     // Structured while loop: block (void) wrapping a loop (void).
     // The condition is checked at the top; if false (eqz), br_if 1 exits the block;
     // body runs, then br 0 continues the loop. Two `end` bytes close loop then block.
+    // Track the two control frames so `break`/`continue` in the body compute their
+    // relative `br` depth: the BLOCK is the `break` target (resume after the loop),
+    // the LOOP is the `continue` target (re-check the condition). Push the ABSOLUTE
+    // `ctrlDepth` of each frame; a branch site at depth D uses `D - <that depth>`.
     fbBlock(64)              // 0x02 block, 0x40 void blocktype
+    ctrlEnter()
+    loopBrkDepth.push(ctrlDepth)
     fbLoop(64)               // 0x03 loop, 0x40 void blocktype
+    ctrlEnter()
+    loopContDepth.push(ctrlDepth)
     // condition + eqz: if condition is false (zero), exit block
     if emitExpr(body, s.whileCond, fnIx) < 0 { return 0 - 1 }
     fbI32Eqz()               // 0x45 i32.eqz (invert: exit if condition was false)
@@ -4433,7 +4475,34 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     if emitStmts(body, s.whileBody, fnIx) < 0 { return 0 - 1 }
     fbBr(0)                  // 0x0c br, depth 0 = continue loop
     fbEnd()                  // 0x0b end (loop)
+    ctrlLeave()
+    loopContDepth.pop()
     fbEnd()                  // 0x0b end (block)
+    ctrlLeave()
+    loopBrkDepth.pop()
+    return 0
+  }
+  if s is BreakStmt {
+    // `break`: branch out of the innermost loop's wrapping BLOCK, so control resumes
+    // after the whole loop. No loop labels in the self-host AST, so always the
+    // innermost (`loopBrkDepth` top). The relative `br` operand is the frame distance
+    // `ctrlDepth - <block depth>`. A `break` outside any loop is a parser/typecheck
+    // error upstream; guard anyway so a stray one fails loudly, not with a bad `br`.
+    if loopBrkDepth.length == 0 {
+      return emitFail("emitProgram: `break` outside a loop")
+    }
+    let blkDepth = loopBrkDepth[loopBrkDepth.length - 1]
+    fbBr(ctrlDepth - blkDepth)   // 0x0c br to the loop's wrapping block
+    return 0
+  }
+  if s is ContinueStmt {
+    // `continue`: branch to the innermost loop frame, re-checking the condition. The
+    // relative `br` operand is the frame distance `ctrlDepth - <loop depth>`.
+    if loopContDepth.length == 0 {
+      return emitFail("emitProgram: `continue` outside a loop")
+    }
+    let loopDepth = loopContDepth[loopContDepth.length - 1]
+    fbBr(ctrlDepth - loopDepth)  // 0x0c br to the loop header
     return 0
   }
   emitFail("emitProgram: unsupported statement in body")
@@ -4963,6 +5032,11 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     scopeSlots = []
     scopeFrames = []
     emitLetCursor = 0
+    // Reset the loop control-frame tracking (`break`/`continue` branch-depth state)
+    // so a previous function's open frames never leak into this one.
+    ctrlDepth = 0
+    loopContDepth = []
+    loopBrkDepth = []
     if emitFuncBody(bodyExpr, fn.fnBody, fnIx) < 0 { return 0 - 1 }
     wTarget(exprPrev)
 
