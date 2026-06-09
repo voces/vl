@@ -72,6 +72,10 @@ import {
   RetStmt,
   Block,
   Program,
+  TypeDecl,
+  FieldDef,
+  ObjLit,
+  FieldInit,
 } from "./ast"
 
 // ── Type-arena variants ──────────────────────────────────────────────────────
@@ -116,16 +120,20 @@ type TDiag = { tmsg: string, tat: i32 }
 // `curRet`  — the type-arena index of the enclosing function's return type while
 //             checking its body (`-1` outside any function), so `return e` can be
 //             checked against it.
+// `userTypes` — declared struct types: a `name → type-arena index` map built in a
+//               pre-pass over the program's `type` declarations (so a struct name in
+//               a param/return/let annotation, or in a later struct's field, resolves).
 type Checker = {
   tys: Ty[],
   scopes: {[string]: i32}[],
   diags: TDiag[],
   curRet: i32,
+  userTypes: {[string]: i32},
 }
 
 // The single checker instance. The harness calls `initChecker()` then the entry
 // point `checkProgram(root)` and reads `T.diags`.
-export let T: Checker = { tys: [], scopes: [], diags: [], curRet: -1 }
+export let T: Checker = { tys: [], scopes: [], diags: [], curRet: -1, userTypes: Map() }
 
 // Well-known primitive type-arena indices, pinned by `initChecker` so the hot
 // primitives are interned once (not re-pushed per use). `-1` until initialized.
@@ -182,6 +190,7 @@ export function initChecker(): i32 {
   T.scopes = []
   T.diags = []
   T.curRet = -1
+  T.userTypes = Map()
   TY_I32 = mkPrim("i32")
   TY_F64 = mkPrim("f64")
   TY_BOOL = mkPrim("bool")
@@ -301,6 +310,10 @@ function nameToTy(name: string): i32 {
   }
   if name == "void" {
     return TY_VOID
+  }
+  // A declared struct type (registered by the program's TypeDecl pre-pass).
+  if T.userTypes.has(name) {
+    return T.userTypes[name] ?? -1
   }
   -1
 }
@@ -642,6 +655,26 @@ function checkNode(ix: i32): i32 {
       tyToStr(objTy), ix)
     return TY_ERR
 
+  // ── object literal ──────────────────────────────────────────────────────────
+  // `{ x: e, y: e }` types as a structural `TyObj` whose fields carry each value's
+  // checked type. Assignability against an annotation/param/return then matches it
+  // to a declared struct by structure (`assignable`), so field ORDER need not match
+  // the declaration. Reads each FieldInit child INLINE (Finding 2).
+  } else if n is ObjLit {
+    let fields = n.objFields
+    let fnames: string[] = []
+    let ftys: i32[] = []
+    let i = 0
+    while i < fields.length {
+      let fnode = P.nodes[fields[i]]
+      if fnode is FieldInit {
+        fnames.push(fnode.fiName)
+        ftys.push(checkNode(fnode.fiValue))
+      }
+      i = i + 1
+    }
+    return mkObjTy(fnames, ftys)
+
   } else if n is ErrExpr {
     return TY_ERR
 
@@ -789,6 +822,44 @@ function checkNode(ix: i32): i32 {
   // ── program ───────────────────────────────────────────────────────────────
   } else if n is Program {
     let stmts = n.progStmts
+    // Pass 0: register top-level struct `type` declarations BEFORE anything else, so
+    // a struct name in a param/return/let annotation (pass 1/2) or in a later struct's
+    // field resolves via `nameToTy`. Reads TypeDecl + FieldDef + TypeRef INLINE. Types
+    // register in source order, so a field may reference an EARLIER struct; a forward
+    // reference to a later struct reports "unknown type" (deferred).
+    let ti = 0
+    while ti < stmts.length {
+      let sd = P.nodes[stmts[ti]]
+      if sd is TypeDecl {
+        let dfields = sd.tdFields
+        let fnames: string[] = []
+        let ftys: i32[] = []
+        let fi = 0
+        while fi < dfields.length {
+          let fd = P.nodes[dfields[fi]]
+          if fd is FieldDef {
+            fnames.push(fd.fdName)
+            let fty = TY_ERR
+            if fd.fdType >= 0 {
+              let ftn = P.nodes[fd.fdType]
+              if ftn is TypeRef {
+                let r = nameToTy(ftn.tyName)
+                if r >= 0 {
+                  fty = r
+                } else {
+                  tErr("unknown type '" + ftn.tyName + "' for field '" +
+                    fd.fdName + "'", dfields[fi])
+                }
+              }
+            }
+            ftys.push(fty)
+          }
+          fi = fi + 1
+        }
+        T.userTypes[sd.tdName] = mkObjTy(fnames, ftys)
+      }
+      ti = ti + 1
+    }
     // Pass 1: hoist top-level function signatures so call-before-decl and mutual
     // recursion type-check. Reads FuncDecl + its Param/TypeRef children INLINE.
     let hi = 0
@@ -840,6 +911,9 @@ function checkNode(ix: i32): i32 {
   } else if n is Param {
     return TY_VOID
   } else if n is TypeRef {
+    return TY_VOID
+  } else if n is TypeDecl {
+    // Registered by the Program pass-0 pre-pass; nothing to do when visited.
     return TY_VOID
   }
   TY_ERR

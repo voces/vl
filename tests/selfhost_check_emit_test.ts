@@ -136,6 +136,48 @@ const CASES: Case[] = [
     run: async (call) => assertEq(await call("main"), 42, "inc(41)"),
   },
   {
+    // Structs (Phase 2): two `type` decls, an object literal typed by a `let`
+    // annotation, an obj-literal `return` typed by the function's struct return,
+    // struct-typed param + field reads.
+    key: "t_struct",
+    kind: "emit",
+    src:
+      "type P = { x: i32, y: i32 }\n" +
+      "type Q = { a: i32, b: i32 }\n" +
+      "function mk(a: i32, b: i32): P {\n  return { x: a, y: b }\n}\n" +
+      "function sumXY(p: P): i32 {\n  return p.x + p.y\n}\n" +
+      "function main(): i32 {\n  let p = mk(20, 22)\n  let q: Q = { a: 1, b: 2 }\n  return sumXY(p) + q.a + q.b\n}\n",
+    run: async (call) => assertEq(await call("main"), 45, "sumXY+q.a+q.b"),
+  },
+  {
+    // Structs + module globals + struct field WRITE across calls.
+    key: "t_globals",
+    kind: "emit",
+    src:
+      "type Counter = { n: i32 }\n" +
+      "let base: i32 = 40\n" +
+      "let C: Counter = { n: 0 }\n" +
+      "function bump(): i32 {\n  C.n = C.n + 1\n  return C.n\n}\n" +
+      "function main(): i32 {\n  bump()\n  bump()\n  return base + C.n\n}\n",
+    run: async (call) => assertEq(await call("main"), 42, "base + C.n"),
+  },
+  {
+    key: "r_struct_field_type",
+    kind: "reject",
+    src:
+      "type P = { x: i32 }\n" +
+      "function main(): i32 {\n  let p: P = { x: \"hi\" }\n  return p.x\n}\n",
+    errSubstr: "cannot assign",
+  },
+  {
+    key: "r_struct_unknown_field",
+    kind: "reject",
+    src:
+      "type P = { x: i32 }\n" +
+      "function main(): i32 {\n  let p: P = { x: 1 }\n  return p.y\n}\n",
+    errSubstr: "no field",
+  },
+  {
     key: "r_undeclared",
     kind: "reject",
     src: "function main(): i32 {\n  return x\n}\n",
