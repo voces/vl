@@ -32,7 +32,26 @@ let W: Emitter = { bytes: [] }
 // module output buffer; rebound by `wTarget`, reset by `emitReset`.
 let curBuf: i32[] = W.bytes
 
+// Number of imported FUNCTIONS (4 — the `print` family — when any `print` call
+// exists in the program, else 0). Imports occupy wasm function indices
+// 0..gImports-1, so every LOCAL function's WASM index is `gImports + position`
+// (fnIndices stays the fnStmts POSITION for arena lookups; the offset applies at
+// the index WRITE points: the call instruction, the export entries, the start
+// index). When 0 — every golden — no import section is emitted and nothing
+// shifts, so existing modules stay byte-identical.
+let gImports: i32 = 0
+
+// Top-level STATEMENTS (a bare `print(...)`, an assignment, a `while` over globals —
+// anything that is not a function/type/global declaration). They run inside the
+// synthetic START function, in source order, after the non-const global inits —
+// the host's `__program__` model. Empty for every golden (pure-decl modules).
+let startStmts: i32[] = []
+
 function emitReset(): i32 {
+  // NOTE: `gImports` and `startStmts` are NOT reset here — they are assigned by
+  // their own passes (the print-detection scan in `emitProgram`, `collectFns`)
+  // which run BEFORE `emitModule` calls this; resetting them here would clobber
+  // those passes' results.
   W.bytes = []
   curBuf = W.bytes
   0
@@ -542,6 +561,7 @@ function emitFail(msg: string): i32 {
 // The map is two parallel top-level `let` arrays (they lower to wasm globals): the
 // i-th name maps to the i-th function index. `fnNames[i]`'s function index is
 // `fnIndices[i]`, which equals `i` here but is kept explicit for clarity.
+
 let fnNames: string[] = []
 let fnIndices: i32[] = []
 
@@ -601,6 +621,7 @@ function collectFns(stmts: i32[]): i32 {
   fnStmts = []
   globalStmts = []
   globalNames = []
+  startStmts = []
   let i = 0
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
@@ -614,7 +635,8 @@ function collectFns(stmts: i32[]): i32 {
     } else if s is UnionDecl {
       // A `type N = A | B` union alias — collected by `collectU`, skipped here.
     } else {
-      return emitFail("emitProgram: top-level statement is not a function, type, or global")
+      // A top-level STATEMENT — runs in the synthetic start function (source order).
+      startStmts.push(stmts[i])
     }
     i = i + 1
   }
@@ -3975,6 +3997,20 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         fbArrayNewFixed(aTypeIdx, 1)  // 0xfb 0x08 <typeidx> 1; type shared with i32[]
         return 0
       }
+      // `print(x)` is a compiler builtin lowered to the host's import family
+      // (`__print_i32__` at import index 0). Strings/bools are later slices. The
+      // call yields NOTHING (void import) — the statement path knows not to drop.
+      if callee.identName == "print" {
+        if c.callArgs.length != 1 {
+          return emitFail("emitProgram: print takes exactly one argument")
+        }
+        if exprString(c.callArgs[0], fnIx) {
+          return emitFail("emitProgram: print(string) is not emittable yet")
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        fbCall(0)              // 0x10 call __print_i32__ (import index 0)
+        return 0
+      }
       let target = fnIndexOf(callee.identName)
       if target < 0 {
         return emitFail("emitProgram: call to unknown function")
@@ -4033,7 +4069,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         pendingListSlot = 0
         i = i + 1
       }
-      fbCall(target)         // 0x10 call
+      fbCall(gImports + target)  // 0x10 call (imports occupy indices 0..gImports-1)
       return 0
     }
     return emitFail("emitProgram: callee is not a function name")
@@ -4584,9 +4620,12 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     if callee is Ident {
       // A bare top-level call whose RESULT is discarded (e.g. a helper invoked for its
       // global side effects): emit the call, then `drop` the single value it leaves on
-      // the stack (every function returns one value here).
+      // the stack (every function returns one value here). EXCEPT `print` — its
+      // import is void, so there is nothing on the stack to drop.
       if emitCall(body, stmtIx, fnIx) < 0 { return 0 - 1 }
-      fbDrop()                 // 0x1a drop
+      if callee.identName != "print" {
+        fbDrop()               // 0x1a drop
+      }
       return 0
     }
     return emitFail("emitProgram: bare call statement is not supported")
@@ -6020,6 +6059,17 @@ function emitStartFnCode(out: i32[]): i32 {
     }
     gi = gi + 1
   }
+  // Top-level STATEMENTS, in source order (after the global inits — a statement may
+  // read any global; module-level `let`s are globals, so locals here are rare). The
+  // emit context is module-level (`fnIx = -1`): identifier reads/writes resolve to
+  // globals; a statement needing per-function scratch (push/string-op/map) is out of
+  // this slice and fails loudly at validation. Emitted INSIDE the `bodyExpr` writer
+  // binding so every byte lands in the start body, like the init exprs above.
+  let si = 0
+  while si < startStmts.length {
+    if emitStmt(bodyExpr, startStmts[si], 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+    si = si + 1
+  }
   wTarget(exprPrev)
 
   let body: i32[] = []
@@ -6068,9 +6118,11 @@ function emitModule(stmts: i32[]): i32 {
   }
   let hasStart = 0
   if nNonConst > 0 { hasStart = 1 }
-  // The synthetic start function's index (last, after all `n` user functions) and its
-  // `()->()` functype index (one past the user functypes). Both unused when no start.
-  let startFnIdx = n
+  if startStmts.length > 0 { hasStart = 1 }
+  // The synthetic start function's index (last, after all `n` user functions, which
+  // themselves sit after any imports) and its `()->()` functype index (one past the
+  // user functypes). Both unused when no start.
+  let startFnIdx = gImports + n
 
   // Heap-type indices, in type-section order: standalone structs at 0..ns-1, then
   // (for the union path) the variant structs + box, then the raw i32 array, the
@@ -6109,7 +6161,9 @@ function emitModule(stmts: i32[]): i32 {
   let tyPrev = wTarget(typePayload)
   wU8(1)                                 // one rectype: the rec group
   wU8(78)                                // 0x4e rec group
-  wULEB(n + typeOffset + hasStart)       // types inside the rec group (+1 for start fn)
+  let nPrintTypes = 0
+  if gImports > 0 { nPrintTypes = 2 }    // (i32)->() and ()->() for the print imports
+  wULEB(n + typeOffset + hasStart + nPrintTypes)  // types inside the rec group
   if sDeclared {
     // One `0x5f` struct per declared type (declaration order = heap-type index),
     // each a struct of its fields in declaration order. A field is `0x7f` i32
@@ -6268,8 +6322,51 @@ function emitModule(stmts: i32[]): i32 {
     wU8(0)                       // 0 params
     wU8(0)                       // 0 results
   }
+  // The print-import functypes (only when a `print` exists): `(i32)->()` at index
+  // `typeOffset + n + hasStart` (shared by __print_i32__/__print_bool__/__print_char__)
+  // and `()->()` at +1 (__print_str_flush__). Appended LAST so no user/start functype
+  // index shifts.
+  if gImports > 0 {
+    wU8(96)                      // 0x60 func
+    wU8(1)                       // 1 param
+    wU8(127)                     // 0x7f i32
+    wU8(0)                       // 0 results
+    wU8(96)                      // 0x60 func
+    wU8(0)                       // 0 params
+    wU8(0)                       // 0 results
+  }
   wTarget(tyPrev)
   wSection(1, typePayload)
+
+  // Import section (id 2, between type and function): the 4-entry print family from
+  // the host's `"imports"` module, occupying function indices 0..3 in this exact
+  // order (the call lowering hardcodes them): __print_i32__, __print_bool__,
+  // __print_char__ (all `(i32)->()`), __print_str_flush__ (`()->()`).
+  if gImports > 0 {
+    let ftI32 = typeOffset + n + hasStart
+    let ftVoid = ftI32 + 1
+    let importPayload: i32[] = []
+    let imPrev = wTarget(importPayload)
+    wULEB(4)
+    wName("imports")
+    wName("__print_i32__")
+    wU8(0)                       // import kind: func
+    wULEB(ftI32)
+    wName("imports")
+    wName("__print_bool__")
+    wU8(0)
+    wULEB(ftI32)
+    wName("imports")
+    wName("__print_char__")
+    wU8(0)
+    wULEB(ftI32)
+    wName("imports")
+    wName("__print_str_flush__")
+    wU8(0)
+    wULEB(ftVoid)
+    wTarget(imPrev)
+    wSection(2, importPayload)
+  }
 
   // Function section (id 3): N functions; func i uses functype `typeOffset + i`. The
   // synthetic start function (if any) is the LAST entry — function index `n` — using
@@ -6375,7 +6472,7 @@ function emitModule(stmts: i32[]): i32 {
     if fn is FuncDecl {
       wName(fn.fnName)
       wU8(0)         // export kind: func
-      wULEB(ei)      // func index
+      wULEB(gImports + ei)  // func index (imports occupy 0..gImports-1)
     }
     ei = ei + 1
   }
@@ -8294,10 +8391,27 @@ function emitProgram(rootIx: i32): i32 {
     if collectS(stmts) < 0 { return 0 - 1 }
     if collectA(stmts) < 0 { return 0 - 1 }
     if collectFns(stmts) < 0 { return 0 - 1 }
-    if fnStmts.length < 1 {
-      return emitFail("emitProgram: expected at least one top-level function")
+    if fnStmts.length < 1 && startStmts.length < 1 {
+      return emitFail("emitProgram: expected at least one top-level function or statement")
     }
     if buildFnMap(stmts) < 0 { return 0 - 1 }
+    // Detect `print(...)` anywhere in the program: any use pulls in the 4-import
+    // print family (imports shift every local function's wasm index, so this is
+    // decided up front; a print-free program emits no import section at all).
+    gImports = 0
+    let pscan = 0
+    while pscan < P.nodes.length {
+      let pn = P.nodes[pscan]
+      if pn is Call {
+        let pcallee = P.nodes[pn.callFn]
+        if pcallee is Ident {
+          if pcallee.identName == "print" {
+            gImports = 4
+          }
+        }
+      }
+      pscan = pscan + 1
+    }
     // Every function's parameters must be i32 or the struct type before we commit.
     let i = 0
     while i < fnStmts.length {
