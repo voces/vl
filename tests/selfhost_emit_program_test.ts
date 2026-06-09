@@ -4794,6 +4794,30 @@ const CASES: Case[] = [
       if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
     },
   },
+  {
+    // REGRESSION (str-op scratch in a returned object literal): a function whose body is
+    // a bare implicit-return `{ … }` with a `.slice` in a FIELD (the `mkTok` shape). The
+    // str-op scratch-frame detection must descend into the object-literal's fields, or the
+    // slice's scratch slots fall past the declared locals → `invalid local index`.
+    name: "str-op scratch reserved for a .slice inside a returned object literal => 7",
+    src: [
+      "type T = { s: string, n: i32 }",
+      "function mk(src: string): T {",
+      "  { s: src.slice(1, 3), n: 5 }",
+      "}",
+      "function main(): i32 {",
+      "  let t = mk(\"hello\")",
+      "  return t.s.length + t.n",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // src.slice(1,3) of "hello" = "el" (length 2); 2 + 5 = 7. Before the fix the str-op
+      // frame is unreserved and instantiation fails with an invalid local index.
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
