@@ -162,6 +162,61 @@ const CASES: Case[] = [
     run: async (call) => assertEq(await call("main"), 42, "base + C.n"),
   },
   {
+    // Unions + `is` (Phase 2.2): a discriminated union, `is`-narrowing in a then
+    // branch (param `n` refined to the variant struct, then a field read), union
+    // construction by object literal (`{ av: x }` typed by the `Node` return).
+    key: "t_union",
+    kind: "emit",
+    src:
+      "type A = { av: i32 }\n" +
+      "type B = { bv: i32 }\n" +
+      "type Node = A | B\n" +
+      "function f(n: Node): i32 {\n  if n is A { return n.av }\n  if n is B { return n.bv }\n  return 0\n}\n" +
+      "function mkA(x: i32): Node {\n  return { av: x }\n}\n" +
+      "function main(): i32 {\n  return f(mkA(7))\n}\n",
+    run: async (call) => assertEq(await call("main"), 7, "f(mkA(7))"),
+  },
+  {
+    // Two distinct unions coexisting; `is`-narrowing on each; union locals built by
+    // annotation-typed object literals.
+    key: "t_multiunion",
+    kind: "emit",
+    src:
+      "type Lit = { val: i32 }\n" +
+      "type Var = { vname: string }\n" +
+      "type Node = Lit | Var\n" +
+      "type TyInt = { width: i32 }\n" +
+      "type TyStr = { len: i32 }\n" +
+      "type Ty = TyInt | TyStr\n" +
+      "function readNode(n: Node): i32 {\n  if n is Lit { return n.val }\n  return 0\n}\n" +
+      "function readTy(t: Ty): i32 {\n  if t is TyInt { return t.width }\n  return 0\n}\n" +
+      "function main(): i32 {\n  let n: Node = { val: 10 }\n  let t: Ty = { width: 20 }\n  return readNode(n) + readTy(t)\n}\n",
+    run: async (call) => assertEq(await call("main"), 30, "readNode+readTy"),
+  },
+  {
+    // `is`-narrows `n` to A, then reads a field that only B has → rejected.
+    key: "r_union_wrong_field",
+    kind: "reject",
+    src:
+      "type A = { av: i32 }\n" +
+      "type B = { bv: i32 }\n" +
+      "type N = A | B\n" +
+      "function f(n: N): i32 {\n  if n is A { return n.bv }\n  return 0\n}\n" +
+      "function main(): i32 {\n  return f({ av: 1 })\n}\n",
+    errSubstr: "no field",
+  },
+  {
+    // A union naming an undeclared variant → rejected in the pre-pass.
+    key: "r_union_unknown_variant",
+    kind: "reject",
+    src:
+      "type A = { av: i32 }\n" +
+      "type N = A | Bogus\n" +
+      "function f(n: N): i32 {\n  return 0\n}\n" +
+      "function main(): i32 {\n  return 0\n}\n",
+    errSubstr: "unknown type",
+  },
+  {
     key: "r_struct_field_type",
     kind: "reject",
     src:
