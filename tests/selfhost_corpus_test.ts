@@ -22,8 +22,8 @@
 // next rungs (print emission; span threading). For now the whitelist is the subset of
 // corpus files where the VL front end PARSES + TYPE-CHECKS and agrees with the spec.
 //
-// LEDGER: 156 / 422 single-file corpus cases conform — VL's VERDICT matches the
-// spec: 64 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
+// LEDGER: 179 / 422 single-file corpus cases conform — VL's VERDICT matches the
+// spec: 87 ACCEPTED (clean programs VL parses + type-checks with zero diagnostics)
 // and 92 REJECTED (invalid programs VL refuses — a type error the checker raises,
 // or a lexer/parser syntax error). Every entry is VL behaving CORRECTLY per the
 // directive. (For some advanced `@error` files VL refuses the program because the
@@ -36,8 +36,8 @@
 // through the pipeline in isolation (`tests/selfhost/probe_fullsweep.ts`-style) and
 // keeps the agreeing ones. As `typecheck.vl`/`parser.vl` gain coverage, re-sweep and
 // promote newly-agreeing files. A whitelisted file that starts DISAGREEING fails.
-// The count is the conformance ledger. The 266 current DISAGREEMENTS are the work
-// left: clean files VL can't yet PARSE (for-loops, lambdas, generics, if/then/else
+// The count is the conformance ledger. The 243 current DISAGREEMENTS are the work
+// left: clean files VL can't yet PARSE (lambdas, generics, if/then/else
 // expressions) and `@error` files VL doesn't yet CATCH (redeclaration, const-reassign).
 
 import { runWasm } from "../compiler/compile.ts";
@@ -62,6 +62,7 @@ const WHITELIST = [
   "arith/literal-add.vl",
   "arith/ops.vl",
   "arith/typed-add.vl",
+  "arrays/basics.vl",
   "arrays/equality.vl",
   "arrays/f64-elems.vl",
   "arrays/infer-empty-from-usage.vl",
@@ -70,6 +71,7 @@ const WHITELIST = [
   "arrays/infer-empty-string.vl",
   "chars/literals.vl",
   "functions/forward-reference-nested-struct-param.vl",
+  "functions/forward-reference-struct-array-param.vl",
   "functions/forward-reference-struct-param.vl",
   "functions/forward-reference.vl",
   "functions/mutual-recursion-struct-param.vl",
@@ -77,6 +79,7 @@ const WHITELIST = [
   "functions/return-then-statement-same-line.vl",
   "functions/void-tail-statements.vl",
   "globals/mutate-in-fn-loop.vl",
+  "globals/mutate-in-loop.vl",
   "globals/mutate-through-fn.vl",
   "globals/read-through.vl",
   "globals/struct-field-through-fn.vl",
@@ -88,6 +91,11 @@ const WHITELIST = [
   "lint/exported-function-no-warn.vl",
   "lint/mutual-recursion-no-warn.vl",
   "lint/unused-function.vl",
+  "lists/build-fusion-adv-break.vl",
+  "lists/build-fusion-adv-conditional.vl",
+  "lists/build-fusion-adv-multipush.vl",
+  "lists/build-fusion-adv-reads-a.vl",
+  "lists/build-fusion-continue.vl",
   "lists/build-fusion-cw-adv-bound-mutated.vl",
   "lists/build-fusion-cw-adv-break.vl",
   "lists/build-fusion-cw-adv-double-incr.vl",
@@ -97,17 +105,31 @@ const WHITELIST = [
   "lists/build-fusion-cw-empty.vl",
   "lists/build-fusion-cw-seeded.vl",
   "lists/build-fusion-cw-step2.vl",
+  "lists/build-fusion-empty-count.vl",
+  "lists/build-fusion-range.vl",
+  "lists/build-fusion-seeded.vl",
+  "lists/push-struct-regrow.vl",
   "lists/push-struct.vl",
   "lists/struct-field-push-nested.vl",
   "lists/struct-field-push-regrow.vl",
   "lists/struct-field-push.vl",
+  "loops/empty-range.vl",
+  "loops/for-range-bound-named-step.vl",
+  "loops/for-step.vl",
+  "loops/for-sum.vl",
+  "loops/single-line-block.vl",
   "loops/while-sum.vl",
   "objects/equality.vl",
   "objects/struct.vl",
+  "soundness/README.vl",
   "soundness/boolean-narrowing-if-sound.vl",
   "soundness/equality-array-nested-sound.vl",
   "soundness/equality-boolean-sound.vl",
   "statements/struct-call-as-statement.vl",
+  "strings/accum-adv-other-read.vl",
+  "strings/accum-adv-reset.vl",
+  "strings/accum-basic.vl",
+  "strings/accum-empty.vl",
   "strings/basics.vl",
   "strings/escapes.vl",
   "strings/index-of.vl",
@@ -120,6 +142,7 @@ const WHITELIST = [
   "variables/definite-assign-both-branches-ok.vl",
   "variables/definite-assign-diverging-branch-ok.vl",
   "variables/definite-assign-initialized-ok.vl",
+  "variables/definite-assign-loop-body-ok.vl",
   "variables/definite-assign-then-use-ok.vl",
   "variables/let-literal-widens.vl",
   "variables/let-reassign-ok.vl",
