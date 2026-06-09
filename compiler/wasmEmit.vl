@@ -2628,23 +2628,41 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
         return emitFail("emitProgram: ref array literal but ref list type not collected")
       }
       // The element type determines WHICH (backing, wrapper) pair this literal builds.
-      // A non-empty literal types itself from its first element; an EMPTY `[]` (no
-      // elements) takes the slot the binding site threaded via `pendingListSlot`.
+      // A binding/field site that threaded a ref-list annotation (`pendingListKind` 1/2,
+      // `pendingListSlot` the element slot) is AUTHORITATIVE — its declared element type
+      // wins over the first-element field-shape guess so a `B[] = [{…}]` literal of a
+      // struct sharing field names with another struct still builds B's list. Only a
+      // literal WITHOUT a threaded annotation types itself from its first element. An
+      // EMPTY `[]` (no elements) always takes the threaded slot.
+      let annKind = pendingListKind
+      let annSlot = pendingListSlot
       let rslot = 0
-      if elems.length >= 1 {
+      if annKind == 1 || annKind == 2 {
+        rslot = annSlot
+      } else if elems.length >= 1 {
         rslot = rlSlotByName(arrLitElemName(arrIx))
       } else {
-        rslot = pendingListSlot
+        rslot = annSlot
       }
       if rslot < 0 { rslot = 0 }
+      // A STRUCT-element list (kind 1, NOT a union box) types each element literal as the
+      // list's declared element struct — seed `pendingStructIdx` (consumed by `emitObj`)
+      // so a same-field-name sibling struct does not win the field-shape match. A union
+      // list (kind 2) boxes by variant name and needs no struct hint.
+      let elemStructIdx = 0 - 1
+      if rlElemKindTbl[rslot] == 1 {
+        elemStructIdx = structIndexByName(rlElemName[rslot])
+      }
       let i = 0
       while i < elems.length {
         if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
           return emitFail("emitProgram: nested arrays are not supported")
         }
+        pendingStructIdx = elemStructIdx
         if emitExpr(body, elems[i], fnIx) < 0 { return 0 - 1 }
         i = i + 1
       }
+      pendingStructIdx = 0 - 1
       fbArrayNewFixed(rlBackIdx[rslot], elems.length)  // 0xfb 0x08; builds the ref backing
       fbI32Const(elems.length) // 0x41 i32.const (len)
       fbI32Const(elems.length) // 0x41 i32.const (cap)
@@ -4057,6 +4075,10 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       let isRef = exprRefArray(target.idxArr, fnIx)
       let lTy = lTypeIdx
       let aTy = aTypeIdx
+      // A ref list of STRUCT elements (kind 1) types the stored value literal as the
+      // list's declared element struct — seed `pendingStructIdx` (consumed by `emitObj`)
+      // so `xs[i] = { … }` builds the element struct over a first-field-name match.
+      let storeStructIdx = 0 - 1
       if isRef {
         if !rlUsed {
           return emitFail("emitProgram: ref indexed assignment but ref list type not collected")
@@ -4064,6 +4086,9 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
         let rslot = refListSlotOfExpr(target.idxArr, fnIx)
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
+        if rlElemKindTbl[rslot] == 1 {
+          storeStructIdx = structIndexByName(rlElemName[rslot])
+        }
       } else {
         if !lUsed {
           return emitFail("emitProgram: indexed assignment but list type not collected")
@@ -4075,7 +4100,9 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       if emitExpr(body, target.idxArr, fnIx) < 0 { return 0 - 1 }
       fbStructGet(lTy, 0)    // 0xfb 0x02 <list wrapper struct type index> field 0: backing
       if emitExpr(body, target.idxIndex, fnIx) < 0 { return 0 - 1 }
+      pendingStructIdx = storeStructIdx
       if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+      pendingStructIdx = 0 - 1
       fbArraySet(aTy)        // 0xfb 0x0e <backing array type index>
       return 0
     }
@@ -4169,6 +4196,10 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
       let lTy = lTypeIdx
       let aTy = aTypeIdx
       let base = pushScratchBase
+      // A ref list of STRUCT elements (kind 1) types the pushed value literal as the
+      // list's declared element struct — seed `pendingStructIdx` (consumed by `emitObj`)
+      // so `xs.push({ … })` builds the element struct over a first-field-name match.
+      let pushStructIdx = 0 - 1
       if isRef {
         if !rlUsed {
           return emitFail("emitProgram: ref .push but ref list type not collected")
@@ -4177,6 +4208,9 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
         base = refPushScratchBaseFor(rslot)
+        if rlElemKindTbl[rslot] == 1 {
+          pushStructIdx = structIndexByName(rlElemName[rslot])
+        }
       } else if isStr {
         if !slUsed {
           return emitFail("emitProgram: string .push but string list type not collected")
@@ -4225,7 +4259,9 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         let capIdx = base + 1
         let backIdx = base + 2
         // V = x
+        pendingStructIdx = pushStructIdx
         if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        pendingStructIdx = 0 - 1
         fbLocalSet(valIdx)     // local.set
         // if len(L) == cap(L)
         pushListLen(body, lIdx, lTy)
@@ -4461,7 +4497,15 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     // the element kind to pick the ref-list construction — record it for `emitArr`.
     pendingListKind = letAnnRefListKind(stmtIx)
     pendingListSlot = letAnnRefListSlot(stmtIx)
+    // A `let b: B = { … }` struct LITERAL must build the annotation's struct, not a
+    // first-field-name match — seed `pendingStructIdx` (consumed by `emitObj`) from the
+    // annotation when it names a standalone struct, so a same-field-name sibling struct
+    // does not win. Mirrors the call-arg / element / return / global seeding. A union
+    // annotation names no `sNames` entry (`letAnnStructIdx` is -1) so a variant literal
+    // still boxes; a non-struct-literal init ignores the hint.
+    pendingStructIdx = letAnnStructIdx(stmtIx)
     if emitExpr(body, s.letInit, fnIx) < 0 { return 0 - 1 }
+    pendingStructIdx = 0 - 1
     pendingListKind = 0
     pendingListSlot = 0
     fbLocalSet(idx)          // 0x21 local.set
@@ -4511,8 +4555,21 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     if s.retArg < 0 {
       return emitFail("emitProgram: bare return is not supported")
     }
+    // A `return { … }` struct LITERAL must build the function's DECLARED return struct,
+    // not a first-field-name match — seed `pendingStructIdx` (consumed by `emitObj`) from
+    // the enclosing function's return annotation so a same-field-name sibling struct does
+    // not win. Mirrors how a call-arg / element / global seeds the literal's context. A
+    // non-struct-literal return ignores the hint. Reset after the value lowers.
+    let fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      let rsi = retStructIndex(fn.fnRet)
+      if rsi >= 0 {
+        if retTRFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
+      }
+    }
     // Push the return value, then the `return` instruction.
     if emitExpr(body, s.retArg, fnIx) < 0 { return 0 - 1 }
+    pendingStructIdx = 0 - 1
     fbReturn()               // 0x0f return
     return 0
   }
@@ -7655,6 +7712,24 @@ function letAnnRefListSlot(letIx: i32): i32 {
     }
   }
   0
+}
+
+// The STRUCT TABLE INDEX a `LetDecl`'s annotation names (`let b: B = { … }` → B's index),
+// or -1 when the let is un-annotated OR its annotation names a non-struct (a union alias,
+// `i32`, an array). Threads `pendingStructIdx` so an annotated struct literal builds the
+// annotation's struct over a first-field-name match. An un-annotated `let` is left to the
+// literal's own field-shape (-1).
+function letAnnStructIdx(letIx: i32): i32 {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        return structIndexByName(lt.tyName)
+      }
+    }
+  }
+  0 - 1
 }
 
 // ── string-array-typedness of expressions (`string[]`) ────────────────────────

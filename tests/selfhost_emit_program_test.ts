@@ -4547,6 +4547,127 @@ const CASES: Case[] = [
       if (got !== 0) throw new Error(`main() returned ${got}, expected 0`);
     },
   },
+  // ── context-aware struct-literal typing (struct-type-identity disambiguation) ──
+  // A struct literal `{ … }`'s wasm type was resolved by FIELD-SHAPE matching to the
+  // FIRST declared struct sharing its field names — ambiguous when two structs declare
+  // the SAME fields. Each literal must instead be typed by its CONTEXT (the array element
+  // type / let or return annotation / list-element type). These cases declare two same-
+  // shape structs `A`/`B` so the field-shape guess (A) DIFFERS from the context (B); each
+  // failed `WebAssembly.compile` with a `(ref A)`/`(ref B)` mismatch before the fix.
+  {
+    // Array ELEMENT context: a `B[]` literal's element must build B, not the first same-
+    // shape struct A. Before: `local.set expected (ref B-list), found (ref A-list)`.
+    name: "struct-ctx: `B[]` literal element typed by the array element type => 9",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: B[] = [{ v: 9 }]",
+      "  return xs[0].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 9) throw new Error(`main() returned ${got}, expected 9`);
+    },
+  },
+  {
+    // A multi-element `B[]` literal — every element is typed as B (not just the first).
+    name: "struct-ctx: multi-element `B[]` literal, both elements typed B => 15",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: B[] = [{ v: 6 }, { v: 9 }]",
+      "  return xs[0].v + xs[1].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 15) throw new Error(`main() returned ${got}, expected 15`);
+    },
+  },
+  {
+    // LET-annotation context: `let b: B = { … }` must build B over the first same-shape
+    // struct A. Before: `local.set expected (ref B), found struct.new (ref A)`.
+    name: "struct-ctx: `let b: B = { … }` typed by the let annotation => 6",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function take(b: B): i32 {",
+      "  return b.v",
+      "}",
+      "function main(): i32 {",
+      "  let b: B = { v: 6 }",
+      "  return take(b)",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 6) throw new Error(`main() returned ${got}, expected 6`);
+    },
+  },
+  {
+    // RETURN context: `function mk(): B { return { … } }` must build B over A. Before:
+    // `type error in return[0] (expected (ref B), got (ref A))`.
+    name: "struct-ctx: `return { … }` typed by the function return type => 7",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function mk(): B {",
+      "  return { v: 7 }",
+      "}",
+      "function main(): i32 {",
+      "  let b: B = mk()",
+      "  return b.v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 7) throw new Error(`main() returned ${got}, expected 7`);
+    },
+  },
+  {
+    // PUSH context: `xs.push({ … })` onto a `B[]` must build the list's element struct B.
+    name: "struct-ctx: `.push({ … })` onto a `B[]` typed by the element struct => 8",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: B[] = []",
+      "  xs.push({ v: 8 })",
+      "  return xs[0].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 8) throw new Error(`main() returned ${got}, expected 8`);
+    },
+  },
+  {
+    // INDEX-SET context: `xs[0] = { … }` over a `B[]` must build the element struct B.
+    name: "struct-ctx: `xs[0] = { … }` over a `B[]` typed by the element struct => 4",
+    src: [
+      "type A = { v: i32 }",
+      "type B = { v: i32 }",
+      "function main(): i32 {",
+      "  let xs: B[] = []",
+      "  xs.push({ v: 1 })",
+      "  xs[0] = { v: 4 }",
+      "  return xs[0].v",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 4) throw new Error(`main() returned ${got}, expected 4`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
