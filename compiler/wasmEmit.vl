@@ -5463,11 +5463,15 @@ function vtKindOfParam(paramIx: i32): i32 {
   0
 }
 
-// The struct table index of the parameter node at `paramIx` (from its annotation), or
-// -1 — feeds `pushVT`'s `kind == 1` struct case for a function param's valtype.
+// The second `fbValtype` arg for the parameter node at `paramIx` (from its annotation).
+// For a STRUCT param (kind 1) this is its struct table index (or -1); for a REF-ARRAY
+// param (kind 5) it is the ref-list TABLE SLOT for the element type (`B[]` → B's slot)
+// — `fbValtype`'s kind-5 arm now indexes `rlWrapIdx[slot]`, so it must NOT collapse to
+// -1/slot 0. Mirrors `tyAnnRefListSlot` (how `let`/return annotations resolve `T[]`).
 function paramStructIdxOf(paramIx: i32): i32 {
   let p = P.nodes[paramIx]
   if p is Param {
+    if retRefArrFlag(p.parType) == 1 { return tyAnnRefListSlot(p.parType) }
     return retStructIndex(p.parType)
   }
   0 - 1
@@ -5635,7 +5639,7 @@ function fbRefNullForKind(kind: i32, structIdx: i32): i32 {
   } else if kind == 4 {
     wSLEB(uBoxIdx)
   } else if kind == 5 {
-    wSLEB(rlTypeIdx)
+    wSLEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
   } else if kind == 6 {
     wSLEB(mStructIdx)
   } else if kind == 7 {
@@ -5665,7 +5669,7 @@ function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
     wULEB(uBoxIdx)
   } else if kind == 5 {
     wU8(99)
-    wULEB(rlTypeIdx)
+    wULEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
   } else if kind == 6 {
     wU8(99)
     wULEB(mStructIdx)
@@ -5694,7 +5698,11 @@ function refElemHeapType(): i32 {
 //   2    → i32-list ref `(ref $lTypeIdx)` (the growable `i32[]` wrapper struct)
 //   3    → string ref `(ref $aTypeIdx)` — the raw `(array (mut i32))` of code points
 //   4    → union-box ref `(ref $uBoxIdx)` — the `{tag, value}` box
-//   5    → ref-list ref `(ref $rlTypeIdx)` — the ref-element list wrapper
+//   5    → ref-list ref `(ref $rlWrapIdx[structIdx])` — the ref-element list wrapper
+//          for THIS slot. For kind 5, `structIdx` is the ref-list TABLE SLOT (NOT a
+//          struct index): the self-host program has many distinct ref-list element
+//          types, each with its own wrapper, so the valtype must select the caller's
+//          slot — not collapse to slot 0 (`rlTypeIdx == rlWrapIdx[0]`).
 //   6    → map ref `(ref $mStructIdx)` — the string-keyed map struct
 //   7    → string-list ref `(ref $mkListIdx)` — the string-list wrapper
 //   8    → concrete union-variant ref `(ref $uVarIdx+structIdx)` (gap #2)
@@ -5719,7 +5727,7 @@ function fbValtype(kind: i32, structIdx: i32): i32 {
     wULEB(uBoxIdx)       // the union box `{tag, value}` heap-type index
   } else if kind == 5 {
     wU8(100)
-    wULEB(rlTypeIdx)     // the REF-list wrapper struct heap-type index
+    wULEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
   } else if kind == 6 {
     wU8(100)
     wULEB(mStructIdx)    // the string-keyed MAP struct heap-type index (G8)
@@ -6216,7 +6224,12 @@ function emitModule(stmts: i32[]): i32 {
         pi = pi + 1
       }
       wU8(1)                     // 1 result
-      fbValtype(vtKindOfType(fn.fnRet), retStructIndex(fn.fnRet))
+      // A `T[]` return is kind 5 — its second `fbValtype` arg is the ref-list TABLE SLOT
+      // for the element type (`retStructIndex` is -1 for a ref array), so the result
+      // valtype selects THIS function's element wrapper, not slot 0's.
+      let retSlot = retStructIndex(fn.fnRet)
+      if retRefArrFlag(fn.fnRet) == 1 { retSlot = tyAnnRefListSlot(fn.fnRet) }
+      fbValtype(vtKindOfType(fn.fnRet), retSlot)
     }
     ti = ti + 1
   }
@@ -6279,7 +6292,11 @@ function emitModule(stmts: i32[]): i32 {
           // real init via `global.set` before any other code, so reads never see the
           // zero. The cell stays mutable.
           let ck = globalCellKind(globalStmts[gi])
+          // For a ref-array cell (kind 5) the second `fbValtype`/`fbRefNullForKind` arg is
+          // the ref-list TABLE SLOT (`globalCellStructIdx` is -1 for a ref array), so the
+          // cell valtype and its `ref.null` zero select THIS global's element wrapper.
           let cs = globalCellStructIdx(globalStmts[gi])
+          if ck == 5 { cs = letAnnRefListSlot(globalStmts[gi]) }
           fbValtypeNullable(ck, cs)                     // nullable valtype
           wU8(1)                                        // 0x01 mutable
           if ck == 0 {
@@ -6302,6 +6319,10 @@ function emitModule(stmts: i32[]): i32 {
           if gck == 1 { pendingStructIdx = gcs }
           pendingListKind = letAnnRefListKind(globalStmts[gi])
           pendingListSlot = letAnnRefListSlot(globalStmts[gi])
+          // A ref-array cell (kind 5) passes the ref-list TABLE SLOT as `fbValtype`'s
+          // second arg (`globalCellStructIdx` is -1 for a ref array) so the cell valtype
+          // selects THIS global's element wrapper, not slot 0's.
+          if gck == 5 { gcs = letAnnRefListSlot(globalStmts[gi]) }
           fbValtype(gck, gcs)                            // valtype
           wU8(1)                                         // 0x01 mutable
           if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr

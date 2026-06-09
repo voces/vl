@@ -3867,6 +3867,44 @@ const CASES: Case[] = [
     },
   },
   {
+    // KEYSTONE (ref-list VALTYPE): a `T[]` used as a function PARAM, a function RETURN,
+    // and a module GLOBAL must each select ITS OWN ref-list wrapper heap type — NOT
+    // collapse to the first ref-list slot. With two distinct ref-list types (A[] at
+    // slot 0, B[] at slot 1), the SECOND (non-slot-0) type is used in all three broken
+    // positions: `takeB(xs: B[])` (param), `mkB(): B[]` (return), and `gB: B[]` (global).
+    // Before the fix `fbValtype`/`fbValtypeNullable` emitted `rlWrapIdx[0]` (A[]'s
+    // wrapper) for the B[] param/return/global, so `WebAssembly.compile` rejected the
+    // module with `type error … (expected (ref N), got (ref M))`. The fix indexes
+    // `rlWrapIdx[slot]`, so each position types as B[].
+    name:
+      "ref-list valtype: a non-slot-0 `B[]` as param + return + global selects its own wrapper => 3",
+    src: [
+      "type A = { a: i32 }",
+      "type B = { b: i32 }",
+      "let gA: A[] = []",
+      "let gB: B[] = []",
+      "function takeB(xs: B[]): i32 {",
+      "  return xs.length",
+      "}",
+      "function mkB(): B[] {",
+      "  return []",
+      "}",
+      "function main(): i32 {",
+      "  gB.push({ b: 7 })",
+      "  gB.push({ b: 8 })",
+      "  gA.push({ a: 1 })",
+      "  return takeB(gB) + mkB().length + gA.length",
+      "}",
+      "",
+    ].join("\n"),
+    check: async (logs) => {
+      // gB has 2 elements (push {b:7}, {b:8}); gA has 1 element (push {a:1}); mkB() is empty.
+      // takeB(gB) = 2, mkB().length = 0, gA.length = 1 → 2 + 0 + 1 = 3.
+      const got = await runExport(bytesFromLog(logs), "main");
+      if (got !== 3) throw new Error(`main() returned ${got}, expected 3`);
+    },
+  },
+  {
     // KEYSTONE (multi-union): TWO distinct union types declared in one program —
     // `Node` (Lit|Var) and `Ty` (TyInt|TyStr). Construct a value of EACH union, box it,
     // and narrow it back with `is`, reading a variant field of each. Mirrors `ast.vl`'s
