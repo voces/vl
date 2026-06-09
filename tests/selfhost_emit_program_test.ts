@@ -4017,6 +4017,112 @@ const CASES: Case[] = [
       if (got !== 11) throw new Error(`main() returned ${got}, expected 11`);
     },
   },
+  // ── bitwise / shift operators (gaps P4 + E1) ──────────────────────────────
+  // Each drives the REAL self-host lexer→parser→emitProgram, then instantiates
+  // the emitted bytes in the engine. The LEB-encoder idioms (`& 0xff`, `| 0x80`,
+  // `>> 7`, `>>> 7`) are written with DECIMAL constants — the self-host lexer
+  // doesn't scan hex yet (a separate gap), so `255`/`128` stand in for
+  // `0xff`/`0x80`. The operators (the byte-emit core) are the point.
+  {
+    name: "bitwise AND `a & b` lowers to i32.and",
+    src: "function f(a: i32, b: i32): i32 {\n  return a & b\n}\n",
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      // 0b1100 & 0b1010 = 0b1000 = 8
+      const got = await runExport(bytes, "f", 12, 10);
+      if (got !== 8) throw new Error(`f(12, 10) returned ${got}, expected 8`);
+    },
+  },
+  {
+    name: "bitwise OR `a | b` lowers to i32.or",
+    src: "function f(a: i32, b: i32): i32 {\n  return a | b\n}\n",
+    check: async (logs) => {
+      // 0b1100 | 0b1010 = 0b1110 = 14
+      const got = await runExport(bytesFromLog(logs), "f", 12, 10);
+      if (got !== 14) throw new Error(`f(12, 10) returned ${got}, expected 14`);
+    },
+  },
+  {
+    name: "signed right shift `v >> n` lowers to i32.shr_s (arithmetic)",
+    src: "function f(v: i32, n: i32): i32 {\n  return v >> n\n}\n",
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      // 1024 >> 7 = 8 (the SLEB `v >>= 7` idiom, positive value)
+      const pos = await runExport(bytes, "f", 1024, 7);
+      if (pos !== 8) throw new Error(`f(1024, 7) returned ${pos}, expected 8`);
+      // shr_s preserves sign: -8 >> 1 = -4 (NOT a large positive number)
+      const neg = await runExport(bytes, "f", -8, 1);
+      if (neg !== -4) throw new Error(`f(-8, 1) returned ${neg}, expected -4`);
+    },
+  },
+  {
+    // THE discriminating case: `>>>` MUST lower to i32.shr_u (unsigned/logical),
+    // NOT i32.shr_s. On a value with the high bit set the two shifts DIFFER, so
+    // this assertion FAILS if `>>>` were mis-lowered as the signed `>>`.
+    name: "unsigned right shift `v >>> n` lowers to i32.shr_u — signed/unsigned DIFFER",
+    src: "function f(v: i32, n: i32): i32 {\n  return v >>> n\n}\n",
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      // v = -1 (0xFFFFFFFF, high bit set). shr_u by 7 = 0x01FFFFFF = 33554431.
+      // If lowered as shr_s, -1 >> 7 would stay -1 — so the assert below pins shr_u.
+      const got = await runExport(bytes, "f", -1, 7);
+      if (got !== 33554431) {
+        throw new Error(
+          `f(-1, 7) returned ${got}, expected 33554431 (shr_u); ` +
+            `-1 means \`>>>\` was wrongly lowered as the SIGNED shr_s`,
+        );
+      }
+      // -2 (0xFFFFFFFE) >>> 1 = 0x7FFFFFFF = 2147483647; shr_s would give -1.
+      const half = await runExport(bytes, "f", -2, 1);
+      if (half !== 2147483647) {
+        throw new Error(
+          `f(-2, 1) returned ${half}, expected 2147483647 (shr_u, not shr_s)`,
+        );
+      }
+    },
+  },
+  {
+    // The LEB byte-extraction idiom from `ulebToArr`/`slebToArr`: take the low 7
+    // data bits (`v & 0x7f`, here `& 127`) and set the continuation flag
+    // (`| 0x80`, here `| 128`) on a non-final byte. Exercises `&` and `|` exactly
+    // as the byte-emit core uses them.
+    name: "LEB idiom: `(v & 127) | 128` extracts 7 bits + sets the continuation flag",
+    src: "function leb(v: i32): i32 {\n  let byte = v & 127\n  return byte | 128\n}\n",
+    check: async (logs) => {
+      const bytes = bytesFromLog(logs);
+      // 300 & 127 = 44; 44 | 128 = 172
+      const got = await runExport(bytes, "leb", 300);
+      if (got !== 172) throw new Error(`leb(300) returned ${got}, expected 172`);
+      // The low-7-bit mask drops everything above bit 6: 255 & 127 = 127; | 128 = 255
+      const masked = await runExport(bytes, "leb", 255);
+      if (masked !== 255) {
+        throw new Error(`leb(255) returned ${masked}, expected 255`);
+      }
+    },
+  },
+  {
+    // Precedence: shifts sit BETWEEN relational and additive (host SHIFT_BP), and
+    // bitwise `&`/`|` sit BELOW equality/relational. So `a + b >> c` parses as
+    // `(a + b) >> c`, and `a & b == c` parses as `a & (b == c)`. If the precedence
+    // were wrong these would compute different values.
+    name: "precedence: `a + b >> c` is `(a + b) >> c` (shifts looser than +)",
+    src: "function f(a: i32, b: i32, c: i32): i32 {\n  return a + b >> c\n}\n",
+    check: async (logs) => {
+      // (3 + 5) >> 1 = 8 >> 1 = 4. (If shift bound tighter: 3 + (5>>1) = 3+2 = 5.)
+      const got = await runExport(bytesFromLog(logs), "f", 3, 5, 1);
+      if (got !== 4) throw new Error(`f(3, 5, 1) returned ${got}, expected 4`);
+    },
+  },
+  {
+    name: "precedence: `a & b == c` is `a & (b == c)` (bitwise below equality)",
+    src: "function f(a: i32, b: i32, c: i32): i32 {\n  return a & b == c\n}\n",
+    check: async (logs) => {
+      // a & (b == c): 1 & (5 == 5) = 1 & 1 = 1.
+      // (If `&` bound tighter, `(a & b) == c` = (1 & 5) == 5 = 1 == 5 = 0.)
+      const got = await runExport(bytesFromLog(logs), "f", 1, 5, 5);
+      if (got !== 1) throw new Error(`f(1, 5, 5) returned ${got}, expected 1`);
+    },
+  },
 ];
 
 // The combined driver: shared `loadToks` glue + a per-case runner that RESETS the
