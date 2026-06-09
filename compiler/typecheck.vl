@@ -198,12 +198,28 @@ function mkArrayTy(elem: i32): i32 {
 
 // Intern the well-known primitives and the global scope. Call once before
 // checking.
+// ── return-type inference state (module globals, reset by initChecker) ────────
+// An un-annotated function's hoisted return type is the PENDING sentinel `-2`
+// until its body is checked. `fnDeclIx` maps a top-level function name to its
+// FuncDecl arena index so a forward call can infer the callee ON DEMAND;
+// `inferStack` is the in-progress set (cycle detection); `inferObserved` /
+// `inferSawErr` accumulate what a pending body's `return`s / trailing expression
+// yielded (first concrete type wins; an in-cycle call contributes only "err").
+let fnDeclIx: {[string]: i32} = Map()
+let inferStack: string[] = []
+let inferObserved: i32 = -1
+let inferSawErr: boolean = false
+
 export function initChecker(): i32 {
   T.tys = []
   T.scopes = []
   T.diags = []
   T.curRet = -1
   T.userTypes = Map()
+  fnDeclIx = Map()
+  inferStack = []
+  inferObserved = -1
+  inferSawErr = false
   TY_I32 = mkPrim("i32")
   TY_F64 = mkPrim("f64")
   TY_BOOL = mkPrim("bool")
@@ -696,11 +712,29 @@ function checkCallNode(n: Call, ix: i32): i32 {
   let args = n.callArgs
   let ft = T.tys[fnTy]
   if ft is TyFunc {
+    // PENDING return (-2): the un-annotated callee hasn't been inferred yet (a
+    // forward call). Demand-infer it now — check its FuncDecl, which patches this
+    // very TyFunc in place — unless it is already on the in-progress stack (an
+    // in-cycle call: contribute TY_ERR so the cycle can be detected at the root).
+    if ft.fnRet == 0 - 2 {
+      if cfn is Ident {
+        if !onInferStack(cfn.identName) {
+          let dIx = fnDeclIx[cfn.identName] ?? -1
+          if dIx >= 0 {
+            checkNode(dIx)
+          }
+        }
+      }
+    }
+    let retTy = ft.fnRet
+    if retTy == 0 - 2 {
+      retTy = TY_ERR
+    }
     let params = ft.fnParamTypes
     if args.length != params.length {
       tErr("wrong number of arguments: expected " +
         i32ToStr(params.length) + ", got " + i32ToStr(args.length), ix)
-      return ft.fnRet
+      return retTy
     }
     let i = 0
     while i < args.length {
@@ -711,7 +745,7 @@ function checkCallNode(n: Call, ix: i32): i32 {
       }
       i = i + 1
     }
-    return ft.fnRet
+    return retTy
   }
   if ft is TyErr {
     return TY_ERR
@@ -720,9 +754,69 @@ function checkCallNode(n: Call, ix: i32): i32 {
   TY_ERR
 }
 
+// Is `name` currently being inferred (on the in-progress stack)?
+function onInferStack(name: string): boolean {
+  let i = 0
+  while i < inferStack.length {
+    if inferStack[i] == name {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Record a type a PENDING body produced (a `return e` or the trailing expression):
+// the first CONCRETE type wins; an error type only notes that something err-ish
+// flowed back (an in-cycle call), which distinguishes "void body" from "no basis".
+function noteInferredRet(t: i32): i32 {
+  if t < 0 {
+    return 0
+  }
+  let tt = T.tys[t]
+  if tt is TyErr {
+    inferSawErr = true
+    return 0
+  }
+  if tt is TyPrim {
+    if tt.primName == "void" {
+      return 0
+    }
+  }
+  if inferObserved < 0 {
+    inferObserved = t
+  }
+  0
+}
+
 // A function declaration: resolve param/return annotations (narrowing the Param/
 // TypeRef children), bind the signature, and check the body in a fresh scope.
+// An UN-ANNOTATED return type is INFERRED from the body — its `return`s and
+// trailing expression accumulate via `noteInferredRet` (under the `-2` pending
+// `curRet`), and the result is PATCHED into the hoisted TyFunc in place, so every
+// caller (incl. ones that demand-inferred this function early) sees it. A
+// base-case-less cycle (`ping(){return pong()}` / `pong(){return ping()}`) has
+// nothing concrete to latch onto and reports "cannot infer a return type".
 function checkFuncDeclNode(n: FuncDecl): i32 {
+  let inferring = n.fnRet < 0
+  // Already inferred on demand (a forward call checked this body before pass 2
+  // reached it)? Skip the re-check so diagnostics aren't duplicated.
+  if inferring {
+    if onInferStack(n.fnName) {
+      return TY_VOID
+    }
+    let hoisted = lookup(n.fnName)
+    if hoisted >= 0 {
+      if (fnDeclIx[n.fnName] ?? -1) >= 0 {
+        let ht = T.tys[hoisted]
+        if ht is TyFunc {
+          if ht.fnRet != 0 - 2 {
+            return TY_VOID
+          }
+        }
+      }
+    }
+  }
   let params = n.fnParams
   let paramTys: i32[] = []
   let pi = 0
@@ -746,9 +840,10 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
     paramTys.push(pt)
     pi = pi + 1
   }
-  // Resolve the return-type annotation.
-  let ret = TY_VOID
-  if n.fnRet >= 0 {
+  // Resolve the return-type annotation (or the pending sentinel when inferring).
+  let ret = 0 - 2
+  if !inferring {
+    ret = TY_VOID
     let rtn = P.nodes[n.fnRet]
     if rtn is TypeRef {
       ret = nameToTy(rtn.tyName)
@@ -757,10 +852,19 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
         ret = TY_ERR
       }
     }
+    // `f` is hoisted in the outer scope (checkProgram pre-pass), but re-declaring
+    // it here covers nested function decls and is an idempotent rebind otherwise.
+    declare(n.fnName, mkFuncTy(paramTys, ret))
   }
-  // `f` is hoisted in the outer scope (checkProgram pre-pass), but re-declaring
-  // it here covers nested function decls and is an idempotent rebind otherwise.
-  declare(n.fnName, mkFuncTy(paramTys, ret))
+  // Save the inference accumulators (a demand-inference can nest inside another
+  // function's body check) and the enclosing return type.
+  let savedObserved = inferObserved
+  let savedSawErr = inferSawErr
+  if inferring {
+    inferStack.push(n.fnName)
+    inferObserved = -1
+    inferSawErr = false
+  }
   // Check the body in a fresh scope sharing the parameters.
   pushScope()
   let savedRet = T.curRet
@@ -778,12 +882,45 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
     let stmts = body.blkStmts
     let s = 0
     while s < stmts.length {
-      checkNode(stmts[s])
+      let stTy = checkNode(stmts[s])
+      // The trailing expression is the implicit return; under inference it is a
+      // return-type witness.
+      if inferring && s == stmts.length - 1 {
+        noteInferredRet(stTy)
+      }
       s = s + 1
     }
   }
   T.curRet = savedRet
   popScope()
+  if inferring {
+    inferStack.pop()
+    let inferred = TY_VOID
+    if inferObserved >= 0 {
+      inferred = inferObserved
+    } else if inferSawErr {
+      // Only err-ish types flowed back (a base-case-less cycle): no basis.
+      tErr("cannot infer a return type for '" + n.fnName +
+        "' — annotate a return type", n.fnBody)
+      inferred = TY_ERR
+    }
+    // Patch the hoisted TyFunc IN PLACE so existing references see the result;
+    // a nested (un-hoisted) function declares fresh.
+    let bound = lookup(n.fnName)
+    let patched = false
+    if bound >= 0 {
+      let bt = T.tys[bound]
+      if bt is TyFunc {
+        bt.fnRet = inferred
+        patched = true
+      }
+    }
+    if !patched {
+      declare(n.fnName, mkFuncTy(paramTys, inferred))
+    }
+    inferObserved = savedObserved
+    inferSawErr = savedSawErr
+  }
   TY_VOID
 }
 
@@ -873,17 +1010,23 @@ function checkProgramNode(n: Program): i32 {
         hpt.push(t)
         k = k + 1
       }
-      let hret = TY_VOID
+      // An UN-ANNOTATED return hoists as the PENDING sentinel (-2): the real type
+      // is inferred from the body in pass 2 (or on demand at a forward call site),
+      // then PATCHED into this same TyFunc in place.
+      let hret = 0 - 2
       if s.fnRet >= 0 {
         let hrtn = P.nodes[s.fnRet]
         if hrtn is TypeRef {
           let r = nameToTy(hrtn.tyName)
           if r >= 0 {
             hret = r
+          } else {
+            hret = TY_VOID
           }
         }
       }
       declare(s.fnName, mkFuncTy(hpt, hret))
+      fnDeclIx[s.fnName] = stmts[hi]
     }
     hi = hi + 1
   }
@@ -1262,6 +1405,12 @@ function checkNode(ix: i32): i32 {
       if want >= 0 && !assignable(TY_VOID, want) {
         tErr("return needs a value of type " + tyToStr(want), ix)
       }
+      return TY_VOID
+    }
+    // Under a PENDING return type (-2: this function's return is being inferred),
+    // record the returned type as a witness instead of checking a mismatch.
+    if want == 0 - 2 {
+      noteInferredRet(checkNode(n.retArg))
       return TY_VOID
     }
     let got = checkNode(n.retArg)
