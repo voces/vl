@@ -23,7 +23,7 @@
 //
 // GROWING THE WHITELIST: re-run the runtime sweep as the emitter/checker/parser
 // gain coverage and promote newly-passing files. Current buckets of the 304 @run
-// files: 60 PASS; 70 emit gaps (lambdas/for-in/…), 77 checker false-rejects, 76 parse
+// files: 71 PASS; 70 emit gaps (lambdas/for-in/…), 77 checker false-rejects, 76 parse
 // gaps, 28 scratch-needing top-level statements (emit validly only inside
 // functions today), 11 emitter traps (real bugs to pin), 4 log diffs (bool prints
 // as 1/0 — needs bool-ness threading per the plan's step 3).
@@ -83,6 +83,7 @@ const WHITELIST = [
   "arrays/infer-empty-push.vl",
   "chars/literals.vl",
   "functions/calls.vl",
+  "functions/early-return.vl",
   "functions/forward-call-inferred.vl",
   "functions/forward-reference-needs-return-type.vl",
   "functions/forward-reference-struct-param.vl",
@@ -98,6 +99,7 @@ const WHITELIST = [
   "globals/mutate-in-loop.vl",
   "globals/mutate-through-fn.vl",
   "globals/read-through.vl",
+  "globals/string-read-through.vl",
   "lexer/soft-keywords-as-function-names.vl",
   "lexer/soft-keywords-as-identifiers.vl",
   "lint/called-function-no-warn.vl",
@@ -127,13 +129,22 @@ const WHITELIST = [
   "loops/for-step.vl",
   "loops/for-sum.vl",
   "loops/while-sum.vl",
+  "soundness/boolean-narrowing-if-sound.vl",
   "soundness/equality-boolean-sound.vl",
   "statements/call-result-still-consumable.vl",
   "statements/discarded-call-return.vl",
   "statements/struct-call-as-statement.vl",
+  "strings/accum-adv-other-read.vl",
+  "strings/accum-adv-reset.vl",
+  "strings/accum-basic.vl",
+  "strings/accum-empty.vl",
+  "strings/print-and-eq.vl",
+  "strings/slice.vl",
+  "types/literal-narrowing.vl",
   "types/union-narrowed-helper-recursion.vl",
   "types/union-two-visitors.vl",
   "variables/definite-assign-initialized-ok.vl",
+  "variables/let-literal-widens.vl",
   "variables/let-reassign-ok.vl",
 ];
 
