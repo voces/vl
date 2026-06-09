@@ -104,6 +104,12 @@ type TyNullable = { nInner: i32 }
 // A growable array `T[]`: the element type-arena index (`-1` for an empty `[]`
 // whose element is not yet known — assignable to any array, like a hole).
 type TyArray = { aElem: i32 }
+// A string-keyed map `{[K]: V}` or a Set over it: key and value type-arena
+// indices (`-1` for the holes of a bare `Map()`/`Set()`, pinned by the binding
+// annotation or the first `.set`/`.add`). `mSet` is 1 for the SET flavor — a set
+// is internally a boolean-valued map but exposes ONLY `.add`/`.has`/`.delete`/
+// `.length`/`.values()` (the Map surface — `.set`/`.get`/`.keys` — must not leak).
+type TyMap = { mKey: i32, mVal: i32, mSet: i32 }
 
 // The unified type. Declared after its members (a union alias can't forward-
 // reference). Discriminated with `is`, exactly like the AST `Node`.
@@ -113,7 +119,8 @@ type Ty = TyPrim |
   TyFunc |
   TyUnion |
   TyNullable |
-  TyArray
+  TyArray |
+  TyMap
 
 // A type diagnostic: a message plus the AST node index it was raised at. VL has
 // no exceptions, so errors are accumulated on `T.diags`, not thrown.
@@ -193,6 +200,11 @@ function mkNullableTy(inner: i32): i32 {
 
 function mkArrayTy(elem: i32): i32 {
   let t: Ty = { aElem: elem }
+  addTy(t)
+}
+
+function mkMapTy(key: i32, val: i32, isSet: i32): i32 {
+  let t: Ty = { mKey: key, mVal: val, mSet: isSet }
   addTy(t)
 }
 
@@ -392,6 +404,26 @@ function nameToTy(name: string): i32 {
       return mkArrayTy(nameToTy(name.slice(0, nlen - 2)))
     }
   }
+  // A string-keyed MAP `{[K]:V}` (the parser's synthetic index-signature name).
+  // Split at the FIRST "]:" — the key (between "{[" and "]:") cannot contain `]`,
+  // so a nested-map VALUE (`{[string]:{[string]:i32}}`) splits correctly. Only
+  // string keys are supported (the host's map rep); a non-string key resolves to
+  // -1 so the caller reports "unknown type".
+  if nlen >= 5 {
+    if name[0] == '{' && name[1] == '[' && name[nlen - 1] == '}' {
+      let mi = 2
+      while mi < nlen - 1 {
+        if name[mi] == ']' && name[mi + 1] == ':' {
+          let mk = nameToTy(name.slice(2, mi))
+          if mk != TY_STR {
+            return -1
+          }
+          return mkMapTy(mk, nameToTy(name.slice(mi + 2, nlen - 1)), 0)
+        }
+        mi = mi + 1
+      }
+    }
+  }
   // A declared struct/union type (registered by the program's pre-pass).
   if T.userTypes.has(name) {
     return T.userTypes[name] ?? -1
@@ -454,6 +486,8 @@ function tyToStr(ix: i32): string {
     return tyToStr(t.nInner) + "?"
   } else if t is TyArray {
     return tyToStr(t.aElem) + "[]"
+  } else if t is TyMap {
+    return "{[" + tyToStr(t.mKey) + "]: " + tyToStr(t.mVal) + "}"
   }
   "<?>"
 }
@@ -567,6 +601,13 @@ function assignable(src: i32, dst: i32): boolean {
     }
     return false
   }
+  if s is TyMap {
+    if d is TyMap {
+      // A bare `Map()`/`Set()` (key/value holes, `-1`) is assignable to any map.
+      return assignable(s.mKey, d.mKey) && assignable(s.mVal, d.mVal)
+    }
+    return false
+  }
   if s is TyFunc {
     if d is TyFunc {
       let sp = s.fnParamTypes
@@ -621,6 +662,88 @@ function checkCallNode(n: Call, ix: i32): i32 {
         return TY_I32
       }
       tErr("no method '." + cfn.memProp + "' on array " + tyToStr(recvTy), ix)
+      return TY_ERR
+    }
+    // Map/Set methods over the `{[K]: V}` rep, gated by FLAVOR: a map exposes
+    // `.set`/`.get`/`.has`/`.delete`/`.keys()`/`.values()`; a SET exposes only
+    // `.add`/`.has`/`.delete`/`.values()` (the Map surface must not leak — `.set`
+    // on a set / `.add` on a map is an unknown-property error). The first
+    // `.set`/`.add` on a bare `Map()`/`Set()` PINS its key/value holes in place,
+    // so a later conflicting use is a clean type error.
+    if rt is TyMap {
+      let mp = cfn.memProp
+      let margs2 = n.callArgs
+      if mp == "set" && rt.mSet == 0 {
+        if margs2.length != 2 {
+          tErr("set expects 2 arguments, got " + i32ToStr(margs2.length), ix)
+        } else {
+          let k0 = checkNode(margs2[0])
+          let v0 = checkNode(margs2[1])
+          if rt.mKey < 0 {
+            rt.mKey = k0
+          } else if !assignable(k0, rt.mKey) {
+            tErr("set: expected " + tyToStr(rt.mKey) + ", got " + tyToStr(k0), ix)
+          }
+          if rt.mVal < 0 {
+            rt.mVal = v0
+          } else if !assignable(v0, rt.mVal) {
+            tErr("set: expected " + tyToStr(rt.mVal) + ", got " + tyToStr(v0), ix)
+          }
+        }
+        return TY_VOID
+      }
+      if mp == "get" && rt.mSet == 0 {
+        if margs2.length != 1 {
+          tErr("get expects 1 argument, got " + i32ToStr(margs2.length), ix)
+        } else {
+          let k1 = checkNode(margs2[0])
+          if !assignable(k1, rt.mKey) {
+            tErr("get: key must be " + tyToStr(rt.mKey) + ", got " + tyToStr(k1), ix)
+          }
+        }
+        return mkNullableTy(rt.mVal)
+      }
+      if mp == "add" && rt.mSet == 1 {
+        if margs2.length != 1 {
+          tErr("add expects 1 argument, got " + i32ToStr(margs2.length), ix)
+        } else {
+          let ka = checkNode(margs2[0])
+          if rt.mKey < 0 {
+            rt.mKey = ka
+          } else if !assignable(ka, rt.mKey) {
+            tErr("add: expected " + tyToStr(rt.mKey) + ", got " + tyToStr(ka), ix)
+          }
+        }
+        return TY_VOID
+      }
+      if mp == "has" || mp == "delete" {
+        if margs2.length != 1 {
+          tErr(mp + " expects 1 argument, got " + i32ToStr(margs2.length), ix)
+        } else {
+          let k2 = checkNode(margs2[0])
+          if !assignable(k2, rt.mKey) {
+            tErr(mp + ": key must be " + tyToStr(rt.mKey) + ", got " + tyToStr(k2), ix)
+          }
+        }
+        return TY_BOOL
+      }
+      if mp == "keys" && rt.mSet == 0 {
+        if margs2.length != 0 {
+          tErr("keys expects no arguments", ix)
+        }
+        return mkArrayTy(rt.mKey)
+      }
+      if mp == "values" {
+        if margs2.length != 0 {
+          tErr("values expects no arguments", ix)
+        }
+        // A set's `.values()` yields its ELEMENTS (the keys); a map's its values.
+        if rt.mSet == 1 {
+          return mkArrayTy(rt.mKey)
+        }
+        return mkArrayTy(rt.mVal)
+      }
+      tErr("unknown property `" + mp + "` on " + tyToStr(recvTy), ix)
       return TY_ERR
     }
     // String methods: `.slice(i32,i32)->string`, `.indexOf(string)->i32`,
@@ -693,6 +816,19 @@ function checkCallNode(n: Call, ix: i32): i32 {
         pj = pj + 1
       }
       return TY_VOID
+    }
+    // `Map()` / `Set()` construct an empty string-keyed map: key/value HOLES (-1)
+    // assignable to any map annotation (`const m: {[string]: i32} = Map()`).
+    if cfn.identName == "Map" || cfn.identName == "Set" {
+      if n.callArgs.length != 0 {
+        tErr(cfn.identName + " expects no arguments", ix)
+      }
+      if cfn.identName == "Set" {
+        // A set's VALUE type is the membership boolean; the element (key) is a
+        // hole pinned by the annotation or the first `.add`.
+        return mkMapTy(0 - 1, TY_BOOL, 1)
+      }
+      return mkMapTy(0 - 1, 0 - 1, 0)
     }
     // `fromCodePoint(code)` is a builtin: an i32 code point -> a length-1 string.
     if cfn.identName == "fromCodePoint" {
@@ -1111,6 +1247,19 @@ function checkNode(ix: i32): i32 {
       }
       return TY_BOOL
     }
+    // Nullish coalescing: `a ?? d` strips `a`'s nullability; the default must be
+    // assignable to the inner type. A non-nullable LHS just yields itself.
+    if op == "??" {
+      let lt2 = T.tys[lt]
+      if lt2 is TyNullable {
+        let inner = lt2.nInner
+        if !assignable(rt, inner) {
+          tErr("?? default: expected " + tyToStr(inner) + ", got " + tyToStr(rt), ix)
+        }
+        return inner
+      }
+      return lt
+    }
     // Equality: result bool; requires mutual compatibility.
     if op == "==" || op == "!=" {
       if !assignable(lt, rt) && !assignable(rt, lt) {
@@ -1167,12 +1316,19 @@ function checkNode(ix: i32): i32 {
     if ot is TyErr {
       return TY_ERR
     }
-    // `.length` on an array or a string is an i32.
+    // `.length` on an array, a map, or a string is an i32.
     if ot is TyArray {
       if n.memProp == "length" {
         return TY_I32
       }
       tErr("no field '" + n.memProp + "' on array " + tyToStr(objTy), ix)
+      return TY_ERR
+    }
+    if ot is TyMap {
+      if n.memProp == "length" {
+        return TY_I32
+      }
+      tErr("no field '" + n.memProp + "' on map " + tyToStr(objTy), ix)
       return TY_ERR
     }
     if ot is TyPrim {
@@ -1214,10 +1370,19 @@ function checkNode(ix: i32): i32 {
   } else if n is Index {
     let arrTy = checkNode(n.idxArr)
     let idxTy = checkNode(n.idxIndex)
+    let at = T.tys[arrTy]
+    // A MAP index `m[k]`: the key must match the map's key type; a READ yields the
+    // NULLABLE value (`V | null` — the key may be absent; default with `??`), and an
+    // assignment target `m[k] = v` accepts a plain `V` (assignable to `V | null`).
+    if at is TyMap {
+      if !assignable(idxTy, at.mKey) {
+        tErr("map key must be " + tyToStr(at.mKey) + ", got " + tyToStr(idxTy), ix)
+      }
+      return mkNullableTy(at.mVal)
+    }
     if !assignable(idxTy, TY_I32) {
       tErr("array index must be i32, got " + tyToStr(idxTy), ix)
     }
-    let at = T.tys[arrTy]
     if at is TyArray {
       return at.aElem
     }
@@ -1292,6 +1457,19 @@ function checkNode(ix: i32): i32 {
         if !assignable(initTy, annot) {
           tErr("cannot assign " + tyToStr(initTy) + " to '" + n.letName +
             "' of type " + tyToStr(annot), ix)
+        }
+        // A `Set()` initializer keeps its SET flavor even under a map-shaped
+        // annotation (`let s: {[string]: boolean} = Set()`): the binding exposes
+        // the Set surface (`.add`, no `.set`/`.get`/`.keys`), with the
+        // annotation's key/value types.
+        let it2 = T.tys[initTy]
+        if it2 is TyMap {
+          if it2.mSet == 1 {
+            let an2 = T.tys[annot]
+            if an2 is TyMap {
+              bound = mkMapTy(an2.mKey, an2.mVal, 1)
+            }
+          }
         }
       }
     } else if initTy >= 0 {
