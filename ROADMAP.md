@@ -446,6 +446,19 @@ independent).*
   build is JS-bound). → `DECISIONS.md`. binaryen stays for the TS compiler.
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime
   (wasmtime — full WasmGC since v27) + a small host shim. No V8, no binaryen, no Deno.
+  **Engine choice re-validated (2026 survey):** wasmtime remains the only standards-track
+  non-browser engine with complete, production WasmGC (27.0+, DRC + null collectors; the
+  collector is a per-invocation tuning knob). Wasmer gets GC mainly via its V8 backend (a JS
+  engine again); WAMR/wazero are embedded/Go niches without GC. **System-API strategy:** WASI
+  preview 1 is the whole OS surface `vl` needs (fd_read/fd_write/path_open/args_get/proc_exit),
+  implemented natively by wasmtime — we write no OS code. The split: formatting + all compiler
+  logic in VL; ONE emitter prerequisite — a linear memory + a GC-string→linear-memory copy
+  (the `__store_string__` analog), since WASI's ptr/len ABI can't take GC refs (this also
+  subsumes H4.5: emitted bytes leave via fd_write, killing the decimal-string handoff).
+  Target WASI p1 (p2/component-model + GC interop still settling). Distribution: zero-code via
+  `wasmtime run --dir . vl.cwasm` (AOT-compiled) behind a launcher script; a single static
+  `vl` binary is an OPTIONAL thin Rust embedding of the wasmtime crate (engine setup +
+  preopens only — no OS logic), deferrable until the flip.
 - ⬜ **H5. Versioning — deferred; rustup/Volta model, not nvm** (→ `DECISIONS.md`). Make the H-M1
   install path version-stamped so a launcher can slot in later.
 
