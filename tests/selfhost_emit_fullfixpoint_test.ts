@@ -6,7 +6,7 @@
 // This test proves the STRONGEST rung on the single largest real input there is, the
 // compiler ITSELF:
 //
-//   X            = the compiler's own source (lexer + ast + parser + wasmEmit)
+//   X            = the compiler's own source (lexer + ast + parser + typecheck + wasmEmit)
 //   host_bytes(X)= B_T.runEmitFull()    — X emitted by the HOST-compiled emitter
 //                  (B_T = toWasm.ts(T_full), T_full = X + a tiny entry point)
 //   M_self       = B_T's self-emission of T_full (the self-emitted emitter, ~1.2 MB)
@@ -50,10 +50,14 @@ const lexer = read("../compiler/lexer.vl")
   .replace(/\badvance\b/g, "lexAdvance");
 const ast = read("../compiler/ast.vl");
 const parser = read("../compiler/parser.vl");
+const typecheck = read("../compiler/typecheck.vl");
 const wasmEmit = read("../compiler/wasmEmit.vl");
 
-// X = the compiler's own source: the program M_self must re-emit.
-const X = lexer + "\n" + ast + "\n" + parser + "\n" + wasmEmit + "\n";
+// X = the compiler's own source: the program M_self must re-emit. ALL FIVE modules,
+// including `typecheck.vl` — the emitter emits the whole compiler (the type checker's
+// map/list-of-maps fields, narrowed/variant field writes, and >=64 heap-type refs all
+// land), so the fixpoint capstone now covers the FULL compiler, not just the front end.
+const X = lexer + "\n" + ast + "\n" + parser + "\n" + typecheck + "\n" + wasmEmit + "\n";
 
 const CHUNK = 9000;
 // Render `s` as a sequence of `parts.push("…")` statements over <9000-char chunks
