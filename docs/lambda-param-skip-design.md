@@ -1,95 +1,87 @@
-# Callback parameter-skip ergonomics — design
+# Callback parameter-skip ergonomics — design (options, no pick)
 
-A design note for letting callbacks skip leading parameters without `_` noise —
-e.g. reaching the `index` of `map`/`filter` without `(_, i) => …`. Captures the
-decision and the dependency chain so it's ready to build when the prerequisites
-land. Status: **design only, not yet buildable** (see Prerequisites).
+A design note for letting callbacks (and, relatedly, destructuring patterns) skip
+leading parameters without placeholder noise — e.g. reaching the `index` of
+`map`/`filter` without `(_, i) => …`. This records the candidate syntaxes and
+their tradeoffs **without picking a winner** (maintainer is split between the
+named and `$#` forms, and partial to leading commas for the consistency reasons
+below). Status: **design only, not yet buildable** (see Prerequisites).
 
 ## The problem
 Skipping *leading* callback params to reach a *later* one (almost always the
-index) forces placeholder noise that worsens with each skip:
-`(_, i) =>`, `(_, _, arr) =>`. Trailing omission is already free (a callback may
-take fewer args than supplied), so the pain is specifically "I want arg N and
-don't care about 0..N-1".
+index) forces placeholder noise. And it's worse than it looks in VL: because
+**a param can't be named `_` twice** (duplicate-name error), skipping two means
+inventing distinct dummies — `(_1, _2, arr) =>` — not `(_, _, arr) =>`. So the
+pain is both the placeholders *and* having to name them uniquely.
 
 ## Prerequisites (why this is downstream, not a quick slice)
 1. **Self-host lambdas / closures + HOFs don't exist yet.** `.map`/`.filter`/
-   lambdas are in the emitter-coverage gap bucket — the host TS compiler has them,
-   the native `vl` does not. `[3,7].map(f)` can't compile natively today regardless
-   of skip syntax.
-2. **Param names are not part of function types.** Skip-by-name needs function
-   types to carry parameter *names* (`(value: T, index: i32) => U`, names
-   significant) and the contextual type to flow them into the closure.
+   lambdas are in the emitter-coverage gap — the host TS compiler has them, the
+   native `vl` does not. `[3,7].map(f)` can't compile natively today.
+2. **Skip-by-name additionally needs param names in function types** (`(value: T,
+   index: i32) => U`, names significant) flowed into the closure's contextual type.
 
-So this rides on top of two real features; it is not a standalone parser tweak.
+## Candidate syntaxes (tradeoffs only)
 
-## Options considered
+### A. Leading commas — `[3,7].map((, i) => i + 1)`
+- **For:** no dummy names at all (sidesteps the `_1, _2` problem entirely); zero
+  type-system cost (pure parser/emitter); **consistent with array destructuring**
+  if/when we add it (`const [, foo] = pair()` uses the exact same skip), so one
+  rule covers both pattern positions.
+- **Against:** doesn't scale to *reading* — `(,, x)` makes you count commas; a
+  missing/extra comma silently changes arity and is easy to fat-finger.
+- Net: ugly but understandable, and the destructuring-consistency story is its
+  strongest argument.
 
-### A. Leading commas — `[3,7].map((, i) => i + 1)` — REJECTED
-Explicit and zero type-system cost, but it does **not** solve the stated pain:
-`(,, x)` still makes you *count commas*, just without the `_`s; a leading/extra
-comma is the easiest token to misread or fat-finger (a missing comma silently
-changes arity); and it saves ~1 char per skip over `_`. Marginal, doesn't scale.
+### B. Bare name auto-match — `[3,7].map((index) => index + 1)` — (the one clear no)
+Reads great but is genuinely ambiguous: `(x) =>` already means "first param", so
+`(index) =>` meaning *position 1* (because the name matches the signature) makes
+the same syntactic form bind different positions depending on the name — renaming
+a local silently moves what it binds; a typo silently falls back to position 0.
+Listed only to mark it as the option to avoid.
 
-### B. Bare name auto-match — `[3,7].map((index) => index + 1)` — REJECTED
-Reads great, but the **bare** form is ambiguous and magical:
-- `(x) =>` already means "first param". If `(index) =>` instead binds *position 1*
-  because the name matches the signature, then the same syntactic form means
-  different positions depending on the name — renaming a local silently moves which
-  value it binds.
-- A typo (`(idnex) =>`) either errors (annoying) or silently falls back to
-  position 0 (worse).
-- It hard-couples callers to the library's param names with no visible opt-in.
+### C. Labeled skip ("named") — `[3,7].map((index: i) => i + 1)`
+- **For:** the `:` disambiguates from positional (`(i)` is always positional), and
+  it mirrors VL's existing **named args** (`f(x: 1)`); scales without counting
+  (`(third: x)` regardless of how many precede); self-documenting; binds only what
+  you list (no dummies, no unused-lint).
+- **Against:** needs Prerequisite 2 (param names in function types), and makes a
+  library's param *names* a soft API surface (renaming a param breaks name-matched
+  callers — the tradeoff Python/Swift accept for keyword args, opt-in here).
 
-### C. Labeled skip — `[3,7].map((index: i) => i + 1)` — RECOMMENDED
-The `:` is the disambiguator and mirrors VL's existing **named args** (`f(x: 1)`):
+### D. Positional shorthand — `[3,7].map($1 + 1)` (Swift `$0/$1`, Clojure `%1/%2`)
+- **For:** skipping earlier positions is free; scales; **no** type-system
+  param-name work (pure parser/emitter); established precedent.
+- **Against:** a new sigil, and `$1` is less legible than a name; numbered access
+  has its own miscount risk (which arg is `$1`?).
+
+### E. (Minimal, orthogonal) allow `_` to repeat
+Special-case `_` as a non-binding throwaway so `(_, _, arr) =>` is legal (it is in
+Rust/Scala). Doesn't remove placeholders, but removes the "invent `_1`/`_2`"
+papercut cheaply, and is independent of whichever of A/C/D is chosen.
+
+## Related: array destructuring + multiple returns
+The skip question recurs in **destructuring patterns**, and the cleanest answer
+there ties back to A:
 ```
-[3, 7].map((i) => i + 1)              // positional: i = value (arg 0) — unchanged
-[3, 7].map((index: i) => i + 1)       // skip-by-name: bind the param named `index` to `i`
-[3, 7].map((value: v, index: i) => …) // bind both, explicitly
+const [, foo] = pair()      // leading-comma skip — same rule as a param list
 ```
-- **Unambiguous:** `(i)` is *always* positional; `:` is the explicit opt-in to
-  name-matching. (Deliberately drop the bare `(index)` shorthand — that's the
-  ambiguous case.)
-- **Scales without counting:** `(third: x)` binds the 3rd param no matter how many
-  precede it — self-documenting, no comma-counting.
-- **Binds only what's listed:** unlisted params aren't in scope (no `_`, no
-  unused-lint).
-- **Symmetric** with call-site named args (`label: binding` both ways).
+But note: **returning an array to destructure is the wrong primitive** for
+fixed-arity results — prefer **multiple return values**. wasm supports multi-value
+natively (standard since ~2020; wasmtime/V8/SpiderMonkey all implement it), so a
+`function f(): (i32, string)` lowers to a functype with two result valtypes,
+`return (a, b)` pushes both, and `const [a, b] = f()` pops them into two locals —
+**no allocation, no array boxing**. So if we add destructuring + multiple returns,
+the leading-comma skip (`const [, b] = f()`) and the param-list skip can share one
+grammar — which is the main reason A is attractive despite its scaling weakness.
 
-Cost: requires Prerequisite 2 (names in function types) and makes library param
-names a soft API surface (renaming a param is a breaking change for name-matched
-callers — the same tradeoff Python/Swift accept for call-site keyword args, but
-opt-in here).
+## Open decision (maintainer's call — no recommendation here)
+Live candidates: **A (leading commas)**, **C (labeled `(name: bind)`)**, **D
+(`$#`)** — plus **E** as a cheap orthogonal win regardless. Considerations to
+weigh: A's destructuring-consistency vs its comma-counting; C's readability vs the
+names-in-types cost and param-names-as-API; D's zero type cost vs the sigil. And a
+scoping sub-question if C is chosen: param names in function types **generally**
+(any user HOF) vs **special-cased** for std `map`/`filter` first.
 
-### D. Positional shorthand — `[3,7].map($1 + 1)` — VIABLE CHEAP INTERIM
-Swift (`$0/$1`) / Clojure (`%1/%2`) precedent: reference args by position, skipping
-earlier ones is free. **No type-system param-name work** (pure parser/emitter),
-scales fine. Downsides: a new sigil and it's a bit cryptic (`$1` vs a name). Not
-mutually exclusive with C — could ship as an independent ergonomic once lambdas
-exist, and add C later.
-
-## Recommendation
-Target **C (labeled skip, `(label: binding)`, no bare shorthand)** as the real
-feature — most readable and most VL-idiomatic — and **drop leading commas (A)**.
-**D (`$1`)** is a reasonable independent cheap add if a low-cost win is wanted
-before the type-system work.
-
-## Sliced rollout
-1. **Self-host lambdas/closures + `.map`/`.filter`/`.forEach`** (the big
-   prerequisite; an emitter-coverage feature in its own right).
-2. **Param names in function types** + contextual-type flow (names become
-   load-bearing in the type; functype interning must stay name-agnostic for
-   WasmGC identity / goldens — names live in the checker's type, not the emitted
-   functype).
-3. **Labeled skip syntax (C)** in the parser + checker (match `label` against the
-   contextual callback type's param names; bind only listed params).
-4. *(Optional, independent)* **`$1` shorthand (D)**.
-
-## Open scoping decision (for the maintainer)
-Should param names be part of function types **generally** (enabling skip-by-name
-for *any* user higher-order function) or **special-cased** for the known std
-collection methods (`map`/`filter`/…) first? Recommendation: **general** — the
-special-case is throwaway and would be redone; the general feature is the clean
-target. But the general version is the larger type-system commitment, so a
-std-only first step is a legitimate smaller rung if desired.
+(Whichever way: B — bare auto-match — is the one to avoid, and all of this is
+gated on self-host lambdas + HOFs landing first.)
