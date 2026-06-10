@@ -560,6 +560,32 @@ export const defaultScope = () => {
       }],
       return: { type: "Alias", name: "string" },
     };
+
+    // `fromCodePoints(xs: i32[]): string` — construct a VL string from a LIST of
+    // Unicode code points in one bulk copy. The amortized alternative to per-char
+    // `fromCodePoint(c)` + `+` concat, which is quadratic copy churn (a VL string
+    // is a real array, not a rope) — pathological for compiler-sized strings.
+    scope["fromCodePoints"] = {
+      type: "Function",
+      paramaters: [{
+        type: "Parameter",
+        name: "codes",
+        paramaterType: {
+          type: "Custom",
+          validate: namedFunc(
+            "i32[]",
+            (right: VLType) =>
+              right.type === "Object" &&
+              right.properties.length === 1 &&
+              typeof right.properties[0].name === "object" &&
+              right.properties[0].name.type === "Alias" &&
+              (right.properties[0].name.name === "number" ||
+                right.properties[0].name.name === "i32"),
+          ),
+        },
+      }],
+      return: { type: "Alias", name: "string" },
+    };
   });
 
   return scope;

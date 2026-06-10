@@ -33,33 +33,20 @@ const typecheck = read("../compiler/typecheck.vl");
 const wasmEmit = read("../compiler/wasmEmit.vl");
 
 const driver = `
-// Source accumulates in BOUNDED chunks: a per-code-point append onto one big
-// string is quadratic copy churn (a VL string is a real WasmGC array — concat is
-// O(n), not a rope), which exhausts the GC heap on a compiler-sized input. The
-// current chunk stays <= 4096 chars; the final join is linear in chunk count.
-let vcParts: string[] = []
-let vcCur: string = ""
+// Source accumulates as an i32 CODE-POINT LIST (amortized push — string concat
+// per char is quadratic copy churn, pathological where GC array.copy is a
+// per-element host libcall), converted ONCE by the fromCodePoints builtin.
+let vcCodes: i32[] = []
 export function srcReset(): i32 {
-  vcParts = []
-  vcCur = ""
+  vcCodes = []
   0
 }
 export function srcPush(c: i32): i32 {
-  vcCur = vcCur + fromCodePoint(c)
-  if vcCur.length >= 4096 {
-    vcParts.push(vcCur)
-    vcCur = ""
-  }
+  vcCodes.push(c)
   0
 }
 function vcSource(): string {
-  let out = ""
-  let i = 0
-  while i < vcParts.length {
-    out = out + vcParts[i]
-    i = i + 1
-  }
-  out + vcCur
+  fromCodePoints(vcCodes)
 }
 function vcLoadToks(src: string): i32 {
   let r = tokenize(src)

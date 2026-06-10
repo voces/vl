@@ -1655,6 +1655,46 @@ export const toWasm = async (
     return name;
   };
 
+  // `__codes_to_string__(xs)`: copy a growable `i32[]` list's LIVE elements
+  // [0, len) into an exact-length string array (a VL string IS the i32 code-point
+  // array). Backs `fromCodePoints(xs)` — the amortized bulk string constructor:
+  // building a string by per-char `+` concat is quadratic copy churn (each concat
+  // reallocates the whole array), pathological under engines that route GC
+  // `array.copy` through a host libcall (wasmtime). Push code points into an
+  // `i32[]` (amortized) and convert ONCE instead.
+  const codesToStringFn = (): string => {
+    const name = "__codes_to_string__";
+    if (!_helpers.has(name)) {
+      _helpers.add(name);
+      const at = arrayType(i32Type);
+      const lt = listType(i32Type);
+      // Locals: 0 = list (param); 1 = len; 2 = result array.
+      const list = () => m.local.get(0, lt.refType);
+      const len = () => m.local.get(1, binaryen.i32);
+      const result = () => m.local.get(2, at.refType);
+      const body = m.block(null, [
+        m.local.set(1, listLen(list())),
+        m.local.set(2, m.array.new(at.heapType, len(), m.i32.const(0))),
+        m.array.copy(
+          result(),
+          m.i32.const(0),
+          listBacking(lt, list()),
+          m.i32.const(0),
+          len(),
+        ),
+        result(),
+      ], at.refType);
+      m.addFunction(
+        name,
+        binaryen.createType([lt.refType]),
+        at.refType,
+        [binaryen.i32, at.refType],
+        body,
+      );
+    }
+    return name;
+  };
+
   // `__bool_to_string__(b)`: render a boolean as the VL string `"true"`/`"false"`
   // (a WasmGC i32-array of char codes). Backs `toString(boolean)`.
   const boolToStringFn = (): string => {
@@ -3620,6 +3660,18 @@ export const toWasm = async (
           );
           const at = arrayType(i32Type);
           return m.array.new_fixed(at.heapType, [code]);
+        }
+        // `fromCodePoints(xs)` (H2): construct a VL string from an `i32[]` of
+        // Unicode code points in ONE bulk copy — the amortized alternative to
+        // per-char `+` concat (see `__codes_to_string__`).
+        if (node.function === "fromCodePoints") {
+          const arg = node.arguments[0].value;
+          const list = toExpression(arg);
+          return m.call(
+            codesToStringFn(),
+            [list],
+            arrayType(i32Type).refType,
+          );
         }
         // `Map()` / `Set()` builtin constructors (B6a): allocate an empty hash
         // collection. The concrete map type is the call's resolved return type
