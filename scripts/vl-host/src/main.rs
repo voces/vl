@@ -136,6 +136,44 @@ fn run_program(engine: &Engine, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a `wasm-opt` binary: `$VL_WASM_OPT` override first, else a PATH scan.
+/// Returns `None` when none is found (so `-O` can degrade gracefully).
+fn wasm_opt_path() -> Option<String> {
+    if let Ok(p) = std::env::var("VL_WASM_OPT") {
+        return Some(p);
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':') {
+        let cand = format!("{dir}/wasm-opt");
+        if std::fs::metadata(&cand).map(|m| m.is_file()).unwrap_or(false) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// `vl build -O`: shell out to `wasm-opt` to shrink the emitted module IN PLACE,
+/// when a `wasm-opt` is available. VL output is WasmGC, so the GC + reference-type
+/// features are REQUIRED for binaryen to even validate it; we enable EXACTLY those
+/// two — `-all` would turn on post-3.0 features that wasmtime then refuses to load.
+/// A missing `wasm-opt` is a soft no-op (the unoptimized module is already written).
+fn optimize_in_place(path: &str) -> Result<()> {
+    let Some(opt) = wasm_opt_path() else {
+        eprintln!(
+            "note: -O requested but no `wasm-opt` on PATH (set $VL_WASM_OPT) — wrote the unoptimized module"
+        );
+        return Ok(());
+    };
+    let status = std::process::Command::new(&opt)
+        .args([path, "-O", "--enable-reference-types", "--enable-gc", "-o", path])
+        .status()
+        .map_err(|e| Error::from(e).context(format!("running wasm-opt `{opt}`")))?;
+    if !status.success() {
+        bail!("wasm-opt `{opt}` failed (exit {:?})", status.code());
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -150,8 +188,12 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var("VL_COMPILER_WASM").ok())
         .unwrap_or_else(|| "build/vl-compiler.wasm".to_string());
 
-    let source = std::fs::read_to_string(input)
-        .map_err(|e| Error::from(e).context(format!("reading `{input}`")))?;
+    // Read the source lazily: a `vl run <file.wasm>` input is a binary module, not
+    // UTF-8, so we must not slurp it as a string up front.
+    let read_source = || {
+        std::fs::read_to_string(input)
+            .map_err(|e| Error::from(e).context(format!("reading `{input}`")))
+    };
     // The compile step always runs under the null collector (one-shot batch work);
     // only the user program's own execution gets a real (DRC) collector.
     let compile_engine = gc_engine(Collector::Null)?;
@@ -161,18 +203,35 @@ fn main() -> Result<()> {
             let out = flag("-o").unwrap_or_else(|| {
                 input.strip_suffix(".vl").unwrap_or(input).to_string() + ".wasm"
             });
-            let bytes = compile_vl(&compile_engine, &compiler, &source)?;
+            let bytes = compile_vl(&compile_engine, &compiler, &read_source()?)?;
             std::fs::write(&out, &bytes)?;
-            println!("wrote {out} ({} bytes)", bytes.len());
+            // `-O`: optimize the written module in place (wasm-opt, when present).
+            if args.iter().any(|a| a == "-O") {
+                optimize_in_place(&out)?;
+            }
+            let len = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(bytes.len() as u64);
+            println!("wrote {out} ({len} bytes)");
         }
         "check" => {
             // A clean compile IS the check (typecheck gates emit; emit validates the
             // rest). Diagnostics surface through compile_vl's error path.
-            compile_vl(&compile_engine, &compiler, &source)?;
+            compile_vl(&compile_engine, &compiler, &read_source()?)?;
             println!("ok");
         }
         "run" => {
-            let bytes = compile_vl(&compile_engine, &compiler, &source)?;
+            // Accept either VL source or an already-built wasm module (magic-byte
+            // detection): `vl run prog.wasm` runs a prebuilt module straight through
+            // wasmtime, skipping the compiler — which also lets `vl build -O` output
+            // be run and gated end to end.
+            let raw = std::fs::read(input)
+                .map_err(|e| Error::from(e).context(format!("reading `{input}`")))?;
+            let bytes = if raw.starts_with(b"\0asm") {
+                raw
+            } else {
+                let source = String::from_utf8(raw)
+                    .map_err(|e| Error::from(e).context(format!("`{input}` is neither UTF-8 VL source nor a wasm module")))?;
+                compile_vl(&compile_engine, &compiler, &source)?
+            };
             let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
             run_program(&run_engine, &bytes)?;
         }
