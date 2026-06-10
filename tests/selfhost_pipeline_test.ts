@@ -108,7 +108,9 @@ const CASES: Case[] = [
   {
     label: "mixed-numeric",
     src: "let a: i32 = 1\nlet b: f64 = 2.0\nlet c: i32 = a + b\n",
-    expected: ["diags: 1", "operator '+' mixes i32 and f64"],
+    // `a + b` now widens i32→f64 (B2 widening lattice) → f64; the f64 result into the
+    // `c: i32` slot is a lossy narrowing and is rejected (single diagnostic).
+    expected: ["diags: 1", "cannot assign f64 to 'c' of type i32"],
   },
 ];
 

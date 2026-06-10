@@ -154,6 +154,8 @@ const WHITELIST = [
   "maps/iteration-order.vl",
   "maps/many-keys.vl",
   "numerics/wide.vl",
+  "numerics/wide-arith.vl",
+  "numerics/widening.vl",
   "objects/struct.vl",
   "objects/trailing-comma.vl",
   "operators/unary.vl",
@@ -524,6 +526,7 @@ entries.forEach((e, idx) => {
       imports: {
         __print_i32__: (v: number) => got.push(String(v)),
         __print_i64__: (v: bigint) => got.push(String(v)),
+        __print_f32__: (v: number) => got.push(String(v)),
         __print_f64__: (v: number) => got.push(String(v)),
         __print_bool__: (v: number) => got.push(v ? "true" : "false"),
         __print_char__: (c: number) => chars.push(c),

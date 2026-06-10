@@ -164,6 +164,8 @@ const RUN_CASES = [
   "maps/iteration-order.vl",
   "maps/many-keys.vl",
   "numerics/wide.vl",
+  "numerics/wide-arith.vl",
+  "numerics/widening.vl",
   "objects/struct.vl",
   "objects/trailing-comma.vl",
   "operators/unary.vl",
