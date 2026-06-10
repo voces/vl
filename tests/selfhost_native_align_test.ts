@@ -93,6 +93,7 @@ const RUN_CASES = [
   "arrays/infer-empty-index-set.vl",
   "arrays/infer-empty-push.vl",
   "arrays/trailing-comma.vl",
+  "bitwise/i64.vl",
   "bitwise/precedence.vl",
   "bitwise/shifts.vl",
   "chars/literals.vl",
