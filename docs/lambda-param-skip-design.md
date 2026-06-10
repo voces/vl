@@ -41,13 +41,22 @@ a local silently moves what it binds; a typo silently falls back to position 0.
 Listed only to mark it as the option to avoid.
 
 ### C. Labeled skip ("named") — `[3,7].map((index: i) => i + 1)`
-- **For:** the `:` disambiguates from positional (`(i)` is always positional), and
-  it mirrors VL's existing **named args** (`f(x: 1)`); scales without counting
-  (`(third: x)` regardless of how many precede); self-documenting; binds only what
-  you list (no dummies, no unused-lint).
-- **Against:** needs Prerequisite 2 (param names in function types), and makes a
-  library's param *names* a soft API surface (renaming a param breaks name-matched
-  callers — the tradeoff Python/Swift accept for keyword args, opt-in here).
+- **For:** scales without counting (`(third: x)` regardless of how many precede);
+  self-documenting; binds only what you list (no dummies, no unused-lint).
+- **Against (likely disqualifying): collides with type-annotation syntax.** In a
+  param list `(x: T)` already means "`x` **of type** `T`", so `(index: i)` reads as
+  "param `index` of type `i`" — and if `i` is a defined type it is genuinely
+  *ambiguous*, not just confusing. Worse, C **double-inverts** the `name : thing`
+  shape: normally left = binding name, right = type; C wants left = the
+  *signature's* name and right = the binding — so *both* sides flip meaning vs every
+  other param list. A different separator (`(index as i)`) dodges the type clash but
+  still fights the "left side is the binding" reading and must not clash with a cast
+  `as`.
+- **Against (also):** needs Prerequisite 2 (param names in function types), and
+  makes a library's param *names* a soft API surface (renaming a param breaks
+  name-matched callers — the tradeoff Python/Swift accept for keyword args).
+- Net: the `:` overload pushes the balance toward A and D, which don't touch type
+  syntax at all.
 
 ### D. Positional shorthand — `[3,7].map($1 + 1)` (Swift `$0/$1`, Clojure `%1/%2`)
 - **For:** skipping earlier positions is free; scales; **no** type-system
@@ -76,12 +85,14 @@ the leading-comma skip (`const [, b] = f()`) and the param-list skip can share o
 grammar — which is the main reason A is attractive despite its scaling weakness.
 
 ## Open decision (maintainer's call — no recommendation here)
-Live candidates: **A (leading commas)**, **C (labeled `(name: bind)`)**, **D
-(`$#`)** — plus **E** as a cheap orthogonal win regardless. Considerations to
-weigh: A's destructuring-consistency vs its comma-counting; C's readability vs the
-names-in-types cost and param-names-as-API; D's zero type cost vs the sigil. And a
-scoping sub-question if C is chosen: param names in function types **generally**
-(any user HOF) vs **special-cased** for std `map`/`filter` first.
+Live candidates: **A (leading commas)** and **D (`$#`)** lead, with **C (labeled
+`(name: bind)`)** weakened by its `:` collision with type-annotation syntax (see
+C's "Against") — plus **E** as a cheap orthogonal win regardless. Considerations to
+weigh: A's destructuring-consistency vs its comma-counting; D's zero type cost vs
+the sigil; C's readability vs both the `:`/type ambiguity *and* the names-in-types
+cost. If C is somehow pursued anyway, it'd need a non-`:` separator and a scoping
+sub-question (param names in function types **generally** vs **special-cased** for
+std `map`/`filter`).
 
 (Whichever way: B — bare auto-match — is the one to avoid, and all of this is
 gated on self-host lambdas + HOFs landing first.)
