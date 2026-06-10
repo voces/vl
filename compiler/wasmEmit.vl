@@ -41,6 +41,26 @@ let curBuf: i32[] = W.bytes
 // shifts, so existing modules stay byte-identical.
 let gImports: i32 = 0
 
+// ── name-section opt-in (OFF by default — goldens stay byte-identical) ─────────
+// When `1`, `emitModule` appends a wasm "name" custom section (function-name
+// subsection + module-name subsection) so a wasmtime trap backtrace shows real
+// function names instead of `<wasm function N>`. It is a CUSTOM section (id 0,
+// name "name"): semantically inert, ignored by every conforming runtime, but it
+// CHANGES the emitted bytes. The goldens, the emit/full fixpoints and the
+// self-typecheck NEVER flip this on (the driver's `compileSrc` leaves it at 0),
+// so the default emit path is byte-for-byte unchanged. Only the native `vl`
+// host opts in (via the exported `setEmitNames` below) for `vl run` / `vl build
+// --names`, where legible traps are the whole point.
+let gEmitNames: i32 = 0
+
+// Host opt-in for the name section (see `gEmitNames`). The driver does NOT call
+// this, so every golden/fixpoint emit leaves names OFF; only the native tool
+// turns it on. Idempotent — any nonzero `on` enables, `0` disables.
+export function setEmitNames(on: i32): i32 {
+  if on != 0 { gEmitNames = 1 } else { gEmitNames = 0 }
+  0
+}
+
 // Top-level STATEMENTS (a bare `print(...)`, an assignment, a `while` over globals —
 // anything that is not a function/type/global declaration). They run inside the
 // synthetic START function, in source order, after the non-const global inits —
@@ -7608,6 +7628,75 @@ function emitStartFnCode(out: i32[]): i32 {
   0
 }
 
+// Emit the wasm "name" custom section (section id 0, name "name") so a wasmtime
+// trap backtrace shows real function names instead of `<wasm function N>`. GATED
+// on `gEmitNames` — a no-op when off, so the default emit path (goldens +
+// fixpoints) is byte-identical. `n` is the user-function count (`fnStmts.length`)
+// and `gImports` the imported-function count (0 or 4); the imports occupy wasm
+// indices 0..gImports-1 (the print family), the user functions gImports..gImports+n-1.
+//
+// Layout (per the WebAssembly name-section appendix):
+//   section: id 0, ULEB(size), wName("name"), <subsections>
+//   module-name  subsection (id 0): ULEB(size), wName("vl")
+//   function-name subsection (id 1): ULEB(size), namemap
+//     namemap = ULEB(count), then count * { ULEB(funcidx), wName(name) }
+//   indices MUST be strictly increasing — we emit imports (0..3) then user
+//   functions in their natural index order, so the sequence is already sorted.
+function emitNameSection(n: i32): i32 {
+  if gEmitNames == 0 { return 0 }
+
+  // ── function-name subsection (id 1) ──────────────────────────────────────────
+  // Build the namemap (count + entries) into a temp buffer, then frame it as the
+  // subsection payload. The print imports (if present) are named first at their
+  // hardcoded indices 0..3, then each user function at `gImports + i`.
+  let fnameMap: i32[] = []
+  let mapPrev = wTarget(fnameMap)
+  let count = gImports + n
+  wULEB(count)
+  if gImports > 0 {
+    wULEB(0)
+    wName("__print_i32__")
+    wULEB(1)
+    wName("__print_bool__")
+    wULEB(2)
+    wName("__print_char__")
+    wULEB(3)
+    wName("__print_str_flush__")
+  }
+  let fi = 0
+  while fi < n {
+    let fn = P.nodes[fnStmts[fi]]
+    if fn is FuncDecl {
+      wULEB(gImports + fi)
+      wName(fn.fnName)
+    }
+    fi = fi + 1
+  }
+  wTarget(mapPrev)
+
+  // ── assemble the section payload: wName("name") + the two subsections ─────────
+  let namePayload: i32[] = []
+  let npPrev = wTarget(namePayload)
+  wName("name")
+  // module-name subsection (id 0): a single name. Its payload is a length-prefixed
+  // name, built into a temp so the subsection-size ULEB frames the right length.
+  let modName: i32[] = []
+  let mnPrev = wTarget(modName)
+  wName("vl")
+  wTarget(mnPrev)
+  wU8(0)                       // subsection id 0: module name
+  wULEB(modName.length)
+  wBytes(modName)
+  // function-name subsection (id 1): the namemap built above.
+  wU8(1)                       // subsection id 1: function names
+  wULEB(fnameMap.length)
+  wBytes(fnameMap)
+  wTarget(npPrev)
+
+  wSection(0, namePayload)     // custom section id 0
+  0
+}
+
 // Emit the complete module for the top-level functions in `fnStmts` (each a FuncDecl,
 // validated by `collectFns`/`buildFnMap`/`checkParams`). If a struct `type` was
 // declared, its WasmGC struct type is emitted FIRST (type index 0) and the functypes
@@ -8060,6 +8149,11 @@ function emitModule(stmts: i32[]): i32 {
     if emitStartFnCode(codePayload) < 0 { return 0 - 1 }
   }
   wSection(10, codePayload)
+
+  // Custom "name" section LAST (after the code section, where it conventionally
+  // lives). A no-op unless `gEmitNames` is set, so the default emit path is
+  // byte-identical to every golden.
+  emitNameSection(n)
   0
 }
 
