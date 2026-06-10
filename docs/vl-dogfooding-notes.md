@@ -51,9 +51,9 @@ is open backlog — triage as you like.
   2–4 + an emitter source-map side channel are the rest).
 - **Checker-accepts-but-emit-miscompiles is the worst failure class.** f64 was
   *accepted* by the checker but emitted garbage (`print(2.5)`→`185`) — silent wrong
-  output, worse than a clean reject. (Being fixed in the f64 slice.) General
-  lesson: the checker should not get ahead of the emitter without the emitter at
-  least trapping/rejecting rather than miscompiling.
+  output, worse than a clean reject. `[FIXED #293]` (the f64 emit slice: a pure-i32
+  IEEE-754 encoder). General lesson stands: the checker should not get ahead of the
+  emitter without the emitter at least trapping/rejecting rather than miscompiling.
 
 ---
 
