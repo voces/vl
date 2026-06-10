@@ -2151,6 +2151,8 @@ function exprHasStrOp(exprIx: i32, fnIx: i32): boolean {
           if exprString(e.callArgs[0], fnIx) { return true }
         }
       }
+      // `toString(x)` builds its digits in the string-op scratch frame.
+      if pcal.identName == "toString" { return true }
     }
     if exprHasStrOp(e.callFn, fnIx) { return true }
     let args = e.callArgs
@@ -2965,7 +2967,12 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
       } else {
         rslot = annSlot
       }
-      if rslot < 0 { rslot = 0 }
+      if rslot < 0 {
+        if rlElemName.length < 1 {
+          return emitFail("emitProgram: ref array literal with no interned element type")
+        }
+        rslot = 0
+      }
       // A STRUCT-element list (kind 1, NOT a union box) types each element literal as the
       // list's declared element struct — seed `pendingStructIdx` (consumed by `emitObj`)
       // so a same-field-name sibling struct does not win the field-shape match. A union
@@ -3821,6 +3828,141 @@ function setStrScrI(body: i32[], n: i32): i32 {
   0
 }
 
+// Lower `toString(x)` onto `body`, leaving a fresh string ref on the stack. An i32
+// renders its decimal digits (a negative value gets a leading '-'); a BOOLEAN-
+// classified argument renders the literal text "true" / "false". Uses the string-op
+// scratch frame (Out = the built string; I0 = remaining value, I1 = sign flag,
+// I2 = digit count, I3 = count copy, then the write cursor) — `exprHasStrOp`
+// reserves the frame for any `toString(..)` call. The argument is evaluated FULLY
+// before the first scratch write (nested-op-safe, like every string op).
+function emitToString(body: i32[], callIx: i32, fnIx: i32): i32 {
+  let c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 1 {
+      return emitFail("emitProgram: toString takes exactly one argument")
+    }
+    if !aUsed {
+      return emitFail("emitProgram: toString but array type not collected")
+    }
+    let argIx = c.callArgs[0]
+    if exprIsBool(argIx, fnIx) {
+      // Typed `select`: build BOTH literal strings, then pick by the condition.
+      // (An if/else that `local.set`s a NON-defaultable ref local does not count
+      // as initialization past the `end`, so the branchless select is the valid
+      // shape — and both allocations are tiny constants.)
+      fbI32Const(116)                // 't'
+      fbI32Const(114)                // 'r'
+      fbI32Const(117)                // 'u'
+      fbI32Const(101)                // 'e'
+      fbArrayNewFixed(aTypeIdx, 4)
+      fbI32Const(102)                // 'f'
+      fbI32Const(97)                 // 'a'
+      fbI32Const(108)                // 'l'
+      fbI32Const(115)                // 's'
+      fbI32Const(101)                // 'e'
+      fbArrayNewFixed(aTypeIdx, 5)
+      if emitExpr(body, argIx, fnIx) < 0 { return 0 - 1 }
+      wU8(28)                        // 0x1c select_t
+      wU8(1)                         // one valtype
+      wU8(100)                       // 0x64 (ref ht) — non-null string ref
+      wULEB(aTypeIdx)
+      return 0
+    }
+    // The value rides in NEGATIVE space (a positive x negates to -x) so i32 MIN
+    // needs no overflowing flip; digits come from the negative remainder.
+    // I0 = x; I1 = (x < 0)
+    if emitExpr(body, argIx, fnIx) < 0 { return 0 - 1 }
+    setStrScrI(body, 0)
+    pushStrScrI(body, 0)
+    fbI32Const(0)
+    fbI32Bin(72)                 // 0x48 i32.lt_s
+    setStrScrI(body, 1)
+    // if I0 > 0 { I0 = 0 - I0 }  — now I0 <= 0
+    pushStrScrI(body, 0)
+    fbI32Const(0)
+    fbI32Bin(74)                 // 0x4a i32.gt_s
+    fbIf(64)
+    fbI32Const(0)
+    pushStrScrI(body, 0)
+    fbI32Bin(107)                // 0x6b i32.sub
+    setStrScrI(body, 0)
+    fbEnd()
+    // digit count: I3 = I0; I2 = 1; while I3 <= -10 { I3 = I3 / 10; I2 = I2 + 1 }
+    pushStrScrI(body, 0)
+    setStrScrI(body, 3)
+    fbI32Const(1)
+    setStrScrI(body, 2)
+    fbBlock(64)                  // 0x02 block, void
+    fbLoop(64)                   // 0x03 loop, void
+    pushStrScrI(body, 3)
+    fbI32Const(0 - 10)
+    fbI32Bin(74)                 // i32.gt_s — exit when I3 > -10
+    fbBrIf(1)
+    pushStrScrI(body, 3)
+    fbI32Const(10)
+    fbI32Bin(109)                // 0x6d i32.div_s (truncates toward zero)
+    setStrScrI(body, 3)
+    pushStrScrI(body, 2)
+    fbI32Const(1)
+    fbI32Bin(106)                // 0x6a i32.add
+    setStrScrI(body, 2)
+    fbBr(0)
+    fbEnd()                      // end loop
+    fbEnd()                      // end block
+    // Out = array.new_default (len = I2 + I1)
+    pushStrScrI(body, 2)
+    pushStrScrI(body, 1)
+    fbI32Bin(106)                // i32.add
+    fbArrayNewDefault(aTypeIdx)
+    fbLocalSet(strScratchBase + 2)
+    // if I1 { Out[0] = '-' }
+    pushStrScrI(body, 1)
+    fbIf(64)
+    pushStrScrRef(body, 2)
+    fbI32Const(0)
+    fbI32Const(45)               // '-'
+    fbArraySet(aTypeIdx)
+    fbEnd()
+    // write cursor I3 = I1 + I2 - 1 (the last index)
+    pushStrScrI(body, 1)
+    pushStrScrI(body, 2)
+    fbI32Bin(106)                // i32.add
+    fbI32Const(1)
+    fbI32Bin(107)                // i32.sub
+    setStrScrI(body, 3)
+    // do { Out[I3] = 48 - (I0 % 10); I0 = I0 / 10; I3 = I3 - 1 } while I0 != 0
+    // (a do-while so the value 0 still writes its single '0' digit; the remainder
+    // of the negative-space value is <= 0, so SUBTRACTING it yields the digit)
+    fbBlock(64)
+    fbLoop(64)
+    pushStrScrRef(body, 2)
+    pushStrScrI(body, 3)
+    fbI32Const(48)               // '0'
+    pushStrScrI(body, 0)
+    fbI32Const(10)
+    fbI32Bin(111)                // 0x6f i32.rem_s (negative for a negative I0)
+    fbI32Bin(107)                // 0x6b i32.sub — 48 - (-d) = 48 + d
+    fbArraySet(aTypeIdx)
+    pushStrScrI(body, 0)
+    fbI32Const(10)
+    fbI32Bin(109)                // i32.div_s
+    setStrScrI(body, 0)
+    pushStrScrI(body, 3)
+    fbI32Const(1)
+    fbI32Bin(107)                // i32.sub
+    setStrScrI(body, 3)
+    pushStrScrI(body, 0)
+    fbI32Eqz()                   // 0x45 — exit when I0 == 0
+    fbBrIf(1)
+    fbBr(0)
+    fbEnd()                      // end loop
+    fbEnd()                      // end block
+    pushStrScrRef(body, 2)       // the built string
+    return 0
+  }
+  emitFail("emitProgram: expected a toString call")
+}
+
 // Lower a string concatenation `a + b` onto `body`, leaving the new string ref on
 // the stack. Allocate a fresh `(array i32)` of `len(a)+len(b)` (`array.new_default`,
 // which zero-inits — every slot is then overwritten), `array.copy` a's code points
@@ -4368,6 +4510,12 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
       // code points (`aTypeIdx`), so this is a length-1 array — push the one i32 arg,
       // then `array.new_fixed $aTypeIdx 1`. Mirrors toWasm's `fromCodePoint` lowering.
       // BEFORE the `fnIndexOf` lookup, which would fail ("unknown function").
+      // `toString(x)` is a compiler builtin: an i32 renders its decimal digits, a
+      // BOOLEAN-classified argument the literal text "true"/"false" — both as a
+      // fresh string (array of code points).
+      if callee.identName == "toString" {
+        return emitToString(body, callIx, fnIx)
+      }
       if callee.identName == "fromCodePoint" {
         if !aUsed {
           return emitFail("emitProgram: fromCodePoint but array type not collected")
@@ -6400,8 +6548,8 @@ function globalCellStructIdx(letIx: i32): i32 {
 function fbRefNullForKind(kind: i32, structIdx: i32): i32 {
   wU8(208)                     // 0xd0 ref.null
   // Same unresolved-slot guard as `fbValtype`: fail loudly, never read a table OOB.
-  if structIdx < 0 {
-    if kind == 1 || kind == 5 {
+  if kind == 1 || kind == 5 {
+    if structIdx < 0 || (kind == 1 && structIdx >= sHeapIdx.length) || (kind == 5 && structIdx >= rlWrapIdx.length) {
       wSLEB(aTypeIdx)
       return emitFail("emitProgram: ref.null with no interned shape")
     }
@@ -6431,11 +6579,11 @@ function fbRefNullForKind(kind: i32, structIdx: i32): i32 {
 // same `0x7f` i32 as `fbValtype`. Only used for NON-const globals; const globals keep
 // the non-null `fbValtype` (so goldens are unchanged).
 function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
-  // A struct/ref-list kind with NO resolved table slot would read a table out of
-  // bounds (a trap). Fail loudly instead, writing a placeholder i32 so the buffer
-  // stays well-formed while `emitFail` unwinds.
-  if structIdx < 0 {
-    if kind == 1 || kind == 5 || kind == 8 {
+  // A struct/ref-list kind with NO resolved table slot (or one past its table)
+  // would read a table out of bounds (a trap). Fail loudly instead, writing a
+  // placeholder i32 so the buffer stays well-formed while `emitFail` unwinds.
+  if kind == 1 || kind == 5 || kind == 8 {
+    if structIdx < 0 || (kind == 1 && structIdx >= sHeapIdx.length) || (kind == 5 && structIdx >= rlWrapIdx.length) {
       wU8(127)
       return emitFail("emitProgram: ref valtype with no interned shape")
     }
@@ -6499,9 +6647,9 @@ function refElemHeapType(): i32 {
 // `curBuf`), matching every other `fb*` method.
 function fbValtype(kind: i32, structIdx: i32): i32 {
   // Same out-of-bounds guard as `fbValtypeNullable`: a struct/ref-list kind whose
-  // table slot never resolved fails loudly, never traps.
-  if structIdx < 0 {
-    if kind == 1 || kind == 5 || kind == 8 {
+  // table slot never resolved (or overran its table) fails loudly, never traps.
+  if kind == 1 || kind == 5 || kind == 8 {
+    if structIdx < 0 || (kind == 1 && structIdx >= sHeapIdx.length) || (kind == 5 && structIdx >= rlWrapIdx.length) {
       wU8(127)
       return emitFail("emitProgram: ref valtype with no interned shape")
     }
@@ -6737,6 +6885,45 @@ function recordStartRefPushSlot(stmtIx: i32): i32 {
   0
 }
 
+// Run every scratch-detection walker over one start-fn BLOCK (a loop body, an if
+// arm), feeding the `fnUses*` flags + the ref-push slot recorders. BOTH push
+// walkers feed the push flags, mirroring `fnHasPush`: a `.push` (the push walker)
+// and a Member-receiver `.pop` (the pop walker, which reuses the push frame's
+// slots) each need the scratch quad.
+function startScanBlock(blockIx: i32): i32 {
+  if blockHasPushKind(blockIx, 0 - 1, 0) { fnUsesPush = true }
+  if blockHasPushKind(blockIx, 0 - 1, 1) { fnUsesRefPush = true }
+  if blockHasPushKind(blockIx, 0 - 1, 2) { fnUsesStrPush = true }
+  if blockHasMemberPopKind(blockIx, 0 - 1, 0) { fnUsesPush = true }
+  if blockHasMemberPopKind(blockIx, 0 - 1, 1) { fnUsesRefPush = true }
+  if blockHasMemberPopKind(blockIx, 0 - 1, 2) { fnUsesStrPush = true }
+  if blockHasStrOp(blockIx, 0 - 1) { fnUsesStrOp = true }
+  if blockHasMapOp(blockIx, 0 - 1) { fnUsesMap = true }
+  collectRefPushSlots(blockIx, 0 - 1)
+  collectMemberPopRefSlots(blockIx, 0 - 1)
+  0
+}
+
+// Scan a TOP-LEVEL `if` chain: the condition expression plus every arm's block
+// (an `else if` recurses through this function).
+function startScanIf(ifIx: i32): i32 {
+  let st = P.nodes[ifIx]
+  if st is IfStmt {
+    if exprHasStrOp(st.ifCond, 0 - 1) { fnUsesStrOp = true }
+    if exprHasMapOp(st.ifCond, 0 - 1) { fnUsesMap = true }
+    if exprHasMemberPopKind(st.ifCond, 0 - 1, 0) { fnUsesPush = true }
+    if exprHasMemberPopKind(st.ifCond, 0 - 1, 1) { fnUsesRefPush = true }
+    if exprHasMemberPopKind(st.ifCond, 0 - 1, 2) { fnUsesStrPush = true }
+    startScanBlock(st.ifThen)
+    if st.ifElse >= 0 {
+      let els = P.nodes[st.ifElse]
+      if els is Block { startScanBlock(st.ifElse) }
+      if els is IfStmt { startScanIf(st.ifElse) }
+    }
+  }
+  0
+}
+
 function startFnDetectScratch(): i32 {
   fnUsesPush = false
   fnUsesRefPush = false
@@ -6762,49 +6949,22 @@ function startFnDetectScratch(): i32 {
     gi = gi + 1
   }
   // Top-level STATEMENTS may also need scratch (a `.push` / string op / map op in a
-  // top-level `for`/`while` body or a bare call). Scan each through the same
-  // walkers (which recurse into for/while/if bodies).
+  // top-level `for`/`while`/`if` body or a bare call). Scan each through the same
+  // walkers (which recurse into for/while/if bodies). `startScanBlock` runs every
+  // block walker over one body; `startScanIf` descends an if/else-if chain.
   let si = 0
   while si < startStmts.length {
     let st = P.nodes[startStmts[si]]
     if st is ForRange {
-      // BOTH walkers feed the push flags, mirroring `fnHasPush`: a `.push` (the
-      // push walker) and a Member-receiver `.pop` (the pop walker, which reuses
-      // the push frame's slots) each need the scratch quad.
-      if blockHasPushKind(st.frBody, 0 - 1, 0) { fnUsesPush = true }
-      if blockHasPushKind(st.frBody, 0 - 1, 1) { fnUsesRefPush = true }
-      if blockHasPushKind(st.frBody, 0 - 1, 2) { fnUsesStrPush = true }
-      if blockHasMemberPopKind(st.frBody, 0 - 1, 0) { fnUsesPush = true }
-      if blockHasMemberPopKind(st.frBody, 0 - 1, 1) { fnUsesRefPush = true }
-      if blockHasMemberPopKind(st.frBody, 0 - 1, 2) { fnUsesStrPush = true }
-      if blockHasStrOp(st.frBody, 0 - 1) { fnUsesStrOp = true }
-      if blockHasMapOp(st.frBody, 0 - 1) { fnUsesMap = true }
-      collectRefPushSlots(st.frBody, 0 - 1)
-      collectMemberPopRefSlots(st.frBody, 0 - 1)
+      startScanBlock(st.frBody)
     } else if st is ForIn {
-      if blockHasPushKind(st.fiBody, 0 - 1, 0) { fnUsesPush = true }
-      if blockHasPushKind(st.fiBody, 0 - 1, 1) { fnUsesRefPush = true }
-      if blockHasPushKind(st.fiBody, 0 - 1, 2) { fnUsesStrPush = true }
-      if blockHasMemberPopKind(st.fiBody, 0 - 1, 0) { fnUsesPush = true }
-      if blockHasMemberPopKind(st.fiBody, 0 - 1, 1) { fnUsesRefPush = true }
-      if blockHasMemberPopKind(st.fiBody, 0 - 1, 2) { fnUsesStrPush = true }
-      if blockHasStrOp(st.fiBody, 0 - 1) { fnUsesStrOp = true }
-      if blockHasMapOp(st.fiBody, 0 - 1) { fnUsesMap = true }
+      startScanBlock(st.fiBody)
       if exprHasStrOp(st.fiIter, 0 - 1) { fnUsesStrOp = true }
       if exprHasMapOp(st.fiIter, 0 - 1) { fnUsesMap = true }
-      collectRefPushSlots(st.fiBody, 0 - 1)
-      collectMemberPopRefSlots(st.fiBody, 0 - 1)
     } else if st is WhileStmt {
-      if blockHasPushKind(st.whileBody, 0 - 1, 0) { fnUsesPush = true }
-      if blockHasPushKind(st.whileBody, 0 - 1, 1) { fnUsesRefPush = true }
-      if blockHasPushKind(st.whileBody, 0 - 1, 2) { fnUsesStrPush = true }
-      if blockHasMemberPopKind(st.whileBody, 0 - 1, 0) { fnUsesPush = true }
-      if blockHasMemberPopKind(st.whileBody, 0 - 1, 1) { fnUsesRefPush = true }
-      if blockHasMemberPopKind(st.whileBody, 0 - 1, 2) { fnUsesStrPush = true }
-      if blockHasStrOp(st.whileBody, 0 - 1) { fnUsesStrOp = true }
-      if blockHasMapOp(st.whileBody, 0 - 1) { fnUsesMap = true }
-      collectRefPushSlots(st.whileBody, 0 - 1)
-      collectMemberPopRefSlots(st.whileBody, 0 - 1)
+      startScanBlock(st.whileBody)
+    } else if st is IfStmt {
+      startScanIf(startStmts[si])
     } else {
       // expression statements (a bare call / assignment): the per-statement push
       // detector plus the expr walkers
@@ -7619,6 +7779,10 @@ function collectA(stmts: i32[]): i32 {
         if cf.identName == "fromCodePoint" {
           aUsed = true
         }
+        // `toString(x)` builds a fresh string (decimal digits / "true"/"false").
+        if cf.identName == "toString" {
+          aUsed = true
+        }
         // An un-annotated `Map()` (usage-inferred binding) still constructs the map
         // struct — force the same types a `{[string]: i32}` annotation does.
         if cf.identName == "Map" {
@@ -7842,7 +8006,11 @@ function collectAnonShapes(): i32 {
         }
         if ok && codes.length > 0 {
           sDeclared = true
-          sNames.push("")
+          // A synthetic UNIQUE name (the `#` prefix can never collide with a user
+          // identifier or annotation) — a real key, so a ref LIST of this element
+          // shape interns a per-element-type slot (`rlInternName` treats the empty
+          // string as its "not a ref element" sentinel).
+          sNames.push("#anon" + i32ToStr(sNames.length))
           sFieldStart.push(sFieldNames.length)
           sFieldCount.push(codes.length)
           let pi = 0
@@ -9213,6 +9381,7 @@ function letIsMap(letIx: i32, fnIx: i32): boolean {
 // returning function would be.
 function fnRetString(name: string): boolean {
   if name == "fromCodePoint" { return true }
+  if name == "toString" { return true }
   let i = 0
   while i < fnNames.length {
     if fnNames[i] == name { return fRetStr[i] == 1 }
