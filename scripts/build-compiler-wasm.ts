@@ -32,80 +32,10 @@ const parser = read("../compiler/parser.vl");
 const typecheck = read("../compiler/typecheck.vl");
 const wasmEmit = read("../compiler/wasmEmit.vl");
 
-const driver = `
-// Source accumulates as an i32 CODE-POINT LIST (amortized push — string concat
-// per char is quadratic copy churn, pathological where GC array.copy is a
-// per-element host libcall), converted ONCE by the fromCodePoints builtin.
-let vcCodes: i32[] = []
-export function srcReset(): i32 {
-  vcCodes = []
-  0
-}
-export function srcPush(c: i32): i32 {
-  vcCodes.push(c)
-  0
-}
-function vcSource(): string {
-  fromCodePoints(vcCodes)
-}
-function vcLoadToks(src: string): i32 {
-  let r = tokenize(src)
-  let i = 0
-  while i < r.tokens.length {
-    let t = r.tokens[i]
-    P.toks.push({ kind: t.kind, text: t.text, pos: i })
-    i = i + 1
-  }
-  P.toks.length
-}
-// 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error.
-export function compileSrc(): i32 {
-  P.toks = []
-  P.nodes = []
-  P.diags = []
-  P.pos = 0
-  W.bytes = []
-  fnNames = []
-  fnIndices = []
-  localNames = []
-  globalStmts = []
-  globalNames = []
-  initChecker()
-  vcLoadToks(vcSource())
-  let root = parseProgram()
-  if P.diags.length > 0 { return 1 }
-  let nerr = i32ToStr(checkProgram(root))
-  if T.diags.length > 0 { return 2 }
-  let rc = emitProgram(root)
-  if rc < 0 { return 3 }
-  0
-}
-export function rbyteLen(): i32 { W.bytes.length }
-export function rbyteAt(i: i32): i32 { W.bytes[i] }
-// All failure diagnostics, newline-joined: parse diags, then typecheck diags,
-// then the emit failure message (whichever stage failed populated its store).
-function vcDiags(): string {
-  let out = ""
-  let i = 0
-  while i < P.diags.length {
-    let d = P.diags[i]
-    out = out + d.msg + "\\n"
-    i = i + 1
-  }
-  let j = 0
-  while j < T.diags.length {
-    let d2 = T.diags[j]
-    out = out + d2.tmsg + "\\n"
-    j = j + 1
-  }
-  if emitErr.length > 0 {
-    out = out + emitErr + "\\n"
-  }
-  out
-}
-export function diagLen(): i32 { vcDiags().length }
-export function diagAt(i: i32): i32 { vcDiags()[i] }
-`;
+// The driver is SINGLE-SOURCED in `vl-compiler-driver.vl` (the native-fixpoint
+// script appends the same file with cat), so the seed compiler and a
+// self-rebuilt compiler expose the identical surface.
+const driver = read("./vl-compiler-driver.vl");
 
 const outFlag = Deno.args.indexOf("-o");
 const outPath = outFlag >= 0
