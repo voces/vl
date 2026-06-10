@@ -606,6 +606,11 @@ let fRetRArr: i32[] = []
 // its distinct element-type table slot.
 let fRetRArrElem: string[] = []
 
+// Parallel to `fnNames`: `1` if the i-th function's return is a NULLABLE STRUCT
+// (`S | null` — annotated, or inferred); the base struct index rides in
+// `fRetStructIdx`. The functype result is `(ref null $S)` (kind 9).
+let fRetNul: i32[] = []
+
 // Parallel to `fnNames`: `1` if the i-th function RETURNS a boolean — its declared
 // return type is `boolean`/`bool`, or (un-annotated) its first valued `return` is
 // boolean-classified (`computeRetInference`). Drives the `print` import choice for a
@@ -705,6 +710,87 @@ function globalIsMap(name: string): boolean {
   if li < 0 { return false }
   letIsMap(li, 0 - 1)
 }
+function globalIsNulRef(name: string): boolean {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsNulRef(li, 0 - 1)
+}
+
+// True if the parameter `name` of function `fnIx` is a nullable struct (`S | null`).
+function paramNulRef(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          return retNulRefFlag(p.parType) == 1
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the function `name` returns a nullable struct (`fRetNul`).
+function fnRetNulRef(name: string): boolean {
+  let i = 0
+  while i < fnNames.length {
+    if fnNames[i] == name { return fRetNul[i] == 1 }
+    i = i + 1
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` declares a nullable-struct local: its annotation
+// is `S | null`, OR its initializer produces one (a nullable-returning call).
+function letIsNulRef(letIx: i32, fnIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      if retNulRefFlag(d.letType) == 1 { return true }
+    }
+    return exprNullableStruct(d.letInit, fnIx)
+  }
+  false
+}
+
+// The base struct index of a nullable-struct `LetDecl`: the annotation's base, or
+// the initializer's resolved struct (a nullable-returning call's `fRetStructIdx`).
+function nulRefStructIdxOfLet(letIx: i32, fnIx: i32): i32 {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let ri = retNulRefIndex(d.letType)
+      if ri >= 0 { return ri }
+    }
+    return structIndexOfExpr(d.letInit, fnIx)
+  }
+  0 - 1
+}
+
+// True if evaluating the expression at `exprIx` yields a NULLABLE struct ref —
+// a nullable-annotated param/local/global reference or a `S | null`-returning call.
+function exprNullableStruct(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Paren { return exprNullableStruct(e.parInner, fnIx) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident { return fnRetNulRef(callee.identName) }
+    return false
+  }
+  if e is Ident {
+    if paramNulRef(fnIx, e.identName) { return true }
+    if declaredNulRef(e.identName) { return true }
+    return globalIsNulRef(e.identName)
+  }
+  false
+}
 
 // Map each function NAME to its wasm function index (its position in `fnStmts`), and
 // record whether it returns the struct. Returns the function count.
@@ -720,6 +806,7 @@ function buildFnMap(stmts: i32[]): i32 {
   fRetRArr = []
   fRetRArrElem = []
   fRetBool = []
+  fRetNul = []
   let i = 0
   while i < fnStmts.length {
     let s = P.nodes[fnStmts[i]]
@@ -735,6 +822,7 @@ function buildFnMap(stmts: i32[]): i32 {
       fRetRArr.push(retRefArrFlag(s.fnRet))
       fRetRArrElem.push(retRefArrElemName(s.fnRet))
       fRetBool.push(retBoolFlag(s.fnRet))
+      fRetNul.push(retNulRefFlag(s.fnRet))
     }
     i = i + 1
   }
@@ -919,7 +1007,12 @@ function computeRetInference(): i32 {
               fRetUni[i] = 1
               changed = true
             }
-            if fRetRef[i] == 0 && exprStruct(rx, fnStmts[i]) {
+            if fRetNul[i] == 0 && exprNullableStruct(rx, fnStmts[i]) {
+              fRetNul[i] = 1
+              fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
+              changed = true
+            }
+            if fRetRef[i] == 0 && fRetNul[i] == 0 && exprStruct(rx, fnStmts[i]) {
               fRetRef[i] = 1
               fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
               changed = true
@@ -1549,6 +1642,11 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
         let slot = 0 - 1
         if letIsMap(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 6, 0 - 1)
+        } else if letIsNulRef(stmts[i], fnIx) {
+          // Nullable struct (`S | null`, code 9): annotation-first, else the
+          // initializer's nullable-returning call. BEFORE the struct case (a
+          // nullable init must not collapse to the non-null kind 1).
+          slot = addLocalName(s.letName, 9, nulRefStructIdxOfLet(stmts[i], fnIx))
         } else if letIsStringArray(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 7, 0 - 1)
         } else if letIsRefArray(stmts[i], fnIx) {
@@ -2644,6 +2742,17 @@ function emitUnionBox(body: i32[], objIx: i32, fnIx: i32): i32 {
 // `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag),
 // then `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
 function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
+  // `p is null` over a NULLABLE struct ref — `ref.is_null` (no union needed).
+  let nd0 = P.nodes[isIx]
+  if nd0 is IsExpr {
+    if nd0.isVariant == "null" {
+      if exprNullableStruct(nd0.isObj, fnIx) {
+        if emitExpr(body, nd0.isObj, fnIx) < 0 { return 0 - 1 }
+        wU8(209)             // 0xd1 ref.is_null
+        return 0
+      }
+    }
+  }
   if !uDeclared {
     return emitFail("emitProgram: `is` test but no union type declared")
   }
@@ -2761,6 +2870,12 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
       return emitFail("emitProgram: unknown struct field in field access")
     }
     if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
+    // A NULLABLE-struct receiver (`S | null`) recovers its non-null ref before the
+    // field read — the checker proved every such access guarded, so the cast can
+    // never trap on a checked program.
+    if exprNullableStruct(m.memObj, fnIx) {
+      wU8(212)               // 0xd4 ref.as_non_null
+    }
     fbStructGet(sHeapIdx[si], idx)   // 0xfb 0x02 <struct ht> <field index>
     return 0
   }
@@ -4268,7 +4383,10 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
         // const global keeps its non-null cell, so no cast (goldens unchanged). A
         // scalar (i32/boolean) global needs no cast either.
         if globalNameIsNonConst(e.identName) {
-          if globalCellKind(globalLetOf(e.identName)) != 0 {
+          let gck0 = globalCellKind(globalLetOf(e.identName))
+          // A NULLABLE-struct cell (kind 9) legitimately holds null — its reads
+          // stay nullable (the member-access path recovers non-null at use).
+          if gck0 != 0 && gck0 != 9 {
             wU8(212)         // 0xd4 ref.as_non_null
           }
         }
@@ -4332,6 +4450,19 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
   }
   if e is IsExpr {
     return emitIs(body, exprIx, fnIx)
+  }
+  if e is NullLit {
+    // A bare `null` VALUE: its target struct comes from the binding/argument/
+    // return seed (`pendingStructIdx`) — `ref.null $S`. With no seed it cannot
+    // be typed here; fail loudly.
+    if pendingStructIdx >= 0 {
+      if pendingStructIdx < sHeapIdx.length {
+        wU8(208)             // 0xd0 ref.null
+        wSLEB(sHeapIdx[pendingStructIdx])
+        return 0
+      }
+    }
+    return emitFail("emitProgram: bare null needs a struct-typed context")
   }
   if e is ObjLit {
     // A literal whose field-set matches a STANDALONE struct constructs that struct
@@ -4443,6 +4574,25 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     }
     if exprIsStrEq(exprIx, fnIx) {
       return emitStrEq(body, exprIx, fnIx)
+    }
+    // `p == null` / `p != null` over a NULLABLE struct ref: `ref.is_null`
+    // (inverted with `eqz` for `!=`) — never the i32 compare.
+    if e.binOp == "==" || e.binOp == "!=" {
+      let nlhs = P.nodes[e.binLeft]
+      let nrhs = P.nodes[e.binRight]
+      let nref = 0 - 1
+      if nrhs is NullLit { nref = e.binLeft }
+      if nlhs is NullLit { nref = e.binRight }
+      if nref >= 0 {
+        if exprNullableStruct(nref, fnIx) {
+          if emitExpr(body, nref, fnIx) < 0 { return 0 - 1 }
+          wU8(209)           // 0xd1 ref.is_null
+          if e.binOp == "!=" {
+            fbI32Eqz()       // invert: non-null
+          }
+          return 0
+        }
+      }
     }
     let opcode = binOpcode(e.binOp)
     if opcode < 0 {
@@ -4636,7 +4786,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         if cFn is FuncDecl {
           let cParams = cFn.fnParams
           if i < cParams.length {
-            if vtKindOfParam(cParams[i]) == 1 {
+            if vtKindOfParam(cParams[i]) == 1 || vtKindOfParam(cParams[i]) == 9 {
               pendingStructIdx = paramStructIdxOf(cParams[i])
             }
             if vtKindOfParam(cParams[i]) == 8 {
@@ -5343,6 +5493,9 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       let rsi = retStructIndex(fn.fnRet)
       if rsi >= 0 {
         if retTRFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
+        // A `S | null` return seeds the same struct context: `return { … }` builds
+        // the base struct; `return null` consumes the seed as `ref.null $S`.
+        if retNulRefFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
       }
       // A `return [{ … }]` ref-list LITERAL must build the function's DECLARED return
       // list element type, not a first-element field-shape match — seed the list context
@@ -5905,10 +6058,13 @@ function checkParams(fnIx: i32): i32 {
         let ty = P.nodes[p.parType]
         if ty is TypeRef {
           // i32, `boolean` (which rides in an i32, 0/1 — encoded as the SAME 0x7f
-          // valtype), the declared struct type, an array (`i32[]`), or `string` (the
-          // SAME `array i32` of code points) are allowed; anything else fails.
+          // valtype), the declared struct type, a NULLABLE struct (`S | null`), an
+          // array (`i32[]`), or `string` (the SAME `array i32` of code points) are
+          // allowed; anything else fails.
           // (`collectA` already validated every array annotation is i32[].)
-          if ty.tyName != "i32" {
+          if retNulRefFlag(p.parType) == 1 {
+            // accepted — a `(ref null $S)` param
+          } else if ty.tyName != "i32" {
             if ty.tyName != "boolean" {
               if !isSName(ty.tyName) {
                 if !isUName(ty.tyName) {
@@ -6224,6 +6380,104 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
   emitFail("emitProgram: not a function declaration")
 }
 
+// ── nullable struct refs (`S | null`) ─────────────────────────────────────────
+// "S|null" / "null|S" (exactly TWO `|` parts, one of them `null`) → the non-null
+// part's name, or "" when the name is not a two-part nullable.
+function nullablePartOf(name: string): string {
+  let bar = 0 - 1
+  let i = 0
+  while i < name.length {
+    if name[i] == '|' {
+      if bar < 0 { bar = i }
+    }
+    i = i + 1
+  }
+  if bar < 0 { return "" }
+  let a = name.slice(0, bar)
+  let b = name.slice(bar + 1, name.length)
+  if a == "null" { return b }
+  if b == "null" { return a }
+  ""
+}
+
+// The struct table index a type NAME names: a declared struct name directly, or an
+// INLINE object-shape name (`{x:i32,y:i32}`) matched by field-name SET against the
+// interned shapes (the anonymous literals interned the same sets). -1 if neither.
+function structIndexOfTypeName(name: string): i32 {
+  let si = structIndexByName(name)
+  if si >= 0 { return si }
+  if name.length >= 2 && name[0] == '{' && name[1] != '[' {
+    // Collect the top-level FIELD NAMES: a name run starts after `{` or a
+    // depth-0 `,` and ends at the depth-0 `:` (nested `{…}`/`[…]` skipped).
+    let fnames: string[] = []
+    let cur = ""
+    let depth = 0
+    let collecting = true
+    let i = 1
+    while i < name.length - 1 {
+      let c = name[i]
+      if c == '{' || c == '[' {
+        depth = depth + 1
+      } else if c == '}' || c == ']' {
+        depth = depth - 1
+      } else if depth == 0 && c == ':' {
+        if collecting {
+          fnames.push(cur)
+          cur = ""
+          collecting = false
+        }
+      } else if depth == 0 && c == ',' {
+        collecting = true
+      } else if depth == 0 && collecting {
+        cur = cur + fromCodePoint(c)
+      }
+      i = i + 1
+    }
+    let si2 = 0
+    while si2 < sNames.length {
+      if sFieldCount[si2] == fnames.length {
+        let ok = true
+        let k = 0
+        while k < fnames.length {
+          if sFieldIndex(si2, fnames[k]) < 0 { ok = false }
+          k = k + 1
+        }
+        if ok { return si2 }
+      }
+      si2 = si2 + 1
+    }
+  }
+  0 - 1
+}
+
+// `1` if the type-annotation node at `tyIx` is a NULLABLE STRUCT (`S | null` with a
+// resolvable struct part), else `0`. Feeds the `kind == 9` (nullable struct ref,
+// `0x63`) family.
+function retNulRefFlag(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      let base = nullablePartOf(ty.tyName)
+      if base != "" {
+        if structIndexOfTypeName(base) >= 0 { return 1 }
+      }
+    }
+  }
+  0
+}
+
+// The base struct table index of a `S | null` annotation at `tyIx`, or -1.
+function retNulRefIndex(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      let base = nullablePartOf(ty.tyName)
+      if base != "" { return structIndexOfTypeName(base) }
+    }
+  }
+  0 - 1
+}
+
 // `1` if the type-annotation node at `tyIx` names the struct, else `0` (i32 / none).
 // Used for functype param/result valtypes and the `fRetRef` table. Returning the
 // flag (not pushing bytes) keeps each call free of a `0→1` local reassignment, which
@@ -6248,7 +6502,14 @@ function retStructIndex(tyIx: i32): i32 {
       if si >= 0 { return si }
       // A union-variant name carries its VARIANT index here (consumed by `pushVT`'s
       // `kind == 8` variant-struct case); not a standalone struct, so it is -1 above.
-      return variantIndexOf(ty.tyName)
+      let vi = variantIndexOf(ty.tyName)
+      if vi >= 0 { return vi }
+      // A `S | null` annotation resolves to its BASE struct's index — the single
+      // chokepoint the param/local/return struct lookups read, so a nullable-struct
+      // binding's member layout resolves without separate plumbing.
+      let base = nullablePartOf(ty.tyName)
+      if base != "" { return structIndexOfTypeName(base) }
+      return 0 - 1
     }
   }
   0 - 1
@@ -6379,6 +6640,7 @@ function retBoolFlag(tyIx: i32): i32 {
 // is a distinct code from array purely for typedness clarity; `pushVT` emits the SAME
 // array ref valtype for both, since a string IS the i32-array type here.
 function vtKindOfType(tyIx: i32): i32 {
+  if retNulRefFlag(tyIx) == 1 { return 9 }
   if retStrArrFlag(tyIx) == 1 { return 7 }
   if retRefArrFlag(tyIx) == 1 { return 5 }
   if retUnionFlag(tyIx) == 1 { return 4 }
@@ -6497,6 +6759,7 @@ function globalKind(initIx: i32): i32 {
   // and the start function `global.set`s the computed value. An i32-producing
   // expression matches none of these and stays kind 0 — programs without ref-typed
   // global expressions emit byte-identical bytes.
+  if exprNullableStruct(initIx, 0 - 1) { return 9 }
   if exprMap(initIx, 0 - 1) { return 6 }
   if exprString(initIx, 0 - 1) { return 3 }
   if exprStringArray(initIx, 0 - 1) { return 7 }
@@ -6596,6 +6859,7 @@ function globalCellKind(letIx: i32): i32 {
   let d = P.nodes[letIx]
   if d is LetDecl {
     if globalHasTypeAnn(letIx) {
+      if letIsNulRef(letIx, 0 - 1) { return 9 }
       if letIsMap(letIx, 0 - 1) { return 6 }
       if letIsStringArray(letIx, 0 - 1) { return 7 }
       if letIsRefArray(letIx, 0 - 1) { return 5 }
@@ -6635,13 +6899,13 @@ function globalCellStructIdx(letIx: i32): i32 {
 function fbRefNullForKind(kind: i32, structIdx: i32): i32 {
   wU8(208)                     // 0xd0 ref.null
   // Same unresolved-slot guard as `fbValtype`: fail loudly, never read a table OOB.
-  if kind == 1 || kind == 5 {
-    if structIdx < 0 || (kind == 1 && structIdx >= sHeapIdx.length) || (kind == 5 && structIdx >= rlWrapIdx.length) {
+  if kind == 1 || kind == 5 || kind == 9 {
+    if structIdx < 0 || ((kind == 1 || kind == 9) && structIdx >= sHeapIdx.length) || (kind == 5 && structIdx >= rlWrapIdx.length) {
       wSLEB(aTypeIdx)
       return emitFail("emitProgram: ref.null with no interned shape")
     }
   }
-  if kind == 1 {
+  if kind == 1 || kind == 9 {
     wSLEB(sHeapIdx[structIdx])
   } else if kind == 2 {
     wSLEB(lTypeIdx)
@@ -6669,13 +6933,13 @@ function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
   // A struct/ref-list kind with NO resolved table slot (or one past its table)
   // would read a table out of bounds (a trap). Fail loudly instead, writing a
   // placeholder i32 so the buffer stays well-formed while `emitFail` unwinds.
-  if kind == 1 || kind == 5 || kind == 8 {
-    if structIdx < 0 || (kind == 1 && structIdx >= sHeapIdx.length) || (kind == 5 && structIdx >= rlWrapIdx.length) {
+  if kind == 1 || kind == 5 || kind == 8 || kind == 9 {
+    if structIdx < 0 || ((kind == 1 || kind == 9) && structIdx >= sHeapIdx.length) || (kind == 5 && structIdx >= rlWrapIdx.length) {
       wU8(127)
       return emitFail("emitProgram: ref valtype with no interned shape")
     }
   }
-  if kind == 1 {
+  if kind == 1 || kind == 9 {
     wU8(99)                    // 0x63 (ref null ht)
     wULEB(sHeapIdx[structIdx])
   } else if kind == 2 {
@@ -6735,11 +6999,17 @@ function refElemHeapType(): i32 {
 function fbValtype(kind: i32, structIdx: i32): i32 {
   // Same out-of-bounds guard as `fbValtypeNullable`: a struct/ref-list kind whose
   // table slot never resolved (or overran its table) fails loudly, never traps.
-  if kind == 1 || kind == 5 || kind == 8 {
-    if structIdx < 0 || (kind == 1 && structIdx >= sHeapIdx.length) || (kind == 5 && structIdx >= rlWrapIdx.length) {
+  if kind == 1 || kind == 5 || kind == 8 || kind == 9 {
+    if structIdx < 0 || ((kind == 1 || kind == 9) && structIdx >= sHeapIdx.length) || (kind == 5 && structIdx >= rlWrapIdx.length) {
       wU8(127)
       return emitFail("emitProgram: ref valtype with no interned shape")
     }
+  }
+  if kind == 9 {
+    // Nullable struct ref `S | null` — `(ref null $S)`, the 0x63 form.
+    wU8(99)
+    wULEB(sHeapIdx[structIdx])
+    return 0
   }
   if kind == 1 {
     wU8(100)             // 0x64 (ref ht) — non-null ref
@@ -7412,6 +7682,10 @@ function emitModule(stmts: i32[]): i32 {
         if fRetUni[ti] == 1 { infKind = 4 }
         if fRetRef[ti] == 1 {
           infKind = 1
+          infSlot = fRetStructIdx[ti]
+        }
+        if fRetNul[ti] == 1 {
+          infKind = 9
           infSlot = fRetStructIdx[ti]
         }
         if fRetRArr[ti] == 1 { infKind = 5 }
@@ -8436,7 +8710,16 @@ function exprStruct(exprIx: i32, fnIx: i32): boolean {
       return rlElemKindTbl[slot] == 1
     }
   }
-  false
+  // A NULLABLE struct value (`S | null`) participates in the struct machinery
+  // (member layout resolution); the field-read path inserts the non-null recover.
+  exprNullableStruct(exprIx, fnIx)
+}
+
+// True if the already-collected declared local `name` is a nullable struct (code 9).
+function declaredNulRef(name: string): boolean {
+  let slot = declaredSlotOf(name)
+  if slot < 0 { return false }
+  localIsRef[slot] == 9
 }
 
 // True if the already-collected declared local `name` is a struct ref. Resolves to
@@ -8484,7 +8767,15 @@ function paramStructIndex(fnIx: i32, name: string): i32 {
         if p.parName == name {
           if p.parType >= 0 {
             let ty = P.nodes[p.parType]
-            if ty is TypeRef { return structIndexByName(ty.tyName) }
+            if ty is TypeRef {
+              // A plain struct name, or the `S | null` nullable BASE. (NOT a union
+              // variant — a variant-typed param rides the gap-#2 path, and its
+              // VARIANT index must not leak into the struct tables.)
+              let psi = structIndexByName(ty.tyName)
+              if psi >= 0 { return psi }
+              let pbase = nullablePartOf(ty.tyName)
+              if pbase != "" { return structIndexOfTypeName(pbase) }
+            }
           }
           return 0 - 1
         }
@@ -8540,6 +8831,7 @@ function declaredStructIndex(name: string): i32 {
   let slot = declaredSlotOf(name)
   if slot < 0 { return 0 - 1 }
   if localIsRef[slot] == 1 { return localStructIdx[slot] }
+  if localIsRef[slot] == 9 { return localStructIdx[slot] }
   0 - 1
 }
 
