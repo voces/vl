@@ -111,12 +111,12 @@ const CASES: Case[] = [
     // `let x = (1` — the parenthesized expr's RPAREN is missing; one diagnostic,
     // and the parser recovers (no loop/crash).
     body: `
-P.toks.push({ kind: "LET", text: "let", pos: 0 })
-P.toks.push({ kind: "IDENT", text: "x", pos: 1 })
-P.toks.push({ kind: "EQUAL", text: "=", pos: 2 })
-P.toks.push({ kind: "LPAREN", text: "(", pos: 3 })
-P.toks.push({ kind: "NUMBER", text: "1", pos: 4 })
-P.toks.push({ kind: "EOF", text: "", pos: 5 })
+P.toks.push({ kind: "LET", text: "let", pos: 0, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "IDENT", text: "x", pos: 1, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "EQUAL", text: "=", pos: 2, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "LPAREN", text: "(", pos: 3, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "NUMBER", text: "1", pos: 4, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "EOF", text: "", pos: 5, start: 0, line: 1, col: 0 })
 let _root = parseProgram()
 print("nodes: " + i32ToStr(P.nodes.length))
 print("diags: " + i32ToStr(P.diags.length))
@@ -240,12 +240,12 @@ print("diags: " + i32ToStr(P.diags.length))
     // the while, [4] the program — so node 1 is the `BreakStmt`. Real parseProgram.
     name: "parses a bare `break` inside a while with no diagnostics",
     body: `
-P.toks.push({ kind: "WHILE", text: "while", pos: 0 })
-P.toks.push({ kind: "IDENT", text: "x", pos: 6 })
-P.toks.push({ kind: "LBRACE", text: "{", pos: 8 })
-P.toks.push({ kind: "BREAK", text: "break", pos: 10 })
-P.toks.push({ kind: "RBRACE", text: "}", pos: 16 })
-P.toks.push({ kind: "EOF", text: "", pos: 17 })
+P.toks.push({ kind: "WHILE", text: "while", pos: 0, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "IDENT", text: "x", pos: 6, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "LBRACE", text: "{", pos: 8, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "BREAK", text: "break", pos: 10, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "RBRACE", text: "}", pos: 16, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "EOF", text: "", pos: 17, start: 0, line: 1, col: 0 })
 let _root = parseProgram()
 print("nodes: " + i32ToStr(P.nodes.length))
 print("diags: " + i32ToStr(P.diags.length))
@@ -263,12 +263,12 @@ if stmt is BreakStmt { print("kind: break") }
     // `mkContinue`, no diagnostics, the body statement is a `ContinueStmt`.
     name: "parses a bare `continue` inside a while with no diagnostics",
     body: `
-P.toks.push({ kind: "WHILE", text: "while", pos: 0 })
-P.toks.push({ kind: "IDENT", text: "x", pos: 6 })
-P.toks.push({ kind: "LBRACE", text: "{", pos: 8 })
-P.toks.push({ kind: "CONTINUE", text: "continue", pos: 10 })
-P.toks.push({ kind: "RBRACE", text: "}", pos: 19 })
-P.toks.push({ kind: "EOF", text: "", pos: 20 })
+P.toks.push({ kind: "WHILE", text: "while", pos: 0, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "IDENT", text: "x", pos: 6, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "LBRACE", text: "{", pos: 8, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "CONTINUE", text: "continue", pos: 10, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "RBRACE", text: "}", pos: 19, start: 0, line: 1, col: 0 })
+P.toks.push({ kind: "EOF", text: "", pos: 20, start: 0, line: 1, col: 0 })
 let _root = parseProgram()
 print("nodes: " + i32ToStr(P.nodes.length))
 print("diags: " + i32ToStr(P.diags.length))

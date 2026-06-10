@@ -61,7 +61,7 @@ ${chunkPushes(Xp)}
 function scLoadToks(src: string): i32 {
   let r = tokenize(src)
   let i = 0
-  while i < r.tokens.length { let t = r.tokens[i] P.toks.push({ kind: t.kind, text: t.text, pos: i }) i = i + 1 }
+  while i < r.tokens.length { let t = r.tokens[i] P.toks.push({ kind: t.kind, text: t.text, pos: i, start: t.start, line: t.line, col: t.col }) i = i + 1 }
   P.toks.length
 }
 // Packed result: 1000000*stage + count. stage 1 = lexer diags, 2 = parse diags,

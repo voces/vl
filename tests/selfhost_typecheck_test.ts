@@ -186,7 +186,7 @@ import { parseProgram } from "./parser"
 import { checkProgram, declare, initChecker, mkObjTy, T, TY_I32 } from "./typecheck"
 
 function tok(kind: string, text: string): i32 {
-  P.toks.push({ kind: kind, text: text, pos: P.toks.length })
+  P.toks.push({ kind: kind, text: text, pos: P.toks.length, start: 0, line: 1, col: 0 })
   P.toks.length - 1
 }
 ${buildWellTyped}

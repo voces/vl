@@ -4958,7 +4958,7 @@ function loadToks(src: string): i32 {
   let i = 0
   while i < r.tokens.length {
     let t = r.tokens[i]
-    P.toks.push({ kind: t.kind, text: t.text, pos: i })
+    P.toks.push({ kind: t.kind, text: t.text, pos: i, start: t.start, line: t.line, col: t.col })
     i = i + 1
   }
   P.toks.length
