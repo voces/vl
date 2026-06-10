@@ -111,6 +111,11 @@ const outFlag = Deno.args.indexOf("-o");
 const outPath = outFlag >= 0
   ? Deno.args[outFlag + 1]
   : "build/vl-compiler.wasm";
+// A RELATIVE -o resolves against the repo root (the script's parent), so the
+// default lands in `<repo>/build/` from any cwd; an absolute path is used as-is.
+const outUrl = outPath.startsWith("/")
+  ? new URL("file://" + outPath)
+  : new URL("../" + outPath, import.meta.url);
 
 const { wasm, diagnostics } = await compileCached(
   lexer + "\n" + ast + "\n" + parser + "\n" + typecheck + "\n" + wasmEmit +
@@ -124,7 +129,6 @@ if (errs.length > 0 || !wasm) {
   );
   Deno.exit(1);
 }
-await Deno.mkdir(new URL("../" + outPath.replace(/[^/]+$/, ""), import.meta.url), { recursive: true })
-  .catch(() => {});
-Deno.writeFileSync(new URL("../" + outPath, import.meta.url), wasm);
+await Deno.mkdir(new URL(".", outUrl), { recursive: true }).catch(() => {});
+Deno.writeFileSync(outUrl, wasm);
 console.log(`wrote ${outPath} (${wasm.length} bytes)`);
