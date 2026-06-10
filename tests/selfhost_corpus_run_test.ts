@@ -535,6 +535,89 @@ entries.forEach((e, idx) => {
   });
 });
 
+// ── import functypes are STANDALONE rectypes (wasmtime-portable) ──────────────
+// A `print` import's functype must NOT live inside the module's WasmGC rec group:
+// a rec-group-member functype carries nominal rec-group identity that a strict-GC
+// host (wasmtime) refuses to match against a host-provided function, so the import
+// fails to instantiate (V8 is lenient and accepts either). This decodes a real
+// emitted print module and asserts every imported func's type index lands AFTER the
+// rec group's members — the invariant that keeps self-hosted output portable.
+Deno.test("corpus-run: emitted print imports use STANDALONE functypes (wasmtime-portable)", async () => {
+  const exp = await getPipeline();
+  // LEB128 reader over a byte array, threaded position.
+  const uleb = (b: Uint8Array, p: number): [number, number] => {
+    let v = 0, s = 0, n = p;
+    for (;;) {
+      const c = b[n++];
+      v |= (c & 0x7f) << s;
+      if ((c & 0x80) === 0) break;
+      s += 7;
+    }
+    return [v >>> 0, n];
+  };
+  // Decode sections → { typePayload, importPayload } (or undefined if absent).
+  const sections = (b: Uint8Array): Map<number, Uint8Array> => {
+    const out = new Map<number, Uint8Array>();
+    let i = 8; // skip magic + version
+    while (i < b.length) {
+      const id = b[i++];
+      let size: number;
+      [size, i] = uleb(b, i);
+      out.set(id, b.subarray(i, i + size));
+      i += size;
+    }
+    return out;
+  };
+
+  let checked = 0;
+  for (let idx = 0; idx < entries.length; idx++) {
+    if (exp.runOne(idx) !== 0) continue;
+    const len = exp.rbyteLen();
+    const bytes = new Uint8Array(len);
+    for (let j = 0; j < len; j++) bytes[j] = exp.rbyteAt(j);
+    const secs = sections(bytes);
+    const imp = secs.get(2);
+    if (!imp) continue; // no import section → no print → nothing to check
+
+    // Type section: the FIRST rectype is the rec group (0x4e <count>); its members
+    // occupy type indices [0, recCount). Anything emitted after is standalone.
+    const ty = secs.get(1)!;
+    let p = 0;
+    [, p] = uleb(ty, p); // section's rectype count
+    if (ty[p] !== 0x4e) throw new Error(`${entries[idx].rel}: type section does not start with a rec group`);
+    p += 1;
+    let recCount: number;
+    [recCount, p] = uleb(ty, p);
+
+    // Import section: every func import (kind 0) must reference a type index >= recCount.
+    let q = 0;
+    let nImports: number;
+    [nImports, q] = uleb(imp, q);
+    for (let k = 0; k < nImports; k++) {
+      let mlen: number;
+      [mlen, q] = uleb(imp, q); q += mlen; // module name
+      let flen: number;
+      [flen, q] = uleb(imp, q); q += flen; // field name
+      const kind = imp[q++];
+      if (kind === 0) {
+        let typeIdx: number;
+        [typeIdx, q] = uleb(imp, q);
+        if (typeIdx < recCount) {
+          throw new Error(
+            `${entries[idx].rel}: imported functype index ${typeIdx} is INSIDE the rec group ` +
+              `(recCount=${recCount}) — would fail to instantiate on a strict WasmGC host`,
+          );
+        }
+      } else if (kind === 1) { q += 0; // table — not emitted, skip defensively
+      } else if (kind === 2) { let f: number; [f, q] = uleb(imp, q); if (f === 1) [, q] = uleb(imp, q); else [, q] = uleb(imp, q);
+      } else if (kind === 3) { q += 1; [, q] = uleb(imp, q); }
+    }
+    checked++;
+    if (checked >= 3) break; // a few real print modules is enough to lock the invariant
+  }
+  if (checked === 0) throw new Error("no emitted print module found to check the import-functype invariant");
+});
+
 // ── Check→emit test registrations ────────────────────────────────────────────
 // Helper: read a diagnostic tmsg back from wasm as a JS string.
 const getDiagMsg = (
