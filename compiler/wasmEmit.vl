@@ -2550,18 +2550,18 @@ function sFieldRefSlot(si: i32, fi: i32): i32 {
 function pushFieldStorage(code: i32, refSlot: i32): i32 {
   if code == 3 {
     wU8(100)                   // 0x64 (ref ht) — non-null string ref
-    wULEB(aTypeIdx)
+    wSLEB(aTypeIdx)
   } else if code == 4 {
     wU8(100)                   // 0x64 (ref ht) — non-null i32-list wrapper ref
-    wULEB(lTypeIdx)
+    wSLEB(lTypeIdx)
   } else if code == 5 {
     wU8(100)                   // 0x64 (ref ht) — non-null ref-list wrapper ref
     let s = refSlot
     if s < 0 { s = 0 }
-    wULEB(rlWrapIdx[s])        // THIS field's distinct ref-list wrapper
+    wSLEB(rlWrapIdx[s])        // THIS field's distinct ref-list wrapper (s33 heap type)
   } else if code == 6 {
     wU8(100)                   // 0x64 (ref ht) — non-null string-list wrapper ref
-    wULEB(mkListIdx)
+    wSLEB(mkListIdx)
   } else {
     wU8(127)                   // 0x7f i32 storagetype
   }
@@ -4007,7 +4007,7 @@ function emitToString(body: i32[], callIx: i32, fnIx: i32): i32 {
       wU8(28)                        // 0x1c select_t
       wU8(1)                         // one valtype
       wU8(100)                       // 0x64 (ref ht) — non-null string ref
-      wULEB(aTypeIdx)
+      wSLEB(aTypeIdx)
       return 0
     }
     // The value rides in NEGATIVE space (a positive x negates to -x) so i32 MIN
@@ -4929,6 +4929,46 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
       return 0
     }
     if target is Member {
+      // A field WRITE on a NARROWED union identifier (`if v is M { v.field = x }`)
+      // downcasts through the box like the READ path (`emitNarrowedMem`): push the
+      // box ref, unbox to the variant struct (`ref.cast`), push the value, then
+      // `struct.set` the variant field. The mutation hits the SHARED arena object
+      // (the in-place hole-filling `typecheck.vl` relies on).
+      if memIsNarrowed(a.binLeft) {
+        let nvi = memNarrowVariantIndex(a.binLeft)
+        if nvi < 0 {
+          return emitFail("emitProgram: narrowed field-assignment receiver names no variant")
+        }
+        let nm = P.nodes[a.binLeft]
+        if nm is Member {
+          let nfi = variantFieldIndex(nvi, nm.memProp)
+          if nfi < 0 {
+            return emitFail("emitProgram: unknown variant field in narrowed field assignment")
+          }
+          if emitExpr(body, nm.memObj, fnIx) < 0 { return 0 - 1 }
+          fbStructGet(uBoxIdx, 1)        // box field 1: value (anyref)
+          fbRefCast(uVarIdx + nvi)       // ref.cast to the variant struct
+          if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+          fbStructSet(uVarIdx + nvi, nfi)
+          return 0
+        }
+      }
+      // A field WRITE on a VARIANT-TYPED PARAM (`o: TyObj`) writes the variant struct
+      // directly (the param IS the unboxed variant ref — no box unwrap).
+      let pwvi = exprVariantIndex(target.memObj, fnIx)
+      if pwvi >= 0 {
+        let m1 = P.nodes[a.binLeft]
+        if m1 is Member {
+          let pwfi = variantFieldIndex(pwvi, m1.memProp)
+          if pwfi < 0 {
+            return emitFail("emitProgram: unknown variant field in field assignment")
+          }
+          if emitExpr(body, m1.memObj, fnIx) < 0 { return 0 - 1 }
+          if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+          fbStructSet(uVarIdx + pwvi, pwfi)
+          return 0
+        }
+      }
       // Field WRITE `recv.field = v` → `struct.set $0 <fieldidx>` (`0xfb 0x05`). The
       // single declared struct lives at WasmGC type index 0 (matching `emitMem`'s read
       // path). Operand order is load-bearing: push the struct REF first, then the value,
@@ -6163,7 +6203,7 @@ function fbI32Run(): i32 {
 function fbRefRun(heapIdx: i32): i32 {
   wU8(1)
   wU8(100)                 // 0x64 (ref ht) — non-null ref
-  wULEB(heapIdx)
+  wSLEB(heapIdx)
   0
 }
 
@@ -6941,25 +6981,25 @@ function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
   }
   if kind == 1 || kind == 9 {
     wU8(99)                    // 0x63 (ref null ht)
-    wULEB(sHeapIdx[structIdx])
+    wSLEB(sHeapIdx[structIdx])
   } else if kind == 2 {
     wU8(99)
-    wULEB(lTypeIdx)
+    wSLEB(lTypeIdx)
   } else if kind == 3 {
     wU8(99)
-    wULEB(aTypeIdx)
+    wSLEB(aTypeIdx)
   } else if kind == 4 {
     wU8(99)
-    wULEB(uBoxIdx)
+    wSLEB(uBoxIdx)
   } else if kind == 5 {
     wU8(99)
-    wULEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
+    wSLEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
   } else if kind == 6 {
     wU8(99)
-    wULEB(mStructIdx)
+    wSLEB(mStructIdx)
   } else if kind == 7 {
     wU8(99)
-    wULEB(mkListIdx)
+    wSLEB(mkListIdx)
   } else {
     wU8(127)                   // 0x7f i32
   }
@@ -7008,33 +7048,33 @@ function fbValtype(kind: i32, structIdx: i32): i32 {
   if kind == 9 {
     // Nullable struct ref `S | null` — `(ref null $S)`, the 0x63 form.
     wU8(99)
-    wULEB(sHeapIdx[structIdx])
+    wSLEB(sHeapIdx[structIdx])
     return 0
   }
   if kind == 1 {
     wU8(100)             // 0x64 (ref ht) — non-null ref
-    wULEB(sHeapIdx[structIdx])   // this struct's heap-type index
+    wSLEB(sHeapIdx[structIdx])   // this struct's heap-type index
   } else if kind == 2 {
     wU8(100)
-    wULEB(lTypeIdx)      // the i32-list wrapper struct heap-type index
+    wSLEB(lTypeIdx)      // the i32-list wrapper struct heap-type index
   } else if kind == 3 {
     wU8(100)
-    wULEB(aTypeIdx)      // the raw i32 array heap-type index (string)
+    wSLEB(aTypeIdx)      // the raw i32 array heap-type index (string)
   } else if kind == 4 {
     wU8(100)
-    wULEB(uBoxIdx)       // the union box `{tag, value}` heap-type index
+    wSLEB(uBoxIdx)       // the union box `{tag, value}` heap-type index
   } else if kind == 5 {
     wU8(100)
-    wULEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
+    wSLEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
   } else if kind == 6 {
     wU8(100)
-    wULEB(mStructIdx)    // the string-keyed MAP struct heap-type index (G8)
+    wSLEB(mStructIdx)    // the string-keyed MAP struct heap-type index (G8)
   } else if kind == 7 {
     wU8(100)
-    wULEB(mkListIdx)     // the STRING-LIST wrapper struct heap-type index
+    wSLEB(mkListIdx)     // the STRING-LIST wrapper struct heap-type index
   } else if kind == 8 {
     wU8(100)
-    wULEB(uVarIdx + structIdx)   // the CONCRETE union-variant struct heap-type index (gap #2)
+    wSLEB(uVarIdx + structIdx)   // the CONCRETE union-variant struct heap-type index (gap #2)
   } else {
     wU8(127)             // 0x7f i32
   }
@@ -7584,7 +7624,7 @@ function emitModule(stmts: i32[]): i32 {
     wU8(95)                      // 0x5f struct
     wU8(3)                       // 3 fields
     wU8(100)                     // field 0 backing: 0x64 (ref ht) — non-null
-    wULEB(aTypeIdx)              // ...to the raw array heap type
+    wSLEB(aTypeIdx)              // ...to the raw array heap type
     wU8(1)                       // mutable
     wU8(127)                     // field 1 len: 0x7f i32
     wU8(1)                       // mutable
@@ -7599,12 +7639,12 @@ function emitModule(stmts: i32[]): i32 {
   while rti < rlElemName.length {
     wU8(94)                      // 0x5e array (ref backing)
     wU8(99)                      // 0x63 (ref null ht) — nullable element ref
-    wULEB(rlElemHeap[rti])
+    wSLEB(rlElemHeap[rti])
     wU8(1)                       // mutable
     wU8(95)                      // 0x5f struct (ref-list wrapper)
     wU8(3)                       // 3 fields
     wU8(100)                     // field 0 backing: 0x64 (ref ht) — non-null
-    wULEB(rlBackIdx[rti])        // ...to THIS slot's ref backing
+    wSLEB(rlBackIdx[rti])        // ...to THIS slot's ref backing
     wU8(1)                       // mutable
     wU8(127)                     // field 1 len: 0x7f i32
     wU8(1)                       // mutable
@@ -7621,12 +7661,12 @@ function emitModule(stmts: i32[]): i32 {
     // the i32 list, over the string backing.
     wU8(94)                      // 0x5e array (keys/string backing)
     wU8(99)                      // 0x63 (ref null ht) — nullable string ref
-    wULEB(aTypeIdx)
+    wSLEB(aTypeIdx)
     wU8(1)                       // mutable
     wU8(95)                      // 0x5f struct (string-list wrapper)
     wU8(3)                       // 3 fields
     wU8(100)                     // field 0 backing: 0x64 (ref ht) — non-null
-    wULEB(mkArrIdx)
+    wSLEB(mkArrIdx)
     wU8(1)                       // mutable
     wU8(127)                     // field 1 len: 0x7f i32
     wU8(1)                       // mutable
@@ -7640,13 +7680,13 @@ function emitModule(stmts: i32[]): i32 {
     wU8(95)                      // 0x5f struct (map)
     wU8(5)                       // 5 fields (open-addressing hash map)
     wU8(100)                     // field 0 keys: 0x64 (ref $mkListIdx) — non-null
-    wULEB(mkListIdx)
+    wSLEB(mkListIdx)
     wU8(1)                       // mutable
     wU8(100)                     // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
-    wULEB(lTypeIdx)
+    wSLEB(lTypeIdx)
     wU8(1)                       // mutable
     wU8(100)                     // field 2 index: 0x64 (ref $aTypeIdx) — non-null i32 array
-    wULEB(aTypeIdx)
+    wSLEB(aTypeIdx)
     wU8(1)                       // mutable
     wU8(127)                     // field 3 count: 0x7f i32
     wU8(1)                       // mutable
@@ -9803,6 +9843,39 @@ function declaredString(name: string): boolean {
 // True if evaluating the expression at `exprIx` yields a string: a string literal, a
 // `string`-returning call, a string param/local reference, or a parenthesized string
 // expression. An index read / `.length` yields an i32, so neither counts.
+// The wasm-type CODE (`0` i32/bool, `3` string, `4` i32[], `5` ref list, `6` string
+// list) of the field a `Member` access `recv.field` reads, resolving the receiver
+// through the three field-bearing shapes — a NARROWED union local (`if n is A {…}`),
+// a VARIANT-TYPED value/param (`fn f(n: A)`, the `checkXNode(n: Variant)` idiom), or a
+// plain declared struct — or -1 when the receiver is none of these. The single place
+// the `exprString`/`exprStruct`/`exprArray`/`exprMap` classifiers consult so a field
+// read of ANY receiver shape resolves to its declared field type.
+function memberFieldCode(memIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[memIx]
+  if e is Member {
+    if memIsNarrowed(memIx) {
+      let vi = memNarrowVariantIndex(memIx)
+      if vi >= 0 {
+        let vfi = variantFieldIndex(vi, e.memProp)
+        if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
+      }
+      return 0 - 1
+    }
+    let pvi = exprVariantIndex(e.memObj, fnIx)
+    if pvi >= 0 {
+      let pvfi = variantFieldIndex(pvi, e.memProp)
+      if pvfi >= 0 { return variantFieldTypeAt(pvi, pvfi) }
+      return 0 - 1
+    }
+    let si = structIndexOfExpr(e.memObj, fnIx)
+    if si >= 0 {
+      let fi = sFieldIndex(si, e.memProp)
+      if fi >= 0 { return sFieldTypeAt(si, fi) }
+    }
+  }
+  0 - 1
+}
+
 function exprString(exprIx: i32, fnIx: i32): boolean {
   if exprIx < 0 { return false }
   let e = P.nodes[exprIx]
@@ -9835,25 +9908,9 @@ function exprString(exprIx: i32, fnIx: i32): boolean {
   // A field read `p.f` where `f` is a STRING struct field yields a string ref (gap #2:
   // `let k = t.kind` must give `k` the string type, not i32).
   if e is Member {
-    // A field read on a NARROWED union identifier (`if n is A { … n.f … }`) reads the
-    // variant field; a string variant field yields a string ref.
-    if memIsNarrowed(exprIx) {
-      let vi = memNarrowVariantIndex(exprIx)
-      if vi >= 0 {
-        let vfi = variantFieldIndex(vi, e.memProp)
-        if vfi >= 0 {
-          if variantFieldTypeAt(vi, vfi) == 3 { return true }
-        }
-      }
-      return false
-    }
-    let si = structIndexOfExpr(e.memObj, fnIx)
-    if si >= 0 {
-      let fi = sFieldIndex(si, e.memProp)
-      if fi >= 0 {
-        if sFieldTypeAt(si, fi) == 3 { return true }
-      }
-    }
+    // A field read whose declared field type is `string` (code 3) — resolved through
+    // the narrowed-local / variant-param / plain-struct shapes by `memberFieldCode`.
+    return memberFieldCode(exprIx, fnIx) == 3
   }
   false
 }
