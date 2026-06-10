@@ -606,6 +606,13 @@ let fRetRArr: i32[] = []
 // its distinct element-type table slot.
 let fRetRArrElem: string[] = []
 
+// Parallel to `fnNames`: `1` if the i-th function RETURNS a boolean — its declared
+// return type is `boolean`/`bool`, or (un-annotated) its first valued `return` is
+// boolean-classified (`computeRetInference`). Drives the `print` import choice for a
+// call argument (`__print_bool__` vs `__print_i32__`); a bool rides in an i32 at the
+// wasm level, so the functype result is unchanged.
+let fRetBool: i32[] = []
+
 // ── module-level GLOBALS (G2b) ────────────────────────────────────────────────
 // A top-level `let`/`const` (`LetDecl`) lowers to a wasm module GLOBAL (mutable),
 // emitted in the global section (id 6). Its wasm GLOBAL INDEX is its position among
@@ -707,6 +714,7 @@ function buildFnMap(stmts: i32[]): i32 {
   fRetUni = []
   fRetRArr = []
   fRetRArrElem = []
+  fRetBool = []
   let i = 0
   while i < fnStmts.length {
     let s = P.nodes[fnStmts[i]]
@@ -721,6 +729,7 @@ function buildFnMap(stmts: i32[]): i32 {
       fRetUni.push(retUnionFlag(s.fnRet))
       fRetRArr.push(retRefArrFlag(s.fnRet))
       fRetRArrElem.push(retRefArrElemName(s.fnRet))
+      fRetBool.push(retBoolFlag(s.fnRet))
     }
     i = i + 1
   }
@@ -877,6 +886,13 @@ function computeRetInference(): i32 {
         if fn.fnRet < 0 && fRetVoid[i] == 0 {
           let rx = fnRetExprOf(fnStmts[i])
           if rx >= 0 {
+            // A tail ASSIGNMENT yields its RHS (assignment-as-expression), so the
+            // function's return kind is the RHS's kind (`function emit(s: string)
+            // { acc = acc + s }` returns the new string).
+            let rxe = P.nodes[rx]
+            if rxe is BinExpr {
+              if rxe.binOp == "=" { rx = rxe.binRight }
+            }
             if fRetStr[i] == 0 && exprString(rx, fnStmts[i]) {
               fRetStr[i] = 1
               changed = true
@@ -896,6 +912,10 @@ function computeRetInference(): i32 {
             if fRetRef[i] == 0 && exprStruct(rx, fnStmts[i]) {
               fRetRef[i] = 1
               fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
+              changed = true
+            }
+            if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
+              fRetBool[i] = 1
               changed = true
             }
           }
@@ -2316,6 +2336,7 @@ function binOpcode(op: string): i32 {
 // The wasm struct field index of `name` within struct `si` (declaration order), or
 // -1 if that struct has no such field.
 function sFieldIndex(si: i32, name: string): i32 {
+  if si < 0 { return 0 - 1 }   // unresolved struct (e.g. an inferred ref with no interned shape)
   let start = sFieldStart[si]
   let cnt = sFieldCount[si]
   let j = 0
@@ -4217,9 +4238,10 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
 // (`__print_bool__` renders true/false; everything else prints as i32). A bool
 // rides in an i32 at the wasm level, so this is a SYNTACTIC classification:
 // bool literals, comparisons, logical connectives, `!`, `is` guards, and calls
-// to a function whose return annotation is `boolean`/`bool`. Identifiers are NOT
-// classified (a bool-typed local prints as 0/1 for now — annotation threading
-// through the local registry is a later slice).
+// to a function that returns a boolean (annotated `boolean`/`bool`, or inferred —
+// `fRetBool` via `computeRetInference`). Identifiers are NOT classified (a
+// bool-typed local prints as 0/1 for now — annotation threading through the local
+// registry is a later slice).
 function exprIsBool(ix: i32, fnIx: i32): boolean {
   if ix < 0 {
     return false
@@ -4256,6 +4278,11 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
             if rt is TypeRef {
               return rt.tyName == "boolean" || rt.tyName == "bool"
             }
+          } else {
+            // Un-annotated: `computeRetInference` has classified the callee's first
+            // valued return into `fRetBool` (fixed point, so a mutually-recursive
+            // group resolves).
+            return fRetBool[target] == 1
           }
         }
       }
@@ -4891,8 +4918,12 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     let slot = emitLetCursor
     emitLetCursor = emitLetCursor + 1
     let paramN = 0
-    let fn = P.nodes[fnIx]
-    if fn is FuncDecl { paramN = fn.fnParams.length }
+    // The START function (`fnIx == -1`, top-level statements) has no params — and no
+    // arena node to read, so the lookup must be guarded.
+    if fnIx >= 0 {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl { paramN = fn.fnParams.length }
+    }
     let idx = paramN + slot
     if s.letInit < 0 {
       return emitFail("emitProgram: local declaration needs an initializer")
@@ -5896,6 +5927,19 @@ function retStrFlag(tyIx: i32): i32 {
   0
 }
 
+// `1` if the type-annotation node at `tyIx` is `boolean`/`bool`, else `0`. A bool
+// rides in an i32 at the wasm level — this feeds ONLY the `print` import choice
+// (`fRetBool`), never a valtype.
+function retBoolFlag(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if ty.tyName == "boolean" || ty.tyName == "bool" { return 1 }
+    }
+  }
+  0
+}
+
 // Combine the struct/array/string flags for a type-annotation node at `tyIx` into the
 // single `pushVT` `kind` code: `1` struct, `2` array, `3` string, `0` i32. (Struct
 // wins if a name were somehow both — it cannot be, the lexemes are disjoint.) String
@@ -6011,6 +6055,19 @@ function globalKind(initIx: i32): i32 {
     return 2
   }
   if e is StrLit { return 3 }
+  // A NON-LITERAL initializer (a concat `"a" + "b"`, a `fromCodePoint(...)` or
+  // user-function call, a reference to another global): classify via the expression
+  // family with no enclosing function (`fnIx = -1`) — the same predicates the local
+  // `letIs*` ladder uses. The cell zero-inits (`ref.null` via the non-const path)
+  // and the start function `global.set`s the computed value. An i32-producing
+  // expression matches none of these and stays kind 0 — programs without ref-typed
+  // global expressions emit byte-identical bytes.
+  if exprString(initIx, 0 - 1) { return 3 }
+  if exprStringArray(initIx, 0 - 1) { return 7 }
+  if exprRefArray(initIx, 0 - 1) { return 5 }
+  if exprUnion(initIx, 0 - 1) { return 4 }
+  if exprStruct(initIx, 0 - 1) { return 1 }
+  if exprArray(initIx, 0 - 1) { return 2 }
   0
 }
 
@@ -6141,6 +6198,13 @@ function globalCellStructIdx(letIx: i32): i32 {
 // `i32.const 0`.
 function fbRefNullForKind(kind: i32, structIdx: i32): i32 {
   wU8(208)                     // 0xd0 ref.null
+  // Same unresolved-slot guard as `fbValtype`: fail loudly, never read a table OOB.
+  if structIdx < 0 {
+    if kind == 1 || kind == 5 {
+      wSLEB(aTypeIdx)
+      return emitFail("emitProgram: ref.null with no interned shape")
+    }
+  }
   if kind == 1 {
     wSLEB(sHeapIdx[structIdx])
   } else if kind == 2 {
@@ -6166,6 +6230,15 @@ function fbRefNullForKind(kind: i32, structIdx: i32): i32 {
 // same `0x7f` i32 as `fbValtype`. Only used for NON-const globals; const globals keep
 // the non-null `fbValtype` (so goldens are unchanged).
 function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
+  // A struct/ref-list kind with NO resolved table slot would read a table out of
+  // bounds (a trap). Fail loudly instead, writing a placeholder i32 so the buffer
+  // stays well-formed while `emitFail` unwinds.
+  if structIdx < 0 {
+    if kind == 1 || kind == 5 || kind == 8 {
+      wU8(127)
+      return emitFail("emitProgram: ref valtype with no interned shape")
+    }
+  }
   if kind == 1 {
     wU8(99)                    // 0x63 (ref null ht)
     wULEB(sHeapIdx[structIdx])
@@ -6224,6 +6297,14 @@ function refElemHeapType(): i32 {
 // callers `wTarget(buf)` the destination buffer first (the writer streams to
 // `curBuf`), matching every other `fb*` method.
 function fbValtype(kind: i32, structIdx: i32): i32 {
+  // Same out-of-bounds guard as `fbValtypeNullable`: a struct/ref-list kind whose
+  // table slot never resolved fails loudly, never traps.
+  if structIdx < 0 {
+    if kind == 1 || kind == 5 || kind == 8 {
+      wU8(127)
+      return emitFail("emitProgram: ref valtype with no interned shape")
+    }
+  }
   if kind == 1 {
     wU8(100)             // 0x64 (ref ht) — non-null ref
     wULEB(sHeapIdx[structIdx])   // this struct's heap-type index
@@ -7473,6 +7554,73 @@ function nodeIsTypeDecl(ix: i32): boolean {
   false
 }
 
+// The struct field-type CODE for an ANONYMOUS-shape field, from its literal VALUE
+// (an anonymous literal has no `type` annotation to read): a number/boolean is i32
+// (`0`), a string literal is a string ref (`3`). Anything else (a function value, a
+// nested literal, a call, …) returns -1 — the whole shape is then left un-interned
+// and the literal fails loudly downstream.
+function anonFieldCode(valIx: i32): i32 {
+  if valIx < 0 { return 0 - 1 }
+  let e = P.nodes[valIx]
+  if e is NumLit { return 0 }
+  if e is BoolLit { return 0 }
+  if e is StrLit { return 3 }
+  0 - 1
+}
+
+// ANONYMOUS shapes: an object literal naming NO declared struct and NO union variant
+// still constructs a WasmGC struct (`const p = { y: 4, x: 3 }` with no `type` in
+// sight — the host interns every shape). Intern each distinct field-name SET as an
+// unnamed struct (name "", field order = literal order, field types from the literal
+// values), APPENDED after every declared struct so declared indices are unchanged —
+// a program with no anonymous literal emits byte-identical bytes. A later literal
+// with the same name set matches the interned shape via `structIndexOfObj`. A field
+// value `anonFieldCode` can't type leaves the whole shape un-interned; that literal
+// then fails loudly downstream (never a trap). Must run AFTER `collectU` (variant
+// shapes are the union's, not standalone structs).
+function collectAnonShapes(): i32 {
+  let ai = 0
+  while ai < P.nodes.length {
+    let an = P.nodes[ai]
+    if an is ObjLit {
+      if structIndexOfObj(ai) < 0 && objVariantName(ai) == "" {
+        let fields = an.objFields
+        let codes: i32[] = []
+        let names: string[] = []
+        let ok = true
+        let fi = 0
+        while fi < fields.length {
+          let f = P.nodes[fields[fi]]
+          if f is FieldInit {
+            let code = anonFieldCode(f.fiValue)
+            if code < 0 { ok = false }
+            codes.push(code)
+            names.push(f.fiName)
+          } else {
+            ok = false
+          }
+          fi = fi + 1
+        }
+        if ok && codes.length > 0 {
+          sDeclared = true
+          sNames.push("")
+          sFieldStart.push(sFieldNames.length)
+          sFieldCount.push(codes.length)
+          let pi = 0
+          while pi < codes.length {
+            sFieldNames.push(names[pi])
+            sFieldTypes.push(codes[pi])
+            sFieldElemName.push("")
+            pi = pi + 1
+          }
+        }
+      }
+    }
+    ai = ai + 1
+  }
+  0
+}
+
 // Scan the top-level statements for EVERY struct `type` declaration and record each
 // into the flat multi-struct table (name + field names in declaration order, plus a
 // per-field wasm-type code: `0` = i32 / boolean, `3` = string). Each `type X = {…}`
@@ -7523,7 +7671,7 @@ function collectS(stmts: i32[]): i32 {
     }
     i = i + 1
   }
-  0
+  collectAnonShapes()
 }
 
 // ── union collection (G1) ─────────────────────────────────────────────────────
@@ -8983,7 +9131,12 @@ function emitProgram(rootIx: i32): i32 {
       if checkParams(fnStmts[i]) < 0 { return 0 - 1 }
       i = i + 1
     }
-    return emitModule(stmts)
+    let rc = emitModule(stmts)
+    if rc < 0 { return rc }
+    // An `emitFail` whose -1 a deep helper swallowed (e.g. inside a valtype write)
+    // must still fail the WHOLE emit: a failed module never reaches instantiation.
+    if emitFailed { return 0 - 1 }
+    return rc
   }
   emitFail("emitProgram: root node is not a Program")
 }
