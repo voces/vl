@@ -41,6 +41,13 @@ let curBuf: i32[] = W.bytes
 // shifts, so existing modules stay byte-identical.
 let gImports: i32 = 0
 
+// `true` when the program uses `print` AND declares an i64 binding — pulling in a
+// FIFTH import `__print_i64__` (function index 4) with a `(i64)->()` functype. Decided
+// up front like `gImports` (an extra import shifts every local function's wasm index by
+// one MORE). A program with no i64 annotation never sets this, so its emitted bytes are
+// byte-identical to before (the existing 4-import / 0-import layouts are untouched).
+let gNeedsI64Print: boolean = false
+
 // ── name-section opt-in (OFF by default — goldens stay byte-identical) ─────────
 // When `1`, `emitModule` appends a wasm "name" custom section (function-name
 // subsection + module-name subsection) so a wasmtime trap backtrace shows real
@@ -256,6 +263,135 @@ function fbGlobalSet(i: i32): i32 {
 function fbI32Const(v: i32): i32 {
   wU8(65)            // 0x41 i32.const
   wSLEB(v)
+  0
+}
+// Signed-LEB128 over a 64-bit value carried as a (hi, lo) i32 PAIR (`hi` the high
+// 32 bits, `lo` the low 32 — both read as UNSIGNED 32-bit lanes). The self-host
+// compiler is i32-only internally, so a 64-bit literal cannot live in one i32: it
+// is carried as the pair and shifted RIGHT 7 bits at a time across the lane
+// boundary by hand. `wSLEB`'s i32 form cannot be reused (its `v >> 7` is a 32-bit
+// arithmetic shift). Termination mirrors `slebToArr`: stop once the remaining
+// value is all-0 (with the sign bit clear) or all-1 (sign bit set).
+function wSLEB64(hi: i32, lo: i32): i32 {
+  let h = hi
+  let l = lo
+  let more = true
+  while more {
+    let byte = l & 0x7f
+    // Logical 64-bit right shift by 7: low lane gets its top 25 bits plus the
+    // low 7 bits of `hi` rotated in; high lane is a plain unsigned >>> 7.
+    let newLo = (l >>> 7) | (h << 25)
+    let newHi = h >>> 7
+    l = newLo
+    h = newHi
+    let signBit = 0
+    if (byte & 0x40) != 0 { signBit = 1 }
+    // Remaining value is "done" when both lanes are 0 (non-negative tail) or both
+    // lanes are all-ones, i.e. -1 (negative tail) — matching SLEB's sign rule.
+    if l == 0 && h == 0 {
+      if signBit == 0 {
+        wU8(byte)
+        more = false
+      } else {
+        wU8(byte | 0x80)
+      }
+    } else if l == (0 - 1) && h == (0 - 1) {
+      if signBit == 1 {
+        wU8(byte)
+        more = false
+      } else {
+        wU8(byte | 0x80)
+      }
+    } else {
+      wU8(byte | 0x80)
+    }
+  }
+  0
+}
+// Fold a non-negative integer LEXEME (a `NumLit.numText`, possibly past the i32
+// range) into a 64-bit (hi, lo) i32 PAIR, returned as `[hi, lo]`. Mirrors
+// `parseI32`'s base detection (hex `0x`/binary `0b`/octal `0o`, else decimal,
+// with `_` separators skipped) but accumulates into the pair via 64-bit
+// multiply-add so values like `0xFFFFFFFFFF` survive intact. Each step computes
+// `pair = pair * base + digit` using `mulAdd64`.
+function parseI64Pair(text: string): i32[] {
+  let hi = 0
+  let lo = 0
+  let i = 0
+  let base = 10
+  if text.length >= 2 && text[0] == '0' {
+    let p = text[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  while i < text.length {
+    let c = text[i]
+    if c == '_' {
+      i = i + 1
+    } else {
+      let d = 0
+      if c >= '0' && c <= '9' {
+        d = c - '0'
+      } else if c >= 'a' && c <= 'f' {
+        d = c - 'a' + 10
+      } else {
+        d = c - 'A' + 10
+      }
+      let r = mulAdd64(hi, lo, base, d)
+      hi = r[0]
+      lo = r[1]
+      i = i + 1
+    }
+  }
+  let out: i32[] = []
+  out.push(hi)
+  out.push(lo)
+  out
+}
+// 64-bit `(hi, lo) * m + add`, returned as `[hi, lo]`. `m`/`add` are small
+// (base ≤ 16, digit ≤ 15) so the multiply fits without a full 64×64. The low
+// lane is split into two 16-bit halves so each partial product stays within i32;
+// carries propagate into the high lane. All lanes are treated as UNSIGNED 32-bit.
+function mulAdd64(hi: i32, lo: i32, m: i32, add: i32): i32[] {
+  let loLow = lo & 0xffff
+  let loHigh = (lo >>> 16) & 0xffff
+  let p0 = loLow * m + add
+  let p1 = loHigh * m + (p0 >>> 16)
+  let newLo = (p0 & 0xffff) | ((p1 & 0xffff) << 16)
+  let carry = p1 >>> 16
+  // High lane: hi * m + carry, low 32 bits kept (overflow past 64 bits is dropped,
+  // as the host's `i64.const` wraps mod 2^64).
+  let hiLow = hi & 0xffff
+  let hiHigh = (hi >>> 16) & 0xffff
+  let q0 = hiLow * m + carry
+  let q1 = hiHigh * m + (q0 >>> 16)
+  let newHi = (q0 & 0xffff) | ((q1 & 0xffff) << 16)
+  let out: i32[] = []
+  out.push(newHi)
+  out.push(newLo)
+  out
+}
+// i64.const: 0x42 <value-sleb64>. The 64-bit literal value is carried as a (hi,
+// lo) i32 pair (`parseI64Pair`) and signed-LEB-encoded over 64 bits (`wSLEB64`).
+function fbI64Const(hi: i32, lo: i32): i32 {
+  wU8(66)            // 0x42 i64.const
+  wSLEB64(hi, lo)
+  0
+}
+// i64.extend_i32_s: 0xac. Sign-extends an i32 on the stack to i64 — the bridge
+// inserted when an i32-typed value (e.g. a bare integer literal) is used where i64
+// is expected. (Slice 1 prefers typing the literal directly as i64; this is the
+// fallback for a non-literal i32 source.)
+function fbI64ExtendI32S(): i32 {
+  wU8(172)           // 0xac i64.extend_i32_s
   0
 }
 // if: 0x04 <blocktype>. `blockType` is a single byte (0x40 void, or a valtype byte).
@@ -1519,6 +1655,14 @@ let pendingListSlot: i32 = 0
 // literal does not inherit the outer hint.
 let pendingStructIdx: i32 = 0 - 1
 
+// `true` while lowering an expression whose CONTEXT expects an i64 (an `: i64`
+// binding/global init, an i64 param argument, or an i64 return). Read by the
+// `NumLit` literal lowering to pick `i64.const` over `i32.const`; set immediately
+// before the relevant `emitExpr` call and cleared right after (like
+// `pendingStructIdx`). Slice 1 only needs the literal case; nested arithmetic is
+// Slice 2.
+let pendingI64: boolean = false
+
 // ── discriminated-union table (G1: struct unions + `is`-narrowing) ────────────
 // A program may declare ONE union alias `type N = A | B | …` (a `UnionDecl`) whose
 // members are struct `type`s (each a `TypeDecl`). When a union IS declared, the
@@ -1679,6 +1823,11 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
           slot = addLocalName(s.letName, 2, 0 - 1)
         } else if letIsString(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 3, 0 - 1)
+        } else if letIsI64(stmts[i]) {
+          // Scalar i64 local (`let x: i64 = …`, kind 10, valtype 0x7e). Bypasses
+          // `checkLocalI32` (which rejects a non-i32 annotation); the init literal
+          // lowers as `i64.const` in `emitStmt`'s LetDecl path.
+          slot = addLocalName(s.letName, 10, 0 - 1)
         } else {
           if checkLocalI32(stmts[i]) < 0 { scopePop() return 0 - 1 }
           slot = addLocalName(s.letName, 0, 0 - 1)
@@ -4381,6 +4530,15 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
   }
   let e = P.nodes[exprIx]
   if e is NumLit {
+    // An integer literal in i64 CONTEXT (`pendingI64`) lowers as `i64.const` over the
+    // 64-bit (hi, lo) pair parsed from its lexeme — so a value past the i32 range
+    // (`9000000000`, `0xFFFFFFFFFF`) survives. Otherwise the default i32 path is
+    // byte-identical to before (bare integer literals stay i32 — Slice 1 invariant).
+    if pendingI64 {
+      let pr = parseI64Pair(e.numText)
+      fbI64Const(pr[0], pr[1])
+      return 0
+    }
     fbI32Const(parseI32(e.numText))
     return 0
   }
@@ -4669,6 +4827,56 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
 // `fRetBool` via `computeRetInference`). Identifiers are NOT classified (a
 // bool-typed local prints as 0/1 for now — annotation threading through the local
 // registry is a later slice).
+// True if the PARAMETER `name` of the function at `fnIx` is annotated `i64`.
+function paramIsI64(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          return retI64Flag(p.parType) == 1
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the DECLARED LOCAL `name` is an i64 slot (kind 10 in the local registry).
+function declaredI64(name: string): boolean {
+  let slot = declaredSlotOf(name)
+  if slot < 0 { return false }
+  localIsRef[slot] == 10
+}
+
+// True if the module GLOBAL `name` is an i64 cell.
+function globalIsI64(name: string): boolean {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsI64(li)
+}
+
+// True if evaluating the expression at `exprIx` yields an i64 — a reference to an
+// i64 param/local/global, or a parenthesized such. Drives the `print` import choice
+// (`__print_i64__`, import 4). Arithmetic/calls returning i64 are Slice 2; here only
+// the direct-reference forms (the Slice-1 `print(x)` shape) classify as i64.
+function exprIsI64(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Paren { return exprIsI64(e.parInner, fnIx) }
+  if e is Ident {
+    if paramIsI64(fnIx, e.identName) { return true }
+    if declaredI64(e.identName) { return true }
+    return globalIsI64(e.identName)
+  }
+  false
+}
+
 function exprIsBool(ix: i32, fnIx: i32): boolean {
   if ix < 0 {
     return false
@@ -4838,8 +5046,14 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
           fbCall(3)                        // __print_str_flush__
           return 0
         }
+        // An i64-typed argument lowers to `i64.const`/`local.get` of an i64 slot, so it
+        // must route to `__print_i64__` (import 4) — its functype is `(i64)->()`, so the
+        // i32/bool imports would fail to typecheck the call. Checked before bool/i32.
+        let argI64 = exprIsI64(c.callArgs[0], fnIx)
         if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
-        if exprIsBool(c.callArgs[0], fnIx) {
+        if argI64 {
+          fbCall(4)            // 0x10 call __print_i64__ (import index 4)
+        } else if exprIsBool(c.callArgs[0], fnIx) {
           fbCall(1)            // 0x10 call __print_bool__ (import index 1)
         } else {
           fbCall(0)            // 0x10 call __print_i32__ (import index 0)
@@ -4865,6 +5079,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         pendingStructIdx = 0 - 1
         pendingListKind = 0
         pendingListSlot = 0
+        pendingI64 = false
         // A VARIANT-typed param position (kind 8): the callee wants the CONCRETE variant
         // struct ref, but a union-valued argument (a narrowed local/param, a union-
         // returning call) is the BOX `{tag, value}`. Bridge the boundary by unboxing the
@@ -4890,6 +5105,8 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
               pendingListKind = tyAnnRefListKind(cp.parType)
               pendingListSlot = tyAnnRefListSlot(cp.parType)
             }
+            // An i64 param position lowers an integer-literal argument as `i64.const`.
+            if vtKindOfParam(cParams[i]) == 10 { pendingI64 = true }
           }
         }
         if emitExpr(body, args[i], fnIx) < 0 { return 0 - 1 }
@@ -4902,6 +5119,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         pendingStructIdx = 0 - 1
         pendingListKind = 0
         pendingListSlot = 0
+        pendingI64 = false
         i = i + 1
       }
       fbCall(gImports + target)  // 0x10 call (imports occupy indices 0..gImports-1)
@@ -5561,7 +5779,10 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     // annotation names no `sNames` entry (`letAnnStructIdx` is -1) so a variant literal
     // still boxes; a non-struct-literal init ignores the hint.
     pendingStructIdx = letAnnStructIdx(stmtIx)
+    // An `: i64` binding lowers its init literal as `i64.const` (see the NumLit path).
+    pendingI64 = letIsI64(stmtIx)
     if emitExpr(body, s.letInit, fnIx) < 0 { return 0 - 1 }
+    pendingI64 = false
     pendingStructIdx = 0 - 1
     pendingListKind = 0
     pendingListSlot = 0
@@ -6230,18 +6451,20 @@ function checkParams(fnIx: i32): i32 {
           if retNulRefFlag(p.parType) == 1 {
             // accepted — a `(ref null $S)` param
           } else if ty.tyName != "i32" {
+            if ty.tyName != "i64" {            // i64 rides the 0x7e valtype (Slice 1)
             if ty.tyName != "boolean" {
               if !isSName(ty.tyName) {
                 if !isUName(ty.tyName) {
                   if variantIndexOf(ty.tyName) < 0 {
                     if !nameIsArray(ty.tyName) {
                       if !nameIsString(ty.tyName) {
-                        return emitFail("emitProgram: only i32, boolean, struct, union, array, or string parameters are supported")
+                        return emitFail("emitProgram: only i32, i64, boolean, struct, union, array, or string parameters are supported")
                       }
                     }
                   }
                 }
               }
+            }
             }
           }
         } else {
@@ -6813,6 +7036,20 @@ function vtKindOfType(tyIx: i32): i32 {
   if retTRFlag(tyIx) == 1 { return 1 }
   if retArrFlag(tyIx) == 1 { return 2 }
   if retStrFlag(tyIx) == 1 { return 3 }
+  if retI64Flag(tyIx) == 1 { return 10 }
+  0
+}
+
+// `1` if the type-annotation node at `tyIx` is `i64`, else `0`. A scalar i64
+// param/result/local/global classifies as kind 10 (valtype `0x7e`); checked LAST
+// (after every ref/array case) since `i64` is a plain TypeRef name like `i32`.
+function retI64Flag(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if ty.tyName == "i64" { return 1 }
+    }
+  }
   0
 }
 
@@ -7031,6 +7268,7 @@ function globalCellKind(letIx: i32): i32 {
       if letIsStruct(letIx, 0 - 1) { return 1 }
       if letIsArray(letIx, 0 - 1) { return 2 }
       if letIsString(letIx, 0 - 1) { return 3 }
+      if letIsI64(letIx) { return 10 }
       return 0
     }
     // No annotation: a const literal init types itself; a non-const un-annotated init is
@@ -7125,6 +7363,8 @@ function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
   } else if kind == 7 {
     wU8(99)
     wSLEB(mkListIdx)
+  } else if kind == 10 {
+    wU8(126)                   // 0x7e i64 (scalar, never a nullable ref)
   } else {
     wU8(127)                   // 0x7f i32
   }
@@ -7200,6 +7440,8 @@ function fbValtype(kind: i32, structIdx: i32): i32 {
   } else if kind == 8 {
     wU8(100)
     wSLEB(uVarIdx + structIdx)   // the CONCRETE union-variant struct heap-type index (gap #2)
+  } else if kind == 10 {
+    wU8(126)             // 0x7e i64 (Slice 1: scalar i64 local/param/global/result)
   } else {
     wU8(127)             // 0x7f i32
   }
@@ -7662,6 +7904,11 @@ function emitNameSection(n: i32): i32 {
     wName("__print_char__")
     wULEB(3)
     wName("__print_str_flush__")
+    // The 5th import (index 4) is named only when an i64 program prints.
+    if gNeedsI64Print {
+      wULEB(4)
+      wName("__print_i64__")
+    }
   }
   let fi = 0
   while fi < n {
@@ -7779,6 +8026,7 @@ function emitModule(stmts: i32[]): i32 {
   // section rectype count stays 1, rec-group count unchanged) are byte-identical.
   let nPrintTypes = 0
   if gImports > 0 { nPrintTypes = 2 }    // (i32)->() and ()->() for the print imports
+  if gNeedsI64Print { nPrintTypes = nPrintTypes + 1 }   // + (i64)->() for __print_i64__
   wULEB(1 + nPrintTypes)                 // rectypes: the rec group + the standalone print functypes
   wU8(78)                                // 0x4e rec group
   wULEB(n + typeOffset + hasStart)       // types inside the rec group (print functypes excluded)
@@ -7977,6 +8225,15 @@ function emitModule(stmts: i32[]): i32 {
     wU8(0)                       // 0 params
     wU8(0)                       // 0 results
   }
+  // The `(i64)->()` functype for `__print_i64__` (only when an i64 program prints),
+  // standalone AFTER the two existing print functypes — its index is `ftVoid + 1`,
+  // so no existing functype index shifts.
+  if gNeedsI64Print {
+    wU8(96)                      // 0x60 func
+    wU8(1)                       // 1 param
+    wU8(126)                     // 0x7e i64
+    wU8(0)                       // 0 results
+  }
   wTarget(tyPrev)
   wSection(1, typePayload)
 
@@ -7987,9 +8244,13 @@ function emitModule(stmts: i32[]): i32 {
   if gImports > 0 {
     let ftI32 = typeOffset + n + hasStart
     let ftVoid = ftI32 + 1
+    let ftI64 = ftVoid + 1
     let importPayload: i32[] = []
     let imPrev = wTarget(importPayload)
-    wULEB(4)
+    // 4 imports normally; a 5th (`__print_i64__`) when an i64 program prints.
+    let nImports = 4
+    if gNeedsI64Print { nImports = 5 }
+    wULEB(nImports)
     wName("imports")
     wName("__print_i32__")
     wU8(0)                       // import kind: func
@@ -8006,6 +8267,14 @@ function emitModule(stmts: i32[]): i32 {
     wName("__print_str_flush__")
     wU8(0)
     wULEB(ftVoid)
+    // `__print_i64__` LAST, at function index 4 (`fbCall(4)` in the print router), so
+    // the existing imports keep indices 0..3 and only this entry is conditionally added.
+    if gNeedsI64Print {
+      wName("imports")
+      wName("__print_i64__")
+      wU8(0)
+      wULEB(ftI64)
+    }
     wTarget(imPrev)
     wSection(2, importPayload)
   }
@@ -8091,7 +8360,10 @@ function emitModule(stmts: i32[]): i32 {
           if gck == 5 { gcs = letAnnRefListSlot(globalStmts[gi]) }
           fbValtype(gck, gcs)                            // valtype
           wU8(1)                                         // 0x01 mutable
+          // An `: i64` global lowers its literal init as `i64.const` (kind 10 / 0x7e).
+          pendingI64 = (gck == 10)
           if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
+          pendingI64 = false
           pendingListKind = 0
           pendingListSlot = 0
           fbEnd()                                         // 0x0b end of init expr
@@ -10320,6 +10592,23 @@ function letIsString(letIx: i32, fnIx: i32): boolean {
   false
 }
 
+// True if the `LetDecl`/global at `letIx` declares an `i64` binding. ANNOTATION-ONLY:
+// a bare integer literal stays i32 by design (Slice 1 keeps existing programs
+// byte-identical), so only an explicit `: i64` annotation selects the i64 slot
+// (valtype `0x7e`, kind 10). The initializer literal is then lowered as `i64.const`.
+function letIsI64(letIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if lt.tyName == "i64" { return true }
+      }
+    }
+  }
+  false
+}
+
 function emitProgram(rootIx: i32): i32 {
   emitFailed = false
   emitErr = ""
@@ -10354,7 +10643,9 @@ function emitProgram(rootIx: i32): i32 {
     // print family (imports shift every local function's wasm index, so this is
     // decided up front; a print-free program emits no import section at all).
     gImports = 0
+    gNeedsI64Print = false
     let pscan = 0
+    let sawI64Ann = false
     while pscan < P.nodes.length {
       let pn = P.nodes[pscan]
       if pn is Call {
@@ -10365,7 +10656,25 @@ function emitProgram(rootIx: i32): i32 {
           }
         }
       }
+      // Any `i64` type annotation anywhere flags the program as i64-using. Combined
+      // with `print`, it pulls in the `__print_i64__` import. (An over-approximation:
+      // a program with an i64 binding but no `print(<i64>)` would carry one unused
+      // import — harmless, and never the case for the existing byte-identical goldens,
+      // none of which name `i64`.)
+      if pn is TypeRef {
+        if pn.tyName == "i64" { sawI64Ann = true }
+      }
       pscan = pscan + 1
+    }
+    // When the program both prints (gImports > 0, i.e. == 4) and names an i64 type,
+    // add the 5th `__print_i64__` import. (Bumped from the proven `gImports > 0` form;
+    // a direct `gImports == 4` is avoided — the host bootstrap typechecker mishandles
+    // the literal comparison on this reassigned module global.)
+    if gImports > 0 {
+      if sawI64Ann {
+        gImports = gImports + 1
+        gNeedsI64Print = true
+      }
     }
     // Every function's parameters must be i32 or the struct type before we commit.
     let i = 0

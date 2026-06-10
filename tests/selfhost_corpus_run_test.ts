@@ -138,6 +138,7 @@ const WHITELIST = [
   "lists/struct-field-push.vl",
   "literals/binary.vl",
   "literals/octal.vl",
+  "literals/wide-hex.vl",
   "loops/continue.vl",
   "loops/for-in.vl",
   "loops/for-range-bound-named-step.vl",
@@ -518,6 +519,7 @@ entries.forEach((e, idx) => {
     const inst = await WebAssembly.instantiate(mod, {
       imports: {
         __print_i32__: (v: number) => got.push(String(v)),
+        __print_i64__: (v: bigint) => got.push(String(v)),
         __print_bool__: (v: number) => got.push(v ? "true" : "false"),
         __print_char__: (c: number) => chars.push(c),
         __print_str_flush__: () => {

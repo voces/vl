@@ -129,6 +129,7 @@ fn run_program(engine: &Engine, bytes: &[u8]) -> Result<()> {
     let mut linker = Linker::new(engine);
 
     linker.func_wrap("imports", "__print_i32__", |v: i32| println!("{v}"))?;
+    linker.func_wrap("imports", "__print_i64__", |v: i64| println!("{v}"))?;
     linker.func_wrap("imports", "__print_bool__", |v: i32| {
         println!("{}", if v != 0 { "true" } else { "false" })
     })?;
