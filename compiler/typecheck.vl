@@ -282,6 +282,133 @@ export function initChecker(): i32 {
 
 // ── scope chain ──────────────────────────────────────────────────────────────
 
+// ── flow narrowing (condition collectors) ────────────────────────────────────
+// The Ident name of a `x == null` / `x != null` / `null == x` comparison, "" else.
+function nullCmpName(condIx: i32): string {
+  let cond = P.nodes[condIx]
+  if cond is BinExpr {
+    let lhs = P.nodes[cond.binLeft]
+    let rhs = P.nodes[cond.binRight]
+    if rhs is NullLit {
+      if lhs is Ident { return lhs.identName }
+    }
+    if lhs is NullLit {
+      if rhs is Ident { return rhs.identName }
+    }
+  }
+  ""
+}
+
+// The non-null INNER type of the nullable binding `name`, or -1 (not nullable /
+// not bound).
+function nullableInnerOf(name: string): i32 {
+  let curTy = lookup(name)
+  if curTy >= 0 {
+    let ct = T.tys[curTy]
+    if ct is TyNullable { return ct.nInner }
+  }
+  0 - 1
+}
+
+// Collect the narrowings that hold when `cond` is TRUE into the parallel
+// `names`/`tys` arrays: `x != null` strips x's null, `x is T` pins x to T
+// (`is null` pins to the null type), `a && b` contributes BOTH conjuncts,
+// `!(e)` contributes e's FALSE narrowings, and parens recurse. Union-COMPLEMENT
+// narrowing (x is NOT T → drop T) stays out — tried and reverted (it made VL
+// miss real errors); null-stripping is the well-defined core.
+function collectThenNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
+  let cond = P.nodes[condIx]
+  if cond is Paren {
+    return collectThenNarrows(cond.parInner, names, tys)
+  }
+  if cond is Unary {
+    if cond.unOp == "!" { return collectElseNarrows(cond.unArg, names, tys) }
+    return 0
+  }
+  if cond is IsExpr {
+    let obj = P.nodes[cond.isObj]
+    if obj is Ident {
+      if cond.isVariant == "null" {
+        names.push(obj.identName)
+        tys.push(TY_NULL)
+      } else {
+        let tIdx = nameToTy(cond.isVariant)
+        if tIdx >= 0 {
+          names.push(obj.identName)
+          tys.push(tIdx)
+        }
+      }
+    }
+    return 0
+  }
+  if cond is BinExpr {
+    if cond.binOp == "&&" {
+      collectThenNarrows(cond.binLeft, names, tys)
+      collectThenNarrows(cond.binRight, names, tys)
+      return 0
+    }
+    if cond.binOp == "!=" {
+      let nm = nullCmpName(condIx)
+      if nm != "" {
+        let inner = nullableInnerOf(nm)
+        if inner >= 0 {
+          names.push(nm)
+          tys.push(inner)
+        }
+      }
+    }
+    return 0
+  }
+  0
+}
+
+// Collect the narrowings that hold when `cond` is FALSE: `x == null` strips the
+// null in the else-branch, `x is null` false means non-null, `a || b`
+// contributes BOTH disjuncts (De Morgan: neither held), `!(e)` contributes e's
+// TRUE narrowings, and parens recurse.
+function collectElseNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
+  let cond = P.nodes[condIx]
+  if cond is Paren {
+    return collectElseNarrows(cond.parInner, names, tys)
+  }
+  if cond is Unary {
+    if cond.unOp == "!" { return collectThenNarrows(cond.unArg, names, tys) }
+    return 0
+  }
+  if cond is IsExpr {
+    let obj = P.nodes[cond.isObj]
+    if obj is Ident {
+      if cond.isVariant == "null" {
+        let inner = nullableInnerOf(obj.identName)
+        if inner >= 0 {
+          names.push(obj.identName)
+          tys.push(inner)
+        }
+      }
+    }
+    return 0
+  }
+  if cond is BinExpr {
+    if cond.binOp == "||" {
+      collectElseNarrows(cond.binLeft, names, tys)
+      collectElseNarrows(cond.binRight, names, tys)
+      return 0
+    }
+    if cond.binOp == "==" {
+      let nm = nullCmpName(condIx)
+      if nm != "" {
+        let inner = nullableInnerOf(nm)
+        if inner >= 0 {
+          names.push(nm)
+          tys.push(inner)
+        }
+      }
+    }
+    return 0
+  }
+  0
+}
+
 // Enter a new lexical scope (push a fresh name→type map).
 function pushScope(): i32 {
   T.scopes.push(Map())
@@ -1541,6 +1668,36 @@ function checkNode(ix: i32): i32 {
   // ── binary ────────────────────────────────────────────────────────────────
   } else if n is BinExpr {
     let op = n.binOp
+    // `a && b` / `a || b`: the LEFT side's narrowings hold while CHECKING the
+    // right (`p != null && p.x > 0` checks `p.x` under a non-null `p`; for `||`
+    // the right is reached only when the left was FALSE, so its else-narrowings
+    // hold — `p == null || p.x > 0`).
+    if op == "&&" || op == "||" {
+      let clt = checkNode(n.binLeft)
+      let cnames: string[] = []
+      let ctys: i32[] = []
+      if op == "&&" {
+        collectThenNarrows(n.binLeft, cnames, ctys)
+      } else {
+        collectElseNarrows(n.binLeft, cnames, ctys)
+      }
+      let cpushed = 0
+      if cnames.length > 0 {
+        pushScope()
+        let cni = 0
+        while cni < cnames.length {
+          declare(cnames[cni], ctys[cni])
+          cni = cni + 1
+        }
+        cpushed = 1
+      }
+      let crt = checkNode(n.binRight)
+      if cpushed == 1 { popScope() }
+      if !assignable(clt, TY_BOOL) || !assignable(crt, TY_BOOL) {
+        tErr("operator '" + op + "' expects bool operands", ix)
+      }
+      return TY_BOOL
+    }
     let lt = checkNode(n.binLeft)
     let rt = checkNode(n.binRight)
     // Assignment: RHS must be assignable to the LHS's (already-bound) type.
@@ -1559,13 +1716,6 @@ function checkNode(ix: i32): i32 {
       // Assignment is an expression yielding its RIGHT-HAND SIDE (host parity;
       // DECISIONS: assignment-as-expression).
       return rt
-    }
-    // Logical connectives: both sides bool, result bool.
-    if op == "&&" || op == "||" {
-      if !assignable(lt, TY_BOOL) || !assignable(rt, TY_BOOL) {
-        tErr("operator '" + op + "' expects bool operands", ix)
-      }
-      return TY_BOOL
     }
     // Nullish coalescing: `a ?? d` strips `a`'s nullability; the default must be
     // assignable to the inner type. A non-nullable LHS just yields itself.
@@ -1916,79 +2066,45 @@ function checkNode(ix: i32): i32 {
     // Branch narrowing rides a pushed scope that shadows `x`. (Union-complement
     // narrowing after `is T` was tried and REVERTED — it made VL miss real errors;
     // null-stripping is the well-defined core and is what the corpus leans on.)
-    let narrowed = 0
-    let cond = P.nodes[n.ifCond]
-    if cond is IsExpr {
-      let obj = P.nodes[cond.isObj]
-      if obj is Ident {
-        let tIdx = nameToTy(cond.isVariant)
-        if tIdx >= 0 {
-          pushScope()
-          declare(obj.identName, tIdx)
-          narrowed = 1
-        }
-      }
-    }
-    // Null-comparison narrowing: `x == null` / `x != null` (either operand order)
-    // over an identifier whose current type is nullable.
-    let nullName = ""
-    let nullInner = -1
-    let nullIsEq = 0
-    if cond is BinExpr {
-      if cond.binOp == "==" || cond.binOp == "!=" {
-        let identName = ""
-        let lhs = P.nodes[cond.binLeft]
-        let rhs = P.nodes[cond.binRight]
-        if rhs is NullLit {
-          if lhs is Ident {
-            identName = lhs.identName
-          }
-        } else if lhs is NullLit {
-          if rhs is Ident {
-            identName = rhs.identName
-          }
-        }
-        if identName != "" {
-          let curTy = lookup(identName)
-          if curTy >= 0 {
-            let ct = T.tys[curTy]
-            if ct is TyNullable {
-              nullName = identName
-              nullInner = ct.nInner
-              if cond.binOp == "==" {
-                nullIsEq = 1
-              }
-            }
-          }
-        }
-      }
-    }
-    // THEN: `x != null` means x is non-null inside.
-    if nullName != "" && nullIsEq == 0 {
+    // The condition's TRUE narrowings hold in the THEN branch, its FALSE
+    // narrowings in the ELSE (and, for a diverging then — a guard clause — for
+    // the rest of the enclosing block). The collectors handle `is` / null
+    // compares / `&&`-`||` chains / `!(…)` / parens.
+    let tnNames: string[] = []
+    let tnTys: i32[] = []
+    collectThenNarrows(n.ifCond, tnNames, tnTys)
+    let enNames: string[] = []
+    let enTys: i32[] = []
+    collectElseNarrows(n.ifCond, enNames, enTys)
+    if tnNames.length > 0 {
       pushScope()
-      declare(nullName, nullInner)
-      narrowed = 1
+      let ti = 0
+      while ti < tnNames.length {
+        declare(tnNames[ti], tnTys[ti])
+        ti = ti + 1
+      }
     }
     checkNode(n.ifThen)
-    if narrowed == 1 {
+    if tnNames.length > 0 {
       popScope()
     }
-    // ELSE: `x == null` means x is non-null in the else branch.
     if n.ifElse >= 0 {
-      let elseNarrowed = 0
-      if nullName != "" && nullIsEq == 1 {
+      if enNames.length > 0 {
         pushScope()
-        declare(nullName, nullInner)
-        elseNarrowed = 1
+        let ei = 0
+        while ei < enNames.length {
+          declare(enNames[ei], enTys[ei])
+          ei = ei + 1
+        }
       }
       checkNode(n.ifElse)
-      if elseNarrowed == 1 {
+      if enNames.length > 0 {
         popScope()
       }
     }
-    // GUARD CLAUSE: `if x == null { …return/break/continue }` — x is non-null for
-    // the rest of the enclosing block.
-    if nullName != "" && nullIsEq == 1 {
+    // GUARD CLAUSE: a THEN that always exits applies the FALSE narrowings to
+    // the rest of the enclosing block (`if x == null { return } … x.f …`).
+    if enNames.length > 0 {
       let tn2 = P.nodes[n.ifThen]
       if tn2 is Block {
         let tst = tn2.blkStmts
@@ -2003,7 +2119,11 @@ function checkNode(ix: i32): i32 {
             diverges = true
           }
           if diverges {
-            declare(nullName, nullInner)
+            let gi2 = 0
+            while gi2 < enNames.length {
+              declare(enNames[gi2], enTys[gi2])
+              gi2 = gi2 + 1
+            }
           }
         }
       }

@@ -84,6 +84,7 @@ const runFixture = (): Promise<string[]> =>
       `  LetDecl,\n` +
       `  Member,\n` +
       `  NumLit,\n` +
+      `  NullLit,\n` +
       `  ObjLit,\n` +
       `  Param,\n` +
       `  Paren,\n` +
