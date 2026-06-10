@@ -125,3 +125,129 @@ jobs:
         if: steps.docs_check.outputs.docs_only != 'true'
         run: deno task build
         working-directory: lsp
+
+  # ---------------------------------------------------------------------------
+  # ci-native — gates the NATIVE self-hosting path (scripts/vl-host + the
+  # self-host compiler wasm), end to end with zero TS/deno in the compile+run
+  # loop past the seed. A SEPARATE, PARALLEL job: it never extends the `ci` job's
+  # critical path (the maintainer is duration-sensitive), and a slow cold cargo
+  # build here can't delay the deno suite's result.
+  #
+  # Steps: build the vl-host binary → build the seed compiler wasm → prove the
+  # native fixpoint (stage3 == stage4 byte-for-byte) → run the native corpus
+  # alignment suite (env-gated, drives the corpus through `vl`).
+  #
+  # Caching: ubuntu-latest ships cargo, so we only cache ~/.cargo + the cargo
+  # target dir (cold wasmtime build ~2-4 min, warm seconds — busted only when
+  # scripts/vl-host/Cargo.lock changes). The seed reuses the same rolling
+  # `vl-cache` as the `ci` job (the whole-compile blobs from buildCache.ts).
+  #
+  # Docs-only skip is mirrored from `ci` so a docs-only PR exits this job green
+  # too (keeping the stable job name satisfied for branch protection).
+  # ---------------------------------------------------------------------------
+  ci-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect docs-only change
+        id: docs_check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.event.after }}"
+          fi
+
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE="HEAD~1"
+          fi
+
+          NON_DOCS=$(git diff --name-only "$BASE" "$HEAD" \
+            | grep -Ev '^(docs/|.*\.md$)' || true)
+
+          if [ -z "$NON_DOCS" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "Docs-only change detected — heavy steps will be skipped."
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Non-docs files changed:"
+            echo "$NON_DOCS"
+          fi
+
+      - uses: denoland/setup-deno@v2
+        if: steps.docs_check.outputs.docs_only != 'true'
+        with:
+          deno-version: v2.x
+
+      # Node + node_modules: the SEED bootstrap (build-compiler-wasm.ts) runs the
+      # stage-0 (deno/toWasm.ts) toolchain, which needs binaryen from npm.
+      - uses: actions/setup-node@v5
+        if: steps.docs_check.outputs.docs_only != 'true'
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Cache Deno modules
+        if: steps.docs_check.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
+          restore-keys: |
+            deno-${{ runner.os }}-
+
+      # Reuse the same rolling VL build cache as the `ci` job so the seed compile
+      # restores master's whole-compile blobs (keyed internally; rolling key safe).
+      - name: Cache VL build cache
+        if: steps.docs_check.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vl-cache
+          key: vl-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            vl-cache-${{ runner.os }}-
+
+      # Cargo registry/index + the vl-host target dir. Cold wasmtime build is the
+      # only real cost here; warm restores drop it to seconds. Busted only when
+      # the vl-host lockfile moves.
+      - name: Cache cargo + vl-host target
+        if: steps.docs_check.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            scripts/vl-host/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('scripts/vl-host/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Install node deps
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: npm ci
+
+      - name: Build vl-host (native tool)
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: cargo build --release
+        working-directory: scripts/vl-host
+
+      - name: Build seed compiler wasm
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: deno run -A scripts/build-compiler-wasm.ts
+        env:
+          VL_CACHE_DIR: ${{ runner.temp }}/vl-cache
+
+      - name: Native fixpoint (stage3 == stage4)
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: ./scripts/native-fixpoint.sh
+
+      - name: Native corpus alignment suite
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: deno test -A --no-check tests/selfhost_native_align_test.ts
+        env:
+          SELFHOST_NATIVE_ALIGN: "1"
