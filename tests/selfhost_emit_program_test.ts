@@ -328,23 +328,23 @@ const CASES: Case[] = [
     },
   },
   {
-    name: "a non-i32 local init fails loudly, not with garbage bytes",
-    // A float local is neither i32 nor a supported ref type (string locals ARE now
-    // supported — see the STRINGS cases below — so the old `let s = "hi"` no longer
-    // fails; a float literal stays out of scope).
-    src: "function bad(): i32 {\n  let s = 3.14\n  return 0\n}\n",
-    check: (logs) => {
+    name: "a float local emits a valid f64 slot (Slice 3), not garbage bytes",
+    // A float local was historically out of scope (`let s = 3.14` rejected by
+    // `checkExprI32`). Slice 3 fixes f64 end-to-end: an un-annotated float-literal
+    // local now lowers to an f64 slot (valtype 0x7c) and the init to `f64.const`, so
+    // the module emits successfully and is a VALID wasm module (no garbage bytes).
+    src: "function ok(): i32 {\n  let s = 3.14\n  return 0\n}\n",
+    check: async (logs) => {
       const errLine = logs.find((l) => l.startsWith("err: "));
-      if (!errLine) {
+      if (errLine) {
         throw new Error(
-          `expected an \`err:\` line for the non-i32 local; got ${
-            JSON.stringify(logs)
-          }`,
+          `f64 local should now emit, but got an error: ${errLine}`,
         );
       }
-      if (!errLine.includes("i32 locals")) {
-        throw new Error(`unexpected emitter error message: ${errLine}`);
-      }
+      // Byte-validity: the emitted module must compile (a wrong f64.const encoding or
+      // a misthreaded valtype would make wasm validation reject it).
+      const bytes = bytesFromLog(logs);
+      await WebAssembly.compile(bytes);
     },
   },
   {
