@@ -8815,6 +8815,163 @@ function assignTags(): i32 {
   0
 }
 
+// ── inline union annotations (`v: A | B`) ─────────────────────────────────────
+// An INLINE union annotation parses to a `TypeRef` whose synthetic name is the
+// pipe-joined member list (`"A|B"`, mirroring the `i32[]` / `{[K]:V}` synthetic
+// names — see `parser.vl`'s `parseTypeName`). A NAMED alias `type N = A | B` is a
+// `UnionDecl` whose name `"N"` is registered in `unNames`; an inline annotation has
+// no such name, so none of the name-keyed union machinery (`isUName`, valtype
+// interning, narrowing) recognizes it. To make an inline `A | B` behave IDENTICALLY
+// to a named alias, we register the synthetic name itself as a union alias — the
+// same tables, the same heap-type interning, the same tags — so every downstream
+// lookup keyed on the type-name string just works.
+//
+// Append the member atoms of the synthetic union name `name` to `out`, split on its
+// TOP-LEVEL `|` separators (depth tracked so a nested `{…}` / `[…]` member is not
+// split inside). A bare name with no `|` appends one atom. The flat `out` accumulator
+// (vs returning a fresh `string[]`) keeps this off the self-host emitter's
+// empty-ref-array-literal return path.
+function splitUnionAtoms(name: string, out: string[]): i32 {
+  let cur = ""
+  let depth = 0
+  let i = 0
+  while i < name.length {
+    let c = name[i]
+    if c == '{' || c == '[' {
+      depth = depth + 1
+      cur = cur + fromCodePoint(c)
+    } else if c == '}' || c == ']' {
+      depth = depth - 1
+      cur = cur + fromCodePoint(c)
+    } else if depth == 0 && c == '|' {
+      out.push(cur)
+      cur = ""
+    } else {
+      cur = cur + fromCodePoint(c)
+    }
+    i = i + 1
+  }
+  out.push(cur)
+  0
+}
+
+// The number of TOP-LEVEL `|`-separated members in the synthetic name `name` (1 for a
+// bare name). Counts separators without materializing the atom strings.
+function unionMemberCount(name: string): i32 {
+  let n = 1
+  let depth = 0
+  let i = 0
+  while i < name.length {
+    let c = name[i]
+    if c == '{' || c == '[' { depth = depth + 1 }
+    else if c == '}' || c == ']' { depth = depth - 1 }
+    else if depth == 0 && c == '|' { n = n + 1 }
+    i = i + 1
+  }
+  n
+}
+
+// True if `name` is declared by a top-level struct `type X = {…}` (`TypeDecl`). Used
+// during `collectU` — BEFORE `collectS` runs — so it scans the arena directly rather
+// than reading the not-yet-populated `sNames` table.
+function isDeclaredStructName(stmts: i32[], name: string): boolean {
+  let i = 0
+  while i < stmts.length {
+    let s = P.nodes[stmts[i]]
+    if s is TypeDecl {
+      if s.tdName == name { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True if `name` is an inline STRUCT-VARIANT union annotation we can intern: two+
+// members, none `null`, every member a declared struct type. A primitive value union
+// (`i32 | string`) or a nullable (`S | null`) returns false — neither is a boxed
+// variant-struct union (the only union shape this slice's variant path lowers; the
+// named-alias path rejects them too).
+function isInlineStructUnion(stmts: i32[], name: string): boolean {
+  if unionMemberCount(name) < 2 { return false }
+  let atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let j = 0
+  while j < atoms.length {
+    if !isDeclaredStructName(stmts, atoms[j]) { return false }
+    j = j + 1
+  }
+  true
+}
+
+// Register the inline union synthetic name `name` (e.g. `"A|B"`) as a union alias in
+// the per-union tables, exactly as `collectU` registers a `UnionDecl`: record the
+// name + its variant-slice range, append each member to the GLOBAL `uVariants` list,
+// and collect each member's fields into the flat table. A no-op if `name` is already
+// a registered union (a named alias OR a previously-seen inline annotation), or if it
+// is not an inline struct-variant union. Returns 0, or -1 (via `emitFail`).
+function registerInlineUnion(stmts: i32[], name: string): i32 {
+  if isUName(name) { return 0 }
+  if !isInlineStructUnion(stmts, name) { return 0 }
+  let atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  uDeclared = true
+  unNames.push(name)
+  unVarStart.push(uVariants.length)
+  unVarCount.push(atoms.length)
+  let vi = 0
+  while vi < atoms.length {
+    uVariants.push(atoms[vi])
+    if collectVariantFields(stmts, atoms[vi]) < 0 { return 0 - 1 }
+    vi = vi + 1
+  }
+  0
+}
+
+// The synthetic type-name string of the annotation node at `tyIx` (a `TypeRef`), or
+// "" if `tyIx` is unset / not a type name. Lets the inline-union scan read a param /
+// return annotation's name without a `P.nodes[...] is TypeRef` round-trip at the call
+// site (this slice cannot narrow there).
+function tyNameOf(tyIx: i32): string {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef { return ty.tyName }
+  }
+  ""
+}
+
+// Scan every top-level FuncDecl's parameter + return annotations and every top-level
+// `let`/`const` annotation for INLINE union types, registering each as a synthetic
+// union alias (so it interns its variant shapes + heap types exactly like a named
+// alias). Must run AFTER the `UnionDecl` pass (so an inline name matching a named
+// alias is a no-op) and BEFORE `assignTags` (which ranks the FINAL `uVariants` set).
+// Returns 0, or -1 (via `emitFail`).
+function collectInlineUnions(stmts: i32[]): i32 {
+  let i = 0
+  while i < stmts.length {
+    let s = P.nodes[stmts[i]]
+    if s is FuncDecl {
+      // Read both annotation-bearing fields of the narrowed `s` BEFORE the inner loop
+      // introduces a `Param` narrowing (a fresh `is`-narrowing pins its own binding;
+      // reading `s.fnRet` after it would no longer see `s`'s FuncDecl narrowing).
+      let params = s.fnParams
+      let retTy = s.fnRet
+      if registerInlineUnion(stmts, tyNameOf(retTy)) < 0 { return 0 - 1 }
+      let pi = 0
+      while pi < params.length {
+        let p = P.nodes[params[pi]]
+        if p is Param {
+          if registerInlineUnion(stmts, tyNameOf(p.parType)) < 0 { return 0 - 1 }
+        }
+        pi = pi + 1
+      }
+    } else if s is LetDecl {
+      if registerInlineUnion(stmts, tyNameOf(s.letType)) < 0 { return 0 - 1 }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Scan the top-level statements for EVERY union alias `type N = A | B | …` (a
 // `UnionDecl`); for each, record its name + variant-slice range in the per-union table
 // (`unNames`/`unVarStart`/`unVarCount`), append its variant struct names to the GLOBAL
@@ -8853,6 +9010,12 @@ function collectU(stmts: i32[]): i32 {
     }
     i = i + 1
   }
+  // Inline union annotations (`v: A | B`) carry no `UnionDecl`; register each as a
+  // synthetic alias keyed on its pipe-joined name, so its variant shapes are interned
+  // and every name-keyed lookup treats it like a named alias. Runs after the
+  // `UnionDecl` pass (so a matching named alias makes the inline form a no-op) and
+  // before `assignTags` (which ranks the FINAL variant set).
+  if collectInlineUnions(stmts) < 0 { return 0 - 1 }
   if uDeclared {
     if assignTags() < 0 { return 0 - 1 }
   }
