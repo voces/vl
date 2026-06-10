@@ -700,6 +700,11 @@ function globalIsStringArray(name: string): boolean {
   if li < 0 { return false }
   letIsStringArray(li, 0 - 1)
 }
+function globalIsMap(name: string): boolean {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsMap(li, 0 - 1)
+}
 
 // Map each function NAME to its wasm function index (its position in `fnStmts`), and
 // record whether it returns the struct. Returns the function count.
@@ -753,6 +758,8 @@ function blockHasValuedReturn(blockIx: i32): boolean {
         if blockHasValuedReturn(st.whileBody) { return true }
       } else if st is ForRange {
         if blockHasValuedReturn(st.frBody) { return true }
+      } else if st is ForIn {
+        if blockHasValuedReturn(st.fiBody) { return true }
       }
       i = i + 1
     }
@@ -844,6 +851,9 @@ function firstValuedReturn(blockIx: i32): i32 {
         if r >= 0 { return r }
       } else if st is ForRange {
         let r = firstValuedReturn(st.frBody)
+        if r >= 0 { return r }
+      } else if st is ForIn {
+        let r = firstValuedReturn(st.fiBody)
         if r >= 0 { return r }
       }
       i = i + 1
@@ -1544,6 +1554,20 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
         scopeBind(s.frVar, fvSlot)
         addLocalName(s.frVar + "#b", 0, 0 - 1)
         if collectLocals(s.frBody, fnIx) < 0 { scopePop() return 0 - 1 }
+      } else if s is ForIn {
+        // A `for v in <list>` introduces THREE slots in pre-order: the element var
+        // (i32, or a string ref for a string-list / `.keys()` iterable), a hidden
+        // i32 cursor, and a hidden list temp holding the iterable (evaluated ONCE).
+        // The hidden names carry `#` so they can never collide with user identifiers.
+        let fiEk = forInElemKind(s.fiIter, fnIx)
+        if fiEk < 0 { scopePop() return emitFail("emitProgram: unsupported for-in iterable") }
+        let fiSlot = addLocalName(s.fiVar, fiEk, 0 - 1)
+        scopeBind(s.fiVar, fiSlot)
+        addLocalName(s.fiVar + "#i", 0, 0 - 1)
+        let fiLk = 2
+        if fiEk == 3 { fiLk = 7 }
+        addLocalName(s.fiVar + "#l", fiLk, 0 - 1)
+        if collectLocals(s.fiBody, fnIx) < 0 { scopePop() return 0 - 1 }
       }
       i = i + 1
     }
@@ -1599,6 +1623,16 @@ function checkLocalI32(letIx: i32): i32 {
   let d = P.nodes[letIx]
   if d is LetDecl {
     if d.letInit < 0 {
+      // An UNINITIALIZED `let x: T` (A-definite-assign) is legal for a SCALAR
+      // (i32/boolean) annotation: the checker guarantees write-before-read, and the
+      // wasm local's implicit zero-init covers the declaration. A ref-typed or
+      // un-annotated uninitialized local still fails (non-null refs have no default).
+      if d.letType >= 0 {
+        let ty = P.nodes[d.letType]
+        if ty is TypeRef {
+          if ty.tyName == "i32" || ty.tyName == "boolean" { return 0 }
+        }
+      }
       return emitFail("emitProgram: local declaration needs an initializer")
     }
     if d.letType >= 0 {
@@ -1780,6 +1814,9 @@ function blockHasMemberPopKind(blockIx: i32, fnIx: i32, kind: i32): boolean {
       } else if s is WhileStmt {
         if exprHasMemberPopKind(s.whileCond, fnIx, kind) { return true }
         if blockHasMemberPopKind(s.whileBody, fnIx, kind) { return true }
+      } else if s is ForIn {
+        if exprHasMemberPopKind(s.fiIter, fnIx, kind) { return true }
+        if blockHasMemberPopKind(s.fiBody, fnIx, kind) { return true }
       } else if s is ForRange {
         if exprHasMemberPopKind(s.frFrom, fnIx, kind) { return true }
         if exprHasMemberPopKind(s.frTo, fnIx, kind) { return true }
@@ -1826,6 +1863,8 @@ function blockHasPushKind(blockIx: i32, fnIx: i32, kind: i32): boolean {
         if blockHasPushKind(s.whileBody, fnIx, kind) { return true }
       } else if s is ForRange {
         if blockHasPushKind(s.frBody, fnIx, kind) { return true }
+      } else if s is ForIn {
+        if blockHasPushKind(s.fiBody, fnIx, kind) { return true }
       }
       i = i + 1
     }
@@ -1893,6 +1932,8 @@ function collectRefPushSlots(blockIx: i32, fnIx: i32): i32 {
         collectRefPushSlots(s.whileBody, fnIx)
       } else if s is ForRange {
         collectRefPushSlots(s.frBody, fnIx)
+      } else if s is ForIn {
+        collectRefPushSlots(s.fiBody, fnIx)
       }
       i = i + 1
     }
@@ -1978,6 +2019,9 @@ function collectMemberPopRefSlots(blockIx: i32, fnIx: i32): i32 {
       } else if s is WhileStmt {
         collectMemberPopRefSlotsExpr(s.whileCond, fnIx)
         collectMemberPopRefSlots(s.whileBody, fnIx)
+      } else if s is ForIn {
+        collectMemberPopRefSlotsExpr(s.fiIter, fnIx)
+        collectMemberPopRefSlots(s.fiBody, fnIx)
       } else if s is ForRange {
         collectMemberPopRefSlotsExpr(s.frFrom, fnIx)
         collectMemberPopRefSlotsExpr(s.frTo, fnIx)
@@ -2176,6 +2220,9 @@ function blockHasStrOp(blockIx: i32, fnIx: i32): boolean {
       } else if s is WhileStmt {
         if exprHasStrOp(s.whileCond, fnIx) { return true }
         if blockHasStrOp(s.whileBody, fnIx) { return true }
+      } else if s is ForIn {
+        if exprHasStrOp(s.fiIter, fnIx) { return true }
+        if blockHasStrOp(s.fiBody, fnIx) { return true }
       } else if s is ForRange {
         if exprHasStrOp(s.frFrom, fnIx) { return true }
         if exprHasStrOp(s.frTo, fnIx) { return true }
@@ -3426,6 +3473,12 @@ function emitMapResize(body: i32[]): i32 {
 // Ordering matters: `index[slot] = count+1` is written BEFORE the two pushes, because
 // `emitMapPushKey`/`emitMapPushVal` clobber the probe slot (slot 3) and cap (slot 4).
 function emitMapSet(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32): i32 {
+  // The vals list is the i32 list — a REF value (a string / struct / list) would
+  // store a ref into an i32 array (invalid wasm). Fail loudly until ref-valued
+  // maps land.
+  if exprString(valIx, fnIx) || exprStruct(valIx, fnIx) || exprArray(valIx, fnIx) || exprRefArray(valIx, fnIx) || exprStringArray(valIx, fnIx) {
+    return emitFail("emitProgram: map values must be i32 / boolean")
+  }
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
   pushMapScr(body, 5)        // entry
   fbIf(64)                   // if (entry != 0 → overwrite), void
@@ -4147,6 +4200,13 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       if exprArray(e.memObj, fnIx) || exprString(e.memObj, fnIx) || exprRefArray(e.memObj, fnIx) || exprStringArray(e.memObj, fnIx) {
         return emitArrLen(body, exprIx, fnIx)
       }
+      // G8: `m.length` on a MAP is the LIVE entry count — struct field 4 (`size`),
+      // maintained by set/delete (NOT `count`, which includes tombstones).
+      if exprMap(e.memObj, fnIx) {
+        if emitExpr(body, e.memObj, fnIx) < 0 { return 0 - 1 }
+        fbStructGet(mStructIdx, 4)  // 0xfb 0x02: field 4 `size`
+        return 0
+      }
     }
     return emitMem(body, exprIx, fnIx)
   }
@@ -4285,6 +4345,12 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
             return fRetBool[target] == 1
           }
         }
+      }
+    }
+    // G8: a map membership test `m.has(k)` yields a boolean (prints true/false).
+    if callee is Member {
+      if callee.memProp == "has" {
+        return exprMap(callee.memObj, fnIx)
       }
     }
   }
@@ -4894,6 +4960,52 @@ function restoreNarrow(n: i32): i32 {
   0
 }
 
+// The ELEMENT kind of a `for v in <iter>` iterable: `0` = i32 (an `i32[]` list, a
+// map `.values()`), `3` = string (a `string[]` list, a map `.keys()`), or -1 (an
+// unsupported iterable — the caller fails loudly). The map forms read the map's
+// insertion-ordered keys/vals lists directly (no delete exists in the op set yet,
+// so every entry is live).
+function forInElemKind(iterIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[iterIx]
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Member {
+      if exprMap(callee.memObj, fnIx) {
+        if callee.memProp == "keys" { return 3 }
+        if callee.memProp == "values" { return 0 }
+      }
+    }
+  }
+  if exprStringArray(iterIx, fnIx) { return 3 }
+  if exprArray(iterIx, fnIx) { return 0 }
+  0 - 1
+}
+
+// Push the LIST ref a `for v in <iter>` iterates: a map `.keys()`/`.values()`
+// reads the map struct's ordered list field (0 = keys, 1 = vals); any other
+// supported iterable is the list value itself.
+function emitForInList(body: i32[], iterIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[iterIx]
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Member {
+      if exprMap(callee.memObj, fnIx) {
+        if callee.memProp == "keys" {
+          if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+          fbStructGet(mStructIdx, 0)  // field 0: ordered keys list
+          return 0
+        }
+        if callee.memProp == "values" {
+          if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+          fbStructGet(mStructIdx, 1)  // field 1: ordered vals list
+          return 0
+        }
+      }
+    }
+  }
+  emitExpr(body, iterIx, fnIx)
+}
+
 // Lower a single statement at `stmtIx` onto `body`, resolving identifiers/params
 // against function `fnIx`. Returns 0, or -1 (via `emitFail`) on an unsupported shape.
 //
@@ -4926,7 +5038,11 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     }
     let idx = paramN + slot
     if s.letInit < 0 {
-      return emitFail("emitProgram: local declaration needs an initializer")
+      // UNINITIALIZED scalar local (validated by `checkLocalI32`): nothing to store
+      // — the wasm local's implicit zero-init covers the declaration; bind the name
+      // so later reads/writes resolve to this slot.
+      scopeBind(s.letName, slot)
+      return 0
     }
     // An empty `[]` initializer over a ref-array annotation (`let xs: T[] = []`) needs
     // the element kind to pick the ref-list construction — record it for `emitArr`.
@@ -4973,6 +5089,16 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
         if emitPop(body, stmtIx, fnIx) < 0 { return 0 - 1 }
         fbDrop()               // 0x1a drop
         return 0
+      }
+      // G8: a map `m.set(k, v)` STATEMENT is the method form of `m[k] = v` — the
+      // same scan/overwrite-or-append lowering.
+      if callee.memProp == "set" {
+        if exprMap(callee.memObj, fnIx) {
+          if s.callArgs.length != 2 {
+            return emitFail("emitProgram: map set takes exactly two arguments")
+          }
+          return emitMapSet(body, callee.memObj, s.callArgs[0], s.callArgs[1], fnIx)
+        }
       }
       return emitFail("emitProgram: unsupported member-call statement")
     }
@@ -5161,6 +5287,78 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     fbI32Const(stepK)
     fbI32Bin(106)            // 0x6a i32.add
     fbLocalSet(vIdx)
+    fbBr(0)                  // continue loop
+    fbEnd()                  // end loop
+    ctrlLeave()
+    loopContDepth.pop()
+    fbEnd()                  // end block
+    ctrlLeave()
+    loopBrkDepth.pop()
+    return 0
+  }
+  if s is ForIn {
+    // `for v in <list> { body }` — iterate an i32 list, a string list, or a map's
+    // ordered `.keys()`/`.values()` list. THREE cursor slots in collect pre-order:
+    // the element var `v` (i32, or a string ref), a hidden i32 cursor `v#i`, and a
+    // hidden list temp `v#l` (the iterable evaluates ONCE). Shape mirrors `while`:
+    // block/loop, exit on `cursor >= len`, element read per iteration, cursor++.
+    let ek = forInElemKind(s.fiIter, fnIx)
+    if ek < 0 {
+      return emitFail("emitProgram: unsupported for-in iterable")
+    }
+    let vSlot = emitLetCursor
+    emitLetCursor = emitLetCursor + 1
+    let iSlot = emitLetCursor
+    emitLetCursor = emitLetCursor + 1
+    let lSlot = emitLetCursor
+    emitLetCursor = emitLetCursor + 1
+    let paramN = 0
+    if fnIx >= 0 {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl { paramN = fn.fnParams.length }
+    }
+    let vIdx = paramN + vSlot
+    let iIdx = paramN + iSlot
+    let lIdx = paramN + lSlot
+    let wrapTy = lTypeIdx
+    let backTy = aTypeIdx
+    if ek == 3 {
+      wrapTy = mkListIdx
+      backTy = mkArrIdx
+    }
+    // list = <iter> (evaluated once); cursor = 0
+    if emitForInList(body, s.fiIter, fnIx) < 0 { return 0 - 1 }
+    fbLocalSet(lIdx)
+    fbI32Const(0)
+    fbLocalSet(iIdx)
+    scopeBind(s.fiVar, vSlot)
+    fbBlock(64)              // 0x02 block, void
+    ctrlEnter()
+    loopBrkDepth.push(ctrlDepth)
+    fbLoop(64)               // 0x03 loop, void
+    ctrlEnter()
+    loopContDepth.push(ctrlDepth)
+    // exit when cursor >= len (the list wrapper's field 1)
+    fbLocalGet(iIdx)
+    fbLocalGet(lIdx)
+    fbStructGet(wrapTy, 1)
+    fbI32Bin(78)             // 0x4e i32.ge_s
+    fbBrIf(1)                // 0x0d br_if -> break out of block
+    // v = backing[cursor] (a string element recovers its non-null ref)
+    fbLocalGet(lIdx)
+    fbStructGet(wrapTy, 0)
+    fbLocalGet(iIdx)
+    fbArrayGet(backTy)
+    if ek == 3 {
+      wU8(212)               // 0xd4 ref.as_non_null
+    }
+    fbLocalSet(vIdx)
+    if emitStmts(body, s.fiBody, fnIx) < 0 { return 0 - 1 }
+    // cursor = cursor + 1
+    fbLocalGet(iIdx)
+    fbI32Const(1)
+    fbI32Bin(106)            // 0x6a i32.add
+    fbLocalSet(iIdx)
     fbBr(0)                  // continue loop
     fbEnd()                  // end loop
     ctrlLeave()
@@ -6048,10 +6246,12 @@ function globalKind(initIx: i32): i32 {
     return 1
   }
   if e is ArrayLit {
-    // A ref-element array literal is a ref list (kind 5); an i32/empty literal is the
-    // i32 list (kind 2). A module-global empty `[]` over a ref type is out of scope
-    // (a global ref-list constexpr needs the binding annotation — deferred).
+    // A ref-element array literal is a ref list (kind 5); a STRING-element literal
+    // is the string list (kind 7); an i32/empty literal is the i32 list (kind 2). A
+    // module-global empty `[]` over a ref type is out of scope (a global ref-list
+    // constexpr needs the binding annotation — deferred).
     if arrLitIsRef(initIx) { return 5 }
+    if arrLitIsStr(initIx, 0 - 1) { return 7 }
     return 2
   }
   if e is StrLit { return 3 }
@@ -6062,6 +6262,7 @@ function globalKind(initIx: i32): i32 {
   // and the start function `global.set`s the computed value. An i32-producing
   // expression matches none of these and stays kind 0 — programs without ref-typed
   // global expressions emit byte-identical bytes.
+  if exprMap(initIx, 0 - 1) { return 6 }
   if exprString(initIx, 0 - 1) { return 3 }
   if exprStringArray(initIx, 0 - 1) { return 7 }
   if exprRefArray(initIx, 0 - 1) { return 5 }
@@ -6580,6 +6781,19 @@ function startFnDetectScratch(): i32 {
       if blockHasMapOp(st.frBody, 0 - 1) { fnUsesMap = true }
       collectRefPushSlots(st.frBody, 0 - 1)
       collectMemberPopRefSlots(st.frBody, 0 - 1)
+    } else if st is ForIn {
+      if blockHasPushKind(st.fiBody, 0 - 1, 0) { fnUsesPush = true }
+      if blockHasPushKind(st.fiBody, 0 - 1, 1) { fnUsesRefPush = true }
+      if blockHasPushKind(st.fiBody, 0 - 1, 2) { fnUsesStrPush = true }
+      if blockHasMemberPopKind(st.fiBody, 0 - 1, 0) { fnUsesPush = true }
+      if blockHasMemberPopKind(st.fiBody, 0 - 1, 1) { fnUsesRefPush = true }
+      if blockHasMemberPopKind(st.fiBody, 0 - 1, 2) { fnUsesStrPush = true }
+      if blockHasStrOp(st.fiBody, 0 - 1) { fnUsesStrOp = true }
+      if blockHasMapOp(st.fiBody, 0 - 1) { fnUsesMap = true }
+      if exprHasStrOp(st.fiIter, 0 - 1) { fnUsesStrOp = true }
+      if exprHasMapOp(st.fiIter, 0 - 1) { fnUsesMap = true }
+      collectRefPushSlots(st.fiBody, 0 - 1)
+      collectMemberPopRefSlots(st.fiBody, 0 - 1)
     } else if st is WhileStmt {
       if blockHasPushKind(st.whileBody, 0 - 1, 0) { fnUsesPush = true }
       if blockHasPushKind(st.whileBody, 0 - 1, 1) { fnUsesRefPush = true }
@@ -6637,6 +6851,16 @@ function collectStartLocals(): i32 {
       scopeBind(s.frVar, fvSlot)
       addLocalName(s.frVar + "#b", 0, 0 - 1)
       if collectLocals(s.frBody, 0 - 1) < 0 { scopePop() return 0 - 1 }
+    } else if s is ForIn {
+      let fiEk = forInElemKind(s.fiIter, 0 - 1)
+      if fiEk < 0 { scopePop() return emitFail("emitProgram: unsupported for-in iterable") }
+      let fiSlot = addLocalName(s.fiVar, fiEk, 0 - 1)
+      scopeBind(s.fiVar, fiSlot)
+      addLocalName(s.fiVar + "#i", 0, 0 - 1)
+      let fiLk = 2
+      if fiEk == 3 { fiLk = 7 }
+      addLocalName(s.fiVar + "#l", fiLk, 0 - 1)
+      if collectLocals(s.fiBody, 0 - 1) < 0 { scopePop() return 0 - 1 }
     } else if s is WhileStmt {
       if collectLocals(s.whileBody, 0 - 1) < 0 { scopePop() return 0 - 1 }
     } else if s is IfStmt {
@@ -6649,11 +6873,14 @@ function collectStartLocals(): i32 {
 }
 
 function emitStartFnCode(out: i32[]): i32 {
-  // Scratch detection + layout: declared locals come from the top-level statements
-  // (a `for`'s var/bound pair); the scratch frames follow them.
-  startFnDetectScratch()
+  // Locals FIRST, detection SECOND: the scratch detectors classify expressions
+  // through the declared-locals registry (`declaredString(k)` for a `print(k)` over
+  // a for-in string element), so the registry must be populated before they run —
+  // `declaredSlotOf` falls back to the flat `localNames` scan when no scope frame
+  // is active, exactly for detection passes. Then the frames follow the locals.
   let nStartLocals = collectStartLocals()
   if nStartLocals < 0 { return 0 - 1 }
+  startFnDetectScratch()
   fbBeginFunc(0, nStartLocals)
 
   let bodyExpr: i32[] = []
@@ -7372,6 +7599,11 @@ function collectA(stmts: i32[]): i32 {
         raUsed = true
         rElemKind = arrLitElemKind(i)
         rlInternName(arrLitElemName(i), arrLitElemKind(i))
+      } else if arrLitIsStr(i, 0 - 1) {
+        // A STRING-element literal is a string-ref list — the same wrapper/backing
+        // a `string[]` annotation forces.
+        slUsed = true
+        aUsed = true
       } else {
         lUsed = true
         aUsed = true
@@ -7385,6 +7617,13 @@ function collectA(stmts: i32[]): i32 {
       let cf = P.nodes[nd.callFn]
       if cf is Ident {
         if cf.identName == "fromCodePoint" {
+          aUsed = true
+        }
+        // An un-annotated `Map()` (usage-inferred binding) still constructs the map
+        // struct — force the same types a `{[string]: i32}` annotation does.
+        if cf.identName == "Map" {
+          mUsed = true
+          lUsed = true
           aUsed = true
         }
       }
@@ -8761,7 +9000,8 @@ function exprMap(exprIx: i32, fnIx: i32): boolean {
   }
   if e is Ident {
     if paramMap(fnIx, e.identName) { return true }
-    return declaredMap(e.identName)
+    if declaredMap(e.identName) { return true }
+    return globalIsMap(e.identName)
   }
   // `scopes[i]` over a MAP ref list (`{[string]:i32}[]`, element kind 3) yields a Map ref
   // — so map member/index ops on it route to the existing map lowering. Per-slot: the
@@ -8894,6 +9134,9 @@ function blockHasMapOp(blockIx: i32, fnIx: i32): boolean {
       } else if s is WhileStmt {
         if exprHasMapOp(s.whileCond, fnIx) { return true }
         if blockHasMapOp(s.whileBody, fnIx) { return true }
+      } else if s is ForIn {
+        if exprHasMapOp(s.fiIter, fnIx) { return true }
+        if blockHasMapOp(s.fiBody, fnIx) { return true }
       } else if s is ForRange {
         if exprHasMapOp(s.frFrom, fnIx) { return true }
         if exprHasMapOp(s.frTo, fnIx) { return true }
@@ -9034,6 +9277,12 @@ function exprString(exprIx: i32, fnIx: i32): boolean {
     if paramString(fnIx, e.identName) { return true }
     if declaredString(e.identName) { return true }
     return globalIsString(e.identName)
+  }
+  // An index read over a STRING list (`names[i]`, a `string[]` element) yields a
+  // string ref. (An index over an i32 list or a string `s[i]` yields an i32 — the
+  // string-array check is the only string-producing index form.)
+  if e is Index {
+    if exprStringArray(e.idxArr, fnIx) { return true }
   }
   // A field read `p.f` where `f` is a STRING struct field yields a string ref (gap #2:
   // `let k = t.kind` must give `k` the string type, not i32).
