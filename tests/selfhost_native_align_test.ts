@@ -160,6 +160,7 @@ const RUN_CASES = [
   "maps/many-keys.vl",
   "objects/struct.vl",
   "objects/trailing-comma.vl",
+  "operators/unary.vl",
   "soundness/boolean-narrowing-if-sound.vl",
   "soundness/equality-boolean-sound.vl",
   "soundness/equality-nullness-sound.vl",
