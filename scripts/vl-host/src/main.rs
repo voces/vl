@@ -38,9 +38,10 @@ fn gc_engine(collector: Collector) -> Result<Engine> {
 
 /// Drive the self-hosted compiler module: feed `source` in, call `entry`
 /// (`compileSrc` for the full pipeline, `checkSrc` for parse + typecheck only),
-/// and return the emitted wasm bytes (empty for a check), or the compiler's own
-/// diagnostics as the error.
-fn compile_vl(engine: &Engine, compiler_path: &str, source: &str, entry: &str) -> Result<Vec<u8>> {
+/// optionally enabling the `name` custom section (`emit_names`), and return the
+/// emitted wasm bytes (empty for a check), or the compiler's own diagnostics as
+/// the error.
+fn compile_vl(engine: &Engine, compiler_path: &str, source: &str, entry: &str, emit_names: bool) -> Result<Vec<u8>> {
     // A `.cwasm` SIDECAR caches the Cranelift compilation of the compiler module
     // (the dominant fixed cost of every invocation). Keyed by freshness: rebuilt
     // whenever the `.wasm` is newer. `deserialize_file` is unsafe because a
@@ -79,6 +80,16 @@ fn compile_vl(engine: &Engine, compiler_path: &str, source: &str, entry: &str) -
     let rat = inst.get_typed_func::<i32, i32>(&mut store, "rbyteAt")?;
     let dlen = inst.get_typed_func::<(), i32>(&mut store, "diagLen")?;
     let dat = inst.get_typed_func::<i32, i32>(&mut store, "diagAt")?;
+
+    // Opt into the wasm "name" custom section so trap backtraces name functions.
+    // The export is OFF by default (the compiler leaves goldens byte-identical);
+    // we flip it on only here, for the native tool's build/run paths. The export
+    // is absent from older compiler modules, so treat a missing symbol as a no-op.
+    if emit_names {
+        if let Ok(set_names) = inst.get_typed_func::<i32, i32>(&mut store, "setEmitNames") {
+            set_names.call(&mut store, 1)?;
+        }
+    }
 
     src_reset.call(&mut store, ())?;
     for ch in source.chars() {
@@ -205,7 +216,9 @@ fn main() -> Result<()> {
             let out = flag("-o").unwrap_or_else(|| {
                 input.strip_suffix(".vl").unwrap_or(input).to_string() + ".wasm"
             });
-            let bytes = compile_vl(&compile_engine, &compiler, &read_source()?, "compileSrc")?;
+            // `--names` embeds a wasm "name" custom section (legible trap backtraces).
+            let names = args.iter().any(|a| a == "--names");
+            let bytes = compile_vl(&compile_engine, &compiler, &read_source()?, "compileSrc", names)?;
             std::fs::write(&out, &bytes)?;
             // `-O`: optimize the written module in place (wasm-opt, when present).
             if args.iter().any(|a| a == "-O") {
@@ -218,8 +231,9 @@ fn main() -> Result<()> {
             // `check` is parse + typecheck only (the `checkSrc` entrypoint) — NOT a
             // full compile. Emit is `vl build`'s job; running it here would only be
             // slower and would reject type-valid programs the emitter can't yet
-            // lower. Diagnostics surface through compile_vl's error path.
-            compile_vl(&compile_engine, &compiler, &read_source()?, "checkSrc")?;
+            // lower. Diagnostics surface through compile_vl's error path. (No names:
+            // check emits nothing.)
+            compile_vl(&compile_engine, &compiler, &read_source()?, "checkSrc", false)?;
             println!("ok");
         }
         "run" => {
@@ -234,7 +248,8 @@ fn main() -> Result<()> {
             } else {
                 let source = String::from_utf8(raw)
                     .map_err(|e| Error::from(e).context(format!("`{input}` is neither UTF-8 VL source nor a wasm module")))?;
-                compile_vl(&compile_engine, &compiler, &source, "compileSrc")?
+                // `vl run` always embeds names so a trap backtrace is legible.
+                compile_vl(&compile_engine, &compiler, &source, "compileSrc", true)?
             };
             let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
             run_program(&run_engine, &bytes)?;
