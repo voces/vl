@@ -1228,6 +1228,11 @@ function globalIsMap(name: string): boolean {
   if li < 0 { return false }
   letIsMap(li, 0 - 1)
 }
+function globalIsF64Array(name: string): boolean {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsF64Array(li, 0 - 1)
+}
 function globalIsNulRef(name: string): boolean {
   let li = globalLetOf(name)
   if li < 0 { return false }
@@ -1993,6 +1998,21 @@ let mStructIdx: i32 = 0
 // thus need no new heap type; they share `mkArrIdx`/`mkListIdx`.
 let slUsed: boolean = false
 
+// ── f64-element array table (Slice 4: `f64[]`) ────────────────────────────────
+// A distinct WasmGC array heap type `(array (mut f64))` + its growable-list wrapper
+// `{ backing: (ref $fa64TypeIdx), len: i32, cap: i32 }`, interned AFTER every existing
+// type so no existing heap-type index shifts (the byte-identical-golden invariant: an
+// i32-only program never sets `fa64Used`, so these slots are never allocated/emitted).
+// Modeled on the i32-list pair (`aTypeIdx`/`lTypeIdx`) but with an f64 element store —
+// element reads/writes yield/consume an f64 directly, and the push grow-quad's value +
+// backing scratch locals are f64-typed. `fa64Used` is a presence flag set by `collectA`
+// (an `f64[]` annotation or a float-element array literal); `fa64TypeIdx`/`fl64TypeIdx`
+// are the resolved heap-type indices, computed in `emitModule`. Local/global cells of an
+// f64 list carry kind `12` (the f64-list wrapper ref) in the local/global kind registry.
+let fa64Used: boolean = false
+let fa64TypeIdx: i32 = 0
+let fl64TypeIdx: i32 = 0
+
 // The kind an EMPTY `[]` literal constructs, set by the binding site (a `let`/global
 // whose declared type is a ref array `S[]`/`N[]`) just before its initializer is
 // lowered: `0` = i32 list (the default), `1` = struct-ref list, `2` = union-ref list.
@@ -2179,6 +2199,10 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
           slot = addLocalName(s.letName, 9, nulRefStructIdxOfLet(stmts[i], fnIx))
         } else if letIsStringArray(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 7, 0 - 1)
+        } else if letIsF64Array(stmts[i], fnIx) {
+          // Scalar-f64-element list local (`let xs: f64[] = …` / a float-literal array
+          // init), kind 12 — its cell is `(ref $fl64TypeIdx)`. (Slice 4.)
+          slot = addLocalName(s.letName, 12, 0 - 1)
         } else if letIsRefArray(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 5, letRefListSlot(stmts[i], fnIx))
         } else if letIsUnion(stmts[i], fnIx) {
@@ -3671,9 +3695,33 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
     // refs) wrapped in the string-list wrapper (`mkListIdx`). Checked before the i32/ref
     // paths since a string element is neither i32 nor a struct/union ref.
     let isStrLit = arrLitIsStr(arrIx, fnIx)
+    // An f64-element literal — float ELEMENTS, OR an empty `[]` whose binding is an
+    // `f64[]` (`pendingListKind == 4`). Its backing is `(array (mut f64))` (Slice 4).
+    let isF64Lit = arrLitIsF64(arrIx, fnIx)
     if elems.length == 0 {
       if pendingListKind == 3 { isStrLit = true }
+      else if pendingListKind == 4 { isF64Lit = true }
       else { if pendingListKind != 0 { isRefLit = true } }
+    }
+    if isF64Lit {
+      if !fa64Used {
+        return emitFail("emitProgram: f64 array literal but f64 list type not collected")
+      }
+      let i = 0
+      while i < elems.length {
+        if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
+          return emitFail("emitProgram: nested arrays are not supported")
+        }
+        // Each element is lowered as an f64 (a float literal → `f64.const`; an i32
+        // operand widened via `f64.convert_i32_s`) so the backing's element type matches.
+        if emitExprAsF64(body, elems[i], fnIx) < 0 { return 0 - 1 }
+        i = i + 1
+      }
+      fbArrayNewFixed(fa64TypeIdx, elems.length)  // 0xfb 0x08; builds the f64 backing
+      fbI32Const(elems.length) // 0x41 i32.const (len)
+      fbI32Const(elems.length) // 0x41 i32.const (cap)
+      fbStructNew(fl64TypeIdx) // 0xfb 0x00 <f64-list wrapper struct type index>
+      return 0
     }
     if isStrLit {
       if !slUsed {
@@ -4490,6 +4538,19 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32): i32 {
       wU8(212)               // 0xd4 ref.as_non_null (recover the non-null string)
       return 0
     }
+    // An f64 list `xs[i]` → unwrap to its `(array (mut f64))` backing, `array.get
+    // $fa64TypeIdx` — yielding an f64 directly. (Slice 4; before the i32 path since an
+    // f64 element is not an i32.)
+    if exprF64Array(nd.idxArr, fnIx) {
+      if !fa64Used {
+        return emitFail("emitProgram: f64 index access but f64 array type not collected")
+      }
+      if emitExpr(body, nd.idxArr, fnIx) < 0 { return 0 - 1 }
+      fbStructGet(fl64TypeIdx, 0)  // 0xfb 0x02 <f64-list wrapper> field 0: backing
+      if emitExpr(body, nd.idxIndex, fnIx) < 0 { return 0 - 1 }
+      fbArrayGet(fa64TypeIdx)      // 0xfb 0x0b <f64 backing array type index> — yields f64
+      return 0
+    }
     if !aUsed {
       return emitFail("emitProgram: index access but array type not collected")
     }
@@ -4529,6 +4590,13 @@ function emitArrLen(body: i32[], memIx: i32, fnIx: i32): i32 {
     if exprStringArray(m.memObj, fnIx) {
       if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
       fbStructGet(mkListIdx, 1)  // 0xfb 0x02 <string-list wrapper> field 1: len
+      return 0
+    }
+    // An f64 list's `.length` is its wrapper's `len` field (`struct.get $fl64TypeIdx 1`),
+    // an i32 — same as the i32 list, over the f64 wrapper. (Slice 4.)
+    if exprF64Array(m.memObj, fnIx) {
+      if emitExpr(body, m.memObj, fnIx) < 0 { return 0 - 1 }
+      fbStructGet(fl64TypeIdx, 1)  // 0xfb 0x02 <f64-list wrapper> field 1: len
       return 0
     }
     let isList = exprArray(m.memObj, fnIx)
@@ -5490,6 +5558,9 @@ function exprIsF64(exprIx: i32, fnIx: i32): boolean {
   let e = P.nodes[exprIx]
   if e is NumLit { return numTextIsFloat(e.numText) }
   if e is Paren { return exprIsF64(e.parInner, fnIx) }
+  // An index read into an `f64[]` yields an f64 element (Slice 4) — so it routes to
+  // `__print_f64__` and participates in f64 arithmetic.
+  if e is Index { return exprF64Array(e.idxArr, fnIx) }
   if e is Ident {
     if paramIsF64(fnIx, e.identName) { return true }
     if declaredF64(e.identName) { return true }
@@ -7703,6 +7774,7 @@ function retBoolFlag(tyIx: i32): i32 {
 function vtKindOfType(tyIx: i32): i32 {
   if retNulRefFlag(tyIx) == 1 { return 9 }
   if retStrArrFlag(tyIx) == 1 { return 7 }
+  if retF64ArrFlag(tyIx) == 1 { return 12 }
   if retRefArrFlag(tyIx) == 1 { return 5 }
   if retUnionFlag(tyIx) == 1 { return 4 }
   if retVariantFlag(tyIx) == 1 { return 8 }
@@ -7711,6 +7783,20 @@ function vtKindOfType(tyIx: i32): i32 {
   if retStrFlag(tyIx) == 1 { return 3 }
   if retI64Flag(tyIx) == 1 { return 10 }
   if retF64Flag(tyIx) == 1 { return 11 }
+  0
+}
+
+// `1` if the type-annotation node at `tyIx` is an `f64[]` (the f64-element list), else
+// `0`. Feeds the `kind == 12` (f64-list wrapper) branch of `fbValtype`/`pushVT`. Checked
+// BEFORE the `retRefArrFlag`/`retArrFlag` cases since `f64[]` is an `[]` array name but
+// is neither a struct/union ref list nor the i32 list. (Slice 4.)
+function retF64ArrFlag(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if nameIsF64Array(ty.tyName) { return 1 }
+    }
+  }
   0
 }
 
@@ -7838,11 +7924,13 @@ function globalKind(initIx: i32): i32 {
   }
   if e is ArrayLit {
     // A ref-element array literal is a ref list (kind 5); a STRING-element literal
-    // is the string list (kind 7); an i32/empty literal is the i32 list (kind 2). A
-    // module-global empty `[]` over a ref type is out of scope (a global ref-list
-    // constexpr needs the binding annotation — deferred).
+    // is the string list (kind 7); an f64-element literal is the f64 list (kind 12,
+    // Slice 4); an i32/empty literal is the i32 list (kind 2). A module-global empty
+    // `[]` over a ref type is out of scope (a global ref-list constexpr needs the
+    // binding annotation — deferred).
     if arrLitIsRef(initIx) { return 5 }
     if arrLitIsStr(initIx, 0 - 1) { return 7 }
+    if arrLitIsF64(initIx, 0 - 1) { return 12 }
     return 2
   }
   if e is StrLit { return 3 }
@@ -7957,6 +8045,7 @@ function globalCellKind(letIx: i32): i32 {
       if letIsMap(letIx, 0 - 1) { return 6 }
       if letIsStringArray(letIx, 0 - 1) { return 7 }
       if letIsRefArray(letIx, 0 - 1) { return 5 }
+      if letIsF64Array(letIx, 0 - 1) { return 12 }
       if letIsStruct(letIx, 0 - 1) { return 1 }
       if letIsArray(letIx, 0 - 1) { return 2 }
       if letIsString(letIx, 0 - 1) { return 3 }
@@ -8060,6 +8149,9 @@ function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
     wU8(126)                   // 0x7e i64 (scalar, never a nullable ref)
   } else if kind == 11 {
     wU8(124)                   // 0x7c f64 (scalar, never a nullable ref)
+  } else if kind == 12 {
+    wU8(99)
+    wSLEB(fl64TypeIdx)         // the f64-list wrapper struct heap-type index (Slice 4)
   } else {
     wU8(127)                   // 0x7f i32
   }
@@ -8139,6 +8231,9 @@ function fbValtype(kind: i32, structIdx: i32): i32 {
     wU8(126)             // 0x7e i64 (Slice 1: scalar i64 local/param/global/result)
   } else if kind == 11 {
     wU8(124)             // 0x7c f64 (Slice 3: scalar f64 local/param/global/result)
+  } else if kind == 12 {
+    wU8(100)
+    wSLEB(fl64TypeIdx)   // the f64-list wrapper struct heap-type index (Slice 4)
   } else {
     wU8(127)             // 0x7f i32
   }
@@ -8302,11 +8397,30 @@ function mAssignTypeIndices(n: i32): i32 {
   } else {
     mStructIdx = oldMStructIdx
   }
+  // The f64 array + list-wrapper pair (Slice 4), interned LAST among the heap types so no
+  // existing index shifts. The `(array (mut f64))` backing first, then its `{backing,len,
+  // cap}` wrapper struct (which references the backing). Present only when `fa64Used`.
+  let oldFa64Idx = preMap + strListOffsetOf() + mapStructOffsetOf()
+  if fa64Used {
+    fa64TypeIdx = mAllocType()
+    fl64TypeIdx = mAllocType()
+    if mAssertIdx(fa64TypeIdx, oldFa64Idx, "fa64TypeIdx") < 0 { return 0 - 1 }
+    if mAssertIdx(fl64TypeIdx, oldFa64Idx + 1, "fl64TypeIdx") < 0 { return 0 - 1 }
+  } else {
+    fa64TypeIdx = oldFa64Idx
+    fl64TypeIdx = oldFa64Idx + 1
+  }
   // The functypes follow; the first lands at the current counter (`typeOffset`).
   let typeOffset = mNextType
-  let oldTypeOffset = preMap + strListOffsetOf() + mapStructOffsetOf()
+  let oldTypeOffset = preMap + strListOffsetOf() + mapStructOffsetOf() + f64ListOffsetOf()
   if mAssertIdx(typeOffset, oldTypeOffset, "typeOffset") < 0 { return 0 - 1 }
   typeOffset
+}
+
+// The f64-list type count (backing + wrapper): 2 when present, else 0.
+function f64ListOffsetOf(): i32 {
+  if fa64Used { return 2 }
+  0
 }
 
 // The string-list type count (keys backing + wrapper): 2 when present, else 0.
@@ -8857,6 +8971,24 @@ function emitModule(stmts: i32[]): i32 {
     wU8(127)                     // field 4 size: 0x7f i32
     wU8(1)                       // mutable
   }
+  if fa64Used {
+    // The f64 array `(array (mut f64))` (Slice 4): `0x5e` array form, `0x7c` f64
+    // storagetype, `0x01` mutable — the f64 analogue of the `5e 7f 01` i32 array.
+    wU8(94)                      // 0x5e array
+    wU8(124)                     // 0x7c f64 storagetype
+    wU8(1)                       // mutable
+    // The f64-list wrapper `{ backing: (ref $fa64TypeIdx), len: i32, cap: i32 }` — the
+    // same `{backing,len,cap}` triple as the i32 list, over the f64 backing.
+    wU8(95)                      // 0x5f struct
+    wU8(3)                       // 3 fields
+    wU8(100)                     // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(fa64TypeIdx)           // ...to the f64 array heap type
+    wU8(1)                       // mutable
+    wU8(127)                     // field 1 len: 0x7f i32
+    wU8(1)                       // mutable
+    wU8(127)                     // field 2 cap: 0x7f i32
+    wU8(1)                       // mutable
+  }
   // The functype param/result valtypes (`fbValtype`) stream to `curBuf == typePayload`,
   // interleaved identically with the surrounding raw framing bytes (the `wTarget` bind
   // covering this whole payload build was established above).
@@ -9281,6 +9413,14 @@ function nameIsStringArray(name: string): boolean {
   name == "string[]"
 }
 
+// True if the type-name `name` is exactly `f64[]` — a growable list whose elements are
+// scalar f64 (Slice 4). Its backing is `(array (mut f64))` (`fa64TypeIdx`); its wrapper
+// is the `{backing,len,cap}` triple over that f64 backing (`fl64TypeIdx`). Distinct from
+// `i32[]` so element reads/writes use the f64 element store.
+function nameIsF64Array(name: string): boolean {
+  name == "f64[]"
+}
+
 // The per-field wasm-type code for a struct / union-variant field whose type node is
 // `tyIx` (a `TypeRef`). Mirrors the inline classifier `collectS`/`collectVariantFields`
 // used to use, EXTENDED with array-typed fields (gap #5): a field of array type stores a
@@ -9359,6 +9499,7 @@ function collectA(stmts: i32[]): i32 {
   rlElemKindTbl = []
   mUsed = false
   slUsed = false
+  fa64Used = false
   let i = 0
   while i < P.nodes.length {
     let nd = P.nodes[i]
@@ -9378,6 +9519,10 @@ function collectA(stmts: i32[]): i32 {
         // a `string[]` annotation forces.
         slUsed = true
         aUsed = true
+      } else if arrLitIsF64(i, 0 - 1) {
+        // An f64-element literal is an f64 list — its own `(array (mut f64))` backing +
+        // wrapper. Does NOT force `aUsed`/`lUsed` (those are the i32 array/list). (Slice 4.)
+        fa64Used = true
       } else {
         lUsed = true
         aUsed = true
@@ -9438,6 +9583,10 @@ function collectA(stmts: i32[]): i32 {
           lUsed = true
           aUsed = true
         }
+      } else if nameIsF64Array(nd.tyName) {
+        // An `f64[]` annotation forces the f64 array + wrapper pair (Slice 4) — its own
+        // `(array (mut f64))` backing, independent of the i32 array/list.
+        fa64Used = true
       } else if nameIsArray(nd.tyName) {
         if checkArrName(nd.tyName) < 0 { return 0 - 1 }
         // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
@@ -9475,6 +9624,19 @@ function arrLitIsStr(arrIx: i32, fnIx: i32): boolean {
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
     return exprString(a.arrElems[0], fnIx)
+  }
+  false
+}
+
+// True if the array literal at `arrIx` has f64 ELEMENTS — its first element is an
+// f64-typed expression (a `.` float literal, or an f64-returning expression). An empty
+// literal is NOT detectable here; its kind comes from the binding annotation
+// (`pendingListKind == 4`). (Slice 4.)
+function arrLitIsF64(arrIx: i32, fnIx: i32): boolean {
+  let a = P.nodes[arrIx]
+  if a is ArrayLit {
+    if a.arrElems.length < 1 { return false }
+    return exprIsF64(a.arrElems[0], fnIx)
   }
   false
 }
@@ -10903,6 +11065,75 @@ function letIsStringArray(letIx: i32, fnIx: i32): boolean {
       }
     }
     return exprStringArray(d.letInit, fnIx)
+  }
+  false
+}
+
+// ── f64-array-typedness of expressions (Slice 4) ──────────────────────────────
+// Parallel to the i32/string-array families: decide whether an expression / param /
+// local PRODUCES an `f64[]` list — a `(ref $fl64TypeIdx)`. Drives the index-read
+// dispatch (an f64-array `xs[i]` yields an f64 from `array.get $fa64TypeIdx`) and the
+// f64-list local/global cell kind (`12`). `localIsRef` code `12` flags an f64-list local.
+
+// True if the parameter `name` of function `fnIx` is an `f64[]` type.
+function paramF64Array(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef { return nameIsF64Array(ty.tyName) }
+          }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the already-collected declared local `name` is an f64-list ref (code `12`).
+function declaredF64Array(name: string): boolean {
+  let slot = declaredSlotOf(name)
+  if slot < 0 { return false }
+  localIsRef[slot] == 12
+}
+
+// True if evaluating the expression at `exprIx` yields an f64 list: an f64-element
+// array literal, an f64-array param/local reference, or a parenthesized one.
+function exprF64Array(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is ArrayLit { return arrLitIsF64(exprIx, fnIx) }
+  if e is Paren { return exprF64Array(e.parInner, fnIx) }
+  if e is Ident {
+    if paramF64Array(fnIx, e.identName) { return true }
+    if declaredF64Array(e.identName) { return true }
+    return globalIsF64Array(e.identName)
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` declares an `f64[]` local: its annotation is `f64[]`,
+// OR its initializer produces an f64 list. Picks the local's valtype (`(ref $fl64TypeIdx)`)
+// and the code-`12` flag in `collectLocals`.
+function letIsF64Array(letIx: i32, fnIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if nameIsF64Array(lt.tyName) { return true }
+      }
+    }
+    return exprF64Array(d.letInit, fnIx)
   }
   false
 }
