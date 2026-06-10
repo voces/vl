@@ -1684,12 +1684,23 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
         // The hidden names carry `#` so they can never collide with user identifiers.
         let fiEk = forInElemKind(s.fiIter, fnIx)
         if fiEk < 0 { scopePop() return emitFail("emitProgram: unsupported for-in iterable") }
-        let fiSlot = addLocalName(s.fiVar, fiEk, 0 - 1)
+        // A struct element (`S[]`, code 1) binds the loop var as a struct local
+        // carrying the element struct table index; the `#l` temp holds the ref-list
+        // WRAPPER (code 5 + the ref-list slot). i32/string elements keep their slots.
+        let fiVarIdx = 0 - 1
+        let fiLk = 2
+        if fiEk == 1 {
+          fiVarIdx = forInRefArrayStructIdx(s.fiIter, fnIx)
+          fiLk = 5
+        } else if fiEk == 3 {
+          fiLk = 7
+        }
+        let fiSlot = addLocalName(s.fiVar, fiEk, fiVarIdx)
         scopeBind(s.fiVar, fiSlot)
         addLocalName(s.fiVar + "#i", 0, 0 - 1)
-        let fiLk = 2
-        if fiEk == 3 { fiLk = 7 }
-        addLocalName(s.fiVar + "#l", fiLk, 0 - 1)
+        let fiLs = 0 - 1
+        if fiEk == 1 { fiLs = refListSlotOfExpr(s.fiIter, fnIx) }
+        addLocalName(s.fiVar + "#l", fiLk, fiLs)
         if collectLocals(s.fiBody, fnIx) < 0 { scopePop() return 0 - 1 }
       }
       i = i + 1
@@ -5384,10 +5395,12 @@ function restoreNarrow(n: i32): i32 {
 }
 
 // The ELEMENT kind of a `for v in <iter>` iterable: `0` = i32 (an `i32[]` list, a
-// map `.values()`), `3` = string (a `string[]` list, a map `.keys()`), or -1 (an
-// unsupported iterable — the caller fails loudly). The map forms read the map's
-// insertion-ordered keys/vals lists directly (no delete exists in the op set yet,
-// so every entry is live).
+// map `.values()`), `3` = string (a `string[]` list, a map `.keys()`), `1` = struct
+// (a `S[]` ref list whose element is a struct), or -1 (an unsupported iterable — the
+// caller fails loudly). The returned kind doubles as the loop var's LOCAL code, so a
+// struct element binds a code-`1` struct local (member access on `v` then resolves).
+// The map forms read the map's insertion-ordered keys/vals lists directly (no delete
+// exists in the op set yet, so every entry is live).
 function forInElemKind(iterIx: i32, fnIx: i32): i32 {
   let e = P.nodes[iterIx]
   if e is Call {
@@ -5400,8 +5413,25 @@ function forInElemKind(iterIx: i32, fnIx: i32): i32 {
     }
   }
   if exprStringArray(iterIx, fnIx) { return 3 }
+  // A STRUCT-element ref list (`S[]`): the element is a struct ref, so bind the loop
+  // var as a code-`1` struct local. (Union-box (`2`) / map-array ref lists are not
+  // yet supported here — they fall through to the unsupported -1.)
+  if exprRefArray(iterIx, fnIx) {
+    let rslot = refListSlotOfExpr(iterIx, fnIx)
+    if rlElemKindTbl[rslot] == 1 { return 1 }
+    return 0 - 1
+  }
   if exprArray(iterIx, fnIx) { return 0 }
   0 - 1
+}
+
+// The element struct TABLE INDEX of a `for v in <S[]>` iterable (the struct that the
+// code-`1` loop var binds), or -1 when the iterable is not a struct ref list. Mirrors
+// the index-read resolution (`structIndexOfExpr` over `xs[i]`): the element name comes
+// from the ref-list slot, then its struct table index.
+function forInRefArrayStructIdx(iterIx: i32, fnIx: i32): i32 {
+  if !exprRefArray(iterIx, fnIx) { return 0 - 1 }
+  structIndexByName(refListElemNameOfExpr(iterIx, fnIx))
 }
 
 // Push the LIST ref a `for v in <iter>` iterates: a map `.keys()`/`.values()`
@@ -5780,11 +5810,12 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     return 0
   }
   if s is ForIn {
-    // `for v in <list> { body }` — iterate an i32 list, a string list, or a map's
-    // ordered `.keys()`/`.values()` list. THREE cursor slots in collect pre-order:
-    // the element var `v` (i32, or a string ref), a hidden i32 cursor `v#i`, and a
-    // hidden list temp `v#l` (the iterable evaluates ONCE). Shape mirrors `while`:
-    // block/loop, exit on `cursor >= len`, element read per iteration, cursor++.
+    // `for v in <list> { body }` — iterate an i32 list, a string list, a struct
+    // `S[]` ref list, or a map's ordered `.keys()`/`.values()` list. THREE cursor
+    // slots in collect pre-order: the element var `v` (i32, a string ref, or a struct
+    // ref), a hidden i32 cursor `v#i`, and a hidden list temp `v#l` (the iterable
+    // evaluates ONCE). Shape mirrors `while`: block/loop, exit on `cursor >= len`,
+    // element read per iteration, cursor++.
     let ek = forInElemKind(s.fiIter, fnIx)
     if ek < 0 {
       return emitFail("emitProgram: unsupported for-in iterable")
@@ -5808,6 +5839,13 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     if ek == 3 {
       wrapTy = mkListIdx
       backTy = mkArrIdx
+    } else if ek == 1 {
+      // A struct ref list (`S[]`): the wrapper/backing are THIS ref-list slot's, and
+      // each element is a struct ref recovered with `ref.as_non_null` — mirrors the
+      // indexed read (`xs[i]`) of the same slot.
+      let rslot = refListSlotOfExpr(s.fiIter, fnIx)
+      wrapTy = rlWrapIdx[rslot]
+      backTy = rlBackIdx[rslot]
     }
     // list = <iter> (evaluated once); cursor = 0
     if emitForInList(body, s.fiIter, fnIx) < 0 { return 0 - 1 }
@@ -5832,8 +5870,8 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     fbStructGet(wrapTy, 0)
     fbLocalGet(iIdx)
     fbArrayGet(backTy)
-    if ek == 3 {
-      wU8(212)               // 0xd4 ref.as_non_null
+    if ek == 3 || ek == 1 {
+      wU8(212)               // 0xd4 ref.as_non_null (string / struct element ref)
     }
     fbLocalSet(vIdx)
     // Same INNER continue block as for-range: `continue` must still increment.
@@ -7478,12 +7516,23 @@ function collectStartLocals(): i32 {
     } else if s is ForIn {
       let fiEk = forInElemKind(s.fiIter, 0 - 1)
       if fiEk < 0 { scopePop() return emitFail("emitProgram: unsupported for-in iterable") }
-      let fiSlot = addLocalName(s.fiVar, fiEk, 0 - 1)
+      // A struct element (`S[]`, code 1) binds the loop var as a struct local carrying
+      // the element struct table index; the `#l` temp holds the ref-list WRAPPER
+      // (code 5 + the ref-list slot). i32/string elements keep their slots.
+      let fiVarIdx = 0 - 1
+      let fiLk = 2
+      if fiEk == 1 {
+        fiVarIdx = forInRefArrayStructIdx(s.fiIter, 0 - 1)
+        fiLk = 5
+      } else if fiEk == 3 {
+        fiLk = 7
+      }
+      let fiSlot = addLocalName(s.fiVar, fiEk, fiVarIdx)
       scopeBind(s.fiVar, fiSlot)
       addLocalName(s.fiVar + "#i", 0, 0 - 1)
-      let fiLk = 2
-      if fiEk == 3 { fiLk = 7 }
-      addLocalName(s.fiVar + "#l", fiLk, 0 - 1)
+      let fiLs = 0 - 1
+      if fiEk == 1 { fiLs = refListSlotOfExpr(s.fiIter, 0 - 1) }
+      addLocalName(s.fiVar + "#l", fiLk, fiLs)
       if collectLocals(s.fiBody, 0 - 1) < 0 { scopePop() return 0 - 1 }
     } else if s is WhileStmt {
       if collectLocals(s.whileBody, 0 - 1) < 0 { scopePop() return 0 - 1 }

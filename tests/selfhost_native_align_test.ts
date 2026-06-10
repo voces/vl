@@ -100,6 +100,7 @@ const RUN_CASES = [
   "functions/early-return.vl",
   "functions/forward-call-inferred.vl",
   "functions/forward-reference-needs-return-type.vl",
+  "functions/forward-reference-struct-array-param.vl",
   "functions/forward-reference-struct-param.vl",
   "functions/forward-reference.vl",
   "functions/mutual-recursion-inferred.vl",
