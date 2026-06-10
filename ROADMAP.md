@@ -470,6 +470,16 @@ independent).*
   `wasmtime run --dir . vl.cwasm` (AOT-compiled) behind a launcher script; a single static
   `vl` binary is an OPTIONAL thin Rust embedding of the wasmtime crate (engine setup +
   preopens only — no OS logic), deferrable until the flip.
+  **Status (2026-06): the INTERIM Rust host shipped** (`scripts/vl-host` — `vl build/check/run`,
+  brains in `build/vl-compiler.wasm`; the native stage3 == stage4 fixpoint holds via
+  `scripts/native-fixpoint.sh`, ~6 s, no TS past the seed). **Killing the Rust host entirely is
+  confirmed feasible** (no negatives beyond the VL-side work): (1) the emitter gains WASI p1
+  imports + a linear memory + the GC-string↔memory copies above (UTF-8 encode/decode written in
+  VL); (2) the driver becomes a WASI `_start` reading `args_get`/`fd_read`, writing bytes +
+  diagnostics via `fd_write`; (3) `print` lowers to `fd_write` so EMITTED user programs also run
+  under any stock engine. Then the only dependency is a prebuilt conforming engine binary (any
+  GC+WASI engine — wasmtime today), same trust/distribution model as deno now, and
+  `scripts/vl-host` is deleted. Low priority while the interim host is ~150 frozen lines.
 - ⬜ **H5. Versioning — deferred; rustup/Volta model, not nvm** (→ `DECISIONS.md`). Make the H-M1
   install path version-stamped so a launcher can slot in later.
 
