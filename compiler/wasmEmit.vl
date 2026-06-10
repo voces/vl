@@ -959,38 +959,63 @@ function fnIndexOf(name: string): i32 {
 function parseI32(text: string): i32 {
   let v = 0
   let i = 0
-  // Hex `0x…` / binary `0b…` — skip the two-char prefix, then fold base 16 / 2.
+  // Hex `0x…` / binary `0b…` / octal `0o…` — skip the two-char prefix, then fold
+  // base 16 / 2 / 8. A `_` digit separator (legal in every base) is skipped.
   if text.length >= 2 && text[0] == '0' {
     let p = text[1]
     if p == 'x' || p == 'X' {
       i = 2
       while i < text.length {
         let c = text[i]
-        let d = 0
-        if c >= '0' && c <= '9' {
-          d = c - '0'
-        } else if c >= 'a' && c <= 'f' {
-          d = c - 'a' + 10
+        if c == '_' {
+          i = i + 1
         } else {
-          d = c - 'A' + 10
+          let d = 0
+          if c >= '0' && c <= '9' {
+            d = c - '0'
+          } else if c >= 'a' && c <= 'f' {
+            d = c - 'a' + 10
+          } else {
+            d = c - 'A' + 10
+          }
+          v = v * 16 + d
+          i = i + 1
         }
-        v = v * 16 + d
-        i = i + 1
       }
       return v
     }
     if p == 'b' || p == 'B' {
       i = 2
       while i < text.length {
-        v = v * 2 + (text[i] - '0')
-        i = i + 1
+        if text[i] == '_' {
+          i = i + 1
+        } else {
+          v = v * 2 + (text[i] - '0')
+          i = i + 1
+        }
+      }
+      return v
+    }
+    if p == 'o' || p == 'O' {
+      i = 2
+      while i < text.length {
+        if text[i] == '_' {
+          i = i + 1
+        } else {
+          v = v * 8 + (text[i] - '0')
+          i = i + 1
+        }
       }
       return v
     }
   }
   while i < text.length {
-    v = v * 10 + (text[i] - '0')
-    i = i + 1
+    if text[i] == '_' {
+      i = i + 1
+    } else {
+      v = v * 10 + (text[i] - '0')
+      i = i + 1
+    }
   }
   v
 }
@@ -2353,6 +2378,8 @@ function binOpcode(op: string): i32 {
   // `INT_BINOPS` map in toWasm.ts (`&`->and, `|`->or, `>>`->shr_s, `>>>`->shr_u).
   if op == "&" { return 113 }   // 0x71 i32.and
   if op == "|" { return 114 }   // 0x72 i32.or
+  if op == "^" { return 115 }   // 0x73 i32.xor
+  if op == "<<" { return 116 }  // 0x74 i32.shl
   if op == ">>" { return 117 }  // 0x75 i32.shr_s (signed/arithmetic)
   if op == ">>>" { return 118 } // 0x76 i32.shr_u (unsigned/logical)
   0 - 1
@@ -5154,6 +5181,39 @@ function emitForInList(body: i32[], iterIx: i32, fnIx: i32): i32 {
   emitExpr(body, iterIx, fnIx)
 }
 
+// Does this loop BODY contain a `continue` that binds to THIS loop? Descends `if`
+// arms (a conditional continue) but NOT nested loops (their `continue` is their
+// own). Drives the for-range/for-in INNER continue block: a body without a direct
+// `continue` keeps the original (golden-pinned) two-frame shape.
+function blockHasDirectContinue(blockIx: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let st = P.nodes[stmts[i]]
+      if st is ContinueStmt { return true }
+      if st is IfStmt {
+        if ifHasDirectContinue(stmts[i]) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+function ifHasDirectContinue(ifIx: i32): boolean {
+  let st = P.nodes[ifIx]
+  if st is IfStmt {
+    if blockHasDirectContinue(st.ifThen) { return true }
+    if st.ifElse >= 0 {
+      let els = P.nodes[st.ifElse]
+      if els is Block { return blockHasDirectContinue(st.ifElse) }
+      if els is IfStmt { return ifHasDirectContinue(st.ifElse) }
+    }
+  }
+  false
+}
+
 // Lower a single statement at `stmtIx` onto `body`, resolving identifiers/params
 // against function `fnIx`. Returns 0, or -1 (via `emitFail`) on an unsupported shape.
 //
@@ -5429,7 +5489,22 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     }
     fbI32Eqz()               // 0x45 invert: exit when out of range
     fbBrIf(1)                // 0x0d br_if -> break out of block
+    // A body with a DIRECT `continue` needs an INNER block as the continue
+    // target: branching to its END falls into the increment (a branch to the
+    // loop header would SKIP the increment — an infinite loop). A body without
+    // one keeps the original two-frame shape (goldens pinned on it).
+    let frHasCont = blockHasDirectContinue(s.frBody)
+    if frHasCont {
+      fbBlock(64)            // continue block
+      ctrlEnter()
+      loopContDepth.push(ctrlDepth)
+    }
     if emitStmts(body, s.frBody, fnIx) < 0 { return 0 - 1 }
+    if frHasCont {
+      fbEnd()                // end continue block — `continue` lands here
+      ctrlLeave()
+      loopContDepth.pop()
+    }
     // v = v + K
     fbLocalGet(vIdx)
     fbI32Const(stepK)
@@ -5501,7 +5576,19 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       wU8(212)               // 0xd4 ref.as_non_null
     }
     fbLocalSet(vIdx)
+    // Same INNER continue block as for-range: `continue` must still increment.
+    let fiHasCont = blockHasDirectContinue(s.fiBody)
+    if fiHasCont {
+      fbBlock(64)            // continue block
+      ctrlEnter()
+      loopContDepth.push(ctrlDepth)
+    }
     if emitStmts(body, s.fiBody, fnIx) < 0 { return 0 - 1 }
+    if fiHasCont {
+      fbEnd()                // end continue block — `continue` lands here
+      ctrlLeave()
+      loopContDepth.pop()
+    }
     // cursor = cursor + 1
     fbLocalGet(iIdx)
     fbI32Const(1)
