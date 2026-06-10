@@ -172,6 +172,7 @@ const WHITELIST = [
   "strings/accum-tostring.vl",
   "strings/basics.vl",
   "strings/from-code-point.vl",
+  "strings/from-code-points.vl",
   "strings/print-and-eq.vl",
   "strings/slice.vl",
   "tostring/bool.vl",

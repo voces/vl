@@ -2276,6 +2276,8 @@ function exprHasStrOp(exprIx: i32, fnIx: i32): boolean {
       }
       // `toString(x)` builds its digits in the string-op scratch frame.
       if pcal.identName == "toString" { return true }
+      // `fromCodePoints(xs)` stages its length + result there too.
+      if pcal.identName == "fromCodePoints" { return true }
     }
     if exprHasStrOp(e.callFn, fnIx) { return true }
     let args = e.callArgs
@@ -4692,6 +4694,47 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
       // fresh string (array of code points).
       if callee.identName == "toString" {
         return emitToString(body, callIx, fnIx)
+      }
+      // `fromCodePoints(xs)` (H2): bulk string construction — ONE array.copy of
+      // the list's live elements into an exact-length string array, instead of
+      // per-char concat (quadratic churn). Uses the string-op scratch frame
+      // (I0 = len, Out = the result) — `exprHasStrOp` reserves it. The list is
+      // re-read per use, so the argument must be a NAME (param/local/global);
+      // an arbitrary expression would need a list-typed temp slot.
+      if callee.identName == "fromCodePoints" {
+        if !aUsed || !lUsed {
+          return emitFail("emitProgram: fromCodePoints but array/list types not collected")
+        }
+        if c.callArgs.length != 1 {
+          return emitFail("emitProgram: fromCodePoints takes exactly one argument")
+        }
+        let fcpArg = c.callArgs[0]
+        let fcpN0 = P.nodes[fcpArg]
+        if fcpN0 is Paren {
+          fcpArg = fcpN0.parInner
+        }
+        let fcpNode = P.nodes[fcpArg]
+        if fcpNode is Ident {
+          // I0 = xs.len
+          if emitExpr(body, fcpArg, fnIx) < 0 { return 0 - 1 }
+          fbStructGet(lTypeIdx, 1)
+          setStrScrI(body, 0)
+          // Out = array.new_default(I0)
+          pushStrScrI(body, 0)
+          fbArrayNewDefault(aTypeIdx)
+          fbLocalSet(strScratchBase + 2)
+          // array.copy Out 0 xs.backing 0 I0
+          pushStrScrRef(body, 2)
+          fbI32Const(0)
+          if emitExpr(body, fcpArg, fnIx) < 0 { return 0 - 1 }
+          fbStructGet(lTypeIdx, 0)
+          fbI32Const(0)
+          pushStrScrI(body, 0)
+          fbArrayCopy(aTypeIdx, aTypeIdx)
+          pushStrScrRef(body, 2)
+          return 0
+        }
+        return emitFail("emitProgram: fromCodePoints argument must be a named i32[] binding")
       }
       if callee.identName == "fromCodePoint" {
         if !aUsed {
@@ -8193,6 +8236,11 @@ function collectA(stmts: i32[]): i32 {
         if cf.identName == "toString" {
           aUsed = true
         }
+        // `fromCodePoints(xs)` builds a fresh string from an i32 list.
+        if cf.identName == "fromCodePoints" {
+          aUsed = true
+          lUsed = true
+        }
         // An un-annotated `Map()` (usage-inferred binding) still constructs the map
         // struct — force the same types a `{[string]: i32}` annotation does.
         if cf.identName == "Map" {
@@ -9809,6 +9857,7 @@ function letIsMap(letIx: i32, fnIx: i32): boolean {
 // returning function would be.
 function fnRetString(name: string): boolean {
   if name == "fromCodePoint" { return true }
+  if name == "fromCodePoints" { return true }
   if name == "toString" { return true }
   let i = 0
   while i < fnNames.length {
