@@ -48,6 +48,24 @@ let gImports: i32 = 0
 // byte-identical to before (the existing 4-import / 0-import layouts are untouched).
 let gNeedsI64Print: boolean = false
 
+// `true` when the program uses `print` AND declares/uses an f64 value (a `.` literal,
+// an `: f64` binding, or f64 arithmetic) — pulling in the `__print_f64__` import with a
+// `(f64)->()` functype, placed AFTER `__print_i64__` (so its function index is
+// `4 + (gNeedsI64Print ? 1 : 0)`, recorded in `gF64PrintIdx`). A program with no f64
+// never sets this, so its emitted bytes are byte-identical to before. (Slice 3.)
+let gNeedsF64Print: boolean = false
+
+// The wasm function index of the `__print_f64__` import (`fbCall` target in the print
+// router). Computed up front in `emitProgram`: `4` when no i64 print, `5` when i64 print
+// is also present (the i64 import takes index 4 first). Only meaningful when
+// `gNeedsF64Print` is true. (Slice 3.)
+let gF64PrintIdx: i32 = 0
+
+// Scratch out-param for `bigDivmod`: set to `true` when the division left a NONZERO
+// remainder (the IEEE-754 "sticky" bit). The decimal→double encoder reads it after the
+// final divide to decide round-to-nearest-ties-to-even. (Slice 3.)
+let gDivRemNonzero: boolean = false
+
 // ── name-section opt-in (OFF by default — goldens stay byte-identical) ─────────
 // When `1`, `emitModule` appends a wasm "name" custom section (function-name
 // subsection + module-name subsection) so a wasmtime trap backtrace shows real
@@ -395,6 +413,337 @@ function fbI64Const(hi: i32, lo: i32): i32 {
 // fallback for a non-literal i32 source.)
 function fbI64ExtendI32S(): i32 {
   wU8(172)           // 0xac i64.extend_i32_s
+  0
+}
+
+// ── f64.const: pure-i32 decimal-string → IEEE-754 double (Slice 3) ─────────────
+// The self-host compiler is i32-only — it has no float runtime and cannot ask the
+// host for a value's bits. So `f64.const` is synthesized arithmetically from the
+// decimal LEXEME: parse it as an exact rational `mantissa / 10^fracDigits`, then
+// long-divide in binary to a 53-bit significand with round-to-nearest-ties-to-even,
+// and pack sign|exp|mantissa. All intermediates exceed 32 bits, so a "bignum" is
+// carried as a little-endian array of base-2^16 i32 LIMBS (each 0..0xffff); every
+// partial product (16×16) stays within i32. Validated bit-for-bit against the
+// hardware IEEE-754 encoder for 2.5/1.0/0.5/3.14/0.1/0.2/0.3/1000.5/pi and rounding
+// torture cases before wiring in.
+
+// Drop leading-zero limbs (keep at least one). A bignum is always >= 1 limb.
+function bigTrim(a: i32[]): i32[] {
+  while a.length > 1 && a[a.length - 1] == 0 {
+    a.pop()
+  }
+  a
+}
+// True when the bignum is exactly zero.
+function bigIsZero(a: i32[]): boolean {
+  a.length == 1 && a[0] == 0
+}
+// `a * m` for a small (<= 0xffff) multiplier. Each limb×m fits in i32; carry rolls up.
+function bigMulSmall(a: i32[], m: i32): i32[] {
+  let out: i32[] = []
+  let carry = 0
+  let i = 0
+  while i < a.length {
+    let p = a[i] * m + carry
+    out.push(p & 0xffff)
+    carry = (p >>> 16) & 0xffff
+    i = i + 1
+  }
+  while carry != 0 {
+    out.push(carry & 0xffff)
+    carry = (carry >>> 16) & 0xffff
+  }
+  if out.length == 0 { out.push(0) }
+  bigTrim(out)
+}
+// `a + v` for a small (<= 0xffff) addend.
+function bigAddSmall(a: i32[], v: i32): i32[] {
+  let out: i32[] = []
+  let i = 0
+  while i < a.length {
+    out.push(a[i])
+    i = i + 1
+  }
+  let carry = v
+  let j = 0
+  while carry != 0 {
+    if j >= out.length { out.push(0) }
+    let s = out[j] + carry
+    out[j] = s & 0xffff
+    carry = (s >>> 16) & 0xffff
+    j = j + 1
+  }
+  bigTrim(out)
+}
+// Compare two bignums: -1 if a<b, 0 if equal, 1 if a>b.
+function bigCmp(a: i32[], b: i32[]): i32 {
+  if a.length != b.length {
+    if a.length < b.length { return 0 - 1 }
+    return 1
+  }
+  let i = a.length - 1
+  while i >= 0 {
+    if a[i] != b[i] {
+      if a[i] < b[i] { return 0 - 1 }
+      return 1
+    }
+    i = i - 1
+  }
+  0
+}
+// `a - b`, requiring a >= b (caller guarantees). Borrow-propagating limb subtract.
+function bigSub(a: i32[], b: i32[]): i32[] {
+  let out: i32[] = []
+  let borrow = 0
+  let i = 0
+  while i < a.length {
+    let bv = 0
+    if i < b.length { bv = b[i] }
+    let d = a[i] - bv - borrow
+    if d < 0 {
+      d = d + 0x10000
+      borrow = 1
+    } else {
+      borrow = 0
+    }
+    out.push(d)
+    i = i + 1
+  }
+  bigTrim(out)
+}
+// `a * 2` (left shift by one bit).
+function bigShl1(a: i32[]): i32[] {
+  let out: i32[] = []
+  let carry = 0
+  let i = 0
+  while i < a.length {
+    let v = (a[i] << 1) | carry
+    out.push(v & 0xffff)
+    carry = (v >>> 16) & 1
+    i = i + 1
+  }
+  if carry != 0 { out.push(1) }
+  bigTrim(out)
+}
+// `a >> 1` (floor divide by two). Walk limbs high→low, threading the dropped bit.
+function bigShr1(a: i32[]): i32[] {
+  let out: i32[] = []
+  let i = 0
+  while i < a.length {
+    out.push(0)
+    i = i + 1
+  }
+  let carry = 0
+  let k = a.length - 1
+  while k >= 0 {
+    let v = a[k] | (carry << 16)
+    out[k] = (v >>> 1) & 0xffff
+    carry = v & 1
+    k = k - 1
+  }
+  bigTrim(out)
+}
+// `a << bits` (multiply by 2^bits), applied bit-by-bit (`bits` is small here).
+function bigShlK(a: i32[], bits: i32): i32[] {
+  let r = a
+  let i = 0
+  while i < bits {
+    r = bigShl1(r)
+    i = i + 1
+  }
+  r
+}
+// Number of significant bits in `a` (0 for zero).
+function bigBitLen(a: i32[]): i32 {
+  if bigIsZero(a) { return 0 }
+  let top = a[a.length - 1]
+  let bits = (a.length - 1) * 16
+  while top != 0 {
+    bits = bits + 1
+    top = top >>> 1
+  }
+  bits
+}
+// Bit `idx` (0 = least significant) of `a`.
+function bigGetBit(a: i32[], idx: i32): i32 {
+  let limb = idx >>> 4
+  let off = idx & 15
+  if limb >= a.length { return 0 }
+  (a[limb] >>> off) & 1
+}
+// floor(n / d) by bitwise long division. The REMAINDER's nonzero-ness (the sticky
+// bit) is returned via the `gDivRemNonzero` module global — that is all the encoder
+// needs from the remainder, so no second array is returned.
+function bigDivmod(n: i32[], d: i32[]): i32[] {
+  let nb = bigBitLen(n)
+  let rem: i32[] = []
+  rem.push(0)
+  let qbits: i32[] = []
+  let b = nb - 1
+  while b >= 0 {
+    rem = bigShl1(rem)
+    if bigGetBit(n, b) == 1 { rem = bigAddSmall(rem, 1) }
+    if bigCmp(rem, d) >= 0 {
+      rem = bigSub(rem, d)
+      qbits.push(1)
+    } else {
+      qbits.push(0)
+    }
+    b = b - 1
+  }
+  // qbits are MSB-first; fold into a bignum.
+  let q: i32[] = []
+  q.push(0)
+  let i = 0
+  while i < qbits.length {
+    q = bigShl1(q)
+    if qbits[i] == 1 { q = bigAddSmall(q, 1) }
+    i = i + 1
+  }
+  gDivRemNonzero = !bigIsZero(rem)
+  bigTrim(q)
+}
+// Encode the decimal literal `text` as its 8-byte little-endian IEEE-754 double,
+// returned as an i32[] of 8 bytes. Sign is parsed too (a leading `-`/`+`), though the
+// NumLit site never carries a sign (unary minus is a separate node) — kept for safety.
+function f64Bytes(text: string): i32[] {
+  let neg = false
+  let i = 0
+  if text.length > 0 {
+    if text[0] == '-' {
+      neg = true
+      i = 1
+    } else if text[0] == '+' {
+      i = 1
+    }
+  }
+  // Parse mantissa digits (ignoring `.` and `_`), counting fractional digits.
+  let mant: i32[] = []
+  mant.push(0)
+  let frac = 0
+  let dot = false
+  while i < text.length {
+    let c = text[i]
+    if c == '_' {
+      i = i + 1
+    } else if c == '.' {
+      dot = true
+      i = i + 1
+    } else {
+      mant = bigMulSmall(mant, 10)
+      mant = bigAddSmall(mant, c - '0')
+      if dot { frac = frac + 1 }
+      i = i + 1
+    }
+  }
+  // signWord is the high 16 bits of the high byte's eventual word; assembled at the end.
+  if bigIsZero(mant) {
+    // +/- zero: all bytes 0 except the sign in the top bit of byte 7.
+    let z: i32[] = []
+    let zi = 0
+    while zi < 8 {
+      z.push(0)
+      zi = zi + 1
+    }
+    if neg { z[7] = 0x80 }
+    return z
+  }
+  // value = mant / 10^frac. Build numerator and denominator bignums.
+  let num = mant
+  let den: i32[] = []
+  den.push(1)
+  let fk = 0
+  while fk < frac {
+    den = bigMulSmall(den, 10)
+    fk = fk + 1
+  }
+  // value = (num/den) * 2^exp. Align so floor(num/den) has exactly 54 bits, then round
+  // the 54th bit (guard) plus the remainder (sticky) down to a 53-bit significand.
+  let exp = 0
+  let diff = bigBitLen(num) - bigBitLen(den)
+  if diff < 54 {
+    num = bigShlK(num, 54 - diff)
+    exp = exp - (54 - diff)
+  } else if diff > 54 {
+    den = bigShlK(den, diff - 54)
+    exp = exp + (diff - 54)
+  }
+  let q = bigDivmod(num, den)
+  // The bit-length estimate can be one off; correct to exactly 54 bits.
+  while bigBitLen(q) < 54 {
+    num = bigShl1(num)
+    exp = exp - 1
+    q = bigDivmod(num, den)
+  }
+  while bigBitLen(q) > 54 {
+    den = bigShl1(den)
+    exp = exp + 1
+    q = bigDivmod(num, den)
+  }
+  // q is 54 bits; reduce to 53. guard = dropped low bit; sticky = remainder nonzero.
+  let guard = q[0] & 1
+  let sticky = 0
+  if gDivRemNonzero { sticky = 1 }
+  let q53 = bigShr1(q)
+  let e53 = exp + 1
+  // Round-to-nearest, ties-to-even: round up on guard=1 with sticky, or an exact tie
+  // (guard=1, sticky=0) when the kept LSB is odd.
+  let roundUp = false
+  if guard == 1 {
+    if sticky == 1 {
+      roundUp = true
+    } else if (q53[0] & 1) == 1 {
+      roundUp = true
+    }
+  }
+  if roundUp {
+    q53 = bigAddSmall(q53, 1)
+    if bigBitLen(q53) > 53 {
+      q53 = bigShr1(q53)
+      e53 = e53 + 1
+    }
+  }
+  // q53 is exactly 53 bits in [2^52, 2^53): q53 = 1.f * 2^52, value = 1.f * 2^(e53+52).
+  let bigE = e53 + 52
+  let biased = bigE + 1023
+  // The low 52 bits of q53 are the stored fraction (drop the implicit leading 1, i.e.
+  // bit 52). Read the four low 16-bit limbs.
+  let m0 = 0
+  let m1 = 0
+  let m2 = 0
+  let m3 = 0
+  if q53.length > 0 { m0 = q53[0] }
+  if q53.length > 1 { m1 = q53[1] }
+  if q53.length > 2 { m2 = q53[2] }
+  if q53.length > 3 { m3 = q53[3] }
+  // The 8 little-endian bytes: 52-bit fraction in bytes 0..6 (low nibble of byte 6),
+  // 11-bit biased exponent straddling byte 6 (high nibble) and byte 7, sign in bit 7
+  // of byte 7. m3 holds bits 48..52: bit 52 is the implicit 1 (masked off), bits 48..51
+  // are the fraction's top nibble.
+  let out: i32[] = []
+  out.push(m0 & 0xff)               // byte 0: frac bits 0..7
+  out.push((m0 >>> 8) & 0xff)       // byte 1: frac bits 8..15
+  out.push(m1 & 0xff)               // byte 2: frac bits 16..23
+  out.push((m1 >>> 8) & 0xff)       // byte 3: frac bits 24..31
+  out.push(m2 & 0xff)               // byte 4: frac bits 32..39
+  out.push((m2 >>> 8) & 0xff)       // byte 5: frac bits 40..47
+  let fracHi = m3 & 0xf             // frac bits 48..51 (bit 52 implicit-1 dropped)
+  out.push(fracHi | ((biased & 0xf) << 4))   // byte 6: frac 48..51 | exp low 4 bits
+  let signTop = 0
+  if neg { signTop = 0x80 }
+  out.push(((biased >>> 4) & 0x7f) | signTop) // byte 7: exp high 7 bits | sign
+  out
+}
+// f64.const: 0x44 followed by 8 raw little-endian IEEE-754 bytes (`f64Bytes`).
+function fbF64Const(text: string): i32 {
+  wU8(68)            // 0x44 f64.const
+  wBytes(f64Bytes(text))
+  0
+}
+// f64.convert_i32_s: 0xb7 — widen a signed i32 on the stack to f64 (the bridge for a
+// mixed i32/f64 operand, mirroring i64.extend_i32_s). (Slice 3.)
+function fbF64ConvertI32S(): i32 {
+  wU8(183)           // 0xb7 f64.convert_i32_s
   0
 }
 // if: 0x04 <blocktype>. `blockType` is a single byte (0x40 void, or a valtype byte).
@@ -782,6 +1131,11 @@ let fRetBool: i32[] = []
 // feeds i64 arithmetic / print (Slice 2). i32-only programs leave this all-zero.
 let fRetI64: i32[] = []
 
+// Parallel to `fnNames`: `1` if the i-th function's declared return type is `f64`
+// (kind 11). Lets a call to an f64-returning function classify as f64 so its result
+// feeds f64 arithmetic / print (Slice 3). i32-only programs leave this all-zero.
+let fRetF64: i32[] = []
+
 // ── module-level GLOBALS (G2b) ────────────────────────────────────────────────
 // A top-level `let`/`const` (`LetDecl`) lowers to a wasm module GLOBAL (mutable),
 // emitted in the global section (id 6). Its wasm GLOBAL INDEX is its position among
@@ -972,6 +1326,7 @@ function buildFnMap(stmts: i32[]): i32 {
   fRetBool = []
   fRetNul = []
   fRetI64 = []
+  fRetF64 = []
   let i = 0
   while i < fnStmts.length {
     let s = P.nodes[fnStmts[i]]
@@ -989,6 +1344,7 @@ function buildFnMap(stmts: i32[]): i32 {
       fRetBool.push(retBoolFlag(s.fnRet))
       fRetNul.push(retNulRefFlag(s.fnRet))
       fRetI64.push(retI64Flag(s.fnRet))
+      fRetF64.push(retF64Flag(s.fnRet))
     }
     i = i + 1
   }
@@ -1838,6 +2194,11 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
           // `checkLocalI32` (which rejects a non-i32 annotation); the init literal
           // lowers as `i64.const` in `emitStmt`'s LetDecl path.
           slot = addLocalName(s.letName, 10, 0 - 1)
+        } else if letIsF64(stmts[i]) {
+          // Scalar f64 local (`let x: f64 = …` OR an un-annotated `.` literal init,
+          // kind 11, valtype 0x7c). Bypasses `checkLocalI32`; the init literal lowers
+          // as `f64.const` in `emitStmt`'s LetDecl path. (Slice 3.)
+          slot = addLocalName(s.letName, 11, 0 - 1)
         } else {
           if checkLocalI32(stmts[i]) < 0 { scopePop() return 0 - 1 }
           slot = addLocalName(s.letName, 0, 0 - 1)
@@ -2701,6 +3062,26 @@ function binOpcodeI64(op: string): i32 {
   if op == ">" { return 85 }    // 0x55 i64.gt_s
   if op == "<=" { return 87 }   // 0x57 i64.le_s
   if op == ">=" { return 89 }   // 0x59 i64.ge_s
+  0 - 1
+}
+
+// The f64 instruction variant for `op` (Slice 3), selected when an operand is f64.
+// Arithmetic consumes two f64 and leaves an f64; comparisons consume two f64 and leave
+// an i32 BOOL. Returns -1 for an op with no f64 form (`%`/bitwise/shift/`&&`/`||`/...).
+//   +  f64.add 0xa0  -  f64.sub 0xa1  *  f64.mul 0xa2  /  f64.div 0xa3
+//   == f64.eq 0x61   != f64.ne 0x62   <  f64.lt 0x63   >  f64.gt 0x64
+//   <= f64.le 0x65   >= f64.ge 0x66
+function binOpcodeF64(op: string): i32 {
+  if op == "+" { return 160 }   // 0xa0 f64.add
+  if op == "-" { return 161 }   // 0xa1 f64.sub
+  if op == "*" { return 162 }   // 0xa2 f64.mul
+  if op == "/" { return 163 }   // 0xa3 f64.div
+  if op == "==" { return 97 }   // 0x61 f64.eq
+  if op == "!=" { return 98 }   // 0x62 f64.ne
+  if op == "<" { return 99 }    // 0x63 f64.lt
+  if op == ">" { return 100 }   // 0x64 f64.gt
+  if op == "<=" { return 101 }  // 0x65 f64.le
+  if op == ">=" { return 102 }  // 0x66 f64.ge
   0 - 1
 }
 
@@ -4569,6 +4950,14 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
   }
   let e = P.nodes[exprIx]
   if e is NumLit {
+    // A FLOAT literal (lexeme carries a `.`) lowers as `f64.const` — the pure-i32
+    // decimal→IEEE-754 packer (`f64Bytes`). Checked FIRST: a `.` literal is never i32
+    // or i64, so this can't disturb the integer paths (the checker already types it
+    // f64). Bare integer literals fall through, byte-identical to before. (Slice 3.)
+    if numTextIsFloat(e.numText) {
+      fbF64Const(e.numText)
+      return 0
+    }
     // An integer literal in i64 CONTEXT (`pendingI64`) lowers as `i64.const` over the
     // 64-bit (hi, lo) pair parsed from its lexeme — so a value past the i32 range
     // (`9000000000`, `0xFFFFFFFFFF`) survives. Otherwise the default i32 path is
@@ -4672,6 +5061,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // i64 operand the zero and the subtract are i64 (Slice 2).
     if e.unOp != "-" {
       return emitFail("emitProgram: unsupported unary operator")
+    }
+    // f64 negation uses the dedicated `f64.neg` (0x9a) — flips the sign bit (Slice 3).
+    if exprIsF64(e.unArg, fnIx) {
+      if emitExpr(body, e.unArg, fnIx) < 0 { return 0 - 1 }
+      wU8(154)                   // 0x9a f64.neg
+      return 0
     }
     if exprIsI64(e.unArg, fnIx) {
       fbI64Const(0, 0)            // i64 0
@@ -4861,6 +5256,22 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
         }
       }
     }
+    // Slice 3 — f64 operators. If EITHER operand is f64, emit the f64 instruction
+    // variant and widen the i32 operand (if any) to f64 first (`emitExprAsF64`). Covers
+    // arithmetic (f64 result) AND comparisons (i32 bool result, COMPARE consumes two
+    // f64). Checked BEFORE i64 since a float operand is never i64. Keyed on operand kind,
+    // so an i32-only program never enters it — the i32 path below is byte-identical.
+    let lF64 = exprIsF64(e.binLeft, fnIx)
+    let rF64 = exprIsF64(e.binRight, fnIx)
+    if lF64 || rF64 {
+      let opcF = binOpcodeF64(e.binOp)
+      if opcF >= 0 {
+        if emitExprAsF64(body, e.binLeft, fnIx) < 0 { return 0 - 1 }
+        if emitExprAsF64(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+        fbI32Bin(opcF)
+        return 0
+      }
+    }
     // Slice 2 — i64 operators. If EITHER operand is i64, emit the i64 instruction
     // variant and widen the i32 operand (if any) to i64 first (`emitExprAsI64`). This
     // covers arithmetic/bitwise/shift (i64 result) AND comparisons (i32 bool result,
@@ -4923,6 +5334,20 @@ function emitExprAsI64(body: i32[], exprIx: i32, fnIx: i32): i32 {
   // Non-literal i32: evaluate, then sign-extend to i64.
   if emitExpr(body, exprIx, fnIx) < 0 { return 0 - 1 }
   fbI64ExtendI32S()
+  0
+}
+
+// Emit the expression at `exprIx` as an f64 value (Slice 3). If it already yields f64
+// (`exprIsF64`) it is emitted as-is. Otherwise it is an i32 expression flowing into an
+// f64 op (the mixed-operand case, e.g. `1.5 + 2`): evaluate it as i32, then widen with
+// `f64.convert_i32_s` (0xb7) — lossless for any i32. (An i64 operand mixed with f64 is
+// out of scope here; the corpus targets only mix i32 with f64.)
+function emitExprAsF64(body: i32[], exprIx: i32, fnIx: i32): i32 {
+  if exprIsF64(exprIx, fnIx) {
+    return emitExpr(body, exprIx, fnIx)
+  }
+  if emitExpr(body, exprIx, fnIx) < 0 { return 0 - 1 }
+  fbF64ConvertI32S()
   0
 }
 
@@ -5014,6 +5439,85 @@ function exprIsI64(exprIx: i32, fnIx: i32): boolean {
       let target = fnIndexOf(callee.identName)
       if target >= 0 {
         return fRetI64[target] == 1
+      }
+    }
+    return false
+  }
+  false
+}
+
+// True if the PARAMETER `name` of the function at `fnIx` is annotated `f64`. (Slice 3.)
+function paramIsF64(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          return retF64Flag(p.parType) == 1
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the DECLARED LOCAL `name` is an f64 slot (kind 11 in the local registry).
+function declaredF64(name: string): boolean {
+  let slot = declaredSlotOf(name)
+  if slot < 0 { return false }
+  localIsRef[slot] == 11
+}
+
+// True if the module GLOBAL `name` is an f64 cell. (Slice 3.)
+function globalIsF64(name: string): boolean {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsF64(li)
+}
+
+// True if evaluating the expression at `exprIx` yields an f64: a float `.` literal,
+// a reference to an f64 param/local/global, f64 arithmetic (either operand f64 — the
+// i32 side widens via `f64.convert_i32_s`), unary `-`/parens over such, or a call to
+// an f64-returning function. Drives the `print` import choice (`__print_f64__`) and the
+// per-operand opcode selection in the BinExpr path. (Slice 3.)
+function exprIsF64(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is NumLit { return numTextIsFloat(e.numText) }
+  if e is Paren { return exprIsF64(e.parInner, fnIx) }
+  if e is Ident {
+    if paramIsF64(fnIx, e.identName) { return true }
+    if declaredF64(e.identName) { return true }
+    return globalIsF64(e.identName)
+  }
+  // Arithmetic yields f64 when EITHER operand is f64. Comparisons / logical connectives
+  // produce an i32 BOOL even over f64 operands, so they are NOT f64.
+  if e is BinExpr {
+    let op = e.binOp
+    if op == "+" || op == "-" || op == "*" || op == "/" {
+      if exprIsF64(e.binLeft, fnIx) { return true }
+      return exprIsF64(e.binRight, fnIx)
+    }
+    return false
+  }
+  // Unary negation `-x` preserves f64-ness (`~` is integer-only; `!` is bool).
+  if e is Unary {
+    if e.unOp == "-" {
+      return exprIsF64(e.unArg, fnIx)
+    }
+    return false
+  }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      let target = fnIndexOf(callee.identName)
+      if target >= 0 {
+        return fRetF64[target] == 1
       }
     }
     return false
@@ -5193,9 +5697,14 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         // An i64-typed argument lowers to `i64.const`/`local.get` of an i64 slot, so it
         // must route to `__print_i64__` (import 4) — its functype is `(i64)->()`, so the
         // i32/bool imports would fail to typecheck the call. Checked before bool/i32.
+        // An f64 argument routes to `__print_f64__` (import `gF64PrintIdx`, a `(f64)->()`
+        // functype) — checked first since a float literal/operand is never i64/bool/i32.
         let argI64 = exprIsI64(c.callArgs[0], fnIx)
+        let argF64 = exprIsF64(c.callArgs[0], fnIx)
         if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
-        if argI64 {
+        if argF64 {
+          fbCall(gF64PrintIdx)  // 0x10 call __print_f64__
+        } else if argI64 {
           fbCall(4)            // 0x10 call __print_i64__ (import index 4)
         } else if exprIsBool(c.callArgs[0], fnIx) {
           fbCall(1)            // 0x10 call __print_bool__ (import index 1)
@@ -5253,6 +5762,23 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
             if vtKindOfParam(cParams[i]) == 10 { pendingI64 = true }
           }
         }
+        // An f64 param position lowers the argument as f64 (a float literal is f64.const;
+        // an i32 expression is widened via f64.convert_i32_s). (Slice 3.)
+        let cParamF64 = false
+        if cFn is FuncDecl {
+          let cParams2 = cFn.fnParams
+          if i < cParams2.length {
+            if vtKindOfParam(cParams2[i]) == 11 { cParamF64 = true }
+          }
+        }
+        if cParamF64 {
+          if emitExprAsF64(body, args[i], fnIx) < 0 { return 0 - 1 }
+          pendingStructIdx = 0 - 1
+          pendingListKind = 0
+          pendingListSlot = 0
+          pendingI64 = false
+          i = i + 1
+        } else {
         if emitExpr(body, args[i], fnIx) < 0 { return 0 - 1 }
         if cVi >= 0 {
           if exprUnion(args[i], fnIx) {
@@ -5265,6 +5791,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         pendingListSlot = 0
         pendingI64 = false
         i = i + 1
+        }
       }
       fbCall(gImports + target)  // 0x10 call (imports occupy indices 0..gImports-1)
       return 0
@@ -6596,18 +7123,20 @@ function checkParams(fnIx: i32): i32 {
             // accepted — a `(ref null $S)` param
           } else if ty.tyName != "i32" {
             if ty.tyName != "i64" {            // i64 rides the 0x7e valtype (Slice 1)
+            if ty.tyName != "f64" {            // f64 rides the 0x7c valtype (Slice 3)
             if ty.tyName != "boolean" {
               if !isSName(ty.tyName) {
                 if !isUName(ty.tyName) {
                   if variantIndexOf(ty.tyName) < 0 {
                     if !nameIsArray(ty.tyName) {
                       if !nameIsString(ty.tyName) {
-                        return emitFail("emitProgram: only i32, i64, boolean, struct, union, array, or string parameters are supported")
+                        return emitFail("emitProgram: only i32, i64, f64, boolean, struct, union, array, or string parameters are supported")
                       }
                     }
                   }
                 }
               }
+            }
             }
             }
           }
@@ -7181,6 +7710,7 @@ function vtKindOfType(tyIx: i32): i32 {
   if retArrFlag(tyIx) == 1 { return 2 }
   if retStrFlag(tyIx) == 1 { return 3 }
   if retI64Flag(tyIx) == 1 { return 10 }
+  if retF64Flag(tyIx) == 1 { return 11 }
   0
 }
 
@@ -7192,6 +7722,19 @@ function retI64Flag(tyIx: i32): i32 {
     let ty = P.nodes[tyIx]
     if ty is TypeRef {
       if ty.tyName == "i64" { return 1 }
+    }
+  }
+  0
+}
+
+// `1` if the type-annotation node at `tyIx` is `f64`, else `0`. A scalar f64
+// param/result/local/global classifies as kind 11 (valtype `0x7c`); checked LAST
+// (alongside `retI64Flag`) since `f64` is a plain TypeRef name like `i32`. (Slice 3.)
+function retF64Flag(tyIx: i32): i32 {
+  if tyIx >= 0 {
+    let ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if ty.tyName == "f64" { return 1 }
     }
   }
   0
@@ -7281,6 +7824,11 @@ function paramStructIdxOf(paramIx: i32): i32 {
 function globalKind(initIx: i32): i32 {
   if initIx < 0 { return 0 }
   let e = P.nodes[initIx]
+  // An un-annotated float `.` literal init (`const a = 1.5`) is an f64 cell (kind 11),
+  // lowered as `f64.const`. (Slice 3 — additive; bare integer globals stay kind 0.)
+  if e is NumLit {
+    if numTextIsFloat(e.numText) { return 11 }
+  }
   if e is ObjLit {
     // A literal matching a standalone struct is that struct ref (kind 1) — even in a
     // union program. Otherwise, in a union program it boxes into the union (kind 4).
@@ -7413,6 +7961,7 @@ function globalCellKind(letIx: i32): i32 {
       if letIsArray(letIx, 0 - 1) { return 2 }
       if letIsString(letIx, 0 - 1) { return 3 }
       if letIsI64(letIx) { return 10 }
+      if letIsF64(letIx) { return 11 }
       return 0
     }
     // No annotation: a const literal init types itself; a non-const un-annotated init is
@@ -7509,6 +8058,8 @@ function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
     wSLEB(mkListIdx)
   } else if kind == 10 {
     wU8(126)                   // 0x7e i64 (scalar, never a nullable ref)
+  } else if kind == 11 {
+    wU8(124)                   // 0x7c f64 (scalar, never a nullable ref)
   } else {
     wU8(127)                   // 0x7f i32
   }
@@ -7586,6 +8137,8 @@ function fbValtype(kind: i32, structIdx: i32): i32 {
     wSLEB(uVarIdx + structIdx)   // the CONCRETE union-variant struct heap-type index (gap #2)
   } else if kind == 10 {
     wU8(126)             // 0x7e i64 (Slice 1: scalar i64 local/param/global/result)
+  } else if kind == 11 {
+    wU8(124)             // 0x7c f64 (Slice 3: scalar f64 local/param/global/result)
   } else {
     wU8(127)             // 0x7f i32
   }
@@ -8053,6 +8606,11 @@ function emitNameSection(n: i32): i32 {
       wULEB(4)
       wName("__print_i64__")
     }
+    // The `__print_f64__` import is named at its computed index (`gF64PrintIdx`, 4 or 5).
+    if gNeedsF64Print {
+      wULEB(gF64PrintIdx)
+      wName("__print_f64__")
+    }
   }
   let fi = 0
   while fi < n {
@@ -8171,6 +8729,7 @@ function emitModule(stmts: i32[]): i32 {
   let nPrintTypes = 0
   if gImports > 0 { nPrintTypes = 2 }    // (i32)->() and ()->() for the print imports
   if gNeedsI64Print { nPrintTypes = nPrintTypes + 1 }   // + (i64)->() for __print_i64__
+  if gNeedsF64Print { nPrintTypes = nPrintTypes + 1 }   // + (f64)->() for __print_f64__
   wULEB(1 + nPrintTypes)                 // rectypes: the rec group + the standalone print functypes
   wU8(78)                                // 0x4e rec group
   wULEB(n + typeOffset + hasStart)       // types inside the rec group (print functypes excluded)
@@ -8378,6 +8937,14 @@ function emitModule(stmts: i32[]): i32 {
     wU8(126)                     // 0x7e i64
     wU8(0)                       // 0 results
   }
+  // The `(f64)->()` functype for `__print_f64__`, standalone AFTER the i64 one (if any),
+  // so no existing functype index shifts. (Slice 3.)
+  if gNeedsF64Print {
+    wU8(96)                      // 0x60 func
+    wU8(1)                       // 1 param
+    wU8(124)                     // 0x7c f64
+    wU8(0)                       // 0 results
+  }
   wTarget(tyPrev)
   wSection(1, typePayload)
 
@@ -8389,11 +8956,15 @@ function emitModule(stmts: i32[]): i32 {
     let ftI32 = typeOffset + n + hasStart
     let ftVoid = ftI32 + 1
     let ftI64 = ftVoid + 1
+    // The `(f64)->()` functype index trails the i64 one when present, else the void one.
+    let ftF64 = ftVoid + 1
+    if gNeedsI64Print { ftF64 = ftI64 + 1 }
     let importPayload: i32[] = []
     let imPrev = wTarget(importPayload)
-    // 4 imports normally; a 5th (`__print_i64__`) when an i64 program prints.
+    // 4 imports normally; +1 for `__print_i64__` and/or +1 for `__print_f64__`.
     let nImports = 4
-    if gNeedsI64Print { nImports = 5 }
+    if gNeedsI64Print { nImports = nImports + 1 }
+    if gNeedsF64Print { nImports = nImports + 1 }
     wULEB(nImports)
     wName("imports")
     wName("__print_i32__")
@@ -8418,6 +8989,13 @@ function emitModule(stmts: i32[]): i32 {
       wName("__print_i64__")
       wU8(0)
       wULEB(ftI64)
+    }
+    // `__print_f64__` LAST, at function index `gF64PrintIdx` (4 or 5). (Slice 3.)
+    if gNeedsF64Print {
+      wName("imports")
+      wName("__print_f64__")
+      wU8(0)
+      wULEB(ftF64)
     }
     wTarget(imPrev)
     wSection(2, importPayload)
@@ -10753,6 +11331,43 @@ function letIsI64(letIx: i32): boolean {
   false
 }
 
+// True if the `NumLit` lexeme `t` carries a `.` (a float literal). Mirrors the
+// checker's literal-default rule (`.`→f64). (Slice 3.)
+function numTextIsFloat(t: string): boolean {
+  let i = 0
+  while i < t.length {
+    if t[i] == '.' { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True if the `LetDecl`/global at `letIx` declares an `f64` binding: an explicit
+// `: f64` annotation, OR an UN-annotated binding whose initializer is a float `.`
+// literal (e.g. `const a = 1.5`). Such a binding selects the f64 slot (valtype 0x7c,
+// kind 11) and lowers its init literal as `f64.const`. An un-annotated float `let`
+// was previously a hard error (`checkExprI32` rejects `.`), so accepting it here is
+// strictly additive — no existing i32 program changes. (Slice 3.)
+function letIsF64(letIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if lt.tyName == "f64" { return true }
+      }
+      return false
+    }
+    if d.letInit >= 0 {
+      let ie = P.nodes[d.letInit]
+      if ie is NumLit {
+        return numTextIsFloat(ie.numText)
+      }
+    }
+  }
+  false
+}
+
 function emitProgram(rootIx: i32): i32 {
   emitFailed = false
   emitErr = ""
@@ -10788,8 +11403,11 @@ function emitProgram(rootIx: i32): i32 {
     // decided up front; a print-free program emits no import section at all).
     gImports = 0
     gNeedsI64Print = false
+    gNeedsF64Print = false
+    gF64PrintIdx = 0
     let pscan = 0
     let sawI64Ann = false
+    let sawF64 = false
     while pscan < P.nodes.length {
       let pn = P.nodes[pscan]
       if pn is Call {
@@ -10807,6 +11425,11 @@ function emitProgram(rootIx: i32): i32 {
       // none of which name `i64`.)
       if pn is TypeRef {
         if pn.tyName == "i64" { sawI64Ann = true }
+        if pn.tyName == "f64" { sawF64 = true }
+      }
+      // A float `.` literal flags the program as f64-using (the checker types it f64).
+      if pn is NumLit {
+        if numTextIsFloat(pn.numText) { sawF64 = true }
       }
       pscan = pscan + 1
     }
@@ -10818,6 +11441,13 @@ function emitProgram(rootIx: i32): i32 {
       if sawI64Ann {
         gImports = gImports + 1
         gNeedsI64Print = true
+      }
+      // Then `__print_f64__` (at the next index — 4 or 5). The f64 import always
+      // trails the i64 one so the i64 print index (4) is unchanged. (Slice 3.)
+      if sawF64 {
+        gF64PrintIdx = gImports
+        gImports = gImports + 1
+        gNeedsF64Print = true
       }
     }
     // Every function's parameters must be i32 or the struct type before we commit.

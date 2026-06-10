@@ -130,6 +130,10 @@ fn run_program(engine: &Engine, bytes: &[u8]) -> Result<()> {
 
     linker.func_wrap("imports", "__print_i32__", |v: i32| println!("{v}"))?;
     linker.func_wrap("imports", "__print_i64__", |v: i64| println!("{v}"))?;
+    // f64: Rust's `{}` Display matches JS `String(v)` for the corpus values (whole
+    // numbers print without a trailing `.0`, e.g. 4.0 → "4"), mirroring the host's
+    // `__print_f64__` (`String(v)`) so emitted output matches `@log`. (Slice 3.)
+    linker.func_wrap("imports", "__print_f64__", |v: f64| println!("{v}"))?;
     linker.func_wrap("imports", "__print_bool__", |v: i32| {
         println!("{}", if v != 0 { "true" } else { "false" })
     })?;
