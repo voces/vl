@@ -148,6 +148,7 @@ const RUN_CASES = [
   "lists/struct-field-push.vl",
   "literals/binary.vl",
   "literals/octal.vl",
+  "literals/wide-hex.vl",
   "loops/continue.vl",
   "loops/for-in.vl",
   "loops/for-range-bound-named-step.vl",
