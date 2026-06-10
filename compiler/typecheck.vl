@@ -188,6 +188,7 @@ function isConstName(name: string): boolean {
 export let TY_I32: i32 = -1
 let TY_I64: i32 = -1
 let TY_F64: i32 = -1
+let TY_F32: i32 = -1
 let TY_BOOL: i32 = -1
 let TY_STR: i32 = -1
 let TY_VOID: i32 = -1
@@ -275,6 +276,7 @@ export function initChecker(): i32 {
   TY_I32 = mkPrim("i32")
   TY_I64 = mkPrim("i64")
   TY_F64 = mkPrim("f64")
+  TY_F32 = mkPrim("f32")
   TY_BOOL = mkPrim("bool")
   TY_STR = mkPrim("string")
   TY_VOID = mkPrim("void")
@@ -472,7 +474,8 @@ function isNumeric(ix: i32): boolean {
     return true
   }
   if t is TyPrim {
-    return t.primName == "i32" || t.primName == "i64" || t.primName == "f64"
+    return t.primName == "i32" || t.primName == "i64" || t.primName == "f64" ||
+      t.primName == "f32"
   }
   false
 }
@@ -512,6 +515,59 @@ function mixesI64(a: i32, b: i32): boolean {
   false
 }
 
+// The bare primitive name of type-arena index `ix`, or "" if it is not a primitive.
+function primNameOf(ix: i32): string {
+  if ix < 0 { return "" }
+  let t = T.tys[ix]
+  if t is TyPrim {
+    return t.primName
+  }
+  ""
+}
+
+// LOSSLESS numeric WIDENING lattice (B2): does a value of primitive type `sn` flow
+// into a `dn`-typed slot without loss? The lossless edges are
+//   i32 → i64,  i32 → f32,  i32 → f64,  i64 → f64,  f32 → f64
+// (plus every type to itself). NOT lossless — and so NOT here: i64→f32 (a large i64
+// loses precision), f64→f32 (demote), and any float→integer (truncation). Codegen
+// inserts the matching wasm convert at the boundary. Keyed on bare names so it is a
+// pure value-lattice query independent of arena identity.
+function numWidensName(sn: string, dn: string): boolean {
+  if sn == dn { return false }
+  if sn == "i32" {
+    if dn == "i64" || dn == "f32" || dn == "f64" { return true }
+  }
+  if sn == "i64" {
+    if dn == "f64" { return true }
+  }
+  if sn == "f32" {
+    if dn == "f64" { return true }
+  }
+  false
+}
+
+// True when `src`→`dst` is a lossless numeric widening (see `numWidensName`).
+function numWidens(src: i32, dst: i32): boolean {
+  numWidensName(primNameOf(src), primNameOf(dst))
+}
+
+// Are `a` and `b` two numeric operands of DIFFERENT but compatible types, so a mixed
+// arithmetic/comparison widens the narrower side to the wider one? True exactly when
+// one operand losslessly widens to the other (either direction). The shared op type
+// is then the WIDER of the two (`widerNumeric`).
+function mixesNumeric(a: i32, b: i32): boolean {
+  if numWidens(a, b) { return true }
+  if numWidens(b, a) { return true }
+  false
+}
+
+// The WIDER of two mixed numeric operands (the result/op type): whichever the other
+// widens INTO. Caller guarantees `mixesNumeric(a, b)`.
+function widerNumeric(a: i32, b: i32): i32 {
+  if numWidens(a, b) { return b }
+  a
+}
+
 // Do two numeric type indices denote the SAME numeric type?
 function sameNumeric(a: i32, b: i32): boolean {
   let ta = T.tys[a]
@@ -532,6 +588,32 @@ function sameNumeric(a: i32, b: i32): boolean {
     if tb is TyPrim {
       return ta.primName == tb.primName
     }
+  }
+  false
+}
+
+// Is the EXPRESSION at `ix` (peeling parens) a float `.` NUMBER literal? A float
+// literal is polymorphic across the float types: it types f64 by default but
+// re-encodes EXACTLY into an f32 slot, so a float literal flowing into an `f32`
+// binding/operand is accepted (the demote that a general f64 value would need is
+// never performed — the literal is encoded at f32 directly). Integer literals are
+// NOT covered here (they ride the i32→{i64,f32,f64} widening lattice).
+function isFloatLitExpr(ix: i32): boolean {
+  if ix < 0 { return false }
+  let e = P.nodes[ix]
+  if e is Paren { return isFloatLitExpr(e.parInner) }
+  if e is NumLit { return hasDot(e.numText) }
+  false
+}
+
+// Literal-aware assignability for a numeric binding/argument/return: the normal
+// `assignable` lattice, PLUS the float-literal→f32 exception (`isFloatLitExpr`). Used
+// where the SOURCE EXPRESSION node is in hand (so the literal can be recognized);
+// type-only sites keep using `assignable`.
+function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  if assignable(srcTy, dstTy) { return true }
+  if primNameOf(dstTy) == "f32" {
+    if isFloatLitExpr(srcExpr) { return true }
   }
   false
 }
@@ -626,6 +708,9 @@ function nameToTy(name: string): i32 {
   }
   if name == "f64" {
     return TY_F64
+  }
+  if name == "f32" {
+    return TY_F32
   }
   if name == "bool" || name == "boolean" {
     return TY_BOOL
@@ -874,11 +959,14 @@ function assignable(src: i32, dst: i32): boolean {
   }
   if s is TyPrim {
     if d is TyPrim {
-      // Lossless integer WIDENING: an i32 value (including a bare integer literal,
-      // which defaults to i32) flows into an i64 slot — annotation, argument,
-      // return. The reverse (i64→i32) is NOT assignable. This is the only numeric
-      // coercion Slice 1 enables; the binding takes the WIDER type (the annotation).
-      if s.primName == "i32" && d.primName == "i64" {
+      // Lossless numeric WIDENING (B2): a narrower numeric value flows into a wider
+      // slot — annotation, argument, return — along the lattice i32→{i64,f32,f64},
+      // i64→f64, f32→f64. The reverse (any narrowing, e.g. i64→i32, f64→f32, f64→i32)
+      // is NOT assignable: it is lossy and must be made explicit. Codegen inserts the
+      // matching wasm convert at the boundary. f32 literals reach an f32 slot via the
+      // float-literal exception at the binding/arg/return sites (a float literal types
+      // f64 by default but re-encodes exactly at f32). The binding takes the WIDER type.
+      if numWidensName(s.primName, d.primName) {
         return true
       }
       return s.primName == d.primName
@@ -1826,8 +1914,9 @@ function checkNode(ix: i32): i32 {
       if !isNumeric(lt) || !isNumeric(rt) {
         tErr("comparison expects numeric operands, got " +
           tyToStr(lt) + " and " + tyToStr(rt), ix)
-      } else if !sameNumeric(lt, rt) && !mixesI64(lt, rt) {
-        // i32/i64 may be compared (the i32 side widens to i64); other mixes error.
+      } else if !sameNumeric(lt, rt) && !mixesNumeric(lt, rt) {
+        // Mixed numerics may be compared when one side losslessly widens to the other
+        // (i32/i64, i32/f64, f32/f64, …); the narrower side widens. Other mixes error.
         tErr("comparison mixes " + tyToStr(lt) + " and " + tyToStr(rt), ix)
       }
       return TY_BOOL
@@ -1845,15 +1934,30 @@ function checkNode(ix: i32): i32 {
         tyToStr(lt) + " and " + tyToStr(rt), ix)
       return TY_ERR
     }
-    // An integer op with an i64 operand widens the i32 side to i64 and yields i64
-    // (`i64 op i64`, `i32 op i64`, `i64 op i32`). Done BEFORE the same-type check so
-    // a mixed i32/i64 pair is accepted (Slice 2). i32-only programs never reach here
-    // (they are `sameNumeric` and fall through to `return lt`, unchanged).
-    if mixesI64(lt, rt) {
-      if isI64Ty(lt) {
-        return lt
+    // BITWISE / SHIFT operators are INTEGER-ONLY: a float operand (i32↔f64 mixing or
+    // even same-type f64) has no bitwise form. Reject before the numeric-widening rules
+    // so `1.0 & 2` errors (the float-widening lattice must not make it pass). Arithmetic
+    // (`+ - * /`), `%`, and comparisons are unaffected.
+    if op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>" || op == ">>>" {
+      if primNameOf(lt) == "f64" || primNameOf(lt) == "f32" ||
+         primNameOf(rt) == "f64" || primNameOf(rt) == "f32" {
+        tErr("operator '" + op + "' is integer-only, got " +
+          tyToStr(lt) + " and " + tyToStr(rt), ix)
+        return TY_ERR
       }
-      return rt
+    }
+    // A FLOAT LITERAL operand adopts the OTHER side's f32 type (the literal re-encodes
+    // exactly at f32, so `x + 4.0` with `x: f32` stays f32 — the `4.0` is NOT demoted
+    // f64). Checked before the general mixed rule so the result is f32, not the wider
+    // f64. (One side is the f32 variable; the other the float literal typed f64.)
+    if primNameOf(lt) == "f32" && isFloatLitExpr(n.binRight) { return lt }
+    if primNameOf(rt) == "f32" && isFloatLitExpr(n.binLeft) { return rt }
+    // A mixed-numeric op widens the narrower operand to the wider one and yields the
+    // wider type (`i32 op i64`→i64, `f64 op i32`→f64, `f32 op f64`→f64, …). Done BEFORE
+    // the same-type check so a compatible mixed pair is accepted (B2). i32-only programs
+    // never reach here (they are `sameNumeric` and fall through to `return lt`).
+    if mixesNumeric(lt, rt) {
+      return widerNumeric(lt, rt)
     }
     if !sameNumeric(lt, rt) {
       tErr("operator '" + op + "' mixes " + tyToStr(lt) + " and " +
@@ -2053,7 +2157,7 @@ function checkNode(ix: i32): i32 {
     if annot >= 0 {
       bound = annot
       if initTy >= 0 {
-        if !assignable(initTy, annot) {
+        if !assignableExpr(n.letInit, initTy, annot) {
           tErr("cannot assign " + tyToStr(initTy) + " to '" + n.letName +
             "' of type " + tyToStr(annot), ix)
         }

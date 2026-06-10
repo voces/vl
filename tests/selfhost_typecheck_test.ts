@@ -143,9 +143,10 @@ tok("LET","let") tok("IDENT","a") tok("COLON",":") tok("IDENT","i32") tok("EQUAL
 tok("LET","let") tok("IDENT","b") tok("COLON",":") tok("IDENT","f64") tok("EQUAL","=") tok("NUMBER","2.0") tok("NEWLINE","\\n")
 tok("LET","let") tok("IDENT","c") tok("COLON",":") tok("IDENT","i32") tok("EQUAL","=") tok("IDENT","a") tok("PLUS","+") tok("IDENT","b") tok("NEWLINE","\\n")
 tok("EOF","")`,
-    // `a + b` mixes i32/f64 (reports once, yields the error type); the error type is
-    // assignable to `c: i32`, so the assignment does NOT cascade a second diagnostic.
-    expected: ["diags: 1", "operator '+' mixes i32 and f64"],
+    // `a + b` now WIDENS the i32 to f64 (B2 numeric-widening lattice) and yields f64;
+    // the f64 result then flows into the `c: i32` slot, which is a LOSSY narrowing and
+    // is rejected — a single diagnostic on the assignment (no error on `a + b` itself).
+    expected: ["diags: 1", "cannot assign f64 to 'c' of type i32"],
   },
   {
     label: "member-access",

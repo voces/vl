@@ -134,6 +134,11 @@ fn run_program(engine: &Engine, bytes: &[u8]) -> Result<()> {
     // numbers print without a trailing `.0`, e.g. 4.0 → "4"), mirroring the host's
     // `__print_f64__` (`String(v)`) so emitted output matches `@log`. (Slice 3.)
     linker.func_wrap("imports", "__print_f64__", |v: f64| println!("{v}"))?;
+    // f32: widen to f64 before Display so the printed decimal matches JS `String(v)`
+    // (where a wasm f32 arrives as a JS number, i.e. its exact f64 value), mirroring the
+    // host's `__print_f32__` (`String(v)`). Whole f32 values print without `.0` (e.g.
+    // 6.5→"6.5", 10.0→"10"). (Slice 5.)
+    linker.func_wrap("imports", "__print_f32__", |v: f32| println!("{}", v as f64))?;
     linker.func_wrap("imports", "__print_bool__", |v: i32| {
         println!("{}", if v != 0 { "true" } else { "false" })
     })?;
