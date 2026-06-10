@@ -303,9 +303,15 @@ Empirical results from the native stage3→stage4 experiment that REVISE the pri
   Those calls are semantic — no post-hoc optimizer can remove them. wasm-opt stays worthwhile
   for SIZE and for when wasmtime's array-copy fast path improves, but it does not fix the
   rebuild time today.
-- Consequence: the rebuild-time wins are **#8 (bulk source I/O — kill the per-code-point feed)**
-  and reducing per-character copy traffic in VL's string paths (or an upstream wasmtime
-  array-copy fast path); #1 (.cwasm) and #2 (null collector) remain valid fixed-cost wins.
+- **#1 (.cwasm) and #2 (null collector) are ALSO measured no-ops on this workload** (13.8s vs
+  13.3s with the null collector; warm-cache run identical): DRC barriers are not the cost, and
+  Cranelift compilation of a 152KB module was never significant. Both stay adopted in `vl-host`
+  as correct architecture (no GC pauses in one-shot compiles; compile cost will matter as
+  modules grow), but neither moves the rebuild time.
+- Consequence: the ONLY rebuild-time lever is **reducing per-element copy traffic itself** — a
+  `fromCodePoints(i32[]): string` builtin (amortized list build + one inlined conversion loop,
+  no `array.copy` libcalls) for the source feed and eventually the lexer/string paths, or an
+  upstream wasmtime array-copy fast path.
 - One more compat note: `wasm-opt -all` emits **exact reference types** (custom descriptors),
   which wasmtime 45 rejects — pass explicit `--enable-reference-types --enable-gc` instead.
 

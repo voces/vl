@@ -21,21 +21,51 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
-fn gc_engine() -> Result<Engine> {
+fn gc_engine(collector: Collector) -> Result<Engine> {
     let mut cfg = Config::new();
     cfg.wasm_gc(true);
     cfg.wasm_function_references(true);
+    // The COMPILER instance is one-shot batch work: the null collector (never
+    // frees) skips every DRC barrier/refcount, trading memory for speed — give it
+    // a large reservation to grow into. User programs (`vl run`) keep DRC: they
+    // may be long-lived and actually need garbage collected.
+    cfg.collector(collector);
+    if matches!(collector, Collector::Null) {
+        cfg.gc_heap_reservation(8 << 30); // 8 GiB virtual reservation (lazily committed)
+    }
     Ok(Engine::new(&cfg)?)
 }
 
 /// Drive the self-hosted compiler module: feed `source` in, return the emitted
 /// wasm bytes, or the compiler's own diagnostics as the error.
 fn compile_vl(engine: &Engine, compiler_path: &str, source: &str) -> Result<Vec<u8>> {
-    let module = Module::from_file(engine, compiler_path).map_err(|e| {
-        e.context(format!(
-            "loading compiler module `{compiler_path}` (build it with: deno run -A scripts/build-compiler-wasm.ts)"
-        ))
-    })?;
+    // A `.cwasm` SIDECAR caches the Cranelift compilation of the compiler module
+    // (the dominant fixed cost of every invocation). Keyed by freshness: rebuilt
+    // whenever the `.wasm` is newer. `deserialize_file` is unsafe because a
+    // corrupt/forged artifact is UB — we only ever load a sidecar this same
+    // binary wrote next to the module it was derived from.
+    let sidecar = format!("{compiler_path}.cwasm");
+    let fresh = match (std::fs::metadata(&sidecar), std::fs::metadata(compiler_path)) {
+        (Ok(c), Ok(w)) => matches!((c.modified(), w.modified()), (Ok(cm), Ok(wm)) if cm >= wm),
+        _ => false,
+    };
+    let module = if fresh {
+        match unsafe { Module::deserialize_file(engine, &sidecar) } {
+            Ok(m) => m,
+            Err(_) => Module::from_file(engine, compiler_path)?, // stale config/version — recompile
+        }
+    } else {
+        let m = Module::from_file(engine, compiler_path).map_err(|e| {
+            e.context(format!(
+                "loading compiler module `{compiler_path}` (build it with: deno run -A scripts/build-compiler-wasm.ts)"
+            ))
+        })?;
+        // Best-effort cache write; failure is non-fatal (read-only dirs etc.).
+        if let Ok(bytes) = m.serialize() {
+            let _ = std::fs::write(&sidecar, bytes);
+        }
+        m
+    };
     let mut store = Store::new(engine, ());
     let linker = Linker::new(engine);
     let inst = linker.instantiate(&mut store, &module)?;
@@ -122,26 +152,29 @@ fn main() -> Result<()> {
 
     let source = std::fs::read_to_string(input)
         .map_err(|e| Error::from(e).context(format!("reading `{input}`")))?;
-    let engine = gc_engine()?;
+    // The compile step always runs under the null collector (one-shot batch work);
+    // only the user program's own execution gets a real (DRC) collector.
+    let compile_engine = gc_engine(Collector::Null)?;
 
     match cmd {
         "build" => {
             let out = flag("-o").unwrap_or_else(|| {
                 input.strip_suffix(".vl").unwrap_or(input).to_string() + ".wasm"
             });
-            let bytes = compile_vl(&engine, &compiler, &source)?;
+            let bytes = compile_vl(&compile_engine, &compiler, &source)?;
             std::fs::write(&out, &bytes)?;
             println!("wrote {out} ({} bytes)", bytes.len());
         }
         "check" => {
             // A clean compile IS the check (typecheck gates emit; emit validates the
             // rest). Diagnostics surface through compile_vl's error path.
-            compile_vl(&engine, &compiler, &source)?;
+            compile_vl(&compile_engine, &compiler, &source)?;
             println!("ok");
         }
         "run" => {
-            let bytes = compile_vl(&engine, &compiler, &source)?;
-            run_program(&engine, &bytes)?;
+            let bytes = compile_vl(&compile_engine, &compiler, &source)?;
+            let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
+            run_program(&run_engine, &bytes)?;
         }
         _ => usage(),
     }
