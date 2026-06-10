@@ -185,6 +185,7 @@ const WHITELIST = [
   "tostring/numbers.vl",
   "types/literal-narrowing.vl",
   "types/or-guard-narrowing.vl",
+  "types/struct-union-same-shape.vl",
   "types/union-narrowed-helper-recursion.vl",
   "types/union-two-visitors.vl",
   "variables/assignment.vl",
