@@ -157,6 +157,28 @@ type Checker = {
 // point `checkProgram(root)` and reads `T.diags`.
 export let T: Checker = { tys: [], scopes: [], diags: [], curRet: -1, userTypes: Map() }
 
+// The const-binding chain, PARALLEL to `T.scopes`: each frame records which of
+// its names were bound `const` (immutable NAME, not immutable data — a field
+// write through a const stays legal). Kept module-level (not a `Checker` field)
+// so the exported struct shape is unchanged.
+let constScopes: {[string]: boolean}[] = []
+
+// True if `name` resolves (innermost-first) to a `const` binding.
+function isConstName(name: string): boolean {
+  let i = T.scopes.length - 1
+  while i >= 0 {
+    if T.scopes[i].has(name) {
+      if i < constScopes.length {
+        return constScopes[i].has(name)
+      }
+      return false
+    }
+    i = i - 1
+  }
+  false
+}
+
+
 // Well-known primitive type-arena indices, pinned by `initChecker` so the hot
 // primitives are interned once (not re-pushed per use). `-1` until initialized.
 export let TY_I32: i32 = -1
@@ -253,6 +275,8 @@ export function initChecker(): i32 {
   TY_ERR = mkErrTy()
   TY_NULL = mkPrim("null")
   T.scopes.push(Map())
+  constScopes = []
+  constScopes.push(Map())
   0
 }
 
@@ -261,6 +285,7 @@ export function initChecker(): i32 {
 // Enter a new lexical scope (push a fresh name→type map).
 function pushScope(): i32 {
   T.scopes.push(Map())
+  constScopes.push(Map())
   0
 }
 
@@ -269,6 +294,7 @@ function pushScope(): i32 {
 // `tests/cases/lists/struct-field-pop-statement.vl`.)
 function popScope(): i32 {
   T.scopes.pop()
+  constScopes.pop()
   0
 }
 
@@ -1519,6 +1545,14 @@ function checkNode(ix: i32): i32 {
     let rt = checkNode(n.binRight)
     // Assignment: RHS must be assignable to the LHS's (already-bound) type.
     if op == "=" {
+      // A `const` NAME cannot be rebound (`x = …`, and the `x++`/`x += …`
+      // desugarings). Data behind it stays mutable (a Member/Index target).
+      let tgt = P.nodes[n.binLeft]
+      if tgt is Ident {
+        if isConstName(tgt.identName) {
+          tErr("cannot reassign `const` " + tgt.identName, ix)
+        }
+      }
       if !assignable(rt, lt) {
         tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(lt), ix)
       }
@@ -1798,6 +1832,12 @@ function checkNode(ix: i32): i32 {
       tErr("'" + n.letName + "' needs a type annotation or initializer", ix)
     }
     declare(n.letName, bound)
+    if n.letKw == "const" {
+      let ctop = constScopes.length - 1
+      if ctop >= 0 {
+        constScopes[ctop][n.letName] = true
+      }
+    }
     return TY_VOID
 
   // ── function declaration ─────────────────────────────────────────────────────

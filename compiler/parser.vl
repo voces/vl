@@ -43,7 +43,7 @@
 // The AST data layer (`compiler/ast.vl`): the token type, the global parser state
 // `P`, and the arena `mk*` constructors. The parser's own `advance`/`peekTok`
 // cursor primitives stay PRIVATE to this module.
-import { Tok, P } from "./ast"
+import { Tok, P, Ident } from "./ast"
 import {
   mkNum,
   mkStr,
@@ -171,31 +171,38 @@ function expect(kind: string): boolean {
 // `^` (XOR) and `<<` (left shift); those are out of scope for this slice.
 function binPrec(kind: string): i32 {
   if kind == "EQUAL" { return 1 }    // assignment (right-associative)
+  // Compound assignment (`+=` etc.) sits WITH assignment; the climber desugars it.
+  if kind == "PLUSEQ" { return 1 }
+  if kind == "MINUSEQ" { return 1 }
+  if kind == "STAREQ" { return 1 }
+  if kind == "SLASHEQ" { return 1 }
   if kind == "QUESTION_QUESTION" { return 2 }   // `a ?? b` nullish-coalescing
   if kind == "OR" { return 2 }
   if kind == "AND" { return 3 }
   if kind == "PIPE" { return 4 }     // bitwise OR  (`|`  -> i32.or)
-  if kind == "AMPERSAND" { return 5 }  // bitwise AND (`&`  -> i32.and)
-  if kind == "EQ" { return 6 }
-  if kind == "NE" { return 6 }
-  if kind == "LT" { return 7 }
-  if kind == "GT" { return 7 }
-  if kind == "LE" { return 7 }
-  if kind == "GE" { return 7 }
-  if kind == "SHR" { return 8 }      // signed right shift   (`>>`  -> i32.shr_s)
-  if kind == "USHR" { return 8 }     // unsigned right shift (`>>>` -> i32.shr_u)
-  if kind == "PLUS" { return 9 }
-  if kind == "MINUS" { return 9 }
-  if kind == "STAR" { return 10 }
-  if kind == "SLASH" { return 10 }
-  if kind == "PERCENT" { return 10 }
+  if kind == "CARET" { return 5 }    // bitwise XOR (`^`  -> i32.xor) — between | and &
+  if kind == "AMPERSAND" { return 6 }  // bitwise AND (`&`  -> i32.and)
+  if kind == "EQ" { return 7 }
+  if kind == "NE" { return 7 }
+  if kind == "LT" { return 8 }
+  if kind == "GT" { return 8 }
+  if kind == "LE" { return 8 }
+  if kind == "GE" { return 8 }
+  if kind == "SHL" { return 9 }      // left shift           (`<<` -> i32.shl)
+  if kind == "SHR" { return 9 }      // signed right shift   (`>>` -> i32.shr_s)
+  if kind == "USHR" { return 9 }     // unsigned right shift (`>>>` -> i32.shr_u)
+  if kind == "PLUS" { return 10 }
+  if kind == "MINUS" { return 10 }
+  if kind == "STAR" { return 11 }
+  if kind == "SLASH" { return 11 }
+  if kind == "PERCENT" { return 11 }
   0
 }
 
 // The right-associative operators (assignment): their RHS parses at the SAME
 // precedence, not `prec + 1`, so `a = b = c` nests as `a = (b = c)`.
 function rightAssoc(kind: string): boolean {
-  kind == "EQUAL"
+  kind == "EQUAL" || kind == "PLUSEQ" || kind == "MINUSEQ" || kind == "STAREQ" || kind == "SLASHEQ"
 }
 
 // ── type annotations ─────────────────────────────────────────────────────────
@@ -368,13 +375,22 @@ function parsePrimary(): i32 {
 // local `more` and re-checked in the body.)
 function parseArgs(): i32[] {
   let args: i32[] = []
+  // An argument list may span lines and allow ONE trailing comma before `)`.
+  skipNewlines()
   if peekKind() != "RPAREN" {
     args.push(parseExpr())
+    skipNewlines()
     let more = peekKind() == "COMMA"
     while more {
       advance()
-      args.push(parseExpr())
-      more = peekKind() == "COMMA"
+      skipNewlines()
+      if peekKind() == "RPAREN" {
+        more = false
+      } else {
+        args.push(parseExpr())
+        skipNewlines()
+        more = peekKind() == "COMMA"
+      }
     }
   }
   expect("RPAREN")
@@ -423,12 +439,17 @@ function parseObjLit(): i32 {
 // order — that order IS the fixed array's element order for `array.new_fixed`.
 function parseArrayLit(): i32 {
   expect("LBRACK")
+  // A literal may span lines (`[` NEWLINE `1,` NEWLINE `]`) and allow ONE
+  // trailing comma before `]` — newlines are insignificant until the `]`.
+  skipNewlines()
   let elems: i32[] = []
   let going = peekKind() != "RBRACK"
   while going {
     elems.push(parseExpr())
+    skipNewlines()
     if peekKind() == "COMMA" {
       advance()
+      skipNewlines()
       going = peekKind() != "RBRACK"
     } else {
       going = false
@@ -477,6 +498,19 @@ function parsePostfix(): i32 {
       going = false
     }
   }
+  // Postfix `x++` / `x--` on an IDENT desugars to `x = x + 1` / `x = x - 1`.
+  // (Assignment-as-expression yields the NEW value; the corpus uses the postfix
+  // forms in STATEMENT position, where the value is discarded anyway.)
+  let pk2 = peekKind()
+  if pk2 == "PLUSPLUS" || pk2 == "MINUSMINUS" {
+    let pt = P.nodes[node]
+    if pt is Ident {
+      advance()
+      let pop = "+"
+      if pk2 == "MINUSMINUS" { pop = "-" }
+      node = mkBinary("=", node, mkBinary(pop, node, mkNum("1")))
+    }
+  }
   node
 }
 
@@ -489,6 +523,15 @@ function parseUnary(): i32 {
   if k == "BANG" {
     advance()
     return mkUnary("!", parseUnary())
+  }
+  // Prefix `++x` / `--x` desugars to `x = x + 1` / `x = x - 1` (assignment-as-
+  // expression yields the NEW value - the prefix semantics exactly).
+  if k == "PLUSPLUS" || k == "MINUSMINUS" {
+    advance()
+    let iop = "+"
+    if k == "MINUSMINUS" { iop = "-" }
+    let itgt = parseUnary()
+    return mkBinary("=", itgt, mkBinary(iop, itgt, mkNum("1")))
   }
   if k == "MINUS" {
     advance()
@@ -531,7 +574,13 @@ function parseBinary(left: i32, minPrec: i32): i32 {
       let nextMin = prec + 1
       if rightAssoc(k) { nextMin = prec }
       let right = parseBinary(parseUnary(), nextMin)
-      acc = mkBinary(opText, acc, right)
+      if k == "PLUSEQ" || k == "MINUSEQ" || k == "STAREQ" || k == "SLASHEQ" {
+        // `a += b` desugars to `a = a + (b)` (the host's ARITH_ASSIGN_OPS). The
+        // target node is shared between read and write - arena reads are pure.
+        acc = mkBinary("=", acc, mkBinary(opText.slice(0, 1), acc, right))
+      } else {
+        acc = mkBinary(opText, acc, right)
+      }
     }
   }
   acc
@@ -780,7 +829,17 @@ function parseFunc(): i32 {
 function parseIf(): i32 {
   advance()                        // "if"
   let cond = parseExpr()
-  let thenB = parseBlock()
+  // `if cond then <stmt>` — the single-statement sugar (host: soft keyword
+  // `then`); the one statement wraps as the then-block.
+  let thenB = -1
+  if peekKind() == "IDENT" && peekTok().text == "then" {
+    advance()                      // "then"
+    let one: i32[] = []
+    one.push(parseStmt())
+    thenB = mkBlock(one)
+  } else {
+    thenB = parseBlock()
+  }
   let els = -1
   // The `else` may sit on a new line after the then-block's `}` (`}` NEWLINE
   // `else {`). Mirror the host: scan PAST any NEWLINEs to look for `else`, but
