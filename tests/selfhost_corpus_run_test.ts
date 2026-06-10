@@ -79,6 +79,7 @@ const WHITELIST = [
   "arith/ops.vl",
   "arith/typed-add.vl",
   "arrays/basics.vl",
+  "arrays/f64-elems.vl",
   "arrays/infer-empty-from-usage.vl",
   "arrays/infer-empty-index-set.vl",
   "arrays/infer-empty-push.vl",
