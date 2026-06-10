@@ -278,10 +278,13 @@ function wSLEB64(hi: i32, lo: i32): i32 {
   let more = true
   while more {
     let byte = l & 0x7f
-    // Logical 64-bit right shift by 7: low lane gets its top 25 bits plus the
-    // low 7 bits of `hi` rotated in; high lane is a plain unsigned >>> 7.
+    // ARITHMETIC 64-bit right shift by 7: low lane gets its top 25 bits plus the
+    // low 7 bits of `hi` rotated in; high lane is a SIGNED `>> 7` so a negative
+    // value's sign bit propagates (the all-ones tail terminates correctly). For a
+    // non-negative value (top bit 0) signed and unsigned shift agree, so the
+    // Slice-1 non-negative literals are byte-identical.
     let newLo = (l >>> 7) | (h << 25)
-    let newHi = h >>> 7
+    let newHi = h >> 7
     l = newLo
     h = newHi
     let signBit = 0
@@ -774,6 +777,11 @@ let fRetNul: i32[] = []
 // wasm level, so the functype result is unchanged.
 let fRetBool: i32[] = []
 
+// Parallel to `fnNames`: `1` if the i-th function's declared return type is `i64`
+// (kind 10). Lets a call to an i64-returning function classify as i64 so its result
+// feeds i64 arithmetic / print (Slice 2). i32-only programs leave this all-zero.
+let fRetI64: i32[] = []
+
 // ── module-level GLOBALS (G2b) ────────────────────────────────────────────────
 // A top-level `let`/`const` (`LetDecl`) lowers to a wasm module GLOBAL (mutable),
 // emitted in the global section (id 6). Its wasm GLOBAL INDEX is its position among
@@ -963,6 +971,7 @@ function buildFnMap(stmts: i32[]): i32 {
   fRetRArrElem = []
   fRetBool = []
   fRetNul = []
+  fRetI64 = []
   let i = 0
   while i < fnStmts.length {
     let s = P.nodes[fnStmts[i]]
@@ -979,6 +988,7 @@ function buildFnMap(stmts: i32[]): i32 {
       fRetRArrElem.push(retRefArrElemName(s.fnRet))
       fRetBool.push(retBoolFlag(s.fnRet))
       fRetNul.push(retNulRefFlag(s.fnRet))
+      fRetI64.push(retI64Flag(s.fnRet))
     }
     i = i + 1
   }
@@ -2662,6 +2672,35 @@ function binOpcode(op: string): i32 {
   if op == "<<" { return 116 }  // 0x74 i32.shl
   if op == ">>" { return 117 }  // 0x75 i32.shr_s (signed/arithmetic)
   if op == ">>>" { return 118 } // 0x76 i32.shr_u (unsigned/logical)
+  0 - 1
+}
+
+// The i64 instruction variant for `op` (Slice 2), selected when an operand is i64.
+// Arithmetic/bitwise/shift consume two i64 and leave an i64; comparisons consume two
+// i64 and leave an i32 BOOL. Returns -1 for an op with no i64 form (`&&`/`||`/`=`/`??`).
+//   +  i64.add 0x7c  -  i64.sub 0x7d  *  i64.mul 0x7e  /  i64.div_s 0x7f  %  i64.rem_s 0x81
+//   &  i64.and 0x83  |  i64.or 0x84   ^  i64.xor 0x85  << i64.shl  0x86
+//   >> i64.shr_s 0x87  >>> i64.shr_u 0x88
+//   == i64.eq 0x51  != i64.ne 0x52  < i64.lt_s 0x53  > i64.gt_s 0x55
+//   <= i64.le_s 0x57  >= i64.ge_s 0x59
+function binOpcodeI64(op: string): i32 {
+  if op == "+" { return 124 }   // 0x7c i64.add
+  if op == "-" { return 125 }   // 0x7d i64.sub
+  if op == "*" { return 126 }   // 0x7e i64.mul
+  if op == "/" { return 127 }   // 0x7f i64.div_s
+  if op == "%" { return 129 }   // 0x81 i64.rem_s
+  if op == "&" { return 131 }   // 0x83 i64.and
+  if op == "|" { return 132 }   // 0x84 i64.or
+  if op == "^" { return 133 }   // 0x85 i64.xor
+  if op == "<<" { return 134 }  // 0x86 i64.shl
+  if op == ">>" { return 135 }  // 0x87 i64.shr_s
+  if op == ">>>" { return 136 } // 0x88 i64.shr_u
+  if op == "==" { return 81 }   // 0x51 i64.eq
+  if op == "!=" { return 82 }   // 0x52 i64.ne
+  if op == "<" { return 83 }    // 0x53 i64.lt_s
+  if op == ">" { return 85 }    // 0x55 i64.gt_s
+  if op == "<=" { return 87 }   // 0x57 i64.le_s
+  if op == ">=" { return 89 }   // 0x59 i64.ge_s
   0 - 1
 }
 
@@ -4614,9 +4653,31 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       }
       return 0
     }
-    // Integer negation: `-x` == `0 - x`, so push 0, the operand, then sub.
+    // Bitwise NOT `~x` == `x ^ -1` (flip every bit). The all-ones mask is an i64
+    // `-1` when the operand is i64, an i32 `-1` otherwise; the XOR opcode follows
+    // suit. (Slice 2 — the i64 path; the i32 path is the same shape over i32 ops.)
+    if e.unOp == "~" {
+      if exprIsI64(e.unArg, fnIx) {
+        if emitExpr(body, e.unArg, fnIx) < 0 { return 0 - 1 }
+        fbI64Const(0 - 1, 0 - 1)  // i64 -1 (all ones)
+        fbI32Bin(133)             // 0x85 i64.xor
+        return 0
+      }
+      if emitExpr(body, e.unArg, fnIx) < 0 { return 0 - 1 }
+      fbI32Const(0 - 1)           // i32 -1 (all ones)
+      fbI32Bin(115)               // 0x73 i32.xor
+      return 0
+    }
+    // Integer negation: `-x` == `0 - x`, so push 0, the operand, then sub. For an
+    // i64 operand the zero and the subtract are i64 (Slice 2).
     if e.unOp != "-" {
       return emitFail("emitProgram: unsupported unary operator")
+    }
+    if exprIsI64(e.unArg, fnIx) {
+      fbI64Const(0, 0)            // i64 0
+      if emitExpr(body, e.unArg, fnIx) < 0 { return 0 - 1 }
+      fbI32Bin(125)              // 0x7d i64.sub
+      return 0
     }
     fbI32Const(0)
     if emitExpr(body, e.unArg, fnIx) < 0 { return 0 - 1 }
@@ -4800,6 +4861,22 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
         }
       }
     }
+    // Slice 2 — i64 operators. If EITHER operand is i64, emit the i64 instruction
+    // variant and widen the i32 operand (if any) to i64 first (`emitExprAsI64`). This
+    // covers arithmetic/bitwise/shift (i64 result) AND comparisons (i32 bool result,
+    // but the COMPARE consumes two i64). The whole branch is keyed on operand kind, so
+    // an i32-only program never enters it — the i32 path below is byte-identical.
+    let lI64 = exprIsI64(e.binLeft, fnIx)
+    let rI64 = exprIsI64(e.binRight, fnIx)
+    if lI64 || rI64 {
+      let opc64 = binOpcodeI64(e.binOp)
+      if opc64 >= 0 {
+        if emitExprAsI64(body, e.binLeft, fnIx) < 0 { return 0 - 1 }
+        if emitExprAsI64(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+        fbI32Bin(opc64)
+        return 0
+      }
+    }
     let opcode = binOpcode(e.binOp)
     if opcode < 0 {
       return emitFail("emitProgram: unsupported binary operator")
@@ -4811,6 +4888,42 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     return 0
   }
   emitFail("emitProgram: unsupported expression in return")
+}
+
+// Peel any nested parentheses, returning the innermost wrapped expression index.
+function unwrapParen(exprIx: i32): i32 {
+  let cur = exprIx
+  let node = P.nodes[cur]
+  if node is Paren {
+    return unwrapParen(node.parInner)
+  }
+  cur
+}
+
+// Emit the expression at `exprIx` as an i64 value (Slice 2). If it already yields
+// i64 (`exprIsI64`) it is emitted as-is. Otherwise it is an i32 expression flowing
+// into an i64 op: a bare integer LITERAL is lowered directly as `i64.const` (set
+// `pendingI64` so the NumLit path takes the 64-bit form), and any other i32 source
+// is emitted then sign-extended with `i64.extend_i32_s` (0xac). This is the i32→i64
+// widening for mixed-width operands.
+function emitExprAsI64(body: i32[], exprIx: i32, fnIx: i32): i32 {
+  if exprIsI64(exprIx, fnIx) {
+    return emitExpr(body, exprIx, fnIx)
+  }
+  // Peel parens to find a bare literal we can emit directly as i64.const.
+  let inner = unwrapParen(exprIx)
+  let innerNode = P.nodes[inner]
+  if innerNode is NumLit {
+    let saved = pendingI64
+    pendingI64 = true
+    let r = emitExpr(body, inner, fnIx)
+    pendingI64 = saved
+    return r
+  }
+  // Non-literal i32: evaluate, then sign-extend to i64.
+  if emitExpr(body, exprIx, fnIx) < 0 { return 0 - 1 }
+  fbI64ExtendI32S()
+  0
 }
 
 // Lower a call expression at `callIx` onto `body`: evaluate every argument left-to-
@@ -4873,6 +4986,37 @@ function exprIsI64(exprIx: i32, fnIx: i32): boolean {
     if paramIsI64(fnIx, e.identName) { return true }
     if declaredI64(e.identName) { return true }
     return globalIsI64(e.identName)
+  }
+  // Slice 2: an ARITHMETIC / BITWISE / SHIFT op yields i64 when EITHER operand is i64
+  // (the i32 side widens). COMPARISONS (`==` `!=` `<` `>` `<=` `>=`) and logical
+  // connectives produce an i32 BOOL even over i64 operands, so they are NOT i64.
+  if e is BinExpr {
+    let op = e.binOp
+    if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" ||
+       op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>" || op == ">>>" {
+      if exprIsI64(e.binLeft, fnIx) { return true }
+      return exprIsI64(e.binRight, fnIx)
+    }
+    return false
+  }
+  // Unary negation `-x` / bitwise NOT `~x` preserve the operand's i64-ness. (`!`
+  // is a bool, never i64; `p+`/`p-` ride their operand but are statement-level.)
+  if e is Unary {
+    if e.unOp == "-" || e.unOp == "~" {
+      return exprIsI64(e.unArg, fnIx)
+    }
+    return false
+  }
+  // A call to an i64-returning function yields i64.
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      let target = fnIndexOf(callee.identName)
+      if target >= 0 {
+        return fRetI64[target] == 1
+      }
+    }
+    return false
   }
   false
 }
