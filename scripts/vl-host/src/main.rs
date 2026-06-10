@@ -36,9 +36,11 @@ fn gc_engine(collector: Collector) -> Result<Engine> {
     Ok(Engine::new(&cfg)?)
 }
 
-/// Drive the self-hosted compiler module: feed `source` in, return the emitted
-/// wasm bytes, or the compiler's own diagnostics as the error.
-fn compile_vl(engine: &Engine, compiler_path: &str, source: &str) -> Result<Vec<u8>> {
+/// Drive the self-hosted compiler module: feed `source` in, call `entry`
+/// (`compileSrc` for the full pipeline, `checkSrc` for parse + typecheck only),
+/// and return the emitted wasm bytes (empty for a check), or the compiler's own
+/// diagnostics as the error.
+fn compile_vl(engine: &Engine, compiler_path: &str, source: &str, entry: &str) -> Result<Vec<u8>> {
     // A `.cwasm` SIDECAR caches the Cranelift compilation of the compiler module
     // (the dominant fixed cost of every invocation). Keyed by freshness: rebuilt
     // whenever the `.wasm` is newer. `deserialize_file` is unsafe because a
@@ -72,7 +74,7 @@ fn compile_vl(engine: &Engine, compiler_path: &str, source: &str) -> Result<Vec<
 
     let src_reset = inst.get_typed_func::<(), i32>(&mut store, "srcReset")?;
     let src_push = inst.get_typed_func::<i32, i32>(&mut store, "srcPush")?;
-    let compile = inst.get_typed_func::<(), i32>(&mut store, "compileSrc")?;
+    let compile = inst.get_typed_func::<(), i32>(&mut store, entry)?;
     let rlen = inst.get_typed_func::<(), i32>(&mut store, "rbyteLen")?;
     let rat = inst.get_typed_func::<i32, i32>(&mut store, "rbyteAt")?;
     let dlen = inst.get_typed_func::<(), i32>(&mut store, "diagLen")?;
@@ -203,7 +205,7 @@ fn main() -> Result<()> {
             let out = flag("-o").unwrap_or_else(|| {
                 input.strip_suffix(".vl").unwrap_or(input).to_string() + ".wasm"
             });
-            let bytes = compile_vl(&compile_engine, &compiler, &read_source()?)?;
+            let bytes = compile_vl(&compile_engine, &compiler, &read_source()?, "compileSrc")?;
             std::fs::write(&out, &bytes)?;
             // `-O`: optimize the written module in place (wasm-opt, when present).
             if args.iter().any(|a| a == "-O") {
@@ -213,9 +215,11 @@ fn main() -> Result<()> {
             println!("wrote {out} ({len} bytes)");
         }
         "check" => {
-            // A clean compile IS the check (typecheck gates emit; emit validates the
-            // rest). Diagnostics surface through compile_vl's error path.
-            compile_vl(&compile_engine, &compiler, &read_source()?)?;
+            // `check` is parse + typecheck only (the `checkSrc` entrypoint) — NOT a
+            // full compile. Emit is `vl build`'s job; running it here would only be
+            // slower and would reject type-valid programs the emitter can't yet
+            // lower. Diagnostics surface through compile_vl's error path.
+            compile_vl(&compile_engine, &compiler, &read_source()?, "checkSrc")?;
             println!("ok");
         }
         "run" => {
@@ -230,7 +234,7 @@ fn main() -> Result<()> {
             } else {
                 let source = String::from_utf8(raw)
                     .map_err(|e| Error::from(e).context(format!("`{input}` is neither UTF-8 VL source nor a wasm module")))?;
-                compile_vl(&compile_engine, &compiler, &source)?
+                compile_vl(&compile_engine, &compiler, &source, "compileSrc")?
             };
             let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
             run_program(&run_engine, &bytes)?;
