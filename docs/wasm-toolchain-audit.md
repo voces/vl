@@ -290,6 +290,25 @@ module is precompiled (§4.2); measure before adopting. **Priority: later.**
 
 ---
 
+## Measured addendum (2026-06-10, this machine)
+
+Empirical results from the native stage3→stage4 experiment that REVISE the priorities above:
+
+- **The stage-0-built compiler module is 4.8× faster than the self-emitted one** on identical
+  work (19KB `vl check`: 13.3s vs 64.4s).
+- **`wasm-opt` over the self-emitted module was a NO-OP on runtime** (64.4s → 63.0s; size
+  222KB → 199KB). Item #3's runtime hopes do not materialize: stack sampling shows the hot cost
+  is wasmtime executing GC `array.copy` via a **per-element host libcall**
+  (`vm::libcalls::array_copy` → `ArrayRef::_get`/`_set` per element; V8 inlines the same op).
+  Those calls are semantic — no post-hoc optimizer can remove them. wasm-opt stays worthwhile
+  for SIZE and for when wasmtime's array-copy fast path improves, but it does not fix the
+  rebuild time today.
+- Consequence: the rebuild-time wins are **#8 (bulk source I/O — kill the per-code-point feed)**
+  and reducing per-character copy traffic in VL's string paths (or an upstream wasmtime
+  array-copy fast path); #1 (.cwasm) and #2 (null collector) remain valid fixed-cost wins.
+- One more compat note: `wasm-opt -all` emits **exact reference types** (custom descriptors),
+  which wasmtime 45 rejects — pass explicit `--enable-reference-types --enable-gc` instead.
+
 ## Recommended adoption order
 
 | # | Action | Component | Wins | Priority |
