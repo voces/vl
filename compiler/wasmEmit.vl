@@ -1068,6 +1068,28 @@ function fbRefCast(heapIdx: i32): i32 {
   0
 }
 
+// Function-value ops (lambdas):
+// `ref.func <funcidx>` (0xd2) — a typed funcref to function `funcidx`. The target must
+// be declared referenceable (the declarative elem segment, section 9).
+function fbRefFunc(funcIdx: i32): i32 {
+  wU8(210)           // 0xd2 ref.func
+  wULEB(funcIdx)
+  0
+}
+// `call_ref <typeidx>` (0x14) — call through a typed funcref popped off the stack,
+// after the env + args. `typeidx` is the `$fnsig` env-leading functype.
+function fbCallRef(typeIdx: i32): i32 {
+  wU8(20)            // 0x14 call_ref
+  wULEB(typeIdx)
+  0
+}
+// `ref.null struct` (0xd0 0x6b) — the null env for a non-capturing function value.
+function fbRefNullStruct(): i32 {
+  wU8(208)           // 0xd0 ref.null
+  wU8(107)           // structref abstract heaptype (0x6b)
+  0
+}
+
 // ── module header ────────────────────────────────────────────────────────────
 function emitHeader(): i32 {
   // "\0asm" magic + version 1
@@ -1254,6 +1276,35 @@ let fnIndices: i32[] = []
 // other top-level statement fails loudly there.
 let fnStmts: i32[] = []
 
+// ── function-value / closure ABI (lambdas) ────────────────────────────────────
+// A function value is a WasmGC fat-pointer struct `{ code: (ref $fnsig), env:
+// structref }` (`cloStructIdx`), called via `call_ref $fnsig` (`cloSigIdx`). Both
+// interned AFTER every existing heap type so no existing index shifts; minted ONLY
+// when `fnValUsed` (a whole-module flag — a function callable both by-name and as a
+// value uses the env-leading signature, so the decision is module-wide). When
+// `fnValUsed == 0` (every golden + the compiler's own source), zero closure types are
+// minted, the env-leading param is absent, section 9 is omitted, and the module is
+// byte-identical. `$fnsig` is the env-leading functype `(structref, i32...) -> i32`.
+// All lambdas in the corpus share `(structref, i32) -> i32`, so one `$fnsig` suffices.
+let fnValUsed: boolean = false
+let cloStructIdx: i32 = 0    // the closure fat-pointer struct heap-type index
+// The distinct value-call ARITIES (declared param counts) any function value can be
+// called with — one `$fnsig` env-leading functype `(structref, i32*arity)->i32` is
+// interned per entry, in this order. `cloSigBase` is the type index of the first.
+let cloSigArities: i32[] = []
+let cloSigBase: i32 = 0
+// Per-lifted-function env struct heap-type index, parallel to `fnStmts` (-1 = the
+// function captures nothing, so its closure env is `ref.null structref`). Filled by
+// `mAssignTypeIndices`. The captured NAMES per function are recomputed on demand by
+// `captureNamesOf` (a flat `string[]` per call — `string[][]` is not self-host-emittable).
+let fnEnvIdx: i32[] = []
+// Parallel to `fnStmts`: the `fnStmts` index of the ENCLOSING lifted function (the
+// frame a lifted function captures from), or -1 for a top-level function. A captured
+// variable's wasm type is resolved against this parent frame. Built during lifting.
+let fnParent: i32[] = []
+// Anonymous-lambda name counter (synthesized names `__lambda_N`), reset per program.
+let lambdaCtr: i32 = 0
+
 // Parallel to `fnNames`: `1` if the i-th function's declared RETURN type is the
 // struct, else `0`. Populated by `buildFnMap` so `fnRetStruct` is a flat lookup.
 let fRetRef: i32[] = []
@@ -1336,14 +1387,18 @@ let globalNames: string[] = []
 // loudly. Returns the function count, or -1 (via `emitFail`).
 function collectFns(stmts: i32[]): i32 {
   fnStmts = []
+  fnParent = []
   globalStmts = []
   globalNames = []
   startStmts = []
+  lambdaCtr = 0
+  fnValUsed = false
   let i = 0
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
     if s is FuncDecl {
       fnStmts.push(stmts[i])
+      fnParent.push(0 - 1)
     } else if s is LetDecl {
       // A top-level `let`/`const` — a module global; its position here is its index.
       globalStmts.push(stmts[i])
@@ -1357,7 +1412,187 @@ function collectFns(stmts: i32[]): i32 {
     }
     i = i + 1
   }
+  // Lift nested function declarations and anonymous `function(...)...` literals into
+  // the flat `fnStmts` list (lambda support). Each lifted FuncDecl becomes a real
+  // top-level wasm function with its own index. Scan the bodies of every function
+  // already collected AND every top-level global init / start statement; the worklist
+  // grows as nested functions are discovered (a closure inside a closure). Anonymous
+  // literals (`fnName == ""`) get a synthesized `__lambda_N` name written into the node.
+  let wi = 0
+  while wi < fnStmts.length {
+    let fn = P.nodes[fnStmts[wi]]
+    if fn is FuncDecl {
+      liftFnsInExpr(fn.fnBody, wi)
+    }
+    wi = wi + 1
+  }
+  // Also lift lambdas in top-level global initializers and start statements (parent -1).
+  let gi = 0
+  while gi < globalStmts.length {
+    let g = P.nodes[globalStmts[gi]]
+    if g is LetDecl {
+      if g.letInit >= 0 { liftFnsInExpr(g.letInit, 0 - 1) }
+    }
+    gi = gi + 1
+  }
+  let si = 0
+  while si < startStmts.length {
+    liftFnsInExpr(startStmts[si], 0 - 1)
+    si = si + 1
+  }
+  // Collect the distinct param ARITIES across all lifted functions — one `$fnsig`
+  // env-leading functype is interned per arity (a function value of arity k is called
+  // via `call_ref (structref, i32*k)->i32`). Conservatively covers every function's
+  // arity (any could be used as a value).
+  cloSigArities = []
+  if fnValUsed {
+    let ai = 0
+    while ai < fnStmts.length {
+      let afn = P.nodes[fnStmts[ai]]
+      if afn is FuncDecl {
+        let ar = afn.fnParams.length
+        if !arityKnown(ar) { cloSigArities.push(ar) }
+      }
+      ai = ai + 1
+    }
+  }
   fnStmts.length
+}
+
+// True if arity `ar` is already in `cloSigArities`.
+function arityKnown(ar: i32): boolean {
+  let i = 0
+  while i < cloSigArities.length {
+    if cloSigArities[i] == ar { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The type index of the `$fnsig` functype for value-call arity `ar`
+// (`cloSigBase + position in cloSigArities`), or -1 if not interned.
+function fnSigIdxForArity(ar: i32): i32 {
+  let i = 0
+  while i < cloSigArities.length {
+    if cloSigArities[i] == ar { return cloSigBase + i }
+    i = i + 1
+  }
+  0 - 1
+}
+
+// Recursively walk the node at `ix` (a statement or expression subtree) and append
+// every nested `FuncDecl` — whether a nested declaration statement or an anonymous
+// `function(...)` literal in expression position — to `fnStmts` (lambda lifting). An
+// anonymous literal (`fnName == ""`) is given a synthesized unique name first, so it
+// resolves like a named function. The function's OWN body is NOT descended here (the
+// outer worklist loop in `collectFns` descends each lifted function once it is in
+// `fnStmts`), preventing double-collection. Any function value's existence flips the
+// module-wide `fnValUsed` flag.
+function liftFnsInExpr(ix: i32, parent: i32): i32 {
+  if ix < 0 { return 0 }
+  let n = P.nodes[ix]
+  if n is FuncDecl {
+    if n.fnName == "" {
+      n.fnName = "__lambda_" + i32ToStr(lambdaCtr)
+      lambdaCtr = lambdaCtr + 1
+    }
+    fnStmts.push(ix)
+    fnParent.push(parent)
+    fnValUsed = true
+    return 0
+  }
+  if n is Block {
+    let stmts = n.blkStmts
+    let i = 0
+    while i < stmts.length {
+      liftFnsInExpr(stmts[i], parent)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is LetDecl {
+    if n.letInit >= 0 { liftFnsInExpr(n.letInit, parent) }
+    return 0
+  }
+  if n is RetStmt {
+    if n.retArg >= 0 { liftFnsInExpr(n.retArg, parent) }
+    return 0
+  }
+  if n is IfStmt {
+    liftFnsInExpr(n.ifCond, parent)
+    liftFnsInExpr(n.ifThen, parent)
+    if n.ifElse >= 0 { liftFnsInExpr(n.ifElse, parent) }
+    return 0
+  }
+  if n is WhileStmt {
+    liftFnsInExpr(n.whileCond, parent)
+    liftFnsInExpr(n.whileBody, parent)
+    return 0
+  }
+  if n is ForRange {
+    liftFnsInExpr(n.frFrom, parent)
+    liftFnsInExpr(n.frTo, parent)
+    if n.frStep >= 0 { liftFnsInExpr(n.frStep, parent) }
+    liftFnsInExpr(n.frBody, parent)
+    return 0
+  }
+  if n is ForIn {
+    liftFnsInExpr(n.fiIter, parent)
+    liftFnsInExpr(n.fiBody, parent)
+    return 0
+  }
+  if n is Call {
+    liftFnsInExpr(n.callFn, parent)
+    let args = n.callArgs
+    let i = 0
+    while i < args.length {
+      liftFnsInExpr(args[i], parent)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is BinExpr {
+    liftFnsInExpr(n.binLeft, parent)
+    liftFnsInExpr(n.binRight, parent)
+    return 0
+  }
+  if n is Unary {
+    liftFnsInExpr(n.unArg, parent)
+    return 0
+  }
+  if n is Paren {
+    liftFnsInExpr(n.parInner, parent)
+    return 0
+  }
+  if n is Member {
+    liftFnsInExpr(n.memObj, parent)
+    return 0
+  }
+  if n is Index {
+    liftFnsInExpr(n.idxArr, parent)
+    liftFnsInExpr(n.idxIndex, parent)
+    return 0
+  }
+  if n is ObjLit {
+    let fields = n.objFields
+    let i = 0
+    while i < fields.length {
+      let f = P.nodes[fields[i]]
+      if f is FieldInit { liftFnsInExpr(f.fiValue, parent) }
+      i = i + 1
+    }
+    return 0
+  }
+  if n is ArrayLit {
+    let elems = n.arrElems
+    let i = 0
+    while i < elems.length {
+      liftFnsInExpr(elems[i], parent)
+      i = i + 1
+    }
+    return 0
+  }
+  0
 }
 
 // The wasm global index for `name`, or -1 if no top-level global has that name.
@@ -1757,6 +1992,321 @@ function fnIndexOf(name: string): i32 {
       return fnIndices[i]
     }
     i = i + 1
+  }
+  0 - 1
+}
+
+// ── capture analysis (closures) ───────────────────────────────────────────────
+// The captured-variable NAMES of the lifted function at `fnStmts[fe]`, in
+// encounter (= env field) order. A capture is a free variable: an identifier read
+// in the body that is NOT one of the function's own params, NOT a `let`/`const`
+// declared in the body, NOT a module global, and NOT a top-level/lifted function
+// name (those are addressable directly). Recomputed on demand (no `string[][]`
+// state — that type is not self-host-emittable). The walk threads a growable
+// `bound` set (params, then each `let` as it is declared) and accumulates free
+// names into `caps` (deduped). Mirrors the host's `captureCollector`.
+function captureNamesOf(fe: i32): string[] {
+  let caps: string[] = []
+  if fe < 0 || fe >= fnStmts.length { return caps }
+  let fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    let bound: string[] = []
+    let params = fn.fnParams
+    let pi = 0
+    while pi < params.length {
+      let p = P.nodes[params[pi]]
+      if p is Param { bound.push(p.parName) }
+      pi = pi + 1
+    }
+    capScan(fn.fnBody, bound, caps)
+  }
+  caps
+}
+
+// The number of captured variables of the lifted function at `fnStmts[fe]`.
+function captureCountOf(fe: i32): i32 {
+  let caps = captureNamesOf(fe)
+  caps.length
+}
+
+// True if `name` is currently in the `bound` set (a param or an in-scope `let`).
+function capIsBound(bound: string[], name: string): boolean {
+  let i = 0
+  while i < bound.length {
+    if bound[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True if `name` is in `caps` already (dedup the capture list).
+function capHas(caps: string[], name: string): boolean {
+  let i = 0
+  while i < caps.length {
+    if caps[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Record a free-variable reference to `name`: a capture unless it is bound locally,
+// a module global, or a top-level/lifted function name (addressable directly).
+function capRecord(name: string, bound: string[], caps: string[]): i32 {
+  if capIsBound(bound, name) { return 0 }
+  if globalIndexOf(name) >= 0 { return 0 }
+  if fnIndexOf(name) >= 0 { return 0 }
+  if capHas(caps, name) { return 0 }
+  caps.push(name)
+  0
+}
+
+// Walk a statement/expression subtree collecting free-variable captures. `bound`
+// grows as `let`/`const` declarations are seen (wasm locals are function-scoped, so
+// once declared a name shadows an enclosing binding for the rest of the body — a
+// conservative but sound match for the corpus). A NESTED FuncDecl is NOT descended
+// (it is lifted to its own function with its own capture analysis); its name, if
+// any, binds locally.
+function capScan(ix: i32, bound: string[], caps: string[]): i32 {
+  if ix < 0 { return 0 }
+  let n = P.nodes[ix]
+  if n is Ident {
+    capRecord(n.identName, bound, caps)
+    return 0
+  }
+  if n is FuncDecl {
+    if n.fnName != "" { bound.push(n.fnName) }
+    return 0
+  }
+  if n is Block {
+    let stmts = n.blkStmts
+    let i = 0
+    while i < stmts.length {
+      capScan(stmts[i], bound, caps)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is LetDecl {
+    if n.letInit >= 0 { capScan(n.letInit, bound, caps) }
+    bound.push(n.letName)
+    return 0
+  }
+  if n is RetStmt {
+    if n.retArg >= 0 { capScan(n.retArg, bound, caps) }
+    return 0
+  }
+  if n is IfStmt {
+    capScan(n.ifCond, bound, caps)
+    capScan(n.ifThen, bound, caps)
+    if n.ifElse >= 0 { capScan(n.ifElse, bound, caps) }
+    return 0
+  }
+  if n is WhileStmt {
+    capScan(n.whileCond, bound, caps)
+    capScan(n.whileBody, bound, caps)
+    return 0
+  }
+  if n is ForRange {
+    capScan(n.frFrom, bound, caps)
+    capScan(n.frTo, bound, caps)
+    if n.frStep >= 0 { capScan(n.frStep, bound, caps) }
+    bound.push(n.frVar)
+    capScan(n.frBody, bound, caps)
+    return 0
+  }
+  if n is ForIn {
+    capScan(n.fiIter, bound, caps)
+    bound.push(n.fiVar)
+    capScan(n.fiBody, bound, caps)
+    return 0
+  }
+  if n is Call {
+    capScan(n.callFn, bound, caps)
+    let args = n.callArgs
+    let i = 0
+    while i < args.length {
+      capScan(args[i], bound, caps)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is BinExpr {
+    capScan(n.binLeft, bound, caps)
+    capScan(n.binRight, bound, caps)
+    return 0
+  }
+  if n is Unary {
+    capScan(n.unArg, bound, caps)
+    return 0
+  }
+  if n is Paren {
+    capScan(n.parInner, bound, caps)
+    return 0
+  }
+  if n is Member {
+    capScan(n.memObj, bound, caps)
+    return 0
+  }
+  if n is OptMember {
+    capScan(n.omObj, bound, caps)
+    return 0
+  }
+  if n is Index {
+    capScan(n.idxArr, bound, caps)
+    capScan(n.idxIndex, bound, caps)
+    return 0
+  }
+  if n is IsExpr {
+    capScan(n.isObj, bound, caps)
+    return 0
+  }
+  if n is ObjLit {
+    let fields = n.objFields
+    let i = 0
+    while i < fields.length {
+      let f = P.nodes[fields[i]]
+      if f is FieldInit { capScan(f.fiValue, bound, caps) }
+      i = i + 1
+    }
+    return 0
+  }
+  if n is ArrayLit {
+    let elems = n.arrElems
+    let i = 0
+    while i < elems.length {
+      capScan(elems[i], bound, caps)
+      i = i + 1
+    }
+    return 0
+  }
+  0
+}
+
+// The env struct heap-type index for the lifted function at index `fe`, or -1 if it
+// captures nothing (its closure env is `ref.null structref`). Resolved by
+// `mAssignTypeIndices` into `fnEnvIdx`.
+function fnEnvIdxOf(fe: i32): i32 {
+  if fe < 0 || fe >= fnEnvIdx.length { return 0 - 1 }
+  fnEnvIdx[fe]
+}
+
+// True if function `fe`'s env-leading signature matches an interned `$fnsig`
+// `(structref, i32 * arity) -> i32` — every param i32, an i32 (or inferred-i32) result,
+// non-void. Such a function is declared with `fnSigIdxForArity` as its functype (so its
+// ACTUAL type IS `$fnsig`), making `ref.func` of it yield a value the `call_ref` site's
+// `ref.cast` to `$fnsig` accepts. A function with a non-i32 param/return keeps its own
+// functype and cannot be used as a value (none in the corpus are).
+function fnSigIsClosure(fe: i32): boolean {
+  if fe < 0 || fe >= fnStmts.length { return false }
+  let fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let pi = 0
+    while pi < params.length {
+      if vtKindOfParam(params[pi]) != 0 { return false }   // every param must be i32
+      pi = pi + 1
+    }
+    if fRetVoid[fe] == 1 { return false }
+    if fnReturnsClosure(fe) { return false }
+    if fn.fnRet >= 0 { return vtKindOfType(fn.fnRet) == 0 }
+    // Un-annotated: i32 unless a non-i32 kind was inferred.
+    if fRetStr[fe] == 1 { return false }
+    if fRetArr[fe] == 1 { return false }
+    if fRetUni[fe] == 1 { return false }
+    if fRetRef[fe] == 1 { return false }
+    if fRetNul[fe] == 1 { return false }
+    if fRetRArr[fe] == 1 { return false }
+    if fRetI64[fe] == 1 { return false }
+    if fRetF64[fe] == 1 { return false }
+    if fRetF32[fe] == 1 { return false }
+    return true
+  }
+  false
+}
+
+// The arena index of the parent frame's binding for a captured `name` — the parent
+// FuncDecl's matching `Param` node, or a `LetDecl` in the parent body, or -1. Used to
+// resolve a capture's wasm valtype (its declared type lives in the parent frame).
+function parentBindingOf(fe: i32, name: string): i32 {
+  if fe < 0 || fe >= fnParent.length { return 0 - 1 }
+  let par = fnParent[fe]
+  if par < 0 || par >= fnStmts.length { return 0 - 1 }
+  let pfn = P.nodes[fnStmts[par]]
+  if pfn is FuncDecl {
+    let params = pfn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return params[i] }
+      }
+      i = i + 1
+    }
+    return parentLetOf(pfn.fnBody, name)
+  }
+  0 - 1
+}
+
+// Find a `LetDecl` for `name` anywhere in the parent body block (incl. nested if/loop
+// bodies — wasm locals are function-scoped). Returns its arena index or -1.
+function parentLetOf(blockIx: i32, name: string): i32 {
+  if blockIx < 0 { return 0 - 1 }
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let st = P.nodes[stmts[i]]
+      if st is LetDecl {
+        if st.letName == name { return stmts[i] }
+      } else if st is IfStmt {
+        let r = parentLetOf(st.ifThen, name)
+        if r >= 0 { return r }
+        if st.ifElse >= 0 {
+          let r2 = parentLetOf(st.ifElse, name)
+          if r2 >= 0 { return r2 }
+        }
+      } else if st is WhileStmt {
+        let r3 = parentLetOf(st.whileBody, name)
+        if r3 >= 0 { return r3 }
+      }
+      i = i + 1
+    }
+  }
+  0 - 1
+}
+
+// The `fbValtype` kind for a captured variable `name` of lifted function `fe`,
+// resolved against the parent frame's binding (a param's annotation, or a local
+// `let`'s annotation / struct-literal initializer). Defaults to i32 (kind 0).
+function captureValKind(fe: i32, name: string): i32 {
+  let b = parentBindingOf(fe, name)
+  if b < 0 { return 0 }
+  let bn = P.nodes[b]
+  if bn is Param { return vtKindOfType(bn.parType) }
+  if bn is LetDecl {
+    if bn.letType >= 0 { return vtKindOfType(bn.letType) }
+    // Un-annotated local: a struct-literal init is a struct ref (kind 1).
+    if bn.letInit >= 0 {
+      let iv = P.nodes[bn.letInit]
+      if iv is ObjLit { return 1 }
+    }
+  }
+  0
+}
+
+// The second `fbValtype` arg (struct table index) for a captured struct-ref variable.
+function captureValStructIdx(fe: i32, name: string): i32 {
+  let b = parentBindingOf(fe, name)
+  if b < 0 { return 0 - 1 }
+  let bn = P.nodes[b]
+  if bn is Param { return retStructIndex(bn.parType) }
+  if bn is LetDecl {
+    if bn.letType >= 0 { return retStructIndex(bn.letType) }
+    if bn.letInit >= 0 {
+      let iv = P.nodes[bn.letInit]
+      if iv is ObjLit { return structIndexOfExpr(bn.letInit, fnParent[fe]) }
+    }
   }
   0 - 1
 }
@@ -2433,6 +2983,10 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
           // kind 11, valtype 0x7c). Bypasses `checkLocalI32`; the init literal lowers
           // as `f64.const` in `emitStmt`'s LetDecl path. (Slice 3.)
           slot = addLocalName(s.letName, 11, 0 - 1)
+        } else if letIsClosure(stmts[i], fnIx) {
+          // A function-VALUE local (`const f = function(...)...` or `const g = namedFn`),
+          // kind 14 — its cell is the closure fat-pointer struct `(ref $cloStructIdx)`.
+          slot = addLocalName(s.letName, 14, 0 - 1)
         } else {
           if checkLocalI32(stmts[i]) < 0 { scopePop() return 0 - 1 }
           slot = addLocalName(s.letName, 0, 0 - 1)
@@ -3221,17 +3775,28 @@ function declaredIndexOf(fnIx: i32, name: string): i32 {
   }
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    return fn.fnParams.length + pos
+    return envSlotShift(fnIx) + fn.fnParams.length + pos
   }
   0 - 1
 }
 
+// The wasm-local-index offset introduced by the env-leading closure param: when ANY
+// function value exists in the module (`fnValUsed`), EVERY function (except the start
+// fn, `fnIx < 0`) carries a hidden leading `structref env` at local 0, so its declared
+// params shift to locals 1..p and its declared locals to p+1... Zero otherwise — so a
+// no-lambda module keeps the original 0-based param layout and stays byte-identical.
+function envSlotShift(fnIx: i32): i32 {
+  if fnValUsed && fnIx >= 0 { return 1 }
+  0
+}
+
 // Resolve an identifier `name` to its wasm local index for function `fnIx`: a param
-// first (locals 0..p-1), else a declared local (locals p..). Returns -1 if neither.
+// first (locals 0..p-1, shifted past the env param when `fnValUsed`), else a declared
+// local. Returns -1 if neither.
 function localIndexOf(fnIx: i32, name: string): i32 {
   let pIx = paramIndexOf(fnIx, name)
   if pIx >= 0 {
-    return pIx
+    return envSlotShift(fnIx) + pIx
   }
   declaredIndexOf(fnIx, name)
 }
@@ -3538,6 +4103,83 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
     return 0
   }
   emitFail("emitProgram: expected an object literal")
+}
+
+// ── function-value construction (lambdas) ─────────────────────────────────────
+// Emit a function VALUE for the lifted function at `fnStmts` position `fe`: the closure
+// fat-pointer `struct.new $cloStruct [ ref.func $(gImports+fe), env ]`. The env is
+// `ref.null struct` for a non-capturing function, else a `struct.new $envStruct` of the
+// captured values, each READ in the enclosing frame `fnIx` (so a capture of `n` emits a
+// `local.get` of `n` in the maker's frame). Mirrors the host's `closureValue`.
+function emitClosureValue(body: i32[], fe: i32, fnIx: i32): i32 {
+  if fe < 0 || fe >= fnStmts.length {
+    return emitFail("emitProgram: function value with no lifted function")
+  }
+  // field 0: the typed funcref to the lifted function (imports occupy 0..gImports-1).
+  fbRefFunc(gImports + fe)
+  // field 1: the env. Non-capturing → null; capturing → a fresh env struct.
+  let envIdx = fnEnvIdxOf(fe)
+  if envIdx < 0 {
+    fbRefNullStruct()
+  } else {
+    let caps = captureNamesOf(fe)
+    let ci = 0
+    while ci < caps.length {
+      // Read each captured variable in the ENCLOSING frame. The capture's value is its
+      // current local/param/global value at the point the closure is created.
+      if emitCaptureRead(body, caps[ci], fnIx) < 0 { return 0 - 1 }
+      ci = ci + 1
+    }
+    fbStructNew(envIdx)
+  }
+  fbStructNew(cloStructIdx)
+  0
+}
+
+// If `name` is a CAPTURED variable of the capturing lifted function currently being
+// emitted (`fnIx`), emit a read of it from the env struct and return 1; else return 0
+// (the caller falls through to the normal param/local/global path). The env rides as
+// the leading `structref` param at local 0; recover the concrete env struct with
+// `ref.cast`, then `struct.get` the field at the capture's index. Mirrors the host's
+// captured-Name lowering.
+function emitCapturedRead(body: i32[], name: string, fnIx: i32): i32 {
+  if fnIx < 0 { return 0 }
+  if !fnValUsed { return 0 }
+  let fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return 0 }
+  let envIdx = fnEnvIdxOf(fe)
+  if envIdx < 0 { return 0 }
+  let caps = captureNamesOf(fe)
+  let ci = 0
+  while ci < caps.length {
+    if caps[ci] == name {
+      // (ref.cast (ref $env) (local.get 0)) then struct.get $env ci.
+      fbLocalGet(0)              // the leading env param (structref)
+      fbRefCast(envIdx)          // 0xfb 0x16 <env heap> ref.cast — narrow to this env
+      fbStructGet(envIdx, ci)
+      return 1
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// Read a captured variable `name` in the enclosing frame `fnIx` for the env struct
+// build. A param/local is a `local.get`; a module global a `global.get`. (Captures of
+// globals/top-level functions are excluded by capture analysis, so this only sees
+// params/locals of the maker.)
+function emitCaptureRead(body: i32[], name: string, fnIx: i32): i32 {
+  let idx = localIndexOf(fnIx, name)
+  if idx >= 0 {
+    fbLocalGet(idx)
+    return 0
+  }
+  let gIdx = globalIndexOf(name)
+  if gIdx >= 0 {
+    fbGlobalGet(gIdx)
+    return 0
+  }
+  emitFail("emitProgram: captured variable not found in enclosing frame")
 }
 
 // ── union value construction + discrimination + narrowing (G1) ────────────────
@@ -4066,6 +4708,12 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
 let fnUsesMap: boolean = false
 let mapScratchBase: i32 = 0
 
+// Whether the current function performs a `call_ref` (a function-value call) — drives a
+// 1-slot closure scratch frame (`callRefSlot`, a `(ref $cloStruct)` local) that stashes
+// the closure once so its env + code fields are read off ONE evaluation.
+let fnUsesCallRef: boolean = false
+let callRefSlot: i32 = 0
+
 // True if function `fnIx` operates on a map — it has a map PARAM, or `buildLocals`
 // flagged a map LOCAL (code `6`). Drives the map scratch-frame reservation. (Run
 // AFTER `buildLocals`, so `localIsRef` is populated.)
@@ -4098,6 +4746,106 @@ function fnHasMap(fnIx: i32): boolean {
       }
       pj = pj + 1
     }
+  }
+  false
+}
+
+// True if the statement/expression tree at `ix` contains a function-VALUE call (a
+// `Call` whose callee is a closure value rather than a known function name) — so the
+// function needs the closure scratch slot for `call_ref`. (Lambdas.)
+function blockHasCallRef(ix: i32, fnIx: i32): boolean {
+  if ix < 0 { return false }
+  let n = P.nodes[ix]
+  if n is Call {
+    let callee = P.nodes[n.callFn]
+    let isVal = false
+    if callee is Ident {
+      let t = fnIndexOf(callee.identName)
+      if t < 0 {
+        if exprIsClosure(n.callFn, fnIx) { isVal = true }
+      } else {
+        // A direct call to a CAPTURING function is lowered via call_ref too.
+        if captureCountOf(t) > 0 { isVal = true }
+      }
+    } else {
+      if exprIsClosure(n.callFn, fnIx) { isVal = true }
+    }
+    if isVal { return true }
+    if blockHasCallRef(n.callFn, fnIx) { return true }
+    let args = n.callArgs
+    let i = 0
+    while i < args.length {
+      if blockHasCallRef(args[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if n is Block {
+    let stmts = n.blkStmts
+    let i = 0
+    while i < stmts.length {
+      if blockHasCallRef(stmts[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if n is LetDecl {
+    if n.letInit >= 0 { return blockHasCallRef(n.letInit, fnIx) }
+    return false
+  }
+  if n is RetStmt {
+    if n.retArg >= 0 { return blockHasCallRef(n.retArg, fnIx) }
+    return false
+  }
+  if n is IfStmt {
+    if blockHasCallRef(n.ifCond, fnIx) { return true }
+    if blockHasCallRef(n.ifThen, fnIx) { return true }
+    if n.ifElse >= 0 { return blockHasCallRef(n.ifElse, fnIx) }
+    return false
+  }
+  if n is WhileStmt {
+    if blockHasCallRef(n.whileCond, fnIx) { return true }
+    return blockHasCallRef(n.whileBody, fnIx)
+  }
+  if n is ForRange {
+    if blockHasCallRef(n.frFrom, fnIx) { return true }
+    if blockHasCallRef(n.frTo, fnIx) { return true }
+    if n.frStep >= 0 { if blockHasCallRef(n.frStep, fnIx) { return true } }
+    return blockHasCallRef(n.frBody, fnIx)
+  }
+  if n is ForIn {
+    if blockHasCallRef(n.fiIter, fnIx) { return true }
+    return blockHasCallRef(n.fiBody, fnIx)
+  }
+  if n is BinExpr {
+    if blockHasCallRef(n.binLeft, fnIx) { return true }
+    return blockHasCallRef(n.binRight, fnIx)
+  }
+  if n is Unary { return blockHasCallRef(n.unArg, fnIx) }
+  if n is Paren { return blockHasCallRef(n.parInner, fnIx) }
+  if n is Member { return blockHasCallRef(n.memObj, fnIx) }
+  if n is Index {
+    if blockHasCallRef(n.idxArr, fnIx) { return true }
+    return blockHasCallRef(n.idxIndex, fnIx)
+  }
+  if n is ObjLit {
+    let fields = n.objFields
+    let i = 0
+    while i < fields.length {
+      let f = P.nodes[fields[i]]
+      if f is FieldInit { if blockHasCallRef(f.fiValue, fnIx) { return true } }
+      i = i + 1
+    }
+    return false
+  }
+  if n is ArrayLit {
+    let elems = n.arrElems
+    let i = 0
+    while i < elems.length {
+      if blockHasCallRef(elems[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
   }
   false
 }
@@ -5303,9 +6051,22 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     return 0
   }
   if e is Ident {
+    // A CAPTURED variable (a free var of a capturing lifted function): read it from the
+    // env struct threaded as the leading param (local 0) —
+    // `struct.get $env <fieldIdx> (ref.cast (local.get 0) (ref $env))`. Checked FIRST so
+    // a capture shadows nothing (it is neither a param/local of this function nor a
+    // global). Only fires inside a capturing lifted function.
+    if emitCapturedRead(body, e.identName, fnIx) == 1 { return 0 }
     // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
     let idx = localIndexOf(fnIx, e.identName)
     if idx < 0 {
+      // A bare top-level/lifted function NAME in value position constructs a function
+      // value (closure fat-pointer). A capturing function referenced by name would need
+      // its captures live — but a top-level function never captures, so its env is null.
+      let fe = fnStmtsPosOf(fnIndexOf(e.identName))
+      if fe >= 0 {
+        return emitClosureValue(body, fe, fnIx)
+      }
       // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
       let gIdx = globalIndexOf(e.identName)
       if gIdx >= 0 {
@@ -5639,6 +6400,15 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
     fbI32Bin(opcode)
     return 0
+  }
+  if e is FuncDecl {
+    // An anonymous `function(...)` literal in value position (it was lifted to a
+    // top-level function by `collectFns`, keeping its name). Construct its closure value.
+    let fe = fnStmtsPosOf(exprIx)
+    if fe >= 0 {
+      return emitClosureValue(body, fe, fnIx)
+    }
+    return emitFail("emitProgram: function literal not lifted")
   }
   emitFail("emitProgram: unsupported expression in return")
 }
@@ -6191,7 +6961,41 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
       }
       let target = fnIndexOf(callee.identName)
       if target < 0 {
+        // Not a known function name — a CLOSURE-VALUED callee (a let/param/global holding
+        // a function value, or a higher-order call result). Emit a `call_ref` over the
+        // closure fat-pointer: push env, push args, push code, `call_ref $fnsig`.
+        if exprIsClosure(c.callFn, fnIx) {
+          return emitCallRef(body, callIx, fnIx)
+        }
         return emitFail("emitProgram: call to unknown function")
+      }
+      // A direct call to a CAPTURING lifted function (`add(10)` where `add` captures `n`
+      // from the enclosing frame): build its closure value (reading the captures live)
+      // and `call_ref` it — a plain `call` would pass a null env and lose the captures.
+      // Gated on `fnValUsed` so a no-lambda module never enters this path (and capture
+      // analysis, which can false-positive on a forward reference, is never consulted).
+      if fnValUsed && captureCountOf(target) > 0 {
+        // Stash the freshly-built closure, then call_ref it (same shape as emitCallRef
+        // but the callee is a value we synthesize here, not an existing binding).
+        if emitClosureValue(body, target, fnIx) < 0 { return 0 - 1 }
+        fbLocalSet(callRefSlot)
+        fbLocalGet(callRefSlot)
+        fbStructGet(cloStructIdx, 1)            // env
+        let cargs = c.callArgs
+        let cai = 0
+        while cai < cargs.length {
+          if emitExpr(body, cargs[cai], fnIx) < 0 { return 0 - 1 }
+          cai = cai + 1
+        }
+        let csig = fnSigIdxForArity(cargs.length)
+        if csig < 0 {
+          return emitFail("emitProgram: captured call arity has no interned signature")
+        }
+        fbLocalGet(callRefSlot)
+        fbStructGet(cloStructIdx, 0)            // code (funcref)
+        fbRefCast(csig)
+        fbCallRef(csig)
+        return 0
       }
       // The callee's FuncDecl lives at `fnStmts[target]` (the function index IS the
       // fnStmts position). Its parameter list lets a struct-literal argument construct as
@@ -6200,6 +7004,12 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
       // whose param struct shares field names with another struct.
       let cFn = P.nodes[fnStmts[target]]
       let args = c.callArgs
+      // When a function value exists module-wide, EVERY callee carries a hidden leading
+      // `structref env` param. A direct call to a top-level function (never capturing)
+      // passes a null env. Pushed BEFORE the args, matching the env-leading signature.
+      if fnValUsed {
+        fbRefNullStruct()
+      }
       let i = 0
       while i < args.length {
         // If this argument position is a struct-typed parameter, hint `emitObj` with the
@@ -6285,7 +7095,47 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
       fbCall(gImports + target)  // 0x10 call (imports occupy indices 0..gImports-1)
       return 0
     }
+    // A non-Ident callee yielding a function value (`o.go(10)`, `(expr)(args)`):
+    // `call_ref` over the closure fat-pointer.
+    if exprIsClosure(c.callFn, fnIx) {
+      return emitCallRef(body, callIx, fnIx)
+    }
     return emitFail("emitProgram: callee is not a function name")
+  }
+  emitFail("emitProgram: expected a call expression")
+}
+
+// Lower a function-VALUE call `f(args)` via `call_ref` over the closure fat-pointer.
+// The closure is evaluated ONCE into a scratch local, then: push its env
+// (`struct.get 1`), push the args, push its code funcref (`struct.get 0`), and
+// `call_ref $fnsig`. Mirrors the host's `indirectCall` (adapted to `call_ref`).
+function emitCallRef(body: i32[], callIx: i32, fnIx: i32): i32 {
+  let c = P.nodes[callIx]
+  if c is Call {
+    // Evaluate the closure once into the call-ref scratch local (`callRefSlot`).
+    if emitExpr(body, c.callFn, fnIx) < 0 { return 0 - 1 }
+    fbLocalSet(callRefSlot)
+    // env = closure.env (field 1).
+    fbLocalGet(callRefSlot)
+    fbStructGet(cloStructIdx, 1)
+    // args.
+    let args = c.callArgs
+    let i = 0
+    while i < args.length {
+      if emitExpr(body, args[i], fnIx) < 0 { return 0 - 1 }
+      i = i + 1
+    }
+    // code = closure.code (field 0) — a generic funcref. ref.cast it to the concrete
+    // `$fnsig` for this call's arity, then call_ref.
+    let sig = fnSigIdxForArity(args.length)
+    if sig < 0 {
+      return emitFail("emitProgram: function-value call arity has no interned signature")
+    }
+    fbLocalGet(callRefSlot)
+    fbStructGet(cloStructIdx, 0)
+    fbRefCast(sig)             // 0xfb 0x16 <fnsig> ref.cast funcref -> (ref $fnsig)
+    fbCallRef(sig)
+    return 0
   }
   emitFail("emitProgram: expected a call expression")
 }
@@ -6905,6 +7755,12 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     return emitFail("emitProgram: missing statement")
   }
   let s = P.nodes[stmtIx]
+  if s is FuncDecl {
+    // A NESTED function declaration statement (`function add(x) x + n`): it was lifted to
+    // a top-level wasm function by `collectFns`, so it emits no inline code here — just a
+    // no-op in its enclosing body. Its name resolves as a closure value when referenced.
+    return 0
+  }
   if s is LetDecl {
     // `let x = <expr>` / `const x = <expr>`: emit the init, then store it into the
     // local's slot. This `LetDecl`'s slot is the next cursor position (collect allocated
@@ -6918,7 +7774,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     // arena node to read, so the lookup must be guarded.
     if fnIx >= 0 {
       let fn = P.nodes[fnIx]
-      if fn is FuncDecl { paramN = fn.fnParams.length }
+      if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
     }
     let idx = paramN + slot
     if s.letInit < 0 {
@@ -7165,7 +8021,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     let paramN = 0
     if fnIx >= 0 {
       let fn = P.nodes[fnIx]
-      if fn is FuncDecl { paramN = fn.fnParams.length }
+      if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
     }
     let vIdx = paramN + vSlot
     let bIdx = paramN + bSlot
@@ -7266,7 +8122,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     let paramN = 0
     if fnIx >= 0 {
       let fn = P.nodes[fnIx]
-      if fn is FuncDecl { paramN = fn.fnParams.length }
+      if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
     }
     let vIdx = paramN + vSlot
     let iIdx = paramN + iSlot
@@ -7731,6 +8587,9 @@ function fbBeginFunc(nParams: i32, nLocals: i32): i32 {
   // G8 map scratch frame (12 slots).
   mapScratchBase = fbScratchCur
   if fnUsesMap { fbReserve(12) }
+  // Closure scratch frame (1 slot, a `(ref $cloStruct)`) for `call_ref` (lambdas).
+  callRefSlot = fbScratchCur
+  if fnUsesCallRef { fbReserve(1) }
   fbScratchCur
 }
 
@@ -7774,6 +8633,7 @@ function fbLocalsCount(nLocals: i32): i32 {
   if fnUsesStrPush { n = n + 4 }
   if fnUsesStrOp { n = n + 7 }
   if fnUsesMap { n = n + 12 }
+  if fnUsesCallRef { n = n + 1 }
   n
 }
 
@@ -7849,6 +8709,10 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32): i32 {
     fbRefRun(aTypeIdx)
     fbI32Run()
   }
+  // Closure scratch slot (1, (ref $cloStruct)) for `call_ref` (lambdas).
+  if fnUsesCallRef {
+    fbRefRun(cloStructIdx)
+  }
   wTarget(prev)
   0
 }
@@ -7892,6 +8756,10 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     // `fnHasMap` only scans LOCALS/params; also reserve the frame when a map op runs
     // on a GLOBAL struct-field map-array element (e.g. `T.scopes[top][k] = v`).
     if !fnUsesMap { fnUsesMap = fnHasGlobalMapOp(fnIx) }
+    // A function-value call (`call_ref`) anywhere in the body reserves the closure
+    // scratch slot. Only detected when a function value exists module-wide (lambdas).
+    fnUsesCallRef = false
+    if fnValUsed { fnUsesCallRef = blockHasCallRef(fn.fnBody, fnIx) }
     // Collect the DISTINCT ref-list element-type slots this function pushes onto (each
     // gets its own typed 4-slot scratch frame). Empty unless `fnUsesRefPush`.
     fnRefPushSlots = []
@@ -7906,7 +8774,9 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     // FuncBuilder cursor (Phase H), which sets `pushScratchBase` /
     // `refPushScratchBase` / `refPushBaseBySlot` / `strPushScratchBase` /
     // `strScratchBase` / `mapScratchBase` from ONE running offset in frame order.
-    fbBeginFunc(fn.fnParams.length, nLocals)
+    // Scratch frames land after the params AND the hidden env param (local 0) when a
+    // function value exists module-wide, so the cursor starts past `envSlotShift`.
+    fbBeginFunc(fn.fnParams.length + envSlotShift(fnIx), nLocals)
 
     let bodyExpr: i32[] = []
     // Bind the writer at `bodyExpr` so the `fb*` opcode methods (which append to
@@ -8381,6 +9251,12 @@ function paramStructIdxOf(paramIx: i32): i32 {
 function globalKind(initIx: i32): i32 {
   if initIx < 0 { return 0 }
   let e = P.nodes[initIx]
+  // A function-literal init (`const add = function(...)...`) — or a bare reference to a
+  // top-level function name in value position — is a closure fat-pointer cell (kind 14).
+  if e is FuncDecl { return 14 }
+  if e is Ident {
+    if fnIndexOf(e.identName) >= 0 { return 14 }
+  }
   // An un-annotated float `.` literal init (`const a = 1.5`) is an f64 cell (kind 11),
   // lowered as `f64.const`. (Slice 3 — additive; bare integer globals stay kind 0.)
   if e is NumLit {
@@ -8576,6 +9452,8 @@ function fbRefNullForKind(kind: i32, structIdx: i32): i32 {
     wSLEB(mStructIdx)
   } else if kind == 7 {
     wSLEB(mkListIdx)
+  } else if kind == 14 {
+    wSLEB(cloStructIdx)          // the closure fat-pointer struct heap type
   } else {
     wSLEB(aTypeIdx)
   }
@@ -8626,6 +9504,9 @@ function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
     wSLEB(fl64TypeIdx)         // the f64-list wrapper struct heap-type index (Slice 4)
   } else if kind == 13 {
     wU8(125)                   // 0x7d f32 (scalar, never a nullable ref — Slice 5)
+  } else if kind == 14 {
+    wU8(99)                    // 0x63 (ref null) — nullable closure ref (lambdas)
+    wSLEB(cloStructIdx)
   } else {
     wU8(127)                   // 0x7f i32
   }
@@ -8710,6 +9591,9 @@ function fbValtype(kind: i32, structIdx: i32): i32 {
     wSLEB(fl64TypeIdx)   // the f64-list wrapper struct heap-type index (Slice 4)
   } else if kind == 13 {
     wU8(125)             // 0x7d f32 (Slice 5: scalar f32 local/param/global/result)
+  } else if kind == 14 {
+    wU8(100)             // 0x64 non-null ref — the closure fat-pointer struct (lambdas)
+    wSLEB(cloStructIdx)
   } else {
     wU8(127)             // 0x7f i32
   }
@@ -8886,11 +9770,62 @@ function mAssignTypeIndices(n: i32): i32 {
     fa64TypeIdx = oldFa64Idx
     fl64TypeIdx = oldFa64Idx + 1
   }
+  // The function-value closure types (lambdas), interned LAST among the heap types so no
+  // existing index shifts. The closure fat-pointer struct `{ code: (ref $fnsig), env:
+  // structref }` first, then the env-leading functype `$fnsig` `(structref, i32...) ->
+  // i32`. Both reference each other (mutually recursive in the one rec group). Then one
+  // env struct per CAPTURING lifted function (capture order = field order), interned
+  // after `$fnsig`. Present only when `fnValUsed`; zero types minted otherwise.
+  let oldCloIdx = oldFa64Idx + f64ListOffsetOf()
+  fnEnvIdx = []
+  if fnValUsed {
+    cloStructIdx = mAllocType()
+    if mAssertIdx(cloStructIdx, oldCloIdx, "cloStructIdx") < 0 { return 0 - 1 }
+    // One `$fnsig` functype per distinct value-call arity (`cloSigArities`).
+    cloSigBase = mNextType
+    let sa = 0
+    while sa < cloSigArities.length {
+      mAllocType()
+      sa = sa + 1
+    }
+    // One env struct per capturing lifted function (in `fnStmts` order). A
+    // non-capturing function gets `-1` (its closure env is `ref.null structref`).
+    let fe = 0
+    while fe < fnStmts.length {
+      let ncap = captureCountOf(fe)
+      if ncap > 0 {
+        fnEnvIdx.push(mAllocType())
+      } else {
+        fnEnvIdx.push(0 - 1)
+      }
+      fe = fe + 1
+    }
+  } else {
+    cloStructIdx = oldCloIdx
+    cloSigBase = oldCloIdx + 1
+  }
   // The functypes follow; the first lands at the current counter (`typeOffset`).
   let typeOffset = mNextType
-  let oldTypeOffset = preMap + strListOffsetOf() + mapStructOffsetOf() + f64ListOffsetOf()
+  let oldTypeOffset = preMap + strListOffsetOf() + mapStructOffsetOf() + f64ListOffsetOf() + fnClosureOffsetOf()
   if mAssertIdx(typeOffset, oldTypeOffset, "typeOffset") < 0 { return 0 - 1 }
   typeOffset
+}
+
+// The closure-type count interned ahead of the functypes: the closure struct + the
+// `$fnsig` functype (2) plus one env struct per capturing lifted function, or 0 when
+// no function value exists. Mirrors `f64ListOffsetOf` — keeps `typeOffset`'s oracle
+// formula in step with the live counter.
+function fnClosureOffsetOf(): i32 {
+  if !fnValUsed { return 0 }
+  // 1 closure struct + one `$fnsig` per distinct value-call arity + one env struct per
+  // capturing lifted function.
+  let total = 1 + cloSigArities.length
+  let fe = 0
+  while fe < fnStmts.length {
+    if captureCountOf(fe) > 0 { total = total + 1 }
+    fe = fe + 1
+  }
+  total
 }
 
 // The f64-list type count (backing + wrapper): 2 when present, else 0.
@@ -8981,6 +9916,7 @@ function startFnDetectScratch(): i32 {
   fnUsesStrPush = false
   fnUsesStrOp = false
   fnUsesMap = false
+  fnUsesCallRef = false
   fnRefPushSlots = []
   refPushBaseBySlot = []
   let gi = 0
@@ -8994,6 +9930,7 @@ function startFnDetectScratch(): i32 {
         if exprHasMemberPopKind(ix, 0 - 1, 2) { fnUsesStrPush = true }
         if exprHasStrOp(ix, 0 - 1) { fnUsesStrOp = true }
         if exprHasMapOp(ix, 0 - 1) { fnUsesMap = true }
+        if fnValUsed { if blockHasCallRef(ix, 0 - 1) { fnUsesCallRef = true } }
         collectMemberPopRefSlotsExpr(ix, 0 - 1)
       }
     }
@@ -9027,6 +9964,7 @@ function startFnDetectScratch(): i32 {
       if exprHasMemberPopKind(startStmts[si], 0 - 1, 2) { fnUsesStrPush = true }
       if exprHasStrOp(startStmts[si], 0 - 1) { fnUsesStrOp = true }
       if exprHasMapOp(startStmts[si], 0 - 1) { fnUsesMap = true }
+      if fnValUsed { if blockHasCallRef(startStmts[si], 0 - 1) { fnUsesCallRef = true } }
       if stmtIsPushKind(startStmts[si], 0 - 1, 1) { recordStartRefPushSlot(startStmts[si]) }
       collectMemberPopRefSlotsExpr(startStmts[si], 0 - 1)
     }
@@ -9487,6 +10425,59 @@ function emitModule(stmts: i32[]): i32 {
     wU8(127)                     // field 2 cap: 0x7f i32
     wU8(1)                       // mutable
   }
+  if fnValUsed {
+    // The closure fat-pointer struct `{ code: funcref, env: (ref null struct) }`
+    // (lambdas) — field 0 a GENERIC `funcref` (so ONE closure struct serves every
+    // function arity), field 1 a nullable `structref` env (null when non-capturing).
+    // Both IMMUTABLE. At a `call_ref` site the funcref is `ref.cast` to the concrete
+    // env-leading `$fnsig` for that call's arity, then `call_ref`. The interned
+    // `$fnsig` functypes (one per distinct value-call arity) follow.
+    wU8(95)                      // 0x5f struct
+    wU8(2)                       // 2 fields
+    wU8(99)                      // field 0 code: 0x63 (ref null) funcref
+    wU8(112)                     // ...the abstract `func` heaptype (0x70 funcref)
+    wU8(0)                       // immutable
+    wU8(99)                      // field 1 env: 0x63 (ref null ht)
+    wU8(107)                     // ...to the abstract `struct` heaptype (structref)
+    wU8(0)                       // immutable
+    // One env-leading `$fnsig` functype per distinct value-call arity, in arity order
+    // (`cloSigArities`): `(structref, i32 * arity) -> i32`.
+    let sai = 0
+    while sai < cloSigArities.length {
+      let ar = cloSigArities[sai]
+      wU8(96)                    // 0x60 func
+      wULEB(ar + 1)              // env + arity params
+      wU8(107)                   // param 0 env: structref (0x6b)
+      let pj = 0
+      while pj < ar {
+        wU8(127)                 // i32 param
+        pj = pj + 1
+      }
+      wU8(1)                     // 1 result
+      wU8(127)                   // i32 result
+      sai = sai + 1
+    }
+    // One env struct per CAPTURING lifted function (`fnEnvIdx[fe] >= 0`), in `fnStmts`
+    // order — the order `mAssignTypeIndices` minted them. Each is a struct of one
+    // IMMUTABLE i32 field per captured variable (capture order = field order). The
+    // corpus captures are all i32 (and one struct-ref capture in `closure.vl`'s
+    // `sumPoint`, handled by emitting the captured ref's valtype).
+    let fe = 0
+    while fe < fnStmts.length {
+      if fnEnvIdxOf(fe) >= 0 {
+        let caps = captureNamesOf(fe)
+        wU8(95)                  // 0x5f struct
+        wULEB(caps.length)
+        let ci = 0
+        while ci < caps.length {
+          fbValtype(captureValKind(fe, caps[ci]), captureValStructIdx(fe, caps[ci]))
+          wU8(0)                 // immutable
+          ci = ci + 1
+        }
+      }
+      fe = fe + 1
+    }
+  }
   // The functype param/result valtypes (`fbValtype`) stream to `curBuf == typePayload`,
   // interleaved identically with the surrounding raw framing bytes (the `wTarget` bind
   // covering this whole payload build was established above).
@@ -9497,7 +10488,16 @@ function emitModule(stmts: i32[]): i32 {
       let params = fn.fnParams
       let nParams = params.length
       wU8(96)                    // 0x60 func
-      wULEB(nParams)             // param count
+      // When a function value exists module-wide, EVERY function carries a hidden
+      // leading `structref env` param (local 0). The declared params follow at 1..p.
+      // A non-capturing function ignores its env; a capturing one `ref.cast`s + reads
+      // it. Gated on `fnValUsed` so a no-lambda module's functypes are byte-identical.
+      if fnValUsed {
+        wULEB(nParams + 1)       // param count incl. the env param
+        wU8(107)                 // env param: structref (0x6b)
+      } else {
+        wULEB(nParams)           // param count
+      }
       let pi = 0
       while pi < nParams {
         fbValtype(vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
@@ -9505,6 +10505,10 @@ function emitModule(stmts: i32[]): i32 {
       }
       if fRetVoid[ti] == 1 {
         wU8(0)                   // 0 results — a VOID function (`()->()`)
+      } else if fn.fnRet < 0 && fnReturnsClosure(ti) {
+        // A function VALUE return (un-annotated; its tail is a function value) — kind 14.
+        wU8(1)
+        fbValtype(14, 0 - 1)
       } else if fn.fnRet < 0 {
         // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
         // fRet* tables the annotation path fills). i32 when nothing matched.
@@ -9659,7 +10663,18 @@ function emitModule(stmts: i32[]): i32 {
   wULEB(n + hasStart)
   let fi = 0
   while fi < n {
-    wULEB(typeOffset + fi)   // functype index
+    // A function whose env-leading signature matches an interned `$fnsig` is declared
+    // with that `$fnsig` functype, so `ref.func` of it produces a value the call_ref
+    // site's `ref.cast` to `$fnsig` accepts (its ACTUAL type IS `$fnsig`). Others keep
+    // their own functype. Only when `fnValUsed`. (Lambdas.)
+    if fnValUsed && fnSigIsClosure(fi) {
+      let fnArity = 0
+      let ffn = P.nodes[fnStmts[fi]]
+      if ffn is FuncDecl { fnArity = ffn.fnParams.length }
+      wULEB(fnSigIdxForArity(fnArity))
+    } else {
+      wULEB(typeOffset + fi)   // functype index
+    }
     fi = fi + 1
   }
   if hasStart == 1 {
@@ -9789,6 +10804,28 @@ function emitModule(stmts: i32[]): i32 {
     wULEB(startFnIdx)
     wTarget(stPrev)
     wSection(8, startPayload)
+  }
+
+  // Element section (id 9): a single DECLARATIVE elem segment declaring every user
+  // function as `ref.func`-referenceable (lambdas). `ref.func` requires its target be
+  // forward-declared; with no table we use a declarative segment (flags 0x03, elemkind
+  // 0x00 funcref, then the func-index vec). Emitted ONLY when a function value exists
+  // (`fnValUsed`), so a no-lambda module emits no section 9 and stays byte-identical —
+  // mirroring the start-section conditional. Sits AFTER start (8), BEFORE code (10).
+  if fnValUsed {
+    let elemPayload: i32[] = []
+    let elPrev = wTarget(elemPayload)
+    wULEB(1)                      // 1 element segment
+    wU8(3)                        // flags 0x03: declarative, elemkind + func-index vec
+    wU8(0)                        // elemkind 0x00 — funcref
+    wULEB(n)                      // count of declared funcs
+    let di = 0
+    while di < n {
+      wULEB(gImports + di)        // func index (imports occupy 0..gImports-1)
+      di = di + 1
+    }
+    wTarget(elPrev)
+    wSection(9, elemPayload)
   }
 
   // Code section (id 10): one size-prefixed body per function, in index order, then
@@ -10969,6 +12006,27 @@ function globalStructIndex(name: string): i32 {
 
 // The struct table index that the expression at `exprIx` produces, or -1 if it is not
 // a struct value. Mirrors `exprStruct`'s cases.
+// The struct table index of a CAPTURED struct-ref variable `name` of the capturing
+// lifted function `fnIx`, or -1 if `name` is not a captured struct of `fnIx`. Mirrors
+// `emitCapturedRead`'s guards so a captured struct receiver (`p.x` where `p` is a
+// captured `{ … }` in an enclosing frame) resolves to its struct type exactly as a
+// param/local/global receiver would — the value itself is read from the env by
+// `emitCapturedRead`; this only supplies the heap type so `emitMem` can pick the field.
+function capturedStructIndex(fnIx: i32, name: string): i32 {
+  if fnIx < 0 { return 0 - 1 }
+  if !fnValUsed { return 0 - 1 }
+  let fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return 0 - 1 }
+  if fnEnvIdxOf(fe) < 0 { return 0 - 1 }
+  let caps = captureNamesOf(fe)
+  let ci = 0
+  while ci < caps.length {
+    if caps[ci] == name { return captureValStructIdx(fe, name) }
+    ci = ci + 1
+  }
+  0 - 1
+}
+
 function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return 0 - 1 }
   let e = P.nodes[exprIx]
@@ -10984,7 +12042,9 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
     if pi >= 0 { return pi }
     let di = declaredStructIndex(e.identName)
     if di >= 0 { return di }
-    return globalStructIndex(e.identName)
+    let gi = globalStructIndex(e.identName)
+    if gi >= 0 { return gi }
+    return capturedStructIndex(fnIx, e.identName)
   }
   // `xs[i]` over a STRUCT-element ref list yields that list's element struct. The
   // element struct TABLE INDEX comes from the receiver's per-element-type slot's name
@@ -12161,6 +13221,179 @@ function letIsF32(letIx: i32): boolean {
         if lt.tyName == "f32" { return true }
       }
     }
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` binds a FUNCTION VALUE (kind 14): its initializer is
+// a `function(...)` literal, a bare reference to a top-level/lifted function name, or a
+// call returning a function value. The cell is the closure fat-pointer `(ref
+// $cloStructIdx)`. (Lambdas.)
+function letIsClosure(letIx: i32, fnIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 { return false }
+    return exprIsClosure(d.letInit, fnIx)
+  }
+  false
+}
+
+// True if the expression at `exprIx` evaluates to a function value (a closure
+// fat-pointer): a `function(...)` literal, a bare reference to a top-level/lifted
+// function name, a reference to a closure-typed param/local, or a call returning a
+// function value (a function whose body's tail is itself a function value).
+function exprIsClosure(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Paren { return exprIsClosure(e.parInner, fnIx) }
+  if e is FuncDecl { return true }
+  if e is Ident {
+    if fnIndexOf(e.identName) >= 0 { return true }
+    // A closure-typed param/local (kind 14 in the registry).
+    if paramIsClosure(fnIx, e.identName) { return true }
+    let slot = declaredSlotOf(e.identName)
+    if slot >= 0 { return localIsRef[slot] == 14 }
+    // A module-global closure cell (kind 14).
+    let gl = globalLetOf(e.identName)
+    if gl >= 0 { return globalCellKind(gl) == 14 }
+    return false
+  }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      let t = fnIndexOf(callee.identName)
+      if t >= 0 { return fnReturnsClosure(t) }
+    }
+    return false
+  }
+  if e is Member {
+    // A struct field holding a function value reads back as a closure.
+    return memberIsClosure(e.memObj, callMemProp(exprIx), fnIx)
+  }
+  false
+}
+
+// The `memProp` of a Member expression at `exprIx` (or "").
+function callMemProp(exprIx: i32): string {
+  let e = P.nodes[exprIx]
+  if e is Member { return e.memProp }
+  ""
+}
+
+// True if the parameter `name` of function `fnIx` is annotated as a function type
+// (lowered to the closure fat-pointer, kind 14).
+function paramIsClosure(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return tyIsFuncType(p.parType) }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the type-annotation node at `tyIx` is a function type — the self-host parses a
+// function-typed annotation as a `TypeRef` whose name contains `=>` or `(`/`)->`. For the
+// corpus, function params are rare; a closure param is detected structurally elsewhere.
+function tyIsFuncType(tyIx: i32): boolean {
+  if tyIx < 0 { return false }
+  let ty = P.nodes[tyIx]
+  if ty is TypeRef {
+    // A function-type annotation name carries an arrow; bare scalar/struct names do not.
+    return strContains(ty.tyName, "=>")
+  }
+  false
+}
+
+// True if `s` contains the substring `sub`.
+function strContains(s: string, sub: string): boolean {
+  if sub.length == 0 { return true }
+  if sub.length > s.length { return false }
+  let i = 0
+  while i + sub.length <= s.length {
+    let j = 0
+    let ok = true
+    while j < sub.length {
+      if s[i + j] != sub[j] { ok = false j = sub.length } else { j = j + 1 }
+    }
+    if ok { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True if the function at `fnStmts` position `t` returns a function value — its body's
+// tail expression is itself a function value (a bare function name, a `function(...)`
+// literal, or a closure-typed local). Drives `exprIsClosure` for call results
+// (`const f = makeAdder(5)` where `makeAdder` returns its inner closure).
+function fnReturnsClosure(t: i32): boolean {
+  if t < 0 || t >= fnStmts.length { return false }
+  let fn = P.nodes[fnStmts[t]]
+  if fn is FuncDecl {
+    return blockTailIsClosure(fn.fnBody, fnStmts[t])
+  }
+  false
+}
+
+// True if the block's tail (implicit-return) expression is a function value.
+function blockTailIsClosure(blockIx: i32, fnIx: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let n = stmts.length
+    if n == 0 { return false }
+    let last = stmts[n - 1]
+    let s = P.nodes[last]
+    if s is RetStmt {
+      if s.retArg >= 0 { return exprIsClosureNoLocal(s.retArg, fnIx) }
+      return false
+    }
+    return exprIsClosureNoLocal(last, fnIx)
+  }
+  false
+}
+
+// `exprIsClosure` restricted to forms safe to query during return-kind classification
+// (avoids recursion through `declaredSlotOf`, which needs the local registry built):
+// a function name, a `function(...)` literal, or an object field. Captures the common
+// `return add` / `{ go: add }` escaping-closure tails.
+function exprIsClosureNoLocal(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Paren { return exprIsClosureNoLocal(e.parInner, fnIx) }
+  if e is FuncDecl { return true }
+  if e is Ident { return fnIndexOf(e.identName) >= 0 }
+  if e is ObjLit { return false }
+  false
+}
+
+// True if member access `obj.prop` yields a function value — `prop` is a struct field
+// whose declared type is a function type. (For `objects/equality-function-field.vl` and
+// `escaping.vl`'s `o.go`.) Resolved against the receiver's struct table fields.
+function memberIsClosure(objIx: i32, prop: string, fnIx: i32): boolean {
+  let si = structIndexOfExpr(objIx, fnIx)
+  if si < 0 { return false }
+  return structFieldIsClosure(si, prop)
+}
+
+// True if field `prop` of struct table index `si` is a function-valued field (kind 14).
+function structFieldIsClosure(si: i32, prop: string): boolean {
+  if si < 0 || si >= sNames.length { return false }
+  let cnt = sFieldCount[si]
+  let start = sFieldStart[si]
+  let fj = 0
+  while fj < cnt {
+    if sFieldNames[start + fj] == prop {
+      return sFieldTypeAt(si, fj) == 14
+    }
+    fj = fj + 1
   }
   false
 }
