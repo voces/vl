@@ -4248,7 +4248,7 @@ const CASES: Case[] = [
     // REGRESSION (global-field map-array map op): a map SET/GET/has on an element of a
     // module-GLOBAL struct-field map-array (`C.scopes[top][name] = ty`) — EXACTLY
     // typecheck.vl's `declare`/`lookup` over its global checker `T`. The function has NO
-    // map LOCAL, so `fnHasMap`'s local scan missed it and reserved no 12-slot map scratch
+    // map LOCAL, so `fnHasMap`'s local scan missed it and reserved no 13-slot map scratch
     // frame; `mapScratchBase` pointed past the locals and INSTANTIATE failed with
     // `invalid local index`. `fnHasGlobalMapOp` now body-walks the lowered map-op shapes
     // (set / get / `??` / `.has`) gated by the same `exprMap` the lowering uses, so the
