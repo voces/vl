@@ -192,6 +192,7 @@ const RUN_CASES = [
   "soundness/equality-boolean-sound.vl",
   "soundness/equality-nullness-sound.vl",
   "soundness/guard-function-post-guard-sound.vl",
+  "soundness/is-multi-narrow-recursive-visitor.vl",
   "soundness/narrowing-and-chain-two-places.vl",
   "soundness/narrowing-null-guard.vl",
   "soundness/narrowing-or-chain-post-guard.vl",

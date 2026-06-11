@@ -1335,10 +1335,35 @@ function joinTys(a: i32, b: i32): i32 {
   if b < 0 { return a }
   if assignable(b, a) { return a }
   if assignable(a, b) { return b }
-  let ms: i32[] = []
-  ms.push(a)
-  ms.push(b)
-  mkUnionTy(ms)
+  // Distinct variants: a FLATTENED, deduped union (nullability folds back
+  // into a `?` wrapper) — mirrors the host's `flattenType(Union(...))`.
+  let vars: i32[] = []
+  flattenVariantsInto(a, vars)
+  flattenVariantsInto(b, vars)
+  let kept: i32[] = []
+  let hasNull = false
+  let i = 0
+  while i < vars.length {
+    let v = vars[i]
+    if isNullTy(v) {
+      hasNull = true
+    } else {
+      let dup = false
+      let j = 0
+      while j < kept.length {
+        if kept[j] == v { dup = true }
+        if sameVariantTy(kept[j], v) { dup = true }
+        j = j + 1
+      }
+      if !dup { kept.push(v) }
+    }
+    i = i + 1
+  }
+  if kept.length == 0 { return TY_NULL }
+  let res = kept[0]
+  if kept.length > 1 { res = mkUnionTy(kept) }
+  if hasNull { return mkNullableTy(res) }
+  res
 }
 
 // Whether the expression is a bare `true`/`false` literal (through parens) —
@@ -3299,6 +3324,30 @@ function checkNode(ix: i32): i32 {
       if !assignable(rt, lt) {
         tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(lt), ix)
       }
+      // A-infer-null: a nullable binding's open inner HOLE (`let x = null`)
+      // fills from the first non-null assignment (in place, so the binding
+      // becomes `T | null` everywhere); and a straight-line non-null `x = e`
+      // narrows `x` for the REST of the enclosing block (host
+      // `assignmentNarrowing` — an assignment inside a branch unwinds with the
+      // branch's scope, so it never leaks past the join).
+      let asgTgt = P.nodes[n.binLeft]
+      if asgTgt is Ident {
+        let asgCur = lookup(asgTgt.identName)
+        if asgCur >= 0 {
+          let asgCt = T.tys[asgCur]
+          if asgCt is TyNullable {
+            let rtT = T.tys[rt]
+            let rhsNullable = false
+            if rtT is TyNullable { rhsNullable = true }
+            if !rhsNullable && !isNullTy(rt) && rt >= 0 {
+              if asgCt.nInner < 0 {
+                asgCt.nInner = rt
+              }
+              declare(asgTgt.identName, nonNullTy(asgCur))
+            }
+          }
+        }
+      }
       // Assignment is an expression yielding its RIGHT-HAND SIDE (host parity;
       // DECISIONS: assignment-as-expression).
       return rt
@@ -3490,10 +3539,10 @@ function checkNode(ix: i32): i32 {
     let ei = 1
     while ei < elems.length {
       let et = checkNode(elems[ei])
-      if !assignable(et, elemTy) {
-        tErr("array element " + i32ToStr(ei) + " is " + tyToStr(et) +
-          ", expected " + tyToStr(elemTy), ix)
-      }
+      // Host parity: the element type is the UNION of every element's type
+      // (flattened/deduped) — `[a, b, c]` over mixed struct variants types as
+      // `(A | B | C)[]`; an annotation then checks each member structurally.
+      elemTy = joinTys(elemTy, et)
       ei = ei + 1
     }
     return mkArrayTy(elemTy)
@@ -3691,6 +3740,14 @@ function checkNode(ix: i32): i32 {
       }
     } else if initTy >= 0 {
       bound = initTy
+      // USAGE-DRIVEN NULLABLE HOLE (A-infer-null): an un-annotated `let x =
+      // null` is NOT pinned to the exact `null` type — `null` is hole-bearing
+      // (it inhabits every `T | null`). Bind a nullable with an OPEN inner
+      // hole; the first non-null assignment fills `T` in place (see the `=`
+      // arm), so `x` becomes `T | null`. A COMPLETE initializer still pins.
+      if isNullTy(initTy) {
+        bound = mkNullableTy(0 - 1)
+      }
       // UN-INFERRED EMPTY-COLLECTION FLOOR: an un-annotated `[]` / `Map()` / `Set()`
       // whose hole is still open here may yet be pinned by a downstream
       // `.push`/`.set`/`.add` (those mutate the shared arena entry in place), so we
