@@ -214,6 +214,15 @@ let tyToStrDepth: i32 = 0
 let pgKeys: string[] = []
 let pgFrames: i32[] = []
 
+// INFERRED TYPE-GUARD functions (A6b, host `guards`): a named function whose
+// body is exactly `return <null-test-on-a-param>` becomes a guard — calling it
+// in a condition narrows the argument's null-ness. Parallel arrays: the guard's
+// name, the tested param's index, and 1 when the non-null branch is THEN
+// (`self != null`) / 0 when it is ELSE (`p == null`).
+let guardNames: string[] = []
+let guardParamIdxs: i32[] = []
+let guardThens: i32[] = []
+
 // Record an un-annotated empty-collection binding for the deferred scope-close check.
 function notePending(name: string, ty: i32, at: i32): i32 {
   pendNames.push(name)
@@ -603,6 +612,22 @@ export function initChecker(): i32 {
   tyToStrDepth = 0
   pgKeys = []
   pgFrames = []
+  guardNames = []
+  guardParamIdxs = []
+  guardThens = []
+  // Memory intrinsics (host `defaultScope`): raw linear-memory stores/loads and
+  // the `__log__` host hook used by low-level corpus programs.
+  declare("__store_i32__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__store_i64__", mkFuncTy([TY_I32, TY_I64], TY_VOID))
+  declare("__store_f32__", mkFuncTy([TY_I32, TY_F32], TY_VOID))
+  declare("__store_f64__", mkFuncTy([TY_I32, TY_F64], TY_VOID))
+  declare("__load_i32__", mkFuncTy([TY_I32], TY_I32))
+  declare("__store_string__", mkFuncTy([TY_I32, TY_STR], TY_I32))
+  declare("__log_string__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__log__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__memory_grow__", mkFuncTy([TY_I32], TY_I32))
+  let noParams: i32[] = []
+  declare("__memory_size__", mkFuncTy(noParams, TY_I32))
   0
 }
 
@@ -884,6 +909,36 @@ function pushOptChainThenFacts(placeIx: i32, names: string[], tys: i32[]): i32 {
   0
 }
 
+// The argument PLACE a guard call narrows in the branch where its non-null
+// side is `wantThen` (1: THEN, 0: ELSE), or -1: not a registered guard call /
+// wrong direction / no stable argument. Handles the inline form
+// (`present(v)`) and the UFCS form (`v.present()` — the receiver fills the
+// guard's `self` param 0).
+function guardCallPlace(cond: Call, wantThen: i32): i32 {
+  let cfn = P.nodes[cond.callFn]
+  let gname = ""
+  let gRecv = -1
+  if cfn is Ident {
+    gname = cfn.identName
+  } else if cfn is Member {
+    gname = cfn.memProp
+    gRecv = cfn.memObj
+  }
+  if gname == "" { return -1 }
+  let gi = guardIndexOf(gname)
+  if gi < 0 { return -1 }
+  if guardThens[gi] != wantThen { return -1 }
+  let pIdx = guardParamIdxs[gi]
+  let cargs = cond.callArgs
+  if gRecv >= 0 {
+    if pIdx == 0 { return gRecv }
+    if pIdx - 1 < cargs.length { return cargs[pIdx - 1] }
+    return -1
+  }
+  if pIdx < cargs.length { return cargs[pIdx] }
+  -1
+}
+
 // Collect the narrowings that hold when `cond` is TRUE into the parallel
 // `names`/`tys` arrays (keys are place paths — see `placeKeyOf`): `x != null`
 // strips x's null, `x is T` pins x to T (`is null` pins to the null type),
@@ -926,6 +981,21 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
         if inner >= 0 && inner != cur {
           pushNarrowFact(placeIx, inner, names, tys)
         }
+      }
+    }
+    return 0
+  }
+  // Inferred type-guard call (A6b): `if present(v)` narrows `v` the way the
+  // guard's body narrows its parameter — non-null here when the guard's
+  // non-null branch is THEN.
+  if cond is Call {
+    let gArg = guardCallPlace(cond, 1)
+    if gArg >= 0 {
+      pushOptChainThenFacts(gArg, names, tys)
+      let gCur = placeCurTy(gArg, names, tys)
+      let gInner = nonNullTy(gCur)
+      if gInner >= 0 && gInner != gCur {
+        pushNarrowFact(gArg, gInner, names, tys)
       }
     }
     return 0
@@ -979,6 +1049,21 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
           if inner >= 0 && inner != cur {
             pushNarrowFact(placeIx, inner, names, tys)
           }
+        }
+      }
+    }
+    return 0
+  }
+  // Inferred type-guard call (A6b): `if absent(p) { … } else { /* p!=null */ }`
+  // — non-null in the ELSE branch when the guard's non-null branch is ELSE.
+  if cond is Call {
+    let gArg = guardCallPlace(cond, 0)
+    if gArg >= 0 {
+      if !placeHasOptionalHop(gArg) {
+        let gCur = placeCurTy(gArg, names, tys)
+        let gInner = nonNullTy(gCur)
+        if gInner >= 0 && gInner != gCur {
+          pushNarrowFact(gArg, gInner, names, tys)
         }
       }
     }
@@ -1902,6 +1987,106 @@ function bindOf(bNames: string[], bTys: i32[], name: string): i32 {
 // A call expression: array-method builtins (`xs.push`), string-method builtins
 // (`.slice`/`.indexOf`/`.includes`/`.charCodeAt`), the `print`/`fromCodePoint`
 // builtins, then the generic function-call path (arity + per-arg assignability).
+// UFCS `self`-method dispatch (host parser: `o.f(args)` → `f(o, args)` for a
+// free function whose first parameter accepts the receiver). Returns the
+// call's type, or -1 when no matching function exists (the caller reports its
+// own "no method"/"no field" error). Mirrors the general call path's pending-
+// return demand-inference; generic (TyVar) self-functions are not dispatched.
+function ufcsCallTy(name: string, recvTy: i32, n: Call, ix: i32): i32 {
+  let fnTy = lookup(name)
+  if fnTy < 0 { return -1 }
+  let preFt = T.tys[fnTy]
+  if preFt is TyFunc {
+    if preFt.fnRet == 0 - 2 {
+      if !onInferStack(name) {
+        let dIx = fnDeclIx[name] ?? -1
+        if dIx >= 0 {
+          checkNode(dIx)
+        }
+      }
+    }
+  } else {
+    return -1
+  }
+  let ft = T.tys[fnTy]
+  if ft is TyFunc {
+    let retTy = ft.fnRet
+    if retTy == 0 - 2 { retTy = TY_ERR }
+    let params = ft.fnParamTypes
+    let args = n.callArgs
+    if params.length != args.length + 1 { return -1 }
+    if !assignable(recvTy, params[0]) { return -1 }
+    let i = 0
+    while i < args.length {
+      let at = checkNode(args[i])
+      constrainEmpty(at, params[i + 1])
+      if !assignableExpr(args[i], at, params[i + 1]) {
+        tErr("argument " + i32ToStr(i + 1) + ": expected " +
+          tyToStr(params[i + 1]) + ", got " + tyToStr(at), ix)
+      }
+      i = i + 1
+    }
+    return retTy
+  }
+  -1
+}
+
+// The innermost guard registration for `name`, or -1 (not a guard).
+function guardIndexOf(name: string): i32 {
+  let i = guardNames.length - 1
+  while i >= 0 {
+    if guardNames[i] == name { return i }
+    i = i - 1
+  }
+  -1
+}
+
+// The A6b guard fact of a function body's result expression over the params:
+// the index of the param whose NULL-ness it tests, or -1 (not a guard shape).
+// Sets nothing itself — the caller reads the branch direction from the shape:
+// the encoded result is `paramIndex * 2 + 1` when the non-null branch is THEN
+// (`x != null`, `x is T`), `paramIndex * 2` when it is ELSE (`x == null`,
+// `x is null`). Mirrors the host's `conditionNarrowing` over a bare param.
+function guardFactOf(exprIx: i32, paramNames: string[]): i32 {
+  let e = P.nodes[exprIx]
+  if e is Paren { return guardFactOf(e.parInner, paramNames) }
+  if e is IsExpr {
+    let obj = P.nodes[e.isObj]
+    if obj is Ident {
+      let gi = 0
+      while gi < paramNames.length {
+        if paramNames[gi] == obj.identName {
+          if e.isVariant == "null" {
+            return gi * 2
+          }
+          return gi * 2 + 1
+        }
+        gi = gi + 1
+      }
+    }
+    return -1
+  }
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      let placeIx = nullCmpPlace(exprIx)
+      if placeIx >= 0 {
+        let p = P.nodes[placeIx]
+        if p is Ident {
+          let gj = 0
+          while gj < paramNames.length {
+            if paramNames[gj] == p.identName {
+              if e.binOp == "!=" { return gj * 2 + 1 }
+              return gj * 2
+            }
+            gj = gj + 1
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
 function checkCallNode(n: Call, ix: i32): i32 {
   // Array method call `xs.push(e)`: when the callee is a member access whose
   // receiver is an array, type it as a builtin (NOT a struct field). Only fires for
@@ -2140,9 +2325,25 @@ function checkCallNode(n: Call, ix: i32): i32 {
           }
           return TY_I32
         }
+        // UFCS `self`-method on a string receiver (`"hello".first()`).
+        let su = ufcsCallTy(sp, recvTy, n, ix)
+        if su >= 0 { return su }
         tErr("no method '." + sp + "' on string", ix)
         return TY_ERR
       }
+    }
+    // UFCS `self`-method on any other receiver (struct / nullable / union):
+    // `o.f(args)` lowers to `f(o, args)` when the receiver carries no such
+    // FIELD (a callable field keeps precedence) and a matching free function
+    // exists; otherwise fall through to the normal member-call path/error.
+    let ufcsHasField = false
+    let urt = T.tys[recvTy]
+    if urt is TyObj {
+      if objFieldType(urt, cfn.memProp) >= 0 { ufcsHasField = true }
+    }
+    if !ufcsHasField {
+      let uu = ufcsCallTy(cfn.memProp, recvTy, n, ix)
+      if uu >= 0 { return uu }
     }
   }
   // `print(x)` is a compiler builtin (no module/import system yet): it accepts a
@@ -2722,6 +2923,44 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
     }
     inferObserved = savedObserved
     inferSawErr = savedSawErr
+  }
+  // Inferred type guard (A6b, host parity — degenerate case): a NAMED function
+  // whose body's RESULT is exactly a null-test on one of its params registers
+  // as a guard, so calling it in a condition narrows the argument (inline,
+  // UFCS, and the guard-clause form).
+  if n.fnName != "" {
+    let gBody = P.nodes[n.fnBody]
+    if gBody is Block {
+      let gStmts = gBody.blkStmts
+      if gStmts.length > 0 {
+        let gLastIx = gStmts[gStmts.length - 1]
+        let gLast = P.nodes[gLastIx]
+        let gResIx = gLastIx
+        if gLast is RetStmt {
+          gResIx = gLast.retArg
+        }
+        if gResIx >= 0 {
+          let gParamNames: string[] = []
+          let gp = 0
+          while gp < params.length {
+            let gpn = P.nodes[params[gp]]
+            if gpn is Param {
+              gParamNames.push(gpn.parName)
+            } else {
+              gParamNames.push("")
+            }
+            gp = gp + 1
+          }
+          let gFact = guardFactOf(gResIx, gParamNames)
+          if gFact >= 0 {
+            let gThen = gFact - gFact / 2 * 2
+            guardNames.push(n.fnName)
+            guardParamIdxs.push(gFact / 2)
+            guardThens.push(gThen)
+          }
+        }
+      }
+    }
   }
   // The function's own type — a FuncDecl in EXPRESSION position (a lambda, or a
   // named function referenced as a value) evaluates to it.

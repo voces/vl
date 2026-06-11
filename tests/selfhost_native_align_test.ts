@@ -191,6 +191,7 @@ const RUN_CASES = [
   "soundness/boolean-narrowing-if-sound.vl",
   "soundness/equality-boolean-sound.vl",
   "soundness/equality-nullness-sound.vl",
+  "soundness/guard-function-post-guard-sound.vl",
   "soundness/narrowing-and-chain-two-places.vl",
   "soundness/narrowing-null-guard.vl",
   "soundness/narrowing-or-chain-post-guard.vl",
