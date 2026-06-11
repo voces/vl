@@ -252,32 +252,24 @@ function parseType(): i32 {
 // map case embed the value type's name into its own synthetic name WITHOUT a
 // `P.nodes[...] is TypeRef` round-trip (which this self-host slice can't narrow here).
 function parseTypeName(): string {
-  let name = parseTypeIntersect()
+  let name = parseTypeAtom()
   // Inline UNION annotation `A | B | null`. In TYPE position (after a `:`), `|` is a
   // union separator (vs the bitwise-OR operator in expression position). Encoded as
   // the synthetic name `"A|B"` (mirroring the `i32[]` / `{[K]:V}` synthetic names);
   // the checker splits on `|` to build the union/nullable type.
+  //
+  // The host also parses INTERSECTIONS (`A & B`), NEGATIONS (`!A`), literal
+  // types (`"a" | "b"`, `0 | 1`) and parenthesized groups here. Those stay
+  // PARSE-REJECTED in the self-host on purpose: the native checker has no
+  // literal/intersection algebra (`nameToTy` can't resolve them) and treats an
+  // unresolvable annotation PERMISSIVELY, so accepting the syntax would flip the
+  // soundness REJECT corpus (e.g. `literal-union-reject-*.vl`) from "rejected"
+  // to "wrongly accepted". Reject at parse until the checker learns the types.
   let more = peekKind() == "PIPE"
   while more {
     advance()                        // "|"
-    name = name + "|" + parseTypeIntersect()
+    name = name + "|" + parseTypeAtom()
     more = peekKind() == "PIPE"
-  }
-  name
-}
-
-// Intersection `A & B` (host A3): binds tighter than the union `|` and looser
-// than the prefix `!` negation, so `A | B & !C` is `A | (B & (!C))`. Encoded
-// into the synthetic name with `&` (the checker has no native intersection
-// algebra yet, so a name carrying `&` resolves to "unknown type" — the parse
-// shape still matches the host's grammar).
-function parseTypeIntersect(): string {
-  let name = parseTypeAtom()
-  let more = peekKind() == "AMPERSAND"
-  while more {
-    advance()                        // "&"
-    name = name + "&" + parseTypeAtom()
-    more = peekKind() == "AMPERSAND"
   }
   name
 }
@@ -340,40 +332,6 @@ function parseTypeAtom(): string {
   } else if peekKind() == "NULL" {
     advance()                        // `null` is a valid union member type
     name = "null"
-  } else if peekKind() == "LPAREN" {
-    // A parenthesized type `(0 | 1 | 2) & !2` — grouping for the `|`/`&`
-    // precedence. The parens are kept in the synthetic name so the grouping
-    // survives the flat encoding.
-    advance()                        // "("
-    name = "(" + parseTypeName() + ")"
-    expect("RPAREN")
-  } else if peekKind() == "BANG" {
-    // Type negation `!A` (host A4) — binds tighter than `&`, so `A & !B` is
-    // "A but not B".
-    advance()                        // "!"
-    name = "!" + parseTypeAtom()
-  } else if peekKind() == "STRING" {
-    // A string-LITERAL type (`"expense" | "reimbursement"`); the raw lexeme
-    // (quotes kept) is the synthetic name.
-    name = advance().text
-  } else if peekKind() == "NUMBER" {
-    // A numeric-literal type (`0 | 1 | 2`).
-    name = advance().text
-  } else if peekKind() == "MINUS" {
-    // A negative numeric-literal type (`-1 | 0 | 1`).
-    advance()                        // "-"
-    let neg = peekKind()
-    if neg == "NUMBER" {
-      name = "-" + advance().text
-    } else {
-      expect("NUMBER")
-    }
-  } else if peekKind() == "TRUE" {
-    advance()
-    name = "true"
-  } else if peekKind() == "FALSE" {
-    advance()
-    name = "false"
   } else if peekKind() == "IDENT" {
     name = advance().text
     if peekKind() == "LT" {
@@ -818,36 +776,12 @@ function parseTypeDecl(): i32 {
   // a `{`). Parse the `member (PIPE member)*` list into a `UnionDecl` — a member
   // is an intersection chain of atoms (bare names, literal types: `type T = "a" |
   // "b"`, inline objects). A single bare name `type N = A` (no `|`) is also
-  // accepted as a one-member union. A `{`-leading RHS is a struct DECLARATION
-  // (`type N = { fields }`) UNLESS the balanced `{ … }` is followed by `&`/`|`
-  // (`type AB = { a: i32 } & { b: i32 }`) — then the brace is an inline-object
-  // ATOM of a compound type, parsed through the union/intersection path.
+  // accepted as a one-member union. (A compound `{ … } & { … }` RHS — host A3 —
+  // stays parse-rejected with the other intersection syntax; see `parseTypeName`.)
   let afterEq = peekKind()
-  let braceCompound = false
-  if afterEq == "LBRACE" {
-    let bd = 0
-    let bscan = P.pos
-    let bgoing = true
-    while bgoing {
-      let bk = kindAt(bscan)
-      if bk == "EOF" {
-        bgoing = false
-      } else {
-        if bk == "LBRACE" {
-          bd = bd + 1
-        } else if bk == "RBRACE" {
-          bd = bd - 1
-        }
-        bscan = bscan + 1
-        bgoing = bd > 0
-      }
-    }
-    let bAfter = kindAt(bscan)
-    braceCompound = bAfter == "AMPERSAND" || bAfter == "PIPE"
-  }
-  if afterEq != "LBRACE" || braceCompound {
+  if afterEq != "LBRACE" {
     let variants: string[] = []
-    variants.push(parseTypeIntersect())
+    variants.push(parseTypeAtom())
     // A multiline union puts each `|` on its own line, so a NEWLINE may precede
     // the next `|` — skip newlines before testing for the pipe.
     skipNewlines()
@@ -855,7 +789,7 @@ function parseTypeDecl(): i32 {
     while more {
       advance()                      // "|"
       skipNewlines()                 // and after it, before the variant name
-      variants.push(parseTypeIntersect())
+      variants.push(parseTypeAtom())
       skipNewlines()
       more = peekKind() == "PIPE"
     }
