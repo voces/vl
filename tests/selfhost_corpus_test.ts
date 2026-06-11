@@ -234,6 +234,8 @@ const WHITELIST = [
   "arrays/render-i32-array.vl",
   "arrays/trailing-comma-illegal.vl",
   "bitwise/float-reject.vl",
+  "chars/empty.vl",
+  "chars/multi.vl",
   "functions/inferred-cycle-no-base-case.vl",
   "functions/inferred-return-soundness.vl",
   "functions/lambda-uninferable-param.vl",
@@ -340,6 +342,14 @@ function loadToks(src: string): i32 {
     let t = r.tokens[i]
     P.toks.push({ kind: t.kind, text: t.text, pos: i, start: t.start, line: t.line, col: t.col })
     i = i + 1
+  }
+  // Fold lexer diagnostics into the parse-stage store (mirrors the production
+  // driver's vcLoadToks + the host's checkOnly): a LEX error like an empty \`''\`
+  // or multi-char \`'ab'\` char literal becomes a parse-stage rejection.
+  let d = 0
+  while d < r.diags.length {
+    P.diags.push({ msg: r.diags[d].msg, at: 0 })
+    d = d + 1
   }
   P.toks.length
 }

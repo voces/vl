@@ -229,6 +229,8 @@ const REJECT_CASES = [
   "arrays/render-i32-array.vl",
   "arrays/trailing-comma-illegal.vl",
   "bitwise/float-reject.vl",
+  "chars/empty.vl",
+  "chars/multi.vl",
   "functions/inferred-cycle-no-base-case.vl",
   "functions/inferred-return-soundness.vl",
   "functions/lambda-uninferable-param.vl",
