@@ -933,6 +933,114 @@ function hasDot(s: string): boolean {
   false
 }
 
+// Does the non-negative integer LEXEME `t` (decimal / `0x` hex / `0b` binary /
+// `0o` octal, `_` separators skipped) fit the i32 range [0, 2147483647]? Ports
+// the host's `defaultIntegerType` magnitude rule (typecheck.ts): an un-annotated
+// integer literal defaults to i32 when its value fits, else widens to i64 —
+// defaulting an out-of-range literal to i32 would silently wrap (0xDEAD_BEEF).
+// A `NumLit` lexeme never carries a sign (unary minus is a separate node), so
+// only the positive bound is checked. Digits fold with a pre-multiply overflow
+// guard (`v > (max - d) / base`) instead of 64-bit arithmetic.
+function intLexemeFitsI32(t: string): boolean {
+  let v = 0
+  let i = 0
+  let base = 10
+  if t.length >= 2 && t[0] == '0' {
+    let p = t[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  while i < t.length {
+    let c = t[i]
+    if c == '_' {
+      i = i + 1
+    } else {
+      let d = 0
+      if c >= '0' && c <= '9' {
+        d = c - '0'
+      } else if c >= 'a' && c <= 'f' {
+        d = c - 'a' + 10
+      } else {
+        d = c - 'A' + 10
+      }
+      if v > (2147483647 - d) / base {
+        return false
+      }
+      v = v * base + d
+      i = i + 1
+    }
+  }
+  true
+}
+
+// Is the integer LEXEME's magnitude EXACTLY 2^31 (2147483648)? The host PARSER
+// folds a negated literal into a signed literal before defaulting (`-${text}`,
+// parser.ts), so `-2147483648` / `-0x8000_0000` sits AT I32_MIN and defaults to
+// i32 — even though the bare magnitude is one past I32_MAX. The unary `-` arm
+// uses this for parity. Compares the significant digits (base prefix, `_`
+// separators and leading zeros stripped) against 2^31 written in the lexeme's
+// base; hex letters never match a decimal digit char, so no case folding needed.
+function intLexemeIs2Pow31(t: string): boolean {
+  let digits = "2147483648"
+  let i = 0
+  if t.length >= 2 && t[0] == '0' {
+    let p = t[1]
+    if p == 'x' || p == 'X' {
+      digits = "80000000"
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      digits = "10000000000000000000000000000000"
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      digits = "20000000000"
+      i = 2
+    }
+  }
+  let started = false
+  let j = 0
+  while i < t.length {
+    let c = t[i]
+    if c == '_' {
+      i = i + 1
+    } else if !started && c == '0' {
+      i = i + 1
+    } else {
+      started = true
+      if j >= digits.length {
+        return false
+      }
+      if c != digits[j] {
+        return false
+      }
+      i = i + 1
+      j = j + 1
+    }
+  }
+  j == digits.length
+}
+
+// Is the EXPRESSION at `ix` (peeling parens) an INTEGER literal of magnitude
+// exactly 2^31 — the one operand whose NEGATION fits i32 while the bare literal
+// does not? Companion of `intLexemeIs2Pow31` for the unary `-` arm.
+function isNegI32MinLit(ix: i32): boolean {
+  if ix < 0 { return false }
+  let e = P.nodes[ix]
+  if e is Paren { return isNegI32MinLit(e.parInner) }
+  if e is NumLit {
+    if hasDot(e.numText) { return false }
+    return intLexemeIs2Pow31(e.numText)
+  }
+  false
+}
+
 // Map a written type NAME to its type-arena index (a primitive, or TY_ERR for an
 // unknown name). Takes the bare NAME — NOT a `Node` index — so it never narrows
 // the `Node` union (see Finding 2). The single caller (`checkNode`) extracts the
@@ -2367,12 +2475,16 @@ function checkNode(ix: i32): i32 {
 
   // ── literals & identifiers ────────────────────────────────────────────────
   if n is NumLit {
-    // A literal with a "." is f64, else i32 (a deliberately simple rule for the
-    // subset — VL's real checker tracks literal types and softens; see PR note).
+    // A literal with a "." is f64. An integer literal defaults to the NARROWEST
+    // type that holds it exactly — i32 if its magnitude fits, else i64 — the
+    // host's `defaultIntegerType` rule (`intLexemeFitsI32`).
     if hasDot(n.numText) {
       return TY_F64
     }
-    return TY_I32
+    if intLexemeFitsI32(n.numText) {
+      return TY_I32
+    }
+    return TY_I64
   } else if n is StrLit {
     return TY_STR
   } else if n is CharLit {
@@ -2424,6 +2536,14 @@ function checkNode(ix: i32): i32 {
     if !isNumeric(arg) {
       tErr("unary '-' expects a numeric type, got " + tyToStr(arg), ix)
       return TY_ERR
+    }
+    // Host parity: the host folds `-lit` into a signed literal BEFORE defaulting,
+    // so `-2147483648` (magnitude 2^31, one past I32_MAX) sits at I32_MIN and is
+    // i32 — even though the bare operand literal alone types i64.
+    if n.unOp == "-" {
+      if isNegI32MinLit(n.unArg) {
+        return TY_I32
+      }
     }
     return arg
 

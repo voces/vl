@@ -147,6 +147,7 @@ const WHITELIST = [
   "lists/struct-field-push.vl",
   "lists/struct-pop-get-map.vl",
   "literals/binary.vl",
+  "literals/hex.vl",
   "literals/octal.vl",
   "literals/separators.vl",
   "literals/wide-hex.vl",
