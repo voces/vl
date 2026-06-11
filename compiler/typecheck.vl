@@ -188,6 +188,41 @@ let pendTys: i32[] = []
 let pendAts: i32[] = []
 let pendDepths: i32[] = []
 
+// FLOW-NARROWED PROPERTY PATHS (mirrors the host's `narrowedPaths` overlay):
+// a stack of `key → type-arena index` entries (`"o.v" → i32`) overlaid while a
+// branch body is checked, plus per-scope frame marks so `popScope` unwinds the
+// entries pushed inside that scope. Bare-NAME narrowings keep riding the scope
+// chain (a shadowing `declare`); only dotted paths land here.
+let npKeys: string[] = []
+let npTys: i32[] = []
+let npFrames: i32[] = []
+
+// CYCLE GUARD stacks for `assignable` over recursive named types (A11): a
+// (src, dst) pair already being compared higher in the recursion is assumed
+// assignable — coinductive, mirroring the host's lazy alias-leaf leniency for
+// self-referential types (`left: Tree | null` terminates, not expands).
+let asgSrcStack: i32[] = []
+let asgDstStack: i32[] = []
+
+// DEPTH GUARD for `tyToStr` on recursive named types (A11): a cyclic arena
+// shape would otherwise render forever — past a fixed depth it prints `…`.
+let tyToStrDepth: i32 = 0
+
+// Places already union-SUBTRACTED by a post-guard fall-through in the current
+// scope (one subtraction per place per block — see the guard-clause comment in
+// the IfStmt arm), with per-scope frame marks like the path overlay's.
+let pgKeys: string[] = []
+let pgFrames: i32[] = []
+
+// INFERRED TYPE-GUARD functions (A6b, host `guards`): a named function whose
+// body is exactly `return <null-test-on-a-param>` becomes a guard — calling it
+// in a condition narrows the argument's null-ness. Parallel arrays: the guard's
+// name, the tested param's index, and 1 when the non-null branch is THEN
+// (`self != null`) / 0 when it is ELSE (`p == null`).
+let guardNames: string[] = []
+let guardParamIdxs: i32[] = []
+let guardThens: i32[] = []
+
 // Record an un-annotated empty-collection binding for the deferred scope-close check.
 function notePending(name: string, ty: i32, at: i32): i32 {
   pendNames.push(name)
@@ -569,45 +604,347 @@ export function initChecker(): i32 {
   pendTys = []
   pendAts = []
   pendDepths = []
+  npKeys = []
+  npTys = []
+  npFrames = []
+  asgSrcStack = []
+  asgDstStack = []
+  tyToStrDepth = 0
+  pgKeys = []
+  pgFrames = []
+  guardNames = []
+  guardParamIdxs = []
+  guardThens = []
+  // Memory intrinsics (host `defaultScope`): raw linear-memory stores/loads and
+  // the `__log__` host hook used by low-level corpus programs.
+  declare("__store_i32__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__store_i64__", mkFuncTy([TY_I32, TY_I64], TY_VOID))
+  declare("__store_f32__", mkFuncTy([TY_I32, TY_F32], TY_VOID))
+  declare("__store_f64__", mkFuncTy([TY_I32, TY_F64], TY_VOID))
+  declare("__load_i32__", mkFuncTy([TY_I32], TY_I32))
+  declare("__store_string__", mkFuncTy([TY_I32, TY_STR], TY_I32))
+  declare("__log_string__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__log__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__memory_grow__", mkFuncTy([TY_I32], TY_I32))
+  let noParams: i32[] = []
+  declare("__memory_size__", mkFuncTy(noParams, TY_I32))
   0
 }
 
 // ── scope chain ──────────────────────────────────────────────────────────────
 
 // ── flow narrowing (condition collectors) ────────────────────────────────────
-// The Ident name of a `x == null` / `x != null` / `null == x` comparison, "" else.
-function nullCmpName(condIx: i32): string {
-  let cond = P.nodes[condIx]
-  if cond is BinExpr {
-    let lhs = P.nodes[cond.binLeft]
-    let rhs = P.nodes[cond.binRight]
-    if rhs is NullLit {
-      if lhs is Ident { return lhs.identName }
-    }
-    if lhs is NullLit {
-      if rhs is Ident { return rhs.identName }
-    }
+// The canonical narrowing key for a "place" — a bare name (`x`) or a property
+// path rooted at one (`o.v`, `o.v.w`) — or "" for anything else (a call, an
+// index, a literal: not a stable place to narrow). Mirrors the host's
+// `placeKey`; `x?.y` keys the same place as `x.y`, so a guard written with
+// `?.` refines the regular `x.y` reads in the branch body.
+function placeKeyOf(ix: i32): string {
+  let n = P.nodes[ix]
+  if n is Ident {
+    return n.identName
+  }
+  if n is Member {
+    let base = placeKeyOf(n.memObj)
+    if base == "" { return "" }
+    return base + "." + n.memProp
+  }
+  if n is OptMember {
+    let base = placeKeyOf(n.omObj)
+    if base == "" { return "" }
+    return base + "." + n.omProp
   }
   ""
 }
 
-// The non-null INNER type of the nullable binding `name`, or -1 (not nullable /
-// not bound).
-function nullableInnerOf(name: string): i32 {
-  let curTy = lookup(name)
-  if curTy >= 0 {
-    let ct = T.tys[curTy]
-    if ct is TyNullable { return ct.nInner }
+// The innermost narrowed-path overlay entry for `key`, or -1 (not narrowed).
+function narrowedPathTy(key: string): i32 {
+  let i = npKeys.length - 1
+  while i >= 0 {
+    if npKeys[i] == key { return npTys[i] }
+    i = i - 1
   }
-  0 - 1
+  -1
+}
+
+// The node index of the place compared against `null` in a `x == null` /
+// `x != null` / `null == x` comparison, or -1 (not a null compare).
+function nullCmpPlace(condIx: i32): i32 {
+  let cond = P.nodes[condIx]
+  if cond is BinExpr {
+    let lhs = P.nodes[cond.binLeft]
+    let rhs = P.nodes[cond.binRight]
+    if rhs is NullLit { return cond.binLeft }
+    if lhs is NullLit { return cond.binRight }
+  }
+  -1
+}
+
+// Whether `ty` is the `null` primitive (compared structurally — `null` may be
+// interned more than once across annotations).
+function isNullTy(ty: i32): boolean {
+  if ty < 0 { return false }
+  let t = T.tys[ty]
+  if t is TyPrim { return t.primName == "null" }
+  false
+}
+
+// The non-null part of `ty` (the host's `nonNullable`): a nullable peels to
+// its inner type; anything else is already non-null. -1 propagates.
+function nonNullTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  ty
+}
+
+// A place's CURRENT type during fact collection: facts already collected into
+// `names`/`tys` (innermost-last wins) override the path overlay, which
+// overrides the scope/field lookup — so successive narrowings compose
+// (`o != null && o.y is i32` resolves `o.y` against the non-null `o`).
+// Read-only: collection must never raise a diagnostic.
+function placeCurTy(ix: i32, names: string[], tys: i32[]): i32 {
+  let key = placeKeyOf(ix)
+  if key != "" {
+    let i = names.length - 1
+    while i >= 0 {
+      if names[i] == key { return tys[i] }
+      i = i - 1
+    }
+    let ov = narrowedPathTy(key)
+    if ov >= 0 { return ov }
+  }
+  let n = P.nodes[ix]
+  if n is Ident {
+    return lookup(n.identName)
+  }
+  if n is Member {
+    return placeFieldTy(placeCurTy(n.memObj, names, tys), n.memProp, false)
+  }
+  if n is OptMember {
+    return placeFieldTy(placeCurTy(n.omObj, names, tys), n.omProp, true)
+  }
+  -1
+}
+
+// The type of field `prop` read off `baseTy` for narrowing purposes (no
+// diagnostics): an OPTIONAL hop peels a nullable receiver and re-wraps the
+// result nullable; the field resolves off a struct, or as a shared union
+// field. -1 when unresolvable (no narrowing is recorded then).
+function placeFieldTy(baseTy: i32, prop: string, optional: boolean): i32 {
+  if baseTy < 0 { return -1 }
+  let bt = T.tys[baseTy]
+  let wasNullable = false
+  let core = baseTy
+  if bt is TyNullable {
+    if !optional { return -1 }
+    wasNullable = true
+    core = bt.nInner
+  }
+  if core < 0 { return -1 }
+  let ct = T.tys[core]
+  let ft = -1
+  if ct is TyObj {
+    ft = objFieldType(ct, prop)
+  } else if ct is TyUnion {
+    ft = sharedUnionFieldTy(ct, prop)
+  }
+  if ft < 0 { return -1 }
+  if wasNullable { return mkNullableTy(ft) }
+  ft
+}
+
+// SHARED-FIELD ACCESS over a struct union (the host's `sharedUnionField`): a
+// field present on EVERY member with a mutually-assignable type is readable on
+// the union directly, without narrowing — `(A | B).tag`. -1 when any member
+// lacks the field, disagrees on its type, or isn't a struct.
+function sharedUnionFieldTy(u: TyUnion, prop: string): i32 {
+  let members = u.uMembers
+  if members.length < 1 { return -1 }
+  let shared = -1
+  let i = 0
+  while i < members.length {
+    let mIx = members[i]
+    if mIx < 0 { return -1 }
+    let m = T.tys[mIx]
+    if m is TyObj {
+      let ft = objFieldType(m, prop)
+      if ft < 0 { return -1 }
+      if shared < 0 {
+        shared = ft
+      } else if !assignable(shared, ft) || !assignable(ft, shared) {
+        return -1
+      }
+    } else {
+      return -1
+    }
+    i = i + 1
+  }
+  shared
+}
+
+// Flatten a union/nullable into its variant list (`null` becomes the null
+// type), mirroring the host's `flattenVariants`.
+function flattenVariantsInto(ty: i32, out: i32[]): i32 {
+  if ty < 0 {
+    out.push(ty)
+    return 0
+  }
+  let t = T.tys[ty]
+  if t is TyUnion {
+    let members = t.uMembers
+    let i = 0
+    while i < members.length {
+      flattenVariantsInto(members[i], out)
+      i = i + 1
+    }
+    return 0
+  }
+  if t is TyNullable {
+    flattenVariantsInto(t.nInner, out)
+    out.push(TY_NULL)
+    return 0
+  }
+  out.push(ty)
+  0
+}
+
+// Two arena types denoting the same variant (mutually assignable). A generic
+// type variable is never "the same variant" as anything — the host's hole
+// guard (`isHole`) — so narrowing never pins an un-instantiated parameter.
+function sameVariantTy(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  let ta = T.tys[a]
+  if ta is TyVar { return false }
+  let tb = T.tys[b]
+  if tb is TyVar { return false }
+  if !assignable(a, b) { return false }
+  assignable(b, a)
+}
+
+// Remove a variant from a union/nullable, returning the residual type (the
+// host's `subtractType`) — backs else-branch narrowing: in `if x is A { … }
+// else { … }`, `x` is `U − A` in the else branch. Returns -1 both when nothing
+// concrete is removed (open-world negation isn't tracked) and when nothing
+// remains (a dead branch — the host skips overlaying a `Never`).
+function subtractTy(ty: i32, removed: i32): i32 {
+  if ty < 0 || removed < 0 { return -1 }
+  let drop: i32[] = []
+  flattenVariantsInto(removed, drop)
+  let vars: i32[] = []
+  flattenVariantsInto(ty, vars)
+  let kept: i32[] = []
+  let i = 0
+  while i < vars.length {
+    let v = vars[i]
+    let hit = false
+    let j = 0
+    while j < drop.length {
+      if sameVariantTy(v, drop[j]) { hit = true }
+      j = j + 1
+    }
+    if !hit { kept.push(v) }
+    i = i + 1
+  }
+  if kept.length == vars.length { return -1 }
+  if kept.length == 0 { return -1 }
+  // Reassemble the residual: a surviving `null` folds back into a nullable.
+  let hasNull = false
+  let core: i32[] = []
+  let k = 0
+  while k < kept.length {
+    if isNullTy(kept[k]) {
+      hasNull = true
+    } else {
+      core.push(kept[k])
+    }
+    k = k + 1
+  }
+  if core.length == 0 { return TY_NULL }
+  let res = core[0]
+  if core.length > 1 { res = mkUnionTy(core) }
+  if hasNull { return mkNullableTy(res) }
+  res
+}
+
+// Append one narrowing fact (place key → type) when the place is stable and
+// the narrowed type resolved (-1 means "no fact" and is skipped).
+function pushNarrowFact(placeIx: i32, ty: i32, names: string[], tys: i32[]): i32 {
+  if ty < 0 { return 0 }
+  let key = placeKeyOf(placeIx)
+  if key == "" { return 0 }
+  names.push(key)
+  tys.push(ty)
+  0
+}
+
+// Whether the place runs through a `?.` hop — its negation is then not a sound
+// else-branch refinement (the chain may be null because a RECEIVER was).
+function placeHasOptionalHop(ix: i32): boolean {
+  let n = P.nodes[ix]
+  if n is OptMember { return true }
+  if n is Member { return placeHasOptionalHop(n.memObj) }
+  false
+}
+
+// For a guard on an optional chain (`x?.y is T`), the truthy branch also
+// implies every `?.` receiver is non-null — push those facts innermost-first
+// (each resolves against an already-narrowed receiver), so the body's regular
+// `x.y` reads resolve. THEN branch only (the host's `optionalChainThenFacts`).
+function pushOptChainThenFacts(placeIx: i32, names: string[], tys: i32[]): i32 {
+  let n = P.nodes[placeIx]
+  if n is Member {
+    pushOptChainThenFacts(n.memObj, names, tys)
+    return 0
+  }
+  if n is OptMember {
+    pushOptChainThenFacts(n.omObj, names, tys)
+    let cur = placeCurTy(n.omObj, names, tys)
+    let inner = nonNullTy(cur)
+    if inner >= 0 && inner != cur {
+      pushNarrowFact(n.omObj, inner, names, tys)
+    }
+    return 0
+  }
+  0
+}
+
+// The argument PLACE a guard call narrows in the branch where its non-null
+// side is `wantThen` (1: THEN, 0: ELSE), or -1: not a registered guard call /
+// wrong direction / no stable argument. Handles the inline form
+// (`present(v)`) and the UFCS form (`v.present()` — the receiver fills the
+// guard's `self` param 0).
+function guardCallPlace(cond: Call, wantThen: i32): i32 {
+  let cfn = P.nodes[cond.callFn]
+  let gname = ""
+  let gRecv = -1
+  if cfn is Ident {
+    gname = cfn.identName
+  } else if cfn is Member {
+    gname = cfn.memProp
+    gRecv = cfn.memObj
+  }
+  if gname == "" { return -1 }
+  let gi = guardIndexOf(gname)
+  if gi < 0 { return -1 }
+  if guardThens[gi] != wantThen { return -1 }
+  let pIdx = guardParamIdxs[gi]
+  let cargs = cond.callArgs
+  if gRecv >= 0 {
+    if pIdx == 0 { return gRecv }
+    if pIdx - 1 < cargs.length { return cargs[pIdx - 1] }
+    return -1
+  }
+  if pIdx < cargs.length { return cargs[pIdx] }
+  -1
 }
 
 // Collect the narrowings that hold when `cond` is TRUE into the parallel
-// `names`/`tys` arrays: `x != null` strips x's null, `x is T` pins x to T
-// (`is null` pins to the null type), `a && b` contributes BOTH conjuncts,
-// `!(e)` contributes e's FALSE narrowings, and parens recurse. Union-COMPLEMENT
-// narrowing (x is NOT T → drop T) stays out — tried and reverted (it made VL
-// miss real errors); null-stripping is the well-defined core.
+// `names`/`tys` arrays (keys are place paths — see `placeKeyOf`): `x != null`
+// strips x's null, `x is T` pins x to T (`is null` pins to the null type),
+// `a && b` contributes BOTH conjuncts, `!(e)` contributes e's FALSE
+// narrowings, and parens recurse. A guard over an optional chain also narrows
+// each `?.` receiver non-null (host `optionalChainThenFacts`).
 function collectThenNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
   let cond = P.nodes[condIx]
   if cond is Paren {
@@ -618,17 +955,13 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
     return 0
   }
   if cond is IsExpr {
-    let obj = P.nodes[cond.isObj]
-    if obj is Ident {
-      if cond.isVariant == "null" {
-        names.push(obj.identName)
-        tys.push(TY_NULL)
-      } else {
-        let tIdx = nameToTy(cond.isVariant)
-        if tIdx >= 0 {
-          names.push(obj.identName)
-          tys.push(tIdx)
-        }
+    pushOptChainThenFacts(cond.isObj, names, tys)
+    if cond.isVariant == "null" {
+      pushNarrowFact(cond.isObj, TY_NULL, names, tys)
+    } else {
+      let tIdx = nameToTy(cond.isVariant)
+      if tIdx >= 0 {
+        pushNarrowFact(cond.isObj, tIdx, names, tys)
       }
     }
     return 0
@@ -640,13 +973,29 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
       return 0
     }
     if cond.binOp == "!=" {
-      let nm = nullCmpName(condIx)
-      if nm != "" {
-        let inner = nullableInnerOf(nm)
-        if inner >= 0 {
-          names.push(nm)
-          tys.push(inner)
+      let placeIx = nullCmpPlace(condIx)
+      if placeIx >= 0 {
+        pushOptChainThenFacts(placeIx, names, tys)
+        let cur = placeCurTy(placeIx, names, tys)
+        let inner = nonNullTy(cur)
+        if inner >= 0 && inner != cur {
+          pushNarrowFact(placeIx, inner, names, tys)
         }
+      }
+    }
+    return 0
+  }
+  // Inferred type-guard call (A6b): `if present(v)` narrows `v` the way the
+  // guard's body narrows its parameter — non-null here when the guard's
+  // non-null branch is THEN.
+  if cond is Call {
+    let gArg = guardCallPlace(cond, 1)
+    if gArg >= 0 {
+      pushOptChainThenFacts(gArg, names, tys)
+      let gCur = placeCurTy(gArg, names, tys)
+      let gInner = nonNullTy(gCur)
+      if gInner >= 0 && gInner != gCur {
+        pushNarrowFact(gArg, gInner, names, tys)
       }
     }
     return 0
@@ -654,10 +1003,12 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
   0
 }
 
-// Collect the narrowings that hold when `cond` is FALSE: `x == null` strips the
-// null in the else-branch, `x is null` false means non-null, `a || b`
-// contributes BOTH disjuncts (De Morgan: neither held), `!(e)` contributes e's
-// TRUE narrowings, and parens recurse.
+// Collect the narrowings that hold when `cond` is FALSE: `x == null` strips
+// the null in the else-branch, `x is null` false means non-null, `x is T`
+// false leaves the union COMPLEMENT `U − T` (host `subtractType`), `a || b`
+// contributes BOTH disjuncts (De Morgan: neither held), `!(e)` contributes
+// e's TRUE narrowings, and parens recurse. A place behind a `?.` hop is never
+// else-narrowed (the chain may be null because a receiver was).
 function collectElseNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
   let cond = P.nodes[condIx]
   if cond is Paren {
@@ -668,14 +1019,17 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
     return 0
   }
   if cond is IsExpr {
-    let obj = P.nodes[cond.isObj]
-    if obj is Ident {
-      if cond.isVariant == "null" {
-        let inner = nullableInnerOf(obj.identName)
-        if inner >= 0 {
-          names.push(obj.identName)
-          tys.push(inner)
-        }
+    if placeHasOptionalHop(cond.isObj) { return 0 }
+    let cur = placeCurTy(cond.isObj, names, tys)
+    if cond.isVariant == "null" {
+      let inner = nonNullTy(cur)
+      if inner >= 0 && inner != cur {
+        pushNarrowFact(cond.isObj, inner, names, tys)
+      }
+    } else {
+      let tIdx = nameToTy(cond.isVariant)
+      if tIdx >= 0 {
+        pushNarrowFact(cond.isObj, subtractTy(cur, tIdx), names, tys)
       }
     }
     return 0
@@ -687,12 +1041,29 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
       return 0
     }
     if cond.binOp == "==" {
-      let nm = nullCmpName(condIx)
-      if nm != "" {
-        let inner = nullableInnerOf(nm)
-        if inner >= 0 {
-          names.push(nm)
-          tys.push(inner)
+      let placeIx = nullCmpPlace(condIx)
+      if placeIx >= 0 {
+        if !placeHasOptionalHop(placeIx) {
+          let cur = placeCurTy(placeIx, names, tys)
+          let inner = nonNullTy(cur)
+          if inner >= 0 && inner != cur {
+            pushNarrowFact(placeIx, inner, names, tys)
+          }
+        }
+      }
+    }
+    return 0
+  }
+  // Inferred type-guard call (A6b): `if absent(p) { … } else { /* p!=null */ }`
+  // — non-null in the ELSE branch when the guard's non-null branch is ELSE.
+  if cond is Call {
+    let gArg = guardCallPlace(cond, 0)
+    if gArg >= 0 {
+      if !placeHasOptionalHop(gArg) {
+        let gCur = placeCurTy(gArg, names, tys)
+        let gInner = nonNullTy(gCur)
+        if gInner >= 0 && gInner != gCur {
+          pushNarrowFact(gArg, gInner, names, tys)
         }
       }
     }
@@ -701,10 +1072,40 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
   0
 }
 
-// Enter a new lexical scope (push a fresh name→type map).
+// Whether a narrowing key is a property PATH (`o.v`) rather than a bare name.
+function isPathKey(s: string): boolean {
+  let i = 0
+  while i < s.length {
+    if s[i] == 46 { return true } // '.'
+    i = i + 1
+  }
+  false
+}
+
+// Apply collected narrowings around a branch: a bare name shadows via the
+// scope chain (the caller pushes a scope first), a property path rides the
+// `npKeys`/`npTys` overlay — whose entries the matching `popScope` unwinds.
+function applyNarrows(names: string[], tys: i32[]): i32 {
+  let i = 0
+  while i < names.length {
+    if isPathKey(names[i]) {
+      npKeys.push(names[i])
+      npTys.push(tys[i])
+    } else {
+      declare(names[i], tys[i])
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Enter a new lexical scope (push a fresh name→type map). Marks the current
+// narrowed-path overlay depth so `popScope` unwinds entries pushed inside.
 function pushScope(): i32 {
   T.scopes.push(Map())
   constScopes.push(Map())
+  npFrames.push(npKeys.length)
+  pgFrames.push(pgKeys.length)
   0
 }
 
@@ -715,6 +1116,21 @@ function popScope(): i32 {
   flushUninferred(T.scopes.length - 1)
   T.scopes.pop()
   constScopes.pop()
+  if npFrames.length > 0 {
+    let base = npFrames[npFrames.length - 1]
+    npFrames.pop()
+    while npKeys.length > base {
+      npKeys.pop()
+      npTys.pop()
+    }
+  }
+  if pgFrames.length > 0 {
+    let pbase = pgFrames[pgFrames.length - 1]
+    pgFrames.pop()
+    while pgKeys.length > pbase {
+      pgKeys.pop()
+    }
+  }
   0
 }
 
@@ -912,10 +1328,65 @@ function isFloatLitExpr(ix: i32): boolean {
 // `assignable` lattice, PLUS the float-literal→f32 exception (`isFloatLitExpr`). Used
 // where the SOURCE EXPRESSION node is in hand (so the literal can be recognized);
 // type-only sites keep using `assignable`.
+// The least upper bound used by `??` (host: `flatten(Union(nonNull(l), r))`):
+// mutually-assignable types collapse to the wider; otherwise a two-member union.
+function joinTys(a: i32, b: i32): i32 {
+  if a < 0 { return b }
+  if b < 0 { return a }
+  if assignable(b, a) { return a }
+  if assignable(a, b) { return b }
+  // Distinct variants: a FLATTENED, deduped union (nullability folds back
+  // into a `?` wrapper) — mirrors the host's `flattenType(Union(...))`.
+  let vars: i32[] = []
+  flattenVariantsInto(a, vars)
+  flattenVariantsInto(b, vars)
+  let kept: i32[] = []
+  let hasNull = false
+  let i = 0
+  while i < vars.length {
+    let v = vars[i]
+    if isNullTy(v) {
+      hasNull = true
+    } else {
+      let dup = false
+      let j = 0
+      while j < kept.length {
+        if kept[j] == v { dup = true }
+        if sameVariantTy(kept[j], v) { dup = true }
+        j = j + 1
+      }
+      if !dup { kept.push(v) }
+    }
+    i = i + 1
+  }
+  if kept.length == 0 { return TY_NULL }
+  let res = kept[0]
+  if kept.length > 1 { res = mkUnionTy(kept) }
+  if hasNull { return mkNullableTy(res) }
+  res
+}
+
+// Whether the expression is a bare `true`/`false` literal (through parens) —
+// excluded from the A7 boolean→i32 value coercion (a literal in an i32 slot is
+// more likely a mistake; write `1`/`0`).
+function isBoolLitExpr(ix: i32): boolean {
+  if ix < 0 { return false }
+  let e = P.nodes[ix]
+  if e is Paren { return isBoolLitExpr(e.parInner) }
+  if e is BoolLit { return true }
+  false
+}
+
 function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if assignable(srcTy, dstTy) { return true }
   if primNameOf(dstTy) == "f32" {
     if isFloatLitExpr(srcExpr) { return true }
+  }
+  // `boolean`-where-`i32`-expected coercion (A7): a boolean-typed VALUE flows
+  // into an i32 slot as 1/0 (a no-op in codegen — boolean rides in an i32).
+  // One-directional, and a bare `true`/`false` LITERAL is excluded.
+  if primNameOf(dstTy) == "i32" {
+    if primNameOf(srcTy) == "bool" && !isBoolLitExpr(srcExpr) { return true }
   }
   false
 }
@@ -1226,6 +1697,14 @@ function tyToStr(ix: i32): string {
   if ix < 0 {
     return "<none>"
   }
+  if tyToStrDepth > 8 { return "…" }
+  tyToStrDepth = tyToStrDepth + 1
+  let s = tyToStrGo(ix)
+  tyToStrDepth = tyToStrDepth - 1
+  s
+}
+
+function tyToStrGo(ix: i32): string {
   let t = T.tys[ix]
   if t is TyPrim {
     return t.primName
@@ -1371,6 +1850,20 @@ function assignable(src: i32, dst: i32): boolean {
   if src == dst {
     return true
   }
+  let gi = asgSrcStack.length - 1
+  while gi >= 0 {
+    if asgSrcStack[gi] == src && asgDstStack[gi] == dst { return true }
+    gi = gi - 1
+  }
+  asgSrcStack.push(src)
+  asgDstStack.push(dst)
+  let ok = assignableGo(src, dst)
+  asgSrcStack.pop()
+  asgDstStack.pop()
+  ok
+}
+
+function assignableGo(src: i32, dst: i32): boolean {
   let s = T.tys[src]
   let d = T.tys[dst]
   if s is TyErr {
@@ -1519,6 +2012,106 @@ function bindOf(bNames: string[], bTys: i32[], name: string): i32 {
 // A call expression: array-method builtins (`xs.push`), string-method builtins
 // (`.slice`/`.indexOf`/`.includes`/`.charCodeAt`), the `print`/`fromCodePoint`
 // builtins, then the generic function-call path (arity + per-arg assignability).
+// UFCS `self`-method dispatch (host parser: `o.f(args)` → `f(o, args)` for a
+// free function whose first parameter accepts the receiver). Returns the
+// call's type, or -1 when no matching function exists (the caller reports its
+// own "no method"/"no field" error). Mirrors the general call path's pending-
+// return demand-inference; generic (TyVar) self-functions are not dispatched.
+function ufcsCallTy(name: string, recvTy: i32, n: Call, ix: i32): i32 {
+  let fnTy = lookup(name)
+  if fnTy < 0 { return -1 }
+  let preFt = T.tys[fnTy]
+  if preFt is TyFunc {
+    if preFt.fnRet == 0 - 2 {
+      if !onInferStack(name) {
+        let dIx = fnDeclIx[name] ?? -1
+        if dIx >= 0 {
+          checkNode(dIx)
+        }
+      }
+    }
+  } else {
+    return -1
+  }
+  let ft = T.tys[fnTy]
+  if ft is TyFunc {
+    let retTy = ft.fnRet
+    if retTy == 0 - 2 { retTy = TY_ERR }
+    let params = ft.fnParamTypes
+    let args = n.callArgs
+    if params.length != args.length + 1 { return -1 }
+    if !assignable(recvTy, params[0]) { return -1 }
+    let i = 0
+    while i < args.length {
+      let at = checkNode(args[i])
+      constrainEmpty(at, params[i + 1])
+      if !assignableExpr(args[i], at, params[i + 1]) {
+        tErr("argument " + i32ToStr(i + 1) + ": expected " +
+          tyToStr(params[i + 1]) + ", got " + tyToStr(at), ix)
+      }
+      i = i + 1
+    }
+    return retTy
+  }
+  -1
+}
+
+// The innermost guard registration for `name`, or -1 (not a guard).
+function guardIndexOf(name: string): i32 {
+  let i = guardNames.length - 1
+  while i >= 0 {
+    if guardNames[i] == name { return i }
+    i = i - 1
+  }
+  -1
+}
+
+// The A6b guard fact of a function body's result expression over the params:
+// the index of the param whose NULL-ness it tests, or -1 (not a guard shape).
+// Sets nothing itself — the caller reads the branch direction from the shape:
+// the encoded result is `paramIndex * 2 + 1` when the non-null branch is THEN
+// (`x != null`, `x is T`), `paramIndex * 2` when it is ELSE (`x == null`,
+// `x is null`). Mirrors the host's `conditionNarrowing` over a bare param.
+function guardFactOf(exprIx: i32, paramNames: string[]): i32 {
+  let e = P.nodes[exprIx]
+  if e is Paren { return guardFactOf(e.parInner, paramNames) }
+  if e is IsExpr {
+    let obj = P.nodes[e.isObj]
+    if obj is Ident {
+      let gi = 0
+      while gi < paramNames.length {
+        if paramNames[gi] == obj.identName {
+          if e.isVariant == "null" {
+            return gi * 2
+          }
+          return gi * 2 + 1
+        }
+        gi = gi + 1
+      }
+    }
+    return -1
+  }
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      let placeIx = nullCmpPlace(exprIx)
+      if placeIx >= 0 {
+        let p = P.nodes[placeIx]
+        if p is Ident {
+          let gj = 0
+          while gj < paramNames.length {
+            if paramNames[gj] == p.identName {
+              if e.binOp == "!=" { return gj * 2 + 1 }
+              return gj * 2
+            }
+            gj = gj + 1
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
 function checkCallNode(n: Call, ix: i32): i32 {
   // Array method call `xs.push(e)`: when the callee is a member access whose
   // receiver is an array, type it as a builtin (NOT a struct field). Only fires for
@@ -1757,9 +2350,25 @@ function checkCallNode(n: Call, ix: i32): i32 {
           }
           return TY_I32
         }
+        // UFCS `self`-method on a string receiver (`"hello".first()`).
+        let su = ufcsCallTy(sp, recvTy, n, ix)
+        if su >= 0 { return su }
         tErr("no method '." + sp + "' on string", ix)
         return TY_ERR
       }
+    }
+    // UFCS `self`-method on any other receiver (struct / nullable / union):
+    // `o.f(args)` lowers to `f(o, args)` when the receiver carries no such
+    // FIELD (a callable field keeps precedence) and a matching free function
+    // exists; otherwise fall through to the normal member-call path/error.
+    let ufcsHasField = false
+    let urt = T.tys[recvTy]
+    if urt is TyObj {
+      if objFieldType(urt, cfn.memProp) >= 0 { ufcsHasField = true }
+    }
+    if !ufcsHasField {
+      let uu = ufcsCallTy(cfn.memProp, recvTy, n, ix)
+      if uu >= 0 { return uu }
     }
   }
   // `print(x)` is a compiler builtin (no module/import system yet): it accepts a
@@ -1925,7 +2534,7 @@ function checkCallNode(n: Call, ix: i32): i32 {
       // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
       // clearing its uninferred floor — pure downstream-usage inference, no push.
       constrainEmpty(at, expected)
-      if !assignable(at, expected) {
+      if !assignableExpr(args[i], at, expected) {
         tErr("argument " + i32ToStr(i + 1) + ": expected " +
           tyToStr(expected) + ", got " + tyToStr(at), ix)
       }
@@ -2340,6 +2949,44 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
     inferObserved = savedObserved
     inferSawErr = savedSawErr
   }
+  // Inferred type guard (A6b, host parity — degenerate case): a NAMED function
+  // whose body's RESULT is exactly a null-test on one of its params registers
+  // as a guard, so calling it in a condition narrows the argument (inline,
+  // UFCS, and the guard-clause form).
+  if n.fnName != "" {
+    let gBody = P.nodes[n.fnBody]
+    if gBody is Block {
+      let gStmts = gBody.blkStmts
+      if gStmts.length > 0 {
+        let gLastIx = gStmts[gStmts.length - 1]
+        let gLast = P.nodes[gLastIx]
+        let gResIx = gLastIx
+        if gLast is RetStmt {
+          gResIx = gLast.retArg
+        }
+        if gResIx >= 0 {
+          let gParamNames: string[] = []
+          let gp = 0
+          while gp < params.length {
+            let gpn = P.nodes[params[gp]]
+            if gpn is Param {
+              gParamNames.push(gpn.parName)
+            } else {
+              gParamNames.push("")
+            }
+            gp = gp + 1
+          }
+          let gFact = guardFactOf(gResIx, gParamNames)
+          if gFact >= 0 {
+            let gThen = gFact - gFact / 2 * 2
+            guardNames.push(n.fnName)
+            guardParamIdxs.push(gFact / 2)
+            guardThens.push(gThen)
+          }
+        }
+      }
+    }
+  }
   // The function's own type — a FuncDecl in EXPRESSION position (a lambda, or a
   // named function referenced as a value) evaluates to it.
   mkFuncTy(paramTys, ret)
@@ -2355,53 +3002,110 @@ function checkProgramNode(n: Program): i32 {
   // field resolves via `nameToTy`. Types register in source order, so a field may
   // reference an EARLIER struct; a forward reference to a later struct reports
   // "unknown type" (deferred).
+  // Pass 0a: pre-register EVERY top-level `type` name with an EMPTY placeholder
+  // (struct or union) so SELF- and FORWARD-references inside field annotations
+  // and union variants resolve (host A11: a recursive alias is a lazy
+  // self-referential leaf; here the placeholder's arrays are filled in pass 0b,
+  // so the reference lands on the FINAL arena index — the arena shape is cyclic
+  // for a recursive type, which `assignable`/`tyToStr` guard against).
+  let t0 = 0
+  while t0 < stmts.length {
+    let sd0 = P.nodes[stmts[t0]]
+    if sd0 is TypeDecl {
+      let fnames0: string[] = []
+      let ftys0: i32[] = []
+      cUserTypes[sd0.tdName] = mkObjTy(fnames0, ftys0)
+    } else if sd0 is UnionDecl {
+      let members0: i32[] = []
+      cUserTypes[sd0.udName] = mkUnionTy(members0)
+    }
+    t0 = t0 + 1
+  }
+  // Pass 0b: resolve each declaration's fields/variants and fill them into the
+  // placeholder (pushing into the SAME arrays its arena entry holds). A name
+  // redeclared later overwrote the map in 0a, so both decls resolve into the
+  // LAST placeholder; `tdDone` keeps each arena entry filled exactly once.
+  let tdDone: i32[] = []
   let ti = 0
   while ti < stmts.length {
     let sd = P.nodes[stmts[ti]]
     if sd is TypeDecl {
-      let dfields = sd.tdFields
-      let fnames: string[] = []
-      let ftys: i32[] = []
-      let fi = 0
-      while fi < dfields.length {
-        let fd = P.nodes[dfields[fi]]
-        if fd is FieldDef {
-          fnames.push(fd.fdName)
-          let fty = TY_ERR
-          if fd.fdType >= 0 {
-            let ftn = P.nodes[fd.fdType]
-            if ftn is TypeRef {
-              let r = nameToTy(ftn.tyName)
-              if r >= 0 {
-                fty = r
-              } else {
-                tErr("unknown type '" + ftn.tyName + "' for field '" +
-                  fd.fdName + "'", dfields[fi])
+      let declIx = cUserTypes[sd.tdName] ?? -1
+      let dseen = false
+      let dj = 0
+      while dj < tdDone.length {
+        if tdDone[dj] == declIx { dseen = true }
+        dj = dj + 1
+      }
+      if declIx >= 0 && !dseen {
+        tdDone.push(declIx)
+        let pt = T.tys[declIx]
+        if pt is TyObj {
+          let fnames = pt.objFieldNames
+          let ftys = pt.objFieldTypes
+          let dfields = sd.tdFields
+          let fi = 0
+          while fi < dfields.length {
+            let fd = P.nodes[dfields[fi]]
+            if fd is FieldDef {
+              fnames.push(fd.fdName)
+              let fty = TY_ERR
+              if fd.fdType >= 0 {
+                let ftn = P.nodes[fd.fdType]
+                if ftn is TypeRef {
+                  let r = nameToTy(ftn.tyName)
+                  if r >= 0 {
+                    fty = r
+                  } else {
+                    tErr("unknown type '" + ftn.tyName + "' for field '" +
+                      fd.fdName + "'", dfields[fi])
+                  }
+                }
               }
+              ftys.push(fty)
+            }
+            fi = fi + 1
+          }
+        }
+      }
+    } else if sd is UnionDecl {
+      // A union's variants are type NAMES; resolve each into the member
+      // type-arena indices (forward references hit the 0a placeholders).
+      let declIx = cUserTypes[sd.udName] ?? -1
+      let useen = false
+      let uj = 0
+      while uj < tdDone.length {
+        if tdDone[uj] == declIx { useen = true }
+        uj = uj + 1
+      }
+      if declIx >= 0 && !useen {
+        tdDone.push(declIx)
+        let pt = T.tys[declIx]
+        if pt is TyUnion {
+          let members = pt.uMembers
+          let variants = sd.udVariants
+          // A DEGENERATE self-cycle — `type D = D`, a body that is nothing but
+          // the alias itself — has no base case, so nothing can inhabit it.
+          // Reported at the DECLARATION (host parser parity), so an UNUSED
+          // `type D = D` still flags; the members stay empty (host: `Never`).
+          if variants.length == 1 && variants[0] == sd.udName {
+            tErr("Type `" + sd.udName + "` is defined in terms of itself " +
+              "with no base type, so it can never have a value", stmts[ti])
+          } else {
+            let vi = 0
+            while vi < variants.length {
+              let m = nameToTy(variants[vi])
+              if m >= 0 {
+                members.push(m)
+              } else {
+                tErr("unknown type '" + variants[vi] + "' in union '" +
+                  sd.udName + "'", stmts[ti])
+              }
+              vi = vi + 1
             }
           }
-          ftys.push(fty)
         }
-        fi = fi + 1
       }
-      cUserTypes[sd.tdName] = mkObjTy(fnames, ftys)
-    } else if sd is UnionDecl {
-      // A union's variants are type NAMES; resolve each (its variant structs
-      // register earlier in source order) into the member type-arena indices.
-      let variants = sd.udVariants
-      let members: i32[] = []
-      let vi = 0
-      while vi < variants.length {
-        let m = nameToTy(variants[vi])
-        if m >= 0 {
-          members.push(m)
-        } else {
-          tErr("unknown type '" + variants[vi] + "' in union '" +
-            sd.udName + "'", stmts[ti])
-        }
-        vi = vi + 1
-      }
-      cUserTypes[sd.udName] = mkUnionTy(members)
     }
     ti = ti + 1
   }
@@ -2566,11 +3270,7 @@ function checkNode(ix: i32): i32 {
       let cpushed = 0
       if cnames.length > 0 {
         pushScope()
-        let cni = 0
-        while cni < cnames.length {
-          declare(cnames[cni], ctys[cni])
-          cni = cni + 1
-        }
+        applyNarrows(cnames, ctys)
         cpushed = 1
       }
       let crt = checkNode(n.binRight)
@@ -2624,20 +3324,42 @@ function checkNode(ix: i32): i32 {
       if !assignable(rt, lt) {
         tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(lt), ix)
       }
+      // A-infer-null: a nullable binding's open inner HOLE (`let x = null`)
+      // fills from the first non-null assignment (in place, so the binding
+      // becomes `T | null` everywhere); and a straight-line non-null `x = e`
+      // narrows `x` for the REST of the enclosing block (host
+      // `assignmentNarrowing` — an assignment inside a branch unwinds with the
+      // branch's scope, so it never leaks past the join).
+      let asgTgt = P.nodes[n.binLeft]
+      if asgTgt is Ident {
+        let asgCur = lookup(asgTgt.identName)
+        if asgCur >= 0 {
+          let asgCt = T.tys[asgCur]
+          if asgCt is TyNullable {
+            let rtT = T.tys[rt]
+            let rhsNullable = false
+            if rtT is TyNullable { rhsNullable = true }
+            if !rhsNullable && !isNullTy(rt) && rt >= 0 {
+              if asgCt.nInner < 0 {
+                asgCt.nInner = rt
+              }
+              declare(asgTgt.identName, nonNullTy(asgCur))
+            }
+          }
+        }
+      }
       // Assignment is an expression yielding its RIGHT-HAND SIDE (host parity;
       // DECISIONS: assignment-as-expression).
       return rt
     }
-    // Nullish coalescing: `a ?? d` strips `a`'s nullability; the default must be
-    // assignable to the inner type. A non-nullable LHS just yields itself.
+    // Nullish coalescing: `a ?? d` — the result is `a`'s NON-NULL part unioned
+    // with `d`'s type (host `NullCoalesce`: `a ?? b` with a nullable `b` stays
+    // nullable; a non-null default collapses to the inner type). A non-nullable
+    // LHS just yields itself.
     if op == "??" {
       let lt2 = T.tys[lt]
       if lt2 is TyNullable {
-        let inner = lt2.nInner
-        if !assignable(rt, inner) {
-          tErr("?? default: expected " + tyToStr(inner) + ", got " + tyToStr(rt), ix)
-        }
-        return inner
+        return joinTys(lt2.nInner, rt)
       }
       return lt
     }
@@ -2688,6 +3410,20 @@ function checkNode(ix: i32): i32 {
       if assignable(lt, TY_STR) && assignable(rt, TY_STR) {
         return TY_STR
       }
+      // List concat `a + b` → a new `T[]` (collections-design §VL.4); the two
+      // element types must agree (an empty `[]` adopts the other side's).
+      let lta = T.tys[lt]
+      if lta is TyArray {
+        let rta = T.tys[rt]
+        if rta is TyArray {
+          constrainEmpty(rt, lt)
+          constrainEmpty(lt, rt)
+          if assignable(rt, lt) { return lt }
+          if assignable(lt, rt) { return rt }
+          tErr("cannot concat " + tyToStr(lt) + " and " + tyToStr(rt), ix)
+          return TY_ERR
+        }
+      }
     }
     // Remaining arithmetic: numeric-only, both the SAME numeric type (no implicit
     // i32 ↔ f64).
@@ -2734,6 +3470,13 @@ function checkNode(ix: i32): i32 {
 
   // ── member access ───────────────────────────────────────────────────────────
   } else if n is Member {
+    // A flow-narrowed property path (`if o.v is T { … }`) overrides the stored
+    // field type within the branch (the host's `narrowedPaths` overlay).
+    let mKey = placeKeyOf(ix)
+    if mKey != "" {
+      let mOv = narrowedPathTy(mKey)
+      if mOv >= 0 { return mOv }
+    }
     let objTy = checkNode(n.memObj)
     let ot = T.tys[objTy]
     if ot is TyObj {
@@ -2746,6 +3489,13 @@ function checkNode(ix: i32): i32 {
     }
     if ot is TyErr {
       return TY_ERR
+    }
+    // SHARED-FIELD ACCESS over a struct union — `(A | B).tag` when every
+    // member carries the field at the same type (the host's
+    // `sharedUnionField`); an unshared field still needs an `is` narrowing.
+    if ot is TyUnion {
+      let sf = sharedUnionFieldTy(ot, n.memProp)
+      if sf >= 0 { return sf }
     }
     // `.length` on an array, a map, or a string is an i32.
     if ot is TyArray {
@@ -2789,10 +3539,10 @@ function checkNode(ix: i32): i32 {
     let ei = 1
     while ei < elems.length {
       let et = checkNode(elems[ei])
-      if !assignable(et, elemTy) {
-        tErr("array element " + i32ToStr(ei) + " is " + tyToStr(et) +
-          ", expected " + tyToStr(elemTy), ix)
-      }
+      // Host parity: the element type is the UNION of every element's type
+      // (flattened/deduped) — `[a, b, c]` over mixed struct variants types as
+      // `(A | B | C)[]`; an annotation then checks each member structurally.
+      elemTy = joinTys(elemTy, et)
       ei = ei + 1
     }
     return mkArrayTy(elemTy)
@@ -2889,6 +3639,12 @@ function checkNode(ix: i32): i32 {
   // re-wraps the result nullable (`{x: i32} | null` ?. x → `i32 | null`); a
   // non-null receiver behaves like a plain member read.
   } else if n is OptMember {
+    // `x?.y` keys the same narrowed place as `x.y` (host `placeKey`).
+    let omKey = placeKeyOf(ix)
+    if omKey != "" {
+      let omOv = narrowedPathTy(omKey)
+      if omOv >= 0 { return omOv }
+    }
     let recv = checkNode(n.omObj)
     let rcv = T.tys[recv]
     let wasNullable = false
@@ -2896,6 +3652,15 @@ function checkNode(ix: i32): i32 {
     if rcv is TyNullable {
       wasNullable = true
       baseTy = rcv.nInner
+      // Peel a SECOND nullable layer too: the host's `flattenType` collapses
+      // `T??` to `T?`, so a doubly-nullable receiver (`m[k]?.v` off a nullable
+      // map read) still reads its field with one `?.`.
+      if baseTy >= 0 {
+        let rcv2 = T.tys[baseTy]
+        if rcv2 is TyNullable {
+          baseTy = rcv2.nInner
+        }
+      }
     }
     if baseTy < 0 {
       return TY_ERR
@@ -2914,6 +3679,14 @@ function checkNode(ix: i32): i32 {
     }
     if bt is TyErr {
       return TY_ERR
+    }
+    // Shared union field through `?.` — same rule as the plain member read.
+    if bt is TyUnion {
+      let osf = sharedUnionFieldTy(bt, n.omProp)
+      if osf >= 0 {
+        if wasNullable { return mkNullableTy(osf) }
+        return osf
+      }
     }
     tErr("member access '?." + n.omProp + "' on non-object " + tyToStr(recv), ix)
     return TY_ERR
@@ -2967,6 +3740,14 @@ function checkNode(ix: i32): i32 {
       }
     } else if initTy >= 0 {
       bound = initTy
+      // USAGE-DRIVEN NULLABLE HOLE (A-infer-null): an un-annotated `let x =
+      // null` is NOT pinned to the exact `null` type — `null` is hole-bearing
+      // (it inhabits every `T | null`). Bind a nullable with an OPEN inner
+      // hole; the first non-null assignment fills `T` in place (see the `=`
+      // arm), so `x` becomes `T | null`. A COMPLETE initializer still pins.
+      if isNullTy(initTy) {
+        bound = mkNullableTy(0 - 1)
+      }
       // UN-INFERRED EMPTY-COLLECTION FLOOR: an un-annotated `[]` / `Map()` / `Set()`
       // whose hole is still open here may yet be pinned by a downstream
       // `.push`/`.set`/`.add` (those mutate the shared arena entry in place), so we
@@ -3125,11 +3906,7 @@ function checkNode(ix: i32): i32 {
     let daThenDiverges = daBranchDiverges(n.ifThen)
     if tnNames.length > 0 {
       pushScope()
-      let ti = 0
-      while ti < tnNames.length {
-        declare(tnNames[ti], tnTys[ti])
-        ti = ti + 1
-      }
+      applyNarrows(tnNames, tnTys)
     }
     checkNode(n.ifThen)
     if tnNames.length > 0 {
@@ -3146,11 +3923,7 @@ function checkNode(ix: i32): i32 {
       daElseDiverges = daBranchDiverges(n.ifElse)
       if enNames.length > 0 {
         pushScope()
-        let ei = 0
-        while ei < enNames.length {
-          declare(enNames[ei], enTys[ei])
-          ei = ei + 1
-        }
+        applyNarrows(enNames, enTys)
       }
       checkNode(n.ifElse)
       if enNames.length > 0 {
@@ -3175,7 +3948,14 @@ function checkNode(ix: i32): i32 {
     }
     // GUARD CLAUSE: a THEN that always exits applies the FALSE narrowings to
     // the rest of the enclosing block (`if x == null { return } … x.f …`).
-    if enNames.length > 0 {
+    // Host `postGuardNarrowings` parity: only a SINGLE-arm `if` with NO `else`
+    // (an `else`/`else if` chain does not post-narrow the fall-through), and
+    // only ONE union SUBTRACTION per place per block — the host checker accepts
+    // a twice-subtracted residual but both codegens reject it
+    // (xfail-seq-guard-residual-codegen), so the front end keeps rejecting the
+    // second subtraction. Null-STRIPS always apply (guard sequences rely on
+    // them). Path-keyed entries unwind at the ENCLOSING scope's `popScope`.
+    if enNames.length > 0 && !daHasElse {
       let tn2 = P.nodes[n.ifThen]
       if tn2 is Block {
         let tst = tn2.blkStmts
@@ -3192,7 +3972,25 @@ function checkNode(ix: i32): i32 {
           if diverges {
             let gi2 = 0
             while gi2 < enNames.length {
-              declare(enNames[gi2], enTys[gi2])
+              let gKey = enNames[gi2]
+              let gTy = enTys[gi2]
+              if isPathKey(gKey) {
+                npKeys.push(gKey)
+                npTys.push(gTy)
+              } else if gTy == nonNullTy(lookup(gKey)) {
+                declare(gKey, gTy)
+              } else {
+                let gSeen = false
+                let gj = 0
+                while gj < pgKeys.length {
+                  if pgKeys[gj] == gKey { gSeen = true }
+                  gj = gj + 1
+                }
+                if !gSeen {
+                  pgKeys.push(gKey)
+                  declare(gKey, gTy)
+                }
+              }
               gi2 = gi2 + 1
             }
           }
@@ -3220,7 +4018,7 @@ function checkNode(ix: i32): i32 {
     // An explicit `return inner` of an empty collection pins its element from the
     // declared return type — usage-driven inference clearing the floor.
     constrainEmpty(got, want)
-    if want >= 0 && !assignable(got, want) {
+    if want >= 0 && !assignableExpr(n.retArg, got, want) {
       tErr("return type mismatch: expected " + tyToStr(want) + ", got " +
         tyToStr(got), ix)
     }
