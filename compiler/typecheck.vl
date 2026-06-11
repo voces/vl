@@ -1159,6 +1159,64 @@ function objFieldType(o: TyObj, name: string): i32 {
   -1
 }
 
+// ── value-comparability: may `ty` be compared with the default structural `==`? ─
+// SOUNDNESS (mirrors the host's `isEquatable`): `==`/`!=` on a plain data object
+// falls back to structural equality, which is sound only when EVERY component is
+// itself value-comparable. Primitives and strings compare natively; a FUNCTION
+// field compares by reference (same table index + captured env), so it does NOT
+// make its object non-equatable; an array is equatable iff its element type is; an
+// object iff all its fields are. A non-discriminated UNION (or NULLABLE, or a map)
+// field is NOT value-comparable — discriminating the variant would be required
+// first — so its enclosing object needs an explicit `==`. `seen` guards a cyclic
+// (recursive) object shape: a type already on the stack is treated as equatable
+// (its fields decide), matching the host's cycle guard.
+function isEquatable(ty: i32, seen: i32[]): boolean {
+  if ty < 0 {
+    return true
+  }
+  let t = T.tys[ty]
+  if t is TyPrim {
+    // Every scalar primitive (incl. string, bool) is value-comparable; `void`/`null`
+    // never reach a structural compare (a nullness test short-circuits earlier).
+    return true
+  }
+  if t is TyErr {
+    return true
+  }
+  if t is TyVar {
+    return true
+  }
+  if t is TyFunc {
+    return true
+  }
+  if t is TyArray {
+    return isEquatable(t.aElem, seen)
+  }
+  if t is TyObj {
+    let si = 0
+    while si < seen.length {
+      if seen[si] == ty {
+        return true
+      }
+      si = si + 1
+    }
+    seen.push(ty)
+    let ftys = t.objFieldTypes
+    let i = 0
+    let ok = true
+    while i < ftys.length {
+      if !isEquatable(ftys[i], seen) {
+        ok = false
+      }
+      i = i + 1
+    }
+    seen.pop()
+    return ok
+  }
+  // TyUnion / TyNullable / TyMap: not structurally value-comparable.
+  false
+}
+
 // ── structural assignability: is `src` assignable to `dst`? ──────────────────
 // Both are type-arena indices. The error type is assignable in both directions
 // (so one failure doesn't cascade). Primitives match by name. An object is
@@ -1794,6 +1852,119 @@ function noteInferredRet(t: i32): i32 {
   0
 }
 
+// SOUNDNESS — exhaustiveness of an else-less `is`-chain. Does the flat
+// `if p is A {…} else if p is B {…}` chain rooted at `ifIx` (no final `else`)
+// COVER every variant of `p`'s union type? If so its fall-through is unreachable
+// and the chain needs no `else`; if not, a value falls off the end (the host
+// types that as `| null`). Mirrors the host's `conditionsExhaust`, but over the
+// discriminated place's declared union MEMBERS (VL has no union-subtraction /
+// `Never` machinery): collect the per-arm tested types, require every arm to test
+// the SAME single place, then check each union member is covered by some arm.
+// Conservative — any arm that isn't a bare `place is T` (a compound `&&`/`||`, a
+// different place, a null test) makes the chain non-exhaustive (returns false),
+// never wrongly exhaustive.
+function ifChainExhausts(ifIx: i32): boolean {
+  let havePlace = false
+  let placeName = "?"
+  let testedTys: i32[] = []
+  // `allIsArms` stays true only while every arm seen is a bare `<sameIdent> is T`
+  // (the only shape we can prove exhaustive by union-member coverage).
+  let allIsArms = true
+  let node = P.nodes[ifIx]
+  let walking = true
+  while walking {
+    if node is IfStmt {
+      // Classify this arm's condition. Only a single `<ident> is T` (not null)
+      // contributes to coverage; anything else makes the chain non-coverable.
+      let cond = P.nodes[node.ifCond]
+      if cond is IsExpr {
+        if cond.isVariant == "null" {
+          allIsArms = false
+        } else {
+          let obj = P.nodes[cond.isObj]
+          if obj is Ident {
+            if !havePlace {
+              placeName = obj.identName
+              havePlace = true
+            } else if placeName != obj.identName {
+              allIsArms = false
+            }
+            let tIx = nameToTy(cond.isVariant)
+            if tIx < 0 {
+              allIsArms = false
+            } else {
+              testedTys.push(tIx)
+            }
+          } else {
+            allIsArms = false
+          }
+        }
+      } else {
+        allIsArms = false
+      }
+      if node.ifElse < 0 {
+        // No `else`: the chain ends here — decide by coverage below.
+        walking = false
+      } else {
+        let nxt = P.nodes[node.ifElse]
+        if nxt is IfStmt {
+          node = nxt
+        } else {
+          // A real (block) `else` covers the fall-through outright — exhaustive
+          // regardless of the arm shapes.
+          return true
+        }
+      }
+    } else {
+      return false
+    }
+  }
+  // No `else`. Only a pure `is`-chain over one place can be exhaustive by member
+  // coverage; any other shape genuinely falls through.
+  if !allIsArms {
+    return false
+  }
+  // No place was discriminated (shouldn't happen) — not exhaustive.
+  if !havePlace {
+    return false
+  }
+  // Look up the place's union members; cover each against the tested set.
+  let pty = lookup(placeName)
+  if pty < 0 {
+    return false
+  }
+  let pt = T.tys[pty]
+  if pt is TyNullable {
+    // A nullable place needs an explicit `is null` (or `else`) arm to be covered;
+    // an else-less `is`-chain over the inner variants always leaves the null path.
+    return false
+  }
+  if pt is TyUnion {
+    // Cover each union member against the tested set.
+    let members = pt.uMembers
+    let mi = 0
+    let allCovered = true
+    while mi < members.length {
+      let covered = false
+      let ti = 0
+      while ti < testedTys.length {
+        if assignable(members[mi], testedTys[ti]) {
+          covered = true
+        }
+        ti = ti + 1
+      }
+      if !covered {
+        allCovered = false
+      }
+      mi = mi + 1
+    }
+    return allCovered
+  }
+  // A non-union place: an `is`-chain over it is degenerate; treat as covered
+  // (a single concrete type is "exhausted" by any always-true branch).
+  true
+}
+
 // A function declaration: resolve param/return annotations (narrowing the Param/
 // TypeRef children), bind the signature, and check the body in a fresh scope.
 // An UN-ANNOTATED return type is INFERRED from the body — its `return`s and
@@ -1907,6 +2078,39 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
           noteInferredRet(stTy)
         } else {
           constrainEmpty(stTy, ret)
+          // SOUNDNESS — missing-return / non-exhaustive fall-through. When the
+          // body's LAST statement is an else-less `is`-chain that does NOT cover
+          // every variant of its discriminated union, a value falls off the end
+          // (the host types this as `branches | null`). For a non-void declared
+          // return that is a soundness hole: "you forgot a case". An `if` WITH a
+          // final `else`, or an EXHAUSTIVE chain, is unreachable past its end and
+          // is fine; any other trailing statement is a normal value/return and is
+          // left to the per-`return` and trailing-expression checks above. Skip
+          // when the return type is itself nullable (a `| null` fall-through is
+          // assignable) or the error type (don't cascade).
+          let lastN = P.nodes[stmts[s]]
+          if lastN is IfStmt {
+            // Only an `is`-chain (the trailing `if` discriminates with `is`) is
+            // subject to this exhaustiveness rule — leave plain `if cond {…}`
+            // shapes to the existing per-branch checks.
+            let firstCond = P.nodes[lastN.ifCond]
+            let isChain = false
+            if firstCond is IsExpr {
+              isChain = true
+            }
+            let retT = T.tys[ret]
+            let retNullable = false
+            if retT is TyNullable {
+              retNullable = true
+            }
+            if isChain && ret != TY_VOID && ret != TY_ERR && !retNullable {
+              if !ifChainExhausts(stmts[s]) {
+                tErr("non-exhaustive `is`-chain falls through with no `else`" +
+                  " — add the missing variant(s) or an `else` (expected " +
+                  tyToStr(ret) + ")", stmts[s])
+              }
+            }
+          }
         }
       }
       s = s + 1
@@ -2240,6 +2444,29 @@ function checkNode(ix: i32): i32 {
     if op == "==" || op == "!=" {
       if !assignable(lt, rt) && !assignable(rt, lt) {
         tErr("cannot compare " + tyToStr(lt) + " with " + tyToStr(rt), ix)
+      } else {
+        // SOUNDNESS: a STRUCTURAL `==`/`!=` on a plain object (or array) defaults
+        // to field-by-field equality, which is sound only when every field is
+        // itself value-comparable. A non-discriminated union/nullable/map field is
+        // not — so reject the default structural compare and ask for an explicit
+        // `==`. (Unions/nullables compared DIRECTLY — value-union equality, `==
+        // null` nullness tests — never reach here: only an object/array operand is
+        // tested, matching the host's anonymous-object structural fallback.)
+        let lT = T.tys[lt]
+        let structural = false
+        if lT is TyObj {
+          structural = true
+        } else if lT is TyArray {
+          structural = true
+        }
+        if structural {
+          let seen: i32[] = []
+          if !isEquatable(lt, seen) {
+            tErr(tyToStr(lt) +
+              " isn't equatable (a field is not value-comparable) — define a `==` operator for it",
+              ix)
+          }
+        }
       }
       return TY_BOOL
     }
@@ -2426,9 +2653,33 @@ function checkNode(ix: i32): i32 {
   // narrowing of `x` to `T` happens in the THEN branch of an enclosing `if` (see the
   // IfStmt case); used elsewhere it is just a boolean test.
   } else if n is IsExpr {
-    let _objTy = checkNode(n.isObj)
-    if nameToTy(n.isVariant) < 0 {
+    let objTy = checkNode(n.isObj)
+    let chkTy = nameToTy(n.isVariant)
+    if chkTy < 0 {
       tErr("unknown type '" + n.isVariant + "' in 'is'", ix)
+    } else if n.isVariant != "null" {
+      // SOUNDNESS: `x is T` is meaningful only when `T` is one of the value's
+      // possible variants (or `null`). When the value's type is a union/nullable,
+      // the check type must be assignable to its non-null part — otherwise the
+      // test can never hold (e.g. `(string | i32) is boolean`, or a struct outside
+      // the union), so reject it rather than compile an always-false branch. Only
+      // a union/nullable value is "testable"; a plain (incl. generic/inferred)
+      // operand is left alone, matching the host.
+      let ot = T.tys[objTy]
+      let testable = false
+      let baseTy = objTy
+      if ot is TyUnion {
+        testable = true
+      } else if ot is TyNullable {
+        testable = true
+        baseTy = ot.nInner
+      }
+      if testable {
+        if !assignable(chkTy, baseTy) {
+          tErr("`is` check type '" + n.isVariant +
+            "' is not a variant of " + tyToStr(objTy), ix)
+        }
+      }
     }
     return TY_BOOL
 
