@@ -32,17 +32,16 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ## Next (highest leverage)
 
-- **H3-tail: ref-valued maps** — the last maps emit gap (`maps/string-values.vl`,
-  `object-values.vl`): the native map is monomorphic (string→i32), so string/struct VALUES need
-  the map parameterized by value type (a nullable-ref `vals` backing per value type, `m[k]` →
-  `V | null` narrowed with `?.`/`??`, `.values()` over refs). Unlocks the `name → record`
-  symbol-table pattern. (Delete + `Set`/`.get`/`.add` already landed — #316/#317.)
 - **H3-tail: corpus coverage pay-down** — the measured buckets (`docs/selfhost-corpus-paydown-findings.md`):
   parse gaps, checker false-rejects (generics + literal-unions are the big scoped tracks),
-  scratch-needing top-level statements, the emitter-trap pins. Run-whitelist is **164/316** and the
-  native-align whitelist **246**; grow both as slices land. (The 2 known silent miscompiles —
+  scratch-needing top-level statements, the emitter-trap pins. Run-whitelist is **168/317** and the
+  native-align whitelist **250**; grow both as slices land. (The 2 known silent miscompiles —
   `literals/hex.vl` and `arrays/infer-empty-string.vl` — are tracked under the integer-literal
-  width item below + A-infer-empty.)
+  width item below + A-infer-empty.) (Ref-valued maps — the last maps emit gap — landed in #319:
+  per-value-type map structs over nullable-ref vals lists, `m[k] ?? d`, the fused `m[k]?.f ?? d`,
+  `.values()` walks, plus the Set `.values()` membership-boolean bug fix. Known edges, all loud:
+  map-typed params stay mono-only; union/array/nested-map values unsupported; `?.`-over-map reads
+  are scalar-field-only.)
 - **Integer-literal width (`hex.vl` miscompile)** — port the host's `defaultIntegerType` magnitude
   rule (i32 if it fits, else i64) into `typecheck.vl`/emit; native currently defaults every integer
   literal to i32 and wraps (`0xDEAD_BEEF` prints negative). Mostly goldens-safe (the compiler's own
@@ -150,7 +149,8 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 - 🟡 **B6a. `Map` + `Set`.** REMAINING: **i32-keyed Map/Set** (clean diagnostic for now — i32 keys
   use `T[]`); `for k in map` direct iteration (parser; use `.keys()` today); `map`/`filter` over
   Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`. (Self-host native parity:
-  string-keyed maps, delete, `Set`/`.add`/`.get` landed; ref-valued maps is the open native gap — see Next.)
+  string-keyed maps, delete, `Set`/`.add`/`.get`, and ref-valued maps (string/struct values, #319)
+  landed; map-typed params are the remaining native map gap.)
 - ⬜ **B6a-opt. `Set` drops the unused `vals` array** (LOW priority). A `Set` is emitted as a
   boolean-valued map, so it carries a `vals` array that is always `true` (~17% of a Set's memory +
   needless alloc/grow/`array.copy` on resize). The type already tracks `mSet` (a Set is distinguished
