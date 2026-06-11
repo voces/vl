@@ -211,6 +211,7 @@ const WHITELIST = [
   "tostring/numbers.vl",
   "types/literal-narrowing.vl",
   "types/or-guard-narrowing.vl",
+  "types/recursive-array-element.vl",
   "types/struct-union-same-shape.vl",
   "types/union-narrowed-helper-recursion.vl",
   "types/union-two-visitors.vl",

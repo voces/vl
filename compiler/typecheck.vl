@@ -197,6 +197,17 @@ let npKeys: string[] = []
 let npTys: i32[] = []
 let npFrames: i32[] = []
 
+// CYCLE GUARD stacks for `assignable` over recursive named types (A11): a
+// (src, dst) pair already being compared higher in the recursion is assumed
+// assignable — coinductive, mirroring the host's lazy alias-leaf leniency for
+// self-referential types (`left: Tree | null` terminates, not expands).
+let asgSrcStack: i32[] = []
+let asgDstStack: i32[] = []
+
+// DEPTH GUARD for `tyToStr` on recursive named types (A11): a cyclic arena
+// shape would otherwise render forever — past a fixed depth it prints `…`.
+let tyToStrDepth: i32 = 0
+
 // Record an un-annotated empty-collection binding for the deferred scope-close check.
 function notePending(name: string, ty: i32, at: i32): i32 {
   pendNames.push(name)
@@ -581,6 +592,9 @@ export function initChecker(): i32 {
   npKeys = []
   npTys = []
   npFrames = []
+  asgSrcStack = []
+  asgDstStack = []
+  tyToStrDepth = 0
   0
 }
 
@@ -1527,6 +1541,14 @@ function tyToStr(ix: i32): string {
   if ix < 0 {
     return "<none>"
   }
+  if tyToStrDepth > 8 { return "…" }
+  tyToStrDepth = tyToStrDepth + 1
+  let s = tyToStrGo(ix)
+  tyToStrDepth = tyToStrDepth - 1
+  s
+}
+
+function tyToStrGo(ix: i32): string {
   let t = T.tys[ix]
   if t is TyPrim {
     return t.primName
@@ -1672,6 +1694,20 @@ function assignable(src: i32, dst: i32): boolean {
   if src == dst {
     return true
   }
+  let gi = asgSrcStack.length - 1
+  while gi >= 0 {
+    if asgSrcStack[gi] == src && asgDstStack[gi] == dst { return true }
+    gi = gi - 1
+  }
+  asgSrcStack.push(src)
+  asgDstStack.push(dst)
+  let ok = assignableGo(src, dst)
+  asgSrcStack.pop()
+  asgDstStack.pop()
+  ok
+}
+
+function assignableGo(src: i32, dst: i32): boolean {
   let s = T.tys[src]
   let d = T.tys[dst]
   if s is TyErr {
@@ -2656,53 +2692,101 @@ function checkProgramNode(n: Program): i32 {
   // field resolves via `nameToTy`. Types register in source order, so a field may
   // reference an EARLIER struct; a forward reference to a later struct reports
   // "unknown type" (deferred).
+  // Pass 0a: pre-register EVERY top-level `type` name with an EMPTY placeholder
+  // (struct or union) so SELF- and FORWARD-references inside field annotations
+  // and union variants resolve (host A11: a recursive alias is a lazy
+  // self-referential leaf; here the placeholder's arrays are filled in pass 0b,
+  // so the reference lands on the FINAL arena index — the arena shape is cyclic
+  // for a recursive type, which `assignable`/`tyToStr` guard against).
+  let t0 = 0
+  while t0 < stmts.length {
+    let sd0 = P.nodes[stmts[t0]]
+    if sd0 is TypeDecl {
+      let fnames0: string[] = []
+      let ftys0: i32[] = []
+      cUserTypes[sd0.tdName] = mkObjTy(fnames0, ftys0)
+    } else if sd0 is UnionDecl {
+      let members0: i32[] = []
+      cUserTypes[sd0.udName] = mkUnionTy(members0)
+    }
+    t0 = t0 + 1
+  }
+  // Pass 0b: resolve each declaration's fields/variants and fill them into the
+  // placeholder (pushing into the SAME arrays its arena entry holds). A name
+  // redeclared later overwrote the map in 0a, so both decls resolve into the
+  // LAST placeholder; `tdDone` keeps each arena entry filled exactly once.
+  let tdDone: i32[] = []
   let ti = 0
   while ti < stmts.length {
     let sd = P.nodes[stmts[ti]]
     if sd is TypeDecl {
-      let dfields = sd.tdFields
-      let fnames: string[] = []
-      let ftys: i32[] = []
-      let fi = 0
-      while fi < dfields.length {
-        let fd = P.nodes[dfields[fi]]
-        if fd is FieldDef {
-          fnames.push(fd.fdName)
-          let fty = TY_ERR
-          if fd.fdType >= 0 {
-            let ftn = P.nodes[fd.fdType]
-            if ftn is TypeRef {
-              let r = nameToTy(ftn.tyName)
-              if r >= 0 {
-                fty = r
-              } else {
-                tErr("unknown type '" + ftn.tyName + "' for field '" +
-                  fd.fdName + "'", dfields[fi])
+      let declIx = cUserTypes[sd.tdName] ?? -1
+      let dseen = false
+      let dj = 0
+      while dj < tdDone.length {
+        if tdDone[dj] == declIx { dseen = true }
+        dj = dj + 1
+      }
+      if declIx >= 0 && !dseen {
+        tdDone.push(declIx)
+        let pt = T.tys[declIx]
+        if pt is TyObj {
+          let fnames = pt.objFieldNames
+          let ftys = pt.objFieldTypes
+          let dfields = sd.tdFields
+          let fi = 0
+          while fi < dfields.length {
+            let fd = P.nodes[dfields[fi]]
+            if fd is FieldDef {
+              fnames.push(fd.fdName)
+              let fty = TY_ERR
+              if fd.fdType >= 0 {
+                let ftn = P.nodes[fd.fdType]
+                if ftn is TypeRef {
+                  let r = nameToTy(ftn.tyName)
+                  if r >= 0 {
+                    fty = r
+                  } else {
+                    tErr("unknown type '" + ftn.tyName + "' for field '" +
+                      fd.fdName + "'", dfields[fi])
+                  }
+                }
               }
+              ftys.push(fty)
             }
+            fi = fi + 1
           }
-          ftys.push(fty)
         }
-        fi = fi + 1
       }
-      cUserTypes[sd.tdName] = mkObjTy(fnames, ftys)
     } else if sd is UnionDecl {
-      // A union's variants are type NAMES; resolve each (its variant structs
-      // register earlier in source order) into the member type-arena indices.
-      let variants = sd.udVariants
-      let members: i32[] = []
-      let vi = 0
-      while vi < variants.length {
-        let m = nameToTy(variants[vi])
-        if m >= 0 {
-          members.push(m)
-        } else {
-          tErr("unknown type '" + variants[vi] + "' in union '" +
-            sd.udName + "'", stmts[ti])
-        }
-        vi = vi + 1
+      // A union's variants are type NAMES; resolve each into the member
+      // type-arena indices (forward references hit the 0a placeholders).
+      let declIx = cUserTypes[sd.udName] ?? -1
+      let useen = false
+      let uj = 0
+      while uj < tdDone.length {
+        if tdDone[uj] == declIx { useen = true }
+        uj = uj + 1
       }
-      cUserTypes[sd.udName] = mkUnionTy(members)
+      if declIx >= 0 && !useen {
+        tdDone.push(declIx)
+        let pt = T.tys[declIx]
+        if pt is TyUnion {
+          let members = pt.uMembers
+          let variants = sd.udVariants
+          let vi = 0
+          while vi < variants.length {
+            let m = nameToTy(variants[vi])
+            if m >= 0 {
+              members.push(m)
+            } else {
+              tErr("unknown type '" + variants[vi] + "' in union '" +
+                sd.udName + "'", stmts[ti])
+            }
+            vi = vi + 1
+          }
+        }
+      }
     }
     ti = ti + 1
   }
