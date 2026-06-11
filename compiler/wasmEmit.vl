@@ -4018,6 +4018,35 @@ function exprIsStrSlice(callIx: i32, fnIx: i32): boolean {
   false
 }
 
+// True if `callIx` is a `recv.indexOf(sub)` / `recv.includes(sub)` over a STRING
+// receiver — both ride the same indexOf scan (`includes` negates the -1 compare).
+function exprIsStrIndexOf(callIx: i32, fnIx: i32): boolean {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "indexOf" || callee.memProp == "includes" {
+        return exprString(callee.memObj, fnIx)
+      }
+    }
+  }
+  false
+}
+
+// True if `callIx` is a `recv.charCodeAt(i)` over a STRING receiver.
+function exprIsStrCharCode(callIx: i32, fnIx: i32): boolean {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "charCodeAt" {
+        return exprString(callee.memObj, fnIx)
+      }
+    }
+  }
+  false
+}
+
 // True if the expression at `exprIx` (or any sub-expression) is a string `+`,
 // string `==`/`!=`, or string `.slice`.
 function exprHasStrOp(exprIx: i32, fnIx: i32): boolean {
@@ -4031,6 +4060,10 @@ function exprHasStrOp(exprIx: i32, fnIx: i32): boolean {
   }
   if e is Call {
     if exprIsStrSlice(exprIx, fnIx) { return true }
+    // `s.indexOf(sub)` / `s.includes(sub)` stage their receiver + needle + loop
+    // counters in the same string scratch frame. (`charCodeAt` is a bare
+    // `array.get` — no frame needed; its operands recurse below.)
+    if exprIsStrIndexOf(exprIx, fnIx) { return true }
     // `print(<string>)` rides the string-op scratch frame (the streaming loop's
     // string ref + cursor + length live there).
     let pcal = P.nodes[e.callFn]
@@ -7103,6 +7136,140 @@ function emitStrSlice(body: i32[], callIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected a string slice call")
 }
 
+// Lower `s.indexOf(sub)` (or `s.includes(sub)`) onto `body`, leaving an i32: the
+// first index of `sub` in `s`, or -1 (an empty `sub` yields 0, the JS convention);
+// `includes` is `indexOf != -1`. Mirrors the host's `__string_index_of__` naive
+// O(n*m) scan (compiler/builtins/strings.ts), inlined here like `emitStrEq`.
+// Scratch: refs A = s, B = sub; i32 temps I0 = i (outer), I1 = j (inner),
+// I2 = len(s), I3 = len(sub).
+//   block i32 {
+//     I0 = 0
+//     loop {                                  ; outer: candidate starts
+//       if I0 > I2 - I3 { }                   ; past last start → fall out → -1
+//       else {
+//         I1 = 0
+//         loop {                              ; inner: match scan at I0
+//           if I1 >= I3 { (I0) br <block> }   ; full match → yield I0
+//           if A[I0+I1] != B[I1] { I0 = I0 + 1; br <outer> }
+//           I1 = I1 + 1
+//           br <inner>
+//         }
+//       }
+//     }
+//     (i32.const -1)
+//   }
+function emitStrIndexOf(body: i32[], callIx: i32, fnIx: i32): i32 {
+  if !aUsed {
+    return emitFail("emitProgram: string indexOf but array type not collected")
+  }
+  let c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 1 {
+      return emitFail("emitProgram: string .indexOf takes exactly one argument")
+    }
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      let isIncludes = callee.memProp == "includes"
+      // Eval receiver + needle onto the stack first (nested string ops complete),
+      // then stash: needle on top → B, then receiver → A.
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+      fbLocalSet(strScratchBase + 1)  // local.set strScrB (sub)
+      fbLocalSet(strScratchBase + 0)  // local.set strScrA (s)
+      // I2 = len(s); I3 = len(sub)
+      pushStrScrRef(body, 0)
+      fbArrayLen()             // array.len
+      setStrScrI(body, 2)
+      pushStrScrRef(body, 1)
+      fbArrayLen()             // array.len
+      setStrScrI(body, 3)
+      fbBlock(127)             // 0x02 block, 0x7f i32 blocktype — yields index / -1
+      fbI32Const(0)
+      setStrScrI(body, 0)      // I0 = 0
+      fbLoop(64)               // 0x03 loop (outer), 0x40 void blocktype
+      // Past the last possible start (I0 > I2 - I3) → done, fall out (no match).
+      pushStrScrI(body, 0)
+      pushStrScrI(body, 2)
+      pushStrScrI(body, 3)
+      fbI32Bin(107)            // 0x6b i32.sub → len(s) - len(sub)
+      fbI32Bin(74)             // 0x4a i32.gt_s
+      fbIf(64)                 // 0x04 if, 0x40 void blocktype
+      // then: done — fall through (empty)
+      fbElse()                 // 0x05 else
+      fbI32Const(0)
+      setStrScrI(body, 1)      // I1 = 0
+      fbLoop(64)               // 0x03 loop (inner), 0x40 void blocktype
+      // I1 >= len(sub) → full match at I0: yield I0 out of the i32 block.
+      pushStrScrI(body, 1)
+      pushStrScrI(body, 3)
+      fbI32Bin(78)             // 0x4e i32.ge_s
+      fbIf(64)                 // 0x04 if, 0x40 void blocktype
+      pushStrScrI(body, 0)
+      fbBr(4)                  // depths: if(0)·inner loop(1)·else(2)·outer loop(3)·block(4)
+      fbEnd()                  // 0x0b end (match if)
+      // A[I0+I1] != B[I1] → mismatch: advance I0, continue the outer loop.
+      pushStrScrRef(body, 0)
+      pushStrScrI(body, 0)
+      pushStrScrI(body, 1)
+      fbI32Bin(106)            // 0x6a i32.add
+      fbArrayGet(aTypeIdx)     // 0xfb 0x0b array.get
+      pushStrScrRef(body, 1)
+      pushStrScrI(body, 1)
+      fbArrayGet(aTypeIdx)     // array.get
+      fbI32Bin(71)             // 0x47 i32.ne
+      fbIf(64)                 // 0x04 if, 0x40 void blocktype
+      pushStrScrI(body, 0)
+      fbI32Const(1)
+      fbI32Bin(106)            // i32.add
+      setStrScrI(body, 0)      // I0 = I0 + 1
+      fbBr(3)                  // 0x0c br depth 3 → outer loop header (continue)
+      fbEnd()                  // 0x0b end (mismatch if)
+      // I1 = I1 + 1; br inner loop
+      pushStrScrI(body, 1)
+      fbI32Const(1)
+      fbI32Bin(106)            // i32.add
+      setStrScrI(body, 1)
+      fbBr(0)                  // 0x0c br depth 0 → inner loop header
+      fbEnd()                  // 0x0b end (inner loop)
+      fbEnd()                  // 0x0b end (outer if/else)
+      fbEnd()                  // 0x0b end (outer loop)
+      fbI32Const(0 - 1)        // no match → -1
+      fbEnd()                  // 0x0b end (block) — leaves the i32 result
+      if isIncludes {
+        fbI32Const(0 - 1)
+        fbI32Bin(71)           // 0x47 i32.ne — `includes` ≡ `indexOf(sub) != -1`
+      }
+      return 0
+    }
+    return emitFail("emitProgram: string .indexOf receiver is not a member access")
+  }
+  emitFail("emitProgram: expected a string indexOf call")
+}
+
+// Lower `s.charCodeAt(i)` onto `body`, leaving the char code i32. A direct
+// `array.get` over the code-point array — an out-of-range index TRAPS, matching
+// the host (`s[i]` semantics, no JS NaN; compiler/builtins/strings.ts).
+function emitStrCharCode(body: i32[], callIx: i32, fnIx: i32): i32 {
+  if !aUsed {
+    return emitFail("emitProgram: string charCodeAt but array type not collected")
+  }
+  let c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 1 {
+      return emitFail("emitProgram: string .charCodeAt takes exactly one argument")
+    }
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+      fbArrayGet(aTypeIdx)     // 0xfb 0x0b array.get
+      return 0
+    }
+    return emitFail("emitProgram: string .charCodeAt receiver is not a member access")
+  }
+  emitFail("emitProgram: expected a string charCodeAt call")
+}
+
 function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 {
     return emitFail("emitProgram: missing expression")
@@ -7313,6 +7480,14 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // position are out of scope (the only member-call STATEMENT is `.push`).
     if exprIsStrSlice(exprIx, fnIx) {
       return emitStrSlice(body, exprIx, fnIx)
+    }
+    // `s.indexOf(sub)` / `s.includes(sub)` / `s.charCodeAt(i)` over a string
+    // receiver are intrinsics too (A7), each yielding an i32.
+    if exprIsStrIndexOf(exprIx, fnIx) {
+      return emitStrIndexOf(body, exprIx, fnIx)
+    }
+    if exprIsStrCharCode(exprIx, fnIx) {
+      return emitStrCharCode(body, exprIx, fnIx)
     }
     // G8: the `Map()` builtin constructs an empty string-keyed map. `Set()` is a
     // boolean-valued string map over the SAME 7-field struct, so it emits the
@@ -8089,6 +8264,10 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
       }
       if callee.memProp == "delete" {
         return exprMap(callee.memObj, fnIx)
+      }
+      // A string `s.includes(sub)` yields a boolean (print true/false).
+      if callee.memProp == "includes" {
+        return exprString(callee.memObj, fnIx)
       }
     }
   }
