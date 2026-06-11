@@ -3,8 +3,14 @@
 The vision: a scripting-feel language with types **hidden by aggressive inference**, **permissive &
 structural**, **fully type-safe** (statically sound — no untyped code; inference holes resolve to
 concrete types), compiling to **lean WebAssembly**. Deliverables: an **LSP-backed VS Code extension**
-(partial), a **CLI** (`deno task run`/`build`/`check`; native binary TBD), and an **in-browser
-playground** (partial).
+(partial), a **CLI** (the native `vl` — `build`/`check`/`run`, `-O` via wasm-opt; brains in
+`build/vl-compiler.wasm` under wasmtime), and an **in-browser playground** (partial).
+
+**Self-hosting status:** the compiler is written in VL (`compiler/*.vl` — lexer/ast/parser/
+typecheck/wasmEmit) and **compiles itself to a byte-exact fixpoint** (stage3 == stage4,
+`scripts/native-fixpoint.sh`, ~6s, no TS past the seed; gated in CI by `ci-native`). The TS host
+(`compiler/*.ts`) remains as the bootstrap seed builder + the spec oracle while the self-host
+closes its corpus-coverage tail.
 
 Status: 🟡 partial · ⬜ not started.
 
@@ -26,29 +32,31 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ## Next (highest leverage)
 
-- **Contextual parameter inference (A-infer-ctx)** — infer lambda param types from the expected
-  function type at the call site (`xs.map(function(n) n*2)`). 🟡 In-progress
-  (`claude/contextual-param-inference`).
-- **Robustness floor (A-robust)** — an unresolved `Infer`/`Unknown` must yield a clear diagnostic,
-  never a cryptic codegen crash. The main trigger (`const xs = []; xs.push(1)`) is fixed via
-  A-infer-empty; REMAINING is the same guarantee for the other holes (`Map()`/`Set()` empties, generics).
-- **Exhaustiveness analysis for `is`-chains (A-exhaust)** — flag dead arms, enable omitting the
-  final `else`, elide provably-true discriminants in codegen.
-- **H4.1 / H4.5–H4.6** — remaining (worked-around) self-host codegen gaps for a full `vl build` path.
-- **H2a Re-land clean `selfhost/lexer.vl`** — now unblocked; first concrete H3 slice.
+- **H3-tail: lambda emit slices 3–4** — `.map`/`.filter`/HOF lowering in `wasmEmit.vl` as the
+  generic closure-calling loop over the #306 `call_ref` ABI (per the #304 design: emit simple,
+  let `vl build -O` devirtualize/inline). The single largest remaining emit-coverage lever;
+  escaping closures + function-valued struct fields shipped (#310).
+- **H3-tail: corpus coverage pay-down** — the measured buckets (`docs/selfhost-corpus-paydown-findings.md`):
+  parse gaps, checker false-rejects (generics + literal-unions are the big scoped tracks),
+  scratch-needing top-level statements, the emitter-trap pins. Run-whitelist is 154/304 and the
+  native-align whitelist 236; grow both as slices land.
+- **Self-host struct equality** — `==`/`!=` over struct refs now fails LOUDLY (no invalid wasm);
+  lower it field-wise next (host parity). Wrinkle recorded: under the `call_ref` ABI funcrefs
+  admit no `ref.eq`, so function-field identity needs an identity token on the closure struct.
+- **Explicit numeric conversion syntax** — the lossless-only implicit-widening rule (#298) makes
+  the lossy edges (`i32→f32`, `i64→f64`, all narrowings) EXPRESSIBLE ONLY via a cast that does
+  not exist yet; design + land it (both compilers).
+- **Param-skip ergonomics** (`docs/lambda-param-skip-design.md`) — prerequisite 1 (self-host
+  lambdas/HOFs) is nearly satisfied; decide leading-comma vs `$#` (recommendation deliberately open).
 - **C5 / H-M1** — `deno compile` + brew tap. Small, decoupled; ships the distribution story now.
-- Smaller/independent: B6b collections building blocks, B13 callable objects, B17 lint backlog,
-  A6b Stage A.
+- Smaller/independent: A-robust holes (`Map()`/`Set()` empties, generics), A-exhaust codegen elision,
+  B6b collections building blocks, B13 callable objects, B17 lint backlog, A6b Stage A.
 
 ---
 
 ## Track A — Type system (`typecheck.ts`)
 *Blueprint: Elixir v1.20 set-theoretic types, fully-typed (no gradual escape hatch).*
 
-- 🟢 **A3. Intersection types** (`A & B`). Done: surface syntax, narrowing algebra, AND
-  object-type structural intersection (`{x} & {y}` merges field-wise to `{x, y}` via `meet`).
-  A concrete `A & B` that folds to `never` now warns at the declaration (`empty-intersection`)
-  and rejects forming a value cleanly (never-value type error) instead of crashing codegen.
 - 🟡 **A4. Negation types** (`!A`). REMAINING: full open-world negation tracking (needs A12).
 - 🟡 **A5. Flow narrowing.** REMAINING: `case`/multi-guard (no grammar); stored-witness (A6b Stage B);
   optional *call* `x?.f()` + chain short-circuit `x?.y.z` (use `x?.y?.z`); per-call
@@ -60,7 +68,6 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   signatures. **Stage B:** stored witness (`const f = bar(x); … if f is null` narrows x) — needs
   binding tracking + invalidation (a lightweight borrow). Stage B also subsumes per-call tight return
   types (the forward direction of the same correlation).
-- ✅ **A7. Real `string` type.** `boolean`-where-`i32`-expected coercion done (A7b). (UTF-16 backing is B7.)
 - ⬜ **A8. Exact / Inexact variance.** Params Inexact by default (accept excess properties), values
   Exact. Guards the `a.foo = b` width footgun. (TODO.md)
 - ⬜ **A9. Readable / Writable variance.** Applied automatically during parameter inference. (TODO.md)
@@ -69,24 +76,18 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   `Buffer<N>`) — today generics take *type* params only; enabler for the parameterized
   `Decimal<Backing, Scale>` family (B2) and any fixed-size/parameter-by-value type.
   (Forward/mutual-reference return-type inference: shipped as A17 — see `CHANGELOG.md`.)
-- 🟢 **A11. Recursive structural types.** Done: self-recursion, mutual recursion across *separate*
-  `type` decls, AND recursion through an **array** element (`type List = { rest: List[] }` — the
-  element struct, its list wrapper, and the backing array build in one WasmGC rec group). See `CHANGELOG.md`.
 - 🟡 **A12. Soundness corpus.** REMAINING: keep growing it; the known-unsound corners are
-  `xfail`-marked (e.g. the permissive `i32 + string` hole rule, A13).
-  **Known bugs (all RESOLVED; pinned by passing cases):**
-  - ✅ **A12-bug1. `is <literal>` always-false on literal-unions** — RESOLVED.
-    (`literal-is-runtime-value.vl`; detail: `docs/soundness-findings.md` §literal-is-always-false)
-  - ✅ **A12-bug2. Flat `A|B|null` `is`-chain "illegal cast" trap** — RESOLVED.
-    (`struct-union-null-is-chain-sound.vl`; detail: `docs/soundness-findings.md` §struct-union-null-is-chain)
-  - ✅ **A12-bug3. `x?.field` false error when `x` is typed via a named alias** — RESOLVED.
-    (`optional-chain-coalesce-sound.vl`; detail: `docs/soundness-findings.md` §optional-chain-named-alias)
+  `xfail`-marked (e.g. the permissive `i32 + string` hole rule, A13). The SELF-HOST checker's
+  soundness floor (15 false-accept classes) is closed; new classes go straight to corpus +
+  both checkers.
 - 🟡 **A13. Operator-constraint inference.** REMAINING: the hole-operand rule is permissive (doesn't
   reject `i32 + string` yet); the *stored-closure* operator case (`vec + vec` via a `"+"` field)
   still hits the WasmGC width wall (B13).
 - 🟡 **A14. Named/opaque types.** REMAINING: real **nominal/opaque types** (decision: clean-error-for-now → `DECISIONS.md`).
 - 🟡 **A15. Equality.** REMAINING: a referential-identity operator (`===` / `identical`, O(1) `ref.eq`);
-  `boolean`→i32 coercion when storing a comparison result.
+  `boolean`→i32 coercion when storing a comparison result; SELF-HOST struct/function-value equality
+  (guarded loudly today — and note the `call_ref`-ABI wrinkle: funcrefs admit no `ref.eq`, so
+  function-identity compare needs an identity token on the closure struct).
 - 🟡 **A16. Literal-union types.** REMAINING: the **enum representation** (i32 tag for a closed
   literal union — see `docs/unions.md`); a literal union read *inside* a body softens to base
   (coarser member-narrowing there than at the call boundary).
@@ -94,11 +95,6 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   is shipped. REMAINING: (a) infer `never` for a genuinely base-case-less divergent recursive cycle
   (currently a stopgap "annotate a return type" error); (b) an `unconditional-recursion` lint that fires
   even when the return type is explicitly annotated (catches accidental infinite loops).
-- 🟡 **A-infer-ctx. Contextual parameter inference.** In-progress (`claude/contextual-param-inference`).
-  Infer lambda/callback param types from the **expected function type** at the call site, e.g.
-  `xs.map(function(n) n*2)` infers `n: i32` from `T[]`'s element type. Consistent with the
-  "hide types where possible" identity; today untyped lambda params are a type error. Ties A10 (generic
-  element type) and B15 (untyped lambdas).
 - 🟡 **A-infer-empty. Usage-based inference for empty collections.** Empty ARRAY `[]` inference shipped
   (see `CHANGELOG.md`): `const xs = []; xs.push(1)` infers `xs: i32[]` from downstream usage (push /
   `T[]` param / annotated assignment / `T[]`-returning tail / index-set). REMAINING: the same for
@@ -111,20 +107,13 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   type, so `let x = null; x = 5` errors. Distinct from a pin violation — `null` is hole-bearing, not a
   complete type. Ties A-infer-empty (same usage-driven hole-filling) and A-definite-assign (shared flow
   machinery). (Rationale: DECISIONS "`let x = null` is a nullable hole".)
-- ✅ **A-definite-assign. Definite assignment for uninitialized locals.** Shipped — see `CHANGELOG.md`.
-  An uninitialized `let x` / `let x: T` starts unassigned + non-null; a read on a path where it is not
-  provably written is a "used before assigned" error (closed the silent-`0` soundness gap), via the
-  parser's single-pass flow machinery (fork/join through `if`/`else`/`while`, diverging branches drop).
 - ⬜ **A-infer-params. Top-level function param inference.** Infer named-function param types from
   usage constraints (HM / the existing A13 row-poly inference path), consistent with "hide types where
   possible." Requiring annotations on all named-fn params is NOT VL's stated stance.
-- 🟡 **A-exhaust. Exhaustiveness analysis for `is`-chains.** Three sub-items all reuse the existing
-  `conditionsExhaust` helper: (a) ✅ flag a **dead arm / dead `else`** after an already-exhaustive chain
-  (`info` "unreachable: the preceding `is` arms are exhaustive"); (b) ✅ recognize exhaustiveness for
-  return-coverage so the trailing `else` can be **omitted** (the checker sees the chain as covering);
-  (c) ⬜ **codegen**: elide the provably-true final discriminant test + drop the dead arm — a type-driven
-  optimization binaryen cannot do (it lacks union exhaustiveness). Runtime is already correct (the
-  no-`else` fall-through lowers to `unreachable`); (c) is a pure size/speed optimization, deferred.
+- 🟡 **A-exhaust. Exhaustiveness analysis for `is`-chains.** Dead-arm flagging and omit-the-`else`
+  return-coverage shipped. REMAINING: **codegen** — elide the provably-true final discriminant test +
+  drop the dead arm (a type-driven optimization binaryen cannot do; runtime already correct via the
+  no-`else` `unreachable` fall-through; pure size/speed, deferred).
 - 🟡 **A-robust. Robustness floor.** An unresolved `Infer`/`Unknown` type must produce a clear
   **"cannot infer — annotate"** diagnostic; it must NEVER surface as a cryptic `Unhandled "Unknown"
   type` codegen error or a `containsInfer` TypeError crash. The main trigger — `const xs = []; xs.push(1)`
@@ -137,11 +126,14 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 ## Track B — Codegen, memory model & runtime (`toWasm.ts`)
 *Allocation = WasmGC; binaryen stays (it doesn't block self-hosting). → `DECISIONS.md`.*
 
-- 🟡 **B2. Numeric codegen.** REMAINING: explicit value casting/coercion between numeric types
-  (today only literals coerce); **`0x` hex / `0o` octal / `0b` binary integer literals + digit
-  separators** (`1_000`, `0xFF_FF`) — a lexer/parser add; **arbitrary-precision `BigInt` and a
-  `Decimal<Backing, Scale>` family** as future `std`-library generic types (not primitives).
-  Prereq: const generics (A10).
+- 🟡 **B2. Numeric codegen.** Hex/octal/binary literals + digit separators: SHIPPED (see
+  `tests/cases/literals/`). Self-host i64/f64/f32 scalars, `f64[]` arrays, and the
+  lossless-only implicit-widening matrix: SHIPPED (#290–#298; see `CHANGELOG.md`). REMAINING:
+  **explicit value casting/coercion between numeric types** — now load-bearing, since the
+  lossless-only rule (#298) leaves the lossy edges (`i32→f32`, `i64→f64`, narrowings,
+  float→int) with NO syntax at all; **arbitrary-precision `BigInt` and a `Decimal<Backing,
+  Scale>` family** as future `std`-library generic types (not primitives). Prereq: const
+  generics (A10).
 - 🟡 **B5. Objects.** REMAINING: methods via `self`+UFCS (B14); typed literals in object values
   (`{n: 4<i64>}`); Exact-by-default for values (A8).
 - 🟡 **B6. Collections — growable `T[]`.** REMAINING: in-place bulk append (deferred — will be
@@ -180,8 +172,11 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   `"[]"`/`"[]="` + flat-backed `Matrix`/`Grid` type. Nested `m[i][j]` already composes today.
 - 🟡 **B14. Methods via explicit `self` + UFCS.** REMAINING: route operator dispatch (B13) through
   self-methods; `c.area` (no `()`) as a bound value; mutation/variance (A9).
-- 🟡 **B15. Lambdas + declaration-vs-value.** REMAINING: **untyped** lambdas (a stored closure has
-  one signature — needs pinning-by-use or boxing).
+- 🟡 **B15. Lambdas + declaration-vs-value.** SELF-HOST function-value ABI shipped (#306: `call_ref`
+  + closure struct, non-capturing + capturing; design `docs/selfhost-lambdas-design.md`); escaping
+  closures + function-valued struct fields shipped (#310); `.map`/`.filter` EMIT is the next slice
+  (see Next). REMAINING (host): **untyped** lambdas (a stored closure has one signature — needs
+  pinning-by-use or boxing).
 - ⬜ **B16. Redeclaration / overloading.** Current: same-scope redeclaration errors; nested shadowing
   allowed (uniquified in codegen). Future: ad-hoc overloading? Default "no" → `DECISIONS.md`.
 - 🟡 **B17. Diagnostics + lint.** BUILD OUT — the lint rule backlog (a few at a time). Shipped (see
@@ -207,8 +202,6 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
     (Low priority.)
   - **LSP quick-fixes** (code actions): "remove unused binding" / "prefix with `_`" / "`let`→`const`".
     Diagnostics already carry stable `code`s; the LSP has no code-action provider yet.
-  - ✅ **`vl check --fix`** — apply the provably-safe lint fixes from the CLI (`let`→`const`,
-    unused→`_`-prefix), reusing `codeActions.ts`; idempotent, clean-file no-op.
   - Cross-cutting: thread `severity` through all remaining error variants; consistent message style.
 - ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
   position and emit it.
@@ -241,8 +234,16 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ## Track C — CLI (`vl` / `vital`)
 
+*The NATIVE `vl` exists (`scripts/vl-host`, ~150 lines of frozen Rust over wasmtime): `vl build`
+(`-O` via wasm-opt) / `vl check` (parse+typecheck only) / `vl run` (incl. `.wasm` passthrough),
+brains in `build/vl-compiler.wasm`. Iteration: `scripts/refresh-compiler.sh` refreshes the seed
+from current `compiler/*.vl` in ~3s.*
+
 - 🟡 **C5. Distribution (public release).** REMAINING: tag / brew tap / sha256 bump — decoupled
-  from all compiler work. (Shipping the binary: `deno task compile`/`smoke` already pass.)
+  from all compiler work. (Shipping the deno binary: `deno task compile`/`smoke` already pass;
+  the native `vl` ships under H-M2's model.)
+- ⬜ **C-cli polish.** `vl build` to stdout when no `-o` (decided: yes, pipe-friendly); WAT output
+  (`--wat`, via wasm-tools or wasm-opt); surfacing diagnostics with spans once the spans rungs land.
 
 ---
 
@@ -256,27 +257,11 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
     regenerated: `type` aliases (body & span discarded by the checker), operator-named &
     method-shorthand functions, operator/index-method call desugars. (Trailing comments on `type`
     aliases now stay on their line — #146; functions with a commented expression body now fall back
-    to verbatim correctly — #154; trailing comments on bare-body loop headers (`while`/`for`/`for-in`)
-    now stay on the header line — #165; trailing comments on block closing braces now stay on that
-    line — #172; trailing comment on the last line of a verbatim-fallback function
-    (operator-named / method-shorthand body) now stays on that line — this PR.)
-  - ~~**Trailing comment on bare-body loop header**~~ — `while cond // note` / `for … // note` (bare
-    body): comment now stays on the header line, not expelled outside the enclosing function. Shipped.
-  - ~~**Trailing comment on block closing brace**~~ — `} // note` on the closing `}` of `if`/`while`/
-    `for`/`for-in`/function/free-standing blocks now stays on that line. Shipped.
-  - ~~**Trailing comment on verbatim-fallback function last line**~~ — a trailing comment on the last
-    source line of an operator-named or method-shorthand-body function (verbatim path) now stays on
-    that line instead of being displaced as an own-line comment. Shipped.
+    to verbatim correctly — #154; the trailing-comment placement fixes — #165/#172/+.)
   - **AST type-syntax fidelity gap** — the typechecker fully resolves every type it records (a tiny
     `i32` annotation becomes a giant structural `Object`; `type`-alias bodies and spans are
     discarded). Retain the *as-written* type syntax (or its span) so the AST is lossless for
     types — also benefits hover/inlay rendering (D1/D6/D8).
-  - ~~**Trailing commas**~~ — multi-line wrapped lists emit trailing commas; already shipped.
-- ✅ **D7. Cross-references in doc-comments** — rustdoc-style `` [`Name`] `` / `[Name]` intra-doc
-  links in `///` comments; resolved via D2's symbol table; rewritten to clickable markdown links in
-  hover and completion `documentation`. Cross-import resolution now done (H0 phase 3): a `Name` that
-  is an imported binding links to the exporting sibling module's source location (`siblingUri#L…`),
-  via the module graph's imported-name → source resolution (`lsp/src/moduleGraph.ts`).
 - 🟡 **D — Project-wide unused-export hints.** Core shipped: debounced workspace pass on save (+ 3 s idle), use-map over ≤500 `.vl` files, `hint`/`unnecessary` diagnostics for zero-reference exports. REMAINING: **struct field–level unused-export analysis** — deferred because VL's structural typing makes field-level usage tracking fuzzy (a field could be "used" via a widened receiver type without any import); a future refinement could cross-check field names against known call sites once structural subtyping is tightened.
 - ⬜ **D8. Hover verbosity step-expansion.** Alias-name preservation is done (see `CHANGELOG.md`).
   REMAINING: the interactive shallow↔deep verbosity stepper — expand one alias layer at a time
@@ -292,13 +277,6 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 ## Track E — Browser playground + sandbox
 *Depends on C1. The compiler is pure TS + binaryen (wasm), so it runs client-side.*
 
-- 🟢 **E2. Playground UI.** Monaco editor + client-side LSP, branded light/dark theme pair
-  (persisted; lock-step `data-mode` ↔ `monaco.editor.setTheme`), results-as-tabs
-  (Output / WAT-with-size-badge / Diagnostics-with-count-badge), multi-file projects
-  (one model per file, `inmemory://` URIs; per-file squiggles, aggregated Diagnostics that
-  jump to file+line; whole-program Run/WAT via `compileProgram` → `N files → 1 module`),
-  opt-in auto-run (always-on debounced diagnostics+WAT; opt-in execution), full-width status
-  bar, real Share + Format wiring. (Sandboxed-Worker execution is E3.)
 - ⬜ **E3. Sandboxed execution** — compiled user wasm in a Web Worker, fresh `Memory`, controlled
   `log` only, enforced limits. (Today user wasm runs on the main thread — fine for local use,
   harden before any public deploy.)
@@ -314,27 +292,16 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 - ⬜ **F6. Document the build** (`deno task build`/`test`; the antlr/gradle gen step is gone).
 - ⬜ **F7. Fix the `paramater` misspelling** project-wide (optional; currently consistent).
 - 🟡 **F8.** REMAINING (F5-adjacent): confirm vscode-languageclient forking the ESM server in VS Code.
-- 🟡 **F9. Perf baseline.** Runtime benchmark shipped (`scripts/perf-runtime.ts` / `perf-compare.ts`).
-  Cubic literal-union compile RESOLVED — `flattenType` all-literal dedup is now O(n)-per-flatten
-  (O(n²) overall, was O(n³)); see CHANGELOG A16.
-  **Perf wins identified (detail: `docs/perf-findings.md`):**
-  - ✅ **F9c. Memoize `structSig`** — shipped (#107); see `CHANGELOG.md`. Post-fix: binaryen
-    `optimize()` costs only ~0.8 s on the self-host module — NOT the bottleneck.
-  - 🚫 **F9a. `VL_NO_OPT` / skip `optimize()` in tests — ABANDONED / SUPERSEDED.** The original
-    premise was that `optimize()` dominates self-host compile time (~4 s/test). After the F9c
-    `structSig` memoize fix (#107) the true bottleneck was eliminated: optimize is only ~0.8 s.
-    F9a's projected ~20–25 s saving no longer applies. Keeping `VL_NO_OPT` as a "someday" option
-    (LOW priority) if a future regression makes optimize a bottleneck again; not a near-term action.
-    (detail: `docs/perf-findings.md`)
-  - ⬜ **F9b. Cache / clone binaryen IR across selfhost sub-tests** — each of the 5
-    `selfhost_pipeline_test.ts` sub-tests recompiles the same base source. Caching the binaryen IR
-    for the shared base is more involved (binaryen modules are not trivially cloneable); LOW priority
-    now that F9c removed the dominant cost.
-    (detail: `docs/perf-findings.md` §Part 3 — Medium-Impact)
-
----
-
-## Track G — Hand-written parser — ✅ DONE — see `CHANGELOG.md`
+- 🟡 **F9. Perf baseline.** Runtime benchmark shipped (`scripts/perf-runtime.ts` / `perf-compare.ts`);
+  the past wins/abandons live in `docs/perf-findings.md` + `CHANGELOG.md`. REMAINING:
+  - ⬜ **F9b. Cache / clone binaryen IR across selfhost sub-tests** — LOW priority (the dominant
+    cost fell with the F9c memoize; binaryen modules are not trivially cloneable).
+  - ⬜ **F-tiers. Collapse the redundant corpus runner** — three executors drive the corpus (TS
+    oracle / TS-built-VL run / native `vl` run); once the native runner self-compiles current
+    source in CI (seed restore + ~3s `refresh-compiler.sh`-style rebuild), the middle tier's RUN
+    half is redundant with the native tier — trim toward TS-oracle + native-runner (keep tier-1
+    verdicts). Also: the TS seed build (~80s) is the remaining `ci-native` cost; a rolling
+    master-updated seed cache is the deferred fix (cargo-cache eviction pressure noted in #308).
 
 ---
 
@@ -363,98 +330,29 @@ independent).*
     (`MAX_DISK_FILES`); open-buffer text wins over disk for any file open in the editor.
     REMAINING: the `std:` scheme (phase 2).
   - **Deferred:** import maps, namespace/default imports, export-all, re-exports.
-- 🟡 **H2. Make VL expressive enough to write a compiler.** All H2 gaps fixed — see `CHANGELOG.md`.
-  REMAINING: maps (B6a), enum tag for literal-unions (A16).
-- 🟡 **H2a. Re-land a clean `selfhost/lexer.vl`** (near-term, now unblocked). The spike PR #54 was
-  closed "fix gaps, re-land clean"; with the H2 gaps fixed, re-land a lexer that drops the
-  workarounds: hand-rolled `i32ToStr` → real `toString`, raw `\xXX` lexemes → `fromCodePoint`,
-  struct-threaded scanner state → a real ref-typed module global. First concrete slice of H3.
-- ⬜ **H3. Port the compiler to VL.** Rewrite `toAST`/`typecheck`/`toWasm` as `.vl`, validated by
-  running the corpus through the VL-written compiler. Incremental; TS and VL compilers cross-checked.
-  The front end self-hosts **from raw source text** today — `lexer.vl → parser.vl → typecheck.vl` is
-  wired and test-validated (`tests/selfhost_pipeline_test.ts`) for a language **subset**. Remaining
-  bootstrap work:
-  - **(a) wasm-emit consuming the AST arena.** `emitProgram` now drives the real arena — i32
-    params/arithmetic, calls/comparisons/`if`/`return`, `while` loops, `let`/`const` locals + assignment,
-    structs (#137), arrays (#145), strings (literal, `.length`, index — lowered to the array-i32
-    code-point representation), **growable `i32[]` + `.push`** (the `{backing,len,cap}` wrapper struct,
-    grow-on-full mirroring `toWasm.ts`'s list rep), and **discriminated `type N = A | B` struct unions
-    with `is`-narrowing** (G1, the bootstrap keystone the self-host AST `type Node` + the checker's
-    `type Ty` depend on): the boxed `{tag, value:anyref}` tagged-struct rep, multiple variant struct
-    heap types, `is` tag-discrimination, and the narrowing `ref.cast`+`struct.get` downcast — proven by
-    real `WebAssembly.instantiate`. **Struct field WRITES + module-level mutable globals** (G2) now land:
-    `s.field = v` → `struct.set`, and top-level `let`/`const` lower to a wasm global section (id 6, mutable,
-    constexpr init) with bare-identifier reads/writes routed to `global.get`/`global.set` — together these
-    make the `P`/`T`/`g*` checker/parser state + struct-field mutation emittable (constexpr-init globals
-    only; the start-fn fallback for non-constexpr inits is deferred). **Ref-element growable lists** (G7-ref)
-    now land too: arrays-of-structs (`Tok[]`) and arrays-of-unions (`Node[]`) — the self-host parser's
-    `P.nodes: Node[]` arena + token stream — emit via the `{backing,len,cap}` wrapper over a `(ref null
-    $elem)` backing (nullable-widened so `array.new_default` defaults spare slots to null; an index read
-    `array.get`s then `ref.as_non_null`s back), with `.push`/index-set/`.length`/`is`-narrow over the element
-    refs. **Boolean values + bool/char literals** (G3) now land too: `boolean` params/locals/returns ride in the
-    SAME i32 valtype (0/1, no separate boolean valtype), `BoolLit` → `i32.const 1`/`0`, `CharLit` → `i32.const
-    <code point>` — unblocking the ~40+ self-host predicates that return `boolean`. **Logical `&&`/`||`/`!`**
-    (G4) now land too, introducing the first VALUE-TYPED `if` (blocktype `0x7f`): `a && b` ≡ `if(a){b}else{0}`,
-    `a || b` ≡ `if(a){1}else{b}` (the RHS genuinely short-circuits), `!a` → `i32.eqz` — heavy in the lexer's
-    char-class predicates. **String `+`/`==`/`.slice`** (G6) now land too: a string is the SAME `(array i32)` of
-    code points, so all three lower INLINE — `+` allocates `len(a)+len(b)` and `array.copy`s both in, `==`/`!=`
-    are ELEMENT-WISE value-equality (a length check then a per-code-point loop — NOT ref identity, a correctness
-    fix), `.slice` clamps JS-style + `array.copy`s the range — the operators diagnostics (`+`), the lexer
-    keyword tables (`==`), and lexeme extraction (`gSrc.slice`) lean on. **String-keyed maps `{[string]: i32}`**
-    (G8) now land too — the checker's scope chain (`Map()`, `m[k]=v`, `m.has(k)`, `m[k] ?? -1`) — as a REAL ordered
-    open-addressing HASH MAP (FNV-1a + linear probing + load-factor-1/2 resize), mirroring the host's
-    `compiler/builtins/maps.ts`: a 5-field `{keys, vals, index, count, size}` struct where `keys`/`vals` are the
-    insertion-ordered entry lists (reusing the `{backing,len,cap}` wrapper) and `index` is an i32 hash-slot array.
-    `Map()` allocates an 8-slot index; every op hashes the key + probes to a free-or-matching slot (element-wise `==`);
-    set overwrites-or-appends + links the slot + resizes at load factor 1/2; `m[k] ?? d` / `.has` read the probe.
-    DELETE/tombstones deferred (no delete in the op set). The **end-to-end self-host-compile attempt** is now
-    UNDERWAY (real `ast.vl`/`parser.vl` source flowing through the pipeline, 151 green; see `CHANGELOG.md`):
-    `/`/`%` operators, implicit trailing-expression return, and multiline `type`/union parsing landed (the
-    front-end-attempt slice); the AST ARENA's field vocabulary is now fully expressible — multiple struct types,
-    string struct/variant fields, array (`i32[]`/`T[]`) struct/variant fields + `.push`, `string[]` fields +
-    `.push`, and struct-typed params across mutually-recursive groups. REMAINING (as the source vocabulary
-    widens): unions mixing scalars + structs, `!is`/negated guards, non-i32-value element lists, list
-    `pop`/`+`/equality, string `.indexOf`/`.includes`/`.charCodeAt`, map iteration/`delete`, and `for`/`match`.
-    (The fixed-bytes spike that hand-built two modules without reading `compiler/ast.vl` is retired.)
-  - **(b) Grow the `.vl` parser/typecheck subset.** `parseStmt` handles `let`/`const`/`function`/`if`
-    (incl. `else if` chains)/`return`/block/expr but **no `while`/`for` statements yet**; widen toward
-    the full language.
-  - **(c) Land the `.vl` files on real import/export** to retire the concat + symbol-rename glue
-    (the runner renames the lexer's colliding `Tok`/`Diag`/`advance`; detail: `docs/selfhost-gaps.md`
-    §1). The multi-file substrate now exists (H0 phase 1).
-  First slice (lexer) spiked + closed (#37, then #54) pending the H2 gap fixes; re-lands clean as
-  `selfhost/lexer.vl` (H2a).
-  **Codegen self-host status (detail: `docs/selfhost-gaps.md`):** the `wasmEmit.vl` spike is GREEN —
-  LEB128 + section framing emit valid bytes that the real `WebAssembly` engine instantiates. H3-gap3,
-  H4.2/H4.3/H4.4 are resolved (see `CHANGELOG.md`). The `emitProgram` frontier has advanced through
-  **params, arithmetic, comparisons, calls/recursion, if/return, locals, while, structs (#137), arrays (#145),
-  strings** (literal, `.length`, index — lowered to the array-i32 code-point representation), **growable
-  `i32[]` + `.push`** (the `{backing,len,cap}` wrapper struct with grow-on-full), **discriminated unions +
-  `is` (G1)**, **struct field write + module globals (G2)** (`struct.set`; global section + `global.get`/
-  `global.set`, constexpr inits), **ref-element lists — arrays of structs + unions (G7-ref)** (`Node[]`/
-  `Tok[]` arenas now emittable: a `(ref null $elem)` backing, `ref.as_non_null` on read, `is`-narrow over
-  elements), **boolean params/locals/returns + bool/char literals (G3)** (`boolean` rides in i32; `BoolLit`
-  → `i32.const 1`/`0`, `CharLit` → `i32.const <code point>`), **logical `&&`/`||`/`!` + the first value-typed
-  `if` (G4)** (`&&`/`||` → short-circuit `if` with i32 result-type blocktype `0x7f`, `!` → `i32.eqz`), and
-  **string `+`/`==`/`.slice` (G6)** (inline over the `(array i32)` code-point rep: `+` = `array.new_default` +
-  two `array.copy`s, `==`/`!=` = element-wise value-equality NOT ref identity, `.slice` = JS-clamped `array.copy`),
-  and **string-keyed maps `{[string]: i32}` (G8)** — a REAL ordered open-addressing hash map (FNV-1a + linear probing +
-  load-factor-1/2 resize, a 5-field `{keys, vals, index, count, size}` struct), superseding the earlier parallel-lists/
-  linear-scan placeholder: `Map()`, `m[k]=v` hash-probe overwrite-or-append + resize, `m[k] ?? d` get-with-default,
-  `.has` → 1/0; delete/tombstones deferred. With G8 the full annotated self-host front end is emitProgram-compilable and
-  **G9 inference is a non-gap** (sources are annotated), so next is an **end-to-end self-host-compile attempt**;
-  further ahead are non-i32-value element lists, list `pop`/`+`/equality, string `.indexOf`/`.includes`/`.charCodeAt`,
-  map iteration/`delete` (the deferred tombstone path), and the wider self-host source vocabulary. Remaining sub-items:
+- 🟡 **H2. Make VL expressive enough to write a compiler.** REMAINING: maps (B6a), enum tag for
+  literal-unions (A16).
+- 🟡 **H3. The self-host compiler (`compiler/*.vl`) — close the coverage tail.** The port is REAL:
+  the five modules (lexer/ast/parser/typecheck/wasmEmit + `scripts/vl-compiler-driver.vl`) compile
+  THEMSELVES to a byte-exact native fixpoint (stage3 == stage4, `scripts/native-fixpoint.sh`, gated
+  in CI by `ci-native`); the 14 emit goldens are byte-frozen; the corpus tiers pin behavior
+  (run-whitelist 154/304 `@run` files, native-align 236 cases asserting native == host). REMAINING
+  — the measured coverage tail (`docs/selfhost-corpus-paydown-findings.md` re-ranks the buckets):
+  - **Emit gaps** — `.map`/`.filter`/HOF lowering (the next slice; the function-value ABI landed
+    #306/#310), struct equality (loud-fail today; field-wise lowering + the closure identity
+    token), remaining `for…in` variants, scratch-needing top-level statements, the emitter-trap
+    pins (real bugs, pin each).
+  - **Checker false-rejects** — generics and literal-unions are the two big scoped tracks; the
+    rest is a long tail of narrow rules (each verified against the host before changing).
+  - **Parse gaps** — the long tail of surface forms.
+  - **Real import/export for the `.vl` modules** — retire the concat + symbol-rename glue (the
+    assembly renames the lexer's colliding `Tok`/`Diag`/`advance`; the H0 phase-1 substrate exists).
+  - **Spans** — continue the rungs (rung 1 landed) so native diagnostics carry real positions.
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/selfhost-gaps.md` §H4.1)
-  - ⬜ **H4.5. In-VL byte→host handoff (worked around).** Bytes are serialized via a decimal-join
-    string (`bytesToStr()`); the real fix (linear-memory/`(array i8)` return or a host sink) only
-    matters for a standalone `vl build`, not for proving self-host. (detail: `docs/selfhost-gaps.md` §H4.5)
   - ⬜ **H4.6. Array spread / concat in call position (worked around).** A small `appendAll()` loop
     helper covers bulk-append today; `xs.push(...ys)` lands with variadics (B6). (detail: `docs/selfhost-gaps.md` §H4.6)
-- ⬜ **H4. WASM emission — DECIDED: emit bytes directly + optional `wasm-opt`** (binaryen's npm
-  build is JS-bound). → `DECISIONS.md`. binaryen stays for the TS compiler.
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime
   (wasmtime — full WasmGC since v27) + a small host shim. No V8, no binaryen, no Deno.
   **Engine choice re-validated (2026 survey):** wasmtime remains the only standards-track
@@ -483,5 +381,6 @@ independent).*
 - ⬜ **H5. Versioning — deferred; rustup/Volta model, not nvm** (→ `DECISIONS.md`). Make the H-M1
   install path version-stamped so a launcher can slot in later.
 
-**Sequence:** H-M1 (now) → H2 (B6a maps + A16 enum tag) → H2a (clean lexer) → H3 port → H-M2
-host swap. Cost is dominated by H2/H3; H4 decided.
+**Sequence:** H3 coverage tail (lambda HOF slices → corpus pay-down → struct equality) → real
+import/export for the `.vl` modules → C5/H-M1 distribution (anytime, decoupled) → H-M2 host swap
+(kill the interim Rust host once the WASI driver lands). Cost is dominated by the H3 tail.
