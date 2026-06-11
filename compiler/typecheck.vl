@@ -279,6 +279,157 @@ function flushUninferred(depth: i32): i32 {
   0
 }
 
+// ── definite-assignment flow (A-definite-assign) ─────────────────────────────
+// Mirrors `compiler/typecheck.ts`'s host analysis (which lives in `parser.ts`):
+// an uninitialized `let x: T` (no initializer) starts UNASSIGNED and is non-null,
+// so a READ before it is provably written on every preceding path is a "used
+// before it is assigned" error — closing the silent-`0` soundness gap
+// (`let x: i32; return x` used to compile and return a fabricated 0). The
+// declaration is fine; only the read is gated.
+//
+// `daUnassigned` is the live set of binding NAMES still un-written on the CURRENT
+// path (a plain list — the set is tiny, only uninitialized lets in scope). A
+// `let x: T` with no initializer adds its name; `x = …` removes it; a read of a
+// still-present name errors (and drops it, so the same hole doesn't re-fire on
+// every later read). The host keys by `Binding` identity for exact shadowing; VL
+// keys by name (innermost-wins like `lookup`/`isConstName`) — sound for the
+// subset since the compiler's own source has NO uninitialized lets and no source
+// shadows an uninitialized let. Fork/join for `if`/`else` and loops is explicit
+// (snapshot/restore/join), modelled on the host. `daWriteTarget` is the node
+// index of a plain-`=` LHS Ident currently being evaluated as a WRITE (not a
+// read) so the `Ident` arm does not trip use-before-assign on it; a compound
+// `x += …` desugars to `x = x + (…)` whose RHS reads `x` and IS checked.
+let daUnassigned: string[] = []
+let daWriteTarget: i32 = -1
+
+// True if `name` is currently in the live unassigned set.
+function daIsUnassigned(name: string): boolean {
+  let i = 0
+  while i < daUnassigned.length {
+    if daUnassigned[i] == name {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Mark `name` unassigned on the current path (a `let x: T` with no initializer).
+function daAdd(name: string): i32 {
+  if !daIsUnassigned(name) {
+    daUnassigned.push(name)
+  }
+  0
+}
+
+// Mark `name` assigned on the current path (a write or a checked read), removing
+// it from the live set. Rebuilds the survivors into a temp, then refills the
+// global IN PLACE (`.clear()` + push) — the global array reference is never
+// reassigned (mirrors the host's `unassigned.delete`, and keeps the self-emitter
+// on its supported in-place-mutation path).
+function daMarkAssigned(name: string): i32 {
+  let keep: string[] = []
+  let i = 0
+  while i < daUnassigned.length {
+    if daUnassigned[i] != name {
+      keep.push(daUnassigned[i])
+    }
+    i = i + 1
+  }
+  daClear()
+  let j = 0
+  while j < keep.length {
+    daUnassigned.push(keep[j])
+    j = j + 1
+  }
+  0
+}
+
+// Empty the live set IN PLACE (never reassigns the global reference).
+function daClear(): i32 {
+  // The self-host emitter lowers `.pop()` (and `.length`) as statements but not
+  // `.clear()`, so empty the array in place by popping until empty.
+  while daUnassigned.length > 0 {
+    daUnassigned.pop()
+  }
+  0
+}
+
+// Check a READ of `name`: if still unassigned on this path, report it and drop it
+// so the same hole doesn't re-fire on every later read.
+function daCheckRead(name: string, at: i32): i32 {
+  if daIsUnassigned(name) {
+    daMarkAssigned(name)
+    tErr("`" + name + "` is used before it is assigned", at)
+  }
+  0
+}
+
+// Snapshot the live unassigned set (a copy), for forking and joining paths.
+function daSnapshot(): string[] {
+  let snap: string[] = []
+  let i = 0
+  while i < daUnassigned.length {
+    snap.push(daUnassigned[i])
+    i = i + 1
+  }
+  snap
+}
+
+// Restore the live set from a snapshot (in place — never reassigns the global).
+function daRestore(snap: string[]): i32 {
+  daClear()
+  let i = 0
+  while i < snap.length {
+    daUnassigned.push(snap[i])
+    i = i + 1
+  }
+  0
+}
+
+// Join two surviving paths into the live set: a name is assigned-after-the-merge
+// only if it is assigned on BOTH — equivalently it is STILL unassigned if it is
+// unassigned on EITHER. So the joined live set is the UNION of the two paths'
+// unassigned sets. (`a` is taken as the current live set; `b` is folded in.)
+function daJoinInto(b: string[]): i32 {
+  let i = 0
+  while i < b.length {
+    daAdd(b[i])
+    i = i + 1
+  }
+  0
+}
+
+// True if the statement at node `ix` ALWAYS exits its enclosing path (so its end
+// is unreachable and it contributes nothing to a definite-assignment join). A
+// `return`/`break`/`continue` diverges; a `Block` diverges if its last statement
+// does; an `if … else …` diverges only if BOTH arms diverge (a chain recurses
+// through its `ifElse`). Mirrors the host's `divergesStatement` for the subset.
+function daBranchDiverges(ix: i32): boolean {
+  if ix < 0 {
+    return false
+  }
+  let s = P.nodes[ix]
+  if s is RetStmt {
+    return true
+  } else if s is BreakStmt {
+    return true
+  } else if s is ContinueStmt {
+    return true
+  } else if s is Block {
+    let st = s.blkStmts
+    if st.length > 0 {
+      return daBranchDiverges(st[st.length - 1])
+    }
+    return false
+  } else if s is IfStmt {
+    if s.ifElse < 0 {
+      return false
+    }
+    return daBranchDiverges(s.ifThen) && daBranchDiverges(s.ifElse)
+  }
+  false
+}
 // True if `name` resolves (innermost-first) to a `const` binding.
 function isConstName(name: string): boolean {
   let i = T.scopes.length - 1
@@ -382,6 +533,8 @@ export function initChecker(): i32 {
   T.curRet = -1
   cUserTypes = Map()
   fnDeclIx = Map()
+  daClear()
+  daWriteTarget = -1
   inferStack = []
   inferObserved = -1
   inferSawErr = false
@@ -1722,6 +1875,13 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
   }
   // Check the body in a fresh scope sharing the parameters.
   pushScope()
+  // Definite-assignment: a function body is its OWN flow context — it runs at
+  // call time, not at the declaration site, so a NESTED function that captures an
+  // outer still-unassigned `let x` must not be flagged (the call may happen after
+  // `x` is written). Save and clear the live unassigned set for the body, then
+  // restore the enclosing path.
+  let daSavedUnassigned: string[] = daSnapshot()
+  daClear()
   let savedRet = T.curRet
   T.curRet = ret
   let dj = 0
@@ -1753,6 +1913,7 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
     }
   }
   T.curRet = savedRet
+  daRestore(daSavedUnassigned)
   popScope()
   if inferring {
     inferStack.pop()
@@ -1943,6 +2104,14 @@ function checkNode(ix: i32): i32 {
       tErr("undeclared identifier '" + n.identName + "'", ix)
       return TY_ERR
     }
+    // Definite-assignment read gate: a bare-name READ of a still-unassigned
+    // binding is "used before assigned". The LHS of a plain `=` is a WRITE, not a
+    // read (the `BinExpr` `=` arm marks it as `daWriteTarget` before evaluating
+    // the target), so it is skipped here; a compound `x += …` desugars to
+    // `x = x + (…)` whose RHS reads `x` and DOES reach this gate.
+    if ix != daWriteTarget {
+      daCheckRead(n.identName, ix)
+    }
     return ty
   } else if n is Paren {
     return checkNode(n.parInner)
@@ -2006,7 +2175,21 @@ function checkNode(ix: i32): i32 {
       }
       return TY_BOOL
     }
+    // Definite-assignment: the LHS of a plain `=` with a bare-name target is a
+    // pure WRITE — flag the target node so the `Ident` arm does not trip
+    // use-before-assign on it (the assignment is what assigns it). A compound
+    // `x += …` is desugared to `x = x + (…)`: the inner `x` in the RHS is NOT the
+    // write target, so its read is still gated. Cleared after the target is
+    // checked. Saved/restored so a nested `=` (e.g. `a = (b = c)`) is exact.
+    let savedWriteTarget = daWriteTarget
+    if op == "=" {
+      let wtgt = P.nodes[n.binLeft]
+      if wtgt is Ident {
+        daWriteTarget = n.binLeft
+      }
+    }
     let lt = checkNode(n.binLeft)
+    daWriteTarget = savedWriteTarget
     let rt = checkNode(n.binRight)
     // Assignment: RHS must be assignable to the LHS's (already-bound) type.
     if op == "=" {
@@ -2017,6 +2200,8 @@ function checkNode(ix: i32): i32 {
         if isConstName(tgt.identName) {
           tErr("cannot reassign `const` " + tgt.identName, ix)
         }
+        // This write makes the binding definitely assigned on the current path.
+        daMarkAssigned(tgt.identName)
       }
       // An index-set into an empty `[]` (`xs[i] = v`) pins its element type to
       // `typeof v` in place — usage-driven inference (`infer-empty-index-set.vl`),
@@ -2348,6 +2533,15 @@ function checkNode(ix: i32): i32 {
         constScopes[ctop][n.letName] = true
       }
     }
+    // Definite-assignment: an uninitialized `let x` / `let x: T` (no initializer)
+    // starts UNASSIGNED; a later read before it is written is an error. An
+    // initialized `let x = …` (and every `const`, which must have a value) is
+    // assigned from the start, so it is never tracked. A re-declaration that
+    // shadows clears any prior assigned/unassigned record under that name.
+    daMarkAssigned(n.letName)
+    if n.letInit < 0 {
+      daAdd(n.letName)
+    }
     return TY_VOID
 
   // ── function declaration ─────────────────────────────────────────────────────
@@ -2360,7 +2554,13 @@ function checkNode(ix: i32): i32 {
     if !assignable(wc, TY_BOOL) {
       tErr("while-condition must be bool, got " + tyToStr(wc), ix)
     }
+    // Definite-assignment: a loop body may run ZERO times, so an assignment
+    // inside it is NOT guaranteed to reach code after the loop. Check the body
+    // with the live state (so a read AFTER an in-body assignment is fine), then
+    // RESTORE the pre-loop state for the fall-through.
+    let daLoopEntry: string[] = daSnapshot()
     checkNode(n.whileBody)
+    daRestore(daLoopEntry)
     return TY_VOID
 
   // ── break / continue ────────────────────────────────────────────────────────
@@ -2389,7 +2589,10 @@ function checkNode(ix: i32): i32 {
     }
     pushScope()
     declare(n.frVar, TY_I32)
+    // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
+    let daFrEntry: string[] = daSnapshot()
     checkNode(n.frBody)
+    daRestore(daFrEntry)
     popScope()
     return TY_VOID
 
@@ -2408,7 +2611,10 @@ function checkNode(ix: i32): i32 {
     }
     pushScope()
     declare(n.fiVar, elemTy)
+    // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
+    let daFiEntry: string[] = daSnapshot()
     checkNode(n.fiBody)
+    daRestore(daFiEntry)
     popScope()
     return TY_VOID
 
@@ -2436,6 +2642,15 @@ function checkNode(ix: i32): i32 {
     let enNames: string[] = []
     let enTys: i32[] = []
     collectElseNarrows(n.ifCond, enNames, enTys)
+    // Definite-assignment fork/join: each branch is a separate path forked off
+    // the if-entry state; after the chain they JOIN. A binding is assigned after
+    // the `if` only if assigned on EVERY surviving (non-diverging) path. With no
+    // `else`, the implicit fall-through (condition false) is a surviving path
+    // that assigns nothing — so a write only inside `if c { x = 1 }` does NOT
+    // make `x` assigned afterwards. A branch that always exits (`return`/`break`/
+    // `continue`) contributes nothing to the merge (its end is unreachable).
+    let daEntry: string[] = daSnapshot()
+    let daThenDiverges = daBranchDiverges(n.ifThen)
     if tnNames.length > 0 {
       pushScope()
       let ti = 0
@@ -2448,7 +2663,15 @@ function checkNode(ix: i32): i32 {
     if tnNames.length > 0 {
       popScope()
     }
-    if n.ifElse >= 0 {
+    // Surviving paths' end-states, each as an unassigned snapshot. Seed with the
+    // then-branch end if it survived.
+    let daThenEnd: string[] = daSnapshot()
+    daRestore(daEntry)
+    let daElseDiverges = false
+    let daElseEnd: string[] = daEntry
+    let daHasElse = n.ifElse >= 0
+    if daHasElse {
+      daElseDiverges = daBranchDiverges(n.ifElse)
       if enNames.length > 0 {
         pushScope()
         let ei = 0
@@ -2461,6 +2684,22 @@ function checkNode(ix: i32): i32 {
       if enNames.length > 0 {
         popScope()
       }
+      daElseEnd = daSnapshot()
+    }
+    // Join the surviving paths. Start from the empty set and fold in every
+    // surviving path's unassigned set (the union = "unassigned on some surviving
+    // path"). The else path (or, with no `else`, the entry fall-through) always
+    // counts unless it diverges.
+    daClear()
+    if !daThenDiverges {
+      daJoinInto(daThenEnd)
+    }
+    if daHasElse {
+      if !daElseDiverges {
+        daJoinInto(daElseEnd)
+      }
+    } else {
+      daJoinInto(daEntry)
     }
     // GUARD CLAUSE: a THEN that always exits applies the FALSE narrowings to
     // the rest of the enclosing block (`if x == null { return } … x.f …`).

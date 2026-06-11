@@ -321,6 +321,9 @@ const WHITELIST = [
   "types/self-alias-unused.vl",
   "types/undeclared-call.vl",
   "variables/const-increment-error.vl",
+  "variables/definite-assign-after-loop-error.vl",
+  "variables/definite-assign-one-branch-error.vl",
+  "variables/definite-assign-use-before-assign.vl",
 ];
 
 const corpusSrc = (rel: string) =>
