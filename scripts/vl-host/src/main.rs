@@ -33,22 +33,81 @@ fn gc_engine(collector: Collector) -> Result<Engine> {
     if matches!(collector, Collector::Null) {
         cfg.gc_heap_reservation(8 << 30); // 8 GiB virtual reservation (lazily committed)
     }
-    Ok(Engine::new(&cfg)?)
+    Engine::new(&cfg)
+}
+
+/// Render the compiler's accumulated diagnostics, one per line. A compiler
+/// module with the structured per-diagnostic exports (`diagCount` /
+/// `diagMsgLen` / `diagMsgAt` / `diagLine` / `diagCol`) renders a positioned
+/// diagnostic as `path:line:col: message` — 1-based line, 0-based column (the
+/// lexer's and the corpus `@error-at` directive's convention) — while
+/// `diagLine(i) == 0` means "no position" and the message prints bare. An older
+/// module without those exports degrades to the legacy newline-joined
+/// `diagLen`/`diagAt` text (bare messages), byte-identical to before.
+fn render_diags(inst: &Instance, store: &mut Store<()>, path: &str) -> Result<String> {
+    if let (Ok(count), Ok(mlen), Ok(mat), Ok(dline), Ok(dcol)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "diagCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "diagMsgLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "diagMsgAt"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "diagLine"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "diagCol"),
+    ) {
+        let n = count.call(&mut *store, ())?;
+        let mut out = String::new();
+        for i in 0..n {
+            let len = mlen.call(&mut *store, i)?;
+            let mut msg = String::with_capacity(len as usize);
+            for j in 0..len {
+                if let Some(c) = char::from_u32(mat.call(&mut *store, (i, j))? as u32) {
+                    msg.push(c);
+                }
+            }
+            let line = dline.call(&mut *store, i)?;
+            if line > 0 {
+                let col = dcol.call(&mut *store, i)?;
+                out.push_str(&format!("{path}:{line}:{col}: {msg}\n"));
+            } else {
+                out.push_str(&msg);
+                out.push('\n');
+            }
+        }
+        return Ok(out);
+    }
+    let dlen = inst.get_typed_func::<(), i32>(&mut *store, "diagLen")?;
+    let dat = inst.get_typed_func::<i32, i32>(&mut *store, "diagAt")?;
+    let n = dlen.call(&mut *store, ())?;
+    let mut diags = String::with_capacity(n as usize);
+    for i in 0..n {
+        if let Some(c) = char::from_u32(dat.call(&mut *store, i)? as u32) {
+            diags.push(c);
+        }
+    }
+    Ok(diags)
 }
 
 /// Drive the self-hosted compiler module: feed `source` in, call `entry`
 /// (`compileSrc` for the full pipeline, `checkSrc` for parse + typecheck only),
 /// optionally enabling the `name` custom section (`emit_names`), and return the
 /// emitted wasm bytes (empty for a check), or the compiler's own diagnostics as
-/// the error.
-fn compile_vl(engine: &Engine, compiler_path: &str, source: &str, entry: &str, emit_names: bool) -> Result<Vec<u8>> {
+/// the error (positioned `source_path:line:col: message` lines where known).
+fn compile_vl(
+    engine: &Engine,
+    compiler_path: &str,
+    source: &str,
+    source_path: &str,
+    entry: &str,
+    emit_names: bool,
+) -> Result<Vec<u8>> {
     // A `.cwasm` SIDECAR caches the Cranelift compilation of the compiler module
     // (the dominant fixed cost of every invocation). Keyed by freshness: rebuilt
     // whenever the `.wasm` is newer. `deserialize_file` is unsafe because a
     // corrupt/forged artifact is UB — we only ever load a sidecar this same
     // binary wrote next to the module it was derived from.
     let sidecar = format!("{compiler_path}.cwasm");
-    let fresh = match (std::fs::metadata(&sidecar), std::fs::metadata(compiler_path)) {
+    let fresh = match (
+        std::fs::metadata(&sidecar),
+        std::fs::metadata(compiler_path),
+    ) {
         (Ok(c), Ok(w)) => matches!((c.modified(), w.modified()), (Ok(cm), Ok(wm)) if cm >= wm),
         _ => false,
     };
@@ -78,8 +137,6 @@ fn compile_vl(engine: &Engine, compiler_path: &str, source: &str, entry: &str, e
     let compile = inst.get_typed_func::<(), i32>(&mut store, entry)?;
     let rlen = inst.get_typed_func::<(), i32>(&mut store, "rbyteLen")?;
     let rat = inst.get_typed_func::<i32, i32>(&mut store, "rbyteAt")?;
-    let dlen = inst.get_typed_func::<(), i32>(&mut store, "diagLen")?;
-    let dat = inst.get_typed_func::<i32, i32>(&mut store, "diagAt")?;
 
     // Opt into the wasm "name" custom section so trap backtraces name functions.
     // The export is OFF by default (the compiler leaves goldens byte-identical);
@@ -102,13 +159,7 @@ fn compile_vl(engine: &Engine, compiler_path: &str, source: &str, entry: &str, e
             2 => "type",
             _ => "emit",
         };
-        let n = dlen.call(&mut store, ())?;
-        let mut diags = String::with_capacity(n as usize);
-        for i in 0..n {
-            if let Some(c) = char::from_u32(dat.call(&mut store, i)? as u32) {
-                diags.push(c);
-            }
-        }
+        let diags = render_diags(&inst, &mut store, source_path)?;
         bail!("{stage} error\n{}", diags.trim_end());
     }
     let n = rlen.call(&mut store, ())?;
@@ -138,7 +189,9 @@ fn run_program(engine: &Engine, bytes: &[u8]) -> Result<()> {
     // (where a wasm f32 arrives as a JS number, i.e. its exact f64 value), mirroring the
     // host's `__print_f32__` (`String(v)`). Whole f32 values print without `.0` (e.g.
     // 6.5→"6.5", 10.0→"10"). (Slice 5.)
-    linker.func_wrap("imports", "__print_f32__", |v: f32| println!("{}", v as f64))?;
+    linker.func_wrap("imports", "__print_f32__", |v: f32| {
+        println!("{}", v as f64)
+    })?;
     linker.func_wrap("imports", "__print_bool__", |v: i32| {
         println!("{}", if v != 0 { "true" } else { "false" })
     })?;
@@ -168,7 +221,10 @@ fn wasm_opt_path() -> Option<String> {
     let path = std::env::var("PATH").unwrap_or_default();
     for dir in path.split(':') {
         let cand = format!("{dir}/wasm-opt");
-        if std::fs::metadata(&cand).map(|m| m.is_file()).unwrap_or(false) {
+        if std::fs::metadata(&cand)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
             return Some(cand);
         }
     }
@@ -188,7 +244,14 @@ fn optimize_in_place(path: &str) -> Result<()> {
         return Ok(());
     };
     let status = std::process::Command::new(&opt)
-        .args([path, "-O", "--enable-reference-types", "--enable-gc", "-o", path])
+        .args([
+            path,
+            "-O",
+            "--enable-reference-types",
+            "--enable-gc",
+            "-o",
+            path,
+        ])
         .status()
         .map_err(|e| Error::from(e).context(format!("running wasm-opt `{opt}`")))?;
     if !status.success() {
@@ -205,7 +268,10 @@ fn main() -> Result<()> {
     let cmd = args[1].as_str();
     let input = args[2].as_str();
     let flag = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
     let compiler = flag("--compiler")
         .or_else(|| std::env::var("VL_COMPILER_WASM").ok())
@@ -228,13 +294,22 @@ fn main() -> Result<()> {
             });
             // `--names` embeds a wasm "name" custom section (legible trap backtraces).
             let names = args.iter().any(|a| a == "--names");
-            let bytes = compile_vl(&compile_engine, &compiler, &read_source()?, "compileSrc", names)?;
+            let bytes = compile_vl(
+                &compile_engine,
+                &compiler,
+                &read_source()?,
+                input,
+                "compileSrc",
+                names,
+            )?;
             std::fs::write(&out, &bytes)?;
             // `-O`: optimize the written module in place (wasm-opt, when present).
             if args.iter().any(|a| a == "-O") {
                 optimize_in_place(&out)?;
             }
-            let len = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(bytes.len() as u64);
+            let len = std::fs::metadata(&out)
+                .map(|m| m.len())
+                .unwrap_or(bytes.len() as u64);
             println!("wrote {out} ({len} bytes)");
         }
         "check" => {
@@ -243,7 +318,14 @@ fn main() -> Result<()> {
             // slower and would reject type-valid programs the emitter can't yet
             // lower. Diagnostics surface through compile_vl's error path. (No names:
             // check emits nothing.)
-            compile_vl(&compile_engine, &compiler, &read_source()?, "checkSrc", false)?;
+            compile_vl(
+                &compile_engine,
+                &compiler,
+                &read_source()?,
+                input,
+                "checkSrc",
+                false,
+            )?;
             println!("ok");
         }
         "run" => {
@@ -256,10 +338,20 @@ fn main() -> Result<()> {
             let bytes = if raw.starts_with(b"\0asm") {
                 raw
             } else {
-                let source = String::from_utf8(raw)
-                    .map_err(|e| Error::from(e).context(format!("`{input}` is neither UTF-8 VL source nor a wasm module")))?;
+                let source = String::from_utf8(raw).map_err(|e| {
+                    Error::from(e).context(format!(
+                        "`{input}` is neither UTF-8 VL source nor a wasm module"
+                    ))
+                })?;
                 // `vl run` always embeds names so a trap backtrace is legible.
-                compile_vl(&compile_engine, &compiler, &source, "compileSrc", true)?
+                compile_vl(
+                    &compile_engine,
+                    &compiler,
+                    &source,
+                    input,
+                    "compileSrc",
+                    true,
+                )?
             };
             let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
             run_program(&run_engine, &bytes)?;
