@@ -167,6 +167,118 @@ let cUserTypes: {[string]: i32} = Map()
 // so the exported struct shape is unchanged.
 let constScopes: {[string]: boolean}[] = []
 
+// UN-INFERRED EMPTY-COLLECTION FLOOR (mirrors the host's `reportUninferredBinding`
+// in `compiler/typecheck.ts`): an un-annotated empty `[]` / `Map()` / `Set()` whose
+// element/key/value hole is never pinned — by an annotation or a downstream
+// `.push`/`.set`/`.add` — has a genuinely unknown type. We can't decide that at the
+// declaration (a later use may still pin it), so each such binding is RECORDED here
+// (its name, its type-arena index, the decl node) and re-examined at scope close /
+// program end: if the hole is STILL open (`aElem < 0`, or `mKey`/`mVal < 0`), it
+// "cannot be inferred" and an annotation is required. Three parallel arrays + a
+// per-record scope-depth, flushed by `flushUninferred(depth)` (avoids a nested
+// `Pending[][]`). An ANNOTATED empty collection never lands here (the binding takes
+// the annotation's element type), so the compiler's own annotated `let x: T[] = []`
+// / `Map()` / `Set()` bindings are untouched.
+let pendNames: string[] = []
+let pendTys: i32[] = []
+let pendAts: i32[] = []
+let pendDepths: i32[] = []
+
+// Record an un-annotated empty-collection binding for the deferred scope-close check.
+function notePending(name: string, ty: i32, at: i32): i32 {
+  pendNames.push(name)
+  pendTys.push(ty)
+  pendAts.push(at)
+  pendDepths.push(T.scopes.length - 1)
+  0
+}
+
+// Does type-arena index `ty` still reach an UNRESOLVED collection hole — an empty
+// `[]` element (`aElem < 0`) or a bare `Map()`/`Set()` key/value (`mKey`/`mVal < 0`)
+// that no annotation or downstream use ever pinned? Mirrors the host's
+// `containsUnresolvedHole`, but over the arena's `-1` hole sentinel.
+function unresolvedHole(ty: i32): boolean {
+  if ty < 0 {
+    return false
+  }
+  let t = T.tys[ty]
+  if t is TyArray {
+    return t.aElem < 0
+  }
+  if t is TyMap {
+    return t.mKey < 0 || t.mVal < 0
+  }
+  false
+}
+
+// USAGE-DRIVEN INFERENCE through a TYPED context: when an empty `[]` / bare
+// `Map()`/`Set()` (open holes) flows into a slot with a concrete shape — a `T[]`
+// param at a call site, an annotated assignment (`const ys: i32[] = zs`), or a
+// `T[]`-returning tail — PIN the source's open holes to the destination's, in place,
+// so the binding is no longer uninferable. Mirrors the host's `constrainElementHole`.
+// A no-op unless the source is an array/map with an open hole and the destination
+// supplies the matching shape; recurses into element types so a nested empty pins too.
+function constrainEmpty(srcTy: i32, dstTy: i32): i32 {
+  if srcTy < 0 || dstTy < 0 {
+    return 0
+  }
+  let s = T.tys[srcTy]
+  let d = T.tys[dstTy]
+  if s is TyArray {
+    if d is TyArray {
+      if s.aElem < 0 {
+        s.aElem = d.aElem
+      } else {
+        constrainEmpty(s.aElem, d.aElem)
+      }
+    }
+    return 0
+  }
+  if s is TyMap {
+    if d is TyMap {
+      if s.mKey < 0 {
+        s.mKey = d.mKey
+      }
+      if s.mVal < 0 {
+        s.mVal = d.mVal
+      }
+    }
+    return 0
+  }
+  0
+}
+
+// Flush every pending binding recorded at scope `depth` (called just before the
+// scope is popped, and for the global scope at program end). A binding whose hole is
+// still open at this point will never be pinned, so report the unified
+// "cannot infer a type" diagnostic — the same wording the host raises.
+function flushUninferred(depth: i32): i32 {
+  let keepN: string[] = []
+  let keepT: i32[] = []
+  let keepA: i32[] = []
+  let keepD: i32[] = []
+  let i = 0
+  while i < pendNames.length {
+    if pendDepths[i] == depth {
+      if unresolvedHole(pendTys[i]) {
+        tErr("cannot infer a type for '" + pendNames[i] +
+          "' — add a type annotation", pendAts[i])
+      }
+    } else {
+      keepN.push(pendNames[i])
+      keepT.push(pendTys[i])
+      keepA.push(pendAts[i])
+      keepD.push(pendDepths[i])
+    }
+    i = i + 1
+  }
+  pendNames = keepN
+  pendTys = keepT
+  pendAts = keepA
+  pendDepths = keepD
+  0
+}
+
 // True if `name` resolves (innermost-first) to a `const` binding.
 function isConstName(name: string): boolean {
   let i = T.scopes.length - 1
@@ -285,6 +397,10 @@ export function initChecker(): i32 {
   T.scopes.push(Map())
   constScopes = []
   constScopes.push(Map())
+  pendNames = []
+  pendTys = []
+  pendAts = []
+  pendDepths = []
   0
 }
 
@@ -428,6 +544,7 @@ function pushScope(): i32 {
 // value correctly now — the old PR #4 wasm-validation gap is fixed and pinned by
 // `tests/cases/lists/struct-field-pop-statement.vl`.)
 function popScope(): i32 {
+  flushUninferred(T.scopes.length - 1)
   T.scopes.pop()
   constScopes.pop()
   0
@@ -1066,7 +1183,14 @@ function checkCallNode(n: Call, ix: i32): i32 {
           tErr("push expects 1 argument, got " + i32ToStr(margs.length), ix)
         } else {
           let pat = checkNode(margs[0])
-          if !assignable(pat, rt.aElem) {
+          // The first `.push(v)` on a bare empty `[]` (element hole `-1`) PINS its
+          // element type to `typeof v` in place — this is the usage-driven inference
+          // that resolves an un-annotated `const xs = []` (see `infer-empty-push.vl`),
+          // and clears the uninferred-binding floor. A later conflicting push is then
+          // a clean type error.
+          if rt.aElem < 0 {
+            rt.aElem = pat
+          } else if !assignable(pat, rt.aElem) {
             tErr("push: cannot add " + tyToStr(pat) + " to " + tyToStr(recvTy), ix)
           }
         }
@@ -1413,6 +1537,10 @@ function checkCallNode(n: Call, ix: i32): i32 {
           }
         }
       }
+      // Passing an empty-collection argument into a concrete `T[]` / map param pins
+      // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
+      // clearing its uninferred floor — pure downstream-usage inference, no push.
+      constrainEmpty(at, expected)
       if !assignable(at, expected) {
         tErr("argument " + i32ToStr(i + 1) + ": expected " +
           tyToStr(expected) + ", got " + tyToStr(at), ix)
@@ -1609,9 +1737,15 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
     while s < stmts.length {
       let stTy = checkNode(stmts[s])
       // The trailing expression is the implicit return; under inference it is a
-      // return-type witness.
-      if inferring && s == stmts.length - 1 {
-        noteInferredRet(stTy)
+      // return-type witness. With a CONCRETE annotated return, a trailing empty
+      // collection (`mk(): i32[] { … inner }`) pins its element from the return
+      // type here — before the body scope is popped (and `inner`'s floor checked).
+      if s == stmts.length - 1 {
+        if inferring {
+          noteInferredRet(stTy)
+        } else {
+          constrainEmpty(stTy, ret)
+        }
       }
       s = s + 1
     }
@@ -1880,6 +2014,19 @@ function checkNode(ix: i32): i32 {
       if tgt is Ident {
         if isConstName(tgt.identName) {
           tErr("cannot reassign `const` " + tgt.identName, ix)
+        }
+      }
+      // An index-set into an empty `[]` (`xs[i] = v`) pins its element type to
+      // `typeof v` in place — usage-driven inference (`infer-empty-index-set.vl`),
+      // clearing the uninferred floor. `lt` is the (open `-1`) element type, so
+      // every assignment succeeds against it until it is pinned.
+      if tgt is Index {
+        let arrTy0 = checkNode(tgt.idxArr)
+        let arrT0 = T.tys[arrTy0]
+        if arrT0 is TyArray {
+          if arrT0.aElem < 0 {
+            arrT0.aElem = rt
+          }
         }
       }
       if !assignable(rt, lt) {
@@ -2157,6 +2304,10 @@ function checkNode(ix: i32): i32 {
     if annot >= 0 {
       bound = annot
       if initTy >= 0 {
+        // An annotated assignment of an empty-collection initializer pins the
+        // SOURCE binding's open holes from the annotation (`const ys: i32[] = zs`
+        // resolves `zs`'s element) — clearing its uninferred floor in place.
+        constrainEmpty(initTy, annot)
         if !assignableExpr(n.letInit, initTy, annot) {
           tErr("cannot assign " + tyToStr(initTy) + " to '" + n.letName +
             "' of type " + tyToStr(annot), ix)
@@ -2177,6 +2328,14 @@ function checkNode(ix: i32): i32 {
       }
     } else if initTy >= 0 {
       bound = initTy
+      // UN-INFERRED EMPTY-COLLECTION FLOOR: an un-annotated `[]` / `Map()` / `Set()`
+      // whose hole is still open here may yet be pinned by a downstream
+      // `.push`/`.set`/`.add` (those mutate the shared arena entry in place), so we
+      // can't decide now. Record it for the scope-close re-check; if the hole stays
+      // open it is genuinely uninferable and `flushUninferred` reports it.
+      if unresolvedHole(bound) {
+        notePending(n.letName, bound, ix)
+      }
     } else {
       tErr("'" + n.letName + "' needs a type annotation or initializer", ix)
     }
@@ -2345,6 +2504,9 @@ function checkNode(ix: i32): i32 {
       return TY_VOID
     }
     let got = checkNode(n.retArg)
+    // An explicit `return inner` of an empty collection pins its element from the
+    // declared return type — usage-driven inference clearing the floor.
+    constrainEmpty(got, want)
     if want >= 0 && !assignable(got, want) {
       tErr("return type mismatch: expected " + tyToStr(want) + ", got " +
         tyToStr(got), ix)
@@ -2389,5 +2551,8 @@ function checkNode(ix: i32): i32 {
 // below exercises it in this very module.)
 export function checkProgram(rootIx: i32): i32 {
   checkNode(rootIx)
+  // The global scope (depth 0) is never popped, so flush its un-annotated
+  // empty-collection bindings here: any still-open hole is genuinely uninferable.
+  flushUninferred(0)
   T.diags.length
 }
