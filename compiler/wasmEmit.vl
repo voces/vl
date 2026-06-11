@@ -3221,6 +3221,11 @@ let pendingF32: boolean = false
 // init emit; locals/returns widen via `emitExprAsF64` instead. (Slice 5.)
 let pendingF64: boolean = false
 
+// Set while lowering an initializer whose binding is annotated `boolean|null` —
+// the NICHE scalar nullable. A bare `null` initializer lowers as the sentinel
+// `i32.const 2` (not a `ref.null`), mirroring the host's `nullSentinel`.
+let pendingNulBool: boolean = false
+
 // ── discriminated-union table (G1: struct unions + `is`-narrowing) ────────────
 // A program may declare ONE union alias `type N = A | B | …` (a `UnionDecl`) whose
 // members are struct `type`s (each a `TypeDecl`). When a union IS declared, the
@@ -7546,6 +7551,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     return emitIs(body, exprIx, fnIx)
   }
   if e is NullLit {
+    // `null` in a `boolean|null` NICHE context is the scalar sentinel 2 (an i32,
+    // not a ref) — checked before the struct seed.
+    if pendingNulBool {
+      fbI32Const(2)
+      return 0
+    }
     // A bare `null` VALUE: its target struct comes from the binding/argument/
     // return seed (`pendingStructIdx`) — `ref.null $S`. With no seed it cannot
     // be typed here; fail loudly.
@@ -7825,6 +7836,18 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       if nrhs is NullLit { nref = e.binLeft }
       if nlhs is NullLit { nref = e.binRight }
       if nref >= 0 {
+        // `x == null` over a `boolean|null` NICHE value is a SENTINEL compare
+        // (`x == 2`) — the i32 never holds a ref. Checked before the struct path.
+        if exprNulBool(nref, fnIx) {
+          if emitExpr(body, nref, fnIx) < 0 { return 0 - 1 }
+          fbI32Const(2)
+          if e.binOp == "!=" {
+            fbI32Bin(71)     // 0x47 i32.ne
+          } else {
+            fbI32Bin(70)     // 0x46 i32.eq
+          }
+          return 0
+        }
         if exprNullableStruct(nref, fnIx) {
           if emitExpr(body, nref, fnIx) < 0 { return 0 - 1 }
           wU8(209)           // 0xd1 ref.is_null
@@ -8328,6 +8351,11 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
   }
   if e is Unary {
     return e.unOp == "!"
+  }
+  if e is Ident {
+    // A `boolean|null` NICHE binding read (narrowed non-null in its branch)
+    // prints true/false. Plain `boolean` idents stay unclassified (existing rule).
+    if exprNulBool(ix, fnIx) { return true }
   }
   if e is BinExpr {
     let op = e.binOp
@@ -10032,6 +10060,18 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       scopeBind(s.letName, slot)
       return 0
     }
+    // A degenerate UN-ANNOTATED `let x = null` (A-infer-null): the binding's type
+    // is the plain `null` type — it is never read as a non-null value, so its i32
+    // cell just zero-inits. (An ANNOTATED nullable binding takes the normal path.)
+    if s.letType < 0 {
+      let bareN = P.nodes[unwrapParen(s.letInit)]
+      if bareN is NullLit {
+        fbI32Const(0)
+        fbLocalSet(idx)        // 0x21 local.set
+        scopeBind(s.letName, slot)
+        return 0
+      }
+    }
     // An empty `[]` initializer over a ref-array annotation (`let xs: T[] = []`) needs
     // the element kind to pick the ref-list construction — record it for `emitArr`.
     pendingListKind = letAnnRefListKind(stmtIx)
@@ -10060,7 +10100,10 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     } else if letIsI64(stmtIx) {
       if emitExprAsI64(body, s.letInit, fnIx) < 0 { return 0 - 1 }
     } else {
+      // A `boolean|null` NICHE binding lowers a bare `null` init as the sentinel 2.
+      pendingNulBool = letIsNulBoolAnn(stmtIx)
       if emitExpr(body, s.letInit, fnIx) < 0 { return 0 - 1 }
+      pendingNulBool = false
     }
     pendingI64 = false
     pendingStructIdx = 0 - 1
@@ -11344,6 +11387,54 @@ function structIndexOfTypeName(name: string): i32 {
 // `1` if the type-annotation node at `tyIx` is a NULLABLE STRUCT (`S | null` with a
 // resolvable struct part), else `0`. Feeds the `kind == 9` (nullable struct ref,
 // `0x63`) family.
+// True if the annotation node at `tyIx` is `boolean|null` — the NICHE scalar
+// nullable (host: `nullSentinel`): an i32 holding 0/1, with the spare value 2
+// encoding `null` (no box). `== null` is a sentinel compare; narrowing to
+// non-null is purely type-level (the i32 is already 0/1 in the branch).
+function tyIsNulBool(tyIx: i32): boolean {
+  if tyIx < 0 { return false }
+  let ty = P.nodes[tyIx]
+  if ty is TypeRef {
+    return nullablePartOf(ty.tyName) == "boolean"
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` is annotated `boolean|null`.
+function letIsNulBoolAnn(letIx: i32): boolean {
+  if letIx < 0 { return false }
+  let d = P.nodes[letIx]
+  if d is LetDecl { return tyIsNulBool(d.letType) }
+  false
+}
+
+// True if the expression is a NAME (param / local / module global) annotated
+// `boolean|null` — the niche scalar nullable.
+function exprNulBool(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    if fnIx >= 0 {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl {
+        let params = fn.fnParams
+        let i = 0
+        while i < params.length {
+          let p = P.nodes[params[i]]
+          if p is Param {
+            if p.parName == e.identName { return tyIsNulBool(p.parType) }
+          }
+          i = i + 1
+        }
+        let li = parentLetOf(fn.fnBody, e.identName)
+        if li >= 0 { return letIsNulBoolAnn(li) }
+      }
+    }
+    return letIsNulBoolAnn(globalLetOf(e.identName))
+  }
+  false
+}
+
 function retNulRefFlag(tyIx: i32): i32 {
   if tyIx >= 0 {
     let ty = P.nodes[tyIx]
@@ -12565,7 +12656,10 @@ function emitStartFnCode(out: i32[]): i32 {
             // A map global's start-fn init seeds the map SHAPE (mirrors the
             // local-`let` seeding) so `Map()` builds THIS global's map struct.
             if gck == 6 { pendingMapSlot = letMapShapeOf(globalStmts[gi], 0 - 1) }
+            // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2.
+            pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
             if emitExpr(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+            pendingNulBool = false
             pendingMapSlot = 0 - 1
           }
           let setPrev = wTarget(bodyExpr)
