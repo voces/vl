@@ -225,6 +225,7 @@ const TRAP_CASES = [
 
 // ── REJECT_CASES (@error): `vl check` rejects at the parse/type stage ──
 const REJECT_CASES = [
+  "arrays/error-empty-uninferred.vl",
   "arrays/leading-comma-illegal.vl",
   "arrays/render-i32-array.vl",
   "arrays/trailing-comma-illegal.vl",
@@ -252,7 +253,9 @@ const REJECT_CASES = [
   "loops/for-in-not-array.vl",
   "maps/error-i32-keyed.vl",
   "maps/error-infer-conflict.vl",
+  "maps/error-no-annotation.vl",
   "maps/error-object-literal-not-map.vl",
+  "maps/error-uninferred.vl",
   "numerics/narrowing-reject.vl",
   "objects/self-method-pollution.vl",
   "objects/trailing-comma-illegal.vl",
@@ -260,6 +263,7 @@ const REJECT_CASES = [
   "sets/error-i32-keyed.vl",
   "sets/error-infer-conflict.vl",
   "sets/error-no-get.vl",
+  "sets/error-uninferred.vl",
   "sets/error-no-map-methods.vl",
   "soundness/arith-annotated-mismatch.vl",
   "soundness/equality-cross-type-reject.vl",
