@@ -19,6 +19,12 @@ export function srcPush(c: i32): i32 {
 function vcSource(): string {
   fromCodePoints(vcCodes)
 }
+// Source positions of the LEX diagnostics folded into `P.diags` (parallel to the
+// first `vcLexLines.length` entries of `P.diags`): a lex diag carries a real
+// `line`/`col` but `Diag.at` is a TOKEN index, so the positions ride here and
+// `diagLine`/`diagCol` consult this table first. Reset per compile.
+let vcLexLines: i32[] = []
+let vcLexCols: i32[] = []
 function vcLoadToks(src: string): i32 {
   let r = tokenize(src)
   let i = 0
@@ -31,10 +37,13 @@ function vcLoadToks(src: string): i32 {
   // an empty `''` or multi-char `'ab'` char literal) is rejected at the parse
   // stage. Mirrors the host's `checkOnly`, which seeds its diagnostics list from
   // `tokenize(...).diagnostics` BEFORE appending parse errors. The token index is
-  // not tracked on a lex diag, so it is anchored at 0.
+  // not tracked on a lex diag, so it is anchored at 0; the diag's REAL source
+  // position is kept in the parallel `vcLexLines`/`vcLexCols`.
   let d = 0
   while d < r.diags.length {
     P.diags.push({ msg: r.diags[d].msg, at: 0 })
+    vcLexLines.push(r.diags[d].line)
+    vcLexCols.push(r.diags[d].col)
     d = d + 1
   }
   P.toks.length
@@ -45,6 +54,9 @@ export function compileSrc(): i32 {
   P.nodes = []
   P.diags = []
   P.pos = 0
+  nodeToks = []
+  vcLexLines = []
+  vcLexCols = []
   W.bytes = []
   fnNames = []
   fnIndices = []
@@ -73,6 +85,9 @@ export function checkSrc(): i32 {
   P.nodes = []
   P.diags = []
   P.pos = 0
+  nodeToks = []
+  vcLexLines = []
+  vcLexCols = []
   fnNames = []
   fnIndices = []
   localNames = []
@@ -109,3 +124,68 @@ function vcDiags(): string {
 }
 export function diagLen(): i32 { vcDiags().length }
 export function diagAt(i: i32): i32 { vcDiags()[i] }
+
+// ── Structured per-diagnostic exports (positions) ─────────────────────────────
+// PARALLEL to `diagLen`/`diagAt` (which stay byte-compatible: corpus `@error`
+// directives and host-parity tests substring-match that newline-joined TEXT).
+// The host reads `diagCount()` diagnostics; for each, the message text via the
+// per-byte `diagMsgLen(i)`/`diagMsgAt(i, j)` idiom and its source position via
+// `diagLine(i)` (1-based; 0 = "no position, render the message bare") and
+// `diagCol(i)` (0-based — the lexer's and `@error-at`'s convention). Order
+// matches `vcDiags`: parse diags (lex diags first), then type diags, then the
+// emit failure message (positionless).
+function vcDiagMsg(i: i32): string {
+  if i < P.diags.length {
+    return P.diags[i].msg
+  }
+  let j = i - P.diags.length
+  if j < T.diags.length {
+    return T.diags[j].tmsg
+  }
+  emitErr
+}
+export function diagCount(): i32 {
+  let n = P.diags.length + T.diags.length
+  if emitErr.length > 0 {
+    n = n + 1
+  }
+  n
+}
+export function diagMsgLen(i: i32): i32 { vcDiagMsg(i).length }
+export function diagMsgAt(i: i32, j: i32): i32 { vcDiagMsg(i)[j] }
+export function diagLine(i: i32): i32 {
+  if i < P.diags.length {
+    // A lex diag (always at the front of `P.diags`) carries its own position.
+    if i < vcLexLines.length {
+      return vcLexLines[i]
+    }
+    // A parse diag is anchored at a token index; out of range ⇒ no position.
+    let at = P.diags[i].at
+    if at >= 0 && at < P.toks.length {
+      return P.toks[at].line
+    }
+    return 0
+  }
+  let j = i - P.diags.length
+  if j < T.diags.length {
+    return T.diags[j].tline
+  }
+  0
+}
+export function diagCol(i: i32): i32 {
+  if i < P.diags.length {
+    if i < vcLexCols.length {
+      return vcLexCols[i]
+    }
+    let at = P.diags[i].at
+    if at >= 0 && at < P.toks.length {
+      return P.toks[at].col
+    }
+    return 0
+  }
+  let j = i - P.diags.length
+  if j < T.diags.length {
+    return T.diags[j].tcol
+  }
+  0
+}
