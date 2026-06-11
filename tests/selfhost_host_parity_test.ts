@@ -9,11 +9,11 @@
 // and the documented SPEC verdict must all agree. So it catches both a native↔host
 // divergence AND a silent drift of the shared rule.
 //
-// The widening rule (B2, `numWidensName`) is "same-or-wider total bit-width":
-//   accept  i32→i64, i32→f32, i32→f64, i64→f64, f32→f64   (+ identity)
-//   reject  every narrowing (i64→f32, f64→f32, …) and any float→integer
-// i32→f32 (>2^24) and i64→f64 (>2^53) are accepted as PERMITTED LOSSY widenings
-// (same total width — Java's int→float / long→double), not lossless ones.
+// The widening rule (B2, `numWidensName`) permits only the LOSSLESS edges:
+//   accept  i32→i64, i32→f64, f32→f64   (+ identity)
+//   reject  every narrowing (i64→f32, f64→f32, …), any float→integer, AND the
+//           lossy widenings i32→f32 (>2^24) and i64→f64 (>2^53) — those need an
+//           explicit conversion (no syntax for it yet).
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built vl binary +
 // seed wasm; absent either, every case registers ignored with a build note.
@@ -47,9 +47,10 @@ const TYPES = ["i32", "i64", "f32", "f64"] as const;
 type Ty = (typeof TYPES)[number];
 const litOf = (t: Ty) => (t === "f32" || t === "f64" ? "5.0" : "5");
 
-// The documented same-or-wider widening edges (everything else off-diagonal rejects).
+// The documented LOSSLESS widening edges (everything else off-diagonal rejects,
+// including the lossy i32→f32 / i64→f64 widenings).
 const WIDENS = new Set([
-  "i32→i64", "i32→f32", "i32→f64", "i64→f64", "f32→f64",
+  "i32→i64", "i32→f64", "f32→f64",
 ]);
 
 const snippet = (from: Ty, to: Ty) =>
