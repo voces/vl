@@ -206,6 +206,37 @@ function rightAssoc(kind: string): boolean {
 }
 
 // ── type annotations ─────────────────────────────────────────────────────────
+
+// `>`s still owed by a consumed `>>` / `>>>` token. The host's lexer keeps each
+// `>` a separate token (fusing shifts only in expression position), but THIS
+// lexer fuses `>>`/`>>>` into one SHR/USHR token — so a nested generic close
+// (`Box<Pair<i32, string>>`) arrives as a single token that must close TWO
+// levels. Consuming it credits the extra `>`s here; the enclosing close(s)
+// drain the credit before reading another token.
+let pendingGt: i32 = 0
+
+// Consume one closing `>` of a generic argument list: a banked `>` from an
+// earlier `>>`/`>>>` first, else a `GT` token, else a `SHR`/`USHR` token (which
+// banks its remaining `>`s).
+function expectTypeGt(): i32 {
+  if pendingGt > 0 {
+    pendingGt = pendingGt - 1
+    return 0
+  }
+  let k = peekKind()
+  if k == "SHR" {
+    advance()                        // ">>" — one level now, one banked
+    pendingGt = 1
+    return 0
+  }
+  if k == "USHR" {
+    advance()                        // ">>>" — one level now, two banked
+    pendingGt = 2
+    return 0
+  }
+  expect("GT")
+  0
+}
 // A type-name leaf (`i32`, `string`, a user type), optionally followed by one or
 // more `[]` array suffixes (`i32[]`, `i32[][]`). Each `[]` appends the literal
 // chars to the type-name, so an array type is a `TypeRef` whose name carries the
@@ -226,6 +257,14 @@ function parseTypeName(): string {
   // union separator (vs the bitwise-OR operator in expression position). Encoded as
   // the synthetic name `"A|B"` (mirroring the `i32[]` / `{[K]:V}` synthetic names);
   // the checker splits on `|` to build the union/nullable type.
+  //
+  // The host also parses INTERSECTIONS (`A & B`), NEGATIONS (`!A`), literal
+  // types (`"a" | "b"`, `0 | 1`) and parenthesized groups here. Those stay
+  // PARSE-REJECTED in the self-host on purpose: the native checker has no
+  // literal/intersection algebra (`nameToTy` can't resolve them) and treats an
+  // unresolvable annotation PERMISSIVELY, so accepting the syntax would flip the
+  // soundness REJECT corpus (e.g. `literal-union-reject-*.vl`) from "rejected"
+  // to "wrongly accepted". Reject at parse until the checker learns the types.
   let more = peekKind() == "PIPE"
   while more {
     advance()                        // "|"
@@ -295,6 +334,28 @@ function parseTypeAtom(): string {
     name = "null"
   } else if peekKind() == "IDENT" {
     name = advance().text
+    if peekKind() == "LT" {
+      // A generic-alias APPLICATION `Box<i32>` / `Pair<i32, string>` — in TYPE
+      // position the `<` is unambiguous (no comparison can appear here). The
+      // arguments join into the synthetic name (`Box<i32>`). One trailing comma
+      // before the `>` is tolerated (`Pair<i32, i32,>`), and `>>`/`>>>` close
+      // nested applications via `expectTypeGt`.
+      advance()                      // "<"
+      name = name + "<" + parseTypeName()
+      let gmore = peekKind() == "COMMA"
+      while gmore {
+        advance()                    // ","
+        let gk = peekKind()
+        if gk == "GT" || gk == "SHR" || gk == "USHR" || pendingGt > 0 {
+          gmore = false              // trailing comma — the `>` closes the list
+        } else {
+          name = name + "," + parseTypeName()
+          gmore = peekKind() == "COMMA"
+        }
+      }
+      expectTypeGt()                 // ">"
+      name = name + ">"
+    }
   } else {
     expect("IDENT")
   }
@@ -340,6 +401,12 @@ function parsePrimary(): i32 {
     // FuncDecl in expression position (name ""), with the same optional-generic /
     // param / return / bare-or-braced-body shape as a declaration.
     return parseFuncExpr()
+  }
+  if k == "IF" {
+    // `if` as an EXPRESSION (`print(if a > b then a else b)`) — the host's
+    // `parsePrimary` dispatches `IF` to `parseIf` in expression position; the
+    // same If node serves as statement and expression downstream.
+    return parseIf()
   }
   if k == "IDENT" {
     return mkIdent(advance().text)
@@ -398,9 +465,13 @@ function parseArgs(): i32[] {
 }
 
 // An object literal `{ name: value, ... }`, the cursor on the leading `{`. Each
-// field is `IDENT ":" expr`, comma-separated (a trailing comma is tolerated).
-// Returns an `ObjLit` whose `objFields` are the `FieldInit` node indices in source
-// order — the emitter relies on that order to bind values to the declared fields.
+// field is `IDENT ":" expr`, a STRING key `"+": expr` (operator / index-trap
+// fields — the key is the decoded string, quotes stripped), a method shorthand
+// `add(a, b) { … }` (sugar for `add: function(a, b) { … }`, mirroring the host's
+// `parsePair`), or a bare-IDENT shorthand `{ x }` (→ `x: x`). Fields are
+// comma-separated (a trailing comma is tolerated). Returns an `ObjLit` whose
+// `objFields` are the `FieldInit` node indices in source order — the emitter
+// relies on that order to bind values to the declared fields.
 function parseObjLit(): i32 {
   expect("LBRACE")
   // An object literal may span several source lines (`{` NEWLINE `k: v,` NEWLINE
@@ -412,13 +483,35 @@ function parseObjLit(): i32 {
   let going = peekKind() != "RBRACE"
   while going {
     let name = ""
+    let stringKey = false
     if peekKind() == "IDENT" {
       name = advance().text
+    } else if peekKind() == "STRING" {
+      // A STRING key (`"+": fn`, `"[]": fn`) names an operator / index-trap
+      // field. The host uses the lexer-decoded value so the key matches the
+      // operator lexeme; those keys carry no escapes, so stripping the quotes
+      // is equivalent.
+      let raw = advance().text
+      name = raw.slice(1, raw.length - 1)
+      stringKey = true
     } else {
       expect("IDENT")
     }
-    expect("COLON")
-    let value = parseExpr()
+    let value = -1
+    if !stringKey && peekKind() == "LPAREN" {
+      // Method shorthand `add(a, b) { … }` — a `(` directly after the IDENT key
+      // (no `:`) marks it; the value is an anonymous function whose params /
+      // return / body parse exactly as a lambda's (the host parses it via
+      // `parseFunctionDeclaration` from the key token).
+      let mtps: string[] = []
+      value = parseFuncTail("", mtps)
+    } else if !stringKey && peekKind() != "COLON" {
+      // Bare-IDENT shorthand `{ x }` → `{ x: x }` (the host's `parsePair` fallback).
+      value = mkIdent(name)
+    } else {
+      expect("COLON")
+      value = parseExpr()
+    }
     fields.push(mkFieldInit(name, value))
     skipNewlines()
     if peekKind() == "COMMA" {
@@ -551,18 +644,32 @@ function parseUnary(): i32 {
   }
   let node = parsePostfix()
   let pk = peekKind()
+  // `x is T` / `x !is T` — the RHS is a TYPE, not an expression (host: `parseType`
+  // after the `is`), so `x is {x: i32}`, `x is A | B` and `x is null` all parse.
+  // `!is` (the negated guard, two tokens `!` `is`) inverts the boolean: it
+  // desugars to `!(x is T)`, which the checker's narrowing already understands
+  // (a `Unary "!"` contributes the inverted branch's narrowings).
   if pk == "IS" {
     advance()                        // "is"
-    let vname = ""
-    let vk = peekKind()
-    if vk == "IDENT" {
-      vname = advance().text
-    } else {
-      expect("IDENT")
-    }
-    return mkIsExpr(node, vname)
+    return mkIsExpr(node, parseIsType())
+  }
+  if pk == "BANG" && kindAt(P.pos + 1) == "IS" {
+    advance()                        // "!"
+    advance()                        // "is"
+    return mkUnary("!", mkIsExpr(node, parseIsType()))
   }
   node
+}
+
+// The TYPE on the right of `is` / `!is`, as the synthetic NAME string the
+// checker resolves with `nameToTy`. `null` is its own one-token type; anything
+// else is a full annotation (`parseTypeName`: names, inline objects, unions, …).
+function parseIsType(): string {
+  if peekKind() == "NULL" {
+    advance()
+    return "null"
+  }
+  parseTypeName()
 }
 
 // Precedence climbing from `minPrec`, seeded by an already-parsed `left`.
@@ -638,19 +745,43 @@ function parseTypeDecl(): i32 {
   } else {
     expect("IDENT")
   }
+  // Generic alias parameters `type Box<T> = …` (A10 stage 3). The parameter
+  // names fold into the DECLARED name (`Box<T>`) — the native checker has no
+  // alias-substitution algebra yet, so an applied `Box<i32>` resolves to
+  // "unknown type" (a type-reject, not a parse-reject), matching the grammar
+  // the host accepts.
+  if peekKind() == "LT" {
+    advance()                      // "<"
+    name = name + "<"
+    let tfirst = true
+    let tgoing = peekKind() == "IDENT"
+    while tgoing {
+      if !tfirst {
+        name = name + ","
+      }
+      name = name + advance().text
+      tfirst = false
+      if peekKind() == "COMMA" {
+        advance()
+        tgoing = peekKind() == "IDENT"
+      } else {
+        tgoing = false
+      }
+    }
+    expect("GT")                   // ">"
+    name = name + ">"
+  }
   expect("EQUAL")
   // `type N = A | B | C` — a discriminated-union ALIAS (the RHS is a type name, not
-  // a `{`). Parse the `IDENT (PIPE IDENT)*` member list into a `UnionDecl`. A
-  // single bare name `type N = A` (no `|`) is also accepted as a one-member union.
+  // a `{`). Parse the `member (PIPE member)*` list into a `UnionDecl` — a member
+  // is an intersection chain of atoms (bare names, literal types: `type T = "a" |
+  // "b"`, inline objects). A single bare name `type N = A` (no `|`) is also
+  // accepted as a one-member union. (A compound `{ … } & { … }` RHS — host A3 —
+  // stays parse-rejected with the other intersection syntax; see `parseTypeName`.)
   let afterEq = peekKind()
   if afterEq != "LBRACE" {
     let variants: string[] = []
-    let vk = peekKind()
-    if vk == "IDENT" {
-      variants.push(advance().text)
-    } else {
-      expect("IDENT")
-    }
+    variants.push(parseTypeAtom())
     // A multiline union puts each `|` on its own line, so a NEWLINE may precede
     // the next `|` — skip newlines before testing for the pipe.
     skipNewlines()
@@ -658,12 +789,7 @@ function parseTypeDecl(): i32 {
     while more {
       advance()                      // "|"
       skipNewlines()                 // and after it, before the variant name
-      let nk = peekKind()
-      if nk == "IDENT" {
-        variants.push(advance().text)
-      } else {
-        expect("IDENT")
-      }
+      variants.push(parseTypeAtom())
       skipNewlines()
       more = peekKind() == "PIPE"
     }
@@ -711,89 +837,17 @@ function parseParam(): i32 {
   mkParam(name, ty)
 }
 
-// `"function" IDENT "(" params? ")" (":" type)? block`
-// A function EXPRESSION: like `parseFunc` but the name is optional (anonymous
-// lambdas are the norm: `xs.map(function(n: i32) n * 2)`).
-function parseFuncExpr(): i32 {
-  advance()                        // "function"
-  let name = ""
-  if peekKind() == "IDENT" {
-    name = advance().text
-  }
-  let typarams: string[] = []
-  if peekKind() == "LT" {
-    advance()
-    let tgoing = peekKind() == "IDENT"
-    while tgoing {
-      typarams.push(advance().text)
-      if peekKind() == "COMMA" {
-        advance()
-        tgoing = peekKind() == "IDENT"
-      } else {
-        tgoing = false
-      }
-    }
-    expect("GT")
-  }
-  expect("LPAREN")
-  skipNewlines()
-  let params: i32[] = []
-  if peekKind() != "RPAREN" {
-    params.push(parseParam())
-    skipNewlines()
-    let more = peekKind() == "COMMA"
-    while more {
-      advance()
-      skipNewlines()
-      if peekKind() == "RPAREN" {
-        more = false
-      } else {
-        params.push(parseParam())
-        skipNewlines()
-        more = peekKind() == "COMMA"
-      }
-    }
-  }
-  expect("RPAREN")
-  let ret = -1
-  if accept("COLON") {
-    ret = parseType()
-  }
-  if peekKind() != "LBRACE" {
-    let e = parseExpr()
-    let stmts: i32[] = []
-    stmts.push(e)
-    return mkFunc(name, typarams, params, ret, mkBlock(stmts))
-  }
-  let body = parseBlock()
-  mkFunc(name, typarams, params, ret, body)
-}
-
-function parseFunc(): i32 {
-  advance()                        // "function"
-  let name = ""
-  if peekKind() == "IDENT" {
-    name = advance().text
-  } else {
-    expect("IDENT")
-  }
-  // Generic type parameters `<T, U>` (declaration position only — no ambiguity
-  // with the `<` comparison operator here). Names collected for the checker.
-  let typarams: string[] = []
-  if peekKind() == "LT" {
-    advance()                      // "<"
-    let tgoing = peekKind() == "IDENT"
-    while tgoing {
-      typarams.push(advance().text)
-      if peekKind() == "COMMA" {
-        advance()
-        tgoing = peekKind() == "IDENT"
-      } else {
-        tgoing = false
-      }
-    }
-    expect("GT")                   // ">"
-  }
+// The shared tail of every function form — the cursor on the `(` of the param
+// list. Parses `"(" params? ")" (":" type)? body` and builds the `FuncDecl`.
+// The body is:
+//   • a bare EXPRESSION (no `{`) — implicit return, wrapped in a one-stmt Block;
+//   • empty braces `{}` — a BLOCK (a void function), never an empty object
+//     (mirrors the host's `emptyBraces` special case);
+//   • braces that shape up as an object literal (`function makePoint() { x: 3 }`)
+//     — an object-literal EXPRESSION body (implicit return), decided by
+//     `looksLikeObject` exactly as the host's `parseStatement` path does;
+//   • otherwise a braced statement BLOCK.
+function parseFuncTail(name: string, typarams: string[]): i32 {
   expect("LPAREN")
   // A function signature may span several source lines (`function f(` NEWLINE
   // `a: T,` NEWLINE `b: U` NEWLINE `)`). Mirror the host's `parseParams`: skip
@@ -826,20 +880,95 @@ function parseFunc(): i32 {
   // A BARE-EXPRESSION body (`function dbl(x: i32) x * 2`): no `{` after the
   // signature means the body is a single expression with an implicit return —
   // wrapped in a synthetic one-statement Block so downstream passes see the same
-  // shape as a braced trailing-expression body.
+  // shape as a braced trailing-expression body. An OBJECT-LITERAL body
+  // (`function makePoint() { x: 3, y: 4 }`) is the same implicit-return shape:
+  // the `{` opens an expression, not a block — but EMPTY braces `{}` stay a
+  // block (a void function), matching the host's tie-break.
   if peekKind() != "LBRACE" {
     let e = parseExpr()
     let stmts: i32[] = []
     stmts.push(e)
     return mkFunc(name, typarams, params, ret, mkBlock(stmts))
   }
+  let scan = P.pos + 1
+  let snl = kindAt(scan) == "NEWLINE"
+  while snl {
+    scan = scan + 1
+    snl = kindAt(scan) == "NEWLINE"
+  }
+  let emptyBraces = kindAt(scan) == "RBRACE"
+  if !emptyBraces && looksLikeObject(P.pos) {
+    let oe = parseExpr()
+    let ostmts: i32[] = []
+    ostmts.push(oe)
+    return mkFunc(name, typarams, params, ret, mkBlock(ostmts))
+  }
   let body = parseBlock()
   mkFunc(name, typarams, params, ret, body)
 }
 
-// `"if" expr block ("else" (ifStmt | block))?`
+// The operator tokens a FUNCTION NAME may be (`function +(self, b)` — a free
+// operator function; `a + b` on user objects dispatches to it). Mirrors the
+// host's `OPERATOR_FUNC_NAMES` set (DIV/MOD/comparisons under this lexer's kinds).
+function isOpFuncName(kind: string): boolean {
+  kind == "PLUS" || kind == "MINUS" || kind == "STAR" || kind == "SLASH" ||
+    kind == "PERCENT" || kind == "CARET" || kind == "GT" || kind == "GE" ||
+    kind == "LT" || kind == "LE" || kind == "EQ" || kind == "NE"
+}
+
+// `"function" IDENT? "<" typarams? ">" …tail` — the shared head of the two
+// `function`-keyword forms: an optional name (an identifier or an operator
+// symbol; required for a declaration, optional for an expression), optional
+// generic type parameters, then the common `parseFuncTail`.
+function parseFuncHead(requireName: boolean): i32 {
+  advance()                        // "function"
+  let name = ""
+  if peekKind() == "IDENT" {
+    name = advance().text
+  } else if isOpFuncName(peekKind()) {
+    // An operator-symbol name (`function +(self, b)`); checked AFTER the IDENT
+    // case, so `function <(a, b)` reads the `<` as the name (host order).
+    name = advance().text
+  } else if requireName {
+    expect("IDENT")
+  }
+  // Generic type parameters `<T, U>` (declaration position only — no ambiguity
+  // with the `<` comparison operator here). Names collected for the checker.
+  let typarams: string[] = []
+  if peekKind() == "LT" {
+    advance()                      // "<"
+    let tgoing = peekKind() == "IDENT"
+    while tgoing {
+      typarams.push(advance().text)
+      if peekKind() == "COMMA" {
+        advance()
+        tgoing = peekKind() == "IDENT"
+      } else {
+        tgoing = false
+      }
+    }
+    expect("GT")                   // ">"
+  }
+  parseFuncTail(name, typarams)
+}
+
+// `"function" IDENT "(" params? ")" (":" type)? block`
+// A function EXPRESSION: like `parseFunc` but the name is optional (anonymous
+// lambdas are the norm: `xs.map(function(n: i32) n * 2)`).
+function parseFuncExpr(): i32 {
+  parseFuncHead(false)
+}
+
+function parseFunc(): i32 {
+  parseFuncHead(true)
+}
+
+// `"if" expr (block | "then" stmt) (("elseif" …) | "else" (ifStmt | block | stmt))?`
+// Serves statement AND expression position (the host's `parseIf` is reached from
+// `parsePrimary`); a non-block branch wraps in a one-statement Block so every
+// branch downstream is a Block / If.
 function parseIf(): i32 {
-  advance()                        // "if"
+  advance()                        // "if" (or a chained "elseif" — same shape)
   let cond = parseExpr()
   // `if cond then <stmt>` — the single-statement sugar (host: soft keyword
   // `then`); the one statement wraps as the then-block.
@@ -853,23 +982,50 @@ function parseIf(): i32 {
     thenB = parseBlock()
   }
   let els = -1
-  // The `else` may sit on a new line after the then-block's `}` (`}` NEWLINE
-  // `else {`). Mirror the host: scan PAST any NEWLINEs to look for `else`, but
-  // only CONSUME them if an `else` actually follows — a trailing block whose `}`
-  // is merely followed by a newline (no else) must leave the cursor on that
-  // newline so the enclosing statement loop sees the next statement.
+  // The `else` / `elseif` may sit on a new line after the then-block's `}` (`}`
+  // NEWLINE `else {`). Mirror the host: scan PAST any NEWLINEs to look for it,
+  // but only CONSUME them if an `else`/`elseif` actually follows — a trailing
+  // block whose `}` is merely followed by a newline (no else) must leave the
+  // cursor on that newline so the enclosing statement loop sees the next
+  // statement.
   let look = P.pos
   let scanning = kindAt(look) == "NEWLINE" || kindAt(look) == "SEMI"
   while scanning {
     look = look + 1
     scanning = kindAt(look) == "NEWLINE" || kindAt(look) == "SEMI"
   }
-  if kindAt(look) == "ELSE" {
+  if kindAt(look) == "ELSEIF" {
+    // `elseif cond …` — chains exactly like `else if`: the next conditional
+    // becomes this if's else-branch (the `elseif` token is consumed by the
+    // recursive `parseIf` in place of an `if`).
+    P.pos = look
+    els = parseIf()
+  } else if kindAt(look) == "ELSE" {
     P.pos = look + 1                  // consume the skipped newlines and the `else`
+    // An `else {`-brace is a BLOCK unless it shapes up as an object literal —
+    // and EMPTY braces (`else {}`) stay a block (the same tie-break as a
+    // function body: `looksLikeObject` calls `{}` an object, which here would
+    // synthesize a spurious `{}` expression).
+    let ebraceBlock = false
+    if peekKind() == "LBRACE" {
+      let escan = P.pos + 1
+      let enl = kindAt(escan) == "NEWLINE"
+      while enl {
+        escan = escan + 1
+        enl = kindAt(escan) == "NEWLINE"
+      }
+      ebraceBlock = kindAt(escan) == "RBRACE" || !looksLikeObject(P.pos)
+    }
     if peekKind() == "IF" {
       els = parseIf()
-    } else {
+    } else if ebraceBlock {
       els = parseBlock()
+    } else {
+      // `else <stmt>` — the single-statement form (`if b then 5 else 6`); the
+      // one statement (host: `parseStatement`) wraps as the else-block.
+      let eone: i32[] = []
+      eone.push(parseStmt())
+      els = mkBlock(eone)
     }
   }
   mkIf(cond, thenB, els)
@@ -980,10 +1136,13 @@ function isStmtKeyword(kind: string): boolean {
 //   • `}`            ⇒ object  (empty `{}`, ANTLR order)
 //   • a stmt keyword ⇒ block
 //   • IDENT then (past newlines) `:` / `,` / `}`  ⇒ object
+//   • IDENT then a balanced `( … )` then (past an optional `: type`) `{` ⇒ object
+//     (method shorthand `{ add(a,b){…} }` — distinguishes it from a block whose
+//     first statement is a call like `{ foo() }`)
 //   • STRING then (past newlines) `:`             ⇒ object
 //   • otherwise      ⇒ block
-// (The host's method-shorthand `{ f(){…} }` and computed-key `{ [e]: v }` forms
-// don't occur in the self-host sources, so they're omitted here.)
+// (The host's computed-key `{ [e]: v }` form doesn't occur in the self-host
+// sources, so it's omitted here.)
 function looksLikeObject(bracePos: i32): boolean {
   let i = bracePos + 1
   let going = kindAt(i) == "NEWLINE"
@@ -1009,7 +1168,58 @@ function looksLikeObject(bracePos: i32): boolean {
     if first == "STRING" {
       return nk == "COLON"
     }
-    return nk == "COLON" || nk == "COMMA" || nk == "RBRACE"
+    if nk == "COLON" || nk == "COMMA" || nk == "RBRACE" {
+      return true
+    }
+    // Method shorthand `{ add(a,b){…} }`: an IDENT directly followed by a
+    // balanced `( … )` and then a `{` body. An optional return annotation
+    // `add(a): T { … }` is scanned past with `{`/`[`/`(` depth tracking so an
+    // object/array type in the annotation doesn't swallow the body brace.
+    if nk == "LPAREN" {
+      let depth = 0
+      let k = j
+      let scanning = true
+      while scanning {
+        let t = kindAt(k)
+        if t == "LPAREN" {
+          depth = depth + 1
+        } else if t == "RPAREN" {
+          depth = depth - 1
+        } else if t == "EOF" {
+          return false
+        }
+        k = k + 1
+        scanning = depth > 0
+      }
+      let g2 = kindAt(k) == "NEWLINE"
+      while g2 {
+        k = k + 1
+        g2 = kindAt(k) == "NEWLINE"
+      }
+      if kindAt(k) == "COLON" {
+        k = k + 1
+        let d = 0
+        let tscan = true
+        while tscan {
+          let t2 = kindAt(k)
+          if t2 == "EOF" {
+            return false
+          }
+          if d == 0 && t2 == "LBRACE" {
+            tscan = false
+          } else {
+            if t2 == "LBRACE" || t2 == "LBRACK" || t2 == "LPAREN" {
+              d = d + 1
+            } else if t2 == "RBRACE" || t2 == "RBRACK" || t2 == "RPAREN" {
+              d = d - 1
+            }
+            k = k + 1
+          }
+        }
+      }
+      return kindAt(k) == "LBRACE"
+    }
+    return false
   }
   false
 }
