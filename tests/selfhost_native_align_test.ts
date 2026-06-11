@@ -159,6 +159,7 @@ const RUN_CASES = [
   "lists/build-fusion-cw-seeded.vl",
   "lists/build-fusion-cw-step2.vl",
   "lists/build-fusion-empty-count.vl",
+  "lists/build-fusion-f64.vl",
   "lists/build-fusion-range.vl",
   "lists/build-fusion-ref.vl",
   "lists/build-fusion-seeded.vl",
