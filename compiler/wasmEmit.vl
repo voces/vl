@@ -12558,6 +12558,11 @@ function globalCellKind(letIx: i32): i32 {
       if letIsStringArray(letIx, 0 - 1) { return 7 }
       if letIsRefArray(letIx, 0 - 1) { return 5 }
       if letIsF64Array(letIx, 0 - 1) { return 12 }
+      // A UNION-annotated global cell is the box ref (kind 4), exactly as
+      // `buildLocals` classifies a union local — BEFORE the struct/string cases
+      // (a `string | i32` annotation is neither). `S | null` / `boolean | null`
+      // never register as union names (they keep their niche kinds above).
+      if letIsUnion(letIx, 0 - 1) { return 4 }
       if letIsStruct(letIx, 0 - 1) { return 1 }
       if letIsArray(letIx, 0 - 1) { return 2 }
       if letIsString(letIx, 0 - 1) { return 3 }
@@ -12570,6 +12575,9 @@ function globalCellKind(letIx: i32): i32 {
     // out of scope (no annotation to derive from) and `globalKind` returns its best guess.
     // An empty `[]` whose PUSHES infer a string element is the string list (kind 7).
     if letInfStrListByUse(letIx) { return 7 }
+    // An un-annotated global whose init PRODUCES a union (`const a = make(42)` with
+    // a union-returning `make`) carries the box (kind 4), as a local would.
+    if letIsUnion(letIx, 0 - 1) { return 4 }
     return globalKind(d.letInit)
   }
   0
@@ -13312,7 +13320,16 @@ function emitStartFnCode(out: i32[]): i32 {
             if gck == 6 { pendingMapSlot = letMapShapeOf(globalStmts[gi], 0 - 1) }
             // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2.
             pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
-            if emitExpr(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+            // A UNION cell (kind 4) coerces a raw init value into the box
+            // (`let w: string | i32 = n` boxes the i32 read) — a union-valued
+            // init (a union-returning call) passes through unchanged.
+            let gun = ""
+            if gck == 4 { gun = letUnionNameOf(globalStmts[gi], 0 - 1) }
+            if gun != "" {
+              if emitUnionCoerce(bodyExpr, gun, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+            } else {
+              if emitExpr(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+            }
             pendingNulBool = false
             pendingMapSlot = 0 - 1
           }
@@ -14083,7 +14100,16 @@ function emitModule(stmts: i32[]): i32 {
           pendingI64 = (gck == 10)
           pendingF32 = (gck == 13)
           pendingF64 = (gck == 11)
-          if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
+          // A UNION cell (kind 4) with a CONST init boxes it in the constexpr —
+          // `struct.new` / `array.new_fixed` / `i32.const` are all constant in
+          // WasmGC, so `let w: string | i32 = "a"` builds the box inline.
+          let gun2 = ""
+          if gck == 4 { gun2 = letUnionNameOf(globalStmts[gi], 0 - 1) }
+          if gun2 != "" {
+            if emitUnionCoerce(globalPayload, gun2, g.letInit, 0 - 1) < 0 { return 0 - 1 }
+          } else {
+            if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
+          }
           pendingI64 = false
           pendingF32 = false
           pendingF64 = false
