@@ -208,6 +208,12 @@ let asgDstStack: i32[] = []
 // shape would otherwise render forever — past a fixed depth it prints `…`.
 let tyToStrDepth: i32 = 0
 
+// Places already union-SUBTRACTED by a post-guard fall-through in the current
+// scope (one subtraction per place per block — see the guard-clause comment in
+// the IfStmt arm), with per-scope frame marks like the path overlay's.
+let pgKeys: string[] = []
+let pgFrames: i32[] = []
+
 // Record an un-annotated empty-collection binding for the deferred scope-close check.
 function notePending(name: string, ty: i32, at: i32): i32 {
   pendNames.push(name)
@@ -595,6 +601,8 @@ export function initChecker(): i32 {
   asgSrcStack = []
   asgDstStack = []
   tyToStrDepth = 0
+  pgKeys = []
+  pgFrames = []
   0
 }
 
@@ -1012,6 +1020,7 @@ function pushScope(): i32 {
   T.scopes.push(Map())
   constScopes.push(Map())
   npFrames.push(npKeys.length)
+  pgFrames.push(pgKeys.length)
   0
 }
 
@@ -1028,6 +1037,13 @@ function popScope(): i32 {
     while npKeys.length > base {
       npKeys.pop()
       npTys.pop()
+    }
+  }
+  if pgFrames.length > 0 {
+    let pbase = pgFrames[pgFrames.length - 1]
+    pgFrames.pop()
+    while pgKeys.length > pbase {
+      pgKeys.pop()
     }
   }
   0
@@ -1227,10 +1243,40 @@ function isFloatLitExpr(ix: i32): boolean {
 // `assignable` lattice, PLUS the float-literal→f32 exception (`isFloatLitExpr`). Used
 // where the SOURCE EXPRESSION node is in hand (so the literal can be recognized);
 // type-only sites keep using `assignable`.
+// The least upper bound used by `??` (host: `flatten(Union(nonNull(l), r))`):
+// mutually-assignable types collapse to the wider; otherwise a two-member union.
+function joinTys(a: i32, b: i32): i32 {
+  if a < 0 { return b }
+  if b < 0 { return a }
+  if assignable(b, a) { return a }
+  if assignable(a, b) { return b }
+  let ms: i32[] = []
+  ms.push(a)
+  ms.push(b)
+  mkUnionTy(ms)
+}
+
+// Whether the expression is a bare `true`/`false` literal (through parens) —
+// excluded from the A7 boolean→i32 value coercion (a literal in an i32 slot is
+// more likely a mistake; write `1`/`0`).
+function isBoolLitExpr(ix: i32): boolean {
+  if ix < 0 { return false }
+  let e = P.nodes[ix]
+  if e is Paren { return isBoolLitExpr(e.parInner) }
+  if e is BoolLit { return true }
+  false
+}
+
 function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if assignable(srcTy, dstTy) { return true }
   if primNameOf(dstTy) == "f32" {
     if isFloatLitExpr(srcExpr) { return true }
+  }
+  // `boolean`-where-`i32`-expected coercion (A7): a boolean-typed VALUE flows
+  // into an i32 slot as 1/0 (a no-op in codegen — boolean rides in an i32).
+  // One-directional, and a bare `true`/`false` LITERAL is excluded.
+  if primNameOf(dstTy) == "i32" {
+    if primNameOf(srcTy) == "bool" && !isBoolLitExpr(srcExpr) { return true }
   }
   false
 }
@@ -2262,7 +2308,7 @@ function checkCallNode(n: Call, ix: i32): i32 {
       // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
       // clearing its uninferred floor — pure downstream-usage inference, no push.
       constrainEmpty(at, expected)
-      if !assignable(at, expected) {
+      if !assignableExpr(args[i], at, expected) {
         tErr("argument " + i32ToStr(i + 1) + ": expected " +
           tyToStr(expected) + ", got " + tyToStr(at), ix)
       }
@@ -2774,16 +2820,25 @@ function checkProgramNode(n: Program): i32 {
         if pt is TyUnion {
           let members = pt.uMembers
           let variants = sd.udVariants
-          let vi = 0
-          while vi < variants.length {
-            let m = nameToTy(variants[vi])
-            if m >= 0 {
-              members.push(m)
-            } else {
-              tErr("unknown type '" + variants[vi] + "' in union '" +
-                sd.udName + "'", stmts[ti])
+          // A DEGENERATE self-cycle — `type D = D`, a body that is nothing but
+          // the alias itself — has no base case, so nothing can inhabit it.
+          // Reported at the DECLARATION (host parser parity), so an UNUSED
+          // `type D = D` still flags; the members stay empty (host: `Never`).
+          if variants.length == 1 && variants[0] == sd.udName {
+            tErr("Type `" + sd.udName + "` is defined in terms of itself " +
+              "with no base type, so it can never have a value", stmts[ti])
+          } else {
+            let vi = 0
+            while vi < variants.length {
+              let m = nameToTy(variants[vi])
+              if m >= 0 {
+                members.push(m)
+              } else {
+                tErr("unknown type '" + variants[vi] + "' in union '" +
+                  sd.udName + "'", stmts[ti])
+              }
+              vi = vi + 1
             }
-            vi = vi + 1
           }
         }
       }
@@ -3009,16 +3064,14 @@ function checkNode(ix: i32): i32 {
       // DECISIONS: assignment-as-expression).
       return rt
     }
-    // Nullish coalescing: `a ?? d` strips `a`'s nullability; the default must be
-    // assignable to the inner type. A non-nullable LHS just yields itself.
+    // Nullish coalescing: `a ?? d` — the result is `a`'s NON-NULL part unioned
+    // with `d`'s type (host `NullCoalesce`: `a ?? b` with a nullable `b` stays
+    // nullable; a non-null default collapses to the inner type). A non-nullable
+    // LHS just yields itself.
     if op == "??" {
       let lt2 = T.tys[lt]
       if lt2 is TyNullable {
-        let inner = lt2.nInner
-        if !assignable(rt, inner) {
-          tErr("?? default: expected " + tyToStr(inner) + ", got " + tyToStr(rt), ix)
-        }
-        return inner
+        return joinTys(lt2.nInner, rt)
       }
       return lt
     }
@@ -3068,6 +3121,20 @@ function checkNode(ix: i32): i32 {
     if op == "+" {
       if assignable(lt, TY_STR) && assignable(rt, TY_STR) {
         return TY_STR
+      }
+      // List concat `a + b` → a new `T[]` (collections-design §VL.4); the two
+      // element types must agree (an empty `[]` adopts the other side's).
+      let lta = T.tys[lt]
+      if lta is TyArray {
+        let rta = T.tys[rt]
+        if rta is TyArray {
+          constrainEmpty(rt, lt)
+          constrainEmpty(lt, rt)
+          if assignable(rt, lt) { return lt }
+          if assignable(lt, rt) { return rt }
+          tErr("cannot concat " + tyToStr(lt) + " and " + tyToStr(rt), ix)
+          return TY_ERR
+        }
       }
     }
     // Remaining arithmetic: numeric-only, both the SAME numeric type (no implicit
@@ -3585,7 +3652,14 @@ function checkNode(ix: i32): i32 {
     }
     // GUARD CLAUSE: a THEN that always exits applies the FALSE narrowings to
     // the rest of the enclosing block (`if x == null { return } … x.f …`).
-    if enNames.length > 0 {
+    // Host `postGuardNarrowings` parity: only a SINGLE-arm `if` with NO `else`
+    // (an `else`/`else if` chain does not post-narrow the fall-through), and
+    // only ONE union SUBTRACTION per place per block — the host checker accepts
+    // a twice-subtracted residual but both codegens reject it
+    // (xfail-seq-guard-residual-codegen), so the front end keeps rejecting the
+    // second subtraction. Null-STRIPS always apply (guard sequences rely on
+    // them). Path-keyed entries unwind at the ENCLOSING scope's `popScope`.
+    if enNames.length > 0 && !daHasElse {
       let tn2 = P.nodes[n.ifThen]
       if tn2 is Block {
         let tst = tn2.blkStmts
@@ -3600,9 +3674,29 @@ function checkNode(ix: i32): i32 {
             diverges = true
           }
           if diverges {
-            // Path-keyed entries pushed here unwind at the ENCLOSING scope's
-            // `popScope` — exactly the region where the guard holds.
-            applyNarrows(enNames, enTys)
+            let gi2 = 0
+            while gi2 < enNames.length {
+              let gKey = enNames[gi2]
+              let gTy = enTys[gi2]
+              if isPathKey(gKey) {
+                npKeys.push(gKey)
+                npTys.push(gTy)
+              } else if gTy == nonNullTy(lookup(gKey)) {
+                declare(gKey, gTy)
+              } else {
+                let gSeen = false
+                let gj = 0
+                while gj < pgKeys.length {
+                  if pgKeys[gj] == gKey { gSeen = true }
+                  gj = gj + 1
+                }
+                if !gSeen {
+                  pgKeys.push(gKey)
+                  declare(gKey, gTy)
+                }
+              }
+              gi2 = gi2 + 1
+            }
           }
         }
       }
@@ -3628,7 +3722,7 @@ function checkNode(ix: i32): i32 {
     // An explicit `return inner` of an empty collection pins its element from the
     // declared return type — usage-driven inference clearing the floor.
     constrainEmpty(got, want)
-    if want >= 0 && !assignable(got, want) {
+    if want >= 0 && !assignableExpr(n.retArg, got, want) {
       tErr("return type mismatch: expected " + tyToStr(want) + ", got " +
         tyToStr(got), ix)
     }

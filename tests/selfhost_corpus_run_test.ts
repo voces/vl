@@ -209,6 +209,7 @@ const WHITELIST = [
   "tostring/nested-if.vl",
   "tostring/nested-loop.vl",
   "tostring/numbers.vl",
+  "types/boolean-to-i32.vl",
   "types/literal-narrowing.vl",
   "types/or-guard-narrowing.vl",
   "types/recursive-array-element.vl",
