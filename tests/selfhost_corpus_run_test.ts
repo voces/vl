@@ -430,6 +430,14 @@ function loadToks(src: string): i32 {
     P.toks.push({ kind: t.kind, text: t.text, pos: i, start: t.start, line: t.line, col: t.col })
     i = i + 1
   }
+  // Fold lexer diagnostics into the parse-stage store (mirrors the production
+  // driver's vcLoadToks + the host's checkOnly): a LEX error like an empty \`''\`
+  // or multi-char \`'ab'\` char literal becomes a parse-stage rejection.
+  let d = 0
+  while d < r.diags.length {
+    P.diags.push({ msg: r.diags[d].msg, at: 0 })
+    d = d + 1
+  }
   P.toks.length
 }
 function srcOf(idx: i32): string {
