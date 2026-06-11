@@ -7167,100 +7167,104 @@ function emitStructEqRec(body: i32[], lRoot: i32, rRoot: i32, si: i32, pathSi: i
   0
 }
 
-// Compare ONE field at (si, fi) across the two chains, leaving 0/1.
+// Compare ONE field at (si, fi) across the two chains, leaving 0/1. The path
+// push/pop frames the inner compare so chains rewind for the next sibling field.
 function emitStructEqField(body: i32[], lRoot: i32, rRoot: i32, si: i32, fi: i32, pathSi: i32[], pathFi: i32[], fnIx: i32): i32 {
-  let code = sFieldTypeAt(si, fi)
   pathSi.push(si)
   pathFi.push(fi)
-  let r = 0
+  let r = emitStructEqFieldInner(body, lRoot, rRoot, si, fi, pathSi, pathFi, fnIx)
+  pathSi.pop()
+  pathFi.pop()
+  r
+}
+
+function emitStructEqFieldInner(body: i32[], lRoot: i32, rRoot: i32, si: i32, fi: i32, pathSi: i32[], pathFi: i32[], fnIx: i32): i32 {
+  let code = sFieldTypeAt(si, fi)
   if code == 0 {
     // Scalar (i32 / boolean): a native compare.
-    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { r = 0 - 1 }
-    if r == 0 { if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { r = 0 - 1 } }
-    if r == 0 { fbI32Bin(70) }   // 0x46 i32.eq
-  } else if code == 3 {
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbI32Bin(70)               // 0x46 i32.eq
+    return 0
+  }
+  if code == 3 {
     // String: the element-wise string-eq loop over the two field refs.
     if !aUsed {
-      r = emitFail("emitProgram: string field equality but array type not collected")
+      return emitFail("emitProgram: string field equality but array type not collected")
     }
-    if r == 0 { if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { r = 0 - 1 } }
-    if r == 0 { if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { r = 0 - 1 } }
-    if r == 0 { if emitStrEqCore(body) < 0 { r = 0 - 1 } }
-  } else if code == 15 {
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    return emitStrEqCore(body)
+  }
+  if code == 15 {
     // Nested struct: recurse one level deeper along the chain.
     let nsi = structIndexByName(sFieldElemNameAt(si, fi))
     if nsi < 0 {
-      r = emitFail("emitProgram: nested struct field equality with no interned shape")
-    } else {
-      if emitStructEqRec(body, lRoot, rRoot, nsi, pathSi, pathFi, fnIx) < 0 { r = 0 - 1 }
+      return emitFail("emitProgram: nested struct field equality with no interned shape")
     }
-  } else if code == 4 {
+    return emitStructEqRec(body, lRoot, rRoot, nsi, pathSi, pathFi, fnIx)
+  }
+  if code == 4 {
     // `i32[]` list: lengths equal AND element-wise equal — `len` from the WRAPPER
     // (field 1, the logical size; the backing may be longer), elements off the
     // backings (stashed in the string-op frame refs, the same `(array i32)` type).
     if !lUsed {
-      r = emitFail("emitProgram: i32[] field equality but list type not collected")
+      return emitFail("emitProgram: i32[] field equality but list type not collected")
     }
-    if r == 0 {
-      // lenL != lenR → 0, else the element loop.
-      if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { r = 0 - 1 } else {
-      fbStructGet(lTypeIdx, 1)   // wrapper field 1: len
-      if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { r = 0 - 1 } else {
-      fbStructGet(lTypeIdx, 1)
-      fbI32Bin(71)               // 0x47 i32.ne
-      fbIf(127)                  // 0x04 if, 0x7f i32 blocktype
-      ctrlEnter()
-      fbI32Const(0)              // length mismatch → 0
-      fbElse()                   // 0x05 else — the element loop, like emitStrEqCore
-      // A = backing(L.f); B = backing(R.f); I0 = len; I1 = 0
-      if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { r = 0 - 1 } else {
-      fbStructGet(lTypeIdx, 0)   // backing
-      fbLocalSet(strScratchBase + 0)
-      if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { r = 0 - 1 } else {
-      fbStructGet(lTypeIdx, 0)
-      fbLocalSet(strScratchBase + 1)
-      if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { r = 0 - 1 } else {
-      fbStructGet(lTypeIdx, 1)   // len
-      setStrScrI(body, 0)
-      fbBlock(127)               // 0x02 block, 0x7f i32 — yields the 0/1 result
-      fbI32Const(0)
-      setStrScrI(body, 1)        // I1 = 0
-      fbLoop(64)                 // 0x03 loop, void
-      pushStrScrI(body, 1)
-      pushStrScrI(body, 0)
-      fbI32Bin(78)               // 0x4e i32.ge_s — done?
-      fbIf(64)                   // then: fall through (all matched)
-      fbElse()
-      pushStrScrRef(body, 0)
-      pushStrScrI(body, 1)
-      fbArrayGet(aTypeIdx)
-      pushStrScrRef(body, 1)
-      pushStrScrI(body, 1)
-      fbArrayGet(aTypeIdx)
-      fbI32Bin(71)               // 0x47 i32.ne
-      fbIf(64)                   // mismatch → 0, exit the result block
-      fbI32Const(0)
-      fbBr(3)                    // depths: if(0)·else(1)·loop(2)·block(3)
-      fbEnd()
-      pushStrScrI(body, 1)
-      fbI32Const(1)
-      fbI32Bin(106)              // i32.add
-      setStrScrI(body, 1)
-      fbBr(1)                    // continue the loop
-      fbEnd()                    // end (else's if)
-      fbEnd()                    // end (loop)
-      fbI32Const(1)              // every element matched
-      fbEnd()                    // end (result block)
-      fbEnd()                    // end (length if/else)
-      ctrlLeave()
-      }}}}}
-    }
-  } else {
-    r = emitFail("emitProgram: unsupported struct field type in equality")
+    // lenL != lenR → 0, else the element loop.
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(lTypeIdx, 1)   // wrapper field 1: len
+    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(lTypeIdx, 1)
+    fbI32Bin(71)               // 0x47 i32.ne
+    fbIf(127)                  // 0x04 if, 0x7f i32 blocktype
+    ctrlEnter()
+    fbI32Const(0)              // length mismatch → 0
+    fbElse()                   // 0x05 else — the element loop, like emitStrEqCore
+    // A = backing(L.f); B = backing(R.f); I0 = len; I1 = 0
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(lTypeIdx, 0)   // backing
+    fbLocalSet(strScratchBase + 0)
+    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(lTypeIdx, 0)
+    fbLocalSet(strScratchBase + 1)
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(lTypeIdx, 1)   // len
+    setStrScrI(body, 0)
+    fbBlock(127)               // 0x02 block, 0x7f i32 — yields the 0/1 result
+    fbI32Const(0)
+    setStrScrI(body, 1)        // I1 = 0
+    fbLoop(64)                 // 0x03 loop, void
+    pushStrScrI(body, 1)
+    pushStrScrI(body, 0)
+    fbI32Bin(78)               // 0x4e i32.ge_s — done?
+    fbIf(64)                   // then: fall through (all matched)
+    fbElse()
+    pushStrScrRef(body, 0)
+    pushStrScrI(body, 1)
+    fbArrayGet(aTypeIdx)
+    pushStrScrRef(body, 1)
+    pushStrScrI(body, 1)
+    fbArrayGet(aTypeIdx)
+    fbI32Bin(71)               // 0x47 i32.ne
+    fbIf(64)                   // mismatch → 0, exit the result block
+    fbI32Const(0)
+    fbBr(3)                    // depths: if(0)·else(1)·loop(2)·block(3)
+    fbEnd()
+    pushStrScrI(body, 1)
+    fbI32Const(1)
+    fbI32Bin(106)              // i32.add
+    setStrScrI(body, 1)
+    fbBr(1)                    // continue the loop
+    fbEnd()                    // end (else's if)
+    fbEnd()                    // end (loop)
+    fbI32Const(1)              // every element matched
+    fbEnd()                    // end (result block)
+    fbEnd()                    // end (length if/else)
+    ctrlLeave()
+    return 0
   }
-  pathSi.pop()
-  pathFi.pop()
-  r
+  emitFail("emitProgram: unsupported struct field type in equality")
 }
 
 // Emit `clamp(idx, len)` where `idx` is in i32 temp `idxSlot` and `len` in temp
