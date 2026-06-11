@@ -340,6 +340,52 @@ function wSLEB64(hi: i32, lo: i32): i32 {
   }
   0
 }
+// Does the non-negative integer LEXEME `t` (a `NumLit.numText`: decimal / hex /
+// binary / octal, `_` separators skipped) fit the i32 range [0, 2147483647]?
+// Mirrors the checker's `intLexemeFitsI32` (the host `defaultIntegerType`
+// magnitude rule): a literal past the bound is TYPED i64, so it must lower as
+// `i64.const` — `i32.const` would silently wrap (0xDEAD_BEEF). The lexeme never
+// carries a sign (unary minus is a separate node). Digits fold with a
+// pre-multiply overflow guard (`v > (max - d) / base`), no 64-bit arithmetic.
+function numLexFitsI32(t: string): boolean {
+  let v = 0
+  let i = 0
+  let base = 10
+  if t.length >= 2 && t[0] == '0' {
+    let p = t[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  while i < t.length {
+    let c = t[i]
+    if c == '_' {
+      i = i + 1
+    } else {
+      let d = 0
+      if c >= '0' && c <= '9' {
+        d = c - '0'
+      } else if c >= 'a' && c <= 'f' {
+        d = c - 'a' + 10
+      } else {
+        d = c - 'A' + 10
+      }
+      if v > (2147483647 - d) / base {
+        return false
+      }
+      v = v * base + d
+      i = i + 1
+    }
+  }
+  true
+}
 // Fold a non-negative integer LEXEME (a `NumLit.numText`, possibly past the i32
 // range) into a 64-bit (hi, lo) i32 PAIR, returned as `[hi, lo]`. Mirrors
 // `parseI32`'s base detection (hex `0x`/binary `0b`/octal `0o`, else decimal,
@@ -7053,6 +7099,14 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       fbI64Const(pr[0], pr[1])
       return 0
     }
+    // An integer literal past the i32 range is TYPED i64 by the checker (the host's
+    // `defaultIntegerType` magnitude rule), so it lowers as `i64.const` even with no
+    // i64 context — the old default `i32.const` silently wrapped (0xDEAD_BEEF).
+    if !numLexFitsI32(e.numText) {
+      let pr = parseI64Pair(e.numText)
+      fbI64Const(pr[0], pr[1])
+      return 0
+    }
     fbI32Const(parseI32(e.numText))
     return 0
   }
@@ -7665,6 +7719,13 @@ function exprIsI64(exprIx: i32, fnIx: i32): boolean {
   if exprIx < 0 { return false }
   let e = P.nodes[exprIx]
   if e is Paren { return exprIsI64(e.parInner, fnIx) }
+  // A bare INTEGER literal past the i32 range is typed i64 by the checker (the
+  // host's `defaultIntegerType` magnitude rule) and lowers as `i64.const`, so it
+  // classifies as i64 here too (a float `.` literal is f64, never i64).
+  if e is NumLit {
+    if numTextIsFloat(e.numText) { return false }
+    return !numLexFitsI32(e.numText)
+  }
   if e is Ident {
     if paramIsI64(fnIx, e.identName) { return true }
     if declaredI64(e.identName) { return true }
@@ -15636,8 +15697,15 @@ function emitProgram(rootIx: i32): i32 {
         if pn.tyName == "f32" { sawF32 = true }
       }
       // A float `.` literal flags the program as f64-using (the checker types it f64).
+      // An INTEGER literal past the i32 range flags it as i64-using (the checker
+      // types it i64 — the host `defaultIntegerType` rule), so `print(0xDEAD_BEEF)`
+      // pulls in the `__print_i64__` import even with no `i64` annotation.
       if pn is NumLit {
-        if numTextIsFloat(pn.numText) { sawF64 = true }
+        if numTextIsFloat(pn.numText) {
+          sawF64 = true
+        } else if !numLexFitsI32(pn.numText) {
+          sawI64Ann = true
+        }
       }
       pscan = pscan + 1
     }
