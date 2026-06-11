@@ -1970,6 +1970,13 @@ function exprNullableStruct(exprIx: i32, fnIx: i32): boolean {
     if declaredNulRef(e.identName) { return true }
     return globalIsNulRef(e.identName)
   }
+  // A NESTED-STRUCT field read (code 15) is stored `(ref null $S)` — a `S|null`
+  // field genuinely carries null; a plain `inner: S` field is always written
+  // non-null but shares the nullable storage, so the read is nullable-classified
+  // (the consumer inserts `ref.as_non_null` before a chained field access).
+  if e is Member {
+    return memberFieldCode(exprIx, fnIx) == 15
+  }
   false
 }
 
@@ -2825,6 +2832,12 @@ function refPushScratchBaseFor(slot: i32): i32 {
 // function that pushes onto a `string[]`. `fnUsesStrPush` records the reservation;
 // `strPushScratchBase` is `pushStrVal`'s index.
 let fnUsesStrPush: boolean = false
+
+// Whether the function being emitted pushes onto an f64 list (`f64[]`) — reserves
+// the f64-push quad (val f64 / cap i32 / backing (ref $fa64TypeIdx) / recvRef
+// (ref $fl64TypeIdx)) at `f64PushScratchBase`.
+let fnUsesF64Push: boolean = false
+let f64PushScratchBase: i32 = 0
 let strPushScratchBase: i32 = 0
 
 // ── per-function string-op scratch locals (G6: `+` / `==`/`!=` / `.slice`) ────
@@ -3221,6 +3234,11 @@ let pendingF32: boolean = false
 // init emit; locals/returns widen via `emitExprAsF64` instead. (Slice 5.)
 let pendingF64: boolean = false
 
+// Set while lowering an initializer whose binding is annotated `boolean|null` —
+// the NICHE scalar nullable. A bare `null` initializer lowers as the sentinel
+// `i32.const 2` (not a `ref.null`), mirroring the host's `nullSentinel`.
+let pendingNulBool: boolean = false
+
 // ── discriminated-union table (G1: struct unions + `is`-narrowing) ────────────
 // A program may declare ONE union alias `type N = A | B | …` (a `UnionDecl`) whose
 // members are struct `type`s (each a `TypeDecl`). When a union IS declared, the
@@ -3603,9 +3621,11 @@ function stmtIsPushKind(stmtIx: i32, fnIx: i32, kind: i32): boolean {
       if callee.memProp == "push" {
         let isRef = exprRefArray(callee.memObj, fnIx)
         let isStr = exprStringArray(callee.memObj, fnIx)
+        let isF64 = exprF64Array(callee.memObj, fnIx)
         if kind == 1 { return isRef }
         if kind == 2 { return isStr }
-        return !isRef && !isStr
+        if kind == 3 { return isF64 }
+        return !isRef && !isStr && !isF64
       }
     }
   }
@@ -3623,7 +3643,9 @@ function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: i32): boolean {
   if c is Call {
     let callee = P.nodes[c.callFn]
     if callee is Member {
-      if callee.memProp == "pop" {
+      // `.clear()` resolves its receiver the same way `.pop()` does (a Member /
+      // global receiver stages the wrapper ref in `recvRef`), so it counts too.
+      if callee.memProp == "pop" || callee.memProp == "clear" {
         let recv = P.nodes[callee.memObj]
         // A struct-FIELD / global-field Member receiver, OR a bare module-GLOBAL list
         // ident — both materialize the wrapper ref into the `recvRef` scratch slot, so
@@ -3640,9 +3662,11 @@ function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: i32): boolean {
         if needsScratch {
           let isRef = exprRefArray(callee.memObj, fnIx)
           let isStr = exprStringArray(callee.memObj, fnIx)
+          let isF64 = exprF64Array(callee.memObj, fnIx)
           if kind == 1 { return isRef }
           if kind == 2 { return isStr }
-          return !isRef && !isStr
+          if kind == 3 { return isF64 }
+          return !isRef && !isStr && !isF64
         }
       }
     }
@@ -3972,6 +3996,17 @@ function fnHasStrPush(fnIx: i32): boolean {
   false
 }
 
+// True if the FuncDecl at `fnIx` contains an f64-list (`f64[]`) `.push` — OR a
+// Member-receiver f64-list `.pop` (the f64 push quad's `recvRef`).
+function fnHasF64Push(fnIx: i32): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if blockHasPushKind(fn.fnBody, fnIx, 3) { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, 3)
+  }
+  false
+}
+
 // ── string-op detection (G6: which functions need the string scratch frame) ───
 // A function reserves the shared string scratch frame iff it uses ANY string `+`,
 // string `==`/`!=`, or `.slice` anywhere in an expression — so the walk below
@@ -4004,6 +4039,22 @@ function exprIsStrEq(binIx: i32, fnIx: i32): boolean {
   false
 }
 
+// True if `binIx` is a same-shape STRUCT `==`/`!=` (a field-wise compare). Its
+// string/array field compares stage operands in the string-op scratch frame, so
+// it counts as a string op for frame reservation.
+function exprIsStructEq(binIx: i32, fnIx: i32): boolean {
+  let e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      let lsi = structIndexOfExpr(e.binLeft, fnIx)
+      if lsi >= 0 {
+        return lsi == structIndexOfExpr(e.binRight, fnIx)
+      }
+    }
+  }
+  false
+}
+
 // True if `callIx` is a `recv.slice(start, end)` over a STRING receiver.
 function exprIsStrSlice(callIx: i32, fnIx: i32): boolean {
   let c = P.nodes[callIx]
@@ -4011,6 +4062,35 @@ function exprIsStrSlice(callIx: i32, fnIx: i32): boolean {
     let callee = P.nodes[c.callFn]
     if callee is Member {
       if callee.memProp == "slice" {
+        return exprString(callee.memObj, fnIx)
+      }
+    }
+  }
+  false
+}
+
+// True if `callIx` is a `recv.indexOf(sub)` / `recv.includes(sub)` over a STRING
+// receiver — both ride the same indexOf scan (`includes` negates the -1 compare).
+function exprIsStrIndexOf(callIx: i32, fnIx: i32): boolean {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "indexOf" || callee.memProp == "includes" {
+        return exprString(callee.memObj, fnIx)
+      }
+    }
+  }
+  false
+}
+
+// True if `callIx` is a `recv.charCodeAt(i)` over a STRING receiver.
+function exprIsStrCharCode(callIx: i32, fnIx: i32): boolean {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "charCodeAt" {
         return exprString(callee.memObj, fnIx)
       }
     }
@@ -4026,11 +4106,17 @@ function exprHasStrOp(exprIx: i32, fnIx: i32): boolean {
   if e is BinExpr {
     if exprIsStrConcat(exprIx, fnIx) { return true }
     if exprIsStrEq(exprIx, fnIx) { return true }
+    // A struct `==`/`!=` stages its string/array FIELD compares in the same frame.
+    if exprIsStructEq(exprIx, fnIx) { return true }
     if exprHasStrOp(e.binLeft, fnIx) { return true }
     return exprHasStrOp(e.binRight, fnIx)
   }
   if e is Call {
     if exprIsStrSlice(exprIx, fnIx) { return true }
+    // `s.indexOf(sub)` / `s.includes(sub)` stage their receiver + needle + loop
+    // counters in the same string scratch frame. (`charCodeAt` is a bare
+    // `array.get` — no frame needed; its operands recurse below.)
+    if exprIsStrIndexOf(exprIx, fnIx) { return true }
     // `print(<string>)` rides the string-op scratch frame (the streaming loop's
     // string ref + cursor + length live there).
     let pcal = P.nodes[e.callFn]
@@ -4413,6 +4499,13 @@ function pushFieldStorage(code: i32, refSlot: i32): i32 {
   } else if code == 14 {
     wU8(100)                   // 0x64 (ref ht) — non-null closure fat-pointer ref
     wSLEB(cloStructIdx)        // the closure struct heap type (#306)
+  } else if code == 15 {
+    // A NESTED-STRUCT field: a NULLABLE ref to the target struct (`refSlot` is its
+    // struct TABLE index here). Nullable storage serves both the plain (`inner: S`,
+    // always written non-null) and the `S|null` field — and lets a recursive shape
+    // (`next: Node|null`) terminate. Forward indices resolve in the shared rec group.
+    wU8(99)                    // 0x63 (ref null ht)
+    wSLEB(sHeapIdx[refSlot])
   } else {
     wU8(127)                   // 0x7f i32 storagetype
   }
@@ -4507,8 +4600,11 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
       if valIx < 0 {
         return emitFail("emitProgram: object literal is missing a struct field")
       }
-      if exprStruct(valIx, fnIx) {
-        return emitFail("emitProgram: nested struct fields are not supported")
+      let scode = sFieldTypeAt(si, fi)
+      if scode != 15 {
+        if exprStruct(valIx, fnIx) {
+          return emitFail("emitProgram: nested struct fields are not supported")
+        }
       }
       // A ref-list field (`code 5`: `T[]`/`N[]`) whose value is an EMPTY `[]` literal
       // needs the element kind to build a REF-list (not an i32-list) wrapper — the same
@@ -4516,7 +4612,6 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
       // is global (union box `2` when a union is declared, else a struct `1`).
       pendingListKind = 0
       pendingListSlot = 0
-      let scode = sFieldTypeAt(si, fi)
       if scode == 5 {
         let fslot = sFieldRefSlot(si, fi)
         if fslot < 0 { fslot = 0 }
@@ -4525,7 +4620,15 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
       } else if scode == 6 {
         pendingListKind = 3
       }
+      // A NESTED-STRUCT field (code 15) seeds the TARGET struct so its literal
+      // builds that struct (not a field-shape guess) and a bare `null` value
+      // lowers as `ref.null $S`. Saved/restored around the field's own emit.
+      let savedPSI = pendingStructIdx
+      if scode == 15 {
+        pendingStructIdx = structIndexByName(sFieldElemNameAt(si, fi))
+      }
       if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+      if scode == 15 { pendingStructIdx = savedPSI }
       pendingListKind = 0
       fi = fi + 1
     }
@@ -6947,6 +7050,20 @@ function emitStrEq(body: i32[], binIx: i32, fnIx: i32): i32 {
     // Eval both operands, then stash (B on top → set B first).
     if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }
     if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+    if emitStrEqCore(body) < 0 { return 0 - 1 }
+    if isNe {
+      fbI32Eqz()             // 0x45 i32.eqz  (`!=` negates value-equality)
+    }
+    return 0
+  }
+  emitFail("emitProgram: expected a string equality")
+}
+
+// The string value-equality CORE: expects the two string refs already ON THE
+// STACK (left below right), leaves the 0/1 result. Shared by `emitStrEq` and the
+// struct-equality field compare (which pushes field chains as operands).
+function emitStrEqCore(body: i32[]): i32 {
+  if true {
     fbLocalSet(strScratchBase + 1)  // local.set strScrB
     fbLocalSet(strScratchBase + 0)  // local.set strScrA
     // block i32 { ... }  — yields the 0/1 result.
@@ -6998,12 +7115,177 @@ function emitStrEq(body: i32[], binIx: i32, fnIx: i32): i32 {
     // Every element matched → 1.
     fbI32Const(1)            // i32.const 1
     fbEnd()                  // 0x0b end (block) — leaves the 0/1 result
-    if isNe {
-      fbI32Eqz()             // 0x45 i32.eqz  (`!=` negates value-equality)
+    return 0
+  }
+  0
+}
+
+// Re-evaluate the field ACCESS CHAIN `root.f1.f2…` onto `body`: the root
+// expression, then one `struct.get` per (struct, field) pair in the path arrays.
+// Every step is a pure re-read (the equality compare re-walks chains per field).
+function emitChainRead(body: i32[], rootIx: i32, pathSi: i32[], pathFi: i32[], fnIx: i32): i32 {
+  if emitExpr(body, rootIx, fnIx) < 0 { return 0 - 1 }
+  let k = 0
+  while k < pathSi.length {
+    fbStructGet(sHeapIdx[pathSi[k]], pathFi[k])   // 0xfb 0x02 <struct ht> <field>
+    k = k + 1
+  }
+  0
+}
+
+// Lower a STRUCTURAL struct equality `a == b` (or `!=`) onto `body`, leaving a 0/1
+// i32 — field-wise compare mirroring the host's `valueEq`: native compares for
+// scalars, the string-eq loop for string fields, a length+element loop for `i32[]`
+// fields, and recursion through NESTED struct fields (code 15). Both operands must
+// be PURE re-reads (names / field chains): every field compare re-evaluates the
+// full chain from its root. The two shapes match (same struct table index) — the
+// checker proved the operands comparable.
+function emitStructEq(body: i32[], binIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[binIx]
+  if e is BinExpr {
+    let si = structIndexOfExpr(e.binLeft, fnIx)
+    if si < 0 {
+      return emitFail("emitProgram: struct equality over a non-struct operand")
+    }
+    let pathSi: i32[] = []
+    let pathFi: i32[] = []
+    if emitStructEqRec(body, e.binLeft, e.binRight, si, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    if e.binOp == "!=" {
+      fbI32Eqz()               // 0x45 i32.eqz — negate value-equality
     }
     return 0
   }
-  emitFail("emitProgram: expected a string equality")
+  emitFail("emitProgram: expected a struct equality")
+}
+
+// One struct SHAPE's field-wise compare at path (`pathSi`/`pathFi` from the roots),
+// leaving 0/1: an and-chain of per-field compares lowered as nested value-typed
+// `if`s (compare; if → next field … ; else → 0), so a first mismatch short-circuits.
+function emitStructEqRec(body: i32[], lRoot: i32, rRoot: i32, si: i32, pathSi: i32[], pathFi: i32[], fnIx: i32): i32 {
+  let cnt = sFieldCount[si]
+  if cnt == 0 {
+    fbI32Const(1)
+    return 0
+  }
+  let fi = 0
+  while fi < cnt {
+    if emitStructEqField(body, lRoot, rRoot, si, fi, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    if fi < cnt - 1 {
+      fbIf(127)                // 0x04 if, 0x7f i32 blocktype — chain the next field
+      ctrlEnter()
+    }
+    fi = fi + 1
+  }
+  // Close the chain: each opened `if` gets `else (i32.const 0) end`.
+  let k = cnt - 1
+  while k > 0 {
+    fbElse()                   // 0x05 else
+    fbI32Const(0)
+    fbEnd()                    // 0x0b end
+    ctrlLeave()
+    k = k - 1
+  }
+  0
+}
+
+// Compare ONE field at (si, fi) across the two chains, leaving 0/1. The path
+// push/pop frames the inner compare so chains rewind for the next sibling field.
+function emitStructEqField(body: i32[], lRoot: i32, rRoot: i32, si: i32, fi: i32, pathSi: i32[], pathFi: i32[], fnIx: i32): i32 {
+  pathSi.push(si)
+  pathFi.push(fi)
+  let r = emitStructEqFieldInner(body, lRoot, rRoot, si, fi, pathSi, pathFi, fnIx)
+  pathSi.pop()
+  pathFi.pop()
+  r
+}
+
+function emitStructEqFieldInner(body: i32[], lRoot: i32, rRoot: i32, si: i32, fi: i32, pathSi: i32[], pathFi: i32[], fnIx: i32): i32 {
+  let code = sFieldTypeAt(si, fi)
+  if code == 0 {
+    // Scalar (i32 / boolean): a native compare.
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbI32Bin(70)               // 0x46 i32.eq
+    return 0
+  }
+  if code == 3 {
+    // String: the element-wise string-eq loop over the two field refs.
+    if !aUsed {
+      return emitFail("emitProgram: string field equality but array type not collected")
+    }
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    return emitStrEqCore(body)
+  }
+  if code == 15 {
+    // Nested struct: recurse one level deeper along the chain.
+    let nsi = structIndexByName(sFieldElemNameAt(si, fi))
+    if nsi < 0 {
+      return emitFail("emitProgram: nested struct field equality with no interned shape")
+    }
+    return emitStructEqRec(body, lRoot, rRoot, nsi, pathSi, pathFi, fnIx)
+  }
+  if code == 4 {
+    // `i32[]` list: lengths equal AND element-wise equal — `len` from the WRAPPER
+    // (field 1, the logical size; the backing may be longer), elements off the
+    // backings (stashed in the string-op frame refs, the same `(array i32)` type).
+    if !lUsed {
+      return emitFail("emitProgram: i32[] field equality but list type not collected")
+    }
+    // lenL != lenR → 0, else the element loop.
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(lTypeIdx, 1)   // wrapper field 1: len
+    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(lTypeIdx, 1)
+    fbI32Bin(71)               // 0x47 i32.ne
+    fbIf(127)                  // 0x04 if, 0x7f i32 blocktype
+    ctrlEnter()
+    fbI32Const(0)              // length mismatch → 0
+    fbElse()                   // 0x05 else — the element loop, like emitStrEqCore
+    // A = backing(L.f); B = backing(R.f); I0 = len; I1 = 0
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(lTypeIdx, 0)   // backing
+    fbLocalSet(strScratchBase + 0)
+    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(lTypeIdx, 0)
+    fbLocalSet(strScratchBase + 1)
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(lTypeIdx, 1)   // len
+    setStrScrI(body, 0)
+    fbBlock(127)               // 0x02 block, 0x7f i32 — yields the 0/1 result
+    fbI32Const(0)
+    setStrScrI(body, 1)        // I1 = 0
+    fbLoop(64)                 // 0x03 loop, void
+    pushStrScrI(body, 1)
+    pushStrScrI(body, 0)
+    fbI32Bin(78)               // 0x4e i32.ge_s — done?
+    fbIf(64)                   // then: fall through (all matched)
+    fbElse()
+    pushStrScrRef(body, 0)
+    pushStrScrI(body, 1)
+    fbArrayGet(aTypeIdx)
+    pushStrScrRef(body, 1)
+    pushStrScrI(body, 1)
+    fbArrayGet(aTypeIdx)
+    fbI32Bin(71)               // 0x47 i32.ne
+    fbIf(64)                   // mismatch → 0, exit the result block
+    fbI32Const(0)
+    fbBr(3)                    // depths: if(0)·else(1)·loop(2)·block(3)
+    fbEnd()
+    pushStrScrI(body, 1)
+    fbI32Const(1)
+    fbI32Bin(106)              // i32.add
+    setStrScrI(body, 1)
+    fbBr(1)                    // continue the loop
+    fbEnd()                    // end (else's if)
+    fbEnd()                    // end (loop)
+    fbI32Const(1)              // every element matched
+    fbEnd()                    // end (result block)
+    fbEnd()                    // end (length if/else)
+    ctrlLeave()
+    return 0
+  }
+  emitFail("emitProgram: unsupported struct field type in equality")
 }
 
 // Emit `clamp(idx, len)` where `idx` is in i32 temp `idxSlot` and `len` in temp
@@ -7101,6 +7383,140 @@ function emitStrSlice(body: i32[], callIx: i32, fnIx: i32): i32 {
     return emitFail("emitProgram: string .slice receiver is not a member access")
   }
   emitFail("emitProgram: expected a string slice call")
+}
+
+// Lower `s.indexOf(sub)` (or `s.includes(sub)`) onto `body`, leaving an i32: the
+// first index of `sub` in `s`, or -1 (an empty `sub` yields 0, the JS convention);
+// `includes` is `indexOf != -1`. Mirrors the host's `__string_index_of__` naive
+// O(n*m) scan (compiler/builtins/strings.ts), inlined here like `emitStrEq`.
+// Scratch: refs A = s, B = sub; i32 temps I0 = i (outer), I1 = j (inner),
+// I2 = len(s), I3 = len(sub).
+//   block i32 {
+//     I0 = 0
+//     loop {                                  ; outer: candidate starts
+//       if I0 > I2 - I3 { }                   ; past last start → fall out → -1
+//       else {
+//         I1 = 0
+//         loop {                              ; inner: match scan at I0
+//           if I1 >= I3 { (I0) br <block> }   ; full match → yield I0
+//           if A[I0+I1] != B[I1] { I0 = I0 + 1; br <outer> }
+//           I1 = I1 + 1
+//           br <inner>
+//         }
+//       }
+//     }
+//     (i32.const -1)
+//   }
+function emitStrIndexOf(body: i32[], callIx: i32, fnIx: i32): i32 {
+  if !aUsed {
+    return emitFail("emitProgram: string indexOf but array type not collected")
+  }
+  let c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 1 {
+      return emitFail("emitProgram: string .indexOf takes exactly one argument")
+    }
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      let isIncludes = callee.memProp == "includes"
+      // Eval receiver + needle onto the stack first (nested string ops complete),
+      // then stash: needle on top → B, then receiver → A.
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+      fbLocalSet(strScratchBase + 1)  // local.set strScrB (sub)
+      fbLocalSet(strScratchBase + 0)  // local.set strScrA (s)
+      // I2 = len(s); I3 = len(sub)
+      pushStrScrRef(body, 0)
+      fbArrayLen()             // array.len
+      setStrScrI(body, 2)
+      pushStrScrRef(body, 1)
+      fbArrayLen()             // array.len
+      setStrScrI(body, 3)
+      fbBlock(127)             // 0x02 block, 0x7f i32 blocktype — yields index / -1
+      fbI32Const(0)
+      setStrScrI(body, 0)      // I0 = 0
+      fbLoop(64)               // 0x03 loop (outer), 0x40 void blocktype
+      // Past the last possible start (I0 > I2 - I3) → done, fall out (no match).
+      pushStrScrI(body, 0)
+      pushStrScrI(body, 2)
+      pushStrScrI(body, 3)
+      fbI32Bin(107)            // 0x6b i32.sub → len(s) - len(sub)
+      fbI32Bin(74)             // 0x4a i32.gt_s
+      fbIf(64)                 // 0x04 if, 0x40 void blocktype
+      // then: done — fall through (empty)
+      fbElse()                 // 0x05 else
+      fbI32Const(0)
+      setStrScrI(body, 1)      // I1 = 0
+      fbLoop(64)               // 0x03 loop (inner), 0x40 void blocktype
+      // I1 >= len(sub) → full match at I0: yield I0 out of the i32 block.
+      pushStrScrI(body, 1)
+      pushStrScrI(body, 3)
+      fbI32Bin(78)             // 0x4e i32.ge_s
+      fbIf(64)                 // 0x04 if, 0x40 void blocktype
+      pushStrScrI(body, 0)
+      fbBr(4)                  // depths: if(0)·inner loop(1)·else(2)·outer loop(3)·block(4)
+      fbEnd()                  // 0x0b end (match if)
+      // A[I0+I1] != B[I1] → mismatch: advance I0, continue the outer loop.
+      pushStrScrRef(body, 0)
+      pushStrScrI(body, 0)
+      pushStrScrI(body, 1)
+      fbI32Bin(106)            // 0x6a i32.add
+      fbArrayGet(aTypeIdx)     // 0xfb 0x0b array.get
+      pushStrScrRef(body, 1)
+      pushStrScrI(body, 1)
+      fbArrayGet(aTypeIdx)     // array.get
+      fbI32Bin(71)             // 0x47 i32.ne
+      fbIf(64)                 // 0x04 if, 0x40 void blocktype
+      pushStrScrI(body, 0)
+      fbI32Const(1)
+      fbI32Bin(106)            // i32.add
+      setStrScrI(body, 0)      // I0 = I0 + 1
+      fbBr(3)                  // 0x0c br depth 3 → outer loop header (continue)
+      fbEnd()                  // 0x0b end (mismatch if)
+      // I1 = I1 + 1; br inner loop
+      pushStrScrI(body, 1)
+      fbI32Const(1)
+      fbI32Bin(106)            // i32.add
+      setStrScrI(body, 1)
+      fbBr(0)                  // 0x0c br depth 0 → inner loop header
+      fbEnd()                  // 0x0b end (inner loop)
+      fbEnd()                  // 0x0b end (outer if/else)
+      fbEnd()                  // 0x0b end (outer loop)
+      fbI32Const(0 - 1)        // no match → -1
+      fbEnd()                  // 0x0b end (block) — leaves the i32 result
+      if isIncludes {
+        fbI32Const(0 - 1)
+        fbI32Bin(71)           // 0x47 i32.ne — `includes` ≡ `indexOf(sub) != -1`
+      }
+      return 0
+    }
+    return emitFail("emitProgram: string .indexOf receiver is not a member access")
+  }
+  emitFail("emitProgram: expected a string indexOf call")
+}
+
+// Lower `s.charCodeAt(i)` onto `body`, leaving the char code i32. A direct
+// `array.get` over the code-point array — an out-of-range index TRAPS, matching
+// the host (`s[i]` semantics, no JS NaN; compiler/builtins/strings.ts).
+function emitStrCharCode(body: i32[], callIx: i32, fnIx: i32): i32 {
+  if !aUsed {
+    return emitFail("emitProgram: string charCodeAt but array type not collected")
+  }
+  let c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 1 {
+      return emitFail("emitProgram: string .charCodeAt takes exactly one argument")
+    }
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+      fbArrayGet(aTypeIdx)     // 0xfb 0x0b array.get
+      return 0
+    }
+    return emitFail("emitProgram: string .charCodeAt receiver is not a member access")
+  }
+  emitFail("emitProgram: expected a string charCodeAt call")
 }
 
 function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
@@ -7314,6 +7730,14 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     if exprIsStrSlice(exprIx, fnIx) {
       return emitStrSlice(body, exprIx, fnIx)
     }
+    // `s.indexOf(sub)` / `s.includes(sub)` / `s.charCodeAt(i)` over a string
+    // receiver are intrinsics too (A7), each yielding an i32.
+    if exprIsStrIndexOf(exprIx, fnIx) {
+      return emitStrIndexOf(body, exprIx, fnIx)
+    }
+    if exprIsStrCharCode(exprIx, fnIx) {
+      return emitStrCharCode(body, exprIx, fnIx)
+    }
     // G8: the `Map()` builtin constructs an empty string-keyed map. `Set()` is a
     // boolean-valued string map over the SAME 7-field struct, so it emits the
     // IDENTICAL empty-map construction.
@@ -7369,6 +7793,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     return emitIs(body, exprIx, fnIx)
   }
   if e is NullLit {
+    // `null` in a `boolean|null` NICHE context is the scalar sentinel 2 (an i32,
+    // not a ref) — checked before the struct seed.
+    if pendingNulBool {
+      fbI32Const(2)
+      return 0
+    }
     // A bare `null` VALUE: its target struct comes from the binding/argument/
     // return seed (`pendingStructIdx`) — `ref.null $S`. With no seed it cannot
     // be typed here; fail loudly.
@@ -7472,7 +7902,34 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
               }
               return emitMapGetOr(body, lcallee.memObj, lhs.callArgs[0], e.binRight, fnIx)
             }
+            // `xs.get(i) ?? d` over a SCALAR-element list (i32 / boolean / f64) is
+            // the FUSED checked read-with-default (B6) — one bounds compare.
+            if exprF64Array(lcallee.memObj, fnIx) || exprArray(lcallee.memObj, fnIx) {
+              return emitListGetOr(body, e.binLeft, e.binRight, fnIx)
+            }
           }
+          // `xs.pop() ?? d` over a SCALAR-element list is the FUSED checked
+          // pop-with-default: `len != 0` selects decrement-and-read or `d`.
+          if lcallee.memProp == "pop" {
+            if exprArray(lcallee.memObj, fnIx) {
+              if !exprRefArray(lcallee.memObj, fnIx) && !exprStringArray(lcallee.memObj, fnIx) && !exprF64Array(lcallee.memObj, fnIx) {
+                return emitPopOr(body, e.binLeft, e.binRight, fnIx)
+              }
+            }
+          }
+        }
+      }
+      // `x ?? d` over a binding seeded by a BOOLEAN-list `.pop()`: the i32 cell
+      // holds 0/1 or the niche sentinel 2 (`null`) — select the default on 2.
+      if lhs is Ident {
+        if identNullableBoolPop(lhs.identName, fnIx) {
+          if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }   // d   [a]
+          if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }    // x   [b]
+          if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }
+          fbI32Const(2)
+          fbI32Bin(70)           // 0x46 i32.eq → x == 2 (null)      [cond]
+          wU8(27)                // 0x1b select → d if null else x
+          return 0
         }
       }
       // The null-safe field read `m[k]?.f ?? d` over a STRUCT-VALUED map is the
@@ -7514,6 +7971,94 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
               if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
               fbEnd()                // end (if)
               return 0
+            }
+          }
+        }
+        // `p?.f ?? d` over a NULLABLE-STRUCT name (`p: S | null`): null → the
+        // default, else the field read off the (non-null) struct. The receiver is
+        // a pure name, re-read in the non-null branch. Scalar fields only (the
+        // value-typed `if` blocktype carries them).
+        let omIdN = P.nodes[unwrapParen(lhs.omObj)]
+        if omIdN is Ident {
+          if exprNullableStruct(lhs.omObj, fnIx) {
+            let nsi = structIndexOfExpr(lhs.omObj, fnIx)
+            if nsi >= 0 {
+              let nfi = sFieldIndex(nsi, lhs.omProp)
+              if nfi < 0 {
+                return emitFail("emitProgram: `?.` field is not on the struct")
+              }
+              if sFieldTypeAt(nsi, nfi) != 0 {
+                return emitFail("emitProgram: `?.` over a nullable struct supports only i32/boolean fields")
+              }
+              if emitExpr(body, lhs.omObj, fnIx) < 0 { return 0 - 1 }
+              wU8(209)             // 0xd1 ref.is_null
+              fbIf(127)            // 0x04 if, 0x7f i32 blocktype — null → default
+              ctrlEnter()
+              if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              fbElse()             // 0x05 else — present → the field
+              if emitExpr(body, lhs.omObj, fnIx) < 0 { return 0 - 1 }
+              fbStructGet(sHeapIdx[nsi], nfi)
+              fbEnd()              // 0x0b end
+              ctrlLeave()
+              return 0
+            }
+          }
+        }
+        // `xs.get(i)?.f ?? d` over a STRUCT-element ref list is the FUSED form:
+        // one bounds compare; in range read the field off the (non-null) element,
+        // else the default. A live in-range element is never null (pushes store
+        // non-null), so the `?.` null test coincides with the bounds test —
+        // mirroring the map `m[k]?.f ?? d` path above. Scalar fields only.
+        let omGet = P.nodes[unwrapParen(lhs.omObj)]
+        if omGet is Call {
+          let gCallee = P.nodes[omGet.callFn]
+          if gCallee is Member {
+            if gCallee.memProp == "get" {
+              let gSi = structListPopGetElem(unwrapParen(lhs.omObj), fnIx)
+              if gSi >= 0 && rlUsed {
+                if omGet.callArgs.length != 1 {
+                  return emitFail("emitProgram: .get takes exactly one argument")
+                }
+                let gFi = sFieldIndex(gSi, lhs.omProp)
+                if gFi < 0 {
+                  return emitFail("emitProgram: `?.` field is not on the list's element struct")
+                }
+                if sFieldTypeAt(gSi, gFi) != 0 {
+                  return emitFail("emitProgram: `?.` over a list .get supports only i32/boolean fields")
+                }
+                let gRecvN = P.nodes[unwrapParen(gCallee.memObj)]
+                let gOkRecv = false
+                if gRecvN is Ident { gOkRecv = true }
+                if !gOkRecv {
+                  return emitFail("emitProgram: .get receiver must be a named list binding")
+                }
+                let gIdxN = P.nodes[unwrapParen(omGet.callArgs[0])]
+                let gOkIdx = false
+                if gIdxN is NumLit { gOkIdx = true }
+                if gIdxN is Ident { gOkIdx = true }
+                if !gOkIdx {
+                  return emitFail("emitProgram: .get index must be a literal or a name")
+                }
+                let gSlot = refListSlotOfExpr(gCallee.memObj, fnIx)
+                // cond: idx u< len
+                if emitExpr(body, omGet.callArgs[0], fnIx) < 0 { return 0 - 1 }
+                if emitExpr(body, gCallee.memObj, fnIx) < 0 { return 0 - 1 }
+                fbStructGet(rlWrapIdx[gSlot], 1)   // field 1: len
+                fbI32Bin(73)                       // 0x49 i32.lt_u
+                fbIf(127)                          // 0x04 if, 0x7f i32 result blocktype
+                ctrlEnter()
+                if emitExpr(body, gCallee.memObj, fnIx) < 0 { return 0 - 1 }
+                fbStructGet(rlWrapIdx[gSlot], 0)   // field 0: backing
+                if emitExpr(body, omGet.callArgs[0], fnIx) < 0 { return 0 - 1 }
+                fbArrayGet(rlBackIdx[gSlot])       // → (ref null $elem)
+                fbRefAsNonNull()                   // a live in-range element is non-null
+                fbStructGet(sHeapIdx[gSi], gFi)    // .f
+                fbElse()                           // 0x05 else
+                if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+                fbEnd()                            // 0x0b end
+                ctrlLeave()
+                return 0
+              }
             }
           }
         }
@@ -7563,6 +8108,18 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       if nrhs is NullLit { nref = e.binLeft }
       if nlhs is NullLit { nref = e.binRight }
       if nref >= 0 {
+        // `x == null` over a `boolean|null` NICHE value is a SENTINEL compare
+        // (`x == 2`) — the i32 never holds a ref. Checked before the struct path.
+        if exprNulBool(nref, fnIx) {
+          if emitExpr(body, nref, fnIx) < 0 { return 0 - 1 }
+          fbI32Const(2)
+          if e.binOp == "!=" {
+            fbI32Bin(71)     // 0x47 i32.ne
+          } else {
+            fbI32Bin(70)     // 0x46 i32.eq
+          }
+          return 0
+        }
         if exprNullableStruct(nref, fnIx) {
           if emitExpr(body, nref, fnIx) < 0 { return 0 - 1 }
           wU8(209)           // 0xd1 ref.is_null
@@ -7572,15 +8129,17 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
           return 0
         }
       }
-      // Struct / function-value equality is NOT lowered yet — fail LOUDLY rather
-      // than fall through to the i32 compare (which would emit an `i32.eq` over
-      // two refs: invalid wasm, a validation trap instead of a diagnostic). The
-      // host compares structs field-wise and function values by identity; that
-      // is follow-up work — under the `call_ref` ABI a function-identity compare
-      // needs an identity token on the closure struct (funcrefs admit no ref.eq).
-      // Guard is check-only: a program with no struct/closure `==` emits
-      // byte-identical bytes.
-      if structIndexOfExpr(e.binLeft, fnIx) >= 0 || structIndexOfExpr(e.binRight, fnIx) >= 0 {
+      // STRUCTURAL struct equality: same-shape operands compare field-wise
+      // (`emitStructEq` — scalars native, strings via the eq loop, `i32[]` via a
+      // length+element loop, nested structs recursively). A function-valued field
+      // still fails loudly (under the `call_ref` ABI a function-identity compare
+      // needs an identity token on the closure struct — funcrefs admit no ref.eq).
+      let eqLsi = structIndexOfExpr(e.binLeft, fnIx)
+      let eqRsi = structIndexOfExpr(e.binRight, fnIx)
+      if eqLsi >= 0 || eqRsi >= 0 {
+        if eqLsi >= 0 && eqLsi == eqRsi {
+          return emitStructEq(body, exprIx, fnIx)
+        }
         return emitFail("emitProgram: struct equality is not supported yet")
       }
       if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
@@ -8008,6 +8567,20 @@ function exprIsF64(exprIx: i32, fnIx: i32): boolean {
       if exprIsF64(e.binLeft, fnIx) { return true }
       return exprIsF64(e.binRight, fnIx)
     }
+    // `xs.get(i) ?? d` over an f64 list yields an f64 (the fused checked read);
+    // the default `d` shares the element type, so classify by the right side.
+    if op == "??" {
+      let lhs = P.nodes[unwrapParen(e.binLeft)]
+      if lhs is Call {
+        let lcallee = P.nodes[lhs.callFn]
+        if lcallee is Member {
+          if lcallee.memProp == "get" || lcallee.memProp == "pop" {
+            if exprF64Array(lcallee.memObj, fnIx) { return true }
+          }
+        }
+      }
+      return false
+    }
     return false
   }
   // Unary negation `-x` preserves f64-ness (`~` is integer-only; `!` is bool).
@@ -8053,11 +8626,34 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
   if e is Unary {
     return e.unOp == "!"
   }
+  if e is Ident {
+    // A `boolean|null` NICHE binding read (narrowed non-null in its branch)
+    // prints true/false. Plain `boolean` idents stay unclassified (existing rule).
+    if exprNulBool(ix, fnIx) { return true }
+  }
   if e is BinExpr {
     let op = e.binOp
     if op == "==" || op == "!=" { return true }
     if op == "<" || op == ">" || op == "<=" || op == ">=" { return true }
     if op == "&&" || op == "||" { return true }
+    // `lhs ?? d` over a BOOLEAN-list `.get`/`.pop` (or a binding seeded by one)
+    // yields a boolean — render true/false. Other `??` reads keep i32 (map gets).
+    if op == "??" {
+      let lhs = P.nodes[unwrapParen(e.binLeft)]
+      if lhs is Call {
+        let lcallee = P.nodes[lhs.callFn]
+        if lcallee is Member {
+          if lcallee.memProp == "get" || lcallee.memProp == "pop" {
+            if !exprMap(lcallee.memObj, fnIx) {
+              return listElemIsBool(lcallee.memObj, fnIx)
+            }
+          }
+        }
+      }
+      if lhs is Ident {
+        return identNullableBoolPop(lhs.identName, fnIx)
+      }
+    }
     return false
   }
   if e is Call {
@@ -8089,6 +8685,10 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
       }
       if callee.memProp == "delete" {
         return exprMap(callee.memObj, fnIx)
+      }
+      // A string `s.includes(sub)` yields a boolean (print true/false).
+      if callee.memProp == "includes" {
+        return exprString(callee.memObj, fnIx)
       }
     }
   }
@@ -8639,7 +9239,8 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
       // receiver is to materialize its wrapper ref into the `recvRef` scratch slot.
       let isRef = exprRefArray(callee.memObj, fnIx)
       let isStr = exprStringArray(callee.memObj, fnIx)
-      if !isRef && !isStr && !exprArray(callee.memObj, fnIx) {
+      let isF64 = exprF64Array(callee.memObj, fnIx)
+      if !isRef && !isStr && !isF64 && !exprArray(callee.memObj, fnIx) {
         return emitFail("emitProgram: .push receiver is not a list")
       }
       // Pick the list/backing type indices + scratch base for this push kind. A string
@@ -8672,6 +9273,15 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         lTy = mkListIdx
         aTy = mkArrIdx
         base = strPushScratchBase
+      } else if isF64 {
+        // An f64-list push runs the SAME grow/append over the f64 wrapper/backing,
+        // staged in the f64-typed push quad (`pushF64Val` is an f64 local).
+        if !fa64Used {
+          return emitFail("emitProgram: f64 .push but f64 list type not collected")
+        }
+        lTy = fl64TypeIdx
+        aTy = fa64TypeIdx
+        base = f64PushScratchBase
       } else if !lUsed {
         return emitFail("emitProgram: .push but list type not collected")
       }
@@ -8712,9 +9322,13 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32): i32 {
         let valIdx = base
         let capIdx = base + 1
         let backIdx = base + 2
-        // V = x
+        // V = x  (an f64-list push coerces/encodes the value as f64)
         pendingStructIdx = pushStructIdx
-        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        if isF64 {
+          if emitExprAsF64(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        } else {
+          if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        }
         pendingStructIdx = 0 - 1
         fbLocalSet(valIdx)     // local.set
         // if len(L) == cap(L)
@@ -8849,6 +9463,29 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
         return emitFail("emitProgram: .pop receiver must be a local or struct field")
       }
       if true {
+        // A BOOLEAN-element list pops CHECKED: `boolean | null` rides the i32
+        // niche (true=1 / false=0 / null=2), so an empty pop yields the sentinel
+        // 2 instead of trapping — mirroring the host's nullable `.pop()` (B6).
+        if !elemIsRef {
+          if listElemIsBool(callee.memObj, fnIx) {
+            pushListLen(body, lIdx, lTy)   // cond: len != 0
+            fbIf(127)            // 0x04 if, 0x7f i32 result blocktype
+            ctrlEnter()
+            fbLocalGet(lIdx)     // L.len = len - 1
+            pushListLen(body, lIdx, lTy)
+            fbI32Const(1)
+            fbI32Bin(107)        // 0x6b i32.sub
+            fbStructSet(lTy, 1)  // field 1: len
+            pushListBacking(body, lIdx, lTy)
+            pushListLen(body, lIdx, lTy)
+            fbArrayGet(aTy)      // the popped element (0/1)
+            fbElse()             // 0x05 else — empty → the null sentinel
+            fbI32Const(2)
+            fbEnd()              // 0x0b end
+            ctrlLeave()
+            return 0
+          }
+        }
         // L.len = len - 1
         fbLocalGet(lIdx)       // local.get L
         pushListLen(body, lIdx, lTy)
@@ -8867,6 +9504,70 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
     }
   }
   emitFail("emitProgram: expected a .pop call")
+}
+
+// Lower a `.clear()` STATEMENT onto `body`: reset the list's logical length to 0,
+// RETAINING the backing (a refill reuses it; cap is untouched) — mirroring the
+// host's `.clear()` (B6). Generic over the list kind, with `emitPop`'s receiver
+// resolution (bare local, module global, or struct field via the `recvRef` scratch).
+function emitClear(body: i32[], callIx: i32, fnIx: i32): i32 {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if c.callArgs.length != 0 {
+        return emitFail("emitProgram: .clear takes no arguments")
+      }
+      let recv = P.nodes[callee.memObj]
+      let isRef = exprRefArray(callee.memObj, fnIx)
+      let isStr = exprStringArray(callee.memObj, fnIx)
+      if !isRef && !isStr && !exprArray(callee.memObj, fnIx) {
+        return emitFail("emitProgram: .clear receiver is not a list")
+      }
+      let lTy = lTypeIdx
+      let base = pushScratchBase
+      if isRef {
+        if !rlUsed {
+          return emitFail("emitProgram: ref .clear but ref list type not collected")
+        }
+        let rslot = refListSlotOfExpr(callee.memObj, fnIx)
+        lTy = rlWrapIdx[rslot]
+        base = refPushScratchBaseFor(rslot)
+      } else if isStr {
+        if !slUsed {
+          return emitFail("emitProgram: string .clear but string list type not collected")
+        }
+        lTy = mkListIdx
+        base = strPushScratchBase
+      } else if !lUsed {
+        return emitFail("emitProgram: .clear but list type not collected")
+      }
+      let lIdx = 0 - 1
+      if recv is Ident {
+        lIdx = localIndexOf(fnIx, recv.identName)
+        if lIdx < 0 {
+          if globalIndexOf(recv.identName) < 0 {
+            return emitFail("emitProgram: .clear receiver is not a list local")
+          }
+          if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+          fbLocalSet(base + 3)   // local.set recvRef
+          lIdx = base + 3
+        }
+      } else if recv is Member {
+        if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+        fbLocalSet(base + 3)     // local.set recvRef
+        lIdx = base + 3
+      } else {
+        return emitFail("emitProgram: .clear receiver must be a local or struct field")
+      }
+      // L.len = 0
+      fbLocalGet(lIdx)
+      fbI32Const(0)
+      fbStructSet(lTy, 1)        // 0xfb 0x05 <lTy> field 1: len
+      return 0
+    }
+  }
+  emitFail("emitProgram: expected a .clear call")
 }
 
 // Lower a checked `.get(i)` over a STRUCT-element ref list onto `body`, leaving a
@@ -8925,6 +9626,209 @@ function emitListGet(body: i32[], callIx: i32, fnIx: i32): i32 {
     }
   }
   emitFail("emitProgram: expected a .get call")
+}
+
+// True if the list at `arrIx` carries BOOLEAN elements: a `[true, ...]` literal, a
+// `boolean[]` annotation, a name tracing to either (local let or module global), or
+// a `.map`/`.filter` result whose callback returns boolean (`mfArrElemIsBool`).
+// Boolean elements ride the i32 list rep (0/1), with the spare value 2 encoding the
+// `boolean | null` of a checked `.pop()` — the niche sentinel, mirroring the host.
+function listElemIsBool(arrIx: i32, fnIx: i32): boolean {
+  if arrIx < 0 { return false }
+  let inner = unwrapParen(arrIx)
+  let e = P.nodes[inner]
+  if e is ArrayLit {
+    if e.arrElems.length > 0 { return exprIsBool(e.arrElems[0], fnIx) }
+    return false
+  }
+  if e is Ident {
+    let li = 0 - 1
+    if fnIx >= 0 {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+    }
+    if li < 0 { li = globalLetOf(e.identName) }
+    if li >= 0 {
+      let d = P.nodes[li]
+      if d is LetDecl {
+        if d.letType >= 0 {
+          let lt = P.nodes[d.letType]
+          if lt is TypeRef {
+            if lt.tyName == "boolean[]" { return true }
+          }
+        }
+        if d.letInit >= 0 {
+          if unwrapParen(d.letInit) != inner { return listElemIsBool(d.letInit, fnIx) }
+        }
+      }
+    }
+    return false
+  }
+  mfArrElemIsBool(arrIx, fnIx)
+}
+
+// True if `name` is a binding whose initializer is a checked `.pop()` over a
+// BOOLEAN-element list — its i32 cell holds 0/1 or the niche sentinel 2 (`null`),
+// so a later `name ?? d` must compare against 2, not test a ref.
+function identNullableBoolPop(name: string, fnIx: i32): boolean {
+  let li = 0 - 1
+  if fnIx >= 0 {
+    let fn = P.nodes[fnIx]
+    if fn is FuncDecl { li = parentLetOf(fn.fnBody, name) }
+  }
+  if li < 0 { li = globalLetOf(name) }
+  if li >= 0 {
+    let d = P.nodes[li]
+    if d is LetDecl {
+      if d.letInit >= 0 {
+        let ini = P.nodes[unwrapParen(d.letInit)]
+        if ini is Call {
+          let callee = P.nodes[ini.callFn]
+          if callee is Member {
+            if callee.memProp == "pop" {
+              return listElemIsBool(callee.memObj, fnIx)
+            }
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+// Lower a FUSED `xs.get(i) ?? d` over a SCALAR-element list (i32 / boolean / f64)
+// onto `body`: ONE unsigned bounds compare (`i u< len`) selects the element read or
+// the default — the `T | null` intermediate never materializes (the host's checked
+// `.get` composed with `??` reduces to the same branch). The receiver must be a
+// bare name and the index a literal/name — both are re-read (bounds check + read).
+function emitListGetOr(body: i32[], getIx: i32, defIx: i32, fnIx: i32): i32 {
+  let c = P.nodes[getIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if c.callArgs.length != 1 {
+        return emitFail("emitProgram: .get takes exactly one argument")
+      }
+      let isF64 = exprF64Array(callee.memObj, fnIx)
+      let lTy = lTypeIdx
+      let aTy = aTypeIdx
+      if isF64 {
+        if !fa64Used {
+          return emitFail("emitProgram: f64 .get but f64 list type not collected")
+        }
+        lTy = fl64TypeIdx
+        aTy = fa64TypeIdx
+      } else if !lUsed {
+        return emitFail("emitProgram: .get but list type not collected")
+      }
+      let recvN = P.nodes[unwrapParen(callee.memObj)]
+      let okRecv = false
+      if recvN is Ident { okRecv = true }
+      if !okRecv {
+        return emitFail("emitProgram: .get receiver must be a named list binding")
+      }
+      let idxN = P.nodes[unwrapParen(c.callArgs[0])]
+      let okIdx = false
+      if idxN is NumLit { okIdx = true }
+      if idxN is Ident { okIdx = true }
+      if idxN is Unary {
+        // A NEGATIVE literal index (`xs.get(-1)`) is pure too — the unsigned
+        // bounds compare maps it past `len`, so it takes the default branch.
+        if idxN.unOp == "-" {
+          let idxArgN = P.nodes[unwrapParen(idxN.unArg)]
+          if idxArgN is NumLit { okIdx = true }
+        }
+      }
+      if !okIdx {
+        return emitFail("emitProgram: .get index must be a literal or a name")
+      }
+      // cond: idx u< len  (one unsigned compare covers negative + past-len)
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+      fbStructGet(lTy, 1)        // field 1: len
+      fbI32Bin(73)               // 0x49 i32.lt_u
+      if isF64 {
+        fbIf(124)                // 0x04 if, 0x7c f64 result blocktype
+      } else {
+        fbIf(127)                // 0x04 if, 0x7f i32 result blocktype
+      }
+      ctrlEnter()
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+      fbStructGet(lTy, 0)        // field 0: backing
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+      fbArrayGet(aTy)            // 0xfb 0x0b array.get — the element
+      fbElse()                   // 0x05 else
+      if isF64 {
+        if emitExprAsF64(body, defIx, fnIx) < 0 { return 0 - 1 }
+      } else {
+        if emitExpr(body, defIx, fnIx) < 0 { return 0 - 1 }
+      }
+      fbEnd()                    // 0x0b end
+      ctrlLeave()
+      return 0
+    }
+  }
+  emitFail("emitProgram: expected a list .get call")
+}
+
+// Lower a FUSED `xs.pop() ?? d` over a SCALAR-element (i32 / boolean) list onto
+// `body`: `len != 0` selects the decrement-and-read (the popped element) or the
+// default. The receiver resolves like `emitPop` (bare local, module global, or
+// struct field — the latter two staged into the push frame's `recvRef` scratch).
+function emitPopOr(body: i32[], popIx: i32, defIx: i32, fnIx: i32): i32 {
+  let c = P.nodes[popIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if c.callArgs.length != 0 {
+        return emitFail("emitProgram: .pop takes no arguments")
+      }
+      if !lUsed {
+        return emitFail("emitProgram: .pop but list type not collected")
+      }
+      let recv = P.nodes[callee.memObj]
+      let lTy = lTypeIdx
+      let aTy = aTypeIdx
+      let base = pushScratchBase
+      let lIdx = 0 - 1
+      if recv is Ident {
+        lIdx = localIndexOf(fnIx, recv.identName)
+        if lIdx < 0 {
+          if globalIndexOf(recv.identName) < 0 {
+            return emitFail("emitProgram: .pop receiver is not a list local")
+          }
+          if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+          fbLocalSet(base + 3)   // local.set recvRef
+          lIdx = base + 3
+        }
+      } else if recv is Member {
+        if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+        fbLocalSet(base + 3)     // local.set recvRef
+        lIdx = base + 3
+      } else {
+        return emitFail("emitProgram: .pop receiver must be a local or struct field")
+      }
+      // cond: len != 0 (len is never negative)
+      pushListLen(body, lIdx, lTy)
+      fbIf(127)                  // 0x04 if, 0x7f i32 result blocktype
+      ctrlEnter()
+      // L.len = len - 1; backing[L.len]
+      fbLocalGet(lIdx)
+      pushListLen(body, lIdx, lTy)
+      fbI32Const(1)
+      fbI32Bin(107)              // 0x6b i32.sub
+      fbStructSet(lTy, 1)        // field 1: len
+      pushListBacking(body, lIdx, lTy)
+      pushListLen(body, lIdx, lTy)
+      fbArrayGet(aTy)            // the popped element
+      fbElse()                   // 0x05 else — empty list → the default
+      if emitExpr(body, defIx, fnIx) < 0 { return 0 - 1 }
+      fbEnd()                    // 0x0b end
+      ctrlLeave()
+      return 0
+    }
+  }
+  emitFail("emitProgram: expected a list .pop call")
 }
 
 // Lower a `.map`/`.filter` HOF call onto `body`, leaving the RESULT list wrapper ref
@@ -9444,6 +10348,18 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       scopeBind(s.letName, slot)
       return 0
     }
+    // A degenerate UN-ANNOTATED `let x = null` (A-infer-null): the binding's type
+    // is the plain `null` type — it is never read as a non-null value, so its i32
+    // cell just zero-inits. (An ANNOTATED nullable binding takes the normal path.)
+    if s.letType < 0 {
+      let bareN = P.nodes[unwrapParen(s.letInit)]
+      if bareN is NullLit {
+        fbI32Const(0)
+        fbLocalSet(idx)        // 0x21 local.set
+        scopeBind(s.letName, slot)
+        return 0
+      }
+    }
     // An empty `[]` initializer over a ref-array annotation (`let xs: T[] = []`) needs
     // the element kind to pick the ref-list construction — record it for `emitArr`.
     pendingListKind = letAnnRefListKind(stmtIx)
@@ -9472,7 +10388,10 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     } else if letIsI64(stmtIx) {
       if emitExprAsI64(body, s.letInit, fnIx) < 0 { return 0 - 1 }
     } else {
+      // A `boolean|null` NICHE binding lowers a bare `null` init as the sentinel 2.
+      pendingNulBool = letIsNulBoolAnn(stmtIx)
       if emitExpr(body, s.letInit, fnIx) < 0 { return 0 - 1 }
+      pendingNulBool = false
     }
     pendingI64 = false
     pendingStructIdx = 0 - 1
@@ -9487,12 +10406,15 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     return 0
   }
   if s is BinExpr {
-    // A bare `BinExpr` statement is an assignment (`x = <expr>`); any other operator
-    // in statement position is a discarded value, which this slice does not emit.
+    // A bare `BinExpr` statement is an assignment (`x = <expr>`); any OTHER operator
+    // in statement position is a DISCARDED value (`1 + 1` as a tail statement of a
+    // void function) — evaluate it for effect, then `drop` the value it leaves.
     if s.binOp == "=" {
       return emitAssign(body, stmtIx, fnIx)
     }
-    return emitFail("emitProgram: expression statement is not an assignment")
+    if emitExpr(body, stmtIx, fnIx) < 0 { return 0 - 1 }
+    fbDrop()                   // 0x1a drop
+    return 0
   }
   if s is Unary {
     // Postfix `x++` / `x--` in STATEMENT position: the OLD-value result is discarded,
@@ -9518,6 +10440,12 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
         if emitPop(body, stmtIx, fnIx) < 0 { return 0 - 1 }
         fbDrop()               // 0x1a drop
         return 0
+      }
+      // A `.clear()` STATEMENT resets the list's length to 0 (backing retained).
+      if callee.memProp == "clear" {
+        if exprArray(callee.memObj, fnIx) || exprRefArray(callee.memObj, fnIx) || exprStringArray(callee.memObj, fnIx) {
+          return emitClear(body, stmtIx, fnIx)
+        }
       }
       // G8: a map `m.set(k, v)` STATEMENT is the method form of `m[k] = v` — the
       // same scan/overwrite-or-append lowering.
@@ -10314,6 +11242,9 @@ function fbBeginFunc(nParams: i32, nLocals: i32): i32 {
   // String-list push quad.
   strPushScratchBase = fbScratchCur
   if fnUsesStrPush { fbReserve(4) }
+  // f64-list push quad (val f64 / cap / backing / recvRef).
+  f64PushScratchBase = fbScratchCur
+  if fnUsesF64Push { fbReserve(4) }
   // String-op frame (3 non-null string refs + 4 i32 temporaries).
   strScratchBase = fbScratchCur
   if fnUsesStrOp { fbReserve(7) }
@@ -10405,6 +11336,7 @@ function fbLocalsCount(nLocals: i32): i32 {
   if fnUsesPush { n = n + 4 }
   n = n + fnRefPushSlots.length * 4
   if fnUsesStrPush { n = n + 4 }
+  if fnUsesF64Push { n = n + 4 }
   if fnUsesStrOp { n = n + 7 }
   if fnUsesMap { n = n + 14 + mvValName.length * 3 }
   if fnUsesCallRef { n = n + 1 }
@@ -10454,6 +11386,15 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32): i32 {
     fbI32Run()
     fbRefRun(mkArrIdx)
     fbRefRun(mkListIdx)
+  }
+  // f64-list push quad: pushF64Val f64, pushF64Cap i32, pushF64Backing
+  // (ref $fa64TypeIdx), pushF64RecvRef (ref $fl64TypeIdx).
+  if fnUsesF64Push {
+    wU8(1)
+    wU8(124)                 // 0x7c f64
+    fbI32Run()
+    fbRefRun(fa64TypeIdx)
+    fbRefRun(fl64TypeIdx)
   }
   // String-op frame: strScrA/B/Out (3 non-null `(ref $aTypeIdx)` string refs),
   // then strScrI0..strScrI3 (4 i32 temporaries).
@@ -10578,6 +11519,7 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     fnUsesPush = fnHasPush(fnIx)
     fnUsesRefPush = fnHasRefPush(fnIx)
     fnUsesStrPush = fnHasStrPush(fnIx)
+    fnUsesF64Push = fnHasF64Push(fnIx)
     fnUsesStrOp = fnHasStrOp(fnIx)
     fnUsesMap = fnHasMap(fnIx)
     // `fnHasMap` only scans LOCALS/params; also reserve the frame when a map op runs
@@ -10747,6 +11689,54 @@ function structIndexOfTypeName(name: string): i32 {
 // `1` if the type-annotation node at `tyIx` is a NULLABLE STRUCT (`S | null` with a
 // resolvable struct part), else `0`. Feeds the `kind == 9` (nullable struct ref,
 // `0x63`) family.
+// True if the annotation node at `tyIx` is `boolean|null` — the NICHE scalar
+// nullable (host: `nullSentinel`): an i32 holding 0/1, with the spare value 2
+// encoding `null` (no box). `== null` is a sentinel compare; narrowing to
+// non-null is purely type-level (the i32 is already 0/1 in the branch).
+function tyIsNulBool(tyIx: i32): boolean {
+  if tyIx < 0 { return false }
+  let ty = P.nodes[tyIx]
+  if ty is TypeRef {
+    return nullablePartOf(ty.tyName) == "boolean"
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` is annotated `boolean|null`.
+function letIsNulBoolAnn(letIx: i32): boolean {
+  if letIx < 0 { return false }
+  let d = P.nodes[letIx]
+  if d is LetDecl { return tyIsNulBool(d.letType) }
+  false
+}
+
+// True if the expression is a NAME (param / local / module global) annotated
+// `boolean|null` — the niche scalar nullable.
+function exprNulBool(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    if fnIx >= 0 {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl {
+        let params = fn.fnParams
+        let i = 0
+        while i < params.length {
+          let p = P.nodes[params[i]]
+          if p is Param {
+            if p.parName == e.identName { return tyIsNulBool(p.parType) }
+          }
+          i = i + 1
+        }
+        let li = parentLetOf(fn.fnBody, e.identName)
+        if li >= 0 { return letIsNulBoolAnn(li) }
+      }
+    }
+    return letIsNulBoolAnn(globalLetOf(e.identName))
+  }
+  false
+}
+
 function retNulRefFlag(tyIx: i32): i32 {
   if tyIx >= 0 {
     let ty = P.nodes[tyIx]
@@ -10824,6 +11814,8 @@ function tyAnnRefListKind(tyIx: i32): i32 {
         return 1
       }
       if nameIsStringArray(lt.tyName) { return 3 }
+      // An `f64[]` annotation: an empty `[]` builds the f64-list wrapper (kind 4).
+      if nameIsF64Array(lt.tyName) { return 4 }
     }
   }
   0
@@ -11246,6 +12238,8 @@ function globalCellKind(letIx: i32): i32 {
     }
     // No annotation: a const literal init types itself; a non-const un-annotated init is
     // out of scope (no annotation to derive from) and `globalKind` returns its best guess.
+    // An empty `[]` whose PUSHES infer a string element is the string list (kind 7).
+    if letInfStrListByUse(letIx) { return 7 }
     return globalKind(d.letInit)
   }
   0
@@ -11740,9 +12734,11 @@ function startScanBlock(blockIx: i32): i32 {
   if blockHasPushKind(blockIx, 0 - 1, 0) { fnUsesPush = true }
   if blockHasPushKind(blockIx, 0 - 1, 1) { fnUsesRefPush = true }
   if blockHasPushKind(blockIx, 0 - 1, 2) { fnUsesStrPush = true }
+  if blockHasPushKind(blockIx, 0 - 1, 3) { fnUsesF64Push = true }
   if blockHasMemberPopKind(blockIx, 0 - 1, 0) { fnUsesPush = true }
   if blockHasMemberPopKind(blockIx, 0 - 1, 1) { fnUsesRefPush = true }
   if blockHasMemberPopKind(blockIx, 0 - 1, 2) { fnUsesStrPush = true }
+  if blockHasMemberPopKind(blockIx, 0 - 1, 3) { fnUsesF64Push = true }
   if blockHasStrOp(blockIx, 0 - 1) { fnUsesStrOp = true }
   if blockHasMapOp(blockIx, 0 - 1) { fnUsesMap = true }
   collectRefPushSlots(blockIx, 0 - 1)
@@ -11760,6 +12756,7 @@ function startScanIf(ifIx: i32): i32 {
     if exprHasMemberPopKind(st.ifCond, 0 - 1, 0) { fnUsesPush = true }
     if exprHasMemberPopKind(st.ifCond, 0 - 1, 1) { fnUsesRefPush = true }
     if exprHasMemberPopKind(st.ifCond, 0 - 1, 2) { fnUsesStrPush = true }
+    if exprHasMemberPopKind(st.ifCond, 0 - 1, 3) { fnUsesF64Push = true }
     startScanBlock(st.ifThen)
     if st.ifElse >= 0 {
       let els = P.nodes[st.ifElse]
@@ -11774,6 +12771,7 @@ function startFnDetectScratch(): i32 {
   fnUsesPush = false
   fnUsesRefPush = false
   fnUsesStrPush = false
+  fnUsesF64Push = false
   fnUsesStrOp = false
   fnUsesMap = false
   fnUsesCallRef = false
@@ -11794,6 +12792,7 @@ function startFnDetectScratch(): i32 {
         if exprHasMemberPopKind(ix, 0 - 1, 0) { fnUsesPush = true }
         if exprHasMemberPopKind(ix, 0 - 1, 1) { fnUsesRefPush = true }
         if exprHasMemberPopKind(ix, 0 - 1, 2) { fnUsesStrPush = true }
+        if exprHasMemberPopKind(ix, 0 - 1, 3) { fnUsesF64Push = true }
         if exprHasStrOp(ix, 0 - 1) { fnUsesStrOp = true }
         if exprHasMapOp(ix, 0 - 1) { fnUsesMap = true }
         if fnValUsed { if blockHasCallRef(ix, 0 - 1) { fnUsesCallRef = true } }
@@ -11835,9 +12834,11 @@ function startFnDetectScratch(): i32 {
       if stmtIsPushKind(startStmts[si], 0 - 1, 0) { fnUsesPush = true }
       if stmtIsPushKind(startStmts[si], 0 - 1, 1) { fnUsesRefPush = true }
       if stmtIsPushKind(startStmts[si], 0 - 1, 2) { fnUsesStrPush = true }
+      if stmtIsPushKind(startStmts[si], 0 - 1, 3) { fnUsesF64Push = true }
       if exprHasMemberPopKind(startStmts[si], 0 - 1, 0) { fnUsesPush = true }
       if exprHasMemberPopKind(startStmts[si], 0 - 1, 1) { fnUsesRefPush = true }
       if exprHasMemberPopKind(startStmts[si], 0 - 1, 2) { fnUsesStrPush = true }
+      if exprHasMemberPopKind(startStmts[si], 0 - 1, 3) { fnUsesF64Push = true }
       if exprHasStrOp(startStmts[si], 0 - 1) { fnUsesStrOp = true }
       if exprHasMapOp(startStmts[si], 0 - 1) { fnUsesMap = true }
       if fnValUsed { if blockHasCallRef(startStmts[si], 0 - 1) { fnUsesCallRef = true } }
@@ -11966,7 +12967,10 @@ function emitStartFnCode(out: i32[]): i32 {
             // A map global's start-fn init seeds the map SHAPE (mirrors the
             // local-`let` seeding) so `Map()` builds THIS global's map struct.
             if gck == 6 { pendingMapSlot = letMapShapeOf(globalStmts[gi], 0 - 1) }
+            // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2.
+            pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
             if emitExpr(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+            pendingNulBool = false
             pendingMapSlot = 0 - 1
           }
           let setPrev = wTarget(bodyExpr)
@@ -12181,7 +13185,11 @@ function emitModule(stmts: i32[]): i32 {
       wULEB(cnt)
       let fj = 0
       while fj < cnt {
-        pushFieldStorage(sFieldTypeAt(si, fj), sFieldRefSlot(si, fj))
+        let fjCode = sFieldTypeAt(si, fj)
+        let fjSlot = sFieldRefSlot(si, fj)
+        // A NESTED-STRUCT field (code 15) passes its TARGET struct table index.
+        if fjCode == 15 { fjSlot = structIndexByName(sFieldElemNameAt(si, fj)) }
+        pushFieldStorage(fjCode, fjSlot)
         wU8(1)                   // mutable
         fj = fj + 1
       }
@@ -12202,7 +13210,11 @@ function emitModule(stmts: i32[]): i32 {
       wULEB(cnt)
       let fj = 0
       while fj < cnt {
-        pushFieldStorage(variantFieldTypeAt(vi, fj), variantFieldRefSlot(vi, fj))
+        let vjCode = variantFieldTypeAt(vi, fj)
+        let vjSlot = variantFieldRefSlot(vi, fj)
+        // A NESTED-STRUCT variant field (code 15) passes its struct table index.
+        if vjCode == 15 { vjSlot = structIndexByName(uFieldElemName[uFieldStart[vi] + fj]) }
+        pushFieldStorage(vjCode, vjSlot)
         wU8(1)                   // mutable
         fj = fj + 1
       }
@@ -12967,9 +13979,36 @@ function fieldTypeCode(tyIx: i32): i32 {
       if nameIsStringArray(ty.tyName) { return 6 }
       return 5
     }
+    // A field naming ANOTHER STRUCT (`inner: Inner`) or a NULLABLE struct
+    // (`next: Node|null`) stores a `(ref null $S)` — code 15. Resolved via the
+    // DECLARATION scan (not the incrementally-built struct table) so a forward /
+    // mutually-recursive reference ties in the shared rec group.
+    let base = ty.tyName
+    let nb = nullablePartOf(base)
+    if nb != "" { base = nb }
+    if nameIsStructDecl(base) { return 15 }
     return 0 - 1
   }
   0 - 1
+}
+
+// True if `name` is a STANDALONE struct `type` declaration's name — independent of
+// the (incrementally-built) struct table, so a struct field may reference a LATER
+// struct declaration. Union aliases and union variants are excluded (their fields
+// ride the variant tables, not the struct table).
+function nameIsStructDecl(name: string): boolean {
+  if name == "" { return false }
+  if isUName(name) { return false }
+  if variantIndexOf(name) >= 0 { return false }
+  let i = 0
+  while i < P.nodes.length {
+    let nd = P.nodes[i]
+    if nd is TypeDecl {
+      if nd.tdName == name { return true }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // The ref-list ELEMENT type-NAME of a field whose type node is `tyIx` — the table key
@@ -12978,7 +14017,19 @@ function fieldTypeCode(tyIx: i32): i32 {
 // being fully populated (collectS builds it incrementally; a field may reference a
 // later-declared struct). Used to fill `sFieldElemName`/`uFieldElemName`.
 function fieldRefElemName(tyIx: i32): string {
-  if fieldTypeCode(tyIx) != 5 { return "" }
+  let code = fieldTypeCode(tyIx)
+  // A NESTED-STRUCT field (code 15) records its TARGET struct name (the `S` of
+  // `inner: S` / `next: S|null`) — resolved to a struct table index at use sites.
+  if code == 15 {
+    let ty15 = P.nodes[tyIx]
+    if ty15 is TypeRef {
+      let base = nullablePartOf(ty15.tyName)
+      if base != "" { return base }
+      return ty15.tyName
+    }
+    return ""
+  }
+  if code != 5 { return "" }
   let ty = P.nodes[tyIx]
   if ty is TypeRef {
     return ty.tyName.slice(0, ty.tyName.length - 2)
@@ -13078,6 +14129,22 @@ function collectA(stmts: i32[]): i32 {
           mUsed = true
           lUsed = true
           aUsed = true
+        }
+      }
+      // A `<recv>.push("…")` (string-LITERAL argument) appends to a STRING list:
+      // the usage-driven inference for an un-annotated empty `[]` binding makes
+      // its receiver a `string[]`, so force the string-list types. Idempotent
+      // when an annotation already forced them (a string push onto a non-string
+      // list is a checker error, so this never fires spuriously).
+      if cf is Member {
+        if cf.memProp == "push" {
+          if nd.callArgs.length == 1 {
+            let spArg = P.nodes[nd.callArgs[0]]
+            if spArg is StrLit {
+              slUsed = true
+              aUsed = true
+            }
+          }
         }
       }
     } else if nd is TypeRef {
@@ -13304,6 +14371,150 @@ function anonFieldCode(valIx: i32): i32 {
   if e is Ident {
     if nameNamesFunction(e.identName) { return 14 }
   }
+  // An i32-element array literal field (`tags: [1, 2, 3]`) is an i32 list (code 4).
+  if e is ArrayLit {
+    if e.arrElems.length > 0 {
+      let ae = P.nodes[e.arrElems[0]]
+      if ae is NumLit { return 4 }
+    }
+    return 0 - 1
+  }
+  // A NESTED object-literal field (`pos: { x: 1 }`) is a nested-struct ref (code
+  // 15) once the inner literal's shape resolves — the parser interns children
+  // before parents (lower arena indices), so a linear collect sees it.
+  if e is ObjLit {
+    if structIndexOfObj(valIx) >= 0 { return 15 }
+    return 0 - 1
+  }
+  0 - 1
+}
+
+// The `sFieldElemName` entry for an ANONYMOUS-shape field: the nested struct's
+// table NAME for a code-15 field (`pos: { x: 1 }` → the inner shape's synthetic
+// name), "" otherwise.
+function anonFieldElemName(valIx: i32, code: i32): string {
+  if code != 15 { return "" }
+  let si = structIndexOfObj(valIx)
+  if si >= 0 { return sNames[si] }
+  ""
+}
+
+// The per-field wasm-type code an INLINE OBJECT-TYPE annotation member names
+// (`x:i32` → 0, `name:string` → 3, `tags:i32[]` → 4, …) — the NAME-level mirror
+// of `fieldTypeCode` (which reads a TypeRef node).
+function nameFieldCode(t: string): i32 {
+  if t == "i32" { return 0 }
+  if t == "boolean" { return 0 }
+  if nameIsString(t) { return 3 }
+  if nameIsArray(t) {
+    if nameIsI32Array(t) { return 4 }
+    if nameIsStringArray(t) { return 6 }
+    return 5
+  }
+  let base = t
+  let nb = nullablePartOf(base)
+  if nb != "" { base = nb }
+  if nameIsStructDecl(base) { return 15 }
+  0 - 1
+}
+
+// Intern every INLINE OBJECT-TYPE annotation (`(p: { x: i32 })`, `: { x: i32 } |
+// null` — the synthetic `{x:i32}` TypeRef names) as an anonymous struct shape, so
+// a literal with the same field-name SET (`{ x: n }`, even one whose field VALUES
+// are param reads `anonFieldCode` cannot classify) matches it via
+// `structIndexOfObj`, and `S|null` returns/params resolve their base shape.
+// Idempotent per field-name set; a module with no inline object annotation interns
+// nothing (byte-identical goldens).
+function collectAnnShapes(): i32 {
+  let ti = 0
+  while ti < P.nodes.length {
+    let tn = P.nodes[ti]
+    if tn is TypeRef {
+      let nm = tn.tyName
+      // Strip a trailing `|null` (the nullable wrapper around the shape).
+      let nb = nullablePartOf(nm)
+      if nb != "" { nm = nb }
+      // Strip trailing `[]` suffixes (`{v:i32}[]` — an inline-shape ELEMENT type).
+      while nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
+        nm = nm.slice(0, nm.length - 2)
+      }
+      if nm.length >= 2 {
+        if nm[0] == '{' && nm[1] != '[' && nm[nm.length - 1] == '}' {
+          let inner = nm.slice(1, nm.length - 1)
+          // Split `x:i32,y:string` into names + codes at depth 0.
+          let names: string[] = []
+          let codes: i32[] = []
+          let ok = true
+          let depth = 0
+          let start = 0
+          let k = 0
+          while k <= inner.length {
+            let atEnd = k == inner.length
+            let brk = false
+            if !atEnd {
+              if inner[k] == '{' || inner[k] == '[' || inner[k] == '(' { depth = depth + 1 }
+              if inner[k] == '}' || inner[k] == ']' || inner[k] == ')' { depth = depth - 1 }
+              if inner[k] == ',' && depth == 0 { brk = true }
+            } else {
+              brk = true
+            }
+            if brk {
+              let part = inner.slice(start, k)
+              // part is `name:type` — split at the first `:`.
+              let ci = part.indexOf(":")
+              if ci <= 0 {
+                ok = false
+              } else {
+                let fc = nameFieldCode(part.slice(ci + 1, part.length))
+                if fc < 0 { ok = false }
+                names.push(part.slice(0, ci))
+                codes.push(fc)
+              }
+              start = k + 1
+            }
+            k = k + 1
+          }
+          if ok && names.length > 0 {
+            if annShapeIndexOf(names) < 0 {
+              sDeclared = true
+              // Interned under the ANNOTATION TEXT itself (`{v:i32}`) — a real
+              // key, so `structIndexByName` on a ref-list element name (`{v:i32}[]`
+              // → `{v:i32}`) resolves directly.
+              sNames.push(nm)
+              sFieldStart.push(sFieldNames.length)
+              sFieldCount.push(codes.length)
+              let pi = 0
+              while pi < codes.length {
+                sFieldNames.push(names[pi])
+                sFieldTypes.push(codes[pi])
+                sFieldElemName.push("")
+                pi = pi + 1
+              }
+            }
+          }
+        }
+      }
+    }
+    ti = ti + 1
+  }
+  0
+}
+
+// The struct table index whose field-name SET matches `names` exactly, or -1.
+function annShapeIndexOf(names: string[]): i32 {
+  let si = 0
+  while si < sNames.length {
+    if sFieldCount[si] == names.length {
+      let allIn = true
+      let i = 0
+      while i < names.length {
+        if sFieldIndex(si, names[i]) < 0 { allIn = false }
+        i = i + 1
+      }
+      if allIn { return si }
+    }
+    si = si + 1
+  }
   0 - 1
 }
 
@@ -13326,6 +14537,7 @@ function collectAnonShapes(): i32 {
         let fields = an.objFields
         let codes: i32[] = []
         let names: string[] = []
+        let elemNames: string[] = []
         let ok = true
         let fi = 0
         while fi < fields.length {
@@ -13335,6 +14547,7 @@ function collectAnonShapes(): i32 {
             if code < 0 { ok = false }
             codes.push(code)
             names.push(f.fiName)
+            elemNames.push(anonFieldElemName(f.fiValue, code))
           } else {
             ok = false
           }
@@ -13353,12 +14566,14 @@ function collectAnonShapes(): i32 {
           while pi < codes.length {
             sFieldNames.push(names[pi])
             sFieldTypes.push(codes[pi])
-            sFieldElemName.push("")
+            sFieldElemName.push(elemNames[pi])
             // A function-valued field (code 14) interns a closure cell `(ref
             // $cloStruct)`; flag the module so the closure rec-group types are
             // emitted even when no lambda is otherwise lifted (e.g. a top-level
             // function used purely as a struct-field value, `{ f: inc }`).
             if codes[pi] == 14 { fnValUsed = true }
+            // (A code-4 i32-list field always rides an ArrayLit value, which the
+            // later `collectA` arena scan classifies — `lUsed`/`aUsed` set there.)
             pi = pi + 1
           }
         }
@@ -13419,6 +14634,9 @@ function collectS(stmts: i32[]): i32 {
     }
     i = i + 1
   }
+  // Inline object-TYPE annotation shapes first, so a literal whose values are
+  // unclassifiable param reads (`{ x: n }`) still matches the annotation's shape.
+  collectAnnShapes()
   collectAnonShapes()
 }
 
@@ -14051,6 +15269,19 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
       if si >= 0 { return si }
     }
   }
+  // A field read `o.inner` whose field is a NESTED STRUCT (code 15) yields the
+  // field's target struct — so `o.inner.v` chains and `n.next` re-enters as `S|null`.
+  if e is Member {
+    let msi = structIndexOfExpr(e.memObj, fnIx)
+    if msi >= 0 {
+      let mfi = sFieldIndex(msi, e.memProp)
+      if mfi >= 0 {
+        if sFieldTypeAt(msi, mfi) == 15 {
+          return structIndexByName(sFieldElemNameAt(msi, mfi))
+        }
+      }
+    }
+  }
   0 - 1
 }
 
@@ -14549,7 +15780,14 @@ function letAnnRefListKind(letIx: i32): i32 {
   // over the let's `letType` so the let / return / call-arg / global seeds agree.
   let d = P.nodes[letIx]
   if d is LetDecl {
-    return tyAnnRefListKind(d.letType)
+    let k = tyAnnRefListKind(d.letType)
+    if k == 0 {
+      // An UN-ANNOTATED empty `[]` whose pushes infer a string element
+      // (`letInfStrListByUse`) seeds the string-list kind, so the empty literal
+      // builds the string-list wrapper (not the default i32 list).
+      if letInfStrListByUse(letIx) { return 3 }
+    }
+    return k
   }
   0
 }
@@ -14671,7 +15909,48 @@ function letIsStringArray(letIx: i32, fnIx: i32): boolean {
         if nameIsStringArray(lt.tyName) { return true }
       }
     }
-    return exprStringArray(d.letInit, fnIx)
+    if exprStringArray(d.letInit, fnIx) { return true }
+    return letInfStrListByUse(letIx)
+  }
+  false
+}
+
+// USAGE-DRIVEN element inference for an UN-ANNOTATED EMPTY `[]` binding: the
+// element type comes from what is PUSHED — a string-literal argument makes the
+// binding a `string[]` (`const xs = []; xs.push("hi")`), mirroring the host
+// checker's usage-driven inference. Scans the whole arena for a
+// `<name>.push("…")` call; string LITERAL arguments only (a richer operand would
+// need the full classifier, which would recurse back into this binding).
+function letInfStrListByUse(letIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    if d.letInit < 0 { return false }
+    let ini = P.nodes[unwrapParen(d.letInit)]
+    if ini is ArrayLit {
+      if ini.arrElems.length != 0 { return false }
+      let i = 0
+      while i < P.nodes.length {
+        let nd = P.nodes[i]
+        if nd is Call {
+          let callee = P.nodes[nd.callFn]
+          if callee is Member {
+            if callee.memProp == "push" {
+              let recv = P.nodes[callee.memObj]
+              if recv is Ident {
+                if recv.identName == d.letName {
+                  if nd.callArgs.length == 1 {
+                    let argN = P.nodes[unwrapParen(nd.callArgs[0])]
+                    if argN is StrLit { return true }
+                  }
+                }
+              }
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
   }
   false
 }
