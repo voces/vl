@@ -221,7 +221,7 @@ export const GOLDENS: Golden[] = [
   {
     name: "g_map",
     covers:
-      "map struct (5 fields); hash/probe/rehash/resize; set/get/has; map scratch frame (12 slots)",
+      "map struct (6 fields, host-aligned: keys/vals/live/index/count/size); hash/probe/rehash/resize; set/get/has; map scratch frame (13 slots)",
     src: [
       "function main(): i32 {",
       "  let m: {[string]: i32} = Map()",

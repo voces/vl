@@ -266,6 +266,19 @@ GOLDENS.forEach((g, which) => {
       const actual = new Uint8Array(len);
       for (let i = 0; i < len; i++) actual[i] = emitter.rbyteAt(i);
 
+      // RE-PIN MODE (`UPDATE_GOLDENS=1`): overwrite the pinned bytes with the
+      // self-emitter's CURRENT output instead of asserting. The goldens are a
+      // native self-snapshot (there is no host-side golden test — see header), so
+      // a DELIBERATE emitter/representation change re-pins them here, and the
+      // FULL fixpoint (`SELFHOST_FULL_FIXPOINT=1`) + native-fixpoint.sh +
+      // behavioral parity (native-align / host-parity / corpus-run) are what
+      // actually validate the change. Guarded behind an env flag so an ordinary
+      // run can never silently bless a regression.
+      if (Deno.env.get("UPDATE_GOLDENS") === "1") {
+        Deno.writeFileSync(goldenPath(g.name), actual);
+        return;
+      }
+
       const expected = Deno.readFileSync(goldenPath(g.name));
       const diff = firstDiff(expected, actual);
       if (diff) {
