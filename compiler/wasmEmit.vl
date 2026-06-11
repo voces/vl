@@ -11840,6 +11840,8 @@ function globalCellKind(letIx: i32): i32 {
     }
     // No annotation: a const literal init types itself; a non-const un-annotated init is
     // out of scope (no annotation to derive from) and `globalKind` returns its best guess.
+    // An empty `[]` whose PUSHES infer a string element is the string list (kind 7).
+    if letInfStrListByUse(letIx) { return 7 }
     return globalKind(d.letInit)
   }
   0
@@ -13674,6 +13676,22 @@ function collectA(stmts: i32[]): i32 {
           aUsed = true
         }
       }
+      // A `<recv>.push("…")` (string-LITERAL argument) appends to a STRING list:
+      // the usage-driven inference for an un-annotated empty `[]` binding makes
+      // its receiver a `string[]`, so force the string-list types. Idempotent
+      // when an annotation already forced them (a string push onto a non-string
+      // list is a checker error, so this never fires spuriously).
+      if cf is Member {
+        if cf.memProp == "push" {
+          if nd.callArgs.length == 1 {
+            let spArg = P.nodes[nd.callArgs[0]]
+            if spArg is StrLit {
+              slUsed = true
+              aUsed = true
+            }
+          }
+        }
+      }
     } else if nd is TypeRef {
       if nameIsMap(nd.tyName) {
         // A `{[string]: i32}` annotation (G8) is a string-keyed map: the map struct
@@ -15143,7 +15161,14 @@ function letAnnRefListKind(letIx: i32): i32 {
   // over the let's `letType` so the let / return / call-arg / global seeds agree.
   let d = P.nodes[letIx]
   if d is LetDecl {
-    return tyAnnRefListKind(d.letType)
+    let k = tyAnnRefListKind(d.letType)
+    if k == 0 {
+      // An UN-ANNOTATED empty `[]` whose pushes infer a string element
+      // (`letInfStrListByUse`) seeds the string-list kind, so the empty literal
+      // builds the string-list wrapper (not the default i32 list).
+      if letInfStrListByUse(letIx) { return 3 }
+    }
+    return k
   }
   0
 }
@@ -15265,7 +15290,48 @@ function letIsStringArray(letIx: i32, fnIx: i32): boolean {
         if nameIsStringArray(lt.tyName) { return true }
       }
     }
-    return exprStringArray(d.letInit, fnIx)
+    if exprStringArray(d.letInit, fnIx) { return true }
+    return letInfStrListByUse(letIx)
+  }
+  false
+}
+
+// USAGE-DRIVEN element inference for an UN-ANNOTATED EMPTY `[]` binding: the
+// element type comes from what is PUSHED — a string-literal argument makes the
+// binding a `string[]` (`const xs = []; xs.push("hi")`), mirroring the host
+// checker's usage-driven inference. Scans the whole arena for a
+// `<name>.push("…")` call; string LITERAL arguments only (a richer operand would
+// need the full classifier, which would recurse back into this binding).
+function letInfStrListByUse(letIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    if d.letInit < 0 { return false }
+    let ini = P.nodes[unwrapParen(d.letInit)]
+    if ini is ArrayLit {
+      if ini.arrElems.length != 0 { return false }
+      let i = 0
+      while i < P.nodes.length {
+        let nd = P.nodes[i]
+        if nd is Call {
+          let callee = P.nodes[nd.callFn]
+          if callee is Member {
+            if callee.memProp == "push" {
+              let recv = P.nodes[callee.memObj]
+              if recv is Ident {
+                if recv.identName == d.letName {
+                  if nd.callArgs.length == 1 {
+                    let argN = P.nodes[unwrapParen(nd.callArgs[0])]
+                    if argN is StrLit { return true }
+                  }
+                }
+              }
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
   }
   false
 }

@@ -86,6 +86,7 @@ const WHITELIST = [
   "arrays/infer-empty-from-usage.vl",
   "arrays/infer-empty-index-set.vl",
   "arrays/infer-empty-push.vl",
+  "arrays/infer-empty-string.vl",
   "arrays/map-filter-f64.vl",
   "arrays/map-filter-inferred-callbacks.vl",
   "arrays/map-filter.vl",
