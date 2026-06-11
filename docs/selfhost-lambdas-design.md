@@ -214,6 +214,44 @@ A non-capturing lambda uses the **same** struct with `env = ref.null structref`;
 callee ignores its leading env param. This keeps "every function value is one heap
 type" (the host's interchangeability win) without a table.
 
+#### Pros / cons — `call_ref`+closure-struct vs `call_indirect`+table+i32-index
+
+The two representations are runtime-equivalent in what they express (a function value
+plus its env, dispatched at an unknown-at-compile-time target). They differ mostly in
+emitter mechanics, and — once `vl build -O` runs — barely at all in the emitted code.
+
+| | `call_ref` + typed-funcref closure struct (**recommended**) | `call_indirect` + table + i32 index (host TS) |
+|---|---|---|
+| New section machinery | one **declarative** elem section (id 9, form 0x03), emitted only when a `ref.func` exists | an **active** table section + an active elem section + table min/max sizing |
+| Type interning | one `$fnsig` functype per distinct env-leading signature, in the existing rec group | same `$fnsig` for `call_indirect`'s type operand, **plus** the table type |
+| Value payload | `(ref $fnsig)` funcref (typed) | `i32` table index (untyped — a wrong index is a runtime trap, not a validation error) |
+| Type safety | structurally typed; mismatched call = **validation** error | index is opaque i32; mismatch = **runtime** `call_indirect` trap |
+| Per-call cost | `call_ref` = load funcref from struct, indirect branch | `call_indirect` = bounds-check index, load from table, type-check tag, indirect branch (the bounds + RTT tag check are extra) |
+| Code size | `struct.new`/`struct.get` + `ref.func` + `call_ref` | `i32.const idx` + `struct`/global plumbing + `call_indirect` (table operand) |
+| Emitter fit | reuses existing struct + rec-group + functype interning; **no new index space** | net-new table index space + table-bounds bookkeeping the emitter has nothing like today |
+
+So on **perf and size the two are ~neutral** (if anything `call_ref` shaves the
+`call_indirect` bounds+tag check, but that is noise next to the indirect branch itself);
+the deciding factor is **emitter simplicity** — `call_ref` needs no table machinery the
+emitter doesn't already have, and gets compile-time type safety for free.
+
+**"Assume we had binaryen's machinery" — does the choice change?** No, and this is the
+key point for the review question. Binaryen (and the host TS's table choice) makes tables
+cheap to *emit*, which is why the host picked `call_indirect`. But the representation is
+not where the performance lives. The real lever is **optimization**, and both forms feed
+the same optimizer: `vl build -O` runs the value through **wasm-opt / binaryen**, which
+does **escape analysis** (a closure that never escapes its creating frame is
+scalar-replaced — the struct alloc disappears), **devirtualization** (a `call_ref`/
+`call_indirect` whose target is statically a single known function is rewritten to a
+direct `call`), **inlining** (the now-direct callee body is inlined), and **DCE** (the
+dead closure struct / table entry is removed). After `-O`, a non-capturing `xs.map(f)`
+with a known `f` collapses to the same direct-call loop **regardless** of which
+representation the front end emitted. The emitter's job is therefore to emit the
+**simplest correct lowering** and let `-O` recover the performance — which is another
+argument for `call_ref` (simpler to emit), not for the table. The closure struct +
+`call_ref` is the easier thing for binaryen's escape analysis to scalar-replace, too,
+since it is a plain struct with no table-index indirection to see through.
+
 ### 3.3 The desugar-to-loop shortcut for `.map`/`.filter` — assessed, and it is BLOCKED
 The task asks whether step (3) — `.map`/`.filter` desugared to a loop with an **inline**
 lambda body — is a small self-contained win needing no first-class closures.
@@ -246,6 +284,22 @@ risks a subtle wasm-validity bug (the substituted body must be emitted with the 
 filter, which re-reads `elem(i)` — host does this carefully at `toWasm.ts:2231–2233`).
 A partial win that turns no file green and adds a substitution path is not worth the
 gate exposure ahead of the real ABI.
+
+**And, decisively: the inline-desugar is an *optimization*, not a correctness
+requirement — and it is one `vl build -O` already performs.** The generic loop emits a
+`call_ref` per element against the callback's closure value; when the callback is a
+known, non-capturing, single-expression `function` literal, wasm-opt/binaryen
+**devirtualizes** that `call_ref` to a direct call (the target is statically known) and
+then **inlines** the one-expression body into the loop — producing exactly the
+hand-substituted loop the desugar would have emitted, with the dead closure struct
+scalar-replaced away by escape analysis. So building the inline-desugar in the front end
+would be **duplicating work the optimizer does for free**, on a narrower input set, at
+the cost of a substitution path with its own re-evaluation hazard. The correct division
+of labor (the same "emit-simple, optimize-with-`-O`" principle as §3.2) is: **the
+emitter emits one thing — the generic closure-calling loop — for every `.map`/`.filter`,
+and `-O` recovers the inline form** where it applies. Slice 3 is therefore scoped to the
+generic loop *only*; Slice 3a is retained below strictly as a documented non-goal /
+"don't build this" note, not a planned slice.
 
 ### 3.4 Goldens / fixpoint interaction (why this is gate-safe to *build*)
 - **No golden program uses a lambda, a function value, or `.map`/`.filter`** (the 14
@@ -340,9 +394,13 @@ Build the shared machinery on the easy case (no env):
 - emit the host's inline loop (`toWasm.ts:2181–2244`): build the callback's closure
   value once, pre-size the backing, loop, `call_ref` the closure per element, build the
   result list wrapper; `filter` writes survivors compactly with `len=j, cap=n`.
-- **Slice 3a (optional micro-shortcut, §3.3):** for a **non-capturing, single-
-  expression** inline `function` callback, substitute `param → src[i]` and inline the
-  body — skips the closure alloc for that one common case. Head start, not a replacement.
+- **Slice 3a — DON'T BUILD (documented non-goal, §3.3):** front-end inline-desugar of a
+  non-capturing single-expression callback (`param → src[i]`) is an **optimization that
+  `vl build -O` already performs** — wasm-opt devirtualizes the known-target `call_ref`,
+  inlines the body, and scalar-replaces the dead closure. Emitting it by hand would
+  duplicate the optimizer on a narrower input set and add a substitution/re-evaluation
+  hazard. Slice 3 emits **only** the generic closure-calling loop; this is kept as a
+  "don't build this" marker, not a planned slice.
 - **Unblocks:** `arrays/map-filter.vl`, `lists/struct-pop-get-map.vl` (the `.map`
   half), and — once the i32-element loop works — the f64/i64 element loop is the same
   with the per-element backing type swapped.
@@ -388,7 +446,7 @@ Gates (all must stay green; never regenerate goldens):
 | 1 (non-cap value, `call_ref` ABI) | **low IF** zero new types + no section 9 for no-lambda programs | low (compiler source uses no function value) | the central discipline; `mAssignTypeIndices` drift-assert guards it |
 | 2 (capturing env) | low (only capturing programs mint an env) | low | reuses Slice 1 ABI |
 | 3 (map/filter loop) | low (only `.map`/`.filter` sites) | low | additive method arm |
-| 3a (inline desugar) | low | low | but turns **no file** fully green alone — not worth it ahead of 1–3 |
+| 3a (inline desugar) | — | — | **non-goal** — `-O` (wasm-opt) recovers this from Slice 3's generic loop; don't build |
 | 4 (f64/i64 element) | low | low | element-type swap |
 | 5 (param infer + text) | **none on emit** (checker-only) | none | one diagnostic file's text changes |
 
