@@ -1288,10 +1288,15 @@ let fnStmts: i32[] = []
 // All lambdas in the corpus share `(structref, i32) -> i32`, so one `$fnsig` suffices.
 let fnValUsed: boolean = false
 let cloStructIdx: i32 = 0    // the closure fat-pointer struct heap-type index
-// The distinct value-call ARITIES (declared param counts) any function value can be
-// called with — one `$fnsig` env-leading functype `(structref, i32*arity)->i32` is
-// interned per entry, in this order. `cloSigBase` is the type index of the first.
-let cloSigArities: i32[] = []
+// The distinct value-call SIGNATURES any function value can be called with — one
+// `$fnsig` env-leading functype `(structref, params...) -> ret` is interned per
+// distinct signature KEY (`fnSigKeyOf`), in first-seen `fnStmts` order. `cloSigRepFn`
+// holds a representative function per key (its param/return kinds drive the functype
+// bytes); `cloSigBase` is the type index of the first. Keys carry the full param +
+// return kinds (not just the arity): `.map`/`.filter` callbacks introduce f64 and
+// struct-ref params and f64 results beside the original all-i32 lambdas.
+let cloSigKeys: string[] = []
+let cloSigRepFn: i32[] = []
 let cloSigBase: i32 = 0
 // Per-lifted-function env struct heap-type index, parallel to `fnStmts` (-1 = the
 // function captures nothing, so its closure env is `ref.null structref`). Filled by
@@ -1440,44 +1445,176 @@ function collectFns(stmts: i32[]): i32 {
     liftFnsInExpr(startStmts[si], 0 - 1)
     si = si + 1
   }
-  // Collect the distinct param ARITIES across all lifted functions — one `$fnsig`
-  // env-leading functype is interned per arity (a function value of arity k is called
-  // via `call_ref (structref, i32*k)->i32`). Conservatively covers every function's
-  // arity (any could be used as a value).
-  cloSigArities = []
-  if fnValUsed {
-    let ai = 0
-    while ai < fnStmts.length {
-      let afn = P.nodes[fnStmts[ai]]
-      if afn is FuncDecl {
-        let ar = afn.fnParams.length
-        if !arityKnown(ar) { cloSigArities.push(ar) }
-      }
-      ai = ai + 1
-    }
-  }
+  // The `$fnsig` signature collection happens LATER (`collectCloSigs`, after
+  // `computeRetInference`): a signature key reads each function's param AND return
+  // kinds, and an un-annotated callback's return kind is only known once inference ran.
+  cloSigKeys = []
+  cloSigRepFn = []
   fnStmts.length
 }
 
-// True if arity `ar` is already in `cloSigArities`.
-function arityKnown(ar: i32): boolean {
-  let i = 0
-  while i < cloSigArities.length {
-    if cloSigArities[i] == ar { return true }
-    i = i + 1
+// The interning KEY for lifted function `fe`'s env-leading `$fnsig`, or "" when the
+// signature is not function-value-eligible (a void / closure-returning function, or a
+// param/return kind outside i32/boolean, f64, struct ref). The key encodes the param
+// kinds (with the struct TABLE index for a struct param — stable, assigned by
+// `collectS`) and the return kind, so two functions share one `$fnsig` exactly when
+// their env-leading functypes are byte-identical.
+function fnSigKeyOf(fe: i32): string {
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  let fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    let key = ""
+    let params = fn.fnParams
+    let pi = 0
+    while pi < params.length {
+      let k = vtKindOfParam(params[pi])
+      if k == 0 {
+        key = key + "i"
+      } else if k == 11 {
+        key = key + "d"
+      } else if k == 1 {
+        key = key + "s" + i32ToStr(paramStructIdxOf(params[pi])) + ";"
+      } else {
+        return ""
+      }
+      pi = pi + 1
+    }
+    let r = cloRetKindOf(fe)
+    if r == 0 { return key + ">i" }
+    if r == 11 { return key + ">d" }
+    return ""
+  }
+  ""
+}
+
+// The VALUE-ABI return kind of lifted function `fe` for `$fnsig` purposes: `0`
+// (i32/boolean), `11` (f64), or `-1` (void / closure-returning / any other kind).
+// Annotated returns read the annotation; un-annotated ones ride the inferred fRet*
+// tables, plus a registry-INDEPENDENT f64 tail check (`tailIsF64NoLocal` — the
+// general `exprIsF64` consults the per-function locals registry, whose contents
+// depend on WHICH function is currently being emitted, so the key must not use it).
+function cloRetKindOf(fe: i32): i32 {
+  if fe < 0 || fe >= fnStmts.length { return 0 - 1 }
+  if fe >= fRetVoid.length { return 0 - 1 }
+  let fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fRetVoid[fe] == 1 { return 0 - 1 }
+    if fnReturnsClosure(fe) { return 0 - 1 }
+    if fn.fnRet >= 0 {
+      let k = vtKindOfType(fn.fnRet)
+      if k == 0 { return 0 }
+      if k == 11 { return 11 }
+      return 0 - 1
+    }
+    // Un-annotated: any inferred ref/i64/f32 kind is out of the value ABI; an f64
+    // tail is kind 11; everything else (i32 / boolean) rides the i32 result.
+    if fRetStr[fe] == 1 { return 0 - 1 }
+    if fRetArr[fe] == 1 { return 0 - 1 }
+    if fRetUni[fe] == 1 { return 0 - 1 }
+    if fRetRef[fe] == 1 { return 0 - 1 }
+    if fRetNul[fe] == 1 { return 0 - 1 }
+    if fRetRArr[fe] == 1 { return 0 - 1 }
+    if fRetStrArr[fe] == 1 { return 0 - 1 }
+    if fRetI64[fe] == 1 { return 0 - 1 }
+    if fRetF32[fe] == 1 { return 0 - 1 }
+    if fRetF64[fe] == 1 { return 11 }
+    if tailIsF64NoLocal(fnRetExprOf(fnStmts[fe]), fnStmts[fe]) { return 11 }
+    return 0
+  }
+  0 - 1
+}
+
+// Registry-independent f64-ness of a lifted callback's tail expression: float
+// literals, f64 PARAMS, f64 arithmetic over those, and f64-returning named calls.
+// Deliberately avoids `declaredF64`/`declaredSlotOf` (the locals registry belongs to
+// whichever function is currently being emitted), so the answer is STABLE whether
+// asked during sig collection or during section emission.
+function tailIsF64NoLocal(ix: i32, fnArenaIx: i32): boolean {
+  if ix < 0 { return false }
+  let e = P.nodes[ix]
+  if e is NumLit { return numTextIsFloat(e.numText) }
+  if e is Paren { return tailIsF64NoLocal(e.parInner, fnArenaIx) }
+  if e is Ident { return paramIsF64(fnArenaIx, e.identName) }
+  if e is BinExpr {
+    let op = e.binOp
+    if op == "+" || op == "-" || op == "*" || op == "/" {
+      if tailIsF64NoLocal(e.binLeft, fnArenaIx) { return true }
+      return tailIsF64NoLocal(e.binRight, fnArenaIx)
+    }
+    return false
+  }
+  if e is Unary {
+    if e.unOp == "-" { return tailIsF64NoLocal(e.unArg, fnArenaIx) }
+    return false
+  }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      let t = fnIndexOf(callee.identName)
+      if t >= 0 { if t < fRetF64.length { return fRetF64[t] == 1 } }
+    }
+    return false
   }
   false
 }
 
-// The type index of the `$fnsig` functype for value-call arity `ar`
-// (`cloSigBase + position in cloSigArities`), or -1 if not interned.
-function fnSigIdxForArity(ar: i32): i32 {
+// Collect the distinct `$fnsig` env-leading functypes — one per distinct eligible
+// signature KEY across all lifted functions (any could be used as a value), in
+// `fnStmts` order. Runs AFTER `computeRetInference` (the key reads inferred return
+// kinds) and after `collectMapFilterUse` (which may flip `fnValUsed` for a program
+// whose only function value is a named `.map`/`.filter` callback). Empty (zero new
+// types) unless `fnValUsed` — the byte-identical-golden invariant.
+function collectCloSigs(): i32 {
+  cloSigKeys = []
+  cloSigRepFn = []
+  if !fnValUsed { return 0 }
+  let fe = 0
+  while fe < fnStmts.length {
+    let key = fnSigKeyOf(fe)
+    if key != "" {
+      if cloSigPosOfKey(key) < 0 {
+        cloSigKeys.push(key)
+        cloSigRepFn.push(fe)
+      }
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// The position of `key` in `cloSigKeys`, or -1.
+function cloSigPosOfKey(key: string): i32 {
   let i = 0
-  while i < cloSigArities.length {
-    if cloSigArities[i] == ar { return cloSigBase + i }
+  while i < cloSigKeys.length {
+    if cloSigKeys[i] == key { return i }
     i = i + 1
   }
   0 - 1
+}
+
+// The `$fnsig` type index for lifted function `fe`'s own signature, or -1 when its
+// signature is not value-eligible / not interned.
+function fnSigIdxOfFn(fe: i32): i32 {
+  let key = fnSigKeyOf(fe)
+  if key == "" { return 0 - 1 }
+  let p = cloSigPosOfKey(key)
+  if p < 0 { return 0 - 1 }
+  cloSigBase + p
+}
+
+// The type index of the all-i32 `$fnsig` functype for value-call arity `ar`
+// (`(structref, i32 * ar) -> i32`) — the signature every GENERIC value call (a
+// let-bound / param / field closure `f(args)`) dispatches through. -1 if not interned.
+function fnSigIdxForArity(ar: i32): i32 {
+  let key = ""
+  let i = 0
+  while i < ar {
+    key = key + "i"
+    i = i + 1
+  }
+  let p = cloSigPosOfKey(key + ">i")
+  if p < 0 { return 0 - 1 }
+  cloSigBase + p
 }
 
 // Recursively walk the node at `ix` (a statement or expression subtree) and append
@@ -1723,7 +1860,9 @@ function exprNullableStruct(exprIx: i32, fnIx: i32): boolean {
   if e is Call {
     let callee = P.nodes[e.callFn]
     if callee is Ident { return fnRetNulRef(callee.identName) }
-    return false
+    // `xs.pop()` / `xs.get(i)` over a STRUCT-element ref list yield `S | null` (the
+    // host's nullable list reads — `pop` of an empty list / OOB `get` is null).
+    return structListPopGetElem(exprIx, fnIx) >= 0
   }
   if e is Ident {
     if paramNulRef(fnIx, e.identName) { return true }
@@ -2217,37 +2356,14 @@ function fnEnvIdxOf(fe: i32): i32 {
 }
 
 // True if function `fe`'s env-leading signature matches an interned `$fnsig`
-// `(structref, i32 * arity) -> i32` — every param i32, an i32 (or inferred-i32) result,
-// non-void. Such a function is declared with `fnSigIdxForArity` as its functype (so its
-// ACTUAL type IS `$fnsig`), making `ref.func` of it yield a value the `call_ref` site's
-// `ref.cast` to `$fnsig` accepts. A function with a non-i32 param/return keeps its own
-// functype and cannot be used as a value (none in the corpus are).
+// `(structref, params...) -> ret` (`fnSigKeyOf` eligibility: i32/boolean, f64, or
+// struct-ref params; an i32/boolean or f64 result; non-void). Such a function is
+// declared with `fnSigIdxOfFn` as its functype (so its ACTUAL type IS `$fnsig`),
+// making `ref.func` of it yield a value the `call_ref` site's `ref.cast` to `$fnsig`
+// accepts. A function outside the eligible kinds keeps its own functype and cannot
+// be used as a value (none in the corpus are).
 function fnSigIsClosure(fe: i32): boolean {
-  if fe < 0 || fe >= fnStmts.length { return false }
-  let fn = P.nodes[fnStmts[fe]]
-  if fn is FuncDecl {
-    let params = fn.fnParams
-    let pi = 0
-    while pi < params.length {
-      if vtKindOfParam(params[pi]) != 0 { return false }   // every param must be i32
-      pi = pi + 1
-    }
-    if fRetVoid[fe] == 1 { return false }
-    if fnReturnsClosure(fe) { return false }
-    if fn.fnRet >= 0 { return vtKindOfType(fn.fnRet) == 0 }
-    // Un-annotated: i32 unless a non-i32 kind was inferred.
-    if fRetStr[fe] == 1 { return false }
-    if fRetArr[fe] == 1 { return false }
-    if fRetUni[fe] == 1 { return false }
-    if fRetRef[fe] == 1 { return false }
-    if fRetNul[fe] == 1 { return false }
-    if fRetRArr[fe] == 1 { return false }
-    if fRetI64[fe] == 1 { return false }
-    if fRetF64[fe] == 1 { return false }
-    if fRetF32[fe] == 1 { return false }
-    return true
-  }
-  false
+  fnSigIdxOfFn(fe) >= 0
 }
 
 // The arena index of the parent frame's binding for a captured `name` — the parent
@@ -4743,6 +4859,182 @@ let mapScratchBase: i32 = 0
 let fnUsesCallRef: boolean = false
 let callRefSlot: i32 = 0
 
+// ── `.map` / `.filter` scratch frame (the HOF loop — Slices 3–4) ───────────────
+// A `.map`/`.filter` call lowers to an inline closure-calling loop (mirroring the
+// host's `lowerMapMethodCall`) that needs: 3 shared i32 temporaries (`i` the loop
+// index, `n` the source length, `j` the filter write cursor), one `(ref $cloStruct)`
+// slot holding the callback's closure (built ONCE before the loop), one typed SOURCE
+// slot per distinct receiver list type (the receiver wrapper ref, evaluated once),
+// and one typed DEST slot per distinct result element kind (the fresh backing).
+// `mfScratchBase` is the wasm index of `i` (+1 n, +2 j, +3 clo); the src/dst slots
+// follow. `mfSrcKinds[k]` is `0` (i32 list) / `1` (f64 list) / `2` (ref list, whose
+// table slot is `mfSrcSlots[k]`); `mfDstKinds[k]` is `0` (i32 backing) / `1` (f64
+// backing). Reserved only in a function whose body contains a `.map`/`.filter` over
+// a list (`mfScan`) — every other function's frame layout is byte-identical.
+let fnUsesMapFilter: boolean = false
+let mfScratchBase: i32 = 0
+let mfSrcKinds: i32[] = []
+let mfSrcSlots: i32[] = []
+let mfSrcBases: i32[] = []
+let mfDstKinds: i32[] = []
+let mfDstBases: i32[] = []
+
+// Record a distinct (kind, ref-list slot) source frame requirement.
+function mfRecordSrc(kind: i32, slot: i32): i32 {
+  let i = 0
+  while i < mfSrcKinds.length {
+    if mfSrcKinds[i] == kind && mfSrcSlots[i] == slot { return 0 }
+    i = i + 1
+  }
+  mfSrcKinds.push(kind)
+  mfSrcSlots.push(slot)
+  0
+}
+
+// Record a distinct result-element-kind dest frame requirement.
+function mfRecordDst(kind: i32): i32 {
+  let i = 0
+  while i < mfDstKinds.length {
+    if mfDstKinds[i] == kind { return 0 }
+    i = i + 1
+  }
+  mfDstKinds.push(kind)
+  0
+}
+
+// The wasm local holding the SOURCE wrapper ref for (kind, slot), or -1.
+function mfSrcLocalFor(kind: i32, slot: i32): i32 {
+  let i = 0
+  while i < mfSrcKinds.length {
+    if mfSrcKinds[i] == kind && mfSrcSlots[i] == slot {
+      if i < mfSrcBases.length { return mfSrcBases[i] }
+    }
+    i = i + 1
+  }
+  0 - 1
+}
+
+// The wasm local holding the DEST backing ref for result kind `kind`, or -1.
+function mfDstLocalFor(kind: i32): i32 {
+  let i = 0
+  while i < mfDstKinds.length {
+    if mfDstKinds[i] == kind {
+      if i < mfDstBases.length { return mfDstBases[i] }
+    }
+    i = i + 1
+  }
+  0 - 1
+}
+
+// Walk the statement/expression tree at `ix`, recording every `.map`/`.filter` call
+// over a LIST receiver into the scratch-frame requirement lists above (and setting
+// `fnUsesMapFilter`). Mirrors `blockHasCallRef`'s node coverage; a nested `FuncDecl`
+// (a lifted callback literal) is NOT descended — its own body's sites are detected
+// when that lifted function is emitted.
+function mfScan(ix: i32, fnIx: i32): i32 {
+  if ix < 0 { return 0 }
+  let n = P.nodes[ix]
+  if n is Call {
+    let callee = P.nodes[n.callFn]
+    if callee is Member {
+      if callee.memProp == "map" || callee.memProp == "filter" {
+        if n.callArgs.length == 1 {
+          let rk = mfRecvKindOf(callee.memObj, fnIx)
+          if rk >= 0 {
+            fnUsesMapFilter = true
+            let slot = 0 - 1
+            if rk == 2 { slot = refListSlotOfExpr(callee.memObj, fnIx) }
+            mfRecordSrc(rk, slot)
+            let resK = mfResultKindOf(ix, fnIx)
+            if resK >= 0 { mfRecordDst(resK) }
+          }
+        }
+      }
+    }
+    mfScan(n.callFn, fnIx)
+    let args = n.callArgs
+    let i = 0
+    while i < args.length {
+      mfScan(args[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is Block {
+    let stmts = n.blkStmts
+    let i = 0
+    while i < stmts.length {
+      mfScan(stmts[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is LetDecl {
+    if n.letInit >= 0 { mfScan(n.letInit, fnIx) }
+    return 0
+  }
+  if n is RetStmt {
+    if n.retArg >= 0 { mfScan(n.retArg, fnIx) }
+    return 0
+  }
+  if n is IfStmt {
+    mfScan(n.ifCond, fnIx)
+    mfScan(n.ifThen, fnIx)
+    if n.ifElse >= 0 { mfScan(n.ifElse, fnIx) }
+    return 0
+  }
+  if n is WhileStmt {
+    mfScan(n.whileCond, fnIx)
+    mfScan(n.whileBody, fnIx)
+    return 0
+  }
+  if n is ForRange {
+    mfScan(n.frFrom, fnIx)
+    mfScan(n.frTo, fnIx)
+    if n.frStep >= 0 { mfScan(n.frStep, fnIx) }
+    mfScan(n.frBody, fnIx)
+    return 0
+  }
+  if n is ForIn {
+    mfScan(n.fiIter, fnIx)
+    mfScan(n.fiBody, fnIx)
+    return 0
+  }
+  if n is BinExpr {
+    mfScan(n.binLeft, fnIx)
+    mfScan(n.binRight, fnIx)
+    return 0
+  }
+  if n is Unary { return mfScan(n.unArg, fnIx) }
+  if n is Paren { return mfScan(n.parInner, fnIx) }
+  if n is Member { return mfScan(n.memObj, fnIx) }
+  if n is Index {
+    mfScan(n.idxArr, fnIx)
+    mfScan(n.idxIndex, fnIx)
+    return 0
+  }
+  if n is ObjLit {
+    let fields = n.objFields
+    let i = 0
+    while i < fields.length {
+      let f = P.nodes[fields[i]]
+      if f is FieldInit { mfScan(f.fiValue, fnIx) }
+      i = i + 1
+    }
+    return 0
+  }
+  if n is ArrayLit {
+    let elems = n.arrElems
+    let i = 0
+    while i < elems.length {
+      mfScan(elems[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  0
+}
+
 // True if function `fnIx` operates on a map — it has a map PARAM, or `buildLocals`
 // flagged a map LOCAL (code `6`). Drives the map scratch-frame reservation. (Run
 // AFTER `buildLocals`, so `localIsRef` is populated.)
@@ -6225,6 +6517,21 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       if callee.memProp == "pop" {
         return emitPop(body, exprIx, fnIx)
       }
+      // `xs.get(i)` over a STRUCT-element ref list: the checked nullable read —
+      // in-bounds yields the (still nullable) element slot, out-of-bounds `ref.null $S`.
+      if callee.memProp == "get" {
+        if structListPopGetElem(exprIx, fnIx) >= 0 {
+          return emitListGet(body, exprIx, fnIx)
+        }
+      }
+      // `xs.map(f)` / `xs.filter(p)` over a LIST receiver lower to the inline
+      // closure-calling loop (Slices 3–4). A non-list receiver falls through (a
+      // function-valued struct FIELD named `map` is a `call_ref` member call).
+      if callee.memProp == "map" || callee.memProp == "filter" {
+        if mfRecvKindOf(callee.memObj, fnIx) >= 0 {
+          return emitMapFilter(body, exprIx, fnIx)
+        }
+      }
     }
     return emitCall(body, exprIx, fnIx)
   }
@@ -6277,7 +6584,7 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // receiver falls through to the struct path (which fails loudly if no such field),
     // matching the slice's scope.
     if e.memProp == "length" {
-      if exprArray(e.memObj, fnIx) || exprString(e.memObj, fnIx) || exprRefArray(e.memObj, fnIx) || exprStringArray(e.memObj, fnIx) {
+      if exprArray(e.memObj, fnIx) || exprString(e.memObj, fnIx) || exprRefArray(e.memObj, fnIx) || exprStringArray(e.memObj, fnIx) || exprF64Array(e.memObj, fnIx) {
         return emitArrLen(body, exprIx, fnIx)
       }
       // G8: `m.length` on a MAP is the LIVE entry count — struct field 4 (`size`),
@@ -6824,6 +7131,12 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
   }
   if e is Paren {
     return exprIsBool(e.parInner, fnIx)
+  }
+  if e is Index {
+    // An element read over a BOOLEAN-element list — today only a `.map` result whose
+    // callback returns boolean (`xs.map(function(n: i32) n > 2)[i]`) — prints as
+    // true/false. Any other index read keeps its i32 classification.
+    return mfArrElemIsBool(e.idxArr, fnIx)
   }
   if e is Unary {
     return e.unOp == "!"
@@ -7638,6 +7951,274 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32): i32 {
     }
   }
   emitFail("emitProgram: expected a .pop call")
+}
+
+// Lower a checked `.get(i)` over a STRUCT-element ref list onto `body`, leaving a
+// `(ref null $S)` on the stack: in-bounds yields the backing slot as-is (already
+// nullable-widened), out-of-bounds `ref.null $S` — `xs.get(9)` is `null`, mirroring
+// the host's checked list read. ONE unsigned compare (`idx u< len`) covers both the
+// negative and the past-len cases. The receiver and index are each emitted twice
+// (the bounds check + the read), so both must be PURE re-reads: a bare name receiver
+// and a literal/name index — anything else fails loudly.
+function emitListGet(body: i32[], callIx: i32, fnIx: i32): i32 {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if c.callArgs.length != 1 {
+        return emitFail("emitProgram: .get takes exactly one argument")
+      }
+      if structListPopGetElem(callIx, fnIx) < 0 || !rlUsed {
+        return emitFail("emitProgram: .get receiver is not a struct list")
+      }
+      let rslot = refListSlotOfExpr(callee.memObj, fnIx)
+      let elemHeap = rlElemHeap[rslot]
+      let recvN = P.nodes[unwrapParen(callee.memObj)]
+      let okRecv = false
+      if recvN is Ident { okRecv = true }
+      if !okRecv {
+        return emitFail("emitProgram: .get receiver must be a named list binding")
+      }
+      let idxN = P.nodes[unwrapParen(c.callArgs[0])]
+      let okIdx = false
+      if idxN is NumLit { okIdx = true }
+      if idxN is Ident { okIdx = true }
+      if !okIdx {
+        return emitFail("emitProgram: .get index must be a literal or a name")
+      }
+      // cond: idx u< len
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+      fbStructGet(rlWrapIdx[rslot], 1)    // field 1: len
+      fbI32Bin(73)                        // 0x49 i32.lt_u
+      // if (result (ref null $elem))
+      wU8(4)                              // 0x04 if
+      wU8(99)                             // 0x63 (ref null ht) result blocktype
+      wSLEB(elemHeap)
+      ctrlEnter()
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+      fbStructGet(rlWrapIdx[rslot], 0)    // field 0: backing
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+      fbArrayGet(rlBackIdx[rslot])        // -> (ref null $elem)
+      fbElse()                            // 0x05 else
+      wU8(208)                            // 0xd0 ref.null
+      wSLEB(elemHeap)
+      fbEnd()                             // 0x0b end
+      ctrlLeave()
+      return 0
+    }
+  }
+  emitFail("emitProgram: expected a .get call")
+}
+
+// Lower a `.map`/`.filter` HOF call onto `body`, leaving the RESULT list wrapper ref
+// on the stack. Mirrors the host's `lowerMapMethodCall` (`toWasm.ts:2143–2245`) over
+// the `call_ref` closure ABI — the generic closure-calling loop ONLY (the inline
+// desugar of single-expression callbacks is a documented non-goal; `vl build -O`
+// devirtualizes + inlines it):
+//   map:    n = len(src); back = array.new_default(<outElemArr>, n)
+//           for i in 0..n:  back[i] = call_ref(clo, [elem(i)])
+//           result = wrapper{ back, n, n }
+//   filter: n = len(src); back = array.new_default(<elemArr>, n); j = 0
+//           for i in 0..n:  if call_ref(clo, [elem(i)]): back[j] = elem(i); j++
+//           result = wrapper{ back, j, n }          // len = j, cap = n
+// The receiver is evaluated ONCE into the typed src slot; the callback's closure
+// value is built ONCE before the loop (an inline literal / named function emits
+// `emitClosureValue`; a let-bound value reads its binding). `filter` re-reads
+// `elem(i)` off the src backing for the survivor store (a pure re-read — the host
+// materializes it the same way). The result element kind is the callback's RETURN
+// kind for `map` (an i32→bool callback yields a bool/i32-element list; an f64
+// callback the f64 backing + wrapper), the receiver's element kind for `filter`.
+function emitMapFilter(body: i32[], callIx: i32, fnIx: i32): i32 {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      let isMap = callee.memProp == "map"
+      if c.callArgs.length != 1 {
+        return emitFail("emitProgram: .map/.filter takes exactly one callback argument")
+      }
+      let recvK = mfRecvKindOf(callee.memObj, fnIx)
+      if recvK < 0 {
+        return emitFail("emitProgram: .map/.filter receiver is not a supported list")
+      }
+      let resK = mfResultKindOf(callIx, fnIx)
+      if resK < 0 {
+        return emitFail("emitProgram: unsupported .map/.filter element type")
+      }
+      let cbFe = mfCallbackFe(c.callArgs[0], fnIx)
+      if cbFe < 0 {
+        return emitFail("emitProgram: unsupported .map/.filter callback")
+      }
+      let sig = fnSigIdxOfFn(cbFe)
+      if sig < 0 {
+        return emitFail("emitProgram: .map/.filter callback signature is not interned")
+      }
+      // The SOURCE wrapper/backing heap types (+ whether the element is a ref that
+      // needs `ref.as_non_null` after `array.get`).
+      let srcWrap = lTypeIdx
+      let srcBack = aTypeIdx
+      let srcElemRef = false
+      let srcSlot = 0 - 1
+      if recvK == 1 {
+        if !fa64Used {
+          return emitFail("emitProgram: .map/.filter over f64[] but f64 list type not collected")
+        }
+        srcWrap = fl64TypeIdx
+        srcBack = fa64TypeIdx
+      } else if recvK == 2 {
+        if !rlUsed {
+          return emitFail("emitProgram: .map/.filter over a ref list but ref list type not collected")
+        }
+        srcSlot = refListSlotOfExpr(callee.memObj, fnIx)
+        srcWrap = rlWrapIdx[srcSlot]
+        srcBack = rlBackIdx[srcSlot]
+        srcElemRef = true
+      } else if !lUsed || !aUsed {
+        return emitFail("emitProgram: .map/.filter but list type not collected")
+      }
+      // The RESULT wrapper/backing heap types.
+      let dstWrap = lTypeIdx
+      let dstBack = aTypeIdx
+      if resK == 1 {
+        if !fa64Used {
+          return emitFail("emitProgram: .map result is f64[] but f64 list type not collected")
+        }
+        dstWrap = fl64TypeIdx
+        dstBack = fa64TypeIdx
+      } else if !lUsed || !aUsed {
+        return emitFail("emitProgram: .map/.filter result but list type not collected")
+      }
+      let srcL = mfSrcLocalFor(recvK, srcSlot)
+      let dstL = mfDstLocalFor(resK)
+      if !fnUsesMapFilter || srcL < 0 || dstL < 0 {
+        return emitFail("emitProgram: .map/.filter scratch frame not reserved")
+      }
+      let iL = mfScratchBase
+      let nL = mfScratchBase + 1
+      let jL = mfScratchBase + 2
+      let cL = mfScratchBase + 3
+      // src = <receiver>, evaluated ONCE. (Any nested `.map`/`.filter` in the
+      // receiver chain completes — including its result wrapper — before this store,
+      // so the shared frame slots are free to reuse.)
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
+      fbLocalSet(srcL)
+      // clo = the callback's closure value, built ONCE before the loop. An inline
+      // literal / named function constructs it directly; a let-bound value reads its
+      // binding (an `Ident` read — it cannot itself contain a HOF site, so the frame
+      // slots written above stay live).
+      let cbNode = P.nodes[unwrapParen(c.callArgs[0])]
+      if cbNode is FuncDecl {
+        if emitClosureValue(body, cbFe, fnIx) < 0 { return 0 - 1 }
+      } else if cbNode is Ident {
+        if fnIndexOf(cbNode.identName) >= 0 {
+          if emitClosureValue(body, cbFe, fnIx) < 0 { return 0 - 1 }
+        } else if emitExpr(body, c.callArgs[0], fnIx) < 0 {
+          return 0 - 1
+        }
+      } else {
+        return emitFail("emitProgram: unsupported .map/.filter callback")
+      }
+      fbLocalSet(cL)
+      // n = src.len
+      fbLocalGet(srcL)
+      fbStructGet(srcWrap, 1)    // field 1: len
+      fbLocalSet(nL)
+      // back = array.new_default <dstBack> n
+      fbLocalGet(nL)
+      fbArrayNewDefault(dstBack)
+      fbLocalSet(dstL)
+      // i = 0 (and j = 0 for filter)
+      fbI32Const(0)
+      fbLocalSet(iL)
+      if !isMap {
+        fbI32Const(0)
+        fbLocalSet(jL)
+      }
+      // block { loop { if i >= n br 1; <element step>; i++; br 0 } }
+      fbBlock(64)                // 0x02 block (void)
+      ctrlEnter()
+      fbLoop(64)                 // 0x03 loop (void)
+      ctrlEnter()
+      fbLocalGet(iL)
+      fbLocalGet(nL)
+      fbI32Bin(78)               // 0x4e i32.ge_s — i >= n?
+      fbBrIf(1)                  // exit the block
+      if isMap {
+        // back[i] = call_ref(clo, [elem(i)])
+        fbLocalGet(dstL)
+        fbLocalGet(iL)
+        if emitMfInvoke(body, cL, srcL, iL, srcWrap, srcBack, srcElemRef, sig) < 0 {
+          return 0 - 1
+        }
+        fbArraySet(dstBack)      // 0xfb 0x0e <dstBack>
+      } else {
+        // if call_ref(clo, [elem(i)]): back[j] = elem(i); j++
+        if emitMfInvoke(body, cL, srcL, iL, srcWrap, srcBack, srcElemRef, sig) < 0 {
+          return 0 - 1
+        }
+        fbIf(64)                 // 0x04 if (void)
+        ctrlEnter()
+        fbLocalGet(dstL)
+        fbLocalGet(jL)
+        emitMfElem(body, srcL, iL, srcWrap, srcBack, srcElemRef)
+        fbArraySet(dstBack)
+        fbLocalGet(jL)
+        fbI32Const(1)
+        fbI32Bin(106)            // 0x6a i32.add
+        fbLocalSet(jL)
+        fbEnd()
+        ctrlLeave()
+      }
+      fbLocalGet(iL)
+      fbI32Const(1)
+      fbI32Bin(106)              // 0x6a i32.add
+      fbLocalSet(iL)
+      fbBr(0)                    // continue the loop
+      fbEnd()                    // end loop
+      ctrlLeave()
+      fbEnd()                    // end block
+      ctrlLeave()
+      // result = wrapper{ back, len, cap }: len = n (map) / j (filter), cap = n.
+      fbLocalGet(dstL)
+      if isMap {
+        fbLocalGet(nL)
+      } else {
+        fbLocalGet(jL)
+      }
+      fbLocalGet(nL)
+      fbStructNew(dstWrap)
+      return 0
+    }
+  }
+  emitFail("emitProgram: expected a .map/.filter call")
+}
+
+// Push `elem(i)` — `src.backing[i]` — onto the stack (`ref.as_non_null` for a ref
+// element, surfacing the non-null struct/union box).
+function emitMfElem(body: i32[], srcL: i32, iL: i32, srcWrap: i32, srcBack: i32, srcElemRef: boolean): i32 {
+  fbLocalGet(srcL)
+  fbStructGet(srcWrap, 0)        // field 0: backing
+  fbLocalGet(iL)
+  fbArrayGet(srcBack)            // 0xfb 0x0b <srcBack>
+  if srcElemRef {
+    wU8(212)                     // 0xd4 ref.as_non_null
+  }
+  0
+}
+
+// Invoke the callback closure (stashed in local `cL`) on `elem(i)`: push its env
+// (field 1), the element, its code funcref (field 0) cast to the concrete `$fnsig`,
+// then `call_ref $fnsig` — leaving the callback's result on the stack.
+function emitMfInvoke(body: i32[], cL: i32, srcL: i32, iL: i32, srcWrap: i32, srcBack: i32, srcElemRef: boolean, sig: i32): i32 {
+  fbLocalGet(cL)
+  fbStructGet(cloStructIdx, 1)   // env
+  emitMfElem(body, srcL, iL, srcWrap, srcBack, srcElemRef)
+  fbLocalGet(cL)
+  fbStructGet(cloStructIdx, 0)   // code (funcref)
+  fbRefCast(sig)                 // 0xfb 0x16 <fnsig>
+  fbCallRef(sig)                 // 0x14 <fnsig>
+  0
 }
 
 // `local.get L ; struct.get $lTy 1` — push the list's `len` field onto `body`.
@@ -8537,7 +9118,13 @@ function checkParams(fnIx: i32): i32 {
       let p = P.nodes[params[pi]]
       if p is Param {
         if p.parType < 0 {
-          return emitFail("emitProgram: parameter needs an i32 type")
+          // An UN-ANNOTATED parameter — a contextually-inferred callback literal
+          // (`xs.map(function(n) n * 2)`, Slice 5's checker half). The checker has
+          // already pinned its type from the receiver; this emitter's default kind
+          // for a missing annotation is i32 (`vtKindOfType(-1)` → 0), which is the
+          // only inferred-param receiver element kind in scope. Accepted as-is.
+          pi = pi + 1
+          continue
         }
         let ty = P.nodes[p.parType]
         if ty is TypeRef {
@@ -8636,6 +9223,23 @@ function fbBeginFunc(nParams: i32, nLocals: i32): i32 {
   // Closure scratch frame (1 slot, a `(ref $cloStruct)`) for `call_ref` (lambdas).
   callRefSlot = fbScratchCur
   if fnUsesCallRef { fbReserve(1) }
+  // `.map`/`.filter` HOF frame: 4 shared slots (i, n, j, the callback closure), then
+  // one typed src-wrapper slot per distinct receiver list type and one typed
+  // dst-backing slot per distinct result element kind.
+  mfScratchBase = fbScratchCur
+  if fnUsesMapFilter { fbReserve(4) }
+  mfSrcBases = []
+  let mfk = 0
+  while mfk < mfSrcKinds.length {
+    mfSrcBases.push(fbReserve(1))
+    mfk = mfk + 1
+  }
+  mfDstBases = []
+  let mfd = 0
+  while mfd < mfDstKinds.length {
+    mfDstBases.push(fbReserve(1))
+    mfd = mfd + 1
+  }
   fbScratchCur
 }
 
@@ -8680,6 +9284,8 @@ function fbLocalsCount(nLocals: i32): i32 {
   if fnUsesStrOp { n = n + 7 }
   if fnUsesMap { n = n + 12 }
   if fnUsesCallRef { n = n + 1 }
+  if fnUsesMapFilter { n = n + 4 }
+  n = n + mfSrcKinds.length + mfDstKinds.length
   n
 }
 
@@ -8759,6 +9365,35 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32): i32 {
   if fnUsesCallRef {
     fbRefRun(cloStructIdx)
   }
+  // `.map`/`.filter` HOF frame: i, n, j (3 i32) + the callback closure
+  // (ref $cloStruct), then the typed src-wrapper slots, then the typed dst-backing
+  // slots — in `fbBeginFunc`'s reservation order.
+  if fnUsesMapFilter {
+    fbI32Run()
+    fbI32Run()
+    fbI32Run()
+    fbRefRun(cloStructIdx)
+  }
+  let mfv = 0
+  while mfv < mfSrcKinds.length {
+    if mfSrcKinds[mfv] == 1 {
+      fbRefRun(fl64TypeIdx)
+    } else if mfSrcKinds[mfv] == 2 {
+      fbRefRun(rlWrapIdx[mfSrcSlots[mfv]])
+    } else {
+      fbRefRun(lTypeIdx)
+    }
+    mfv = mfv + 1
+  }
+  let mfw = 0
+  while mfw < mfDstKinds.length {
+    if mfDstKinds[mfw] == 1 {
+      fbRefRun(fa64TypeIdx)
+    } else {
+      fbRefRun(aTypeIdx)
+    }
+    mfw = mfw + 1
+  }
   wTarget(prev)
   0
 }
@@ -8815,6 +9450,15 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     // frame as a ref `.push` onto that slot — record its slot too, so a pop-only function
     // reserves the frame whose `recvRef` holds the field's wrapper ref.
     collectMemberPopRefSlots(fn.fnBody, fnIx)
+    // Collect the `.map`/`.filter` HOF sites this body lowers (each reserves the
+    // shared 4-slot frame + one typed src/dst slot per distinct receiver/result type).
+    fnUsesMapFilter = false
+    mfSrcKinds = []
+    mfSrcSlots = []
+    mfSrcBases = []
+    mfDstKinds = []
+    mfDstBases = []
+    mfScan(fn.fnBody, fnIx)
     let nLocals = localNames.length
     // Lay out every scratch frame after the params + declared locals via the
     // FuncBuilder cursor (Phase H), which sets `pushScratchBase` /
@@ -9345,6 +9989,7 @@ function globalKind(initIx: i32): i32 {
   if exprString(initIx, 0 - 1) { return 3 }
   if exprStringArray(initIx, 0 - 1) { return 7 }
   if exprRefArray(initIx, 0 - 1) { return 5 }
+  if exprF64Array(initIx, 0 - 1) { return 12 }
   if exprUnion(initIx, 0 - 1) { return 4 }
   if exprStruct(initIx, 0 - 1) { return 1 }
   if exprArray(initIx, 0 - 1) { return 2 }
@@ -9504,6 +10149,8 @@ function fbRefNullForKind(kind: i32, structIdx: i32): i32 {
     wSLEB(mStructIdx)
   } else if kind == 7 {
     wSLEB(mkListIdx)
+  } else if kind == 12 {
+    wSLEB(fl64TypeIdx)           // the f64-list wrapper struct heap type (Slice 4)
   } else if kind == 14 {
     wSLEB(cloStructIdx)          // the closure fat-pointer struct heap type
   } else {
@@ -9833,10 +10480,10 @@ function mAssignTypeIndices(n: i32): i32 {
   if fnValUsed {
     cloStructIdx = mAllocType()
     if mAssertIdx(cloStructIdx, oldCloIdx, "cloStructIdx") < 0 { return 0 - 1 }
-    // One `$fnsig` functype per distinct value-call arity (`cloSigArities`).
+    // One `$fnsig` functype per distinct value-call signature (`cloSigKeys`).
     cloSigBase = mNextType
     let sa = 0
-    while sa < cloSigArities.length {
+    while sa < cloSigKeys.length {
       mAllocType()
       sa = sa + 1
     }
@@ -9869,9 +10516,9 @@ function mAssignTypeIndices(n: i32): i32 {
 // formula in step with the live counter.
 function fnClosureOffsetOf(): i32 {
   if !fnValUsed { return 0 }
-  // 1 closure struct + one `$fnsig` per distinct value-call arity + one env struct per
-  // capturing lifted function.
-  let total = 1 + cloSigArities.length
+  // 1 closure struct + one `$fnsig` per distinct value-call signature + one env struct
+  // per capturing lifted function.
+  let total = 1 + cloSigKeys.length
   let fe = 0
   while fe < fnStmts.length {
     if captureCountOf(fe) > 0 { total = total + 1 }
@@ -9971,6 +10618,12 @@ function startFnDetectScratch(): i32 {
   fnUsesCallRef = false
   fnRefPushSlots = []
   refPushBaseBySlot = []
+  fnUsesMapFilter = false
+  mfSrcKinds = []
+  mfSrcSlots = []
+  mfSrcBases = []
+  mfDstKinds = []
+  mfDstBases = []
   let gi = 0
   while gi < globalStmts.length {
     if globalIsNonConst(globalStmts[gi]) {
@@ -9984,9 +10637,19 @@ function startFnDetectScratch(): i32 {
         if exprHasMapOp(ix, 0 - 1) { fnUsesMap = true }
         if fnValUsed { if blockHasCallRef(ix, 0 - 1) { fnUsesCallRef = true } }
         collectMemberPopRefSlotsExpr(ix, 0 - 1)
+        // A `.map`/`.filter` in a non-const global initializer (`const ys =
+        // xs.map(...)`) runs in the start function — reserve its HOF frame here.
+        mfScan(ix, 0 - 1)
       }
     }
     gi = gi + 1
+  }
+  // `.map`/`.filter` sites in top-level STATEMENTS (`print(e.map(...).length)`)
+  // also run in the start function; `mfScan` recurses every statement shape itself.
+  let mfi = 0
+  while mfi < startStmts.length {
+    mfScan(startStmts[mfi], 0 - 1)
+    mfi = mfi + 1
   }
   // Top-level STATEMENTS may also need scratch (a `.push` / string op / map op in a
   // top-level `for`/`while`/`if` body or a bare call). Scan each through the same
@@ -10106,45 +10769,51 @@ function emitStartFnCode(out: i32[]): i32 {
   ctrlDepth = 0
   loopContDepth = []
   loopBrkDepth = []
+  // Non-const global initializers and top-level STATEMENTS run INTERLEAVED in source
+  // order (merged on arena index — top-level statements are parsed sequentially, so
+  // arena order IS source order): `xs.push(1)` before `const ys = xs.map(f)` must
+  // execute before that init. A program with only inits, or only statements, emits
+  // the exact same order as the previous inits-then-statements split (every golden
+  // has at most one of the two, so the bytes are unchanged). The emit context is
+  // module-level (`fnIx = -1`): identifier reads/writes resolve to globals.
   let gi = 0
-  while gi < globalStmts.length {
-    if globalIsNonConst(globalStmts[gi]) {
-      let g = P.nodes[globalStmts[gi]]
-      if g is LetDecl {
-        // Numeric WIDENING at the global-init boundary (a non-const `: f64`/`: f32`/`: i64`
-        // global whose init is a narrower numeric — e.g. `const b: f64 = a` with `a: i32`):
-        // the `emitExprAs*` helper inserts the lattice convert so the start-fn `global.set`
-        // matches the cell valtype. An i32 cell stays byte-identical. (Slice 5 widening.)
-        let gck = globalCellKind(globalStmts[gi])
-        if gck == 13 {
-          let savedF32 = pendingF32
-          pendingF32 = true
-          if emitExprAsF32(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
-          pendingF32 = savedF32
-        } else if gck == 11 {
-          if emitExprAsF64(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
-        } else if gck == 10 {
-          if emitExprAsI64(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
-        } else {
-          if emitExpr(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
-        }
-        let setPrev = wTarget(bodyExpr)
-        fbGlobalSet(gi)
-        wTarget(setPrev)
-      }
-    }
-    gi = gi + 1
-  }
-  // Top-level STATEMENTS, in source order (after the global inits — a statement may
-  // read any global; module-level `let`s are globals, so locals here are rare). The
-  // emit context is module-level (`fnIx = -1`): identifier reads/writes resolve to
-  // globals; a statement needing per-function scratch (push/string-op/map) is out of
-  // this slice and fails loudly at validation. Emitted INSIDE the `bodyExpr` writer
-  // binding so every byte lands in the start body, like the init exprs above.
   let si = 0
-  while si < startStmts.length {
-    if emitStmt(bodyExpr, startStmts[si], 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
-    si = si + 1
+  while gi < globalStmts.length || si < startStmts.length {
+    let takeGlobal = gi < globalStmts.length
+    if takeGlobal && si < startStmts.length {
+      if startStmts[si] < globalStmts[gi] { takeGlobal = false }
+    }
+    if takeGlobal {
+      if globalIsNonConst(globalStmts[gi]) {
+        let g = P.nodes[globalStmts[gi]]
+        if g is LetDecl {
+          // Numeric WIDENING at the global-init boundary (a non-const `: f64`/`: f32`/`: i64`
+          // global whose init is a narrower numeric — e.g. `const b: f64 = a` with `a: i32`):
+          // the `emitExprAs*` helper inserts the lattice convert so the start-fn `global.set`
+          // matches the cell valtype. An i32 cell stays byte-identical. (Slice 5 widening.)
+          let gck = globalCellKind(globalStmts[gi])
+          if gck == 13 {
+            let savedF32 = pendingF32
+            pendingF32 = true
+            if emitExprAsF32(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+            pendingF32 = savedF32
+          } else if gck == 11 {
+            if emitExprAsF64(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+          } else if gck == 10 {
+            if emitExprAsI64(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+          } else {
+            if emitExpr(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+          }
+          let setPrev = wTarget(bodyExpr)
+          fbGlobalSet(gi)
+          wTarget(setPrev)
+        }
+      }
+      gi = gi + 1
+    } else {
+      if emitStmt(bodyExpr, startStmts[si], 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+      si = si + 1
+    }
   }
   wTarget(exprPrev)
 
@@ -10492,21 +11161,26 @@ function emitModule(stmts: i32[]): i32 {
     wU8(99)                      // field 1 env: 0x63 (ref null ht)
     wU8(107)                     // ...to the abstract `struct` heaptype (structref)
     wU8(0)                       // immutable
-    // One env-leading `$fnsig` functype per distinct value-call arity, in arity order
-    // (`cloSigArities`): `(structref, i32 * arity) -> i32`.
+    // One env-leading `$fnsig` functype per distinct eligible SIGNATURE, in
+    // `cloSigKeys` order: `(structref, params...) -> ret`, the param/result valtypes
+    // read off the representative function (`cloSigRepFn` — every function sharing
+    // the key has byte-identical kinds, by construction of the key).
     let sai = 0
-    while sai < cloSigArities.length {
-      let ar = cloSigArities[sai]
-      wU8(96)                    // 0x60 func
-      wULEB(ar + 1)              // env + arity params
-      wU8(107)                   // param 0 env: structref (0x6b)
-      let pj = 0
-      while pj < ar {
-        wU8(127)                 // i32 param
-        pj = pj + 1
+    while sai < cloSigKeys.length {
+      let rep = P.nodes[fnStmts[cloSigRepFn[sai]]]
+      if rep is FuncDecl {
+        let rparams = rep.fnParams
+        wU8(96)                    // 0x60 func
+        wULEB(rparams.length + 1)  // env + declared params
+        wU8(107)                   // param 0 env: structref (0x6b)
+        let pj = 0
+        while pj < rparams.length {
+          fbValtype(vtKindOfParam(rparams[pj]), paramStructIdxOf(rparams[pj]))
+          pj = pj + 1
+        }
+        wU8(1)                     // 1 result
+        fbValtype(cloRetKindOf(cloSigRepFn[sai]), 0 - 1)   // i32 (0) or f64 (11)
       }
-      wU8(1)                     // 1 result
-      wU8(127)                   // i32 result
       sai = sai + 1
     }
     // One env struct per CAPTURING lifted function (`fnEnvIdx[fe] >= 0`), in `fnStmts`
@@ -10720,10 +11394,7 @@ function emitModule(stmts: i32[]): i32 {
     // site's `ref.cast` to `$fnsig` accepts (its ACTUAL type IS `$fnsig`). Others keep
     // their own functype. Only when `fnValUsed`. (Lambdas.)
     if fnValUsed && fnSigIsClosure(fi) {
-      let fnArity = 0
-      let ffn = P.nodes[fnStmts[fi]]
-      if ffn is FuncDecl { fnArity = ffn.fnParams.length }
-      wULEB(fnSigIdxForArity(fnArity))
+      wULEB(fnSigIdxOfFn(fi))
     } else {
       wULEB(typeOffset + fi)   // functype index
     }
@@ -12127,7 +12798,9 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
   if e is Call {
     let callee = P.nodes[e.callFn]
     if callee is Ident { return fnRetStructIndex(callee.identName) }
-    return 0 - 1
+    // `xs.pop()` / `xs.get(i)` over a struct-element ref list yield that list's
+    // element struct (as `S | null` — see `structListPopGetElem`).
+    return structListPopGetElem(exprIx, fnIx)
   }
   if e is Ident {
     let pi = paramStructIndex(fnIx, e.identName)
@@ -12381,6 +13054,10 @@ function exprArray(exprIx: i32, fnIx: i32): boolean {
   if e is Call {
     let callee = P.nodes[e.callFn]
     if callee is Ident { return fnRetArray(callee.identName) }
+    // `xs.map(f)` / `xs.filter(p)` yield a NEW list — the i32 list exactly when the
+    // result ELEMENT kind is i32/boolean (map: the callback's return kind; filter:
+    // the receiver's element kind).
+    if callIsMapFilter(exprIx, fnIx) { return mfResultKindOf(exprIx, fnIx) == 0 }
     return false
   }
   if e is Ident {
@@ -12818,6 +13495,12 @@ function exprF64Array(exprIx: i32, fnIx: i32): boolean {
     if paramF64Array(fnIx, e.identName) { return true }
     if declaredF64Array(e.identName) { return true }
     return globalIsF64Array(e.identName)
+  }
+  // A `.map`/`.filter` whose result ELEMENT kind is f64 yields an f64 list (an f64
+  // receiver's filter, or a map whose callback returns f64). (Slices 3–4.)
+  if e is Call {
+    if callIsMapFilter(exprIx, fnIx) { return mfResultKindOf(exprIx, fnIx) == 1 }
+    return false
   }
   false
 }
@@ -13490,6 +14173,214 @@ function structFieldIsClosure(si: i32, prop: string): boolean {
   false
 }
 
+// `xs.pop()` / `xs.get(i)` over a STRUCT-element ref list — the host types both as
+// `S | null`. Returns the element STRUCT TABLE INDEX, or -1 when the call is not such
+// a read. Restricted to plain-struct elements (`rlElemKindTbl == 1`): map-array
+// (`{[string]:i32}[]`, kind 3) and union-element (kind 2) pops keep their existing
+// classification (g_maparray's golden bytes depend on it).
+function structListPopGetElem(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 - 1 }
+  let e = P.nodes[exprIx]
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Member {
+      if callee.memProp == "pop" || callee.memProp == "get" {
+        if exprRefArray(callee.memObj, fnIx) {
+          let slot = refListSlotOfExpr(callee.memObj, fnIx)
+          if slot >= 0 && slot < rlElemKindTbl.length {
+            if rlElemKindTbl[slot] == 1 {
+              return structIndexByName(rlElemName[slot])
+            }
+          }
+        }
+      }
+    }
+  }
+  0 - 1
+}
+
+// ── `.map` / `.filter` classification (Slices 3–4) ─────────────────────────────
+
+// True if the expression at `exprIx` is a `.map`/`.filter` HOF call over a LIST
+// receiver (one callback argument). A member call named `map`/`filter` over a
+// NON-list receiver (e.g. a function-valued struct field) is NOT a HOF site.
+function callIsMapFilter(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Member {
+      if callee.memProp == "map" || callee.memProp == "filter" {
+        if e.callArgs.length == 1 {
+          return mfRecvKindOf(callee.memObj, fnIx) >= 0
+        }
+      }
+    }
+  }
+  false
+}
+
+// The RECEIVER list kind of a `.map`/`.filter` call: `0` (i32/boolean list), `1`
+// (f64 list), `2` (struct/union ref list), or -1 (not a supported list — a string
+// list or a non-list receiver).
+function mfRecvKindOf(recvIx: i32, fnIx: i32): i32 {
+  if exprF64Array(recvIx, fnIx) { return 1 }
+  if exprRefArray(recvIx, fnIx) { return 2 }
+  if exprStringArray(recvIx, fnIx) { return 0 - 1 }
+  if exprArray(recvIx, fnIx) { return 0 }
+  0 - 1
+}
+
+// The RESULT element kind of the `.map`/`.filter` call at `callIx`: `0` (i32/boolean
+// element — an i32 list result), `1` (f64 element — an f64 list result), or -1
+// (unsupported). `filter` keeps the receiver's element kind (a ref-list filter is
+// out of scope — it fails loudly at emit); `map`'s result element kind IS the
+// callback's RETURN kind (`cloRetKindOf`).
+function mfResultKindOf(callIx: i32, fnIx: i32): i32 {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "filter" {
+        let rk = mfRecvKindOf(callee.memObj, fnIx)
+        if rk == 0 { return 0 }
+        if rk == 1 { return 1 }
+        return 0 - 1
+      }
+      if c.callArgs.length == 1 {
+        let fe = mfCallbackFe(c.callArgs[0], fnIx)
+        if fe < 0 { return 0 - 1 }
+        let rk2 = cloRetKindOf(fe)
+        if rk2 == 0 { return 0 }
+        if rk2 == 11 { return 1 }
+      }
+      return 0 - 1
+    }
+  }
+  0 - 1
+}
+
+// Resolve a `.map`/`.filter` CALLBACK argument to its lifted-function position in
+// `fnStmts`: an inline `function(...)` literal (lifted by `collectFns`), a named
+// function reference, or a let-bound function value whose binding initializer is one
+// of those (a local `let` in the enclosing function, else a module global). -1 when
+// the callback's target function cannot be statically resolved.
+function mfCallbackFe(cbIx: i32, fnIx: i32): i32 {
+  if cbIx < 0 { return 0 - 1 }
+  let inner = unwrapParen(cbIx)
+  let e = P.nodes[inner]
+  if e is FuncDecl { return fnStmtsPosOf(inner) }
+  if e is Ident {
+    let t = fnIndexOf(e.identName)
+    if t >= 0 { return t }
+    let li = 0 - 1
+    if fnIx >= 0 {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+    }
+    if li < 0 { li = globalLetOf(e.identName) }
+    if li >= 0 {
+      let d = P.nodes[li]
+      if d is LetDecl {
+        if d.letInit >= 0 {
+          // Guard the degenerate self-referential binding against infinite recursion.
+          if unwrapParen(d.letInit) != inner { return mfCallbackFe(d.letInit, fnIx) }
+        }
+      }
+    }
+  }
+  0 - 1
+}
+
+// True if the lifted callback at `fe` returns a BOOLEAN (its annotation, or the
+// inferred `fRetBool`) — the element-bool-ness of a `.map` result, threaded to the
+// print import choice (`__print_bool__` renders true/false).
+function mfCbRetIsBool(fe: i32): boolean {
+  if fe < 0 || fe >= fnStmts.length { return false }
+  let fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 {
+      let rt = P.nodes[fn.fnRet]
+      if rt is TypeRef { return rt.tyName == "boolean" || rt.tyName == "bool" }
+      return false
+    }
+    if fe < fRetBool.length { return fRetBool[fe] == 1 }
+  }
+  false
+}
+
+// True if an INDEX READ over the list at `arrIx` yields a boolean element. Today the
+// only boolean-element list producer is a `.map` whose callback returns boolean
+// (`xs.map(function(n: i32) n > 2)`); a `.filter` keeps its receiver's element
+// bool-ness, and a module-global binding traces through its initializer.
+function mfArrElemIsBool(arrIx: i32, fnIx: i32): boolean {
+  if arrIx < 0 { return false }
+  let inner = unwrapParen(arrIx)
+  let e = P.nodes[inner]
+  if e is Call {
+    if callIsMapFilter(inner, fnIx) {
+      let callee = P.nodes[e.callFn]
+      if callee is Member {
+        if callee.memProp == "filter" {
+          return mfArrElemIsBool(callee.memObj, fnIx)
+        }
+        return mfCbRetIsBool(mfCallbackFe(e.callArgs[0], fnIx))
+      }
+    }
+    return false
+  }
+  if e is Ident {
+    let li = globalLetOf(e.identName)
+    if li >= 0 {
+      let d = P.nodes[li]
+      if d is LetDecl {
+        if d.letInit >= 0 {
+          if unwrapParen(d.letInit) != inner { return mfArrElemIsBool(d.letInit, 0 - 1) }
+        }
+      }
+    }
+  }
+  false
+}
+
+// Detect `.map`/`.filter` HOF sites up front (one arena scan, mirroring the print
+// scan): ANY site makes the program function-value-using (`fnValUsed` — the callback
+// is a closure value even when it is a bare named-function reference), and a `.map`
+// whose callback returns i32/boolean (f64) forces the i32 (f64) list types for the
+// RESULT list — the receiver may be a ref/f64 list that never otherwise touches
+// them. `.filter` reuses the receiver's own (already-collected) types. Runs after
+// `computeRetInference` (an un-annotated callback's return kind is inferred);
+// programs without `.map`/`.filter` set nothing — every golden stays byte-identical.
+function collectMapFilterUse(): i32 {
+  let i = 0
+  while i < P.nodes.length {
+    let nd = P.nodes[i]
+    if nd is Call {
+      let callee = P.nodes[nd.callFn]
+      if callee is Member {
+        if callee.memProp == "map" || callee.memProp == "filter" {
+          if nd.callArgs.length == 1 {
+            fnValUsed = true
+            if callee.memProp == "map" {
+              let fe = mfCallbackFe(nd.callArgs[0], 0 - 1)
+              let rk = 0
+              if fe >= 0 { rk = cloRetKindOf(fe) }
+              if rk == 11 {
+                fa64Used = true
+              } else {
+                aUsed = true
+                lUsed = true
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 function emitProgram(rootIx: i32): i32 {
   emitFailed = false
   emitErr = ""
@@ -13520,6 +14411,11 @@ function emitProgram(rootIx: i32): i32 {
     if buildFnMap(stmts) < 0 { return 0 - 1 }
     computeVoidFns()
     computeRetInference()
+    // `.map`/`.filter` sites flip `fnValUsed` (the callback is a function value) and
+    // force the RESULT list's types; the `$fnsig` signature set is then collected
+    // (both need the inferred return kinds, so they run after `computeRetInference`).
+    collectMapFilterUse()
+    collectCloSigs()
     // Detect `print(...)` anywhere in the program: any use pulls in the 4-import
     // print family (imports shift every local function's wasm index, so this is
     // decided up front; a print-free program emits no import section at all).
