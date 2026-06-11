@@ -1970,6 +1970,13 @@ function exprNullableStruct(exprIx: i32, fnIx: i32): boolean {
     if declaredNulRef(e.identName) { return true }
     return globalIsNulRef(e.identName)
   }
+  // A NESTED-STRUCT field read (code 15) is stored `(ref null $S)` — a `S|null`
+  // field genuinely carries null; a plain `inner: S` field is always written
+  // non-null but shares the nullable storage, so the read is nullable-classified
+  // (the consumer inserts `ref.as_non_null` before a chained field access).
+  if e is Member {
+    return memberFieldCode(exprIx, fnIx) == 15
+  }
   false
 }
 
@@ -4453,6 +4460,13 @@ function pushFieldStorage(code: i32, refSlot: i32): i32 {
   } else if code == 14 {
     wU8(100)                   // 0x64 (ref ht) — non-null closure fat-pointer ref
     wSLEB(cloStructIdx)        // the closure struct heap type (#306)
+  } else if code == 15 {
+    // A NESTED-STRUCT field: a NULLABLE ref to the target struct (`refSlot` is its
+    // struct TABLE index here). Nullable storage serves both the plain (`inner: S`,
+    // always written non-null) and the `S|null` field — and lets a recursive shape
+    // (`next: Node|null`) terminate. Forward indices resolve in the shared rec group.
+    wU8(99)                    // 0x63 (ref null ht)
+    wSLEB(sHeapIdx[refSlot])
   } else {
     wU8(127)                   // 0x7f i32 storagetype
   }
@@ -4547,8 +4561,11 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
       if valIx < 0 {
         return emitFail("emitProgram: object literal is missing a struct field")
       }
-      if exprStruct(valIx, fnIx) {
-        return emitFail("emitProgram: nested struct fields are not supported")
+      let scode = sFieldTypeAt(si, fi)
+      if scode != 15 {
+        if exprStruct(valIx, fnIx) {
+          return emitFail("emitProgram: nested struct fields are not supported")
+        }
       }
       // A ref-list field (`code 5`: `T[]`/`N[]`) whose value is an EMPTY `[]` literal
       // needs the element kind to build a REF-list (not an i32-list) wrapper — the same
@@ -4556,7 +4573,6 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
       // is global (union box `2` when a union is declared, else a struct `1`).
       pendingListKind = 0
       pendingListSlot = 0
-      let scode = sFieldTypeAt(si, fi)
       if scode == 5 {
         let fslot = sFieldRefSlot(si, fi)
         if fslot < 0 { fslot = 0 }
@@ -4565,7 +4581,15 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
       } else if scode == 6 {
         pendingListKind = 3
       }
+      // A NESTED-STRUCT field (code 15) seeds the TARGET struct so its literal
+      // builds that struct (not a field-shape guess) and a bare `null` value
+      // lowers as `ref.null $S`. Saved/restored around the field's own emit.
+      let savedPSI = pendingStructIdx
+      if scode == 15 {
+        pendingStructIdx = structIndexByName(sFieldElemNameAt(si, fi))
+      }
       if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+      if scode == 15 { pendingStructIdx = savedPSI }
       pendingListKind = 0
       fi = fi + 1
     }
@@ -12874,7 +12898,11 @@ function emitModule(stmts: i32[]): i32 {
       wULEB(cnt)
       let fj = 0
       while fj < cnt {
-        pushFieldStorage(sFieldTypeAt(si, fj), sFieldRefSlot(si, fj))
+        let fjCode = sFieldTypeAt(si, fj)
+        let fjSlot = sFieldRefSlot(si, fj)
+        // A NESTED-STRUCT field (code 15) passes its TARGET struct table index.
+        if fjCode == 15 { fjSlot = structIndexByName(sFieldElemNameAt(si, fj)) }
+        pushFieldStorage(fjCode, fjSlot)
         wU8(1)                   // mutable
         fj = fj + 1
       }
@@ -12895,7 +12923,11 @@ function emitModule(stmts: i32[]): i32 {
       wULEB(cnt)
       let fj = 0
       while fj < cnt {
-        pushFieldStorage(variantFieldTypeAt(vi, fj), variantFieldRefSlot(vi, fj))
+        let vjCode = variantFieldTypeAt(vi, fj)
+        let vjSlot = variantFieldRefSlot(vi, fj)
+        // A NESTED-STRUCT variant field (code 15) passes its struct table index.
+        if vjCode == 15 { vjSlot = structIndexByName(uFieldElemName[uFieldStart[vi] + fj]) }
+        pushFieldStorage(vjCode, vjSlot)
         wU8(1)                   // mutable
         fj = fj + 1
       }
@@ -13660,9 +13692,36 @@ function fieldTypeCode(tyIx: i32): i32 {
       if nameIsStringArray(ty.tyName) { return 6 }
       return 5
     }
+    // A field naming ANOTHER STRUCT (`inner: Inner`) or a NULLABLE struct
+    // (`next: Node|null`) stores a `(ref null $S)` — code 15. Resolved via the
+    // DECLARATION scan (not the incrementally-built struct table) so a forward /
+    // mutually-recursive reference ties in the shared rec group.
+    let base = ty.tyName
+    let nb = nullablePartOf(base)
+    if nb != "" { base = nb }
+    if nameIsStructDecl(base) { return 15 }
     return 0 - 1
   }
   0 - 1
+}
+
+// True if `name` is a STANDALONE struct `type` declaration's name — independent of
+// the (incrementally-built) struct table, so a struct field may reference a LATER
+// struct declaration. Union aliases and union variants are excluded (their fields
+// ride the variant tables, not the struct table).
+function nameIsStructDecl(name: string): boolean {
+  if name == "" { return false }
+  if isUName(name) { return false }
+  if variantIndexOf(name) >= 0 { return false }
+  let i = 0
+  while i < P.nodes.length {
+    let nd = P.nodes[i]
+    if nd is TypeDecl {
+      if nd.tdName == name { return true }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // The ref-list ELEMENT type-NAME of a field whose type node is `tyIx` — the table key
@@ -13671,7 +13730,19 @@ function fieldTypeCode(tyIx: i32): i32 {
 // being fully populated (collectS builds it incrementally; a field may reference a
 // later-declared struct). Used to fill `sFieldElemName`/`uFieldElemName`.
 function fieldRefElemName(tyIx: i32): string {
-  if fieldTypeCode(tyIx) != 5 { return "" }
+  let code = fieldTypeCode(tyIx)
+  // A NESTED-STRUCT field (code 15) records its TARGET struct name (the `S` of
+  // `inner: S` / `next: S|null`) — resolved to a struct table index at use sites.
+  if code == 15 {
+    let ty15 = P.nodes[tyIx]
+    if ty15 is TypeRef {
+      let base = nullablePartOf(ty15.tyName)
+      if base != "" { return base }
+      return ty15.tyName
+    }
+    return ""
+  }
+  if code != 5 { return "" }
   let ty = P.nodes[tyIx]
   if ty is TypeRef {
     return ty.tyName.slice(0, ty.tyName.length - 2)
@@ -14758,6 +14829,19 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
       let nm = refListElemNameOfExpr(e.idxArr, fnIx)
       let si = structIndexByName(nm)
       if si >= 0 { return si }
+    }
+  }
+  // A field read `o.inner` whose field is a NESTED STRUCT (code 15) yields the
+  // field's target struct — so `o.inner.v` chains and `n.next` re-enters as `S|null`.
+  if e is Member {
+    let msi = structIndexOfExpr(e.memObj, fnIx)
+    if msi >= 0 {
+      let mfi = sFieldIndex(msi, e.memProp)
+      if mfi >= 0 {
+        if sFieldTypeAt(msi, mfi) == 15 {
+          return structIndexByName(sFieldElemNameAt(msi, mfi))
+        }
+      }
     }
   }
   0 - 1
