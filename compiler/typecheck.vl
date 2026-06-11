@@ -526,6 +526,17 @@ let inferStack: string[] = []
 let inferObserved: i32 = -1
 let inferSawErr: boolean = false
 
+// Contextual callback-param inference: when checking a function-literal argument
+// whose expected type is known from the call site (a `.map`/`.filter` receiver's
+// element type, or any HOF whose param is a known `TyFunc`), the caller stashes
+// the expected param types here BEFORE checking the literal. `checkFuncDeclNode`
+// consumes them — binding an UN-annotated param to the expected type rather than
+// reporting "cannot infer a type for parameter" — then clears them. The buffer is
+// single-shot (consumed by the next FuncDecl check and reset), so it never leaks
+// into a nested or unrelated function body.
+let expectedCbParamTys: i32[] = []
+let expectedCbPending: boolean = false
+
 export function initChecker(): i32 {
   T.tys = []
   T.scopes = []
@@ -1418,7 +1429,24 @@ function checkCallNode(n: Call, ix: i32): i32 {
           tErr(cfn.memProp + " expects 1 argument, got " + i32ToStr(cargs.length), ix)
           return TY_ERR
         }
+        // Contextual param inference: the callback is `(elem) -> ?` over the
+        // receiver's element type. Stash that expected param type so an
+        // UN-annotated function-literal arg (`function(n) …`) infers `n` from the
+        // receiver instead of erroring — matching the host. Only meaningful when
+        // the arg is an anonymous function literal AND the element type is known
+        // (not the `-1` hole of a never-pinned `[]`); otherwise it is left
+        // pending and cleared below so it can't leak.
+        let cbArg = P.nodes[cargs[0]]
+        if cbArg is FuncDecl {
+          if cbArg.fnName == "" && rt.aElem >= 0 {
+            expectedCbParamTys = [rt.aElem]
+            expectedCbPending = true
+          }
+        }
         let cbTy = checkNode(cargs[0])
+        // Defensively clear any unconsumed expectation (the arg was not the
+        // single-param literal that would consume it).
+        expectedCbPending = false
         let cb = T.tys[cbTy]
         if cb is TyFunc {
           let cbParams = cb.fnParamTypes
@@ -1719,7 +1747,23 @@ function checkCallNode(n: Call, ix: i32): i32 {
     let bTys: i32[] = []
     let i = 0
     while i < args.length {
+      // Contextual param inference for a function-VALUE argument: when the
+      // expected param is a known function type and the arg is an anonymous
+      // function literal, stash the expected param types so an un-annotated
+      // literal param infers from the signature (the general HOF case, matching
+      // `.map`/`.filter`). Single-shot + cleared after the arg is checked.
+      let pExp = T.tys[params[i]]
+      if pExp is TyFunc {
+        let aNode = P.nodes[args[i]]
+        if aNode is FuncDecl {
+          if aNode.fnName == "" {
+            expectedCbParamTys = pExp.fnParamTypes
+            expectedCbPending = true
+          }
+        }
+      }
       let at = checkNode(args[i])
+      expectedCbPending = false
       let expected = params[i]
       let pt2 = T.tys[expected]
       if pt2 is TyVar {
@@ -1994,6 +2038,17 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
     }
   }
   let params = n.fnParams
+  // Consume any contextual expected-param types stashed by the call site (a
+  // `.map`/`.filter` receiver, or a HOF whose param is a known `TyFunc`). Snapshot
+  // and clear the single-shot buffer immediately so it cannot leak into a nested
+  // function literal checked while this body is processed.
+  let cbExpect: i32[] = []
+  if expectedCbPending {
+    cbExpect = expectedCbParamTys
+    expectedCbPending = false
+    expectedCbParamTys = []
+  }
+  let cbExpectUsable = cbExpect.length == params.length
   let paramTys: i32[] = []
   let pi = 0
   while pi < params.length {
@@ -2009,8 +2064,15 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
             pt = TY_ERR
           }
         }
+      } else if cbExpectUsable && cbExpect[pi] >= 0 {
+        // Contextual inference: the expected callback type pins this un-annotated
+        // param (e.g. `xs.map(function(n) …)` over `i32[]` ⇒ `n: i32`), matching
+        // the host's receiver-driven inference.
+        pt = cbExpect[pi]
       } else {
-        tErr("parameter needs a type annotation", params[pi])
+        // No annotation and no contextual type ⇒ genuinely uninferable.
+        tErr("cannot infer a type for parameter `" + pNode.parName + "`",
+          params[pi])
       }
     }
     paramTys.push(pt)
