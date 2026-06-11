@@ -188,6 +188,15 @@ let pendTys: i32[] = []
 let pendAts: i32[] = []
 let pendDepths: i32[] = []
 
+// FLOW-NARROWED PROPERTY PATHS (mirrors the host's `narrowedPaths` overlay):
+// a stack of `key → type-arena index` entries (`"o.v" → i32`) overlaid while a
+// branch body is checked, plus per-scope frame marks so `popScope` unwinds the
+// entries pushed inside that scope. Bare-NAME narrowings keep riding the scope
+// chain (a shadowing `declare`); only dotted paths land here.
+let npKeys: string[] = []
+let npTys: i32[] = []
+let npFrames: i32[] = []
+
 // Record an un-annotated empty-collection binding for the deferred scope-close check.
 function notePending(name: string, ty: i32, at: i32): i32 {
   pendNames.push(name)
@@ -569,45 +578,296 @@ export function initChecker(): i32 {
   pendTys = []
   pendAts = []
   pendDepths = []
+  npKeys = []
+  npTys = []
+  npFrames = []
   0
 }
 
 // ── scope chain ──────────────────────────────────────────────────────────────
 
 // ── flow narrowing (condition collectors) ────────────────────────────────────
-// The Ident name of a `x == null` / `x != null` / `null == x` comparison, "" else.
-function nullCmpName(condIx: i32): string {
-  let cond = P.nodes[condIx]
-  if cond is BinExpr {
-    let lhs = P.nodes[cond.binLeft]
-    let rhs = P.nodes[cond.binRight]
-    if rhs is NullLit {
-      if lhs is Ident { return lhs.identName }
-    }
-    if lhs is NullLit {
-      if rhs is Ident { return rhs.identName }
-    }
+// The canonical narrowing key for a "place" — a bare name (`x`) or a property
+// path rooted at one (`o.v`, `o.v.w`) — or "" for anything else (a call, an
+// index, a literal: not a stable place to narrow). Mirrors the host's
+// `placeKey`; `x?.y` keys the same place as `x.y`, so a guard written with
+// `?.` refines the regular `x.y` reads in the branch body.
+function placeKeyOf(ix: i32): string {
+  let n = P.nodes[ix]
+  if n is Ident {
+    return n.identName
+  }
+  if n is Member {
+    let base = placeKeyOf(n.memObj)
+    if base == "" { return "" }
+    return base + "." + n.memProp
+  }
+  if n is OptMember {
+    let base = placeKeyOf(n.omObj)
+    if base == "" { return "" }
+    return base + "." + n.omProp
   }
   ""
 }
 
-// The non-null INNER type of the nullable binding `name`, or -1 (not nullable /
-// not bound).
-function nullableInnerOf(name: string): i32 {
-  let curTy = lookup(name)
-  if curTy >= 0 {
-    let ct = T.tys[curTy]
-    if ct is TyNullable { return ct.nInner }
+// The innermost narrowed-path overlay entry for `key`, or -1 (not narrowed).
+function narrowedPathTy(key: string): i32 {
+  let i = npKeys.length - 1
+  while i >= 0 {
+    if npKeys[i] == key { return npTys[i] }
+    i = i - 1
   }
-  0 - 1
+  -1
+}
+
+// The node index of the place compared against `null` in a `x == null` /
+// `x != null` / `null == x` comparison, or -1 (not a null compare).
+function nullCmpPlace(condIx: i32): i32 {
+  let cond = P.nodes[condIx]
+  if cond is BinExpr {
+    let lhs = P.nodes[cond.binLeft]
+    let rhs = P.nodes[cond.binRight]
+    if rhs is NullLit { return cond.binLeft }
+    if lhs is NullLit { return cond.binRight }
+  }
+  -1
+}
+
+// Whether `ty` is the `null` primitive (compared structurally — `null` may be
+// interned more than once across annotations).
+function isNullTy(ty: i32): boolean {
+  if ty < 0 { return false }
+  let t = T.tys[ty]
+  if t is TyPrim { return t.primName == "null" }
+  false
+}
+
+// The non-null part of `ty` (the host's `nonNullable`): a nullable peels to
+// its inner type; anything else is already non-null. -1 propagates.
+function nonNullTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  ty
+}
+
+// A place's CURRENT type during fact collection: facts already collected into
+// `names`/`tys` (innermost-last wins) override the path overlay, which
+// overrides the scope/field lookup — so successive narrowings compose
+// (`o != null && o.y is i32` resolves `o.y` against the non-null `o`).
+// Read-only: collection must never raise a diagnostic.
+function placeCurTy(ix: i32, names: string[], tys: i32[]): i32 {
+  let key = placeKeyOf(ix)
+  if key != "" {
+    let i = names.length - 1
+    while i >= 0 {
+      if names[i] == key { return tys[i] }
+      i = i - 1
+    }
+    let ov = narrowedPathTy(key)
+    if ov >= 0 { return ov }
+  }
+  let n = P.nodes[ix]
+  if n is Ident {
+    return lookup(n.identName)
+  }
+  if n is Member {
+    return placeFieldTy(placeCurTy(n.memObj, names, tys), n.memProp, false)
+  }
+  if n is OptMember {
+    return placeFieldTy(placeCurTy(n.omObj, names, tys), n.omProp, true)
+  }
+  -1
+}
+
+// The type of field `prop` read off `baseTy` for narrowing purposes (no
+// diagnostics): an OPTIONAL hop peels a nullable receiver and re-wraps the
+// result nullable; the field resolves off a struct, or as a shared union
+// field. -1 when unresolvable (no narrowing is recorded then).
+function placeFieldTy(baseTy: i32, prop: string, optional: boolean): i32 {
+  if baseTy < 0 { return -1 }
+  let bt = T.tys[baseTy]
+  let wasNullable = false
+  let core = baseTy
+  if bt is TyNullable {
+    if !optional { return -1 }
+    wasNullable = true
+    core = bt.nInner
+  }
+  if core < 0 { return -1 }
+  let ct = T.tys[core]
+  let ft = -1
+  if ct is TyObj {
+    ft = objFieldType(ct, prop)
+  } else if ct is TyUnion {
+    ft = sharedUnionFieldTy(ct, prop)
+  }
+  if ft < 0 { return -1 }
+  if wasNullable { return mkNullableTy(ft) }
+  ft
+}
+
+// SHARED-FIELD ACCESS over a struct union (the host's `sharedUnionField`): a
+// field present on EVERY member with a mutually-assignable type is readable on
+// the union directly, without narrowing — `(A | B).tag`. -1 when any member
+// lacks the field, disagrees on its type, or isn't a struct.
+function sharedUnionFieldTy(u: TyUnion, prop: string): i32 {
+  let members = u.uMembers
+  if members.length < 1 { return -1 }
+  let shared = -1
+  let i = 0
+  while i < members.length {
+    let mIx = members[i]
+    if mIx < 0 { return -1 }
+    let m = T.tys[mIx]
+    if m is TyObj {
+      let ft = objFieldType(m, prop)
+      if ft < 0 { return -1 }
+      if shared < 0 {
+        shared = ft
+      } else if !assignable(shared, ft) || !assignable(ft, shared) {
+        return -1
+      }
+    } else {
+      return -1
+    }
+    i = i + 1
+  }
+  shared
+}
+
+// Flatten a union/nullable into its variant list (`null` becomes the null
+// type), mirroring the host's `flattenVariants`.
+function flattenVariantsInto(ty: i32, out: i32[]): i32 {
+  if ty < 0 {
+    out.push(ty)
+    return 0
+  }
+  let t = T.tys[ty]
+  if t is TyUnion {
+    let members = t.uMembers
+    let i = 0
+    while i < members.length {
+      flattenVariantsInto(members[i], out)
+      i = i + 1
+    }
+    return 0
+  }
+  if t is TyNullable {
+    flattenVariantsInto(t.nInner, out)
+    out.push(TY_NULL)
+    return 0
+  }
+  out.push(ty)
+  0
+}
+
+// Two arena types denoting the same variant (mutually assignable). A generic
+// type variable is never "the same variant" as anything — the host's hole
+// guard (`isHole`) — so narrowing never pins an un-instantiated parameter.
+function sameVariantTy(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  let ta = T.tys[a]
+  if ta is TyVar { return false }
+  let tb = T.tys[b]
+  if tb is TyVar { return false }
+  if !assignable(a, b) { return false }
+  assignable(b, a)
+}
+
+// Remove a variant from a union/nullable, returning the residual type (the
+// host's `subtractType`) — backs else-branch narrowing: in `if x is A { … }
+// else { … }`, `x` is `U − A` in the else branch. Returns -1 both when nothing
+// concrete is removed (open-world negation isn't tracked) and when nothing
+// remains (a dead branch — the host skips overlaying a `Never`).
+function subtractTy(ty: i32, removed: i32): i32 {
+  if ty < 0 || removed < 0 { return -1 }
+  let drop: i32[] = []
+  flattenVariantsInto(removed, drop)
+  let vars: i32[] = []
+  flattenVariantsInto(ty, vars)
+  let kept: i32[] = []
+  let i = 0
+  while i < vars.length {
+    let v = vars[i]
+    let hit = false
+    let j = 0
+    while j < drop.length {
+      if sameVariantTy(v, drop[j]) { hit = true }
+      j = j + 1
+    }
+    if !hit { kept.push(v) }
+    i = i + 1
+  }
+  if kept.length == vars.length { return -1 }
+  if kept.length == 0 { return -1 }
+  // Reassemble the residual: a surviving `null` folds back into a nullable.
+  let hasNull = false
+  let core: i32[] = []
+  let k = 0
+  while k < kept.length {
+    if isNullTy(kept[k]) {
+      hasNull = true
+    } else {
+      core.push(kept[k])
+    }
+    k = k + 1
+  }
+  if core.length == 0 { return TY_NULL }
+  let res = core[0]
+  if core.length > 1 { res = mkUnionTy(core) }
+  if hasNull { return mkNullableTy(res) }
+  res
+}
+
+// Append one narrowing fact (place key → type) when the place is stable and
+// the narrowed type resolved (-1 means "no fact" and is skipped).
+function pushNarrowFact(placeIx: i32, ty: i32, names: string[], tys: i32[]): i32 {
+  if ty < 0 { return 0 }
+  let key = placeKeyOf(placeIx)
+  if key == "" { return 0 }
+  names.push(key)
+  tys.push(ty)
+  0
+}
+
+// Whether the place runs through a `?.` hop — its negation is then not a sound
+// else-branch refinement (the chain may be null because a RECEIVER was).
+function placeHasOptionalHop(ix: i32): boolean {
+  let n = P.nodes[ix]
+  if n is OptMember { return true }
+  if n is Member { return placeHasOptionalHop(n.memObj) }
+  false
+}
+
+// For a guard on an optional chain (`x?.y is T`), the truthy branch also
+// implies every `?.` receiver is non-null — push those facts innermost-first
+// (each resolves against an already-narrowed receiver), so the body's regular
+// `x.y` reads resolve. THEN branch only (the host's `optionalChainThenFacts`).
+function pushOptChainThenFacts(placeIx: i32, names: string[], tys: i32[]): i32 {
+  let n = P.nodes[placeIx]
+  if n is Member {
+    pushOptChainThenFacts(n.memObj, names, tys)
+    return 0
+  }
+  if n is OptMember {
+    pushOptChainThenFacts(n.omObj, names, tys)
+    let cur = placeCurTy(n.omObj, names, tys)
+    let inner = nonNullTy(cur)
+    if inner >= 0 && inner != cur {
+      pushNarrowFact(n.omObj, inner, names, tys)
+    }
+    return 0
+  }
+  0
 }
 
 // Collect the narrowings that hold when `cond` is TRUE into the parallel
-// `names`/`tys` arrays: `x != null` strips x's null, `x is T` pins x to T
-// (`is null` pins to the null type), `a && b` contributes BOTH conjuncts,
-// `!(e)` contributes e's FALSE narrowings, and parens recurse. Union-COMPLEMENT
-// narrowing (x is NOT T → drop T) stays out — tried and reverted (it made VL
-// miss real errors); null-stripping is the well-defined core.
+// `names`/`tys` arrays (keys are place paths — see `placeKeyOf`): `x != null`
+// strips x's null, `x is T` pins x to T (`is null` pins to the null type),
+// `a && b` contributes BOTH conjuncts, `!(e)` contributes e's FALSE
+// narrowings, and parens recurse. A guard over an optional chain also narrows
+// each `?.` receiver non-null (host `optionalChainThenFacts`).
 function collectThenNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
   let cond = P.nodes[condIx]
   if cond is Paren {
@@ -618,17 +878,13 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
     return 0
   }
   if cond is IsExpr {
-    let obj = P.nodes[cond.isObj]
-    if obj is Ident {
-      if cond.isVariant == "null" {
-        names.push(obj.identName)
-        tys.push(TY_NULL)
-      } else {
-        let tIdx = nameToTy(cond.isVariant)
-        if tIdx >= 0 {
-          names.push(obj.identName)
-          tys.push(tIdx)
-        }
+    pushOptChainThenFacts(cond.isObj, names, tys)
+    if cond.isVariant == "null" {
+      pushNarrowFact(cond.isObj, TY_NULL, names, tys)
+    } else {
+      let tIdx = nameToTy(cond.isVariant)
+      if tIdx >= 0 {
+        pushNarrowFact(cond.isObj, tIdx, names, tys)
       }
     }
     return 0
@@ -640,12 +896,13 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
       return 0
     }
     if cond.binOp == "!=" {
-      let nm = nullCmpName(condIx)
-      if nm != "" {
-        let inner = nullableInnerOf(nm)
-        if inner >= 0 {
-          names.push(nm)
-          tys.push(inner)
+      let placeIx = nullCmpPlace(condIx)
+      if placeIx >= 0 {
+        pushOptChainThenFacts(placeIx, names, tys)
+        let cur = placeCurTy(placeIx, names, tys)
+        let inner = nonNullTy(cur)
+        if inner >= 0 && inner != cur {
+          pushNarrowFact(placeIx, inner, names, tys)
         }
       }
     }
@@ -654,10 +911,12 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
   0
 }
 
-// Collect the narrowings that hold when `cond` is FALSE: `x == null` strips the
-// null in the else-branch, `x is null` false means non-null, `a || b`
-// contributes BOTH disjuncts (De Morgan: neither held), `!(e)` contributes e's
-// TRUE narrowings, and parens recurse.
+// Collect the narrowings that hold when `cond` is FALSE: `x == null` strips
+// the null in the else-branch, `x is null` false means non-null, `x is T`
+// false leaves the union COMPLEMENT `U − T` (host `subtractType`), `a || b`
+// contributes BOTH disjuncts (De Morgan: neither held), `!(e)` contributes
+// e's TRUE narrowings, and parens recurse. A place behind a `?.` hop is never
+// else-narrowed (the chain may be null because a receiver was).
 function collectElseNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
   let cond = P.nodes[condIx]
   if cond is Paren {
@@ -668,14 +927,17 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
     return 0
   }
   if cond is IsExpr {
-    let obj = P.nodes[cond.isObj]
-    if obj is Ident {
-      if cond.isVariant == "null" {
-        let inner = nullableInnerOf(obj.identName)
-        if inner >= 0 {
-          names.push(obj.identName)
-          tys.push(inner)
-        }
+    if placeHasOptionalHop(cond.isObj) { return 0 }
+    let cur = placeCurTy(cond.isObj, names, tys)
+    if cond.isVariant == "null" {
+      let inner = nonNullTy(cur)
+      if inner >= 0 && inner != cur {
+        pushNarrowFact(cond.isObj, inner, names, tys)
+      }
+    } else {
+      let tIdx = nameToTy(cond.isVariant)
+      if tIdx >= 0 {
+        pushNarrowFact(cond.isObj, subtractTy(cur, tIdx), names, tys)
       }
     }
     return 0
@@ -687,12 +949,14 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
       return 0
     }
     if cond.binOp == "==" {
-      let nm = nullCmpName(condIx)
-      if nm != "" {
-        let inner = nullableInnerOf(nm)
-        if inner >= 0 {
-          names.push(nm)
-          tys.push(inner)
+      let placeIx = nullCmpPlace(condIx)
+      if placeIx >= 0 {
+        if !placeHasOptionalHop(placeIx) {
+          let cur = placeCurTy(placeIx, names, tys)
+          let inner = nonNullTy(cur)
+          if inner >= 0 && inner != cur {
+            pushNarrowFact(placeIx, inner, names, tys)
+          }
         }
       }
     }
@@ -701,10 +965,39 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]): i32 {
   0
 }
 
-// Enter a new lexical scope (push a fresh name→type map).
+// Whether a narrowing key is a property PATH (`o.v`) rather than a bare name.
+function isPathKey(s: string): boolean {
+  let i = 0
+  while i < s.length {
+    if s[i] == 46 { return true } // '.'
+    i = i + 1
+  }
+  false
+}
+
+// Apply collected narrowings around a branch: a bare name shadows via the
+// scope chain (the caller pushes a scope first), a property path rides the
+// `npKeys`/`npTys` overlay — whose entries the matching `popScope` unwinds.
+function applyNarrows(names: string[], tys: i32[]): i32 {
+  let i = 0
+  while i < names.length {
+    if isPathKey(names[i]) {
+      npKeys.push(names[i])
+      npTys.push(tys[i])
+    } else {
+      declare(names[i], tys[i])
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Enter a new lexical scope (push a fresh name→type map). Marks the current
+// narrowed-path overlay depth so `popScope` unwinds entries pushed inside.
 function pushScope(): i32 {
   T.scopes.push(Map())
   constScopes.push(Map())
+  npFrames.push(npKeys.length)
   0
 }
 
@@ -715,6 +1008,14 @@ function popScope(): i32 {
   flushUninferred(T.scopes.length - 1)
   T.scopes.pop()
   constScopes.pop()
+  if npFrames.length > 0 {
+    let base = npFrames[npFrames.length - 1]
+    npFrames.pop()
+    while npKeys.length > base {
+      npKeys.pop()
+      npTys.pop()
+    }
+  }
   0
 }
 
@@ -2566,11 +2867,7 @@ function checkNode(ix: i32): i32 {
       let cpushed = 0
       if cnames.length > 0 {
         pushScope()
-        let cni = 0
-        while cni < cnames.length {
-          declare(cnames[cni], ctys[cni])
-          cni = cni + 1
-        }
+        applyNarrows(cnames, ctys)
         cpushed = 1
       }
       let crt = checkNode(n.binRight)
@@ -2734,6 +3031,13 @@ function checkNode(ix: i32): i32 {
 
   // ── member access ───────────────────────────────────────────────────────────
   } else if n is Member {
+    // A flow-narrowed property path (`if o.v is T { … }`) overrides the stored
+    // field type within the branch (the host's `narrowedPaths` overlay).
+    let mKey = placeKeyOf(ix)
+    if mKey != "" {
+      let mOv = narrowedPathTy(mKey)
+      if mOv >= 0 { return mOv }
+    }
     let objTy = checkNode(n.memObj)
     let ot = T.tys[objTy]
     if ot is TyObj {
@@ -2746,6 +3050,13 @@ function checkNode(ix: i32): i32 {
     }
     if ot is TyErr {
       return TY_ERR
+    }
+    // SHARED-FIELD ACCESS over a struct union — `(A | B).tag` when every
+    // member carries the field at the same type (the host's
+    // `sharedUnionField`); an unshared field still needs an `is` narrowing.
+    if ot is TyUnion {
+      let sf = sharedUnionFieldTy(ot, n.memProp)
+      if sf >= 0 { return sf }
     }
     // `.length` on an array, a map, or a string is an i32.
     if ot is TyArray {
@@ -2889,6 +3200,12 @@ function checkNode(ix: i32): i32 {
   // re-wraps the result nullable (`{x: i32} | null` ?. x → `i32 | null`); a
   // non-null receiver behaves like a plain member read.
   } else if n is OptMember {
+    // `x?.y` keys the same narrowed place as `x.y` (host `placeKey`).
+    let omKey = placeKeyOf(ix)
+    if omKey != "" {
+      let omOv = narrowedPathTy(omKey)
+      if omOv >= 0 { return omOv }
+    }
     let recv = checkNode(n.omObj)
     let rcv = T.tys[recv]
     let wasNullable = false
@@ -2896,6 +3213,15 @@ function checkNode(ix: i32): i32 {
     if rcv is TyNullable {
       wasNullable = true
       baseTy = rcv.nInner
+      // Peel a SECOND nullable layer too: the host's `flattenType` collapses
+      // `T??` to `T?`, so a doubly-nullable receiver (`m[k]?.v` off a nullable
+      // map read) still reads its field with one `?.`.
+      if baseTy >= 0 {
+        let rcv2 = T.tys[baseTy]
+        if rcv2 is TyNullable {
+          baseTy = rcv2.nInner
+        }
+      }
     }
     if baseTy < 0 {
       return TY_ERR
@@ -2914,6 +3240,14 @@ function checkNode(ix: i32): i32 {
     }
     if bt is TyErr {
       return TY_ERR
+    }
+    // Shared union field through `?.` — same rule as the plain member read.
+    if bt is TyUnion {
+      let osf = sharedUnionFieldTy(bt, n.omProp)
+      if osf >= 0 {
+        if wasNullable { return mkNullableTy(osf) }
+        return osf
+      }
     }
     tErr("member access '?." + n.omProp + "' on non-object " + tyToStr(recv), ix)
     return TY_ERR
@@ -3125,11 +3459,7 @@ function checkNode(ix: i32): i32 {
     let daThenDiverges = daBranchDiverges(n.ifThen)
     if tnNames.length > 0 {
       pushScope()
-      let ti = 0
-      while ti < tnNames.length {
-        declare(tnNames[ti], tnTys[ti])
-        ti = ti + 1
-      }
+      applyNarrows(tnNames, tnTys)
     }
     checkNode(n.ifThen)
     if tnNames.length > 0 {
@@ -3146,11 +3476,7 @@ function checkNode(ix: i32): i32 {
       daElseDiverges = daBranchDiverges(n.ifElse)
       if enNames.length > 0 {
         pushScope()
-        let ei = 0
-        while ei < enNames.length {
-          declare(enNames[ei], enTys[ei])
-          ei = ei + 1
-        }
+        applyNarrows(enNames, enTys)
       }
       checkNode(n.ifElse)
       if enNames.length > 0 {
@@ -3190,11 +3516,9 @@ function checkNode(ix: i32): i32 {
             diverges = true
           }
           if diverges {
-            let gi2 = 0
-            while gi2 < enNames.length {
-              declare(enNames[gi2], enTys[gi2])
-              gi2 = gi2 + 1
-            }
+            // Path-keyed entries pushed here unwind at the ENCLOSING scope's
+            // `popScope` — exactly the region where the guard holds.
+            applyNarrows(enNames, enTys)
           }
         }
       }
