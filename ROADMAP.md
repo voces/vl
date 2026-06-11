@@ -32,14 +32,21 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ## Next (highest leverage)
 
-- **H3-tail: lambda emit slices 3–4** — `.map`/`.filter`/HOF lowering in `wasmEmit.vl` as the
-  generic closure-calling loop over the #306 `call_ref` ABI (per the #304 design: emit simple,
-  let `vl build -O` devirtualize/inline). The single largest remaining emit-coverage lever;
-  escaping closures + function-valued struct fields shipped (#310).
+- **H3-tail: ref-valued maps** — the last maps emit gap (`maps/string-values.vl`,
+  `object-values.vl`): the native map is monomorphic (string→i32), so string/struct VALUES need
+  the map parameterized by value type (a nullable-ref `vals` backing per value type, `m[k]` →
+  `V | null` narrowed with `?.`/`??`, `.values()` over refs). Unlocks the `name → record`
+  symbol-table pattern. (Delete + `Set`/`.get`/`.add` already landed — #316/#317.)
 - **H3-tail: corpus coverage pay-down** — the measured buckets (`docs/selfhost-corpus-paydown-findings.md`):
   parse gaps, checker false-rejects (generics + literal-unions are the big scoped tracks),
-  scratch-needing top-level statements, the emitter-trap pins. Run-whitelist is 154/304 and the
-  native-align whitelist 236; grow both as slices land.
+  scratch-needing top-level statements, the emitter-trap pins. Run-whitelist is **164/316** and the
+  native-align whitelist **246**; grow both as slices land. (The 2 known silent miscompiles —
+  `literals/hex.vl` and `arrays/infer-empty-string.vl` — are tracked under the integer-literal
+  width item below + A-infer-empty.)
+- **Integer-literal width (`hex.vl` miscompile)** — port the host's `defaultIntegerType` magnitude
+  rule (i32 if it fits, else i64) into `typecheck.vl`/emit; native currently defaults every integer
+  literal to i32 and wraps (`0xDEAD_BEEF` prints negative). Mostly goldens-safe (the compiler's own
+  large FNV constant is hand-wrapped in live code, correctly, for i32 hash semantics).
 - **Self-host struct equality** — `==`/`!=` over struct refs now fails LOUDLY (no invalid wasm);
   lower it field-wise next (host parity). Wrinkle recorded: under the `call_ref` ABI funcrefs
   admit no `ref.eq`, so function-field identity needs an identity token on the closure struct.
@@ -142,7 +149,15 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   `.vl`-std migration once a module system exists. (design: `docs/collections-design.md`)
 - 🟡 **B6a. `Map` + `Set`.** REMAINING: **i32-keyed Map/Set** (clean diagnostic for now — i32 keys
   use `T[]`); `for k in map` direct iteration (parser; use `.keys()` today); `map`/`filter` over
-  Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`.
+  Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`. (Self-host native parity:
+  string-keyed maps, delete, `Set`/`.add`/`.get` landed; ref-valued maps is the open native gap — see Next.)
+- ⬜ **B6a-opt. `Set` drops the unused `vals` array** (LOW priority). A `Set` is emitted as a
+  boolean-valued map, so it carries a `vals` array that is always `true` (~17% of a Set's memory +
+  needless alloc/grow/`array.copy` on resize). The type already tracks `mSet` (a Set is distinguished
+  from a real `{[string]: boolean}` Map, which genuinely needs `vals`), so a Set can leave `vals`
+  null and skip the vals-touch in new/add/compact/rehash (~5 `mSet`-gated sites). Memory/perf
+  refinement, behaviorally invisible; would intentionally diverge from the host (which keeps `vals`
+  for sets) as a justified improvement, not a regression.
 - ⬜ **B6b. Collections building blocks & open items** (all detail in `docs/collections-design.md`).
   - **Prerequisite intrinsics** — `__array_new__`/`__array_new_default__` + bulk `__array_copy__`,
     thin `defaultScope` intrinsics.
@@ -347,7 +362,8 @@ independent).*
   - **Parse gaps** — the long tail of surface forms.
   - **Real import/export for the `.vl` modules** — retire the concat + symbol-rename glue (the
     assembly renames the lexer's colliding `Tok`/`Diag`/`advance`; the H0 phase-1 substrate exists).
-  - **Spans** — continue the rungs (rung 1 landed) so native diagnostics carry real positions.
+  - **Spans** — continue the rungs (rung 1 = token positions; rung 2 = native `path:line:col:`
+    diagnostics, #312) so more diagnostics carry real positions.
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/selfhost-gaps.md` §H4.1)
