@@ -32,23 +32,29 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ## Next (highest leverage)
 
-- **H3-tail: corpus coverage pay-down** — the measured buckets (`docs/selfhost-corpus-paydown-findings.md`):
-  parse gaps, checker false-rejects (generics + literal-unions are the big scoped tracks),
-  scratch-needing top-level statements, the emitter-trap pins. Run-whitelist is **168/317** and the
-  native-align whitelist **250**; grow both as slices land. (The 2 known silent miscompiles —
-  `literals/hex.vl` and `arrays/infer-empty-string.vl` — are tracked under the integer-literal
-  width item below + A-infer-empty.) (Ref-valued maps — the last maps emit gap — landed in #319:
-  per-value-type map structs over nullable-ref vals lists, `m[k] ?? d`, the fused `m[k]?.f ?? d`,
-  `.values()` walks, plus the Set `.values()` membership-boolean bug fix. Known edges, all loud:
-  map-typed params stay mono-only; union/array/nested-map values unsupported; `?.`-over-map reads
-  are scalar-field-only.)
-- **Integer-literal width (`hex.vl` miscompile)** — port the host's `defaultIntegerType` magnitude
-  rule (i32 if it fits, else i64) into `typecheck.vl`/emit; native currently defaults every integer
-  literal to i32 and wraps (`0xDEAD_BEEF` prints negative). Mostly goldens-safe (the compiler's own
-  large FNV constant is hand-wrapped in live code, correctly, for i32 hash semantics).
-- **Self-host struct equality** — `==`/`!=` over struct refs now fails LOUDLY (no invalid wasm);
-  lower it field-wise next (host parity). Wrinkle recorded: under the `call_ref` ABI funcrefs
-  admit no `ref.eq`, so function-field identity needs an identity token on the closure struct.
+- **H3-tail: corpus coverage pay-down** — sweep stands at **191/317 passing** (parse-reject 24,
+  type-reject 35, emit-gap 59, run-error 5); run-whitelist **~198** and align RUN_CASES grew
+  accordingly. The #319/#321/#322/#323/#324 wave landed: ref-valued maps, integer-literal width
+  (BOTH known silent miscompiles fixed — `hex.vl` + `infer-empty-string.vl`), parser grammar
+  (object/method shorthand, `is`-RHS types, if-expressions, generic application), checker flow
+  narrowing + recursive named types + nullable holes, and emit struct equality / nested-struct
+  fields / string intrinsics / fused list defaults. The remaining buckets are TRIAGED to named
+  capabilities (see the agent reports in those PRs):
+  • **emit: boxed value unions** (`{tag,payload}` at flow boundaries; ~14 files) — biggest single track
+  • **emit: recursive struct types in fn bodies** — 5 cases now typecheck but emit INVALID WASM
+    (loud `failed to compile`, the `run-error` bucket): the code-15 nested-struct work doesn't
+    cover self/mutually-recursive locals/params end-to-end
+  • **emit: generic monomorphization** (6 files) + **checker Infer-hole machinery** (7 files) —
+    one combined track, both halves needed before either pays off
+  • **checker: literal-union/intersection enforcement** — parser DELIBERATELY still rejects the
+    syntax (reject-parity: the permissive checker would wrongly accept 7 REJECT cases); port the
+    checking first, then flip the parser
+  • structural param inference, operator-overload + index-trap dispatch, nested arrays `i32[][]`,
+    `modules/*` (blocked on native import resolution, H3)
+- **Self-host struct equality** — LANDED for value shapes (#323: scalars/strings/i32[]/nested,
+  name-rooted operands only, impure operands fail loudly). REMAINING: function-identity compare
+  needs an identity token on the closure struct (funcrefs admit no `ref.eq`) — a closure-rep
+  change; run it solo.
 - **Explicit numeric conversion syntax** — the lossless-only implicit-widening rule (#298) makes
   the lossy edges (`i32→f32`, `i64→f64`, all narrowings) EXPRESSIBLE ONLY via a cast that does
   not exist yet; design + land it (both compilers).
