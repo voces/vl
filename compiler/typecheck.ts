@@ -1453,11 +1453,12 @@ const numericScalarName = (type: VLType): string | undefined => {
 };
 // The LOSSLESS numeric widenings — a value of `from` fits a slot of `to` without
 // loss, so the conversion is implicit (codegen inserts the wasm instruction):
-// `i32` → `i64`/`f32`/`f64`, `i64` → `f64`, `f32` → `f64`. Every other pair of
-// distinct numeric scalars is a lossy narrowing and is rejected.
+// `i32` → `i64`/`f64`, `f32` → `f64`. Every other pair of distinct numeric scalars
+// is rejected: a lossy narrowing (`f64`→`i32`, …) OR a lossy widening that drops
+// precision — `i32`→`f32` (above 2^24) and `i64`→`f64` (above 2^53). Those last two
+// need an explicit conversion (no syntax for it yet), so they are rejected here.
 const NUMERIC_WIDENINGS: Record<string, string[]> = {
-  i32: ["i64", "f32", "f64"],
-  i64: ["f64"],
+  i32: ["i64", "f64"],
   f32: ["f64"],
 };
 const canWidenNumeric = (from: string, to: string): boolean =>
