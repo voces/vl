@@ -3100,7 +3100,11 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
         // THIS slot. `slot` is the new slot's declared-local position.
         let slot = 0 - 1
         if letIsMap(stmts[i], fnIx) {
-          slot = addLocalName(s.letName, 6, 0 - 1)
+          // The kind-6 parallel slot carries the map FLAVOR: `-2` for a `Set()`
+          // binding (its `.values()` walks the keys), `-1` for a plain map.
+          let mflavor = 0 - 1
+          if letIsSet(stmts[i]) { mflavor = 0 - 2 }
+          slot = addLocalName(s.letName, 6, mflavor)
         } else if letIsNulRef(stmts[i], fnIx) {
           // Nullable struct (`S | null`, code 9): annotation-first, else the
           // initializer's nullable-returning call. BEFORE the struct case (a
@@ -8699,7 +8703,12 @@ function forInElemKind(iterIx: i32, fnIx: i32): i32 {
     if callee is Member {
       if exprMap(callee.memObj, fnIx) {
         if callee.memProp == "keys" { return 3 }
-        if callee.memProp == "values" { return 0 }
+        if callee.memProp == "values" {
+          // A SET's `.values()` yields its ELEMENTS — the string keys (kind 3),
+          // not the i32 membership booleans. A map's yields its i32 values.
+          if mapIsSetExpr(callee.memObj, fnIx) { return 3 }
+          return 0
+        }
       }
     }
   }
@@ -8723,6 +8732,34 @@ function forInElemKind(iterIx: i32, fnIx: i32): i32 {
 function forInRefArrayStructIdx(iterIx: i32, fnIx: i32): i32 {
   if !exprRefArray(iterIx, fnIx) { return 0 - 1 }
   structIndexByName(refListElemNameOfExpr(iterIx, fnIx))
+}
+
+// True if the map-typed expression at `exprIx` is a SET (`Set()`-seeded binding or
+// the constructor itself). Consulted by the `.values()` paths: a set's `.values()`
+// yields its ELEMENTS (the keys list), not the membership booleans in `vals` —
+// mirroring the checker (`typecheck.vl`: a set's values() returns `mKey[]`).
+// Params have no Set-distinguishing annotation, so a set passed as a parameter is
+// out of scope (the checker's surface gating keeps `.values()` calls on it valid
+// only for sets, but the flavor bit can't cross the call boundary yet).
+function mapIsSetExpr(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Paren { return mapIsSetExpr(e.parInner, fnIx) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident { return callee.identName == "Set" }
+    return false
+  }
+  if e is Ident {
+    if declaredMap(e.identName) {
+      let slot = declaredSlotOf(e.identName)
+      if slot >= 0 { return localStructIdx[slot] == 0 - 2 }
+      return false
+    }
+    let gl = globalLetOf(e.identName)
+    if gl >= 0 { return letIsSet(gl) }
+  }
+  false
 }
 
 // The map RECEIVER arena index of a `for v in m.keys()` / `m.values()` iterable, or -1
@@ -8764,7 +8801,13 @@ function emitForInList(body: i32[], iterIx: i32, fnIx: i32): i32 {
         }
         if callee.memProp == "values" {
           if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
-          fbStructGet(mStructIdx, 1)  // field 1: ordered vals list
+          // A SET's `.values()` walks the ordered KEYS (its elements); a map's
+          // walks the ordered vals.
+          if mapIsSetExpr(callee.memObj, fnIx) {
+            fbStructGet(mStructIdx, 0)  // field 0: ordered keys list
+          } else {
+            fbStructGet(mStructIdx, 1)  // field 1: ordered vals list
+          }
           return 0
         }
       }
@@ -14296,6 +14339,23 @@ function letIsMap(letIx: i32, fnIx: i32): boolean {
       }
     }
     return exprMap(d.letInit, fnIx)
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` binds a SET — its initializer is the `Set()`
+// constructor. Set-ness is an emitter-side flavor bit over the shared map rep: a
+// set's `.values()` yields its ELEMENTS (the keys list), not the membership
+// booleans in `vals`. Mirrors the checker's `mSet` pin (typecheck.vl), which is
+// likewise seeded only by the `Set()` constructor form.
+function letIsSet(letIx: i32): boolean {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    let init = P.nodes[d.letInit]
+    if init is Call {
+      let callee = P.nodes[init.callFn]
+      if callee is Ident { return callee.identName == "Set" }
+    }
   }
   false
 }
