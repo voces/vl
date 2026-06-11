@@ -5863,12 +5863,18 @@ function emitMapDelete(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
 //
 // Ordering matters: `index[slot] = count+1` is written BEFORE the two pushes, because
 // `emitMapPushKey`/`emitMapPushVal` clobber the probe slot (slot 3) and cap (slot 4).
-function emitMapSet(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32): i32 {
+// `m[k] = v` / `m.set(k, v)`. The Set form `s.add(k)` reuses this exact lowering with
+// `valConst1 = true`: the stored value is the constant boolean `1` (true) instead of an
+// evaluated value expression (and `valIx` is ignored). EXISTING callers pass
+// `valConst1 = false` so their emitted bytes stay byte-identical.
+function emitMapSetV(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32, valConst1: boolean): i32 {
   // The vals list is the i32 list — a REF value (a string / struct / list) would
   // store a ref into an i32 array (invalid wasm). Fail loudly until ref-valued
-  // maps land.
-  if exprString(valIx, fnIx) || exprStruct(valIx, fnIx) || exprArray(valIx, fnIx) || exprRefArray(valIx, fnIx) || exprStringArray(valIx, fnIx) {
-    return emitFail("emitProgram: map values must be i32 / boolean")
+  // maps land. (A constant-true Set value is always a valid i32 boolean.)
+  if valConst1 == false {
+    if exprString(valIx, fnIx) || exprStruct(valIx, fnIx) || exprArray(valIx, fnIx) || exprRefArray(valIx, fnIx) || exprStringArray(valIx, fnIx) {
+      return emitFail("emitProgram: map values must be i32 / boolean")
+    }
   }
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
   pushMapScr(body, 5)        // entry
@@ -5879,7 +5885,11 @@ function emitMapSet(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32)
   pushMapScr(body, 5)        // entry
   fbI32Const(1)
   fbI32Bin(107)              // i32.sub (entry - 1)
-  if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }   // value
+  if valConst1 {
+    fbI32Const(1)            // Set value: constant boolean true
+  } else {
+    if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }   // value
+  }
   fbArraySet(aTypeIdx)       // array.set
   fbElse()                   // else
   // APPEND. index[slot] = count + 1  (the new entry's position + 1).
@@ -5891,7 +5901,7 @@ function emitMapSet(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32)
   fbArraySet(aTypeIdx)       // array.set
   // keys.push(keyRef) ; vals.push(v)  (clobbers slots 3/4 — already linked above).
   if emitMapPushKey(body) < 0 { return 0 - 1 }
-  if emitMapPushVal(body, valIx, fnIx) < 0 { return 0 - 1 }
+  if emitMapPushValV(body, valIx, fnIx, valConst1) < 0 { return 0 - 1 }
   // count = count + 1
   pushMapScr(body, 0)        // mapRef (struct.set receiver)
   pushMapCount(body)
@@ -5907,6 +5917,13 @@ function emitMapSet(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32)
   if emitMapResize(body) < 0 { return 0 - 1 }
   fbEnd()                    // end (if)
   0
+}
+
+// Thin BYTE-IDENTICAL wrappers preserving the original arities — existing callers of
+// `emitMapSet` / `emitMapPushVal` emit exactly the same bytes (the non-constant value
+// path). The `s.add(k)` Set form calls the `*V` variants with `valConst1 = true`.
+function emitMapSet(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32): i32 {
+  emitMapSetV(body, recvIx, keyIx, valIx, fnIx, false)
 }
 
 // Inline list-grow append of the scratch `keyRef` (slot 1) onto `M.keys` (the
@@ -6027,9 +6044,17 @@ function emitMapPushKey(body: i32[]): i32 {
 // Inline list-grow append of value `v` (arena `valIx`) onto `M.vals` (the i32 list).
 // Mirrors `emitPush` over the i32 list, but the wrapper ref is `M.vals` (not a local)
 // and the grow uses the map scratch i32 slots + the vals-backing ref local (slot 7).
+// Byte-identical wrapper: the existing append path (non-constant value).
 function emitMapPushVal(body: i32[], valIx: i32, fnIx: i32): i32 {
+  emitMapPushValV(body, valIx, fnIx, false)
+}
+function emitMapPushValV(body: i32[], valIx: i32, fnIx: i32, valConst1: boolean): i32 {
   // newVal first (slot 3 — free after the scan/keys push)
-  if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+  if valConst1 {
+    fbI32Const(1)            // Set value: constant boolean true
+  } else {
+    if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+  }
   setMapScr(body, 3)
   // if vals.len == vals.cap { grow }
   pushMapValsLen(body)
@@ -6854,10 +6879,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     if exprIsStrSlice(exprIx, fnIx) {
       return emitStrSlice(body, exprIx, fnIx)
     }
-    // G8: the `Map()` builtin constructs an empty string-keyed map.
+    // G8: the `Map()` builtin constructs an empty string-keyed map. `Set()` is a
+    // boolean-valued string map over the SAME 7-field struct, so it emits the
+    // IDENTICAL empty-map construction.
     let callee = P.nodes[e.callFn]
     if callee is Ident {
-      if callee.identName == "Map" {
+      if callee.identName == "Map" || callee.identName == "Set" {
         return emitMapNew(body)
       }
     }
@@ -6992,6 +7019,23 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       if lhs is Index {
         if exprMap(lhs.idxArr, fnIx) {
           return emitMapGetOr(body, lhs.idxArr, lhs.idxIndex, e.binRight, fnIx)
+        }
+      }
+      // The METHOD form `recv.get(k) ?? d` over a map receiver is the SAME fused
+      // get-with-default as `recv[k] ?? d` — lower it identically. (The LIST `.get`
+      // at ~6890 is a distinct struct-element get and is NOT a map; `exprMap` gates
+      // this to map receivers only.)
+      if lhs is Call {
+        let lcallee = P.nodes[lhs.callFn]
+        if lcallee is Member {
+          if lcallee.memProp == "get" {
+            if exprMap(lcallee.memObj, fnIx) {
+              if lhs.callArgs.length != 1 {
+                return emitFail("emitProgram: map .get takes exactly one argument")
+              }
+              return emitMapGetOr(body, lcallee.memObj, lhs.callArgs[0], e.binRight, fnIx)
+            }
+          }
         }
       }
       return emitFail("emitProgram: `??` is only supported on a map index get")
@@ -8885,6 +8929,18 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
             return emitFail("emitProgram: map set takes exactly two arguments")
           }
           return emitMapSet(body, callee.memObj, s.callArgs[0], s.callArgs[1], fnIx)
+        }
+      }
+      // A Set `s.add(k)` STATEMENT is the membership-insert form of `s[k] = true` — the
+      // SAME scan/overwrite-or-append lowering as `emitMapSet`, but storing the constant
+      // boolean `1` (true) as the value (the Set vals-list carries true for live keys).
+      // It takes EXACTLY one arg; the result (if any) is discarded.
+      if callee.memProp == "add" {
+        if exprMap(callee.memObj, fnIx) {
+          if s.callArgs.length != 1 {
+            return emitFail("emitProgram: set add takes exactly one argument")
+          }
+          return emitMapSetV(body, callee.memObj, s.callArgs[0], 0 - 1, fnIx, true)
         }
       }
       // G8: a bare `m.delete(k)` STATEMENT discards the boolean result — emit the
@@ -12297,8 +12353,9 @@ function collectA(stmts: i32[]): i32 {
           lUsed = true
         }
         // An un-annotated `Map()` (usage-inferred binding) still constructs the map
-        // struct — force the same types a `{[string]: i32}` annotation does.
-        if cf.identName == "Map" {
+        // struct — force the same types a `{[string]: i32}` annotation does. `Set()`
+        // is the same 7-field map struct, so it forces the IDENTICAL types.
+        if cf.identName == "Map" || cf.identName == "Set" {
           mUsed = true
           lUsed = true
           aUsed = true
@@ -14016,7 +14073,9 @@ function exprMap(exprIx: i32, fnIx: i32): boolean {
   if e is Paren { return exprMap(e.parInner, fnIx) }
   if e is Call {
     let callee = P.nodes[e.callFn]
-    if callee is Ident { return callee.identName == "Map" }
+    // A `Set()` is a boolean-valued string map — the SAME 7-field struct — so a
+    // `Set()`-bound value is treated as a map throughout the emitter.
+    if callee is Ident { return callee.identName == "Map" || callee.identName == "Set" }
     // `scopes.pop()` over a map ref list (`{[string]:i32}[]`) yields a Map ref.
     if callee is Member {
       if callee.memProp == "pop" {
@@ -14079,11 +14138,19 @@ function exprHasMapOp(exprIx: i32, fnIx: i32): boolean {
     return exprHasMapOp(e.idxIndex, fnIx)
   }
   if e is BinExpr {
-    // Fused map get-with-default `recv[k] ?? d`.
+    // Fused map get-with-default `recv[k] ?? d` (and the method form `recv.get(k) ?? d`).
     if e.binOp == "??" {
       let lhs = P.nodes[e.binLeft]
       if lhs is Index {
         if exprMap(lhs.idxArr, fnIx) { return true }
+      }
+      if lhs is Call {
+        let lcallee = P.nodes[lhs.callFn]
+        if lcallee is Member {
+          if lcallee.memProp == "get" {
+            if exprMap(lcallee.memObj, fnIx) { return true }
+          }
+        }
       }
     }
     // Map SET `recv[k] = v` (an assignment is a statement, but walk it defensively).
