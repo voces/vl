@@ -86,6 +86,7 @@ const runFixture = (): Promise<string[]> =>
       `  NumLit,\n` +
       `  NullLit,\n` +
       `  ObjLit,\n` +
+      `  OptMember,\n` +
       `  Param,\n` +
       `  Paren,\n` +
       `  Program,\n` +
