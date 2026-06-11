@@ -2847,9 +2847,11 @@ let rlElemKindTbl: i32[] = []
 
 // ── string-keyed map table (G8: `{[string]: i32}` open-addressing hash map) ────
 // A string-keyed map `{[string]: i32}` lowers to a REAL ordered open-addressing
-// hash map (mirroring the host's `compiler/builtins/maps.ts`), a 6-field WasmGC
-// struct `MAP = { keys, vals, live, index, count, size }` (FIELD ORDER matches the
-// host EXACTLY) where
+// hash map (mirroring the host's `compiler/builtins/maps.ts`), a 7-field WasmGC
+// struct `MAP = { keys, vals, live, index, count, size, hashes }` — the SAME
+// general-purpose 7-field rep the host emits (FIELD ORDER + COUNT match EXACTLY,
+// `hashes` cache included: justified for large/long-key maps so resize/compact don't
+// re-hash keys, NOT a compiler-symbol-table-narrow optimization) where
 //   • `keys` is a growable list of STRING refs — the wrapper `{ backing: (ref
 //     $mkArr), len, cap }` over a backing `(array (mut (ref null $aTypeIdx)))`
 //     (a string IS the raw `(array i32)` at `aTypeIdx`, so a keys element is a
@@ -2858,16 +2860,19 @@ let rlElemKindTbl: i32[] = []
 //   • `vals` is the EXISTING growable i32 list (`lTypeIdx` over `aTypeIdx`) — the
 //     insertion-ordered entry values; the checker's map value type is always i32.
 //   • `live` is a raw i32 array `(ref $aTypeIdx)` PARALLEL to the entries: `live[i]`
-//     is 1 for a live entry, 0 for a tombstone. It grows in lockstep with the keys
-//     backing. THIS SLICE has no delete, so `live` is ALL 1s — present only to align
-//     the native rep to the host's 6-field layout so a later slice can add tombstone
-//     delete on a host-matching struct. (Same element type as `index`.)
+//     is 1 for a live entry, 0 for a tombstone (set by `delete`). It grows in lockstep
+//     with the keys backing. (Same element type as `index`.)
 //   • `index` is a raw i32 array `(ref $aTypeIdx)` of hash slots → entry-position
-//     + 1 (0 = empty). Initial capacity 8, doubled on load factor 1/2.
-//   • `count` = entries appended; `size` = live entry count. (No delete in the op
-//     set, so count == size always; both kept for forward-compatibility — the
-//     `live` tombstone array above lets a later slice add delete — and to drive the
-//     resize threshold.)
+//     + 1 (0 = empty). Initial capacity 16 (= INITIAL_CAP*2, host-matching), doubled
+//     on load factor 1/2.
+//   • `count` = entries appended (incl. tombstones); `size` = live entry count.
+//     `delete` tombstones (size--), `compact` reclaims (count := size). Both drive the
+//     resize/compaction thresholds.
+//   • `hashes` is a raw i32 array `(ref $aTypeIdx)` PARALLEL to the entries: the
+//     CACHED FNV hash of `keys[i]`, stored on append and grown in lockstep with the
+//     keys backing. Resize/compact RE-PLACE entries from the stored hash (no key
+//     re-hashing); the probe gates the (string) key comparison on a hash mismatch.
+//     (Same element type as `index`/`live`; the host's `MAP_HASHES = 6`.)
 // The map struct's heap-type index is `mStructIdx`. Operations hash the key
 // (FNV-1a, `emitMapHashOf`) into `index` and LINEAR-PROBE (`emitMapProbe`) to a
 // free-or-matching slot, comparing keys with the G6 element-wise string `==`: set
@@ -4841,22 +4846,25 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
 // A map is the 5-field `MAP = { keys, vals, index, count, size }` (see the map-table
 // section above for the full representation). Operations HASH the key (FNV-1a) into
 // `index` and LINEAR-PROBE to a free-or-matching slot — NO O(n) scan. A function that
-// touches a map reserves a 13-slot scratch frame (`mapScratchBase` + 0..12):
+// touches a map reserves a 14-slot scratch frame (`mapScratchBase` + 0..13):
 //   +0  mapRef : (ref $mStructIdx)  — the map value
 //   +1  keyRef : (ref $aTypeIdx)    — the target key string
 //   +2  curRef : (ref $aTypeIdx)    — the current probed key string
 //   +3  slot   : i32                — probe slot offset into `index`
 //   +4  cap    : i32                — index length / newCap (resize)
 //   +5  entry  : i32                — index[slot] (entry+1; 0 = miss)
-//   +6  keysBk : (ref $mkArrIdx)    — grown keys backing
-//   +7  valsBk : (ref $aTypeIdx)    — grown vals backing
-//   +8  chr    : i32                — inner char cursor (key compare / hash)
-//   +9  hcur   : i32                — FNV hash accumulator
-//   +10 idxBk  : (ref $aTypeIdx)    — fresh `index` backing (resize)
-//   +11 rslot  : i32                — inner probe slot (resize)
+//   +6  keysBk : (ref $mkArrIdx)    — grown keys backing (compact: new keys backing)
+//   +7  valsBk : (ref $aTypeIdx)    — grown vals backing (compact: new vals backing)
+//   +8  chr    : i32                — inner char cursor (key compare / hash); compact `i`
+//   +9  hcur   : i32                — FNV hash accumulator; compact write cursor `j`
+//   +10 idxBk  : (ref $aTypeIdx)    — fresh `index` backing (resize); compact new live
+//   +11 rslot  : i32                — inner probe slot (resize); compact target cap
 //   +12 liveBk : (ref $aTypeIdx)    — grown `live` backing (keys-grow lockstep)
+//   +13 hashBk : (ref $aTypeIdx)    — grown `hashes` backing (keys-grow lockstep);
+//                                     compact new hashes backing
 // `emitMapProbe` leaves `slot` = the probe slot and `entry` = index[slot]; reused by
-// set / get / `??` / `.has`. `emitMapResize` rehashes at load factor 1/2.
+// set / get / `??` / `.has` / `delete`. `emitMapResize` rehashes at load factor 1/2;
+// `emitMapDelete` tombstones + amortized-`emitMapCompact`s.
 
 let fnUsesMap: boolean = false
 let mapScratchBase: i32 = 0
@@ -5234,6 +5242,14 @@ function pushMapSize(body: i32[]): i32 {
   0
 }
 
+// `M.hashes` (the i32 per-entry FNV cache, parallel to the entries):
+// `local.get mapRef ; struct.get $mStructIdx 6`.
+function pushMapHashes(body: i32[]): i32 {
+  pushMapScr(body, 0)
+  fbStructGet(mStructIdx, 6)  // field 6: hashes
+  0
+}
+
 // Element-wise string equality of the two refs in map scratch slots `aSlot`/`bSlot`,
 // leaving a 0/1 on the stack. A SELF-CONTAINED port of `emitStrEq`'s compare core
 // (no operands consumed; reads the two scratch string locals directly) so the map
@@ -5338,21 +5354,32 @@ function emitMapHashOf(body: i32[], strSlot: i32): i32 {
 // into `M.index` and linear-probe (wrapping) to the slot holding either the matching
 // key's entry or a free (0) slot. Leaves `slot` (slot 3) = that probe slot and `entry`
 // (slot 5) = `index[slot]` (0 = miss; else entry-position + 1). Shared by get / has /
-// set. The index load factor is kept < 1/2, so a free slot is always reached.
+// set / delete. The index load factor is kept < 1/2, so a free slot is always reached.
+//
+// TOMBSTONE-AWARE (mirrors the host's `mapSlotFn`): a slot whose entry is tombstoned
+// (`live[entry-1] == 0`) is NOT a hit — it acts as a probe MARKER (kept so delete
+// doesn't break the chain), so the probe skips past it. The stored per-entry hash
+// (`hashes[entry-1]`) GATES the (string) key comparison: only run `keyEq` when the
+// hash matches AND the entry is live. With `live` all-1s (delete-free programs) this
+// is behavior-preserving — the live check is always true, and the hash always matches
+// for the matching key (it is the same FNV of the same key).
 function emitMapProbe(body: i32[]): i32 {
   // cap = array.len(index)
   pushMapIndex(body)
   fbArrayLen()               // array.len
   setMapScr(body, 4)         // cap
-  // slot = hash(keyRef) % cap
+  // keyHash = hash(keyRef)  — computed ONCE, reused for the initial slot and to gate
+  // the per-probe key comparison. Stash into slot 11 (rslot, free in the probe).
   if emitMapHashOf(body, 1) < 0 { return 0 - 1 }
+  setMapScr(body, 11)        // keyHash
+  // slot = keyHash % cap
+  pushMapScr(body, 11)       // keyHash
   pushMapScr(body, 4)        // cap
   fbI32Bin(112)              // 0x70 i32.rem_u
   setMapScr(body, 3)         // slot
   // loop { entry = index[slot]
   //        if entry == 0 { break(miss) }
-  //        curRef = keys.backing[entry-1]
-  //        if keyEq(curRef, keyRef) { break(hit) }
+  //        if hashes[entry-1] == keyHash && live[entry-1] != 0 && keyEq(...) { break(hit) }
   //        slot = (slot + 1) % cap ; br loop }
   fbBlock(64)                // 0x02 block (probe break target), void
   fbLoop(64)                 // 0x03 loop, void
@@ -5365,6 +5392,29 @@ function emitMapProbe(body: i32[]): i32 {
   pushMapScr(body, 5)
   fbI32Eqz()                 // i32.eqz
   fbBrIf(1)                  // 0x0d br_if depth 1 → out of the probe block
+  // Match test, yielding 0/1 on the stack: hashes[entry-1] == keyHash
+  //   && live[entry-1] != 0 && keyEq(keys[entry-1], keyRef). `i32.and` is
+  //   unconditional, so the expensive `keyEq` rides an `if` to keep it off the
+  //   mismatch path (mirrors the host's guarded `keyEq`).
+  // hashes[entry-1] == keyHash
+  pushMapHashes(body)
+  pushMapScr(body, 5)        // entry
+  fbI32Const(1)
+  fbI32Bin(107)              // 0x6b i32.sub  (entry - 1)
+  fbArrayGet(aTypeIdx)       // array.get hashes[entry-1]
+  pushMapScr(body, 11)       // keyHash
+  fbI32Bin(70)               // 0x46 i32.eq
+  // && live[entry-1] != 0
+  pushMapLive(body)
+  pushMapScr(body, 5)        // entry
+  fbI32Const(1)
+  fbI32Bin(107)              // i32.sub (entry - 1)
+  fbArrayGet(aTypeIdx)       // array.get live[entry-1]
+  fbI32Const(0)
+  fbI32Bin(71)               // 0x47 i32.ne (live != 0)
+  fbI32Bin(113)              // 0x71 i32.and (hash-match AND live)
+  // ? keyEq(keys[entry-1], keyRef) : 0   — a value-typed if yielding i32.
+  fbIf(127)                  // 0x04 if, 0x7f i32 blocktype
   // curRef = keys.backing[entry-1]  (ref.as_non_null — a stored slot is populated)
   pushMapKeys(body)
   fbStructGet(mkListIdx, 0)  // field 0: backing
@@ -5374,10 +5424,13 @@ function emitMapProbe(body: i32[]): i32 {
   fbArrayGet(mkArrIdx)       // array.get
   wU8(212)                   // 0xd4 ref.as_non_null
   setMapScr(body, 2)         // curRef
-  // if keyEq(curRef, keyRef) { br 2 → out of the probe block (hit) }
   if emitMapKeyEq(body, 2, 1) < 0 { return 0 - 1 }
+  fbElse()                   // else
+  fbI32Const(0)              // hash/live mismatch → not a hit
+  fbEnd()                    // end (if)
+  // if match { br 2 → out of the probe block (hit) }
   fbBrIf(1)                  // 0x0d br_if depth 1 → out of the probe block
-  // slot = (slot + 1) % cap
+  // slot = (slot + 1) % cap  (collision OR a tombstoned slot: keep probing)
   pushMapScr(body, 3)
   fbI32Const(1)
   fbI32Bin(106)              // i32.add
@@ -5407,15 +5460,26 @@ function emitMapNew(body: i32[]): i32 {
   fbI32Const(0)
   fbStructNew(lTypeIdx)
   // live: empty i32 array (cap 0), parallel to the empty keys/vals entry lists. It
-  // grows in lockstep with the keys backing on append; all 1s (no delete this slice).
+  // grows in lockstep with the keys backing on append (a fresh entry is live = 1).
   fbArrayNewFixed(aTypeIdx, 0)
-  // index: i32 hash-slot array of INITIAL_CAP (8) zero-filled slots (0 = empty).
-  fbI32Const(8)              // i32.const 8
+  // index: i32 hash-slot array of INITIAL_CAP*2 (16) zero-filled slots (0 = empty) —
+  // matches the host's `mapNewFn` (4th `struct.new` operand `INITIAL_CAP * 2`). The
+  // load factor is kept < 1/2 (resize at `size*2 >= cap`); starting at 2×INITIAL_CAP
+  // (not INITIAL_CAP) means a tombstone-churn workload reaches the amortized-compaction
+  // threshold (`(count - size) > size + INITIAL_CAP`) BEFORE the index fills with dead
+  // probe markers — without it, same-key add/delete churn would fill all 8 slots with
+  // dead markers and the next probe would spin forever (no free slot).
+  fbI32Const(16)             // i32.const 16 (INITIAL_CAP * 2)
   fbArrayNewDefault(aTypeIdx)
   // count = 0, size = 0.
   fbI32Const(0)
   fbI32Const(0)
-  // map struct { keys, vals, live, index, count, size }.
+  // hashes: empty i32 array (cap 0), parallel to the entries; grows in lockstep with
+  // the keys backing on append (the stored FNV hash of each key). Mirrors the host's
+  // 7th `struct.new` operand (`mapNewFn`); native sizes it like `live` (cap 0, grown
+  // on demand) rather than INITIAL_CAP so the entry-parallel arrays stay length-locked.
+  fbArrayNewFixed(aTypeIdx, 0)
+  // map struct { keys, vals, live, index, count, size, hashes }.
   fbStructNew(mStructIdx)
   0
 }
@@ -5490,30 +5554,18 @@ function emitMapHas(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
   0
 }
 
-// Resize the `index` when the load factor (size / cap) crosses 1/2: allocate a fresh
-// `index` of `2*cap` slots and REBUILD it from the ordered entries — for each entry
-// `i` in `[0, count)`, hash `keys[i]` into the new index and linear-probe to a free
-// slot, writing `i+1`. The ordered keys/vals lists are UNTOUCHED (insertion order
-// preserved); only `index` is rebuilt. `mapRef` is in slot 0. Scratch use (all free
-// after the probe/append): 4 newCap, 3 entry cursor `i`, 10 new index backing, 11
-// inner probe slot; `emitMapHashOf` uses 9/8 internally (disjoint from these).
-function emitMapResize(body: i32[]): i32 {
-  // if size * 2 >= len(index) { rehash to 2 * len(index) }
-  pushMapSize(body)
-  fbI32Const(2)
-  fbI32Bin(108)              // i32.mul (size * 2)
-  pushMapIndex(body)
-  fbArrayLen()               // array.len
-  fbI32Bin(79)               // 0x4f i32.ge_u (size*2 >= cap)
-  fbIf(64)                   // if, void
-  // newCap = 2 * len(index)
-  pushMapIndex(body)
-  fbArrayLen()               // array.len
-  fbI32Const(2)
-  fbI32Bin(108)              // i32.mul
-  setMapScr(body, 4)         // newCap (slot 4)
+// REHASH primitive: with `mapRef` in slot 0 and the target capacity in slot 4
+// (`newCap`), allocate a fresh `index` of `newCap` slots and REBUILD it from the LIVE
+// entries — for each entry `i` in `[0, count)` with `live[i] != 0`, RE-PLACE from the
+// STORED `hashes[i]` (no key re-hashing — mirrors the host's `mapRehashFn`) and
+// linear-probe to a free slot, writing `i+1`. The ordered keys/vals/live/hashes are
+// UNTOUCHED (insertion order preserved); only `index` is rebuilt. Scratch use (all
+// free after the probe/append): 4 newCap, 3 entry cursor `i`, 10 new index backing, 11
+// inner probe slot. Used by `emitMapResize` (load-factor grow, newCap = 2×cap) and
+// `emitMapCompact` (shrink to a live-count-based cap).
+function emitMapRehashTo(body: i32[]): i32 {
   // idxBk = array.new_default $aTypeIdx newCap  (zero-filled)
-  pushMapScr(body, 4)
+  pushMapScr(body, 4)        // newCap (slot 4, set by the caller)
   fbArrayNewDefault(aTypeIdx)
   setMapScr(body, 10)        // idxBk (slot 10)
   // i = 0
@@ -5527,15 +5579,19 @@ function emitMapResize(body: i32[]): i32 {
   fbIf(64)                   // if, void
   // then: done (empty)
   fbElse()                   // else
-  // curRef = keys.backing[i]  (ref.as_non_null — entries are populated)
-  pushMapKeys(body)
-  fbStructGet(mkListIdx, 0)  // struct.get (keys backing), field 0: backing
+  // Skip tombstoned entries — only LIVE entries get re-placed in the new index (mirror
+  // the host's `mapRehashFn` `if live[i] != 0`). `live` is all-1s in a delete-free
+  // program, so this `if` is always taken (behavior-preserving).
+  pushMapLive(body)
   pushMapScr(body, 3)        // i
-  fbArrayGet(mkArrIdx)       // array.get
-  wU8(212)                   // 0xd4 ref.as_non_null
-  setMapScr(body, 2)         // curRef
-  // rslot = hash(curRef) % newCap
-  if emitMapHashOf(body, 2) < 0 { return 0 - 1 }
+  fbArrayGet(aTypeIdx)       // array.get live[i]
+  fbI32Const(0)
+  fbI32Bin(71)               // 0x47 i32.ne (live[i] != 0)
+  fbIf(64)                   // if, void
+  // rslot = hashes[i] % newCap  — RE-PLACE FROM THE STORED HASH (no key re-hashing).
+  pushMapHashes(body)
+  pushMapScr(body, 3)        // i
+  fbArrayGet(aTypeIdx)       // array.get hashes[i]
   pushMapScr(body, 4)        // newCap
   fbI32Bin(112)              // i32.rem_u
   setMapScr(body, 11)        // rslot
@@ -5565,6 +5621,7 @@ function emitMapResize(body: i32[]): i32 {
   fbI32Const(1)
   fbI32Bin(106)              // i32.add (i + 1)
   fbArraySet(aTypeIdx)       // array.set
+  fbEnd()                    // end (live[i] != 0 if)
   // i = i + 1
   pushMapScr(body, 3)
   fbI32Const(1)
@@ -5577,7 +5634,224 @@ function emitMapResize(body: i32[]): i32 {
   pushMapScr(body, 0)        // mapRef
   pushMapScr(body, 10)       // idxBk
   fbStructSet(mStructIdx, 3) // struct.set field 3: index
+  0
+}
+
+// Resize the `index` when the load factor (size / cap) crosses 1/2: pick newCap =
+// 2×cap and rebuild via `emitMapRehashTo`. The ordered entry lists are untouched.
+function emitMapResize(body: i32[]): i32 {
+  // if size * 2 >= len(index) { rehash to 2 * len(index) }
+  pushMapSize(body)
+  fbI32Const(2)
+  fbI32Bin(108)              // i32.mul (size * 2)
+  pushMapIndex(body)
+  fbArrayLen()               // array.len
+  fbI32Bin(79)               // 0x4f i32.ge_u (size*2 >= cap)
+  fbIf(64)                   // if, void
+  // newCap = 2 * len(index)
+  pushMapIndex(body)
+  fbArrayLen()               // array.len
+  fbI32Const(2)
+  fbI32Bin(108)              // i32.mul
+  setMapScr(body, 4)         // newCap (slot 4)
+  if emitMapRehashTo(body) < 0 { return 0 - 1 }
   fbEnd()                    // end (resize if)
+  0
+}
+
+// `emitMapCompact` (mirror of the host's `mapCompactFn`): reclaim tombstones. Rebuild
+// keys/vals/live/hashes from the LIVE entries only (dropping deleted ones, preserving
+// insertion order), set `count = size`, then rebuild the index at a live-count-based
+// capacity (next pow2 ≥ 2×size, floored at INITIAL_CAP*2 = 16). This bounds `count`
+// and the entry+index arrays under add/delete churn. `mapRef` in slot 0. Scratch:
+//   6 nk (ref $mkArrIdx), 7 nv (ref $aTypeIdx), 10 nl (ref $aTypeIdx),
+//   13 nh (ref $aTypeIdx) — the rebuilt entry arrays; 8 = i (read cursor),
+//   9 = j (write cursor), 11 = target cap; 4 = newCap for `emitMapRehashTo`.
+function emitMapCompact(body: i32[]): i32 {
+  // Fresh entry arrays sized to the OLD entry capacity (keeps spare room; lengths are
+  // irrelevant to iteration — count/size bound it). Mirrors the host's `array.new_default
+  // (len(oldArr))`.
+  // nk = new keys backing (slot 6)
+  pushMapKeysBacking(body)
+  fbArrayLen()
+  fbArrayNewDefault(mkArrIdx)
+  setMapScrKB(body)          // nk (slot 6)
+  // nv = new vals backing (slot 7)
+  pushMapValsBacking(body)
+  fbArrayLen()
+  fbArrayNewDefault(aTypeIdx)
+  setMapScrVB(body)          // nv (slot 7)
+  // nl = new live backing (slot 10)
+  pushMapLive(body)
+  fbArrayLen()
+  fbArrayNewDefault(aTypeIdx)
+  setMapScr(body, 10)        // nl (slot 10)
+  // nh = new hashes backing (slot 13)
+  pushMapHashes(body)
+  fbArrayLen()
+  fbArrayNewDefault(aTypeIdx)
+  setMapScrHB(body)          // nh (slot 13)
+  // i = 0 ; j = 0
+  fbI32Const(0)
+  setMapScr(body, 8)         // i (read cursor)
+  fbI32Const(0)
+  setMapScr(body, 9)         // j (write cursor)
+  // Copy the live entries down, compacting out tombstones (order kept).
+  // loop { if i >= count {} else { if live[i] != 0 { copy i->j ; j++ } ; i++ ; br } }
+  fbLoop(64)                 // loop, void
+  pushMapScr(body, 8)        // i
+  pushMapCount(body)
+  fbI32Bin(78)               // i32.ge_s (i >= count → done)
+  fbIf(64)                   // if, void
+  // then: done (empty)
+  fbElse()                   // else
+  pushMapLive(body)
+  pushMapScr(body, 8)        // i
+  fbArrayGet(aTypeIdx)       // live[i]
+  fbI32Const(0)
+  fbI32Bin(71)               // i32.ne (live[i] != 0)
+  fbIf(64)                   // if, void
+  // nk[j] = keys.backing[i]
+  pushMapScrKB(body)         // nk
+  pushMapScr(body, 9)        // j
+  pushMapKeysBacking(body)
+  pushMapScr(body, 8)        // i
+  fbArrayGet(mkArrIdx)       // keys.backing[i] (nullable string ref)
+  fbArraySet(mkArrIdx)
+  // nv[j] = vals.backing[i]
+  pushMapScrVB(body)         // nv
+  pushMapScr(body, 9)        // j
+  pushMapValsBacking(body)
+  pushMapScr(body, 8)        // i
+  fbArrayGet(aTypeIdx)       // vals.backing[i]
+  fbArraySet(aTypeIdx)
+  // nl[j] = 1
+  pushMapScr(body, 10)       // nl
+  pushMapScr(body, 9)        // j
+  fbI32Const(1)
+  fbArraySet(aTypeIdx)
+  // nh[j] = hashes[i]
+  pushMapScrHB(body)         // nh
+  pushMapScr(body, 9)        // j
+  pushMapHashes(body)
+  pushMapScr(body, 8)        // i
+  fbArrayGet(aTypeIdx)       // hashes[i]
+  fbArraySet(aTypeIdx)
+  // j = j + 1
+  pushMapScr(body, 9)
+  fbI32Const(1)
+  fbI32Bin(106)
+  setMapScr(body, 9)
+  fbEnd()                    // end (live[i] != 0 if)
+  // i = i + 1
+  pushMapScr(body, 8)
+  fbI32Const(1)
+  fbI32Bin(106)
+  setMapScr(body, 8)
+  fbBr(1)                    // br → loop header
+  fbEnd()                    // end (ge_s if)
+  fbEnd()                    // end (loop)
+  // Swap the rebuilt entry arrays into the keys/vals list wrappers + the struct.
+  // keys.backing = nk ; keys.len = size ; keys.cap = len(nk)
+  pushMapKeys(body)
+  pushMapScrKB(body)
+  fbStructSet(mkListIdx, 0)  // keys.backing = nk
+  pushMapKeys(body)
+  pushMapSize(body)
+  fbStructSet(mkListIdx, 1)  // keys.len = size
+  pushMapKeys(body)
+  pushMapScrKB(body)
+  fbArrayLen()
+  fbStructSet(mkListIdx, 2)  // keys.cap = len(nk)
+  // vals.backing = nv ; vals.len = size ; vals.cap = len(nv)
+  pushMapVals(body)
+  pushMapScrVB(body)
+  fbStructSet(lTypeIdx, 0)   // vals.backing = nv
+  pushMapVals(body)
+  pushMapSize(body)
+  fbStructSet(lTypeIdx, 1)   // vals.len = size
+  pushMapVals(body)
+  pushMapScrVB(body)
+  fbArrayLen()
+  fbStructSet(lTypeIdx, 2)   // vals.cap = len(nv)
+  // M.live = nl ; M.hashes = nh
+  pushMapScr(body, 0)
+  pushMapScr(body, 10)       // nl
+  fbStructSet(mStructIdx, 2) // live = nl
+  pushMapScr(body, 0)
+  pushMapScrHB(body)         // nh
+  fbStructSet(mStructIdx, 6) // hashes = nh
+  // count = size (no tombstones remain)
+  pushMapScr(body, 0)
+  pushMapSize(body)
+  fbStructSet(mStructIdx, 4) // count = size
+  // Target index cap: next pow2 ≥ 2×size, floored at INITIAL_CAP*2 = 16. cap in slot 11.
+  fbI32Const(16)
+  setMapScr(body, 11)        // cap
+  // while cap < 2*size { cap = cap * 2 }
+  fbLoop(64)                 // loop, void
+  pushMapScr(body, 11)       // cap
+  pushMapSize(body)
+  fbI32Const(2)
+  fbI32Bin(108)              // size * 2
+  fbI32Bin(79)               // 0x4f i32.ge_u (cap >= 2*size → done)
+  fbIf(64)                   // if, void
+  // then: done (empty)
+  fbElse()                   // else
+  pushMapScr(body, 11)
+  fbI32Const(2)
+  fbI32Bin(108)              // cap * 2
+  setMapScr(body, 11)
+  fbBr(1)                    // br → loop header
+  fbEnd()                    // end (ge_u if)
+  fbEnd()                    // end (loop)
+  // Rebuild the index at the chosen cap.
+  pushMapScr(body, 11)       // cap
+  setMapScr(body, 4)         // newCap (for emitMapRehashTo)
+  if emitMapRehashTo(body) < 0 { return 0 - 1 }
+  0
+}
+
+// Lower a map DELETE `m.delete(k): boolean` onto `body` (mirror of the host's
+// `mapDeleteFn`): probe to the entry; if `index[slot] == 0` push 0 (absent), else
+// tombstone `live[entry-1] = 0`, `size -= 1`, amortized-`compact` when dead entries
+// (`count - size`) exceed `size + INITIAL_CAP`, and push 1. Leaves a 0/1 i32 on the
+// stack (consumed as a boolean expression, or dropped as a bare statement).
+function emitMapDelete(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
+  if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
+  // if entry == 0 { 0 } else { tombstone ; size-- ; maybe-compact ; 1 }
+  pushMapScr(body, 5)        // entry
+  fbIf(127)                  // if (entry != 0), 0x7f i32 blocktype
+  // live[entry-1] = 0  (tombstone; keeps the entry's insertion-order position)
+  pushMapLive(body)
+  pushMapScr(body, 5)        // entry
+  fbI32Const(1)
+  fbI32Bin(107)              // i32.sub (entry - 1)
+  fbI32Const(0)
+  fbArraySet(aTypeIdx)       // array.set live[entry-1] = 0
+  // size = size - 1
+  pushMapScr(body, 0)        // mapRef
+  pushMapSize(body)
+  fbI32Const(1)
+  fbI32Bin(107)              // i32.sub
+  fbStructSet(mStructIdx, 5) // struct.set field 5: size
+  // Amortized compaction: if (count - size) > (size + INITIAL_CAP) { compact }.
+  pushMapCount(body)
+  pushMapSize(body)
+  fbI32Bin(107)              // i32.sub (count - size)
+  pushMapSize(body)
+  fbI32Const(8)              // INITIAL_CAP
+  fbI32Bin(106)              // i32.add (size + INITIAL_CAP)
+  fbI32Bin(75)               // 0x4b i32.gt_u ((count-size) > (size+INITIAL_CAP))
+  fbIf(64)                   // if, void
+  if emitMapCompact(body) < 0 { return 0 - 1 }
+  fbEnd()                    // end (compact if)
+  // result = 1 (a key was removed)
+  fbI32Const(1)
+  fbElse()                   // else
+  // result = 0 (absent)
+  fbI32Const(0)
+  fbEnd()                    // end (entry if)
   0
 }
 
@@ -5707,11 +5981,34 @@ function emitMapPushKey(body: i32[]): i32 {
   pushMapScr(body, 0)        // mapRef
   pushMapScrLB(body)
   fbStructSet(mStructIdx, 2) // struct.set field 2: live
+  // hashes grows in LOCKSTEP too (entry-parallel): fresh `(ref $aTypeIdx)` of newCap
+  // (slot 13), copy `[0, keys.len)` over, store back into M.hashes (field 6). Mirrors
+  // the host's grow of its entry-parallel `hashes` array.
+  pushMapScr(body, 4)        // newCap
+  fbArrayNewDefault(aTypeIdx)
+  setMapScrHB(body)          // newHashBacking (slot 13)
+  pushMapScrHB(body)         // dest
+  fbI32Const(0)
+  pushMapHashes(body)        // src (old hashes)
+  fbI32Const(0)
+  pushMapKeysLen(body)       // count (entries copied)
+  fbArrayCopy(aTypeIdx, aTypeIdx)   // array.copy (dest type, src type)
+  pushMapScr(body, 0)        // mapRef
+  pushMapScrHB(body)
+  fbStructSet(mStructIdx, 6) // struct.set field 6: hashes
   fbEnd()                    // end (grow if)
-  // live[keys.len] = 1  (the new entry is live; all 1s this slice — no delete).
+  // live[keys.len] = 1  (the new entry is live).
   pushMapLive(body)
   pushMapKeysLen(body)       // entry index (== count, pre-append)
   fbI32Const(1)
+  fbArraySet(aTypeIdx)       // array.set
+  // hashes[keys.len] = hash(keyRef)  — cache the key's FNV hash parallel to the entry
+  // so resize/compact re-place it without re-hashing (mirrors the host's `mapSetFn`
+  // append, which stores `m.call(hash, [key()])`). `emitMapHashOf` uses slots 8/9
+  // (free here) internally and leaves the masked hash on the stack.
+  pushMapHashes(body)
+  pushMapKeysLen(body)       // entry index (== count, pre-append)
+  if emitMapHashOf(body, 1) < 0 { return 0 - 1 }   // hash(keyRef), masked, on the stack
   fbArraySet(aTypeIdx)       // array.set
   // keys.backing[keys.len] = keyRef
   pushMapKeysBacking(body)
@@ -5843,6 +6140,17 @@ function setMapScrLB(body: i32[]): i32 {
 }
 function pushMapScrLB(body: i32[]): i32 {
   fbLocalGet(mapScratchBase + 12)
+  0
+}
+// The grown `hashes` backing ref (slot 13, a non-null `(ref $aTypeIdx)` i32 array),
+// used by the keys grow to reallocate `hashes` in lockstep with the keys backing, and
+// by `compact` as the rebuilt hashes backing.
+function setMapScrHB(body: i32[]): i32 {
+  fbLocalSet(mapScratchBase + 13)
+  0
+}
+function pushMapScrHB(body: i32[]): i32 {
+  fbLocalGet(mapScratchBase + 13)
   0
 }
 
@@ -6563,6 +6871,16 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
           return emitMapHas(body, callee.memObj, e.callArgs[0], fnIx)
         }
       }
+      // G8: a map `m.delete(k)` member-call in VALUE position yields a 0/1 boolean
+      // (whether a key was removed). The same lowering serves the bare-statement form.
+      if callee.memProp == "delete" {
+        if exprMap(callee.memObj, fnIx) {
+          if e.callArgs.length != 1 {
+            return emitFail("emitProgram: .delete takes exactly one argument")
+          }
+          return emitMapDelete(body, callee.memObj, e.callArgs[0], fnIx)
+        }
+      }
       // `xs.pop()` removes + returns the last list element (any list kind).
       if callee.memProp == "pop" {
         return emitPop(body, exprIx, fnIx)
@@ -7219,9 +7537,13 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
         }
       }
     }
-    // G8: a map membership test `m.has(k)` yields a boolean (prints true/false).
+    // G8: a map membership test `m.has(k)` and a `m.delete(k)` both yield a boolean
+    // (print true/false): `.has` = is-present, `.delete` = was-present-and-removed.
     if callee is Member {
       if callee.memProp == "has" {
+        return exprMap(callee.memObj, fnIx)
+      }
+      if callee.memProp == "delete" {
         return exprMap(callee.memObj, fnIx)
       }
     }
@@ -8359,13 +8681,32 @@ function forInRefArrayStructIdx(iterIx: i32, fnIx: i32): i32 {
   structIndexByName(refListElemNameOfExpr(iterIx, fnIx))
 }
 
+// The map RECEIVER arena index of a `for v in m.keys()` / `m.values()` iterable, or -1
+// when the iterable is not a map keys/values walk. Drives the tombstone-aware skip in
+// the for-in loop (the map's `live` array is consulted per entry).
+function forInMapRecv(iterIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[iterIx]
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Member {
+      if callee.memProp == "keys" || callee.memProp == "values" {
+        if exprMap(callee.memObj, fnIx) { return callee.memObj }
+      }
+    }
+  }
+  0 - 1
+}
+
 // Push the LIST ref a `for v in <iter>` iterates: a map `.keys()`/`.values()`
 // reads the map struct's ordered list field (0 = keys, 1 = vals); any other
 // supported iterable is the list value itself.
-// TODO(delete): once tombstone delete lands, iteration must SKIP entries with
-// `live[i] == 0`. Today `live` is all 1s and the for-in machinery walks the keys/vals
-// LIST WRAPPER by its `len` (decoupled from the map struct), so a straight walk is
-// observably identical; the skip-loop will need a map-struct-aware iteration path.
+//
+// DELETE-AWARE ITERATION: the keys/vals LIST WRAPPER is decoupled from the map struct
+// (its `len` counts appended entries == `count`), so a straight len-walk would VISIT
+// tombstoned entries. The for-in loop therefore stashes the MAP ref in the map scratch
+// frame (slot 0) and, per entry `i`, SKIPS when `M.live[i] == 0` — a map-struct-aware
+// walk over `[0, count)` matching the host's iteration semantics (order + skipping).
+// For a delete-free map `live` is all-1s, so the skip never fires (behavior-preserving).
 function emitForInList(body: i32[], iterIx: i32, fnIx: i32): i32 {
   let e = P.nodes[iterIx]
   if e is Call {
@@ -8544,6 +8885,18 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
             return emitFail("emitProgram: map set takes exactly two arguments")
           }
           return emitMapSet(body, callee.memObj, s.callArgs[0], s.callArgs[1], fnIx)
+        }
+      }
+      // G8: a bare `m.delete(k)` STATEMENT discards the boolean result — emit the
+      // delete, then `drop` the 0/1 it leaves on the stack.
+      if callee.memProp == "delete" {
+        if exprMap(callee.memObj, fnIx) {
+          if s.callArgs.length != 1 {
+            return emitFail("emitProgram: map delete takes exactly one argument")
+          }
+          if emitMapDelete(body, callee.memObj, s.callArgs[0], fnIx) < 0 { return 0 - 1 }
+          fbDrop()               // 0x1a drop (discard the boolean result)
+          return 0
         }
       }
       return emitFail("emitProgram: unsupported member-call statement")
@@ -8821,6 +9174,14 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       wrapTy = rlWrapIdx[rslot]
       backTy = rlBackIdx[rslot]
     }
+    // For a map `.keys()`/`.values()` walk, stash the MAP ref in map scratch slot 0 so
+    // the loop can consult `M.live[cursor]` and SKIP tombstoned entries (host-matching
+    // tombstone-aware iteration). `mapRecv >= 0` iff this is a map iteration.
+    let mapRecv = forInMapRecv(s.fiIter, fnIx)
+    if mapRecv >= 0 {
+      if emitExpr(body, mapRecv, fnIx) < 0 { return 0 - 1 }
+      setMapScr(body, 0)     // mapRef (scratch slot 0)
+    }
     // list = <iter> (evaluated once); cursor = 0
     if emitForInList(body, s.fiIter, fnIx) < 0 { return 0 - 1 }
     fbLocalSet(lIdx)
@@ -8839,6 +9200,23 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     fbStructGet(wrapTy, 1)
     fbI32Bin(78)             // 0x4e i32.ge_s
     fbBrIf(1)                // 0x0d br_if -> break out of block
+    // TOMBSTONE SKIP: if M.live[cursor] == 0, advance the cursor and re-loop WITHOUT
+    // binding `v` / running the body — the deleted entry is invisible to iteration
+    // (insertion order of the survivors preserved). `br 1` targets the loop header
+    // (if-frame is 0, loop is 1). A delete-free map has live all-1s, so never taken.
+    if mapRecv >= 0 {
+      pushMapLive(body)      // M.live (scratch slot 0)
+      fbLocalGet(iIdx)
+      fbArrayGet(aTypeIdx)   // M.live[cursor]
+      fbI32Eqz()             // live[cursor] == 0 ?
+      fbIf(64)               // 0x04 if, void
+      fbLocalGet(iIdx)
+      fbI32Const(1)
+      fbI32Bin(106)          // cursor + 1
+      fbLocalSet(iIdx)
+      fbBr(1)                // 0x0c br -> loop header (re-check exit)
+      fbEnd()                // 0x0b end (if)
+    }
     // v = backing[cursor] (a string element recovers its non-null ref)
     fbLocalGet(lIdx)
     fbStructGet(wrapTy, 0)
@@ -9271,9 +9649,9 @@ function fbBeginFunc(nParams: i32, nLocals: i32): i32 {
   // String-op frame (3 non-null string refs + 4 i32 temporaries).
   strScratchBase = fbScratchCur
   if fnUsesStrOp { fbReserve(7) }
-  // G8 map scratch frame (13 slots).
+  // G8 map scratch frame (14 slots).
   mapScratchBase = fbScratchCur
-  if fnUsesMap { fbReserve(13) }
+  if fnUsesMap { fbReserve(14) }
   // Closure scratch frame (1 slot, a `(ref $cloStruct)`) for `call_ref` (lambdas).
   callRefSlot = fbScratchCur
   if fnUsesCallRef { fbReserve(1) }
@@ -9336,7 +9714,7 @@ function fbLocalsCount(nLocals: i32): i32 {
   n = n + fnRefPushSlots.length * 4
   if fnUsesStrPush { n = n + 4 }
   if fnUsesStrOp { n = n + 7 }
-  if fnUsesMap { n = n + 13 }
+  if fnUsesMap { n = n + 14 }
   if fnUsesCallRef { n = n + 1 }
   if fnUsesMapFilter { n = n + 4 }
   n = n + mfSrcKinds.length + mfDstKinds.length
@@ -9400,7 +9778,7 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32): i32 {
   //   0 mapRef (ref $mStructIdx), 1 keyRef (ref $aTypeIdx), 2 curRef (ref $aTypeIdx),
   //   3 slot i32, 4 cap i32, 5 entry i32, 6 keysBk (ref $mkArrIdx),
   //   7 valsBk (ref $aTypeIdx), 8 chr i32, 9 hcur i32, 10 idxBk (ref $aTypeIdx),
-  //   11 rslot i32, 12 liveBk (ref $aTypeIdx).
+  //   11 rslot i32, 12 liveBk (ref $aTypeIdx), 13 hashBk (ref $aTypeIdx).
   if fnUsesMap {
     fbRefRun(mStructIdx)
     fbRefRun(aTypeIdx)
@@ -9414,6 +9792,7 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32): i32 {
     fbI32Run()
     fbRefRun(aTypeIdx)
     fbI32Run()
+    fbRefRun(aTypeIdx)
     fbRefRun(aTypeIdx)
   }
   // Closure scratch slot (1, (ref $cloStruct)) for `call_ref` (lambdas).
@@ -11165,14 +11544,17 @@ function emitModule(stmts: i32[]): i32 {
   }
   if mUsed {
     // The MAP struct `{ keys: (ref $mkListIdx), vals: (ref $lTypeIdx), live: (ref
-    // $aTypeIdx), index: (ref $aTypeIdx), count, size }` — two non-null list refs (the
-    // keys string-list + the i32 vals list), the i32 `live` tombstone array (all 1s in
-    // this slice; aligns the rep to the host's 6-field layout), the i32 `index`
-    // hash-slot array, and the `count`/`size` counters. FIELD ORDER matches the host
-    // (`compiler/builtins/maps.ts`): live is at index 2, shifting index/count/size to
-    // 3/4/5.
+    // $aTypeIdx), index: (ref $aTypeIdx), count, size, hashes: (ref $aTypeIdx) }` — two
+    // non-null list refs (the keys string-list + the i32 vals list), the i32 `live`
+    // tombstone array, the i32 `index` hash-slot array, the `count`/`size` counters, and
+    // the i32 `hashes` per-entry FNV cache. FIELD ORDER + COUNT now match the host's
+    // 7-field general-purpose rep EXACTLY (`compiler/builtins/maps.ts`, `MAP_HASHES = 6`):
+    // the cached per-entry hash lets resize/compact RE-PLACE entries without re-hashing
+    // keys and gates the (string) key comparison on a hash mismatch — justified for
+    // large/long-key maps, not a compiler-symbol-table-narrow optimization. live is at
+    // index 2, index/count/size at 3/4/5, hashes at 6.
     wU8(95)                      // 0x5f struct (map)
-    wU8(6)                       // 6 fields (open-addressing hash map, host-aligned)
+    wU8(7)                       // 7 fields (open-addressing hash map, host-aligned)
     wU8(100)                     // field 0 keys: 0x64 (ref $mkListIdx) — non-null
     wSLEB(mkListIdx)
     wU8(1)                       // mutable
@@ -11188,6 +11570,9 @@ function emitModule(stmts: i32[]): i32 {
     wU8(127)                     // field 4 count: 0x7f i32
     wU8(1)                       // mutable
     wU8(127)                     // field 5 size: 0x7f i32
+    wU8(1)                       // mutable
+    wU8(100)                     // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
     wU8(1)                       // mutable
   }
   if fa64Used {
@@ -13712,10 +14097,18 @@ function exprHasMapOp(exprIx: i32, fnIx: i32): boolean {
     return exprHasMapOp(e.binRight, fnIx)
   }
   if e is Call {
-    // `recv.has(k)` map membership.
+    // `recv.has(k)` map membership / `recv.delete(k)` map removal — both touch a map.
+    // `m.keys()` / `m.values()` ITERATION also needs the map scratch frame (slot 0
+    // holds the map ref for the tombstone-aware `live[i]` skip in the for-in loop).
     let callee = P.nodes[e.callFn]
     if callee is Member {
       if callee.memProp == "has" {
+        if exprMap(callee.memObj, fnIx) { return true }
+      }
+      if callee.memProp == "delete" {
+        if exprMap(callee.memObj, fnIx) { return true }
+      }
+      if callee.memProp == "keys" || callee.memProp == "values" {
         if exprMap(callee.memObj, fnIx) { return true }
       }
     }
