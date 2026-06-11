@@ -95,6 +95,7 @@ const WHITELIST = [
   "functions/forward-reference-struct-array-param.vl",
   "functions/forward-reference-struct-param.vl",
   "functions/forward-reference.vl",
+  "functions/let-untyped-from-array-call.vl",
   "functions/mutual-recursion-inferred.vl",
   "functions/mutual-recursion-struct-param.vl",
   "functions/mutual-recursion.vl",
