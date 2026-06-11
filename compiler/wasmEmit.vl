@@ -1089,6 +1089,17 @@ function fbRefNullStruct(): i32 {
   wU8(107)           // structref abstract heaptype (0x6b)
   0
 }
+// `ref.null <heaptype>` (0xd0 <s33>) — a typed null (a missing map value, etc.).
+function fbRefNull(heapIdx: i32): i32 {
+  wU8(208)           // 0xd0 ref.null
+  wSLEB(heapIdx)
+  0
+}
+// `ref.as_non_null` (0xd4) — recover the non-null ref a nullable slot holds.
+function fbRefAsNonNull(): i32 {
+  wU8(212)           // 0xd4 ref.as_non_null
+  0
+}
 
 // ── module header ────────────────────────────────────────────────────────────
 function emitHeader(): i32 {
@@ -2893,6 +2904,161 @@ let mStructIdx: i32 = 0
 // thus need no new heap type; they share `mkArrIdx`/`mkListIdx`.
 let slUsed: boolean = false
 
+// ── ref-valued map table (per-VALUE-type map parameterization) ─────────────────
+// A `{[string]: V}` whose V is a REFERENCE type (a string, a struct) cannot ride the
+// monomorphic i32 `vals` list — its values are refs. Mirroring the host
+// (`builtins/maps.ts` parameterizes helpers per (key,value) wasm type pair, with a
+// NULLABLE-ref vals element so `array.new_default` null-inits), each distinct ref
+// value type interns a SLOT here, carrying its OWN 7-field map struct whose `vals`
+// field references the matching ref-list wrapper:
+//   • V = string      → vals is the string-ref list (`mkListIdx` over `mkArrIdx`) —
+//                       the exact pair the KEYS list already uses.
+//   • V = a struct    → vals is that element's ref list (`rlWrapIdx`/`rlBackIdx`
+//                       slot, interned via `rlInternName` like any `S[]`).
+// The keys/live/index/count/size/hashes fields are IDENTICAL across all map structs,
+// so the probe/rehash/compact machinery is shared; only the `vals` reads/writes and
+// the struct.get/set TYPE immediates differ per slot. Slot `-1` everywhere means the
+// monomorphic i32-valued map (`mStructIdx`); `-2` is the Set flavor (boolean vals,
+// mono rep); `-3` marks an UNSUPPORTED value type (fails loudly at the op site).
+// Gated additively: a program without a ref-valued map interns zero slots and emits
+// byte-identical output.
+let mvValName: string[] = []     // canonical value type-name per slot
+let mvValKind: i32[] = []        // 3 = string value, 1 = struct value
+let mvValStructIdx: i32[] = []   // struct TABLE index of a kind-1 value, else -1
+let mvRlSlot: i32[] = []         // ref-list table slot of a kind-1 vals list, else -1
+let mvMapTypeIdx: i32[] = []     // this slot's map struct heap-type index (emitModule)
+
+// The VALUE type-name of a synthetic map type-name `{[K]:V}` — the text after the
+// FIRST "]:" (the key cannot contain `]`), minus the closing `}`. Mirrors the
+// checker's split (typecheck.vl `parseMapName`). "" if the name is not that shape.
+function mapValNameOf(name: string): string {
+  if !nameIsMap(name) { return "" }
+  let i = 2
+  while i < name.length - 1 {
+    if name[i] == ']' {
+      if name[i + 1] == ':' {
+        return name.slice(i + 2, name.length - 1)
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Resolve a value type-NAME to a struct TABLE index: a declared struct by name, or
+// an inline object type `{a:T,b:U}` matched by FIELD-NAME SET against the table
+// (anonymous shapes are interned from literals by `collectAnonShapes` under `#anonN`
+// names, so the annotation text never matches by name — the field set is the key,
+// exactly how `structIndexOfObj` binds literals). -1 when nothing matches.
+function structIndexByValName(name: string): i32 {
+  let si = structIndexByName(name)
+  if si >= 0 { return si }
+  if name.length < 2 { return 0 - 1 }
+  if name[0] != '{' { return 0 - 1 }
+  if name[1] == '[' { return 0 - 1 }
+  // Parse the field NAMES out of `{a:T,b:U}`: each field name runs from a `{`/`,`
+  // at depth 1 to its `:`. Nested `{}`/`[]` in field types are depth-tracked so
+  // their commas/colons don't split.
+  let fnames: string[] = []
+  let depth = 0
+  let i = 0
+  let start = 0 - 1
+  while i < name.length {
+    let c = name[i]
+    if c == '{' || c == '[' {
+      depth = depth + 1
+      if depth == 1 { start = i + 1 }
+    } else if c == '}' || c == ']' {
+      depth = depth - 1
+    } else if c == ',' {
+      if depth == 1 { start = i + 1 }
+    } else if c == ':' {
+      if depth == 1 {
+        if start >= 0 { fnames.push(name.slice(start, i)) }
+        start = 0 - 1
+      }
+    }
+    i = i + 1
+  }
+  if fnames.length == 0 { return 0 - 1 }
+  // Match by exact field-name set (count + every name present).
+  let s = 0
+  while s < sNames.length {
+    if sFieldCount[s] == fnames.length {
+      let ok = true
+      let k = 0
+      while k < fnames.length {
+        if sFieldIndex(s, fnames[k]) < 0 { ok = false }
+        k = k + 1
+      }
+      if ok { return s }
+    }
+    s = s + 1
+  }
+  0 - 1
+}
+
+// Classify + intern a map VALUE type-name, returning the binding's map SHAPE code:
+// `-1` mono i32 map (i32 / boolean values), a slot `>= 0` for a ref value type
+// (string / struct), or `-3` unsupported (unions, arrays, nested maps — the op
+// sites fail loudly). Interning is idempotent (one slot per distinct name).
+// Kind-1 (struct) values force the element's ref-list types (`rlInternName`), and
+// every ref-valued map forces the string-list (keys) + mono map types — the shared
+// probe machinery and the keys list ride on them.
+function mvShapeOfValName(valName: string): i32 {
+  if valName == "i32" || valName == "boolean" { return 0 - 1 }
+  let kind = 0 - 1
+  let vsi = 0 - 1
+  if valName == "string" {
+    kind = 3
+  } else {
+    vsi = structIndexByValName(valName)
+    if vsi >= 0 { kind = 1 }
+  }
+  if kind < 0 { return 0 - 3 }
+  let i = 0
+  while i < mvValName.length {
+    if mvValName[i] == valName { return i }
+    i = i + 1
+  }
+  mvValName.push(valName)
+  mvValKind.push(kind)
+  mvValStructIdx.push(vsi)
+  if kind == 1 {
+    mvRlSlot.push(rlInternName(sNames[vsi], 1))
+    rlUsed = true
+    raUsed = true
+  } else {
+    mvRlSlot.push(0 - 1)
+  }
+  mvMapTypeIdx.push(0)
+  mvValName.length - 1
+}
+
+// Per-slot type accessors, each answering for the MONO map on slot < 0 so callers
+// thread one code everywhere. `mapTypeIdxOf` is the struct.get/set TYPE immediate;
+// `mvValsWrapOf`/`mvValsBackOf` are the vals list wrapper/backing heap types;
+// `mvValElemHeapOf` is the heap type a ref VALUE slot holds (for ref.null / casts).
+function mapTypeIdxOf(slot: i32): i32 {
+  if slot < 0 { return mStructIdx }
+  mvMapTypeIdx[slot]
+}
+function mvValsWrapOf(slot: i32): i32 {
+  if slot < 0 { return lTypeIdx }
+  if mvValKind[slot] == 3 { return mkListIdx }
+  rlWrapIdx[mvRlSlot[slot]]
+}
+function mvValsBackOf(slot: i32): i32 {
+  if slot < 0 { return aTypeIdx }
+  if mvValKind[slot] == 3 { return mkArrIdx }
+  rlBackIdx[mvRlSlot[slot]]
+}
+function mvValElemHeapOf(slot: i32): i32 {
+  if slot < 0 { return aTypeIdx }
+  if mvValKind[slot] == 3 { return aTypeIdx }
+  sHeapIdx[mvValStructIdx[slot]]
+}
+
 // ── f64-element array table (Slice 4: `f64[]`) ────────────────────────────────
 // A distinct WasmGC array heap type `(array (mut f64))` + its growable-list wrapper
 // `{ backing: (ref $fa64TypeIdx), len: i32, cap: i32 }`, interned AFTER every existing
@@ -2935,6 +3101,13 @@ let pendingListSlot: i32 = 0
 // following literal lowering; `emitObj` clears it back to `-1` once consumed so a NESTED
 // literal does not inherit the outer hint.
 let pendingStructIdx: i32 = 0 - 1
+
+// The map SHAPE a `Map()` constructor must build as, seeded by the binding /
+// global-init site just before the initializer is lowered (`-1` mono i32 map, an
+// mv slot >= 0 for a ref-valued map, `-2` a Set — mono rep). Like
+// `pendingStructIdx`: overwritten at each binding, consumed (reset to -1) by
+// `emitMapNew`, so a non-constructor init can't leak a stale slot.
+let pendingMapSlot: i32 = 0 - 1
 
 // `true` while lowering an expression whose CONTEXT expects an i64 (an `: i64`
 // binding/global init, an i64 param argument, or an i64 return). Read by the
@@ -3100,11 +3273,10 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
         // THIS slot. `slot` is the new slot's declared-local position.
         let slot = 0 - 1
         if letIsMap(stmts[i], fnIx) {
-          // The kind-6 parallel slot carries the map FLAVOR: `-2` for a `Set()`
-          // binding (its `.values()` walks the keys), `-1` for a plain map.
-          let mflavor = 0 - 1
-          if letIsSet(stmts[i]) { mflavor = 0 - 2 }
-          slot = addLocalName(s.letName, 6, mflavor)
+          // The kind-6 parallel slot carries the map SHAPE: `-2` for a `Set()`
+          // binding (its `.values()` walks the keys), an mv slot (>= 0) for a
+          // ref-valued map, `-1` for the mono i32 map.
+          slot = addLocalName(s.letName, 6, letMapShapeOf(stmts[i], fnIx))
         } else if letIsNulRef(stmts[i], fnIx) {
           // Nullable struct (`S | null`, code 9): annotation-first, else the
           // initializer's nullable-returning call. BEFORE the struct case (a
@@ -3185,7 +3357,14 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
         scopeBind(s.fiVar, fiSlot)
         addLocalName(s.fiVar + "#i", 0, 0 - 1)
         let fiLs = 0 - 1
-        if fiEk == 1 { fiLs = refListSlotOfExpr(s.fiIter, fnIx) }
+        if fiEk == 1 {
+          let fiMvs = forInMapValsSlot(s.fiIter, fnIx)
+          if fiMvs >= 0 {
+            fiLs = mvRlSlot[fiMvs]
+          } else {
+            fiLs = refListSlotOfExpr(s.fiIter, fnIx)
+          }
+        }
         addLocalName(s.fiVar + "#l", fiLk, fiLs)
         if collectLocals(s.fiBody, fnIx) < 0 { scopePop() return 0 - 1 }
       }
@@ -4872,6 +5051,10 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
 
 let fnUsesMap: boolean = false
 let mapScratchBase: i32 = 0
+// The base wasm-local index of the ref-valued map frames (3 typed slots per module
+// mv slot — mapRef / valsBk / valStash), reserved after every other scratch frame
+// in a map-using function. See `fbBeginFunc`.
+let fnMvBase: i32 = 0
 
 // Whether the current function performs a `call_ref` (a function-value call) — drives a
 // 1-slot closure scratch frame (`callRefSlot`, a `(ref $cloStruct)` local) that stashes
@@ -5191,7 +5374,52 @@ function blockHasCallRef(ix: i32, fnIx: i32): boolean {
   false
 }
 
-// `local.get` of map scratch slot `n`.
+// ── the CURRENT map-op context (the receiver's mv slot) ───────────────────────
+// `cmSlot` is the map SHAPE the op being lowered runs against: `-1` the mono i32
+// map (also the Set flavor, normalized by `emitMapPrep`), or an mv slot >= 0 (a
+// ref-valued map). Set by each op entry (`emitMapPrep`/`emitMapNew`/the for-in
+// walk) and RE-SET after any inner `emitExpr` (a value/default expression may
+// itself contain a map op against a different map — the inner op clobbers the
+// context). The leaf accessors below read it to pick the struct.get/set TYPE
+// immediates, the vals list/backing types, and the mapRef/valsBk/valStash locals.
+let cmSlot: i32 = 0 - 1
+
+// The current op's map struct heap type / vals wrapper / vals backing.
+function cmMapTy(): i32 {
+  mapTypeIdxOf(cmSlot)
+}
+function cmValsWrap(): i32 {
+  mvValsWrapOf(cmSlot)
+}
+function cmValsBack(): i32 {
+  mvValsBackOf(cmSlot)
+}
+
+// The current op's mapRef local: the shared mono scratch slot 0, or this mv
+// slot's typed frame slot (the mono `(ref $mStructIdx)` local cannot hold an mv
+// map ref — the types differ).
+function cmMapRefLocal(): i32 {
+  if cmSlot < 0 { return mapScratchBase }
+  fnMvMapRefLocal(cmSlot)
+}
+// The current op's vals-backing scratch local (grow/compact temporary).
+function cmValsBkLocal(): i32 {
+  if cmSlot < 0 { return mapScratchBase + 7 }
+  fnMvValsBkLocal(cmSlot)
+}
+
+// `local.get` / `local.set` of the current op's mapRef.
+function pushMapRef(body: i32[]): i32 {
+  fbLocalGet(cmMapRefLocal())  // 0x20 local.get
+  0
+}
+function setMapRef(body: i32[]): i32 {
+  fbLocalSet(cmMapRefLocal())  // 0x21 local.set
+  0
+}
+
+// `local.get` of map scratch slot `n` (the shared mono frame — every slot except
+// the mapRef/valsBk/valStash trio is map-shape-agnostic and stays shared).
 function pushMapScr(body: i32[], n: i32): i32 {
   fbLocalGet(mapScratchBase + n)  // 0x20 local.get
   0
@@ -5203,54 +5431,54 @@ function setMapScr(body: i32[], n: i32): i32 {
   0
 }
 
-// `M.keys` (the keys list wrapper ref): `local.get mapRef ; struct.get $mStructIdx 0`.
+// `M.keys` (the keys list wrapper ref): `local.get mapRef ; struct.get <mapTy> 0`.
 function pushMapKeys(body: i32[]): i32 {
-  pushMapScr(body, 0)
-  fbStructGet(mStructIdx, 0)  // field 0: keys
+  pushMapRef(body)
+  fbStructGet(cmMapTy(), 0)  // field 0: keys
   0
 }
 
-// `M.vals` (the i32 vals list wrapper ref): `local.get mapRef ; struct.get $mStructIdx 1`.
+// `M.vals` (the vals list wrapper ref): `local.get mapRef ; struct.get <mapTy> 1`.
 function pushMapVals(body: i32[]): i32 {
-  pushMapScr(body, 0)
-  fbStructGet(mStructIdx, 1)  // field 1: vals
+  pushMapRef(body)
+  fbStructGet(cmMapTy(), 1)  // field 1: vals
   0
 }
 
 // `M.live` (the i32 tombstone array, parallel to entries; all 1s in this slice):
-// `local.get mapRef ; struct.get $mStructIdx 2`.
+// `local.get mapRef ; struct.get <mapTy> 2`.
 function pushMapLive(body: i32[]): i32 {
-  pushMapScr(body, 0)
-  fbStructGet(mStructIdx, 2)  // field 2: live
+  pushMapRef(body)
+  fbStructGet(cmMapTy(), 2)  // field 2: live
   0
 }
 
-// `M.index` (the i32 hash-slot array): `local.get mapRef ; struct.get $mStructIdx 3`.
+// `M.index` (the i32 hash-slot array): `local.get mapRef ; struct.get <mapTy> 3`.
 function pushMapIndex(body: i32[]): i32 {
-  pushMapScr(body, 0)
-  fbStructGet(mStructIdx, 3)  // field 3: index
+  pushMapRef(body)
+  fbStructGet(cmMapTy(), 3)  // field 3: index
   0
 }
 
-// `M.count` (entries appended): `local.get mapRef ; struct.get $mStructIdx 4`.
+// `M.count` (entries appended): `local.get mapRef ; struct.get <mapTy> 4`.
 function pushMapCount(body: i32[]): i32 {
-  pushMapScr(body, 0)
-  fbStructGet(mStructIdx, 4)  // field 4: count
+  pushMapRef(body)
+  fbStructGet(cmMapTy(), 4)  // field 4: count
   0
 }
 
-// `M.size` (live entry count): `local.get mapRef ; struct.get $mStructIdx 5`.
+// `M.size` (live entry count): `local.get mapRef ; struct.get <mapTy> 5`.
 function pushMapSize(body: i32[]): i32 {
-  pushMapScr(body, 0)
-  fbStructGet(mStructIdx, 5)  // field 5: size
+  pushMapRef(body)
+  fbStructGet(cmMapTy(), 5)  // field 5: size
   0
 }
 
 // `M.hashes` (the i32 per-entry FNV cache, parallel to the entries):
-// `local.get mapRef ; struct.get $mStructIdx 6`.
+// `local.get mapRef ; struct.get <mapTy> 6`.
 function pushMapHashes(body: i32[]): i32 {
-  pushMapScr(body, 0)
-  fbStructGet(mStructIdx, 6)  // field 6: hashes
+  pushMapRef(body)
+  fbStructGet(cmMapTy(), 6)  // field 6: hashes
   0
 }
 
@@ -5453,16 +5681,24 @@ function emitMapNew(body: i32[]): i32 {
   if !mUsed {
     return emitFail("emitProgram: Map() but map type not collected")
   }
+  // The binding-seeded map SHAPE (consumed here): -1/-2 build the mono map; an mv
+  // slot >= 0 builds THIS value type's map struct over its ref vals list.
+  let slot = pendingMapSlot
+  pendingMapSlot = 0 - 1
+  if slot == 0 - 2 { slot = 0 - 1 }
+  if slot == 0 - 3 {
+    return emitFail("emitProgram: unsupported map value type (only i32 / boolean / string / struct values)")
+  }
   // keys list: empty string-ref backing → wrapper.
   fbArrayNewFixed(mkArrIdx, 0)             // 0 elements
   fbI32Const(0)              // len = 0
   fbI32Const(0)              // cap = 0
   fbStructNew(mkListIdx)
-  // vals list: empty i32 backing → wrapper.
-  fbArrayNewFixed(aTypeIdx, 0)
+  // vals list: empty backing → wrapper (the i32 list, or the slot's ref list).
+  fbArrayNewFixed(mvValsBackOf(slot), 0)
   fbI32Const(0)
   fbI32Const(0)
-  fbStructNew(lTypeIdx)
+  fbStructNew(mvValsWrapOf(slot))
   // live: empty i32 array (cap 0), parallel to the empty keys/vals entry lists. It
   // grows in lockstep with the keys backing on append (a fresh entry is live = 1).
   fbArrayNewFixed(aTypeIdx, 0)
@@ -5483,8 +5719,9 @@ function emitMapNew(body: i32[]): i32 {
   // 7th `struct.new` operand (`mapNewFn`); native sizes it like `live` (cap 0, grown
   // on demand) rather than INITIAL_CAP so the entry-parallel arrays stay length-locked.
   fbArrayNewFixed(aTypeIdx, 0)
-  // map struct { keys, vals, live, index, count, size, hashes }.
-  fbStructNew(mStructIdx)
+  // map struct { keys, vals, live, index, count, size, hashes } — the mono struct,
+  // or the mv slot's (identical shape, vals field referencing the slot's wrapper).
+  fbStructNew(mapTypeIdxOf(slot))
   0
 }
 
@@ -5502,9 +5739,22 @@ function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
   if !exprString(keyIx, fnIx) {
     return emitFail("emitProgram: map key is not a string")
   }
+  // Resolve the receiver's map SHAPE into the op context. A Set (-2) runs on the
+  // mono machinery; an unsupported value type (-3) fails loudly.
+  let mshape = mapShapeOfExpr(recvIx, fnIx)
+  if mshape == 0 - 2 { mshape = 0 - 1 }
+  if mshape == 0 - 3 {
+    return emitFail("emitProgram: unsupported map value type (only i32 / boolean / string / struct values)")
+  }
+  // The receiver expr is emitted OUTSIDE the context (it is map-op-free by
+  // construction — an Ident/global/constructor), then the context pins the typed
+  // mapRef store. The KEY expr may contain an inner map op (`m[n[k] ?? "d"]`),
+  // which clobbers `cmSlot` — re-pin it before the probe.
   if emitExpr(body, recvIx, fnIx) < 0 { return 0 - 1 }
-  setMapScr(body, 0)         // mapRef
+  cmSlot = mshape
+  setMapRef(body)            // mapRef (the shared mono slot, or this mv frame's)
   if emitExpr(body, keyIx, fnIx) < 0 { return 0 - 1 }
+  cmSlot = mshape
   setMapScr(body, 1)         // keyRef
   emitMapProbe(body)
 }
@@ -5514,6 +5764,31 @@ function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
 // ALWAYS reads a map through `?? -1` (a total fallback), so this is the primary get.
 function emitMapGetOr(body: i32[], recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32): i32 {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
+  if cmSlot >= 0 {
+    // REF values: a value-typed `if` would need an interned blocktype functype, so
+    // route through the slot's NULLABLE valStash local instead — both arms set it
+    // (the hit arm with the (ref null) slot read, the miss arm with the default's
+    // non-null value), then `ref.as_non_null` recovers the non-null result the
+    // `??` expression's type promises. A live entry's val slot is never null.
+    let mslot = cmSlot
+    pushMapScr(body, 5)      // entry
+    fbIf(64)                 // if (entry != 0 → found), void
+    pushMapVals(body)
+    fbStructGet(cmValsWrap(), 0)   // vals backing
+    pushMapScr(body, 5)      // entry
+    fbI32Const(1)
+    fbI32Bin(107)            // i32.sub (entry - 1)
+    fbArrayGet(cmValsBack()) // (ref null <elem>) slot read
+    fbLocalSet(fnMvValStashLocal(mslot))
+    fbElse()                 // else
+    if emitExpr(body, defIx, fnIx) < 0 { return 0 - 1 }
+    cmSlot = mslot
+    fbLocalSet(fnMvValStashLocal(mslot))
+    fbEnd()                  // end (if)
+    fbLocalGet(fnMvValStashLocal(mslot))
+    fbRefAsNonNull()         // the `??` result is the non-null value type
+    return 0
+  }
   // if entry != 0 { vals.backing[entry-1] } else { d }  — a value-typed if yielding i32.
   pushMapScr(body, 5)        // entry
   fbIf(127)                  // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
@@ -5535,6 +5810,27 @@ function emitMapGetOr(body: i32[], recvIx: i32, keyIx: i32, defIx: i32, fnIx: i3
 // completeness so `m[k]` in value position is total (0 default).
 function emitMapGet(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
+  if cmSlot >= 0 {
+    // REF values: yield the NULLABLE element — the (ref null <elem>) vals slot on
+    // a hit, `ref.null <elem>` on a miss — via the slot's valStash (same
+    // blocktype-avoidance as `emitMapGetOr`). The `m[k]` type is `V | null`.
+    let mslot = cmSlot
+    pushMapScr(body, 5)      // entry
+    fbIf(64)                 // if (entry != 0), void
+    pushMapVals(body)
+    fbStructGet(cmValsWrap(), 0)
+    pushMapScr(body, 5)      // entry
+    fbI32Const(1)
+    fbI32Bin(107)            // i32.sub (entry - 1)
+    fbArrayGet(cmValsBack())
+    fbLocalSet(fnMvValStashLocal(mslot))
+    fbElse()                 // else
+    fbRefNull(mvValElemHeapOf(mslot))
+    fbLocalSet(fnMvValStashLocal(mslot))
+    fbEnd()                  // end
+    fbLocalGet(fnMvValStashLocal(mslot))
+    return 0
+  }
   pushMapScr(body, 5)        // entry
   fbIf(127)                  // if (entry != 0), i32 blocktype
   pushMapVals(body)
@@ -5635,9 +5931,9 @@ function emitMapRehashTo(body: i32[]): i32 {
   fbEnd()                    // end (ge_s if)
   fbEnd()                    // end (outer loop)
   // M.index = idxBk
-  pushMapScr(body, 0)        // mapRef
+  pushMapRef(body)           // mapRef
   pushMapScr(body, 10)       // idxBk
-  fbStructSet(mStructIdx, 3) // struct.set field 3: index
+  fbStructSet(cmMapTy(), 3)  // struct.set field 3: index
   0
 }
 
@@ -5680,11 +5976,11 @@ function emitMapCompact(body: i32[]): i32 {
   fbArrayLen()
   fbArrayNewDefault(mkArrIdx)
   setMapScrKB(body)          // nk (slot 6)
-  // nv = new vals backing (slot 7)
+  // nv = new vals backing (the valsBk scratch — slot 7 mono, the mv frame else)
   pushMapValsBacking(body)
   fbArrayLen()
-  fbArrayNewDefault(aTypeIdx)
-  setMapScrVB(body)          // nv (slot 7)
+  fbArrayNewDefault(cmValsBack())
+  setMapScrVB(body)          // nv
   // nl = new live backing (slot 10)
   pushMapLive(body)
   fbArrayLen()
@@ -5727,8 +6023,8 @@ function emitMapCompact(body: i32[]): i32 {
   pushMapScr(body, 9)        // j
   pushMapValsBacking(body)
   pushMapScr(body, 8)        // i
-  fbArrayGet(aTypeIdx)       // vals.backing[i]
-  fbArraySet(aTypeIdx)
+  fbArrayGet(cmValsBack())   // vals.backing[i]
+  fbArraySet(cmValsBack())
   // nl[j] = 1
   pushMapScr(body, 10)       // nl
   pushMapScr(body, 9)        // j
@@ -5770,25 +6066,25 @@ function emitMapCompact(body: i32[]): i32 {
   // vals.backing = nv ; vals.len = size ; vals.cap = len(nv)
   pushMapVals(body)
   pushMapScrVB(body)
-  fbStructSet(lTypeIdx, 0)   // vals.backing = nv
+  fbStructSet(cmValsWrap(), 0)   // vals.backing = nv
   pushMapVals(body)
   pushMapSize(body)
-  fbStructSet(lTypeIdx, 1)   // vals.len = size
+  fbStructSet(cmValsWrap(), 1)   // vals.len = size
   pushMapVals(body)
   pushMapScrVB(body)
   fbArrayLen()
-  fbStructSet(lTypeIdx, 2)   // vals.cap = len(nv)
+  fbStructSet(cmValsWrap(), 2)   // vals.cap = len(nv)
   // M.live = nl ; M.hashes = nh
-  pushMapScr(body, 0)
+  pushMapRef(body)
   pushMapScr(body, 10)       // nl
-  fbStructSet(mStructIdx, 2) // live = nl
-  pushMapScr(body, 0)
+  fbStructSet(cmMapTy(), 2)  // live = nl
+  pushMapRef(body)
   pushMapScrHB(body)         // nh
-  fbStructSet(mStructIdx, 6) // hashes = nh
+  fbStructSet(cmMapTy(), 6)  // hashes = nh
   // count = size (no tombstones remain)
-  pushMapScr(body, 0)
+  pushMapRef(body)
   pushMapSize(body)
-  fbStructSet(mStructIdx, 4) // count = size
+  fbStructSet(cmMapTy(), 4)  // count = size
   // Target index cap: next pow2 ≥ 2×size, floored at INITIAL_CAP*2 = 16. cap in slot 11.
   fbI32Const(16)
   setMapScr(body, 11)        // cap
@@ -5834,11 +6130,11 @@ function emitMapDelete(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
   fbI32Const(0)
   fbArraySet(aTypeIdx)       // array.set live[entry-1] = 0
   // size = size - 1
-  pushMapScr(body, 0)        // mapRef
+  pushMapRef(body)           // mapRef
   pushMapSize(body)
   fbI32Const(1)
   fbI32Bin(107)              // i32.sub
-  fbStructSet(mStructIdx, 5) // struct.set field 5: size
+  fbStructSet(cmMapTy(), 5)  // struct.set field 5: size
   // Amortized compaction: if (count - size) > (size + INITIAL_CAP) { compact }.
   pushMapCount(body)
   pushMapSize(body)
@@ -5872,20 +6168,25 @@ function emitMapDelete(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32): i32 {
 // evaluated value expression (and `valIx` is ignored). EXISTING callers pass
 // `valConst1 = false` so their emitted bytes stay byte-identical.
 function emitMapSetV(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32, valConst1: boolean): i32 {
-  // The vals list is the i32 list — a REF value (a string / struct / list) would
-  // store a ref into an i32 array (invalid wasm). Fail loudly until ref-valued
-  // maps land. (A constant-true Set value is always a valid i32 boolean.)
+  // A MONO (i32/boolean-valued) map cannot store a REF value (a string / struct /
+  // list ref into an i32 array is invalid wasm) — fail loudly. A ref-valued map
+  // (mv slot) stores string/struct values through its own typed vals list. (A
+  // constant-true Set value is always a valid i32 boolean.) The shape is resolved
+  // here only for the GATE; `emitMapPrep` re-resolves it into the op context.
   if valConst1 == false {
-    if exprString(valIx, fnIx) || exprStruct(valIx, fnIx) || exprArray(valIx, fnIx) || exprRefArray(valIx, fnIx) || exprStringArray(valIx, fnIx) {
-      return emitFail("emitProgram: map values must be i32 / boolean")
+    if mapShapeOfExpr(recvIx, fnIx) < 0 {
+      if exprString(valIx, fnIx) || exprStruct(valIx, fnIx) || exprArray(valIx, fnIx) || exprRefArray(valIx, fnIx) || exprStringArray(valIx, fnIx) {
+        return emitFail("emitProgram: map values must be i32 / boolean")
+      }
     }
   }
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return 0 - 1 }
+  let mslot = cmSlot
   pushMapScr(body, 5)        // entry
   fbIf(64)                   // if (entry != 0 → overwrite), void
   // OVERWRITE: vals.backing[entry-1] = v
   pushMapVals(body)
-  fbStructGet(lTypeIdx, 0)   // struct.get (vals backing), field 0: backing
+  fbStructGet(cmValsWrap(), 0)   // struct.get (vals backing), field 0: backing
   pushMapScr(body, 5)        // entry
   fbI32Const(1)
   fbI32Bin(107)              // i32.sub (entry - 1)
@@ -5893,8 +6194,9 @@ function emitMapSetV(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32
     fbI32Const(1)            // Set value: constant boolean true
   } else {
     if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }   // value
+    cmSlot = mslot
   }
-  fbArraySet(aTypeIdx)       // array.set
+  fbArraySet(cmValsBack())   // array.set
   fbElse()                   // else
   // APPEND. index[slot] = count + 1  (the new entry's position + 1).
   pushMapIndex(body)
@@ -5907,17 +6209,17 @@ function emitMapSetV(body: i32[], recvIx: i32, keyIx: i32, valIx: i32, fnIx: i32
   if emitMapPushKey(body) < 0 { return 0 - 1 }
   if emitMapPushValV(body, valIx, fnIx, valConst1) < 0 { return 0 - 1 }
   // count = count + 1
-  pushMapScr(body, 0)        // mapRef (struct.set receiver)
+  pushMapRef(body)           // mapRef (struct.set receiver)
   pushMapCount(body)
   fbI32Const(1)
   fbI32Bin(106)              // i32.add
-  fbStructSet(mStructIdx, 4) // struct.set field 4: count
+  fbStructSet(cmMapTy(), 4)  // struct.set field 4: count
   // size = size + 1
-  pushMapScr(body, 0)        // mapRef
+  pushMapRef(body)           // mapRef
   pushMapSize(body)
   fbI32Const(1)
   fbI32Bin(106)              // i32.add
-  fbStructSet(mStructIdx, 5) // struct.set field 5: size
+  fbStructSet(cmMapTy(), 5)  // struct.set field 5: size
   if emitMapResize(body) < 0 { return 0 - 1 }
   fbEnd()                    // end (if)
   0
@@ -5999,9 +6301,9 @@ function emitMapPushKey(body: i32[]): i32 {
   fbI32Const(0)
   pushMapKeysLen(body)       // count (entries copied)
   fbArrayCopy(aTypeIdx, aTypeIdx)   // array.copy (dest type, src type)
-  pushMapScr(body, 0)        // mapRef
+  pushMapRef(body)           // mapRef
   pushMapScrLB(body)
-  fbStructSet(mStructIdx, 2) // struct.set field 2: live
+  fbStructSet(cmMapTy(), 2)  // struct.set field 2: live
   // hashes grows in LOCKSTEP too (entry-parallel): fresh `(ref $aTypeIdx)` of newCap
   // (slot 13), copy `[0, keys.len)` over, store back into M.hashes (field 6). Mirrors
   // the host's grow of its entry-parallel `hashes` array.
@@ -6014,9 +6316,9 @@ function emitMapPushKey(body: i32[]): i32 {
   fbI32Const(0)
   pushMapKeysLen(body)       // count (entries copied)
   fbArrayCopy(aTypeIdx, aTypeIdx)   // array.copy (dest type, src type)
-  pushMapScr(body, 0)        // mapRef
+  pushMapRef(body)           // mapRef
   pushMapScrHB(body)
-  fbStructSet(mStructIdx, 6) // struct.set field 6: hashes
+  fbStructSet(cmMapTy(), 6)  // struct.set field 6: hashes
   fbEnd()                    // end (grow if)
   // live[keys.len] = 1  (the new entry is live).
   pushMapLive(body)
@@ -6053,13 +6355,21 @@ function emitMapPushVal(body: i32[], valIx: i32, fnIx: i32): i32 {
   emitMapPushValV(body, valIx, fnIx, false)
 }
 function emitMapPushValV(body: i32[], valIx: i32, fnIx: i32, valConst1: boolean): i32 {
-  // newVal first (slot 3 — free after the scan/keys push)
+  // newVal first — the mono i32 stash (slot 3, free after the scan/keys push), or
+  // the mv slot's TYPED valStash (an i32 local cannot hold a ref value). The value
+  // expr may contain an inner map op, so re-pin the context after it.
+  let mslot = cmSlot
   if valConst1 {
     fbI32Const(1)            // Set value: constant boolean true
   } else {
     if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+    cmSlot = mslot
   }
-  setMapScr(body, 3)
+  if mslot >= 0 {
+    fbLocalSet(fnMvValStashLocal(mslot))
+  } else {
+    setMapScr(body, 3)
+  }
   // if vals.len == vals.cap { grow }
   pushMapValsLen(body)
   pushMapValsCap(body)
@@ -6076,37 +6386,41 @@ function emitMapPushValV(body: i32[], valIx: i32, fnIx: i32, valConst1: boolean)
   fbI32Bin(108)              // i32.mul
   fbEnd()                    // end
   setMapScr(body, 4)
-  // newBacking = array.new_default $aTypeIdx newCap  → slot 7 (i32 vals backing)
+  // newBacking = array.new_default <valsBack> newCap → the valsBk scratch
   pushMapScr(body, 4)
-  fbArrayNewDefault(aTypeIdx)
-  setMapScrVB(body)          // newValsBacking (slot 7)
+  fbArrayNewDefault(cmValsBack())
+  setMapScrVB(body)          // newValsBacking
   // array.copy newBacking 0 oldBacking 0 len
   pushMapScrVB(body)
   fbI32Const(0)
   pushMapValsBacking(body)
   fbI32Const(0)
   pushMapValsLen(body)
-  fbArrayCopy(aTypeIdx, aTypeIdx)   // array.copy (dest type, src type)
+  fbArrayCopy(cmValsBack(), cmValsBack())   // array.copy (dest type, src type)
   // vals.backing = newBacking
   pushMapVals(body)
   pushMapScrVB(body)
-  fbStructSet(lTypeIdx, 0)   // struct.set field 0: backing
+  fbStructSet(cmValsWrap(), 0)   // struct.set field 0: backing
   // vals.cap = newCap
   pushMapVals(body)
   pushMapScr(body, 4)
-  fbStructSet(lTypeIdx, 2)   // struct.set field 2: cap
+  fbStructSet(cmValsWrap(), 2)   // struct.set field 2: cap
   fbEnd()                    // end (grow if)
   // vals.backing[vals.len] = newVal
   pushMapValsBacking(body)
   pushMapValsLen(body)
-  pushMapScr(body, 3)        // newVal
-  fbArraySet(aTypeIdx)       // array.set
+  if mslot >= 0 {
+    fbLocalGet(fnMvValStashLocal(mslot))   // newVal (typed ref)
+  } else {
+    pushMapScr(body, 3)      // newVal
+  }
+  fbArraySet(cmValsBack())   // array.set
   // vals.len = vals.len + 1
   pushMapVals(body)
   pushMapValsLen(body)
   fbI32Const(1)
   fbI32Bin(106)              // i32.add
-  fbStructSet(lTypeIdx, 1)   // struct.set field 1: len
+  fbStructSet(cmValsWrap(), 1)   // struct.set field 1: len
   0
 }
 
@@ -6126,20 +6440,21 @@ function pushMapKeysBacking(body: i32[]): i32 {
   fbStructGet(mkListIdx, 0)
   0
 }
-// `M.vals.len` / `.cap` / `.backing` field reads (struct.get $lTypeIdx 1/2/0).
+// `M.vals.len` / `.cap` / `.backing` field reads (struct.get <valsWrap> 1/2/0 —
+// the i32 list wrapper for the mono map, this mv slot's ref-list wrapper else).
 function pushMapValsLen(body: i32[]): i32 {
   pushMapVals(body)
-  fbStructGet(lTypeIdx, 1)
+  fbStructGet(cmValsWrap(), 1)
   0
 }
 function pushMapValsCap(body: i32[]): i32 {
   pushMapVals(body)
-  fbStructGet(lTypeIdx, 2)
+  fbStructGet(cmValsWrap(), 2)
   0
 }
 function pushMapValsBacking(body: i32[]): i32 {
   pushMapVals(body)
-  fbStructGet(lTypeIdx, 0)
+  fbStructGet(cmValsWrap(), 0)
   0
 }
 
@@ -6154,11 +6469,11 @@ function pushMapScrKB(body: i32[]): i32 {
   0
 }
 function setMapScrVB(body: i32[]): i32 {
-  fbLocalSet(mapScratchBase + 7)
+  fbLocalSet(cmValsBkLocal())
   0
 }
 function pushMapScrVB(body: i32[]): i32 {
-  fbLocalGet(mapScratchBase + 7)
+  fbLocalGet(cmValsBkLocal())
   0
 }
 // The grown `live` backing ref (slot 12, a non-null `(ref $aTypeIdx)` i32 array),
@@ -6990,7 +7305,9 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       // maintained by set/delete (NOT `count`, which includes tombstones).
       if exprMap(e.memObj, fnIx) {
         if emitExpr(body, e.memObj, fnIx) < 0 { return 0 - 1 }
-        fbStructGet(mStructIdx, 5)  // 0xfb 0x02: field 5 `size`
+        let lsl = mapShapeOfExpr(e.memObj, fnIx)
+        if lsl == 0 - 2 || lsl == 0 - 3 { lsl = 0 - 1 }
+        fbStructGet(mapTypeIdxOf(lsl), 5)  // 0xfb 0x02: field 5 `size`
         return 0
       }
     }
@@ -7038,6 +7355,49 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
                 return emitFail("emitProgram: map .get takes exactly one argument")
               }
               return emitMapGetOr(body, lcallee.memObj, lhs.callArgs[0], e.binRight, fnIx)
+            }
+          }
+        }
+      }
+      // The null-safe field read `m[k]?.f ?? d` over a STRUCT-VALUED map is the
+      // FUSED form: probe; on a hit read the field off the (non-null) value
+      // struct, else push the default. A live entry's value slot is never null,
+      // so the `?.` null test coincides with the probe's hit test — no
+      // intermediate nullable materializes. Scalar (i32/boolean) fields only (a
+      // value-typed `if` blocktype carries them; ref fields would need an
+      // interned blocktype functype).
+      if lhs is OptMember {
+        let omInner = P.nodes[lhs.omObj]
+        if omInner is Index {
+          if exprMap(omInner.idxArr, fnIx) {
+            let omSl = mapShapeOfExpr(omInner.idxArr, fnIx)
+            if omSl >= 0 {
+              if mvValKind[omSl] != 1 {
+                return emitFail("emitProgram: `?.` needs a struct-valued map")
+              }
+              let omSi = mvValStructIdx[omSl]
+              let omFi = sFieldIndex(omSi, lhs.omProp)
+              if omFi < 0 {
+                return emitFail("emitProgram: `?.` field is not on the map's value struct")
+              }
+              if sFieldTypeAt(omSi, omFi) != 0 {
+                return emitFail("emitProgram: `?.` over a map read supports only i32/boolean fields")
+              }
+              if emitMapPrep(body, omInner.idxArr, omInner.idxIndex, fnIx) < 0 { return 0 - 1 }
+              pushMapScr(body, 5)    // entry
+              fbIf(127)              // if (entry != 0 → hit), i32 blocktype
+              pushMapVals(body)
+              fbStructGet(cmValsWrap(), 0)   // vals backing
+              pushMapScr(body, 5)    // entry
+              fbI32Const(1)
+              fbI32Bin(107)          // i32.sub (entry - 1)
+              fbArrayGet(cmValsBack())       // (ref null <value struct>)
+              fbRefAsNonNull()       // a live entry's value is non-null
+              fbStructGet(sHeapIdx[omSi], omFi)   // .f
+              fbElse()               // else
+              if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              fbEnd()                // end (if)
+              return 0
             }
           }
         }
@@ -8705,8 +9065,15 @@ function forInElemKind(iterIx: i32, fnIx: i32): i32 {
         if callee.memProp == "keys" { return 3 }
         if callee.memProp == "values" {
           // A SET's `.values()` yields its ELEMENTS — the string keys (kind 3),
-          // not the i32 membership booleans. A map's yields its i32 values.
+          // not the i32 membership booleans. A map's yields its VALUES: i32 for
+          // the mono map, the value's kind for a ref-valued map (string 3 /
+          // struct 1 — the loop var binds that kind).
           if mapIsSetExpr(callee.memObj, fnIx) { return 3 }
+          let vsl = mapShapeOfExpr(callee.memObj, fnIx)
+          if vsl >= 0 {
+            if mvValKind[vsl] == 3 { return 3 }
+            return 1
+          }
           return 0
         }
       }
@@ -8725,11 +9092,37 @@ function forInElemKind(iterIx: i32, fnIx: i32): i32 {
   0 - 1
 }
 
+// The mv SLOT of a `for v in m.values()` walk over a REF-VALUED map, or -1 (not a
+// map walk / a mono map / a set). The values walk then types its loop var + list
+// temp off the slot's value type instead of a ref-array's element.
+function forInMapValsSlot(iterIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[iterIx]
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Member {
+      if callee.memProp == "values" {
+        if exprMap(callee.memObj, fnIx) {
+          if mapIsSetExpr(callee.memObj, fnIx) { return 0 - 1 }
+          let sl = mapShapeOfExpr(callee.memObj, fnIx)
+          if sl >= 0 { return sl }
+        }
+      }
+    }
+  }
+  0 - 1
+}
+
 // The element struct TABLE INDEX of a `for v in <S[]>` iterable (the struct that the
 // code-`1` loop var binds), or -1 when the iterable is not a struct ref list. Mirrors
 // the index-read resolution (`structIndexOfExpr` over `xs[i]`): the element name comes
-// from the ref-list slot, then its struct table index.
+// from the ref-list slot, then its struct table index. A STRUCT-VALUED map's
+// `.values()` walk binds the slot's value struct.
 function forInRefArrayStructIdx(iterIx: i32, fnIx: i32): i32 {
+  let mvs = forInMapValsSlot(iterIx, fnIx)
+  if mvs >= 0 {
+    if mvValKind[mvs] == 1 { return mvValStructIdx[mvs] }
+    return 0 - 1
+  }
   if !exprRefArray(iterIx, fnIx) { return 0 - 1 }
   structIndexByName(refListElemNameOfExpr(iterIx, fnIx))
 }
@@ -8742,24 +9135,44 @@ function forInRefArrayStructIdx(iterIx: i32, fnIx: i32): i32 {
 // out of scope (the checker's surface gating keeps `.values()` calls on it valid
 // only for sets, but the flavor bit can't cross the call boundary yet).
 function mapIsSetExpr(exprIx: i32, fnIx: i32): boolean {
-  if exprIx < 0 { return false }
+  mapShapeOfExpr(exprIx, fnIx) == 0 - 2
+}
+
+// The mv SLOT a map READ expression resolves to: `m[k]` (Index over a ref-valued
+// map) or `m.get(k)` (the method form), else -1. The chokepoint the expression-kind
+// resolvers (`exprString` / struct resolution / `??` lowering) consult so a
+// ref-valued `m[k] ?? d` classifies as its VALUE type.
+function mapReadMvSlot(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 - 1 }
   let e = P.nodes[exprIx]
-  if e is Paren { return mapIsSetExpr(e.parInner, fnIx) }
+  if e is Index {
+    if exprMap(e.idxArr, fnIx) {
+      let sl = mapShapeOfExpr(e.idxArr, fnIx)
+      if sl >= 0 { return sl }
+    }
+    return 0 - 1
+  }
   if e is Call {
     let callee = P.nodes[e.callFn]
-    if callee is Ident { return callee.identName == "Set" }
-    return false
-  }
-  if e is Ident {
-    if declaredMap(e.identName) {
-      let slot = declaredSlotOf(e.identName)
-      if slot >= 0 { return localStructIdx[slot] == 0 - 2 }
-      return false
+    if callee is Member {
+      if callee.memProp == "get" {
+        if exprMap(callee.memObj, fnIx) {
+          let sl = mapShapeOfExpr(callee.memObj, fnIx)
+          if sl >= 0 { return sl }
+        }
+      }
     }
-    let gl = globalLetOf(e.identName)
-    if gl >= 0 { return letIsSet(gl) }
   }
-  false
+  0 - 1
+}
+
+// The mv slot of a `lhs ?? d` READ-WITH-DEFAULT over a ref-valued map, else -1.
+function coalesceMvSlot(exprIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[exprIx]
+  if e is BinExpr {
+    if e.binOp == "??" { return mapReadMvSlot(e.binLeft, fnIx) }
+  }
+  0 - 1
 }
 
 // The map RECEIVER arena index of a `for v in m.keys()` / `m.values()` iterable, or -1
@@ -8794,9 +9207,11 @@ function emitForInList(body: i32[], iterIx: i32, fnIx: i32): i32 {
     let callee = P.nodes[e.callFn]
     if callee is Member {
       if exprMap(callee.memObj, fnIx) {
+        let fsl = mapShapeOfExpr(callee.memObj, fnIx)
+        if fsl == 0 - 2 || fsl == 0 - 3 { fsl = 0 - 1 }
         if callee.memProp == "keys" {
           if emitExpr(body, callee.memObj, fnIx) < 0 { return 0 - 1 }
-          fbStructGet(mStructIdx, 0)  // field 0: ordered keys list
+          fbStructGet(mapTypeIdxOf(fsl), 0)  // field 0: ordered keys list
           return 0
         }
         if callee.memProp == "values" {
@@ -8804,9 +9219,9 @@ function emitForInList(body: i32[], iterIx: i32, fnIx: i32): i32 {
           // A SET's `.values()` walks the ordered KEYS (its elements); a map's
           // walks the ordered vals.
           if mapIsSetExpr(callee.memObj, fnIx) {
-            fbStructGet(mStructIdx, 0)  // field 0: ordered keys list
+            fbStructGet(mapTypeIdxOf(fsl), 0)  // field 0: ordered keys list
           } else {
-            fbStructGet(mStructIdx, 1)  // field 1: ordered vals list
+            fbStructGet(mapTypeIdxOf(fsl), 1)  // field 1: ordered vals list
           }
           return 0
         }
@@ -8904,6 +9319,9 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     // annotation names no `sNames` entry (`letAnnStructIdx` is -1) so a variant literal
     // still boxes; a non-struct-literal init ignores the hint.
     pendingStructIdx = letAnnStructIdx(stmtIx)
+    // A map-typed binding seeds the map SHAPE so a `Map()` initializer constructs
+    // THIS binding's map struct (mono, or the annotation's ref-valued mv slot).
+    if letIsMap(stmtIx, fnIx) { pendingMapSlot = letMapShapeOf(stmtIx, fnIx) }
     // Numeric WIDENING at the binding boundary: an `: f64` / `: f32` / `: i64` slot
     // coerces a narrower init value (the lattice convert is inserted by the `emitExprAs*`
     // helpers — i32/i64/f32→f64, i32→f32, i32→i64). A float/integer literal re-encodes in
@@ -8924,6 +9342,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     pendingStructIdx = 0 - 1
     pendingListKind = 0
     pendingListSlot = 0
+    pendingMapSlot = 0 - 1
     fbLocalSet(idx)          // 0x21 local.set
     // Bind `name → slot` in the current emit-time frame AFTER emitting the init (so the
     // init resolved any same-named OUTER binding), making this binding live for the rest
@@ -9268,18 +9687,31 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     } else if ek == 1 {
       // A struct ref list (`S[]`): the wrapper/backing are THIS ref-list slot's, and
       // each element is a struct ref recovered with `ref.as_non_null` — mirrors the
-      // indexed read (`xs[i]`) of the same slot.
-      let rslot = refListSlotOfExpr(s.fiIter, fnIx)
-      wrapTy = rlWrapIdx[rslot]
-      backTy = rlBackIdx[rslot]
+      // indexed read (`xs[i]`) of the same slot. A STRUCT-VALUED map walk reads its
+      // mv slot's vals list instead.
+      let fimv = forInMapValsSlot(s.fiIter, fnIx)
+      if fimv >= 0 {
+        wrapTy = mvValsWrapOf(fimv)
+        backTy = mvValsBackOf(fimv)
+      } else {
+        let rslot = refListSlotOfExpr(s.fiIter, fnIx)
+        wrapTy = rlWrapIdx[rslot]
+        backTy = rlBackIdx[rslot]
+      }
     }
-    // For a map `.keys()`/`.values()` walk, stash the MAP ref in map scratch slot 0 so
-    // the loop can consult `M.live[cursor]` and SKIP tombstoned entries (host-matching
-    // tombstone-aware iteration). `mapRecv >= 0` iff this is a map iteration.
+    // For a map `.keys()`/`.values()` walk, stash the MAP ref (mono scratch slot 0,
+    // or the mv frame's typed mapRef) so the loop can consult `M.live[cursor]` and
+    // SKIP tombstoned entries (host-matching tombstone-aware iteration).
+    // `mapRecv >= 0` iff this is a map iteration. The pinned `cmSlot` drives both
+    // the stash and the skip's `pushMapLive` struct.get type.
     let mapRecv = forInMapRecv(s.fiIter, fnIx)
+    let mwShape = 0 - 1
     if mapRecv >= 0 {
+      mwShape = mapShapeOfExpr(mapRecv, fnIx)
+      if mwShape == 0 - 2 || mwShape == 0 - 3 { mwShape = 0 - 1 }
       if emitExpr(body, mapRecv, fnIx) < 0 { return 0 - 1 }
-      setMapScr(body, 0)     // mapRef (scratch slot 0)
+      cmSlot = mwShape
+      setMapRef(body)        // mapRef
     }
     // list = <iter> (evaluated once); cursor = 0
     if emitForInList(body, s.fiIter, fnIx) < 0 { return 0 - 1 }
@@ -9304,7 +9736,8 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     // (insertion order of the survivors preserved). `br 1` targets the loop header
     // (if-frame is 0, loop is 1). A delete-free map has live all-1s, so never taken.
     if mapRecv >= 0 {
-      pushMapLive(body)      // M.live (scratch slot 0)
+      cmSlot = mwShape
+      pushMapLive(body)      // M.live (off the pinned mapRef)
       fbLocalGet(iIdx)
       fbArrayGet(aTypeIdx)   // M.live[cursor]
       fbI32Eqz()             // live[cursor] == 0 ?
@@ -9771,7 +10204,31 @@ function fbBeginFunc(nParams: i32, nLocals: i32): i32 {
     mfDstBases.push(fbReserve(1))
     mfd = mfd + 1
   }
+  // Ref-valued map frames: 3 typed slots PER MODULE MV SLOT in any map-using
+  // function — mapRef (ref <mv struct>), valsBk (ref <vals backing>), valStash
+  // (ref null <value elem>, the pushVal/get value temporary). Allocated for every
+  // mv slot rather than per-function-used ones (locals are cheap; an mv-free
+  // module reserves zero, keeping existing layouts byte-identical).
+  fnMvBase = fbScratchCur
+  if fnUsesMap {
+    let mvk = 0
+    while mvk < mvValName.length {
+      fbReserve(3)
+      mvk = mvk + 1
+    }
+  }
   fbScratchCur
+}
+
+// The per-function mv frame base for mv slot `slot` (valid when `fnUsesMap`).
+function fnMvMapRefLocal(slot: i32): i32 {
+  fnMvBase + slot * 3
+}
+function fnMvValsBkLocal(slot: i32): i32 {
+  fnMvBase + slot * 3 + 1
+}
+function fnMvValStashLocal(slot: i32): i32 {
+  fnMvBase + slot * 3 + 2
 }
 
 // ── locals-vector emission (derived, never separately counted) ────────────────
@@ -9813,7 +10270,7 @@ function fbLocalsCount(nLocals: i32): i32 {
   n = n + fnRefPushSlots.length * 4
   if fnUsesStrPush { n = n + 4 }
   if fnUsesStrOp { n = n + 7 }
-  if fnUsesMap { n = n + 14 }
+  if fnUsesMap { n = n + 14 + mvValName.length * 3 }
   if fnUsesCallRef { n = n + 1 }
   if fnUsesMapFilter { n = n + 4 }
   n = n + mfSrcKinds.length + mfDstKinds.length
@@ -9927,7 +10384,27 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32): i32 {
     }
     mfw = mfw + 1
   }
+  // Ref-valued map frames (3 typed slots per module mv slot, map-using functions
+  // only — `fbBeginFunc`'s reservation order): mapRef, valsBk, valStash (nullable —
+  // it holds a vals-slot read, which is a `(ref null <elem>)`).
+  if fnUsesMap {
+    let mvr = 0
+    while mvr < mvValName.length {
+      fbRefRun(mvMapTypeIdx[mvr])
+      fbRefRun(mvValsBackOf(mvr))
+      fbRefNullRun(mvValElemHeapOf(mvr))
+      mvr = mvr + 1
+    }
+  }
   wTarget(prev)
+  0
+}
+
+// One (1, (ref null ht)) run — nullable `0x63 <uleb heapIdx>`.
+function fbRefNullRun(heapIdx: i32): i32 {
+  wU8(1)
+  wU8(99)                  // 0x63 (ref null ht) — nullable ref
+  wSLEB(heapIdx)
   0
 }
 
@@ -10679,7 +11156,7 @@ function fbRefNullForKind(kind: i32, structIdx: i32): i32 {
   } else if kind == 5 {
     wSLEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
   } else if kind == 6 {
-    wSLEB(mStructIdx)
+    wSLEB(mapTypeIdxOf(structIdx))   // mono map, or THIS mv slot's map struct
   } else if kind == 7 {
     wSLEB(mkListIdx)
   } else if kind == 12 {
@@ -10723,7 +11200,7 @@ function fbValtypeNullable(kind: i32, structIdx: i32): i32 {
     wSLEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
   } else if kind == 6 {
     wU8(99)
-    wSLEB(mStructIdx)
+    wSLEB(mapTypeIdxOf(structIdx))   // mono map, or THIS mv slot's map struct
   } else if kind == 7 {
     wU8(99)
     wSLEB(mkListIdx)
@@ -10807,7 +11284,7 @@ function fbValtype(kind: i32, structIdx: i32): i32 {
     wSLEB(rlWrapIdx[structIdx])  // THIS ref-list slot's wrapper struct heap-type index
   } else if kind == 6 {
     wU8(100)
-    wSLEB(mStructIdx)    // the string-keyed MAP struct heap-type index (G8)
+    wSLEB(mapTypeIdxOf(structIdx))   // mono map (G8), or THIS mv slot's map struct
   } else if kind == 7 {
     wU8(100)
     wSLEB(mkListIdx)     // the STRING-LIST wrapper struct heap-type index
@@ -11036,11 +11513,26 @@ function mAssignTypeIndices(n: i32): i32 {
     cloStructIdx = oldCloIdx
     cloSigBase = oldCloIdx + 1
   }
+  // The ref-valued map structs (one 7-field map struct per mv slot), interned LAST
+  // among the heap types so no existing index shifts; zero types when no ref-valued
+  // map exists (`mvOffsetOf` = 0 → byte-identical output for every existing program).
+  let oldMvIdx = oldCloIdx + fnClosureOffsetOf()
+  let mvi = 0
+  while mvi < mvValName.length {
+    mvMapTypeIdx[mvi] = mAllocType()
+    if mAssertIdx(mvMapTypeIdx[mvi], oldMvIdx + mvi, "mvMapTypeIdx") < 0 { return 0 - 1 }
+    mvi = mvi + 1
+  }
   // The functypes follow; the first lands at the current counter (`typeOffset`).
   let typeOffset = mNextType
-  let oldTypeOffset = preMap + strListOffsetOf() + mapStructOffsetOf() + f64ListOffsetOf() + fnClosureOffsetOf()
+  let oldTypeOffset = preMap + strListOffsetOf() + mapStructOffsetOf() + f64ListOffsetOf() + fnClosureOffsetOf() + mvOffsetOf()
   if mAssertIdx(typeOffset, oldTypeOffset, "typeOffset") < 0 { return 0 - 1 }
   typeOffset
+}
+
+// The ref-valued-map struct count: one map struct per interned mv slot.
+function mvOffsetOf(): i32 {
+  mvValName.length
 }
 
 // The closure-type count interned ahead of the functypes: the closure struct + the
@@ -11335,7 +11827,11 @@ function emitStartFnCode(out: i32[]): i32 {
           } else if gck == 10 {
             if emitExprAsI64(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
           } else {
+            // A map global's start-fn init seeds the map SHAPE (mirrors the
+            // local-`let` seeding) so `Map()` builds THIS global's map struct.
+            if gck == 6 { pendingMapSlot = letMapShapeOf(globalStmts[gi], 0 - 1) }
             if emitExpr(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+            pendingMapSlot = 0 - 1
           }
           let setPrev = wTarget(bodyExpr)
           fbGlobalSet(gi)
@@ -11750,6 +12246,36 @@ function emitModule(stmts: i32[]): i32 {
       fe = fe + 1
     }
   }
+  // The ref-valued map structs (one per mv slot), in `mvMapTypeIdx` mint order —
+  // the SAME 7-field shape as the mono map struct, with `vals` referencing this
+  // slot's ref-list wrapper (the string-list pair for string values, the element's
+  // `rlWrapIdx` for struct values). Keys/live/index/count/size/hashes are identical
+  // across all map structs, so the shared probe/rehash/compact bytes apply as-is.
+  let mvs = 0
+  while mvs < mvValName.length {
+    wU8(95)                      // 0x5f struct (ref-valued map)
+    wU8(7)                       // 7 fields (host-aligned open-addressing hash map)
+    wU8(100)                     // field 0 keys: 0x64 (ref $mkListIdx) — non-null
+    wSLEB(mkListIdx)
+    wU8(1)                       // mutable
+    wU8(100)                     // field 1 vals: 0x64 (ref <this slot's wrapper>)
+    wSLEB(mvValsWrapOf(mvs))
+    wU8(1)                       // mutable
+    wU8(100)                     // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)                       // mutable
+    wU8(100)                     // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)                       // mutable
+    wU8(127)                     // field 4 count: 0x7f i32
+    wU8(1)                       // mutable
+    wU8(127)                     // field 5 size: 0x7f i32
+    wU8(1)                       // mutable
+    wU8(100)                     // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)                       // mutable
+    mvs = mvs + 1
+  }
   // The functype param/result valtypes (`fbValtype`) stream to `curBuf == typePayload`,
   // interleaved identically with the surrounding raw framing bytes (the `wTarget` bind
   // covering this whole payload build was established above).
@@ -11988,6 +12514,9 @@ function emitModule(stmts: i32[]): i32 {
           // cell valtype and its `ref.null` zero select THIS global's element wrapper.
           let cs = globalCellStructIdx(globalStmts[gi])
           if ck == 5 { cs = letAnnRefListSlot(globalStmts[gi]) }
+          // A map cell (kind 6) passes its map SHAPE (mv slot / -1 mono / -2 set)
+          // so the cell valtype + ref.null zero select THIS map's struct type.
+          if ck == 6 { cs = letMapShapeOf(globalStmts[gi], 0 - 1) }
           fbValtypeNullable(ck, cs)                     // nullable valtype
           wU8(1)                                        // 0x01 mutable
           if ck == 0 {
@@ -12020,6 +12549,12 @@ function emitModule(stmts: i32[]): i32 {
           // second arg (`globalCellStructIdx` is -1 for a ref array) so the cell valtype
           // selects THIS global's element wrapper, not slot 0's.
           if gck == 5 { gcs = letAnnRefListSlot(globalStmts[gi]) }
+          // A map cell (kind 6): the map SHAPE picks the struct type; the
+          // `pendingMapSlot` seed makes the `Map()` init constexpr build it.
+          if gck == 6 {
+            gcs = letMapShapeOf(globalStmts[gi], 0 - 1)
+            pendingMapSlot = gcs
+          }
           fbValtype(gck, gcs)                            // valtype
           wU8(1)                                         // 0x01 mutable
           // An `: i64` global lowers its literal init as `i64.const` (kind 10 / 0x7e);
@@ -12348,6 +12883,11 @@ function collectA(stmts: i32[]): i32 {
   mUsed = false
   slUsed = false
   fa64Used = false
+  mvValName = []
+  mvValKind = []
+  mvValStructIdx = []
+  mvRlSlot = []
+  mvMapTypeIdx = []
   let i = 0
   while i < P.nodes.length {
     let nd = P.nodes[i]
@@ -12413,6 +12953,12 @@ function collectA(stmts: i32[]): i32 {
         mUsed = true
         lUsed = true
         aUsed = true
+        // A REF value type (`{[string]: string}` / `{[string]: {x:i32}}`) interns a
+        // per-value-type map slot (its own map struct over a ref vals list). All mv
+        // interning happens HERE (collect scans every TypeRef), so the type-index
+        // assignment in `emitModule` sees the full slot set; later resolutions are
+        // idempotent lookups.
+        mvShapeOfValName(mapValNameOf(nd.tyName))
       } else if nameIsStringArray(nd.tyName) {
         // A `string[]` annotation is a string-ref list — the SAME wrapper/backing as
         // the map keys list. Force the keys list types (`slUsed`) + the string backing
@@ -14360,6 +14906,60 @@ function letIsSet(letIx: i32): boolean {
   false
 }
 
+// The map SHAPE code of a map-typed `LetDecl`: `-2` a Set, an mv SLOT (>= 0) for a
+// ref-valued map (from the annotation's value type-name), `-1` the mono i32 map,
+// `-3` an unsupported value type (op sites fail loudly). Annotation-first, else the
+// initializer's shape (a `Map()`/`Set()` constructor, or a map-typed passthrough).
+function letMapShapeOf(letIx: i32, fnIx: i32): i32 {
+  if letIsSet(letIx) { return 0 - 2 }
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      let lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if nameIsMap(lt.tyName) {
+          return mvShapeOfValName(mapValNameOf(lt.tyName))
+        }
+      }
+    }
+    return mapShapeOfExpr(d.letInit, fnIx)
+  }
+  0 - 1
+}
+
+// The map SHAPE code of a map-typed EXPRESSION (the receiver of a map op): `-2`
+// Set, mv slot >= 0, `-1` mono, `-3` unsupported. Mirrors `exprMap`'s resolution
+// chain: constructor calls, locals (the kind-6 parallel slot stored by
+// `collectLocals`), globals (their `LetDecl`'s shape), and the mono-only map-array
+// element / `.pop()` forms. Map-typed PARAMS stay mono-only (no `vtKindOfParam`
+// map case exists yet — a ref-valued map cannot cross a call boundary).
+function mapShapeOfExpr(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 - 1 }
+  let e = P.nodes[exprIx]
+  if e is Paren { return mapShapeOfExpr(e.parInner, fnIx) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      if callee.identName == "Set" { return 0 - 2 }
+      return 0 - 1
+    }
+    return 0 - 1
+  }
+  if e is Ident {
+    if declaredMap(e.identName) {
+      let slot = declaredSlotOf(e.identName)
+      if slot >= 0 { return localStructIdx[slot] }
+      return 0 - 1
+    }
+    if paramMap(fnIx, e.identName) { return 0 - 1 }
+    let gl = globalLetOf(e.identName)
+    if gl >= 0 {
+      if letIsMap(gl, 0 - 1) { return letMapShapeOf(gl, 0 - 1) }
+    }
+  }
+  0 - 1
+}
+
 // ── string-typedness of expressions ──────────────────────────────────────────
 // Parallel to the array family above: decide whether an expression / param / local
 // PRODUCES a `string` (CURRENTLY the same `(array (mut i32))` of code points an array
@@ -14469,6 +15069,10 @@ function exprString(exprIx: i32, fnIx: i32): boolean {
     return false
   }
   if e is BinExpr {
+    // A `m[k] ?? d` / `m.get(k) ?? d` read over a STRING-valued map yields a
+    // string ref (the value type).
+    let cms = coalesceMvSlot(exprIx, fnIx)
+    if cms >= 0 { return mvValKind[cms] == 3 }
     // G6: string concatenation `a + b` produces a string; no other binary operator
     // does (`==`/`!=` yield an i32).
     return exprIsStrConcat(exprIx, fnIx)
