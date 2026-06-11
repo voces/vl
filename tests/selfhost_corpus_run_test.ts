@@ -90,6 +90,7 @@ const WHITELIST = [
   "chars/literals.vl",
   "functions/calls.vl",
   "functions/early-return.vl",
+  "functions/escaping.vl",
   "functions/lambda.vl",
   "functions/closure.vl",
   "functions/forward-call-inferred.vl",

@@ -101,6 +101,7 @@ const RUN_CASES = [
   "functions/calls.vl",
   "functions/closure.vl",
   "functions/early-return.vl",
+  "functions/escaping.vl",
   "functions/forward-call-inferred.vl",
   "functions/forward-reference-needs-return-type.vl",
   "functions/forward-reference-struct-array-param.vl",

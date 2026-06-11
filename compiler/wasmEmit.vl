@@ -1996,6 +1996,32 @@ function fnIndexOf(name: string): i32 {
   0 - 1
 }
 
+// `fnIndexOf` but SCOPE-AWARE for a name referenced as a VALUE inside function `fnIx`
+// (a node index): when two lifted functions share a name (each `makeX` declaring its
+// own nested `add`), the flat `fnIndexOf` always returns the FIRST — wrong for the
+// SECOND maker's body, whose `add` captures a different frame. Prefer a lifted function
+// named `name` whose PARENT is `fnIx`'s own `fnStmts` position; fall back to the flat
+// lookup (a top-level function, or no nested match). Only consulted on the function-
+// VALUE path (gated by `fnValUsed`), so by-name resolution elsewhere is unchanged.
+function fnIndexOfInScope(name: string, fnIx: i32): i32 {
+  if fnIx >= 0 {
+    let pp = fnStmtsPosOf(fnIx)
+    if pp >= 0 {
+      let i = 0
+      while i < fnStmts.length {
+        let s = P.nodes[fnStmts[i]]
+        if s is FuncDecl {
+          if s.fnName == name {
+            if i < fnParent.length && fnParent[i] == pp { return i }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  fnIndexOf(name)
+}
+
 // ── capture analysis (closures) ───────────────────────────────────────────────
 // The captured-variable NAMES of the lifted function at `fnStmts[fe]`, in
 // encounter (= env field) order. A capture is a free variable: an identifier read
@@ -3983,6 +4009,9 @@ function pushFieldStorage(code: i32, refSlot: i32): i32 {
   } else if code == 6 {
     wU8(100)                   // 0x64 (ref ht) — non-null string-list wrapper ref
     wSLEB(mkListIdx)
+  } else if code == 14 {
+    wU8(100)                   // 0x64 (ref ht) — non-null closure fat-pointer ref
+    wSLEB(cloStructIdx)        // the closure struct heap type (#306)
   } else {
     wU8(127)                   // 0x7f i32 storagetype
   }
@@ -6061,9 +6090,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     let idx = localIndexOf(fnIx, e.identName)
     if idx < 0 {
       // A bare top-level/lifted function NAME in value position constructs a function
-      // value (closure fat-pointer). A capturing function referenced by name would need
-      // its captures live — but a top-level function never captures, so its env is null.
-      let fe = fnStmtsPosOf(fnIndexOf(e.identName))
+      // value (closure fat-pointer). `fnIndexOf` IS the `fnStmts` position (the function
+      // index), exactly what `emitClosureValue` expects — passed directly (a top-level
+      // function never captures, so its env is null; a captured lifted function reads its
+      // captures live in the enclosing frame `fnIx`). Scope-aware so a nested function
+      // sharing a name with another maker's nested function resolves to THIS frame's.
+      let fe = fnIndexOfInScope(e.identName, fnIx)
       if fe >= 0 {
         return emitClosureValue(body, fe, fnIx)
       }
@@ -6340,6 +6372,20 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
           }
           return 0
         }
+      }
+      // Struct / function-value equality is NOT lowered yet — fail LOUDLY rather
+      // than fall through to the i32 compare (which would emit an `i32.eq` over
+      // two refs: invalid wasm, a validation trap instead of a diagnostic). The
+      // host compares structs field-wise and function values by identity; that
+      // is follow-up work — under the `call_ref` ABI a function-identity compare
+      // needs an identity token on the closure struct (funcrefs admit no ref.eq).
+      // Guard is check-only: a program with no struct/closure `==` emits
+      // byte-identical bytes.
+      if structIndexOfExpr(e.binLeft, fnIx) >= 0 || structIndexOfExpr(e.binRight, fnIx) >= 0 {
+        return emitFail("emitProgram: struct equality is not supported yet")
+      }
+      if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
+        return emitFail("emitProgram: function-value equality is not supported yet")
       }
     }
     // Slice 5 — f32 operators. If EITHER operand is f32, emit the f32 instruction
@@ -9288,6 +9334,12 @@ function globalKind(initIx: i32): i32 {
   // and the start function `global.set`s the computed value. An i32-producing
   // expression matches none of these and stays kind 0 — programs without ref-typed
   // global expressions emit byte-identical bytes.
+  // A non-literal init that evaluates to a function value — a call returning a closure
+  // (`const f = makeAdder(5)`) or a member read of a function-valued field (`const h =
+  // o.go`) — is a closure fat-pointer cell (kind 14). Checked FIRST among the
+  // expression-family cases (it never overlaps the others, and only fires in a program
+  // that uses function values, so non-closure globals stay byte-identical).
+  if exprIsClosure(initIx, 0 - 1) { return 14 }
   if exprNullableStruct(initIx, 0 - 1) { return 9 }
   if exprMap(initIx, 0 - 1) { return 6 }
   if exprString(initIx, 0 - 1) { return 3 }
@@ -10780,11 +10832,22 @@ function emitModule(stmts: i32[]): i32 {
   let exportPayload: i32[] = []
   let exPrev = wTarget(exportPayload)
   wULEB(n)
+  // Export names must be UNIQUE. Lifted nested functions keep their source name, so two
+  // makers each declaring a nested `add` would both export `add` (a duplicate-name
+  // validation error). Disambiguate a repeat by suffixing its `fnStmts` position
+  // (`add#3`) — the FIRST occurrence keeps the bare name. No golden program has a
+  // repeated function name, so their export bytes are unchanged.
+  let usedExportNames: string[] = []
   let ei = 0
   while ei < n {
     let fn = P.nodes[fnStmts[ei]]
     if fn is FuncDecl {
-      wName(fn.fnName)
+      let exName = fn.fnName
+      if capHas(usedExportNames, exName) {
+        exName = exName + "#" + i32ToStr(ei)
+      }
+      usedExportNames.push(exName)
+      wName(exName)
       wU8(0)         // export kind: func
       wULEB(gImports + ei)  // func index (imports occupy 0..gImports-1)
     }
@@ -11306,17 +11369,41 @@ function nodeIsTypeDecl(ix: i32): boolean {
   false
 }
 
+// True if `name` is the name of a FuncDecl ANYWHERE in the arena (top-level or a
+// nested/lifted function). Used at `collectS` time — BEFORE `buildFnMap` populates
+// `fnNames`, so `fnIndexOf` is not yet usable — to classify an anon-struct field
+// whose value is a bare function name (`{ go: add }`). A direct arena scan, so it
+// sees a function declared after the literal too.
+function nameNamesFunction(name: string): boolean {
+  if name == "" { return false }
+  let i = 0
+  while i < P.nodes.length {
+    let n = P.nodes[i]
+    if n is FuncDecl {
+      if n.fnName == name { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
 // The struct field-type CODE for an ANONYMOUS-shape field, from its literal VALUE
 // (an anonymous literal has no `type` annotation to read): a number/boolean is i32
-// (`0`), a string literal is a string ref (`3`). Anything else (a function value, a
-// nested literal, a call, …) returns -1 — the whole shape is then left un-interned
-// and the literal fails loudly downstream.
+// (`0`), a string literal is a string ref (`3`), a function VALUE is a closure
+// fat-pointer (`14` — a `(ref $cloStruct)`, the same kind #306 uses for a closure
+// cell). A function value is either a FuncDecl literal (an inline lambda) or a bare
+// Ident naming a function. Anything else (a nested literal, a call, …) returns -1 —
+// the whole shape is then left un-interned and the literal fails loudly downstream.
 function anonFieldCode(valIx: i32): i32 {
   if valIx < 0 { return 0 - 1 }
   let e = P.nodes[valIx]
   if e is NumLit { return 0 }
   if e is BoolLit { return 0 }
   if e is StrLit { return 3 }
+  if e is FuncDecl { return 14 }
+  if e is Ident {
+    if nameNamesFunction(e.identName) { return 14 }
+  }
   0 - 1
 }
 
@@ -11367,6 +11454,11 @@ function collectAnonShapes(): i32 {
             sFieldNames.push(names[pi])
             sFieldTypes.push(codes[pi])
             sFieldElemName.push("")
+            // A function-valued field (code 14) interns a closure cell `(ref
+            // $cloStruct)`; flag the module so the closure rec-group types are
+            // emitted even when no lambda is otherwise lifted (e.g. a top-level
+            // function used purely as a struct-field value, `{ f: inc }`).
+            if codes[pi] == 14 { fnValUsed = true }
             pi = pi + 1
           }
         }
