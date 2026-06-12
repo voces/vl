@@ -25,12 +25,45 @@ function vcSource(): string {
 // `diagLine`/`diagCol` consult this table first. Reset per compile.
 let vcLexLines: i32[] = []
 let vcLexCols: i32[] = []
+
+// ── H3 module-table state (globals precede their first textual use; the module
+// SUBSYSTEM itself — exports, scan, pipeline, rewrite — lives at the bottom of
+// this file) ──────────────────────────────────────────────────────────────────
+let modKeys: string[] = []       // resolved module keys, [0] = the entry
+let modSrcs: string[] = []       // module sources ("" when missing)
+let modFound: i32[] = []         // 1 = read ok, 0 = host could not read the key
+let modKeyAcc: i32[] = []        // accumulators for the NEXT commit
+let modSrcAcc: i32[] = []
+// Flat per-import-entry tables (filled by the token scan at each commit):
+let impMod: i32[] = []           // importing module's table index
+let impSpec: string[] = []       // the raw specifier text (diagnostics)
+let impKey: string[] = []        // resolved key ("" = unsupported specifier)
+let impName: string[] = []       // the exported (source) name ("" = bare import)
+let impLocal: string[] = []      // the local binding name (after `as`)
+// Flat per-module export-name sets (token scan: `export`-modified declarations).
+let expMod: i32[] = []
+let expName: string[] = []
+// Resolved keys imported by committed modules that are neither committed nor
+// marked missing — what the host fetch loop reads next. Recomputed per commit.
+let modPending: string[] = []
+// DFS state: 0 unvisited, 1 loading (a back-edge is a cycle), 2 done; `modOrder`
+// collects table indices dependency-first; `modDiags` the resolution errors.
+let modState: i32[] = []
+let modOrder: i32[] = []
+let modDiags: string[] = []
+// Per-module rename map (`name` → `name$mN`) and the lexical shadow stack.
+let modRenameFrom: string[] = []
+let modRenameTo: string[] = []
+let modShadow: string[] = []
+
 function vcLoadToks(src: string): i32 {
   let r = tokenize(src)
   let i = 0
   while i < r.tokens.length {
     let t = r.tokens[i]
-    P.toks.push({ kind: t.kind, text: t.text, pos: i, start: t.start, line: t.line, col: t.col })
+    // `pos` is the GLOBAL P.toks index (single-source: identical to the per-call
+    // index; module mode APPENDS each module's tokens, so anchors stay correct).
+    P.toks.push({ kind: t.kind, text: t.text, pos: P.toks.length, start: t.start, line: t.line, col: t.col })
     i = i + 1
   }
   // Fold the lexer's diagnostics into the parse-stage store so a LEX error (e.g.
@@ -64,6 +97,10 @@ export function compileSrc(): i32 {
   globalStmts = []
   globalNames = []
   initChecker()
+  // Module mode (H3): a non-empty module table runs the multi-file pipeline
+  // (order/validate → parse-merge → rename/rewrite → check/emit). With an EMPTY
+  // table (every existing consumer) the single-source path below is untouched.
+  if modKeys.length > 0 { return modCompile(1) }
   vcLoadToks(vcSource())
   let root = parseProgram()
   if P.diags.length > 0 { return 1 }
@@ -94,6 +131,8 @@ export function checkSrc(): i32 {
   globalStmts = []
   globalNames = []
   initChecker()
+  // Module mode (H3) — see compileSrc; `check` runs the same pipeline minus emit.
+  if modKeys.length > 0 { return modCompile(0) }
   vcLoadToks(vcSource())
   let root = parseProgram()
   if P.diags.length > 0 { return 1 }
@@ -187,5 +226,743 @@ export function diagCol(i: i32): i32 {
   if j < T.diags.length {
     return T.diags[j].tcol
   }
+  0
+}
+
+// ── H3: native module resolution ──────────────────────────────────────────────
+// The module-table half of docs/native-modules-design.md (state declared at the
+// top of this file — globals precede their first textual use). The host (Rust
+// driver) runs a FETCH LOOP: it commits the entry, asks `modPendingCount` which
+// resolved keys are still needed, reads + commits them, and repeats until the
+// graph is closed; `compileSrc`/`checkSrc` then run the module pipeline
+// (order/validate → parse-merge → rename/rewrite → check/emit). With an EMPTY
+// table they behave exactly as before — the back-compat branch every existing
+// consumer (the selfhost harnesses, the fixpoint assemblies) rides.
+export function modReset(): i32 {
+  modKeys = []
+  modSrcs = []
+  modFound = []
+  modKeyAcc = []
+  modSrcAcc = []
+  impMod = []
+  impSpec = []
+  impKey = []
+  impName = []
+  impLocal = []
+  expMod = []
+  expName = []
+  modPending = []
+  0
+}
+export function modKeyPush(c: i32): i32 {
+  modKeyAcc.push(c)
+  0
+}
+export function modSrcPush(c: i32): i32 {
+  modSrcAcc.push(c)
+  0
+}
+// Register the accumulated (key, source) pair. `found = 0` marks "the host could
+// not read this key" so the unresolvable diagnostic fires instead of an infinite
+// re-request. A found module is token-scanned immediately (imports + exports).
+export function modCommit(found: i32): i32 {
+  let key = fromCodePoints(modKeyAcc)
+  let src = fromCodePoints(modSrcAcc)
+  modKeyAcc = []
+  modSrcAcc = []
+  modKeys.push(key)
+  modSrcs.push(src)
+  modFound.push(found)
+  if found != 0 {
+    modScan(modKeys.length - 1, src)
+  }
+  modRecomputePending()
+  0
+}
+export function modPendingCount(): i32 { modPending.length }
+export function modPendingLen(i: i32): i32 { modPending[i].length }
+export function modPendingAt(i: i32, j: i32): i32 { modPending[i][j] }
+
+// ── specifier resolution (ports of the host's pure string math) ───────────────
+function modIsRelative(spec: string): boolean {
+  if spec.length >= 2 {
+    if spec[0] == '.' && spec[1] == '/' { return true }
+  }
+  if spec.length >= 3 {
+    if spec[0] == '.' && spec[1] == '.' && spec[2] == '/' { return true }
+  }
+  false
+}
+// The directory portion of a `/`-separated key (no trailing slash), "" if none.
+function modDirOf(key: string): string {
+  let slash = 0 - 1
+  let i = 0
+  while i < key.length {
+    if key[i] == '/' { slash = i }
+    i = i + 1
+  }
+  if slash < 0 { return "" }
+  // An explicit `return` — a bare member-call TAIL expression routes through the
+  // statement dispatch, an emit gap in the native pipeline.
+  return key.slice(0, slash)
+}
+// Normalize a `/`-separated path, collapsing `.` and `..` segments. A leading
+// `/` (absolute key) is preserved; leading `..` that escape the root are kept
+// (the key stays distinct and the reader simply won't find it).
+function modNormalize(path: string): string {
+  let absolute = false
+  if path.length > 0 {
+    if path[0] == '/' { absolute = true }
+  }
+  let segs: string[] = []
+  let cur: i32[] = []
+  let i = 0
+  while i <= path.length {
+    let atEnd = i == path.length
+    let c = 0
+    if !atEnd { c = path[i] }
+    if atEnd || c == '/' {
+      let seg = fromCodePoints(cur)
+      cur = []
+      if seg == "" || seg == "." {
+        // skip
+      } else if seg == ".." {
+        if segs.length > 0 && segs[segs.length - 1] != ".." {
+          // Drop the last segment (rebuild — a bare `.pop()` STATEMENT is an
+          // emit gap in the native pipeline; this stays on the lowered path).
+          let trimmed: string[] = []
+          let ti = 0
+          while ti < segs.length - 1 {
+            trimmed.push(segs[ti])
+            ti = ti + 1
+          }
+          segs = trimmed
+        } else {
+          segs.push("..")
+        }
+      } else {
+        segs.push(seg)
+      }
+    } else {
+      cur.push(c)
+    }
+    i = i + 1
+  }
+  let out = ""
+  let s = 0
+  while s < segs.length {
+    if s > 0 { out = out + "/" }
+    out = out + segs[s]
+    s = s + 1
+  }
+  if absolute { return "/" + out }
+  out
+}
+// Resolve `spec` written in the module at `fromKey` to a key, or "" for a kind
+// phase 1 cannot resolve (`std:`/bare). `.vl` is APPENDED (specifiers omit it).
+function modResolveSpecifier(spec: string, fromKey: string): string {
+  if !modIsRelative(spec) { return "" }
+  let base = modDirOf(fromKey)
+  let joined = spec
+  if base != "" { joined = base + "/" + spec }
+  modNormalize(joined) + ".vl"
+}
+
+// ── token-level import/export scan (per committed module) ─────────────────────
+// Tokenizes the committed source with the REAL `tokenize` and walks top-level
+// tokens (brace-depth tracked): each `import { a as b, … } from "spec"` records
+// one import entry per specifier (resolved against THIS module's key); each
+// top-level `export`-modified `function`/`let`/`const`/`type` records an export
+// name. Imports still PARSE as no-ops later — this scan is the only reader.
+function modScan(m: i32, src: string): i32 {
+  let r = tokenize(src)
+  let toks = r.tokens
+  let depth = 0
+  let i = 0
+  while i < toks.length {
+    let k = toks[i].kind
+    if k == "LBRACE" {
+      depth = depth + 1
+      i = i + 1
+    } else if k == "RBRACE" {
+      depth = depth - 1
+      i = i + 1
+    } else if k == "IMPORT" && depth == 0 {
+      // One `import { a as b, … } from "spec"`, scanned INLINE (the lexer's
+      // token type is renamed per assembly — `Tok` → `LexTok` — so a named
+      // annotation can't portably type a token param). Records one entry per
+      // specifier (the `as` local rename honored); a specifier-less import
+      // records one entry with empty names (a pure graph edge). The cursor
+      // ends just past the trailing path STRING.
+      i = i + 1
+      let names: string[] = []
+      let locals: string[] = []
+      if i < toks.length {
+        if toks[i].kind == "LBRACE" {
+          i = i + 1
+          let going = true
+          while going && i < toks.length {
+            let ck = toks[i].kind
+            if ck == "RBRACE" {
+              i = i + 1
+              going = false
+            } else {
+              if ck == "IDENT" {
+                let nm = toks[i].text
+                let loc = nm
+                if i + 2 < toks.length {
+                  if toks[i + 1].kind == "IDENT" && toks[i + 1].text == "as" && toks[i + 2].kind == "IDENT" {
+                    loc = toks[i + 2].text
+                    i = i + 2
+                  }
+                }
+                names.push(nm)
+                locals.push(loc)
+              }
+              i = i + 1
+            }
+          }
+        }
+      }
+      // Forward to the path STRING (the `from` keyword rides as an IDENT). The
+      // STRING token's `text` keeps its surrounding quotes — strip them.
+      let spec = ""
+      let scanning = true
+      while scanning && i < toks.length {
+        let sk = toks[i].kind
+        if sk == "STRING" {
+          spec = toks[i].text
+          if spec.length >= 2 {
+            if spec[0] == '"' && spec[spec.length - 1] == '"' {
+              spec = spec.slice(1, spec.length - 1)
+            }
+          }
+          i = i + 1
+          scanning = false
+        } else if sk == "EOF" {
+          scanning = false
+        } else {
+          i = i + 1
+        }
+      }
+      let key = modResolveSpecifier(spec, modKeys[m])
+      let n = 0
+      while n < names.length {
+        impMod.push(m)
+        impSpec.push(spec)
+        impKey.push(key)
+        impName.push(names[n])
+        impLocal.push(locals[n])
+        n = n + 1
+      }
+      if names.length == 0 {
+        impMod.push(m)
+        impSpec.push(spec)
+        impKey.push(key)
+        impName.push("")
+        impLocal.push("")
+      }
+    } else if k == "EXPORT" && depth == 0 {
+      if i + 2 < toks.length {
+        let dk = toks[i + 1].kind
+        if dk == "FUNCTION" || dk == "LET" || dk == "CONST" || dk == "TYPE" {
+          expMod.push(m)
+          expName.push(toks[i + 2].text)
+        }
+      }
+      i = i + 1
+    } else {
+      i = i + 1
+    }
+  }
+  0
+}
+function modIndexOfKey(key: string): i32 {
+  let i = 0
+  while i < modKeys.length {
+    if modKeys[i] == key { return i }
+    i = i + 1
+  }
+  0 - 1
+}
+function modRecomputePending(): i32 {
+  modPending = []
+  let i = 0
+  while i < impKey.length {
+    let k = impKey[i]
+    if k != "" && modIndexOfKey(k) < 0 {
+      if !capHas(modPending, k) { modPending.push(k) }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// ── module pipeline (order/validate → parse-merge → rename/rewrite) ───────────
+// DFS state lives at the top of this file: 0 unvisited, 1 loading (on the stack
+// — a back-edge is a cycle), 2 done. `modOrder` collects table indices in
+// dependency-first (post) order.
+function modDiag(msg: string): i32 {
+  if !capHas(modDiags, msg) { modDiags.push(msg) }
+  0
+}
+function modExportsHas(m: i32, name: string): boolean {
+  let i = 0
+  while i < expMod.length {
+    if expMod[i] == m && expName[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+// Visit module `m`: resolve + validate its imports (unsupported specifier,
+// unresolvable key, cycle back-edge, name-not-exported), recursing into deps
+// first. Message texts match the host's `modules.ts` (the corpus `@error`s
+// substring them).
+function modVisit(m: i32): i32 {
+  modState[m] = 1
+  let i = 0
+  while i < impMod.length {
+    if impMod[i] == m {
+      let spec = impSpec[i]
+      let key = impKey[i]
+      if key == "" {
+        modDiag("Unsupported import specifier \"" + spec + "\" — phase 1 supports only relative paths (`./`, `../`); `std:` and bare specifiers are not yet implemented")
+      } else {
+        let d = modIndexOfKey(key)
+        if d < 0 {
+          modDiag("Cannot resolve import \"" + spec + "\" (no module `" + key + "`)")
+        } else if modFound[d] == 0 {
+          modDiag("Cannot resolve import \"" + spec + "\" (no module `" + key + "`)")
+        } else if modState[d] == 1 {
+          modDiag("Import cycle detected through \"" + spec + "\" (module `" + key + "`)")
+        } else {
+          if modState[d] == 0 { modVisit(d) }
+          if impName[i] != "" {
+            if !modExportsHas(d, impName[i]) {
+              modDiag("\"" + impName[i] + "\" is not exported by \"" + spec + "\"")
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  modState[m] = 2
+  modOrder.push(m)
+  0
+}
+// The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
+function modCompile(emit: i32): i32 {
+  // 1. Order + validate (DFS from the entry, table index 0).
+  modState = []
+  modOrder = []
+  modDiags = []
+  let s = 0
+  while s < modKeys.length {
+    modState.push(0)
+    s = s + 1
+  }
+  modVisit(0)
+  if modDiags.length > 0 {
+    let d = 0
+    while d < modDiags.length {
+      P.diags.push({ msg: modDiags[d], at: 0 - 1 })
+      d = d + 1
+    }
+    return 1
+  }
+  // 2. Parse each module dependency-first into the SHARED arena. Tokens append
+  // to `P.toks` (anchors stay per-module-correct via the global `pos`); each
+  // `parseProgram` starts at its own module's first token.
+  let roots: i32[] = []
+  let o = 0
+  while o < modOrder.length {
+    let m = modOrder[o]
+    P.pos = P.toks.length
+    vcLoadToks(modSrcs[m])
+    roots.push(parseProgram())
+    if P.diags.length > 0 { return 1 }
+    o = o + 1
+  }
+  // 3 + 4. Per-module rename map + scope-aware arena rewrite.
+  let o2 = 0
+  while o2 < modOrder.length {
+    modBuildRename(modOrder[o2], roots[o2])
+    modShadow = []
+    modRwStmt(roots[o2])
+    o2 = o2 + 1
+  }
+  // 5. Merge: ONE Program concatenating the modules' statements dependency-first
+  // (deps' top-level initializers run before their dependents', as in the host).
+  let allStmts: i32[] = []
+  let o3 = 0
+  while o3 < modOrder.length {
+    let r = P.nodes[roots[o3]]
+    if r is Program {
+      let ss = r.progStmts
+      let q = 0
+      while q < ss.length {
+        allStmts.push(ss[q])
+        q = q + 1
+      }
+    }
+    o3 = o3 + 1
+  }
+  let merged = mkProgram(allStmts)
+  let nerr = i32ToStr(checkProgram(merged))
+  if T.diags.length > 0 { return 2 }
+  if emit != 0 {
+    let rc = emitProgram(merged)
+    if rc < 0 { return 3 }
+  }
+  0
+}
+
+// ── per-module rename map (state at the top of this file) ─────────────────────
+// `modRenameFrom[i]` → `modRenameTo[i]`: every top-level value/type name of the
+// module maps to `name$mN` (N = the module's TABLE index — entry 0); an imported
+// local maps to the EXPORTING module's mangled export name. Generic declarations
+// (a `<` in the name) are skipped — exporting generics is out of phase-1 scope;
+// the type-annotation SEGMENT rewrite still renames plain applications.
+function modStrHasLt(name: string): boolean {
+  let i = 0
+  while i < name.length {
+    if name[i] == '<' { return true }
+    i = i + 1
+  }
+  false
+}
+function modBuildRename(m: i32, root: i32): i32 {
+  modRenameFrom = []
+  modRenameTo = []
+  let impLocals: string[] = []
+  let ii = 0
+  while ii < impMod.length {
+    if impMod[ii] == m && impLocal[ii] != "" {
+      impLocals.push(impLocal[ii])
+    }
+    ii = ii + 1
+  }
+  let suffix = "$m" + i32ToStr(m)
+  let r = P.nodes[root]
+  if r is Program {
+    let ss = r.progStmts
+    let si = 0
+    while si < ss.length {
+      let st = P.nodes[ss[si]]
+      let nm = ""
+      if st is FuncDecl { nm = st.fnName }
+      if st is LetDecl { nm = st.letName }
+      if st is TypeDecl { nm = st.tdName }
+      if st is UnionDecl { nm = st.udName }
+      if nm != "" {
+        if !capHas(impLocals, nm) && !modStrHasLt(nm) {
+          modRenameFrom.push(nm)
+          modRenameTo.push(nm + suffix)
+        }
+      }
+      si = si + 1
+    }
+  }
+  let ij = 0
+  while ij < impMod.length {
+    if impMod[ij] == m && impLocal[ij] != "" {
+      let dd = modIndexOfKey(impKey[ij])
+      if dd >= 0 {
+        modRenameFrom.push(impLocal[ij])
+        modRenameTo.push(impName[ij] + "$m" + i32ToStr(dd))
+      }
+    }
+    ij = ij + 1
+  }
+  0
+}
+// A VALUE reference: shadowed locals win, then the rename map, else unchanged.
+function modRenamed(name: string): string {
+  if capHas(modShadow, name) { return name }
+  let j = 0
+  while j < modRenameFrom.length {
+    if modRenameFrom[j] == name { return modRenameTo[j] }
+    j = j + 1
+  }
+  name
+}
+// A TYPE-position name: annotations are SYNTHETIC strings ("A|B", "Point[]",
+// "Box<i32>"), so rewrite identifier SEGMENTS through the rename map (types are
+// never shadowed by locals — VL has no local type declarations). Quoted
+// string-literal segments (`"a"|"b"`) are copied verbatim.
+function modTypeRenamed(tn: string): string {
+  let out: i32[] = []
+  let run: i32[] = []
+  let i = 0
+  while i <= tn.length {
+    let atEnd = i == tn.length
+    let c = 0
+    if !atEnd { c = tn[i] }
+    let isIdent = false
+    if !atEnd {
+      if c >= 'a' && c <= 'z' { isIdent = true }
+      if c >= 'A' && c <= 'Z' { isIdent = true }
+      if c >= '0' && c <= '9' { isIdent = true }
+      if c == '_' { isIdent = true }
+    }
+    if isIdent {
+      run.push(c)
+    } else {
+      if run.length > 0 {
+        let seg = fromCodePoints(run)
+        run = []
+        let rep = seg
+        let j = 0
+        while j < modRenameFrom.length {
+          if modRenameFrom[j] == seg { rep = modRenameTo[j] }
+          j = j + 1
+        }
+        let k = 0
+        while k < rep.length {
+          out.push(rep[k])
+          k = k + 1
+        }
+      }
+      if !atEnd {
+        if c == '"' {
+          // copy a quoted literal segment verbatim (no escapes in type names)
+          out.push(c)
+          i = i + 1
+          let copying = true
+          while copying && i < tn.length {
+            out.push(tn[i])
+            if tn[i] == '"' { copying = false }
+            i = i + 1
+          }
+          i = i - 1
+        } else {
+          out.push(c)
+        }
+      }
+    }
+    i = i + 1
+  }
+  fromCodePoints(out)
+}
+
+// ── scope-aware arena rewrite (port of the host's moduleRewrite.ts) ───────────
+// Rewrites Name references, call targets, declaration names — and (NATIVE
+// DIVERGENCE, mechanism not semantics) type-annotation references and type
+// declaration names, since the native checker resolves type names from the
+// merged program (the host resolves imported types at parse time, so its
+// rewriter never sees them). A top-level name shadowed by a param, loop var, or
+// block-local `let`/`function` is left alone for that scope's extent
+// (`modShadow`, a save/restore stack).
+function modRwType(tyIx: i32): i32 {
+  if tyIx < 0 { return 0 }
+  let t = P.nodes[tyIx]
+  if t is TypeRef {
+    t.tyName = modTypeRenamed(t.tyName)
+  }
+  0
+}
+// Truncate the shadow stack back to `saved` entries (rebuild — a bare `.pop()`
+// STATEMENT is an emit gap in the native pipeline).
+function modShadowTrim(saved: i32): i32 {
+  let keep: string[] = []
+  let ki = 0
+  while ki < saved {
+    keep.push(modShadow[ki])
+    ki = ki + 1
+  }
+  modShadow = keep
+  0
+}
+function modRwFunc(ix: i32): i32 {
+  let n = P.nodes[ix]
+  if n is FuncDecl {
+    n.fnName = modRenamed(n.fnName)
+    let saved = modShadow.length
+    let pi = 0
+    while pi < n.fnParams.length {
+      let p = P.nodes[n.fnParams[pi]]
+      if p is Param {
+        modShadow.push(p.parName)
+        modRwType(p.parType)
+      }
+      pi = pi + 1
+    }
+    modRwType(n.fnRet)
+    modRwStmt(n.fnBody)
+    modShadowTrim(saved)
+  }
+  0
+}
+function modRwBlock(ix: i32): i32 {
+  let n = P.nodes[ix]
+  if n is Block {
+    // Block-local `let`/`function` names shadow a same-named top-level binding
+    // for the WHOLE block (VL `let` is block-scoped, visible across the block).
+    let saved = modShadow.length
+    let pre = 0
+    while pre < n.blkStmts.length {
+      let st = P.nodes[n.blkStmts[pre]]
+      if st is LetDecl { modShadow.push(st.letName) }
+      if st is FuncDecl {
+        if st.fnName != "" { modShadow.push(st.fnName) }
+      }
+      pre = pre + 1
+    }
+    let i = 0
+    while i < n.blkStmts.length {
+      modRwStmt(n.blkStmts[i])
+      i = i + 1
+    }
+    modShadowTrim(saved)
+  }
+  0
+}
+function modRwStmt(ix: i32): i32 {
+  if ix < 0 { return 0 }
+  let n = P.nodes[ix]
+  if n is Program {
+    let i = 0
+    while i < n.progStmts.length {
+      modRwStmt(n.progStmts[i])
+      i = i + 1
+    }
+    return 0
+  }
+  if n is Block { return modRwBlock(ix) }
+  if n is LetDecl {
+    // The initializer evaluates in the ENCLOSING scope; rewrite it before the
+    // name. At the top level the declaration name is RENAMED; in a nested block
+    // it is pre-collected into the shadow set, so `modRenamed` is a no-op.
+    if n.letInit >= 0 { modRwExpr(n.letInit) }
+    modRwType(n.letType)
+    n.letName = modRenamed(n.letName)
+    return 0
+  }
+  if n is FuncDecl { return modRwFunc(ix) }
+  if n is RetStmt {
+    if n.retArg >= 0 { modRwExpr(n.retArg) }
+    return 0
+  }
+  if n is IfStmt {
+    modRwExpr(n.ifCond)
+    modRwStmt(n.ifThen)
+    if n.ifElse >= 0 { modRwStmt(n.ifElse) }
+    return 0
+  }
+  if n is WhileStmt {
+    modRwExpr(n.whileCond)
+    modRwStmt(n.whileBody)
+    return 0
+  }
+  if n is ForRange {
+    modRwExpr(n.frFrom)
+    modRwExpr(n.frTo)
+    if n.frStep >= 0 { modRwExpr(n.frStep) }
+    let frSaved = modShadow.length
+    modShadow.push(n.frVar)
+    modRwStmt(n.frBody)
+    modShadowTrim(frSaved)
+    return 0
+  }
+  if n is ForIn {
+    modRwExpr(n.fiIter)
+    let fiSaved = modShadow.length
+    modShadow.push(n.fiVar)
+    modRwStmt(n.fiBody)
+    modShadowTrim(fiSaved)
+    return 0
+  }
+  if n is BreakStmt { return 0 }
+  if n is ContinueStmt { return 0 }
+  if n is TypeDecl {
+    n.tdName = modTypeRenamed(n.tdName)
+    let i = 0
+    while i < n.tdFields.length {
+      let f = P.nodes[n.tdFields[i]]
+      if f is FieldDef { modRwType(f.fdType) }
+      i = i + 1
+    }
+    return 0
+  }
+  if n is UnionDecl {
+    n.udName = modTypeRenamed(n.udName)
+    let vs: string[] = []
+    let i = 0
+    while i < n.udVariants.length {
+      vs.push(modTypeRenamed(n.udVariants[i]))
+      i = i + 1
+    }
+    n.udVariants = vs
+    return 0
+  }
+  modRwExpr(ix)
+}
+function modRwExpr(ix: i32): i32 {
+  if ix < 0 { return 0 }
+  let n = P.nodes[ix]
+  if n is Ident {
+    n.identName = modRenamed(n.identName)
+    return 0
+  }
+  if n is Call {
+    modRwExpr(n.callFn)
+    let i = 0
+    while i < n.callArgs.length {
+      modRwExpr(n.callArgs[i])
+      i = i + 1
+    }
+    return 0
+  }
+  if n is Member {
+    // The property is a field label, never a top-level binding — receiver only.
+    modRwExpr(n.memObj)
+    return 0
+  }
+  if n is OptMember {
+    modRwExpr(n.omObj)
+    return 0
+  }
+  if n is Index {
+    modRwExpr(n.idxArr)
+    modRwExpr(n.idxIndex)
+    return 0
+  }
+  if n is BinExpr {
+    modRwExpr(n.binLeft)
+    modRwExpr(n.binRight)
+    return 0
+  }
+  if n is Unary {
+    modRwExpr(n.unArg)
+    return 0
+  }
+  if n is Paren {
+    modRwExpr(n.parInner)
+    return 0
+  }
+  if n is ObjLit {
+    let i = 0
+    while i < n.objFields.length {
+      let f = P.nodes[n.objFields[i]]
+      if f is FieldInit { modRwExpr(f.fiValue) }
+      i = i + 1
+    }
+    return 0
+  }
+  if n is ArrayLit {
+    let i = 0
+    while i < n.arrElems.length {
+      modRwExpr(n.arrElems[i])
+      i = i + 1
+    }
+    return 0
+  }
+  if n is IsExpr {
+    modRwExpr(n.isObj)
+    n.isVariant = modTypeRenamed(n.isVariant)
+    return 0
+  }
+  if n is FuncDecl { return modRwFunc(ix) }
   0
 }
