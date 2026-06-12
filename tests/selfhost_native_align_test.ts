@@ -358,6 +358,10 @@ const RUN_CASES = [
   "tostring/numbers.vl",
   "types/and-narrowing.vl",
   "types/boolean-to-i32.vl",
+  // Field-rep long tail: union/nullable/nested struct fields with member-path
+  // narrowing, `i32[] | null` (kind-15 slots + ref.as_non_null reads), and
+  // map-typed fields with a recursive map-value back-edge.
+  "types/field-union.vl",
   "types/guard-function.vl",
   "types/infer-null-conditional-assign.vl",
   "types/infer-null-reassign.vl",
@@ -376,9 +380,11 @@ const RUN_CASES = [
   "types/not-paren-is-guard-narrowing.vl",
   "types/null-coalesce.vl",
   "types/nullable-boolean.vl",
+  "types/nullable-list-index.vl",
   "types/optional-chain.vl",
   "types/or-guard-narrowing.vl",
   "types/recursive-array-element.vl",
+  "types/recursive-map-value.vl",
   "types/recursive-tree.vl",
   "types/ref-union.vl",
   "types/struct-union-same-shape.vl",
