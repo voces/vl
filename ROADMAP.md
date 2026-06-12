@@ -32,36 +32,20 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ## Next (highest leverage)
 
-- **H3-tail: corpus coverage pay-down** — sweep stands at **250/317 passing** after the wave-3
-  pair (#332 deep union boxing — union `==`, post-guard narrowing, union-element arrays;
-  #333 monomorphization — per-callsite instantiation via instance clones, checker inference
-  holes with call-site collapse): parse-reject **2** (named args + labelled break — AST-shape
-  items), type-reject 27, emit-gap 34, run-error 1. Run-whitelist **253**, align **335**.
-  Remaining tracks, all triaged: structural param inference, generic type aliases,
-  operator-overload + index-trap dispatch, nested arrays `i32[][]`, modules (H3),
-  function-identity equality (closure-rep change, solo). Known divergence queue: out-of-i64
-  literal overflow diagnosis; `xfail-arith-hole-operand` expects a binaryen constant-fold
-  artifact the native compiler correctly rejects loudly (re-pin the expectation under A13). The #319/#321/#322/#323/#324 wave landed: ref-valued maps, integer-literal width
-  (BOTH known silent miscompiles fixed — `hex.vl` + `infer-empty-string.vl`), parser grammar
-  (object/method shorthand, `is`-RHS types, if-expressions, generic application), checker flow
-  narrowing + recursive named types + nullable holes, and emit struct equality / nested-struct
-  fields / string intrinsics / fused list defaults. The remaining buckets are TRIAGED to named
-  capabilities (see the agent reports in those PRs):
-  • **emit: boxed value unions** (`{tag,payload}` at flow boundaries; ~14 files) — biggest single track
-  • **emit: recursive struct types in fn bodies** — 5 cases now typecheck but emit INVALID WASM
-    (loud `failed to compile`, the `run-error` bucket): the code-15 nested-struct work doesn't
-    cover self/mutually-recursive locals/params end-to-end
-  • **emit: generic monomorphization** (6 files) + **checker Infer-hole machinery** (7 files) —
-    one combined track, both halves needed before either pays off
-  • **checker: literal-union/intersection enforcement** — parser DELIBERATELY still rejects the
-    syntax (reject-parity: the permissive checker would wrongly accept 7 REJECT cases); port the
-    checking first, then flip the parser
-  • structural param inference, operator-overload + index-trap dispatch, nested arrays `i32[][]`,
-    `modules/*` (blocked on native import resolution, H3)
-- **Self-host struct equality** — LANDED for value shapes (#323: scalars/strings/i32[]/nested,
-  name-rooted operands only, impure operands fail loudly). REMAINING: function-identity compare
-  needs an identity token on the closure struct (funcrefs admit no `ref.eq`) — a closure-rep
-  change; run it solo.
+- **H3-tail: corpus coverage pay-down** — sweep stands at **295/314 passing (94%)** after the
+  round-4 pair (#335 generic aliases + structural params + operator/index dispatch, type-rejects
+  24→1; #336 memory intrinsics + UFCS + struct-union dispatch + optional chains + nested arrays,
+  emit-gaps 34→9). Run-whitelist **309**, align **391**. The residue is fully named:
+  • emit: recursive list value-equality (arrays/equality), list concat, recursive inline-shape
+    interning (field-union), nullable list refs, map-valued struct fields (recursive-map-value),
+    usage-driven `i32|null` inference (infer-null ×2), negated-`is` codegen (not-is-narrowing),
+    closure struct-return ABI + captured-list indexing (operator-overload, nested/write-trap),
+    bool-ness through closure results (generic-trap), f64 struct fields (structural-generic)
+  • function-identity equality (closure-rep change — identity token; run SOLO)
+  • parse: named args, labelled break (AST-shape extensions)
+  • modules/* (H3 — native import resolution; architectural)
+  • xfails: arith-hole-operand (host binaryen artifact — re-pin under A13),
+    array-element-recursion (i32-keyed maps — map-rep extension)
 - **Explicit numeric conversion syntax** — the lossless-only implicit-widening rule (#298) makes
   the lossy edges (`i32→f32`, `i64→f64`, all narrowings) EXPRESSIBLE ONLY via a cast that does
   not exist yet; design + land it (both compilers).
