@@ -697,8 +697,20 @@ const getPipeline = (): Promise<Record<string, (...a: number[]) => number>> =>
     return inst.exports as Record<string, (...a: number[]) => number>;
   })();
 
+// F-tiers: the RUN half below is REDUNDANT with the native align tier — the same
+// corpus runs through the same .vl emitter under the native `vl` tool in
+// `selfhost_native_align_test.ts` / `scripts/native-corpus-sweep.sh` (ci-native),
+// where it is dramatically cheaper. Gated OFF by default; `SELFHOST_DENO_RUN=1`
+// re-enables the V8-side run (e.g. to bisect a wasmtime-vs-V8 divergence). The
+// CHECK→EMIT verdict cases and the functype-portability invariant below stay on —
+// they are the deno-side gate (tier-1 verdicts), not the redundant RUN tier.
+const DENO_RUN = Deno.env.get("SELFHOST_DENO_RUN") === "1";
+
 entries.forEach((e, idx) => {
-  Deno.test(`corpus-run: ${e.rel} — VL-emitted wasm logs match @log`, async () => {
+  Deno.test({
+    name: `corpus-run: ${e.rel} — VL-emitted wasm logs match @log`,
+    ignore: !DENO_RUN,
+  }, async () => {
     const exp = await getPipeline();
     const st = exp.runOne(idx);
     if (st !== 0) {
