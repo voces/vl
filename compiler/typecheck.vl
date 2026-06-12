@@ -2197,6 +2197,300 @@ function objFieldType(o: TyObj, name: string): i32 {
   -1
 }
 
+// ── emit-name canonicalization ────────────────────────────────────────────────
+// The native emitter classifies annotations by their synthetic NAME, and the
+// literal/intersection algebra above is purely a CHECKER notion — at runtime a
+// same-base literal union IS its base scalar (`"a" | "b"` rides a string,
+// `0 | 1` an i32, `1.5 | 2.5` an f64) and a folded intersection IS its fold
+// (`(0|1|2) & !2` an i32, `{a} & {b}` the merged shape). So at the end of
+// `checkProgram`, `canonEmitTypeNames` rewrites every annotation name into the
+// emitter's vocabulary; a name with no literal/intersection construct passes
+// through BYTE-IDENTICAL (the membership rules were already enforced above —
+// the emitter only needs the representation).
+
+// Whether `name` contains a construct the emitter can't classify: a quoted
+// string-literal member, an `&` intersection, a `!` negation, a parenthesized
+// group, or a numeric-literal member (a digit at a member-START position —
+// after `|` / `:` / `,` or at the very start; a digit INSIDE an identifier
+// like `i32` never starts a member).
+function nameNeedsCanon(name: string): boolean {
+  let i = 0
+  while i < name.length {
+    let c = name[i]
+    if c == '"' || c == '&' || c == '!' || c == '(' { return true }
+    if c >= '0' && c <= '9' {
+      if i == 0 { return true }
+      let p = name[i - 1]
+      if p == '|' || p == ':' || p == ',' { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The base-scalar emit name of one LITERAL member lexeme (`"a"` → string,
+// `0` → i32, `1.5` → f64, an i32-overflowing integer → i64 — the same
+// magnitude rule as `litBaseTy`).
+function litBaseName(part: string): string {
+  if part[0] == '"' { return "string" }
+  if hasDot(part) { return "f64" }
+  if intLexemeFitsI32(part) { return "i32" }
+  "i64"
+}
+
+// Render a RESOLVED arena type as an emitter-classifiable synthetic name, or
+// "" when it has none (a TyVar, a residual negation, err/never). Only the
+// `&`-fold arm of `canonEmitName` consults this — every other arm rewrites the
+// name STRUCTURALLY without resolving it, so a NAMED struct keeps its name.
+function tyToEmitName(ix: i32): string {
+  if ix < 0 { return "" }
+  let t = T.tys[ix]
+  if t is TyPrim {
+    if t.primName == "never" { return "" }
+    return t.primName
+  }
+  if t is TyLit {
+    if t.litKind == "str" { return "string" }
+    if t.litKind == "flt" { return "f64" }
+    if intLexemeFitsI32(t.litText) { return "i32" }
+    return "i64"
+  }
+  if t is TyUnion {
+    let members = t.uMembers
+    let parts: string[] = []
+    let i = 0
+    while i < members.length {
+      let s = tyToEmitName(members[i])
+      if s == "" { return "" }
+      let dup = false
+      let j = 0
+      while j < parts.length {
+        if parts[j] == s { dup = true }
+        j = j + 1
+      }
+      if !dup { parts.push(s) }
+      i = i + 1
+    }
+    if parts.length == 0 { return "" }
+    let out = parts[0]
+    let k = 1
+    while k < parts.length {
+      out = out + "|" + parts[k]
+      k = k + 1
+    }
+    return out
+  }
+  if t is TyNullable {
+    let inner = tyToEmitName(t.nInner)
+    if inner == "" { return "" }
+    return inner + "|null"
+  }
+  if t is TyObj {
+    let names = t.objFieldNames
+    let ftys = t.objFieldTypes
+    let out = "{"
+    let fi = 0
+    while fi < names.length {
+      let fs = tyToEmitName(ftys[fi])
+      if fs == "" { return "" }
+      if fi > 0 { out = out + "," }
+      out = out + names[fi] + ":" + fs
+      fi = fi + 1
+    }
+    return out + "}"
+  }
+  if t is TyArray {
+    let el = tyToEmitName(t.aElem)
+    if el == "" { return "" }
+    if nameHasPipe(el) { return "(" + el + ")[]" }
+    return el + "[]"
+  }
+  if t is TyMap {
+    let mk = tyToEmitName(t.mKey)
+    let mv = tyToEmitName(t.mVal)
+    if mk == "" || mv == "" { return "" }
+    return "{[" + mk + "]:" + mv + "}"
+  }
+  ""
+}
+
+// Canonicalize one inline `{…}` shape name (an object `{f:T,…}` or a map
+// `{[K]:V}`): each field/key/value type recurses through `canonEmitName`, the
+// surrounding structure is rebuilt with the parser's exact conventions (no
+// spaces), so a shape with no literal field is reproduced byte-identical.
+function canonShapeName(name: string): string {
+  let inner = name.slice(1, name.length - 1)
+  if inner.length > 0 && inner[0] == '[' {
+    // A map `{[K]:V}` — the key ends at its matching `]` (depth-aware).
+    let depth = 0
+    let i = 0
+    while i < inner.length {
+      let c = inner[i]
+      if c == '"' {
+        i = skipQuotedName(inner, i)
+      } else {
+        if c == '[' || c == '{' || c == '(' { depth = depth + 1 }
+        if c == ']' || c == '}' || c == ')' {
+          depth = depth - 1
+          if depth == 0 {
+            let key = inner.slice(1, i)
+            let val = inner.slice(i + 2, inner.length)
+            return "{[" + canonEmitName(key) + "]:" + canonEmitName(val) + "}"
+          }
+        }
+        i = i + 1
+      }
+    }
+    return name
+  }
+  // An object shape `{f:T,…}`: split fields at depth 0 (quoted literal members
+  // skipped), canon each field's type past its first depth-0 `:`.
+  let out = "{"
+  let depth = 0
+  let start = 0
+  let i = 0
+  while i <= inner.length {
+    let atSplit = i == inner.length
+    let step = 1
+    if !atSplit {
+      let c = inner[i]
+      if c == '"' {
+        step = skipQuotedName(inner, i) - i
+      } else if c == '{' || c == '[' || c == '(' {
+        depth = depth + 1
+      } else if c == '}' || c == ']' || c == ')' {
+        depth = depth - 1
+      } else if c == ',' && depth == 0 {
+        atSplit = true
+      }
+    }
+    if atSplit {
+      let field = inner.slice(start, i)
+      // The field's type starts past its first depth-0 `:` (quote-aware).
+      let cdepth = 0
+      let colonAt = 0 - 1
+      let ci = 0
+      while ci < field.length {
+        let cc = field[ci]
+        if cc == '"' {
+          ci = skipQuotedName(field, ci) - 1
+        } else if cc == '{' || cc == '[' || cc == '(' {
+          cdepth = cdepth + 1
+        } else if cc == '}' || cc == ']' || cc == ')' {
+          cdepth = cdepth - 1
+        } else if cc == ':' && cdepth == 0 && colonAt < 0 {
+          colonAt = ci
+        }
+        ci = ci + 1
+      }
+      if start > 0 { out = out + "," }
+      if colonAt >= 0 {
+        out = out + field.slice(0, colonAt + 1) +
+          canonEmitName(field.slice(colonAt + 1, field.length))
+      } else {
+        out = out + field
+      }
+      start = i + 1
+    }
+    i = i + step
+  }
+  out + "}"
+}
+
+// Rewrite one synthetic annotation name into the emitter's vocabulary (see the
+// block comment above). Structure-preserving: only literal members, `&` folds
+// and whole-name parens change; any name without those constructs is returned
+// byte-identical (the `nameNeedsCanon` fast path).
+function canonEmitName(name: string): string {
+  if name.length == 0 { return name }
+  if !nameNeedsCanon(name) { return name }
+  // A top-level UNION: canon each member and collapse duplicates (`"a" | "b"`
+  // both soften to string → the bare scalar; a mixed-base union keeps each
+  // softened member — `"a" | 1` stays the boxed `string|i32`).
+  if nameHasPipe(name) {
+    let parts: string[] = []
+    splitTypeName(name, '|', parts)
+    let kept: string[] = []
+    let i = 0
+    while i < parts.length {
+      let c = canonEmitName(parts[i])
+      let dup = false
+      let j = 0
+      while j < kept.length {
+        if kept[j] == c { dup = true }
+        j = j + 1
+      }
+      if !dup { kept.push(c) }
+      i = i + 1
+    }
+    let out = kept[0]
+    let k = 1
+    while k < kept.length {
+      out = out + "|" + kept[k]
+      k = k + 1
+    }
+    return out
+  }
+  // A top-level INTERSECTION: fold through the checker algebra (`nameToTy`
+  // runs `intersectTy`), then render the fold. An unrenderable fold leaves the
+  // name unchanged — the emitter reports its own coverage gap.
+  if (nameHasSep(name, '&')) {
+    let folded = nameToTy(name)
+    if folded >= 0 {
+      let r = tyToEmitName(folded)
+      if r != "" { return r }
+    }
+    return name
+  }
+  // A trailing `[]`: canon the ELEMENT (no top-level `|`/`&` here, so the
+  // suffix binds the whole core); a union element keeps its grouping parens.
+  if name.length > 2 && name[name.length - 2] == '[' && name[name.length - 1] == ']' {
+    let core = canonEmitName(name.slice(0, name.length - 2))
+    if nameHasPipe(core) { return "(" + core + ")[]" }
+    return core + "[]"
+  }
+  // A parenthesized group wrapping the whole (no top-level `|`/`&`/`[]` left):
+  // strip and canon the inside.
+  if name[0] == '(' && name[name.length - 1] == ')' {
+    return canonEmitName(name.slice(1, name.length - 1))
+  }
+  // A literal member → its base scalar.
+  if name[0] == '"' { return "string" }
+  if name[0] >= '0' && name[0] <= '9' { return litBaseName(name) }
+  // A residual negation (only meaningful under `&`) — leave for the emitter.
+  if name[0] == '!' { return name }
+  // An inline `{…}` shape: canon its field/value types.
+  if name[0] == '{' && name[name.length - 1] == '}' {
+    return canonShapeName(name)
+  }
+  name
+}
+
+// The post-check sweep: rewrite every `TypeRef` annotation and every
+// `UnionDecl` variant name in the arena. Runs once at the end of
+// `checkProgram` — `compileSrc` hands this SAME arena to `emitProgram`, so the
+// emitter only ever sees its own vocabulary.
+function canonEmitTypeNames(): i32 {
+  let i = 0
+  while i < P.nodes.length {
+    let n = P.nodes[i]
+    if n is TypeRef {
+      let c = canonEmitName(n.tyName)
+      if c != n.tyName { n.tyName = c }
+    } else if n is UnionDecl {
+      let vs = n.udVariants
+      let vi = 0
+      while vi < vs.length {
+        let c2 = canonEmitName(vs[vi])
+        if c2 != vs[vi] { vs[vi] = c2 }
+        vi = vi + 1
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // ── value-comparability: may `ty` be compared with the default structural `==`? ─
 // SOUNDNESS (mirrors the host's `isEquatable`): `==`/`!=` on a plain data object
 // falls back to structural equality, which is sound only when EVERY component is
@@ -4600,5 +4894,9 @@ export function checkProgram(rootIx: i32): i32 {
   // The global scope (depth 0) is never popped, so flush its un-annotated
   // empty-collection bindings here: any still-open hole is genuinely uninferable.
   flushUninferred(0)
+  // Rewrite literal/intersection annotation names into the emitter's
+  // vocabulary (membership was enforced above; the emitter needs only the
+  // runtime representation). Names without those constructs are untouched.
+  canonEmitTypeNames()
   T.diags.length
 }
