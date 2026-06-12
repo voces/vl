@@ -1179,6 +1179,14 @@ function fbRefNullStruct(): i32 {
   wU8(107)           // structref abstract heaptype (0x6b)
   0
 }
+// `ref.null none` (0xd0 0x71) — the bottom null of the `any` hierarchy, the
+// payload slot of a boxed union's `null` tag (the slot is `anyref`; the tag says
+// it is never read).
+function fbRefNullNone(): i32 {
+  wU8(208)           // 0xd0 ref.null
+  wU8(113)           // none abstract heaptype (0x71)
+  0
+}
 // `ref.null <heaptype>` (0xd0 <s33>) — a typed null (a missing map value, etc.).
 function fbRefNull(heapIdx: i32): i32 {
   wU8(208)           // 0xd0 ref.null
@@ -3289,6 +3297,29 @@ let uTags: i32[] = []
 let uBoxIdx: i32 = 0
 let uVarIdx: i32 = 0
 
+// ── VALUE unions (`i32 | null`, `string | i32`, `boolean | i32`, `i32 | f64`) ──
+// A union whose members are scalar/string atoms boxes into the SAME `{tag, anyref}`
+// box (`uBoxIdx`) as a struct union; a SCALAR payload (i32/boolean/i64/f64/f32) is
+// wrapped in a one-field `{ rep }` VALUE BOX behind the `anyref` slot (mirroring
+// `toWasm.ts`'s `valueBoxStruct`, keyed by wasm rep — boolean shares the i32 box);
+// a STRING payload is the `(ref $aTypeIdx)` array itself (already an `anyref`
+// subtype, no inner box). Atom tags are globally stable: `scalarTagOf` assigns each
+// atom KIND a fixed tag ABOVE every struct-variant tag (`uVariants.length + kind`),
+// so a value keeps its identity across sub-union flow and alongside struct unions.
+// (REPRESENTATION NOTE: the host uses a payload-typed box (`{tag, i32}`) when every
+// member shares one scalar rep — the "value" kind. This emitter always routes
+// through the shared `anyref` box + per-rep value box: observably identical, and it
+// reuses the single interned `uBoxIdx` machinery.) The `vb*Used` flags are set when
+// a value union is registered; each used rep interns one box heap type (`vb*Idx`).
+let vbI32Used: boolean = false
+let vbI64Used: boolean = false
+let vbF32Used: boolean = false
+let vbF64Used: boolean = false
+let vbI32Idx: i32 = 0
+let vbI64Idx: i32 = 0
+let vbF32Idx: i32 = 0
+let vbF64Idx: i32 = 0
+
 // ── flat multi-struct field table (union variant structs) ─────────────────────
 // Parallel to `uVariants`: variant struct `i` owns the field names
 // `uFieldNames[uFieldStart[i] .. uFieldStart[i] + uFieldCount[i]]`, all i32, in
@@ -4230,12 +4261,20 @@ function ifChainHasStrOp(ifIx: i32, fnIx: i32): boolean {
     if narrowed { restoreNarrow(savedTop) }
     if hit { return true }
     if s.ifElse >= 0 {
+      // A VALUE union narrows to the COMPLEMENT set in the else-arm (mirroring
+      // `emitStmt`'s else lowering), so `else { print(v) }` with `v` now `string`
+      // is detected as a string print and reserves the scratch frame.
+      let savedElseTop = narrowTop
+      let narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
       let els = P.nodes[s.ifElse]
+      let hitElse = false
       if els is Block {
-        if blockHasStrOp(s.ifElse, fnIx) { return true }
+        hitElse = blockHasStrOp(s.ifElse, fnIx)
       } else if els is IfStmt {
-        if ifChainHasStrOp(s.ifElse, fnIx) { return true }
+        hitElse = ifChainHasStrOp(s.ifElse, fnIx)
       }
+      if narrowedElse { restoreNarrow(savedElseTop) }
+      if hitElse { return true }
     }
   }
   false
@@ -4506,6 +4545,12 @@ function pushFieldStorage(code: i32, refSlot: i32): i32 {
     // (`next: Node|null`) terminate. Forward indices resolve in the shared rec group.
     wU8(99)                    // 0x63 (ref null ht)
     wSLEB(sHeapIdx[refSlot])
+  } else if code == 16 {
+    // A VALUE-UNION field (`y: string | i32`): a non-null ref to the shared
+    // union box — a `null` MEMBER rides the box's tag, never a null field ref.
+    // The box's heap index is a forward reference inside the shared rec group.
+    wU8(100)                   // 0x64 (ref ht)
+    wSLEB(uBoxIdx)
   } else {
     wU8(127)                   // 0x7f i32 storagetype
   }
@@ -4627,7 +4672,14 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
       if scode == 15 {
         pendingStructIdx = structIndexByName(sFieldElemNameAt(si, fi))
       }
-      if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+      // A VALUE-UNION field (code 16) coerces a raw scalar/string/null value into
+      // the box (`{ y: 5 }` against `{ y: string | i32 }` boxes the 5 with its
+      // atom tag); a union-valued field expression passes through unchanged.
+      if scode == 16 {
+        if emitUnionCoerce(body, sFieldElemNameAt(si, fi), valIx, fnIx) < 0 { return 0 - 1 }
+      } else {
+        if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+      }
       if scode == 15 { pendingStructIdx = savedPSI }
       pendingListKind = 0
       fi = fi + 1
@@ -4784,6 +4836,52 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
       }
     }
   }
+  // `x is i32` / `x is string` / … over a BOXED value union: the same box-tag
+  // compare as a struct variant, against the atom's globally-stable scalar tag.
+  let ndv = P.nodes[isIx]
+  if ndv is IsExpr {
+    if valueAtomKind(ndv.isVariant) >= 0 {
+      // A union-typed IDENT receiver pushes its RAW box slot directly — even
+      // when an outer arm has already narrowed it to a single atom (the last
+      // `else if x is boolean` of an exhaustive chain), where the narrowed
+      // Ident read would unbox instead of yielding the box.
+      let vrecv = P.nodes[unwrapParen(ndv.isObj)]
+      if vrecv is Ident {
+        if unionNameOfIdent(vrecv.identName, fnIx) != "" {
+          if emitUnionBoxPush(body, vrecv.identName, fnIx) < 0 { return 0 - 1 }
+          fbStructGet(uBoxIdx, 0)  // 0xfb 0x02 <box ht> field 0: tag
+          fbI32Const(scalarTagOf(ndv.isVariant))
+          fbI32Bin(70)             // 0x46 i32.eq
+          return 0
+        }
+      }
+      // `o.y is i32` over a UNION-typed struct FIELD (code 16): read the field's
+      // box (recovering a nullable receiver first) and compare its tag — the
+      // member-path narrowing's runtime test.
+      if vrecv is Member {
+        if memberUnionFieldName(unwrapParen(ndv.isObj), fnIx) != "" {
+          let msi = structIndexOfExpr(vrecv.memObj, fnIx)
+          let mfi = sFieldIndex(msi, vrecv.memProp)
+          if emitExpr(body, vrecv.memObj, fnIx) < 0 { return 0 - 1 }
+          if exprNullableStruct(vrecv.memObj, fnIx) {
+            wU8(212)               // 0xd4 ref.as_non_null
+          }
+          fbStructGet(sHeapIdx[msi], mfi)  // the field's box
+          fbStructGet(uBoxIdx, 0)          // field 0: tag
+          fbI32Const(scalarTagOf(ndv.isVariant))
+          fbI32Bin(70)             // 0x46 i32.eq
+          return 0
+        }
+      }
+      if exprUnion(ndv.isObj, fnIx) {
+        if emitExpr(body, ndv.isObj, fnIx) < 0 { return 0 - 1 }
+        fbStructGet(uBoxIdx, 0)  // 0xfb 0x02 <box ht> field 0: tag
+        fbI32Const(scalarTagOf(ndv.isVariant))
+        fbI32Bin(70)             // 0x46 i32.eq
+        return 0
+      }
+    }
+  }
   if !uDeclared {
     return emitFail("emitProgram: `is` test but no union type declared")
   }
@@ -4835,6 +4933,117 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected a field access")
 }
 
+// Push the RAW union box ref of the binding `name` (a local/param or a module
+// global) — bypassing the narrowed-unbox Ident path, so a tag read works even
+// while the binding is narrowed to a single atom (its slot still holds the box;
+// narrowing is type-level only).
+function emitUnionBoxPush(body: i32[], name: string, fnIx: i32): i32 {
+  let idx = localIndexOf(fnIx, name)
+  if idx >= 0 {
+    fbLocalGet(idx)
+  } else {
+    let gIdx = globalIndexOf(name)
+    if gIdx < 0 {
+      return emitFail("emitProgram: narrowed union binding is not a local or global")
+    }
+    fbGlobalGet(gIdx)
+    // A non-const global box rides in a NULLABLE cell (start-fn initialized);
+    // recover the non-null box ref (same as the plain Ident global read).
+    if globalNameIsNonConst(name) {
+      wU8(212)               // 0xd4 ref.as_non_null
+    }
+  }
+  0
+}
+
+// Lower a narrowed VALUE-union ident read `name` (active narrowing = the single
+// scalar atom `atom`): push the box (a local/param or a module global), then
+// `struct.get $box 1` (the `anyref` payload) and recover the atom's rep — a
+// `ref.cast (ref $aTypeIdx)` for a string payload (stored unboxed), or a
+// `ref.cast (ref $vb)` + `struct.get $vb 0` for a scalar in its value box.
+function emitValueUnionUnboxRead(body: i32[], name: string, atom: string, fnIx: i32): i32 {
+  if emitUnionBoxPush(body, name, fnIx) < 0 { return 0 - 1 }
+  fbStructGet(uBoxIdx, 1)    // 0xfb 0x02 <box ht> field 1: value (anyref)
+  if atom == "string" {
+    fbRefCast(aTypeIdx)      // the payload IS the string array ref
+    return 0
+  }
+  let vb = vbHeapIdxOfAtom(atom)
+  if vb < 0 {
+    return emitFail("emitProgram: narrowed union atom has no value box")
+  }
+  fbRefCast(vb)              // 0xfb 0x16 <value box>
+  fbStructGet(vb, 0)         // the scalar payload
+  0
+}
+
+// Lower the expression at `exprIx` COERCED into the boxed union `unionName`'s
+// representation (the host's `coerceToUnion` at a flow boundary — a binding init,
+// an assignment, an argument, a return). Pass-through when the value already IS
+// the box (a union-typed ident / call, including a sub-union narrowing); a bare
+// `null` boxes as the null tag with a `ref.null` payload (any boxed union — a
+// value union OR a struct union with a `null` member); a raw scalar/string boxes
+// as its atom's tag + payload. A struct union's object literal falls through to
+// the normal lowering (`emitUnionBox` boxes it via the `uDeclared` path).
+function emitUnionCoerce(body: i32[], unionName: string, exprIx: i32, fnIx: i32): i32 {
+  if exprUnion(exprIx, fnIx) {
+    return emitExpr(body, exprIx, fnIx)
+  }
+  let bare = P.nodes[unwrapParen(exprIx)]
+  if bare is NullLit {
+    fbI32Const(scalarTagOf("null"))
+    fbRefNullNone()          // the payload slot is unread under the null tag
+    fbStructNew(uBoxIdx)
+    return 0
+  }
+  if unionName == "" || !isValueUnionName(unionName) {
+    return emitExpr(body, exprIx, fnIx)
+  }
+  // Classify the value's atom. Order mirrors the print-import ladder (f32 before
+  // f64 — a float literal classifies f64 too; string/bool/i64 are disjoint). The
+  // default is i32 unless the union has no `i32` member but does have `i64` (an
+  // integer flowing into `i64 | …`), or the literal exceeds the i32 range.
+  let atom = "i32"
+  if exprString(exprIx, fnIx) {
+    atom = "string"
+  } else if exprIsF32(exprIx, fnIx) {
+    atom = "f32"
+  } else if exprIsF64(exprIx, fnIx) {
+    atom = "f64"
+  } else if exprIsI64(exprIx, fnIx) {
+    atom = "i64"
+  } else if exprIsBool(exprIx, fnIx) {
+    atom = "boolean"
+  } else {
+    if !unionHasAtom(unionName, "i32") && unionHasAtom(unionName, "i64") { atom = "i64" }
+    if bare is NumLit {
+      if !numLexFitsI32(bare.numText) { atom = "i64" }
+    }
+  }
+  fbI32Const(scalarTagOf(atom))
+  if atom == "i64" {
+    if emitExprAsI64(body, exprIx, fnIx) < 0 { return 0 - 1 }
+  } else if atom == "f64" {
+    if emitExprAsF64(body, exprIx, fnIx) < 0 { return 0 - 1 }
+  } else if atom == "f32" {
+    let savedF32 = pendingF32
+    pendingF32 = true
+    if emitExprAsF32(body, exprIx, fnIx) < 0 { return 0 - 1 }
+    pendingF32 = savedF32
+  } else {
+    if emitExpr(body, exprIx, fnIx) < 0 { return 0 - 1 }
+  }
+  if atom != "string" {
+    let vb = vbHeapIdxOfAtom(atom)
+    if vb < 0 {
+      return emitFail("emitProgram: union atom has no value box")
+    }
+    fbStructNew(vb)          // wrap the scalar payload
+  }
+  fbStructNew(uBoxIdx)       // { tag, payload }
+  0
+}
+
 // True if the member access at `memIx` reads a field of a CURRENTLY-narrowed union
 // identifier (the receiver `Ident` has an active binding on the narrowing stack).
 function memIsNarrowed(memIx: i32): boolean {
@@ -4865,6 +5074,34 @@ function memNarrowVariantIndex(memIx: i32): i32 {
 
 // Lower a field read `recv.field` onto `body`: evaluate the receiver (must be a
 // struct), then `struct.get $0 <fieldidx>` (`0xfb 0x02 0x00 idx`).
+// The narrowing-stack KEY of a one-level member path (`o.y` over a plain Ident
+// receiver) — the same string `setNarrowFromCond` pushes for a union-FIELD
+// `is`/null guard. "" for any other receiver shape (no path narrowing).
+function memberPathKeyOf(memIx: i32): string {
+  let m = P.nodes[memIx]
+  if m is Member {
+    let r = P.nodes[unwrapParen(m.memObj)]
+    if r is Ident { return r.identName + "." + m.memProp }
+  }
+  ""
+}
+
+// The VALUE-union name of a union-typed struct FIELD read `o.y` (field code 16),
+// or "" when the member is not a union-box field.
+function memberUnionFieldName(memIx: i32, fnIx: i32): string {
+  let m = P.nodes[memIx]
+  if m is Member {
+    let si = structIndexOfExpr(m.memObj, fnIx)
+    if si >= 0 {
+      let fi = sFieldIndex(si, m.memProp)
+      if fi >= 0 {
+        if sFieldTypeAt(si, fi) == 16 { return sFieldElemNameAt(si, fi) }
+      }
+    }
+  }
+  ""
+}
+
 function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   // A field read on a NARROWED union identifier downcasts through the box (G1).
   if memIsNarrowed(memIx) {
@@ -4908,6 +5145,26 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
       wU8(212)               // 0xd4 ref.as_non_null
     }
     fbStructGet(sHeapIdx[si], idx)   // 0xfb 0x02 <struct ht> <field index>
+    // A UNION-typed field (code 16) read while the member PATH is narrowed to one
+    // scalar atom (`if o.y is i32 { … o.y … }`) unboxes the payload — the same
+    // recovery as a narrowed union IDENT read. An un-narrowed read is the box.
+    if sFieldTypeAt(si, idx) == 16 {
+      let mAtom = narrowVariantFor(memberPathKeyOf(memIx))
+      let mk = valueAtomKind(mAtom)
+      if mk >= 0 && mk != 6 {
+        fbStructGet(uBoxIdx, 1)      // field 1: value (anyref)
+        if mAtom == "string" {
+          fbRefCast(aTypeIdx)        // the payload IS the string array ref
+        } else {
+          let mvb = vbHeapIdxOfAtom(mAtom)
+          if mvb < 0 {
+            return emitFail("emitProgram: narrowed union field atom has no value box")
+          }
+          fbRefCast(mvb)
+          fbStructGet(mvb, 0)        // the scalar payload
+        }
+      }
+    }
     return 0
   }
   emitFail("emitProgram: expected a field access")
@@ -7594,6 +7851,15 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // a capture shadows nothing (it is neither a param/local of this function nor a
     // global). Only fires inside a capturing lifted function.
     if emitCapturedRead(body, e.identName, fnIx) == 1 { return 0 }
+    // A VALUE-union binding narrowed to ONE scalar atom reads UNBOXED: push the
+    // box, recover the `anyref` payload, cast it, and (for a scalar atom) read
+    // the value-box field — `if u is i32 { print(u) }` yields the raw i32.
+    let vAtom = narrowedValueAtomOf(e.identName)
+    if vAtom != "" {
+      if unionNameOfIdent(e.identName, fnIx) != "" {
+        return emitValueUnionUnboxRead(body, e.identName, vAtom, fnIx)
+      }
+    }
     // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
     let idx = localIndexOf(fnIx, e.identName)
     if idx < 0 {
@@ -7931,6 +8197,48 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
           wU8(27)                // 0x1b select → d if null else x
           return 0
         }
+        // `x ?? d` over a BOXED value union containing `null` (`i32 | null`):
+        // the value-level dual of the null guard — read the box tag; the null
+        // tag selects the default, anything else unboxes the SINGLE remaining
+        // scalar atom (the host's `??` result is the non-null base type). The
+        // receiver is a pure name, re-read in the non-null arm. Scalar atoms
+        // only (the value-typed `if` blocktype carries the unboxed rep).
+        let cunm = unionNameOfIdent(lhs.identName, fnIx)
+        if cunm != "" {
+          if isValueUnionName(cunm) && unionHasAtom(cunm, "null") {
+            let crest = removeAtomFrom(currentNarrowSetOf(lhs.identName, fnIx), "null")
+            let cak = valueAtomKind(crest)
+            if cak >= 0 && cak != 6 {
+              if cak == 2 {
+                return emitFail("emitProgram: `??` over a string|null union is not supported yet")
+              }
+              if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 } // the box
+              fbStructGet(uBoxIdx, 0)                // field 0: tag
+              fbI32Const(scalarTagOf("null"))
+              fbI32Bin(70)                           // 0x46 i32.eq → null?
+              let cbt = 127                          // 0x7f i32 (boolean shares it)
+              if cak == 3 { cbt = 126 }              // 0x7e i64
+              if cak == 4 { cbt = 124 }              // 0x7c f64
+              if cak == 5 { cbt = 125 }              // 0x7d f32
+              fbIf(cbt)                              // 0x04 if, value blocktype
+              ctrlEnter()
+              if cak == 3 {
+                if emitExprAsI64(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              } else if cak == 4 {
+                if emitExprAsF64(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              } else if cak == 5 {
+                if emitExprAsF32(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              } else {
+                if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              }
+              fbElse()                               // 0x05 else — present → unbox
+              if emitValueUnionUnboxRead(body, lhs.identName, crest, fnIx) < 0 { return 0 - 1 }
+              fbEnd()                                // 0x0b end
+              ctrlLeave()
+              return 0
+            }
+          }
+        }
       }
       // The null-safe field read `m[k]?.f ?? d` over a STRUCT-VALUED map is the
       // FUSED form: probe; on a hit read the field off the (non-null) value
@@ -8113,6 +8421,21 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
         if exprNulBool(nref, fnIx) {
           if emitExpr(body, nref, fnIx) < 0 { return 0 - 1 }
           fbI32Const(2)
+          if e.binOp == "!=" {
+            fbI32Bin(71)     // 0x47 i32.ne
+          } else {
+            fbI32Bin(70)     // 0x46 i32.eq
+          }
+          return 0
+        }
+        // `x == null` / `x != null` over a BOXED union (`i32 | null`,
+        // `A | B | null`): the box itself is never null — the null VARIANT rides
+        // in the TAG — so compare the box tag against the global null tag (the
+        // host's `variantTag(info, null)` path), never `ref.is_null`.
+        if exprUnion(nref, fnIx) {
+          if emitExpr(body, nref, fnIx) < 0 { return 0 - 1 }
+          fbStructGet(uBoxIdx, 0)              // box field 0: tag
+          fbI32Const(scalarTagOf("null"))
           if e.binOp == "!=" {
             fbI32Bin(71)     // 0x47 i32.ne
           } else {
@@ -8348,6 +8671,10 @@ function exprIsI64(exprIx: i32, fnIx: i32): boolean {
     return !numLexFitsI32(e.numText)
   }
   if e is Ident {
+    // A VALUE-union ident classifies by its narrowed atom (the read unboxes to
+    // that rep); an un-narrowed union ident is the box, never a scalar.
+    let uk = unionIdentReadKind(exprIx, fnIx)
+    if uk != 0 - 3 { return uk == 3 }
     if paramIsI64(fnIx, e.identName) { return true }
     if declaredI64(e.identName) { return true }
     return globalIsI64(e.identName)
@@ -8444,6 +8771,9 @@ function exprIsF32(exprIx: i32, fnIx: i32): boolean {
   let e = P.nodes[exprIx]
   if e is Paren { return exprIsF32(e.parInner, fnIx) }
   if e is Ident {
+    // A VALUE-union ident classifies by its narrowed atom (see exprIsI64).
+    let uk = unionIdentReadKind(exprIx, fnIx)
+    if uk != 0 - 3 { return uk == 5 }
     if paramIsF32(fnIx, e.identName) { return true }
     if declaredF32(e.identName) { return true }
     return globalIsF32(e.identName)
@@ -8555,6 +8885,9 @@ function exprIsF64(exprIx: i32, fnIx: i32): boolean {
   // `__print_f64__` and participates in f64 arithmetic.
   if e is Index { return exprF64Array(e.idxArr, fnIx) }
   if e is Ident {
+    // A VALUE-union ident classifies by its narrowed atom (see exprIsI64).
+    let uk = unionIdentReadKind(exprIx, fnIx)
+    if uk != 0 - 3 { return uk == 4 }
     if paramIsF64(fnIx, e.identName) { return true }
     if declaredF64(e.identName) { return true }
     return globalIsF64(e.identName)
@@ -8627,6 +8960,10 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
     return e.unOp == "!"
   }
   if e is Ident {
+    // A VALUE-union ident narrowed to `boolean` unboxes to the bool rep and
+    // prints true/false (see exprIsI64 for the classification rule).
+    let uk = unionIdentReadKind(ix, fnIx)
+    if uk != 0 - 3 { return uk == 1 }
     // A `boolean|null` NICHE binding read (narrowed non-null in its branch)
     // prints true/false. Plain `boolean` idents stay unclassified (existing rule).
     if exprNulBool(ix, fnIx) { return true }
@@ -8904,6 +9241,11 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         // A NON-NULL struct param position (kind 1, `(ref $S)`): a nullable-REP
         // argument needs `ref.as_non_null` at the boundary (see below).
         let cParamStruct = false
+        // A UNION-typed param position (kind 4): the callee wants the box, so a raw
+        // scalar/string/null argument is COERCED into the union representation
+        // (`emitUnionCoerce` — the host's call-boundary `coerceUnion`). The param's
+        // union NAME carries the atom set for the tag choice.
+        let cUNm = ""
         if cFn is FuncDecl {
           let cParams = cFn.fnParams
           if i < cParams.length {
@@ -8913,6 +9255,10 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
             if vtKindOfParam(cParams[i]) == 1 { cParamStruct = true }
             if vtKindOfParam(cParams[i]) == 8 {
               cVi = paramStructIdxOf(cParams[i])
+            }
+            if vtKindOfParam(cParams[i]) == 4 {
+              let cp4 = P.nodes[cParams[i]]
+              if cp4 is Param { cUNm = tyNameOf(cp4.parType) }
             }
             // A ref-array param position (`take(xs: B[])`): seed the list context from the
             // param's annotation so a non-empty `B[]` LITERAL argument builds the param's
@@ -8957,17 +9303,21 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
           pendingI64 = false
           i = i + 1
         } else {
-        if emitExpr(body, args[i], fnIx) < 0 { return 0 - 1 }
-        // A nullable-REP value (a null-narrowed `S | null` param/local, or a
-        // recursive `S | null` field read whose wasm slot stays `(ref null $S)`)
-        // flowing into a NON-NULL `(ref $S)` param: recover the non-null ref at
-        // the call boundary. The checker proved the value non-null on this path
-        // (the call sits under its null guard), so the cast never traps —
-        // narrowing is type-level only and the stack value keeps the nullable
-        // rep, which a `(ref $S)` param does not accept.
-        if cParamStruct {
-          if exprNullableStruct(args[i], fnIx) {
-            fbRefAsNonNull()   // 0xd4
+        if cUNm != "" {
+          if emitUnionCoerce(body, cUNm, args[i], fnIx) < 0 { return 0 - 1 }
+        } else {
+          if emitExpr(body, args[i], fnIx) < 0 { return 0 - 1 }
+          // A nullable-REP value (a null-narrowed `S | null` param/local, or a
+          // recursive `S | null` field read whose wasm slot stays `(ref null $S)`)
+          // flowing into a NON-NULL `(ref $S)` param: recover the non-null ref at
+          // the call boundary. The checker proved the value non-null on this path
+          // (the call sits under its null guard), so the cast never traps —
+          // narrowing is type-level only and the stack value keeps the nullable
+          // rep, which a `(ref $S)` param does not accept.
+          if cParamStruct {
+            if exprNullableStruct(args[i], fnIx) {
+              fbRefAsNonNull()   // 0xd4
+            }
           }
         }
         if cVi >= 0 {
@@ -9066,7 +9416,14 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
           if globalCellKind(gLet) == 1 { pendingStructIdx = globalCellStructIdx(gLet) }
           pendingListKind = letAnnRefListKind(gLet)
           pendingListSlot = letAnnRefListSlot(gLet)
-          if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+          // A UNION-typed global (kind 4) coerces a raw assigned value into the
+          // box (`w = 5` over `let w: string | i32` boxes the 5).
+          let gUNm = letUnionNameOf(gLet, 0 - 1)
+          if gUNm != "" {
+            if emitUnionCoerce(body, gUNm, a.binRight, fnIx) < 0 { return 0 - 1 }
+          } else {
+            if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+          }
           pendingListKind = 0
           pendingListSlot = 0
           fbGlobalSet(gIdx)    // 0x24 global.set
@@ -9074,8 +9431,15 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32): i32 {
         }
         return emitFail("emitProgram: assignment target is not a parameter, local, or global")
       }
-      // Value first, then store it into the local's slot.
-      if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+      // A UNION-typed local (kind 4) coerces a raw assigned value into the box
+      // (`u = 3.5` over `let u: i32 | f64` boxes the f64); a union-valued RHS
+      // passes through unchanged. Value first, then store it into the slot.
+      let aUNm = unionNameOfIdent(target.identName, fnIx)
+      if aUNm != "" {
+        if emitUnionCoerce(body, aUNm, a.binRight, fnIx) < 0 { return 0 - 1 }
+      } else {
+        if emitExpr(body, a.binRight, fnIx) < 0 { return 0 - 1 }
+      }
       fbLocalSet(idx)        // 0x21 local.set
       return 0
     }
@@ -10094,6 +10458,115 @@ function setNarrowFromCond(condIx: i32, fnIx: i32): boolean {
         return true
       }
     }
+    // `o.y is T` over a UNION-typed struct FIELD narrows the member PATH (the
+    // narrowing key is the path string `o.y`; `emitMem` unboxes under it).
+    let mrecv = P.nodes[unwrapParen(c.isObj)]
+    if mrecv is Member {
+      if memberUnionFieldName(unwrapParen(c.isObj), fnIx) != "" {
+        let mk = memberPathKeyOf(unwrapParen(c.isObj))
+        if mk != "" {
+          pushNarrow(mk, c.isVariant)
+          return true
+        }
+      }
+    }
+  }
+  // `a && b` composes: the then-branch sees BOTH conjuncts' narrowings (the
+  // host's A5 — the RHS is even CHECKED under the LHS's narrowing). The pushes
+  // stack; the caller's save/restore of `narrowTop` unwinds them together.
+  if c is BinExpr {
+    if c.binOp == "&&" {
+      let nl = setNarrowFromCond(c.binLeft, fnIx)
+      let nr = setNarrowFromCond(c.binRight, fnIx)
+      return nl || nr
+    }
+  }
+  // `x == null` / `x != null` over a BOXED VALUE union narrows the THEN-branch:
+  // `==` pins `x` to the `null` member; `!=` strips `null` from the current set
+  // (so `i32 | null` fully unboxes to `i32` in the non-null branch).
+  let nm = valueUnionNullCmpName(condIx, fnIx)
+  if nm != "" {
+    let cn = P.nodes[condIx]
+    if cn is BinExpr {
+      if cn.binOp == "==" {
+        pushNarrow(nm, "null")
+        return true
+      }
+      let rest = removeAtomFrom(currentNarrowSetOf(nm, fnIx), "null")
+      if rest != "" {
+        pushNarrow(nm, rest)
+        return true
+      }
+    }
+  }
+  false
+}
+
+// The receiver NAME when the condition at `condIx` is `<ident> == null` /
+// `<ident> != null` over a boxed VALUE union, else "". (A struct union / niche
+// nullable keeps its existing lowering and narrowing behavior.)
+function valueUnionNullCmpName(condIx: i32, fnIx: i32): string {
+  let c = P.nodes[condIx]
+  if c is BinExpr {
+    if c.binOp == "==" || c.binOp == "!=" {
+      let lhs = P.nodes[unwrapParen(c.binLeft)]
+      let rhs = P.nodes[unwrapParen(c.binRight)]
+      let refIx = 0 - 1
+      if rhs is NullLit { refIx = unwrapParen(c.binLeft) }
+      if lhs is NullLit { refIx = unwrapParen(c.binRight) }
+      if refIx >= 0 {
+        let r = P.nodes[refIx]
+        if r is Ident {
+          let un = unionNameOfIdent(r.identName, fnIx)
+          if un != "" {
+            if isValueUnionName(un) { return r.identName }
+          }
+        }
+      }
+    }
+  }
+  ""
+}
+
+// The ELSE-branch dual of `setNarrowFromCond`, for VALUE unions only: the guard
+// was FALSE there, so `is T` strips `T` from the current set (a 2-member union
+// fully discriminates — `string | i32` minus `i32` is `string`, which unboxes),
+// `== null` strips `null`, and `!= null` pins `null`. Struct unions keep their
+// existing (no else-narrowing) behavior — their member reads must not change.
+function setNarrowFromCondElse(condIx: i32, fnIx: i32): boolean {
+  let c = P.nodes[condIx]
+  if c is IsExpr {
+    if valueAtomKind(c.isVariant) >= 0 {
+      let recv = P.nodes[unwrapParen(c.isObj)]
+      if recv is Ident {
+        let un = unionNameOfIdent(recv.identName, fnIx)
+        if un != "" {
+          if isValueUnionName(un) {
+            let rest = removeAtomFrom(currentNarrowSetOf(recv.identName, fnIx), c.isVariant)
+            if rest != "" {
+              pushNarrow(recv.identName, rest)
+              return true
+            }
+          }
+        }
+      }
+    }
+    return false
+  }
+  let nm = valueUnionNullCmpName(condIx, fnIx)
+  if nm != "" {
+    let cn = P.nodes[condIx]
+    if cn is BinExpr {
+      if cn.binOp == "!=" {
+        pushNarrow(nm, "null")
+        return true
+      }
+      let rest = removeAtomFrom(currentNarrowSetOf(nm, fnIx), "null")
+      if rest != "" {
+        pushNarrow(nm, rest)
+        return true
+      }
+    }
   }
   false
 }
@@ -10394,7 +10867,17 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     // coerces a narrower init value (the lattice convert is inserted by the `emitExprAs*`
     // helpers — i32/i64/f32→f64, i32→f32, i32→i64). A float/integer literal re-encodes in
     // place via `pendingF32`/`pendingI64`. An i32-only binding stays byte-identical.
-    if letIsF32(stmtIx) {
+    // A UNION-annotated binding (kind 4) coerces a raw init value into the box
+    // (`let u: boolean | i32 = 5` boxes the 5 with its atom tag); an already-union
+    // init (a union-returning call) and a struct-union object literal pass through
+    // `emitUnionCoerce` unchanged.
+    let letUNm = ""
+    let letAnnNm = ""
+    if s.letType >= 0 { letAnnNm = tyNameOf(s.letType) }
+    if isUName(letAnnNm) { letUNm = letAnnNm }
+    if letUNm != "" {
+      if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return 0 - 1 }
+    } else if letIsF32(stmtIx) {
       let savedF32 = pendingF32
       pendingF32 = true
       if emitExprAsF32(body, s.letInit, fnIx) < 0 { return 0 - 1 }
@@ -10550,10 +11033,15 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     let retF32 = false
     let retF64 = false
     let retI64 = false
+    // A UNION return type (kind 4) WIDENS a raw scalar/string/null return value
+    // into the box at the return boundary (the host's return-site `coerceUnion`):
+    // `function wrap(n): string | i32 { return n }` boxes `n` with its atom tag.
+    let retUNm = ""
     if fn is FuncDecl {
       if retF32Flag(fn.fnRet) == 1 { retF32 = true }
       if retF64Flag(fn.fnRet) == 1 { retF64 = true }
       if retI64Flag(fn.fnRet) == 1 { retI64 = true }
+      if retUnionFlag(fn.fnRet) == 1 { retUNm = tyNameOf(fn.fnRet) }
     }
     // Push the return value, then the `return` instruction.
     if retF32 {
@@ -10565,6 +11053,8 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       if emitExprAsF64(body, s.retArg, fnIx) < 0 { return 0 - 1 }
     } else if retI64 {
       if emitExprAsI64(body, s.retArg, fnIx) < 0 { return 0 - 1 }
+    } else if retUNm != "" {
+      if emitUnionCoerce(body, retUNm, s.retArg, fnIx) < 0 { return 0 - 1 }
     } else {
       if emitExpr(body, s.retArg, fnIx) < 0 { return 0 - 1 }
     }
@@ -10596,13 +11086,19 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     if s.ifElse >= 0 {
       fbElse()               // 0x05 else
       // The else may be a Block or a nested IfStmt (`else if`); both go through
-      // `emitStmt` (a lone statement) — a Block re-enters `emitStmts`. The narrowing
-      // does NOT hold in the else-branch (the guard was false there).
+      // `emitStmt` (a lone statement) — a Block re-enters `emitStmts`. The then
+      // narrowing does NOT hold in the else-branch (the guard was false there);
+      // a VALUE union narrows to the COMPLEMENT set instead (`is T` removes `T`).
+      let savedElseTop = narrowTop
+      let narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
       let els = P.nodes[s.ifElse]
       if els is Block {
         if emitStmts(body, s.ifElse, fnIx) < 0 { return 0 - 1 }
       } else {
         if emitStmt(body, s.ifElse, fnIx) < 0 { return 0 - 1 }
+      }
+      if narrowedElse {
+        restoreNarrow(savedElseTop)
       }
     }
     fbEnd()                  // 0x0b end
@@ -11137,12 +11633,18 @@ function emitIfTail(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     }
     if s.ifElse >= 0 {
       fbElse()               // 0x05 else
+      // A VALUE union narrows to the COMPLEMENT set in the else-arm (see emitStmt).
+      let savedElseTop = narrowTop
+      let narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
       let els = P.nodes[s.ifElse]
       if els is Block {
         if emitStmtsTail(body, s.ifElse, fnIx) < 0 { return 0 - 1 }
       } else {
         // `else if`: a lone nested IfStmt, still in tail position.
         if emitStmtTail(body, s.ifElse, fnIx) < 0 { return 0 - 1 }
+      }
+      if narrowedElse {
+        restoreNarrow(savedElseTop)
       }
     }
     fbEnd()                  // 0x0b end
@@ -11636,10 +12138,16 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
 // "S|null" / "null|S" (exactly TWO `|` parts, one of them `null`) → the non-null
 // part's name, or "" when the name is not a two-part nullable.
 function nullablePartOf(name: string): string {
+  // Depth-aware: a `|` INSIDE an inline shape (`{y:string|i32}|null`) is part of
+  // the FIELD's union, not the nullable wrapper — only a depth-0 bar splits.
   let bar = 0 - 1
+  let depth = 0
   let i = 0
   while i < name.length {
-    if name[i] == '|' {
+    let ch = name[i]
+    if ch == '{' || ch == '[' { depth = depth + 1 }
+    if ch == '}' || ch == ']' { depth = depth - 1 }
+    if ch == '|' && depth == 0 {
       if bar < 0 { bar = i }
     }
     i = i + 1
@@ -12244,6 +12752,11 @@ function globalCellKind(letIx: i32): i32 {
       if letIsStringArray(letIx, 0 - 1) { return 7 }
       if letIsRefArray(letIx, 0 - 1) { return 5 }
       if letIsF64Array(letIx, 0 - 1) { return 12 }
+      // A UNION-annotated global cell is the box ref (kind 4), exactly as
+      // `buildLocals` classifies a union local — BEFORE the struct/string cases
+      // (a `string | i32` annotation is neither). `S | null` / `boolean | null`
+      // never register as union names (they keep their niche kinds above).
+      if letIsUnion(letIx, 0 - 1) { return 4 }
       if letIsStruct(letIx, 0 - 1) { return 1 }
       if letIsArray(letIx, 0 - 1) { return 2 }
       if letIsString(letIx, 0 - 1) { return 3 }
@@ -12256,6 +12769,9 @@ function globalCellKind(letIx: i32): i32 {
     // out of scope (no annotation to derive from) and `globalKind` returns its best guess.
     // An empty `[]` whose PUSHES infer a string element is the string list (kind 7).
     if letInfStrListByUse(letIx) { return 7 }
+    // An un-annotated global whose init PRODUCES a union (`const a = make(42)` with
+    // a union-returning `make`) carries the box (kind 4), as a local would.
+    if letIsUnion(letIx, 0 - 1) { return 4 }
     return globalKind(d.letInit)
   }
   0
@@ -12510,7 +13026,14 @@ function mAssignTypeIndices(n: i32): i32 {
   let oldUnionOffset = 0
   let oldUVarIdx = structOffset
   let oldUBoxIdx = structOffset + uVariants.length
-  if uDeclared { oldUnionOffset = uVariants.length + 1 }
+  // The per-rep VALUE BOXES (value unions) land right after the union box; every
+  // later offset formula shifts by however many are interned.
+  let vbTotal = 0
+  if vbI32Used { vbTotal = vbTotal + 1 }
+  if vbI64Used { vbTotal = vbTotal + 1 }
+  if vbF32Used { vbTotal = vbTotal + 1 }
+  if vbF64Used { vbTotal = vbTotal + 1 }
+  if uDeclared { oldUnionOffset = uVariants.length + 1 + vbTotal }
   let preTypes = structOffset + oldUnionOffset
   let arrayOffset = 0
   if aUsed { arrayOffset = 1 }
@@ -12546,6 +13069,12 @@ function mAssignTypeIndices(n: i32): i32 {
     }
     uBoxIdx = mAllocType()
     if mAssertIdx(uBoxIdx, oldUBoxIdx, "uBoxIdx") < 0 { return 0 - 1 }
+    // The per-rep VALUE BOXES (`{ i32 }` / `{ i64 }` / `{ f32 }` / `{ f64 }`),
+    // in this fixed rep order — only the reps a registered value union uses.
+    if vbI32Used { vbI32Idx = mAllocType() }
+    if vbI64Used { vbI64Idx = mAllocType() }
+    if vbF32Used { vbF32Idx = mAllocType() }
+    if vbF64Used { vbF64Idx = mAllocType() }
   }
   // The raw i32 array (string rep + list/map backing), then the i32-list wrapper.
   if aUsed {
@@ -12773,11 +13302,21 @@ function startScanIf(ifIx: i32): i32 {
     if exprHasMemberPopKind(st.ifCond, 0 - 1, 1) { fnUsesRefPush = true }
     if exprHasMemberPopKind(st.ifCond, 0 - 1, 2) { fnUsesStrPush = true }
     if exprHasMemberPopKind(st.ifCond, 0 - 1, 3) { fnUsesF64Push = true }
+    // Narrow across each arm (mirroring `ifChainHasStrOp` / `emitStmt`): the
+    // then-branch sees the guard's narrowing, the else-branch sees a VALUE
+    // union's complement — so a top-level `if w is string { print(w) }`
+    // reserves the string scratch frame in the start function.
+    let savedTop = narrowTop
+    let narrowed = setNarrowFromCond(st.ifCond, 0 - 1)
     startScanBlock(st.ifThen)
+    if narrowed { restoreNarrow(savedTop) }
     if st.ifElse >= 0 {
+      let savedElseTop = narrowTop
+      let narrowedElse = setNarrowFromCondElse(st.ifCond, 0 - 1)
       let els = P.nodes[st.ifElse]
       if els is Block { startScanBlock(st.ifElse) }
       if els is IfStmt { startScanIf(st.ifElse) }
+      if narrowedElse { restoreNarrow(savedElseTop) }
     }
   }
   0
@@ -12985,7 +13524,16 @@ function emitStartFnCode(out: i32[]): i32 {
             if gck == 6 { pendingMapSlot = letMapShapeOf(globalStmts[gi], 0 - 1) }
             // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2.
             pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
-            if emitExpr(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+            // A UNION cell (kind 4) coerces a raw init value into the box
+            // (`let w: string | i32 = n` boxes the i32 read) — a union-valued
+            // init (a union-returning call) passes through unchanged.
+            let gun = ""
+            if gck == 4 { gun = letUnionNameOf(globalStmts[gi], 0 - 1) }
+            if gun != "" {
+              if emitUnionCoerce(bodyExpr, gun, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+            } else {
+              if emitExpr(bodyExpr, g.letInit, 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+            }
             pendingNulBool = false
             pendingMapSlot = 0 - 1
           }
@@ -13242,6 +13790,34 @@ function emitModule(stmts: i32[]): i32 {
     wU8(0)                       // immutable
     wU8(110)                     // field 1 value: 0x6e anyref
     wU8(0)                       // immutable
+    // The per-rep VALUE BOXES — each a one-field immutable struct `{ rep }` that
+    // carries a scalar value-union payload behind the box's `anyref` slot
+    // (mirroring `toWasm.ts`'s `valueBoxStruct`). Emitted in the SAME fixed order
+    // `mAssignTypeIndices` interned them (i32, i64, f32, f64).
+    if vbI32Used {
+      wU8(95)                    // 0x5f struct (i32 value box — boolean shares it)
+      wU8(1)
+      wU8(127)                   // 0x7f i32
+      wU8(0)                     // immutable
+    }
+    if vbI64Used {
+      wU8(95)                    // 0x5f struct (i64 value box)
+      wU8(1)
+      wU8(126)                   // 0x7e i64
+      wU8(0)                     // immutable
+    }
+    if vbF32Used {
+      wU8(95)                    // 0x5f struct (f32 value box)
+      wU8(1)
+      wU8(125)                   // 0x7d f32
+      wU8(0)                     // immutable
+    }
+    if vbF64Used {
+      wU8(95)                    // 0x5f struct (f64 value box)
+      wU8(1)
+      wU8(124)                   // 0x7c f64
+      wU8(0)                     // immutable
+    }
   }
   if aUsed {
     wU8(94)                      // 0x5e array
@@ -13728,7 +14304,16 @@ function emitModule(stmts: i32[]): i32 {
           pendingI64 = (gck == 10)
           pendingF32 = (gck == 13)
           pendingF64 = (gck == 11)
-          if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
+          // A UNION cell (kind 4) with a CONST init boxes it in the constexpr —
+          // `struct.new` / `array.new_fixed` / `i32.const` are all constant in
+          // WasmGC, so `let w: string | i32 = "a"` builds the box inline.
+          let gun2 = ""
+          if gck == 4 { gun2 = letUnionNameOf(globalStmts[gi], 0 - 1) }
+          if gun2 != "" {
+            if emitUnionCoerce(globalPayload, gun2, g.letInit, 0 - 1) < 0 { return 0 - 1 }
+          } else {
+            if emitExpr(globalPayload, g.letInit, 0 - 1) < 0 { return 0 - 1 }   // init constexpr
+          }
           pendingI64 = false
           pendingF32 = false
           pendingF64 = false
@@ -14427,6 +15012,11 @@ function nameFieldCode(t: string): i32 {
     if nameIsStringArray(t) { return 6 }
     return 5
   }
+  // A VALUE-union field (`y: string | i32`) stores the union BOX ref (code 16);
+  // its union name rides `sFieldElemName` (the tag set + value-box reps).
+  // Checked before the nullable-struct strip (`i32|null` is a value union, not
+  // a nullable struct name).
+  if isValueUnionName(t) { return 16 }
   let base = t
   let nb = nullablePartOf(base)
   if nb != "" { base = nb }
@@ -14457,9 +15047,12 @@ function collectAnnShapes(): i32 {
       if nm.length >= 2 {
         if nm[0] == '{' && nm[1] != '[' && nm[nm.length - 1] == '}' {
           let inner = nm.slice(1, nm.length - 1)
-          // Split `x:i32,y:string` into names + codes at depth 0.
+          // Split `x:i32,y:string` into names + codes at depth 0. `texts` keeps
+          // each field's raw type TEXT (a code-16 union field interns its union
+          // and records the name in `sFieldElemName`).
           let names: string[] = []
           let codes: i32[] = []
+          let texts: string[] = []
           let ok = true
           let depth = 0
           let start = 0
@@ -14481,10 +15074,12 @@ function collectAnnShapes(): i32 {
               if ci <= 0 {
                 ok = false
               } else {
-                let fc = nameFieldCode(part.slice(ci + 1, part.length))
+                let ftxt = part.slice(ci + 1, part.length)
+                let fc = nameFieldCode(ftxt)
                 if fc < 0 { ok = false }
                 names.push(part.slice(0, ci))
                 codes.push(fc)
+                texts.push(ftxt)
               }
               start = k + 1
             }
@@ -14503,7 +15098,15 @@ function collectAnnShapes(): i32 {
               while pi < codes.length {
                 sFieldNames.push(names[pi])
                 sFieldTypes.push(codes[pi])
-                sFieldElemName.push("")
+                if codes[pi] == 16 {
+                  // The union FIELD's name keys its atom set; registering it
+                  // interns the shared box + the value-box reps it needs (this
+                  // runs after `collectU`, but before any type-index math).
+                  sFieldElemName.push(texts[pi])
+                  registerValueUnionName(texts[pi])
+                } else {
+                  sFieldElemName.push("")
+                }
                 pi = pi + 1
               }
             }
@@ -14821,6 +15424,137 @@ function unionMemberCount(name: string): i32 {
   n
 }
 
+// ── value-union atom classification ───────────────────────────────────────────
+// The atom KIND of a value-union member type name: 0 i32, 1 boolean, 2 string,
+// 3 i64, 4 f64, 5 f32, 6 null — or -1 for anything else (a struct name, an inline
+// shape, an array). The kind doubles as the atom's tag offset (`scalarTagOf`).
+function valueAtomKind(name: string): i32 {
+  if name == "i32" { return 0 }
+  if name == "boolean" || name == "bool" { return 1 }
+  if name == "string" { return 2 }
+  if name == "i64" { return 3 }
+  if name == "f64" { return 4 }
+  if name == "f32" { return 5 }
+  if name == "null" { return 6 }
+  0 - 1
+}
+
+// The GLOBALLY-stable tag of a value-union atom: every struct variant takes the
+// dense ranks `0 .. uVariants.length-1` (`assignTags`), so atom kinds claim the
+// fixed slots above them. Stable across every union in the module (mirroring the
+// host's interned `tagOf(variantKey)` global table), so a value boxed as
+// `string | i32 | boolean` keeps its tag inside the sub-union `string | i32`.
+function scalarTagOf(atom: string): i32 {
+  uVariants.length + valueAtomKind(atom)
+}
+
+// The interned VALUE-BOX heap-type index for a scalar atom (`boolean` shares the
+// i32 box — same wasm rep), or -1 for `string`/`null` (no inner box: a string ref
+// is already an `anyref` subtype; a null payload is `ref.null`).
+function vbHeapIdxOfAtom(atom: string): i32 {
+  let k = valueAtomKind(atom)
+  if k == 0 || k == 1 { return vbI32Idx }
+  if k == 3 { return vbI64Idx }
+  if k == 4 { return vbF64Idx }
+  if k == 5 { return vbF32Idx }
+  0 - 1
+}
+
+// True if `name` is a VALUE union this emitter boxes: 2+ top-level atoms, every
+// atom a scalar/string/null name, and either (a) 2+ non-null atoms, or (b) exactly
+// one non-null NUMERIC atom plus `null` (`i32 | null` — a scalar has no spare null
+// niche, so it boxes; `boolean | null` keeps its existing sentinel NICHE encoding,
+// and a single REF member + null (`S | null`, `string | null`) stays a niche
+// nullable ref — neither is a box).
+function isValueUnionName(name: string): boolean {
+  if unionMemberCount(name) < 2 { return false }
+  let atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let nonNull = 0
+  let hasNull = false
+  let soloKind = 0 - 1
+  let i = 0
+  while i < atoms.length {
+    let k = valueAtomKind(atoms[i])
+    if k < 0 { return false }
+    if k == 6 {
+      hasNull = true
+    } else {
+      nonNull = nonNull + 1
+      soloKind = k
+    }
+    i = i + 1
+  }
+  if nonNull >= 2 { return true }
+  if nonNull == 1 && hasNull {
+    // Only a NUMERIC scalar boxes with null; boolean|null / string|null are niches.
+    return soloKind == 0 || soloKind == 3 || soloKind == 4 || soloKind == 5
+  }
+  false
+}
+
+// True if the value union `name` contains the member atom `atom`.
+function unionHasAtom(name: string, atom: string): boolean {
+  let atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let i = 0
+  while i < atoms.length {
+    if atoms[i] == atom { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The pipe-joined complement of `set` (a union name / narrowed sub-set string)
+// with the atom `removed` taken out — the ELSE-branch narrowing of `is removed`.
+function removeAtomFrom(set: string, removed: string): string {
+  let atoms: string[] = []
+  splitUnionAtoms(set, atoms)
+  let out = ""
+  let i = 0
+  while i < atoms.length {
+    if atoms[i] != removed {
+      if out != "" { out = out + "|" }
+      out = out + atoms[i]
+    }
+    i = i + 1
+  }
+  out
+}
+
+// Register the VALUE union `name` in the per-union table (no variant structs —
+// its atoms tag via `scalarTagOf`, its payloads ride the shared value boxes).
+// Idempotent; a non-value-union name is a no-op. Callable from any collection
+// phase (it reads no statement table) — `collectAnnShapes` registers a union
+// FIELD's atom set through it after `collectU` has run.
+function registerValueUnionName(name: string): i32 {
+  if isUName(name) { return 0 }
+  if !isValueUnionName(name) { return 0 }
+  uDeclared = true
+  unNames.push(name)
+  unVarStart.push(uVariants.length)
+  unVarCount.push(0)
+  markValueUnionAtoms(name)
+  0
+}
+
+// Mark the per-rep value-box usage flags for every scalar atom of the value union
+// `name` (registration-time, so `mAssignTypeIndices` interns exactly the used reps).
+function markValueUnionAtoms(name: string): i32 {
+  let atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let i = 0
+  while i < atoms.length {
+    let k = valueAtomKind(atoms[i])
+    if k == 0 || k == 1 { vbI32Used = true }
+    if k == 3 { vbI64Used = true }
+    if k == 4 { vbF64Used = true }
+    if k == 5 { vbF32Used = true }
+    i = i + 1
+  }
+  0
+}
+
 // True if `name` is declared by a top-level struct `type X = {…}` (`TypeDecl`). Used
 // during `collectU` — BEFORE `collectS` runs — so it scans the arena directly rather
 // than reading the not-yet-populated `sNames` table.
@@ -14845,12 +15579,20 @@ function isInlineStructUnion(stmts: i32[], name: string): boolean {
   if unionMemberCount(name) < 2 { return false }
   let atoms: string[] = []
   splitUnionAtoms(name, atoms)
+  // A `null` atom is tolerated (`A | B | null` is the boxed struct union whose
+  // null rides in the tag — `scalarTagOf("null")`), but at least TWO members must
+  // be declared structs: a single struct + null (`A | null`) stays the kind-9
+  // niche nullable ref, not a box.
+  let structAtoms = 0
   let j = 0
   while j < atoms.length {
-    if !isDeclaredStructName(stmts, atoms[j]) { return false }
+    if atoms[j] != "null" {
+      if !isDeclaredStructName(stmts, atoms[j]) { return false }
+      structAtoms = structAtoms + 1
+    }
     j = j + 1
   }
-  true
+  structAtoms >= 2
 }
 
 // Register the inline union synthetic name `name` (e.g. `"A|B"`) as a union alias in
@@ -14861,17 +15603,34 @@ function isInlineStructUnion(stmts: i32[], name: string): boolean {
 // is not an inline struct-variant union. Returns 0, or -1 (via `emitFail`).
 function registerInlineUnion(stmts: i32[], name: string): i32 {
   if isUName(name) { return 0 }
+  // A VALUE union (`i32 | null`, `string | i32`, `i32 | f64`) registers the name
+  // alone — it owns NO variant structs (its members are scalar atoms whose tags
+  // come from `scalarTagOf` and whose payloads ride the shared value boxes), so
+  // its variant slice is empty. Registering interns the shared box (`uDeclared`)
+  // and the per-rep value boxes it needs.
+  if isValueUnionName(name) {
+    return registerValueUnionName(name)
+  }
   if !isInlineStructUnion(stmts, name) { return 0 }
   let atoms: string[] = []
   splitUnionAtoms(name, atoms)
   uDeclared = true
   unNames.push(name)
   unVarStart.push(uVariants.length)
-  unVarCount.push(atoms.length)
+  // A `null` atom is no variant struct — only the struct members occupy slots.
+  let nStructs = 0
+  let cnt = 0
+  while cnt < atoms.length {
+    if atoms[cnt] != "null" { nStructs = nStructs + 1 }
+    cnt = cnt + 1
+  }
+  unVarCount.push(nStructs)
   let vi = 0
   while vi < atoms.length {
-    uVariants.push(atoms[vi])
-    if collectVariantFields(stmts, atoms[vi]) < 0 { return 0 - 1 }
+    if atoms[vi] != "null" {
+      uVariants.push(atoms[vi])
+      if collectVariantFields(stmts, atoms[vi]) < 0 { return 0 - 1 }
+    }
     vi = vi + 1
   }
   0
@@ -14896,15 +15655,25 @@ function tyNameOf(tyIx: i32): string {
 // alias is a no-op) and BEFORE `assignTags` (which ranks the FINAL `uVariants` set).
 // Returns 0, or -1 (via `emitFail`).
 function collectInlineUnions(stmts: i32[]): i32 {
+  collectInlineUnionsIn(stmts, stmts)
+}
+
+// The recursive worker: scan the statement list `walk` (registering against the
+// TOP-LEVEL `stmts`, where struct `TypeDecl`s live), descending into function
+// bodies and branch blocks so a `let v: A | B = …` INSIDE a function (or a nested
+// `if`/loop body) registers its inline union too — value unions especially appear
+// as local annotations, not just at module scope.
+function collectInlineUnionsIn(stmts: i32[], walk: i32[]): i32 {
   let i = 0
-  while i < stmts.length {
-    let s = P.nodes[stmts[i]]
+  while i < walk.length {
+    let s = P.nodes[walk[i]]
     if s is FuncDecl {
       // Read both annotation-bearing fields of the narrowed `s` BEFORE the inner loop
       // introduces a `Param` narrowing (a fresh `is`-narrowing pins its own binding;
       // reading `s.fnRet` after it would no longer see `s`'s FuncDecl narrowing).
       let params = s.fnParams
       let retTy = s.fnRet
+      let fnBody = s.fnBody
       if registerInlineUnion(stmts, tyNameOf(retTy)) < 0 { return 0 - 1 }
       let pi = 0
       while pi < params.length {
@@ -14914,10 +15683,42 @@ function collectInlineUnions(stmts: i32[]): i32 {
         }
         pi = pi + 1
       }
+      if collectInlineUnionsBlock(stmts, fnBody) < 0 { return 0 - 1 }
     } else if s is LetDecl {
       if registerInlineUnion(stmts, tyNameOf(s.letType)) < 0 { return 0 - 1 }
+    } else if s is IfStmt {
+      let thenB = s.ifThen
+      let elseN = s.ifElse
+      if collectInlineUnionsBlock(stmts, thenB) < 0 { return 0 - 1 }
+      if elseN >= 0 {
+        let els = P.nodes[elseN]
+        if els is Block {
+          if collectInlineUnionsBlock(stmts, elseN) < 0 { return 0 - 1 }
+        } else {
+          // `else if`: a lone nested statement — wrap it in a one-shot walk.
+          let one: i32[] = []
+          one.push(elseN)
+          if collectInlineUnionsIn(stmts, one) < 0 { return 0 - 1 }
+        }
+      }
+    } else if s is WhileStmt {
+      if collectInlineUnionsBlock(stmts, s.whileBody) < 0 { return 0 - 1 }
+    } else if s is ForRange {
+      if collectInlineUnionsBlock(stmts, s.frBody) < 0 { return 0 - 1 }
+    } else if s is ForIn {
+      if collectInlineUnionsBlock(stmts, s.fiBody) < 0 { return 0 - 1 }
     }
     i = i + 1
+  }
+  0
+}
+
+// Recurse into a Block node's statement list (a function body / branch arm).
+function collectInlineUnionsBlock(stmts: i32[], blockIx: i32): i32 {
+  if blockIx < 0 { return 0 }
+  let b = P.nodes[blockIx]
+  if b is Block {
+    return collectInlineUnionsIn(stmts, b.blkStmts)
   }
   0
 }
@@ -14930,6 +15731,10 @@ function collectInlineUnions(stmts: i32[]): i32 {
 // coexist (mirroring the multi-struct table). Returns 0, or -1 (via `emitFail`).
 function collectU(stmts: i32[]): i32 {
   uDeclared = false
+  vbI32Used = false
+  vbI64Used = false
+  vbF32Used = false
+  vbF64Used = false
   unNames = []
   unVarStart = []
   unVarCount = []
@@ -15380,8 +16185,18 @@ function exprUnion(exprIx: i32, fnIx: i32): boolean {
     return false
   }
   if e is Ident {
+    // A VALUE-union ident narrowed to ONE scalar atom (`if u is i32 { … u … }`)
+    // reads UNBOXED in this scope — it is no longer a union value here (the host's
+    // narrowing types it as the member). A sub-union narrowing (2+ atoms) keeps
+    // the box.
+    if narrowedValueAtomOf(e.identName) != "" { return false }
     if paramUnion(fnIx, e.identName) { return true }
-    return declaredUnion(e.identName)
+    if declaredUnion(e.identName) { return true }
+    // A module GLOBAL union binding (a union annotation, or a union-returning
+    // init): top-level `const a = make(42)` / `let w: string | i32 = "a"`.
+    let gi = globalLetOf(e.identName)
+    if gi >= 0 { return letIsUnion(gi, 0 - 1) }
+    return false
   }
   // `ns[i]` over a UNION-element ref list yields the union box (G7-ref) — so the value
   // is usable with `is`-narrowing (a `let n0 = ns[i]` is a union local). Per-slot: the
@@ -15410,6 +16225,119 @@ function letIsUnion(letIx: i32, fnIx: i32): boolean {
     return exprUnion(d.letInit, fnIx)
   }
   false
+}
+
+// ── value-union name resolution (the union a value flows as) ─────────────────
+// The registered union NAME a binding `name` carries in function `fnIx` (its param
+// annotation, its `let` annotation, an inferred union-returning init, or a module
+// global's), or "" when the binding is not union-typed. The name string IS the
+// atom set (`"boolean|i32"`), so narrowing complements split it directly.
+function unionNameOfIdent(name: string, fnIx: i32): string {
+  if fnIx >= 0 {
+    let fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      // Read the body field BEFORE the Param narrowing below pins its own binding.
+      let body = fn.fnBody
+      let params = fn.fnParams
+      let i = 0
+      while i < params.length {
+        let p = P.nodes[params[i]]
+        if p is Param {
+          if p.parName == name {
+            let pn = tyNameOf(p.parType)
+            if isUName(pn) { return pn }
+            return ""
+          }
+        }
+        i = i + 1
+      }
+      let li = parentLetOf(body, name)
+      if li >= 0 { return letUnionNameOf(li, fnIx) }
+    }
+  }
+  let gi = globalLetOf(name)
+  if gi >= 0 { return letUnionNameOf(gi, 0 - 1) }
+  ""
+}
+
+// The union name of a `LetDecl`: its annotation when that names a union, else the
+// union its (un-annotated) initializer produces (`const r = pick(true)`).
+function letUnionNameOf(letIx: i32, fnIx: i32): string {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    let an = tyNameOf(d.letType)
+    if isUName(an) { return an }
+    if d.letType < 0 { return unionNameOfExpr(d.letInit, fnIx) }
+  }
+  ""
+}
+
+// The union NAME the expression at `exprIx` produces (the name-typed mirror of the
+// boolean `exprUnion`): a union-returning call's return annotation, a union-typed
+// ident, a parenthesized union. "" when the expression is not union-valued.
+function unionNameOfExpr(exprIx: i32, fnIx: i32): string {
+  if exprIx < 0 { return "" }
+  let e = P.nodes[unwrapParen(exprIx)]
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      let t = fnIndexOf(callee.identName)
+      if t >= 0 {
+        let fn = P.nodes[fnStmts[t]]
+        if fn is FuncDecl {
+          let rn = tyNameOf(fn.fnRet)
+          if isUName(rn) { return rn }
+        }
+      }
+    }
+    return ""
+  }
+  if e is Ident {
+    return unionNameOfIdent(e.identName, fnIx)
+  }
+  ""
+}
+
+// The single scalar atom a binding `name` is currently narrowed to (`"i32"`,
+// `"string"`, `"boolean"`, `"i64"`, `"f64"`, `"f32"`), or "" when it is not
+// narrowed / narrowed to a sub-union (a pipe-joined set classifies as no atom) /
+// narrowed to `null` / narrowed to a struct variant. A non-"" answer means an
+// ident READ unboxes to that atom's rep.
+function narrowedValueAtomOf(name: string): string {
+  let v = narrowVariantFor(name)
+  if v == "" { return "" }
+  let k = valueAtomKind(v)
+  if k >= 0 && k != 6 { return v }
+  ""
+}
+
+// The atom KIND an IDENT expression currently reads as, for the scalar/string
+// classifiers (`exprString`/`exprIsBool`/`exprIsI64`/`exprIsF64`/`exprIsF32`):
+// `valueAtomKind` codes when the ident is a union binding narrowed to ONE scalar
+// atom (the read unboxes to that atom's rep), -2 when it is a union binding NOT
+// narrowed to a single atom (the read is the BOX ref — no scalar classification,
+// even if the binding's INIT was a string/bool literal), or -3 when the
+// expression is not a union-typed ident at all (the caller keeps its existing
+// classification rules).
+function unionIdentReadKind(exprIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[exprIx]
+  if e is Ident {
+    if unionNameOfIdent(e.identName, fnIx) != "" {
+      let a = narrowedValueAtomOf(e.identName)
+      if a != "" { return valueAtomKind(a) }
+      return 0 - 2
+    }
+  }
+  0 - 3
+}
+
+// The CURRENT narrowed atom set of the union binding `name`: its innermost active
+// narrowing when one exists (which may already be a sub-union), else its declared
+// union's full member set (the union name itself). "" when not a union binding.
+function currentNarrowSetOf(name: string, fnIx: i32): string {
+  let v = narrowVariantFor(name)
+  if v != "" { return v }
+  unionNameOfIdent(name, fnIx)
 }
 
 // The variant struct name an object literal at `objIx` matches: the union variant
@@ -16509,6 +17437,11 @@ function exprString(exprIx: i32, fnIx: i32): boolean {
     return exprIsStrConcat(exprIx, fnIx)
   }
   if e is Ident {
+    // A VALUE-union ident is a string ONLY when narrowed to the `string` atom
+    // (the unboxed read is the array ref); an un-narrowed union binding is the
+    // BOX, even when its init was a string literal (see exprIsI64).
+    let uk = unionIdentReadKind(exprIx, fnIx)
+    if uk != 0 - 3 { return uk == 2 }
     if paramString(fnIx, e.identName) { return true }
     if declaredString(e.identName) { return true }
     return globalIsString(e.identName)
