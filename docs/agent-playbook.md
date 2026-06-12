@@ -52,6 +52,9 @@ To diagnose invalid emitted wasm:
   three slices have now tripped on this.
 
 ## Known landmines
+- When a slice makes something START WORKING, grep the test suites for stale
+  negative tests asserting it fails (`fails loudly`, `err:`, REJECT lists) and
+  flip them — two CI failures came from obsoleted expectations.
 - The FNV constant `0 - 2128831035` in wasmEmit.vl is deliberately
   hand-wrapped for i32 hash semantics — not a bug.
 - The type-index oracle formulas (`mAssignTypeIndices` + `*OffsetOf`) are a
