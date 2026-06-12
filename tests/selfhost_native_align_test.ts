@@ -235,6 +235,7 @@ const RUN_CASES = [
   "soundness/union-field-narrowing-sound.vl",
   "strings/literal-length.vl",
   "types/else-chain-narrowing.vl",
+  "types/guard-function.vl",
   "objects/pass.vl",
   "objects/self-method.vl",
   "objects/operator-self-method.vl",
