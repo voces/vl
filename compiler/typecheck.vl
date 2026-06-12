@@ -3291,6 +3291,23 @@ function checkCallNode(n: Call, ix: i32): i32 {
         let rb = bindOf(bNames, bTys, rt3.tvName)
         if rb >= 0 {
           retTy = rb
+        } else if rt3.tvName.length > 5 {
+          if rt3.tvName.slice(0, 5) == "?ret." {
+            // A DERIVED hole `?ret.<calleeHole>` — the body called a hole param
+            // (`function apply(fn, a, b) fn(a, b)`). When THIS call site pins
+            // the callee hole to a concrete function, the call's result is that
+            // function's RETURN (the host's instantiate-and-collapse), so an
+            // unsound flow (`__store_i32__(4, apply(addf, 1, 2))` with an
+            // f64-returning `addf`) REJECTS instead of riding an unconstrained
+            // hole (`functions/inferred-return-soundness.vl`).
+            let inner = bindOf(bNames, bTys, rt3.tvName.slice(5, rt3.tvName.length))
+            if inner >= 0 {
+              let it = T.tys[inner]
+              if it is TyFunc {
+                retTy = it.fnRet
+              }
+            }
+          }
         }
       } else if rt3 is TyArray {
         let re = rt3.aElem
@@ -3309,6 +3326,21 @@ function checkCallNode(n: Call, ix: i32): i32 {
   }
   if ft is TyErr {
     return TY_ERR
+  }
+  if ft is TyVar {
+    // Calling an INFERENCE-HOLE value — an un-annotated parameter used as a
+    // function inside its own (generic) body: `function apply(fn, a, b)
+    // fn(a, b)`. Host parity: the hole pins to a function shape per
+    // monomorphized call site, so here the arguments are checked on their own
+    // and the call yields a fresh hole (resolved when an outer call binds the
+    // generic signature; the emitter compiles each instance concretely).
+    let hargs = n.callArgs
+    let hj = 0
+    while hj < hargs.length {
+      checkNode(hargs[hj])
+      hj = hj + 1
+    }
+    return mkTyVar("?ret." + ft.tvName)
   }
   tErr("called value is not a function (" + tyToStr(fnTy) + ")", ix)
   TY_ERR
@@ -3579,8 +3611,21 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
         // param (e.g. `xs.map(function(n) …)` over `i32[]` ⇒ `n: i32`), matching
         // the host's receiver-driven inference.
         pt = cbExpect[pi]
+      } else if n.fnName != "" {
+        // HOST PARITY (`Infer<Unknown>` param holes): a NAMED function's
+        // un-annotated parameter is a fresh inference HOLE — a synthetic TyVar
+        // (one per param, named by declaration + position so the hoisted
+        // signature and the body bind the same hole). Each CALL SITE pins it
+        // independently through the existing generic TyVar binding (the
+        // per-call `bNames`/`bTys`), mirroring the host's per-callsite
+        // `instantiateFunctionType`; the emitter then monomorphizes one wasm
+        // instance per distinct shape. Inside the body the hole is opaque
+        // (assignable both ways), exactly like an explicit `<T>` param.
+        pt = mkTyVar("?" + n.fnName + "." + i32ToStr(pi))
       } else {
-        // No annotation and no contextual type ⇒ genuinely uninferable.
+        // An ANONYMOUS literal with no annotation and no contextual type is
+        // genuinely uninferable — its value-typed binding demands a concrete
+        // signature NOW (host parity: `lambda-uninferable-param`).
         tErr("cannot infer a type for parameter `" + pNode.parName + "`",
           params[pi])
       }
@@ -3938,6 +3983,11 @@ function checkProgramNode(n: Program): i32 {
                 t = r
               }
             }
+          } else {
+            // An un-annotated param hoists as its inference HOLE (the same
+            // declaration+position name `checkFuncDeclNode` mints, so a
+            // forward call site binds the identical hole by name).
+            t = mkTyVar("?" + s.fnName + "." + i32ToStr(k))
           }
         }
         hpt.push(t)

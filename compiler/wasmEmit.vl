@@ -4978,6 +4978,28 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
       }
     }
   }
+  // STATIC `is` over a NON-union operand against a base TYPE NAME (`x is i32`,
+  // `x is string`) — the monomorphized-generic-param guard. Each instance pins
+  // the param to one concrete type, so the test is decided AT COMPILE TIME per
+  // instance and lowers to a constant (host parity: `is T` on a generic param
+  // is resolved statically per monomorphized call site, so calls don't
+  // cross-contaminate). Union-typed operands took the tag-compare paths above;
+  // a declared VARIANT name keeps the loud union-only failure below.
+  if nd0 is IsExpr {
+    if variantIndexOf(nd0.isVariant) < 0 {
+      if !exprUnion(nd0.isObj, fnIx) {
+        let sk = monoArgTyName(nd0.isObj, fnIx)
+        if sk != "" {
+          if sk == nd0.isVariant {
+            fbI32Const(1)
+          } else {
+            fbI32Const(0)
+          }
+          return 0
+        }
+      }
+    }
+  }
   if !uDeclared {
     return emitFail("emitProgram: `is` test but no union type declared")
   }
@@ -9790,8 +9812,20 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32): i32 {
       i = i + 1
     }
     // code = closure.code (field 0) — a generic funcref. ref.cast it to the concrete
-    // `$fnsig` for this call's arity, then call_ref.
-    let sig = fnSigIdxForArity(args.length)
+    // `$fnsig` for this call, then call_ref. A callee that is a CLOSURE-PINNED
+    // param (a monomorphized instance's `"=>sigkey"` annotation) carries its
+    // exact signature key — use it, so a non-all-i32 shape (`(f64,f64)->f64`)
+    // casts to the right functype; anything else keeps the all-i32 arity key.
+    let sig = 0 - 1
+    let cre = P.nodes[c.callFn]
+    if cre is Ident {
+      let ck = paramCloSigKey(fnIx, cre.identName)
+      if ck != "" {
+        let cp = cloSigPosOfKey(ck)
+        if cp >= 0 { sig = cloSigBase + cp }
+      }
+    }
+    if sig < 0 { sig = fnSigIdxForArity(args.length) }
     if sig < 0 {
       return emitFail("emitProgram: function-value call arity has no interned signature")
     }
@@ -12172,7 +12206,9 @@ function checkParams(fnIx: i32): i32 {
           // array (`i32[]`), or `string` (the SAME `array i32` of code points) are
           // allowed; anything else fails.
           // (`collectA` already validated every array annotation is i32[].)
-          if retNulRefFlag(p.parType) == 1 {
+          if tyIsFuncType(p.parType) {
+            // a function-typed (closure fat-pointer) param — kind 14
+          } else if retNulRefFlag(p.parType) == 1 {
             // accepted — a `(ref null $S)` param
           } else if ty.tyName != "i32" {
             if ty.tyName != "i64" {            // i64 rides the 0x7e valtype (Slice 1)
@@ -12943,6 +12979,10 @@ function retBoolFlag(tyIx: i32): i32 {
 // is a distinct code from array purely for typedness clarity; `pushVT` emits the SAME
 // array ref valtype for both, since a string IS the i32-array type here.
 function vtKindOfType(tyIx: i32): i32 {
+  // A function-typed annotation (a name carrying `=>` — incl. the synthetic
+  // `"=>sigkey"` a monomorphized closure param is pinned with) is the closure
+  // fat-pointer, kind 14. Checked first; no other name contains an arrow.
+  if tyIsFuncType(tyIx) { return 14 }
   if retNulRefFlag(tyIx) == 1 { return 9 }
   if retStrArrFlag(tyIx) == 1 { return 7 }
   if retF64ArrFlag(tyIx) == 1 { return 12 }
@@ -15167,11 +15207,51 @@ function checkArrName(name: string): i32 {
 // — setting `aUsed`. A VL string IS that same array-i32 of code points, so a string
 // literal / `string` annotation needs the very type an array does. A single linear
 // pass over `P.nodes` is exhaustive (every node, reachable or not, is checked) and
+// Every FuncDecl type-parameter name in the program (`<T, U>` declarations),
+// gathered by `collectA`'s pre-pass. A generic original's `T`/`T[]` annotations
+// ride these names; `genTyParamArr` consults the set so `collectA` skips them.
+let genTyParamNames: string[] = []
+
+// True when `name` is `T[]` for some declared FuncDecl type parameter `T`.
+function genTyParamArr(name: string): boolean {
+  if genTyParamNames.length == 0 { return false }
+  let n = name.length
+  if n < 2 { return false }
+  if name[n - 2] != '[' { return false }
+  if name[n - 1] != ']' { return false }
+  let base = name.slice(0, n - 2)
+  let i = 0
+  while i < genTyParamNames.length {
+    if genTyParamNames[i] == base { return true }
+    i = i + 1
+  }
+  false
+}
+
 // stable: it fixes whether the program needs the array heap type BEFORE the type
 // section is emitted. Each `[]` annotation is validated as `i32[]` here, so a non-i32
 // element array (e.g. `string[]`) fails loudly up-front. Returns 0, or -1 (via
 // `emitFail`).
 function collectA(stmts: i32[]): i32 {
+  // Gather every FuncDecl TYPE-PARAMETER name first (a separate cheap pass — a
+  // `T[]` annotation node precedes its FuncDecl in the arena, so the main walk
+  // below would see it too early). Consulted by `genTyParamArr` to skip a
+  // generic original's `T[]` annotation. Empty for any program without `<T>`
+  // declarations — zero behavior change.
+  genTyParamNames = []
+  let gtp = 0
+  while gtp < P.nodes.length {
+    let gnd = P.nodes[gtp]
+    if gnd is FuncDecl {
+      let gtps = gnd.fnTyParams
+      let gj = 0
+      while gj < gtps.length {
+        genTyParamNames.push(gtps[gj])
+        gj = gj + 1
+      }
+    }
+    gtp = gtp + 1
+  }
   aUsed = false
   lUsed = false
   raUsed = false
@@ -15300,6 +15380,12 @@ function collectA(stmts: i32[]): i32 {
         // An `f64[]` annotation forces the f64 array + wrapper pair (Slice 4) — its own
         // `(array (mut f64))` backing, independent of the i32 array/list.
         fa64Used = true
+      } else if genTyParamArr(nd.tyName) {
+        // A `T[]` over a FuncDecl TYPE PARAMETER — a generic ORIGINAL's
+        // annotation. Its monomorphized instances carry concrete pinned names
+        // (collected when `monomorphize` re-runs this pass); the original is
+        // replaced by its first instance and never emitted, so nothing is
+        // forced or validated here.
       } else if nameIsArray(nd.tyName) {
         if checkArrName(nd.tyName) < 0 { return 0 - 1 }
         // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
@@ -18226,6 +18312,39 @@ function callMemProp(exprIx: i32): string {
   ""
 }
 
+// The `$fnsig` signature KEY a closure-pinned parameter carries — the part after
+// the `"=>"` of a monomorphized instance's synthetic annotation (`"=>ii>i"` →
+// `"ii>i"`), or "" when `name` is not such a param of function `fnIx`.
+function paramCloSigKey(fnIx: i32, name: string): string {
+  if fnIx < 0 { return "" }
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef {
+              let nm = ty.tyName
+              if nm.length > 2 {
+                if nm[0] == '=' && nm[1] == '>' {
+                  return nm.slice(2, nm.length)
+                }
+              }
+            }
+          }
+          return ""
+        }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
 // True if the parameter `name` of function `fnIx` is annotated as a function type
 // (lowered to the closure fat-pointer, kind 14).
 function paramIsClosure(fnIx: i32, name: string): boolean {
@@ -18552,6 +18671,524 @@ function collectMapFilterUse(): i32 {
   0
 }
 
+// ── Per-callsite monomorphization (host: toWasm.ts `instantiate`) ────────────
+// A GENERIC lifted function — explicit `<T>` type params, or any UN-ANNOTATED
+// parameter (an inference hole the checker pins per call site) — has no single
+// wasm signature. Mirroring the host's lazy `instantiate`, each DIRECT call to
+// one resolves to a concrete INSTANCE: a clone of the declaration whose generic
+// param/return annotations are replaced by the call's concrete type NAMES.
+// Instances are keyed by `(original decl, pinned-param-names)` — registered
+// BEFORE their body is walked, so a recursive self-call at the same shape hits
+// the registry instead of looping. The FIRST instance keeps the bare name and
+// REPLACES the original's `fnStmts` slot (so every declared function keeps its
+// wasm index — the golden-pinned `fnStmts` position); each later DISTINCT shape
+// appends a clone `name$N` at the END of `fnStmts` and rewrites that call
+// site's callee `Ident` to the clone's name. A program with no generic call
+// creates zero instances and emits byte-identical output (usage-gated).
+//
+// DIVERGENCES from the host, both deliberate: (1) instantiation is an eager
+// pre-pass in program order, not lazy mid-emission — the native emitter
+// classifies types from annotations in earlier phases (`collectCloSigs`,
+// `mAssignTypeIndices`), so instances must exist with concrete annotations
+// before those phases run; (2) clones SHARE the original's body arena nodes, so
+// a RECURSIVE generic used at multiple shapes would mis-resolve its self-call
+// (none exists in the corpus; the first-instance/replacement path is exact).
+
+// Was `fnStmts[fe]` generic before instantiation? (frozen at pass start)
+let monoGen: i32[] = []
+// The ORIGINAL FuncDecl arena index per pre-pass `fnStmts` slot (the slot itself
+// is overwritten by the first instance, but later shapes clone from the
+// original's pristine annotations).
+let monoOrigNode: i32[] = []
+// Instance registry: key "<origFe>#<name,name,…>" → instance fnStmts pos + name.
+let monoKeys: string[] = []
+let monoInstOrig: i32[] = []
+let monoInstName: string[] = []
+let monoInstFe: i32[] = []
+// The root statement list, for the per-instance map/inference rebuilds.
+let monoProgStmts: i32[] = []
+
+// Is the FuncDecl at arena index `fnIx` generic — explicit `<T>` params, or any
+// un-annotated parameter (a per-callsite inference hole)?
+function monoIsGenericDecl(fnIx: i32): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if fn.fnTyParams.length > 0 { return true }
+    let ps = fn.fnParams
+    let i = 0
+    while i < ps.length {
+      let p = P.nodes[ps[i]]
+      if p is Param {
+        if p.parType < 0 { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The type-parameter NAME a written annotation rides on — `ann == tp` (bare) or
+// `ann == tp + "[]"` (array-of) for some `tp` in `typarams` — or "" when the
+// annotation is concrete. Mirrors the checker's `resolveAnnot` shape.
+function monoTyParamOf(ann: string, typarams: string[]): string {
+  let i = 0
+  while i < typarams.length {
+    if typarams[i] == ann { return typarams[i] }
+    i = i + 1
+  }
+  let n = ann.length
+  if n >= 2 {
+    if ann[n - 2] == '[' && ann[n - 1] == ']' {
+      let base = ann.slice(0, n - 2)
+      let j = 0
+      while j < typarams.length {
+        if typarams[j] == base { return typarams[j] }
+        j = j + 1
+      }
+    }
+  }
+  ""
+}
+
+// The first-use-wins binding of type-param `tp` in the per-call binding lists,
+// or "" if unbound.
+function monoBindOf(tvN: string[], tvV: string[], tp: string): string {
+  let i = 0
+  while i < tvN.length {
+    if tvN[i] == tp { return tvV[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// The concrete annotation NAME for the argument expression at `ix` inside
+// function `fnIx` (-1 = top level) — the same classification ladder the return-
+// kind inference runs (`exprString`/`exprArray`/…), rendered back to the
+// annotation name an instance's pinned `TypeRef` carries. "" = a kind this pass
+// cannot name (the caller fails loudly).
+function monoArgTyName(ix: i32, fnIx: i32): string {
+  if exprIsClosure(ix, fnIx) {
+    // A FUNCTION-VALUE argument pins its param as a CLOSURE (kind 14). The
+    // pinned name carries the callee's `$fnsig` KEY (`"=>ii>i"`) so the
+    // instance's value-call (`fn(a, b)`) ref-casts to the EXACT signature.
+    // Only a bare top-level function name resolves a key here (the HOF shape
+    // in scope); any other closure value fails loudly at the caller.
+    let ce = P.nodes[unwrapParen(ix)]
+    if ce is Ident {
+      let cfe = fnIndexOf(ce.identName)
+      if cfe >= 0 {
+        let ck = fnSigKeyOf(cfe)
+        if ck != "" { return "=>" + ck }
+      }
+    }
+    return ""
+  }
+  if exprString(ix, fnIx) { return "string" }
+  if exprStringArray(ix, fnIx) { return "string[]" }
+  if exprRefArray(ix, fnIx) {
+    // A struct/union-element array: only a LITERAL argument names its element
+    // type cheaply; other shapes are out of scope for now.
+    let nd = P.nodes[ix]
+    if nd is ArrayLit { return arrLitElemName(ix) + "[]" }
+    return ""
+  }
+  if exprArray(ix, fnIx) { return "i32[]" }
+  if exprUnion(ix, fnIx) { return "" }
+  if exprNullableStruct(ix, fnIx) { return "" }
+  if exprStruct(ix, fnIx) {
+    let si = structIndexOfExpr(ix, fnIx)
+    if si >= 0 { return sNames[si] }
+    return ""
+  }
+  if exprIsF64(ix, fnIx) { return "f64" }
+  if exprIsI64(ix, fnIx) { return "i64" }
+  if exprIsF32(ix, fnIx) { return "f32" }
+  if exprIsBool(ix, fnIx) { return "boolean" }
+  "i32"
+}
+
+// Rebuild the name→index map and the voidness/return-kind inference after a new
+// instance lands in `fnStmts`, so later argument classification sees its
+// concrete signature. Also re-runs `collectA` (a pinned `string[]`/`f64`
+// annotation may force list/array types the original generic name never did).
+function monoRebuild(): i32 {
+  if collectA(monoProgStmts) < 0 { return 0 - 1 }
+  if buildFnMap(monoProgStmts) < 0 { return 0 - 1 }
+  computeVoidFns()
+  computeRetInference()
+  0
+}
+
+// Instantiate (or reuse) the instance of generic `origFe` for the call at
+// `callIx` (whose enclosing function is `ctx`, -1 = top level), and point the
+// call site at it. Returns 0, or -1 via `emitFail`.
+function monoInstantiate(origFe: i32, callIx: i32, ctx: i32): i32 {
+  let c = P.nodes[callIx]
+  let fn = P.nodes[monoOrigNode[origFe]]
+  if c is Call {
+    if fn is FuncDecl {
+      let args = c.callArgs
+      let params = fn.fnParams
+      if args.length != params.length {
+        return emitFail("emitProgram: monomorphize: wrong number of arguments calling `" +
+          fn.fnName + "`")
+      }
+      // Pin each parameter: an un-annotated param takes its argument's type
+      // name; a type-param-riding annotation binds the type param (first use
+      // wins, later uses take the binding); a concrete annotation is kept.
+      let tvN: string[] = []
+      let tvV: string[] = []
+      let pinned: string[] = []
+      let i = 0
+      while i < args.length {
+        let p = P.nodes[params[i]]
+        if p is Param {
+          if p.parType < 0 {
+            let an = monoArgTyName(args[i], ctx)
+            if an == "" {
+              return emitFail("emitProgram: monomorphize: unsupported argument type for `" +
+                p.parName + "` in a call to `" + fn.fnName + "`")
+            }
+            pinned.push(an)
+          } else {
+            let ann = tyNameOf(p.parType)
+            let tp = monoTyParamOf(ann, fn.fnTyParams)
+            if tp == "" {
+              pinned.push(ann)
+            } else {
+              let an2 = monoArgTyName(args[i], ctx)
+              if an2 == "" {
+                return emitFail("emitProgram: monomorphize: unsupported argument type for `" +
+                  p.parName + "` in a call to `" + fn.fnName + "`")
+              }
+              let bind = an2
+              if ann != tp {
+                // `T[]` param: the argument must be an array; its element binds T.
+                let an2n = an2.length
+                if an2n < 2 {
+                  return emitFail("emitProgram: monomorphize: expected an array argument for `" +
+                    p.parName + "` in a call to `" + fn.fnName + "`")
+                }
+                if an2[an2n - 2] != '[' {
+                  return emitFail("emitProgram: monomorphize: expected an array argument for `" +
+                    p.parName + "` in a call to `" + fn.fnName + "`")
+                }
+                bind = an2.slice(0, an2n - 2)
+              }
+              let b = monoBindOf(tvN, tvV, tp)
+              if b == "" {
+                tvN.push(tp)
+                tvV.push(bind)
+              } else {
+                bind = b
+              }
+              if ann != tp {
+                pinned.push(bind + "[]")
+              } else {
+                pinned.push(bind)
+              }
+            }
+          }
+        }
+        i = i + 1
+      }
+      let key = i32ToStr(origFe) + "#"
+      let pk = 0
+      while pk < pinned.length {
+        key = key + pinned[pk] + ","
+        pk = pk + 1
+      }
+      // A closure-pinned param flips the module's function-value machinery on
+      // (the instance body `call_ref`s through it; the argument side builds the
+      // fat pointer) — the same flag a lifted lambda flips in `liftFnsInExpr`.
+      let pv = 0
+      while pv < pinned.length {
+        let pvn = pinned[pv]
+        if pvn.length > 2 {
+          if pvn[0] == '=' && pvn[1] == '>' { fnValUsed = true }
+        }
+        pv = pv + 1
+      }
+      // Registry hit: point this call site at the existing instance.
+      let k = 0
+      while k < monoKeys.length {
+        if monoKeys[k] == key {
+          let cal = P.nodes[c.callFn]
+          if cal is Ident {
+            if cal.identName != monoInstName[k] {
+              cal.identName = monoInstName[k]
+            }
+          }
+          return 0
+        }
+        k = k + 1
+      }
+      // New shape: clone the ORIGINAL declaration with pinned annotations. An
+      // un-annotated param pinned at plain i32 keeps `parType = -1` (the
+      // emitter's default kind — zero new arena nodes on the all-i32 path).
+      let count = 0
+      let k2 = 0
+      while k2 < monoInstOrig.length {
+        if monoInstOrig[k2] == origFe { count = count + 1 }
+        k2 = k2 + 1
+      }
+      let nps: i32[] = []
+      let pj = 0
+      while pj < params.length {
+        let p3 = P.nodes[params[pj]]
+        if p3 is Param {
+          let nt = 0 - 1
+          if p3.parType >= 0 {
+            if monoTyParamOf(tyNameOf(p3.parType), fn.fnTyParams) == "" {
+              nt = p3.parType
+            } else {
+              nt = mkTypeRef(pinned[pj])
+            }
+          } else if pinned[pj] != "i32" {
+            nt = mkTypeRef(pinned[pj])
+          }
+          nps.push(mkParam(p3.parName, nt))
+        }
+        pj = pj + 1
+      }
+      // Substitute a type-param-riding RETURN annotation through the binding.
+      let nret = fn.fnRet
+      if fn.fnRet >= 0 {
+        let rn = tyNameOf(fn.fnRet)
+        let rtp = monoTyParamOf(rn, fn.fnTyParams)
+        if rtp != "" {
+          let rb = monoBindOf(tvN, tvV, rtp)
+          if rb == "" {
+            return emitFail("emitProgram: monomorphize: return type parameter `" + rtp +
+              "` of `" + fn.fnName + "` is not bound by any parameter")
+          }
+          if rn == rtp {
+            nret = mkTypeRef(rb)
+          } else {
+            nret = mkTypeRef(rb + "[]")
+          }
+        }
+      }
+      // An UN-ANNOTATED return whose return expression is a value-call THROUGH a
+      // closure-pinned param takes that signature's RESULT kind as a concrete
+      // annotation (`"…>d"` → `f64`): the emitter's return-kind inference has no
+      // expression form for a `call_ref` result, so the instance's functype and
+      // its callers' classification ride the normal annotation tables instead.
+      if nret < 0 {
+        let rx2 = fnRetExprOf(monoOrigNode[origFe])
+        if rx2 >= 0 {
+          let rxe = P.nodes[rx2]
+          if rxe is Call {
+            let rcal = P.nodes[rxe.callFn]
+            if rcal is Ident {
+              let pq = 0
+              while pq < params.length {
+                let pp = P.nodes[params[pq]]
+                if pp is Param {
+                  if pp.parName == rcal.identName {
+                    let pn = pinned[pq]
+                    if pn.length > 2 {
+                      if pn[0] == '=' && pn[1] == '>' {
+                        if pn[pn.length - 1] == 'd' { nret = mkTypeRef("f64") }
+                      }
+                    }
+                  }
+                }
+                pq = pq + 1
+              }
+            }
+          }
+        }
+      }
+      let instName = fn.fnName
+      let instFe = origFe
+      if count > 0 {
+        instName = fn.fnName + "$" + i32ToStr(count)
+      }
+      let noTyParams: string[] = []
+      let nfn = mkFunc(instName, noTyParams, nps, nret, fn.fnBody)
+      if count == 0 {
+        // First instance: keep the bare name and the original's wasm index.
+        fnStmts[origFe] = nfn
+      } else {
+        fnStmts.push(nfn)
+        fnParent.push(0 - 1)
+        instFe = fnStmts.length - 1
+        let cal2 = P.nodes[c.callFn]
+        if cal2 is Ident { cal2.identName = instName }
+      }
+      // REGISTER before walking the body, so a recursive self-call at the same
+      // shape resolves here instead of recursing (the host's discipline).
+      monoKeys.push(key)
+      monoInstOrig.push(origFe)
+      monoInstName.push(instName)
+      monoInstFe.push(instFe)
+      if monoRebuild() < 0 { return 0 - 1 }
+      // Walk the instance's body — a nested generic call instantiates its own
+      // callee against THIS instance's concrete annotations.
+      if monoWalk(fn.fnBody, nfn) < 0 { return 0 - 1 }
+      if monoRebuild() < 0 { return 0 - 1 }
+      return 0
+    }
+  }
+  0
+}
+
+// Walk the statement/expression tree at `ix` (inside function `ctx`, -1 = top
+// level) and instantiate every direct call to a generic function. Arguments are
+// walked BEFORE their call is classified, so an inner generic call's instance
+// (and its now-concrete return kind) is in place when the outer call's argument
+// types are read.
+function monoWalk(ix: i32, ctx: i32): i32 {
+  if ix < 0 { return 0 }
+  let n = P.nodes[ix]
+  if n is Call {
+    let args = n.callArgs
+    let i = 0
+    while i < args.length {
+      if monoWalk(args[i], ctx) < 0 { return 0 - 1 }
+      i = i + 1
+    }
+    let callee = P.nodes[n.callFn]
+    if callee is Ident {
+      let fe = fnIndexOf(callee.identName)
+      if fe >= 0 && fe < monoGen.length {
+        if monoGen[fe] == 1 {
+          return monoInstantiate(fe, ix, ctx)
+        }
+      }
+      return 0
+    }
+    return monoWalk(n.callFn, ctx)
+  }
+  if n is Block {
+    let bs = n.blkStmts
+    let i2 = 0
+    while i2 < bs.length {
+      if monoWalk(bs[i2], ctx) < 0 { return 0 - 1 }
+      i2 = i2 + 1
+    }
+    return 0
+  }
+  if n is LetDecl { return monoWalk(n.letInit, ctx) }
+  if n is IfStmt {
+    if monoWalk(n.ifCond, ctx) < 0 { return 0 - 1 }
+    if monoWalk(n.ifThen, ctx) < 0 { return 0 - 1 }
+    return monoWalk(n.ifElse, ctx)
+  }
+  if n is WhileStmt {
+    if monoWalk(n.whileCond, ctx) < 0 { return 0 - 1 }
+    return monoWalk(n.whileBody, ctx)
+  }
+  if n is ForRange {
+    if monoWalk(n.frFrom, ctx) < 0 { return 0 - 1 }
+    if monoWalk(n.frTo, ctx) < 0 { return 0 - 1 }
+    if monoWalk(n.frStep, ctx) < 0 { return 0 - 1 }
+    return monoWalk(n.frBody, ctx)
+  }
+  if n is ForIn {
+    if monoWalk(n.fiIter, ctx) < 0 { return 0 - 1 }
+    return monoWalk(n.fiBody, ctx)
+  }
+  if n is RetStmt { return monoWalk(n.retArg, ctx) }
+  if n is BinExpr {
+    if monoWalk(n.binLeft, ctx) < 0 { return 0 - 1 }
+    return monoWalk(n.binRight, ctx)
+  }
+  if n is Unary { return monoWalk(n.unArg, ctx) }
+  if n is Paren { return monoWalk(n.parInner, ctx) }
+  if n is Member { return monoWalk(n.memObj, ctx) }
+  if n is OptMember { return monoWalk(n.omObj, ctx) }
+  if n is Index {
+    if monoWalk(n.idxArr, ctx) < 0 { return 0 - 1 }
+    return monoWalk(n.idxIndex, ctx)
+  }
+  if n is IsExpr { return monoWalk(n.isObj, ctx) }
+  if n is ArrayLit {
+    let es = n.arrElems
+    let i3 = 0
+    while i3 < es.length {
+      if monoWalk(es[i3], ctx) < 0 { return 0 - 1 }
+      i3 = i3 + 1
+    }
+    return 0
+  }
+  if n is ObjLit {
+    let fs = n.objFields
+    let i4 = 0
+    while i4 < fs.length {
+      let f = P.nodes[fs[i4]]
+      if f is FieldInit {
+        if monoWalk(f.fiValue, ctx) < 0 { return 0 - 1 }
+      }
+      i4 = i4 + 1
+    }
+    return 0
+  }
+  // A nested FuncDecl's body is walked through its own `fnStmts` slot (it was
+  // lambda-lifted); every other node kind has no call-bearing children.
+  0
+}
+
+// The monomorphization pass: snapshot which lifted functions are generic, then
+// walk every top-level statement (program order — a `const ys = get([…])` pins
+// `get` before a later `first(ys)` reads its return kind) and every NON-generic
+// function body; instance bodies are walked as they are created. Usage-gated:
+// a program with no generic declaration returns immediately.
+function monomorphize(stmts: i32[]): i32 {
+  monoGen = []
+  monoOrigNode = []
+  monoKeys = []
+  monoInstOrig = []
+  monoInstName = []
+  monoInstFe = []
+  monoProgStmts = stmts
+  let any = false
+  let fe = 0
+  while fe < fnStmts.length {
+    monoOrigNode.push(fnStmts[fe])
+    if monoIsGenericDecl(fnStmts[fe]) {
+      monoGen.push(1)
+      any = true
+    } else {
+      monoGen.push(0)
+    }
+    fe = fe + 1
+  }
+  if !any { return 0 }
+  // Top-level statements first, in source order (global inits + start stmts).
+  let i = 0
+  while i < stmts.length {
+    let s = P.nodes[stmts[i]]
+    if s is FuncDecl {
+    } else if s is LetDecl {
+      if monoWalk(s.letInit, 0 - 1) < 0 { return 0 - 1 }
+    } else if nodeIsTypeDecl(stmts[i]) {
+    } else if s is UnionDecl {
+    } else {
+      if monoWalk(stmts[i], 0 - 1) < 0 { return 0 - 1 }
+    }
+    i = i + 1
+  }
+  // Then every non-generic lifted function's body. (A generic original's body
+  // is only ever walked through an instance; an instance appended during this
+  // loop extends `fnStmts`, but its body was already walked on creation —
+  // `monoGen` is frozen at the pre-pass length, and appended slots are past it.)
+  let fe2 = 0
+  let nDecl = monoGen.length
+  while fe2 < nDecl {
+    if monoGen[fe2] == 0 {
+      let fn = P.nodes[fnStmts[fe2]]
+      if fn is FuncDecl {
+        if monoWalk(fn.fnBody, fnStmts[fe2]) < 0 { return 0 - 1 }
+      }
+    }
+    fe2 = fe2 + 1
+  }
+  0
+}
+
+
 function emitProgram(rootIx: i32): i32 {
   emitFailed = false
   emitErr = ""
@@ -18582,6 +19219,11 @@ function emitProgram(rootIx: i32): i32 {
     if buildFnMap(stmts) < 0 { return 0 - 1 }
     computeVoidFns()
     computeRetInference()
+    // Monomorphize: resolve every direct call to a generic (`<T>` / un-annotated
+    // param) function into a concretely-annotated instance (cloned per distinct
+    // call shape, host `instantiate` parity) BEFORE signatures and types are
+    // collected. Usage-gated: zero instances → byte-identical output.
+    if monomorphize(stmts) < 0 { return 0 - 1 }
     // `.map`/`.filter` sites flip `fnValUsed` (the callback is a function value) and
     // force the RESULT list's types; the `$fnsig` signature set is then collected
     // (both need the inferred return kinds, so they run after `computeRetInference`).
