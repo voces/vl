@@ -113,10 +113,13 @@ no new concatenation point):
 a CONCATENATED `vlsrc.vl` that still contains the compiler's own line-leading
 `import { … } from "./ast"` lines (no-op-skipped today). Under the new gate the
 driver would try to resolve `./ast` against the temp dir and fail. Fix: the
-assembly seds BLANK OUT import lines (`s/^import \{.*$//` — blank, not delete,
-preserving line numbers). Import statements contribute zero AST nodes and zero
-emitted bytes, so stage3/stage4 and the TS-seed equivalence stay byte-identical
-(verified as part of the slice: full cold fixpoint + SELFHOST_FULL_FIXPOINT).
+assembly seds BLANK OUT import statements — range-aware, since two compiler
+imports span lines: `/^import \{/,/\} from "/ s\/.*\/\/` (blank, not delete,
+preserving line numbers). VERIFIED up front: building the current assembly with
+all imports range-blanked produces a byte-identical compiler wasm (imports are
+parse no-ops contributing zero AST nodes/bytes), so stage3/stage4 and the
+TS-seed equivalence hold; the slice still re-proves it with a full cold
+fixpoint + SELFHOST_FULL_FIXPOINT.
 
 ### Diagnostics: path attribution (accepted v1 gap)
 
