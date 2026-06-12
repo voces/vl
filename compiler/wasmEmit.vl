@@ -1073,6 +1073,21 @@ function fbI32Bin(op: i32): i32 {
   wU8(op)
   0
 }
+// i32.store: 0x36 <align-exp> <offset> — fixed align=4 bytes (exponent 2), offset 0,
+// matching the host's `__store_i32__` builtin body (`m.i32.store(0, 4, addr, v)`).
+function fbI32Store(): i32 {
+  wU8(54)            // 0x36 i32.store
+  wU8(2)             // align exponent (4-byte alignment)
+  wU8(0)             // offset 0
+  0
+}
+// i32.load: 0x28 <align-exp> <offset> — the `__load_i32__` twin of `fbI32Store`.
+function fbI32Load(): i32 {
+  wU8(40)            // 0x28 i32.load
+  wU8(2)             // align exponent (4-byte alignment)
+  wU8(0)             // offset 0
+  0
+}
 
 // ── opcode-method STUBS for the later families (Phases C–F) ───────────────────
 // Names declared now so the closed ~40-method set is coherent and self-documenting;
@@ -2186,8 +2201,17 @@ function computeRetInference(): i32 {
       let fn = P.nodes[fnStmts[i]]
       if fn is FuncDecl {
         if fn.fnRet < 0 && fRetVoid[i] == 0 {
-          let rx = fnRetExprOf(fnStmts[i])
-          if rx >= 0 {
+          // Classify over EVERY valued return (tail value first — the same
+          // preference `fnRetExprOf` had), not just the first: a function whose
+          // first return is an unclassifiable narrowed path read (`if x?.y is
+          // string { return x.y } return "-1"`) still types from its other
+          // returns — the checker already proved all returns agree.
+          let rxs: i32[] = []
+          collectValuedReturns(fnStmts[i], rxs)
+          let rxj = 0
+          while rxj < rxs.length {
+            let rx = rxs[rxj]
+            rxj = rxj + 1
             // A tail ASSIGNMENT yields its RHS (assignment-as-expression), so the
             // function's return kind is the RHS's kind (`function emit(s: string)
             // { acc = acc + s }` returns the new string).
@@ -2233,6 +2257,65 @@ function computeRetInference(): i32 {
         }
       }
       i = i + 1
+    }
+  }
+  0
+}
+
+// EVERY valued return expression of the FuncDecl at `fnIx`, the bare tail value
+// (if any) FIRST — the same preference `fnRetExprOf` gives it — then each
+// `return <e>` in source order.
+function collectValuedReturns(fnIx: i32, out: i32[]): i32 {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let b = P.nodes[fn.fnBody]
+    if b is Block {
+      let stmts = b.blkStmts
+      if stmts.length > 0 {
+        let last = stmts[stmts.length - 1]
+        if stmtIsTailValue(last) { out.push(last) }
+      }
+    }
+    collectValuedReturnsIn(fn.fnBody, out)
+  }
+  0
+}
+
+function collectValuedReturnsIn(blockIx: i32, out: i32[]): i32 {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let st = P.nodes[stmts[i]]
+      if st is RetStmt {
+        if st.retArg >= 0 { out.push(st.retArg) }
+      } else if st is IfStmt {
+        collectValuedReturnsInIf(stmts[i], out)
+      } else if st is WhileStmt {
+        collectValuedReturnsIn(st.whileBody, out)
+      } else if st is ForRange {
+        collectValuedReturnsIn(st.frBody, out)
+      } else if st is ForIn {
+        collectValuedReturnsIn(st.fiBody, out)
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+function collectValuedReturnsInIf(ifIx: i32, out: i32[]): i32 {
+  let st = P.nodes[ifIx]
+  if st is IfStmt {
+    collectValuedReturnsIn(st.ifThen, out)
+    if st.ifElse >= 0 {
+      let els = P.nodes[st.ifElse]
+      if els is Block {
+        collectValuedReturnsIn(st.ifElse, out)
+      } else if els is IfStmt {
+        collectValuedReturnsInIf(st.ifElse, out)
+      }
     }
   }
   0
@@ -3185,6 +3268,20 @@ let fa64Used: boolean = false
 let fa64TypeIdx: i32 = 0
 let fl64TypeIdx: i32 = 0
 
+// Linear-memory intrinsics (`__store_i32__` / `__load_i32__` / `__log__`): `memUsed`
+// gates the module-DEFINED memory (section 5); `memLogUsed` additionally gates the
+// synthetic in-module `__log__` decoder function. DIVERGENCE from the host (justified):
+// the host IMPORTS `imports.memory` + `imports.__log__`, but the native runner
+// (scripts/vl-host) provides neither import, so the native module defines its own
+// memory and decodes the tag/value pairs itself via the print imports — identical
+// observable stdout for every corpus `__log__` program. Both usage-gated: a program
+// with no memory intrinsic emits byte-identical output.
+let memUsed: boolean = false
+let memLogUsed: boolean = false
+// The synthetic `__log__` decoder's wasm function index (the LAST index — after the
+// imports, the user functions, and the start fn), set by `emitModule`.
+let gMemLogIdx: i32 = 0
+
 // The kind an EMPTY `[]` literal constructs, set by the binding site (a `let`/global
 // whose declared type is a ref array `S[]`/`N[]`) just before its initializer is
 // lowered: `0` = i32 list (the default), `1` = struct-ref list, `2` = union-ref list.
@@ -3292,6 +3389,11 @@ let uDeclared: boolean = false
 let unNames: string[] = []
 let unVarStart: i32[] = []
 let unVarCount: i32[] = []
+// Parallel to `unNames`: each union's FULL pipe-joined member set (variant struct
+// names AND atom members like `null`, which own no variant slot — so complement
+// narrowing can subtract from the complete set). For an inline union the set IS
+// the name; for a declared alias it is the joined `udVariants`.
+let unMemberSet: string[] = []
 let uVariants: string[] = []
 let uTags: i32[] = []
 let uBoxIdx: i32 = 0
@@ -4888,6 +4990,19 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
         return 0
       }
     }
+    // `p is { x: i32 }` / `p is S` over a NICHE nullable struct (`S | null` — one
+    // struct member, a nullable REF not a box): the checker already proved the
+    // tested shape matches the struct member, so the only runtime distinction is
+    // null vs non-null — the test lowers to `!ref.is_null` (host: the nullable's
+    // non-null narrowing test).
+    if nd0.isVariant != "null" {
+      if exprNullableStruct(nd0.isObj, fnIx) {
+        if emitExpr(body, nd0.isObj, fnIx) < 0 { return 0 - 1 }
+        wU8(209)             // 0xd1 ref.is_null
+        fbI32Eqz()           // 0x45 → non-null
+        return 0
+      }
+    }
   }
   // `x is i32` / `x is string` / … over a BOXED value union: the same box-tag
   // compare as a struct variant, against the atom's globally-stable scalar tag.
@@ -4924,6 +5039,32 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
           fbI32Const(scalarTagOf(ndv.isVariant))
           fbI32Bin(70)             // 0x46 i32.eq
           return 0
+        }
+      }
+      // `x?.y is i32` — an OPTIONAL-CHAIN receiver folds its null test into the
+      // result: any null link → false (the host's chain yields `null`, and
+      // `null is i32` is false), else the union FIELD's box-tag compare.
+      if vrecv is OptMember {
+        let oisSi = optChainStructIdxOf(vrecv.omObj, fnIx)
+        if oisSi >= 0 {
+          let oisFi = sFieldIndex(oisSi, vrecv.omProp)
+          if oisFi >= 0 {
+            if sFieldTypeAt(oisSi, oisFi) == 16 {
+              if emitOptChainIsNull(body, vrecv.omObj, fnIx) < 0 { return 0 - 1 }
+              fbIf(127)              // a null link → false
+              ctrlEnter()
+              fbI32Const(0)
+              fbElse()
+              if emitOptChainValue(body, vrecv.omObj, fnIx) < 0 { return 0 - 1 }
+              fbStructGet(sHeapIdx[oisSi], oisFi)  // the field's box
+              fbStructGet(uBoxIdx, 0)              // field 0: tag
+              fbI32Const(scalarTagOf(ndv.isVariant))
+              fbI32Bin(70)           // 0x46 i32.eq
+              fbEnd()
+              ctrlLeave()
+              return 0
+            }
+          }
         }
       }
       if exprUnion(ndv.isObj, fnIx) {
@@ -5049,6 +5190,97 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32): i32 {
     return 0
   }
   emitFail("emitProgram: expected a field access")
+}
+
+// ── optional chains over niche nullable structs (`o?.inner?.v`) ───────────────
+// Every link is an effect-free place (an Ident root + field reads), so the chain
+// is re-evaluated instead of spilling to a scratch local — mirroring the host's
+// temp-local OptionalAccess only in VALUE, not in shape.
+
+// The struct TABLE index of an optional-chain RECEIVER's value: an `a?.b` link
+// resolves its field's TARGET struct (a code-15 nested-struct field); any other
+// receiver resolves through the normal classifier. -1 when unresolvable.
+function optChainStructIdxOf(exprIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[unwrapParen(exprIx)]
+  if e is OptMember {
+    let psi = optChainStructIdxOf(e.omObj, fnIx)
+    if psi < 0 { return 0 - 1 }
+    let pfi = sFieldIndex(psi, e.omProp)
+    if pfi < 0 { return 0 - 1 }
+    if sFieldTypeAt(psi, pfi) != 15 { return 0 - 1 }
+    return structIndexByName(sFieldElemNameAt(psi, pfi))
+  }
+  structIndexOfExpr(exprIx, fnIx)
+}
+
+// Push 1 if the optional-chain VALUE at `exprIx` is null — any null link folds
+// `null` through (the host's OptionalAccess) — else 0. A code-15 leaf field tests
+// its own ref; a code-16 (value-union box) leaf compares the box tag against the
+// global null tag (the box ref itself is never null); any other leaf is never
+// null once every link held.
+function emitOptChainIsNull(body: i32[], exprIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[unwrapParen(exprIx)]
+  if e is OptMember {
+    let psi = optChainStructIdxOf(e.omObj, fnIx)
+    if psi < 0 {
+      return emitFail("emitProgram: `?.` receiver is not a struct chain")
+    }
+    let pfi = sFieldIndex(psi, e.omProp)
+    if pfi < 0 {
+      return emitFail("emitProgram: `?.` field is not on the struct")
+    }
+    if emitOptChainIsNull(body, e.omObj, fnIx) < 0 { return 0 - 1 }
+    fbIf(127)                  // 0x04 if, i32 result — receiver null → 1
+    ctrlEnter()
+    fbI32Const(1)
+    fbElse()
+    let pfc = sFieldTypeAt(psi, pfi)
+    if pfc == 15 {
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return 0 - 1 }
+      fbStructGet(sHeapIdx[psi], pfi)   // the (ref null $S) field
+      wU8(209)                 // 0xd1 ref.is_null
+    } else if pfc == 16 {
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return 0 - 1 }
+      fbStructGet(sHeapIdx[psi], pfi)   // the field's union box (non-null ref)
+      fbStructGet(uBoxIdx, 0)           // box field 0: tag
+      fbI32Const(scalarTagOf("null"))
+      fbI32Bin(70)             // 0x46 i32.eq
+    } else {
+      fbI32Const(0)            // a non-nullable field is never null past its links
+    }
+    fbEnd()
+    ctrlLeave()
+    return 0
+  }
+  if emitExpr(body, exprIx, fnIx) < 0 { return 0 - 1 }
+  wU8(209)                     // 0xd1 ref.is_null
+  0
+}
+
+// Push the NON-NULL value of the optional-chain receiver at `exprIx` (assumes
+// every link was already null-tested): each nullable link recovers
+// `ref.as_non_null` so the next `struct.get` sees a non-null ref.
+function emitOptChainValue(body: i32[], exprIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[unwrapParen(exprIx)]
+  if e is OptMember {
+    let psi = optChainStructIdxOf(e.omObj, fnIx)
+    if psi < 0 {
+      return emitFail("emitProgram: `?.` receiver is not a struct chain")
+    }
+    let pfi = sFieldIndex(psi, e.omProp)
+    if pfi < 0 {
+      return emitFail("emitProgram: `?.` field is not on the struct")
+    }
+    if emitOptChainValue(body, e.omObj, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(sHeapIdx[psi], pfi)
+    fbRefAsNonNull()           // 0xd4 — the link was null-tested
+    return 0
+  }
+  if emitExpr(body, exprIx, fnIx) < 0 { return 0 - 1 }
+  if exprNullableStruct(exprIx, fnIx) {
+    fbRefAsNonNull()           // 0xd4
+  }
+  0
 }
 
 // Push the RAW union box ref of the binding `name` (a local/param or a module
@@ -5524,6 +5756,76 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
       return 0
     }
   }
+  // Shared-field access over an UN-narrowed struct union (`(A | B).tag` — the
+  // host's `sharedUnionFieldRead`): the checker proved the field present on EVERY
+  // member, but members may store it at DIFFERENT indices, so dispatch on the box
+  // tag and read the field at THAT member's own index. The arms are exhaustive
+  // (the LAST member is the unconditional fall-through, host parity). Ported
+  // SUBSET: an IDENT receiver (an effect-free place — it is re-evaluated per arm
+  // instead of spilling to a scratch local) and an i32-rep field (a single-byte
+  // `if (result i32)` blocktype); anything else falls through to the loud
+  // failures below. A multi-variant NARROWED set ("N2|N3") dispatches over just
+  // its remaining members.
+  let mS = P.nodes[memIx]
+  if mS is Member {
+    if exprUnion(mS.memObj, fnIx) {
+      let shRecv = P.nodes[unwrapParen(mS.memObj)]
+      if shRecv is Ident {
+        let shSet = currentStructNarrowSetOf(shRecv.identName, fnIx)
+        if shSet != "" {
+          let shAtoms: string[] = []
+          splitUnionAtoms(shSet, shAtoms)
+          // Validate: every member a struct VARIANT carrying the field as i32.
+          let shVis: i32[] = []
+          let shFis: i32[] = []
+          let shOk = shAtoms.length >= 2
+          let sa = 0
+          while sa < shAtoms.length {
+            let svi = variantIndexOf(shAtoms[sa])
+            if svi < 0 {
+              shOk = false
+            } else {
+              let sfi = variantFieldIndex(svi, mS.memProp)
+              if sfi < 0 || variantFieldTypeAt(svi, sfi) != 0 {
+                shOk = false
+              } else {
+                shVis.push(svi)
+                shFis.push(sfi)
+              }
+            }
+            sa = sa + 1
+          }
+          if shOk {
+            let si2 = 0
+            while si2 < shAtoms.length - 1 {
+              if emitExpr(body, mS.memObj, fnIx) < 0 { return 0 - 1 }
+              fbStructGet(uBoxIdx, 0)            // field 0: tag
+              fbI32Const(uTags[shVis[si2]])
+              fbI32Bin(70)                       // 0x46 i32.eq
+              fbIf(127)                          // if (result i32)
+              if emitExpr(body, mS.memObj, fnIx) < 0 { return 0 - 1 }
+              fbStructGet(uBoxIdx, 1)            // field 1: value (anyref)
+              fbRefCast(uVarIdx + shVis[si2])
+              fbStructGet(uVarIdx + shVis[si2], shFis[si2])
+              fbElse()
+              si2 = si2 + 1
+            }
+            let shLast = shAtoms.length - 1
+            if emitExpr(body, mS.memObj, fnIx) < 0 { return 0 - 1 }
+            fbStructGet(uBoxIdx, 1)              // field 1: value (anyref)
+            fbRefCast(uVarIdx + shVis[shLast])
+            fbStructGet(uVarIdx + shVis[shLast], shFis[shLast])
+            let se = 0
+            while se < shAtoms.length - 1 {
+              fbEnd()
+              se = se + 1
+            }
+            return 0
+          }
+        }
+      }
+    }
+  }
   if !sDeclared {
     return emitFail("emitProgram: field access but no struct type declared")
   }
@@ -5853,8 +6155,12 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
       if rlElemKindTbl[rslot] == 2 { elemUnionNm = rlElemName[rslot] }
       let i = 0
       while i < elems.length {
-        if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
-          return emitFail("emitProgram: nested arrays are not supported")
+        // An `i32[][]` literal's elements ARE arrays (each lowers to the normal
+        // i32-list literal, yielding the `(ref $lTypeIdx)` element value).
+        if rlElemKindTbl[rslot] != 4 {
+          if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
+            return emitFail("emitProgram: nested arrays are not supported")
+          }
         }
         pendingStructIdx = elemStructIdx
         if elemUnionNm != "" {
@@ -8569,6 +8875,15 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // every scope map through `?? -1`. The LHS must be a map index in this slice.
     if e.binOp == "??" {
       let lhs = P.nodes[e.binLeft]
+      // `a ?? b ?? d` parses LEFT-associative (`(a ?? b) ?? d`); `??` is
+      // associative, so RE-ASSOCIATE to `a ?? (b ?? d)` — the inner coalesce
+      // becomes the outer's default and each LHS is again a plain place the
+      // single-step lowerings below handle (host: same chained-coalesce value).
+      if lhs is BinExpr {
+        if lhs.binOp == "??" {
+          return emitExpr(body, mkBinary("??", lhs.binLeft, mkBinary("??", lhs.binRight, e.binRight)), fnIx)
+        }
+      }
       if lhs is Index {
         if exprMap(lhs.idxArr, fnIx) {
           return emitMapGetOr(body, lhs.idxArr, lhs.idxIndex, e.binRight, fnIx)
@@ -8790,6 +9105,33 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
             }
           }
         }
+        // A NESTED optional chain `o?.inner?.v ?? d` (niche nullable links): any
+        // null link selects the default; otherwise the chain reads through
+        // non-null refs (each `S|null` link recovers `ref.as_non_null`). The
+        // links are effect-free places, re-evaluated in the value arm. Scalar
+        // (i32/boolean) leaf fields only (the value-typed `if` blocktype).
+        let omDeep = P.nodes[unwrapParen(lhs.omObj)]
+        if omDeep is OptMember {
+          let dsi = optChainStructIdxOf(lhs.omObj, fnIx)
+          if dsi >= 0 {
+            let dfi = sFieldIndex(dsi, lhs.omProp)
+            if dfi >= 0 {
+              if sFieldTypeAt(dsi, dfi) != 0 {
+                return emitFail("emitProgram: `?.` chain supports only i32/boolean leaf fields")
+              }
+              if emitOptChainIsNull(body, lhs.omObj, fnIx) < 0 { return 0 - 1 }
+              fbIf(127)            // 0x04 if, i32 result — a null link → default
+              ctrlEnter()
+              if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              fbElse()             // 0x05 else — every link present → the leaf
+              if emitOptChainValue(body, lhs.omObj, fnIx) < 0 { return 0 - 1 }
+              fbStructGet(sHeapIdx[dsi], dfi)
+              fbEnd()              // 0x0b end
+              ctrlLeave()
+              return 0
+            }
+          }
+        }
         // `xs.get(i)?.f ?? d` over a STRUCT-element ref list is the FUSED form:
         // one bounds compare; in range read the field off the (non-null) element,
         // else the default. A live in-range element is never null (pushes store
@@ -8931,6 +9273,17 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
           }
           return 0
         }
+        // `<opt-chain> == null` / `!= null` (`o?.y != null`): any null LINK makes
+        // the chain's value null (the host's OptionalAccess folds null through),
+        // so the compare IS the chain's null test (inverted for `!=`).
+        let ncN = P.nodes[unwrapParen(nref)]
+        if ncN is OptMember {
+          if emitOptChainIsNull(body, nref, fnIx) < 0 { return 0 - 1 }
+          if e.binOp == "!=" {
+            fbI32Eqz()       // 0x45 invert: the chain value is present
+          }
+          return 0
+        }
         // `x == null` / `x != null` over a BOXED union (`i32 | null`,
         // `A | B | null`): the box itself is never null — the null VARIANT rides
         // in the TAG — so compare the box tag against the global null tag (the
@@ -9040,7 +9393,66 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     }
     return emitFail("emitProgram: function literal not lifted")
   }
+  if e is IfStmt {
+    // An IF-EXPRESSION in value position (`if c then 7 else 9` — the parser wraps
+    // each arm as a one-statement Block; an `elseif` chain nests an IfStmt in the
+    // else slot). Lowered as `if (result i32)` over the arm VALUES.
+    return emitIfExpr(body, exprIx, fnIx)
+  }
   emitFail("emitProgram: unsupported expression in return")
+}
+
+// Lower an if-EXPRESSION (`if c then a else b` in value position) onto `body`:
+// cond, `if (result i32)`, the then-arm VALUE, `else`, the else-arm VALUE (an
+// `elseif` chain recurses), `end`. Each arm applies the same condition narrowing
+// the statement form does. Restricted to i32-rep arm values (the single-byte
+// blocktype); a missing else / non-value arm fails loudly — the checker already
+// proved both arms exist and agree for a value-position `if`.
+function emitIfExpr(body: i32[], ifIx: i32, fnIx: i32): i32 {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse < 0 {
+      return emitFail("emitProgram: if-expression requires an else arm")
+    }
+    if emitExpr(body, s.ifCond, fnIx) < 0 { return 0 - 1 }
+    fbIf(127)                  // 0x04 if, 0x7f i32 result blocktype
+    let savedTop = narrowTop
+    let narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    let rcT = emitBlockValue(body, s.ifThen, fnIx)
+    if narrowed { restoreNarrow(savedTop) }
+    if rcT < 0 { return 0 - 1 }
+    fbElse()                   // 0x05 else
+    let savedElseTop = narrowTop
+    let narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
+    let els = P.nodes[s.ifElse]
+    let rc = 0
+    if els is IfStmt {
+      rc = emitIfExpr(body, s.ifElse, fnIx)
+    } else {
+      rc = emitBlockValue(body, s.ifElse, fnIx)
+    }
+    if narrowedElse { restoreNarrow(savedElseTop) }
+    if rc < 0 { return 0 - 1 }
+    fbEnd()                    // 0x0b end
+    return 0
+  }
+  emitFail("emitProgram: expected an if expression")
+}
+
+// The VALUE of an if-expression arm (the parser wraps `then <expr>` as a Block of
+// ONE statement): its single tail-value statement, emitted as an expression.
+function emitBlockValue(body: i32[], blockIx: i32, fnIx: i32): i32 {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    if stmts.length == 1 {
+      if stmtIsTailValue(stmts[0]) {
+        return emitExpr(body, stmts[0], fnIx)
+      }
+    }
+    return emitFail("emitProgram: if-expression arm is not a single value")
+  }
+  emitFail("emitProgram: if-expression arm is not a block")
 }
 
 // Peel any nested parentheses, returning the innermost wrapped expression index.
@@ -9674,6 +10086,37 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         }
         return 0
       }
+      // The linear-memory intrinsics, lowered INLINE (the host defines `__store_i32__`/
+      // `__load_i32__` as one-instruction wasm functions — same instruction, no call):
+      // store → `i32.store`, load → `i32.load`, `__log__` → call the synthetic
+      // in-module decoder at `gMemLogIdx` (the host imports `__log__` instead; the
+      // native runner provides no such import — see `emitMemLogFnCode`).
+      if callee.identName == "__store_i32__" {
+        if c.callArgs.length != 2 {
+          return emitFail("emitProgram: __store_i32__ takes exactly two arguments")
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        if emitExpr(body, c.callArgs[1], fnIx) < 0 { return 0 - 1 }
+        fbI32Store()
+        return 0
+      }
+      if callee.identName == "__load_i32__" {
+        if c.callArgs.length != 1 {
+          return emitFail("emitProgram: __load_i32__ takes exactly one argument")
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        fbI32Load()
+        return 0
+      }
+      if callee.identName == "__log__" {
+        if c.callArgs.length != 2 {
+          return emitFail("emitProgram: __log__ takes exactly two arguments")
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        if emitExpr(body, c.callArgs[1], fnIx) < 0 { return 0 - 1 }
+        fbCall(gMemLogIdx)
+        return 0
+      }
       let target = fnIndexOf(callee.identName)
       if target < 0 {
         // Not a known function name — a CLOSURE-VALUED callee (a let/param/global holding
@@ -9843,6 +10286,38 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
     // `call_ref` over the closure fat-pointer.
     if exprIsClosure(c.callFn, fnIx) {
       return emitCallRef(body, callIx, fnIx)
+    }
+    // A UFCS `self`-method call (the host parser's rule, parser.ts case 2):
+    // `o.f(args)` where `f` is a free function whose FIRST parameter is named
+    // `self` (and arity matches) lowers to the direct call `f(o, args)`. The
+    // callable-FIELD case won above (`exprIsClosure` → `call_ref`), mirroring the
+    // host's precedence. Lowered by building the direct-call node in the arena and
+    // re-lowering it, so every direct-call coercion path (struct hints, union
+    // boxing, nullable bridging, widening) is shared rather than duplicated.
+    let um = P.nodes[c.callFn]
+    if um is Member {
+      let uTarget = fnIndexOf(um.memProp)
+      if uTarget >= 0 {
+        let uFn = P.nodes[fnStmts[uTarget]]
+        if uFn is FuncDecl {
+          let uParams = uFn.fnParams
+          if uParams.length == c.callArgs.length + 1 {
+            let uP0 = P.nodes[uParams[0]]
+            if uP0 is Param {
+              if uP0.parName == "self" {
+                let uArgs: i32[] = []
+                uArgs.push(um.memObj)
+                let ua = 0
+                while ua < c.callArgs.length {
+                  uArgs.push(c.callArgs[ua])
+                  ua = ua + 1
+                }
+                return emitCall(body, mkCall(mkIdent(um.memProp), uArgs), fnIx)
+              }
+            }
+          }
+        }
+      }
     }
     return emitFail("emitProgram: callee is not a function name")
   }
@@ -10985,6 +11460,24 @@ function setNarrowFromCond(condIx: i32, fnIx: i32): boolean {
         }
       }
     }
+    // `x?.y is T` narrows the member PATH exactly like `x.y is T` — the then-arm
+    // only runs when every chain link held AND the union field matched, so the
+    // plain `x.y` reads inside it unbox under the same path key.
+    if mrecv is OptMember {
+      let omSi = optChainStructIdxOf(mrecv.omObj, fnIx)
+      if omSi >= 0 {
+        let omFi = sFieldIndex(omSi, mrecv.omProp)
+        if omFi >= 0 {
+          if sFieldTypeAt(omSi, omFi) == 16 {
+            let omRoot = P.nodes[unwrapParen(mrecv.omObj)]
+            if omRoot is Ident {
+              pushNarrow(omRoot.identName + "." + mrecv.omProp, c.isVariant)
+              return true
+            }
+          }
+        }
+      }
+    }
   }
   // `a && b` composes: the then-branch sees BOTH conjuncts' narrowings (the
   // host's A5 — the RHS is even CHECKED under the LHS's narrowing). The pushes
@@ -10994,6 +11487,13 @@ function setNarrowFromCond(condIx: i32, fnIx: i32): boolean {
       let nl = setNarrowFromCond(c.binLeft, fnIx)
       let nr = setNarrowFromCond(c.binRight, fnIx)
       return nl || nr
+    }
+  }
+  // `!cond` swaps the branch senses: the then-arm of `if !(x is A) { … }` sees the
+  // ELSE-narrowing of the inner condition (the host's negation complement).
+  if c is Unary {
+    if c.unOp == "!" {
+      return setNarrowFromCondElse(unwrapParen(c.unArg), fnIx)
     }
   }
   // `x == null` / `x != null` over a BOXED VALUE union narrows the THEN-branch:
@@ -11014,7 +11514,58 @@ function setNarrowFromCond(condIx: i32, fnIx: i32): boolean {
       }
     }
   }
+  // The same null-compare narrowing over a BOXED STRUCT union with a `null` member
+  // (`v: A | B | null`): `!=` strips `null` (so an inner `is`/else chain subtracts
+  // toward a single variant), `==` pins `null`. The 1-struct niche (`S | null`) is
+  // excluded — it is a nullable REF, not a box, and keeps its existing lowering.
+  let snm = structUnionNullCmpName(condIx, fnIx)
+  if snm != "" {
+    let scn = P.nodes[condIx]
+    if scn is BinExpr {
+      if scn.binOp == "==" {
+        pushNarrow(snm, "null")
+        return true
+      }
+      let srest = removeAtomFrom(currentStructNarrowSetOf(snm, fnIx), "null")
+      if srest != "" {
+        pushNarrow(snm, srest)
+        return true
+      }
+    }
+  }
   false
+}
+
+// The receiver NAME when the condition at `condIx` is `<ident> == null` /
+// `<ident> != null` over a BOXED STRUCT union (2+ struct variants plus a `null`
+// member), else "". The value-union and 1-struct-niche forms are excluded (each
+// keeps its own narrowing path).
+function structUnionNullCmpName(condIx: i32, fnIx: i32): string {
+  let c = P.nodes[condIx]
+  if c is BinExpr {
+    if c.binOp == "==" || c.binOp == "!=" {
+      let lhs = P.nodes[unwrapParen(c.binLeft)]
+      let rhs = P.nodes[unwrapParen(c.binRight)]
+      let refIx = 0 - 1
+      if rhs is NullLit { refIx = unwrapParen(c.binLeft) }
+      if lhs is NullLit { refIx = unwrapParen(c.binRight) }
+      if refIx >= 0 {
+        let r = P.nodes[refIx]
+        if r is Ident {
+          let un = unionNameOfIdent(r.identName, fnIx)
+          if un != "" {
+            if !isValueUnionName(un) {
+              let uset = unionMemberSetOf(un)
+              if unionHasAtom(uset, "null") && nonNullMemberCountOf(uset) >= 2 {
+                return r.identName
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  ""
 }
 
 // The receiver NAME when the condition at `condIx` is `<ident> == null` /
@@ -11065,8 +11616,33 @@ function setNarrowFromCondElse(condIx: i32, fnIx: i32): boolean {
           }
         }
       }
+      return false
+    }
+    // STRUCT-union complement (host flow narrowing): the guard was FALSE, so the
+    // tested VARIANT is stripped from the receiver's current set. When one member
+    // remains, the else-arm fully discriminates (`if v is A {…} else { v.y }`
+    // reads `v` as the `B` variant); a multi-member rest ("N2|N3") keeps a later
+    // `else if` arm subtracting toward its own singleton. Only a BOXED struct
+    // union narrows (`exprUnion` — the 1-struct niche is a nullable ref, whose
+    // member reads must not change).
+    let srecv = P.nodes[unwrapParen(c.isObj)]
+    if srecv is Ident {
+      if exprUnion(c.isObj, fnIx) {
+        let srest = removeAtomFrom(currentStructNarrowSetOf(srecv.identName, fnIx), c.isVariant)
+        if srest != "" {
+          pushNarrow(srecv.identName, srest)
+          return true
+        }
+      }
     }
     return false
+  }
+  // `!cond` in the ELSE-arm: the inner condition was TRUE there, so the else sees
+  // the inner condition's THEN-narrowing (`if !(n is Program) {…} else { n.progStmts }`).
+  if c is Unary {
+    if c.unOp == "!" {
+      return setNarrowFromCond(unwrapParen(c.unArg), fnIx)
+    }
   }
   let nm = valueUnionNullCmpName(condIx, fnIx)
   if nm != "" {
@@ -11079,6 +11655,23 @@ function setNarrowFromCondElse(condIx: i32, fnIx: i32): boolean {
       let rest = removeAtomFrom(currentNarrowSetOf(nm, fnIx), "null")
       if rest != "" {
         pushNarrow(nm, rest)
+        return true
+      }
+    }
+  }
+  // The struct-union dual: in the else of `v != null` the value IS `null`; in the
+  // else of `v == null` it is the non-null variant set.
+  let snm = structUnionNullCmpName(condIx, fnIx)
+  if snm != "" {
+    let scn = P.nodes[condIx]
+    if scn is BinExpr {
+      if scn.binOp == "!=" {
+        pushNarrow(snm, "null")
+        return true
+      }
+      let srest = removeAtomFrom(currentStructNarrowSetOf(snm, fnIx), "null")
+      if srest != "" {
+        pushNarrow(snm, srest)
         return true
       }
     }
@@ -11559,6 +12152,9 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       // (a void import) and a VOID function (`()->()` leaves nothing).
       if emitCall(body, stmtIx, fnIx) < 0 { return 0 - 1 }
       let dropIt = callee.identName != "print"
+      // The void memory intrinsics leave nothing on the stack.
+      if callee.identName == "__store_i32__" { dropIt = false }
+      if callee.identName == "__log__" { dropIt = false }
       if dropIt {
         let vt = fnIndexOf(callee.identName)
         if vt >= 0 {
@@ -11999,6 +12595,9 @@ function stmtIsTailValue(stmtIx: i32): boolean {
     let callee = P.nodes[s.callFn]
     if callee is Ident {
       if callee.identName == "print" { return false }
+      // The void memory intrinsics are statements, never tail values.
+      if callee.identName == "__store_i32__" { return false }
+      if callee.identName == "__log__" { return false }
       let target = fnIndexOf(callee.identName)
       if target >= 0 {
         return fRetVoid[target] == 0
@@ -13698,6 +14297,10 @@ function mAssignTypeIndices(n: i32): i32 {
       rlElemHeap[rs] = uBoxIdx
     } else if rlElemKindTbl[rs] == 3 {
       rlElemHeap[rs] = mStructIdxPre
+    } else if rlElemKindTbl[rs] == 4 {
+      // An `i32[][]` slot's element is the i32-list WRAPPER (interned just above,
+      // so `lTypeIdx` is already assigned).
+      rlElemHeap[rs] = lTypeIdx
     } else {
       let esi = structIndexByName(rlElemName[rs])
       if esi >= 0 { rlElemHeap[rs] = sHeapIdx[esi] } else { rlElemHeap[rs] = 0 }
@@ -14113,6 +14716,10 @@ function emitStartFnCode(out: i32[]): i32 {
             // A map global's start-fn init seeds the map SHAPE (mirrors the
             // local-`let` seeding) so `Map()` builds THIS global's map struct.
             if gck == 6 { pendingMapSlot = letMapShapeOf(globalStmts[gi], 0 - 1) }
+            // A struct / nullable-struct cell seeds the struct context so a bare
+            // `null` init lowers as `ref.null $S` and a literal builds THIS
+            // global's annotated struct (mirrors the const-path seeding).
+            if gck == 1 || gck == 9 { pendingStructIdx = globalCellStructIdx(globalStmts[gi]) }
             // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2.
             pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
             // A UNION cell (kind 4) coerces a raw init value into the box
@@ -14127,6 +14734,7 @@ function emitStartFnCode(out: i32[]): i32 {
             }
             pendingNulBool = false
             pendingMapSlot = 0 - 1
+            pendingStructIdx = 0 - 1
           }
           let setPrev = wTarget(bodyExpr)
           fbGlobalSet(gi)
@@ -14149,6 +14757,58 @@ function emitStartFnCode(out: i32[]): i32 {
   fbEnd()                  // 0x0b end (void → void: stack already empty)
   wTarget(endPrev)
 
+  let outPrev = wTarget(out)
+  wULEB(body.length)
+  wBytes(body)
+  wTarget(outPrev)
+  0
+}
+
+// The synthetic `__log__(offset, length)` decoder body: walk the tag/value pairs in
+// linear memory ([offset, offset+length), 8 bytes per pair) and print each value.
+// Mirrors the host runner's `__log__` import (compile.ts `runWasm`): tag 0 = plain
+// i32, printed via `__print_i32__` (import 0 — `memLogUsed` forces the print family).
+// A non-zero tag (i64/f32/f64 payloads, which span extra words) traps (`unreachable`)
+// — no corpus program logs them natively yet, and a silent wrong decode is worse.
+// DIVERGENCE (justified): the host joins a multi-pair log into ONE space-separated
+// line; this prints one line per pair. Every corpus `__log__` call logs exactly one
+// pair, so stdout is identical.
+function emitMemLogFnCode(out: i32[]): i32 {
+  let body: i32[] = []
+  let prev = wTarget(body)
+  // Locals vector: params occupy 0 (offset) and 1 (length); local 2 is the cursor.
+  wULEB(1)                    // 1 locals run
+  wULEB(1)                    // count 1
+  wU8(127)                    // 0x7f i32
+  fbLocalGet(0)
+  fbLocalSet(2)               // cursor = offset
+  fbBlock(64)                 // block (void)
+  fbLoop(64)                  // loop (void)
+  fbLocalGet(2)
+  fbLocalGet(0)
+  fbLocalGet(1)
+  fbI32Bin(106)               // 0x6a i32.add — offset + length (the end)
+  fbI32Bin(78)                // 0x4e i32.ge_s — cursor >= end?
+  fbBrIf(1)                   // exit the block
+  fbLocalGet(2)
+  fbI32Load()                 // the pair's TAG
+  fbIf(64)                    // tag != 0 → unsupported payload kind
+  fbUnreachable()
+  fbEnd()
+  fbLocalGet(2)
+  fbI32Const(4)
+  fbI32Bin(106)               // i32.add — the value word
+  fbI32Load()
+  fbCall(0)                   // __print_i32__ (import 0)
+  fbLocalGet(2)
+  fbI32Const(8)
+  fbI32Bin(106)               // i32.add
+  fbLocalSet(2)               // cursor += 8
+  fbBr(0)                     // next pair
+  fbEnd()                     // end loop
+  fbEnd()                     // end block
+  fbEnd()                     // 0x0b end (void function: stack empty)
+  wTarget(prev)
   let outPrev = wTarget(out)
   wULEB(body.length)
   wBytes(body)
@@ -14276,6 +14936,12 @@ function emitModule(stmts: i32[]): i32 {
   // themselves sit after any imports) and its `()->()` functype index (one past the
   // user functypes). Both unused when no start.
   let startFnIdx = gImports + n
+  // The synthetic `__log__` decoder (memory intrinsics) is the LAST function index —
+  // after the imports, the user functions, AND the start fn — so no other function
+  // index shifts. `memFn` (0 or 1) feeds the function/code section counts.
+  let memFn = 0
+  if memLogUsed { memFn = 1 }
+  gMemLogIdx = gImports + n + hasStart
 
   // Heap-type indices, in type-section order: standalone structs at 0..ns-1, then
   // (for the union path) the variant structs + box, then the raw i32 array, the
@@ -14325,7 +14991,7 @@ function emitModule(stmts: i32[]): i32 {
   if gNeedsI64Print { nPrintTypes = nPrintTypes + 1 }   // + (i64)->() for __print_i64__
   if gNeedsF64Print { nPrintTypes = nPrintTypes + 1 }   // + (f64)->() for __print_f64__
   if gNeedsF32Print { nPrintTypes = nPrintTypes + 1 }   // + (f32)->() for __print_f32__
-  wULEB(1 + nPrintTypes)                 // rectypes: the rec group + the standalone print functypes
+  wULEB(1 + nPrintTypes + memFn)         // rectypes: the rec group + the standalone print/(log) functypes
   wU8(78)                                // 0x4e rec group
   wULEB(n + typeOffset + hasStart)       // types inside the rec group (print functypes excluded)
   if sDeclared {
@@ -14716,6 +15382,16 @@ function emitModule(stmts: i32[]): i32 {
     wU8(125)                     // 0x7d f32
     wU8(0)                       // 0 results
   }
+  // The `(i32, i32) -> ()` functype for the synthetic `__log__` decoder, standalone
+  // LAST (after every print functype) so no existing functype index shifts. Its
+  // index is `typeOffset + n + hasStart + nPrintTypes`.
+  if memLogUsed {
+    wU8(96)                      // 0x60 func
+    wU8(2)                       // 2 params
+    wU8(127)                     // 0x7f i32 (offset)
+    wU8(127)                     // 0x7f i32 (length)
+    wU8(0)                       // 0 results
+  }
   wTarget(tyPrev)
   wSection(1, typePayload)
 
@@ -14789,7 +15465,7 @@ function emitModule(stmts: i32[]): i32 {
   // the `()->()` functype at index `typeOffset + n`.
   let funcPayload: i32[] = []
   let fnPrev = wTarget(funcPayload)
-  wULEB(n + hasStart)
+  wULEB(n + hasStart + memFn)
   let fi = 0
   while fi < n {
     // A function whose env-leading signature matches an interned `$fnsig` is declared
@@ -14806,8 +15482,28 @@ function emitModule(stmts: i32[]): i32 {
   if hasStart == 1 {
     wULEB(typeOffset + n)    // start fn functype index
   }
+  if memLogUsed {
+    // The synthetic `__log__` decoder uses the standalone `(i32,i32)->()` functype
+    // emitted after the print functypes.
+    wULEB(typeOffset + n + hasStart + nPrintTypes)
+  }
   wTarget(fnPrev)
   wSection(3, funcPayload)
+
+  // Memory section (id 5, between function (3) and global (6)): ONE module-DEFINED
+  // memory, min 1 page (64 KiB — ample for the corpus' tag/value scratch region), no
+  // max. The host IMPORTS `imports.memory` instead; the native runner provides no
+  // memory import, so the module defines its own (same observable behavior). Emitted
+  // only when a memory intrinsic is used — byte-identical output otherwise.
+  if memUsed {
+    let memPayload: i32[] = []
+    let memPrev = wTarget(memPayload)
+    wULEB(1)                     // 1 memory
+    wU8(0)                       // limits flag 0x00: min only
+    wULEB(1)                     // min: 1 page
+    wTarget(memPrev)
+    wSection(5, memPayload)
+  }
 
   // Global section (id 6): one mutable global per top-level `let`/`const`, in
   // declaration order (that order IS the global index `global.get`/`global.set` use).
@@ -14874,6 +15570,10 @@ function emitModule(stmts: i32[]): i32 {
           let gck = globalCellKind(globalStmts[gi])
           let gcs = globalCellStructIdx(globalStmts[gi])
           if gck == 1 { pendingStructIdx = gcs }
+          // A NULLABLE-struct cell (kind 9) seeds the same struct context: a bare
+          // `null` init lowers as `ref.null $S` (a valid constexpr), a struct
+          // literal as that struct.
+          if gck == 9 { pendingStructIdx = gcs }
           pendingListKind = letAnnRefListKind(globalStmts[gi])
           pendingListSlot = letAnnRefListSlot(globalStmts[gi])
           // A ref-array cell (kind 5) passes the ref-list TABLE SLOT as `fbValtype`'s
@@ -14987,7 +15687,7 @@ function emitModule(stmts: i32[]): i32 {
   // (if any) the synthetic start function's body LAST.
   let codePayload: i32[] = []
   let codePrev = wTarget(codePayload)
-  wULEB(n + hasStart)
+  wULEB(n + hasStart + memFn)
   wTarget(codePrev)
   let ci = 0
   while ci < n {
@@ -14996,6 +15696,9 @@ function emitModule(stmts: i32[]): i32 {
   }
   if hasStart == 1 {
     if emitStartFnCode(codePayload) < 0 { return 0 - 1 }
+  }
+  if memLogUsed {
+    if emitMemLogFnCode(codePayload) < 0 { return 0 - 1 }
   }
   wSection(10, codePayload)
 
@@ -15093,6 +15796,10 @@ function nameIsMapArray(name: string): boolean {
 // NOT a ref array. The element name is recovered by checking each declared struct/union
 // name + `"[]"` (a `string + string` concat; a `string + i32` would be a type error).
 function nameIsRefArray(name: string): boolean {
+  // A NESTED `i32[][]` is a ref list whose elements are the i32-list wrapper
+  // (element kind 4) — the existing ref-pair machinery serves it; only the
+  // element heap type differs (`lTypeIdx`).
+  if name == "i32[][]" { return true }
   let i = 0
   while i < sNames.length {
     if name == sNames[i] + "[]" { return true }
@@ -15130,6 +15837,7 @@ function parenUnionArrElemName(name: string): string {
 // `1` = a struct element, `2` = a union-box element (`uBoxIdx`), `3` = a map-struct
 // element (`mStructIdx`, the scope-chain `{[string]:i32}[]`).
 function refArrElemKind(name: string): i32 {
+  if name == "i32[][]" { return 4 }
   if nameIsMapArray(name) { return 3 }
   // A `(string|i32)[]` value-union element list is a union-box list (kind 2).
   if parenUnionArrElemName(name) != "" { return 2 }
@@ -15356,6 +16064,12 @@ function collectA(stmts: i32[]): i32 {
         raUsed = true
         rElemKind = arrLitElemKind(i)
         rlInternName(arrLitElemName(i), arrLitElemKind(i))
+        // A nested `[[…]]` literal's elements are i32-list wrappers — force the
+        // i32 list + raw array types for them.
+        if arrLitElemKind(i) == 4 {
+          lUsed = true
+          aUsed = true
+        }
       } else if arrLitIsStr(i, 0 - 1) {
         // A STRING-element literal is a string-ref list — the same wrapper/backing
         // a `string[]` annotation forces.
@@ -15443,6 +16157,12 @@ function collectA(stmts: i32[]): i32 {
         raUsed = true
         rElemKind = refArrElemKind(nd.tyName)
         rlInternName(refArrElemName(nd.tyName), refArrElemKind(nd.tyName))
+        // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
+        // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
+        if refArrElemKind(nd.tyName) == 4 {
+          lUsed = true
+          aUsed = true
+        }
         if nameIsMapArray(nd.tyName) {
           mUsed = true
           lUsed = true
@@ -15482,6 +16202,14 @@ function arrLitIsRef(arrIx: i32): boolean {
     if a.arrElems.length < 1 { return false }
     let e0 = P.nodes[a.arrElems[0]]
     if e0 is ObjLit { return true }
+    // A NESTED array literal (`[[1, 2], [3, 4]]`) whose inner elements are
+    // i32-ish is an `i32[][]` ref list (element kind 4). String / f64 / ref
+    // inner elements stay unsupported (loud failure downstream).
+    if e0 is ArrayLit {
+      if !arrLitIsStr(a.arrElems[0], 0 - 1) && !arrLitIsF64(a.arrElems[0], 0 - 1) && !arrLitIsRef(a.arrElems[0]) {
+        return true
+      }
+    }
   }
   false
 }
@@ -15521,6 +16249,7 @@ function arrLitElemKind(arrIx: i32): i32 {
   if a is ArrayLit {
     if a.arrElems.length >= 1 {
       let e0 = P.nodes[a.arrElems[0]]
+      if e0 is ArrayLit { return 4 }
       if e0 is ObjLit {
         // A union-variant element boxes into the union (kind 2); a plain struct is kind 1.
         if uDeclared {
@@ -15542,6 +16271,7 @@ function arrLitElemName(arrIx: i32): string {
   if a is ArrayLit {
     if a.arrElems.length >= 1 {
       let e0 = P.nodes[a.arrElems[0]]
+      if e0 is ArrayLit { return "i32[]" }
       if e0 is ObjLit {
         if uDeclared {
           let vn = objVariantName(a.arrElems[0])
@@ -15559,6 +16289,7 @@ function arrLitElemName(arrIx: i32): string {
 // element is `name` with the trailing `"[]"` removed — i.e. the struct / union alias
 // name. Mirrors `refArrElemKind` but yields the table key.
 function refArrElemName(name: string): string {
+  if name == "i32[][]" { return "i32[]" }
   if nameIsMapArray(name) { return name.slice(0, name.length - 2) }
   // `(string|i32)[]` → `string|i32` (the parens are annotation grouping only —
   // the TABLE key is the bare atom-set name every other union position uses).
@@ -15762,7 +16493,7 @@ function collectAnnShapes(): i32 {
             k = k + 1
           }
           if ok && names.length > 0 {
-            if annShapeIndexOf(names) < 0 {
+            if annShapeIndexOf(names, codes) < 0 {
               sDeclared = true
               // Interned under the ANNOTATION TEXT itself (`{v:i32}`) — a real
               // key, so `structIndexByName` on a ref-list element name (`{v:i32}[]`
@@ -15865,14 +16596,22 @@ function internShapeAs(key: string, nm: string): i32 {
 }
 
 // The struct table index whose field-name SET matches `names` exactly, or -1.
-function annShapeIndexOf(names: string[]): i32 {
+function annShapeIndexOf(names: string[], codes: i32[]): i32 {
   let si = 0
   while si < sNames.length {
     if sFieldCount[si] == names.length {
       let allIn = true
       let i = 0
       while i < names.length {
-        if sFieldIndex(si, names[i]) < 0 { allIn = false }
+        let fi = sFieldIndex(si, names[i])
+        if fi < 0 {
+          allIn = false
+        } else if sFieldTypeAt(si, fi) != codes[i] {
+          // The same field-NAME set with a DIFFERENT field type (`{y:i32}` vs
+          // `{y:string|i32}`) is a DISTINCT shape — intern it separately so each
+          // annotation resolves its own struct (host: structural interning).
+          allIn = false
+        }
         i = i + 1
       }
       if allIn { return si }
@@ -16239,7 +16978,72 @@ function collectS(stmts: i32[]): i32 {
 // `uFieldNames`/`uFieldStart`/`uFieldCount`/`uFieldTypes` table (declaration order =
 // wasm field index). The struct must exist among the top-level statements and carry
 // only i32/boolean/string fields, else fails loudly. Returns 0, or -1 (via `emitFail`).
+// Parse the inline-shape variant `nm` (`{x:i32,y:string}`) into the flat
+// union-variant field tables — the variant-table twin of `collectAnnShapes`'s
+// field split (same depth-aware `,`/`:` grammar).
+function collectShapeVariantFields(nm: string): i32 {
+  let inner = nm.slice(1, nm.length - 1)
+  uFieldStart.push(uFieldNames.length)
+  let cnt = 0
+  let depth = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    let atEnd = k == inner.length
+    let brk = false
+    if !atEnd {
+      if inner[k] == '{' || inner[k] == '[' || inner[k] == '(' { depth = depth + 1 }
+      if inner[k] == '}' || inner[k] == ']' || inner[k] == ')' { depth = depth - 1 }
+      if inner[k] == ',' && depth == 0 { brk = true }
+    } else {
+      brk = true
+    }
+    if brk {
+      let part = inner.slice(start, k)
+      let ci = part.indexOf(":")
+      if ci <= 0 {
+        return emitFail("emitProgram: malformed inline union-variant shape")
+      }
+      let ftxt = part.slice(ci + 1, part.length)
+      let fc = nameFieldCode(ftxt)
+      if fc < 0 {
+        return emitFail("emitProgram: only i32 / boolean / string / array union-variant fields are supported")
+      }
+      uFieldTypes.push(fc)
+      uFieldElemName.push(shapeFieldElemName(ftxt, fc))
+      uFieldNames.push(part.slice(0, ci))
+      cnt = cnt + 1
+      start = k + 1
+    }
+    k = k + 1
+  }
+  uFieldCount.push(cnt)
+  0
+}
+
+// The ELEMENT/TARGET name a shape-text field records in `uFieldElemName`: a
+// ref-list field its element name, a nested-struct field its (non-null) target
+// name, a value-union field its atom-set name; "" otherwise.
+function shapeFieldElemName(ftxt: string, code: i32): string {
+  if code == 5 { return refArrElemName(ftxt) }
+  if code == 15 {
+    let nb = nullablePartOf(ftxt)
+    if nb != "" { return nb }
+    return ftxt
+  }
+  if code == 16 { return ftxt }
+  ""
+}
+
 function collectVariantFields(stmts: i32[], name: string): i32 {
+  // An INLINE-SHAPE variant (`{x:i32}` inside `{x:i32}|{y:i32}`) carries its
+  // fields in its own text — parse them (the annotation-shape field grammar)
+  // instead of looking for a TypeDecl.
+  if name.length >= 2 {
+    if name[0] == '{' && name[1] != '[' && name[name.length - 1] == '}' {
+      return collectShapeVariantFields(name)
+    }
+  }
   let i = 0
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
@@ -16506,6 +17310,7 @@ function registerValueUnionName(name: string): i32 {
   if !isValueUnionName(name) { return 0 }
   uDeclared = true
   unNames.push(name)
+  unMemberSet.push(name)
   unVarStart.push(uVariants.length)
   unVarCount.push(0)
   markValueUnionAtoms(name)
@@ -16561,7 +17366,17 @@ function isInlineStructUnion(stmts: i32[], name: string): boolean {
   let j = 0
   while j < atoms.length {
     if atoms[j] != "null" {
-      if !isDeclaredStructName(stmts, atoms[j]) { return false }
+      if !isDeclaredStructName(stmts, atoms[j]) {
+        // An INLINE-SHAPE member (`{x:i32}` in `{x:i32}|{y:i32}`) is a struct
+        // variant too — its fields parse from its own text. A map shape
+        // (`{[…]}`) is not.
+        let aj = atoms[j]
+        let shapeOk = false
+        if aj.length >= 2 {
+          if aj[0] == '{' && aj[1] != '[' && aj[aj.length - 1] == '}' { shapeOk = true }
+        }
+        if !shapeOk { return false }
+      }
       structAtoms = structAtoms + 1
     }
     j = j + 1
@@ -16597,6 +17412,7 @@ function registerInlineUnion(stmts: i32[], name: string): i32 {
   splitUnionAtoms(name, atoms)
   uDeclared = true
   unNames.push(name)
+  unMemberSet.push(name)
   unVarStart.push(uVariants.length)
   // A `null` atom is no variant struct — only the struct members occupy slots.
   let nStructs = 0
@@ -16717,6 +17533,7 @@ function collectU(stmts: i32[]): i32 {
   vbF32Used = false
   vbF64Used = false
   unNames = []
+  unMemberSet = []
   unVarStart = []
   unVarCount = []
   uVariants = []
@@ -16742,6 +17559,15 @@ function collectU(stmts: i32[]): i32 {
         return emitFail("emitProgram: union must have at least one variant")
       }
       unNames.push(s.udName)
+      // The alias's full member set, pipe-joined (atom members like `null` kept).
+      let udSet = ""
+      let usj = 0
+      while usj < vs.length {
+        if udSet != "" { udSet = udSet + "|" }
+        udSet = udSet + vs[usj]
+        usj = usj + 1
+      }
+      unMemberSet.push(udSet)
       unVarStart.push(uVariants.length)
       unVarCount.push(vs.length)
       let vi = 0
@@ -17104,6 +17930,16 @@ function structIndexOfLet(letIx: i32, fnIx: i32): i32 {
       if lt is TypeRef {
         let si = structIndexByName(lt.tyName)
         if si >= 0 { return si }
+        // A NULLABLE annotation (`{n:i32} | null`, `Config | null`) resolves its
+        // NON-NULL part — `collectAnnShapes` interns an inline shape under the
+        // bare text (the `|null` wrapper stripped), and a named alias interns
+        // under its own name. Needed when the initializer is a bare `null` (no
+        // struct literal to infer the index from).
+        let nb = nullablePartOf(lt.tyName)
+        if nb != "" {
+          let si2 = structIndexByName(nb)
+          if si2 >= 0 { return si2 }
+        }
       }
     }
     return structIndexOfExpr(d.letInit, fnIx)
@@ -17339,6 +18175,43 @@ function currentNarrowSetOf(name: string, fnIx: i32): string {
   unionNameOfIdent(name, fnIx)
 }
 
+// The FULL pipe-joined member set of the union named `name`: a registered alias
+// returns its `unMemberSet` entry (a declared `type N = A | B` expands to "A|B",
+// atom members like `null` kept); an unregistered / already-pipe-joined name
+// passes through unchanged. Lets complement narrowing subtract variants from an
+// ALIAS-annotated binding's set.
+function unionMemberSetOf(name: string): string {
+  let u = 0
+  while u < unNames.length {
+    if unNames[u] == name { return unMemberSet[u] }
+    u = u + 1
+  }
+  name
+}
+
+// The CURRENT narrowed variant set of a STRUCT-union binding `name`: its innermost
+// active narrowing when one exists (which may already be a subtracted sub-set),
+// else its declared union's FULL member set (alias names expanded so subtraction
+// sees every variant + a `null` member). "" when not a union binding.
+function currentStructNarrowSetOf(name: string, fnIx: i32): string {
+  let v = narrowVariantFor(name)
+  if v != "" { return v }
+  unionMemberSetOf(unionNameOfIdent(name, fnIx))
+}
+
+// The number of NON-`null` members in the pipe-joined set `set`.
+function nonNullMemberCountOf(set: string): i32 {
+  let atoms: string[] = []
+  splitUnionAtoms(set, atoms)
+  let n = 0
+  let i = 0
+  while i < atoms.length {
+    if atoms[i] != "null" { n = n + 1 }
+    i = i + 1
+  }
+  n
+}
+
 // The variant struct name an object literal at `objIx` matches: the union variant
 // whose field-name set EQUALS the literal's field names (order-independent), or "" if
 // none. Used to pick the tag + variant struct when boxing an object literal into the
@@ -17472,6 +18345,16 @@ function exprArray(exprIx: i32, fnIx: i32): boolean {
   // list wrapper ref — so `.length` / indexing / assignment treat it as a list (gap #5).
   if e is Member {
     if memFieldTypeCode(exprIx, fnIx) == 4 { return true }
+  }
+  // `m[i]` over an `i32[][]` ref list (element kind 4) yields the INNER i32 list,
+  // so a chained `m[i][j]` / `m[i].length` treats it as a list.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      let slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        if rlElemKindTbl[slot] == 4 { return true }
+      }
+    }
   }
   false
 }
@@ -19965,6 +20848,8 @@ function emitProgram(rootIx: i32): i32 {
     gF64PrintIdx = 0
     gNeedsF32Print = false
     gF32PrintIdx = 0
+    memUsed = false
+    memLogUsed = false
     let pscan = 0
     let sawI64Ann = false
     let sawF64 = false
@@ -19975,6 +20860,18 @@ function emitProgram(rootIx: i32): i32 {
         let pcallee = P.nodes[pn.callFn]
         if pcallee is Ident {
           if pcallee.identName == "print" {
+            gImports = 4
+          }
+          // The linear-memory intrinsics: any store/load forces the module-defined
+          // memory; `__log__` additionally forces the synthetic decoder function,
+          // which prints through `__print_i32__` — so it pulls in the print-import
+          // family exactly as a `print(...)` call does.
+          if pcallee.identName == "__store_i32__" || pcallee.identName == "__load_i32__" {
+            memUsed = true
+          }
+          if pcallee.identName == "__log__" {
+            memUsed = true
+            memLogUsed = true
             gImports = 4
           }
         }

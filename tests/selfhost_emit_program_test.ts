@@ -1099,10 +1099,11 @@ const CASES: Case[] = [
     },
   },
   {
-    // A nested array element type that is genuinely unsupported (`i32[][]`) still fails
-    // loudly — the `string[]` element type is now supported (see the G5/G3 string-list
-    // tests below), but an array-of-arrays element has no list type.
-    name: "a nested array element type (`i32[][]`) fails loudly",
+    // A nested array element type (`i32[][]`) is now SUPPORTED (element kind 4 —
+    // the inner list rides the existing ref-list machinery); the empty declaration
+    // compiles to a valid module. Runtime behavior is covered by the promoted
+    // corpus cases (index/nested-2d-array.vl, lists/struct-field-pop-statement.vl).
+    name: "a nested array element type (`i32[][]`) compiles to a valid module",
     src: [
       "function main(): i32 {",
       "  let a: i32[][] = []",
@@ -1110,15 +1111,15 @@ const CASES: Case[] = [
       "}",
       "",
     ].join("\n"),
-    check: (logs) => {
+    check: async (logs) => {
       const errLine = logs.find((l) => l.startsWith("err: "));
-      if (!errLine) {
-        throw new Error(
-          `expected an \`err:\` line for the nested array; got ${
-            JSON.stringify(logs)
-          }`,
-        );
+      if (errLine) {
+        throw new Error(`expected a clean compile for i32[][]; got ${errLine}`);
       }
+      const main = logs.find((l) => l.startsWith("main: "));
+      if (!main) throw new Error("expected emitted bytes for i32[][]");
+      const bytes = new Uint8Array(main.slice(6).split(",").map(Number));
+      await WebAssembly.compile(bytes);
     },
   },
   // ── growable arrays + `.push` ──────────────────────────────────────────────
