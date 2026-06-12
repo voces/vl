@@ -5011,8 +5011,19 @@ const runAll = (): Promise<Map<string, string[]>> =>
     return byKey;
   })();
 
+// F-tiers: gated to the deno-side bisect tier — any always-on test here forces
+// the ~90s cold assembly compile (the file's single big compile). The byte
+// tripwire moved NATIVE: `scripts/native-golden-check.ts` (vl build each golden
+// + cmp, ~1s, in ci-native after the fixpoint); the behavioral cases' coverage
+// is corpus-absorbed (native align RUN tier + sweep). `SELFHOST_DENO_RUN=1`
+// re-enables this V8-side run for bisecting.
+const DENO_RUN = Deno.env.get("SELFHOST_DENO_RUN") === "1";
+
 CASES.forEach((c, i) => {
-  Deno.test(`self-hosted emit-program: ${c.name}`, async () => {
+  Deno.test({
+    name: `self-hosted emit-program: ${c.name}`,
+    ignore: !DENO_RUN,
+  }, async () => {
     const logs = (await runAll()).get(`c${i}`) ?? [];
     await c.check(logs);
   });
@@ -5025,7 +5036,10 @@ CASES.forEach((c, i) => {
 // WebAssembly.compile for validity, then byte-compare against the fixture.
 // The UPDATE_GOLDEN=1 regenerate path writes the bytes back to the fixture.
 GOLDENS.forEach((g) => {
-  Deno.test(`emit-golden: ${g.name} — ${g.covers}`, async () => {
+  Deno.test({
+    name: `emit-golden: ${g.name} — ${g.covers}`,
+    ignore: !DENO_RUN,
+  }, async () => {
     const lines = (await runAll()).get(g.name) ?? [];
     const errLine = lines.find((l) => l.startsWith("err: "));
     if (errLine) {

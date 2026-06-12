@@ -26,18 +26,27 @@ export const GOLDENS: Golden[] = [
     name: "g_arith",
     covers:
       "binOpcode set (+ - * / %, the 6 compares), call, local.get, if/else/br, recursion (fib)",
+    // CHECKER-CLEAN (re-pinned with the native golden tripwire): the original
+    // summed raw booleans (`lt + le + …`), which only the GATELESS emit path
+    // accepted — both checkers reject bool arithmetic (the A15 coercion gap).
+    // The `b2i` helper converts each compare to i32, keeping every compare
+    // opcode + the arithmetic set + call + if/br in the emitted bytes.
     src: [
+      "function b2i(c: boolean): i32 {",
+      "  if c { return 1 }",
+      "  return 0",
+      "}",
       "function fib(n: i32): i32 {",
       "  if n < 2 { return n }",
       "  return fib(n - 1) + fib(n - 2)",
       "}",
       "function ops(a: i32, b: i32): i32 {",
-      "  let lt = a < b",
-      "  let le = a <= b",
-      "  let gt = a > b",
-      "  let ge = a >= b",
-      "  let eq = a == b",
-      "  let ne = a != b",
+      "  let lt = b2i(a < b)",
+      "  let le = b2i(a <= b)",
+      "  let gt = b2i(a > b)",
+      "  let ge = b2i(a >= b)",
+      "  let eq = b2i(a == b)",
+      "  let ne = b2i(a != b)",
       "  let q = a / b",
       "  let r = a % b",
       "  return lt + le + gt + ge + eq + ne + q + r",
@@ -240,6 +249,11 @@ export const GOLDENS: Golden[] = [
     name: "g_maparray",
     covers:
       "array-of-maps ({[string]:i32}[]): map struct as ref-list elem + map+list scratch frames combined",
+    // CHECKER-CLEAN (re-pinned with the native golden tripwire): the original
+    // indexed the nullable `pop()` result unguarded, which only the GATELESS
+    // emit path accepted. Reading the element BEFORE the pop preserves the
+    // coverage point (map struct as ref-list element + combined map/list
+    // scratch frames + `??` + pop) without indexing a nullable.
     src: [
       "function main(): i32 {",
       "  let scopes: {[string]: i32}[] = []",
@@ -247,8 +261,8 @@ export const GOLDENS: Golden[] = [
       "  scopes.push(Map())",
       '  scopes[0]["x"] = 7',
       '  scopes[1]["k"] = 9',
-      "  let top = scopes.pop()",
-      '  let v = top["k"] ?? -1',
+      '  let v = scopes[1]["k"] ?? -1',
+      "  scopes.pop()",
       '  return v + (scopes[0]["x"] ?? -1) + scopes.length',
       "}",
       "",
