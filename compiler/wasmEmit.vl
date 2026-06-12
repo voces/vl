@@ -3273,6 +3273,21 @@ let strPushScratchBase: i32 = 0
 let fnUsesStrOp: boolean = false
 let strScratchBase: i32 = 0
 
+// ── per-function list `==`/`!=`/`+` scratch frames (collections-design §VL.4/6) ──
+// List value-equality and list concat lower INLINE (like the string ops above),
+// each staging its two operand WRAPPER refs + a length and an index. One typed
+// frame per receiver list KIND so a nested compare (an `i32[][]` element loop
+// recursing into an i32-list compare) never clobbers its outer loop:
+//   LEQI (5 slots): A/B `(ref $lTypeIdx)`, out `(ref $aTypeIdx)` (concat), n, i
+//   LEQS (4 slots): A/B `(ref $mkListIdx)`, n, i  (string elements ride strScr)
+//   LEQR (4 slots, one frame per ref-list slot): A/B `(ref $rlWrapIdx[slot])`, n, i
+let fnUsesListEqI: boolean = false
+let leqIScratchBase: i32 = 0
+let fnUsesListEqS: boolean = false
+let leqSScratchBase: i32 = 0
+let fnListEqRSlots: i32[] = []
+let leqRBases: i32[] = []
+
 // ── struct-type table (MULTIPLE structs per program) ──────────────────────────
 // A program may declare MANY struct `type`s. Mirroring the union variant table, the
 // struct table is a FLAT store keyed by struct index (declaration order): struct `i`
@@ -4560,6 +4575,166 @@ function exprIsStructEq(binIx: i32, fnIx: i32): boolean {
     }
   }
   false
+}
+
+// ── list `==`/`!=`/`+` detection (which functions need the list-op frames) ────
+// The list-op operand KIND of an expression: `0` an i32 list, `3` a string
+// list, `4` an `i32[][]` (a ref list of i32-list elements), or -1 (not a list /
+// an unsupported element kind). Order mirrors `emitIndex`'s receiver dispatch.
+function listOpKindOf(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 - 1 }
+  if exprString(exprIx, fnIx) { return 0 - 1 }
+  if exprStringArray(exprIx, fnIx) { return 3 }
+  if exprF64Array(exprIx, fnIx) { return 0 - 1 }
+  if exprRefArray(exprIx, fnIx) {
+    let slot = refListSlotOfExpr(exprIx, fnIx)
+    if slot >= 0 && slot < rlElemKindTbl.length {
+      if rlElemKindTbl[slot] == 4 { return 4 }
+    }
+    return 0 - 1
+  }
+  if exprArray(exprIx, fnIx) { return 0 }
+  0 - 1
+}
+
+// The list-op kind of a `==`/`!=`/`+` BinExpr whose operands are BOTH lists of
+// one kind, or -1 (not a list op — the caller keeps its existing dispatch).
+function listOpKindOfBin(binIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" || e.binOp == "+" {
+      let lk = listOpKindOf(e.binLeft, fnIx)
+      if lk < 0 { return 0 - 1 }
+      let rk = listOpKindOf(e.binRight, fnIx)
+      if rk != lk { return 0 - 1 }
+      return lk
+    }
+  }
+  0 - 1
+}
+
+// Note one BinExpr's list-op kind into the per-function frame flags.
+function leqNoteBin(binIx: i32, fnIx: i32): i32 {
+  let k = listOpKindOfBin(binIx, fnIx)
+  if k == 0 { fnUsesListEqI = true }
+  if k == 3 {
+    fnUsesListEqS = true
+    // The per-element string compares stage operands in the string-op frame.
+    fnUsesStrOp = true
+  }
+  if k == 4 {
+    // The nested element compare recurses into the i32-list frame.
+    fnUsesListEqI = true
+    let e = P.nodes[binIx]
+    if e is BinExpr {
+      let slot = refListSlotOfExpr(e.binLeft, fnIx)
+      if slot >= 0 {
+        let seen = false
+        let i = 0
+        while i < fnListEqRSlots.length {
+          if fnListEqRSlots[i] == slot { seen = true }
+          i = i + 1
+        }
+        if !seen { fnListEqRSlots.push(slot) }
+      }
+    }
+  }
+  0
+}
+
+// Recursive expression walk noting every list `==`/`!=`/`+` site.
+function leqScanExpr(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 }
+  let e = P.nodes[exprIx]
+  if e is BinExpr {
+    leqNoteBin(exprIx, fnIx)
+    leqScanExpr(e.binLeft, fnIx)
+    return leqScanExpr(e.binRight, fnIx)
+  }
+  if e is Unary { return leqScanExpr(e.unArg, fnIx) }
+  if e is Paren { return leqScanExpr(e.parInner, fnIx) }
+  if e is Call {
+    leqScanExpr(e.callFn, fnIx)
+    let args = e.callArgs
+    let i = 0
+    while i < args.length {
+      leqScanExpr(args[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  if e is Member { return leqScanExpr(e.memObj, fnIx) }
+  if e is OptMember { return leqScanExpr(e.omObj, fnIx) }
+  if e is Index {
+    leqScanExpr(e.idxArr, fnIx)
+    return leqScanExpr(e.idxIndex, fnIx)
+  }
+  if e is ArrayLit {
+    let es = e.arrElems
+    let i2 = 0
+    while i2 < es.length {
+      leqScanExpr(es[i2], fnIx)
+      i2 = i2 + 1
+    }
+    return 0
+  }
+  if e is ObjLit {
+    let fs = e.objFields
+    let i3 = 0
+    while i3 < fs.length {
+      let f = P.nodes[fs[i3]]
+      if f is FieldInit { leqScanExpr(f.fiValue, fnIx) }
+      i3 = i3 + 1
+    }
+    return 0
+  }
+  if e is IsExpr { return leqScanExpr(e.isObj, fnIx) }
+  0
+}
+
+// Statement-level walk (descends branch/loop bodies; a bare expression
+// statement falls through to the expression walk).
+function leqScanStmt(stmtIx: i32, fnIx: i32): i32 {
+  if stmtIx < 0 { return 0 }
+  let s = P.nodes[stmtIx]
+  if s is LetDecl { return leqScanExpr(s.letInit, fnIx) }
+  if s is RetStmt { return leqScanExpr(s.retArg, fnIx) }
+  if s is IfStmt {
+    leqScanExpr(s.ifCond, fnIx)
+    leqScanBlock(s.ifThen, fnIx)
+    return leqScanBlock(s.ifElse, fnIx)
+  }
+  if s is WhileStmt {
+    leqScanExpr(s.whileCond, fnIx)
+    return leqScanBlock(s.whileBody, fnIx)
+  }
+  if s is ForRange {
+    leqScanExpr(s.frFrom, fnIx)
+    leqScanExpr(s.frTo, fnIx)
+    leqScanExpr(s.frStep, fnIx)
+    return leqScanBlock(s.frBody, fnIx)
+  }
+  if s is ForIn {
+    leqScanExpr(s.fiIter, fnIx)
+    return leqScanBlock(s.fiBody, fnIx)
+  }
+  if s is Block { return leqScanBlock(stmtIx, fnIx) }
+  leqScanExpr(stmtIx, fnIx)
+}
+
+function leqScanBlock(ix: i32, fnIx: i32): i32 {
+  if ix < 0 { return 0 }
+  let b = P.nodes[ix]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      leqScanStmt(stmts[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  leqScanStmt(ix, fnIx)
 }
 
 // True if `callIx` is a `recv.slice(start, end)` over a STRING receiver.
@@ -8477,6 +8652,226 @@ function emitStrEqCore(body: i32[]): i32 {
   0
 }
 
+// ── list value-equality + concat cores (collections-design §VL.4/§VL.6) ───────
+// Each core expects its two list WRAPPER refs already ON THE STACK (left below
+// right) and leaves a 0/1 (equality) or the new wrapper (concat). The loop
+// structure mirrors `emitStrEqCore` exactly (same block/loop/br depths); only
+// the length source (the wrapper's `len` field, NOT `array.len` — the backing
+// has spare capacity) and the element compare differ per kind.
+
+// i32-list `==`: length + element compare over the LEQI frame.
+function emitListEqICore(body: i32[]): i32 {
+  let bA = leqIScratchBase
+  fbLocalSet(bA + 1)         // B
+  fbLocalSet(bA + 0)         // A
+  fbBlock(127)               // block i32
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 1)   // lenA
+  fbLocalSet(bA + 3)         // n = lenA
+  fbLocalGet(bA + 3)
+  fbLocalGet(bA + 1)
+  fbStructGet(lTypeIdx, 1)   // lenB
+  fbI32Bin(71)               // i32.ne
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(1)
+  fbEnd()
+  fbI32Const(0)
+  fbLocalSet(bA + 4)         // i = 0
+  fbLoop(64)
+  fbLocalGet(bA + 4)
+  fbLocalGet(bA + 3)
+  fbI32Bin(78)               // i >= n → done
+  fbIf(64)
+  fbElse()
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 0)   // backing A
+  fbLocalGet(bA + 4)
+  fbArrayGet(aTypeIdx)
+  fbLocalGet(bA + 1)
+  fbStructGet(lTypeIdx, 0)   // backing B
+  fbLocalGet(bA + 4)
+  fbArrayGet(aTypeIdx)
+  fbI32Bin(71)               // element i32.ne
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(3)                    // mismatch → 0, exit block
+  fbEnd()
+  fbLocalGet(bA + 4)
+  fbI32Const(1)
+  fbI32Bin(106)              // i + 1
+  fbLocalSet(bA + 4)
+  fbBr(1)                    // back to loop
+  fbEnd()                    // end (ge_s if/else)
+  fbEnd()                    // end (loop)
+  fbI32Const(1)
+  fbEnd()                    // end (block)
+  0
+}
+
+// String-list `==`: outer loop over the LEQS frame; each element pair rides
+// `emitStrEqCore` (the string-op frame — disjoint locals, safe to nest).
+function emitListEqSCore(body: i32[]): i32 {
+  let bA = leqSScratchBase
+  fbLocalSet(bA + 1)         // B
+  fbLocalSet(bA + 0)         // A
+  fbBlock(127)               // block i32
+  fbLocalGet(bA + 0)
+  fbStructGet(mkListIdx, 1)  // lenA
+  fbLocalSet(bA + 2)         // n
+  fbLocalGet(bA + 2)
+  fbLocalGet(bA + 1)
+  fbStructGet(mkListIdx, 1)
+  fbI32Bin(71)               // i32.ne
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(1)
+  fbEnd()
+  fbI32Const(0)
+  fbLocalSet(bA + 3)         // i = 0
+  fbLoop(64)
+  fbLocalGet(bA + 3)
+  fbLocalGet(bA + 2)
+  fbI32Bin(78)
+  fbIf(64)
+  fbElse()
+  // push elem A, elem B (non-null string refs), compare via the string core
+  fbLocalGet(bA + 0)
+  fbStructGet(mkListIdx, 0)
+  fbLocalGet(bA + 3)
+  fbArrayGet(mkArrIdx)
+  fbRefAsNonNull()
+  fbLocalGet(bA + 1)
+  fbStructGet(mkListIdx, 0)
+  fbLocalGet(bA + 3)
+  fbArrayGet(mkArrIdx)
+  fbRefAsNonNull()
+  if emitStrEqCore(body) < 0 { return 0 - 1 }
+  fbI32Eqz()                 // 1 = mismatch
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(3)
+  fbEnd()
+  fbLocalGet(bA + 3)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(bA + 3)
+  fbBr(1)
+  fbEnd()
+  fbEnd()
+  fbI32Const(1)
+  fbEnd()
+  0
+}
+
+// `i32[][]` `==`: outer loop over the slot's LEQR frame; each element pair (two
+// inner i32-list wrappers) recurses through `emitListEqICore` (disjoint frame).
+function emitListEqRCore(body: i32[], slot: i32, base: i32): i32 {
+  fbLocalSet(base + 1)       // B
+  fbLocalSet(base + 0)       // A
+  fbBlock(127)               // block i32
+  fbLocalGet(base + 0)
+  fbStructGet(rlWrapIdx[slot], 1)
+  fbLocalSet(base + 2)       // n
+  fbLocalGet(base + 2)
+  fbLocalGet(base + 1)
+  fbStructGet(rlWrapIdx[slot], 1)
+  fbI32Bin(71)
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(1)
+  fbEnd()
+  fbI32Const(0)
+  fbLocalSet(base + 3)       // i = 0
+  fbLoop(64)
+  fbLocalGet(base + 3)
+  fbLocalGet(base + 2)
+  fbI32Bin(78)
+  fbIf(64)
+  fbElse()
+  fbLocalGet(base + 0)
+  fbStructGet(rlWrapIdx[slot], 0)
+  fbLocalGet(base + 3)
+  fbArrayGet(rlBackIdx[slot])
+  fbRefAsNonNull()
+  fbLocalGet(base + 1)
+  fbStructGet(rlWrapIdx[slot], 0)
+  fbLocalGet(base + 3)
+  fbArrayGet(rlBackIdx[slot])
+  fbRefAsNonNull()
+  if emitListEqICore(body) < 0 { return 0 - 1 }
+  fbI32Eqz()
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(3)
+  fbEnd()
+  fbLocalGet(base + 3)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(base + 3)
+  fbBr(1)
+  fbEnd()
+  fbEnd()
+  fbI32Const(1)
+  fbEnd()
+  0
+}
+
+// The reserved LEQR frame base for ref-list slot `slot`, or -1.
+function leqRBaseOfSlot(slot: i32): i32 {
+  let i = 0
+  while i < fnListEqRSlots.length {
+    if fnListEqRSlots[i] == slot { return leqRBases[i] }
+    i = i + 1
+  }
+  0 - 1
+}
+
+// i32-list CONCAT `a + b`: a NEW list sized exactly lenA + lenB (one backing
+// allocation, two bulk `array.copy`s) — the host's §VL.4 lowering. The operands
+// are evaluated once into the LEQI frame; the result wrapper is left on the stack.
+function emitListConcatI(body: i32[], leftIx: i32, rightIx: i32, fnIx: i32): i32 {
+  let bA = leqIScratchBase
+  if emitExpr(body, leftIx, fnIx) < 0 { return 0 - 1 }
+  fbLocalSet(bA + 0)         // A
+  if emitExpr(body, rightIx, fnIx) < 0 { return 0 - 1 }
+  fbLocalSet(bA + 1)         // B
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 1)   // lenA
+  fbLocalGet(bA + 1)
+  fbStructGet(lTypeIdx, 1)   // lenB
+  fbI32Bin(106)              // i32.add
+  fbLocalSet(bA + 3)         // n = lenA + lenB
+  fbLocalGet(bA + 3)
+  fbArrayNewDefault(aTypeIdx)
+  fbLocalSet(bA + 2)         // out backing
+  // array.copy out 0 backingA 0 lenA
+  fbLocalGet(bA + 2)
+  fbI32Const(0)
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 0)
+  fbI32Const(0)
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 1)
+  fbArrayCopy(aTypeIdx, aTypeIdx)
+  // array.copy out lenA backingB 0 lenB
+  fbLocalGet(bA + 2)
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 1)
+  fbLocalGet(bA + 1)
+  fbStructGet(lTypeIdx, 0)
+  fbI32Const(0)
+  fbLocalGet(bA + 1)
+  fbStructGet(lTypeIdx, 1)
+  fbArrayCopy(aTypeIdx, aTypeIdx)
+  // the result wrapper { out, n, n }
+  fbLocalGet(bA + 2)
+  fbLocalGet(bA + 3)
+  fbLocalGet(bA + 3)
+  fbStructNew(lTypeIdx)
+  0
+}
+
 // Re-evaluate the field ACCESS CHAIN `root.f1.f2…` onto `body`: the root
 // expression, then one `struct.get` per (struct, field) pair in the path arrays.
 // Every step is a pure re-read (the equality compare re-walks chains per field).
@@ -9625,6 +10020,36 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     }
     if exprIsStrEq(exprIx, fnIx) {
       return emitStrEq(body, exprIx, fnIx)
+    }
+    // List `==`/`!=` (length + element value-compare, recursive through nested
+    // lists / string elements) and list `+` (concat) — collections-design
+    // §VL.4/§VL.6, the host's `listEqFn`/concat lowerings, inlined.
+    let lopK = listOpKindOfBin(exprIx, fnIx)
+    if lopK >= 0 {
+      if e.binOp == "+" {
+        if lopK != 0 {
+          return emitFail("emitProgram: list concat over this element kind is not supported")
+        }
+        return emitListConcatI(body, e.binLeft, e.binRight, fnIx)
+      }
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+      if lopK == 0 {
+        if emitListEqICore(body) < 0 { return 0 - 1 }
+      } else if lopK == 3 {
+        if emitListEqSCore(body) < 0 { return 0 - 1 }
+      } else {
+        let lslot = refListSlotOfExpr(e.binLeft, fnIx)
+        let lbase = leqRBaseOfSlot(lslot)
+        if lbase < 0 {
+          return emitFail("emitProgram: ref-list compare frame not reserved")
+        }
+        if emitListEqRCore(body, lslot, lbase) < 0 { return 0 - 1 }
+      }
+      if e.binOp == "!=" {
+        fbI32Eqz()             // 0x45 i32.eqz (`!=` negates value-equality)
+      }
+      return 0
     }
     // `p == null` / `p != null` over a NULLABLE struct ref: `ref.is_null`
     // (inverted with `eqz` for `!=`) — never the i32 compare.
@@ -13580,6 +14005,20 @@ function fbBeginFunc(nParams: i32, nLocals: i32): i32 {
       mvk = mvk + 1
     }
   }
+  // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6), appended LAST so
+  // every existing layout is untouched: the i32-list frame (A/B wrappers + the
+  // concat out backing + n + i), the string-list frame, then one typed frame per
+  // compared ref-list slot.
+  leqIScratchBase = fbScratchCur
+  if fnUsesListEqI { fbReserve(5) }
+  leqSScratchBase = fbScratchCur
+  if fnUsesListEqS { fbReserve(4) }
+  leqRBases = []
+  let lqk = 0
+  while lqk < fnListEqRSlots.length {
+    leqRBases.push(fbReserve(4))
+    lqk = lqk + 1
+  }
   fbScratchCur
 }
 
@@ -13638,6 +14077,9 @@ function fbLocalsCount(nLocals: i32): i32 {
   if fnUsesCallRef { n = n + 1 }
   if fnUsesMapFilter { n = n + 4 }
   n = n + mfSrcKinds.length + mfDstKinds.length
+  if fnUsesListEqI { n = n + 5 }
+  if fnUsesListEqS { n = n + 4 }
+  n = n + fnListEqRSlots.length * 4
   n
 }
 
@@ -13769,6 +14211,32 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32): i32 {
       mvr = mvr + 1
     }
   }
+  // List `==`/`!=`/`+` frames, in `fbBeginFunc`'s reservation order: the
+  // i32-list frame (A/B wrapper refs, the concat out backing, n, i), the
+  // string-list frame (A/B wrapper refs, n, i), then one typed frame per
+  // compared ref-list slot (A/B wrapper refs, n, i).
+  if fnUsesListEqI {
+    fbRefRun(lTypeIdx)
+    fbRefRun(lTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbI32Run()
+  }
+  if fnUsesListEqS {
+    fbRefRun(mkListIdx)
+    fbRefRun(mkListIdx)
+    fbI32Run()
+    fbI32Run()
+  }
+  let lqv = 0
+  while lqv < fnListEqRSlots.length {
+    let lqs = fnListEqRSlots[lqv]
+    fbRefRun(rlWrapIdx[lqs])
+    fbRefRun(rlWrapIdx[lqs])
+    fbI32Run()
+    fbI32Run()
+    lqv = lqv + 1
+  }
   wTarget(prev)
   0
 }
@@ -13843,6 +14311,13 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     mfDstKinds = []
     mfDstBases = []
     mfScan(fn.fnBody, fnIx)
+    // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6). May also flip
+    // `fnUsesStrOp` (a string-list compare rides the string-op frame), so it
+    // runs AFTER the `fnHasStrOp` assignment above.
+    fnUsesListEqI = false
+    fnUsesListEqS = false
+    fnListEqRSlots = []
+    leqScanBlock(fn.fnBody, fnIx)
     let nLocals = localNames.length
     // Lay out every scratch frame after the params + declared locals via the
     // FuncBuilder cursor (Phase H), which sets `pushScratchBase` /
@@ -15189,6 +15664,24 @@ function startFnDetectScratch(): i32 {
       collectMemberPopRefSlotsExpr(startStmts[si], 0 - 1)
     }
     si = si + 1
+  }
+  // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6) — non-const
+  // global inits and every top-level statement run in the start function.
+  fnUsesListEqI = false
+  fnUsesListEqS = false
+  fnListEqRSlots = []
+  let lgi = 0
+  while lgi < globalStmts.length {
+    if globalIsNonConst(globalStmts[lgi]) {
+      let lg = P.nodes[globalStmts[lgi]]
+      if lg is LetDecl { leqScanExpr(lg.letInit, 0 - 1) }
+    }
+    lgi = lgi + 1
+  }
+  let lsi = 0
+  while lsi < startStmts.length {
+    leqScanStmt(startStmts[lsi], 0 - 1)
+    lsi = lsi + 1
   }
   0
 }
@@ -17004,6 +17497,24 @@ function anonFieldCode(valIx: i32): i32 {
   if e is FuncDecl { return 14 }
   if e is Ident {
     if nameNamesFunction(e.identName) { return 14 }
+    return 0 - 1
+  }
+  // An ARITHMETIC field value (`x: x * s` — an operator-overload maker scaling
+  // its params) is i32 too; a `+` whose operand is a string literal is a concat
+  // (not classifiable here).
+  if e is BinExpr {
+    let bop = e.binOp
+    if bop == "-" || bop == "*" || bop == "/" || bop == "%" { return 0 }
+    if bop == "+" {
+      let bl = P.nodes[unwrapParen(e.binLeft)]
+      let br = P.nodes[unwrapParen(e.binRight)]
+      let strSide = false
+      if bl is StrLit { strSide = true }
+      if br is StrLit { strSide = true }
+      if !strSide { return 0 }
+      return 0 - 1
+    }
+    return 0 - 1
   }
   // An i32-element array literal field (`tags: [1, 2, 3]`) is an i32 list (code 4).
   if e is ArrayLit {
@@ -17264,6 +17775,28 @@ function collectAnonShapes(): i32 {
     if an is ObjLit {
       if structIndexOfObj(ai) < 0 && objVariantName(ai) == "" {
         let fields = an.objFields
+        // Does this literal carry a FUNCTION-valued field? An operator/index
+        // TRAP MAKER (`{ "*": fn, x: x, y: y }`) mixes closures with plain
+        // ident fields — classify the idents as i32 there (the host types them
+        // exactly; a mis-typed non-i32 binding fails loudly at the validator).
+        // A literal with NO function field keeps idents unclassifiable, so a
+        // generic's structural-return literal (`{ first: b, second: a }`) stays
+        // un-interned here and matches its instance-pinned ANNOTATION shape.
+        let hasFnField = false
+        let ffi = 0
+        while ffi < fields.length {
+          let ff = P.nodes[fields[ffi]]
+          if ff is FieldInit {
+            // (Direct node checks, not `fieldValueFeOf` — `fnStmts` is not yet
+            // populated when `collectS`/`collectAnonShapes` run.)
+            let fv = P.nodes[ff.fiValue]
+            if fv is FuncDecl { hasFnField = true }
+            if fv is Ident {
+              if nameNamesFunction(fv.identName) { hasFnField = true }
+            }
+          }
+          ffi = ffi + 1
+        }
         let codes: i32[] = []
         let names: string[] = []
         let elemNames: string[] = []
@@ -17273,6 +17806,12 @@ function collectAnonShapes(): i32 {
           let f = P.nodes[fields[fi]]
           if f is FieldInit {
             let code = anonFieldCode(f.fiValue)
+            if code < 0 && hasFnField {
+              let iv = P.nodes[f.fiValue]
+              if iv is Ident {
+                if !nameNamesFunction(iv.identName) { code = 0 }
+              }
+            }
             if code < 0 { ok = false }
             codes.push(code)
             names.push(f.fiName)
@@ -18442,6 +18981,16 @@ function exprStruct(exprIx: i32, fnIx: i32): boolean {
   if e is Call {
     let callee = P.nodes[e.callFn]
     if callee is Ident { return fnRetStruct(callee.identName) }
+    // A FIELD-CLOSURE call (`(a."*")(2)` — a rewritten operator/index trap)
+    // yields the field function's return struct (mirrors `structIndexOfExpr`).
+    if callee is Member {
+      if drwFieldClosure(structIndexOfExpr(callee.memObj, fnIx), callee.memProp) {
+        let cfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        if cfe >= 0 {
+          if fRetRef[cfe] == 1 { return true }
+        }
+      }
+    }
     return false
   }
   if e is Ident {
@@ -19165,6 +19714,15 @@ function exprArray(exprIx: i32, fnIx: i32): boolean {
     if globalIsArray(e.identName) { return true }
     // A CAPTURED i32-list read (`store[k]` inside a closure capturing `store`).
     return capturedKindOf(fnIx, e.identName) == 2
+  }
+  // A list CONCAT `a + b` yields a NEW i32 list (collections-design §VL.4).
+  if e is BinExpr {
+    if e.binOp == "+" {
+      if exprArray(e.binLeft, fnIx) && !exprStringArray(e.binLeft, fnIx) && !exprRefArray(e.binLeft, fnIx) {
+        return exprArray(e.binRight, fnIx)
+      }
+    }
+    return false
   }
   // A field read `p.items` whose struct field is an `i32[]` (code `4`) yields the i32
   // list wrapper ref — so `.length` / indexing / assignment treat it as a list (gap #5).
