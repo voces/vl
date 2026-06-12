@@ -3321,6 +3321,11 @@ let uDeclared: boolean = false
 let unNames: string[] = []
 let unVarStart: i32[] = []
 let unVarCount: i32[] = []
+// Parallel to `unNames`: each union's FULL pipe-joined member set (variant struct
+// names AND atom members like `null`, which own no variant slot — so complement
+// narrowing can subtract from the complete set). For an inline union the set IS
+// the name; for a declared alias it is the joined `udVariants`.
+let unMemberSet: string[] = []
 let uVariants: string[] = []
 let uTags: i32[] = []
 let uBoxIdx: i32 = 0
@@ -5551,6 +5556,76 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
       if emitExpr(body, m0.memObj, fnIx) < 0 { return 0 - 1 }
       fbStructGet(uVarIdx + pvi, pvfi)  // 0xfb 0x02 <variant struct ht> <field index>
       return 0
+    }
+  }
+  // Shared-field access over an UN-narrowed struct union (`(A | B).tag` — the
+  // host's `sharedUnionFieldRead`): the checker proved the field present on EVERY
+  // member, but members may store it at DIFFERENT indices, so dispatch on the box
+  // tag and read the field at THAT member's own index. The arms are exhaustive
+  // (the LAST member is the unconditional fall-through, host parity). Ported
+  // SUBSET: an IDENT receiver (an effect-free place — it is re-evaluated per arm
+  // instead of spilling to a scratch local) and an i32-rep field (a single-byte
+  // `if (result i32)` blocktype); anything else falls through to the loud
+  // failures below. A multi-variant NARROWED set ("N2|N3") dispatches over just
+  // its remaining members.
+  let mS = P.nodes[memIx]
+  if mS is Member {
+    if exprUnion(mS.memObj, fnIx) {
+      let shRecv = P.nodes[unwrapParen(mS.memObj)]
+      if shRecv is Ident {
+        let shSet = currentStructNarrowSetOf(shRecv.identName, fnIx)
+        if shSet != "" {
+          let shAtoms: string[] = []
+          splitUnionAtoms(shSet, shAtoms)
+          // Validate: every member a struct VARIANT carrying the field as i32.
+          let shVis: i32[] = []
+          let shFis: i32[] = []
+          let shOk = shAtoms.length >= 2
+          let sa = 0
+          while sa < shAtoms.length {
+            let svi = variantIndexOf(shAtoms[sa])
+            if svi < 0 {
+              shOk = false
+            } else {
+              let sfi = variantFieldIndex(svi, mS.memProp)
+              if sfi < 0 || variantFieldTypeAt(svi, sfi) != 0 {
+                shOk = false
+              } else {
+                shVis.push(svi)
+                shFis.push(sfi)
+              }
+            }
+            sa = sa + 1
+          }
+          if shOk {
+            let si2 = 0
+            while si2 < shAtoms.length - 1 {
+              if emitExpr(body, mS.memObj, fnIx) < 0 { return 0 - 1 }
+              fbStructGet(uBoxIdx, 0)            // field 0: tag
+              fbI32Const(uTags[shVis[si2]])
+              fbI32Bin(70)                       // 0x46 i32.eq
+              fbIf(127)                          // if (result i32)
+              if emitExpr(body, mS.memObj, fnIx) < 0 { return 0 - 1 }
+              fbStructGet(uBoxIdx, 1)            // field 1: value (anyref)
+              fbRefCast(uVarIdx + shVis[si2])
+              fbStructGet(uVarIdx + shVis[si2], shFis[si2])
+              fbElse()
+              si2 = si2 + 1
+            }
+            let shLast = shAtoms.length - 1
+            if emitExpr(body, mS.memObj, fnIx) < 0 { return 0 - 1 }
+            fbStructGet(uBoxIdx, 1)              // field 1: value (anyref)
+            fbRefCast(uVarIdx + shVis[shLast])
+            fbStructGet(uVarIdx + shVis[shLast], shFis[shLast])
+            let se = 0
+            while se < shAtoms.length - 1 {
+              fbEnd()
+              se = se + 1
+            }
+            return 0
+          }
+        }
+      }
     }
   }
   if !sDeclared {
@@ -11088,6 +11163,13 @@ function setNarrowFromCond(condIx: i32, fnIx: i32): boolean {
       return nl || nr
     }
   }
+  // `!cond` swaps the branch senses: the then-arm of `if !(x is A) { … }` sees the
+  // ELSE-narrowing of the inner condition (the host's negation complement).
+  if c is Unary {
+    if c.unOp == "!" {
+      return setNarrowFromCondElse(unwrapParen(c.unArg), fnIx)
+    }
+  }
   // `x == null` / `x != null` over a BOXED VALUE union narrows the THEN-branch:
   // `==` pins `x` to the `null` member; `!=` strips `null` from the current set
   // (so `i32 | null` fully unboxes to `i32` in the non-null branch).
@@ -11106,7 +11188,58 @@ function setNarrowFromCond(condIx: i32, fnIx: i32): boolean {
       }
     }
   }
+  // The same null-compare narrowing over a BOXED STRUCT union with a `null` member
+  // (`v: A | B | null`): `!=` strips `null` (so an inner `is`/else chain subtracts
+  // toward a single variant), `==` pins `null`. The 1-struct niche (`S | null`) is
+  // excluded — it is a nullable REF, not a box, and keeps its existing lowering.
+  let snm = structUnionNullCmpName(condIx, fnIx)
+  if snm != "" {
+    let scn = P.nodes[condIx]
+    if scn is BinExpr {
+      if scn.binOp == "==" {
+        pushNarrow(snm, "null")
+        return true
+      }
+      let srest = removeAtomFrom(currentStructNarrowSetOf(snm, fnIx), "null")
+      if srest != "" {
+        pushNarrow(snm, srest)
+        return true
+      }
+    }
+  }
   false
+}
+
+// The receiver NAME when the condition at `condIx` is `<ident> == null` /
+// `<ident> != null` over a BOXED STRUCT union (2+ struct variants plus a `null`
+// member), else "". The value-union and 1-struct-niche forms are excluded (each
+// keeps its own narrowing path).
+function structUnionNullCmpName(condIx: i32, fnIx: i32): string {
+  let c = P.nodes[condIx]
+  if c is BinExpr {
+    if c.binOp == "==" || c.binOp == "!=" {
+      let lhs = P.nodes[unwrapParen(c.binLeft)]
+      let rhs = P.nodes[unwrapParen(c.binRight)]
+      let refIx = 0 - 1
+      if rhs is NullLit { refIx = unwrapParen(c.binLeft) }
+      if lhs is NullLit { refIx = unwrapParen(c.binRight) }
+      if refIx >= 0 {
+        let r = P.nodes[refIx]
+        if r is Ident {
+          let un = unionNameOfIdent(r.identName, fnIx)
+          if un != "" {
+            if !isValueUnionName(un) {
+              let uset = unionMemberSetOf(un)
+              if unionHasAtom(uset, "null") && nonNullMemberCountOf(uset) >= 2 {
+                return r.identName
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  ""
 }
 
 // The receiver NAME when the condition at `condIx` is `<ident> == null` /
@@ -11157,8 +11290,33 @@ function setNarrowFromCondElse(condIx: i32, fnIx: i32): boolean {
           }
         }
       }
+      return false
+    }
+    // STRUCT-union complement (host flow narrowing): the guard was FALSE, so the
+    // tested VARIANT is stripped from the receiver's current set. When one member
+    // remains, the else-arm fully discriminates (`if v is A {…} else { v.y }`
+    // reads `v` as the `B` variant); a multi-member rest ("N2|N3") keeps a later
+    // `else if` arm subtracting toward its own singleton. Only a BOXED struct
+    // union narrows (`exprUnion` — the 1-struct niche is a nullable ref, whose
+    // member reads must not change).
+    let srecv = P.nodes[unwrapParen(c.isObj)]
+    if srecv is Ident {
+      if exprUnion(c.isObj, fnIx) {
+        let srest = removeAtomFrom(currentStructNarrowSetOf(srecv.identName, fnIx), c.isVariant)
+        if srest != "" {
+          pushNarrow(srecv.identName, srest)
+          return true
+        }
+      }
     }
     return false
+  }
+  // `!cond` in the ELSE-arm: the inner condition was TRUE there, so the else sees
+  // the inner condition's THEN-narrowing (`if !(n is Program) {…} else { n.progStmts }`).
+  if c is Unary {
+    if c.unOp == "!" {
+      return setNarrowFromCond(unwrapParen(c.unArg), fnIx)
+    }
   }
   let nm = valueUnionNullCmpName(condIx, fnIx)
   if nm != "" {
@@ -11171,6 +11329,23 @@ function setNarrowFromCondElse(condIx: i32, fnIx: i32): boolean {
       let rest = removeAtomFrom(currentNarrowSetOf(nm, fnIx), "null")
       if rest != "" {
         pushNarrow(nm, rest)
+        return true
+      }
+    }
+  }
+  // The struct-union dual: in the else of `v != null` the value IS `null`; in the
+  // else of `v == null` it is the non-null variant set.
+  let snm = structUnionNullCmpName(condIx, fnIx)
+  if snm != "" {
+    let scn = P.nodes[condIx]
+    if scn is BinExpr {
+      if scn.binOp == "!=" {
+        pushNarrow(snm, "null")
+        return true
+      }
+      let srest = removeAtomFrom(currentStructNarrowSetOf(snm, fnIx), "null")
+      if srest != "" {
+        pushNarrow(snm, srest)
         return true
       }
     }
@@ -16695,6 +16870,7 @@ function registerValueUnionName(name: string): i32 {
   if !isValueUnionName(name) { return 0 }
   uDeclared = true
   unNames.push(name)
+  unMemberSet.push(name)
   unVarStart.push(uVariants.length)
   unVarCount.push(0)
   markValueUnionAtoms(name)
@@ -16786,6 +16962,7 @@ function registerInlineUnion(stmts: i32[], name: string): i32 {
   splitUnionAtoms(name, atoms)
   uDeclared = true
   unNames.push(name)
+  unMemberSet.push(name)
   unVarStart.push(uVariants.length)
   // A `null` atom is no variant struct — only the struct members occupy slots.
   let nStructs = 0
@@ -16906,6 +17083,7 @@ function collectU(stmts: i32[]): i32 {
   vbF32Used = false
   vbF64Used = false
   unNames = []
+  unMemberSet = []
   unVarStart = []
   unVarCount = []
   uVariants = []
@@ -16931,6 +17109,15 @@ function collectU(stmts: i32[]): i32 {
         return emitFail("emitProgram: union must have at least one variant")
       }
       unNames.push(s.udName)
+      // The alias's full member set, pipe-joined (atom members like `null` kept).
+      let udSet = ""
+      let usj = 0
+      while usj < vs.length {
+        if udSet != "" { udSet = udSet + "|" }
+        udSet = udSet + vs[usj]
+        usj = usj + 1
+      }
+      unMemberSet.push(udSet)
       unVarStart.push(uVariants.length)
       unVarCount.push(vs.length)
       let vi = 0
@@ -17526,6 +17713,43 @@ function currentNarrowSetOf(name: string, fnIx: i32): string {
   let v = narrowVariantFor(name)
   if v != "" { return v }
   unionNameOfIdent(name, fnIx)
+}
+
+// The FULL pipe-joined member set of the union named `name`: a registered alias
+// returns its `unMemberSet` entry (a declared `type N = A | B` expands to "A|B",
+// atom members like `null` kept); an unregistered / already-pipe-joined name
+// passes through unchanged. Lets complement narrowing subtract variants from an
+// ALIAS-annotated binding's set.
+function unionMemberSetOf(name: string): string {
+  let u = 0
+  while u < unNames.length {
+    if unNames[u] == name { return unMemberSet[u] }
+    u = u + 1
+  }
+  name
+}
+
+// The CURRENT narrowed variant set of a STRUCT-union binding `name`: its innermost
+// active narrowing when one exists (which may already be a subtracted sub-set),
+// else its declared union's FULL member set (alias names expanded so subtraction
+// sees every variant + a `null` member). "" when not a union binding.
+function currentStructNarrowSetOf(name: string, fnIx: i32): string {
+  let v = narrowVariantFor(name)
+  if v != "" { return v }
+  unionMemberSetOf(unionNameOfIdent(name, fnIx))
+}
+
+// The number of NON-`null` members in the pipe-joined set `set`.
+function nonNullMemberCountOf(set: string): i32 {
+  let atoms: string[] = []
+  splitUnionAtoms(set, atoms)
+  let n = 0
+  let i = 0
+  while i < atoms.length {
+    if atoms[i] != "null" { n = n + 1 }
+    i = i + 1
+  }
+  n
 }
 
 // The variant struct name an object literal at `objIx` matches: the union variant
