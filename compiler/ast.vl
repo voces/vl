@@ -72,7 +72,13 @@ export type NullLit = { nullKw: string }                              // null
 export type Ident = { identName: string }                             // x
 export type Unary = { unOp: string, unArg: i32 }                      // !x  -x
 export type BinExpr = { binOp: string, binLeft: i32, binRight: i32 }  // a + b,  a = b
-export type Call = { callFn: i32, callArgs: i32[] }                   // f(a, b)
+// A call `f(a, b)` / `f(a: 2, b: 1)`. `callArgs` are the argument VALUE nodes in
+// SOURCE order; `callArgNames` is the parallel per-argument NAME list ("" = a
+// positional argument). An all-positional call may carry an EMPTY names list
+// (the common case — every consumer treats a missing entry as ""). Mirrors the
+// host's `VLArgumentNode.name` (`makeArgument` in parser.ts); binding to
+// parameters happens in the checker/emitter via `orderArgsByParamNames`.
+export type Call = { callFn: i32, callArgs: i32[], callArgNames: string[] } // f(a, b) / f(b: 1, a: 2)
 export type Member = { memObj: i32, memProp: string }                 // o.field
 export type OptMember = { omObj: i32, omProp: string }                // o?.field (null-safe)
 export type Paren = { parInner: i32 }                                 // ( e )
@@ -99,20 +105,23 @@ export type IfStmt = {                                                // if c {.
   ifThen: i32,          // then block
   ifElse: i32,          // else node (block or nested if), -1 if none
 }
-export type WhileStmt = { whileCond: i32, whileBody: i32 }            // while c { body }
-// `break` / `continue` loop-control statements. They carry no payload (the
-// self-host has no loop labels), but the AST union discriminates by structural
-// SHAPE — a zero-field struct can't be told apart — so each holds a single
-// distinct marker field (`brkKw` / `contKw`, both the source keyword text). The
-// prefixes (`brk` / `cont`) are distinct from every other variant so `is` stays
-// unambiguous. Mirrors `VLBreakNode` / `VLContinueNode` in `ast.ts`.
-export type BreakStmt = { brkKw: string }                            // break
-export type ContinueStmt = { contKw: string }                        // continue
+// Loops carry an optional LABEL (`outer: while …` / `outer: for …`; "" = none),
+// the target of a labelled `break`/`continue` — mirroring the host's
+// `label: string | undefined` on `VLWhileNode`/`VLForNode`/`VLForInNode`.
+export type WhileStmt = { whileCond: i32, whileBody: i32, whileLabel: string } // [l:] while c { body }
+// `break` / `continue` loop-control statements. Each carries the optional loop
+// LABEL it targets (`break outer`; "" = the innermost loop) plus a marker field
+// (`brkKw` / `contKw`, the source keyword text) — the AST union discriminates by
+// structural SHAPE, so the field-name prefixes (`brk` / `cont`) stay distinct
+// from every other variant and `is` stays unambiguous. Mirrors `VLBreakNode` /
+// `VLContinueNode` in `ast.ts` (whose `label` is undefined when absent).
+export type BreakStmt = { brkKw: string, brkLabel: string }          // break [label]
+export type ContinueStmt = { contKw: string, contLabel: string }     // continue [label]
 // `for v in A to B [step S] { body }` — a numeric RANGE loop; `frStep` is the step
 // EXPRESSION node index, or -1 for the implicit +1. `for v in iterable { body }` —
 // a for-IN loop over an array, binding `v` to the element type.
-export type ForRange = { frVar: string, frFrom: i32, frTo: i32, frStep: i32, frBody: i32 }
-export type ForIn = { fiVar: string, fiIter: i32, fiBody: i32 }      // for v in arr { body }
+export type ForRange = { frVar: string, frFrom: i32, frTo: i32, frStep: i32, frBody: i32, frLabel: string }
+export type ForIn = { fiVar: string, fiIter: i32, fiBody: i32, fiLabel: string } // [l:] for v in arr { body }
 export type RetStmt = { retArg: i32 }                                 // return e?  (-1 bare)
 export type Block = { blkStmts: i32[] }                               // { stmt* }
 export type Program = { progStmts: i32[] }                            // top-level stmt*
@@ -282,8 +291,89 @@ export function mkBinary(op: string, left: i32, right: i32): i32 {
 }
 
 export function mkCall(fn: i32, args: i32[]): i32 {
-  let n: Node = { callFn: fn, callArgs: args }
+  // All-positional (the synthesizers' constructor): an empty names list.
+  let names: string[] = []
+  mkCallN(fn, args, names)
+}
+
+// A call with per-argument NAMES (parallel to `args`; "" = positional) — the
+// parser's constructor for argument lists that may carry `name: value` entries.
+export function mkCallN(fn: i32, args: i32[], names: string[]): i32 {
+  let n: Node = { callFn: fn, callArgs: args, callArgNames: names }
   addNode(n)
+}
+
+// True iff any per-argument name is present (a non-"" entry) — the cheap gate
+// every consumer checks before paying for `orderArgsByParamNames`.
+export function hasNamedArgs(names: string[]): boolean {
+  let i = 0
+  while i < names.length {
+    if names[i] != "" { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Bind call ARGUMENTS to parameter slots by NAME, then positionally — the exact
+// matching the host's `orderArgumentsByParameters` (typecheck.ts) performs, and
+// the single source of truth shared by the checker and the emitter. Returns one
+// VALUE-node index per parameter (in PARAMETER order; -1 where no argument
+// filled the slot), followed by any leftover/unmatched arguments (a named arg
+// with no matching parameter, a named collision, or surplus positionals) in
+// source order — so the result never silently drops an argument. Pure: callers
+// (`checkNode`'s Call arm, `emitCall`) diagnose arity/name errors themselves.
+export function orderArgsByParamNames(paramNames: string[], args: i32[], argNames: string[]): i32[] {
+  let slots: i32[] = []
+  let i = 0
+  while i < paramNames.length {
+    slots.push(0 - 1)
+    i = i + 1
+  }
+  let leftover: i32[] = []
+  let positional: i32[] = []
+  // First place named arguments by parameter name.
+  let j = 0
+  while j < args.length {
+    let nm = ""
+    if j < argNames.length { nm = argNames[j] }
+    if nm == "" {
+      positional.push(args[j])
+    } else {
+      let pIx = 0 - 1
+      let k = 0
+      while k < paramNames.length {
+        if pIx < 0 && paramNames[k] == nm { pIx = k }
+        k = k + 1
+      }
+      if pIx < 0 || slots[pIx] >= 0 {
+        // Unknown name, or a slot already filled (named collision): leave it
+        // for the caller to diagnose rather than overwriting.
+        leftover.push(args[j])
+      } else {
+        slots[pIx] = args[j]
+      }
+    }
+    j = j + 1
+  }
+  // Then fill the remaining slots, in order, with positional arguments.
+  let nx = 0
+  let p = 0
+  while p < positional.length {
+    while nx < slots.length && slots[nx] >= 0 { nx = nx + 1 }
+    if nx < slots.length {
+      slots[nx] = positional[p]
+      nx = nx + 1
+    } else {
+      leftover.push(positional[p])
+    }
+    p = p + 1
+  }
+  let r = 0
+  while r < leftover.length {
+    slots.push(leftover[r])
+    r = r + 1
+  }
+  slots
 }
 
 export function mkMember(obj: i32, prop: string): i32 {
@@ -331,28 +421,29 @@ export function mkIf(cond: i32, thenB: i32, els: i32): i32 {
   addNode(n)
 }
 
-export function mkWhile(cond: i32, body: i32): i32 {
-  let n: Node = { whileCond: cond, whileBody: body }
+// Loop constructors take the optional loop LABEL last ("" = unlabelled).
+export function mkWhile(cond: i32, body: i32, label: string): i32 {
+  let n: Node = { whileCond: cond, whileBody: body, whileLabel: label }
   addNode(n)
 }
 
-export function mkForRange(v: string, from: i32, to: i32, step: i32, body: i32): i32 {
-  let n: Node = { frVar: v, frFrom: from, frTo: to, frStep: step, frBody: body }
+export function mkForRange(v: string, from: i32, to: i32, step: i32, body: i32, label: string): i32 {
+  let n: Node = { frVar: v, frFrom: from, frTo: to, frStep: step, frBody: body, frLabel: label }
   addNode(n)
 }
 
-export function mkForIn(v: string, iter: i32, body: i32): i32 {
-  let n: Node = { fiVar: v, fiIter: iter, fiBody: body }
+export function mkForIn(v: string, iter: i32, body: i32, label: string): i32 {
+  let n: Node = { fiVar: v, fiIter: iter, fiBody: body, fiLabel: label }
   addNode(n)
 }
 
-export function mkBreak(kw: string): i32 {
-  let n: Node = { brkKw: kw }
+export function mkBreak(kw: string, label: string): i32 {
+  let n: Node = { brkKw: kw, brkLabel: label }
   addNode(n)
 }
 
-export function mkContinue(kw: string): i32 {
-  let n: Node = { contKw: kw }
+export function mkContinue(kw: string, label: string): i32 {
+  let n: Node = { contKw: kw, contLabel: label }
   addNode(n)
 }
 
