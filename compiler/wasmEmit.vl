@@ -4261,12 +4261,20 @@ function ifChainHasStrOp(ifIx: i32, fnIx: i32): boolean {
     if narrowed { restoreNarrow(savedTop) }
     if hit { return true }
     if s.ifElse >= 0 {
+      // A VALUE union narrows to the COMPLEMENT set in the else-arm (mirroring
+      // `emitStmt`'s else lowering), so `else { print(v) }` with `v` now `string`
+      // is detected as a string print and reserves the scratch frame.
+      let savedElseTop = narrowTop
+      let narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
       let els = P.nodes[s.ifElse]
+      let hitElse = false
       if els is Block {
-        if blockHasStrOp(s.ifElse, fnIx) { return true }
+        hitElse = blockHasStrOp(s.ifElse, fnIx)
       } else if els is IfStmt {
-        if ifChainHasStrOp(s.ifElse, fnIx) { return true }
+        hitElse = ifChainHasStrOp(s.ifElse, fnIx)
       }
+      if narrowedElse { restoreNarrow(savedElseTop) }
+      if hitElse { return true }
     }
   }
   false
@@ -4880,12 +4888,11 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected a field access")
 }
 
-// Lower a narrowed VALUE-union ident read `name` (active narrowing = the single
-// scalar atom `atom`): push the box (a local/param or a module global), then
-// `struct.get $box 1` (the `anyref` payload) and recover the atom's rep — a
-// `ref.cast (ref $aTypeIdx)` for a string payload (stored unboxed), or a
-// `ref.cast (ref $vb)` + `struct.get $vb 0` for a scalar in its value box.
-function emitValueUnionUnboxRead(body: i32[], name: string, atom: string, fnIx: i32): i32 {
+// Push the RAW union box ref of the binding `name` (a local/param or a module
+// global) — bypassing the narrowed-unbox Ident path, so a tag read works even
+// while the binding is narrowed to a single atom (its slot still holds the box;
+// narrowing is type-level only).
+function emitUnionBoxPush(body: i32[], name: string, fnIx: i32): i32 {
   let idx = localIndexOf(fnIx, name)
   if idx >= 0 {
     fbLocalGet(idx)
@@ -4901,6 +4908,16 @@ function emitValueUnionUnboxRead(body: i32[], name: string, atom: string, fnIx: 
       wU8(212)               // 0xd4 ref.as_non_null
     }
   }
+  0
+}
+
+// Lower a narrowed VALUE-union ident read `name` (active narrowing = the single
+// scalar atom `atom`): push the box (a local/param or a module global), then
+// `struct.get $box 1` (the `anyref` payload) and recover the atom's rep — a
+// `ref.cast (ref $aTypeIdx)` for a string payload (stored unboxed), or a
+// `ref.cast (ref $vb)` + `struct.get $vb 0` for a scalar in its value box.
+function emitValueUnionUnboxRead(body: i32[], name: string, atom: string, fnIx: i32): i32 {
+  if emitUnionBoxPush(body, name, fnIx) < 0 { return 0 - 1 }
   fbStructGet(uBoxIdx, 1)    // 0xfb 0x02 <box ht> field 1: value (anyref)
   if atom == "string" {
     fbRefCast(aTypeIdx)      // the payload IS the string array ref
@@ -8087,6 +8104,48 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
           wU8(27)                // 0x1b select → d if null else x
           return 0
         }
+        // `x ?? d` over a BOXED value union containing `null` (`i32 | null`):
+        // the value-level dual of the null guard — read the box tag; the null
+        // tag selects the default, anything else unboxes the SINGLE remaining
+        // scalar atom (the host's `??` result is the non-null base type). The
+        // receiver is a pure name, re-read in the non-null arm. Scalar atoms
+        // only (the value-typed `if` blocktype carries the unboxed rep).
+        let cunm = unionNameOfIdent(lhs.identName, fnIx)
+        if cunm != "" {
+          if isValueUnionName(cunm) && unionHasAtom(cunm, "null") {
+            let crest = removeAtomFrom(currentNarrowSetOf(lhs.identName, fnIx), "null")
+            let cak = valueAtomKind(crest)
+            if cak >= 0 && cak != 6 {
+              if cak == 2 {
+                return emitFail("emitProgram: `??` over a string|null union is not supported yet")
+              }
+              if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 } // the box
+              fbStructGet(uBoxIdx, 0)                // field 0: tag
+              fbI32Const(scalarTagOf("null"))
+              fbI32Bin(70)                           // 0x46 i32.eq → null?
+              let cbt = 127                          // 0x7f i32 (boolean shares it)
+              if cak == 3 { cbt = 126 }              // 0x7e i64
+              if cak == 4 { cbt = 124 }              // 0x7c f64
+              if cak == 5 { cbt = 125 }              // 0x7d f32
+              fbIf(cbt)                              // 0x04 if, value blocktype
+              ctrlEnter()
+              if cak == 3 {
+                if emitExprAsI64(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              } else if cak == 4 {
+                if emitExprAsF64(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              } else if cak == 5 {
+                if emitExprAsF32(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              } else {
+                if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              }
+              fbElse()                               // 0x05 else — present → unbox
+              if emitValueUnionUnboxRead(body, lhs.identName, crest, fnIx) < 0 { return 0 - 1 }
+              fbEnd()                                // 0x0b end
+              ctrlLeave()
+              return 0
+            }
+          }
+        }
       }
       // The null-safe field read `m[k]?.f ?? d` over a STRUCT-VALUED map is the
       // FUSED form: probe; on a hit read the field off the (non-null) value
@@ -8519,6 +8578,10 @@ function exprIsI64(exprIx: i32, fnIx: i32): boolean {
     return !numLexFitsI32(e.numText)
   }
   if e is Ident {
+    // A VALUE-union ident classifies by its narrowed atom (the read unboxes to
+    // that rep); an un-narrowed union ident is the box, never a scalar.
+    let uk = unionIdentReadKind(exprIx, fnIx)
+    if uk != 0 - 3 { return uk == 3 }
     if paramIsI64(fnIx, e.identName) { return true }
     if declaredI64(e.identName) { return true }
     return globalIsI64(e.identName)
@@ -8615,6 +8678,9 @@ function exprIsF32(exprIx: i32, fnIx: i32): boolean {
   let e = P.nodes[exprIx]
   if e is Paren { return exprIsF32(e.parInner, fnIx) }
   if e is Ident {
+    // A VALUE-union ident classifies by its narrowed atom (see exprIsI64).
+    let uk = unionIdentReadKind(exprIx, fnIx)
+    if uk != 0 - 3 { return uk == 5 }
     if paramIsF32(fnIx, e.identName) { return true }
     if declaredF32(e.identName) { return true }
     return globalIsF32(e.identName)
@@ -8726,6 +8792,9 @@ function exprIsF64(exprIx: i32, fnIx: i32): boolean {
   // `__print_f64__` and participates in f64 arithmetic.
   if e is Index { return exprF64Array(e.idxArr, fnIx) }
   if e is Ident {
+    // A VALUE-union ident classifies by its narrowed atom (see exprIsI64).
+    let uk = unionIdentReadKind(exprIx, fnIx)
+    if uk != 0 - 3 { return uk == 4 }
     if paramIsF64(fnIx, e.identName) { return true }
     if declaredF64(e.identName) { return true }
     return globalIsF64(e.identName)
@@ -8798,6 +8867,10 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
     return e.unOp == "!"
   }
   if e is Ident {
+    // A VALUE-union ident narrowed to `boolean` unboxes to the bool rep and
+    // prints true/false (see exprIsI64 for the classification rule).
+    let uk = unionIdentReadKind(ix, fnIx)
+    if uk != 0 - 3 { return uk == 1 }
     // A `boolean|null` NICHE binding read (narrowed non-null in its branch)
     // prints true/false. Plain `boolean` idents stay unclassified (existing rule).
     if exprNulBool(ix, fnIx) { return true }
@@ -13108,11 +13181,21 @@ function startScanIf(ifIx: i32): i32 {
     if exprHasMemberPopKind(st.ifCond, 0 - 1, 1) { fnUsesRefPush = true }
     if exprHasMemberPopKind(st.ifCond, 0 - 1, 2) { fnUsesStrPush = true }
     if exprHasMemberPopKind(st.ifCond, 0 - 1, 3) { fnUsesF64Push = true }
+    // Narrow across each arm (mirroring `ifChainHasStrOp` / `emitStmt`): the
+    // then-branch sees the guard's narrowing, the else-branch sees a VALUE
+    // union's complement — so a top-level `if w is string { print(w) }`
+    // reserves the string scratch frame in the start function.
+    let savedTop = narrowTop
+    let narrowed = setNarrowFromCond(st.ifCond, 0 - 1)
     startScanBlock(st.ifThen)
+    if narrowed { restoreNarrow(savedTop) }
     if st.ifElse >= 0 {
+      let savedElseTop = narrowTop
+      let narrowedElse = setNarrowFromCondElse(st.ifCond, 0 - 1)
       let els = P.nodes[st.ifElse]
       if els is Block { startScanBlock(st.ifElse) }
       if els is IfStmt { startScanIf(st.ifElse) }
+      if narrowedElse { restoreNarrow(savedElseTop) }
     }
   }
   0
@@ -16078,6 +16161,26 @@ function narrowedValueAtomOf(name: string): string {
   ""
 }
 
+// The atom KIND an IDENT expression currently reads as, for the scalar/string
+// classifiers (`exprString`/`exprIsBool`/`exprIsI64`/`exprIsF64`/`exprIsF32`):
+// `valueAtomKind` codes when the ident is a union binding narrowed to ONE scalar
+// atom (the read unboxes to that atom's rep), -2 when it is a union binding NOT
+// narrowed to a single atom (the read is the BOX ref — no scalar classification,
+// even if the binding's INIT was a string/bool literal), or -3 when the
+// expression is not a union-typed ident at all (the caller keeps its existing
+// classification rules).
+function unionIdentReadKind(exprIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[exprIx]
+  if e is Ident {
+    if unionNameOfIdent(e.identName, fnIx) != "" {
+      let a = narrowedValueAtomOf(e.identName)
+      if a != "" { return valueAtomKind(a) }
+      return 0 - 2
+    }
+  }
+  0 - 3
+}
+
 // The CURRENT narrowed atom set of the union binding `name`: its innermost active
 // narrowing when one exists (which may already be a sub-union), else its declared
 // union's full member set (the union name itself). "" when not a union binding.
@@ -17184,6 +17287,11 @@ function exprString(exprIx: i32, fnIx: i32): boolean {
     return exprIsStrConcat(exprIx, fnIx)
   }
   if e is Ident {
+    // A VALUE-union ident is a string ONLY when narrowed to the `string` atom
+    // (the unboxed read is the array ref); an un-narrowed union binding is the
+    // BOX, even when its init was a string literal (see exprIsI64).
+    let uk = unionIdentReadKind(exprIx, fnIx)
+    if uk != 0 - 3 { return uk == 2 }
     if paramString(fnIx, e.identName) { return true }
     if declaredString(e.identName) { return true }
     return globalIsString(e.identName)
