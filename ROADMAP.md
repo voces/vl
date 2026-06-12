@@ -314,13 +314,13 @@ from current `compiler/*.vl` in ~3s.*
     cost fell with the F9c memoize; binaryen modules are not trivially cloneable).
   - 🟡 **F-tiers. Collapse the redundant corpus runner.** REMAINING: delete the
     `SELFHOST_DENO_RUN`-gated tiers (the corpus RUN half + its 305-file whitelist, the check→emit
-    verdicts, the V8-side golden fixpoint) outright once the native tier is the undisputed runner;
-    fold the deno-side CHECK verdicts the same way when the native checker gates message/span
-    parity; consider a NATIVE golden byte-tripwire (vl build each golden + cmp, <1s in ci-native)
-    so `selfhost_emit_program_test` can ride down with the TS emitter. Also: the single-unit
-    assembly compile is SUPERLINEAR in the TS host (~5s as a 2-module graph vs ~100s concatenated
-    — wasmEmit.vl is the multiplier); worth a profile if any big assembly survives. (Landed so
-    far → `CHANGELOG.md`: gating, parallel sweep, seed cache + ~3s refresh, graph-compile caching.)
+    verdicts, the V8-side golden fixpoint + emit-program suite) outright once the native tier is
+    the undisputed runner; fold the deno-side CHECK verdicts the same way when the native checker
+    gates message/span parity. Also: the single-unit assembly compile is SUPERLINEAR in the TS
+    host (~5s as a 2-module graph vs ~100s concatenated — wasmEmit.vl is the multiplier); worth a
+    profile if any gated assembly is still exercised regularly. (Landed → `CHANGELOG.md`: gating,
+    parallel sweep, seed cache + ~3s refresh, graph-compile caching, the NATIVE golden
+    byte-tripwire `scripts/native-golden-check.ts` — no big assembly remains always-on.)
 
 ---
 
