@@ -4178,7 +4178,12 @@ function exprHasStrOp(exprIx: i32, fnIx: i32): boolean {
   }
   if e is Unary { return exprHasStrOp(e.unArg, fnIx) }
   if e is Paren { return exprHasStrOp(e.parInner, fnIx) }
-  if e is IsExpr { return exprHasStrOp(e.isObj, fnIx) }
+  if e is IsExpr {
+    // A string-LITERAL `is` (`s is "a"`) lowers through `emitStrEqCore`, so it
+    // stages operands in the string scratch frame like a string `==`.
+    if e.isVariant.length > 0 && e.isVariant[0] == '"' { return true }
+    return exprHasStrOp(e.isObj, fnIx)
+  }
   if e is ObjLit {
     let fields = e.objFields
     let i = 0
@@ -4821,6 +4826,16 @@ function emitUnionBox(body: i32[], objIx: i32, fnIx: i32): i32 {
   0
 }
 
+// True when an `is` RHS names a LITERAL type (`"a"`, `0`, `1.5`) — the runtime
+// value-test arm of `emitIs` (the place's literal-union ANNOTATION softened to
+// the base scalar in `canonEmitTypeNames`; the `is` compares the value).
+function isLitVariantName(name: string): boolean {
+  if name.length == 0 { return false }
+  let c = name[0]
+  if c == '"' { return true }
+  c >= '0' && c <= '9'
+}
+
 // Lower a type guard `recv is Variant` onto `body` as the box-tag compare (mirroring
 // `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag),
 // then `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
@@ -4878,6 +4893,41 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
         fbStructGet(uBoxIdx, 0)  // 0xfb 0x02 <box ht> field 0: tag
         fbI32Const(scalarTagOf(ndv.isVariant))
         fbI32Bin(70)             // 0x46 i32.eq
+  // `v is <literal>` over a SOFTENED scalar: a same-base literal union rides
+  // its base scalar after `canonEmitTypeNames` (`"a" | "b"` a string, `0 | 1`
+  // an i32, `1.5 | 2.5` an f64), so the `is` is a runtime VALUE test — the
+  // same lowering as `v == <literal>` (string value-equality / numeric eq).
+  // A literal `is` over a still-BOXED mixed-rep union falls through to the
+  // variant path below (out of scope — fails loudly there).
+  if nd0 is IsExpr {
+    let lv = nd0.isVariant
+    if isLitVariantName(lv) {
+      if !exprUnion(nd0.isObj, fnIx) {
+        if lv[0] == '"' {
+          // The variant lexeme IS a raw quoted string lexeme (quotes kept,
+          // escapes unresolved — the same shape a `StrLit.strText` carries),
+          // so a synthesized `StrLit` node lowers it; then the value-eq core.
+          if !aUsed {
+            return emitFail("emitProgram: string `is` test but array type not collected")
+          }
+          if emitExpr(body, nd0.isObj, fnIx) < 0 { return 0 - 1 }
+          if emitExpr(body, mkStr(lv), fnIx) < 0 { return 0 - 1 }
+          return emitStrEqCore(body)
+        }
+        if emitExpr(body, nd0.isObj, fnIx) < 0 { return 0 - 1 }
+        if numTextIsFloat(lv) {
+          fbF64Const(lv)
+          fbI32Bin(97)         // 0x61 f64.eq
+          return 0
+        }
+        if exprIsI64(nd0.isObj, fnIx) || !numLexFitsI32(lv) {
+          let pr = parseI64Pair(lv)
+          fbI64Const(pr[0], pr[1])
+          fbI32Bin(81)         // 0x51 i64.eq
+          return 0
+        }
+        fbI32Const(parseI32(lv))
+        fbI32Bin(70)           // 0x46 i32.eq
         return 0
       }
     }
