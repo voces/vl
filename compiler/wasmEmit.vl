@@ -2454,6 +2454,119 @@ function firstValuedReturnIf(ifIx: i32): i32 {
 // functype result valtype AND every call-site classification (exprString's Call
 // case reads fRetStr, …) follow from one place. Iterated to a fixed point like
 // voidness: `function outer() { return inner() }` needs inner's inferred kind.
+// The active `is`-narrowing stack (see the union-narrowing section below for
+// the full architecture comment) — declared HERE because the narrowing-aware
+// return-inference walk just below is its textually earliest reader.
+let narrowNames: string[] = []
+let narrowVariants: string[] = []
+let narrowTop: i32 = 0
+
+// Null-hole inference tables (A-infer-null — see `nliInferLet`): the arena index
+// of each un-annotated `let x = null` whose hole a later assignment fills, and
+// the inferred `T|null` value-union name it carries.
+let nliLetIxs: i32[] = []
+let nliNames: string[] = []
+
+// Whether the current `computeRetInference` sweep flipped any fRet* flag.
+let criChanged: boolean = false
+
+// Classify ONE valued return expression at `rx0` of the function at `fnStmts`
+// position `i`, under the CURRENT narrowing stack — the loop body the flat
+// return scan used to run, extracted so the narrowing-aware walk shares it.
+function criClassify(rx0: i32, i: i32): i32 {
+  let rx = rx0
+  // A tail ASSIGNMENT yields its RHS (assignment-as-expression), so the
+  // function's return kind is the RHS's kind (`function emit(s: string)
+  // { acc = acc + s }` returns the new string).
+  let rxe = P.nodes[rx]
+  if rxe is BinExpr {
+    if rxe.binOp == "=" { rx = rxe.binRight }
+  }
+  if fRetStr[i] == 0 && exprString(rx, fnStmts[i]) {
+    fRetStr[i] = 1
+    criChanged = true
+  }
+  if fRetRArr[i] == 0 && exprRefArray(rx, fnStmts[i]) {
+    fRetRArr[i] = 1
+    criChanged = true
+  }
+  if fRetStrArr[i] == 0 && exprStringArray(rx, fnStmts[i]) {
+    fRetStrArr[i] = 1
+    criChanged = true
+  }
+  if fRetArr[i] == 0 && exprArray(rx, fnStmts[i]) {
+    fRetArr[i] = 1
+    criChanged = true
+  }
+  if fRetUni[i] == 0 && exprUnion(rx, fnStmts[i]) {
+    fRetUni[i] = 1
+    criChanged = true
+  }
+  if fRetNul[i] == 0 && exprNullableStruct(rx, fnStmts[i]) {
+    fRetNul[i] = 1
+    fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
+    criChanged = true
+  }
+  if fRetRef[i] == 0 && fRetNul[i] == 0 && exprStruct(rx, fnStmts[i]) {
+    fRetRef[i] = 1
+    fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
+    criChanged = true
+  }
+  if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
+    fRetBool[i] = 1
+    criChanged = true
+  }
+  0
+}
+
+// Walk a block's statements classifying every `return <e>` under the SAME
+// narrowing the emit loops apply: each `if` arm classifies under its
+// condition's then/else narrowing, and a divergent guard narrows the rest of
+// the block (`pushPostGuardNarrow`). The stack rewinds at block exit.
+function criWalkBlock(blockIx: i32, i: i32): i32 {
+  if blockIx < 0 { return 0 }
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let savedGuardTop = narrowTop
+    let k = 0
+    while k < stmts.length {
+      criWalkStmt(stmts[k], i)
+      pushPostGuardNarrow(stmts[k], fnStmts[i])
+      k = k + 1
+    }
+    restoreNarrow(savedGuardTop)
+    return 0
+  }
+  criWalkStmt(blockIx, i)
+}
+
+function criWalkStmt(stmtIx: i32, i: i32): i32 {
+  if stmtIx < 0 { return 0 }
+  let s = P.nodes[stmtIx]
+  if s is RetStmt {
+    if s.retArg >= 0 { criClassify(s.retArg, i) }
+    return 0
+  }
+  if s is IfStmt {
+    let savedTop = narrowTop
+    setNarrowFromCond(s.ifCond, fnStmts[i])
+    criWalkBlock(s.ifThen, i)
+    restoreNarrow(savedTop)
+    if s.ifElse >= 0 {
+      let savedElseTop = narrowTop
+      setNarrowFromCondElse(s.ifCond, fnStmts[i])
+      criWalkBlock(s.ifElse, i)
+      restoreNarrow(savedElseTop)
+    }
+    return 0
+  }
+  if s is WhileStmt { return criWalkBlock(s.whileBody, i) }
+  if s is ForRange { return criWalkBlock(s.frBody, i) }
+  if s is ForIn { return criWalkBlock(s.fiBody, i) }
+  0
+}
+
 function computeRetInference(): i32 {
   let changed = true
   while changed {
@@ -2467,55 +2580,24 @@ function computeRetInference(): i32 {
           // preference `fnRetExprOf` had), not just the first: a function whose
           // first return is an unclassifiable narrowed path read (`if x?.y is
           // string { return x.y } return "-1"`) still types from its other
-          // returns — the checker already proved all returns agree.
-          let rxs: i32[] = []
-          collectValuedReturns(fnStmts[i], rxs)
-          let rxj = 0
-          while rxj < rxs.length {
-            let rx = rxs[rxj]
-            rxj = rxj + 1
-            // A tail ASSIGNMENT yields its RHS (assignment-as-expression), so the
-            // function's return kind is the RHS's kind (`function emit(s: string)
-            // { acc = acc + s }` returns the new string).
-            let rxe = P.nodes[rx]
-            if rxe is BinExpr {
-              if rxe.binOp == "=" { rx = rxe.binRight }
+          // returns — the checker already proved all returns agree. The walk is
+          // NARROWING-AWARE (`criWalkBlock` mirrors the emit loops' condition /
+          // post-guard narrowing), so `if v !is i32 { return v }` classifies the
+          // narrowed `v` as its complement (a string return, not the union box) —
+          // the host's flow-sensitive return typing.
+          criChanged = false
+          let fnb = P.nodes[fnStmts[i]]
+          if fnb is FuncDecl {
+            let fb = P.nodes[fnb.fnBody]
+            if fb is Block {
+              let fbs = fb.blkStmts
+              if fbs.length > 0 {
+                if stmtIsTailValue(fbs[fbs.length - 1]) { criClassify(fbs[fbs.length - 1], i) }
+              }
             }
-            if fRetStr[i] == 0 && exprString(rx, fnStmts[i]) {
-              fRetStr[i] = 1
-              changed = true
-            }
-            if fRetRArr[i] == 0 && exprRefArray(rx, fnStmts[i]) {
-              fRetRArr[i] = 1
-              changed = true
-            }
-            if fRetStrArr[i] == 0 && exprStringArray(rx, fnStmts[i]) {
-              fRetStrArr[i] = 1
-              changed = true
-            }
-            if fRetArr[i] == 0 && exprArray(rx, fnStmts[i]) {
-              fRetArr[i] = 1
-              changed = true
-            }
-            if fRetUni[i] == 0 && exprUnion(rx, fnStmts[i]) {
-              fRetUni[i] = 1
-              changed = true
-            }
-            if fRetNul[i] == 0 && exprNullableStruct(rx, fnStmts[i]) {
-              fRetNul[i] = 1
-              fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
-              changed = true
-            }
-            if fRetRef[i] == 0 && fRetNul[i] == 0 && exprStruct(rx, fnStmts[i]) {
-              fRetRef[i] = 1
-              fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
-              changed = true
-            }
-            if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
-              fRetBool[i] = 1
-              changed = true
-            }
+            criWalkBlock(fnb.fnBody, i)
           }
+          if criChanged { changed = true }
         }
       }
       i = i + 1
@@ -3790,15 +3872,9 @@ let uFieldElemName: string[] = []
 // active. Entries are appended on push; on branch exit the depth is rewound (the arrays
 // keep their slots — no `.pop()`, so no global-list-pop self-host dependency). A push
 // past the current length appends; a push within reuses/overwrites the slot.
-let narrowNames: string[] = []
-let narrowVariants: string[] = []
-let narrowTop: i32 = 0
-
-// Null-hole inference tables (A-infer-null — see `nliInferLet`): the arena index
-// of each un-annotated `let x = null` whose hole a later assignment fills, and
-// the inferred `T|null` value-union name it carries.
-let nliLetIxs: i32[] = []
-let nliNames: string[] = []
+// (`narrowNames`/`narrowVariants`/`narrowTop` and the `nli*` tables are declared
+// early, before `computeRetInference` — module-level `let`s must textually
+// precede the function bodies/call sites that read them.)
 
 // The variant a union local `name` is narrowed to in the current scope (the innermost
 // active binding within `narrowTop`), or "" if `name` is not currently narrowed.

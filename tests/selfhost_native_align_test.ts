@@ -362,6 +362,7 @@ const RUN_CASES = [
   "types/literal-union-dedup.vl",
   "types/mutual-recursive-type.vl",
   "types/never-narrowing-legit.vl",
+  "types/not-is-narrowing.vl",
   "types/not-paren-is-guard-narrowing.vl",
   "types/null-coalesce.vl",
   "types/nullable-boolean.vl",
