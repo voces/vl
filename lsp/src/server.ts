@@ -56,6 +56,12 @@ import {
 } from "./codeActions.ts";
 import type { Context } from "../../compiler/ast.ts";
 import { tokenize } from "../../compiler/lexer.ts";
+import { join } from "node:path";
+import {
+  diffDiagnostics,
+  loadWasmChecker,
+  type WasmChecker,
+} from "./wasmChecker.ts";
 import {
   type Completion,
   type CompletionKind,
@@ -198,6 +204,12 @@ const parseSymbolsSeeded = (
 // The workspace folder this server is operating on
 let workspaceFolder: string | null;
 
+// LSP-on-wasm Stage 1 state (see `wasmChecker.ts` and `onInitialize`): which
+// checker publishes diagnostics, and the loaded self-hosted compiler when the
+// mode wants one. `"ts"` is the default and the universal fallback.
+let checkerMode: "ts" | "wasm" | "both" = "ts";
+let wasmChecker: WasmChecker | undefined;
+
 const severityMap: Record<VLSeverity, DiagnosticSeverity> = {
   error: DiagnosticSeverity.Error,
   warning: DiagnosticSeverity.Warning,
@@ -315,11 +327,51 @@ documents.onDidChangeContent(async (event) => {
   // statements. A file with no imports analyzes exactly as the single-file
   // `checkOnly` path did. Codegen-only diagnostics (the rare `Codegen error:`)
   // aren't produced here, same trade-off as `vl check`.
-  const { diagnostics } = await checkDocument(
-    event.document.getText(),
-    entryKeyOf(event.document.uri),
-    workspaceReader,
-  );
+  // Stage 1 of LSP-on-wasm (`vital.checker`): `"wasm"` publishes the
+  // self-hosted compiler's diagnostics instead of the TS checker's (no lint
+  // tier yet — that's Stage 3); `"both"` publishes the TS diagnostics and LOGS
+  // structural divergence from the wasm checker — the parity instrument the
+  // TS-host teardown gates on. Any wasm-side failure falls back to TS.
+  let diagnostics: VLDiagnostic[];
+  if (checkerMode === "wasm" && wasmChecker !== undefined) {
+    diagnostics = await wasmChecker
+      .check(
+        event.document.getText(),
+        entryKeyOf(event.document.uri),
+        workspaceReader,
+      )
+      .catch(async (err) => {
+        connection.console.log(`[wasm-checker] check failed (${err}) — TS fallback`);
+        return (await checkDocument(
+          event.document.getText(),
+          entryKeyOf(event.document.uri),
+          workspaceReader,
+        )).diagnostics;
+      });
+  } else {
+    diagnostics = (await checkDocument(
+      event.document.getText(),
+      entryKeyOf(event.document.uri),
+      workspaceReader,
+    )).diagnostics;
+    if (checkerMode === "both" && wasmChecker !== undefined) {
+      try {
+        const wasmDiags = await wasmChecker.check(
+          event.document.getText(),
+          entryKeyOf(event.document.uri),
+          workspaceReader,
+        );
+        const diff = diffDiagnostics(diagnostics, wasmDiags);
+        if (diff !== undefined) {
+          connection.console.log(
+            `[wasm-parity] divergence in ${event.document.uri}\n${diff}`,
+          );
+        }
+      } catch (err) {
+        connection.console.log(`[wasm-parity] wasm check failed: ${err}`);
+      }
+    }
+  }
 
   // Cache the raw VL diagnostics (which carry `code`/`range`/`source`) so
   // `onCodeAction` can offer fixes by line overlap, not just for the exact
@@ -854,6 +906,24 @@ connection.onInitialize((params) => {
   connection.console.log(
     `[Server(${process.pid}) ${workspaceFolder}] Started and initialize received`,
   );
+  // `vital.checker` rides initializationOptions (static per session — the
+  // extension passes the workspace config at client start). A requested wasm
+  // checker that cannot load (no seed, no WasmGC in this host) degrades to
+  // `"ts"` after one log line.
+  const opts = (params.initializationOptions ?? {}) as {
+    checker?: string;
+    compilerWasm?: string;
+  };
+  if (opts.checker === "wasm" || opts.checker === "both") {
+    const root = params.rootUri ? uriToPath(params.rootUri) : "";
+    const wasmPath = opts.compilerWasm ||
+      join(root, "build", "vl-compiler.wasm");
+    wasmChecker = loadWasmChecker(
+      wasmPath,
+      (msg) => connection.console.log(msg),
+    );
+    checkerMode = wasmChecker !== undefined ? opts.checker : "ts";
+  }
   return {
     capabilities: {
       textDocumentSync: {
