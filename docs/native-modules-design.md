@@ -144,3 +144,33 @@ lands (needs WASI argv/file IO on top).
    tests/cases/modules/*.
 4. Promote the 5 @run dirs + 4 err cases into the native gates; cold
    native-fixpoint + full align battery.
+
+## Post-parity revisit (H3 is a bridge, not the destination)
+
+The merge-by-renaming design below is deliberate migration engineering — full
+host parity with zero impact on single-file consumers — NOT the long-term module
+system. Once native/host parity is reached, revisit with these intents:
+
+KEEP (correct regardless of era):
+
+- The fetch loop (compiler asks host for sources) — provider-query shape;
+  upgrade the char-by-char ABI to bulk string passing when convenient.
+- Resolution semantics: relative-only, append `.vl`, no directory guessing,
+  cycles rejected.
+- Whole-program → one wasm module (cross-module mono/DCE for free; separate
+  WasmGC compilation needs a stable ABI + cross-module rec-group identity —
+  adopt only when build times force it).
+- Dependency-first init order; entry-only host exports.
+
+REPLACE (the load-bearing reversal):
+
+- Name mangling (`name$mN`) + the scope-aware rewriter → SYMBOL-based
+  resolution: per-module scopes, imports as first-class bindings, references
+  resolve to symbol IDs, not strings. Kills the rewriter (every new AST node /
+  scoping construct is a latent silent-corruption bug in the walker — the
+  type-position divergence vs the host was this smell showing).
+- The `/^\s*import\s*\{/m` textual gate + commit-time token rescan → imports as
+  real AST nodes read off one parse; "module mode" stops being a mode.
+- Entry-path-only diagnostics → spans carry module identity natively.
+- Privacy-via-renaming → checker-enforced visibility ("`secret` is private to
+  ./util" beats "is not exported").
