@@ -342,6 +342,8 @@ const RUN_CASES = [
   "types/and-narrowing.vl",
   "types/boolean-to-i32.vl",
   "types/guard-function.vl",
+  "types/infer-null-conditional-assign.vl",
+  "types/infer-null-reassign.vl",
   "types/infer-null-unconstrained.vl",
   "types/intersection-annotation.vl",
   "types/intersection-object-merge.vl",
