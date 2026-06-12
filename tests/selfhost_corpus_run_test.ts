@@ -104,6 +104,7 @@ const WHITELIST = [
   "functions/calls.vl",
   "functions/doc-comments.vl",
   "functions/recursion.vl",
+  "functions/structural-generic.vl",
   "functions/early-return.vl",
   "functions/escaping.vl",
   "functions/lambda.vl",
