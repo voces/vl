@@ -2014,7 +2014,14 @@ function nameToTy(name: string): i32 {
   let nlen = name.length
   if nlen >= 2 {
     if name[nlen - 2] == '[' && name[nlen - 1] == ']' {
-      return mkArrayTy(nameToTy(name.slice(0, nlen - 2)))
+      // An UNRESOLVED element name poisons the whole array annotation (-1,
+      // "unknown type 'Bad[]'"). Building `mkArrayTy(-1)` here instead would
+      // leak the `-1` ELEMENT HOLE (the empty-`[]` sentinel) as the type of
+      // every `xs[i]` read — and a member access on that hole indexes the
+      // type arena at -1, a checker CRASH (generics/type-alias-nested.vl).
+      let aeTy = nameToTy(name.slice(0, nlen - 2))
+      if aeTy < 0 { return -1 }
+      return mkArrayTy(aeTy)
     }
   }
   // A string-keyed MAP `{[K]:V}` (the parser's synthetic index-signature name).
@@ -4371,6 +4378,12 @@ function checkNode(ix: i32): i32 {
       if mOv >= 0 { return mOv }
     }
     let objTy = checkNode(n.memObj)
+    // A NEGATIVE receiver type is an unpinned inference hole (the `-1` element
+    // of a never-pinned empty `[]` read back through `xs[i]`), not an arena
+    // index — indexing `T.tys` with it would CRASH. The hole itself is already
+    // reported (`flushUninferred` / the unknown-annotation path), so don't
+    // cascade.
+    if objTy < 0 { return TY_ERR }
     let ot = T.tys[objTy]
     if ot is TyObj {
       let ft = objFieldType(ot, n.memProp)
@@ -4444,6 +4457,8 @@ function checkNode(ix: i32): i32 {
   } else if n is Index {
     let arrTy = checkNode(n.idxArr)
     let idxTy = checkNode(n.idxIndex)
+    // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
+    if arrTy < 0 { return TY_ERR }
     let at = T.tys[arrTy]
     // A MAP index `m[k]`: the key must match the map's key type; a READ yields the
     // NULLABLE value (`V | null` — the key may be absent; default with `??`), and an
@@ -4539,6 +4554,8 @@ function checkNode(ix: i32): i32 {
       if omOv >= 0 { return omOv }
     }
     let recv = checkNode(n.omObj)
+    // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
+    if recv < 0 { return TY_ERR }
     let rcv = T.tys[recv]
     let wasNullable = false
     let baseTy = recv
