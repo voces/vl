@@ -1703,7 +1703,265 @@ function collectCloSigs(): i32 {
     }
     fe = fe + 1
   }
+  // EXTENDED field-closure signatures (index/operator-trap dispatch): a closure
+  // that is an OBJECT-FIELD VALUE may be void (`"[]=": function(k,v) {…}`) or
+  // struct-returning (`"[]": function(i) row(i)`, an operator field returning a
+  // struct) — sigs the value ABI above excludes. Intern each such field
+  // closure's extended key (`>v` / `>sN;` results) so the member-call site can
+  // `ref.cast` to the callee's REAL functype. Usage-gated: only fires for a
+  // field closure whose sig is NOT already value-eligible, so a program without
+  // one emits byte-identical types.
+  let ai = 0
+  while ai < P.nodes.length {
+    let an = P.nodes[ai]
+    if an is ObjLit {
+      let fs = an.objFields
+      let fi = 0
+      while fi < fs.length {
+        let f = P.nodes[fs[fi]]
+        if f is FieldInit {
+          let ffe = fieldValueFeOf(f.fiValue)
+          if ffe >= 0 {
+            if fnSigKeyOf(ffe) == "" {
+              let ek = cloSigKeyExt(ffe)
+              if ek != "" {
+                if cloSigPosOfKey(ek) < 0 {
+                  cloSigKeys.push(ek)
+                  cloSigRepFn.push(ffe)
+                }
+              }
+            }
+          }
+        }
+        fi = fi + 1
+      }
+    }
+    ai = ai + 1
+  }
   0
+}
+
+// The lifted-function position (`fnStmts` index) of an object-literal FIELD
+// VALUE that is a function: an inline lambda (`FuncDecl` node — lifted in place,
+// so its arena index appears in `fnStmts`) or a bare Ident naming a function.
+// -1 for any other field value.
+function fieldValueFeOf(valIx: i32): i32 {
+  if valIx < 0 { return 0 - 1 }
+  let v = P.nodes[valIx]
+  if v is FuncDecl { return fnStmtsPosOf(valIx) }
+  if v is Ident { return fnIndexOf(v.identName) }
+  0 - 1
+}
+
+// The EXTENDED `$fnsig` key of lifted function `fe`: `fnSigKeyOf`'s key when the
+// sig is value-eligible, else the same param spine with a VOID (`>v`) or
+// STRUCT-REF (`>sN;`) result — the field-closure dispatch sigs. "" when any
+// param/result kind is still outside the ABI.
+function cloSigKeyExt(fe: i32): string {
+  let base = fnSigKeyOf(fe)
+  if base != "" { return base }
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  if fe >= fRetVoid.length { return "" }
+  let fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    // Read every field of the narrowed `fn` BEFORE further narrowings.
+    let params = fn.fnParams
+    let retTy = fn.fnRet
+    let key = ""
+    let pi = 0
+    while pi < params.length {
+      let k = vtKindOfParam(params[pi])
+      if k == 0 {
+        key = key + "i"
+      } else if k == 11 {
+        key = key + "d"
+      } else if k == 1 {
+        key = key + "s" + i32ToStr(paramStructIdxOf(params[pi])) + ";"
+      } else {
+        return ""
+      }
+      pi = pi + 1
+    }
+    if fRetVoid[fe] == 1 { return key + ">v" }
+    if fnReturnsClosure(fe) { return "" }
+    if retTy >= 0 {
+      if vtKindOfType(retTy) == 1 {
+        return key + ">s" + i32ToStr(retStructIndex(retTy)) + ";"
+      }
+      return ""
+    }
+    if fRetRef[fe] == 1 {
+      if fRetStructIdx[fe] >= 0 { return key + ">s" + i32ToStr(fRetStructIdx[fe]) + ";" }
+    }
+    return ""
+  }
+  ""
+}
+
+// The lifted-function position of the closure held by FIELD `prop` of struct
+// `si`, resolved through the object LITERAL(s) that intern shape `si` — every
+// literal of one shape carries sig-identical closures (monomorphized instances
+// included), so the first match types the call. -1 when no literal of shape
+// `si` sets a function-valued `prop`.
+function fieldClosureFeOf(si: i32, prop: string): i32 {
+  if si < 0 { return 0 - 1 }
+  let ai = 0
+  while ai < P.nodes.length {
+    let an = P.nodes[ai]
+    if an is ObjLit {
+      if structIndexOfObj(ai) == si {
+        let ffe = fieldValueFeOf(objFieldVal(ai, prop))
+        if ffe >= 0 { return ffe }
+      }
+    }
+    ai = ai + 1
+  }
+  0 - 1
+}
+
+// The lifted-function position of the closure a member call `recv.prop(...)`
+// dispatches to, resolved as precisely as possible: first by following the
+// RECEIVER to the literal that built it (a `const o = make(...)` whose maker
+// returns an object literal — so two same-shaped receivers from different
+// monomorphized makers each resolve their OWN closure), else by the receiver's
+// struct SHAPE (`fieldClosureFeOf`). -1 when neither resolves.
+function fieldClosureFeOfRecv(recvIx: i32, prop: string, fnIx: i32): i32 {
+  let e = P.nodes[unwrapParen(recvIx)]
+  if e is Ident {
+    let li = 0 - 1
+    if fnIx >= 0 {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+    }
+    if li < 0 { li = globalLetOf(e.identName) }
+    if li >= 0 {
+      let d = P.nodes[li]
+      if d is LetDecl {
+        let ffe = fieldClosureFeOfInit(d.letInit, prop)
+        if ffe >= 0 { return ffe }
+      }
+    }
+  }
+  if e is Call {
+    let ffe2 = fieldClosureFeOfInit(unwrapParen(recvIx), prop)
+    if ffe2 >= 0 { return ffe2 }
+  }
+  fieldClosureFeOf(structIndexOfExpr(recvIx, fnIx), prop)
+}
+
+// The MAKER function (`fnStmts` position) whose tail object literal built the
+// receiver expression at `recvIx`: a direct `make(...)` call, or an ident bound
+// (let/global) to one. -1 when the receiver's origin is not a maker call.
+function recvMakerFnOf(recvIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[unwrapParen(recvIx)]
+  let initIx = unwrapParen(recvIx)
+  if e is Ident {
+    let li = 0 - 1
+    if fnIx >= 0 {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+    }
+    if li < 0 { li = globalLetOf(e.identName) }
+    if li < 0 { return 0 - 1 }
+    let d = P.nodes[li]
+    if d is LetDecl { initIx = unwrapParen(d.letInit) } else { return 0 - 1 }
+  }
+  let ie = P.nodes[initIx]
+  if ie is Call {
+    let callee = P.nodes[ie.callFn]
+    if callee is Ident { return fnIndexOf(callee.identName) }
+  }
+  0 - 1
+}
+
+// The annotation NAME of parameter `name` of the lifted function at `fe` ("" if
+// not a param / un-annotated).
+function feParamTyName(fe: i32, name: string): string {
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  let fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return tyNameOf(p.parType) }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// BOOLEAN-ness of a field-closure trap call `recv.prop(...)`. Monomorphized
+// maker instances SHARE the closure body, so the closure's own inferred return
+// kind cannot distinguish `wrap(true)` from `wrap(99)` — instead, follow the
+// receiver to ITS maker instance and read the closure's tail through the
+// instance's pinned param annotations (`function(_k) x` with the instance's
+// `x: boolean` → true). Falls back to the shared closure's `fRetBool`.
+function fieldCloCallIsBool(recvIx: i32, prop: string, fnIx: i32): boolean {
+  let mk = recvMakerFnOf(recvIx, fnIx)
+  if mk >= 0 {
+    let rx = fnRetExprOf(fnStmts[mk])
+    if rx >= 0 {
+      let re = P.nodes[unwrapParen(rx)]
+      if re is ObjLit {
+        let v = objFieldVal(unwrapParen(rx), prop)
+        if v >= 0 {
+          let vf = P.nodes[v]
+          if vf is FuncDecl {
+            let vRet = vf.fnRet
+            if vRet >= 0 {
+              return tyNameOf(vRet) == "boolean" || tyNameOf(vRet) == "bool"
+            }
+            let tx = fnRetExprOf(v)
+            if tx >= 0 {
+              let te = P.nodes[unwrapParen(tx)]
+              if te is Ident {
+                let ptn = feParamTyName(mk, te.identName)
+                if ptn != "" { return ptn == "boolean" || ptn == "bool" }
+              }
+              return exprIsBool(tx, v)
+            }
+          }
+        }
+      }
+    }
+  }
+  let bfe = fieldClosureFeOfRecv(recvIx, prop, fnIx)
+  if bfe >= 0 {
+    let bfn = P.nodes[fnStmts[bfe]]
+    if bfn is FuncDecl {
+      if bfn.fnRet >= 0 {
+        return tyNameOf(bfn.fnRet) == "boolean" || tyNameOf(bfn.fnRet) == "bool"
+      }
+    }
+    if bfe < fRetBool.length { return fRetBool[bfe] == 1 }
+  }
+  false
+}
+
+// Resolve `prop`'s closure through an INITIALIZER expression: an object literal
+// reads its own field; a call to a maker follows the maker's return expression
+// (its tail object literal). -1 otherwise.
+function fieldClosureFeOfInit(initIx: i32, prop: string): i32 {
+  if initIx < 0 { return 0 - 1 }
+  let e = P.nodes[unwrapParen(initIx)]
+  if e is ObjLit { return fieldValueFeOf(objFieldVal(unwrapParen(initIx), prop)) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      let t = fnIndexOf(callee.identName)
+      if t >= 0 {
+        let rx = fnRetExprOf(fnStmts[t])
+        if rx >= 0 {
+          let re = P.nodes[unwrapParen(rx)]
+          if re is ObjLit { return fieldValueFeOf(objFieldVal(unwrapParen(rx), prop)) }
+        }
+      }
+    }
+  }
+  0 - 1
 }
 
 // The position of `key` in `cloSigKeys`, or -1.
@@ -1717,9 +1975,13 @@ function cloSigPosOfKey(key: string): i32 {
 }
 
 // The `$fnsig` type index for lifted function `fe`'s own signature, or -1 when its
-// signature is not value-eligible / not interned.
+// signature is not value-eligible / not interned. The EXTENDED key (`cloSigKeyExt`)
+// equals the value-ABI key for an eligible sig; a void / struct-returning FIELD
+// closure resolves its interned `>v`/`>sN;` sig (so its function-section type IS
+// that `$fnsig` and the trap call site's `ref.cast` accepts it); any other
+// non-eligible sig stays -1 (its ext key is never interned).
 function fnSigIdxOfFn(fe: i32): i32 {
-  let key = fnSigKeyOf(fe)
+  let key = cloSigKeyExt(fe)
   if key == "" { return 0 - 1 }
   let p = cloSigPosOfKey(key)
   if p < 0 { return 0 - 1 }
@@ -2192,6 +2454,119 @@ function firstValuedReturnIf(ifIx: i32): i32 {
 // functype result valtype AND every call-site classification (exprString's Call
 // case reads fRetStr, …) follow from one place. Iterated to a fixed point like
 // voidness: `function outer() { return inner() }` needs inner's inferred kind.
+// The active `is`-narrowing stack (see the union-narrowing section below for
+// the full architecture comment) — declared HERE because the narrowing-aware
+// return-inference walk just below is its textually earliest reader.
+let narrowNames: string[] = []
+let narrowVariants: string[] = []
+let narrowTop: i32 = 0
+
+// Null-hole inference tables (A-infer-null — see `nliInferLet`): the arena index
+// of each un-annotated `let x = null` whose hole a later assignment fills, and
+// the inferred `T|null` value-union name it carries.
+let nliLetIxs: i32[] = []
+let nliNames: string[] = []
+
+// Whether the current `computeRetInference` sweep flipped any fRet* flag.
+let criChanged: boolean = false
+
+// Classify ONE valued return expression at `rx0` of the function at `fnStmts`
+// position `i`, under the CURRENT narrowing stack — the loop body the flat
+// return scan used to run, extracted so the narrowing-aware walk shares it.
+function criClassify(rx0: i32, i: i32): i32 {
+  let rx = rx0
+  // A tail ASSIGNMENT yields its RHS (assignment-as-expression), so the
+  // function's return kind is the RHS's kind (`function emit(s: string)
+  // { acc = acc + s }` returns the new string).
+  let rxe = P.nodes[rx]
+  if rxe is BinExpr {
+    if rxe.binOp == "=" { rx = rxe.binRight }
+  }
+  if fRetStr[i] == 0 && exprString(rx, fnStmts[i]) {
+    fRetStr[i] = 1
+    criChanged = true
+  }
+  if fRetRArr[i] == 0 && exprRefArray(rx, fnStmts[i]) {
+    fRetRArr[i] = 1
+    criChanged = true
+  }
+  if fRetStrArr[i] == 0 && exprStringArray(rx, fnStmts[i]) {
+    fRetStrArr[i] = 1
+    criChanged = true
+  }
+  if fRetArr[i] == 0 && exprArray(rx, fnStmts[i]) {
+    fRetArr[i] = 1
+    criChanged = true
+  }
+  if fRetUni[i] == 0 && exprUnion(rx, fnStmts[i]) {
+    fRetUni[i] = 1
+    criChanged = true
+  }
+  if fRetNul[i] == 0 && exprNullableStruct(rx, fnStmts[i]) {
+    fRetNul[i] = 1
+    fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
+    criChanged = true
+  }
+  if fRetRef[i] == 0 && fRetNul[i] == 0 && exprStruct(rx, fnStmts[i]) {
+    fRetRef[i] = 1
+    fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
+    criChanged = true
+  }
+  if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
+    fRetBool[i] = 1
+    criChanged = true
+  }
+  0
+}
+
+// Walk a block's statements classifying every `return <e>` under the SAME
+// narrowing the emit loops apply: each `if` arm classifies under its
+// condition's then/else narrowing, and a divergent guard narrows the rest of
+// the block (`pushPostGuardNarrow`). The stack rewinds at block exit.
+function criWalkBlock(blockIx: i32, i: i32): i32 {
+  if blockIx < 0 { return 0 }
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let savedGuardTop = narrowTop
+    let k = 0
+    while k < stmts.length {
+      criWalkStmt(stmts[k], i)
+      pushPostGuardNarrow(stmts[k], fnStmts[i])
+      k = k + 1
+    }
+    restoreNarrow(savedGuardTop)
+    return 0
+  }
+  criWalkStmt(blockIx, i)
+}
+
+function criWalkStmt(stmtIx: i32, i: i32): i32 {
+  if stmtIx < 0 { return 0 }
+  let s = P.nodes[stmtIx]
+  if s is RetStmt {
+    if s.retArg >= 0 { criClassify(s.retArg, i) }
+    return 0
+  }
+  if s is IfStmt {
+    let savedTop = narrowTop
+    setNarrowFromCond(s.ifCond, fnStmts[i])
+    criWalkBlock(s.ifThen, i)
+    restoreNarrow(savedTop)
+    if s.ifElse >= 0 {
+      let savedElseTop = narrowTop
+      setNarrowFromCondElse(s.ifCond, fnStmts[i])
+      criWalkBlock(s.ifElse, i)
+      restoreNarrow(savedElseTop)
+    }
+    return 0
+  }
+  if s is WhileStmt { return criWalkBlock(s.whileBody, i) }
+  if s is ForRange { return criWalkBlock(s.frBody, i) }
+  if s is ForIn { return criWalkBlock(s.fiBody, i) }
+  0
+}
+
 function computeRetInference(): i32 {
   let changed = true
   while changed {
@@ -2205,55 +2580,24 @@ function computeRetInference(): i32 {
           // preference `fnRetExprOf` had), not just the first: a function whose
           // first return is an unclassifiable narrowed path read (`if x?.y is
           // string { return x.y } return "-1"`) still types from its other
-          // returns — the checker already proved all returns agree.
-          let rxs: i32[] = []
-          collectValuedReturns(fnStmts[i], rxs)
-          let rxj = 0
-          while rxj < rxs.length {
-            let rx = rxs[rxj]
-            rxj = rxj + 1
-            // A tail ASSIGNMENT yields its RHS (assignment-as-expression), so the
-            // function's return kind is the RHS's kind (`function emit(s: string)
-            // { acc = acc + s }` returns the new string).
-            let rxe = P.nodes[rx]
-            if rxe is BinExpr {
-              if rxe.binOp == "=" { rx = rxe.binRight }
+          // returns — the checker already proved all returns agree. The walk is
+          // NARROWING-AWARE (`criWalkBlock` mirrors the emit loops' condition /
+          // post-guard narrowing), so `if v !is i32 { return v }` classifies the
+          // narrowed `v` as its complement (a string return, not the union box) —
+          // the host's flow-sensitive return typing.
+          criChanged = false
+          let fnb = P.nodes[fnStmts[i]]
+          if fnb is FuncDecl {
+            let fb = P.nodes[fnb.fnBody]
+            if fb is Block {
+              let fbs = fb.blkStmts
+              if fbs.length > 0 {
+                if stmtIsTailValue(fbs[fbs.length - 1]) { criClassify(fbs[fbs.length - 1], i) }
+              }
             }
-            if fRetStr[i] == 0 && exprString(rx, fnStmts[i]) {
-              fRetStr[i] = 1
-              changed = true
-            }
-            if fRetRArr[i] == 0 && exprRefArray(rx, fnStmts[i]) {
-              fRetRArr[i] = 1
-              changed = true
-            }
-            if fRetStrArr[i] == 0 && exprStringArray(rx, fnStmts[i]) {
-              fRetStrArr[i] = 1
-              changed = true
-            }
-            if fRetArr[i] == 0 && exprArray(rx, fnStmts[i]) {
-              fRetArr[i] = 1
-              changed = true
-            }
-            if fRetUni[i] == 0 && exprUnion(rx, fnStmts[i]) {
-              fRetUni[i] = 1
-              changed = true
-            }
-            if fRetNul[i] == 0 && exprNullableStruct(rx, fnStmts[i]) {
-              fRetNul[i] = 1
-              fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
-              changed = true
-            }
-            if fRetRef[i] == 0 && fRetNul[i] == 0 && exprStruct(rx, fnStmts[i]) {
-              fRetRef[i] = 1
-              fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
-              changed = true
-            }
-            if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
-              fRetBool[i] = 1
-              changed = true
-            }
+            criWalkBlock(fnb.fnBody, i)
           }
+          if criChanged { changed = true }
         }
       }
       i = i + 1
@@ -2627,10 +2971,26 @@ function captureValKind(fe: i32, name: string): i32 {
   if bn is Param { return vtKindOfType(bn.parType) }
   if bn is LetDecl {
     if bn.letType >= 0 { return vtKindOfType(bn.letType) }
-    // Un-annotated local: a struct-literal init is a struct ref (kind 1).
+    // Un-annotated local: classify the INITIALIZER through the same ladder
+    // `collectLocals` types the binding with (resolved in the PARENT frame), so
+    // a captured list/string/struct env field carries its real ref valtype —
+    // `const store = [a, b]` captured by a closure is the i32-list wrapper ref
+    // (kind 2), not an i32 cell. Order mirrors `collectLocals`.
     if bn.letInit >= 0 {
-      let iv = P.nodes[bn.letInit]
-      if iv is ObjLit { return 1 }
+      let pf = fnParent[fe]
+      if letIsMap(b, pf) { return 6 }
+      if letIsNulRef(b, pf) { return 9 }
+      if letIsStringArray(b, pf) { return 7 }
+      if letIsF64Array(b, pf) { return 12 }
+      if letIsRefArray(b, pf) { return 5 }
+      if letIsUnion(b, pf) { return 4 }
+      if letIsStruct(b, pf) { return 1 }
+      if letIsArray(b, pf) { return 2 }
+      if letIsString(b, pf) { return 3 }
+      if letIsI64(b) { return 10 }
+      if letIsF32(b) { return 13 }
+      if letIsF64(b) { return 11 }
+      if letIsClosure(b, pf) { return 14 }
     }
   }
   0
@@ -2645,8 +3005,15 @@ function captureValStructIdx(fe: i32, name: string): i32 {
   if bn is LetDecl {
     if bn.letType >= 0 { return retStructIndex(bn.letType) }
     if bn.letInit >= 0 {
+      let pf = fnParent[fe]
+      // The kind-specific companion index, mirroring `captureValKind`'s ladder:
+      // a map capture carries its mv SHAPE slot, a nullable-struct / struct
+      // capture its struct table index, a ref-list capture its ref-list slot.
+      if letIsMap(b, pf) { return letMapShapeOf(b, pf) }
+      if letIsNulRef(b, pf) { return nulRefStructIdxOfLet(b, pf) }
+      if letIsRefArray(b, pf) { return letRefListSlot(b, pf) }
       let iv = P.nodes[bn.letInit]
-      if iv is ObjLit { return structIndexOfExpr(bn.letInit, fnParent[fe]) }
+      if iv is ObjLit { return structIndexOfExpr(bn.letInit, pf) }
     }
   }
   0 - 1
@@ -2987,6 +3354,21 @@ let strPushScratchBase: i32 = 0
 // defaultable but always `local.set` before read, which wasm validation accepts.
 let fnUsesStrOp: boolean = false
 let strScratchBase: i32 = 0
+
+// ── per-function list `==`/`!=`/`+` scratch frames (collections-design §VL.4/6) ──
+// List value-equality and list concat lower INLINE (like the string ops above),
+// each staging its two operand WRAPPER refs + a length and an index. One typed
+// frame per receiver list KIND so a nested compare (an `i32[][]` element loop
+// recursing into an i32-list compare) never clobbers its outer loop:
+//   LEQI (5 slots): A/B `(ref $lTypeIdx)`, out `(ref $aTypeIdx)` (concat), n, i
+//   LEQS (4 slots): A/B `(ref $mkListIdx)`, n, i  (string elements ride strScr)
+//   LEQR (4 slots, one frame per ref-list slot): A/B `(ref $rlWrapIdx[slot])`, n, i
+let fnUsesListEqI: boolean = false
+let leqIScratchBase: i32 = 0
+let fnUsesListEqS: boolean = false
+let leqSScratchBase: i32 = 0
+let fnListEqRSlots: i32[] = []
+let leqRBases: i32[] = []
 
 // ── struct-type table (MULTIPLE structs per program) ──────────────────────────
 // A program may declare MANY struct `type`s. Mirroring the union variant table, the
@@ -3490,9 +3872,9 @@ let uFieldElemName: string[] = []
 // active. Entries are appended on push; on branch exit the depth is rewound (the arrays
 // keep their slots — no `.pop()`, so no global-list-pop self-host dependency). A push
 // past the current length appends; a push within reuses/overwrites the slot.
-let narrowNames: string[] = []
-let narrowVariants: string[] = []
-let narrowTop: i32 = 0
+// (`narrowNames`/`narrowVariants`/`narrowTop` and the `nli*` tables are declared
+// early, before `computeRetInference` — module-level `let`s must textually
+// precede the function bodies/call sites that read them.)
 
 // The variant a union local `name` is narrowed to in the current scope (the innermost
 // active binding within `narrowTop`), or "" if `name` is not currently narrowed.
@@ -4271,6 +4653,166 @@ function exprIsStructEq(binIx: i32, fnIx: i32): boolean {
   false
 }
 
+// ── list `==`/`!=`/`+` detection (which functions need the list-op frames) ────
+// The list-op operand KIND of an expression: `0` an i32 list, `3` a string
+// list, `4` an `i32[][]` (a ref list of i32-list elements), or -1 (not a list /
+// an unsupported element kind). Order mirrors `emitIndex`'s receiver dispatch.
+function listOpKindOf(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 - 1 }
+  if exprString(exprIx, fnIx) { return 0 - 1 }
+  if exprStringArray(exprIx, fnIx) { return 3 }
+  if exprF64Array(exprIx, fnIx) { return 0 - 1 }
+  if exprRefArray(exprIx, fnIx) {
+    let slot = refListSlotOfExpr(exprIx, fnIx)
+    if slot >= 0 && slot < rlElemKindTbl.length {
+      if rlElemKindTbl[slot] == 4 { return 4 }
+    }
+    return 0 - 1
+  }
+  if exprArray(exprIx, fnIx) { return 0 }
+  0 - 1
+}
+
+// The list-op kind of a `==`/`!=`/`+` BinExpr whose operands are BOTH lists of
+// one kind, or -1 (not a list op — the caller keeps its existing dispatch).
+function listOpKindOfBin(binIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" || e.binOp == "+" {
+      let lk = listOpKindOf(e.binLeft, fnIx)
+      if lk < 0 { return 0 - 1 }
+      let rk = listOpKindOf(e.binRight, fnIx)
+      if rk != lk { return 0 - 1 }
+      return lk
+    }
+  }
+  0 - 1
+}
+
+// Note one BinExpr's list-op kind into the per-function frame flags.
+function leqNoteBin(binIx: i32, fnIx: i32): i32 {
+  let k = listOpKindOfBin(binIx, fnIx)
+  if k == 0 { fnUsesListEqI = true }
+  if k == 3 {
+    fnUsesListEqS = true
+    // The per-element string compares stage operands in the string-op frame.
+    fnUsesStrOp = true
+  }
+  if k == 4 {
+    // The nested element compare recurses into the i32-list frame.
+    fnUsesListEqI = true
+    let e = P.nodes[binIx]
+    if e is BinExpr {
+      let slot = refListSlotOfExpr(e.binLeft, fnIx)
+      if slot >= 0 {
+        let seen = false
+        let i = 0
+        while i < fnListEqRSlots.length {
+          if fnListEqRSlots[i] == slot { seen = true }
+          i = i + 1
+        }
+        if !seen { fnListEqRSlots.push(slot) }
+      }
+    }
+  }
+  0
+}
+
+// Recursive expression walk noting every list `==`/`!=`/`+` site.
+function leqScanExpr(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return 0 }
+  let e = P.nodes[exprIx]
+  if e is BinExpr {
+    leqNoteBin(exprIx, fnIx)
+    leqScanExpr(e.binLeft, fnIx)
+    return leqScanExpr(e.binRight, fnIx)
+  }
+  if e is Unary { return leqScanExpr(e.unArg, fnIx) }
+  if e is Paren { return leqScanExpr(e.parInner, fnIx) }
+  if e is Call {
+    leqScanExpr(e.callFn, fnIx)
+    let args = e.callArgs
+    let i = 0
+    while i < args.length {
+      leqScanExpr(args[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  if e is Member { return leqScanExpr(e.memObj, fnIx) }
+  if e is OptMember { return leqScanExpr(e.omObj, fnIx) }
+  if e is Index {
+    leqScanExpr(e.idxArr, fnIx)
+    return leqScanExpr(e.idxIndex, fnIx)
+  }
+  if e is ArrayLit {
+    let es = e.arrElems
+    let i2 = 0
+    while i2 < es.length {
+      leqScanExpr(es[i2], fnIx)
+      i2 = i2 + 1
+    }
+    return 0
+  }
+  if e is ObjLit {
+    let fs = e.objFields
+    let i3 = 0
+    while i3 < fs.length {
+      let f = P.nodes[fs[i3]]
+      if f is FieldInit { leqScanExpr(f.fiValue, fnIx) }
+      i3 = i3 + 1
+    }
+    return 0
+  }
+  if e is IsExpr { return leqScanExpr(e.isObj, fnIx) }
+  0
+}
+
+// Statement-level walk (descends branch/loop bodies; a bare expression
+// statement falls through to the expression walk).
+function leqScanStmt(stmtIx: i32, fnIx: i32): i32 {
+  if stmtIx < 0 { return 0 }
+  let s = P.nodes[stmtIx]
+  if s is LetDecl { return leqScanExpr(s.letInit, fnIx) }
+  if s is RetStmt { return leqScanExpr(s.retArg, fnIx) }
+  if s is IfStmt {
+    leqScanExpr(s.ifCond, fnIx)
+    leqScanBlock(s.ifThen, fnIx)
+    return leqScanBlock(s.ifElse, fnIx)
+  }
+  if s is WhileStmt {
+    leqScanExpr(s.whileCond, fnIx)
+    return leqScanBlock(s.whileBody, fnIx)
+  }
+  if s is ForRange {
+    leqScanExpr(s.frFrom, fnIx)
+    leqScanExpr(s.frTo, fnIx)
+    leqScanExpr(s.frStep, fnIx)
+    return leqScanBlock(s.frBody, fnIx)
+  }
+  if s is ForIn {
+    leqScanExpr(s.fiIter, fnIx)
+    return leqScanBlock(s.fiBody, fnIx)
+  }
+  if s is Block { return leqScanBlock(stmtIx, fnIx) }
+  leqScanExpr(stmtIx, fnIx)
+}
+
+function leqScanBlock(ix: i32, fnIx: i32): i32 {
+  if ix < 0 { return 0 }
+  let b = P.nodes[ix]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      leqScanStmt(stmts[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  leqScanStmt(ix, fnIx)
+}
+
 // True if `callIx` is a `recv.slice(start, end)` over a STRING receiver.
 function exprIsStrSlice(callIx: i32, fnIx: i32): boolean {
   let c = P.nodes[callIx]
@@ -4779,6 +5321,8 @@ function pushFieldStorage(code: i32, refSlot: i32): i32 {
     // The box's heap index is a forward reference inside the shared rec group.
     wU8(100)                   // 0x64 (ref ht)
     wSLEB(uBoxIdx)
+  } else if code == 17 {
+    wU8(124)                   // 0x7c f64 storagetype
   } else {
     wU8(127)                   // 0x7f i32 storagetype
   }
@@ -4801,6 +5345,14 @@ function structIndexByName(name: string): i32 {
 // matches. With distinct field-name sets across structs this disambiguates which
 // struct an `{ … }` literal constructs (the struct analogue of `objVariantName`).
 function structIndexOfObj(objIx: i32): i32 {
+  structIndexOfObjCtx(objIx, 0 - 1)
+}
+
+// The context-aware variant: `fnIx` (when >= 0) classifies field VALUES through
+// the expression family too, so a monomorphized instance's SHARED tail literal
+// (`{ x: self.x + b.x }`) resolves per instance — f64 against the f64-param
+// instance, i32 against the i32 one.
+function structIndexOfObjCtx(objIx: i32, fnIx: i32): i32 {
   let o = P.nodes[objIx]
   if o is ObjLit {
     let nf = o.objFields.length
@@ -4812,7 +5364,29 @@ function structIndexOfObj(objIx: i32): i32 {
         while k < nf {
           let f = P.nodes[o.objFields[k]]
           if f is FieldInit {
-            if sFieldIndex(si, f.fiName) < 0 { ok = false }
+            let mfi = sFieldIndex(si, f.fiName)
+            if mfi < 0 {
+              ok = false
+            } else {
+              // F64 DISCRIMINATION: an `{x}` literal matches the i32 `{x}` and
+              // the f64 `{x}` shapes by NAME — split them on the value's float-
+              // ness so `{x: 1.5}` builds the f64 shape and `{x: 1}` the i32
+              // one (monomorphized `addx` instances each pin their own). Only
+              // the f64 axis discriminates; every other code keeps the lenient
+              // name-only match (a `{v: 5}` literal still matches a
+              // `{v: i32|null}` union-field shape).
+              let sc = sFieldTypeAt(si, mfi)
+              let vc = anonFieldCode(f.fiValue)
+              let isFloat = vc == 17
+              if !isFloat && fnIx >= 0 {
+                if exprIsF64(f.fiValue, fnIx) { isFloat = true }
+              }
+              if isFloat {
+                if sc != 17 && sc != 16 { ok = false }
+              } else if sc == 17 {
+                if fnIx >= 0 || vc >= 0 { ok = false }
+              }
+            }
           } else {
             ok = false
           }
@@ -4861,7 +5435,7 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
     let si = pendingStructIdx
     pendingStructIdx = 0 - 1
     if si < 0 {
-      si = structIndexOfObj(objIx)
+      si = structIndexOfObjCtx(objIx, fnIx)
     }
     if si < 0 {
       return emitFail("emitProgram: object literal field count does not match struct")
@@ -4905,6 +5479,10 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
       // atom tag); a union-valued field expression passes through unchanged.
       if scode == 16 {
         if emitUnionCoerce(body, sFieldElemNameAt(si, fi), valIx, fnIx) < 0 { return 0 - 1 }
+      } else if scode == 17 {
+        // An f64 field widens its value at the construction boundary (an int
+        // literal into `x: f64` re-encodes; an f64 expression passes through).
+        if emitExprAsF64(body, valIx, fnIx) < 0 { return 0 - 1 }
       } else {
         if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
       }
@@ -8186,6 +8764,226 @@ function emitStrEqCore(body: i32[]): i32 {
   0
 }
 
+// ── list value-equality + concat cores (collections-design §VL.4/§VL.6) ───────
+// Each core expects its two list WRAPPER refs already ON THE STACK (left below
+// right) and leaves a 0/1 (equality) or the new wrapper (concat). The loop
+// structure mirrors `emitStrEqCore` exactly (same block/loop/br depths); only
+// the length source (the wrapper's `len` field, NOT `array.len` — the backing
+// has spare capacity) and the element compare differ per kind.
+
+// i32-list `==`: length + element compare over the LEQI frame.
+function emitListEqICore(body: i32[]): i32 {
+  let bA = leqIScratchBase
+  fbLocalSet(bA + 1)         // B
+  fbLocalSet(bA + 0)         // A
+  fbBlock(127)               // block i32
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 1)   // lenA
+  fbLocalSet(bA + 3)         // n = lenA
+  fbLocalGet(bA + 3)
+  fbLocalGet(bA + 1)
+  fbStructGet(lTypeIdx, 1)   // lenB
+  fbI32Bin(71)               // i32.ne
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(1)
+  fbEnd()
+  fbI32Const(0)
+  fbLocalSet(bA + 4)         // i = 0
+  fbLoop(64)
+  fbLocalGet(bA + 4)
+  fbLocalGet(bA + 3)
+  fbI32Bin(78)               // i >= n → done
+  fbIf(64)
+  fbElse()
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 0)   // backing A
+  fbLocalGet(bA + 4)
+  fbArrayGet(aTypeIdx)
+  fbLocalGet(bA + 1)
+  fbStructGet(lTypeIdx, 0)   // backing B
+  fbLocalGet(bA + 4)
+  fbArrayGet(aTypeIdx)
+  fbI32Bin(71)               // element i32.ne
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(3)                    // mismatch → 0, exit block
+  fbEnd()
+  fbLocalGet(bA + 4)
+  fbI32Const(1)
+  fbI32Bin(106)              // i + 1
+  fbLocalSet(bA + 4)
+  fbBr(1)                    // back to loop
+  fbEnd()                    // end (ge_s if/else)
+  fbEnd()                    // end (loop)
+  fbI32Const(1)
+  fbEnd()                    // end (block)
+  0
+}
+
+// String-list `==`: outer loop over the LEQS frame; each element pair rides
+// `emitStrEqCore` (the string-op frame — disjoint locals, safe to nest).
+function emitListEqSCore(body: i32[]): i32 {
+  let bA = leqSScratchBase
+  fbLocalSet(bA + 1)         // B
+  fbLocalSet(bA + 0)         // A
+  fbBlock(127)               // block i32
+  fbLocalGet(bA + 0)
+  fbStructGet(mkListIdx, 1)  // lenA
+  fbLocalSet(bA + 2)         // n
+  fbLocalGet(bA + 2)
+  fbLocalGet(bA + 1)
+  fbStructGet(mkListIdx, 1)
+  fbI32Bin(71)               // i32.ne
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(1)
+  fbEnd()
+  fbI32Const(0)
+  fbLocalSet(bA + 3)         // i = 0
+  fbLoop(64)
+  fbLocalGet(bA + 3)
+  fbLocalGet(bA + 2)
+  fbI32Bin(78)
+  fbIf(64)
+  fbElse()
+  // push elem A, elem B (non-null string refs), compare via the string core
+  fbLocalGet(bA + 0)
+  fbStructGet(mkListIdx, 0)
+  fbLocalGet(bA + 3)
+  fbArrayGet(mkArrIdx)
+  fbRefAsNonNull()
+  fbLocalGet(bA + 1)
+  fbStructGet(mkListIdx, 0)
+  fbLocalGet(bA + 3)
+  fbArrayGet(mkArrIdx)
+  fbRefAsNonNull()
+  if emitStrEqCore(body) < 0 { return 0 - 1 }
+  fbI32Eqz()                 // 1 = mismatch
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(3)
+  fbEnd()
+  fbLocalGet(bA + 3)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(bA + 3)
+  fbBr(1)
+  fbEnd()
+  fbEnd()
+  fbI32Const(1)
+  fbEnd()
+  0
+}
+
+// `i32[][]` `==`: outer loop over the slot's LEQR frame; each element pair (two
+// inner i32-list wrappers) recurses through `emitListEqICore` (disjoint frame).
+function emitListEqRCore(body: i32[], slot: i32, base: i32): i32 {
+  fbLocalSet(base + 1)       // B
+  fbLocalSet(base + 0)       // A
+  fbBlock(127)               // block i32
+  fbLocalGet(base + 0)
+  fbStructGet(rlWrapIdx[slot], 1)
+  fbLocalSet(base + 2)       // n
+  fbLocalGet(base + 2)
+  fbLocalGet(base + 1)
+  fbStructGet(rlWrapIdx[slot], 1)
+  fbI32Bin(71)
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(1)
+  fbEnd()
+  fbI32Const(0)
+  fbLocalSet(base + 3)       // i = 0
+  fbLoop(64)
+  fbLocalGet(base + 3)
+  fbLocalGet(base + 2)
+  fbI32Bin(78)
+  fbIf(64)
+  fbElse()
+  fbLocalGet(base + 0)
+  fbStructGet(rlWrapIdx[slot], 0)
+  fbLocalGet(base + 3)
+  fbArrayGet(rlBackIdx[slot])
+  fbRefAsNonNull()
+  fbLocalGet(base + 1)
+  fbStructGet(rlWrapIdx[slot], 0)
+  fbLocalGet(base + 3)
+  fbArrayGet(rlBackIdx[slot])
+  fbRefAsNonNull()
+  if emitListEqICore(body) < 0 { return 0 - 1 }
+  fbI32Eqz()
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(3)
+  fbEnd()
+  fbLocalGet(base + 3)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(base + 3)
+  fbBr(1)
+  fbEnd()
+  fbEnd()
+  fbI32Const(1)
+  fbEnd()
+  0
+}
+
+// The reserved LEQR frame base for ref-list slot `slot`, or -1.
+function leqRBaseOfSlot(slot: i32): i32 {
+  let i = 0
+  while i < fnListEqRSlots.length {
+    if fnListEqRSlots[i] == slot { return leqRBases[i] }
+    i = i + 1
+  }
+  0 - 1
+}
+
+// i32-list CONCAT `a + b`: a NEW list sized exactly lenA + lenB (one backing
+// allocation, two bulk `array.copy`s) — the host's §VL.4 lowering. The operands
+// are evaluated once into the LEQI frame; the result wrapper is left on the stack.
+function emitListConcatI(body: i32[], leftIx: i32, rightIx: i32, fnIx: i32): i32 {
+  let bA = leqIScratchBase
+  if emitExpr(body, leftIx, fnIx) < 0 { return 0 - 1 }
+  fbLocalSet(bA + 0)         // A
+  if emitExpr(body, rightIx, fnIx) < 0 { return 0 - 1 }
+  fbLocalSet(bA + 1)         // B
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 1)   // lenA
+  fbLocalGet(bA + 1)
+  fbStructGet(lTypeIdx, 1)   // lenB
+  fbI32Bin(106)              // i32.add
+  fbLocalSet(bA + 3)         // n = lenA + lenB
+  fbLocalGet(bA + 3)
+  fbArrayNewDefault(aTypeIdx)
+  fbLocalSet(bA + 2)         // out backing
+  // array.copy out 0 backingA 0 lenA
+  fbLocalGet(bA + 2)
+  fbI32Const(0)
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 0)
+  fbI32Const(0)
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 1)
+  fbArrayCopy(aTypeIdx, aTypeIdx)
+  // array.copy out lenA backingB 0 lenB
+  fbLocalGet(bA + 2)
+  fbLocalGet(bA + 0)
+  fbStructGet(lTypeIdx, 1)
+  fbLocalGet(bA + 1)
+  fbStructGet(lTypeIdx, 0)
+  fbI32Const(0)
+  fbLocalGet(bA + 1)
+  fbStructGet(lTypeIdx, 1)
+  fbArrayCopy(aTypeIdx, aTypeIdx)
+  // the result wrapper { out, n, n }
+  fbLocalGet(bA + 2)
+  fbLocalGet(bA + 3)
+  fbLocalGet(bA + 3)
+  fbStructNew(lTypeIdx)
+  0
+}
+
 // Re-evaluate the field ACCESS CHAIN `root.f1.f2…` onto `body`: the root
 // expression, then one `struct.get` per (struct, field) pair in the path arrays.
 // Every step is a pure re-read (the equality compare re-walks chains per field).
@@ -8272,6 +9070,13 @@ function emitStructEqFieldInner(body: i32[], lRoot: i32, rRoot: i32, si: i32, fi
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
     if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
     fbI32Bin(70)               // 0x46 i32.eq
+    return 0
+  }
+  if code == 17 {
+    // f64 scalar field: a native f64 compare (i32 0/1 result).
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    fbI32Bin(97)               // 0x61 f64.eq
     return 0
   }
   if code == 3 {
@@ -9335,6 +10140,36 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     if exprIsStrEq(exprIx, fnIx) {
       return emitStrEq(body, exprIx, fnIx)
     }
+    // List `==`/`!=` (length + element value-compare, recursive through nested
+    // lists / string elements) and list `+` (concat) — collections-design
+    // §VL.4/§VL.6, the host's `listEqFn`/concat lowerings, inlined.
+    let lopK = listOpKindOfBin(exprIx, fnIx)
+    if lopK >= 0 {
+      if e.binOp == "+" {
+        if lopK != 0 {
+          return emitFail("emitProgram: list concat over this element kind is not supported")
+        }
+        return emitListConcatI(body, e.binLeft, e.binRight, fnIx)
+      }
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }
+      if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+      if lopK == 0 {
+        if emitListEqICore(body) < 0 { return 0 - 1 }
+      } else if lopK == 3 {
+        if emitListEqSCore(body) < 0 { return 0 - 1 }
+      } else {
+        let lslot = refListSlotOfExpr(e.binLeft, fnIx)
+        let lbase = leqRBaseOfSlot(lslot)
+        if lbase < 0 {
+          return emitFail("emitProgram: ref-list compare frame not reserved")
+        }
+        if emitListEqRCore(body, lslot, lbase) < 0 { return 0 - 1 }
+      }
+      if e.binOp == "!=" {
+        fbI32Eqz()             // 0x45 i32.eqz (`!=` negates value-equality)
+      }
+      return 0
+    }
     // `p == null` / `p != null` over a NULLABLE struct ref: `ref.is_null`
     // (inverted with `eqz` for `!=`) — never the i32 compare.
     if e.binOp == "==" || e.binOp == "!=" {
@@ -9931,6 +10766,10 @@ function exprIsF64(exprIx: i32, fnIx: i32): boolean {
     }
     return false
   }
+  // A field read `p.x` whose struct field is an f64 slot (code 17) yields an f64.
+  if e is Member {
+    return memFieldTypeCode(exprIx, fnIx) == 17
+  }
   false
 }
 
@@ -9965,6 +10804,10 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
     // A `boolean|null` NICHE binding read (narrowed non-null in its branch)
     // prints true/false. Plain `boolean` idents stay unclassified (existing rule).
     if exprNulBool(ix, fnIx) { return true }
+    // A CAPTURED boolean (a closure returning its maker's `x: boolean` param,
+    // e.g. a monomorphized `wrap(true)` index-trap instance) — so the closure's
+    // inferred return kind (`fRetBool`) sees the bool-ness through the env.
+    if capturedIsBool(fnIx, e.identName) { return true }
   }
   if e is BinExpr {
     let op = e.binOp
@@ -9993,6 +10836,16 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
   }
   if e is Call {
     let callee = P.nodes[e.callFn]
+    // A FIELD-CLOSURE call (`(wb."[]")(0)` — an index-trap dispatch) classifies
+    // by the field function's return: the receiver's ORIGIN resolves the exact
+    // monomorphized MAKER instance, so `wrap(true)`'s trap prints true while
+    // `wrap(99)`'s prints 99 (the instances SHARE the closure body — bool-ness
+    // lives in the instance's pinned param annotation, not the shared closure).
+    if callee is Member {
+      if drwFieldClosure(structIndexOfExpr(callee.memObj, fnIx), callee.memProp) {
+        return fieldCloCallIsBool(callee.memObj, callee.memProp, fnIx)
+      }
+    }
     if callee is Ident {
       let target = fnIndexOf(callee.identName)
       if target >= 0 {
@@ -10515,6 +11368,20 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32): i32 {
       if ck != "" {
         let cp = cloSigPosOfKey(ck)
         if cp >= 0 { sig = cloSigBase + cp }
+      }
+    }
+    // A FIELD-closure callee (`(o."[]")(k)`, an operator/index trap or any
+    // function-valued field): resolve the field's lifted function and cast to
+    // its REAL signature — a void (`>v`) or struct-returning (`>sN;`) field
+    // closure has no all-i32 arity sig to ride.
+    if cre is Member {
+      let mfe = fieldClosureFeOfRecv(cre.memObj, cre.memProp, fnIx)
+      if mfe >= 0 {
+        let mk = cloSigKeyExt(mfe)
+        if mk != "" {
+          let mp = cloSigPosOfKey(mk)
+          if mp >= 0 { sig = cloSigBase + mp }
+        }
       }
     }
     if sig < 0 { sig = fnSigIdxForArity(args.length) }
@@ -11898,6 +12765,33 @@ function pushPostGuardNarrow(stmtIx: i32, fnIx: i32): i32 {
       }
     }
   }
+  // ASSIGNMENT narrowing (A-infer-null, the host's `assignmentNarrowing`): a
+  // straight-line `x = <non-null expr>` over a null-bearing VALUE union makes
+  // `x` provably non-null for the REST of the enclosing block — `let x = null;
+  // x = 5; x + 1` reads the unboxed i32 with no null tax. Emitted only for a
+  // plain `=` to a bare name whose RHS is itself non-null (a `x = maybeNull()`
+  // RHS, or a bare `null`, leaves `x` un-narrowed). The CALLER restores the
+  // depth at block exit, so a branch-local assignment never leaks past the join.
+  if s is BinExpr {
+    if s.binOp == "=" {
+      let tgt = P.nodes[s.binLeft]
+      if tgt is Ident {
+        let un = unionNameOfIdent(tgt.identName, fnIx)
+        if un != "" && isValueUnionName(un) && unionHasAtom(un, "null") {
+          let rhs = P.nodes[unwrapParen(s.binRight)]
+          let rhsNullable = false
+          if rhs is NullLit { rhsNullable = true }
+          let rn = unionNameOfExpr(s.binRight, fnIx)
+          if rn != "" {
+            if unionHasAtom(rn, "null") { rhsNullable = true }
+          }
+          if !rhsNullable {
+            pushNarrow(tgt.identName, removeAtomFrom(un, "null"))
+          }
+        }
+      }
+    }
+  }
   0
 }
 
@@ -12189,16 +13083,20 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       scopeBind(s.letName, slot)
       return 0
     }
-    // A degenerate UN-ANNOTATED `let x = null` (A-infer-null): the binding's type
-    // is the plain `null` type — it is never read as a non-null value, so its i32
-    // cell just zero-inits. (An ANNOTATED nullable binding takes the normal path.)
+    // A degenerate UN-ANNOTATED `let x = null` (A-infer-null): when NO later
+    // assignment fills the hole (`nliNameOf` recorded nothing), the binding's
+    // type is the plain `null` type — it is never read as a non-null value, so
+    // its i32 cell just zero-inits. A FILLED hole (`x = 5` later) is a `T|null`
+    // value-union binding (kind 4) and takes the union-coerce path below.
     if s.letType < 0 {
       let bareN = P.nodes[unwrapParen(s.letInit)]
       if bareN is NullLit {
-        fbI32Const(0)
-        fbLocalSet(idx)        // 0x21 local.set
-        scopeBind(s.letName, slot)
-        return 0
+        if nliNameOf(stmtIx) == "" {
+          fbI32Const(0)
+          fbLocalSet(idx)        // 0x21 local.set
+          scopeBind(s.letName, slot)
+          return 0
+        }
       }
     }
     // An empty `[]` initializer over a ref-array annotation (`let xs: T[] = []`) needs
@@ -12226,7 +13124,9 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     let letUNm = ""
     let letAnnNm = ""
     if s.letType >= 0 { letAnnNm = tyNameOf(s.letType) }
-    if isUName(letAnnNm) { letUNm = letAnnNm }
+    // A filled null hole (`let x = null` + later `x = e`, A-infer-null) is its
+    // inferred `T|null` value union — coerce the bare `null` init into the box.
+    if isUName(letAnnNm) { letUNm = letAnnNm } else { letUNm = nliNameOf(stmtIx) }
     if letUNm != "" {
       if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return 0 - 1 }
     } else if letIsF32(stmtIx) {
@@ -12331,6 +13231,21 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
           fbDrop()               // 0x1a drop (discard the boolean result)
           return 0
         }
+      }
+      // A CLOSURE-FIELD member call STATEMENT (`(o."[]=")(k, v)` — the rewritten
+      // index WRITE trap, or any function-valued field invoked for effect):
+      // `call_ref` it; drop the result unless the field's function is void.
+      if exprIsClosure(s.callFn, fnIx) {
+        if emitCallRef(body, stmtIx, fnIx) < 0 { return 0 - 1 }
+        let mcFe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        let mcVoid = false
+        if mcFe >= 0 {
+          if fRetVoid[mcFe] == 1 { mcVoid = true }
+        }
+        if !mcVoid {
+          fbDrop()               // 0x1a drop (discard the unused result)
+        }
+        return 0
       }
       return emitFail("emitProgram: unsupported member-call statement")
     }
@@ -13213,6 +14128,20 @@ function fbBeginFunc(nParams: i32, nLocals: i32): i32 {
       mvk = mvk + 1
     }
   }
+  // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6), appended LAST so
+  // every existing layout is untouched: the i32-list frame (A/B wrappers + the
+  // concat out backing + n + i), the string-list frame, then one typed frame per
+  // compared ref-list slot.
+  leqIScratchBase = fbScratchCur
+  if fnUsesListEqI { fbReserve(5) }
+  leqSScratchBase = fbScratchCur
+  if fnUsesListEqS { fbReserve(4) }
+  leqRBases = []
+  let lqk = 0
+  while lqk < fnListEqRSlots.length {
+    leqRBases.push(fbReserve(4))
+    lqk = lqk + 1
+  }
   fbScratchCur
 }
 
@@ -13271,6 +14200,9 @@ function fbLocalsCount(nLocals: i32): i32 {
   if fnUsesCallRef { n = n + 1 }
   if fnUsesMapFilter { n = n + 4 }
   n = n + mfSrcKinds.length + mfDstKinds.length
+  if fnUsesListEqI { n = n + 5 }
+  if fnUsesListEqS { n = n + 4 }
+  n = n + fnListEqRSlots.length * 4
   n
 }
 
@@ -13402,6 +14334,32 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32): i32 {
       mvr = mvr + 1
     }
   }
+  // List `==`/`!=`/`+` frames, in `fbBeginFunc`'s reservation order: the
+  // i32-list frame (A/B wrapper refs, the concat out backing, n, i), the
+  // string-list frame (A/B wrapper refs, n, i), then one typed frame per
+  // compared ref-list slot (A/B wrapper refs, n, i).
+  if fnUsesListEqI {
+    fbRefRun(lTypeIdx)
+    fbRefRun(lTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbI32Run()
+  }
+  if fnUsesListEqS {
+    fbRefRun(mkListIdx)
+    fbRefRun(mkListIdx)
+    fbI32Run()
+    fbI32Run()
+  }
+  let lqv = 0
+  while lqv < fnListEqRSlots.length {
+    let lqs = fnListEqRSlots[lqv]
+    fbRefRun(rlWrapIdx[lqs])
+    fbRefRun(rlWrapIdx[lqs])
+    fbI32Run()
+    fbI32Run()
+    lqv = lqv + 1
+  }
   wTarget(prev)
   0
 }
@@ -13476,6 +14434,13 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     mfDstKinds = []
     mfDstBases = []
     mfScan(fn.fnBody, fnIx)
+    // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6). May also flip
+    // `fnUsesStrOp` (a string-list compare rides the string-op frame), so it
+    // runs AFTER the `fnHasStrOp` assignment above.
+    fnUsesListEqI = false
+    fnUsesListEqS = false
+    fnListEqRSlots = []
+    leqScanBlock(fn.fnBody, fnIx)
     let nLocals = localNames.length
     // Lay out every scratch frame after the params + declared locals via the
     // FuncBuilder cursor (Phase H), which sets `pushScratchBase` /
@@ -14823,6 +15788,24 @@ function startFnDetectScratch(): i32 {
     }
     si = si + 1
   }
+  // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6) — non-const
+  // global inits and every top-level statement run in the start function.
+  fnUsesListEqI = false
+  fnUsesListEqS = false
+  fnListEqRSlots = []
+  let lgi = 0
+  while lgi < globalStmts.length {
+    if globalIsNonConst(globalStmts[lgi]) {
+      let lg = P.nodes[globalStmts[lgi]]
+      if lg is LetDecl { leqScanExpr(lg.letInit, 0 - 1) }
+    }
+    lgi = lgi + 1
+  }
+  let lsi = 0
+  while lsi < startStmts.length {
+    leqScanStmt(startStmts[lsi], 0 - 1)
+    lsi = lsi + 1
+  }
   0
 }
 
@@ -14925,6 +15908,10 @@ function emitStartFnCode(out: i32[]): i32 {
   // module-level (`fnIx = -1`): identifier reads/writes resolve to globals.
   let gi = 0
   let si = 0
+  // Post-statement narrowing for the top-level statement list (the assignment
+  // narrowing of `pushPostGuardNarrow` — a top-level guard `if` cannot
+  // `return`, so only the assignment arm ever fires here). Restored at loop end.
+  let savedStartNarrowTop = narrowTop
   while gi < globalStmts.length || si < startStmts.length {
     let takeGlobal = gi < globalStmts.length
     if takeGlobal && si < startStmts.length {
@@ -14980,9 +15967,11 @@ function emitStartFnCode(out: i32[]): i32 {
       gi = gi + 1
     } else {
       if emitStmt(bodyExpr, startStmts[si], 0 - 1) < 0 { wTarget(exprPrev) return 0 - 1 }
+      pushPostGuardNarrow(startStmts[si], 0 - 1)
       si = si + 1
     }
   }
+  restoreNarrow(savedStartNarrowTop)
   wTarget(exprPrev)
 
   let body: i32[] = []
@@ -15442,9 +16431,11 @@ function emitModule(stmts: i32[]): i32 {
     // the key has byte-identical kinds, by construction of the key).
     let sai = 0
     while sai < cloSigKeys.length {
-      let rep = P.nodes[fnStmts[cloSigRepFn[sai]]]
+      let repFe = cloSigRepFn[sai]
+      let rep = P.nodes[fnStmts[repFe]]
       if rep is FuncDecl {
         let rparams = rep.fnParams
+        let rRetTy = rep.fnRet
         wU8(96)                    // 0x60 func
         wULEB(rparams.length + 1)  // env + declared params
         wU8(107)                   // param 0 env: structref (0x6b)
@@ -15453,8 +16444,23 @@ function emitModule(stmts: i32[]): i32 {
           fbValtype(vtKindOfParam(rparams[pj]), paramStructIdxOf(rparams[pj]))
           pj = pj + 1
         }
-        wU8(1)                     // 1 result
-        fbValtype(cloRetKindOf(cloSigRepFn[sai]), 0 - 1)   // i32 (0) or f64 (11)
+        // The RESULT must byte-match the rep function's own functype result so
+        // the call-site `ref.cast` to this `$fnsig` accepts the callee funcref:
+        // a VOID field-closure sig (`>v`) has 0 results; a STRUCT-returning one
+        // (`>sN;`) yields the struct ref exactly as the function functype does.
+        if fRetVoid[repFe] == 1 {
+          wU8(0)                   // 0 results — the `>v` write-trap sig
+        } else {
+          wU8(1)                   // 1 result
+          let rk = cloRetKindOf(repFe)
+          if rk == 0 || rk == 11 {
+            fbValtype(rk, 0 - 1)   // i32 (0) or f64 (11)
+          } else {
+            let rsi = 0 - 1
+            if rRetTy >= 0 { rsi = retStructIndex(rRetTy) } else { rsi = fRetStructIdx[repFe] }
+            fbValtype(1, rsi)      // (ref $S) — the `>sN;` struct-result sig
+          }
+        }
       }
       sai = sai + 1
     }
@@ -16128,6 +17134,8 @@ function fieldTypeCode(tyIx: i32): i32 {
   if ty is TypeRef {
     if ty.tyName == "i32" { return 0 }
     if ty.tyName == "boolean" { return 0 }
+    // An f64 field (`x: f64`) stores a raw f64 valtype slot — code 17.
+    if ty.tyName == "f64" { return 17 }
     if nameIsString(ty.tyName) { return 3 }
     if nameIsArray(ty.tyName) {
       if nameIsI32Array(ty.tyName) { return 4 }
@@ -16608,12 +17616,34 @@ function nameNamesFunction(name: string): boolean {
 function anonFieldCode(valIx: i32): i32 {
   if valIx < 0 { return 0 - 1 }
   let e = P.nodes[valIx]
-  if e is NumLit { return 0 }
+  if e is NumLit {
+    // A float `.` literal field (`x: 1.5`) is an f64 slot (code 17).
+    if numTextIsFloat(e.numText) { return 17 }
+    return 0
+  }
   if e is BoolLit { return 0 }
   if e is StrLit { return 3 }
   if e is FuncDecl { return 14 }
   if e is Ident {
     if nameNamesFunction(e.identName) { return 14 }
+    return 0 - 1
+  }
+  // An ARITHMETIC field value (`x: x * s` — an operator-overload maker scaling
+  // its params) is i32 too; a `+` whose operand is a string literal is a concat
+  // (not classifiable here).
+  if e is BinExpr {
+    let bop = e.binOp
+    if bop == "-" || bop == "*" || bop == "/" || bop == "%" { return 0 }
+    if bop == "+" {
+      let bl = P.nodes[unwrapParen(e.binLeft)]
+      let br = P.nodes[unwrapParen(e.binRight)]
+      let strSide = false
+      if bl is StrLit { strSide = true }
+      if br is StrLit { strSide = true }
+      if !strSide { return 0 }
+      return 0 - 1
+    }
+    return 0 - 1
   }
   // An i32-element array literal field (`tags: [1, 2, 3]`) is an i32 list (code 4).
   if e is ArrayLit {
@@ -16649,6 +17679,8 @@ function anonFieldElemName(valIx: i32, code: i32): string {
 function nameFieldCode(t: string): i32 {
   if t == "i32" { return 0 }
   if t == "boolean" { return 0 }
+  if t == "f64" { return 17 }
+
   if nameIsString(t) { return 3 }
   if nameIsArray(t) {
     if nameIsI32Array(t) { return 4 }
@@ -16874,6 +17906,28 @@ function collectAnonShapes(): i32 {
     if an is ObjLit {
       if structIndexOfObj(ai) < 0 && objVariantName(ai) == "" {
         let fields = an.objFields
+        // Does this literal carry a FUNCTION-valued field? An operator/index
+        // TRAP MAKER (`{ "*": fn, x: x, y: y }`) mixes closures with plain
+        // ident fields — classify the idents as i32 there (the host types them
+        // exactly; a mis-typed non-i32 binding fails loudly at the validator).
+        // A literal with NO function field keeps idents unclassifiable, so a
+        // generic's structural-return literal (`{ first: b, second: a }`) stays
+        // un-interned here and matches its instance-pinned ANNOTATION shape.
+        let hasFnField = false
+        let ffi = 0
+        while ffi < fields.length {
+          let ff = P.nodes[fields[ffi]]
+          if ff is FieldInit {
+            // (Direct node checks, not `fieldValueFeOf` — `fnStmts` is not yet
+            // populated when `collectS`/`collectAnonShapes` run.)
+            let fv = P.nodes[ff.fiValue]
+            if fv is FuncDecl { hasFnField = true }
+            if fv is Ident {
+              if nameNamesFunction(fv.identName) { hasFnField = true }
+            }
+          }
+          ffi = ffi + 1
+        }
         let codes: i32[] = []
         let names: string[] = []
         let elemNames: string[] = []
@@ -16883,6 +17937,12 @@ function collectAnonShapes(): i32 {
           let f = P.nodes[fields[fi]]
           if f is FieldInit {
             let code = anonFieldCode(f.fiValue)
+            if code < 0 && hasFnField {
+              let iv = P.nodes[f.fiValue]
+              if iv is Ident {
+                if !nameNamesFunction(iv.identName) { code = 0 }
+              }
+            }
             if code < 0 { ok = false }
             codes.push(code)
             names.push(f.fiName)
@@ -17681,6 +18741,127 @@ function tyNameOf(tyIx: i32): string {
   ""
 }
 
+// ── usage-driven `let x = null` nullable-hole inference (A-infer-null) ───────
+// The host's hole-bearing `null`: an UN-ANNOTATED `let x = null` is NOT pinned to
+// the exact `null` type — a later assignment `x = e` fills the hole's `T`, so `x`
+// is the value union `T | null`. The native mirror infers `T` once at collection
+// time (the FIRST classifiable assignment in the binding's enclosing statement
+// list, descending into branch/loop blocks but NOT nested function bodies — their
+// same-named locals are different bindings), registers `T|null` as a value union
+// (interning its box reps), and records it per LetDecl arena index so every later
+// classifier (`letIsUnion` / `letUnionNameOf` / `globalCellKind`) sees the union.
+// (The `nliLetIxs`/`nliNames` tables are declared with the narrowing stack —
+// module-level `let`s must precede their first textual use site.)
+
+// The inferred `T|null` union name of the null-init `LetDecl` at `letIx`, or "".
+function nliNameOf(letIx: i32): string {
+  let i = 0
+  while i < nliLetIxs.length {
+    if nliLetIxs[i] == letIx { return nliNames[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// The value-union ATOM name an assignment RHS fills a null hole with ("i32",
+// "boolean", "string", "f64", "i64"), or "" when the RHS is not classifiable at
+// collection time (an ident, a member read, …). A function-call RHS reads the
+// callee's declared return annotation straight from the arena (the fn tables are
+// not populated yet when this scan runs).
+function nliAtomOfExpr(exprIx: i32): string {
+  if exprIx < 0 { return "" }
+  let e = P.nodes[unwrapParen(exprIx)]
+  if e is NumLit {
+    if numTextIsFloat(e.numText) { return "f64" }
+    if !numLexFitsI32(e.numText) { return "i64" }
+    return "i32"
+  }
+  if e is StrLit { return "string" }
+  if e is BoolLit { return "boolean" }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      let cn = callee.identName
+      let ti = 0
+      while ti < P.nodes.length {
+        let f = P.nodes[ti]
+        if f is FuncDecl {
+          if f.fnName == cn {
+            let rn = tyNameOf(f.fnRet)
+            if valueAtomKind(rn) >= 0 && rn != "null" { return rn }
+            return ""
+          }
+        }
+        ti = ti + 1
+      }
+    }
+  }
+  ""
+}
+
+// Scan the statement list `walk` from position `from` for the FIRST classifiable
+// assignment `name = e`, descending into branch/loop blocks.
+function nliScanStmts(walk: i32[], from: i32, name: string): string {
+  let i = from
+  while i < walk.length {
+    let a = nliScanStmt(walk[i], name)
+    if a != "" { return a }
+    i = i + 1
+  }
+  ""
+}
+
+// Scan one statement (an `else if` chains a lone IfStmt through here too).
+function nliScanStmt(stmtIx: i32, name: string): string {
+  if stmtIx < 0 { return "" }
+  let s = P.nodes[stmtIx]
+  if s is BinExpr {
+    if s.binOp == "=" {
+      let tgt = P.nodes[s.binLeft]
+      if tgt is Ident {
+        if tgt.identName == name { return nliAtomOfExpr(s.binRight) }
+      }
+    }
+    return ""
+  }
+  if s is IfStmt {
+    let a = nliScanBlock(s.ifThen, name)
+    if a != "" { return a }
+    return nliScanStmt(s.ifElse, name)
+  }
+  if s is Block { return nliScanStmts(s.blkStmts, 0, name) }
+  if s is WhileStmt { return nliScanBlock(s.whileBody, name) }
+  if s is ForRange { return nliScanBlock(s.frBody, name) }
+  if s is ForIn { return nliScanBlock(s.fiBody, name) }
+  ""
+}
+
+function nliScanBlock(blockIx: i32, name: string): string {
+  if blockIx < 0 { return "" }
+  nliScanStmt(blockIx, name)
+}
+
+// Infer + register the null hole of the un-annotated `let x = null` at
+// `walk[i]`, scanning the REST of `walk` for the filling assignment.
+function nliInferLet(walk: i32[], i: i32): i32 {
+  let s = P.nodes[walk[i]]
+  if s is LetDecl {
+    if s.letType < 0 && s.letInit >= 0 {
+      let ini = P.nodes[s.letInit]
+      if ini is NullLit {
+        let atom = nliScanStmts(walk, i + 1, s.letName)
+        if atom != "" {
+          let nn = atom + "|null"
+          registerValueUnionName(nn)
+          nliLetIxs.push(walk[i])
+          nliNames.push(nn)
+        }
+      }
+    }
+  }
+  0
+}
+
 // Scan every top-level FuncDecl's parameter + return annotations and every top-level
 // `let`/`const` annotation for INLINE union types, registering each as a synthetic
 // union alias (so it interns its variant shapes + heap types exactly like a named
@@ -17688,6 +18869,8 @@ function tyNameOf(tyIx: i32): string {
 // alias is a no-op) and BEFORE `assignTags` (which ranks the FINAL `uVariants` set).
 // Returns 0, or -1 (via `emitFail`).
 function collectInlineUnions(stmts: i32[]): i32 {
+  nliLetIxs = []
+  nliNames = []
   collectInlineUnionsIn(stmts, stmts)
 }
 
@@ -17719,6 +18902,8 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]): i32 {
       if collectInlineUnionsBlock(stmts, fnBody) < 0 { return 0 - 1 }
     } else if s is LetDecl {
       if registerInlineUnion(stmts, tyNameOf(s.letType)) < 0 { return 0 - 1 }
+      // Usage-driven `let x = null` hole (A-infer-null): infer + register `T|null`.
+      nliInferLet(walk, i)
     } else if s is IfStmt {
       let thenB = s.ifThen
       let elseN = s.ifElse
@@ -17927,6 +19112,16 @@ function exprStruct(exprIx: i32, fnIx: i32): boolean {
   if e is Call {
     let callee = P.nodes[e.callFn]
     if callee is Ident { return fnRetStruct(callee.identName) }
+    // A FIELD-CLOSURE call (`(a."*")(2)` — a rewritten operator/index trap)
+    // yields the field function's return struct (mirrors `structIndexOfExpr`).
+    if callee is Member {
+      if drwFieldClosure(structIndexOfExpr(callee.memObj, fnIx), callee.memProp) {
+        let cfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        if cfe >= 0 {
+          if fRetRef[cfe] == 1 { return true }
+        }
+      }
+    }
     return false
   }
   if e is Ident {
@@ -18108,14 +19303,78 @@ function capturedStructIndex(fnIx: i32, name: string): i32 {
   0 - 1
 }
 
+// True if the CAPTURED variable `name` of the capturing lifted function `fnIx`
+// is BOOLEAN-typed in the parent frame (a `boolean` param annotation, a
+// `boolean`-annotated let, or a bool-literal init). Bool rides in an i32, so
+// `capturedKindOf` cannot carry it — this is the print/`fRetBool` side channel.
+function capturedIsBool(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }
+  if !fnValUsed { return false }
+  let fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return false }
+  let caps = captureNamesOf(fe)
+  let isCap = false
+  let ci = 0
+  while ci < caps.length {
+    if caps[ci] == name { isCap = true }
+    ci = ci + 1
+  }
+  if !isCap { return false }
+  let b = parentBindingOf(fe, name)
+  if b < 0 { return false }
+  let bn = P.nodes[b]
+  if bn is Param { return tyNameOf(bn.parType) == "boolean" || tyNameOf(bn.parType) == "bool" }
+  if bn is LetDecl {
+    if bn.letType >= 0 {
+      return tyNameOf(bn.letType) == "boolean" || tyNameOf(bn.letType) == "bool"
+    }
+    if bn.letInit >= 0 {
+      let iv = P.nodes[unwrapParen(bn.letInit)]
+      if iv is BoolLit { return true }
+    }
+  }
+  false
+}
+
+// The VALUE KIND of a CAPTURED variable `name` of the capturing lifted function
+// `fnIx` (the same `fbValtype` codes `captureValKind` types the env field with),
+// or -1 if `name` is not a captured variable of `fnIx`. Same guards as
+// `capturedStructIndex` — this is the classifier-side mirror, so an expression
+// classifier (`exprArray` & co) can type a captured-list/string read exactly as
+// a param/local/global receiver would.
+function capturedKindOf(fnIx: i32, name: string): i32 {
+  if fnIx < 0 { return 0 - 1 }
+  if !fnValUsed { return 0 - 1 }
+  let fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return 0 - 1 }
+  if fnEnvIdxOf(fe) < 0 { return 0 - 1 }
+  let caps = captureNamesOf(fe)
+  let ci = 0
+  while ci < caps.length {
+    if caps[ci] == name { return captureValKind(fe, name) }
+    ci = ci + 1
+  }
+  0 - 1
+}
+
 function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return 0 - 1 }
   let e = P.nodes[exprIx]
-  if e is ObjLit { return structIndexOfObj(exprIx) }
+  if e is ObjLit { return structIndexOfObjCtx(exprIx, fnIx) }
   if e is Paren { return structIndexOfExpr(e.parInner, fnIx) }
   if e is Call {
     let callee = P.nodes[e.callFn]
     if callee is Ident { return fnRetStructIndex(callee.identName) }
+    // A FIELD-CLOSURE call (`(a."[]")(i)` — a chained index trap whose "[]"
+    // returns another trap object) yields the field function's return struct.
+    if callee is Member {
+      if drwFieldClosure(structIndexOfExpr(callee.memObj, fnIx), callee.memProp) {
+        let cfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        if cfe >= 0 {
+          if fRetRef[cfe] == 1 || fRetNul[cfe] == 1 { return fRetStructIdx[cfe] }
+        }
+      }
+    }
     // `xs.pop()` / `xs.get(i)` over a struct-element ref list yield that list's
     // element struct (as `S | null` — see `structListPopGetElem`).
     return structListPopGetElem(exprIx, fnIx)
@@ -18282,7 +19541,9 @@ function letIsUnion(letIx: i32, fnIx: i32): boolean {
         if isUName(lt.tyName) { return true }
       }
     }
-    return exprUnion(d.letInit, fnIx)
+    if exprUnion(d.letInit, fnIx) { return true }
+    // A null-hole binding (`let x = null`, A-infer-null) is its inferred union.
+    return nliNameOf(letIx) != ""
   }
   false
 }
@@ -18327,7 +19588,13 @@ function letUnionNameOf(letIx: i32, fnIx: i32): string {
   if d is LetDecl {
     let an = tyNameOf(d.letType)
     if isUName(an) { return an }
-    if d.letType < 0 { return unionNameOfExpr(d.letInit, fnIx) }
+    if d.letType < 0 {
+      let inf = unionNameOfExpr(d.letInit, fnIx)
+      if inf != "" { return inf }
+      // A null-hole binding (`let x = null` filled by a later `x = e`) carries
+      // its inferred `T|null` value union (A-infer-null).
+      return nliNameOf(letIx)
+    }
   }
   ""
 }
@@ -18575,7 +19842,18 @@ function exprArray(exprIx: i32, fnIx: i32): boolean {
   if e is Ident {
     if paramArray(fnIx, e.identName) { return true }
     if declaredArray(e.identName) { return true }
-    return globalIsArray(e.identName)
+    if globalIsArray(e.identName) { return true }
+    // A CAPTURED i32-list read (`store[k]` inside a closure capturing `store`).
+    return capturedKindOf(fnIx, e.identName) == 2
+  }
+  // A list CONCAT `a + b` yields a NEW i32 list (collections-design §VL.4).
+  if e is BinExpr {
+    if e.binOp == "+" {
+      if exprArray(e.binLeft, fnIx) && !exprStringArray(e.binLeft, fnIx) && !exprRefArray(e.binLeft, fnIx) {
+        return exprArray(e.binRight, fnIx)
+      }
+    }
+    return false
   }
   // A field read `p.items` whose struct field is an `i32[]` (code `4`) yields the i32
   // list wrapper ref — so `.length` / indexing / assignment treat it as a list (gap #5).
@@ -20947,7 +22225,19 @@ function dispatchRewrite(stmts: i32[]): i32 {
     } else if nodeIsTypeDecl(stmts[i]) {
     } else if s is UnionDecl {
     } else {
-      stmts[i] = drwWalk(stmts[i], 0 - 1)
+      let oldIx = stmts[i]
+      let newIx = drwWalk(oldIx, 0 - 1)
+      if newIx != oldIx {
+        // The statement node was REPLACED (e.g. `o[k] = v` → the `(o."[]=")(k,v)`
+        // write-trap call). `startStmts` captured the OLD arena index during
+        // `collectFns` — repoint it so the start function emits the rewritten form.
+        stmts[i] = newIx
+        let ssj = 0
+        while ssj < startStmts.length {
+          if startStmts[ssj] == oldIx { startStmts[ssj] = newIx }
+          ssj = ssj + 1
+        }
+      }
     }
     i = i + 1
   }

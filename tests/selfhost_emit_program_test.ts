@@ -956,7 +956,7 @@ const CASES: Case[] = [
     },
   },
   {
-    name: "a non-i32 struct field fails loudly, not with garbage bytes",
+    name: "an f64 struct field emits valid bytes (was a loud-fail guard)",
     src: [
       "type P = { x: f64 }",
       "function main(): i32 {",
@@ -964,18 +964,9 @@ const CASES: Case[] = [
       "}",
       "",
     ].join("\n"),
-    check: (logs) => {
-      const errLine = logs.find((l) => l.startsWith("err: "));
-      if (!errLine) {
-        throw new Error(
-          `expected an \`err:\` line for the non-i32 struct field; got ${
-            JSON.stringify(logs)
-          }`,
-        );
-      }
-      if (!errLine.includes("struct fields are supported")) {
-        throw new Error(`unexpected emitter error message: ${errLine}`);
-      }
+    check: async (logs) => {
+      const got = await runMain(bytesFromLog(logs));
+      if (got !== 0) throw new Error(`main() returned ${got}, expected 0`);
     },
   },
   // ── WasmGC arrays ──────────────────────────────────────────────────────────

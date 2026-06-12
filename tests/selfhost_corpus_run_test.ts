@@ -80,6 +80,8 @@ const WHITELIST = [
   "arith/typed-add.vl",
   "arrays/annotated-empty-ok.vl",
   "arrays/basics.vl",
+  "arrays/concat.vl",
+  "arrays/equality.vl",
   "arrays/boolean-elements.vl",
   "arrays/capacity-and-get.vl",
   "arrays/f64-elems.vl",
@@ -102,6 +104,7 @@ const WHITELIST = [
   "functions/calls.vl",
   "functions/doc-comments.vl",
   "functions/recursion.vl",
+  "functions/structural-generic.vl",
   "functions/early-return.vl",
   "functions/escaping.vl",
   "functions/lambda.vl",
@@ -236,8 +239,12 @@ const WHITELIST = [
   "objects/pass.vl",
   "objects/self-method.vl",
   "objects/operator-self-method.vl",
+  "objects/operator-overload.vl",
   "index/read-trap.vl",
   "index/native-vs-trap.vl",
+  "index/nested-trap.vl",
+  "index/write-trap.vl",
+  "index/generic-trap.vl",
   "objects/method-shorthand-equiv.vl",
   "objects/method-shorthand-mixed.vl",
   "objects/equality.vl",
@@ -332,6 +339,8 @@ const WHITELIST = [
   "types/and-narrowing.vl",
   "types/boolean-to-i32.vl",
   "types/guard-function.vl",
+  "types/infer-null-conditional-assign.vl",
+  "types/infer-null-reassign.vl",
   "types/infer-null-unconstrained.vl",
   "types/intersection-annotation.vl",
   "types/intersection-object-merge.vl",
@@ -343,6 +352,7 @@ const WHITELIST = [
   "types/literal-union-dedup.vl",
   "types/mutual-recursive-type.vl",
   "types/never-narrowing-legit.vl",
+  "types/not-is-narrowing.vl",
   "types/not-paren-is-guard-narrowing.vl",
   "types/null-coalesce.vl",
   "types/nullable-boolean.vl",
@@ -672,7 +682,10 @@ const getPipeline = (): Promise<Record<string, (...a: number[]) => number>> =>
           errs.map((d) => d.message).join("; "),
       );
     }
-    const inst = await WebAssembly.instantiate(await WebAssembly.compile(wasm), {});
+    const inst = await WebAssembly.instantiate(
+      await WebAssembly.compile(wasm as BufferSource),
+      {},
+    );
     return inst.exports as Record<string, (...a: number[]) => number>;
   })();
 
