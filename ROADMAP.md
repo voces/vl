@@ -32,20 +32,22 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ## Next (highest leverage)
 
-- **H3-tail: corpus coverage pay-down** — sweep stands at **295/314 passing (94%)** after the
-  round-4 pair (#335 generic aliases + structural params + operator/index dispatch, type-rejects
-  24→1; #336 memory intrinsics + UFCS + struct-union dispatch + optional chains + nested arrays,
-  emit-gaps 34→9). Run-whitelist **309**, align **391**. The residue is fully named:
-  • emit: recursive list value-equality (arrays/equality), list concat, recursive inline-shape
-    interning (field-union), nullable list refs, map-valued struct fields (recursive-map-value),
-    usage-driven `i32|null` inference (infer-null ×2), negated-`is` codegen (not-is-narrowing),
-    closure struct-return ABI + captured-list indexing (operator-overload, nested/write-trap),
-    bool-ness through closure results (generic-trap), f64 struct fields (structural-generic)
-  • function-identity equality (closure-rep change — identity token; run SOLO)
-  • parse: named args, labelled break (AST-shape extensions)
-  • modules/* (H3 — native import resolution; architectural)
-  • xfails: arith-hole-operand (host binaryen artifact — re-pin under A13),
-    array-element-recursion (i32-keyed maps — map-rep extension)
+- **Kill the TS host (the new front).** Corpus parity reached (sweep 312/316; → `CHANGELOG.md`
+  rounds 5–7), so retire the TS compiler in stages — make it unnecessary, then delete:
+  1. ⬜ **LSP-on-wasm spike (the long pole, do first).** The LSP runs the TS compiler core per
+     keystroke; prove (or refute) keystroke-latency checking against the wasm compiler while the
+     TS fallback still exists. The finding sets how aggressive the rest of the teardown can be.
+  2. ⬜ Delete the gated deno-side RUN half + its 305-file whitelist outright (see F-tiers);
+     fold the deno-side CHECK verdicts once the native checker gates message/span parity.
+  3. ⬜ `std:` Phase 2 (H0) written in VL — doubles as the demand-driven discovery engine for the
+     remaining emitter long tail (each gap fails loudly: nullable lists beyond `i32[]|null`,
+     map-typed params / nullable map fields, struct-union `==`, `?.` beyond i32/boolean leaves, …).
+  4. Once the `.vl` compiler is the spec, the parked soundness xfails (arith-hole-operand — A13;
+     array-element-recursion — i32-keyed maps) become fixable bugs, not parity constraints.
+- ⬜ **`vl test` (end-state testing story).** The corpus's `// @run`/`// @log` directive fixtures
+  are the parity vehicle, not the destination: move toward traditional in-language tests — a
+  `vl test` runner over `std:testing` (H0 Phase 2), assertion functions, `*_test.vl` discovery.
+  Direction not fully settled; meanwhile, don't over-invest in new directive machinery.
 - **Explicit numeric conversion syntax** — the lossless-only implicit-widening rule (#298) makes
   the lossy edges (`i32→f32`, `i64→f64`, all narrowings) EXPRESSIBLE ONLY via a cast that does
   not exist yet; design + land it (both compilers).
@@ -310,12 +312,11 @@ from current `compiler/*.vl` in ~3s.*
   the past wins/abandons live in `docs/perf-findings.md` + `CHANGELOG.md`. REMAINING:
   - ⬜ **F9b. Cache / clone binaryen IR across selfhost sub-tests** — LOW priority (the dominant
     cost fell with the F9c memoize; binaryen modules are not trivially cloneable).
-  - ⬜ **F-tiers. Collapse the redundant corpus runner** — three executors drive the corpus (TS
-    oracle / TS-built-VL run / native `vl` run); once the native runner self-compiles current
-    source in CI (seed restore + ~3s `refresh-compiler.sh`-style rebuild), the middle tier's RUN
-    half is redundant with the native tier — trim toward TS-oracle + native-runner (keep tier-1
-    verdicts). Also: the TS seed build (~80s) is the remaining `ci-native` cost; a rolling
-    master-updated seed cache is the deferred fix (cargo-cache eviction pressure noted in #308).
+  - 🟡 **F-tiers. Collapse the redundant corpus runner.** REMAINING: delete the gated deno-side
+    RUN half (`SELFHOST_DENO_RUN=1`) + its 305-file whitelist outright once the native tier is
+    the undisputed runner; fold the deno-side CHECK verdicts the same way when the native checker
+    gates message/span parity. (Gating, parallel sweep, and the ci-native seed cache + ~3s
+    refresh path → `CHANGELOG.md`.)
 
 ---
 

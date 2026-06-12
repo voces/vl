@@ -5,6 +5,12 @@
 # stdout diffed against the file's ordered `// @log` directives. Buckets land in
 # /tmp/sweep-{pass,checkfail,runfail,logdiff}.txt for triage.
 #
+# PARALLEL: files fan out over `JOBS` workers (default: every core) via xargs;
+# each worker classifies one file and appends a single `BUCKET\tfile` line to a
+# shared results file (O_APPEND single-line writes are atomic). ~24x wall-clock
+# over the old serial loop on a 24-core box; buckets/summary are byte-identical
+# (sorted) to the serial output.
+#
 # NOTE: matches files containing the literal `// @run` ANYWHERE — two soundness
 # @check files mention `// @run` in prose comments and show up as CHECKFAIL noise
 # (xfail-elseif-chain-residual, xfail-seq-guard-residual-codegen); read the
@@ -15,24 +21,45 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-VL="${VL:-scripts/vl-host/target/release/vl}"
-SEED="${SEED:-build/vl-compiler.wasm}"
-pass=0; checkfail=0; runfail=0; logdiff=0
-: > /tmp/sweep-pass.txt; : > /tmp/sweep-checkfail.txt
-: > /tmp/sweep-runfail.txt; : > /tmp/sweep-logdiff.txt
-for f in $(grep -rl '// @run' tests/cases --include='*.vl' | sort); do
+export VL="${VL:-scripts/vl-host/target/release/vl}"
+export SEED="${SEED:-build/vl-compiler.wasm}"
+JOBS="${JOBS:-$(nproc)}"
+
+RESULTS="$(mktemp)"
+trap 'rm -f "$RESULTS"' EXIT
+export RESULTS
+
+classify() {
+  f="$1"
   if ! "$VL" check "$f" --compiler "$SEED" >/dev/null 2>&1; then
-    checkfail=$((checkfail+1)); echo "$f" >> /tmp/sweep-checkfail.txt; continue
+    echo "CHECKFAIL	$f" >> "$RESULTS"; return
   fi
   expected=$(sed -n 's|^// @log ||p' "$f")
-  actual=$("$VL" run "$f" --compiler "$SEED" 2>/dev/null)
-  if [ $? -ne 0 ]; then
-    runfail=$((runfail+1)); echo "$f" >> /tmp/sweep-runfail.txt; continue
+  if ! actual=$("$VL" run "$f" --compiler "$SEED" 2>/dev/null); then
+    echo "RUNFAIL	$f" >> "$RESULTS"; return
   fi
   if [ "$actual" == "$expected" ]; then
-    pass=$((pass+1)); echo "$f" >> /tmp/sweep-pass.txt
+    echo "PASS	$f" >> "$RESULTS"
   else
-    logdiff=$((logdiff+1)); echo "$f" >> /tmp/sweep-logdiff.txt
+    echo "LOGDIFF	$f" >> "$RESULTS"
   fi
+}
+export -f classify
+
+grep -rl '// @run' tests/cases --include='*.vl' | sort |
+  xargs -P "$JOBS" -n 1 bash -c 'classify "$1"' _
+
+for b in pass checkfail runfail logdiff; do : > "/tmp/sweep-$b.txt"; done
+sort -k2 "$RESULTS" | while IFS=$'\t' read -r bucket f; do
+  case "$bucket" in
+    PASS) echo "$f" >> /tmp/sweep-pass.txt ;;
+    CHECKFAIL) echo "$f" >> /tmp/sweep-checkfail.txt ;;
+    RUNFAIL) echo "$f" >> /tmp/sweep-runfail.txt ;;
+    LOGDIFF) echo "$f" >> /tmp/sweep-logdiff.txt ;;
+  esac
 done
+pass=$(wc -l < /tmp/sweep-pass.txt)
+checkfail=$(wc -l < /tmp/sweep-checkfail.txt)
+runfail=$(wc -l < /tmp/sweep-runfail.txt)
+logdiff=$(wc -l < /tmp/sweep-logdiff.txt)
 echo "PASS=$pass CHECKFAIL=$checkfail RUNFAIL=$runfail LOGDIFF=$logdiff TOTAL=$((pass+checkfail+runfail+logdiff))"
