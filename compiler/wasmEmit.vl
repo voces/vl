@@ -2201,8 +2201,17 @@ function computeRetInference(): i32 {
       let fn = P.nodes[fnStmts[i]]
       if fn is FuncDecl {
         if fn.fnRet < 0 && fRetVoid[i] == 0 {
-          let rx = fnRetExprOf(fnStmts[i])
-          if rx >= 0 {
+          // Classify over EVERY valued return (tail value first — the same
+          // preference `fnRetExprOf` had), not just the first: a function whose
+          // first return is an unclassifiable narrowed path read (`if x?.y is
+          // string { return x.y } return "-1"`) still types from its other
+          // returns — the checker already proved all returns agree.
+          let rxs: i32[] = []
+          collectValuedReturns(fnStmts[i], rxs)
+          let rxj = 0
+          while rxj < rxs.length {
+            let rx = rxs[rxj]
+            rxj = rxj + 1
             // A tail ASSIGNMENT yields its RHS (assignment-as-expression), so the
             // function's return kind is the RHS's kind (`function emit(s: string)
             // { acc = acc + s }` returns the new string).
@@ -2248,6 +2257,65 @@ function computeRetInference(): i32 {
         }
       }
       i = i + 1
+    }
+  }
+  0
+}
+
+// EVERY valued return expression of the FuncDecl at `fnIx`, the bare tail value
+// (if any) FIRST — the same preference `fnRetExprOf` gives it — then each
+// `return <e>` in source order.
+function collectValuedReturns(fnIx: i32, out: i32[]): i32 {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let b = P.nodes[fn.fnBody]
+    if b is Block {
+      let stmts = b.blkStmts
+      if stmts.length > 0 {
+        let last = stmts[stmts.length - 1]
+        if stmtIsTailValue(last) { out.push(last) }
+      }
+    }
+    collectValuedReturnsIn(fn.fnBody, out)
+  }
+  0
+}
+
+function collectValuedReturnsIn(blockIx: i32, out: i32[]): i32 {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let st = P.nodes[stmts[i]]
+      if st is RetStmt {
+        if st.retArg >= 0 { out.push(st.retArg) }
+      } else if st is IfStmt {
+        collectValuedReturnsInIf(stmts[i], out)
+      } else if st is WhileStmt {
+        collectValuedReturnsIn(st.whileBody, out)
+      } else if st is ForRange {
+        collectValuedReturnsIn(st.frBody, out)
+      } else if st is ForIn {
+        collectValuedReturnsIn(st.fiBody, out)
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+function collectValuedReturnsInIf(ifIx: i32, out: i32[]): i32 {
+  let st = P.nodes[ifIx]
+  if st is IfStmt {
+    collectValuedReturnsIn(st.ifThen, out)
+    if st.ifElse >= 0 {
+      let els = P.nodes[st.ifElse]
+      if els is Block {
+        collectValuedReturnsIn(st.ifElse, out)
+      } else if els is IfStmt {
+        collectValuedReturnsInIf(st.ifElse, out)
+      }
     }
   }
   0
@@ -4973,6 +5041,32 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
           return 0
         }
       }
+      // `x?.y is i32` — an OPTIONAL-CHAIN receiver folds its null test into the
+      // result: any null link → false (the host's chain yields `null`, and
+      // `null is i32` is false), else the union FIELD's box-tag compare.
+      if vrecv is OptMember {
+        let oisSi = optChainStructIdxOf(vrecv.omObj, fnIx)
+        if oisSi >= 0 {
+          let oisFi = sFieldIndex(oisSi, vrecv.omProp)
+          if oisFi >= 0 {
+            if sFieldTypeAt(oisSi, oisFi) == 16 {
+              if emitOptChainIsNull(body, vrecv.omObj, fnIx) < 0 { return 0 - 1 }
+              fbIf(127)              // a null link → false
+              ctrlEnter()
+              fbI32Const(0)
+              fbElse()
+              if emitOptChainValue(body, vrecv.omObj, fnIx) < 0 { return 0 - 1 }
+              fbStructGet(sHeapIdx[oisSi], oisFi)  // the field's box
+              fbStructGet(uBoxIdx, 0)              // field 0: tag
+              fbI32Const(scalarTagOf(ndv.isVariant))
+              fbI32Bin(70)           // 0x46 i32.eq
+              fbEnd()
+              ctrlLeave()
+              return 0
+            }
+          }
+        }
+      }
       if exprUnion(ndv.isObj, fnIx) {
         if emitExpr(body, ndv.isObj, fnIx) < 0 { return 0 - 1 }
         fbStructGet(uBoxIdx, 0)  // 0xfb 0x02 <box ht> field 0: tag
@@ -5096,6 +5190,97 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32): i32 {
     return 0
   }
   emitFail("emitProgram: expected a field access")
+}
+
+// ── optional chains over niche nullable structs (`o?.inner?.v`) ───────────────
+// Every link is an effect-free place (an Ident root + field reads), so the chain
+// is re-evaluated instead of spilling to a scratch local — mirroring the host's
+// temp-local OptionalAccess only in VALUE, not in shape.
+
+// The struct TABLE index of an optional-chain RECEIVER's value: an `a?.b` link
+// resolves its field's TARGET struct (a code-15 nested-struct field); any other
+// receiver resolves through the normal classifier. -1 when unresolvable.
+function optChainStructIdxOf(exprIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[unwrapParen(exprIx)]
+  if e is OptMember {
+    let psi = optChainStructIdxOf(e.omObj, fnIx)
+    if psi < 0 { return 0 - 1 }
+    let pfi = sFieldIndex(psi, e.omProp)
+    if pfi < 0 { return 0 - 1 }
+    if sFieldTypeAt(psi, pfi) != 15 { return 0 - 1 }
+    return structIndexByName(sFieldElemNameAt(psi, pfi))
+  }
+  structIndexOfExpr(exprIx, fnIx)
+}
+
+// Push 1 if the optional-chain VALUE at `exprIx` is null — any null link folds
+// `null` through (the host's OptionalAccess) — else 0. A code-15 leaf field tests
+// its own ref; a code-16 (value-union box) leaf compares the box tag against the
+// global null tag (the box ref itself is never null); any other leaf is never
+// null once every link held.
+function emitOptChainIsNull(body: i32[], exprIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[unwrapParen(exprIx)]
+  if e is OptMember {
+    let psi = optChainStructIdxOf(e.omObj, fnIx)
+    if psi < 0 {
+      return emitFail("emitProgram: `?.` receiver is not a struct chain")
+    }
+    let pfi = sFieldIndex(psi, e.omProp)
+    if pfi < 0 {
+      return emitFail("emitProgram: `?.` field is not on the struct")
+    }
+    if emitOptChainIsNull(body, e.omObj, fnIx) < 0 { return 0 - 1 }
+    fbIf(127)                  // 0x04 if, i32 result — receiver null → 1
+    ctrlEnter()
+    fbI32Const(1)
+    fbElse()
+    let pfc = sFieldTypeAt(psi, pfi)
+    if pfc == 15 {
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return 0 - 1 }
+      fbStructGet(sHeapIdx[psi], pfi)   // the (ref null $S) field
+      wU8(209)                 // 0xd1 ref.is_null
+    } else if pfc == 16 {
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return 0 - 1 }
+      fbStructGet(sHeapIdx[psi], pfi)   // the field's union box (non-null ref)
+      fbStructGet(uBoxIdx, 0)           // box field 0: tag
+      fbI32Const(scalarTagOf("null"))
+      fbI32Bin(70)             // 0x46 i32.eq
+    } else {
+      fbI32Const(0)            // a non-nullable field is never null past its links
+    }
+    fbEnd()
+    ctrlLeave()
+    return 0
+  }
+  if emitExpr(body, exprIx, fnIx) < 0 { return 0 - 1 }
+  wU8(209)                     // 0xd1 ref.is_null
+  0
+}
+
+// Push the NON-NULL value of the optional-chain receiver at `exprIx` (assumes
+// every link was already null-tested): each nullable link recovers
+// `ref.as_non_null` so the next `struct.get` sees a non-null ref.
+function emitOptChainValue(body: i32[], exprIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[unwrapParen(exprIx)]
+  if e is OptMember {
+    let psi = optChainStructIdxOf(e.omObj, fnIx)
+    if psi < 0 {
+      return emitFail("emitProgram: `?.` receiver is not a struct chain")
+    }
+    let pfi = sFieldIndex(psi, e.omProp)
+    if pfi < 0 {
+      return emitFail("emitProgram: `?.` field is not on the struct")
+    }
+    if emitOptChainValue(body, e.omObj, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(sHeapIdx[psi], pfi)
+    fbRefAsNonNull()           // 0xd4 — the link was null-tested
+    return 0
+  }
+  if emitExpr(body, exprIx, fnIx) < 0 { return 0 - 1 }
+  if exprNullableStruct(exprIx, fnIx) {
+    fbRefAsNonNull()           // 0xd4
+  }
+  0
 }
 
 // Push the RAW union box ref of the binding `name` (a local/param or a module
@@ -8686,6 +8871,15 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     // every scope map through `?? -1`. The LHS must be a map index in this slice.
     if e.binOp == "??" {
       let lhs = P.nodes[e.binLeft]
+      // `a ?? b ?? d` parses LEFT-associative (`(a ?? b) ?? d`); `??` is
+      // associative, so RE-ASSOCIATE to `a ?? (b ?? d)` — the inner coalesce
+      // becomes the outer's default and each LHS is again a plain place the
+      // single-step lowerings below handle (host: same chained-coalesce value).
+      if lhs is BinExpr {
+        if lhs.binOp == "??" {
+          return emitExpr(body, mkBinary("??", lhs.binLeft, mkBinary("??", lhs.binRight, e.binRight)), fnIx)
+        }
+      }
       if lhs is Index {
         if exprMap(lhs.idxArr, fnIx) {
           return emitMapGetOr(body, lhs.idxArr, lhs.idxIndex, e.binRight, fnIx)
@@ -8907,6 +9101,33 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
             }
           }
         }
+        // A NESTED optional chain `o?.inner?.v ?? d` (niche nullable links): any
+        // null link selects the default; otherwise the chain reads through
+        // non-null refs (each `S|null` link recovers `ref.as_non_null`). The
+        // links are effect-free places, re-evaluated in the value arm. Scalar
+        // (i32/boolean) leaf fields only (the value-typed `if` blocktype).
+        let omDeep = P.nodes[unwrapParen(lhs.omObj)]
+        if omDeep is OptMember {
+          let dsi = optChainStructIdxOf(lhs.omObj, fnIx)
+          if dsi >= 0 {
+            let dfi = sFieldIndex(dsi, lhs.omProp)
+            if dfi >= 0 {
+              if sFieldTypeAt(dsi, dfi) != 0 {
+                return emitFail("emitProgram: `?.` chain supports only i32/boolean leaf fields")
+              }
+              if emitOptChainIsNull(body, lhs.omObj, fnIx) < 0 { return 0 - 1 }
+              fbIf(127)            // 0x04 if, i32 result — a null link → default
+              ctrlEnter()
+              if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+              fbElse()             // 0x05 else — every link present → the leaf
+              if emitOptChainValue(body, lhs.omObj, fnIx) < 0 { return 0 - 1 }
+              fbStructGet(sHeapIdx[dsi], dfi)
+              fbEnd()              // 0x0b end
+              ctrlLeave()
+              return 0
+            }
+          }
+        }
         // `xs.get(i)?.f ?? d` over a STRUCT-element ref list is the FUSED form:
         // one bounds compare; in range read the field off the (non-null) element,
         // else the default. A live in-range element is never null (pushes store
@@ -9045,6 +9266,17 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
             fbI32Bin(71)     // 0x47 i32.ne
           } else {
             fbI32Bin(70)     // 0x46 i32.eq
+          }
+          return 0
+        }
+        // `<opt-chain> == null` / `!= null` (`o?.y != null`): any null LINK makes
+        // the chain's value null (the host's OptionalAccess folds null through),
+        // so the compare IS the chain's null test (inverted for `!=`).
+        let ncN = P.nodes[unwrapParen(nref)]
+        if ncN is OptMember {
+          if emitOptChainIsNull(body, nref, fnIx) < 0 { return 0 - 1 }
+          if e.binOp == "!=" {
+            fbI32Eqz()       // 0x45 invert: the chain value is present
           }
           return 0
         }
@@ -11221,6 +11453,24 @@ function setNarrowFromCond(condIx: i32, fnIx: i32): boolean {
         if mk != "" {
           pushNarrow(mk, c.isVariant)
           return true
+        }
+      }
+    }
+    // `x?.y is T` narrows the member PATH exactly like `x.y is T` — the then-arm
+    // only runs when every chain link held AND the union field matched, so the
+    // plain `x.y` reads inside it unbox under the same path key.
+    if mrecv is OptMember {
+      let omSi = optChainStructIdxOf(mrecv.omObj, fnIx)
+      if omSi >= 0 {
+        let omFi = sFieldIndex(omSi, mrecv.omProp)
+        if omFi >= 0 {
+          if sFieldTypeAt(omSi, omFi) == 16 {
+            let omRoot = P.nodes[unwrapParen(mrecv.omObj)]
+            if omRoot is Ident {
+              pushNarrow(omRoot.identName + "." + mrecv.omProp, c.isVariant)
+              return true
+            }
+          }
         }
       }
     }
@@ -14458,6 +14708,10 @@ function emitStartFnCode(out: i32[]): i32 {
             // A map global's start-fn init seeds the map SHAPE (mirrors the
             // local-`let` seeding) so `Map()` builds THIS global's map struct.
             if gck == 6 { pendingMapSlot = letMapShapeOf(globalStmts[gi], 0 - 1) }
+            // A struct / nullable-struct cell seeds the struct context so a bare
+            // `null` init lowers as `ref.null $S` and a literal builds THIS
+            // global's annotated struct (mirrors the const-path seeding).
+            if gck == 1 || gck == 9 { pendingStructIdx = globalCellStructIdx(globalStmts[gi]) }
             // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2.
             pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
             // A UNION cell (kind 4) coerces a raw init value into the box
@@ -14472,6 +14726,7 @@ function emitStartFnCode(out: i32[]): i32 {
             }
             pendingNulBool = false
             pendingMapSlot = 0 - 1
+            pendingStructIdx = 0 - 1
           }
           let setPrev = wTarget(bodyExpr)
           fbGlobalSet(gi)
@@ -15307,6 +15562,10 @@ function emitModule(stmts: i32[]): i32 {
           let gck = globalCellKind(globalStmts[gi])
           let gcs = globalCellStructIdx(globalStmts[gi])
           if gck == 1 { pendingStructIdx = gcs }
+          // A NULLABLE-struct cell (kind 9) seeds the same struct context: a bare
+          // `null` init lowers as `ref.null $S` (a valid constexpr), a struct
+          // literal as that struct.
+          if gck == 9 { pendingStructIdx = gcs }
           pendingListKind = letAnnRefListKind(globalStmts[gi])
           pendingListSlot = letAnnRefListSlot(globalStmts[gi])
           // A ref-array cell (kind 5) passes the ref-list TABLE SLOT as `fbValtype`'s
@@ -16198,7 +16457,7 @@ function collectAnnShapes(): i32 {
             k = k + 1
           }
           if ok && names.length > 0 {
-            if annShapeIndexOf(names) < 0 {
+            if annShapeIndexOf(names, codes) < 0 {
               sDeclared = true
               // Interned under the ANNOTATION TEXT itself (`{v:i32}`) — a real
               // key, so `structIndexByName` on a ref-list element name (`{v:i32}[]`
@@ -16301,14 +16560,22 @@ function internShapeAs(key: string, nm: string): i32 {
 }
 
 // The struct table index whose field-name SET matches `names` exactly, or -1.
-function annShapeIndexOf(names: string[]): i32 {
+function annShapeIndexOf(names: string[], codes: i32[]): i32 {
   let si = 0
   while si < sNames.length {
     if sFieldCount[si] == names.length {
       let allIn = true
       let i = 0
       while i < names.length {
-        if sFieldIndex(si, names[i]) < 0 { allIn = false }
+        let fi = sFieldIndex(si, names[i])
+        if fi < 0 {
+          allIn = false
+        } else if sFieldTypeAt(si, fi) != codes[i] {
+          // The same field-NAME set with a DIFFERENT field type (`{y:i32}` vs
+          // `{y:string|i32}`) is a DISTINCT shape — intern it separately so each
+          // annotation resolves its own struct (host: structural interning).
+          allIn = false
+        }
         i = i + 1
       }
       if allIn { return si }
@@ -17552,6 +17819,16 @@ function structIndexOfLet(letIx: i32, fnIx: i32): i32 {
       if lt is TypeRef {
         let si = structIndexByName(lt.tyName)
         if si >= 0 { return si }
+        // A NULLABLE annotation (`{n:i32} | null`, `Config | null`) resolves its
+        // NON-NULL part — `collectAnnShapes` interns an inline shape under the
+        // bare text (the `|null` wrapper stripped), and a named alias interns
+        // under its own name. Needed when the initializer is a bare `null` (no
+        // struct literal to infer the index from).
+        let nb = nullablePartOf(lt.tyName)
+        if nb != "" {
+          let si2 = structIndexByName(nb)
+          if si2 >= 0 { return si2 }
+        }
       }
     }
     return structIndexOfExpr(d.letInit, fnIx)
