@@ -682,7 +682,10 @@ const getPipeline = (): Promise<Record<string, (...a: number[]) => number>> =>
           errs.map((d) => d.message).join("; "),
       );
     }
-    const inst = await WebAssembly.instantiate(await WebAssembly.compile(wasm), {});
+    const inst = await WebAssembly.instantiate(
+      await WebAssembly.compile(wasm as BufferSource),
+      {},
+    );
     return inst.exports as Record<string, (...a: number[]) => number>;
   })();
 
