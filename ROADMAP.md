@@ -32,12 +32,16 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ## Next (highest leverage)
 
-- **H3-tail: corpus coverage pay-down** — sweep stands at **230/317 passing** after the union wave
-  (#329 boxed value unions, #330 the literal-union vertical): parse-reject **2** (named args +
-  labelled break — both AST-shape items), type-reject 35, emit-gap 44, run-error 3 (the deep
-  boxed-`==` positions, loud). Run-whitelist **233**, align **315**. In flight: the
-  monomorphization vertical (`docs/monomorphization-design.md`) and the deep boxed-primitive
-  positions (`==`/array-element/param-dispatch boxing). The #319/#321/#322/#323/#324 wave landed: ref-valued maps, integer-literal width
+- **H3-tail: corpus coverage pay-down** — sweep stands at **250/317 passing** after the wave-3
+  pair (#332 deep union boxing — union `==`, post-guard narrowing, union-element arrays;
+  #333 monomorphization — per-callsite instantiation via instance clones, checker inference
+  holes with call-site collapse): parse-reject **2** (named args + labelled break — AST-shape
+  items), type-reject 27, emit-gap 34, run-error 1. Run-whitelist **253**, align **335**.
+  Remaining tracks, all triaged: structural param inference, generic type aliases,
+  operator-overload + index-trap dispatch, nested arrays `i32[][]`, modules (H3),
+  function-identity equality (closure-rep change, solo). Known divergence queue: out-of-i64
+  literal overflow diagnosis; `xfail-arith-hole-operand` expects a binaryen constant-fold
+  artifact the native compiler correctly rejects loudly (re-pin the expectation under A13). The #319/#321/#322/#323/#324 wave landed: ref-valued maps, integer-literal width
   (BOTH known silent miscompiles fixed — `hex.vl` + `infer-empty-string.vl`), parser grammar
   (object/method shorthand, `is`-RHS types, if-expressions, generic application), checker flow
   narrowing + recursive named types + nullable holes, and emit struct equality / nested-struct
