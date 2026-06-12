@@ -209,6 +209,7 @@ const WHITELIST = [
   "soundness/is-across-boundary-sound.vl",
   "soundness/intersection-param-sound.vl",
   "soundness/is-multi-narrow-recursive-visitor.vl",
+  "soundness/is-value-kind-union-sound.vl",
   "soundness/literal-is-runtime-value.vl",
   "soundness/literal-is-union-param-dispatch.vl",
   "soundness/literal-union-exhaustive-elseif.vl",

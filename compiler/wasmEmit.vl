@@ -4234,8 +4234,17 @@ function exprHasStrOp(exprIx: i32, fnIx: i32): boolean {
 }
 
 // True if any statement in the block at `blockIx` (descending into if/else branches
-// and while bodies, the scopes `collectLocals` walks) contains a string op.
+// and while bodies, the scopes `collectLocals` walks) contains a string op. A
+// wrapper restores the narrowing depth the scan's post-guard pushes (mirroring
+// the emit loops) may leave behind on an early `true`.
 function blockHasStrOp(blockIx: i32, fnIx: i32): boolean {
+  let savedGuardTop = narrowTop
+  let hit = blockHasStrOpScan(blockIx, fnIx)
+  restoreNarrow(savedGuardTop)
+  hit
+}
+
+function blockHasStrOpScan(blockIx: i32, fnIx: i32): boolean {
   let b = P.nodes[blockIx]
   if b is Block {
     let stmts = b.blkStmts
@@ -4268,6 +4277,10 @@ function blockHasStrOp(blockIx: i32, fnIx: i32): boolean {
         if exprHasStrOp(s.frTo, fnIx) { return true }
         if blockHasStrOp(s.frBody, fnIx) { return true }
       }
+      // Post-guard complement narrowing (mirrors the emit loops) — so a string
+      // read below a returning guard (`if x is i32 { return 0 } print(x)`) is
+      // detected under the SAME narrowing the emit applies. The wrapper restores.
+      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
   }
@@ -10968,6 +10981,62 @@ function restoreNarrow(n: i32): i32 {
   0
 }
 
+// True if EVERY control path through the block at `blockIx` returns: a direct
+// `return` statement, or an `if`/`else` (incl. an `else if` chain) whose arms
+// all return. Conservative — a `while` etc. never counts (mirrors the host's
+// flow analysis only as far as the post-guard narrowing below needs).
+function blockAlwaysReturns(blockIx: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is RetStmt { return true }
+      if s is IfStmt {
+        if ifAlwaysReturns(stmts[i]) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the `if` at `ifIx` returns on EVERY path: it has an else, the
+// then-block always returns, and the else (a block or a chained `else if`)
+// always returns too.
+function ifAlwaysReturns(ifIx: i32): boolean {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse < 0 { return false }
+    if !blockAlwaysReturns(s.ifThen) { return false }
+    let els = P.nodes[s.ifElse]
+    if els is Block { return blockAlwaysReturns(s.ifElse) }
+    if els is IfStmt { return ifAlwaysReturns(s.ifElse) }
+    return false
+  }
+  false
+}
+
+// After a GUARD `if` — one with NO else whose then-branch always returns — the
+// rest of the enclosing block only runs when the guard was FALSE, so it sees
+// the same complement narrowing an explicit else-arm would (the host's flow
+// narrowing after an early return): `if x is boolean { return 0 } return x`
+// reads `x` as the unboxed `i32` below the guard. Pushes via
+// `setNarrowFromCondElse` (VALUE unions only — struct unions keep their
+// no-else-narrowing behavior); the CALLER restores the depth at block exit.
+function pushPostGuardNarrow(stmtIx: i32, fnIx: i32): i32 {
+  let s = P.nodes[stmtIx]
+  if s is IfStmt {
+    if s.ifElse < 0 {
+      if blockAlwaysReturns(s.ifThen) {
+        setNarrowFromCondElse(s.ifCond, fnIx)
+      }
+    }
+  }
+  0
+}
+
 // The ELEMENT kind of a `for v in <iter>` iterable: `0` = i32 (an `i32[]` list, a
 // map `.values()`), `3` = string (a `string[]` list, a map `.keys()`), `1` = struct
 // (a `S[]` ref list whose element is a struct), or -1 (an unsupported iterable — the
@@ -11890,6 +11959,9 @@ function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32): i32 {
     scopePush()
     let stmts = b.blkStmts
     let n = stmts.length
+    // A guard `if` (no else, then-branch always returns) narrows the REST of the
+    // body to the guard's complement (the host's post-early-return flow narrowing).
+    let savedGuardTop = narrowTop
     let i = 0
     while i < n {
       let isLast = i == n - 1
@@ -11905,8 +11977,10 @@ function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32): i32 {
       } else {
         if emitStmt(body, stmts[i], fnIx) < 0 { scopePop() return 0 - 1 }
       }
+      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
+    restoreNarrow(savedGuardTop)
     scopePop()
     return 0
   }
@@ -11948,11 +12022,15 @@ function emitStmts(body: i32[], blockIx: i32, fnIx: i32): i32 {
     // are dropped on exit.
     scopePush()
     let stmts = b.blkStmts
+    // Post-guard complement narrowing (see `emitFuncBody`/`pushPostGuardNarrow`).
+    let savedGuardTop = narrowTop
     let i = 0
     while i < stmts.length {
       if emitStmt(body, stmts[i], fnIx) < 0 { scopePop() return 0 - 1 }
+      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
+    restoreNarrow(savedGuardTop)
     scopePop()
     return 0
   }
@@ -11976,12 +12054,17 @@ function emitStmtsTail(body: i32[], blockIx: i32, fnIx: i32): i32 {
     }
     // A tail-position nested block is its own lexical scope too (mirrors `collectLocals`).
     scopePush()
+    // Post-guard complement narrowing (see `emitFuncBody`/`pushPostGuardNarrow`) —
+    // pushed in the loop, active for the TAIL statement, restored on exit.
+    let savedGuardTop = narrowTop
     let i = 0
     while i < n - 1 {
       if emitStmt(body, stmts[i], fnIx) < 0 { scopePop() return 0 - 1 }
+      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
     let rc = emitStmtTail(body, stmts[n - 1], fnIx)
+    restoreNarrow(savedGuardTop)
     scopePop()
     return rc
   }
