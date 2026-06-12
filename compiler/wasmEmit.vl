@@ -1073,6 +1073,21 @@ function fbI32Bin(op: i32): i32 {
   wU8(op)
   0
 }
+// i32.store: 0x36 <align-exp> <offset> — fixed align=4 bytes (exponent 2), offset 0,
+// matching the host's `__store_i32__` builtin body (`m.i32.store(0, 4, addr, v)`).
+function fbI32Store(): i32 {
+  wU8(54)            // 0x36 i32.store
+  wU8(2)             // align exponent (4-byte alignment)
+  wU8(0)             // offset 0
+  0
+}
+// i32.load: 0x28 <align-exp> <offset> — the `__load_i32__` twin of `fbI32Store`.
+function fbI32Load(): i32 {
+  wU8(40)            // 0x28 i32.load
+  wU8(2)             // align exponent (4-byte alignment)
+  wU8(0)             // offset 0
+  0
+}
 
 // ── opcode-method STUBS for the later families (Phases C–F) ───────────────────
 // Names declared now so the closed ~40-method set is coherent and self-documenting;
@@ -3184,6 +3199,20 @@ function mvValElemHeapOf(slot: i32): i32 {
 let fa64Used: boolean = false
 let fa64TypeIdx: i32 = 0
 let fl64TypeIdx: i32 = 0
+
+// Linear-memory intrinsics (`__store_i32__` / `__load_i32__` / `__log__`): `memUsed`
+// gates the module-DEFINED memory (section 5); `memLogUsed` additionally gates the
+// synthetic in-module `__log__` decoder function. DIVERGENCE from the host (justified):
+// the host IMPORTS `imports.memory` + `imports.__log__`, but the native runner
+// (scripts/vl-host) provides neither import, so the native module defines its own
+// memory and decodes the tag/value pairs itself via the print imports — identical
+// observable stdout for every corpus `__log__` program. Both usage-gated: a program
+// with no memory intrinsic emits byte-identical output.
+let memUsed: boolean = false
+let memLogUsed: boolean = false
+// The synthetic `__log__` decoder's wasm function index (the LAST index — after the
+// imports, the user functions, and the start fn), set by `emitModule`.
+let gMemLogIdx: i32 = 0
 
 // The kind an EMPTY `[]` literal constructs, set by the binding site (a `let`/global
 // whose declared type is a ref array `S[]`/`N[]`) just before its initializer is
@@ -9674,6 +9703,37 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         }
         return 0
       }
+      // The linear-memory intrinsics, lowered INLINE (the host defines `__store_i32__`/
+      // `__load_i32__` as one-instruction wasm functions — same instruction, no call):
+      // store → `i32.store`, load → `i32.load`, `__log__` → call the synthetic
+      // in-module decoder at `gMemLogIdx` (the host imports `__log__` instead; the
+      // native runner provides no such import — see `emitMemLogFnCode`).
+      if callee.identName == "__store_i32__" {
+        if c.callArgs.length != 2 {
+          return emitFail("emitProgram: __store_i32__ takes exactly two arguments")
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        if emitExpr(body, c.callArgs[1], fnIx) < 0 { return 0 - 1 }
+        fbI32Store()
+        return 0
+      }
+      if callee.identName == "__load_i32__" {
+        if c.callArgs.length != 1 {
+          return emitFail("emitProgram: __load_i32__ takes exactly one argument")
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        fbI32Load()
+        return 0
+      }
+      if callee.identName == "__log__" {
+        if c.callArgs.length != 2 {
+          return emitFail("emitProgram: __log__ takes exactly two arguments")
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        if emitExpr(body, c.callArgs[1], fnIx) < 0 { return 0 - 1 }
+        fbCall(gMemLogIdx)
+        return 0
+      }
       let target = fnIndexOf(callee.identName)
       if target < 0 {
         // Not a known function name — a CLOSURE-VALUED callee (a let/param/global holding
@@ -11559,6 +11619,9 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       // (a void import) and a VOID function (`()->()` leaves nothing).
       if emitCall(body, stmtIx, fnIx) < 0 { return 0 - 1 }
       let dropIt = callee.identName != "print"
+      // The void memory intrinsics leave nothing on the stack.
+      if callee.identName == "__store_i32__" { dropIt = false }
+      if callee.identName == "__log__" { dropIt = false }
       if dropIt {
         let vt = fnIndexOf(callee.identName)
         if vt >= 0 {
@@ -11999,6 +12062,9 @@ function stmtIsTailValue(stmtIx: i32): boolean {
     let callee = P.nodes[s.callFn]
     if callee is Ident {
       if callee.identName == "print" { return false }
+      // The void memory intrinsics are statements, never tail values.
+      if callee.identName == "__store_i32__" { return false }
+      if callee.identName == "__log__" { return false }
       let target = fnIndexOf(callee.identName)
       if target >= 0 {
         return fRetVoid[target] == 0
@@ -14156,6 +14222,58 @@ function emitStartFnCode(out: i32[]): i32 {
   0
 }
 
+// The synthetic `__log__(offset, length)` decoder body: walk the tag/value pairs in
+// linear memory ([offset, offset+length), 8 bytes per pair) and print each value.
+// Mirrors the host runner's `__log__` import (compile.ts `runWasm`): tag 0 = plain
+// i32, printed via `__print_i32__` (import 0 — `memLogUsed` forces the print family).
+// A non-zero tag (i64/f32/f64 payloads, which span extra words) traps (`unreachable`)
+// — no corpus program logs them natively yet, and a silent wrong decode is worse.
+// DIVERGENCE (justified): the host joins a multi-pair log into ONE space-separated
+// line; this prints one line per pair. Every corpus `__log__` call logs exactly one
+// pair, so stdout is identical.
+function emitMemLogFnCode(out: i32[]): i32 {
+  let body: i32[] = []
+  let prev = wTarget(body)
+  // Locals vector: params occupy 0 (offset) and 1 (length); local 2 is the cursor.
+  wULEB(1)                    // 1 locals run
+  wULEB(1)                    // count 1
+  wU8(127)                    // 0x7f i32
+  fbLocalGet(0)
+  fbLocalSet(2)               // cursor = offset
+  fbBlock(64)                 // block (void)
+  fbLoop(64)                  // loop (void)
+  fbLocalGet(2)
+  fbLocalGet(0)
+  fbLocalGet(1)
+  fbI32Bin(106)               // 0x6a i32.add — offset + length (the end)
+  fbI32Bin(78)                // 0x4e i32.ge_s — cursor >= end?
+  fbBrIf(1)                   // exit the block
+  fbLocalGet(2)
+  fbI32Load()                 // the pair's TAG
+  fbIf(64)                    // tag != 0 → unsupported payload kind
+  fbUnreachable()
+  fbEnd()
+  fbLocalGet(2)
+  fbI32Const(4)
+  fbI32Bin(106)               // i32.add — the value word
+  fbI32Load()
+  fbCall(0)                   // __print_i32__ (import 0)
+  fbLocalGet(2)
+  fbI32Const(8)
+  fbI32Bin(106)               // i32.add
+  fbLocalSet(2)               // cursor += 8
+  fbBr(0)                     // next pair
+  fbEnd()                     // end loop
+  fbEnd()                     // end block
+  fbEnd()                     // 0x0b end (void function: stack empty)
+  wTarget(prev)
+  let outPrev = wTarget(out)
+  wULEB(body.length)
+  wBytes(body)
+  wTarget(outPrev)
+  0
+}
+
 // Emit the wasm "name" custom section (section id 0, name "name") so a wasmtime
 // trap backtrace shows real function names instead of `<wasm function N>`. GATED
 // on `gEmitNames` — a no-op when off, so the default emit path (goldens +
@@ -14276,6 +14394,12 @@ function emitModule(stmts: i32[]): i32 {
   // themselves sit after any imports) and its `()->()` functype index (one past the
   // user functypes). Both unused when no start.
   let startFnIdx = gImports + n
+  // The synthetic `__log__` decoder (memory intrinsics) is the LAST function index —
+  // after the imports, the user functions, AND the start fn — so no other function
+  // index shifts. `memFn` (0 or 1) feeds the function/code section counts.
+  let memFn = 0
+  if memLogUsed { memFn = 1 }
+  gMemLogIdx = gImports + n + hasStart
 
   // Heap-type indices, in type-section order: standalone structs at 0..ns-1, then
   // (for the union path) the variant structs + box, then the raw i32 array, the
@@ -14325,7 +14449,7 @@ function emitModule(stmts: i32[]): i32 {
   if gNeedsI64Print { nPrintTypes = nPrintTypes + 1 }   // + (i64)->() for __print_i64__
   if gNeedsF64Print { nPrintTypes = nPrintTypes + 1 }   // + (f64)->() for __print_f64__
   if gNeedsF32Print { nPrintTypes = nPrintTypes + 1 }   // + (f32)->() for __print_f32__
-  wULEB(1 + nPrintTypes)                 // rectypes: the rec group + the standalone print functypes
+  wULEB(1 + nPrintTypes + memFn)         // rectypes: the rec group + the standalone print/(log) functypes
   wU8(78)                                // 0x4e rec group
   wULEB(n + typeOffset + hasStart)       // types inside the rec group (print functypes excluded)
   if sDeclared {
@@ -14716,6 +14840,16 @@ function emitModule(stmts: i32[]): i32 {
     wU8(125)                     // 0x7d f32
     wU8(0)                       // 0 results
   }
+  // The `(i32, i32) -> ()` functype for the synthetic `__log__` decoder, standalone
+  // LAST (after every print functype) so no existing functype index shifts. Its
+  // index is `typeOffset + n + hasStart + nPrintTypes`.
+  if memLogUsed {
+    wU8(96)                      // 0x60 func
+    wU8(2)                       // 2 params
+    wU8(127)                     // 0x7f i32 (offset)
+    wU8(127)                     // 0x7f i32 (length)
+    wU8(0)                       // 0 results
+  }
   wTarget(tyPrev)
   wSection(1, typePayload)
 
@@ -14789,7 +14923,7 @@ function emitModule(stmts: i32[]): i32 {
   // the `()->()` functype at index `typeOffset + n`.
   let funcPayload: i32[] = []
   let fnPrev = wTarget(funcPayload)
-  wULEB(n + hasStart)
+  wULEB(n + hasStart + memFn)
   let fi = 0
   while fi < n {
     // A function whose env-leading signature matches an interned `$fnsig` is declared
@@ -14806,8 +14940,28 @@ function emitModule(stmts: i32[]): i32 {
   if hasStart == 1 {
     wULEB(typeOffset + n)    // start fn functype index
   }
+  if memLogUsed {
+    // The synthetic `__log__` decoder uses the standalone `(i32,i32)->()` functype
+    // emitted after the print functypes.
+    wULEB(typeOffset + n + hasStart + nPrintTypes)
+  }
   wTarget(fnPrev)
   wSection(3, funcPayload)
+
+  // Memory section (id 5, between function (3) and global (6)): ONE module-DEFINED
+  // memory, min 1 page (64 KiB — ample for the corpus' tag/value scratch region), no
+  // max. The host IMPORTS `imports.memory` instead; the native runner provides no
+  // memory import, so the module defines its own (same observable behavior). Emitted
+  // only when a memory intrinsic is used — byte-identical output otherwise.
+  if memUsed {
+    let memPayload: i32[] = []
+    let memPrev = wTarget(memPayload)
+    wULEB(1)                     // 1 memory
+    wU8(0)                       // limits flag 0x00: min only
+    wULEB(1)                     // min: 1 page
+    wTarget(memPrev)
+    wSection(5, memPayload)
+  }
 
   // Global section (id 6): one mutable global per top-level `let`/`const`, in
   // declaration order (that order IS the global index `global.get`/`global.set` use).
@@ -14987,7 +15141,7 @@ function emitModule(stmts: i32[]): i32 {
   // (if any) the synthetic start function's body LAST.
   let codePayload: i32[] = []
   let codePrev = wTarget(codePayload)
-  wULEB(n + hasStart)
+  wULEB(n + hasStart + memFn)
   wTarget(codePrev)
   let ci = 0
   while ci < n {
@@ -14996,6 +15150,9 @@ function emitModule(stmts: i32[]): i32 {
   }
   if hasStart == 1 {
     if emitStartFnCode(codePayload) < 0 { return 0 - 1 }
+  }
+  if memLogUsed {
+    if emitMemLogFnCode(codePayload) < 0 { return 0 - 1 }
   }
   wSection(10, codePayload)
 
@@ -19965,6 +20122,8 @@ function emitProgram(rootIx: i32): i32 {
     gF64PrintIdx = 0
     gNeedsF32Print = false
     gF32PrintIdx = 0
+    memUsed = false
+    memLogUsed = false
     let pscan = 0
     let sawI64Ann = false
     let sawF64 = false
@@ -19975,6 +20134,18 @@ function emitProgram(rootIx: i32): i32 {
         let pcallee = P.nodes[pn.callFn]
         if pcallee is Ident {
           if pcallee.identName == "print" {
+            gImports = 4
+          }
+          // The linear-memory intrinsics: any store/load forces the module-defined
+          // memory; `__log__` additionally forces the synthetic decoder function,
+          // which prints through `__print_i32__` — so it pulls in the print-import
+          // family exactly as a `print(...)` call does.
+          if pcallee.identName == "__store_i32__" || pcallee.identName == "__load_i32__" {
+            memUsed = true
+          }
+          if pcallee.identName == "__log__" {
+            memUsed = true
+            memLogUsed = true
             gImports = 4
           }
         }
