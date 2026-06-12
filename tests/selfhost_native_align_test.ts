@@ -198,6 +198,7 @@ const RUN_CASES = [
   "literals/octal.vl",
   "literals/separators.vl",
   "literals/wide-hex.vl",
+  "loops/break.vl",
   "loops/continue.vl",
   "loops/for-in.vl",
   "loops/for-range-bound-named-step.vl",

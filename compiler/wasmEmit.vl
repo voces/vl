@@ -2773,6 +2773,10 @@ let localIsRef: i32[] = []
 // resolves to the right heap type + field layout). For non-struct locals the slot is
 // unused (`-1`). Rebuilt alongside `localNames` by `buildLocals`.
 let localStructIdx: i32[] = []
+// Parallel to `localNames`: `1` when the i-th declared local is a LOOP VARIABLE
+// (a `for` counter / for-in element), whose scope is the loop — the resolution
+// fallback skips these once their loop has closed (see `markLoopVarSlot`).
+let localLoopVar: i32[] = []
 
 // ── lexical scope stack (per-block local binding resolution) ──────────────────
 // Wasm locals are function-scoped, but VL `let`s are LEXICALLY block-scoped: two
@@ -2833,6 +2837,20 @@ function scopeBind(name: string, slot: i32): i32 {
   0
 }
 
+// Drop the most recent binding — the loop-VARIABLE unbind. A `for` binds its
+// variable in the ENCLOSING frame (no frame of its own), but the variable's
+// scope is the LOOP (host parity: the loop declares it in the loop's scope), so
+// both passes unbind it as the loop closes. Without this the loop var would
+// keep shadowing a same-named binding that resolves through a LATER channel
+// (e.g. a top-level `let` lowered to a wasm GLOBAL — locals win the lookup), so
+// `for i in …` followed by `let i = 0` mis-read the dead loop counter.
+// Returns 0.
+function scopeUnbind(): i32 {
+  scopeNames.pop()
+  scopeSlots.pop()
+  0
+}
+
 // The declared-local POSITION bound to `name` by the innermost live scope frame, or
 // -1 if `name` is not a live lexical binding. Searches the scope stack top-down
 // (innermost first), so a shadowing inner `let` wins over an outer same-named one.
@@ -2859,11 +2877,19 @@ function scopeSlotOf(name: string): i32 {
 // of the block frame onto `loopBrkDepth` (the `break` target). At a `break`/
 // `continue` site the relative `br` operand is `ctrlDepth - <stack top>`. The
 // stacks are popped when the `while` closes. All reset per function in the body
-// emit. (The self-host AST carries no loop labels, so only the INNERMOST loop is
-// ever targeted — `loop*Depth[length-1]`.)
+// emit.
+//
+// LOOP LABELS: each loop also pushes its LABEL ("" = unlabelled) onto
+// `loopBrkLabel`/`loopContLabel`, parallel to the depth stacks. An unlabelled
+// `break`/`continue` targets the stack TOP (the innermost loop); a labelled one
+// scans the label stack from the top for its label and uses the matching depth
+// — the host's `node.label ?? loopLabels[last]` branch-target selection
+// (`toWasm.ts` `Break`/`Continue` cases) expressed in relative depths.
 let ctrlDepth: i32 = 0
 let loopContDepth: i32[] = []
 let loopBrkDepth: i32[] = []
+let loopContLabel: string[] = []
+let loopBrkLabel: string[] = []
 
 // Opening a control frame: bump the running depth. Returns 0.
 function ctrlEnter(): i32 {
@@ -2875,6 +2901,20 @@ function ctrlEnter(): i32 {
 function ctrlLeave(): i32 {
   ctrlDepth = ctrlDepth - 1
   0
+}
+
+// The loop-stack position a `break`/`continue` targets: "" (unlabelled) binds
+// to the TOP entry (the innermost loop); a label scans from the top for the
+// nearest enclosing loop carrying it. Returns -1 when the label names no
+// enclosing loop (the emit-time fail-loud guard).
+function loopStackFind(labels: string[], label: string): i32 {
+  if label == "" { return labels.length - 1 }
+  let i = labels.length - 1
+  while i >= 0 {
+    if labels[i] == label { return i }
+    i = i - 1
+  }
+  0 - 1
 }
 
 // ── per-function `.push` scratch locals ──────────────────────────────────────
@@ -3489,7 +3529,21 @@ function addLocalName(name: string, isRef: i32, structIdx: i32): i32 {
   localNames.push(name)
   localIsRef.push(isRef)
   localStructIdx.push(structIdx)
+  localLoopVar.push(0)
   pos
+}
+
+// Mark the declared-local slot as a LOOP VARIABLE (a `for` counter / for-in
+// element). A loop var's scope is the LOOP: while it is live the scope stack
+// resolves it; once its loop closes (`scopeUnbind`) it must NOT be resolvable
+// again — but the flat `localNames` fallback scan would still find it (it
+// serves the scope-less DETECTION passes, which must keep seeing loop vars for
+// in-body classification). RESOLUTION (`declaredIndexOf`) therefore skips
+// flagged slots in its fallback, so a post-loop reference falls through to an
+// outer/global binding exactly as the host's loop-scoped declaration does.
+function markLoopVarSlot(slot: i32): i32 {
+  localLoopVar[slot] = 1
+  0
 }
 
 // Recursively collect the declared-local names of the block at `blockIx` into
@@ -3573,9 +3627,12 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
         // a synthetic bound temp (the `to` expression is evaluated ONCE). The temp's
         // name carries a `#` so it can never collide with a user identifier.
         let fvSlot = addLocalName(s.frVar, 0, 0 - 1)
+        markLoopVarSlot(fvSlot)
         scopeBind(s.frVar, fvSlot)
         addLocalName(s.frVar + "#b", 0, 0 - 1)
         if collectLocals(s.frBody, fnIx) < 0 { scopePop() return 0 - 1 }
+        // The loop variable's scope is the loop (see `scopeUnbind`).
+        scopeUnbind()
       } else if s is ForIn {
         // A `for v in <list>` introduces THREE slots in pre-order: the element var
         // (i32, or a string ref for a string-list / `.keys()` iterable), a hidden
@@ -3595,6 +3652,7 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
           fiLk = 7
         }
         let fiSlot = addLocalName(s.fiVar, fiEk, fiVarIdx)
+        markLoopVarSlot(fiSlot)
         scopeBind(s.fiVar, fiSlot)
         addLocalName(s.fiVar + "#i", 0, 0 - 1)
         let fiLs = 0 - 1
@@ -3608,6 +3666,8 @@ function collectLocals(blockIx: i32, fnIx: i32): i32 {
         }
         addLocalName(s.fiVar + "#l", fiLk, fiLs)
         if collectLocals(s.fiBody, fnIx) < 0 { scopePop() return 0 - 1 }
+        // The loop variable's scope is the loop (see `scopeUnbind`).
+        scopeUnbind()
       }
       i = i + 1
     }
@@ -3729,6 +3789,7 @@ function buildLocals(fnIx: i32): i32 {
   localNames = []
   localIsRef = []
   localStructIdx = []
+  localLoopVar = []
   // Reset the lexical scope stack per function. `collectLocals` pushes/pops frames as
   // it walks (leaving it balanced/empty), then the emit pass rebuilds it in lockstep.
   scopeNames = []
@@ -4440,6 +4501,28 @@ function fnHasStrOp(fnIx: i32): boolean {
 // ITS own slot, with its own valtype), else the first `localNames` slot of that name
 // as a safety net (used when no scope frame is active, e.g. the `fnUses*` detection
 // pass, where any same-named slot's type suffices). -1 if `name` is not a local.
+// The RESOLUTION variant of `declaredSlotOf`: identical, except the flat
+// fallback scan SKIPS loop-variable slots (`localLoopVar`). At resolution time
+// the scope stack is maintained in lockstep with the walk, so a live loop var
+// always resolves through it; a flat-scan hit on a loop var would be a DEAD
+// binding (its loop already closed) shadowing the outer/global the host would
+// resolve (see `markLoopVarSlot`). Detection/classifier passes keep using
+// `declaredSlotOf` (they run scope-less and must see in-body loop vars).
+function declaredSlotLive(name: string): i32 {
+  let scoped = scopeSlotOf(name)
+  if scoped >= 0 {
+    return scoped
+  }
+  let pos = 0
+  while pos < localNames.length {
+    if localNames[pos] == name && localLoopVar[pos] == 0 {
+      return pos
+    }
+    pos = pos + 1
+  }
+  0 - 1
+}
+
 function declaredSlotOf(name: string): i32 {
   let scoped = scopeSlotOf(name)
   if scoped >= 0 {
@@ -4459,7 +4542,7 @@ function declaredSlotOf(name: string): i32 {
 // local. Declared locals sit AFTER the params, so the slot is `paramCount + pos`
 // where `pos` is the name's resolved declared-local position (`declaredSlotOf`).
 function declaredIndexOf(fnIx: i32, name: string): i32 {
-  let pos = declaredSlotOf(name)
+  let pos = declaredSlotLive(name)
   if pos < 0 {
     return 0 - 1
   }
@@ -12000,34 +12083,63 @@ function emitForInList(body: i32[], iterIx: i32, fnIx: i32): i32 {
   emitExpr(body, iterIx, fnIx)
 }
 
-// Does this loop BODY contain a `continue` that binds to THIS loop? Descends `if`
-// arms (a conditional continue) but NOT nested loops (their `continue` is their
-// own). Drives the for-range/for-in INNER continue block: a body without a direct
-// `continue` keeps the original (golden-pinned) two-frame shape.
-function blockHasDirectContinue(blockIx: i32): boolean {
+// Does this loop BODY contain a `continue` that binds to THIS loop (whose label
+// is `label`, "" when unlabelled)? Two binding forms (mirroring the host's
+// `hasEscapingBreak` shape, applied to continue):
+//   • an UNLABELLED `continue` binds to the innermost loop — so it counts only
+//     when not `nested` inside another loop (descends `if` arms, a conditional
+//     continue, but NOT nested loops: their `continue` is their own);
+//   • a LABELLED `continue l` binds to the loop labelled `l` from ANYWHERE in
+//     the body, including inside nested loops — so when this loop HAS a label
+//     the scan also descends nested loop bodies looking for it.
+// Drives the for-range/for-in INNER continue block: a body without a binding
+// `continue` keeps the original (golden-pinned) two-frame shape, and an
+// unlabelled loop scans exactly as before (the nested-loop descent is gated on
+// `label != ""`), so existing modules stay byte-identical.
+function blockHasContinueFor(blockIx: i32, label: string, nested: boolean): boolean {
   let b = P.nodes[blockIx]
   if b is Block {
     let stmts = b.blkStmts
     let i = 0
     while i < stmts.length {
       let st = P.nodes[stmts[i]]
-      if st is ContinueStmt { return true }
-      if st is IfStmt {
-        if ifHasDirectContinue(stmts[i]) { return true }
+      if st is ContinueStmt {
+        if st.contLabel == "" {
+          if !nested { return true }
+        } else {
+          if label != "" && st.contLabel == label { return true }
+        }
+      } else if st is IfStmt {
+        if ifHasContinueFor(stmts[i], label, nested) { return true }
+      } else if st is WhileStmt {
+        if label != "" {
+          if blockHasContinueFor(st.whileBody, label, true) { return true }
+        }
+      } else if st is ForRange {
+        if label != "" {
+          if blockHasContinueFor(st.frBody, label, true) { return true }
+        }
+      } else if st is ForIn {
+        if label != "" {
+          if blockHasContinueFor(st.fiBody, label, true) { return true }
+        }
       }
       i = i + 1
     }
   }
   false
 }
-function ifHasDirectContinue(ifIx: i32): boolean {
+
+// The `if`-statement descent of `blockHasContinueFor`: both arms, including a
+// chained `else if`.
+function ifHasContinueFor(ifIx: i32, label: string, nested: boolean): boolean {
   let st = P.nodes[ifIx]
   if st is IfStmt {
-    if blockHasDirectContinue(st.ifThen) { return true }
+    if blockHasContinueFor(st.ifThen, label, nested) { return true }
     if st.ifElse >= 0 {
       let els = P.nodes[st.ifElse]
-      if els is Block { return blockHasDirectContinue(st.ifElse) }
-      if els is IfStmt { return ifHasDirectContinue(st.ifElse) }
+      if els is Block { return blockHasContinueFor(st.ifElse, label, nested) }
+      if els is IfStmt { return ifHasContinueFor(st.ifElse, label, nested) }
     }
   }
   false
@@ -12359,9 +12471,11 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     fbBlock(64)              // 0x02 block, 0x40 void blocktype
     ctrlEnter()
     loopBrkDepth.push(ctrlDepth)
+    loopBrkLabel.push(s.whileLabel)
     fbLoop(64)               // 0x03 loop, 0x40 void blocktype
     ctrlEnter()
     loopContDepth.push(ctrlDepth)
+    loopContLabel.push(s.whileLabel)
     // condition + eqz: if condition is false (zero), exit block
     if emitExpr(body, s.whileCond, fnIx) < 0 { return 0 - 1 }
     fbI32Eqz()               // 0x45 i32.eqz (invert: exit if condition was false)
@@ -12372,9 +12486,11 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     fbEnd()                  // 0x0b end (loop)
     ctrlLeave()
     loopContDepth.pop()
+    loopContLabel.pop()
     fbEnd()                  // 0x0b end (block)
     ctrlLeave()
     loopBrkDepth.pop()
+    loopBrkLabel.pop()
     return 0
   }
   if s is ForRange {
@@ -12430,9 +12546,11 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     fbBlock(64)              // 0x02 block, void
     ctrlEnter()
     loopBrkDepth.push(ctrlDepth)
+    loopBrkLabel.push(s.frLabel)
     fbLoop(64)               // 0x03 loop, void
     ctrlEnter()
     loopContDepth.push(ctrlDepth)
+    loopContLabel.push(s.frLabel)
     // continue-condition: le_s (ascending) / ge_s (descending), inverted to exit
     fbLocalGet(vIdx)
     fbLocalGet(bIdx)
@@ -12443,21 +12561,26 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     }
     fbI32Eqz()               // 0x45 invert: exit when out of range
     fbBrIf(1)                // 0x0d br_if -> break out of block
-    // A body with a DIRECT `continue` needs an INNER block as the continue
+    // A body with a `continue` binding to THIS loop (direct, or `continue
+    // <label>` from a nested loop) needs an INNER block as the continue
     // target: branching to its END falls into the increment (a branch to the
     // loop header would SKIP the increment — an infinite loop). A body without
-    // one keeps the original two-frame shape (goldens pinned on it).
-    let frHasCont = blockHasDirectContinue(s.frBody)
+    // one keeps the original two-frame shape (goldens pinned on it). The inner
+    // block carries the loop's LABEL too, shadowing the header entry, so a
+    // binding `continue` lands on the increment.
+    let frHasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
     if frHasCont {
       fbBlock(64)            // continue block
       ctrlEnter()
       loopContDepth.push(ctrlDepth)
+      loopContLabel.push(s.frLabel)
     }
     if emitStmts(body, s.frBody, fnIx) < 0 { return 0 - 1 }
     if frHasCont {
       fbEnd()                // end continue block — `continue` lands here
       ctrlLeave()
       loopContDepth.pop()
+      loopContLabel.pop()
     }
     // v = v + K
     fbLocalGet(vIdx)
@@ -12468,9 +12591,13 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     fbEnd()                  // end loop
     ctrlLeave()
     loopContDepth.pop()
+    loopContLabel.pop()
     fbEnd()                  // end block
     ctrlLeave()
     loopBrkDepth.pop()
+    loopBrkLabel.pop()
+    // The loop variable's scope is the loop (see `scopeUnbind`).
+    scopeUnbind()
     return 0
   }
   if s is ForIn {
@@ -12541,9 +12668,11 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     fbBlock(64)              // 0x02 block, void
     ctrlEnter()
     loopBrkDepth.push(ctrlDepth)
+    loopBrkLabel.push(s.fiLabel)
     fbLoop(64)               // 0x03 loop, void
     ctrlEnter()
     loopContDepth.push(ctrlDepth)
+    loopContLabel.push(s.fiLabel)
     // exit when cursor >= len (the list wrapper's field 1)
     fbLocalGet(iIdx)
     fbLocalGet(lIdx)
@@ -12578,17 +12707,19 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     }
     fbLocalSet(vIdx)
     // Same INNER continue block as for-range: `continue` must still increment.
-    let fiHasCont = blockHasDirectContinue(s.fiBody)
+    let fiHasCont = blockHasContinueFor(s.fiBody, s.fiLabel, false)
     if fiHasCont {
       fbBlock(64)            // continue block
       ctrlEnter()
       loopContDepth.push(ctrlDepth)
+      loopContLabel.push(s.fiLabel)
     }
     if emitStmts(body, s.fiBody, fnIx) < 0 { return 0 - 1 }
     if fiHasCont {
       fbEnd()                // end continue block — `continue` lands here
       ctrlLeave()
       loopContDepth.pop()
+      loopContLabel.pop()
     }
     // cursor = cursor + 1
     fbLocalGet(iIdx)
@@ -12599,32 +12730,50 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
     fbEnd()                  // end loop
     ctrlLeave()
     loopContDepth.pop()
+    loopContLabel.pop()
     fbEnd()                  // end block
     ctrlLeave()
     loopBrkDepth.pop()
+    loopBrkLabel.pop()
+    // The loop variable's scope is the loop (see `scopeUnbind`).
+    scopeUnbind()
     return 0
   }
   if s is BreakStmt {
-    // `break`: branch out of the innermost loop's wrapping BLOCK, so control resumes
-    // after the whole loop. No loop labels in the self-host AST, so always the
-    // innermost (`loopBrkDepth` top). The relative `br` operand is the frame distance
-    // `ctrlDepth - <block depth>`. A `break` outside any loop is a parser/typecheck
-    // error upstream; guard anyway so a stray one fails loudly, not with a bad `br`.
+    // `break [label]`: branch out of a loop's wrapping BLOCK, so control resumes
+    // after the whole loop. Unlabelled targets the innermost (`loopBrkDepth` top);
+    // `break outer` scans the parallel label stack from the top for `outer` —
+    // the host's `brkLabel(node.label ?? loopLabels[last])` target selection.
+    // The relative `br` operand is the frame distance `ctrlDepth - <block depth>`.
+    // A `break` outside any loop / to an unknown label fails loudly, not with a
+    // bad `br`.
     if loopBrkDepth.length == 0 {
       return emitFail("emitProgram: `break` outside a loop")
     }
-    let blkDepth = loopBrkDepth[loopBrkDepth.length - 1]
+    let brkAt = loopStackFind(loopBrkLabel, s.brkLabel)
+    if brkAt < 0 {
+      return emitFail("emitProgram: `break` label does not name an enclosing loop")
+    }
+    let blkDepth = loopBrkDepth[brkAt]
     fbBr(ctrlDepth - blkDepth)   // 0x0c br to the loop's wrapping block
     return 0
   }
   if s is ContinueStmt {
-    // `continue`: branch to the innermost loop frame, re-checking the condition. The
-    // relative `br` operand is the frame distance `ctrlDepth - <loop depth>`.
+    // `continue [label]`: branch to a loop's continue target — the loop header
+    // for a `while` (re-check the condition), the inner continue block for a
+    // `for` (fall into the increment). Unlabelled targets the innermost;
+    // `continue outer` scans the label stack from the top (the labelled for's
+    // INNER block shadows its header entry — both carry the label — so a
+    // binding `continue` never skips the increment).
     if loopContDepth.length == 0 {
       return emitFail("emitProgram: `continue` outside a loop")
     }
-    let loopDepth = loopContDepth[loopContDepth.length - 1]
-    fbBr(ctrlDepth - loopDepth)  // 0x0c br to the loop header
+    let contAt = loopStackFind(loopContLabel, s.contLabel)
+    if contAt < 0 {
+      return emitFail("emitProgram: `continue` label does not name an enclosing loop")
+    }
+    let loopDepth = loopContDepth[contAt]
+    fbBr(ctrlDepth - loopDepth)  // 0x0c br to the loop's continue target
     return 0
   }
   emitFail("emitProgram: unsupported statement in body")
@@ -13355,6 +13504,8 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     ctrlDepth = 0
     loopContDepth = []
     loopBrkDepth = []
+    loopContLabel = []
+    loopBrkLabel = []
     if emitFuncBody(bodyExpr, fn.fnBody, fnIx) < 0 { return 0 - 1 }
     wTarget(exprPrev)
 
@@ -14690,6 +14841,7 @@ function collectStartLocals(): i32 {
   localNames = []
   localIsRef = []
   localStructIdx = []
+  localLoopVar = []
   scopeNames = []
   scopeSlots = []
   scopeFrames = []
@@ -14699,9 +14851,12 @@ function collectStartLocals(): i32 {
     let s = P.nodes[startStmts[i]]
     if s is ForRange {
       let fvSlot = addLocalName(s.frVar, 0, 0 - 1)
+      markLoopVarSlot(fvSlot)
       scopeBind(s.frVar, fvSlot)
       addLocalName(s.frVar + "#b", 0, 0 - 1)
       if collectLocals(s.frBody, 0 - 1) < 0 { scopePop() return 0 - 1 }
+      // The loop variable's scope is the loop (see `scopeUnbind`).
+      scopeUnbind()
     } else if s is ForIn {
       let fiEk = forInElemKind(s.fiIter, 0 - 1)
       if fiEk < 0 { scopePop() return emitFail("emitProgram: unsupported for-in iterable") }
@@ -14717,12 +14872,15 @@ function collectStartLocals(): i32 {
         fiLk = 7
       }
       let fiSlot = addLocalName(s.fiVar, fiEk, fiVarIdx)
+      markLoopVarSlot(fiSlot)
       scopeBind(s.fiVar, fiSlot)
       addLocalName(s.fiVar + "#i", 0, 0 - 1)
       let fiLs = 0 - 1
       if fiEk == 1 { fiLs = refListSlotOfExpr(s.fiIter, 0 - 1) }
       addLocalName(s.fiVar + "#l", fiLk, fiLs)
       if collectLocals(s.fiBody, 0 - 1) < 0 { scopePop() return 0 - 1 }
+      // The loop variable's scope is the loop (see `scopeUnbind`).
+      scopeUnbind()
     } else if s is WhileStmt {
       if collectLocals(s.whileBody, 0 - 1) < 0 { scopePop() return 0 - 1 }
     } else if s is IfStmt {
@@ -14756,6 +14914,8 @@ function emitStartFnCode(out: i32[]): i32 {
   ctrlDepth = 0
   loopContDepth = []
   loopBrkDepth = []
+  loopContLabel = []
+  loopBrkLabel = []
   // Non-const global initializers and top-level STATEMENTS run INTERLEAVED in source
   // order (merged on arena index — top-level statements are parsed sequentially, so
   // arena order IS source order): `xs.push(1)` before `const ys = xs.map(f)` must
