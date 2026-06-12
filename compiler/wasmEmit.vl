@@ -4070,6 +4070,28 @@ function exprIsStrEq(binIx: i32, fnIx: i32): boolean {
   false
 }
 
+// True if `binIx` is a `==`/`!=` whose union-box value compare can hit the
+// STRING arm — a box compared against a string operand, or two boxes whose
+// shared arms include `string`. Those payload compares stage their operands in
+// the string scratch frame (`emitStrEqCore`), so the frame must be reserved.
+function exprIsUnionStrEq(binIx: i32, fnIx: i32): boolean {
+  let e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      let lU = exprUnion(e.binLeft, fnIx)
+      let rU = exprUnion(e.binRight, fnIx)
+      if lU && rU {
+        let ln = unionNameOfExpr(e.binLeft, fnIx)
+        let rn = unionNameOfExpr(e.binRight, fnIx)
+        return unionHasAtom(ln, "string") && unionHasAtom(rn, "string")
+      }
+      if lU { return exprString(e.binRight, fnIx) }
+      if rU { return exprString(e.binLeft, fnIx) }
+    }
+  }
+  false
+}
+
 // True if `binIx` is a same-shape STRUCT `==`/`!=` (a field-wise compare). Its
 // string/array field compares stage operands in the string-op scratch frame, so
 // it counts as a string op for frame reservation.
@@ -4137,6 +4159,9 @@ function exprHasStrOp(exprIx: i32, fnIx: i32): boolean {
   if e is BinExpr {
     if exprIsStrConcat(exprIx, fnIx) { return true }
     if exprIsStrEq(exprIx, fnIx) { return true }
+    // A union-box `==`/`!=` whose value compare can hit the STRING arm stages
+    // its payloads in the same frame (`emitStrEqCore`).
+    if exprIsUnionStrEq(exprIx, fnIx) { return true }
     // A struct `==`/`!=` stages its string/array FIELD compares in the same frame.
     if exprIsStructEq(exprIx, fnIx) { return true }
     if exprHasStrOp(e.binLeft, fnIx) { return true }
@@ -4209,8 +4234,17 @@ function exprHasStrOp(exprIx: i32, fnIx: i32): boolean {
 }
 
 // True if any statement in the block at `blockIx` (descending into if/else branches
-// and while bodies, the scopes `collectLocals` walks) contains a string op.
+// and while bodies, the scopes `collectLocals` walks) contains a string op. A
+// wrapper restores the narrowing depth the scan's post-guard pushes (mirroring
+// the emit loops) may leave behind on an early `true`.
 function blockHasStrOp(blockIx: i32, fnIx: i32): boolean {
+  let savedGuardTop = narrowTop
+  let hit = blockHasStrOpScan(blockIx, fnIx)
+  restoreNarrow(savedGuardTop)
+  hit
+}
+
+function blockHasStrOpScan(blockIx: i32, fnIx: i32): boolean {
   let b = P.nodes[blockIx]
   if b is Block {
     let stmts = b.blkStmts
@@ -4243,6 +4277,10 @@ function blockHasStrOp(blockIx: i32, fnIx: i32): boolean {
         if exprHasStrOp(s.frTo, fnIx) { return true }
         if blockHasStrOp(s.frBody, fnIx) { return true }
       }
+      // Post-guard complement narrowing (mirrors the emit loops) — so a string
+      // read below a returning guard (`if x is i32 { return 0 } print(x)`) is
+      // detected under the SAME narrowing the emit applies. The wrapper restores.
+      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
   }
@@ -4901,11 +4939,15 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
   // its base scalar after `canonEmitTypeNames` (`"a" | "b"` a string, `0 | 1`
   // an i32, `1.5 | 2.5` an f64), so the `is` is a runtime VALUE test — the
   // same lowering as `v == <literal>` (string value-equality / numeric eq).
-  // A literal `is` over a still-BOXED mixed-rep union falls through to the
-  // variant path below (out of scope — fails loudly there).
+  // A literal `is` over a still-BOXED mixed-rep union (`"a" | "b" | 1`) is the
+  // tag-gated payload compare (`emitUnionLitIs`) — same-rep literals share a
+  // tag, so the tag alone cannot discriminate them.
   if nd0 is IsExpr {
     let lv = nd0.isVariant
     if isLitVariantName(lv) {
+      if exprUnion(nd0.isObj, fnIx) {
+        return emitUnionLitIs(body, nd0.isObj, lv, fnIx)
+      }
       if !exprUnion(nd0.isObj, fnIx) {
         if lv[0] == '"' {
           // The variant lexeme IS a raw quoted string lexeme (quotes kept,
@@ -5095,6 +5137,288 @@ function emitUnionCoerce(body: i32[], unionName: string, exprIx: i32, fnIx: i32)
     fbStructNew(vb)          // wrap the scalar payload
   }
   fbStructNew(uBoxIdx)       // { tag, payload }
+  0
+}
+
+// ── union `==`/`!=` (the host's structural-equality union branch) ─────────────
+// `==`/`!=` are structural by value, so a still-BOXED value-union operand
+// compares by "does the box's tag select the arm whose rep matches the other
+// side, AND does the unboxed payload value-equal it". The tag compare GATES the
+// payload compare (the payload `ref.cast` would trap on a wrong-rep arm), as a
+// value-typed `if` (blocktype 0x7f) — the same short-circuit `toWasm.ts` folds.
+// REPRESENTATION NOTE: the host hoists each box into a fresh local so the tag
+// read and the payload read share one evaluation; this emitter RE-EVALUATES the
+// operand instead (the established struct-`==` re-evaluation pattern), so a
+// union operand is restricted to a simple BINDING read — re-reading an ident is
+// effect-free and yields the same box. Anything effectful fails loudly.
+
+// True when the union-box operand at `exprIx` can be re-evaluated without side
+// effects (an ident read — a param, local, or module global).
+function unionEqOperandOk(exprIx: i32): boolean {
+  let e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident { return true }
+  false
+}
+
+// The value-eq opcode (i32 result) for a scalar union atom: `i32`/`boolean`
+// share `i32.eq`; i64/f64/f32 take their own. -1 for `string` (its eq loop) /
+// `null` (tag equality alone decides it — no payload).
+function atomEqOpcode(atom: string): i32 {
+  let k = valueAtomKind(atom)
+  if k == 0 || k == 1 { return 70 }   // 0x46 i32.eq
+  if k == 3 { return 81 }             // 0x51 i64.eq
+  if k == 4 { return 97 }             // 0x61 f64.eq
+  if k == 5 { return 91 }             // 0x5b f32.eq
+  0 - 1
+}
+
+// Unbox a union payload already pushed as `anyref` (`struct.get $box 1`) to the
+// atom's rep: a string payload IS the string array (cast only); a scalar rides
+// its per-rep value box (cast + field 0). Mirrors `emitValueUnionUnboxRead`.
+function emitUnionPayloadUnbox(body: i32[], atom: string): i32 {
+  if atom == "string" {
+    fbRefCast(aTypeIdx)      // the payload IS the string array ref
+    return 0
+  }
+  let vb = vbHeapIdxOfAtom(atom)
+  if vb < 0 {
+    return emitFail("emitProgram: union `==` atom has no value box")
+  }
+  fbRefCast(vb)              // 0xfb 0x16 <value box>
+  fbStructGet(vb, 0)         // the scalar payload
+  0
+}
+
+// The union ATOM the concrete (non-box) side of a union `==` compares under —
+// the same rep ladder `emitUnionCoerce` classifies a coerced value with.
+function unionEqAtomOf(otherIx: i32, unionName: string, fnIx: i32): string {
+  let atom = "i32"
+  if exprString(otherIx, fnIx) {
+    atom = "string"
+  } else if exprIsF32(otherIx, fnIx) {
+    atom = "f32"
+  } else if exprIsF64(otherIx, fnIx) {
+    atom = "f64"
+  } else if exprIsI64(otherIx, fnIx) {
+    atom = "i64"
+  } else if exprIsBool(otherIx, fnIx) {
+    atom = "boolean"
+  } else {
+    if !unionHasAtom(unionName, "i32") && unionHasAtom(unionName, "i64") { atom = "i64" }
+    let bare = P.nodes[unwrapParen(otherIx)]
+    if bare is NumLit {
+      if !numLexFitsI32(bare.numText) { atom = "i64" }
+    }
+  }
+  atom
+}
+
+// Emit the concrete operand at `otherIx` in the atom's rep (the host's
+// `withDesiredType(member, …)` — an i32 literal widens to the arm's i64/f64/f32).
+function emitUnionEqOther(body: i32[], otherIx: i32, atom: string, fnIx: i32): i32 {
+  if atom == "i64" {
+    return emitExprAsI64(body, otherIx, fnIx)
+  }
+  if atom == "f64" {
+    return emitExprAsF64(body, otherIx, fnIx)
+  }
+  if atom == "f32" {
+    let savedF32 = pendingF32
+    pendingF32 = true
+    if emitExprAsF32(body, otherIx, fnIx) < 0 { return 0 - 1 }
+    pendingF32 = savedF32
+    return 0
+  }
+  emitExpr(body, otherIx, fnIx)
+}
+
+// union == concrete (either operand order — equality is symmetric): the box's
+// tag must select the arm whose rep matches the other side, then the unboxed
+// payload value-compares it. A rep with no arm is statically unequal (`==` 0 /
+// `!=` 1) — both operands still evaluate for side effects, box side first
+// (the host's drop-block). `isNe` negates the result for `!=`.
+function emitUnionConcreteEq(body: i32[], boxIx: i32, otherIx: i32, isNe: boolean, fnIx: i32): i32 {
+  if !unionEqOperandOk(boxIx) {
+    return emitFail("emitProgram: union `==` over a non-binding union value is not supported yet")
+  }
+  let uname = unionNameOfExpr(boxIx, fnIx)
+  if uname == "" || !isValueUnionName(uname) {
+    return emitFail("emitProgram: `==` over a struct union is not supported yet")
+  }
+  let atom = unionEqAtomOf(otherIx, uname, fnIx)
+  if !unionHasAtom(uname, atom) {
+    // No arm has the other operand's rep: the box can never hold such a value.
+    if emitExpr(body, boxIx, fnIx) < 0 { return 0 - 1 }
+    fbDrop()                 // 0x1a drop
+    if emitUnionEqOther(body, otherIx, atom, fnIx) < 0 { return 0 - 1 }
+    fbDrop()                 // 0x1a drop
+    if isNe { fbI32Const(1) } else { fbI32Const(0) }
+    return 0
+  }
+  if atom == "string" && !aUsed {
+    return emitFail("emitProgram: union string `==` but array type not collected")
+  }
+  // tag == tagOf(atom), gating the payload compare.
+  if emitExpr(body, boxIx, fnIx) < 0 { return 0 - 1 }
+  fbStructGet(uBoxIdx, 0)    // 0xfb 0x02 <box ht> field 0: tag
+  fbI32Const(scalarTagOf(atom))
+  fbI32Bin(70)               // 0x46 i32.eq
+  fbIf(127)                  // 0x04 if, 0x7f i32 result blocktype
+  if emitExpr(body, boxIx, fnIx) < 0 { return 0 - 1 }
+  fbStructGet(uBoxIdx, 1)    // 0xfb 0x02 <box ht> field 1: value (anyref)
+  if emitUnionPayloadUnbox(body, atom) < 0 { return 0 - 1 }
+  if emitUnionEqOther(body, otherIx, atom, fnIx) < 0 { return 0 - 1 }
+  if atom == "string" {
+    if emitStrEqCore(body) < 0 { return 0 - 1 }
+  } else {
+    fbI32Bin(atomEqOpcode(atom))
+  }
+  fbElse()                   // 0x05 else: wrong-rep arm — structurally unequal
+  fbI32Const(0)
+  fbEnd()                    // 0x0b end
+  if isNe {
+    fbI32Eqz()               // 0x45 i32.eqz (`!=` negates value-equality)
+  }
+  0
+}
+
+// union == union: equal iff the SAME arm (tag) holds AND the unboxed payloads
+// value-compare equal per that arm. Folded as a nested value-typed `if` chain
+// over the SHARED non-null arms, bottoming out at bare tag equality (covers the
+// `null` arm and any non-shared arm: distinct tags ⇒ unequal, equal null tags
+// ⇒ equal). The right payload's unbox short-circuits on ITS tag too.
+function emitUnionUnionEq(body: i32[], lIx: i32, rIx: i32, isNe: boolean, fnIx: i32): i32 {
+  if !unionEqOperandOk(lIx) || !unionEqOperandOk(rIx) {
+    return emitFail("emitProgram: union `==` over a non-binding union value is not supported yet")
+  }
+  let lname = unionNameOfExpr(lIx, fnIx)
+  let rname = unionNameOfExpr(rIx, fnIx)
+  if !isValueUnionName(lname) || !isValueUnionName(rname) {
+    return emitFail("emitProgram: `==` over a struct union is not supported yet")
+  }
+  // The shared non-null arms (matched by atom — atoms tag globally).
+  let lAtoms: string[] = []
+  splitUnionAtoms(lname, lAtoms)
+  let arms: string[] = []
+  let ai = 0
+  while ai < lAtoms.length {
+    if lAtoms[ai] != "null" && unionHasAtom(rname, lAtoms[ai]) {
+      arms.push(lAtoms[ai])
+    }
+    ai = ai + 1
+  }
+  if unionHasAtom(lname, "string") && unionHasAtom(rname, "string") && !aUsed {
+    return emitFail("emitProgram: union string `==` but array type not collected")
+  }
+  // Outermost `if` is the LAST arm (the host wraps its chain in arm order).
+  let k = arms.length - 1
+  while k >= 0 {
+    if emitExpr(body, lIx, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(uBoxIdx, 0)  // left tag
+    fbI32Const(scalarTagOf(arms[k]))
+    fbI32Bin(70)             // 0x46 i32.eq
+    fbIf(127)                // left holds this arm
+    if emitExpr(body, rIx, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(uBoxIdx, 0)  // right tag
+    fbI32Const(scalarTagOf(arms[k]))
+    fbI32Bin(70)             // 0x46 i32.eq
+    fbIf(127)                // right holds it too → payload value-compare
+    if emitExpr(body, lIx, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(uBoxIdx, 1)  // left payload (anyref)
+    if emitUnionPayloadUnbox(body, arms[k]) < 0 { return 0 - 1 }
+    if emitExpr(body, rIx, fnIx) < 0 { return 0 - 1 }
+    fbStructGet(uBoxIdx, 1)  // right payload (anyref)
+    if emitUnionPayloadUnbox(body, arms[k]) < 0 { return 0 - 1 }
+    if arms[k] == "string" {
+      if emitStrEqCore(body) < 0 { return 0 - 1 }
+    } else {
+      fbI32Bin(atomEqOpcode(arms[k]))
+    }
+    fbElse()                 // right holds a different arm → unequal
+    fbI32Const(0)
+    fbEnd()
+    fbElse()                 // left holds an earlier arm → recurse down the chain
+    k = k - 1
+  }
+  // Chain bottom: bare tag equality (null arm / non-shared arms).
+  if emitExpr(body, lIx, fnIx) < 0 { return 0 - 1 }
+  fbStructGet(uBoxIdx, 0)
+  if emitExpr(body, rIx, fnIx) < 0 { return 0 - 1 }
+  fbStructGet(uBoxIdx, 0)
+  fbI32Bin(70)               // 0x46 i32.eq
+  // Close every arm's outer `if` frame.
+  let c = 0
+  while c < arms.length {
+    fbEnd()
+    c = c + 1
+  }
+  if isNe {
+    fbI32Eqz()               // 0x45 i32.eqz
+  }
+  0
+}
+
+// `v is <literal>` over a STILL-BOXED mixed-rep union (`"a" | "b" | 1` boxes as
+// `string|i32` — same-rep literals SHARE a tag): the tag selects the literal's
+// rep arm, then the unboxed payload value-compares the literal. A literal whose
+// rep has no arm is statically false (literal-is-always-false), evaluating the
+// receiver for effects. The same gated shape as `emitUnionConcreteEq`.
+function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32): i32 {
+  if !unionEqOperandOk(objIx) {
+    return emitFail("emitProgram: literal `is` over a non-binding union value is not supported yet")
+  }
+  let uname = unionNameOfExpr(objIx, fnIx)
+  if uname == "" || !isValueUnionName(uname) {
+    return emitFail("emitProgram: literal `is` over a struct union is not supported")
+  }
+  // The literal's rep atom (a quoted lexeme is a string; a float f64; an
+  // integer i32, widening to i64 when out of range or when the union's only
+  // integer arm is i64 — the `emitUnionCoerce` default).
+  let atom = "i32"
+  if lit[0] == '"' {
+    atom = "string"
+  } else if numTextIsFloat(lit) {
+    atom = "f64"
+  } else if !numLexFitsI32(lit) {
+    atom = "i64"
+  } else if !unionHasAtom(uname, "i32") && unionHasAtom(uname, "i64") {
+    atom = "i64"
+  }
+  if !unionHasAtom(uname, atom) {
+    if emitExpr(body, objIx, fnIx) < 0 { return 0 - 1 }
+    fbDrop()                 // 0x1a drop
+    fbI32Const(0)
+    return 0
+  }
+  if atom == "string" && !aUsed {
+    return emitFail("emitProgram: string `is` test but array type not collected")
+  }
+  if emitExpr(body, objIx, fnIx) < 0 { return 0 - 1 }
+  fbStructGet(uBoxIdx, 0)    // 0xfb 0x02 <box ht> field 0: tag
+  fbI32Const(scalarTagOf(atom))
+  fbI32Bin(70)               // 0x46 i32.eq
+  fbIf(127)                  // 0x04 if, 0x7f i32 result blocktype
+  if emitExpr(body, objIx, fnIx) < 0 { return 0 - 1 }
+  fbStructGet(uBoxIdx, 1)    // field 1: value (anyref)
+  if emitUnionPayloadUnbox(body, atom) < 0 { return 0 - 1 }
+  if atom == "string" {
+    // The literal lexeme rides a synthesized `StrLit` (same shape as `strText`).
+    if emitExpr(body, mkStr(lit), fnIx) < 0 { return 0 - 1 }
+    if emitStrEqCore(body) < 0 { return 0 - 1 }
+  } else if atom == "f64" {
+    fbF64Const(lit)
+    fbI32Bin(97)             // 0x61 f64.eq
+  } else if atom == "i64" {
+    let pr = parseI64Pair(lit)
+    fbI64Const(pr[0], pr[1])
+    fbI32Bin(81)             // 0x51 i64.eq
+  } else {
+    fbI32Const(parseI32(lit))
+    fbI32Bin(70)             // 0x46 i32.eq
+  }
+  fbElse()                   // wrong-rep arm — the literal can never match
+  fbI32Const(0)
+  fbEnd()                    // 0x0b end
   0
 }
 
@@ -5419,6 +5743,16 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
       else if pendingListKind == 4 { isF64Lit = true }
       else { if pendingListKind != 0 { isRefLit = true } }
     }
+    // A NON-EMPTY literal under a threaded UNION-list annotation (kind 2) is a
+    // ref literal even when its elements are bare scalars/strings — a
+    // `(string|i32)[]` literal's elements COERCE into the union box at the
+    // write boundary (the host's `coerceUnion` per element), they don't type
+    // the list. Without the annotation a scalar literal stays the i32 list.
+    if pendingListKind == 2 {
+      isRefLit = true
+      isStrLit = false
+      isF64Lit = false
+    }
     if isF64Lit {
       if !fa64Used {
         return emitFail("emitProgram: f64 array literal but f64 list type not collected")
@@ -5489,13 +5823,23 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
       if rlElemKindTbl[rslot] == 1 {
         elemStructIdx = structIndexByName(rlElemName[rslot])
       }
+      // A UNION-element list (kind 2) coerces each element into the box at the
+      // write boundary (`emitUnionCoerce` — the host's per-element `coerceUnion`):
+      // a bare scalar/string boxes under its atom's tag; an object literal /
+      // already-union value passes through to its existing boxing.
+      let elemUnionNm = ""
+      if rlElemKindTbl[rslot] == 2 { elemUnionNm = rlElemName[rslot] }
       let i = 0
       while i < elems.length {
         if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
           return emitFail("emitProgram: nested arrays are not supported")
         }
         pendingStructIdx = elemStructIdx
-        if emitExpr(body, elems[i], fnIx) < 0 { return 0 - 1 }
+        if elemUnionNm != "" {
+          if emitUnionCoerce(body, elemUnionNm, elems[i], fnIx) < 0 { return 0 - 1 }
+        } else {
+          if emitExpr(body, elems[i], fnIx) < 0 { return 0 - 1 }
+        }
         i = i + 1
       }
       pendingStructIdx = 0 - 1
@@ -8450,6 +8794,31 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       fbEnd()                  // 0x0b end
       return 0
     }
+    // Structural `==`/`!=` with a still-BOXED value-union operand (either side,
+    // or both — equality is symmetric). Checked BEFORE the string-eq routing (a
+    // union box compared against a string would otherwise misclassify as a bare
+    // string compare) and SKIPS `null` literals — the box-tag null compare below
+    // owns `v == null` (the host's `variantTag(info, null)` path).
+    if e.binOp == "==" || e.binOp == "!=" {
+      let uql = P.nodes[unwrapParen(e.binLeft)]
+      let uqr = P.nodes[unwrapParen(e.binRight)]
+      let uqNull = false
+      if uql is NullLit { uqNull = true }
+      if uqr is NullLit { uqNull = true }
+      if !uqNull {
+        let uqL = exprUnion(e.binLeft, fnIx)
+        let uqR = exprUnion(e.binRight, fnIx)
+        if uqL && uqR {
+          return emitUnionUnionEq(body, e.binLeft, e.binRight, e.binOp == "!=", fnIx)
+        }
+        if uqL {
+          return emitUnionConcreteEq(body, e.binLeft, e.binRight, e.binOp == "!=", fnIx)
+        }
+        if uqR {
+          return emitUnionConcreteEq(body, e.binRight, e.binLeft, e.binOp == "!=", fnIx)
+        }
+      }
+    }
     // G6 string operators (a string is a `(array i32)` of code points): `+` is a NEW
     // concatenated array; `==`/`!=` are ELEMENT-WISE value-equality, NOT ref identity
     // — so they take their own inline lowering BEFORE the i32 `binOpcode` path (which
@@ -10632,6 +11001,62 @@ function restoreNarrow(n: i32): i32 {
   0
 }
 
+// True if EVERY control path through the block at `blockIx` returns: a direct
+// `return` statement, or an `if`/`else` (incl. an `else if` chain) whose arms
+// all return. Conservative — a `while` etc. never counts (mirrors the host's
+// flow analysis only as far as the post-guard narrowing below needs).
+function blockAlwaysReturns(blockIx: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is RetStmt { return true }
+      if s is IfStmt {
+        if ifAlwaysReturns(stmts[i]) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if the `if` at `ifIx` returns on EVERY path: it has an else, the
+// then-block always returns, and the else (a block or a chained `else if`)
+// always returns too.
+function ifAlwaysReturns(ifIx: i32): boolean {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse < 0 { return false }
+    if !blockAlwaysReturns(s.ifThen) { return false }
+    let els = P.nodes[s.ifElse]
+    if els is Block { return blockAlwaysReturns(s.ifElse) }
+    if els is IfStmt { return ifAlwaysReturns(s.ifElse) }
+    return false
+  }
+  false
+}
+
+// After a GUARD `if` — one with NO else whose then-branch always returns — the
+// rest of the enclosing block only runs when the guard was FALSE, so it sees
+// the same complement narrowing an explicit else-arm would (the host's flow
+// narrowing after an early return): `if x is boolean { return 0 } return x`
+// reads `x` as the unboxed `i32` below the guard. Pushes via
+// `setNarrowFromCondElse` (VALUE unions only — struct unions keep their
+// no-else-narrowing behavior); the CALLER restores the depth at block exit.
+function pushPostGuardNarrow(stmtIx: i32, fnIx: i32): i32 {
+  let s = P.nodes[stmtIx]
+  if s is IfStmt {
+    if s.ifElse < 0 {
+      if blockAlwaysReturns(s.ifThen) {
+        setNarrowFromCondElse(s.ifCond, fnIx)
+      }
+    }
+  }
+  0
+}
+
 // The ELEMENT kind of a `for v in <iter>` iterable: `0` = i32 (an `i32[]` list, a
 // map `.values()`), `3` = string (a `string[]` list, a map `.keys()`), `1` = struct
 // (a `S[]` ref list whose element is a struct), or -1 (an unsupported iterable — the
@@ -11554,6 +11979,9 @@ function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32): i32 {
     scopePush()
     let stmts = b.blkStmts
     let n = stmts.length
+    // A guard `if` (no else, then-branch always returns) narrows the REST of the
+    // body to the guard's complement (the host's post-early-return flow narrowing).
+    let savedGuardTop = narrowTop
     let i = 0
     while i < n {
       let isLast = i == n - 1
@@ -11569,8 +11997,10 @@ function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32): i32 {
       } else {
         if emitStmt(body, stmts[i], fnIx) < 0 { scopePop() return 0 - 1 }
       }
+      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
+    restoreNarrow(savedGuardTop)
     scopePop()
     return 0
   }
@@ -11612,11 +12042,15 @@ function emitStmts(body: i32[], blockIx: i32, fnIx: i32): i32 {
     // are dropped on exit.
     scopePush()
     let stmts = b.blkStmts
+    // Post-guard complement narrowing (see `emitFuncBody`/`pushPostGuardNarrow`).
+    let savedGuardTop = narrowTop
     let i = 0
     while i < stmts.length {
       if emitStmt(body, stmts[i], fnIx) < 0 { scopePop() return 0 - 1 }
+      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
+    restoreNarrow(savedGuardTop)
     scopePop()
     return 0
   }
@@ -11640,12 +12074,17 @@ function emitStmtsTail(body: i32[], blockIx: i32, fnIx: i32): i32 {
     }
     // A tail-position nested block is its own lexical scope too (mirrors `collectLocals`).
     scopePush()
+    // Post-guard complement narrowing (see `emitFuncBody`/`pushPostGuardNarrow`) —
+    // pushed in the loop, active for the TAIL statement, restored on exit.
+    let savedGuardTop = narrowTop
     let i = 0
     while i < n - 1 {
       if emitStmt(body, stmts[i], fnIx) < 0 { scopePop() return 0 - 1 }
+      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
     let rc = emitStmtTail(body, stmts[n - 1], fnIx)
+    restoreNarrow(savedGuardTop)
     scopePop()
     return rc
   }
@@ -14566,8 +15005,27 @@ function nameIsRefArray(name: string): boolean {
     if name == unNames[u] + "[]" { return true }
     u = u + 1
   }
+  // A `(string|i32)[]` annotation — a VALUE-union element list. The element
+  // slots hold the same `{tag, value}` boxes a bare union binding does (the
+  // host stores the coerced union value), so it is a kind-2 ref list.
+  if parenUnionArrElemName(name) != "" { return true }
   if nameIsMapArray(name) { return true }
   false
+}
+
+// The VALUE-union element name of a parenthesized union-array annotation:
+// `(string|i32)[]` → `string|i32` (`canonEmitName` keeps a union element's
+// grouping parens), or "" when `name` is not a value-union array name.
+// Registration-independent (classifies from the atom set, not `unNames`).
+function parenUnionArrElemName(name: string): string {
+  if name.length < 5 { return "" }
+  if name[name.length - 2] != '[' { return "" }
+  if name[name.length - 1] != ']' { return "" }
+  if name[0] != '(' { return "" }
+  if name[name.length - 3] != ')' { return "" }
+  let inner = name.slice(1, name.length - 3)
+  if isValueUnionName(inner) { return inner }
+  ""
 }
 
 // The ref-element kind for an array type-name (assumes `nameIsRefArray(name)`):
@@ -14575,6 +15033,8 @@ function nameIsRefArray(name: string): boolean {
 // element (`mStructIdx`, the scope-chain `{[string]:i32}[]`).
 function refArrElemKind(name: string): i32 {
   if nameIsMapArray(name) { return 3 }
+  // A `(string|i32)[]` value-union element list is a union-box list (kind 2).
+  if parenUnionArrElemName(name) != "" { return 2 }
   let u = 0
   while u < unNames.length {
     if name == unNames[u] + "[]" { return 2 }
@@ -14942,6 +15402,10 @@ function arrLitElemName(arrIx: i32): string {
 // name. Mirrors `refArrElemKind` but yields the table key.
 function refArrElemName(name: string): string {
   if nameIsMapArray(name) { return name.slice(0, name.length - 2) }
+  // `(string|i32)[]` → `string|i32` (the parens are annotation grouping only —
+  // the TABLE key is the bare atom-set name every other union position uses).
+  let pun = parenUnionArrElemName(name)
+  if pun != "" { return pun }
   let u = 0
   while u < unNames.length {
     if name == unNames[u] + "[]" { return unNames[u] }
@@ -15743,6 +16207,13 @@ function registerInlineUnion(stmts: i32[], name: string): i32 {
   if isValueUnionName(name) {
     return registerValueUnionName(name)
   }
+  // A `(string|i32)[]` ARRAY-of-value-union annotation registers its ELEMENT
+  // union: the list's slots hold the same `{tag, value}` boxes a bare binding
+  // does, so the box + value-box reps must be interned for it too.
+  let pun = parenUnionArrElemName(name)
+  if pun != "" {
+    return registerValueUnionName(pun)
+  }
   if !isInlineStructUnion(stmts, name) { return 0 }
   let atoms: string[] = []
   splitUnionAtoms(name, atoms)
@@ -16433,6 +16904,17 @@ function unionNameOfExpr(exprIx: i32, fnIx: i32): string {
   }
   if e is Ident {
     return unionNameOfIdent(e.identName, fnIx)
+  }
+  // `ns[i]` over a UNION-element ref list yields the element union's box (the
+  // name-typed mirror of `exprUnion`'s Index case) — so an un-annotated
+  // `const a = arr[0]` binding resolves its union name for narrowing/unboxing.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      let slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        if rlElemKindTbl[slot] == 2 { return rlElemName[slot] }
+      }
+    }
   }
   ""
 }
