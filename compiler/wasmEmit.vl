@@ -6155,8 +6155,12 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
       if rlElemKindTbl[rslot] == 2 { elemUnionNm = rlElemName[rslot] }
       let i = 0
       while i < elems.length {
-        if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
-          return emitFail("emitProgram: nested arrays are not supported")
+        // An `i32[][]` literal's elements ARE arrays (each lowers to the normal
+        // i32-list literal, yielding the `(ref $lTypeIdx)` element value).
+        if rlElemKindTbl[rslot] != 4 {
+          if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
+            return emitFail("emitProgram: nested arrays are not supported")
+          }
         }
         pendingStructIdx = elemStructIdx
         if elemUnionNm != "" {
@@ -14293,6 +14297,10 @@ function mAssignTypeIndices(n: i32): i32 {
       rlElemHeap[rs] = uBoxIdx
     } else if rlElemKindTbl[rs] == 3 {
       rlElemHeap[rs] = mStructIdxPre
+    } else if rlElemKindTbl[rs] == 4 {
+      // An `i32[][]` slot's element is the i32-list WRAPPER (interned just above,
+      // so `lTypeIdx` is already assigned).
+      rlElemHeap[rs] = lTypeIdx
     } else {
       let esi = structIndexByName(rlElemName[rs])
       if esi >= 0 { rlElemHeap[rs] = sHeapIdx[esi] } else { rlElemHeap[rs] = 0 }
@@ -15788,6 +15796,10 @@ function nameIsMapArray(name: string): boolean {
 // NOT a ref array. The element name is recovered by checking each declared struct/union
 // name + `"[]"` (a `string + string` concat; a `string + i32` would be a type error).
 function nameIsRefArray(name: string): boolean {
+  // A NESTED `i32[][]` is a ref list whose elements are the i32-list wrapper
+  // (element kind 4) — the existing ref-pair machinery serves it; only the
+  // element heap type differs (`lTypeIdx`).
+  if name == "i32[][]" { return true }
   let i = 0
   while i < sNames.length {
     if name == sNames[i] + "[]" { return true }
@@ -15825,6 +15837,7 @@ function parenUnionArrElemName(name: string): string {
 // `1` = a struct element, `2` = a union-box element (`uBoxIdx`), `3` = a map-struct
 // element (`mStructIdx`, the scope-chain `{[string]:i32}[]`).
 function refArrElemKind(name: string): i32 {
+  if name == "i32[][]" { return 4 }
   if nameIsMapArray(name) { return 3 }
   // A `(string|i32)[]` value-union element list is a union-box list (kind 2).
   if parenUnionArrElemName(name) != "" { return 2 }
@@ -16051,6 +16064,12 @@ function collectA(stmts: i32[]): i32 {
         raUsed = true
         rElemKind = arrLitElemKind(i)
         rlInternName(arrLitElemName(i), arrLitElemKind(i))
+        // A nested `[[…]]` literal's elements are i32-list wrappers — force the
+        // i32 list + raw array types for them.
+        if arrLitElemKind(i) == 4 {
+          lUsed = true
+          aUsed = true
+        }
       } else if arrLitIsStr(i, 0 - 1) {
         // A STRING-element literal is a string-ref list — the same wrapper/backing
         // a `string[]` annotation forces.
@@ -16138,6 +16157,12 @@ function collectA(stmts: i32[]): i32 {
         raUsed = true
         rElemKind = refArrElemKind(nd.tyName)
         rlInternName(refArrElemName(nd.tyName), refArrElemKind(nd.tyName))
+        // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
+        // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
+        if refArrElemKind(nd.tyName) == 4 {
+          lUsed = true
+          aUsed = true
+        }
         if nameIsMapArray(nd.tyName) {
           mUsed = true
           lUsed = true
@@ -16177,6 +16202,14 @@ function arrLitIsRef(arrIx: i32): boolean {
     if a.arrElems.length < 1 { return false }
     let e0 = P.nodes[a.arrElems[0]]
     if e0 is ObjLit { return true }
+    // A NESTED array literal (`[[1, 2], [3, 4]]`) whose inner elements are
+    // i32-ish is an `i32[][]` ref list (element kind 4). String / f64 / ref
+    // inner elements stay unsupported (loud failure downstream).
+    if e0 is ArrayLit {
+      if !arrLitIsStr(a.arrElems[0], 0 - 1) && !arrLitIsF64(a.arrElems[0], 0 - 1) && !arrLitIsRef(a.arrElems[0]) {
+        return true
+      }
+    }
   }
   false
 }
@@ -16216,6 +16249,7 @@ function arrLitElemKind(arrIx: i32): i32 {
   if a is ArrayLit {
     if a.arrElems.length >= 1 {
       let e0 = P.nodes[a.arrElems[0]]
+      if e0 is ArrayLit { return 4 }
       if e0 is ObjLit {
         // A union-variant element boxes into the union (kind 2); a plain struct is kind 1.
         if uDeclared {
@@ -16237,6 +16271,7 @@ function arrLitElemName(arrIx: i32): string {
   if a is ArrayLit {
     if a.arrElems.length >= 1 {
       let e0 = P.nodes[a.arrElems[0]]
+      if e0 is ArrayLit { return "i32[]" }
       if e0 is ObjLit {
         if uDeclared {
           let vn = objVariantName(a.arrElems[0])
@@ -16254,6 +16289,7 @@ function arrLitElemName(arrIx: i32): string {
 // element is `name` with the trailing `"[]"` removed — i.e. the struct / union alias
 // name. Mirrors `refArrElemKind` but yields the table key.
 function refArrElemName(name: string): string {
+  if name == "i32[][]" { return "i32[]" }
   if nameIsMapArray(name) { return name.slice(0, name.length - 2) }
   // `(string|i32)[]` → `string|i32` (the parens are annotation grouping only —
   // the TABLE key is the bare atom-set name every other union position uses).
@@ -18234,6 +18270,16 @@ function exprArray(exprIx: i32, fnIx: i32): boolean {
   // list wrapper ref — so `.length` / indexing / assignment treat it as a list (gap #5).
   if e is Member {
     if memFieldTypeCode(exprIx, fnIx) == 4 { return true }
+  }
+  // `m[i]` over an `i32[][]` ref list (element kind 4) yields the INNER i32 list,
+  // so a chained `m[i][j]` / `m[i].length` treats it as a list.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      let slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        if rlElemKindTbl[slot] == 4 { return true }
+      }
+    }
   }
   false
 }
