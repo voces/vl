@@ -148,6 +148,71 @@ fn compile_vl(
         }
     }
 
+    // Multi-file module resolution (H3): when the source has a line-leading
+    // `import {` (the host CLI's cheap textual gate — an import-free file keeps
+    // the single-source path byte-identical) AND the compiler module exposes the
+    // module-table exports (older seeds: fall back to today's behavior), run the
+    // FETCH LOOP — commit the entry, then read + commit whatever resolved keys
+    // the compiler still needs, until the graph is closed. Module keys are
+    // `/`-separated paths relative to whatever the entry path was, so the host
+    // just reads them; a missing file commits `found = 0` (the unresolvable
+    // diagnostic fires inside the wasm instead of an infinite re-request).
+    let has_imports = source.lines().any(|l| {
+        let t = l.trim_start();
+        t.strip_prefix("import")
+            .map(|rest| rest.trim_start().starts_with('{'))
+            .unwrap_or(false)
+    });
+    if has_imports {
+        if let (Ok(mod_reset), Ok(key_push), Ok(msrc_push), Ok(commit), Ok(pend_n), Ok(pend_len), Ok(pend_at)) = (
+            inst.get_typed_func::<(), i32>(&mut store, "modReset"),
+            inst.get_typed_func::<i32, i32>(&mut store, "modKeyPush"),
+            inst.get_typed_func::<i32, i32>(&mut store, "modSrcPush"),
+            inst.get_typed_func::<i32, i32>(&mut store, "modCommit"),
+            inst.get_typed_func::<(), i32>(&mut store, "modPendingCount"),
+            inst.get_typed_func::<i32, i32>(&mut store, "modPendingLen"),
+            inst.get_typed_func::<(i32, i32), i32>(&mut store, "modPendingAt"),
+        ) {
+            let commit_module =
+                |store: &mut Store<()>, key: &str, src: Option<&str>| -> Result<()> {
+                    for ch in key.chars() {
+                        key_push.call(&mut *store, ch as i32)?;
+                    }
+                    if let Some(s) = src {
+                        for ch in s.chars() {
+                            msrc_push.call(&mut *store, ch as i32)?;
+                        }
+                    }
+                    commit.call(&mut *store, if src.is_some() { 1 } else { 0 })?;
+                    Ok(())
+                };
+            mod_reset.call(&mut store, ())?;
+            commit_module(&mut store, source_path, Some(source))?;
+            loop {
+                let n = pend_n.call(&mut store, ())?;
+                if n == 0 {
+                    break;
+                }
+                // Snapshot the pending keys first — committing mutates the list.
+                let mut keys = Vec::with_capacity(n as usize);
+                for i in 0..n {
+                    let len = pend_len.call(&mut store, i)?;
+                    let mut key = String::with_capacity(len as usize);
+                    for j in 0..len {
+                        if let Some(c) = char::from_u32(pend_at.call(&mut store, (i, j))? as u32) {
+                            key.push(c);
+                        }
+                    }
+                    keys.push(key);
+                }
+                for key in keys {
+                    let src = std::fs::read_to_string(&key).ok();
+                    commit_module(&mut store, &key, src.as_deref())?;
+                }
+            }
+        }
+    }
+
     src_reset.call(&mut store, ())?;
     for ch in source.chars() {
         src_push.call(&mut store, ch as i32)?;

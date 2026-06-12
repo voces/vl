@@ -51,6 +51,10 @@ sed -E 's/\bTok\b/LexTok/g; s/\bDiag\b/LexDiag/g; s/\badvance\b/lexAdvance/g' \
   compiler/lexer.vl > "$WORK/vlsrc.vl"
 cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.vl \
   scripts/vl-compiler-driver.vl >> "$WORK/vlsrc.vl"
+# BLANK the compiler's own import statements (range-aware; multi-line imports) —
+# see native-fixpoint.sh: a line-leading `import {` would trip the vl binary's
+# module gate (H3). Blanking preserves line numbers; byte-identical output.
+sed -i -E '/^import \{/,/\} from "/ s/.*//' "$WORK/vlsrc.vl"
 
 echo "== self-compile current compiler source with the seed =="
 if ! "$VL" build "$WORK/vlsrc.vl" -o "$WORK/next.wasm" --compiler "$SEED"; then

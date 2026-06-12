@@ -241,6 +241,8 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   the offending values (e.g. `index 7 out of bounds (length 3)`); (3) an index-assignment LHS has
   no parser span yet — broaden parser span coverage for OOB *write* errors. Also feasible: a
   **REPL** (accumulate-session-source + recompile-per-entry) as a future CLI item.
+- ⬜ H3 merge-by-renaming is a bridge — post-parity revisit notes live in native-modules-design.md
+  §Post-parity revisit (symbol-based resolution replaces the rename walker).
 
 ---
 

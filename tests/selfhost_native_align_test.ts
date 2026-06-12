@@ -223,6 +223,14 @@ const RUN_CASES = [
   "maps/many-keys.vl",
   "maps/object-values.vl",
   "maps/string-values.vl",
+  // H3 native modules: multi-file entries — `vl run` resolves the sibling
+  // imports through the driver's fetch loop (relative to the entry path).
+  "modules/basic/entry.vl",
+  "modules/inferred-exports/entry.vl",
+  "modules/name-isolation/entry.vl",
+  "modules/rename/entry.vl",
+  "modules/solo/entry.vl",
+  "modules/transitive/entry.vl",
   "sets/basics.vl",
   "sets/infer-from-add.vl",
   "numerics/wide.vl",
@@ -430,6 +438,12 @@ const REJECT_CASES = [
   "maps/error-no-annotation.vl",
   "maps/error-object-literal-not-map.vl",
   "maps/error-uninferred.vl",
+  // H3 native modules: graph-resolution errors reject at the parse stage with
+  // the host's message texts (cycle / not-exported / unresolvable).
+  "modules/err-cycle/entry.vl",
+  "modules/err-not-exported/entry.vl",
+  "modules/err-undefined/entry.vl",
+  "modules/err-unresolvable/entry.vl",
   "numerics/narrowing-reject.vl",
   "objects/self-method-pollution.vl",
   "objects/trailing-comma-illegal.vl",

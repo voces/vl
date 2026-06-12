@@ -29,6 +29,12 @@ sed -E 's/\bTok\b/LexTok/g; s/\bDiag\b/LexDiag/g; s/\badvance\b/lexAdvance/g' \
   compiler/lexer.vl > "$WORK/vlsrc.vl"
 cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.vl \
   scripts/vl-compiler-driver.vl >> "$WORK/vlsrc.vl"
+# BLANK the compiler's own import statements (range-aware — two compiler imports
+# span multiple lines): a line-leading `import {` would trip the vl binary's
+# module gate (H3) and send the fetch loop chasing `./ast` against the temp dir.
+# Blanking (not deleting) preserves line numbers; imports are parse no-ops
+# contributing zero AST nodes, so the output is byte-identical (verified).
+sed -i -E '/^import \{/,/\} from "/ s/.*//' "$WORK/vlsrc.vl"
 
 echo "== stage3: seed compiles the compiler =="
 "$VL" build "$WORK/vlsrc.vl" -o "$WORK/stage3.wasm" --compiler "$SEED"
