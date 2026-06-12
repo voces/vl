@@ -10139,7 +10139,11 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         fbLocalSet(callRefSlot)
         fbLocalGet(callRefSlot)
         fbStructGet(cloStructIdx, 1)            // env
-        let cargs = c.callArgs
+        // Parameter-order args (named-call reorder; see the direct path below).
+        let cargs = orderedDirectArgs(callIx, target)
+        if directArgsBad(cargs, callIx) {
+          return emitFail("emitProgram: named argument does not match a parameter")
+        }
         let cai = 0
         while cai < cargs.length {
           if emitExpr(body, cargs[cai], fnIx) < 0 { return 0 - 1 }
@@ -10161,7 +10165,16 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
       // for passing a struct value into a forward-referenced / mutually-recursive callee
       // whose param struct shares field names with another struct.
       let cFn = P.nodes[fnStmts[target]]
-      let args = c.callArgs
+      // Arguments in PARAMETER order (host parity: `orderArgumentsByParameters`
+      // + operands built per-parameter). A call with no named args keeps its
+      // source list untouched; a named call (`f(b: 1, a: 2)`) reorders here so
+      // each emitted operand lands on (and is typed by) its declared parameter
+      // — including EVALUATION order, which follows parameter order as the
+      // host's per-parameter operand build does.
+      let args = orderedDirectArgs(callIx, target)
+      if directArgsBad(args, callIx) {
+        return emitFail("emitProgram: named argument does not match a parameter")
+      }
       // When a function value exists module-wide, EVERY callee carries a hidden leading
       // `structref env` param. A direct call to a top-level function (never capturing)
       // passes a null env. Pushed BEFORE the args, matching the env-leading signature.
@@ -10312,7 +10325,20 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
                   uArgs.push(c.callArgs[ua])
                   ua = ua + 1
                 }
-                return emitCall(body, mkCall(mkIdent(um.memProp), uArgs), fnIx)
+                // The injected receiver is an UNNAMED slot-0 positional; any
+                // named args shift right with it ("" rides slot 0) so the
+                // rebuilt direct call reorders them around the receiver
+                // exactly as the host does.
+                let uNames: string[] = []
+                if hasNamedArgs(c.callArgNames) {
+                  uNames.push("")
+                  let un = 0
+                  while un < c.callArgNames.length {
+                    uNames.push(c.callArgNames[un])
+                    un = un + 1
+                  }
+                }
+                return emitCall(body, mkCallN(mkIdent(um.memProp), uArgs, uNames), fnIx)
               }
             }
           }
@@ -10324,13 +10350,63 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
   emitFail("emitProgram: expected a call expression")
 }
 
+// The argument VALUE nodes of the call at `callIx`, bound into PARAMETER order
+// for a direct call to the function at fnStmts position `target` — the host's
+// `orderArgumentsByParameters` applied at the emission boundary. An
+// all-positional call returns its source list untouched (byte-identical to the
+// pre-named-args emitter); a named call reorders by the callee FuncDecl's
+// parameter names. A binding failure surfaces as a -1 slot / surplus entry,
+// which `directArgsBad` detects (the checker already diagnosed it; the emitter
+// just refuses to emit a mis-mapped call).
+function orderedDirectArgs(callIx: i32, target: i32): i32[] {
+  let none: i32[] = []
+  let c = P.nodes[callIx]
+  if c is Call {
+    if !hasNamedArgs(c.callArgNames) { return c.callArgs }
+    let pNames: string[] = []
+    let d = P.nodes[fnStmts[target]]
+    if d is FuncDecl {
+      let ps = d.fnParams
+      let i = 0
+      while i < ps.length {
+        let p = P.nodes[ps[i]]
+        if p is Param { pNames.push(p.parName) }
+        i = i + 1
+      }
+    }
+    return orderArgsByParamNames(pNames, c.callArgs, c.callArgNames)
+  }
+  none
+}
+
+// True when a parameter-ordered argument list failed to bind: a hole (-1, an
+// unfilled parameter slot) or a length differing from the source argument
+// count (a leftover named/positional arg appended past the slots).
+function directArgsBad(args: i32[], callIx: i32): boolean {
+  let c = P.nodes[callIx]
+  if c is Call {
+    if args.length != c.callArgs.length { return true }
+  }
+  let i = 0
+  while i < args.length {
+    if args[i] < 0 { return true }
+    i = i + 1
+  }
+  false
+}
+
 // Lower a function-VALUE call `f(args)` via `call_ref` over the closure fat-pointer.
 // The closure is evaluated ONCE into a scratch local, then: push its env
 // (`struct.get 1`), push the args, push its code funcref (`struct.get 0`), and
 // `call_ref $fnsig`. Mirrors the host's `indirectCall` (adapted to `call_ref`).
+// A NAMED argument needs the callee's parameter names, which a function VALUE
+// (its `TyFunc`) does not carry — fail loudly rather than mis-map positionally.
 function emitCallRef(body: i32[], callIx: i32, fnIx: i32): i32 {
   let c = P.nodes[callIx]
   if c is Call {
+    if hasNamedArgs(c.callArgNames) {
+      return emitFail("emitProgram: named arguments require a declared function")
+    }
     // Evaluate the closure once into the call-ref scratch local (`callRefSlot`).
     if emitExpr(body, c.callFn, fnIx) < 0 { return 0 - 1 }
     fbLocalSet(callRefSlot)

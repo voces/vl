@@ -54,6 +54,7 @@ import {
   mkUnary,
   mkBinary,
   mkCall,
+  mkCallN,
   mkMember,
   mkOptMember,
   mkParen,
@@ -470,16 +471,31 @@ function parsePrimary(): i32 {
   mkErr("expr", P.pos)
 }
 
+// The per-argument NAMES of the argument list parseArgs LAST completed ("" =
+// positional), parallel to its returned values. A module global rather than a
+// second return (VL functions return one value): safe against nesting because
+// parseArgs assigns it at the END — an inner call's list is finished (and its
+// `mkCallN` consumed the global in `parsePostfix`) before the outer list
+// resumes collecting into its own local.
+let gCallArgNames: string[] = []
+
 // A comma-separated argument list, already past the "(". Consumes the ")".
 // Returns the argument node indices. (A string-returning call can't drive a
 // `while` condition directly — a tracked gap — so the comma test is read into a
 // local `more` and re-checked in the body.)
+//
+// Each argument may carry a NAME — `f(a: 2, b: 1)` — recognized exactly as the
+// host does (parser.ts `parseArguments`): an IDENT immediately followed by a
+// COLON names the argument; the name binds to the parameter with that name in
+// the checker/emitter, not to its source position. Names collect into
+// `gCallArgNames` ("" for a positional entry).
 function parseArgs(): i32[] {
   let args: i32[] = []
+  let names: string[] = []
   // An argument list may span lines and allow ONE trailing comma before `)`.
   skipNewlines()
   if peekKind() != "RPAREN" {
-    args.push(parseExpr())
+    parseOneArg(args, names)
     skipNewlines()
     let more = peekKind() == "COMMA"
     while more {
@@ -488,14 +504,31 @@ function parseArgs(): i32[] {
       if peekKind() == "RPAREN" {
         more = false
       } else {
-        args.push(parseExpr())
+        parseOneArg(args, names)
         skipNewlines()
         more = peekKind() == "COMMA"
       }
     }
   }
   expect("RPAREN")
+  gCallArgNames = names
   args
+}
+
+// One argument: an optional `name:` prefix (IDENT directly followed by COLON —
+// the host's `at("ID") && peek(1).kind === "COLON"` test), then the value
+// expression. Pushes the value onto `args` and the name ("" if positional)
+// onto `names`.
+function parseOneArg(args: i32[], names: string[]): i32 {
+  if peekKind() == "IDENT" && kindAt(P.pos + 1) == "COLON" {
+    names.push(advance().text)
+    advance()                  // COLON
+    skipNewlines()
+  } else {
+    names.push("")
+  }
+  args.push(parseExpr())
+  0
 }
 
 // An object literal `{ name: value, ... }`, the cursor on the leading `{`. Each
@@ -595,7 +628,7 @@ function parsePostfix(): i32 {
     if k == "LPAREN" {
       advance()
       let args = parseArgs()
-      node = mkCall(node, args)
+      node = mkCallN(node, args, gCallArgNames)
     } else if k == "DOT" {
       advance()
       let prop = ""

@@ -120,6 +120,7 @@ const WHITELIST = [
   "functions/mutual-recursion-inferred.vl",
   "functions/mutual-recursion-struct-param.vl",
   "functions/mutual-recursion.vl",
+  "functions/named-args.vl",
   "functions/return-then-statement-same-line.vl",
   "functions/struct-param-mutual-recursion-global.vl",
   "functions/trailing-comma-call.vl",

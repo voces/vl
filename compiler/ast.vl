@@ -72,7 +72,13 @@ export type NullLit = { nullKw: string }                              // null
 export type Ident = { identName: string }                             // x
 export type Unary = { unOp: string, unArg: i32 }                      // !x  -x
 export type BinExpr = { binOp: string, binLeft: i32, binRight: i32 }  // a + b,  a = b
-export type Call = { callFn: i32, callArgs: i32[] }                   // f(a, b)
+// A call `f(a, b)` / `f(a: 2, b: 1)`. `callArgs` are the argument VALUE nodes in
+// SOURCE order; `callArgNames` is the parallel per-argument NAME list ("" = a
+// positional argument). An all-positional call may carry an EMPTY names list
+// (the common case — every consumer treats a missing entry as ""). Mirrors the
+// host's `VLArgumentNode.name` (`makeArgument` in parser.ts); binding to
+// parameters happens in the checker/emitter via `orderArgsByParamNames`.
+export type Call = { callFn: i32, callArgs: i32[], callArgNames: string[] } // f(a, b) / f(b: 1, a: 2)
 export type Member = { memObj: i32, memProp: string }                 // o.field
 export type OptMember = { omObj: i32, omProp: string }                // o?.field (null-safe)
 export type Paren = { parInner: i32 }                                 // ( e )
@@ -282,8 +288,89 @@ export function mkBinary(op: string, left: i32, right: i32): i32 {
 }
 
 export function mkCall(fn: i32, args: i32[]): i32 {
-  let n: Node = { callFn: fn, callArgs: args }
+  // All-positional (the synthesizers' constructor): an empty names list.
+  let names: string[] = []
+  mkCallN(fn, args, names)
+}
+
+// A call with per-argument NAMES (parallel to `args`; "" = positional) — the
+// parser's constructor for argument lists that may carry `name: value` entries.
+export function mkCallN(fn: i32, args: i32[], names: string[]): i32 {
+  let n: Node = { callFn: fn, callArgs: args, callArgNames: names }
   addNode(n)
+}
+
+// True iff any per-argument name is present (a non-"" entry) — the cheap gate
+// every consumer checks before paying for `orderArgsByParamNames`.
+export function hasNamedArgs(names: string[]): boolean {
+  let i = 0
+  while i < names.length {
+    if names[i] != "" { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Bind call ARGUMENTS to parameter slots by NAME, then positionally — the exact
+// matching the host's `orderArgumentsByParameters` (typecheck.ts) performs, and
+// the single source of truth shared by the checker and the emitter. Returns one
+// VALUE-node index per parameter (in PARAMETER order; -1 where no argument
+// filled the slot), followed by any leftover/unmatched arguments (a named arg
+// with no matching parameter, a named collision, or surplus positionals) in
+// source order — so the result never silently drops an argument. Pure: callers
+// (`checkNode`'s Call arm, `emitCall`) diagnose arity/name errors themselves.
+export function orderArgsByParamNames(paramNames: string[], args: i32[], argNames: string[]): i32[] {
+  let slots: i32[] = []
+  let i = 0
+  while i < paramNames.length {
+    slots.push(0 - 1)
+    i = i + 1
+  }
+  let leftover: i32[] = []
+  let positional: i32[] = []
+  // First place named arguments by parameter name.
+  let j = 0
+  while j < args.length {
+    let nm = ""
+    if j < argNames.length { nm = argNames[j] }
+    if nm == "" {
+      positional.push(args[j])
+    } else {
+      let pIx = 0 - 1
+      let k = 0
+      while k < paramNames.length {
+        if pIx < 0 && paramNames[k] == nm { pIx = k }
+        k = k + 1
+      }
+      if pIx < 0 || slots[pIx] >= 0 {
+        // Unknown name, or a slot already filled (named collision): leave it
+        // for the caller to diagnose rather than overwriting.
+        leftover.push(args[j])
+      } else {
+        slots[pIx] = args[j]
+      }
+    }
+    j = j + 1
+  }
+  // Then fill the remaining slots, in order, with positional arguments.
+  let nx = 0
+  let p = 0
+  while p < positional.length {
+    while nx < slots.length && slots[nx] >= 0 { nx = nx + 1 }
+    if nx < slots.length {
+      slots[nx] = positional[p]
+      nx = nx + 1
+    } else {
+      leftover.push(positional[p])
+    }
+    p = p + 1
+  }
+  let r = 0
+  while r < leftover.length {
+    slots.push(leftover[r])
+    r = r + 1
+  }
+  slots
 }
 
 export function mkMember(obj: i32, prop: string): i32 {
