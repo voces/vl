@@ -66,6 +66,10 @@ const createClient = (
       options: { execArgv: ["--nolazy", "--inspect=6012"] },
     },
   };
+  // `vital.checker` / `vital.compilerWasm` ride initializationOptions (read
+  // once at client start — change requires a reload, fine for an experimental
+  // toggle). See lsp/src/wasmChecker.ts for the wasm-backed checker.
+  const config = Workspace.getConfiguration("vital", folder?.uri);
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{
       scheme,
@@ -74,6 +78,10 @@ const createClient = (
     }],
     diagnosticCollectionName: "vital",
     outputChannel: outputChannel,
+    initializationOptions: {
+      checker: config.get<string>("checker", "ts"),
+      compilerWasm: config.get<string>("compilerWasm", ""),
+    },
   };
   const client = new LanguageClient("Vital", serverOptions, clientOptions);
   client.start();
