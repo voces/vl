@@ -226,6 +226,8 @@ const RUN_CASES = [
   "objects/member-call.vl",
   "run/print.vl",
   "soundness/not-is-exhaustive-union.vl",
+  "soundness/narrowing-is-null-sound.vl",
+  "types/guard-narrowing.vl",
   "soundness/nullable-access-guarded.vl",
   "soundness/nullable-chain-double-guard.vl",
   "soundness/nullable-field-guard-sound.vl",
