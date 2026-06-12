@@ -1703,7 +1703,265 @@ function collectCloSigs(): i32 {
     }
     fe = fe + 1
   }
+  // EXTENDED field-closure signatures (index/operator-trap dispatch): a closure
+  // that is an OBJECT-FIELD VALUE may be void (`"[]=": function(k,v) {…}`) or
+  // struct-returning (`"[]": function(i) row(i)`, an operator field returning a
+  // struct) — sigs the value ABI above excludes. Intern each such field
+  // closure's extended key (`>v` / `>sN;` results) so the member-call site can
+  // `ref.cast` to the callee's REAL functype. Usage-gated: only fires for a
+  // field closure whose sig is NOT already value-eligible, so a program without
+  // one emits byte-identical types.
+  let ai = 0
+  while ai < P.nodes.length {
+    let an = P.nodes[ai]
+    if an is ObjLit {
+      let fs = an.objFields
+      let fi = 0
+      while fi < fs.length {
+        let f = P.nodes[fs[fi]]
+        if f is FieldInit {
+          let ffe = fieldValueFeOf(f.fiValue)
+          if ffe >= 0 {
+            if fnSigKeyOf(ffe) == "" {
+              let ek = cloSigKeyExt(ffe)
+              if ek != "" {
+                if cloSigPosOfKey(ek) < 0 {
+                  cloSigKeys.push(ek)
+                  cloSigRepFn.push(ffe)
+                }
+              }
+            }
+          }
+        }
+        fi = fi + 1
+      }
+    }
+    ai = ai + 1
+  }
   0
+}
+
+// The lifted-function position (`fnStmts` index) of an object-literal FIELD
+// VALUE that is a function: an inline lambda (`FuncDecl` node — lifted in place,
+// so its arena index appears in `fnStmts`) or a bare Ident naming a function.
+// -1 for any other field value.
+function fieldValueFeOf(valIx: i32): i32 {
+  if valIx < 0 { return 0 - 1 }
+  let v = P.nodes[valIx]
+  if v is FuncDecl { return fnStmtsPosOf(valIx) }
+  if v is Ident { return fnIndexOf(v.identName) }
+  0 - 1
+}
+
+// The EXTENDED `$fnsig` key of lifted function `fe`: `fnSigKeyOf`'s key when the
+// sig is value-eligible, else the same param spine with a VOID (`>v`) or
+// STRUCT-REF (`>sN;`) result — the field-closure dispatch sigs. "" when any
+// param/result kind is still outside the ABI.
+function cloSigKeyExt(fe: i32): string {
+  let base = fnSigKeyOf(fe)
+  if base != "" { return base }
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  if fe >= fRetVoid.length { return "" }
+  let fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    // Read every field of the narrowed `fn` BEFORE further narrowings.
+    let params = fn.fnParams
+    let retTy = fn.fnRet
+    let key = ""
+    let pi = 0
+    while pi < params.length {
+      let k = vtKindOfParam(params[pi])
+      if k == 0 {
+        key = key + "i"
+      } else if k == 11 {
+        key = key + "d"
+      } else if k == 1 {
+        key = key + "s" + i32ToStr(paramStructIdxOf(params[pi])) + ";"
+      } else {
+        return ""
+      }
+      pi = pi + 1
+    }
+    if fRetVoid[fe] == 1 { return key + ">v" }
+    if fnReturnsClosure(fe) { return "" }
+    if retTy >= 0 {
+      if vtKindOfType(retTy) == 1 {
+        return key + ">s" + i32ToStr(retStructIndex(retTy)) + ";"
+      }
+      return ""
+    }
+    if fRetRef[fe] == 1 {
+      if fRetStructIdx[fe] >= 0 { return key + ">s" + i32ToStr(fRetStructIdx[fe]) + ";" }
+    }
+    return ""
+  }
+  ""
+}
+
+// The lifted-function position of the closure held by FIELD `prop` of struct
+// `si`, resolved through the object LITERAL(s) that intern shape `si` — every
+// literal of one shape carries sig-identical closures (monomorphized instances
+// included), so the first match types the call. -1 when no literal of shape
+// `si` sets a function-valued `prop`.
+function fieldClosureFeOf(si: i32, prop: string): i32 {
+  if si < 0 { return 0 - 1 }
+  let ai = 0
+  while ai < P.nodes.length {
+    let an = P.nodes[ai]
+    if an is ObjLit {
+      if structIndexOfObj(ai) == si {
+        let ffe = fieldValueFeOf(objFieldVal(ai, prop))
+        if ffe >= 0 { return ffe }
+      }
+    }
+    ai = ai + 1
+  }
+  0 - 1
+}
+
+// The lifted-function position of the closure a member call `recv.prop(...)`
+// dispatches to, resolved as precisely as possible: first by following the
+// RECEIVER to the literal that built it (a `const o = make(...)` whose maker
+// returns an object literal — so two same-shaped receivers from different
+// monomorphized makers each resolve their OWN closure), else by the receiver's
+// struct SHAPE (`fieldClosureFeOf`). -1 when neither resolves.
+function fieldClosureFeOfRecv(recvIx: i32, prop: string, fnIx: i32): i32 {
+  let e = P.nodes[unwrapParen(recvIx)]
+  if e is Ident {
+    let li = 0 - 1
+    if fnIx >= 0 {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+    }
+    if li < 0 { li = globalLetOf(e.identName) }
+    if li >= 0 {
+      let d = P.nodes[li]
+      if d is LetDecl {
+        let ffe = fieldClosureFeOfInit(d.letInit, prop)
+        if ffe >= 0 { return ffe }
+      }
+    }
+  }
+  if e is Call {
+    let ffe2 = fieldClosureFeOfInit(unwrapParen(recvIx), prop)
+    if ffe2 >= 0 { return ffe2 }
+  }
+  fieldClosureFeOf(structIndexOfExpr(recvIx, fnIx), prop)
+}
+
+// The MAKER function (`fnStmts` position) whose tail object literal built the
+// receiver expression at `recvIx`: a direct `make(...)` call, or an ident bound
+// (let/global) to one. -1 when the receiver's origin is not a maker call.
+function recvMakerFnOf(recvIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[unwrapParen(recvIx)]
+  let initIx = unwrapParen(recvIx)
+  if e is Ident {
+    let li = 0 - 1
+    if fnIx >= 0 {
+      let fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+    }
+    if li < 0 { li = globalLetOf(e.identName) }
+    if li < 0 { return 0 - 1 }
+    let d = P.nodes[li]
+    if d is LetDecl { initIx = unwrapParen(d.letInit) } else { return 0 - 1 }
+  }
+  let ie = P.nodes[initIx]
+  if ie is Call {
+    let callee = P.nodes[ie.callFn]
+    if callee is Ident { return fnIndexOf(callee.identName) }
+  }
+  0 - 1
+}
+
+// The annotation NAME of parameter `name` of the lifted function at `fe` ("" if
+// not a param / un-annotated).
+function feParamTyName(fe: i32, name: string): string {
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  let fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return tyNameOf(p.parType) }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// BOOLEAN-ness of a field-closure trap call `recv.prop(...)`. Monomorphized
+// maker instances SHARE the closure body, so the closure's own inferred return
+// kind cannot distinguish `wrap(true)` from `wrap(99)` — instead, follow the
+// receiver to ITS maker instance and read the closure's tail through the
+// instance's pinned param annotations (`function(_k) x` with the instance's
+// `x: boolean` → true). Falls back to the shared closure's `fRetBool`.
+function fieldCloCallIsBool(recvIx: i32, prop: string, fnIx: i32): boolean {
+  let mk = recvMakerFnOf(recvIx, fnIx)
+  if mk >= 0 {
+    let rx = fnRetExprOf(fnStmts[mk])
+    if rx >= 0 {
+      let re = P.nodes[unwrapParen(rx)]
+      if re is ObjLit {
+        let v = objFieldVal(unwrapParen(rx), prop)
+        if v >= 0 {
+          let vf = P.nodes[v]
+          if vf is FuncDecl {
+            let vRet = vf.fnRet
+            if vRet >= 0 {
+              return tyNameOf(vRet) == "boolean" || tyNameOf(vRet) == "bool"
+            }
+            let tx = fnRetExprOf(v)
+            if tx >= 0 {
+              let te = P.nodes[unwrapParen(tx)]
+              if te is Ident {
+                let ptn = feParamTyName(mk, te.identName)
+                if ptn != "" { return ptn == "boolean" || ptn == "bool" }
+              }
+              return exprIsBool(tx, v)
+            }
+          }
+        }
+      }
+    }
+  }
+  let bfe = fieldClosureFeOfRecv(recvIx, prop, fnIx)
+  if bfe >= 0 {
+    let bfn = P.nodes[fnStmts[bfe]]
+    if bfn is FuncDecl {
+      if bfn.fnRet >= 0 {
+        return tyNameOf(bfn.fnRet) == "boolean" || tyNameOf(bfn.fnRet) == "bool"
+      }
+    }
+    if bfe < fRetBool.length { return fRetBool[bfe] == 1 }
+  }
+  false
+}
+
+// Resolve `prop`'s closure through an INITIALIZER expression: an object literal
+// reads its own field; a call to a maker follows the maker's return expression
+// (its tail object literal). -1 otherwise.
+function fieldClosureFeOfInit(initIx: i32, prop: string): i32 {
+  if initIx < 0 { return 0 - 1 }
+  let e = P.nodes[unwrapParen(initIx)]
+  if e is ObjLit { return fieldValueFeOf(objFieldVal(unwrapParen(initIx), prop)) }
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      let t = fnIndexOf(callee.identName)
+      if t >= 0 {
+        let rx = fnRetExprOf(fnStmts[t])
+        if rx >= 0 {
+          let re = P.nodes[unwrapParen(rx)]
+          if re is ObjLit { return fieldValueFeOf(objFieldVal(unwrapParen(rx), prop)) }
+        }
+      }
+    }
+  }
+  0 - 1
 }
 
 // The position of `key` in `cloSigKeys`, or -1.
@@ -1717,9 +1975,13 @@ function cloSigPosOfKey(key: string): i32 {
 }
 
 // The `$fnsig` type index for lifted function `fe`'s own signature, or -1 when its
-// signature is not value-eligible / not interned.
+// signature is not value-eligible / not interned. The EXTENDED key (`cloSigKeyExt`)
+// equals the value-ABI key for an eligible sig; a void / struct-returning FIELD
+// closure resolves its interned `>v`/`>sN;` sig (so its function-section type IS
+// that `$fnsig` and the trap call site's `ref.cast` accepts it); any other
+// non-eligible sig stays -1 (its ext key is never interned).
 function fnSigIdxOfFn(fe: i32): i32 {
-  let key = fnSigKeyOf(fe)
+  let key = cloSigKeyExt(fe)
   if key == "" { return 0 - 1 }
   let p = cloSigPosOfKey(key)
   if p < 0 { return 0 - 1 }
@@ -2627,10 +2889,26 @@ function captureValKind(fe: i32, name: string): i32 {
   if bn is Param { return vtKindOfType(bn.parType) }
   if bn is LetDecl {
     if bn.letType >= 0 { return vtKindOfType(bn.letType) }
-    // Un-annotated local: a struct-literal init is a struct ref (kind 1).
+    // Un-annotated local: classify the INITIALIZER through the same ladder
+    // `collectLocals` types the binding with (resolved in the PARENT frame), so
+    // a captured list/string/struct env field carries its real ref valtype —
+    // `const store = [a, b]` captured by a closure is the i32-list wrapper ref
+    // (kind 2), not an i32 cell. Order mirrors `collectLocals`.
     if bn.letInit >= 0 {
-      let iv = P.nodes[bn.letInit]
-      if iv is ObjLit { return 1 }
+      let pf = fnParent[fe]
+      if letIsMap(b, pf) { return 6 }
+      if letIsNulRef(b, pf) { return 9 }
+      if letIsStringArray(b, pf) { return 7 }
+      if letIsF64Array(b, pf) { return 12 }
+      if letIsRefArray(b, pf) { return 5 }
+      if letIsUnion(b, pf) { return 4 }
+      if letIsStruct(b, pf) { return 1 }
+      if letIsArray(b, pf) { return 2 }
+      if letIsString(b, pf) { return 3 }
+      if letIsI64(b) { return 10 }
+      if letIsF32(b) { return 13 }
+      if letIsF64(b) { return 11 }
+      if letIsClosure(b, pf) { return 14 }
     }
   }
   0
@@ -2645,8 +2923,15 @@ function captureValStructIdx(fe: i32, name: string): i32 {
   if bn is LetDecl {
     if bn.letType >= 0 { return retStructIndex(bn.letType) }
     if bn.letInit >= 0 {
+      let pf = fnParent[fe]
+      // The kind-specific companion index, mirroring `captureValKind`'s ladder:
+      // a map capture carries its mv SHAPE slot, a nullable-struct / struct
+      // capture its struct table index, a ref-list capture its ref-list slot.
+      if letIsMap(b, pf) { return letMapShapeOf(b, pf) }
+      if letIsNulRef(b, pf) { return nulRefStructIdxOfLet(b, pf) }
+      if letIsRefArray(b, pf) { return letRefListSlot(b, pf) }
       let iv = P.nodes[bn.letInit]
-      if iv is ObjLit { return structIndexOfExpr(bn.letInit, fnParent[fe]) }
+      if iv is ObjLit { return structIndexOfExpr(bn.letInit, pf) }
     }
   }
   0 - 1
@@ -9971,6 +10256,10 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
     // A `boolean|null` NICHE binding read (narrowed non-null in its branch)
     // prints true/false. Plain `boolean` idents stay unclassified (existing rule).
     if exprNulBool(ix, fnIx) { return true }
+    // A CAPTURED boolean (a closure returning its maker's `x: boolean` param,
+    // e.g. a monomorphized `wrap(true)` index-trap instance) — so the closure's
+    // inferred return kind (`fRetBool`) sees the bool-ness through the env.
+    if capturedIsBool(fnIx, e.identName) { return true }
   }
   if e is BinExpr {
     let op = e.binOp
@@ -9999,6 +10288,16 @@ function exprIsBool(ix: i32, fnIx: i32): boolean {
   }
   if e is Call {
     let callee = P.nodes[e.callFn]
+    // A FIELD-CLOSURE call (`(wb."[]")(0)` — an index-trap dispatch) classifies
+    // by the field function's return: the receiver's ORIGIN resolves the exact
+    // monomorphized MAKER instance, so `wrap(true)`'s trap prints true while
+    // `wrap(99)`'s prints 99 (the instances SHARE the closure body — bool-ness
+    // lives in the instance's pinned param annotation, not the shared closure).
+    if callee is Member {
+      if drwFieldClosure(structIndexOfExpr(callee.memObj, fnIx), callee.memProp) {
+        return fieldCloCallIsBool(callee.memObj, callee.memProp, fnIx)
+      }
+    }
     if callee is Ident {
       let target = fnIndexOf(callee.identName)
       if target >= 0 {
@@ -10521,6 +10820,20 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32): i32 {
       if ck != "" {
         let cp = cloSigPosOfKey(ck)
         if cp >= 0 { sig = cloSigBase + cp }
+      }
+    }
+    // A FIELD-closure callee (`(o."[]")(k)`, an operator/index trap or any
+    // function-valued field): resolve the field's lifted function and cast to
+    // its REAL signature — a void (`>v`) or struct-returning (`>sN;`) field
+    // closure has no all-i32 arity sig to ride.
+    if cre is Member {
+      let mfe = fieldClosureFeOfRecv(cre.memObj, cre.memProp, fnIx)
+      if mfe >= 0 {
+        let mk = cloSigKeyExt(mfe)
+        if mk != "" {
+          let mp = cloSigPosOfKey(mk)
+          if mp >= 0 { sig = cloSigBase + mp }
+        }
       }
     }
     if sig < 0 { sig = fnSigIdxForArity(args.length) }
@@ -12370,6 +12683,21 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
           fbDrop()               // 0x1a drop (discard the boolean result)
           return 0
         }
+      }
+      // A CLOSURE-FIELD member call STATEMENT (`(o."[]=")(k, v)` — the rewritten
+      // index WRITE trap, or any function-valued field invoked for effect):
+      // `call_ref` it; drop the result unless the field's function is void.
+      if exprIsClosure(s.callFn, fnIx) {
+        if emitCallRef(body, stmtIx, fnIx) < 0 { return 0 - 1 }
+        let mcFe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        let mcVoid = false
+        if mcFe >= 0 {
+          if fRetVoid[mcFe] == 1 { mcVoid = true }
+        }
+        if !mcVoid {
+          fbDrop()               // 0x1a drop (discard the unused result)
+        }
+        return 0
       }
       return emitFail("emitProgram: unsupported member-call statement")
     }
@@ -15487,9 +15815,11 @@ function emitModule(stmts: i32[]): i32 {
     // the key has byte-identical kinds, by construction of the key).
     let sai = 0
     while sai < cloSigKeys.length {
-      let rep = P.nodes[fnStmts[cloSigRepFn[sai]]]
+      let repFe = cloSigRepFn[sai]
+      let rep = P.nodes[fnStmts[repFe]]
       if rep is FuncDecl {
         let rparams = rep.fnParams
+        let rRetTy = rep.fnRet
         wU8(96)                    // 0x60 func
         wULEB(rparams.length + 1)  // env + declared params
         wU8(107)                   // param 0 env: structref (0x6b)
@@ -15498,8 +15828,23 @@ function emitModule(stmts: i32[]): i32 {
           fbValtype(vtKindOfParam(rparams[pj]), paramStructIdxOf(rparams[pj]))
           pj = pj + 1
         }
-        wU8(1)                     // 1 result
-        fbValtype(cloRetKindOf(cloSigRepFn[sai]), 0 - 1)   // i32 (0) or f64 (11)
+        // The RESULT must byte-match the rep function's own functype result so
+        // the call-site `ref.cast` to this `$fnsig` accepts the callee funcref:
+        // a VOID field-closure sig (`>v`) has 0 results; a STRUCT-returning one
+        // (`>sN;`) yields the struct ref exactly as the function functype does.
+        if fRetVoid[repFe] == 1 {
+          wU8(0)                   // 0 results — the `>v` write-trap sig
+        } else {
+          wU8(1)                   // 1 result
+          let rk = cloRetKindOf(repFe)
+          if rk == 0 || rk == 11 {
+            fbValtype(rk, 0 - 1)   // i32 (0) or f64 (11)
+          } else {
+            let rsi = 0 - 1
+            if rRetTy >= 0 { rsi = retStructIndex(rRetTy) } else { rsi = fRetStructIdx[repFe] }
+            fbValtype(1, rsi)      // (ref $S) — the `>sN;` struct-result sig
+          }
+        }
       }
       sai = sai + 1
     }
@@ -18278,6 +18623,60 @@ function capturedStructIndex(fnIx: i32, name: string): i32 {
   0 - 1
 }
 
+// True if the CAPTURED variable `name` of the capturing lifted function `fnIx`
+// is BOOLEAN-typed in the parent frame (a `boolean` param annotation, a
+// `boolean`-annotated let, or a bool-literal init). Bool rides in an i32, so
+// `capturedKindOf` cannot carry it — this is the print/`fRetBool` side channel.
+function capturedIsBool(fnIx: i32, name: string): boolean {
+  if fnIx < 0 { return false }
+  if !fnValUsed { return false }
+  let fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return false }
+  let caps = captureNamesOf(fe)
+  let isCap = false
+  let ci = 0
+  while ci < caps.length {
+    if caps[ci] == name { isCap = true }
+    ci = ci + 1
+  }
+  if !isCap { return false }
+  let b = parentBindingOf(fe, name)
+  if b < 0 { return false }
+  let bn = P.nodes[b]
+  if bn is Param { return tyNameOf(bn.parType) == "boolean" || tyNameOf(bn.parType) == "bool" }
+  if bn is LetDecl {
+    if bn.letType >= 0 {
+      return tyNameOf(bn.letType) == "boolean" || tyNameOf(bn.letType) == "bool"
+    }
+    if bn.letInit >= 0 {
+      let iv = P.nodes[unwrapParen(bn.letInit)]
+      if iv is BoolLit { return true }
+    }
+  }
+  false
+}
+
+// The VALUE KIND of a CAPTURED variable `name` of the capturing lifted function
+// `fnIx` (the same `fbValtype` codes `captureValKind` types the env field with),
+// or -1 if `name` is not a captured variable of `fnIx`. Same guards as
+// `capturedStructIndex` — this is the classifier-side mirror, so an expression
+// classifier (`exprArray` & co) can type a captured-list/string read exactly as
+// a param/local/global receiver would.
+function capturedKindOf(fnIx: i32, name: string): i32 {
+  if fnIx < 0 { return 0 - 1 }
+  if !fnValUsed { return 0 - 1 }
+  let fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return 0 - 1 }
+  if fnEnvIdxOf(fe) < 0 { return 0 - 1 }
+  let caps = captureNamesOf(fe)
+  let ci = 0
+  while ci < caps.length {
+    if caps[ci] == name { return captureValKind(fe, name) }
+    ci = ci + 1
+  }
+  0 - 1
+}
+
 function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return 0 - 1 }
   let e = P.nodes[exprIx]
@@ -18286,6 +18685,16 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
   if e is Call {
     let callee = P.nodes[e.callFn]
     if callee is Ident { return fnRetStructIndex(callee.identName) }
+    // A FIELD-CLOSURE call (`(a."[]")(i)` — a chained index trap whose "[]"
+    // returns another trap object) yields the field function's return struct.
+    if callee is Member {
+      if drwFieldClosure(structIndexOfExpr(callee.memObj, fnIx), callee.memProp) {
+        let cfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        if cfe >= 0 {
+          if fRetRef[cfe] == 1 || fRetNul[cfe] == 1 { return fRetStructIdx[cfe] }
+        }
+      }
+    }
     // `xs.pop()` / `xs.get(i)` over a struct-element ref list yield that list's
     // element struct (as `S | null` — see `structListPopGetElem`).
     return structListPopGetElem(exprIx, fnIx)
@@ -18753,7 +19162,9 @@ function exprArray(exprIx: i32, fnIx: i32): boolean {
   if e is Ident {
     if paramArray(fnIx, e.identName) { return true }
     if declaredArray(e.identName) { return true }
-    return globalIsArray(e.identName)
+    if globalIsArray(e.identName) { return true }
+    // A CAPTURED i32-list read (`store[k]` inside a closure capturing `store`).
+    return capturedKindOf(fnIx, e.identName) == 2
   }
   // A field read `p.items` whose struct field is an `i32[]` (code `4`) yields the i32
   // list wrapper ref — so `.length` / indexing / assignment treat it as a list (gap #5).
@@ -21125,7 +21536,19 @@ function dispatchRewrite(stmts: i32[]): i32 {
     } else if nodeIsTypeDecl(stmts[i]) {
     } else if s is UnionDecl {
     } else {
-      stmts[i] = drwWalk(stmts[i], 0 - 1)
+      let oldIx = stmts[i]
+      let newIx = drwWalk(oldIx, 0 - 1)
+      if newIx != oldIx {
+        // The statement node was REPLACED (e.g. `o[k] = v` → the `(o."[]=")(k,v)`
+        // write-trap call). `startStmts` captured the OLD arena index during
+        // `collectFns` — repoint it so the start function emits the rewritten form.
+        stmts[i] = newIx
+        let ssj = 0
+        while ssj < startStmts.length {
+          if startStmts[ssj] == oldIx { startStmts[ssj] = newIx }
+          ssj = ssj + 1
+        }
+      }
     }
     i = i + 1
   }
