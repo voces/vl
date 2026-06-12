@@ -120,6 +120,8 @@ const RUN_CASES = [
   "functions/forward-reference.vl",
   "functions/lambda.vl",
   "functions/generic-return.vl",
+  "functions/indirect-polymorphic.vl",
+  "functions/indirect.vl",
   "functions/let-untyped-from-array-call.vl",
   "functions/mutual-recursion-inferred.vl",
   "functions/mutual-recursion-struct-param.vl",

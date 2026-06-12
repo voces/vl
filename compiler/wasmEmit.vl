@@ -9812,8 +9812,20 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32): i32 {
       i = i + 1
     }
     // code = closure.code (field 0) — a generic funcref. ref.cast it to the concrete
-    // `$fnsig` for this call's arity, then call_ref.
-    let sig = fnSigIdxForArity(args.length)
+    // `$fnsig` for this call, then call_ref. A callee that is a CLOSURE-PINNED
+    // param (a monomorphized instance's `"=>sigkey"` annotation) carries its
+    // exact signature key — use it, so a non-all-i32 shape (`(f64,f64)->f64`)
+    // casts to the right functype; anything else keeps the all-i32 arity key.
+    let sig = 0 - 1
+    let cre = P.nodes[c.callFn]
+    if cre is Ident {
+      let ck = paramCloSigKey(fnIx, cre.identName)
+      if ck != "" {
+        let cp = cloSigPosOfKey(ck)
+        if cp >= 0 { sig = cloSigBase + cp }
+      }
+    }
+    if sig < 0 { sig = fnSigIdxForArity(args.length) }
     if sig < 0 {
       return emitFail("emitProgram: function-value call arity has no interned signature")
     }
@@ -12194,7 +12206,9 @@ function checkParams(fnIx: i32): i32 {
           // array (`i32[]`), or `string` (the SAME `array i32` of code points) are
           // allowed; anything else fails.
           // (`collectA` already validated every array annotation is i32[].)
-          if retNulRefFlag(p.parType) == 1 {
+          if tyIsFuncType(p.parType) {
+            // a function-typed (closure fat-pointer) param — kind 14
+          } else if retNulRefFlag(p.parType) == 1 {
             // accepted — a `(ref null $S)` param
           } else if ty.tyName != "i32" {
             if ty.tyName != "i64" {            // i64 rides the 0x7e valtype (Slice 1)
@@ -12965,6 +12979,10 @@ function retBoolFlag(tyIx: i32): i32 {
 // is a distinct code from array purely for typedness clarity; `pushVT` emits the SAME
 // array ref valtype for both, since a string IS the i32-array type here.
 function vtKindOfType(tyIx: i32): i32 {
+  // A function-typed annotation (a name carrying `=>` — incl. the synthetic
+  // `"=>sigkey"` a monomorphized closure param is pinned with) is the closure
+  // fat-pointer, kind 14. Checked first; no other name contains an arrow.
+  if tyIsFuncType(tyIx) { return 14 }
   if retNulRefFlag(tyIx) == 1 { return 9 }
   if retStrArrFlag(tyIx) == 1 { return 7 }
   if retF64ArrFlag(tyIx) == 1 { return 12 }
@@ -18294,6 +18312,39 @@ function callMemProp(exprIx: i32): string {
   ""
 }
 
+// The `$fnsig` signature KEY a closure-pinned parameter carries — the part after
+// the `"=>"` of a monomorphized instance's synthetic annotation (`"=>ii>i"` →
+// `"ii>i"`), or "" when `name` is not such a param of function `fnIx`.
+function paramCloSigKey(fnIx: i32, name: string): string {
+  if fnIx < 0 { return "" }
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      let p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            let ty = P.nodes[p.parType]
+            if ty is TypeRef {
+              let nm = ty.tyName
+              if nm.length > 2 {
+                if nm[0] == '=' && nm[1] == '>' {
+                  return nm.slice(2, nm.length)
+                }
+              }
+            }
+          }
+          return ""
+        }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
 // True if the parameter `name` of function `fnIx` is annotated as a function type
 // (lowered to the closure fat-pointer, kind 14).
 function paramIsClosure(fnIx: i32, name: string): boolean {
@@ -18716,7 +18767,22 @@ function monoBindOf(tvN: string[], tvV: string[], tp: string): string {
 // annotation name an instance's pinned `TypeRef` carries. "" = a kind this pass
 // cannot name (the caller fails loudly).
 function monoArgTyName(ix: i32, fnIx: i32): string {
-  if exprIsClosure(ix, fnIx) { return "" }
+  if exprIsClosure(ix, fnIx) {
+    // A FUNCTION-VALUE argument pins its param as a CLOSURE (kind 14). The
+    // pinned name carries the callee's `$fnsig` KEY (`"=>ii>i"`) so the
+    // instance's value-call (`fn(a, b)`) ref-casts to the EXACT signature.
+    // Only a bare top-level function name resolves a key here (the HOF shape
+    // in scope); any other closure value fails loudly at the caller.
+    let ce = P.nodes[unwrapParen(ix)]
+    if ce is Ident {
+      let cfe = fnIndexOf(ce.identName)
+      if cfe >= 0 {
+        let ck = fnSigKeyOf(cfe)
+        if ck != "" { return "=>" + ck }
+      }
+    }
+    return ""
+  }
   if exprString(ix, fnIx) { return "string" }
   if exprStringArray(ix, fnIx) { return "string[]" }
   if exprRefArray(ix, fnIx) {
@@ -18832,6 +18898,17 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32): i32 {
         key = key + pinned[pk] + ","
         pk = pk + 1
       }
+      // A closure-pinned param flips the module's function-value machinery on
+      // (the instance body `call_ref`s through it; the argument side builds the
+      // fat pointer) — the same flag a lifted lambda flips in `liftFnsInExpr`.
+      let pv = 0
+      while pv < pinned.length {
+        let pvn = pinned[pv]
+        if pvn.length > 2 {
+          if pvn[0] == '=' && pvn[1] == '>' { fnValUsed = true }
+        }
+        pv = pv + 1
+      }
       // Registry hit: point this call site at the existing instance.
       let k = 0
       while k < monoKeys.length {
@@ -18889,6 +18966,37 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32): i32 {
             nret = mkTypeRef(rb)
           } else {
             nret = mkTypeRef(rb + "[]")
+          }
+        }
+      }
+      // An UN-ANNOTATED return whose return expression is a value-call THROUGH a
+      // closure-pinned param takes that signature's RESULT kind as a concrete
+      // annotation (`"…>d"` → `f64`): the emitter's return-kind inference has no
+      // expression form for a `call_ref` result, so the instance's functype and
+      // its callers' classification ride the normal annotation tables instead.
+      if nret < 0 {
+        let rx2 = fnRetExprOf(monoOrigNode[origFe])
+        if rx2 >= 0 {
+          let rxe = P.nodes[rx2]
+          if rxe is Call {
+            let rcal = P.nodes[rxe.callFn]
+            if rcal is Ident {
+              let pq = 0
+              while pq < params.length {
+                let pp = P.nodes[params[pq]]
+                if pp is Param {
+                  if pp.parName == rcal.identName {
+                    let pn = pinned[pq]
+                    if pn.length > 2 {
+                      if pn[0] == '=' && pn[1] == '>' {
+                        if pn[pn.length - 1] == 'd' { nret = mkTypeRef("f64") }
+                      }
+                    }
+                  }
+                }
+                pq = pq + 1
+              }
+            }
           }
         }
       }
