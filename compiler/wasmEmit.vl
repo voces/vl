@@ -5743,6 +5743,16 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
       else if pendingListKind == 4 { isF64Lit = true }
       else { if pendingListKind != 0 { isRefLit = true } }
     }
+    // A NON-EMPTY literal under a threaded UNION-list annotation (kind 2) is a
+    // ref literal even when its elements are bare scalars/strings — a
+    // `(string|i32)[]` literal's elements COERCE into the union box at the
+    // write boundary (the host's `coerceUnion` per element), they don't type
+    // the list. Without the annotation a scalar literal stays the i32 list.
+    if pendingListKind == 2 {
+      isRefLit = true
+      isStrLit = false
+      isF64Lit = false
+    }
     if isF64Lit {
       if !fa64Used {
         return emitFail("emitProgram: f64 array literal but f64 list type not collected")
@@ -5813,13 +5823,23 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32): i32 {
       if rlElemKindTbl[rslot] == 1 {
         elemStructIdx = structIndexByName(rlElemName[rslot])
       }
+      // A UNION-element list (kind 2) coerces each element into the box at the
+      // write boundary (`emitUnionCoerce` — the host's per-element `coerceUnion`):
+      // a bare scalar/string boxes under its atom's tag; an object literal /
+      // already-union value passes through to its existing boxing.
+      let elemUnionNm = ""
+      if rlElemKindTbl[rslot] == 2 { elemUnionNm = rlElemName[rslot] }
       let i = 0
       while i < elems.length {
         if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
           return emitFail("emitProgram: nested arrays are not supported")
         }
         pendingStructIdx = elemStructIdx
-        if emitExpr(body, elems[i], fnIx) < 0 { return 0 - 1 }
+        if elemUnionNm != "" {
+          if emitUnionCoerce(body, elemUnionNm, elems[i], fnIx) < 0 { return 0 - 1 }
+        } else {
+          if emitExpr(body, elems[i], fnIx) < 0 { return 0 - 1 }
+        }
         i = i + 1
       }
       pendingStructIdx = 0 - 1
@@ -14985,8 +15005,27 @@ function nameIsRefArray(name: string): boolean {
     if name == unNames[u] + "[]" { return true }
     u = u + 1
   }
+  // A `(string|i32)[]` annotation — a VALUE-union element list. The element
+  // slots hold the same `{tag, value}` boxes a bare union binding does (the
+  // host stores the coerced union value), so it is a kind-2 ref list.
+  if parenUnionArrElemName(name) != "" { return true }
   if nameIsMapArray(name) { return true }
   false
+}
+
+// The VALUE-union element name of a parenthesized union-array annotation:
+// `(string|i32)[]` → `string|i32` (`canonEmitName` keeps a union element's
+// grouping parens), or "" when `name` is not a value-union array name.
+// Registration-independent (classifies from the atom set, not `unNames`).
+function parenUnionArrElemName(name: string): string {
+  if name.length < 5 { return "" }
+  if name[name.length - 2] != '[' { return "" }
+  if name[name.length - 1] != ']' { return "" }
+  if name[0] != '(' { return "" }
+  if name[name.length - 3] != ')' { return "" }
+  let inner = name.slice(1, name.length - 3)
+  if isValueUnionName(inner) { return inner }
+  ""
 }
 
 // The ref-element kind for an array type-name (assumes `nameIsRefArray(name)`):
@@ -14994,6 +15033,8 @@ function nameIsRefArray(name: string): boolean {
 // element (`mStructIdx`, the scope-chain `{[string]:i32}[]`).
 function refArrElemKind(name: string): i32 {
   if nameIsMapArray(name) { return 3 }
+  // A `(string|i32)[]` value-union element list is a union-box list (kind 2).
+  if parenUnionArrElemName(name) != "" { return 2 }
   let u = 0
   while u < unNames.length {
     if name == unNames[u] + "[]" { return 2 }
@@ -15361,6 +15402,10 @@ function arrLitElemName(arrIx: i32): string {
 // name. Mirrors `refArrElemKind` but yields the table key.
 function refArrElemName(name: string): string {
   if nameIsMapArray(name) { return name.slice(0, name.length - 2) }
+  // `(string|i32)[]` → `string|i32` (the parens are annotation grouping only —
+  // the TABLE key is the bare atom-set name every other union position uses).
+  let pun = parenUnionArrElemName(name)
+  if pun != "" { return pun }
   let u = 0
   while u < unNames.length {
     if name == unNames[u] + "[]" { return unNames[u] }
@@ -16162,6 +16207,13 @@ function registerInlineUnion(stmts: i32[], name: string): i32 {
   if isValueUnionName(name) {
     return registerValueUnionName(name)
   }
+  // A `(string|i32)[]` ARRAY-of-value-union annotation registers its ELEMENT
+  // union: the list's slots hold the same `{tag, value}` boxes a bare binding
+  // does, so the box + value-box reps must be interned for it too.
+  let pun = parenUnionArrElemName(name)
+  if pun != "" {
+    return registerValueUnionName(pun)
+  }
   if !isInlineStructUnion(stmts, name) { return 0 }
   let atoms: string[] = []
   splitUnionAtoms(name, atoms)
@@ -16852,6 +16904,17 @@ function unionNameOfExpr(exprIx: i32, fnIx: i32): string {
   }
   if e is Ident {
     return unionNameOfIdent(e.identName, fnIx)
+  }
+  // `ns[i]` over a UNION-element ref list yields the element union's box (the
+  // name-typed mirror of `exprUnion`'s Index case) — so an un-annotated
+  // `const a = arr[0]` binding resolves its union name for narrowing/unboxing.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      let slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        if rlElemKindTbl[slot] == 2 { return rlElemName[slot] }
+      }
+    }
   }
   ""
 }

@@ -241,6 +241,7 @@ const RUN_CASES = [
   "soundness/return-union-narrowed-at-call-site.vl",
   "soundness/struct-union-null-is-chain-multi.vl",
   "soundness/struct-union-null-is-chain-sound.vl",
+  "soundness/union-in-array-widen-sound.vl",
   "soundness/union-triple-variant-boundary-sound.vl",
   "soundness/union-widen-ok.vl",
   "soundness/union-widen-via-return-sound.vl",
