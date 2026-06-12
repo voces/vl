@@ -16978,7 +16978,72 @@ function collectS(stmts: i32[]): i32 {
 // `uFieldNames`/`uFieldStart`/`uFieldCount`/`uFieldTypes` table (declaration order =
 // wasm field index). The struct must exist among the top-level statements and carry
 // only i32/boolean/string fields, else fails loudly. Returns 0, or -1 (via `emitFail`).
+// Parse the inline-shape variant `nm` (`{x:i32,y:string}`) into the flat
+// union-variant field tables — the variant-table twin of `collectAnnShapes`'s
+// field split (same depth-aware `,`/`:` grammar).
+function collectShapeVariantFields(nm: string): i32 {
+  let inner = nm.slice(1, nm.length - 1)
+  uFieldStart.push(uFieldNames.length)
+  let cnt = 0
+  let depth = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    let atEnd = k == inner.length
+    let brk = false
+    if !atEnd {
+      if inner[k] == '{' || inner[k] == '[' || inner[k] == '(' { depth = depth + 1 }
+      if inner[k] == '}' || inner[k] == ']' || inner[k] == ')' { depth = depth - 1 }
+      if inner[k] == ',' && depth == 0 { brk = true }
+    } else {
+      brk = true
+    }
+    if brk {
+      let part = inner.slice(start, k)
+      let ci = part.indexOf(":")
+      if ci <= 0 {
+        return emitFail("emitProgram: malformed inline union-variant shape")
+      }
+      let ftxt = part.slice(ci + 1, part.length)
+      let fc = nameFieldCode(ftxt)
+      if fc < 0 {
+        return emitFail("emitProgram: only i32 / boolean / string / array union-variant fields are supported")
+      }
+      uFieldTypes.push(fc)
+      uFieldElemName.push(shapeFieldElemName(ftxt, fc))
+      uFieldNames.push(part.slice(0, ci))
+      cnt = cnt + 1
+      start = k + 1
+    }
+    k = k + 1
+  }
+  uFieldCount.push(cnt)
+  0
+}
+
+// The ELEMENT/TARGET name a shape-text field records in `uFieldElemName`: a
+// ref-list field its element name, a nested-struct field its (non-null) target
+// name, a value-union field its atom-set name; "" otherwise.
+function shapeFieldElemName(ftxt: string, code: i32): string {
+  if code == 5 { return refArrElemName(ftxt) }
+  if code == 15 {
+    let nb = nullablePartOf(ftxt)
+    if nb != "" { return nb }
+    return ftxt
+  }
+  if code == 16 { return ftxt }
+  ""
+}
+
 function collectVariantFields(stmts: i32[], name: string): i32 {
+  // An INLINE-SHAPE variant (`{x:i32}` inside `{x:i32}|{y:i32}`) carries its
+  // fields in its own text — parse them (the annotation-shape field grammar)
+  // instead of looking for a TypeDecl.
+  if name.length >= 2 {
+    if name[0] == '{' && name[1] != '[' && name[name.length - 1] == '}' {
+      return collectShapeVariantFields(name)
+    }
+  }
   let i = 0
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
@@ -17301,7 +17366,17 @@ function isInlineStructUnion(stmts: i32[], name: string): boolean {
   let j = 0
   while j < atoms.length {
     if atoms[j] != "null" {
-      if !isDeclaredStructName(stmts, atoms[j]) { return false }
+      if !isDeclaredStructName(stmts, atoms[j]) {
+        // An INLINE-SHAPE member (`{x:i32}` in `{x:i32}|{y:i32}`) is a struct
+        // variant too — its fields parse from its own text. A map shape
+        // (`{[…]}`) is not.
+        let aj = atoms[j]
+        let shapeOk = false
+        if aj.length >= 2 {
+          if aj[0] == '{' && aj[1] != '[' && aj[aj.length - 1] == '}' { shapeOk = true }
+        }
+        if !shapeOk { return false }
+      }
       structAtoms = structAtoms + 1
     }
     j = j + 1

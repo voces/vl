@@ -358,6 +358,7 @@ const RUN_CASES = [
   "types/or-guard-narrowing.vl",
   "types/recursive-array-element.vl",
   "types/recursive-tree.vl",
+  "types/ref-union.vl",
   "types/struct-union-same-shape.vl",
   "types/union-narrowed-helper-recursion.vl",
   "types/union-narrowing.vl",
