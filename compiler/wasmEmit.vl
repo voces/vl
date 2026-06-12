@@ -4922,6 +4922,19 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
         return 0
       }
     }
+    // `p is { x: i32 }` / `p is S` over a NICHE nullable struct (`S | null` — one
+    // struct member, a nullable REF not a box): the checker already proved the
+    // tested shape matches the struct member, so the only runtime distinction is
+    // null vs non-null — the test lowers to `!ref.is_null` (host: the nullable's
+    // non-null narrowing test).
+    if nd0.isVariant != "null" {
+      if exprNullableStruct(nd0.isObj, fnIx) {
+        if emitExpr(body, nd0.isObj, fnIx) < 0 { return 0 - 1 }
+        wU8(209)             // 0xd1 ref.is_null
+        fbI32Eqz()           // 0x45 → non-null
+        return 0
+      }
+    }
   }
   // `x is i32` / `x is string` / … over a BOXED value union: the same box-tag
   // compare as a struct variant, against the atom's globally-stable scalar tag.
@@ -9144,7 +9157,66 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
     }
     return emitFail("emitProgram: function literal not lifted")
   }
+  if e is IfStmt {
+    // An IF-EXPRESSION in value position (`if c then 7 else 9` — the parser wraps
+    // each arm as a one-statement Block; an `elseif` chain nests an IfStmt in the
+    // else slot). Lowered as `if (result i32)` over the arm VALUES.
+    return emitIfExpr(body, exprIx, fnIx)
+  }
   emitFail("emitProgram: unsupported expression in return")
+}
+
+// Lower an if-EXPRESSION (`if c then a else b` in value position) onto `body`:
+// cond, `if (result i32)`, the then-arm VALUE, `else`, the else-arm VALUE (an
+// `elseif` chain recurses), `end`. Each arm applies the same condition narrowing
+// the statement form does. Restricted to i32-rep arm values (the single-byte
+// blocktype); a missing else / non-value arm fails loudly — the checker already
+// proved both arms exist and agree for a value-position `if`.
+function emitIfExpr(body: i32[], ifIx: i32, fnIx: i32): i32 {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse < 0 {
+      return emitFail("emitProgram: if-expression requires an else arm")
+    }
+    if emitExpr(body, s.ifCond, fnIx) < 0 { return 0 - 1 }
+    fbIf(127)                  // 0x04 if, 0x7f i32 result blocktype
+    let savedTop = narrowTop
+    let narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    let rcT = emitBlockValue(body, s.ifThen, fnIx)
+    if narrowed { restoreNarrow(savedTop) }
+    if rcT < 0 { return 0 - 1 }
+    fbElse()                   // 0x05 else
+    let savedElseTop = narrowTop
+    let narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
+    let els = P.nodes[s.ifElse]
+    let rc = 0
+    if els is IfStmt {
+      rc = emitIfExpr(body, s.ifElse, fnIx)
+    } else {
+      rc = emitBlockValue(body, s.ifElse, fnIx)
+    }
+    if narrowedElse { restoreNarrow(savedElseTop) }
+    if rc < 0 { return 0 - 1 }
+    fbEnd()                    // 0x0b end
+    return 0
+  }
+  emitFail("emitProgram: expected an if expression")
+}
+
+// The VALUE of an if-expression arm (the parser wraps `then <expr>` as a Block of
+// ONE statement): its single tail-value statement, emitted as an expression.
+function emitBlockValue(body: i32[], blockIx: i32, fnIx: i32): i32 {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    if stmts.length == 1 {
+      if stmtIsTailValue(stmts[0]) {
+        return emitExpr(body, stmts[0], fnIx)
+      }
+    }
+    return emitFail("emitProgram: if-expression arm is not a single value")
+  }
+  emitFail("emitProgram: if-expression arm is not a block")
 }
 
 // Peel any nested parentheses, returning the innermost wrapped expression index.
