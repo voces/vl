@@ -4545,6 +4545,12 @@ function pushFieldStorage(code: i32, refSlot: i32): i32 {
     // (`next: Node|null`) terminate. Forward indices resolve in the shared rec group.
     wU8(99)                    // 0x63 (ref null ht)
     wSLEB(sHeapIdx[refSlot])
+  } else if code == 16 {
+    // A VALUE-UNION field (`y: string | i32`): a non-null ref to the shared
+    // union box — a `null` MEMBER rides the box's tag, never a null field ref.
+    // The box's heap index is a forward reference inside the shared rec group.
+    wU8(100)                   // 0x64 (ref ht)
+    wSLEB(uBoxIdx)
   } else {
     wU8(127)                   // 0x7f i32 storagetype
   }
@@ -4666,7 +4672,14 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
       if scode == 15 {
         pendingStructIdx = structIndexByName(sFieldElemNameAt(si, fi))
       }
-      if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+      // A VALUE-UNION field (code 16) coerces a raw scalar/string/null value into
+      // the box (`{ y: 5 }` against `{ y: string | i32 }` boxes the 5 with its
+      // atom tag); a union-valued field expression passes through unchanged.
+      if scode == 16 {
+        if emitUnionCoerce(body, sFieldElemNameAt(si, fi), valIx, fnIx) < 0 { return 0 - 1 }
+      } else {
+        if emitExpr(body, valIx, fnIx) < 0 { return 0 - 1 }
+      }
       if scode == 15 { pendingStructIdx = savedPSI }
       pendingListKind = 0
       fi = fi + 1
@@ -4837,6 +4850,24 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32): i32 {
         if unionNameOfIdent(vrecv.identName, fnIx) != "" {
           if emitUnionBoxPush(body, vrecv.identName, fnIx) < 0 { return 0 - 1 }
           fbStructGet(uBoxIdx, 0)  // 0xfb 0x02 <box ht> field 0: tag
+          fbI32Const(scalarTagOf(ndv.isVariant))
+          fbI32Bin(70)             // 0x46 i32.eq
+          return 0
+        }
+      }
+      // `o.y is i32` over a UNION-typed struct FIELD (code 16): read the field's
+      // box (recovering a nullable receiver first) and compare its tag — the
+      // member-path narrowing's runtime test.
+      if vrecv is Member {
+        if memberUnionFieldName(unwrapParen(ndv.isObj), fnIx) != "" {
+          let msi = structIndexOfExpr(vrecv.memObj, fnIx)
+          let mfi = sFieldIndex(msi, vrecv.memProp)
+          if emitExpr(body, vrecv.memObj, fnIx) < 0 { return 0 - 1 }
+          if exprNullableStruct(vrecv.memObj, fnIx) {
+            wU8(212)               // 0xd4 ref.as_non_null
+          }
+          fbStructGet(sHeapIdx[msi], mfi)  // the field's box
+          fbStructGet(uBoxIdx, 0)          // field 0: tag
           fbI32Const(scalarTagOf(ndv.isVariant))
           fbI32Bin(70)             // 0x46 i32.eq
           return 0
@@ -5043,6 +5074,34 @@ function memNarrowVariantIndex(memIx: i32): i32 {
 
 // Lower a field read `recv.field` onto `body`: evaluate the receiver (must be a
 // struct), then `struct.get $0 <fieldidx>` (`0xfb 0x02 0x00 idx`).
+// The narrowing-stack KEY of a one-level member path (`o.y` over a plain Ident
+// receiver) — the same string `setNarrowFromCond` pushes for a union-FIELD
+// `is`/null guard. "" for any other receiver shape (no path narrowing).
+function memberPathKeyOf(memIx: i32): string {
+  let m = P.nodes[memIx]
+  if m is Member {
+    let r = P.nodes[unwrapParen(m.memObj)]
+    if r is Ident { return r.identName + "." + m.memProp }
+  }
+  ""
+}
+
+// The VALUE-union name of a union-typed struct FIELD read `o.y` (field code 16),
+// or "" when the member is not a union-box field.
+function memberUnionFieldName(memIx: i32, fnIx: i32): string {
+  let m = P.nodes[memIx]
+  if m is Member {
+    let si = structIndexOfExpr(m.memObj, fnIx)
+    if si >= 0 {
+      let fi = sFieldIndex(si, m.memProp)
+      if fi >= 0 {
+        if sFieldTypeAt(si, fi) == 16 { return sFieldElemNameAt(si, fi) }
+      }
+    }
+  }
+  ""
+}
+
 function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
   // A field read on a NARROWED union identifier downcasts through the box (G1).
   if memIsNarrowed(memIx) {
@@ -5086,6 +5145,26 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32): i32 {
       wU8(212)               // 0xd4 ref.as_non_null
     }
     fbStructGet(sHeapIdx[si], idx)   // 0xfb 0x02 <struct ht> <field index>
+    // A UNION-typed field (code 16) read while the member PATH is narrowed to one
+    // scalar atom (`if o.y is i32 { … o.y … }`) unboxes the payload — the same
+    // recovery as a narrowed union IDENT read. An un-narrowed read is the box.
+    if sFieldTypeAt(si, idx) == 16 {
+      let mAtom = narrowVariantFor(memberPathKeyOf(memIx))
+      let mk = valueAtomKind(mAtom)
+      if mk >= 0 && mk != 6 {
+        fbStructGet(uBoxIdx, 1)      // field 1: value (anyref)
+        if mAtom == "string" {
+          fbRefCast(aTypeIdx)        // the payload IS the string array ref
+        } else {
+          let mvb = vbHeapIdxOfAtom(mAtom)
+          if mvb < 0 {
+            return emitFail("emitProgram: narrowed union field atom has no value box")
+          }
+          fbRefCast(mvb)
+          fbStructGet(mvb, 0)        // the scalar payload
+        }
+      }
+    }
     return 0
   }
   emitFail("emitProgram: expected a field access")
@@ -10379,6 +10458,28 @@ function setNarrowFromCond(condIx: i32, fnIx: i32): boolean {
         return true
       }
     }
+    // `o.y is T` over a UNION-typed struct FIELD narrows the member PATH (the
+    // narrowing key is the path string `o.y`; `emitMem` unboxes under it).
+    let mrecv = P.nodes[unwrapParen(c.isObj)]
+    if mrecv is Member {
+      if memberUnionFieldName(unwrapParen(c.isObj), fnIx) != "" {
+        let mk = memberPathKeyOf(unwrapParen(c.isObj))
+        if mk != "" {
+          pushNarrow(mk, c.isVariant)
+          return true
+        }
+      }
+    }
+  }
+  // `a && b` composes: the then-branch sees BOTH conjuncts' narrowings (the
+  // host's A5 — the RHS is even CHECKED under the LHS's narrowing). The pushes
+  // stack; the caller's save/restore of `narrowTop` unwinds them together.
+  if c is BinExpr {
+    if c.binOp == "&&" {
+      let nl = setNarrowFromCond(c.binLeft, fnIx)
+      let nr = setNarrowFromCond(c.binRight, fnIx)
+      return nl || nr
+    }
   }
   // `x == null` / `x != null` over a BOXED VALUE union narrows the THEN-branch:
   // `==` pins `x` to the `null` member; `!=` strips `null` from the current set
@@ -12037,10 +12138,16 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
 // "S|null" / "null|S" (exactly TWO `|` parts, one of them `null`) → the non-null
 // part's name, or "" when the name is not a two-part nullable.
 function nullablePartOf(name: string): string {
+  // Depth-aware: a `|` INSIDE an inline shape (`{y:string|i32}|null`) is part of
+  // the FIELD's union, not the nullable wrapper — only a depth-0 bar splits.
   let bar = 0 - 1
+  let depth = 0
   let i = 0
   while i < name.length {
-    if name[i] == '|' {
+    let ch = name[i]
+    if ch == '{' || ch == '[' { depth = depth + 1 }
+    if ch == '}' || ch == ']' { depth = depth - 1 }
+    if ch == '|' && depth == 0 {
       if bar < 0 { bar = i }
     }
     i = i + 1
@@ -14905,6 +15012,11 @@ function nameFieldCode(t: string): i32 {
     if nameIsStringArray(t) { return 6 }
     return 5
   }
+  // A VALUE-union field (`y: string | i32`) stores the union BOX ref (code 16);
+  // its union name rides `sFieldElemName` (the tag set + value-box reps).
+  // Checked before the nullable-struct strip (`i32|null` is a value union, not
+  // a nullable struct name).
+  if isValueUnionName(t) { return 16 }
   let base = t
   let nb = nullablePartOf(base)
   if nb != "" { base = nb }
@@ -14935,9 +15047,12 @@ function collectAnnShapes(): i32 {
       if nm.length >= 2 {
         if nm[0] == '{' && nm[1] != '[' && nm[nm.length - 1] == '}' {
           let inner = nm.slice(1, nm.length - 1)
-          // Split `x:i32,y:string` into names + codes at depth 0.
+          // Split `x:i32,y:string` into names + codes at depth 0. `texts` keeps
+          // each field's raw type TEXT (a code-16 union field interns its union
+          // and records the name in `sFieldElemName`).
           let names: string[] = []
           let codes: i32[] = []
+          let texts: string[] = []
           let ok = true
           let depth = 0
           let start = 0
@@ -14959,10 +15074,12 @@ function collectAnnShapes(): i32 {
               if ci <= 0 {
                 ok = false
               } else {
-                let fc = nameFieldCode(part.slice(ci + 1, part.length))
+                let ftxt = part.slice(ci + 1, part.length)
+                let fc = nameFieldCode(ftxt)
                 if fc < 0 { ok = false }
                 names.push(part.slice(0, ci))
                 codes.push(fc)
+                texts.push(ftxt)
               }
               start = k + 1
             }
@@ -14981,7 +15098,15 @@ function collectAnnShapes(): i32 {
               while pi < codes.length {
                 sFieldNames.push(names[pi])
                 sFieldTypes.push(codes[pi])
-                sFieldElemName.push("")
+                if codes[pi] == 16 {
+                  // The union FIELD's name keys its atom set; registering it
+                  // interns the shared box + the value-box reps it needs (this
+                  // runs after `collectU`, but before any type-index math).
+                  sFieldElemName.push(texts[pi])
+                  registerValueUnionName(texts[pi])
+                } else {
+                  sFieldElemName.push("")
+                }
                 pi = pi + 1
               }
             }
@@ -15397,6 +15522,22 @@ function removeAtomFrom(set: string, removed: string): string {
   out
 }
 
+// Register the VALUE union `name` in the per-union table (no variant structs —
+// its atoms tag via `scalarTagOf`, its payloads ride the shared value boxes).
+// Idempotent; a non-value-union name is a no-op. Callable from any collection
+// phase (it reads no statement table) — `collectAnnShapes` registers a union
+// FIELD's atom set through it after `collectU` has run.
+function registerValueUnionName(name: string): i32 {
+  if isUName(name) { return 0 }
+  if !isValueUnionName(name) { return 0 }
+  uDeclared = true
+  unNames.push(name)
+  unVarStart.push(uVariants.length)
+  unVarCount.push(0)
+  markValueUnionAtoms(name)
+  0
+}
+
 // Mark the per-rep value-box usage flags for every scalar atom of the value union
 // `name` (registration-time, so `mAssignTypeIndices` interns exactly the used reps).
 function markValueUnionAtoms(name: string): i32 {
@@ -15468,12 +15609,7 @@ function registerInlineUnion(stmts: i32[], name: string): i32 {
   // its variant slice is empty. Registering interns the shared box (`uDeclared`)
   // and the per-rep value boxes it needs.
   if isValueUnionName(name) {
-    uDeclared = true
-    unNames.push(name)
-    unVarStart.push(uVariants.length)
-    unVarCount.push(0)
-    markValueUnionAtoms(name)
-    return 0
+    return registerValueUnionName(name)
   }
   if !isInlineStructUnion(stmts, name) { return 0 }
   let atoms: string[] = []
