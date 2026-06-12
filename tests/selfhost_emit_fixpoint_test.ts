@@ -253,9 +253,22 @@ const firstDiff = (
   return undefined;
 };
 
+// F-tiers: this V8-side fixpoint is REDUNDANT with the native one — ci-native's
+// `native-fixpoint.sh` proves stage3 == stage4 byte-for-byte over the WHOLE
+// compiler (a strictly larger input than the 14 goldens) on every run, and the
+// golden byte-pin itself is asserted by `selfhost_emit_program_test.ts`. Its
+// marginal value is catching a V8-vs-wasmtime divergence in the self-compiled
+// emitter — gate it behind `SELFHOST_DENO_RUN=1` (the deno-side bisect tier)
+// rather than pay its ~100s cold assembly compile on every compiler-touching
+// run.
+const DENO_RUN = Deno.env.get("SELFHOST_DENO_RUN") === "1";
+
 GOLDENS.forEach((g, which) => {
   Deno.test(
-    `emit-fixpoint: M_self emits ${g.name} byte-identical to the host golden`,
+    {
+      name: `emit-fixpoint: M_self emits ${g.name} byte-identical to the host golden`,
+      ignore: !DENO_RUN,
+    },
     async () => {
       const emitter = await buildSelfEmitter();
       const rc = emitter.runEmit(which);

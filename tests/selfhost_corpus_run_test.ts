@@ -758,7 +758,10 @@ entries.forEach((e, idx) => {
 // fails to instantiate (V8 is lenient and accepts either). This decodes a real
 // emitted print module and asserts every imported func's type index lands AFTER the
 // rec group's members — the invariant that keeps self-hosted output portable.
-Deno.test("corpus-run: emitted print imports use STANDALONE functypes (wasmtime-portable)", async () => {
+Deno.test({
+  name: "corpus-run: emitted print imports use STANDALONE functypes (wasmtime-portable)",
+  ignore: !DENO_RUN,
+}, async () => {
   const exp = await getPipeline();
   // LEB128 reader over a byte array, threaded position.
   const uleb = (b: Uint8Array, p: number): [number, number] => {
@@ -846,9 +849,22 @@ const getDiagMsg = (
   return String.fromCodePoint(...cps);
 };
 
+// F-tiers: like the RUN tier above, the check→emit verdicts and the functype
+// invariant are gated to the deno-side bisect tier — NOT because they are
+// individually expensive, but because any always-on test in this file forces
+// the full assembly compile (~107s cold; the assembly embeds wasmEmit.vl plus
+// every corpus source) on every compiler-touching run. Coverage stands
+// elsewhere: corpus check verdicts in `selfhost_corpus_test.ts` (A1, cheap) +
+// the native align REJECT tier; emit behavior in the native align RUN tier +
+// sweep; and the functype-portability invariant is enforced de facto by the
+// entire native suite (wasmtime refuses to instantiate a print module whose
+// import functypes sit inside the rec group).
 CHECK_EMIT_CASES.forEach((c, idx) => {
   if (c.kind === "emit") {
-    Deno.test(`check→emit: ${c.key} type-checks clean, emits, runs`, async () => {
+    Deno.test({
+      name: `check→emit: ${c.key} type-checks clean, emits, runs`,
+      ignore: !DENO_RUN,
+    }, async () => {
       const exp = await getPipeline();
       const st = exp.runCheckEmit(idx);
       if (st !== 0) {
@@ -876,7 +892,10 @@ CHECK_EMIT_CASES.forEach((c, idx) => {
       await c.run(caller);
     });
   } else {
-    Deno.test(`check→emit: ${c.key} is REJECTED by the type-checker (gate blocks emit)`, async () => {
+    Deno.test({
+      name: `check→emit: ${c.key} is REJECTED by the type-checker (gate blocks emit)`,
+      ignore: !DENO_RUN,
+    }, async () => {
       const exp = await getPipeline();
       const st = exp.runCheckEmit(idx);
       if (st !== 2) {

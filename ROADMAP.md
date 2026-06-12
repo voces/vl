@@ -312,11 +312,15 @@ from current `compiler/*.vl` in ~3s.*
   the past wins/abandons live in `docs/perf-findings.md` + `CHANGELOG.md`. REMAINING:
   - ⬜ **F9b. Cache / clone binaryen IR across selfhost sub-tests** — LOW priority (the dominant
     cost fell with the F9c memoize; binaryen modules are not trivially cloneable).
-  - 🟡 **F-tiers. Collapse the redundant corpus runner.** REMAINING: delete the gated deno-side
-    RUN half (`SELFHOST_DENO_RUN=1`) + its 305-file whitelist outright once the native tier is
-    the undisputed runner; fold the deno-side CHECK verdicts the same way when the native checker
-    gates message/span parity. (Gating, parallel sweep, and the ci-native seed cache + ~3s
-    refresh path → `CHANGELOG.md`.)
+  - 🟡 **F-tiers. Collapse the redundant corpus runner.** REMAINING: delete the
+    `SELFHOST_DENO_RUN`-gated tiers (the corpus RUN half + its 305-file whitelist, the check→emit
+    verdicts, the V8-side golden fixpoint) outright once the native tier is the undisputed runner;
+    fold the deno-side CHECK verdicts the same way when the native checker gates message/span
+    parity; consider a NATIVE golden byte-tripwire (vl build each golden + cmp, <1s in ci-native)
+    so `selfhost_emit_program_test` can ride down with the TS emitter. Also: the single-unit
+    assembly compile is SUPERLINEAR in the TS host (~5s as a 2-module graph vs ~100s concatenated
+    — wasmEmit.vl is the multiplier); worth a profile if any big assembly survives. (Landed so
+    far → `CHANGELOG.md`: gating, parallel sweep, seed cache + ~3s refresh, graph-compile caching.)
 
 ---
 
@@ -347,23 +351,21 @@ independent).*
   - **Deferred:** import maps, namespace/default imports, export-all, re-exports.
 - 🟡 **H2. Make VL expressive enough to write a compiler.** REMAINING: maps (B6a), enum tag for
   literal-unions (A16).
-- 🟡 **H3. The self-host compiler (`compiler/*.vl`) — close the coverage tail.** The port is REAL:
-  the five modules (lexer/ast/parser/typecheck/wasmEmit + `scripts/vl-compiler-driver.vl`) compile
-  THEMSELVES to a byte-exact native fixpoint (stage3 == stage4, `scripts/native-fixpoint.sh`, gated
-  in CI by `ci-native`); the 14 emit goldens are byte-frozen; the corpus tiers pin behavior
-  (run-whitelist 154/304 `@run` files, native-align 236 cases asserting native == host). REMAINING
-  — the measured coverage tail (`docs/selfhost-corpus-paydown-findings.md` re-ranks the buckets):
-  - **Emit gaps** — `.map`/`.filter`/HOF lowering (the next slice; the function-value ABI landed
-    #306/#310), struct equality (loud-fail today; field-wise lowering + the closure identity
-    token), remaining `for…in` variants, scratch-needing top-level statements, the emitter-trap
-    pins (real bugs, pin each).
-  - **Checker false-rejects** — generics and literal-unions are the two big scoped tracks; the
-    rest is a long tail of narrow rules (each verified against the host before changing).
-  - **Parse gaps** — the long tail of surface forms.
-  - **Real import/export for the `.vl` modules** — retire the concat + symbol-rename glue (the
-    assembly renames the lexer's colliding `Tok`/`Diag`/`advance`; the H0 phase-1 substrate exists).
+- 🟡 **H3. The self-host compiler (`compiler/*.vl`).** Corpus parity REACHED (sweep 312/316, the
+  residue is the parked soundness xfails — see "Kill the TS host" in Next; history →
+  `CHANGELOG.md`). The port compiles ITSELF to a byte-exact native fixpoint (stage3 == stage4,
+  `scripts/native-fixpoint.sh`, ~6s, gated in CI by `ci-native`). REMAINING:
+  - **Real import/export for the `.vl` BUILD** — retire the concat + symbol-rename glue (the
+    assembly renames the lexer's colliding `Tok`/`Diag`/`advance`). Import HEADERS landed (every
+    compiler file checks as a module — LSP/`vl check` clean); switching the BUILD waits on the
+    post-parity module revisit (symbol-based resolution — don't bet the compiler on the rename
+    walker; → `docs/native-modules-design.md` §Post-parity revisit).
   - **Spans** — continue the rungs (rung 1 = token positions; rung 2 = native `path:line:col:`
-    diagnostics, #312) so more diagnostics carry real positions.
+    diagnostics, #312; rung 3 = end positions for LSP ranges, `diagEndCol`) so more diagnostics
+    carry real positions; message/span parity gates the deno-CHECK-tier deletion (F-tiers).
+  - **The untested emitter long tail** — each fails loudly (nullable lists beyond `i32[]|null`,
+    map-typed params / nullable map fields, struct-union `==`, `?.` beyond i32/boolean leaves,
+    …); burned down demand-driven as real VL code (std, the compiler) hits them.
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/selfhost-gaps.md` §H4.1)
@@ -397,6 +399,6 @@ independent).*
 - ⬜ **H5. Versioning — deferred; rustup/Volta model, not nvm** (→ `DECISIONS.md`). Make the H-M1
   install path version-stamped so a launcher can slot in later.
 
-**Sequence:** H3 coverage tail (lambda HOF slices → corpus pay-down → struct equality) → real
-import/export for the `.vl` modules → C5/H-M1 distribution (anytime, decoupled) → H-M2 host swap
-(kill the interim Rust host once the WASI driver lands). Cost is dominated by the H3 tail.
+**Sequence:** kill-the-TS-host staging (LSP-on-wasm stages → tier deletion → `std:` Phase 2) →
+real import/export for the `.vl` build (post module-revisit) → C5/H-M1 distribution (anytime,
+decoupled) → H-M2 host swap (kill the interim Rust host once the WASI driver lands).
