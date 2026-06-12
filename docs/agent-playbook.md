@@ -46,8 +46,10 @@ To diagnose invalid emitted wasm:
   the checker got more permissive).
 - Before finishing: `deno test -A --no-check tests/selfhost_emit_fixpoint_test.ts`
   must be 14/14. Read real output (`grep -E "passed|failed"`), never `tail -1`.
-- If you add an `is <Node>` narrowing on a new node type, add it to the
-  import list in `tests/selfhost_wasm_emit_test.ts`.
+- If you add an `is <Node>` narrowing on a new node type, OR call any
+  `ast.vl` helper (`mk*`, etc.) not already imported there, add it to the
+  import list in `tests/selfhost_wasm_emit_test.ts` and RUN that test —
+  three slices have now tripped on this.
 
 ## Known landmines
 - The FNV constant `0 - 2128831035` in wasmEmit.vl is deliberately

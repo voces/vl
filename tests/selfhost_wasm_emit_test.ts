@@ -62,7 +62,7 @@ const runFixture = (): Promise<string[]> =>
     // narrows with `is` checks — the module system resolves these to ast.vl's
     // exported surface.
     const driverSrc =
-      `import { P, i32ToStr, mkStr, mkTypeRef, mkParam, mkFunc, mkIdent, mkCall, mkMember } from "./ast"\n` +
+      `import { P, i32ToStr, mkStr, mkTypeRef, mkParam, mkFunc, mkIdent, mkCall, mkMember, mkBinary } from "./ast"\n` +
       `import {\n` +
       `  ArrayLit,\n` +
       `  BinExpr,\n` +
