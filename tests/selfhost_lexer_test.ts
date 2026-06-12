@@ -16,10 +16,9 @@
 // to split. The sample case reads its driver from the standalone fixture
 // (`tests/selfhost/lexer_harness.vl`) verbatim at runtime.
 
-import { compileProgram, runWasm } from "../compiler/compile.ts";
-import { createOptimizeCache } from "../compiler/buildCache.ts";
+import { runWasm } from "../compiler/compile.ts";
+import { compileProgramCached } from "./_selfhost_cache.ts";
 
-const optimizeCache = createOptimizeCache();
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
@@ -229,15 +228,7 @@ const runAll = (): Promise<Map<number, string[]>> =>
       [DRIVER]: driver,
       [LEXER]: Deno.readTextFileSync(LEXER),
     };
-    const readSource = (key: string): string | undefined => sources[key];
-    const { wasm, diagnostics } = await compileProgram(
-      DRIVER,
-      readSource,
-      DRIVER,
-      {
-        optimizeCache: await optimizeCache,
-      },
-    );
+    const { wasm, diagnostics } = await compileProgramCached(DRIVER, sources);
     const errors = diagnostics.filter((d) => d.severity === "error");
     if (errors.length > 0 || !wasm) {
       throw new Error(

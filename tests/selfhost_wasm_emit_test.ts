@@ -22,16 +22,15 @@
 // PERF (compile-once): both test cases drive the IDENTICAL module; the driver is
 // compiled and run ONCE (memoized). The logs carry a `const:` line and an `id:`
 // line; each `Deno.test` pulls its own line. binaryen `optimize()` still runs
-// once — the `optimizeCache` is passed through.
+// once — whole-compile cached via `compileProgramCached`.
 
-import { compileProgram, runWasm } from "../compiler/compile.ts";
-import { createOptimizeCache } from "../compiler/buildCache.ts";
+import { runWasm } from "../compiler/compile.ts";
+import { compileProgramCached } from "./_selfhost_cache.ts";
 
 // Reuse binaryen's `optimize()` output across runs for any module whose
 // pre-optimize bytes are unchanged (~40% of a compile). Keyed on unoptimized
 // bytes + binaryen version; a compiler change busts only the modules whose
 // codegen output changed.
-const optimizeCache = createOptimizeCache();
 
 // Resolved keys for the on-disk modules and the in-memory driver.
 const compilerUrl = (name: string) =>
@@ -116,10 +115,7 @@ const runFixture = (): Promise<string[]> =>
       [DRIVER]: driverSrc,
       [AST]: Deno.readTextFileSync(AST),
     };
-    const read = (key: string): string | undefined => sources[key];
-    const { wasm, diagnostics } = await compileProgram(DRIVER, read, DRIVER, {
-      optimizeCache: await optimizeCache,
-    });
+    const { wasm, diagnostics } = await compileProgramCached(DRIVER, sources);
     const errors = diagnostics.filter((d) => d.severity === "error");
     if (errors.length > 0 || !wasm) {
       throw new Error(

@@ -16,10 +16,9 @@
 // (resetting the parser arena `P` first) behind a `@@N` sentinel so the host can split
 // the single run's log.
 
-import { compileProgram, runWasm } from "../compiler/compile.ts";
-import { createOptimizeCache } from "../compiler/buildCache.ts";
+import { runWasm } from "../compiler/compile.ts";
+import { compileProgramCached } from "./_selfhost_cache.ts";
 
-const optimizeCache = createOptimizeCache();
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
@@ -299,15 +298,7 @@ const runAll = (): Promise<Map<number, string[]>> =>
       [AST]: Deno.readTextFileSync(AST),
       [PARSER]: Deno.readTextFileSync(PARSER),
     };
-    const readSource = (key: string): string | undefined => sources[key];
-    const { wasm, diagnostics } = await compileProgram(
-      DRIVER,
-      readSource,
-      DRIVER,
-      {
-        optimizeCache: await optimizeCache,
-      },
-    );
+    const { wasm, diagnostics } = await compileProgramCached(DRIVER, sources);
     const errors = diagnostics.filter((d) => d.severity === "error");
     if (errors.length > 0 || !wasm) {
       throw new Error(

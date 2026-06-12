@@ -30,14 +30,13 @@
 // typecheck runs on every case, and binaryen `optimize()` still runs — once), a
 // fraction of the time.
 
-import { compileProgram, runWasm } from "../compiler/compile.ts";
-import { createOptimizeCache } from "../compiler/buildCache.ts";
+import { runWasm } from "../compiler/compile.ts";
+import { compileProgramCached } from "./_selfhost_cache.ts";
 
 // Reuse binaryen's `optimize()` output across runs for any module whose pre-optimize
 // bytes are unchanged (optimize is ~40% of a compile). The graph driver path takes
 // the same optimize cache the single-string self-host tests use; whole-compile
 // caching does not apply here (that tier is keyed on a single source string).
-const optimizeCache = createOptimizeCache();
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual, null, 2);
@@ -172,10 +171,7 @@ const runAll = (): Promise<Map<string, string[]>> =>
       [PARSER]: Deno.readTextFileSync(PARSER),
       [TYPECHECK]: Deno.readTextFileSync(TYPECHECK),
     };
-    const read = (key: string): string | undefined => sources[key];
-    const { wasm, diagnostics } = await compileProgram(DRIVER, read, DRIVER, {
-      optimizeCache: await optimizeCache,
-    });
+    const { wasm, diagnostics } = await compileProgramCached(DRIVER, sources);
     const errors = diagnostics.filter((d) => d.severity === "error");
     if (errors.length > 0 || !wasm) {
       throw new Error(

@@ -17,7 +17,11 @@
 //
 // Test-only glue: the production `compile()`/`toWasm()` path is untouched.
 
-import { compile, type VLDiagnostic } from "../compiler/compile.ts";
+import {
+  compile,
+  compileProgram,
+  type VLDiagnostic,
+} from "../compiler/compile.ts";
 import {
   cacheKey,
   createOptimizeCache,
@@ -55,6 +59,39 @@ export const compileCached = async (source: string): Promise<CachedCompile> => {
   const { wasm, diagnostics } = await compile(source, "source.vl", {
     optimizeCache: await optimizeCache,
   });
+  if (wasm && !diagnostics.some((d) => d.severity === "error")) {
+    writeCachedBlob(key, wasm);
+  }
+  return { wasm, diagnostics };
+};
+
+/**
+ * Like `compileProgram(entry, reader, entry, …)` over an IN-MEMORY source map,
+ * but whole-compile cached — the module-graph sibling of `compileCached`. The
+ * graph-driven suites (lexer/parser/typecheck/pipeline/wasm_emit) previously
+ * paid their full front-end compile on EVERY run (~10–13s each warm; only the
+ * optimize() stage was cached): the wasm is a pure function of (entry, every
+ * module source, compiler code), so it caches exactly like the single-unit
+ * assemblies. Only clean compiles are cached.
+ */
+export const compileProgramCached = async (
+  entryKey: string,
+  sources: Record<string, string>,
+): Promise<CachedCompile> => {
+  const material = entryKey + "\u0000" +
+    Object.keys(sources).sort().map((k) => `${k}\u0000${sources[k]}`).join(
+      "\u0000",
+    );
+  const key = `${await cacheKey("selfhost-graph", material)}.wasm`;
+  const cached = readCachedBlob(key);
+  if (cached) return { wasm: cached, diagnostics: [] };
+
+  const { wasm, diagnostics } = await compileProgram(
+    entryKey,
+    (k: string) => sources[k],
+    entryKey,
+    { optimizeCache: await optimizeCache },
+  );
   if (wasm && !diagnostics.some((d) => d.severity === "error")) {
     writeCachedBlob(key, wasm);
   }
