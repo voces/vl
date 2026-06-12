@@ -46,7 +46,7 @@
 // `P.nodes` arena the checker walks), the int→string helper, and every `Node`
 // variant type the single `checkNode` visitor `is`-narrows. The checker's own
 // `Ty` type algebra stays PRIVATE to this module.
-import { P, i32ToStr, nodeToks } from "./ast"
+import { P, i32ToStr, nodeToks, hasNamedArgs, orderArgsByParamNames } from "./ast"
 import {
   NumLit,
   StrLit,
@@ -3340,6 +3340,58 @@ function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32): i32 {
 // call's type, or -1 when no matching function exists (the caller reports its
 // own "no method"/"no field" error). Mirrors the general call path's pending-
 // return demand-inference; generic (TyVar) self-functions are not dispatched.
+// The declared parameter NAMES of the top-level function `name` (via its
+// `FuncDecl` in `fnDeclIx`), or an empty list when no declaration is known (an
+// undeclared name, or a closure-valued binding — `TyFunc` carries no parameter
+// names, so NAMED arguments resolve only against a declared function).
+function fnParamNamesOf(name: string): string[] {
+  let out: string[] = []
+  let dIx = fnDeclIx[name] ?? -1
+  if dIx >= 0 {
+    let d = P.nodes[dIx]
+    if d is FuncDecl {
+      let ps = d.fnParams
+      let i = 0
+      while i < ps.length {
+        let p = P.nodes[ps[i]]
+        if p is Param { out.push(p.parName) }
+        i = i + 1
+      }
+    }
+  }
+  out
+}
+
+// Bind a call's arguments into PARAMETER order when any is NAMED (`f(b: 1,
+// a: 2)`), mirroring the host's `orderArgumentsByParameters`: named args fill
+// their parameter's slot, positionals fill the remaining slots in order.
+// Returns the VALUE-node indices in parameter order, or an empty list on a
+// binding failure (an unknown/duplicate name — diagnosed here). `paramNames`
+// must align 1:1 with the checked parameter types (the UFCS path passes the
+// names AFTER `self`, since the receiver fills slot 0 separately).
+function orderNamedCallArgs(paramNames: string[], args: i32[], argNames: string[], ix: i32): i32[] {
+  let bad: i32[] = []
+  if paramNames.length != args.length {
+    // Arity is diagnosed by the caller; just refuse to reorder.
+    tErr("named arguments require a declared function with matching arity", ix)
+    return bad
+  }
+  let ordered = orderArgsByParamNames(paramNames, args, argNames)
+  if ordered.length != paramNames.length {
+    tErr("named argument does not match a parameter", ix)
+    return bad
+  }
+  let i = 0
+  while i < ordered.length {
+    if ordered[i] < 0 {
+      tErr("named argument does not match a parameter", ix)
+      return bad
+    }
+    i = i + 1
+  }
+  ordered
+}
+
 function ufcsCallTy(name: string, recvTy: i32, n: Call, ix: i32): i32 {
   let fnTy = lookup(name)
   if fnTy < 0 { return -1 }
@@ -3364,6 +3416,25 @@ function ufcsCallTy(name: string, recvTy: i32, n: Call, ix: i32): i32 {
     let args = n.callArgs
     if params.length != args.length + 1 { return -1 }
     if !assignable(recvTy, params[0]) { return -1 }
+    // NAMED arguments (`5.scale(plus: 1, by: 2)`): the receiver is an unnamed
+    // slot-0 positional, so the explicit args bind against the parameter names
+    // AFTER `self`, in PARAMETER order (host: `orderArgumentsByParameters` over
+    // the full list with the injected receiver unnamed).
+    if hasNamedArgs(n.callArgNames) {
+      let uNames = fnParamNamesOf(name)
+      if uNames.length != params.length {
+        tErr("named arguments require a declared function", ix)
+        return TY_ERR
+      }
+      let restNames: string[] = []
+      let rn = 1
+      while rn < uNames.length {
+        restNames.push(uNames[rn])
+        rn = rn + 1
+      }
+      args = orderNamedCallArgs(restNames, args, n.callArgNames, ix)
+      if args.length != restNames.length { return TY_ERR }
+    }
     // Generic dispatch (host: UFCS reuses the call machinery, so `self`
     // monomorphizes to the receiver's shape): bind the receiver into the
     // `self` param's holes — when the body DEMANDED fields, a receiver
@@ -3827,6 +3898,21 @@ function checkCallNode(n: Call, ix: i32): i32 {
       tErr("wrong number of arguments: expected " +
         i32ToStr(params.length) + ", got " + i32ToStr(args.length), ix)
       return retTy
+    }
+    // NAMED arguments bind to parameters by NAME, then positionally — source
+    // order is irrelevant for named args (host: `ensureParameters` /
+    // `orderArgumentsByParameters`). `TyFunc` carries no parameter names, so
+    // the names resolve against the callee's `FuncDecl`; a closure-valued
+    // callee (no declaration) cannot take named arguments.
+    if hasNamedArgs(n.callArgNames) {
+      let cNames: string[] = []
+      if cfn is Ident { cNames = fnParamNamesOf(cfn.identName) }
+      if cNames.length != params.length {
+        tErr("named arguments require a declared function", ix)
+        return retTy
+      }
+      args = orderNamedCallArgs(cNames, args, n.callArgNames, ix)
+      if args.length != params.length { return retTy }
     }
     // Generic CALL-SITE inference: a TyVar param (or `T[]`) BINDS its type-param to
     // the argument's type (first use wins; later uses must agree), and the return

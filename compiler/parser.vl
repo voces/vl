@@ -54,6 +54,7 @@ import {
   mkUnary,
   mkBinary,
   mkCall,
+  mkCallN,
   mkMember,
   mkOptMember,
   mkParen,
@@ -470,16 +471,31 @@ function parsePrimary(): i32 {
   mkErr("expr", P.pos)
 }
 
+// The per-argument NAMES of the argument list parseArgs LAST completed ("" =
+// positional), parallel to its returned values. A module global rather than a
+// second return (VL functions return one value): safe against nesting because
+// parseArgs assigns it at the END — an inner call's list is finished (and its
+// `mkCallN` consumed the global in `parsePostfix`) before the outer list
+// resumes collecting into its own local.
+let gCallArgNames: string[] = []
+
 // A comma-separated argument list, already past the "(". Consumes the ")".
 // Returns the argument node indices. (A string-returning call can't drive a
 // `while` condition directly — a tracked gap — so the comma test is read into a
 // local `more` and re-checked in the body.)
+//
+// Each argument may carry a NAME — `f(a: 2, b: 1)` — recognized exactly as the
+// host does (parser.ts `parseArguments`): an IDENT immediately followed by a
+// COLON names the argument; the name binds to the parameter with that name in
+// the checker/emitter, not to its source position. Names collect into
+// `gCallArgNames` ("" for a positional entry).
 function parseArgs(): i32[] {
   let args: i32[] = []
+  let names: string[] = []
   // An argument list may span lines and allow ONE trailing comma before `)`.
   skipNewlines()
   if peekKind() != "RPAREN" {
-    args.push(parseExpr())
+    parseOneArg(args, names)
     skipNewlines()
     let more = peekKind() == "COMMA"
     while more {
@@ -488,14 +504,31 @@ function parseArgs(): i32[] {
       if peekKind() == "RPAREN" {
         more = false
       } else {
-        args.push(parseExpr())
+        parseOneArg(args, names)
         skipNewlines()
         more = peekKind() == "COMMA"
       }
     }
   }
   expect("RPAREN")
+  gCallArgNames = names
   args
+}
+
+// One argument: an optional `name:` prefix (IDENT directly followed by COLON —
+// the host's `at("ID") && peek(1).kind === "COLON"` test), then the value
+// expression. Pushes the value onto `args` and the name ("" if positional)
+// onto `names`.
+function parseOneArg(args: i32[], names: string[]): i32 {
+  if peekKind() == "IDENT" && kindAt(P.pos + 1) == "COLON" {
+    names.push(advance().text)
+    advance()                  // COLON
+    skipNewlines()
+  } else {
+    names.push("")
+  }
+  args.push(parseExpr())
+  0
 }
 
 // An object literal `{ name: value, ... }`, the cursor on the leading `{`. Each
@@ -595,7 +628,7 @@ function parsePostfix(): i32 {
     if k == "LPAREN" {
       advance()
       let args = parseArgs()
-      node = mkCall(node, args)
+      node = mkCallN(node, args, gCallArgNames)
     } else if k == "DOT" {
       advance()
       let prop = ""
@@ -1099,19 +1132,21 @@ function parseIf(): i32 {
   mkIf(cond, thenB, els)
 }
 
-// `"while" expr block`
-function parseWhile(): i32 {
+// `"while" expr block` — `label` is the loop's label when dispatched from the
+// labelled-statement form `name: while …` ("" otherwise; host: `parseWhile(label, t)`).
+function parseWhile(label: string): i32 {
   advance()                        // "while"
   let cond = parseExpr()
   let body = parseBlock()
-  mkWhile(cond, body)
+  mkWhile(cond, body, label)
 }
 
 // `for v in <from> to <to> [step <s>] { body }`  (numeric range), OR
 // `for v in <iterable> { body }`  (for-in over an array). `in`, `to` and `step` are
 // SOFT keywords (lexed as IDENT, matched by text). The form is decided after the
 // `in`-expression: a following soft `to` means a range, otherwise it is a for-in.
-function parseFor(): i32 {
+// `label` is the loop's label from the `name: for …` form ("" otherwise).
+function parseFor(label: string): i32 {
   advance()                        // "for"
   let v = ""
   if peekKind() == "IDENT" {
@@ -1135,24 +1170,34 @@ function parseFor(): i32 {
       step = parseExpr()
     }
     let rbody = parseBlock()
-    return mkForRange(v, first, to, step, rbody)
+    return mkForRange(v, first, to, step, rbody, label)
   }
   let ibody = parseBlock()
-  mkForIn(v, first, ibody)
+  mkForIn(v, first, ibody, label)
 }
 
-// `"break"` — a bare loop-control statement. The host (`parser.ts`) also accepts
-// an optional loop LABEL after the keyword; the self-host has no labels, so this
-// consumes only the keyword. Mirrors the `case "BREAK"` arm in `parser.ts`.
+// `"break" [label]` — a loop-control statement with an optional loop LABEL after
+// the keyword (an IDENT on the same line — a NEWLINE token stops the lookahead,
+// exactly as the host's `at("ID")` does). Mirrors the `case "BREAK"` arm in
+// `parser.ts`.
 function parseBreak(): i32 {
   let kw = advance()               // "break"
-  mkBreak(kw.text)
+  let label = ""
+  if peekKind() == "IDENT" {
+    label = advance().text
+  }
+  mkBreak(kw.text, label)
 }
 
-// `"continue"` — see `parseBreak`. Mirrors the `case "CONTINUE"` arm in `parser.ts`.
+// `"continue" [label]` — see `parseBreak`. Mirrors the `case "CONTINUE"` arm in
+// `parser.ts`.
 function parseContinue(): i32 {
   let kw = advance()               // "continue"
-  mkContinue(kw.text)
+  let label = ""
+  if peekKind() == "IDENT" {
+    label = advance().text
+  }
+  mkContinue(kw.text, label)
 }
 
 // `"return" expr?`
@@ -1314,10 +1359,10 @@ function parseStmt(): i32 {
     return parseIf()
   }
   if k == "WHILE" {
-    return parseWhile()
+    return parseWhile("")
   }
   if k == "FOR" {
-    return parseFor()
+    return parseFor("")
   }
   if k == "BREAK" {
     return parseBreak()
@@ -1337,6 +1382,22 @@ function parseStmt(): i32 {
       return parseExpr()
     }
     return parseBlock()
+  }
+  // Labelled loop `name: while …` / `name: for …` — an IDENT directly followed
+  // by a COLON and a loop keyword (host: the `case "ID"` arm's `peek(1)`/
+  // `peek(2)` test). Anything else falls through to an expression statement.
+  if k == "IDENT" && kindAt(P.pos + 1) == "COLON" {
+    let lk = kindAt(P.pos + 2)
+    if lk == "WHILE" {
+      let label = advance().text
+      advance()                    // COLON
+      return parseWhile(label)
+    }
+    if lk == "FOR" {
+      let label = advance().text
+      advance()                    // COLON
+      return parseFor(label)
+    }
   }
   parseExpr()
 }
