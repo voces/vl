@@ -196,6 +196,17 @@ let gaDeclIxs: i32[] = []
 let tpEnvNames: string[] = []
 let tpEnvTys: i32[] = []
 
+// DEMANDED HOLE SHAPES (host: `getChildType` pins an `Infer<Unknown>` to a
+// GROWING `{…}` object): a member access on an inference-hole param
+// (`self.x` where `self` is the hole `?add.0`) records field `x` on the
+// hole's demanded shape — a TyObj that grows one DERIVED hole
+// (`?fld.x.?add.0`) per accessed field. Each call site then checks its
+// argument against the demanded shape (so `getx(5)` rejects when the body
+// read `o.x`), and `substTyDeep` resolves the derived holes against the
+// call's bindings (`?fld.x.?getx.0` → field `x` of the pinned argument).
+let holeShapeNames: string[] = []
+let holeShapeTys: i32[] = []
+
 // The const-binding chain, PARALLEL to `T.scopes`: each frame records which of
 // its names were bound `const` (immutable NAME, not immutable data — a field
 // write through a const stays legal). Kept module-level (not a `Checker` field)
@@ -642,6 +653,8 @@ export function initChecker(): i32 {
   bgSrcStack = []
   bgDstStack = []
   stSeenStack = []
+  holeShapeNames = []
+  holeShapeTys = []
   fnDeclIx = Map()
   daClear()
   daWriteTarget = -1
@@ -2971,6 +2984,97 @@ function bindOf(bNames: string[], bTys: i32[], name: string): i32 {
   -1
 }
 
+// The demanded shape (TyObj arena index) of hole `name`, or -1.
+function holeShapeOf(name: string): i32 {
+  let i = 0
+  while i < holeShapeNames.length {
+    if holeShapeNames[i] == name {
+      return holeShapeTys[i]
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Member access on an inference hole (host `getChildType` on `Infer<Unknown>`):
+// record the field on the hole's demanded shape — creating the shape on first
+// access, the field on first read — and return the field's DERIVED hole.
+function holeMemberTy(holeName: string, prop: string): i32 {
+  let shape = holeShapeOf(holeName)
+  if shape < 0 {
+    let fnames: string[] = []
+    let ftys: i32[] = []
+    shape = mkObjTy(fnames, ftys)
+    holeShapeNames.push(holeName)
+    holeShapeTys.push(shape)
+  }
+  let st = T.tys[shape]
+  if st is TyObj {
+    let f = objFieldType(st, prop)
+    if f >= 0 {
+      return f
+    }
+    let d = mkTyVar("?fld." + prop + "." + holeName)
+    st.objFieldNames.push(prop)
+    st.objFieldTypes.push(d)
+    return d
+  }
+  TY_ERR
+}
+
+// Resolve a (possibly DERIVED) hole NAME against a call's bindings: a direct
+// binding wins; `?ret.<h>` collapses to the pinned function's return (the
+// host's instantiate-and-collapse — keeps `inferred-return-soundness`
+// rejecting); `?fld.<prop>.<h>` to the pinned object's field (the structural
+// A13 read `self.x` concretized per call site). -1 = unresolved.
+function substHoleByName(name: string, bNames: string[], bTys: i32[]): i32 {
+  let b = bindOf(bNames, bTys, name)
+  if b >= 0 {
+    return b
+  }
+  if name.length > 5 {
+    if name.slice(0, 5) == "?ret." {
+      let inner = substHoleByName(name.slice(5, name.length), bNames, bTys)
+      if inner >= 0 {
+        let it = T.tys[inner]
+        if it is TyFunc {
+          return it.fnRet
+        }
+      }
+      return -1
+    }
+    if name.slice(0, 5) == "?fld." {
+      let rest = name.slice(5, name.length)
+      let dot = -1
+      let i = 0
+      let going = i < rest.length
+      while going {
+        if rest[i] == '.' {
+          dot = i
+          going = false
+        } else {
+          i = i + 1
+          going = i < rest.length
+        }
+      }
+      if dot > 0 {
+        let inner2 = substHoleByName(rest.slice(dot + 1, rest.length), bNames, bTys)
+        if inner2 >= 0 {
+          let it2 = T.tys[inner2]
+          if it2 is TyObj {
+            let f = objFieldType(it2, rest.slice(0, dot))
+            if f >= 0 {
+              return f
+            }
+          }
+        }
+      }
+      return -1
+    }
+  }
+  -1
+}
+
 // Generic CALL-SITE binding, deep (host `instantiateFunctionType`): walk an
 // expected parameter type against the argument's actual type and bind every
 // TyVar leaf — a declared type param (`T`) or an inference hole (`?f.N`) — on
@@ -3057,20 +3161,9 @@ function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]): i32 {
   }
   let t = T.tys[tyIx]
   if t is TyVar {
-    let b = bindOf(bNames, bTys, t.tvName)
+    let b = substHoleByName(t.tvName, bNames, bTys)
     if b >= 0 {
       return b
-    }
-    if t.tvName.length > 5 {
-      if t.tvName.slice(0, 5) == "?ret." {
-        let inner = bindOf(bNames, bTys, t.tvName.slice(5, t.tvName.length))
-        if inner >= 0 {
-          let it = T.tys[inner]
-          if it is TyFunc {
-            return it.fnRet
-          }
-        }
-      }
     }
     return tyIx
   }
@@ -3157,6 +3250,83 @@ function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]): i32 {
   res
 }
 
+// Operator dispatch `a op b` over a STRUCT left operand through the free
+// `self`-function named for the operator (`function +(self, b)` — host parser
+// B13+B14): the function must exist, take exactly (self, right), and its FIRST
+// param must be NAMED `self` (the pollution rule). Binds the operands into the
+// function's holes like any call (the operator "monomorphizes per call") and
+// substitutes the return. -1 = no such function fits (the caller falls through
+// to the operator-FIELD lookup / the native numeric paths).
+function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32): i32 {
+  let fnTy = lookup(op)
+  if fnTy < 0 { return -1 }
+  let preFt = T.tys[fnTy]
+  if preFt is TyFunc {
+    if preFt.fnRet == 0 - 2 {
+      if !onInferStack(op) {
+        let dIx = fnDeclIx[op] ?? -1
+        if dIx >= 0 {
+          checkNode(dIx)
+        }
+      }
+    }
+  } else {
+    return -1
+  }
+  let dIx2 = fnDeclIx[op] ?? -1
+  if dIx2 < 0 { return -1 }
+  let d = P.nodes[dIx2]
+  let selfOk = false
+  if d is FuncDecl {
+    if d.fnParams.length == 2 {
+      let p0 = P.nodes[d.fnParams[0]]
+      if p0 is Param {
+        if p0.parName == "self" { selfOk = true }
+      }
+    }
+  }
+  if !selfOk { return -1 }
+  let ft = T.tys[fnTy]
+  if ft is TyFunc {
+    let retTy = ft.fnRet
+    if retTy == 0 - 2 { retTy = TY_ERR }
+    let params = ft.fnParamTypes
+    if params.length != 2 { return -1 }
+    if !assignable(lt, params[0]) { return -1 }
+    let bNames: string[] = []
+    let bTys: i32[] = []
+    let p0t = T.tys[params[0]]
+    if p0t is TyVar {
+      let hs0 = holeShapeOf(p0t.tvName)
+      if hs0 >= 0 {
+        if !assignable(lt, hs0) { return -1 }
+      }
+    }
+    bindGenWalk(params[0], lt, bNames, bTys)
+    bindGenWalk(params[1], rt, bNames, bTys)
+    let expected = substTyDeep(params[1], bNames, bTys)
+    let p1t = T.tys[params[1]]
+    if p1t is TyVar {
+      let hs1 = holeShapeOf(p1t.tvName)
+      if hs1 >= 0 {
+        if !assignableExpr(rightIx, rt, hs1) {
+          tErr("operator '" + op + "': expected " + tyToStr(hs1) +
+            ", got " + tyToStr(rt), ix)
+        }
+      }
+    }
+    if !assignableExpr(rightIx, rt, expected) {
+      tErr("operator '" + op + "': expected " + tyToStr(expected) +
+        ", got " + tyToStr(rt), ix)
+    }
+    if bNames.length > 0 {
+      retTy = substTyDeep(retTy, bNames, bTys)
+    }
+    return retTy
+  }
+  -1
+}
+
 // A call expression: array-method builtins (`xs.push`), string-method builtins
 // (`.slice`/`.indexOf`/`.includes`/`.charCodeAt`), the `print`/`fromCodePoint`
 // builtins, then the generic function-call path (arity + per-arg assignability).
@@ -3189,15 +3359,45 @@ function ufcsCallTy(name: string, recvTy: i32, n: Call, ix: i32): i32 {
     let args = n.callArgs
     if params.length != args.length + 1 { return -1 }
     if !assignable(recvTy, params[0]) { return -1 }
+    // Generic dispatch (host: UFCS reuses the call machinery, so `self`
+    // monomorphizes to the receiver's shape): bind the receiver into the
+    // `self` param's holes — when the body DEMANDED fields, a receiver
+    // missing one is NOT this method (fall through to the caller's error) —
+    // then bind/check the explicit args and substitute the return.
+    let bNames: string[] = []
+    let bTys: i32[] = []
+    let p0 = T.tys[params[0]]
+    if p0 is TyVar {
+      let hShape0 = holeShapeOf(p0.tvName)
+      if hShape0 >= 0 {
+        if !assignable(recvTy, hShape0) { return -1 }
+      }
+    }
+    bindGenWalk(params[0], recvTy, bNames, bTys)
     let i = 0
     while i < args.length {
       let at = checkNode(args[i])
-      constrainEmpty(at, params[i + 1])
-      if !assignableExpr(args[i], at, params[i + 1]) {
+      bindGenWalk(params[i + 1], at, bNames, bTys)
+      let expected = substTyDeep(params[i + 1], bNames, bTys)
+      let pHole = T.tys[params[i + 1]]
+      if pHole is TyVar {
+        let hShape = holeShapeOf(pHole.tvName)
+        if hShape >= 0 {
+          if !assignableExpr(args[i], at, hShape) {
+            tErr("argument " + i32ToStr(i + 1) + ": expected " +
+              tyToStr(hShape) + ", got " + tyToStr(at), ix)
+          }
+        }
+      }
+      constrainEmpty(at, expected)
+      if !assignableExpr(args[i], at, expected) {
         tErr("argument " + i32ToStr(i + 1) + ": expected " +
-          tyToStr(params[i + 1]) + ", got " + tyToStr(at), ix)
+          tyToStr(expected) + ", got " + tyToStr(at), ix)
       }
       i = i + 1
+    }
+    if bNames.length > 0 {
+      retTy = substTyDeep(retTy, bNames, bTys)
     }
     return retTy
   }
@@ -3653,6 +3853,19 @@ function checkCallNode(n: Call, ix: i32): i32 {
       // SUBSTITUTED expected type — a later disagreeing use errors here.
       bindGenWalk(params[i], at, bNames, bTys)
       let expected = substTyDeep(params[i], bNames, bTys)
+      // A hole param whose body DEMANDED fields (member access on the hole)
+      // checks the argument against the demanded shape, so `getx(5)` rejects
+      // when the body read `o.x` (host: the grown `Infer<{x,…}>` pin).
+      let pHole = T.tys[params[i]]
+      if pHole is TyVar {
+        let hShape = holeShapeOf(pHole.tvName)
+        if hShape >= 0 {
+          if !assignableExpr(args[i], at, hShape) {
+            tErr("argument " + i32ToStr(i + 1) + ": expected " +
+              tyToStr(hShape) + ", got " + tyToStr(at), ix)
+          }
+        }
+      }
       // Passing an empty-collection argument into a concrete `T[]` / map param pins
       // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
       // clearing its uninferred floor — pure downstream-usage inference, no push.
@@ -4549,6 +4762,29 @@ function checkNode(ix: i32): i32 {
             arrT0.aElem = rt
           }
         }
+        // Index WRITE trap (B13, host `indexTrap` "[]="): `o[k] = v` on an
+        // object that declares `"[]="` checks the value against the method's
+        // VALUE parameter (index/wrong-value-type.vl rejects); an object with
+        // only a READ trap rejects the write (host: the missing-method error).
+        if arrT0 is TyObj {
+          let wtrap = objFieldType(arrT0, "[]=")
+          if wtrap >= 0 {
+            let wt = T.tys[wtrap]
+            if wt is TyFunc {
+              if wt.fnParamTypes.length == 2 {
+                if !assignableExpr(n.binRight, rt, wt.fnParamTypes[1]) {
+                  tErr("index write: expected " + tyToStr(wt.fnParamTypes[1]) +
+                    ", got " + tyToStr(rt), ix)
+                }
+                return rt
+              }
+            }
+          } else if objFieldType(arrT0, "[]") >= 0 {
+            tErr("no \"[]=\" method for index assignment on " +
+              tyToStr(arrTy0), ix)
+            return TY_ERR
+          }
+        }
       }
       if !assignableExpr(n.binRight, rt, lt) {
         tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(lt), ix)
@@ -4648,6 +4884,32 @@ function checkNode(ix: i32): i32 {
         }
       }
       return TY_BOOL
+    }
+    // OPERATOR DISPATCH on a user object (B13 + B14): `a op b` with a STRUCT
+    // left operand resolves through a free `self`-function named for the
+    // operator (host parser dispatch — checked FIRST, host order), else
+    // through an operator closure FIELD (`"*": function(s) …` — host
+    // `opFunc`). Equality/logicals/`=`/`??` returned above, so only the
+    // arithmetic/comparison operators reach here.
+    if op != "&&" && op != "||" {
+      let odsp = T.tys[lt]
+      if odsp is TyObj {
+        let osf = opSelfFnTy(op, lt, rt, n.binRight, ix)
+        if osf >= 0 { return osf }
+        let ofld = objFieldType(odsp, op)
+        if ofld >= 0 {
+          let oft = T.tys[ofld]
+          if oft is TyFunc {
+            if oft.fnParamTypes.length == 1 {
+              if !assignableExpr(n.binRight, rt, oft.fnParamTypes[0]) {
+                tErr("operator '" + op + "': expected " +
+                  tyToStr(oft.fnParamTypes[0]) + ", got " + tyToStr(rt), ix)
+              }
+              return oft.fnRet
+            }
+          }
+        }
+      }
     }
     // Ordering comparison: result bool; requires matching numeric types. A
     // literal / literal-union operand is its base scalar here (`n < 2` over
@@ -4791,6 +5053,17 @@ function checkNode(ix: i32): i32 {
         return TY_ERR
       }
     }
+    // Member access on an INFERENCE HOLE (`self.x` where `self` is the
+    // un-annotated param hole `?add.0` — host: `getChildType` pins the
+    // `Infer<Unknown>` to a growing object shape): record the demanded field
+    // and yield its derived hole; the call site pins both (A13).
+    if ot is TyVar {
+      if ot.tvName.length > 0 {
+        if ot.tvName[0] == '?' {
+          return holeMemberTy(ot.tvName, n.memProp)
+        }
+      }
+    }
     tErr("member access '." + n.memProp + "' on non-object " +
       tyToStr(objTy), ix)
     return TY_ERR
@@ -4832,6 +5105,30 @@ function checkNode(ix: i32): i32 {
         tErr("map key must be " + tyToStr(at.mKey) + ", got " + tyToStr(idxTy), ix)
       }
       return mkNullableTy(at.mVal)
+    }
+    // Index TRAP (B13, host parser `indexTrap`): a user object that declares a
+    // `"[]"` method handles `o[k]` itself — the key checks against the
+    // method's parameter (so an i32-keyed trap indexed with a string REJECTS,
+    // index/wrong-key-type.vl), the result is its return. Checked BEFORE the
+    // native i32-index rule (a trap key may be any type); a struct with no
+    // `"[]"` falls through to the cannot-index error. Write traps (`o[k] = v`)
+    // check in the assignment arm against `"[]="`.
+    if at is TyObj {
+      let trap = objFieldType(at, "[]")
+      if trap >= 0 {
+        let tt = T.tys[trap]
+        if tt is TyFunc {
+          if tt.fnParamTypes.length == 1 {
+            if !assignableExpr(n.idxIndex, idxTy, tt.fnParamTypes[0]) {
+              tErr("index: expected " + tyToStr(tt.fnParamTypes[0]) +
+                ", got " + tyToStr(idxTy), ix)
+            }
+            return tt.fnRet
+          }
+        }
+      }
+      tErr("cannot index non-array " + tyToStr(arrTy), ix)
+      return TY_ERR
     }
     if !assignable(idxTy, TY_I32) {
       tErr("array index must be i32, got " + tyToStr(idxTy), ix)
