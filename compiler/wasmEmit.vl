@@ -15169,6 +15169,75 @@ function collectAnnShapes(): i32 {
   0
 }
 
+// The inline-shape synthetic name of a STRUCT-ALIAS union decl — a `UnionDecl`
+// with exactly ONE variant that is an inline object shape (`{a:i32,b:i32}`,
+// not a map `{[…]}`) — or "". The shape a canonicalized object intersection
+// (`type AB = {a} & {b}` → the merged single variant) leaves behind: it is a
+// plain named STRUCT at runtime, so `collectS` interns it and `collectU`
+// skips it.
+function unionStructAliasShape(variants: string[]): string {
+  if variants.length == 1 {
+    let v = variants[0]
+    if v.length >= 2 && v[0] == '{' && v[1] != '[' && v[v.length - 1] == '}' {
+      return v
+    }
+  }
+  ""
+}
+
+// Intern the inline shape name `nm` (`{a:i32,b:i32}`) as the NAMED struct
+// `key` — the same field parsing as `collectAnnShapes`, but keyed under the
+// alias name so `structIndexByName(key)` resolves params/locals/literals.
+function internShapeAs(key: string, nm: string): i32 {
+  let inner = nm.slice(1, nm.length - 1)
+  let names: string[] = []
+  let codes: i32[] = []
+  let depth = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    let atEnd = k == inner.length
+    let brk = false
+    if !atEnd {
+      if inner[k] == '{' || inner[k] == '[' || inner[k] == '(' { depth = depth + 1 }
+      if inner[k] == '}' || inner[k] == ']' || inner[k] == ')' { depth = depth - 1 }
+      if inner[k] == ',' && depth == 0 { brk = true }
+    } else {
+      brk = true
+    }
+    if brk {
+      let part = inner.slice(start, k)
+      let ci = part.indexOf(":")
+      if ci <= 0 {
+        return emitFail("emitProgram: malformed struct field")
+      }
+      let fc = nameFieldCode(part.slice(ci + 1, part.length))
+      if fc < 0 {
+        return emitFail("emitProgram: only i32 / boolean / string / array struct fields are supported")
+      }
+      names.push(part.slice(0, ci))
+      codes.push(fc)
+      start = k + 1
+    }
+    k = k + 1
+  }
+  if names.length == 0 {
+    return emitFail("emitProgram: empty struct alias shape")
+  }
+  sDeclared = true
+  sNames.push(key)
+  sFieldStart.push(sFieldNames.length)
+  sFieldCount.push(codes.length)
+  let pi = 0
+  while pi < codes.length {
+    sFieldNames.push(names[pi])
+    sFieldTypes.push(codes[pi])
+    sFieldElemName.push("")
+    pi = pi + 1
+  }
+  0
+}
+
 // The struct table index whose field-name SET matches `names` exactly, or -1.
 function annShapeIndexOf(names: string[]): i32 {
   let si = 0
@@ -15273,6 +15342,15 @@ function collectS(stmts: i32[]): i32 {
   let i = 0
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
+    // A STRUCT-ALIAS union decl (a canonicalized object intersection — single
+    // inline-shape variant) is a plain named struct: intern it here (collectU
+    // skipped it).
+    if s is UnionDecl {
+      let aliasShape = unionStructAliasShape(s.udVariants)
+      if aliasShape != "" {
+        if internShapeAs(s.udName, aliasShape) < 0 { return 0 - 1 }
+      }
+    }
     // A union variant `TypeDecl` is owned by the variant table, NOT a standalone struct.
     if s is TypeDecl {
       if variantIndexOf(s.tdName) < 0 {
@@ -15798,6 +15876,13 @@ function collectU(stmts: i32[]): i32 {
   while i < stmts.length {
     let s = P.nodes[stmts[i]]
     if s is UnionDecl {
+      // A STRUCT-ALIAS union (single inline-shape variant — a canonicalized
+      // `type AB = {…} & {…}` object intersection) is a named STRUCT, not a
+      // union: `collectS` interns it; skip it here.
+      if unionStructAliasShape(s.udVariants) != "" {
+        i = i + 1
+        continue
+      }
       uDeclared = true
       let vs = s.udVariants
       if vs.length < 1 {
