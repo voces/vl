@@ -3370,6 +3370,15 @@ let leqSScratchBase: i32 = 0
 let fnListEqRSlots: i32[] = []
 let leqRBases: i32[] = []
 
+// ── per-function closure-equality scratch frame (function-identity `==`) ──────
+// `f == g` (or a struct equality whose shape carries a function-typed field)
+// stages both closure fat-pointers in a 2-slot `(ref $cloStruct)` frame (A the
+// left operand, B the right) so each operand's id + env fields read off ONE
+// evaluation. Flagged by `cloEqNoteBin` riding the leq scan; appended LAST in
+// the frame layout so every existing layout is untouched.
+let fnUsesCloEq: boolean = false
+let cloEqScratchBase: i32 = 0
+
 // ── struct-type table (MULTIPLE structs per program) ──────────────────────────
 // A program may declare MANY struct `type`s. Mirroring the union variant table, the
 // struct table is a FLAT store keyed by struct index (declaration order): struct `i`
@@ -4718,12 +4727,57 @@ function leqNoteBin(binIx: i32, fnIx: i32): i32 {
   0
 }
 
-// Recursive expression walk noting every list `==`/`!=`/`+` site.
+// True if struct shape `si` carries a function-typed field (code 14), looking
+// through nested-struct fields (code 15). `seen` guards recursive shapes.
+function shapeHasCloField(si: i32, seen: i32[]): boolean {
+  let k = 0
+  while k < seen.length {
+    if seen[k] == si { return false }
+    k = k + 1
+  }
+  seen.push(si)
+  let fi = 0
+  while fi < sFieldCount[si] {
+    let code = sFieldTypeAt(si, fi)
+    if code == 14 { return true }
+    if code == 15 {
+      let nsi = structIndexByName(sFieldElemNameAt(si, fi))
+      if nsi >= 0 { if shapeHasCloField(nsi, seen) { return true } }
+    }
+    fi = fi + 1
+  }
+  false
+}
+
+// Note one BinExpr's function-identity equality site (`f == g`, or a struct
+// equality whose shape carries a function-typed field) into `fnUsesCloEq` — the
+// compare stages both operands in the 2-slot closure-eq frame.
+function cloEqNoteBin(binIx: i32, fnIx: i32): i32 {
+  let e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
+        fnUsesCloEq = true
+        return 0
+      }
+      let si = structIndexOfExpr(e.binLeft, fnIx)
+      if si >= 0 {
+        let seen: i32[] = []
+        if shapeHasCloField(si, seen) { fnUsesCloEq = true }
+      }
+    }
+  }
+  0
+}
+
+// Recursive expression walk noting every list `==`/`!=`/`+` site (and, riding the
+// same walk, every function-identity equality site — `cloEqNoteBin`).
 function leqScanExpr(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return 0 }
   let e = P.nodes[exprIx]
   if e is BinExpr {
     leqNoteBin(exprIx, fnIx)
+    cloEqNoteBin(exprIx, fnIx)
     leqScanExpr(e.binLeft, fnIx)
     return leqScanExpr(e.binRight, fnIx)
   }
@@ -5498,10 +5552,11 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32): i32 {
 
 // ── function-value construction (lambdas) ─────────────────────────────────────
 // Emit a function VALUE for the lifted function at `fnStmts` position `fe`: the closure
-// fat-pointer `struct.new $cloStruct [ ref.func $(gImports+fe), env ]`. The env is
+// fat-pointer `struct.new $cloStruct [ ref.func $(gImports+fe), env, id ]`. The env is
 // `ref.null struct` for a non-capturing function, else a `struct.new $envStruct` of the
 // captured values, each READ in the enclosing frame `fnIx` (so a capture of `n` emits a
-// `local.get` of `n` in the maker's frame). Mirrors the host's `closureValue`.
+// `local.get` of `n` in the maker's frame). The id is the lifted function's wasm index
+// (`gImports + fe`) — the `==` identity token. Mirrors the host's `closureValue`.
 function emitClosureValue(body: i32[], fe: i32, fnIx: i32): i32 {
   if fe < 0 || fe >= fnStmts.length {
     return emitFail("emitProgram: function value with no lifted function")
@@ -5523,6 +5578,8 @@ function emitClosureValue(body: i32[], fe: i32, fnIx: i32): i32 {
     }
     fbStructNew(envIdx)
   }
+  // field 2: the identity token — the lifted function's wasm index.
+  fbI32Const(gImports + fe)
   fbStructNew(cloStructIdx)
   0
 }
@@ -8997,6 +9054,29 @@ function emitChainRead(body: i32[], rootIx: i32, pathSi: i32[], pathFi: i32[], f
   0
 }
 
+// Compare two closure fat-pointers already on the stack (left below right), leaving
+// a 0/1 i32 — function IDENTITY: the same lifted function (id, field 2) AND the same
+// captured env (`ref.eq` over field 1; two null envs are equal, two separately
+// CREATED envs of the same function are not). Stages both operands in the 2-slot
+// closure-eq frame (`cloEqScratchBase`, reserved by `cloEqNoteBin`'s scan). Mirrors
+// the host's function-identity `==` (same table index AND same env).
+function emitCloEqCore(body: i32[]): i32 {
+  fbLocalSet(cloEqScratchBase + 1)   // B = right operand
+  fbLocalSet(cloEqScratchBase + 0)   // A = left operand
+  fbLocalGet(cloEqScratchBase + 0)
+  fbStructGet(cloStructIdx, 2)       // A.id
+  fbLocalGet(cloEqScratchBase + 1)
+  fbStructGet(cloStructIdx, 2)       // B.id
+  fbI32Bin(70)                       // 0x46 i32.eq
+  fbLocalGet(cloEqScratchBase + 0)
+  fbStructGet(cloStructIdx, 1)       // A.env
+  fbLocalGet(cloEqScratchBase + 1)
+  fbStructGet(cloStructIdx, 1)       // B.env
+  wU8(211)                           // 0xd3 ref.eq (null == null → 1)
+  fbI32Bin(113)                      // 0x71 i32.and
+  0
+}
+
 // Lower a STRUCTURAL struct equality `a == b` (or `!=`) onto `body`, leaving a 0/1
 // i32 — field-wise compare mirroring the host's `valueEq`: native compares for
 // scalars, the string-eq loop for string fields, a length+element loop for `i32[]`
@@ -9155,6 +9235,12 @@ function emitStructEqFieldInner(body: i32[], lRoot: i32, rRoot: i32, si: i32, fi
     fbEnd()                    // end (length if/else)
     ctrlLeave()
     return 0
+  }
+  if code == 14 {
+    // Function-valued field: identity compare (id + env) via the closure-eq frame.
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return 0 - 1 }
+    return emitCloEqCore(body)
   }
   emitFail("emitProgram: unsupported struct field type in equality")
 }
@@ -10228,9 +10314,8 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
       }
       // STRUCTURAL struct equality: same-shape operands compare field-wise
       // (`emitStructEq` — scalars native, strings via the eq loop, `i32[]` via a
-      // length+element loop, nested structs recursively). A function-valued field
-      // still fails loudly (under the `call_ref` ABI a function-identity compare
-      // needs an identity token on the closure struct — funcrefs admit no ref.eq).
+      // length+element loop, nested structs recursively, function-valued fields
+      // by identity via `emitCloEqCore`).
       let eqLsi = structIndexOfExpr(e.binLeft, fnIx)
       let eqRsi = structIndexOfExpr(e.binRight, fnIx)
       if eqLsi >= 0 || eqRsi >= 0 {
@@ -10239,8 +10324,17 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32): i32 {
         }
         return emitFail("emitProgram: struct equality is not supported yet")
       }
+      // Function-value `==`/`!=`: IDENTITY — the same lifted function (the id
+      // field) AND the same captured env (`ref.eq`). Mirrors the host (same
+      // table index AND same env; null == null envs are equal).
       if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
-        return emitFail("emitProgram: function-value equality is not supported yet")
+        if emitExpr(body, e.binLeft, fnIx) < 0 { return 0 - 1 }
+        if emitExpr(body, e.binRight, fnIx) < 0 { return 0 - 1 }
+        if emitCloEqCore(body) < 0 { return 0 - 1 }
+        if e.binOp == "!=" {
+          fbI32Eqz()             // 0x45 i32.eqz — negate identity-equality
+        }
+        return 0
       }
     }
     // Slice 5 — f32 operators. If EITHER operand is f32, emit the f32 instruction
@@ -14142,6 +14236,10 @@ function fbBeginFunc(nParams: i32, nLocals: i32): i32 {
     leqRBases.push(fbReserve(4))
     lqk = lqk + 1
   }
+  // Closure equality frame (2 `(ref $cloStruct)` slots), appended LAST so every
+  // existing layout is untouched.
+  cloEqScratchBase = fbScratchCur
+  if fnUsesCloEq { fbReserve(2) }
   fbScratchCur
 }
 
@@ -14203,6 +14301,7 @@ function fbLocalsCount(nLocals: i32): i32 {
   if fnUsesListEqI { n = n + 5 }
   if fnUsesListEqS { n = n + 4 }
   n = n + fnListEqRSlots.length * 4
+  if fnUsesCloEq { n = n + 2 }
   n
 }
 
@@ -14360,6 +14459,11 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32): i32 {
     fbI32Run()
     lqv = lqv + 1
   }
+  // Closure equality frame (2 `(ref $cloStruct)` slots, appended LAST).
+  if fnUsesCloEq {
+    fbRefRun(cloStructIdx)
+    fbRefRun(cloStructIdx)
+  }
   wTarget(prev)
   0
 }
@@ -14440,6 +14544,7 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     fnUsesListEqI = false
     fnUsesListEqS = false
     fnListEqRSlots = []
+    fnUsesCloEq = false
     leqScanBlock(fn.fnBody, fnIx)
     let nLocals = localNames.length
     // Lay out every scratch frame after the params + declared locals via the
@@ -15793,6 +15898,7 @@ function startFnDetectScratch(): i32 {
   fnUsesListEqI = false
   fnUsesListEqS = false
   fnListEqRSlots = []
+  fnUsesCloEq = false
   let lgi = 0
   while lgi < globalStmts.length {
     if globalIsNonConst(globalStmts[lgi]) {
@@ -16411,19 +16517,23 @@ function emitModule(stmts: i32[]): i32 {
     wU8(1)                       // mutable
   }
   if fnValUsed {
-    // The closure fat-pointer struct `{ code: funcref, env: (ref null struct) }`
-    // (lambdas) — field 0 a GENERIC `funcref` (so ONE closure struct serves every
-    // function arity), field 1 a nullable `structref` env (null when non-capturing).
-    // Both IMMUTABLE. At a `call_ref` site the funcref is `ref.cast` to the concrete
-    // env-leading `$fnsig` for that call's arity, then `call_ref`. The interned
-    // `$fnsig` functypes (one per distinct value-call arity) follow.
+    // The closure fat-pointer struct `{ code: funcref, env: (ref null struct),
+    // id: i32 }` (lambdas) — field 0 a GENERIC `funcref` (so ONE closure struct
+    // serves every function arity), field 1 a nullable `structref` env (null when
+    // non-capturing), field 2 the lifted function's wasm INDEX (`gImports + fe`) —
+    // the identity token for `==` (funcrefs admit no `ref.eq`). All IMMUTABLE. At a
+    // `call_ref` site the funcref is `ref.cast` to the concrete env-leading `$fnsig`
+    // for that call's arity, then `call_ref`. The interned `$fnsig` functypes (one
+    // per distinct value-call arity) follow.
     wU8(95)                      // 0x5f struct
-    wU8(2)                       // 2 fields
+    wU8(3)                       // 3 fields
     wU8(99)                      // field 0 code: 0x63 (ref null) funcref
     wU8(112)                     // ...the abstract `func` heaptype (0x70 funcref)
     wU8(0)                       // immutable
     wU8(99)                      // field 1 env: 0x63 (ref null ht)
     wU8(107)                     // ...to the abstract `struct` heaptype (structref)
+    wU8(0)                       // immutable
+    wU8(127)                     // field 2 id: 0x7f i32 — the function-identity token
     wU8(0)                       // immutable
     // One env-leading `$fnsig` functype per distinct eligible SIGNATURE, in
     // `cloSigKeys` order: `(structref, params...) -> ret`, the param/result valtypes
@@ -21330,6 +21440,46 @@ function mfArrElemIsBool(arrIx: i32, fnIx: i32): boolean {
 // them. `.filter` reuses the receiver's own (already-collected) types. Runs after
 // `computeRetInference` (an un-annotated callback's return kind is inferred);
 // programs without `.map`/`.filter` set nothing — every golden stays byte-identical.
+// True if the expression at `ix` is a bare Ident naming a top-level function —
+// a function VALUE use when it sits in a value position (an initializer, an
+// assignment's right side, an equality operand).
+function exprIsBareFnName(ix: i32): boolean {
+  if ix < 0 { return false }
+  let e = P.nodes[ix]
+  if e is Ident { return fnIndexOf(e.identName) >= 0 }
+  false
+}
+
+// Detect bare named-function VALUE uses the other flips miss (arena scan): a
+// `let`/`const` initialized to a function name (`const f = inc`), a reassignment
+// (`x = inc`), a function name as an equality operand (`inc == h`), or a
+// function-valued object-literal field (`{ f: inc }` — `collectAnonShapes`' own
+// flip is wiped by `collectFns`' reset, which runs after `collectS`; a LAMBDA
+// field re-flips during the lift, a named-function field only here). Each such
+// cell is a closure fat-pointer (kind 14), so the closure rec-group types must
+// intern (`fnValUsed`) even when no lambda/`.map` site otherwise flips it.
+// Programs without such uses set nothing — every golden stays byte-identical.
+function collectFnValUse(): i32 {
+  let i = 0
+  while i < P.nodes.length {
+    let nd = P.nodes[i]
+    if nd is LetDecl {
+      if exprIsBareFnName(nd.letInit) { fnValUsed = true }
+    }
+    if nd is BinExpr {
+      if nd.binOp == "=" || nd.binOp == "==" || nd.binOp == "!=" {
+        if exprIsBareFnName(nd.binLeft) { fnValUsed = true }
+        if exprIsBareFnName(nd.binRight) { fnValUsed = true }
+      }
+    }
+    if nd is FieldInit {
+      if exprIsBareFnName(nd.fiValue) { fnValUsed = true }
+    }
+    i = i + 1
+  }
+  0
+}
+
 function collectMapFilterUse(): i32 {
   let i = 0
   while i < P.nodes.length {
@@ -22364,6 +22514,7 @@ function emitProgram(rootIx: i32): i32 {
     // force the RESULT list's types; the `$fnsig` signature set is then collected
     // (both need the inferred return kinds, so they run after `computeRetInference`).
     collectMapFilterUse()
+    collectFnValUse()
     collectCloSigs()
     // Detect `print(...)` anywhere in the program: any use pulls in the 4-import
     // print family (imports shift every local function's wasm index, so this is
