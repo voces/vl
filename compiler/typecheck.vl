@@ -178,6 +178,24 @@ export let T: Checker = { tys: [], scopes: [], diags: [], curRet: -1 }
 // equivalent (and keeps the full compiler self-emittable). Reset by `initChecker`.
 let cUserTypes: {[string]: i32} = Map()
 
+// GENERIC TYPE ALIASES (A10 stage 3, host `instantiateAlias`): a parameterized
+// `type Box<T> = { value: T }` registers here (NOT in `cUserTypes` — it has no
+// concrete type until applied). Three parallel arrays: the base name ("Box"),
+// the comma-joined parameter names ("T" / "A,B"), and the `TypeDecl` node index
+// whose fields are re-resolved per APPLICATION (`Box<i32>`) under a type-param
+// binding environment. Applications memoize into `cUserTypes` under their full
+// synthetic name ("Box<i32>"), which also closes recursive applications.
+let gaNames: string[] = []
+let gaParamLists: string[] = []
+let gaDeclIxs: i32[] = []
+
+// The TYPE-PARAM BINDING ENVIRONMENT consulted by `nameToTy` (innermost LAST):
+// a generic function's `<T>` names bind to their TyVars while its annotations
+// resolve (`resolveAnnot`), and an alias application's params bind to the
+// argument types while the alias body resolves (`applyGenAlias`).
+let tpEnvNames: string[] = []
+let tpEnvTys: i32[] = []
+
 // The const-binding chain, PARALLEL to `T.scopes`: each frame records which of
 // its names were bound `const` (immutable NAME, not immutable data — a field
 // write through a const stays legal). Kept module-level (not a `Checker` field)
@@ -216,6 +234,13 @@ let npFrames: i32[] = []
 // self-referential types (`left: Tree | null` terminates, not expands).
 let asgSrcStack: i32[] = []
 let asgDstStack: i32[] = []
+
+// CYCLE GUARD stacks for the generic call-site binding walk (`bindGenWalk`)
+// and the deep substitution (`substTyDeep`) — a recursive named type is cyclic
+// in the arena, so both walks remember what they are already visiting.
+let bgSrcStack: i32[] = []
+let bgDstStack: i32[] = []
+let stSeenStack: i32[] = []
 
 // DEPTH GUARD for `tyToStr` on recursive named types (A11): a cyclic arena
 // shape would otherwise render forever — past a fixed depth it prints `…`.
@@ -609,6 +634,14 @@ export function initChecker(): i32 {
   T.diags = []
   T.curRet = -1
   cUserTypes = Map()
+  gaNames = []
+  gaParamLists = []
+  gaDeclIxs = []
+  tpEnvNames = []
+  tpEnvTys = []
+  bgSrcStack = []
+  bgDstStack = []
+  stSeenStack = []
   fnDeclIx = Map()
   daClear()
   daWriteTarget = -1
@@ -1883,6 +1916,145 @@ function splitTypeName(name: string, sep: i32, out: string[]): i32 {
   0
 }
 
+// The registry slot of a generic alias base name ("Box"), or -1.
+function gaIndexOf(name: string): i32 {
+  let i = 0
+  while i < gaNames.length {
+    if gaNames[i] == name {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Split a generic-application argument list ("i32,string", "Pair<i32,i32>,T")
+// at its TOP-LEVEL commas — `<>`/`{}`/`[]`/`()` nest, quoted literal-type names
+// skip whole. (The general `splitTypeName` doesn't track `<>` depth, so the
+// application form gets its own splitter.) Empty parts drop (a tolerated
+// trailing comma).
+function splitGenArgs(s: string, out: string[]): i32 {
+  let depth = 0
+  let start = 0
+  let i = 0
+  while i <= s.length {
+    let isEnd = i == s.length
+    let step = 1
+    let split = isEnd
+    if !isEnd {
+      let c = s[i]
+      if c == '"' {
+        step = skipQuotedName(s, i) - i
+      } else if c == '<' || c == '{' || c == '[' || c == '(' {
+        depth = depth + 1
+      } else if c == '>' || c == '}' || c == ']' || c == ')' {
+        depth = depth - 1
+      } else if c == ',' && depth == 0 {
+        split = true
+      }
+    }
+    if split {
+      let part = s.slice(start, i)
+      if part.length > 0 {
+        out.push(part)
+      }
+      start = i + 1
+    }
+    i = i + step
+  }
+  0
+}
+
+// Apply a generic alias (`Box<i32>`, `Pair<i32,string>`, `Box<T>` under a live
+// type-param env): resolve the arguments in the CURRENT environment, check the
+// arity, bind the declared parameter names to the argument types, and resolve
+// the declaration's fields under those bindings — the host's `instantiateAlias`
+// substitution. The result memoizes into `cUserTypes` under a RESOLVED key
+// (`Box<#2>` — the head + the argument arena indices, NOT the spelled name:
+// a `Box<T>` spelled under two different `T` bindings must not collide),
+// REGISTERED as an empty placeholder before the fields resolve so a recursive
+// application (`type A<T> = { next: A<T> | null }`) lands on its own (cyclic)
+// arena index instead of recursing forever. Returns -1 for an unknown
+// base/argument (the caller reports "unknown type"); a wrong ARITY reports
+// here (the full name is otherwise well-formed) and yields the error type.
+function applyGenAlias(head: string, inner: string): i32 {
+  let gi = gaIndexOf(head)
+  if gi < 0 {
+    return -1
+  }
+  let pnames: string[] = []
+  splitGenArgs(gaParamLists[gi], pnames)
+  let argNames: string[] = []
+  splitGenArgs(inner, argNames)
+  let argTys: i32[] = []
+  let ai = 0
+  while ai < argNames.length {
+    let a = nameToTy(argNames[ai])
+    if a < 0 {
+      return -1
+    }
+    argTys.push(a)
+    ai = ai + 1
+  }
+  if argTys.length != pnames.length {
+    tErr("`" + head + "` expects " + i32ToStr(pnames.length) +
+      " type arguments but got " + i32ToStr(argTys.length), -1)
+    return TY_ERR
+  }
+  let memoKey = head + "<#"
+  let mi = 0
+  while mi < argTys.length {
+    memoKey = memoKey + i32ToStr(argTys[mi]) + ","
+    mi = mi + 1
+  }
+  if cUserTypes.has(memoKey) {
+    return cUserTypes[memoKey] ?? -1
+  }
+  let fnames: string[] = []
+  let ftys: i32[] = []
+  let resIx = mkObjTy(fnames, ftys)
+  cUserTypes[memoKey] = resIx
+  let bi = 0
+  while bi < pnames.length {
+    tpEnvNames.push(pnames[bi])
+    tpEnvTys.push(argTys[bi])
+    bi = bi + 1
+  }
+  let decl = P.nodes[gaDeclIxs[gi]]
+  if decl is TypeDecl {
+    let dfields = decl.tdFields
+    let fi = 0
+    while fi < dfields.length {
+      let fd = P.nodes[dfields[fi]]
+      if fd is FieldDef {
+        fnames.push(fd.fdName)
+        let fty = TY_ERR
+        if fd.fdType >= 0 {
+          let ftn = P.nodes[fd.fdType]
+          if ftn is TypeRef {
+            let r = nameToTy(ftn.tyName)
+            if r >= 0 {
+              fty = r
+            } else {
+              tErr("unknown type '" + ftn.tyName + "' for field '" +
+                fd.fdName + "'", dfields[fi])
+            }
+          }
+        }
+        ftys.push(fty)
+      }
+      fi = fi + 1
+    }
+  }
+  let pj = 0
+  while pj < pnames.length {
+    tpEnvNames.pop()
+    tpEnvTys.pop()
+    pj = pj + 1
+  }
+  resIx
+}
+
 function nameToTy(name: string): i32 {
   // An inline UNION `A | B | null` — the parser joins the members with `|` into one
   // synthetic name. Split on TOP-LEVEL `|`s (depth-aware), resolve each member, and
@@ -2102,9 +2274,48 @@ function nameToTy(name: string): i32 {
       return mkObjTy(fnames, ftys)
     }
   }
+  // A live type-parameter BINDING (a generic function's `<T>` while its
+  // annotations resolve via `resolveAnnot`, or a generic alias application's
+  // params while its body resolves via `applyGenAlias`) — innermost wins.
+  let tpi = tpEnvNames.length - 1
+  while tpi >= 0 {
+    if tpEnvNames[tpi] == name {
+      return tpEnvTys[tpi]
+    }
+    tpi = tpi - 1
+  }
+  // A generic alias APPLICATION `Box<i32>` / `Pair<i32,string>` — the parser
+  // folds the arguments into the synthetic name; substitute them into the
+  // declared body (A10 stage 3).
+  if nlen >= 3 {
+    if name[nlen - 1] == '>' {
+      let ltAt = -1
+      let gj = 0
+      let ggoing = gj < nlen
+      while ggoing {
+        if name[gj] == '<' {
+          ltAt = gj
+          ggoing = false
+        } else {
+          gj = gj + 1
+          ggoing = gj < nlen
+        }
+      }
+      if ltAt > 0 {
+        return applyGenAlias(name.slice(0, ltAt), name.slice(ltAt + 1, nlen - 1))
+      }
+    }
+  }
   // A declared struct/union type (registered by the program's pre-pass).
   if cUserTypes.has(name) {
     return cUserTypes[name] ?? -1
+  }
+  // A BARE reference to a generic alias has no concrete type — its parameters
+  // were never supplied (host: `Generic type … was used without any`).
+  if gaIndexOf(name) >= 0 {
+    tErr("Generic type `" + name +
+      "` expects type arguments but was used without any", -1)
+    return TY_ERR
   }
   -1
 }
@@ -2760,6 +2971,192 @@ function bindOf(bNames: string[], bTys: i32[], name: string): i32 {
   -1
 }
 
+// Generic CALL-SITE binding, deep (host `instantiateFunctionType`): walk an
+// expected parameter type against the argument's actual type and bind every
+// TyVar leaf — a declared type param (`T`) or an inference hole (`?f.N`) — on
+// FIRST use. Later uses are checked by the caller against the SUBSTITUTED
+// expected type (`substTyDeep`), so disagreeing uses still error
+// (generics/return-correlation). Nested positions bind too: a `Box<T>` param
+// (`{value: T}`) pins `T` from the argument's field, a callback param's
+// signature from the argument function. Recursion over a cyclic arena (a
+// recursive named type) is cut by the visited-pair stack.
+function bindGenWalk(expIx: i32, atIx: i32, bNames: string[], bTys: i32[]): i32 {
+  if expIx < 0 || atIx < 0 {
+    return 0
+  }
+  let e = T.tys[expIx]
+  if e is TyVar {
+    if bindOf(bNames, bTys, e.tvName) < 0 {
+      bNames.push(e.tvName)
+      bTys.push(atIx)
+    }
+    return 0
+  }
+  let gi = bgSrcStack.length - 1
+  while gi >= 0 {
+    if bgSrcStack[gi] == expIx && bgDstStack[gi] == atIx {
+      return 0
+    }
+    gi = gi - 1
+  }
+  bgSrcStack.push(expIx)
+  bgDstStack.push(atIx)
+  let a = T.tys[atIx]
+  if e is TyArray {
+    if a is TyArray {
+      bindGenWalk(e.aElem, a.aElem, bNames, bTys)
+    }
+  } else if e is TyNullable {
+    if a is TyNullable {
+      bindGenWalk(e.nInner, a.nInner, bNames, bTys)
+    } else if atIx != TY_NULL {
+      bindGenWalk(e.nInner, atIx, bNames, bTys)
+    }
+  } else if e is TyObj {
+    if a is TyObj {
+      let enames = e.objFieldNames
+      let etys = e.objFieldTypes
+      let i = 0
+      while i < enames.length {
+        let sf = objFieldType(a, enames[i])
+        if sf >= 0 {
+          bindGenWalk(etys[i], sf, bNames, bTys)
+        }
+        i = i + 1
+      }
+    }
+  } else if e is TyFunc {
+    if a is TyFunc {
+      let ep = e.fnParamTypes
+      let ap = a.fnParamTypes
+      let i = 0
+      while i < ep.length {
+        if i < ap.length {
+          bindGenWalk(ep[i], ap[i], bNames, bTys)
+        }
+        i = i + 1
+      }
+      bindGenWalk(e.fnRet, a.fnRet, bNames, bTys)
+    }
+  }
+  bgSrcStack.pop()
+  bgDstStack.pop()
+  0
+}
+
+// Deep substitution of a call's bindings into a type (host: instantiate-and-
+// collapse): a bound TyVar becomes its binding; a DERIVED return hole
+// `?ret.<calleeHole>` collapses to the pinned function's return (the body
+// called a hole param — `function apply(fn, a, b) fn(a, b)`); composites
+// rebuild ONLY when a child actually changed, so a concrete type keeps its
+// arena identity (and the in-place pinning semantics that ride on it).
+// Cyclic arenas (recursive named types) return themselves unchanged.
+function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]): i32 {
+  if tyIx < 0 || bNames.length == 0 {
+    return tyIx
+  }
+  let t = T.tys[tyIx]
+  if t is TyVar {
+    let b = bindOf(bNames, bTys, t.tvName)
+    if b >= 0 {
+      return b
+    }
+    if t.tvName.length > 5 {
+      if t.tvName.slice(0, 5) == "?ret." {
+        let inner = bindOf(bNames, bTys, t.tvName.slice(5, t.tvName.length))
+        if inner >= 0 {
+          let it = T.tys[inner]
+          if it is TyFunc {
+            return it.fnRet
+          }
+        }
+      }
+    }
+    return tyIx
+  }
+  let si = stSeenStack.length - 1
+  while si >= 0 {
+    if stSeenStack[si] == tyIx {
+      return tyIx
+    }
+    si = si - 1
+  }
+  stSeenStack.push(tyIx)
+  let res = tyIx
+  if t is TyArray {
+    let e2 = substTyDeep(t.aElem, bNames, bTys)
+    if e2 != t.aElem {
+      res = mkArrayTy(e2)
+    }
+  } else if t is TyNullable {
+    let n2 = substTyDeep(t.nInner, bNames, bTys)
+    if n2 != t.nInner {
+      res = mkNullableTy(n2)
+    }
+  } else if t is TyObj {
+    let onames = t.objFieldNames
+    let otys = t.objFieldTypes
+    let out: i32[] = []
+    let changed = false
+    let i = 0
+    while i < otys.length {
+      let f2 = substTyDeep(otys[i], bNames, bTys)
+      if f2 != otys[i] {
+        changed = true
+      }
+      out.push(f2)
+      i = i + 1
+    }
+    if changed {
+      let nn: string[] = []
+      let j = 0
+      while j < onames.length {
+        nn.push(onames[j])
+        j = j + 1
+      }
+      res = mkObjTy(nn, out)
+    }
+  } else if t is TyFunc {
+    let ps = t.fnParamTypes
+    let out2: i32[] = []
+    let changed2 = false
+    let k = 0
+    while k < ps.length {
+      let p2 = substTyDeep(ps[k], bNames, bTys)
+      if p2 != ps[k] {
+        changed2 = true
+      }
+      out2.push(p2)
+      k = k + 1
+    }
+    let r2 = substTyDeep(t.fnRet, bNames, bTys)
+    if r2 != t.fnRet {
+      changed2 = true
+    }
+    if changed2 {
+      res = mkFuncTy(out2, r2)
+    }
+  } else if t is TyUnion {
+    let ms = t.uMembers
+    let out3: i32[] = []
+    let changed3 = false
+    let u = 0
+    while u < ms.length {
+      let m2 = substTyDeep(ms[u], bNames, bTys)
+      if m2 != ms[u] {
+        changed3 = true
+      }
+      out3.push(m2)
+      u = u + 1
+    }
+    if changed3 {
+      res = mkUnionTy(out3)
+    }
+  }
+  stSeenStack.pop()
+  res
+}
+
 // A call expression: array-method builtins (`xs.push`), string-method builtins
 // (`.slice`/`.indexOf`/`.includes`/`.charCodeAt`), the `print`/`fromCodePoint`
 // builtins, then the generic function-call path (arity + per-arg assignability).
@@ -3251,36 +3648,11 @@ function checkCallNode(n: Call, ix: i32): i32 {
       }
       let at = checkNode(args[i])
       expectedCbPending = false
-      let expected = params[i]
-      let pt2 = T.tys[expected]
-      if pt2 is TyVar {
-        let b0 = bindOf(bNames, bTys, pt2.tvName)
-        if b0 >= 0 {
-          expected = b0
-        } else {
-          bNames.push(pt2.tvName)
-          bTys.push(at)
-          expected = at
-        }
-      } else if pt2 is TyArray {
-        let elemIx = pt2.aElem
-        if elemIx >= 0 {
-          let et2 = T.tys[elemIx]
-          if et2 is TyVar {
-            let at2 = T.tys[at]
-            if at2 is TyArray {
-              let b1 = bindOf(bNames, bTys, et2.tvName)
-              if b1 >= 0 {
-                expected = mkArrayTy(b1)
-              } else {
-                bNames.push(et2.tvName)
-                bTys.push(at2.aElem)
-                expected = at
-              }
-            }
-          }
-        }
-      }
+      // Bind every TyVar reachable in the expected param position from the
+      // argument's shape (first use wins), then check the argument against the
+      // SUBSTITUTED expected type — a later disagreeing use errors here.
+      bindGenWalk(params[i], at, bNames, bTys)
+      let expected = substTyDeep(params[i], bNames, bTys)
       // Passing an empty-collection argument into a concrete `T[]` / map param pins
       // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
       // clearing its uninferred floor — pure downstream-usage inference, no push.
@@ -3291,43 +3663,13 @@ function checkCallNode(n: Call, ix: i32): i32 {
       }
       i = i + 1
     }
-    // Substitute the binding into a generic return type.
+    // Substitute the binding into a generic return type — deep, so a
+    // structural return (`{first: B, second: A}`, a generic alias body, a
+    // function-typed field) concretizes per call site; a DERIVED `?ret.` hole
+    // collapses to the pinned callee's return (see `substTyDeep`, which keeps
+    // `functions/inferred-return-soundness.vl` rejecting).
     if bNames.length > 0 {
-      let rt3 = T.tys[retTy]
-      if rt3 is TyVar {
-        let rb = bindOf(bNames, bTys, rt3.tvName)
-        if rb >= 0 {
-          retTy = rb
-        } else if rt3.tvName.length > 5 {
-          if rt3.tvName.slice(0, 5) == "?ret." {
-            // A DERIVED hole `?ret.<calleeHole>` — the body called a hole param
-            // (`function apply(fn, a, b) fn(a, b)`). When THIS call site pins
-            // the callee hole to a concrete function, the call's result is that
-            // function's RETURN (the host's instantiate-and-collapse), so an
-            // unsound flow (`__store_i32__(4, apply(addf, 1, 2))` with an
-            // f64-returning `addf`) REJECTS instead of riding an unconstrained
-            // hole (`functions/inferred-return-soundness.vl`).
-            let inner = bindOf(bNames, bTys, rt3.tvName.slice(5, rt3.tvName.length))
-            if inner >= 0 {
-              let it = T.tys[inner]
-              if it is TyFunc {
-                retTy = it.fnRet
-              }
-            }
-          }
-        }
-      } else if rt3 is TyArray {
-        let re = rt3.aElem
-        if re >= 0 {
-          let re2 = T.tys[re]
-          if re2 is TyVar {
-            let rb2 = bindOf(bNames, bTys, re2.tvName)
-            if rb2 >= 0 {
-              retTy = mkArrayTy(rb2)
-            }
-          }
-        }
-      }
+      retTy = substTyDeep(retTy, bNames, bTys)
     }
     return retTy
   }
@@ -3354,30 +3696,28 @@ function checkCallNode(n: Call, ix: i32): i32 {
 }
 
 // Resolve a written annotation NAME in the context of generic type-parameter
-// names: a bare type-param resolves to its TyVar, `T[]` to an array of it; any
-// other name falls through to `nameToTy`.
+// names: the type params bind to their TyVars in the type-param ENVIRONMENT
+// consulted by `nameToTy`, so a bare `T`, a `T[]` suffix, a structural
+// `{first: B, second: A}`, and a generic alias application `Box<T>` all
+// resolve through the one name grammar with the params substituted.
 function resolveAnnot(name: string, typarams: string[]): i32 {
+  if typarams.length == 0 {
+    return nameToTy(name)
+  }
   let i = 0
   while i < typarams.length {
-    if typarams[i] == name {
-      return mkTyVar(name)
-    }
+    tpEnvNames.push(typarams[i])
+    tpEnvTys.push(mkTyVar(typarams[i]))
     i = i + 1
   }
-  let nlen = name.length
-  if nlen >= 2 {
-    if name[nlen - 2] == '[' && name[nlen - 1] == ']' {
-      let base = name.slice(0, nlen - 2)
-      let j = 0
-      while j < typarams.length {
-        if typarams[j] == base {
-          return mkArrayTy(mkTyVar(base))
-        }
-        j = j + 1
-      }
-    }
+  let r = nameToTy(name)
+  let j = 0
+  while j < typarams.length {
+    tpEnvNames.pop()
+    tpEnvTys.pop()
+    j = j + 1
   }
-  nameToTy(name)
+  r
 }
 
 // Is `name` currently being inferred (on the in-progress stack)?
@@ -3858,9 +4198,33 @@ function checkProgramNode(n: Program): i32 {
   while t0 < stmts.length {
     let sd0 = P.nodes[stmts[t0]]
     if sd0 is TypeDecl {
-      let fnames0: string[] = []
-      let ftys0: i32[] = []
-      cUserTypes[sd0.tdName] = mkObjTy(fnames0, ftys0)
+      // A GENERIC alias (`type Box<T> = …` — the parser folds the params into
+      // the declared name "Box<T>") registers in the generic-alias registry,
+      // NOT in `cUserTypes`: it has no concrete type until applied. Pass 0b
+      // skips it (its `cUserTypes` lookup misses); each application resolves
+      // its fields under the param→argument bindings (`applyGenAlias`).
+      let gname = sd0.tdName
+      let gLt = -1
+      let gk = 0
+      let gGoing = gk < gname.length
+      while gGoing {
+        if gname[gk] == '<' {
+          gLt = gk
+          gGoing = false
+        } else {
+          gk = gk + 1
+          gGoing = gk < gname.length
+        }
+      }
+      if gLt > 0 {
+        gaNames.push(gname.slice(0, gLt))
+        gaParamLists.push(gname.slice(gLt + 1, gname.length - 1))
+        gaDeclIxs.push(stmts[t0])
+      } else {
+        let fnames0: string[] = []
+        let ftys0: i32[] = []
+        cUserTypes[sd0.tdName] = mkObjTy(fnames0, ftys0)
+      }
     } else if sd0 is UnionDecl {
       let members0: i32[] = []
       cUserTypes[sd0.udName] = mkUnionTy(members0)
