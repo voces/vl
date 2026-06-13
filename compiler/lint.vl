@@ -17,13 +17,14 @@
 //     binding KIND only — not `mutable` / `exported` / `isImport` / `isWrite`.
 //   - The native AST has no full-span side-table: `nodeToks[i]` anchors a node at
 //     its LAST token only (`ast.vl`; full start/stop spans are scoped but not
-//     built — see docs/selfhost-spans-design.md).
-// So the rules implemented here are the ones derivable from the AST ALONE, and
-// every diagnostic is anchored at a single `line:col` (the node's anchor token),
-// not the full range the TS lint emits. The binding-metadata rules
-// (unused-variable / unused-parameter / prefer-const / unused-import /
-// empty-intersection) are NOT ported — they need symbol-table fields the native
-// front end does not yet produce. See the report for the precise gap inventory.
+//     built — see docs/selfhost-spans-design.md). The native parser also DROPS
+//     the `export` modifier from the AST entirely.
+// So this port reconstructs what the TS rules need DIRECTLY from the AST + token
+// stream: use/write information by NAME (a name is used iff referenced, written
+// iff an assignment LHS), and the `export` modifier by token scan (an `EXPORT`
+// keyword two tokens before a declaration's name). Every diagnostic is anchored
+// at a single `line:col` — the node's anchor / name / keyword token — not the
+// full start-stop range the TS lint emits (the span gap above).
 //
 // Rules ported (byte-identical code/message/severity; single-point span):
 //   - constant-condition  : `if false {…}` / `if true {…} else {…}` /
@@ -35,6 +36,22 @@
 //   - unused-function     : a non-exported, never-referenced top-level
 //                           `function` (reference set collected from the AST,
 //                           matching the TS `collectReferencedNames` model).
+//   - unused-variable     : an unread `variable` / `parameter` binding (a `_`
+//                           name downgrades to a `hint`; exported top-level
+//                           bindings are exempt).
+//   - prefer-const        : a `let` that is read but never reassigned.
+//
+// NOT ported (need metadata the native front end does not produce):
+//   - unused-import       : no `isImport` binding flag in the native model.
+//   - empty-intersection  : needs the `emptyIntersectionInfo` records the type
+//     checker attaches; the native type checker ALREADY emits the equivalent
+//     `never`-type error itself, so the standalone lint adds nothing here.
+//
+// KNOWN DIVERGENCE (name-keying vs binding identity): use/write tracking keys by
+// NAME, so a file that SHADOWS a name (an inner binding reusing an outer name, or
+// a method/field whose name equals a function's) can differ from the oracle's
+// binding-identity model. Exact for programs without same-name shadowing (the
+// common case and the whole lint corpus).
 
 import { P, Node, nodeToks, declNameTokOf } from "./ast"
 import {
