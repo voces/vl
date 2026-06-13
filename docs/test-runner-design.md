@@ -24,14 +24,20 @@ The runner splits along the same line as the compiler itself (`main.rs`
 charter: "the brains land in the wasm, the adapter stays an I/O shim"):
 
 - **`std:test/runner` — a VL program — owns all POLICY**: CLI-arg
-  interpretation (the host passes argv through), glob/filter matching, the
-  plan (which tests run where, `.only`/skip resolution, ordering), report
-  formatting (the spec/dot trees, the summary line), and the exit-code
-  decision.
+  interpretation (the host passes argv through), the directory WALK and
+  glob/filter matching (over raw fs primitives — below), the plan (which
+  tests run where, `.only`/skip resolution, ordering), report formatting
+  (the spec/dot trees, the summary line), and the exit-code decision.
 - **The Rust host owns only the MECHANISM the wasm capability model cannot
-  express**: filesystem walk/read, the thread pool, wasm instance lifecycle
-  (instantiate/kill/re-instantiate), print-sink capture buffers, per-call
-  trap catching, and timeouts (epoch interruption).
+  express**, exposed as RAW primitives, never policy: `listDir(path)` →
+  entries (name, isDir) — the walk recursion, skip lists, and glob matching
+  are VL code consuming it; `readFile`; the thread pool; wasm instance
+  lifecycle (instantiate/kill/re-instantiate); print-sink capture buffers;
+  per-call trap catching; timeouts (epoch interruption). (A batched
+  `walk`/`glob` primitive is a later PERF option if pumping `listDir`
+  per-directory ever shows up; start with the rawest primitive that works —
+  it is also exactly `fd_readdir`, so the VL walk code survives the WASI
+  transition with only the primitive's transport changing.)
 
 The two talk through a **command-queue protocol** — the same shape as the H3
 module fetch loop (the wasm holds a pending list; the host drains it and
@@ -68,9 +74,18 @@ down from ~450 in the all-Rust draft.
    into `std:test`'s module-level registry and nothing else
    (registration-only `describe` bodies — the Deno-steps lesson; document
    loudly, lint later).
-2. **Plan**: the runner reads each file's registry (`vltCount`,
-   `vltNameLen/At(i)` — the full `describe/…/it` slash-path — relayed by the
-   host), applies filters (`-t`, `.only`, `.skip`), and schedules.
+2. **Plan**: the runner reads each file's registry, relayed by the host.
+   Mechanically (no strings-as-code, no parsing): the RUNNER instance issues
+   a `collect <path>` command; the host compiles + instantiates that TEST
+   FILE as a second instance, whose start function has just run the
+   registrations; the host then reads the test file's registry through ITS
+   exports (`vltCount()`, then per test the slash-path name via the
+   per-codepoint `vltNameLen(i)`/`vltNameAt(i, j)` idiom — the same
+   string-crossing protocol the compiler driver and fetch loop already use)
+   and commits the entries into the runner instance through the runner's
+   push/commit exports. Two live instances, host as relay; nothing is ever
+   evaluated from strings. The runner then applies filters (`-t`, `.only`,
+   `.skip`) and schedules.
 3. **Execute**: `vltRun(i): i32` per test (0 pass; a failed expectation
    prints its rendered FAIL line and `__trap__()`s — the host catches the
    trap for that call, reports it to the runner, and continues). Hooks run
@@ -150,23 +165,40 @@ file FAILs and the run continues), 2 usage — consistent with the binary today.
   args accept files, dirs, or globs (`vl test 'src/**/parser*'`).
 - `-t <substring/regex>` matches the slash-path (`describe/inner/it name` —
   go test's `-run` hierarchy, the survey's standout filter UX).
-- `.only` (registers as only-mode), `.skip(reason)`, `.todo(name)` — one
-  canonical spelling, no `fit`/`xit` aliases (jasmine's focused/excluded
-  shorthands are pure aliases for the same registration bits; one way to say
-  it). Two-phase registration makes `.only` naturally SINGLE-PASS: the
-  registry marks focused entries during collect, the plan simply drops the
-  rest — no re-run, no second walk. `--forbid-only` for CI. Runtime
-  `skip(reason)` inside a test marks SKIP (environment-dependent skips
-  without conditional attributes).
+- **Focused/skipped tests — `.only`/`.skip(reason)`/`.todo(name)`.** The
+  ecosystem survey splits cleanly: in-code focus markers are a JS idiom
+  (jest/vitest `.only`, jasmine `fit`/`xit` — pure aliases for the same
+  bits); the typed/compiled ecosystems do RUNNER-SIDE selection instead —
+  Go has no focus marker (`go test -run Name` filters), Rust has
+  `cargo test <filter>` + `#[ignore]` (run them back with `--ignored`),
+  Swift Testing has `.disabled(reason)` + runner/IDE filters, JUnit/Kotlin
+  `@Disabled`/`@Tag` + engine filters, pytest `-k`/marks, ExUnit tags +
+  `path:line`. Their reasoning: edit-code-to-configure-a-run is a footgun (a
+  committed focus mark silently skips the suite). VL keeps BOTH halves:
+  `-t`/path filters are the primary selection mechanism (and `path:line`
+  targeting once call-site injection lands — the ExUnit workflow), and
+  `.only` exists for the editor-proximate jest workflow with
+  `--forbid-only` as the CI guard. One spelling, no `fit`/`xit` aliases.
+  Two-phase registration makes `.only` naturally SINGLE-PASS: the registry
+  marks focused entries during collect, the plan drops the rest — no re-run.
+  `.skip(reason)` doubles as the `#[ignore]`/`@Disabled` analog (reasons
+  surface in the report); runtime `skip(reason)` inside a test marks SKIP
+  (environment-dependent skips without conditional attributes).
 - **Changed-file selection (jest's `--changedSince`, chartered v2)**: the
-  module graph already exists in the compiler — map `git status`-dirty files
-  through the import closure to the affected `*.test.vl` set. Defaults per
-  the maintainer: working tree dirty → affected tests; clean → all.
-  `--changed-priority` for CI: run everything, AFFECTED FIRST, so a likely
-  failure surfaces in seconds while the full run continues (fail-fast
-  ordering without losing coverage). The graph walk is VL-side (the runner
-  brain — the compiler's own module scanner is reachable there); `git
-  status` is one host command primitive.
+  module graph already exists in the compiler — map changed files through
+  the import closure to the affected `*.test.vl` set. There are TWO change
+  ranges, both workable (each is just a different `git diff --name-only`
+  feeding the same closure): (a) the WORKING TREE (uncommitted edits —
+  `git status`), the local-loop default; (b) AGAINST A BASE
+  (`--changed-since=<ref>`, typically `origin/master` — the branch's whole
+  diff), the CI/branch range. Defaults per the maintainer: working tree
+  dirty → affected tests; clean → all (locally; falling back to (b) against
+  the branch base when on a branch is a possible refinement — decide from
+  use). `--changed-priority[=<ref>]` for CI: run everything, AFFECTED FIRST,
+  so a likely failure surfaces in seconds while the full run continues
+  (fail-fast ordering without losing coverage). The graph walk is VL-side
+  (the runner brain — the compiler's own module scanner is reachable there);
+  the git queries are one host command primitive.
 - `path.test.vl:42` line targeting and `--failed-first` ride the
   compiler-injected call-site work (below) and the JSON event stream — v2.
 

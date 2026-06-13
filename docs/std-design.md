@@ -253,15 +253,15 @@ parallelism, and output capture live). The maintainer's direction: jest-shaped
   exports don't survive either module pipeline until slice 2. So v1 ships
   `expect(v: i32 | i64 | f64 | boolean | string)` (a value union — one
   `expect` name, no `expectI32` splay, no overloading needed) returning an
-  `Expectation` struct; `.toBe(w)` compares via union `==`, `.not()` inverts,
-  failure renders via `std:fmt`. `expect<T>` over structs/lists is the v2
-  upgrade (after slice 2), and its `==` already works.
-- **Matcher naming: one matcher, `.toBe`, meaning VL `==`.** Jest's
-  `toBe`/`toEqual` split exists because JS has two equalities (identity vs
-  deep). VL has ONE today — `==` is structural everywhere — so v1 has one
-  matcher. If/when a referential-identity operator lands (ROADMAP A15 `===`),
-  `.toBeIdentical` can join; `.toEqual` is reserved as a future alias
-  decision, not v1 surface.
+  `Expectation` struct; `.toEqual(w)` compares via union `==`, `.not()`
+  inverts, failure renders via `std:fmt`. `expect<T>` over structs/lists is
+  the v2 upgrade (after slice 2), and its `==` already works.
+- **Matcher naming (maintainer call): `.toEqual` = structural VL `==`, same
+  as jest; `.toBe` is RESERVED for referential identity and lands with the
+  `===` operator (ROADMAP A15) — not v1 surface.** Jest's split exists
+  because JS has two equalities; VL has one today (`==` is structural
+  everywhere), so v1 ships only `.toEqual` and the names stay
+  jest-compatible when the second equality arrives.
 - **Failure contract: record-print-trap.** A failing matcher prints one
   rendered line (`FAIL <test name>: expected …, got …`), then `__trap__()` —
   the test aborts (jest semantics: a test stops at its first failed
@@ -329,7 +329,7 @@ Dependencies: 0 and 1 independent; 2 independent of 3; 3 needs 1; 4 needs
   semantics) is chosen; a collect-all-expectations mode is a v2 runner policy.
 - **OD4 — LSP go-to-def into std**: workspace-`std/`-only navigation for v1.
 - **OD5 — `print` stays builtin through Phase 2.**
-- **OD6 — naming: RESOLVED `std:test`** (maintainer call on the PR review).
-  Matchers: v1 has only `.toBe` = VL `==` (structural — see D5); the
-  jest `toBe`/`toEqual` split has no meaning until a referential `===`
-  exists (A15).
+- **OD6 — naming: RESOLVED** (maintainer calls on the PR review): the module
+  is `std:test`; the v1 matcher is `.toEqual` = structural VL `==` (jest
+  semantics), with `.toBe` reserved for referential identity alongside the
+  future `===` (A15).
