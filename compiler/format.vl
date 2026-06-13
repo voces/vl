@@ -1,0 +1,1022 @@
+// AST-driven source formatter for VL, written in VL — the self-hosting
+// counterpart of `compiler/format.ts` (roadmap D4). `format(source)` tokenizes
+// and parses the source to the native arena AST (`compiler/ast.vl` +
+// `compiler/parser.vl`), then walks that arena and GENERATES canonical VL
+// source from it — it does not reformat the token stream.
+//
+// ── Faithfulness boundary vs the TS oracle ───────────────────────────────────
+// `compiler/format.ts` is the byte-for-byte spec. It reaches byte-identity by
+// leaning on three pieces of parser infrastructure that the NATIVE pipeline does
+// not yet record, so this port cannot match the oracle wherever a file uses them:
+//
+//   1. COMMENTS. The native lexer (`compiler/lexer.vl`) SKIPS `//` and `///`
+//      comments entirely — they never reach the token stream, so no comment
+//      trivia survives to re-emit. format.ts threads a flat `Comment[]` (with
+//      placement / `//` vs `///` kind / source line) out of `checkOnly` and
+//      re-attaches each. Any file with a comment cannot round-trip here.
+//
+//   2. PER-NODE CHAR SPANS. The native AST records only `nodeToks[i]` — the
+//      INDEX of the last token consumed for node `i` — not a start/stop
+//      `Context`. format.ts slices verbatim source for every TYPE and PARAMETER
+//      surface (var/param/return annotations, `is` check-types, function
+//      headers, whole `type` aliases) and for its hard-construct verbatim
+//      fallback. With no node span this port RECONSTRUCTS types from the
+//      parser's synthetic `tyName` string, which is byte-identical only for
+//      simple types (it has already canonicalized whitespace, `i32[]`, `A|B`).
+//
+//   3. REPRINT-FIDELITY FIELDS. The native parser DESUGARS at parse time and
+//      keeps no surface marker: `a += b` becomes `BinExpr("=", a, BinExpr("+",
+//      a, b))` (no `compoundOperator`), `x !is T` becomes `Unary("!", IsExpr)`,
+//      `p++` becomes a `"p+"` unary over an assignment. format.ts reprints the
+//      surface form from `compoundOperator` / the `Is` negate flag / spans;
+//      this port reprints the DESUGARED form, which diverges on those inputs.
+//
+// What this module DOES faithfully port: the structural printer for the
+// comment-free / simple-type subset — literals, names, binary/unary chains with
+// precedence-minimal parens and width reflow, member / index / call access,
+// object / array literals, `if`/`elseif`/`else` (block, inline-`then`, and the
+// one-line collapse + chain layout), `while` / `for` / `for-in` loops, `return`
+// / `break` / `continue`, `let`/`const` with reconstructed annotations, function
+// declarations with reconstructed headers, and the list-wrapping / trailing-comma
+// policy. The number/string/char/bool/null literals are emitted from their raw
+// lexeme (`numText` / `strText` / `charText`), preserving base and escapes.
+
+import { Tok, P } from "./ast"
+import {
+  Node,
+  NumLit,
+  StrLit,
+  CharLit,
+  BoolLit,
+  NullLit,
+  Ident,
+  Unary,
+  BinExpr,
+  Call,
+  Member,
+  OptMember,
+  Paren,
+  LetDecl,
+  Param,
+  TypeRef,
+  FuncDecl,
+  IfStmt,
+  WhileStmt,
+  BreakStmt,
+  ContinueStmt,
+  ForRange,
+  ForIn,
+  RetStmt,
+  Block,
+  Program,
+  FieldDef,
+  TypeDecl,
+  FieldInit,
+  ObjLit,
+  ArrayLit,
+  Index,
+  UnionDecl,
+  IsExpr,
+} from "./ast"
+import { tokenize } from "./lexer"
+import { parseProgram } from "./parser"
+
+let INDENT = "  "
+let WIDTH = 80
+
+// ── precedence (mirrors the parser's infix binding power / format.ts) ─────────
+// Bitwise `| ^ &` below equality/relational; shifts between relational and
+// additive. All binary operators are left-associative.
+function binPrec(op: string): i32 {
+  if op == "||" { return 4 }
+  if op == "&&" { return 6 }
+  if op == "|" { return 7 }
+  if op == "^" { return 8 }
+  if op == "&" { return 9 }
+  if op == "==" { return 10 }
+  if op == "!=" { return 10 }
+  if op == "<" { return 12 }
+  if op == "<=" { return 12 }
+  if op == ">" { return 12 }
+  if op == ">=" { return 12 }
+  if op == "<<" { return 13 }
+  if op == ">>" { return 13 }
+  if op == ">>>" { return 13 }
+  if op == "+" { return 14 }
+  if op == "-" { return 14 }
+  if op == "*" { return 16 }
+  if op == "/" { return 16 }
+  if op == "%" { return 16 }
+  0
+}
+
+function isAlphaNum(c: i32): boolean {
+  if c >= 'a' && c <= 'z' { return true }
+  if c >= 'A' && c <= 'Z' { return true }
+  if c >= '0' && c <= '9' { return true }
+  if c == '_' { return true }
+  c == '$'
+}
+
+// Whether `s` is a plain identifier (the `/^[A-Za-z_$][A-Za-z0-9_$]*$/` test in
+// format.ts) — the gate that separates a faithful structural reprint from a
+// desugared operator/index name this port cannot recover.
+function isIdentifier(s: string): boolean {
+  if s.length == 0 { return false }
+  let c0 = s.charCodeAt(0)
+  let okStart = (c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_' || c0 == '$'
+  if !okStart { return false }
+  let i = 1
+  while i < s.length {
+    if !isAlphaNum(s.charCodeAt(i)) { return false }
+    i = i + 1
+  }
+  true
+}
+
+function indentStr(n: i32): string {
+  let out = ""
+  let i = 0
+  while i < n {
+    out = out + INDENT
+    i = i + 1
+  }
+  out
+}
+
+// Whether `s` contains a newline (a multi-line rendering that blocks a one-line
+// collapse). VL strings expose `charCodeAt`/`length`, so scan for `\n` (10).
+function hasNewline(s: string): boolean {
+  let i = 0
+  while i < s.length {
+    if s.charCodeAt(i) == 10 { return true }
+    i = i + 1
+  }
+  false
+}
+
+// ── output buffer ─────────────────────────────────────────────────────────────
+// A statement emitter appends whole physical lines; the program tail normalizes
+// whitespace once.
+let outBuf = ""
+function emit(s: string): i32 {
+  outBuf = outBuf + s
+  0
+}
+function emitLine(indent: i32, text: string): i32 {
+  emit(indentStr(indent) + text + "\n")
+}
+
+// ── arena access ──────────────────────────────────────────────────────────────
+function nodeAt(i: i32): Node {
+  P.nodes[i]
+}
+
+// ── expression printer ────────────────────────────────────────────────────────
+// `column` is the visual column the expression's first line starts at (its indent
+// already applied by the caller), used to decide reflow. Returns possibly-
+// multiline text with continuation lines indented relative to `indent`.
+
+function exprAt(i: i32, indent: i32, column: i32): string {
+  if i < 0 { return "" }
+  let n = nodeAt(i)
+  if n is NumLit { return n.numText }
+  if n is StrLit { return n.strText }
+  if n is CharLit { return n.charText }
+  if n is BoolLit {
+    if n.boolVal != 0 { return "true" }
+    return "false"
+  }
+  if n is NullLit { return n.nullKw }
+  if n is Ident { return n.identName }
+  if n is Paren {
+    // The parser keeps a `( e )` group as a Paren node; the printer re-inserts
+    // parens only where precedence demands. A surface group around a composite
+    // whose precedence already forces parens elsewhere is dropped; otherwise keep.
+    return "(" + exprAt(n.parInner, indent, column + 1) + ")"
+  }
+  if n is Unary { return unaryStr(n, indent, column) }
+  if n is BinExpr { return binaryStr(n, indent, column) }
+  if n is IsExpr {
+    let value = primaryStr(n.isObj, indent, column)
+    return value + " is " + n.isVariant
+  }
+  if n is Member { return memberStr(n, indent, column) }
+  if n is OptMember {
+    return primaryStr(n.omObj, indent, column) + "?." + n.omProp
+  }
+  if n is Index {
+    return primaryStr(n.idxArr, indent, column) + "[" + exprAt(n.idxIndex, indent, column) + "]"
+  }
+  if n is Call { return callStr(n, indent, column) }
+  if n is ObjLit { return objLitStr(n, indent, column) }
+  if n is ArrayLit { return arrayLitStr(n, indent, column) }
+  if n is FuncDecl { return funcExprStr(n, indent) }
+  if n is IfStmt { return ifExprStr(n, indent) }
+  ""
+}
+
+// Receiver position of `.`/`?.`/`[]`/call: a composite operand is parenthesized
+// so the postfix binds the whole value (`(a + b).length`).
+function primaryStr(i: i32, indent: i32, column: i32): string {
+  if i < 0 { return "" }
+  let n = nodeAt(i)
+  let rendered = exprAt(i, indent, column)
+  if n is BinExpr { return "(" + rendered + ")" }
+  if n is Unary { return "(" + rendered + ")" }
+  if n is IsExpr { return "(" + rendered + ")" }
+  if n is IfStmt { return "(" + rendered + ")" }
+  rendered
+}
+
+function memberStr(n: Member, indent: i32, column: i32): string {
+  primaryStr(n.memObj, indent, column) + "." + n.memProp
+}
+
+function unaryStr(n: Unary, indent: i32, column: i32): string {
+  let operand = exprAt(n.unArg, indent, column)
+  let inner = nodeAt(n.unArg)
+  // `!` binds tighter than any binary/is operand, so a composite operand needs
+  // parens to preserve grouping (`!(a > b)`).
+  if n.unOp == "!" {
+    if inner is BinExpr { operand = "(" + operand + ")" }
+    if inner is IsExpr { operand = "(" + operand + ")" }
+  }
+  // The native parser encodes only PREFIX unary operators as `Unary` (postfix
+  // `++`/`--` desugar to a `"p+"`/`"p-"` tag over an assignment, handled below).
+  if n.unOp == "p+" || n.unOp == "p-" { return operand }
+  n.unOp + operand
+}
+
+function binaryStr(n: BinExpr, indent: i32, column: i32): string {
+  if n.binOp == "=" {
+    let left = exprAt(n.binLeft, indent, column)
+    let right = exprAt(n.binRight, indent, column + left.length + 3)
+    return left + " = " + right
+  }
+  binaryChainStr(n, indent, column)
+}
+
+// An n-ary chain of same-precedence left-associative operators, reflowed if long.
+// The flattened parts are collected into module-global parallel lists to avoid a
+// recursive closure (the arena is index-based, no node holds its children).
+let chainOps: string[] = []
+let chainTexts: string[] = []
+
+function chainFlatten(i: i32, leading: string, prec: i32, indent: i32, column: i32): i32 {
+  let n = nodeAt(i)
+  if n is BinExpr {
+    if n.binOp != "=" {
+      if binPrec(n.binOp) == prec {
+        chainFlatten(n.binLeft, leading, prec, indent, column)
+        chainFlatten(n.binRight, n.binOp, prec, indent, column)
+        return 0
+      }
+    }
+  }
+  let r = exprAt(i, indent, column)
+  let wrapped = parenForChain(i, r, prec)
+  chainOps.push(leading)
+  chainTexts.push(wrapped)
+  0
+}
+
+function parenForChain(i: i32, rendered: string, parentPrec: i32): string {
+  let n = nodeAt(i)
+  if n is BinExpr {
+    if n.binOp != "=" {
+      if binPrec(n.binOp) < parentPrec { return "(" + rendered + ")" }
+    }
+  }
+  rendered
+}
+
+function binaryChainStr(n: BinExpr, indent: i32, column: i32): string {
+  let prec = binPrec(n.binOp)
+  let savedOps = chainOps
+  let savedTexts = chainTexts
+  chainOps = []
+  chainTexts = []
+  chainFlatten(n.binLeft, "", prec, indent, column)
+  chainFlatten(n.binRight, n.binOp, prec, indent, column)
+  let ops = chainOps
+  let texts = chainTexts
+  chainOps = savedOps
+  chainTexts = savedTexts
+
+  let oneLine = ""
+  let i = 0
+  while i < texts.length {
+    if i > 0 { oneLine = oneLine + " " }
+    if ops[i] != "" { oneLine = oneLine + ops[i] + " " }
+    oneLine = oneLine + texts[i]
+    i = i + 1
+  }
+  if column + oneLine.length <= WIDTH {
+    if !hasNewline(oneLine) { return oneLine }
+  }
+  // Reflow: the operator rides the END of the previous line (the parser skips
+  // newlines after an infix operator, not before).
+  let result = texts[0] + " " + ops[1]
+  let j = 1
+  while j < texts.length {
+    let tail = ""
+    if j + 1 < texts.length { tail = " " + ops[j + 1] }
+    result = result + "\n" + INDENT + texts[j] + tail
+    j = j + 1
+  }
+  result
+}
+
+function ifExprStr(n: IfStmt, indent: i32): string {
+  // An `if` used as an expression value, rendered single-line as
+  // `if c then a [elseif … then …] [else b]`.
+  let cond = exprAt(n.ifCond, indent, 0)
+  let parts = "if " + cond + " then " + exprAt(n.ifThen, indent, 0)
+  if n.ifElse >= 0 {
+    let e = nodeAt(n.ifElse)
+    if e is IfStmt {
+      // `elseif` chain in expression position.
+      parts = parts + elseChainExpr(n.ifElse, indent)
+    } else {
+      parts = parts + " else " + exprAt(n.ifElse, indent, 0)
+    }
+  }
+  parts
+}
+
+function elseChainExpr(i: i32, indent: i32): string {
+  let n = nodeAt(i)
+  if n is IfStmt {
+    let cond = exprAt(n.ifCond, indent, 0)
+    let s = " elseif " + cond + " then " + exprAt(n.ifThen, indent, 0)
+    if n.ifElse >= 0 {
+      let e = nodeAt(n.ifElse)
+      if e is IfStmt {
+        return s + elseChainExpr(n.ifElse, indent)
+      }
+      return s + " else " + exprAt(n.ifElse, indent, 0)
+    }
+    return s
+  }
+  ""
+}
+
+function exprIsSimple(i: i32): boolean {
+  if i < 0 { return true }
+  let n = nodeAt(i)
+  if n is Block { return false }
+  if n is IfStmt { return false }
+  if n is WhileStmt { return false }
+  if n is ForRange { return false }
+  if n is ForIn { return false }
+  true
+}
+
+// ── calls / lists ─────────────────────────────────────────────────────────────
+function callStr(n: Call, indent: i32, column: i32): string {
+  let callee = exprAt(n.callFn, indent, column)
+  let items: string[] = []
+  let i = 0
+  while i < n.callArgs.length {
+    let nm = ""
+    if i < n.callArgNames.length { nm = n.callArgNames[i] }
+    let v = exprAt(n.callArgs[i], indent, column)
+    if nm != "" {
+      items.push(nm + ": " + v)
+    } else {
+      items.push(v)
+    }
+    i = i + 1
+  }
+  callee + wrapList("(", items, ")", indent, column + callee.length)
+}
+
+function objLitStr(n: ObjLit, indent: i32, column: i32): string {
+  if n.objFields.length == 0 { return "{}" }
+  let items: string[] = []
+  let i = 0
+  while i < n.objFields.length {
+    let f = nodeAt(n.objFields[i])
+    if f is FieldInit {
+      items.push(f.fiName + ": " + exprAt(f.fiValue, indent, column))
+    }
+    i = i + 1
+  }
+  wrapList("{ ", items, " }", indent, column)
+}
+
+function arrayLitStr(n: ArrayLit, indent: i32, column: i32): string {
+  if n.arrElems.length == 0 { return "[]" }
+  let items: string[] = []
+  let i = 0
+  while i < n.arrElems.length {
+    items.push(exprAt(n.arrElems[i], indent, column))
+    i = i + 1
+  }
+  wrapList("[", items, "]", indent, column)
+}
+
+// Render `open item, item, … close`, collapsing to one line when it fits in WIDTH
+// from `column`, otherwise one item per line with a TRAILING COMMA on every item
+// (the wrapped form) — the parser accepts a trailing comma in every list, so this
+// is idempotent. The single-line form never carries a trailing comma.
+function wrapList(open: string, items: string[], close: string, indent: i32, column: i32): string {
+  if items.length == 0 {
+    return trimStr(open) + trimStr(close)
+  }
+  let joined = ""
+  let i = 0
+  while i < items.length {
+    if i > 0 { joined = joined + ", " }
+    joined = joined + items[i]
+    i = i + 1
+  }
+  let oneLine = open + joined + close
+  if column + oneLine.length <= WIDTH {
+    if !hasNewline(oneLine) { return oneLine }
+  }
+  let pad = indentStr(indent + 1)
+  let closePad = indentStr(indent)
+  let openTok = trimEnd(open)
+  let closeTok = trimStart(close)
+  let body = ""
+  let j = 0
+  while j < items.length {
+    body = body + pad + items[j] + ",\n"
+    j = j + 1
+  }
+  openTok + "\n" + body + closePad + closeTok
+}
+
+// ── string trimming helpers (no std import in the concatenated build) ──────────
+function isSpace(c: i32): boolean {
+  c == 32 || c == 9 || c == 10 || c == 13
+}
+function trimStart(s: string): string {
+  let i = 0
+  while i < s.length {
+    if !isSpace(s.charCodeAt(i)) { return s.slice(i, s.length) }
+    i = i + 1
+  }
+  ""
+}
+function trimEnd(s: string): string {
+  let e = s.length
+  while e > 0 {
+    if !isSpace(s.charCodeAt(e - 1)) { return s.slice(0, e) }
+    e = e - 1
+  }
+  ""
+}
+function trimStr(s: string): string {
+  trimEnd(trimStart(s))
+}
+
+// ── type-annotation reconstruction ────────────────────────────────────────────
+// The parser collapses a type to a synthetic NAME (`i32[]`, `A|B`, `{[K]:V}`).
+// This reproduces only that canonical form — byte-identical to the oracle for a
+// simple name, divergent for a type whose source had non-canonical whitespace.
+function typeStr(i: i32): string {
+  if i < 0 { return "" }
+  let n = nodeAt(i)
+  if n is TypeRef { return n.tyName }
+  ""
+}
+
+// ── function header reconstruction ────────────────────────────────────────────
+function funcHeader(n: FuncDecl): string {
+  let head = "function"
+  if n.fnName != "" {
+    if isIdentifier(n.fnName) { head = head + " " + n.fnName }
+  }
+  // Generic type params `<T, U>`.
+  if n.fnTyParams.length > 0 {
+    let tp = ""
+    let i = 0
+    while i < n.fnTyParams.length {
+      if i > 0 { tp = tp + ", " }
+      tp = tp + n.fnTyParams[i]
+      i = i + 1
+    }
+    head = head + "<" + tp + ">"
+  }
+  let params: string[] = []
+  let j = 0
+  while j < n.fnParams.length {
+    let p = nodeAt(n.fnParams[j])
+    if p is Param {
+      if p.parType >= 0 {
+        params.push(p.parName + ": " + typeStr(p.parType))
+      } else {
+        params.push(p.parName)
+      }
+    }
+    j = j + 1
+  }
+  let ret = ""
+  if n.fnRet >= 0 { ret = ": " + typeStr(n.fnRet) }
+  head + wrapList("(", params, ")", 0, head.length + ret.length) + ret
+}
+
+function funcExprStr(n: FuncDecl, indent: i32): string {
+  let header = funcHeader(n)
+  if n.fnBody < 0 { return header + " {}" }
+  let b = nodeAt(n.fnBody)
+  if b is Block {
+    if b.blkStmts.length == 0 { return header + " {}" }
+    let saved = outBuf
+    outBuf = ""
+    emitStatements(b.blkStmts, indent + 1)
+    let inner = outBuf
+    outBuf = saved
+    return header + " {\n" + stripTrailingNewline(inner) + "\n" + indentStr(indent) + "}"
+  }
+  header + " " + statementInline(n.fnBody, indent)
+}
+
+function stripTrailingNewline(s: string): string {
+  if s.length > 0 {
+    if s.charCodeAt(s.length - 1) == 10 { return s.slice(0, s.length - 1) }
+  }
+  s
+}
+
+// ── statements ────────────────────────────────────────────────────────────────
+function emitStatements(stmts: i32[], indent: i32): i32 {
+  let i = 0
+  while i < stmts.length {
+    emitStatement(stmts[i], indent)
+    i = i + 1
+  }
+  0
+}
+
+// A "leaf" statement holds no nested statement list (collapsing it to one line is
+// the only re-layout option).
+function isLeafStatement(i: i32): boolean {
+  let n = nodeAt(i)
+  if n is WhileStmt { return false }
+  if n is ForRange { return false }
+  if n is ForIn { return false }
+  if n is IfStmt { return false }
+  if n is Block { return false }
+  if n is FuncDecl { return false }
+  true
+}
+
+// A one-line body rendering (expression or simple statement).
+function statementInline(i: i32, indent: i32): string {
+  let n = nodeAt(i)
+  if n is RetStmt {
+    if n.retArg < 0 { return "return" }
+    return "return " + exprAt(n.retArg, indent, 0)
+  }
+  if n is BreakStmt {
+    if n.brkLabel != "" { return "break " + n.brkLabel }
+    return "break"
+  }
+  if n is ContinueStmt {
+    if n.contLabel != "" { return "continue " + n.contLabel }
+    return "continue"
+  }
+  exprAt(i, indent, 0)
+}
+
+function emitStatement(i: i32, indent: i32): i32 {
+  let n = nodeAt(i)
+  if n is LetDecl { return emitLet(n, indent) }
+  if n is RetStmt { return emitReturn(n, indent) }
+  if n is WhileStmt { return emitWhile(n, indent) }
+  if n is ForRange { return emitForRange(n, indent) }
+  if n is ForIn { return emitForIn(n, indent) }
+  if n is BreakStmt {
+    if n.brkLabel != "" { return emitLine(indent, "break " + n.brkLabel) }
+    return emitLine(indent, "break")
+  }
+  if n is ContinueStmt {
+    if n.contLabel != "" { return emitLine(indent, "continue " + n.contLabel) }
+    return emitLine(indent, "continue")
+  }
+  if n is Block { return emitBlockStatement(n, indent) }
+  if n is IfStmt { return emitIf(i, n, indent) }
+  if n is FuncDecl { return emitFunction(n, indent) }
+  if n is TypeDecl { return emitTypeDecl(n, indent) }
+  if n is UnionDecl { return emitUnionDecl(n, indent) }
+  // Expression statement.
+  emitMultiline(exprAt(i, indent, 0), indent)
+}
+
+// Emit a possibly-multiline rendering at `indent`, indenting only the FIRST line
+// (continuation lines already carry their own relative indentation).
+function emitMultiline(rendered: string, indent: i32): i32 {
+  let lines = splitLines(rendered)
+  let i = 0
+  while i < lines.length {
+    emit(indentStr(indent) + lines[i] + "\n")
+    i = i + 1
+  }
+  0
+}
+
+// Split `s` on '\n' into physical lines (no trailing empty element for a final
+// newline-free string).
+function splitLines(s: string): string[] {
+  let out: string[] = []
+  let start = 0
+  let i = 0
+  while i < s.length {
+    if s.charCodeAt(i) == 10 {
+      out.push(s.slice(start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out.push(s.slice(start, s.length))
+  out
+}
+
+function emitLet(n: LetDecl, indent: i32): i32 {
+  let head = n.letKw + " " + n.letName
+  if n.letType >= 0 { head = head + ": " + typeStr(n.letType) }
+  if n.letInit >= 0 {
+    let valueText = exprAt(n.letInit, indent, head.length + 3)
+    emitMultiline(head + " = " + valueText, indent)
+  } else {
+    emitMultiline(head, indent)
+  }
+  0
+}
+
+function emitReturn(n: RetStmt, indent: i32): i32 {
+  if n.retArg < 0 {
+    emitMultiline("return", indent)
+    return 0
+  }
+  let valueText = exprAt(n.retArg, indent, 7)
+  emitMultiline("return " + valueText, indent)
+}
+
+function emitWhile(n: WhileStmt, indent: i32): i32 {
+  let label = ""
+  if n.whileLabel != "" { label = n.whileLabel + ": " }
+  let cond = exprAt(n.whileCond, indent, 0)
+  let body = nodeAt(n.whileBody)
+  if body is Block {
+    emitLine(indent, label + "while " + cond + " {")
+    emitStatements(body.blkStmts, indent + 1)
+    emitLine(indent, "}")
+  } else {
+    emitLine(indent, label + "while " + cond)
+    emitStatement(n.whileBody, indent + 1)
+  }
+  0
+}
+
+function emitForRange(n: ForRange, indent: i32): i32 {
+  let label = ""
+  if n.frLabel != "" { label = n.frLabel + ": " }
+  let from = exprAt(n.frFrom, indent, 0)
+  let to = exprAt(n.frTo, indent, 0)
+  let head = label + "for " + n.frVar + " in " + from + " to " + to
+  if n.frStep >= 0 { head = head + " step " + exprAt(n.frStep, indent, 0) }
+  emitLoopBody(head, n.frBody, indent)
+}
+
+function emitForIn(n: ForIn, indent: i32): i32 {
+  let label = ""
+  if n.fiLabel != "" { label = n.fiLabel + ": " }
+  let iter = exprAt(n.fiIter, indent, 0)
+  emitLoopBody(label + "for " + n.fiVar + " in " + iter, n.fiBody, indent)
+}
+
+function emitLoopBody(head: string, bodyIx: i32, indent: i32): i32 {
+  let body = nodeAt(bodyIx)
+  if body is Block {
+    emitLine(indent, head + " {")
+    emitStatements(body.blkStmts, indent + 1)
+    emitLine(indent, "}")
+  } else {
+    emitLine(indent, head)
+    emitStatement(bodyIx, indent + 1)
+  }
+  0
+}
+
+function emitBlockStatement(n: Block, indent: i32): i32 {
+  emitLine(indent, "{")
+  emitStatements(n.blkStmts, indent + 1)
+  emitLine(indent, "}")
+}
+
+// Whether the node at `i` is a brace block.
+function isBlock(i: i32): boolean {
+  if i < 0 { return false }
+  let n = nodeAt(i)
+  if n is Block { return true }
+  false
+}
+
+// Render a brace block with a single simple statement as inline `{ stmt }`, or
+// `{}` when empty. Returns "" (sentinel: not inlinable) for >1 statement, a
+// compound statement, or a body that itself wraps to multiple lines.
+function inlineBlockBody(i: i32, indent: i32): string {
+  let n = nodeAt(i)
+  if n is Block {
+    if n.blkStmts.length == 0 { return "{}" }
+    if n.blkStmts.length != 1 { return "" }
+    let s = n.blkStmts[0]
+    if !isLeafStatement(s) { return "" }
+    let inner = statementInline(s, indent)
+    if hasNewline(inner) { return "" }
+    return "{ " + inner + " }"
+  }
+  ""
+}
+
+// Sentinel "" from `inlineBlockBody` means the body cannot be kept on one line.
+// A real inline body always begins with `{`.
+function notInlinable(s: string): boolean {
+  s == ""
+}
+
+function emitIf(selfIx: i32, n: IfStmt, indent: i32): i32 {
+  // An `else if … [else]` chain whose every branch is a brace block renders as a
+  // sequence of clauses (one line when it fits, else one clause per line). Plain
+  // `if` / `if … else` falls through to the per-line block layout.
+  if emitIfChain(selfIx, n, indent) { return 0 }
+
+  let thenBlock = isBlock(n.ifThen)
+  let elseBlock = true
+  if n.ifElse >= 0 { elseBlock = isBlock(n.ifElse) }
+
+  if thenBlock && elseBlock {
+    // One-line collapse for a plain single `if cond { stmt }` / `… else { … }`.
+    let oneLine = collapseSingleIf(n, indent)
+    if oneLine != "" {
+      if !notInlinable(oneLine) {
+        emitLine(indent, oneLine)
+        return 0
+      }
+    }
+    let tb = nodeAt(n.ifThen)
+    let cond = exprAt(n.ifCond, indent, 0)
+    emitLine(indent, "if " + cond + " {")
+    if tb is Block { emitStatements(tb.blkStmts, indent + 1) }
+    if n.ifElse >= 0 {
+      let eb = nodeAt(n.ifElse)
+      if eb is Block {
+        emitLine(indent, "} else {")
+        emitStatements(eb.blkStmts, indent + 1)
+      }
+    }
+    emitLine(indent, "}")
+    return 0
+  }
+  // Inline form: `if cond then <stmt>`.
+  let cond2 = exprAt(n.ifCond, indent, 0)
+  let tb2 = nodeAt(n.ifThen)
+  if tb2 is Block {
+    emitLine(indent, "if " + cond2 + " {")
+    emitStatements(tb2.blkStmts, indent + 1)
+    emitLine(indent, "}")
+  } else {
+    emitLine(indent, "if " + cond2 + " then " + statementInline(n.ifThen, indent))
+  }
+  if n.ifElse >= 0 {
+    let eb2 = nodeAt(n.ifElse)
+    if eb2 is Block {
+      emitLine(indent, "else {")
+      emitStatements(eb2.blkStmts, indent + 1)
+      emitLine(indent, "}")
+    } else {
+      emitLine(indent, "else " + statementInline(n.ifElse, indent))
+    }
+  }
+  0
+}
+
+function collapseSingleIf(n: IfStmt, indent: i32): string {
+  let cond = exprAt(n.ifCond, indent, 0)
+  let thenBody = inlineBlockBody(n.ifThen, indent)
+  if notInlinable(thenBody) { return "" }
+  let line = "if " + cond + " " + thenBody
+  if n.ifElse >= 0 {
+    let elseBody = inlineBlockBody(n.ifElse, indent)
+    if notInlinable(elseBody) { return "" }
+    line = line + " else " + elseBody
+  }
+  if indent * INDENT.length + line.length > WIDTH { return "" }
+  line
+}
+
+// Flatten an `else if` chain into parallel lists (cond node index; -1 for the
+// trailing `else`) and body block index. Returns false (no chain) unless the
+// `else` branch is itself an `If`.
+let chainCond: i32[] = []
+let chainBody: i32[] = []
+function flattenIfChain(i: i32): i32 {
+  let n = nodeAt(i)
+  if n is IfStmt {
+    chainCond.push(n.ifCond)
+    chainBody.push(n.ifThen)
+    if n.ifElse >= 0 {
+      let e = nodeAt(n.ifElse)
+      if e is IfStmt {
+        return flattenIfChain(n.ifElse)
+      }
+      chainCond.push(0 - 1)
+      chainBody.push(n.ifElse)
+    }
+  }
+  0
+}
+
+function emitIfChain(selfIx: i32, n: IfStmt, indent: i32): boolean {
+  if n.ifElse < 0 { return false }
+  let e = nodeAt(n.ifElse)
+  if !(e is IfStmt) { return false }
+  let savedC = chainCond
+  let savedB = chainBody
+  chainCond = []
+  chainBody = []
+  flattenIfChain(selfIx)
+  let conds = chainCond
+  let bodies = chainBody
+  chainCond = savedC
+  chainBody = savedB
+  // Every branch must be a brace block to use the chain layout.
+  let allBlocks = true
+  let k = 0
+  while k < bodies.length {
+    if !isBlock(bodies[k]) { allBlocks = false }
+    k = k + 1
+  }
+  if !allBlocks { return false }
+
+  // Try the inline body for every clause.
+  let inlines: string[] = []
+  let allInline = true
+  let c = 0
+  while c < bodies.length {
+    let ib = inlineBlockBody(bodies[c], indent)
+    if notInlinable(ib) { allInline = false }
+    inlines.push(ib)
+    c = c + 1
+  }
+
+  if allInline {
+    let oneLine = ""
+    let j = 0
+    while j < bodies.length {
+      let h = chainHead(conds[j], j == 0, indent)
+      if j > 0 { oneLine = oneLine + " " }
+      oneLine = oneLine + h + " " + inlines[j]
+      j = j + 1
+    }
+    if indent * INDENT.length + oneLine.length <= WIDTH {
+      emitLine(indent, oneLine)
+      return true
+    }
+  }
+
+  let m = 0
+  while m < bodies.length {
+    let h = chainHead(conds[m], m == 0, indent)
+    let inline = inlines[m]
+    let fits = false
+    if !notInlinable(inline) {
+      if indent * INDENT.length + h.length + 1 + inline.length <= WIDTH { fits = true }
+    }
+    if fits {
+      emitLine(indent, h + " " + inline)
+    } else {
+      emitLine(indent, h + " {")
+      let bn = nodeAt(bodies[m])
+      if bn is Block { emitStatements(bn.blkStmts, indent + 1) }
+      emitLine(indent, "}")
+    }
+    m = m + 1
+  }
+  true
+}
+
+function chainHead(condIx: i32, first: boolean, indent: i32): string {
+  if condIx < 0 { return "else" }
+  let kw = "else if"
+  if first { kw = "if" }
+  kw + " " + exprAt(condIx, indent, 0)
+}
+
+// ── type / union declarations (reconstructed from the desugared AST) ───────────
+function emitTypeDecl(n: TypeDecl, indent: i32): i32 {
+  let items: string[] = []
+  let i = 0
+  while i < n.tdFields.length {
+    let f = nodeAt(n.tdFields[i])
+    if f is FieldDef {
+      items.push(f.fdName + ": " + typeStr(f.fdType))
+    }
+    i = i + 1
+  }
+  let body = wrapList("{ ", items, " }", indent, ("type " + n.tdName + " = ").length)
+  emitLine(indent, "type " + n.tdName + " = " + body)
+}
+
+function emitUnionDecl(n: UnionDecl, indent: i32): i32 {
+  let body = ""
+  let i = 0
+  while i < n.udVariants.length {
+    if i > 0 { body = body + " | " }
+    body = body + n.udVariants[i]
+    i = i + 1
+  }
+  emitLine(indent, "type " + n.udName + " = " + body)
+}
+
+function emitFunction(n: FuncDecl, indent: i32): i32 {
+  // Operator-named / anonymous functions lose surface form in the AST; this port
+  // cannot recover them (no node span to slice). Emit the structural header,
+  // which diverges from the oracle's verbatim slice on those inputs.
+  let header = funcHeader(n)
+  if n.fnBody < 0 {
+    emitLine(indent, header + " {}")
+    return 0
+  }
+  let b = nodeAt(n.fnBody)
+  if b is Block {
+    if b.blkStmts.length == 0 {
+      emitLine(indent, header + " {}")
+      return 0
+    }
+    emitLine(indent, header + " {")
+    emitStatements(b.blkStmts, indent + 1)
+    emitLine(indent, "}")
+  } else {
+    emitLine(indent, header + " " + statementInline(n.fnBody, indent))
+  }
+  0
+}
+
+// ── program normalization ─────────────────────────────────────────────────────
+// Collapse 3+ blank lines to 1, strip trailing whitespace per line, ensure a
+// single trailing newline, and an empty program is "".
+function normalize(s: string): string {
+  // Strip trailing whitespace on each line + collapse runs of blank lines.
+  let lines = splitLines(s)
+  let out = ""
+  let blanks = 0
+  let i = 0
+  while i < lines.length {
+    let l = trimEnd(lines[i])
+    if l == "" {
+      blanks = blanks + 1
+      if blanks <= 1 {
+        out = out + "\n"
+      }
+    } else {
+      blanks = 0
+      out = out + l + "\n"
+    }
+    i = i + 1
+  }
+  // Strip leading newlines.
+  out = trimStartNewlines(out)
+  // Ensure exactly one trailing newline.
+  out = trimEnd(out)
+  if out == "" { return "" }
+  out + "\n"
+}
+
+function trimStartNewlines(s: string): string {
+  let i = 0
+  while i < s.length {
+    if s.charCodeAt(i) != 10 { return s.slice(i, s.length) }
+    i = i + 1
+  }
+  ""
+}
+
+// ── entry ─────────────────────────────────────────────────────────────────────
+// `format(source)` — tokenize, parse to the native arena, walk + print, then
+// normalize. Resets parser state so repeated calls are independent.
+export function format(source: string): string {
+  P.toks = []
+  P.nodes = []
+  P.diags = []
+  P.pos = 0
+  let r = tokenize(source)
+  let i = 0
+  while i < r.tokens.length {
+    let t = r.tokens[i]
+    P.toks.push({ kind: t.kind, text: t.text, pos: P.toks.length, start: t.start, line: t.line, col: t.col })
+    i = i + 1
+  }
+  let root = parseProgram()
+  outBuf = ""
+  let rn = nodeAt(root)
+  if rn is Program {
+    emitStatements(rn.progStmts, 0)
+  }
+  normalize(outBuf)
+}
