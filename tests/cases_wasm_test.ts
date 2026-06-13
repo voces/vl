@@ -386,14 +386,26 @@ const driveCase = (
   exp.srcReset();
   pushString(exp.srcPush, src);
   const rc = emit ? exp.compileSrc() : exp.checkSrc();
-  const diags = readDiags(exp);
+  // rc 0 means no diagnostics (the Rust host reads them only on failure) —
+  // and the instance is shared across cases, so don't trust `diagCount` on a
+  // success: a stale emit failure could still be sitting in its store.
+  const diags = rc === 0 ? [] : readDiags(exp);
+  let bytes: Uint8Array | undefined;
   if (emit && rc === 0) {
     const n = exp.rbyteLen();
-    const bytes = new Uint8Array(n);
+    bytes = new Uint8Array(n);
     for (let i = 0; i < n; i++) bytes[i] = exp.rbyteAt(i);
-    return { rc, diags, bytes };
   }
-  return { rc, diags };
+  if (emit && rc === 3) {
+    // The emit-failure store resets only at `emitProgram`'s start, so a failed
+    // emit would leak its message into every later case's diagnostics on this
+    // shared instance; a minimal clean compile flushes it.
+    exp.modReset();
+    exp.srcReset();
+    pushString(exp.srcPush, "print(1)\n");
+    exp.compileSrc();
+  }
+  return { rc, diags, bytes };
 };
 
 const fmtDiags = (diags: WasmDiag[]): string =>
