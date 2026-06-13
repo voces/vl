@@ -226,6 +226,7 @@ const RUN_CASES = [
   // union): `o.f(args)` rewrites to `f(o, args)` PRE-COLLECT for every receiver
   // kind, so a string/union arg keeps its rep through the scratch-frame sizing.
   // The field-precedence regression asserts a callable struct field still wins.
+  "methods/array-receiver-ufcs.vl",
   "methods/field-wins-over-self-fn.vl",
   "methods/i32-recv-scalar-arg.vl",
   "methods/named-arg-ufcs.vl",
@@ -256,6 +257,7 @@ const RUN_CASES = [
   "modules/rename/entry.vl",
   "modules/solo/entry.vl",
   "modules/std-basic/entry.vl",
+  "modules/std-fmt/entry.vl",
   "modules/transitive/entry.vl",
   "modules/ufcs-import/entry.vl",
   "modules/ufcs-import-field-precedence/entry.vl",
