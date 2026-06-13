@@ -18,6 +18,7 @@ import {
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
 } from "../lsp/src/typeFeatures.ts";
+import { loadWasmChecker } from "../lsp/src/wasmChecker.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
@@ -210,5 +211,86 @@ Deno.test("classifyDocument: returns ClassifiedToken records (direct call)", () 
   // `let` keyword, `x` variable decl, `1` number — at least three tokens.
   if (tokens.length < 3) {
     throw new Error(`expected >=3 tokens, got ${tokens.length}`);
+  }
+});
+
+// ---- LSP-on-wasm Stage 2: the wasm identifier classification ----------------
+// Seed-gated (mirrors tests/lsp_wasm_checker_test.ts): the wasm `tokensAt` must
+// classify identifiers the SAME way the TS symbol-table pass does, for the kinds
+// this slice covers (variable / parameter / function). Literals/keywords/
+// operators/comments/members stay TS and aren't asserted here.
+
+const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const seedExists = (() => {
+  try {
+    Deno.statSync(SEED);
+    return true;
+  } catch {
+    return false;
+  }
+})();
+const ignore = !seedExists;
+const noSiblings = () => undefined;
+// The legend's first three indices ARE the wasm `bindKind` convention.
+const KIND_NAME = ["variable", "parameter", "function"] as const;
+
+Deno.test({
+  name: "wasm-tokens: identifier classification matches the TS symbol table",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  // `f` (function), `n` (parameter), `r` (variable) decls + a `n` param use and
+  // an `f` call use — one of each binding kind this slice colours.
+  const src = [
+    "function f(n: i32): i32 {",
+    "  let r = n + 1",
+    "  return r",
+    "}",
+    "let y = f(2)",
+    "",
+  ].join("\n");
+
+  const wasm = await checker.tokensAt(src, "/tmp/x.vl", noSiblings);
+  // Every wasm token, keyed by position, with its kind NAME + decl flag.
+  const wasmAt = new Map(
+    wasm.map((t) => [
+      `${t.line}:${t.char}`,
+      { type: KIND_NAME[t.bindKind], isDecl: t.isDecl, length: t.length },
+    ]),
+  );
+
+  // The TS identifier classifications (binding-kind tokens only) for the same src.
+  const tsToks = tokensOf(src).filter((t) =>
+    (KIND_NAME as readonly string[]).includes(t.type)
+  );
+  if (tsToks.length === 0) throw new Error("no TS identifier tokens to compare");
+
+  for (const ts of tsToks) {
+    const w = wasmAt.get(`${ts.line}:${ts.char}`);
+    if (!w) {
+      throw new Error(
+        `wasm missing identifier at ${ts.line}:${ts.char} (${ts.type})`,
+      );
+    }
+    if (w.type !== ts.type || w.isDecl !== ts.isDecl || w.length !== ts.length) {
+      throw new Error(
+        `mismatch at ${ts.line}:${ts.char}: ts ${ts.type}/${ts.isDecl}/${ts.length} ` +
+          `vs wasm ${w.type}/${w.isDecl}/${w.length}`,
+      );
+    }
+  }
+
+  // Spot-check the kinds are actually present (not all the same).
+  const f = wasmAt.get("0:9"); // `f` decl
+  if (f?.type !== "function" || !f.isDecl) {
+    throw new Error(`expected f as a function decl, got ${JSON.stringify(f)}`);
+  }
+  const n = wasmAt.get("0:11"); // `n` param decl
+  if (n?.type !== "parameter" || !n.isDecl) {
+    throw new Error(`expected n as a parameter decl, got ${JSON.stringify(n)}`);
+  }
+  const r = wasmAt.get("1:6"); // `r` variable decl
+  if (r?.type !== "variable" || !r.isDecl) {
+    throw new Error(`expected r as a variable decl, got ${JSON.stringify(r)}`);
   }
 });

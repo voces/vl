@@ -33,6 +33,22 @@ export type WasmRange = {
   end: { line: number; character: number };
 };
 
+/**
+ * One classified identifier from the wasm semantic-token pass (Stage 2). The
+ * native checker records only IDENTIFIER occurrences with their binding kind, so
+ * `bindKind` is 0=variable / 1=parameter / 2=function; `isDecl` marks the
+ * declaring occurrence. Position is 0-based line, 0-based char (LSP). The host
+ * maps `bindKind` onto its semantic-token legend and keeps its own lexical pass
+ * for keywords/operators/literals/comments + member walk for properties.
+ */
+export type WasmToken = {
+  line: number; // 0-based
+  char: number; // 0-based
+  length: number;
+  bindKind: number; // 0=variable 1=parameter 2=function
+  isDecl: boolean;
+};
+
 export type WasmChecker = {
   /** Diagnostics for `source` as the entry module at `entryKey`. */
   check: (
@@ -77,6 +93,16 @@ export type WasmChecker = {
     line: number,
     character: number,
   ) => Promise<string | undefined>;
+  /**
+   * Semantic tokens (Stage 2): every classified IDENTIFIER occurrence in the
+   * document (binding kind + declaration flag + span). Empty when the seed
+   * predates the token exports — the host then falls back to its TS pass.
+   */
+  tokensAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ) => Promise<WasmToken[]>;
 };
 
 /** One wasm call per code point — fine at editor scale (~0.2 ms/file). */
@@ -261,6 +287,45 @@ export const loadWasmChecker = (
     return readString(len, (j) => exp.typeStrCharAt(j));
   };
 
+  // The token exports ride the same Stage-2 seed as the symbol exports; an older
+  // seed lacks them, so the method yields [] (the host falls back to TS).
+  const hasTokens = (exp: Exports): boolean =>
+    typeof exp.tokCount === "function" &&
+    typeof exp.tokBindKindAt === "function" &&
+    typeof exp.tokSpanStartLine === "function";
+
+  const tokensAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<WasmToken[]> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp) || !hasTokens(exp)) return [];
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    const count = exp.tokCount();
+    const out: WasmToken[] = [];
+    for (let i = 0; i < count; i++) {
+      const bindKind = exp.tokBindKindAt(i);
+      // Only identifiers with a known binding kind are coloured by this slice;
+      // a -1 (not a tracked binding) is skipped (the host's lexical pass owns it).
+      if (bindKind < 0) continue;
+      const sl = exp.tokSpanStartLine(i); // 1-based native line
+      const startCol = exp.tokSpanStartCol(i);
+      const endCol = exp.tokSpanEndCol(i);
+      const length = endCol - startCol;
+      if (length <= 0) continue; // defensive: a name never has a zero-width span
+      out.push({
+        line: sl > 0 ? sl - 1 : 0,
+        char: startCol,
+        length,
+        bindKind,
+        isDecl: exp.symIsDecl(i) === 1,
+      });
+    }
+    return out;
+  };
+
   const check = async (
     source: string,
     entryKey: string,
@@ -300,7 +365,7 @@ export const loadWasmChecker = (
     return diags;
   };
 
-  return { check, definitionAt, referencesAt, hoverTypeAt };
+  return { check, definitionAt, referencesAt, hoverTypeAt, tokensAt };
 };
 
 /**
@@ -385,4 +450,37 @@ export const diffHoverType = (
   const b = wasm ?? "";
   if (a === b) return undefined;
   return `hover: ts ${JSON.stringify(a)} vs wasm ${JSON.stringify(b)}`;
+};
+
+/** One TS-side classified identifier token, for `diffSemanticTokens`. */
+export type TsIdentToken = {
+  line: number;
+  char: number;
+  length: number;
+  bindKind: number; // 0=variable 1=parameter 2=function (the legend's first 3)
+  isDecl: boolean;
+};
+
+const tokenKey = (t: WasmToken | TsIdentToken): string =>
+  `${t.line}:${t.char}+${t.length}/${t.bindKind}${t.isDecl ? "d" : ""}`;
+
+/**
+ * Divergence between the TS and wasm SEMANTIC-TOKEN identifier sets (order-
+ * independent), for `"both"` mode logging. This slice classifies identifiers
+ * ONLY (variable/parameter/function); the caller filters the TS tokens to that
+ * same subset before comparing, so keywords/operators/literals/comments/members
+ * — which stay TS-only — never count as divergence. Undefined = the sets match.
+ */
+export const diffSemanticTokens = (
+  ts: TsIdentToken[],
+  wasm: WasmToken[],
+): string | undefined => {
+  const tsSet = new Set(ts.map(tokenKey));
+  const wasmSet = new Set(wasm.map(tokenKey));
+  const same = tsSet.size === wasmSet.size &&
+    [...tsSet].every((k) => wasmSet.has(k));
+  if (same) return undefined;
+  return `semtok: ts {${[...tsSet].sort().join(", ")}} vs wasm {${
+    [...wasmSet].sort().join(", ")
+  }}`;
 };
