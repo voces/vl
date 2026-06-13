@@ -7,9 +7,9 @@
 #
 # PARALLEL: files fan out over `JOBS` workers (default: every core) via xargs;
 # each worker classifies one file and appends a single `BUCKET\tfile` line to a
-# shared results file (O_APPEND single-line writes are atomic). ~24x wall-clock
-# over the old serial loop on a 24-core box; buckets/summary are byte-identical
-# (sorted) to the serial output.
+# shared results file (O_APPEND single-line writes are atomic). Wall-clock scales
+# roughly with core count; the results file is sorted before bucketing, so the
+# buckets and summary are deterministic regardless of worker scheduling.
 #
 # NOTE: matches files containing the literal `// @run` ANYWHERE — two soundness
 # @check files mention `// @run` in prose comments and show up as CHECKFAIL noise

@@ -1,22 +1,20 @@
-// AST + token model for the VL-in-VL parser (Track H / H3 self-hosting).
+// AST + token model for the VL-in-VL parser (the H3 self-hosting track).
 //
-// Side-by-side with `compiler/ast.ts`, which it will eventually replace. VL has
-// no module system yet, so the TS driver (`tests/selfhost_parser_test.ts`)
-// concatenates this file ahead of `compiler/parser.vl` and a print-driver before
-// compiling. This file is the data layer the parser builds onto.
+// Side-by-side with `compiler/ast.ts`, which it will eventually replace. This
+// module is the data layer the parser builds onto; `compiler/parser.vl` imports
+// the token type, the parser state `P`, and the arena constructors from here.
 //
-// ── A GENUINE discriminated-union AST ────────────────────────────────────────
+// ── A discriminated-union AST ────────────────────────────────────────────────
 // Each node KIND is its own struct `type` (`NumLit`, `BinExpr`, `Call`, …); the
-// `Node` alias unions them, and the parser/printer discriminate with `is` (which
-// is sound over a struct union now — gap #69 is fixed). This replaces the spike's
-// single `Node { kind: string }` wide-row struct: the kind is the runtime VARIANT,
-// not a tag field, so a mis-parse can't silently read the wrong slot.
+// `Node` alias unions them, and the parser/printer discriminate with `is`. The
+// kind is the runtime VARIANT, not a tag field, so a mis-parse can't silently
+// read the wrong slot.
 //
 // Discrimination is by structural SHAPE (WasmGC erases field names but the variant
 // tag is field-name-aware): two variants tell apart iff their field-name sets
 // differ. So every variant uses a DISTINCT field-name prefix (`num*`, `bin*`,
 // `call*`, …) — no variant's fields are a subset of another's — which keeps `is`
-// unambiguous across all 19 kinds. (A discriminant `tag` field would also work for
+// unambiguous across all kinds. (A discriminant `tag` field would also work for
 // genuinely same-shape variants; here the natural shapes already differ.)
 //
 // ── Children by ARENA INDEX ──────────────────────────────────────────────────
@@ -26,27 +24,25 @@
 // which VL's alias resolver can't express yet (a union alias can't forward- or
 // self-reference its members), and is how many production self-hosted parsers
 // represent their AST anyway. The arena lives in a STRUCT FIELD (`Parser.nodes`),
-// and constructors `.push` straight onto it (gap #66 is fixed) — no more threading
-// the array as a bare parameter. (The struct is reached via a module GLOBAL rather
-// than a parameter — see the `Parser` note below for why.)
+// and constructors `.push` straight onto it. (The struct is reached via a module
+// GLOBAL rather than a parameter — see the `Parser` note below for why.)
 
 // ── Token ────────────────────────────────────────────────────────────────────
 // A token consumed by the parser. `kind` is a plain string tag, matching the
 // convention the self-hosted lexer uses: VL has no enum / closed-literal-union tag
 // representation yet, and a bare `string` compares with `==` and prints directly.
 //
-// SOURCE POSITIONS (rung 1 of span threading): besides `pos` — the token's INDEX
-// in the stream (the cursor unit the parser/diags already use) — a token now also
-// carries the SOURCE position of its first char, mirroring the lexer's `LexTok`:
+// SOURCE POSITIONS: besides `pos` — the token's INDEX in the stream (the cursor
+// unit the parser/diags use) — a token carries the SOURCE position of its first
+// char, mirroring the lexer's `LexTok`:
 //   start — char offset of the first char (0-based, into the source string).
 //   line  — 1-based source line of the first char.
 //   col   — 0-based column of the first char.
-// These are PURELY ADDITIVE plumbing: the parser does not yet read them (a later
-// rung copies them onto the AST nodes it builds and wires them into diagnostics),
-// and the emitter never sees tokens, so they cannot perturb emitted bytes. The
-// bridge that converts the lexer's `LexTok` stream into this `Tok` (the compiler
-// driver and the self-host test harnesses) fills them from the lexed token; a
-// hand-built token stream that has no real source may pass `0`/`1`/`0`.
+// The parser itself never reads these; diagnostics reach them through the
+// `nodeToks` side table (below). The bridge that converts the lexer's `LexTok`
+// stream into this `Tok` (the compiler driver and the self-host test harnesses)
+// fills them from the lexed token; a hand-built token stream that has no real
+// source may pass `0`/`1`/`0`.
 export type Tok = {
   kind: string,
   text: string,
@@ -200,15 +196,11 @@ export type Diag = { msg: string, at: i32 }
 
 // ── Parser state (all in STRUCT FIELDS, held in a module GLOBAL) ──────────────
 // The whole parser state is one struct: the token stream, the node arena, the
-// diagnostics, and the cursor. `.push` onto a struct-field array works now (gap
-// #66), so the arena and diagnostics live in struct fields and the constructors
-// `.push` straight onto them — not threaded as bare array parameters.
+// diagnostics, and the cursor. The arena and diagnostics live in struct fields
+// and the constructors `.push` straight onto them.
 //
-// The struct is reached through a module GLOBAL `P` — a STYLE choice now: it keeps
-// every call site free of a boilerplate state argument. (Historically it was forced:
-// passing a struct-typed VALUE into a mutually-recursive function group miscompiled
-// — "Unhandled AST -> WASM Never". That host bug is fixed, pinned by
-// `tests/cases/functions/struct-param-mutual-recursion-global.vl`.)
+// The struct is reached through a module GLOBAL `P` — a STYLE choice: it keeps
+// every call site free of a boilerplate state argument.
 export type Parser = {
   toks: Tok[],
   nodes: Node[],
@@ -220,14 +212,14 @@ export type Parser = {
 // reads `P.nodes` / `P.diags` back out.
 export let P: Parser = { toks: [], nodes: [], diags: [], pos: 0 }
 
-// ── Node → token side table (rung 2 of span threading) ──────────────────────
+// ── Node → token side table ──────────────────────────────────────────────────
 // `nodeToks[i]` is the TOKEN INDEX of the LAST token consumed when `P.nodes[i]`
 // was constructed (`addNode` records `P.pos - 1`). Constructors run right after
 // their construct's final token is consumed, so this anchors a node at its last
 // token — exact for single-token leaves (Ident, NumLit, …), the closing token
 // for larger constructs. Good enough to render a `line:col` on a diagnostic;
 // a full start/stop span is a later refinement (docs/selfhost-spans-design.md).
-// A SIDE ARRAY (not a field on the 33 node variants) keeps every node struct —
+// A SIDE ARRAY (not a field on each node variant) keeps every node struct —
 // and the `is`-discrimination shape set — untouched.
 //
 // CONSUMERS MUST BOUNDS-CHECK: a harness that resets `P.nodes` without resetting
@@ -503,8 +495,9 @@ export function mkIsExpr(obj: i32, variant: string): i32 {
 }
 
 // ── int → string ─────────────────────────────────────────────────────────────
-// `toString` still does not resolve inside a function/loop body (a tracked gap),
-// so the harness renders node counts with this hand-rolled converter.
+// A hand-rolled decimal converter. `i32ToStr` is the shared count/index renderer
+// across the self-host: the checker, emitter, and driver import it for
+// diagnostics and synthetic names.
 function digitChar(d: i32): string {
   if d == 0 { return "0" }
   if d == 1 { return "1" }

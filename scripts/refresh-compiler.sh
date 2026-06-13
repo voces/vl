@@ -9,8 +9,8 @@
 #
 # Iteration loop this enables: edit compiler/*.vl → `scripts/refresh-compiler.sh`
 # → `vl check/run/build` against the refreshed seed reflects the edit, seconds
-# later. (Without this, a stale seed silently tests YESTERDAY'S checker — e.g.
-# `vl check` kept printing a pre-Slice-5 diagnostic until the seed was rebuilt.)
+# later. (A stale seed silently tests an outdated compiler: `vl check`/`vl run`
+# behavior reflects the seed's pinned source, not the current compiler/*.vl.)
 #
 # STALE-SEED FALLBACK: a seed that predates a language construct newly used BY
 # THE COMPILER ITSELF cannot compile current source (e.g. "unsupported statement
@@ -53,7 +53,7 @@ cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.v
   scripts/vl-compiler-driver.vl >> "$WORK/vlsrc.vl"
 # BLANK the compiler's own import statements (range-aware; multi-line imports) —
 # see native-fixpoint.sh: a line-leading `import {` would trip the vl binary's
-# module gate (H3). Blanking preserves line numbers; byte-identical output.
+# module gate. Blanking preserves line numbers; byte-identical output.
 sed -i -E '/^import \{/,/\} from "/ s/.*//' "$WORK/vlsrc.vl"
 
 echo "== self-compile current compiler source with the seed =="

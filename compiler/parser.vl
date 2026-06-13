@@ -1,9 +1,9 @@
 // A recursive-descent parser for a meaningful subset of VL, written in VL
-// (Track H / H3 self-hosting — the component after the lexer).
+// (the H3 self-hosting track).
 //
 // Side-by-side with `compiler/parser.ts`, which it will eventually replace. It
-// consumes a token stream (the `Tok[]` on the global `P` — the real lexer is a
-// parallel re-land, out of scope here) and builds the discriminated-union arena
+// consumes a token stream (the `Tok[]` on the global `P`, filled by the driver
+// from the self-hosted lexer's output) and builds the discriminated-union arena
 // AST defined in `compiler/ast.vl`. Grammar covered:
 //
 //   program    := stmt*
@@ -21,22 +21,20 @@
 //   postfix    := primary ( "(" args? ")" | "." IDENT )*
 //   primary    := NUMBER | STRING | CHAR | "true" | "false" | IDENT | "(" expr ")"
 //
-// ── Idiomatic structure: GENUINE mutual recursion ────────────────────────────
+// ── Structure: mutual recursion ──────────────────────────────────────────────
 // Recursive descent is intrinsically mutually recursive — the expression levels
-// re-enter through `(expr)` / call args, and a block re-enters statements. Forward
-// references / mutual recursion across top-level functions work now (gap #67), so
+// re-enter through `(expr)` / call args, and a block re-enters statements — so
 // these are written as the natural separate functions (`parseExpr` ↔ `parseUnary`
-// ↔ `parsePrimary`, `parseStmt` ↔ `parseBlock`, …), NOT a single `mode`-dispatched
-// mega-function. The one rule: a forward-referenced / mutually-recursive function
-// must DECLARE its return type — so every parser function is annotated `: i32`
-// (the arena index it produces), idiomatic for a parser anyway.
+// ↔ `parsePrimary`, `parseStmt` ↔ `parseBlock`, …). The one rule: a forward-
+// referenced / mutually-recursive function must DECLARE its return type — so
+// every parser function is annotated `: i32` (the arena index it produces),
+// idiomatic for a parser anyway.
 //
 // All parser state lives in the `Parser` struct fields, reached through the module
 // global `P` (`compiler/ast.vl`): the token stream, the node arena, the
 // diagnostics, and the cursor. Constructors `.push` onto the struct-field arena
-// directly (gap #66). (`P` is a global rather than a struct parameter as a STYLE
-// choice — the old struct-param-into-recursive-group miscompile is fixed; see the
-// note in `ast.vl`.) Errors append a `Diag` (VL has no exceptions) and the
+// directly. (`P` is a global rather than a struct parameter as a STYLE choice —
+// see the note in `ast.vl`.) Errors append a `Diag` (VL has no exceptions) and the
 // parser recovers by synthesizing an `ErrExpr` leaf or skipping a token, so the
 // walk always terminates (panic-free).
 
@@ -164,12 +162,11 @@ function expect(kind: string): boolean {
 // Binding powers follow the TS host (`parser.ts` `infixBp` + `SHIFT_BP`),
 // remapped onto this compressed contiguous ladder but preserving the host's
 // RELATIVE order, looser→tighter:
-//   ??/|| < && < `|` (bitwise OR) < `&` (bitwise AND) < ==/!= < relational
-//        < shifts (`>>`/`>>>`) < +/- < * / %
-// Bitwise `|`/`&` bind BELOW equality/relational (so `a & b == c` is
+//   ??/|| < && < `|` (bitwise OR) < `^` (XOR) < `&` (bitwise AND) < ==/!=
+//        < relational < shifts (`<<`/`>>`/`>>>`) < +/- < * / %
+// Bitwise `|`/`^`/`&` bind BELOW equality/relational (so `a & b == c` is
 // `a & (b == c)`), and the shifts sit BETWEEN relational and additive (so
-// `a + b >> c` is `(a + b) >> c` — shifts looser than `+`). The host also has
-// `^` (XOR) and `<<` (left shift); those are out of scope for this slice.
+// `a + b >> c` is `(a + b) >> c` — shifts looser than `+`).
 function binPrec(kind: string): i32 {
   if kind == "EQUAL" { return 1 }    // assignment (right-associative)
   // Compound assignment (`+=` etc.) sits WITH assignment; the climber desugars it.
@@ -251,7 +248,7 @@ function parseType(): i32 {
 // Parse a type ANNOTATION and return its synthetic NAME string (the lexeme the
 // emitter discriminates on), without building a node. Splitting the name out lets the
 // map case embed the value type's name into its own synthetic name WITHOUT a
-// `P.nodes[...] is TypeRef` round-trip (which this self-host slice can't narrow here).
+// `P.nodes[...] is TypeRef` round-trip (an arena-element read `is` can't narrow here).
 function parseTypeName(): string {
   let name = parseTypeIsect()
   // Inline UNION annotation `A | B | null`. In TYPE position (after a `:`), `|` is a
@@ -269,7 +266,7 @@ function parseTypeName(): string {
   name
 }
 
-// An INTERSECTION chain `A & B [& …]` (A3) — `&` binds tighter than the union
+// An INTERSECTION chain `A & B [& …]` — `&` binds tighter than the union
 // `|` and looser than the prefix `!` / `[]` suffix (host
 // `parseIntersectionType`). Encoded as the synthetic name `"A&B"`; the checker
 // splits on top-level `&` and folds the operands through `intersectTy` (so a
@@ -661,9 +658,8 @@ function parsePostfix(): i32 {
   // Postfix `x++` / `x--` on an IDENT. The increment itself is `x = x ± 1`, but a
   // postfix EXPRESSION must yield the OLD value (unlike prefix, which yields the
   // new one), so the assignment is wrapped in a postfix `Unary` (`"p+"`/`"p-"`):
-  // the emitter unwraps it to the plain assignment in STATEMENT position
-  // (byte-identical to before) and recovers the pre-increment value (new ∓ 1) in
-  // EXPRESSION position.
+  // the emitter unwraps it to the plain assignment in STATEMENT position and
+  // recovers the pre-increment value (new ∓ 1) in EXPRESSION position.
   let pk2 = peekKind()
   if pk2 == "PLUSPLUS" || pk2 == "MINUSMINUS" {
     let pt = P.nodes[node]
@@ -812,11 +808,10 @@ function parseTypeDecl(): i32 {
   } else {
     expect("IDENT")
   }
-  // Generic alias parameters `type Box<T> = …` (A10 stage 3). The parameter
-  // names fold into the DECLARED name (`Box<T>`) — the native checker has no
-  // alias-substitution algebra yet, so an applied `Box<i32>` resolves to
-  // "unknown type" (a type-reject, not a parse-reject), matching the grammar
-  // the host accepts.
+  // Generic alias parameters `type Box<T> = …` (A10). The parameter names fold
+  // into the DECLARED name (`Box<T>`); the checker splits them back out when it
+  // registers the alias and substitutes the type arguments at an application
+  // site (`Box<i32>`).
   if peekKind() == "LT" {
     advance()                      // "<"
     name = name + "<"
@@ -843,9 +838,9 @@ function parseTypeDecl(): i32 {
   // a `{`). Parse the `member (PIPE member)*` list into a `UnionDecl` — a member
   // is an intersection chain of atoms (bare names, literal types: `type T = "a" |
   // "b"`, inline objects). A single bare name `type N = A` (no `|`) is also
-  // accepted as a one-member union. (A compound `{ … } & { … }` RHS — host A3 —
-  // takes the LBRACE path below and re-encodes as a UnionDecl when an `&`/`|`
-  // follows the closing brace.)
+  // accepted as a one-member union. (A compound `{ … } & { … }` RHS takes the
+  // LBRACE path below and re-encodes as a UnionDecl when an `&`/`|` follows the
+  // closing brace.)
   let afterEq = peekKind()
   if afterEq != "LBRACE" {
     let variants: string[] = []
@@ -866,7 +861,7 @@ function parseTypeDecl(): i32 {
   expect("LBRACE")
   let fields: i32[] = []
   // `synth` mirrors the field list as the inline-object SYNTHETIC name
-  // (`{a:i32,b:i32}`), so a `{ … } & …` / `{ … } | …` continuation (A3) can
+  // (`{a:i32,b:i32}`), so a `{ … } & …` / `{ … } | …` continuation can
   // re-encode the whole RHS as a UnionDecl alias without re-parsing.
   let synth = ""
   skipNewlines()                     // a multiline `{` puts the first field on the next line
@@ -895,7 +890,7 @@ function parseTypeDecl(): i32 {
     }
   }
   expect("RBRACE")
-  // Object-type structural intersection `type AB = { … } & { … }` (A3), or a
+  // Object-type structural intersection `type AB = { … } & { … }`, or a
   // union whose FIRST variant is an inline object: the struct body was only the
   // first operand. Re-encode the RHS as a `UnionDecl` over synthetic names —
   // the checker's `nameToTy` folds the `&` chain into a merged TyObj.
@@ -1403,9 +1398,10 @@ function parseStmt(): i32 {
 }
 
 // Consume an `import { a, b, … } from "path"` (or `import x from "path"`)
-// statement, the cursor on the leading `import`. Modules are concatenated ahead
-// of compilation (VL has no runtime module system), so an import is a NO-OP for
-// the AST — it is consumed and produces no node. Tokens up to and INCLUDING the
+// statement, the cursor on the leading `import`. Import binding is the module
+// front end's job (each module is parsed separately and merged into one
+// program, mirroring the host's `modules.ts`), so an import is a NO-OP for the
+// AST — it is consumed and produces no node. Tokens up to and INCLUDING the
 // trailing path STRING are skipped (the `from` clause keyword rides as an
 // `IDENT`, so it needs no dedicated keyword).
 function skipImport(): i32 {
