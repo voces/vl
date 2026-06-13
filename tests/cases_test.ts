@@ -393,6 +393,8 @@ cases.sort((a, b) => caseName(a).localeCompare(caseName(b)));
 const TS_HOST_INCOMPATIBLE: Record<string, string> = {
   "modules/std-fmt/":
     "the TS host emitter cannot pass a union-narrowed i64 as an i64 argument (`std:fmt`'s `toStr`); native lowers it — cases_wasm_test owns this case",
+  "modules/std-testing-pass/":
+    "the TS host emitter cannot lower `std:test`'s union-based `expect` over the full value-union (a value-union struct field read back, with i64/f64 members); native lowers it — cases_wasm_test owns this case",
 };
 
 for (const c of cases) {
