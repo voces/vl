@@ -111,6 +111,19 @@ export type ProgramResult = {
 const isRelative = (spec: string): boolean =>
   spec.startsWith("./") || spec.startsWith("../");
 
+/**
+ * A `std:` specifier: `std:` + a `[a-z0-9_]+(/[a-z0-9_]+)*` module name. The
+ * specifier IS the module key — it resolves verbatim, never to a
+ * filesystem-shaped path; the READER layer owns the mapping to bytes (the CLI
+ * reads the repo `std/` dir, the Rust host `$VL_STD`/the exe-relative `std/`,
+ * the LSP the embedded map). Keeps std keys unspoofable by user paths.
+ */
+const STD_SPEC = /^std:[a-z0-9_]+(\/[a-z0-9_]+)*$/;
+const isStdSpec = (spec: string): boolean => STD_SPEC.test(spec);
+
+/** True for a module key in the `std:` scheme (a verbatim std specifier). */
+export const isStdKey = (key: ModuleKey): boolean => key.startsWith("std:");
+
 /** The directory portion of a `/`-separated module key (no trailing slash). */
 const dirOf = (key: ModuleKey): string => {
   const slash = key.lastIndexOf("/");
@@ -140,17 +153,22 @@ const normalize = (path: string): string => {
 
 /**
  * Resolve an import `specifier` written in the module at `fromKey` to a module
- * key, or `undefined` when it is a kind phase 1 cannot resolve (a `std:` scheme
- * or any non-relative bare specifier — deferred to phase 2). A relative
- * specifier resolves against the importing file's directory; the `.vl` extension
- * is APPENDED (specifiers omit it) per the design's "append `.vl`, no
- * index/directory guessing" rule.
+ * key, or `undefined` when it is a kind the resolver cannot resolve (a bare
+ * specifier, a malformed `std:` name, or a RELATIVE specifier inside a std
+ * module — std-internal imports use `std:` specifiers only, because
+ * `dirOf("std:fmt")` is `""` so `./x` would resolve CWD-relative, a confusion
+ * magnet). A well-formed `std:` specifier IS its key (returned verbatim). A
+ * relative specifier resolves against the importing file's directory; the `.vl`
+ * extension is APPENDED (specifiers omit it) per the design's "append `.vl`,
+ * no index/directory guessing" rule.
  */
 export const resolveSpecifier = (
   specifier: string,
   fromKey: ModuleKey,
 ): ModuleKey | undefined => {
-  if (!isRelative(specifier)) return undefined; // std:/bare — phase 2+
+  if (isStdSpec(specifier)) return specifier; // the specifier IS the key
+  if (!isRelative(specifier)) return undefined; // bare/malformed-std
+  if (isStdKey(fromKey)) return undefined; // std-internal relative — rejected
   const base = dirOf(fromKey);
   const joined = base === "" ? specifier : `${base}/${specifier}`;
   return `${normalize(joined)}.vl`;
@@ -267,13 +285,17 @@ export const loadProgram = async (
     for (const imp of probe.moduleImports ?? []) {
       const depKey = resolveSpecifier(imp.specifier, key);
       if (depKey === undefined) {
-        // `std:` and bare specifiers are deferred to phase 2 (embedded std).
+        // Texts mirror the native driver's `modVisit` — keep them aligned.
         diagnostics.push(importError(
           imp,
           probeSpans,
-          `Unsupported import specifier "${imp.specifier}" — phase 1 supports ` +
-            `only relative paths (\`./\`, \`../\`); \`std:\` and bare ` +
-            `specifiers are not yet implemented`,
+          isStdKey(key) && isRelative(imp.specifier)
+            ? `Unsupported import specifier "${imp.specifier}" — std modules ` +
+              `import only via \`std:\` specifiers (relative imports inside ` +
+              `std are not allowed)`
+            : `Unsupported import specifier "${imp.specifier}" — supported: ` +
+              `relative paths (\`./\`, \`../\`) and \`std:\` modules; bare ` +
+              `specifiers are not yet implemented`,
         ));
         continue;
       }

@@ -21,6 +21,7 @@ import {
   makeWorkspaceReader,
   pathToUri,
   uriToPath,
+  withStd,
 } from "../lsp/src/moduleGraph.ts";
 import type { VLDiagnostic } from "../compiler/compile.ts";
 
@@ -173,7 +174,7 @@ Deno.test("module diagnostics: imported name carries its real resolved type", as
 
 // ---- (6b) the workspace reader prefers open buffers over disk ---------------
 
-Deno.test("workspace reader: open buffer wins over disk; disk is the fallback", () => {
+Deno.test("workspace reader: open buffer wins over disk; disk is the fallback", async () => {
   // Open-document stand-in: one URI with an UNSAVED edit. The disk stand-in has
   // a DIFFERENT (stale) source for it, plus a file with no open buffer.
   const openText = "export function add(a: i32, b: i32) {\n  return a + b\n}\n";
@@ -191,15 +192,15 @@ Deno.test("workspace reader: open buffer wins over disk; disk is the fallback", 
   const read = makeWorkspaceReader(documents, (p) => disk[p]);
 
   // Open buffer wins (unsaved edits are analyzed, not the stale disk copy).
-  if (read("/proj/util.vl") !== openText) {
+  if (await read("/proj/util.vl") !== openText) {
     throw new Error("open buffer must shadow disk");
   }
   // No open buffer → disk fallback.
-  if (read("/proj/other.vl") !== disk["/proj/other.vl"]) {
+  if (await read("/proj/other.vl") !== disk["/proj/other.vl"]) {
     throw new Error("disk fallback must be used when no buffer is open");
   }
   // Missing everywhere → undefined (surfaced as unresolvable upstream).
-  if (read("/proj/missing.vl") !== undefined) {
+  if (await read("/proj/missing.vl") !== undefined) {
     throw new Error("a missing module must read as undefined");
   }
 });
@@ -245,4 +246,62 @@ Deno.test("module diagnostics: a no-import file diagnoses exactly as single-file
       JSON.stringify(brokenGraph.diagnostics)
     }`,
   );
+});
+
+// ---- (8) std: modules through the LSP reader ---------------------------------
+
+Deno.test("module diagnostics: a std: import resolves via the embedded map (no spurious diagnostics)", async () => {
+  // The workspace reader (entry served as an open buffer, no disk) knows
+  // nothing about std; `withStd` (applied inside `makeWorkspaceReader`) serves
+  // `std:seed` from the generated embedded map.
+  const entry = 'import { stdSmoke } from "std:seed"\n\nprint(stdSmoke())\n';
+  const read = makeWorkspaceReader(
+    {
+      get: (uri: string) =>
+        uri === pathToUri("/proj/main.vl") ? { getText: () => entry } : undefined,
+    },
+    () => undefined,
+  );
+  const { diagnostics, importedScope } = await checkDocument(
+    entry,
+    "/proj/main.vl",
+    read,
+  );
+  assert(
+    !undeclared(diagnostics, "stdSmoke"),
+    `imported std name must not be undeclared; got ${JSON.stringify(diagnostics)}`,
+  );
+  assert(
+    !diagnostics.some((d) => d.severity === "error"),
+    `clean std import should have no errors; got ${JSON.stringify(diagnostics)}`,
+  );
+  assert(importedScope["stdSmoke"] !== undefined, "stdSmoke must be in the imported scope");
+});
+
+Deno.test("withStd: workspace std/ wins over the embedded map; non-std keys pass through", async () => {
+  const inner = memoryReader({
+    "/ws/std/seed.vl": "WORKSPACE",
+    "/proj/util.vl": "UTIL",
+  });
+  // Workspace override present → its bytes win.
+  const overridden = withStd(inner, () => "/ws/std");
+  assert(await overridden("std:seed") === "WORKSPACE", "workspace std must win");
+  // No workspace dir → embedded map serves the seed module.
+  const embedded = withStd(memoryReader({}));
+  const fromMap = await embedded("std:seed");
+  assert(
+    fromMap !== undefined && fromMap.includes("stdSmoke"),
+    "embedded map must serve std:seed",
+  );
+  // Workspace dir known but the file absent → fall through to the embedded map.
+  const fallthrough = withStd(memoryReader({}), () => "/ws/std");
+  const fell = await fallthrough("std:seed");
+  assert(
+    fell !== undefined && fell.includes("stdSmoke"),
+    "missing workspace file must fall through to the embedded map",
+  );
+  // Unknown std module → undefined (the caller's Cannot-resolve path).
+  assert(await embedded("std:nope") === undefined, "unknown std module must be undefined");
+  // Non-std keys pass through to the inner reader untouched.
+  assert(await overridden("/proj/util.vl") === "UTIL", "non-std keys pass through");
 });

@@ -92,6 +92,52 @@ Deno.test({ name: "wasm-checker: a missing import is a diagnostic, not a crash",
   if (diags.length === 0) throw new Error("expected an unresolvable-import diagnostic");
 });
 
+Deno.test({ name: "wasm-checker: a std: import resolves through withStd (embedded map)", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // The injected reader knows NOTHING about std — the fetch loop's withStd
+  // wrapper serves `std:seed` from the embedded map.
+  const diags = await checker.check(
+    'import { stdSmoke } from "std:seed"\nprint(stdSmoke())\n',
+    "/proj/main.vl",
+    noSiblings,
+  );
+  if (diags.length !== 0) {
+    throw new Error(`expected clean, got: ${diags.map((d) => d.message).join("; ")}`);
+  }
+  // An unknown std module falls out as the existing Cannot-resolve diagnostic.
+  const bad = await checker.check(
+    'import { x } from "std:nope"\nprint(1)\n',
+    "/proj/main.vl",
+    noSiblings,
+  );
+  if (!bad.some((d) => d.message.includes("Cannot resolve import"))) {
+    throw new Error(
+      `expected a Cannot-resolve diagnostic for std:nope, got: ${
+        bad.map((d) => d.message).join("; ")
+      }`,
+    );
+  }
+});
+
+Deno.test({ name: "wasm-checker: a workspace std/ dir wins over the embedded map", ignore }, async () => {
+  // The workspace's std/seed.vl declares a DIFFERENT stdSmoke arity; the
+  // zero-arg call that is clean against the embedded map must now error —
+  // proving the workspace override took precedence.
+  const checker = loadWasmChecker(SEED, log, () => "/ws/std")!;
+  const read = (key: string) =>
+    key === "/ws/std/seed.vl"
+      ? "export function stdSmoke(n: i32): i32 {\n  return n\n}\n"
+      : undefined;
+  const diags = await checker.check(
+    'import { stdSmoke } from "std:seed"\nprint(stdSmoke())\n',
+    "/proj/main.vl",
+    read,
+  );
+  if (diags.length === 0) {
+    throw new Error("expected an arity error against the workspace std override");
+  }
+});
+
 const at = (line: number, ch: number, message: string): VLDiagnostic => ({
   message,
   severity: "error",

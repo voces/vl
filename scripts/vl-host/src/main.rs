@@ -21,6 +21,23 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+/// The std source directory `std:` module keys read from. First hit wins:
+/// `$VL_STD`; the repo `std/` resolved off the exe path (the dev tree — the
+/// binary lives at `scripts/vl-host/target/release/vl`, so four levels up);
+/// `<exe dir>/std` (the release layout: std ships beside the binary).
+fn std_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("VL_STD") {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let dev = exe_dir.join("../../../../std");
+    if dev.is_dir() {
+        return Some(dev);
+    }
+    Some(exe_dir.join("std"))
+}
+
 fn gc_engine(collector: Collector) -> Result<Engine> {
     let mut cfg = Config::new();
     cfg.wasm_gc(true);
@@ -206,7 +223,16 @@ fn compile_vl(
                     keys.push(key);
                 }
                 for key in keys {
-                    let src = std::fs::read_to_string(&key).ok();
+                    // A `std:` key maps to `<stdDir>/<name>.vl` (slash segments
+                    // are subdirectories: `std:a/b` → `<stdDir>/a/b.vl`); every
+                    // other key is a filesystem path read as-is. A missing file
+                    // commits `found = 0` either way (the compiler's
+                    // Cannot-resolve diagnostic fires, never the host).
+                    let src = match key.strip_prefix("std:") {
+                        Some(name) => std_dir()
+                            .and_then(|dir| std::fs::read_to_string(dir.join(format!("{name}.vl"))).ok()),
+                        None => std::fs::read_to_string(&key).ok(),
+                    };
                     commit_module(&mut store, &key, src.as_deref())?;
                 }
             }

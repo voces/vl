@@ -72,7 +72,12 @@ const vl = async (args: string[]): Promise<Run> => {
     stdout: "piped",
     stderr: "piped",
     // Deterministic, compact stderr (no Rust backtrace) for stage matching.
-    env: { RUST_BACKTRACE: "0" },
+    // VL_STD pins the std dir to THIS tree: agent worktrees symlink the cargo
+    // target into the main checkout, so the binary's exe-relative std/
+    // fallback (/proc/self/exe resolves symlinks) would point at the WRONG
+    // checkout there. The env override is the first hit in the host's std-dir
+    // resolution either way.
+    env: { RUST_BACKTRACE: "0", VL_STD: `${ROOT}/std` },
   }).output();
   return {
     code,
@@ -230,6 +235,7 @@ const RUN_CASES = [
   "modules/name-isolation/entry.vl",
   "modules/rename/entry.vl",
   "modules/solo/entry.vl",
+  "modules/std-basic/entry.vl",
   "modules/transitive/entry.vl",
   "sets/basics.vl",
   "sets/infer-from-add.vl",
@@ -450,6 +456,7 @@ const REJECT_CASES = [
   "modules/err-not-exported/entry.vl",
   "modules/err-undefined/entry.vl",
   "modules/err-unresolvable/entry.vl",
+  "modules/std-unknown/entry.vl",
   "numerics/narrowing-reject.vl",
   "objects/self-method-pollution.vl",
   "objects/trailing-comma-illegal.vl",
