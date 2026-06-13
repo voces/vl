@@ -54,6 +54,11 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   chartered follow-ups: compiler-injected call sites, generic `expect<T>` + structural diffs,
   power-`assert` rewriting. New behavioral tests switch to `*.test.vl` at v1 (directive-corpus
   growth stops; conversion waits for the TS-tier teardown).
+- ⬜ **Error-handling design** (`docs/error-handling-design.md`, to write) — the language's
+  failure story BEFORE std grows fallible APIs (`std:fs`, parsing): Go-style error returns (VL
+  unions already express `T | Error`) vs Rust `Result`+`?` vs try/catch over the standardized
+  wasm exception-handling proposal (`exnref`); how the choice composes with async/await (B12) and
+  streams. Until it lands, std ships only total functions + `__trap__` aborts (std-design D1).
 - **Explicit numeric conversion syntax** — the lossless-only implicit-widening rule (#298) makes
   the lossy edges (`i32→f32`, `i64→f64`, all narrowings) EXPRESSIBLE ONLY via a cast that does
   not exist yet; design + land it (both compilers).

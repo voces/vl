@@ -3,35 +3,79 @@
 The in-language testing story that eventually replaces the corpus's
 `@run`/`@log` directive fixtures for BEHAVIORAL tests (the `@check`/`@error`
 family stays — compile-time verdicts are the language's spec corpus, not user
-tests). Sibling design: `docs/std-design.md` D5 owns the in-language
-`std:testing` surface; this doc owns discovery, execution, parallelism,
-capture, and reporting — the Rust host's half.
+tests; the far end-state, once the compiler is itself reachable as a std API,
+is corpus files becoming `*.test.vl` files that inline sources and drive a
+`std:`-exposed compile/run — deferred, noted in §Migration). Sibling design:
+`docs/std-design.md` D5 owns the in-language `std:test` surface; this doc
+owns discovery, execution, parallelism, capture, and reporting.
 
 Direction set by the maintainer: `*.test.vl` discovery with configurable
 globs; jest-shaped `describe`/`it`/`beforeEach`/`afterEach`; `expect(...)`
 matchers; files parallel / in-file serial by default, with opt-in
 parallelism for blocks within a file; per-test stdout capture under
-parallelism. The cross-language survey (jest/vitest, Deno.test, pytest,
-go test, cargo-nextest, ExUnit, Zig, Swift Testing, JUnit 5) confirms the
-shape and sharpens five decisions, folded in below.
+parallelism; **runner logic in VL wherever possible, not Rust**. The
+cross-language survey (jest/vitest, Deno.test, pytest, go test,
+cargo-nextest, ExUnit, Zig, Swift Testing, JUnit 5) confirms the shape and
+sharpens five decisions, folded in below.
 
-## Execution model — two-phase registration, host-driven
+## Architecture — the brain is VL; Rust is the mechanism pump
 
-1. **Collect**: the host compiles a `*.test.vl` file (module-aware — the
-   existing fetch loop resolves its relative + `std:` imports) and
-   instantiates it. The wasm start function runs the file's top level:
-   `describe`/`it`/hook calls REGISTER into `std:testing`'s module-level
-   registry and nothing else (registration-only `describe` bodies — the
-   Deno-steps lesson; document loudly, lint later).
-2. **Plan**: the host reads the registry through a small export protocol —
-   `vltCount(): i32`, `vltNameLen(i)/vltNameAt(i,j)` (the full
-   `describe/…/it` slash-path), `vltSerialOnly(i)` etc. — then applies
-   filters (`-t`, `.only`, `.skip`) and schedules.
+The runner splits along the same line as the compiler itself (`main.rs`
+charter: "the brains land in the wasm, the adapter stays an I/O shim"):
+
+- **`std:test/runner` — a VL program — owns all POLICY**: CLI-arg
+  interpretation (the host passes argv through), glob/filter matching, the
+  plan (which tests run where, `.only`/skip resolution, ordering), report
+  formatting (the spec/dot trees, the summary line), and the exit-code
+  decision.
+- **The Rust host owns only the MECHANISM the wasm capability model cannot
+  express**: filesystem walk/read, the thread pool, wasm instance lifecycle
+  (instantiate/kill/re-instantiate), print-sink capture buffers, per-call
+  trap catching, and timeouts (epoch interruption).
+
+The two talk through a **command-queue protocol** — the same shape as the H3
+module fetch loop (the wasm holds a pending list; the host drains it and
+commits results; the linker stays EMPTY, no host-function imports): the host
+pumps `rnNextCmd()` (e.g. "walk these globs", "collect file X", "run test i
+of file X concurrent", "emit this report line"), executes each, and pushes
+results back through commit exports. The runner program is a pure state
+machine; the host is a loop.
+
+Why this split is load-bearing and not taste:
+- **Threads are not WASI** (wasi-threads never standardized; the component
+  model's async story is still settling) — even a pure-WASI runner cannot
+  spawn. Parallel scheduling is host-side in EVERY design; the only question
+  is whether the policy around it is Rust or VL. VL.
+- **The Rust host is scheduled to die** (ROADMAP H-M2: the binary becomes a
+  thin WASI shim, then optional). A Rust-heavy runner deepens the host
+  exactly when the plan is to shrink it; the VL brain survives the H-M2
+  transition unchanged while the fs-walk half of the mechanism dissolves
+  into WASI preopens.
+- **Dogfood**: the runner is the first nontrivial VL *program* (not compiler
+  module) in the tree — more demand-driven discovery.
+
+The runner program is compiled at `vl test` startup by the seed (~ms) from
+`std/test/runner.vl` — no second prebuilt artifact.
+
+Estimated Rust: ~200 LOC (subcommand + walker + pump + capture + pool),
+down from ~450 in the all-Rust draft.
+
+## Execution model — two-phase registration, runner-driven
+
+1. **Collect**: a test file compiles (module-aware — the existing fetch loop
+   resolves its relative + `std:` imports) and instantiates. The wasm start
+   function runs the file's top level: `describe`/`it`/hook calls REGISTER
+   into `std:test`'s module-level registry and nothing else
+   (registration-only `describe` bodies — the Deno-steps lesson; document
+   loudly, lint later).
+2. **Plan**: the runner reads each file's registry (`vltCount`,
+   `vltNameLen/At(i)` — the full `describe/…/it` slash-path — relayed by the
+   host), applies filters (`-t`, `.only`, `.skip`), and schedules.
 3. **Execute**: `vltRun(i): i32` per test (0 pass; a failed expectation
    prints its rendered FAIL line and `__trap__()`s — the host catches the
-   trap, marks the test failed, and continues). Hooks run inside `vltRun`
-   (the registry knows the enclosing scopes). Per-test host calls give trap
-   isolation, output attribution, timeouts, and retries for free.
+   trap for that call, reports it to the runner, and continues). Hooks run
+   inside `vltRun` (the registry knows the enclosing scopes). Per-test calls
+   give trap isolation, output attribution, timeouts, and retries for free.
 
 Why two-phase (vs Deno-style steps discovered during execution): listing,
 `-t` filtering, `.only`, line targeting, and parallel scheduling all need the
@@ -53,7 +97,12 @@ model onto wasm cleanly:
   node — VL instances share nothing by construction, so parallel-by-default
   is safe). One wasm instance per file, scheduled across a Rust thread pool
   (`--jobs`, default ncpu). A per-file `serial` opt-out covers files touching
-  shared host resources.
+  shared host resources. (Why a HOST pool and not VL/WASI threads:
+  wasi-threads was never standardized and the component-model async story is
+  still settling — no portable wasm program can spawn today. In-language
+  concurrency is the B12 async/await track, far future; if/when wasm gains a
+  portable spawn, the command-queue protocol absorbs it without redesign —
+  the runner already expresses the plan, only the executor changes.)
 - **Tests within a file: serial**, sharing the instance — `beforeAll`-style
   expensive setup and closure-shared state work as in jest.
 - **In-file parallel blocks (opt-in)**: `it.concurrent`/`describe.concurrent`
@@ -101,25 +150,41 @@ file FAILs and the run continues), 2 usage — consistent with the binary today.
   args accept files, dirs, or globs (`vl test 'src/**/parser*'`).
 - `-t <substring/regex>` matches the slash-path (`describe/inner/it name` —
   go test's `-run` hierarchy, the survey's standout filter UX).
-- `.only` (registers as only-mode; host runs only those, `--forbid-only` for
-  CI), `.skip(reason)`, `.todo(name)`; runtime `t`-less `skip(reason)` inside
-  a test marks SKIP (environment-dependent skips without conditional
-  attributes).
+- `.only` (registers as only-mode), `.skip(reason)`, `.todo(name)` — one
+  canonical spelling, no `fit`/`xit` aliases (jasmine's focused/excluded
+  shorthands are pure aliases for the same registration bits; one way to say
+  it). Two-phase registration makes `.only` naturally SINGLE-PASS: the
+  registry marks focused entries during collect, the plan simply drops the
+  rest — no re-run, no second walk. `--forbid-only` for CI. Runtime
+  `skip(reason)` inside a test marks SKIP (environment-dependent skips
+  without conditional attributes).
+- **Changed-file selection (jest's `--changedSince`, chartered v2)**: the
+  module graph already exists in the compiler — map `git status`-dirty files
+  through the import closure to the affected `*.test.vl` set. Defaults per
+  the maintainer: working tree dirty → affected tests; clean → all.
+  `--changed-priority` for CI: run everything, AFFECTED FIRST, so a likely
+  failure surfaces in seconds while the full run continues (fail-fast
+  ordering without losing coverage). The graph walk is VL-side (the runner
+  brain — the compiler's own module scanner is reachable there); `git
+  status` is one host command primitive.
 - `path.test.vl:42` line targeting and `--failed-first` ride the
   compiler-injected call-site work (below) and the JSON event stream — v2.
 
 ## What v1 needs, by component
 
-- **Rust host** (`scripts/vl-host/src/main.rs`, the only v1 implementation
-  surface beyond std:testing itself): `test` subcommand; the walker; a
+- **`std:test/runner` (VL — the brain)**: the command-queue state machine
+  (plan/filter/schedule policy, reporters, summary, exit code). Compiled by
+  the seed at `vl test` startup.
+- **Rust host (the mechanism pump, ~200 LOC)**: `test` subcommand; the
+  `*.test.vl` walker + file reads (as command executors); the pump loop; a
   capture-mode `run_program` variant (print closures → per-instance buffer,
-  return the `Instance`); the `vlt*` export protocol driver (functype-aware —
-  the hidden leading structref env param when `fnValUsed`, mangled `$m0`
-  names: centralize the name predicate, both are bridge artifacts that the
-  symbol-resolution revisit replaces); per-call trap catch; thread-pool
-  scheduling; spec/dot reporters. ~400–500 LOC.
-- **`std:testing` v1** (see std-design.md D5): registry + `describe`/`it`/
-  hooks/`expect` over value unions + `__trap__` failure path.
+  return the `Instance`); the `vlt*` per-file protocol driver
+  (functype-aware — the hidden leading structref env param when `fnValUsed`,
+  mangled `$m0` names: centralize the name predicate, both are bridge
+  artifacts the symbol-resolution revisit replaces); per-call trap catch +
+  epoch timeouts; the thread pool.
+- **`std:test` v1** (see std-design.md D5): registry + `describe`/`it`/
+  hooks/`expect` + `__trap__` failure path.
 - **Compiler**: nothing for v1 beyond std-design Slice 0's `__trap__`.
 - **Corpus/CI**: dogfood `*.test.vl` files for the runner itself; a ci-native
   step running `vl test` over them; from this slice on, new behavioral tests
@@ -133,8 +198,9 @@ file FAILs and the run continues), 2 usage — consistent with the binary today.
    locations regrets it; VL owns both compilers, no macros needed). Unlocks
    `path:line` targeting and clickable failures.
 2. **Generic `expect<T>`** + structural diff rendering via `std:fmt` (gated
-   on generic exports + struct-eq emit coverage — std-design slices 2/6).
-   Matcher quality IS diff quality; `std:fmt` grows debug-formatting early.
+   on generic exports — std-design slice 2; structural `==` over
+   structs/lists already works in both compilers). Matcher quality IS diff
+   quality; `std:fmt` grows debug-formatting early.
 3. **Power-`assert`** — compile-time rewriting of plain `assert a == b` to
    print sub-expression values (pytest/Swift's killer UX). VL owns its
    compiler; post-1.0 differentiator.
@@ -154,7 +220,13 @@ file FAILs and the run continues), 2 usage — consistent with the binary today.
   directives are the cross-compiler parity vehicle until then. The immediate
   effect of v1 is freezing the directive corpus, not converting it.
 - `@check`/`@error`/`@error-at`/`@warning`/`@hint`/`@info` (~260): stay
-  directive fixtures indefinitely — they are the spec/soundness corpus.
+  directive fixtures for now — they are the spec/soundness corpus. The far
+  end-state (maintainer direction, deferred): once the COMPILER is reachable
+  as a std API (`std:compile`-class — compile this source string, give me
+  diagnostics/wasm), even these become `*.test.vl` files that inline the
+  source under test and expect on the diagnostics — the directive runners'
+  job, in-language. That waits on the H-M2-era "compiler as a library"
+  surface; no directive machinery should grow meanwhile.
 - The sweep + align test remain the parity gates throughout; `vl test` adds
   the user-facing tier, it doesn't replace the oracle tiers until the TS host
   is gone.

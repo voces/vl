@@ -1,6 +1,6 @@
 # The `std:` scheme + the embedded VL std (H0 Phase 2) — design
 
-The plan for shipping a `.vl` standard library (`std:fmt`, `std:testing`, then
+The plan for shipping a `.vl` standard library (`std:fmt`, `std:test`, then
 collections) resolved through the `std:` specifier scheme, over the
 two-primitive intrinsic floor, in BOTH compile pipelines (TS host + native) and
 BOTH LSP checkers (TS moduleGraph + wasm checker). This is ROADMAP "Kill the TS
@@ -9,7 +9,7 @@ for the native emitter's long tail — each std module that hits an emitter gap
 fails loudly and becomes a burn-down item.
 
 The test RUNNER (`vl test` — discovery, parallel execution, reporting) is the
-sibling design: `docs/test-runner-design.md`. The two meet at `std:testing`'s
+sibling design: `docs/test-runner-design.md`. The two meet at `std:test`'s
 surface (D5).
 
 ## Verified facts (the ground this stands on)
@@ -85,15 +85,47 @@ The floor = `defaultScope`/typecheck.vl builtins, and ONLY these classes:
    per collections-design.md §LS.2 — same class as `__store_i32__`, lowered by
    name in both emitters (instructions both backends already emit internally).
 5. NEW (Slice 0): `__trap__(): void` lowered to `unreachable` — the deliberate
-   abort primitive `std:testing`'s failure path needs. Both emitters already
+   abort primitive `std:test`'s failure path needs. Both emitters already
    emit `unreachable` internally. (A richer `panic(msg)` can subsume it later.)
+
+**Cost of the new intrinsics: zero.** Each is a 1:1 wrapper over a single
+wasm instruction (`array.new`/`array.new_default`/`array.copy`/
+`unreachable`), monomorphized per element type at the call site — the SAME
+bytes both backends already emit internally for string concat/slice and list
+grow. wasm-opt sees identical input to today; there is no call overhead (they
+lower inline, not as functions) and no representation change. The only
+performance question collections-design already answers is downstream of the
+floor (a pure-VL `List` vs the builtin `T[]` lowering — measured separately
+in slice 5, and `T[]` is NOT replaced in this phase).
+
+**Failure/exception strategy: deliberately undecided here.** `__trap__` is an
+ABORT (process-fatal, like Rust's `abort()`), not an exception mechanism, and
+`std:test` v1 needs nothing more. The real question — Go-style error returns
+(which VL's unions express today as `T | Error`) vs Rust-style `Result`+`?`
+vs try/catch over the now-standardized wasm exception-handling proposal
+(`exnref`), and how any of them composes with the future async/await (B12)
+and streams — deserves its own deep-dive BEFORE std grows fallible APIs
+(`std:fs`, parsing). Chartered as `docs/error-handling-design.md` (ROADMAP
+Next); until it lands, std surfaces only total functions + `__trap__` aborts,
+so nothing here pre-commits the answer.
 
 `print` STAYS a builtin through Phase 2 (the §LS.3 migration to a `std:fmt`
 dispatcher is deferred — pure churn, no new primitive).
 
-Contract: std reaches DOWN to the floor only through these named intrinsics;
-the compiler never reaches UP into std by name. A program that imports nothing
-compiles byte-identically to today — the same back-compat invariant H3 held.
+**Contract**: std reaches DOWN to the floor only through these named
+intrinsics. For Phase 2 the compiler does not import std (a program that
+imports nothing compiles byte-identically to today — the H3 back-compat
+invariant). May the COMPILER use std later? Other languages say yes: rustc
+uses core/std, Go's compiler uses its stdlib — and VL's compiler is just a VL
+program, so `wasmEmit.vl` importing `std:fmt`'s `toStr` instead of carrying
+its own `i32ToStr` is the DRY end-state. What it costs: std sources join the
+seed assembly + the fixpoint surface (every std edit perturbs the seed), and
+the bootstrap gains an ordering rule (std must compile without importing
+itself — the floor breaks the cycle, so this is satisfiable). Verdict:
+allowed AFTER the module-system revisit moves the build off concatenation;
+not in Phase 2, where keeping the compiler std-free keeps the seed/fixpoint
+flow untouched. The one-way door is avoided: nothing in Phase 2 makes
+compiler-uses-std harder later.
 
 ### D2. Resolution semantics
 
@@ -102,10 +134,14 @@ compiles byte-identically to today — the same back-compat invariant H3 held.
   to bytes. Keeps both resolvers pure string math, makes std keys unspoofable
   by user paths, and matches the H3 "fetch loop = provider query" KEEP
   decision.
-- **Change in both resolvers:** specifier `std:` + nonempty `[a-z0-9_]+` name →
-  return verbatim; anything else keeps the unsupported-specifier diagnostic.
-  Host and native diagnostic texts stay aligned with each other (no corpus
-  `@error` pins the current text).
+- **Change in both resolvers:** specifier `std:` + a `[a-z0-9_]+(/[a-z0-9_]+)*`
+  name → return verbatim; anything else keeps the unsupported-specifier
+  diagnostic. Path SEGMENTS are allowed from day one (`std:test/runner` ↔
+  `std/test/runner.vl`) — the validation is the same string math either way —
+  but the v1 module inventory stays flat; segments exist for runner-internal
+  modules and future families (`std:fs/path`-style), not as an organizing
+  principle yet. Host and native diagnostic texts stay aligned with each
+  other (no corpus `@error` pins the current text).
 - **Unknown std module** (`std:nope`): the reader returns undefined / the host
   commits `found=0` → the existing `Cannot resolve import` path. No new
   diagnostic.
@@ -115,9 +151,29 @@ compiles byte-identically to today — the same back-compat invariant H3 held.
 - **No version/feature surface.** One std per compiler build; std's version IS
   the compiler's version.
 
+**What belongs in std (the admission principle).** Std sits between the
+compiler (maximally privileged) and user code: it is ordinary VL that ships
+with the compiler, is version-locked to it, and is allowed to lean on
+floor intrinsics — nothing else distinguishes it. The survey of stances:
+Go (batteries-included: fmt/testing/net/http in std — ages well for servers,
+poorly for everything else), Rust (lean core+std, ecosystem owns the rest —
+ages well but pushes beginners to crates for basics), Deno/Zig (curated
+mid-size std, explicitly versioned with the toolchain — closest to VL's
+situation: no package ecosystem exists yet, so std IS the ecosystem
+bootstrap). VL adopts the Deno/Zig stance with a Go-shaped floor: what goes
+in is (a) what the LANGUAGE story needs to be complete without third parties
+— formatting, testing, collections, and eventually fs/io/args once WASI
+lands (H-M2) — and (b) what benefits from compiler version-locking (the test
+runner protocol, anything the toolchain itself drives). What stays out:
+anything speculative without a consumer in the tree (no `std:http` before a
+network story), and anything the floor would have to grow for prematurely.
+Initial inventory: `std:fmt`, `std:test` (+ `std:test/runner`), `std:list`,
+`std:map`/`std:set`; first WASI-era additions: `std:fs`, `std:args`,
+`std:io` — gated on the error-handling design.
+
 ### D3. Source of truth + delivery (the embedding decision)
 
-Std source lives in a repo `std/` directory (`std/fmt.vl`, `std/testing.vl`,
+Std source lives in a repo `std/` directory (`std/fmt.vl`, `std/test.vl`,
 …), sibling to `compiler/`. `std:NAME` ↔ `std/NAME.vl`. Delivery is
 per-consumer (the hybrid):
 
@@ -136,6 +192,20 @@ vehicle; the edit loop wins. The embedded end-state remains available later
 under H-M2 packaging (or `include_str!` into the Rust host at release build —
 open decision OD1).
 
+**Distribution + version skew.** Std is distributed WITH each consumer, never
+separately, and is version-locked to the compiler it ships with:
+- the repo/dev tree: `std/` is just files — edit, rerun, no build step;
+- a released `vl` binary: carries its own std (the `<exe dir>/std` layout or
+  `include_str!`, OD1) — a user never installs std independently;
+- the VS Code extension: `std/embedded.ts` is generated at bundle time, so
+  the extension's std matches the extension's bundled checker. SKEW: the
+  extension's std may trail/lead the workspace's `vl` binary — the same skew
+  the TS-vs-wasm checker already has, surfaced by the same instrument (the
+  `vital.checker: both` divergence log); for a workspace WITH a `std/` dir
+  (this repo), the workspace files win over the embedded map, so dogfooding
+  sees edits live;
+- the playground: embedded map, pinned to the deployed compiler build.
+
 ### D4. Module inventory + order
 
 Fine-grained modules, one per concern. Sequenced so early slices stay inside
@@ -147,14 +217,15 @@ the rename walker is the riskiest code in the module bridge — land it alone.
 1. **`std:fmt` v1** — pure-VL `toStr` for i32/i64/boolean (the `i32ToStr`
    technique), `padLeft`/`repeat`/`join`-class helpers. f64→string (shortest
    round-trip, Ryu-class) explicitly DEFERRED — `print` keeps covering floats.
-2. **`std:testing` v1** — registration + matcher surface per D5; co-designed
+2. **`std:test` v1** — registration + matcher surface per D5; co-designed
    with the `vl test` runner.
 3. **`std:list`** — the collections-design §VL growable over the floor. The
    big demand-discovery slice.
-4. **`std:map` / `std:set`** — then `std:testing` v2 (generic `expect<T>`,
-   struct/list matchers as struct-eq emit coverage lands).
+4. **`std:map` / `std:set`** — then `std:test` v2 (generic `expect<T>` —
+   structural `==` over structs/lists already works in both compilers; the
+   gate is generic exports, slice 2).
 
-### D5. `std:testing` v1 — the in-language surface (the runner contract)
+### D5. `std:test` v1 — the in-language surface (the runner contract)
 
 Decided jointly with `docs/test-runner-design.md` (where the execution model,
 parallelism, and output capture live). The maintainer's direction: jest-shaped
@@ -173,15 +244,24 @@ parallelism, and output capture live). The maintainer's direction: jest-shaped
   `describe` scope; `vltRun(i)` runs the hook chain around the test. State
   flows through closure-captured module `let`s (idiomatic) — typed
   fixture-helpers (`let db = testDb()`) are the blessed pattern over DI.
-- **`expect`, v1 trick — value-union matchers before generics.** Generic
-  exports don't exist until slice 2 and struct-union `==` is an emitter gap,
-  but VALUE unions compare natively today. So v1:
-  `expect(v: i32 | i64 | f64 | boolean | string)` returns an `Expectation`
-  struct holding the union; `.toBe(w)` compares via union `==`, `.not()`
-  inverts, failure renders via `std:fmt`. One `expect` name covers every
-  scalar + string — no `expectI32`/`expectStr` splay, no overloading needed.
-  `expect<T>` for structs/lists is the v2 upgrade (slice 4, after generic
-  exports + struct-eq coverage).
+- **`expect`, v1 trick — value-union matchers before generics.** To be
+  precise about what gates what: VL `==` is ALREADY STRUCTURAL for structs
+  and arrays in both compilers (corpus `objects/equality`, `arrays/equality`;
+  the native lowering shipped — `emitStructEq` recurses fields, lists compare
+  length+elements, function-valued fields by identity). The v1 limitation is
+  NOT equality — it's that `expect<T>` is a GENERIC function and generic
+  exports don't survive either module pipeline until slice 2. So v1 ships
+  `expect(v: i32 | i64 | f64 | boolean | string)` (a value union — one
+  `expect` name, no `expectI32` splay, no overloading needed) returning an
+  `Expectation` struct; `.toBe(w)` compares via union `==`, `.not()` inverts,
+  failure renders via `std:fmt`. `expect<T>` over structs/lists is the v2
+  upgrade (after slice 2), and its `==` already works.
+- **Matcher naming: one matcher, `.toBe`, meaning VL `==`.** Jest's
+  `toBe`/`toEqual` split exists because JS has two equalities (identity vs
+  deep). VL has ONE today — `==` is structural everywhere — so v1 has one
+  matcher. If/when a referential-identity operator lands (ROADMAP A15 `===`),
+  `.toBeIdentical` can join; `.toEqual` is reserved as a future alias
+  decision, not v1 surface.
 - **Failure contract: record-print-trap.** A failing matcher prints one
   rendered line (`FAIL <test name>: expected …, got …`), then `__trap__()` —
   the test aborts (jest semantics: a test stops at its first failed
@@ -227,13 +307,13 @@ slices.
 3. **`std:fmt` v1**: toStr/join/pad in pure VL. Corpus `std-fmt/` pinning
    exact rendering. First expected long-tail contact; each gap files with a
    minimized corpus case.
-4. **`std:testing` v1 + the `vl test` runner v1** (see test-runner-design.md
+4. **`std:test` v1 + the `vl test` runner v1** (see test-runner-design.md
    for the runner half): the D5 surface + the host protocol + discovery/
    reporting. Corpus: `modules/std-testing-pass/` (@run), `std-testing-fail/`
    (@trap). From this slice on, NEW behavioral tests are written as
    `*.test.vl` — directive-corpus growth stops.
 5. **`std:list`** over the floor (heavy demand-discovery).
-6. **`std:map`/`std:set`** + `std:testing` v2 (generic `expect<T>`,
+6. **`std:map`/`std:set`** + `std:test` v2 (generic `expect<T>`,
    struct/list matchers).
 
 Dependencies: 0 and 1 independent; 2 independent of 3; 3 needs 1; 4 needs
@@ -249,6 +329,7 @@ Dependencies: 0 and 1 independent; 2 independent of 3; 3 needs 1; 4 needs
   semantics) is chosen; a collect-all-expectations mode is a v2 runner policy.
 - **OD4 — LSP go-to-def into std**: workspace-`std/`-only navigation for v1.
 - **OD5 — `print` stays builtin through Phase 2.**
-- **OD6 — naming**: `std:testing` vs `std:test`; final matcher names
-  (`toBe`/`toEqual` split deferred until structural equality exists — v1 has
-  only `toBe`).
+- **OD6 — naming: RESOLVED `std:test`** (maintainer call on the PR review).
+  Matchers: v1 has only `.toBe` = VL `==` (structural — see D5); the
+  jest `toBe`/`toEqual` split has no meaning until a referential `===`
+  exists (A15).
