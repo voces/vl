@@ -41,7 +41,7 @@
 // The AST data layer (`compiler/ast.vl`): the token type, the global parser state
 // `P`, and the arena `mk*` constructors. The parser's own `advance`/`peekTok`
 // cursor primitives stay PRIVATE to this module.
-import { Tok, P, Ident } from "./ast"
+import { Tok, P, Ident, mkDeclNameTok } from "./ast"
 import {
   mkNum,
   mkStr,
@@ -568,7 +568,7 @@ function parseObjLit(): i32 {
       // return / body parse exactly as a lambda's (the host parses it via
       // `parseFunctionDeclaration` from the key token).
       let mtps: string[] = []
-      value = parseFuncTail("", mtps)
+      value = parseFuncTail("", mtps, 0 - 1)
     } else if !stringKey && peekKind() != "COLON" {
       // Bare-IDENT shorthand `{ x }` → `{ x: x }` (the host's `parsePair` fallback).
       value = mkIdent(name)
@@ -780,7 +780,9 @@ function parseExpr(): i32 {
 function parseLet(): i32 {
   let kw = advance().text          // "let" or "const"
   let name = ""
+  let nameTok = 0 - 1
   if peekKind() == "IDENT" {
+    nameTok = P.pos                 // the name token's index (consumed next)
     name = advance().text
   } else {
     expect("IDENT")
@@ -793,7 +795,9 @@ function parseLet(): i32 {
   if accept("EQUAL") {
     init = parseExpr()
   }
-  mkLet(kw, name, ty, init)
+  let ix = mkLet(kw, name, ty, init)
+  mkDeclNameTok(ix, nameTok)
+  ix
 }
 
 // `"type" IDENT "=" "{" (IDENT ":" type ("," IDENT ":" type)*)? "}"`
@@ -803,7 +807,9 @@ function parseLet(): i32 {
 function parseTypeDecl(): i32 {
   advance()                        // "type"
   let name = ""
+  let nameTok = 0 - 1
   if peekKind() == "IDENT" {
+    nameTok = P.pos
     name = advance().text
   } else {
     expect("IDENT")
@@ -856,7 +862,9 @@ function parseTypeDecl(): i32 {
       skipNewlines()
       more = peekKind() == "PIPE"
     }
-    return mkUnionDecl(name, variants)
+    let uix = mkUnionDecl(name, variants)
+    mkDeclNameTok(uix, nameTok)
+    return uix
   }
   expect("LBRACE")
   let fields: i32[] = []
@@ -913,15 +921,21 @@ function parseTypeDecl(): i32 {
       skipNewlines()
       umore = peekKind() == "PIPE"
     }
-    return mkUnionDecl(name, variants)
+    let u2ix = mkUnionDecl(name, variants)
+    mkDeclNameTok(u2ix, nameTok)
+    return u2ix
   }
-  mkTypeDecl(name, fields)
+  let tdix = mkTypeDecl(name, fields)
+  mkDeclNameTok(tdix, nameTok)
+  tdix
 }
 
 // `IDENT (":" type)?`
 function parseParam(): i32 {
   let name = ""
+  let nameTok = 0 - 1
   if peekKind() == "IDENT" {
+    nameTok = P.pos
     name = advance().text
   } else {
     expect("IDENT")
@@ -930,7 +944,9 @@ function parseParam(): i32 {
   if accept("COLON") {
     ty = parseType()
   }
-  mkParam(name, ty)
+  let ix = mkParam(name, ty)
+  mkDeclNameTok(ix, nameTok)
+  ix
 }
 
 // The shared tail of every function form — the cursor on the `(` of the param
@@ -943,7 +959,7 @@ function parseParam(): i32 {
 //     — an object-literal EXPRESSION body (implicit return), decided by
 //     `looksLikeObject` exactly as the host's `parseStatement` path does;
 //   • otherwise a braced statement BLOCK.
-function parseFuncTail(name: string, typarams: string[]): i32 {
+function parseFuncTail(name: string, typarams: string[], nameTok: i32): i32 {
   expect("LPAREN")
   // A function signature may span several source lines (`function f(` NEWLINE
   // `a: T,` NEWLINE `b: U` NEWLINE `)`). Mirror the host's `parseParams`: skip
@@ -984,7 +1000,9 @@ function parseFuncTail(name: string, typarams: string[]): i32 {
     let e = parseExpr()
     let stmts: i32[] = []
     stmts.push(e)
-    return mkFunc(name, typarams, params, ret, mkBlock(stmts))
+    let bix = mkFunc(name, typarams, params, ret, mkBlock(stmts))
+    mkDeclNameTok(bix, nameTok)
+    return bix
   }
   let scan = P.pos + 1
   let snl = kindAt(scan) == "NEWLINE"
@@ -997,10 +1015,14 @@ function parseFuncTail(name: string, typarams: string[]): i32 {
     let oe = parseExpr()
     let ostmts: i32[] = []
     ostmts.push(oe)
-    return mkFunc(name, typarams, params, ret, mkBlock(ostmts))
+    let oix = mkFunc(name, typarams, params, ret, mkBlock(ostmts))
+    mkDeclNameTok(oix, nameTok)
+    return oix
   }
   let body = parseBlock()
-  mkFunc(name, typarams, params, ret, body)
+  let fix = mkFunc(name, typarams, params, ret, body)
+  mkDeclNameTok(fix, nameTok)
+  fix
 }
 
 // The operator tokens a FUNCTION NAME may be (`function +(self, b)` — a free
@@ -1019,11 +1041,14 @@ function isOpFuncName(kind: string): boolean {
 function parseFuncHead(requireName: boolean): i32 {
   advance()                        // "function"
   let name = ""
+  let nameTok = 0 - 1
   if peekKind() == "IDENT" {
+    nameTok = P.pos
     name = advance().text
   } else if isOpFuncName(peekKind()) {
     // An operator-symbol name (`function +(self, b)`); checked AFTER the IDENT
     // case, so `function <(a, b)` reads the `<` as the name (host order).
+    nameTok = P.pos
     name = advance().text
   } else if requireName {
     expect("IDENT")
@@ -1045,7 +1070,7 @@ function parseFuncHead(requireName: boolean): i32 {
     }
     expect("GT")                   // ">"
   }
-  parseFuncTail(name, typarams)
+  parseFuncTail(name, typarams, nameTok)
 }
 
 // `"function" IDENT "(" params? ")" (":" type)? block`
@@ -1144,7 +1169,9 @@ function parseWhile(label: string): i32 {
 function parseFor(label: string): i32 {
   advance()                        // "for"
   let v = ""
+  let vTok = 0 - 1
   if peekKind() == "IDENT" {
+    vTok = P.pos
     v = advance().text
   } else {
     expect("IDENT")
@@ -1165,10 +1192,14 @@ function parseFor(label: string): i32 {
       step = parseExpr()
     }
     let rbody = parseBlock()
-    return mkForRange(v, first, to, step, rbody, label)
+    let frix = mkForRange(v, first, to, step, rbody, label)
+    mkDeclNameTok(frix, vTok)
+    return frix
   }
   let ibody = parseBlock()
-  mkForIn(v, first, ibody, label)
+  let fiix = mkForIn(v, first, ibody, label)
+  mkDeclNameTok(fiix, vTok)
+  fiix
 }
 
 // `"break" [label]` — a loop-control statement with an optional loop LABEL after

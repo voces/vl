@@ -169,6 +169,12 @@ const RUN_CASES = [
   "globals/string-reassign-cross-function.vl",
   "globals/struct-field-through-fn.vl",
   "index/nested-2d-array.vl",
+  "intrinsics/array-copy-overlap.vl",
+  "intrinsics/array-copy.vl",
+  "intrinsics/array-new-bool.vl",
+  "intrinsics/array-new-default-zero.vl",
+  "intrinsics/array-new-f64.vl",
+  "intrinsics/array-new-fill.vl",
   "lexer/soft-keywords-as-function-names.vl",
   "lexer/soft-keywords-as-identifiers.vl",
   "lint/called-function-no-warn.vl",
@@ -216,6 +222,17 @@ const RUN_CASES = [
   "loops/single-line-block.vl",
   "loops/while-sum.vl",
   "loops/while-true-return.vl",
+  // Free-function `self`-UFCS on NON-STRUCT receivers (string / i32 / value
+  // union): `o.f(args)` rewrites to `f(o, args)` PRE-COLLECT for every receiver
+  // kind, so a string/union arg keeps its rep through the scratch-frame sizing.
+  // The field-precedence regression asserts a callable struct field still wins.
+  "methods/field-wins-over-self-fn.vl",
+  "methods/i32-recv-scalar-arg.vl",
+  "methods/named-arg-ufcs.vl",
+  "methods/string-recv-mixed-args.vl",
+  "methods/string-recv-string-arg.vl",
+  "methods/union-recv-args.vl",
+  "methods/union-recv-no-args.vl",
   "maps/annotated-empty-ok.vl",
   "maps/basics.vl",
   "maps/churn-reuse-correct.vl",
@@ -231,6 +248,9 @@ const RUN_CASES = [
   // H3 native modules: multi-file entries — `vl run` resolves the sibling
   // imports through the driver's fetch loop (relative to the entry path).
   "modules/basic/entry.vl",
+  "modules/generic-export/entry.vl",
+  "modules/generic-isolation/entry.vl",
+  "modules/generic-shadow/entry.vl",
   "modules/inferred-exports/entry.vl",
   "modules/name-isolation/entry.vl",
   "modules/rename/entry.vl",
@@ -238,6 +258,8 @@ const RUN_CASES = [
   "modules/std-basic/entry.vl",
   "modules/std-fmt/entry.vl",
   "modules/transitive/entry.vl",
+  "modules/ufcs-import/entry.vl",
+  "modules/ufcs-import-field-precedence/entry.vl",
   "sets/basics.vl",
   "sets/infer-from-add.vl",
   "numerics/wide.vl",
@@ -413,6 +435,7 @@ const RUN_CASES = [
 
 // ── TRAP_CASES: `vl run` exits nonzero with a runtime trap ──
 const TRAP_CASES = [
+  "intrinsics/trap.vl",
   "traps/array-oob-read.vl",
   "traps/divide-by-zero.vl",
 ];
@@ -438,6 +461,10 @@ const REJECT_CASES = [
   "generics/type-alias-soundness.vl",
   "index/wrong-key-type.vl",
   "index/wrong-value-type.vl",
+  "intrinsics/error-array-copy-not-list.vl",
+  "intrinsics/error-array-new-arity.vl",
+  "intrinsics/error-array-new-bad-length.vl",
+  "intrinsics/error-trap-args.vl",
   "lint/empty-intersection.vl",
   "lint/for-step-zero.vl",
   "literals/err-bad-hex-digit.vl",

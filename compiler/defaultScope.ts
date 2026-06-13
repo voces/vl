@@ -561,6 +561,106 @@ export const defaultScope = () => {
       return: { type: "Alias", name: "string" },
     };
 
+    // The array-intrinsic floor (std-design D1 / collections-design §LS.2): the
+    // runtime-length / bulk siblings of the array literal, the two primitives a
+    // pure-VL `List<T>` stands on. Each is a thin wrapper over a single WasmGC
+    // instruction, lowered INLINE by name in `toWasm.ts` (no call overhead) and
+    // monomorphized per element type through the existing array-type interner.
+    //
+    // `__array_new__<T>(length: i32, fill: T): T[]` → `array.new`: allocate
+    // `length` slots, every slot set to `fill`. The element type `T` is a shared
+    // inference hole between `fill` and the returned `T[]`, so each call site
+    // instantiates and pins it from its own fill argument (the same machinery as
+    // any generic signature — `instantiateFunctionType`).
+    {
+      const element: VLType = { type: "Infer", subType: { type: "Unknown" } };
+      scope.__array_new__ = {
+        type: "Function",
+        paramaters: [{
+          type: "Parameter",
+          name: "length",
+          paramaterType: { type: "Alias", name: "i32" },
+        }, {
+          type: "Parameter",
+          name: "fill",
+          paramaterType: element,
+        }],
+        return: {
+          type: "Object",
+          properties: [{
+            // Canonical array key (`{[number]: T}` — see `arrayElementType`).
+            name: { type: "Alias", name: "number" },
+            type: element,
+          }],
+        },
+      };
+    }
+
+    // `__array_new_default__<T>(length: i32): T[]` → `array.new_default`:
+    // allocate `length` default-initialized (zeroed) slots. `T` appears only in
+    // the return, so — like `Map()`/`Set()` — the element type comes from
+    // context: `typeFromExpression` returns a fresh element hole that the
+    // surrounding annotation pins (see the special case in `typecheck.ts`).
+    scope.__array_new_default__ = {
+      type: "Function",
+      paramaters: [{
+        type: "Parameter",
+        name: "length",
+        paramaterType: { type: "Alias", name: "i32" },
+      }],
+      return: { type: "Infer", subType: { type: "Unknown" } },
+    };
+
+    // `__array_copy__<T>(dst: T[], dstAt: i32, src: T[], srcAt: i32, count: i32):
+    // null` → `array.copy`: bulk-move `count` elements from `src[srcAt..]` into
+    // `dst[dstAt..]` (memmove semantics — overlapping ranges are handled by the
+    // instruction). The shared `T` hole pins from `dst` and holds `src` to the
+    // same element type. Out-of-range spans trap (the instruction's own check).
+    {
+      const element: VLType = { type: "Infer", subType: { type: "Unknown" } };
+      const listOfElement = (): VLType => ({
+        type: "Object",
+        properties: [{
+          name: { type: "Alias", name: "number" },
+          type: element,
+        }],
+      });
+      scope.__array_copy__ = {
+        type: "Function",
+        paramaters: [{
+          type: "Parameter",
+          name: "dst",
+          paramaterType: listOfElement(),
+        }, {
+          type: "Parameter",
+          name: "dstAt",
+          paramaterType: { type: "Alias", name: "i32" },
+        }, {
+          type: "Parameter",
+          name: "src",
+          paramaterType: listOfElement(),
+        }, {
+          type: "Parameter",
+          name: "srcAt",
+          paramaterType: { type: "Alias", name: "i32" },
+        }, {
+          type: "Parameter",
+          name: "count",
+          paramaterType: { type: "Alias", name: "i32" },
+        }],
+        return: { type: "Alias", name: "null" },
+      };
+    }
+
+    // `__trap__(): null` → `unreachable`: the deliberate abort primitive
+    // (process-fatal, like Rust's `abort()`), `std:test`'s failure path. A
+    // richer `panic(msg)` can subsume it later (std-design OD2).
+    scope.__trap__ = {
+      type: "Function",
+      paramaters: [],
+      return: { type: "Alias", name: "null" },
+    };
+
     // `fromCodePoints(xs: i32[]): string` — construct a VL string from a LIST of
     // Unicode code points in one bulk copy. The amortized alternative to per-char
     // `fromCodePoint(c)` + `+` concat, which is quadratic copy churn (a VL string

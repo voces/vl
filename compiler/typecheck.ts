@@ -524,6 +524,23 @@ export const _typeFromExpression = (
         if (expr.functionType) expr.functionType.return = hole;
         return hole;
       }
+      // `__array_new_default__(n)` (the intrinsic floor, std-design D1): the
+      // element type appears only in the return, so — like `Map()`/`Set()` — it
+      // comes from context. Return a `T[]` whose element is a FRESH inference
+      // hole; the surrounding `ensureType(annotation, …)` pins it. Codegen reads
+      // the resolved list type back off the call's `functionType.return` (or the
+      // desired type).
+      if (expr.function === "__array_new_default__") {
+        const ret: VLType = {
+          type: "Object",
+          properties: [{
+            name: { type: "Alias", name: "number" },
+            type: { type: "Infer", subType: { type: "Unknown" } },
+          }],
+        };
+        if (expr.functionType) expr.functionType.return = ret;
+        return ret;
+      }
       // Prefer the per-call instantiated signature (its return is resolved to a
       // concrete type for this call's arguments); the shared scope entry's
       // return may still hold an inference hole pinned by another call site.

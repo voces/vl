@@ -58,9 +58,13 @@ import type { Context } from "../../compiler/ast.ts";
 import { tokenize } from "../../compiler/lexer.ts";
 import { join } from "node:path";
 import {
+  diffDefinition,
   diffDiagnostics,
+  diffHoverType,
+  diffReferences,
   loadWasmChecker,
   type WasmChecker,
+  type WasmRange,
 } from "./wasmChecker.ts";
 import {
   type Completion,
@@ -450,27 +454,65 @@ connection.onDefinition(async (params): Promise<Location | null> => {
   if (!doc) return null;
   const text = doc.getText();
 
-  // Is the cursor on an imported name? If so, resolve cross-file.
-  const lineText = doc.getText({
-    start: { line: params.position.line, character: 0 },
-    end: { line: params.position.line + 1, character: 0 },
-  });
-  const word = wordAt(lineText, params.position.character);
-  if (word) {
-    const source = await importedNameSource(
-      word,
-      text,
-      entryKeyOf(params.textDocument.uri),
-      workspaceReader,
-    );
-    if (source) return Location.create(source.uri, source.range);
-  }
+  // The TS path (the default + the universal fallback): cross-file imported-name
+  // jump first, then the single-file symbol table.
+  const tsDefinition = async (): Promise<Location | null> => {
+    const lineText = doc.getText({
+      start: { line: params.position.line, character: 0 },
+      end: { line: params.position.line + 1, character: 0 },
+    });
+    const word = wordAt(lineText, params.position.character);
+    if (word) {
+      const source = await importedNameSource(
+        word,
+        text,
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+      );
+      if (source) return Location.create(source.uri, source.range);
+    }
+    const symbols = parseSymbols(text);
+    const decl = symbols.definitionAt(toVLPosition(params.position));
+    if (!decl) return null;
+    return Location.create(params.textDocument.uri, ctxToRange(decl));
+  };
 
-  // Local definition (single-file, unchanged).
-  const symbols = parseSymbols(text);
-  const decl = symbols.definitionAt(toVLPosition(params.position));
-  if (!decl) return null;
-  return Location.create(params.textDocument.uri, ctxToRange(decl));
+  // LSP-on-wasm Stage 2: route go-to-def to the self-hosted compiler. `"wasm"`
+  // uses its result, falling back to TS on a miss (the cursor was off any binding
+  // the native checker tracks, or the seed predates the symbol exports); `"both"`
+  // serves the TS result but logs structural divergence — the parity instrument.
+  const wasmDef = async (): Promise<WasmRange | undefined> => {
+    if (wasmChecker?.definitionAt === undefined) return undefined;
+    return await wasmChecker
+      .definitionAt(
+        text,
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+        params.position.line,
+        params.position.character,
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] definitionAt failed: ${err}`);
+        return undefined;
+      });
+  };
+
+  if (checkerMode === "wasm" && wasmChecker !== undefined) {
+    const r = await wasmDef();
+    if (r) return Location.create(params.textDocument.uri, r);
+    return tsDefinition();
+  }
+  if (checkerMode === "both" && wasmChecker !== undefined) {
+    const ts = await tsDefinition();
+    const wasm = await wasmDef();
+    const tsRange = ts && ts.uri === params.textDocument.uri ? ts.range : undefined;
+    const diff = diffDefinition(tsRange, wasm);
+    if (diff !== undefined) {
+      connection.console.log(`[wasm-parity] ${params.textDocument.uri} ${diff}`);
+    }
+    return ts;
+  }
+  return tsDefinition();
 });
 
 // Find-references: every occurrence (declaration + uses) of the binding under
@@ -487,49 +529,84 @@ connection.onReferences(async (params): Promise<Location[] | null> => {
   const text = doc.getText();
   const includeDeclaration = params.context?.includeDeclaration ?? true;
 
-  // Cross-file: only attempt when the cursor sits on an identifier.
-  const lineText = doc.getText({
-    start: { line: params.position.line, character: 0 },
-    end: { line: params.position.line + 1, character: 0 },
-  });
-  const word = wordAt(lineText, params.position.character);
-  if (word) {
-    const openDocs = documents.all().map((d) => ({
-      uri: d.uri,
-      text: d.getText(),
-    }));
-
-    // Determine the project root for the on-disk crawl. Prefer the LSP workspace
-    // folder root (set during `onInitialize`); fall back to detecting it by
-    // walking up from the current file's path.
-    const entryKey = entryKeyOf(params.textDocument.uri);
-    const crawlRoot = workspaceFolder
-      ? uriToPath(workspaceFolder)
-      : detectProjectRoot(entryKey);
-    const diskFiles = enumerateWorkspaceFiles(crawlRoot);
-
-    const crossRefs = await crossFileReferences(
-      word,
-      text,
-      entryKey,
-      openDocs,
-      workspaceReader,
-      includeDeclaration,
-      diskFiles,
-    );
-    // A defined (possibly empty) result means the symbol is cross-module: use it.
-    // `undefined` means a purely-local symbol → fall through to single-file.
-    if (crossRefs !== undefined) {
-      return crossRefs.map((r) => Location.create(r.uri, r.range));
+  // The TS path (default + fallback): cross-module crawl when the symbol is
+  // exported/imported, else the single-file symbol table.
+  const tsReferences = async (): Promise<Location[]> => {
+    const lineText = doc.getText({
+      start: { line: params.position.line, character: 0 },
+      end: { line: params.position.line + 1, character: 0 },
+    });
+    const word = wordAt(lineText, params.position.character);
+    if (word) {
+      const openDocs = documents.all().map((d) => ({
+        uri: d.uri,
+        text: d.getText(),
+      }));
+      const entryKey = entryKeyOf(params.textDocument.uri);
+      const crawlRoot = workspaceFolder
+        ? uriToPath(workspaceFolder)
+        : detectProjectRoot(entryKey);
+      const diskFiles = enumerateWorkspaceFiles(crawlRoot);
+      const crossRefs = await crossFileReferences(
+        word,
+        text,
+        entryKey,
+        openDocs,
+        workspaceReader,
+        includeDeclaration,
+        diskFiles,
+      );
+      // A defined (possibly empty) result means the symbol is cross-module.
+      if (crossRefs !== undefined) {
+        return crossRefs.map((r) => Location.create(r.uri, r.range));
+      }
     }
-  }
+    const symbols = parseSymbols(text);
+    const spans = symbols.referencesAt(toVLPosition(params.position), includeDeclaration);
+    return spans.map((ctx) => Location.create(params.textDocument.uri, ctxToRange(ctx)));
+  };
 
-  // Single-file references (a local binding), unchanged.
-  const symbols = parseSymbols(text);
-  const spans = symbols.referencesAt(toVLPosition(params.position), includeDeclaration);
-  return spans.map((ctx) =>
-    Location.create(params.textDocument.uri, ctxToRange(ctx))
-  );
+  // LSP-on-wasm Stage 2: the native references are SINGLE-FILE (the binding's
+  // occurrences in the entry module). A cross-module symbol still wants the TS
+  // crawl, so `"wasm"` defers to TS when the native side finds nothing local.
+  const wasmRefs = async (): Promise<WasmRange[]> => {
+    if (wasmChecker?.referencesAt === undefined) return [];
+    return await wasmChecker
+      .referencesAt(
+        text,
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+        params.position.line,
+        params.position.character,
+        includeDeclaration,
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] referencesAt failed: ${err}`);
+        return [];
+      });
+  };
+
+  if (checkerMode === "wasm" && wasmChecker !== undefined) {
+    const refs = await wasmRefs();
+    if (refs.length > 0) {
+      return refs.map((r) => Location.create(params.textDocument.uri, r));
+    }
+    return tsReferences();
+  }
+  if (checkerMode === "both" && wasmChecker !== undefined) {
+    const ts = await tsReferences();
+    const wasm = await wasmRefs();
+    // Compare only same-file spans (the native side is single-file).
+    const tsLocal = ts
+      .filter((l) => l.uri === params.textDocument.uri)
+      .map((l) => l.range as WasmRange);
+    const diff = diffReferences(tsLocal, wasm);
+    if (diff !== undefined) {
+      connection.console.log(`[wasm-parity] ${params.textDocument.uri} ${diff}`);
+    }
+    return ts;
+  }
+  return tsReferences();
 });
 
 // Extract the identifier `[A-Za-z_][A-Za-z0-9_]*` straddling `character` on
@@ -568,6 +645,40 @@ const hoverMarkdown = (code: string): Hover["contents"] => ({
 connection.onHover(async (params): Promise<Hover | null> => {
   const document = documents.get(params.textDocument.uri);
   if (!document) return null;
+
+  // LSP-on-wasm Stage 2: the native hover type for the binding under the cursor.
+  // `"wasm"` returns it when present (else falls through to the TS hover, which
+  // also covers members + flow types the native path doesn't yet render);
+  // `"both"` logs the type-string divergence against the TS render below.
+  const wasmHoverType = async (): Promise<string | undefined> => {
+    if (wasmChecker?.hoverTypeAt === undefined) return undefined;
+    return await wasmChecker
+      .hoverTypeAt(
+        document.getText(),
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+        params.position.line,
+        params.position.character,
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] hoverTypeAt failed: ${err}`);
+        return undefined;
+      });
+  };
+  const wordForHover = wordAt(
+    document.getText({
+      start: { line: params.position.line, character: 0 },
+      end: { line: params.position.line + 1, character: 0 },
+    }),
+    params.position.character,
+  );
+  if (checkerMode === "wasm" && wasmChecker !== undefined) {
+    const t = await wasmHoverType();
+    if (t && wordForHover) {
+      return { contents: hoverMarkdown(`${wordForHover}: ${t}`) };
+    }
+    // else fall through to the TS hover (members, imported names, flow types).
+  }
 
   const lineText = document.getText({
     start: { line: params.position.line, character: 0 },
@@ -623,13 +734,19 @@ connection.onHover(async (params): Promise<Hover | null> => {
     // the alias shows its BODY while keeping any inner alias names (`type thing =
     // "a" | I32` hovers as `"a" | I32`) — otherwise it would render its own name.
     const aliasDepth = occ.binding.kind === "type" ? 1 : 0;
+    const tsTypeStr = stringifyType(occ.binding.type, new Set(), aliasDepth);
+    if (checkerMode === "both" && wasmChecker !== undefined) {
+      const wasmType = await wasmHoverType();
+      const diff = diffHoverType(tsTypeStr, wasmType);
+      if (diff !== undefined) {
+        connection.console.log(`[wasm-parity] ${params.textDocument.uri} ${diff}`);
+      }
+    }
     return {
       contents: {
         kind: "markdown",
         value: docMarkdown(
-          `${occ.binding.name}: ${
-            stringifyType(occ.binding.type, new Set(), aliasDepth)
-          }`,
+          `${occ.binding.name}: ${tsTypeStr}`,
           VL_LANGUAGE_ID,
           occ.binding.doc,
           docResolver,
