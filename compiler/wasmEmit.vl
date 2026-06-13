@@ -22873,24 +22873,56 @@ function drwWalk(ix: i32, ctx: i32): i32 {
     let callee = P.nodes[n.callFn]
     if callee is Member {
       callee.memObj = drwWalk(callee.memObj, ctx)
-      // UFCS: a struct receiver with NO such field, and a free `self`-function
-      // of matching arity → `f(o, args)`. The Call node mutates in place: the
-      // receiver shifts in as argument 0, the callee becomes a bare Ident.
+      // UFCS (host parser.ts case 2): `o.f(args)` where `f` is a free function
+      // whose FIRST parameter is named `self` (arity matching) lowers to the
+      // direct call `f(o, args)`. The receiver TYPE does not gate it — string,
+      // i32, and value-union receivers dispatch identically to struct ones.
+      // The Call node mutates in place: the receiver shifts in as argument 0,
+      // the callee becomes a bare Ident, and any named args slide right of the
+      // unnamed receiver ("" rides slot 0).
+      //
+      // Precedence, mirroring the host:
+      //   • a REAL struct field of that name wins (a value access, not a call);
+      //   • a callable FIELD (closure-valued, kind 14) wins as a `call_ref`
+      //     member-call (`exprIsClosure`), so it is NOT UFCS-rewritten.
+      // A non-struct receiver has no fields, so neither precedence case can
+      // apply — the rewrite fires once a matching `self`-function exists.
       let si = structIndexOfExpr(callee.memObj, ctx)
+      let ufcs = false
       if si >= 0 {
         if sFieldIndex(si, callee.memProp) < 0 {
-          if drwSelfFnOf(callee.memProp, args.length + 1) >= 0 {
-            let recvIx = callee.memObj
-            args.push(0 - 1)
-            let j = args.length - 1
-            while j > 0 {
-              args[j] = args[j - 1]
-              j = j - 1
-            }
-            args[0] = recvIx
-            n.callFn = mkIdent(callee.memProp)
-          }
+          if drwSelfFnOf(callee.memProp, args.length + 1) >= 0 { ufcs = true }
         }
+      }
+      if si < 0 {
+        if !exprIsClosure(n.callFn, ctx) {
+          if drwSelfFnOf(callee.memProp, args.length + 1) >= 0 { ufcs = true }
+        }
+      }
+      if ufcs {
+        let recvIx = callee.memObj
+        args.push(0 - 1)
+        let j = args.length - 1
+        while j > 0 {
+          args[j] = args[j - 1]
+          j = j - 1
+        }
+        args[0] = recvIx
+        // Named-arg parity: the injected receiver is an UNNAMED slot-0
+        // positional. Only when the call already carries names does the name
+        // list need a leading "" (an all-positional call keeps its empty
+        // list, so `hasNamedArgs` stays false downstream).
+        if hasNamedArgs(n.callArgNames) {
+          let nm = n.callArgNames
+          nm.push("")
+          let k = nm.length - 1
+          while k > 0 {
+            nm[k] = nm[k - 1]
+            k = k - 1
+          }
+          nm[0] = ""
+        }
+        n.callFn = mkIdent(callee.memProp)
       }
       return ix
     }
