@@ -236,6 +236,7 @@ const RUN_CASES = [
   "modules/rename/entry.vl",
   "modules/solo/entry.vl",
   "modules/std-basic/entry.vl",
+  "modules/std-fmt/entry.vl",
   "modules/transitive/entry.vl",
   "sets/basics.vl",
   "sets/infer-from-add.vl",
