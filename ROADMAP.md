@@ -34,20 +34,31 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 - **Kill the TS host (the new front).** Corpus parity reached (sweep 312/316; → `CHANGELOG.md`
   rounds 5–7), so retire the TS compiler in stages — make it unnecessary, then delete:
-  1. ⬜ **LSP-on-wasm spike (the long pole, do first).** The LSP runs the TS compiler core per
-     keystroke; prove (or refute) keystroke-latency checking against the wasm compiler while the
-     TS fallback still exists. The finding sets how aggressive the rest of the teardown can be.
+  1. 🟡 **LSP-on-wasm.** Spike verdict GO (wasm checker 30–60× the TS checker; Stage 1 —
+     `vital.checker: ts|wasm|both` — shipped, → `CHANGELOG.md`). REMAINING: collect `"both"`-mode
+     divergence data from real editing; then Stage 2 (symbol occurrences + binding types ported
+     into parser.vl/typecheck.vl, driver query exports for def/refs/hover) and Stage 3 (members,
+     doc comments, a .vl lint pass).
   2. ⬜ Delete the gated deno-side RUN half + its 305-file whitelist outright (see F-tiers);
      fold the deno-side CHECK verdicts once the native checker gates message/span parity.
-  3. ⬜ `std:` Phase 2 (H0) written in VL — doubles as the demand-driven discovery engine for the
-     remaining emitter long tail (each gap fails loudly: nullable lists beyond `i32[]|null`,
-     map-typed params / nullable map fields, struct-union `==`, `?.` beyond i32/boolean leaves, …).
+  3. ⬜ `std:` Phase 2 (H0) written in VL — DESIGNED: `docs/std-design.md` (the `std:` scheme,
+     hybrid delivery, the two-primitive intrinsic floor + `__trap__`, slices 0–6 with gates; six
+     open decisions flagged for the maintainer). Doubles as the demand-driven discovery engine
+     for the remaining emitter long tail (each gap fails loudly).
   4. Once the `.vl` compiler is the spec, the parked soundness xfails (arith-hole-operand — A13;
      array-element-recursion — i32-keyed maps) become fixable bugs, not parity constraints.
-- ⬜ **`vl test` (end-state testing story).** The corpus's `// @run`/`// @log` directive fixtures
-  are the parity vehicle, not the destination: move toward traditional in-language tests — a
-  `vl test` runner over `std:testing` (H0 Phase 2), assertion functions, `*_test.vl` discovery.
-  Direction not fully settled; meanwhile, don't over-invest in new directive machinery.
+- ⬜ **`vl test`.** DESIGNED: `docs/test-runner-design.md` (jest-shaped `describe`/`it`/`expect`
+  over `std:testing`; two-phase registration, host-driven `vlt*` protocol; `*.test.vl` discovery
+  + configurable globs; files parallel by default / in-file serial, opt-in fresh-instance
+  `it.concurrent`; per-test capture, failure-first reporting). v1 lands with std-design slice 4;
+  chartered follow-ups: compiler-injected call sites, generic `expect<T>` + structural diffs,
+  power-`assert` rewriting. New behavioral tests switch to `*.test.vl` at v1 (directive-corpus
+  growth stops; conversion waits for the TS-tier teardown).
+- ⬜ **Error-handling design** (`docs/error-handling-design.md`, to write) — the language's
+  failure story BEFORE std grows fallible APIs (`std:fs`, parsing): Go-style error returns (VL
+  unions already express `T | Error`) vs Rust `Result`+`?` vs try/catch over the standardized
+  wasm exception-handling proposal (`exnref`); how the choice composes with async/await (B12) and
+  streams. Until it lands, std ships only total functions + `__trap__` aborts (std-design D1).
 - **Explicit numeric conversion syntax** — the lossless-only implicit-widening rule (#298) makes
   the lossy edges (`i32→f32`, `i64→f64`, all narrowings) EXPRESSIBLE ONLY via a cast that does
   not exist yet; design + land it (both compilers).
