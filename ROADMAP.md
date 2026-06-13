@@ -33,14 +33,25 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 ## Next (highest leverage)
 
 - **Kill the TS host (the new front).** Corpus parity reached (sweep 312/316; → `CHANGELOG.md`
-  rounds 5–7), so retire the TS compiler in stages — make it unnecessary, then delete:
+  rounds 5–7), so retire the TS compiler in stages — make it unnecessary, then delete.
+  **STANDING POLICY (maintainer): no parity-BACKWARDS work — new language/module/std features are
+  NATIVE-ONLY; the TS compiler is feature-frozen and never grows a twin of a native feature.**
+  The structural enabler is step 0; until it lands, a corpus case for a native-only feature
+  cannot pass the TS-driven tier, which is the forcing function to remove:
+  0. ⬜ **Flip the corpus oracle off the TS compiler.** `cases_test`-class corpus adjudication
+     runs the WASM compiler under deno (the harness stays; the TS compiler leaves the gate
+     path): compile via `build/vl-compiler.wasm` (the #345 loader pattern), run emitted bytes
+     under V8 (`runWasm`), same directives. After this, the corpus gates are wasm-under-deno +
+     native-under-wasmtime — one brain, two engines, zero TS — and `deno test` survives as
+     infrastructure (the maintainer cares about killing the TWO COMPILERS, not deno).
   1. 🟡 **LSP-on-wasm.** Spike verdict GO (wasm checker 30–60× the TS checker; Stage 1 —
-     `vital.checker: ts|wasm|both` — shipped, → `CHANGELOG.md`). REMAINING: collect `"both"`-mode
-     divergence data from real editing; then Stage 2 (symbol occurrences + binding types ported
-     into parser.vl/typecheck.vl, driver query exports for def/refs/hover) and Stage 3 (members,
+     `vital.checker: ts|wasm|both` — shipped, → `CHANGELOG.md`). The batch parity instrument
+     (`scripts/checker-parity-sweep.ts`) holds the divergence inventory (83, mostly span
+     anchors). REMAINING: Stage 2 (symbol occurrences + binding types ported into
+     parser.vl/typecheck.vl, driver query exports for def/refs/hover) and Stage 3 (members,
      doc comments, a .vl lint pass).
   2. ⬜ Delete the gated deno-side RUN half + its 305-file whitelist outright (see F-tiers);
-     fold the deno-side CHECK verdicts once the native checker gates message/span parity.
+     the deno-side CHECK verdicts fold into the oracle flip (step 0).
   3. ⬜ `std:` Phase 2 (H0) written in VL — DESIGNED: `docs/std-design.md` (the `std:` scheme,
      hybrid delivery, the two-primitive intrinsic floor + `__trap__`, slices 0–6 with gates; six
      open decisions flagged for the maintainer). Doubles as the demand-driven discovery engine
