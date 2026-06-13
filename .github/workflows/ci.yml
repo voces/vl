@@ -179,18 +179,14 @@ jobs:
             echo "$NON_DOCS"
           fi
 
+      # deno serves only the non-genesis test tooling in this job (native golden
+      # byte-tripwire, corpus oracle). The seed is obtained natively — cache, else
+      # the release seed via scripts/fetch-seed.sh — so no Node/npm is needed here
+      # (the TS stage-0 toolchain that required binaryen from npm is off this path).
       - uses: denoland/setup-deno@v2
         if: steps.docs_check.outputs.docs_only != 'true'
         with:
           deno-version: v2.x
-
-      # Node + node_modules: the SEED bootstrap (build-compiler-wasm.ts) runs the
-      # stage-0 (deno/toWasm.ts) toolchain, which needs binaryen from npm.
-      - uses: actions/setup-node@v5
-        if: steps.docs_check.outputs.docs_only != 'true'
-        with:
-          node-version: 22
-          cache: npm
 
       - name: Cache Deno modules
         if: steps.docs_check.outputs.docs_only != 'true'
@@ -241,10 +237,6 @@ jobs:
             cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-
             cargo-${{ runner.os }}-
 
-      - name: Install node deps
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: npm ci
-
       - name: Build vl-host (native tool)
         if: steps.docs_check.outputs.docs_only != 'true'
         run: cargo build --release
@@ -252,11 +244,11 @@ jobs:
 
       # The rolling seed cache (F-tiers): an exact hit means the seed was built
       # from THIS compiler source; a restore-keys hit hands refresh-compiler.sh a
-      # healthy older seed to SELF-compile current source with (~3s), so the TS
-      # stage-0 bootstrap (~80s) runs only on a cold cache or a seed too stale to
-      # compile current source (the script falls back automatically). The
-      # downstream fixpoint step (stage3 == stage4) re-proves the refreshed seed
-      # every run, so a cache hit never weakens the gate.
+      # healthy older seed to SELF-compile current source with (~3s). On a cold
+      # cache refresh-compiler.sh fetches the release seed (scripts/fetch-seed.sh,
+      # below) rather than TS-minting. The downstream fixpoint step (stage3 ==
+      # stage4) re-proves the refreshed seed every run, so neither a cache hit nor
+      # a fetched seed weakens the gate.
       - name: Cache seed compiler wasm
         if: steps.docs_check.outputs.docs_only != 'true'
         uses: actions/cache@v4
@@ -266,11 +258,17 @@ jobs:
           restore-keys: |
             vl-seed-${{ runner.os }}-
 
-      - name: Refresh seed compiler wasm (self-compile; TS stage-0 fallback)
+      # Self-compile current source with the seed. On a cold cache
+      # refresh-compiler.sh fetches the release `seed-latest` (one push stale is
+      # fine — the fixpoint re-proves it); a seed too stale to compile current
+      # source fails loud at its --ts-genesis break-glass, never re-entering TS.
+      # GH_TOKEN lets fetch-seed.sh use `gh release download` on the cold path.
+      - name: Refresh seed compiler wasm (self-compile; release-seed fetch fallback)
         if: steps.docs_check.outputs.docs_only != 'true'
         run: ./scripts/refresh-compiler.sh
         env:
           VL_CACHE_DIR: ${{ runner.temp }}/vl-cache
+          GH_TOKEN: ${{ github.token }}
 
       - name: Native fixpoint (stage3 == stage4)
         if: steps.docs_check.outputs.docs_only != 'true'

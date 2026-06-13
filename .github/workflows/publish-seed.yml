@@ -1,0 +1,143 @@
+# Publish the rolling seed release (genesis without TypeScript; see
+# docs/genesis-design.md).
+#
+# Freshness invariant this workflow maintains:
+#
+#   > the published seed can compile *current* master.
+#
+# Each master push compiles a new seed by SELF-compiling current source with the
+# PREVIOUS published seed (restored from cache, or fetched from `seed-latest`),
+# gates it through native-fixpoint.sh (stage3 == stage4 byte-for-byte), then
+# re-points the rolling `seed-latest` pre-release at the new seed. Consumers
+# never need a per-commit seed: fetch-seed.sh always pulls `seed-latest` and
+# refresh-compiler.sh self-compiles current source with it; compatibility is
+# proven at use time by the same fixpoint gate, so there is no version-matching
+# logic. The fixpoint is a hard GATE — if it does not hold the job fails and
+# `seed-latest` stays pinned to the last-good seed.
+#
+# Repo/tag knobs mirror fetch-seed.sh so the producer and the consumer stay
+# consistent (VL_SEED_REPO default voces/vl, VL_SEED_TAG default seed-latest).
+
+name: publish-seed
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      ts_genesis:
+        description: "One-time seed-v0 mint via the TS stage-0 break-glass (VL_SEED_TS_GENESIS=1). Default off."
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  # Mirror fetch-seed.sh: the producer and the consumer must agree on where the
+  # rolling seed lives.
+  VL_SEED_REPO: ${{ vars.VL_SEED_REPO || 'voces/vl' }}
+  VL_SEED_TAG: ${{ vars.VL_SEED_TAG || 'seed-latest' }}
+
+jobs:
+  publish-seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # deno + node are needed only on the --ts-genesis break-glass path (the
+      # one-time seed-v0 mint runs scripts/build-compiler-wasm.ts, which pulls
+      # binaryen from npm); both are skipped on the normal republish path.
+      - uses: denoland/setup-deno@v2
+        if: inputs.ts_genesis
+        with:
+          deno-version: v2.x
+
+      - uses: actions/setup-node@v5
+        if: inputs.ts_genesis
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install node deps (TS genesis only)
+        if: inputs.ts_genesis
+        run: npm ci
+
+      - name: Build vl-host (native tool)
+        run: cargo build --release
+        working-directory: scripts/vl-host
+
+      # Warm path: restore the seed built by the previous master push. An exact
+      # hit means the seed already matches THIS source; a restore-keys hit hands
+      # refresh-compiler.sh a healthy older seed to self-compile current source
+      # with. The fixpoint step re-proves it regardless, so a cache hit never
+      # weakens the gate.
+      - name: Cache seed compiler wasm
+        uses: actions/cache@v4
+        with:
+          path: build/vl-compiler.wasm
+          key: vl-seed-${{ runner.os }}-${{ hashFiles('compiler/*.vl', 'scripts/vl-compiler-driver.vl') }}
+          restore-keys: |
+            vl-seed-${{ runner.os }}-
+
+      # Cold path: with no cached seed, fetch the prior `seed-latest` so the new
+      # seed is compiled by the previously published seed (self-perpetuation). A
+      # present seed (cache hit) is left untouched by fetch-seed.sh. Skipped on
+      # the --ts-genesis mint, which has no prior seed to fetch.
+      - name: Fetch prior seed (cold cache)
+        if: ${{ !inputs.ts_genesis }}
+        run: ./scripts/fetch-seed.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # The one-time seed-v0 mint: the last legitimate TS-genesis use. Mints a
+      # seed from source with no prior seed required; the fixpoint below still
+      # gates it.
+      - name: Mint genesis seed (TS break-glass)
+        if: inputs.ts_genesis
+        run: ./scripts/fetch-seed.sh --ts-genesis
+
+      # Self-compile current source with the seed in hand. Skipped on the
+      # --ts-genesis mint, where the just-minted seed already reflects current
+      # source.
+      - name: Refresh seed compiler wasm (self-compile)
+        if: ${{ !inputs.ts_genesis }}
+        run: ./scripts/refresh-compiler.sh
+
+      # The GATE: fail loudly if stage3 != stage4. `seed-latest` is only
+      # re-pointed when this holds.
+      - name: Native fixpoint (stage3 == stage4)
+        run: ./scripts/native-fixpoint.sh
+
+      # The asset contract (docs/genesis-design.md): the seed, its checksum
+      # sidecar (fetch-seed.sh fails closed on mismatch), and a fingerprint over
+      # the producing source plus the producing commit SHA for provenance.
+      - name: Assemble release assets
+        run: |
+          cd build
+          sha256sum vl-compiler.wasm > vl-compiler.wasm.sha256
+          src_hash="$(sha256sum ../compiler/*.vl ../scripts/vl-compiler-driver.vl | sha256sum | cut -d' ' -f1)"
+          {
+            echo "source-sha256: $src_hash"
+            echo "commit:        $GITHUB_SHA"
+          } > seed-fingerprint.txt
+
+      # Re-point the rolling `seed-latest` pre-release at the new seed. The tag is
+      # continuously overwritten (a moving "latest" pointer, not a version);
+      # softprops/action-gh-release re-creates/updates the release in place. This
+      # mirrors the release mechanism the release.yml publish TODO already names.
+      - name: Publish to rolling seed-latest
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VL_SEED_TAG }}
+          name: Rolling seed (latest)
+          prerelease: true
+          # Move the tag onto the producing commit each run so the rolling release
+          # tracks the seed it actually published.
+          target_commitish: ${{ github.sha }}
+          files: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.sha256
+            build/seed-fingerprint.txt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

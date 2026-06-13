@@ -12,12 +12,19 @@
 # later. (A stale seed silently tests an outdated compiler: `vl check`/`vl run`
 # behavior reflects the seed's pinned source, not the current compiler/*.vl.)
 #
-# STALE-SEED FALLBACK: a seed that predates a language construct newly used BY
-# THE COMPILER ITSELF cannot compile current source (e.g. "unsupported statement
-# in body" after the compiler starts using a feature only newer emitters lower).
-# In that one case the TS stage-0 bootstrap is the only way to mint a seed, so
-# this script falls back to it automatically (pass --no-fallback to fail instead,
-# e.g. in environments without deno).
+# MISSING-SEED FALLBACK: with no seed present, this fetches the rolling
+# `seed-latest` release (scripts/fetch-seed.sh) and falls THROUGH to the
+# self-compile step. The fetched seed may be one master push stale — fine: it
+# need only be new enough to compile current source, and native-fixpoint.sh
+# re-proves the refreshed result. TS is NOT on this path; it is reachable only
+# via the explicit `scripts/fetch-seed.sh --ts-genesis` break-glass.
+#
+# STALE-SEED FAILURE: a seed (cached or fetched) that predates a language
+# construct newly used BY THE COMPILER ITSELF cannot compile current source (e.g.
+# "unsupported statement in body" after the compiler starts using a feature only
+# newer emitters lower). That is a LOUD failure pointing at --ts-genesis, never a
+# silent TS re-entry. (Pass --no-fallback to fail on a missing seed too, e.g. in
+# an environment with no network.)
 #
 # The new seed replaces build/vl-compiler.wasm ATOMICALLY (temp + mv) and only
 # after a sanity run, so an interrupted/broken build never clobbers a good seed.
@@ -33,16 +40,16 @@ FALLBACK=1
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-ts_bootstrap() {
-  echo "== falling back to the TS stage-0 bootstrap (slow path) =="
-  deno run -A scripts/build-compiler-wasm.ts
-  echo "refreshed $OUT via TS bootstrap"
-}
-
 [ -x "$VL" ] || { echo "missing vl binary: $VL (cd scripts/vl-host && cargo build --release)"; exit 1; }
+# Missing seed: fetch the rolling `seed-latest` release, then fall through to the
+# self-compile below — the fetched seed need only compile current source. The TS
+# stage-0 path is gone from here; fetch-seed.sh routes air-gapped/genesis cases
+# through its own --ts-genesis break-glass.
 if [ ! -f "$SEED" ]; then
-  if [ "$FALLBACK" = 1 ]; then ts_bootstrap; exit 0; fi
-  echo "missing seed: $SEED (deno run -A scripts/build-compiler-wasm.ts)"; exit 1
+  if [ "$FALLBACK" = 0 ]; then
+    echo "missing seed: $SEED (scripts/fetch-seed.sh, or --ts-genesis offline)"; exit 1
+  fi
+  SEED="$SEED" scripts/fetch-seed.sh
 fi
 
 # The compiler's own source + the single-sourced driver — the same sed/cat
@@ -57,12 +64,13 @@ cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.v
 sed -i -E '/^import \{/,/\} from "/ s/.*//' "$WORK/vlsrc.vl"
 
 echo "== self-compile current compiler source with the seed =="
+# A seed that cannot compile current source is too stale (the compiler started
+# using a construct its emitter cannot lower). Fail LOUD — do not silently
+# re-enter the TS stage-0 path. The fix is an explicit break-glass re-mint.
 if ! "$VL" build "$WORK/vlsrc.vl" -o "$WORK/next.wasm" --compiler "$SEED"; then
-  if [ "$FALLBACK" = 1 ]; then
-    echo "seed cannot compile current source (stale seed)"
-    ts_bootstrap; exit 0
-  fi
-  echo "seed cannot compile current source (stale seed); re-run without --no-fallback or: deno run -A scripts/build-compiler-wasm.ts"
+  echo "ERROR: seed cannot compile current source (stale seed)." >&2
+  echo "  The published seed-latest predates a construct the compiler now uses." >&2
+  echo "  Break-glass: scripts/fetch-seed.sh --ts-genesis  (re-mint from source; needs deno)." >&2
   exit 1
 fi
 
