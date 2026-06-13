@@ -257,6 +257,8 @@ const RUN_CASES = [
   "modules/solo/entry.vl",
   "modules/std-basic/entry.vl",
   "modules/transitive/entry.vl",
+  "modules/ufcs-import/entry.vl",
+  "modules/ufcs-import-field-precedence/entry.vl",
   "sets/basics.vl",
   "sets/infer-from-add.vl",
   "numerics/wide.vl",

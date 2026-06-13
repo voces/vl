@@ -18,6 +18,7 @@ import {
   i32ToStr,
   hasNamedArgs,
   orderArgsByParamNames,
+  ufcsAliasOf,
   mkBinary,
   mkCall,
   mkCallN,
@@ -11793,7 +11794,13 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
     // boxing, nullable bridging, widening) is shared rather than duplicated.
     let um = P.nodes[c.callFn]
     if um is Member {
-      let uTarget = fnIndexOf(um.memProp)
+      // A UFCS member-call normally lowers to a direct `Ident` call in
+      // `dispatchRewrite`/`drwWalk` before emission; this fallback re-derives the
+      // same direct call should it reach emit unrewritten. The merge mangles the
+      // free `self`-function but leaves the property plain, so resolve through the
+      // alias (identity single-file).
+      let uName = ufcsAliasOf(um.memProp)
+      let uTarget = fnIndexOf(uName)
       if uTarget >= 0 {
         let uFn = P.nodes[fnStmts[uTarget]]
         if uFn is FuncDecl {
@@ -11822,7 +11829,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
                     un = un + 1
                   }
                 }
-                return emitCall(body, mkCallN(mkIdent(um.memProp), uArgs, uNames), fnIx)
+                return emitCall(body, mkCallN(mkIdent(uName), uArgs, uNames), fnIx)
               }
             }
           }
@@ -22881,6 +22888,13 @@ function drwWalk(ix: i32, ctx: i32): i32 {
       // the callee becomes a bare Ident, and any named args slide right of the
       // unnamed receiver ("" rides slot 0).
       //
+      // The module merge mangles a free `self`-function (`shout` → `shout$m1`)
+      // but leaves the call's property plain so field precedence still resolves
+      // from the receiver shape; `ufcsAliasOf` maps the plain property to the
+      // mangled function, and the rebuilt direct-call Ident carries that name so
+      // every downstream pass (string detection, print routing, coercion) sees a
+      // normal named call. Identity single-file.
+      let uName = ufcsAliasOf(callee.memProp)
       // Precedence, mirroring the host:
       //   • a REAL struct field of that name wins (a value access, not a call);
       //   • a callable FIELD (closure-valued, kind 14) wins as a `call_ref`
@@ -22891,12 +22905,12 @@ function drwWalk(ix: i32, ctx: i32): i32 {
       let ufcs = false
       if si >= 0 {
         if sFieldIndex(si, callee.memProp) < 0 {
-          if drwSelfFnOf(callee.memProp, args.length + 1) >= 0 { ufcs = true }
+          if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
         }
       }
       if si < 0 {
         if !exprIsClosure(n.callFn, ctx) {
-          if drwSelfFnOf(callee.memProp, args.length + 1) >= 0 { ufcs = true }
+          if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
         }
       }
       if ufcs {
@@ -22922,7 +22936,7 @@ function drwWalk(ix: i32, ctx: i32): i32 {
           }
           nm[0] = ""
         }
-        n.callFn = mkIdent(callee.memProp)
+        n.callFn = mkIdent(uName)
       }
       return ix
     }
