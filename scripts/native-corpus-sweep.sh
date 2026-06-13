@@ -23,6 +23,11 @@ cd "$(dirname "$0")/.."
 
 export VL="${VL:-scripts/vl-host/target/release/vl}"
 export SEED="${SEED:-build/vl-compiler.wasm}"
+# Pin the std dir to THIS tree: agent worktrees symlink the cargo target into
+# the main checkout, so the binary's exe-relative std/ fallback (resolved via
+# /proc/self/exe, which follows symlinks) would point at the wrong checkout
+# there. $VL_STD is the first hit in the host's std-dir resolution.
+export VL_STD="${VL_STD:-$PWD/std}"
 JOBS="${JOBS:-$(nproc)}"
 
 RESULTS="$(mktemp)"

@@ -157,12 +157,26 @@ const connection = createConnection(ProposedFeatures.all);
 // Create a manager for open text documents
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
 
+// The workspace's `std/` source dir, when the workspace root is known — feeds
+// the `withStd` std-module precedence (workspace files win over the embedded
+// map, so dogfooding in the compiler repo sees `std/` edits live). A thunk
+// because readers are built at module load while the root arrives in
+// `onInitialize`; a workspace without a `std/` dir simply never satisfies a
+// read there and falls through to the embedded map.
+let workspaceStdDir: string | undefined;
+const getStdDir = (): string | undefined => workspaceStdDir;
+
 // Module-aware analysis reads sibling `.vl` files: it prefers the open document
-// buffers (so unsaved edits are seen) and falls back to disk. Keyed on the
-// open-document URIs the manager tracks (see `makeWorkspaceReader`).
-const workspaceReader = makeWorkspaceReader({
-  get: (uri: string) => documents.get(uri),
-});
+// buffers (so unsaved edits are seen) and falls back to disk; `std:` keys are
+// served via `withStd`. Keyed on the open-document URIs the manager tracks
+// (see `makeWorkspaceReader`).
+const workspaceReader = makeWorkspaceReader(
+  {
+    get: (uri: string) => documents.get(uri),
+  },
+  undefined,
+  getStdDir,
+);
 
 // The current document's module key: its filesystem path (resolveSpecifier
 // resolves relative imports against this). Falls back to a synthetic key for a
@@ -903,6 +917,12 @@ documents.listen(connection);
 
 connection.onInitialize((params) => {
   workspaceFolder = params.rootUri;
+  // The workspace's `std/` dir (for the withStd precedence). No existence
+  // check needed: a missing `<root>/std/NAME.vl` read just falls through to
+  // the embedded map.
+  workspaceStdDir = params.rootUri
+    ? join(uriToPath(params.rootUri), "std")
+    : undefined;
   connection.console.log(
     `[Server(${process.pid}) ${workspaceFolder}] Started and initialize received`,
   );
@@ -921,6 +941,7 @@ connection.onInitialize((params) => {
     wasmChecker = loadWasmChecker(
       wasmPath,
       (msg) => connection.console.log(msg),
+      getStdDir,
     );
     checkerMode = wasmChecker !== undefined ? opts.checker : "ts";
   }

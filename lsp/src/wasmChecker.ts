@@ -23,6 +23,7 @@
 import { readFileSync, statSync } from "node:fs";
 import type { VLDiagnostic } from "../../compiler/compile.ts";
 import type { ModuleReader } from "../../compiler/modules.ts";
+import { withStd } from "./moduleGraph.ts";
 
 type Exports = Record<string, (...args: number[]) => number>;
 
@@ -59,10 +60,15 @@ const hasImports = (source: string): boolean =>
  * instantiate it (no WasmGC). The instance is cached and transparently
  * reloaded when the seed file's mtime changes (a dev `refresh-compiler.sh`
  * mid-session picks up the new compiler without an editor reload).
+ *
+ * `getStdDir` feeds the `withStd` wrapper around every check's reader: a
+ * workspace `std/` dir (when one exists) wins over the embedded std map, the
+ * same precedence the TS checker's workspace reader applies.
  */
 export const loadWasmChecker = (
   wasmPath: string,
   log: (msg: string) => void,
+  getStdDir?: () => string | undefined,
 ): WasmChecker | undefined => {
   let exports: Exports | undefined;
   let loadedMtime = -1;
@@ -109,6 +115,10 @@ export const loadWasmChecker = (
     // fills it once per build) — an LSP check is a fresh program every time.
     exp.modReset();
     if (hasImports(source)) {
+      // `std:` keys resolve through the shared withStd wrapper (workspace
+      // `std/` dir first, then the embedded map) — same precedence as the TS
+      // checker's workspace reader, so the two checkers agree about std.
+      const readModule = withStd(read, getStdDir);
       const commit = (key: string, src: string | undefined) => {
         pushString(exp.modKeyPush, key);
         if (src !== undefined) pushString(exp.modSrcPush, src);
@@ -124,7 +134,7 @@ export const loadWasmChecker = (
           keys.push(readString(exp.modPendingLen(i), (j) => exp.modPendingAt(i, j)));
         }
         for (const key of keys) {
-          commit(key, await read(key));
+          commit(key, await readModule(key));
         }
       }
     }

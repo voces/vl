@@ -34,6 +34,7 @@ import {
   type ModuleReader,
   resolveSpecifier,
 } from "../../compiler/modules.ts";
+import { STD_SOURCES } from "../../std/embedded.ts";
 import { tokenize } from "../../compiler/lexer.ts";
 import { parseProgram } from "../../compiler/parser.ts";
 import { defaultScope } from "../../compiler/defaultScope.ts";
@@ -92,6 +93,40 @@ export const pathToUri = (path: string): string => {
   return `file://${encoded}`;
 };
 
+// ---- std: module reads -------------------------------------------------------
+
+/**
+ * Wrap a {@link ModuleReader} so `std:` module keys resolve (docs/std-design.md
+ * D3). A `std:` key is served from, first hit wins:
+ *   1. the workspace's own `std/` dir when one is known (`getStdDir`) — read
+ *      through the INNER reader so open-buffer edits to std sources win over
+ *      disk, and a workspace WITHOUT the file falls through; this is what lets
+ *      dogfooding in this repo see `std/` edits live, ahead of the embedded
+ *      map bundled with the extension;
+ *   2. the GENERATED embedded map (`std/embedded.ts`, `deno task gen-std`) —
+ *      the no-filesystem path the bundled LSP and the playground rely on.
+ * Every other key passes through unchanged. Used by BOTH LSP checkers: the TS
+ * moduleGraph (via {@link makeWorkspaceReader}) and the wasm checker's fetch
+ * loop (`wasmChecker.ts`), so the editor agrees with the CLI about std.
+ *
+ * `getStdDir` is a thunk because the workspace root is only known after
+ * `onInitialize`, while readers are constructed at module load.
+ */
+export const withStd = (
+  read: ModuleReader,
+  getStdDir?: () => string | undefined,
+): ModuleReader =>
+async (key: string): Promise<string | undefined> => {
+  if (!key.startsWith("std:")) return read(key);
+  const name = key.slice("std:".length);
+  const stdDir = getStdDir?.();
+  if (stdDir !== undefined) {
+    const fromWorkspace = await read(`${stdDir}/${name}.vl`);
+    if (fromWorkspace !== undefined) return fromWorkspace;
+  }
+  return STD_SOURCES[key];
+};
+
 // ---- workspace ModuleReader -------------------------------------------------
 
 /**
@@ -102,21 +137,23 @@ export const pathToUri = (path: string): string => {
  * filesystem (defaults to `node:fs`'s `readFileSync`).
  *
  * Keys are plain filesystem paths (what `resolveSpecifier` produces for relative
- * specifiers resolved from a path-shaped `fromKey`). Open buffers are keyed by
- * `file://` URI, so the reader converts the path key back to a URI to consult
- * them.
+ * specifiers resolved from a path-shaped `fromKey`) or `std:` module keys,
+ * served via {@link withStd} (workspace `std/` dir when `getStdDir` yields one,
+ * else the embedded map). Open buffers are keyed by `file://` URI, so the
+ * reader converts the path key back to a URI to consult them.
  */
 export const makeWorkspaceReader = (
   documents: OpenDocuments,
   readDisk: (path: string) => string | undefined = defaultReadDisk,
+  getStdDir?: () => string | undefined,
 ): ModuleReader =>
-(key: string): string | undefined => {
-  // 1. Open buffer (unsaved edits win over disk).
-  const open = documents.get(pathToUri(key));
-  if (open) return open.getText();
-  // 2. Disk fallback.
-  return readDisk(key);
-};
+  withStd((key: string): string | undefined => {
+    // 1. Open buffer (unsaved edits win over disk).
+    const open = documents.get(pathToUri(key));
+    if (open) return open.getText();
+    // 2. Disk fallback.
+    return readDisk(key);
+  }, getStdDir);
 
 // `node:fs` is loaded via `createRequire` rather than a static `import … from
 // "node:fs"`: a static node-module import makes `deno check` demand `@types/node`

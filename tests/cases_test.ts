@@ -182,15 +182,24 @@ const walk = async function* (dir: URL): AsyncGenerator<Case> {
   }
 };
 
+// The repo `std/` dir, for `std:` module keys — mirrors the CLI's fsRead
+// mapping (`std:NAME` ↔ `std/NAME.vl`) so std-importing corpus cases compile
+// through the same source of truth the CLI reads.
+const STD_DIR = new URL("../std/", import.meta.url);
+
 /**
  * Reads a `.vl` module given its resolved key for `compileProgram`. Keys are
  * absolute, `/`-separated filesystem paths (NOT `file://` URLs — the resolver's
- * pure string-math normalization would mangle a scheme), so the reader reads the
- * path directly. Returns `undefined` for a missing path (an unresolvable
- * import).
+ * pure string-math normalization would mangle a scheme) or verbatim `std:`
+ * module keys (read from the repo `std/`). Returns `undefined` for a missing
+ * path (an unresolvable import).
  */
 const diskReader = (key: string): Promise<string | undefined> =>
-  Deno.readTextFile(key).catch(() => undefined);
+  Deno.readTextFile(
+    key.startsWith("std:")
+      ? new URL(`${key.slice("std:".length)}.vl`, STD_DIR)
+      : key,
+  ).catch(() => undefined);
 
 const errorMessages = (diags: VLDiagnostic[]) =>
   diags.filter((d) => d.severity === "error").map((d) => d.message);

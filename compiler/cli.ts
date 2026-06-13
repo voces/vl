@@ -62,10 +62,23 @@ const SUBCOMMANDS = new Set(["run", "build", "check", "fmt"]);
 const IMPORT_RE = /^\s*import\s*\{/m;
 const hasImports = (source: string): boolean => IMPORT_RE.test(source);
 
-/** Read a module's source by path for the graph resolver; `undefined` if absent. */
+// The std source directory `std:` module keys read from: the repo `std/`,
+// sibling to `compiler/`, resolved off this module's URL (so the CLI works from
+// any cwd). `std:NAME` ↔ `std/NAME.vl`, slash segments as subdirectories.
+const STD_DIR = new URL("../std/", import.meta.url);
+
+/**
+ * Read a module's source by its resolved key for the graph resolver;
+ * `undefined` if absent. A `std:` key reads from the repo `std/` dir; every
+ * other key is a filesystem path read as-is.
+ */
 const fsRead = (key: string): string | undefined => {
   try {
-    return Deno.readTextFileSync(key);
+    return Deno.readTextFileSync(
+      key.startsWith("std:")
+        ? new URL(`${key.slice("std:".length)}.vl`, STD_DIR)
+        : key,
+    );
   } catch {
     return undefined;
   }
