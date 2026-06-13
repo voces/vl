@@ -55,6 +55,18 @@ let modDiags: string[] = []
 let modRenameFrom: string[] = []
 let modRenameTo: string[] = []
 let modShadow: string[] = []
+// Registry of every top-level free `self`-function across all modules, keyed by
+// its MANGLED name (`shout$m1`) with its parameter arity. A UFCS call
+// `"x".shout()` is a `Call` whose callee is a `Member` (`memProp == shout`); the
+// native pipeline lowers UFCS at check/emit time (not at parse time like the
+// host). The merge cannot rewrite `memProp` (a same-named struct field must keep
+// precedence, decided by the receiver TYPE the walker lacks), so it records a
+// plain→mangled `ufcsAlias` for every site whose `prop` resolves through this
+// registry to a self-function of matching arity (the host parser's UFCS rule,
+// applied at the merge boundary); the checker/emitter follow the alias AFTER the
+// field check.
+let modSelfFnName: string[] = []
+let modSelfFnArity: i32[] = []
 // Generic type-parameter names live inside the rewrite of their declaration
 // (`T` while inside `id<T>`'s annotations/body or `Box<T>`'s definition): a
 // segment matching one must NOT rewrite through the rename map — it names the
@@ -730,7 +742,12 @@ function modCompile(emit: i32): i32 {
     if P.diags.length > 0 { return 1 }
     o = o + 1
   }
-  // 3 + 4. Per-module rename map + scope-aware arena rewrite.
+  // 3 + 4. Per-module rename map + scope-aware arena rewrite. First register
+  // every top-level `self`-function under its mangled name (across ALL modules)
+  // so a UFCS member-call can resolve its (possibly mangled) callee through the
+  // merge; the rewrite records the plain→mangled aliases it discovers.
+  ufcsAliasReset()
+  modCollectSelfFns(roots)
   let o2 = 0
   while o2 < modOrder.length {
     modBuildRename(modOrder[o2], roots[o2])
@@ -860,6 +877,61 @@ function modBuildRename(m: i32, root: i32): i32 {
     ij = ij + 1
   }
   0
+}
+// Record every top-level free `self`-function of each module under its mangled
+// name, so a cross-module UFCS member-call (`"x".shout()`) can resolve its
+// callee through the merge. Runs over modOrder with each module's rename map
+// (modBuildRename) live, so a self-fn declared `shout` is registered as
+// `shout$mN` — the exact name the rewritten `memProp` and the merged FuncDecl
+// will carry. A self-fn is a FuncDecl whose FIRST parameter is named `self`
+// (the host parser's UFCS-reachability test).
+function modCollectSelfFns(roots: i32[]): i32 {
+  modSelfFnName = []
+  modSelfFnArity = []
+  let o = 0
+  while o < roots.length {
+    let m = modOrder[o]
+    modBuildRename(m, roots[o])
+    modShadow = []
+    let r = P.nodes[roots[o]]
+    if r is Program {
+      let ss = r.progStmts
+      let si = 0
+      while si < ss.length {
+        let st = P.nodes[ss[si]]
+        if st is FuncDecl {
+          if st.fnParams.length > 0 {
+            let p0 = P.nodes[st.fnParams[0]]
+            if p0 is Param {
+              if p0.parName == "self" {
+                // `modGenBase` strips a generic parameter list; the base segment
+                // is what the rename map keys on, and a UFCS callee names the
+                // function by that bare segment.
+                modSelfFnName.push(modRenamed(modGenBase(st.fnName)))
+                modSelfFnArity.push(st.fnParams.length)
+              }
+            }
+          }
+        }
+        si = si + 1
+      }
+    }
+    o = o + 1
+  }
+  0
+}
+// The mangled name of a UFCS `self`-function reachable as `.prop(args)` —
+// `prop` mapped through the live module's rename map, matched against the
+// registry with arity = explicit args + 1 (the receiver fills `self`). Empty
+// when `prop` names no such function (an ordinary field/method stays unrenamed).
+function modSelfFnTarget(prop: string, argc: i32): string {
+  let cand = modRenamed(prop)
+  let i = 0
+  while i < modSelfFnName.length {
+    if modSelfFnName[i] == cand && modSelfFnArity[i] == argc + 1 { return cand }
+    i = i + 1
+  }
+  ""
 }
 // A VALUE reference: shadowed locals win, then the rename map, else unchanged.
 function modRenamed(name: string): string {
@@ -1124,6 +1196,19 @@ function modRwExpr(ix: i32): i32 {
     return 0
   }
   if n is Call {
+    // A UFCS member-call `recv.prop(args)` whose `prop` names a free
+    // `self`-function (matching arity) that the merge MANGLED — same-module
+    // (`inc` → `inc$m0`) or imported (`shout` → `shout$m1`). The property string
+    // on the `Member` is NOT rewritten (a callable field/struct method of the
+    // same name must keep field precedence, which the checker/emitter decide from
+    // the receiver TYPE — info the rename walker lacks). Instead, record the
+    // plain→mangled alias so the checker's/emitter's UFCS resolution (which runs
+    // AFTER the field check, with the plain `prop`) can find the mangled function.
+    let cf = P.nodes[n.callFn]
+    if cf is Member {
+      let target = modSelfFnTarget(cf.memProp, n.callArgs.length)
+      if target != "" { ufcsAliasAdd(cf.memProp, target) }
+    }
     modRwExpr(n.callFn)
     let i = 0
     while i < n.callArgs.length {
