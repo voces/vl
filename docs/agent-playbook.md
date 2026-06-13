@@ -61,6 +61,13 @@ To diagnose invalid emitted wasm:
   shared chokepoint: interning new heap types means appending a new
   usage-gated offset function, never reordering existing ones.
 - Map/list/set/closure struct layouts are rep changes — out of agent scope.
+- A new corpus `@error`/`@run` case whose verdict the WASM oracle reaches by a
+  different message — or that the native emitter loud-rejects while the host
+  accepts (the native long tail) — must be registered in
+  `tests/cases_wasm_test.ts`'s `EXPECTED_DIVERGENCES` IN THE SAME PR. Skipping
+  this turns master red the moment the case merges (the slice-0 intrinsics
+  corpus did exactly this — 5 cases red on master until #358). Run
+  `deno test -A tests/cases_wasm_test.ts` before opening any corpus-adding PR.
 
 ## Final report
 Files promoted / files advanced-but-not-promoted with the blocking stage /
