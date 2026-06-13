@@ -570,11 +570,19 @@ function collectRefVisit(ix: i32): i32 {
   }
   let n = P.nodes[ix]
   if n is Call {
-    // The callee is an Ident node in the desugared AST; record its name.
+    // The TS `collectReferencedNames` records the callee NAME of every
+    // `FunctionCall` — and the TS parser has ALREADY desugared a UFCS method call
+    // (`x.m(…)`) and an operator method (`a + b`) into a `FunctionCall` whose
+    // `function` is the bare method/operator name. The native parser does NOT
+    // desugar at parse time: `x.m(…)` stays `Call { callFn: Member(x, "m") }`. So
+    // to capture the SAME reference set, record an Ident callee's name AND a
+    // Member callee's property name (the UFCS method name the call dispatches to).
     if n.callFn >= 0 && n.callFn < P.nodes.length {
       let fn = P.nodes[n.callFn]
       if fn is Ident {
         refNamesAdd(fn.identName)
+      } else if fn is Member {
+        refNamesAdd(fn.memProp)
       }
     }
     collectRefVisit(n.callFn)
@@ -586,17 +594,27 @@ function collectRefVisit(ix: i32): i32 {
   } else if n is Ident {
     refNamesAdd(n.identName)
   } else if n is Unary {
+    // An operator method (`-x` → `function -(self)`) dispatches by operator name;
+    // the TS reference walk records it as a `FunctionCall` callee, so mirror it.
+    refNamesAdd(n.unOp)
     collectRefVisit(n.unArg)
   } else if n is BinExpr {
     // An assignment `x = e` (the parser desugars `x += e` / `x++` to this shape)
     // whose LHS is a bare name marks that name WRITTEN — prefer-const consults
     // this. The LHS is still recorded as a reference (visited below), matching the
     // TS model where a write occurrence also counts as a use.
-    if n.binOp == "=" && n.binLeft >= 0 && n.binLeft < P.nodes.length {
-      let lhs = P.nodes[n.binLeft]
-      if lhs is Ident {
-        writeNamesAdd(lhs.identName)
+    if n.binOp == "=" {
+      if n.binLeft >= 0 && n.binLeft < P.nodes.length {
+        let lhs = P.nodes[n.binLeft]
+        if lhs is Ident {
+          writeNamesAdd(lhs.identName)
+        }
       }
+    } else {
+      // An operator (`a + b` → `function +(self, b)`) dispatches by operator
+      // name; the TS reference walk records it as a `FunctionCall` callee.
+      // Assignment `=` is not a method call, so it is excluded above.
+      refNamesAdd(n.binOp)
     }
     collectRefVisit(n.binLeft)
     collectRefVisit(n.binRight)
@@ -751,20 +769,65 @@ function collectDeclVisit(ix: i32): i32 {
       i = i + 1
     }
   } else if n is IfStmt {
+    collectDeclVisit(n.ifCond)
     collectDeclVisit(n.ifThen)
     if n.ifElse >= 0 {
       collectDeclVisit(n.ifElse)
     }
   } else if n is WhileStmt {
+    collectDeclVisit(n.whileCond)
     collectDeclVisit(n.whileBody)
   } else if n is ForRange {
+    collectDeclVisit(n.frFrom)
+    collectDeclVisit(n.frTo)
+    if n.frStep >= 0 {
+      collectDeclVisit(n.frStep)
+    }
     collectDeclVisit(n.frBody)
   } else if n is ForIn {
+    collectDeclVisit(n.fiIter)
     collectDeclVisit(n.fiBody)
   } else if n is RetStmt {
     if n.retArg >= 0 {
       collectDeclVisit(n.retArg)
     }
+  } else if n is Call {
+    collectDeclVisit(n.callFn)
+    let a = 0
+    while a < n.callArgs.length {
+      collectDeclVisit(n.callArgs[a])
+      a = a + 1
+    }
+  } else if n is BinExpr {
+    collectDeclVisit(n.binLeft)
+    collectDeclVisit(n.binRight)
+  } else if n is Unary {
+    collectDeclVisit(n.unArg)
+  } else if n is Paren {
+    collectDeclVisit(n.parInner)
+  } else if n is Member {
+    collectDeclVisit(n.memObj)
+  } else if n is OptMember {
+    collectDeclVisit(n.omObj)
+  } else if n is Index {
+    collectDeclVisit(n.idxArr)
+    collectDeclVisit(n.idxIndex)
+  } else if n is ArrayLit {
+    let i = 0
+    while i < n.arrElems.length {
+      collectDeclVisit(n.arrElems[i])
+      i = i + 1
+    }
+  } else if n is ObjLit {
+    let i = 0
+    while i < n.objFields.length {
+      collectDeclVisit(n.objFields[i])
+      i = i + 1
+    }
+  } else if n is FieldInit {
+    collectDeclVisit(n.fiValue)
+  } else if n is IsExpr {
+    collectDeclVisit(n.isObj)
   }
   0
 }
