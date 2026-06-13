@@ -46,7 +46,7 @@
 // `P.nodes` arena the checker walks), the int→string helper, and every `Node`
 // variant type the single `checkNode` visitor `is`-narrows. The checker's own
 // `Ty` type algebra stays PRIVATE to this module.
-import { P, i32ToStr, nodeToks, hasNamedArgs, orderArgsByParamNames } from "./ast"
+import { P, i32ToStr, nodeToks, declNameTokOf, hasNamedArgs, orderArgsByParamNames } from "./ast"
 import {
   NumLit,
   StrLit,
@@ -169,6 +169,37 @@ type Checker = {
 // The single checker instance. The harness calls `initChecker()` then the entry
 // point `checkProgram(root)` and reads `T.diags`.
 export let T: Checker = { tys: [], scopes: [], diags: [], curRet: -1 }
+
+// ── LSP symbol table (occurrences + binding types) ───────────────────────────
+// Off by default: `symEnabled == 0` (every existing consumer — the fixpoint
+// assemblies, `vl check`/`build`) records NOTHING, so checking is byte-identical
+// and free. The driver's symbol-query path sets it to 1 before `checkProgram`.
+// IMPORTANT: these tables are READ ONLY by the driver query exports; the emitter
+// re-derives its own information and never consults them, so populating them does
+// not perturb `emitProgram`'s output.
+//
+// The model mirrors `compiler/symbols.ts` (a flat OCCURRENCE list over a binding
+// set), specialized to what the native checker can produce cheaply:
+//   - A BINDING is identified by its DECLARING NODE INDEX (`bindingId`): the
+//     `LetDecl`/`Param`/`FuncDecl`/`TypeDecl`/`UnionDecl`/for-loop node. Stable
+//     and unique (no two source declarations share a node).
+//   - An OCCURRENCE is one identifier appearance. Parallel arrays: the
+//     identifier's TOKEN index (`symOccTok` — its source span), the binding it
+//     resolves to (`symOccDecl`, a bindingId), and whether it is the declaration
+//     itself (`symOccIsDecl`).
+//   - Resolution reuses the checker's own scope walk: `symDeclScope` is a
+//     name→declNodeIx chain pushed/popped in lockstep with `T.scopes`, so a use
+//     resolves to the SAME binding the type checker resolved (shadowing included).
+//   - `symBindNode`/`symBindType` retain each binding's type-arena index PAST
+//     scope-close (the arena `T.tys` persists for the whole check, so the index
+//     stays renderable via `tyToStr` at query time — hover types).
+let symEnabled: i32 = 0
+let symOccTok: i32[] = []
+let symOccDecl: i32[] = []
+let symOccIsDecl: i32[] = []
+let symDeclScope: {[string]: i32}[] = []
+let symBindNode: i32[] = []
+let symBindType: i32[] = []
 
 // `cUserTypes` — declared struct/union types: a `name → type-arena index` map built
 // in a pre-pass over the program's `type` declarations (so a struct name in a
@@ -689,6 +720,18 @@ export function initChecker(): i32 {
   guardNames = []
   guardParamIdxs = []
   guardThens = []
+  // LSP symbol-table data — cleared every check (the `symEnabled` mode flag is the
+  // driver's to set, so it is NOT reset here). The global scope's decl frame is
+  // seeded to parallel the global type scope `T.scopes` already pushed below.
+  symOccTok = []
+  symOccDecl = []
+  symOccIsDecl = []
+  symDeclScope = []
+  symBindNode = []
+  symBindType = []
+  if symEnabled != 0 {
+    symDeclScope.push(Map())
+  }
   // Memory intrinsics (host `defaultScope`): raw linear-memory stores/loads and
   // the `__log__` host hook used by low-level corpus programs.
   declare("__store_i32__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
@@ -1391,6 +1434,9 @@ function pushScope(): i32 {
   constScopes.push(Map())
   npFrames.push(npKeys.length)
   pgFrames.push(pgKeys.length)
+  if symEnabled != 0 {
+    symDeclScope.push(Map())
+  }
   0
 }
 
@@ -1416,7 +1462,267 @@ function popScope(): i32 {
       pgKeys.pop()
     }
   }
+  if symEnabled != 0 {
+    if symDeclScope.length > 0 {
+      symDeclScope.pop()
+    }
+  }
   0
+}
+
+// ── LSP symbol-table recording (no-ops when `symEnabled == 0`) ────────────────
+// A binding's type-arena index, retained by `bindingId` (its decl node index)
+// so hover can render it after the scope closed. The last write for a node wins
+// (a re-check during demand-inference overwrites with the resolved type).
+function symRetainType(declNode: i32, ty: i32): i32 {
+  let i = 0
+  while i < symBindNode.length {
+    if symBindNode[i] == declNode {
+      symBindType[i] = ty
+      return 0
+    }
+    i = i + 1
+  }
+  symBindNode.push(declNode)
+  symBindType.push(ty)
+  0
+}
+
+// Record a DECLARATION: bind `name → declNode` in the innermost decl scope, emit
+// the declaration's own occurrence (anchored at its NAME token), and retain its
+// type. `declNode` is the bindingId; `nameTok` its identifier token (from the
+// parser's `declNameTok` side table — falls back to the node anchor when unset).
+function symDecl(name: string, declNode: i32, ty: i32): i32 {
+  if symEnabled == 0 { return 0 }
+  if symDeclScope.length > 0 {
+    let top = symDeclScope.length - 1
+    symDeclScope[top][name] = declNode
+  }
+  symRetainType(declNode, ty)
+  let tok = declNameTokOf(declNode)
+  if tok < 0 {
+    if declNode >= 0 && declNode < nodeToks.length {
+      tok = nodeToks[declNode]
+    }
+  }
+  // Idempotent by token: a function body re-checked during demand-inference would
+  // otherwise stamp the same source identifier twice.
+  if symOccHasTok(tok) { return 0 }
+  symOccTok.push(tok)
+  symOccDecl.push(declNode)
+  symOccIsDecl.push(1)
+  0
+}
+
+// Whether an occurrence at token `tok` is already recorded (the dedup guard).
+function symOccHasTok(tok: i32): boolean {
+  if tok < 0 { return false }
+  let i = 0
+  while i < symOccTok.length {
+    if symOccTok[i] == tok { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Like `symDecl`, but binds into the ENCLOSING decl scope (one level out from the
+// innermost). A function name lives in the scope surrounding its body, yet its
+// body scope is already pushed when the params/name are processed — so its
+// binding must land one frame up to resolve recursive and sibling references.
+function symDeclInOuter(name: string, declNode: i32, ty: i32): i32 {
+  if symEnabled == 0 { return 0 }
+  let outer = symDeclScope.length - 2
+  if outer >= 0 {
+    symDeclScope[outer][name] = declNode
+  } else if symDeclScope.length > 0 {
+    symDeclScope[symDeclScope.length - 1][name] = declNode
+  }
+  symRetainType(declNode, ty)
+  let tok = declNameTokOf(declNode)
+  if tok < 0 {
+    if declNode >= 0 && declNode < nodeToks.length {
+      tok = nodeToks[declNode]
+    }
+  }
+  if symOccHasTok(tok) { return 0 }
+  symOccTok.push(tok)
+  symOccDecl.push(declNode)
+  symOccIsDecl.push(1)
+  0
+}
+
+// Resolve `name` to its binding's decl node through the decl-scope chain
+// (innermost first — mirrors `lookup`), or `-1` if it is not a tracked binding
+// (a builtin/intrinsic, or an import seeded with no decl node).
+function symResolve(name: string): i32 {
+  let i = symDeclScope.length - 1
+  while i >= 0 {
+    if symDeclScope[i].has(name) {
+      return symDeclScope[i][name] ?? (0 - 1)
+    }
+    i = i - 1
+  }
+  0 - 1
+}
+
+// Record a USE occurrence of the identifier node `useNode` (its anchor token IS
+// the identifier). Resolves to its binding through the decl-scope chain; a name
+// with no tracked binding records nothing (no go-to-def target).
+function symUse(useNode: i32, name: string): i32 {
+  if symEnabled == 0 { return 0 }
+  let decl = symResolve(name)
+  if decl < 0 { return 0 }
+  let tok = 0 - 1
+  if useNode >= 0 && useNode < nodeToks.length {
+    tok = nodeToks[useNode]
+  }
+  if symOccHasTok(tok) { return 0 }
+  symOccTok.push(tok)
+  symOccDecl.push(decl)
+  symOccIsDecl.push(0)
+  0
+}
+
+// ── symbol-table QUERY API (consumed by the driver's exports) ────────────────
+// Turn the LSP symbol machinery on/off. The driver flips it on before a
+// symbol-aware `checkProgram`; everything else leaves it off (free, no recording).
+export function symSetEnabled(on: i32): i32 {
+  symEnabled = on
+  0
+}
+// The recorded occurrences (declarations + uses), in source-walk order.
+export function symOccCount(): i32 { symOccTok.length }
+// The bindingId (declaring node index) the occurrence `i` resolves to.
+export function symOccBinding(i: i32): i32 {
+  if i >= 0 && i < symOccDecl.length { return symOccDecl[i] }
+  0 - 1
+}
+// 1 when occurrence `i` is its binding's declaration, 0 for a use.
+export function symOccIsDeclAt(i: i32): i32 {
+  if i >= 0 && i < symOccIsDecl.length { return symOccIsDecl[i] }
+  0
+}
+// The four span coordinates of occurrence `i`, derived from its anchor token: a
+// lexeme never spans lines, so the end line equals the start line and the end
+// column is `col + text.length`. A missing/out-of-range token degrades to 0s.
+function symOccTokOf(i: i32): i32 {
+  if i >= 0 && i < symOccTok.length { return symOccTok[i] }
+  0 - 1
+}
+export function symOccStartLine(i: i32): i32 {
+  let tk = symOccTokOf(i)
+  if tk >= 0 && tk < P.toks.length { return P.toks[tk].line }
+  0
+}
+export function symOccStartCol(i: i32): i32 {
+  let tk = symOccTokOf(i)
+  if tk >= 0 && tk < P.toks.length { return P.toks[tk].col }
+  0
+}
+export function symOccEndLine(i: i32): i32 { symOccStartLine(i) }
+export function symOccEndCol(i: i32): i32 {
+  let tk = symOccTokOf(i)
+  if tk >= 0 && tk < P.toks.length {
+    return P.toks[tk].col + P.toks[tk].text.length
+  }
+  0
+}
+
+// Whether occurrence `i`'s span covers (line, col): start inclusive, end
+// inclusive (a cursor on the last char of a name still resolves — the host
+// `spanContains` convention).
+function symOccCovers(i: i32, line: i32, col: i32): boolean {
+  let sl = symOccStartLine(i)
+  if sl == 0 { return false }
+  if line != sl { return false }
+  let sc = symOccStartCol(i)
+  let ec = symOccEndCol(i)
+  col >= sc && col <= ec
+}
+// The occurrence index covering (line, col), tightest span winning (a name
+// nested in a larger construct beats an outer one); -1 if the cursor is off any
+// identifier occurrence.
+export function symOccAt(line: i32, col: i32): i32 {
+  let best = 0 - 1
+  let bestWidth = 0
+  let i = 0
+  while i < symOccTok.length {
+    if symOccCovers(i, line, col) {
+      let w = symOccEndCol(i) - symOccStartCol(i)
+      if best < 0 || w < bestWidth {
+        best = i
+        bestWidth = w
+      }
+    }
+    i = i + 1
+  }
+  best
+}
+// The DECLARATION occurrence index for the binding under (line, col), or -1.
+// Drives go-to-definition: jump to this occurrence's span.
+export function symDefAt(line: i32, col: i32): i32 {
+  let occ = symOccAt(line, col)
+  if occ < 0 { return 0 - 1 }
+  let binding = symOccDecl[occ]
+  let i = 0
+  while i < symOccTok.length {
+    if symOccDecl[i] == binding && symOccIsDecl[i] == 1 {
+      return i
+    }
+    i = i + 1
+  }
+  // A binding with no recorded declaration occurrence (defensive): the use under
+  // the cursor is itself the best available anchor.
+  occ
+}
+// The count of occurrences (declaration + uses) of the binding under (line, col)
+// — find-references. `symRefAt(line, col, k)` returns the k-th such occurrence
+// INDEX (read its span via the `symOcc*` accessors).
+export function symRefsCountAt(line: i32, col: i32): i32 {
+  let occ = symOccAt(line, col)
+  if occ < 0 { return 0 }
+  let binding = symOccDecl[occ]
+  let n = 0
+  let i = 0
+  while i < symOccTok.length {
+    if symOccDecl[i] == binding { n = n + 1 }
+    i = i + 1
+  }
+  n
+}
+export function symRefAt(line: i32, col: i32, k: i32): i32 {
+  let occ = symOccAt(line, col)
+  if occ < 0 { return 0 - 1 }
+  let binding = symOccDecl[occ]
+  let seen = 0
+  let i = 0
+  while i < symOccTok.length {
+    if symOccDecl[i] == binding {
+      if seen == k { return i }
+      seen = seen + 1
+    }
+    i = i + 1
+  }
+  0 - 1
+}
+// The rendered TYPE STRING of the binding under (line, col), or "" when the
+// cursor is off any tracked binding or its type was not retained. The arena
+// `T.tys` persists for the whole check, so the retained index renders even after
+// the binding's scope closed (hover-types).
+export function symTypeStrAt(line: i32, col: i32): string {
+  let occ = symOccAt(line, col)
+  if occ < 0 { return "" }
+  let binding = symOccDecl[occ]
+  let i = 0
+  while i < symBindNode.length {
+    if symBindNode[i] == binding {
+      let ty = symBindType[i]
+      if ty < 0 { return "" }
+      return tyToStr(ty)
+    }
+    i = i + 1
+  }
+  ""
 }
 
 // Bind `name` to type-arena index `ty` in the innermost scope.
@@ -4278,7 +4584,7 @@ function ifChainExhausts(ifIx: i32): boolean {
 // caller (incl. ones that demand-inferred this function early) sees it. A
 // base-case-less cycle (`ping(){return pong()}` / `pong(){return ping()}`) has
 // nothing concrete to latch onto and reports "cannot infer a return type".
-function checkFuncDeclNode(n: FuncDecl): i32 {
+function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
   let inferring = n.fnRet < 0
   // Already inferred on demand (a forward call checked this body before pass 2
   // reached it)? Skip the re-check so diagnostics aren't duplicated.
@@ -4391,11 +4697,22 @@ function checkFuncDeclNode(n: FuncDecl): i32 {
   daClear()
   let savedRet = T.curRet
   T.curRet = ret
+  // LSP: the function name binds in the OUTER scope (decl-scope chain), but its
+  // body — params + statements — is checked under this pushed scope. Record the
+  // name occurrence against the enclosing decl scope before descending.
+  if symEnabled != 0 {
+    if n.fnName != "" && fnIx >= 0 {
+      symDeclInOuter(n.fnName, fnIx, mkFuncTy(paramTys, ret))
+    }
+  }
   let dj = 0
   while dj < params.length {
     let pNode2 = P.nodes[params[dj]]
     if pNode2 is Param {
       declare(pNode2.parName, paramTys[dj])
+      if symEnabled != 0 {
+        symDecl(pNode2.parName, params[dj], paramTys[dj])
+      }
     }
     dj = dj + 1
   }
@@ -4805,6 +5122,9 @@ function checkNode(ix: i32): i32 {
     if ty < 0 {
       tErr("undeclared identifier '" + n.identName + "'", ix)
       return TY_ERR
+    }
+    if symEnabled != 0 {
+      symUse(ix, n.identName)
     }
     // Definite-assignment read gate: a bare-name READ of a still-unassigned
     // binding is "used before assigned". The LHS of a plain `=` is a WRITE, not a
@@ -5500,6 +5820,9 @@ function checkNode(ix: i32): i32 {
       tErr("redeclared " + n.letName, ix)
     }
     declare(n.letName, bound)
+    if symEnabled != 0 {
+      symDecl(n.letName, ix, bound)
+    }
     if n.letKw == "const" {
       let ctop = constScopes.length - 1
       if ctop >= 0 {
@@ -5519,7 +5842,7 @@ function checkNode(ix: i32): i32 {
 
   // ── function declaration ─────────────────────────────────────────────────────
   } else if n is FuncDecl {
-    return checkFuncDeclNode(n)
+    return checkFuncDeclNode(n, ix)
 
   // ── while ─────────────────────────────────────────────────────────────────
   } else if n is WhileStmt {
@@ -5572,6 +5895,9 @@ function checkNode(ix: i32): i32 {
     }
     pushScope()
     declare(n.frVar, TY_I32)
+    if symEnabled != 0 {
+      symDecl(n.frVar, ix, TY_I32)
+    }
     // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
     let daFrEntry: string[] = daSnapshot()
     checkNode(n.frBody)
@@ -5594,6 +5920,9 @@ function checkNode(ix: i32): i32 {
     }
     pushScope()
     declare(n.fiVar, elemTy)
+    if symEnabled != 0 {
+      symDecl(n.fiVar, ix, elemTy)
+    }
     // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
     let daFiEntry: string[] = daSnapshot()
     checkNode(n.fiBody)
