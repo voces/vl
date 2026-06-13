@@ -244,6 +244,18 @@ Deno.test({ name: "wasm-symbols: hoverTypeAt renders a non-empty type", ignore }
   }
 });
 
+Deno.test({ name: "wasm-symbols: an un-annotated polymorphic param hovers as any, not an inference hole", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // `x` is never annotated and only probed via `is i32`, so it stays a fresh
+  // inference hole (`?describe.0`). The hover must render that as `any` (host
+  // parity), not leak the internal hole name.
+  const fixture = 'function describe(x): string {\n  if x is i32 { return "num" }\n  return "str"\n}\n';
+  const ty = await checker.hoverTypeAt(fixture, "/tmp/x.vl", noSiblings, 0, 9);
+  if (ty !== "(any) -> string") {
+    throw new Error(`expected (any) -> string for a polymorphic param, got ${JSON.stringify(ty)}`);
+  }
+});
+
 Deno.test({ name: "wasm-symbols: an imported name resolves through the reader", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   const util = "export function add(a: i32, b: i32): i32 { return a + b }\n";
