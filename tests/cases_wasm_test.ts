@@ -89,6 +89,12 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
   "generics/type-alias-soundness.vl": TS_WORDING,
   "index/wrong-key-type.vl": TS_WORDING,
   "index/wrong-value-type.vl": TS_WORDING,
+  "intrinsics/array-new-ref-elems.vl":
+    "wasm emitter rejects ref-element `__array_new__` fills (i32/boolean/f64 only natively); the host lowers them generically — the native emitter long tail (std-design slice 0 residue)",
+  "intrinsics/error-array-copy-not-list.vl": TS_WORDING,
+  "intrinsics/error-array-new-arity.vl": TS_WORDING,
+  "intrinsics/error-array-new-bad-length.vl": TS_WORDING,
+  "intrinsics/error-trap-args.vl": TS_WORDING,
   "lint/empty-intersection.vl": TS_WORDING,
   "literals/err-bad-hex-digit.vl": LEX_WORDING,
   "literals/err-doubled-separator.vl": LEX_WORDING,
