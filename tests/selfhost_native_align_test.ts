@@ -237,6 +237,9 @@ const RUN_CASES = [
   // H3 native modules: multi-file entries — `vl run` resolves the sibling
   // imports through the driver's fetch loop (relative to the entry path).
   "modules/basic/entry.vl",
+  "modules/generic-export/entry.vl",
+  "modules/generic-isolation/entry.vl",
+  "modules/generic-shadow/entry.vl",
   "modules/inferred-exports/entry.vl",
   "modules/name-isolation/entry.vl",
   "modules/rename/entry.vl",
