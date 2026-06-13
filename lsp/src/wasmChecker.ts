@@ -27,6 +27,12 @@ import { withStd } from "./moduleGraph.ts";
 
 type Exports = Record<string, (...args: number[]) => number>;
 
+/** An LSP source span (0-based line, 0-based character — the LSP convention). */
+export type WasmRange = {
+  start: { line: number; character: number };
+  end: { line: number; character: number };
+};
+
 export type WasmChecker = {
   /** Diagnostics for `source` as the entry module at `entryKey`. */
   check: (
@@ -34,6 +40,43 @@ export type WasmChecker = {
     entryKey: string,
     read: ModuleReader,
   ) => Promise<VLDiagnostic[]>;
+  /**
+   * Go-to-definition (Stage 2): the declaring span for the binding under
+   * (`line`, `character`) (both 0-based, LSP), or undefined when the cursor is
+   * off any tracked binding (or the seed predates the symbol exports).
+   */
+  definitionAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<WasmRange | undefined>;
+  /**
+   * Find-references (Stage 2): every occurrence span (declaration + uses) of the
+   * binding under the cursor. `includeDeclaration` drops the declaration's own
+   * span when false. Empty when the cursor is off any tracked binding.
+   */
+  referencesAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+    includeDeclaration: boolean,
+  ) => Promise<WasmRange[]>;
+  /**
+   * Hover-types (Stage 2): the rendered type string of the binding under the
+   * cursor, or undefined when the cursor is off any tracked binding / no type was
+   * retained / the seed predates the exports.
+   */
+  hoverTypeAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<string | undefined>;
 };
 
 /** One wasm call per code point — fine at editor scale (~0.2 ms/file). */
@@ -101,18 +144,16 @@ export const loadWasmChecker = (
   // caller can drop to "ts" mode); later mtime-driven reloads are per-check.
   if (instantiate() === undefined) return undefined;
 
-  const check = async (
+  // Shared setup for every query: reset the module table (it persists across
+  // checks by design — an LSP check is a fresh program every time), run the
+  // import fetch loop against the workspace reader, then stage the entry source.
+  // Leaves the instance ready for a `checkSrc`/`checkSrcSym` call by the caller.
+  const prepare = async (
+    exp: Exports,
     source: string,
     entryKey: string,
     read: ModuleReader,
-  ): Promise<VLDiagnostic[]> => {
-    const exp = instantiate();
-    if (exp === undefined) {
-      throw new Error("wasm checker became unavailable (seed removed?)");
-    }
-
-    // The module table persists across checks by design (the host fetch loop
-    // fills it once per build) — an LSP check is a fresh program every time.
+  ): Promise<void> => {
     exp.modReset();
     if (hasImports(source)) {
       // `std:` keys resolve through the shared withStd wrapper (workspace
@@ -138,9 +179,99 @@ export const loadWasmChecker = (
         }
       }
     }
-
     exp.srcReset();
     pushString(exp.srcPush, source);
+  };
+
+  // The symbol-query exports land in a single Stage-2 seed. An older Stage-1 seed
+  // (diagnostics only) lacks them; the methods degrade to "no result" so the LSP
+  // falls back to its TS path rather than crashing on a missing export.
+  const hasSymbols = (exp: Exports): boolean =>
+    typeof exp.checkSrcSym === "function" &&
+    typeof exp.defAt === "function" &&
+    typeof exp.symSpanStartLine === "function";
+
+  // The k-th coordinate-set of occurrence `occ`, as a 0-based LSP range. The
+  // native spans are 1-based line / 0-based column (the diagnostic convention).
+  const occRange = (exp: Exports, occ: number): WasmRange => {
+    const sl = exp.symSpanStartLine(occ);
+    const el = exp.symSpanEndLine(occ);
+    return {
+      start: { line: sl > 0 ? sl - 1 : 0, character: exp.symSpanStartCol(occ) },
+      end: { line: el > 0 ? el - 1 : 0, character: exp.symSpanEndCol(occ) },
+    };
+  };
+
+  const definitionAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<WasmRange | undefined> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp)) return undefined;
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    // Native lines are 1-based; the LSP cursor line is 0-based.
+    const occ = exp.defAt(line + 1, character);
+    return occ >= 0 ? occRange(exp, occ) : undefined;
+  };
+
+  const referencesAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+    includeDeclaration: boolean,
+  ): Promise<WasmRange[]> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp)) return [];
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    const nativeLine = line + 1;
+    const count = exp.refsCountAt(nativeLine, character);
+    const out: WasmRange[] = [];
+    for (let k = 0; k < count; k++) {
+      const occ = exp.refAt(nativeLine, character, k);
+      if (occ < 0) continue;
+      if (!includeDeclaration && exp.symIsDecl(occ) === 1) continue;
+      out.push(occRange(exp, occ));
+    }
+    return out;
+  };
+
+  const hoverTypeAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<string | undefined> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp) ||
+      typeof exp.typeStrAt !== "function") {
+      return undefined;
+    }
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    const len = exp.typeStrAt(line + 1, character);
+    if (len <= 0) return undefined;
+    return readString(len, (j) => exp.typeStrCharAt(j));
+  };
+
+  const check = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<VLDiagnostic[]> => {
+    const exp = instantiate();
+    if (exp === undefined) {
+      throw new Error("wasm checker became unavailable (seed removed?)");
+    }
+
+    await prepare(exp, source, entryKey, read);
     exp.checkSrc();
 
     const count = exp.diagCount();
@@ -169,7 +300,7 @@ export const loadWasmChecker = (
     return diags;
   };
 
-  return { check };
+  return { check, definitionAt, referencesAt, hoverTypeAt };
 };
 
 /**
@@ -200,4 +331,58 @@ export const diffDiagnostics = (
     `wasm errors (${wasm.length}):`,
     ...wasm.map((d) => `  ${fmt(d)}`),
   ].join("\n");
+};
+
+const rangeKey = (r: WasmRange): string =>
+  `${r.start.line}:${r.start.character}-${r.end.line}:${r.end.character}`;
+
+/**
+ * Divergence between the TS and wasm go-to-definition spans for `"both"` mode
+ * logging. Compares only the start position (the span the editor jumps to), so a
+ * difference in span WIDTH — the wasm side anchors to the name token, the TS side
+ * may range the whole declaration — is not flagged. Undefined = agree (including
+ * both-undefined).
+ */
+export const diffDefinition = (
+  ts: WasmRange | undefined,
+  wasm: WasmRange | undefined,
+): string | undefined => {
+  const k = (r: WasmRange | undefined) =>
+    r ? `${r.start.line}:${r.start.character}` : "none";
+  if (k(ts) === k(wasm)) return undefined;
+  return `def: ts ${k(ts)} vs wasm ${k(wasm)}`;
+};
+
+/**
+ * Divergence between the TS and wasm find-references span SETS (order-
+ * independent), for `"both"` mode logging. Undefined = the two sets match.
+ */
+export const diffReferences = (
+  ts: WasmRange[],
+  wasm: WasmRange[],
+): string | undefined => {
+  const tsSet = new Set(ts.map(rangeKey));
+  const wasmSet = new Set(wasm.map(rangeKey));
+  const same = tsSet.size === wasmSet.size &&
+    [...tsSet].every((k) => wasmSet.has(k));
+  if (same) return undefined;
+  return `refs: ts {${[...tsSet].sort().join(", ")}} vs wasm {${
+    [...wasmSet].sort().join(", ")
+  }}`;
+};
+
+/**
+ * Divergence between the TS and wasm hover type STRINGS, for `"both"` mode
+ * logging. Exact-string comparison (the native renderer's output is allowed to
+ * differ from `stringifyType` — this is the instrument that surfaces where).
+ * Undefined = identical (including both-empty).
+ */
+export const diffHoverType = (
+  ts: string | undefined,
+  wasm: string | undefined,
+): string | undefined => {
+  const a = ts ?? "";
+  const b = wasm ?? "";
+  if (a === b) return undefined;
+  return `hover: ts ${JSON.stringify(a)} vs wasm ${JSON.stringify(b)}`;
 };

@@ -88,11 +88,13 @@ function vcLoadToks(src: string): i32 {
 }
 // 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error.
 export function compileSrc(): i32 {
+  symSetEnabled(0)
   P.toks = []
   P.nodes = []
   P.diags = []
   P.pos = 0
   nodeToks = []
+  declNameTok = []
   vcLexLines = []
   vcLexCols = []
   W.bytes = []
@@ -123,11 +125,13 @@ export function rbyteAt(i: i32): i32 { W.bytes[i] }
 // type-VALID program the emitter can't yet lower (an emit-coverage gap is not a
 // check failure). Shares the diagnostic stores (`diagLen`/`diagAt`) with compileSrc.
 export function checkSrc(): i32 {
+  symSetEnabled(0)
   P.toks = []
   P.nodes = []
   P.diags = []
   P.pos = 0
   nodeToks = []
+  declNameTok = []
   vcLexLines = []
   vcLexCols = []
   fnNames = []
@@ -145,6 +149,81 @@ export function checkSrc(): i32 {
   if T.diags.length > 0 { return 2 }
   0
 }
+
+// ── LSP symbol query (Stage 2): a SYMBOL-AWARE check ──────────────────────────
+// Identical to `checkSrc` but with the symbol table turned ON, so the checker
+// records the occurrence + binding-type tables the query exports below read.
+// Used ONLY by the LSP's go-to-def / find-refs / hover path; every other consumer
+// calls `checkSrc`/`compileSrc`, which force the table OFF (zero cost, and emit
+// stays byte-identical — the tables never feed the emitter). The codes match
+// `checkSrc` (0 ok, 1 lex/parse, 2 type); the symbol tables are populated for a
+// 0 OR 2 result (a type error still yields partial occurrences), and stay valid
+// until the next check. Module mode rides the same `modCompile` path.
+export function checkSrcSym(): i32 {
+  symSetEnabled(1)
+  P.toks = []
+  P.nodes = []
+  P.diags = []
+  P.pos = 0
+  nodeToks = []
+  declNameTok = []
+  vcLexLines = []
+  vcLexCols = []
+  fnNames = []
+  fnIndices = []
+  localNames = []
+  globalStmts = []
+  globalNames = []
+  initChecker()
+  if modKeys.length > 0 {
+    let mrc = modCompile(0)
+    return mrc
+  }
+  vcLoadToks(vcSource())
+  let root = parseProgram()
+  if P.diags.length > 0 { return 1 }
+  let nerr = i32ToStr(checkProgram(root))
+  if T.diags.length > 0 { return 2 }
+  0
+}
+
+// The occurrence table (parallel to the host's `SymbolOccurrence[]`). After a
+// `checkSrcSym`, the host reads `symCount()` occurrences; for each, its source
+// span via `symSpanStartLine/Col` + `symSpanEndLine/Col` (1-based line, 0-based
+// col — the diagnostic convention), `symIsDecl(i)` (1 = the binding's declaration,
+// 0 = a use), and `symBindingId(i)` (the declaring node index — the stable
+// binding identity two occurrences share iff they refer to the same binding).
+export function symCount(): i32 { symOccCount() }
+export function symSpanStartLine(i: i32): i32 { symOccStartLine(i) }
+export function symSpanStartCol(i: i32): i32 { symOccStartCol(i) }
+export function symSpanEndLine(i: i32): i32 { symOccEndLine(i) }
+export function symSpanEndCol(i: i32): i32 { symOccEndCol(i) }
+export function symIsDecl(i: i32): i32 { symOccIsDeclAt(i) }
+export function symBindingId(i: i32): i32 { symOccBinding(i) }
+
+// Go-to-definition: the occurrence index of the DECLARATION for the binding whose
+// occurrence covers (line, col), or -1 when the cursor is off any tracked name.
+// Read its span via the `symSpan*` accessors.
+export function defAt(line: i32, col: i32): i32 { symDefAt(line, col) }
+
+// Find-references: the count of occurrences (declaration + uses) of the binding
+// at (line, col), and the k-th such occurrence INDEX (its span via `symSpan*`).
+export function refsCountAt(line: i32, col: i32): i32 { symRefsCountAt(line, col) }
+export function refAt(line: i32, col: i32, k: i32): i32 { symRefAt(line, col, k) }
+
+// Hover-types: the rendered type string of the binding at (line, col), exposed
+// per-codepoint via a result buffer the host fills then reads (mirrors the
+// `rbyte*` idiom). `typeStrAt` computes the string and returns its length;
+// `typeStrCharAt(j)` reads code point `j` of that last-computed string. A cursor
+// off any tracked binding yields a zero-length string.
+let symTyBuf: string = ""
+export function typeStrAt(line: i32, col: i32): i32 {
+  symTyBuf = symTypeStrAt(line, col)
+  symTyBuf.length
+}
+export function typeStrLen(): i32 { symTyBuf.length }
+export function typeStrCharAt(j: i32): i32 { symTyBuf[j] }
+
 // All failure diagnostics, newline-joined: parse diags, then typecheck diags,
 // then the emit failure message (whichever stage failed populated its store).
 function vcDiags(): string {
