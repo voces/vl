@@ -1,6 +1,7 @@
-// NATIVE golden byte-tripwire — the no-TS replacement for the deno-side golden
-// pin (`tests/selfhost_emit_program_test.ts`, whose single always-on assembly
-// compile cost ~90–160s cold). The goldens are a NATIVE SELF-SNAPSHOT (re-pinned
+// NATIVE golden byte-tripwire — the always-on byte gate for emitted wasm. The
+// deno-side golden pin (`tests/selfhost_emit_program_test.ts`) is
+// SELFHOST_DENO_RUN-gated; this no-TS check covers the default CI path cheaply.
+// The goldens are a NATIVE SELF-SNAPSHOT (pinned
 // from the self-emitter — see the UPDATE_GOLDENS note in
 // `tests/selfhost_emit_fixpoint_test.ts`), so the direct assertion is: `vl build`
 // each golden source with the current seed and compare byte-for-byte against

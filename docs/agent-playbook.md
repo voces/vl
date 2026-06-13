@@ -66,3 +66,15 @@ To diagnose invalid emitted wasm:
 Files promoted / files advanced-but-not-promoted with the blocking stage /
 files untouched with reason / divergences from the host WITH justification /
 branch name + final commit SHA.
+
+## Comment policy — state, never diff
+Comments describe what the code IS and which invariants it holds — never
+what changed, when, or what it used to be (git blame + CHANGELOG own that).
+Concretely banned in comments: "was X" / "formerly X" / "renamed from" /
+"now does" / "added/new in" / slice or phase tags ("Slice 3", "Phase G") /
+PR numbers (#306) — EXCEPT where the rationale genuinely lives in that PR's
+discussion and nowhere else (rare; prefer DECISIONS.md). When a change makes
+an existing comment narrate history, rewrite it to describe the resulting
+state or delete it. Keep (and write) the comments that carry invariants,
+contracts, and the WHY a non-obvious shape is required — those are the ones
+the next reader needs.
