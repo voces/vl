@@ -370,6 +370,75 @@ export const semanticTokensData = (
 ): number[] =>
   encodeSemanticTokens(classifyDocument(table, tokens, source, ast, spans));
 
+/**
+ * One pre-classified identifier from an EXTERNAL classifier (the wasm checker's
+ * `tokensAt`). The `bindKind` (0=variable 1=parameter 2=function) indexes the
+ * legend's first three entries directly — the same convention as the symbol-table
+ * pass — and `isDecl` carries the declaration modifier. Position is 0-based.
+ */
+export type IdentToken = {
+  line: number;
+  char: number;
+  length: number;
+  bindKind: number; // 0=variable 1=parameter 2=function
+  isDecl: boolean;
+};
+
+/** An identifier classifier's tokens as {@link ClassifiedToken}s, keyed by position. */
+const identTokensByPos = (
+  idents: IdentToken[],
+): Map<string, ClassifiedToken> => {
+  const byPos = new Map<string, ClassifiedToken>();
+  for (const id of idents) {
+    if (id.length <= 0) continue;
+    // bindKind indexes the legend's first three entries (variable/parameter/
+    // function); guard defensively against an out-of-range kind.
+    if (id.bindKind < 0 || id.bindKind >= SEMANTIC_TOKEN_TYPES.length) continue;
+    byPos.set(`${id.line}:${id.char}`, {
+      line: id.line,
+      char: id.char,
+      length: id.length,
+      tokenType: id.bindKind,
+      tokenModifiers: id.isDecl ? DECLARATION_BIT : 0,
+    });
+  }
+  return byPos;
+};
+
+/**
+ * Full-document semantic tokens with the IDENTIFIER classification supplied by an
+ * external source (the wasm checker) instead of the TS symbol table. The lexical
+ * pass (literals/keywords/operators), recovered comments, and the member walk
+ * stay TS-side and merge identically to {@link classifyDocument} — only the
+ * identifier-binding source moves to wasm. Where the external set classifies a
+ * position, it wins (as the symbol-table pass does); leftover identifiers fall
+ * through to the lexical/member passes unchanged.
+ *
+ * This is the LSP-on-wasm Stage-2 entry point for `textDocument/semanticTokens`:
+ * `server.ts` builds `idents` from `wasmChecker.tokensAt`, the rest is pure JS.
+ */
+export const semanticTokensDataFromIdentifiers = (
+  idents: IdentToken[],
+  tokens: Token[],
+  source: string,
+  ast?: VLProgramNode,
+  spans?: NodeSpans,
+): number[] => {
+  const identTokens = identTokensByPos(idents);
+  const merged: ClassifiedToken[] = [...identTokens.values()];
+  for (const t of classifyLexicalTokens(tokens)) {
+    if (!identTokens.has(`${t.line}:${t.char}`)) merged.push(t);
+  }
+  merged.push(...commentTokens(source));
+  if (ast && spans) {
+    for (const t of classifyMemberTokens(ast, spans)) {
+      if (!identTokens.has(`${t.line}:${t.char}`)) merged.push(t);
+    }
+  }
+  merged.sort((a, b) => a.line - b.line || a.char - b.char);
+  return encodeSemanticTokens(merged);
+};
+
 // ---- inlay hints (D6) -------------------------------------------------------
 
 /**

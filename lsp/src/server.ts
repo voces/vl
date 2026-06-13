@@ -62,9 +62,12 @@ import {
   diffDiagnostics,
   diffHoverType,
   diffReferences,
+  diffSemanticTokens,
   loadWasmChecker,
+  type TsIdentToken,
   type WasmChecker,
   type WasmRange,
+  type WasmToken,
 } from "./wasmChecker.ts";
 import {
   type Completion,
@@ -80,6 +83,7 @@ import {
   resolveMemberAt,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
+  semanticTokensDataFromIdentifiers,
   snippetCompletions,
   typeLabelDetail,
 } from "./typeFeatures.ts";
@@ -816,17 +820,82 @@ connection.languages.inlayHint.on((params): InlayHint[] => {
 // grammar can't tell apart — and merged with a lexical pass over the token
 // stream for literals/keywords/operators plus recovered `//` comments. The
 // `data` array is the delta-encoded form LSP mandates (see `semanticTokensData`).
-connection.languages.semanticTokens.on((params): SemanticTokens => {
-  const doc = documents.get(params.textDocument.uri);
-  if (!doc) return { data: [] };
-  const text = doc.getText();
-  const { tokens } = tokenize(text);
-  // `checkOnly` (synchronous, binaryen-free) gives the symbol table AND the AST
-  // node spans, so member names (`o.x`, `xs.get`) get `property`/`method` tokens
-  // alongside the binding-classified identifiers.
-  const { symbols, ast, spans } = checkOnly(text);
-  return { data: semanticTokensData(symbols, tokens, text, ast, spans) };
-});
+connection.languages.semanticTokens.on(
+  async (params): Promise<SemanticTokens> => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) return { data: [] };
+    const text = doc.getText();
+    const { tokens } = tokenize(text);
+    // `checkOnly` (synchronous, binaryen-free) gives the symbol table AND the AST
+    // node spans, so member names (`o.x`, `xs.get`) get `property`/`method` tokens
+    // alongside the binding-classified identifiers.
+    const { symbols, ast, spans } = checkOnly(text);
+
+    // LSP-on-wasm Stage 2: source the IDENTIFIER classification (variable/
+    // parameter/function) from the self-hosted compiler; the lexical pass
+    // (keywords/operators/literals/comments) and member walk stay TS. On any
+    // error (or an empty wasm result — a seed predating the token exports), fall
+    // back to the TS classification — mirrors the `definitionAt` fallback.
+    const wasmIdents = async (): Promise<WasmToken[]> => {
+      if (wasmChecker?.tokensAt === undefined) return [];
+      return await wasmChecker
+        .tokensAt(text, entryKeyOf(params.textDocument.uri), workspaceReader)
+        .catch((err) => {
+          connection.console.log(`[wasm-symbols] tokensAt failed: ${err}`);
+          return [];
+        });
+    };
+
+    if (checkerMode === "wasm" && wasmChecker !== undefined) {
+      const idents = await wasmIdents();
+      if (idents.length > 0) {
+        return {
+          data: semanticTokensDataFromIdentifiers(idents, tokens, text, ast, spans),
+        };
+      }
+      return { data: semanticTokensData(symbols, tokens, text, ast, spans) };
+    }
+    if (checkerMode === "both" && wasmChecker !== undefined) {
+      const idents = await wasmIdents();
+      // The TS identifier set, projected to the same shape, for the parity diff:
+      // only the binding-classified identifiers (legend indices 0/1/2) — the
+      // subset the wasm slice covers — are compared.
+      const tsIdents: TsIdentToken[] = [];
+      for (const occ of symbols.occurrences) {
+        const { span } = occ;
+        if (span.start.line !== span.stop.line) continue;
+        const length = span.stop.column - span.start.column;
+        if (length <= 0) continue;
+        const bindKind = TS_BIND_KIND[occ.binding.kind];
+        if (bindKind === undefined) continue; // a `type` — not in this slice
+        tsIdents.push({
+          line: span.start.line - 1,
+          char: span.start.column,
+          length,
+          bindKind,
+          isDecl: occ.isDecl,
+        });
+      }
+      const diff = diffSemanticTokens(tsIdents, idents);
+      if (diff !== undefined) {
+        connection.console.log(`[wasm-parity] ${params.textDocument.uri} ${diff}`);
+      }
+      return { data: semanticTokensData(symbols, tokens, text, ast, spans) };
+    }
+    return { data: semanticTokensData(symbols, tokens, text, ast, spans) };
+  },
+);
+
+// TS binding kind → the wasm `bindKind` convention (legend indices 0/1/2). A
+// `type` alias has no wasm counterpart in this slice (the native occurrence
+// table records variable/parameter/function only), so it maps to undefined and
+// is excluded from the parity diff.
+const TS_BIND_KIND: Record<string, number | undefined> = {
+  variable: 0,
+  parameter: 1,
+  function: 2,
+  type: undefined,
+};
 
 // Map a neutral completion kind (from `typeFeatures.ts`) to the LSP enum. A VL
 // `type` alias / builtin type maps to `Struct` (VL types are structural objects,

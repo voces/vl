@@ -200,6 +200,13 @@ let symOccIsDecl: i32[] = []
 let symDeclScope: {[string]: i32}[] = []
 let symBindNode: i32[] = []
 let symBindType: i32[] = []
+// Parallel to `symBindNode`: each binding's KIND, for semantic-token coloring
+// (the LSP classifies an identifier by what it binds to, which a lexer can't).
+// 0 = variable (let/const/loop var), 1 = parameter, 2 = function. Types and
+// properties aren't recorded as bindings here, so they never appear (the host
+// leaves those identifiers to its lexical pass). Looked up by occurrence via
+// `symBindKindOf` and exported as `tokBindKindAt`.
+let symBindKind: i32[] = []
 
 // `cUserTypes` — declared struct/union types: a `name → type-arena index` map built
 // in a pre-pass over the program's `type` declarations (so a struct name in a
@@ -729,6 +736,7 @@ export function initChecker(): i32 {
   symDeclScope = []
   symBindNode = []
   symBindType = []
+  symBindKind = []
   if symEnabled != 0 {
     symDeclScope.push(Map())
   }
@@ -1474,31 +1482,44 @@ function popScope(): i32 {
 // A binding's type-arena index, retained by `bindingId` (its decl node index)
 // so hover can render it after the scope closed. The last write for a node wins
 // (a re-check during demand-inference overwrites with the resolved type).
-function symRetainType(declNode: i32, ty: i32): i32 {
+function symRetainType(declNode: i32, ty: i32, kind: i32): i32 {
   let i = 0
   while i < symBindNode.length {
     if symBindNode[i] == declNode {
       symBindType[i] = ty
+      symBindKind[i] = kind
       return 0
     }
     i = i + 1
   }
   symBindNode.push(declNode)
   symBindType.push(ty)
+  symBindKind.push(kind)
   0
+}
+
+// The kind (0=variable 1=parameter 2=function) of the binding `declNode`
+// resolves to, or -1 when it is not a recorded binding — semantic-token coloring.
+function symBindKindOf(declNode: i32): i32 {
+  let i = 0
+  while i < symBindNode.length {
+    if symBindNode[i] == declNode { return symBindKind[i] }
+    i = i + 1
+  }
+  0 - 1
 }
 
 // Record a DECLARATION: bind `name → declNode` in the innermost decl scope, emit
 // the declaration's own occurrence (anchored at its NAME token), and retain its
 // type. `declNode` is the bindingId; `nameTok` its identifier token (from the
 // parser's `declNameTok` side table — falls back to the node anchor when unset).
-function symDecl(name: string, declNode: i32, ty: i32): i32 {
+function symDecl(name: string, declNode: i32, ty: i32, kind: i32): i32 {
   if symEnabled == 0 { return 0 }
   if symDeclScope.length > 0 {
     let top = symDeclScope.length - 1
     symDeclScope[top][name] = declNode
   }
-  symRetainType(declNode, ty)
+  symRetainType(declNode, ty, kind)
   let tok = declNameTokOf(declNode)
   if tok < 0 {
     if declNode >= 0 && declNode < nodeToks.length {
@@ -1529,7 +1550,7 @@ function symOccHasTok(tok: i32): boolean {
 // innermost). A function name lives in the scope surrounding its body, yet its
 // body scope is already pushed when the params/name are processed — so its
 // binding must land one frame up to resolve recursive and sibling references.
-function symDeclInOuter(name: string, declNode: i32, ty: i32): i32 {
+function symDeclInOuter(name: string, declNode: i32, ty: i32, kind: i32): i32 {
   if symEnabled == 0 { return 0 }
   let outer = symDeclScope.length - 2
   if outer >= 0 {
@@ -1537,7 +1558,7 @@ function symDeclInOuter(name: string, declNode: i32, ty: i32): i32 {
   } else if symDeclScope.length > 0 {
     symDeclScope[symDeclScope.length - 1][name] = declNode
   }
-  symRetainType(declNode, ty)
+  symRetainType(declNode, ty, kind)
   let tok = declNameTokOf(declNode)
   if tok < 0 {
     if declNode >= 0 && declNode < nodeToks.length {
@@ -1601,6 +1622,12 @@ export function symOccBinding(i: i32): i32 {
 export function symOccIsDeclAt(i: i32): i32 {
   if i >= 0 && i < symOccIsDecl.length { return symOccIsDecl[i] }
   0
+}
+// The binding KIND of occurrence `i` (0=variable 1=parameter 2=function), or -1
+// when out of range — semantic-token coloring reads this per identifier.
+export function symOccKindAt(i: i32): i32 {
+  if i >= 0 && i < symOccDecl.length { return symBindKindOf(symOccDecl[i]) }
+  0 - 1
 }
 // The four span coordinates of occurrence `i`, derived from its anchor token: a
 // lexeme never spans lines, so the end line equals the start line and the end
@@ -4714,7 +4741,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
   // name occurrence against the enclosing decl scope before descending.
   if symEnabled != 0 {
     if n.fnName != "" && fnIx >= 0 {
-      symDeclInOuter(n.fnName, fnIx, mkFuncTy(paramTys, ret))
+      symDeclInOuter(n.fnName, fnIx, mkFuncTy(paramTys, ret), 2)
     }
   }
   let dj = 0
@@ -4723,7 +4750,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
     if pNode2 is Param {
       declare(pNode2.parName, paramTys[dj])
       if symEnabled != 0 {
-        symDecl(pNode2.parName, params[dj], paramTys[dj])
+        symDecl(pNode2.parName, params[dj], paramTys[dj], 1)
       }
     }
     dj = dj + 1
@@ -5833,7 +5860,7 @@ function checkNode(ix: i32): i32 {
     }
     declare(n.letName, bound)
     if symEnabled != 0 {
-      symDecl(n.letName, ix, bound)
+      symDecl(n.letName, ix, bound, 0)
     }
     if n.letKw == "const" {
       let ctop = constScopes.length - 1
@@ -5908,7 +5935,7 @@ function checkNode(ix: i32): i32 {
     pushScope()
     declare(n.frVar, TY_I32)
     if symEnabled != 0 {
-      symDecl(n.frVar, ix, TY_I32)
+      symDecl(n.frVar, ix, TY_I32, 0)
     }
     // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
     let daFrEntry: string[] = daSnapshot()
@@ -5933,7 +5960,7 @@ function checkNode(ix: i32): i32 {
     pushScope()
     declare(n.fiVar, elemTy)
     if symEnabled != 0 {
-      symDecl(n.fiVar, ix, elemTy)
+      symDecl(n.fiVar, ix, elemTy, 0)
     }
     // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
     let daFiEntry: string[] = daSnapshot()
