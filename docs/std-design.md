@@ -14,13 +14,17 @@ surface (D5).
 
 ## Verified facts (the ground this stands on)
 
-**The two-primitive intrinsic floor is DEFINED but NOT IMPLEMENTED.**
-`docs/collections-design.md` §LS.2 derives it: a pure-VL `List` is blocked on
-exactly (1) dynamic-length array allocation (`__array_new__<T>(length, fill)` /
-`__array_new_default__<T>(length)` → `array.new`/`array.new_default`) and
-(2) bulk `__array_copy__` → `array.copy`. Neither name exists in either
-compiler today (verified by grep); exposing them is ROADMAP B6b's
-"Prerequisite intrinsics" and is Slice 0 here.
+**The two-primitive intrinsic floor is IMPLEMENTED (Slice 0 / B6b's
+"Prerequisite intrinsics" — landed).** `docs/collections-design.md` §LS.2
+derives it: a pure-VL `List` stands on exactly (1) dynamic-length array
+allocation (`__array_new__<T>(length, fill)` / `__array_new_default__<T>(length)`
+→ `array.new`/`array.new_default`) and (2) bulk `__array_copy__` →
+`array.copy`; `__trap__()` → `unreachable` rides along (D1.5). All four live in
+all four places (defaultScope.ts + toWasm.ts; typecheck.vl + wasmEmit.vl),
+lowered inline by name, monomorphized per element type. Native element
+coverage: the i32 list (i32/boolean) and the f64 list; ref/string elements
+fail loudly there (emitter long tail; the host covers them generically).
+Corpus: `tests/cases/intrinsics/`.
 
 **The intrinsic floor as it exists today.** Host: `compiler/defaultScope.ts` —
 the `__store_*__`/`__load_i32__`/`__log*__`/`__memory_*__` memory intrinsics
@@ -289,11 +293,12 @@ regressions; `refresh-compiler.sh` + `native-fixpoint.sh` whenever
 `compiler/*.vl`/the driver changed; full fixpoint on typecheck/wasmEmit
 slices.
 
-0. **The intrinsic floor**: `__array_new__`/`__array_new_default__`/
+0. ✅ **The intrinsic floor**: `__array_new__`/`__array_new_default__`/
    `__array_copy__` + `__trap__` in all four places (defaultScope.ts +
    toWasm.ts; typecheck.vl + wasmEmit.vl). Corpus `tests/cases/intrinsics/`
    (@run: runtime-length alloc, fill, bulk copy incl. overlap; @trap for
    `__trap__`; @error: misuse). Independently landable (B6b's first checkbox).
+   LANDED — see the verified-facts entry above for the shipped shape.
 1. **`std:` resolution plumbing, no std content**: both resolvers + the
    std-internal relative guard; Rust std-dir mapping; cli.ts fsRead wrap;
    `std/embedded.ts` generator + freshness test; `withStd` in moduleGraph +

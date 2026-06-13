@@ -169,6 +169,12 @@ const RUN_CASES = [
   "globals/string-reassign-cross-function.vl",
   "globals/struct-field-through-fn.vl",
   "index/nested-2d-array.vl",
+  "intrinsics/array-copy-overlap.vl",
+  "intrinsics/array-copy.vl",
+  "intrinsics/array-new-bool.vl",
+  "intrinsics/array-new-default-zero.vl",
+  "intrinsics/array-new-f64.vl",
+  "intrinsics/array-new-fill.vl",
   "lexer/soft-keywords-as-function-names.vl",
   "lexer/soft-keywords-as-identifiers.vl",
   "lint/called-function-no-warn.vl",
@@ -412,6 +418,7 @@ const RUN_CASES = [
 
 // ── TRAP_CASES: `vl run` exits nonzero with a runtime trap ──
 const TRAP_CASES = [
+  "intrinsics/trap.vl",
   "traps/array-oob-read.vl",
   "traps/divide-by-zero.vl",
 ];
@@ -437,6 +444,10 @@ const REJECT_CASES = [
   "generics/type-alias-soundness.vl",
   "index/wrong-key-type.vl",
   "index/wrong-value-type.vl",
+  "intrinsics/error-array-copy-not-list.vl",
+  "intrinsics/error-array-new-arity.vl",
+  "intrinsics/error-array-new-bad-length.vl",
+  "intrinsics/error-trap-args.vl",
   "lint/empty-intersection.vl",
   "lint/for-step-zero.vl",
   "literals/err-bad-hex-digit.vl",

@@ -3673,6 +3673,114 @@ export const toWasm = async (
             arrayType(i32Type).refType,
           );
         }
+        // The array-intrinsic floor (std-design D1 / collections-design §LS.2):
+        // thin wrappers over single WasmGC instructions, lowered INLINE at the
+        // call site (no helper function, no call overhead), monomorphized per
+        // element type through the existing list/array interners.
+        //
+        // `__trap__()` → `unreachable`: the deliberate abort primitive.
+        if (node.function === "__trap__") return m.unreachable();
+        // `__array_new__(n, fill)` → `array.new` (every slot set to `fill`);
+        // `__array_new_default__(n)` → `array.new_default` (slots zeroed/default).
+        // Both yield a `T[]` — the `{backing,len,cap}` list struct with
+        // `len == cap == n` — the runtime-length sibling of the array literal.
+        // The element type is the call's resolved return type's element (pinned
+        // from the fill argument / the annotation), or comes from the desired
+        // type when the call is itself the RHS being coerced.
+        if (
+          node.function === "__array_new__" ||
+          node.function === "__array_new_default__"
+        ) {
+          let element: VLType | undefined;
+          for (const cand of [node.functionType?.return, desiredType]) {
+            if (!cand) continue;
+            let s = softenImplicitType(cand);
+            while (s.type === "Infer") s = softenImplicitType(s.subType);
+            if (!isListType(s)) continue;
+            let el = softenImplicitType(arrayElementType(s)!);
+            while (el.type === "Infer") el = softenImplicitType(el.subType);
+            if (el.type !== "Unknown") {
+              element = el;
+              break;
+            }
+          }
+          if (!element) {
+            throw new Error(
+              `${node.function}() needs a list type annotation ` +
+                "(e.g. `let xs: i32[] = " + node.function + "(…)`)",
+            );
+          }
+          const lt = listType(element);
+          const nLocal = newLocal(binaryen.i32);
+          const n = () => m.local.get(nLocal, binaryen.i32);
+          // Evaluate `n` into a local FIRST (source order: length, then fill);
+          // it feeds the allocation size and the struct's len/cap fields.
+          const setN = m.local.set(
+            nLocal,
+            withDesiredType(i32Type, () => toExpression(node.arguments[0].value)),
+          );
+          // A non-null ref element stores into the (nullable-widened) backing
+          // slot directly — the slot type accepts the non-null fill value.
+          const backing = node.function === "__array_new__"
+            ? m.array.new(
+              lt.backing.heapType,
+              n(),
+              withDesiredType(element, () =>
+                toExpression(node.arguments[1].value)),
+            )
+            : m.array.new_default(lt.backing.heapType, n());
+          const value = m.block(
+            null,
+            [setN, m.struct.new([backing, n(), n()], lt.heapType)],
+            lt.refType,
+          );
+          return !hasDesiredType() ? m.drop(value) : value;
+        }
+        // `__array_copy__(dst, dstAt, src, srcAt, count)` → `array.copy` over the
+        // two lists' backings: bulk-move `count` elements from `src[srcAt..]`
+        // into `dst[dstAt..]`. Memmove semantics (overlap is handled by the
+        // instruction); out-of-range spans trap (the instruction's own check,
+        // against the backing's physical length).
+        if (node.function === "__array_copy__") {
+          const [dst, dstAt, src, srcAt, count] = node.arguments.map(
+            (a) => a.value,
+          );
+          const dstT = listTypeOf(dst);
+          const srcT = listTypeOf(src);
+          if (!dstT || !srcT) {
+            throw new Error("__array_copy__: expected list (T[]) operands");
+          }
+          // Generic param↔param correlation is lenient in the checker (the same
+          // standing gap as a declared `<T>(a: T[], b: T[])`), so a mismatched
+          // element pair reaches codegen — fail loudly here rather than dying in
+          // the wasm validator.
+          if (dstT.lt.heapType !== srcT.lt.heapType) {
+            throw new Error(
+              "__array_copy__: dst and src must share one element type",
+            );
+          }
+          const asI32 = (e: VLExpression) =>
+            withDesiredType(i32Type, () => toExpression(e));
+          return m.array.copy(
+            listBacking(
+              dstT.lt,
+              listRefNonNull(
+                dstT.lt,
+                withDesiredType(objectTypeOf(dst), () => toExpression(dst)),
+              ),
+            ),
+            asI32(dstAt),
+            listBacking(
+              srcT.lt,
+              listRefNonNull(
+                srcT.lt,
+                withDesiredType(objectTypeOf(src), () => toExpression(src)),
+              ),
+            ),
+            asI32(srcAt),
+            asI32(count),
+          );
+        }
         // `Map()` / `Set()` builtin constructors (B6a): allocate an empty hash
         // collection. The concrete map type is the call's resolved return type
         // (pinned from the binding annotation), or — when the call is itself the
