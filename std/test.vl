@@ -1,0 +1,105 @@
+// `std:test` v1 — a pure-VL assertion library over the intrinsic floor
+// (docs/std-design.md D5). The matcher surface reads jest-shaped through
+// STRUCT-RECEIVER UFCS: `expectI32(x).toEqual(y)` builds a small `Expectation`
+// struct and `.toEqual` is a free `self`-function resolved by self+arity. A
+// failed assertion calls `__trap__()` (std-design D1 item 5 / OD2) — a
+// process-fatal abort, jest's "a test stops at its first failed expectation".
+// A passing assertion is a no-op. The runner half (`vl test`, per-test trap
+// isolation, reporting — docs/test-runner-design.md) drives these from the
+// host; under bare `vl run` a green file exits 0, a red one aborts.
+//
+// SCOPE OF v1 — concrete value types, no generic `expect<T>`. The
+// design-doc shape `expect(v: i32 | i64 | f64 | boolean | string)` returning
+// `Expectation { actual: <that union> }` is NOT expressible on the current
+// native seed: a value-union STRUCT FIELD does not round-trip — reading it
+// back (`self.actual`) mis-types the load (the field is a `ref`, the read is
+// emitted as `i32`), and a struct carrying a union field is rejected as
+// not-equatable. Generic `expect<T>` is independently blocked (exporting
+// generics is out of phase-1 scope, std-design "generic exports" / slice 2).
+// So v1 stores the value in CONCRETE fields under a tag and splays the entry
+// point per type (`expectI32`/`expectBool`/`expectStr`). i64 and f64 are
+// absent because the seed restricts struct fields to i32/boolean/string/array
+// ("only i32 / boolean / string / array struct fields are supported"); they
+// return once wide/float fields land. The names stay jest-compatible for the
+// generic `expect` upgrade (std-design slice 6).
+//
+// One `Expectation` shape, one method name each: the seed does not overload by
+// receiver type (two `toEqual`s with different `self` structs fail UFCS
+// resolution), and a struct-union receiver (`self: ExpectI32 | ExpectStr`)
+// crashes the emitter — so a single tagged struct carries every value kind.
+type Expectation = {
+  tag: i32,        // 1 = i32, 2 = boolean, 3 = string — selects the live field
+  i: i32,
+  b: boolean,
+  s: string,
+  negated: boolean // `.not()` flips the pass/fail sense (jest's `.not`)
+}
+
+// `expect` over an i32 value: the receiver for the integer matchers.
+export function expectI32(value: i32): Expectation {
+  return { tag: 1, i: value, b: false, s: "", negated: false }
+}
+
+// `expect` over a boolean value: the receiver for `toBeTrue`/`toBeFalse` and
+// boolean `toEqual`.
+export function expectBool(value: boolean): Expectation {
+  return { tag: 2, i: 0, b: value, s: "", negated: false }
+}
+
+// `expect` over a string value.
+export function expectStr(value: string): Expectation {
+  return { tag: 3, i: 0, b: false, s: value, negated: false }
+}
+
+// Inverts the pass/fail sense: `expectI32(5).not().toEqual(6)` passes because
+// 5 != 6. Returns a fresh `Expectation` (the receiver is a value; no aliasing).
+export function not(self: Expectation): Expectation {
+  return { tag: self.tag, i: self.i, b: self.b, s: self.s, negated: !self.negated }
+}
+
+// Does the boxed value structurally equal `expected`? The `expected` UFCS
+// argument is a value union — narrowed by `is` so each arm compares the live
+// CONCRETE field directly. (Comparing through the union by boxing the field is
+// avoided: boxing a boolean field into the union mis-tags it as i32 on the
+// current seed, silently failing the compare; the narrow-then-concrete path
+// sidesteps that.) A type mismatch (`expectI32(4).toEqual("4")`) is unequal.
+function matches(self: Expectation, expected: i32 | boolean | string): boolean {
+  if self.tag == 1 {
+    if expected is i32 { return self.i == expected }
+    return false
+  }
+  if self.tag == 2 {
+    if expected is boolean { return self.b == expected }
+    return false
+  }
+  if expected is string { return self.s == expected }
+  return false
+}
+
+// Aborts unless `matches` agrees with the current sense (`negated`). Factored
+// so every matcher shares one pass/fail/`__trap__` decision.
+function adjudicate(self: Expectation, ok: boolean) {
+  if self.negated {
+    if ok { __trap__() }
+  } else {
+    if !ok { __trap__() }
+  }
+}
+
+// `.toEqual` — structural equality, jest semantics (std-design D5/OD6).
+// `.toBe` (referential identity) is reserved for the future `===` (ROADMAP
+// A15) and is deliberately NOT part of v1.
+export function toEqual(self: Expectation, expected: i32 | boolean | string) {
+  adjudicate(self, matches(self, expected))
+}
+
+// `.toBeTrue` — the receiver is a boolean and holds `true`. A non-boolean
+// receiver is never true.
+export function toBeTrue(self: Expectation) {
+  adjudicate(self, self.tag == 2 && self.b)
+}
+
+// `.toBeFalse` — the receiver is a boolean and holds `false`.
+export function toBeFalse(self: Expectation) {
+  adjudicate(self, self.tag == 2 && !self.b)
+}
