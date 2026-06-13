@@ -168,9 +168,11 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   null and skip the vals-touch in new/add/compact/rehash (~5 `mSet`-gated sites). Memory/perf
   refinement, behaviorally invisible; would intentionally diverge from the host (which keeps `vals`
   for sets) as a justified improvement, not a regression.
-- ⬜ **B6b. Collections building blocks & open items** (all detail in `docs/collections-design.md`).
-  - **Prerequisite intrinsics** — `__array_new__`/`__array_new_default__` + bulk `__array_copy__`,
-    thin `defaultScope` intrinsics.
+- 🟡 **B6b. Collections building blocks & open items** (all detail in `docs/collections-design.md`).
+  - ✅ **Prerequisite intrinsics** — `__array_new__`/`__array_new_default__` + bulk `__array_copy__`
+    (+ `__trap__`, std-design D1), thin `defaultScope`/typecheck.vl intrinsics lowered inline in both
+    emitters, monomorphized per element type (native: i32/boolean/f64 element reps; ref/string
+    elements fail loudly — emitter long tail). Corpus `tests/cases/intrinsics/`.
   - **Std-over-primitives** — write the collection (and opportunistically `print`) as `.vl` std, not
     compiler-privileged types (ties to H3 / H0 phase 2 `std:` scheme).
   - **Indexing perf** (DECIDED resolutions; sub-choices open) — native-indexing flag (drops B13

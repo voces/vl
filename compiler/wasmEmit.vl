@@ -3493,6 +3493,15 @@ let leqRBases: i32[] = []
 let fnUsesCloEq: boolean = false
 let cloEqScratchBase: i32 = 0
 
+// ── per-function array-intrinsic scratch (std-design D1: the intrinsic floor) ──
+// `__array_new__(n, fill)` / `__array_new_default__(n)` stage the runtime
+// length `n` in ONE i32 scratch slot — it feeds the allocation size and the
+// list wrapper's len/cap fields. Flagged by `fnHasArrNew` (a pure name-walk for
+// the two allocator calls); appended LAST in the frame layout so every existing
+// layout is untouched. (`__array_copy__`/`__trap__` need no scratch.)
+let fnUsesArrNew: boolean = false
+let arrNewScratchBase: i32 = 0
+
 // ── struct-type table (MULTIPLE structs per program) ──────────────────────────
 // A program may declare MANY struct `type`s. Mirroring the union variant table, the
 // struct table is a FLAT store keyed by struct index (declaration order): struct `i`
@@ -5223,6 +5232,156 @@ function fnHasStrOp(fnIx: i32): boolean {
   let fn = P.nodes[fnIx]
   if fn is FuncDecl {
     return blockHasStrOp(fn.fnBody, fnIx)
+  }
+  false
+}
+
+// ── array-intrinsic detection (std-design D1 / collections-design §LS.2) ──────
+// `__array_new__(n, fill)` / `__array_new_default__(n)` / `__array_copy__(…)` /
+// `__trap__()` lower INLINE at the call site (host parity: toWasm.ts lowers the
+// same names to array.new / array.new_default / array.copy / unreachable). The
+// two allocators reserve the 1-slot `arrNewScratchBase` frame; these walkers
+// find them anywhere in a body — a pure NAME walk (no classification, so no
+// narrowing bookkeeping is needed, unlike the string-op scan).
+
+// The intrinsic-allocation ELEMENT KIND of the Call at `callIx`: `0` = the i32
+// list (i32/boolean fills — the i32 backing), `1` = the f64 list (an f64 fill),
+// `-1` = not an intrinsic allocation. `__array_new_default__` is always the i32
+// list natively: its element kind is not derivable from the argument list (an
+// f64 default needs `__array_new__(n, 0.0)`); the host covers it generically.
+function arrNewIntrKind(callIx: i32, fnIx: i32): i32 {
+  let c = P.nodes[callIx]
+  if c is Call {
+    let callee = P.nodes[c.callFn]
+    if callee is Ident {
+      if callee.identName == "__array_new__" {
+        if c.callArgs.length == 2 {
+          if exprIsF64(c.callArgs[1], fnIx) { return 1 }
+        }
+        return 0
+      }
+      if callee.identName == "__array_new_default__" { return 0 }
+    }
+  }
+  0 - 1
+}
+
+// True if the expression at `exprIx` contains an intrinsic allocator call
+// (`__array_new__` / `__array_new_default__`) anywhere.
+function exprHasArrNew(exprIx: i32): boolean {
+  if exprIx < 0 { return false }
+  let e = P.nodes[exprIx]
+  if e is Call {
+    let callee = P.nodes[e.callFn]
+    if callee is Ident {
+      if callee.identName == "__array_new__" { return true }
+      if callee.identName == "__array_new_default__" { return true }
+    }
+    if exprHasArrNew(e.callFn) { return true }
+    let args = e.callArgs
+    let i = 0
+    while i < args.length {
+      if exprHasArrNew(args[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if e is BinExpr {
+    if exprHasArrNew(e.binLeft) { return true }
+    return exprHasArrNew(e.binRight)
+  }
+  if e is Member { return exprHasArrNew(e.memObj) }
+  if e is Index {
+    if exprHasArrNew(e.idxArr) { return true }
+    return exprHasArrNew(e.idxIndex)
+  }
+  if e is Unary { return exprHasArrNew(e.unArg) }
+  if e is Paren { return exprHasArrNew(e.parInner) }
+  if e is IsExpr { return exprHasArrNew(e.isObj) }
+  if e is ObjLit {
+    let fields = e.objFields
+    let i = 0
+    while i < fields.length {
+      let f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if exprHasArrNew(f.fiValue) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  if e is ArrayLit {
+    let elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      if exprHasArrNew(elems[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+// True if any statement in the block at `blockIx` (descending into if/else arms
+// and loop bodies) contains an intrinsic allocator call.
+function blockHasArrNew(blockIx: i32): boolean {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    let stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        if exprHasArrNew(s.letInit) { return true }
+      } else if s is RetStmt {
+        if exprHasArrNew(s.retArg) { return true }
+      } else if s is BinExpr {
+        if exprHasArrNew(stmts[i]) { return true }
+      } else if s is Call {
+        if exprHasArrNew(stmts[i]) { return true }
+      } else if s is ObjLit {
+        if exprHasArrNew(stmts[i]) { return true }
+      } else if s is IfStmt {
+        if ifChainHasArrNew(stmts[i]) { return true }
+      } else if s is WhileStmt {
+        if exprHasArrNew(s.whileCond) { return true }
+        if blockHasArrNew(s.whileBody) { return true }
+      } else if s is ForIn {
+        if exprHasArrNew(s.fiIter) { return true }
+        if blockHasArrNew(s.fiBody) { return true }
+      } else if s is ForRange {
+        if exprHasArrNew(s.frFrom) { return true }
+        if exprHasArrNew(s.frTo) { return true }
+        if blockHasArrNew(s.frBody) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if any arm of the `if` / `else if` chain at `ifIx` contains an intrinsic
+// allocator call — condition, then-branch, `else` block, or a chained `else if`.
+function ifChainHasArrNew(ifIx: i32): boolean {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if exprHasArrNew(s.ifCond) { return true }
+    if blockHasArrNew(s.ifThen) { return true }
+    if s.ifElse >= 0 {
+      let els = P.nodes[s.ifElse]
+      if els is Block { return blockHasArrNew(s.ifElse) }
+      if els is IfStmt { return ifChainHasArrNew(s.ifElse) }
+    }
+  }
+  false
+}
+
+// True if the FuncDecl at `fnIx` allocates via an intrinsic allocator — so it
+// reserves the 1-slot arrNew scratch frame.
+function fnHasArrNew(fnIx: i32): boolean {
+  let fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    return blockHasArrNew(fn.fnBody)
   }
   false
 }
@@ -11328,6 +11487,120 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         fbCall(gMemLogIdx)
         return 0
       }
+      // The array-intrinsic floor (std-design D1 / collections-design §LS.2),
+      // lowered INLINE — host parity: toWasm.ts lowers the same names to single
+      // WasmGC instructions (array.new / array.new_default / array.copy /
+      // unreachable). `__trap__()` is the deliberate abort primitive.
+      if callee.identName == "__trap__" {
+        if c.callArgs.length != 0 {
+          return emitFail("emitProgram: __trap__ takes no arguments")
+        }
+        fbUnreachable()
+        return 0
+      }
+      // `__array_new__(n, fill)` → `array.new` (every slot set to `fill`);
+      // `__array_new_default__(n)` → `array.new_default` (slots zeroed). Both
+      // yield the `{backing, len: n, cap: n}` list wrapper — the runtime-length
+      // sibling of the array literal. The length is staged in the 1-slot arrNew
+      // scratch local (it feeds the allocation size and both wrapper fields).
+      // Native element coverage: the i32 list (i32/boolean) and, for
+      // `__array_new__`, the f64 list via an f64 fill; ref/string elements are
+      // emitter long tail — fail loudly, never emit wrong bytes.
+      if callee.identName == "__array_new__" || callee.identName == "__array_new_default__" {
+        let anIsNew = callee.identName == "__array_new__"
+        let anWant = 1
+        if anIsNew { anWant = 2 }
+        if c.callArgs.length != anWant {
+          return emitFail("emitProgram: " + callee.identName + " takes exactly " +
+            i32ToStr(anWant) + " argument(s)")
+        }
+        let anBack = aTypeIdx
+        let anWrap = lTypeIdx
+        if arrNewIntrKind(callIx, fnIx) == 1 {
+          if !fa64Used {
+            return emitFail("emitProgram: __array_new__ f64 fill but f64 list types not collected")
+          }
+          anBack = fa64TypeIdx
+          anWrap = fl64TypeIdx
+        } else {
+          if !aUsed || !lUsed {
+            return emitFail("emitProgram: array intrinsic but list types not collected")
+          }
+          if anIsNew {
+            let anFill = c.callArgs[1]
+            let anFillNode = P.nodes[anFill]
+            let anFillRef = false
+            if anFillNode is ObjLit { anFillRef = true }
+            if exprString(anFill, fnIx) { anFillRef = true }
+            if exprIsClosure(anFill, fnIx) { anFillRef = true }
+            if exprArray(anFill, fnIx) { anFillRef = true }
+            if exprRefArray(anFill, fnIx) { anFillRef = true }
+            if exprStringArray(anFill, fnIx) { anFillRef = true }
+            if exprMap(anFill, fnIx) { anFillRef = true }
+            if anFillRef {
+              return emitFail("emitProgram: __array_new__ supports i32/boolean/f64 fills natively")
+            }
+          }
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        fbLocalSet(arrNewScratchBase)
+        if anIsNew {
+          if emitExpr(body, c.callArgs[1], fnIx) < 0 { return 0 - 1 }
+          fbLocalGet(arrNewScratchBase)
+          fbArrayNew(anBack)
+        } else {
+          fbLocalGet(arrNewScratchBase)
+          fbArrayNewDefault(anBack)
+        }
+        fbLocalGet(arrNewScratchBase)
+        fbLocalGet(arrNewScratchBase)
+        fbStructNew(anWrap)
+        return 0
+      }
+      // `__array_copy__(dst, dstAt, src, srcAt, count)` → `array.copy` over the
+      // two lists' backings: bulk-move `count` elements from `src[srcAt..]` into
+      // `dst[dstAt..]` (memmove semantics; OOB spans trap — the instruction's
+      // own check). Operand order matches the instruction's stack shape, so no
+      // scratch is needed.
+      if callee.identName == "__array_copy__" {
+        if c.callArgs.length != 5 {
+          return emitFail("emitProgram: __array_copy__ takes exactly five arguments")
+        }
+        let acDstF64 = exprF64Array(c.callArgs[0], fnIx)
+        let acSrcF64 = exprF64Array(c.callArgs[2], fnIx)
+        if acDstF64 != acSrcF64 {
+          return emitFail("emitProgram: __array_copy__ dst and src must share one element type")
+        }
+        let acBack = aTypeIdx
+        let acWrap = lTypeIdx
+        if acDstF64 {
+          if !fa64Used {
+            return emitFail("emitProgram: __array_copy__ f64 lists but f64 list types not collected")
+          }
+          acBack = fa64TypeIdx
+          acWrap = fl64TypeIdx
+        } else {
+          if exprRefArray(c.callArgs[0], fnIx) || exprStringArray(c.callArgs[0], fnIx) ||
+            exprRefArray(c.callArgs[2], fnIx) || exprStringArray(c.callArgs[2], fnIx) {
+            return emitFail("emitProgram: __array_copy__ supports i32/boolean/f64 lists natively")
+          }
+          if !exprArray(c.callArgs[0], fnIx) || !exprArray(c.callArgs[2], fnIx) {
+            return emitFail("emitProgram: __array_copy__ expects list (T[]) operands")
+          }
+          if !aUsed || !lUsed {
+            return emitFail("emitProgram: array intrinsic but list types not collected")
+          }
+        }
+        if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
+        fbStructGet(acWrap, 0)
+        if emitExpr(body, c.callArgs[1], fnIx) < 0 { return 0 - 1 }
+        if emitExpr(body, c.callArgs[2], fnIx) < 0 { return 0 - 1 }
+        fbStructGet(acWrap, 0)
+        if emitExpr(body, c.callArgs[3], fnIx) < 0 { return 0 - 1 }
+        if emitExpr(body, c.callArgs[4], fnIx) < 0 { return 0 - 1 }
+        fbArrayCopy(acBack, acBack)
+        return 0
+      }
       let target = fnIndexOf(callee.identName)
       if target < 0 {
         // Not a known function name — a CLOSURE-VALUED callee (a let/param/global holding
@@ -13558,6 +13831,10 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32): i32 {
       // The void memory intrinsics leave nothing on the stack.
       if callee.identName == "__store_i32__" { dropIt = false }
       if callee.identName == "__log__" { dropIt = false }
+      // The void array intrinsics: `__array_copy__` leaves nothing; `__trap__`
+      // is `unreachable` (no value reaches the drop).
+      if callee.identName == "__array_copy__" { dropIt = false }
+      if callee.identName == "__trap__" { dropIt = false }
       if dropIt {
         let vt = fnIndexOf(callee.identName)
         if vt >= 0 {
@@ -14043,6 +14320,10 @@ function stmtIsTailValue(stmtIx: i32): boolean {
       // The void memory intrinsics are statements, never tail values.
       if callee.identName == "__store_i32__" { return false }
       if callee.identName == "__log__" { return false }
+      // The void array intrinsics likewise: `__array_copy__` yields nothing;
+      // `__trap__` diverges (no value).
+      if callee.identName == "__array_copy__" { return false }
+      if callee.identName == "__trap__" { return false }
       let target = fnIndexOf(callee.identName)
       if target >= 0 {
         return fRetVoid[target] == 0
@@ -14453,6 +14734,11 @@ function fbBeginFunc(nParams: i32, nLocals: i32): i32 {
   // existing layout is untouched.
   cloEqScratchBase = fbScratchCur
   if fnUsesCloEq { fbReserve(2) }
+  // Array-intrinsic frame (1 i32 slot — the staged runtime length `n` of an
+  // `__array_new__`/`__array_new_default__` allocation), appended after every
+  // existing frame so layouts without it are untouched.
+  arrNewScratchBase = fbScratchCur
+  if fnUsesArrNew { fbReserve(1) }
   fbScratchCur
 }
 
@@ -14515,6 +14801,7 @@ function fbLocalsCount(nLocals: i32): i32 {
   if fnUsesListEqS { n = n + 4 }
   n = n + fnListEqRSlots.length * 4
   if fnUsesCloEq { n = n + 2 }
+  if fnUsesArrNew { n = n + 1 }
   n
 }
 
@@ -14677,6 +14964,10 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32): i32 {
     fbRefRun(cloStructIdx)
     fbRefRun(cloStructIdx)
   }
+  // Array-intrinsic frame (1 i32 slot — the staged allocation length).
+  if fnUsesArrNew {
+    fbI32Run()
+  }
   wTarget(prev)
   0
 }
@@ -14725,6 +15016,7 @@ function emitFuncCode(out: i32[], fnIx: i32): i32 {
     fnUsesStrPush = fnHasStrPush(fnIx)
     fnUsesF64Push = fnHasF64Push(fnIx)
     fnUsesStrOp = fnHasStrOp(fnIx)
+    fnUsesArrNew = fnHasArrNew(fnIx)
     fnUsesMap = fnHasMap(fnIx)
     // `fnHasMap` only scans LOCALS/params; also reserve the frame when a map op runs
     // on a GLOBAL struct-field map-array element (e.g. `T.scopes[top][k] = v`).
@@ -16022,6 +16314,7 @@ function startScanBlock(blockIx: i32): i32 {
   if blockHasMemberPopKind(blockIx, 0 - 1, 2) { fnUsesStrPush = true }
   if blockHasMemberPopKind(blockIx, 0 - 1, 3) { fnUsesF64Push = true }
   if blockHasStrOp(blockIx, 0 - 1) { fnUsesStrOp = true }
+  if blockHasArrNew(blockIx) { fnUsesArrNew = true }
   if blockHasMapOp(blockIx, 0 - 1) { fnUsesMap = true }
   collectRefPushSlots(blockIx, 0 - 1)
   collectMemberPopRefSlots(blockIx, 0 - 1)
@@ -16034,6 +16327,7 @@ function startScanIf(ifIx: i32): i32 {
   let st = P.nodes[ifIx]
   if st is IfStmt {
     if exprHasStrOp(st.ifCond, 0 - 1) { fnUsesStrOp = true }
+    if exprHasArrNew(st.ifCond) { fnUsesArrNew = true }
     if exprHasMapOp(st.ifCond, 0 - 1) { fnUsesMap = true }
     if exprHasMemberPopKind(st.ifCond, 0 - 1, 0) { fnUsesPush = true }
     if exprHasMemberPopKind(st.ifCond, 0 - 1, 1) { fnUsesRefPush = true }
@@ -16065,6 +16359,7 @@ function startFnDetectScratch(): i32 {
   fnUsesStrPush = false
   fnUsesF64Push = false
   fnUsesStrOp = false
+  fnUsesArrNew = false
   fnUsesMap = false
   fnUsesCallRef = false
   fnRefPushSlots = []
@@ -16086,6 +16381,7 @@ function startFnDetectScratch(): i32 {
         if exprHasMemberPopKind(ix, 0 - 1, 2) { fnUsesStrPush = true }
         if exprHasMemberPopKind(ix, 0 - 1, 3) { fnUsesF64Push = true }
         if exprHasStrOp(ix, 0 - 1) { fnUsesStrOp = true }
+        if exprHasArrNew(ix) { fnUsesArrNew = true }
         if exprHasMapOp(ix, 0 - 1) { fnUsesMap = true }
         if fnValUsed { if blockHasCallRef(ix, 0 - 1) { fnUsesCallRef = true } }
         collectMemberPopRefSlotsExpr(ix, 0 - 1)
@@ -16115,6 +16411,7 @@ function startFnDetectScratch(): i32 {
     } else if st is ForIn {
       startScanBlock(st.fiBody)
       if exprHasStrOp(st.fiIter, 0 - 1) { fnUsesStrOp = true }
+      if exprHasArrNew(st.fiIter) { fnUsesArrNew = true }
       if exprHasMapOp(st.fiIter, 0 - 1) { fnUsesMap = true }
     } else if st is WhileStmt {
       startScanBlock(st.whileBody)
@@ -16132,6 +16429,7 @@ function startFnDetectScratch(): i32 {
       if exprHasMemberPopKind(startStmts[si], 0 - 1, 2) { fnUsesStrPush = true }
       if exprHasMemberPopKind(startStmts[si], 0 - 1, 3) { fnUsesF64Push = true }
       if exprHasStrOp(startStmts[si], 0 - 1) { fnUsesStrOp = true }
+      if exprHasArrNew(startStmts[si]) { fnUsesArrNew = true }
       if exprHasMapOp(startStmts[si], 0 - 1) { fnUsesMap = true }
       if fnValUsed { if blockHasCallRef(startStmts[si], 0 - 1) { fnUsesCallRef = true } }
       if stmtIsPushKind(startStmts[si], 0 - 1, 1) { recordStartRefPushSlot(startStmts[si]) }
@@ -17731,6 +18029,17 @@ function collectA(stmts: i32[]): i32 {
           mUsed = true
           lUsed = true
           aUsed = true
+        }
+        // The array-intrinsic allocators (std-design D1) construct a list even
+        // with no literal/annotation in sight: an f64 FILL forces the f64
+        // array+wrapper pair, anything else the i32 list (wrapper + backing).
+        if cf.identName == "__array_new__" || cf.identName == "__array_new_default__" {
+          if arrNewIntrKind(i, 0 - 1) == 1 {
+            fa64Used = true
+          } else {
+            lUsed = true
+            aUsed = true
+          }
         }
       }
       // A `<recv>.push("…")` (string-LITERAL argument) appends to a STRING list:
@@ -20268,7 +20577,12 @@ function exprArray(exprIx: i32, fnIx: i32): boolean {
   if e is Paren { return exprArray(e.parInner, fnIx) }
   if e is Call {
     let callee = P.nodes[e.callFn]
-    if callee is Ident { return fnRetArray(callee.identName) }
+    if callee is Ident {
+      // The intrinsic allocators yield an i32 list unless the fill is f64
+      // (`arrNewIntrKind` 1 — then `exprF64Array` claims the call).
+      if arrNewIntrKind(exprIx, fnIx) == 0 { return true }
+      return fnRetArray(callee.identName)
+    }
     // `xs.map(f)` / `xs.filter(p)` yield a NEW list — the i32 list exactly when the
     // result ELEMENT kind is i32/boolean (map: the callback's return kind; filter:
     // the receiver's element kind).
@@ -20791,6 +21105,8 @@ function exprF64Array(exprIx: i32, fnIx: i32): boolean {
   // A `.map`/`.filter` whose result ELEMENT kind is f64 yields an f64 list (an f64
   // receiver's filter, or a map whose callback returns f64). (Slices 3–4.)
   if e is Call {
+    // `__array_new__(n, <f64 fill>)` yields an f64 list.
+    if arrNewIntrKind(exprIx, fnIx) == 1 { return true }
     if callIsMapFilter(exprIx, fnIx) { return mfResultKindOf(exprIx, fnIx) == 1 }
     return false
   }
