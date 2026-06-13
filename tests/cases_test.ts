@@ -386,6 +386,15 @@ const caseName = (c: Case): string =>
   (c.kind === "single" ? c.url.href : c.dir.href).slice(CASES_DIR.href.length);
 cases.sort((a, b) => caseName(a).localeCompare(caseName(b)));
 
+// Cases that use a NATIVE-ONLY capability the frozen TS host emitter cannot
+// lower — adjudicated solely by the wasm oracle (`cases_wasm_test.ts`). The TS
+// compiler is feature-frozen (ROADMAP "Kill the TS host"); never grow a twin of
+// a native feature to satisfy it. Keyed by case name (the path under cases/).
+const TS_HOST_INCOMPATIBLE: Record<string, string> = {
+  "modules/std-fmt/":
+    "the TS host emitter cannot pass a union-narrowed i64 as an i64 argument (`std:fmt`'s `toStr`); native lowers it — cases_wasm_test owns this case",
+};
+
 for (const c of cases) {
   const name = caseName(c);
   // Directives always come from the case's primary file: the lone `.vl` for a
@@ -396,7 +405,7 @@ for (const c of cases) {
 
   Deno.test({
     name,
-    ignore: d.skip != null,
+    ignore: d.skip != null || name in TS_HOST_INCOMPATIBLE,
     fn: async () => {
       const result = await quiet(() => {
         if (c.kind === "single") return compile(src, name);
