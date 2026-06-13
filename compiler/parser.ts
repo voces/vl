@@ -306,6 +306,10 @@ export const parseProgram = (
     if (!map) return;
     for (const binding of map.values()) {
       if (binding.kind !== "variable" || !binding.type) continue;
+      // An imported binding's type arrived fully formed from the exporting
+      // module; a hole inside it is the exporter's generic type PARAMETER
+      // (instantiated per call site), not a local inference failure.
+      if (binding.isImport) continue;
       reportUninferredBinding(binding.name, binding.type, binding.decl);
     }
   };

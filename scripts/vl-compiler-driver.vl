@@ -55,6 +55,11 @@ let modDiags: string[] = []
 let modRenameFrom: string[] = []
 let modRenameTo: string[] = []
 let modShadow: string[] = []
+// Generic type-parameter names live inside the rewrite of their declaration
+// (`T` while inside `id<T>`'s annotations/body or `Box<T>`'s definition): a
+// segment matching one must NOT rewrite through the rename map — it names the
+// parameter, not a top-level binding.
+let modTyShadow: string[] = []
 
 function vcLoadToks(src: string): i32 {
   let r = tokenize(src)
@@ -651,6 +656,7 @@ function modCompile(emit: i32): i32 {
   while o2 < modOrder.length {
     modBuildRename(modOrder[o2], roots[o2])
     modShadow = []
+    modTyShadow = []
     modRwStmt(roots[o2])
     o2 = o2 + 1
   }
@@ -683,16 +689,52 @@ function modCompile(emit: i32): i32 {
 // ── per-module rename map (state at the top of this file) ─────────────────────
 // `modRenameFrom[i]` → `modRenameTo[i]`: every top-level value/type name of the
 // module maps to `name$mN` (N = the module's TABLE index — entry 0); an imported
-// local maps to the EXPORTING module's mangled export name. Generic declarations
-// (a `<` in the name) are skipped — exporting generics is out of phase-1 scope;
-// the type-annotation SEGMENT rewrite still renames plain applications.
-function modStrHasLt(name: string): boolean {
+// local maps to the EXPORTING module's mangled export name. A generic TYPE
+// declaration (`Box<T>` — the parser folds alias parameters into the declared
+// name) renames by its BASE segment, so the declaration (→ `Box$mN<T>`) and
+// every application (`Box<i32>` → `Box$mN<i32>`) rewrite consistently through
+// the segment rewriter. Generic FUNCTIONS carry their parameters out-of-name
+// (`fnTyParams`) and rename like any value.
+// The base segment of a declared name (`Box` of `Box<T>`); a non-generic name
+// is its own base.
+function modGenBase(name: string): string {
   let i = 0
   while i < name.length {
-    if name[i] == '<' { return true }
+    if name[i] == '<' {
+      return name.slice(0, i)
+    }
     i = i + 1
   }
-  false
+  name
+}
+// The type-parameter names folded into a generic declared name (`Pair<A,B>` →
+// A, B); empty for a non-generic name. Declaration-position parameters are
+// plain identifiers, so ident runs after the `<` are exactly the names.
+function modGenParams(name: string): string[] {
+  let out: string[] = []
+  let run: i32[] = []
+  let started = false
+  let i = 0
+  while i < name.length {
+    let c = name[i]
+    if started {
+      let isIdent = false
+      if c >= 'a' && c <= 'z' { isIdent = true }
+      if c >= 'A' && c <= 'Z' { isIdent = true }
+      if c >= '0' && c <= '9' { isIdent = true }
+      if c == '_' { isIdent = true }
+      if isIdent {
+        run.push(c)
+      } else if run.length > 0 {
+        out.push(fromCodePoints(run))
+        run = []
+      }
+    } else if c == '<' {
+      started = true
+    }
+    i = i + 1
+  }
+  out
 }
 function modBuildRename(m: i32, root: i32): i32 {
   modRenameFrom = []
@@ -718,9 +760,10 @@ function modBuildRename(m: i32, root: i32): i32 {
       if st is TypeDecl { nm = st.tdName }
       if st is UnionDecl { nm = st.udName }
       if nm != "" {
-        if !capHas(impLocals, nm) && !modStrHasLt(nm) {
-          modRenameFrom.push(nm)
-          modRenameTo.push(nm + suffix)
+        let base = modGenBase(nm)
+        if !capHas(impLocals, base) {
+          modRenameFrom.push(base)
+          modRenameTo.push(base + suffix)
         }
       }
       si = si + 1
@@ -775,10 +818,14 @@ function modTypeRenamed(tn: string): string {
         let seg = fromCodePoints(run)
         run = []
         let rep = seg
-        let j = 0
-        while j < modRenameFrom.length {
-          if modRenameFrom[j] == seg { rep = modRenameTo[j] }
-          j = j + 1
+        // A live generic type-parameter name is the PARAMETER here, never the
+        // top-level binding it may textually collide with.
+        if !capHas(modTyShadow, seg) {
+          let j = 0
+          while j < modRenameFrom.length {
+            if modRenameFrom[j] == seg { rep = modRenameTo[j] }
+            j = j + 1
+          }
         }
         let k = 0
         while k < rep.length {
@@ -824,16 +871,19 @@ function modRwType(tyIx: i32): i32 {
   }
   0
 }
-// Truncate the shadow stack back to `saved` entries (rebuild — a bare `.pop()`
+// The first `saved` entries of a shadow stack (rebuild — a bare `.pop()`
 // STATEMENT is an emit gap in the native pipeline).
-function modShadowTrim(saved: i32): i32 {
+function modTrimTo(stack: string[], saved: i32): string[] {
   let keep: string[] = []
   let ki = 0
   while ki < saved {
-    keep.push(modShadow[ki])
+    keep.push(stack[ki])
     ki = ki + 1
   }
-  modShadow = keep
+  keep
+}
+function modShadowTrim(saved: i32): i32 {
+  modShadow = modTrimTo(modShadow, saved)
   0
 }
 function modRwFunc(ix: i32): i32 {
@@ -841,6 +891,14 @@ function modRwFunc(ix: i32): i32 {
   if n is FuncDecl {
     n.fnName = modRenamed(n.fnName)
     let saved = modShadow.length
+    let tySaved = modTyShadow.length
+    // The function's generic type parameters are live across its annotations
+    // and body — segments naming them must not rewrite (see `modTyShadow`).
+    let ti = 0
+    while ti < n.fnTyParams.length {
+      modTyShadow.push(n.fnTyParams[ti])
+      ti = ti + 1
+    }
     let pi = 0
     while pi < n.fnParams.length {
       let p = P.nodes[n.fnParams[pi]]
@@ -853,6 +911,7 @@ function modRwFunc(ix: i32): i32 {
     modRwType(n.fnRet)
     modRwStmt(n.fnBody)
     modShadowTrim(saved)
+    modTyShadow = modTrimTo(modTyShadow, tySaved)
   }
   0
 }
@@ -938,6 +997,15 @@ function modRwStmt(ix: i32): i32 {
   if n is BreakStmt { return 0 }
   if n is ContinueStmt { return 0 }
   if n is TypeDecl {
+    // A generic alias's parameters (folded into the declared name) are live
+    // across the name and the field annotations.
+    let tdTySaved = modTyShadow.length
+    let tdPs = modGenParams(n.tdName)
+    let tdPi = 0
+    while tdPi < tdPs.length {
+      modTyShadow.push(tdPs[tdPi])
+      tdPi = tdPi + 1
+    }
     n.tdName = modTypeRenamed(n.tdName)
     let i = 0
     while i < n.tdFields.length {
@@ -945,9 +1013,17 @@ function modRwStmt(ix: i32): i32 {
       if f is FieldDef { modRwType(f.fdType) }
       i = i + 1
     }
+    modTyShadow = modTrimTo(modTyShadow, tdTySaved)
     return 0
   }
   if n is UnionDecl {
+    let udTySaved = modTyShadow.length
+    let udPs = modGenParams(n.udName)
+    let udPi = 0
+    while udPi < udPs.length {
+      modTyShadow.push(udPs[udPi])
+      udPi = udPi + 1
+    }
     n.udName = modTypeRenamed(n.udName)
     let vs: string[] = []
     let i = 0
@@ -956,6 +1032,7 @@ function modRwStmt(ix: i32): i32 {
       i = i + 1
     }
     n.udVariants = vs
+    modTyShadow = modTrimTo(modTyShadow, udTySaved)
     return 0
   }
   modRwExpr(ix)
