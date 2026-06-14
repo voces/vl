@@ -26,14 +26,13 @@ else on your machine or network is in reach.
 
 Files:
 - [`devcontainer.json`](./devcontainer.json) — container definition (caps, mounts, the firewall hook).
-- [`Dockerfile`](./Dockerfile) — the image (toolchains installed at build time, where network is unrestricted).
+- [`Dockerfile`](./Dockerfile) — the image and its toolchains.
 - [`init-firewall.sh`](./init-firewall.sh) — the egress allowlist, raised on every container start.
 
 ## Prerequisites
 
-1. **Docker Desktop running** (`docker info` must succeed). On this machine it's
-   at `/Applications/Docker.app` — `open -a Docker` and wait ~20s.
-2. **VSCode "Dev Containers" extension** (`ms-vscode-remote.remote-containers`) — already installed.
+1. **Docker running** (`docker info` must succeed).
+2. The VSCode **Dev Containers** extension (`ms-vscode-remote.remote-containers`).
 
 ## Open it
 
@@ -75,34 +74,45 @@ claude            # then complete the login flow
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-## Bypass mode (no approval prompts)
+## GitHub auth (gh)
 
-Two surfaces, two ways to skip prompts — both already wired for this sandbox:
+GitHub credentials live **inside the container**, not passed from the host.
+`~/.config/gh` is a named volume, so you authenticate once and it persists across
+rebuilds. Run:
 
-**The VSCode extension** does *not* bypass automatically; by default it prompts,
-and merely choosing "bypassPermissions" is silently downgraded to "default"
-unless a separate gate is open. So `devcontainer.json` sets **both** required
-settings (container-scoped — they never touch your host config):
-
-```jsonc
-"claudeCode.allowDangerouslySkipPermissions": true,   // the gate
-"claudeCode.initialPermissionMode": "bypassPermissions" // start each convo bypassed
+```sh
+gh auth login --insecure-storage   # device flow via github.com (already allowlisted)
+gh auth setup-git                  # optional: lets `git push` use the gh credential
 ```
 
-With those, every new conversation in the extension starts in bypass mode.
+`--insecure-storage` keeps the token in the volume-backed `~/.config/gh/` (the
+container has no system keyring to use instead). Once logged in, `gh`,
+`scripts/fetch-seed.sh`, and authenticated git all work. If a tool needs the
+token in an env var, export it on demand:
 
-**The CLI** (integrated terminal) is independent of the extension settings above
-— run it with the flag:
+```sh
+export GH_TOKEN="$(gh auth token)"
+```
+
+## Bypass mode (no approval prompts)
+
+**The VSCode extension** is pre-configured to start every conversation in bypass
+mode. Two settings in `devcontainer.json` do this — the first unlocks bypass, the
+second selects it (both are required):
+
+```jsonc
+"claudeCode.allowDangerouslySkipPermissions": true,
+"claudeCode.initialPermissionMode": "bypassPermissions"
+```
+
+**The CLI** (integrated terminal) is separate — run it with the flag:
 
 ```sh
 claude --dangerously-skip-permissions
 ```
 
-In both cases the egress allowlist ([`init-firewall.sh`](./init-firewall.sh)) is
-the compensating control: bypass is "recommended only for sandboxes with no
-internet access," and this sandbox's internet is restricted to the allowlist.
-Claude Code also refuses bypass when running as **root** — this container runs as
-the non-root `node` user, so that's satisfied.
+Either way, the egress allowlist — not the per-action prompts — is the security
+boundary, which is what makes skipping prompts safe in here.
 
 ## The firewall
 
@@ -123,12 +133,9 @@ are what let it program iptables; without them the sandbox guarantee doesn't hol
 
 ### Allow another host
 
-Add it to the `ALLOWED_DOMAINS` array in [`init-firewall.sh`](./init-firewall.sh),
-then re-raise the firewall without restarting:
-
-```sh
-sudo /usr/local/bin/init-firewall.sh
-```
+Add it to the `ALLOWED_DOMAINS` array in [`init-firewall.sh`](./init-firewall.sh)
+and **Rebuild Container** — the script is baked into the image at build time, so a
+source edit only takes effect after a rebuild.
 
 ### Verify it's active
 
@@ -139,22 +146,11 @@ curl -s -o /dev/null -w '%{http_code}\n' --connect-timeout 5 https://github.com 
 
 ## Troubleshooting
 
-- **VSCode can't install extensions / the VSCode Server fails to download** →
-  the Marketplace + server CDNs must be allowlisted; they already are
-  (`marketplace.visualstudio.com`, `update.code.visualstudio.com`,
-  `vscode.download.prss.microsoft.com`, `main.vscode-cdn.net`, and
-  `market-prod-cdn.trafficmanager.net` — the shared Akamai CDN behind every
-  `*.gallerycdn.vsassets.io` VSIX asset, so any publisher's extension is covered).
-  If you changed `init-firewall.sh`, the script is baked into the image, so
-  **Rebuild Container** (Command Palette) for the new allowlist to take effect —
-  re-running the old in-container firewall won't pick up edits.
-- **A download fails / hangs** → its host isn't allowlisted. Find the domain and
-  add it (see above). Watch for CDN-fronted hosts that resolve to rotating IPs;
-  if a host connects in one session but not another, that's CDN IP rotation — the
-  resolver does 3 passes per domain to widen coverage, and re-running the firewall
-  (`sudo /usr/local/bin/init-firewall.sh`) re-resolves.
+- **A download fails** → its host isn't allowlisted; add it (see *Allow another
+  host*). CDN-fronted hosts that rotate IPs can fail intermittently — re-run
+  `sudo /usr/local/bin/init-firewall.sh` to re-resolve.
 - **`init-firewall.sh` aborts at start** → `api.anthropic.com` was unreachable, or
-  the caps are missing. Confirm Docker Desktop grants `NET_ADMIN`/`NET_RAW`.
+  the `NET_ADMIN`/`NET_RAW` capabilities aren't granted.
 - **Reset Claude's auth/config** → delete the volume:
   `docker volume rm vl-claude-config-<id>` (find it with `docker volume ls`).
 - **Rebuild from scratch** → Command Palette → *Dev Containers: Rebuild Container*.
