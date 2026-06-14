@@ -1048,12 +1048,33 @@ connection.onDocumentFormatting((params): TextEdit[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const text = doc.getText();
-  let formatted: string;
-  try {
-    formatted = format(text);
-  } catch {
-    return [];
+  // The TS `format()` — the fallback, and the authoritative path in `"both"`.
+  const tsFormat = (): string | undefined => {
+    try {
+      return format(text);
+    } catch {
+      return undefined;
+    }
+  };
+  let formatted: string | undefined;
+  if (checkerMode === "wasm" && wasmChecker?.formatSrc !== undefined) {
+    // Self-hosted formatter; fall back to TS on a parse error / missing export.
+    formatted = wasmChecker.formatSrc(text) ?? tsFormat();
+  } else if (checkerMode === "both" && wasmChecker?.formatSrc !== undefined) {
+    // TS publishes; run the wasm formatter too and LOG any divergence — the
+    // parity instrument the TS-host teardown gates on (mirrors the diagnostics/
+    // hover/token "both" instruments).
+    formatted = tsFormat();
+    const wasmFormatted = wasmChecker.formatSrc(text);
+    if (wasmFormatted !== undefined && wasmFormatted !== formatted) {
+      connection.console.log(
+        `[wasm-checker] format divergence on ${params.textDocument.uri}`,
+      );
+    }
+  } else {
+    formatted = tsFormat();
   }
+  if (formatted === undefined) return [];
   if (formatted === text) return [];
   const fullRange: Range = {
     start: { line: 0, character: 0 },

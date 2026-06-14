@@ -330,3 +330,47 @@ Deno.test("wasm-parity diff: a missing error reports both lists", () => {
     throw new Error(`bad divergence report: ${d}`);
   }
 });
+
+// ── formatting (kill-TS step 1: the `format.ts` consumer) ────────────────────
+// `formatSrc` drives the self-hosted formatter (`format.vl`) through the seed.
+// Full-corpus equivalence with the host is proven by
+// `tests/selfhost_format_corpus_test.ts`; here we assert the wasm path reflows to
+// a canonical, idempotent form, agrees with the host on already-canonical source,
+// and degrades to undefined (TS fallback) on a parse error.
+
+import { format } from "../compiler/format.ts";
+
+Deno.test({ name: "wasm-checker: formatSrc reflows messy source to a canonical, idempotent form", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const messy = "let   x=1\nfunction f(a: i32, b: i32): i32 {\nreturn a+b\n}\n";
+  const got = checker.formatSrc(messy);
+  if (got === undefined) throw new Error("formatSrc returned undefined on valid source");
+  if (!got.includes("let x = 1")) throw new Error(`not reflowed: ${JSON.stringify(got)}`);
+  if (!got.includes("  return a + b")) throw new Error(`not reflowed: ${JSON.stringify(got)}`);
+  // Idempotent: formatting the output again is a no-op.
+  if (checker.formatSrc(got) !== got) throw new Error("formatSrc not idempotent");
+});
+
+Deno.test({ name: "wasm-checker: formatSrc matches the host on canonical source (incl. params)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // Feeding the HOST's canonical output back through the wasm formatter must be a
+  // no-op — the two agree on the canonical form (params included). (format.vl
+  // canonicalizes non-canonical param-colon spacing `a:i32`→`a: i32`, an
+  // intentional improvement over the host.)
+  const canonical = format(
+    "function f(a: i32, b: i32): i32 {\n  return a + b\n}\nprint(f(1, 2))\n",
+  );
+  const got = checker.formatSrc(canonical);
+  if (got !== canonical) {
+    throw new Error(`expected stable, got ${JSON.stringify(got)} for ${JSON.stringify(canonical)}`);
+  }
+});
+
+Deno.test({ name: "wasm-checker: formatSrc returns undefined on a parse error (TS fallback)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // An unterminated function body — the driver's formatSrc signals -1.
+  const got = checker.formatSrc("function f( {\n");
+  if (got !== undefined) {
+    throw new Error(`expected undefined on parse error, got ${JSON.stringify(got)}`);
+  }
+});

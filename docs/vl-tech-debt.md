@@ -36,7 +36,8 @@ Organized by area. Triage freely.
   `add: function(a, b) { … }`; (b) `format.vl` does not collapse short `else if`
   chains onto one line the way the host can. Neither breaks a guarantee; both would
   need addressing for byte-for-byte parity if that ever becomes a requirement.
-  Tracked so they aren't mistaken for done.
+  Tracked so they aren't mistaken for done. (Param-colon spacing `a:i32`→`a: i32`
+  is intentional canonicalization, not debt — it's an improvement over the host.)
 - **Self-host test glue duplicates the lexer rename.** Multiple `selfhost_*_test.ts`
   files independently `sed`/`.replace()` the lexer's `Tok`/`Diag`/`advance` names to
   de-collide when concatenating modules (no module system in the test driver path).
