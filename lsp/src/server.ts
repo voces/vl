@@ -42,6 +42,7 @@ import {
   importedNameSource,
   importedNameSources,
   makeWorkspaceReader,
+  pathToUri,
   type UnusedExportUseMap,
   unusedExportHints,
   uriToPath,
@@ -66,6 +67,7 @@ import {
   loadWasmChecker,
   type TsIdentToken,
   type WasmChecker,
+  type WasmImportedSource,
   type WasmMemberToken,
   type WasmRange,
   type WasmToken,
@@ -234,6 +236,47 @@ let workspaceFolder: string | null;
 // universal fallback — we degrade to it whenever the wasm seed cannot load.
 let checkerMode: "ts" | "wasm" | "both" = "wasm";
 let wasmChecker: WasmChecker | undefined;
+
+// Shape a native `WasmImportedSource` (1-based line, 0-based col, exported-name
+// length) onto the host's `CrossFileSource` (0-based LSP range + `file://` URI),
+// the form go-to-definition and the doc-xref resolver consume.
+const toCrossFileSource = (s: WasmImportedSource): CrossFileSource => {
+  const line = s.line > 0 ? s.line - 1 : 0;
+  return {
+    key: s.key,
+    uri: pathToUri(s.key),
+    range: {
+      start: { line, character: s.col },
+      end: { line, character: s.col + s.length },
+    },
+  };
+};
+
+// Cross-file imported sources for the document at `uri`, off the wasm checker
+// when `"wasm"` mode wants it and the seed exports the import/export pass —
+// otherwise undefined so the caller falls back to the TS `importedNameSources`.
+// A throw (or a wasm result that's empty, i.e. nothing resolved natively) also
+// returns undefined, so the TS path serves the file unchanged. Mirrors how the
+// other wasm features fall back to TS.
+const wasmImportedSources = async (
+  uri: string,
+  text: string,
+): Promise<Record<string, CrossFileSource> | undefined> => {
+  if (checkerMode !== "wasm" || wasmChecker?.importedNameSources === undefined) {
+    return undefined;
+  }
+  const native = await wasmChecker
+    .importedNameSources(text, entryKeyOf(uri), workspaceReader)
+    .catch((err) => {
+      connection.console.log(`[wasm-symbols] importedNameSources failed: ${err}`);
+      return {} as Record<string, WasmImportedSource>;
+    });
+  const locals = Object.keys(native);
+  if (locals.length === 0) return undefined; // nothing resolved — fall back to TS
+  const out: Record<string, CrossFileSource> = {};
+  for (const local of locals) out[local] = toCrossFileSource(native[local]);
+  return out;
+};
 
 const severityMap: Record<VLSeverity, DiagnosticSeverity> = {
   error: DiagnosticSeverity.Error,
@@ -473,7 +516,10 @@ connection.onDefinition(async (params): Promise<Location | null> => {
     });
     const word = wordAt(lineText, params.position.character);
     if (word) {
-      const source = await importedNameSource(
+      // Prefer the wasm import/export pass when `"wasm"` mode wants it; fall back
+      // to the TS resolver when the seed predates the exports or nothing resolved.
+      const wasmSources = await wasmImportedSources(params.textDocument.uri, text);
+      const source = wasmSources?.[word] ?? await importedNameSource(
         word,
         text,
         entryKeyOf(params.textDocument.uri),
@@ -733,11 +779,14 @@ connection.onHover(async (params): Promise<Hover | null> => {
   // used by `docMarkdown` to rewrite `` [`Name`] `` / `[Name]` spans in `///`
   // doc-comments into clickable links to the named symbol's definition.
   // H0 phase 3: imported names link cross-file to their exporting sibling.
-  const importedSources = await importedNameSources(
-    document.getText(),
-    entryKeyOf(params.textDocument.uri),
-    workspaceReader,
-  );
+  // Prefer the wasm import/export pass in `"wasm"` mode; fall back to TS.
+  const importedSources =
+    await wasmImportedSources(params.textDocument.uri, document.getText()) ??
+      await importedNameSources(
+        document.getText(),
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+      );
   const docResolver = buildDocRefResolver(
     symbols,
     params.textDocument.uri,
@@ -1048,11 +1097,14 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   // D7: build the doc-comment resolver once for all completion items in this
   // request — identifier completions carry `///` docs that may contain xrefs.
   // H0 phase 3: imported names link cross-file to their exporting sibling.
-  const importedSources = await importedNameSources(
-    text,
-    entryKeyOf(params.textDocument.uri),
-    workspaceReader,
-  );
+  // Prefer the wasm import/export pass in `"wasm"` mode; fall back to TS.
+  const importedSources =
+    await wasmImportedSources(params.textDocument.uri, text) ??
+      await importedNameSources(
+        text,
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+      );
   const docResolver = buildDocRefResolver(
     symbols,
     params.textDocument.uri,

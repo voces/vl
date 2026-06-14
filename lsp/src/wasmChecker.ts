@@ -77,6 +77,22 @@ export type WasmScopeBinding = {
   type: string; // rendered type, "" when none
 };
 
+/**
+ * One resolved cross-file imported source, from the wasm import/export pass — the
+ * native counterpart of the host's `importedNameSources`. Keyed (in the returned
+ * record) by the LOCAL binding name; `key` is the exporting sibling module's
+ * resolved KEY, `line`/`col` the export decl-name token (1-based line, 0-based
+ * col — the native convention), `length` the exported name's length so the host
+ * can shape the decl-name end column. The host maps these onto its
+ * `CrossFileSource` (0-based LSP range + `file://` URI).
+ */
+export type WasmImportedSource = {
+  key: string;
+  line: number; // 1-based native line
+  col: number; // 0-based column
+  length: number; // exported name length (for the range end)
+};
+
 export type WasmChecker = {
   /** Diagnostics for `source` as the entry module at `entryKey`. */
   check: (
@@ -171,6 +187,21 @@ export type WasmChecker = {
     line: number,
     character: number,
   ) => Promise<WasmScopeBinding[]>;
+  /**
+   * Cross-file imported sources (kill-TS step 3-C): for each LOCAL imported name
+   * in `source` (as the entry module at `entryKey`), the exporting sibling
+   * module's decl-name location — the native counterpart of the host's
+   * `importedNameSources`. Powers cross-file go-to-definition and doc-xref links
+   * off the self-hosted checker. Names whose import is unresolvable (bad
+   * specifier, missing module, not-exported) or that resolve to the entry itself
+   * are omitted; a bare `import "x"` is skipped. Empty when the seed predates the
+   * import/export exports — the host then falls back to its TS path.
+   */
+  importedNameSources: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ) => Promise<Record<string, WasmImportedSource>>;
   /**
    * Whole-document formatting (kill-TS step 1, the `format.ts` consumer): the
    * canonical reprint of `source` via the self-hosted formatter (`format.vl`'s
@@ -502,6 +533,72 @@ export const loadWasmChecker = (
     return out;
   };
 
+  // The import/export tables ride the same Stage-2+ seed as the symbol exports;
+  // an older seed lacks them, so the method yields {} (the host falls back to its
+  // TS `importedNameSources`).
+  const hasCrossFile = (exp: Exports): boolean =>
+    typeof exp.impCount === "function" &&
+    typeof exp.expCount === "function" &&
+    typeof exp.modKeyCount === "function" &&
+    typeof exp.expDeclLineAt === "function";
+
+  const importedNameSources = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<Record<string, WasmImportedSource>> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp) || !hasCrossFile(exp)) return {};
+    // `prepare` commits the entry (table index 0) plus its transitive deps, so
+    // the import/export tables below cover every committed module.
+    await prepare(exp, source, entryKey, read);
+
+    // Module KEY by table index — the bridge between an import's resolved key and
+    // the export entry's owning module.
+    const modCount = exp.modKeyCount();
+    const keyOf = new Array<string>(modCount);
+    for (let m = 0; m < modCount; m++) {
+      keyOf[m] = readString(exp.modKeyAtLen(m), (j) => exp.modKeyAtCharAt(m, j));
+    }
+
+    // Index every export by `${moduleKey} ${exportName}` so an import resolves in
+    // one lookup. Native line is 1-based, col 0-based.
+    const exportsByKey = new Map<string, { line: number; col: number }>();
+    const expCount = exp.expCount();
+    for (let i = 0; i < expCount; i++) {
+      const mod = exp.expModAt(i);
+      const modKey = mod >= 0 && mod < modCount ? keyOf[mod] : "";
+      if (modKey === "") continue;
+      const name = readString(exp.expNameLen(i), (j) => exp.expNameCharAt(i, j));
+      if (name.length === 0) continue;
+      exportsByKey.set(`${modKey} ${name}`, {
+        line: exp.expDeclLineAt(i),
+        col: exp.expDeclColAt(i),
+      });
+    }
+
+    const out: Record<string, WasmImportedSource> = {};
+    const impCount = exp.impCount();
+    for (let i = 0; i < impCount; i++) {
+      // Only the entry module's own imports (table index 0); a transitive dep's
+      // imports are not the current file's.
+      if (exp.impModAt(i) !== 0) continue;
+      const key = readString(exp.impKeyLen(i), (j) => exp.impKeyCharAt(i, j));
+      if (key === "" || key === entryKey) continue; // unresolved or self
+      const name = readString(exp.impNameLen(i), (j) => exp.impNameCharAt(i, j));
+      if (name.length === 0) continue; // bare `import "x"` — no name to resolve
+      const decl = exportsByKey.get(`${key} ${name}`);
+      if (decl === undefined) continue; // not exported by the resolved module
+      const local = readString(
+        exp.impLocalLen(i),
+        (j) => exp.impLocalCharAt(i, j),
+      );
+      if (local.length === 0) continue; // defensive: an import always binds a name
+      out[local] = { key, line: decl.line, col: decl.col, length: name.length };
+    }
+    return out;
+  };
+
   const check = async (
     source: string,
     entryKey: string,
@@ -630,6 +727,7 @@ export const loadWasmChecker = (
     tokensAt,
     memberTokensAt,
     scopeAt,
+    importedNameSources,
     formatSrc,
     lint,
   };
