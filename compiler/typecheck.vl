@@ -1855,6 +1855,44 @@ function symMem(ix: i32, ty: i32): i32 {
   ty
 }
 
+// The `symMemTy` sentinel for a method-CALL callee whose member name is recorded
+// for semantic tokens but whose type is not (method hover is not served
+// natively). Distinct from `-1` (unresolved) so `symMemberIsMethod` can tell a
+// recorded method apart while `symMemTypeStrAt` still treats it as un-typed.
+let SYM_MEM_METHOD: i32 = -2
+
+// Record a method-CALL callee member name (`xs.push`, `m.set`, `s.slice`) for
+// semantic tokens. A method call's callee never flows through the member-read
+// arm (the builtin arms type and return it directly), so `symMem` never sees it;
+// this records its property-name span, classified as a `method`. A later `symMem`
+// for the same node (a struct field holding a function, resolved via the call's
+// fall-through) overwrites the type so member hover still works for that case.
+function symMemMethod(ix: i32): i32 {
+  if symEnabled == 0 { return ix }
+  if ix < 0 || ix >= nodeToks.length { return ix }
+  let tk = nodeToks[ix]
+  if tk < 0 || tk >= P.toks.length { return ix }
+  let t = P.toks[tk]
+  let pl = 0
+  let nd = P.nodes[ix]
+  if nd is Member {
+    pl = nd.memProp.length
+  } else if nd is OptMember {
+    pl = nd.omProp.length
+  }
+  let i = 0
+  while i < symMemNode.length {
+    if symMemNode[i] == ix { return ix }
+    i = i + 1
+  }
+  symMemNode.push(ix)
+  symMemTy.push(SYM_MEM_METHOD)
+  symMemLine.push(t.line)
+  symMemCol.push(t.col)
+  symMemEndCol.push(t.col + pl)
+  ix
+}
+
 // The rendered TYPE STRING of the member access whose PROPERTY NAME covers
 // (line, col) — member hover (`o.x` / `o?.y`). The narrowest covering span wins
 // (defensive against any overlap). "" when the cursor is off any recorded member.
@@ -1876,6 +1914,32 @@ export function symMemTypeStrAt(line: i32, col: i32): string {
   let ty = symMemTy[best]
   if ty < 0 { return "" }
   tyToStr(ty)
+}
+
+// Whether type `ty` is a function — the `method` vs `property` distinction for
+// semantic tokens. Unwraps a nullable wrapper so an optional method (`o?.fn`)
+// still classifies as a method, matching the host member walk.
+function symMemIsFn(ty: i32): boolean {
+  if ty < 0 { return false }
+  let t = T.tys[ty]
+  if t is TyNullable { return symMemIsFn(t.nInner) }
+  t is TyFunc
+}
+
+// Member-access enumeration (semantic tokens): every recorded member-access
+// property name, in record order, with its span and method/property class — the
+// native equivalent of the host's AST member walk. The host reads
+// `symMemberCount()` then the per-index accessors. Line is 1-based, col 0-based;
+// `symMemberLen` is the property name's length; `symMemberIsMethod` is 1 for a
+// function-typed member, else 0.
+export function symMemberCount(): i32 { symMemNode.length }
+export function symMemberLine(i: i32): i32 { symMemLine[i] }
+export function symMemberCol(i: i32): i32 { symMemCol[i] }
+export function symMemberLen(i: i32): i32 { symMemEndCol[i] - symMemCol[i] }
+export function symMemberIsMethod(i: i32): i32 {
+  if symMemTy[i] == SYM_MEM_METHOD { return 1 }
+  if symMemIsFn(symMemTy[i]) { return 1 }
+  0
 }
 
 // Bind `name` to type-arena index `ty` in the innermost scope.
@@ -4045,6 +4109,12 @@ function checkCallNode(n: Call, ix: i32): i32 {
   // an array receiver, so a plain `f(…)` / non-array method falls through.
   let cfn = P.nodes[n.callFn]
   if cfn is Member {
+    // A member-access callee is, by definition, function-typed — the `method`
+    // classification for semantic tokens. The builtin method arms below type and
+    // return it directly (never via the member-read arm), so record its name here;
+    // a struct field holding a function falls through to `checkNode(n.callFn)` and
+    // `symMem` overwrites the type for hover.
+    symMemMethod(n.callFn)
     let recvTy = checkNode(cfn.memObj)
     let rt = T.tys[recvTy]
     if rt is TyArray {

@@ -406,6 +406,37 @@ const identTokensByPos = (
 };
 
 /**
+ * One member-access property name from an EXTERNAL classifier (the wasm checker's
+ * `memberTokensAt`), already classified `method` vs `property` from its resolved
+ * type. Position is 0-based — the same shape the host's AST member walk produces,
+ * so the two are interchangeable in {@link semanticTokensDataFromIdentifiers}.
+ */
+export type ExtMemberToken = {
+  line: number;
+  char: number;
+  length: number;
+  isMethod: boolean;
+};
+
+/** External member tokens as {@link ClassifiedToken}s (the legend's method/property). */
+const memberTokensFromExternal = (
+  members: ExtMemberToken[],
+): ClassifiedToken[] => {
+  const out: ClassifiedToken[] = [];
+  for (const m of members) {
+    if (m.length <= 0) continue;
+    out.push({
+      line: m.line,
+      char: m.char,
+      length: m.length,
+      tokenType: m.isMethod ? TT.method : TT.property,
+      tokenModifiers: 0,
+    });
+  }
+  return out;
+};
+
+/**
  * Full-document semantic tokens with the IDENTIFIER classification supplied by an
  * external source (the wasm checker) instead of the TS symbol table. The lexical
  * pass (literals/keywords/operators), recovered comments, and the member walk
@@ -423,6 +454,7 @@ export const semanticTokensDataFromIdentifiers = (
   source: string,
   ast?: VLProgramNode,
   spans?: NodeSpans,
+  extMembers?: ExtMemberToken[],
 ): number[] => {
   const identTokens = identTokensByPos(idents);
   const merged: ClassifiedToken[] = [...identTokens.values()];
@@ -430,10 +462,15 @@ export const semanticTokensDataFromIdentifiers = (
     if (!identTokens.has(`${t.line}:${t.char}`)) merged.push(t);
   }
   merged.push(...commentTokens(source));
-  if (ast && spans) {
-    for (const t of classifyMemberTokens(ast, spans)) {
-      if (!identTokens.has(`${t.line}:${t.char}`)) merged.push(t);
-    }
+  // Member names: prefer the EXTERNAL (wasm) member slice when supplied — the
+  // native checker classifies `method`/`property` from the resolved type, the
+  // kill-TS counterpart of the AST member walk. Fall back to the TS walk only
+  // when the wasm slice is absent (a seed predating the member exports).
+  const memberTokens = extMembers !== undefined
+    ? memberTokensFromExternal(extMembers)
+    : (ast && spans ? classifyMemberTokens(ast, spans) : []);
+  for (const t of memberTokens) {
+    if (!identTokens.has(`${t.line}:${t.char}`)) merged.push(t);
   }
   merged.sort((a, b) => a.line - b.line || a.char - b.char);
   return encodeSemanticTokens(merged);
