@@ -66,6 +66,7 @@ import {
   loadWasmChecker,
   type TsIdentToken,
   type WasmChecker,
+  type WasmMemberToken,
   type WasmRange,
   type WasmToken,
 } from "./wasmChecker.ts";
@@ -879,11 +880,32 @@ connection.languages.semanticTokens.on(
         });
     };
 
+    // The member slice (`o.x`/`xs.get` → property/method), classified by the
+    // native checker from the resolved type. Empty on a seed predating the
+    // member exports — the host then falls back to its TS AST member walk.
+    const wasmMembers = async (): Promise<WasmMemberToken[]> => {
+      if (wasmChecker?.memberTokensAt === undefined) return [];
+      return await wasmChecker
+        .memberTokensAt(text, entryKeyOf(params.textDocument.uri), workspaceReader)
+        .catch((err) => {
+          connection.console.log(`[wasm-symbols] memberTokensAt failed: ${err}`);
+          return [];
+        });
+    };
+
     if (checkerMode === "wasm" && wasmChecker !== undefined) {
       const idents = await wasmIdents();
       if (idents.length > 0) {
+        const members = await wasmMembers();
         return {
-          data: semanticTokensDataFromIdentifiers(idents, tokens, text, ast, spans),
+          data: semanticTokensDataFromIdentifiers(
+            idents,
+            tokens,
+            text,
+            ast,
+            spans,
+            members.length > 0 ? members : undefined,
+          ),
         };
       }
       return { data: semanticTokensData(symbols, tokens, text, ast, spans) };

@@ -49,6 +49,20 @@ export type WasmToken = {
   isDecl: boolean;
 };
 
+/**
+ * One member-access property name from the wasm semantic-token pass — the native
+ * equivalent of the host's AST member walk. `isMethod` is true for a
+ * function-typed member (`xs.get`, `s.slice`), false for an object field (`o.x`);
+ * the host maps these onto its `method`/`property` legend entries. Position is
+ * 0-based line, 0-based char (LSP).
+ */
+export type WasmMemberToken = {
+  line: number; // 0-based
+  char: number; // 0-based
+  length: number;
+  isMethod: boolean;
+};
+
 export type WasmChecker = {
   /** Diagnostics for `source` as the entry module at `entryKey`. */
   check: (
@@ -116,6 +130,17 @@ export type WasmChecker = {
     entryKey: string,
     read: ModuleReader,
   ) => Promise<WasmToken[]>;
+  /**
+   * Semantic tokens, member slice (kill-TS): every member-access property name
+   * the checker resolved, each classified `method`/`property` from its native
+   * type. Lets the wasm semantic-tokens path drop the TS AST member walk. Empty
+   * when the seed predates the member exports — the host then keeps its TS walk.
+   */
+  memberTokensAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ) => Promise<WasmMemberToken[]>;
   /**
    * Whole-document formatting (kill-TS step 1, the `format.ts` consumer): the
    * canonical reprint of `source` via the self-hosted formatter (`format.vl`'s
@@ -377,6 +402,38 @@ export const loadWasmChecker = (
     return out;
   };
 
+  // The member exports ride the same seed as the symbol exports; an older seed
+  // lacks them, so the member slice yields [] (the host keeps its TS walk).
+  const hasMembers = (exp: Exports): boolean =>
+    typeof exp.memberCount === "function" &&
+    typeof exp.memberLineAt === "function" &&
+    typeof exp.memberIsMethodAt === "function";
+
+  const memberTokensAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<WasmMemberToken[]> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp) || !hasMembers(exp)) return [];
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    const count = exp.memberCount();
+    const out: WasmMemberToken[] = [];
+    for (let i = 0; i < count; i++) {
+      const length = exp.memberLenAt(i);
+      if (length <= 0) continue; // defensive: a name never has a zero-width span
+      const line = exp.memberLineAt(i); // 1-based native line
+      out.push({
+        line: line > 0 ? line - 1 : 0,
+        char: exp.memberColAt(i),
+        length,
+        isMethod: exp.memberIsMethodAt(i) === 1,
+      });
+    }
+    return out;
+  };
+
   const check = async (
     source: string,
     entryKey: string,
@@ -503,6 +560,7 @@ export const loadWasmChecker = (
     hoverTypeAt,
     memberTypeAt,
     tokensAt,
+    memberTokensAt,
     formatSrc,
     lint,
   };

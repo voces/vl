@@ -427,3 +427,34 @@ Deno.test({ name: "wasm-symbols: memberTypeAt is undefined off any member access
   const t = await checker.memberTypeAt(src, "/tmp/x.vl", noSiblings, 1, 4);
   if (t !== undefined) throw new Error(`expected undefined off a member, got ${JSON.stringify(t)}`);
 });
+
+// `memberTokensAt` enumerates every member-access property name with its span and
+// `method`/`property` class — the native member slice for semantic tokens.
+
+Deno.test({ name: "wasm-symbols: memberTokensAt classifies a field as a property", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // line 2 (0-based) `print(p.x)`: `x`@8, one char long, an object field.
+  const src = "type P = { x: i32, y: i32 }\nlet p: P = { x: 1, y: 2 }\nprint(p.x)\n";
+  const members = await checker.memberTokensAt(src, "/tmp/x.vl", noSiblings);
+  const x = members.find((m) => m.line === 2 && m.char === 8);
+  if (!x) throw new Error(`no member token at 2:8, got ${JSON.stringify(members)}`);
+  if (x.length !== 1) throw new Error(`expected length 1 for .x, got ${x.length}`);
+  if (x.isMethod) throw new Error("expected .x to be a property, not a method");
+});
+
+Deno.test({ name: "wasm-symbols: memberTokensAt classifies a function-typed member as a method", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // line 1 (0-based) `xs.push(2)`: `push`@3..7, a function-typed member.
+  const src = "let xs = [1]\nxs.push(2)\n";
+  const members = await checker.memberTokensAt(src, "/tmp/x.vl", noSiblings);
+  const push = members.find((m) => m.line === 1 && m.char === 3);
+  if (!push) throw new Error(`no member token at 1:3, got ${JSON.stringify(members)}`);
+  if (push.length !== 4) throw new Error(`expected length 4 for .push, got ${push.length}`);
+  if (!push.isMethod) throw new Error("expected .push to be a method");
+});
+
+Deno.test({ name: "wasm-symbols: memberTokensAt is empty on source with no member access", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const members = await checker.memberTokensAt("let a = 1\nprint(a)\n", "/tmp/x.vl", noSiblings);
+  if (members.length !== 0) throw new Error(`expected no members, got ${JSON.stringify(members)}`);
+});

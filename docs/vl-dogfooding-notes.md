@@ -150,6 +150,16 @@ is open backlog — triage as you like.
   the next comment. Fixed by pinning the cursor past the last variant before
   constructing the node. General lesson for the spans work: capture a node's end
   position at the construct's true end, not after speculative lookahead.
+- **Method-call callees bypass the member-read arm.** A builtin method call
+  (`xs.push(e)`, `m.set(k,v)`, `s.slice(a,b)`) is typed inside `checkCallNode`'s
+  member-callee branch, which `return`s the result directly — the callee `Member`
+  node is never `checkNode`'d through the member-read arm. So the per-member
+  recording that drives IDE queries (`symMem`, the member-hover/-token tables) never
+  sees those names; only member *reads* (`o.x`, `s.length`) and struct-field
+  function calls (which fall through to `checkNode(n.callFn)`) are recorded. Found
+  building native member semantic tokens — had to add a separate `symMemMethod`
+  recorder at the call branch. A single member-resolution choke point shared by the
+  read arm and the call arm would remove this asymmetry.
 
 ### Syntax worth documenting (not wrong, just non-obvious)
 
