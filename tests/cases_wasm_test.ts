@@ -89,12 +89,10 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
     "parked soundness xfail: wasm rejects the i32-keyed-map element recursion the TS checker accepts",
   "soundness/xfail-seq-guard-residual-codegen.vl":
     "@error pins the TS host's own Codegen error; the wasm checker rejects earlier, at the type tier",
-  "types/bodyless-alias.vl": PARSER_WORDING,
   "types/never-value-intersection.vl":
     `${TS_WORDING}; wasm also adds a cascade error on the never-typed binding`,
   "types/never-value-self-intersection.vl":
     `${TS_WORDING}; wasm also adds a cascade error on the never-typed binding`,
-  "types/recursive-type.vl": PARSER_WORDING,
   "types/self-alias-still-clean.vl":
     "wasm adds a cascade error (assignment to the never-typed alias) after the matched self-alias diagnostic",
 };
