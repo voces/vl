@@ -67,20 +67,13 @@ const seedExists = (() => {
 // skips its case; the trailing tripwire test fails on a stale entry. Burning
 // this list down is the message/span-parity work that also gates the deno
 // CHECK-tier deletion (ROADMAP F-tiers).
-const TS_WORDING =
-  "@error text pins the TS message; the wasm reject message differs in substance";
-const PARSER_WORDING =
-  "@error text pins the TS parser message; wasm parse-recovery wording differs";
 const EXPECTED_DIVERGENCES: Record<string, string> = {
-  "functions/lambda-uninferable-param.vl":
-    "wasm adds a cascade error (uninferable lambda return) beyond the declared diagnostic",
   "intrinsics/array-new-ref-elems.vl":
     "wasm emitter rejects ref-element `__array_new__` fills (i32/boolean/f64 only natively); the host lowers them generically — the native emitter long tail (std-design slice 0 residue)",
   "numerics/i64-infer-let.vl":
     "native emitter gap: an unannotated let from an i64 expression materializes an i32 local (invalid wasm); the host infers the initializer's width — the native long tail",
   "numerics/widen-call-arg.vl":
     "native emitter gap: an i32 variable passed to an i64 parameter is not sign-extended at the call site (invalid wasm); the host widens it — the native long tail",
-  "objects/trailing-comma-illegal.vl": PARSER_WORDING,
   "soundness/README.vl":
     "a prose line parses as @run; the wasm emitter rejects a statement-less program (TS emits an empty module)",
   "soundness/xfail-arith-hole-operand.vl":
@@ -89,12 +82,6 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
     "parked soundness xfail: wasm rejects the i32-keyed-map element recursion the TS checker accepts",
   "soundness/xfail-seq-guard-residual-codegen.vl":
     "@error pins the TS host's own Codegen error; the wasm checker rejects earlier, at the type tier",
-  "types/never-value-intersection.vl":
-    `${TS_WORDING}; wasm also adds a cascade error on the never-typed binding`,
-  "types/never-value-self-intersection.vl":
-    `${TS_WORDING}; wasm also adds a cascade error on the never-typed binding`,
-  "types/self-alias-still-clean.vl":
-    "wasm adds a cascade error (assignment to the never-typed alias) after the matched self-alias diagnostic",
 };
 
 type Exports = Record<string, (...args: number[]) => number>;

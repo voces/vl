@@ -997,6 +997,10 @@ function isNeverTy(ix: i32): boolean {
   if ix < 0 { return false }
   let t = T.tys[ix]
   if t is TyPrim { return t.primName == "never" }
+  // An empty union (no surviving members — e.g. a degenerate `type D = D` or an
+  // empty intersection `A & B`) is uninhabited, i.e. `never`. The declaration
+  // already reported it; treating it as `never` keeps use sites from cascading.
+  if t is TyUnion { return t.uMembers.length == 0 }
   false
 }
 
@@ -4693,6 +4697,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
   }
   let cbExpectUsable = cbExpect.length == params.length
   let paramTys: i32[] = []
+  let paramUninferable = false
   let pi = 0
   while pi < params.length {
     let pNode = P.nodes[params[pi]]
@@ -4729,6 +4734,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
         // signature NOW (host parity: `lambda-uninferable-param`).
         tErr("cannot infer a type for parameter `" + pNode.parName + "`",
           params[pi])
+        // The body can't be typed once a param is unknown — don't also cascade
+        // a "cannot infer a return type" from the resulting error-only return.
+        paramUninferable = true
       }
     }
     paramTys.push(pt)
@@ -4874,9 +4882,13 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
     if inferObserved >= 0 {
       inferred = inferObserved
     } else if inferSawErr {
-      // Only err-ish types flowed back (a base-case-less cycle): no basis.
-      tErr("cannot infer a return type for '" + n.fnName +
-        "' — annotate a return type", n.fnBody)
+      // Only err-ish types flowed back (a base-case-less cycle): no basis. But a
+      // param that was itself uninferable already reported the root cause, so
+      // suppress the (redundant) return-type message in that case.
+      if !paramUninferable {
+        tErr("cannot infer a return type for '" + n.fnName +
+          "' — annotate a return type", n.fnBody)
+      }
       inferred = TY_ERR
     }
     ret = inferred
@@ -5874,7 +5886,11 @@ function checkNode(ix: i32): i32 {
         // SOURCE binding's open holes from the annotation (`const ys: i32[] = zs`
         // resolves `zs`'s element) — clearing its uninferred floor in place.
         constrainEmpty(initTy, annot)
-        if !assignableExpr(n.letInit, initTy, annot) {
+        // A `never`-typed annotation (a degenerate/empty-intersection alias) was
+        // ALREADY reported at its declaration; don't also cascade a "cannot assign
+        // … of type <empty>" at every use site.
+        let neverAnnot = isNeverTy(annot)
+        if !neverAnnot && !assignableExpr(n.letInit, initTy, annot) {
           // An object literal (`{}` / `{x: 1}`) assigned to a map type is a
           // category error, not a width mismatch — point at the fix (`Map()`)
           // rather than the opaque "cannot assign {} to … of type {[string]: …}".

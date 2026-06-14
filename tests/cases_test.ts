@@ -470,6 +470,9 @@ const WASM_CANONICAL_WORDING: Record<string, boolean> = {
   "types/i32-string-mismatch.vl": true,
   "types/infer-null-pin-guard.vl": true,
   "literals/err-bad-hex-digit.vl": true,
+  "objects/trailing-comma-illegal.vl": true,
+  "types/never-value-intersection.vl": true,
+  "types/never-value-self-intersection.vl": true,
 };
 
 for (const c of cases) {
