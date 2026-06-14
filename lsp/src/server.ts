@@ -349,27 +349,30 @@ documents.onDidChangeContent(async (event) => {
   // statements. A file with no imports analyzes exactly as the single-file
   // `checkOnly` path did. Codegen-only diagnostics (the rare `Codegen error:`)
   // aren't produced here, same trade-off as `vl check`.
-  // Stage 1 of LSP-on-wasm (`vital.checker`): `"wasm"` publishes the
-  // self-hosted compiler's diagnostics instead of the TS checker's (no lint
-  // tier yet — that's Stage 3); `"both"` publishes the TS diagnostics and LOGS
-  // structural divergence from the wasm checker — the parity instrument the
-  // TS-host teardown gates on. Any wasm-side failure falls back to TS.
+  // LSP-on-wasm (`vital.checker`): `"wasm"` publishes the self-hosted compiler's
+  // diagnostics — the error tier (`check`) PLUS the Stage-3 lint tier (`lint`),
+  // which `check` excludes — instead of the TS checker's; `"both"` publishes the
+  // TS diagnostics and LOGS structural divergence from the wasm checker (the
+  // parity instrument the TS-host teardown gates on). Any wasm-side failure falls
+  // back to TS (whose `checkDocument` already includes lint, so no double-count).
   let diagnostics: VLDiagnostic[];
   if (checkerMode === "wasm" && wasmChecker !== undefined) {
-    diagnostics = await wasmChecker
-      .check(
+    try {
+      const text = event.document.getText();
+      const errors = await wasmChecker.check(
+        text,
+        entryKeyOf(event.document.uri),
+        workspaceReader,
+      );
+      diagnostics = [...errors, ...wasmChecker.lint(text)];
+    } catch (err) {
+      connection.console.log(`[wasm-checker] check failed (${err}) — TS fallback`);
+      diagnostics = (await checkDocument(
         event.document.getText(),
         entryKeyOf(event.document.uri),
         workspaceReader,
-      )
-      .catch(async (err) => {
-        connection.console.log(`[wasm-checker] check failed (${err}) — TS fallback`);
-        return (await checkDocument(
-          event.document.getText(),
-          entryKeyOf(event.document.uri),
-          workspaceReader,
-        )).diagnostics;
-      });
+      )).diagnostics;
+    }
   } else {
     diagnostics = (await checkDocument(
       event.document.getText(),

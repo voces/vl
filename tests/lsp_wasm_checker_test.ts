@@ -374,3 +374,28 @@ Deno.test({ name: "wasm-checker: formatSrc returns undefined on a parse error (T
     throw new Error(`expected undefined on parse error, got ${JSON.stringify(got)}`);
   }
 });
+
+// ── lint tier (Stage 3: the lint.vl consumer) ────────────────────────────────
+// `lint` drives the self-hosted lint pass through the seed. The error-tier
+// `check` excludes lint, so the diagnostics path merges both.
+
+Deno.test({ name: "wasm-checker: lint surfaces a rule with code, non-error severity, and position", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // `x` is read but never reassigned → prefer-const (a lint warning the error
+  // tier never reports).
+  const diags = checker.lint("let x = 1\nprint(x)\n");
+  const pc = diags.find((d) => d.code === "prefer-const");
+  if (!pc) throw new Error(`expected a prefer-const diagnostic, got: ${JSON.stringify(diags)}`);
+  if (pc.severity === "error") throw new Error(`lint should not be error-tier: ${pc.severity}`);
+  if (pc.range.start.line !== 0) throw new Error(`expected line 0, got ${pc.range.start.line}`);
+  if (pc.range.end.character <= pc.range.start.character) {
+    throw new Error(`expected a non-empty range, got ${JSON.stringify(pc.range)}`);
+  }
+});
+
+Deno.test({ name: "wasm-checker: lint returns [] on a parse error", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  if (checker.lint("function f( {\n").length !== 0) {
+    throw new Error("expected [] on a parse error");
+  }
+});
