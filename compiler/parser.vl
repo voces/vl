@@ -554,6 +554,7 @@ function parseObjLit(): i32 {
     let fp0 = peekTok().start         // the field's leading token (its key)
     let name = ""
     let stringKey = false
+    let badKey = false
     if peekKind() == "IDENT" {
       name = advance().text
     } else if peekKind() == "STRING" {
@@ -565,24 +566,40 @@ function parseObjLit(): i32 {
       name = raw.slice(1, raw.length - 1)
       stringKey = true
     } else {
-      expect("IDENT")
+      // A friendlier message than the generic `expect("IDENT")` ("expected IDENT
+      // but found COMMA") — name what's wanted and show the offending lexeme.
+      P.diags.push({
+        msg: "expected a field name but found `" + peekTok().text + "`",
+        at: P.pos,
+      })
+      advance()
+      badKey = true
     }
-    let value = -1
-    if !stringKey && peekKind() == "LPAREN" {
-      // Method shorthand `add(a, b) { … }` — a `(` directly after the IDENT key
-      // (no `:`) marks it; the value is an anonymous function whose params /
-      // return / body parse exactly as a lambda's (the host parses it via
-      // `parseFunctionDeclaration` from the key token).
-      let mtps: string[] = []
-      value = parseFuncTail("", mtps, 0 - 1, fp0)
-    } else if !stringKey && peekKind() != "COLON" {
-      // Bare-IDENT shorthand `{ x }` → `{ x: x }` (the host's `parsePair` fallback).
-      value = mkIdent(name, fp0)
+    if badKey {
+      // Recover from a malformed field key (e.g. a doubled comma `{ x: 1,, y }`):
+      // skip to the next `,`/`}` so it yields ONE diagnostic ("expected IDENT …")
+      // rather than a cascade of mis-parses from the leftover tokens.
+      while peekKind() != "COMMA" && peekKind() != "RBRACE" && peekKind() != "EOF" {
+        advance()
+      }
     } else {
-      expect("COLON")
-      value = parseExpr()
+      let value = -1
+      if !stringKey && peekKind() == "LPAREN" {
+        // Method shorthand `add(a, b) { … }` — a `(` directly after the IDENT key
+        // (no `:`) marks it; the value is an anonymous function whose params /
+        // return / body parse exactly as a lambda's (the host parses it via
+        // `parseFunctionDeclaration` from the key token).
+        let mtps: string[] = []
+        value = parseFuncTail("", mtps, 0 - 1, fp0)
+      } else if !stringKey && peekKind() != "COLON" {
+        // Bare-IDENT shorthand `{ x }` → `{ x: x }` (the host's `parsePair` fallback).
+        value = mkIdent(name, fp0)
+      } else {
+        expect("COLON")
+        value = parseExpr()
+      }
+      fields.push(mkFieldInit(name, value, fp0))
     }
-    fields.push(mkFieldInit(name, value, fp0))
     skipNewlines()
     if peekKind() == "COMMA" {
       advance()
@@ -862,6 +879,24 @@ function parseTypeDecl(): i32 {
     }
     expect("GT")                   // ">"
     name = name + ">"
+  }
+  // A bodyless `type Bar` (no `= body`) is reported ONCE, at the declaration,
+  // with an actionable message — instead of cascading "expected EQUAL …" from
+  // mis-parsing the following line as the body. Recover as a sentinel TypeDecl
+  // (`tdFields == [-1]`) that the checker registers as an error type, so the use
+  // site (`let y: Bar = …`) does not cascade either.
+  let eqHere = peekKind() == "EQUAL"
+  if !eqHere {
+    P.diags.push({
+      msg: "A type alias requires a body; write `type " + name +
+        " = …` to define `" + name + "`",
+      at: nameTok,
+    })
+    let bodyless: i32[] = []
+    bodyless.push(0 - 1)
+    let blix = mkTypeDecl(name, bodyless, p0)
+    mkDeclNameTok(blix, nameTok)
+    return blix
   }
   expect("EQUAL")
   // `type N = A | B | C` — a discriminated-union ALIAS (the RHS is a type name, not

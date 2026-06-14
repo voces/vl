@@ -997,7 +997,59 @@ function isNeverTy(ix: i32): boolean {
   if ix < 0 { return false }
   let t = T.tys[ix]
   if t is TyPrim { return t.primName == "never" }
+  // An empty union (no surviving members — e.g. a degenerate `type D = D` or an
+  // empty intersection `A & B`) is uninhabited, i.e. `never`. The declaration
+  // already reported it; treating it as `never` keeps use sites from cascading.
+  if t is TyUnion { return t.uMembers.length == 0 }
   false
+}
+
+// A prose description of a type's underlying SHAPE, for explaining why two
+// intersection operands can't overlap (`A & B` → "an object and a string
+// literal"). Mirrors the TS host's `operandKind`. A single-member union (a
+// `type B = "foo"` alias) peels to its member so it reads "a string literal",
+// not "a union".
+function operandKind(ix: i32): string {
+  if ix < 0 { return "a type" }
+  let t = T.tys[ix]
+  if t is TyUnion {
+    if t.uMembers.length == 1 { return operandKind(t.uMembers[0]) }
+    return "a union"
+  }
+  if t is TyLit {
+    if t.litKind == "str" { return "a string literal" }
+    return "a number literal"
+  }
+  if t is TyObj { return "an object" }
+  if t is TyFunc { return "a function" }
+  if t is TyPrim { return "the type `" + t.primName + "`" }
+  if t is TyArray { return "an array" }
+  if t is TyMap { return "a map" }
+  "a type"
+}
+
+// Split a synthetic intersection name (`A&B`, `{a:i32}&B`) into its TOP-LEVEL
+// operands (depth-aware, so a nested `{…}`/`[…]`/`(…)` `&` doesn't split). One
+// element when there is no top-level `&`.
+function splitTopAmp(name: string): string[] {
+  let parts: string[] = []
+  let depth = 0
+  let start = 0
+  let i = 0
+  while i < name.length {
+    let c = name[i]
+    if c == '{' || c == '[' || c == '(' {
+      depth = depth + 1
+    } else if c == '}' || c == ']' || c == ')' {
+      depth = depth - 1
+    } else if c == '&' && depth == 0 {
+      parts.push(name.slice(start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  parts.push(name.slice(start, name.length))
+  parts
 }
 
 // The base scalar a literal type SOFTENS to (host: `StringLiteral` → string,
@@ -4693,6 +4745,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
   }
   let cbExpectUsable = cbExpect.length == params.length
   let paramTys: i32[] = []
+  let paramUninferable = false
   let pi = 0
   while pi < params.length {
     let pNode = P.nodes[params[pi]]
@@ -4729,6 +4782,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
         // signature NOW (host parity: `lambda-uninferable-param`).
         tErr("cannot infer a type for parameter `" + pNode.parName + "`",
           params[pi])
+        // The body can't be typed once a param is unknown — don't also cascade
+        // a "cannot infer a return type" from the resulting error-only return.
+        paramUninferable = true
       }
     }
     paramTys.push(pt)
@@ -4874,9 +4930,13 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
     if inferObserved >= 0 {
       inferred = inferObserved
     } else if inferSawErr {
-      // Only err-ish types flowed back (a base-case-less cycle): no basis.
-      tErr("cannot infer a return type for '" + n.fnName +
-        "' — annotate a return type", n.fnBody)
+      // Only err-ish types flowed back (a base-case-less cycle): no basis. But a
+      // param that was itself uninferable already reported the root cause, so
+      // suppress the (redundant) return-type message in that case.
+      if !paramUninferable {
+        tErr("cannot infer a return type for '" + n.fnName +
+          "' — annotate a return type", n.fnBody)
+      }
       inferred = TY_ERR
     }
     ret = inferred
@@ -4986,9 +5046,19 @@ function checkProgramNode(n: Program): i32 {
         gaParamLists.push(gname.slice(gLt + 1, gname.length - 1))
         gaDeclIxs.push(stmts[t0])
       } else {
-        let fnames0: string[] = []
-        let ftys0: i32[] = []
-        cUserTypes[sd0.tdName] = mkObjTy(fnames0, ftys0)
+        // A bodyless alias (parser sentinel `tdFields == [-1]`) registers as the
+        // error type — the parser already reported it, and the error type
+        // suppresses use-site cascades. A real (possibly empty `{}`) body builds
+        // an object placeholder that pass 0b fills.
+        let df0 = sd0.tdFields
+        let bodyless0 = df0.length == 1 && df0[0] == (0 - 1)
+        if bodyless0 {
+          cUserTypes[sd0.tdName] = TY_ERR
+        } else {
+          let fnames0: string[] = []
+          let ftys0: i32[] = []
+          cUserTypes[sd0.tdName] = mkObjTy(fnames0, ftys0)
+        }
       }
     } else if sd0 is UnionDecl {
       let members0: i32[] = []
@@ -5088,9 +5158,33 @@ function checkProgramNode(n: Program): i32 {
               vi = vi + 1
             }
             if resolvedAny && members.length == 0 {
-              tErr("Type `" + sd.udName + "` is `never` (an empty type — " +
-                "its operands have no common values), so it has no values",
-                stmts[ti])
+              // Explain the empty intersection in SOURCE terms (matching the TS
+              // host): name the two operands and their kinds (`A & B`, an object
+              // and a string literal), or call out a self-reference
+              // (`type E = A & E`). Falls back to the generic wording for a
+              // non-binary / non-intersection never (e.g. `type C = NeverAlias`).
+              let ops = splitTopAmp(variants[0])
+              let didDetail = false
+              if variants.length == 1 && ops.length == 2 {
+                let expr = ops[0] + " & " + ops[1]
+                let selfRef = ops[0] == sd.udName || ops[1] == sd.udName
+                if selfRef {
+                  tErr("Type `" + sd.udName +
+                    "` refers to itself inside an intersection (`" + expr +
+                    "`), so it reduces to `never`", stmts[ti])
+                } else {
+                  tErr("Type `" + sd.udName + "` is `never` (an empty type — `" +
+                    expr + "`, " + operandKind(nameToTy(ops[0])) + " and " +
+                    operandKind(nameToTy(ops[1])) +
+                    ", have no common values), so it has no values", stmts[ti])
+                }
+                didDetail = true
+              }
+              if !didDetail {
+                tErr("Type `" + sd.udName + "` is `never` (an empty type — " +
+                  "its operands have no common values), so it has no values",
+                  stmts[ti])
+              }
             }
           }
         }
@@ -5864,7 +5958,11 @@ function checkNode(ix: i32): i32 {
         // SOURCE binding's open holes from the annotation (`const ys: i32[] = zs`
         // resolves `zs`'s element) — clearing its uninferred floor in place.
         constrainEmpty(initTy, annot)
-        if !assignableExpr(n.letInit, initTy, annot) {
+        // A `never`-typed annotation (a degenerate/empty-intersection alias) was
+        // ALREADY reported at its declaration; don't also cascade a "cannot assign
+        // … of type <empty>" at every use site.
+        let neverAnnot = isNeverTy(annot)
+        if !neverAnnot && !assignableExpr(n.letInit, initTy, annot) {
           // An object literal (`{}` / `{x: 1}`) assigned to a map type is a
           // category error, not a width mismatch — point at the fix (`Map()`)
           // rather than the opaque "cannot assign {} to … of type {[string]: …}".

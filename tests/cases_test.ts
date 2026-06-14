@@ -410,7 +410,6 @@ const WASM_CANONICAL_WORDING: Record<string, boolean> = {
   "generics/type-alias-bare-error.vl": true,
   "index/wrong-key-type.vl": true,
   "index/wrong-value-type.vl": true,
-  "lint/empty-intersection.vl": true,
   "maps/error-infer-conflict.vl": true,
   "sets/error-infer-conflict.vl": true,
   "soundness/exhaustive-is-chain-no-else-reject.vl": true,
@@ -436,7 +435,6 @@ const WASM_CANONICAL_WORDING: Record<string, boolean> = {
   "soundness/struct-missing-field-reject.vl": true,
   "soundness/union-four-variant-missing-reject.vl": true,
   "soundness/union-narrow-reject.vl": true,
-  "types/empty-intersection-unused.vl": true,
   "types/fn-arg-type.vl": true,
   "types/negation-annotation-reject.vl": true,
   "types/return-mismatch.vl": true,
@@ -470,6 +468,7 @@ const WASM_CANONICAL_WORDING: Record<string, boolean> = {
   "types/i32-string-mismatch.vl": true,
   "types/infer-null-pin-guard.vl": true,
   "literals/err-bad-hex-digit.vl": true,
+  "objects/trailing-comma-illegal.vl": true,
 };
 
 for (const c of cases) {
