@@ -2671,6 +2671,39 @@ function nameToTy(name: string): i32 {
   -1
 }
 
+// If `name` is a synthetic map shape `{[K]:V}` (the parser's index-signature
+// name), return the KEY type name `K`; otherwise "". Used to give an actionable
+// diagnostic for an unsupported (non-`string`) map key instead of a bare
+// "unknown type '{[i32]:i32}'".
+function mapShapeKeyName(name: string): string {
+  let nlen = name.length
+  if nlen < 5 { return "" }
+  if name[0] != '{' || name[1] != '[' { return "" }
+  let mi = 2
+  while mi < nlen - 1 {
+    if name[mi] == ']' && name[mi + 1] == ':' {
+      return name.slice(2, mi)
+    }
+    mi = mi + 1
+  }
+  return ""
+}
+
+// The collection FLAVOR of a binding initializer: "Set" when the init is a
+// `Set()` call, else "Map" (a `Map()` call or any other shape). Lets the
+// i32-keyed diagnostic name the right constructor (`Map`/`Set`).
+function initMapCtorName(initIx: i32): string {
+  if initIx < 0 { return "Map" }
+  let inode = P.nodes[initIx]
+  if inode is Call {
+    let cn = P.nodes[inode.callFn]
+    if cn is Ident {
+      if cn.identName == "Set" { return "Set" }
+    }
+  }
+  return "Map"
+}
+
 // ── type → string (for diagnostics) ──────────────────────────────────────────
 // Renders a type-arena index as a readable type name. Recurses through the arena
 // for object/function/union/nullable. Narrows the `Ty` union only — never `Node`.
@@ -5796,7 +5829,16 @@ function checkNode(ix: i32): i32 {
       if tn is TypeRef {
         annot = nameToTy(tn.tyName)
         if annot < 0 {
-          tErr("unknown type '" + tn.tyName + "'", n.letType)
+          // An i32-keyed map shape (`{[i32]: V}`) is the native list/array path,
+          // not the string-keyed hash map — report that directly (with the fix)
+          // instead of a bare "unknown type", naming the constructor in play.
+          if mapShapeKeyName(tn.tyName) == "i32" {
+            tErr("An i32-keyed " + initMapCtorName(n.letInit) +
+              " isn't supported yet — i32 keys use a list/array (`T[]`); " +
+              "`Map`/`Set` keys must be `string` for now", n.letType)
+          } else {
+            tErr("unknown type '" + tn.tyName + "'", n.letType)
+          }
           annot = TY_ERR
         }
       }
@@ -5814,8 +5856,23 @@ function checkNode(ix: i32): i32 {
         // resolves `zs`'s element) — clearing its uninferred floor in place.
         constrainEmpty(initTy, annot)
         if !assignableExpr(n.letInit, initTy, annot) {
-          tErr("cannot assign " + tyToStr(initTy) + " to '" + n.letName +
-            "' of type " + tyToStr(annot), ix)
+          // An object literal (`{}` / `{x: 1}`) assigned to a map type is a
+          // category error, not a width mismatch — point at the fix (`Map()`)
+          // rather than the opaque "cannot assign {} to … of type {[string]: …}".
+          let annT = T.tys[annot]
+          let initN = P.nodes[n.letInit]
+          let objToMap = false
+          if annT is TyMap {
+            if initN is ObjLit { objToMap = true }
+          }
+          if objToMap {
+            tErr("An object literal isn't a map value — construct a map with " +
+              "`Map()` (or a set with `Set()`), e.g. `let m: {[string]: i32} = Map()`",
+              ix)
+          } else {
+            tErr("cannot assign " + tyToStr(initTy) + " to '" + n.letName +
+              "' of type " + tyToStr(annot), ix)
+          }
         }
         // A `Set()` initializer keeps its SET flavor even under a map-shaped
         // annotation (`let s: {[string]: boolean} = Set()`): the binding exposes

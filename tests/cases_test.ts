@@ -397,6 +397,51 @@ const TS_HOST_INCOMPATIBLE: Record<string, string> = {
     "the TS host emitter cannot lower `std:test`'s union-based `expect` over the full value-union (a value-union struct field read back, with i64/f64 members); native lowers it — cases_wasm_test owns this case",
 };
 
+// Cases whose `@error` directive pins VL's CANONICAL (clearer) diagnostic, which
+// the frozen TS compiler words differently — so the TS oracle SKIPS them and the
+// wasm oracle (`cases_wasm_test.ts`) adjudicates against VL's message. This is the
+// directive-quality inverse of `EXPECTED_DIVERGENCES`: rather than shrinking the
+// corpus directive to a substring both compilers happen to share (which buried
+// VL's better message), the directive states VL's real message and the dying TS
+// compiler opts out here. Both this list and `EXPECTED_DIVERGENCES` empty out as
+// the TS compiler retires (ROADMAP "Kill the TS host"). Keyed by case name.
+const WASM_CANONICAL_WORDING: Record<string, boolean> = {
+  "arrays/render-i32-array.vl": true,
+  "generics/type-alias-bare-error.vl": true,
+  "index/wrong-key-type.vl": true,
+  "index/wrong-value-type.vl": true,
+  "lint/empty-intersection.vl": true,
+  "maps/error-infer-conflict.vl": true,
+  "sets/error-infer-conflict.vl": true,
+  "soundness/exhaustive-is-chain-no-else-reject.vl": true,
+  "soundness/exhaustive-missing-is-case.vl": true,
+  "soundness/exhaustive-missing-literal-case.vl": true,
+  "soundness/function-arg-type-reject.vl": true,
+  "soundness/intersection-param-reject.vl": true,
+  "soundness/is-non-variant-reject.vl": true,
+  "soundness/is-not-variant-of-union-reject.vl": true,
+  "soundness/literal-union-reject-arg.vl": true,
+  "soundness/literal-union-reject-assign.vl": true,
+  "soundness/literal-union-reject-non-member.vl": true,
+  "soundness/narrowing-and-else-not-narrowed.vl": true,
+  "soundness/narrowing-then-only-no-leak.vl": true,
+  "soundness/nullable-access-nested.vl": true,
+  "soundness/nullable-access-unguarded.vl": true,
+  "soundness/nullable-chain-unguarded-reject.vl": true,
+  "soundness/object-field-value-mismatch-generic.vl": true,
+  "soundness/object-field-value-mismatch-inline.vl": true,
+  "soundness/object-field-value-mismatch.vl": true,
+  "soundness/return-union-unnarrowed-reject.vl": true,
+  "soundness/struct-field-type-mismatch-reject.vl": true,
+  "soundness/struct-missing-field-reject.vl": true,
+  "soundness/union-four-variant-missing-reject.vl": true,
+  "soundness/union-narrow-reject.vl": true,
+  "types/empty-intersection-unused.vl": true,
+  "types/fn-arg-type.vl": true,
+  "types/negation-annotation-reject.vl": true,
+  "types/return-mismatch.vl": true,
+};
+
 for (const c of cases) {
   const name = caseName(c);
   // Directives always come from the case's primary file: the lone `.vl` for a
@@ -407,7 +452,8 @@ for (const c of cases) {
 
   Deno.test({
     name,
-    ignore: d.skip != null || name in TS_HOST_INCOMPATIBLE,
+    ignore: d.skip != null || name in TS_HOST_INCOMPATIBLE ||
+      name in WASM_CANONICAL_WORDING,
     fn: async () => {
       const result = await quiet(() => {
         if (c.kind === "single") return compile(src, name);
