@@ -83,11 +83,8 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
   "literals/err-empty-hex.vl": LEX_WORDING,
   "literals/err-prefix-separator.vl": LEX_WORDING,
   "literals/err-trailing-separator.vl": LEX_WORDING,
-  "numerics/i32-to-f32-reject.vl": TS_WORDING,
   "numerics/i64-infer-let.vl":
     "native emitter gap: an unannotated let from an i64 expression materializes an i32 local (invalid wasm); the host infers the initializer's width — the native long tail",
-  "numerics/i64-to-f64-reject.vl": TS_WORDING,
-  "numerics/narrowing-reject.vl": TS_WORDING,
   "numerics/widen-call-arg.vl":
     "native emitter gap: an i32 variable passed to an i64 parameter is not sign-extended at the call site (invalid wasm); the host widens it — the native long tail",
   "objects/trailing-comma-illegal.vl": PARSER_WORDING,
