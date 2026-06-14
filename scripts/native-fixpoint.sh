@@ -27,7 +27,7 @@ trap 'rm -rf "$WORK"' EXIT
 # the same Tok/Diag/advance de-collision glue the whole self-host suite applies.
 sed -E 's/\bTok\b/LexTok/g; s/\bDiag\b/LexDiag/g; s/\badvance\b/lexAdvance/g' \
   compiler/lexer.vl > "$WORK/vlsrc.vl"
-cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.vl compiler/lint.vl \
+cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.vl compiler/lint.vl compiler/format.vl \
   scripts/vl-compiler-driver.vl >> "$WORK/vlsrc.vl"
 # BLANK the compiler's own import statements (range-aware — two compiler imports
 # span multiple lines): a line-leading `import {` would trip the vl binary's
