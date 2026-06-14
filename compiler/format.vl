@@ -130,6 +130,12 @@ export function fmtAddComment(text: string, start: i32, line: i32, trailing: i32
 // `outBuf` so the inner statements render into a fresh buffer.
 let outBuf: string[] = []
 
+// Seed for the TOP-LEVEL `emitStatements`' `prevLine`: the stop line of the last
+// recovered import (0 when there are none). It lets the blank-line policy between
+// the import block and the first statement match the source. `emitStatements`
+// consumes it on entry and resets it to 0, so nested calls are unaffected.
+let topPrevLine = 0
+
 function fmtEmitRaw(s: string): i32 {
   outBuf.push(s)
   0
@@ -438,11 +444,53 @@ export function formatProgram(progRoot: i32): string {
   }
   let root = P.nodes[progRoot]
   if root is Program {
+    // Imports are skipped by the parser (no AST node), so recover them from the
+    // token stream and emit them verbatim before the parsed statements; seed the
+    // top-level blank-line policy with the last import's line.
+    topPrevLine = emitImports()
     emitStatements(root.progStmts, 0)
     flushRemaining(0)
   }
   let text = joinOut()
   normalizeProgram(text)
+}
+
+// Recover `import { … } from "path"` statements from `P.toks` (the parser
+// consumes their tokens but builds no node). Each import runs from an `IMPORT`
+// keyword to its path `STRING`; slice that span verbatim, placing own-line
+// comments and a single source blank line before each. Returns the last import's
+// stop line, or 0 when the file has none.
+function emitImports(): i32 {
+  let prevLine = 0
+  let i = 0
+  while i < P.toks.length {
+    let t = P.toks[i]
+    if t.kind == "IMPORT" {
+      let j = i
+      let found = 0 - 1
+      while j < P.toks.length && found < 0 {
+        if P.toks[j].kind == "STRING" { found = j }
+        j = j + 1
+      }
+      if found < 0 {
+        return prevLine
+      }
+      let endTok = P.toks[found]
+      let startLine = t.line
+      let leading = peekLeadingCount(startLine)
+      if prevLine > 0 && startLine - prevLine > 1 + leading && outBuf.length > 0 {
+        fmtEmitRaw("\n")
+      }
+      emitLeadingComments(0, startLine)
+      let src = fmtSrc.slice(t.start, endTok.start + endTok.text.length)
+      emitLine(0, src + trailerSuffix(endTok.line))
+      prevLine = endTok.line
+      i = found + 1
+    } else {
+      i = i + 1
+    }
+  }
+  prevLine
 }
 
 function joinOut(): string {
@@ -485,7 +533,8 @@ function normalizeProgram(text: string): string {
 // Emit a sequence of statements at `indent`, preserving a single user blank line
 // between them and placing own-line / trailing comments.
 function emitStatements(stmts: i32[], indent: i32): i32 {
-  let prevLine = 0
+  let prevLine = topPrevLine
+  topPrevLine = 0
   let i = 0
   while i < stmts.length {
     let ix = stmts[i]
