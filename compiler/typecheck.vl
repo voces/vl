@@ -1004,6 +1004,54 @@ function isNeverTy(ix: i32): boolean {
   false
 }
 
+// A prose description of a type's underlying SHAPE, for explaining why two
+// intersection operands can't overlap (`A & B` → "an object and a string
+// literal"). Mirrors the TS host's `operandKind`. A single-member union (a
+// `type B = "foo"` alias) peels to its member so it reads "a string literal",
+// not "a union".
+function operandKind(ix: i32): string {
+  if ix < 0 { return "a type" }
+  let t = T.tys[ix]
+  if t is TyUnion {
+    if t.uMembers.length == 1 { return operandKind(t.uMembers[0]) }
+    return "a union"
+  }
+  if t is TyLit {
+    if t.litKind == "str" { return "a string literal" }
+    return "a number literal"
+  }
+  if t is TyObj { return "an object" }
+  if t is TyFunc { return "a function" }
+  if t is TyPrim { return "the type `" + t.primName + "`" }
+  if t is TyArray { return "an array" }
+  if t is TyMap { return "a map" }
+  "a type"
+}
+
+// Split a synthetic intersection name (`A&B`, `{a:i32}&B`) into its TOP-LEVEL
+// operands (depth-aware, so a nested `{…}`/`[…]`/`(…)` `&` doesn't split). One
+// element when there is no top-level `&`.
+function splitTopAmp(name: string): string[] {
+  let parts: string[] = []
+  let depth = 0
+  let start = 0
+  let i = 0
+  while i < name.length {
+    let c = name[i]
+    if c == '{' || c == '[' || c == '(' {
+      depth = depth + 1
+    } else if c == '}' || c == ']' || c == ')' {
+      depth = depth - 1
+    } else if c == '&' && depth == 0 {
+      parts.push(name.slice(start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  parts.push(name.slice(start, name.length))
+  parts
+}
+
 // The base scalar a literal type SOFTENS to (host: `StringLiteral` → string,
 // `IntegerLiteral` → its magnitude-defaulted integer type, `RealLiteral` →
 // f64). An integer literal past the i32 range softens to i64 (the host's
@@ -5110,9 +5158,33 @@ function checkProgramNode(n: Program): i32 {
               vi = vi + 1
             }
             if resolvedAny && members.length == 0 {
-              tErr("Type `" + sd.udName + "` is `never` (an empty type — " +
-                "its operands have no common values), so it has no values",
-                stmts[ti])
+              // Explain the empty intersection in SOURCE terms (matching the TS
+              // host): name the two operands and their kinds (`A & B`, an object
+              // and a string literal), or call out a self-reference
+              // (`type E = A & E`). Falls back to the generic wording for a
+              // non-binary / non-intersection never (e.g. `type C = NeverAlias`).
+              let ops = splitTopAmp(variants[0])
+              let didDetail = false
+              if variants.length == 1 && ops.length == 2 {
+                let expr = ops[0] + " & " + ops[1]
+                let selfRef = ops[0] == sd.udName || ops[1] == sd.udName
+                if selfRef {
+                  tErr("Type `" + sd.udName +
+                    "` refers to itself inside an intersection (`" + expr +
+                    "`), so it reduces to `never`", stmts[ti])
+                } else {
+                  tErr("Type `" + sd.udName + "` is `never` (an empty type — `" +
+                    expr + "`, " + operandKind(nameToTy(ops[0])) + " and " +
+                    operandKind(nameToTy(ops[1])) +
+                    ", have no common values), so it has no values", stmts[ti])
+                }
+                didDetail = true
+              }
+              if !didDetail {
+                tErr("Type `" + sd.udName + "` is `never` (an empty type — " +
+                  "its operands have no common values), so it has no values",
+                  stmts[ti])
+              }
             }
           }
         }
