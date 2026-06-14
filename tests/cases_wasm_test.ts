@@ -97,7 +97,6 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
   "literals/err-prefix-separator.vl": LEX_WORDING,
   "literals/err-trailing-separator.vl": LEX_WORDING,
   "loops/for-in-not-array.vl": TS_WORDING,
-  "maps/error-object-literal-not-map.vl": TS_WORDING,
   "numerics/i32-to-f32-reject.vl": TS_WORDING,
   "numerics/i64-infer-let.vl":
     "native emitter gap: an unannotated let from an i64 expression materializes an i32 local (invalid wasm); the host infers the initializer's width — the native long tail",
