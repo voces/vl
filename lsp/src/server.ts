@@ -673,6 +673,23 @@ connection.onHover(async (params): Promise<Hover | null> => {
         return undefined;
       });
   };
+  // The native member-access type (`o.x`, `s.length`) under the cursor — the
+  // member hover the binding-only `hoverTypeAt` can't serve.
+  const wasmMemberType = async (): Promise<string | undefined> => {
+    if (wasmChecker?.memberTypeAt === undefined) return undefined;
+    return await wasmChecker
+      .memberTypeAt(
+        document.getText(),
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+        params.position.line,
+        params.position.character,
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] memberTypeAt failed: ${err}`);
+        return undefined;
+      });
+  };
   const wordForHover = wordAt(
     document.getText({
       start: { line: params.position.line, character: 0 },
@@ -685,7 +702,12 @@ connection.onHover(async (params): Promise<Hover | null> => {
     if (t && wordForHover) {
       return { contents: hoverMarkdown(`${wordForHover}: ${t}`) };
     }
-    // else fall through to the TS hover (members, imported names, flow types).
+    // Binding miss — try the native member type before the TS fallback.
+    const mt = await wasmMemberType();
+    if (mt && wordForHover) {
+      return { contents: hoverMarkdown(`${wordForHover}: ${mt}`) };
+    }
+    // else fall through to the TS hover (imported names, flow types).
   }
 
   const lineText = document.getText({
@@ -772,8 +794,15 @@ connection.onHover(async (params): Promise<Hover | null> => {
   if (checkedAst && spans) {
     const member = resolveMemberAt(checkedAst, spans, toVLPosition(params.position));
     if (member) {
+      const tsMemberType = stringifyType(member.type);
+      if (checkerMode === "both" && wasmChecker !== undefined) {
+        const diff = diffHoverType(tsMemberType, await wasmMemberType());
+        if (diff !== undefined) {
+          connection.console.log(`[wasm-parity] member ${params.textDocument.uri} ${diff}`);
+        }
+      }
       return {
-        contents: hoverMarkdown(`${member.name}: ${stringifyType(member.type)}`),
+        contents: hoverMarkdown(`${member.name}: ${tsMemberType}`),
       };
     }
   }

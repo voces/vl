@@ -94,6 +94,19 @@ export type WasmChecker = {
     character: number,
   ) => Promise<string | undefined>;
   /**
+   * Member hover: the rendered type string of the member access (`o.x` / `o?.y`)
+   * whose PROPERTY NAME is under the cursor, or undefined when the cursor is off
+   * any recorded member / the seed predates the export. Lets the wasm path serve
+   * member hover that `hoverTypeAt` (binding-only) can't.
+   */
+  memberTypeAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<string | undefined>;
+  /**
    * Semantic tokens (Stage 2): every classified IDENTIFIER occurrence in the
    * document (binding kind + declaration flag + span). Empty when the seed
    * predates the token exports — the host then falls back to its TS pass.
@@ -306,6 +319,25 @@ export const loadWasmChecker = (
     return readString(len, (j) => exp.typeStrCharAt(j));
   };
 
+  const memberTypeAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<string | undefined> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp) ||
+      typeof exp.memberTypeStrAt !== "function") {
+      return undefined;
+    }
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    const len = exp.memberTypeStrAt(line + 1, character);
+    if (len <= 0) return undefined;
+    return readString(len, (j) => exp.memberTypeStrCharAt(j));
+  };
+
   // The token exports ride the same Stage-2 seed as the symbol exports; an older
   // seed lacks them, so the method yields [] (the host falls back to TS).
   const hasTokens = (exp: Exports): boolean =>
@@ -469,6 +501,7 @@ export const loadWasmChecker = (
     definitionAt,
     referencesAt,
     hoverTypeAt,
+    memberTypeAt,
     tokensAt,
     formatSrc,
     lint,
