@@ -1,7 +1,13 @@
 # Deno deprecation — inventory & staged removal
 
-**Goal:** remove Deno from the project entirely. No `deno test`, `deno run`, `deno compile`,
+**North star:** remove Deno from the project entirely. No `deno test`, `deno run`, `deno compile`,
 `deno check`, `deno lint`; no `deno.json` / `deno.lock`; no `denoland/setup-deno` in CI.
+
+**Priority order matters.** The *active* top goal is **killing the two compilers** (ROADMAP Next) —
+Deno removal is the destination that goal is on the road to, not a parallel effort. Killing the TS
+host deletes Deno's single largest role (the TS-oracle brain) for free; everything in this doc is
+the residue that comes off *behind* that front. Don't spend effort fighting Deno where the TS-host
+kill already removes it.
 
 **End-state runtimes:** the `vl` brain runs under **wasmtime + WASI** (ROADMAP Track H, H-M2). The
 JS/TS tooling that outlives the TS compiler (LSP bundle, playground) runs under **Node**. Behavioral

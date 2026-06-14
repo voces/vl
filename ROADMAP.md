@@ -42,10 +42,11 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
      runs the WASM compiler under deno (the harness stays; the TS compiler leaves the gate
      path): compile via `build/vl-compiler.wasm` (the #345 loader pattern), run emitted bytes
      under V8 (`runWasm`), same directives. After this, the corpus gates are wasm-under-deno +
-     native-under-wasmtime — one brain, two engines, zero TS. Deno survives this step as bare
-     test/script infrastructure, but it is no longer permanent: **killing Deno is now a tracked
-     goal** (Track J). Killing the TWO COMPILERS is the prerequisite — it deletes Deno's
-     largest role (the TS-oracle brain) — and Track J removes the rest behind it.
+     native-under-wasmtime — one brain, two engines, zero TS. **Killing the TWO COMPILERS is the
+     top priority** — and it is the first and largest leg on the road to killing Deno: it deletes
+     Deno's biggest role (the TS-oracle brain) outright. Deno itself comes off afterward (Track J,
+     the follow-through); it is no longer treated as permanent, but it is sequenced behind this
+     front, not run in parallel with it.
   1. 🟡 **LSP-on-wasm.** Spike verdict GO (wasm checker 30–60× the TS checker; Stage 1 —
      `vital.checker: ts|wasm|both` — shipped, → `CHANGELOG.md`). The batch parity instrument
      (`scripts/checker-parity-sweep.ts`) holds the divergence inventory (83, mostly span
@@ -432,15 +433,19 @@ decoupled) → H-M2 host swap (kill the interim Rust host once the WASI driver l
 
 ---
 
-## Track J — Kill Deno
-*Goal: remove Deno entirely — no `deno test`, no `deno run`, no `deno compile`, no `deno.json`/
-`deno.lock`, no `setup-deno` in CI. The end-state runtime story is wasmtime+WASI for the
-`vl` brain (Track H, H-M2) and Node for the JS-side tooling that outlives the TS compiler (LSP
-bundling, the playground). Detailed inventory + staged plan: `docs/deno-deprecation.md`.*
+## Track J — Kill Deno (the destination behind the TS-host kill)
+*The north star: remove Deno entirely — no `deno test`, no `deno run`, no `deno compile`, no
+`deno.json`/`deno.lock`, no `setup-deno` in CI. End-state runtimes: wasmtime+WASI for the `vl`
+brain (Track H, H-M2), Node for the JS-side tooling that outlives the TS compiler (LSP bundling,
+the playground). Detailed inventory + staged plan: `docs/deno-deprecation.md`.*
 
-Deno is NOT one dependency — it fills six roles, removed on different timelines. Most of the
-surface dies as a side effect of fronts already in flight (the TS-host kill, `vl test`, H-M2);
-Track J is the residue that is genuinely Deno-specific plus the final teardown.
+**This track is NOT a competing now-priority.** The active front is **killing the two compilers**
+(see Next) — that is the top goal, and it is the road this leads down: it removes Deno's largest
+role for free. Track J is the follow-through *behind* that front. Deno is NOT one dependency — it
+fills six roles on different timelines, and most of the surface dies as a side effect of work
+already in flight (the TS-host kill, `vl test`, H-M2); J is the genuinely Deno-specific residue
+plus the final teardown, sequenced after the compilers are gone (the J4 bundling swap is the one
+piece that can land early, fully decoupled).
 
 - **J0 — the TS-oracle brain (biggest role; rides the TS-host kill).** `compiler/cli.ts` + the
   `compiler/*.ts` graph run under Deno; corpus adjudication + emit run in Deno's V8. This vanishes
