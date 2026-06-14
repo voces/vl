@@ -78,11 +78,6 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
     "wasm adds a cascade error (uninferable lambda return) beyond the declared diagnostic",
   "intrinsics/array-new-ref-elems.vl":
     "wasm emitter rejects ref-element `__array_new__` fills (i32/boolean/f64 only natively); the host lowers them generically — the native emitter long tail (std-design slice 0 residue)",
-  "literals/err-bad-hex-digit.vl": LEX_WORDING,
-  "literals/err-doubled-separator.vl": LEX_WORDING,
-  "literals/err-empty-hex.vl": LEX_WORDING,
-  "literals/err-prefix-separator.vl": LEX_WORDING,
-  "literals/err-trailing-separator.vl": LEX_WORDING,
   "numerics/i64-infer-let.vl":
     "native emitter gap: an unannotated let from an i64 expression materializes an i32 local (invalid wasm); the host infers the initializer's width — the native long tail",
   "numerics/widen-call-arg.vl":

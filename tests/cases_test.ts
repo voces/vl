@@ -469,6 +469,7 @@ const WASM_CANONICAL_WORDING: Record<string, boolean> = {
   "types/for-bound-type.vl": true,
   "types/i32-string-mismatch.vl": true,
   "types/infer-null-pin-guard.vl": true,
+  "literals/err-bad-hex-digit.vl": true,
 };
 
 for (const c of cases) {
