@@ -25,6 +25,16 @@ is open backlog — triage as you like.
 - **wasmtime 45 uses its own `wasmtime::Error`** (not `anyhow`) — minor host-glue
   friction (different `.context`/`bail!` surface than the ecosystem default).
 
+- **`fetch-seed.sh` didn't fall back to curl when `gh` was unauthenticated.**
+  `[FIXED]` — `fetch()` used `gh release download` whenever `gh` was merely on
+  PATH and only used curl when `gh` was ABSENT. In a sandbox with `gh` installed
+  but not logged in, the gh call failed and the whole fetch errored — even though
+  the release asset is public and a plain curl (302 → the published GitHub CDN
+  range, already in the firewall allowlist) returns it fine. Now it tries gh and
+  falls THROUGH to curl on any failure. (Diagnosed while bringing up the seed in
+  the restrictive devcontainer: the failure looked like a firewall block but was
+  purely the gh-XOR-curl branch.)
+
 ### Internal (`vl build` / `check` / `run`)
 
 - **`vl check` used to do a full compile** (parse→type→**emit**). `[FIXED #283]` —
