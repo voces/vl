@@ -1233,14 +1233,80 @@ function binaryChain(ix: i32, node: BinExpr, indent: i32, column: i32): string {
 
 function renderBinary(ix: i32, node: BinExpr, indent: i32, column: i32): string {
   if node.binOp == "=" {
-    let left = expr(node.binLeft, indent, column)
-    let right = expr(node.binRight, indent, column + left.length + 3)
-    return left + " = " + right
+    return renderAssign(ix, node, indent, column)
   }
   binaryChain(ix, node, indent, column)
 }
 
+// The token kind whose source-offset start is exactly `off`, or "" if none.
+function tokKindAt(off: i32): string {
+  let i = 0
+  while i < P.toks.length {
+    let t = P.toks[i]
+    if t.start == off { return t.kind }
+    i = i + 1
+  }
+  ""
+}
+
+// The surface compound-assignment operator char (`+`/`-`/`*`/`/`) for the first
+// assignment-family token within [start, stop), or "" when the assignment was
+// written as a plain `=`. The left operand of an assignment is an lvalue
+// (ident / member / index) and contains no assignment token, so the first such
+// token in the span IS the operator.
+function compoundOpIn(start: i32, stop: i32): string {
+  let i = 0
+  while i < P.toks.length {
+    let t = P.toks[i]
+    if t.start >= start && t.start < stop {
+      if t.kind == "PLUSEQ" { return "+" }
+      if t.kind == "MINUSEQ" { return "-" }
+      if t.kind == "STAREQ" { return "*" }
+      if t.kind == "SLASHEQ" { return "/" }
+      if t.kind == "EQUAL" { return "" }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// An assignment `=` node. The parser DESUGARS `a += b` → `a = a + b`, prefix
+// `++x` → `x = x + 1`, and prefix `--x` → `x = x - 1`; recover the SURFACE form
+// from the source tokens so the printer reproduces what was written (host parity).
+function renderAssign(ix: i32, node: BinExpr, indent: i32, column: i32): string {
+  let leftPos = nodePos(node.binLeft)
+  // Prefix `++x` / `--x`: the `=` node is anchored at the prefix operator, so it
+  // starts BEFORE the target it assigns.
+  if node.pos >= 0 && leftPos >= 0 && node.pos < leftPos {
+    let pk = tokKindAt(node.pos)
+    if pk == "PLUSPLUS" { return "++" + expr(node.binLeft, indent, column + 2) }
+    if pk == "MINUSMINUS" { return "--" + expr(node.binLeft, indent, column + 2) }
+  }
+  let left = expr(node.binLeft, indent, column)
+  // Compound assignment: emit `<left> <op>= <addend>` where the addend is the
+  // right operand of the desugared inner arithmetic node (`a + b` → `b`).
+  let op = compoundOpIn(nodePos(ix), nodeEndOf(ix))
+  if op.length > 0 {
+    let addendIx = node.binRight
+    let r = P.nodes[node.binRight]
+    if r is BinExpr { addendIx = r.binRight }
+    return left + " " + op + "= " + expr(addendIx, indent, column + left.length + 4)
+  }
+  left + " = " + expr(node.binRight, indent, column + left.length + 3)
+}
+
 function unary(ix: i32, node: Unary, indent: i32, column: i32): string {
+  // Postfix `x++` / `x--`: the parser models it as `Unary("p+"/"p-", (x = x+1))`.
+  // Recover the target (the inner assignment's left) and the surface operator.
+  if node.unOp == "p+" || node.unOp == "p-" {
+    let pop = "++"
+    if node.unOp == "p-" { pop = "--" }
+    let inner = P.nodes[node.unArg]
+    if inner is BinExpr {
+      return expr(inner.binLeft, indent, column) + pop
+    }
+    return expr(node.unArg, indent, column) + pop
+  }
   let operand = expr(node.unArg, indent, column)
   if node.unOp == "!" {
     let a = P.nodes[node.unArg]
