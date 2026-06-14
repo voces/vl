@@ -71,8 +71,6 @@ const TS_WORDING =
   "@error text pins the TS message; the wasm reject message differs in substance";
 const PARSER_WORDING =
   "@error text pins the TS parser message; wasm parse-recovery wording differs";
-const LEX_WORDING =
-  "the wasm lexer splits the malformed literal into plain tokens (undeclared-identifier reject) — no lex-tier message parity";
 const EXPECTED_DIVERGENCES: Record<string, string> = {
   "functions/lambda-uninferable-param.vl":
     "wasm adds a cascade error (uninferable lambda return) beyond the declared diagnostic",
