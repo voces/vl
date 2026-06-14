@@ -63,6 +63,20 @@ export type WasmMemberToken = {
   isMethod: boolean;
 };
 
+/**
+ * One in-scope binding from the wasm scope-at-position pass — a
+ * variable/parameter/function visible at the cursor, the native counterpart of
+ * the host's `bindingsInScopeAt` walk. `kind` is 0=variable / 1=parameter /
+ * 2=function (the same convention as {@link WasmToken}'s `bindKind`); `type` is
+ * the rendered type string, empty when the binding has no retained type. The
+ * native set covers only USER bindings — builtins/imports/types stay host-side.
+ */
+export type WasmScopeBinding = {
+  name: string;
+  kind: number; // 0=variable 1=parameter 2=function
+  type: string; // rendered type, "" when none
+};
+
 export type WasmChecker = {
   /** Diagnostics for `source` as the entry module at `entryKey`. */
   check: (
@@ -141,6 +155,22 @@ export type WasmChecker = {
     entryKey: string,
     read: ModuleReader,
   ) => Promise<WasmMemberToken[]>;
+  /**
+   * Scope-at-position completions (kill-TS): every user binding
+   * (variable/parameter/function) visible at (`line`, `character`) — both
+   * 0-based, LSP — the native counterpart of the host's `bindingsInScopeAt`
+   * walk. The set excludes builtins/imports/types (the host folds those in), so
+   * the completion path merges these over the builtin-derived items. Empty when
+   * the seed predates the scope exports — the host then falls back to its TS
+   * `identifierCompletions`.
+   */
+  scopeAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<WasmScopeBinding[]>;
   /**
    * Whole-document formatting (kill-TS step 1, the `format.ts` consumer): the
    * canonical reprint of `source` via the self-hosted formatter (`format.vl`'s
@@ -434,6 +464,44 @@ export const loadWasmChecker = (
     return out;
   };
 
+  // The scope exports ride the same Stage-2 seed as the symbol exports; an older
+  // seed lacks them, so the method yields [] (the host falls back to its TS
+  // `identifierCompletions`).
+  const hasScope = (exp: Exports): boolean =>
+    typeof exp.scopeAt === "function" &&
+    typeof exp.scopeNameLen === "function" &&
+    typeof exp.scopeKindAt === "function";
+
+  const scopeAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<WasmScopeBinding[]> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp) || !hasScope(exp)) return [];
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    // Native lines are 1-based; the LSP cursor line is 0-based.
+    const count = exp.scopeAt(line + 1, character);
+    const out: WasmScopeBinding[] = [];
+    for (let i = 0; i < count; i++) {
+      // The native side rebuilds the per-index NAME buffer on each
+      // `scopeNameLen(i)`/`scopeNameCharAt(i, j)` call keyed by `i`, then the
+      // TYPE buffer likewise — so read all of one name, then all of one type,
+      // for a given `i` before moving on (nothing interleaves another index).
+      const name = readString(exp.scopeNameLen(i), (j) => exp.scopeNameCharAt(i, j));
+      if (name.length === 0) continue; // defensive: a binding always has a name
+      const typeLen = exp.scopeTypeLen(i);
+      const type = typeLen <= 0
+        ? ""
+        : readString(typeLen, (j) => exp.scopeTypeCharAt(i, j));
+      out.push({ name, kind: exp.scopeKindAt(i), type });
+    }
+    return out;
+  };
+
   const check = async (
     source: string,
     entryKey: string,
@@ -561,6 +629,7 @@ export const loadWasmChecker = (
     memberTypeAt,
     tokensAt,
     memberTokensAt,
+    scopeAt,
     formatSrc,
     lint,
   };

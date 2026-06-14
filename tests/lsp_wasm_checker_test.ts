@@ -458,3 +458,55 @@ Deno.test({ name: "wasm-symbols: memberTokensAt is empty on source with no membe
   const members = await checker.memberTokensAt("let a = 1\nprint(a)\n", "/tmp/x.vl", noSiblings);
   if (members.length !== 0) throw new Error(`expected no members, got ${JSON.stringify(members)}`);
 });
+
+// `scopeAt` enumerates the user bindings (var/param/function) visible at a
+// position — the native `bindingsInScopeAt` behind scope-aware completion.
+
+Deno.test({ name: "wasm-symbols: scopeAt sees params + locals + top-level in a function body", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "function add(a: i32, b: i32): i32 {\n  let s = a + b\n  s\n}\nlet top = 1\n";
+  // line 2 (0-based), inside the body: a, b (params), s (local), add + top (top-level).
+  const names = (await checker.scopeAt(src, "/tmp/x.vl", noSiblings, 2, 4)).map((b) => b.name);
+  for (const want of ["add", "a", "b", "s", "top"]) {
+    if (!names.includes(want)) throw new Error(`expected '${want}' in scope, got ${JSON.stringify(names)}`);
+  }
+});
+
+Deno.test({ name: "wasm-symbols: scopeAt classifies kind and carries the type", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "function add(a: i32, b: i32): i32 {\n  let s = a + b\n  s\n}\nlet top = 1\n";
+  const got = await checker.scopeAt(src, "/tmp/x.vl", noSiblings, 2, 4);
+  const a = got.find((b) => b.name === "a");
+  if (!a || a.kind !== 1) throw new Error(`expected 'a' kind 1 (parameter), got ${JSON.stringify(a)}`);
+  if (a.type !== "i32") throw new Error(`expected 'a' type i32, got ${JSON.stringify(a?.type)}`);
+  const fn = got.find((b) => b.name === "add");
+  if (!fn || fn.kind !== 2) throw new Error(`expected 'add' kind 2 (function), got ${JSON.stringify(fn)}`);
+});
+
+Deno.test({ name: "wasm-symbols: scopeAt keeps a demand-inferred forward function global", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // `helper` has an un-annotated return and is forward-called from a NESTED block
+  // in `main`, so it is demand-inferred from a deep stack. Its visibility must
+  // stay global (the pass-1 stamp wins), so it appears at top-level positions.
+  const src =
+    "function main(): i32 {\n  let acc = 0\n  if acc == 0 {\n    acc = helper()\n  }\n  acc\n}\nfunction helper() {\n  42\n}\n";
+  // line 5 (0-based), in main's body but OUTSIDE the if-block.
+  const names = (await checker.scopeAt(src, "/tmp/x.vl", noSiblings, 5, 2)).map((b) => b.name);
+  if (!names.includes("helper")) {
+    throw new Error(`expected forward 'helper' visible, got ${JSON.stringify(names)}`);
+  }
+});
+
+Deno.test({ name: "wasm-symbols: scopeAt respects block scope (an inner binding does not leak out)", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "let g = 1\nif g == 1 {\n  let inner = 2\n}\nlet after = 3\n";
+  // line 2 (0-based), inside the if-block: inner IS visible.
+  const inside = (await checker.scopeAt(src, "/tmp/x.vl", noSiblings, 2, 4)).map((b) => b.name);
+  if (!inside.includes("inner")) throw new Error(`expected 'inner' inside the block, got ${JSON.stringify(inside)}`);
+  // line 4 (0-based), after the block closed: inner is gone, g + after remain.
+  const after = (await checker.scopeAt(src, "/tmp/x.vl", noSiblings, 4, 0)).map((b) => b.name);
+  if (after.includes("inner")) throw new Error(`'inner' should not leak past its block, got ${JSON.stringify(after)}`);
+  if (!after.includes("g") || !after.includes("after")) {
+    throw new Error(`expected 'g' and 'after' visible, got ${JSON.stringify(after)}`);
+  }
+});
