@@ -922,6 +922,7 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32): boolean {
   // Collect clause condition + body arena indices walking the chain.
   let condIxs: i32[] = []
   let bodyIxs: i32[] = []
+  let clauseIxs: i32[] = []
   let hasElse = false
   let elseBodyIx = 0 - 1
   let curIx = ix
@@ -931,6 +932,7 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32): boolean {
     if c is IfStmt {
       condIxs.push(c.ifCond)
       bodyIxs.push(c.ifThen)
+      clauseIxs.push(curIx)
       let e = c.ifElse
       if e < 0 {
         walking = false
@@ -957,14 +959,19 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32): boolean {
       return false
     }
   }
-  // Block layout: `if cond {` / `} elseif cond {` / `} else {` / `}`.
+  // Block layout: `if cond {` / `} elseif cond {` / `} else {` / `}`. The chain
+  // keyword (`elseif` vs `else if`) is recovered per-clause from the source token
+  // at the clause's `if` node — both parse to the same nested-If AST, so only the
+  // surface token tells them apart (host parity).
   let m = 0
   while m < condIxs.length {
     let cond = expr(condIxs[m], indent, 0)
     if m == 0 {
       emitLine(indent, "if " + cond + " {")
     } else {
-      emitLine(indent, "} elseif " + cond + " {")
+      let kw = "} elseif "
+      if tokKindAt(nodePos(clauseIxs[m])) == "IF" { kw = "} else if " }
+      emitLine(indent, kw + cond + " {")
     }
     emitBlockBody(bodyIxs[m], indent)
     m = m + 1
@@ -1306,6 +1313,18 @@ function unary(ix: i32, node: Unary, indent: i32, column: i32): string {
       return expr(inner.binLeft, indent, column) + pop
     }
     return expr(node.unArg, indent, column) + pop
+  }
+  // Negated type guard `x !is T`: the parser desugars it to `!(x is T)` as a
+  // `Unary("!", IsExpr)` anchored at the OPERAND (its pos is the operand's first
+  // token, not the `!`). A genuine prefix `!` anchors at the `!` token. Recover
+  // the surface `!is` form when the operand-anchored shape is present.
+  if node.unOp == "!" {
+    let g = P.nodes[node.unArg]
+    if g is IsExpr {
+      if tokKindAt(node.pos) != "BANG" {
+        return expr(g.isObj, indent, column) + " !is " + recoverIsType(node.unArg)
+      }
+    }
   }
   let operand = expr(node.unArg, indent, column)
   if node.unOp == "!" {
