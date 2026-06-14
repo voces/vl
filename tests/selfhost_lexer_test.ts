@@ -173,6 +173,33 @@ print("diags: " + toString(r.diags.length))
     ],
   },
   {
+    // Comment retention (Lane 2 fidelity rung): `//`/`///` comments are collected
+    // into `LexResult.comments` as trivia (NOT in `tokens`), with verbatim text,
+    // line, doc-vs-line, and trailing-vs-own-line placement.
+    name: "retains // line and /// doc comments as trivia (text + placement)",
+    body: `
+let r = tokenize("let x = 1 // trail\\n/// doc\\nlet y = 2")
+let i = 0
+while i < r.comments.length {
+  let cm = r.comments[i]
+  let kind = "line"
+  if cm.doc { kind = "doc" }
+  let place = "own"
+  if cm.trailing { place = "trail" }
+  print(kind + " " + place + " L" + toString(cm.line) + " " + cm.text)
+  i = i + 1
+}
+print("comments: " + toString(r.comments.length))
+print("tokens have no comment kind: " + toString(r.tokens.length))
+`,
+    expected: [
+      "line trail L1 // trail",
+      "doc own L2 /// doc",
+      "comments: 2",
+      "tokens have no comment kind: 11",
+    ],
+  },
+  {
     name: "reports unterminated string and bad char literals",
     body: `
 let bad = tokenize("x = \\"oops")
