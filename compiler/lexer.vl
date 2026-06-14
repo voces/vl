@@ -102,6 +102,14 @@ function isOctDigit(c: i32): boolean {
   c >= '0' && c <= '7'
 }
 
+// A digit of the given base (16 hex / 2 binary / 8 octal / else decimal).
+function isRadixDigit(c: i32, base: i32): boolean {
+  if base == 16 { return isHex(c) }
+  if base == 2 { return isBinDigit(c) }
+  if base == 8 { return isOctDigit(c) }
+  isDigit(c)
+}
+
 // ---- scanner primitives --------------------------------------------------
 
 // The char code at the current position, or -1 at end of input.
@@ -276,6 +284,62 @@ function mkTok(
   }
 }
 
+// Scan the digit run of a base-prefixed integer (`0x`/`0b`/`0o`), the prefix
+// ALREADY consumed. Validates digits + `_` separators and emits at most one lex
+// diagnostic; consumes any trailing identifier run so a malformed suffix (`0xG`,
+// `0x_FF`) never cascades into a separate "undeclared identifier". The caller
+// pushes the (recovery) NUMBER token from the span. Returns the diag count.
+// NOTE: condition expressions store each `isRadixDigit`/`isIdPart` call in a
+// BOOL LOCAL first — the frozen TS host emitter drops a bare boolean call used
+// directly as an `if` condition (the native emitter handles it), so mirror the
+// existing lexer's `let c = peek(); if isIdStart(c)` shape.
+function scanRadix(base: i32, baseName: string, prefixChar: i32): i32 {
+  let any = false
+  let bad = false
+  while gPos < gSrc.length {
+    let p = peek()
+    let pIsDigit = isRadixDigit(p, base)
+    let p2IsDigit = isRadixDigit(peek2(), base)
+    if pIsDigit {
+      advance()
+      any = true
+    } else if p == '_' && any && p2IsDigit {
+      // A separator is legal only BETWEEN two digits.
+      advance()
+    } else if p == '_' {
+      // A separator at the start, doubled, or trailing (`0x_F`, `0xF__F`, `0xF_`).
+      diag("`_` may only separate digits in a numeric literal")
+      bad = true
+      break
+    } else {
+      break
+    }
+  }
+  if !bad {
+    let pc = peek()
+    let stray = isIdPart(pc)
+    if !any && stray {
+      // No valid digit, a stray id char names the bad digit (`0xG`).
+      diag("invalid " + baseName + " digit '" + fromCodePoint(pc) + "'")
+      bad = true
+    } else if !any {
+      // Nothing usable after the prefix (`0x`).
+      diag(baseName + " literal has no digits after `0" + fromCodePoint(prefixChar) + "`")
+      bad = true
+    } else if stray {
+      // Digits, then a non-base id char (`0xFG`).
+      diag("invalid " + baseName + " digit '" + fromCodePoint(pc) + "'")
+      bad = true
+    }
+  }
+  if bad {
+    while gPos < gSrc.length && isIdPart(peek()) {
+      advance()
+    }
+  }
+  gDiags.length
+}
+
 // ---- string / char scanning ----------------------------------------------
 // Scan a quoted literal (the cursor is on the opening quote). `quote` is the
 // quote char code. Returns the decoded `value` with escapes resolved; `\xXX` /
@@ -441,44 +505,47 @@ export function tokenize(source: string): LexResult {
     // (lexer.ts); the host normalizes the token text to decimal up-front, while we
     // keep the raw lexeme and fold the base at value time in `parseI32`.
     if isDigit(c) {
-      // `0x`/`0X` hex literal — at least one hex digit must follow the prefix.
-      if c == '0' && (peek2() == 'x' || peek2() == 'X') && isHex(peekN(2)) {
+      // Base-prefixed integer: `0x`/`0X` hex, `0b`/`0B` binary, `0o`/`0O` octal.
+      // The prefix is recognized REGARDLESS of what follows, so a malformed
+      // literal (`0x`, `0xG`, `0x_FF`) becomes ONE clear lex error via `scanRadix`
+      // instead of silently splitting into `0` + an identifier.
+      if c == '0' && (peek2() == 'x' || peek2() == 'X') {
         advance()                          // '0'
         advance()                          // 'x' / 'X'
-        // A `_` separator is legal only BETWEEN digits (no doubled `__`, no
-        // trailing `_`): consume it only when a digit follows.
-        while gPos < gSrc.length && (isHex(peek()) || (peek() == '_' && isHex(peek2()))) {
-          advance()
-        }
+        scanRadix(16, "hex", 'x')
         toks.push(mkTok("NUMBER", "", startPos, startLine, startCol))
         continue
       }
-      // `0b`/`0B` binary literal — at least one binary digit must follow.
-      if c == '0' && (peek2() == 'b' || peek2() == 'B') && isBinDigit(peekN(2)) {
+      if c == '0' && (peek2() == 'b' || peek2() == 'B') {
         advance()                          // '0'
         advance()                          // 'b' / 'B'
-        while gPos < gSrc.length && (isBinDigit(peek()) || (peek() == '_' && isBinDigit(peek2()))) {
-          advance()
-        }
+        scanRadix(2, "binary", 'b')
         toks.push(mkTok("NUMBER", "", startPos, startLine, startCol))
         continue
       }
-      // `0o`/`0O` octal literal — at least one octal digit must follow.
-      if c == '0' && (peek2() == 'o' || peek2() == 'O') && isOctDigit(peekN(2)) {
+      if c == '0' && (peek2() == 'o' || peek2() == 'O') {
         advance()                          // '0'
         advance()                          // 'o' / 'O'
-        while gPos < gSrc.length && (isOctDigit(peek()) || (peek() == '_' && isOctDigit(peek2()))) {
-          advance()
-        }
+        scanRadix(8, "octal", 'o')
         toks.push(mkTok("NUMBER", "", startPos, startLine, startCol))
         continue
       }
+      // Plain decimal, optional fractional part. A `_` separator is legal only
+      // BETWEEN digits (consumed when a digit follows).
       while gPos < gSrc.length && (isDigit(peek()) || (peek() == '_' && isDigit(peek2()))) {
         advance()
       }
       if peek() == '.' && isDigit(peek2()) {
         advance()
         while gPos < gSrc.length && (isDigit(peek()) || (peek() == '_' && isDigit(peek2()))) {
+          advance()
+        }
+      }
+      // A misplaced separator (doubled `1__0`, trailing `1_`) — a `_` left here
+      // sits at the start, end, or against another `_`, never between digits.
+      if peek() == '_' {
+        diag("`_` may only separate digits in a numeric literal")
+        while gPos < gSrc.length && isIdPart(peek()) {
           advance()
         }
       }
