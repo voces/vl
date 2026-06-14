@@ -42,8 +42,11 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
      runs the WASM compiler under deno (the harness stays; the TS compiler leaves the gate
      path): compile via `build/vl-compiler.wasm` (the #345 loader pattern), run emitted bytes
      under V8 (`runWasm`), same directives. After this, the corpus gates are wasm-under-deno +
-     native-under-wasmtime — one brain, two engines, zero TS — and `deno test` survives as
-     infrastructure (the maintainer cares about killing the TWO COMPILERS, not deno).
+     native-under-wasmtime — one brain, two engines, zero TS. **Killing the TWO COMPILERS is the
+     top priority** — and it is the first and largest leg on the road to killing Deno: it deletes
+     Deno's biggest role (the TS-oracle brain) outright. Deno itself comes off afterward (Track J,
+     the follow-through); it is no longer treated as permanent, but it is sequenced behind this
+     front, not run in parallel with it.
   1. 🟡 **LSP-on-wasm.** Spike verdict GO (wasm checker 30–60× the TS checker; Stage 1 —
      `vital.checker: ts|wasm|both` — shipped, → `CHANGELOG.md`). The batch parity instrument
      (`scripts/checker-parity-sweep.ts`) holds the divergence inventory (83, mostly span
@@ -336,7 +339,8 @@ from current `compiler/*.vl` in ~3s.*
   the past wins/abandons live in `docs/perf-findings.md` + `CHANGELOG.md`. REMAINING:
   - ⬜ **F9b. Cache / clone binaryen IR across selfhost sub-tests** — LOW priority (the dominant
     cost fell with the F9c memoize; binaryen modules are not trivially cloneable).
-  - 🟡 **F-tiers. Collapse the redundant corpus runner.** REMAINING: delete the
+  - 🟡 **F-tiers. Collapse the redundant corpus runner.** (This is Track J's J1 — it removes
+    Deno-as-an-engine.) REMAINING: delete the
     `SELFHOST_DENO_RUN`-gated tiers (the corpus RUN half + its 305-file whitelist, the check→emit
     verdicts, the V8-side golden fixpoint + emit-program suite) outright once the native tier is
     the undisputed runner; fold the deno-side CHECK verdicts the same way when the native checker
@@ -426,3 +430,62 @@ independent).*
 **Sequence:** kill-the-TS-host staging (LSP-on-wasm stages → tier deletion → `std:` Phase 2) →
 real import/export for the `.vl` build (post module-revisit) → C5/H-M1 distribution (anytime,
 decoupled) → H-M2 host swap (kill the interim Rust host once the WASI driver lands).
+
+---
+
+## Track J — Kill Deno (the destination behind the TS-host kill)
+*The north star: remove Deno entirely — no `deno test`, no `deno run`, no `deno compile`, no
+`deno.json`/`deno.lock`, no `setup-deno` in CI. End-state runtimes: wasmtime+WASI for the `vl`
+brain (Track H, H-M2), Node for the JS-side tooling that outlives the TS compiler (LSP bundling,
+the playground). Detailed inventory + staged plan: `docs/deno-deprecation.md`.*
+
+**This track is NOT a competing now-priority.** The active front is **killing the two compilers**
+(see Next) — that is the top goal, and it is the road this leads down: it removes Deno's largest
+role for free. Track J is the follow-through *behind* that front. Deno is NOT one dependency — it
+fills six roles on different timelines, and most of the surface dies as a side effect of work
+already in flight (the TS-host kill, `vl test`, H-M2); J is the genuinely Deno-specific residue
+plus the final teardown, sequenced after the compilers are gone (the J4 bundling swap is the one
+piece that can land early, fully decoupled).
+
+- **J0 — the TS-oracle brain (biggest role; rides the TS-host kill).** `compiler/cli.ts` + the
+  `compiler/*.ts` graph run under Deno; corpus adjudication + emit run in Deno's V8. This vanishes
+  when the TWO COMPILERS die (see Next) — no Deno-specific work, just don't block it. `deno check`
+  / `deno lint` (the TS type+lint gate, CI) go with it; the `.vl` side is already covered by the
+  native checker + `lint.vl`.
+- 🟡 **J1 — the V8 wasm executor.** Tests run emitted wasm via `runWasm` in Deno's V8; the native
+  tier already runs the same bytes under wasmtime (`scripts/vl-host`, `ci-native`). REMAINING:
+  finish folding the corpus RUN + CHECK verdicts onto the native/wasmtime tier (this is F-tiers +
+  Next step 2) so no gate depends on Deno-as-an-engine. Then the only thing left for Deno is
+  *orchestration*, not execution.
+- ⬜ **J2 — the test harness (the hard core).** All 52 `tests/*.ts` are `Deno.test`. Split by what
+  they test:
+  - **Behavioral `.vl` corpus** (`cases_test`/`cases_wasm_test`, `selfhost_*`) → migrate to the
+    native runner + `*.test.vl` under **`vl test`** (already designed/charted — see Next +
+    `docs/test-runner-design.md`). This is the bulk of the harness and the main forcing function.
+  - **TS-infra tests** (LSP, playground, lint-TS, format, symbols, stringify, source-map) → these
+    test TS that outlives the compiler; they move to a **Node** test runner (`node --test`) when
+    their subsystem is ported, OR ride along under Deno until then. Decide the Node-runner cutover
+    once `vl test` has absorbed the behavioral corpus.
+- ⬜ **J3 — build/dev scripts.** `deno run scripts/*.ts` (gen-std, build-binary, smoke-binary,
+  perf*, checker-parity-sweep, native-golden-check). Two buckets: **load-bearing** (gen-std embeds
+  the std; native-golden-check is a CI tripwire) → port to `.vl`/native or to Node; **dev-only**
+  (perf, parity sweeps) → can lag, move to Node last or retire. Audit each for a `Deno.*` global.
+- ⬜ **J4 — bundling (independent; can land anytime).** The LSP (`cd lsp && deno task build`) and
+  the playground (`playground/build.ts`) are esbuild-under-Deno; their deps are already
+  node-resolvable (binaryen, vscode-languageserver*, monaco). Swap to esbuild-on-Node (`npm`
+  scripts) — decoupled from all compiler work, the cleanest early win.
+- ⬜ **J5 — distribution.** `deno compile` builds the `vl` binary today (C5 / `release.yml` /
+  DECISIONS "Distribute via `deno compile`"). Superseded by H-M2 (wasmtime+WASI; `scripts/vl-host`
+  already exists). The `deno compile` binary is now explicitly the **interim** distribution, not
+  the destination — retire it when H-M2's WASI driver lands. (DECISIONS entry annotated.)
+- ⬜ **J6 — final teardown.** Once J0–J5 land: delete `deno.json` + `deno.lock`, drop
+  `denoland/setup-deno` from `ci.yml`/`pages.yml` (replace the deno cache steps with node/wasmtime),
+  rewrite the AGENTS.md command list off `deno task *`, and remove the dual-runtime `no unguarded
+  Deno globals` rule (compiler core becomes Node+wasmtime only).
+
+**Sequence:** J4 (anytime, independent) ‖ J0 rides the TS-host kill ‖ J1 finishes with F-tiers →
+J2 behavioral corpus onto `vl test` → J3 load-bearing scripts → J2 TS-infra onto `node --test` →
+J5 folds into H-M2 → J6 teardown. **Dependencies:** J2-behavioral needs `vl test` (Next); J5
+needs H-M2 (Track H); the rest is unblocked. **Open decisions (maintainer):** Node `node --test`
+vs another runner for the surviving JS-side tests (J2/J3); whether load-bearing scripts port to
+`.vl` (dogfood) or to Node (faster).

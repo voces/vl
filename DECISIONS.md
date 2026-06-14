@@ -226,8 +226,11 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   two statements, `a - b` is subtraction) or carries a real perf cost. Applies to
   both the TS parser and the self-hosted `parser.vl` being built for the
   bootstrap. (G8)
-- **Distribute via `deno compile`.** A single native `vl` binary (V8 + the TS
-  compiler + binaryen.js) through brew; versionless for now. Chosen over
+- **Distribute via `deno compile`.** *(INTERIM — superseded as the destination by
+  the "Kill Deno" goal, ROADMAP Track J / J5. `deno compile` is now explicitly the
+  stopgap distribution, not the end-state: it folds into H-M2's wasmtime+WASI model
+  once the WASI driver lands. Kept until then.)* A single native `vl` binary (V8 +
+  the TS compiler + binaryen.js) through brew; versionless for now. Chosen over
   hand-rolling a wasm-native bundle so distribution ships now, decoupled from
   self-hosting (H-M2). Verified: `npm:binaryen@130` is a single-file Emscripten
   build with the wasm inlined as base64, so it instantiates inside the compiled
