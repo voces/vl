@@ -145,7 +145,10 @@ tok("EOF","")`,
     // `a + b` now WIDENS the i32 to f64 (B2 numeric-widening lattice) and yields f64;
     // the f64 result then flows into the `c: i32` slot, which is a LOSSY narrowing and
     // is rejected — a single diagnostic on the assignment (no error on `a + b` itself).
-    expected: ["diags: 1", "cannot assign f64 to 'c' of type i32"],
+    expected: [
+      "diags: 1",
+      "f64 doesn't fit in i32 — the conversion is lossy and must be made explicit (narrowing truncates the value)",
+    ],
   },
   {
     label: "member-access",

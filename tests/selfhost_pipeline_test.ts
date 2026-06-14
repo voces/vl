@@ -109,7 +109,10 @@ const CASES: Case[] = [
     src: "let a: i32 = 1\nlet b: f64 = 2.0\nlet c: i32 = a + b\n",
     // `a + b` now widens i32→f64 (B2 widening lattice) → f64; the f64 result into the
     // `c: i32` slot is a lossy narrowing and is rejected (single diagnostic).
-    expected: ["diags: 1", "cannot assign f64 to 'c' of type i32"],
+    expected: [
+      "diags: 1",
+      "f64 doesn't fit in i32 — the conversion is lossy and must be made explicit (narrowing truncates the value)",
+    ],
   },
 ];
 
