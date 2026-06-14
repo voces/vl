@@ -74,7 +74,9 @@ doesn't belong here.
 - **Always open a PR for work you push, and auto-watch it** — don't leave finished work
   on an un-PR'd branch. Open the PR, subscribe to its activity, and follow it through
   until it is merged or closed (investigate CI failures and review comments; fix the
-  small/clear ones, ask on anything ambiguous).
+  small/clear ones, ask on anything ambiguous). The *how* (one `Monitor` over all open
+  PRs, the notification tools, replying to review feedback) is in
+  [`docs/agent-pr-watch.md`](docs/agent-pr-watch.md).
 
 ### Comments
 
