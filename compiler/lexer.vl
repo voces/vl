@@ -50,9 +50,28 @@ type Tok = {
 }
 
 // The result of lexing: the token stream (EOF-terminated) and any diagnostics.
+// A retained `//` (or doc `///`) comment. Kept OUT of `tokens` so the parser's
+// peek/lookahead is untouched — comments are metadata for the formatter / doc
+// cross-refs, not grammar tokens. `text` is the VERBATIM lexeme including the
+// leading `//`; `start`/`line`/`col` anchor it (char offset, 1-based line,
+// 0-based col); `trailing` is true when it sits on the SAME source line AFTER a
+// real token (`let x = 1 // c`), false when it stands on its own line. Native
+// counterpart of the host lexer's `Comment` (`kind`/`placement`). Defined BEFORE
+// `LexResult` so the frozen TS host (which does not hoist type aliases) resolves
+// the forward reference.
+type Comment = {
+  doc: boolean,
+  text: string,
+  start: i32,
+  line: i32,
+  col: i32,
+  trailing: boolean
+}
+
 export type LexResult = {
   tokens: Tok[],
-  diags: Diag[]
+  diags: Diag[],
+  comments: Comment[]
 }
 
 // ---- scanner state (ref-typed module globals) ----------------------------
@@ -65,6 +84,7 @@ let gPos = 0
 let gLine = 1
 let gCol = 0
 let gDiags: Diag[] = []
+let gComments: Comment[] = []
 
 // ---- character classes (char literals) -----------------------------------
 
@@ -455,6 +475,8 @@ export function tokenize(source: string): LexResult {
   gCol = 0
   let fresh: Diag[] = []
   gDiags = fresh
+  let freshC: Comment[] = []
+  gComments = freshC
 
   let toks: Tok[] = []
 
@@ -478,11 +500,28 @@ export function tokenize(source: string): LexResult {
       continue
     }
 
-    // Line comment `// ...` (and doc `/// ...`) — consumed up to the newline.
+    // Line comment `// ...` (and doc `/// ...`) — consumed up to the newline and
+    // RETAINED as trivia in `gComments` (not emitted into `toks`, so the parser
+    // is untouched). A doc comment is `///`; a comment is `trailing` when the
+    // last emitted token sits on this same source line (`let x = 1 // c`).
     if c == '/' && peek2() == '/' {
+      let isDoc = peekN(2) == '/'
       while gPos < gSrc.length && peek() != '\n' && peek() != '\r' {
         advance()
       }
+      let isTrailing = false
+      if toks.length > 0 {
+        let lt = toks[toks.length - 1]
+        if lt.kind != "NEWLINE" && lt.line == startLine { isTrailing = true }
+      }
+      gComments.push({
+        doc: isDoc,
+        text: gSrc.slice(startPos, gPos),
+        start: startPos,
+        line: startLine,
+        col: startCol,
+        trailing: isTrailing,
+      })
       continue
     }
 
@@ -610,5 +649,5 @@ export function tokenize(source: string): LexResult {
   }
 
   toks.push(mkTok("EOF", "", gPos, gLine, gCol))
-  { tokens: toks, diags: gDiags }
+  { tokens: toks, diags: gDiags, comments: gComments }
 }
