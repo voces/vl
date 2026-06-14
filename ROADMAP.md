@@ -206,7 +206,10 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 - 🟡 **B8. Loops.** REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
   destructuring forms; **expression `step`** on a counter range (`for i = 1 to 5 step i * 2` — a
   multiplicative/variable step, not just a const increment), distinct from the const-step
-  build-loop-fusion descriptor (DECISIONS) and the `step 0` lint (B17).
+  build-loop-fusion descriptor (DECISIONS) and the `step 0` lint (B17);
+  **float for-range bounds** (`for i = 1 to 1.5` — today bounds must be i32; open up to f64, maint.
+  note on #377); **user-defined iterators** (`for x in <anything>` via an iterator protocol, so
+  `for…in` is not array/map-only — maint. note on #377).
 - ⬜ **B12. `async`/`await`.** Keywords lexed; no semantics/codegen. Large; likely last.
 - 🟡 **B13. Well-known-symbol dispatch.** REMAINING: callable objects (`"()"`).
 - ⬜ **B13a. Multi-index matrix idiom** (low priority). Single-bracket `m[i, j]` → multi-arg
