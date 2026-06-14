@@ -82,6 +82,7 @@ import {
   memberCompletions,
   receiverObjectType,
   resolveMemberAt,
+  scopeCompletionsFromBindings,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
   semanticTokensDataFromIdentifiers,
@@ -1087,8 +1088,45 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   // Fold imported names into the completion scope so they're suggested with
   // their real types alongside builtins + top-level names.
   const builtins = { ...(ast?.scope ?? {}), ...importedScope };
-  const identifiers = identifierCompletions(symbols, vlPos, builtins, stringifyType)
-    .map((c) => toCompletionItem(c, docResolver));
+  // Identifier source: in `"wasm"` mode (and when the seed exports the scope
+  // pass), the in-scope USER bindings come from the native checker; builtins/
+  // imports/types still come from `builtins` (the native set excludes them). The
+  // native bindings override same-named builtin entries (a user binding shadows a
+  // builtin), matching `identifierCompletions`'s own builtin-then-user merge. An
+  // empty native result (an older seed) falls back to the TS path unchanged.
+  let identifiers: CompletionItem[];
+  const nativeBindings =
+    checkerMode === "wasm" && wasmChecker?.scopeAt !== undefined
+      ? await wasmChecker
+        .scopeAt(
+          text,
+          entryKeyOf(params.textDocument.uri),
+          workspaceReader,
+          params.position.line,
+          params.position.character,
+        )
+        .catch((err) => {
+          connection.console.log(`[wasm-checker] scopeAt failed: ${err}`);
+          return [];
+        })
+      : [];
+  if (nativeBindings.length > 0) {
+    const byName = new Map<string, Completion>();
+    // The builtins/imports/types half only — a name present in `builtins`. The
+    // TS user-binding half (a name NOT in `builtins`) is dropped: the native
+    // scope set owns those. Native bindings then override same-named entries so a
+    // local/param/function shadows a builtin in the list.
+    for (const c of identifierCompletions(symbols, vlPos, builtins, stringifyType)) {
+      if (builtins[c.name] !== undefined) byName.set(c.name, c);
+    }
+    for (const c of scopeCompletionsFromBindings(nativeBindings)) {
+      byName.set(c.name, c);
+    }
+    identifiers = [...byName.values()].map((c) => toCompletionItem(c, docResolver));
+  } else {
+    identifiers = identifierCompletions(symbols, vlPos, builtins, stringifyType)
+      .map((c) => toCompletionItem(c, docResolver));
+  }
   const keywords = keywordCompletions(false).map((c) => toCompletionItem(c));
   const snippets = snippetCompletions(false).map((c) => toCompletionItem(c));
   return [...identifiers, ...keywords, ...snippets];

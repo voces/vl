@@ -900,6 +900,50 @@ export const identifierCompletions = (
   return [...byName.values()];
 };
 
+/**
+ * One in-scope binding from an EXTERNAL source (the wasm checker's `scopeAt`),
+ * the native counterpart of a {@link SymbolTable} binding. `kind` is
+ * 0=variable / 1=parameter / 2=function (the same convention as
+ * {@link IdentToken}'s `bindKind`); `type` is the rendered type string, empty
+ * when none. Local to this module — like {@link IdentToken} / {@link
+ * ExtMemberToken} — so the helper stays decoupled from the compiler core.
+ */
+export type ScopeBinding = {
+  name: string;
+  kind: number; // 0=variable 1=parameter 2=function
+  type: string; // rendered type, "" when none
+};
+
+/** Map a 0/1/2 scope kind to its {@link CompletionKind} (variable/parameter/function). */
+const scopeBindingKind = (kind: number): CompletionKind =>
+  kind === 1 ? "parameter" : kind === 2 ? "function" : "variable";
+
+/**
+ * Scope-aware identifier completions from an external binding set (the wasm
+ * checker's `scopeAt`) instead of the TS symbol table — the kill-TS counterpart
+ * of {@link identifierCompletions}'s user-binding half. Each binding maps to a
+ * {@link Completion} tagged with its kind, carrying the rendered `type` as
+ * `detail` (dropped to `undefined` when empty). De-duped by name (last wins),
+ * mirroring {@link identifierCompletions}'s `byName` map.
+ *
+ * `server.ts` merges these OVER the builtin-derived completions — the native
+ * scope set covers only user var/param/fn bindings, not builtins/imports/types —
+ * so a user binding shadows a same-named builtin, matching the TS path.
+ */
+export const scopeCompletionsFromBindings = (
+  bindings: ScopeBinding[],
+): Completion[] => {
+  const byName = new Map<string, Completion>();
+  for (const b of bindings) {
+    byName.set(b.name, {
+      name: b.name,
+      kind: scopeBindingKind(b.kind),
+      detail: b.type.length > 0 ? b.type : undefined,
+    });
+  }
+  return [...byName.values()];
+};
+
 // VL keywords: hard keywords (reserved by the lexer) plus soft keywords
 // (contextual — lexed as `ID` but given syntactic meaning by the parser). We
 // enumerate them statically rather than importing the lexer's `KEYWORDS` map so

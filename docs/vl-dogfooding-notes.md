@@ -160,6 +160,25 @@ is open backlog — triage as you like.
   building native member semantic tokens — had to add a separate `symMemMethod`
   recorder at the call branch. A single member-resolution choke point shared by the
   read arm and the call arm would remove this asymmetry.
+- **Scope spans live in offsets; the symbol queries live in line/col.** `nodePos`/
+  `nodeEndOf` (the #385 spans) are CHAR OFFSETS, but every IDE query compares
+  1-based-line / 0-based-col (token `.line`/`.col`). Building scope-at-position
+  (completion) meant recovering a scope-owning node's start line/col by SCANNING
+  the token table for the token whose `.start` equals the node's offset — there is
+  no offset→line/col map. A small lexer-built line-start table (or storing both on
+  the node) would make span work less ad-hoc. Also: the checker's lexical scopes
+  are pushed/popped during the walk and gone afterward, so a position query needs
+  each binding stamped with its scope's *source span* at decl time — the scope
+  stack itself can't be queried post-hoc.
+- **Demand inference re-runs a body from a deeper stack.** An un-annotated
+  function called forward is type-checked ON DEMAND at the call site, so its body
+  runs with the caller's scope stack underneath it — its apparent "enclosing
+  scope depth" is wrong during that pass. Anything that reads scope DEPTH while
+  recording (here: a function name's visibility scope = one frame out) gets a
+  too-tight answer. The fix was to stamp top-level functions in the hoist pre-pass
+  (global, before any demand inference) and make the recorder first-write-wins.
+  Lesson: don't infer lexical structure from the live scope-stack depth during a
+  pass that demand inference can re-enter — derive it from the node instead.
 
 ### Syntax worth documenting (not wrong, just non-obvious)
 
