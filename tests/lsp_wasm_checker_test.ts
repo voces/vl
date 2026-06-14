@@ -399,3 +399,31 @@ Deno.test({ name: "wasm-checker: lint returns [] on a parse error", ignore }, ()
     throw new Error("expected [] on a parse error");
   }
 });
+
+// ── member hover (kill-TS: the typeFeatures.ts member-typing consumer) ────────
+// `memberTypeAt` types the `.member` half of `receiver.member` via the seed —
+// the member hover the binding-only `hoverTypeAt` can't serve.
+
+Deno.test({ name: "wasm-symbols: memberTypeAt types an object field at the cursor", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // line 2 `print(p.x)`: `p`@6 `.`@7 `x`@8.
+  const src = "type P = { x: i32, y: i32 }\nlet p: P = { x: 1, y: 2 }\nprint(p.x)\n";
+  const t = await checker.memberTypeAt(src, "/tmp/x.vl", noSiblings, 2, 8);
+  if (t !== "i32") throw new Error(`expected i32 for p.x, got ${JSON.stringify(t)}`);
+});
+
+Deno.test({ name: "wasm-symbols: memberTypeAt types string .length", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // line 1 `print(s.length)`: `s`@6 `.`@7 `length`@8..13.
+  const src = 'let s = "hi"\nprint(s.length)\n';
+  const t = await checker.memberTypeAt(src, "/tmp/x.vl", noSiblings, 1, 8);
+  if (t !== "i32") throw new Error(`expected i32 for s.length, got ${JSON.stringify(t)}`);
+});
+
+Deno.test({ name: "wasm-symbols: memberTypeAt is undefined off any member access", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "type P = { x: i32, y: i32 }\nlet p: P = { x: 1, y: 2 }\nprint(p.x)\n";
+  // line 1, char 4 — the `p` binding decl, not a member access.
+  const t = await checker.memberTypeAt(src, "/tmp/x.vl", noSiblings, 1, 4);
+  if (t !== undefined) throw new Error(`expected undefined off a member, got ${JSON.stringify(t)}`);
+});
