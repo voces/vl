@@ -34,13 +34,10 @@ Organized by area. Triage freely.
   semantics-preserving (pass the round-trip oracle) so not caught by the corpus
   test: (a) object-literal METHOD SHORTHAND `add(a, b) { … }` is expanded to
   `add: function(a, b) { … }`; (b) `format.vl` does not collapse short `else if`
-  chains onto one line the way the host can; (c) on NON-canonical parameter-colon
-  spacing the host recovers the param annotation verbatim (`a:i32`) while
-  `format.vl` canonicalizes (`a: i32`) — format.vl is arguably more consistent (the
-  host adds the space after the return-type colon and after commas, so its no-space
-  param colon is a quirk). None breaks a guarantee; all three would need addressing
-  for byte-for-byte parity if that ever becomes a requirement. Tracked so they
-  aren't mistaken for done.
+  chains onto one line the way the host can. Neither breaks a guarantee; both would
+  need addressing for byte-for-byte parity if that ever becomes a requirement.
+  Tracked so they aren't mistaken for done. (Param-colon spacing `a:i32`→`a: i32`
+  is intentional canonicalization, not debt — it's an improvement over the host.)
 - **Self-host test glue duplicates the lexer rename.** Multiple `selfhost_*_test.ts`
   files independently `sed`/`.replace()` the lexer's `Tok`/`Diag`/`advance` names to
   de-collide when concatenating modules (no module system in the test driver path).

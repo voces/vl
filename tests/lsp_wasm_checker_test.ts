@@ -354,8 +354,9 @@ Deno.test({ name: "wasm-checker: formatSrc reflows messy source to a canonical, 
 Deno.test({ name: "wasm-checker: formatSrc matches the host on canonical source (incl. params)", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
   // Feeding the HOST's canonical output back through the wasm formatter must be a
-  // no-op — the two agree on the canonical form (params included). A known
-  // divergence on NON-canonical param-colon spacing is logged in vl-tech-debt.md.
+  // no-op — the two agree on the canonical form (params included). (format.vl
+  // canonicalizes non-canonical param-colon spacing `a:i32`→`a: i32`, an
+  // intentional improvement over the host.)
   const canonical = format(
     "function f(a: i32, b: i32): i32 {\n  return a + b\n}\nprint(f(1, 2))\n",
   );
