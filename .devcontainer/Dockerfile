@@ -43,10 +43,13 @@ RUN SNIPPET="export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhisto
 # Marker so tooling (and you) can tell this is the sandbox.
 ENV DEVCONTAINER=true
 
-# Workspace, claude config, and npm-global prefix dirs, owned by the non-root
-# user (so `npm install -g` and Claude can write without root).
-RUN mkdir -p /workspace /home/node/.claude /usr/local/share/npm-global && \
-  chown -R node:node /workspace /home/node/.claude /usr/local/share/npm-global
+# Workspace, claude config, gh config, and npm-global prefix dirs, owned by the
+# non-root user (so `npm install -g`, Claude, and `gh auth login` can write
+# without root). A named volume mounted onto an image dir inherits that dir's
+# ownership on first creation — so creating ~/.config/gh as `node` here is what
+# lets `gh` write its persisted auth into the volume.
+RUN mkdir -p /workspace /home/node/.claude /home/node/.config/gh /usr/local/share/npm-global && \
+  chown -R node:node /workspace /home/node/.claude /home/node/.config /usr/local/share/npm-global
 
 # --- Deno -------------------------------------------------------------------
 # Installed to a shared prefix so it's on PATH for the node user. The install
