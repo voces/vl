@@ -103,6 +103,15 @@ export type WasmChecker = {
     entryKey: string,
     read: ModuleReader,
   ) => Promise<WasmToken[]>;
+  /**
+   * Whole-document formatting (kill-TS step 1, the `format.ts` consumer): the
+   * canonical reprint of `source` via the self-hosted formatter (`format.vl`'s
+   * `formatSrc`), or undefined when the source has a parse error (the driver
+   * returns -1) or the seed predates the format exports — the host then falls
+   * back to the TS `format()`. Synchronous: formatting is single-file, so no
+   * module fetch / `prepare` is needed.
+   */
+  formatSrc: (source: string) => string | undefined;
 };
 
 /** One wasm call per code point — fine at editor scale (~0.2 ms/file). */
@@ -365,7 +374,28 @@ export const loadWasmChecker = (
     return diags;
   };
 
-  return { check, definitionAt, referencesAt, hoverTypeAt, tokensAt };
+  // Formatting rides the same seed as the other Stage-1+ exports; an older seed
+  // (or a future one built without the formatter) lacks `formatSrc`/`fmtByteAt`,
+  // so the method yields undefined and the host falls back to the TS `format()`.
+  const formatSrc = (source: string): string | undefined => {
+    const exp = instantiate();
+    if (
+      exp === undefined ||
+      typeof exp.formatSrc !== "function" ||
+      typeof exp.fmtByteAt !== "function"
+    ) {
+      return undefined;
+    }
+    // No `prepare`: the formatter is purely syntactic (lex → parse → print) and
+    // never resolves imports, so the source is staged directly.
+    exp.srcReset();
+    pushString(exp.srcPush, source);
+    const len = exp.formatSrc();
+    if (len < 0) return undefined; // parse error — the driver signals -1
+    return readString(len, (j) => exp.fmtByteAt(j));
+  };
+
+  return { check, definitionAt, referencesAt, hoverTypeAt, tokensAt, formatSrc };
 };
 
 /**
