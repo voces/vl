@@ -1,8 +1,15 @@
 # Source-span threading in the self-hosted front end — design + measured rollout
 
-Status: rung 1 (token positions) PROTOTYPED and gate-green in this worktree; rungs
-2–4 SCOPED with a measured touch-point count and per-gate risk. See "Gate results"
-at the bottom for the actual runs.
+Status: rungs 1 (token positions), 2 (node `pos` start offset), and 3 (diagnostics
+`line:col`, incl. `@error-at` end-column) LANDED. The `[start, stop)` span DATA the
+formatter needs is now complete: `start` is the node's `pos` field, `stop` is the
+new `nodeEndOf(nodeIx)` accessor (the stop offset of the node's last token, derived
+from the `nodeToks` anchor — the same mechanism the driver's `diagEndCol` already
+uses, here returning an absolute char OFFSET instead of a column). Proven by
+`tests/selfhost_spans_test.ts`: lexes + parses real source, then slices each
+construct (and each `let` initializer) out by its span and checks it reconstructs
+the original text. Rung 4 (`@trap` source map) remains. See "Gate results" at the
+bottom for the actual runs.
 
 ## Why this matters
 
@@ -70,11 +77,14 @@ Two structural differences make a verbatim port impossible in the self-host:
   stays as the stream-index cursor unit). The bridge fills them from `LexTok`.
 - **AST nodes (rung 2):** add a single `pos: i32` field — the START token's char
   offset (or `-1` for synthesized/desugared nodes) — to every `Node` variant, set
-  by the `mk*` constructor from the current token. A full `start+stop` span is a
-  later refinement; a single start offset is enough for `@error-at` (which pins one
-  point) and is the smallest ripple. (A parallel `i32[]` side array indexed by arena
-  index is the alternative; the field is simpler because the constructors already
-  return the index and a field travels with the node through every read.)
+  by the `mk*` constructor from the current token. A single start offset is enough
+  for `@error-at` (which pins one point) and is the smallest ripple. (A parallel
+  `i32[]` side array indexed by arena index is the alternative; the field is simpler
+  because the constructors already return the index and a field travels with the
+  node through every read.) The `stop` end of the span needs NO second field: it is
+  recovered on demand by `nodeEndOf(nodeIx)` from the `nodeToks` last-token anchor
+  (that token's stop offset = `start + text.length`), so the formatter reads `pos`
+  for start and `nodeEndOf` for stop — a full `[start, stop)` span with one field.
 - **Offset → line:col:** the lexer already produces line/col per token, so rung 2
   can store the START token's `line`/`col` directly on the node (no offset→line:col
   reconstruction needed). Storing the raw `start` offset is also fine; a tiny
