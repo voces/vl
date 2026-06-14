@@ -112,6 +112,16 @@ export type WasmChecker = {
    * module fetch / `prepare` is needed.
    */
   formatSrc: (source: string) => string | undefined;
+  /**
+   * Lint diagnostics (Stage 3): the AST-derivable lint pass (`lint.vl`) over
+   * `source` — `unused-variable`, `prefer-const`, `unused-import`, … — each with
+   * its stable `code` (for quick-fixes), `severity` (warning/info/hint), and
+   * position. The error tier (`check`) excludes these, so the diagnostics path
+   * merges both. Empty on a parse error or a seed without the lint exports.
+   * Synchronous + single-file: the lint pass is parse-only and resolves no
+   * imports, so the source is staged directly (no `prepare`).
+   */
+  lint: (source: string) => VLDiagnostic[];
 };
 
 /** One wasm call per code point — fine at editor scale (~0.2 ms/file). */
@@ -395,7 +405,74 @@ export const loadWasmChecker = (
     return readString(len, (j) => exp.fmtByteAt(j));
   };
 
-  return { check, definitionAt, referencesAt, hoverTypeAt, tokensAt, formatSrc };
+  // Coerce the native severity lexeme to a VLSeverity; an unknown value (a future
+  // tier) degrades to "warning" so it still surfaces.
+  const asSeverity = (s: string): VLDiagnostic["severity"] =>
+    s === "error" || s === "warning" || s === "info" || s === "hint"
+      ? s
+      : "warning";
+
+  // The lint pass reports a start line/col but no end column. Widen to the
+  // identifier (or, failing that, one char) starting at `col` on `line` so the
+  // squiggle is visible and a quick-fix range overlaps the cursor.
+  const wordEndCol = (source: string, line: number, col: number): number => {
+    const lines = source.split("\n");
+    const text = lines[line] ?? "";
+    let end = col;
+    while (end < text.length && /[A-Za-z0-9_]/.test(text[end])) end++;
+    return end > col ? end : col + 1;
+  };
+
+  // Lint diagnostics ride the same seed as the Stage-1+ exports; an older seed
+  // (or one built before the lint code/pos exports) lacks them, so this yields []
+  // and the diagnostics path keeps its TS lint. Like `formatSrc`: single-file,
+  // parse-only, no `prepare`.
+  const lint = (source: string): VLDiagnostic[] => {
+    const exp = instantiate();
+    if (
+      exp === undefined ||
+      typeof exp.lintSrc !== "function" ||
+      typeof exp.lintCodeLen !== "function"
+    ) {
+      return [];
+    }
+    exp.srcReset();
+    pushString(exp.srcPush, source);
+    const n = exp.lintSrc();
+    if (n <= 0) return []; // -1 = parse error, 0 = no lint diagnostics
+    const out: VLDiagnostic[] = [];
+    for (let i = 0; i < n; i++) {
+      const message = readString(exp.lintMsgLen(i), (j) => exp.lintMsgByte(i, j));
+      const code = readString(exp.lintCodeLen(i), (j) => exp.lintCodeByte(i, j));
+      const sev = readString(exp.lintSevLen(i), (j) => exp.lintSevByte(i, j));
+      const line = exp.lintLine(i); // 1-based; 0 = positionless
+      const col = exp.lintCol(i); // 0-based
+      const lspLine = line > 0 ? line - 1 : 0;
+      const startChar = line > 0 ? col : 0;
+      const endChar = line > 0 ? wordEndCol(source, lspLine, col) : 0;
+      out.push({
+        message,
+        severity: asSeverity(sev),
+        source: "vital",
+        code: code.length > 0 ? code : undefined,
+        range: {
+          start: { line: lspLine, character: startChar },
+          end: { line: lspLine, character: endChar },
+        },
+      });
+    }
+    return out;
+  };
+
+  return {
+    check,
+    definitionAt,
+    referencesAt,
+    hoverTypeAt,
+    tokensAt,
+    formatSrc,
+    lint,
+  };
 };
 
 /**
