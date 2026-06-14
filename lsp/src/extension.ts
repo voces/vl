@@ -67,8 +67,9 @@ const createClient = (
     },
   };
   // `vital.checker` / `vital.compilerWasm` ride initializationOptions (read
-  // once at client start — change requires a reload, fine for an experimental
-  // toggle). See lsp/src/wasmChecker.ts for the wasm-backed checker.
+  // once at client start — change requires a reload). The default is `"wasm"`
+  // (kill-TS step 2); set `vital.checker` to `"ts"` to opt back into the
+  // TypeScript checker. See lsp/src/wasmChecker.ts for the wasm-backed checker.
   const config = Workspace.getConfiguration("vital", folder?.uri);
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{
@@ -79,7 +80,7 @@ const createClient = (
     diagnosticCollectionName: "vital",
     outputChannel: outputChannel,
     initializationOptions: {
-      checker: config.get<string>("checker", "ts"),
+      checker: config.get<string>("checker", "wasm"),
       compilerWasm: config.get<string>("compilerWasm", ""),
     },
   };

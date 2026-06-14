@@ -228,8 +228,9 @@ let workspaceFolder: string | null;
 
 // LSP-on-wasm Stage 1 state (see `wasmChecker.ts` and `onInitialize`): which
 // checker publishes diagnostics, and the loaded self-hosted compiler when the
-// mode wants one. `"ts"` is the default and the universal fallback.
-let checkerMode: "ts" | "wasm" | "both" = "ts";
+// mode wants one. `"wasm"` is the default (kill-TS step 2); `"ts"` remains the
+// universal fallback — we degrade to it whenever the wasm seed cannot load.
+let checkerMode: "ts" | "wasm" | "both" = "wasm";
 let wasmChecker: WasmChecker | undefined;
 
 const severityMap: Record<VLSeverity, DiagnosticSeverity> = {
@@ -461,8 +462,8 @@ connection.onDefinition(async (params): Promise<Location | null> => {
   if (!doc) return null;
   const text = doc.getText();
 
-  // The TS path (the default + the universal fallback): cross-file imported-name
-  // jump first, then the single-file symbol table.
+  // The TS path (the universal fallback): cross-file imported-name jump first,
+  // then the single-file symbol table.
   const tsDefinition = async (): Promise<Location | null> => {
     const lineText = doc.getText({
       start: { line: params.position.line, character: 0 },
@@ -536,7 +537,7 @@ connection.onReferences(async (params): Promise<Location[] | null> => {
   const text = doc.getText();
   const includeDeclaration = params.context?.includeDeclaration ?? true;
 
-  // The TS path (default + fallback): cross-module crawl when the symbol is
+  // The TS path (the fallback): cross-module crawl when the symbol is
   // exported/imported, else the single-file symbol table.
   const tsReferences = async (): Promise<Location[]> => {
     const lineText = doc.getText({
@@ -1137,14 +1138,17 @@ connection.onInitialize((params) => {
     `[Server(${process.pid}) ${workspaceFolder}] Started and initialize received`,
   );
   // `vital.checker` rides initializationOptions (static per session — the
-  // extension passes the workspace config at client start). A requested wasm
-  // checker that cannot load (no seed, no WasmGC in this host) degrades to
-  // `"ts"` after one log line.
+  // extension passes the workspace config at client start). The default is
+  // `"wasm"` (kill-TS step 2): when no `checker` is supplied we behave as if
+  // `"wasm"` was requested. An explicit `"ts"` opts out entirely. A wasm checker
+  // that cannot load (no seed, no WasmGC in this host) degrades to `"ts"` after
+  // one log line — the TS fallback is always preserved.
   const opts = (params.initializationOptions ?? {}) as {
     checker?: string;
     compilerWasm?: string;
   };
-  if (opts.checker === "wasm" || opts.checker === "both") {
+  const requestedMode = opts.checker ?? "wasm";
+  if (requestedMode === "wasm" || requestedMode === "both") {
     const root = params.rootUri ? uriToPath(params.rootUri) : "";
     const wasmPath = opts.compilerWasm ||
       join(root, "build", "vl-compiler.wasm");
@@ -1153,7 +1157,9 @@ connection.onInitialize((params) => {
       (msg) => connection.console.log(msg),
       getStdDir,
     );
-    checkerMode = wasmChecker !== undefined ? opts.checker : "ts";
+    checkerMode = wasmChecker !== undefined ? requestedMode : "ts";
+  } else {
+    checkerMode = "ts";
   }
   return {
     capabilities: {

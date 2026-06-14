@@ -10,9 +10,9 @@
 // Selected by the `vital.checker` setting (`"ts" | "wasm" | "both"` — see
 // server.ts): `"wasm"` publishes these diagnostics, `"both"` runs both checkers
 // and LOGS divergence — the parity instrument the TS-host teardown gates on.
-// The TS path stays the default and the fallback: a missing/uninstantiable
-// seed (e.g. an extension host whose V8 lacks WasmGC) degrades to `"ts"` with
-// one log line, never an error.
+// As of kill-TS step 2 `"wasm"` is the DEFAULT. The TS path stays the fallback:
+// a missing/uninstantiable seed (e.g. an extension host whose V8 lacks WasmGC)
+// degrades to `"ts"` with one log line, never an error.
 //
 // Latency contract (measured in the spike): cold compile+instantiate ~2 ms,
 // steady-state `checkSrc` ~0.1–1.3 ms on editor-sized files, ~75 ms on the
