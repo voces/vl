@@ -39,7 +39,6 @@ import {
   type VLSeverity,
   wasmToWat,
 } from "./compile.ts";
-import { format } from "./format.ts";
 import {
   letToConstFix,
   type LspTextEdit,
@@ -917,6 +916,52 @@ const check = async (args: string[]): Promise<void> => {
 // Self-contained (mirrors `check`'s walk/flags) so it composes with the other
 // in-flight CLI work without touching the run/build/check regions.
 
+// Self-hosted formatter via the compiled seed (`build/vl-compiler.wasm`) — the
+// same driver `formatSrc` the LSP and the native `vl fmt` use. Repoints `fmt`
+// off the TS `format()` (kill-TS: drop the `compiler/format.ts` consumer). The
+// seed is instantiated once and reused; formatting is single-file and purely
+// syntactic, so the source is staged directly (no module resolution).
+type SeedExports = Record<string, (...args: number[]) => number>;
+let seedExports: SeedExports | undefined;
+const seedPath = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+
+const loadSeed = (): SeedExports => {
+  if (seedExports !== undefined) return seedExports;
+  const bytes = Deno.readFileSync(seedPath);
+  const instance = new WebAssembly.Instance(
+    new WebAssembly.Module(bytes as BufferSource),
+    {},
+  );
+  seedExports = instance.exports as unknown as SeedExports;
+  return seedExports;
+};
+
+const formatSource = (source: string): string => {
+  let exp: SeedExports;
+  try {
+    exp = loadSeed();
+  } catch (err) {
+    console.error(
+      `vl fmt: cannot load the self-hosted formatter seed at ${seedPath} ` +
+        `(build it with scripts/refresh-compiler.sh): ${err}`,
+    );
+    Deno.exit(1);
+  }
+  exp.srcReset();
+  for (const ch of source) exp.srcPush(ch.codePointAt(0)!);
+  const len = exp.formatSrc();
+  // A lex/parse error (-1) has no faithful AST to reprint — leave the source
+  // unchanged rather than emit a corrupted partial result.
+  if (len < 0) return source;
+  const cps = new Array<number>(len);
+  for (let j = 0; j < len; j++) cps[j] = exp.fmtByteAt(j);
+  let out = "";
+  for (let i = 0; i < cps.length; i += 8192) {
+    out += String.fromCodePoint(...cps.slice(i, i + 8192));
+  }
+  return out;
+};
+
 type FmtArgs = {
   write: boolean;
   check: boolean;
@@ -941,7 +986,7 @@ const fmtFile = async (
   opts: FmtArgs,
 ): Promise<{ changed: boolean }> => {
   const source = await Deno.readTextFile(file);
-  const formatted = format(source);
+  const formatted = formatSource(source);
   const changed = formatted !== source;
 
   if (opts.check) {
@@ -965,7 +1010,7 @@ const fmt = async (args: string[]): Promise<void> => {
   // stream, so it is ignored; `--check` reports drift via the exit code.
   if (opts.paths.length === 0) {
     const source = await new Response(Deno.stdin.readable).text();
-    const formatted = format(source);
+    const formatted = formatSource(source);
     if (opts.check) {
       Deno.exit(formatted === source ? 0 : 1);
     }
