@@ -27,13 +27,20 @@
 // `if`-expressions), with own-line and trailing comment placement, blank-line
 // preservation, list reflow at the width, and the multi-line trailing-comma policy.
 //
-// DIVERGENCES from the host (intrinsic to the self-host AST): the self-host KEEPS
-// explicit `Paren` nodes (the host drops them, so `(x) is A` → `x is A` there;
-// here a paren round-trips as written). Compound assignment is desugared in the
-// arena (`a += b` → `a = a + b`) and is reprinted in its desugared form. The
-// verbatim-source fallback for interior-comment leaf statements and operator-named
-// constructs is NOT ported (the self-host has no operator-named functions). These
-// are documented limits, not bugs.
+// SURFACE-FORM RECOVERY: the self-host parser DESUGARS several constructs in the
+// arena, so the surface form is recovered from the source TOKENS in a node's span
+// to match the host: compound assignment (`a += b`, not `a = a + b`), increment
+// (`x++` / `++x`, not `x = x + 1`), the negated guard (`x !is T`, not `!(x is T)`),
+// the chain keyword (`else if` vs `elseif`, which share one nested-If AST), and
+// quoted operator / index-trap object keys (`"[]"`, `"*"` — the parser strips the
+// quotes). `import` statements (which the parser consumes without a node) are
+// recovered from the token stream and re-emitted. The self-host KEEPS explicit
+// `Paren` nodes, so a paren round-trips as written.
+//
+// RESIDUAL host divergences (semantics-preserving, so they still satisfy the
+// idempotent / AST-round-trip / comment guarantees): object-literal method
+// shorthand `m(a) { … }` is expanded to `m: function(a) { … }`, and short
+// `else if` chains are not collapsed onto one line. See docs/vl-tech-debt.md.
 
 import { P, Node, nodeEndOf, i32ToStr } from "./ast"
 import {
@@ -129,6 +136,12 @@ export function fmtAddComment(text: string, start: i32, line: i32, trailing: i32
 // nested rendering (function-expression / block-expression body) saves and swaps
 // `outBuf` so the inner statements render into a fresh buffer.
 let outBuf: string[] = []
+
+// Seed for the TOP-LEVEL `emitStatements`' `prevLine`: the stop line of the last
+// recovered import (0 when there are none). It lets the blank-line policy between
+// the import block and the first statement match the source. `emitStatements`
+// consumes it on entry and resets it to 0, so nested calls are unaffected.
+let topPrevLine = 0
 
 function fmtEmitRaw(s: string): i32 {
   outBuf.push(s)
@@ -438,11 +451,53 @@ export function formatProgram(progRoot: i32): string {
   }
   let root = P.nodes[progRoot]
   if root is Program {
+    // Imports are skipped by the parser (no AST node), so recover them from the
+    // token stream and emit them verbatim before the parsed statements; seed the
+    // top-level blank-line policy with the last import's line.
+    topPrevLine = emitImports()
     emitStatements(root.progStmts, 0)
     flushRemaining(0)
   }
   let text = joinOut()
   normalizeProgram(text)
+}
+
+// Recover `import { … } from "path"` statements from `P.toks` (the parser
+// consumes their tokens but builds no node). Each import runs from an `IMPORT`
+// keyword to its path `STRING`; slice that span verbatim, placing own-line
+// comments and a single source blank line before each. Returns the last import's
+// stop line, or 0 when the file has none.
+function emitImports(): i32 {
+  let prevLine = 0
+  let i = 0
+  while i < P.toks.length {
+    let t = P.toks[i]
+    if t.kind == "IMPORT" {
+      let j = i
+      let found = 0 - 1
+      while j < P.toks.length && found < 0 {
+        if P.toks[j].kind == "STRING" { found = j }
+        j = j + 1
+      }
+      if found < 0 {
+        return prevLine
+      }
+      let endTok = P.toks[found]
+      let startLine = t.line
+      let leading = peekLeadingCount(startLine)
+      if prevLine > 0 && startLine - prevLine > 1 + leading && outBuf.length > 0 {
+        fmtEmitRaw("\n")
+      }
+      emitLeadingComments(0, startLine)
+      let src = fmtSrc.slice(t.start, endTok.start + endTok.text.length)
+      emitLine(0, src + trailerSuffix(endTok.line))
+      prevLine = endTok.line
+      i = found + 1
+    } else {
+      i = i + 1
+    }
+  }
+  prevLine
 }
 
 function joinOut(): string {
@@ -485,7 +540,8 @@ function normalizeProgram(text: string): string {
 // Emit a sequence of statements at `indent`, preserving a single user blank line
 // between them and placing own-line / trailing comments.
 function emitStatements(stmts: i32[], indent: i32): i32 {
-  let prevLine = 0
+  let prevLine = topPrevLine
+  topPrevLine = 0
   let i = 0
   while i < stmts.length {
     let ix = stmts[i]
@@ -922,6 +978,7 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32): boolean {
   // Collect clause condition + body arena indices walking the chain.
   let condIxs: i32[] = []
   let bodyIxs: i32[] = []
+  let clauseIxs: i32[] = []
   let hasElse = false
   let elseBodyIx = 0 - 1
   let curIx = ix
@@ -931,6 +988,7 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32): boolean {
     if c is IfStmt {
       condIxs.push(c.ifCond)
       bodyIxs.push(c.ifThen)
+      clauseIxs.push(curIx)
       let e = c.ifElse
       if e < 0 {
         walking = false
@@ -957,14 +1015,19 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32): boolean {
       return false
     }
   }
-  // Block layout: `if cond {` / `} elseif cond {` / `} else {` / `}`.
+  // Block layout: `if cond {` / `} elseif cond {` / `} else {` / `}`. The chain
+  // keyword (`elseif` vs `else if`) is recovered per-clause from the source token
+  // at the clause's `if` node — both parse to the same nested-If AST, so only the
+  // surface token tells them apart (host parity).
   let m = 0
   while m < condIxs.length {
     let cond = expr(condIxs[m], indent, 0)
     if m == 0 {
       emitLine(indent, "if " + cond + " {")
     } else {
-      emitLine(indent, "} elseif " + cond + " {")
+      let kw = "} elseif "
+      if tokKindAt(nodePos(clauseIxs[m])) == "IF" { kw = "} else if " }
+      emitLine(indent, kw + cond + " {")
     }
     emitBlockBody(bodyIxs[m], indent)
     m = m + 1
@@ -1233,14 +1296,92 @@ function binaryChain(ix: i32, node: BinExpr, indent: i32, column: i32): string {
 
 function renderBinary(ix: i32, node: BinExpr, indent: i32, column: i32): string {
   if node.binOp == "=" {
-    let left = expr(node.binLeft, indent, column)
-    let right = expr(node.binRight, indent, column + left.length + 3)
-    return left + " = " + right
+    return renderAssign(ix, node, indent, column)
   }
   binaryChain(ix, node, indent, column)
 }
 
+// The token kind whose source-offset start is exactly `off`, or "" if none.
+function tokKindAt(off: i32): string {
+  let i = 0
+  while i < P.toks.length {
+    let t = P.toks[i]
+    if t.start == off { return t.kind }
+    i = i + 1
+  }
+  ""
+}
+
+// The surface compound-assignment operator char (`+`/`-`/`*`/`/`) for the first
+// assignment-family token within [start, stop), or "" when the assignment was
+// written as a plain `=`. The left operand of an assignment is an lvalue
+// (ident / member / index) and contains no assignment token, so the first such
+// token in the span IS the operator.
+function compoundOpIn(start: i32, stop: i32): string {
+  let i = 0
+  while i < P.toks.length {
+    let t = P.toks[i]
+    if t.start >= start && t.start < stop {
+      if t.kind == "PLUSEQ" { return "+" }
+      if t.kind == "MINUSEQ" { return "-" }
+      if t.kind == "STAREQ" { return "*" }
+      if t.kind == "SLASHEQ" { return "/" }
+      if t.kind == "EQUAL" { return "" }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// An assignment `=` node. The parser DESUGARS `a += b` → `a = a + b`, prefix
+// `++x` → `x = x + 1`, and prefix `--x` → `x = x - 1`; recover the SURFACE form
+// from the source tokens so the printer reproduces what was written (host parity).
+function renderAssign(ix: i32, node: BinExpr, indent: i32, column: i32): string {
+  let leftPos = nodePos(node.binLeft)
+  // Prefix `++x` / `--x`: the `=` node is anchored at the prefix operator, so it
+  // starts BEFORE the target it assigns.
+  if node.pos >= 0 && leftPos >= 0 && node.pos < leftPos {
+    let pk = tokKindAt(node.pos)
+    if pk == "PLUSPLUS" { return "++" + expr(node.binLeft, indent, column + 2) }
+    if pk == "MINUSMINUS" { return "--" + expr(node.binLeft, indent, column + 2) }
+  }
+  let left = expr(node.binLeft, indent, column)
+  // Compound assignment: emit `<left> <op>= <addend>` where the addend is the
+  // right operand of the desugared inner arithmetic node (`a + b` → `b`).
+  let op = compoundOpIn(nodePos(ix), nodeEndOf(ix))
+  if op.length > 0 {
+    let addendIx = node.binRight
+    let r = P.nodes[node.binRight]
+    if r is BinExpr { addendIx = r.binRight }
+    return left + " " + op + "= " + expr(addendIx, indent, column + left.length + 4)
+  }
+  left + " = " + expr(node.binRight, indent, column + left.length + 3)
+}
+
 function unary(ix: i32, node: Unary, indent: i32, column: i32): string {
+  // Postfix `x++` / `x--`: the parser models it as `Unary("p+"/"p-", (x = x+1))`.
+  // Recover the target (the inner assignment's left) and the surface operator.
+  if node.unOp == "p+" || node.unOp == "p-" {
+    let pop = "++"
+    if node.unOp == "p-" { pop = "--" }
+    let inner = P.nodes[node.unArg]
+    if inner is BinExpr {
+      return expr(inner.binLeft, indent, column) + pop
+    }
+    return expr(node.unArg, indent, column) + pop
+  }
+  // Negated type guard `x !is T`: the parser desugars it to `!(x is T)` as a
+  // `Unary("!", IsExpr)` anchored at the OPERAND (its pos is the operand's first
+  // token, not the `!`). A genuine prefix `!` anchors at the `!` token. Recover
+  // the surface `!is` form when the operand-anchored shape is present.
+  if node.unOp == "!" {
+    let g = P.nodes[node.unArg]
+    if g is IsExpr {
+      if tokKindAt(node.pos) != "BANG" {
+        return expr(g.isObj, indent, column) + " !is " + recoverIsType(node.unArg)
+      }
+    }
+  }
   let operand = expr(node.unArg, indent, column)
   if node.unOp == "!" {
     let a = P.nodes[node.unArg]
@@ -1367,9 +1508,29 @@ function objectLiteral(ix: i32, node: ObjLit, indent: i32, column: i32): string 
 function fieldInitText(ix: i32, indent: i32, column: i32): string {
   let n = P.nodes[ix]
   if n is FieldInit {
-    return n.fiName + ": " + expr(n.fiValue, indent, column)
+    return fieldKeyText(ix, n.fiName) + ": " + expr(n.fiValue, indent, column)
   }
   ""
+}
+
+// A field key as written. The parser STRIPS the quotes from a string-literal key
+// (`"[]"`, `"*"`, `"=="` — operator / index-trap method fields), so an
+// identifier-keyed field prints bare while a string-keyed one is recovered with
+// its quoted lexeme from source (host parity; those keys carry no escapes).
+function fieldKeyText(ix: i32, name: string): string {
+  let p = nodePos(ix)
+  if p >= 0 && p < fmtSrc.length {
+    let c = fmtSrc.slice(p, p + 1)
+    if c == "\"" || c == "'" {
+      let i = 0
+      while i < P.toks.length {
+        let t = P.toks[i]
+        if t.start == p && t.kind == "STRING" { return t.text }
+        i = i + 1
+      }
+    }
+  }
+  name
 }
 
 function arrayLiteral(ix: i32, node: ArrayLit, indent: i32, column: i32): string {

@@ -25,6 +25,16 @@ is open backlog — triage as you like.
 - **wasmtime 45 uses its own `wasmtime::Error`** (not `anyhow`) — minor host-glue
   friction (different `.context`/`bail!` surface than the ecosystem default).
 
+- **`fetch-seed.sh` didn't fall back to curl when `gh` was unauthenticated.**
+  `[FIXED]` — `fetch()` used `gh release download` whenever `gh` was merely on
+  PATH and only used curl when `gh` was ABSENT. In a sandbox with `gh` installed
+  but not logged in, the gh call failed and the whole fetch errored — even though
+  the release asset is public and a plain curl (302 → the published GitHub CDN
+  range, already in the firewall allowlist) returns it fine. Now it tries gh and
+  falls THROUGH to curl on any failure. (Diagnosed while bringing up the seed in
+  the restrictive devcontainer: the failure looked like a firewall block but was
+  purely the gh-XOR-curl branch.)
+
 ### Internal (`vl build` / `check` / `run`)
 
 - **`vl check` used to do a full compile** (parse→type→**emit**). `[FIXED #283]` —
@@ -113,6 +123,33 @@ is open backlog — triage as you like.
 - **Pinned narrowing forces fresh names** (above) — turns what would be one
   reassigned variable into a chain of `s0/s1/s2`, which reads worse than the logic
   warrants.
+
+### Parser desugaring loses surface syntax (formatter friction)
+
+- **The parser desugars many surface forms in the arena, so the AST is not
+  faithful to what was written** — a recurring tax on the formatter (and any
+  tool that wants to reproduce source). Found while porting `format.vl`:
+  `a += b` → `a = a + b`, `x++` → `Unary("p+", x = x+1)`, `++x` → `x = x + 1`,
+  `x !is T` → `!(x is T)`, and `else if` ⟷ `elseif` collapse to the SAME nested-If
+  AST. Each had to be recovered in the formatter by scanning the source TOKENS in
+  the node's span (e.g. a `PLUSEQ` token ⇒ emit `+=`; the token at a clause's `if`
+  node ⇒ `else if` vs `elseif`). It works, but it means surface fidelity lives in
+  two places (parser desugar + formatter re-recovery). A faithful AST (keep the
+  surface operator as a field, the way the host stores `compoundOperator`) would
+  remove the guesswork. The self-host already keeps `Paren` nodes for exactly this
+  reason — the same treatment for assignment/increment/guard operators would help.
+- **`import` statements produce no AST node** (the single-file parser `skipImport`s
+  them; binding is the module layer's job). Any tool that walks the AST — including
+  the formatter — silently loses them. `format.vl` had to re-scan `P.toks` for
+  `IMPORT…STRING` runs and slice the source. A lightweight retained import node
+  (even just its span) would be cleaner than token re-scanning.
+- **A lookahead-then-construct ordering bug stretched a node's source span.** The
+  union-decl parser ran `skipNewlines()` (to peek for a continuation `|`) BEFORE
+  `mkUnionDecl`, so the node's end-token (`nodeEndOf`, the #385 spans) landed on a
+  following blank/comment line — and the formatter's verbatim slice then swallowed
+  the next comment. Fixed by pinning the cursor past the last variant before
+  constructing the node. General lesson for the spans work: capture a node's end
+  position at the construct's true end, not after speculative lookahead.
 
 ### Syntax worth documenting (not wrong, just non-obvious)
 

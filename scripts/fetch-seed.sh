@@ -37,11 +37,16 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 fetch() {
-  if command -v gh >/dev/null 2>&1; then
-    gh release download "$TAG" --repo "$REPO" --pattern "$1" --dir "$WORK" --clobber 2>/dev/null
-  else
-    curl -fsSL "https://github.com/$REPO/releases/download/$TAG/$1" -o "$WORK/$1"
+  # Prefer gh (honors auth / private repos / rate limits), but FALL BACK to curl
+  # when gh is absent OR fails — an unauthenticated gh on PATH errors out, and the
+  # release asset is public, so the curl path (which 302s to the published GitHub
+  # CDN range) still succeeds. Without this fallthrough an unauthenticated gh would
+  # fail the whole fetch even though the bytes are reachable.
+  if command -v gh >/dev/null 2>&1 && \
+     gh release download "$TAG" --repo "$REPO" --pattern "$1" --dir "$WORK" --clobber 2>/dev/null; then
+    return 0
   fi
+  curl -fsSL "https://github.com/$REPO/releases/download/$TAG/$1" -o "$WORK/$1"
 }
 
 echo "== fetch $ASSET from $REPO release '$TAG' =="
