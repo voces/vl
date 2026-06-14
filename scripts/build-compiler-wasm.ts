@@ -31,6 +31,7 @@ const ast = read("../compiler/ast.vl");
 const parser = read("../compiler/parser.vl");
 const typecheck = read("../compiler/typecheck.vl");
 const wasmEmit = read("../compiler/wasmEmit.vl");
+const lint = read("../compiler/lint.vl");
 
 // The driver is SINGLE-SOURCED in `vl-compiler-driver.vl` (the native-fixpoint
 // script appends the same file with cat), so the seed compiler and a
@@ -49,7 +50,7 @@ const outUrl = outPath.startsWith("/")
 
 const { wasm, diagnostics } = await compileCached(
   lexer + "\n" + ast + "\n" + parser + "\n" + typecheck + "\n" + wasmEmit +
-    "\n" + driver + "\n",
+    "\n" + lint + "\n" + driver + "\n",
 );
 const errs = diagnostics.filter((d) => d.severity === "error");
 if (errs.length > 0 || !wasm) {

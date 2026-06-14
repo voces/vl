@@ -68,6 +68,20 @@ const seedExists = (() => {
 // this list down is the message/span-parity work that also gates the deno
 // CHECK-tier deletion (ROADMAP F-tiers).
 const EXPECTED_DIVERGENCES: Record<string, string> = {
+  // The `unreachable: exhaustive is-chain` @info is TYPE-AWARE (A-exhaust): TS
+  // derives it from the checker. The native lint pass is parse-only and the wasm
+  // driver's diagnostic stream is error-only, so this info is TS-only until the
+  // checker exposes warning/info diagnostics to the oracle (a later slice).
+  "lint/exhaustive-is-chain-dead-else.vl":
+    "type-aware `unreachable: exhaustive is-chain` @info — not produced by the parse-only native lint / error-only diag stream",
+  "soundness/literal-is-union-param-dispatch.vl":
+    "type-aware `unreachable: exhaustive is-chain` @info — TS-only (see lint/exhaustive-is-chain-dead-else)",
+  "types/struct-union-same-shape.vl":
+    "type-aware `unreachable: exhaustive is-chain` @info — TS-only (see lint/exhaustive-is-chain-dead-else)",
+  "loops/empty-range.vl":
+    "the empty-range @warning is a const-eval rule the native lint pass does not implement yet — TS-only",
+  "lint/generic-intersection-no-warn.vl":
+    "wasm CHECKER gap: a generic intersection `T & S` reports `unknown type 'T&S'` where the TS checker accepts it (not a lint divergence)",
   "soundness/README.vl":
     "a prose line parses as @run; the wasm emitter rejects a statement-less program (TS emits an empty module)",
   "soundness/xfail-arith-hole-operand.vl":
@@ -180,14 +194,6 @@ const parseDirectives = (src: string): Directives => {
   return d;
 };
 
-/** True when the case's only expectations live in the lint tier (@warning/
- * @info/@hint with no error-tier or runtime directives) — TS-only territory
- * until the .vl lint pass. */
-const lintOnly = (d: Directives): boolean =>
-  d.mode === "check" &&
-  d.errors.length === 0 &&
-  d.errorsAt.length === 0 &&
-  d.warnings.length + d.infos.length + d.hints.length > 0;
 
 type Case =
   | { kind: "single"; url: URL }
@@ -422,6 +428,64 @@ const assertCase = async (
   }
 };
 
+// ── Lint tier (the .vl lint pass, via the driver's `lintSrc`) ──────────────────
+type LintDiag = { sev: string; line: number; col: number; msg: string };
+
+/** Run the self-hosted lint pass over `src` and read its diagnostics. */
+const driveLint = (exp: Exports, src: string): LintDiag[] => {
+  exp.modReset();
+  exp.srcReset();
+  pushString(exp.srcPush, src);
+  const n = exp.lintSrc();
+  const out: LintDiag[] = [];
+  if (n < 0) return out; // a lex/parse error — lint needs a valid AST
+  for (let i = 0; i < n; i++) {
+    out.push({
+      sev: readString(exp.lintSevLen(i), (j) => exp.lintSevByte(i, j)),
+      line: exp.lintLineAt(i),
+      col: exp.lintColAt(i),
+      msg: readString(exp.lintMsgLen(i), (j) => exp.lintMsgByte(i, j)),
+    });
+  }
+  return out;
+};
+
+/**
+ * Adjudicate the lint directives (@warning/@info/@hint) against the lint diags,
+ * per severity, strict-by-default (every declared directive matches a diag, and
+ * every diag is declared) — mirroring `cases_test.ts`'s lint contract. Message
+ * matching folds case/quote style like the error tier.
+ */
+const assertLint = (d: Directives, lints: LintDiag[]): void => {
+  const bySev = (s: string): string[] =>
+    lints.filter((l) => l.sev === s).map((l) => l.msg);
+  const wants: [string[], string, string][] = [
+    [d.warnings, "warning", "@warning"],
+    [d.infos, "info", "@info"],
+    [d.hints, "hint", "@hint"],
+  ];
+  for (const [decls, sev, directive] of wants) {
+    const actual = bySev(sev);
+    for (const want of decls) {
+      if (!actual.some((m) => matches(m, want))) {
+        throw new Error(
+          `expected a ${sev} (${directive}) containing "${want}", got: ${
+            JSON.stringify(actual)
+          }`,
+        );
+      }
+    }
+    const extra = actual.filter((m) => !decls.some((w) => matches(m, w)));
+    if (extra.length) {
+      throw new Error(
+        `unexpected ${sev}(s) (declare with ${directive} if intended): ${
+          JSON.stringify(extra)
+        }`,
+      );
+    }
+  }
+};
+
 const cases: Case[] = [...walk(CASES_DIR)];
 const caseName = (c: Case): string =>
   (c.kind === "single" ? c.url.href : c.dir.href).slice(CASES_DIR.href.length);
@@ -439,8 +503,6 @@ for (const c of cases) {
     ? "no seed — bash scripts/refresh-compiler.sh"
     : d.skip !== null
     ? d.skip
-    : lintOnly(d)
-    ? "lint-tier (TS-only until the .vl lint pass)"
     : EXPECTED_DIVERGENCES[name];
 
   Deno.test({
@@ -456,6 +518,17 @@ for (const c of cases) {
         c.kind === "module",
       );
       await assertCase(d, r);
+      // The lint tier (.vl lint pass) — adjudicated on SINGLE-FILE cases that
+      // type-check cleanly (no `@error`/`@error-at`). Lint is a quality pass over
+      // WELL-FORMED code; on an erroring program the native lint over-reports
+      // (e.g. "unused variable" on a redeclared/ill-typed binding) relative to the
+      // TS host, which doesn't lint a failed compile — so error cases skip the
+      // lint tier here (module-graph lint is a later slice too).
+      if (
+        c.kind === "single" && d.errors.length === 0 && d.errorsAt.length === 0
+      ) {
+        assertLint(d, driveLint(exports!, src));
+      }
     },
   });
 }

@@ -56,7 +56,7 @@ fi
 # assembly as native-fixpoint.sh (lexer Tok/Diag/advance de-collision rename).
 sed -E 's/\bTok\b/LexTok/g; s/\bDiag\b/LexDiag/g; s/\badvance\b/lexAdvance/g' \
   compiler/lexer.vl > "$WORK/vlsrc.vl"
-cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.vl \
+cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.vl compiler/lint.vl \
   scripts/vl-compiler-driver.vl >> "$WORK/vlsrc.vl"
 # BLANK the compiler's own import statements (range-aware; multi-line imports) —
 # see native-fixpoint.sh: a line-leading `import {` would trip the vl binary's
