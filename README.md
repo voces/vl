@@ -14,7 +14,10 @@ for how the seed is bootstrapped.
 
 ## Quick start (native)
 
-You need **Rust** (for the host) and a **compiler seed**.
+You need **Rust** (for the host) and a **compiler seed**. For a sandboxed,
+batteries-included environment (node + deno + rust + Claude behind a network
+firewall, safe for `claude --dangerously-skip-permissions`), see the
+[Dev Container](./.devcontainer/README.md).
 
 ```sh
 # 1. Build the native `vl` host (~once)
