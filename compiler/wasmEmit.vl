@@ -5258,6 +5258,13 @@ function arrNewIntrKind(callIx: i32, fnIx: i32): i32 {
       if callee.identName == "__array_new__" {
         if c.callArgs.length == 2 {
           if exprIsF64(c.callArgs[1], fnIx) { return 1 }
+          // A STRING fill (kind 2) builds the string list; a STRUCT/object-literal
+          // fill (kind 3) builds the ref list for that element struct. (Ref
+          // long-tail: closures / nested arrays / maps as fills still fail loudly.)
+          if exprString(c.callArgs[1], fnIx) { return 2 }
+          let anf = P.nodes[c.callArgs[1]]
+          if anf is ObjLit { return 3 }
+          if exprStruct(c.callArgs[1], fnIx) { return 3 }
         }
         return 0
       }
@@ -11520,12 +11527,33 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
         }
         let anBack = aTypeIdx
         let anWrap = lTypeIdx
-        if arrNewIntrKind(callIx, fnIx) == 1 {
+        // The element struct for a kind-3 (ref) fill — seeds `pendingStructIdx`
+        // so the `{…}` fill emits as the list's declared element struct.
+        let anElemStructIdx = 0 - 1
+        let ank = arrNewIntrKind(callIx, fnIx)
+        if ank == 1 {
           if !fa64Used {
             return emitFail("emitProgram: __array_new__ f64 fill but f64 list types not collected")
           }
           anBack = fa64TypeIdx
           anWrap = fl64TypeIdx
+        } else if ank == 2 {
+          // STRING fill → the string list (`array.new` of the shared string-ref
+          // backing; a non-null string ref stores into the nullable slot directly).
+          if !slUsed {
+            return emitFail("emitProgram: __array_new__ string fill but string list types not collected")
+          }
+          anBack = mkArrIdx
+          anWrap = mkListIdx
+        } else if ank == 3 {
+          // STRUCT fill → the ref list of the element struct (its interned slot).
+          if !rlUsed {
+            return emitFail("emitProgram: __array_new__ struct fill but ref list types not collected")
+          }
+          let anSlot = refListSlotOfExpr(callIx, fnIx)
+          anBack = rlBackIdx[anSlot]
+          anWrap = rlWrapIdx[anSlot]
+          anElemStructIdx = structIndexByName(rlElemName[anSlot])
         } else {
           if !aUsed || !lUsed {
             return emitFail("emitProgram: array intrinsic but list types not collected")
@@ -11535,21 +11563,23 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32): i32 {
             let anFillNode = P.nodes[anFill]
             let anFillRef = false
             if anFillNode is ObjLit { anFillRef = true }
-            if exprString(anFill, fnIx) { anFillRef = true }
             if exprIsClosure(anFill, fnIx) { anFillRef = true }
             if exprArray(anFill, fnIx) { anFillRef = true }
             if exprRefArray(anFill, fnIx) { anFillRef = true }
             if exprStringArray(anFill, fnIx) { anFillRef = true }
             if exprMap(anFill, fnIx) { anFillRef = true }
             if anFillRef {
-              return emitFail("emitProgram: __array_new__ supports i32/boolean/f64 fills natively")
+              // Remaining ref-fill long tail: closures / nested arrays / maps.
+              return emitFail("emitProgram: __array_new__ fill type not yet supported natively")
             }
           }
         }
         if emitExpr(body, c.callArgs[0], fnIx) < 0 { return 0 - 1 }
         fbLocalSet(arrNewScratchBase)
         if anIsNew {
+          pendingStructIdx = anElemStructIdx
           if emitExpr(body, c.callArgs[1], fnIx) < 0 { return 0 - 1 }
+          pendingStructIdx = 0 - 1
           fbLocalGet(arrNewScratchBase)
           fbArrayNew(anBack)
         } else {
@@ -18105,8 +18135,18 @@ function collectA(stmts: i32[]): i32 {
         // with no literal/annotation in sight: an f64 FILL forces the f64
         // array+wrapper pair, anything else the i32 list (wrapper + backing).
         if cf.identName == "__array_new__" || cf.identName == "__array_new_default__" {
-          if arrNewIntrKind(i, 0 - 1) == 1 {
+          let ank = arrNewIntrKind(i, 0 - 1)
+          if ank == 1 {
             fa64Used = true
+          } else if ank == 2 {
+            // String fill → the string list (wrapper/backing shared with `string[]`).
+            slUsed = true
+            aUsed = true
+          } else if ank == 3 {
+            // Struct fill → the ref list of the element struct (intern its slot).
+            rlUsed = true
+            raUsed = true
+            rlInternName(refListElemNameOfExpr(i, 0 - 1), 1)
           } else {
             lUsed = true
             aUsed = true
@@ -20796,6 +20836,8 @@ function exprRefArray(exprIx: i32, fnIx: i32): boolean {
   if e is ArrayLit { return arrLitIsRef(exprIx) }
   if e is Paren { return exprRefArray(e.parInner, fnIx) }
   if e is Call {
+    // `__array_new__(n, {…})` builds a ref list of the element struct (kind 3).
+    if arrNewIntrKind(exprIx, fnIx) == 3 { return true }
     let callee = P.nodes[e.callFn]
     if callee is Ident { return fnRetRefArray(callee.identName) }
     return false
@@ -20880,6 +20922,12 @@ function refListElemNameOfExpr(exprIx: i32, fnIx: i32): string {
   if e is ArrayLit { return arrLitElemName(exprIx) }
   if e is Paren { return refListElemNameOfExpr(e.parInner, fnIx) }
   if e is Call {
+    // `__array_new__(n, {…})` — the ref-list element name is the fill's struct.
+    if arrNewIntrKind(exprIx, fnIx) == 3 {
+      let asi = structIndexOfExpr(e.callArgs[1], fnIx)
+      if asi >= 0 { return sNames[asi] }
+      return ""
+    }
     let callee = P.nodes[e.callFn]
     if callee is Ident { return fnRetRefArrayName(callee.identName) }
     return ""
@@ -21070,6 +21118,8 @@ function exprStringArray(exprIx: i32, fnIx: i32): boolean {
   if e is ArrayLit { return arrLitIsStr(exprIx, fnIx) }
   if e is Paren { return exprStringArray(e.parInner, fnIx) }
   if e is Call {
+    // `__array_new__(n, "s")` builds a string list (intrinsic kind 2).
+    if arrNewIntrKind(exprIx, fnIx) == 2 { return true }
     let callee = P.nodes[e.callFn]
     if callee is Ident { return fnRetStringArray(callee.identName) }
     return false
