@@ -70,10 +70,6 @@ const seedExists = (() => {
 const EXPECTED_DIVERGENCES: Record<string, string> = {
   "intrinsics/array-new-ref-elems.vl":
     "wasm emitter rejects ref-element `__array_new__` fills (i32/boolean/f64 only natively); the host lowers them generically — the native emitter long tail (std-design slice 0 residue)",
-  "numerics/i64-infer-let.vl":
-    "native emitter gap: an unannotated let from an i64 expression materializes an i32 local (invalid wasm); the host infers the initializer's width — the native long tail",
-  "numerics/widen-call-arg.vl":
-    "native emitter gap: an i32 variable passed to an i64 parameter is not sign-extended at the call site (invalid wasm); the host widens it — the native long tail",
   "soundness/README.vl":
     "a prose line parses as @run; the wasm emitter rejects a statement-less program (TS emits an empty module)",
   "soundness/xfail-arith-hole-operand.vl":
