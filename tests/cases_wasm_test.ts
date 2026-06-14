@@ -68,8 +68,6 @@ const seedExists = (() => {
 // this list down is the message/span-parity work that also gates the deno
 // CHECK-tier deletion (ROADMAP F-tiers).
 const EXPECTED_DIVERGENCES: Record<string, string> = {
-  "intrinsics/array-new-ref-elems.vl":
-    "wasm emitter rejects ref-element `__array_new__` fills (i32/boolean/f64 only natively); the host lowers them generically — the native emitter long tail (std-design slice 0 residue)",
   "soundness/README.vl":
     "a prose line parses as @run; the wasm emitter rejects a statement-less program (TS emits an empty module)",
   "soundness/xfail-arith-hole-operand.vl":
