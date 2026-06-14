@@ -74,29 +74,15 @@ const PARSER_WORDING =
 const LEX_WORDING =
   "the wasm lexer splits the malformed literal into plain tokens (undeclared-identifier reject) — no lex-tier message parity";
 const EXPECTED_DIVERGENCES: Record<string, string> = {
-  "arrays/leading-comma-illegal.vl": PARSER_WORDING,
-  "arrays/trailing-comma-illegal.vl": PARSER_WORDING,
-  "bitwise/float-reject.vl": TS_WORDING,
-  "functions/inferred-return-soundness.vl": TS_WORDING,
   "functions/lambda-uninferable-param.vl":
     "wasm adds a cascade error (uninferable lambda return) beyond the declared diagnostic",
-  "functions/named-args-unknown.vl": TS_WORDING,
-  "functions/trailing-comma-illegal.vl": PARSER_WORDING,
-  "generics/array-element-correlation.vl": TS_WORDING,
-  "generics/return-correlation.vl": TS_WORDING,
-  "generics/type-alias-soundness.vl": TS_WORDING,
   "intrinsics/array-new-ref-elems.vl":
     "wasm emitter rejects ref-element `__array_new__` fills (i32/boolean/f64 only natively); the host lowers them generically — the native emitter long tail (std-design slice 0 residue)",
-  "intrinsics/error-array-copy-not-list.vl": TS_WORDING,
-  "intrinsics/error-array-new-arity.vl": TS_WORDING,
-  "intrinsics/error-array-new-bad-length.vl": TS_WORDING,
-  "intrinsics/error-trap-args.vl": TS_WORDING,
   "literals/err-bad-hex-digit.vl": LEX_WORDING,
   "literals/err-doubled-separator.vl": LEX_WORDING,
   "literals/err-empty-hex.vl": LEX_WORDING,
   "literals/err-prefix-separator.vl": LEX_WORDING,
   "literals/err-trailing-separator.vl": LEX_WORDING,
-  "loops/for-in-not-array.vl": TS_WORDING,
   "numerics/i32-to-f32-reject.vl": TS_WORDING,
   "numerics/i64-infer-let.vl":
     "native emitter gap: an unannotated let from an i64 expression materializes an i32 local (invalid wasm); the host infers the initializer's width — the native long tail",
@@ -104,31 +90,16 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
   "numerics/narrowing-reject.vl": TS_WORDING,
   "numerics/widen-call-arg.vl":
     "native emitter gap: an i32 variable passed to an i64 parameter is not sign-extended at the call site (invalid wasm); the host widens it — the native long tail",
-  "objects/self-method-pollution.vl": TS_WORDING,
   "objects/trailing-comma-illegal.vl": PARSER_WORDING,
-  "operators/eq-no-union-mismatch.vl": TS_WORDING,
   "soundness/README.vl":
     "a prose line parses as @run; the wasm emitter rejects a statement-less program (TS emits an empty module)",
-  "soundness/arith-annotated-mismatch.vl": TS_WORDING,
-  "soundness/equality-cross-type-reject.vl": TS_WORDING,
-  "soundness/equality-type-mismatch.vl": TS_WORDING,
-  "soundness/not-is-guard-no-divergence-no-narrow.vl": TS_WORDING,
-  "soundness/struct-union-unshared-field-reject.vl": TS_WORDING,
   "soundness/xfail-arith-hole-operand.vl":
     "parked soundness xfail (arith-hole-operand, ROADMAP A13): the wasm pipeline emits an invalid module",
   "soundness/xfail-array-element-recursion.vl":
     "parked soundness xfail: wasm rejects the i32-keyed-map element recursion the TS checker accepts",
   "soundness/xfail-seq-guard-residual-codegen.vl":
     "@error pins the TS host's own Codegen error; the wasm checker rejects earlier, at the type tier",
-  "types/assign-type.vl": TS_WORDING,
   "types/bodyless-alias.vl": PARSER_WORDING,
-  "types/boolean-literal-to-i32-reject.vl": TS_WORDING,
-  "types/boolean-to-i32-reject.vl": TS_WORDING,
-  "types/condition-type.vl": TS_WORDING,
-  "types/fn-arg-count.vl": TS_WORDING,
-  "types/for-bound-type.vl": TS_WORDING,
-  "types/i32-string-mismatch.vl": TS_WORDING,
-  "types/infer-null-pin-guard.vl": TS_WORDING,
   "types/never-value-intersection.vl":
     `${TS_WORDING}; wasm also adds a cascade error on the never-typed binding`,
   "types/never-value-self-intersection.vl":
