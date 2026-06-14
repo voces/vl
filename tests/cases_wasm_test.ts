@@ -97,7 +97,6 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
   "literals/err-prefix-separator.vl": LEX_WORDING,
   "literals/err-trailing-separator.vl": LEX_WORDING,
   "loops/for-in-not-array.vl": TS_WORDING,
-  "maps/error-i32-keyed.vl": TS_WORDING,
   "maps/error-object-literal-not-map.vl": TS_WORDING,
   "numerics/i32-to-f32-reject.vl": TS_WORDING,
   "numerics/i64-infer-let.vl":
@@ -109,7 +108,6 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
   "objects/self-method-pollution.vl": TS_WORDING,
   "objects/trailing-comma-illegal.vl": PARSER_WORDING,
   "operators/eq-no-union-mismatch.vl": TS_WORDING,
-  "sets/error-i32-keyed.vl": TS_WORDING,
   "soundness/README.vl":
     "a prose line parses as @run; the wasm emitter rejects a statement-less program (TS emits an empty module)",
   "soundness/arith-annotated-mismatch.vl": TS_WORDING,
