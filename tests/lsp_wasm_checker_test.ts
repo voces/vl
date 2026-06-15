@@ -265,6 +265,17 @@ Deno.test({ name: "wasm-symbols: typeAliasAt renders a user type name (decl + us
   }
 });
 
+Deno.test({ name: "wasm-symbols: an unannotated function's inferred return is retained (hover)", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // No return annotation — the checker now writes the demand-inferred return back
+  // into the function's retained type, so hover renders `-> i32`, not `-> <none>`.
+  const src = "function add(a: i32, b: i32) {\n  a + b\n}\n";
+  const ty = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 9);
+  if (ty !== "(i32, i32) -> i32") {
+    throw new Error(`expected the inferred return retained, got ${JSON.stringify(ty)}`);
+  }
+});
+
 Deno.test({ name: "wasm-symbols: an un-annotated polymorphic param hovers as any, not an inference hole", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // `x` is never annotated and only probed via `is i32`, so it stays a fresh

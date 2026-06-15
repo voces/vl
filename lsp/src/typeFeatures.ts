@@ -737,6 +737,57 @@ export const deriveInlayHints = (
   return hints;
 };
 
+/**
+ * One inlay-hint CANDIDATE from an external source (the wasm checker's
+ * `inlayHintsAt`): an unannotated declaration with its inferred type. `kind` 0 = a
+ * value binding (`let`/`const`/parameter) — the hint sits after the NAME; 1 = a
+ * function — the hint is its RETURN type and sits after the param list's `)`.
+ * `line`/`col` are the NAME end (1-based line, 0-based col — the native
+ * convention).
+ */
+export type ExtInlayCandidate = {
+  kind: number; // 0=value 1=function-return
+  line: number; // 1-based name-end line
+  col: number; // 0-based name-end col
+  type: string;
+};
+
+/**
+ * Type inlay hints from external candidates (the wasm checker) instead of the TS
+ * symbol-table walk — the kill-TS counterpart of {@link deriveInlayHints}. The
+ * checker supplies the inferred types + name-end positions; the source-scan
+ * filters that stay host-side — skip a declaration the user already annotated,
+ * place a function's hint after its `)`, honor the request `range` — are applied
+ * here, reusing the same helpers as the TS path.
+ */
+export const inlayHintsFromWasm = (
+  candidates: ExtInlayCandidate[],
+  range: LspRange | undefined,
+  source: string,
+): TypeInlayHint[] => {
+  const lines = splitLines(source);
+  const hints: TypeInlayHint[] = [];
+  for (const c of candidates) {
+    const idEnd: Position = { line: c.line, column: c.col };
+    // A function's return-type hint sits after the param list's `)`; a value
+    // binding's after its name. Skip a function whose `)` can't be located.
+    let pos: Position;
+    if (c.kind === 1) {
+      const close = closingParen(lines, idEnd);
+      if (!close) continue;
+      pos = close;
+    } else {
+      pos = idEnd;
+    }
+    // Skip a declaration the user already annotated (a `:` follows the position).
+    if (isAnnotated(lines, pos)) continue;
+    const lsp = toLsp(pos);
+    if (range && !posInRange(lsp.line, lsp.char, range)) continue;
+    hints.push({ line: lsp.line, char: lsp.char, label: `: ${c.type}`, name: "" });
+  }
+  return hints;
+};
+
 // ---- completion (D3) --------------------------------------------------------
 
 /**
