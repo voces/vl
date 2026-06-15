@@ -1,14 +1,12 @@
-// Cross-file LSP navigation (cross-file LSP / H0 phase 3, Track D).
+// Cross-file find-references (cross-file LSP / H0 phase 3, Track D).
 //
-// Builds on the module-graph foundation (`lsp/src/moduleGraph.ts`): when the
-// symbol under the cursor is an IMPORTED name, go-to-definition and doc-comment
-// xrefs resolve to the EXPORTING sibling module's declaration; find-references
-// gathers occurrences across the current file plus other open documents, AND
-// across unopened on-disk siblings (the disk-crawl extension).
-//
-// Like `lsp_module_diagnostics_test.ts`, these drive the PURE module-graph
-// helpers with an injected in-memory `ModuleReader` (no filesystem / cwd), since
-// `server.ts` can't load under Deno (Node-only `vscode-languageserver`).
+// `crossFileReferences` (`lsp/src/moduleGraph.ts`) gathers a symbol's occurrences
+// across the current file, other open documents, AND unopened on-disk siblings
+// (the disk crawl), orchestrating the self-hosted checker per candidate. These
+// drive that orchestrator + the workspace-enumeration helpers with an injected
+// in-memory `ModuleReader` (no filesystem / cwd), since `server.ts` can't load
+// under Deno (Node-only `vscode-languageserver`). Cross-file go-to-def / doc-xref
+// (the import/export pass) is covered by `tests/lsp_crossfile_wasm_test.ts`.
 //
 // Run: deno test -A --no-check tests/lsp_crossfile_test.ts
 
@@ -17,8 +15,6 @@ import {
   crossFileReferences,
   detectProjectRoot,
   enumerateWorkspaceFiles,
-  importedNameSource,
-  importedNameSources,
   type OpenDocument,
   pathToUri,
 } from "../lsp/src/moduleGraph.ts";
@@ -64,118 +60,6 @@ const xref = (
     includeDeclaration,
     diskFiles,
   );
-
-// ---- (1) cross-file go-to-definition ---------------------------------------
-
-Deno.test("cross-file go-to-def: an imported name resolves to the sibling's declaration", async () => {
-  const files = {
-    "/proj/util.vl": "export function add(a: i32, b: i32) {\n  return a + b\n}\n",
-    "/proj/main.vl": 'import { add } from "./util"\n\nprint(add(2, 3))\n',
-  };
-  const source = await importedNameSource(
-    "add",
-    files["/proj/main.vl"],
-    "/proj/main.vl",
-    memoryReader(files),
-  );
-  assert(source !== undefined, "imported `add` should resolve cross-file");
-  // Right FILE: the exporting sibling, not the importer.
-  assert(
-    source!.uri === pathToUri("/proj/util.vl"),
-    `should point at util.vl; got ${source!.uri}`,
-  );
-  assert(source!.key === "/proj/util.vl", `key should be util.vl; got ${source!.key}`);
-  // Right LINE: `export function add` is on line 0 (0-based LSP).
-  assert(
-    source!.range.start.line === 0,
-    `add's declaration is on line 0; got ${source!.range.start.line}`,
-  );
-  // The range points at the NAME `add` (column 16 in `export function add(`).
-  assert(
-    source!.range.start.character === "export function ".length,
-    `range should start at the name; got col ${source!.range.start.character}`,
-  );
-});
-
-Deno.test("cross-file go-to-def: a renamed import (`as`) resolves by EXPORTED name", async () => {
-  const files = {
-    "/proj/util.vl": "let _x = 0\nexport function compute() {\n  return 1\n}\n",
-    "/proj/main.vl": 'import { compute as run } from "./util"\n\nprint(run())\n',
-  };
-  // The local name is `run`; it must resolve via the exported name `compute`.
-  const source = await importedNameSource(
-    "run",
-    files["/proj/main.vl"],
-    "/proj/main.vl",
-    memoryReader(files),
-  );
-  assert(source !== undefined, "renamed import `run` should resolve");
-  assert(
-    source!.uri === pathToUri("/proj/util.vl"),
-    "renamed import should point at util.vl",
-  );
-  // `export function compute` is on line 1 (0-based).
-  assert(
-    source!.range.start.line === 1,
-    `compute's declaration is on line 1; got ${source!.range.start.line}`,
-  );
-});
-
-Deno.test("cross-file go-to-def: a non-imported local name does NOT resolve cross-file", async () => {
-  const files = {
-    "/proj/util.vl": "export function add(a: i32, b: i32) {\n  return a + b\n}\n",
-    "/proj/main.vl": 'import { add } from "./util"\n\nlet local = 7\nprint(local)\n',
-  };
-  const sources = await importedNameSources(
-    files["/proj/main.vl"],
-    "/proj/main.vl",
-    memoryReader(files),
-  );
-  assert("add" in sources, "imported `add` should be a cross-file source");
-  assert(!("local" in sources), "a local binding must NOT resolve cross-file");
-});
-
-Deno.test("cross-file go-to-def: a not-exported import yields no source", async () => {
-  const files = {
-    "/proj/util.vl": "function secret() {\n  return 2\n}\n", // not exported
-    "/proj/main.vl": 'import { secret } from "./util"\n\nprint(1)\n',
-  };
-  const source = await importedNameSource(
-    "secret",
-    files["/proj/main.vl"],
-    "/proj/main.vl",
-    memoryReader(files),
-  );
-  assert(source === undefined, "a non-exported import must not resolve");
-});
-
-// ---- (2) cross-file doc-comment xrefs --------------------------------------
-//
-// `buildDocRefResolver` (in server.ts) layers `importedNameSources` over the
-// single-file resolver. We assert the underlying source resolution here (the
-// resolver's cross-import branch is `importedSources[name]` → `uri#L<line+1>`),
-// since server.ts can't load under Deno.
-
-Deno.test("cross-file doc-xref: an imported `[`Name`]` resolves to the sibling source line", async () => {
-  const files = {
-    "/proj/util.vl": "export function add(a: i32, b: i32) {\n  return a + b\n}\n",
-    "/proj/main.vl":
-      'import { add } from "./util"\n\n/// see [`add`]\nfunction main() {\n  return add(1, 2)\n}\n',
-  };
-  const sources = await importedNameSources(
-    files["/proj/main.vl"],
-    "/proj/main.vl",
-    memoryReader(files),
-  );
-  const imported = sources["add"];
-  assert(imported !== undefined, "doc-xref `[`add`]` must resolve cross-import");
-  // The doc link the resolver builds: `<siblingUri>#L<1-based line>`.
-  const link = `${imported.uri}#L${imported.range.start.line + 1}`;
-  assert(
-    link === `${pathToUri("/proj/util.vl")}#L1`,
-    `doc link should jump to util.vl line 1; got ${link}`,
-  );
-});
 
 // ---- (3) cross-file find-references -----------------------------------------
 
@@ -250,21 +134,6 @@ Deno.test({ name: "cross-file find-refs: a purely-local symbol returns undefined
   assert(
     refs === undefined,
     "a non-exported local must defer to the single-file references path",
-  );
-});
-
-// ---- (4) REGRESSION: single-file go-to-def is untouched ---------------------
-
-Deno.test("regression: a no-import file exposes no cross-file sources", async () => {
-  const main = "function add(a: i32, b: i32) {\n  return a + b\n}\nprint(add(1, 2))\n";
-  const sources = await importedNameSources(
-    main,
-    "/proj/solo.vl",
-    memoryReader({ "/proj/solo.vl": main }),
-  );
-  assert(
-    Object.keys(sources).length === 0,
-    `a no-import file has no cross-file sources; got ${JSON.stringify(sources)}`,
   );
 });
 
