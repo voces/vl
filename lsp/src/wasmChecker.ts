@@ -93,6 +93,41 @@ export type WasmImportedSource = {
   length: number; // exported name length (for the range end)
 };
 
+/**
+ * One export of a module's surface, from the wasm import/export pass — the native
+ * counterpart of the host's `exportedDeclRanges` plus the `export`-keyword span.
+ * `name` is the exported name; `declLine`/`declCol` locate the decl NAME (1-based
+ * line, 0-based col — the native convention), `kwLine`/`kwCol` the `export`
+ * KEYWORD. Used by the project-wide unused-export pass to place its hints.
+ */
+export type WasmModuleExport = {
+  name: string;
+  declLine: number; // 1-based native line
+  declCol: number; // 0-based column
+  kwLine: number; // 1-based native line of the `export` keyword
+  kwCol: number; // 0-based column of the `export` keyword
+};
+
+/**
+ * One resolved import of a module's surface, from the wasm import/export pass:
+ * the exporting sibling module's resolved `key` plus the exported source `name`.
+ * Bare imports (`import "x"`) and unresolved/unexported specifiers are omitted by
+ * {@link WasmChecker.moduleSurface}.
+ */
+export type WasmModuleImport = { key: string; name: string };
+
+/**
+ * A module's import/export surface, from the wasm import/export pass — the native
+ * counterpart of the host's single-file symbol scan in the unused-export pass.
+ * `exports` are the module's own `export`ed decls; `imports` are its resolved
+ * cross-file references. Both are empty when the seed predates the import/export
+ * exports (the caller then treats the module as having no surface).
+ */
+export type WasmModuleSurface = {
+  exports: WasmModuleExport[];
+  imports: WasmModuleImport[];
+};
+
 export type WasmChecker = {
   /** Diagnostics for `source` as the entry module at `entryKey`. */
   check: (
@@ -202,6 +237,19 @@ export type WasmChecker = {
     entryKey: string,
     read: ModuleReader,
   ) => Promise<Record<string, WasmImportedSource>>;
+  /**
+   * Module import/export surface (kill-TS step 3-C Stage 2): the ENTRY module's
+   * own `export`ed decls (name + decl-name span + `export`-keyword span) and its
+   * RESOLVED cross-file imports (sibling key + exported source name). Powers the
+   * project-wide unused-export pass off the self-hosted checker. Bare imports and
+   * unresolved/unexported specifiers are omitted. `{exports:[],imports:[]}` when
+   * the seed predates the import/export exports — the caller then treats the
+   * module as surface-less.
+   */
+  moduleSurface: (
+    source: string,
+    entryKey: string,
+  ) => WasmModuleSurface;
   /**
    * Whole-document formatting (kill-TS step 1, the `format.ts` consumer): the
    * canonical reprint of `source` via the self-hosted formatter (`format.vl`'s
@@ -599,6 +647,61 @@ export const loadWasmChecker = (
     return out;
   };
 
+  // The `export`-keyword span exports ride the same Stage-2+ seed as the rest of
+  // the import/export table; an older seed has the decl-name span (`hasCrossFile`)
+  // but not the keyword span, so the surface query degrades to an empty result.
+  const hasExportKw = (exp: Exports): boolean =>
+    typeof exp.expKwLineAt === "function" &&
+    typeof exp.expKwColAt === "function";
+
+  const moduleSurface = (
+    source: string,
+    entryKey: string,
+  ): WasmModuleSurface => {
+    const exp = instantiate();
+    if (exp === undefined || !hasCrossFile(exp) || !hasExportKw(exp)) {
+      return { exports: [], imports: [] };
+    }
+    // Commit the entry (table index 0) so `modScan` fills the import/export tables
+    // for it. Unlike `prepare` — whose graph commit is import-gated (a single-file
+    // check needs no module table) — the entry must be committed here even when it
+    // has no imports, since we read its EXPORTS. A module's own surface (its
+    // exports + its imports' resolved keys) comes from its own tokens, so no
+    // dependency fetch is needed; key resolution is pure string math.
+    exp.modReset();
+    pushString(exp.modKeyPush, entryKey);
+    pushString(exp.modSrcPush, source);
+    exp.modCommit(1);
+
+    const exports: WasmModuleExport[] = [];
+    const expCount = exp.expCount();
+    for (let i = 0; i < expCount; i++) {
+      if (exp.expModAt(i) !== 0) continue; // entry module only
+      const name = readString(exp.expNameLen(i), (j) => exp.expNameCharAt(i, j));
+      if (name.length === 0) continue;
+      exports.push({
+        name,
+        declLine: exp.expDeclLineAt(i),
+        declCol: exp.expDeclColAt(i),
+        kwLine: exp.expKwLineAt(i),
+        kwCol: exp.expKwColAt(i),
+      });
+    }
+
+    const imports: WasmModuleImport[] = [];
+    const impCount = exp.impCount();
+    for (let i = 0; i < impCount; i++) {
+      if (exp.impModAt(i) !== 0) continue; // entry module only
+      const key = readString(exp.impKeyLen(i), (j) => exp.impKeyCharAt(i, j));
+      if (key.length === 0) continue; // unresolved specifier
+      const name = readString(exp.impNameLen(i), (j) => exp.impNameCharAt(i, j));
+      if (name.length === 0) continue; // bare `import "x"`
+      imports.push({ key, name });
+    }
+
+    return { exports, imports };
+  };
+
   const check = async (
     source: string,
     entryKey: string,
@@ -728,6 +831,7 @@ export const loadWasmChecker = (
     memberTokensAt,
     scopeAt,
     importedNameSources,
+    moduleSurface,
     formatSrc,
     lint,
   };
