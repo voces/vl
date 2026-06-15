@@ -43,9 +43,8 @@ import {
   rangeFromCtx,
   stringifyType,
   type SymbolTable,
-  type VLDiagnostic,
-  type VLRange,
 } from "../../compiler/compile.ts";
+import type { VLDiagnostic, VLRange } from "../../compiler/diagnostics.ts";
 import { lint } from "../../compiler/lint.ts";
 import type {
   NodeSpans,

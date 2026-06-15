@@ -21,7 +21,7 @@
 // which `checkSrc` does NOT reset, so every check calls it).
 
 import { readFileSync, statSync } from "node:fs";
-import type { VLDiagnostic } from "../../compiler/compile.ts";
+import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
 import type { ModuleReader } from "../../compiler/modules.ts";
 import { withStd } from "./moduleGraph.ts";
 
