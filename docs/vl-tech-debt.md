@@ -56,6 +56,22 @@ Organized by area. Triage freely.
   function breaks a lambda's capture analysis (branch `claude/capscan-shadow-fix`).
   Forces awkward renames in `.vl` source — debt paid in workarounds until the fix
   lands.
+- **Cross-module completion scope leak (`symScopeAt`).** In a multi-module compile
+  the merge concatenates every module's tokens into one stream but each keeps its
+  OWN per-module line numbers, and all top-level decls flatten into one global
+  scope — the import boundaries are lost. So `scopeAt` (LSP completion) at a cursor
+  in the entry file can surface a DEPENDENCY's nested params/locals whose
+  per-module line span happens to overlap the cursor's line (e.g. importing `util`
+  leaks `util`'s function params into the entry's completion list). A naive
+  entry-module filter doesn't work: a legitimately-imported top-level name and a
+  dep-internal local both have their decl in the dependency module, and a
+  global-scope filter would instead leak TRANSITIVE deps' top-level names the entry
+  can't reference. A correct fix needs the merge to preserve each module's import
+  set + scope chain (global token coordinates, or per-module-tagged vis spans with
+  an import-visibility check) rather than a flat global scope. Pre-existing since
+  `scopeAt` shipped; the imported-name DISPLAY was fixed separately (de-mangle of
+  `add$m1` → `add`). Def/refs/hover are unaffected — they disambiguate by module
+  tag (`symOccModuleAt`).
 
 ## Test infrastructure
 

@@ -58,3 +58,21 @@ Deno.test({
     throw new Error(`expected no entry for the non-exported name, got ${JSON.stringify(sources.sub)}`);
   }
 });
+
+Deno.test({
+  name: "wasm-crossfile: scopeAt shows an imported name under its source name (de-mangled)",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // In a multi-module compile the importer's use of `add` resolves to the merge's
+  // canonical binding `add$m1`; completion must surface the SOURCE name `add`, not
+  // the internal mangled form. (`print` is at line 2 / 0-based 1, col 0.)
+  const scope = await checker.scopeAt(entry, "/proj/main.vl", read, 1, 0);
+  const names = scope.map((b) => b.name);
+  if (!names.includes("add")) {
+    throw new Error(`expected the de-mangled \`add\`, got ${JSON.stringify(names)}`);
+  }
+  if (names.some((n) => n.includes("$"))) {
+    throw new Error(`a mangled name leaked into completion: ${JSON.stringify(names)}`);
+  }
+});
