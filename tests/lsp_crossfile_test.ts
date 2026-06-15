@@ -18,7 +18,7 @@ import {
   type OpenDocument,
   pathToUri,
 } from "../lsp/src/moduleGraph.ts";
-import { loadWasmChecker } from "../lsp/src/wasmChecker.ts";
+import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
 const assert = (cond: boolean, msg: string): void => {
   if (!cond) throw new Error(msg);

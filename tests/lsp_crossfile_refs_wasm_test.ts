@@ -9,7 +9,7 @@
 
 import type { ModuleReader } from "../compiler/modules.ts";
 import { crossFileReferences, pathToUri } from "../lsp/src/moduleGraph.ts";
-import { loadWasmChecker } from "../lsp/src/wasmChecker.ts";
+import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
 const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
 const seedExists = (() => {

@@ -8,7 +8,7 @@
 // wasm suite. The pure `memberCompletionsFromWasm` conversion runs unconditionally.
 //   deno test -A --no-check tests/lsp_member_completion_wasm_test.ts
 
-import { loadWasmChecker } from "../lsp/src/wasmChecker.ts";
+import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import {
   builtinCompletionsFromWasm,
   memberCompletionsFromWasm,

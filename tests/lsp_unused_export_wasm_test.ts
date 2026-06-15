@@ -8,7 +8,7 @@
 // `refresh-compiler.sh` yet) they self-ignore, the same convention as the
 // rest of the wasm suite.
 
-import { loadWasmChecker } from "../lsp/src/wasmChecker.ts";
+import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import {
   buildUnusedExportUseMap,
   unusedExportHints,

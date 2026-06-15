@@ -10,7 +10,7 @@ import {
   diffHoverType,
   diffReferences,
   loadWasmChecker,
-} from "../lsp/src/wasmChecker.ts";
+} from "../lsp/src/wasmCheckerNode.ts";
 import type { VLDiagnostic } from "../compiler/compile.ts";
 
 const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;

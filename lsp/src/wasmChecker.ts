@@ -1,18 +1,19 @@
-// The wasm-backed checker — Stage 1 of the LSP-on-wasm migration (ROADMAP
-// "Kill the TS host", step 1). Loads the SELF-HOSTED compiler
-// (`build/vl-compiler.wasm`, the same seed `vl check` runs) and drives its
-// driver exports for per-keystroke diagnostics: `srcReset`/`srcPush` +
-// `checkSrc` + the structured diagnostic reads (`diagCount`/`diagMsg*`/
-// `diagLine`/`diagCol`/`diagEndCol`), plus the H3 module-fetch protocol
-// (`modReset`/`modKeyPush`/`modSrcPush`/`modCommit`/`modPending*`) wired to the
-// LSP's workspace reader so sibling imports resolve against open buffers.
+// The wasm-backed checker — the LSP-on-wasm core (ROADMAP "Kill the TS host").
+// Drives the SELF-HOSTED compiler seed (`build/vl-compiler.wasm`, the same one
+// `vl check` runs) through its driver exports: per-keystroke diagnostics
+// (`srcReset`/`srcPush` + `checkSrc` + the structured `diagCount`/`diagMsg*`/
+// `diagLine`/`diagCol`/`diagEndCol` reads), the H3 module-fetch protocol
+// (`modReset`/`modKeyPush`/`modSrcPush`/`modCommit`/`modPending*`) wired to a
+// workspace reader so sibling imports resolve against open buffers, plus the
+// Stage-2/3 symbol/token/scope/member/inlay + format + lint query families.
 //
-// Selected by the `vital.checker` setting (`"ts" | "wasm" | "both"` — see
-// server.ts): `"wasm"` publishes these diagnostics, `"both"` runs both checkers
-// and LOGS divergence — the parity instrument the TS-host teardown gates on.
-// As of kill-TS step 2 `"wasm"` is the DEFAULT. The TS path stays the fallback:
-// a missing/uninstantiable seed (e.g. an extension host whose V8 lacks WasmGC)
-// degrades to `"ts"` with one log line, never an error.
+// This module is ENVIRONMENT-AGNOSTIC: {@link createWasmChecker} takes a seed
+// `instantiate`r and a reader wrapper, with no `node:fs`/DOM coupling, so the
+// same driver protocol backs both the Node LSP (`wasmCheckerNode.ts` loads the
+// seed off disk and re-reads on its mtime) and the browser playground (which
+// fetches the seed bytes once). Every method degrades to a "no result" when the
+// seed is unavailable or predates an export, so a host whose V8 lacks WasmGC, or
+// an older seed, never errors.
 //
 // Latency contract (measured in the spike): cold compile+instantiate ~2 ms,
 // steady-state `checkSrc` ~0.1–1.3 ms on editor-sized files, ~75 ms on the
@@ -20,12 +21,17 @@
 // (`checkSrc` resets all compiler state; `modReset` clears the module table,
 // which `checkSrc` does NOT reset, so every check calls it).
 
-import { readFileSync, statSync } from "node:fs";
 import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
 import type { ModuleReader } from "../../compiler/modules.ts";
-import { withStd } from "./moduleGraph.ts";
 
-type Exports = Record<string, (...args: number[]) => number>;
+/**
+ * The seed's driver exports, as a flat numeric ABI (every arg/return is an
+ * `i32`; strings cross the boundary code-point-by-code-point via the
+ * `*Len`/`*CharAt` accessor pattern). Supplied to {@link createWasmChecker} by
+ * the host — `wasmCheckerNode.ts` instantiates from a file path (`node:fs`), the
+ * playground from fetched bytes — so this module stays environment-agnostic.
+ */
+export type Exports = Record<string, (...args: number[]) => number>;
 
 /** An LSP source span (0-based line, 0-based character — the LSP convention). */
 export type WasmRange = {
@@ -455,52 +461,23 @@ const hasImports = (source: string): boolean =>
   });
 
 /**
- * Load (or reuse) the checker for the seed at `wasmPath`. Returns undefined —
- * after one `log` line — when the seed is missing or the host cannot
- * instantiate it (no WasmGC). The instance is cached and transparently
- * reloaded when the seed file's mtime changes (a dev `refresh-compiler.sh`
- * mid-session picks up the new compiler without an editor reload).
+ * Build a checker over a seed `instantiate`r — the environment-agnostic core of
+ * the LSP-on-wasm path. `instantiate` returns the live driver {@link Exports}
+ * (or undefined when the seed is unavailable — every method then degrades to a
+ * "no result"); it owns whatever caching/reload policy fits the host
+ * (`wasmCheckerNode.ts` re-reads on the seed file's mtime, the browser caches
+ * the fetched bytes once). Each query method calls it afresh so a mid-session
+ * reload is picked up transparently.
  *
- * `getStdDir` feeds the `withStd` wrapper around every check's reader: a
- * workspace `std/` dir (when one exists) wins over the embedded std map, the
- * same precedence the TS checker's workspace reader applies.
+ * `wrapReader` wraps every check's {@link ModuleReader} before the import-fetch
+ * loop — the std-resolution layer. The Node loader passes `withStd` (workspace
+ * `std/` dir over the embedded map); the browser passes an embedded-map reader.
+ * Omitted, the reader is used as-is (no std overlay).
  */
-export const loadWasmChecker = (
-  wasmPath: string,
-  log: (msg: string) => void,
-  getStdDir?: () => string | undefined,
-): WasmChecker | undefined => {
-  let exports: Exports | undefined;
-  let loadedMtime = -1;
-
-  const instantiate = (): Exports | undefined => {
-    let mtime: number;
-    try {
-      mtime = statSync(wasmPath).mtimeMs;
-    } catch {
-      log(`[wasm-checker] seed not found at ${wasmPath} — falling back to the TS checker`);
-      return undefined;
-    }
-    if (exports !== undefined && mtime === loadedMtime) return exports;
-    try {
-      const bytes = readFileSync(wasmPath);
-      const module = new WebAssembly.Module(bytes as BufferSource);
-      const instance = new WebAssembly.Instance(module, {});
-      exports = instance.exports as unknown as Exports;
-      loadedMtime = mtime;
-      log(`[wasm-checker] loaded ${wasmPath} (${bytes.length} bytes)`);
-      return exports;
-    } catch (err) {
-      log(`[wasm-checker] failed to instantiate ${wasmPath}: ${err} — falling back to the TS checker`);
-      exports = undefined;
-      return undefined;
-    }
-  };
-
-  // Probe once at startup so a hopeless host degrades immediately (and the
-  // caller can drop to "ts" mode); later mtime-driven reloads are per-check.
-  if (instantiate() === undefined) return undefined;
-
+export const createWasmChecker = (
+  instantiate: () => Exports | undefined,
+  wrapReader?: (read: ModuleReader) => ModuleReader,
+): WasmChecker => {
   // Shared setup for every query: reset the module table (it persists across
   // checks by design — an LSP check is a fresh program every time), run the
   // import fetch loop against the workspace reader, then stage the entry source.
@@ -513,10 +490,11 @@ export const loadWasmChecker = (
   ): Promise<void> => {
     exp.modReset();
     if (hasImports(source)) {
-      // `std:` keys resolve through the shared withStd wrapper (workspace
-      // `std/` dir first, then the embedded map) — same precedence as the TS
-      // checker's workspace reader, so the two checkers agree about std.
-      const readModule = withStd(read, getStdDir);
+      // `std:` keys resolve through the host's reader wrapper (the Node loader's
+      // `withStd`: workspace `std/` dir first, then the embedded map — same
+      // precedence as the TS checker's workspace reader, so the two agree about
+      // std). With no wrapper, the reader is used as-is.
+      const readModule = wrapReader ? wrapReader(read) : read;
       const commit = (key: string, src: string | undefined) => {
         pushString(exp.modKeyPush, key);
         if (src !== undefined) pushString(exp.modSrcPush, src);

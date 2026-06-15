@@ -51,7 +51,7 @@ import {
   type WasmMemberToken,
   type WasmRange,
   type WasmToken,
-} from "./wasmChecker.ts";
+} from "./wasmCheckerNode.ts";
 import {
   builtinCompletionsFromWasm,
   type Completion,

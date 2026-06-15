@@ -19,7 +19,7 @@ import {
   semanticTokensData,
   semanticTokensDataFromWasm,
 } from "../lsp/src/typeFeatures.ts";
-import { loadWasmChecker } from "../lsp/src/wasmChecker.ts";
+import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
