@@ -244,6 +244,27 @@ Deno.test({ name: "wasm-symbols: hoverTypeAt renders a non-empty type", ignore }
   }
 });
 
+Deno.test({ name: "wasm-symbols: typeAliasAt renders a user type name (decl + use)", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // `type Pt = { x: i32 }` on line 0 (name at col 5); `let p: Pt = …` on line 1
+  // (the `Pt` annotation use at col 7). Both resolve to the alias's body.
+  const src = "type Pt = { x: i32 }\nlet p: Pt = { x: 1 }\n";
+  const declTy = await checker.typeAliasAt(src, "/tmp/x.vl", noSiblings, 0, 5);
+  if (declTy !== "{x: i32}") {
+    throw new Error(`expected the alias body at the decl, got ${JSON.stringify(declTy)}`);
+  }
+  const useTy = await checker.typeAliasAt(src, "/tmp/x.vl", noSiblings, 1, 7);
+  if (useTy !== "{x: i32}") {
+    throw new Error(`expected the alias body at the use, got ${JSON.stringify(useTy)}`);
+  }
+  // The value binding `p` (col 4) is NOT a type name — typeAliasAt yields nothing
+  // (it's served by `hoverTypeAt`); a non-identifier position likewise.
+  const atValue = await checker.typeAliasAt(src, "/tmp/x.vl", noSiblings, 1, 4);
+  if (atValue !== undefined && atValue !== "") {
+    throw new Error(`expected no type-alias at the value binding, got ${JSON.stringify(atValue)}`);
+  }
+});
+
 Deno.test({ name: "wasm-symbols: an un-annotated polymorphic param hovers as any, not an inference hole", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // `x` is never annotated and only probed via `is i32`, so it stays a fresh
