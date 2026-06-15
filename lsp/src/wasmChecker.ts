@@ -251,6 +251,20 @@ export type WasmChecker = {
     character: number,
   ) => Promise<string | undefined>;
   /**
+   * Type-alias hover (kill-TS): the rendered type of the user `type` NAME (a
+   * struct/union alias) under the cursor — its decl name or a use in an
+   * annotation — which `hoverTypeAt` (value-binding only) can't serve. Resolves
+   * the token at the position through the checker's declared-types map. undefined
+   * when the cursor is off a known user type / the seed predates the export.
+   */
+  typeAliasAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<string | undefined>;
+  /**
    * Semantic tokens (Stage 2): every classified IDENTIFIER occurrence in the
    * document (binding kind + declaration flag + span). Empty when the seed
    * predates the token exports — the host then falls back to its TS pass.
@@ -674,6 +688,25 @@ export const loadWasmChecker = (
     const len = exp.memberTypeStrAt(line + 1, character);
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.memberTypeStrCharAt(j));
+  };
+
+  const typeAliasAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<string | undefined> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp) ||
+      typeof exp.typeAliasAt !== "function") {
+      return undefined;
+    }
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    const len = exp.typeAliasAt(line + 1, character);
+    if (len <= 0) return undefined;
+    return readString(len, (j) => exp.typeAliasCharAt(j));
   };
 
   // The token exports ride the same Stage-2 seed as the symbol exports; an older
@@ -1130,6 +1163,7 @@ export const loadWasmChecker = (
     referencesInEntry,
     hoverTypeAt,
     memberTypeAt,
+    typeAliasAt,
     tokensAt,
     memberTokensAt,
     lexicalTokensAt,

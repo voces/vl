@@ -56,6 +56,16 @@ Organized by area. Triage freely.
   function breaks a lambda's capture analysis (branch `claude/capscan-shadow-fix`).
   Forces awkward renames in `.vl` source — debt paid in workarounds until the fix
   lands.
+- **No `///` doc-comments on wasm-mode hover/completion.** The native symbol
+  query exposes a binding's type but not its authored `///` doc comment, so
+  `"wasm"`-mode hover renders `name: type` with no doc panel and completion items
+  carry no `documentation` (the TS path's `docMarkdown` + xref linkification). This
+  has been the wasm-mode behaviour since hover/completion went wasm-primary (the
+  native path always returned first); now that those handlers are formally
+  TS-free, the docs won't return via fallback. Closing it needs a native
+  doc-comment export (the lexer already retains `//`/`///` as trivia — a
+  `docAt(line,col)` could associate the leading doc run with the binding/decl
+  under the cursor) plus re-plumbing the xref resolver off the native import graph.
 - **Cross-module completion scope leak (`symScopeAt`).** In a multi-module compile
   the merge concatenates every module's tokens into one stream but each keeps its
   OWN per-module line numbers, and all top-level decls flatten into one global

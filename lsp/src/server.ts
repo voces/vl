@@ -756,6 +756,23 @@ connection.onHover(async (params): Promise<Hover | null> => {
         return undefined;
       });
   };
+  // The native type of a user `type` NAME (struct/union alias) under the cursor —
+  // the type-alias hover `hoverTypeAt` (value-binding only) can't serve.
+  const wasmTypeAlias = async (): Promise<string | undefined> => {
+    if (wasmChecker?.typeAliasAt === undefined) return undefined;
+    return await wasmChecker
+      .typeAliasAt(
+        document.getText(),
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+        params.position.line,
+        params.position.character,
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] typeAliasAt failed: ${err}`);
+        return undefined;
+      });
+  };
   const wordForHover = wordAt(
     document.getText({
       start: { line: params.position.line, character: 0 },
@@ -763,17 +780,32 @@ connection.onHover(async (params): Promise<Hover | null> => {
     }),
     params.position.character,
   );
-  if (checkerMode === "wasm" && wasmChecker !== undefined) {
+
+  // ── Kill-TS: fully self-hosted hover in "wasm" mode ────────────────────────
+  // Value binding (`hoverTypeAt`, incl. imported names) → member access
+  // (`memberTypeAt`) → user `type` alias (`typeAliasAt`) → builtin (native
+  // builtin list). No checkOnly/parseSymbols/importedScope. Source `///` docs are
+  // not rendered — unchanged from the prior wasm-mode behaviour (the native path
+  // never carried them; a doc-aware hover needs a separate native export).
+  if (
+    checkerMode === "wasm" && wasmChecker !== undefined &&
+    wasmChecker.hoverTypeAt !== undefined &&
+    wasmChecker.memberTypeAt !== undefined &&
+    wasmChecker.typeAliasAt !== undefined &&
+    wasmChecker.builtinCompletions !== undefined
+  ) {
+    if (!wordForHover) return null;
     const t = await wasmHoverType();
-    if (t && wordForHover) {
-      return { contents: hoverMarkdown(`${wordForHover}: ${t}`) };
-    }
-    // Binding miss — try the native member type before the TS fallback.
+    if (t) return { contents: hoverMarkdown(`${wordForHover}: ${t}`) };
     const mt = await wasmMemberType();
-    if (mt && wordForHover) {
-      return { contents: hoverMarkdown(`${wordForHover}: ${mt}`) };
+    if (mt) return { contents: hoverMarkdown(`${wordForHover}: ${mt}`) };
+    const at = await wasmTypeAlias();
+    if (at) return { contents: hoverMarkdown(`${wordForHover}: ${at}`) };
+    const b = wasmChecker.builtinCompletions().find((x) => x.name === wordForHover);
+    if (b && b.detail.length > 0) {
+      return { contents: hoverMarkdown(`${wordForHover}: ${b.detail}`) };
     }
-    // else fall through to the TS hover (imported names, flow types).
+    return null;
   }
 
   const lineText = document.getText({
