@@ -316,7 +316,7 @@ const wasmTokensOf = async (
 Deno.test({
   name: "wasm-lexical: classifies keywords / operators / literals / comments",
   ignore,
-}, async () => {
+}, () => {
   const checker = loadWasmChecker(SEED, () => {})!;
   const lex = checker.lexicalTokensAt(
     "let x = 1 + 2 // hi\nif x == 3 { return true }\n",
@@ -341,7 +341,7 @@ Deno.test({
 Deno.test({
   name: "wasm-lexical: every operator kind the lexer emits is coloured",
   ignore,
-}, async () => {
+}, () => {
   const checker = loadWasmChecker(SEED, () => {})!;
   // `/` and `%` (SLASH/PERCENT) were among the kinds the TS host mislabelled and
   // dropped; assert the native pass colours them as operators.
