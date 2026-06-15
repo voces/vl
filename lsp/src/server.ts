@@ -82,6 +82,7 @@ import {
   keywordCompletions,
   type LspRange,
   memberCompletions,
+  memberCompletionsFromWasm,
   receiverObjectType,
   resolveMemberAt,
   scopeCompletionsFromBindings,
@@ -1091,6 +1092,19 @@ const wordEndingBefore = (line: string, character: number): string | null => {
   return /^[A-Za-z_]/.test(word) ? word : null;
 };
 
+// Remove the single character at (0-based line, 0-based col) from `text` — used to
+// strip the trailing `.` so the wasm member-completion path can resolve the
+// receiver as a bare expression (the native parser isn't error-tolerant for the
+// incomplete `receiver.`). A no-op if the position is out of range.
+const removeCharAt = (text: string, line: number, col: number): string => {
+  const lines = text.split("\n");
+  if (line < 0 || line >= lines.length) return text;
+  const l = lines[line];
+  if (col < 0 || col >= l.length) return text;
+  lines[line] = l.slice(0, col) + l.slice(col + 1);
+  return lines.join("\n");
+};
+
 // Completion (D3): scope-aware identifier suggestions everywhere, structural
 // member suggestions after `.`, plus keyword and snippet completions for
 // statement-position typing. Driven by the pure helpers in `typeFeatures.ts`
@@ -1137,6 +1151,36 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   if (charBeforeCursor === ".") {
     const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
     if (!receiver) return [];
+
+    // Kill-TS: member completion off the self-hosted checker. The native parser
+    // isn't error-tolerant for the incomplete `receiver.`, so strip the trailing
+    // `.` (the char before the cursor) and resolve the receiver as a bare
+    // expression at its own position. Empty when the receiver has no completable
+    // members (arrays/maps — same as the TS path) or the cursor can't resolve —
+    // we then fall through to TS (no regression).
+    if (checkerMode === "wasm" && wasmChecker?.memberCompletionsAt !== undefined) {
+      const dotCol = params.position.character - 1;
+      const repaired = removeCharAt(text, params.position.line, dotCol);
+      const recvCol = dotCol - receiver.length;
+      const members = await wasmChecker
+        .memberCompletionsAt(
+          repaired,
+          entryKeyOf(params.textDocument.uri),
+          workspaceReader,
+          params.position.line,
+          recvCol,
+        )
+        .catch((err) => {
+          connection.console.log(`[wasm-checker] memberCompletionsAt failed: ${err}`);
+          return [];
+        });
+      if (members.length > 0) {
+        return memberCompletionsFromWasm(members).map((c) =>
+          toCompletionItem(c, docResolver)
+        );
+      }
+    }
+
     const { ast } = checkOnly(text);
     if (!ast) return [];
     // Fold imported names in so an imported object can be a member receiver.

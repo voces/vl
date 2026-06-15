@@ -114,6 +114,19 @@ export type WasmScopeBinding = {
 };
 
 /**
+ * One member-completion entry from the wasm member-completion pass (kill-TS) — a
+ * field of a struct receiver, or a builtin method of a `string` receiver. The
+ * native counterpart of the host's `receiverObjectType` + `memberCompletions`.
+ * `name` is the member identifier; `detail` its rendered type; `isMethod` true for
+ * a function-typed member (→ the `function` completion kind), else a plain field.
+ */
+export type WasmMemberCompletion = {
+  name: string;
+  detail: string;
+  isMethod: boolean;
+};
+
+/**
  * One resolved cross-file imported source, from the wasm import/export pass — the
  * native counterpart of the host's `importedNameSources`. Keyed (in the returned
  * record) by the LOCAL binding name; `key` is the exporting sibling module's
@@ -272,6 +285,24 @@ export type WasmChecker = {
     line: number,
     character: number,
   ) => Promise<WasmScopeBinding[]>;
+  /**
+   * Member-completion (kill-TS): the members of the receiver whose binding is
+   * under (`line`, `character`) — both 0-based, LSP — a struct receiver's fields
+   * or a `string` receiver's builtin methods, the native counterpart of the
+   * host's `receiverObjectType` + `memberCompletions`. The caller passes the
+   * source with the trailing `.` STRIPPED (so the receiver parses as a bare
+   * expression — the native parser isn't error-tolerant for `receiver.`) and a
+   * position on the receiver name. Empty when the cursor is off a typed binding,
+   * the receiver has no completable members (arrays/maps, like the host), or the
+   * seed predates the exports — the host then falls back to its TS member path.
+   */
+  memberCompletionsAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<WasmMemberCompletion[]>;
   /**
    * Cross-file imported sources (kill-TS step 3-C): for each LOCAL imported name
    * in `source` (as the entry module at `entryKey`), the exporting sibling
@@ -734,6 +765,45 @@ export const loadWasmChecker = (
     return out;
   };
 
+  // The member-completion exports ride the same Stage-2+ seed as the symbol
+  // exports; an older seed lacks them, so the method yields [] (the host falls
+  // back to its TS `memberCompletions`).
+  const hasMemberScan = (exp: Exports): boolean =>
+    typeof exp.memberScanAt === "function" &&
+    typeof exp.memberScanNameLen === "function" &&
+    typeof exp.memberScanIsFn === "function";
+
+  const memberCompletionsAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<WasmMemberCompletion[]> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp) || !hasMemberScan(exp)) return [];
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    // Native lines are 1-based; the LSP cursor line is 0-based.
+    const count = exp.memberScanAt(line + 1, character);
+    const out: WasmMemberCompletion[] = [];
+    for (let i = 0; i < count; i++) {
+      // Per-index buffers (like `scopeAt`): read this index's NAME fully, then its
+      // detail TYPE fully, before moving on.
+      const name = readString(
+        exp.memberScanNameLen(i),
+        (j) => exp.memberScanNameCharAt(i, j),
+      );
+      if (name.length === 0) continue; // defensive: a member always has a name
+      const detailLen = exp.memberScanTypeLen(i);
+      const detail = detailLen <= 0
+        ? ""
+        : readString(detailLen, (j) => exp.memberScanTypeCharAt(i, j));
+      out.push({ name, detail, isMethod: exp.memberScanIsFn(i) === 1 });
+    }
+    return out;
+  };
+
   // The import/export tables ride the same Stage-2+ seed as the symbol exports;
   // an older seed lacks them, so the method yields {} (the host falls back to its
   // TS `importedNameSources`).
@@ -1021,6 +1091,7 @@ export const loadWasmChecker = (
     memberTokensAt,
     lexicalTokensAt,
     scopeAt,
+    memberCompletionsAt,
     importedNameSources,
     moduleSurface,
     formatSrc,

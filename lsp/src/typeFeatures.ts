@@ -1012,6 +1012,36 @@ export const scopeCompletionsFromBindings = (
   return [...byName.values()];
 };
 
+/** An external member-completion entry (the wasm checker's `memberCompletionsAt`). */
+export type ExtMemberCompletion = {
+  name: string;
+  detail: string;
+  isMethod: boolean;
+};
+
+/**
+ * Member completions from an external member set (the wasm checker's
+ * `memberCompletionsAt`) instead of the TS `receiverObjectType` +
+ * {@link memberCompletions}. A function-typed member maps to the `function`
+ * completion kind, any other to `variable`; the rendered `detail` is dropped to
+ * `undefined` when empty. De-duped by name (first wins), matching
+ * {@link memberCompletions}'s `seen` set.
+ */
+export const memberCompletionsFromWasm = (
+  members: ExtMemberCompletion[],
+): Completion[] => {
+  const byName = new Map<string, Completion>();
+  for (const m of members) {
+    if (byName.has(m.name)) continue;
+    byName.set(m.name, {
+      name: m.name,
+      kind: m.isMethod ? "function" : "variable",
+      detail: m.detail.length > 0 ? m.detail : undefined,
+    });
+  }
+  return [...byName.values()];
+};
+
 // VL keywords: hard keywords (reserved by the lexer) plus soft keywords
 // (contextual — lexed as `ID` but given syntactic meaning by the parser). We
 // enumerate them statically rather than importing the lexer's `KEYWORDS` map so
