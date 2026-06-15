@@ -38,25 +38,23 @@ export type { Binding, BindingKind, SymbolOccurrence } from "./symbols.ts";
 export { SymbolTable } from "./symbols.ts";
 export type { Comment } from "./lexer.ts";
 
-// `hint` is the lowest tier: VS Code renders it with NO squiggle and keeps it
-// out of the warning/error count. Combined with the `unnecessary` tag it greys
-// out the span (used for `_`-prefixed intentionally-unused bindings). Hints must
-// never count toward the CLI error/warning tally or fail the test harness.
-export type VLSeverity = "error" | "warning" | "info" | "hint";
-export type VLPosition = { line: number; character: number };
-export type VLRange = { start: VLPosition; end: VLPosition };
-// LSP diagnostic tags (LSP `DiagnosticTag`): `unnecessary` renders the span
-// faded/greyed out (VS Code dims unused/unreachable code rather than only
-// squiggling it); `deprecated` strikes it through. The lint pass tags
-// unused-variable / unreachable-code as `unnecessary`.
-export type VLDiagnosticTag = "unnecessary" | "deprecated";
-export type VLDiagnostic = {
-  message: string;
-  severity: VLSeverity;
-  range: VLRange;
-  code?: string | number;
-  source: "vital";
-  tags?: VLDiagnosticTag[];
+// The diagnostic vocabulary lives in the dependency-free `./diagnostics.ts` leaf
+// (so the LSP can import the shapes without pulling in the compiler core). Both
+// imported for this module's own use and re-exported for the many existing
+// `from "./compile.ts"` consumers.
+import type {
+  VLDiagnostic,
+  VLDiagnosticTag,
+  VLPosition,
+  VLRange,
+  VLSeverity,
+} from "./diagnostics.ts";
+export type {
+  VLDiagnostic,
+  VLDiagnosticTag,
+  VLPosition,
+  VLRange,
+  VLSeverity,
 };
 
 export type CompileResult = {

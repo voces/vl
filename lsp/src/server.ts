@@ -27,10 +27,12 @@ import {
   parseSymbols,
   rangeFromCtx,
   stringifyType,
+} from "../../compiler/compile.ts";
+import type {
   VLDiagnostic,
   VLDiagnosticTag,
   VLSeverity,
-} from "../../compiler/compile.ts";
+} from "../../compiler/diagnostics.ts";
 import { format } from "../../compiler/format.ts";
 import {
   buildUnusedExportUseMap,
