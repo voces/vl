@@ -130,14 +130,15 @@ is open backlog — triage as you like.
   faithful to what was written** — a recurring tax on the formatter (and any
   tool that wants to reproduce source). Found while porting `format.vl`:
   `a += b` → `a = a + b`, `x++` → `Unary("p+", x = x+1)`, `++x` → `x = x + 1`,
-  `x !is T` → `!(x is T)`, and `else if` ⟷ `elseif` collapse to the SAME nested-If
-  AST. Each had to be recovered in the formatter by scanning the source TOKENS in
-  the node's span (e.g. a `PLUSEQ` token ⇒ emit `+=`; the token at a clause's `if`
-  node ⇒ `else if` vs `elseif`). It works, but it means surface fidelity lives in
-  two places (parser desugar + formatter re-recovery). A faithful AST (keep the
-  surface operator as a field, the way the host stores `compoundOperator`) would
-  remove the guesswork. The self-host already keeps `Paren` nodes for exactly this
-  reason — the same treatment for assignment/increment/guard operators would help.
+  `x !is T` → `!(x is T)`, and `else if` ⟷ `elseif` collapsed to the SAME nested-If
+  AST. Originally each was recovered in the formatter by scanning the source TOKENS
+  in the node's span — surface fidelity living in two places. **MOSTLY RESOLVED** by
+  carrying a faithful-surface MARKER on the node (the host's `compoundOperator`
+  approach): compound assignment + prefix increment ride `BinExpr.binCompound`, the
+  negated guard rides `IsExpr.isNeg`, and `elseif` was REMOVED as a redundant alias
+  of `else if` (one canonical chain form — `else` whose branch is an `if`, no fused
+  keyword). Remaining token-recovered surface: the `export` modifier, quoted operator
+  keys, and `import` statements (no node — see below).
 - **`import` statements produce no AST node** (the single-file parser `skipImport`s
   them; binding is the module layer's job). Any tool that walks the AST — including
   the formatter — silently loses them. `format.vl` had to re-scan `P.toks` for

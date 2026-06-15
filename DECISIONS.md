@@ -330,3 +330,13 @@ count). Confirmed deliberate (2026-06): the classic `if (x = 5)` C foot-gun is m
 defused by VL's mandatory-`bool` conditions; the residual hole — `if x = true` with a
 boolean `x` — is handled by LINT, not semantics (an assignment whose RHS is a LITERAL in
 condition position warns; see ROADMAP B17), keeping the expression semantics uniform.
+
+## `else if`, not a fused `elseif` keyword
+
+A chain is `else` whose branch is another `if` (the brace grammar nests with no extra
+terminator — the C / Rust / Swift / JS form). The fused `elseif` keyword was removed as a
+pure alias (it parsed to the identical nested-`IfStmt` AST and was used once in the whole
+corpus vs 571 `else if`). A dedicated `elseif`/`elif` keyword only earns its keep in
+block-terminator languages (Python/Lua/Ruby) where `else if` would force an extra `end`;
+VL's `{}` blocks make it redundant. One form means no parser ambiguity and no formatter
+surface-recovery for the chain keyword.

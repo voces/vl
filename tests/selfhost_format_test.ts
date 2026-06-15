@@ -70,10 +70,6 @@ const CASES: { label: string; src: string }[] = [
     src: "let a = 1\n\n\n\nlet b = 2\n",
   },
   {
-    label: "elseif-chain",
-    src: "let n = 1\nif n == 0 {\n  print(0)\n} elseif n == 1 {\n  print(1)\n} else {\n  print(2)\n}\n",
-  },
-  {
     label: "access-chains",
     src: "let r = obj.field.inner\nlet s = arr[0]\nlet t = obj?.maybe\nlet u = f(g(1), h(2))\n",
   },

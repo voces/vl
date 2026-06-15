@@ -22,9 +22,11 @@ Organized by area. Triage freely.
 - **Formatter divergences documented as "limits, not bugs."** `compiler/format.vl`
   header lists three intentional divergences from `format.ts` (kept `Paren` nodes,
   desugared `a += b`, un-ported verbatim fallback). `[MOSTLY PAID]` — the
-  full-corpus parity pass reconciled the real divergences via source-token
-  recovery: compound assign `+=`, `++`/`--`, `!is`, `else if`/`elseif`, quoted
-  operator/index-trap object keys (`"[]"`, `"*"`), and `import` re-emission. The
+  full-corpus parity pass reconciled the real divergences — now mostly via faithful
+  AST markers rather than token recovery: compound assign `+=` and `++`/`--`
+  (`binCompound`), `!is` (`IsExpr.isNeg`); `elseif` was dropped as a redundant alias
+  of `else if`. Token recovery remains only for quoted operator/index-trap object
+  keys (`"[]"`, `"*"`), the `export` modifier, and `import` re-emission. The
   self-host formatter now upholds all three guarantees (idempotent / AST round-trip
   / comment-preserving) over 477/477 host-parseable corpus files
   (`tests/selfhost_format_corpus_test.ts`). Residual, non-guarantee-breaking
