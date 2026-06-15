@@ -55,6 +55,7 @@ import type {
   VLImportNode,
   VLType,
 } from "../../compiler/ast.ts";
+import type { WasmChecker, WasmModuleSurface } from "./wasmChecker.ts";
 
 // A minimal view of the LSP `TextDocuments` manager — just what the reader needs
 // to consult open buffers. Kept structural so tests can pass a tiny stand-in and
@@ -1019,6 +1020,7 @@ export type UnusedExportUseMap = Map<string, Map<string, ExportRefCounts>>;
 export const buildUnusedExportUseMap = async (
   allFiles: string[],
   read: ModuleReader,
+  wasmChecker: WasmChecker,
 ): Promise<UnusedExportUseMap> => {
   const useMap: UnusedExportUseMap = new Map();
 
@@ -1050,53 +1052,50 @@ export const buildUnusedExportUseMap = async (
     inner.set(exportName, { cross: counts.cross, local: counts.local + 1 });
   };
 
-  // Read all sources up front (one async pass over the file list).
+  // Read all sources up front (one async pass over the file list), and resolve
+  // each file's import/export surface off the self-hosted checker. A file the
+  // reader can't serve is skipped.
   const sources = new Map<string, string>();
+  const surfaces = new Map<string, WasmModuleSurface>();
   for (const filePath of allFiles) {
     const src = await read(filePath);
-    if (src !== undefined) sources.set(filePath, src);
+    if (src === undefined) continue;
+    sources.set(filePath, src);
+    surfaces.set(filePath, wasmChecker.moduleSurface(src, filePath));
   }
 
   // ── PASS 1: seed the use-map with every export declaration (counts {0,0}). ─
-  // `parseSymbols` is used because: it's synchronous, cheap, and correctly
-  // records `binding.exported === true` for top-level `export`-modifier bindings
-  // regardless of whether imports are seeded into scope.
-  for (const [filePath, source] of sources) {
-    const symbols = cachedParseSymbols(filePath, source);
-    for (const occ of symbols.occurrences) {
-      if (!occ.isDecl) continue;
-      if (!occ.binding.exported) continue;
-      ensureEntry(filePath, occ.binding.name);
-    }
+  for (const [filePath, surface] of surfaces) {
+    for (const exp of surface.exports) ensureEntry(filePath, exp.name);
   }
 
-  // ── PASS 2: count references. ──────────────────────────────────────────────
-  for (const [filePath, source] of sources) {
-    const { tokens } = tokenize(source);
-    const [program] = parseProgram(tokens, defaultScope());
+  // ── PASS 2a: cross-module refs via resolved imports. ───────────────────────
+  // Each resolved `import { name } from "./sibling"` is a reference to
+  // `sibling.vl`'s `name` export, regardless of whether the local binding is
+  // later used (unused-import lint handles "imported but never used"). The
+  // surface already carries the resolved sibling key + exported source name.
+  for (const surface of surfaces.values()) {
+    for (const imp of surface.imports) addCrossRef(imp.key, imp.name);
+  }
 
-    // ── 2a. Cross-module refs via import statements. ─────────────────────────
-    // Each `import { name as local } from "./sibling"` is a reference to
-    // `sibling.vl`'s `name` export, regardless of whether `local` is later used.
-    // (Unused-import lint handles the "imported but never used" case.)
-    for (const imp of program.moduleImports ?? []) {
-      const depKey = resolveSpecifier(imp.specifier, filePath);
-      if (depKey === undefined || depKey === filePath) continue;
-      for (const spec of imp.specifiers) {
-        addCrossRef(depKey, spec.name);
-      }
-    }
-
-    // ── 2b. Same-file refs via symbol-table non-decl occurrences. ────────────
-    // An exported binding used WITHIN the same file (e.g. a recursive exported
-    // function, or a value the file also uses) is counted here. `parseSymbols`
-    // resolves local bindings (declared in this file) fine — only imported
-    // bindings are unresolved, which 2a already handles.
-    const symbols = cachedParseSymbols(filePath, source);
-    for (const occ of symbols.occurrences) {
-      if (occ.isDecl) continue;
-      if (!occ.binding.exported) continue;
-      addLocalRef(filePath, occ.binding.name);
+  // ── PASS 2b: same-file refs via the checker's reference set. ───────────────
+  // An exported binding used WITHIN the same file (e.g. a recursive exported
+  // function, or a value the file also consumes) is not dead. Find-references on
+  // the export's decl name yields the declaration plus every use; the local-use
+  // count is the reference total minus the declaration occurrence itself.
+  for (const [filePath, surface] of surfaces) {
+    const source = sources.get(filePath)!;
+    for (const exp of surface.exports) {
+      const refs = await wasmChecker.referencesAt(
+        source,
+        filePath,
+        read,
+        exp.declLine - 1, // native 1-based line → 0-based LSP line
+        exp.declCol,
+        true,
+      );
+      const localUses = Math.max(0, refs.length - 1);
+      for (let n = 0; n < localUses; n++) addLocalRef(filePath, exp.name);
     }
   }
 
@@ -1138,25 +1137,31 @@ export const unusedExportHints = (
   entrySource: string,
   entryKey: string,
   useMap: UnusedExportUseMap,
+  wasmChecker: WasmChecker,
 ): VLDiagnostic[] => {
   const hints: VLDiagnostic[] = [];
   const fileExports = useMap.get(entryKey);
   if (fileExports === undefined || fileExports.size === 0) return hints;
 
-  const symbols = parseSymbols(entrySource);
-  // Build a map from exported name → { nameRange, exportKwRange? } for this file.
+  // Build a map from exported name → { nameRange, exportKwRange } off the
+  // self-hosted checker's surface. Native spans are 1-based line / 0-based col;
+  // the LSP range is 0-based line / 0-based char. The decl-name range spans the
+  // name; the keyword range spans the literal `export` (6 chars).
   const declRanges = new Map<string, VLRange>();
   const exportKwRanges = new Map<string, VLRange>();
-  for (const occ of symbols.occurrences) {
-    if (!occ.isDecl) continue;
-    if (!occ.binding.exported) continue;
-    const name = occ.binding.name;
-    if (!declRanges.has(name)) {
-      declRanges.set(name, rangeFromCtx(occ.binding.decl));
-      if (occ.binding.exportKeywordSpan !== undefined) {
-        exportKwRanges.set(name, rangeFromCtx(occ.binding.exportKeywordSpan));
-      }
-    }
+  const surface = wasmChecker.moduleSurface(entrySource, entryKey);
+  for (const exp of surface.exports) {
+    if (declRanges.has(exp.name)) continue; // first decl wins
+    const nameLine = exp.declLine > 0 ? exp.declLine - 1 : 0;
+    declRanges.set(exp.name, {
+      start: { line: nameLine, character: exp.declCol },
+      end: { line: nameLine, character: exp.declCol + exp.name.length },
+    });
+    const kwLine = exp.kwLine > 0 ? exp.kwLine - 1 : 0;
+    exportKwRanges.set(exp.name, {
+      start: { line: kwLine, character: exp.kwCol },
+      end: { line: kwLine, character: exp.kwCol + "export".length },
+    });
   }
 
   for (const [exportName, counts] of fileExports) {

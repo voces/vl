@@ -347,6 +347,10 @@ const UNUSED_EXPORT_DEBOUNCE_MS = 3000;
  * Called on document SAVE (immediate) and by the idle debounce timer.
  */
 const runUnusedExportPass = async (): Promise<void> => {
+  // The pass is driven entirely off the self-hosted checker (the surface scan
+  // and local-use counts). A host that couldn't instantiate the seed has no
+  // checker, so it skips the pass rather than crawling the workspace for nothing.
+  if (wasmChecker === undefined) return;
   // Determine the project root (same logic as onReferences).
   const openUris = documents.all().map((d) => d.uri);
   // Use the first open document's key to detect the root; fall back to an
@@ -359,7 +363,11 @@ const runUnusedExportPass = async (): Promise<void> => {
   const diskFiles = enumerateWorkspaceFiles(crawlRoot);
 
   // Build the use-map over all project files (open buffers + disk).
-  const useMap = await buildUnusedExportUseMap(diskFiles, workspaceReader);
+  const useMap = await buildUnusedExportUseMap(
+    diskFiles,
+    workspaceReader,
+    wasmChecker,
+  );
   lastUseMap = useMap;
 
   // Re-publish diagnostics for every open document so hints update atomically.
@@ -369,6 +377,7 @@ const runUnusedExportPass = async (): Promise<void> => {
       doc.getText(),
       uriToPath(doc.uri),
       useMap,
+      wasmChecker,
     );
     connection.sendDiagnostics({
       uri: doc.uri,
@@ -454,11 +463,14 @@ documents.onDidChangeContent(async (event) => {
   // stale relative to this edit — they will be refreshed by the debounce
   // timer that fires after idle. Publishing the stale hints avoids losing
   // them entirely on every keystroke.
-  const hints = unusedExportHints(
-    event.document.getText(),
-    entryKeyOf(event.document.uri),
-    lastUseMap,
-  );
+  const hints = wasmChecker !== undefined
+    ? unusedExportHints(
+      event.document.getText(),
+      entryKeyOf(event.document.uri),
+      lastUseMap,
+      wasmChecker,
+    )
+    : [];
 
   connection.sendDiagnostics({
     uri: event.document.uri,
