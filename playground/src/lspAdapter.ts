@@ -1,43 +1,44 @@
 // Browser-side "language server" adapter for the playground.
 //
-// VL has no server process: its compiler and LSP feature-helpers are pure TS
-// (compile.ts is binaryen-free on the check path; typeFeatures.ts depends only on
-// the symbol table + AST). So the same logic the Node LSP (`lsp/src/server.ts`)
-// runs per request, we run *client-side* on the current editor text. This module
-// is the bridge — it imports ONLY the pure helpers (never `lsp/src/server.ts`,
-// which is Node-bound via `vscode-languageserver`) and returns plain, Monaco-free
-// data (positions, ranges, token arrays). `main.ts` maps these onto the Monaco
-// provider shapes, so this stays a pure transform that mirrors `server.ts`.
+// VL has no server process. The playground runs the SAME self-hosted compiler
+// seed the Node LSP (`lsp/src/server.ts`) and `vl check` run, driven through the
+// environment-agnostic wasm checker (`lsp/src/wasmChecker.ts` via the browser
+// loader `wasmCheckerBrowser.ts`). So the same logic `server.ts` runs per request
+// runs here, client-side, on the current editor text — but against the wasm seed
+// rather than the TS compiler. This module is the bridge: it drives the checker +
+// the LSP-neutral assembly helpers (`typeFeatures.ts`'s `*FromWasm` family) and
+// returns plain, Monaco-free data (positions, ranges, token arrays). `main.ts`
+// maps these onto Monaco's provider shapes.
 //
-// Position convention: VL spans / the symbol table use 1-based line / 0-based
-// column (`Position`). The helpers here accept and return 0-based line / 0-based
-// character (the LSP wire form, which is also what Monaco uses minus a +1 on the
-// line — Monaco is 1-based line / 1-based column; `main.ts` bridges that). We
-// keep this module in LSP coordinates so it matches `server.ts` exactly.
+// The seed-backed methods are ASYNC (the checker stages the source, then queries)
+// and degrade to an empty result before `initLsp` is called or when the seed
+// failed to load — Monaco accepts a Thenable from every provider, so this is
+// transparent. `diagnostics` stays on the TS `checkOnly` (the playground's Run
+// path already pulls the TS compiler in for codegen; moving the squiggle pass to
+// wasm is a separate, later step) and `codeActions` is pure string surgery.
+//
+// Position convention: VL spans / the wasm checker use 1-based line / 0-based
+// column natively, but every method here speaks the LSP wire form (0-based line /
+// 0-based character) — the checker does the 1↔0 line bridge internally, and
+// `main.ts` bridges LSP↔Monaco (Monaco is 1-based line / 1-based column).
 
+import { checkOnly, type VLDiagnostic } from "../../compiler/compile.ts";
 import {
-  checkOnly,
-  parseSymbols,
-  stringifyType,
-  type VLDiagnostic,
-} from "../../compiler/compile.ts";
-import { tokenize } from "../../compiler/lexer.ts";
-import {
+  builtinCompletionsFromWasm,
   type Completion,
   type CompletionKind,
-  deriveInlayHints,
   docMarkdown,
-  identifierCompletions,
+  inlayHintsFromWasm,
   keywordCompletions,
   type LspRange,
-  memberCompletions,
-  receiverObjectType,
-  resolveMemberAt,
+  memberCompletionsFromWasm,
+  scopeCompletionsFromBindings,
   SEMANTIC_TOKEN_LEGEND,
-  semanticTokensData,
+  semanticTokensDataFromWasm,
   snippetCompletions,
   typeLabelDetail,
 } from "../../lsp/src/typeFeatures.ts";
+import type { WasmChecker } from "../../lsp/src/wasmChecker.ts";
 import {
   fixableDiagnosticsForRange,
   type LspTextEdit,
@@ -51,18 +52,31 @@ export { SEMANTIC_TOKEN_LEGEND };
 /** LSP 0-based line / 0-based character — the wire form `server.ts` speaks. */
 export type LspPosition = { line: number; character: number };
 
-// LSP position (0-based line) → VL `Position` (1-based line, 0-based column),
-// exactly the `toVLPosition` bridge `server.ts` uses.
-const toVLPosition = (p: LspPosition) => ({ line: p.line + 1, column: p.character });
+// The playground is single-file: every LSP query runs the active buffer as the
+// entry module under a stable key, with a reader that resolves no siblings (the
+// checker's std-key wrapper, baked in by `wasmCheckerBrowser.ts`, still serves
+// `std:` imports from the embedded map). This mirrors the single-file behaviour
+// the playground has always had.
+const ENTRY_KEY = "main.vl";
+const NO_SIBLINGS = () => undefined;
+
+// The injected checker (set once by `main.ts` after the seed loads). Undefined
+// until then — and forever if the seed couldn't be fetched/instantiated — in
+// which case every seed-backed feature returns an empty result.
+let checker: WasmChecker | undefined;
+
+/** Wire the loaded wasm checker into the adapter. Call once, after load. */
+export const initLsp = (loaded: WasmChecker | undefined): void => {
+  checker = loaded;
+};
 
 // ---- diagnostics -----------------------------------------------------------
 
 /**
  * Run the codegen-free front end and return its diagnostics (parse + type errors
- * plus the B17 lint, which tags unused/`_`-hint bindings `unnecessary`). This is
- * what drives the editor squiggles; the heavier `compile` (codegen) only runs on
- * Run. `checkOnly` is synchronous and binaryen-free, so it's cheap to call on
- * every (debounced) keystroke.
+ * plus the B17 lint). This drives the editor squiggles; the heavier `compile`
+ * (codegen) only runs on Run. `checkOnly` is synchronous and binaryen-free, so
+ * it's cheap to call on every (debounced) keystroke.
  */
 export const diagnostics = (text: string): VLDiagnostic[] =>
   checkOnly(text).diagnostics;
@@ -70,16 +84,20 @@ export const diagnostics = (text: string): VLDiagnostic[] =>
 // ---- semantic tokens -------------------------------------------------------
 
 /**
- * The delta-encoded semantic-token `data` array for the whole document — the same
- * stream `server.ts` returns for `textDocument/semanticTokens/full`. Identifiers
- * are classified by their resolved binding kind via the symbol table, merged with
- * a lexical pass for literals/keywords/operators and recovered comments, plus
- * member names (`o.x`, `xs.get`) typed from the AST.
+ * The delta-encoded semantic-token `data` array for the whole document, sourced
+ * entirely from the wasm checker (the same path `server.ts`'s
+ * `textDocument/semanticTokens` takes): identifiers (`tokensAt`) + the lexical
+ * layer (`lexicalTokensAt` — keywords/operators/literals/comments) + member names
+ * (`memberTokensAt`), assembled by `semanticTokensDataFromWasm`. Empty before the
+ * seed loads.
  */
-export const semanticTokens = (text: string): number[] => {
-  const { tokens } = tokenize(text);
-  const { symbols, ast, spans } = checkOnly(text);
-  return semanticTokensData(symbols, tokens, text, ast, spans);
+export const semanticTokens = async (text: string): Promise<number[]> => {
+  if (checker === undefined) return [];
+  const idents = await checker.tokensAt(text, ENTRY_KEY, NO_SIBLINGS).catch(() => []);
+  const members = await checker.memberTokensAt(text, ENTRY_KEY, NO_SIBLINGS)
+    .catch(() => []);
+  const lexical = checker.lexicalTokensAt(text);
+  return semanticTokensDataFromWasm(idents, lexical, members);
 };
 
 // ---- hover -----------------------------------------------------------------
@@ -92,61 +110,41 @@ export type HoverResult = {
   range?: { start: LspPosition; end: LspPosition };
 };
 
-// A `Context` (1-based line / 0-based col) → an LSP 0-based range.
-const ctxToLspRange = (
-  ctx: { start: { line: number; column: number }; stop: { line: number; column: number } },
-): { start: LspPosition; end: LspPosition } => ({
-  start: { line: ctx.start.line - 1, character: ctx.start.column },
-  end: { line: ctx.stop.line - 1, character: ctx.stop.column },
-});
-
 /**
- * Resolve the type at `pos`, mirroring `server.ts`'s `onHover` resolution order:
- *   1. the D2 symbol table (locals/params/functions/type aliases carry a type);
- *   2. failing that, a member name in `receiver.member`, typed from the AST;
- *   3. failing that, a top-level scope name (a builtin / declared type).
- * Returns `null` when the cursor isn't on anything typeable.
+ * Resolve the type at `pos`, mirroring `server.ts`'s wasm-mode `onHover` chain:
+ * value binding (`hoverTypeAt`) → member access (`memberTypeAt`) → user `type`
+ * alias (`typeAliasAt`) → builtin (the native builtin set). Returns `null` when
+ * the cursor isn't on a typeable word (or the seed hasn't loaded). The hovered
+ * word's range comes from a local scan so Monaco can highlight it.
  */
-export const hover = (text: string, pos: LspPosition): HoverResult | null => {
-  const vlPos = toVLPosition(pos);
-
-  // 1. Symbol-table binding.
-  const symbols = parseSymbols(text);
-  const occ = symbols.occurrenceAt(vlPos);
-  if (occ?.binding.type) {
-    return {
-      contents: `${occ.binding.name}: ${stringifyType(occ.binding.type)}`,
-      range: ctxToLspRange(occ.span),
-    };
-  }
-
-  // 2. Member-aware hover (`o.x`, `xs.get`, `s.length`).
-  const { ast, spans } = checkOnly(text);
-  if (ast && spans) {
-    const member = resolveMemberAt(ast, spans, vlPos);
-    if (member) {
-      return {
-        contents: `${member.name}: ${stringifyType(member.type)}`,
-        range: ctxToLspRange(member.span),
-      };
-    }
-  }
-
-  // 3. Top-level scope fallback (builtins / declared types) — the program scope
-  // hangs off the AST node, keyed by the bare word under the cursor.
+export const hover = async (
+  text: string,
+  pos: LspPosition,
+): Promise<HoverResult | null> => {
+  if (checker === undefined) return null;
   const word = wordAt(text, pos);
-  if (word) {
-    const type = ast?.scope?.[word.text];
-    if (type) {
-      return { contents: `${word.text}: ${stringifyType(type)}`, range: word.range };
-    }
+  if (!word) return null;
+  const at = async (
+    fn: (s: string, k: string, r: typeof NO_SIBLINGS, l: number, c: number) => Promise<string | undefined>,
+  ): Promise<string | undefined> =>
+    await fn(text, ENTRY_KEY, NO_SIBLINGS, pos.line, pos.character).catch(() => undefined);
+
+  const t = await at(checker.hoverTypeAt) ??
+    await at(checker.memberTypeAt) ??
+    await at(checker.typeAliasAt);
+  if (t) return { contents: `${word.text}: ${t}`, range: word.range };
+
+  // Builtin (`print`/`i32`/…): the word in the native builtin set.
+  const b = checker.builtinCompletions().find((x) => x.name === word.text);
+  if (b && b.detail.length > 0) {
+    return { contents: `${word.text}: ${b.detail}`, range: word.range };
   }
   return null;
 };
 
 // The identifier straddling the cursor (`[A-Za-z_][A-Za-z0-9_]*`), with its
 // 0-based range, or null. Mirrors `server.ts`'s `wordAt` but also returns the
-// span so the fallback hover can highlight it.
+// span so the hover can highlight it.
 const wordAt = (
   text: string,
   pos: LspPosition,
@@ -169,55 +167,65 @@ const wordAt = (
   };
 };
 
-// ---- inlay hints (stretch / D6) --------------------------------------------
+// ---- inlay hints (D6) ------------------------------------------------------
 
 /** One inferred-type inlay hint, in LSP 0-based coordinates. */
 export type InlayHint = { line: number; character: number; label: string };
 
 /**
  * Inferred-type inlay hints for the (visible) range, mirroring `server.ts`'s
- * inlay-hint handler: surface the inferred type after each *unannotated*
- * declaration (`let x` → `x: i32`). Already-annotated declarations are
- * suppressed (the source is passed so `deriveInlayHints` can tell).
+ * wasm-mode inlay handler: the inferred types + decl positions come from the
+ * checker (`inlayHintsAt`); the source-scan annotation/range filters stay
+ * host-side (`inlayHintsFromWasm`). Empty before the seed loads.
  */
-export const inlayHints = (text: string, range: LspRange): InlayHint[] =>
-  deriveInlayHints(parseSymbols(text), stringifyType, range, text).map((h) => ({
+export const inlayHints = async (
+  text: string,
+  range: LspRange,
+): Promise<InlayHint[]> => {
+  if (checker === undefined) return [];
+  const candidates = await checker.inlayHintsAt(text, ENTRY_KEY, NO_SIBLINGS)
+    .catch(() => []);
+  return inlayHintsFromWasm(candidates, range, text).map((h) => ({
     line: h.line,
     character: h.char,
     label: h.label,
   }));
+};
 
-// ---- go-to-definition (stretch / D2) ---------------------------------------
+// ---- go-to-definition (D2) -------------------------------------------------
 
 /**
  * The defining span of the binding under `pos`, in LSP 0-based coordinates, or
- * null — the data behind go-to-definition. Mirrors `server.ts`'s `onDefinition`.
+ * null — the data behind go-to-definition. Mirrors `server.ts`'s wasm-mode
+ * `onDefinition` (`definitionAt`).
  */
-export const definition = (
+export const definition = async (
   text: string,
   pos: LspPosition,
-): { start: LspPosition; end: LspPosition } | null => {
-  const decl = parseSymbols(text).definitionAt(toVLPosition(pos));
-  return decl ? ctxToLspRange(decl) : null;
+): Promise<{ start: LspPosition; end: LspPosition } | null> => {
+  if (checker === undefined) return null;
+  const range = await checker
+    .definitionAt(text, ENTRY_KEY, NO_SIBLINGS, pos.line, pos.character)
+    .catch(() => undefined);
+  return range ?? null;
 };
+
+// ---- whole-document formatting (D4) ----------------------------------------
+
+/**
+ * Reprint `source` via the self-hosted formatter (`format.vl` through
+ * `wasmChecker.formatSrc`), or undefined on a parse error / before the seed
+ * loads — `main.ts` then leaves the buffer untouched.
+ */
+export const format = (source: string): string | undefined =>
+  checker?.formatSrc(source);
 
 // ---- quick-fixes (code actions / B17) --------------------------------------
 
 /**
  * Quick-fixes for the lint diagnostics overlapping `range`, mirroring
- * `server.ts`'s `onCodeAction` exactly. The editor passes the markers it holds
- * (`contextDiagnostics`) AND we re-derive the current diagnostics (`text`'s own
- * `vital` lints) as the "cached" set — the equivalent of `server.ts`'s
- * `diagnosticsByUri` cache. `fixableDiagnosticsForRange` keeps only `vital`-sourced
- * diagnostics, de-dupes them, and folds in any cached one on an overlapping line
- * (so a fix is still offered when the cursor sits on the binding line but off the
- * diagnostic's exact span — e.g. on the name while `prefer-const` points at `let`).
- * `quickFixesForDiagnostic` then dispatches on each diagnostic's `code`:
- *   - `unused-variable` → remove-binding (alt) + prefix-`_` (preferred)
- *   - `unused-import`   → remove-import
- *   - `prefer-const`    → `let`→`const`
- * Each returned `QuickFix` carries plain 0-based LSP text edits; `main.ts` wraps
- * them into Monaco `CodeAction`s (1-based) with a `WorkspaceEdit`.
+ * `server.ts`'s `onCodeAction`. Pure string surgery over the diagnostic `code`
+ * + range (`codeActions.ts`) — unchanged by the wasm migration.
  */
 export const codeActions = (
   text: string,
@@ -236,37 +244,27 @@ export const codeActions = (
 // ---- completion (D3) -------------------------------------------------------
 
 /**
- * One completion item in playground (Monaco-free) form — the browser mirror of
- * the LSP `CompletionItem` `server.ts`'s `toCompletionItem` builds. `main.ts`
- * maps each onto a Monaco `CompletionItem`. The render decisions (inline label
- * detail + highlighted `documentation` panel, snippet flag) are made HERE so the
- * Monaco provider stays a thin shape-mapper, exactly as `server.ts` keeps them in
+ * One completion item in playground (Monaco-free) form. `main.ts` maps each onto
+ * a Monaco `CompletionItem`. The render decisions (inline label detail +
+ * highlighted `documentation` panel, snippet flag) are made HERE so the Monaco
+ * provider stays a thin shape-mapper, exactly as `server.ts` keeps them in
  * `toCompletionItem`.
  */
 export type CompletionItem = {
-  /** The text inserted / the label shown. */
   label: string;
-  /** The completion's binding-flavoured kind; `main.ts` maps it to a Monaco kind. */
   kind: CompletionKind;
-  /** Compact inline `: <type>` shown on the label row (`labelDetails.detail`). */
   labelDetail?: string;
-  /** A fenced `vital` markdown block (type + any `///` doc) for the detail panel. */
   documentation?: string;
-  /** LSP snippet insert text (tab-stops) for snippet items; identifier/keyword
-   * items insert their `label` and leave this unset. */
   insertText?: string;
 };
 
 /** The fence language id the playground hover/completion code blocks use. */
 const VL_LANGUAGE_ID = "vital";
 
-// One pure `Completion` (typeFeatures.ts) → the playground `CompletionItem`,
-// mirroring `server.ts`'s `toCompletionItem`: a typed item renders its type once
-// inline (`labelDetail`) and once highlighted (`documentation`), never the
-// top-level `detail` (which would duplicate it). A snippet carries its insert
-// text + the snippet kind. (No `///` doc resolver in the single-file playground —
-// `docMarkdown` collapses to the bare type fence, matching the server with no
-// resolver passed.)
+// One LSP-neutral `Completion` → the playground `CompletionItem`, mirroring
+// `server.ts`'s `toCompletionItem`: a typed item renders its type once inline
+// (`labelDetail`) and once highlighted (`documentation`), never the top-level
+// `detail`. A snippet carries its insert text + the snippet kind.
 const toCompletionItem = (c: Completion): CompletionItem => {
   const item: CompletionItem = { label: c.name, kind: c.kind };
   if (c.detail !== undefined) item.labelDetail = typeLabelDetail(c.detail);
@@ -278,29 +276,23 @@ const toCompletionItem = (c: Completion): CompletionItem => {
 };
 
 /**
- * Completion candidates at `pos`, mirroring `server.ts`'s `onCompletion`:
- *   - after a `.` receiver (`triggerChar === "."` or the char before the cursor
- *     is `.`): resolve the `<name>.` receiver's object type and return ONLY its
- *     members (struct fields + built-in methods) — keywords/snippets suppressed.
- *   - otherwise: scope-aware identifiers (locals/params/functions/types +
- *     builtins) plus keyword and snippet completions for statement-position typing.
- *
- * The receiver/member typing reuses the checker's resolution: `checkOnly`'s
- * program `scope` (which folds in `defaultScope`'s builtins, so a list/string/Map
- * receiver carries its intrinsic members) feeds `receiverObjectType`. The
- * playground is single-file, so there's no imported-scope seeding — the rest is
- * identical to the server.
+ * Completion candidates at `pos`, mirroring `server.ts`'s wasm-mode
+ * `onCompletion`:
+ *   - after a `.` receiver: strip the trailing `.` (the native parser isn't
+ *     error-tolerant for `receiver.`) and return the receiver's members
+ *     (`memberCompletionsAt`) — keywords/snippets suppressed.
+ *   - otherwise: native in-scope bindings (`scopeAt`) + native builtins
+ *     (`builtinCompletions`) + keyword and snippet completions. A user binding
+ *     shadows a same-named builtin (added last).
+ * Empty before the seed loads.
  */
-export const completion = (
+export const completion = async (
   text: string,
   pos: LspPosition,
   triggerChar?: string,
-): CompletionItem[] => {
-  const vlPos = toVLPosition(pos);
-  const symbols = parseSymbols(text);
+): Promise<CompletionItem[]> => {
+  if (checker === undefined) return [];
 
-  // The text on the current line up to the cursor — to detect a `.` trigger and
-  // find the receiver name before it (matches `server.ts`'s `linePrefix`).
   const line = text.split("\n")[pos.line] ?? "";
   const linePrefix = line.slice(0, pos.character);
   const charBeforeCursor = linePrefix[linePrefix.length - 1];
@@ -309,20 +301,28 @@ export const completion = (
   if (triggerChar === "." || charBeforeCursor === ".") {
     const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
     if (!receiver) return [];
-    const { ast } = checkOnly(text);
-    if (!ast) return [];
-    const objectType = receiverObjectType(receiver, symbols, vlPos, ast.scope);
-    if (!objectType) return [];
-    return memberCompletions(objectType, stringifyType).map(toCompletionItem);
+    const dotCol = pos.character - 1;
+    const repaired = removeCharAt(text, pos.line, dotCol);
+    const members = await checker
+      .memberCompletionsAt(repaired, ENTRY_KEY, NO_SIBLINGS, pos.line, dotCol - receiver.length)
+      .catch(() => []);
+    return memberCompletionsFromWasm(members).map(toCompletionItem);
   }
 
-  // Identifier completion: in-scope names + builtins, plus keyword/snippet items.
-  const { ast } = checkOnly(text);
-  const builtins = ast?.scope ?? {};
-  const identifiers = identifierCompletions(symbols, vlPos, builtins, stringifyType);
-  const keywords = keywordCompletions(false);
-  const snippets = snippetCompletions(false);
-  return [...identifiers, ...keywords, ...snippets].map(toCompletionItem);
+  // Identifier completion: in-scope user bindings + builtins, plus keyword/snippet
+  // items. A user binding shadows a same-named builtin (added last).
+  const bindings = await checker
+    .scopeAt(text, ENTRY_KEY, NO_SIBLINGS, pos.line, pos.character)
+    .catch(() => []);
+  const byName = new Map<string, Completion>();
+  for (const c of builtinCompletionsFromWasm(checker.builtinCompletions())) {
+    byName.set(c.name, c);
+  }
+  for (const c of scopeCompletionsFromBindings(bindings)) byName.set(c.name, c);
+  const identifiers = [...byName.values()].map(toCompletionItem);
+  const keywords = keywordCompletions(false).map(toCompletionItem);
+  const snippets = snippetCompletions(false).map(toCompletionItem);
+  return [...identifiers, ...keywords, ...snippets];
 };
 
 // The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`
@@ -336,4 +336,17 @@ const wordEndingBefore = (line: string, character: number): string | null => {
   if (start === end) return null;
   const word = line.slice(start, end);
   return /^[A-Za-z_]/.test(word) ? word : null;
+};
+
+// Remove the single character at (0-based line, 0-based col) — strips the trailing
+// `.` so the wasm member-completion path resolves the receiver as a bare
+// expression (the native parser isn't error-tolerant for `receiver.`). Mirrors
+// `server.ts`'s `removeCharAt`. A no-op if the position is out of range.
+const removeCharAt = (text: string, line: number, col: number): string => {
+  const lines = text.split("\n");
+  if (line < 0 || line >= lines.length) return text;
+  const l = lines[line];
+  if (col < 0 || col >= l.length) return text;
+  lines[line] = l.slice(0, col) + l.slice(col + 1);
+  return lines.join("\n");
 };

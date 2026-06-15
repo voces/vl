@@ -47,7 +47,7 @@ import { SAMPLES, type Sample } from "./samples.ts";
 import * as lsp from "./lspAdapter.ts";
 import { decodeHash, encodeSource } from "./share.ts";
 import { loadLastSession, saveLastSession } from "./projects.ts";
-import { format } from "../../compiler/format.ts";
+import { loadBrowserChecker } from "./wasmCheckerBrowser.ts";
 
 const VL_LANGUAGE_ID = "vital";
 const ENTRY_FILE = "main.vl";
@@ -251,8 +251,8 @@ const semanticLegend: monaco.languages.SemanticTokensLegend = {
 
 monaco.languages.registerDocumentSemanticTokensProvider(VL_LANGUAGE_ID, {
   getLegend: () => semanticLegend,
-  provideDocumentSemanticTokens: (model) => ({
-    data: new Uint32Array(lsp.semanticTokens(model.getValue())),
+  provideDocumentSemanticTokens: async (model) => ({
+    data: new Uint32Array(await lsp.semanticTokens(model.getValue())),
     resultId: undefined,
   }),
   releaseDocumentSemanticTokens: () => {},
@@ -261,8 +261,8 @@ monaco.languages.registerDocumentSemanticTokensProvider(VL_LANGUAGE_ID, {
 // --- hover provider ----------------------------------------------------------
 
 monaco.languages.registerHoverProvider(VL_LANGUAGE_ID, {
-  provideHover: (model, position) => {
-    const result = lsp.hover(model.getValue(), {
+  provideHover: async (model, position) => {
+    const result = await lsp.hover(model.getValue(), {
       line: position.lineNumber - 1, // Monaco 1-based line → LSP 0-based
       character: position.column - 1, // Monaco 1-based col → LSP 0-based
     });
@@ -285,8 +285,8 @@ monaco.languages.registerHoverProvider(VL_LANGUAGE_ID, {
 // --- inlay hints provider ----------------------------------------------------
 
 monaco.languages.registerInlayHintsProvider(VL_LANGUAGE_ID, {
-  provideInlayHints: (model, range) => {
-    const hints = lsp.inlayHints(model.getValue(), {
+  provideInlayHints: async (model, range) => {
+    const hints = await lsp.inlayHints(model.getValue(), {
       start: { line: range.startLineNumber - 1, character: range.startColumn - 1 },
       end: { line: range.endLineNumber - 1, character: range.endColumn - 1 },
     });
@@ -305,8 +305,8 @@ monaco.languages.registerInlayHintsProvider(VL_LANGUAGE_ID, {
 // --- definition provider -----------------------------------------------------
 
 monaco.languages.registerDefinitionProvider(VL_LANGUAGE_ID, {
-  provideDefinition: (model, position) => {
-    const def = lsp.definition(model.getValue(), {
+  provideDefinition: async (model, position) => {
+    const def = await lsp.definition(model.getValue(), {
       line: position.lineNumber - 1,
       character: position.column - 1,
     });
@@ -404,8 +404,8 @@ const COMPLETION_KIND: Record<lsp.CompletionItem["kind"], monaco.languages.Compl
 
 monaco.languages.registerCompletionItemProvider(VL_LANGUAGE_ID, {
   triggerCharacters: ["."],
-  provideCompletionItems: (model, position, context) => {
-    const items = lsp.completion(
+  provideCompletionItems: async (model, position, context) => {
+    const items = await lsp.completion(
       model.getValue(),
       { line: position.lineNumber - 1, character: position.column - 1 },
       context.triggerCharacter,
@@ -1149,16 +1149,18 @@ shareBtn.addEventListener("click", () => {
 
 // --- format ------------------------------------------------------------------
 //
-// Wired to the REAL VL formatter (`compiler/format.ts`), applied to the active
-// file's model in place (preserving cursor where possible).
+// Wired to the REAL VL formatter — the self-hosted `format.vl` through the wasm
+// seed (`lspAdapter.format` → `wasmChecker.formatSrc`), applied to the active
+// file's model in place (preserving cursor where possible). A no-op before the
+// seed loads or on a parse error (`format` returns undefined).
 
 let formatResetTimer: ReturnType<typeof setTimeout> | undefined;
 formatBtn.addEventListener("click", () => {
   const model = models.get(activeFile);
   if (!model) return;
   try {
-    const formatted = format(model.getValue());
-    if (formatted !== model.getValue()) {
+    const formatted = lsp.format(model.getValue());
+    if (formatted !== undefined && formatted !== model.getValue()) {
       editor.executeEdits("format", [{
         range: model.getFullModelRange(),
         text: formatted,
@@ -1285,7 +1287,15 @@ setStatus("Loading compiler…", "busy");
 runBtn.disabled = true;
 (async () => {
   try {
-    await runProgram("print(1)");
+    // Load the self-hosted seed for the LSP features (hover/completion/semantic
+    // tokens/inlay/definition/format) in parallel with the binaryen warm-up. The
+    // seed is independent of Run: if it fails to load, those features degrade to
+    // empty (and format to a no-op), but Run still works on the TS compiler.
+    const [checker] = await Promise.all([
+      loadBrowserChecker(),
+      runProgram("print(1)"),
+    ]);
+    lsp.initLsp(checker);
     compilerReady = true;
     runBtn.disabled = false;
     refreshDiagnostics();

@@ -6,28 +6,36 @@ semantic-token syntax colouring, hover, inlay hints, go-to-definition), click
 **Run**, and see captured `log`/`print` output and (optionally) the `.wat` text —
 all in the browser, with no server-side compile and no language-server process.
 
-The whole compiler **and language server** run in the page: VL is pure
-TypeScript + binaryen (an Emscripten single-file wasm build), so the same
-`compile` / `runWasm` pipeline the CLI uses (`compiler/compile.ts`) AND the same
-pure LSP feature-helpers the Node LSP uses (`lsp/src/typeFeatures.ts`) are
-bundled to one ESM module and executed client-side. `src/lspAdapter.ts` is the
-bridge — it imports ONLY the pure helpers (never the Node-bound
-`lsp/src/server.ts`) and `src/main.ts` maps its results onto Monaco's provider
-APIs.
+The whole compiler **and language server** run in the page. The LSP features run
+on the **self-hosted compiler seed** (`build/vl-compiler.wasm`, the same one the
+Node LSP and `vl check` run): `src/wasmCheckerBrowser.ts` fetches the seed (copied
+next to the bundle by `build.ts`) and drives it through the environment-agnostic
+`createWasmChecker` core (`lsp/src/wasmChecker.ts`), exactly as the Node LSP does.
+The **Run** path still uses the TS compiler + binaryen (an Emscripten single-file
+wasm build) — the same `compile` / `runWasm` pipeline the CLI uses
+(`compiler/compile.ts`) — bundled to one ESM module and executed client-side.
+`src/lspAdapter.ts` is the bridge: it drives the wasm checker + the LSP-neutral
+assembly helpers (`lsp/src/typeFeatures.ts`'s `*FromWasm` family) and `src/main.ts`
+maps its results onto Monaco's provider APIs. It never imports the Node-bound
+`lsp/src/server.ts`.
 
 ## Editor / LSP features (client-side)
 
 | Feature | Monaco surface | Backed by |
 | --- | --- | --- |
-| Diagnostics (incl. B17 unused-var lint, greyed via the `unnecessary` tag) | `setModelMarkers` (debounced on edit) | `checkOnly` |
-| Semantic-token syntax colouring | `DocumentSemanticTokensProvider` | `semanticTokensData` + `SEMANTIC_TOKEN_LEGEND` |
-| Hover (type at cursor, incl. members) | `HoverProvider` | symbol table + `resolveMemberAt` + `stringifyType` |
-| Inlay hints (inferred types) | `InlayHintsProvider` | `deriveInlayHints` |
-| Go-to-definition | `DefinitionProvider` | `SymbolTable.definitionAt` |
+| Diagnostics (incl. B17 unused-var lint, greyed via the `unnecessary` tag) | `setModelMarkers` (debounced on edit) | `checkOnly` (TS) |
+| Semantic-token syntax colouring | `DocumentSemanticTokensProvider` | wasm `tokensAt`/`memberTokensAt`/`lexicalTokensAt` → `semanticTokensDataFromWasm` |
+| Hover (type at cursor, incl. members + type aliases) | `HoverProvider` | wasm `hoverTypeAt`/`memberTypeAt`/`typeAliasAt` + builtins |
+| Inlay hints (inferred types) | `InlayHintsProvider` | wasm `inlayHintsAt` → `inlayHintsFromWasm` |
+| Go-to-definition | `DefinitionProvider` | wasm `definitionAt` |
+| Completion (identifiers + members + keywords/snippets) | `CompletionItemProvider` (`.`-triggered) | wasm `scopeAt`/`builtinCompletions`/`memberCompletionsAt` |
+| Format (whole document) | the **Format** button | wasm `formatSrc` (`format.vl`) |
 
 A small Monarch grammar provides a synchronous fallback for strings/comments/
 numbers; the semantic-token provider does the accurate identifier/member
-colouring. Autocomplete (D3) is intentionally skipped (not implemented in core).
+colouring. The LSP features degrade to empty (and format to a no-op) until the
+seed loads, and stay disabled if the seed can't be fetched (an old browser
+without WasmGC, or a build that didn't ship the seed) — Run still works.
 
 ## Run it locally
 

@@ -15,9 +15,33 @@
 
 import * as esbuild from "esbuild";
 import { denoPlugins } from "esbuild-deno-loader";
+import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 
 const HERE = new URL(".", import.meta.url);
 const ROOT = new URL("../", HERE);
+
+// The self-hosted seed the playground's LSP features run on. Built by
+// `./scripts/refresh-compiler.sh`; absent on a fresh clone, in which case the
+// seed-backed feature checks self-skip (the same convention as the wasm test
+// suites), and the page would likewise disable those features.
+const SEED = new URL("build/vl-compiler.wasm", ROOT).pathname;
+
+// Build a checker over the on-disk seed (the headless analogue of
+// `wasmCheckerBrowser.ts`'s fetch), or undefined when the seed isn't built.
+const loadSeedChecker = () => {
+  let bytes: Uint8Array;
+  try {
+    bytes = Deno.readFileSync(SEED);
+  } catch {
+    return undefined;
+  }
+  const instance = new WebAssembly.Instance(
+    new WebAssembly.Module(bytes as BufferSource),
+    {},
+  );
+  const exports = instance.exports as unknown as Exports;
+  return createWasmChecker(() => exports);
+};
 
 const binaryenEntry = (): string =>
   new URL(import.meta.resolve("binaryen")).pathname.replace(
@@ -201,7 +225,8 @@ const main = async (): Promise<void> => {
   const src = `let x = 41\nlet _unused = 1\nprint(x + 1)\n`;
 
   // Diagnostics: the unused `_unused` binding is a B17 lint hint tagged
-  // `unnecessary` (the greyed-out lint the editor surfaces).
+  // `unnecessary` (the greyed-out lint the editor surfaces). TS `checkOnly`, no
+  // seed needed.
   const diags = lsp.diagnostics(src);
   const unused = diags.find((d) => d.tags?.includes("unnecessary"));
   if (!unused) {
@@ -209,53 +234,73 @@ const main = async (): Promise<void> => {
   }
   console.error(`OK: diagnostics -> B17 lint "${unused!.message}" (unnecessary)`);
 
-  // Semantic tokens: a non-empty, well-formed (multiple-of-5) delta stream.
-  const tokens = lsp.semanticTokens(src);
-  if (tokens.length === 0 || tokens.length % 5 !== 0) {
-    fail(`malformed semantic-token data (len ${tokens.length})`);
-  }
-  console.error(`OK: semantic tokens -> ${tokens.length / 5} tokens`);
+  // The seed-backed LSP features (semantic tokens / hover / inlay / definition /
+  // completion / format) run on the wasm checker the page injects via `initLsp`.
+  // Headless, we build it from the on-disk seed; absent, those checks self-skip.
+  const checker = loadSeedChecker();
+  if (checker === undefined) {
+    console.error(
+      "SKIP: compiler seed not built (./scripts/refresh-compiler.sh) — " +
+        "seed-backed LSP feature checks skipped",
+    );
+  } else {
+    lsp.initLsp(checker);
 
-  // Hover: the type of `x` (line 0, on the `x`) is `i32`.
-  const hov = lsp.hover(src, { line: 0, character: 4 });
-  if (!hov || !hov.contents.includes("x: i32")) {
-    fail(`hover did not resolve x: i32 (got ${JSON.stringify(hov)})`);
-  }
-  console.error(`OK: hover -> "${hov!.contents}"`);
+    // Semantic tokens: a non-empty, well-formed (multiple-of-5) delta stream.
+    const tokens = await lsp.semanticTokens(src);
+    if (tokens.length === 0 || tokens.length % 5 !== 0) {
+      fail(`malformed semantic-token data (len ${tokens.length})`);
+    }
+    console.error(`OK: semantic tokens -> ${tokens.length / 5} tokens`);
 
-  // Stretch: inlay hints (inferred `: i32` for the unannotated `x`) and
-  // go-to-definition (a use of `x` jumps to its declaration on line 0).
-  const hints = lsp.inlayHints(src, {
-    start: { line: 0, character: 0 },
-    end: { line: 10, character: 0 },
-  });
-  if (!hints.some((h) => h.label.includes("i32"))) {
-    fail(`no inlay hint with an inferred type: ${JSON.stringify(hints)}`);
-  }
-  const def = lsp.definition(src, { line: 2, character: 6 }); // the `x` in print
-  if (!def || def.start.line !== 0) {
-    fail(`go-to-definition did not jump to the decl: ${JSON.stringify(def)}`);
-  }
-  console.error(
-    `OK: inlay hints -> ${hints.length}, definition -> line ${def!.start.line + 1}`,
-  );
+    // Hover: the type of `x` (line 0, on the `x`) is `i32`.
+    const hov = await lsp.hover(src, { line: 0, character: 4 });
+    if (!hov || !hov.contents.includes("x: i32")) {
+      fail(`hover did not resolve x: i32 (got ${JSON.stringify(hov)})`);
+    }
+    console.error(`OK: hover -> "${hov!.contents}"`);
 
-  // Completion (D3): scope-aware identifiers at a non-member position, and
-  // structural member completion after a `.` receiver — the two halves the Monaco
-  // `CompletionItemProvider` (`.`-triggered) wires.
-  const idItems = lsp.completion(src, { line: 2, character: 9 }); // inside print(x + |)
-  if (!idItems.some((c) => c.label === "x")) {
-    fail(`identifier completion missing in-scope \`x\`: ${JSON.stringify(idItems.map((c) => c.label))}`);
+    // Stretch: inlay hints (inferred `: i32` for the unannotated `x`) and
+    // go-to-definition (a use of `x` jumps to its declaration on line 0).
+    const hints = await lsp.inlayHints(src, {
+      start: { line: 0, character: 0 },
+      end: { line: 10, character: 0 },
+    });
+    if (!hints.some((h) => h.label.includes("i32"))) {
+      fail(`no inlay hint with an inferred type: ${JSON.stringify(hints)}`);
+    }
+    const def = await lsp.definition(src, { line: 2, character: 6 }); // the `x` in print
+    if (!def || def.start.line !== 0) {
+      fail(`go-to-definition did not jump to the decl: ${JSON.stringify(def)}`);
+    }
+    console.error(
+      `OK: inlay hints -> ${hints.length}, definition -> line ${def!.start.line + 1}`,
+    );
+
+    // Completion (D3): scope-aware identifiers at a non-member position, and
+    // structural member completion after a `.` receiver — the two halves the Monaco
+    // `CompletionItemProvider` (`.`-triggered) wires.
+    const idItems = await lsp.completion(src, { line: 2, character: 9 }); // inside print(x + |)
+    if (!idItems.some((c) => c.label === "x")) {
+      fail(`identifier completion missing in-scope \`x\`: ${JSON.stringify(idItems.map((c) => c.label))}`);
+    }
+    const memberSrc = `let p = { x: 1, y: 2 }\nprint(p.)\n`;
+    const memberItems = await lsp.completion(memberSrc, { line: 1, character: 8 }, ".");
+    const memberLabels = memberItems.map((c) => c.label).sort();
+    if (memberLabels.join(",") !== "x,y") {
+      fail(`member completion after \`p.\` did not list x,y: ${JSON.stringify(memberLabels)}`);
+    }
+    console.error(
+      `OK: completion -> ${idItems.length} identifiers, members after \`.\` -> [${memberLabels.join(", ")}]`,
+    );
+
+    // Format (D4): the self-hosted formatter reprints a messily-spaced program.
+    const formatted = lsp.format(`let   x=1\nprint( x )\n`);
+    if (formatted === undefined || !formatted.includes("let x = 1")) {
+      fail(`format did not reprint via the seed: ${JSON.stringify(formatted)}`);
+    }
+    console.error(`OK: format -> reprinted via the self-hosted formatter`);
   }
-  const memberSrc = `let p = { x: 1, y: 2 }\nprint(p.)\n`;
-  const memberItems = lsp.completion(memberSrc, { line: 1, character: 8 }, ".");
-  const memberLabels = memberItems.map((c) => c.label).sort();
-  if (memberLabels.join(",") !== "x,y") {
-    fail(`member completion after \`p.\` did not list x,y: ${JSON.stringify(memberLabels)}`);
-  }
-  console.error(
-    `OK: completion -> ${idItems.length} identifiers, members after \`.\` -> [${memberLabels.join(", ")}]`,
-  );
 
   // Quick-fixes (code actions / B17): the unused `x` binding on line 0 offers the
   // `_`-prefix (preferred) + remove-binding fixes; an unused import offers a

@@ -104,5 +104,28 @@ const build = async (): Promise<void> => {
   console.error("built playground/dist/playground.js");
 };
 
+// Copy the self-hosted compiler seed next to the bundle so the page can fetch it
+// (`wasmCheckerBrowser.ts` resolves `vl-compiler.wasm` relative to the loaded
+// module). The seed backs the playground's LSP features (hover/completion/
+// semantic tokens/inlay/definition/format) — the same one the Node LSP and
+// `vl check` run. A missing seed isn't fatal here (the page degrades those
+// features to empty), but warn loudly: build it with `./scripts/refresh-compiler.sh`.
+const copySeed = async (): Promise<void> => {
+  const seed = new URL("build/vl-compiler.wasm", ROOT);
+  const dest = new URL("dist/vl-compiler.wasm", HERE);
+  try {
+    await Deno.copyFile(seed, dest);
+    console.error("copied build/vl-compiler.wasm → playground/dist/");
+  } catch (err) {
+    console.warn(
+      `warn: could not copy the compiler seed (${
+        err instanceof Error ? err.message : String(err)
+      }) — the playground's LSP features will be disabled. ` +
+        "Build the seed with ./scripts/refresh-compiler.sh",
+    );
+  }
+};
+
 await build();
+await copySeed();
 esbuild.stop();
