@@ -803,67 +803,64 @@ export type CrossFileReference = { uri: string; range: VLRange };
 export type OpenDocument = { uri: string; text: string };
 
 /**
- * The canonical export a symbol denotes: the module that DECLARES it and the
- * name it's exported under. `undefined` when the symbol isn't a cross-module
- * symbol (a purely-local binding, or an unresolvable import) — the caller then
- * stays single-file.
+ * The canonical export a symbol denotes: the module that DECLARES it, the name
+ * it's exported under, and the 1-based line / 0-based col of that export's
+ * declaring name (the `target` shape `WasmChecker.referencesInEntry` consumes).
+ * `undefined` when the symbol isn't a cross-module symbol (a purely-local
+ * binding, or an unresolvable import) — the caller then stays single-file.
  */
-type CanonicalExport = { key: string; exportedName: string };
-
-/**
- * Resolve the symbol named `local` (used in the document at `entryKey`) to its
- * canonical export, or `undefined`. Two cases:
- *   - `local` is IMPORTED here → `(resolvedSpecifierKey, importedExportName)`.
- *   - `local` is a local binding declared+EXPORTED here → `(entryKey, local)`.
- * A purely-local (non-exported) binding has no cross-module identity → undefined
- * (the caller reports only same-file references for it).
- *
- * Synchronous: it only inspects the CURRENT file's own import/export surface
- * (`entrySource`), never a sibling, so it needs no `ModuleReader`.
- */
-const canonicalExportOf = (
-  local: string,
-  entrySource: string,
-  entryKey: string,
-): CanonicalExport | undefined => {
-  const { tokens } = tokenize(entrySource);
-  const [program] = parseProgram(tokens, defaultScope());
-
-  // Imported here? Find the import specifier whose LOCAL name is `local`.
-  for (const imp of program.moduleImports ?? []) {
-    const spec = imp.specifiers.find((s) => s.local === local);
-    if (!spec) continue;
-    const depKey = resolveSpecifier(imp.specifier, entryKey);
-    if (depKey === undefined || depKey === entryKey) return undefined;
-    return { key: depKey, exportedName: spec.name };
-  }
-
-  // Locally declared AND exported here?
-  if ((program.moduleExports ?? {})[local]) {
-    return { key: entryKey, exportedName: local };
-  }
-  return undefined;
+type CanonicalExport = {
+  key: string;
+  exportedName: string;
+  declLine: number; // 1-based native line of the decl name
+  declCol: number; // 0-based column of the decl name
 };
 
 /**
- * The LOCAL name that denotes the canonical export `(target.key/exportedName)`
- * inside the document at `docKey`, or `undefined` when this document neither
- * declares nor imports it. In the exporting module the local name IS the
- * exported name; in an importer it's the import specifier's `local`.
+ * Resolve the symbol named `name` (used in the document at `entryKey`) to its
+ * canonical export, off the SELF-HOSTED checker, or `undefined`. Two cases:
+ *   - `name` is IMPORTED here → the sibling's `(key, exportedName, decl pos)`,
+ *     recovered directly from `importedNameSources` (which now carries the
+ *     exported name + the sibling's decl-name position).
+ *   - `name` is a local binding declared+EXPORTED here → `(entryKey, name, decl
+ *     pos)` from the entry's own `moduleSurface` export entry.
+ * A purely-local (non-exported) binding has no cross-module identity → undefined
+ * (the caller reports only same-file references for it).
+ *
+ * Async because the imported case reads the entry's import sources through the
+ * wasm checker (which commits the sibling graph via the workspace reader).
  */
-const localNameForExport = (
-  docKey: string,
-  docSource: string,
-  target: CanonicalExport,
-): string | undefined => {
-  if (docKey === target.key) return target.exportedName; // the declaring module
-  const { tokens } = tokenize(docSource);
-  const [program] = parseProgram(tokens, defaultScope());
-  for (const imp of program.moduleImports ?? []) {
-    const depKey = resolveSpecifier(imp.specifier, docKey);
-    if (depKey !== target.key) continue;
-    const spec = imp.specifiers.find((s) => s.name === target.exportedName);
-    if (spec) return spec.local;
+const canonicalExportOf = async (
+  name: string,
+  entrySource: string,
+  entryKey: string,
+  read: ModuleReader,
+  wasmChecker: WasmChecker,
+): Promise<CanonicalExport | undefined> => {
+  // Imported here? `importedNameSources` keys by the LOCAL alias and carries the
+  // sibling key, the EXPORTED name, and the export's decl-name position.
+  const sources = await wasmChecker.importedNameSources(entrySource, entryKey, read);
+  const src = sources[name];
+  if (src !== undefined) {
+    return {
+      key: src.key,
+      exportedName: src.exportedName,
+      declLine: src.line,
+      declCol: src.col,
+    };
+  }
+
+  // Locally declared AND exported here? The entry's own surface lists its
+  // exports with their decl-name positions.
+  const surface = wasmChecker.moduleSurface(entrySource, entryKey);
+  const exp = surface.exports.find((e) => e.name === name);
+  if (exp !== undefined) {
+    return {
+      key: entryKey,
+      exportedName: exp.name,
+      declLine: exp.declLine,
+      declCol: exp.declCol,
+    };
   }
   return undefined;
 };
@@ -897,10 +894,17 @@ export const crossFileReferences = async (
   entryKey: string,
   openDocs: OpenDocument[],
   read: ModuleReader,
+  wasmChecker: WasmChecker,
   includeDeclaration = true,
   diskFiles: string[] = [],
 ): Promise<CrossFileReference[] | undefined> => {
-  const target = canonicalExportOf(name, entrySource, entryKey);
+  const target = await canonicalExportOf(
+    name,
+    entrySource,
+    entryKey,
+    read,
+    wasmChecker,
+  );
   if (target === undefined) return undefined;
 
   // The current file plus the open documents, de-duplicated by module key.
@@ -925,24 +929,18 @@ export const crossFileReferences = async (
 
   const refs: CrossFileReference[] = [];
   for (const [docKey, doc] of docsByKey) {
-    const localName = localNameForExport(docKey, doc.text, target);
-    if (localName === undefined) continue;
-    // Use the GRAPH-SEEDED symbol table: in an importing module a use of the
-    // imported `localName` only resolves to a binding (and is recorded as an
-    // occurrence) when the parse scope is seeded with the import's type — exactly
-    // what `checkDocument` does. In the exporting module the binding is its real
-    // local declaration; a no-import seed leaves that path unchanged.
-    const { symbols } = await checkDocument(doc.text, docKey, read);
-    for (const occ of symbols.occurrences) {
-      if (occ.binding.name !== localName) continue;
-      // In an importing module the synthesized declaration occurrence points at
-      // the import statement (not a real definition); skip it when the client
-      // excludes declarations, OR when it's an importer (the canonical decl lives
-      // in the exporting module, reported there). In the exporting module the
-      // declaration IS the real definition.
-      const isImporter = docKey !== target.key;
-      if (occ.isDecl && (isImporter || !includeDeclaration)) continue;
-      refs.push({ uri: doc.uri, range: rangeFromCtx(occ.span) });
+    // Compile each candidate as its OWN entry off the self-hosted checker: an
+    // entry's committed graph only spans modules it imports, so a reference that
+    // lives in another importer surfaces only in that importer's own compile —
+    // which is exactly why we drive one compile per candidate file and union the
+    // per-candidate (module 0) occurrences here.
+    const occs = await wasmChecker.referencesInEntry(doc.text, docKey, read, target);
+    for (const occ of occs) {
+      // An importer has no synthesized declaration occurrence (imports are
+      // parser-skipped), so a decl only appears in the declaring module; drop it
+      // when the client excludes declarations.
+      if (occ.isDecl && !includeDeclaration) continue;
+      refs.push({ uri: doc.uri, range: occ.range });
     }
   }
   return refs;

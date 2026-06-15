@@ -605,7 +605,10 @@ connection.onReferences(async (params): Promise<Location[] | null> => {
       end: { line: params.position.line + 1, character: 0 },
     });
     const word = wordAt(lineText, params.position.character);
-    if (word) {
+    // The cross-module crawl runs off the self-hosted checker (kill-TS step 3-C
+    // Stage 3), so it needs a live wasm checker; without one the symbol is
+    // resolved single-file below.
+    if (word && wasmChecker !== undefined) {
       const openDocs = documents.all().map((d) => ({
         uri: d.uri,
         text: d.getText(),
@@ -621,6 +624,7 @@ connection.onReferences(async (params): Promise<Location[] | null> => {
         entryKey,
         openDocs,
         workspaceReader,
+        wasmChecker,
         includeDeclaration,
         diskFiles,
       );

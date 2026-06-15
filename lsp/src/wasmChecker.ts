@@ -34,6 +34,19 @@ export type WasmRange = {
 };
 
 /**
+ * One occurrence from the cross-file references pass (kill-TS step 3-C Stage 3):
+ * the occurrence's 0-based LSP span plus whether it is the binding's DECLARATION,
+ * so the orchestrator can honor `includeDeclaration` (drop the decl when false).
+ * Only the entry module's (table index 0) occurrences of the target binding are
+ * returned — the per-candidate compile model means each candidate file surfaces
+ * just its own references (see {@link WasmChecker.referencesInEntry}).
+ */
+export type WasmOccurrence = {
+  range: WasmRange;
+  isDecl: boolean;
+};
+
+/**
  * One classified identifier from the wasm semantic-token pass (Stage 2). The
  * native checker records only IDENTIFIER occurrences with their binding kind, so
  * `bindKind` is 0=variable / 1=parameter / 2=function; `isDecl` marks the
@@ -81,13 +94,16 @@ export type WasmScopeBinding = {
  * One resolved cross-file imported source, from the wasm import/export pass — the
  * native counterpart of the host's `importedNameSources`. Keyed (in the returned
  * record) by the LOCAL binding name; `key` is the exporting sibling module's
- * resolved KEY, `line`/`col` the export decl-name token (1-based line, 0-based
- * col — the native convention), `length` the exported name's length so the host
- * can shape the decl-name end column. The host maps these onto its
- * `CrossFileSource` (0-based LSP range + `file://` URI).
+ * resolved KEY, `exportedName` the name the sibling declares it under (the `name`
+ * side of a `{ name as local }` specifier), `line`/`col` the export decl-name
+ * token (1-based line, 0-based col — the native convention), `length` the
+ * exported name's length so the host can shape the decl-name end column. The host
+ * maps these onto its `CrossFileSource` (0-based LSP range + `file://` URI); the
+ * canonical-export resolver in `crossFileReferences` uses `exportedName`.
  */
 export type WasmImportedSource = {
   key: string;
+  exportedName: string;
   line: number; // 1-based native line
   col: number; // 0-based column
   length: number; // exported name length (for the range end)
@@ -250,6 +266,29 @@ export type WasmChecker = {
     source: string,
     entryKey: string,
   ) => WasmModuleSurface;
+  /**
+   * Cross-file find-references, per-candidate slice (kill-TS step 3-C Stage 3):
+   * the occurrences IN `candidateSource` (committed as the entry, module 0) that
+   * refer to the canonical export `target` (its declaring file `key` + exported
+   * `name` + 1-based decl-name `declLine` / 0-based `declCol`). Empty when the
+   * candidate doesn't reach the declaring module, the declaration isn't found at
+   * `target`'s position, or the seed predates the module-tag exports. The
+   * orchestrator (`crossFileReferences`) compiles each candidate file as its own
+   * entry — an entry's committed graph only spans modules it imports, so refs in
+   * OTHER importers live in those importers' own compiles — and unions the
+   * results, honoring `includeDeclaration` via each occurrence's `isDecl`.
+   */
+  referencesInEntry: (
+    candidateSource: string,
+    candidateKey: string,
+    read: ModuleReader,
+    target: {
+      key: string;
+      exportedName: string;
+      declLine: number; // 1-based native line of the decl name
+      declCol: number; // 0-based column of the decl name
+    },
+  ) => Promise<WasmOccurrence[]>;
   /**
    * Whole-document formatting (kill-TS step 1, the `format.ts` consumer): the
    * canonical reprint of `source` via the self-hosted formatter (`format.vl`'s
@@ -430,6 +469,86 @@ export const loadWasmChecker = (
       if (occ < 0) continue;
       if (!includeDeclaration && exp.symIsDecl(occ) === 1) continue;
       out.push(occRange(exp, occ));
+    }
+    return out;
+  };
+
+  // The per-occurrence module-tag exports (`symOccModuleAt`/`modKeyCount`) ride a
+  // Stage-3 seed; an older Stage-2 seed has the occurrence spans but no module
+  // tag, so cross-file references degrades to [] (the host keeps its TS crawl).
+  const hasModuleTags = (exp: Exports): boolean =>
+    typeof exp.symOccModuleAt === "function" &&
+    typeof exp.modKeyCount === "function";
+
+  const referencesInEntry = async (
+    candidateSource: string,
+    candidateKey: string,
+    read: ModuleReader,
+    target: {
+      key: string;
+      exportedName: string;
+      declLine: number;
+      declCol: number;
+    },
+  ): Promise<WasmOccurrence[]> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp) || !hasModuleTags(exp)) return [];
+    // Compile this candidate as its own entry (module 0) + its transitive deps,
+    // so its committed graph includes the declaring module IFF the candidate
+    // reaches it via imports.
+    await prepare(exp, candidateSource, candidateKey, read);
+    exp.checkSrcSym();
+
+    // The declaring module's table index — the candidate may not reach it (then
+    // it holds no occurrence of the target binding) → no refs here. An import-free
+    // candidate compiles single-file (no module table, `modKeyCount() === 0`): it
+    // is its own module 0, so it reaches the declaration IFF it IS the declaring
+    // file (e.g. the exporting module with no imports of its own).
+    const modCount = exp.modKeyCount();
+    let declModuleIndex = -1;
+    if (modCount === 0) {
+      declModuleIndex = candidateKey === target.key ? 0 : -1;
+    } else {
+      for (let m = 0; m < modCount; m++) {
+        const k = readString(exp.modKeyAtLen(m), (j) => exp.modKeyAtCharAt(m, j));
+        if (k === target.key) {
+          declModuleIndex = m;
+          break;
+        }
+      }
+    }
+    if (declModuleIndex < 0) return [];
+
+    // The canonical binding id: the declaration occurrence in the declaring
+    // module at `target`'s decl-name position. Every other occurrence of this
+    // binding — including an importer's uses, which the merge rewrites to the
+    // canonical symbol — shares this id.
+    const count = exp.symCount();
+    let canonicalBinding = -1;
+    for (let i = 0; i < count; i++) {
+      if (exp.symOccModuleAt(i) !== declModuleIndex) continue;
+      if (exp.symIsDecl(i) !== 1) continue;
+      if (exp.symSpanStartLine(i) !== target.declLine) continue;
+      if (exp.symSpanStartCol(i) !== target.declCol) continue;
+      canonicalBinding = exp.symBindingId(i);
+      break;
+    }
+    if (canonicalBinding < 0) return [];
+
+    // Collect only THIS candidate's own occurrences (module 0) of the binding.
+    const out: WasmOccurrence[] = [];
+    for (let i = 0; i < count; i++) {
+      if (exp.symOccModuleAt(i) !== 0) continue;
+      if (exp.symBindingId(i) !== canonicalBinding) continue;
+      const sl = exp.symSpanStartLine(i);
+      const el = exp.symSpanEndLine(i);
+      out.push({
+        range: {
+          start: { line: sl > 0 ? sl - 1 : 0, character: exp.symSpanStartCol(i) },
+          end: { line: el > 0 ? el - 1 : 0, character: exp.symSpanEndCol(i) },
+        },
+        isDecl: exp.symIsDecl(i) === 1,
+      });
     }
     return out;
   };
@@ -642,7 +761,13 @@ export const loadWasmChecker = (
         (j) => exp.impLocalCharAt(i, j),
       );
       if (local.length === 0) continue; // defensive: an import always binds a name
-      out[local] = { key, line: decl.line, col: decl.col, length: name.length };
+      out[local] = {
+        key,
+        exportedName: name,
+        line: decl.line,
+        col: decl.col,
+        length: name.length,
+      };
     }
     return out;
   };
@@ -825,6 +950,7 @@ export const loadWasmChecker = (
     check,
     definitionAt,
     referencesAt,
+    referencesInEntry,
     hoverTypeAt,
     memberTypeAt,
     tokensAt,
