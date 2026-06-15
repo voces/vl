@@ -19,8 +19,10 @@ import {
   enumerateWorkspaceFiles,
   importedNameSource,
   importedNameSources,
+  type OpenDocument,
   pathToUri,
 } from "../lsp/src/moduleGraph.ts";
+import { loadWasmChecker } from "../lsp/src/wasmChecker.ts";
 
 const assert = (cond: boolean, msg: string): void => {
   if (!cond) throw new Error(msg);
@@ -28,6 +30,40 @@ const assert = (cond: boolean, msg: string): void => {
 
 const memoryReader = (files: Record<string, string>): ModuleReader =>
   (key: string) => files[key];
+
+// Cross-file find-references runs off the self-hosted checker; load the seed once
+// and inject it via `xref`. Absent (fresh clone, no `refresh-compiler.sh`) the
+// find-refs tests self-ignore via `refsIgnore` — the convention of the rest of the
+// wasm suite. The go-to-def tests use the TS module-graph helpers and need no seed.
+const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const refsIgnore = !((() => {
+  try {
+    Deno.statSync(SEED);
+    return true;
+  } catch {
+    return false;
+  }
+})());
+const checker = refsIgnore ? undefined : loadWasmChecker(SEED, () => {});
+const xref = (
+  name: string,
+  entrySource: string,
+  entryKey: string,
+  openDocs: OpenDocument[],
+  read: ModuleReader,
+  includeDeclaration = true,
+  diskFiles: string[] = [],
+) =>
+  crossFileReferences(
+    name,
+    entrySource,
+    entryKey,
+    openDocs,
+    read,
+    checker!,
+    includeDeclaration,
+    diskFiles,
+  );
 
 // ---- (1) cross-file go-to-definition ---------------------------------------
 
@@ -143,7 +179,7 @@ Deno.test("cross-file doc-xref: an imported `[`Name`]` resolves to the sibling s
 
 // ---- (3) cross-file find-references -----------------------------------------
 
-Deno.test("cross-file find-refs: an exported symbol's references span the open graph", async () => {
+Deno.test({ name: "cross-file find-refs: an exported symbol's references span the open graph", ignore: refsIgnore }, async () => {
   const util = "export function add(a: i32, b: i32) {\n  return a + b\n}\n";
   const main = 'import { add } from "./util"\n\nprint(add(2, 3))\nprint(add(4, 5))\n';
   const files = { "/proj/util.vl": util, "/proj/main.vl": main };
@@ -152,7 +188,7 @@ Deno.test("cross-file find-refs: an exported symbol's references span the open g
     { uri: pathToUri("/proj/main.vl"), text: main },
   ];
   // Cursor on `add` in main.vl (an imported name): references across the graph.
-  const refs = await crossFileReferences(
+  const refs = await xref(
     "add",
     main,
     "/proj/main.vl",
@@ -175,7 +211,7 @@ Deno.test("cross-file find-refs: an exported symbol's references span the open g
   );
 });
 
-Deno.test("cross-file find-refs: resolving from the DECLARING module also finds importers", async () => {
+Deno.test({ name: "cross-file find-refs: resolving from the DECLARING module also finds importers", ignore: refsIgnore }, async () => {
   const util = "export function add(a: i32, b: i32) {\n  return a + b\n}\n";
   const main = 'import { add } from "./util"\n\nprint(add(2, 3))\n';
   const files = { "/proj/util.vl": util, "/proj/main.vl": main };
@@ -184,7 +220,7 @@ Deno.test("cross-file find-refs: resolving from the DECLARING module also finds 
     { uri: pathToUri("/proj/main.vl"), text: main },
   ];
   // Cursor on the `add` DECLARATION in util.vl (an exported local).
-  const refs = await crossFileReferences(
+  const refs = await xref(
     "add",
     util,
     "/proj/util.vl",
@@ -200,10 +236,10 @@ Deno.test("cross-file find-refs: resolving from the DECLARING module also finds 
   );
 });
 
-Deno.test("cross-file find-refs: a purely-local symbol returns undefined (single-file fallback)", async () => {
+Deno.test({ name: "cross-file find-refs: a purely-local symbol returns undefined (single-file fallback)", ignore: refsIgnore }, async () => {
   const main = 'let only = 1\nprint(only)\nprint(only)\n';
   const files = { "/proj/main.vl": main };
-  const refs = await crossFileReferences(
+  const refs = await xref(
     "only",
     main,
     "/proj/main.vl",
@@ -237,7 +273,7 @@ Deno.test("regression: a no-import file exposes no cross-file sources", async ()
 // These tests inject a `diskFiles` list and an in-memory reader to simulate the
 // workspace crawl without touching the filesystem.
 
-Deno.test("on-disk find-refs: a symbol referenced in an UNOPENED on-disk sibling is included", async () => {
+Deno.test({ name: "on-disk find-refs: a symbol referenced in an UNOPENED on-disk sibling is included", ignore: refsIgnore }, async () => {
   // util.vl exports `add`; main.vl (the entry, treated as open) imports it.
   // consumer.vl also imports and uses `add` but is NOT in the openDocs set —
   // only on the injected reader (simulating an on-disk-only file).
@@ -257,7 +293,7 @@ Deno.test("on-disk find-refs: a symbol referenced in an UNOPENED on-disk sibling
   // consumer.vl which is not in openDocs.
   const diskFiles = ["/proj/util.vl", "/proj/main.vl", "/proj/consumer.vl"];
 
-  const refs = await crossFileReferences(
+  const refs = await xref(
     "add",
     main,
     "/proj/main.vl",
@@ -288,7 +324,7 @@ Deno.test("on-disk find-refs: a symbol referenced in an UNOPENED on-disk sibling
   );
 });
 
-Deno.test("on-disk find-refs: a file in BOTH openDocs and diskFiles is NOT double-counted", async () => {
+Deno.test({ name: "on-disk find-refs: a file in BOTH openDocs and diskFiles is NOT double-counted", ignore: refsIgnore }, async () => {
   // main.vl is in both openDocs and diskFiles — it must appear exactly once.
   const util = "export function add(a: i32, b: i32) {\n  return a + b\n}\n";
   const main = 'import { add } from "./util"\n\nprint(add(1, 2))\n';
@@ -302,7 +338,7 @@ Deno.test("on-disk find-refs: a file in BOTH openDocs and diskFiles is NOT doubl
   // diskFiles also lists both files — duplicates must be de-duped.
   const diskFiles = ["/proj/util.vl", "/proj/main.vl"];
 
-  const refs = await crossFileReferences(
+  const refs = await xref(
     "add",
     main,
     "/proj/main.vl",
@@ -330,7 +366,7 @@ Deno.test("on-disk find-refs: a file in BOTH openDocs and diskFiles is NOT doubl
   );
 });
 
-Deno.test("on-disk find-refs: empty diskFiles list behaves like the open-docs-only path", async () => {
+Deno.test({ name: "on-disk find-refs: empty diskFiles list behaves like the open-docs-only path", ignore: refsIgnore }, async () => {
   // Without diskFiles the behaviour must be identical to the pre-extension path.
   const util = "export function add(a: i32, b: i32) {\n  return a + b\n}\n";
   const main = 'import { add } from "./util"\n\nprint(add(2, 3))\nprint(add(4, 5))\n';
@@ -342,7 +378,7 @@ Deno.test("on-disk find-refs: empty diskFiles list behaves like the open-docs-on
     { uri: pathToUri("/proj/main.vl"), text: main },
   ];
 
-  const refs = await crossFileReferences(
+  const refs = await xref(
     "add",
     main,
     "/proj/main.vl",
@@ -427,12 +463,12 @@ Deno.test("detectProjectRoot: falls back to immediate parent when no sentinel fo
 
 // ---- (7) REGRESSION: single-file find-refs unchanged after extension ---------
 
-Deno.test("regression: single-file find-refs (no exports) unchanged with disk extension", async () => {
+Deno.test({ name: "regression: single-file find-refs (no exports) unchanged with disk extension", ignore: refsIgnore }, async () => {
   // A purely-local symbol must still return undefined (triggering single-file
   // fallback in the caller), even when diskFiles is supplied.
   const main = "let only = 1\nprint(only)\nprint(only)\n";
   const files = { "/proj/main.vl": main };
-  const refs = await crossFileReferences(
+  const refs = await xref(
     "only",
     main,
     "/proj/main.vl",

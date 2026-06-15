@@ -59,6 +59,12 @@ let modPending: string[] = []
 let modState: i32[] = []
 let modOrder: i32[] = []
 let modDiags: string[] = []
+// Per-module token-load ranges, recorded as each module's tokens append to the
+// shared `P.toks` during `modCompile`: `modLoadStart[o]` is the first token index
+// of the o-th loaded module, `modLoadMod[o]` its TABLE index. `modOfTok` maps an
+// occurrence's token back to its owning module — cross-file find-references.
+let modLoadStart: i32[] = []
+let modLoadMod: i32[] = []
 // Per-module rename map (`name` → `name$mN`) and the lexical shadow stack.
 let modRenameFrom: string[] = []
 let modRenameTo: string[] = []
@@ -311,6 +317,26 @@ export function symSpanEndCol(i: i32): i32 { symOccEndCol(i) }
 export function symIsDecl(i: i32): i32 { symOccIsDeclAt(i) }
 export function symBindingId(i: i32): i32 { symOccBinding(i) }
 
+// Cross-file find-references: the MODULE (table index) occurrence `i` belongs to.
+// A module's tokens occupy a contiguous range of the merged `P.toks` (recorded as
+// `modLoadStart`/`modLoadMod` during `modCompile`); map the occurrence's anchor
+// token into that range. Single-file mode (no module load) → 0. Lets the host
+// attribute each occurrence to its source file and collect refs across the graph.
+function modOfTok(tok: i32): i32 {
+  let best = 0
+  let o = 0
+  while o < modLoadStart.length {
+    if modLoadStart[o] <= tok { best = modLoadMod[o] }
+    o = o + 1
+  }
+  best
+}
+export function symOccModuleAt(i: i32): i32 {
+  let tok = symOccTokAt(i)
+  if tok < 0 { return 0 }
+  modOfTok(tok)
+}
+
 // Semantic tokens (Stage 2): after a `checkSrcSym`, the recorded occurrences ARE
 // the classified identifiers, so `tokCount` is just `symCount` and a token's span
 // reads via the same `symSpan*` accessors. The ONE addition is each token's
@@ -525,6 +551,11 @@ export function modReset(): i32 {
   expKwLine = []
   expKwCol = []
   modPending = []
+  // Clear the token-load ranges too: a subsequent SINGLE-FILE check (no imports →
+  // no `modCompile`) must not inherit a prior graph's ranges, or `symOccModuleAt`
+  // would mis-attribute its occurrences.
+  modLoadStart = []
+  modLoadMod = []
   0
 }
 export function modKeyPush(c: i32): i32 {
@@ -921,10 +952,16 @@ function modCompile(emit: i32): i32 {
   // to `P.toks` (anchors stay per-module-correct via the global `pos`); each
   // `parseProgram` starts at its own module's first token.
   let roots: i32[] = []
+  modLoadStart = []
+  modLoadMod = []
   let o = 0
   while o < modOrder.length {
     let m = modOrder[o]
     P.pos = P.toks.length
+    // Record where this module's tokens begin so an occurrence's token maps back
+    // to its module (`modOfTok`) for cross-file find-references.
+    modLoadStart.push(P.toks.length)
+    modLoadMod.push(m)
     vcLoadToks(modSrcs[m])
     roots.push(parseProgram())
     if P.diags.length > 0 { return 1 }
