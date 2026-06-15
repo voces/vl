@@ -6,7 +6,7 @@
 // (`build/vl-compiler.wasm`); absent (fresh clone, no `refresh-compiler.sh` yet)
 // they self-ignore, the same convention as the rest of the wasm suite.
 
-import { loadWasmChecker } from "../lsp/src/wasmChecker.ts";
+import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
 const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
 const seedExists = (() => {

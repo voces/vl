@@ -15,7 +15,7 @@
 // Prereqs: a fresh seed (`bash scripts/refresh-compiler.sh`).
 
 import { checkOnly } from "../compiler/compile.ts";
-import { diffDiagnostics, loadWasmChecker } from "../lsp/src/wasmChecker.ts";
+import { diffDiagnostics, loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
 const root = new URL("..", import.meta.url).pathname;
 const seed = `${root}build/vl-compiler.wasm`;
