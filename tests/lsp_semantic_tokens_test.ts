@@ -17,6 +17,7 @@ import {
   classifyDocument,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
+  semanticTokensDataFromWasm,
 } from "../lsp/src/typeFeatures.ts";
 import { loadWasmChecker } from "../lsp/src/wasmChecker.ts";
 
@@ -293,4 +294,94 @@ Deno.test({
   if (r?.type !== "variable" || !r.isDecl) {
     throw new Error(`expected r as a variable decl, got ${JSON.stringify(r)}`);
   }
+});
+
+// ---- kill-TS: the wasm LEXICAL slice + whole-document wasm-only assembly ------
+// `lexicalTokensAt` is the native counterpart of the TS `tokenize` +
+// `lexicalTokenType` + comment scan; `semanticTokensDataFromWasm` assembles a
+// whole document from the wasm identifier + lexical + member slices with NO TS.
+
+// The whole document's semantic tokens sourced ENTIRELY from the wasm checker.
+const wasmTokensOf = async (
+  checker: ReturnType<typeof loadWasmChecker>,
+  src: string,
+): Promise<Decoded[]> => {
+  const c = checker!;
+  const idents = await c.tokensAt(src, "/tmp/x.vl", noSiblings);
+  const lexical = c.lexicalTokensAt(src);
+  const members = await c.memberTokensAt(src, "/tmp/x.vl", noSiblings);
+  return decode(semanticTokensDataFromWasm(idents, lexical, members));
+};
+
+Deno.test({
+  name: "wasm-lexical: classifies keywords / operators / literals / comments",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const lex = checker.lexicalTokensAt(
+    "let x = 1 + 2 // hi\nif x == 3 { return true }\n",
+  );
+  const cls = new Map(
+    lex.map((t) => [`${t.line}:${t.char}`, t.tokenClass]),
+  );
+  // class: 0=keyword 1=operator 2=number 3=boolean 4=comment
+  assertEquals(cls.get("0:0"), 0, "`let` keyword");
+  assertEquals(cls.get("0:6"), 1, "`=` operator");
+  assertEquals(cls.get("0:8"), 2, "`1` number");
+  assertEquals(cls.get("0:10"), 1, "`+` operator");
+  assertEquals(cls.get("0:14"), 4, "`// hi` comment");
+  assertEquals(cls.get("1:0"), 0, "`if` keyword");
+  // `==` (EQ) — the host's old `lexicalTokenType` never matched this kind, so it
+  // went uncoloured; the native classifier keys off the real lexer tag.
+  assertEquals(cls.get("1:5"), 1, "`==` operator (drift fix)");
+  assertEquals(cls.get("1:12"), 0, "`return` keyword");
+  assertEquals(cls.get("1:19"), 3, "`true` boolean");
+});
+
+Deno.test({
+  name: "wasm-lexical: every operator kind the lexer emits is coloured",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  // `/` and `%` (SLASH/PERCENT) were among the kinds the TS host mislabelled and
+  // dropped; assert the native pass colours them as operators.
+  const lex = checker.lexicalTokensAt("let q = 7 / 2 % 3\n");
+  const cls = new Map(lex.map((t) => [`${t.line}:${t.char}`, t.tokenClass]));
+  assertEquals(cls.get("0:10"), 1, "`/` operator");
+  assertEquals(cls.get("0:14"), 1, "`%` operator");
+});
+
+Deno.test({
+  name: "wasm-lexical: whole-document wasm-only assembly covers the TS feature",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const src = [
+    "type Pair = { a: i32 }",
+    "// a comment",
+    "function inc(p: Pair): Pair {",
+    "  let r = p.a + 1",
+    "  return r",
+    "}",
+    "",
+  ].join("\n");
+  const toks = await wasmTokensOf(checker, src);
+  const find = (l: number, c: number) =>
+    toks.find((t) => t.line === l && c >= t.char && c < t.char + t.length);
+
+  // Keyword / type / function / parameter / variable / number / operator /
+  // comment all classify from the wasm-only assembly — the TS path's coverage.
+  assertEquals(find(0, 0)?.type, "keyword", "`type`");
+  assertEquals(find(1, 0)?.type, "comment", "`// a comment`");
+  assertEquals(find(1, 0)?.length, "// a comment".length);
+  assertEquals(find(2, 0)?.type, "keyword", "`function`");
+  assertEquals(find(2, 9)?.type, "function", "`inc` decl");
+  assertEquals(find(2, 13)?.type, "parameter", "`p` decl");
+  assertEquals(find(3, 2)?.type, "keyword", "`let`");
+  assertEquals(find(3, 6)?.type, "variable", "`r` decl");
+  assertEquals(find(3, 14)?.type, "operator", "`+`");
+  assertEquals(find(3, 16)?.type, "number", "`1`");
+  // `p.a` member `a` (line 3, col 12) classifies as a property from the wasm
+  // member slice — no TS AST walk.
+  assertEquals(find(3, 12)?.type, "property", "`a` member");
 });

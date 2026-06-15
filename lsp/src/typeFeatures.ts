@@ -476,6 +476,74 @@ export const semanticTokensDataFromIdentifiers = (
   return encodeSemanticTokens(merged);
 };
 
+/**
+ * One classified lexical token from an external source (the wasm checker) — the
+ * native counterpart of {@link classifyLexicalTokens} + {@link commentTokens}.
+ * `tokenClass` is the wasm lexical enum (0=keyword 1=operator 2=number 3=boolean
+ * 4=comment), mapped onto the legend by {@link semanticTokensDataFromWasm}.
+ */
+export type ExtLexicalToken = {
+  line: number; // 0-based
+  char: number; // 0-based
+  length: number;
+  tokenClass: number;
+};
+
+// The wasm lexical-token enum → its index in {@link SEMANTIC_TOKEN_TYPES}. Kept
+// in lockstep with the driver's `lexClassOf` (scripts/vl-compiler-driver.vl) and
+// the WASM_LEX_* constants in wasmChecker.ts.
+const LEX_CLASS_TOKEN_TYPE: Record<number, number> = {
+  0: TT.keyword,
+  1: TT.operator,
+  2: TT.number,
+  3: TT.boolean,
+  4: TT.comment,
+};
+
+const lexicalTokensFromExternal = (
+  lexical: ExtLexicalToken[],
+): ClassifiedToken[] => {
+  const out: ClassifiedToken[] = [];
+  for (const t of lexical) {
+    if (t.length <= 0) continue;
+    const tokenType = LEX_CLASS_TOKEN_TYPE[t.tokenClass];
+    if (tokenType === undefined) continue; // a future class the host doesn't render
+    out.push({
+      line: t.line,
+      char: t.char,
+      length: t.length,
+      tokenType,
+      tokenModifiers: 0,
+    });
+  }
+  return out;
+};
+
+/**
+ * Full-document semantic tokens sourced ENTIRELY from the wasm checker (kill-TS):
+ * identifiers from `tokensAt`, the lexical layer (keywords/operators/literals/
+ * comments) from `lexicalTokensAt`, and members from `memberTokensAt` — no TS
+ * `tokenize`/`checkOnly`/AST. Merges with the same precedence as
+ * {@link semanticTokensDataFromIdentifiers} (an identifier classification at a
+ * position wins over a lexical/member one there).
+ */
+export const semanticTokensDataFromWasm = (
+  idents: IdentToken[],
+  lexical: ExtLexicalToken[],
+  extMembers: ExtMemberToken[],
+): number[] => {
+  const identTokens = identTokensByPos(idents);
+  const merged: ClassifiedToken[] = [...identTokens.values()];
+  for (const t of lexicalTokensFromExternal(lexical)) {
+    if (!identTokens.has(`${t.line}:${t.char}`)) merged.push(t);
+  }
+  for (const t of memberTokensFromExternal(extMembers)) {
+    if (!identTokens.has(`${t.line}:${t.char}`)) merged.push(t);
+  }
+  merged.sort((a, b) => a.line - b.line || a.char - b.char);
+  return encodeSemanticTokens(merged);
+};
+
 // ---- inlay hints (D6) -------------------------------------------------------
 
 /**

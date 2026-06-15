@@ -77,6 +77,29 @@ export type WasmMemberToken = {
 };
 
 /**
+ * One classified lexical token from the wasm lexical pass (kill-TS) — the native
+ * counterpart of the host's TS `tokenize` + `lexicalTokenType` + comment scan.
+ * `tokenClass` is a stable small enum the host maps onto its semantic-token
+ * legend: 0=keyword, 1=operator, 2=number, 3=boolean, 4=comment. Identifiers
+ * (owned by the symbol slice), strings (left to the TextMate grammar), and
+ * structural punctuation carry no class and are not emitted. Position is 0-based
+ * line, 0-based char (LSP).
+ */
+export type WasmLexicalToken = {
+  line: number; // 0-based
+  char: number; // 0-based
+  length: number;
+  tokenClass: number; // 0=keyword 1=operator 2=number 3=boolean 4=comment
+};
+
+/** {@link WasmLexicalToken.tokenClass} values, for the host's legend mapping. */
+export const WASM_LEX_KEYWORD = 0;
+export const WASM_LEX_OPERATOR = 1;
+export const WASM_LEX_NUMBER = 2;
+export const WASM_LEX_BOOLEAN = 3;
+export const WASM_LEX_COMMENT = 4;
+
+/**
  * One in-scope binding from the wasm scope-at-position pass — a
  * variable/parameter/function visible at the cursor, the native counterpart of
  * the host's `bindingsInScopeAt` walk. `kind` is 0=variable / 1=parameter /
@@ -222,6 +245,17 @@ export type WasmChecker = {
     entryKey: string,
     read: ModuleReader,
   ) => Promise<WasmMemberToken[]>;
+  /**
+   * Semantic tokens, lexical slice (kill-TS): every keyword / operator / numeric
+   * or boolean literal / comment in `source`, each tagged with its
+   * {@link WasmLexicalToken.tokenClass}. The native counterpart of the host's TS
+   * `tokenize` + `lexicalTokenType` + comment scan, letting the wasm
+   * semantic-tokens path drop the last TS lexer dependency. Synchronous +
+   * single-file: lexing resolves no imports, so the source is staged directly (no
+   * `prepare`). Empty when the seed predates the lexical exports — the host then
+   * keeps its TS lexical pass.
+   */
+  lexicalTokensAt: (source: string) => WasmLexicalToken[];
   /**
    * Scope-at-position completions (kill-TS): every user binding
    * (variable/parameter/function) visible at (`line`, `character`) — both
@@ -946,6 +980,36 @@ export const loadWasmChecker = (
     return out;
   };
 
+  // The lexical-token exports ride the same seed as the Stage-1+ exports; an older
+  // seed lacks them, so this yields [] and the host keeps its TS lexical pass.
+  // Like `formatSrc`/`lint`: single-file, parse-free, no `prepare`.
+  const lexicalTokensAt = (source: string): WasmLexicalToken[] => {
+    const exp = instantiate();
+    if (
+      exp === undefined ||
+      typeof exp.lexScan !== "function" ||
+      typeof exp.lexClassAt !== "function"
+    ) {
+      return [];
+    }
+    exp.srcReset();
+    pushString(exp.srcPush, source);
+    const n = exp.lexScan();
+    const out: WasmLexicalToken[] = [];
+    for (let i = 0; i < n; i++) {
+      const length = exp.lexLenAt(i);
+      if (length <= 0) continue; // defensive: a coloured token never has zero width
+      const line = exp.lexLineAt(i); // 1-based native line
+      out.push({
+        line: line > 0 ? line - 1 : 0,
+        char: exp.lexColAt(i),
+        length,
+        tokenClass: exp.lexClassAt(i),
+      });
+    }
+    return out;
+  };
+
   return {
     check,
     definitionAt,
@@ -955,6 +1019,7 @@ export const loadWasmChecker = (
     memberTypeAt,
     tokensAt,
     memberTokensAt,
+    lexicalTokensAt,
     scopeAt,
     importedNameSources,
     moduleSurface,

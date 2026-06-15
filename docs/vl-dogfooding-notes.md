@@ -187,6 +187,13 @@ is open backlog — triage as you like.
   binary operators** (so `n.x is A` is `(n.x) is A`, usable directly as an `if`
   condition). Easy to mis-predict.
 - Two `for…in` forms: `for x in arr` (element binding) vs `for i in 0..n` (range).
+- **Multi-line boolean expressions must break AFTER the operator, not before.** A
+  `&&`/`||` chain wraps fine when each line *ends* with the operator
+  (`a == x ||` ⏎ `  a == y`), but a continuation line that *starts* with `||`
+  parses as a fresh statement → `Syntax error: unexpected "||"`. The lexer emits a
+  `NEWLINE` that the expression parser treats as a terminator unless the prior
+  token demands a continuation, so a trailing binary operator is the signal. (Hit
+  writing the driver's `lexClassOf`; matches existing style in `wasmEmit.vl`.)
 
 ---
 
