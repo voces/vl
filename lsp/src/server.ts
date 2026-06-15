@@ -87,7 +87,7 @@ import {
   scopeCompletionsFromBindings,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensData,
-  semanticTokensDataFromIdentifiers,
+  semanticTokensDataFromWasm,
   snippetCompletions,
   typeLabelDetail,
 } from "./typeFeatures.ts";
@@ -925,21 +925,25 @@ connection.languages.semanticTokens.on(
     const doc = documents.get(params.textDocument.uri);
     if (!doc) return { data: [] };
     const text = doc.getText();
-    const { tokens } = tokenize(text);
-    // `checkOnly` (synchronous, binaryen-free) gives the symbol table AND the AST
-    // node spans, so member names (`o.x`, `xs.get`) get `property`/`method` tokens
-    // alongside the binding-classified identifiers.
-    const { symbols, ast, spans } = checkOnly(text);
+    const uri = params.textDocument.uri;
 
-    // LSP-on-wasm Stage 2: source the IDENTIFIER classification (variable/
-    // parameter/function) from the self-hosted compiler; the lexical pass
-    // (keywords/operators/literals/comments) and member walk stay TS. On any
-    // error (or an empty wasm result — a seed predating the token exports), fall
-    // back to the TS classification — mirrors the `definitionAt` fallback.
+    // The TS classification — computed lazily so the wasm-only path pays no
+    // tokenize/checkOnly cost. `checkOnly` (synchronous, binaryen-free) gives the
+    // symbol table AND the AST node spans for the member walk; `tokenize` the
+    // lexical pass. Used only by the `"ts"`/`"both"` modes and the no-wasm fallback.
+    const tsData = (): number[] => {
+      const { tokens } = tokenize(text);
+      const { symbols, ast, spans } = checkOnly(text);
+      return semanticTokensData(symbols, tokens, text, ast, spans);
+    };
+
+    // LSP-on-wasm Stage 2: the IDENTIFIER classification (variable/parameter/
+    // function) from the self-hosted compiler. On any error (or an empty result —
+    // a seed predating the token exports), yields [] — mirrors `definitionAt`.
     const wasmIdents = async (): Promise<WasmToken[]> => {
       if (wasmChecker?.tokensAt === undefined) return [];
       return await wasmChecker
-        .tokensAt(text, entryKeyOf(params.textDocument.uri), workspaceReader)
+        .tokensAt(text, entryKeyOf(uri), workspaceReader)
         .catch((err) => {
           connection.console.log(`[wasm-symbols] tokensAt failed: ${err}`);
           return [];
@@ -948,11 +952,11 @@ connection.languages.semanticTokens.on(
 
     // The member slice (`o.x`/`xs.get` → property/method), classified by the
     // native checker from the resolved type. Empty on a seed predating the
-    // member exports — the host then falls back to its TS AST member walk.
+    // member exports.
     const wasmMembers = async (): Promise<WasmMemberToken[]> => {
       if (wasmChecker?.memberTokensAt === undefined) return [];
       return await wasmChecker
-        .memberTokensAt(text, entryKeyOf(params.textDocument.uri), workspaceReader)
+        .memberTokensAt(text, entryKeyOf(uri), workspaceReader)
         .catch((err) => {
           connection.console.log(`[wasm-symbols] memberTokensAt failed: ${err}`);
           return [];
@@ -960,23 +964,21 @@ connection.languages.semanticTokens.on(
     };
 
     if (checkerMode === "wasm" && wasmChecker !== undefined) {
+      // Whole document off the self-hosted checker: identifiers + members + the
+      // lexical layer (keywords/operators/literals/comments) — no TS at all. When
+      // BOTH the identifier and lexical slices are empty (a seed predating the
+      // exports, never a real document on the current seed), fall back to TS.
+      const lexical = wasmChecker.lexicalTokensAt(text);
       const idents = await wasmIdents();
-      if (idents.length > 0) {
+      if (idents.length > 0 || lexical.length > 0) {
         const members = await wasmMembers();
-        return {
-          data: semanticTokensDataFromIdentifiers(
-            idents,
-            tokens,
-            text,
-            ast,
-            spans,
-            members.length > 0 ? members : undefined,
-          ),
-        };
+        return { data: semanticTokensDataFromWasm(idents, lexical, members) };
       }
-      return { data: semanticTokensData(symbols, tokens, text, ast, spans) };
+      return { data: tsData() };
     }
     if (checkerMode === "both" && wasmChecker !== undefined) {
+      const { tokens } = tokenize(text);
+      const { symbols, ast, spans } = checkOnly(text);
       const idents = await wasmIdents();
       // The TS identifier set, projected to the same shape, for the parity diff:
       // only the binding-classified identifiers (legend indices 0/1/2) — the
@@ -1003,7 +1005,7 @@ connection.languages.semanticTokens.on(
       }
       return { data: semanticTokensData(symbols, tokens, text, ast, spans) };
     }
-    return { data: semanticTokensData(symbols, tokens, text, ast, spans) };
+    return { data: tsData() };
   },
 );
 
