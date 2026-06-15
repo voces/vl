@@ -304,7 +304,7 @@ Deno.test("keywordCompletions: returns all hard and soft keywords with kind=keyw
   const cs = keywordCompletions(false);
   const kwNames = cs.map((c) => c.name);
   // Spot-check a selection of hard keywords.
-  for (const kw of ["let", "const", "function", "return", "if", "else", "elseif", "while", "type", "import", "export", "true", "false", "null"]) {
+  for (const kw of ["let", "const", "function", "return", "if", "else", "while", "type", "import", "export", "true", "false", "null"]) {
     if (!kwNames.includes(kw)) throw new Error(`keyword "${kw}" missing`);
   }
   // Soft keywords.

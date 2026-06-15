@@ -19,7 +19,7 @@
 // ── COVERAGE (what this port DOES and DOES NOT yet cover) ────────────────────
 // Covered: top-level + nested let/const (with `export` recovered by token scan),
 // function declarations (block + single-expression bodies), `type` struct decls
-// and union decls (verbatim), if / elseif / else (with one-line collapse of a
+// and union decls (verbatim), if / else if / else (with one-line collapse of a
 // single plain `if`), while, for-range, for-in, break/continue/return, blocks,
 // and the full expression grammar (names, literals, unary, binary chains with
 // precedence-minimal parens, `is`, member / optional / index access, calls,
@@ -28,14 +28,15 @@
 // preservation, list reflow at the width, and the multi-line trailing-comma policy.
 //
 // SURFACE-FORM RECOVERY: the self-host parser DESUGARS several constructs in the
-// arena, so the surface form is recovered from the source TOKENS in a node's span
-// to match the host: compound assignment (`a += b`, not `a = a + b`), increment
-// (`x++` / `++x`, not `x = x + 1`), the negated guard (`x !is T`, not `!(x is T)`),
-// the chain keyword (`else if` vs `elseif`, which share one nested-If AST), and
-// quoted operator / index-trap object keys (`"[]"`, `"*"` — the parser strips the
-// quotes). `import` statements (which the parser consumes without a node) are
-// recovered from the token stream and re-emitted. The self-host KEEPS explicit
-// `Paren` nodes, so a paren round-trips as written.
+// arena. Most carry a faithful-surface MARKER on the node so the printer reprints
+// the written form directly: compound assignment and prefix increment (`a += b` /
+// `++x`, via `binCompound`), the negated guard (`x !is T`, via `IsExpr.isNeg`);
+// postfix `x++` rides a `Unary "p+"`. `else if` is the one chain form (no fused
+// `elseif` keyword). The remaining token-scanned forms are quoted operator /
+// index-trap object keys (`"[]"`, `"*"` — the parser strips the quotes), the
+// `export` modifier, and `import` statements (which the parser consumes without a
+// node) re-emitted from the token stream. The self-host KEEPS explicit `Paren`
+// nodes, so a paren round-trips as written.
 //
 // RESIDUAL host divergences (semantics-preserving, so they still satisfy the
 // idempotent / AST-round-trip / comment guarantees): object-literal method
@@ -831,7 +832,7 @@ function elseIsIf(elseIx: i32): boolean {
 }
 
 function emitIf(ix: i32, node: IfStmt, indent: i32): i32 {
-  // An `if … elseif … [else]` chain whose every branch is a brace block renders
+  // An `if … else if … [else]` chain whose every branch is a brace block renders
   // as a clause sequence (one line if it fits, else one clause per line).
   let didChain = emitIfChain(ix, node, indent)
   if didChain {
@@ -955,22 +956,20 @@ function isLeafStmt(ix: i32): boolean {
   true
 }
 
-// Render an `if … elseif … [else]` chain whose every branch is a brace block, in
-// the canonical multi-conditional layout the host emits:
+// Render an `if … else if … [else]` chain whose every branch is a brace block, in
+// the canonical multi-conditional layout:
 //   if cond {
 //     …
-//   } elseif cond {
+//   } else if cond {
 //     …
 //   } else {
 //     …
 //   }
-// The self-host parser desugars BOTH `elseif` and `else if` into a nested `IfStmt`
-// in the `ifElse` slot, so a chain is detected by `elseIsIf`. Returns false when
-// the node is not such a chain (no nested-if else, or some branch is not a brace
-// block) — the caller then uses the plain `if`/`else` forms. (The host's one-line
-// chain collapse is reserved for the nested `else if` shape it can tell apart;
-// the self-host cannot distinguish `elseif` from `else if` post-parse, so it keeps
-// every chain in this stable multi-line block form — the canonical `elseif` style.)
+// A chain is a nested `IfStmt` in the `ifElse` slot (`else if` — there is no fused
+// `elseif` keyword), detected by `elseIsIf`. Returns false when the node is not
+// such a chain (no nested-if else, or some branch is not a brace block) — the
+// caller then uses the plain `if`/`else` forms. Every chain keeps this stable
+// multi-line block form (no one-line collapse).
 function emitIfChain(ix: i32, node: IfStmt, indent: i32): boolean {
   if !elseIsIf(node.ifElse) {
     return false
@@ -978,7 +977,6 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32): boolean {
   // Collect clause condition + body arena indices walking the chain.
   let condIxs: i32[] = []
   let bodyIxs: i32[] = []
-  let clauseIxs: i32[] = []
   let hasElse = false
   let elseBodyIx = 0 - 1
   let curIx = ix
@@ -988,7 +986,6 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32): boolean {
     if c is IfStmt {
       condIxs.push(c.ifCond)
       bodyIxs.push(c.ifThen)
-      clauseIxs.push(curIx)
       let e = c.ifElse
       if e < 0 {
         walking = false
@@ -1015,19 +1012,15 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32): boolean {
       return false
     }
   }
-  // Block layout: `if cond {` / `} elseif cond {` / `} else {` / `}`. The chain
-  // keyword (`elseif` vs `else if`) is recovered per-clause from the source token
-  // at the clause's `if` node — both parse to the same nested-If AST, so only the
-  // surface token tells them apart (host parity).
+  // Block layout: `if cond {` / `} else if cond {` / `} else {` / `}`. A chain is
+  // always `else if` (the fused `elseif` keyword was removed — one canonical form).
   let m = 0
   while m < condIxs.length {
     let cond = expr(condIxs[m], indent, 0)
     if m == 0 {
       emitLine(indent, "if " + cond + " {")
     } else {
-      let kw = "} elseif "
-      if tokKindAt(nodePos(clauseIxs[m])) == "IF" { kw = "} else if " }
-      emitLine(indent, kw + cond + " {")
+      emitLine(indent, "} else if " + cond + " {")
     }
     emitBlockBody(bodyIxs[m], indent)
     m = m + 1
@@ -1301,17 +1294,6 @@ function renderBinary(ix: i32, node: BinExpr, indent: i32, column: i32): string 
   binaryChain(ix, node, indent, column)
 }
 
-// The token kind whose source-offset start is exactly `off`, or "" if none.
-function tokKindAt(off: i32): string {
-  let i = 0
-  while i < P.toks.length {
-    let t = P.toks[i]
-    if t.start == off { return t.kind }
-    i = i + 1
-  }
-  ""
-}
-
 // An assignment `=` node. A desugared compound `a += b` or prefix `++x`/`--x`
 // carries its surface operator on the node (`binCompound`: `+`/`-`/`*`/`/` for a
 // compound, `++`/`--` for a prefix increment), so it reprints directly — no source
@@ -1563,7 +1545,7 @@ function ifExpr(ix: i32, node: IfStmt, indent: i32): string {
     if node.ifElse >= 0 {
       let e = P.nodes[node.ifElse]
       if e is IfStmt {
-        parts = parts + " " + elseifExpr(node.ifElse, indent)
+        parts = parts + " " + elseIfExpr(node.ifElse, indent)
       } else {
         parts = parts + " else " + bareBodyInline(node.ifElse, indent)
       }
@@ -1573,17 +1555,17 @@ function ifExpr(ix: i32, node: IfStmt, indent: i32): string {
   collapseWs(sliceNode(ix))
 }
 
-// An `elseif`-chain tail in expression position.
-function elseifExpr(ix: i32, indent: i32): string {
+// An `else if`-chain tail in expression position.
+function elseIfExpr(ix: i32, indent: i32): string {
   let n = P.nodes[ix]
   if n is IfStmt {
     let cond = expr(n.ifCond, indent, 0)
     let thenE = bareBodyInline(n.ifThen, indent)
-    let parts = "elseif " + cond + " then " + thenE
+    let parts = "else if " + cond + " then " + thenE
     if n.ifElse >= 0 {
       let e = P.nodes[n.ifElse]
       if e is IfStmt {
-        parts = parts + " " + elseifExpr(n.ifElse, indent)
+        parts = parts + " " + elseIfExpr(n.ifElse, indent)
       } else {
         parts = parts + " else " + bareBodyInline(n.ifElse, indent)
       }

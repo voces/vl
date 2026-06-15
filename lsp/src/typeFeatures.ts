@@ -950,7 +950,7 @@ export const scopeCompletionsFromBindings = (
 // this module stays free of runtime dependencies on the compiler internals.
 //
 // Hard keywords (from lexer.ts `KEYWORDS` map):
-//   function if else elseif while for const let return is await break continue
+//   function if else while for const let return is await break continue
 //   import export type true false null
 // Soft keywords (recognized by text in parser.ts via `atSoft`):
 //   as from in step to then
@@ -958,7 +958,6 @@ const VL_HARD_KEYWORDS: readonly string[] = [
   "function",
   "if",
   "else",
-  "elseif",
   "while",
   "for",
   "const",
@@ -1017,7 +1016,7 @@ export const keywordCompletions = (afterDot: boolean): Completion[] => {
  * Snippet set (idiomatic VL syntax — braces on same line, no semicolons):
  *   function …  →  function ${1:name}(${2:params}): ${3:T} {\n\t${0}\n}
  *   if …        →  if ${1:cond} {\n\t${0}\n}
- *   elseif …    →  elseif ${1:cond} {\n\t${0}\n}
+ *   else if …   →  else if ${1:cond} {\n\t${0}\n}
  *   else { }    →  else {\n\t${0}\n}
  *   while …     →  while ${1:cond} {\n\t${0}\n}
  *   for … in …  →  for ${1:item} in ${2:collection} {\n\t${0}\n}
@@ -1040,9 +1039,9 @@ export const snippetCompletions = (afterDot: boolean): Completion[] => {
       insertText: "if ${1:cond} {\n\t${0}\n}",
     },
     {
-      name: "elseif",
+      name: "else if",
       kind: "snippet" as const,
-      insertText: "elseif ${1:cond} {\n\t${0}\n}",
+      insertText: "else if ${1:cond} {\n\t${0}\n}",
     },
     {
       name: "else",
