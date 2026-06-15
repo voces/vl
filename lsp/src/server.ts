@@ -13,7 +13,6 @@ import {
   InsertTextFormat,
   Location,
   MarkupKind,
-  Position,
   ProposedFeatures,
   Range,
   SemanticTokens,
@@ -22,12 +21,6 @@ import {
   TextEdit,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
-import {
-  checkOnly,
-  parseSymbols,
-  rangeFromCtx,
-  stringifyType,
-} from "../../compiler/compile.ts";
 import type {
   VLDiagnostic,
   VLDiagnosticTag,
@@ -36,38 +29,23 @@ import type {
 import { format } from "../../compiler/format.ts";
 import {
   buildUnusedExportUseMap,
-  checkDocument,
   crossFileReferences,
   type CrossFileSource,
   detectProjectRoot,
   enumerateWorkspaceFiles,
-  importedNameSource,
-  importedNameSources,
   makeWorkspaceReader,
   pathToUri,
   type UnusedExportUseMap,
   unusedExportHints,
   uriToPath,
 } from "./moduleGraph.ts";
-import { parseProgram } from "../../compiler/parser.ts";
-import { defaultScope } from "../../compiler/defaultScope.ts";
-import { tokenize as tokenizeSource } from "../../compiler/lexer.ts";
-import { SymbolTable } from "../../compiler/symbols.ts";
 import {
   fixableDiagnosticsForRange,
   quickFixesForDiagnostic,
 } from "./codeActions.ts";
-import type { Context } from "../../compiler/ast.ts";
-import { tokenize } from "../../compiler/lexer.ts";
 import { join } from "node:path";
 import {
-  diffDefinition,
-  diffDiagnostics,
-  diffHoverType,
-  diffReferences,
-  diffSemanticTokens,
   loadWasmChecker,
-  type TsIdentToken,
   type WasmChecker,
   type WasmImportedSource,
   type WasmMemberToken,
@@ -78,20 +56,14 @@ import {
   builtinCompletionsFromWasm,
   type Completion,
   type CompletionKind,
-  deriveInlayHints,
   docMarkdown,
-  inlayHintsFromWasm,
   type DocRefResolver,
-  identifierCompletions,
+  inlayHintsFromWasm,
   keywordCompletions,
   type LspRange,
-  memberCompletions,
   memberCompletionsFromWasm,
-  receiverObjectType,
-  resolveMemberAt,
   scopeCompletionsFromBindings,
   SEMANTIC_TOKEN_LEGEND,
-  semanticTokensData,
   semanticTokensDataFromWasm,
   snippetCompletions,
   typeLabelDetail,
@@ -101,70 +73,6 @@ import {
 // id `vital`, scope `source.vital`). Used as the markdown fence info string so
 // hover code blocks render syntax-highlighted via the TextMate grammar.
 const VL_LANGUAGE_ID = "vital";
-
-// ---- D7: doc-comment cross-reference resolver --------------------------------
-
-/**
- * Build a {@link DocRefResolver} for a document's symbol table (D7). The
- * resolver maps a symbol name to a markdown link URL that jumps to that
- * symbol's definition inside `documentUri`.
- *
- * Resolution scope (single-file): we collect every top-level declaration from
- * the symbol table — any `isDecl` occurrence whose binding's `scope` is the
- * widest-reaching span (the whole file). A top-level `let`/`const`, `function`
- * declaration, or `type` alias all have the whole-file span as their scope.
- * The outermost scope has the maximum line span, so we select declarations
- * whose scope length equals the maximum across all observed scopes.
- *
- * Link format: `documentUri#L<1-based line>` — the convention LSP clients
- * (VS Code) honour for `file://` URIs; clicking the link in a hover panel
- * navigates to the definition line.
- *
- * Cross-import (H0 phase 3): when `name` is an IMPORTED binding rather than a
- * local declaration, it resolves through `importedSources` — the imported
- * name → exporting-sibling source map produced by the module graph
- * (`importedNameSources`). An imported `` [`Name`] `` then links to the SIBLING
- * module's definition line (`siblingUri#L…`) instead of the local import line.
- * A local declaration of the same name takes precedence (it's the in-file
- * definition the reader means). `importedSources` is empty for a no-import file,
- * so single-file behaviour is unchanged.
- */
-const buildDocRefResolver = (
-  symbols: ReturnType<typeof parseSymbols>,
-  documentUri: string,
-  importedSources: Record<string, CrossFileSource> = {},
-): DocRefResolver => {
-  // Walk all declaration occurrences and record each name's definition line.
-  // For a given name, prefer the binding with the widest scope span (most
-  // lines) — that is the outermost (top-level) declaration when nesting exists.
-  // We avoid the O(n²) re-scan by tracking the max scope width seen per name.
-  const byName = new Map<string, { line: number; scopeLines: number }>();
-  for (const occ of symbols.occurrences) {
-    if (!occ.isDecl) continue;
-    const { binding } = occ;
-    const declLine = occ.span.start.line; // 1-based VL line
-    const scopeLines = binding.scope
-      ? binding.scope.stop.line - binding.scope.start.line
-      : 0;
-    const existing = byName.get(binding.name);
-    if (existing === undefined || scopeLines > existing.scopeLines) {
-      byName.set(binding.name, { line: declLine, scopeLines });
-    }
-  }
-  return (name: string): string | undefined => {
-    // A local declaration is the in-file definition the reader means.
-    const entry = byName.get(name);
-    if (entry !== undefined) {
-      // `file://path#Lline` is the VS Code convention for "jump to line".
-      return `${documentUri}#L${entry.line}`;
-    }
-    // Otherwise, an imported name links to its exporting sibling's definition.
-    // `range.start.line` is 0-based (LSP); the `#L` anchor is 1-based.
-    const imported = importedSources[name];
-    if (imported) return `${imported.uri}#L${imported.range.start.line + 1}`;
-    return undefined;
-  };
-};
 
 declare const process: NodeJS.Process;
 
@@ -201,45 +109,13 @@ const workspaceReader = makeWorkspaceReader(
 // relative imports, so analysis degrades to single-file, which is correct.
 const entryKeyOf = (uri: string): string => uriToPath(uri);
 
-/**
- * Imported names' resolved types for the document at `uri`, seeded so the
- * synchronous symbol/AST helpers (`parseSymbols`/`checkOnly`) resolve imported
- * references instead of flagging them undeclared. Returns an empty scope for a
- * file with no (resolvable) imports — the common case behaves exactly as before.
- */
-const importedScopeFor = async (
-  uri: string,
-  text: string,
-): Promise<Record<string, ReturnType<typeof defaultScope>[string]>> => {
-  const { importedScope } = await checkDocument(text, entryKeyOf(uri), workspaceReader);
-  return importedScope;
-};
-
-/**
- * `parseSymbols` SEEDED with imported names' types — so a symbol-table query over
- * an imported name resolves to its real type (hover) instead of nothing. Mirrors
- * `parseSymbols` but threads a non-empty initial scope.
- */
-const parseSymbolsSeeded = (
-  text: string,
-  importedScope: Record<string, ReturnType<typeof defaultScope>[string]>,
-): SymbolTable => {
-  const { tokens } = tokenizeSource(text);
-  const [, , symbols] = parseProgram(tokens, {
-    ...defaultScope(),
-    ...importedScope,
-  });
-  return symbols;
-};
-
 // The workspace folder this server is operating on
 let workspaceFolder: string | null;
 
-// LSP-on-wasm Stage 1 state (see `wasmChecker.ts` and `onInitialize`): which
-// checker publishes diagnostics, and the loaded self-hosted compiler when the
-// mode wants one. `"wasm"` is the default (kill-TS step 2); `"ts"` remains the
-// universal fallback — we degrade to it whenever the wasm seed cannot load.
-let checkerMode: "ts" | "wasm" | "both" = "wasm";
+// The self-hosted compiler, loaded from the wasm seed in `onInitialize` (kill-TS:
+// the LSP runs ENTIRELY on this — no TS checker). `undefined` when the seed is
+// absent or this host can't instantiate it (no WasmGC); every handler then
+// degrades to an empty/no-op result rather than a TS fallback.
 let wasmChecker: WasmChecker | undefined;
 
 // Shape a native `WasmImportedSource` (1-based line, 0-based col, exported-name
@@ -257,17 +133,15 @@ const toCrossFileSource = (s: WasmImportedSource): CrossFileSource => {
   };
 };
 
-// Cross-file imported sources for the document at `uri`, off the wasm checker
-// when `"wasm"` mode wants it and the seed exports the import/export pass —
-// otherwise undefined so the caller falls back to the TS `importedNameSources`.
-// A throw (or a wasm result that's empty, i.e. nothing resolved natively) also
-// returns undefined, so the TS path serves the file unchanged. Mirrors how the
-// other wasm features fall back to TS.
+// Cross-file imported sources for the document at `uri`, off the self-hosted
+// checker's import/export pass — the exporting sibling's decl location for each
+// imported name (powers cross-file go-to-definition + doc-xref). Undefined when
+// no checker is loaded / the seed predates the export, or nothing resolved.
 const wasmImportedSources = async (
   uri: string,
   text: string,
 ): Promise<Record<string, CrossFileSource> | undefined> => {
-  if (checkerMode !== "wasm" || wasmChecker?.importedNameSources === undefined) {
+  if (wasmChecker?.importedNameSources === undefined) {
     return undefined;
   }
   const native = await wasmChecker
@@ -409,14 +283,11 @@ documents.onDidChangeContent(async (event) => {
   // statements. A file with no imports analyzes exactly as the single-file
   // `checkOnly` path did. Codegen-only diagnostics (the rare `Codegen error:`)
   // aren't produced here, same trade-off as `vl check`.
-  // LSP-on-wasm (`vital.checker`): `"wasm"` publishes the self-hosted compiler's
-  // diagnostics — the error tier (`check`) PLUS the Stage-3 lint tier (`lint`),
-  // which `check` excludes — instead of the TS checker's; `"both"` publishes the
-  // TS diagnostics and LOGS structural divergence from the wasm checker (the
-  // parity instrument the TS-host teardown gates on). Any wasm-side failure falls
-  // back to TS (whose `checkDocument` already includes lint, so no double-count).
-  let diagnostics: VLDiagnostic[];
-  if (checkerMode === "wasm" && wasmChecker !== undefined) {
+  // Diagnostics from the self-hosted compiler: the error tier (`check`) PLUS the
+  // Stage-3 lint tier (`lint`, which `check` excludes). No checker (no seed / no
+  // WasmGC in this host) → no diagnostics, rather than a TS fallback.
+  let diagnostics: VLDiagnostic[] = [];
+  if (wasmChecker !== undefined) {
     try {
       const text = event.document.getText();
       const errors = await wasmChecker.check(
@@ -426,35 +297,7 @@ documents.onDidChangeContent(async (event) => {
       );
       diagnostics = [...errors, ...wasmChecker.lint(text)];
     } catch (err) {
-      connection.console.log(`[wasm-checker] check failed (${err}) — TS fallback`);
-      diagnostics = (await checkDocument(
-        event.document.getText(),
-        entryKeyOf(event.document.uri),
-        workspaceReader,
-      )).diagnostics;
-    }
-  } else {
-    diagnostics = (await checkDocument(
-      event.document.getText(),
-      entryKeyOf(event.document.uri),
-      workspaceReader,
-    )).diagnostics;
-    if (checkerMode === "both" && wasmChecker !== undefined) {
-      try {
-        const wasmDiags = await wasmChecker.check(
-          event.document.getText(),
-          entryKeyOf(event.document.uri),
-          workspaceReader,
-        );
-        const diff = diffDiagnostics(diagnostics, wasmDiags);
-        if (diff !== undefined) {
-          connection.console.log(
-            `[wasm-parity] divergence in ${event.document.uri}\n${diff}`,
-          );
-        }
-      } catch (err) {
-        connection.console.log(`[wasm-parity] wasm check failed: ${err}`);
-      }
+      connection.console.log(`[wasm-checker] check failed: ${err}`);
     }
   }
 
@@ -504,10 +347,6 @@ documents.onDidSave(async (_event) => {
   await runUnusedExportPass().catch(() => {});
 });
 
-// LSP positions are 0-based line / 0-based character; VL's `Position` (and the
-// spans in the symbol table) are 1-based line / 0-based column. Bridge here.
-const toVLPosition = (p: Position) => ({ line: p.line + 1, column: p.character });
-const ctxToRange = (ctx: Context): Range => rangeFromCtx(ctx);
 
 // Go-to-definition: map the cursor to the binding it lands on, return that
 // binding's declaring span (D2). When the cursor lands on an IMPORTED name
@@ -524,39 +363,14 @@ connection.onDefinition(async (params): Promise<Location | null> => {
   if (!doc) return null;
   const text = doc.getText();
 
-  // The TS path (the universal fallback): cross-file imported-name jump first,
-  // then the single-file symbol table.
-  const tsDefinition = async (): Promise<Location | null> => {
-    const lineText = doc.getText({
-      start: { line: params.position.line, character: 0 },
-      end: { line: params.position.line + 1, character: 0 },
-    });
-    const word = wordAt(lineText, params.position.character);
-    if (word) {
-      // Prefer the wasm import/export pass when `"wasm"` mode wants it; fall back
-      // to the TS resolver when the seed predates the exports or nothing resolved.
-      const wasmSources = await wasmImportedSources(params.textDocument.uri, text);
-      const source = wasmSources?.[word] ?? await importedNameSource(
-        word,
-        text,
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-      );
-      if (source) return Location.create(source.uri, source.range);
-    }
-    const symbols = parseSymbols(text);
-    const decl = symbols.definitionAt(toVLPosition(params.position));
-    if (!decl) return null;
-    return Location.create(params.textDocument.uri, ctxToRange(decl));
-  };
-
-  // LSP-on-wasm Stage 2: route go-to-def to the self-hosted compiler. `"wasm"`
-  // uses its result, falling back to TS on a miss (the cursor was off any binding
-  // the native checker tracks, or the seed predates the symbol exports); `"both"`
-  // serves the TS result but logs structural divergence — the parity instrument.
-  const wasmDef = async (): Promise<WasmRange | undefined> => {
-    if (wasmChecker?.definitionAt === undefined) return undefined;
-    return await wasmChecker
+  // Go-to-definition off the self-hosted checker (kill-TS). The single-file
+  // binding declaration first (native `definitionAt`); then, on a miss, the
+  // cross-file imported-name jump — an imported name resolves to the exporting
+  // sibling's declaration via the native import/export pass
+  // (`wasmImportedSources`). No checker (no seed / no WasmGC) → no result.
+  if (wasmChecker === undefined) return null;
+  const nativeDecl = wasmChecker.definitionAt !== undefined
+    ? await wasmChecker
       .definitionAt(
         text,
         entryKeyOf(params.textDocument.uri),
@@ -567,25 +381,21 @@ connection.onDefinition(async (params): Promise<Location | null> => {
       .catch((err) => {
         connection.console.log(`[wasm-symbols] definitionAt failed: ${err}`);
         return undefined;
-      });
-  };
+      })
+    : undefined;
+  if (nativeDecl) return Location.create(params.textDocument.uri, nativeDecl);
 
-  if (checkerMode === "wasm" && wasmChecker !== undefined) {
-    const r = await wasmDef();
-    if (r) return Location.create(params.textDocument.uri, r);
-    return tsDefinition();
+  const lineText = doc.getText({
+    start: { line: params.position.line, character: 0 },
+    end: { line: params.position.line + 1, character: 0 },
+  });
+  const word = wordAt(lineText, params.position.character);
+  if (word) {
+    const sources = await wasmImportedSources(params.textDocument.uri, text);
+    const source = sources?.[word];
+    if (source) return Location.create(source.uri, source.range);
   }
-  if (checkerMode === "both" && wasmChecker !== undefined) {
-    const ts = await tsDefinition();
-    const wasm = await wasmDef();
-    const tsRange = ts && ts.uri === params.textDocument.uri ? ts.range : undefined;
-    const diff = diffDefinition(tsRange, wasm);
-    if (diff !== undefined) {
-      connection.console.log(`[wasm-parity] ${params.textDocument.uri} ${diff}`);
-    }
-    return ts;
-  }
-  return tsDefinition();
+  return null;
 });
 
 // Find-references: every occurrence (declaration + uses) of the binding under
@@ -602,53 +412,14 @@ connection.onReferences(async (params): Promise<Location[] | null> => {
   const text = doc.getText();
   const includeDeclaration = params.context?.includeDeclaration ?? true;
 
-  // The TS path (the fallback): cross-module crawl when the symbol is
-  // exported/imported, else the single-file symbol table.
-  const tsReferences = async (): Promise<Location[]> => {
-    const lineText = doc.getText({
-      start: { line: params.position.line, character: 0 },
-      end: { line: params.position.line + 1, character: 0 },
-    });
-    const word = wordAt(lineText, params.position.character);
-    // The cross-module crawl runs off the self-hosted checker (kill-TS step 3-C
-    // Stage 3), so it needs a live wasm checker; without one the symbol is
-    // resolved single-file below.
-    if (word && wasmChecker !== undefined) {
-      const openDocs = documents.all().map((d) => ({
-        uri: d.uri,
-        text: d.getText(),
-      }));
-      const entryKey = entryKeyOf(params.textDocument.uri);
-      const crawlRoot = workspaceFolder
-        ? uriToPath(workspaceFolder)
-        : detectProjectRoot(entryKey);
-      const diskFiles = enumerateWorkspaceFiles(crawlRoot);
-      const crossRefs = await crossFileReferences(
-        word,
-        text,
-        entryKey,
-        openDocs,
-        workspaceReader,
-        wasmChecker,
-        includeDeclaration,
-        diskFiles,
-      );
-      // A defined (possibly empty) result means the symbol is cross-module.
-      if (crossRefs !== undefined) {
-        return crossRefs.map((r) => Location.create(r.uri, r.range));
-      }
-    }
-    const symbols = parseSymbols(text);
-    const spans = symbols.referencesAt(toVLPosition(params.position), includeDeclaration);
-    return spans.map((ctx) => Location.create(params.textDocument.uri, ctxToRange(ctx)));
-  };
+  // Find-references off the self-hosted checker (kill-TS). No checker → no result.
+  if (wasmChecker === undefined) return null;
 
-  // LSP-on-wasm Stage 2: the native references are SINGLE-FILE (the binding's
-  // occurrences in the entry module). A cross-module symbol still wants the TS
-  // crawl, so `"wasm"` defers to TS when the native side finds nothing local.
-  const wasmRefs = async (): Promise<WasmRange[]> => {
-    if (wasmChecker?.referencesAt === undefined) return [];
-    return await wasmChecker
+  // The native references are SINGLE-FILE (the binding's occurrences in the entry
+  // module). Try that first; on a miss, the symbol may be cross-module, so run the
+  // cross-module crawl (itself wasm-backed, kill-TS step 3-C Stage 3).
+  const localRefs = wasmChecker.referencesAt !== undefined
+    ? await wasmChecker
       .referencesAt(
         text,
         entryKeyOf(params.textDocument.uri),
@@ -659,31 +430,40 @@ connection.onReferences(async (params): Promise<Location[] | null> => {
       )
       .catch((err) => {
         connection.console.log(`[wasm-symbols] referencesAt failed: ${err}`);
-        return [];
-      });
-  };
+        return [] as WasmRange[];
+      })
+    : [];
+  if (localRefs.length > 0) {
+    return localRefs.map((r) => Location.create(params.textDocument.uri, r));
+  }
 
-  if (checkerMode === "wasm" && wasmChecker !== undefined) {
-    const refs = await wasmRefs();
-    if (refs.length > 0) {
-      return refs.map((r) => Location.create(params.textDocument.uri, r));
+  const lineText = doc.getText({
+    start: { line: params.position.line, character: 0 },
+    end: { line: params.position.line + 1, character: 0 },
+  });
+  const word = wordAt(lineText, params.position.character);
+  if (word) {
+    const openDocs = documents.all().map((d) => ({ uri: d.uri, text: d.getText() }));
+    const entryKey = entryKeyOf(params.textDocument.uri);
+    const crawlRoot = workspaceFolder
+      ? uriToPath(workspaceFolder)
+      : detectProjectRoot(entryKey);
+    const diskFiles = enumerateWorkspaceFiles(crawlRoot);
+    const crossRefs = await crossFileReferences(
+      word,
+      text,
+      entryKey,
+      openDocs,
+      workspaceReader,
+      wasmChecker,
+      includeDeclaration,
+      diskFiles,
+    );
+    if (crossRefs !== undefined) {
+      return crossRefs.map((r) => Location.create(r.uri, r.range));
     }
-    return tsReferences();
   }
-  if (checkerMode === "both" && wasmChecker !== undefined) {
-    const ts = await tsReferences();
-    const wasm = await wasmRefs();
-    // Compare only same-file spans (the native side is single-file).
-    const tsLocal = ts
-      .filter((l) => l.uri === params.textDocument.uri)
-      .map((l) => l.range as WasmRange);
-    const diff = diffReferences(tsLocal, wasm);
-    if (diff !== undefined) {
-      connection.console.log(`[wasm-parity] ${params.textDocument.uri} ${diff}`);
-    }
-    return ts;
-  }
-  return tsReferences();
+  return null;
 });
 
 // Extract the identifier `[A-Za-z_][A-Za-z0-9_]*` straddling `character` on
@@ -790,145 +570,20 @@ connection.onHover(async (params): Promise<Hover | null> => {
   // builtin list). No checkOnly/parseSymbols/importedScope. Source `///` docs are
   // not rendered — unchanged from the prior wasm-mode behaviour (the native path
   // never carried them; a doc-aware hover needs a separate native export).
-  if (
-    checkerMode === "wasm" && wasmChecker !== undefined &&
-    wasmChecker.hoverTypeAt !== undefined &&
-    wasmChecker.memberTypeAt !== undefined &&
-    wasmChecker.typeAliasAt !== undefined &&
-    wasmChecker.builtinCompletions !== undefined
-  ) {
-    if (!wordForHover) return null;
-    const t = await wasmHoverType();
-    if (t) return { contents: hoverMarkdown(`${wordForHover}: ${t}`) };
-    const mt = await wasmMemberType();
-    if (mt) return { contents: hoverMarkdown(`${wordForHover}: ${mt}`) };
-    const at = await wasmTypeAlias();
-    if (at) return { contents: hoverMarkdown(`${wordForHover}: ${at}`) };
-    const b = wasmChecker.builtinCompletions().find((x) => x.name === wordForHover);
-    if (b && b.detail.length > 0) {
-      return { contents: hoverMarkdown(`${wordForHover}: ${b.detail}`) };
-    }
-    return null;
+  if (wasmChecker === undefined) return null;
+  if (!wordForHover) return null;
+  const t = await wasmHoverType();
+  if (t) return { contents: hoverMarkdown(`${wordForHover}: ${t}`) };
+  const mt = await wasmMemberType();
+  if (mt) return { contents: hoverMarkdown(`${wordForHover}: ${mt}`) };
+  const at = await wasmTypeAlias();
+  if (at) return { contents: hoverMarkdown(`${wordForHover}: ${at}`) };
+  // Builtin (`print`/`i32`/…): the word in the native builtin set.
+  const b = wasmChecker.builtinCompletions?.().find((x) => x.name === wordForHover);
+  if (b && b.detail.length > 0) {
+    return { contents: hoverMarkdown(`${wordForHover}: ${b.detail}`) };
   }
-
-  const lineText = document.getText({
-    start: { line: params.position.line, character: 0 },
-    end: { line: params.position.line + 1, character: 0 },
-  });
-  // Hover resolves through the D2 symbol table first: it maps the cursor to its
-  // `Binding` (locals/params/functions/type aliases included) and reads the type
-  // each binding carries. Falls back to the top-level scope lookup below for
-  // anything the symbol table doesn't carry.
-  //
-  // Module-aware: seed the parse with imported names' resolved types so a hover
-  // over an imported name (`foo` from `./x`) shows its REAL type rather than
-  // resolving to nothing. A no-import file seeds an empty scope (unchanged).
-  const importedScope = await importedScopeFor(
-    params.textDocument.uri,
-    document.getText(),
-  );
-  const symbols = parseSymbolsSeeded(document.getText(), importedScope);
-  // D7: build the doc-comment cross-reference resolver for this document. It is
-  // used by `docMarkdown` to rewrite `` [`Name`] `` / `[Name]` spans in `///`
-  // doc-comments into clickable links to the named symbol's definition.
-  // H0 phase 3: imported names link cross-file to their exporting sibling.
-  // Prefer the wasm import/export pass in `"wasm"` mode; fall back to TS.
-  const importedSources =
-    await wasmImportedSources(params.textDocument.uri, document.getText()) ??
-      await importedNameSources(
-        document.getText(),
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-      );
-  const docResolver = buildDocRefResolver(
-    symbols,
-    params.textDocument.uri,
-    importedSources,
-  );
-  const occ = symbols.occurrenceAt(toVLPosition(params.position));
-  if (occ?.binding.type) {
-    // Feature 1(b) — "declared vs flow-refined type" — is DEFERRED. The symbol
-    // table carries only the binding's *declared/inferred* type (`binding.type`),
-    // shared by all occurrences. Flow narrowing (`if x is T { … }`) lives in the
-    // type checker's transient `narrowedPaths` (compiler/typecheck.ts) and is not
-    // recorded per occurrence, so the *refined* type at this exact cursor isn't
-    // obtainable without a compiler-core change (recording a narrowed type on
-    // each `SymbolOccurrence` during the typecheck/toAST pass). That change is
-    // out of scope here (compiler/*.ts is owned by other agents). When it lands,
-    // render both via separate labelled markdown sections — the LSP convention
-    // for two types in one hover — e.g. "declared `T`" then "narrowed `U`".
-    // Render the authored `///` doc (if any) as markdown above the type block.
-    // `docMarkdown` collapses to the bare type fence when there's no doc, so
-    // undocumented bindings hover exactly as before. Pass `docResolver` so any
-    // `` [`Name`] `` / `[Name]` spans in the doc are linkified (D7).
-    //
-    // D8 alias display: a *value* binding (`x: thing`) renders at maxDepth 0 —
-    // every alias name preserved (hover `x: thing`, not its body). A *type*
-    // binding (`type thing = …`) peels exactly one layer (maxDepth 1) so hovering
-    // the alias shows its BODY while keeping any inner alias names (`type thing =
-    // "a" | I32` hovers as `"a" | I32`) — otherwise it would render its own name.
-    const aliasDepth = occ.binding.kind === "type" ? 1 : 0;
-    const tsTypeStr = stringifyType(occ.binding.type, new Set(), aliasDepth);
-    if (checkerMode === "both" && wasmChecker !== undefined) {
-      const wasmType = await wasmHoverType();
-      const diff = diffHoverType(tsTypeStr, wasmType);
-      if (diff !== undefined) {
-        connection.console.log(`[wasm-parity] ${params.textDocument.uri} ${diff}`);
-      }
-    }
-    return {
-      contents: {
-        kind: "markdown",
-        value: docMarkdown(
-          `${occ.binding.name}: ${tsTypeStr}`,
-          VL_LANGUAGE_ID,
-          occ.binding.doc,
-          docResolver,
-        ),
-      },
-    };
-  }
-
-  // Member-aware hover: when the cursor is on the `.member` half of a
-  // `receiver.member` (`o.x`, `xs.get`, `s.length`) — which is NOT a symbol-table
-  // binding — locate the member-access AST node, type its receiver, and render
-  // the resolved member type. Driven by the public AST node spans (`.spans`) +
-  // the checker's member typing (one mechanism shared with semantic tokens).
-  const { ast: checkedAst, spans } = checkOnly(document.getText());
-  if (checkedAst && spans) {
-    const member = resolveMemberAt(checkedAst, spans, toVLPosition(params.position));
-    if (member) {
-      const tsMemberType = stringifyType(member.type);
-      if (checkerMode === "both" && wasmChecker !== undefined) {
-        const diff = diffHoverType(tsMemberType, await wasmMemberType());
-        if (diff !== undefined) {
-          connection.console.log(`[wasm-parity] member ${params.textDocument.uri} ${diff}`);
-        }
-      }
-      return {
-        contents: hoverMarkdown(`${member.name}: ${tsMemberType}`),
-      };
-    }
-  }
-
-  const word = wordAt(lineText, params.position.character);
-  if (!word) return null;
-
-  // An imported name resolves through the graph-seeded scope first (its REAL
-  // type), then through the program scope (builtins + top-level names). The
-  // single-file `compile`/`checkOnly` AST scope doesn't carry imports, so the
-  // seeded `importedScope` is consulted explicitly here.
-  const importedType = importedScope[word];
-  if (importedType) {
-    return { contents: hoverMarkdown(`${word}: ${stringifyType(importedType)}`) };
-  }
-  const { ast } = checkOnly(document.getText());
-  const type = ast?.scope[word];
-  if (!type) return null;
-
-  return {
-    contents: hoverMarkdown(`${word}: ${stringifyType(type)}`),
-  };
+  return null;
 });
 
 // Inlay hints (D6): for every declaration that *lacks* a visible annotation,
@@ -947,26 +602,17 @@ connection.languages.inlayHint.on(async (params): Promise<InlayHint[]> => {
     paddingLeft: true, // keep it unobtrusive: a space before `: type`
   });
 
-  // Kill-TS: in "wasm" mode the inferred types + decl positions come from the
-  // native checker (`inlayHintsAt`); the source-scan annotation/range filters stay
-  // host-side (`inlayHintsFromWasm`). No `parseSymbols`. An empty result on an
-  // older seed falls through to the TS walk.
-  if (checkerMode === "wasm" && wasmChecker?.inlayHintsAt !== undefined) {
-    const candidates = await wasmChecker
-      .inlayHintsAt(text, entryKeyOf(params.textDocument.uri), workspaceReader)
-      .catch((err) => {
-        connection.console.log(`[wasm-checker] inlayHintsAt failed: ${err}`);
-        return [];
-      });
-    if (candidates.length > 0) {
-      return inlayHintsFromWasm(candidates, range, text).map(toHint);
-    }
-  }
-
-  // TS path: the symbol-table walk. Pass the source so annotated declarations are
-  // suppressed — only *inferred* positions are hinted.
-  const symbols = parseSymbols(text);
-  return deriveInlayHints(symbols, stringifyType, range, text).map(toHint);
+  // Kill-TS: the inferred types + decl positions come from the native checker
+  // (`inlayHintsAt`); the source-scan annotation/range filters stay host-side
+  // (`inlayHintsFromWasm`). No checker → no hints.
+  if (wasmChecker?.inlayHintsAt === undefined) return [];
+  const candidates = await wasmChecker
+    .inlayHintsAt(text, entryKeyOf(params.textDocument.uri), workspaceReader)
+    .catch((err) => {
+      connection.console.log(`[wasm-checker] inlayHintsAt failed: ${err}`);
+      return [];
+    });
+  return inlayHintsFromWasm(candidates, range, text).map(toHint);
 });
 
 // Semantic tokens (D5): richer, semantically-accurate highlighting beyond the
@@ -981,99 +627,30 @@ connection.languages.semanticTokens.on(
     if (!doc) return { data: [] };
     const text = doc.getText();
     const uri = params.textDocument.uri;
+    if (wasmChecker === undefined) return { data: [] };
 
-    // The TS classification — computed lazily so the wasm-only path pays no
-    // tokenize/checkOnly cost. `checkOnly` (synchronous, binaryen-free) gives the
-    // symbol table AND the AST node spans for the member walk; `tokenize` the
-    // lexical pass. Used only by the `"ts"`/`"both"` modes and the no-wasm fallback.
-    const tsData = (): number[] => {
-      const { tokens } = tokenize(text);
-      const { symbols, ast, spans } = checkOnly(text);
-      return semanticTokensData(symbols, tokens, text, ast, spans);
-    };
-
-    // LSP-on-wasm Stage 2: the IDENTIFIER classification (variable/parameter/
-    // function) from the self-hosted compiler. On any error (or an empty result —
-    // a seed predating the token exports), yields [] — mirrors `definitionAt`.
-    const wasmIdents = async (): Promise<WasmToken[]> => {
-      if (wasmChecker?.tokensAt === undefined) return [];
-      return await wasmChecker
-        .tokensAt(text, entryKeyOf(uri), workspaceReader)
+    // Whole document off the self-hosted checker: identifiers (`tokensAt`) +
+    // members (`memberTokensAt`) + the lexical layer (`lexicalTokensAt` —
+    // keywords/operators/literals/comments). No TS. Each slice yields [] on any
+    // error / a seed predating its export.
+    const idents = wasmChecker.tokensAt !== undefined
+      ? await wasmChecker.tokensAt(text, entryKeyOf(uri), workspaceReader)
         .catch((err) => {
           connection.console.log(`[wasm-symbols] tokensAt failed: ${err}`);
-          return [];
-        });
-    };
-
-    // The member slice (`o.x`/`xs.get` → property/method), classified by the
-    // native checker from the resolved type. Empty on a seed predating the
-    // member exports.
-    const wasmMembers = async (): Promise<WasmMemberToken[]> => {
-      if (wasmChecker?.memberTokensAt === undefined) return [];
-      return await wasmChecker
-        .memberTokensAt(text, entryKeyOf(uri), workspaceReader)
+          return [] as WasmToken[];
+        })
+      : [];
+    const members = wasmChecker.memberTokensAt !== undefined
+      ? await wasmChecker.memberTokensAt(text, entryKeyOf(uri), workspaceReader)
         .catch((err) => {
           connection.console.log(`[wasm-symbols] memberTokensAt failed: ${err}`);
-          return [];
-        });
-    };
-
-    if (checkerMode === "wasm" && wasmChecker !== undefined) {
-      // Whole document off the self-hosted checker: identifiers + members + the
-      // lexical layer (keywords/operators/literals/comments) — no TS at all. When
-      // BOTH the identifier and lexical slices are empty (a seed predating the
-      // exports, never a real document on the current seed), fall back to TS.
-      const lexical = wasmChecker.lexicalTokensAt(text);
-      const idents = await wasmIdents();
-      if (idents.length > 0 || lexical.length > 0) {
-        const members = await wasmMembers();
-        return { data: semanticTokensDataFromWasm(idents, lexical, members) };
-      }
-      return { data: tsData() };
-    }
-    if (checkerMode === "both" && wasmChecker !== undefined) {
-      const { tokens } = tokenize(text);
-      const { symbols, ast, spans } = checkOnly(text);
-      const idents = await wasmIdents();
-      // The TS identifier set, projected to the same shape, for the parity diff:
-      // only the binding-classified identifiers (legend indices 0/1/2) — the
-      // subset the wasm slice covers — are compared.
-      const tsIdents: TsIdentToken[] = [];
-      for (const occ of symbols.occurrences) {
-        const { span } = occ;
-        if (span.start.line !== span.stop.line) continue;
-        const length = span.stop.column - span.start.column;
-        if (length <= 0) continue;
-        const bindKind = TS_BIND_KIND[occ.binding.kind];
-        if (bindKind === undefined) continue; // a `type` — not in this slice
-        tsIdents.push({
-          line: span.start.line - 1,
-          char: span.start.column,
-          length,
-          bindKind,
-          isDecl: occ.isDecl,
-        });
-      }
-      const diff = diffSemanticTokens(tsIdents, idents);
-      if (diff !== undefined) {
-        connection.console.log(`[wasm-parity] ${params.textDocument.uri} ${diff}`);
-      }
-      return { data: semanticTokensData(symbols, tokens, text, ast, spans) };
-    }
-    return { data: tsData() };
+          return [] as WasmMemberToken[];
+        })
+      : [];
+    const lexical = wasmChecker.lexicalTokensAt(text);
+    return { data: semanticTokensDataFromWasm(idents, lexical, members) };
   },
 );
-
-// TS binding kind → the wasm `bindKind` convention (legend indices 0/1/2). A
-// `type` alias has no wasm counterpart in this slice (the native occurrence
-// table records variable/parameter/function only), so it maps to undefined and
-// is excluded from the parity diff.
-const TS_BIND_KIND: Record<string, number | undefined> = {
-  variable: 0,
-  parameter: 1,
-  function: 2,
-  type: undefined,
-};
 
 // Map a neutral completion kind (from `typeFeatures.ts`) to the LSP enum. A VL
 // `type` alias / builtin type maps to `Struct` (VL types are structural objects,
@@ -1177,102 +754,65 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   });
   const charBeforeCursor = linePrefix[linePrefix.length - 1];
 
-  // ── Kill-TS: fully self-hosted completion in "wasm" mode ───────────────────
-  // Native in-scope bindings (`scopeAt`, incl. imported names) + native builtins
-  // (`builtinCompletions`, the source the TS `defaultScope` used to provide) +
-  // native member completion — no `checkOnly`/`parseSymbols`/`importedScope`/
-  // `defaultScope`. Items carry no source `///` docs (the native scope set
-  // doesn't retain them — unchanged from the prior wasm-mode behaviour).
+  // Fully self-hosted completion (kill-TS): native in-scope bindings (`scopeAt`,
+  // incl. imported names) + native builtins (`builtinCompletions`, the source the
+  // TS `defaultScope` used to provide) + native member completion — no
+  // `checkOnly`/`parseSymbols`/`importedScope`/`defaultScope`. Items carry no
+  // source `///` docs (the native scope set doesn't retain them). No checker (no
+  // seed, or one predating these exports) → no completions.
   if (
-    checkerMode === "wasm" && wasmChecker !== undefined &&
-    wasmChecker.scopeAt !== undefined &&
-    wasmChecker.builtinCompletions !== undefined &&
-    wasmChecker.memberCompletionsAt !== undefined
+    wasmChecker === undefined ||
+    wasmChecker.scopeAt === undefined ||
+    wasmChecker.builtinCompletions === undefined ||
+    wasmChecker.memberCompletionsAt === undefined
   ) {
-    if (charBeforeCursor === ".") {
-      const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
-      if (!receiver) return [];
-      // The native parser isn't error-tolerant for the incomplete `receiver.`,
-      // so strip the trailing `.` and resolve the receiver as a bare expression
-      // at its own position. Empty for a receiver with no completable members
-      // (arrays/maps, as the TS path) or one that can't resolve.
-      const dotCol = params.position.character - 1;
-      const repaired = removeCharAt(text, params.position.line, dotCol);
-      const members = await wasmChecker
-        .memberCompletionsAt(
-          repaired,
-          entryKeyOf(uri),
-          workspaceReader,
-          params.position.line,
-          dotCol - receiver.length,
-        )
-        .catch((err) => {
-          connection.console.log(`[wasm-checker] memberCompletionsAt failed: ${err}`);
-          return [];
-        });
-      return memberCompletionsFromWasm(members).map((c) => toCompletionItem(c));
-    }
-
-    // Identifier completion: native in-scope user bindings + native builtins +
-    // keywords/snippets. A user binding shadows a same-named builtin (added last).
-    const bindings = await wasmChecker
-      .scopeAt(
-        text,
-        entryKeyOf(uri),
-        workspaceReader,
-        params.position.line,
-        params.position.character,
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-checker] scopeAt failed: ${err}`);
-        return [];
-      });
-    const byName = new Map<string, Completion>();
-    for (const c of builtinCompletionsFromWasm(wasmChecker.builtinCompletions())) {
-      byName.set(c.name, c);
-    }
-    for (const c of scopeCompletionsFromBindings(bindings)) byName.set(c.name, c);
-    const identifiers = [...byName.values()].map((c) => toCompletionItem(c));
-    const keywords = keywordCompletions(false).map((c) => toCompletionItem(c));
-    const snippets = snippetCompletions(false).map((c) => toCompletionItem(c));
-    return [...identifiers, ...keywords, ...snippets];
+    return [];
   }
 
-  // ── TS path (`"ts"`/`"both"`, or a seed without the completion exports) ─────
-  const vlPos = toVLPosition(params.position);
-  // Module-aware: seed the parse with imported names' resolved types so imported
-  // names appear as completions with their real types (and resolve as receivers).
-  const importedScope = await importedScopeFor(uri, text);
-  const symbols = parseSymbolsSeeded(text, importedScope);
-  // D7: build the doc-comment resolver once for all completion items in this
-  // request — identifier completions carry `///` docs that may contain xrefs.
-  const importedSources =
-    await wasmImportedSources(uri, text) ??
-      await importedNameSources(text, entryKeyOf(uri), workspaceReader);
-  const docResolver = buildDocRefResolver(symbols, uri, importedSources);
-
-  // Member completion: cursor follows `<receiver>.`. Only the simple `name.`
-  // receiver is resolved; a more complex receiver yields no suggestions.
   if (charBeforeCursor === ".") {
     const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
     if (!receiver) return [];
-    const { ast } = checkOnly(text);
-    if (!ast) return [];
-    // Fold imported names in so an imported object can be a member receiver.
-    const scope = { ...ast.scope, ...importedScope };
-    const objectType = receiverObjectType(receiver, symbols, vlPos, scope);
-    if (!objectType) return [];
-    return memberCompletions(objectType, stringifyType).map((c) =>
-      toCompletionItem(c, docResolver)
-    );
+    // The native parser isn't error-tolerant for the incomplete `receiver.`, so
+    // strip the trailing `.` and resolve the receiver as a bare expression at its
+    // own position. Empty for a receiver with no completable members (arrays/maps)
+    // or one that can't resolve.
+    const dotCol = params.position.character - 1;
+    const repaired = removeCharAt(text, params.position.line, dotCol);
+    const members = await wasmChecker
+      .memberCompletionsAt(
+        repaired,
+        entryKeyOf(uri),
+        workspaceReader,
+        params.position.line,
+        dotCol - receiver.length,
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-checker] memberCompletionsAt failed: ${err}`);
+        return [];
+      });
+    return memberCompletionsFromWasm(members).map((c) => toCompletionItem(c));
   }
 
-  // Identifier completion: in-scope names + builtins (`ast.scope` carries the
-  // builtins from `defaultScope` plus top-level names) + keywords/snippets.
-  const { ast } = checkOnly(text);
-  const builtins = { ...(ast?.scope ?? {}), ...importedScope };
-  const identifiers = identifierCompletions(symbols, vlPos, builtins, stringifyType)
-    .map((c) => toCompletionItem(c, docResolver));
+  // Identifier completion: native in-scope user bindings + native builtins +
+  // keywords/snippets. A user binding shadows a same-named builtin (added last).
+  const bindings = await wasmChecker
+    .scopeAt(
+      text,
+      entryKeyOf(uri),
+      workspaceReader,
+      params.position.line,
+      params.position.character,
+    )
+    .catch((err) => {
+      connection.console.log(`[wasm-checker] scopeAt failed: ${err}`);
+      return [];
+    });
+  const byName = new Map<string, Completion>();
+  for (const c of builtinCompletionsFromWasm(wasmChecker.builtinCompletions())) {
+    byName.set(c.name, c);
+  }
+  for (const c of scopeCompletionsFromBindings(bindings)) byName.set(c.name, c);
+  const identifiers = [...byName.values()].map((c) => toCompletionItem(c));
   const keywords = keywordCompletions(false).map((c) => toCompletionItem(c));
   const snippets = snippetCompletions(false).map((c) => toCompletionItem(c));
   return [...identifiers, ...keywords, ...snippets];
@@ -1287,7 +827,9 @@ connection.onDocumentFormatting((params): TextEdit[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const text = doc.getText();
-  // The TS `format()` — the fallback, and the authoritative path in `"both"`.
+  // The self-hosted formatter (`format.vl` via `wasmChecker.formatSrc`); on a
+  // parse error / missing export it falls back to the TS `format()` (the
+  // `format.ts` finale is separately gated on the playground wasm migration).
   const tsFormat = (): string | undefined => {
     try {
       return format(text);
@@ -1295,24 +837,9 @@ connection.onDocumentFormatting((params): TextEdit[] => {
       return undefined;
     }
   };
-  let formatted: string | undefined;
-  if (checkerMode === "wasm" && wasmChecker?.formatSrc !== undefined) {
-    // Self-hosted formatter; fall back to TS on a parse error / missing export.
-    formatted = wasmChecker.formatSrc(text) ?? tsFormat();
-  } else if (checkerMode === "both" && wasmChecker?.formatSrc !== undefined) {
-    // TS publishes; run the wasm formatter too and LOG any divergence — the
-    // parity instrument the TS-host teardown gates on (mirrors the diagnostics/
-    // hover/token "both" instruments).
-    formatted = tsFormat();
-    const wasmFormatted = wasmChecker.formatSrc(text);
-    if (wasmFormatted !== undefined && wasmFormatted !== formatted) {
-      connection.console.log(
-        `[wasm-checker] format divergence on ${params.textDocument.uri}`,
-      );
-    }
-  } else {
-    formatted = tsFormat();
-  }
+  const formatted = wasmChecker?.formatSrc !== undefined
+    ? wasmChecker.formatSrc(text) ?? tsFormat()
+    : tsFormat();
   if (formatted === undefined) return [];
   if (formatted === text) return [];
   const fullRange: Range = {
@@ -1372,30 +899,22 @@ connection.onInitialize((params) => {
   connection.console.log(
     `[Server(${process.pid}) ${workspaceFolder}] Started and initialize received`,
   );
-  // `vital.checker` rides initializationOptions (static per session — the
-  // extension passes the workspace config at client start). The default is
-  // `"wasm"` (kill-TS step 2): when no `checker` is supplied we behave as if
-  // `"wasm"` was requested. An explicit `"ts"` opts out entirely. A wasm checker
-  // that cannot load (no seed, no WasmGC in this host) degrades to `"ts"` after
-  // one log line — the TS fallback is always preserved.
+  // Load the self-hosted compiler from the wasm seed (kill-TS: the LSP runs
+  // entirely on it). `compilerWasm` overrides the seed path; otherwise it's the
+  // workspace's `build/vl-compiler.wasm`. A seed that can't load (absent, or no
+  // WasmGC in this host) leaves `wasmChecker` undefined — every handler then
+  // returns an empty/no-op result. (The legacy `vital.checker` option is ignored:
+  // there is no longer a TS checker to select.)
   const opts = (params.initializationOptions ?? {}) as {
-    checker?: string;
     compilerWasm?: string;
   };
-  const requestedMode = opts.checker ?? "wasm";
-  if (requestedMode === "wasm" || requestedMode === "both") {
-    const root = params.rootUri ? uriToPath(params.rootUri) : "";
-    const wasmPath = opts.compilerWasm ||
-      join(root, "build", "vl-compiler.wasm");
-    wasmChecker = loadWasmChecker(
-      wasmPath,
-      (msg) => connection.console.log(msg),
-      getStdDir,
-    );
-    checkerMode = wasmChecker !== undefined ? requestedMode : "ts";
-  } else {
-    checkerMode = "ts";
-  }
+  const root = params.rootUri ? uriToPath(params.rootUri) : "";
+  const wasmPath = opts.compilerWasm || join(root, "build", "vl-compiler.wasm");
+  wasmChecker = loadWasmChecker(
+    wasmPath,
+    (msg) => connection.console.log(msg),
+    getStdDir,
+  );
   return {
     capabilities: {
       textDocumentSync: {
