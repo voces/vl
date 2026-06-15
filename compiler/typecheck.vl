@@ -2191,6 +2191,114 @@ export function symScopeTypeCharAt(i: i32, j: i32): i32 {
   scopeResType[i][j]
 }
 
+// ── Member completion (LSP): the members of the receiver type under the cursor ──
+// The native counterpart of the host's `receiverObjectType` + `memberCompletions`.
+// `symMemberScanAt(line, col)` resolves the binding under the cursor (the receiver
+// identifier — the host strips the trailing `.` so it parses as a bare expression),
+// reads its retained type, softens a nullable, and records each completable member:
+// a `TyObj`'s identifier-named fields, or a `string`'s builtin methods. The result
+// lands in the `memc*` arrays, read by the per-index accessors. Arrays/maps expose
+// no members here (parity with the host, which surfaces none for them).
+let memcName: string[] = []
+let memcType: string[] = []
+let memcIsFn: i32[] = []
+
+// Whether `nm` is a plain identifier (so it's dot-accessible) — excludes the
+// operator field names (`+`, `==`, …) an object type also carries. Mirrors the
+// host's `/^[A-Za-z_][A-Za-z0-9_]*$/` guard.
+function isIdentName(nm: string): boolean {
+  if nm.length == 0 { return false }
+  let c0 = nm[0]
+  if !((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95) {
+    return false
+  }
+  let k = 1
+  while k < nm.length {
+    let c = nm[k]
+    let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 ||
+      (c >= 48 && c <= 57)
+    if !ok { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Soften a receiver type to its member-bearing core: unwrap a nullable (`o?.`).
+function memcSoften(ty: i32): i32 {
+  if ty < 0 { return ty }
+  let t = T.tys[ty]
+  if t is TyNullable { return memcSoften(t.nInner) }
+  ty
+}
+
+function memcPush(nm: string, ds: string, fn: i32) {
+  memcName.push(nm)
+  memcType.push(ds)
+  memcIsFn.push(fn)
+}
+
+export function symMemberScanAt(line: i32, col: i32): i32 {
+  memcName = []
+  memcType = []
+  memcIsFn = []
+  let occ = symOccAt(line, col)
+  if occ < 0 { return 0 }
+  let binding = symOccDecl[occ]
+  let ty = 0 - 1
+  let i = 0
+  while i < symBindNode.length {
+    if symBindNode[i] == binding { ty = symBindType[i] }
+    i = i + 1
+  }
+  if ty < 0 { return 0 }
+  ty = memcSoften(ty)
+  if ty < 0 { return 0 }
+  let t = T.tys[ty]
+  if t is TyObj {
+    let k = 0
+    while k < t.objFieldNames.length {
+      let nm = t.objFieldNames[k]
+      if isIdentName(nm) {
+        let fty = t.objFieldTypes[k]
+        let isfn = 0
+        if symMemIsFn(fty) { isfn = 1 }
+        memcPush(nm, tyToStr(fty), isfn)
+      }
+      k = k + 1
+    }
+  } else if t is TyPrim {
+    if t.primName == "string" {
+      // The string builtin methods the host surfaces (call-arms in this file).
+      memcPush("slice", "(i32, i32) -> string", 1)
+      memcPush("indexOf", "(string) -> i32", 1)
+      memcPush("includes", "(string) -> boolean", 1)
+      memcPush("charCodeAt", "(i32) -> i32", 1)
+    }
+  }
+  memcName.length
+}
+export function symMemberScanCount(): i32 { memcName.length }
+export function symMemberScanNameLen(i: i32): i32 {
+  if i < 0 || i >= memcName.length { return 0 }
+  memcName[i].length
+}
+export function symMemberScanNameCharAt(i: i32, j: i32): i32 {
+  if i < 0 || i >= memcName.length { return 0 }
+  memcName[i][j]
+}
+export function symMemberScanTypeLen(i: i32): i32 {
+  if i < 0 || i >= memcType.length { return 0 }
+  memcType[i].length
+}
+export function symMemberScanTypeCharAt(i: i32, j: i32): i32 {
+  if i < 0 || i >= memcType.length { return 0 }
+  memcType[i][j]
+}
+export function symMemberScanIsFn(i: i32): i32 {
+  if i < 0 || i >= memcIsFn.length { return 0 }
+  memcIsFn[i]
+}
+
 // Bind `name` to type-arena index `ty` in the innermost scope.
 export function declare(name: string, ty: i32): i32 {
   let top = T.scopes.length - 1
