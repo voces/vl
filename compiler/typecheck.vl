@@ -1962,21 +1962,87 @@ export function symRefAt(line: i32, col: i32, k: i32): i32 {
 // cursor is off any tracked binding or its type was not retained. The arena
 // `T.tys` persists for the whole check, so the retained index renders even after
 // the binding's scope closed (hover-types).
+// The retained type-arena index of binding `binding`, or -1 when none was kept.
+function bindTypeOf(binding: i32): i32 {
+  let i = 0
+  while i < symBindNode.length {
+    if symBindNode[i] == binding { return symBindType[i] }
+    i = i + 1
+  }
+  0 - 1
+}
+
 export function symTypeStrAt(line: i32, col: i32): string {
   let occ = symOccAt(line, col)
   if occ < 0 { return "" }
-  let binding = symOccDecl[occ]
+  let ty = bindTypeOf(symOccDecl[occ])
+  if ty < 0 { return "" }
+  tyToStr(ty)
+}
+
+// ── Inlay hints (LSP): the inferred type at an UNANNOTATED declaration ─────────
+// The native counterpart of the host's `deriveInlayHints`. `symInlayScan` walks
+// the declaration occurrences and records, per binding with a concrete retained
+// type, a hint: KIND 0 = a value binding (`let`/`const`/parameter) → its type,
+// anchored at the NAME end; KIND 1 = a function → its RETURN type, anchored at the
+// name end (the host walks forward to the `)` and places the hint there). The
+// host applies the source-scan filters it already owns — skip an annotation the
+// user wrote, honor the request range — so only the typing moves to the checker.
+// A type that's still an inference hole (a type variable / error placeholder) is
+// skipped (matching the host's `isHole`).
+let inlayKind: i32[] = []
+let inlayLine: i32[] = []
+let inlayCol: i32[] = []
+let inlayType: string[] = []
+
+// Whether `ty` is an unresolved hole the host's `isHole` would skip (an
+// `Infer`/`Unknown` analogue): a generic type variable or an error placeholder.
+function inlayHole(ty: i32): boolean {
+  if ty < 0 { return true }
+  let t = T.tys[ty]
+  if t is TyVar { return true }
+  if t is TyErr { return true }
+  false
+}
+
+function inlayPush(k: i32, occ: i32, ty: i32) {
+  inlayKind.push(k)
+  inlayLine.push(symOccEndLine(occ))
+  inlayCol.push(symOccEndCol(occ))
+  inlayType.push(tyToStr(ty))
+}
+
+export function symInlayScan(): i32 {
+  inlayKind = []
+  inlayLine = []
+  inlayCol = []
+  inlayType = []
   let i = 0
-  while i < symBindNode.length {
-    if symBindNode[i] == binding {
-      let ty = symBindType[i]
-      if ty < 0 { return "" }
-      return tyToStr(ty)
+  while i < symOccIsDecl.length {
+    if symOccIsDecl[i] == 1 {
+      let ty = bindTypeOf(symOccDecl[i])
+      if ty >= 0 {
+        let k = symOccKindAt(i)
+        if k == 2 {
+          let t = T.tys[ty]
+          if t is TyFunc {
+            if !inlayHole(t.fnRet) { inlayPush(1, i, t.fnRet) }
+          }
+        } else {
+          if !inlayHole(ty) { inlayPush(0, i, ty) }
+        }
+      }
     }
     i = i + 1
   }
-  ""
+  inlayKind.length
 }
+export function symInlayCount(): i32 { inlayKind.length }
+export function symInlayKindAt(i: i32): i32 { inlayKind[i] }
+export function symInlayLineAt(i: i32): i32 { inlayLine[i] }
+export function symInlayColAt(i: i32): i32 { inlayCol[i] }
+export function symInlayTypeLen(i: i32): i32 { inlayType[i].length }
+export function symInlayTypeCharAt(i: i32, j: i32): i32 { inlayType[i][j] }
 
 // Type-alias hover: the rendered type of the user TYPE NAME (a `type`-declared
 // struct/union alias) whose token covers (line, col) — the decl name or a use in
@@ -5495,6 +5561,15 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
       }
       if !patched {
         declare(n.fnName, mkFuncTy(paramTys, inferred))
+      }
+      // Re-retain the SYMBOL-TABLE type with the inferred return: the entry
+      // stamped while checking the signature (`symDeclInOuter`, above) carried the
+      // `-2` infer-later sentinel, and the in-place patch above only touches the
+      // scope-bound copy (a distinct arena entry). Without this, hover / inlay on
+      // an unannotated function render `-> <none>`. `symRetainType` overwrites the
+      // existing `fnIx` entry in place.
+      if symEnabled != 0 {
+        symRetainType(fnIx, mkFuncTy(paramTys, inferred), 2)
       }
     }
     inferObserved = savedObserved

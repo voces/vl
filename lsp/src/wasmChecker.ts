@@ -127,6 +127,21 @@ export type WasmMemberCompletion = {
 };
 
 /**
+ * One inlay-hint candidate from the wasm inlay pass (kill-TS) — an unannotated
+ * declaration with its inferred type, the native counterpart of the host's
+ * `deriveInlayHints` symbol-table walk. `kind` 0 = a value binding (hint after the
+ * name), 1 = a function (RETURN type, hint after the `)`); `line`/`col` are the
+ * NAME end (1-based line, 0-based col); `type` the rendered inferred type. The
+ * host applies the source-scan annotation/range filters.
+ */
+export type WasmInlayCandidate = {
+  kind: number; // 0=value 1=function-return
+  line: number; // 1-based name-end line
+  col: number; // 0-based name-end col
+  type: string;
+};
+
+/**
  * One builtin completion from the wasm builtin pass (kill-TS) — a numeric/string
  * TYPE name or a builtin FUNCTION (`print`/`Map`/`Set`/…), the native source for
  * the builtin half the host used to fold in from the TS `defaultScope`. `kind` is
@@ -303,6 +318,18 @@ export type WasmChecker = {
    * when the seed predates the export, so the host then keeps its TS builtins.
    */
   builtinCompletions: () => WasmBuiltin[];
+  /**
+   * Inlay hints (kill-TS): the inferred type at each UNANNOTATED declaration —
+   * value bindings + function returns — the native counterpart of
+   * `deriveInlayHints`. The caller applies the source-scan annotation/range
+   * filters. Empty when the seed predates the export — the host then keeps its TS
+   * `deriveInlayHints`.
+   */
+  inlayHintsAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ) => Promise<WasmInlayCandidate[]>;
   /**
    * Scope-at-position completions (kill-TS): every user binding
    * (variable/parameter/function) visible at (`line`, `character`) — both
@@ -857,6 +884,37 @@ export const loadWasmChecker = (
     return out;
   };
 
+  // The inlay exports ride the same Stage-2+ seed as the symbol exports; an older
+  // seed lacks them, so this yields [] (the host keeps its TS `deriveInlayHints`).
+  const hasInlay = (exp: Exports): boolean =>
+    typeof exp.inlayScan === "function" &&
+    typeof exp.inlayKindAt === "function";
+
+  const inlayHintsAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<WasmInlayCandidate[]> => {
+    const exp = instantiate();
+    if (exp === undefined || !hasSymbols(exp) || !hasInlay(exp)) return [];
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    const count = exp.inlayScan();
+    const out: WasmInlayCandidate[] = [];
+    for (let i = 0; i < count; i++) {
+      const typeLen = exp.inlayTypeLen(i);
+      if (typeLen <= 0) continue; // no renderable type — nothing to hint
+      const type = readString(typeLen, (j) => exp.inlayTypeCharAt(i, j));
+      out.push({
+        kind: exp.inlayKindAt(i),
+        line: exp.inlayLineAt(i),
+        col: exp.inlayColAt(i),
+        type,
+      });
+    }
+    return out;
+  };
+
   // The import/export tables ride the same Stage-2+ seed as the symbol exports;
   // an older seed lacks them, so the method yields {} (the host falls back to its
   // TS `importedNameSources`).
@@ -1168,6 +1226,7 @@ export const loadWasmChecker = (
     memberTokensAt,
     lexicalTokensAt,
     builtinCompletions,
+    inlayHintsAt,
     scopeAt,
     memberCompletionsAt,
     importedNameSources,

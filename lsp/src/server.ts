@@ -78,6 +78,7 @@ import {
   type CompletionKind,
   deriveInlayHints,
   docMarkdown,
+  inlayHintsFromWasm,
   type DocRefResolver,
   identifierCompletions,
   keywordCompletions,
@@ -932,20 +933,38 @@ connection.onHover(async (params): Promise<Hover | null> => {
 // surface the inferred type after the identifier (`x: i32`) — the headline
 // feature for a language that otherwise hides its types. Driven by the symbol
 // table (see `deriveInlayHints`); honours the request's `range`.
-connection.languages.inlayHint.on((params): InlayHint[] => {
+connection.languages.inlayHint.on(async (params): Promise<InlayHint[]> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const text = doc.getText();
-  const symbols = parseSymbols(text);
   const range: LspRange = params.range;
-  // Pass the source so annotated declarations are suppressed — only *inferred*
-  // positions are hinted, never an annotation the user already wrote.
-  return deriveInlayHints(symbols, stringifyType, range, text).map((h) => ({
+  const toHint = (h: { line: number; char: number; label: string }): InlayHint => ({
     position: { line: h.line, character: h.char },
     label: h.label, // `: <type>`
     kind: InlayHintKind.Type,
     paddingLeft: true, // keep it unobtrusive: a space before `: type`
-  }));
+  });
+
+  // Kill-TS: in "wasm" mode the inferred types + decl positions come from the
+  // native checker (`inlayHintsAt`); the source-scan annotation/range filters stay
+  // host-side (`inlayHintsFromWasm`). No `parseSymbols`. An empty result on an
+  // older seed falls through to the TS walk.
+  if (checkerMode === "wasm" && wasmChecker?.inlayHintsAt !== undefined) {
+    const candidates = await wasmChecker
+      .inlayHintsAt(text, entryKeyOf(params.textDocument.uri), workspaceReader)
+      .catch((err) => {
+        connection.console.log(`[wasm-checker] inlayHintsAt failed: ${err}`);
+        return [];
+      });
+    if (candidates.length > 0) {
+      return inlayHintsFromWasm(candidates, range, text).map(toHint);
+    }
+  }
+
+  // TS path: the symbol-table walk. Pass the source so annotated declarations are
+  // suppressed — only *inferred* positions are hinted.
+  const symbols = parseSymbols(text);
+  return deriveInlayHints(symbols, stringifyType, range, text).map(toHint);
 });
 
 // Semantic tokens (D5): richer, semantically-accurate highlighting beyond the
