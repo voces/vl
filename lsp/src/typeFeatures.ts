@@ -1019,6 +1019,29 @@ export type ExtMemberCompletion = {
   isMethod: boolean;
 };
 
+/** An external builtin completion (the wasm checker's `builtinCompletions`). */
+export type ExtBuiltin = {
+  name: string;
+  kind: number; // 0=type 1=function
+  detail: string;
+};
+
+/**
+ * Builtin completions from an external source (the wasm checker's
+ * `builtinCompletions`) instead of the TS `defaultScope` — the kill-TS
+ * counterpart of {@link identifierCompletions}'s builtin half. A function-kind
+ * builtin maps to the `function` completion kind, a type-kind to `type`; the
+ * rendered `detail` is dropped to `undefined` when empty.
+ */
+export const builtinCompletionsFromWasm = (
+  builtins: ExtBuiltin[],
+): Completion[] =>
+  builtins.map((b) => ({
+    name: b.name,
+    kind: b.kind === 1 ? "function" : "type",
+    detail: b.detail.length > 0 ? b.detail : undefined,
+  }));
+
 /**
  * Member completions from an external member set (the wasm checker's
  * `memberCompletionsAt`) instead of the TS `receiverObjectType` +

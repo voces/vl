@@ -73,6 +73,7 @@ import {
   type WasmToken,
 } from "./wasmChecker.ts";
 import {
+  builtinCompletionsFromWasm,
   type Completion,
   type CompletionKind,
   deriveInlayHints,
@@ -1113,7 +1114,7 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const text = doc.getText();
-  const vlPos = toVLPosition(params.position);
+  const uri = params.textDocument.uri;
 
   // The text on the current line up to the cursor — to detect a `.` trigger and
   // find the receiver name before it.
@@ -1121,126 +1122,104 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     start: { line: params.position.line, character: 0 },
     end: params.position,
   });
-
-  // Module-aware: seed the parse with imported names' resolved types so imported
-  // names appear as completions with their real types (and resolve as receivers).
-  const importedScope = await importedScopeFor(params.textDocument.uri, text);
-  const symbols = parseSymbolsSeeded(text, importedScope);
-  // D7: build the doc-comment resolver once for all completion items in this
-  // request — identifier completions carry `///` docs that may contain xrefs.
-  // H0 phase 3: imported names link cross-file to their exporting sibling.
-  // Prefer the wasm import/export pass in `"wasm"` mode; fall back to TS.
-  const importedSources =
-    await wasmImportedSources(params.textDocument.uri, text) ??
-      await importedNameSources(
-        text,
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-      );
-  const docResolver = buildDocRefResolver(
-    symbols,
-    params.textDocument.uri,
-    importedSources,
-  );
   const charBeforeCursor = linePrefix[linePrefix.length - 1];
 
-  // Member completion: cursor follows `<receiver>.`. Only the simple `name.`
-  // receiver is resolved (see `receiverObjectType` / the D3 report); a more
-  // complex receiver yields no member suggestions rather than wrong ones.
-  // Keywords and snippets are suppressed after `.` (never valid as member names).
-  if (charBeforeCursor === ".") {
-    const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
-    if (!receiver) return [];
-
-    // Kill-TS: member completion off the self-hosted checker. The native parser
-    // isn't error-tolerant for the incomplete `receiver.`, so strip the trailing
-    // `.` (the char before the cursor) and resolve the receiver as a bare
-    // expression at its own position. Empty when the receiver has no completable
-    // members (arrays/maps — same as the TS path) or the cursor can't resolve —
-    // we then fall through to TS (no regression).
-    if (checkerMode === "wasm" && wasmChecker?.memberCompletionsAt !== undefined) {
+  // ── Kill-TS: fully self-hosted completion in "wasm" mode ───────────────────
+  // Native in-scope bindings (`scopeAt`, incl. imported names) + native builtins
+  // (`builtinCompletions`, the source the TS `defaultScope` used to provide) +
+  // native member completion — no `checkOnly`/`parseSymbols`/`importedScope`/
+  // `defaultScope`. Items carry no source `///` docs (the native scope set
+  // doesn't retain them — unchanged from the prior wasm-mode behaviour).
+  if (
+    checkerMode === "wasm" && wasmChecker !== undefined &&
+    wasmChecker.scopeAt !== undefined &&
+    wasmChecker.builtinCompletions !== undefined &&
+    wasmChecker.memberCompletionsAt !== undefined
+  ) {
+    if (charBeforeCursor === ".") {
+      const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
+      if (!receiver) return [];
+      // The native parser isn't error-tolerant for the incomplete `receiver.`,
+      // so strip the trailing `.` and resolve the receiver as a bare expression
+      // at its own position. Empty for a receiver with no completable members
+      // (arrays/maps, as the TS path) or one that can't resolve.
       const dotCol = params.position.character - 1;
       const repaired = removeCharAt(text, params.position.line, dotCol);
-      const recvCol = dotCol - receiver.length;
       const members = await wasmChecker
         .memberCompletionsAt(
           repaired,
-          entryKeyOf(params.textDocument.uri),
+          entryKeyOf(uri),
           workspaceReader,
           params.position.line,
-          recvCol,
+          dotCol - receiver.length,
         )
         .catch((err) => {
           connection.console.log(`[wasm-checker] memberCompletionsAt failed: ${err}`);
           return [];
         });
-      if (members.length > 0) {
-        return memberCompletionsFromWasm(members).map((c) =>
-          toCompletionItem(c, docResolver)
-        );
-      }
+      return memberCompletionsFromWasm(members).map((c) => toCompletionItem(c));
     }
 
+    // Identifier completion: native in-scope user bindings + native builtins +
+    // keywords/snippets. A user binding shadows a same-named builtin (added last).
+    const bindings = await wasmChecker
+      .scopeAt(
+        text,
+        entryKeyOf(uri),
+        workspaceReader,
+        params.position.line,
+        params.position.character,
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-checker] scopeAt failed: ${err}`);
+        return [];
+      });
+    const byName = new Map<string, Completion>();
+    for (const c of builtinCompletionsFromWasm(wasmChecker.builtinCompletions())) {
+      byName.set(c.name, c);
+    }
+    for (const c of scopeCompletionsFromBindings(bindings)) byName.set(c.name, c);
+    const identifiers = [...byName.values()].map((c) => toCompletionItem(c));
+    const keywords = keywordCompletions(false).map((c) => toCompletionItem(c));
+    const snippets = snippetCompletions(false).map((c) => toCompletionItem(c));
+    return [...identifiers, ...keywords, ...snippets];
+  }
+
+  // ── TS path (`"ts"`/`"both"`, or a seed without the completion exports) ─────
+  const vlPos = toVLPosition(params.position);
+  // Module-aware: seed the parse with imported names' resolved types so imported
+  // names appear as completions with their real types (and resolve as receivers).
+  const importedScope = await importedScopeFor(uri, text);
+  const symbols = parseSymbolsSeeded(text, importedScope);
+  // D7: build the doc-comment resolver once for all completion items in this
+  // request — identifier completions carry `///` docs that may contain xrefs.
+  const importedSources =
+    await wasmImportedSources(uri, text) ??
+      await importedNameSources(text, entryKeyOf(uri), workspaceReader);
+  const docResolver = buildDocRefResolver(symbols, uri, importedSources);
+
+  // Member completion: cursor follows `<receiver>.`. Only the simple `name.`
+  // receiver is resolved; a more complex receiver yields no suggestions.
+  if (charBeforeCursor === ".") {
+    const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
+    if (!receiver) return [];
     const { ast } = checkOnly(text);
     if (!ast) return [];
     // Fold imported names in so an imported object can be a member receiver.
     const scope = { ...ast.scope, ...importedScope };
     const objectType = receiverObjectType(receiver, symbols, vlPos, scope);
     if (!objectType) return [];
-    // Member completions don't carry source `///` docs (no source binding), so
-    // passing the resolver is a no-op but keeps the call shape consistent.
     return memberCompletions(objectType, stringifyType).map((c) =>
       toCompletionItem(c, docResolver)
     );
   }
 
-  // Identifier completion: in-scope names + builtins. `ast.scope` carries the
-  // builtins (from `defaultScope`) plus top-level names; user bindings from the
-  // symbol table override same-named builtins inside `identifierCompletions`.
-  // Keyword and snippet completions are appended for statement-position typing.
+  // Identifier completion: in-scope names + builtins (`ast.scope` carries the
+  // builtins from `defaultScope` plus top-level names) + keywords/snippets.
   const { ast } = checkOnly(text);
-  // Fold imported names into the completion scope so they're suggested with
-  // their real types alongside builtins + top-level names.
   const builtins = { ...(ast?.scope ?? {}), ...importedScope };
-  // Identifier source: in `"wasm"` mode (and when the seed exports the scope
-  // pass), the in-scope USER bindings come from the native checker; builtins/
-  // imports/types still come from `builtins` (the native set excludes them). The
-  // native bindings override same-named builtin entries (a user binding shadows a
-  // builtin), matching `identifierCompletions`'s own builtin-then-user merge. An
-  // empty native result (an older seed) falls back to the TS path unchanged.
-  let identifiers: CompletionItem[];
-  const nativeBindings =
-    checkerMode === "wasm" && wasmChecker?.scopeAt !== undefined
-      ? await wasmChecker
-        .scopeAt(
-          text,
-          entryKeyOf(params.textDocument.uri),
-          workspaceReader,
-          params.position.line,
-          params.position.character,
-        )
-        .catch((err) => {
-          connection.console.log(`[wasm-checker] scopeAt failed: ${err}`);
-          return [];
-        })
-      : [];
-  if (nativeBindings.length > 0) {
-    const byName = new Map<string, Completion>();
-    // The builtins/imports/types half only — a name present in `builtins`. The
-    // TS user-binding half (a name NOT in `builtins`) is dropped: the native
-    // scope set owns those. Native bindings then override same-named entries so a
-    // local/param/function shadows a builtin in the list.
-    for (const c of identifierCompletions(symbols, vlPos, builtins, stringifyType)) {
-      if (builtins[c.name] !== undefined) byName.set(c.name, c);
-    }
-    for (const c of scopeCompletionsFromBindings(nativeBindings)) {
-      byName.set(c.name, c);
-    }
-    identifiers = [...byName.values()].map((c) => toCompletionItem(c, docResolver));
-  } else {
-    identifiers = identifierCompletions(symbols, vlPos, builtins, stringifyType)
-      .map((c) => toCompletionItem(c, docResolver));
-  }
+  const identifiers = identifierCompletions(symbols, vlPos, builtins, stringifyType)
+    .map((c) => toCompletionItem(c, docResolver));
   const keywords = keywordCompletions(false).map((c) => toCompletionItem(c));
   const snippets = snippetCompletions(false).map((c) => toCompletionItem(c));
   return [...identifiers, ...keywords, ...snippets];

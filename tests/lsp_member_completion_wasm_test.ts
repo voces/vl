@@ -9,7 +9,10 @@
 //   deno test -A --no-check tests/lsp_member_completion_wasm_test.ts
 
 import { loadWasmChecker } from "../lsp/src/wasmChecker.ts";
-import { memberCompletionsFromWasm } from "../lsp/src/typeFeatures.ts";
+import {
+  builtinCompletionsFromWasm,
+  memberCompletionsFromWasm,
+} from "../lsp/src/typeFeatures.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
@@ -116,6 +119,41 @@ Deno.test({
 });
 
 // ---- the pure host conversion (no seed needed) ------------------------------
+
+// ---- kill-TS: native builtin completions (the TS `defaultScope` source) -------
+
+Deno.test({
+  name: "wasm-builtins: the compiler's builtin surface (types + functions)",
+  ignore,
+}, () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const builtins = checker.builtinCompletions();
+  const byName = new Map(builtins.map((b) => [b.name, b]));
+  // The numeric/string TYPE names and the builtin FUNCTIONS the host folds into
+  // identifier completion — the set the TS `defaultScope` used to provide.
+  for (const t of ["i32", "i64", "f32", "f64", "boolean", "string"]) {
+    if (byName.get(t)?.kind !== 0) {
+      throw new Error(`expected \`${t}\` as a type builtin, got ${JSON.stringify(byName.get(t))}`);
+    }
+  }
+  for (const f of ["print", "toString", "fromCodePoint", "fromCodePoints", "Map", "Set"]) {
+    if (byName.get(f)?.kind !== 1) {
+      throw new Error(`expected \`${f}\` as a function builtin, got ${JSON.stringify(byName.get(f))}`);
+    }
+  }
+  assertEquals(byName.get("print")?.detail, "(any) -> null", "print signature");
+});
+
+Deno.test("builtinCompletionsFromWasm: maps 0/1 kinds to type/function", () => {
+  const out = builtinCompletionsFromWasm([
+    { name: "i32", kind: 0, detail: "i32" },
+    { name: "print", kind: 1, detail: "(any) -> null" },
+    { name: "bare", kind: 0, detail: "" },
+  ]);
+  assertEquals(out[0], { name: "i32", kind: "type", detail: "i32" });
+  assertEquals(out[1], { name: "print", kind: "function", detail: "(any) -> null" });
+  assertEquals(out[2], { name: "bare", kind: "type", detail: undefined });
+});
 
 Deno.test("memberCompletionsFromWasm: maps method/field kinds and drops empty detail", () => {
   const out = memberCompletionsFromWasm([

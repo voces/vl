@@ -127,6 +127,19 @@ export type WasmMemberCompletion = {
 };
 
 /**
+ * One builtin completion from the wasm builtin pass (kill-TS) — a numeric/string
+ * TYPE name or a builtin FUNCTION (`print`/`Map`/`Set`/…), the native source for
+ * the builtin half the host used to fold in from the TS `defaultScope`. `kind` is
+ * 0=type / 1=function; `detail` its rendered type. The set is fixed (the
+ * compiler's builtin surface), so the host reads it once and reuses it.
+ */
+export type WasmBuiltin = {
+  name: string;
+  kind: number; // 0=type 1=function
+  detail: string;
+};
+
+/**
  * One resolved cross-file imported source, from the wasm import/export pass — the
  * native counterpart of the host's `importedNameSources`. Keyed (in the returned
  * record) by the LOCAL binding name; `key` is the exporting sibling module's
@@ -269,6 +282,13 @@ export type WasmChecker = {
    * keeps its TS lexical pass.
    */
   lexicalTokensAt: (source: string) => WasmLexicalToken[];
+  /**
+   * Builtin completions (kill-TS): the compiler's builtin surface — numeric/string
+   * type names + builtin functions — the host folds into identifier completion,
+   * replacing the TS `defaultScope`. A fixed set (no source / `prepare`); empty
+   * when the seed predates the export, so the host then keeps its TS builtins.
+   */
+  builtinCompletions: () => WasmBuiltin[];
   /**
    * Scope-at-position completions (kill-TS): every user binding
    * (variable/parameter/function) visible at (`line`, `character`) — both
@@ -1080,6 +1100,29 @@ export const loadWasmChecker = (
     return out;
   };
 
+  // The builtin-completion export rides the same seed as the Stage-2+ exports; an
+  // older seed lacks it, so this yields [] and the host keeps its TS builtins.
+  // Static (no source / `prepare`) — the builtin surface is fixed.
+  const builtinCompletions = (): WasmBuiltin[] => {
+    const exp = instantiate();
+    if (exp === undefined || typeof exp.builtinScan !== "function") return [];
+    const n = exp.builtinScan();
+    const out: WasmBuiltin[] = [];
+    for (let i = 0; i < n; i++) {
+      const name = readString(
+        exp.builtinNameLen(i),
+        (j) => exp.builtinNameCharAt(i, j),
+      );
+      if (name.length === 0) continue;
+      const detailLen = exp.builtinTypeLen(i);
+      const detail = detailLen <= 0
+        ? ""
+        : readString(detailLen, (j) => exp.builtinTypeCharAt(i, j));
+      out.push({ name, kind: exp.builtinKindAt(i), detail });
+    }
+    return out;
+  };
+
   return {
     check,
     definitionAt,
@@ -1090,6 +1133,7 @@ export const loadWasmChecker = (
     tokensAt,
     memberTokensAt,
     lexicalTokensAt,
+    builtinCompletions,
     scopeAt,
     memberCompletionsAt,
     importedNameSources,
