@@ -744,8 +744,16 @@ export const createWasmChecker = (
     await prepare(exp, source, entryKey, read);
     exp.checkSrcSym();
     const count = exp.tokCount();
+    // In a multi-module compile the occurrence table spans EVERY committed module,
+    // each carrying its own module-local line/col. Keep only the entry module's
+    // (table index 0) occurrences — a dependency's tokens would otherwise render at
+    // their own line/col against THIS document, corrupting an importer's
+    // highlighting (`./mathx`'s decls bleeding onto the `import` line). Single-file
+    // mode has no module table, so `symOccModuleAt` returns 0 for all (no filter).
+    const byModule = hasModuleTags(exp);
     const out: WasmToken[] = [];
     for (let i = 0; i < count; i++) {
+      if (byModule && exp.symOccModuleAt(i) !== 0) continue;
       const bindKind = exp.tokBindKindAt(i);
       // Only identifiers with a known binding kind are coloured by this slice;
       // a -1 (not a tracked binding) is skipped (the host's lexical pass owns it).

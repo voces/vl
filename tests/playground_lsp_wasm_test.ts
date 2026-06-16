@@ -104,6 +104,29 @@ Deno.test({ name: "playground-lsp: cross-file hover resolves imported names + de
   }
 });
 
+Deno.test({ name: "playground-lsp: go-to-definition jumps cross-file to an imported name's source", ignore }, async () => {
+  // The regression: definitionAt returns the imported name's canonical decl span
+  // (in the DEPENDENCY) with no module, so the host landed on the current file's
+  // import line. The cross-file `importedNameSources` jump must win for imports.
+  const main = `import { add, square } from "./mathx"\nlet r = add(square(3), 4)\nprint(r)\n`;
+  const mathx =
+    `export function add(a: i32, b: i32): i32 {\n  return a + b\n}\nexport function square(n: i32): i32 {\n  return n * n\n}\n`;
+  lsp.setWorkspace(() => ({ "main.vl": main, "mathx.vl": mathx }));
+  try {
+    initFromSeed();
+    // `add` use on line 1, col 8 → mathx.vl, the `add` decl (line 0, col 16).
+    const addDef = await lsp.definition(main, { line: 1, character: 8 }, "main.vl");
+    assertEquals(addDef?.file, "mathx.vl", "cross-file target");
+    assertEquals(addDef?.start, { line: 0, character: 16 }, "add decl position in mathx");
+    // A local use stays in-file (no `file`): `r` use on line 2 → its decl line 1.
+    const rDef = await lsp.definition(main, { line: 2, character: 6 }, "main.vl");
+    if (rDef?.file !== undefined) throw new Error(`local def should not be cross-file: ${JSON.stringify(rDef)}`);
+    assertEquals(rDef?.start, { line: 1, character: 4 }, "r decl position");
+  } finally {
+    lsp.setWorkspace(() => ({}));
+  }
+});
+
 Deno.test({ name: "playground-lsp: hover resolves a binding type off the seed", ignore }, async () => {
   initFromSeed();
   const result = await lsp.hover("let x = 41\nprint(x + 1)\n", { line: 0, character: 4 });

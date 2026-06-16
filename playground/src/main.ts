@@ -318,8 +318,11 @@ monaco.languages.registerDefinitionProvider(VL_LANGUAGE_ID, {
       character: position.column - 1,
     }, entryKeyOf(model));
     if (!def) return null;
+    // A cross-file jump (`def.file`) targets a sibling module's model; a same-file
+    // jump stays in the current model.
+    const targetUri = def.file ? modelUri(def.file) : model.uri;
     return {
-      uri: model.uri,
+      uri: targetUri,
       range: new monaco.Range(
         def.start.line + 1,
         def.start.character + 1,
