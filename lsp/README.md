@@ -23,9 +23,10 @@ self-hosted compiler wasm seed — selectable with the `vital.checker` setting
   **devDependencies of the *root* [`package.json`](../package.json)**, not of
   this folder. esbuild resolves them from the root `node_modules/`, so the root
   install must run before the build.
-- `.vl` program execution (the **Run Current File** command) shells out to
-  `deno task run` in the compiler project root; that path is optional and only
-  used by the run command, not by diagnostics.
+- `.vl` program execution (the **Run Current File** command) shells out to the
+  native `vl` binary (`vl run`), resolved from the `vital.compilerPath` setting
+  (relative paths are against the project root) or `vl` on the PATH; that path is
+  optional and only used by the run command, not by diagnostics.
 
 ## Build & install (run from the repo root)
 
