@@ -149,6 +149,42 @@ passes `--color=auto|always|never` resolution into argv (it knows `isatty` +
 `NO_COLOR`), and the VL formatter honors the resolved flag — keeping the
 TTY-detection (mechanism) in the host and the ANSI rendering (policy) in VL.
 
+## defaultScope, std, and sync
+
+Three layers, kept distinct:
+
+- **The `cli*` protocol exports are compiler/driver-only — NOT `defaultScope`.**
+  They are the host-pump ABI (the yield queue); no VL program calls `cliNext()`.
+  `defaultScope` (the always-in-scope builtins — `print`, `Map`, …) is untouched.
+  I/O is rightly *not* a global builtin anyway — like most languages, the fs/os
+  surface should be an explicit `std:` import, not ambient.
+
+- **The pure policy helpers are ordinary VL and CAN graduate to `std:` now**,
+  independent of any host capability: the glob matcher, the diagnostic renderer,
+  path utilities. They do no I/O, need no imports, and run anywhere — so they can
+  move to std libraries whenever useful, and `cli.vl` would import them from there.
+
+- **The I/O itself (`listDir`/`readFile`/`writeFile`/argv/stdout) becomes a std
+  surface (`std:fs` / `std:os` / `std:io`) at the WASI transition, not before** —
+  and this is the load-bearing constraint. A std `fs.readFile(path): string` that
+  returns synchronously requires a host-function IMPORT the wasm calls (WASI's
+  `path_open` + `fd_read`). But the seed is instantiated with an EMPTY linker by
+  every consumer today — the playground (`new WebAssembly.Instance(m, {})`), the
+  Node/LSP checker, `cases_wasm`, and the Rust host all provide no imports. A wasm
+  module's declared imports are mandatory at instantiation, so adding I/O imports
+  to the seed would break all of them. The command-queue (exports only — nothing
+  to provide) is exactly what keeps one seed runnable by every host. So I/O stays
+  the compiler-internal yield protocol until the host is a WASI runtime supplying
+  `fd_*`; then `std:fs`/`std:os` wrap those imports as sync functions, `cli.vl`
+  consumes std like any program, and the command-queue's commands map 1:1 onto the
+  WASI calls (`CMD_LIST_DIR` ≈ `fd_readdir`, …) — the VL policy is unchanged.
+
+**Sync: yes — everything is synchronous; VL has no async/await.** Under the
+command-queue the CLI is a *state machine* (it returns the next command and is
+resumed with the result): sync semantics, structured as a yield loop rather than
+straight-line `readFile()` calls. Under WASI the same operations become
+straight-line sync imports. No async is introduced either way.
+
 ## `run` and `build`
 
 - **`run`**: VL parses args + reads the source (`CMD_READ_FILE`) / takes `-e`/stdin
