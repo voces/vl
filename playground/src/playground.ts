@@ -1,27 +1,27 @@
-// Browser entry point for the VL playground.
+// The playground's Run path (DOM-free): compile -> collect diagnostics -> (when
+// clean) instantiate + capture `log` output -> (optionally) emit WAT.
 //
-// This is the ONLY module bundled for the browser (see build.ts). It imports the
-// headless compiler core read-only and exposes a single `runProgram` helper that
-// mirrors the CLI's run flow (compiler/cli.ts): compile -> collect diagnostics ->
-// (when clean) instantiate + capture `log` output -> (optionally) emit WAT.
+// CODEGEN runs on the self-hosted compiler seed (the SAME `build/vl-compiler.wasm`
+// the editor features and `vl build` run): the injected `WasmChecker.compile`
+// turns source into wasm bytes via the driver's `compileSrc`. Execution is the
+// pure `runWasm` (a `WebAssembly.instantiate` with the VL host-import ABI — no
+// binaryen, no compiler front end). The TS compiler front end is no longer on the
+// Run path.
 //
-// The key integration risk is binaryen-in-the-browser. binaryen@130 is an
-// Emscripten single-file ESM build with the wasm inlined and a *top-level await*
-// that instantiates it; importing the module therefore resolves only once the
-// wasm is ready (ROADMAP F8 relies on the same property for the ESM LSP server).
-// `compile` reaches binaryen via a dynamic `import("./toWasm.ts")`, so esbuild
-// bundles it into this module and the TLA runs at module-eval time in the page.
+// binaryen is now used ONLY to render the WAT text (`wasmToWat`), reached via a
+// dynamic `import("./toWasm.ts")` so it loads lazily when the WAT pane is shown,
+// not at module-eval time. `checkProgram` (the codegen-free TS front end) still
+// backs the multi-file `checkProject` import-resolution diagnostics — pending its
+// own move to the seed.
 
-import {
-  checkProgram,
-  compile,
-  compileProgram,
-  runWasm,
-  type VLDiagnostic,
-  wasmToWat,
-} from "../../compiler/compile.ts";
+import { checkProgram, runWasm, type VLDiagnostic, wasmToWat } from "../../compiler/compile.ts";
+import type { WasmChecker } from "../../lsp/src/wasmChecker.ts";
 
 export type { VLDiagnostic };
+
+// The playground is single-file by default; multi-file Run threads a reader over
+// the project's in-memory file map. The entry module's key is its filename.
+const NO_SIBLINGS = () => undefined;
 
 export type PlaygroundResult = {
   diagnostics: VLDiagnostic[];
@@ -44,32 +44,34 @@ export type PlaygroundResult = {
  */
 export const runProgram = async (
   source: string,
+  checker: WasmChecker,
   opts: { wat?: boolean } = {},
 ): Promise<PlaygroundResult> => {
-  const { diagnostics, wasm } = await compile(source);
-  return finishRun(diagnostics, wasm, opts);
+  const { diagnostics, bytes } = await checker.compile(source, "main.vl", NO_SIBLINGS);
+  return finishRun(diagnostics, bytes, opts);
 };
 
 /**
  * Multi-file (whole-program) variant of {@link runProgram}. `files` is the
  * project: filename → source. `entry` is the entry module (the first file,
- * `main.vl`), from which the import graph is resolved. The whole graph is
- * compiled to ONE wasm module via `compileProgram` (compiler/compile.ts),
- * matching VL's model: `N files → 1 module`. A single-file project is just this
- * with a one-entry graph — but `runProgram` stays the path for the no-import
- * case so existing callers/tests are untouched.
+ * `main.vl`), from which the import graph is resolved. `checker.compile` threads
+ * the `read` over the file map (the seed's module pipeline resolves the graph to
+ * ONE wasm module), matching VL's model: `N files → 1 module`. A single-file
+ * project is just this with a one-entry graph — but `runProgram` stays the path
+ * for the no-import case so existing callers/tests are untouched.
  */
 export const runProject = async (
   files: Record<string, string>,
   entry: string,
+  checker: WasmChecker,
   opts: { wat?: boolean } = {},
 ): Promise<PlaygroundResult> => {
-  const { diagnostics, wasm } = await compileProgram(
+  const { diagnostics, bytes } = await checker.compile(
+    files[entry] ?? "",
     entry,
     (key) => files[key],
-    entry,
   );
-  return finishRun(diagnostics, wasm, opts);
+  return finishRun(diagnostics, bytes, opts);
 };
 
 /**

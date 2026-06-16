@@ -6,18 +6,23 @@ semantic-token syntax colouring, hover, inlay hints, go-to-definition), click
 **Run**, and see captured `log`/`print` output and (optionally) the `.wat` text —
 all in the browser, with no server-side compile and no language-server process.
 
-The whole compiler **and language server** run in the page. The LSP features run
-on the **self-hosted compiler seed** (`build/vl-compiler.wasm`, the same one the
-Node LSP and `vl check` run): `src/wasmCheckerBrowser.ts` fetches the seed (copied
-next to the bundle by `build.ts`) and drives it through the environment-agnostic
+The whole compiler **and language server** run in the page, on the **self-hosted
+compiler seed** (`build/vl-compiler.wasm`, the same one the Node LSP and `vl
+check`/`vl build` run): `src/wasmCheckerBrowser.ts` fetches the seed (copied next
+to the bundle by `build.ts`) and drives it through the environment-agnostic
 `createWasmChecker` core (`lsp/src/wasmChecker.ts`), exactly as the Node LSP does.
-The **Run** path still uses the TS compiler + binaryen (an Emscripten single-file
-wasm build) — the same `compile` / `runWasm` pipeline the CLI uses
-(`compiler/compile.ts`) — bundled to one ESM module and executed client-side.
-`src/lspAdapter.ts` is the bridge: it drives the wasm checker + the LSP-neutral
-assembly helpers (`lsp/src/typeFeatures.ts`'s `*FromWasm` family) and `src/main.ts`
-maps its results onto Monaco's provider APIs. It never imports the Node-bound
-`lsp/src/server.ts`.
+The **Run** path compiles VL → wasm on the seed too (`createWasmChecker.compile`
+→ the driver's `compileSrc`) and executes the bytes with the pure `runWasm`
+(a `WebAssembly.instantiate` over the VL host-import ABI — `compiler/compile.ts`,
+no front end). `src/lspAdapter.ts` is the editor-feature bridge: it drives the
+checker + the LSP-neutral assembly helpers (`lsp/src/typeFeatures.ts`'s `*FromWasm`
+family) and `src/main.ts` maps its results onto Monaco's provider APIs. It never
+imports the Node-bound `lsp/src/server.ts`.
+
+Two TS-compiler bits remain (their migration to the seed is the last step):
+**diagnostics** still use the codegen-free TS `checkOnly`, and the **WAT** pane is
+rendered by **binaryen** (`wasmToWat`, lazily loaded) disassembling the seed's
+emitted bytes — binaryen no longer compiles VL.
 
 ## Editor / LSP features (client-side)
 
@@ -87,17 +92,18 @@ Two small esbuild plugins handle the binaryen integration:
   Marking `node:*` external keeps it a runtime dynamic `import()` the dead branch
   never reaches.
 
-### binaryen in the browser (the key risk) — it works
+### binaryen in the browser (WAT only) — it works
 
 binaryen@130 is an ESM module that self-initializes its inlined wasm with a
 **top-level await**: importing it resolves only once the wasm is instantiated.
-That is exactly the property ROADMAP F8 relies on for the ESM LSP server, and it
-lets binaryen run in the page unmodified — no patch, no out-of-band `.wasm`
-asset. `format: esm` is required (TLA is illegal in CJS/IIFE output).
+`format: esm` is required (TLA is illegal in CJS/IIFE output). It is now reached
+ONLY via the lazy `import("./toWasm.ts")` behind `wasmToWat`, so it loads when the
+WAT pane is first shown — not on page load, and never on the Run path (which
+compiles + executes on the seed). Retiring it (the WAT pane's last dependency on
+the TS compiler tree) is the remaining playground migration step.
 
-If binaryen ever fails to instantiate in a given browser, the UI shows a clear
-"Compiler failed to load (binaryen could not instantiate…)" status instead of a
-silent hang.
+If the **seed** fails to load, the UI shows a clear "Compiler failed to load…"
+status instead of a silent hang, and the editor features + Run stay disabled.
 
 ## Verifying
 
@@ -106,26 +112,28 @@ works. It re-bundles the DOM-free modules (`src/playground.ts` and the pure
 `src/lspAdapter.ts`) with the identical esbuild settings, imports the artifacts,
 and asserts:
 
-- a clean program compiles, runs, and produces the expected `log` output;
-- WAT is emitted on request;
+- a clean program compiles (seed codegen), runs (the pure `runWasm` host ABI),
+  and produces the expected `log` output;
+- WAT is emitted on request (binaryen disassembling the seed's bytes);
 - a broken program yields an error diagnostic with a source position;
 - the LSP adapter produces: the B17 unused-var lint (tagged `unnecessary`), a
-  well-formed semantic-token stream, a correct hover (`x: i32`), inlay hints, and
-  go-to-definition;
+  well-formed semantic-token stream, a correct hover (`x: i32`), inlay hints,
+  go-to-definition, completion, and format;
 - the **full** page bundle (`src/main.ts` + Monaco) builds — emitting both the JS
   and the sibling CSS — with every LSP provider wired (the headline Monaco
   integration risk). Monaco needs the DOM so it's built, not evaluated, here.
 
-Note: under Deno the bundle is imported from a temp file (not a `data:` URL)
-because binaryen's glue detects `globalThis.process` and takes its Node branch;
-in a real browser `process` is undefined and that branch is skipped. Either way
-the same bundled binaryen + compiler codegen is what runs.
+The Run-path and LSP checks drive the on-disk seed (the headless analogue of the
+page's fetch); they self-skip if it isn't built. Note: under Deno the bundle is
+imported from a temp file (not a `data:` URL) because binaryen's glue (lazily
+loaded for WAT) detects `globalThis.process` and takes its Node branch; in a real
+browser `process` is undefined and that branch is skipped.
 
 ### Manual in-browser check
 
 1. `deno task playground` and open the URL.
-2. The status line shows "Loading compiler…" then "Ready." (binaryen
-   instantiated client-side); the Monaco editor renders with the print sample.
+2. The status line shows "Loading compiler…" then "Ready." (the self-hosted seed
+   fetched + instantiated); the Monaco editor renders with the print sample.
 3. You should see **syntax colours** (keywords, strings, numbers, and
    semantically-distinct variable/function/type/member colours from the semantic
    tokens) and faint **inlay hints** (`: i32`) after unannotated declarations.
@@ -146,7 +154,7 @@ playground/
   src/
     main.ts         Monaco + LSP-provider wiring to the DOM (the bundle entry)
     lspAdapter.ts   pure browser "language server": wraps the pure LSP helpers
-    playground.ts   DOM-free wrapper over compiler/compile.ts (compile -> run -> WAT)
+    playground.ts   DOM-free Run path: seed compile (compileSrc) -> runWasm -> WAT
     samples.ts      seed programs (from tests/cases/**)
   build.ts          esbuild bundler (-> dist/playground.js + dist/playground.css)
   serve.ts          tiny static file server

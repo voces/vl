@@ -7,8 +7,9 @@
 // seed (`build/vl-compiler.wasm`) — absent (fresh clone, no `refresh-compiler.sh`
 // yet) they self-ignore, the same convention as the other wasm suites.
 
-import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
+import { createWasmChecker, type Exports, type WasmChecker } from "../lsp/src/wasmChecker.ts";
 import * as lsp from "../playground/src/lspAdapter.ts";
+import { runProgram } from "../playground/src/playground.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
@@ -38,6 +39,44 @@ const initFromSeed = (): void => {
   );
   lsp.initLsp(createWasmChecker(() => instance.exports as unknown as Exports));
 };
+
+// A bare seed-backed checker (no LSP wiring) — for the Run-path tests, which call
+// `checker.compile` / `runProgram(…, checker)` directly.
+const seedChecker = (): WasmChecker => {
+  const bytes = Deno.readFileSync(SEED);
+  const instance = new WebAssembly.Instance(
+    new WebAssembly.Module(bytes as BufferSource),
+    {},
+  );
+  return createWasmChecker(() => instance.exports as unknown as Exports);
+};
+
+const noSiblings = () => undefined;
+
+Deno.test({ name: "playground-run: compile emits wasm bytes for a clean program", ignore }, async () => {
+  const { bytes, diagnostics } = await seedChecker().compile("print(1 + 2)\n", "main.vl", noSiblings);
+  if (diagnostics.length !== 0) {
+    throw new Error(`expected no diagnostics, got: ${diagnostics.map((d) => d.message).join("; ")}`);
+  }
+  if (bytes === undefined || bytes.length === 0) throw new Error("expected non-empty wasm bytes");
+  // A real wasm module starts with the `\0asm` magic.
+  assertEquals([...bytes.slice(0, 4)], [0x00, 0x61, 0x73, 0x6d], "wasm magic");
+});
+
+Deno.test({ name: "playground-run: compile yields no bytes + a diagnostic on a type error", ignore }, async () => {
+  const { bytes, diagnostics } = await seedChecker().compile('const x: i32 = "no"\n', "main.vl", noSiblings);
+  if (bytes !== undefined) throw new Error("expected no bytes for a type error");
+  if (diagnostics.length === 0) throw new Error("expected a diagnostic");
+});
+
+Deno.test({ name: "playground-run: runProgram compiles + runs + captures print output", ignore }, async () => {
+  const result = await runProgram("print(42)\nlet s = 0\nwhile s < 10 { s = s + 1 }\nprint(s)\n", seedChecker());
+  if (result.diagnostics.some((d) => d.severity === "error")) {
+    throw new Error(`unexpected errors: ${JSON.stringify(result.diagnostics)}`);
+  }
+  if (!result.compiled) throw new Error("expected a compiled module");
+  assertEquals(result.logs, ["42", "10"], "captured print output");
+});
 
 Deno.test({ name: "playground-lsp: hover resolves a binding type off the seed", ignore }, async () => {
   initFromSeed();
