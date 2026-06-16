@@ -24,8 +24,11 @@ file; the lexer/parser are the grammar.
   - `deno check compiler/*.ts tests/run.ts` — type-check the core + test runner.
   - `deno lint` — lint (excludes `reference/`).
   - `deno task test` — the `.vl` corpus (the behavior oracle).
-- **Run / build / check a file:** `deno task run <file.vl>` · `deno task build <file> [-o out.wasm] [--wat]`
-  · `deno task check <file>`. Also `deno task run -e "<snippet>"` or pipe stdin.
+- **Run / build / check / fmt a file:** the native `vl` binary (`scripts/vl-host`, built with
+  `cd scripts/vl-host && cargo build --release`): `vl run <file.vl>` · `vl build <file> [-o out.wasm]`
+  · `vl check <file>` · `vl fmt <file> [-w|--check]`. Richer conveniences not yet ported to `vl`
+  (`run -e "<snippet>"` / stdin, `build --wat`, `check` over a dir / `--fix` / `--severity`) still run via
+  `deno run -A compiler/cli.ts …` until that surface lands in `vl`.
 - **After ANY compiler change, rebuild the LSP bundle:** `cd lsp && deno task build` (the compiler core
   is bundled into the LSP; `lsp/dist` is gitignored). CI also builds it.
 

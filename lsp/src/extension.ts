@@ -2,6 +2,7 @@ import * as path from "path";
 import * as os from "node:os";
 import { writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import {
   commands as Commands,
   ExtensionContext,
@@ -102,12 +103,14 @@ const findProjectRoot = (startDir: string): string | undefined => {
   }
 };
 
-// Runs the active `.vl` file in an integrated terminal via the compiler's
-// `deno task run` CLI (compile + run, streaming diagnostics and program output).
-// The terminal is reused across runs. `cwd` is the compiler project root, found
-// by walking up from the file (or its workspace folder) to the nearest
-// `deno.json` — robust to how the extension itself is installed (symlinked dev
-// install, dev host, or packaged), which `context.extensionPath` is not.
+// Runs the active `.vl` file in an integrated terminal via the native `vl`
+// binary (`vl run` — compile + run, streaming diagnostics and program output).
+// The binary is `vital.compilerPath` (relative paths resolve against the project
+// root) or `vl` on the PATH. The terminal is reused across runs. `cwd` is the
+// compiler project root, found by walking up from the file (or its workspace
+// folder) to the nearest `deno.json` — robust to how the extension itself is
+// installed (symlinked dev install, dev host, or packaged), which
+// `context.extensionPath` is not.
 const registerRunCommand = (context: ExtensionContext) => {
   let terminal: Terminal | undefined;
   // Track the cwd the terminal was opened in: the terminal's working directory
@@ -159,12 +162,41 @@ const registerRunCommand = (context: ExtensionContext) => {
     } else {
       file = doc.uri.fsPath;
     }
+    // Resolve the `vl` binary: an explicit `vital.compilerPath` (relative to the
+    // project root if not absolute), else `vl` on the PATH.
+    const config = Workspace.getConfiguration("vital", doc.uri);
+    const configuredBin = config.get<string>("compilerPath", "").trim();
+    const vlBin = configuredBin
+      ? (path.isAbsolute(configuredBin) ? configuredBin : path.join(cwd, configuredBin))
+      : "vl";
+    // Probe the binary BEFORE opening a terminal: a missing (`ENOENT`) or
+    // wrong-platform (`exec format error`) binary fails to spawn. Surface a clear,
+    // actionable error instead of leaking a cryptic shell error into the terminal.
+    // `vl` with no args prints usage and exits non-zero, but it EXECUTES — `error`
+    // is set only when the OS can't run it at all (so a non-zero status is fine).
+    const probe = spawnSync(vlBin, [], { stdio: "ignore" });
+    if (probe.error) {
+      const where = configuredBin
+        ? `the \`vl\` binary at ${vlBin}`
+        : "`vl` on your PATH";
+      Window.showErrorMessage(
+        `Vital: can't run ${where} (${probe.error.message}). Build it for this ` +
+          "platform with `cd scripts/vl-host && cargo build --release`, then set " +
+          "`vital.compilerPath` to it (or put `vl` on your PATH).",
+      );
+      return;
+    }
+    // Thread the configured seed through to `vl run` when set; otherwise `vl`
+    // defaults to <cwd>/build/vl-compiler.wasm (the project root).
+    const compilerWasm = config.get<string>("compilerWasm", "").trim();
+    const compilerArg = compilerWasm ? ` --compiler "${compilerWasm}"` : "";
+    const binToken = configuredBin ? `"${vlBin}"` : "vl";
     if (!terminal) {
       terminal = Window.createTerminal({ name: "Vital", cwd });
       terminalCwd = cwd;
     }
     terminal.show(true);
-    terminal.sendText(`deno task run "${file}"`);
+    terminal.sendText(`${binToken} run "${file}"${compilerArg}`);
   };
 
   context.subscriptions.push(Commands.registerCommand("vital.runFile", run));

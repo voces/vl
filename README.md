@@ -43,7 +43,7 @@ vl run hello.vl
 ## The `vl` tool
 
 ```
-usage: vl <build|check|run> <file.vl> [-o out.wasm] [--compiler vl-compiler.wasm]
+usage: vl <build|check|run|fmt> <file.vl> [-o out.wasm] [-w|--check] [--compiler vl-compiler.wasm]
 ```
 
 The compiler seed is resolved in order:
@@ -54,10 +54,12 @@ The compiler seed is resolved in order:
 | `vl run <file.vl>` | Compile and run; program output goes to stdout. |
 | `vl build <file.vl>` | Compile to WebAssembly (`-o <out.wasm>`). |
 | `vl check <file.vl>` | Type-check + report diagnostics only; non-zero exit on error (CI gate). |
+| `vl fmt <path>` | Format (AST-driven, via `format.vl`): stdout, `-w` write in place, `--check` CI gate, dirs recurse. |
 
-`fmt` and `test` subcommands are planned (the runner brains live in VL — see
-[`docs/test-runner-design.md`](./docs/test-runner-design.md)); until they land, use the
-deno tasks below.
+The brains live in VL (the seed); `vl` is a thin host. A `test` subcommand is planned (see
+[`docs/test-runner-design.md`](./docs/test-runner-design.md)). Some richer `cli.ts` conveniences
+aren't ported to `vl` yet (`run -e`/stdin, `build --wat`, `check` over a dir / `--fix` / `--severity`) —
+run those via `deno run -A compiler/cli.ts …` for now.
 
 ## Self-hosting & bootstrap
 
@@ -85,8 +87,6 @@ deno task install               # = npm ci
 | Task | What it does |
 |---|---|
 | `deno task test` | Run the suite (`tests/` — the `.vl` corpus + unit tests). |
-| `deno task fmt` | AST-driven formatter (stdout / `-w` write / `--check` gate). |
-| `deno task check` | Diagnostics-only over a path. |
 | `deno task playground` | Build the in-browser playground (Monaco + client-side LSP) and serve it. |
 | `deno task playground:build` / `:verify` | Build / verify just the playground bundle. |
 
