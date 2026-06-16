@@ -26,7 +26,6 @@ import type {
   VLDiagnosticTag,
   VLSeverity,
 } from "../../compiler/diagnostics.ts";
-import { format } from "../../compiler/format.ts";
 import {
   buildUnusedExportUseMap,
   crossFileReferences,
@@ -823,30 +822,18 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   return [...identifiers, ...keywords, ...snippets];
 });
 
-// Document formatting (D4): rewrite the whole document through the AST-driven
-// formatter (`compiler/format.ts`). Returned as a single full-range TextEdit —
-// the formatter is whole-document and idempotent, so a full replace is correct
-// and lets the editor compute a minimal on-disk diff. A parse/format failure
-// yields no edits rather than a corrupting partial result.
+// Document formatting (D4): rewrite the whole document through the self-hosted
+// formatter (`format.vl` via the seed's `wasmChecker.formatSrc`). Returned as a
+// single full-range TextEdit — the formatter is whole-document and idempotent, so
+// a full replace is correct and lets the editor compute a minimal on-disk diff. A
+// parse error / no seed yields `undefined` → no edits (rather than a corrupting
+// partial result); there is no TS-formatter fallback (kill-TS).
 connection.onDocumentFormatting((params): TextEdit[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const text = doc.getText();
-  // The self-hosted formatter (`format.vl` via `wasmChecker.formatSrc`); on a
-  // parse error / missing export it falls back to the TS `format()` (the
-  // `format.ts` finale is separately gated on the playground wasm migration).
-  const tsFormat = (): string | undefined => {
-    try {
-      return format(text);
-    } catch {
-      return undefined;
-    }
-  };
-  const formatted = wasmChecker?.formatSrc !== undefined
-    ? wasmChecker.formatSrc(text) ?? tsFormat()
-    : tsFormat();
-  if (formatted === undefined) return [];
-  if (formatted === text) return [];
+  const formatted = wasmChecker?.formatSrc?.(text);
+  if (formatted === undefined || formatted === text) return [];
   const fullRange: Range = {
     start: { line: 0, character: 0 },
     end: doc.positionAt(text.length),
