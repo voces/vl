@@ -51,7 +51,7 @@ The compiler seed is resolved in order:
 
 | Command | What it does |
 |---|---|
-| `vl run <file.vl>` | Compile and run; program output goes to stdout. |
+| `vl run <file.vl>` | Compile and run; program output goes to stdout. Also `vl run -e "<src>"`, `… \| vl run` (stdin), or `vl run <prebuilt.wasm>`. |
 | `vl build <file.vl>` | Compile to WebAssembly (`-o <out.wasm>`; `-O` optimize, `--wat` also dump text). |
 | `vl check <file.vl>` | Type-check + report diagnostics only; non-zero exit on error (CI gate). |
 | `vl fmt <path>` | Format (AST-driven, via `format.vl`): stdout, `-w` write in place, `--check` CI gate, dirs recurse. |
@@ -62,7 +62,7 @@ PATH — `brew install binaryen`, or the [prebuilt releases](https://github.com/
 
 The brains live in VL (the seed); `vl` is a thin host. A `test` subcommand is planned (see
 [`docs/test-runner-design.md`](./docs/test-runner-design.md)). Some richer `cli.ts` conveniences
-aren't ported to `vl` yet (`run -e`/stdin, `check` over a dir / `--fix` / `--severity`) —
+aren't ported to `vl` yet (`check` over a dir / `--fix` / `--severity`) —
 run those via `deno run -A compiler/cli.ts …` for now.
 
 ## Self-hosting & bootstrap

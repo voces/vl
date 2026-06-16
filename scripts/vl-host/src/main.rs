@@ -546,12 +546,98 @@ fn run_fmt(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Compile `source` through the seed (names enabled, for legible trap traces) and
+/// run the emitted module on the DRC engine.
+fn compile_and_run(
+    compiler: &str,
+    source: &str,
+    source_path: &str,
+    run_engine: &Engine,
+) -> Result<()> {
+    let compile_engine = gc_engine(Collector::Null)?;
+    let bytes = compile_vl(&compile_engine, compiler, source, source_path, "compileSrc", true)?;
+    run_program(run_engine, &bytes)
+}
+
+/// `vl run` — compile + run a VL program, matching the TS CLI's `run`. Source comes
+/// from (in priority) `-e "<snippet>"`, a file argument, or stdin (when piped). A
+/// file whose bytes start with the wasm magic runs straight through wasmtime (a
+/// prebuilt module — lets `vl build`/`-O` output be run end to end); otherwise the
+/// source is compiled through the seed and the emitted module is run. Its own arg
+/// shape (no file with `-e`/stdin) is dispatched before the positional parsing.
+fn run_cmd(args: &[String]) -> Result<()> {
+    use std::io::{IsTerminal, Read};
+    let mut compiler: Option<String> = None;
+    let mut inline: Option<String> = None;
+    let mut file: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--compiler" => {
+                compiler = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "-e" => {
+                inline = args.get(i + 1).cloned();
+                i += 1;
+            }
+            a if !a.starts_with('-') && file.is_none() => file = Some(a.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    let compiler = compiler
+        .or_else(|| std::env::var("VL_COMPILER_WASM").ok())
+        .unwrap_or_else(|| "build/vl-compiler.wasm".to_string());
+
+    const USAGE: &str = "usage: vl run <file.vl> | -e <source> | < stdin";
+    let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
+
+    // A file argument (no `-e`): a prebuilt wasm runs directly; else it's source.
+    if inline.is_none() {
+        if let Some(f) = &file {
+            let raw = std::fs::read(f)
+                .map_err(|e| Error::from(e).context(format!("reading `{f}`")))?;
+            if raw.starts_with(b"\0asm") {
+                return run_program(&run_engine, &raw);
+            }
+            let source = String::from_utf8(raw).map_err(|e| {
+                Error::from(e)
+                    .context(format!("`{f}` is neither UTF-8 VL source nor a wasm module"))
+            })?;
+            return compile_and_run(&compiler, &source, f, &run_engine);
+        }
+    }
+
+    // `-e` snippet, else stdin — but only when piped: an interactive TTY has
+    // nothing to read, so blocking on stdin would hang forever; show usage.
+    let source = if let Some(src) = inline {
+        src
+    } else {
+        if std::io::stdin().is_terminal() {
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        s
+    };
+    if source.trim().is_empty() {
+        eprintln!("{USAGE}");
+        std::process::exit(2);
+    }
+    compile_and_run(&compiler, &source, "source.vl", &run_engine)
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    // `fmt` has its own arg shape (optional path — stdin when absent — plus flags),
-    // so it is dispatched before the positional `<cmd> <input>` parsing below.
+    // `fmt` and `run` have their own arg shapes (optional/absent file, flags,
+    // stdin), so they're dispatched before the positional `<cmd> <input>` parsing.
     if args.get(1).map(|s| s == "fmt").unwrap_or(false) {
         return run_fmt(&args[2..]);
+    }
+    if args.get(1).map(|s| s == "run").unwrap_or(false) {
+        return run_cmd(&args[2..]);
     }
     if args.len() < 3 {
         usage();
@@ -624,34 +710,6 @@ fn main() -> Result<()> {
                 false,
             )?;
             println!("ok");
-        }
-        "run" => {
-            // Accept either VL source or an already-built wasm module (magic-byte
-            // detection): `vl run prog.wasm` runs a prebuilt module straight through
-            // wasmtime, skipping the compiler — which also lets `vl build -O` output
-            // be run and gated end to end.
-            let raw = std::fs::read(input)
-                .map_err(|e| Error::from(e).context(format!("reading `{input}`")))?;
-            let bytes = if raw.starts_with(b"\0asm") {
-                raw
-            } else {
-                let source = String::from_utf8(raw).map_err(|e| {
-                    Error::from(e).context(format!(
-                        "`{input}` is neither UTF-8 VL source nor a wasm module"
-                    ))
-                })?;
-                // `vl run` always embeds names so a trap backtrace is legible.
-                compile_vl(
-                    &compile_engine,
-                    &compiler,
-                    &source,
-                    input,
-                    "compileSrc",
-                    true,
-                )?
-            };
-            let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
-            run_program(&run_engine, &bytes)?;
         }
         _ => usage(),
     }
