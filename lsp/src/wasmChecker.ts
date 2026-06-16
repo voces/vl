@@ -899,8 +899,17 @@ export const createWasmChecker = (
     await prepare(exp, source, entryKey, read);
     exp.checkSrcSym();
     const count = exp.inlayScan();
+    // A whole-program compile records a hint for EVERY committed module's
+    // unannotated decls, each carrying its own module-local line/col. Keep only
+    // the entry module's (table index 0) — a dependency's hints would otherwise
+    // render at their own line/col against THIS document (`./mathx`'s
+    // function-return hints bleeding onto the `import` line, into a string
+    // literal, …). Mirrors `tokensAt`'s module-0 filter; an older seed without
+    // `inlayModuleAt` keeps every hint (single-file mode is module 0 throughout).
+    const byModule = typeof exp.inlayModuleAt === "function";
     const out: WasmInlayCandidate[] = [];
     for (let i = 0; i < count; i++) {
+      if (byModule && exp.inlayModuleAt(i) !== 0) continue;
       const typeLen = exp.inlayTypeLen(i);
       if (typeLen <= 0) continue; // no renderable type — nothing to hint
       const type = readString(typeLen, (j) => exp.inlayTypeCharAt(i, j));

@@ -68,3 +68,44 @@ Deno.test({
   }, src);
   assertEquals(ranged.map((h) => h.line), [1], "only the line-1 hint survives the range");
 });
+
+// Regression: a whole-program compile records inlay candidates for EVERY module,
+// each with module-local line/col. The checker must return ONLY the entry
+// module's (table index 0); otherwise a dependency's hints (e.g. `./mathx`'s
+// function-return types) render against the importer — bleeding onto the
+// `import` line and into string literals (the `inlayModuleAt` filter).
+Deno.test({
+  name: "wasm-inlay: a dependency's hints don't bleed onto the importer",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const main = `import { add, square } from "./mathx"
+import { TAU as twoPi } from "./mathx"
+
+let r = add(square(3), 4)
+print(r)
+print(twoPi)
+`;
+  const mathx = `export function add(a: i32, b: i32): i32 {
+  return a + b
+}
+export function square(n: i32): i32 {
+  return n * n
+}
+export const TAU: f64 = 6.28318
+`;
+  const files: Record<string, string> = { "main.vl": main, "mathx.vl": mathx };
+  const candidates = await checker.inlayHintsAt(
+    main,
+    "main.vl",
+    (key) => files[key],
+  );
+  const hints = inlayHintsFromWasm(candidates, undefined, main);
+  // The ONLY unannotated decl in main.vl is `let r` (inferred `i32`). `mathx`'s
+  // params/returns/`TAU` are in module 1 and must not appear.
+  assertEquals(
+    hints.map((h) => ({ line: h.line, char: h.char, label: h.label })),
+    [{ line: 3, char: 5, label: ": i32" }],
+    "only the entry module's hint survives",
+  );
+});
