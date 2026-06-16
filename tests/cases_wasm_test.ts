@@ -1,11 +1,9 @@
-// The corpus oracle on the SELF-HOSTED compiler (ROADMAP "Kill the TS host",
-// step 0): the same `tests/cases/**` files, the same `// @directive` contract
-// as `cases_test.ts`, adjudicated by the wasm compiler seed
-// (`build/vl-compiler.wasm`) running under Deno — the TS compiler
-// (`compiler/compile.ts`'s `compile`/`compileProgram`) is NOT in this gate
-// path, so a native-only feature's corpus case can go green here without ever
-// teaching the TS compiler about it. `runWasm` (the V8 instantiate + print
-// capture) is harness plumbing, not the TS compiler — it lives in the
+// The corpus oracle (ROADMAP "Kill the TS host"): the `tests/cases/**` files,
+// each carrying its `// @directive` expectations, adjudicated by the SELF-HOSTED
+// wasm compiler seed (`build/vl-compiler.wasm`) running under Deno. This is the
+// SOLE behavioral corpus oracle — the TS compiler is retired, so there is no
+// second compiler to compare against; the directives are the spec. `runWasm`
+// (the V8 instantiate + print capture) is harness plumbing — it lives in the
 // compiler-free `tests/support/runWasm.ts` so this oracle carries no dependency
 // on `compiler/compile.ts` (kill-TS is deleting the TS front end).
 //
@@ -20,8 +18,8 @@
 // The module table persists across compiles by design, so EVERY case starts
 // with `modReset()`.
 //
-// Directive semantics mirror `cases_test.ts` (see its header for the full
-// contract), with the wasm tier's documented deltas:
+// Directive semantics (the corpus's `// @directive` contract), with the wasm
+// tier's documented deltas:
 //   - The wasm compiler has NO lint tier and only the "error" severity, so a
 //     case whose ONLY directives are @warning/@info/@hint is SKIPPED here
 //     (lint stays TS-adjudicated until the .vl lint pass — LSP-on-wasm
@@ -209,8 +207,8 @@ const hasEntry = (dir: URL): boolean => {
   }
 };
 
-// Mirrors cases_test.ts: a directory holding an `entry.vl` is ONE multi-file
-// case (never descended into); other directories are walked file-per-test.
+// A directory holding an `entry.vl` is ONE multi-file case (never descended
+// into); other directories are walked file-per-test.
 const walk = function* (dir: URL): Generator<Case> {
   if (hasEntry(dir)) {
     yield { kind: "module", dir, entry: new URL("entry.vl", dir) };
@@ -455,8 +453,8 @@ const driveLint = (exp: Exports, src: string): LintDiag[] => {
 /**
  * Adjudicate the lint directives (@warning/@info/@hint) against the lint diags,
  * per severity, strict-by-default (every declared directive matches a diag, and
- * every diag is declared) — mirroring `cases_test.ts`'s lint contract. Message
- * matching folds case/quote style like the error tier.
+ * every diag is declared). Message matching folds case/quote style like the
+ * error tier.
  */
 const assertLint = (d: Directives, lints: LintDiag[]): void => {
   const bySev = (s: string): string[] =>

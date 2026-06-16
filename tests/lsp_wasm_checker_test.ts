@@ -11,7 +11,7 @@ import {
   diffReferences,
   loadWasmChecker,
 } from "../lsp/src/wasmCheckerNode.ts";
-import type { VLDiagnostic } from "../compiler/compile.ts";
+import type { VLDiagnostic } from "../compiler/diagnostics.ts";
 
 const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
 const seedExists = (() => {
@@ -363,14 +363,10 @@ Deno.test("wasm-parity diff: a missing error reports both lists", () => {
   }
 });
 
-// ── formatting (kill-TS step 1: the `format.ts` consumer) ────────────────────
+// ── formatting (kill-TS step 1: the `format.vl` consumer) ────────────────────
 // `formatSrc` drives the self-hosted formatter (`format.vl`) through the seed.
-// Full-corpus equivalence with the host is proven by
-// `tests/selfhost_format_corpus_test.ts`; here we assert the wasm path reflows to
-// a canonical, idempotent form, agrees with the host on already-canonical source,
-// and degrades to undefined (TS fallback) on a parse error.
-
-import { format } from "../compiler/format.ts";
+// Here we assert the wasm path reflows to a canonical, idempotent form, is stable
+// on already-canonical source, and degrades to undefined on a parse error.
 
 Deno.test({ name: "wasm-checker: formatSrc reflows messy source to a canonical, idempotent form", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
@@ -383,15 +379,14 @@ Deno.test({ name: "wasm-checker: formatSrc reflows messy source to a canonical, 
   if (checker.formatSrc(got) !== got) throw new Error("formatSrc not idempotent");
 });
 
-Deno.test({ name: "wasm-checker: formatSrc matches the host on canonical source (incl. params)", ignore }, () => {
+Deno.test({ name: "wasm-checker: formatSrc is stable on already-canonical source (incl. params)", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
-  // Feeding the HOST's canonical output back through the wasm formatter must be a
-  // no-op — the two agree on the canonical form (params included). (format.vl
-  // canonicalizes non-canonical param-colon spacing `a:i32`→`a: i32`, an
-  // intentional improvement over the host.)
-  const canonical = format(
-    "function f(a: i32, b: i32): i32 {\n  return a + b\n}\nprint(f(1, 2))\n",
-  );
+  // Already-canonical source must round-trip unchanged (params included). This is
+  // the canonical form `format.vl` produces — a literal here, no TS formatter:
+  // the kill-TS work retired the TS `format()`, and full-corpus equivalence was
+  // its own (now-deleted) parity suite.
+  const canonical =
+    "function f(a: i32, b: i32): i32 {\n  return a + b\n}\nprint(f(1, 2))\n";
   const got = checker.formatSrc(canonical);
   if (got !== canonical) {
     throw new Error(`expected stable, got ${JSON.stringify(got)} for ${JSON.stringify(canonical)}`);
