@@ -363,12 +363,27 @@ connection.onDefinition(async (params): Promise<Location | null> => {
   if (!doc) return null;
   const text = doc.getText();
 
-  // Go-to-definition off the self-hosted checker (kill-TS). The single-file
-  // binding declaration first (native `definitionAt`); then, on a miss, the
-  // cross-file imported-name jump — an imported name resolves to the exporting
-  // sibling's declaration via the native import/export pass
-  // (`wasmImportedSources`). No checker (no seed / no WasmGC) → no result.
+  // Go-to-definition off the self-hosted checker (kill-TS). An IMPORTED name jumps
+  // CROSS-FILE first — to the exporting sibling's declaration via the native
+  // import/export pass (`wasmImportedSources`). This must precede the local
+  // `definitionAt`: for an imported name, `definitionAt` returns the canonical
+  // declaration's span in the DEPENDENCY, but the span carries no module, so the
+  // host would mis-attribute it to THIS file (landing on the import line). For a
+  // purely-local name the cross-file lookup misses and `definitionAt` gives the
+  // correct same-file declaration. No checker (no seed / no WasmGC) → no result.
   if (wasmChecker === undefined) return null;
+
+  const lineText = doc.getText({
+    start: { line: params.position.line, character: 0 },
+    end: { line: params.position.line + 1, character: 0 },
+  });
+  const word = wordAt(lineText, params.position.character);
+  if (word) {
+    const sources = await wasmImportedSources(params.textDocument.uri, text);
+    const source = sources?.[word];
+    if (source) return Location.create(source.uri, source.range);
+  }
+
   const nativeDecl = wasmChecker.definitionAt !== undefined
     ? await wasmChecker
       .definitionAt(
@@ -384,17 +399,6 @@ connection.onDefinition(async (params): Promise<Location | null> => {
       })
     : undefined;
   if (nativeDecl) return Location.create(params.textDocument.uri, nativeDecl);
-
-  const lineText = doc.getText({
-    start: { line: params.position.line, character: 0 },
-    end: { line: params.position.line + 1, character: 0 },
-  });
-  const word = wordAt(lineText, params.position.character);
-  if (word) {
-    const sources = await wasmImportedSources(params.textDocument.uri, text);
-    const source = sources?.[word];
-    if (source) return Location.create(source.uri, source.range);
-  }
   return null;
 });
 

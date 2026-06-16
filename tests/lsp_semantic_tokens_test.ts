@@ -116,6 +116,35 @@ Deno.test({
   }
 });
 
+Deno.test({
+  name: "wasm-tokens: an importer's tokens exclude the dependency's (module-0 only)",
+  ignore,
+}, async () => {
+  // Regression: the occurrence table spans every committed module, each with its
+  // own module-local line/col. Without filtering to the entry module, a
+  // dependency's decls (here mathx's `add`/`square` + their params, at mathx's
+  // lines) bleed onto the importer's display — corrupting the `import` lines.
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const main = `import { add, square } from "./mathx"\nlet r = add(square(3), 4)\nprint(r)\n`;
+  const mathx =
+    `export function add(a: i32, b: i32): i32 {\n  return a + b\n}\nexport function square(n: i32): i32 {\n  return n * n\n}\n`;
+  const reader = (k: string) =>
+    ({ "main.vl": main, "mathx.vl": mathx } as Record<string, string>)[k];
+
+  const wasm = await checker.tokensAt(main, "main.vl", reader);
+  // No token may sit on the `import` lines (0 and 1) — those came only from the
+  // dependency bleed; main.vl's own tokens start at line 1 (`let r = …`).
+  const onImportLine = wasm.filter((t) => t.line === 0);
+  if (onImportLine.length !== 0) {
+    throw new Error(`dependency tokens bled onto the import line: ${JSON.stringify(onImportLine)}`);
+  }
+  // The importer's OWN tokens survive: `add`/`square` uses (functions) on line 1.
+  const addUse = wasm.find((t) => t.line === 1 && t.char === 8);
+  if (addUse?.bindKind !== 2) {
+    throw new Error(`expected the local \`add\` use as a function, got ${JSON.stringify(addUse)}`);
+  }
+});
+
 // ---- kill-TS: the wasm LEXICAL slice + whole-document wasm-only assembly ------
 // `lexicalTokensAt` is the native counterpart of the TS `tokenize` + comment
 // scan; `semanticTokensDataFromWasm` assembles a whole document from the wasm

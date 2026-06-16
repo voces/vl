@@ -216,14 +216,41 @@ export const inlayHints = async (
 /**
  * The defining span of the binding under `pos`, in LSP 0-based coordinates, or
  * null — the data behind go-to-definition. Mirrors `server.ts`'s wasm-mode
- * `onDefinition` (`definitionAt`).
+ * `onDefinition`: an IMPORTED name jumps CROSS-FILE first (to the exporting
+ * sibling's decl via `importedNameSources`) — `definitionAt` would return the
+ * canonical decl's span in the DEPENDENCY with no module, mis-attributing it to
+ * the current file (the import line). A purely-local name falls to `definitionAt`.
+ * `file` names the target module key when the jump is cross-file (`main.ts` maps
+ * it to the sibling model); undefined for a same-file jump.
  */
+export type DefinitionResult = {
+  start: LspPosition;
+  end: LspPosition;
+  file?: string;
+};
+
 export const definition = async (
   text: string,
   pos: LspPosition,
   entryKey: string = DEFAULT_ENTRY,
-): Promise<{ start: LspPosition; end: LspPosition } | null> => {
+): Promise<DefinitionResult | null> => {
   if (checker === undefined) return null;
+  // Imported name → its exporting sibling's declaration.
+  const word = wordAt(text, pos);
+  if (word) {
+    const sources = await checker
+      .importedNameSources(text, entryKey, reader)
+      .catch(() => ({} as Record<string, { key: string; line: number; col: number; length: number }>));
+    const src = sources[word.text];
+    if (src) {
+      return {
+        file: src.key,
+        start: { line: src.line - 1, character: src.col }, // native 1-based line → 0-based
+        end: { line: src.line - 1, character: src.col + src.length },
+      };
+    }
+  }
+  // Local binding declaration (same file).
   const range = await checker
     .definitionAt(text, entryKey, reader, pos.line, pos.character)
     .catch(() => undefined);
