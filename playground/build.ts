@@ -82,13 +82,23 @@ const build = async (): Promise<void> => {
     // esbuild's cwd anchors the native loader's `deno info` at the repo root, so
     // node_modules and the import map are found.
     absWorkingDir: ROOT.pathname,
-    entryPoints: [new URL("src/main.ts", HERE).pathname],
-    outfile: new URL("dist/playground.js", HERE).pathname,
+    // The object form names the entry output `playground.js` (+ `playground.css`)
+    // under `outdir`, which `splitting` requires (it can't target a single
+    // `outfile`). index.html loads `./dist/playground.js`; the split chunk(s) sit
+    // beside it and are fetched lazily by their relative URLs.
+    entryPoints: { playground: new URL("src/main.ts", HERE).pathname },
+    outdir: new URL("dist", HERE).pathname,
     bundle: true,
     format: "esm",
     platform: "browser",
     conditions: ["browser"],
     target: "es2022",
+    // Code-split so binaryen — reached ONLY via dynamic `import("binaryen")` /
+    // `import("./toWasm.ts")` (the WAT renderer `wasmToWat`; codegen is on the
+    // seed now) — lands in its own chunk fetched on demand when the WAT pane is
+    // shown, instead of being inlined into the ~13 MB-heavier initial bundle.
+    splitting: true,
+    chunkNames: "chunk-[hash]",
     // Monaco's ESM imports `.css` (its widget styles) and a `.ttf` (the codicon
     // icon font). esbuild bundles the CSS into a sibling `dist/playground.css`
     // (loaded by index.html); inline the font as a data: URL so there's no extra
