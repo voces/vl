@@ -648,6 +648,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
 // inside the seed, so it survives the host's planned shrink to a WASI shim.
 
 const CMD_DONE: i32 = 0;
+const CMD_LIST_DIR: i32 = 1;
 const CMD_READ_FILE: i32 = 2;
 const CMD_PRINT_OUT: i32 = 4;
 const CMD_PRINT_ERR: i32 = 5;
@@ -719,6 +720,9 @@ fn cli_pump(args: &[String]) -> Result<()> {
     let data_at = inst.get_typed_func::<i32, i32>(&mut store, "cliCmdDataAt")?;
     let result_push = inst.get_typed_func::<i32, i32>(&mut store, "cliResultPush")?;
     let file_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliFileCommit")?;
+    let dir_name_push = inst.get_typed_func::<i32, i32>(&mut store, "cliDirNamePush")?;
+    let dir_entry_push = inst.get_typed_func::<i32, i32>(&mut store, "cliDirEntryPush")?;
+    let dir_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliDirCommit")?;
     let exit_code = inst.get_typed_func::<(), i32>(&mut store, "cliExitCode")?;
 
     let mut out = std::io::stdout();
@@ -726,6 +730,30 @@ fn cli_pump(args: &[String]) -> Result<()> {
     loop {
         match next.call(&mut store, ())? {
             CMD_DONE => break,
+            CMD_LIST_DIR => {
+                // List one directory (no recursion, no skip-list, no glob — all VL
+                // policy). `cliDirCommit(1)` when the path is a directory (entries
+                // streamed first), `0` when it is a file or does not exist, so the
+                // VL program can classify a file-vs-directory target.
+                let path = read_cli_str(&mut store, &path_len, &path_at)?;
+                match std::fs::read_dir(&path) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let is_dir =
+                                entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                            for ch in entry.file_name().to_string_lossy().chars() {
+                                dir_name_push.call(&mut store, ch as i32)?;
+                            }
+                            dir_entry_push.call(&mut store, if is_dir { 1 } else { 0 })?;
+                        }
+                        dir_commit.call(&mut store, 1)?;
+                    }
+                    Err(_) => {
+                        // Not a directory (a file, or missing) — no entries.
+                        dir_commit.call(&mut store, 0)?;
+                    }
+                }
+            }
             CMD_READ_FILE => {
                 let path = read_cli_str(&mut store, &path_len, &path_at)?;
                 // A `std:` key maps to `<stdDir>/<name>.vl` (slash segments are
