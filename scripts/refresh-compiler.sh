@@ -57,7 +57,7 @@ fi
 sed -E 's/\bTok\b/LexTok/g; s/\bDiag\b/LexDiag/g; s/\badvance\b/lexAdvance/g' \
   compiler/lexer.vl > "$WORK/vlsrc.vl"
 cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.vl compiler/lint.vl compiler/format.vl \
-  scripts/vl-compiler-driver.vl >> "$WORK/vlsrc.vl"
+  scripts/vl-compiler-driver.vl compiler/cli.vl >> "$WORK/vlsrc.vl"
 # BLANK the compiler's own import statements (range-aware; multi-line imports) —
 # see native-fixpoint.sh: a line-leading `import {` would trip the vl binary's
 # module gate. Blanking preserves line numbers; byte-identical output.

@@ -39,6 +39,10 @@ const format = read("../compiler/format.vl");
 // self-rebuilt compiler expose the identical surface.
 const driver = read("./vl-compiler-driver.vl");
 
+// The CLI command-queue brain (docs/cli-design.md) — joined AFTER the driver so
+// it can call the driver's source-staging + diagnostic accessors in-module.
+const cli = read("../compiler/cli.vl");
+
 const outFlag = Deno.args.indexOf("-o");
 const outPath = outFlag >= 0
   ? Deno.args[outFlag + 1]
@@ -51,7 +55,7 @@ const outUrl = outPath.startsWith("/")
 
 const { wasm, diagnostics } = await compileCached(
   lexer + "\n" + ast + "\n" + parser + "\n" + typecheck + "\n" + wasmEmit +
-    "\n" + lint + "\n" + format + "\n" + driver + "\n",
+    "\n" + lint + "\n" + format + "\n" + driver + "\n" + cli + "\n",
 );
 const errs = diagnostics.filter((d) => d.severity === "error");
 if (errs.length > 0 || !wasm) {
