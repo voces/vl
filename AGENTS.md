@@ -28,8 +28,10 @@ file; the lexer/parser are the grammar.
   `cd scripts/vl-host && cargo build --release`): `vl run <file.vl>` (also `-e "<src>"` / stdin /
   a prebuilt `.wasm`) · `vl build <file> [-o out.wasm]` · `vl check <file>` · `vl fmt <file> [-w|--check]`.
   `vl build` also takes `-O` (optimize) and `--wat` (text dump) — both shell out to binaryen
-  (`wasm-opt`/`wasm-dis`; `brew install binaryen`), soft no-op when absent. Conveniences not yet ported
-  to `vl` (`check` over a dir / `--fix` / `--severity`) still run via `deno run -A compiler/cli.ts …`.
+  (`wasm-opt`/`wasm-dis`; `brew install binaryen`), soft no-op when absent. `vl check` reports errors
+  + lint (warnings/hints), `--severity <level>` (gate + display floor), `--concise`, `--codegen`.
+  Not yet ported to `vl` (`check` over a directory / `--exclude`, `check --fix`) still run via
+  `deno run -A compiler/cli.ts …`.
 - **After ANY compiler change, rebuild the LSP bundle:** `cd lsp && deno task build` (the compiler core
   is bundled into the LSP; `lsp/dist` is gitignored). CI also builds it.
 

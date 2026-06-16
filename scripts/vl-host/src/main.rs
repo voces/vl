@@ -146,31 +146,13 @@ fn load_compiler(engine: &Engine, compiler_path: &str) -> Result<(Store<()>, Ins
     Ok((store, inst))
 }
 
-fn compile_vl(
-    engine: &Engine,
-    compiler_path: &str,
-    source: &str,
-    source_path: &str,
-    entry: &str,
-    emit_names: bool,
-) -> Result<Vec<u8>> {
-    let (mut store, inst) = load_compiler(engine, compiler_path)?;
-
-    let src_reset = inst.get_typed_func::<(), i32>(&mut store, "srcReset")?;
-    let src_push = inst.get_typed_func::<i32, i32>(&mut store, "srcPush")?;
-    let compile = inst.get_typed_func::<(), i32>(&mut store, entry)?;
-    let rlen = inst.get_typed_func::<(), i32>(&mut store, "rbyteLen")?;
-    let rat = inst.get_typed_func::<i32, i32>(&mut store, "rbyteAt")?;
-
-    // Opt into the wasm "name" custom section so trap backtraces name functions.
-    // The export is OFF by default (the compiler leaves goldens byte-identical);
-    // we flip it on only here, for the native tool's build/run paths. The export
-    // is absent from older compiler modules, so treat a missing symbol as a no-op.
-    if emit_names {
-        if let Ok(set_names) = inst.get_typed_func::<i32, i32>(&mut store, "setEmitNames") {
-            set_names.call(&mut store, 1)?;
-        }
-    }
+/// Stage `source` (as `source_path`) into a freshly-loaded compiler instance: run
+/// the module fetch loop when it has imports, then `srcReset` + `srcPush`. Leaves
+/// the instance ready for a `checkSrc` / `compileSrc` / `lintSrc` call. Shared by
+/// `compile_vl` (build/run) and `check_cmd`.
+fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_path: &str) -> Result<()> {
+    let src_reset = inst.get_typed_func::<(), i32>(&mut *store, "srcReset")?;
+    let src_push = inst.get_typed_func::<i32, i32>(&mut *store, "srcPush")?;
 
     // Multi-file module resolution (H3): when the source has a line-leading
     // `import {` (the host CLI's cheap textual gate — an import-free file keeps
@@ -189,13 +171,13 @@ fn compile_vl(
     });
     if has_imports {
         if let (Ok(mod_reset), Ok(key_push), Ok(msrc_push), Ok(commit), Ok(pend_n), Ok(pend_len), Ok(pend_at)) = (
-            inst.get_typed_func::<(), i32>(&mut store, "modReset"),
-            inst.get_typed_func::<i32, i32>(&mut store, "modKeyPush"),
-            inst.get_typed_func::<i32, i32>(&mut store, "modSrcPush"),
-            inst.get_typed_func::<i32, i32>(&mut store, "modCommit"),
-            inst.get_typed_func::<(), i32>(&mut store, "modPendingCount"),
-            inst.get_typed_func::<i32, i32>(&mut store, "modPendingLen"),
-            inst.get_typed_func::<(i32, i32), i32>(&mut store, "modPendingAt"),
+            inst.get_typed_func::<(), i32>(&mut *store, "modReset"),
+            inst.get_typed_func::<i32, i32>(&mut *store, "modKeyPush"),
+            inst.get_typed_func::<i32, i32>(&mut *store, "modSrcPush"),
+            inst.get_typed_func::<i32, i32>(&mut *store, "modCommit"),
+            inst.get_typed_func::<(), i32>(&mut *store, "modPendingCount"),
+            inst.get_typed_func::<i32, i32>(&mut *store, "modPendingLen"),
+            inst.get_typed_func::<(i32, i32), i32>(&mut *store, "modPendingAt"),
         ) {
             let commit_module =
                 |store: &mut Store<()>, key: &str, src: Option<&str>| -> Result<()> {
@@ -210,20 +192,20 @@ fn compile_vl(
                     commit.call(&mut *store, if src.is_some() { 1 } else { 0 })?;
                     Ok(())
                 };
-            mod_reset.call(&mut store, ())?;
-            commit_module(&mut store, source_path, Some(source))?;
+            mod_reset.call(&mut *store, ())?;
+            commit_module(store, source_path, Some(source))?;
             loop {
-                let n = pend_n.call(&mut store, ())?;
+                let n = pend_n.call(&mut *store, ())?;
                 if n == 0 {
                     break;
                 }
                 // Snapshot the pending keys first — committing mutates the list.
                 let mut keys = Vec::with_capacity(n as usize);
                 for i in 0..n {
-                    let len = pend_len.call(&mut store, i)?;
+                    let len = pend_len.call(&mut *store, i)?;
                     let mut key = String::with_capacity(len as usize);
                     for j in 0..len {
-                        if let Some(c) = char::from_u32(pend_at.call(&mut store, (i, j))? as u32) {
+                        if let Some(c) = char::from_u32(pend_at.call(&mut *store, (i, j))? as u32) {
                             key.push(c);
                         }
                     }
@@ -240,16 +222,44 @@ fn compile_vl(
                             .and_then(|dir| std::fs::read_to_string(dir.join(format!("{name}.vl"))).ok()),
                         None => std::fs::read_to_string(&key).ok(),
                     };
-                    commit_module(&mut store, &key, src.as_deref())?;
+                    commit_module(store, &key, src.as_deref())?;
                 }
             }
         }
     }
 
-    src_reset.call(&mut store, ())?;
+    src_reset.call(&mut *store, ())?;
     for ch in source.chars() {
-        src_push.call(&mut store, ch as i32)?;
+        src_push.call(&mut *store, ch as i32)?;
     }
+    Ok(())
+}
+
+fn compile_vl(
+    engine: &Engine,
+    compiler_path: &str,
+    source: &str,
+    source_path: &str,
+    entry: &str,
+    emit_names: bool,
+) -> Result<Vec<u8>> {
+    let (mut store, inst) = load_compiler(engine, compiler_path)?;
+
+    let compile = inst.get_typed_func::<(), i32>(&mut store, entry)?;
+    let rlen = inst.get_typed_func::<(), i32>(&mut store, "rbyteLen")?;
+    let rat = inst.get_typed_func::<i32, i32>(&mut store, "rbyteAt")?;
+
+    // Opt into the wasm "name" custom section so trap backtraces name functions.
+    // The export is OFF by default (the compiler leaves goldens byte-identical);
+    // we flip it on only here, for the native tool's build/run paths. The export
+    // is absent from older compiler modules, so treat a missing symbol as a no-op.
+    if emit_names {
+        if let Ok(set_names) = inst.get_typed_func::<i32, i32>(&mut store, "setEmitNames") {
+            set_names.call(&mut store, 1)?;
+        }
+    }
+
+    stage_program(&mut store, &inst, source, source_path)?;
     let rc = compile.call(&mut store, ())?;
     if rc != 0 {
         let stage = match rc {
@@ -629,15 +639,312 @@ fn run_cmd(args: &[String]) -> Result<()> {
     compile_and_run(&compiler, &source, "source.vl", &run_engine)
 }
 
+// ── `vl check` — diagnostics (errors + lint), severity gating + display ──────
+
+/// One reported diagnostic, merged from the error tier (`checkSrc`/`compileSrc`'s
+/// `diag*`) and the lint tier (`lintSrc`'s `lint*`). `line` is 1-based (0 =
+/// positionless, e.g. a codegen sentinel); `col`/`end_col` are 0-based.
+#[derive(Clone)]
+struct Diag {
+    severity: String, // "error" | "warning" | "info" | "hint"
+    line: i32,
+    col: i32,
+    end_col: i32,
+    message: String,
+}
+
+// Low → high, so the index IS the rank (hint=0 … error=3). An unknown lexeme
+// falls back to `warning` (still surfaces). Mirrors the TS CLI's SEVERITY_ORDER.
+const SEVERITIES: [&str; 4] = ["hint", "info", "warning", "error"];
+fn severity_rank(s: &str) -> i32 {
+    SEVERITIES.iter().position(|x| *x == s).map(|i| i as i32).unwrap_or(2)
+}
+
+// Read a per-index wasm string (`len(i)` code points via `at(i, j)`).
+fn read_wasm_string(
+    store: &mut Store<()>,
+    len: &TypedFunc<i32, i32>,
+    at: &TypedFunc<(i32, i32), i32>,
+    i: i32,
+) -> Result<String> {
+    let n = len.call(&mut *store, i)?;
+    let mut s = String::with_capacity(n.max(0) as usize);
+    for j in 0..n {
+        if let Some(c) = char::from_u32(at.call(&mut *store, (i, j))? as u32) {
+            s.push(c);
+        }
+    }
+    Ok(s)
+}
+
+/// The error-tier diagnostics in the store after a `checkSrc`/`compileSrc` (all
+/// `error` severity). Native line is 1-based (0 = positionless), col 0-based.
+fn collect_error_diags(store: &mut Store<()>, inst: &Instance) -> Result<Vec<Diag>> {
+    let count = inst.get_typed_func::<(), i32>(&mut *store, "diagCount")?;
+    let mlen = inst.get_typed_func::<i32, i32>(&mut *store, "diagMsgLen")?;
+    let mat = inst.get_typed_func::<(i32, i32), i32>(&mut *store, "diagMsgAt")?;
+    let dline = inst.get_typed_func::<i32, i32>(&mut *store, "diagLine")?;
+    let dcol = inst.get_typed_func::<i32, i32>(&mut *store, "diagCol")?;
+    let dend = inst.get_typed_func::<i32, i32>(&mut *store, "diagEndCol").ok();
+    let n = count.call(&mut *store, ())?;
+    let mut out = Vec::with_capacity(n.max(0) as usize);
+    for i in 0..n {
+        let message = read_wasm_string(store, &mlen, &mat, i)?;
+        let line = dline.call(&mut *store, i)?;
+        let col = dcol.call(&mut *store, i)?;
+        let end_col = match &dend {
+            Some(f) => f.call(&mut *store, i)?,
+            None => col,
+        };
+        out.push(Diag { severity: "error".into(), line, col, end_col, message });
+    }
+    Ok(out)
+}
+
+/// The lint-tier diagnostics (`lintSrc`) for `source` — warnings/info/hints the
+/// error tier never reports. Lint is single-file + parse-only, so the entry
+/// source is staged directly (no module fetch); `-1`/`0` (parse error / none)
+/// yields an empty set. Absent on an older seed → empty (no lint).
+fn collect_lint_diags(store: &mut Store<()>, inst: &Instance, source: &str) -> Result<Vec<Diag>> {
+    let src_reset = inst.get_typed_func::<(), i32>(&mut *store, "srcReset")?;
+    let src_push = inst.get_typed_func::<i32, i32>(&mut *store, "srcPush")?;
+    let lint = match inst.get_typed_func::<(), i32>(&mut *store, "lintSrc") {
+        Ok(f) => f,
+        Err(_) => return Ok(vec![]),
+    };
+    let mlen = inst.get_typed_func::<i32, i32>(&mut *store, "lintMsgLen")?;
+    let mat = inst.get_typed_func::<(i32, i32), i32>(&mut *store, "lintMsgByte")?;
+    let slen = inst.get_typed_func::<i32, i32>(&mut *store, "lintSevLen")?;
+    let sat = inst.get_typed_func::<(i32, i32), i32>(&mut *store, "lintSevByte")?;
+    let lline = inst.get_typed_func::<i32, i32>(&mut *store, "lintLine")?;
+    let lcol = inst.get_typed_func::<i32, i32>(&mut *store, "lintCol")?;
+    src_reset.call(&mut *store, ())?;
+    for ch in source.chars() {
+        src_push.call(&mut *store, ch as i32)?;
+    }
+    let n = lint.call(&mut *store, ())?;
+    let mut out = Vec::new();
+    if n <= 0 {
+        return Ok(out);
+    }
+    for i in 0..n {
+        let message = read_wasm_string(store, &mlen, &mat, i)?;
+        let sev = read_wasm_string(store, &slen, &sat, i)?;
+        let line = lline.call(&mut *store, i)?;
+        let col = lcol.call(&mut *store, i)?;
+        out.push(Diag {
+            severity: if sev.is_empty() { "warning".into() } else { sev },
+            line,
+            col,
+            end_col: col + 1,
+            message,
+        });
+    }
+    Ok(out)
+}
+
+// ANSI wrap, gated on `color` (so call sites stay branch-free).
+fn ansi(color: bool, code: &str, s: &str) -> String {
+    if color {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+fn sev_code(sev: &str) -> &'static str {
+    match sev {
+        "error" => "31",
+        "warning" => "33",
+        _ => "34",
+    }
+}
+
+// Tabs → 4 columns so carets line up under tab-indented source (the shown line is
+// detabbed to match). `visual_width(s, n)` is the column the prefix `[0,n)` ends at.
+const TAB_WIDTH: usize = 4;
+fn detab(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if ch == '\t' {
+            let pad = TAB_WIDTH - (out.len() % TAB_WIDTH);
+            out.push_str(&" ".repeat(pad));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+fn visual_width(raw: &str, n: usize) -> usize {
+    let take: String = raw.chars().take(n).collect();
+    detab(&take).chars().count()
+}
+
+/// Concise one-line form: `<file>: <severity> [<line>:<col>] <message>` (1-based
+/// L:C). Matches the TS CLI's `--concise` shape (grep-friendly, never colored).
+fn fmt_concise(d: &Diag, file: &str) -> String {
+    let line = if d.line > 0 { d.line } else { 1 };
+    format!("{file}: {} [{}:{}] {}", d.severity, line, d.col + 1, d.message)
+}
+
+/// Pretty rustc/Deno-style rendering: `[SEVERITY]: msg` / source line / caret /
+/// `at file:line:col`. A positionless diagnostic drops the source+caret block.
+fn fmt_pretty(d: &Diag, file: &str, lines: &[&str], color: bool) -> String {
+    let head = ansi(color, &format!("1;{}", sev_code(&d.severity)), &format!("[{}]", d.severity.to_uppercase()));
+    let mut out = vec![format!("{head}: {}", d.message)];
+    if d.line > 0 {
+        if let Some(raw) = lines.get((d.line - 1) as usize) {
+            let shown = detab(raw);
+            out.push(format!("  {shown}"));
+            let start = visual_width(raw, d.col as usize);
+            let end = visual_width(raw, d.end_col.max(d.col + 1) as usize);
+            let remaining = shown.chars().count().saturating_sub(start).max(1);
+            let span = (end.saturating_sub(start)).clamp(1, remaining);
+            let underline = format!("^{}", "~".repeat(span - 1));
+            out.push(format!("  {}{}", " ".repeat(start), ansi(color, sev_code(&d.severity), &underline)));
+        }
+        out.push(ansi(color, "2", &format!("  at {file}:{}:{}", d.line, d.col + 1)));
+    } else {
+        out.push(ansi(color, "2", &format!("  at {file}")));
+    }
+    out.join("\n")
+}
+
+/// `vl check` — type-check + lint a file, reporting diagnostics. Merges the error
+/// tier (`checkSrc`, or `compileSrc` under `--codegen` so emit errors surface)
+/// with the lint tier (`lintSrc`). `--severity <hint|info|warning|error>` both
+/// gates the exit code and raises the display floor; default gate `error`, default
+/// display "show everything". `--concise` switches to the grep-friendly one-liner.
+fn check_cmd(args: &[String]) -> Result<()> {
+    use std::io::IsTerminal;
+    let mut compiler: Option<String> = None;
+    let mut file: Option<String> = None;
+    let mut concise = false;
+    let mut codegen = false;
+    let mut severity = "error".to_string();
+    let mut severity_given = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--compiler" {
+            compiler = args.get(i + 1).cloned();
+            i += 1;
+        } else if a == "--concise" {
+            concise = true;
+        } else if a == "--codegen" {
+            codegen = true;
+        } else if a == "--severity" {
+            severity = args.get(i + 1).cloned().unwrap_or_default();
+            severity_given = true;
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("--severity=") {
+            severity = v.to_string();
+            severity_given = true;
+        } else if !a.starts_with('-') && file.is_none() {
+            file = Some(a.to_string());
+        }
+        i += 1;
+    }
+    if severity_given && !SEVERITIES.contains(&severity.as_str()) {
+        let levels: Vec<&str> = SEVERITIES.iter().rev().copied().collect();
+        eprintln!("check: invalid --severity `{severity}` (expected one of: {})", levels.join(", "));
+        std::process::exit(2);
+    }
+    let compiler = compiler
+        .or_else(|| std::env::var("VL_COMPILER_WASM").ok())
+        .unwrap_or_else(|| "build/vl-compiler.wasm".to_string());
+    // check-1 is single-file; a directory target / default-cwd walk is a follow-up.
+    let Some(file) = file else {
+        eprintln!("usage: vl check <file.vl> [--concise] [--severity <level>] [--codegen]");
+        std::process::exit(2);
+    };
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| Error::from(e).context(format!("reading `{file}`")))?;
+
+    let engine = gc_engine(Collector::Null)?;
+    let (mut store, inst) = load_compiler(&engine, &compiler)?;
+    let entry = if codegen { "compileSrc" } else { "checkSrc" };
+    stage_program(&mut store, &inst, &source, &file)?;
+    // rc names the failing STAGE (1 parse, 2 type, 3 emit) — surfaced in the
+    // summary so tooling can classify WHERE a rejection happened. A `checkSrc`
+    // run only reaches parse/type; `--codegen` runs `compileSrc`, which can emit.
+    let rc = inst.get_typed_func::<(), i32>(&mut store, entry)?.call(&mut store, ())?;
+    let stage = match rc {
+        1 => "parse",
+        2 => "type",
+        3 => "emit",
+        _ => "",
+    };
+
+    let mut diags = collect_error_diags(&mut store, &inst)?;
+    diags.extend(collect_lint_diags(&mut store, &inst, &source)?);
+
+    // The gate counts every diagnostic at or above the threshold (default `error`).
+    // The display floor is the threshold when `--severity` was given, else the
+    // lowest level (show everything) — so warnings/hints still print by default.
+    let threshold_rank = severity_rank(&severity);
+    let display_rank = if severity_given { threshold_rank } else { 0 };
+    let gating = diags.iter().filter(|d| severity_rank(&d.severity) >= threshold_rank).count();
+
+    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let lines: Vec<&str> = source.lines().collect();
+    let mut shown: Vec<&Diag> = diags
+        .iter()
+        .filter(|d| severity_rank(&d.severity) >= display_rank)
+        .collect();
+    shown.sort_by_key(|d| (d.line, d.col));
+    for d in &shown {
+        if concise {
+            eprintln!("{}", fmt_concise(d, &file));
+        } else {
+            eprintln!("{}", fmt_pretty(d, &file, &lines, color));
+        }
+    }
+
+    let errors = diags.iter().filter(|d| d.severity == "error").count();
+    let warnings = diags.iter().filter(|d| d.severity == "warning").count();
+    let summary = if errors == 0 && warnings == 0 {
+        ansi(color, "2", "Checked 1 file, no errors.")
+    } else {
+        let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
+        let mut parts = vec![plural(errors, "error")];
+        if warnings > 0 {
+            parts.push(plural(warnings, "warning"));
+        }
+        let note = if gating > 0 && severity != "error" {
+            format!(" (failing at severity {severity})")
+        } else {
+            String::new()
+        };
+        // Name the rejection stage when there are errors (parse/type/emit), so
+        // tooling can classify it from the summary line.
+        let stage_note = if errors > 0 && !stage.is_empty() {
+            format!(" ({stage} error)")
+        } else {
+            String::new()
+        };
+        let text = format!("Found {}.{note}{stage_note}", parts.join(", "));
+        ansi(color, if gating > 0 { "31" } else { "33" }, &text)
+    };
+    eprintln!("{summary}");
+
+    if gating > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    // `fmt` and `run` have their own arg shapes (optional/absent file, flags,
-    // stdin), so they're dispatched before the positional `<cmd> <input>` parsing.
+    // `fmt`, `run`, and `check` have their own arg shapes (optional/absent file,
+    // flags, stdin), so they're dispatched before the positional `<cmd> <input>`.
     if args.get(1).map(|s| s == "fmt").unwrap_or(false) {
         return run_fmt(&args[2..]);
     }
     if args.get(1).map(|s| s == "run").unwrap_or(false) {
         return run_cmd(&args[2..]);
+    }
+    if args.get(1).map(|s| s == "check").unwrap_or(false) {
+        return check_cmd(&args[2..]);
     }
     if args.len() < 3 {
         usage();
@@ -694,22 +1001,6 @@ fn main() -> Result<()> {
                 let wat = format!("{}.wat", out.strip_suffix(".wasm").unwrap_or(&out));
                 disassemble_to_wat(&out, &wat)?;
             }
-        }
-        "check" => {
-            // `check` is parse + typecheck only (the `checkSrc` entrypoint) — NOT a
-            // full compile. Emit is `vl build`'s job; running it here would only be
-            // slower and would reject type-valid programs the emitter can't yet
-            // lower. Diagnostics surface through compile_vl's error path. (No names:
-            // check emits nothing.)
-            compile_vl(
-                &compile_engine,
-                &compiler,
-                &read_source()?,
-                input,
-                "checkSrc",
-                false,
-            )?;
-            println!("ok");
         }
         _ => usage(),
     }

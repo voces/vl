@@ -53,7 +53,7 @@ The compiler seed is resolved in order:
 |---|---|
 | `vl run <file.vl>` | Compile and run; program output goes to stdout. Also `vl run -e "<src>"`, `… \| vl run` (stdin), or `vl run <prebuilt.wasm>`. |
 | `vl build <file.vl>` | Compile to WebAssembly (`-o <out.wasm>`; `-O` optimize, `--wat` also dump text). |
-| `vl check <file.vl>` | Type-check + report diagnostics only; non-zero exit on error (CI gate). |
+| `vl check <file.vl>` | Type-check + lint (errors + warnings/hints); pretty output (carets, TTY color) or `--concise`. `--severity <hint\|info\|warning\|error>` gates the exit code + display floor; `--codegen` also runs the emitter. |
 | `vl fmt <path>` | Format (AST-driven, via `format.vl`): stdout, `-w` write in place, `--check` CI gate, dirs recurse. |
 
 `-O` (optimize) and `--wat` (text dump) shell out to **binaryen** (`wasm-opt` / `wasm-dis`) on the
@@ -62,7 +62,7 @@ PATH — `brew install binaryen`, or the [prebuilt releases](https://github.com/
 
 The brains live in VL (the seed); `vl` is a thin host. A `test` subcommand is planned (see
 [`docs/test-runner-design.md`](./docs/test-runner-design.md)). Some richer `cli.ts` conveniences
-aren't ported to `vl` yet (`check` over a dir / `--fix` / `--severity`) —
+aren't ported to `vl` yet (`check` over a directory / `--exclude`, `check --fix`) —
 run those via `deno run -A compiler/cli.ts …` for now.
 
 ## Self-hosting & bootstrap
