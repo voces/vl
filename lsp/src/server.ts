@@ -588,8 +588,9 @@ connection.onHover(async (params): Promise<Hover | null> => {
 
 // Inlay hints (D6): for every declaration that *lacks* a visible annotation,
 // surface the inferred type after the identifier (`x: i32`) — the headline
-// feature for a language that otherwise hides its types. Driven by the symbol
-// table (see `deriveInlayHints`); honours the request's `range`.
+// feature for a language that otherwise hides its types. Driven by the wasm
+// checker's `inlayHintsAt` + the `inlayHintsFromWasm` source-scan filters;
+// honours the request's `range`.
 connection.languages.inlayHint.on(async (params): Promise<InlayHint[]> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
@@ -620,7 +621,7 @@ connection.languages.inlayHint.on(async (params): Promise<InlayHint[]> => {
 // (local vs parameter vs function vs type) via the D2 symbol table — something a
 // grammar can't tell apart — and merged with a lexical pass over the token
 // stream for literals/keywords/operators plus recovered `//` comments. The
-// `data` array is the delta-encoded form LSP mandates (see `semanticTokensData`).
+// `data` array is the delta-encoded form LSP mandates (see `encodeSemanticTokens`).
 connection.languages.semanticTokens.on(
   async (params): Promise<SemanticTokens> => {
     const doc = documents.get(params.textDocument.uri);
