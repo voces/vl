@@ -71,6 +71,13 @@ The built bundle lands in `playground/dist/` (git-ignored).
 Deno (the root `deno.json` import map + the `.ts` sloppy-import graph), targeting
 `platform: browser`, `format: esm`, `conditions: ["browser"]`.
 
+**Code-splitting** is on (`splitting: true`, `outdir`): the entry is `playground.js`
+(~2 MB) and everything reached only through a dynamic `import()` lands in a
+`chunk-*.js` fetched on demand — most importantly **binaryen** (~13 MB), which the
+WAT renderer (`wasmToWat`) pulls lazily, so it never weighs on the initial load.
+`index.html` loads only `playground.js` + `playground.css`; the chunks sit beside
+them and are fetched by their relative URLs.
+
 **Monaco** (`npm:monaco-editor`) is bundled through the same pipeline. Its ESM
 imports `.css` (widget styles) and a `.ttf` (the codicon icon font); esbuild
 emits the CSS into a sibling `dist/playground.css` (loaded by `index.html`) and a
@@ -96,11 +103,11 @@ Two small esbuild plugins handle the binaryen integration:
 
 binaryen@130 is an ESM module that self-initializes its inlined wasm with a
 **top-level await**: importing it resolves only once the wasm is instantiated.
-`format: esm` is required (TLA is illegal in CJS/IIFE output). It is now reached
-ONLY via the lazy `import("./toWasm.ts")` behind `wasmToWat`, so it loads when the
-WAT pane is first shown — not on page load, and never on the Run path (which
-compiles + executes on the seed). Retiring it (the WAT pane's last dependency on
-the TS compiler tree) is the remaining playground migration step.
+`format: esm` is required (TLA is illegal in CJS/IIFE output). It is reached ONLY
+via the lazy `import("binaryen")` / `import("./toWasm.ts")` behind `wasmToWat`, so
+code-splitting puts it in its own `chunk-*.js` fetched when the WAT pane is first
+shown — not on page load, and never on the Run path (which compiles + executes on
+the seed). It is the WAT pane's only remaining dependency on the TS compiler tree.
 
 If the **seed** fails to load, the UI shows a clear "Compiler failed to load…"
 status instead of a silent hang, and the editor features + Run stay disabled.
