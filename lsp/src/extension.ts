@@ -2,6 +2,7 @@ import * as path from "path";
 import * as os from "node:os";
 import { writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import {
   commands as Commands,
   ExtensionContext,
@@ -162,18 +163,26 @@ const registerRunCommand = (context: ExtensionContext) => {
       file = doc.uri.fsPath;
     }
     // Resolve the `vl` binary: an explicit `vital.compilerPath` (relative to the
-    // project root if not absolute), else `vl` on the PATH. A configured-but-
-    // missing path is a clear misconfiguration — surface it before opening a
-    // terminal, rather than leaving a cryptic shell "command not found".
+    // project root if not absolute), else `vl` on the PATH.
     const config = Workspace.getConfiguration("vital", doc.uri);
     const configuredBin = config.get<string>("compilerPath", "").trim();
     const vlBin = configuredBin
       ? (path.isAbsolute(configuredBin) ? configuredBin : path.join(cwd, configuredBin))
       : "vl";
-    if (configuredBin && !existsSync(vlBin)) {
+    // Probe the binary BEFORE opening a terminal: a missing (`ENOENT`) or
+    // wrong-platform (`exec format error`) binary fails to spawn. Surface a clear,
+    // actionable error instead of leaking a cryptic shell error into the terminal.
+    // `vl` with no args prints usage and exits non-zero, but it EXECUTES — `error`
+    // is set only when the OS can't run it at all (so a non-zero status is fine).
+    const probe = spawnSync(vlBin, [], { stdio: "ignore" });
+    if (probe.error) {
+      const where = configuredBin
+        ? `the \`vl\` binary at ${vlBin}`
+        : "`vl` on your PATH";
       Window.showErrorMessage(
-        `Vital: \`vl\` binary not found at ${vlBin} (vital.compilerPath). ` +
-          "Build it with `cd scripts/vl-host && cargo build --release`.",
+        `Vital: can't run ${where} (${probe.error.message}). Build it for this ` +
+          "platform with `cd scripts/vl-host && cargo build --release`, then set " +
+          "`vital.compilerPath` to it (or put `vl` on your PATH).",
       );
       return;
     }
