@@ -443,9 +443,69 @@ fn format_source(
 /// build output, deps, or vendored copies. Mirrors the retired TS CLI's `SKIP_DIRS`.
 const SKIP_DIRS: [&str; 4] = ["node_modules", ".git", "dist", "reference"];
 
-/// Collect every `*.vl` under `dir`, recursively, honouring the skip-list.
+// Glob-match `text` against `pat` ENTIRELY: `*` matches within a path segment,
+// `**` crosses separators, every other byte matches literally (regex metachars
+// included — no escaping needed since this isn't a regex). Backtracking; paths
+// are short. Mirrors the TS `globToRegExp` expansion (`*`→`[^/]*`, `**`→`.*`).
+fn glob_exact(p: &[u8], t: &[u8]) -> bool {
+    if p.is_empty() {
+        return t.is_empty();
+    }
+    if p[0] == b'*' {
+        let (rest, cross) = if p.len() >= 2 && p[1] == b'*' {
+            (&p[2..], true)
+        } else {
+            (&p[1..], false)
+        };
+        let mut k = 0;
+        loop {
+            if glob_exact(rest, &t[k..]) {
+                return true;
+            }
+            if k == t.len() {
+                break;
+            }
+            if !cross && t[k] == b'/' {
+                break; // a single `*` can't cross a separator
+            }
+            k += 1;
+        }
+        return false;
+    }
+    if t.is_empty() {
+        return false;
+    }
+    if p[0] == t[0] {
+        return glob_exact(&p[1..], &t[1..]);
+    }
+    false
+}
+
+/// Glob-match anchored with an optional trailing `/…`, so a directory pattern
+/// (`tests`) also matches everything beneath it (`tests/...`). Mirrors the TS
+/// `^EXPANSION(/.*)?$`.
+fn glob_anchored(pat: &str, text: &str) -> bool {
+    let (p, t) = (pat.as_bytes(), text.as_bytes());
+    (0..=t.len()).any(|k| (k == t.len() || t[k] == b'/') && glob_exact(p, &t[..k]))
+}
+
+/// An `--exclude`/`--ignore` pattern skips a candidate two ways (TS parity): its
+/// path RELATIVE TO THE ROOT, or its BASENAME. Patterns are normalized (strip a
+/// leading `./` and trailing `/`, so `./tests/` == `tests`).
+fn exclude_matches(patterns: &[String], rel_path: &str, basename: &str) -> bool {
+    patterns.iter().any(|p| {
+        let norm = p.trim_start_matches("./").trim_end_matches('/');
+        glob_anchored(norm, rel_path) || glob_anchored(norm, basename)
+    })
+}
+
+/// Collect every `*.vl` under `dir`, recursively, honouring the skip-list and the
+/// `--exclude`/`--ignore` patterns (matched against the path relative to the walk
+/// root — `rel` is the running prefix — and the basename).
 fn collect_vl_files(
     dir: &std::path::Path,
+    rel: &str,
+    excludes: &[String],
     out: &mut Vec<std::path::PathBuf>,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)
@@ -455,11 +515,17 @@ fn collect_vl_files(
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        let rel_path = if rel.is_empty() {
+            name.to_string()
+        } else {
+            format!("{rel}/{name}")
+        };
         if path.is_dir() {
-            if !SKIP_DIRS.contains(&name.as_ref()) {
-                collect_vl_files(&path, out)?;
+            if SKIP_DIRS.contains(&name.as_ref()) || exclude_matches(excludes, &rel_path, &name) {
+                continue;
             }
-        } else if name.ends_with(".vl") {
+            collect_vl_files(&path, &rel_path, excludes, out)?;
+        } else if name.ends_with(".vl") && !exclude_matches(excludes, &rel_path, &name) {
             out.push(path);
         }
     }
@@ -519,7 +585,7 @@ fn run_fmt(args: &[String]) -> Result<()> {
     for p in &paths {
         let path = std::path::Path::new(p);
         match std::fs::metadata(path) {
-            Ok(m) if m.is_dir() => collect_vl_files(path, &mut files)?,
+            Ok(m) if m.is_dir() => collect_vl_files(path, "", &[], &mut files)?,
             Ok(_) => files.push(path.to_path_buf()),
             Err(_) => {
                 eprintln!("fmt: no such file or directory: {p}");
@@ -814,10 +880,32 @@ fn fmt_pretty(d: &Diag, file: &str, lines: &[&str], color: bool) -> String {
 /// with the lint tier (`lintSrc`). `--severity <hint|info|warning|error>` both
 /// gates the exit code and raises the display floor; default gate `error`, default
 /// display "show everything". `--concise` switches to the grep-friendly one-liner.
+/// Type-check (+ lint) ONE file: stage it, run `checkSrc` (or `compileSrc` under
+/// `--codegen`), and collect the merged error + lint diagnostics. Returns the
+/// stage rc (1 parse / 2 type / 3 emit; 0 ok) and the diagnostics, plus the source
+/// (the caller needs its lines for the caret render). Reuses one loaded instance
+/// across files — `stage_program` resets the source/module table per call.
+fn check_one(
+    store: &mut Store<()>,
+    inst: &Instance,
+    file: &str,
+    codegen: bool,
+) -> Result<(i32, Vec<Diag>, String)> {
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| Error::from(e).context(format!("reading `{file}`")))?;
+    let entry = if codegen { "compileSrc" } else { "checkSrc" };
+    stage_program(store, inst, &source, file)?;
+    let rc = inst.get_typed_func::<(), i32>(&mut *store, entry)?.call(&mut *store, ())?;
+    let mut diags = collect_error_diags(store, inst)?;
+    diags.extend(collect_lint_diags(store, inst, &source)?);
+    Ok((rc, diags, source))
+}
+
 fn check_cmd(args: &[String]) -> Result<()> {
     use std::io::IsTerminal;
     let mut compiler: Option<String> = None;
-    let mut file: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut excludes: Vec<String> = Vec::new();
     let mut concise = false;
     let mut codegen = false;
     let mut severity = "error".to_string();
@@ -839,8 +927,15 @@ fn check_cmd(args: &[String]) -> Result<()> {
         } else if let Some(v) = a.strip_prefix("--severity=") {
             severity = v.to_string();
             severity_given = true;
-        } else if !a.starts_with('-') && file.is_none() {
-            file = Some(a.to_string());
+        } else if a == "--exclude" || a == "--ignore" {
+            if let Some(v) = args.get(i + 1) {
+                excludes.push(v.clone());
+            }
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("--exclude=").or_else(|| a.strip_prefix("--ignore=")) {
+            excludes.push(v.to_string());
+        } else if !a.starts_with('-') && target.is_none() {
+            target = Some(a.to_string());
         }
         i += 1;
     }
@@ -852,82 +947,86 @@ fn check_cmd(args: &[String]) -> Result<()> {
     let compiler = compiler
         .or_else(|| std::env::var("VL_COMPILER_WASM").ok())
         .unwrap_or_else(|| "build/vl-compiler.wasm".to_string());
-    // check-1 is single-file; a directory target / default-cwd walk is a follow-up.
-    let Some(file) = file else {
-        eprintln!("usage: vl check <file.vl> [--concise] [--severity <level>] [--codegen]");
-        std::process::exit(2);
+
+    // Resolve the target into a file list: a `.vl` file is taken as-is; a directory
+    // (default: the cwd) is walked recursively with the skip-list + excludes.
+    let target = target.unwrap_or_else(|| ".".to_string());
+    let meta = std::fs::metadata(&target)
+        .map_err(|e| Error::from(e).context(format!("check: cannot stat `{target}`")))?;
+    let files: Vec<String> = if meta.is_dir() {
+        let mut paths = Vec::new();
+        collect_vl_files(std::path::Path::new(&target), "", &excludes, &mut paths)?;
+        paths.sort();
+        paths.iter().map(|p| p.to_string_lossy().into_owned()).collect()
+    } else {
+        vec![target.clone()]
     };
-    let source = std::fs::read_to_string(&file)
-        .map_err(|e| Error::from(e).context(format!("reading `{file}`")))?;
 
     let engine = gc_engine(Collector::Null)?;
     let (mut store, inst) = load_compiler(&engine, &compiler)?;
-    let entry = if codegen { "compileSrc" } else { "checkSrc" };
-    stage_program(&mut store, &inst, &source, &file)?;
-    // rc names the failing STAGE (1 parse, 2 type, 3 emit) — surfaced in the
-    // summary so tooling can classify WHERE a rejection happened. A `checkSrc`
-    // run only reaches parse/type; `--codegen` runs `compileSrc`, which can emit.
-    let rc = inst.get_typed_func::<(), i32>(&mut store, entry)?.call(&mut store, ())?;
-    let stage = match rc {
-        1 => "parse",
-        2 => "type",
-        3 => "emit",
-        _ => "",
-    };
-
-    let mut diags = collect_error_diags(&mut store, &inst)?;
-    diags.extend(collect_lint_diags(&mut store, &inst, &source)?);
-
-    // The gate counts every diagnostic at or above the threshold (default `error`).
-    // The display floor is the threshold when `--severity` was given, else the
-    // lowest level (show everything) — so warnings/hints still print by default.
-    let threshold_rank = severity_rank(&severity);
-    let display_rank = if severity_given { threshold_rank } else { 0 };
-    let gating = diags.iter().filter(|d| severity_rank(&d.severity) >= threshold_rank).count();
-
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    let lines: Vec<&str> = source.lines().collect();
-    let mut shown: Vec<&Diag> = diags
-        .iter()
-        .filter(|d| severity_rank(&d.severity) >= display_rank)
-        .collect();
-    shown.sort_by_key(|d| (d.line, d.col));
-    for d in &shown {
-        if concise {
-            eprintln!("{}", fmt_concise(d, &file));
-        } else {
-            eprintln!("{}", fmt_pretty(d, &file, &lines, color));
+    let threshold_rank = severity_rank(&severity);
+    // Display floor: the threshold when `--severity` was given, else the lowest
+    // level (show everything) — so warnings/hints still print by default.
+    let display_rank = if severity_given { threshold_rank } else { 0 };
+
+    let mut total_errors = 0usize;
+    let mut total_warnings = 0usize;
+    let mut total_gating = 0usize;
+    let mut last_stage = ""; // for the single-file rejection-stage note
+    for file in &files {
+        let (rc, diags, source) = check_one(&mut store, &inst, file, codegen)?;
+        let lines: Vec<&str> = source.lines().collect();
+        let mut shown: Vec<&Diag> = diags
+            .iter()
+            .filter(|d| severity_rank(&d.severity) >= display_rank)
+            .collect();
+        shown.sort_by_key(|d| (d.line, d.col));
+        for d in &shown {
+            if concise {
+                eprintln!("{}", fmt_concise(d, file));
+            } else {
+                eprintln!("{}", fmt_pretty(d, file, &lines, color));
+            }
         }
+        total_errors += diags.iter().filter(|d| d.severity == "error").count();
+        total_warnings += diags.iter().filter(|d| d.severity == "warning").count();
+        total_gating += diags.iter().filter(|d| severity_rank(&d.severity) >= threshold_rank).count();
+        last_stage = match rc {
+            1 => "parse",
+            2 => "type",
+            3 => "emit",
+            _ => last_stage,
+        };
     }
 
-    let errors = diags.iter().filter(|d| d.severity == "error").count();
-    let warnings = diags.iter().filter(|d| d.severity == "warning").count();
-    let summary = if errors == 0 && warnings == 0 {
-        ansi(color, "2", "Checked 1 file, no errors.")
+    let summary = if total_errors == 0 && total_warnings == 0 {
+        let noun = if files.len() == 1 { "file" } else { "files" };
+        ansi(color, "2", &format!("Checked {} {noun}, no errors.", files.len()))
     } else {
         let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
-        let mut parts = vec![plural(errors, "error")];
-        if warnings > 0 {
-            parts.push(plural(warnings, "warning"));
+        let mut parts = vec![plural(total_errors, "error")];
+        if total_warnings > 0 {
+            parts.push(plural(total_warnings, "warning"));
         }
-        let note = if gating > 0 && severity != "error" {
+        let note = if total_gating > 0 && severity != "error" {
             format!(" (failing at severity {severity})")
         } else {
             String::new()
         };
-        // Name the rejection stage when there are errors (parse/type/emit), so
-        // tooling can classify it from the summary line.
-        let stage_note = if errors > 0 && !stage.is_empty() {
-            format!(" ({stage} error)")
+        // Name the rejection stage (parse/type/emit) for a single-file check, so
+        // tooling can classify WHERE the front end rejected.
+        let stage_note = if files.len() == 1 && total_errors > 0 && !last_stage.is_empty() {
+            format!(" ({last_stage} error)")
         } else {
             String::new()
         };
         let text = format!("Found {}.{note}{stage_note}", parts.join(", "));
-        ansi(color, if gating > 0 { "31" } else { "33" }, &text)
+        ansi(color, if total_gating > 0 { "31" } else { "33" }, &text)
     };
     eprintln!("{summary}");
 
-    if gating > 0 {
+    if total_gating > 0 {
         std::process::exit(1);
     }
     Ok(())
