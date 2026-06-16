@@ -4,18 +4,20 @@
 // CODEGEN runs on the self-hosted compiler seed (the SAME `build/vl-compiler.wasm`
 // the editor features and `vl build` run): the injected `WasmChecker.compile`
 // turns source into wasm bytes via the driver's `compileSrc`. Execution is the
-// pure `runWasm` (a `WebAssembly.instantiate` with the VL host-import ABI — no
-// binaryen, no compiler front end). The TS compiler front end is no longer on the
-// Run path.
+// pure `runWasmBytes` (`runtime.ts` — a `WebAssembly.instantiate` over the VL
+// host-import ABI, no binaryen, no compiler front end). WAT is `watFromBytes`
+// (`wat.ts` — binaryen disassembling those bytes, lazily code-split). Neither
+// touches the TS compiler.
 //
-// binaryen is now used ONLY to render the WAT text (`wasmToWat`), reached via a
-// dynamic `import("./toWasm.ts")` so it loads lazily when the WAT pane is shown,
-// not at module-eval time. `checkProgram` (the codegen-free TS front end) still
-// backs the multi-file `checkProject` import-resolution diagnostics — pending its
-// own move to the seed.
+// The one remaining TS-compiler import here is `checkProgram` — the codegen-free
+// front end backing the multi-file `checkProject` import-resolution diagnostics,
+// pending its own move to the seed (then the playground imports nothing from
+// `compiler/`).
 
-import { checkProgram, runWasm, type VLDiagnostic, wasmToWat } from "../../compiler/compile.ts";
+import { checkProgram, type VLDiagnostic } from "../../compiler/compile.ts";
 import type { WasmChecker } from "../../lsp/src/wasmChecker.ts";
+import { runWasmBytes } from "./runtime.ts";
+import { watFromBytes } from "./wat.ts";
 
 export type { VLDiagnostic };
 
@@ -106,7 +108,7 @@ const finishRun = async (
   let wat: string | undefined;
   if (opts.wat) {
     try {
-      wat = await wasmToWat(wasm);
+      wat = await watFromBytes(wasm);
     } catch (err) {
       // WAT rendering is a non-essential extra; never let it sink the run.
       wat = `; failed to emit WAT: ${
@@ -116,7 +118,7 @@ const finishRun = async (
   }
 
   try {
-    const { logs } = await runWasm(wasm);
+    const logs = await runWasmBytes(wasm);
     return { diagnostics, logs, wat, compiled: true, wasmBytes };
   } catch (err) {
     // A runtime trap (e.g. an out-of-bounds access) escapes WebAssembly

@@ -52,6 +52,14 @@ Organized by area. Triage freely.
 
 ## Known bugs carried as debt
 
+- **Builtin-type hover renders `i32: i32`.** Hovering a builtin TYPE name (`i32`,
+  `f64`, `boolean`, `string`, …) in any position shows `i32: i32` — silly. The
+  hover chain (`server.ts` `onHover` / `lspAdapter.hover`) ends in a builtin
+  fallback that finds the word in `wasmChecker.builtinCompletions()` and renders
+  `${word}: ${detail}`; for a builtin TYPE the `detail` IS the type name, so name
+  and type coincide. Fix: when the matched builtin is a TYPE (kind 0), render just
+  the name (or `type i32`) instead of `name: type`. Same for a user `type` alias
+  whose body renders to its own name. Minor cosmetic; affects extension + playground.
 - **native capScan shadowing bug.** A local `let` shadowing a same-named top-level
   function breaks a lambda's capture analysis (branch `claude/capscan-shadow-fix`).
   Forces awkward renames in `.vl` source — debt paid in workarounds until the fix
