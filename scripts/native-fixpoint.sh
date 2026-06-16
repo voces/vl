@@ -28,7 +28,7 @@ trap 'rm -rf "$WORK"' EXIT
 sed -E 's/\bTok\b/LexTok/g; s/\bDiag\b/LexDiag/g; s/\badvance\b/lexAdvance/g' \
   compiler/lexer.vl > "$WORK/vlsrc.vl"
 cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.vl compiler/lint.vl compiler/format.vl \
-  scripts/vl-compiler-driver.vl >> "$WORK/vlsrc.vl"
+  scripts/vl-compiler-driver.vl compiler/cli.vl >> "$WORK/vlsrc.vl"
 # BLANK the compiler's own import statements (range-aware — two compiler imports
 # span multiple lines): a line-leading `import {` would trip the vl binary's
 # module gate and send the fetch loop chasing `./ast` against the temp dir.

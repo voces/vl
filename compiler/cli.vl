@@ -1,0 +1,570 @@
+// ── `vl` CLI — the brain in VL (docs/cli-design.md) ──────────────────────────
+// The command-queue half of the CLI. The host (scripts/vl-host) is a thin PUMP:
+// it calls `cliNext()` until it returns CMD_DONE, services the one raw I/O
+// command each step asks for (read a file, print a line), commits the result
+// back, and loops. ALL POLICY lives here — arg parsing, running the checker
+// IN-MODULE, diagnostic formatting, severity gating, the exit code — so it
+// survives the host's planned shrink to a WASI shim (each command maps 1:1 onto
+// a WASI call). The linker stays EMPTY: this is a state machine over the globals
+// below, identical in shape to the H3 module-fetch loop.
+//
+// cli.vl is joined into the compiled compiler, so it calls the lexer/parser/
+// checker/lint and the driver's diagnostic accessors DIRECTLY — no second copy
+// of the compiler, no ABI marshalling inside the module.
+//
+// Command codes (mirror docs/cli-design.md). Inlined as integer literals at the
+// `cliNext` return sites; named here for the reader:
+//   CMD_DONE 0 · CMD_LIST_DIR 1 · CMD_READ_FILE 2 · CMD_WRITE_FILE 3
+//   CMD_PRINT_OUT 4 · CMD_PRINT_ERR 5
+
+// ── protocol state ────────────────────────────────────────────────────────────
+let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
+let cliArgAcc: i32[] = []       // the in-flight argument's code points
+let cliState: i32 = 0           // 0 init · 1 await-entry · 2 fetch · 3 print · 4 done
+let cliCmdPath: string = ""     // path payload of the current command
+let cliCmdData: string = ""     // data payload of the current command (a print line)
+let cliResultAcc: i32[] = []    // the host pushes a file's contents here
+let cliFileSrc: string = ""     // last committed file contents
+let cliFileFound: i32 = 0       // 1 = the host read the file, 0 = missing
+let cliExit: i32 = 0            // the process exit code, read after CMD_DONE
+
+// ── parsed `check` configuration ───────────────────────────────────────────────
+let cliFile: string = ""
+let cliConcise: i32 = 0
+let cliCodegen: i32 = 0
+let cliColor: i32 = 0
+let cliSeverity: string = "error"
+let cliSeverityGiven: i32 = 0
+let cliArgErr: string = ""      // a fatal arg-parse message (printed, exit 2)
+
+// ── work + output ──────────────────────────────────────────────────────────────
+let cliEntrySrc: string = ""    // the entry file's source
+let cliModMode: i32 = 0         // 1 = drive the module fetch loop
+let cliFetchKey: string = ""    // the module key currently being read
+let cliOut: string[] = []       // the stderr lines to emit, in order
+let cliOutIdx: i32 = 0
+
+// The reported diagnostics, as PARALLEL arrays (the compiler's own idiom — cf.
+// lint.vl's lintMsgs/lintLines/…): severity, 1-based line (0 = positionless),
+// 0-based col, 0-based end col, message. One entry per index.
+let dgSev: string[] = []
+let dgLine: i32[] = []
+let dgCol: i32[] = []
+let dgEnd: i32[] = []
+let dgMsg: string[] = []
+let cliSrcLines: string[] = []
+
+// ── argv intake (host pushes each arg before the run loop) ─────────────────────
+export function cliArgReset(): i32 {
+  cliArgs = []
+  cliArgAcc = []
+  cliState = 0
+  cliCmdPath = ""
+  cliCmdData = ""
+  cliResultAcc = []
+  cliFileSrc = ""
+  cliFileFound = 0
+  cliExit = 0
+  cliFile = ""
+  cliConcise = 0
+  cliCodegen = 0
+  cliColor = 0
+  cliSeverity = "error"
+  cliSeverityGiven = 0
+  cliArgErr = ""
+  cliEntrySrc = ""
+  cliModMode = 0
+  cliFetchKey = ""
+  cliOut = []
+  cliOutIdx = 0
+  dgSev = []
+  dgLine = []
+  dgCol = []
+  dgEnd = []
+  dgMsg = []
+  cliSrcLines = []
+  0
+}
+export function cliArgPush(c: i32): i32 {
+  cliArgAcc.push(c)
+  0
+}
+export function cliArgCommit(): i32 {
+  cliArgs.push(fromCodePoints(cliArgAcc))
+  cliArgAcc = []
+  0
+}
+
+// ── current-command payload accessors (valid until the next cliNext) ───────────
+export function cliCmdPathLen(): i32 { cliCmdPath.length }
+export function cliCmdPathAt(j: i32): i32 { cliCmdPath[j] }
+export function cliCmdDataLen(): i32 { cliCmdData.length }
+export function cliCmdDataAt(j: i32): i32 { cliCmdData[j] }
+
+// ── result intake (host commits the serviced command's result) ─────────────────
+export function cliResultPush(c: i32): i32 {
+  cliResultAcc.push(c)
+  0
+}
+export function cliFileCommit(found: i32): i32 {
+  cliFileFound = found
+  cliFileSrc = fromCodePoints(cliResultAcc)
+  cliResultAcc = []
+  0
+}
+export function cliExitCode(): i32 { return cliExit }
+
+// ── string helpers ─────────────────────────────────────────────────────────────
+function cliRepeat(s: string, n: i32): string {
+  let out = ""
+  let i = 0
+  while i < n {
+    out = out + s
+    i = i + 1
+  }
+  out
+}
+function cliUpper(s: string): string {
+  let out: i32[] = []
+  let i = 0
+  while i < s.length {
+    let c = s[i]
+    if c >= 'a' && c <= 'z' { c = c - 32 }
+    out.push(c)
+    i = i + 1
+  }
+  fromCodePoints(out)
+}
+// Tabs → 4 columns so carets line up under tab-indented source (the shown line is
+// detabbed to match). Mirrors the host's former `detab`.
+function cliDetab(s: string): string {
+  let out: i32[] = []
+  let i = 0
+  while i < s.length {
+    let c = s[i]
+    if c == '\t' {
+      let pad = 4 - (out.length % 4)
+      let p = 0
+      while p < pad {
+        out.push(' ')
+        p = p + 1
+      }
+    } else {
+      out.push(c)
+    }
+    i = i + 1
+  }
+  fromCodePoints(out)
+}
+// The visual column the prefix `[0, n)` of `raw` ends at, after detabbing.
+function cliVisualWidth(raw: string, n: i32): i32 {
+  let m = n
+  if m > raw.length { m = raw.length }
+  if m < 0 { m = 0 }
+  cliDetab(raw.slice(0, m)).length
+}
+// `str::lines()` semantics: split on `\n`, drop a trailing `\r`, no trailing
+// empty line for a final newline.
+function cliSplitLines(s: string): string[] {
+  let out: string[] = []
+  let cur: i32[] = []
+  let i = 0
+  while i < s.length {
+    let c = s[i]
+    if c == '\n' {
+      let line = fromCodePoints(cur)
+      if line.length > 0 && line[line.length - 1] == '\r' { line = line.slice(0, line.length - 1) }
+      out.push(line)
+      cur = []
+    } else {
+      cur.push(c)
+    }
+    i = i + 1
+  }
+  if cur.length > 0 {
+    let line = fromCodePoints(cur)
+    if line.length > 0 && line[line.length - 1] == '\r' { line = line.slice(0, line.length - 1) }
+    out.push(line)
+  }
+  out
+}
+
+// ── severity model (mirror the host's SEVERITIES / severity_rank) ──────────────
+// Low → high, so the rank IS the index (hint=0 … error=3). An unknown lexeme
+// falls back to `warning` (still surfaces).
+function cliSevRank(s: string): i32 {
+  if s == "hint" { return 0 }
+  if s == "info" { return 1 }
+  if s == "warning" { return 2 }
+  if s == "error" { return 3 }
+  2
+}
+function cliSevValid(s: string): boolean {
+  s == "hint" || s == "info" || s == "warning" || s == "error"
+}
+function cliSevCode(s: string): string {
+  if s == "error" { return "31" }
+  if s == "warning" { return "33" }
+  "34"
+}
+// ANSI wrap, gated on color (so call sites stay branch-free).
+function cliAnsi(color: i32, code: string, s: string): string {
+  if color != 0 { return "\x1b[" + code + "m" + s + "\x1b[0m" }
+  s
+}
+
+// ── diagnostic formatting (the policy retired from the Rust host) ──────────────
+function cliAddDiag(sev: string, line: i32, col: i32, endc: i32, msg: string): i32 {
+  dgSev.push(sev)
+  dgLine.push(line)
+  dgCol.push(col)
+  dgEnd.push(endc)
+  dgMsg.push(msg)
+  0
+}
+// Concise one-liner: `<file>: <severity> [<line>:<col>] <message>` (1-based L:C).
+function cliFmtConcise(d: i32): string {
+  let line = dgLine[d]
+  if line <= 0 { line = 1 }
+  cliFile + ": " + dgSev[d] + " [" + i32ToStr(line) + ":" + i32ToStr(dgCol[d] + 1) + "] " + dgMsg[d]
+}
+// Pretty rustc/Deno-style block: `[SEVERITY]: msg` / source line / caret /
+// `at file:line:col`. A positionless diagnostic drops the source+caret block.
+function cliFmtPretty(d: i32): string {
+  let sev = dgSev[d]
+  let head = cliAnsi(cliColor, "1;" + cliSevCode(sev), "[" + cliUpper(sev) + "]")
+  let out = head + ": " + dgMsg[d]
+  let col = dgCol[d]
+  if dgLine[d] > 0 {
+    let idx = dgLine[d] - 1
+    if idx >= 0 && idx < cliSrcLines.length {
+      let raw = cliSrcLines[idx]
+      let shown = cliDetab(raw)
+      out = out + "\n  " + shown
+      let start = cliVisualWidth(raw, col)
+      let endc = dgEnd[d]
+      if endc < col + 1 { endc = col + 1 }
+      let end = cliVisualWidth(raw, endc)
+      let remaining = shown.length - start
+      if remaining < 1 { remaining = 1 }
+      let span = end - start
+      if span < 1 { span = 1 }
+      if span > remaining { span = remaining }
+      let underline = "^" + cliRepeat("~", span - 1)
+      out = out + "\n  " + cliRepeat(" ", start) + cliAnsi(cliColor, cliSevCode(sev), underline)
+    }
+    out = out + "\n" + cliAnsi(cliColor, "2", "  at " + cliFile + ":" + i32ToStr(dgLine[d]) + ":" + i32ToStr(col + 1))
+  } else {
+    out = out + "\n" + cliAnsi(cliColor, "2", "  at " + cliFile)
+  }
+  out
+}
+function cliPlural(n: i32, w: string): string {
+  let out = i32ToStr(n) + " " + w
+  if n != 1 { out = out + "s" }
+  out
+}
+
+// Stable insertion sort of a diagnostic-INDEX array by (line, col): ties keep
+// insertion order, so error-tier diagnostics precede lint-tier ones at the same
+// position (matching the host's stable `sort_by_key`).
+function cliDiagLess(a: i32, b: i32): boolean {
+  if dgLine[a] != dgLine[b] { return dgLine[a] < dgLine[b] }
+  dgCol[a] < dgCol[b]
+}
+function cliStableSort(order: i32[]): i32 {
+  let i = 1
+  while i < order.length {
+    let key = order[i]
+    let j = i - 1
+    while j >= 0 && cliDiagLess(key, order[j]) {
+      order[j + 1] = order[j]
+      j = j - 1
+    }
+    order[j + 1] = key
+    i = i + 1
+  }
+  0
+}
+
+// ── module-mode detection (mirror the host's cheap textual gate) ───────────────
+// A line whose first non-space token is `import` immediately followed (after
+// optional whitespace) by `{`.
+function cliLineIsImport(line: string): i32 {
+  let i = 0
+  while i < line.length && (line[i] == ' ' || line[i] == '\t') { i = i + 1 }
+  let kw = "import"
+  let k = 0
+  while k < kw.length {
+    if i + k >= line.length { return 0 }
+    if line[i + k] != kw[k] { return 0 }
+    k = k + 1
+  }
+  i = i + kw.length
+  while i < line.length && (line[i] == ' ' || line[i] == '\t') { i = i + 1 }
+  if i < line.length && line[i] == '{' { return 1 }
+  0
+}
+function cliHasImports(s: string): i32 {
+  let lines = cliSplitLines(s)
+  let i = 0
+  while i < lines.length {
+    if cliLineIsImport(lines[i]) != 0 { return 1 }
+    i = i + 1
+  }
+  0
+}
+
+// ── the `check` policy ─────────────────────────────────────────────────────────
+// Parse `check`'s args. `--compiler <path>` is the host's concern (it selects the
+// module) — skip it and its value here.
+function cliParseArgs(): i32 {
+  let i = 1
+  while i < cliArgs.length {
+    let a = cliArgs[i]
+    if a == "--compiler" {
+      i = i + 1
+    } else if a == "--concise" {
+      cliConcise = 1
+    } else if a == "--codegen" {
+      cliCodegen = 1
+    } else if a == "--severity" {
+      if i + 1 < cliArgs.length { cliSeverity = cliArgs[i + 1] }
+      cliSeverityGiven = 1
+      i = i + 1
+    } else if a.length > 11 && a.slice(0, 11) == "--severity=" {
+      cliSeverity = a.slice(11, a.length)
+      cliSeverityGiven = 1
+    } else if a.length > 8 && a.slice(0, 8) == "--color=" {
+      if a.slice(8, a.length) == "always" { cliColor = 1 } else { cliColor = 0 }
+    } else if a.length > 0 && a[0] != '-' && cliFile.length == 0 {
+      cliFile = a
+    }
+    i = i + 1
+  }
+  if cliSeverityGiven != 0 && !cliSevValid(cliSeverity) {
+    cliArgErr = "check: invalid --severity `" + cliSeverity + "` (expected one of: error, warning, info, hint)"
+  }
+  0
+}
+
+// Stage `cliEntrySrc` into the single-source input buffer (vcCodes).
+function cliStageEntry(): i32 {
+  srcReset()
+  let i = 0
+  while i < cliEntrySrc.length {
+    srcPush(cliEntrySrc[i])
+    i = i + 1
+  }
+  0
+}
+// Commit one (key, src, found) into the module table (the fetch protocol).
+function cliModCommitOne(key: string, src: string, found: i32): i32 {
+  let i = 0
+  while i < key.length {
+    modKeyPush(key[i])
+    i = i + 1
+  }
+  if found != 0 {
+    let j = 0
+    while j < src.length {
+      modSrcPush(src[j])
+      j = j + 1
+    }
+  }
+  modCommit(found)
+  0
+}
+// The k-th pending module key, read per-code-point from the driver's accessors.
+function cliPendingKey(k: i32): string {
+  let out: i32[] = []
+  let n = modPendingLen(k)
+  let j = 0
+  while j < n {
+    out.push(modPendingAt(k, j))
+    j = j + 1
+  }
+  fromCodePoints(out)
+}
+
+// Run the checker in-module and build the stderr output + exit code.
+function cliRunCheck(): i32 {
+  if cliModMode == 0 { cliStageEntry() }
+  let rc = 0
+  if cliCodegen != 0 { rc = compileSrc() } else { rc = checkSrc() }
+  let stage = ""
+  if rc == 1 { stage = "parse" } else if rc == 2 { stage = "type" } else if rc == 3 { stage = "emit" }
+
+  // Error-tier diagnostics (all `error`), read straight from the driver stores.
+  dgSev = []
+  dgLine = []
+  dgCol = []
+  dgEnd = []
+  dgMsg = []
+  let n = diagCount()
+  let i = 0
+  while i < n {
+    cliAddDiag("error", diagLine(i), diagCol(i), diagEndCol(i), vcDiagMsg(i))
+    i = i + 1
+  }
+  // Lint-tier diagnostics: single-file, parse-only, over the ENTRY source — so
+  // re-stage the entry (module mode left the module table populated; `lintSrc`
+  // ignores it and reads vcSource()).
+  srcReset()
+  let li = 0
+  while li < cliEntrySrc.length {
+    srcPush(cliEntrySrc[li])
+    li = li + 1
+  }
+  let ln = lintSrc()
+  if ln > 0 {
+    let k = 0
+    while k < ln {
+      let sev = lintSevAt(k)
+      if sev.length == 0 { sev = "warning" }
+      cliAddDiag(sev, lintLineAt(k), lintColAt(k), lintColAt(k) + 1, lintMsgAt(k))
+      k = k + 1
+    }
+  }
+  cliBuildOutput(stage)
+  0
+}
+
+function cliBuildOutput(stage: string): i32 {
+  cliOut = []
+  cliSrcLines = cliSplitLines(cliEntrySrc)
+  let thr = cliSevRank(cliSeverity)
+  let disp = 0
+  if cliSeverityGiven != 0 { disp = thr }
+
+  // The gate counts every diagnostic at or above the threshold (default `error`).
+  let gating = 0
+  let i = 0
+  while i < dgSev.length {
+    if cliSevRank(dgSev[i]) >= thr { gating = gating + 1 }
+    i = i + 1
+  }
+  // The display floor is the threshold when `--severity` was given, else show
+  // everything. Collect indices, stable-sort by position, render.
+  let order: i32[] = []
+  let j = 0
+  while j < dgSev.length {
+    if cliSevRank(dgSev[j]) >= disp { order.push(j) }
+    j = j + 1
+  }
+  cliStableSort(order)
+  let s = 0
+  while s < order.length {
+    if cliConcise != 0 { cliOut.push(cliFmtConcise(order[s])) } else { cliOut.push(cliFmtPretty(order[s])) }
+    s = s + 1
+  }
+
+  let errors = 0
+  let warnings = 0
+  let c = 0
+  while c < dgSev.length {
+    if dgSev[c] == "error" { errors = errors + 1 }
+    if dgSev[c] == "warning" { warnings = warnings + 1 }
+    c = c + 1
+  }
+  let summary = ""
+  if errors == 0 && warnings == 0 {
+    summary = cliAnsi(cliColor, "2", "Checked 1 file, no errors.")
+  } else {
+    let parts = cliPlural(errors, "error")
+    if warnings > 0 { parts = parts + ", " + cliPlural(warnings, "warning") }
+    let note = ""
+    if gating > 0 && cliSeverity != "error" { note = " (failing at severity " + cliSeverity + ")" }
+    let stageNote = ""
+    if errors > 0 && stage != "" { stageNote = " (" + stage + " error)" }
+    let text = "Found " + parts + "." + note + stageNote
+    let code = "33"
+    if gating > 0 { code = "31" }
+    summary = cliAnsi(cliColor, code, text)
+  }
+  cliOut.push(summary)
+  cliExit = 0
+  if gating > 0 { cliExit = 1 }
+  0
+}
+
+// ── the state machine ──────────────────────────────────────────────────────────
+// Transition into the print phase and return the first output command.
+function cliBeginPrint(): i32 {
+  cliOutIdx = 0
+  cliState = 3
+  cliEmitNextOut()
+}
+function cliEmitNextOut(): i32 {
+  if cliOutIdx < cliOut.length {
+    cliCmdData = cliOut[cliOutIdx]
+    cliOutIdx = cliOutIdx + 1
+    return 5 // CMD_PRINT_ERR
+  }
+  cliState = 4
+  0 // CMD_DONE
+}
+// Either request the next pending module file, or — graph closed — run the check.
+function cliFetchOrCheck(): i32 {
+  if modPendingCount() > 0 {
+    cliFetchKey = cliPendingKey(0)
+    cliCmdPath = cliFetchKey
+    cliState = 2
+    return 2 // CMD_READ_FILE
+  }
+  cliRunCheck()
+  cliBeginPrint()
+}
+
+export function cliNext(): i32 {
+  // Dispatch on a LOCAL copy of the state: `cliState == N` would narrow the
+  // global to the literal `N`, and a later `cliState = …` write would then be
+  // checked against that narrowed singleton. Narrowing the local instead leaves
+  // the global free to take the next state.
+  let st = cliState
+  if st == 0 {
+    cliParseArgs()
+    if cliArgErr != "" {
+      cliOut = [cliArgErr]
+      cliExit = 2
+      return cliBeginPrint()
+    }
+    if cliArgs.length == 0 || cliArgs[0] != "check" {
+      cliOut = ["vl: this build's pump only implements `check`"]
+      cliExit = 2
+      return cliBeginPrint()
+    }
+    if cliFile.length == 0 {
+      cliOut = ["usage: vl check <file.vl> [--concise] [--severity <level>] [--codegen]"]
+      cliExit = 2
+      return cliBeginPrint()
+    }
+    cliCmdPath = cliFile
+    cliState = 1
+    return 2 // CMD_READ_FILE — the entry
+  }
+  if st == 1 {
+    if cliFileFound == 0 {
+      cliOut = ["check: cannot read " + cliFile]
+      cliExit = 2
+      return cliBeginPrint()
+    }
+    cliEntrySrc = cliFileSrc
+    modReset()
+    if cliHasImports(cliEntrySrc) != 0 {
+      cliModMode = 1
+      cliModCommitOne(cliFile, cliEntrySrc, 1)
+    } else {
+      cliModMode = 0
+    }
+    return cliFetchOrCheck()
+  }
+  if st == 2 {
+    cliModCommitOne(cliFetchKey, cliFileSrc, cliFileFound)
+    return cliFetchOrCheck()
+  }
+  if st == 3 {
+    return cliEmitNextOut()
+  }
+  0 // CMD_DONE
+}

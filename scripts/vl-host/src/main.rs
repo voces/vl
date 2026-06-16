@@ -148,8 +148,9 @@ fn load_compiler(engine: &Engine, compiler_path: &str) -> Result<(Store<()>, Ins
 
 /// Stage `source` (as `source_path`) into a freshly-loaded compiler instance: run
 /// the module fetch loop when it has imports, then `srcReset` + `srcPush`. Leaves
-/// the instance ready for a `checkSrc` / `compileSrc` / `lintSrc` call. Shared by
-/// `compile_vl` (build/run) and `check_cmd`.
+/// the instance ready for a `checkSrc` / `compileSrc` / `lintSrc` call. Used by
+/// `compile_vl` (build/run); `check` drives its own module fetch from VL via the
+/// command-queue pump.
 fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_path: &str) -> Result<()> {
     let src_reset = inst.get_typed_func::<(), i32>(&mut *store, "srcReset")?;
     let src_push = inst.get_typed_func::<i32, i32>(&mut *store, "srcPush")?;
@@ -639,299 +640,131 @@ fn run_cmd(args: &[String]) -> Result<()> {
     compile_and_run(&compiler, &source, "source.vl", &run_engine)
 }
 
-// ── `vl check` — diagnostics (errors + lint), severity gating + display ──────
+// ── `vl check` — driven by the in-wasm CLI command-queue (docs/cli-design.md) ──
+// The host is a thin PUMP: push argv, then call `cliNext()` until CMD_DONE,
+// servicing each raw I/O command (read a file, print a line) and committing the
+// result back. ALL policy — arg parsing, running the checker in-module,
+// diagnostic formatting, severity gating, the exit code — lives in `cli.vl`
+// inside the seed, so it survives the host's planned shrink to a WASI shim.
 
-/// One reported diagnostic, merged from the error tier (`checkSrc`/`compileSrc`'s
-/// `diag*`) and the lint tier (`lintSrc`'s `lint*`). `line` is 1-based (0 =
-/// positionless, e.g. a codegen sentinel); `col`/`end_col` are 0-based.
-#[derive(Clone)]
-struct Diag {
-    severity: String, // "error" | "warning" | "info" | "hint"
-    line: i32,
-    col: i32,
-    end_col: i32,
-    message: String,
-}
+const CMD_DONE: i32 = 0;
+const CMD_READ_FILE: i32 = 2;
+const CMD_PRINT_OUT: i32 = 4;
+const CMD_PRINT_ERR: i32 = 5;
 
-// Low → high, so the index IS the rank (hint=0 … error=3). An unknown lexeme
-// falls back to `warning` (still surfaces). Mirrors the TS CLI's SEVERITY_ORDER.
-const SEVERITIES: [&str; 4] = ["hint", "info", "warning", "error"];
-fn severity_rank(s: &str) -> i32 {
-    SEVERITIES.iter().position(|x| *x == s).map(|i| i as i32).unwrap_or(2)
-}
-
-// Read a per-index wasm string (`len(i)` code points via `at(i, j)`).
-fn read_wasm_string(
+/// Read the current command's string payload via a `<prefix>Len()` / `<prefix>At(j)`
+/// accessor pair (one UTF-32 code point per `At`, the seed's string-out idiom).
+fn read_cli_str(
     store: &mut Store<()>,
-    len: &TypedFunc<i32, i32>,
-    at: &TypedFunc<(i32, i32), i32>,
-    i: i32,
+    len: &TypedFunc<(), i32>,
+    at: &TypedFunc<i32, i32>,
 ) -> Result<String> {
-    let n = len.call(&mut *store, i)?;
+    let n = len.call(&mut *store, ())?;
     let mut s = String::with_capacity(n.max(0) as usize);
     for j in 0..n {
-        if let Some(c) = char::from_u32(at.call(&mut *store, (i, j))? as u32) {
+        if let Some(c) = char::from_u32(at.call(&mut *store, j)? as u32) {
             s.push(c);
         }
     }
     Ok(s)
 }
 
-/// The error-tier diagnostics in the store after a `checkSrc`/`compileSrc` (all
-/// `error` severity). Native line is 1-based (0 = positionless), col 0-based.
-fn collect_error_diags(store: &mut Store<()>, inst: &Instance) -> Result<Vec<Diag>> {
-    let count = inst.get_typed_func::<(), i32>(&mut *store, "diagCount")?;
-    let mlen = inst.get_typed_func::<i32, i32>(&mut *store, "diagMsgLen")?;
-    let mat = inst.get_typed_func::<(i32, i32), i32>(&mut *store, "diagMsgAt")?;
-    let dline = inst.get_typed_func::<i32, i32>(&mut *store, "diagLine")?;
-    let dcol = inst.get_typed_func::<i32, i32>(&mut *store, "diagCol")?;
-    let dend = inst.get_typed_func::<i32, i32>(&mut *store, "diagEndCol").ok();
-    let n = count.call(&mut *store, ())?;
-    let mut out = Vec::with_capacity(n.max(0) as usize);
-    for i in 0..n {
-        let message = read_wasm_string(store, &mlen, &mat, i)?;
-        let line = dline.call(&mut *store, i)?;
-        let col = dcol.call(&mut *store, i)?;
-        let end_col = match &dend {
-            Some(f) => f.call(&mut *store, i)?,
-            None => col,
-        };
-        out.push(Diag { severity: "error".into(), line, col, end_col, message });
-    }
-    Ok(out)
-}
-
-/// The lint-tier diagnostics (`lintSrc`) for `source` — warnings/info/hints the
-/// error tier never reports. Lint is single-file + parse-only, so the entry
-/// source is staged directly (no module fetch); `-1`/`0` (parse error / none)
-/// yields an empty set. Absent on an older seed → empty (no lint).
-fn collect_lint_diags(store: &mut Store<()>, inst: &Instance, source: &str) -> Result<Vec<Diag>> {
-    let src_reset = inst.get_typed_func::<(), i32>(&mut *store, "srcReset")?;
-    let src_push = inst.get_typed_func::<i32, i32>(&mut *store, "srcPush")?;
-    let lint = match inst.get_typed_func::<(), i32>(&mut *store, "lintSrc") {
-        Ok(f) => f,
-        Err(_) => return Ok(vec![]),
-    };
-    let mlen = inst.get_typed_func::<i32, i32>(&mut *store, "lintMsgLen")?;
-    let mat = inst.get_typed_func::<(i32, i32), i32>(&mut *store, "lintMsgByte")?;
-    let slen = inst.get_typed_func::<i32, i32>(&mut *store, "lintSevLen")?;
-    let sat = inst.get_typed_func::<(i32, i32), i32>(&mut *store, "lintSevByte")?;
-    let lline = inst.get_typed_func::<i32, i32>(&mut *store, "lintLine")?;
-    let lcol = inst.get_typed_func::<i32, i32>(&mut *store, "lintCol")?;
-    src_reset.call(&mut *store, ())?;
-    for ch in source.chars() {
-        src_push.call(&mut *store, ch as i32)?;
-    }
-    let n = lint.call(&mut *store, ())?;
-    let mut out = Vec::new();
-    if n <= 0 {
-        return Ok(out);
-    }
-    for i in 0..n {
-        let message = read_wasm_string(store, &mlen, &mat, i)?;
-        let sev = read_wasm_string(store, &slen, &sat, i)?;
-        let line = lline.call(&mut *store, i)?;
-        let col = lcol.call(&mut *store, i)?;
-        out.push(Diag {
-            severity: if sev.is_empty() { "warning".into() } else { sev },
-            line,
-            col,
-            end_col: col + 1,
-            message,
-        });
-    }
-    Ok(out)
-}
-
-// ANSI wrap, gated on `color` (so call sites stay branch-free).
-fn ansi(color: bool, code: &str, s: &str) -> String {
-    if color {
-        format!("\x1b[{code}m{s}\x1b[0m")
-    } else {
-        s.to_string()
-    }
-}
-fn sev_code(sev: &str) -> &'static str {
-    match sev {
-        "error" => "31",
-        "warning" => "33",
-        _ => "34",
-    }
-}
-
-// Tabs → 4 columns so carets line up under tab-indented source (the shown line is
-// detabbed to match). `visual_width(s, n)` is the column the prefix `[0,n)` ends at.
-const TAB_WIDTH: usize = 4;
-fn detab(s: &str) -> String {
-    let mut out = String::new();
-    for ch in s.chars() {
-        if ch == '\t' {
-            let pad = TAB_WIDTH - (out.len() % TAB_WIDTH);
-            out.push_str(&" ".repeat(pad));
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-fn visual_width(raw: &str, n: usize) -> usize {
-    let take: String = raw.chars().take(n).collect();
-    detab(&take).chars().count()
-}
-
-/// Concise one-line form: `<file>: <severity> [<line>:<col>] <message>` (1-based
-/// L:C). Matches the TS CLI's `--concise` shape (grep-friendly, never colored).
-fn fmt_concise(d: &Diag, file: &str) -> String {
-    let line = if d.line > 0 { d.line } else { 1 };
-    format!("{file}: {} [{}:{}] {}", d.severity, line, d.col + 1, d.message)
-}
-
-/// Pretty rustc/Deno-style rendering: `[SEVERITY]: msg` / source line / caret /
-/// `at file:line:col`. A positionless diagnostic drops the source+caret block.
-fn fmt_pretty(d: &Diag, file: &str, lines: &[&str], color: bool) -> String {
-    let head = ansi(color, &format!("1;{}", sev_code(&d.severity)), &format!("[{}]", d.severity.to_uppercase()));
-    let mut out = vec![format!("{head}: {}", d.message)];
-    if d.line > 0 {
-        if let Some(raw) = lines.get((d.line - 1) as usize) {
-            let shown = detab(raw);
-            out.push(format!("  {shown}"));
-            let start = visual_width(raw, d.col as usize);
-            let end = visual_width(raw, d.end_col.max(d.col + 1) as usize);
-            let remaining = shown.chars().count().saturating_sub(start).max(1);
-            let span = (end.saturating_sub(start)).clamp(1, remaining);
-            let underline = format!("^{}", "~".repeat(span - 1));
-            out.push(format!("  {}{}", " ".repeat(start), ansi(color, sev_code(&d.severity), &underline)));
-        }
-        out.push(ansi(color, "2", &format!("  at {file}:{}:{}", d.line, d.col + 1)));
-    } else {
-        out.push(ansi(color, "2", &format!("  at {file}")));
-    }
-    out.join("\n")
-}
-
-/// `vl check` — type-check + lint a file, reporting diagnostics. Merges the error
-/// tier (`checkSrc`, or `compileSrc` under `--codegen` so emit errors surface)
-/// with the lint tier (`lintSrc`). `--severity <hint|info|warning|error>` both
-/// gates the exit code and raises the display floor; default gate `error`, default
-/// display "show everything". `--concise` switches to the grep-friendly one-liner.
-fn check_cmd(args: &[String]) -> Result<()> {
-    use std::io::IsTerminal;
+/// `vl check` (and, later, every subcommand) over the command-queue pump. The host
+/// performs only raw mechanism: load the compiler module, resolve the compiler
+/// path + TTY colour, stream argv in, then loop servicing file reads and line
+/// prints until the VL program reports CMD_DONE, and exit with its code.
+fn cli_pump(args: &[String]) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    // Resolve the compiler module (host mechanism): --compiler / env / default.
     let mut compiler: Option<String> = None;
-    let mut file: Option<String> = None;
-    let mut concise = false;
-    let mut codegen = false;
-    let mut severity = "error".to_string();
-    let mut severity_given = false;
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
-        if a == "--compiler" {
+        if args[i] == "--compiler" {
             compiler = args.get(i + 1).cloned();
             i += 1;
-        } else if a == "--concise" {
-            concise = true;
-        } else if a == "--codegen" {
-            codegen = true;
-        } else if a == "--severity" {
-            severity = args.get(i + 1).cloned().unwrap_or_default();
-            severity_given = true;
-            i += 1;
-        } else if let Some(v) = a.strip_prefix("--severity=") {
-            severity = v.to_string();
-            severity_given = true;
-        } else if !a.starts_with('-') && file.is_none() {
-            file = Some(a.to_string());
         }
         i += 1;
-    }
-    if severity_given && !SEVERITIES.contains(&severity.as_str()) {
-        let levels: Vec<&str> = SEVERITIES.iter().rev().copied().collect();
-        eprintln!("check: invalid --severity `{severity}` (expected one of: {})", levels.join(", "));
-        std::process::exit(2);
     }
     let compiler = compiler
         .or_else(|| std::env::var("VL_COMPILER_WASM").ok())
         .unwrap_or_else(|| "build/vl-compiler.wasm".to_string());
-    // check-1 is single-file; a directory target / default-cwd walk is a follow-up.
-    let Some(file) = file else {
-        eprintln!("usage: vl check <file.vl> [--concise] [--severity <level>] [--codegen]");
-        std::process::exit(2);
-    };
-    let source = std::fs::read_to_string(&file)
-        .map_err(|e| Error::from(e).context(format!("reading `{file}`")))?;
 
     let engine = gc_engine(Collector::Null)?;
     let (mut store, inst) = load_compiler(&engine, &compiler)?;
-    let entry = if codegen { "compileSrc" } else { "checkSrc" };
-    stage_program(&mut store, &inst, &source, &file)?;
-    // rc names the failing STAGE (1 parse, 2 type, 3 emit) — surfaced in the
-    // summary so tooling can classify WHERE a rejection happened. A `checkSrc`
-    // run only reaches parse/type; `--codegen` runs `compileSrc`, which can emit.
-    let rc = inst.get_typed_func::<(), i32>(&mut store, entry)?.call(&mut store, ())?;
-    let stage = match rc {
-        1 => "parse",
-        2 => "type",
-        3 => "emit",
-        _ => "",
-    };
 
-    let mut diags = collect_error_diags(&mut store, &inst)?;
-    diags.extend(collect_lint_diags(&mut store, &inst, &source)?);
-
-    // The gate counts every diagnostic at or above the threshold (default `error`).
-    // The display floor is the threshold when `--severity` was given, else the
-    // lowest level (show everything) — so warnings/hints still print by default.
-    let threshold_rank = severity_rank(&severity);
-    let display_rank = if severity_given { threshold_rank } else { 0 };
-    let gating = diags.iter().filter(|d| severity_rank(&d.severity) >= threshold_rank).count();
-
+    // TTY + NO_COLOR is host mechanism; the VL formatter can't probe isatty, so the
+    // resolved decision rides in as a synthetic `--color=always|never` argument.
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    let lines: Vec<&str> = source.lines().collect();
-    let mut shown: Vec<&Diag> = diags
-        .iter()
-        .filter(|d| severity_rank(&d.severity) >= display_rank)
-        .collect();
-    shown.sort_by_key(|d| (d.line, d.col));
-    for d in &shown {
-        if concise {
-            eprintln!("{}", fmt_concise(d, &file));
-        } else {
-            eprintln!("{}", fmt_pretty(d, &file, &lines, color));
+
+    let arg_reset = inst.get_typed_func::<(), i32>(&mut store, "cliArgReset")?;
+    let arg_push = inst.get_typed_func::<i32, i32>(&mut store, "cliArgPush")?;
+    let arg_commit = inst.get_typed_func::<(), i32>(&mut store, "cliArgCommit")?;
+    arg_reset.call(&mut store, ())?;
+    for a in args {
+        for ch in a.chars() {
+            arg_push.call(&mut store, ch as i32)?;
+        }
+        arg_commit.call(&mut store, ())?;
+    }
+    let color_arg = if color { "--color=always" } else { "--color=never" };
+    for ch in color_arg.chars() {
+        arg_push.call(&mut store, ch as i32)?;
+    }
+    arg_commit.call(&mut store, ())?;
+
+    let next = inst.get_typed_func::<(), i32>(&mut store, "cliNext")?;
+    let path_len = inst.get_typed_func::<(), i32>(&mut store, "cliCmdPathLen")?;
+    let path_at = inst.get_typed_func::<i32, i32>(&mut store, "cliCmdPathAt")?;
+    let data_len = inst.get_typed_func::<(), i32>(&mut store, "cliCmdDataLen")?;
+    let data_at = inst.get_typed_func::<i32, i32>(&mut store, "cliCmdDataAt")?;
+    let result_push = inst.get_typed_func::<i32, i32>(&mut store, "cliResultPush")?;
+    let file_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliFileCommit")?;
+    let exit_code = inst.get_typed_func::<(), i32>(&mut store, "cliExitCode")?;
+
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+    loop {
+        match next.call(&mut store, ())? {
+            CMD_DONE => break,
+            CMD_READ_FILE => {
+                let path = read_cli_str(&mut store, &path_len, &path_at)?;
+                // A `std:` key maps to `<stdDir>/<name>.vl` (slash segments are
+                // subdirectories); every other key is a filesystem path read as-is.
+                // A missing file commits `found = 0` (the VL program raises its own
+                // unresolvable-import / cannot-read diagnostic).
+                let data = match path.strip_prefix("std:") {
+                    Some(name) => std_dir()
+                        .and_then(|d| std::fs::read_to_string(d.join(format!("{name}.vl"))).ok()),
+                    None => std::fs::read_to_string(&path).ok(),
+                };
+                match data {
+                    Some(s) => {
+                        for ch in s.chars() {
+                            result_push.call(&mut store, ch as i32)?;
+                        }
+                        file_commit.call(&mut store, 1)?;
+                    }
+                    None => {
+                        file_commit.call(&mut store, 0)?;
+                    }
+                }
+            }
+            CMD_PRINT_OUT => {
+                let line = read_cli_str(&mut store, &data_len, &data_at)?;
+                writeln!(out, "{line}")?;
+            }
+            CMD_PRINT_ERR => {
+                let line = read_cli_str(&mut store, &data_len, &data_at)?;
+                writeln!(err, "{line}")?;
+            }
+            other => bail!("vl: unknown CLI command {other} from the wasm pump"),
         }
     }
-
-    let errors = diags.iter().filter(|d| d.severity == "error").count();
-    let warnings = diags.iter().filter(|d| d.severity == "warning").count();
-    let summary = if errors == 0 && warnings == 0 {
-        ansi(color, "2", "Checked 1 file, no errors.")
-    } else {
-        let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
-        let mut parts = vec![plural(errors, "error")];
-        if warnings > 0 {
-            parts.push(plural(warnings, "warning"));
-        }
-        let note = if gating > 0 && severity != "error" {
-            format!(" (failing at severity {severity})")
-        } else {
-            String::new()
-        };
-        // Name the rejection stage when there are errors (parse/type/emit), so
-        // tooling can classify it from the summary line.
-        let stage_note = if errors > 0 && !stage.is_empty() {
-            format!(" ({stage} error)")
-        } else {
-            String::new()
-        };
-        let text = format!("Found {}.{note}{stage_note}", parts.join(", "));
-        ansi(color, if gating > 0 { "31" } else { "33" }, &text)
-    };
-    eprintln!("{summary}");
-
-    if gating > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
+    out.flush().ok();
+    err.flush().ok();
+    std::process::exit(exit_code.call(&mut store, ())?);
 }
+
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -944,7 +777,8 @@ fn main() -> Result<()> {
         return run_cmd(&args[2..]);
     }
     if args.get(1).map(|s| s == "check").unwrap_or(false) {
-        return check_cmd(&args[2..]);
+        // The subcommand rides as argv[0] so the VL program dispatches on it.
+        return cli_pump(&args[1..]);
     }
     if args.len() < 3 {
         usage();
