@@ -166,50 +166,61 @@ const main = async (): Promise<void> => {
   console.error("bundling DOM-free core (browser settings)…");
   const code = await bundleCore("src/playground.ts");
 
-  // Import the freshly built browser bundle. Evaluating it runs binaryen's
-  // top-level await — the same instantiation a page performs on load. Write it to
-  // a real temp file rather than a data: URL so `import.meta.url` is a file URL:
-  // under Deno, binaryen's Emscripten glue detects `globalThis.process` and takes
-  // its node branch (`createRequire(import.meta.url)`), which rejects data: URLs.
-  // In a browser `process` is undefined and that branch is skipped — so this is a
-  // Deno-host detail, not a browser concern; either way the SAME bundled binaryen
-  // + compiler codegen is what runs here.
+  // Import the freshly built browser bundle. Write it to a real temp file rather
+  // than a data: URL so `import.meta.url` is a file URL: under Deno, binaryen's
+  // Emscripten glue (lazily imported by `wasmToWat`) detects `globalThis.process`
+  // and takes its node branch (`createRequire(import.meta.url)`), which rejects
+  // data: URLs. In a browser `process` is undefined and that branch is skipped —
+  // a Deno-host detail, not a browser concern; either way the SAME bundled
+  // binaryen renders the WAT below.
   const tmp = await Deno.makeTempFile({ suffix: ".mjs" });
   await Deno.writeTextFile(tmp, code);
   const mod = await import(
     new URL(`file://${tmp}`).href
   ) as typeof import("./src/playground.ts");
-  console.error("bundle evaluated (binaryen instantiated)");
+  console.error("bundle evaluated");
 
-  // 1. A clean program compiles, runs, and logs.
-  const ok = await mod.runProgram(
-    `print(42)\nlet s = 0\nwhile s < 10 { s = s + 1 }\nprint(s)`,
-    { wat: true },
-  );
-  if (ok.diagnostics.some((d) => d.severity === "error")) {
-    fail(`clean program produced errors: ${JSON.stringify(ok.diagnostics)}`);
-  }
-  if (!ok.compiled) fail("clean program did not compile to wasm");
-  if (ok.logs.join(",") !== "42,10") {
-    fail(`unexpected log output: ${JSON.stringify(ok.logs)}`);
-  }
-  if (!ok.wat || !ok.wat.includes("(module")) {
-    fail(`WAT was not emitted: ${ok.wat?.slice(0, 80)}`);
-  }
-  console.error(
-    `OK: clean run -> logs ${JSON.stringify(ok.logs)}, WAT emitted`,
-  );
+  // The Run path compiles on the self-hosted seed (the headless analogue of the
+  // page's fetch — build it from the on-disk seed). Absent → skip the run checks.
+  const runChecker = loadSeedChecker();
+  if (runChecker === undefined) {
+    console.error(
+      "SKIP: compiler seed not built (./scripts/refresh-compiler.sh) — " +
+        "Run-path checks skipped",
+    );
+  } else {
+    // 1. A clean program compiles (seed codegen), runs (the pure `runWasm` host
+    // ABI), and logs; WAT is rendered by binaryen (lazily loaded in the bundle).
+    const ok = await mod.runProgram(
+      `print(42)\nlet s = 0\nwhile s < 10 { s = s + 1 }\nprint(s)`,
+      runChecker,
+      { wat: true },
+    );
+    if (ok.diagnostics.some((d) => d.severity === "error")) {
+      fail(`clean program produced errors: ${JSON.stringify(ok.diagnostics)}`);
+    }
+    if (!ok.compiled) fail("clean program did not compile to wasm");
+    if (ok.logs.join(",") !== "42,10") {
+      fail(`unexpected log output: ${JSON.stringify(ok.logs)}`);
+    }
+    if (!ok.wat || !ok.wat.includes("(module")) {
+      fail(`WAT was not emitted: ${ok.wat?.slice(0, 80)}`);
+    }
+    console.error(
+      `OK: clean run -> logs ${JSON.stringify(ok.logs)}, WAT emitted`,
+    );
 
-  // 2. A broken program yields an error diagnostic with a real position.
-  const bad = await mod.runProgram(`let n: i32 = "nope"`);
-  const err = bad.diagnostics.find((d) => d.severity === "error");
-  if (!err) fail("broken program produced no error diagnostic");
-  if (bad.compiled) fail("broken program should not have compiled");
-  console.error(
-    `OK: broken run -> error at ${err!.range.start.line + 1}:${
-      err!.range.start.character + 1
-    } "${err!.message}"`,
-  );
+    // 2. A broken program yields an error diagnostic with a real position.
+    const bad = await mod.runProgram(`let n: i32 = "nope"`, runChecker);
+    const err = bad.diagnostics.find((d) => d.severity === "error");
+    if (!err) fail("broken program produced no error diagnostic");
+    if (bad.compiled) fail("broken program should not have compiled");
+    console.error(
+      `OK: broken run -> error at ${err!.range.start.line + 1}:${
+        err!.range.start.character + 1
+      } "${err!.message}"`,
+    );
+  }
 
   // 3. The browser-side LSP adapter (pure, DOM-free) — bundle + evaluate it the
   // same way, then exercise the providers the page wires onto Monaco. This is the

@@ -924,9 +924,12 @@ const persistSession = (): void => {
 
 let compilerReady = false;
 let running = false;
+// The self-hosted seed the Run path compiles on (set once it loads; undefined if
+// the seed couldn't be fetched, in which case Run stays disabled).
+let checker: Awaited<ReturnType<typeof loadBrowserChecker>>;
 
 const run = async () => {
-  if (!compilerReady || running) return;
+  if (!compilerReady || running || checker === undefined) return;
   if (autoTimer !== undefined) clearTimeout(autoTimer);
   running = true;
   runBtn.disabled = true;
@@ -939,8 +942,8 @@ const run = async () => {
   const startedAt = performance.now();
   try {
     const result = nFiles > 1
-      ? await runProject(fileSet, ENTRY_FILE, { wat: true })
-      : await runProgram(fileSet[ENTRY_FILE] ?? "", { wat: true });
+      ? await runProject(fileSet, ENTRY_FILE, checker, { wat: true })
+      : await runProgram(fileSet[ENTRY_FILE] ?? "", checker, { wat: true });
     const elapsed = Math.max(1, Math.round(performance.now() - startedAt));
 
     // Whole-program diagnostics drive the run verdict; the per-file panel was
@@ -1287,15 +1290,23 @@ setStatus("Loading compiler…", "busy");
 runBtn.disabled = true;
 (async () => {
   try {
-    // Load the self-hosted seed for the LSP features (hover/completion/semantic
-    // tokens/inlay/definition/format) in parallel with the binaryen warm-up. The
-    // seed is independent of Run: if it fails to load, those features degrade to
-    // empty (and format to a no-op), but Run still works on the TS compiler.
-    const [checker] = await Promise.all([
-      loadBrowserChecker(),
-      runProgram("print(1)"),
-    ]);
+    // Load the self-hosted seed — it backs BOTH the LSP features (hover/
+    // completion/semantic tokens/inlay/definition/format) and the Run path
+    // (codegen via `compileSrc`). Without it the editor features degrade to empty
+    // and Run is disabled (there's no TS-compiler fallback anymore).
+    checker = await loadBrowserChecker();
     lsp.initLsp(checker);
+    if (checker === undefined) {
+      setStatus(
+        "Compiler failed to load (the self-hosted seed could not be fetched or " +
+          "instantiated in this browser)",
+        "error",
+      );
+      return;
+    }
+    // Warm-up: confirm the seed compiles + runs a trivial program (its codegen +
+    // the WebAssembly host-import ABI) before enabling Run.
+    await runProgram("print(1)", checker);
     compilerReady = true;
     runBtn.disabled = false;
     refreshDiagnostics();
@@ -1303,8 +1314,8 @@ runBtn.disabled = true;
     if (autoRun) run();
   } catch (err) {
     setStatus(
-      "Compiler failed to load (binaryen could not instantiate in this " +
-        `browser): ${err instanceof Error ? err.message : String(err)}`,
+      "Compiler failed to load (the self-hosted seed could not instantiate in " +
+        `this browser): ${err instanceof Error ? err.message : String(err)}`,
       "error",
     );
   }

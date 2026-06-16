@@ -222,6 +222,19 @@ export type WasmChecker = {
     read: ModuleReader,
   ) => Promise<VLDiagnostic[]>;
   /**
+   * Compile `source` (as the entry at `entryKey`) to a wasm module via the
+   * self-hosted emitter (`compileSrc` — the same path `vl build` runs),
+   * alongside its error-tier diagnostics. `bytes` is undefined when compilation
+   * didn't reach a module (a lex/parse/type/emit error — see `diagnostics`) or
+   * the seed predates `compileSrc`. The module uses the standard VL host-import
+   * ABI, so the caller runs it by instantiating with the matching imports.
+   */
+  compile: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ) => Promise<{ bytes: Uint8Array | undefined; diagnostics: VLDiagnostic[] }>;
+  /**
    * Go-to-definition (Stage 2): the declaring span for the binding under
    * (`line`, `character`) (both 0-based, LSP), or undefined when the cursor is
    * off any tracked binding (or the seed predates the symbol exports).
@@ -1020,19 +1033,11 @@ export const createWasmChecker = (
     return { exports, imports };
   };
 
-  const check = async (
-    source: string,
-    entryKey: string,
-    read: ModuleReader,
-  ): Promise<VLDiagnostic[]> => {
-    const exp = instantiate();
-    if (exp === undefined) {
-      throw new Error("wasm checker became unavailable (seed removed?)");
-    }
-
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrc();
-
+  // Read the error-tier diagnostic store (`diagCount`/`diagMsg*`/`diagLine`/
+  // `diagCol`/`diagEndCol`) — shared by `checkSrc` AND `compileSrc`, which write
+  // the same store — into LSP-shaped diagnostics. Native line is 1-based (0 =
+  // positionless); col 0-based.
+  const readDiags = (exp: Exports): VLDiagnostic[] => {
     const count = exp.diagCount();
     const diags: VLDiagnostic[] = [];
     // An older seed predates `diagEndCol`; degrade to zero-width ranges.
@@ -1057,6 +1062,48 @@ export const createWasmChecker = (
       });
     }
     return diags;
+  };
+
+  const check = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<VLDiagnostic[]> => {
+    const exp = instantiate();
+    if (exp === undefined) {
+      throw new Error("wasm checker became unavailable (seed removed?)");
+    }
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrc();
+    return readDiags(exp);
+  };
+
+  // Whole-program codegen (the playground's Run path): compile `source` (as the
+  // entry at `entryKey`, with `read` resolving sibling/`std:` imports) to a wasm
+  // module via the self-hosted emitter (`compileSrc` + the `rbyte*` reads — the
+  // SAME path `vl build` runs), alongside the error-tier diagnostics. `bytes` is
+  // undefined when compilation didn't reach a module (`compileSrc` returns a
+  // non-zero status: lex/parse, type, or emit error) or the seed predates
+  // `compileSrc`. The emitted module uses the standard VL host-import ABI
+  // (`imports.__print_*__`/`__log*__`/`memory`), so the caller instantiates it
+  // with that import object to run it.
+  const compile = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<{ bytes: Uint8Array | undefined; diagnostics: VLDiagnostic[] }> => {
+    const exp = instantiate();
+    if (exp === undefined || typeof exp.compileSrc !== "function") {
+      return { bytes: undefined, diagnostics: [] };
+    }
+    await prepare(exp, source, entryKey, read);
+    const status = exp.compileSrc(); // 0 ok; 1 lex/parse; 2 type; 3 emit
+    const diagnostics = readDiags(exp);
+    if (status !== 0) return { bytes: undefined, diagnostics };
+    const n = exp.rbyteLen();
+    const bytes = new Uint8Array(n);
+    for (let i = 0; i < n; i++) bytes[i] = exp.rbyteAt(i);
+    return { bytes, diagnostics };
   };
 
   // Formatting rides the same seed as the other Stage-1+ exports; an older seed
@@ -1194,6 +1241,7 @@ export const createWasmChecker = (
 
   return {
     check,
+    compile,
     definitionAt,
     referencesAt,
     referencesInEntry,
