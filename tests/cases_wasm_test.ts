@@ -5,7 +5,9 @@
 // (`compiler/compile.ts`'s `compile`/`compileProgram`) is NOT in this gate
 // path, so a native-only feature's corpus case can go green here without ever
 // teaching the TS compiler about it. `runWasm` (the V8 instantiate + print
-// capture) IS reused: it is harness plumbing, not the TS compiler.
+// capture) is harness plumbing, not the TS compiler — it lives in the
+// compiler-free `tests/support/runWasm.ts` so this oracle carries no dependency
+// on `compiler/compile.ts` (kill-TS is deleting the TS front end).
 //
 // Seed loading follows `lsp/src/wasmChecker.ts`: `WebAssembly.Module`/
 // `Instance` over the seed with an EMPTY import object, then the driver
@@ -46,7 +48,7 @@
 //
 // Run with:  deno test -A tests/cases_wasm_test.ts
 
-import { runWasm, VLRuntimeError } from "../compiler/compile.ts";
+import { runWasm, VLRuntimeError } from "./support/runWasm.ts";
 
 const CASES_DIR = new URL("./cases/", import.meta.url);
 const STD_DIR = new URL("../std/", import.meta.url);

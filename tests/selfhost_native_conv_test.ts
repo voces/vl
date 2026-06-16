@@ -1,13 +1,16 @@
-// NATIVE ↔ HOST verdict parity for the numeric conversion lattice.
+// NATIVE verdict ↔ SPEC for the numeric conversion lattice.
 //
 // The corpus directives (and the `@run`/verdict alignment suites) don't exercise
-// most scalar→scalar numeric conversions, so a divergence in the implicit-widening
-// rule between the self-hosted checker (native `vl check`) and the host TS checker
-// (`checkOnly`) could go unnoticed — exactly how the lossy i32→f32 / i64→f64 edges'
-// mislabeling surfaced. This suite locks the full 4×4 numeric conversion matrix:
-// for `const a: FROM = …; const x: TO = a`, the NATIVE verdict, the HOST verdict,
-// and the documented SPEC verdict must all agree. So it catches both a native↔host
-// divergence AND a silent drift of the shared rule.
+// most scalar→scalar numeric conversions, so a drift in the implicit-widening
+// rule of the self-hosted checker (native `vl check`) could go unnoticed —
+// exactly how the lossy i32→f32 / i64→f64 edges' mislabeling surfaced. This suite
+// locks the full 4×4 numeric conversion matrix: for `const a: FROM = …;
+// const x: TO = a`, the NATIVE verdict must match the documented SPEC verdict.
+//
+// (Originally this also ran the TS host checker as a third column — the
+// native↔host parity oracle. With the TS compiler retired (kill-TS), the seed IS
+// the compiler, so the test pins the native verdict directly against the spec
+// lattice; nothing to be parity-checked against anymore.)
 //
 // The widening rule (B2, `numWidensName`) permits only the LOSSLESS edges:
 //   accept  i32→i64, i32→f64, f32→f64   (+ identity)
@@ -17,8 +20,6 @@
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built vl binary +
 // seed wasm; absent either, every case registers ignored with a build note.
-
-import { checkOnly } from "../compiler/compile.ts";
 
 const exists = (p: string): boolean => {
   try {
@@ -37,9 +38,9 @@ const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
 if (GATED && !ENABLED) {
   console.warn(
-    "[host-parity] skipped — missing vl binary or seed wasm. Build:\n" +
+    "[native-spec] skipped — missing vl binary or seed wasm. Build:\n" +
       "  (cd scripts/vl-host && cargo build --release)\n" +
-      "  deno run -A scripts/build-compiler-wasm.ts",
+      "  bash scripts/refresh-compiler.sh",
   );
 }
 
@@ -55,14 +56,6 @@ const WIDENS = new Set([
 
 const snippet = (from: Ty, to: Ty) =>
   `const a: ${from} = ${litOf(from)}\nconst x: ${to} = a\n`;
-
-const hostRejects = (src: string): boolean => {
-  try {
-    return checkOnly(src).diagnostics.some((d) => d.severity === "error");
-  } catch {
-    return true;
-  }
-};
 
 const nativeRejects = async (src: string): Promise<boolean> => {
   const tmp = await Deno.makeTempFile({ suffix: ".vl" });
@@ -85,22 +78,15 @@ for (const from of TYPES) {
     if (from === to) continue;
     const pair = `${from}→${to}`;
     Deno.test({
-      name: `host-parity: ${pair} — native == host == spec`,
+      name: `native-spec: ${pair} — native == spec`,
       ignore: !ENABLED,
       fn: async () => {
         const src = snippet(from, to);
         const expectReject = !WIDENS.has(pair); // identity excluded above
-        const host = hostRejects(src);
         const native = await nativeRejects(src);
-        if (native !== host) {
-          throw new Error(
-            `${pair}: native↔host DIVERGENCE — native ${native ? "REJECT" : "accept"}, ` +
-              `host ${host ? "REJECT" : "accept"}`,
-          );
-        }
         if (native !== expectReject) {
           throw new Error(
-            `${pair}: both compilers ${native ? "REJECT" : "accept"}, but the spec lattice ` +
+            `${pair}: the compiler ${native ? "REJECTs" : "accepts"}, but the spec lattice ` +
               `expects ${expectReject ? "REJECT" : "accept"} — rule drift (update WIDENS or the checker)`,
           );
         }
