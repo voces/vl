@@ -44,6 +44,30 @@ let cliFetchKey: string = ""    // the module key currently being read
 let cliOut: string[] = []       // the stderr lines to emit, in order
 let cliOutIdx: i32 = 0
 
+// ── directory walk + multi-file run (A-impl 2) ──────────────────────────────────
+let cliDirMode: i32 = 0          // 1 = the target is a directory (file-count noun, no per-stage note)
+let cliWalkStack: string[] = []  // directories still to list (DFS work-stack)
+let cliFiles: string[] = []      // collected `.vl` paths — the check work-list
+let cliFileIdx: i32 = 0          // cursor into cliFiles for the per-file loop
+let cliCurFile: string = ""      // the file currently being checked (its path)
+let cliCurDir: string = ""       // the directory currently being listed (child-path base)
+let cliLastStage: string = ""    // failing stage of the LAST file compiled (single-file note)
+// Running tally across every file checked.
+let cliErrors: i32 = 0
+let cliWarnings: i32 = 0
+let cliGating: i32 = 0
+// One committed directory listing (parallel arrays), refilled per CMD_LIST_DIR.
+let cliDirNames: string[] = []
+let cliDirIsDirs: i32[] = []
+let cliDirNameAcc: i32[] = []
+let cliDirWasDir: i32 = 0         // 1 if the last CMD_LIST_DIR target was a directory
+
+// Directories skipped when walking broadly (build output, deps, vendored,
+// retired ts-interpreter) — mirrors the host's former SKIP_DIRS.
+function cliSkipDir(name: string): boolean {
+  name == "node_modules" || name == ".git" || name == "dist" || name == "reference"
+}
+
 // The reported diagnostics, as PARALLEL arrays (the compiler's own idiom — cf.
 // lint.vl's lintMsgs/lintLines/…): severity, 1-based line (0 = positionless),
 // 0-based col, 0-based end col, message. One entry per index.
@@ -113,6 +137,25 @@ export function cliFileCommit(found: i32): i32 {
   0
 }
 export function cliExitCode(): i32 { return cliExit }
+
+// ── directory-listing intake (host commits one CMD_LIST_DIR result) ─────────────
+export function cliDirNamePush(c: i32): i32 {
+  cliDirNameAcc.push(c)
+  0
+}
+export function cliDirEntryPush(isDir: i32): i32 {
+  cliDirNames.push(fromCodePoints(cliDirNameAcc))
+  cliDirIsDirs.push(isDir)
+  cliDirNameAcc = []
+  0
+}
+// `isDir = 1` when the listed path was a directory (entries pushed above); `0`
+// when it was a file or did not exist (no entries) — the VL program then treats
+// the path as a single file.
+export function cliDirCommit(isDir: i32): i32 {
+  cliDirWasDir = isDir
+  0
+}
 
 // ── string helpers ─────────────────────────────────────────────────────────────
 function cliRepeat(s: string, n: i32): string {
@@ -226,7 +269,7 @@ function cliAddDiag(sev: string, line: i32, col: i32, endc: i32, msg: string): i
 function cliFmtConcise(d: i32): string {
   let line = dgLine[d]
   if line <= 0 { line = 1 }
-  cliFile + ": " + dgSev[d] + " [" + i32ToStr(line) + ":" + i32ToStr(dgCol[d] + 1) + "] " + dgMsg[d]
+  cliCurFile + ": " + dgSev[d] + " [" + i32ToStr(line) + ":" + i32ToStr(dgCol[d] + 1) + "] " + dgMsg[d]
 }
 // Pretty rustc/Deno-style block: `[SEVERITY]: msg` / source line / caret /
 // `at file:line:col`. A positionless diagnostic drops the source+caret block.
@@ -253,9 +296,9 @@ function cliFmtPretty(d: i32): string {
       let underline = "^" + cliRepeat("~", span - 1)
       out = out + "\n  " + cliRepeat(" ", start) + cliAnsi(cliColor, cliSevCode(sev), underline)
     }
-    out = out + "\n" + cliAnsi(cliColor, "2", "  at " + cliFile + ":" + i32ToStr(dgLine[d]) + ":" + i32ToStr(col + 1))
+    out = out + "\n" + cliAnsi(cliColor, "2", "  at " + cliCurFile + ":" + i32ToStr(dgLine[d]) + ":" + i32ToStr(col + 1))
   } else {
-    out = out + "\n" + cliAnsi(cliColor, "2", "  at " + cliFile)
+    out = out + "\n" + cliAnsi(cliColor, "2", "  at " + cliCurFile)
   }
   out
 }
@@ -387,13 +430,77 @@ function cliPendingKey(k: i32): string {
   fromCodePoints(out)
 }
 
-// Run the checker in-module and build the stderr output + exit code.
-function cliRunCheck(): i32 {
+// ── directory walk ──────────────────────────────────────────────────────────
+// True when `name` ends in `.vl`.
+function cliEndsVl(name: string): boolean {
+  if name.length < 3 { return false }
+  let a = name.length - 3
+  name[a] == '.' && name[a + 1] == 'v' && name[a + 2] == 'l'
+}
+// `a` sorts strictly AFTER `b` (code-point lexicographic order).
+function cliStrGt(a: string, b: string): boolean {
+  let n = a.length
+  if b.length < n { n = b.length }
+  let i = 0
+  while i < n {
+    if a[i] != b[i] { return a[i] > b[i] }
+    i = i + 1
+  }
+  a.length > b.length
+}
+// Stable insertion sort of the collected file paths (stable output across runs).
+function cliSortFiles(): i32 {
+  let i = 1
+  while i < cliFiles.length {
+    let key = cliFiles[i]
+    let j = i - 1
+    while j >= 0 && cliStrGt(cliFiles[j], key) {
+      cliFiles[j + 1] = cliFiles[j]
+      j = j - 1
+    }
+    cliFiles[j + 1] = key
+    i = i + 1
+  }
+  0
+}
+// All but the last element of a stack (rebuild — a bare `.pop()` is an emit gap
+// in the native pipeline; the driver uses the same idiom).
+function cliPopLast(xs: string[]): string[] {
+  let out: string[] = []
+  let i = 0
+  while i < xs.length - 1 {
+    out.push(xs[i])
+    i = i + 1
+  }
+  out
+}
+// Ingest one committed directory listing rooted at `base`: queue non-skipped
+// subdirectories onto the walk stack, collect `.vl` files onto the work-list.
+function cliIngestEntries(base: string): i32 {
+  let i = 0
+  while i < cliDirNames.length {
+    let name = cliDirNames[i]
+    let child = base + "/" + name
+    if cliDirIsDirs[i] != 0 {
+      if !cliSkipDir(name) { cliWalkStack.push(child) }
+    } else {
+      if cliEndsVl(name) { cliFiles.push(child) }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// ── per-file check (appends to cliOut + folds into the tally) ───────────────────
+// Run the checker over the CURRENT file (cliEntrySrc / cliCurFile), append its
+// formatted diagnostics to cliOut, and add its error/warning/gating counts to the
+// running tally. The summary is built once at the end (cliFinishSummary).
+function cliCheckCurFile(): i32 {
   if cliModMode == 0 { cliStageEntry() }
   let rc = 0
   if cliCodegen != 0 { rc = compileSrc() } else { rc = checkSrc() }
-  let stage = ""
-  if rc == 1 { stage = "parse" } else if rc == 2 { stage = "type" } else if rc == 3 { stage = "emit" }
+  cliLastStage = ""
+  if rc == 1 { cliLastStage = "parse" } else if rc == 2 { cliLastStage = "type" } else if rc == 3 { cliLastStage = "emit" }
 
   // Error-tier diagnostics (all `error`), read straight from the driver stores.
   dgSev = []
@@ -426,65 +533,59 @@ function cliRunCheck(): i32 {
       k = k + 1
     }
   }
-  cliBuildOutput(stage)
-  0
-}
 
-function cliBuildOutput(stage: string): i32 {
-  cliOut = []
   cliSrcLines = cliSplitLines(cliEntrySrc)
   let thr = cliSevRank(cliSeverity)
   let disp = 0
   if cliSeverityGiven != 0 { disp = thr }
-
-  // The gate counts every diagnostic at or above the threshold (default `error`).
-  let gating = 0
-  let i = 0
-  while i < dgSev.length {
-    if cliSevRank(dgSev[i]) >= thr { gating = gating + 1 }
-    i = i + 1
+  // Fold this file's counts into the running tally (gating + error/warning).
+  let gi = 0
+  while gi < dgSev.length {
+    if cliSevRank(dgSev[gi]) >= thr { cliGating = cliGating + 1 }
+    if dgSev[gi] == "error" { cliErrors = cliErrors + 1 }
+    if dgSev[gi] == "warning" { cliWarnings = cliWarnings + 1 }
+    gi = gi + 1
   }
-  // The display floor is the threshold when `--severity` was given, else show
-  // everything. Collect indices, stable-sort by position, render.
+  // Display: those at or above the floor, stable-sorted by position, appended.
   let order: i32[] = []
-  let j = 0
-  while j < dgSev.length {
-    if cliSevRank(dgSev[j]) >= disp { order.push(j) }
-    j = j + 1
+  let oj = 0
+  while oj < dgSev.length {
+    if cliSevRank(dgSev[oj]) >= disp { order.push(oj) }
+    oj = oj + 1
   }
   cliStableSort(order)
-  let s = 0
-  while s < order.length {
-    if cliConcise != 0 { cliOut.push(cliFmtConcise(order[s])) } else { cliOut.push(cliFmtPretty(order[s])) }
-    s = s + 1
+  let os = 0
+  while os < order.length {
+    if cliConcise != 0 { cliOut.push(cliFmtConcise(order[os])) } else { cliOut.push(cliFmtPretty(order[os])) }
+    os = os + 1
   }
+  0
+}
 
-  let errors = 0
-  let warnings = 0
-  let c = 0
-  while c < dgSev.length {
-    if dgSev[c] == "error" { errors = errors + 1 }
-    if dgSev[c] == "warning" { warnings = warnings + 1 }
-    c = c + 1
-  }
+// The aggregate summary line, once every file is checked. A single-FILE target
+// (cliDirMode == 0) keeps the per-stage note (`(type error)`) tooling greps for;
+// a directory run aggregates across files and omits it.
+function cliFinishSummary(): i32 {
   let summary = ""
-  if errors == 0 && warnings == 0 {
-    summary = cliAnsi(cliColor, "2", "Checked 1 file, no errors.")
+  if cliErrors == 0 && cliWarnings == 0 {
+    let noun = "files"
+    if cliFiles.length == 1 { noun = "file" }
+    summary = cliAnsi(cliColor, "2", "Checked " + i32ToStr(cliFiles.length) + " " + noun + ", no errors.")
   } else {
-    let parts = cliPlural(errors, "error")
-    if warnings > 0 { parts = parts + ", " + cliPlural(warnings, "warning") }
+    let parts = cliPlural(cliErrors, "error")
+    if cliWarnings > 0 { parts = parts + ", " + cliPlural(cliWarnings, "warning") }
     let note = ""
-    if gating > 0 && cliSeverity != "error" { note = " (failing at severity " + cliSeverity + ")" }
+    if cliGating > 0 && cliSeverity != "error" { note = " (failing at severity " + cliSeverity + ")" }
     let stageNote = ""
-    if errors > 0 && stage != "" { stageNote = " (" + stage + " error)" }
+    if cliDirMode == 0 && cliErrors > 0 && cliLastStage != "" { stageNote = " (" + cliLastStage + " error)" }
     let text = "Found " + parts + "." + note + stageNote
     let code = "33"
-    if gating > 0 { code = "31" }
+    if cliGating > 0 { code = "31" }
     summary = cliAnsi(cliColor, code, text)
   }
   cliOut.push(summary)
   cliExit = 0
-  if gating > 0 { cliExit = 1 }
+  if cliGating > 0 { cliExit = 1 }
   0
 }
 
@@ -501,19 +602,54 @@ function cliEmitNextOut(): i32 {
     cliOutIdx = cliOutIdx + 1
     return 5 // CMD_PRINT_ERR
   }
-  cliState = 4
+  cliState = 6
   0 // CMD_DONE
 }
-// Either request the next pending module file, or — graph closed — run the check.
-function cliFetchOrCheck(): i32 {
+// Advance the directory walk: list the next pending dir, or — walk done — sort
+// the work-list and begin the per-file check loop.
+function cliWalkStep(): i32 {
+  if cliWalkStack.length > 0 {
+    cliCurDir = cliWalkStack[cliWalkStack.length - 1]
+    cliWalkStack = cliPopLast(cliWalkStack)
+    cliDirNames = []
+    cliDirIsDirs = []
+    cliCmdPath = cliCurDir
+    cliState = 2
+    return 1 // CMD_LIST_DIR
+  }
+  cliSortFiles()
+  if cliFiles.length == 0 {
+    cliOut = ["check: no .vl files found under " + cliFile]
+    cliExit = 0
+    return cliBeginPrint()
+  }
+  cliFileIdx = 0
+  cliStartFile()
+}
+// Begin checking cliFiles[cliFileIdx] (read its source), or — work-list done —
+// build the summary and start printing.
+function cliStartFile(): i32 {
+  if cliFileIdx >= cliFiles.length {
+    cliFinishSummary()
+    return cliBeginPrint()
+  }
+  cliCurFile = cliFiles[cliFileIdx]
+  cliCmdPath = cliCurFile
+  cliState = 4
+  2 // CMD_READ_FILE — the file's source
+}
+// For the current file: fetch the next pending module, or — graph closed — check
+// it and advance to the next file.
+function cliFetchOrCheckFile(): i32 {
   if modPendingCount() > 0 {
     cliFetchKey = cliPendingKey(0)
     cliCmdPath = cliFetchKey
-    cliState = 2
+    cliState = 5
     return 2 // CMD_READ_FILE
   }
-  cliRunCheck()
-  cliBeginPrint()
+  cliCheckCurFile()
+  cliFileIdx = cliFileIdx + 1
+  cliStartFile()
 }
 
 export function cliNext(): i32 {
@@ -534,34 +670,61 @@ export function cliNext(): i32 {
       cliExit = 2
       return cliBeginPrint()
     }
-    if cliFile.length == 0 {
-      cliOut = ["usage: vl check <file.vl> [--concise] [--severity <level>] [--codegen]"]
-      cliExit = 2
-      return cliBeginPrint()
-    }
+    // No path → check the current directory (`vl check` ≡ `vl check .`).
+    if cliFile.length == 0 { cliFile = "." }
+    cliOut = []
+    cliErrors = 0
+    cliWarnings = 0
+    cliGating = 0
+    cliWalkStack = []
+    cliFiles = []
+    cliDirNames = []
+    cliDirIsDirs = []
     cliCmdPath = cliFile
     cliState = 1
-    return 2 // CMD_READ_FILE — the entry
+    return 1 // CMD_LIST_DIR — classify the target (dir vs file)
   }
   if st == 1 {
+    if cliDirWasDir != 0 {
+      cliDirMode = 1
+      cliIngestEntries(cliFile)
+      return cliWalkStep()
+    }
+    // A file (or a missing path) — single-file run.
+    cliDirMode = 0
+    cliFiles = [cliFile]
+    cliFileIdx = 0
+    return cliStartFile()
+  }
+  if st == 2 {
+    cliIngestEntries(cliCurDir)
+    return cliWalkStep()
+  }
+  if st == 4 {
     if cliFileFound == 0 {
-      cliOut = ["check: cannot read " + cliFile]
-      cliExit = 2
-      return cliBeginPrint()
+      // A single-file target that does not exist → cannot read. A collected file
+      // that vanished mid-walk → skip it.
+      if cliDirMode == 0 {
+        cliOut = ["check: cannot read " + cliFile]
+        cliExit = 2
+        return cliBeginPrint()
+      }
+      cliFileIdx = cliFileIdx + 1
+      return cliStartFile()
     }
     cliEntrySrc = cliFileSrc
     modReset()
     if cliHasImports(cliEntrySrc) != 0 {
       cliModMode = 1
-      cliModCommitOne(cliFile, cliEntrySrc, 1)
+      cliModCommitOne(cliCurFile, cliEntrySrc, 1)
     } else {
       cliModMode = 0
     }
-    return cliFetchOrCheck()
+    return cliFetchOrCheckFile()
   }
-  if st == 2 {
+  if st == 5 {
     cliModCommitOne(cliFetchKey, cliFileSrc, cliFileFound)
-    return cliFetchOrCheck()
+    return cliFetchOrCheckFile()
   }
   if st == 3 {
     return cliEmitNextOut()
