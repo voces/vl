@@ -22,7 +22,7 @@
 // 0-based character) — the checker does the 1↔0 line bridge internally, and
 // `main.ts` bridges LSP↔Monaco (Monaco is 1-based line / 1-based column).
 
-import { checkOnly, type VLDiagnostic } from "../../compiler/compile.ts";
+import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
 import {
   builtinCompletionsFromWasm,
   type Completion,
@@ -87,13 +87,21 @@ export const initLsp = (loaded: WasmChecker | undefined): void => {
 // ---- diagnostics -----------------------------------------------------------
 
 /**
- * Run the codegen-free front end and return its diagnostics (parse + type errors
- * plus the B17 lint). This drives the editor squiggles; the heavier `compile`
- * (codegen) only runs on Run. `checkOnly` is synchronous and binaryen-free, so
- * it's cheap to call on every (debounced) keystroke.
+ * Diagnostics for `text` (as the entry at `entryKey`) off the self-hosted seed:
+ * the error tier (`check` — parse + type, whole-program via the workspace reader,
+ * so cross-module import errors surface and resolved imports don't read as
+ * "undeclared") merged with the lint pass (`lint` — unused/prefer-const/…, with
+ * the `unnecessary` tag for dead spans). This drives the editor squiggles; the
+ * heavier codegen only runs on Run. Empty before the seed loads.
  */
-export const diagnostics = (text: string): VLDiagnostic[] =>
-  checkOnly(text).diagnostics;
+export const diagnostics = async (
+  text: string,
+  entryKey: string = DEFAULT_ENTRY,
+): Promise<VLDiagnostic[]> => {
+  if (checker === undefined) return [];
+  const errors = await checker.check(text, entryKey, reader).catch(() => []);
+  return [...errors, ...checker.lint(text)];
+};
 
 // ---- semantic tokens -------------------------------------------------------
 
@@ -274,12 +282,13 @@ export const format = (source: string): string | undefined =>
  * `server.ts`'s `onCodeAction`. Pure string surgery over the diagnostic `code`
  * + range (`codeActions.ts`) — unchanged by the wasm migration.
  */
-export const codeActions = (
+export const codeActions = async (
   text: string,
   range: LspRange,
   contextDiagnostics: VLDiagnostic[] = [],
-): QuickFix[] => {
-  const cached = diagnostics(text);
+  entryKey: string = DEFAULT_ENTRY,
+): Promise<QuickFix[]> => {
+  const cached = await diagnostics(text, entryKey);
   const fixable = fixableDiagnosticsForRange(contextDiagnostics, cached, range);
   const fixes: QuickFix[] = [];
   for (const d of fixable) {

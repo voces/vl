@@ -235,27 +235,26 @@ const main = async (): Promise<void> => {
 
   const src = `let x = 41\nlet _unused = 1\nprint(x + 1)\n`;
 
-  // Diagnostics: the unused `_unused` binding is a B17 lint hint tagged
-  // `unnecessary` (the greyed-out lint the editor surfaces). TS `checkOnly`, no
-  // seed needed.
-  const diags = lsp.diagnostics(src);
-  const unused = diags.find((d) => d.tags?.includes("unnecessary"));
-  if (!unused) {
-    fail(`no \`unnecessary\`-tagged lint produced: ${JSON.stringify(diags)}`);
-  }
-  console.error(`OK: diagnostics -> B17 lint "${unused!.message}" (unnecessary)`);
-
-  // The seed-backed LSP features (semantic tokens / hover / inlay / definition /
-  // completion / format) run on the wasm checker the page injects via `initLsp`.
-  // Headless, we build it from the on-disk seed; absent, those checks self-skip.
+  // Every LSP feature now runs on the wasm checker the page injects via `initLsp`
+  // — diagnostics included (seed `check` + `lint`). Headless we build the checker
+  // from the on-disk seed; absent, the whole block self-skips.
   const checker = loadSeedChecker();
   if (checker === undefined) {
     console.error(
       "SKIP: compiler seed not built (./scripts/refresh-compiler.sh) — " +
-        "seed-backed LSP feature checks skipped",
+        "LSP feature checks skipped",
     );
   } else {
     lsp.initLsp(checker);
+
+    // Diagnostics: the unused `_unused` binding is a lint hint tagged
+    // `unnecessary` (the greyed-out lint the editor surfaces).
+    const diags = await lsp.diagnostics(src);
+    const unused = diags.find((d) => d.tags?.includes("unnecessary"));
+    if (!unused) {
+      fail(`no \`unnecessary\`-tagged lint produced: ${JSON.stringify(diags)}`);
+    }
+    console.error(`OK: diagnostics -> lint "${unused!.message}" (unnecessary)`);
 
     // Semantic tokens: a non-empty, well-formed (multiple-of-5) delta stream.
     const tokens = await lsp.semanticTokens(src);
@@ -311,67 +310,62 @@ const main = async (): Promise<void> => {
       fail(`format did not reprint via the seed: ${JSON.stringify(formatted)}`);
     }
     console.error(`OK: format -> reprinted via the self-hosted formatter`);
-  }
 
-  // Quick-fixes (code actions / B17): the unused `x` binding on line 0 offers the
-  // `_`-prefix (preferred) + remove-binding fixes; an unused import offers a
-  // remove-import fix. Mirrors the editor's "Auto Fix" lightbulb.
-  const unusedSrc = `let x = 1\nprint(1)\n`;
-  const varFixes = lsp.codeActions(unusedSrc, {
-    start: { line: 0, character: 4 },
-    end: { line: 0, character: 4 },
-  });
-  const preferred = varFixes.find((f) => f.isPreferred);
-  if (!preferred || !preferred.title.includes("_")) {
-    fail(`unused-variable did not offer the preferred \`_\`-prefix fix: ${JSON.stringify(varFixes)}`);
-  }
-  if (!varFixes.some((f) => f.title.toLowerCase().includes("remove"))) {
-    fail(`unused-variable did not offer a remove-binding fix: ${JSON.stringify(varFixes)}`);
-  }
-  // `unused-import` only fires through the graph-aware front end (it needs module
-  // resolution to seed the import binding), which the playground's single-file
-  // diagnostics path doesn't run — same as the real single-file LSP. So feed the
-  // diagnostic explicitly (as an editor marker would carry it) to prove the
-  // remove-import dispatch in the adapter is wired, mirroring `server.ts`.
-  const importSrc = `import { add } from "./mathx"\nprint(1)\n`;
-  const importRange = {
-    start: { line: 0, character: 9 },
-    end: { line: 0, character: 12 },
-  };
-  const importFixes = lsp.codeActions(importSrc, importRange, [{
-    message: "Unused import `add` (remove it)",
-    severity: "warning",
-    source: "vital",
-    code: "unused-import",
-    range: importRange,
-  }]);
-  if (!importFixes.some((f) => f.title.toLowerCase().includes("import"))) {
-    fail(`unused-import did not offer a remove-import fix: ${JSON.stringify(importFixes)}`);
-  }
+    // Quick-fixes (code actions / B17): the unused `x` binding on line 0 offers the
+    // `_`-prefix (preferred) + remove-binding fixes; an unused import offers a
+    // remove-import fix. Mirrors the editor's "Auto Fix" lightbulb.
+    const unusedSrc = `let x = 1\nprint(1)\n`;
+    const varFixes = await lsp.codeActions(unusedSrc, {
+      start: { line: 0, character: 4 },
+      end: { line: 0, character: 4 },
+    });
+    const preferred = varFixes.find((f) => f.isPreferred);
+    if (!preferred || !preferred.title.includes("_")) {
+      fail(`unused-variable did not offer the preferred \`_\`-prefix fix: ${JSON.stringify(varFixes)}`);
+    }
+    if (!varFixes.some((f) => f.title.toLowerCase().includes("remove"))) {
+      fail(`unused-variable did not offer a remove-binding fix: ${JSON.stringify(varFixes)}`);
+    }
+    // `unused-import` is fed explicitly (as an editor marker would carry it) to
+    // prove the remove-import dispatch is wired, mirroring `server.ts`.
+    const importSrc = `import { add } from "./mathx"\nprint(1)\n`;
+    const importRange = {
+      start: { line: 0, character: 9 },
+      end: { line: 0, character: 12 },
+    };
+    const importFixes = await lsp.codeActions(importSrc, importRange, [{
+      message: "Unused import `add` (remove it)",
+      severity: "warning",
+      source: "vital",
+      code: "unused-import",
+      range: importRange,
+    }]);
+    if (!importFixes.some((f) => f.title.toLowerCase().includes("import"))) {
+      fail(`unused-import did not offer a remove-import fix: ${JSON.stringify(importFixes)}`);
+    }
 
-  // A never-reassigned `let` offers the `let`→`const` fix (also fed as a marker,
-  // since `prefer-const` likewise comes from a path the single-file pass may not
-  // surface here — the dispatch is what we're verifying).
-  const constSrc = `let y = 1\nprint(y)\n`;
-  const constRange = {
-    start: { line: 0, character: 0 },
-    end: { line: 0, character: 3 },
-  };
-  const constFixes = lsp.codeActions(constSrc, constRange, [{
-    message: "`let y` is never reassigned; prefer `const`",
-    severity: "info",
-    source: "vital",
-    code: "prefer-const",
-    range: constRange,
-  }]);
-  if (!constFixes.some((f) => f.title.toLowerCase().includes("const"))) {
-    fail(`prefer-const did not offer a let→const fix: ${JSON.stringify(constFixes)}`);
+    // A never-reassigned `let` offers the `let`→`const` fix (also fed as a marker).
+    const constSrc = `let y = 1\nprint(y)\n`;
+    const constRange = {
+      start: { line: 0, character: 0 },
+      end: { line: 0, character: 3 },
+    };
+    const constFixes = await lsp.codeActions(constSrc, constRange, [{
+      message: "`let y` is never reassigned; prefer `const`",
+      severity: "info",
+      source: "vital",
+      code: "prefer-const",
+      range: constRange,
+    }]);
+    if (!constFixes.some((f) => f.title.toLowerCase().includes("const"))) {
+      fail(`prefer-const did not offer a let→const fix: ${JSON.stringify(constFixes)}`);
+    }
+    console.error(
+      `OK: quick-fixes -> var [${varFixes.map((f) => f.title).join(", ")}], ` +
+        `import [${importFixes.map((f) => f.title).join(", ")}], ` +
+        `const [${constFixes.map((f) => f.title).join(", ")}]`,
+    );
   }
-  console.error(
-    `OK: quick-fixes -> var [${varFixes.map((f) => f.title).join(", ")}], ` +
-      `import [${importFixes.map((f) => f.title).join(", ")}], ` +
-      `const [${constFixes.map((f) => f.title).join(", ")}]`,
-  );
 
   // 4. The shareable-link encode/decode round-trip (E4).
   // `share.ts` uses only built-in browser APIs (CompressionStream / btoa / atob)

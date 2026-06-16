@@ -37,12 +37,7 @@
 // main thread.
 
 import * as monaco from "monaco-editor";
-import {
-  checkProject,
-  runProgram,
-  runProject,
-  type VLDiagnostic,
-} from "./playground.ts";
+import { runProgram, runProject, type VLDiagnostic } from "./playground.ts";
 import { SAMPLES, type Sample } from "./samples.ts";
 import * as lsp from "./lspAdapter.ts";
 import { decodeHash, encodeSource } from "./share.ts";
@@ -343,7 +338,7 @@ monaco.languages.registerDefinitionProvider(VL_LANGUAGE_ID, {
 // diagnostic `code` (we stash it on each marker in `toMarker`), so the dispatch
 // picks the right fix — exactly the `code`-keyed mapping the editor uses.
 monaco.languages.registerCodeActionProvider(VL_LANGUAGE_ID, {
-  provideCodeActions: (model, range, context) => {
+  provideCodeActions: async (model, range, context) => {
     // Monaco markers → the `VLDiagnostic`-shaped context (0-based LSP coords)
     // `lspAdapter.codeActions` expects. Monaco stores `code` as a string or
     // `{ value }` object, so normalise both.
@@ -359,13 +354,14 @@ monaco.languages.registerCodeActionProvider(VL_LANGUAGE_ID, {
         },
       }));
 
-    const fixes = lsp.codeActions(
+    const fixes = await lsp.codeActions(
       model.getValue(),
       {
         start: { line: range.startLineNumber - 1, character: range.startColumn - 1 },
         end: { line: range.endLineNumber - 1, character: range.endColumn - 1 },
       },
       contextDiagnostics,
+      entryKeyOf(model),
     );
 
     const actions: monaco.languages.CodeAction[] = fixes.map((fix) => ({
@@ -615,79 +611,29 @@ const isLocationless = (d: VLDiagnostic): boolean => {
 
 type AggregatedDiag = { file: string; diag: VLDiagnostic };
 
-// The names a module `import`s — used to suppress single-file "undeclared X"
-// errors for X resolved from another module (the single-file check can't see
-// cross-module bindings; the whole-program `checkProject` catches genuinely
-// unresolved imports instead). Mirrors the real LSP today, which is single-file.
-const IMPORT_RE = /^\s*import\s*\{([^}]*)\}\s*from\b/gm;
-const importedNames = (text: string): Set<string> => {
-  const names = new Set<string>();
-  for (const m of text.matchAll(IMPORT_RE)) {
-    for (const part of m[1].split(",")) {
-      // `a` or `a as b` → the LOCAL name (`a`, or `b` after `as`).
-      const local = part.trim().split(/\s+as\s+/).pop()?.trim();
-      if (local) names.add(local);
-    }
-  }
-  return names;
-};
-
-const UNDECLARED_RE = /undeclared\s+(\w+)/;
-const isImportedUndeclared = (d: VLDiagnostic, imported: Set<string>): boolean => {
-  const m = UNDECLARED_RE.exec(d.message);
-  return m !== null && imported.has(m[1]);
-};
-
 // Recompute per-file diagnostics, set Monaco markers on each model, and re-render
 // the aggregated Diagnostics pane.
 //
-// Per file: the single-file `lsp.diagnostics` (synchronous, binaryen-free) — the
-// same path the real (single-file) LSP runs — minus the spurious "undeclared
-// <imported-name>" errors a single-file check can't resolve cross-module.
-//
-// For a multi-file project we ALSO run the whole-program `checkProject` (the
-// graph-aware front end) and surface its import-resolution errors (bad path, name
-// not exported, cycles) — locationless ones attach to the entry module. This is
-// async, so a monotonic generation guard drops stale results from earlier edits.
+// Each file runs `lsp.diagnostics` (the seed `check` + `lint`) as its OWN entry
+// module, with the workspace reader supplying siblings — so the check is
+// whole-program: an importer's resolved names don't read as "undeclared", and
+// real cross-module import errors (bad path, name not exported) surface on the
+// file that imports them. No separate whole-program pass / "undeclared import"
+// filtering is needed (the single-file TS path that required them is gone). Async,
+// so a monotonic generation guard drops stale results from earlier edits.
 let diagGen = 0;
 
 const refreshDiagnostics = async (): Promise<void> => {
   const gen = ++diagGen;
-  const multi = files.length > 1;
   const perFile = new Map<string, VLDiagnostic[]>();
 
   for (const f of files) {
     const model = models.get(f.name);
     if (!model) continue;
-    const text = model.getValue();
-    const imported = importedNames(text);
-    const diags = lsp.diagnostics(text)
-      .filter((d) => !isImportedUndeclared(d, imported));
+    const diags = await lsp.diagnostics(model.getValue(), f.name);
+    if (gen !== diagGen) return; // a newer edit superseded this pass
     perFile.set(f.name, diags);
   }
-
-  if (multi) {
-    // Whole-program errors the single-file pass can't see (unresolved imports,
-    // unexported names, cycles). Skip the ones already represented per file.
-    try {
-      const projectDiags = await checkProject(projectFiles(), ENTRY_FILE);
-      if (gen !== diagGen) return; // a newer edit superseded this pass
-      for (const d of projectDiags) {
-        if (d.severity !== "error") continue;
-        if (!/not exported|Cannot resolve import|Import cycle/.test(d.message)) {
-          continue;
-        }
-        // These point at the importing module; attach to the entry (the file the
-        // graph is rooted at) so they're always visible.
-        let entryDiags = perFile.get(ENTRY_FILE);
-        if (!entryDiags) perFile.set(ENTRY_FILE, entryDiags = []);
-        entryDiags.push(d);
-      }
-    } catch {
-      // Graph check is best-effort; per-file diagnostics already rendered below.
-    }
-  }
-  if (gen !== diagGen) return;
 
   const all: AggregatedDiag[] = [];
   for (const f of files) {
