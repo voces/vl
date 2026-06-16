@@ -52,6 +52,13 @@ import { loadBrowserChecker } from "./wasmCheckerBrowser.ts";
 const VL_LANGUAGE_ID = "vital";
 const ENTRY_FILE = "main.vl";
 
+// The active model's file key (`main.vl`, `mathx.vl`, …) — the entry module for an
+// LSP query, so the wasm checker resolves relative imports (`./mathx`) against the
+// right file and cross-file names (imported functions/consts) resolve. The
+// `inmemory://vl/<name>` URI's path is `/<name>`.
+const entryKeyOf = (model: monaco.editor.ITextModel): string =>
+  model.uri.path.replace(/^\/+/, "") || ENTRY_FILE;
+
 // --- Monaco worker environment ---------------------------------------------
 //
 // Monaco asks for workers for its built-in languages. We register none of those
@@ -252,7 +259,7 @@ const semanticLegend: monaco.languages.SemanticTokensLegend = {
 monaco.languages.registerDocumentSemanticTokensProvider(VL_LANGUAGE_ID, {
   getLegend: () => semanticLegend,
   provideDocumentSemanticTokens: async (model) => ({
-    data: new Uint32Array(await lsp.semanticTokens(model.getValue())),
+    data: new Uint32Array(await lsp.semanticTokens(model.getValue(), entryKeyOf(model))),
     resultId: undefined,
   }),
   releaseDocumentSemanticTokens: () => {},
@@ -265,7 +272,7 @@ monaco.languages.registerHoverProvider(VL_LANGUAGE_ID, {
     const result = await lsp.hover(model.getValue(), {
       line: position.lineNumber - 1, // Monaco 1-based line → LSP 0-based
       character: position.column - 1, // Monaco 1-based col → LSP 0-based
-    });
+    }, entryKeyOf(model));
     if (!result) return null;
     const range = result.range
       ? new monaco.Range(
@@ -289,7 +296,7 @@ monaco.languages.registerInlayHintsProvider(VL_LANGUAGE_ID, {
     const hints = await lsp.inlayHints(model.getValue(), {
       start: { line: range.startLineNumber - 1, character: range.startColumn - 1 },
       end: { line: range.endLineNumber - 1, character: range.endColumn - 1 },
-    });
+    }, entryKeyOf(model));
     return {
       hints: hints.map((h) => ({
         position: { lineNumber: h.line + 1, column: h.character + 1 },
@@ -309,7 +316,7 @@ monaco.languages.registerDefinitionProvider(VL_LANGUAGE_ID, {
     const def = await lsp.definition(model.getValue(), {
       line: position.lineNumber - 1,
       character: position.column - 1,
-    });
+    }, entryKeyOf(model));
     if (!def) return null;
     return {
       uri: model.uri,
@@ -409,6 +416,7 @@ monaco.languages.registerCompletionItemProvider(VL_LANGUAGE_ID, {
       model.getValue(),
       { line: position.lineNumber - 1, character: position.column - 1 },
       context.triggerCharacter,
+      entryKeyOf(model),
     );
     // The word under the cursor is the replacement range; after a `.` Monaco gives
     // an empty word at the cursor, so members insert just past the dot.
@@ -896,6 +904,11 @@ const projectFiles = (): Record<string, string> => {
   for (const f of files) out[f.name] = models.get(f.name)?.getValue() ?? "";
   return out;
 };
+
+// Wire the live project files into the LSP adapter so cross-file analysis (an
+// imported name's type/hover, completion, go-to-definition across modules) sees
+// sibling buffers — the browser counterpart of the Node LSP's workspace reader.
+lsp.setWorkspace(projectFiles);
 
 // --- last-session persistence ------------------------------------------------
 //
