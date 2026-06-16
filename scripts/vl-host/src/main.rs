@@ -410,153 +410,6 @@ fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Format `source` via the seed's `formatSrc` (single-file, purely syntactic — no
-/// module resolution; the formatting logic lives in `format.vl`). Returns the
-/// canonical reprint, or `None` on a lex/parse error (the driver signals -1), so
-/// the caller leaves the source unchanged rather than emit a corrupt partial.
-fn format_source(
-    store: &mut Store<()>,
-    inst: &Instance,
-    source: &str,
-) -> Result<Option<String>> {
-    let src_reset = inst.get_typed_func::<(), i32>(&mut *store, "srcReset")?;
-    let src_push = inst.get_typed_func::<i32, i32>(&mut *store, "srcPush")?;
-    let format = inst.get_typed_func::<(), i32>(&mut *store, "formatSrc")?;
-    let fmt_at = inst.get_typed_func::<i32, i32>(&mut *store, "fmtByteAt")?;
-    src_reset.call(&mut *store, ())?;
-    for ch in source.chars() {
-        src_push.call(&mut *store, ch as i32)?;
-    }
-    let len = format.call(&mut *store, ())?;
-    if len < 0 {
-        return Ok(None);
-    }
-    let mut out = String::with_capacity(len as usize);
-    for j in 0..len {
-        if let Some(c) = char::from_u32(fmt_at.call(&mut *store, j)? as u32) {
-            out.push(c);
-        }
-    }
-    Ok(Some(out))
-}
-
-/// Directories skipped when walking broadly, so `vl fmt .` doesn't descend into
-/// build output, deps, or vendored copies. Mirrors the retired TS CLI's `SKIP_DIRS`.
-const SKIP_DIRS: [&str; 4] = ["node_modules", ".git", "dist", "reference"];
-
-/// Collect every `*.vl` under `dir`, recursively, honouring the skip-list.
-fn collect_vl_files(
-    dir: &std::path::Path,
-    out: &mut Vec<std::path::PathBuf>,
-) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .map_err(|e| Error::from(e).context(format!("reading dir `{}`", dir.display())))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if path.is_dir() {
-            if !SKIP_DIRS.contains(&name.as_ref()) {
-                collect_vl_files(&path, out)?;
-            }
-        } else if name.ends_with(".vl") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-/// `vl fmt` — the self-hosted formatter (`format.vl` via the seed's `formatSrc`),
-/// matching the retired TS CLI's `fmt`:
-///   vl fmt <file.vl>        print the formatted source to stdout
-///   vl fmt -w <path>        rewrite the file(s) in place (only when changed)
-///   vl fmt --check <path>   exit non-zero if any file is not already formatted
-///   vl fmt <dir>            recurse over every *.vl under a directory
-///   cmd | vl fmt            format stdin to stdout
-fn run_fmt(args: &[String]) -> Result<()> {
-    use std::io::{Read, Write};
-    let mut write = false;
-    let mut check = false;
-    let mut compiler: Option<String> = None;
-    let mut paths: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-w" | "--write" => write = true,
-            "--check" => check = true,
-            "--compiler" => {
-                compiler = args.get(i + 1).cloned();
-                i += 1;
-            }
-            a if !a.starts_with('-') => paths.push(a.to_string()),
-            _ => {} // ignore unknown flags (parity with the TS arg parser)
-        }
-        i += 1;
-    }
-    let compiler = compiler
-        .or_else(|| std::env::var("VL_COMPILER_WASM").ok())
-        .unwrap_or_else(|| "build/vl-compiler.wasm".to_string());
-
-    let engine = gc_engine(Collector::Null)?;
-    let (mut store, inst) = load_compiler(&engine, &compiler)?;
-
-    // No path: format stdin to stdout (`cmd | vl fmt`). `-w` is meaningless on a
-    // stream; `--check` reports drift via the exit code.
-    if paths.is_empty() {
-        let mut source = String::new();
-        std::io::stdin().read_to_string(&mut source)?;
-        let formatted =
-            format_source(&mut store, &inst, &source)?.unwrap_or_else(|| source.clone());
-        if check {
-            std::process::exit(if formatted == source { 0 } else { 1 });
-        }
-        std::io::stdout().write_all(formatted.as_bytes())?;
-        return Ok(());
-    }
-
-    // Expand each path: a file is taken as-is; a directory is walked recursively.
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-    for p in &paths {
-        let path = std::path::Path::new(p);
-        match std::fs::metadata(path) {
-            Ok(m) if m.is_dir() => collect_vl_files(path, &mut files)?,
-            Ok(_) => files.push(path.to_path_buf()),
-            Err(_) => {
-                eprintln!("fmt: no such file or directory: {p}");
-                std::process::exit(2);
-            }
-        }
-    }
-    files.sort();
-
-    let mut drift = 0;
-    for file in &files {
-        let source = std::fs::read_to_string(file)
-            .map_err(|e| Error::from(e).context(format!("reading `{}`", file.display())))?;
-        let formatted =
-            format_source(&mut store, &inst, &source)?.unwrap_or_else(|| source.clone());
-        let changed = formatted != source;
-        if check {
-            if changed {
-                eprintln!("{}: not formatted", file.display());
-                drift += 1;
-            }
-        } else if write {
-            if changed {
-                std::fs::write(file, formatted.as_bytes())?;
-            }
-        } else {
-            std::io::stdout().write_all(formatted.as_bytes())?;
-        }
-    }
-    // --check is a CI gate: non-zero exit when any file would change.
-    if check && drift > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
 /// Compile `source` through the seed (names enabled, for legible trap traces) and
 /// run the emitted module on the DRC engine.
 fn compile_and_run(
@@ -650,8 +503,10 @@ fn run_cmd(args: &[String]) -> Result<()> {
 const CMD_DONE: i32 = 0;
 const CMD_LIST_DIR: i32 = 1;
 const CMD_READ_FILE: i32 = 2;
+const CMD_WRITE_FILE: i32 = 3;
 const CMD_PRINT_OUT: i32 = 4;
 const CMD_PRINT_ERR: i32 = 5;
+const CMD_READ_STDIN: i32 = 6;
 
 /// Read the current command's string payload via a `<prefix>Len()` / `<prefix>At(j)`
 /// accessor pair (one UTF-32 code point per `At`, the seed's string-out idiom).
@@ -777,9 +632,29 @@ fn cli_pump(args: &[String]) -> Result<()> {
                     }
                 }
             }
+            CMD_WRITE_FILE => {
+                // Write the formatted (or fixed) contents back to disk. Path +
+                // data both ride the current-command payload.
+                let path = read_cli_str(&mut store, &path_len, &path_at)?;
+                let data = read_cli_str(&mut store, &data_len, &data_at)?;
+                std::fs::write(&path, data.as_bytes())
+                    .map_err(|e| Error::from(e).context(format!("writing `{path}`")))?;
+            }
+            CMD_READ_STDIN => {
+                // `… | vl fmt` — slurp stdin and commit it like a file read.
+                use std::io::Read;
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s).ok();
+                for ch in s.chars() {
+                    result_push.call(&mut store, ch as i32)?;
+                }
+                file_commit.call(&mut store, 1)?;
+            }
             CMD_PRINT_OUT => {
-                let line = read_cli_str(&mut store, &data_len, &data_at)?;
-                writeln!(out, "{line}")?;
+                // Raw stdout (no added newline) — formatted source carries its own
+                // trailing newline, so `vl fmt` output stays byte-exact.
+                let data = read_cli_str(&mut store, &data_len, &data_at)?;
+                write!(out, "{data}")?;
             }
             CMD_PRINT_ERR => {
                 let line = read_cli_str(&mut store, &data_len, &data_at)?;
@@ -799,7 +674,8 @@ fn main() -> Result<()> {
     // `fmt`, `run`, and `check` have their own arg shapes (optional/absent file,
     // flags, stdin), so they're dispatched before the positional `<cmd> <input>`.
     if args.get(1).map(|s| s == "fmt").unwrap_or(false) {
-        return run_fmt(&args[2..]);
+        // The subcommand rides as argv[0] so the VL program dispatches on it.
+        return cli_pump(&args[1..]);
     }
     if args.get(1).map(|s| s == "run").unwrap_or(false) {
         return run_cmd(&args[2..]);
