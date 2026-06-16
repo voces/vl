@@ -222,13 +222,38 @@ host path until the protocol is proven on `check`.
 Each step rebuilds the seed (the `.vl` CLI is in the compiled source), so the
 native fixpoint + golden gates apply.
 
+## Why the pump and not WASI now (decision)
+
+The pump is **bespoke**, not a standard — it mirrors the in-repo module-fetch
+loop. WASI is the standard. We chose the pump for the near term anyway, for three
+reasons (heaviest first):
+
+1. **ABI mismatch with WASI Preview 1.** Preview 1 is linear-memory/iovec-based
+   (`path_open(path_ptr, path_len)`, `fd_read` into memory); VL is WasmGC —
+   strings/arrays are GC refs, not memory regions. Bridging Preview 1 means a
+   linear memory + a GC↔linear *copy at every syscall* (the marshalling H-M2's
+   roadmap entry plans as its one emitter prerequisite). The pump instead uses
+   VL's existing GC-native per-code-point accessors (`srcPush`/`diagMsgAt`/…) —
+   zero marshalling. Preview 2 (native `string`/`list`) is the clean fit but its
+   async/tooling story is still settling.
+2. **The seed is import-free and most embedders do no I/O.** wasmtime gives WASI
+   p1 for free, but **browsers don't implement WASI** — the playground checks code
+   in-memory and would have to ship a JS WASI shim for imports it never calls.
+   The pump (exports only) runs identically in wasmtime, deno, and the browser.
+3. **Consistency** — the module-fetch loop is already this exact empty-linker queue.
+
+This does **not** handcuff VL to Preview 2. The WASI transport, when it lands, can
+be *either* the roadmap's marshal-copy (H-M2: a linear memory + GC→linear copies)
+*or* native unmanaged linear-memory string/array objects (a larger language
+feature — a distinct unmanaged type with its own ops + lifetime/arena story — that
+makes WASI/FFI zero-copy). **The VL policy (walk, glob, formatting, severity, fix)
+is identical under all three**; only the I/O transport differs. The pump unblocks
+the CLI now and defers the transport choice.
+
 ## WASI end-state
 
 Every command code maps onto a WASI primitive — `CMD_LIST_DIR` ≈ `fd_readdir`,
 `CMD_READ_FILE` ≈ `path_open`+`fd_read`, `CMD_WRITE_FILE` ≈ `fd_write`,
 `CMD_PRINT_*` ≈ `fd_write` to 1/2, argv ≈ `args_get`. When the host becomes a WASI
-shim (or disappears in favor of a stock WASI runtime), the VL CLI program is
-unchanged; only the transport under the command queue swaps. The pump exists today
-because the wasm component model's I/O story is still settling and because the
-empty-linker command-queue keeps the seed runnable by *any* host (deno, wasmtime
-embedding, browser) without a host-import contract.
+shim (or a stock WASI runtime), the VL CLI program is unchanged; only the queue's
+transport swaps (per the marshal-copy or native-linear-objects choice above).
