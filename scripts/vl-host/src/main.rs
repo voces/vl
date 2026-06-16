@@ -310,15 +310,16 @@ fn run_program(engine: &Engine, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a `wasm-opt` binary: `$VL_WASM_OPT` override first, else a PATH scan.
-/// Returns `None` when none is found (so `-O` can degrade gracefully).
-fn wasm_opt_path() -> Option<String> {
-    if let Ok(p) = std::env::var("VL_WASM_OPT") {
+/// Resolve a binaryen CLI tool (`wasm-opt` for `-O`, `wasm-dis` for `--wat`): an
+/// explicit env override first (`$VL_WASM_OPT` / `$VL_WASM_DIS`), else a PATH scan.
+/// `None` when none is found, so the optional passes degrade gracefully.
+fn binaryen_tool(tool: &str, env_override: &str) -> Option<String> {
+    if let Ok(p) = std::env::var(env_override) {
         return Some(p);
     }
     let path = std::env::var("PATH").unwrap_or_default();
     for dir in path.split(':') {
-        let cand = format!("{dir}/wasm-opt");
+        let cand = format!("{dir}/{tool}");
         if std::fs::metadata(&cand)
             .map(|m| m.is_file())
             .unwrap_or(false)
@@ -329,16 +330,30 @@ fn wasm_opt_path() -> Option<String> {
     None
 }
 
+/// Platform-tailored note when a binaryen CLI tool isn't found, so `-O` / `--wat`
+/// degrade to a clear soft no-op rather than a silent one. macOS suggests Homebrew;
+/// other platforms point at the package manager / the prebuilt releases. The hint
+/// is compile-time `cfg!` (the binary is native per-platform), so it never suggests
+/// `brew` on Linux.
+fn binaryen_missing_note(flag: &str, tool: &str, env_override: &str, consequence: &str) {
+    let install = if cfg!(target_os = "macos") {
+        "`brew install binaryen`"
+    } else {
+        "your package manager, or https://github.com/WebAssembly/binaryen/releases"
+    };
+    eprintln!(
+        "note: {flag} requested but no `{tool}` on PATH ({consequence}) — install binaryen ({install}), or set ${env_override}"
+    );
+}
+
 /// `vl build -O`: shell out to `wasm-opt` to shrink the emitted module IN PLACE,
 /// when a `wasm-opt` is available. VL output is WasmGC, so the GC + reference-type
 /// features are REQUIRED for binaryen to even validate it; we enable EXACTLY those
 /// two — `-all` would turn on post-3.0 features that wasmtime then refuses to load.
 /// A missing `wasm-opt` is a soft no-op (the unoptimized module is already written).
 fn optimize_in_place(path: &str) -> Result<()> {
-    let Some(opt) = wasm_opt_path() else {
-        eprintln!(
-            "note: -O requested but no `wasm-opt` on PATH (set $VL_WASM_OPT) — wrote the unoptimized module"
-        );
+    let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
+        binaryen_missing_note("-O", "wasm-opt", "VL_WASM_OPT", "wrote the unoptimized module");
         return Ok(());
     };
     let status = std::process::Command::new(&opt)
@@ -355,6 +370,32 @@ fn optimize_in_place(path: &str) -> Result<()> {
     if !status.success() {
         bail!("wasm-opt `{opt}` failed (exit {:?})", status.code());
     }
+    Ok(())
+}
+
+/// `vl build --wat`: shell out to `wasm-dis` to write a `.wat` text dump beside the
+/// emitted module. Like `-O`, WasmGC output needs the GC + reference-type features
+/// enabled for `wasm-dis` to parse it (NOT `-all` — see `optimize_in_place`). A
+/// missing `wasm-dis` is a soft no-op (the `.wasm` is already written).
+fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
+    let Some(dis) = binaryen_tool("wasm-dis", "VL_WASM_DIS") else {
+        binaryen_missing_note("--wat", "wasm-dis", "VL_WASM_DIS", "skipped the .wat");
+        return Ok(());
+    };
+    let status = std::process::Command::new(&dis)
+        .args([
+            wasm_path,
+            "--enable-reference-types",
+            "--enable-gc",
+            "-o",
+            wat_path,
+        ])
+        .status()
+        .map_err(|e| Error::from(e).context(format!("running wasm-dis `{dis}`")))?;
+    if !status.success() {
+        bail!("wasm-dis `{dis}` failed (exit {:?})", status.code());
+    }
+    println!("wrote {wat_path}");
     Ok(())
 }
 
@@ -561,6 +602,12 @@ fn main() -> Result<()> {
                 .map(|m| m.len())
                 .unwrap_or(bytes.len() as u64);
             println!("wrote {out} ({len} bytes)");
+            // `--wat`: also write a `.wat` text dump beside the module (wasm-dis,
+            // when present). Reflects the `-O`-optimized module if both are given.
+            if args.iter().any(|a| a == "--wat") {
+                let wat = format!("{}.wat", out.strip_suffix(".wasm").unwrap_or(&out));
+                disassemble_to_wat(&out, &wat)?;
+            }
         }
         "check" => {
             // `check` is parse + typecheck only (the `checkSrc` entrypoint) — NOT a
