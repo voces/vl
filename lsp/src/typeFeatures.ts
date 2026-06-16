@@ -1,43 +1,28 @@
-// Pure, runtime-agnostic helpers behind the type-aware editor features
-// (inlay hints, semantic tokens) the LSP layers on top of the D2 symbol table.
+// Pure, runtime-agnostic ASSEMBLY helpers behind the type-aware editor features
+// (semantic tokens, inlay hints, completion, hover-doc rendering). As of the
+// kill-TS teardown these no longer run any TS compiler pass: the analysis is done
+// by the self-hosted wasm checker (`wasmChecker.ts`), and the helpers here turn
+// its results into the LSP wire shapes — `semanticTokensDataFromWasm`,
+// `inlayHintsFromWasm`, `builtinCompletionsFromWasm`, `memberCompletionsFromWasm`,
+// `scopeCompletionsFromBindings`, the keyword/snippet completion lists, the
+// `docMarkdown`/`linkifyDocRefs` doc renderer, and the semantic-token legend +
+// delta encoder. So this module imports nothing executable from the compiler core
+// (only two TYPE aliases) — it's shared verbatim by the Node LSP (`server.ts`)
+// and the browser playground (`playground/src/lspAdapter.ts`).
 //
-// These live in their own module — rather than in `server.ts` — for one reason:
+// These live in their own module — rather than in `server.ts` — because
 // `server.ts` imports the Node-only `vscode-languageserver` package and calls
-// `createConnection().listen()` at module load, so it can't be imported by a
-// Deno unit test. Everything here depends only on the compiler's `SymbolTable`
-// (`../../compiler/symbols.ts`), so `tests/lsp_type_features_test.ts` drives it
-// directly. `server.ts` does the LSP request/response plumbing around it.
+// `createConnection().listen()` at module load, so it can't be imported by a Deno
+// unit test or the browser bundle; this module can.
 //
-// Position convention: VL spans (from the symbol table) are 1-based line /
-// 0-based column. The LSP wire format is 0-based line / 0-based character. To
-// keep these helpers independent of the LSP enums and easy to assert on, they
-// emit *plain* 0-based positions; `server.ts` wraps the results in the real
-// `InlayHint` / `SemanticTokens` shapes.
+// Position convention: the wasm checker reports 1-based line / 0-based column; the
+// LSP wire format is 0-based line / 0-based character. To keep these helpers
+// independent of the LSP enums and easy to assert on, they emit *plain* 0-based
+// positions; the host wraps the results in the real `InlayHint` / `SemanticTokens`
+// shapes.
 
-import type {
-  Context,
-  NodeSpans,
-  Position,
-  Scope,
-  VLExpression,
-  VLObjectType,
-  VLProgramNode,
-  VLType,
-} from "../../compiler/ast.ts";
-import { spanOf } from "../../compiler/ast.ts";
-import type { BindingKind, SymbolTable } from "../../compiler/symbols.ts";
-import type { Token, TokenKind } from "../../compiler/lexer.ts";
-import {
-  arrayElementType,
-  isListType,
-  listMemberType,
-  mapKeyValueType,
-  mapMemberType,
-  setElementType,
-  setMemberType,
-  softenImplicitType,
-  typeFromExpression,
-} from "../../compiler/typecheck.ts";
+import type { Position } from "../../compiler/ast.ts";
+import type { BindingKind } from "../../compiler/symbols.ts";
 
 // ---- semantic tokens (D5) ---------------------------------------------------
 
@@ -83,20 +68,12 @@ const TT = Object.fromEntries(
   SEMANTIC_TOKEN_TYPES.map((name, i) => [name, i]),
 ) as Record<(typeof SEMANTIC_TOKEN_TYPES)[number], number>;
 
-/** Map a binding kind to its index in {@link SEMANTIC_TOKEN_TYPES}. */
-const bindingTokenType: Record<BindingKind, number> = {
-  variable: TT.variable,
-  parameter: TT.parameter,
-  function: TT.function,
-  type: TT.type,
-};
-
 const DECLARATION_BIT = 1 << 0; // index 0 in SEMANTIC_TOKEN_MODIFIERS
 
 /**
  * One classified token span, in 0-based LSP coordinates. Spans are single-line
- * (a defensive guard in {@link classifyLexicalTokens} / the symbol-table path
- * drops any that aren't, since the encoding below assumes one line per token).
+ * (the external-token helpers drop any whose `length <= 0`, since the encoding
+ * below assumes one line per token).
  */
 export type ClassifiedToken = {
   line: number; // 0-based
@@ -106,237 +83,13 @@ export type ClassifiedToken = {
   tokenModifiers: number; // bitset over SEMANTIC_TOKEN_MODIFIERS
 };
 
-/** Convert a 1-based VL span start to a 0-based single-line token, or undefined. */
-const spanToken = (
-  span: Context,
-  tokenType: number,
-  tokenModifiers: number,
-): ClassifiedToken | undefined => {
-  // Skip anything spanning lines — the relative encoding assumes one line per
-  // token. (Identifiers/keywords/numbers never wrap; a multi-line string is
-  // dropped rather than mis-encoded.)
-  if (span.start.line !== span.stop.line) return undefined;
-  const length = span.stop.column - span.start.column;
-  if (length <= 0) return undefined;
-  return {
-    line: span.start.line - 1, // 1-based VL → 0-based LSP
-    char: span.start.column,
-    length,
-    tokenType,
-    tokenModifiers,
-  };
-};
-
-/**
- * Classify identifier occurrences from the symbol table — the semantically
- * accurate path. A name that resolves to a function declaration becomes a
- * `function` token, a type-position name a `type`, etc., which a purely lexical
- * pass (every `ID` looks the same) can't distinguish. Declaration occurrences
- * carry the `declaration` modifier.
- *
- * Returned keyed by an `<line>:<char>` position string so the lexical pass can
- * defer to these for any identifier the symbol table already resolved (and only
- * colour the leftover `ID`s — builtins, members — itself).
- */
-const classifySymbolTokens = (
-  table: SymbolTable,
-): Map<string, ClassifiedToken> => {
-  const byPos = new Map<string, ClassifiedToken>();
-  for (const occ of table.occurrences) {
-    const t = spanToken(
-      occ.span,
-      bindingTokenType[occ.binding.kind],
-      occ.isDecl ? DECLARATION_BIT : 0,
-    );
-    if (t) byPos.set(`${t.line}:${t.char}`, t);
-  }
-  return byPos;
-};
-
-/**
- * The token type for a lexer {@link TokenKind}, or `undefined` for kinds we
- * don't colour (whitespace-like structural tokens: `NEWLINE`, `EOF`, brackets,
- * commas, dots, colons — these are handled fine by the TextMate grammar and
- * carry no semantic weight). `ID` is intentionally absent: identifiers are
- * resolved by the symbol-table pass; a leftover `ID` (a builtin like `i32`, a
- * member name) gets no semantic token and falls back to the grammar.
- */
-const lexicalTokenType = (kind: TokenKind): number | undefined => {
-  switch (kind) {
-    // Strings (and their escapes) are intentionally left to the TextMate grammar:
-    // a whole-literal `string` semantic token overrides the grammar's finer
-    // `constant.character.escape` scope, so `\n`/`\t` etc. would stop being
-    // highlighted in source. The grammar already colors strings + escapes.
-    case "NUMBER":
-      return TT.number;
-    case "TRUE":
-    case "FALSE":
-    case "NULL":
-      return TT.boolean;
-    // Keywords (excluding the literal keywords handled above).
-    case "FUNCTION":
-    case "IF":
-    case "ELSE":
-    case "ELSEIF":
-    case "WHILE":
-    case "FOR":
-    case "CONST":
-    case "LET":
-    case "RETURN":
-    case "IS":
-    case "AWAIT":
-    case "BREAK":
-    case "CONTINUE":
-    case "TYPE":
-      return TT.keyword;
-    // Operators (arithmetic / logical / comparison / nullish). Pure punctuation
-    // (parens, braces, brackets, comma, dot, colon) is deliberately omitted.
-    case "PLUS":
-    case "MINUS":
-    case "STAR":
-    case "DIV":
-    case "MOD":
-    case "CARET":
-    case "EQUAL":
-    case "PLUSPLUS":
-    case "MINUSMINUS":
-    case "AND":
-    case "OR":
-    case "EXCLAMATION":
-    case "QUESTION_DOT":
-    case "QUESTION_QUESTION":
-    case "EQUAL_TO":
-    case "NOT_EQUAL_TO":
-    case "GREATER_THAN":
-    case "GREATER_THAN_OR_EQUAL_TO":
-    case "LESS_THAN":
-    case "LESS_THAN_OR_EQUAL_TO":
-    case "PIPE":
-    case "AMPERSAND":
-      return TT.operator;
-    default:
-      return undefined;
-  }
-};
-
-/**
- * Classify the lexer token stream into {@link ClassifiedToken}s for literals,
- * keywords, and operators. Identifiers are skipped here — the symbol-table pass
- * ({@link classifySymbolTokens}) classifies them more accurately. Comments are
- * recovered separately ({@link commentTokens}) because the lexer drops them as
- * trivia.
- */
-const classifyLexicalTokens = (tokens: Token[]): ClassifiedToken[] => {
-  const out: ClassifiedToken[] = [];
-  for (const tok of tokens) {
-    const tokenType = lexicalTokenType(tok.kind);
-    if (tokenType === undefined) continue;
-    const t = spanToken(tok, tokenType, 0);
-    if (t) out.push(t);
-  }
-  return out;
-};
-
-/**
- * Recover `//` line comments as `comment` tokens by scanning the source — the
- * lexer drops them as trivia (and never records doc comments' spans), so they're
- * not in the token stream. We scan line-by-line for `//` that is NOT inside a
- * string literal, colouring from the `//` to end of line. This is a lightweight
- * heuristic: it tracks single/double-quoted string state on each line so a `//`
- * inside `"http://…"` isn't mistaken for a comment, but it does not handle a
- * string that spans multiple lines (rare; a worst case mis-colours a comment-
- * like run inside such a string, never breaks encoding).
- */
-const commentTokens = (source: string): ClassifiedToken[] => {
-  const out: ClassifiedToken[] = [];
-  const lines = source.split("\n");
-  for (let line = 0; line < lines.length; line++) {
-    const text = lines[line];
-    let quote: string | null = null;
-    for (let i = 0; i < text.length; i++) {
-      const c = text[i];
-      if (quote) {
-        if (c === "\\") {
-          i++; // skip the escaped char
-        } else if (c === quote) {
-          quote = null;
-        }
-        continue;
-      }
-      if (c === '"' || c === "'") {
-        quote = c;
-        continue;
-      }
-      if (c === "/" && text[i + 1] === "/") {
-        out.push({
-          line,
-          char: i,
-          length: text.length - i,
-          tokenType: TT.comment,
-          tokenModifiers: 0,
-        });
-        break; // rest of line is the comment
-      }
-    }
-  }
-  return out;
-};
-
-/**
- * Classify a whole document into {@link ClassifiedToken}s, merging the
- * semantically-accurate symbol-table pass (identifiers → variable/parameter/
- * function/type) with the lexical pass (literals/keywords/operators) and
- * recovered comments. Where both passes cover the same position the symbol-table
- * classification wins (it carries the real binding kind + declaration modifier).
- *
- * Sorted by (line, char) — the relative encoding {@link encodeSemanticTokens}
- * requires a non-decreasing position order.
- */
-export const classifyDocument = (
-  table: SymbolTable,
-  tokens: Token[],
-  source: string,
-  ast?: VLProgramNode,
-  spans?: NodeSpans,
-): ClassifiedToken[] => {
-  const symbolTokens = classifySymbolTokens(table);
-  const merged: ClassifiedToken[] = [...symbolTokens.values()];
-  for (const t of classifyLexicalTokens(tokens)) {
-    // A symbol-table classification at this exact position takes precedence.
-    if (!symbolTokens.has(`${t.line}:${t.char}`)) merged.push(t);
-  }
-  merged.push(...commentTokens(source));
-  // Member names (`o.x`, `xs.get`) — leftover `ID`s neither pass classifies. A
-  // symbol-table classification at the same position still wins (defensive: a
-  // member name never overlaps a binding occurrence).
-  if (ast && spans) {
-    for (const t of classifyMemberTokens(ast, spans)) {
-      if (!symbolTokens.has(`${t.line}:${t.char}`)) merged.push(t);
-    }
-  }
-  merged.sort((a, b) => a.line - b.line || a.char - b.char);
-  return merged;
-};
-
-/**
- * Classify only the symbol-table identifier occurrences (variable/parameter/
- * function/type). Retained for the focused unit tests and as the
- * semantically-accurate core; full-document classification is
- * {@link classifyDocument}.
- */
-export const classifyTokens = (table: SymbolTable): ClassifiedToken[] => {
-  const tokens = [...classifySymbolTokens(table).values()];
-  tokens.sort((a, b) => a.line - b.line || a.char - b.char);
-  return tokens;
-};
-
 /**
  * Delta-encode classified tokens into the flat `data` array LSP semantic tokens
  * use: groups of five `[deltaLine, deltaChar, length, tokenType, tokenModifiers]`.
  *
  * `deltaLine` is relative to the previous token's line; `deltaChar` is relative
  * to the previous token's char *only when on the same line*, otherwise it's the
- * absolute char. Tokens must already be sorted (see {@link classifyTokens}).
+ * absolute char. Tokens must already be sorted by (line, char).
  *
  * Factored out and unit-tested because relative encoding is famously easy to get
  * subtly wrong (off-by-one on the same-line vs new-line char delta).
@@ -354,21 +107,6 @@ export const encodeSemanticTokens = (tokens: ClassifiedToken[]): number[] => {
   }
   return data;
 };
-
-/**
- * Convenience: classify a whole document (symbol-table identifiers + lexical
- * literals/keywords/operators + comments) and delta-encode it into the flat LSP
- * `data` array in one call. This is what `server.ts` returns for
- * `textDocument/semanticTokens/full`.
- */
-export const semanticTokensData = (
-  table: SymbolTable,
-  tokens: Token[],
-  source: string,
-  ast?: VLProgramNode,
-  spans?: NodeSpans,
-): number[] =>
-  encodeSemanticTokens(classifyDocument(table, tokens, source, ast, spans));
 
 /**
  * One pre-classified identifier from an EXTERNAL classifier (the wasm checker's
@@ -434,46 +172,6 @@ const memberTokensFromExternal = (
     });
   }
   return out;
-};
-
-/**
- * Full-document semantic tokens with the IDENTIFIER classification supplied by an
- * external source (the wasm checker) instead of the TS symbol table. The lexical
- * pass (literals/keywords/operators), recovered comments, and the member walk
- * stay TS-side and merge identically to {@link classifyDocument} — only the
- * identifier-binding source moves to wasm. Where the external set classifies a
- * position, it wins (as the symbol-table pass does); leftover identifiers fall
- * through to the lexical/member passes unchanged.
- *
- * This is the LSP-on-wasm Stage-2 entry point for `textDocument/semanticTokens`:
- * `server.ts` builds `idents` from `wasmChecker.tokensAt`, the rest is pure JS.
- */
-export const semanticTokensDataFromIdentifiers = (
-  idents: IdentToken[],
-  tokens: Token[],
-  source: string,
-  ast?: VLProgramNode,
-  spans?: NodeSpans,
-  extMembers?: ExtMemberToken[],
-): number[] => {
-  const identTokens = identTokensByPos(idents);
-  const merged: ClassifiedToken[] = [...identTokens.values()];
-  for (const t of classifyLexicalTokens(tokens)) {
-    if (!identTokens.has(`${t.line}:${t.char}`)) merged.push(t);
-  }
-  merged.push(...commentTokens(source));
-  // Member names: prefer the EXTERNAL (wasm) member slice when supplied — the
-  // native checker classifies `method`/`property` from the resolved type, the
-  // kill-TS counterpart of the AST member walk. Fall back to the TS walk only
-  // when the wasm slice is absent (a seed predating the member exports).
-  const memberTokens = extMembers !== undefined
-    ? memberTokensFromExternal(extMembers)
-    : (ast && spans ? classifyMemberTokens(ast, spans) : []);
-  for (const t of memberTokens) {
-    if (!identTokens.has(`${t.line}:${t.char}`)) merged.push(t);
-  }
-  merged.sort((a, b) => a.line - b.line || a.char - b.char);
-  return encodeSemanticTokens(merged);
 };
 
 /**
@@ -658,84 +356,6 @@ const toLsp = (pos: Position): { line: number; char: number } => ({
   line: pos.line - 1, // 1-based VL → 0-based LSP
   char: pos.column,
 });
-
-/**
- * Whether a type is an unresolved inference hole — an `Infer` placeholder or a
- * bare `Unknown` (`any`) — for which a hint would read `: I<…>` / `: any`. Those
- * are noise, not the concrete inferred type the feature promises (they occur for
- * an unconstrained generic parameter), so we skip hinting them.
- */
-const isHole = (type: VLType): boolean =>
-  type.type === "Infer" || type.type === "Unknown";
-
-/**
- * Derive type inlay hints from a symbol table: surface the *inferred* type at
- * each declaration the user left unannotated. Three positions:
- *   - a `let`/`const` binding (`variable`) with no `: T` — `name: <type>`;
- *   - a function `parameter` with no `: T` — `name: <type>`;
- *   - a `function`'s omitted return type — `): <type>` after the param list.
- *
- * Crucially, a declaration the user *already annotated* gets NO hint — echoing
- * the written annotation is noise, the opposite of the feature's point. We detect
- * the annotation from the source text ({@link isAnnotated} / the return-gap scan)
- * since the symbol table records `binding.type` but not whether it was authored
- * or inferred. `source` is therefore required for suppression; without it (legacy
- * callers / pure-table tests) every eligible declaration is hinted.
- *
- * `stringify` is injected (rather than importing `stringifyType` here) so this
- * stays a pure data transform and tests can pass a trivial stub. A `type` alias
- * is never hinted (it names its own RHS).
- */
-export const deriveInlayHints = (
-  table: SymbolTable,
-  stringify: (type: VLType) => string,
-  range?: LspRange,
-  source?: string,
-): TypeInlayHint[] => {
-  const lines = source !== undefined ? splitLines(source) : undefined;
-  const hints: TypeInlayHint[] = [];
-
-  const push = (
-    pos: { line: number; char: number },
-    label: string,
-    name: string,
-  ) => {
-    if (range && !posInRange(pos.line, pos.char, range)) return;
-    hints.push({ line: pos.line, char: pos.char, label, name });
-  };
-
-  for (const occ of table.occurrences) {
-    if (!occ.isDecl) continue;
-    const { binding } = occ;
-    if (binding.type === undefined) continue;
-
-    if (binding.kind === "variable" || binding.kind === "parameter") {
-      // Skip already-annotated bindings (the headline rule). Without `source`
-      // we can't tell, so we hint all eligible declarations (legacy behaviour).
-      if (lines && isAnnotated(lines, occ.span.stop)) continue;
-      if (isHole(binding.type)) continue;
-      push(toLsp(occ.span.stop), `: ${stringify(binding.type)}`, binding.name);
-      continue;
-    }
-
-    if (binding.kind === "function" && binding.type.type === "Function") {
-      // Return-type hint: only when the user omitted it, and only when we can
-      // locate the param list's `)` from the source. Place it just after `)`.
-      if (!lines) continue;
-      if (isHole(binding.type.return)) continue;
-      const close = closingParen(lines, occ.span.stop);
-      if (!close) continue;
-      // Annotated iff the next non-whitespace char after `)` is `:`.
-      if (isAnnotated(lines, close)) continue;
-      push(
-        toLsp(close),
-        `: ${stringify(binding.type.return)}`,
-        binding.name,
-      );
-    }
-  }
-  return hints;
-};
 
 /**
  * One inlay-hint CANDIDATE from an external source (the wasm checker's
@@ -962,61 +582,6 @@ export const docMarkdown = (
   if (!trimmed) return fence;
   const linked = resolve ? linkifyDocRefs(trimmed, resolve) : trimmed;
   return fence ? `${linked}\n\n${fence}` : linked;
-};
-
-/**
- * Classify a builtin (from `defaultScope`) by its `VLType`: a `Function` type is
- * a callable, anything else is treated as a `type` (the builtins are the numeric
- * /string *types* `i32`, `string`, … which are object types naming themselves).
- * Builtins carry no `BindingKind`, so we infer one from the type shape alone.
- */
-const builtinKind = (type: VLType): CompletionKind =>
-  type.type === "Function" ? "function" : "type";
-
-/**
- * Scope-aware identifier completions at `pos` (roadmap D3 feature 1): every name
- * visible at the cursor — locals, parameters, functions, and `type` aliases —
- * plus the builtins from `defaultScope` (`builtins`), each tagged with its kind
- * and (when known) a type detail string.
- *
- * In-scope user names come from `SymbolTable.bindingsInScopeAt` (which honours
- * nesting + shadowing: an inner `let x` shadows an outer one, and a name whose
- * enclosing scope doesn't cover `pos` is excluded). A user binding shadows a
- * builtin of the same name. `pos` uses the symbol table's 1-based-line /
- * 0-based-column convention (`server.ts` bridges from the LSP position).
- *
- * `stringify` is injected (not imported) to keep this a pure transform, matching
- * the other helpers in this module.
- */
-export const identifierCompletions = (
-  table: SymbolTable,
-  pos: Position,
-  builtins: Scope,
-  stringify: (type: VLType) => string,
-): Completion[] => {
-  const byName = new Map<string, Completion>();
-  // Builtins first; user bindings (added next) overwrite same-named entries so a
-  // local/param/function/type shadows a builtin in the suggestion list. The
-  // `__name__` runtime intrinsics (`__store_i32__`, …) live in the same scope but
-  // aren't surface syntax users write, so they're filtered out.
-  for (const name of Object.keys(builtins)) {
-    if (name.startsWith("__")) continue;
-    const type = builtins[name];
-    byName.set(name, {
-      name,
-      kind: builtinKind(type),
-      detail: stringify(type),
-    });
-  }
-  for (const binding of table.bindingsInScopeAt(pos)) {
-    byName.set(binding.name, {
-      name: binding.name,
-      kind: binding.kind,
-      detail: binding.type ? stringify(binding.type) : undefined,
-      doc: binding.doc,
-    });
-  }
-  return [...byName.values()];
 };
 
 /**
@@ -1251,338 +816,4 @@ export const snippetCompletions = (afterDot: boolean): Completion[] => {
       insertText: "return ${0}",
     },
   ];
-};
-
-/**
- * Member completions for an object type (roadmap D3 feature 2): the field/method
- * names declared on `objectType`, each with a type detail. Only properties whose
- * key is a string literal are surfaced — those are the addressable `.member`
- * names. Operator entries (whose key is a *union* of operator string literals
- * like `"+"`/`"=="`) and index signatures (numeric/`i32` keys) are skipped: they
- * aren't dot-accessible identifiers. A method (a property whose type is a
- * `Function`) is tagged `"function"`; a plain field is a `"variable"`.
- */
-export const memberCompletions = (
-  objectType: VLObjectType,
-  stringify: (type: VLType) => string,
-): Completion[] => {
-  const out: Completion[] = [];
-  const seen = new Set<string>();
-  for (const prop of objectType.properties) {
-    if (prop.name.type !== "StringLiteral") continue;
-    const name = prop.name.value;
-    // Skip pure operator names (`+`, `==`, …) — not dot-accessible identifiers.
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
-    if (seen.has(name)) continue;
-    seen.add(name);
-    out.push({
-      name,
-      kind: prop.type.type === "Function" ? "function" : "variable",
-      detail: stringify(prop.type),
-    });
-  }
-  return out;
-};
-
-/**
- * Resolve a receiver expression's *object* type so {@link memberCompletions} can
- * read its members — best-effort for the simple `name.` receiver (the common
- * case; resolving an arbitrary expression's type at a cursor needs a deeper
- * compiler hook, see the D3 report).
- *
- * `receiver` is the identifier just before the `.`. We find its type from the
- * symbol table (an in-scope binding) or from the program `scope` (a builtin /
- * top-level name), then soften it to an object: a bare `Object` is returned
- * directly; a `Nullable<Object>` (an `x?.`-style receiver) unwraps to its object;
- * an `Alias` is followed one hop through `scope` (e.g. `let p: Point` →
- * `scope.Point` → the object). Returns `undefined` when no object type is found.
- */
-export const receiverObjectType = (
-  receiver: string,
-  table: SymbolTable,
-  pos: Position,
-  scope: Scope,
-): VLObjectType | undefined => {
-  const fromBinding = table
-    .bindingsInScopeAt(pos)
-    .find((b) => b.name === receiver)?.type;
-  const type = fromBinding ?? scope[receiver];
-  return type ? asObjectType(type, scope) : undefined;
-};
-
-/** Soften a type to an object: unwrap `Nullable`, follow one `Alias` hop. */
-const asObjectType = (
-  type: VLType,
-  scope: Scope,
-  depth = 0,
-): VLObjectType | undefined => {
-  if (depth > 8) return undefined; // guard against a cyclic alias chain
-  if (type.type === "Object") return type;
-  // A named `Type` wrapper (a resolved `type` alias, D8) carries the alias name
-  // for display but wraps its concrete body — step through it to that body.
-  if (type.type === "Type") return asObjectType(type.subType, scope, depth + 1);
-  if (type.type === "Nullable") {
-    return asObjectType(type.subType, scope, depth + 1);
-  }
-  if (type.type === "Alias") {
-    const target = scope[type.name];
-    return target ? asObjectType(target, scope, depth + 1) : undefined;
-  }
-  return undefined;
-};
-
-// ---- member-aware hover / semantic tokens (D1/D5 follow-up) -----------------
-//
-// Hover and semantic tokens previously resolved only D2 symbol-table *bindings*.
-// A member name in `receiver.member` (`o.x`, `xs.get`, `s.length`) isn't a
-// binding, so the `.member` half came back empty. The mechanism below closes
-// that gap with ONE path shared by both features: locate the `PropertyAccess` /
-// `OptionalAccess` AST node whose *member name* is under the cursor, type its
-// receiver, and look the member up. (Member calls — `xs.get(i)` — parse to a
-// `Call` whose `callee` is exactly such a `PropertyAccess`, so they're covered
-// by the same node walk.)
-
-/**
- * How a resolved member is categorised — mirrors the LSP semantic-token split.
- * A function-typed member is a `method`; any other member is a `property`. (These
- * are distinct from {@link BindingKind} because a member has no binding.)
- */
-export type MemberTokenKind = "property" | "method";
-
-/** A member name located under the cursor, with its resolved type. */
-export type ResolvedMember = {
-  /** The member identifier text (`x`, `get`, `length`). */
-  name: string;
-  /** The member's resolved type — the field type, or the builtin member type. */
-  type: VLType;
-  /** `method` for a function-typed member, else `property`. */
-  kind: MemberTokenKind;
-  /** The source span of the member NAME (not the whole `receiver.member`). */
-  span: Context;
-};
-
-/**
- * The source span of the member NAME in a `PropertyAccess` / `OptionalAccess`.
- * The parser records the *whole* `receiver.member` span on the node (object
- * start → member-id stop) and stores the member as a bare string, so the member
- * name itself has no recorded span. We reconstruct it: the recorded span's
- * `stop` is the member id's last-char-plus-one, and the id is `property` chars
- * long, so the name occupies `[stop.column - property.length, stop.column]` on
- * the stop line. (Member ids never wrap a line, so a single-line span is safe.)
- * Returns `undefined` when the arithmetic would be inconsistent (defensive).
- */
-const memberNameSpan = (
-  nodeSpan: Context,
-  property: string,
-): Context | undefined => {
-  const startColumn = nodeSpan.stop.column - property.length;
-  if (startColumn < 0) return undefined;
-  return {
-    start: { line: nodeSpan.stop.line, column: startColumn },
-    stop: nodeSpan.stop,
-  };
-};
-
-/** Whether a 1-based-line / 0-based-column VL position falls inside `span`. */
-const posInSpan = (pos: Position, span: Context): boolean => {
-  const afterStart = pos.line > span.start.line ||
-    (pos.line === span.start.line && pos.column >= span.start.column);
-  const beforeStop = pos.line < span.stop.line ||
-    (pos.line === span.stop.line && pos.column <= span.stop.column);
-  return afterStart && beforeStop;
-};
-
-/** The character span length, for picking the innermost (narrowest) match. */
-const spanWidth = (span: Context): number =>
-  span.start.line === span.stop.line
-    ? span.stop.column - span.start.column
-    : Number.MAX_SAFE_INTEGER; // multi-line: always the outer of a pair
-
-/**
- * Collect every `PropertyAccess` / `OptionalAccess` node in the AST, paired with
- * its recorded span. A generic structural walk (recurse into every object/array
- * field) so it stays decoupled from each node shape — new expression kinds don't
- * need a visitor here. The `Scope` carried on the program node is skipped (it's a
- * type environment, not AST, and is cyclic). A `seen` set guards the AST being a
- * graph (shared sub-nodes) from looping.
- */
-const collectMemberAccesses = (
-  root: VLProgramNode,
-  spans: NodeSpans,
-): { node: VLPropertyLikeAccess; span: Context }[] => {
-  const out: { node: VLPropertyLikeAccess; span: Context }[] = [];
-  const seen = new Set<object>();
-  const visit = (value: unknown): void => {
-    if (value === null || typeof value !== "object") return;
-    if (seen.has(value)) return;
-    seen.add(value);
-    if (Array.isArray(value)) {
-      for (const item of value) visit(item);
-      return;
-    }
-    const node = value as { type?: unknown };
-    if (node.type === "PropertyAccess" || node.type === "OptionalAccess") {
-      const span = spanOf(spans, value);
-      if (span) out.push({ node: value as VLPropertyLikeAccess, span });
-    }
-    for (const key of Object.keys(node)) {
-      if (key === "scope") continue; // the type environment, not AST
-      visit((node as Record<string, unknown>)[key]);
-    }
-  };
-  visit(root);
-  return out;
-};
-
-/** A `PropertyAccess` or `OptionalAccess` — the two member-read node shapes. */
-type VLPropertyLikeAccess = {
-  type: "PropertyAccess" | "OptionalAccess";
-  object: VLExpression;
-  property: string;
-};
-
-/**
- * Resolve the *member* type for a `receiver.member` whose member NAME is under
- * the cursor, for hover and semantic tokens alike. Returns `undefined` when the
- * cursor isn't on a member name, or the member can't be typed.
- *
- * Mechanism (one path for both features):
- *   1. Walk the AST for member-access nodes, reconstruct each member-name span
- *      ({@link memberNameSpan}), and pick the innermost whose name covers `pos`.
- *   2. Type the receiver via the checker's `typeFromExpression` — memoized during
- *      the parse, so this returns the already-computed receiver type (it never
- *      re-walks scopes for an already-typed node).
- *   3. Look the member up on that type:
- *        - `.length` on an array/string → the intrinsic `i32`;
- *        - an intrinsic list member (`.get`/`.push`/… on a `T[]`) → its
- *          `listMemberType` entry;
- *        - otherwise a structural object field (covers user objects AND string
- *          members, which live as properties on the nominal `string` object).
- *
- * `pos` uses the VL 1-based-line / 0-based-column convention (`server.ts`
- * bridges). `objectType`/member lookup reuses the same compiler type APIs the
- * checker itself uses, so a member hovers exactly as the checker types it.
- */
-export const resolveMemberAt = (
-  ast: VLProgramNode,
-  spans: NodeSpans,
-  pos: Position,
-): ResolvedMember | undefined => {
-  let best: { node: VLPropertyLikeAccess; nameSpan: Context } | undefined;
-  for (const { node, span } of collectMemberAccesses(ast, spans)) {
-    const nameSpan = memberNameSpan(span, node.property);
-    if (!nameSpan || !posInSpan(pos, nameSpan)) continue;
-    // Innermost wins: a nested `a.b.c` records spans for both `a.b` and
-    // `(a.b).c`; the member-name spans don't overlap, but prefer the narrowest
-    // defensively in case two ever do.
-    if (!best || spanWidth(nameSpan) < spanWidth(best.nameSpan)) {
-      best = { node, nameSpan };
-    }
-  }
-  if (!best) return undefined;
-
-  const { node, nameSpan } = best;
-  const memberType = memberTypeOf(node.object, node.property);
-  if (!memberType) return undefined;
-  return {
-    name: node.property,
-    type: memberType,
-    kind: memberType.type === "Function" ? "method" : "property",
-    span: nameSpan,
-  };
-};
-
-/**
- * Classify every member name in the document into {@link ClassifiedToken}s for
- * semantic highlighting: each `receiver.member` whose member resolves becomes a
- * `property` (object field) or `method` (function-typed member) token at the
- * member name's span. Member names are otherwise un-tokenised leftover `ID`s
- * (the symbol-table pass tracks bindings, not members; the lexical pass skips
- * identifiers), so these never collide with an existing classification.
- *
- * Driven by the same node walk + member typing as {@link resolveMemberAt}, so a
- * member's hover and its token always agree.
- */
-const classifyMemberTokens = (
-  ast: VLProgramNode,
-  spans: NodeSpans,
-): ClassifiedToken[] => {
-  const out: ClassifiedToken[] = [];
-  for (const { node, span } of collectMemberAccesses(ast, spans)) {
-    const nameSpan = memberNameSpan(span, node.property);
-    if (!nameSpan) continue;
-    const memberType = memberTypeOf(node.object, node.property);
-    if (!memberType) continue;
-    const tokenType = memberType.type === "Function" ? TT.method : TT.property;
-    const token = spanToken(nameSpan, tokenType, 0);
-    if (token) out.push(token);
-  }
-  return out;
-};
-
-/**
- * The type of `property` accessed on `object`, reusing the checker's member
- * rules. `object` is typed via the memoized `typeFromExpression` (populated
- * during the parse), then `property` is resolved against that type the same way
- * the checker's `PropertyAccess` case does. Returns `undefined` when the member
- * doesn't resolve.
- */
-const memberTypeOf = (
-  object: VLExpression,
-  property: string,
-): VLType | undefined => {
-  // The ctx is only consulted on a *cache miss*; receivers are always typed
-  // during the parse, so the memoized type is returned and the ctx is unused.
-  // (A trivial sentinel span keeps the call total without a real source ctx.)
-  const sentinel: Context = {
-    start: { line: 1, column: 0 },
-    stop: { line: 1, column: 0 },
-  };
-  let objType = typeFromExpression(object, sentinel);
-  if (objType.type === "Infer") objType = objType.subType;
-  if (objType.type === "Nullable") objType = objType.subType; // `x?.y` receiver
-  // A literal receiver (`"hi".slice(…)`, or a `const s = "hi"` binding that kept
-  // its narrow `StringLiteral` type) dispatches like its base type: a literal
-  // carries no members of its own, but its base (`string`, `i32`, …) does. Soften
-  // it so the intrinsic member resolves instead of yielding `never` — mirroring
-  // the compiler's method-dispatch and property-read paths (PR #119).
-  if (
-    objType.type === "StringLiteral" || objType.type === "IntegerLiteral" ||
-    objType.type === "RealLiteral" || objType.type === "BooleanLiteral"
-  ) {
-    objType = softenImplicitType(objType);
-  }
-  if (objType.type !== "Object") return undefined;
-
-  // `.length` on an array/string is an intrinsic i32 (not a structural field).
-  if (property === "length" && arrayElementType(objType)) {
-    return { type: "Alias", name: "i32" };
-  }
-  // Intrinsic list members (`.get`, `.push`, `.pop`, …) on a `T[]`.
-  if (isListType(objType)) {
-    const member = listMemberType(arrayElementType(objType)!)[property];
-    if (member) return member;
-  }
-  // Intrinsic map/set members — the same branch the checker's `PropertyAccess`
-  // case uses (typecheck.ts): a `Set<T>` (boolean-valued `{[T]:boolean}`) routes
-  // to its OWN surface (`setMemberType` — `.add`/`.has`/`.delete`/`.length`),
-  // while a `Map<K,V>` routes to `mapMemberType` (`.set`/`.get`/`.has`/…). The
-  // discriminator (`setElementType`) is the checker's, so a member resolves here
-  // exactly as it types at the access site.
-  {
-    const kv = mapKeyValueType(objType);
-    if (kv) {
-      const setEl = setElementType(objType);
-      const member = setEl !== null
-        ? setMemberType(setEl)[property]
-        : mapMemberType(kv.key, kv.value)[property];
-      if (member) return member;
-    }
-  }
-  // Structural field — covers user-object fields AND string members (which live
-  // as properties on the nominal `string` object in `defaultScope`).
-  const prop = objType.properties.find((p) =>
-    p.name.type === "StringLiteral" && p.name.value === property
-  );
-  return prop?.type;
 };
