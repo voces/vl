@@ -95,6 +95,38 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-check-dir: --exclude gates a subtree and a basename glob",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_check_dir_" });
+    try {
+      await Deno.writeTextFile(`${dir}/a.vl`, "print(1)\n");
+      await Deno.mkdir(`${dir}/sub`);
+      await Deno.writeTextFile(`${dir}/sub/b.vl`, "let bad: string = 5\n"); // error
+      await Deno.writeTextFile(`${dir}/x.gen.vl`, "let bad: string = 5\n"); // error
+
+      // Exclude the `sub` subtree (relPath match) AND the generated file
+      // (basename glob) — both errors are gated, leaving a clean run over a.vl.
+      const both = await check(dir, ["--exclude", "sub", "--exclude", "*.gen.vl"]);
+      if (both.code !== 0 || !both.err.includes("Checked 1 file, no errors.")) {
+        throw new Error(`expected clean 1-file run, got ${both.code}:\n${both.err}`);
+      }
+
+      // Excluding only the subtree still surfaces the generated file's error.
+      const justSub = await check(dir, ["--exclude=sub"]);
+      if (justSub.code !== 1 || !justSub.err.includes(`${dir}/x.gen.vl: error`)) {
+        throw new Error(`expected x.gen.vl error to remain, got ${justSub.code}:\n${justSub.err}`);
+      }
+      if (justSub.err.includes(`${dir}/sub/b.vl`)) {
+        throw new Error(`sub/ should have been excluded, got:\n${justSub.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "vl-check-dir: no path defaults to the current directory",
   ignore: !ENABLED,
   fn: async () => {

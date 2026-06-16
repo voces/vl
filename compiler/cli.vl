@@ -35,6 +35,7 @@ let cliCodegen: i32 = 0
 let cliColor: i32 = 0
 let cliSeverity: string = "error"
 let cliSeverityGiven: i32 = 0
+let cliExcludes: string[] = []  // --exclude glob patterns (normalized)
 let cliArgErr: string = ""      // a fatal arg-parse message (printed, exit 2)
 
 // ── work + output ──────────────────────────────────────────────────────────────
@@ -46,11 +47,13 @@ let cliOutIdx: i32 = 0
 
 // ── directory walk + multi-file run (A-impl 2) ──────────────────────────────────
 let cliDirMode: i32 = 0          // 1 = the target is a directory (file-count noun, no per-stage note)
-let cliWalkStack: string[] = []  // directories still to list (DFS work-stack)
+let cliWalkStack: string[] = []  // directories still to list (DFS work-stack, full paths)
+let cliWalkRel: string[] = []    // parallel: each pending dir's path RELATIVE to the check root
 let cliFiles: string[] = []      // collected `.vl` paths — the check work-list
 let cliFileIdx: i32 = 0          // cursor into cliFiles for the per-file loop
 let cliCurFile: string = ""      // the file currently being checked (its path)
 let cliCurDir: string = ""       // the directory currently being listed (child-path base)
+let cliCurRel: string = ""       // the directory currently being listed, relative to the root
 let cliLastStage: string = ""    // failing stage of the LAST file compiled (single-file note)
 // Running tally across every file checked.
 let cliErrors: i32 = 0
@@ -361,6 +364,55 @@ function cliHasImports(s: string): i32 {
 // ── the `check` policy ─────────────────────────────────────────────────────────
 // Parse `check`'s args. `--compiler <path>` is the host's concern (it selects the
 // module) — skip it and its value here.
+// ── --exclude glob filtering (A-impl 2b) ───────────────────────────────────────
+// Normalize a pattern (strip a leading `./` and trailing `/`s) and record it.
+function cliAddExclude(pat: string): i32 {
+  let p = pat
+  if p.length >= 2 && p[0] == '.' && p[1] == '/' { p = p.slice(2, p.length) }
+  while p.length > 0 && p[p.length - 1] == '/' { p = p.slice(0, p.length - 1) }
+  cliExcludes.push(p)
+  0
+}
+// Match glob `pat` (from `pi`) against `text` (from `ti`). `*` matches a run of
+// non-`/` characters, `**` crosses separators, every other char is literal. A
+// completed pattern match succeeds when the remaining text is empty OR begins a
+// new `/`-segment — encoding the host's `^<pat>(/.*)?$` anchoring, so `tests`
+// gates `tests` and everything beneath it.
+function cliGlobAt(pat: string, pi: i32, text: string, ti: i32): boolean {
+  if pi >= pat.length {
+    return ti >= text.length || text[ti] == '/'
+  }
+  if pat[pi] == '*' {
+    if pi + 1 < pat.length && pat[pi + 1] == '*' {
+      // `**` — match zero+ of ANY character (crosses `/`).
+      if cliGlobAt(pat, pi + 2, text, ti) { return true }
+      if ti < text.length { return cliGlobAt(pat, pi, text, ti + 1) }
+      return false
+    }
+    // `*` — match zero+ NON-`/` characters.
+    if cliGlobAt(pat, pi + 1, text, ti) { return true }
+    if ti < text.length && text[ti] != '/' { return cliGlobAt(pat, pi, text, ti + 1) }
+    return false
+  }
+  if ti < text.length && text[ti] == pat[pi] {
+    return cliGlobAt(pat, pi + 1, text, ti + 1)
+  }
+  false
+}
+// True if any exclude pattern matches the path RELATIVE TO THE CHECK ROOT or its
+// BASENAME — so `--exclude tests` prunes a whole subtree and `--exclude '*.gen.vl'`
+// matches generated files anywhere.
+function cliExcluded(relPath: string, basename: string): boolean {
+  let i = 0
+  while i < cliExcludes.length {
+    let p = cliExcludes[i]
+    if cliGlobAt(p, 0, relPath, 0) { return true }
+    if cliGlobAt(p, 0, basename, 0) { return true }
+    i = i + 1
+  }
+  false
+}
+
 function cliParseArgs(): i32 {
   let i = 1
   while i < cliArgs.length {
@@ -380,6 +432,11 @@ function cliParseArgs(): i32 {
       cliSeverityGiven = 1
     } else if a.length > 8 && a.slice(0, 8) == "--color=" {
       if a.slice(8, a.length) == "always" { cliColor = 1 } else { cliColor = 0 }
+    } else if a == "--exclude" {
+      if i + 1 < cliArgs.length { cliAddExclude(cliArgs[i + 1]) }
+      i = i + 1
+    } else if a.length > 10 && a.slice(0, 10) == "--exclude=" {
+      cliAddExclude(a.slice(10, a.length))
     } else if a.length > 0 && a[0] != '-' && cliFile.length == 0 {
       cliFile = a
     }
@@ -474,17 +531,25 @@ function cliPopLast(xs: string[]): string[] {
   }
   out
 }
-// Ingest one committed directory listing rooted at `base`: queue non-skipped
-// subdirectories onto the walk stack, collect `.vl` files onto the work-list.
-function cliIngestEntries(base: string): i32 {
+// Ingest one committed directory listing rooted at `base` (full path) / `relBase`
+// (relative to the check root): queue non-skipped, non-excluded subdirectories
+// onto the walk stack, collect non-excluded `.vl` files onto the work-list. The
+// exclude test sees the path relative to the root and the basename, matching the
+// host's `makeExcludeMatcher`.
+function cliIngestEntries(base: string, relBase: string): i32 {
   let i = 0
   while i < cliDirNames.length {
     let name = cliDirNames[i]
     let child = base + "/" + name
+    let rel = name
+    if relBase.length > 0 { rel = relBase + "/" + name }
     if cliDirIsDirs[i] != 0 {
-      if !cliSkipDir(name) { cliWalkStack.push(child) }
+      if !cliSkipDir(name) && !cliExcluded(rel, name) {
+        cliWalkStack.push(child)
+        cliWalkRel.push(rel)
+      }
     } else {
-      if cliEndsVl(name) { cliFiles.push(child) }
+      if cliEndsVl(name) && !cliExcluded(rel, name) { cliFiles.push(child) }
     }
     i = i + 1
   }
@@ -610,7 +675,9 @@ function cliEmitNextOut(): i32 {
 function cliWalkStep(): i32 {
   if cliWalkStack.length > 0 {
     cliCurDir = cliWalkStack[cliWalkStack.length - 1]
+    cliCurRel = cliWalkRel[cliWalkRel.length - 1]
     cliWalkStack = cliPopLast(cliWalkStack)
+    cliWalkRel = cliPopLast(cliWalkRel)
     cliDirNames = []
     cliDirIsDirs = []
     cliCmdPath = cliCurDir
@@ -677,6 +744,7 @@ export function cliNext(): i32 {
     cliWarnings = 0
     cliGating = 0
     cliWalkStack = []
+    cliWalkRel = []
     cliFiles = []
     cliDirNames = []
     cliDirIsDirs = []
@@ -687,7 +755,7 @@ export function cliNext(): i32 {
   if st == 1 {
     if cliDirWasDir != 0 {
       cliDirMode = 1
-      cliIngestEntries(cliFile)
+      cliIngestEntries(cliFile, "")
       return cliWalkStep()
     }
     // A file (or a missing path) — single-file run.
@@ -697,7 +765,7 @@ export function cliNext(): i32 {
     return cliStartFile()
   }
   if st == 2 {
-    cliIngestEntries(cliCurDir)
+    cliIngestEntries(cliCurDir, cliCurRel)
     return cliWalkStep()
   }
   if st == 4 {

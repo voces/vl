@@ -30,9 +30,8 @@ file; the lexer/parser are the grammar.
   `vl build` also takes `-O` (optimize) and `--wat` (text dump) — both shell out to binaryen
   (`wasm-opt`/`wasm-dis`; `brew install binaryen`), soft no-op when absent. `vl check` reports errors
   + lint (warnings/hints), `--severity <level>` (gate + display floor), `--concise`, `--codegen`, and
-  takes a file OR a directory (recursive; `vl check` ≡ `vl check .`).
-  Not yet ported to `vl` (`check --exclude`/`--ignore`, `check --fix`) still run via
-  `deno run -A compiler/cli.ts …`.
+  takes a file OR a directory (recursive; `vl check` ≡ `vl check .`; `--exclude <glob>`).
+  Not yet ported to `vl` (`check --fix`) still runs via `deno run -A compiler/cli.ts …`.
 - **After ANY compiler change, rebuild the LSP bundle:** `cd lsp && deno task build` (the compiler core
   is bundled into the LSP; `lsp/dist` is gitignored). CI also builds it.
 
