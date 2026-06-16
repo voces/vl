@@ -39,6 +39,7 @@ import {
   typeLabelDetail,
 } from "../../lsp/src/typeFeatures.ts";
 import type { WasmChecker } from "../../lsp/src/wasmChecker.ts";
+import type { ModuleReader } from "../../compiler/modules.ts";
 import {
   fixableDiagnosticsForRange,
   type LspTextEdit,
@@ -52,13 +53,26 @@ export { SEMANTIC_TOKEN_LEGEND };
 /** LSP 0-based line / 0-based character — the wire form `server.ts` speaks. */
 export type LspPosition = { line: number; character: number };
 
-// The playground is single-file: every LSP query runs the active buffer as the
-// entry module under a stable key, with a reader that resolves no siblings (the
-// checker's std-key wrapper, baked in by `wasmCheckerBrowser.ts`, still serves
-// `std:` imports from the embedded map). This mirrors the single-file behaviour
-// the playground has always had.
-const ENTRY_KEY = "main.vl";
-const NO_SIBLINGS = () => undefined;
+// Each LSP query runs a buffer as the entry module at its file's KEY, with a
+// reader that resolves SIBLING modules (`./mathx`) from the project — the browser
+// counterpart of the Node LSP's workspace reader. Cross-file analysis (an
+// imported name's type/hover, completion, go-to-definition) needs this: a
+// single-file check of an importer can't see the exported decls, so imported
+// names — and anything whose inferred type depends on them — come back untyped.
+// (`std:` imports still resolve via the embedded-map wrapper baked into the
+// checker by `wasmCheckerBrowser.ts`.)
+//
+// `main.ts` wires the live project files via `setWorkspace`. Before that — and in
+// a single-file unit test — the reader yields nothing and queries run single-file
+// under the default entry key.
+const DEFAULT_ENTRY = "main.vl";
+let workspaceFiles: () => Record<string, string> = () => ({});
+const reader: ModuleReader = (key: string) => workspaceFiles()[key];
+
+/** Wire the project's files (filename → source) for cross-file analysis. */
+export const setWorkspace = (getFiles: () => Record<string, string>): void => {
+  workspaceFiles = getFiles;
+};
 
 // The injected checker (set once by `main.ts` after the seed loads). Undefined
 // until then — and forever if the seed couldn't be fetched/instantiated — in
@@ -91,10 +105,13 @@ export const diagnostics = (text: string): VLDiagnostic[] =>
  * (`memberTokensAt`), assembled by `semanticTokensDataFromWasm`. Empty before the
  * seed loads.
  */
-export const semanticTokens = async (text: string): Promise<number[]> => {
+export const semanticTokens = async (
+  text: string,
+  entryKey: string = DEFAULT_ENTRY,
+): Promise<number[]> => {
   if (checker === undefined) return [];
-  const idents = await checker.tokensAt(text, ENTRY_KEY, NO_SIBLINGS).catch(() => []);
-  const members = await checker.memberTokensAt(text, ENTRY_KEY, NO_SIBLINGS)
+  const idents = await checker.tokensAt(text, entryKey, reader).catch(() => []);
+  const members = await checker.memberTokensAt(text, entryKey, reader)
     .catch(() => []);
   const lexical = checker.lexicalTokensAt(text);
   return semanticTokensDataFromWasm(idents, lexical, members);
@@ -120,14 +137,15 @@ export type HoverResult = {
 export const hover = async (
   text: string,
   pos: LspPosition,
+  entryKey: string = DEFAULT_ENTRY,
 ): Promise<HoverResult | null> => {
   if (checker === undefined) return null;
   const word = wordAt(text, pos);
   if (!word) return null;
   const at = async (
-    fn: (s: string, k: string, r: typeof NO_SIBLINGS, l: number, c: number) => Promise<string | undefined>,
+    fn: (s: string, k: string, r: ModuleReader, l: number, c: number) => Promise<string | undefined>,
   ): Promise<string | undefined> =>
-    await fn(text, ENTRY_KEY, NO_SIBLINGS, pos.line, pos.character).catch(() => undefined);
+    await fn(text, entryKey, reader, pos.line, pos.character).catch(() => undefined);
 
   const t = await at(checker.hoverTypeAt) ??
     await at(checker.memberTypeAt) ??
@@ -181,9 +199,10 @@ export type InlayHint = { line: number; character: number; label: string };
 export const inlayHints = async (
   text: string,
   range: LspRange,
+  entryKey: string = DEFAULT_ENTRY,
 ): Promise<InlayHint[]> => {
   if (checker === undefined) return [];
-  const candidates = await checker.inlayHintsAt(text, ENTRY_KEY, NO_SIBLINGS)
+  const candidates = await checker.inlayHintsAt(text, entryKey, reader)
     .catch(() => []);
   return inlayHintsFromWasm(candidates, range, text).map((h) => ({
     line: h.line,
@@ -202,10 +221,11 @@ export const inlayHints = async (
 export const definition = async (
   text: string,
   pos: LspPosition,
+  entryKey: string = DEFAULT_ENTRY,
 ): Promise<{ start: LspPosition; end: LspPosition } | null> => {
   if (checker === undefined) return null;
   const range = await checker
-    .definitionAt(text, ENTRY_KEY, NO_SIBLINGS, pos.line, pos.character)
+    .definitionAt(text, entryKey, reader, pos.line, pos.character)
     .catch(() => undefined);
   return range ?? null;
 };
@@ -290,6 +310,7 @@ export const completion = async (
   text: string,
   pos: LspPosition,
   triggerChar?: string,
+  entryKey: string = DEFAULT_ENTRY,
 ): Promise<CompletionItem[]> => {
   if (checker === undefined) return [];
 
@@ -304,7 +325,7 @@ export const completion = async (
     const dotCol = pos.character - 1;
     const repaired = removeCharAt(text, pos.line, dotCol);
     const members = await checker
-      .memberCompletionsAt(repaired, ENTRY_KEY, NO_SIBLINGS, pos.line, dotCol - receiver.length)
+      .memberCompletionsAt(repaired, entryKey, reader, pos.line, dotCol - receiver.length)
       .catch(() => []);
     return memberCompletionsFromWasm(members).map(toCompletionItem);
   }
@@ -312,7 +333,7 @@ export const completion = async (
   // Identifier completion: in-scope user bindings + builtins, plus keyword/snippet
   // items. A user binding shadows a same-named builtin (added last).
   const bindings = await checker
-    .scopeAt(text, ENTRY_KEY, NO_SIBLINGS, pos.line, pos.character)
+    .scopeAt(text, entryKey, reader, pos.line, pos.character)
     .catch(() => []);
   const byName = new Map<string, Completion>();
   for (const c of builtinCompletionsFromWasm(checker.builtinCompletions())) {

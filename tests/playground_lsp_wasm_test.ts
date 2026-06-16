@@ -78,6 +78,32 @@ Deno.test({ name: "playground-run: runProgram compiles + runs + captures print o
   assertEquals(result.logs, ["42", "10"], "captured print output");
 });
 
+Deno.test({ name: "playground-lsp: cross-file hover resolves imported names + dependent locals", ignore }, async () => {
+  // The regression: a single-file LSP can't see `./mathx`, so `add`/`square`
+  // (imported) come back untyped and `r` (whose type depends on them) collapses —
+  // only `print` (a static builtin) worked. With the project files wired as the
+  // workspace reader, the importer's graph resolves like it does in VS Code.
+  const main = `import { add, square } from "./mathx"\nlet r = add(square(3), 4)\nprint(r)\n`;
+  const mathx =
+    `export function add(a: i32, b: i32): i32 {\n  return a + b\n}\nexport function square(n: i32): i32 {\n  return n * n\n}\n`;
+  lsp.setWorkspace(() => ({ "main.vl": main, "mathx.vl": mathx }));
+  try {
+    initFromSeed();
+    // `add` use on line 1 (`let r = add(...)`), 'add' at col 8 → its function type.
+    const addHover = await lsp.hover(main, { line: 1, character: 8 }, "main.vl");
+    if (!addHover || !addHover.contents.includes("add: (i32, i32) -> i32")) {
+      throw new Error(`add hover (cross-file): ${JSON.stringify(addHover)}`);
+    }
+    // `r` decl on line 1, col 4 → i32 — inferred only when add/square resolve.
+    const rHover = await lsp.hover(main, { line: 1, character: 4 }, "main.vl");
+    if (!rHover || !rHover.contents.includes("r: i32")) {
+      throw new Error(`r hover (depends on cross-file): ${JSON.stringify(rHover)}`);
+    }
+  } finally {
+    lsp.setWorkspace(() => ({})); // reset so the other tests run single-file
+  }
+});
+
 Deno.test({ name: "playground-lsp: hover resolves a binding type off the seed", ignore }, async () => {
   initFromSeed();
   const result = await lsp.hover("let x = 41\nprint(x + 1)\n", { line: 0, character: 4 });
