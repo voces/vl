@@ -1153,6 +1153,19 @@ export const createWasmChecker = (
     return end > col ? end : col + 1;
   };
 
+  // Lint codes whose span is DEAD (unused / unreachable / always-the-same) and so
+  // carries the `unnecessary` tag — editors grey/fade it. Mirrors the set the TS
+  // lint (`compiler/lint.ts`) tagged; the driver's lint store has no tag field, so
+  // the host reconstructs it from the code. (`prefer-const`/`empty-intersection`/
+  // `for-step-zero` are advisories, not dead code — not tagged.)
+  const UNNECESSARY_CODES = new Set([
+    "unused-import",
+    "unused-variable",
+    "unused-function",
+    "constant-condition",
+    "unreachable-code",
+  ]);
+
   // Lint diagnostics ride the same seed as the Stage-1+ exports; an older seed
   // (or one built before the lint code/pos exports) lacks them, so this yields []
   // and the diagnostics path keeps its TS lint. Like `formatSrc`: single-file,
@@ -1185,6 +1198,12 @@ export const createWasmChecker = (
         severity: asSeverity(sev),
         source: "vital",
         code: code.length > 0 ? code : undefined,
+        // The driver's lint store carries no tags; reconstruct the `unnecessary`
+        // tag from the code so editors GREY/FADE dead spans (unused bindings,
+        // unreachable/constant-condition code) — the same set the TS lint tagged.
+        tags: code.length > 0 && UNNECESSARY_CODES.has(code)
+          ? ["unnecessary"]
+          : undefined,
         range: {
           start: { line: lspLine, character: startChar },
           end: { line: lspLine, character: endChar },

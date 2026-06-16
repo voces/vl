@@ -6,15 +6,12 @@
 // turns source into wasm bytes via the driver's `compileSrc`. Execution is the
 // pure `runWasmBytes` (`runtime.ts` — a `WebAssembly.instantiate` over the VL
 // host-import ABI, no binaryen, no compiler front end). WAT is `watFromBytes`
-// (`wat.ts` — binaryen disassembling those bytes, lazily code-split). Neither
-// touches the TS compiler.
+// (`wat.ts` — binaryen disassembling those bytes, lazily code-split).
 //
-// The one remaining TS-compiler import here is `checkProgram` — the codegen-free
-// front end backing the multi-file `checkProject` import-resolution diagnostics,
-// pending its own move to the seed (then the playground imports nothing from
-// `compiler/`).
+// This module imports NOTHING from the TS compiler (only the `VLDiagnostic` type
+// leaf) — the whole playground now runs on the self-hosted seed.
 
-import { checkProgram, type VLDiagnostic } from "../../compiler/compile.ts";
+import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
 import type { WasmChecker } from "../../lsp/src/wasmChecker.ts";
 import { runWasmBytes } from "./runtime.ts";
 import { watFromBytes } from "./wat.ts";
@@ -74,22 +71,6 @@ export const runProject = async (
     (key) => files[key],
   );
   return finishRun(diagnostics, bytes, opts);
-};
-
-/**
- * Whole-program (codegen-free) front end for a project: resolve + parse +
- * type-check the import graph from `entry`, returning the aggregated diagnostics
- * (parse/type errors PLUS cross-module import-resolution errors). This is the
- * graph-aware analogue of the single-file `lsp.diagnostics` — `main.ts` uses it
- * so a multi-file project surfaces real import errors (bad path, name not
- * exported) instead of single-file "undeclared <imported-name>" noise.
- */
-export const checkProject = async (
-  files: Record<string, string>,
-  entry: string,
-): Promise<VLDiagnostic[]> => {
-  const { diagnostics } = await checkProgram(entry, (key) => files[key]);
-  return diagnostics;
 };
 
 // Shared tail: optionally emit WAT, then instantiate + capture `log` output.

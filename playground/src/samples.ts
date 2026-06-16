@@ -8,7 +8,7 @@
 // samples are a single file; the `project` sample demonstrates VL's real module
 // system (`export` / `import { … } from "./mathx"`, relative paths, no `.vl`
 // extension — see docs/modules-design.md), compiled whole-program to one wasm
-// module via `compileProgram` (compiler/compile.ts).
+// module by the self-hosted seed (`WasmChecker.compile` → the driver `compileSrc`).
 
 export type SampleFile = { name: string; source: string };
 export type Sample = { name: string; files: SampleFile[] };
