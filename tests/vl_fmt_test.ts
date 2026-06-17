@@ -469,6 +469,46 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: a function header wraps its params when the whole line overflows",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      // The header is 84 cols including `export ` and ` {` — over the budget — so
+      // the params wrap one-per-line with `): T {` on its own row. A short header
+      // stays inline. (The width check used to omit `export ` + ` {`.)
+      const f = `${dir}/f.vl`;
+      const src =
+        "export function mkLet(kw: string, name: string, ty: i32, init: i32, pos: i32): i32 {\n" +
+        "  addNode(n)\n" +
+        "}\n" +
+        "function short(a: i32, b: i32): i32 { a + b }\n";
+      await Deno.writeTextFile(f, src);
+      const r = await run([f]);
+      if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+      const wrapped =
+        "export function mkLet(\n" +
+        "  kw: string,\n  name: string,\n  ty: i32,\n  init: i32,\n  pos: i32,\n" +
+        "): i32 {\n";
+      if (!r.out.includes(wrapped)) {
+        throw new Error(`params did not wrap one-per-line:\n${r.out}`);
+      }
+      if (!r.out.includes("function short(a: i32, b: i32): i32 { a + b }\n")) {
+        throw new Error(`short header should stay inline:\n${r.out}`);
+      }
+      const f2 = `${dir}/f2.vl`;
+      await Deno.writeTextFile(f2, r.out);
+      const twice = await run([f2]);
+      if (twice.out !== r.out) {
+        throw new Error(`fmt not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: --check over a directory flags drift on stderr and exits nonzero",
   ignore: !ENABLED,
   fn: async () => {
