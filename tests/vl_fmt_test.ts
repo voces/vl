@@ -284,6 +284,56 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: an overflowing if/while condition wraps in forced parens (idempotent)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      // A condition too wide for one line wraps Prettier-style: `if (` / one
+      // operand per line / `) {`, so the `)` row separates the condition from the
+      // body. fmt ADDS the parens, so the re-parse sees a `Paren` node — the
+      // formatter peels one layer before re-wrapping, keeping it idempotent. A
+      // short condition stays inline.
+      const f = `${dir}/c.vl`;
+      const src =
+        "function f(): void {\n" +
+        "  if aaaaaaaaaa && bbbbbbbbbb && cccccccccc && dddddddddd && eeeeeeeeee && ffffffffff {\n" +
+        "    step()\n" +
+        "  }\n" +
+        "  if short {\n" +
+        "    g()\n" +
+        "  }\n" +
+        "}\n";
+      await Deno.writeTextFile(f, src);
+      const once = await run([f]);
+      if (once.code !== 0) throw new Error(`fmt failed: ${once.err}`);
+      // Paren form: `if (` then operands at +4, then `) {`.
+      if (
+        !once.out.includes("  if (\n") ||
+        !once.out.includes("\n    aaaaaaaaaa &&\n") ||
+        !once.out.includes("\n    ffffffffff\n") ||
+        !once.out.includes("\n  ) {\n")
+      ) {
+        throw new Error(`condition did not wrap in forced parens:\n${once.out}`);
+      }
+      // The short condition stays inline (no parens added).
+      if (!once.out.includes("if short {")) {
+        throw new Error(`short condition should stay inline:\n${once.out}`);
+      }
+      // Idempotent across the added-paren round-trip.
+      const f2 = `${dir}/c2.vl`;
+      await Deno.writeTextFile(f2, once.out);
+      const twice = await run([f2]);
+      if (twice.out !== once.out) {
+        throw new Error(`fmt not idempotent:\n--- once ---\n${once.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: --check over a directory flags drift on stderr and exits nonzero",
   ignore: !ENABLED,
   fn: async () => {
