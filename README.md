@@ -53,17 +53,16 @@ The compiler seed is resolved in order:
 |---|---|
 | `vl run <file.vl>` | Compile and run; program output goes to stdout. Also `vl run -e "<src>"`, `… \| vl run` (stdin), or `vl run <prebuilt.wasm>`. |
 | `vl build <file.vl>` | Compile to WebAssembly (`-o <out.wasm>`; `-O` optimize, `--wat` also dump text). |
-| `vl check <path>` | Type-check + lint (errors + warnings/hints) a file, or every `*.vl` under a directory (recursive; `vl check` ≡ `vl check .`; `--exclude <glob>` prunes paths). Pretty output (carets, TTY color) or `--concise`. `--severity <hint\|info\|warning\|error>` gates the exit code + display floor; `--codegen` also runs the emitter. |
+| `vl check <path>` | Type-check + lint (errors + warnings/hints) a file, or every `*.vl` under a directory (recursive; `vl check` ≡ `vl check .`; `--exclude <glob>` prunes paths). Pretty output (carets, TTY color) or `--concise`. `--severity <hint\|info\|warning\|error>` gates the exit code + display floor; `--codegen` also runs the emitter; `--fix` writes the `prefer-const` lint fix (`let`→`const`) in place. |
 | `vl fmt <path>` | Format (AST-driven, via `format.vl`): stdout, `-w` write in place, `--check` CI gate, dirs recurse. |
 
 `-O` (optimize) and `--wat` (text dump) shell out to **binaryen** (`wasm-opt` / `wasm-dis`) on the
 PATH — `brew install binaryen`, or the [prebuilt releases](https://github.com/WebAssembly/binaryen/releases)
 (or point `$VL_WASM_OPT` / `$VL_WASM_DIS` at them). Absent, each is a soft no-op with a note.
 
-The brains live in VL (the seed); `vl` is a thin host. A `test` subcommand is planned (see
-[`docs/test-runner-design.md`](./docs/test-runner-design.md)). Some richer `cli.ts` conveniences
-aren't ported to `vl` yet (`check --fix`) —
-run those via `deno run -A compiler/cli.ts …` for now.
+The brains live in VL (the seed); `vl` is a thin host (a command-queue pump — all
+CLI policy is VL, see [`docs/cli-design.md`](./docs/cli-design.md)). A `test`
+subcommand is planned (see [`docs/test-runner-design.md`](./docs/test-runner-design.md)).
 
 ## Self-hosting & bootstrap
 
