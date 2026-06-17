@@ -334,6 +334,72 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: a single-statement function body stays inline; a compound one expands",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      const f = `${dir}/f.vl`;
+      const src =
+        "export function rbyteLen(): i32 { W.bytes.length }\n" +
+        "function big(): i32 {\n  const x = 1\n  x\n}\n";
+      await Deno.writeTextFile(f, src);
+      const r = await run([f]);
+      if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+      // The single-expression body is kept on one line (not expanded).
+      if (!r.out.includes("export function rbyteLen(): i32 { W.bytes.length }\n")) {
+        throw new Error(`inline body was expanded:\n${r.out}`);
+      }
+      // The two-statement body stays multi-line.
+      if (!r.out.includes("function big(): i32 {\n  const x = 1\n")) {
+        throw new Error(`compound body should stay multi-line:\n${r.out}`);
+      }
+      const f2 = `${dir}/f2.vl`;
+      await Deno.writeTextFile(f2, r.out);
+      const twice = await run([f2]);
+      if (twice.out !== r.out) {
+        throw new Error(`fmt not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: keeps a single blank line between/around comments (idempotent)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      const f = `${dir}/b.vl`;
+      // A blank separates a section header from the comment after it, and the
+      // last comment from the code; consecutive comments with no blank stay
+      // grouped. These separators used to be dropped.
+      const src =
+        "// section header\n\n// detail comment\nconst a = 1\n\n// group one\n// group two\nconst b = 2\n";
+      await Deno.writeTextFile(f, src);
+      const r = await run([f]);
+      if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+      if (!r.out.includes("// section header\n\n// detail comment\n")) {
+        throw new Error(`blank between comments dropped:\n${r.out}`);
+      }
+      if (!r.out.includes("// group one\n// group two\n")) {
+        throw new Error(`grouped comments wrongly separated:\n${r.out}`);
+      }
+      const f2 = `${dir}/b2.vl`;
+      await Deno.writeTextFile(f2, r.out);
+      const twice = await run([f2]);
+      if (twice.out !== r.out) {
+        throw new Error(`fmt not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: --check over a directory flags drift on stderr and exits nonzero",
   ignore: !ENABLED,
   fn: async () => {
