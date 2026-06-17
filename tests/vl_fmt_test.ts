@@ -107,6 +107,41 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: preserves `export` on type decls + doesn't duplicate field comments (idempotent)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      const f = `${dir}/t.vl`;
+      // An exported type with a trailing comment on its opening line + a field
+      // comment — the two constructs the formatter used to mishandle (drop the
+      // `export`, and re-emit the inline comments as own-line copies each pass).
+      const src =
+        "export type T = {                 // a T\n  a: i32, // first\n  b: i32,\n}\nprint(0)\n";
+      await Deno.writeTextFile(f, src);
+      const once = await run([f]);
+      if (once.code !== 0) throw new Error(`fmt failed: ${once.err}`);
+      if (!once.out.includes("export type T")) {
+        throw new Error(`export dropped from type decl:\n${once.out}`);
+      }
+      const comments = (once.out.match(/\/\//g) ?? []).length;
+      if (comments !== 2) {
+        throw new Error(`expected exactly 2 comments (no duplication), got ${comments}:\n${once.out}`);
+      }
+      // Idempotent: formatting the formatted output is a no-op.
+      const f2 = `${dir}/t2.vl`;
+      await Deno.writeTextFile(f2, once.out);
+      const twice = await run([f2]);
+      if (twice.out !== once.out) {
+        throw new Error(`fmt not idempotent:\n--- once ---\n${once.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: --check over a directory flags drift on stderr and exits nonzero",
   ignore: !ENABLED,
   fn: async () => {
