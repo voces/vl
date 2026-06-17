@@ -449,6 +449,15 @@ function codeWidthBefore(line: string, c: i32): i32 {
   w
 }
 
+// The count of leading spaces on a line (its indentation depth in columns).
+function leadingSpaces(line: string): i32 {
+  let i = 0
+  while i < line.length && line[i] == ' ' {
+    i = i + 1
+  }
+  i
+}
+
 function alignComments(text: string): string {
   const lines = splitLines(text)
   const out: string[] = []
@@ -458,10 +467,17 @@ function alignComments(text: string): string {
       out.push(lines[i])
       i = i + 1
     } else {
-      // Gather the block [i, j) and the widest commented code that still fits.
+      // A RUN is consecutive code lines at the SAME indent (a comment-less line is
+      // tolerated; a blank, an own-line comment, or an indent change ends it — so a
+      // struct's fields don't align against the surrounding declarations). The run
+      // is aligned only when the author signalled intent — some commented line has
+      // ≥2 spaces before its `//`; otherwise each comment normalizes to one space.
+      // The widest fitting commented line sets the column; one too wide to leave
+      // room keeps its single space rather than dragging the column out.
+      const runIndent = leadingSpaces(lines[i])
       let j = i
       let alignCol = 0
-      while j < lines.length && !isBlankLine(lines[j]) && !isOwnLineComment(lines[j]) {
+      while j < lines.length && !isBlankLine(lines[j]) && !isOwnLineComment(lines[j]) && leadingSpaces(lines[j]) == runIndent {
         const c = trailingCommentAt(lines[j])
         if c >= 0 {
           const w = codeWidthBefore(lines[j], c)
@@ -469,14 +485,31 @@ function alignComments(text: string): string {
         }
         j = j + 1
       }
+      // Intent = a line NARROWER than the widest carries padding (>1 space) — the
+      // act of aligning is padding the short lines up to a column, so that is the
+      // real signal. The widest line ends at one space regardless, so its own
+      // spacing doesn't count (else a single stray gap would drag the run).
+      let intent = false
+      let m = i
+      while m < j {
+        const c = trailingCommentAt(lines[m])
+        if c >= 0 {
+          const w = codeWidthBefore(lines[m], c)
+          if w < alignCol && c - w >= 2 { intent = true }
+        }
+        m = m + 1
+      }
       const target = alignCol + 1
       let k = i
       while k < j {
         const c = trailingCommentAt(lines[k])
         if c >= 0 {
           const w = codeWidthBefore(lines[k], c)
-          let col = target
-          if w >= col || w + 2 > fmtWidth { col = w + 1 }
+          let col = w + 1
+          if intent {
+            col = target
+            if w >= col || w + 2 > fmtWidth { col = w + 1 }
+          }
           out.push(lines[k].slice(0, w) + spaces(col - w) + lines[k].slice(c, lines[k].length))
         } else {
           out.push(lines[k])
@@ -555,10 +588,30 @@ function trailingOn(line: i32): string {
   ""
 }
 
-// Suffix form of `trailingOn`: " <comment>" or "".
+// The count of spaces/tabs in the source immediately before offset `off`.
+function gapBefore(off: i32): i32 {
+  let g = 0
+  let i = off - 1
+  while i >= 0 && (fmtSrc[i] == ' ' || fmtSrc[i] == '\t') {
+    g = g + 1
+    i = i - 1
+  }
+  g
+}
+
+// Suffix form of `trailingOn`: " <comment>" or "". The author's spacing before
+// the comment is peeked first: ≥2 spaces signals an intent to align, preserved as
+// two spaces so the alignment post-pass can detect it even on a RECONSTRUCTED line
+// (where the original gap would otherwise be normalized away). A run with no such
+// signal is left at one space.
 function trailerSuffix(line: i32): string {
+  let wide = false
+  if cmtCursor < cmtText.length && cmtTrailing[cmtCursor] == 1 && cmtLine[cmtCursor] == line {
+    if gapBefore(cmtStart[cmtCursor]) >= 2 { wide = true }
+  }
   const t = trailingOn(line)
   if t.length == 0 { return "" }
+  if wide { return "  " + t }
   " " + t
 }
 
@@ -932,9 +985,15 @@ function emitWhile(ix: i32, node: WhileStmt, indent: i32): i32 {
     label = node.whileLabel + ": "
   }
   if isBracedBlock(node.whileBody) {
-    emitCondHead(indent, label + "while ", node.whileCond, " {")
-    emitBlockBody(node.whileBody, indent)
-    closingBrace(indent, stopLineOf(node.whileBody))
+    const cond = expr(node.whileCond, indent, 0)
+    const inline = inlineBlockBody(node.whileBody, indent)
+    if !hasNewline(cond) && inline.length > 0 && indent * 2 + label.length + 6 + cond.length + 1 + inline.length <= fmtWidth {
+      emitLine(indent, label + "while " + cond + " " + inline)
+    } else {
+      emitCondHead(indent, label + "while ", node.whileCond, " {")
+      emitBlockBody(node.whileBody, indent)
+      closingBrace(indent, stopLineOf(node.whileBody))
+    }
   } else {
     const cond = expr(node.whileCond, indent, 0)
     const headerLine = startLineOf(ix)
@@ -999,9 +1058,14 @@ function emitForIn(ix: i32, node: ForIn, indent: i32): i32 {
 
 function emitLoopBody(head: string, body: i32, indent: i32, headerLine: i32): i32 {
   if isBracedBlock(body) {
-    emitLine(indent, head + " {")
-    emitBlockBody(body, indent)
-    closingBrace(indent, stopLineOf(body))
+    const inline = inlineBlockBody(body, indent)
+    if inline.length > 0 && indent * 2 + head.length + 1 + inline.length <= fmtWidth {
+      emitLine(indent, head + " " + inline)
+    } else {
+      emitLine(indent, head + " {")
+      emitBlockBody(body, indent)
+      closingBrace(indent, stopLineOf(body))
+    }
   } else {
     let suffix = ""
     if headerLine > 0 {

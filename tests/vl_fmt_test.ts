@@ -194,39 +194,46 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-fmt: aligns a run of trailing comments to a common column (gaps tolerated, outlier excluded)",
+  name: "vl-fmt: aligns a trailing-comment run only when the author signals intent (≥2 spaces)",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
     try {
-      // A block of trailing comments aligns to (widest commented code)+1. A
-      // comment-LESS line in the middle is tolerated (it neither breaks the run
-      // nor pulls the column). A line wide enough to crowd the 80-col width keeps
-      // its single space instead of dragging the whole column right.
+      // First run: some line has ≥2 spaces before `//` → alignment intent, so the
+      // run aligns to (widest fitting code)+1. A comment-LESS line is tolerated; a
+      // line too wide for the 80-col budget keeps one space and doesn't drag the
+      // column. Second run (blank-separated): all one space → no intent → left as
+      // written, so unequal-width lines do NOT get force-aligned.
       const wide = "const " + "x".repeat(72) + " = 0"; // 82-col code, over the budget
       const f = `${dir}/c.vl`;
       const src =
-        "const aaa = 1 // first\n" +
+        "const aaa = 1  // first\n" +     // 2 spaces → signals intent
         "const noComment = 5\n" +
-        "const c = 3 // third\n" +
+        "const c = 3  // third\n" +
         `${wide} // outlier\n` +
-        "print(0)\n";
+        "print(0)\n" +
+        "\n" +
+        "const dd = 1 // x\n" +           // 1 space, on its own run
+        "const eeeee = 22 // y\n";
       await Deno.writeTextFile(f, src);
       const r = await run([f]);
       if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
-      // Widest commented-and-fitting code is `const aaa = 1` (13) → column 14.
+      // Run 1 aligns to column 14 (widest fitting code `const aaa = 1` = 13).
       if (
         !r.out.includes("const aaa = 1 // first\n") ||      // 13 + 1 space
         !r.out.includes("const c = 3   // third\n")         // 11 + 3 spaces → col 14
       ) {
-        throw new Error(`run not aligned to column 14:\n${r.out}`);
+        throw new Error(`intent run not aligned to column 14:\n${r.out}`);
       }
       if (!r.out.includes("const noComment = 5\n")) {
         throw new Error(`comment-less line altered:\n${r.out}`);
       }
-      // The over-wide line keeps a single space and did not drag the column.
       if (!r.out.includes(`${wide} // outlier\n`)) {
         throw new Error(`outlier line should keep a single space:\n${r.out}`);
+      }
+      // Run 2: one space, differing widths — NOT force-aligned.
+      if (!r.out.includes("const dd = 1 // x\n") || !r.out.includes("const eeeee = 22 // y\n")) {
+        throw new Error(`one-space run should be left as written:\n${r.out}`);
       }
       // Idempotent.
       const f2 = `${dir}/c2.vl`;
@@ -234,6 +241,68 @@ Deno.test({
       const twice = await run([f2]);
       if (twice.out !== r.out) {
         throw new Error(`alignment not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a lone wide comment's spacing does not force-align the narrower lines",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      // Only the WIDEST line carries ≥2 spaces; the narrower line has one. That is
+      // not an alignment signal (you align by padding the SHORTER lines), so the
+      // run is left as written — both end at one space.
+      const f = `${dir}/r.vl`;
+      const src = "const short = 1 // a\nconst longername = 2  // b\n";
+      await Deno.writeTextFile(f, src);
+      const r = await run([f]);
+      if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+      if (!r.out.includes("const short = 1 // a\n") || !r.out.includes("const longername = 2 // b\n")) {
+        throw new Error(`widest line's spacing should not force alignment:\n${r.out}`);
+      }
+      const f2 = `${dir}/r2.vl`;
+      await Deno.writeTextFile(f2, r.out);
+      const twice = await run([f2]);
+      if (twice.out !== r.out) {
+        throw new Error(`fmt not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a single-statement while/for body stays inline",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      const f = `${dir}/l.vl`;
+      const src =
+        "function f(): void {\n" +
+        "  while nx < slots.length && slots[nx] >= 0 { nx = nx + 1 }\n" +
+        "  for i in 0 to n { sum = sum + i }\n" +
+        "}\n";
+      await Deno.writeTextFile(f, src);
+      const r = await run([f]);
+      if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+      if (!r.out.includes("  while nx < slots.length && slots[nx] >= 0 { nx = nx + 1 }\n")) {
+        throw new Error(`while one-liner was expanded:\n${r.out}`);
+      }
+      if (!r.out.includes("  for i in 0 to n { sum = sum + i }\n")) {
+        throw new Error(`for one-liner was expanded:\n${r.out}`);
+      }
+      const f2 = `${dir}/l2.vl`;
+      await Deno.writeTextFile(f2, r.out);
+      const twice = await run([f2]);
+      if (twice.out !== r.out) {
+        throw new Error(`fmt not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${twice.out}`);
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
