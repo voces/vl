@@ -12,15 +12,32 @@
 // checker/lint and the driver's diagnostic accessors DIRECTLY — no second copy
 // of the compiler, no ABI marshalling inside the module.
 //
-// Command codes (mirror docs/cli-design.md). Inlined as integer literals at the
-// `cliNext` return sites; named here for the reader:
-//   CMD_DONE 0 · CMD_LIST_DIR 1 · CMD_READ_FILE 2 · CMD_WRITE_FILE 3
-//   CMD_PRINT_OUT 4 · CMD_PRINT_ERR 5
+// The command codes `cliNext` returns to the host pump (mirror docs/cli-design.md).
+const CMD_DONE = 0
+const CMD_LIST_DIR = 1
+const CMD_READ_FILE = 2
+const CMD_WRITE_FILE = 3
+const CMD_PRINT_OUT = 4
+const CMD_PRINT_ERR = 5
+const CMD_READ_STDIN = 6
+
+// The state-machine states (cliState). `*_RECV` states resume after the host has
+// committed the result of the command the previous `cliNext` returned.
+const ST_INIT = 0          // parse argv, classify the target
+const ST_CLASSIFY = 1      // got the LIST_DIR result for the target (dir vs file)
+const ST_WALK = 2          // got a LIST_DIR result for a pending directory
+const ST_PRINT = 3         // draining cliOut to stderr
+const ST_CHECK_READ = 4    // got a check file's source
+const ST_CHECK_FETCH = 5   // got a pending module's source
+const ST_DONE = 6          // finished
+const ST_FMT_STDIN = 7     // got stdin for `fmt`
+const ST_FMT_READ = 8      // got a fmt file's source
+const ST_FMT_AFTER = 9     // a fmt write/print was serviced; advance
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
 let cliArgAcc: i32[] = []       // the in-flight argument's code points
-let cliState: i32 = 0           // 0 init · 1 await-entry · 2 fetch · 3 print · 4 done
+let cliState: i32 = 0           // see the ST_* constants above
 let cliCmdPath: string = ""     // path payload of the current command
 let cliCmdData: string = ""     // data payload of the current command (a print line)
 let cliResultAcc: i32[] = []    // the host pushes a file's contents here
@@ -59,6 +76,13 @@ let cliLastStage: string = ""    // failing stage of the LAST file compiled (sin
 let cliErrors: i32 = 0
 let cliWarnings: i32 = 0
 let cliGating: i32 = 0
+// fmt mode (A-impl 3): the walk + file collection are shared with `check`; only
+// the per-file action and the finish differ.
+let cliCmd: i32 = 0           // subcommand: 0 = check, 1 = fmt
+let cliFmtWrite: i32 = 0      // -w / --write (rewrite in place)
+let cliFmtCheck: i32 = 0      // --check (CI gate: nonzero exit on any drift)
+let cliFmtDrift: i32 = 0      // count of not-already-formatted files (--check)
+let cliFmtResult: string = "" // the formatted source of the current file
 // One committed directory listing (parallel arrays), refilled per CMD_LIST_DIR.
 let cliDirNames: string[] = []
 let cliDirIsDirs: i32[] = []
@@ -85,7 +109,7 @@ let cliSrcLines: string[] = []
 export function cliArgReset(): i32 {
   cliArgs = []
   cliArgAcc = []
-  cliState = 0
+  cliState = ST_INIT
   cliCmdPath = ""
   cliCmdData = ""
   cliResultAcc = []
@@ -437,6 +461,10 @@ function cliParseArgs(): i32 {
       i = i + 1
     } else if a.length > 10 && a.slice(0, 10) == "--exclude=" {
       cliAddExclude(a.slice(10, a.length))
+    } else if a == "-w" || a == "--write" {
+      cliFmtWrite = 1
+    } else if a == "--check" {
+      cliFmtCheck = 1
     } else if a.length > 0 && a[0] != '-' && cliFile.length == 0 {
       cliFile = a
     }
@@ -658,17 +686,17 @@ function cliFinishSummary(): i32 {
 // Transition into the print phase and return the first output command.
 function cliBeginPrint(): i32 {
   cliOutIdx = 0
-  cliState = 3
+  cliState = ST_PRINT
   cliEmitNextOut()
 }
 function cliEmitNextOut(): i32 {
   if cliOutIdx < cliOut.length {
     cliCmdData = cliOut[cliOutIdx]
     cliOutIdx = cliOutIdx + 1
-    return 5 // CMD_PRINT_ERR
+    return CMD_PRINT_ERR
   }
-  cliState = 6
-  0 // CMD_DONE
+  cliState = ST_DONE
+  CMD_DONE
 }
 // Advance the directory walk: list the next pending dir, or — walk done — sort
 // the work-list and begin the per-file check loop.
@@ -681,16 +709,22 @@ function cliWalkStep(): i32 {
     cliDirNames = []
     cliDirIsDirs = []
     cliCmdPath = cliCurDir
-    cliState = 2
-    return 1 // CMD_LIST_DIR
+    cliState = ST_WALK
+    return CMD_LIST_DIR
   }
   cliSortFiles()
-  if cliFiles.length == 0 {
+  if cliFiles.length == 0 && cliCmd == 0 {
     cliOut = ["check: no .vl files found under " + cliFile]
     cliExit = 0
     return cliBeginPrint()
   }
   cliFileIdx = 0
+  cliStartWork()
+}
+// Dispatch the per-file loop on the subcommand: `check` runs the checker, `fmt`
+// reformats.
+function cliStartWork(): i32 {
+  if cliCmd == 1 { return cliStartFmtFile() }
   cliStartFile()
 }
 // Begin checking cliFiles[cliFileIdx] (read its source), or — work-list done —
@@ -702,8 +736,8 @@ function cliStartFile(): i32 {
   }
   cliCurFile = cliFiles[cliFileIdx]
   cliCmdPath = cliCurFile
-  cliState = 4
-  2 // CMD_READ_FILE — the file's source
+  cliState = ST_CHECK_READ
+  CMD_READ_FILE // — the file's source
 }
 // For the current file: fetch the next pending module, or — graph closed — check
 // it and advance to the next file.
@@ -711,12 +745,52 @@ function cliFetchOrCheckFile(): i32 {
   if modPendingCount() > 0 {
     cliFetchKey = cliPendingKey(0)
     cliCmdPath = cliFetchKey
-    cliState = 5
-    return 2 // CMD_READ_FILE
+    cliState = ST_CHECK_FETCH
+    return CMD_READ_FILE
   }
   cliCheckCurFile()
   cliFileIdx = cliFileIdx + 1
   cliStartFile()
+}
+
+// ── fmt per-file (A-impl 3) ─────────────────────────────────────────────────────
+// Format `src` via the AST formatter (format.vl / formatSrc), single-file and
+// purely syntactic — no module resolution. A lex/parse error (driver returns -1)
+// leaves the source unchanged rather than emit a corrupt partial.
+function cliFormatNow(src: string): string {
+  srcReset()
+  let i = 0
+  while i < src.length {
+    srcPush(src[i])
+    i = i + 1
+  }
+  let len = formatSrc()
+  if len < 0 { return src }
+  vcFmtOut
+}
+// Begin formatting cliFiles[cliFileIdx] (read its source), or — work-list done —
+// finish (the `--check` drift report / exit code).
+function cliStartFmtFile(): i32 {
+  if cliFileIdx >= cliFiles.length {
+    return cliFmtFinish()
+  }
+  cliCurFile = cliFiles[cliFileIdx]
+  cliCmdPath = cliCurFile
+  cliState = ST_FMT_READ
+  CMD_READ_FILE
+}
+// `--check`: nonzero exit + a stderr "not formatted" line per drifted file (those
+// lines were accumulated into cliOut during the loop). `-w`/stdout: output was
+// interleaved per file, nothing left to print.
+function cliFmtFinish(): i32 {
+  if cliFmtCheck != 0 {
+    cliExit = 0
+    if cliFmtDrift > 0 { cliExit = 1 }
+    return cliBeginPrint()
+  }
+  cliExit = 0
+  cliState = ST_DONE
+  CMD_DONE
 }
 
 export function cliNext(): i32 {
@@ -725,34 +799,49 @@ export function cliNext(): i32 {
   // checked against that narrowed singleton. Narrowing the local instead leaves
   // the global free to take the next state.
   let st = cliState
-  if st == 0 {
+  if st == ST_INIT {
     cliParseArgs()
     if cliArgErr != "" {
       cliOut = [cliArgErr]
       cliExit = 2
       return cliBeginPrint()
     }
-    if cliArgs.length == 0 || cliArgs[0] != "check" {
-      cliOut = ["vl: this build's pump only implements `check`"]
+    if cliArgs.length == 0 {
+      cliOut = ["vl: no subcommand"]
       cliExit = 2
       return cliBeginPrint()
     }
-    // No path → check the current directory (`vl check` ≡ `vl check .`).
-    if cliFile.length == 0 { cliFile = "." }
+    let sub = cliArgs[0]
+    if sub == "fmt" {
+      cliCmd = 1
+    } else if sub == "check" {
+      cliCmd = 0
+    } else {
+      cliOut = ["vl: this build's pump implements `check` and `fmt`"]
+      cliExit = 2
+      return cliBeginPrint()
+    }
     cliOut = []
     cliErrors = 0
     cliWarnings = 0
     cliGating = 0
+    cliFmtDrift = 0
     cliWalkStack = []
     cliWalkRel = []
     cliFiles = []
     cliDirNames = []
     cliDirIsDirs = []
+    // `fmt` with no path formats stdin to stdout; `check` with no path → cwd.
+    if cliCmd == 1 && cliFile.length == 0 {
+      cliState = ST_FMT_STDIN
+      return CMD_READ_STDIN
+    }
+    if cliFile.length == 0 { cliFile = "." }
     cliCmdPath = cliFile
-    cliState = 1
-    return 1 // CMD_LIST_DIR — classify the target (dir vs file)
+    cliState = ST_CLASSIFY
+    return CMD_LIST_DIR // — classify the target (dir vs file)
   }
-  if st == 1 {
+  if st == ST_CLASSIFY {
     if cliDirWasDir != 0 {
       cliDirMode = 1
       cliIngestEntries(cliFile, "")
@@ -762,13 +851,13 @@ export function cliNext(): i32 {
     cliDirMode = 0
     cliFiles = [cliFile]
     cliFileIdx = 0
-    return cliStartFile()
+    return cliStartWork()
   }
-  if st == 2 {
+  if st == ST_WALK {
     cliIngestEntries(cliCurDir, cliCurRel)
     return cliWalkStep()
   }
-  if st == 4 {
+  if st == ST_CHECK_READ {
     if cliFileFound == 0 {
       // A single-file target that does not exist → cannot read. A collected file
       // that vanished mid-walk → skip it.
@@ -790,12 +879,64 @@ export function cliNext(): i32 {
     }
     return cliFetchOrCheckFile()
   }
-  if st == 5 {
+  if st == ST_CHECK_FETCH {
     cliModCommitOne(cliFetchKey, cliFileSrc, cliFileFound)
     return cliFetchOrCheckFile()
   }
-  if st == 3 {
+  if st == ST_FMT_STDIN {
+    // stdin formatted to stdout (`… | vl fmt`); `--check` reports drift via exit.
+    cliCurFile = ""
+    cliFmtResult = cliFormatNow(cliFileSrc)
+    if cliFmtCheck != 0 {
+      cliExit = 0
+      if cliFmtResult != cliFileSrc { cliExit = 1 }
+      cliState = ST_DONE
+      return CMD_DONE
+    }
+    cliCmdData = cliFmtResult
+    cliState = ST_DONE
+    return CMD_PRINT_OUT
+  }
+  if st == ST_FMT_READ {
+    if cliFileFound == 0 {
+      if cliDirMode == 0 {
+        cliOut = ["fmt: cannot read " + cliFile]
+        cliExit = 2
+        return cliBeginPrint()
+      }
+      cliFileIdx = cliFileIdx + 1
+      return cliStartFmtFile()
+    }
+    cliFmtResult = cliFormatNow(cliFileSrc)
+    let changed = cliFmtResult != cliFileSrc
+    if cliFmtCheck != 0 {
+      if changed {
+        cliOut.push(cliCurFile + ": not formatted")
+        cliFmtDrift = cliFmtDrift + 1
+      }
+      cliFileIdx = cliFileIdx + 1
+      return cliStartFmtFile()
+    }
+    if cliFmtWrite != 0 {
+      if changed {
+        cliCmdPath = cliCurFile
+        cliCmdData = cliFmtResult
+        cliState = ST_FMT_AFTER
+        return CMD_WRITE_FILE
+      }
+      cliFileIdx = cliFileIdx + 1
+      return cliStartFmtFile()
+    }
+    cliCmdData = cliFmtResult
+    cliState = ST_FMT_AFTER
+    return CMD_PRINT_OUT
+  }
+  if st == ST_FMT_AFTER {
+    cliFileIdx = cliFileIdx + 1
+    return cliStartFmtFile()
+  }
+  if st == ST_PRINT {
     return cliEmitNextOut()
   }
-  0 // CMD_DONE
+  CMD_DONE
 }
