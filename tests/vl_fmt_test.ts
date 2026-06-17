@@ -142,6 +142,58 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: a wrapped object literal indents fields/`}` to its own depth (no over- or under-indent)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      // Each object is wide enough to force the multi-line (wrapped) form. The
+      // statement is one indent deep (a function body) and the value is also
+      // nested one object deep, exercising both directions the indent used to
+      // drift: emitMultiline double-counting the statement indent (fields landed
+      // at col 6, `}` at col 4) and a nested field value never deepening (it
+      // landed back at col 2/0).
+      const f = `${dir}/w.vl`;
+      const src =
+        "function f(): void {\n" +
+        "  const body = { onefield: 1, twofield: 2, threefield: 3, fourfield: 4, fivefield: 5, sixfield: 6 }\n" +
+        "  const wrap = { outerkey: { alphaval: 1, betaval: 2, gammaval: 3, deltaval: 4, epsival: 5, zeta: 6 } }\n" +
+        "}\n";
+      await Deno.writeTextFile(f, src);
+      const once = await run([f]);
+      if (once.code !== 0) throw new Error(`fmt failed: ${once.err}`);
+      // `body`'s fields sit one level past `const body` (col 4), its `}` aligns
+      // with the declaration (col 2). Col 6 / col 4 is the over-indent bug.
+      if (!once.out.includes("\n    onefield: 1,\n") || !once.out.includes("\n  }\n")) {
+        throw new Error(`expected fields at col 4, \`}\` at col 2, got:\n${once.out}`);
+      }
+      if (once.out.includes("\n      onefield: 1,")) {
+        throw new Error(`over-indented fields (col 6):\n${once.out}`);
+      }
+      // The nested `outerkey` value deepens by one level: its key at col 4, its
+      // own fields at col 6, its `}` at col 4 (vs the under-indent bug that put
+      // them back at col 2 / col 0).
+      if (
+        !once.out.includes("\n    outerkey: {\n") ||
+        !once.out.includes("\n      alphaval: 1,\n") ||
+        !once.out.includes("\n    },\n")
+      ) {
+        throw new Error(`nested object did not deepen correctly:\n${once.out}`);
+      }
+      // Idempotent.
+      const f2 = `${dir}/w2.vl`;
+      await Deno.writeTextFile(f2, once.out);
+      const twice = await run([f2]);
+      if (twice.out !== once.out) {
+        throw new Error(`fmt not idempotent:\n--- once ---\n${once.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: --check over a directory flags drift on stderr and exits nonzero",
   ignore: !ENABLED,
   fn: async () => {
