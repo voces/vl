@@ -513,9 +513,20 @@ function rstripNl(s: string): string {
 
 // Emit every own-line comment that starts strictly before source `line`.
 function emitLeadingComments(indent: i32, line: i32): i32 {
+  let prev = 0
   while cmtCursor < cmtText.length && cmtLine[cmtCursor] < line {
+    // Keep a single source blank line between consecutive own-line comments, so a
+    // section header stays separated from the comment that follows it.
+    if prev > 0 && cmtLine[cmtCursor] - prev > 1 {
+      fmtEmitRaw("\n")
+    }
     emitLine(indent, cmtText[cmtCursor])
+    prev = cmtLine[cmtCursor]
     cmtCursor = cmtCursor + 1
+  }
+  // …and a blank between the last comment and the code it precedes.
+  if prev > 0 && line > 0 && line - prev > 1 {
+    fmtEmitRaw("\n")
   }
   0
 }
@@ -690,8 +701,15 @@ function emitStatements(stmts: i32[], indent: i32): i32 {
     if sLine < 1 {
       sLine = prevLine + 1
     }
-    const leading = peekLeadingCount(sLine)
-    if prevLine > 0 && sLine - prevLine > 1 + leading && outBuf.length > 0 {
+    // Preserve a single blank line before this statement's leading comment block
+    // (or the statement itself, if none): measure the gap to the FIRST pending
+    // comment, not the statement, so a blank line WITHIN the comment block is
+    // accounted for there (emitLeadingComments) rather than mistaken for one here.
+    let gapTo = sLine
+    if cmtCursor < cmtText.length && cmtLine[cmtCursor] < sLine {
+      gapTo = cmtLine[cmtCursor]
+    }
+    if prevLine > 0 && gapTo - prevLine > 1 && outBuf.length > 0 {
       fmtEmitRaw("\n")
     }
     emitLeadingComments(indent, sLine)
@@ -1209,8 +1227,13 @@ function emitFunction(ix: i32, node: FuncDecl, indent: i32): i32 {
   if isBracedBlock(body) {
     const bn = P.nodes[body]
     if bn is Block {
-      if bn.blkStmts.length == 0 {
-        emitLine(indent, header + " {}")
+      // A single simple statement (and `{}`) collapses onto the header line when
+      // it fits, mirroring the one-line `if` collapse — so a body written inline
+      // stays inline instead of being expanded. An interior comment, a compound
+      // body, or an overflow keeps the multi-line form.
+      const inline = inlineBlockBody(body, indent)
+      if inline.length > 0 && indent * 2 + header.length + 1 + inline.length <= fmtWidth {
+        emitLine(indent, header + " " + inline)
         return 0
       }
       emitLine(indent, header + " {")
