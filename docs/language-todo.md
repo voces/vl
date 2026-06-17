@@ -55,10 +55,23 @@ const foo = { 1 }   // expected a field name but found `1`
 print(foo)          // want: 1
 ```
 
-Needs `{ … }` disambiguation in the parser (object literal `{ field: v }` vs
-block `{ stmts; lastExpr }`), plus typecheck (the block's type is its tail
+Needs `{ … }` disambiguation in the parser (object literal vs block
+`{ stmts; lastExpr }`), plus typecheck (the block's type is its tail
 expression's) and emit. The tail-as-value rule already exists for function block
 bodies, so the emitter groundwork is partly there.
+
+**Disambiguation rule — prefer a valid object.** When `{ … }` is a valid object
+literal it should parse as one; only the shapes that *can't* be an object
+(`{ 1 }`, `{ stmt }`, `{ a; b }`) are blocks. The sharp edge is the bare-identifier
+case `{ field }`: as an object it's the property shorthand `{ field: field }`, as
+a block it's "the value of `field`." This DIRECTLY reverses #438
+(`fix(parse): a braced bare identifier is a block, not a shorthand object`), which
+made `{ x }` a block so a `{ x }` function/lambda body wasn't misread as `{x: x}`.
+Reconcile the two into one coherent rule before implementing — "prefer object when
+it's a valid object" wants `{ field }` to be the shorthand object (the opposite of
+#438's fix), so block-expressions must re-derive how a bare-identifier body is
+disambiguated (likely by position/context, not by shape alone). Keep it sensible
+and predictable.
 
 ## Optional `else` on an if-expression
 
