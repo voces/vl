@@ -33,6 +33,7 @@ const ST_DONE = 6          // finished
 const ST_FMT_STDIN = 7     // got stdin for `fmt`
 const ST_FMT_READ = 8      // got a fmt file's source
 const ST_FMT_AFTER = 9     // a fmt write/print was serviced; advance
+const ST_FIX_WROTE = 10    // a `check --fix` write was serviced; run the check
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
@@ -83,6 +84,9 @@ let cliFmtWrite: i32 = 0      // -w / --write (rewrite in place)
 let cliFmtCheck: i32 = 0      // --check (CI gate: nonzero exit on any drift)
 let cliFmtDrift: i32 = 0      // count of not-already-formatted files (--check)
 let cliFmtResult: string = "" // the formatted source of the current file
+let cliFix: i32 = 0           // check --fix: apply the safe lint fixes in place
+let cliFixedSrc: string = ""  // the post-fix source of the current file
+let cliFixCount: i32 = 0      // total safe fixes applied across the run
 // One committed directory listing (parallel arrays), refilled per CMD_LIST_DIR.
 let cliDirNames: string[] = []
 let cliDirIsDirs: i32[] = []
@@ -465,6 +469,8 @@ function cliParseArgs(): i32 {
       cliFmtWrite = 1
     } else if a == "--check" {
       cliFmtCheck = 1
+    } else if a == "--fix" {
+      cliFix = 1
     } else if a.length > 0 && a[0] != '-' && cliFile.length == 0 {
       cliFile = a
     }
@@ -659,6 +665,10 @@ function cliCheckCurFile(): i32 {
 // (cliDirMode == 0) keeps the per-stage note (`(type error)`) tooling greps for;
 // a directory run aggregates across files and omits it.
 function cliFinishSummary(): i32 {
+  // --fix: note how many safe fixes were written, ahead of the check report.
+  if cliFix != 0 && cliFixCount > 0 {
+    cliOut.push(cliAnsi(cliColor, "2", "Applied " + i32ToStr(cliFixCount) + " fix(es)."))
+  }
   let summary = ""
   if cliErrors == 0 && cliWarnings == 0 {
     let noun = "files"
@@ -752,6 +762,18 @@ function cliFetchOrCheckFile(): i32 {
   cliFileIdx = cliFileIdx + 1
   cliStartFile()
 }
+// Begin checking the current file's source (cliEntrySrc): set up module mode if it
+// imports, then run the fetch-or-check loop. Shared by the plain and `--fix` paths.
+function cliBeginCheck(): i32 {
+  modReset()
+  if cliHasImports(cliEntrySrc) != 0 {
+    cliModMode = 1
+    cliModCommitOne(cliCurFile, cliEntrySrc, 1)
+  } else {
+    cliModMode = 0
+  }
+  cliFetchOrCheckFile()
+}
 
 // ── fmt per-file (A-impl 3) ─────────────────────────────────────────────────────
 // Format `src` via the AST formatter (format.vl / formatSrc), single-file and
@@ -768,6 +790,88 @@ function cliFormatNow(src: string): string {
   if len < 0 { return src }
   vcFmtOut
 }
+
+// ── check --fix (A-impl 4) ──────────────────────────────────────────────────────
+// Apply the auto-fixes to `src` and return the rewritten source, counting fixes
+// into cliFixCount. Exactly ONE fix, the only one that is *always* the right
+// answer with no human judgment:
+//   prefer-const → the `let` keyword (the lint anchors on it) becomes `const`.
+// `--fix` deliberately does NOT touch unused-variable/parameter: the `_`-prefix
+// SILENCES a warning, and whether silencing is correct depends on intent (a
+// genuinely-unused param wants `_`; a forgotten-after-refactor one wants to be
+// removed) — so it stays a deliberate human choice. The lint still reports them.
+// Edits are computed as absolute (offset, len, text) and spliced back-to-front so
+// earlier offsets stay valid; lint is parse-only, so this needs no type info.
+function cliApplyFixes(src: string): string {
+  srcReset()
+  let i = 0
+  while i < src.length {
+    srcPush(src[i])
+    i = i + 1
+  }
+  let n = lintSrc()
+  if n <= 0 { return src }
+  // The absolute offset where each 0-based line begins.
+  let starts: i32[] = [0]
+  let s = 0
+  while s < src.length {
+    if src[s] == '\n' { starts.push(s + 1) }
+    s = s + 1
+  }
+  let pos: i32[] = []
+  let len: i32[] = []
+  let txt: string[] = []
+  let k = 0
+  while k < n {
+    let code = lintCodeAt(k)
+    let ln = lintLineAt(k) - 1
+    let col = lintColAt(k)
+    if ln >= 0 && ln < starts.length {
+      let off = starts[ln] + col
+      if code == "prefer-const" {
+        if off + 3 <= src.length && src[off] == 'l' && src[off + 1] == 'e' && src[off + 2] == 't' {
+          pos.push(off)
+          len.push(3)
+          txt.push("const")
+        }
+      }
+    }
+    k = k + 1
+  }
+  if pos.length == 0 { return src }
+  // Order the edits by start offset DESCENDING (insertion sort over indices), so
+  // splicing one never shifts the offset of an edit yet to be applied.
+  let order: i32[] = []
+  let oi = 0
+  while oi < pos.length {
+    order.push(oi)
+    oi = oi + 1
+  }
+  let a = 1
+  while a < order.length {
+    let key = order[a]
+    let b = a - 1
+    while b >= 0 && pos[order[b]] < pos[key] {
+      order[b + 1] = order[b]
+      b = b - 1
+    }
+    order[b + 1] = key
+    a = a + 1
+  }
+  let out = src
+  let e = 0
+  while e < order.length {
+    let idx = order[e]
+    let p = pos[idx]
+    let pre = out.slice(0, p)
+    let post = out.slice(p + len[idx], out.length)
+    out = pre + txt[idx] + post
+    cliFixCount = cliFixCount + 1
+    e = e + 1
+  }
+  out
+}
+
 // Begin formatting cliFiles[cliFileIdx] (read its source), or — work-list done —
 // finish (the `--check` drift report / exit code).
 function cliStartFmtFile(): i32 {
@@ -826,6 +930,7 @@ export function cliNext(): i32 {
     cliWarnings = 0
     cliGating = 0
     cliFmtDrift = 0
+    cliFixCount = 0
     cliWalkStack = []
     cliWalkRel = []
     cliFiles = []
@@ -869,15 +974,25 @@ export function cliNext(): i32 {
       cliFileIdx = cliFileIdx + 1
       return cliStartFile()
     }
-    cliEntrySrc = cliFileSrc
-    modReset()
-    if cliHasImports(cliEntrySrc) != 0 {
-      cliModMode = 1
-      cliModCommitOne(cliCurFile, cliEntrySrc, 1)
-    } else {
-      cliModMode = 0
+    // --fix: rewrite the safe lint fixes back to disk BEFORE checking, so the
+    // report below reflects the post-fix state. The fixed source is then what
+    // gets checked. A clean file (no fixes) falls straight through.
+    if cliFix != 0 {
+      cliFixedSrc = cliApplyFixes(cliFileSrc)
+      if cliFixedSrc != cliFileSrc {
+        cliEntrySrc = cliFixedSrc
+        cliCmdPath = cliCurFile
+        cliCmdData = cliFixedSrc
+        cliState = ST_FIX_WROTE
+        return CMD_WRITE_FILE
+      }
     }
-    return cliFetchOrCheckFile()
+    cliEntrySrc = cliFileSrc
+    return cliBeginCheck()
+  }
+  if st == ST_FIX_WROTE {
+    // The fixed file was written; check the fixed source (already in cliEntrySrc).
+    return cliBeginCheck()
   }
   if st == ST_CHECK_FETCH {
     cliModCommitOne(cliFetchKey, cliFileSrc, cliFileFound)

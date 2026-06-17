@@ -29,9 +29,10 @@ file; the lexer/parser are the grammar.
   a prebuilt `.wasm`) · `vl build <file> [-o out.wasm]` · `vl check <path>` · `vl fmt <file> [-w|--check]`.
   `vl build` also takes `-O` (optimize) and `--wat` (text dump) — both shell out to binaryen
   (`wasm-opt`/`wasm-dis`; `brew install binaryen`), soft no-op when absent. `vl check` reports errors
-  + lint (warnings/hints), `--severity <level>` (gate + display floor), `--concise`, `--codegen`, and
-  takes a file OR a directory (recursive; `vl check` ≡ `vl check .`; `--exclude <glob>`).
-  Not yet ported to `vl` (`check --fix`) still runs via `deno run -A compiler/cli.ts …`.
+  + lint (warnings/hints), `--severity <level>` (gate + display floor), `--concise`, `--codegen`,
+  `--fix` (the `prefer-const` lint fix), and takes a file OR a
+  directory (recursive; `vl check` ≡ `vl check .`; `--exclude <glob>`). `vl` is a command-queue
+  pump — all CLI policy is VL (`compiler/cli.vl`); see [`docs/cli-design.md`](docs/cli-design.md).
 - **After ANY compiler change, rebuild the LSP bundle:** `cd lsp && deno task build` (the compiler core
   is bundled into the LSP; `lsp/dist` is gitignored). CI also builds it.
 
