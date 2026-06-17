@@ -194,6 +194,54 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: aligns a run of trailing comments to a common column (gaps tolerated, outlier excluded)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      // A block of trailing comments aligns to (widest commented code)+1. A
+      // comment-LESS line in the middle is tolerated (it neither breaks the run
+      // nor pulls the column). A line wide enough to crowd the 80-col width keeps
+      // its single space instead of dragging the whole column right.
+      const wide = "const " + "x".repeat(72) + " = 0"; // 82-col code, over the budget
+      const f = `${dir}/c.vl`;
+      const src =
+        "const aaa = 1 // first\n" +
+        "const noComment = 5\n" +
+        "const c = 3 // third\n" +
+        `${wide} // outlier\n` +
+        "print(0)\n";
+      await Deno.writeTextFile(f, src);
+      const r = await run([f]);
+      if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+      // Widest commented-and-fitting code is `const aaa = 1` (13) → column 14.
+      if (
+        !r.out.includes("const aaa = 1 // first\n") ||      // 13 + 1 space
+        !r.out.includes("const c = 3   // third\n")         // 11 + 3 spaces → col 14
+      ) {
+        throw new Error(`run not aligned to column 14:\n${r.out}`);
+      }
+      if (!r.out.includes("const noComment = 5\n")) {
+        throw new Error(`comment-less line altered:\n${r.out}`);
+      }
+      // The over-wide line keeps a single space and did not drag the column.
+      if (!r.out.includes(`${wide} // outlier\n`)) {
+        throw new Error(`outlier line should keep a single space:\n${r.out}`);
+      }
+      // Idempotent.
+      const f2 = `${dir}/c2.vl`;
+      await Deno.writeTextFile(f2, r.out);
+      const twice = await run([f2]);
+      if (twice.out !== r.out) {
+        throw new Error(`alignment not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: --check over a directory flags drift on stderr and exits nonzero",
   ignore: !ENABLED,
   fn: async () => {
