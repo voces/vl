@@ -913,12 +913,12 @@ function emitWhile(ix: i32, node: WhileStmt, indent: i32): i32 {
   if node.whileLabel.length > 0 {
     label = node.whileLabel + ": "
   }
-  const cond = expr(node.whileCond, indent, 0)
   if isBracedBlock(node.whileBody) {
-    emitLine(indent, label + "while " + cond + " {")
+    emitCondHead(indent, label + "while ", node.whileCond, " {")
     emitBlockBody(node.whileBody, indent)
     closingBrace(indent, stopLineOf(node.whileBody))
   } else {
+    const cond = expr(node.whileCond, indent, 0)
     const headerLine = startLineOf(ix)
     let suffix = trailerSuffix(headerLine)
     emitLine(indent, label + "while " + cond + suffix)
@@ -1023,8 +1023,7 @@ function emitIf(ix: i32, node: IfStmt, indent: i32): i32 {
       emitLine(indent, oneLine)
       return 0
     }
-    const cond = expr(node.ifCond, indent, 0)
-    emitLine(indent, "if " + cond + " {")
+    emitCondHead(indent, "if ", node.ifCond, " {")
     emitBlockBody(node.ifThen, indent)
     if elsePresent {
       emitLine(indent, "} else {")
@@ -1034,12 +1033,12 @@ function emitIf(ix: i32, node: IfStmt, indent: i32): i32 {
     return 0
   }
   // Inline (`then` / `else <stmt>`) form: a non-block branch prints inline.
-  const cond2 = expr(node.ifCond, indent, 0)
   if thenIsBlock {
-    emitLine(indent, "if " + cond2 + " {")
+    emitCondHead(indent, "if ", node.ifCond, " {")
     emitBlockBody(node.ifThen, indent)
     closingBrace(indent, stopLineOf(node.ifThen))
   } else {
+    const cond2 = expr(node.ifCond, indent, 0)
     let body = bareBodyInline(node.ifThen, indent)
     emitLine(indent, "if " + cond2 + " then " + body)
   }
@@ -1188,12 +1187,9 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32): boolean {
   // always `else if` (the fused `elseif` keyword was removed — one canonical form).
   let m = 0
   while m < condIxs.length {
-    const cond = expr(condIxs[m], indent, 0)
-    if m == 0 {
-      emitLine(indent, "if " + cond + " {")
-    } else {
-      emitLine(indent, "} else if " + cond + " {")
-    }
+    let prefix = "if "
+    if m > 0 { prefix = "} else if " }
+    emitCondHead(indent, prefix, condIxs[m], " {")
     emitBlockBody(bodyIxs[m], indent)
     m = m + 1
   }
@@ -1464,6 +1460,78 @@ function renderBinary(ix: i32, node: BinExpr, indent: i32, column: i32): string 
     return renderAssign(ix, node, indent, column)
   }
   binaryChain(ix, node, indent, column)
+}
+
+// ── conditional heads (`if` / `else if` / `while`) ────────────────────────────
+// A condition that fits prints inline (`if cond {`); one that would overflow the
+// line wraps in PARENTHESES, with one operand per line, so the `)` row cleanly
+// separates the condition from the body (the body and a hanging continuation
+// would otherwise share an indent):
+//   if (
+//     cond1 &&
+//     cond2
+//   ) {
+// fmt ADDS the parens, so on a re-format the condition is a `Paren` node; we peel
+// one layer before re-wrapping to keep the output idempotent.
+function unwrapOuterParen(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return ix }
+  let n = P.nodes[ix]
+  if n is Paren { return n.parInner }
+  ix
+}
+
+// Emit possibly-multiline `text` with only its FIRST line indented (continuation
+// lines already carry their absolute indentation — the `emitMultiline` contract).
+function emitFirstIndented(indent: i32, text: string): i32 {
+  const lines = splitLines(text)
+  let i = 0
+  while i < lines.length {
+    let pre = ""
+    if i == 0 { pre = indentStr(indent) }
+    outBuf.push(pre + lines[i] + "\n")
+    i = i + 1
+  }
+  0
+}
+
+// Emit each top-level `&&`/`||` operand of a wrapped condition on its own line at
+// `indent`, the operator trailing every line but the last (mirroring the inline
+// chain). A non-chain condition is emitted as a single (possibly wrapped) operand.
+function emitCondOperands(ix: i32, indent: i32): i32 {
+  let n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp != "=" {
+      const prec = binPrecOf(n.binOp)
+      const ops: string[] = []
+      const txt: string[] = []
+      flattenChain(ix, "", prec, indent, indent * 2, ops, txt)
+      let i = 0
+      while i < txt.length {
+        let tail = ""
+        if i + 1 < txt.length { tail = " " + ops[i + 1] }
+        emitFirstIndented(indent, txt[i] + tail)
+        i = i + 1
+      }
+      return 0
+    }
+  }
+  emitFirstIndented(indent, expr(ix, indent, indent * 2))
+  0
+}
+
+// Emit `<prefix><cond><suffix>` as a head line, switching to the forced-paren
+// multi-line form when the inline head would overflow the width.
+function emitCondHead(indent: i32, prefix: string, condIx: i32, suffix: string): i32 {
+  const inline = expr(condIx, indent, 0)
+  const head = prefix + inline + suffix
+  if !hasNewline(inline) && indent * 2 + head.length <= fmtWidth {
+    emitLine(indent, head)
+    return 0
+  }
+  emitLine(indent, prefix + "(")
+  emitCondOperands(unwrapOuterParen(condIx), indent + 1)
+  emitLine(indent, ")" + suffix)
+  0
 }
 
 // An assignment `=` node. A desugared compound `a += b` or prefix `++x`/`--x`
