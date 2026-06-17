@@ -509,6 +509,55 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: an else-if chain of single-statement clauses renders one clause per line",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      // Every clause body is one simple statement → switch-like per-clause layout
+      // (`else` on its own line, which the parser accepts). A clause with a
+      // compound body falls back to the stable block layout.
+      const f = `${dir}/c.vl`;
+      const src =
+        "function f(rc: i32): i32 {\n" +
+        "  let s = 0\n" +
+        "  if rc == 1 { s = 1 } else if rc == 2 { s = 2 } else { s = 3 }\n" +
+        "  s\n" +
+        "}\n";
+      await Deno.writeTextFile(f, src);
+      const r = await run([f]);
+      if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+      if (!r.out.includes("  if rc == 1 { s = 1 }\n  else if rc == 2 { s = 2 }\n  else { s = 3 }\n")) {
+        throw new Error(`chain did not render per-clause:\n${r.out}`);
+      }
+      // A compound clause stays in block form.
+      const g = `${dir}/g.vl`;
+      const gsrc =
+        "function g(rc: i32): i32 {\n" +
+        "  let s = 0\n" +
+        "  if rc == 1 { s = 1 } else if rc == 2 { s = 2\n    s = s + 1 }\n" +
+        "  s\n" +
+        "}\n";
+      await Deno.writeTextFile(g, gsrc);
+      const rg = await run([g]);
+      if (rg.code !== 0) throw new Error(`fmt failed: ${rg.err}`);
+      if (!rg.out.includes("  if rc == 1 {\n    s = 1\n  } else if rc == 2 {\n")) {
+        throw new Error(`compound clause should use block form:\n${rg.out}`);
+      }
+      // Idempotent.
+      const f2 = `${dir}/c2.vl`;
+      await Deno.writeTextFile(f2, r.out);
+      const twice = await run([f2]);
+      if (twice.out !== r.out) {
+        throw new Error(`fmt not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: --check over a directory flags drift on stderr and exits nonzero",
   ignore: !ENABLED,
   fn: async () => {
