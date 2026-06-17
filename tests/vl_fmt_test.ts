@@ -242,6 +242,48 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: a comment inside a block stays in that block (no leak into the next branch)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      // The then-branch holds ONLY a comment; the else-if branch has a statement.
+      // The comment used to leak out of the empty branch and reappear inside the
+      // following `else if` branch (it bound to the next emitted statement).
+      const f = `${dir}/c.vl`;
+      const src =
+        "function classify(seg: string): i32 {\n" +
+        "  if seg == \"\" {\n" +
+        "    // skip\n" +
+        "  } else if seg == \"..\" {\n" +
+        "    pop()\n" +
+        "  }\n" +
+        "  0\n" +
+        "}\n";
+      await Deno.writeTextFile(f, src);
+      const r = await run([f]);
+      if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+      // The comment sits in the then-branch (right after its `{`), NOT above pop().
+      if (!r.out.includes("if seg == \"\" {\n    // skip\n  } else if")) {
+        throw new Error(`comment not kept in the then-branch:\n${r.out}`);
+      }
+      if (r.out.includes("// skip\n    pop()")) {
+        throw new Error(`comment leaked into the else-if branch:\n${r.out}`);
+      }
+      // Idempotent.
+      const f2 = `${dir}/c2.vl`;
+      await Deno.writeTextFile(f2, r.out);
+      const twice = await run([f2]);
+      if (twice.out !== r.out) {
+        throw new Error(`fmt not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: --check over a directory flags drift on stderr and exits nonzero",
   ignore: !ENABLED,
   fn: async () => {
