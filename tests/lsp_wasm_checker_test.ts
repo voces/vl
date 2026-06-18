@@ -374,26 +374,28 @@ Deno.test({ name: "wasm-checker: formatSrc reflows messy source to a canonical, 
   const got = checker.formatSrc(messy);
   if (got === undefined) throw new Error("formatSrc returned undefined on valid source");
   if (!got.includes("let x = 1")) throw new Error(`not reflowed: ${JSON.stringify(got)}`);
-  if (!got.includes("  return a + b")) throw new Error(`not reflowed: ${JSON.stringify(got)}`);
+  // The short single-statement body collapses to the inline form.
+  if (!got.includes("function f(a: i32, b: i32): i32 { return a + b }")) {
+    throw new Error(`not reflowed: ${JSON.stringify(got)}`);
+  }
   // Idempotent: formatting the output again is a no-op.
   if (checker.formatSrc(got) !== got) throw new Error("formatSrc not idempotent");
 });
 
 Deno.test({ name: "wasm-checker: formatSrc is stable on already-canonical source (incl. params)", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
-  // Already-canonical source must round-trip unchanged (params included). This is
-  // the canonical form `format.vl` produces — a literal here, no TS formatter:
-  // the kill-TS work retired the TS `format()`, and full-corpus equivalence was
-  // its own (now-deleted) parity suite.
+  // Already-canonical source must round-trip unchanged (params + a 2-space block
+  // body included). A literal here — the canonical form `format.vl` produces; a
+  // multi-statement body stays block (a single-statement one would inline-collapse).
   const canonical =
-    "function f(a: i32, b: i32): i32 {\n  return a + b\n}\nprint(f(1, 2))\n";
+    "function f(a: i32, b: i32): i32 {\n  const s = a + b\n  return s\n}\nprint(f(1, 2))\n";
   const got = checker.formatSrc(canonical);
   if (got !== canonical) {
     throw new Error(`expected stable, got ${JSON.stringify(got)} for ${JSON.stringify(canonical)}`);
   }
 });
 
-Deno.test({ name: "wasm-checker: formatSrc returns undefined on a parse error (TS fallback)", ignore }, () => {
+Deno.test({ name: "wasm-checker: formatSrc returns undefined on a parse error (no edits)", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
   // An unterminated function body — the driver's formatSrc signals -1.
   const got = checker.formatSrc("function f( {\n");
