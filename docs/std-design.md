@@ -56,7 +56,7 @@ the CLI disagree.
 
 **The seed/fixpoint flow std must not break.** The seed is assembled by
 concatenating `compiler/*.vl` + the driver with import lines range-blanked
-(refresh-compiler.sh, native-fixpoint.sh, build-compiler-wasm.ts);
+(refresh-compiler.sh, native-fixpoint.sh);
 `refresh-compiler.sh` gives a ~3s edit→seed loop.
 
 **Generic exports are a known hole in BOTH module pipelines.** The native

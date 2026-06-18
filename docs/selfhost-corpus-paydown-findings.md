@@ -143,7 +143,7 @@ Reproduce any of the above with the native tool:
 
 ```
 cd scripts/vl-host && cargo build --release
-deno run -A scripts/build-compiler-wasm.ts
+scripts/fetch-seed.sh
 echo 'print(0xDEAD_BEEF)' > /tmp/t.vl
 scripts/vl-host/target/release/vl run /tmp/t.vl --compiler build/vl-compiler.wasm
 ```

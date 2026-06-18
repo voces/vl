@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# GENESIS bootstrap — obtain a first `build/vl-compiler.wasm` seed WITHOUT the TS
-# stage-0 emitter, by downloading the rolling `seed-latest` release asset (a seed
-# published by the previous master push; see docs/genesis-design.md). The fetched
-# seed need only be new enough to compile current compiler/*.vl — refresh-compiler.sh
-# self-compiles current source with it and native-fixpoint.sh re-proves it — so a
-# one-push-stale `seed-latest` is fine.
+# Obtain a `build/vl-compiler.wasm` seed by downloading the rolling `seed-latest`
+# release asset (a seed published by the previous master push; see
+# docs/genesis-design.md). The fetched seed need only be new enough to compile
+# current compiler/*.vl — refresh-compiler.sh self-compiles current source with it
+# and native-fixpoint.sh re-proves it — so a one-push-stale `seed-latest` is fine.
 #
-# This is the path that replaces the TS genesis: the deno/binaryen `toWasm.ts`
-# bootstrap (scripts/build-compiler-wasm.ts) is retained ONLY as the explicit
-# --ts-genesis break-glass for offline/air-gapped first bootstraps and the
-# one-time seed-v0 mint. It is never on an automatic path.
+# The published release IS the seed's source of truth: there is no TypeScript
+# genesis path. `seed-v0` (the immutable tagged release) anchors the auditable
+# lineage; every later seed self-compiles from the one before, gated by the
+# fixpoint. (The TS stage-0 bootstrap was retired — the project does not maintain
+# a second compiler.)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -17,13 +17,6 @@ REPO="${VL_SEED_REPO:-voces/vl}"
 TAG="${VL_SEED_TAG:-seed-latest}"
 ASSET="vl-compiler.wasm"
 OUT="${SEED:-build/vl-compiler.wasm}"
-
-if [ "${1:-}" = "--ts-genesis" ] || [ "${VL_SEED_TS_GENESIS:-}" = "1" ]; then
-  echo "== seed genesis via the TS stage-0 bootstrap (break-glass; needs deno) =="
-  deno run -A scripts/build-compiler-wasm.ts
-  echo "minted $OUT via TS genesis"
-  exit 0
-fi
 
 # Idempotent: a present, non-empty seed is left untouched (refresh-compiler.sh
 # overwrites it with a current-source rebuild regardless).
@@ -52,8 +45,8 @@ fetch() {
 echo "== fetch $ASSET from $REPO release '$TAG' =="
 if ! fetch "$ASSET"; then
   echo "ERROR: no seed in $OUT and could not fetch '$TAG/$ASSET' from $REPO." >&2
-  echo "  Online:  ensure network access to github.com (or 'gh auth login')." >&2
-  echo "  Offline: scripts/fetch-seed.sh --ts-genesis  (one-time air-gapped mint; needs deno + npm)." >&2
+  echo "  Ensure network access to github.com (or 'gh auth login'); the seed is" >&2
+  echo "  republished on every master push, so '$TAG' tracks current master." >&2
   exit 1
 fi
 

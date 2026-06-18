@@ -57,7 +57,7 @@ if (GATED && !ENABLED) {
   console.warn(
     `[native-align] skipped — ${!haveBin ? "missing vl binary" : "missing seed wasm"}. Build:\n` +
       "  (cd scripts/vl-host && cargo build --release)\n" +
-      "  deno run -A scripts/build-compiler-wasm.ts",
+      "  scripts/fetch-seed.sh",
   );
 }
 

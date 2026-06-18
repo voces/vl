@@ -65,7 +65,7 @@ Two structural differences make a verbatim port impossible in the self-host:
    token's INDEX in the stream (the unit the cursor and parser diagnostics use).
    Because VL has no module system, the build concatenates the modules and the
    lexer's `Tok`/`Diag`/`advance` are RENAMED to `LexTok`/`LexDiag`/`lexAdvance`
-   (`scripts/build-compiler-wasm.ts`, every `selfhost_*` test) to avoid colliding
+   (`refresh-compiler.sh`, `native-fixpoint.sh`) to avoid colliding
    with `ast.vl`'s names. So a **bridge** converts the `LexTok` stream into the
    parser's `Tok` stream — and that bridge is where positions were being dropped.
 
@@ -228,7 +228,7 @@ diagnostics wiring). Every gate GREEN:
   tests/selfhost_self_typecheck_test.ts`: 3 passed / 0 failed (stage2==stage3
   byte-identical; self-typecheck zero diagnostics).
 - **Native fixpoint** — built `scripts/vl-host` (`cargo build --release`, ok) + seed
-  (`deno run -A scripts/build-compiler-wasm.ts` → `build/vl-compiler.wasm`,
+  (`scripts/fetch-seed.sh` → `build/vl-compiler.wasm`,
   153809 bytes), then `./scripts/native-fixpoint.sh`:
   `NATIVE FIXPOINT HOLDS: stage3 == stage4 byte-for-byte (224664 bytes)`.
 - **Native corpus alignment** — `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check

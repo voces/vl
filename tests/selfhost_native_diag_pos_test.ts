@@ -40,7 +40,7 @@ if (GATED && !ENABLED) {
   console.warn(
     "[native-diag-pos] skipped — missing vl binary or seed wasm. Build:\n" +
       "  (cd scripts/vl-host && cargo build --release)\n" +
-      "  deno run -A scripts/build-compiler-wasm.ts",
+      "  scripts/fetch-seed.sh",
   );
 }
 

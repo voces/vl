@@ -39,7 +39,7 @@ if (GATED && !ENABLED) {
   console.warn(
     `[native-opt] skipped — ${why}. Build:\n` +
       "  (cd scripts/vl-host && cargo build --release)\n" +
-      "  deno run -A scripts/build-compiler-wasm.ts\n  npm ci",
+      "  scripts/fetch-seed.sh\n  npm ci",
   );
 }
 

@@ -45,11 +45,6 @@ Organized by area. Triage freely.
   de-collide when concatenating modules (no module system in the test driver path).
   The same rename lives in `refresh-compiler.sh`, `native-fixpoint.sh`, and several
   tests. One shared helper would remove the copy-paste and the risk of them drifting.
-- **`--ts-genesis` break-glass + TS-built seed path.** `scripts/build-compiler-wasm.ts`
-  and the `fetch-seed.sh --ts-genesis` path keep a TS route to mint a seed. Needed
-  until the self-host seed lineage is fully independent; retire as the last kill-TS
-  step.
-
 ## Known bugs carried as debt
 
 - **Builtin-type hover renders `i32: i32`.** Hovering a builtin TYPE name (`i32`,

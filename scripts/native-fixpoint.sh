@@ -7,7 +7,7 @@
 #   assert stage3 == stage4 byte-for-byte, and stage3 runs a program correctly
 #
 # Prereqs (each step prints how to produce it if missing):
-#   build/vl-compiler.wasm        — the seed (deno run -A scripts/build-compiler-wasm.ts)
+#   build/vl-compiler.wasm        — the seed (scripts/fetch-seed.sh, or scripts/refresh-compiler.sh)
 #   scripts/vl-host target        — the vl binary (cargo build --release in scripts/vl-host)
 #
 # Everything PAST the seed is TS-free: the compiler-source assembly below is
@@ -21,7 +21,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 [ -x "$VL" ] || { echo "missing vl binary: $VL (cd scripts/vl-host && cargo build --release)"; exit 1; }
-[ -f "$SEED" ] || { echo "missing seed: $SEED (deno run -A scripts/build-compiler-wasm.ts)"; exit 1; }
+[ -f "$SEED" ] || { echo "missing seed: $SEED (scripts/fetch-seed.sh, or scripts/refresh-compiler.sh)"; exit 1; }
 
 # X = the compiler's own source + the single-sourced driver. The lexer rename is
 # the same Tok/Diag/advance de-collision glue the whole self-host suite applies.
