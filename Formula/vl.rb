@@ -1,7 +1,9 @@
-# Homebrew formula for the VL / Vital compiler CLI (roadmap C5 / H-M1).
+# Homebrew formula for the VL / Vital compiler CLI (roadmap C5 / H-M1 / H-M2).
 #
-# DRAFT — not yet tappable. This installs the prebuilt `vl` binary produced by
-# `deno compile` (see scripts/build-binary.ts and .github/workflows/release.yml).
+# DRAFT — not yet tappable. This installs the prebuilt native `vl` binary produced
+# by `cargo build --features embed-seed` (a single self-contained file with the
+# compiler seed embedded; see scripts/build-binary.sh and
+# .github/workflows/release.yml).
 # Versionless per the C5 decision (DECISIONS.md "Parser, distribution &
 # bootstrapping"): the formula tracks a rolling artifact rather than pinned
 # semver releases until H5 introduces a real versioning model.
@@ -24,8 +26,8 @@ class Vl < Formula
   version "rolling"
   license "TODO" # confirm project license before publishing
 
-  # Prebuilt binaries from `deno compile --target`. The macOS/Linux arches map
-  # 1:1 to the targets in scripts/build-binary.ts.
+  # Prebuilt native binaries (one self-contained file per target). The macOS/Linux
+  # arches map 1:1 to the targets in scripts/build-binary.sh / release.yml.
   on_macos do
     on_arm do
       url "https://github.com/TODO-OWNER/vl/releases/latest/download/vl-aarch64-apple-darwin"
@@ -54,8 +56,8 @@ class Vl < Formula
   end
 
   test do
-    # Exercises the full pipeline (parse -> typecheck -> binaryen codegen ->
-    # run) inside the installed binary — the same path the smoke test covers.
-    assert_equal "3", shell_output("#{bin}/vl -e 'print(1 + 2)'").strip
+    # Exercises the full pipeline (parse -> typecheck -> emit -> run) inside the
+    # installed binary, driving the embedded compiler seed with no out-of-band asset.
+    assert_equal "3", shell_output("#{bin}/vl run -e 'print(1 + 2)'").strip
   end
 end

@@ -7,12 +7,12 @@
 // everything" while the gate stays `error`, so warnings/hints still print.
 //
 // This is the native counterpart to the retired tests/cli_severity_test.ts (which
-// drove the TS `compiler/cli.ts`). The TS test also poked the internal
+// drove the now-deleted TS CLI). That TS test also poked the internal
 // `severityRank`/`meetsThreshold` helpers directly; that behaviour is fully
 // observable here through the exit code + displayed output, so it needs no
 // separate unit. (The TS test's `run`/`build` advisory-floor cases covered the TS
-// host's display policy, which the native host does not mirror, so they retire
-// with cli.ts rather than port.)
+// host's display policy, which the native host does not mirror, so they retired
+// with the TS CLI rather than port.)
 //
 // GATING: same as tests/vl_check_dir_test.ts — env-gated (`SELFHOST_NATIVE_ALIGN=1`)
 // AND requires the built binary + seed wasm.

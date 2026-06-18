@@ -400,8 +400,8 @@ export const compile = async (
         severity: "error",
         source: "vital",
         // Sentinel range: a codegen throw carries no source span, so it points
-        // at 0:0/0:0 with start == end. The CLI's pretty formatter keys off this
-        // exact shape to skip rendering a bogus source line/caret (see cli.ts). A
+        // at 0:0/0:0 with start == end. A pretty formatter keys off this
+        // exact shape to skip rendering a bogus source line/caret. A
         // genuine diagnostic at the very start of a file is distinguishable
         // because its `end` is past the start.
         range: {

@@ -26,15 +26,15 @@ Deno fills **six distinct roles**. Each is removed by a different front:
 
 | # | Role | What depends on it | Removed by |
 |---|------|--------------------|------------|
-| J0 | **TS-oracle brain** | `compiler/cli.ts`, the `compiler/*.ts` graph, corpus adjudication, `deno check`/`deno lint` | Killing the TWO COMPILERS (ROADMAP Next) |
+| J0 | **TS-oracle brain** | the `compiler/*.ts` graph, corpus adjudication, `deno check`/`deno lint` (`compiler/cli.ts` retired) | Killing the TWO COMPILERS (ROADMAP Next) |
 | J1 | **V8 wasm executor** | `runWasm` in the corpus/selfhost tests; the deno-side golden + emit suites | Folding RUN/CHECK onto the native (wasmtime) tier — F-tiers |
 | J2 | **Test harness** | all 52 `tests/*.ts` (`Deno.test`) | `vl test` for behavioral `.vl`; `node --test` for TS-infra tests |
 | J3 | **Build/dev scripts** | `deno run scripts/*.ts` | port load-bearing scripts to `.vl`/Node; retire/move dev-only ones |
 | J4 | **Bundling** | `lsp` esbuild build, `playground/build.ts` | esbuild-on-Node (deps already node-resolvable) |
-| J5 | **Distribution** | `deno compile` (C5, `release.yml`) | H-M2 wasmtime+WASI binary |
+| J5 | **Distribution** | ~~`deno compile`~~ → DONE: native `vl` host, seed embedded (`release.yml`) | — (shipped, H-M2) |
 
 The single largest role is **J0** — and it requires *zero Deno-specific work*. When the TS compiler
-is deleted, every `deno run compiler/cli.ts` / `deno check compiler/*.ts` / V8-adjudicated corpus
+is deleted, every `deno check compiler/*.ts` / V8-adjudicated corpus
 path disappears with it. So the order of operations is: **don't fight Deno where the TS-host kill
 already removes it; spend effort only on the genuinely Deno-specific residue (J1–J6).**
 
@@ -43,8 +43,9 @@ already removes it; spend effort only on the genuinely Deno-specific residue (J1
 ## Role-by-role detail
 
 ### J0 — the TS-oracle brain (rides the TS-host kill; no Deno-specific work)
-- `compiler/cli.ts` is the Deno entry point for `vl build/check/run/fmt`; the native `vl`
-  (`scripts/vl-host`, wasmtime) already does this with zero Deno.
+- `compiler/cli.ts` (the old Deno entry point for `vl build/check/run/fmt`) is RETIRED — the native
+  `vl` (`scripts/vl-host`, wasmtime) is the sole CLI and ships as a self-contained binary with the
+  seed embedded, zero Deno.
 - The corpus oracle currently adjudicates via the TS compiler under Deno. ROADMAP Next step 0
   flips it to the WASM compiler under Deno (one brain, two engines), and the native tier
   (`ci-native`) already adjudicates under wasmtime.
@@ -79,8 +80,9 @@ All 52 `tests/*.ts` are `Deno.test`. Split by subject:
 ### J3 — build/dev scripts
 `deno run scripts/*.ts`:
 - **Load-bearing** — `gen-std.ts` (embeds the `.vl` std into `std/embedded.ts`),
-  `native-golden-check.ts` (CI byte tripwire), `build-binary.ts`/`smoke-binary.ts` (only until J5).
-  Port to `.vl` (dogfood) or Node.
+  `native-golden-check.ts` (CI byte tripwire). Port to `.vl` (dogfood) or Node. (The deno
+  `build-binary.ts`/`smoke-binary.ts` are RETIRED — release distribution is the native
+  `scripts/build-binary.sh`, a thin cargo wrapper, no Deno.)
 - **Dev-only** — `checker-parity-sweep.ts` (the LSP TS-vs-wasm divergence inventory). Can lag; move
   to Node last or retire when the TS compiler (its subject) is gone. (The `perf*.ts` benchmarks drove
   the TS `compile()` and were RETIRED — see `CHANGELOG.md`; rebuild against the native binary if a
@@ -95,12 +97,13 @@ All 52 `tests/*.ts` are `Deno.test`. Split by subject:
 - **Action:** swap to esbuild-on-Node via `npm` scripts. Fully decoupled from compiler work — can
   land first, before anything else in Track J.
 
-### J5 — distribution
-- `deno compile` builds the `vl` binary today (DECISIONS "Distribute via `deno compile`",
-  ROADMAP C5, `release.yml` matrix over `--target`). It embeds V8 + the TS compiler + binaryen.js.
-- Superseded as the *destination* by H-M2 (wasmtime+WASI; `scripts/vl-host` already exists). The
-  `deno compile` binary is now explicitly the **interim** distribution — retire it when H-M2's WASI
-  driver lands. DECISIONS entry annotated accordingly.
+### J5 — distribution — DONE
+- The `deno compile` binary (V8 + the TS compiler + binaryen.js) is RETIRED. Distribution is now the
+  native Rust `vl` host with the compiler seed embedded (`cargo build --features embed-seed` via
+  `scripts/build-binary.sh`) — a single self-contained file per target, no Deno/V8/node/binaryen.
+- `release.yml` builds all five targets per-OS (ubuntu for both Linux arches, macOS for both Darwin,
+  Windows for win-x64); `compiler/cli.ts` + `scripts/build-binary.ts` + `scripts/smoke-binary.ts` are
+  deleted. The DECISIONS "Distribute via `deno compile`" entry is marked RETIRED. (→ `CHANGELOG.md`)
 
 ### J6 — final teardown (last)
 Once J0–J5 land:

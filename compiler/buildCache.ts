@@ -2,8 +2,8 @@
 //
 // IMPORTANT: this is NOT part of the runtime-agnostic compiler core. `compile.ts`
 // and `toWasm.ts` stay free of `Deno`/filesystem use so they bundle into the LSP
-// and playground; this module uses `Deno` directly (like `cli.ts`) and must only
-// be imported by Deno entry points (the CLI, the test suite, build scripts) —
+// and playground; this module uses `Deno` directly and must only
+// be imported by Deno entry points (the test suite, build scripts) —
 // never from the core or anything esbuild bundles.
 //
 // What it provides: a tiny content-addressed blob store for expensive,

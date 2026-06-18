@@ -38,9 +38,10 @@ file; the lexer/parser are the grammar.
 
 ## Hard constraints
 
-- **The compiler core is dual-runtime** — bundled into both the Deno CLI and the Node LSP server. Keep
-  `compiler/*.ts` **side-effect-free** with **no unguarded `Deno`/`process` globals**. Runtime-specific
-  code lives in `compiler/cli.ts` (Deno) and `lsp/` (Node).
+- **The compiler core is runtime-agnostic** — `compiler/*.ts` is bundled into the Node LSP server and
+  the browser playground (and runs under Deno in the test suite). Keep it **side-effect-free** with **no
+  unguarded `Deno`/`process` globals**. Runtime-specific code lives in `lsp/` (Node) and the Deno
+  test/build scripts; the shipping CLI is the native Rust host (`scripts/vl-host`), not TS.
 - **WasmGC** is the allocation model; lean on binaryen's optimizer (Heap2Local) rather than hand-rolling
   scalarization. See `DECISIONS.md`.
 

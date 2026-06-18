@@ -55,10 +55,13 @@ A **self-contained release binary** bakes the seed in, so a shipped `vl` is one
 file that runs anywhere with no out-of-band asset:
 
 ```sh
-scripts/fetch-seed.sh                                       # seed into build/
-cargo build --release --features embed-seed \
-  --manifest-path scripts/vl-host/Cargo.toml                # single-file `vl`
+scripts/fetch-seed.sh           # seed into build/
+scripts/build-binary.sh         # → dist/vl (host); --target <T> or --all to cross-build
 ```
+
+(`scripts/build-binary.sh` wraps `cargo build --release --features embed-seed`; the
+release workflow builds every target this way. `deno task compile` is an alias for
+the host build.)
 
 | Command | What it does |
 |---|---|
