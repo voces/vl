@@ -81,8 +81,10 @@ All 52 `tests/*.ts` are `Deno.test`. Split by subject:
 - **Load-bearing** — `gen-std.ts` (embeds the `.vl` std into `std/embedded.ts`),
   `native-golden-check.ts` (CI byte tripwire), `build-binary.ts`/`smoke-binary.ts` (only until J5).
   Port to `.vl` (dogfood) or Node.
-- **Dev-only** — `perf.ts`, `perf-runtime.ts`, `perf-compare.ts`, `checker-parity-sweep.ts`. Can
-  lag; move to Node last or retire when the TS compiler (their subject) is gone.
+- **Dev-only** — `checker-parity-sweep.ts` (the LSP TS-vs-wasm divergence inventory). Can lag; move
+  to Node last or retire when the TS compiler (its subject) is gone. (The `perf*.ts` benchmarks drove
+  the TS `compile()` and were RETIRED — see `CHANGELOG.md`; rebuild against the native binary if a
+  perf baseline is wanted again.)
 - Each script must be audited for `Deno.*` globals (file IO, `Deno.args`, `Deno.run`) when ported.
 
 ### J4 — bundling (independent; cleanest early win)

@@ -1,5 +1,10 @@
 # VL Compiler — Test-Suite Parallelisation & Perf Findings
 
+> **Historical.** The `scripts/perf*.ts` harnesses this doc describes were retired
+> with the kill-TS dev-script sweep (they drove the TS `compile()`). The findings
+> below are kept as a record; re-establish a baseline against the native binary if
+> regression-tracking is wanted again.
+
 Date: 2026-06-07  
 Branch: `claude/perf-test-parallel`
 
