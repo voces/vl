@@ -149,28 +149,56 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-check-redundant-type: suppressed in a multi-module check (entry with imports)",
+  name: "vl-check-redundant-type: module-aware — reports + fixes the ENTRY's findings, not a dep's",
   ignore: !ENABLED,
   fn: async () => {
-    // A graph compile merges modules; until per-module attribution lands, a file
-    // with imports does not report this hint (rather than mis-attribute a dep's).
+    // A graph compile merges modules, so each finding is attributed to its owning
+    // module (`redunModuleAt`) and only the ENTRY's (module 0) are reported/fixed.
+    // The check resolves imports first, so an import-DEPENDENT redundancy
+    // (`let e: i32 = f()`, `f` imported) is detected reliably too.
     const dir = await Deno.makeTempDir({ prefix: "vl_redun_mod_" });
     try {
-      await Deno.writeTextFile(`${dir}/dep.vl`, "export function f(): i32 { 9 }\n");
+      // dep has its own redundant annotation (`let z: i32 = 9`) — must NOT be touched.
+      await Deno.writeTextFile(
+        `${dir}/dep.vl`,
+        "export function f(): i32 {\n  let z: i32 = 9\n  z\n}\n",
+      );
       await Deno.writeTextFile(
         `${dir}/entry.vl`,
-        "import { f } from \"./dep\"\nlet e: i32 = f()\nprint(e)\n",
+        // `e` is import-dependent (= f()); `arr` is an empty-array hole (keep).
+        "import { f } from \"./dep\"\nlet e: i32 = f()\nlet arr: i32[] = []\narr.push(e)\nprint(arr.length)\n",
       );
-      const { code, stderr } = await new Deno.Command(VL, {
+      // Report (real path so imports resolve): the entry's `e` IS flagged; the
+      // dep's `z` is NOT (different module).
+      const rep = await new Deno.Command(VL, {
         args: ["check", `${dir}/entry.vl`, "--concise", "--compiler", COMPILER],
         stdout: "null",
         stderr: "piped",
         env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
       }).output();
-      const err = new TextDecoder().decode(stderr);
-      if (code !== 0) throw new Error(`expected clean check, got ${code}:\n${err}`);
-      if (redundantLines(err).length !== 0) {
-        throw new Error(`multi-module check should not report redundant hints:\n${err}`);
+      const err = new TextDecoder().decode(rep.stderr);
+      const hits = redundantLines(err);
+      if (hits.length !== 1 || !hits[0].includes("`e`")) {
+        throw new Error(`expected exactly the entry's \`e\` flagged, got:\n${err}`);
+      }
+      // --fix: removes the entry's `e` annotation, keeps the empty-array `arr`, and
+      // leaves dep.vl untouched.
+      await new Deno.Command(VL, {
+        args: ["check", `${dir}/entry.vl`, "--fix", "--compiler", COMPILER],
+        stdout: "null",
+        stderr: "null",
+        env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+      }).output();
+      const entryAfter = await Deno.readTextFile(`${dir}/entry.vl`);
+      const depAfter = await Deno.readTextFile(`${dir}/dep.vl`);
+      if (entryAfter.includes(": i32 = f()") || !/\b(let|const) e = f\(\)/.test(entryAfter)) {
+        throw new Error(`entry's import-dependent annotation not removed:\n${entryAfter}`);
+      }
+      if (!entryAfter.includes("arr: i32[] = []")) {
+        throw new Error(`empty-array annotation wrongly removed:\n${entryAfter}`);
+      }
+      if (!depAfter.includes("let z: i32 = 9")) {
+        throw new Error(`a dependency file was wrongly modified:\n${depAfter}`);
       }
     } finally {
       await Deno.remove(dir, { recursive: true });

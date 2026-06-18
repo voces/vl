@@ -212,9 +212,11 @@ host path until the protocol is proven on `check`.
 3. **`vl fmt` in VL** — walk + write/stdout/`--check` over the same protocol;
    retire the Rust-side fmt walk/glob (#429).
 4. **`vl check --fix`** — VL fix-edit computation (prefer-const; `redundant-type`,
-   which removes an explicit annotation the initializer already infers — the type
-   checker flags it during the `LetDecl` check and `cliApplyFixes` rewrites
-   `let x: T = e` → `let x = e`, single-module only for now) + `CMD_WRITE_FILE`.
+   which removes an explicit annotation the initializer already infers) + `CMD_WRITE_FILE`.
+   MODULE-AWARE: the fixes are computed in `cliCheckCurFile` AFTER the resolved
+   module compile (so the checker's types are reliable), from the entry module's
+   findings (`redunModuleAt == 0`); the file is written, then re-checked for the
+   report. (`cliComputeFixes` only reads the populated redun + lint streams.)
 5. **Retire `cli.ts` + the `cli_*` tests** — DONE. The behavioral tests were
    repointed to drive the native `vl` binary (`vl_check_severity`/`_codegen`/
    `_exclude`/`_fix`) and `compiler/cli.ts` is deleted, along with the `deno compile`
