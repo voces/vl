@@ -275,6 +275,17 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   the offending values (e.g. `index 7 out of bounds (length 3)`); (3) an index-assignment LHS has
   no parser span yet — broaden parser span coverage for OOB *write* errors. Also feasible: a
   **REPL** (accumulate-session-source + recompile-per-entry) as a future CLI item.
+- ⬜ **B-emitmsg. Human, clear, explainable emit-failure errors.** Codegen/emit failures still
+  surface developer-internal phrasing — e.g. a recursion cycle through a nested collection
+  (`{ [string]: Tree[] }`) reports `emitProgram: map value type has no interned slot` / `(emit error)`,
+  jargon that names an internal data structure rather than the user's mistake. Audit the `wasmEmit.vl`
+  error paths and rewrite each into a source-located, plain-language diagnostic that names the
+  offending construct and (where possible) the supported alternative — matching the quality bar the
+  type-checker diagnostics already hit (cf. the A-track honest-message work). The still-unsupported
+  nested-collection recursion shape is the canonical first case (its fixture lives in
+  `tests/vl_check_codegen_test.ts`, which deliberately asserts only the emit-stage *marker* so it
+  won't pin the wording this item improves). Compile-time analogue of B-debug's value-rich panic
+  messages (runtime traps).
 - ⬜ H3 merge-by-renaming is a bridge — post-parity revisit notes live in native-modules-design.md
   §Post-parity revisit (symbol-based resolution replaces the rename walker).
 
