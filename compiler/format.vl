@@ -168,14 +168,22 @@ function emitLine(indent: i32, text: string): i32 {
 // ── low-level source access ───────────────────────────────────────────────────
 
 // The 1-based source line containing char offset `off` (a scan over `lineStart`).
+// `lineStart` is ascending, so binary-search the largest index whose offset is
+// `<= off`. The old linear scan was O(lines) PER call and is hit per node
+// (start/stopLineOf), so over a whole file it was O(n²) — minutes + heap blow-up
+// on the 6940-line typecheck.vl.
 function lineOf(off: i32): i32 {
+  let lo = 1
+  let hi = lineStart.length - 1
   let ln = 1
-  let i = 1
-  while i < lineStart.length {
-    if lineStart[i] <= off {
-      ln = i
+  while lo <= hi {
+    const mid = lo + (hi - lo) / 2
+    if lineStart[mid] <= off {
+      ln = mid
+      lo = mid + 1
+    } else {
+      hi = mid - 1
     }
-    i = i + 1
   }
   ln
 }
@@ -378,15 +386,21 @@ function spaces(n: i32): string {
   s
 }
 
+// Concatenate `parts[lo..hi)` with a `\n` between every adjacent pair, splitting
+// the range in half so the total intermediate-string allocation is O(n log n)
+// rather than the O(n²) of a running `s = s + parts[i]` accumulator. That
+// quadratic blows up under the compiler's NON-FREEING null GC collector — on a
+// large file (e.g. the 6940-line typecheck.vl) the old form exhausted the heap
+// ("allocation size too large") or ran for minutes.
+function joinLinesRange(parts: string[], lo: i32, hi: i32): string {
+  if hi - lo <= 0 { return "" }
+  if hi - lo == 1 { return parts[lo] }
+  const mid = lo + (hi - lo) / 2
+  joinLinesRange(parts, lo, mid) + "\n" + joinLinesRange(parts, mid, hi)
+}
+
 function joinLines(parts: string[]): string {
-  let s = ""
-  let i = 0
-  while i < parts.length {
-    if i > 0 { s = s + "\n" }
-    s = s + parts[i]
-    i = i + 1
-  }
-  s
+  joinLinesRange(parts, 0, parts.length)
 }
 
 function isBlankLine(line: string): boolean {
@@ -702,21 +716,27 @@ function emitImports(): i32 {
   prevLine
 }
 
+// Concatenate `outBuf[lo..hi)` divide-and-conquer — O(n log n) intermediate
+// allocation, not the O(n²) of a running accumulator (see `joinLinesRange`).
+function joinOutRange(lo: i32, hi: i32): string {
+  if hi - lo <= 0 { return "" }
+  if hi - lo == 1 { return outBuf[lo] }
+  const mid = lo + (hi - lo) / 2
+  joinOutRange(lo, mid) + joinOutRange(mid, hi)
+}
+
 function joinOut(): string {
-  let s = ""
-  let i = 0
-  while i < outBuf.length {
-    s = s + outBuf[i]
-    i = i + 1
-  }
-  s
+  joinOutRange(0, outBuf.length)
 }
 
 // Final normalization: strip per-line trailing whitespace, collapse 2+ blank
 // lines to one, strip leading blank lines, ensure a single trailing newline.
 function normalizeProgram(text: string): string {
   const lines = splitLines(text)
-  let out = ""
+  // Collect the kept lines, then join ONCE — a running `out = out + line`
+  // accumulator here is O(n²) (and on a large file blew the non-freeing heap, the
+  // last fmt scalability hotspot alongside joinOut/lineOf/exportPrefix).
+  const out: string[] = []
   let blanks = 0
   let started = false
   let i = 0
@@ -726,15 +746,16 @@ function normalizeProgram(text: string): string {
       blanks = blanks + 1
     } else {
       if started && blanks > 0 {
-        out = out + "\n"
+        out.push("")
       }
-      out = out + line + "\n"
+      out.push(line)
       started = true
       blanks = 0
     }
     i = i + 1
   }
-  out
+  if out.length == 0 { return "" }
+  joinLines(out) + "\n"
 }
 
 // ── statements ────────────────────────────────────────────────────────────────
@@ -861,21 +882,30 @@ function emitExpressionStatement(ix: i32, indent: i32): i32 {
   0
 }
 
+// Index of the token whose `start` is exactly `pos`, or -1. Tokens are in source
+// order (ascending, distinct `start`), so binary-search it. The linear scans this
+// replaces were O(tokens) per call and run per declaration/field → O(n²) on a
+// large file.
+function tokIndexAt(pos: i32): i32 {
+  let lo = 0
+  let hi = P.toks.length - 1
+  while lo <= hi {
+    const mid = lo + (hi - lo) / 2
+    const s = P.toks[mid].start
+    if s == pos { return mid }
+    if s < pos { lo = mid + 1 } else { hi = mid - 1 }
+  }
+  0 - 1
+}
+
 // `export`-modifier recovery: the parser drops `export`, so look at the token
 // immediately before the declaration's start token for an EXPORT keyword.
 function exportPrefix(ix: i32): string {
   let p = nodePos(ix)
   if p < 0 { return "" }
-  let i = 0
-  while i < P.toks.length {
-    const t = P.toks[i]
-    if t.start == p {
-      if i > 0 && P.toks[i - 1].kind == "EXPORT" {
-        return "export "
-      }
-      return ""
-    }
-    i = i + 1
+  const i = tokIndexAt(p)
+  if i > 0 && P.toks[i - 1].kind == "EXPORT" {
+    return "export "
   }
   ""
 }
