@@ -670,6 +670,33 @@ function cliCheckCurFile(): i32 {
       k = k + 1
     }
   }
+  // Redundant explicit type annotations (a `hint`): `let x: T = e` where the
+  // initializer already infers to exactly `T`. Populated by the type checker
+  // (the `checkSrc`/`compileSrc` run above), so it's read straight off the redun
+  // stream here — anchored at the annotation, removable by `--fix`.
+  //
+  // Gated to a SINGLE-MODULE check (`impCount() == 0`): a module-graph compile
+  // merges every module into one AST, so a dependency's findings would surface
+  // with merge-mangled names + module-local positions against the entry. Proper
+  // per-module attribution (à la inlay hints' `symOccModuleAt`) is a follow-up;
+  // until then a file with imports simply doesn't report this hint.
+  let rn = 0
+  if impCount() == 0 { rn = redunCount() }
+  let ri = 0
+  while ri < rn {
+    cliAddDiag(
+      "hint",
+      redunSLineAt(ri),
+      redunSColAt(ri),
+      redunSColAt(ri) + 1,
+      "redundant type annotation: `" +
+        redunNameAt(ri) +
+        "` is inferred as `" +
+        redunTypeAt(ri) +
+        "` — remove it to lean on inference",
+    )
+    ri = ri + 1
+  }
 
   cliSrcLines = cliSplitLines(cliEntrySrc)
   const thr = cliSevRank(cliSeverity)
@@ -863,8 +890,11 @@ function cliApplyFixes(src: string): string {
     srcPush(src[i])
     i = i + 1
   }
+  // Type-check too (over the same staged source) so the redundant-annotation
+  // stream is populated — its fix needs the inferred type, which `lintSrc` (a
+  // parse-only pass) doesn't compute. Then lint for the syntactic fixes.
+  checkSrc()
   let n = lintSrc()
-  if n <= 0 { return src }
   // The absolute offset where each 0-based line begins.
   const starts: i32[] = [0]
   let s = 0
@@ -896,6 +926,30 @@ function cliApplyFixes(src: string): string {
       }
     }
     k = k + 1
+  }
+  // Redundant type annotations: rewrite `let x: T = init` → `let x = init` by
+  // replacing the span [name-end, `=`-start) — i.e. `: T ` — with a single space
+  // (the `= init` is kept). The checker computed the span (its end is the
+  // assignment `=`, found by a depth-aware token scan, so a multi-token or
+  // function-type annotation is handled correctly).
+  // Single-module only (see the display path) — a graph compile's findings carry
+  // module-local positions that don't map onto the entry source being rewritten.
+  let rcount = 0
+  if impCount() == 0 { rcount = redunCount() }
+  let rk = 0
+  while rk < rcount {
+    const sl = redunSLineAt(rk) - 1
+    const el = redunELineAt(rk) - 1
+    if sl >= 0 && sl < starts.length && el >= 0 && el < starts.length {
+      const so = starts[sl] + redunSColAt(rk)
+      const eo = starts[el] + redunEColAt(rk)
+      if so >= 0 && eo > so && eo <= src.length {
+        pos.push(so)
+        len.push(eo - so)
+        txt.push(" ")
+      }
+    }
+    rk = rk + 1
   }
   if pos.length == 0 { return src }
   // Order the edits by start offset ASCENDING (insertion sort over indices), then
