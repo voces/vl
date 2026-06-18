@@ -6,14 +6,16 @@
 //   vl fmt   [path] [-w|--check]     format source (stdout / write / CI gate); stdin when no path
 //
 // This is a THIN host adapter: all compiler logic (lex/parse/typecheck/emit) lives
-// in the self-hosted compiler wasm (`build/vl-compiler.wasm`, built by
-// scripts/build-compiler-wasm.ts from the VL-written compiler). The Rust side only
-// does argv, file I/O, stdout, and the wasmtime embedding — it never parses or
-// types VL. Future subcommands (fmt, test, …) follow the same shape: the brains
-// land in the wasm, the adapter stays an I/O shim.
+// in the self-hosted compiler wasm (`build/vl-compiler.wasm`, self-compiled from
+// the VL-written compiler — see scripts/refresh-compiler.sh / fetch-seed.sh). The
+// Rust side only does argv, file I/O, stdout, and the wasmtime embedding — it never
+// parses or types VL. Future subcommands (fmt, test, …) follow the same shape: the
+// brains land in the wasm, the adapter stays an I/O shim.
 //
-// The compiler module is resolved from (first hit wins):
-//   --compiler <path>  |  $VL_COMPILER_WASM  |  ./build/vl-compiler.wasm
+// The compiler seed is resolved from (first hit wins):
+//   --compiler <path>  |  $VL_COMPILER_WASM  |  ./build/vl-compiler.wasm  |  embedded
+// The embedded copy exists only in a release build (`--features embed-seed`, which
+// bakes the seed in via build.rs), so a shipped `vl` is one self-contained file.
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
@@ -103,6 +105,53 @@ fn render_diags(inst: &Instance, store: &mut Store<()>, path: &str) -> Result<St
     Ok(diags)
 }
 
+/// Where the compiler seed bytes come from: a path on disk (the dev/CI default,
+/// cached via a `.cwasm` sidecar) or bytes baked into THIS binary at build time (a
+/// release build with `--features embed-seed`, so the shipped `vl` is a single
+/// self-contained file with no out-of-band asset).
+enum CompilerSource {
+    Path(String),
+    Embedded(&'static [u8]),
+}
+
+#[cfg(feature = "embed-seed")]
+static EMBEDDED_SEED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vl-compiler.wasm"));
+
+/// The compiled-in seed, present only when built with `--features embed-seed`.
+fn embedded_seed() -> Option<&'static [u8]> {
+    #[cfg(feature = "embed-seed")]
+    {
+        Some(EMBEDDED_SEED)
+    }
+    #[cfg(not(feature = "embed-seed"))]
+    {
+        None
+    }
+}
+
+/// Resolve which compiler seed to load, first hit wins:
+///   --compiler <path>  →  $VL_COMPILER_WASM  →  ./build/vl-compiler.wasm  →  embedded
+/// An EXPLICIT request (flag or env) is honoured strictly — a missing file is an
+/// error, never a silent fall-through to the embedded copy. Only the default
+/// (neither flag nor env) falls back: the on-disk seed wins when present (so a dev
+/// checkout / CI drives its freshly-built seed, and a release binary's embedded copy
+/// stays overridable), and the embedded seed is the last resort so a distributed
+/// `vl` runs anywhere. With no flag/env, no disk seed, and no embedded copy, return
+/// the default path so the loader emits its build-the-seed hint.
+fn resolve_compiler(explicit: Option<String>) -> CompilerSource {
+    if let Some(p) = explicit.or_else(|| std::env::var("VL_COMPILER_WASM").ok()) {
+        return CompilerSource::Path(p);
+    }
+    const DEFAULT: &str = "build/vl-compiler.wasm";
+    if std::path::Path::new(DEFAULT).exists() {
+        return CompilerSource::Path(DEFAULT.to_string());
+    }
+    if let Some(bytes) = embedded_seed() {
+        return CompilerSource::Embedded(bytes);
+    }
+    CompilerSource::Path(DEFAULT.to_string())
+}
+
 /// Drive the self-hosted compiler module: feed `source` in, call `entry`
 /// (`compileSrc` for the full pipeline, `checkSrc` for parse + typecheck only),
 /// optionally enabling the `name` custom section (`emit_names`), and return the
@@ -114,31 +163,42 @@ fn render_diags(inst: &Instance, store: &mut Store<()>, path: &str) -> Result<St
 /// by every subcommand that drives the seed (`compile_vl`, `fmt`). `deserialize_file`
 /// is unsafe because a corrupt/forged artifact is UB — we only ever load a sidecar
 /// this same binary wrote next to the module it was derived from.
-fn load_compiler(engine: &Engine, compiler_path: &str) -> Result<(Store<()>, Instance)> {
-    let sidecar = format!("{compiler_path}.cwasm");
-    let fresh = match (
-        std::fs::metadata(&sidecar),
-        std::fs::metadata(compiler_path),
-    ) {
-        (Ok(c), Ok(w)) => matches!((c.modified(), w.modified()), (Ok(cm), Ok(wm)) if cm >= wm),
-        _ => false,
-    };
-    let module = if fresh {
-        match unsafe { Module::deserialize_file(engine, &sidecar) } {
-            Ok(m) => m,
-            Err(_) => Module::from_file(engine, compiler_path)?, // stale config/version — recompile
+fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>, Instance)> {
+    let module = match source {
+        // Embedded seed (a `--features embed-seed` release binary): compile from the
+        // baked-in bytes each run. No `.cwasm` sidecar — there's no path to key it on;
+        // the Cranelift compile is the one cost a future cache could reclaim.
+        CompilerSource::Embedded(bytes) => Module::from_binary(engine, bytes)
+            .map_err(|e| e.context("loading the embedded compiler seed"))?,
+        CompilerSource::Path(compiler_path) => {
+            let sidecar = format!("{compiler_path}.cwasm");
+            let fresh = match (
+                std::fs::metadata(&sidecar),
+                std::fs::metadata(compiler_path),
+            ) {
+                (Ok(c), Ok(w)) => {
+                    matches!((c.modified(), w.modified()), (Ok(cm), Ok(wm)) if cm >= wm)
+                }
+                _ => false,
+            };
+            if fresh {
+                match unsafe { Module::deserialize_file(engine, &sidecar) } {
+                    Ok(m) => m,
+                    Err(_) => Module::from_file(engine, compiler_path)?, // stale config/version — recompile
+                }
+            } else {
+                let m = Module::from_file(engine, compiler_path).map_err(|e| {
+                    e.context(format!(
+                        "loading compiler module `{compiler_path}` (build it with: scripts/refresh-compiler.sh)"
+                    ))
+                })?;
+                // Best-effort cache write; failure is non-fatal (read-only dirs etc.).
+                if let Ok(bytes) = m.serialize() {
+                    let _ = std::fs::write(&sidecar, bytes);
+                }
+                m
+            }
         }
-    } else {
-        let m = Module::from_file(engine, compiler_path).map_err(|e| {
-            e.context(format!(
-                "loading compiler module `{compiler_path}` (build it with: scripts/refresh-compiler.sh)"
-            ))
-        })?;
-        // Best-effort cache write; failure is non-fatal (read-only dirs etc.).
-        if let Ok(bytes) = m.serialize() {
-            let _ = std::fs::write(&sidecar, bytes);
-        }
-        m
     };
     let mut store = Store::new(engine, ());
     let linker = Linker::new(engine);
@@ -238,13 +298,13 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
 
 fn compile_vl(
     engine: &Engine,
-    compiler_path: &str,
+    compiler: &CompilerSource,
     source: &str,
     source_path: &str,
     entry: &str,
     emit_names: bool,
 ) -> Result<Vec<u8>> {
-    let (mut store, inst) = load_compiler(engine, compiler_path)?;
+    let (mut store, inst) = load_compiler(engine, compiler)?;
 
     let compile = inst.get_typed_func::<(), i32>(&mut store, entry)?;
     let rlen = inst.get_typed_func::<(), i32>(&mut store, "rbyteLen")?;
@@ -413,7 +473,7 @@ fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
 /// Compile `source` through the seed (names enabled, for legible trap traces) and
 /// run the emitted module on the DRC engine.
 fn compile_and_run(
-    compiler: &str,
+    compiler: &CompilerSource,
     source: &str,
     source_path: &str,
     run_engine: &Engine,
@@ -450,9 +510,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
         }
         i += 1;
     }
-    let compiler = compiler
-        .or_else(|| std::env::var("VL_COMPILER_WASM").ok())
-        .unwrap_or_else(|| "build/vl-compiler.wasm".to_string());
+    let compiler = resolve_compiler(compiler);
 
     const USAGE: &str = "usage: vl run <file.vl> | -e <source> | < stdin";
     let run_engine = gc_engine(Collector::DeferredReferenceCounting)?;
@@ -541,9 +599,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
         }
         i += 1;
     }
-    let compiler = compiler
-        .or_else(|| std::env::var("VL_COMPILER_WASM").ok())
-        .unwrap_or_else(|| "build/vl-compiler.wasm".to_string());
+    let compiler = resolve_compiler(compiler);
 
     let engine = gc_engine(Collector::Null)?;
     let (mut store, inst) = load_compiler(&engine, &compiler)?;
@@ -695,9 +751,7 @@ fn main() -> Result<()> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    let compiler = flag("--compiler")
-        .or_else(|| std::env::var("VL_COMPILER_WASM").ok())
-        .unwrap_or_else(|| "build/vl-compiler.wasm".to_string());
+    let compiler = resolve_compiler(flag("--compiler"));
 
     // Read the source lazily: a `vl run <file.wasm>` input is a binary module, not
     // UTF-8, so we must not slurp it as a string up front.
