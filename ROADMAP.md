@@ -358,8 +358,9 @@ seed from current `compiler/*.vl` in ~3s.*
     gates message/span parity. Also: the single-unit assembly compile is SUPERLINEAR in the TS
     host (~5s as a 2-module graph vs ~100s concatenated — wasmEmit.vl is the multiplier); worth a
     profile if any gated assembly is still exercised regularly. (Landed → `CHANGELOG.md`: gating,
-    parallel sweep, seed cache + ~3s refresh, graph-compile caching, the NATIVE golden
-    byte-tripwire `scripts/native-golden-check.ts` — no big assembly remains always-on.)
+    parallel sweep, seed cache + ~3s refresh, graph-compile caching — no big assembly remains
+    always-on. The native golden byte-tripwire that briefly covered this is since retired —
+    redundant with the fixpoint + the functional corpus, → `CHANGELOG.md`.)
 
 ---
 
@@ -477,10 +478,11 @@ piece that can land early, fully decoupled).
     test TS that outlives the compiler; they move to a **Node** test runner (`node --test`) when
     their subsystem is ported, OR ride along under Deno until then. Decide the Node-runner cutover
     once `vl test` has absorbed the behavioral corpus.
-- ⬜ **J3 — build/dev scripts.** `deno run scripts/*.ts` (gen-std, build-binary, smoke-binary,
-  perf*, checker-parity-sweep, native-golden-check). Two buckets: **load-bearing** (gen-std embeds
-  the std; native-golden-check is a CI tripwire) → port to `.vl`/native or to Node; **dev-only**
-  (perf, parity sweeps) → can lag, move to Node last or retire. Audit each for a `Deno.*` global.
+- 🟡 **J3 — build/dev scripts.** Nearly done by attrition: `build-binary.ts`→`.sh`, and
+  `smoke-binary`/`perf*`/`checker-parity-sweep`/`native-golden-check` are all deleted (retired with
+  the TS compiler / as redundant). The ONLY remaining `scripts/*.ts` is **`gen-std.ts`** (embeds the
+  `.vl` std into `std/embedded.ts`) — load-bearing; port to `.vl` (dogfood) once VL has the file I/O
+  it needs, or move to Node. Audit for `Deno.*` globals when ported.
 - ⬜ **J4 — bundling (independent; can land anytime).** The LSP (`cd lsp && deno task build`) and
   the playground (`playground/build.ts`) are esbuild-under-Deno; their deps are already
   node-resolvable (binaryen, vscode-languageserver*, monaco). Swap to esbuild-on-Node (`npm`
