@@ -54,6 +54,32 @@ Organized by area. Triage freely.
   de-collide when concatenating modules (no module system in the test driver path).
   The same rename lives in `refresh-compiler.sh`, `native-fixpoint.sh`, and several
   tests. One shared helper would remove the copy-paste and the risk of them drifting.
+
+## Inference cleanup (lean on types — remove redundant annotations)
+
+VL hides types and surfaces them only where required; the `redundant-type` lint +
+`--fix` (→ `CHANGELOG.md`) is the first rule of a family that strips explicit
+annotations the compiler already infers. Shipped: redundant LOCAL-variable
+annotations (`let`/`const`). Follow-ups, in order of safety:
+
+- **Multi-module attribution.** The rule is gated to single-module checks: a graph
+  compile merges every module into one AST, so a dependency's findings carry
+  merge-mangled names (`x$m1`) + module-local positions that mis-attribute against
+  the entry. Record the owning module per finding (à la inlay hints' `inlayOcc` +
+  `symOccModuleAt`) and keep only the entry module's. This is the blocker for
+  dogfooding the compiler's own source (every `compiler/*.vl` imports another) and
+  for surfacing the hint in the LSP.
+- **Redundant RETURN-type annotations.** `function f(): T { … }` where the body's
+  inferred return is exactly `T`. Reuse the demand-inferred-return machinery
+  (`noteInferredRet`); the checker already writes the inferred return back into the
+  retained type, so the comparison point exists. Lower volume risk than params.
+- **Redundant PARAMETER annotations — last, and carefully.** Removing a param
+  annotation can turn a monomorphic function generic (a real semantic change: it
+  changes overload/monomorphization behavior, not just a type label). Only safe
+  under much stricter conditions (e.g. a non-exported function whose every call site
+  pins the same concrete type, and where leaving it inferred wouldn't widen). Treat
+  as its own design note before implementing.
+
 ## Known bugs carried as debt
 
 - **Builtin-type hover renders `i32: i32`.** Hovering a builtin TYPE name (`i32`,

@@ -695,6 +695,7 @@ let expectedCbParamTys: i32[] = []
 let expectedCbPending: boolean = false
 
 export function initChecker(): i32 {
+  redunReset()
   T.tys = []
   T.scopes = []
   T.diags = []
@@ -1988,6 +1989,92 @@ export function symInlayColAt(i: i32): i32 { inlayCol[i] }
 export function symInlayTypeLen(i: i32): i32 { inlayType[i].length }
 export function symInlayTypeCharAt(i: i32, j: i32): i32 { inlayType[i][j] }
 export function symInlayOccAt(i: i32): i32 { inlayOcc[i] }
+
+// ── Redundant explicit type annotations (lint: lean on inference) ───────────────
+// A `let x: T = init` whose annotation T is EXACTLY the type inference gives the
+// initializer ON ITS OWN is redundant — removing `: T` yields the identical type.
+// The init is typed by `checkNode` BEFORE the annotation is consulted (the LetDecl
+// arm), so its context-free type is in hand; we compare the two there and record a
+// finding here. cli.vl surfaces each as a `hint` + a `--fix` that rewrites
+// `let x: T = init` → `let x = init` (replace the span [name-end, init-start) with
+// " = "). Empty-collection / `null` holes are excluded for free: their pre-constrain
+// init type never RENDERS equal to the concrete annotation, so the string compare
+// below skips them; a hole/error/`never` init is also skipped explicitly.
+let redunSLine: i32[] = []   // replace-span start (just after the name) — line
+let redunSCol: i32[] = []    //                                          — col
+let redunELine: i32[] = []   // replace-span end (the initializer start) — line
+let redunECol: i32[] = []    //                                          — col
+let redunName: string[] = [] // the binding name (for the message)
+let redunType: string[] = [] // the inferred type (for the message)
+
+function redunReset(): i32 {
+  redunSLine = []
+  redunSCol = []
+  redunELine = []
+  redunECol = []
+  redunName = []
+  redunType = []
+  0
+}
+
+// Record `let <name>: T = init` as redundant when init's own type == the annotation.
+// `declIx` is the LetDecl node (for its name token); `n` carries letName/letInit.
+function recordRedundantAnnot(
+  n: LetDecl,
+  declIx: i32,
+  initTy: i32,
+  annot: i32,
+): i32 {
+  // Only a CONCRETE init type that renders identically to the annotation. A hole
+  // (empty `[]`/`Map()`, a lone `null`), an error, or `never` is never redundant.
+  if inlayHole(initTy) { return 0 }
+  if isNeverTy(initTy) { return 0 }
+  if annot == TY_ERR { return 0 }
+  if tyToStr(initTy) != tyToStr(annot) { return 0 }
+  let nameTok = declNameTokOf(declIx)
+  if nameTok < 0 { return 0 }
+  // The fix deletes the annotation, so the span runs from just after the NAME to
+  // the assignment `=`. Find that `=` by scanning the tokens between (the
+  // annotation can be multi-token — `{[string]: i32}[]`, a function type — so the
+  // init node's anchor token is unreliable). It is the first `EQUAL` at bracket
+  // depth 0 that is NOT part of `=>` (an `EQUAL` immediately followed by `>`).
+  let eqTok = -1
+  let depth = 0
+  let t = nameTok + 1
+  while t < P.toks.length {
+    if eqTok < 0 {
+      const kd = P.toks[t].kind
+      if kd == "LPAREN" || kd == "LBRACK" || kd == "LBRACE" {
+        depth = depth + 1
+      } else if kd == "RPAREN" || kd == "RBRACK" || kd == "RBRACE" {
+        depth = depth - 1
+      } else if depth == 0 && kd == "EQUAL" {
+        let isArrow = false
+        if t + 1 < P.toks.length {
+          if P.toks[t + 1].kind == "GT" { isArrow = true }
+        }
+        if !isArrow { eqTok = t }
+      }
+    }
+    t = t + 1
+  }
+  if eqTok < 0 { return 0 }
+  redunSLine.push(P.toks[nameTok].line)
+  redunSCol.push(P.toks[nameTok].col + n.letName.length)
+  redunELine.push(P.toks[eqTok].line)
+  redunECol.push(P.toks[eqTok].col)
+  redunName.push(n.letName)
+  redunType.push(tyToStr(initTy))
+  0
+}
+
+export function redunCount(): i32 { redunName.length }
+export function redunSLineAt(i: i32): i32 { redunSLine[i] }
+export function redunSColAt(i: i32): i32 { redunSCol[i] }
+export function redunELineAt(i: i32): i32 { redunELine[i] }
+export function redunEColAt(i: i32): i32 { redunECol[i] }
+export function redunNameAt(i: i32): string { redunName[i] }
+export function redunTypeAt(i: i32): string { redunType[i] }
 
 // Type-alias hover: the rendered type of the user TYPE NAME (a `type`-declared
 // struct/union alias) whose token covers (line, col) — the decl name or a use in
@@ -6289,6 +6376,13 @@ function checkNode(ix: i32): i32 {
     }
     let initTy = -1
     if n.letInit >= 0 { initTy = checkNode(n.letInit) }
+    // Redundant explicit annotation: the initializer's CONTEXT-FREE type (checked
+    // just above, before the annotation is consulted) already IS the annotation, so
+    // `: T` adds nothing. Recorded BEFORE `constrainEmpty` runs, so an empty-
+    // collection hole the annotation legitimately pins is naturally excluded.
+    if annot >= 0 && initTy >= 0 && n.letInit >= 0 {
+      recordRedundantAnnot(n, ix, initTy, annot)
+    }
     let bound = TY_ERR
     if annot >= 0 {
       bound = annot
