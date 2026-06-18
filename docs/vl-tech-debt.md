@@ -62,13 +62,11 @@ VL hides types and surfaces them only where required; the `redundant-type` lint 
 annotations the compiler already infers. Shipped: redundant LOCAL-variable
 annotations (`let`/`const`). Follow-ups, in order of safety:
 
-- **Multi-module attribution.** The rule is gated to single-module checks: a graph
-  compile merges every module into one AST, so a dependency's findings carry
-  merge-mangled names (`x$m1`) + module-local positions that mis-attribute against
-  the entry. Record the owning module per finding (à la inlay hints' `inlayOcc` +
-  `symOccModuleAt`) and keep only the entry module's. This is the blocker for
-  dogfooding the compiler's own source (every `compiler/*.vl` imports another) and
-  for surfacing the hint in the LSP.
+- **Multi-module attribution + module-aware `--fix`.** `[DONE]` Each finding records
+  its module (`redunModuleAt`), so `vl check`/`--fix` report + fix only the entry
+  module's; `--fix` runs AFTER the resolved module compile (reliable types). Applied
+  to the compiler (`−150` annotations, byte-identical seed). LSP surfacing of the
+  hint could ride the same `redunModuleAt` filter (not yet wired).
 - **Redundant RETURN-type annotations.** `function f(): T { … }` where the body's
   inferred return is exactly `T`. Reuse the demand-inferred-return machinery
   (`noteInferredRet`); the checker already writes the inferred return back into the
