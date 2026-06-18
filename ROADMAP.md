@@ -339,8 +339,10 @@ seed from current `compiler/*.vl` in ~3s.*
 - ⬜ **F6. Document the build** (`deno task build`/`test`; the antlr/gradle gen step is gone).
 - ⬜ **F7. Fix the `paramater` misspelling** project-wide (optional; currently consistent).
 - 🟡 **F8.** REMAINING (F5-adjacent): confirm vscode-languageclient forking the ESM server in VS Code.
-- 🟡 **F9. Perf baseline.** Runtime benchmark shipped (`scripts/perf-runtime.ts` / `perf-compare.ts`);
-  the past wins/abandons live in `docs/perf-findings.md` + `CHANGELOG.md`. REMAINING:
+- 🟡 **F9. Perf baseline.** The TS-driven harnesses (`scripts/perf*.ts`) were RETIRED with the
+  kill-TS dev-script sweep (they benchmarked the TS `compile()`); the past wins/abandons live in
+  `docs/perf-findings.md` + `CHANGELOG.md`. REMAINING: rebuild a baseline against the NATIVE binary
+  (`vl build`/`vl run` timing) if/when regression-tracking is wanted again; plus:
   - ⬜ **F9b. Cache / clone binaryen IR across selfhost sub-tests** — LOW priority (the dominant
     cost fell with the F9c memoize; binaryen modules are not trivially cloneable).
   - 🟡 **F-tiers. Collapse the redundant corpus runner.** (This is Track J's J1 — it removes

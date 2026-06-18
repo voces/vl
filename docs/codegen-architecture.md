@@ -568,7 +568,7 @@ that the streaming writer made redundant.
 | The builder accidentally uses a non-self-compilable feature (closure, generic) | enforce the §4 feature whitelist; the builder must compile under `emitProgram` itself — add a CI step that runs `emitProgram` over the builder module |
 | Type-index migration (Step 3) is the one place indices could drift | assert new `mIntern*` indices equal the old offset arithmetic for the golden module *before* deleting the arithmetic; keep the formulas as a debug assert for one release |
 | In-flight feature work (`.push` G7, maps G8) collides with the family-by-family migration | sequence: migrate a family **only after** its feature has landed; don't refactor and feature-add the same family in one PR |
-| Builder call overhead regresses self-hosted runtime | keep `fb*` methods flat/allocation-free (§5); the host build inlines them, the self-host build pays one cheap call — measure against `scripts/perf.ts` if in doubt |
+| Builder call overhead regresses self-hosted runtime | keep `fb*` methods flat/allocation-free (§5); the host build inlines them, the self-host build pays one cheap call — measure against the native build (the `ci-native` fixpoint timing / `vl build`) if in doubt |
 
 ---
 
