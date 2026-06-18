@@ -66,8 +66,8 @@ const mainSrc = read("../playground/src/main.ts");
 //                     surfaces here).
 //   - `adapterExport` the `lspAdapter.ts` export expected for this feature, or
 //                     `null` when the playground wires it WITHOUT a dedicated
-//                     adapter binding (e.g. formatting calls `compiler/format.ts`
-//                     straight from a toolbar button).
+//                     adapter binding (e.g. formatting drives the seed's
+//                     `formatSrc` straight from a toolbar button).
 //   - `mainMarker`    a substring that MUST appear in `main.ts` — the Monaco
 //                     `register…Provider` / capability call that wires it.
 //   - `knownGap`      OPTIONAL. When set, this feature is a DOCUMENTED parity
@@ -122,8 +122,8 @@ const FEATURES: Parity[] = [
     feature: "document formatting",
     serverMarker: "connection.onDocumentFormatting",
     // The playground wires formatting WITHOUT an `lspAdapter` binding: the
-    // Format toolbar button calls `compiler/format.ts`'s `format()` directly
-    // (`main.ts`), the same whole-document formatter the LSP's
+    // Format toolbar button drives the seed's `formatSrc` straight from
+    // `main.ts`, the same whole-document formatter the LSP's
     // `onDocumentFormatting` uses. Recognized as provider-less wiring.
     adapterExport: null,
     mainMarker: "format(model.getValue())",

@@ -281,9 +281,10 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 ## Track C — CLI (`vl` / `vital`)
 
 *The NATIVE `vl` exists (`scripts/vl-host`, ~150 lines of frozen Rust over wasmtime): `vl build`
-(`-O` via wasm-opt) / `vl check` (parse+typecheck only) / `vl run` (incl. `.wasm` passthrough),
-brains in `build/vl-compiler.wasm`. Iteration: `scripts/refresh-compiler.sh` refreshes the seed
-from current `compiler/*.vl` in ~3s.*
+(`-O` via wasm-opt) / `vl check` (parse+typecheck only) / `vl run` (incl. `.wasm` passthrough) /
+`vl fmt` (`-w`/`--check`, AST-driven via `format.vl` — the sole formatter; the TS `format.ts` is
+retired), brains in `build/vl-compiler.wasm`. Iteration: `scripts/refresh-compiler.sh` refreshes the
+seed from current `compiler/*.vl` in ~3s.*
 
 - 🟡 **C5. Distribution (public release).** REMAINING: tag / brew tap / sha256 bump — decoupled
   from all compiler work. (Shipping the deno binary: `deno task compile`/`smoke` already pass;

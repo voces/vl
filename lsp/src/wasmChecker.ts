@@ -435,12 +435,11 @@ export type WasmChecker = {
     },
   ) => Promise<WasmOccurrence[]>;
   /**
-   * Whole-document formatting (kill-TS step 1, the `format.ts` consumer): the
-   * canonical reprint of `source` via the self-hosted formatter (`format.vl`'s
-   * `formatSrc`), or undefined when the source has a parse error (the driver
-   * returns -1) or the seed predates the format exports — the host then falls
-   * back to the TS `format()`. Synchronous: formatting is single-file, so no
-   * module fetch / `prepare` is needed.
+   * Whole-document formatting: the canonical reprint of `source` via the
+   * self-hosted formatter (`format.vl`'s `formatSrc`), or undefined when the
+   * source has a parse error (the driver returns -1) or the seed predates the
+   * format exports — the host then makes no edits. Synchronous: formatting is
+   * single-file, so no module fetch / `prepare` is needed.
    */
   formatSrc: (source: string) => string | undefined;
   /**
@@ -1125,7 +1124,7 @@ export const createWasmChecker = (
 
   // Formatting rides the same seed as the other Stage-1+ exports; an older seed
   // (or a future one built without the formatter) lacks `formatSrc`/`fmtByteAt`,
-  // so the method yields undefined and the host falls back to the TS `format()`.
+  // so the method yields undefined and the host makes no edits.
   const formatSrc = (source: string): string | undefined => {
     const exp = instantiate();
     if (

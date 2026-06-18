@@ -901,11 +901,12 @@ const check = async (args: string[]): Promise<void> => {
 
 // --- fmt ------------------------------------------------------------------
 
-// The AST-driven formatter (compiler/format.ts) rewrites source into canonical
-// form: it parses to the typed AST and regenerates source from it (spans +
-// comment list + the reprint-fidelity fields), reflowing over-long calls /
-// literals / boolean chains and collapsing them back when they fit. `fmt` is a
-// thin I/O shell around the pure `format()`:
+// The AST-driven formatter (`compiler/format.vl`, via the compiled seed)
+// rewrites source into canonical form: it parses to the typed AST and
+// regenerates source from it (spans + comment list + the reprint-fidelity
+// fields), reflowing over-long calls / literals / boolean chains and collapsing
+// them back when they fit. `fmt` is a thin I/O shell around the seed's
+// `formatSrc`:
 //
 //   vl fmt <file.vl>        print the formatted source to stdout
 //   vl fmt -w <path>        rewrite the file(s) in place
@@ -917,10 +918,9 @@ const check = async (args: string[]): Promise<void> => {
 // in-flight CLI work without touching the run/build/check regions.
 
 // Self-hosted formatter via the compiled seed (`build/vl-compiler.wasm`) — the
-// same driver `formatSrc` the LSP and the native `vl fmt` use. Repoints `fmt`
-// off the TS `format()` (kill-TS: drop the `compiler/format.ts` consumer). The
-// seed is instantiated once and reused; formatting is single-file and purely
-// syntactic, so the source is staged directly (no module resolution).
+// same `formatSrc` driver the LSP and the native `vl fmt` use. The seed is
+// instantiated once and reused; formatting is single-file and purely syntactic,
+// so the source is staged directly (no module resolution).
 type SeedExports = Record<string, (...args: number[]) => number>;
 let seedExports: SeedExports | undefined;
 const seedPath = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
