@@ -200,9 +200,10 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   (yet).** The design's end-state is to write the collection in `.vl` over an
   intrinsic floor (ports for free under self-hosting), but that needs a module
   system VL doesn't have. So v1 lowers `T[]` to a `{backing,len,cap}` WasmGC
-  struct with lazily-emitted **per-element-wasm-type helpers** in
-  `compiler/builtins/lists.ts` — exactly how strings already work
-  (`__string_eq__`). Migrate to `.vl`-std when modules land. The _type_
+  struct with lazily-emitted **per-element-wasm-type helpers** (in the self-hosted
+  `compiler/wasmEmit.vl`; this was `compiler/builtins/lists.ts` in the retired TS
+  compiler) — exactly how strings already work (`__string_eq__`). Migrate to
+  `.vl`-std when modules land. The _type_
   representation stays `{[i32]:T}` (so generic inference/equality/`.length` are
   untouched — it is purely a codegen change); `string` is excluded from the
   struct rep via `isListType = arrayElementType(t) && t.name===undefined`. (B6)
