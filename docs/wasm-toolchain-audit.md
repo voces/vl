@@ -155,7 +155,7 @@ Three independent layers ([Module docs](https://docs.wasmtime.dev/api/wasmtime/s
    `Module::serialize()` produce an AOT artifact; `Module::deserialize_file()` memory-maps it back
    with **no compilation at all** (lazily paged, `unsafe` because the artifact is trusted native
    code; version-locked to the exact wasmtime release, with deterministic rejection on mismatch).
-   `scripts/build-compiler-wasm.ts` should emit `vl-compiler.cwasm` next to the `.wasm` (via a tiny
+   the seed pipeline should emit `vl-compiler.cwasm` next to the `.wasm` (via a tiny
    `vl-host` subcommand, e.g. `vl precompile`), and `compile_vl()` should prefer it. This removes
    the "cranelift recompiles the compiler module each run" cost **entirely** — the single biggest
    structural fix available for batch latency. The ROADMAP's H-M2 note already assumes this

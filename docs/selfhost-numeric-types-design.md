@@ -47,7 +47,7 @@ and claim below was grepped/read out of the tree, not estimated.
 
 ### 1.3 Live miscompile evidence (reproduced via the native tool)
 Built `scripts/vl-host` (cargo, release) + seeded `build/vl-compiler.wasm`
-(`deno run -A scripts/build-compiler-wasm.ts`), then
+(`scripts/fetch-seed.sh`), then
 `vl run <f> --compiler build/vl-compiler.wasm`:
 
 | Program            | Output | Expected | Cause |

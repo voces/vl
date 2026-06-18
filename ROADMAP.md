@@ -8,9 +8,11 @@ concrete types), compiling to **lean WebAssembly**. Deliverables: an **LSP-backe
 
 **Self-hosting status:** the compiler is written in VL (`compiler/*.vl` — lexer/ast/parser/
 typecheck/wasmEmit) and **compiles itself to a byte-exact fixpoint** (stage3 == stage4,
-`scripts/native-fixpoint.sh`, ~6s, no TS past the seed; gated in CI by `ci-native`). The TS host
-(`compiler/*.ts`) remains as the bootstrap seed builder + the spec oracle while the self-host
-closes its corpus-coverage tail.
+`scripts/native-fixpoint.sh`, ~6s, no TS past the seed; gated in CI by `ci-native`). The TS
+genesis is gone — the seed's source of truth is the published `seed-latest` release (self-compiled
+each master push), with the immutable `seed-v0` anchoring the lineage. The TS host (`compiler/*.ts`)
+now survives only as the spec oracle and the deno-compiled release binary (`cli.ts`), both slated to
+go; see "Kill the TS host" below.
 
 Status: 🟡 partial · ⬜ not started.
 

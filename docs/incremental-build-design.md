@@ -111,9 +111,11 @@ layer (peer to `cli.ts`; the runtime-agnostic core stays Deno-free):
 - `cacheKey(...)`, `readCachedBlob`/`writeCachedBlob` — atomic content-addressed
   blob store under `<tmpdir>/vl-cache` (`VL_CACHE_DIR` override, `VL_NO_CACHE`).
 
-**Whole-compile cache** (`tests/_selfhost_cache.ts`): keyed on source + the whole
-compiler/toolchain. A full hit is free; busts on any compiler edit. Warm
-`deno task test` ≈ 5 s (vs ~16 s).
+**Whole-compile cache** (`tests/_selfhost_cache.ts`, REMOVED): keyed on source +
+the whole compiler/toolchain — it memoized the TS `compile()` for the deno test
+suite. Deleted with the TS genesis/compile path (the corpus oracle now runs on the
+seed under wasmtime, which has its own seed cache); kept here as a record of the
+caching shape.
 
 **Optimize-stage cache** (`toWasm` `OptimizeCache` seam + `createOptimizeCache()`):
 keys the `optimize()` result on `(unoptimized bytes ⊕ binaryen pin ⊕ os/arch)`.

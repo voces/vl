@@ -74,8 +74,10 @@ scripts/refresh-compiler.sh     # rebuild the seed from current source (self-com
 scripts/native-fixpoint.sh      # prove stage3 == stage4 byte-identical
 ```
 
-The *first* seed (genesis) is fetched from a published release artifact via
-`scripts/fetch-seed.sh` (`--ts-genesis` is an offline break-glass). Full design in
+The seed is fetched from a published release artifact via
+`scripts/fetch-seed.sh` (republished on every master push; the immutable `seed-v0`
+release anchors the lineage). There is no TypeScript genesis path — the project
+keeps no second compiler. Full design in
 [`docs/genesis-design.md`](./docs/genesis-design.md).
 
 ## Developer tooling (deno)

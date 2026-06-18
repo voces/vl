@@ -10,7 +10,7 @@ Branch: `selfhost-lambdas-design` off `origin/master` (`dad9804`).
 
 Every count and claim below was grepped/driven out of the tree on this branch, not
 estimated. The native self-host tool (`scripts/vl-host/target/release/vl`, cargo
-release) + seed (`build/vl-compiler.wasm`, `deno run -A scripts/build-compiler-wasm.ts`)
+release) + seed (`build/vl-compiler.wasm`, `scripts/fetch-seed.sh`)
 were used to drive each corpus file and capture exact stage + message.
 
 ---
