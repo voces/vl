@@ -16,8 +16,12 @@
 # A failure prints positions against the assembled file; to get source-file
 # positions while developing, run `vl check <file.vl>` (or `vl check compiler/`).
 #
-# fmt is NOT gated here yet — `vl fmt` needs a hardening pass first (wrapped
-# object-literal indentation); add `vl fmt --check` here once that lands.
+# fmt IS gated here too (below): `vl fmt --check` over the source `.vl`
+# (compiler/, std/, scripts/) — the directory walk only visits `.vl`, so the
+# `.ts`/`.sh` alongside scripts/ are ignored. `tests/` is excluded by
+# construction (the deliberately-malformed fixture corpus is never fmt-clean and
+# is not source we ship). Unlike the lint above, fmt is PER-FILE (it needs no
+# cross-file resolution), so the real source files are checked directly.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -43,4 +47,12 @@ echo "== self-lint: the assembled compiler =="
 echo "== self-lint: std/ =="
 "$VL" check std/ --severity info
 
-echo "self-lint clean ✅"
+# fmt gate: the source tree must be `vl fmt`-clean. `--check` exits non-zero on
+# any drift (set -e fails the run), naming the offending file on stderr. tests/
+# is NOT passed in.
+echo "== fmt-check: compiler/ std/ scripts/ =="
+"$VL" fmt --check compiler/
+"$VL" fmt --check std/
+"$VL" fmt --check scripts/
+
+echo "self-lint + fmt-check clean ✅"
