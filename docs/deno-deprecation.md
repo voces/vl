@@ -26,7 +26,7 @@ Deno fills **six distinct roles**. Each is removed by a different front:
 
 | # | Role | What depends on it | Removed by |
 |---|------|--------------------|------------|
-| J0 | **TS-oracle brain** | the `compiler/*.ts` graph, corpus adjudication, `deno check`/`deno lint` (`compiler/cli.ts` retired) | Killing the TWO COMPILERS (ROADMAP Next) |
+| J0 | **TS-oracle brain** | ~~the `compiler/*.ts` graph, corpus adjudication~~ → DONE: TS front end DELETED; `deno check`/`deno lint` now cover only the surviving type leaves + JS tooling | — (the TWO COMPILERS are now one) |
 | J1 | **V8 wasm executor** | `runWasm` in the corpus/selfhost tests; the deno-side golden + emit suites | Folding RUN/CHECK onto the native (wasmtime) tier — F-tiers |
 | J2 | **Test harness** | all 52 `tests/*.ts` (`Deno.test`) | `vl test` for behavioral `.vl`; `node --test` for TS-infra tests |
 | J3 | **Build/dev scripts** | `deno run scripts/*.ts` | port load-bearing scripts to `.vl`/Node; retire/move dev-only ones |
@@ -42,17 +42,18 @@ already removes it; spend effort only on the genuinely Deno-specific residue (J1
 
 ## Role-by-role detail
 
-### J0 — the TS-oracle brain (rides the TS-host kill; no Deno-specific work)
+### J0 — the TS-oracle brain — DONE (Deno's biggest role, gone)
 - `compiler/cli.ts` (the old Deno entry point for `vl build/check/run/fmt`) is RETIRED — the native
   `vl` (`scripts/vl-host`, wasmtime) is the sole CLI and ships as a self-contained binary with the
   seed embedded, zero Deno.
-- The corpus oracle currently adjudicates via the TS compiler under Deno. ROADMAP Next step 0
-  flips it to the WASM compiler under Deno (one brain, two engines), and the native tier
-  (`ci-native`) already adjudicates under wasmtime.
-- `deno check compiler/*.ts` + `deno lint` (CI `ci` job) gate the TS source — they exist exactly as
-  long as the TS source does. The `.vl` equivalent is the native checker + `lint.vl` (already
-  ported), so nothing new is needed for the VL side.
-- **Action:** none beyond the existing "Kill the TS host" front. Track it; don't block it.
+- The **TS compiler front end is DELETED** (`compiler/*.ts` core graph + `checker-parity-sweep.ts`,
+  ~18.3K LOC). The corpus oracle is `cases_wasm_test.ts` (the seed under Deno) + the native
+  wasmtime tier (`ci-native`) — one brain, two engines, zero TS. Only the dependency-free type
+  leaves `coreTypes.ts`/`diagnostics.ts` remain.
+- `deno check compiler/*.ts` + `deno lint` now cover just those leaves + the JS-side tooling; the
+  `.vl` compiler is checked by the native checker + `lint.vl` (`lint-self.sh`, `ci-native`).
+- **Action:** none — done. What remains under Track J is the genuinely Deno-specific residue
+  (J1–J6: the V8 executor, harness, dev scripts, bundling, the teardown).
 
 ### J1 — the V8 wasm executor (🟡 in progress as F-tiers)
 - Tests execute emitted wasm with `runWasm` (Deno's V8). The native tier runs the *same bytes*

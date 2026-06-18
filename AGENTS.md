@@ -38,10 +38,12 @@ file; the lexer/parser are the grammar.
 
 ## Hard constraints
 
-- **The compiler core is runtime-agnostic** — `compiler/*.ts` is bundled into the Node LSP server and
-  the browser playground (and runs under Deno in the test suite). Keep it **side-effect-free** with **no
-  unguarded `Deno`/`process` globals**. Runtime-specific code lives in `lsp/` (Node) and the Deno
-  test/build scripts; the shipping CLI is the native Rust host (`scripts/vl-host`), not TS.
+- **The TS compiler is gone — the compiler is `compiler/*.vl` (the wasm seed).** The TS front end was
+  deleted; only the dependency-free type leaves `compiler/coreTypes.ts` + `compiler/diagnostics.ts`
+  remain (the diagnostic/position vocabulary the Node LSP and browser playground import — both drive
+  the seed for all checking). Keep those leaves **side-effect-free** with **no `Deno`/`process`
+  globals**. The shipping CLI is the native Rust host (`scripts/vl-host`); language/semantics changes
+  land once, in the `.vl` source.
 - **WasmGC** is the allocation model; lean on binaryen's optimizer (Heap2Local) rather than hand-rolling
   scalarization. See `DECISIONS.md`.
 

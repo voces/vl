@@ -12,13 +12,22 @@ Organized by area. Triage freely.
 
 ## Self-host migration (kill-TS)
 
-- **Two parallel compilers.** `compiler/*.ts` (host) and `compiler/*.vl`
-  (self-host) implement the same front end twice. This is intentional, transient
-  debt — the whole kill-TS effort is paying it down — but until `*.ts` is deleted
-  every language/semantics change must land in BOTH, and the test suite carries
-  parity harnesses (`selfhost_*_test.ts`) whose only reason to exist is to prove
-  the two agree. Tracked by the kill-TS roadmap (formatter parity → LSP → cli →
-  delete `*.ts`).
+- **Native checker diagnostic-span polish (ex-parity residuals).** When the TS
+  checker + its parity sweep were retired, the native checker was at accept/reject
+  VERDICT parity over the single-file corpus (456 files) — but 81 STRUCTURAL
+  divergences remained vs the frozen TS reference, none a verdict disagreement (no
+  program native accepts that TS rejected, or vice versa). Breakdown: **74
+  span-only** — both emit the same error count, the native caret sits at a different
+  column, often a BETTER one (e.g. `&` integer-only anchored at the operand; `cannot
+  infer` at the binding's use); **4 where native is STRICTER** — it catches an error
+  frozen-TS missed (native is correct); **3 where TS emits an extra secondary/cascade
+  diagnostic on a file both reject** (`trailing-comma-illegal`, `err-bad-hex-digit`,
+  `soundness/not-is-guard-no-divergence-no-narrow` — native reports 1 of 2; the
+  rejection stands). These are diagnostic ergonomics, not soundness. The native
+  checker is the spec now, so "match the TS span" is no longer the goal — fix a span
+  or wording only where it is genuinely worse. (The full bucket list lived in
+  `/tmp/checker-parity.txt`, regenerable only while a TS checker existed; this entry
+  is the durable record.)
 - **Formatter divergences documented as "limits, not bugs."** `compiler/format.vl`
   header lists three intentional divergences from `format.ts` (kept `Paren` nodes,
   desugared `a += b`, un-ported verbatim fallback). `[MOSTLY PAID]` — the

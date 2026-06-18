@@ -10,14 +10,17 @@ concrete types), compiling to **lean WebAssembly**. Deliverables: an **LSP-backe
 typecheck/wasmEmit) and **compiles itself to a byte-exact fixpoint** (stage3 == stage4,
 `scripts/native-fixpoint.sh`, ~6s, no TS past the seed; gated in CI by `ci-native`). The TS
 genesis is gone — the seed's source of truth is the published `seed-latest` release (self-compiled
-each master push), with the immutable `seed-v0` anchoring the lineage. The TS host (`compiler/*.ts`)
-now survives ONLY as the spec oracle (`checker-parity-sweep.ts`) — the deno-compiled `cli.ts` release
-binary is retired (the native `vl` host ships with the seed embedded); see "Kill the TS host" below.
+each master push), with the immutable `seed-v0` anchoring the lineage. **The TS host is DELETED** —
+the ~18K-LOC `compiler/*.ts` front end, the `cli.ts` release binary, and the `checker-parity-sweep.ts`
+oracle are all gone; only the dependency-free type leaves (`coreTypes.ts`/`diagnostics.ts`) remain for
+the LSP/playground. The self-hosted `compiler/*.vl` is the one and only compiler.
 
 Status: 🟡 partial · ⬜ not started.
 
-**Repo layout:** `compiler/` — the language core (compile, toAST, typecheck, toWasm, defaultScope) ·
-`lsp/` — the VS Code extension + LSP server over the core · `grammar/` — the `.g4` spec (reference
+**Repo layout:** `compiler/` — the self-hosted compiler (`*.vl` — lexer/parser/typecheck/wasmEmit,
+built to the wasm seed; the only `.ts` left are the `coreTypes`/`diagnostics` type leaves) ·
+`scripts/vl-host/` — the native Rust `vl` host · `lsp/` — the VS Code extension + LSP server (drives
+the seed) · `grammar/` — the `.g4` spec (reference
 only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs/` ·
 `reference/` — retired ts-interpreter. Tracks are **independent** unless a dependency is called out.
 
@@ -34,35 +37,23 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ## Next (highest leverage)
 
-- **Kill the TS host (the new front).** Corpus parity reached (sweep 312/316; → `CHANGELOG.md`
-  rounds 5–7), so retire the TS compiler in stages — make it unnecessary, then delete.
-  **STANDING POLICY (maintainer): no parity-BACKWARDS work — new language/module/std features are
-  NATIVE-ONLY; the TS compiler is feature-frozen and never grows a twin of a native feature.**
-  The structural enabler is step 0; until it lands, a corpus case for a native-only feature
-  cannot pass the TS-driven tier, which is the forcing function to remove:
-  0. ⬜ **Flip the corpus oracle off the TS compiler.** `cases_test`-class corpus adjudication
-     runs the WASM compiler under deno (the harness stays; the TS compiler leaves the gate
-     path): compile via `build/vl-compiler.wasm` (the #345 loader pattern), run emitted bytes
-     under V8 (`runWasm`), same directives. After this, the corpus gates are wasm-under-deno +
-     native-under-wasmtime — one brain, two engines, zero TS. **Killing the TWO COMPILERS is the
-     top priority** — and it is the first and largest leg on the road to killing Deno: it deletes
-     Deno's biggest role (the TS-oracle brain) outright. Deno itself comes off afterward (Track J,
-     the follow-through); it is no longer treated as permanent, but it is sequenced behind this
-     front, not run in parallel with it.
-  1. 🟡 **LSP-on-wasm.** Spike verdict GO (wasm checker 30–60× the TS checker; Stage 1 —
-     `vital.checker: ts|wasm|both` — shipped, → `CHANGELOG.md`). The batch parity instrument
-     (`scripts/checker-parity-sweep.ts`) holds the divergence inventory (83, mostly span
-     anchors). REMAINING: Stage 2 (symbol occurrences + binding types ported into
-     parser.vl/typecheck.vl, driver query exports for def/refs/hover) and Stage 3 (members,
-     doc comments, a .vl lint pass).
-  2. ⬜ Delete the gated deno-side RUN half + its 305-file whitelist outright (see F-tiers);
-     the deno-side CHECK verdicts fold into the oracle flip (step 0).
-  3. ⬜ `std:` Phase 2 (H0) written in VL — DESIGNED: `docs/std-design.md` (the `std:` scheme,
-     hybrid delivery, the two-primitive intrinsic floor + `__trap__`, slices 0–6 with gates; six
-     open decisions flagged for the maintainer). Doubles as the demand-driven discovery engine
-     for the remaining emitter long tail (each gap fails loudly).
-  4. Once the `.vl` compiler is the spec, the parked soundness xfails (arith-hole-operand — A13;
-     array-element-recursion — i32-keyed maps) become fixable bugs, not parity constraints.
+- ✅ **Kill the TS host. DONE — the TWO COMPILERS are now one.** The TS compiler core
+  (`compiler/*.ts` front end + `cli.ts` + the `checker-parity-sweep.ts` oracle) is DELETED; the
+  self-hosted `compiler/*.vl` (the wasm seed) is the sole compiler. Got here in stages:
+  0. ✅ **Corpus oracle flipped off the TS compiler.** `cases_wasm_test.ts` (seed under deno) is
+     the sole corpus oracle, run in `ci-native`; the TS `cases_test` runner is gone.
+  1. ✅ **LSP-on-wasm.** `server.ts` is wasm-only (the `vital.checker: ts|both` modes + their
+     live parity instruments removed). The batch parity sweep reached accept/reject VERDICT parity
+     over the corpus and was retired; the residual 81 span/ergonomic deltas are recorded in
+     `docs/vl-tech-debt.md` (native is the spec now — "match the TS span" is no longer a goal).
+  Follow-through that outlived the TS kill (separate, still open):
+  - ⬜ Delete the gated deno-side RUN half + its 305-file whitelist outright (see F-tiers).
+  - ⬜ `std:` Phase 2 (H0) written in VL — DESIGNED: `docs/std-design.md` (the `std:` scheme,
+    hybrid delivery, the two-primitive intrinsic floor + `__trap__`, slices 0–6 with gates; six
+    open decisions flagged for the maintainer). Doubles as the demand-driven discovery engine
+    for the remaining emitter long tail (each gap fails loudly).
+  - The `.vl` compiler is now the spec, so the parked soundness xfails (arith-hole-operand — A13;
+    array-element-recursion — i32-keyed maps) are fixable bugs, not parity constraints.
 - ⬜ **`vl test`.** DESIGNED: `docs/test-runner-design.md` (jest-shaped `describe`/`it`/`expect`
   over `std:testing`; two-phase registration, host-driven `vlt*` protocol; `*.test.vl` discovery
   + configurable globs; files parallel by default / in-file serial, opt-in fresh-instance
@@ -86,7 +77,7 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ---
 
-## Track A — Type system (`typecheck.ts`)
+## Track A — Type system (`typecheck.vl`)
 *Blueprint: Elixir v1.20 set-theoretic types, fully-typed (no gradual escape hatch).*
 
 - 🟡 **A4. Negation types** (`!A`). REMAINING: full open-world negation tracking (needs A12).
@@ -155,7 +146,7 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ---
 
-## Track B — Codegen, memory model & runtime (`toWasm.ts`)
+## Track B — Codegen, memory model & runtime (`wasmEmit.vl`)
 *Allocation = WasmGC; binaryen stays (it doesn't block self-hosting). → `DECISIONS.md`.*
 
 - 🟡 **B2. Numeric codegen.** Hex/octal/binary literals + digit separators: SHIPPED (see
@@ -347,7 +338,7 @@ seed from current `compiler/*.vl` in ~3s.*
 ## Track F — Infrastructure & hygiene
 *Independent; do continuously.*
 
-- ⬜ **F2. Gate debug `console.log`s** in `toWasm.ts` behind a debug flag.
+- ✅ **F2. Gate debug `console.log`s** — moot: `toWasm.ts` is deleted (the `.vl` emitter has no such logs).
 - ⬜ **F4. Re-enable inline `m.validate()`** during dev for earlier failure.
 - ⬜ **F5. Settle the name** (VL vs Vital) and apply consistently.
 - ⬜ **F6. Document the build** (`deno task build`/`test`; the antlr/gradle gen step is gone).
@@ -467,11 +458,11 @@ already in flight (the TS-host kill, `vl test`, H-M2); J is the genuinely Deno-s
 plus the final teardown, sequenced after the compilers are gone (the J4 bundling swap is the one
 piece that can land early, fully decoupled).
 
-- **J0 — the TS-oracle brain (biggest role; rides the TS-host kill).** The `compiler/*.ts` graph
-  runs under Deno; corpus adjudication + emit run in Deno's V8 (`compiler/cli.ts` is retired). This
-  vanishes when the TWO COMPILERS die (see Next) — no Deno-specific work, just don't block it.
-  `deno check` / `deno lint` (the TS type+lint gate, CI) go with it; the `.vl` side is already
-  covered by the native checker + `lint.vl`.
+- ✅ **J0 — the TS-oracle brain. DONE (Deno's biggest role, gone).** The `compiler/*.ts` core
+  graph is DELETED — no more TS front end running under Deno, no V8-adjudicated corpus emit. Only
+  the dependency-free type leaves (`coreTypes.ts`/`diagnostics.ts`) remain. `deno check`/`deno lint`
+  now cover just those leaves + the JS-side tooling; the `.vl` compiler is checked by the native
+  checker + `lint.vl` (`lint-self.sh`, `ci-native`).
 - 🟡 **J1 — the V8 wasm executor.** Tests run emitted wasm via `runWasm` in Deno's V8; the native
   tier already runs the same bytes under wasmtime (`scripts/vl-host`, `ci-native`). REMAINING:
   finish folding the corpus RUN + CHECK verdicts onto the native/wasmtime tier (this is F-tiers +
