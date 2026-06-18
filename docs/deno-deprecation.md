@@ -78,17 +78,14 @@ All 52 `tests/*.ts` are `Deno.test`. Split by subject:
 - **Open decision:** `node --test` vs another runner (vitest/uvu) for the surviving JS-side tests.
   Pick once `vl test` has absorbed the behavioral corpus and the residual TS test count is known.
 
-### J3 — build/dev scripts
-`deno run scripts/*.ts`:
-- **Load-bearing** — `gen-std.ts` (embeds the `.vl` std into `std/embedded.ts`),
-  `native-golden-check.ts` (CI byte tripwire). Port to `.vl` (dogfood) or Node. (The deno
-  `build-binary.ts`/`smoke-binary.ts` are RETIRED — release distribution is the native
-  `scripts/build-binary.sh`, a thin cargo wrapper, no Deno.)
-- **Dev-only** — `checker-parity-sweep.ts` (the LSP TS-vs-wasm divergence inventory). Can lag; move
-  to Node last or retire when the TS compiler (its subject) is gone. (The `perf*.ts` benchmarks drove
-  the TS `compile()` and were RETIRED — see `CHANGELOG.md`; rebuild against the native binary if a
-  perf baseline is wanted again.)
-- Each script must be audited for `Deno.*` globals (file IO, `Deno.args`, `Deno.run`) when ported.
+### J3 — build/dev scripts — nearly done
+`deno run scripts/*.ts` is down to ONE file:
+- **`gen-std.ts`** (embeds the `.vl` std into `std/embedded.ts`) — load-bearing; port to `.vl`
+  (dogfood) once VL has file I/O, or move to Node. Audit for `Deno.*` globals (file IO, `Deno.args`)
+  when ported.
+- RETIRED already: `build-binary.ts`→native `build-binary.sh`; `smoke-binary.ts`, `perf*.ts`,
+  `checker-parity-sweep.ts` deleted with the TS compiler; `native-golden-check.ts` retired as a
+  byte-tripwire redundant with the native fixpoint + the functional corpus (→ `CHANGELOG.md`).
 
 ### J4 — bundling (independent; cleanest early win)
 - LSP: `cd lsp && deno task build` (esbuild under Deno). Playground: `playground/build.ts`,
