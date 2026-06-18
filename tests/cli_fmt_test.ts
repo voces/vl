@@ -1,8 +1,7 @@
-// Tests for `vl fmt` — the CLI formatter. As of the kill-TS port, `fmt` runs the
-// SELF-HOSTED formatter (the compiled seed's `formatSrc`), not the TS
-// `compiler/format.ts`. These drive the real CLI subprocess (arg parsing →
-// seed-backed format → stdout / in-place write / --check exit code) exactly as a
-// user runs it.
+// Tests for `vl fmt` — the CLI formatter. `fmt` runs the SELF-HOSTED formatter
+// (the compiled seed's `formatSrc`, whose logic lives in `compiler/format.vl`).
+// These drive the real CLI subprocess (arg parsing → seed-backed format →
+// stdout / in-place write / --check exit code) exactly as a user runs it.
 //
 // The seed (`build/vl-compiler.wasm`) is required; absent (fresh clone, no
 // `scripts/refresh-compiler.sh` yet) the tests self-ignore — same convention as
