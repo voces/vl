@@ -47,7 +47,18 @@ usage: vl <build|check|run|fmt> <file.vl> [-o out.wasm] [-w|--check] [--compiler
 ```
 
 The compiler seed is resolved in order:
-`--compiler <path>`  →  `$VL_COMPILER_WASM`  →  `./build/vl-compiler.wasm`.
+`--compiler <path>`  →  `$VL_COMPILER_WASM`  →  `./build/vl-compiler.wasm`  →  *embedded*.
+An explicit `--compiler`/env is honoured strictly; the embedded copy is the final
+fallback and exists only in a release build (next section).
+
+A **self-contained release binary** bakes the seed in, so a shipped `vl` is one
+file that runs anywhere with no out-of-band asset:
+
+```sh
+scripts/fetch-seed.sh                                       # seed into build/
+cargo build --release --features embed-seed \
+  --manifest-path scripts/vl-host/Cargo.toml                # single-file `vl`
+```
 
 | Command | What it does |
 |---|---|
