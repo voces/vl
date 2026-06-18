@@ -17,8 +17,10 @@
 
 import type { Context, Position, VLType } from "./ast.ts";
 
-/** What kind of thing a name binds to (drives nothing yet; useful for clients). */
-export type BindingKind = "variable" | "parameter" | "function" | "type";
+// `BindingKind` lives in the dependency-free leaf `coreTypes.ts` (shared with the
+// LSP/playground); re-exported here so the compiler's internal imports are unchanged.
+import type { BindingKind } from "./coreTypes.ts";
+export type { BindingKind };
 
 /** A single declaration: its name and the span of its defining identifier. */
 export type Binding = {

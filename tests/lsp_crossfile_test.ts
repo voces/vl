@@ -10,7 +10,7 @@
 //
 // Run: deno test -A --no-check tests/lsp_crossfile_test.ts
 
-import type { ModuleReader } from "../compiler/modules.ts";
+import type { ModuleReader } from "../compiler/coreTypes.ts";
 import {
   crossFileReferences,
   detectProjectRoot,

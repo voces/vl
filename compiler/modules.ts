@@ -49,21 +49,11 @@ import { defaultScope } from "./defaultScope.ts";
 import { SymbolTable } from "./symbols.ts";
 import { rewriteNames } from "./moduleRewrite.ts";
 
-/** A resolved module specifier — the absolute-ish key the graph dedupes on. */
-type ModuleKey = string;
-
-/**
- * Reads a module's source given its resolved key, or returns `undefined` when no
- * such module exists. Injected by the caller (filesystem in the CLI, an in-memory
- * map in tests). Keys are whatever `resolveSpecifier` produces — for relative
- * imports, a normalized path with the `.vl` extension appended.
- */
-export type ModuleReader = (key: ModuleKey) =>
-  | string
-  | undefined
-  | Promise<
-    string | undefined
-  >;
+// `ModuleKey` + `ModuleReader` live in the dependency-free leaf `coreTypes.ts`
+// (shared with the LSP/playground); re-exported here so the compiler's internal
+// imports are unchanged.
+import type { ModuleKey, ModuleReader } from "./coreTypes.ts";
+export type { ModuleKey, ModuleReader };
 
 /** One parsed module plus its resolved key and per-module rename map. */
 type LoadedModule = {

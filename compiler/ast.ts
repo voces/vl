@@ -1,8 +1,11 @@
 // AST + type-system node definitions for VL. Pure types, no runtime.
 
 // A source position: 1-based line, 0-based column (matching the convention the
-// diagnostics layer expects — see `rangeFromCtx` in compile.ts).
-export type Position = { line: number; column: number };
+// diagnostics layer expects — see `rangeFromCtx` in compile.ts). Defined in the
+// dependency-free leaf `coreTypes.ts` (shared with the LSP/playground) and
+// re-exported here so the compiler's internal imports are unchanged.
+import type { Position } from "./coreTypes.ts";
+export type { Position };
 
 // A source span attached to AST/diagnostic nodes for error reporting. `start` is
 // the first character (inclusive); `stop` is one past the last character

@@ -21,8 +21,7 @@
 // positions; the host wraps the results in the real `InlayHint` / `SemanticTokens`
 // shapes.
 
-import type { Position } from "../../compiler/ast.ts";
-import type { BindingKind } from "../../compiler/symbols.ts";
+import type { BindingKind, Position } from "../../compiler/coreTypes.ts";
 
 // ---- semantic tokens (D5) ---------------------------------------------------
 
