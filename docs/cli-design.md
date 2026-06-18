@@ -213,9 +213,11 @@ host path until the protocol is proven on `check`.
    retire the Rust-side fmt walk/glob (#429).
 4. **`vl check --fix`** — VL fix-edit computation (prefer-const, unused-var
    `_`-prefix) + `CMD_WRITE_FILE`.
-5. **Retire `cli.ts` + the `cli_*` tests** — repoint the behavioral ones
-   (`cli_severity`/`cli_fmt`/`cli_fix`) to drive the `vl` binary; the TS-internal
-   `cli_excludes` unit test + the binaryen-specific `cli_codegen` retire.
+5. **Retire `cli.ts` + the `cli_*` tests** — DONE. The behavioral tests were
+   repointed to drive the native `vl` binary (`vl_check_severity`/`_codegen`/
+   `_exclude`/`_fix`) and `compiler/cli.ts` is deleted, along with the `deno compile`
+   release path it fed (`build-binary.ts`/`smoke-binary.ts` → native
+   `build-binary.sh`). See `CHANGELOG.md`.
 6. **`run`/`build` policy** — move arg parsing/output framing onto the protocol if
    it pays; keep wasm-exec + binaryen as host capabilities.
 

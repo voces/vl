@@ -1,10 +1,16 @@
-# Release pipeline for the native `vl` binary (roadmap C5 / H-M1).
+# Release pipeline for the native `vl` binary (roadmap C5 / H-M1 / H-M2).
 #
-# DRAFT — committed but intentionally NOT wired to publish. It cross-compiles
-# the CLI for every supported target via `deno compile --target` and uploads
-# the binaries as workflow artifacts. Promoting these to an actual public
-# release (GitHub Release / Homebrew tap) is left as a deliberate TODO below so
-# nothing ships by accident from this branch.
+# DRAFT — committed but intentionally NOT wired to publish. It builds the native
+# Rust `vl` host with the compiler seed EMBEDDED (`--features embed-seed`, via
+# scripts/build-binary.sh) for every supported target and uploads each as a
+# workflow artifact. A shipped `vl` is a single self-contained file — no V8/node/
+# binaryen runtime (the brains are the embedded wasm seed). Promoting these to an
+# actual public release (GitHub Release / Homebrew tap) is left as a deliberate
+# TODO below so nothing ships by accident.
+#
+# Unlike the retired `deno compile` path (which cross-built all targets from one
+# ubuntu runner), the Rust toolchain builds per-OS: ubuntu for both Linux arches
+# (aarch64 via a cross linker), macOS for both Darwin arches, Windows for win-x64.
 #
 # Versionless per the C5 decision (DECISIONS.md). When H5 introduces real
 # versioning, switch the trigger to `on: push: tags: ['v*']` and add the
@@ -25,40 +31,81 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The five targets deno compile understands. The runner OS only affects
-        # build speed (deno cross-compiles), so a single ubuntu runner suffices.
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
-          - x86_64-pc-windows-msvc
-    runs-on: ubuntu-latest
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            host_runnable: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            host_runnable: false # cross-built on x86 — can't run here
+            cross_apt: gcc-aarch64-linux-gnu
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            host_runnable: false # cross-built on the arm64 runner
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            host_runnable: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            host_runnable: true
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # bash on every runner (incl. Windows via Git-Bash) so the shared scripts
+        # (fetch-seed.sh, build-binary.sh) run identically everywhere.
+        shell: bash
     steps:
       - uses: actions/checkout@v5
 
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
+      # rustup ships on every GitHub runner; just add the target triple. The
+      # aarch64-linux build also needs a cross linker (build-binary.sh wires the
+      # CARGO_TARGET_* linker env when it is present).
+      - name: Install cross linker (linux-arm64)
+        if: matrix.cross_apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cross_apt }}
 
-      # binaryen is an npm dep embedded into the binary by `deno compile`, so we
-      # need node_modules present at compile time.
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-      - name: Install node deps
-        run: npm ci
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
 
-      - name: Compile (${{ matrix.target }})
-        run: deno run -A scripts/build-binary.ts --target ${{ matrix.target }}
+      # The seed (build/vl-compiler.wasm) is baked into the binary by build.rs, so
+      # it must exist before the build. Fetch the published rolling seed.
+      - name: Fetch compiler seed
+        run: bash scripts/fetch-seed.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
 
-      # Record the sha256 of each artifact — these are the values that go into
-      # Formula/vl.rb (TODO_SHA256_* placeholders) when cutting a real release.
+      - name: Build ${{ matrix.target }} (embed-seed)
+        run: bash scripts/build-binary.sh --target ${{ matrix.target }}
+
+      # Prove the self-contained binary runs — but only for a target whose arch
+      # matches the runner (a cross-built artifact can't execute here). Run from a
+      # dir with no on-disk seed so the EMBEDDED seed is exercised.
+      - name: Smoke (host-runnable target)
+        if: matrix.host_runnable
+        run: |
+          suffix=""
+          case "${{ matrix.target }}" in *windows*) suffix=".exe" ;; esac
+          bin="$PWD/dist/vl-${{ matrix.target }}$suffix"
+          out="$(cd "$(mktemp -d)" && echo 'print(6 * 7)' | "$bin" run)"
+          if [ "$out" != "42" ]; then
+            echo "smoke failed: expected 42 from the embedded binary, got: $out"
+            exit 1
+          fi
+          echo "embedded binary runs ($out)."
+
+      # Record the sha256 of each artifact — the values that go into Formula/vl.rb
+      # (TODO_SHA256_* placeholders) when cutting a real release. `sha256sum`
+      # (Linux/Git-Bash) or `shasum` (macOS), whichever the runner has.
       - name: Checksum
         run: |
           cd dist
-          for f in vl-*; do shasum -a 256 "$f" | tee -a "$GITHUB_STEP_SUMMARY"; done
+          for f in vl-*; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              shasum -a 256 "$f" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

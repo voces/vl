@@ -52,9 +52,18 @@ fi
 
 # Integrity: verify against the published checksum sidecar when present. A corrupt
 # download must fail closed — a bad seed would otherwise feed refresh-compiler.sh's
-# self-compile and surface as a confusing downstream error.
+# self-compile and surface as a confusing downstream error. `sha256sum -c` (Linux,
+# Git-Bash) and `shasum -a 256 -c` (macOS) read the same sidecar format; pick
+# whichever the platform ships so a Mac fetch verifies too.
+verify_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "$1" >/dev/null
+  else
+    shasum -a 256 -c "$1" >/dev/null
+  fi
+}
 if fetch "$ASSET.sha256"; then
-  ( cd "$WORK" && sha256sum -c "$ASSET.sha256" >/dev/null ) || {
+  ( cd "$WORK" && verify_sha256 "$ASSET.sha256" ) || {
     echo "ERROR: checksum mismatch on $ASSET — refusing to install." >&2
     exit 1
   }

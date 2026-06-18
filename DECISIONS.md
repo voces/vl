@@ -226,20 +226,16 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   two statements, `a - b` is subtraction) or carries a real perf cost. Applies to
   both the TS parser and the self-hosted `parser.vl` being built for the
   bootstrap. (G8)
-- **Distribute via `deno compile`.** *(INTERIM — superseded as the destination by
-  the "Kill Deno" goal, ROADMAP Track J / J5. `deno compile` is now explicitly the
-  stopgap distribution, not the end-state: it folds into H-M2's wasmtime+WASI model
-  once the WASI driver lands. Kept until then.)* A single native `vl` binary (V8 +
-  the TS compiler + binaryen.js) through brew; versionless for now. Chosen over
-  hand-rolling a wasm-native bundle so distribution ships now, decoupled from
-  self-hosting (H-M2). Verified: `npm:binaryen@130` is a single-file Emscripten
-  build with the wasm inlined as base64, so it instantiates inside the compiled
-  binary with no special flags. Tooling: `scripts/build-binary.ts`,
-  `scripts/smoke-binary.ts`. Compile with `--node-modules-dir=none --no-lock` so
-  the binary embeds only cli.ts's import graph (binaryen), not the local
-  node_modules trees (incl. `lsp/node_modules`) nor the lsp deps in the shared
-  `deno.lock` — without those flags the binary balloons by ~2MB of unused
-  vscode-language* packages. (C5)
+- **Distribute via `deno compile`.** *(RETIRED — replaced by the native `vl` host
+  (H-M2): `cargo build --features embed-seed` produces a single self-contained Rust
+  binary with the compiler seed baked in, no V8/node/binaryen runtime. The
+  `deno compile` path + its `compiler/cli.ts` entry, `scripts/build-binary.ts`, and
+  `scripts/smoke-binary.ts` are deleted; `release.yml` builds the native binary
+  per-OS via `scripts/build-binary.sh`. See `CHANGELOG.md`.)* The original interim
+  decision: a single native `vl` binary (V8 + the TS compiler + binaryen.js) through
+  brew, versionless — chosen so distribution shipped early, decoupled from
+  self-hosting. It served until the self-hosted seed + native host made the TS
+  compiler unnecessary in the shipped artifact. (C5)
 - **Self-hosted WASM emission: emit bytes directly + optional `wasm-opt`.**
   binaryen's npm build is JS-bound (Emscripten glue, not a standalone WASI
   module), so the self-hosted compiler emits the wasm binary encoding itself and

@@ -11,8 +11,8 @@ typecheck/wasmEmit) and **compiles itself to a byte-exact fixpoint** (stage3 == 
 `scripts/native-fixpoint.sh`, ~6s, no TS past the seed; gated in CI by `ci-native`). The TS
 genesis is gone — the seed's source of truth is the published `seed-latest` release (self-compiled
 each master push), with the immutable `seed-v0` anchoring the lineage. The TS host (`compiler/*.ts`)
-now survives only as the spec oracle and the deno-compiled release binary (`cli.ts`), both slated to
-go; see "Kill the TS host" below.
+now survives ONLY as the spec oracle (`checker-parity-sweep.ts`) — the deno-compiled `cli.ts` release
+binary is retired (the native `vl` host ships with the seed embedded); see "Kill the TS host" below.
 
 Status: 🟡 partial · ⬜ not started.
 
@@ -299,9 +299,10 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 retired), brains in `build/vl-compiler.wasm`. Iteration: `scripts/refresh-compiler.sh` refreshes the
 seed from current `compiler/*.vl` in ~3s.*
 
-- 🟡 **C5. Distribution (public release).** REMAINING: tag / brew tap / sha256 bump — decoupled
-  from all compiler work. (Shipping the deno binary: `deno task compile`/`smoke` already pass;
-  the native `vl` ships under H-M2's model.)
+- 🟡 **C5. Distribution (public release).** The shipped artifact is now the NATIVE `vl` host with
+  the seed embedded (`--features embed-seed`; `release.yml` builds all 5 targets, `build-binary.sh`
+  locally) — the `deno compile cli.ts` path is retired. REMAINING: tag / brew tap / sha256 bump
+  (the publish job + Formula are drafts) — decoupled from all compiler work, deferred to H5.
 - ⬜ **C-cli polish.** `vl build` to stdout when no `-o` (decided: yes, pipe-friendly); WAT output
   (`--wat`, via wasm-tools or wasm-opt); surfacing diagnostics with spans once the spans rungs land.
 
@@ -466,11 +467,11 @@ already in flight (the TS-host kill, `vl test`, H-M2); J is the genuinely Deno-s
 plus the final teardown, sequenced after the compilers are gone (the J4 bundling swap is the one
 piece that can land early, fully decoupled).
 
-- **J0 — the TS-oracle brain (biggest role; rides the TS-host kill).** `compiler/cli.ts` + the
-  `compiler/*.ts` graph run under Deno; corpus adjudication + emit run in Deno's V8. This vanishes
-  when the TWO COMPILERS die (see Next) — no Deno-specific work, just don't block it. `deno check`
-  / `deno lint` (the TS type+lint gate, CI) go with it; the `.vl` side is already covered by the
-  native checker + `lint.vl`.
+- **J0 — the TS-oracle brain (biggest role; rides the TS-host kill).** The `compiler/*.ts` graph
+  runs under Deno; corpus adjudication + emit run in Deno's V8 (`compiler/cli.ts` is retired). This
+  vanishes when the TWO COMPILERS die (see Next) — no Deno-specific work, just don't block it.
+  `deno check` / `deno lint` (the TS type+lint gate, CI) go with it; the `.vl` side is already
+  covered by the native checker + `lint.vl`.
 - 🟡 **J1 — the V8 wasm executor.** Tests run emitted wasm via `runWasm` in Deno's V8; the native
   tier already runs the same bytes under wasmtime (`scripts/vl-host`, `ci-native`). REMAINING:
   finish folding the corpus RUN + CHECK verdicts onto the native/wasmtime tier (this is F-tiers +
@@ -493,10 +494,10 @@ piece that can land early, fully decoupled).
   the playground (`playground/build.ts`) are esbuild-under-Deno; their deps are already
   node-resolvable (binaryen, vscode-languageserver*, monaco). Swap to esbuild-on-Node (`npm`
   scripts) — decoupled from all compiler work, the cleanest early win.
-- ⬜ **J5 — distribution.** `deno compile` builds the `vl` binary today (C5 / `release.yml` /
-  DECISIONS "Distribute via `deno compile`"). Superseded by H-M2 (wasmtime+WASI; `scripts/vl-host`
-  already exists). The `deno compile` binary is now explicitly the **interim** distribution, not
-  the destination — retire it when H-M2's WASI driver lands. (DECISIONS entry annotated.)
+- ✅ **J5 — distribution. DONE.** The `deno compile cli.ts` binary is retired; `release.yml` builds
+  the native Rust `vl` host with the seed embedded (`--features embed-seed`, via `build-binary.sh`)
+  for all 5 targets per-OS. No V8/node/binaryen in the shipped artifact. (`compiler/cli.ts` +
+  `build-binary.ts` + `smoke-binary.ts` deleted; DECISIONS C5 marked RETIRED. → `CHANGELOG.md`.)
 - ⬜ **J6 — final teardown.** Once J0–J5 land: delete `deno.json` + `deno.lock`, drop
   `denoland/setup-deno` from `ci.yml`/`pages.yml` (replace the deno cache steps with node/wasmtime),
   rewrite the AGENTS.md command list off `deno task *`, and remove the dual-runtime `no unguarded
