@@ -7,7 +7,7 @@
 // (`build/vl-compiler.wasm`); absent (fresh clone, no `refresh-compiler.sh` yet)
 // they self-ignore, the same convention as the rest of the wasm suite.
 
-import type { ModuleReader } from "../compiler/modules.ts";
+import type { ModuleReader } from "../compiler/coreTypes.ts";
 import { crossFileReferences, pathToUri } from "../lsp/src/moduleGraph.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 

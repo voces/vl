@@ -22,7 +22,7 @@
 // which `checkSrc` does NOT reset, so every check calls it).
 
 import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
-import type { ModuleReader } from "../../compiler/modules.ts";
+import type { ModuleReader } from "../../compiler/coreTypes.ts";
 
 /**
  * The seed's driver exports, as a flat numeric ABI (every arg/return is an

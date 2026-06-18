@@ -19,7 +19,7 @@ import {
   type Exports,
   type WasmChecker,
 } from "../../lsp/src/wasmChecker.ts";
-import type { ModuleReader } from "../../compiler/modules.ts";
+import type { ModuleReader } from "../../compiler/coreTypes.ts";
 import { STD_SOURCES } from "../../std/embedded.ts";
 
 // `std:` keys resolve from the generated embedded map — the no-filesystem path

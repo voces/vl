@@ -39,7 +39,7 @@ import {
   typeLabelDetail,
 } from "../../lsp/src/typeFeatures.ts";
 import type { WasmChecker } from "../../lsp/src/wasmChecker.ts";
-import type { ModuleReader } from "../../compiler/modules.ts";
+import type { ModuleReader } from "../../compiler/coreTypes.ts";
 import {
   fixableDiagnosticsForRange,
   type LspTextEdit,

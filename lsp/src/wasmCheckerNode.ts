@@ -10,7 +10,7 @@
 // types.
 
 import { readFileSync, statSync } from "node:fs";
-import type { ModuleReader } from "../../compiler/modules.ts";
+import type { ModuleReader } from "../../compiler/coreTypes.ts";
 import { withStd } from "./moduleGraph.ts";
 import { createWasmChecker, type Exports, type WasmChecker } from "./wasmChecker.ts";
 

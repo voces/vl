@@ -30,7 +30,7 @@
 // reader prefers OPEN document buffers (unsaved edits are seen) and falls back to
 // disk. Specifier resolution mirrors `compiler/modules.ts`'s `resolveSpecifier`.
 
-import type { ModuleReader } from "../../compiler/modules.ts";
+import type { ModuleReader } from "../../compiler/coreTypes.ts";
 import { STD_SOURCES } from "../../std/embedded.ts";
 import type { VLDiagnostic, VLRange } from "../../compiler/diagnostics.ts";
 import type { WasmChecker, WasmModuleSurface } from "./wasmChecker.ts";
