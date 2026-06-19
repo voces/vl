@@ -93,25 +93,22 @@ annotations (`let`/`const`). Follow-ups, in order of safety:
   a per-function slot, unlike the singleton string/i32 lists). Genuinely-required
   annotations that stay regardless: base-case-less inferred cycles (`cannot infer`)
   and object returns (structural emit identity).
-- **Lower INFERRED union/nullable returns end-to-end (remove the floor).** `[A-infer-return-join PARTIAL]`
-  Return-type inference now JOINS all returns, so a multi-return function infers the
-  true `i32 | null` / `i32 | string` (was first-wins, which dropped later branches).
-  But the EMITTER can't yet lower an un-annotated union/nullable return — the `A20`
-  return classifier (`inferRetNameOf` → `fRet*` flag) carries scalar/string/array, not
-  the union box (kind 4) / nullable-struct (kind 9) / nullable-scalar seed. So an
-  un-annotated function inferring a union/nullable hits a robustness floor (`cannot
-  infer a union/nullable return type — annotate it`) rather than a codegen crash; the
-  ANNOTATED form lowers (the annotated path seeds the return via `pendingStructIdx` /
-  the niche). Closing this = teach the A20 side table to carry union/nullable
-  classification + the box/slot (the emitter already has `fRetUni`/`fRetNul` handling
-  in the un-annotated signature path; the missing piece is SETTING them from the
-  inferred type, and seeding `return null` / the union box at the return sites that
-  currently fail with `bare null needs a struct-typed context`). SEPARATE deeper gaps
-  surfaced while scoping, NOT covered by the join fix: an `if … else …` EXPRESSION in
-  TAIL position with a `null` branch (`{ if b { 5 } else { null } }`) fails
-  `unsupported statement in body` even ANNOTATED; and `??` on a nullable SCALAR fails
-  `\`??\` is only supported on a map index get` — both are nullable-scalar codegen
-  holes independent of return inference.
+- **Lower the REMAINING inferred union returns (struct-ref unions + niches).** `[A-infer-return-join MOSTLY PAID]`
+  Return-type inference JOINS all returns (`i32 | null` / `i32 | string`, was
+  first-wins), and the emitter now LOWERS the VALUE-union / nullable-scalar cases
+  un-annotated end-to-end — driven from the checker's exported inferred name through
+  `registerValueUnionName` → `fRetUni` → `emitUnionCoerce` → `unionNameOfExpr` (the
+  same path an annotation takes; `isValueUnionName` is the gate). REMAINING (still
+  floored with `cannot infer a {union,nullable} return type — annotate it`): a union of
+  STRUCT refs (`{…} | {…}` — needs the variant-boxed ref rep + tag assignment from the
+  inferred members, not the value box) and the `boolean | null` / `string | null`
+  NICHE reps (`isValueUnionName` excludes them — the niche encoding is a sentinel, not
+  the box). Closing those = thread the inferred variant/niche structure (not just the
+  value-atom name) to the emitter's variant-box / niche return seeding. SEPARATE
+  nullable-scalar codegen holes, independent of return inference: an `if … else …`
+  EXPRESSION in TAIL position with a `null` branch (`{ if b { 5 } else { null } }`)
+  fails `unsupported statement in body` even ANNOTATED; and `??` on a nullable SCALAR
+  fails `` `??` is only supported on a map index get ``.
 - **`vl fmt -w` ≠ `vl fmt --check` on long single-line `if/else`.** `vl fmt -w` is a
   no-op (idempotent) on a long single-line `if cond { a = x } else { a = y }` that
   exceeds the wrap width, yet `vl fmt --check` rejects it (`not formatted`, exit 1) —
