@@ -699,6 +699,14 @@ let moduleGlobals: {[string]: boolean} = Map()
 // inference (the demand call stack IS the dependency-order traversal). `bodyChecked`
 // lets the real pass still check each body once (the pre-pass only resolved types).
 let topUnannotFns: i32[] = []
+// A20: parallel arrays (name -> inferred concrete return-type name) for each
+// un-annotated top-level function, exported for the emitter so it can classify a
+// return from the inferred TYPE rather than re-deriving from the return expression
+// (which misses a plain-variable return). Kept OUT of the AST `fnRet` so `fmt` never
+// re-adds the annotation. A string-VALUED map would do, but a `{[string]: string}`
+// with `?? ""` mis-lowers (nullable-ref vs ref), so use arrays. Reset per compile.
+let inferRetFn: string[] = []
+let inferRetTy: string[] = []
 let bodyChecked: {[string]: boolean} = Map()
 let inferQuiet = false
 let cycleBreakCount = 0
@@ -737,6 +745,8 @@ export function initChecker(): i32 {
   fnDeclIx = Map()
   moduleGlobals = Map()
   topUnannotFns = []
+  inferRetFn = []
+  inferRetTy = []
   bodyChecked = Map()
   inferQuiet = false
   cycleBreakCount = 0
@@ -7049,5 +7059,64 @@ export function checkProgram(rootIx: i32): i32 {
   // vocabulary (membership was enforced above; the emitter needs only the
   // runtime representation). Names without those constructs are untouched.
   canonEmitTypeNames()
+  // A20: record each un-annotated function's INFERRED concrete return name for the
+  // emitter (never the AST, so `fmt` stays oblivious).
+  let ei = 0
+  while ei < topUnannotFns.length {
+    const efn = P.nodes[topUnannotFns[ei]]
+    if efn is FuncDecl {
+      const eft = lookup(efn.fnName)
+      if eft >= 0 {
+        const eftt = T.tys[eft]
+        if eftt is TyFunc {
+          const er = eftt.fnRet
+          // Skip GENERIC functions (a `self` marker or any un-annotated param is a
+          // `TyVar` hole): their return is per-call-site, so the definition-time
+          // inferred type is a placeholder that renders to a misleading name (e.g.
+          // `sumsq(self)` → `string`). Only a fully concrete signature is elaborated.
+          let generic = false
+          const ert0 = T.tys[er]
+          if ert0 is TyVar { generic = true }
+          let gp = 0
+          while gp < eftt.fnParamTypes.length {
+            const pt = T.tys[eftt.fnParamTypes[gp]]
+            if pt is TyVar { generic = true }
+            gp = gp + 1
+          }
+          if !generic && er >= 0 && er != TY_VOID && er != TY_ERR {
+            // Only SCALAR/STRING returns — names that unambiguously round-trip through
+            // the emitter's classifier. A structural object / union / array name
+            // (`{x: i32}`, `A | B`, `Tok[]`) can mis-classify, and the emitter's
+            // expression-based fallback already handles those, so leave them be.
+            const enm = tyToStr(er)
+            if (
+              enm == "i32" ||
+              enm == "i64" ||
+              enm == "f32" ||
+              enm == "f64" ||
+              enm == "boolean" ||
+              enm == "bool" ||
+              enm == "string"
+            ) {
+              inferRetFn.push(efn.fnName)
+              inferRetTy.push(enm)
+            }
+          }
+        }
+      }
+    }
+    ei = ei + 1
+  }
   T.diags.length
+}
+
+// A20: the emitter reads this to classify an un-annotated function's return from its
+// inferred TYPE name rather than re-deriving from the return expression.
+export function inferRetNameOf(name: string): string {
+  let i = 0
+  while i < inferRetFn.length {
+    if inferRetFn[i] == name { return inferRetTy[i] }
+    i = i + 1
+  }
+  ""
 }
