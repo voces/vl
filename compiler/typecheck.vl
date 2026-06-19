@@ -683,6 +683,13 @@ let inferStack: string[] = []
 let inferObserved = -1
 let inferSawErr = false
 
+// Every top-level (module-scope) `let`/`const` NAME, hoisted in pass 1.5 so a
+// function body — checked in pass 2 OR pulled early by demand-inference — resolves
+// it regardless of source order, exactly as it already resolves a top-level
+// function. Membership also drives the pass-2 redeclare-error skip (the hoist owns
+// the canonical declaration). Reset per compile in initChecker.
+let moduleGlobals: {[string]: boolean} = Map()
+
 // Contextual callback-param inference: when checking a function-literal argument
 // whose expected type is known from the call site (a `.map`/`.filter` receiver's
 // element type, or any HOF whose param is a known `TyFunc`), the caller stashes
@@ -712,6 +719,7 @@ export function initChecker(): i32 {
   holeShapeNames = []
   holeShapeTys = []
   fnDeclIx = Map()
+  moduleGlobals = Map()
   daClear()
   daWriteTarget = -1
   inferStack = []
@@ -5683,6 +5691,65 @@ function checkProgramNode(n: Program): i32 {
     }
     hi = hi + 1
   }
+  // Pass 1.5: hoist top-level VALUE bindings (`let`/`const`) — names + types — so a
+  // function body sees every module-level value regardless of source order, exactly
+  // as pass 1 makes every top-level function visible. This makes the module scope
+  // order-independent; the annotation a forward-referenced/demand-inferred function
+  // used to NEED (so its body could resolve a later global) becomes genuinely
+  // redundant.
+  //
+  // Initialization order still matters for STRAIGHT-LINE top-level code: each global
+  // joins the definite-assignment dead-zone here (`daAdd`) and is marked assigned
+  // only when pass 2 reaches its initializer, so reading one before its `let` is a
+  // "used before initialization" (TDZ) error. A function body runs at CALL time, not
+  // at the declaration site — `checkFuncDeclNode` clears the dead-zone for the body
+  // (`daSnapshot`/`daClear`) — so a deferred read from inside a function is correctly
+  // NOT flagged. The annotation type is registered now for forward references; pass 2
+  // overwrites the binding with the final (identical, for annotated) type.
+  let mi = 0
+  while mi < stmts.length {
+    const sm = P.nodes[stmts[mi]]
+    if sm is LetDecl {
+      if moduleGlobals[sm.letName] ?? false {
+        // A genuine top-level redeclaration — reported here (pass 2 skips its own
+        // redeclare check for module globals, since the hoist owns the declaration).
+        tErr("redeclared " + sm.letName, stmts[mi])
+      } else {
+        let mty = TY_ERR
+        if sm.letType >= 0 {
+          const mtn = P.nodes[sm.letType]
+          if mtn is TypeRef {
+            const r = nameToTy(mtn.tyName)
+            if r >= 0 { mty = r }
+          }
+        } else if sm.letInit >= 0 {
+          // Un-annotated: peek ONLY at a LITERAL initializer — side-effect free. A
+          // `checkNode` here would prematurely demand-infer callees and PATCH their
+          // hoisted return types (corrupting the real pass-2 result), so a non-literal
+          // init stays an error placeholder that pass 2 overwrites with its real type.
+          // (A forward reference to an un-annotated NON-literal global is the one case
+          // still order-dependent — it carries no manifest type to hoist.)
+          const initN = P.nodes[sm.letInit]
+          if initN is NumLit {
+            if hasDot(initN.numText) { mty = TY_F64 }
+            else if intLexemeFitsI32(initN.numText) { mty = TY_I32 }
+            else { mty = TY_I64 }
+          } else if initN is StrLit {
+            mty = TY_STR
+          } else if initN is CharLit {
+            mty = TY_I32
+          } else if initN is BoolLit {
+            mty = TY_BOOL
+          }
+        }
+        declare(sm.letName, mty)
+        moduleGlobals[sm.letName] = true
+        // TDZ: in the dead-zone until pass 2 reaches the initializer.
+        daAdd(sm.letName)
+      }
+    }
+    mi = mi + 1
+  }
   // Pass 2: check every top-level statement (bodies included).
   let j = 0
   while j < stmts.length {
@@ -6485,7 +6552,13 @@ function checkNode(ix: i32): i32 {
     // chain is innermost-wins), so we check `T.scopes[top].has` — the current
     // frame only — not the full `lookup` chain.
     const dtop = T.scopes.length - 1
-    if T.scopes[dtop].has(n.letName) { tErr("redeclared " + n.letName, ix) }
+    // A module global is pre-declared by the pass-1.5 hoist, so its own pass-2
+    // declaration would falsely trip the same-frame redeclare check — skip it there
+    // (genuine top-level dups are caught in the hoist). Nested `let`s are unaffected.
+    const preHoisted = dtop == 0 && (moduleGlobals[n.letName] ?? false)
+    if !preHoisted && T.scopes[dtop].has(n.letName) {
+      tErr("redeclared " + n.letName, ix)
+    }
     declare(n.letName, bound)
     if symEnabled != 0 { symDecl(n.letName, ix, bound, 0) }
     if n.letKw == "const" {
@@ -6555,6 +6628,11 @@ function checkNode(ix: i32): i32 {
     if symEnabled != 0 { symDecl(n.frVar, ix, TY_I32, 0) }
     // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
     const daFrEntry = daSnapshot()
+    // The loop variable is always assigned in the body; clear it from the dead-zone
+    // so a body read isn't flagged when the loop var SHADOWS a still-uninitialized
+    // module global of the same name (the `daRestore` below preserves that global's
+    // TDZ for any post-loop read).
+    daMarkAssigned(n.frVar)
     checkNode(n.frBody)
     daRestore(daFrEntry)
     popScope()
@@ -6573,6 +6651,9 @@ function checkNode(ix: i32): i32 {
     if symEnabled != 0 { symDecl(n.fiVar, ix, elemTy, 0) }
     // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
     const daFiEntry = daSnapshot()
+    // See ForRange: clear the loop var from the dead-zone for the body so it can't
+    // collide with a shadowed, still-uninitialized module global of the same name.
+    daMarkAssigned(n.fiVar)
     checkNode(n.fiBody)
     daRestore(daFiEntry)
     popScope()
