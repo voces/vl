@@ -1375,6 +1375,12 @@ let fRetStrArr: i32[] = []
 // `fRetStructIdx`. The functype result is `(ref null $S)` (kind 9).
 let fRetNul: i32[] = []
 
+// Per-function `1` if the function returns `string | null` (kind 16) — the nullable raw
+// string array `(ref null $aTypeIdx)`. Drives the caller's niche detection
+// (`fnRetNulString`) so `f(x) != null` is `ref.is_null` and a `const r = f()` binding
+// resolves nullable-string. Populated by `buildFnMap` from `retNulStringFlag`.
+let fRetNulStr: i32[] = []
+
 // Parallel to `fnNames`: `1` if the i-th function RETURNS a boolean — its declared
 // return type is `boolean`/`bool`, or (un-annotated) its first valued `return` is
 // boolean-classified (`computeRetInference`). Drives the `print` import choice for a
@@ -2056,7 +2062,9 @@ function globalIsArray(name: string) {
 function globalIsString(name: string) {
   let li = globalLetOf(name)
   if li < 0 { return false }
-  letIsString(li, -1)
+  // A `string | null` (kind 16) global reads AS a string under narrowing — the global
+  // read recovers non-null (`ref.as_non_null`), and the `!= null` check reads it raw.
+  letIsString(li, -1) || letIsNulString(li, -1)
 }
 function globalIsRefArray(name: string) {
   let li = globalLetOf(name)
@@ -2181,6 +2189,78 @@ function exprNullableList(exprIx: i32, fnIx: i32) {
   false
 }
 
+// ── nullable-string (`string | null`, kind 16) predicates — the ref-rep analog of
+// the nullable-list family above; `null` is `ref.null $aTypeIdx`, `!= null` is
+// `ref.is_null`. Unlike a nullable list, an INITIALIZER can produce one (a string
+// literal, or a `string | null`-returning call), so `letIsNulString` consults the init.
+function declaredNulString(name: string) {
+  let slot = declaredSlotOf(name)
+  if slot < 0 { return false }
+  localIsRef[slot] == 16
+}
+
+function globalIsNulString(name: string) {
+  let li = globalLetOf(name)
+  if li < 0 { return false }
+  letIsNulString(li, -1)
+}
+
+function paramNulString(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return retNulStringFlag(p.parType) == 1 }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+function fnRetNulString(name: string) {
+  let i = 0
+  while i < fnNames.length {
+    if fnNames[i] == name { return fRetNulStr[i] == 1 }
+    i = i + 1
+  }
+  false
+}
+
+function letIsNulString(letIx: i32, fnIx: i32) {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      if retNulStringFlag(d.letType) == 1 { return true }
+    }
+    if d.letType < 0 { return exprNullableString(d.letInit, fnIx) }
+  }
+  false
+}
+
+// True if evaluating the expression at `exprIx` yields a `string | null` ref — a
+// nullable-string param/local/global, or a `: string | null`-returning call. Consulted
+// by the `!= null` `ref.is_null` path and the assignment/return/arg null-seeding.
+function exprNullableString(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident { return fnRetNulString(callee.identName) }
+    return false
+  }
+  if e is Ident {
+    if paramNulString(fnIx, e.identName) { return true }
+    if declaredNulString(e.identName) { return true }
+    return globalIsNulString(e.identName)
+  }
+  false
+}
+
 // The base struct index of a nullable-struct `LetDecl`: the annotation's base, or
 // the initializer's resolved struct (a nullable-returning call's `fRetStructIdx`).
 function nulRefStructIdxOfLet(letIx: i32, fnIx: i32) {
@@ -2237,6 +2317,7 @@ function buildFnMap(stmts: i32[]) {
   fRetStrArr = []
   fRetBool = []
   fRetNul = []
+  fRetNulStr = []
   fRetI64 = []
   fRetF64 = []
   fRetF32 = []
@@ -2257,6 +2338,7 @@ function buildFnMap(stmts: i32[]) {
       fRetStrArr.push(retStrArrFlag(s.fnRet))
       fRetBool.push(retBoolFlag(s.fnRet))
       fRetNul.push(retNulRefFlag(s.fnRet))
+      fRetNulStr.push(retNulStringFlag(s.fnRet))
       fRetI64.push(retI64Flag(s.fnRet))
       fRetF64.push(retF64Flag(s.fnRet))
       fRetF32.push(retF32Flag(s.fnRet))
@@ -3739,6 +3821,18 @@ let pendingF64 = false
 // `i32.const 2` (not a `ref.null`), mirroring the host's `nullSentinel`.
 let pendingNulBool = false
 
+// When emitting a bare `null` into a `string | null` (kind 16) context — a param arg,
+// a `x = null` assignment, a `return null` — the value is `ref.null $aTypeIdx` (the raw
+// string array made nullable), NOT the struct seed or the boolean sentinel. Seeded at
+// those boundaries, consumed (and reset) by the `NullLit` emit, mirroring `pendingNulBool`.
+let pendingNulString = false
+
+// Set by the `== null`/`!= null` null-check around its receiver emit so a `string | null`
+// (kind 16) ident reads as the RAW nullable ref (for `ref.is_null`), NOT recovered to a
+// non-null string. Every OTHER read of a kind-16 binding is a narrowed value use and
+// recovers non-null (`ref.as_non_null`) — see the `Ident` read in `emitExpr`.
+let pendingRawNullRead = false
+
 // ── discriminated-union table (G1: struct unions + `is`-narrowing) ────────────
 // A program may declare ONE union alias `type N = A | B | …` (a `UnionDecl`) whose
 // members are struct `type`s (each a `TypeDecl`). When a union IS declared, the
@@ -3951,6 +4045,11 @@ function collectLocals(blockIx: i32, fnIx: i32) {
           slot = addLocalName(s.letName, 1, structIndexOfLet(stmts[i], fnIx))
         } else if letIsArray(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 2, -1)
+        } else if letIsNulString(stmts[i], fnIx) {
+          // Nullable string (`string | null`, kind 16): BEFORE the string case so a
+          // nullable annotation/init doesn't collapse to the non-null kind 3 (a later
+          // `x = null` write would then be invalid).
+          slot = addLocalName(s.letName, 16, -1)
         } else if letIsString(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 3, -1)
         } else if letIsI64(stmts[i], fnIx) {
@@ -4590,6 +4689,11 @@ function exprIsStrEq(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp == "==" || e.binOp == "!=" {
+      // A comparison with `null` is a NULL-CHECK (handled by the nullable-string /
+      // -struct / -list `ref.is_null` paths), never element-wise string equality — a
+      // `string | null` operand would otherwise be element-compared against `null`.
+      if P.nodes[unwrapParen(e.binLeft)] is NullLit { return false }
+      if P.nodes[unwrapParen(e.binRight)] is NullLit { return false }
       return exprString(e.binLeft, fnIx) || exprString(e.binRight, fnIx)
     }
   }
@@ -9982,7 +10086,14 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
           // nullable-LIST cell (kind 15) likewise. A SCALAR numeric cell (i32 0 /
           // i64 10 / f64 11 / f32 13 / boolean) is not a ref, so it takes no
           // `ref.as_non_null` either. (Slice 5 adds f32/i64/f64 scalars.)
-          if (
+          // A `string | null` cell (kind 16) holds null legitimately — recover non-null
+          // only for a VALUE read; the `!= null` null-check (`pendingRawNullRead`) keeps
+          // the raw nullable ref for `ref.is_null`.
+          if gck0 == 16 {
+            if !pendingRawNullRead {
+              wU8(212) // 0xd4 ref.as_non_null
+            }
+          } else if (
             gck0 != 0 &&
             gck0 != 9 &&
             gck0 != 10 &&
@@ -9998,6 +10109,14 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
       return emitFail("emitProgram: identifier is not a parameter, local, or global")
     }
     fbLocalGet(idx)
+    // A `string | null` (kind 16) param/local read AS A VALUE recovers the non-null
+    // string ref — the checker narrowed it non-null at every such read. The `!= null`
+    // null-check sets `pendingRawNullRead` to keep the raw nullable ref for `ref.is_null`.
+    if !pendingRawNullRead {
+      if paramNulString(fnIx, e.identName) || declaredNulString(e.identName) {
+        fbRefAsNonNull() // 0xd4
+      }
+    }
     return 0
   }
   if e is Paren { return emitExpr(body, e.parInner, fnIx) }
@@ -10155,6 +10274,14 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     // not a ref) — checked before the struct seed.
     if pendingNulBool {
       fbI32Const(2)
+      return 0
+    }
+    // `null` in a `string | null` (kind 16) context — `ref.null $aTypeIdx` (the raw
+    // string array made nullable). Checked before the struct seed (a string is not a
+    // struct). Seeded at the param-arg / assignment / return boundaries.
+    if pendingNulString {
+      wU8(208) // 0xd0 ref.null
+      wSLEB(aTypeIdx)
       return 0
     }
     // A bare `null` VALUE: its target struct comes from the binding/argument/
@@ -10757,6 +10884,23 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
         // kind 15): the same `ref.is_null` lowering as the nullable struct.
         if exprNullableList(nref, fnIx) {
           if emitExpr(body, nref, fnIx) < 0 { return -1 }
+          wU8(209) // 0xd1 ref.is_null
+          if e.binOp == "!=" {
+            fbI32Eqz() // invert: non-null
+          }
+          return 0
+        }
+        // `s == null` / `s != null` over a `string | null` (kind 16): the nullable raw
+        // array ref — same `ref.is_null` lowering. Checked before the structural string
+        // equality below (which would element-compare a non-null string). The receiver
+        // is read RAW (`pendingRawNullRead`) so the kind-16 ident keeps its nullable ref
+        // instead of being recovered to non-null (which would make `ref.is_null` const 0).
+        if exprNullableString(nref, fnIx) {
+          const savedRaw = pendingRawNullRead
+          pendingRawNullRead = true
+          const re = emitExpr(body, nref, fnIx)
+          pendingRawNullRead = savedRaw
+          if re < 0 { return -1 }
           wU8(209) // 0xd1 ref.is_null
           if e.binOp == "!=" {
             fbI32Eqz() // invert: non-null
@@ -11835,12 +11979,15 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         // A `boolean | null` NICHE param position: a `null` argument is the i32
         // sentinel 2 (seed `pendingNulBool`); a boolean argument is untouched.
         let cParamNulBool = false
+        // A `string | null` param position: a `null` argument is `ref.null $aTypeIdx`.
+        let cParamNulString = false
         if cFn is FuncDecl {
           const cParams = cFn.fnParams
           if i < cParams.length {
             const cpnb = P.nodes[cParams[i]]
             if cpnb is Param {
               if tyIsNulBool(cpnb.parType) { cParamNulBool = true }
+              if retNulStringFlag(cpnb.parType) == 1 { cParamNulString = true }
             }
             if (
               vtKindOfParam(cParams[i]) == 1 ||
@@ -11916,9 +12063,12 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
             if emitUnionCoerce(body, cUNm, args[i], fnIx) < 0 { return -1 }
           } else {
             const savedCNB = pendingNulBool
+            const savedCNS = pendingNulString
             if cParamNulBool { pendingNulBool = true }
+            if cParamNulString { pendingNulString = true }
             if emitExpr(body, args[i], fnIx) < 0 { return -1 }
             pendingNulBool = savedCNB
+            pendingNulString = savedCNS
             // A nullable-REP value (a null-narrowed `S | null` param/local, or a
             // recursive `S | null` field read whose wasm slot stays `(ref null $S)`)
             // flowing into a NON-NULL `(ref $S)` param: recover the non-null ref at
@@ -12163,11 +12313,15 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           if gUNm != "" {
             if emitUnionCoerce(body, gUNm, a.binRight, fnIx) < 0 { return -1 }
           } else {
-            // A `boolean | null` NICHE global: seed the sentinel for a `null` RHS.
+            // A `boolean | null` NICHE global: seed the sentinel for a `null` RHS; a
+            // `string | null` global seeds the nullable-array ref.
             const savedGNB = pendingNulBool
+            const savedGNS = pendingNulString
             if exprNulBool(a.binLeft, fnIx) { pendingNulBool = true }
+            if exprNullableString(a.binLeft, fnIx) { pendingNulString = true }
             if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
             pendingNulBool = savedGNB
+            pendingNulString = savedGNS
           }
           pendingListKind = 0
           pendingListSlot = 0
@@ -12187,11 +12341,15 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       } else {
         // A `boolean | null` NICHE local (`x = null` / `x = b`): the i32 cell holds
         // 0/1 or the sentinel 2 — seed `pendingNulBool` so a `null` RHS emits the
-        // sentinel (a boolean RHS is a `BoolLit`, untouched).
+        // sentinel (a boolean RHS is a `BoolLit`, untouched). A `string | null` local
+        // seeds `pendingNulString` so a `null` RHS is `ref.null $aTypeIdx`.
         const savedNB = pendingNulBool
+        const savedNS = pendingNulString
         if exprNulBool(a.binLeft, fnIx) { pendingNulBool = true }
+        if exprNullableString(a.binLeft, fnIx) { pendingNulString = true }
         if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
         pendingNulBool = savedNB
+        pendingNulString = savedNS
       }
       fbLocalSet(idx) // 0x21 local.set
       return 0
@@ -13947,10 +14105,13 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     } else if letIsI64(stmtIx, fnIx) {
       if emitExprAsI64(body, s.letInit, fnIx) < 0 { return -1 }
     } else {
-      // A `boolean|null` NICHE binding lowers a bare `null` init as the sentinel 2.
+      // A `boolean|null` NICHE binding lowers a bare `null` init as the sentinel 2; a
+      // `string|null` binding lowers it as `ref.null $aTypeIdx`.
       pendingNulBool = letIsNulBoolAnn(stmtIx)
+      pendingNulString = letIsNulString(stmtIx, fnIx)
       if emitExpr(body, s.letInit, fnIx) < 0 { return -1 }
       pendingNulBool = false
+      pendingNulString = false
     }
     pendingI64 = false
     pendingStructIdx = -1
@@ -14121,6 +14282,9 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     // seed `pendingNulBool` so a `return null` emits the sentinel (the signature result
     // is already i32, `vtKindOfType` → 0). A boolean return is a `BoolLit`, untouched.
     let retNulBool = false
+    // A `string | null` return: `return null` is `ref.null $aTypeIdx` (seed
+    // `pendingNulString`); a string return is the array ref, untouched.
+    let retNulString = false
     // A UNION return type (kind 4) WIDENS a raw scalar/string/null return value
     // into the box at the return boundary (the host's return-site `coerceUnion`):
     // `function wrap(n): string | i32 { return n }` boxes `n` with its atom tag.
@@ -14138,6 +14302,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
         if isValueUnionName(im) { retUNm = im }
       }
       if tyIsNulBool(fn.fnRet) { retNulBool = true }
+      if retNulStringFlag(fn.fnRet) == 1 { retNulString = true }
     }
     // Push the return value, then the `return` instruction.
     if retF32 {
@@ -14153,9 +14318,12 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       if emitUnionCoerce(body, retUNm, s.retArg, fnIx) < 0 { return -1 }
     } else {
       const savedRNB = pendingNulBool
+      const savedRNS = pendingNulString
       if retNulBool { pendingNulBool = true }
+      if retNulString { pendingNulString = true }
       if emitExpr(body, s.retArg, fnIx) < 0 { return -1 }
       pendingNulBool = savedRNB
+      pendingNulString = savedRNS
     }
     pendingStructIdx = -1
     pendingListKind = 0
@@ -14842,6 +15010,8 @@ function checkParams(fnIx: i32) {
             // accepted — a `(ref null $lTypeIdx)` param (`i32[] | null`, kind 15)
           } else if tyIsNulBool(p.parType) {
             // accepted — a `boolean | null` NICHE param (the i32 sentinel 0/1/2)
+          } else if retNulStringFlag(p.parType) == 1 {
+            // accepted — a `string | null` param (`(ref null $aTypeIdx)`, kind 16)
           } else if ty.tyName != "i32" {
             if ty.tyName != "i64" {
               // i64 rides the 0x7e valtype (Slice 1)
@@ -15563,6 +15733,10 @@ function retNulRefFlag(tyIx: i32) {
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
       let base = nullablePartOf(ty.tyName)
+      // `string` is the raw i32 array, NOT a struct — `string | null` is the kind-16
+      // nullable-string ref (`retNulStringFlag`), never a nullable struct. Exclude it
+      // here so it isn't mis-claimed as kind 9 (which would read the box as a struct).
+      if base == "string" { return 0 }
       if base != "" {
         if structIndexOfTypeName(base) >= 0 { return 1 }
       }
@@ -15744,6 +15918,20 @@ function retBoolFlag(tyIx: i32) {
   0
 }
 
+// `1` if the type-annotation node at `tyIx` is a `string | null` — the NULLABLE string
+// ref `(ref null $aTypeIdx)`, kind 16. A `string` is the raw i32 array `(ref $aTypeIdx)`;
+// the nullable form is the same backing made nullable (`null` is `ref.null`, `!= null`
+// is `ref.is_null`). Checked in `vtKindOfType` BEFORE the bare `string` (kind 3).
+function retNulStringFlag(tyIx: i32) {
+  if tyIx >= 0 {
+    const ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if nullablePartOf(ty.tyName) == "string" { return 1 }
+    }
+  }
+  0
+}
+
 // Combine the struct/array/string flags for a type-annotation node at `tyIx` into the
 // single `pushVT` `kind` code: `1` struct, `2` array, `3` string, `0` i32. (Struct
 // wins if a name were somehow both — it cannot be, the lexemes are disjoint.) String
@@ -15755,6 +15943,7 @@ function vtKindOfType(tyIx: i32) {
   // fat-pointer, kind 14. Checked first; no other name contains an arrow.
   if tyIsFuncType(tyIx) { return 14 }
   if retNulRefFlag(tyIx) == 1 { return 9 }
+  if retNulStringFlag(tyIx) == 1 { return 16 }
   if retNulListFlag(tyIx) == 1 { return 15 }
   if retStrArrFlag(tyIx) == 1 { return 7 }
   if retF64ArrFlag(tyIx) == 1 { return 12 }
@@ -16048,6 +16237,7 @@ function globalCellKind(letIx: i32) {
       if letIsUnion(letIx, -1) { return 4 }
       if letIsStruct(letIx, -1) { return 1 }
       if letIsArray(letIx, -1) { return 2 }
+      if letIsNulString(letIx, -1) { return 16 }
       if letIsString(letIx, -1) { return 3 }
       if letIsI64(letIx, -1) { return 10 }
       if letIsF64(letIx) { return 11 }
@@ -16061,6 +16251,9 @@ function globalCellKind(letIx: i32) {
     // An un-annotated global whose init PRODUCES a union (`const a = make(42)` with
     // a union-returning `make`) carries the box (kind 4), as a local would.
     if letIsUnion(letIx, -1) { return 4 }
+    // An un-annotated global bound to a `string | null`-returning call (`const r = f()`)
+    // carries the kind-16 nullable-string cell, as a local would.
+    if letIsNulString(letIx, -1) { return 16 }
     return globalKind(d.letInit)
   }
   0
@@ -16176,6 +16369,9 @@ function fbValtypeNullable(kind: i32, structIdx: i32) {
   } else if kind == 15 {
     wU8(99) // 0x63 (ref null) — `i32[] | null` (already nullable)
     wSLEB(lTypeIdx)
+  } else if kind == 16 {
+    wU8(99) // 0x63 (ref null) — `string | null`: the nullable raw-array ref
+    wSLEB(aTypeIdx)
   } else {
     wU8(127) // 0x7f i32
   }
@@ -16264,6 +16460,11 @@ function fbValtype(kind: i32, structIdx: i32) {
     // the nullability lives in the SLOT's valtype, never a separate heap type.
     wU8(99) // 0x63 (ref null ht)
     wSLEB(lTypeIdx)
+  } else if kind == 16 {
+    // `string | null` — a NULLABLE ref to the raw string array (kind 3's backing),
+    // the nullability in the slot valtype. The param/result/local valtype path.
+    wU8(99) // 0x63 (ref null ht)
+    wSLEB(aTypeIdx)
   } else {
     wU8(127) // 0x7f i32
   }
@@ -16900,8 +17101,10 @@ function emitStartFnCode(out: i32[]) {
             if gck == 1 || gck == 9 {
               pendingStructIdx = globalCellStructIdx(globalStmts[gi])
             }
-            // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2.
+            // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
+            // a `string|null` global lowers it as `ref.null $aTypeIdx` (kind 16).
             pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
+            pendingNulString = letIsNulString(globalStmts[gi], -1)
             // A UNION cell (kind 4) coerces a raw init value into the box
             // (`let w: string | i32 = n` boxes the i32 read) — a union-valued
             // init (a union-returning call) passes through unchanged.
@@ -16919,6 +17122,7 @@ function emitStartFnCode(out: i32[]) {
               }
             }
             pendingNulBool = false
+            pendingNulString = false
             pendingMapSlot = -1
             pendingStructIdx = -1
           }
@@ -21987,6 +22191,9 @@ function paramString(fnIx: i32, name: string) {
       if p is Param {
         if p.parName == name {
           if p.parType >= 0 {
+            // A `string | null` param reads as a string under narrowing (see
+            // `declaredString`); a plain `string` param always does.
+            if retNulStringFlag(p.parType) == 1 { return true }
             const ty = P.nodes[p.parType]
             if ty is TypeRef { return nameIsString(ty.tyName) }
           }
@@ -22003,7 +22210,11 @@ function paramString(fnIx: i32, name: string) {
 function declaredString(name: string) {
   let slot = declaredSlotOf(name)
   if slot < 0 { return false }
-  localIsRef[slot] == 3
+  // A `string | null` (kind 16) local reads AS a string for string ops — it is narrowed
+  // non-null at every such read (the checker gates string ops on the narrowed branch),
+  // and the array ops (`array.len`/`array.get`) accept the nullable ref. The `!= null`
+  // null-check reads it through `exprNullableString` FIRST, so this never mis-routes it.
+  localIsRef[slot] == 3 || localIsRef[slot] == 16
 }
 
 // True if evaluating the expression at `exprIx` yields a string: a string literal, a
