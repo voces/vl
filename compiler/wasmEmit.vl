@@ -20630,6 +20630,118 @@ function nliInferLet(walk: i32[], i: i32) {
   0
 }
 
+// Push `atom` onto `atoms` only if absent (dedup, preserving first-seen order).
+function pushUniqueAtom(atoms: string[], atom: string) {
+  let i = 0
+  while i < atoms.length {
+    if atoms[i] == atom { return 0 }
+    i = i + 1
+  }
+  atoms.push(atom)
+  0
+}
+
+// Classify one if-EXPRESSION arm (`blockIx`, a one-statement Block) at REGISTRATION
+// time — a static pre-pass, so only LITERAL / annotated-call atoms resolve (the same
+// `nliAtomOfExpr` the `let x = null` hole uses). Returns 1 for a bare `null` arm, 0 for
+// a classified value atom (pushed onto `atoms`), or -2 if the arm is unclassifiable.
+function collectArmAtom(blockIx: i32, atoms: string[]) {
+  const v = ifArmValueExpr(blockIx)
+  if v < 0 { return -2 }
+  const bare = P.nodes[unwrapParen(v)]
+  if bare is NullLit { return 1 }
+  const atom = nliAtomOfExpr(v)
+  if atom == "" { return -2 }
+  pushUniqueAtom(atoms, atom)
+  0
+}
+
+// Gather the value atoms of every arm of the if-expression at `ifIx` into `atoms`
+// (deduped), recursing through an `else if` chain. Returns -2 if any arm is
+// unclassifiable, else whether a `null` arm / else-less false path was seen (0/1).
+function ifExprCollectAtoms(ifIx: i32, atoms: string[]) {
+  let s = P.nodes[unwrapParen(ifIx)]
+  if s is IfStmt {
+    let hasNull = 0
+    const t = collectArmAtom(s.ifThen, atoms)
+    if t == -2 { return -2 }
+    if t == 1 { hasNull = 1 }
+    if s.ifElse < 0 {
+      return 1 // else-less: the false path is null
+    }
+    const els = P.nodes[s.ifElse]
+    let e = 0
+    if els is IfStmt {
+      e = ifExprCollectAtoms(s.ifElse, atoms)
+    } else {
+      e = collectArmAtom(s.ifElse, atoms)
+    }
+    if e == -2 { return -2 }
+    if e == 1 { hasNull = 1 }
+    return hasNull
+  }
+  -2
+}
+
+// The value-union NAME an un-annotated if-EXPRESSION binding init carries (`const x =
+// if c then 5 else null` → `i32|null`, the else-less `if c then 5` → `i32|null`, `if c
+// then 5 else "hi"` → `i32|string`), or "" when it is not a value union the box can hold
+// (a non-union `if c then 5 else 6`, a `string | null` niche, or an arm the static pre-
+// pass cannot classify). The canonical name is the deduped arm atoms (arm order) with a
+// trailing `|null` when any arm / the else-less path is null.
+function ifExprNliName(ifIx: i32) {
+  const atoms: string[] = []
+  const hn = ifExprCollectAtoms(ifIx, atoms)
+  if hn == -2 { return "" }
+  if atoms.length == 0 { return "" }
+  // Mixed NUMERIC arms WIDEN to a single numeric (`i32` + `f64` → `f64`, #490) — they
+  // are not a union, and this static atom list cannot do that lattice join. Bail so the
+  // numeric value-position-if path (`letIsF64`/`letIsI64`) handles them. A SINGLE numeric
+  // scalar (optionally + null, + a non-numeric like `string`) is fine.
+  let numCount = 0
+  let j = 0
+  while j < atoms.length {
+    let k = valueAtomKind(atoms[j])
+    if k == 0 || k == 3 || k == 4 || k == 5 { numCount = numCount + 1 }
+    j = j + 1
+  }
+  if numCount >= 2 { return "" }
+  let nm = ""
+  let i = 0
+  while i < atoms.length {
+    if nm != "" { nm = nm + "|" }
+    nm = nm + atoms[i]
+    i = i + 1
+  }
+  if hn == 1 { nm = nm + "|null" }
+  // Only a value union the box rep can hold (≥2 non-null atoms, or one NUMERIC scalar +
+  // null) registers here — a `string | null` niche / a non-union stay on their own paths.
+  if !isValueUnionName(nm) { return "" }
+  nm
+}
+
+// Infer + register the value union of an un-annotated `const x = <if-expression>` at
+// `walk[i]` — the if-expression counterpart of `nliInferLet`. Records it in the same
+// `nli` tables so `nliNameOf` drives the slot classification (`letIsUnion` → kind 4 box)
+// and the binding-init emit (`emitNullableIfBinding` via `letUNm`), reusing the
+// annotated-binding lowering with NO annotation.
+function nliInferIfLet(walk: i32[], i: i32) {
+  let s = P.nodes[walk[i]]
+  if s is LetDecl {
+    if s.letType < 0 && s.letInit >= 0 {
+      if exprIsIfStmt(s.letInit) {
+        const nn = ifExprNliName(s.letInit)
+        if nn != "" {
+          registerValueUnionName(nn)
+          nliLetIxs.push(walk[i])
+          nliNames.push(nn)
+        }
+      }
+    }
+  }
+  0
+}
+
 // Scan every top-level FuncDecl's parameter + return annotations and every top-level
 // `let`/`const` annotation for INLINE union types, registering each as a synthetic
 // union alias (so it interns its variant shapes + heap types exactly like a named
@@ -20672,6 +20784,10 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       if registerInlineUnion(stmts, tyNameOf(s.letType)) < 0 { return -1 }
       // Usage-driven `let x = null` hole (A-infer-null): infer + register `T|null`.
       nliInferLet(walk, i)
+      // An un-annotated `const x = if … then … else …` whose arms join to a value
+      // union: register the inferred name so the slot classifies + lowers like an
+      // annotated nullable/value-union binding.
+      nliInferIfLet(walk, i)
     } else if s is IfStmt {
       const thenB = s.ifThen
       const elseN = s.ifElse
