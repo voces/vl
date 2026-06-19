@@ -2443,7 +2443,19 @@ function computeVoidFns() {
         if fn is FuncDecl {
           if fn.fnRet < 0 {
             if !blockHasValuedReturn(fn.fnBody) {
-              if !blockTailIsValue(fn.fnBody) {
+              // An else-less tail `if` makes the return `T | null` (`function f(c) { if
+              // c then 5 }`), but `blockTailIsValue` deliberately ignores else-less ifs
+              // (they feed THIS fixpoint — a void procedure's recursive tail
+              // `if n>0 { rec(n-1) }` must not look like a value). So also consult the
+              // static checker classification: a NULLABLE inferred return (a name with a
+              // `null` atom) is non-void. Gated to nullable specifically (not just
+              // non-empty) so an i32-valued tail the emitter can't lower as a value — e.g.
+              // a Member-target assignment `state.x = …`, which the checker reads as an
+              // i32 expression but `stmtIsTailValue` rejects — still classifies void.
+              if (
+                !blockTailIsValue(fn.fnBody) &&
+                !unionHasAtom(inferRetNameOf(fn.fnName), "null")
+              ) {
                 fRetVoid[i] = 1
                 changed = true
               }
@@ -14935,6 +14947,12 @@ function blockTailIsValue(blockIx: i32) {
 function ifTailIsValue(stmtIx: i32) {
   let s = P.nodes[stmtIx]
   if s is IfStmt {
+    // An else-less `if` NEVER qualifies here (it can fall through with no value). This is
+    // load-bearing: `ifTailIsValue` feeds `blockTailIsValue` → the `fRetVoid` fixpoint in
+    // `buildFnMap`, where treating a void procedure's recursive tail `if n>0 { rec(n-1) }`
+    // as a value would wrongly keep it non-void. The else-less NULLABLE-return tail
+    // (`function f(c) { if c then 5 }` → `i32 | null`) is handled separately at emit time
+    // by `elseLessNullableTail` (gated on the FINAL nullable classification).
     if s.ifElse < 0 { return false }
     if blockTailIsValue(s.ifThen) { return true }
     const els = P.nodes[s.ifElse]
@@ -14949,6 +14967,23 @@ function ifTailIsValue(stmtIx: i32) {
 function lastStmtIsValueIf(stmtIx: i32) {
   let s = P.nodes[stmtIx]
   if s is IfStmt { return ifTailIsValue(stmtIx) }
+  false
+}
+
+// True if the body-tail statement at `stmtIx` is an ELSE-LESS `if` whose then-arm yields
+// a value AND function `fnIx` returns a NULLABLE type — so the false fall-through is the
+// `null` of that nullable (lowered by the function-end `emitNullForRet`), exactly the
+// #484 fall-through but written `if c then v` with no else. Distinct from
+// `lastStmtIsValueIf`: this is consulted only at EMIT time, where `fRetVoid` is final, so
+// it never perturbs the `fRetVoid` fixpoint (a void procedure's `if n>0 { rec(n-1) }`
+// stays void — `fnRetNullBearing` is false for it).
+function elseLessNullableTail(stmtIx: i32, fnIx: i32) {
+  let s = P.nodes[stmtIx]
+  if s is IfStmt {
+    if s.ifElse >= 0 { return false }
+    if !blockTailIsValue(s.ifThen) { return false }
+    return fnRetNullBearing(fnIx)
+  }
   false
 }
 
@@ -14985,6 +15020,18 @@ function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
         // The body ends in an `if`/`else` whose arms each yield a value (implicit
         // return) rather than `return`ing — lower it tail-aware so each arm's trailing
         // value expression becomes the function's return.
+        if emitIfTail(body, stmts[i], fnIx) < 0 {
+          scopePop()
+          return -1
+        }
+      } else if isLast && elseLessNullableTail(stmts[i], fnIx) {
+        // The body ends in an else-less `if` whose then-arm yields a VALUE and whose
+        // return type is NULLABLE (`function f(c) { if c then 5 }` → `i32 | null`): lower
+        // it tail-aware (the then-arm returns its value); the false fall-through is lowered
+        // as `null` by the function-end padding (`emitNullForRet`). Gated on the FINAL
+        // `fRetVoid`/nullable classification — unlike `lastStmtIsValueIf`/`ifTailIsValue`,
+        // which feed the `fRetVoid` fixpoint in `buildFnMap` and so must NOT treat an
+        // else-less recursive tail as a value (a void procedure's `if n>0 { rec(n-1) }`).
         if emitIfTail(body, stmts[i], fnIx) < 0 {
           scopePop()
           return -1
