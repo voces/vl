@@ -114,14 +114,16 @@ annotations (`let`/`const`). Follow-ups, in order of safety:
   (the i32-sentinel niche: 0/1/2) now works end-to-end — param, `x = null` assignment,
   return, and caller narrowing — via `pendingNulBool` seeded at each boundary and
   `exprNulBool` resolving niche-ness through calls + un-annotated bindings (`letNulBool`).
-  REMAINING: **(PR2)** `string | null` — a DIFFERENT rep (nullable ref / `ref.is_null`,
-  not the i32 sentinel), its own param/assign/return/caller seeding; **(PR3)** `??` over
-  a niche value (`r ?? d` for `boolean|null`/`string|null`) + the non-Ident `??`
-  (`f() ?? d` needs a scratch local — the value-union-box `??` only handles a re-readable
-  Ident/field place today); **(PR4)** the `if/else`-expression-tail-with-`null` hole
-  above. Also still floored: the INFERRED `boolean | null` return (the checker's
-  `valueUnionRetName` excludes the niche; extend it + the inferRet export to carry the
-  niche name to the return-site seeding) — fold into PR2/PR3.
+  `[PR2 PAID]` `string | null` (kind 16, the nullable-ref rep `(ref null $aTypeIdx)`)
+  also works end-to-end — param/assign/return/call/global + the narrowed-string value
+  read (`.length`/`==`/`+`/return-as-string via `ref.as_non_null`, null-check raw via
+  `pendingRawNullRead`). REMAINING: **(PR3)** `??` over a niche value (`r ?? d` for
+  `boolean|null`/`string|null`) + the non-Ident `??` (`f() ?? d` needs a scratch local —
+  the value-union-box `??` only handles a re-readable Ident/field place today);
+  **(PR4)** the `if/else`-expression-tail-with-`null` hole above. Also still floored: the
+  INFERRED (un-annotated) `boolean | null` / `string | null` return (the checker's
+  `valueUnionRetName` excludes the niche/ref reps; extend it + the inferRet export to
+  carry the name to the return-site seeding) — fold into PR3.
 - **`vl fmt -w` ≠ `vl fmt --check` on long single-line `if/else`.** `vl fmt -w` is a
   no-op (idempotent) on a long single-line `if cond { a = x } else { a = y }` that
   exceeds the wrap width, yet `vl fmt --check` rejects it (`not formatted`, exit 1) —
