@@ -77,12 +77,16 @@ annotations (`let`/`const`). Follow-ups, in order of safety:
   `A20` (the emitter re-derived an un-annotated string/variable return from the
   expression and crashed codegen). The rule is now scoped to SCALAR/STRING returns of
   NON-generic functions — the categories `A20` + the emitter default lower safely.
-  REMAINING follow-up: **array / union / nullable returns** (kept annotated for now) —
-  widen `A20`'s direct-flag classification to `i32[]`/`string[]` (the checker already
-  exports the inferred name; the emitter would map `nameIsI32Array`→`fRetArr`,
-  `nameIsStringArray`→`fRetStrArr`), then drop the rule's scalar/string-only gate.
-  Genuinely-required annotations that stay: base-case-less inferred cycles (`cannot
-  infer`) and object/ref-array returns (structural emit identity).
+  `i32[]` returns now CLASSIFIED too (`A20` widened: checker exports the inferred
+  `i32[]` name, emitter maps it to `fRetArr`); the compiler-wide apply of those (~22)
+  bootstraps on that seed in a separate step. REMAINING follow-up:
+  **`string[]` and other array/union/nullable returns** (kept annotated). `string[]`
+  needs more than the `fRetStrArr` bit — `string` is internally `{[i32]:i32}`, so
+  `string[]` is a ref-list whose backing/list wasm type must be driven from the
+  return, which the bare flag doesn't do (the function signature falls back to i32);
+  the annotated path registers it via the real `TypeRef`. Genuinely-required
+  annotations that stay: base-case-less inferred cycles (`cannot infer`) and
+  object/ref-array returns (structural emit identity).
 - **Redundant PARAMETER annotations — last, and carefully.** Removing a param
   annotation can turn a monomorphic function generic (a real semantic change: it
   changes overload/monomorphization behavior, not just a type label). Only safe
