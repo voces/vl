@@ -6,7 +6,7 @@
 > `while` loops emit today). This doc records _how_ the CLI sheds its V8 +
 > `binaryen.js` dependency once the front end and codegen self-host, so the
 > decision is already framed when we get there. The final word lands in
-> `DECISIONS.md` (same convention as `docs/modules-design.md`).
+> `DECISIONS.md` (same convention as `docs/internals/modules-design.md`).
 >
 > Two prior decisions bound this: **H4** ("self-hosted WASM emission: emit bytes
 > directly + optional `wasm-opt`") and **C5** (today's `deno compile` binary

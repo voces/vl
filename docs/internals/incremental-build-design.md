@@ -4,7 +4,7 @@
 > content-addressed cache primitive), the **binaryen-`optimize()` stage cache**
 > (hardened), and **L1** (CI caching). L2–L4 are proposal. The final word lands in
 > `DECISIONS.md` at implementation time (same convention as
-> `docs/modules-design.md` / `docs/collections-design.md`).
+> `docs/internals/modules-design.md` / `docs/guide/collections-design.md`).
 >
 > **Priority: test-run throughput.** The thing being optimized *right now* is the
 > speed of `deno task test`, especially under **many parallel headless agents**
@@ -358,7 +358,7 @@ build, in scope to not preclude.
    strongly favours (d); it also keeps the door open to fast compile/LSP later.
    Confirm before building L4.
 3. **Interface hash** — exact two-tier definition and how exported generics fold in.
-   Shared with `docs/modules-design.md`; design before L3/L4.
+   Shared with `docs/internals/modules-design.md`; design before L3/L4.
 4. **Is the dev/release split needed at all** if (d) gives in-mode incrementality?
 5. **L2 cache home + default-on?** (lower priority — end-user loop, deferred.)
 

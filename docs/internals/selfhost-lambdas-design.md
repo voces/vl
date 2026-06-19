@@ -101,7 +101,7 @@ Reading the failures precisely:
   gaps**, and that bucket is labelled "**lambdas/for-in/…**" — lambdas are the named
   lead. So lambdas are the keystone the task describes: closing the emit gap here is
   the single largest emit-coverage lever, and it also unblocks the deferred param-skip
-  ergonomics (`docs/lambda-param-skip-design.md`, whose Prerequisite 1 is *exactly*
+  ergonomics (`docs/guide/lambda-param-skip-design.md`, whose Prerequisite 1 is *exactly*
   "self-host lambdas/HOFs don't exist yet").
 
 ---
@@ -418,7 +418,7 @@ Build the shared machinery on the easy case (no env):
   type at the call site (`function(n) …` over `i32[]` ⇒ `n: i32`); host TS already does
   this. Also align the diagnostic text so `lambda-uninferable-param.vl` matches
   `cannot infer a type for parameter \`n\``.
-- **Then** the param-skip ergonomics (`docs/lambda-param-skip-design.md`) become
+- **Then** the param-skip ergonomics (`docs/guide/lambda-param-skip-design.md`) become
   buildable — Prerequisite 1 (lambdas/HOFs) is satisfied by Slices 1–4, Prerequisite 2
   (param names in function types) is a small `TyFunc` extension.
 - **Unblocks:** `arrays/map-filter-inferred-callbacks.vl`, and the deferred param-skip
@@ -486,7 +486,7 @@ own gated PR, not be half-built behind a partial shortcut.
 ---
 
 ## 8. Merge sequencing / in-flight overlap
-The numeric slices (i64/f32/f64, per `docs/selfhost-numeric-types-design.md`) have
+The numeric slices (i64/f32/f64, per `docs/internals/selfhost-numeric-types-design.md`) have
 **already landed** on `origin/master` (the `fRetI64`/`fRetF32`/`fRetF64` tables and
 `exprIsF32`/`exprIsF64` classifiers are present) — Slice 4 here (`f64[]`/`i64[]`
 element HOFs) builds directly on their array-backing heap types. The only high-traffic

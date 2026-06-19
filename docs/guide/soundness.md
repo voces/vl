@@ -10,7 +10,7 @@ before codegen. A program either pins down a concrete type for every value or it
 fails to compile; it never defers a type decision to runtime.
 
 This document states the contract. The executable form of the contract lives in
-[`tests/cases/soundness/`](../tests/cases/soundness/): a curated, growing corpus
+[`tests/cases/soundness/`](../../tests/cases/soundness/): a curated, growing corpus
 of small "must-error" and "must-not-error" programs. The test runner is **strict
 by default** — a case fails on any diagnostic (error, warning, or info) it did
 not declare, and `@run` cases compare the entire log output — so a "must-not-error"
