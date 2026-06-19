@@ -11832,9 +11832,16 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         // (`emitUnionCoerce` — the host's call-boundary `coerceUnion`). The param's
         // union NAME carries the atom set for the tag choice.
         let cUNm = ""
+        // A `boolean | null` NICHE param position: a `null` argument is the i32
+        // sentinel 2 (seed `pendingNulBool`); a boolean argument is untouched.
+        let cParamNulBool = false
         if cFn is FuncDecl {
           const cParams = cFn.fnParams
           if i < cParams.length {
+            const cpnb = P.nodes[cParams[i]]
+            if cpnb is Param {
+              if tyIsNulBool(cpnb.parType) { cParamNulBool = true }
+            }
             if (
               vtKindOfParam(cParams[i]) == 1 ||
               vtKindOfParam(cParams[i]) == 9
@@ -11908,7 +11915,10 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           if cUNm != "" {
             if emitUnionCoerce(body, cUNm, args[i], fnIx) < 0 { return -1 }
           } else {
+            const savedCNB = pendingNulBool
+            if cParamNulBool { pendingNulBool = true }
             if emitExpr(body, args[i], fnIx) < 0 { return -1 }
+            pendingNulBool = savedCNB
             // A nullable-REP value (a null-narrowed `S | null` param/local, or a
             // recursive `S | null` field read whose wasm slot stays `(ref null $S)`)
             // flowing into a NON-NULL `(ref $S)` param: recover the non-null ref at
@@ -12153,7 +12163,11 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           if gUNm != "" {
             if emitUnionCoerce(body, gUNm, a.binRight, fnIx) < 0 { return -1 }
           } else {
+            // A `boolean | null` NICHE global: seed the sentinel for a `null` RHS.
+            const savedGNB = pendingNulBool
+            if exprNulBool(a.binLeft, fnIx) { pendingNulBool = true }
             if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
+            pendingNulBool = savedGNB
           }
           pendingListKind = 0
           pendingListSlot = 0
@@ -12171,7 +12185,13 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       if aUNm != "" {
         if emitUnionCoerce(body, aUNm, a.binRight, fnIx) < 0 { return -1 }
       } else {
+        // A `boolean | null` NICHE local (`x = null` / `x = b`): the i32 cell holds
+        // 0/1 or the sentinel 2 — seed `pendingNulBool` so a `null` RHS emits the
+        // sentinel (a boolean RHS is a `BoolLit`, untouched).
+        const savedNB = pendingNulBool
+        if exprNulBool(a.binLeft, fnIx) { pendingNulBool = true }
         if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
+        pendingNulBool = savedNB
       }
       fbLocalSet(idx) // 0x21 local.set
       return 0
@@ -14097,6 +14117,10 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     let retF32 = false
     let retF64 = false
     let retI64 = false
+    // A `boolean | null` NICHE return: the i32 result holds 0/1 or the sentinel 2 —
+    // seed `pendingNulBool` so a `return null` emits the sentinel (the signature result
+    // is already i32, `vtKindOfType` → 0). A boolean return is a `BoolLit`, untouched.
+    let retNulBool = false
     // A UNION return type (kind 4) WIDENS a raw scalar/string/null return value
     // into the box at the return boundary (the host's return-site `coerceUnion`):
     // `function wrap(n): string | i32 { return n }` boxes `n` with its atom tag.
@@ -14113,6 +14137,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
         const im = inferRetNameOf(fn.fnName)
         if isValueUnionName(im) { retUNm = im }
       }
+      if tyIsNulBool(fn.fnRet) { retNulBool = true }
     }
     // Push the return value, then the `return` instruction.
     if retF32 {
@@ -14127,7 +14152,10 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     } else if retUNm != "" {
       if emitUnionCoerce(body, retUNm, s.retArg, fnIx) < 0 { return -1 }
     } else {
+      const savedRNB = pendingNulBool
+      if retNulBool { pendingNulBool = true }
       if emitExpr(body, s.retArg, fnIx) < 0 { return -1 }
+      pendingNulBool = savedRNB
     }
     pendingStructIdx = -1
     pendingListKind = 0
@@ -14812,6 +14840,8 @@ function checkParams(fnIx: i32) {
             // accepted — a `(ref null $S)` param
           } else if retNulListFlag(p.parType) == 1 {
             // accepted — a `(ref null $lTypeIdx)` param (`i32[] | null`, kind 15)
+          } else if tyIsNulBool(p.parType) {
+            // accepted — a `boolean | null` NICHE param (the i32 sentinel 0/1/2)
           } else if ty.tyName != "i32" {
             if ty.tyName != "i64" {
               // i64 rides the 0x7e valtype (Slice 1)
@@ -15433,6 +15463,18 @@ function letIsNulBoolAnn(letIx: i32) {
 function exprNulBool(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[unwrapParen(exprIx)]
+  // A CALL of a function annotated `: boolean | null` — its result is the niche i32.
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      const t = fnIndexOf(callee.identName)
+      if t >= 0 {
+        const cfn = P.nodes[fnStmts[t]]
+        if cfn is FuncDecl { return tyIsNulBool(cfn.fnRet) }
+      }
+    }
+    return false
+  }
   if e is Ident {
     if fnIx >= 0 {
       const fn = P.nodes[fnIx]
@@ -15447,10 +15489,25 @@ function exprNulBool(exprIx: i32, fnIx: i32) {
           i = i + 1
         }
         let li = parentLetOf(fn.fnBody, e.identName)
-        if li >= 0 { return letIsNulBoolAnn(li) }
+        if li >= 0 { return letNulBool(li, fnIx) }
       }
     }
-    return letIsNulBoolAnn(globalLetOf(e.identName))
+    const gi = globalLetOf(e.identName)
+    if gi >= 0 { return letNulBool(gi, -1) }
+    return false
+  }
+  false
+}
+
+// A `let`/`const` binding is `boolean | null` if it is so ANNOTATED, or (un-annotated)
+// its initializer is a `boolean | null` value — e.g. `const r = f()` where `f` returns
+// the niche. Mirrors `letUnionNameOf`'s annotation-or-init resolution for value unions.
+function letNulBool(letIx: i32, fnIx: i32) {
+  if letIx < 0 { return false }
+  if letIsNulBoolAnn(letIx) { return true }
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType < 0 { return exprNulBool(d.letInit, fnIx) }
   }
   false
 }
