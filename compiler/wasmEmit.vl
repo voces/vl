@@ -14054,6 +14054,79 @@ function ifHasContinueFor(ifIx: i32, label: string, nested: boolean) {
 //   BinExpr { binOp, binLeft, binRight }          — an assignment expression statement.
 //   Call    { callFn, callArgs }                  — a `recv.push(x)` member-call.
 //   Block   { blkStmts: i32[] }
+// Lower a RETURN-VALUE expression `retArg` for function `fnIx`: seed the return context
+// from the function's return type (struct / ref-list / union / nullable-niche / numeric
+// widening), emit the value through the matching helper, then reset the pending seeds.
+// Does NOT emit the `return` instruction — the caller appends `fbReturn` (an explicit
+// `RetStmt`) or leaves it (the value flows on as an if-tail arm's stack result). This
+// unifies explicit `return e` with IMPLICIT (tail-position) returns, so a trailing `null`
+// or a nullable `if/else`-tail arm gets the SAME box/sentinel/`ref.null` seeding as
+// `return null` — without it the tail paths emitted a bare `null` and failed codegen.
+// `widenNum` enables the numeric (f32/f64/i64) literal WIDENING — correct for an
+// explicit `return e` (a narrower literal promotes to the declared float/i64 return),
+// but the IMPLICIT-return tail path passes `false`: a tail value's type already matches
+// the return (the checker proved it), and forcing `emitExprAs*` there mis-widens an
+// already-f64 value the float-classifier doesn't recognize (e.g. a closure `call_ref`).
+function emitReturnValue(
+  body: i32[],
+  retArg: i32,
+  fnIx: i32,
+  widenNum: boolean,
+) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let rsi = retStructIndex(fn.fnRet)
+    if rsi >= 0 {
+      if retTRFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
+      if retNulRefFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
+    }
+    pendingListKind = tyAnnRefListKind(fn.fnRet)
+    pendingListSlot = tyAnnRefListSlot(fn.fnRet)
+  }
+  let retF32 = false
+  let retF64 = false
+  let retI64 = false
+  let retNulBool = false
+  let retNulString = false
+  let retUNm = ""
+  if fn is FuncDecl {
+    if widenNum && retF32Flag(fn.fnRet) == 1 { retF32 = true }
+    if widenNum && retF64Flag(fn.fnRet) == 1 { retF64 = true }
+    if widenNum && retI64Flag(fn.fnRet) == 1 { retI64 = true }
+    if retUnionFlag(fn.fnRet) == 1 { retUNm = tyNameOf(fn.fnRet) }
+    if fn.fnRet < 0 {
+      const im = inferRetNameOf(fn.fnName)
+      if isValueUnionName(im) { retUNm = im }
+    }
+    if tyIsNulBool(fn.fnRet) { retNulBool = true }
+    if retNulStringFlag(fn.fnRet) == 1 { retNulString = true }
+  }
+  if retF32 {
+    const savedF32 = pendingF32
+    pendingF32 = true
+    if emitExprAsF32(body, retArg, fnIx) < 0 { return -1 }
+    pendingF32 = savedF32
+  } else if retF64 {
+    if emitExprAsF64(body, retArg, fnIx) < 0 { return -1 }
+  } else if retI64 {
+    if emitExprAsI64(body, retArg, fnIx) < 0 { return -1 }
+  } else if retUNm != "" {
+    if emitUnionCoerce(body, retUNm, retArg, fnIx) < 0 { return -1 }
+  } else {
+    const savedRNB = pendingNulBool
+    const savedRNS = pendingNulString
+    if retNulBool { pendingNulBool = true }
+    if retNulString { pendingNulString = true }
+    if emitExpr(body, retArg, fnIx) < 0 { return -1 }
+    pendingNulBool = savedRNB
+    pendingNulString = savedRNS
+  }
+  pendingStructIdx = -1
+  pendingListKind = 0
+  pendingListSlot = 0
+  0
+}
+
 function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
   if stmtIx < 0 { return emitFail("emitProgram: missing statement") }
   let s = P.nodes[stmtIx]
@@ -14291,84 +14364,9 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     if s.retArg < 0 {
       return emitFail("emitProgram: bare return is not supported")
     }
-    // A `return { … }` struct LITERAL must build the function's DECLARED return struct,
-    // not a first-field-name match — seed `pendingStructIdx` (consumed by `emitObj`) from
-    // the enclosing function's return annotation so a same-field-name sibling struct does
-    // not win. Mirrors how a call-arg / element / global seeds the literal's context. A
-    // non-struct-literal return ignores the hint. Reset after the value lowers.
-    const fn = P.nodes[fnIx]
-    if fn is FuncDecl {
-      let rsi = retStructIndex(fn.fnRet)
-      if rsi >= 0 {
-        if retTRFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
-        // A `S | null` return seeds the same struct context: `return { … }` builds
-        // the base struct; `return null` consumes the seed as `ref.null $S`.
-        if retNulRefFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
-      }
-      // A `return [{ … }]` ref-list LITERAL must build the function's DECLARED return
-      // list element type, not a first-element field-shape match — seed the list context
-      // from the return annotation exactly as the let / global path does (consumed by
-      // `emitArr`). A non-list return ignores it.
-      pendingListKind = tyAnnRefListKind(fn.fnRet)
-      pendingListSlot = tyAnnRefListSlot(fn.fnRet)
-    }
-    // Numeric WIDENING at the return boundary: a function declared `: f64` / `: f32` /
-    // `: i64` coerces a narrower returned value (e.g. `function asF64(x: f32): f64 {
-    // return x }` promotes f32→f64). The `emitExprAs*` helpers insert the lattice convert
-    // (or re-encode a literal). An i32-returning / un-annotated function is unchanged.
-    let retF32 = false
-    let retF64 = false
-    let retI64 = false
-    // A `boolean | null` NICHE return: the i32 result holds 0/1 or the sentinel 2 —
-    // seed `pendingNulBool` so a `return null` emits the sentinel (the signature result
-    // is already i32, `vtKindOfType` → 0). A boolean return is a `BoolLit`, untouched.
-    let retNulBool = false
-    // A `string | null` return: `return null` is `ref.null $aTypeIdx` (seed
-    // `pendingNulString`); a string return is the array ref, untouched.
-    let retNulString = false
-    // A UNION return type (kind 4) WIDENS a raw scalar/string/null return value
-    // into the box at the return boundary (the host's return-site `coerceUnion`):
-    // `function wrap(n): string | i32 { return n }` boxes `n` with its atom tag.
-    let retUNm = ""
-    if fn is FuncDecl {
-      if retF32Flag(fn.fnRet) == 1 { retF32 = true }
-      if retF64Flag(fn.fnRet) == 1 { retF64 = true }
-      if retI64Flag(fn.fnRet) == 1 { retI64 = true }
-      if retUnionFlag(fn.fnRet) == 1 { retUNm = tyNameOf(fn.fnRet) }
-      // An UN-annotated function whose returns JOIN to a value union/nullable boxes its
-      // return value exactly like the annotated path — the inferred name (`i32|string`,
-      // `i32|null`) drives `emitUnionCoerce` into the same `uBoxIdx` box.
-      if fn.fnRet < 0 {
-        const im = inferRetNameOf(fn.fnName)
-        if isValueUnionName(im) { retUNm = im }
-      }
-      if tyIsNulBool(fn.fnRet) { retNulBool = true }
-      if retNulStringFlag(fn.fnRet) == 1 { retNulString = true }
-    }
-    // Push the return value, then the `return` instruction.
-    if retF32 {
-      const savedF32 = pendingF32
-      pendingF32 = true
-      if emitExprAsF32(body, s.retArg, fnIx) < 0 { return -1 }
-      pendingF32 = savedF32
-    } else if retF64 {
-      if emitExprAsF64(body, s.retArg, fnIx) < 0 { return -1 }
-    } else if retI64 {
-      if emitExprAsI64(body, s.retArg, fnIx) < 0 { return -1 }
-    } else if retUNm != "" {
-      if emitUnionCoerce(body, retUNm, s.retArg, fnIx) < 0 { return -1 }
-    } else {
-      const savedRNB = pendingNulBool
-      const savedRNS = pendingNulString
-      if retNulBool { pendingNulBool = true }
-      if retNulString { pendingNulString = true }
-      if emitExpr(body, s.retArg, fnIx) < 0 { return -1 }
-      pendingNulBool = savedRNB
-      pendingNulString = savedRNS
-    }
-    pendingStructIdx = -1
-    pendingListKind = 0
-    pendingListSlot = 0
+    // Seed the return context + emit the value (struct / list / union / nullable /
+    // widening) via the shared helper, then the `return` instruction.
+    if emitReturnValue(body, s.retArg, fnIx, true) < 0 { return -1 }
     fbReturn() // 0x0f return
     return 0
   }
@@ -14743,6 +14741,11 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
 function stmtIsTailValue(stmtIx: i32) {
   let s = P.nodes[stmtIx]
   if s is NumLit { return true }
+  // A trailing `null` IS an implicit-return value (the function returns null) — seeded
+  // per the return type by `emitReturnValue` (`ref.null` / sentinel / boxed null), the
+  // same as `return null`. Without this a `{ … null }` tail fell through to the
+  // statement path and failed `unsupported statement in body`.
+  if s is NullLit { return true }
   if s is StrLit { return true }
   if s is CharLit { return true }
   if s is BoolLit { return true }
@@ -14850,8 +14853,10 @@ function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
     while i < n {
       const isLast = i == n - 1
       if isLast && stmtIsTailValue(stmts[i]) {
-        // Implicit return: push the value, then `return` (0x0f).
-        if emitExpr(body, stmts[i], fnIx) < 0 {
+        // Implicit return: seed the return context + push the value (so a trailing
+        // `null` / nullable value boxes or sentinels exactly like `return e`), then
+        // `return` (0x0f).
+        if emitReturnValue(body, stmts[i], fnIx, false) < 0 {
           scopePop()
           return -1
         }
@@ -14976,7 +14981,9 @@ function emitStmtTail(body: i32[], stmtIx: i32, fnIx: i32) {
   let s = P.nodes[stmtIx]
   if s is IfStmt { return emitIfTail(body, stmtIx, fnIx) }
   if stmtIsTailValue(stmtIx) {
-    if emitExpr(body, stmtIx, fnIx) < 0 { return -1 }
+    // An if-tail arm's implicit return — seed the return context (so a `null` arm
+    // boxes / sentinels per the function's return type) exactly like `emitFuncBody`.
+    if emitReturnValue(body, stmtIx, fnIx, false) < 0 { return -1 }
     fbReturn() // 0x0f return
     return 0
   }
