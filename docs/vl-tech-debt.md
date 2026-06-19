@@ -109,14 +109,20 @@ annotations (`let`/`const`). Follow-ups, in order of safety:
   EXPRESSION in TAIL position with a `null` branch (`{ if b { 5 } else { null } }`)
   fails `unsupported statement in body` even ANNOTATED; and `??` on a nullable SCALAR
   fails `` `??` is only supported on a map index get ``.
-- **Nullable-value-type arc — non-Ident `??`, if-else-null-tail, inferred niche return.**
-  Remaining: the **non-Ident `??`** — `f() ?? d` (the `??`-over-niche works for an
-  Ident/field LHS, but a call LHS would re-evaluate; it needs a scratch local to bind the
-  result once); the **`if/else`-expression tail with a `null` branch**
-  (`{ if b { 5 } else { null } }` fails `unsupported statement in body` even ANNOTATED);
-  and the **INFERRED (un-annotated) `boolean | null` / `string | null` return** (the
-  checker's `valueUnionRetName` excludes the niche/ref reps, so it hits the robustness
-  floor — extend it + the inferRet export to carry the name to the return-site seeding).
+- **Nullable-value-type arc — non-Ident `??`, inferred niche return.** Remaining: the
+  **non-Ident `??`** — `f() ?? d` (the `??`-over-niche works for an Ident/field LHS, but a
+  call LHS would re-evaluate; it needs a scratch local to bind the result once); and the
+  **INFERRED (un-annotated) `boolean | null` / `string | null` return** (the checker's
+  `valueUnionRetName` excludes the niche/ref reps, so it hits the robustness floor —
+  extend it + the inferRet export to carry the name to the return-site seeding).
+- **`emitExprAsF64`/`F32`/`I64` don't recognize a closure `call_ref` as already-typed.**
+  A tail/return whose value is a closure call returning f64/f32/i64 (`apply(addf, …)`)
+  isn't classified by `exprIsF64`/etc. (the `Call` case only handles a direct-Ident
+  callee, not a `call_ref`), so the numeric widening would mis-convert it. Worked around
+  in `emitReturnValue` (the implicit-return tail passes `widenNum=false`), which also
+  means an i32-literal in an `f64`/`i64`-returning TAIL (`function f(): f64 { 5 }`) is not
+  widened. Real fix: teach `exprIsF64`/`exprIsF32`/`exprIsI64` to resolve a closure
+  call's return type, so the widen helpers are correctly idempotent.
 - **`vl fmt -w` ≠ `vl fmt --check` on long single-line `if/else`.** `vl fmt -w` is a
   no-op (idempotent) on a long single-line `if cond { a = x } else { a = y }` that
   exceeds the wrap width, yet `vl fmt --check` rejects it (`not formatted`, exit 1) —
