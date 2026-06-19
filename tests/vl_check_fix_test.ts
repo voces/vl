@@ -42,15 +42,17 @@ Deno.test({
     const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_" });
     try {
       const f = `${dir}/a.vl`;
+      // The `: i64` return is NOT redundant (the i32 body widens to it), so the
+      // redundant-return fix leaves it — keeping this case focused on prefer-const.
       const before =
-        "function f(a: i32, b: i32): i32 { b }\nlet unusedLocal = 1\nlet keep = 2\nprint(f(keep, keep))\n";
+        "function f(a: i32, b: i32): i64 { b }\nlet unusedLocal = 1\nlet keep = 2\nprint(f(keep, keep))\n";
       await Deno.writeTextFile(f, before);
       const r = await fix(f);
       if (r.code !== 0) throw new Error(`--fix exited ${r.code}:\n${r.err}`);
       // Only `let keep` → `const keep`. The unused param `a` and unused local are
       // untouched.
       const want =
-        "function f(a: i32, b: i32): i32 { b }\nlet unusedLocal = 1\nconst keep = 2\nprint(f(keep, keep))\n";
+        "function f(a: i32, b: i32): i64 { b }\nlet unusedLocal = 1\nconst keep = 2\nprint(f(keep, keep))\n";
       const after = await Deno.readTextFile(f);
       if (after !== want) throw new Error(`unexpected fixed source:\n${after}`);
       // The unused param + local are still reported, and nothing more is applied.
