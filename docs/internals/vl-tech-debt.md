@@ -41,12 +41,6 @@ in order of safety:
     niche seed (the niche encoding is a sentinel, not the box), so these still require
     an explicit annotation. Closing it = thread the inferred niche structure (not just
     the value-atom name) to the return-site seeding.
-- **Self-recursive un-annotated return inference.** An un-annotated self-recursive
-  function whose recursive call feeds an operator (e.g. `fib(n-1) + fib(n-2)`) infers
-  `i32 | string`: the pending-cycle recursive call leaves `+` ambiguous, so the
-  operator-constraint join admits `string`. Such a function needs an explicit return
-  annotation today. Closing it = resolve the recursive-call return hole before the
-  operator constraint is applied.
 - **`??` on a non-Ident left operand.** `??` is supported only when the left operand
   is a plain identifier or a map-index get; `f(x) ?? d` (a call/expression LHS) fails
   `` `??` is only supported on a map index get ``. A call LHS would re-evaluate, so it
