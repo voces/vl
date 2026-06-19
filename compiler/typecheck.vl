@@ -5750,6 +5750,24 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       }
       inferred = TY_ERR
     }
+    // PERMISSIVE FALL-THROUGH (totality): an un-annotated function that can fall off the
+    // end on some path implicitly yields `null` there, so its inferred return widens to
+    // `T | null` (host byline: "types hidden by aggressive inference"). A box-able value
+    // type (`i32`/`i64`/`f64`/`f32` and their unions) lowers un-annotated via the
+    // `uBoxIdx` box; a NICHE (`boolean`/`string`) widens too but stays floored just below
+    // ("annotate the return type") until A20 carries the niche seed. A void/error
+    // inferred return (no value return at all) never falls into a value position, so it
+    // is exempt. Mirrors the annotated rule below: fall-through `null` must be part of the
+    // return type, here by widening rather than by an explicit annotation.
+    if (
+      !bodyTotalForRet &&
+      inferred >= 0 &&
+      inferred != TY_VOID &&
+      inferred != TY_ERR
+    ) {
+      const inT = T.tys[inferred]
+      if !(inT is TyNullable) { inferred = mkNullableTy(inferred) }
+    }
     // Robustness floor (host parity with the empty-`[]` "cannot infer — annotate"
     // floor): an un-annotated function whose returns JOIN to a union/nullable now
     // infers the CORRECT type, but the emitter cannot yet lower an un-annotated
@@ -5816,13 +5834,32 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     inferSawErr = savedSawErr
     fnSawValueRet = savedValueRet
   }
-  // SOUNDNESS — missing return: a NON-VOID function (`ret` is a real value type, declared
-  // or inferred) whose body can fall off the end without yielding a value on some path
-  // traps at runtime (the wasm result-type fallthrough). Require totality — every path
-  // must return / diverge / end in an implicit-return value. Suppressed in the pre-pass
-  // (`inferQuiet`) and on a void/error return (no cascade).
-  if (!inferQuiet && ret != TY_VOID && ret != TY_ERR && !bodyTotalForRet) {
-    tErr("not all code paths return a value in '" + n.fnName + "'", n.fnBody)
+  // SOUNDNESS — missing return: a function whose body can fall off the end without
+  // yielding a value on some path implicitly produces `null` there. That is sound ONLY
+  // when `null` is part of the return type — a NULLABLE return (declared `: T | null`,
+  // or an inferred return widened to `T | null` just above) lowers the fall-through as
+  // `null` (the emitter pads it; see `emitNullForRet`). A NON-nullable value return with
+  // a reachable fall-through has nowhere to put the `null`, so it is rejected (the TS
+  // `noImplicitReturns` case: annotated `: i32` that falls through). Suppressed in the
+  // pre-pass (`inferQuiet`) and on a void/error return (no cascade).
+  let retNullableNow = false
+  if ret >= 0 {
+    const rtn = T.tys[ret]
+    if rtn is TyNullable { retNullableNow = true }
+  }
+  if (
+    !inferQuiet &&
+    ret != TY_VOID &&
+    ret != TY_ERR &&
+    !bodyTotalForRet &&
+    !retNullableNow
+  ) {
+    tErr(
+      "not all code paths return a value in '" +
+        n.fnName +
+        "' — add a `return`, or annotate the return type `| null` to fall through",
+      n.fnBody,
+    )
   }
   // Redundant RETURN annotation: the body's NATURAL inferred return already equals the
   // explicit `: T`, so removing it yields the identical type. Conservative: a single

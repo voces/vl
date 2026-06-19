@@ -14127,6 +14127,77 @@ function emitReturnValue(
   0
 }
 
+// True if function `fnIx`'s return type CARRIES `null` — a niche (`boolean|null` /
+// `string|null`), a nullable struct ref (`S|null`) / list (`i32[]|null`), or a value-union
+// box whose atoms include `null` (`i32|null`, annotated or inferred). A structural
+// fall-through in such a function is sound — it yields that null (`emitNullForRet`),
+// not dead `unreachable` padding. A non-nullable value return with a reachable
+// fall-through was already rejected by the checker, so it never reaches here.
+function fnRetNullBearing(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  const r = fn.fnRet
+  if tyIsNulBool(r) { return true }
+  if retNulStringFlag(r) == 1 { return true }
+  if retNulRefFlag(r) == 1 { return true }
+  if retNulListFlag(r) == 1 { return true }
+  if retUnionFlag(r) == 1 { return unionHasAtom(tyNameOf(r), "null") }
+  if r < 0 {
+    const im = inferRetNameOf(fn.fnName)
+    if isValueUnionName(im) { return unionHasAtom(im, "null") }
+  }
+  false
+}
+
+// Emit the `null` value of function `fnIx`'s nullable return rep, leaving it on the
+// stack as the function's result (the fall-through path's implicit `return null`).
+// Each arm mirrors the `NullLit` lowering for that rep: the `boolean|null` i32 sentinel
+// `2`, the `string|null` typed `ref.null $array`, a nullable struct `ref.null $S`, a
+// nullable i32-list `ref.null $lTypeIdx`, and the value-union null-tagged box. Guarded
+// by `fnRetNullBearing`; an unsupported rep fails loudly.
+function emitNullForRet(body: i32[], fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return emitFail("emitNullForRet: not a function") }
+  const r = fn.fnRet
+  if tyIsNulBool(r) {
+    fbI32Const(2)
+    return 0
+  }
+  if retNulStringFlag(r) == 1 {
+    wU8(208) // 0xd0 ref.null
+    wSLEB(aTypeIdx)
+    return 0
+  }
+  if retNulRefFlag(r) == 1 {
+    const rsi = retNulRefIndex(r)
+    if rsi >= 0 && rsi < sHeapIdx.length {
+      wU8(208) // 0xd0 ref.null
+      wSLEB(sHeapIdx[rsi])
+      return 0
+    }
+  }
+  if retNulListFlag(r) == 1 {
+    wU8(208) // 0xd0 ref.null
+    wSLEB(lTypeIdx)
+    return 0
+  }
+  // Value-union box (annotated `i32 | null`, or an inferred return widened to it): the
+  // null-tagged box `{ tag: null, payload: ref.null }` — identical to `emitUnionCoerce`'s
+  // bare-`null` path.
+  let isU = false
+  if retUnionFlag(r) == 1 { isU = true }
+  if r < 0 {
+    if isValueUnionName(inferRetNameOf(fn.fnName)) { isU = true }
+  }
+  if isU {
+    fbI32Const(scalarTagOf("null"))
+    fbRefNullNone() // payload slot unread under the null tag
+    fbStructNew(uBoxIdx)
+    return 0
+  }
+  emitFail("emitNullForRet: unsupported nullable return rep")
+}
+
 function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
   if stmtIx < 0 { return emitFail("emitProgram: missing statement") }
   let s = P.nodes[stmtIx]
@@ -15554,15 +15625,23 @@ function emitFuncCode(out: i32[], fnIx: i32) {
     // structurally falls through to the function `end` with an empty stack (e.g. a
     // body ending in `if c { return a } else { return b }`, whose `return`s exit from
     // inside the structured `if`). The validator requires the function's result type
-    // at fallthrough, so emit an `unreachable` (0x00) — the typechecker has proven
-    // this fallthrough is dead, so it is sound padding, never executed.
+    // at fallthrough, so something must occupy it. Two cases:
+    //   • NULLABLE return — the fall-through is a LIVE path that yields `null` (the
+    //     checker permits it precisely because `null` is in the return type), so emit
+    //     that null value (`emitNullForRet`) as the function's result.
+    //   • non-nullable return — the typechecker has proven the fallthrough is DEAD
+    //     (every path returns), so `unreachable` (0x00) is sound padding, never run.
     const fnPos = fnStmtsPosOf(fnIx)
     let isVoidFn = false
     if fnPos >= 0 {
       if fRetVoid[fnPos] == 1 { isVoidFn = true }
     }
     if !isVoidFn && !bodyEndsInReturn(fn.fnBody) {
-      fbUnreachable() // 0x00 unreachable (dead padding for the result type)
+      if fnRetNullBearing(fnIx) {
+        if emitNullForRet(body, fnIx) < 0 { return -1 }
+      } else {
+        fbUnreachable() // 0x00 unreachable (dead padding for the result type)
+      }
     }
     fbEnd() // 0x0b end
     wTarget(endPrev)
