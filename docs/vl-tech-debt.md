@@ -93,6 +93,29 @@ annotations (`let`/`const`). Follow-ups, in order of safety:
   a per-function slot, unlike the singleton string/i32 lists). Genuinely-required
   annotations that stay regardless: base-case-less inferred cycles (`cannot infer`)
   and object returns (structural emit identity).
+- **Lower the REMAINING inferred union returns (struct-ref unions + niches).** `[A-infer-return-join MOSTLY PAID]`
+  Return-type inference JOINS all returns (`i32 | null` / `i32 | string`, was
+  first-wins), and the emitter now LOWERS the VALUE-union / nullable-scalar cases
+  un-annotated end-to-end — driven from the checker's exported inferred name through
+  `registerValueUnionName` → `fRetUni` → `emitUnionCoerce` → `unionNameOfExpr` (the
+  same path an annotation takes; `isValueUnionName` is the gate). REMAINING (still
+  floored with `cannot infer a {union,nullable} return type — annotate it`): a union of
+  STRUCT refs (`{…} | {…}` — needs the variant-boxed ref rep + tag assignment from the
+  inferred members, not the value box) and the `boolean | null` / `string | null`
+  NICHE reps (`isValueUnionName` excludes them — the niche encoding is a sentinel, not
+  the box). Closing those = thread the inferred variant/niche structure (not just the
+  value-atom name) to the emitter's variant-box / niche return seeding. SEPARATE
+  nullable-scalar codegen holes, independent of return inference: an `if … else …`
+  EXPRESSION in TAIL position with a `null` branch (`{ if b { 5 } else { null } }`)
+  fails `unsupported statement in body` even ANNOTATED; and `??` on a nullable SCALAR
+  fails `` `??` is only supported on a map index get ``.
+- **`vl fmt -w` ≠ `vl fmt --check` on long single-line `if/else`.** `vl fmt -w` is a
+  no-op (idempotent) on a long single-line `if cond { a = x } else { a = y }` that
+  exceeds the wrap width, yet `vl fmt --check` rejects it (`not formatted`, exit 1) —
+  so "I ran `fmt -w`" does not imply `--check` passes, and `ci-native`'s fmt gate
+  fails. Workaround: break such statements onto multiple lines by hand. Real fix: make
+  the rewrite path wrap the same constructs the check path demands (one formatter, one
+  canonical form). (Recorded in agent memory `vl-fmt-self-lint-before-push`.)
 - **Redundant PARAMETER annotations — last, and carefully.** Removing a param
   annotation can turn a monomorphic function generic (a real semantic change: it
   changes overload/monomorphization behavior, not just a type label). Only safe

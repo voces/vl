@@ -5121,7 +5121,17 @@ function noteInferredRet(t: i32) {
   if tt is TyPrim {
     if tt.primName == "void" { return 0 }
   }
-  if inferObserved < 0 { inferObserved = t }
+  // JOIN every non-void return, not just the first: a function whose returns
+  // disagree (`return 5` … `return null`, or `return 5` … `return "hi"`) infers the
+  // flattened UNION/nullable of them (`joinTys` mirrors the host's
+  // `flattenType(Union(...))`), so the caller sees the true type. First-wins silently
+  // dropped later branches — the checker then mis-typed a `!= null` compare or let a
+  // string flow through an i32 result and crash codegen.
+  if inferObserved < 0 {
+    inferObserved = t
+  } else {
+    inferObserved = joinTys(inferObserved, t)
+  }
   0
 }
 
@@ -5138,7 +5148,13 @@ function noteNaturalRet(t: i32) {
   if tt is TyPrim {
     if tt.primName == "void" { return 0 }
   }
-  if retNatural < 0 { retNatural = t }
+  // JOIN, mirroring noteInferredRet (above) so the captured "natural" return IS what
+  // an unannotated version would infer — a multi-return function joins to a union.
+  if retNatural < 0 {
+    retNatural = t
+  } else {
+    retNatural = joinTys(retNatural, t)
+  }
   0
 }
 
@@ -5664,6 +5680,43 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         )
       }
       inferred = TY_ERR
+    }
+    // Robustness floor (host parity with the empty-`[]` "cannot infer — annotate"
+    // floor): an un-annotated function whose returns JOIN to a union/nullable now
+    // infers the CORRECT type, but the emitter cannot yet lower an un-annotated
+    // union/nullable return — the `A20` return classifier carries scalar/string/array,
+    // not the union box / nullable-struct seed, so a bare `return null` / a string
+    // through an i32 result crashes codegen ("bare null needs a struct-typed context").
+    // Require an explicit annotation here, which DOES lower (the annotated path seeds
+    // the return). Codegen elaboration that removes this requirement — inferred
+    // union/nullable returns end-to-end — is the documented follow-up.
+    // A VALUE union/nullable (`i32 | string`, `i32 | null`) now lowers un-annotated via
+    // the `uBoxIdx` box (valueUnionRetName != "" — exported above, emitted like the
+    // annotated path), so it does NOT floor. Only a union/nullable the emitter still
+    // can't box un-annotated — struct-ref unions, `boolean | null` / `string | null`
+    // niches — hits the floor.
+    if (
+      !inferQuiet &&
+      n.fnName != "" &&
+      inferred >= 0 &&
+      valueUnionRetName(inferred) == ""
+    ) {
+      const itt = T.tys[inferred]
+      if itt is TyUnion {
+        tErr(
+          "cannot infer a union return type for '" +
+            n.fnName +
+            "' — annotate the return type",
+          n.fnBody,
+        )
+      } else if itt is TyNullable {
+        tErr(
+          "cannot infer a nullable return type for '" +
+            n.fnName +
+            "' — annotate the return type",
+          n.fnBody,
+        )
+      }
     }
     ret = inferred
     // Patch the hoisted TyFunc IN PLACE so existing references see the result;
@@ -7187,6 +7240,50 @@ function checkNode(ix: i32) {
   TY_ERR
 }
 
+// Flatten a (possibly nested) union/nullable type into its leaf atom NAMES, pushing
+// each into `out` ("null" for the nullable slot). joinTys can nest a nullable around a
+// union (`mkNullableTy(mkUnionTy(...))`), so recurse; a scalar leaf renders no-space
+// via tyToStr. Used to build the emitter-format `a|b|null` union name for an inferred
+// return (the emitter's `splitUnionAtoms` splits on a bare `|`, NOT tyToStr's ` | `).
+function collectRetAtoms(er: i32, out: string[]) {
+  if er < 0 { return 0 }
+  const t = T.tys[er]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      collectRetAtoms(t.uMembers[i], out)
+      i = i + 1
+    }
+  } else if t is TyNullable {
+    collectRetAtoms(t.nInner, out)
+    out.push("null")
+  } else {
+    out.push(tyToStr(er))
+  }
+  0
+}
+
+// The emitter-format union NAME (`i32|string`, `i32|null`) for an inferred return type
+// `er` IF it is a VALUE union the emitter can box (the `uBoxIdx` rep: ≥2 non-null value
+// atoms, or one numeric scalar + null — `isValueUnionName`, the same gate the annotated
+// path uses), else "". This is what lets an UN-annotated union/nullable return lower:
+// the name drives `registerValueUnionName` (type interning), `fRetUni` (the result
+// valtype), and `emitUnionCoerce` at the return site — exactly the annotated path.
+function valueUnionRetName(er: i32) {
+  if er < 0 { return "" }
+  const atoms: string[] = []
+  collectRetAtoms(er, atoms)
+  let nm = ""
+  let i = 0
+  while i < atoms.length {
+    if i > 0 { nm = nm + "|" }
+    nm = nm + atoms[i]
+    i = i + 1
+  }
+  if isValueUnionName(nm) { return nm }
+  ""
+}
+
 // The public entry point: check the program rooted at node `rootIx`, returning
 // the number of diagnostics raised (diagnostics also accumulate on `T.diags`).
 // (The old PR #5 gap — a discarded/`let`-bound call return mis-lowering at module
@@ -7245,6 +7342,17 @@ export function checkProgram(rootIx: i32) {
             ) {
               inferRetFn.push(efn.fnName)
               inferRetTy.push(enm)
+            } else {
+              // A VALUE union/nullable inferred return (`i32 | string`, `i32 | null`)
+              // lowers through the same `uBoxIdx` machinery as an annotation — export
+              // its emitter-format name so `buildFnMap`/`registerValueUnionName`/the
+              // return site pick it up. Non-lowerable unions (struct refs, `bool|null`)
+              // return "" here and stay floored by the checker.
+              const un = valueUnionRetName(er)
+              if un != "" {
+                inferRetFn.push(efn.fnName)
+                inferRetTy.push(un)
+              }
             }
           }
         }
@@ -7265,3 +7373,9 @@ export function inferRetNameOf(name: string) {
   }
   ""
 }
+
+// Iteration over the inferred-return table (the emitter's `collectU` registers any
+// VALUE-union names here so their box/value-box reps are interned even when an inferred
+// return is the program's only value union). `inferRetTyAt` is the rendered type name.
+export function inferRetCount() { inferRetFn.length }
+export function inferRetTyAt(i: i32) { inferRetTy[i] }
