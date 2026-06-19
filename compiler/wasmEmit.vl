@@ -10445,6 +10445,47 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
           wU8(27)      // 0x1b select → d if null else x
           return 0
         }
+        // `x ?? d` over a `boolean | null` NICHE binding (param/let/return-bound): the
+        // i32 cell holds 0/1 or the sentinel 2 (`null`) — same select-on-2 as the
+        // boolean-`.pop()` niche above, but for any nullable-bool source.
+        if exprNulBool(e.binLeft, fnIx) {
+          if emitExpr(body, e.binRight, fnIx) < 0 {
+            return -1 // d   [a]
+          }
+          if emitExpr(body, e.binLeft, fnIx) < 0 {
+            return -1 // x   [b]
+          }
+          if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+          fbI32Const(2)
+          fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)      [cond]
+          wU8(27)      // 0x1b select → d if null else x
+          return 0
+        }
+        // `x ?? d` over a `string | null` (kind 16) binding: the nullable raw-array ref —
+        // a VALUE-typed `if` on `ref.is_null` (the else arm `ref.as_non_null`s, so it
+        // only runs when non-null). `pendingRawNullRead` keeps the test ref raw.
+        if exprNullableString(e.binLeft, fnIx) {
+          const savedRaw0 = pendingRawNullRead
+          pendingRawNullRead = true
+          const tre = emitExpr(body, e.binLeft, fnIx) // the raw nullable ref
+          pendingRawNullRead = savedRaw0
+          if tre < 0 { return -1 }
+          wU8(209)                                    // 0xd1 ref.is_null → 1 if null
+          wU8(4)                                      // 0x04 if
+          wU8(100)                                    // blocktype: (ref $aTypeIdx) — non-null string result
+          wSLEB(aTypeIdx)
+          ctrlEnter()
+          if emitExpr(body, e.binRight, fnIx) < 0 {
+            return -1 // d (a string)
+          }
+          fbElse() // 0x05 else
+          if emitExpr(body, e.binLeft, fnIx) < 0 {
+            return -1 // x recovered non-null
+          }
+          fbEnd() // 0x0b end
+          ctrlLeave()
+          return 0
+        }
         // `x ?? d` over a BOXED value union containing `null` (`i32 | null`):
         // the value-level dual of the null guard — read the box tag; the null
         // tag selects the default, anything else unboxes the SINGLE remaining
@@ -22271,6 +22312,11 @@ function exprString(exprIx: i32, fnIx: i32) {
     // string ref (the value type).
     const cms = coalesceMvSlot(exprIx, fnIx)
     if cms >= 0 { return mvValKind[cms] == 3 }
+    // `r ?? d` over a `string | null` LHS yields a (non-null) string — the coalesce
+    // recovers the non-null array ref, so `.length`/`+`/etc. on the result work.
+    if e.binOp == "??" {
+      if exprNullableString(e.binLeft, fnIx) { return true }
+    }
     // G6: string concatenation `a + b` produces a string; no other binary operator
     // does (`==`/`!=` yield an i32).
     return exprIsStrConcat(exprIx, fnIx)
