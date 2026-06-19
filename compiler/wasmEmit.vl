@@ -11159,6 +11159,125 @@ function emitBlockValueAs(body: i32[], blockIx: i32, fnIx: i32, kind: i32) {
   emitFail("emitProgram: if-expression arm is not a block")
 }
 
+// ── nullable / value-union if-EXPRESSION in BINDING-INIT position ──────────────
+// `const x: i32 | null = if c then 5 else null` (and `else if` chains) lowers as a
+// VOID `if` whose every arm writes the binding's OWN local — so no value-typed-if
+// blocktype (an interned functype) and no scratch slot are needed: the destination
+// local IS the stash. Each arm emits its value in the binding's nullable rep (`rep`:
+// 0 the value-union box, 1 a `string | null` ref) then `local.set`s it; a bare `null`
+// arm / an else-less false path writes the rep's null. This is the binding-position
+// counterpart of the return-tail `emitIfTail`/`emitNullForRet` lowering (#484/#489).
+// A `boolean | null` local is not yet a supported rep at all (a separate pre-existing
+// gap), so it is not handled here.
+
+// True if the expression at `ix` is an if-EXPRESSION (an `IfStmt` in value position).
+function exprIsIfStmt(ix: i32) {
+  if ix < 0 { return false }
+  const e = P.nodes[unwrapParen(ix)]
+  if e is IfStmt { return true }
+  false
+}
+
+// Emit ONE arm value (`valIx`) in the binding's nullable rep, then `local.set idx`.
+function emitNulArmToLocal(
+  body: i32[],
+  valIx: i32,
+  idx: i32,
+  rep: i32,
+  unionName: string,
+  fnIx: i32,
+) {
+  if valIx < 0 {
+    return emitFail("emitProgram: if-expression arm is not a value")
+  }
+  if rep == 0 {
+    if emitUnionCoerce(body, unionName, valIx, fnIx) < 0 { return -1 }
+  } else {
+    // rep 1: a `string | null` arm — a non-null string passes through, a bare `null`
+    // lowers as `ref.null $aTypeIdx` (`pendingNulString`).
+    const saved = pendingNulString
+    pendingNulString = true
+    let rc = emitExpr(body, valIx, fnIx)
+    pendingNulString = saved
+    if rc < 0 { return -1 }
+  }
+  fbLocalSet(idx)
+  0
+}
+
+// Emit the rep's NULL (the else-less false path / a synthesized null arm), then
+// `local.set idx`: the value-union null-tagged box (rep 0), or `ref.null $aTypeIdx`
+// for a `string | null` (rep 1).
+function emitNulNullToLocal(body: i32[], idx: i32, rep: i32) {
+  if rep == 0 {
+    fbI32Const(scalarTagOf("null"))
+    fbRefNullNone() // the payload slot is unread under the null tag
+    fbStructNew(uBoxIdx)
+  } else {
+    wU8(208) // 0xd0 ref.null
+    wSLEB(aTypeIdx)
+  }
+  fbLocalSet(idx)
+  0
+}
+
+// Lower a nullable/value-union if-EXPRESSION binding init at `ifIx` into local `idx`:
+// a void `if` whose then-arm writes the binding (narrowed by the condition), and whose
+// else writes the else-arm value, a nested `else if` (recurse), or — when there is no
+// else — the rep's null.
+function emitNullableIfBinding(
+  body: i32[],
+  ifIx: i32,
+  idx: i32,
+  rep: i32,
+  unionName: string,
+  fnIx: i32,
+) {
+  let s = P.nodes[unwrapParen(ifIx)]
+  if s is IfStmt {
+    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    fbIf(64) // 0x04 if, 0x40 void blocktype
+    const savedTop = narrowTop
+    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    let rc = emitNulArmToLocal(
+      body,
+      ifArmValueExpr(s.ifThen),
+      idx,
+      rep,
+      unionName,
+      fnIx,
+    )
+    if narrowed { restoreNarrow(savedTop) }
+    if rc < 0 { return -1 }
+    fbElse() // 0x05 else
+    const savedElseTop = narrowTop
+    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
+    let erc = 0
+    if s.ifElse < 0 {
+      erc = emitNulNullToLocal(body, idx, rep)
+    } else {
+      const els = P.nodes[s.ifElse]
+      if els is IfStmt {
+        erc = emitNullableIfBinding(body, s.ifElse, idx, rep, unionName, fnIx)
+      } else {
+        erc = emitNulArmToLocal(
+          body,
+          ifArmValueExpr(s.ifElse),
+          idx,
+          rep,
+          unionName,
+          fnIx,
+        )
+      }
+    }
+    if narrowedElse { restoreNarrow(savedElseTop) }
+    if erc < 0 { return -1 }
+    fbEnd() // 0x0b end
+    return 0
+  }
+  emitFail("emitProgram: expected an if expression")
+}
+
 // Peel any nested parentheses, returning the innermost wrapped expression index.
 function unwrapParen(exprIx: i32) {
   let cur = exprIx
@@ -14415,6 +14534,44 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       letUNm = letAnnNm
     } else {
       letUNm = nliNameOf(stmtIx)
+    }
+    // A nullable / value-union if-EXPRESSION init (`const x: i32 | null = if c then 5
+    // else null`, `else if` chains) lowers by writing the binding's own local in each
+    // arm of a void `if` — no value-typed-if blocktype or scratch slot needed (the
+    // binding local IS the destination). The slot kind `collectLocals` already chose is
+    // the authoritative rep: kind 4 the value-union box (rep 0, needs the union NAME to
+    // box each arm's atom — taken from the annotation / `letUNm`), kind 16 a `string |
+    // null` ref (rep 1). A `boolean | null` local is a separate pre-existing gap (it is
+    // not yet a supported local rep at all), so it is left to the bare paths below.
+    if exprIsIfStmt(s.letInit) {
+      const slotKind = localIsRef[slot]
+      let nulRep = -1
+      let nulNm = ""
+      if slotKind == 4 {
+        if letUNm != "" { nulNm = letUNm }
+        else if s.letType >= 0 { nulNm = tyNameOf(s.letType) }
+        if nulNm != "" { nulRep = 0 }
+      } else if slotKind == 16 {
+        nulRep = 1
+      }
+      if nulRep >= 0 {
+        // The value-union box local (kind 4) is a NON-null `(ref $uBoxIdx)` — non-
+        // defaultable, so the validator needs it definitely assigned. Both arms below
+        // set it, but a void-`if` merge does not satisfy V8's local-init check; pre-seed
+        // the rep's null first (overwritten by every arm). The `string | null` (nullable
+        // ref) rep is defaultable and needs no pre-seed.
+        if nulRep == 0 {
+          if emitNulNullToLocal(body, idx, 0) < 0 { return -1 }
+        }
+        if (
+          emitNullableIfBinding(body, s.letInit, idx, nulRep, nulNm, fnIx) <
+          0
+        ) {
+          return -1
+        }
+        scopeBind(s.letName, slot)
+        return 0
+      }
     }
     if letUNm != "" {
       if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return -1 }
