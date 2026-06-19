@@ -690,6 +690,22 @@ let inferSawErr = false
 // the canonical declaration). Reset per compile in initChecker.
 let moduleGlobals: {[string]: boolean} = Map()
 
+// Recursive return-type inference (binding-group fixpoint). A function whose return
+// only becomes knowable AFTER a recursive cycle resolves can't be inferred in one
+// demand pass — the cycle-break commits a provisional `void`. So a SUPPRESSED
+// return-inference PRE-PASS resolves every un-annotated return BEFORE the real check
+// pass, iterating the cycle-poisoned ("tentative") functions to a fixpoint. This is
+// standard SCC binding-group inference, realized lazily through the existing demand
+// inference (the demand call stack IS the dependency-order traversal). `bodyChecked`
+// lets the real pass still check each body once (the pre-pass only resolved types).
+let topUnannotFns: i32[] = []
+let bodyChecked: {[string]: boolean} = Map()
+let inferQuiet = false
+let cycleBreakCount = 0
+let inferTentative: string[] = []
+let unresolvedFns: string[] = []
+let fnSawValueRet = false
+
 // Contextual callback-param inference: when checking a function-literal argument
 // whose expected type is known from the call site (a `.map`/`.filter` receiver's
 // element type, or any HOF whose param is a known `TyFunc`), the caller stashes
@@ -720,6 +736,13 @@ export function initChecker(): i32 {
   holeShapeTys = []
   fnDeclIx = Map()
   moduleGlobals = Map()
+  topUnannotFns = []
+  bodyChecked = Map()
+  inferQuiet = false
+  cycleBreakCount = 0
+  inferTentative = []
+  unresolvedFns = []
+  fnSawValueRet = false
   daClear()
   daWriteTarget = -1
   inferStack = []
@@ -4999,6 +5022,122 @@ function noteInferredRet(t: i32): i32 {
   0
 }
 
+function listHasStr(xs: string[], v: string): boolean {
+  let i = 0
+  while i < xs.length {
+    if xs[i] == v { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Is `ix` a STATEMENT node (not a value-producing expression)? A function whose
+// body's last node / `return` arg is a value expression has a value return POSITION;
+// one whose body ends in a bare statement (a recursive `if`/`while` with no trailing
+// value) is genuinely void. The redundant-return fixpoint defers ONLY value-return
+// functions poisoned by a cycle, so genuine void recursion is never mis-flagged.
+function isStmtNode(ix: i32): boolean {
+  const nd = P.nodes[ix]
+  if nd is LetDecl { return true }
+  if nd is IfStmt { return true }
+  if nd is WhileStmt { return true }
+  if nd is BreakStmt { return true }
+  if nd is ContinueStmt { return true }
+  if nd is RetStmt { return true }
+  if nd is ForRange { return true }
+  if nd is ForIn { return true }
+  false
+}
+
+function resetReturnPending(name: string): i32 {
+  const h = lookup(name)
+  if h >= 0 {
+    const ht = T.tys[h]
+    if ht is TyFunc { ht.fnRet = -2 }
+  }
+  0
+}
+
+// Demand-infer one top-level function's return, but only if still pending (the
+// memoization guard already short-circuits a resolved one; the fixpoint resets to
+// pending first to force a fresh re-inference once neighbours have settled).
+function preInferOne(dIx: i32): i32 {
+  const dn = P.nodes[dIx]
+  if dn is FuncDecl {
+    const h = lookup(dn.fnName)
+    let pending = true
+    if h >= 0 {
+      const ht = T.tys[h]
+      if ht is TyFunc {
+        if ht.fnRet != -2 { pending = false }
+      }
+    }
+    if pending { checkFuncDeclNode(dn, dIx) }
+  }
+  0
+}
+
+// The return-inference PRE-PASS: resolve every un-annotated return with diagnostics,
+// symbol recording and the redundant-type stream SUPPRESSED, so the real check pass
+// runs against final return types. Non-cycle functions resolve in the first demand
+// sweep (dependency order); cycle-poisoned ones iterate to a fixpoint — each round
+// resets the still-tentative set to pending and re-infers, until the set stops
+// shrinking. What remains is genuinely base-case-less (recorded for the real pass).
+function inferReturnsPrePass(): i32 {
+  if topUnannotFns.length == 0 { return 0 }
+  inferQuiet = true
+  const savedDiag = T.diags.length
+  const savedSym = symEnabled
+  const savedRedun = redunName.length
+  symEnabled = 0
+  let i = 0
+  while i < topUnannotFns.length {
+    preInferOne(topUnannotFns[i])
+    i = i + 1
+  }
+  let shrinking = true
+  let rounds = 0
+  while shrinking && rounds < 2000 {
+    rounds = rounds + 1
+    const work = inferTentative
+    inferTentative = []
+    let r = 0
+    while r < work.length {
+      resetReturnPending(work[r])
+      r = r + 1
+    }
+    let q = 0
+    while q < work.length {
+      const dIx = fnDeclIx[work[q]] ?? -1
+      if dIx >= 0 { preInferOne(dIx) }
+      q = q + 1
+    }
+    if inferTentative.length >= work.length { shrinking = false }
+  }
+  unresolvedFns = []
+  let u = 0
+  while u < inferTentative.length {
+    unresolvedFns.push(inferTentative[u])
+    u = u + 1
+  }
+  symEnabled = savedSym
+  while T.diags.length > savedDiag { T.diags.pop() }
+  redunTruncate(savedRedun)
+  inferQuiet = false
+  0
+}
+
+function redunTruncate(n: i32): i32 {
+  while redunSLine.length > n { redunSLine.pop() }
+  while redunSCol.length > n { redunSCol.pop() }
+  while redunELine.length > n { redunELine.pop() }
+  while redunECol.length > n { redunECol.pop() }
+  while redunName.length > n { redunName.pop() }
+  while redunType.length > n { redunType.pop() }
+  while redunTok.length > n { redunTok.pop() }
+  0
+}
+
 // SOUNDNESS — exhaustiveness of an else-less `is`-chain. Does the flat
 // `if p is A {…} else if p is B {…}` chain rooted at `ifIx` (no final `else`)
 // COVER every variant of `p`'s union type? If so its fall-through is unreachable
@@ -5141,14 +5280,33 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
   // Already inferred on demand (a forward call checked this body before pass 2
   // reached it)? Skip the re-check so diagnostics aren't duplicated.
   if inferring {
-    if onInferStack(n.fnName) { return TY_VOID }
-    const hoisted = lookup(n.fnName)
-    if hoisted >= 0 {
-      if (fnDeclIx[n.fnName] ?? -1) >= 0 {
-        const ht = T.tys[hoisted]
-        if ht is TyFunc {
-          if ht.fnRet != -2 { return TY_VOID }
+    // Recursive cycle: this function is already on the inference stack. Break with a
+    // provisional `void` (the binding-group fixpoint re-infers it once the cycle's
+    // resolvable members settle), and COUNT the break so the completion below knows
+    // the result is tentative rather than final.
+    if onInferStack(n.fnName) {
+      cycleBreakCount = cycleBreakCount + 1
+      return TY_VOID
+    }
+    if inferQuiet {
+      // Suppressed pre-pass: memoize a resolved return (a `-2` reset by the fixpoint
+      // forces a fresh re-inference).
+      const hoisted = lookup(n.fnName)
+      if hoisted >= 0 {
+        if (fnDeclIx[n.fnName] ?? -1) >= 0 {
+          const ht = T.tys[hoisted]
+          if ht is TyFunc {
+            if ht.fnRet != -2 { return TY_VOID }
+          }
         }
+      }
+    } else {
+      // Real check pass: returns are already resolved by the pre-pass, so skip ONLY a
+      // TOP-LEVEL body already diagnostic-checked (a forward call reached it before
+      // pass 2 did). Gated on `fnIx` matching the registered top-level decl, so a
+      // NESTED function sharing a name (e.g. two `add` closures) is never skipped.
+      if (fnDeclIx[n.fnName] ?? -1) == fnIx {
+        if bodyChecked[n.fnName] ?? false { return TY_VOID }
       }
     }
   }
@@ -5230,10 +5388,13 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
   // function's body check) and the enclosing return type.
   const savedObserved = inferObserved
   const savedSawErr = inferSawErr
+  const cbBefore = cycleBreakCount
+  const savedValueRet = fnSawValueRet
   if inferring {
     inferStack.push(n.fnName)
     inferObserved = -1
     inferSawErr = false
+    fnSawValueRet = false
   }
   // Check the body in a fresh scope sharing the parameters.
   pushScope(n.fnBody)
@@ -5277,6 +5438,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
       // type here — before the body scope is popped (and `inner`'s floor checked).
       if s == stmts.length - 1 {
         if inferring {
+          // A value-producing trailing expression is a value return POSITION (vs a
+          // bare trailing statement); the redundant-return fixpoint defers only these.
+          if !isStmtNode(stmts[s]) { fnSawValueRet = true }
           noteInferredRet(stTy)
         } else {
           constrainEmpty(stTy, ret)
@@ -5341,15 +5505,29 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
   T.curRet = savedRet
   daRestore(daSavedUnassigned)
   popScope()
+  if !inferQuiet {
+    // Mark only the registered TOP-LEVEL decl (not a nested/shadowing namesake).
+    if n.fnName != "" && (fnDeclIx[n.fnName] ?? -1) == fnIx {
+      bodyChecked[n.fnName] = true
+    }
+  }
   if inferring {
     inferStack.pop()
     let inferred = TY_VOID
+    const sawCycle = cycleBreakCount > cbBefore
     if inferObserved >= 0 {
       inferred = inferObserved
+    } else if sawCycle && fnSawValueRet {
+      // A value return position resolved to `void` ONLY because a recursive-cycle
+      // member was still pending. Defer: the binding-group fixpoint re-infers this
+      // once the cycle's resolvable members settle (a genuinely base-case-less cycle
+      // stays tentative and is reported by the real pass). Genuine void recursion has
+      // no value return position (`fnSawValueRet` is false), so it is never deferred.
+      if !listHasStr(inferTentative, n.fnName) { inferTentative.push(n.fnName) }
+      inferred = TY_VOID
     } else if inferSawErr {
-      // Only err-ish types flowed back (a base-case-less cycle): no basis. But a
-      // param that was itself uninferable already reported the root cause, so
-      // suppress the (redundant) return-type message in that case.
+      // Only err-ish types flowed back: no basis. A param that was itself uninferable
+      // already reported the root cause, so suppress the redundant message.
       if !paramUninferable {
         tErr(
           "cannot infer a return type for '" + n.fnName + "' — annotate a return type",
@@ -5385,6 +5563,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32): i32 {
     }
     inferObserved = savedObserved
     inferSawErr = savedSawErr
+    fnSawValueRet = savedValueRet
   }
   // Inferred type guard (A6b, host parity — degenerate case): a NAMED function
   // whose body's RESULT is exactly a null-test on one of its params registers
@@ -5682,6 +5861,9 @@ function checkProgramNode(n: Program): i32 {
       }
       declare(s.fnName, mkFuncTy(hpt, hret))
       fnDeclIx[s.fnName] = stmts[hi]
+      // Collect un-annotated returns (hoisted as the `-2` pending sentinel) for the
+      // return-inference pre-pass.
+      if hret == (-2) { topUnannotFns.push(stmts[hi]) }
       // Completion visibility: a top-level function is global. Stamped here (only
       // the global scope is open) so it wins over any later demand-inference
       // re-entry, which would run the body from a deeper stack (see `symStampVis`).
@@ -5750,11 +5932,34 @@ function checkProgramNode(n: Program): i32 {
     }
     mi = mi + 1
   }
+  // Pass 1.7: return-inference pre-pass — resolve every un-annotated return (cycles
+  // included, via the binding-group fixpoint) BEFORE checking bodies, so pass 2 sees
+  // final return types and a recursive function needs no return annotation.
+  inferReturnsPrePass()
   // Pass 2: check every top-level statement (bodies included).
   let j = 0
   while j < stmts.length {
     checkNode(stmts[j])
     j = j + 1
+  }
+  // A function whose return never resolved (a genuinely base-case-less recursive
+  // cycle) — the fixpoint found no concrete basis. Reported here, after the real
+  // pass (the pre-pass suppressed it).
+  let uf = 0
+  while uf < unresolvedFns.length {
+    const ufIx = fnDeclIx[unresolvedFns[uf]] ?? -1
+    if ufIx >= 0 {
+      const ufn = P.nodes[ufIx]
+      if ufn is FuncDecl {
+        tErr(
+          "cannot infer a return type for '" +
+            unresolvedFns[uf] +
+            "' — annotate a return type",
+          ufn.fnBody,
+        )
+      }
+    }
+    uf = uf + 1
   }
   TY_VOID
 }
@@ -6785,6 +6990,8 @@ function checkNode(ix: i32): i32 {
     // Under a PENDING return type (-2: this function's return is being inferred),
     // record the returned type as a witness instead of checking a mismatch.
     if want == -2 {
+      // `return <expr>` is always a value return position.
+      fnSawValueRet = true
       noteInferredRet(checkNode(n.retArg))
       return TY_VOID
     }

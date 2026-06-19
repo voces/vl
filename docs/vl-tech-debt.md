@@ -71,12 +71,15 @@ annotations (`let`/`const`). Follow-ups, in order of safety:
   inferred return is exactly `T`. Reuse the demand-inferred-return machinery
   (`noteInferredRet`); the checker already writes the inferred return back into the
   retained type, so the comparison point exists. Lower volume risk than params.
-  ENABLER LANDED (`A18`, order-independent module scope): a first cut showed many of
-  the compiler's own return annotations were NOT actually redundant — removing one
-  turned the function demand-inferred, and its body could no longer resolve a global
-  declared later in the file (the annotation was suppressing that early inference).
-  With top-level values now hoisted, those annotations are genuinely removable; the
-  rule + `--fix` apply ride on `A18`.
+  ENABLERS LANDED (`A18` order-independent module scope, `A19` binding-group return
+  inference): a first cut showed many of the compiler's own return annotations were
+  NOT actually redundant — removing one turned the function demand-inferred, and its
+  body could no longer resolve (a) a global declared later in the file (fixed by
+  `A18`), or (b) its own return when it passed through a recursive cycle (the
+  parser's mutual recursion — fixed by `A19`'s fixpoint). With both landed, the
+  parser's recursive functions need no return annotation and the redundant-return
+  rule + `--fix` apply can ride on top. The remaining genuinely-required annotations
+  are only base-case-less inferred cycles (correctly reported as `cannot infer`).
 - **Redundant PARAMETER annotations — last, and carefully.** Removing a param
   annotation can turn a monomorphic function generic (a real semantic change: it
   changes overload/monomorphization behavior, not just a type label). Only safe
