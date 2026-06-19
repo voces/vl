@@ -139,6 +139,16 @@ annotations (`let`/`const`). Follow-ups, in order of safety:
 
 ## Known bugs carried as debt
 
+- **Self-recursive un-annotated return infers a spurious union.** `function fib(n: i32) {
+  if n < 2 { return n }; return fib(n-1) + fib(n-2) }` (no `: i32`) fails with `operator
+  '+' is not defined for i32 | string and i32 | string` — the recursive call's type during
+  cycle-breaking is left ambiguous, so `+` (which is i32-add OR string-concat) widens the
+  return to `i32 | string`, and the next round joins on that. The ANNOTATED form works.
+  A19 (binding-group recursive inference) handles mutual recursion through a plain return;
+  this is the case where the recursive call feeds an OPERATOR whose result type depends on
+  the (still-unknown) operand type. Fix direction: pin the cycle member to its first
+  concrete (non-recursive) return as the provisional type before resolving operator
+  results, or seed `+` from the i32 base when an operand is a pending-cycle hole.
 - **Builtin-type hover renders `i32: i32`.** Hovering a builtin TYPE name (`i32`,
   `f64`, `boolean`, `string`, …) in any position shows `i32: i32` — silly. The
   hover chain (`server.ts` `onHover` / `lspAdapter.hover`) ends in a builtin

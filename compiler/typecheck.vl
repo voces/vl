@@ -576,6 +576,71 @@ function daBranchDiverges(ix: i32) {
   }
   false
 }
+
+// ── missing-return totality (soundness) ──────────────────────────────────────
+// True if the `if`-condition at `ifCondIx` opens a DISCRIMINATING chain — `x is T`, or a
+// `place == <literal>` over a literal-union-bearing place. Such an ELSE-LESS chain may be
+// EXHAUSTIVE (cover every variant), which the dedicated exhaustiveness check adjudicates;
+// the general missing-return rule defers to it rather than double-flagging. Mirrors the
+// `isChain` detection in that check.
+function ifCondIsDiscriminating(ifCondIx: i32) {
+  const fc = P.nodes[ifCondIx]
+  if fc is IsExpr { return true }
+  if fc is BinExpr {
+    if fc.binOp == "==" {
+      let eqPlace = -1
+      if litTyOfExpr(fc.binRight) >= 0 { eqPlace = fc.binLeft }
+      else if litTyOfExpr(fc.binLeft) >= 0 { eqPlace = fc.binRight }
+      if eqPlace >= 0 {
+        const eqObj = P.nodes[eqPlace]
+        if eqObj is Ident {
+          if isLitBearing(lookup(eqObj.identName)) { return true }
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if executing the node at `ix` always produces a RETURN VALUE or DIVERGES — i.e.
+// control never falls off its end without a value. Unlike `daBranchDiverges`, a bare
+// trailing VALUE EXPRESSION counts (an implicit return — `!isStmtNode`), so this is the
+// totality test for "a non-void function must yield a value on every path". A `Block` is
+// total iff its last statement is; an `if`/`else` iff BOTH arms are (an `else if` chain
+// recurses through `ifElse`); a `while true { … }` never falls through (diverges or
+// returns from inside) so it is total — every other loop / if-without-else / statement
+// can complete without a value and is NOT total.
+function nodeIsTotal(ix: i32) {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is Block {
+    const st = n.blkStmts
+    if st.length == 0 { return false }
+    return nodeIsTotal(st[st.length - 1])
+  }
+  if n is RetStmt { return true }
+  if n is BreakStmt { return true }
+  if n is ContinueStmt { return true }
+  if n is IfStmt {
+    if n.ifElse < 0 {
+      // An ELSE-LESS `if`: a discriminating `is` / literal-equality chain may be
+      // EXHAUSTIVE — defer to the dedicated exhaustiveness check (it knows the union's
+      // variants). A plain else-less `if` always has a fall-through, so it is NOT total.
+      if ifCondIsDiscriminating(n.ifCond) { return true }
+      return false
+    }
+    return nodeIsTotal(n.ifThen) && nodeIsTotal(n.ifElse)
+  }
+  if n is WhileStmt {
+    // `while true { … }` never completes normally — it diverges or returns inside.
+    const c = P.nodes[n.whileCond]
+    if c is BoolLit { return c.boolVal != 0 }
+    return false
+  }
+  // A bare trailing value expression IS the implicit return.
+  return !isStmtNode(ix)
+}
+
 // True if `name` resolves (innermost-first) to a `const` binding.
 function isConstName(name: string) {
   let i = T.scopes.length - 1
@@ -5647,6 +5712,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       s = s + 1
     }
   }
+  // Capture body TOTALITY (missing-return soundness) while the body scope is still LIVE
+  // — `ifCondIsDiscriminating` looks up a discriminated param/local's type, which the
+  // `popScope` below would drop. The flag is consumed after `ret` is finalized.
+  const bodyTotalForRet = nodeIsTotal(n.fnBody)
   T.curRet = savedRet
   daRestore(daSavedUnassigned)
   popScope()
@@ -5746,6 +5815,14 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     inferObserved = savedObserved
     inferSawErr = savedSawErr
     fnSawValueRet = savedValueRet
+  }
+  // SOUNDNESS — missing return: a NON-VOID function (`ret` is a real value type, declared
+  // or inferred) whose body can fall off the end without yielding a value on some path
+  // traps at runtime (the wasm result-type fallthrough). Require totality — every path
+  // must return / diverge / end in an implicit-return value. Suppressed in the pre-pass
+  // (`inferQuiet`) and on a void/error return (no cascade).
+  if (!inferQuiet && ret != TY_VOID && ret != TY_ERR && !bodyTotalForRet) {
+    tErr("not all code paths return a value in '" + n.fnName + "'", n.fnBody)
   }
   // Redundant RETURN annotation: the body's NATURAL inferred return already equals the
   // explicit `: T`, so removing it yields the identical type. Conservative: a single
