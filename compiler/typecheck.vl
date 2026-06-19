@@ -5121,7 +5121,17 @@ function noteInferredRet(t: i32) {
   if tt is TyPrim {
     if tt.primName == "void" { return 0 }
   }
-  if inferObserved < 0 { inferObserved = t }
+  // JOIN every non-void return, not just the first: a function whose returns
+  // disagree (`return 5` … `return null`, or `return 5` … `return "hi"`) infers the
+  // flattened UNION/nullable of them (`joinTys` mirrors the host's
+  // `flattenType(Union(...))`), so the caller sees the true type. First-wins silently
+  // dropped later branches — the checker then mis-typed a `!= null` compare or let a
+  // string flow through an i32 result and crash codegen.
+  if inferObserved < 0 {
+    inferObserved = t
+  } else {
+    inferObserved = joinTys(inferObserved, t)
+  }
   0
 }
 
@@ -5138,7 +5148,13 @@ function noteNaturalRet(t: i32) {
   if tt is TyPrim {
     if tt.primName == "void" { return 0 }
   }
-  if retNatural < 0 { retNatural = t }
+  // JOIN, mirroring noteInferredRet (above) so the captured "natural" return IS what
+  // an unannotated version would infer — a multi-return function joins to a union.
+  if retNatural < 0 {
+    retNatural = t
+  } else {
+    retNatural = joinTys(retNatural, t)
+  }
   0
 }
 
@@ -5664,6 +5680,33 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         )
       }
       inferred = TY_ERR
+    }
+    // Robustness floor (host parity with the empty-`[]` "cannot infer — annotate"
+    // floor): an un-annotated function whose returns JOIN to a union/nullable now
+    // infers the CORRECT type, but the emitter cannot yet lower an un-annotated
+    // union/nullable return — the `A20` return classifier carries scalar/string/array,
+    // not the union box / nullable-struct seed, so a bare `return null` / a string
+    // through an i32 result crashes codegen ("bare null needs a struct-typed context").
+    // Require an explicit annotation here, which DOES lower (the annotated path seeds
+    // the return). Codegen elaboration that removes this requirement — inferred
+    // union/nullable returns end-to-end — is the documented follow-up.
+    if !inferQuiet && n.fnName != "" && inferred >= 0 {
+      const itt = T.tys[inferred]
+      if itt is TyUnion {
+        tErr(
+          "cannot infer a union return type for '" +
+            n.fnName +
+            "' — annotate the return type",
+          n.fnBody,
+        )
+      } else if itt is TyNullable {
+        tErr(
+          "cannot infer a nullable return type for '" +
+            n.fnName +
+            "' — annotate the return type",
+          n.fnBody,
+        )
+      }
     }
     ret = inferred
     // Patch the hoisted TyFunc IN PLACE so existing references see the result;
