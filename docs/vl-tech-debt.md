@@ -79,14 +79,20 @@ annotations (`let`/`const`). Follow-ups, in order of safety:
   NON-generic functions — the categories `A20` + the emitter default lower safely.
   `i32[]` returns now CLASSIFIED too (`A20` widened: checker exports the inferred
   `i32[]` name, emitter maps it to `fRetArr`); the compiler-wide apply of those (~22)
-  bootstraps on that seed in a separate step. REMAINING follow-up:
-  **`string[]` and other array/union/nullable returns** (kept annotated). `string[]`
-  needs more than the `fRetStrArr` bit — `string` is internally `{[i32]:i32}`, so
-  `string[]` is a ref-list whose backing/list wasm type must be driven from the
-  return, which the bare flag doesn't do (the function signature falls back to i32);
-  the annotated path registers it via the real `TypeRef`. Genuinely-required
-  annotations that stay: base-case-less inferred cycles (`cannot infer`) and
-  object/ref-array returns (structural emit identity).
+  bootstrapped on that seed in a separate step. `string[]` returns now CLASSIFIED too
+  — the earlier worry that `string` being internally `{[i32]:i32}` forced a
+  per-function ref-list slot was WRONG: `string[]` lowers to the same module-global
+  string-list wrapper (`mkListIdx`, valtype kind 7) the annotated path uses, so the
+  only gap was the un-annotated function-SIGNATURE result valtype (it handled
+  `fRetStr/Arr/Uni/Ref/Nul/RArr` but not `fRetStrArr`, falling back to an i32 result
+  and trapping on a caller's index). Checker exports the inferred `string[]` name,
+  emitter sets `fRetStrArr` + the signature path maps it to kind 7; the apply of those
+  (7) bootstraps on that seed in a separate step. REMAINING follow-up:
+  **`f64[]`, ref-array (`T[]`), union, and nullable returns** (kept annotated) — each
+  needs its own classifier/result-valtype wiring (and a ref-array's element wrapper is
+  a per-function slot, unlike the singleton string/i32 lists). Genuinely-required
+  annotations that stay regardless: base-case-less inferred cycles (`cannot infer`)
+  and object returns (structural emit identity).
 - **Redundant PARAMETER annotations — last, and carefully.** Removing a param
   annotation can turn a monomorphic function generic (a real semantic change: it
   changes overload/monomorphization behavior, not just a type label). Only safe
