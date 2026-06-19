@@ -207,23 +207,26 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-check-redundant-type: flags + fixes a redundant RETURN annotation (scalar/string)",
+  name: "vl-check-redundant-type: flags + fixes a redundant RETURN annotation (scalar/string/string[])",
   ignore: !ENABLED,
   fn: async () => {
-    // `f`/`g` infer exactly their annotation; `widen` (i32 body → i64) and `obj`
-    // (object return) and `gen` (generic `self`) are NOT flagged.
+    // `f`/`g`/`ss` infer exactly their annotation; `widen` (i32 body → i64),
+    // `obj`/`gen` (generic `self`) are NOT flagged. `ss` returns a `string[]` built
+    // from a load-bearing local (`const xs: string[] = []`, whose bare-`[]` init keeps
+    // its annotation) — the RETURN annotation is redundant but the LOCAL is not.
     const src =
       "function f(a: i32, b: i32): i32 { b }\n" +
       "function g(): string { \"hi\" }\n" +
+      "function ss(): string[] {\n  const xs: string[] = []\n  xs.push(\"a\")\n  xs\n}\n" +
       "function widen(): i64 { 5 }\n" +
       "function gen(self): i32 { self.x }\n" +
-      "print(f(1, 2) + g().length + widen() + gen({x: 1}))\n";
+      "print(f(1, 2) + g().length + ss().length + widen() + gen({x: 1}))\n";
     const hits = redundantLines((await check(src)).err);
-    if (hits.length !== 2) {
-      throw new Error(`expected exactly f + g flagged, got ${hits.length}:\n${hits.join("\n")}`);
+    if (hits.length !== 3) {
+      throw new Error(`expected exactly f + g + ss flagged, got ${hits.length}:\n${hits.join("\n")}`);
     }
-    if (!hits[0].includes("`f`") || !hits[1].includes("`g`")) {
-      throw new Error(`expected f + g, got:\n${hits.join("\n")}`);
+    if (!hits[0].includes("`f`") || !hits[1].includes("`g`") || !hits[2].includes("`ss`")) {
+      throw new Error(`expected f + g + ss, got:\n${hits.join("\n")}`);
     }
     const r = await fix(src);
     if (!r.after.includes("function f(a: i32, b: i32) { b }")) {
@@ -231,6 +234,10 @@ Deno.test({
     }
     if (!r.after.includes("function g() { \"hi\" }")) {
       throw new Error(`g's return not removed:\n${r.after}`);
+    }
+    // `ss`'s `string[]` return annotation removed; its load-bearing local kept.
+    if (!r.after.includes("function ss() {") || !r.after.includes("const xs: string[] = []")) {
+      throw new Error(`ss's return not removed (or its local was wrongly stripped):\n${r.after}`);
     }
     if (!r.after.includes("function widen(): i64") || !r.after.includes("function gen(self): i32")) {
       throw new Error(`a load-bearing/excluded return was wrongly removed:\n${r.after}`);
