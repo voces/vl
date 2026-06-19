@@ -67,19 +67,22 @@ annotations (`let`/`const`). Follow-ups, in order of safety:
   module's; `--fix` runs AFTER the resolved module compile (reliable types). Applied
   to the compiler (`−150` annotations, byte-identical seed). LSP surfacing of the
   hint could ride the same `redunModuleAt` filter (not yet wired).
-- **Redundant RETURN-type annotations.** `function f(): T { … }` where the body's
-  inferred return is exactly `T`. Reuse the demand-inferred-return machinery
-  (`noteInferredRet`); the checker already writes the inferred return back into the
-  retained type, so the comparison point exists. Lower volume risk than params.
-  ENABLERS LANDED (`A18` order-independent module scope, `A19` binding-group return
-  inference): a first cut showed many of the compiler's own return annotations were
-  NOT actually redundant — removing one turned the function demand-inferred, and its
-  body could no longer resolve (a) a global declared later in the file (fixed by
-  `A18`), or (b) its own return when it passed through a recursive cycle (the
-  parser's mutual recursion — fixed by `A19`'s fixpoint). With both landed, the
-  parser's recursive functions need no return annotation and the redundant-return
-  rule + `--fix` apply can ride on top. The remaining genuinely-required annotations
-  are only base-case-less inferred cycles (correctly reported as `cannot infer`).
+- **Redundant RETURN-type annotations.** `[MOSTLY PAID]` `function f(): T { … }` whose
+  body's inferred return is exactly `T` is flagged + `--fix`-removed; `vl check --fix
+  compiler/ std/` dropped **1180** of them (byte-identical seed). It took THREE
+  enablers, each a first-cut breakage: removing an annotation makes the function
+  inferred, and the inference/codegen had to keep up — `A18` (order-independent module
+  scope; a body could not resolve a global declared later), `A19` (binding-group
+  recursive inference; a return through a mutual-recursion cycle inferred `void`), and
+  `A20` (the emitter re-derived an un-annotated string/variable return from the
+  expression and crashed codegen). The rule is now scoped to SCALAR/STRING returns of
+  NON-generic functions — the categories `A20` + the emitter default lower safely.
+  REMAINING follow-up: **array / union / nullable returns** (kept annotated for now) —
+  widen `A20`'s direct-flag classification to `i32[]`/`string[]` (the checker already
+  exports the inferred name; the emitter would map `nameIsI32Array`→`fRetArr`,
+  `nameIsStringArray`→`fRetStrArr`), then drop the rule's scalar/string-only gate.
+  Genuinely-required annotations that stay: base-case-less inferred cycles (`cannot
+  infer`) and object/ref-array returns (structural emit identity).
 - **Redundant PARAMETER annotations — last, and carefully.** Removing a param
   annotation can turn a monomorphic function generic (a real semantic change: it
   changes overload/monomorphization behavior, not just a type label). Only safe
