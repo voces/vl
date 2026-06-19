@@ -747,6 +747,19 @@ let fnDeclIx: {[string]: i32} = Map()
 let inferStack: string[] = []
 let inferObserved = -1
 let inferSawErr = false
+// The VALUE type of the most recently checked Block — its trailing expression's type
+// (the block's implicit-return value), or TY_VOID when the block ends in a statement.
+// `checkNode(Block)` itself returns TY_VOID (a block is a statement); this carries the
+// tail value out-of-band so an `if … { v } else { w }` EXPRESSION can join its branch
+// values. Read immediately after a `checkNode(block)`.
+let blockTailTy = -1
+// True while checking a node whose VALUE is the enclosing function's return (an
+// implicit-return tail position): the function-body tail statement, and — propagated —
+// the tail of each branch of a tail `if`/`else`. Gates seeding `inferObserved` from a
+// branch value so a base-case branch pins the type before a recursive sibling branch is
+// checked (`if n<2 { n } else { rec(n-1)+rec(n-2) }`), WITHOUT a non-tail `if`'s branch
+// values polluting the inferred return.
+let retTailPos = false
 
 // Every top-level (module-scope) `let`/`const` NAME, hoisted in pass 1.5 so a
 // function body — checked in pass 2 OR pulled early by demand-inference — resolves
@@ -5655,7 +5668,17 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     const stmts = body.blkStmts
     let s = 0
     while s < stmts.length {
+      // The LAST statement's value is this function's implicit return. Under inference,
+      // mark it as the return-tail position so a tail `if`/`else`'s base-case branch
+      // seeds `inferObserved` before a recursive sibling branch is checked.
+      const savedRTPbody = retTailPos
+      if s == stmts.length - 1 && inferring {
+        retTailPos = true
+      } else {
+        retTailPos = false
+      }
       const stTy = checkNode(stmts[s])
+      retTailPos = savedRTPbody
       // The trailing expression is the implicit return; under inference it is a
       // return-type witness. With a CONCRETE annotated return, a trailing empty
       // collection (`mk(): i32[] { … inner }`) pins its element from the return
@@ -7208,6 +7231,11 @@ function checkNode(ix: i32) {
     return TY_VOID
     // ── if / else ─────────────────────────────────────────────────────────────
   } else if n is IfStmt {
+    // An `if`/`else` in VALUE position is an EXPRESSION whose value is the join of its
+    // branch tail values (`if c { 1 } else { 2 }` is `i32`). Capture whether THIS `if`
+    // sits in the function's return-tail position; the condition itself never does.
+    const ifTail = retTailPos
+    retTailPos = false
     const condTy = checkNode(n.ifCond)
     if !assignable(condTy, TY_BOOL) {
       tErr("if-condition must be bool, got " + tyToStr(condTy), ix)
@@ -7243,14 +7271,30 @@ function checkNode(ix: i32) {
       pushScope(-1)
       applyNarrows(tnNames, tnTys)
     }
+    retTailPos = ifTail
     checkNode(n.ifThen)
+    retTailPos = false
+    const thenTy = blockTailTy
     if tnNames.length > 0 { popScope() }
+    // SEED the inferred return from the then-branch value BEFORE the else is checked, so
+    // a recursive call in the else (`fib(n-1)+fib(n-2)`) resolves against the base-case
+    // type (`return n` → i32) instead of an unresolved hole (the #487 mechanism, now
+    // reached through an implicit-return branch value, not just an explicit `return`).
+    // Seed only from a genuine value-`if` (one WITH an `else` — a no-else `if` is a
+    // statement, not a value expression) and only a CONCRETE branch value: a TY_VOID
+    // (a statement-tail branch, e.g. a void procedure's recursive tail call) or a still-
+    // unresolved TY_ERR (a recursive call with no base case seeded yet) must not be
+    // mistaken for the return type, or a void procedure infers a spurious value/error.
+    if ifTail && n.ifElse >= 0 {
+      if thenTy != TY_VOID && thenTy != TY_ERR { noteInferredRet(thenTy) }
+    }
     // Surviving paths' end-states, each as an unassigned snapshot. Seed with the
     // then-branch end if it survived.
     const daThenEnd = daSnapshot()
     daRestore(daEntry)
     let daElseDiverges = false
     let daElseEnd = daEntry
+    let elseTy = TY_VOID
     const daHasElse = n.ifElse >= 0
     if daHasElse {
       daElseDiverges = daBranchDiverges(n.ifElse)
@@ -7258,8 +7302,14 @@ function checkNode(ix: i32) {
         pushScope(-1)
         applyNarrows(enNames, enTys)
       }
+      retTailPos = ifTail
       checkNode(n.ifElse)
+      retTailPos = false
+      elseTy = blockTailTy
       if enNames.length > 0 { popScope() }
+      if ifTail {
+        if elseTy != TY_VOID && elseTy != TY_ERR { noteInferredRet(elseTy) }
+      }
       daElseEnd = daSnapshot()
     }
     // Join the surviving paths. Start from the empty set and fold in every
@@ -7320,6 +7370,12 @@ function checkNode(ix: i32) {
         }
       }
     }
+    retTailPos = ifTail
+    // The `if`-expression's VALUE type: the join of the two branch tail values. With no
+    // `else` the `if` may not yield a value (the fall-through has none), so it is valueless
+    // (TY_VOID) — a value-position use without `else` stays as before. A statement `if`
+    // (void branches) joins to TY_VOID, unchanged.
+    if daHasElse { return joinTys(thenTy, elseTy) }
     return TY_VOID
     // ── return ────────────────────────────────────────────────────────────────
   } else if n is RetStmt {
@@ -7357,12 +7413,28 @@ function checkNode(ix: i32) {
   } else if n is Block {
     pushScope(ix)
     const stmts = n.blkStmts
+    const savedRTP = retTailPos
+    let tailTy = TY_VOID
     let i = 0
     while i < stmts.length {
-      checkNode(stmts[i])
+      // Only the LAST statement is the block's value (and inherits tail position); the
+      // rest are not the block's value, so they never carry the return tail.
+      if i == stmts.length - 1 {
+        retTailPos = savedRTP
+      } else {
+        retTailPos = false
+      }
+      const sty = checkNode(stmts[i])
+      if i == stmts.length - 1 {
+        // A value-producing trailing expression is the block's value; a trailing
+        // STATEMENT (return / let / assignment / loop) leaves the block valueless.
+        if !isStmtNode(stmts[i]) { tailTy = sty }
+      }
       i = i + 1
     }
+    retTailPos = savedRTP
     popScope()
+    blockTailTy = tailTy
     return TY_VOID
     // ── program ───────────────────────────────────────────────────────────────
   } else if n is Program {
