@@ -1,7 +1,7 @@
 # Codegen builder migration plan: refactoring `wasmEmit.vl` onto a thin builder
 
 > Status: **executable migration plan, not landed.** This operationalizes the
-> recommendation in [`docs/codegen-architecture.md`](codegen-architecture.md)
+> recommendation in [`docs/internals/codegen-architecture.md`](codegen-architecture.md)
 > (branch `claude/codegen-architecture-analysis`): refactor the self-hosted WasmGC
 > emitter (`compiler/wasmEmit.vl`, `emitProgram`) onto a **thin 3-layer streaming
 > builder** — `BinaryWriter` → typed `WasmModule`/`FuncBuilder` → slim `emit*`
@@ -364,7 +364,7 @@ let it drift.
 ## 5. Sequencing vs. the bootstrap
 
 Two milestones are in flight: (1) **`typecheck.vl` self-compiles** (in progress, per
-`docs/selfhost-gaps.md`), and (2) the **`wasmEmit.vl`-self-compiles** step (the final
+`docs/internals/selfhost-gaps.md`), and (2) the **`wasmEmit.vl`-self-compiles** step (the final
 bootstrap milestone — the emitter emitting itself).
 
 **Recommendation: do this refactor *before* `wasmEmit.vl` self-compiles, and it makes
@@ -457,5 +457,5 @@ The golden is the rollback trigger; small PRs are the rollback *mechanism*:
   self-compiles, interleaved per-family with in-flight emitter feature work — the
   refactor *shrinks* the self-compile frontier (657 byte-ops → ~40 methods).
 
-See [`docs/codegen-architecture.md`](codegen-architecture.md) for the rationale this
+See [`docs/internals/codegen-architecture.md`](codegen-architecture.md) for the rationale this
 plan operationalizes.

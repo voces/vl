@@ -3,7 +3,7 @@
 > Status: **design — owner-reviewed direction, pending implementation.** No
 > compiler code exists for this yet, and this document changes none; the final
 > word lands in `DECISIONS.md` at implementation time (in the spirit of
-> `docs/collections-design.md`). The eight points the owner reviewed (§5) are now
+> `docs/guide/collections-design.md`). The eight points the owner reviewed (§5) are now
 > **decided directions (pending implementation)** — settled leanings, not open
 > questions — and the prose below reflects them. Remaining sub-questions and exact
 > spellings of unreviewed details stay open and are flagged as such.
@@ -28,7 +28,7 @@ That blocks two roadmap-critical things:
    should not pay.
 
 2. **The "std written in `.vl` over a thin intrinsic floor" end-state.**
-   `docs/collections-design.md` (§LS.1–LS.7) recommends writing `List`/`Map`/`Set`
+   `docs/guide/collections-design.md` (§LS.1–LS.7) recommends writing `List`/`Map`/`Set`
    as ordinary `.vl` library types over a two-primitive intrinsic floor
    (`__array_new__`/`__array_new_default__` + `__array_copy__`), explicitly the
    Rust/C++/Swift "stdlib-over-primitives" model rather than the Go "baked into the
@@ -381,7 +381,7 @@ model is what lets those files still become the *one* module H-M2 requires.
   explicit-import modules over one grab-bag. **Flat now** (`std:list`, not
   `std:collections/list`); sub-paths only if the namespace sprawls later.
 - **What's in it (as collections migrate off compiler-internal helpers):**
-  - `std:list` — `List<T>`, the growable sequence (`docs/collections-design.md`
+  - `std:list` — `List<T>`, the growable sequence (`docs/guide/collections-design.md`
     §VL.1–VL.7), written in `.vl` over the **two-primitive intrinsic floor**
     (`__array_new__` / `__array_new_default__` + `__array_copy__`). Today its
     capabilities live as compiler-internal helpers / the fixed-array MVP; this is
@@ -642,7 +642,7 @@ each, and the unreviewed item (cross-module init order) stays fully open.
 - WebAssembly single-module vs linking (why whole-program → one module here):
   [WebAssembly component model overview](https://component-model.bytecodealliance.org/),
   [Wasmtime](https://docs.wasmtime.dev/).
-- Internal: `docs/collections-design.md` (§LS.1–LS.7, the std-over-primitives
+- Internal: `docs/guide/collections-design.md` (§LS.1–LS.7, the std-over-primitives
   recommendation + the open module question), `ROADMAP.md` Track H, `DECISIONS.md`
   (B16, D2), `compiler/defaultScope.ts`, `compiler/compile.ts`,
   `compiler/symbols.ts`, `compiler/cli.ts`.

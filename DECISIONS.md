@@ -155,7 +155,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   conditional and multi-piece `+`-chains) lowers to a growable char buffer with
   amortized appends, materialized to one new immutable string after the loop —
   O(n²)→O(n). This is the sanctioned in-place/builder optimization of
-  `docs/strings-design.md` (§Mutability: in-place when the value is provably
+  `docs/guide/strings-design.md` (§Mutability: in-place when the value is provably
   unaliased/dead; OQ-A's perf half), and it does NOT change string storage (still
   `array i32` of code points — frozen until self-hosting), only how a recognized
   accumulation loop lowers. Sound because the accumulator is fresh, never read
@@ -227,16 +227,6 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   two statements, `a - b` is subtraction) or carries a real perf cost. Applies to
   both the TS parser and the self-hosted `parser.vl` being built for the
   bootstrap. (G8)
-- **Distribute via `deno compile`.** *(RETIRED — replaced by the native `vl` host
-  (H-M2): `cargo build --features embed-seed` produces a single self-contained Rust
-  binary with the compiler seed baked in, no V8/node/binaryen runtime. The
-  `deno compile` path + its `compiler/cli.ts` entry, `scripts/build-binary.ts`, and
-  `scripts/smoke-binary.ts` are deleted; `release.yml` builds the native binary
-  per-OS via `scripts/build-binary.sh`. See `CHANGELOG.md`.)* The original interim
-  decision: a single native `vl` binary (V8 + the TS compiler + binaryen.js) through
-  brew, versionless — chosen so distribution shipped early, decoupled from
-  self-hosting. It served until the self-hosted seed + native host made the TS
-  compiler unnecessary in the shipped artifact. (C5)
 - **Self-hosted WASM emission: emit bytes directly + optional `wasm-opt`.**
   binaryen's npm build is JS-bound (Emscripten glue, not a standalone WASI
   module), so the self-hosted compiler emits the wasm binary encoding itself and
@@ -254,7 +244,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   write → dispose, vs. the 640 builder calls) as an upgrade when subprocess
   latency/`PATH` bites. Self-hosting removes the reason V8 ships (the TS
   compiler); direct emission removes the reason binaryen ships as a builder.
-  Full analysis: `docs/binaryen-transition.md`. (H4.1)
+  Full analysis: `docs/internals/binaryen-transition.md`. (H4.1)
 - **B-validwasm is the gate that makes optimization optional.** Today some
   constructs only _validate_ after `optimize()` runs (binaryen's passes quietly
   fix up naive emission), so the "unoptimized" path isn't actually optional.
@@ -286,7 +276,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   (runtime-agnostic, like the rest of the core). Phase 1 = relative user-file
   imports only; the `std:` scheme + embedded std (phase 2) and cross-file LSP
   (phase 3) are deferred, as are import maps / namespace+default imports /
-  re-exports. Design + full rationale: `docs/modules-design.md`. (H0)
+  re-exports. Design + full rationale: `docs/internals/modules-design.md`. (H0)
   - _Sub-questions resolved at implementation:_ (a) the entry module is mangled
     uniformly like every other (simpler rule, debuggable names) rather than kept
     verbatim; (b) modules merge in dependency-first (import topological) order

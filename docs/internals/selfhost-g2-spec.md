@@ -3,7 +3,7 @@
 > Status: **spec / research only.** Changes no compiler file. This is the
 > ground-truth byte reference the G2 implementation lane (in `compiler/wasmEmit.vl`)
 > will trust, derived from gap items **G2** (struct field write) and **G5**
-> (module-level mutable globals) in `docs/selfhost-gaps.md`. Every byte claim
+> (module-level mutable globals) in `docs/internals/selfhost-gaps.md`. Every byte claim
 > below is backed by an actual binaryen hexdump — the reference program and the
 > exact command are given for each so it is reproducible. Wrong bytes here are
 > worse than no spec, so each multi-byte sequence is decoded field-by-field

@@ -584,7 +584,7 @@ is no fixed-array literal to fight.
   in range — inside `for i in 0 to a.length`, in the then-branch of
   `if i < a.length`, or after an explicit guard — it drops the compare-and-trap,
   leaving the bare `array.get`. This reuses the same narrowing engine that refines
-  nullness and union members (A5, `docs/narrowing.md`), pointed at the
+  nullness and union members (A5, `docs/guide/narrowing.md`), pointed at the
   index/length relation. The crucial difference from the result-by-default world:
   **a missed narrowing now costs only a redundant compare-and-trap, not a
   per-access null-unwrap** — so the safe default is fast *with or without* the
@@ -1146,7 +1146,7 @@ here** — this is the plan the design commits to.
    - **Bounds-narrowing — now optional.** Because the trapping `a[i]` is already a
      bare `array.get` on the happy path, narrowing only elides the redundant
      compare-and-trap; a miss costs a check, not a per-access null-unwrap. Still
-     worth doing (touches the core narrowing engine, A5, `docs/narrowing.md`), no
+     worth doing (touches the core narrowing engine, A5, `docs/guide/narrowing.md`), no
      longer load-bearing.
    - **Native-indexing flag — unchanged.** A pure-VL `List` whose `l[i]` routes
      through the B13 `"[]"` method is a per-access indirect call; resolve with a

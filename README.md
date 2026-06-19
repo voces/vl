@@ -9,7 +9,7 @@ the plan and [`DECISIONS.md`](./DECISIONS.md) for the rationale; design notes li
 **VL is self-hosted.** The compiler is written in VL ([`compiler/*.vl`](./compiler)),
 compiled to a WebAssembly *seed* (`build/vl-compiler.wasm`), and run through a thin
 Rust host ([`scripts/vl-host`](./scripts/vl-host)) — an OS/wasmtime shim that never
-parses or types VL itself. See [`docs/genesis-design.md`](./docs/genesis-design.md)
+parses or types VL itself. See [`docs/genesis-design.md`](./docs/internals/genesis-design.md)
 for how the seed is bootstrapped.
 
 ## Quick start (native)
@@ -75,8 +75,8 @@ PATH — `brew install binaryen`, or the [prebuilt releases](https://github.com/
 (or point `$VL_WASM_OPT` / `$VL_WASM_DIS` at them). Absent, each is a soft no-op with a note.
 
 The brains live in VL (the seed); `vl` is a thin host (a command-queue pump — all
-CLI policy is VL, see [`docs/cli-design.md`](./docs/cli-design.md)). A `test`
-subcommand is planned (see [`docs/test-runner-design.md`](./docs/test-runner-design.md)).
+CLI policy is VL, see [`docs/cli-design.md`](./docs/internals/cli-design.md)). A `test`
+subcommand is planned (see [`docs/test-runner-design.md`](./docs/internals/test-runner-design.md)).
 
 ## Self-hosting & bootstrap
 
@@ -92,7 +92,7 @@ The seed is fetched from a published release artifact via
 `scripts/fetch-seed.sh` (republished on every master push; the immutable `seed-v0`
 release anchors the lineage). There is no TypeScript genesis path — the project
 keeps no second compiler. Full design in
-[`docs/genesis-design.md`](./docs/genesis-design.md).
+[`docs/genesis-design.md`](./docs/internals/genesis-design.md).
 
 ## Developer tooling (deno)
 
@@ -124,4 +124,4 @@ selectable with the `vital.checker` setting (`ts | wasm | both`).
 | [`std/`](./std) | The VL standard library (`std:` modules, e.g. `std:fmt`). |
 | [`tests/`](./tests) | The `.vl` corpus (`tests/cases/`) + unit/integration tests. |
 | [`lsp/`](./lsp) · [`playground/`](./playground) | Editor server and in-browser playground. |
-| [`docs/`](./docs) | Design notes (genesis, std, test-runner, native-modules, …). |
+| [`docs/`](./docs/README.md) | Docs — `guide/` (language & CLI) and `internals/` (compiler & contributor); see [`docs/README.md`](./docs/README.md). |

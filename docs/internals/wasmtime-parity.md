@@ -2,7 +2,7 @@
 
 > Status: **spike confirmed — wasmtime runs VL's WasmGC output correctly,
 > with one feature flag and a tiny host shim.** This de-risks the runtime
-> target named in `docs/binaryen-transition.md` ("getting off V8"): VL emits
+> target named in `docs/internals/binaryen-transition.md` ("getting off V8"): VL emits
 > WasmGC (structs / arrays / strings as GC heap values), and the only runtime
 > VL has ever executed on is V8 (via Deno's `WebAssembly`). This doc records an
 > empirical check that a VL-compiled `.wasm` instantiates and runs on

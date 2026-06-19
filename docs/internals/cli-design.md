@@ -1,7 +1,7 @@
 # `vl` CLI design — the brain is VL, the host is a pump
 
 The native `vl` tool (`build`/`check`/`run`/`fmt`, later `test`) follows the same
-charter as the compiler and the test runner (`docs/test-runner-design.md`):
+charter as the compiler and the test runner (`docs/internals/test-runner-design.md`):
 
 > **The brain is VL; Rust is the mechanism pump.** The Rust host owns only the
 > mechanism the wasm capability model cannot express, exposed as RAW primitives,
