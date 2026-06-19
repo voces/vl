@@ -109,6 +109,19 @@ annotations (`let`/`const`). Follow-ups, in order of safety:
   EXPRESSION in TAIL position with a `null` branch (`{ if b { 5 } else { null } }`)
   fails `unsupported statement in body` even ANNOTATED; and `??` on a nullable SCALAR
   fails `` `??` is only supported on a map index get ``.
+- **Nullable-value-type arc (`boolean|null` / `string|null` / `??` / if-else-tail).**
+  A 4-PR plan to make nullable VALUE types first-class. `[PR1 PAID]` `boolean | null`
+  (the i32-sentinel niche: 0/1/2) now works end-to-end — param, `x = null` assignment,
+  return, and caller narrowing — via `pendingNulBool` seeded at each boundary and
+  `exprNulBool` resolving niche-ness through calls + un-annotated bindings (`letNulBool`).
+  REMAINING: **(PR2)** `string | null` — a DIFFERENT rep (nullable ref / `ref.is_null`,
+  not the i32 sentinel), its own param/assign/return/caller seeding; **(PR3)** `??` over
+  a niche value (`r ?? d` for `boolean|null`/`string|null`) + the non-Ident `??`
+  (`f() ?? d` needs a scratch local — the value-union-box `??` only handles a re-readable
+  Ident/field place today); **(PR4)** the `if/else`-expression-tail-with-`null` hole
+  above. Also still floored: the INFERRED `boolean | null` return (the checker's
+  `valueUnionRetName` excludes the niche; extend it + the inferRet export to carry the
+  niche name to the return-site seeding) — fold into PR2/PR3.
 - **`vl fmt -w` ≠ `vl fmt --check` on long single-line `if/else`.** `vl fmt -w` is a
   no-op (idempotent) on a long single-line `if cond { a = x } else { a = y }` that
   exceeds the wrap width, yet `vl fmt --check` rejects it (`not formatted`, exit 1) —
