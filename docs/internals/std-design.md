@@ -9,13 +9,13 @@ for the native emitter's long tail — each std module that hits an emitter gap
 fails loudly and becomes a burn-down item.
 
 The test RUNNER (`vl test` — discovery, parallel execution, reporting) is the
-sibling design: `docs/test-runner-design.md`. The two meet at `std:test`'s
+sibling design: `docs/internals/test-runner-design.md`. The two meet at `std:test`'s
 surface (D5).
 
 ## Verified facts (the ground this stands on)
 
 **The two-primitive intrinsic floor is IMPLEMENTED (Slice 0 / B6b's
-"Prerequisite intrinsics" — landed).** `docs/collections-design.md` §LS.2
+"Prerequisite intrinsics" — landed).** `docs/guide/collections-design.md` §LS.2
 derives it: a pure-VL `List` stands on exactly (1) dynamic-length array
 allocation (`__array_new__<T>(length, fill)` / `__array_new_default__<T>(length)`
 → `array.new`/`array.new_default`) and (2) bulk `__array_copy__` →
@@ -231,7 +231,7 @@ the rename walker is the riskiest code in the module bridge — land it alone.
 
 ### D5. `std:test` v1 — the in-language surface (the runner contract)
 
-Decided jointly with `docs/test-runner-design.md` (where the execution model,
+Decided jointly with `docs/internals/test-runner-design.md` (where the execution model,
 parallelism, and output capture live). The maintainer's direction: jest-shaped
 `describe`/`it`/`beforeEach`/`afterEach`, `expect(...)` matchers over
 `assert*` functions.

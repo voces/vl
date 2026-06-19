@@ -32,7 +32,7 @@ file; the lexer/parser are the grammar.
   + lint (warnings/hints), `--severity <level>` (gate + display floor), `--concise`, `--codegen`,
   `--fix` (the `prefer-const` lint fix), and takes a file OR a
   directory (recursive; `vl check` ≡ `vl check .`; `--exclude <glob>`). `vl` is a command-queue
-  pump — all CLI policy is VL (`compiler/cli.vl`); see [`docs/cli-design.md`](docs/cli-design.md).
+  pump — all CLI policy is VL (`compiler/cli.vl`); see [`docs/internals/cli-design.md`](docs/internals/cli-design.md).
 - **After ANY compiler change, rebuild the LSP bundle:** `cd lsp && deno task build` (the compiler core
   is bundled into the LSP; `lsp/dist` is gitignored). CI also builds it.
 
@@ -62,7 +62,7 @@ raw `__store_*__`/`__log__` API is reserved for tests that exercise the memory b
 - **`ROADMAP.md`** — the forward plan: what's next, dependencies, what's REMAINING per item.
 - **`DECISIONS.md`** — the durable *why* behind non-obvious choices (no-`this`/`self`, null-only `?.`,
   structural `==`, WasmGC, emit-direct self-hosting, …).
-- **`docs/unions.md`**, **`docs/narrowing.md`** — mental models for the two subtle subsystems.
+- **`docs/guide/unions.md`**, **`docs/guide/narrowing.md`** — mental models for the two subtle subsystems.
 
 ## Doc discipline (keep the roadmap maintainable)
 
@@ -86,7 +86,7 @@ doesn't belong here.
   until it is merged or closed (investigate CI failures and review comments; fix the
   small/clear ones, ask on anything ambiguous). The *how* (one `Monitor` over all open
   PRs, the notification tools, replying to review feedback) is in
-  [`docs/agent-pr-watch.md`](docs/agent-pr-watch.md).
+  [`docs/internals/agent-pr-watch.md`](docs/internals/agent-pr-watch.md).
 
 ### Comments
 

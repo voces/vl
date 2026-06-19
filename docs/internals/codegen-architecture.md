@@ -5,8 +5,8 @@
 > builder refactor. It changes no code; it is the decision input for the refactor.
 > Owner's framing: *"the actual wasm code emission is kind of a mess — we're mixing
 > up actual logic with doing binary writing. We should probably adopt a sort of
-> builder pattern."* The perf pass (`docs/perf-findings.md`) independently flagged
-> the want for *"a proper binary-writer/builder abstraction."*
+> builder pattern."* The perf pass independently flagged the want for *"a proper
+> binary-writer/builder abstraction."*
 
 ---
 
@@ -38,7 +38,7 @@
   a binaryen-style in-memory node IR. VL targets lean wasm and the compiler itself
   runs in wasm; a node-tree IR would bloat the emitted compiler and buy nothing
   (binaryen stays available as the optional external optimizer per
-  `docs/binaryen-transition.md`). This is the **wasm-encoder** shape, not the
+  `docs/internals/binaryen-transition.md`). This is the **wasm-encoder** shape, not the
   **binaryen** shape.
 - **Migration is incremental and low-risk**: introduce `BinaryWriter` first
   *behind the existing helpers* (`emitByte`/`emitULEB`/`ulebToArr` already ARE a
@@ -283,7 +283,7 @@ The **consistently load-bearing boundary** is the bottom one: *a typed encoder
 that knows opcodes/sections/LEB but nothing about the source language.* Every
 project has it; only the optimiser-bearing ones add a heavy IR above it. VL needs
 the bottom boundary badly and the heavy IR not at all (binaryen remains the
-external optimiser — `docs/binaryen-transition.md`).
+external optimiser — `docs/internals/binaryen-transition.md`).
 
 ---
 
@@ -486,7 +486,7 @@ Two ends:
   traverse to optimise and encode. *Cost:* the IR is data the compiler allocates
   and walks; in a wasm-hosted self-compiler that is **heap + code bloat in the
   emitted compiler itself**, for an optimiser VL has explicitly decided to keep
-  **external** (`wasm-opt`/libbinaryen, `docs/binaryen-transition.md` options A/B).
+  **external** (`wasm-opt`/libbinaryen, `docs/internals/binaryen-transition.md` options A/B).
   Building a node IR just to immediately encode it — with no in-VL optimiser to
   justify it — is pure overhead. The perf doc already concluded *"don't step on
   binaryen's feet"* and that a leaner-IR pre-pass isn't worth it.
@@ -605,5 +605,5 @@ that the streaming writer made redundant.
   [Compiling/optimizing Wasm with Binaryen (web.dev)](https://web.dev/articles/binaryen)
 - [Goodbye to the C++ Implementation of Zig](https://ziglang.org/news/goodbye-cpp/) ·
   [Zig self-hosted x86 backend default in Debug (Lobsters)](https://lobste.rs/s/fmof95/zig_s_self_hosted_x86_backend_is_now)
-- VL internal: `compiler/wasmEmit.vl`, `compiler/toWasm.ts`,
-  `docs/binaryen-transition.md`, `docs/perf-findings.md`, `docs/selfhost-gaps.md`
+- VL internal: `compiler/wasmEmit.vl`,
+  `binaryen-transition.md`, `selfhost-gaps.md`

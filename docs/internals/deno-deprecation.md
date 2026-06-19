@@ -11,7 +11,7 @@ kill already removes it.
 
 **End-state runtimes:** the `vl` brain runs under **wasmtime + WASI** (ROADMAP Track H, H-M2). The
 JS/TS tooling that outlives the TS compiler (LSP bundle, playground) runs under **Node**. Behavioral
-tests run under **`vl test`** (ROADMAP Next + `docs/test-runner-design.md`); surviving JS-side tests
+tests run under **`vl test`** (ROADMAP Next + `docs/internals/test-runner-design.md`); surviving JS-side tests
 run under **`node --test`** (or another runner — open decision).
 
 This doc is the inventory behind ROADMAP **Track J**. It exists because "kill Deno" reads like one
@@ -67,7 +67,7 @@ already removes it; spend effort only on the genuinely Deno-specific residue (J1
 ### J2 — the test harness (the hard core)
 All 52 `tests/*.ts` are `Deno.test`. Split by subject:
 - **Behavioral `.vl` corpus** — `cases_test.ts`, `cases_wasm_test.ts`, and the `selfhost_*` suites.
-  Migrate to native + `*.test.vl` under **`vl test`** (designed: `docs/test-runner-design.md`;
+  Migrate to native + `*.test.vl` under **`vl test`** (designed: `docs/internals/test-runner-design.md`;
   charted in ROADMAP Next — new behavioral tests switch to `*.test.vl` at `vl test` v1, and the
   directive-corpus conversion waits for the TS-tier teardown). This is the bulk of the harness and
   the main forcing function.

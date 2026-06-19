@@ -6,7 +6,7 @@ family stays — compile-time verdicts are the language's spec corpus, not user
 tests; the far end-state, once the compiler is itself reachable as a std API,
 is corpus files becoming `*.test.vl` files that inline sources and drive a
 `std:`-exposed compile/run — deferred, noted in §Migration). Sibling design:
-`docs/std-design.md` D5 owns the in-language `std:test` surface; this doc
+`docs/internals/std-design.md` D5 owns the in-language `std:test` surface; this doc
 owns discovery, execution, parallelism, capture, and reporting.
 
 Direction set by the maintainer: `*.test.vl` discovery with configurable

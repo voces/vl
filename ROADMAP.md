@@ -45,16 +45,16 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   1. ✅ **LSP-on-wasm.** `server.ts` is wasm-only (the `vital.checker: ts|both` modes + their
      live parity instruments removed). The batch parity sweep reached accept/reject VERDICT parity
      over the corpus and was retired; the residual 81 span/ergonomic deltas are recorded in
-     `docs/vl-tech-debt.md` (native is the spec now — "match the TS span" is no longer a goal).
+     `docs/internals/vl-tech-debt.md` (native is the spec now — "match the TS span" is no longer a goal).
   Follow-through that outlived the TS kill (separate, still open):
   - ⬜ Delete the gated deno-side RUN half + its 305-file whitelist outright (see F-tiers).
-  - ⬜ `std:` Phase 2 (H0) written in VL — DESIGNED: `docs/std-design.md` (the `std:` scheme,
+  - ⬜ `std:` Phase 2 (H0) written in VL — DESIGNED: `docs/internals/std-design.md` (the `std:` scheme,
     hybrid delivery, the two-primitive intrinsic floor + `__trap__`, slices 0–6 with gates; six
     open decisions flagged for the maintainer). Doubles as the demand-driven discovery engine
     for the remaining emitter long tail (each gap fails loudly).
   - The `.vl` compiler is now the spec, so the parked soundness xfails (arith-hole-operand — A13;
     array-element-recursion — i32-keyed maps) are fixable bugs, not parity constraints.
-- ⬜ **`vl test`.** DESIGNED: `docs/test-runner-design.md` (jest-shaped `describe`/`it`/`expect`
+- ⬜ **`vl test`.** DESIGNED: `docs/internals/test-runner-design.md` (jest-shaped `describe`/`it`/`expect`
   over `std:testing`; two-phase registration, host-driven `vlt*` protocol; `*.test.vl` discovery
   + configurable globs; files parallel by default / in-file serial, opt-in fresh-instance
   `it.concurrent`; per-test capture, failure-first reporting). v1 lands with std-design slice 4;
@@ -69,7 +69,7 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 - **Explicit numeric conversion syntax** — the lossless-only implicit-widening rule (#298) makes
   the lossy edges (`i32→f32`, `i64→f64`, all narrowings) EXPRESSIBLE ONLY via a cast that does
   not exist yet; design + land it (both compilers).
-- **Param-skip ergonomics** (`docs/lambda-param-skip-design.md`) — prerequisite 1 (self-host
+- **Param-skip ergonomics** (`docs/guide/lambda-param-skip-design.md`) — prerequisite 1 (self-host
   lambdas/HOFs) is nearly satisfied; decide leading-comma vs `$#` (recommendation deliberately open).
 - **C5 / H-M1** — `deno compile` + brew tap. Small, decoupled; ships the distribution story now.
 - Smaller/independent: A-robust holes (`Map()`/`Set()` empties, generics), A-exhaust codegen elision,
@@ -83,7 +83,7 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 - 🟡 **A4. Negation types** (`!A`). REMAINING: full open-world negation tracking (needs A12).
 - 🟡 **A5. Flow narrowing.** REMAINING: `case`/multi-guard (no grammar); stored-witness (A6b Stage B);
   optional *call* `x?.f()` + chain short-circuit `x?.y.z` (use `x?.y?.z`); per-call
-  reachability-pruned return types (blocked on memoize-with-holes — see `docs/narrowing.md`).
+  reachability-pruned return types (blocked on memoize-with-holes — see `docs/guide/narrowing.md`).
 - 🟡 **A6. `is` operator + tagged unions.** REMAINING: `ref.test` fast-path for ref-vs-ref; union
   arrays (`[boolean | i32]`); declared type-guard signatures (A6b Stage A).
 - 🟡 **A6b. Proof-carrying narrowing (type guards as values).** REMAINING — **Stage A:** richer
@@ -112,7 +112,7 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   (guarded loudly today — and note the `call_ref`-ABI wrinkle: funcrefs admit no `ref.eq`, so
   function-identity compare needs an identity token on the closure struct).
 - 🟡 **A16. Literal-union types.** REMAINING: the **enum representation** (i32 tag for a closed
-  literal union — see `docs/unions.md`); a literal union read *inside* a body softens to base
+  literal union — see `docs/guide/unions.md`); a literal union read *inside* a body softens to base
   (coarser member-narrowing there than at the call boundary).
 - ⬜ **A17 follow-up: `never` inference + `unconditional-recursion` lint.** A17 demand-driven inference
   is shipped. REMAINING: (a) infer `never` for a genuinely base-case-less divergent recursive cycle
@@ -162,7 +162,7 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 - 🟡 **B6. Collections — growable `T[]`.** REMAINING: in-place bulk append (deferred — will be
   `xs.push(...ys)` once variadics land); representation inference (§VL.7 — lower never-grown
   values to a header-less fixed array); `map`/`filter` build-side generics for `Map`/`Set` (A10);
-  `.vl`-std migration once a module system exists. (design: `docs/collections-design.md`)
+  `.vl`-std migration once a module system exists. (design: `docs/guide/collections-design.md`)
 - 🟡 **B6a. `Map` + `Set`.** REMAINING: **i32-keyed Map/Set** (clean diagnostic for now — i32 keys
   use `T[]`); `for k in map` direct iteration (parser; use `.keys()` today); `map`/`filter` over
   Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`. (Self-host native parity:
@@ -175,7 +175,7 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   null and skip the vals-touch in new/add/compact/rehash (~5 `mSet`-gated sites). Memory/perf
   refinement, behaviorally invisible; would intentionally diverge from the host (which keeps `vals`
   for sets) as a justified improvement, not a regression.
-- 🟡 **B6b. Collections building blocks & open items** (all detail in `docs/collections-design.md`).
+- 🟡 **B6b. Collections building blocks & open items** (all detail in `docs/guide/collections-design.md`).
   - ✅ **Prerequisite intrinsics** — `__array_new__`/`__array_new_default__` + bulk `__array_copy__`
     (+ `__trap__`, std-design D1), thin `defaultScope`/typecheck.vl intrinsics lowered inline in both
     emitters, monomorphized per element type (native: i32/boolean/f64 element reps; ref/string
@@ -193,7 +193,7 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   - **Remaining open questions** — capacity/seed construction spelling; `map`/`filter` return type.
 - 🟡 **B7. Strings.** REMAINING: switch backing to `(array mut i16)` + `wasm:js-string` builtins
   (bulk JS-host interop — dart2wasm/Kotlin-Wasm style); UTF-8/i8 packing (size); richer methods.
-  **Strings direction:** `docs/strings-design.md` — long-term UTF-8 internal storage,
+  **Strings direction:** `docs/guide/strings-design.md` — long-term UTF-8 internal storage,
   code-point-indexed API made O(1) for the ASCII common case via an ASCII fast-path flag; strings
   immutable. Ties A7.
 - 🟡 **B8. Loops.** REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
@@ -210,7 +210,7 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 - 🟡 **B14. Methods via explicit `self` + UFCS.** REMAINING: route operator dispatch (B13) through
   self-methods; `c.area` (no `()`) as a bound value; mutation/variance (A9).
 - 🟡 **B15. Lambdas + declaration-vs-value.** SELF-HOST function-value ABI shipped (#306: `call_ref`
-  + closure struct, non-capturing + capturing; design `docs/selfhost-lambdas-design.md`); escaping
+  + closure struct, non-capturing + capturing; design `docs/internals/selfhost-lambdas-design.md`); escaping
   closures + function-valued struct fields shipped (#310); `.map`/`.filter` EMIT is the next slice
   (see Next). REMAINING (host): **untyped** lambdas (a stored closure has one signature — needs
   pinning-by-use or boxing).
@@ -346,7 +346,7 @@ seed from current `compiler/*.vl` in ~3s.*
 - 🟡 **F8.** REMAINING (F5-adjacent): confirm vscode-languageclient forking the ESM server in VS Code.
 - 🟡 **F9. Perf baseline.** The TS-driven harnesses (`scripts/perf*.ts`) were RETIRED with the
   kill-TS dev-script sweep (they benchmarked the TS `compile()`); the past wins/abandons live in
-  `docs/perf-findings.md` + `CHANGELOG.md`. REMAINING: rebuild a baseline against the NATIVE binary
+  `CHANGELOG.md`. REMAINING: rebuild a baseline against the NATIVE binary
   (`vl build`/`vl run` timing) if/when regression-tracking is wanted again; plus:
   - ⬜ **F9b. Cache / clone binaryen IR across selfhost sub-tests** — LOW priority (the dominant
     cost fell with the F9c memoize; binaryen modules are not trivially cloneable).
@@ -399,7 +399,7 @@ independent).*
     assembly renames the lexer's colliding `Tok`/`Diag`/`advance`). Import HEADERS landed (every
     compiler file checks as a module — LSP/`vl check` clean); switching the BUILD waits on the
     post-parity module revisit (symbol-based resolution — don't bet the compiler on the rename
-    walker; → `docs/native-modules-design.md` §Post-parity revisit).
+    walker; → `docs/internals/native-modules-design.md` §Post-parity revisit).
   - **Spans** — continue the rungs (rung 1 = token positions; rung 2 = native `path:line:col:`
     diagnostics, #312; rung 3 = end positions for LSP ranges, `diagEndCol`) so more diagnostics
     carry real positions; message/span parity gates the deno-CHECK-tier deletion (F-tiers).
@@ -408,9 +408,9 @@ independent).*
     …); burned down demand-driven as real VL code (std, the compiler) hits them.
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
-    packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/selfhost-gaps.md` §H4.1)
+    packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/internals/selfhost-gaps.md` §H4.1)
   - ⬜ **H4.6. Array spread / concat in call position (worked around).** A small `appendAll()` loop
-    helper covers bulk-append today; `xs.push(...ys)` lands with variadics (B6). (detail: `docs/selfhost-gaps.md` §H4.6)
+    helper covers bulk-append today; `xs.push(...ys)` lands with variadics (B6). (detail: `docs/internals/selfhost-gaps.md` §H4.6)
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime
   (wasmtime — full WasmGC since v27) + a small host shim. No V8, no binaryen, no Deno.
   **Engine choice re-validated (2026 survey):** wasmtime remains the only standards-track
@@ -449,7 +449,7 @@ decoupled) → H-M2 host swap (kill the interim Rust host once the WASI driver l
 *The north star: remove Deno entirely — no `deno test`, no `deno run`, no `deno compile`, no
 `deno.json`/`deno.lock`, no `setup-deno` in CI. End-state runtimes: wasmtime+WASI for the `vl`
 brain (Track H, H-M2), Node for the JS-side tooling that outlives the TS compiler (LSP bundling,
-the playground). Detailed inventory + staged plan: `docs/deno-deprecation.md`.*
+the playground). Detailed inventory + staged plan: `docs/internals/deno-deprecation.md`.*
 
 **This track is NOT a competing now-priority.** The active front is **killing the two compilers**
 (see Next) — that is the top goal, and it is the road this leads down: it removes Deno's largest
@@ -473,7 +473,7 @@ piece that can land early, fully decoupled).
   they test:
   - **Behavioral `.vl` corpus** (`cases_test`/`cases_wasm_test`, `selfhost_*`) → migrate to the
     native runner + `*.test.vl` under **`vl test`** (already designed/charted — see Next +
-    `docs/test-runner-design.md`). This is the bulk of the harness and the main forcing function.
+    `docs/internals/test-runner-design.md`). This is the bulk of the harness and the main forcing function.
   - **TS-infra tests** (LSP, playground, lint-TS, format, symbols, stringify, source-map) → these
     test TS that outlives the compiler; they move to a **Node** test runner (`node --test`) when
     their subsystem is ported, OR ride along under Deno until then. Decide the Node-runner cutover

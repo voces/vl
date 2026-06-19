@@ -6,7 +6,7 @@
 > languages model strings, committing to a concrete shape for VL's WasmGC backend
 > with rationale and rejected alternatives, and being honest about the one tradeoff
 > the chosen API carries (non-ASCII indexing). As with
-> `docs/collections-design.md` and `docs/modules-design.md`, **the `DECISIONS.md`
+> `docs/guide/collections-design.md` and `docs/internals/modules-design.md`, **the `DECISIONS.md`
 > entry lands with implementation, not before** — this is the mental model and the
 > decision record so the eventual implementation PR is small and uncontested.
 
@@ -660,7 +660,7 @@ text:
   locale-sensitive Turkish `i`, etc.), **normalization** (NFC/NFD), and **collation**
   (locale-aware sorting) each need their own sizable tables.
 
-**Principle (the std-over-primitives frame from `docs/modules-design.md`):** the
+**Principle (the std-over-primitives frame from `docs/internals/modules-design.md`):** the
 common binary stays lean by keeping these in an **opt-in `std:unicode` module**, not
 the core type. This matches precedent — Rust ships grapheme segmentation as the
 external `unicode-segmentation` crate, Go puts normalization/collation/segmentation in
@@ -695,7 +695,7 @@ against. The decision is to **not** put a regex engine in the core, and to shape
 below when it lands.
 
 - **Lives in `std:regex`** (consistent with the `std:` scheme of
-  `docs/modules-design.md` — `std:regex`, like `std:list`/`std:fmt`/`std:unicode`).
+  `docs/internals/modules-design.md` — `std:regex`, like `std:list`/`std:fmt`/`std:unicode`).
   Programs that never match a regex never link the engine; a regex compiler/VM is real
   code-size the common binary should not carry.
 - **Runs over the UTF-8 byte backing directly** — the **Rust `regex` / RE2 model**: a
@@ -929,7 +929,7 @@ Genuinely still open — owner's calls (recommendations given, decision deferred
    - **Interpolation syntax** — `f"Hello {name}"` (or `` `Hello ${name}` ``) lowering to
      a builder/concat sequence; pure ergonomics, orthogonal to the perf fix.
    - **A `std:fmt` format function** — `format("Hello {}", name)` (already namespaced in
-     `docs/modules-design.md`), no new syntax.
+     `docs/internals/modules-design.md`), no new syntax.
    - **Recommendation:** land a **buffer type first** (it fixes the real O(n²) perf
      trap, which is the load-bearing problem), then add **interpolation sugar** on top
      later for ergonomics; `std:fmt` can back both. Owner to choose the mix and the
@@ -976,9 +976,9 @@ Genuinely still open — owner's calls (recommendations given, decision deferred
   [Julia — Strings](https://docs.julialang.org/en/v1/manual/strings/).
 - UTF-8 design (self-synchronizing, ASCII-superset, no BOM/endianness):
   [The Unicode Standard / UTF-8](https://www.unicode.org/faq/utf_bom.html).
-- Internal: `docs/collections-design.md` (the header-vs-bare-array indirection
+- Internal: `docs/guide/collections-design.md` (the header-vs-bare-array indirection
   analysis, the LICM hoist, the "optimization that can only be a win" framing reused
-  for the ASCII flag), `docs/modules-design.md` (the std-over-primitives frame),
+  for the ASCII flag), `docs/internals/modules-design.md` (the std-over-primitives frame),
   `compiler/defaultScope.ts` (`string` as `{[i32]:i32}`), `compiler/lexer.ts` (char
   literal → code point), `compiler/toWasm.ts` (`__string_eq__` / `__print_string__`
   / `__store_string__`), `ROADMAP.md` Track H (self-hosting, the bootstrap gate).
