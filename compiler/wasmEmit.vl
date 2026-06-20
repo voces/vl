@@ -2275,6 +2275,8 @@ function exprNullableString(exprIx: i32, fnIx: i32) {
     if declaredNulString(e.identName) { return true }
     return globalIsNulString(e.identName)
   }
+  // A `string | null` struct FIELD read (`a.v`, code 20) yields a nullable string ref.
+  if e is Member { return memberFieldCode(exprIx, fnIx) == 20 }
   // A chained `a ?? b` over nullable strings is ITSELF nullable-string when the default
   // `b` is also nullable (the result can still be null) — the left-associative
   // `(f() ?? g()) ?? d` shape, where the classifier sees this nested `??` as `binLeft`
@@ -5941,7 +5943,13 @@ function pushFieldStorage(code: i32, refSlot: i32) {
     // map). A recursive value (Tree → map → Tree) ties in the shared rec group.
     wU8(100) // 0x64 (ref ht)
     wSLEB(mapTypeIdxOf(refSlot))
+  } else if code == 20 {
+    // A `string | null` niche field: a NULLABLE ref to the raw string array (the
+    // same backing as code 3, the nullability in the field's storage type).
+    wU8(99) // 0x63 (ref null ht)
+    wSLEB(aTypeIdx)
   } else {
+    // code 21 (`boolean | null`, the i32 sentinel) shares this default i32 storage.
     wU8(127) // 0x7f i32 storagetype
   }
   0
@@ -6034,10 +6042,49 @@ function objFieldVal(objIx: i32, fieldName: string) {
   -1
 }
 
+// Emit the NULL value of an OMITTED nullable field (`si`/`fi`, field code `scode`) in a
+// struct literal — the completion coercion's per-rep null: a `string | null` field (20) is
+// `ref.null $aTypeIdx`, a `boolean | null` field (21) the i32 sentinel 2, a nullable
+// struct (15) `ref.null $S`, a nullable i32-list (18) `ref.null $lTypeIdx`, and a value/box
+// union field (16) WITH a `null` member the null-tagged box. Returns 0, or -1 when the
+// field is NOT nullable (the caller turns that into the missing-field error).
+function emitOmittedFieldNull(body: i32[], si: i32, fi: i32, scode: i32) {
+  if scode == 20 {
+    fbRefNull(aTypeIdx) // ref.null $aTypeIdx
+    return 0
+  }
+  if scode == 21 {
+    fbI32Const(2) // the boolean|null sentinel
+    return 0
+  }
+  if scode == 15 {
+    const tgt = structIndexByName(sFieldElemNameAt(si, fi))
+    if tgt < 0 { return -1 }
+    fbRefNull(sHeapIdx[tgt]) // ref.null $S
+    return 0
+  }
+  if scode == 18 {
+    fbRefNull(lTypeIdx) // ref.null $lTypeIdx (i32[] | null)
+    return 0
+  }
+  if scode == 16 {
+    // A value/box-union field defaults to null ONLY when `null` is a member.
+    if unionHasAtom(sFieldElemNameAt(si, fi), "null") {
+      fbI32Const(scalarTagOf("null"))
+      fbRefNullNone() // payload slot unread under the null tag
+      fbStructNew(uBoxIdx)
+      return 0
+    }
+    return -1
+  }
+  -1
+}
+
 // Lower an object literal `{ f: v, ... }` onto `body`: resolve WHICH struct the
 // literal's field-name set names, push each field's value IN THAT STRUCT'S DECLARED
 // FIELD ORDER, then `struct.new $<heapIdx>` (`0xfb 0x00 <heapIdx>`). The literal must
-// match exactly one struct's fields (no missing/extra field) — else fails loudly.
+// match exactly one struct's fields, EXCEPT a nullable field may be omitted (the
+// completion coercion — it is materialized as `null` via `emitOmittedFieldNull`).
 function emitObj(body: i32[], objIx: i32, fnIx: i32) {
   if !sDeclared {
     return emitFail("emitProgram: object literal but no struct type declared")
@@ -6058,11 +6105,22 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
     let fi = 0
     while fi < cnt {
       const valIx = objFieldVal(objIx, sFieldNames[sFieldStart[si] + fi])
-      if valIx < 0 {
-        return emitFail("emitProgram: object literal is missing a struct field")
-      }
       const scode = sFieldTypeAt(si, fi)
-      if scode != 15 {
+      if valIx < 0 {
+        // COMPLETION COERCION: a NULLABLE field omitted from the literal is materialized
+        // as `null` (the checker `assignableExpr` already permitted the omission). A
+        // non-nullable omitted field is still an error.
+        if emitOmittedFieldNull(body, si, fi, scode) < 0 {
+          return emitFail("emitProgram: object literal is missing a struct field")
+        }
+        fi = fi + 1
+        continue
+      }
+      // A nested struct VALUE is allowed for a nested-struct field (code 15) and for a
+      // BOX-union field (code 16) — the latter boxes the struct as a variant via
+      // `emitUnionCoerce` (`{ v: { a: 7 } }` against `{ v: A | B }`). Any OTHER field type
+      // receiving a struct value is unsupported.
+      if scode != 15 && scode != 16 {
         if exprStruct(valIx, fnIx) {
           return emitFail("emitProgram: nested struct fields are not supported")
         }
@@ -6108,6 +6166,22 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         // An f64 field widens its value at the construction boundary (an int
         // literal into `x: f64` re-encodes; an f64 expression passes through).
         if emitExprAsF64(body, valIx, fnIx) < 0 { return -1 }
+      } else if scode == 20 {
+        // A `string | null` niche field: a `null` value lowers as `ref.null $aTypeIdx`
+        // (`pendingNulString`); a non-null string ref passes through.
+        const svNS = pendingNulString
+        pendingNulString = true
+        let rcNS = emitExpr(body, valIx, fnIx)
+        pendingNulString = svNS
+        if rcNS < 0 { return -1 }
+      } else if scode == 21 {
+        // A `boolean | null` niche field: a `null` value lowers as the i32 sentinel 2
+        // (`pendingNulBool`); a boolean rides its i32 0/1.
+        const svNB = pendingNulBool
+        pendingNulBool = true
+        let rcNB = emitExpr(body, valIx, fnIx)
+        pendingNulBool = svNB
+        if rcNB < 0 { return -1 }
       } else {
         if emitExpr(body, valIx, fnIx) < 0 { return -1 }
       }
@@ -6467,6 +6541,11 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32) {
     let recvVar = ""
     const recvN = P.nodes[m.memObj]
     if recvN is Ident { recvVar = narrowVariantFor(recvN.identName) }
+    // A nested union-FIELD receiver (`t.v.a`): resolve the variant from its path key.
+    if recvN is Member {
+      const pk = memberPathKeyOf(m.memObj)
+      if pk != "" { recvVar = narrowVariantFor(pk) }
+    }
     let vi = variantIndexOf(recvVar)
     if vi < 0 {
       return emitFail("emitProgram: narrowed receiver names no union variant")
@@ -7016,6 +7095,14 @@ function memIsNarrowed(memIx: i32) {
     if recv is Ident {
       if narrowVariantFor(recv.identName) != "" { return true }
     }
+    // A nested union-FIELD receiver (`t.v.a` where `t.v` is narrowed to a variant): the
+    // receiver is itself a Member, narrowed by its path key (`t.v`).
+    if recv is Member {
+      const pk = memberPathKeyOf(m.memObj)
+      if pk != "" {
+        if narrowVariantFor(pk) != "" { return true }
+      }
+    }
   }
   false
 }
@@ -7028,6 +7115,10 @@ function memNarrowVariantIndex(memIx: i32) {
   if m is Member {
     const recv = P.nodes[m.memObj]
     if recv is Ident { return variantIndexOf(narrowVariantFor(recv.identName)) }
+    if recv is Member {
+      const pk = memberPathKeyOf(m.memObj)
+      if pk != "" { return variantIndexOf(narrowVariantFor(pk)) }
+    }
   }
   -1
 }
@@ -7179,6 +7270,15 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
       wU8(212) // 0xd4 ref.as_non_null
     }
     fbStructGet(sHeapIdx[si], idx) // 0xfb 0x02 <struct ht> <field index>
+    // A `string | null` field (code 20) read AS A VALUE recovers the non-null string ref
+    // (`ref.as_non_null` — the checker narrowed it non-null at every value read). The `!=
+    // null` / `??` null-check sets `pendingRawNullRead` to keep the raw nullable ref. A
+    // `boolean | null` field (code 21) needs no recovery (its i32 sentinel reads as-is).
+    if sFieldTypeAt(si, idx) == 20 {
+      if !pendingRawNullRead {
+        wU8(212) // 0xd4 ref.as_non_null
+      }
+    }
     // A UNION-typed field (code 16) read while the member PATH is narrowed to one
     // scalar atom (`if o.y is i32 { … o.y … }`) unboxes the payload — the same
     // recovery as a narrowed union IDENT read. An un-narrowed read is the box.
@@ -10661,6 +10761,54 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
           }
         }
       }
+      // These generic niche `??` paths RE-EVALUATE `e.binLeft` (twice for the bool select,
+      // and in the else arm for the string), so they apply only to an effect-free place —
+      // an ident binding or a struct FIELD. A CALL lhs (`f() ?? d`) cannot be re-evaluated
+      // and is handled by the stash-based call path in the `lhs is Call` block below.
+      let lhsReEval = true
+      if lhs is Call { lhsReEval = false }
+      // `<e> ?? d` over a `boolean | null` NICHE (an ident binding OR a `boolean | null`
+      // struct FIELD, code 21) — the i32 cell holds 0/1 or the sentinel 2 (`null`); select
+      // the default on 2. Generic in `e.binLeft`, so it covers a member field read too.
+      if lhsReEval && exprNulBool(e.binLeft, fnIx) {
+        if emitExpr(body, e.binRight, fnIx) < 0 {
+          return -1 // d   [a]
+        }
+        if emitExpr(body, e.binLeft, fnIx) < 0 {
+          return -1 // x   [b]
+        }
+        if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+        fbI32Const(2)
+        fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)      [cond]
+        wU8(27)      // 0x1b select → d if null else x
+        return 0
+      }
+      // `<e> ?? d` over a `string | null` NICHE (an ident binding OR a `string | null`
+      // struct FIELD, code 20): the nullable raw-array ref — a VALUE-typed `if` on
+      // `ref.is_null` (the else arm reads `e` as a non-null value). `pendingRawNullRead`
+      // keeps the test read raw. Generic in `e.binLeft`, so it covers a member field too.
+      if lhsReEval && exprNullableString(e.binLeft, fnIx) {
+        const savedRawN = pendingRawNullRead
+        pendingRawNullRead = true
+        const treN = emitExpr(body, e.binLeft, fnIx) // the raw nullable ref
+        pendingRawNullRead = savedRawN
+        if treN < 0 { return -1 }
+        wU8(209)                                     // 0xd1 ref.is_null → 1 if null
+        wU8(4)                                       // 0x04 if
+        wU8(100)                                     // blocktype: (ref $aTypeIdx) — non-null string result
+        wSLEB(aTypeIdx)
+        ctrlEnter()
+        if emitExpr(body, e.binRight, fnIx) < 0 {
+          return -1 // d (a string)
+        }
+        fbElse() // 0x05 else
+        if emitExpr(body, e.binLeft, fnIx) < 0 {
+          return -1 // e recovered non-null
+        }
+        fbEnd() // 0x0b end
+        ctrlLeave()
+        return 0
+      }
       // `x ?? d` over a binding seeded by a BOOLEAN-list `.pop()`: the i32 cell
       // holds 0/1 or the niche sentinel 2 (`null`) — select the default on 2.
       if lhs is Ident {
@@ -10675,47 +10823,6 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
           fbI32Const(2)
           fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)      [cond]
           wU8(27)      // 0x1b select → d if null else x
-          return 0
-        }
-        // `x ?? d` over a `boolean | null` NICHE binding (param/let/return-bound): the
-        // i32 cell holds 0/1 or the sentinel 2 (`null`) — same select-on-2 as the
-        // boolean-`.pop()` niche above, but for any nullable-bool source.
-        if exprNulBool(e.binLeft, fnIx) {
-          if emitExpr(body, e.binRight, fnIx) < 0 {
-            return -1 // d   [a]
-          }
-          if emitExpr(body, e.binLeft, fnIx) < 0 {
-            return -1 // x   [b]
-          }
-          if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-          fbI32Const(2)
-          fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)      [cond]
-          wU8(27)      // 0x1b select → d if null else x
-          return 0
-        }
-        // `x ?? d` over a `string | null` (kind 16) binding: the nullable raw-array ref —
-        // a VALUE-typed `if` on `ref.is_null` (the else arm `ref.as_non_null`s, so it
-        // only runs when non-null). `pendingRawNullRead` keeps the test ref raw.
-        if exprNullableString(e.binLeft, fnIx) {
-          const savedRaw0 = pendingRawNullRead
-          pendingRawNullRead = true
-          const tre = emitExpr(body, e.binLeft, fnIx) // the raw nullable ref
-          pendingRawNullRead = savedRaw0
-          if tre < 0 { return -1 }
-          wU8(209)                                    // 0xd1 ref.is_null → 1 if null
-          wU8(4)                                      // 0x04 if
-          wU8(100)                                    // blocktype: (ref $aTypeIdx) — non-null string result
-          wSLEB(aTypeIdx)
-          ctrlEnter()
-          if emitExpr(body, e.binRight, fnIx) < 0 {
-            return -1 // d (a string)
-          }
-          fbElse() // 0x05 else
-          if emitExpr(body, e.binLeft, fnIx) < 0 {
-            return -1 // x recovered non-null
-          }
-          fbEnd() // 0x0b end
-          ctrlLeave()
           return 0
         }
         // `x ?? d` over a BOXED value union containing `null` (`i32 | null`):
@@ -13112,8 +13219,30 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       } else if fscode == 6 {
         pendingListKind = 3
       }
-      if emitExpr(body, a.binRight, fnIx) < 0 {
-        return -1 // then the value
+      // A BOX-union field (code 16) coerces a raw scalar/struct/null RHS into the box; the
+      // niche fields seed the null rep for a bare `null` RHS (`string | null` → `ref.null
+      // $aTypeIdx`, `boolean | null` → the i32 sentinel 2). A non-null value passes through.
+      if fscode == 16 {
+        if (
+          emitUnionCoerce(
+            body,
+            sFieldElemNameAt(si, fieldIdx),
+            a.binRight,
+            fnIx,
+          ) <
+          0
+        ) {
+          return -1
+        }
+      } else {
+        const savedWNS = pendingNulString
+        const savedWNB = pendingNulBool
+        if fscode == 20 { pendingNulString = true }
+        if fscode == 21 { pendingNulBool = true }
+        let rcW = emitExpr(body, a.binRight, fnIx) // then the value
+        pendingNulString = savedWNS
+        pendingNulBool = savedWNB
+        if rcW < 0 { return -1 }
       }
       pendingListKind = 0
       fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
@@ -16502,6 +16631,8 @@ function exprNulBool(exprIx: i32, fnIx: i32) {
     if gi >= 0 { return letNulBool(gi, -1) }
     return false
   }
+  // A `boolean | null` struct FIELD read (`a.v`, code 21) is the niche i32 sentinel.
+  if e is Member { return memberFieldCode(exprIx, fnIx) == 21 }
   // A chained `a ?? b` over `boolean | null` is itself `boolean | null` when the default
   // `b` is also nullable — the left-associative `(f() ?? g()) ?? d` shape (see the
   // `exprNullableString` companion). Keeps `??` print-routing consistent with the rep.
@@ -16598,6 +16729,17 @@ function retNulRefFlag(tyIx: i32) {
 // in scope; other nullable list kinds (`f64[]|null`, `S[]|null`, `string[]|null`)
 // keep failing loudly.
 function nameIsNulI32List(name: string) { nullablePartOf(name) == "i32[]" }
+
+// A `string | null` field type name — the niche FIELD (code 20): a `(ref null $aTypeIdx)`
+// storage slot (the array backing a string), the field analogue of the kind-16 local.
+function nameIsNulString(name: string) { nullablePartOf(name) == "string" }
+
+// A `boolean | null` field type name — the niche FIELD (code 21): an i32 storage slot
+// holding 0/1 with the spare value 2 = `null` (the field analogue of the sentinel local).
+function nameIsNulBool(name: string) {
+  const b = nullablePartOf(name)
+  b == "boolean" || b == "bool"
+}
 
 // `1` if the type-annotation node at `tyIx` is `i32[] | null`, else `0` — the
 // nullable-LIST dual of `retNulRefFlag`. Feeds vt kind 15 (a NULLABLE `(ref null
@@ -19206,12 +19348,18 @@ function fieldTypeCode(tyIx: i32) {
     // re-finds it by the value name (`fieldRefElemName`). A NULLABLE map field
     // (`{[…]}|null`) stays unsupported (falls through to -1).
     if nameIsMap(ty.tyName) { return 19 }
-    // A VALUE-union field (`v: i32 | null`, `y: string | i32`) stores the
-    // shared union BOX ref (code 16) — checked BEFORE the nullable-struct
-    // strip, exactly like `nameFieldCode` (the annotation-shape path), so a
-    // declared `type Opt = { v: i32 | null }` carries the same rep as the
-    // inline `{v:i32|null}` annotation.
+    // A `string | null` niche field — `(ref null $aTypeIdx)`, code 20. Checked before
+    // the value-union test (it is NOT a value union — a single ref + null is a niche).
+    if nameIsNulString(ty.tyName) { return 20 }
+    // A `boolean | null` niche field — i32 sentinel, code 21.
+    if nameIsNulBool(ty.tyName) { return 21 }
+    // A BOX-union field — a VALUE union (`v: i32 | null`, `y: string | i32`) OR a
+    // registered STRUCT / HETEROGENEOUS union (`v: A | B`, `v: A | i32`) — stores the
+    // shared union BOX ref (code 16). Checked BEFORE the nullable-struct strip, exactly
+    // like `nameFieldCode` (the annotation-shape path), so a declared `type Opt = { v:
+    // i32 | null }` carries the same rep as the inline `{v:i32|null}` annotation.
     if isValueUnionName(ty.tyName) { return 16 }
+    if isUName(ty.tyName) { return 16 }
     // A field naming ANOTHER STRUCT (`inner: Inner`) or a NULLABLE struct
     // (`next: Node|null`) stores a `(ref null $S)` — code 15. Resolved via the
     // DECLARATION scan (not the incrementally-built struct table) so a forward /
@@ -19787,11 +19935,18 @@ function nameFieldCode(t: string) {
   }
   // A NULLABLE i32-list field (`rest: i32[] | null`) — code 18 (see fieldTypeCode).
   if nameIsNulI32List(t) { return 18 }
-  // A VALUE-union field (`y: string | i32`) stores the union BOX ref (code 16);
-  // its union name rides `sFieldElemName` (the tag set + value-box reps).
-  // Checked before the nullable-struct strip (`i32|null` is a value union, not
-  // a nullable struct name).
+  // The niche FIELDS: `string | null` (`(ref null $aTypeIdx)`, code 20) and
+  // `boolean | null` (i32 sentinel, code 21) — before the value-union test (a single
+  // ref/scalar + null is a niche, not a box).
+  if nameIsNulString(t) { return 20 }
+  if nameIsNulBool(t) { return 21 }
+  // A BOX-union field — a VALUE union (`y: string | i32`) OR a registered STRUCT /
+  // HETEROGENEOUS union (`v: A | B`, `v: A | i32`) — stores the union BOX ref (code 16);
+  // its union name rides `sFieldElemName` (the tag set + value-box / variant reps).
+  // Checked before the nullable-struct strip (`i32|null` is a value union, not a
+  // nullable struct name).
   if isValueUnionName(t) { return 16 }
+  if isUName(t) { return 16 }
   let base = t
   const nb = nullablePartOf(base)
   if nb != "" { base = nb }
@@ -21209,6 +21364,25 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       // union: register the inferred name so the slot classifies + lowers like an
       // annotated nullable/value-union binding.
       nliInferIfLet(walk, i)
+    } else if s is TypeDecl {
+      // A struct FIELD annotated with an inline union (`type T = { v: A | B }`,
+      // `{ v: A | i32 }`) registers that union here — in `collectU`, BEFORE `collectS`
+      // interns the variant heap types — so the field classifies as the kind-16 box
+      // (`fieldTypeCode` sees `isUName`). A value-union field is interned at field
+      // collection instead; this is the struct/heterogeneous variant-box case.
+      const flds = s.tdFields
+      let tfi = 0
+      while tfi < flds.length {
+        if flds[tfi] >= 0 {
+          const fdn = P.nodes[flds[tfi]]
+          if fdn is FieldDef {
+            if registerInlineUnion(stmts, tyNameOf(fdn.fdType)) < 0 {
+              return -1
+            }
+          }
+        }
+        tfi = tfi + 1
+      }
     } else if s is IfStmt {
       const thenB = s.ifThen
       const elseN = s.ifElse
@@ -23323,9 +23497,12 @@ function exprString(exprIx: i32, fnIx: i32) {
     // string ref (the member-path dual of the Ident rule above).
     const muk = memberUnionReadKind(exprIx, fnIx)
     if muk != -3 { return muk == 2 }
-    // A field read whose declared field type is `string` (code 3) — resolved through
-    // the narrowed-local / variant-param / plain-struct shapes by `memberFieldCode`.
-    return memberFieldCode(exprIx, fnIx) == 3
+    // A field read whose declared field type is `string` (code 3), or a `string | null`
+    // niche field (code 20) read as a VALUE (it recovers the non-null string ref) —
+    // resolved through the narrowed-local / variant-param / plain-struct shapes by
+    // `memberFieldCode`.
+    const mfc = memberFieldCode(exprIx, fnIx)
+    return mfc == 3 || mfc == 20
   }
   false
 }
