@@ -1616,6 +1616,15 @@ function collectCloSigs() {
   let fe = 0
   while fe < fnStmts.length {
     let key = fnSigKeyOf(fe)
+    // A VOID-returning function used as a VALUE (bound, passed, returned) needs its
+    // `>v` sig interned too — the value-eligible key above excludes void. Mirrors the
+    // object-field-closure pass below, but for a void function reached through a
+    // binding / param rather than a struct field. Limited to `>v` here (struct- /
+    // string-returning closure values are a separate slice); usage-gated by `fnValUsed`,
+    // so a program without a void function value emits byte-identical types.
+    if key == "" && fe < fRetVoid.length && fRetVoid[fe] == 1 {
+      key = cloSigKeyExt(fe)
+    }
     if key != "" {
       if cloSigPosOfKey(key) < 0 {
         cloSigKeys.push(key)
@@ -2500,7 +2509,7 @@ function computeVoidFns() {
               // a Member-target assignment `state.x = …`, which the checker reads as an
               // i32 expression but `stmtIsTailValue` rejects — still classifies void.
               if (
-                !blockTailIsValue(fn.fnBody) &&
+                !blockTailIsValue(fn.fnBody, fnStmts[i]) &&
                 !unionHasAtom(inferRetNameOf(fn.fnName), "null")
               ) {
                 fRetVoid[i] = 1
@@ -2527,7 +2536,7 @@ function fnRetExprOf(fnIx: i32) {
       const stmts = b.blkStmts
       if stmts.length > 0 {
         const last = stmts[stmts.length - 1]
-        if stmtIsTailValue(last) { return last }
+        if stmtIsTailValue(last, fnIx) { return last }
       }
     }
     return firstValuedReturn(fn.fnBody)
@@ -2729,7 +2738,7 @@ function computeRetInference() {
             if fb is Block {
               const fbs = fb.blkStmts
               if fbs.length > 0 {
-                if stmtIsTailValue(fbs[fbs.length - 1]) {
+                if stmtIsTailValue(fbs[fbs.length - 1], fnStmts[i]) {
                   criClassify(fbs[fbs.length - 1], i)
                 }
               }
@@ -11589,7 +11598,7 @@ function emitBlockValueAs(body: i32[], blockIx: i32, fnIx: i32, kind: i32) {
   if b is Block {
     const stmts = b.blkStmts
     if stmts.length == 1 {
-      if stmtIsTailValue(stmts[0]) {
+      if stmtIsTailValue(stmts[0], fnIx) {
         if kind == 124 { return emitExprAsF64(body, stmts[0], fnIx) }
         if kind == 125 { return emitExprAsF32(body, stmts[0], fnIx) }
         if kind == 126 { return emitExprAsI64(body, stmts[0], fnIx) }
@@ -15229,6 +15238,10 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
         const vt = fnIndexOf(callee.identName)
         if vt >= 0 {
           if fRetVoid[vt] == 1 { dropIt = false }
+        } else if calleeReturnsVoid(callee.identName, fnIx) {
+          // A closure-VALUE callee (a param / binding, invisible to `fnIndexOf`) whose
+          // `$fnsig` is void leaves nothing — no `drop`.
+          dropIt = false
         }
       }
       if dropIt {
@@ -15616,7 +15629,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
 // Ident — NOT a `recv.push(x)` member-call, which is void). A `LetDecl`/`RetStmt`/
 // `IfStmt`/`WhileStmt`/assignment/`.push` is a STATEMENT, not a tail value, so it is
 // lowered normally by `emitStmt`.
-function stmtIsTailValue(stmtIx: i32) {
+function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
   let s = P.nodes[stmtIx]
   if s is NumLit { return true }
   // A trailing `null` IS an implicit-return value (the function returns null) — seeded
@@ -15662,6 +15675,10 @@ function stmtIsTailValue(stmtIx: i32) {
       if callee.identName == "__trap__" { return false }
       const target = fnIndexOf(callee.identName)
       if target >= 0 { return fRetVoid[target] == 0 }
+      // A CLOSURE-VALUE callee (a `() => void` param / a void-function binding, invisible
+      // to `fnIndexOf`): a void one (`>v` sig) yields nothing, so it is a STATEMENT tail,
+      // not a value — the signal that makes `run(g: () => void) { g() }` infer void.
+      if fnIx >= 0 && calleeReturnsVoid(callee.identName, fnIx) { return false }
       return true
     }
     return false
@@ -15672,7 +15689,7 @@ function stmtIsTailValue(stmtIx: i32) {
 // True if the BLOCK at `blockIx` ends in a bare tail VALUE statement (an implicit
 // return), as opposed to an explicit `return`/`while`/etc. — i.e. lowering it in tail
 // position would need `emitStmtTail`. A nested `if`/`else` tail recurses (any arm).
-function blockTailIsValue(blockIx: i32) {
+function blockTailIsValue(blockIx: i32, fnIx: i32) {
   let b = P.nodes[blockIx]
   if b is Block {
     const stmts = b.blkStmts
@@ -15680,8 +15697,8 @@ function blockTailIsValue(blockIx: i32) {
     if n == 0 { return false }
     const last = stmts[n - 1]
     let s = P.nodes[last]
-    if s is IfStmt { return ifTailIsValue(last) }
-    return stmtIsTailValue(last)
+    if s is IfStmt { return ifTailIsValue(last, fnIx) }
+    return stmtIsTailValue(last, fnIx)
   }
   false
 }
@@ -15690,7 +15707,7 @@ function blockTailIsValue(blockIx: i32) {
 // bare value expression rather than an explicit `return` — so it must be lowered via
 // `emitIfTail`. An `if` WITHOUT an `else` can fall through with no value, so it never
 // qualifies (the existing void-if path handles it). Recurses through `else if` chains.
-function ifTailIsValue(stmtIx: i32) {
+function ifTailIsValue(stmtIx: i32, fnIx: i32) {
   let s = P.nodes[stmtIx]
   if s is IfStmt {
     // An else-less `if` NEVER qualifies here (it can fall through with no value). This is
@@ -15700,19 +15717,19 @@ function ifTailIsValue(stmtIx: i32) {
     // (`function f(c) { if c then 5 }` → `i32 | null`) is handled separately at emit time
     // by `elseLessNullableTail` (gated on the FINAL nullable classification).
     if s.ifElse < 0 { return false }
-    if blockTailIsValue(s.ifThen) { return true }
+    if blockTailIsValue(s.ifThen, fnIx) { return true }
     const els = P.nodes[s.ifElse]
-    if els is Block { return blockTailIsValue(s.ifElse) }
-    return ifTailIsValue(s.ifElse)
+    if els is Block { return blockTailIsValue(s.ifElse, fnIx) }
+    return ifTailIsValue(s.ifElse, fnIx)
   }
   false
 }
 
 // True if the statement at `stmtIx` is a body-tail `if`/`else` whose arms yield a
 // value (implicit return) and so must be lowered tail-aware by `emitIfTail`.
-function lastStmtIsValueIf(stmtIx: i32) {
+function lastStmtIsValueIf(stmtIx: i32, fnIx: i32) {
   let s = P.nodes[stmtIx]
-  if s is IfStmt { return ifTailIsValue(stmtIx) }
+  if s is IfStmt { return ifTailIsValue(stmtIx, fnIx) }
   false
 }
 
@@ -15727,7 +15744,7 @@ function elseLessNullableTail(stmtIx: i32, fnIx: i32) {
   let s = P.nodes[stmtIx]
   if s is IfStmt {
     if s.ifElse >= 0 { return false }
-    if !blockTailIsValue(s.ifThen) { return false }
+    if !blockTailIsValue(s.ifThen, fnIx) { return false }
     return fnRetNullBearing(fnIx)
   }
   false
@@ -15753,7 +15770,7 @@ function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
     let i = 0
     while i < n {
       const isLast = i == n - 1
-      if isLast && stmtIsTailValue(stmts[i]) {
+      if isLast && stmtIsTailValue(stmts[i], fnIx) {
         // Implicit return: seed the return context + push the value (so a trailing
         // `null` / nullable value boxes or sentinels exactly like `return e`), then
         // `return` (0x0f).
@@ -15762,7 +15779,7 @@ function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
           return -1
         }
         fbReturn() // 0x0f return
-      } else if isLast && lastStmtIsValueIf(stmts[i]) {
+      } else if isLast && lastStmtIsValueIf(stmts[i], fnIx) {
         // The body ends in an `if`/`else` whose arms each yield a value (implicit
         // return) rather than `return`ing — lower it tail-aware so each arm's trailing
         // value expression becomes the function's return.
@@ -15809,7 +15826,7 @@ function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
 // explicit `unreachable` precedes the `end`. The typechecker has already proven such
 // a fallthrough is dynamically dead (every path returns), so the `unreachable` is
 // sound padding, never executed.
-function bodyEndsInReturn(blockIx: i32) {
+function bodyEndsInReturn(blockIx: i32, fnIx: i32) {
   let b = P.nodes[blockIx]
   if b is Block {
     const stmts = b.blkStmts
@@ -15818,7 +15835,7 @@ function bodyEndsInReturn(blockIx: i32) {
     const last = stmts[n - 1]
     let s = P.nodes[last]
     if s is RetStmt { return true }
-    return stmtIsTailValue(last)
+    return stmtIsTailValue(last, fnIx)
   }
   false
 }
@@ -15893,7 +15910,7 @@ function emitStmtsTail(body: i32[], blockIx: i32, fnIx: i32) {
 function emitStmtTail(body: i32[], stmtIx: i32, fnIx: i32) {
   let s = P.nodes[stmtIx]
   if s is IfStmt { return emitIfTail(body, stmtIx, fnIx) }
-  if stmtIsTailValue(stmtIx) {
+  if stmtIsTailValue(stmtIx, fnIx) {
     // An if-tail arm's implicit return — seed the return context (so a `null` arm
     // boxes / sentinels per the function's return type) exactly like `emitFuncBody`.
     if emitReturnValue(body, stmtIx, fnIx, false) < 0 { return -1 }
@@ -16496,7 +16513,7 @@ function emitFuncCode(out: i32[], fnIx: i32) {
     if fnPos >= 0 {
       if fRetVoid[fnPos] == 1 { isVoidFn = true }
     }
-    if !isVoidFn && !bodyEndsInReturn(fn.fnBody) {
+    if !isVoidFn && !bodyEndsInReturn(fn.fnBody, fnIx) {
       if fnRetNullBearing(fnIx) {
         if emitNullForRet(body, fnIx) < 0 { return -1 }
       } else {
@@ -23785,6 +23802,7 @@ function annParamKind(t: string) {
 function annRetKind(t: string) {
   if t == "i32" || t == "boolean" || t == "bool" { return ">i" }
   if t == "f64" { return ">d" }
+  if t == "void" { return ">v" }
   const si = structIndexByName(t)
   if si >= 0 { return ">s" + i32ToStr(si) + ";" }
   ""
@@ -23880,7 +23898,10 @@ function calleeCloSigKey(name: string, fnIx: i32) {
     if ak != "" { return ak }
   }
   const fe = identClosureFe(name, fnIx)
-  if fe >= 0 { return fnSigKeyOf(fe) }
+  // The EXTENDED key (not just `fnSigKeyOf`) so a VOID-returning binding (`const f = hi`)
+  // resolves its `>v` sig — interned above for void function values. A value-eligible
+  // (i32/f64) binding takes the same key `fnSigKeyOf` would give.
+  if fe >= 0 { return cloSigKeyExt(fe) }
   ""
 }
 
@@ -23892,6 +23913,17 @@ function calleeReturnsF64(name: string, fnIx: i32) {
   const n = k.length
   if n < 2 { return false }
   k[n - 2] == '>' && k[n - 1] == 'd'
+}
+
+// True if the function-VALUE callee `name` (in scope of `fnIx`) returns void — its
+// resolved `$fnsig` key ends in `>v`. A void closure call leaves NOTHING on the stack, so
+// its statement form must NOT `drop` (the value-call analogue of `fRetVoid` for a named
+// function — which `fnIndexOf` can't see for a param / binding closure value).
+function calleeReturnsVoid(name: string, fnIx: i32) {
+  const k = calleeCloSigKey(name, fnIx)
+  const n = k.length
+  if n < 2 { return false }
+  k[n - 2] == '>' && k[n - 1] == 'v'
 }
 
 function paramCloSigKey(fnIx: i32, name: string) {
