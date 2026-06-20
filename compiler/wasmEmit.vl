@@ -7691,6 +7691,14 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       isStrLit = false
       isF64Lit = false
     }
+    // A CLOSURE-element list (kind 5, `((i32) => i32)[]`): a literal of function values
+    // (`[inc, dbl]`) reads as bare idents, so `arrLitIsRef` (which keys off an objlit /
+    // nested-array first element) misses it — the threaded annotation is authoritative.
+    if pendingListKind == 5 {
+      isRefLit = true
+      isStrLit = false
+      isF64Lit = false
+    }
     if isF64Lit {
       if !fa64Used {
         return emitFail(
@@ -7746,7 +7754,7 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       const annKind = pendingListKind
       const annSlot = pendingListSlot
       let rslot = 0
-      if annKind == 1 || annKind == 2 { rslot = annSlot }
+      if annKind == 1 || annKind == 2 || annKind == 5 { rslot = annSlot }
       else if elems.length >= 1 { rslot = rlSlotByName(arrLitElemName(arrIx)) }
       else { rslot = annSlot }
       if rslot < 0 {
@@ -17089,6 +17097,9 @@ function tyAnnRefListKind(tyIx: i32) {
     if lt is TypeRef {
       if nameIsRefArray(lt.tyName) {
         if refArrElemKind(lt.tyName) == 2 { return 2 }
+        // A closure-element ref list (`((i32) => i32)[]`, kind 5) threads kind 5 so
+        // `emitArr` builds the closure backing (not a struct-shape guess).
+        if refArrElemKind(lt.tyName) == 5 { return 5 }
         return 1
       }
       if nameIsStringArray(lt.tyName) { return 3 }
@@ -17199,11 +17210,30 @@ function retNulStringFlag(tyIx: i32) {
 // wins if a name were somehow both — it cannot be, the lexemes are disjoint.) String
 // is a distinct code from array purely for typedness clarity; `pushVT` emits the SAME
 // array ref valtype for both, since a string IS the i32-array type here.
+// `1` if the type-annotation node at `tyIx` is an ARRAY OF FUNCTIONS (`((i32) => i32)[]`),
+// else `0` — the closure-element ref-list guard `vtKindOfType` checks before the kind-14
+// function-type test.
+function nameIsClosureArrayTy(tyIx: i32) {
+  if tyIx >= 0 {
+    const ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if nameIsClosureArray(ty.tyName) { return 1 }
+    }
+  }
+  0
+}
+
 function vtKindOfType(tyIx: i32) {
   // A NULLABLE function `(fn) | null` is the closure fat-pointer made nullable, kind 19 —
   // checked BEFORE `tyIsFuncType` (whose `=>` test would otherwise claim it as the non-null
   // kind 14). The non-null part is a function, but the `| null` makes the slot nullable.
   if nulCloFlag(tyIx) == 1 { return 19 }
+  // An ARRAY OF FUNCTIONS (`((i32) => i32)[]`) is a closure-element REF LIST (kind 5),
+  // NOT a single closure — checked BEFORE `tyIsFuncType`, whose `=>` substring test would
+  // otherwise claim the whole array as kind 14. The element arrow is NESTED; a TOP-LEVEL
+  // arrow with a trailing `[]` (`(i32) => i32[]`, a function RETURNING a list) is a real
+  // closure value and stays kind 14 below.
+  if nameIsClosureArrayTy(tyIx) == 1 { return 5 }
   // A function-typed annotation (a name carrying `=>` — incl. the synthetic
   // `"=>sigkey"` a monomorphized closure param is pinned with) is the closure
   // fat-pointer, kind 14. Checked first; no other name contains an arrow.
@@ -17959,6 +17989,15 @@ function mAssignTypeIndices(n: i32) {
   if fnValUsed {
     cloStructIdx = mAllocType()
     if mAssertIdx(cloStructIdx, oldCloIdx, "cloStructIdx") < 0 { return -1 }
+    // A CLOSURE-element ref-list slot (kind 5, `((i32) => i32)[]`) backs onto the closure
+    // fat-pointer struct. `cloStructIdx` is interned HERE (after the ref-pair loop above),
+    // so backfill those slots' element heap type now — the backing array `(array (mut (ref
+    // null $cloStructIdx)))` forward-references it within the shared rec group.
+    let rcs = 0
+    while rcs < rlElemName.length {
+      if rlElemKindTbl[rcs] == 5 { rlElemHeap[rcs] = cloStructIdx }
+      rcs = rcs + 1
+    }
     // One `$fnsig` functype per distinct value-call signature (`cloSigKeys`).
     cloSigBase = mNextType
     let sa = 0
@@ -19562,7 +19601,27 @@ function nameIsRefArray(name: string) {
   // host stores the coerced union value), so it is a kind-2 ref list.
   if parenUnionArrElemName(name) != "" { return true }
   if nameIsMapArray(name) { return true }
+  // An ARRAY OF FUNCTIONS (`((i32) => i32)[]`) — a closure-element ref list (kind 5).
+  if nameIsClosureArray(name) { return true }
   false
+}
+
+// True if `name` is an ARRAY OF FUNCTIONS — `((i32) => i32)[]`: a trailing `[]` whose
+// element is a fully-parenthesized FUNCTION type, the arrow NESTED (depth > 0). A
+// TOP-LEVEL arrow (`(i32) => i32[]`) is a function RETURNING a list, NOT an array of
+// functions — excluded via `annArrowAt` (the same disambiguation as the list-return
+// name guard). The element heap type is the shared closure fat-pointer struct
+// (`cloStructIdx`); the ref-list element kind is 5.
+function nameIsClosureArray(name: string) {
+  let n = name.length
+  if n < 4 { return false }
+  if name[n - 2] != '[' { return false }
+  if name[n - 1] != ']' { return false }
+  if annArrowAt(name) >= 0 { return false }
+  const elem = name.slice(0, n - 2)
+  if elem.length < 1 { return false }
+  if elem[0] != '(' { return false }
+  strContains(elem, "=>")
 }
 
 // The VALUE-union element name of a parenthesized union-array annotation:
@@ -19588,6 +19647,8 @@ function refArrElemKind(name: string) {
   if nameIsMapArray(name) { return 3 }
   // A `(string|i32)[]` value-union element list is a union-box list (kind 2).
   if parenUnionArrElemName(name) != "" { return 2 }
+  // An `((i32) => i32)[]` array of functions is a closure-element list (kind 5).
+  if nameIsClosureArray(name) { return 5 }
   let u = 0
   while u < unNames.length {
     if name == unNames[u] + "[]" { return 2 }
@@ -20121,6 +20182,9 @@ function refArrElemName(name: string) {
   // the TABLE key is the bare atom-set name every other union position uses).
   const pun = parenUnionArrElemName(name)
   if pun != "" { return pun }
+  // `((i32) => i32)[]` → `((i32) => i32)` (the parenthesized function-type element, the
+  // table key for the closure-element slot — all such slots share `cloStructIdx`).
+  if nameIsClosureArray(name) { return name.slice(0, name.length - 2) }
   let u = 0
   while u < unNames.length {
     if name == unNames[u] + "[]" { return unNames[u] }
@@ -24120,6 +24184,16 @@ function exprIsClosure(exprIx: i32, fnIx: i32) {
   if e is Member {
     // A struct field holding a function value reads back as a closure.
     return memberIsClosure(e.memObj, callMemProp(exprIx), fnIx)
+  }
+  // An index `xs[i]` into an ARRAY OF FUNCTIONS (`((i32) => i32)[]`, ref-list element
+  // kind 5) reads back a closure fat-pointer — callable via `call_ref`.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      const slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        return rlElemKindTbl[slot] == 5
+      }
+    }
   }
   false
 }
