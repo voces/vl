@@ -22356,6 +22356,24 @@ function unionNameOfExpr(exprIx: i32, fnIx: i32) {
         }
       }
     }
+    // A union-returning FIELD-closure callee (`const r = o.run(7)` over a `(…) => A | B`
+    // field) — the Member analogue of the binding case above: resolve the field's lifted
+    // function's union name so the result narrows/unboxes.
+    if callee is Member {
+      const mfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+      if mfe >= 0 {
+        const mfn = P.nodes[fnStmts[mfe]]
+        if mfn is FuncDecl {
+          const mrn = tyNameOf(mfn.fnRet)
+          if isUName(mrn) { return mrn }
+          if mfn.fnRet < 0 {
+            const mim = inferRetNameOf(mfn.fnName)
+            if isValueUnionName(mim) { return mim }
+            if mim != "" && isUName(mim) { return mim }
+          }
+        }
+      }
+    }
     return ""
   }
   if e is Ident { return unionNameOfIdent(e.identName, fnIx) }
@@ -23932,6 +23950,32 @@ function annParamKind(t: string) {
 // The closure-ABI return suffix for a type NAME (`i32`/`boolean` → ">i", `f64` → ">d", a
 // struct → ">s<idx>;"), or "" outside the value-returning ABI. (`void` is a later slice —
 // its `>v` sig is not interned by the value-eligible pass.)
+// Depth-aware split of a type NAME on its top-level `|` (the union/nullable separator) —
+// the `annSplitParams` analogue for `|`.
+function annSplitPipe(s: string, out: string[]) {
+  let cur = ""
+  let depth = 0
+  let i = 0
+  while i < s.length {
+    const c = s[i]
+    if c == '(' || c == '{' || c == '[' {
+      depth = depth + 1
+      cur = cur + fromCodePoint(c)
+    } else if c == ')' || c == '}' || c == ']' {
+      depth = depth - 1
+      cur = cur + fromCodePoint(c)
+    } else if depth == 0 && c == '|' {
+      out.push(cur)
+      cur = ""
+    } else {
+      cur = cur + fromCodePoint(c)
+    }
+    i = i + 1
+  }
+  out.push(cur)
+  0
+}
+
 function annRetKind(t: string) {
   if t == "i32" || t == "boolean" || t == "bool" { return ">i" }
   if t == "f64" { return ">d" }
@@ -23940,6 +23984,29 @@ function annRetKind(t: string) {
   if t == "i64" { return ">I" }
   const si = structIndexByName(t)
   if si >= 0 { return ">s" + i32ToStr(si) + ";" }
+  // A UNION / NULLABLE return — `string | null` → `>N`, `S | null` → `>nN;`, a 2+-member
+  // union → the box `>u` (matching `cloRetKeySuffix` for the underlying function). An
+  // `i32 | null` boxed niche and any other shape stay "" (un-resolvable here).
+  const parts: string[] = []
+  annSplitPipe(t, parts)
+  if parts.length >= 2 {
+    const nonNull: string[] = []
+    let hasNull = false
+    let pi = 0
+    while pi < parts.length {
+      const p = parts[pi]
+      if p == "null" { hasNull = true }
+      else if p.length > 0 { nonNull.push(p) }
+      pi = pi + 1
+    }
+    if hasNull && nonNull.length == 1 {
+      if nonNull[0] == "string" { return ">N" }
+      const msi = structIndexByName(nonNull[0])
+      if msi >= 0 { return ">n" + i32ToStr(msi) + ";" }
+      return ""
+    }
+    if nonNull.length >= 2 { return ">u" }
+  }
   ""
 }
 
