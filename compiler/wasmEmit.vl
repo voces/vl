@@ -2196,6 +2196,25 @@ function paramNulRef(fnIx: i32, name: string) {
   false
 }
 
+// True if param `name` of function `fnIx` is a NULLABLE function value (`fn | null`, kind
+// 19) — the closure dual of `paramNulRef`.
+function paramNulClosure(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return nulCloFlag(p.parType) == 1 }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
 // True if the function `name` returns a nullable struct (`fRetNul`).
 function fnRetNulRef(name: string) {
   let i = 0
@@ -12860,6 +12879,8 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         let cParamNulBool = false
         // A `string | null` param position: a `null` argument is `ref.null $aTypeIdx`.
         let cParamNulString = false
+        // A `fn | null` param position (kind 19): a `null` argument is `ref.null $cloStruct`.
+        let cParamNulClosure = false
         if cFn is FuncDecl {
           const cParams = cFn.fnParams
           if i < cParams.length {
@@ -12867,6 +12888,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
             if cpnb is Param {
               if tyIsNulBool(cpnb.parType) { cParamNulBool = true }
               if retNulStringFlag(cpnb.parType) == 1 { cParamNulString = true }
+              if nulCloFlag(cpnb.parType) == 1 { cParamNulClosure = true }
             }
             if (
               vtKindOfParam(cParams[i]) == 1 ||
@@ -12943,11 +12965,14 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           } else {
             const savedCNB = pendingNulBool
             const savedCNS = pendingNulString
+            const savedCNC = pendingNulClosure
             if cParamNulBool { pendingNulBool = true }
             if cParamNulString { pendingNulString = true }
+            if cParamNulClosure { pendingNulClosure = true }
             if emitExpr(body, args[i], fnIx) < 0 { return -1 }
             pendingNulBool = savedCNB
             pendingNulString = savedCNS
+            pendingNulClosure = savedCNC
             // A nullable-REP value (a null-narrowed `S | null` param/local, or a
             // recursive `S | null` field read whose wasm slot stays `(ref null $S)`)
             // flowing into a NON-NULL `(ref $S)` param: recover the non-null ref at
@@ -17138,6 +17163,10 @@ function retNulStringFlag(tyIx: i32) {
 // is a distinct code from array purely for typedness clarity; `pushVT` emits the SAME
 // array ref valtype for both, since a string IS the i32-array type here.
 function vtKindOfType(tyIx: i32) {
+  // A NULLABLE function `(fn) | null` is the closure fat-pointer made nullable, kind 19 —
+  // checked BEFORE `tyIsFuncType` (whose `=>` test would otherwise claim it as the non-null
+  // kind 14). The non-null part is a function, but the `| null` makes the slot nullable.
+  if nulCloFlag(tyIx) == 1 { return 19 }
   // A function-typed annotation (a name carrying `=>` — incl. the synthetic
   // `"=>sigkey"` a monomorphized closure param is pinned with) is the closure
   // fat-pointer, kind 14. Checked first; no other name contains an arrow.
@@ -21899,7 +21928,10 @@ function declaredNulClosure(name: string) {
 function exprNulClosure(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[unwrapParen(exprIx)]
-  if e is Ident { return declaredNulClosure(e.identName) }
+  if e is Ident {
+    if paramNulClosure(fnIx, e.identName) { return true }
+    return declaredNulClosure(e.identName)
+  }
   false
 }
 
@@ -23964,6 +23996,7 @@ function exprIsClosure(exprIx: i32, fnIx: i32) {
     // `call_ref`; the nullable cell is recovered to non-null at the call site (after the
     // `if c != null` narrowing the checker requires).
     if paramIsClosure(fnIx, e.identName) { return true }
+    if paramNulClosure(fnIx, e.identName) { return true }
     let slot = declaredSlotOf(e.identName)
     if slot >= 0 { return localIsRef[slot] == 14 || localIsRef[slot] == 19 }
     // A module-global closure cell (kind 14).
