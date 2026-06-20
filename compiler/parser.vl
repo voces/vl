@@ -95,6 +95,13 @@ function peekTok(): Tok {
 // The current token's kind — the common discriminating `==` compare.
 function peekKind() { peekTok().kind }
 
+// The kind of the token AFTER the current one (one-token lookahead) — used to spot a
+// two-token sequence like `=>` (`EQUAL` `GT`) without consuming. EOF past the end.
+function peek2Kind() {
+  if P.pos + 1 >= P.toks.length { return P.toks[P.toks.length - 1].kind }
+  P.toks[P.pos + 1].kind
+}
+
 // Consume and return the current token.
 function advance(): Tok {
   const t = peekTok()
@@ -324,11 +331,38 @@ function parseTypeAtom() {
     // member name; the checker classifies int vs float by the `.`.
     name = advance().text
   } else if peekKind() == "LPAREN" {
-    // A parenthesized group `(A | B)` — kept in the synthetic name so the
-    // checker's top-level `|`/`&` splitters honor the grouping (`(0|1|2)&!2`).
+    // Either a FUNCTION TYPE `(params) => ret` (`() => void`, `(i32, i32) => i32` —
+    // disambiguated by an `=>` after the `)`) or a parenthesized GROUP `(A | B)` (kept in
+    // the synthetic name so the checker's `|`/`&` splitters honor the grouping). Parse the
+    // paren contents as a COMMA-separated type list either way.
     advance() // "("
-    name = "(" + parseTypeName() + ")"
+    let inner = ""
+    if peekKind() != "RPAREN" {
+      inner = parseTypeName()
+      let pmore = peekKind() == "COMMA"
+      while pmore {
+        advance() // ","
+        if peekKind() == "RPAREN" {
+          pmore = false // tolerated trailing comma
+        } else {
+          inner = inner + "," + parseTypeName()
+          pmore = peekKind() == "COMMA"
+        }
+      }
+    }
     expect("RPAREN")
+    if peekKind() == "EQUAL" && peek2Kind() == "GT" {
+      advance() // "="
+      advance() // ">"
+      // The return type is a single ATOM (`i32`, `void`, `S`, a parenthesized `(A | B)`),
+      // so a top-level `|`/`&` stays OUTSIDE the arrow — `((i32) => i32) | null` is a
+      // nullable function, NOT a function returning `i32 | null` (parenthesize the return
+      // for that). Synthetic name `"(params)=>ret"`; the `=>` marks it a function type.
+      const retName = parseTypeAtom()
+      name = "(" + inner + ")=>" + retName
+    } else {
+      name = "(" + inner + ")"
+    }
   } else if peekKind() == "LBRACE" {
     advance() // "{"
     if peekKind() == "LBRACK" {
