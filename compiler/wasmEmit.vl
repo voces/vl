@@ -1751,9 +1751,15 @@ function cloRetKeySuffix(fe: i32) {
   if k == 16 { return ">N" }
   if k == 1 { return ">s" + i32ToStr(cloRetValSlot(fe)) + ";" }
   if k == 9 { return ">n" + i32ToStr(cloRetValSlot(fe)) + ";" }
-  // List returns (`i32[]` 2, `string[]` 7, `f64[]` 12, ref-list 5) and a closure (`14`)
-  // return are a later slice: the list reps mismatch the closure `$fnsig` result, so they
-  // stay un-minted (a clean "no interned signature") rather than mis-lowering.
+  // List returns: `i32[]` (2) → `>a`, `string[]` (7) → `>A`, `f64[]` (12) → `>D`. The
+  // closure `$fnsig` result is the list WRAPPER ref (`fbValtype` kinds 2/7/12), recovered
+  // non-null at the value-call site like every other non-null closure result.
+  if k == 2 { return ">a" }
+  if k == 7 { return ">A" }
+  if k == 12 { return ">D" }
+  // A ref-list (5) and a closure (14) return remain a later slice: those reps still
+  // mismatch the closure `$fnsig` result, so they stay un-minted (a clean "no interned
+  // signature") rather than mis-lowering.
   ""
 }
 
@@ -19918,7 +19924,29 @@ function collectA(stmts: i32[]) {
         }
       }
     } else if nd is TypeRef {
-      if nameIsMap(nd.tyName) {
+      if annArrowAt(nd.tyName) >= 0 {
+        // A TOP-LEVEL function-type annotation (`(i32) => R`): the function-type name
+        // itself needs no array/list type, but its RETURN `R` may (an `i32[]`/`string[]`/
+        // `f64[]` result list, or a `string`). Force the return's backing types so the
+        // closure `$fnsig` result valtype resolves even when the only `i32[]` in the
+        // module rides this annotation. The arrow is TOP-LEVEL, so `((i32) => i32)[]` (a
+        // NESTED arrow — an array OF functions) is NOT caught here; it falls through to
+        // the array branches below. Checked FIRST so the trailing `[]` of a list-returning
+        // function type (`(i32) => i32[]`) is never mis-read as an array name.
+        const fra = annArrowAt(nd.tyName)
+        const frRet = nd.tyName.slice(fra + 2, nd.tyName.length)
+        if frRet == "i32[]" {
+          lUsed = true
+          aUsed = true
+        } else if nameIsStringArray(frRet) {
+          slUsed = true
+          aUsed = true
+        } else if nameIsF64Array(frRet) {
+          fa64Used = true
+        } else if nameIsString(frRet) {
+          aUsed = true
+        }
+      } else if nameIsMap(nd.tyName) {
         // A `{[string]: i32}` annotation (G8) is a string-keyed map: the map struct
         // + the keys list (string-ref backing) + the i32 VALS list (the existing
         // `lTypeIdx`/`aTypeIdx`). So it forces `aUsed` (string backing + vals backing)
@@ -22804,7 +22832,11 @@ function exprArray(exprIx: i32, fnIx: i32) {
       // The intrinsic allocators yield an i32 list unless the fill is f64
       // (`arrNewIntrKind` 1 — then `exprF64Array` claims the call).
       if arrNewIntrKind(exprIx, fnIx) == 0 { return true }
-      return fnRetArray(callee.identName)
+      if fnRetArray(callee.identName) { return true }
+      // A closure-VALUE call (`g(x)` with `g: (i32) => i32[]`) whose resolved sig
+      // result is the i32 list (`>a`, kind 2) — so `const xs = g(x)` types `xs` as a
+      // list and its `.length` / index reads lower through the list machinery.
+      return calleeRetKind(callee.identName, fnIx) == 2
     }
     // `xs.map(f)` / `xs.filter(p)` yield a NEW list — the i32 list exactly when the
     // result ELEMENT kind is i32/boolean (map: the callback's return kind; filter:
@@ -23222,7 +23254,12 @@ function exprStringArray(exprIx: i32, fnIx: i32) {
     // `__array_new__(n, "s")` builds a string list (intrinsic kind 2).
     if arrNewIntrKind(exprIx, fnIx) == 2 { return true }
     const callee = P.nodes[e.callFn]
-    if callee is Ident { return fnRetStringArray(callee.identName) }
+    if callee is Ident {
+      if fnRetStringArray(callee.identName) { return true }
+      // A closure-VALUE call (`g(x)` with `g: (i32) => string[]`) whose resolved sig
+      // result is the string list (`>A`, kind 7).
+      return calleeRetKind(callee.identName, fnIx) == 7
+    }
     return false
   }
   if e is Ident {
@@ -23352,6 +23389,12 @@ function exprF64Array(exprIx: i32, fnIx: i32) {
     if arrNewIntrKind(exprIx, fnIx) == 1 { return true }
     if callIsMapFilter(exprIx, fnIx) {
       return mfResultKindOf(exprIx, fnIx) == 1
+    }
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      // A closure-VALUE call (`g(x)` with `g: (i32) => f64[]`) whose resolved sig
+      // result is the f64 list (`>D`, kind 12).
+      return calleeRetKind(callee.identName, fnIx) == 12
     }
     return false
   }
@@ -24185,6 +24228,12 @@ function annRetKind(t: string) {
   if t == "void" { return ">v" }
   if t == "string" { return ">S" }
   if t == "i64" { return ">I" }
+  // A LIST return — `i32[]` → `>a`, `string[]` → `>A`, `f64[]` → `>D` (matching
+  // `cloRetKeySuffix` for the underlying function), so a `(i32) => i32[]` callback
+  // resolves the interned signature and its value call lowers.
+  if t == "i32[]" { return ">a" }
+  if nameIsStringArray(t) { return ">A" }
+  if nameIsF64Array(t) { return ">D" }
   const si = structIndexByName(t)
   if si >= 0 { return ">s" + i32ToStr(si) + ";" }
   // A UNION / NULLABLE return — `string | null` → `>N`, `S | null` → `>nN;`, a 2+-member
