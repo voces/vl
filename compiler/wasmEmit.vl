@@ -3439,6 +3439,13 @@ let cloEqScratchBase = 0
 let fnUsesArrNew = false
 let arrNewScratchBase = 0
 
+// `f(x) ?? d` (call-LHS null-coalesce) frame: 1 `(ref $uBoxIdx)` slot stashing the
+// call's value-union box once, so the tag test + unbox read the SAME evaluation.
+// Flagged by `fnHasCoalesceCall`; appended LAST in the frame layout (after arrNew) so
+// every existing layout is untouched.
+let fnUsesCoalesceCall = false
+let coalesceCallSlot = 0
+
 // ── struct-type table (MULTIPLE structs per program) ──────────────────────────
 // A program may declare MANY struct `type`s. Mirroring the union variant table, the
 // struct table is a FLAT store keyed by struct index (declaration order): struct `i`
@@ -5356,6 +5363,129 @@ function ifChainHasArrNew(ifIx: i32) {
 function fnHasArrNew(fnIx: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl { return blockHasArrNew(fn.fnBody) }
+  false
+}
+
+// ── `f(x) ?? d` (a CALL-LHS null-coalesce) scratch detection ───────────────────
+// A `??` whose left operand is a CALL cannot RE-EVALUATE its LHS the way an
+// ident/field `x ?? d` does (a call has effects + cost), so it stashes the call's
+// result (a value-union box) in a 1-slot `(ref $uBoxIdx)` frame, then tests the tag
+// and unboxes off the ONE evaluation. The scan reserves that slot for any function
+// containing such a `??`; a function without one keeps a byte-identical layout.
+// Over-approximates to ANY call-LHS `??` (the emit path uses the slot only for a
+// value-union-box result; an unhandled rep reserves-but-skips, still valid).
+function exprHasCoalesceCall(exprIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[exprIx]
+  if e is BinExpr {
+    if e.binOp == "??" {
+      const l = P.nodes[unwrapParen(e.binLeft)]
+      if l is Call { return true }
+    }
+    if exprHasCoalesceCall(e.binLeft) { return true }
+    return exprHasCoalesceCall(e.binRight)
+  }
+  if e is Call {
+    if exprHasCoalesceCall(e.callFn) { return true }
+    const args = e.callArgs
+    let i = 0
+    while i < args.length {
+      if exprHasCoalesceCall(args[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if e is Member { return exprHasCoalesceCall(e.memObj) }
+  if e is OptMember { return exprHasCoalesceCall(e.omObj) }
+  if e is Index {
+    if exprHasCoalesceCall(e.idxArr) { return true }
+    return exprHasCoalesceCall(e.idxIndex)
+  }
+  if e is Unary { return exprHasCoalesceCall(e.unArg) }
+  if e is Paren { return exprHasCoalesceCall(e.parInner) }
+  if e is IsExpr { return exprHasCoalesceCall(e.isObj) }
+  if e is ObjLit {
+    const fields = e.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if exprHasCoalesceCall(f.fiValue) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  if e is ArrayLit {
+    const elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      if exprHasCoalesceCall(elems[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+// True if any statement in the block at `blockIx` (descending into if/else arms and
+// loop bodies) contains a call-LHS `??`. Mirrors `blockHasArrNew`.
+function blockHasCoalesceCall(blockIx: i32) {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        if exprHasCoalesceCall(s.letInit) { return true }
+      } else if s is RetStmt {
+        if exprHasCoalesceCall(s.retArg) { return true }
+      } else if s is BinExpr {
+        if exprHasCoalesceCall(stmts[i]) { return true }
+      } else if s is Call {
+        if exprHasCoalesceCall(stmts[i]) { return true }
+      } else if s is ObjLit {
+        if exprHasCoalesceCall(stmts[i]) { return true }
+      } else if s is IfStmt {
+        if ifChainHasCoalesceCall(stmts[i]) { return true }
+      } else if s is WhileStmt {
+        if exprHasCoalesceCall(s.whileCond) { return true }
+        if blockHasCoalesceCall(s.whileBody) { return true }
+      } else if s is ForIn {
+        if exprHasCoalesceCall(s.fiIter) { return true }
+        if blockHasCoalesceCall(s.fiBody) { return true }
+      } else if s is ForRange {
+        if exprHasCoalesceCall(s.frFrom) { return true }
+        if exprHasCoalesceCall(s.frTo) { return true }
+        if blockHasCoalesceCall(s.frBody) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if any arm of the `if` / `else if` chain at `ifIx` contains a call-LHS `??`.
+function ifChainHasCoalesceCall(ifIx: i32) {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if exprHasCoalesceCall(s.ifCond) { return true }
+    if blockHasCoalesceCall(s.ifThen) { return true }
+    if s.ifElse >= 0 {
+      const els = P.nodes[s.ifElse]
+      if els is Block { return blockHasCoalesceCall(s.ifElse) }
+      if els is IfStmt { return ifChainHasCoalesceCall(s.ifElse) }
+    }
+  }
+  false
+}
+
+// True if the FuncDecl at `fnIx` contains a call-LHS `??` — so it reserves the 1-slot
+// coalesce-call scratch frame.
+function fnHasCoalesceCall(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return blockHasCoalesceCall(fn.fnBody) }
   false
 }
 
@@ -10569,6 +10699,71 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
           }
         }
       }
+      // `f(x) ?? d` over a CALL returning a value union with `null` (`i32 | null`,
+      // …): a call CANNOT be re-evaluated (effects + cost) the way the ident/field
+      // paths above re-read their place, so STASH the box once in the coalesce-call
+      // slot, then test the tag and unbox off that single evaluation. Scalar atoms
+      // only (the value-typed `if` blocktype); a `string | null` call result is
+      // deferred like the ident/field forms. One slot is sound across nesting: each
+      // `??` sets-tests-uses within its own evaluation, and the null arm never reads
+      // the box again (so a nested call-LHS `??` in the default may reuse the slot).
+      if lhs is Call {
+        const kunm = unionNameOfExpr(e.binLeft, fnIx)
+        if kunm != "" {
+          if isValueUnionName(kunm) && unionHasAtom(kunm, "null") {
+            const krest = removeAtomFrom(kunm, "null")
+            const kak = valueAtomKind(krest)
+            if kak >= 0 && kak != 6 {
+              if kak == 2 {
+                return emitFail(
+                  "emitProgram: `??` over a string|null call result is not supported yet",
+                )
+              }
+              if emitExpr(body, e.binLeft, fnIx) < 0 {
+                return -1 // the box, evaluated ONCE
+              }
+              fbLocalSet(coalesceCallSlot)
+              fbLocalGet(coalesceCallSlot)
+              fbStructGet(uBoxIdx, 0) // field 0: tag
+              fbI32Const(scalarTagOf("null"))
+              fbI32Bin(70)            // 0x46 i32.eq → null?
+              let kbt = 127           // 0x7f i32 (boolean shares it)
+              if kak == 3 {
+                kbt = 126 // 0x7e i64
+              }
+              if kak == 4 {
+                kbt = 124 // 0x7c f64
+              }
+              if kak == 5 {
+                kbt = 125 // 0x7d f32
+              }
+              fbIf(kbt) // 0x04 if, value blocktype
+              ctrlEnter()
+              if kak == 3 {
+                if emitExprAsI64(body, e.binRight, fnIx) < 0 { return -1 }
+              } else if kak == 4 {
+                if emitExprAsF64(body, e.binRight, fnIx) < 0 { return -1 }
+              } else if kak == 5 {
+                if emitExprAsF32(body, e.binRight, fnIx) < 0 { return -1 }
+              } else {
+                if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+              }
+              fbElse()                // 0x05 else — present → unbox the stash
+              fbLocalGet(coalesceCallSlot)
+              fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+              const kvb = vbHeapIdxOfAtom(krest)
+              if kvb < 0 {
+                return emitFail("emitProgram: union call atom has no value box")
+              }
+              fbRefCast(kvb)
+              fbStructGet(kvb, 0) // the scalar payload
+              fbEnd()             // 0x0b end
+              ctrlLeave()
+              return 0
+            }
+          }
+        }
+      }
       // `o.v ?? d` over a VALUE-UNION struct field (`v: i32 | null`, code 16):
       // the field-read dual of the boxed-union name path above — read the box
       // off the field, test its tag for `null`, and select the default or the
@@ -11385,12 +11580,34 @@ function globalIsI64(name: string) {
   letIsI64(li, -1)
 }
 
+// The unboxed scalar atom KIND of a value-union null-coalesce `lhs ?? d` (where `lhs`
+// is an ident or call yielding `T | null` with ONE non-null scalar atom): the result
+// of `??` is that atom, so `print`-routing + numeric context coercion classify it by
+// the atom (`i64`/`f64`/`f32` need their own import / convert). -1 when the expression
+// is not such a `??`, or the union keeps ≥2 non-null atoms (still a box, not a scalar).
+function coalesceAtomKind(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is BinExpr {
+    if e.binOp == "??" {
+      const nm = unionNameOfExpr(e.binLeft, fnIx)
+      if nm != "" {
+        if isValueUnionName(nm) && unionHasAtom(nm, "null") {
+          const k = valueAtomKind(removeAtomFrom(nm, "null"))
+          if k >= 0 && k != 6 { return k }
+        }
+      }
+    }
+  }
+  -1
+}
+
 // True if evaluating the expression at `exprIx` yields an i64 — a reference to an
 // i64 param/local/global, or a parenthesized such. Drives the `print` import choice
 // (`__print_i64__`, import 4). Arithmetic/calls returning i64 are Slice 2; here only
 // the direct-reference forms (the Slice-1 `print(x)` shape) classify as i64.
 function exprIsI64(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  if coalesceAtomKind(exprIx, fnIx) == 3 { return true }
   const e = P.nodes[exprIx]
   if e is Paren { return exprIsI64(e.parInner, fnIx) }
   // A bare INTEGER literal past the i32 range is typed i64 by the checker (the
@@ -11505,6 +11722,7 @@ function globalIsF32(name: string) {
 // a mixed f32/float-literal expression routes to the f32 instructions. (Slice 5.)
 function exprIsF32(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  if coalesceAtomKind(exprIx, fnIx) == 5 { return true }
   const e = P.nodes[exprIx]
   if e is Paren { return exprIsF32(e.parInner, fnIx) }
   if e is Ident {
@@ -11648,6 +11866,7 @@ function globalIsF64(name: string) {
 // per-operand opcode selection in the BinExpr path. (Slice 3.)
 function exprIsF64(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  if coalesceAtomKind(exprIx, fnIx) == 4 { return true }
   const e = P.nodes[exprIx]
   if e is NumLit { return numTextIsFloat(e.numText) }
   if e is Paren { return exprIsF64(e.parInner, fnIx) }
@@ -15610,6 +15829,10 @@ function fbBeginFunc(nParams: i32, nLocals: i32) {
   // existing frame so layouts without it are untouched.
   arrNewScratchBase = fbScratchCur
   if fnUsesArrNew { fbReserve(1) }
+  // Call-LHS `??` box stash (1 `(ref $uBoxIdx)` slot), appended after every existing
+  // frame so layouts without it are untouched.
+  coalesceCallSlot = fbScratchCur
+  if fnUsesCoalesceCall { fbReserve(1) }
   fbScratchCur
 }
 
@@ -15667,6 +15890,7 @@ function fbLocalsCount(nLocals: i32) {
   n = n + fnListEqRSlots.length * 4
   if fnUsesCloEq { n = n + 2 }
   if fnUsesArrNew { n = n + 1 }
+  if fnUsesCoalesceCall { n = n + 1 }
   n
 }
 
@@ -15825,6 +16049,8 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   }
   // Array-intrinsic frame (1 i32 slot — the staged allocation length).
   if fnUsesArrNew { fbI32Run() }
+  // Call-LHS `??` box stash (1 `(ref $uBoxIdx)` slot, appended LAST).
+  if fnUsesCoalesceCall { fbRefRun(uBoxIdx) }
   wTarget(prev)
   0
 }
@@ -15874,6 +16100,7 @@ function emitFuncCode(out: i32[], fnIx: i32) {
     fnUsesF64Push = fnHasF64Push(fnIx)
     fnUsesStrOp = fnHasStrOp(fnIx)
     fnUsesArrNew = fnHasArrNew(fnIx)
+    fnUsesCoalesceCall = fnHasCoalesceCall(fnIx)
     fnUsesMap = fnHasMap(fnIx)
     // `fnHasMap` only scans LOCALS/params; also reserve the frame when a map op runs
     // on a GLOBAL struct-field map-array element (e.g. `T.scopes[top][k] = v`).
@@ -17257,6 +17484,7 @@ function startScanBlock(blockIx: i32) {
   if blockHasMemberPopKind(blockIx, -1, 3) { fnUsesF64Push = true }
   if blockHasStrOp(blockIx, -1) { fnUsesStrOp = true }
   if blockHasArrNew(blockIx) { fnUsesArrNew = true }
+  if blockHasCoalesceCall(blockIx) { fnUsesCoalesceCall = true }
   if blockHasMapOp(blockIx, -1) { fnUsesMap = true }
   collectRefPushSlots(blockIx, -1)
   collectMemberPopRefSlots(blockIx, -1)
@@ -17270,6 +17498,7 @@ function startScanIf(ifIx: i32) {
   if st is IfStmt {
     if exprHasStrOp(st.ifCond, -1) { fnUsesStrOp = true }
     if exprHasArrNew(st.ifCond) { fnUsesArrNew = true }
+    if exprHasCoalesceCall(st.ifCond) { fnUsesCoalesceCall = true }
     if exprHasMapOp(st.ifCond, -1) { fnUsesMap = true }
     if exprHasMemberPopKind(st.ifCond, -1, 0) { fnUsesPush = true }
     if exprHasMemberPopKind(st.ifCond, -1, 1) { fnUsesRefPush = true }
@@ -17302,6 +17531,7 @@ function startFnDetectScratch() {
   fnUsesF64Push = false
   fnUsesStrOp = false
   fnUsesArrNew = false
+  fnUsesCoalesceCall = false
   fnUsesMap = false
   fnUsesCallRef = false
   fnRefPushSlots = []
@@ -17324,6 +17554,7 @@ function startFnDetectScratch() {
         if exprHasMemberPopKind(ix, -1, 3) { fnUsesF64Push = true }
         if exprHasStrOp(ix, -1) { fnUsesStrOp = true }
         if exprHasArrNew(ix) { fnUsesArrNew = true }
+        if exprHasCoalesceCall(ix) { fnUsesCoalesceCall = true }
         if exprHasMapOp(ix, -1) { fnUsesMap = true }
         if fnValUsed {
           if blockHasCallRef(ix, -1) { fnUsesCallRef = true }
@@ -17356,6 +17587,7 @@ function startFnDetectScratch() {
       startScanBlock(st.fiBody)
       if exprHasStrOp(st.fiIter, -1) { fnUsesStrOp = true }
       if exprHasArrNew(st.fiIter) { fnUsesArrNew = true }
+      if exprHasCoalesceCall(st.fiIter) { fnUsesCoalesceCall = true }
       if exprHasMapOp(st.fiIter, -1) { fnUsesMap = true }
     } else if st is WhileStmt {
       startScanBlock(st.whileBody)
@@ -17374,6 +17606,7 @@ function startFnDetectScratch() {
       if exprHasMemberPopKind(startStmts[si], -1, 3) { fnUsesF64Push = true }
       if exprHasStrOp(startStmts[si], -1) { fnUsesStrOp = true }
       if exprHasArrNew(startStmts[si]) { fnUsesArrNew = true }
+      if exprHasCoalesceCall(startStmts[si]) { fnUsesCoalesceCall = true }
       if exprHasMapOp(startStmts[si], -1) { fnUsesMap = true }
       if fnValUsed {
         if blockHasCallRef(startStmts[si], -1) { fnUsesCallRef = true }
