@@ -4127,6 +4127,14 @@ function collectLocals(blockIx: i32, fnIx: i32) {
           // A function-VALUE local (`const f = function(...)...` or `const g = namedFn`),
           // kind 14 — its cell is the closure fat-pointer struct `(ref $cloStructIdx)`.
           slot = addLocalName(s.letName, 14, -1)
+        } else if letNulBool(stmts[i], fnIx) {
+          // `boolean | null` NICHE local (kind 17): the cell is a plain i32 holding 0/1,
+          // with the spare value 2 encoding `null` (no box) — so `fbValtype` renders it
+          // i32 (the default), same as a plain boolean. A DEDICATED kind so the annotation
+          // / inferred-if init isn't rejected by `checkLocalI32` and the if-binding emit
+          // routes it to the sentinel-2 rep (rep 2); a later `x = null` stays valid (the
+          // write consults `exprNulBool`, an AST walk, not the slot kind).
+          slot = addLocalName(s.letName, 17, -1)
         } else {
           if checkLocalI32(stmts[i]) < 0 {
             scopePop()
@@ -11408,13 +11416,21 @@ function emitNulArmToLocal(
   }
   if rep == 0 {
     if emitUnionCoerce(body, unionName, valIx, fnIx) < 0 { return -1 }
-  } else {
+  } else if rep == 1 {
     // rep 1: a `string | null` arm — a non-null string passes through, a bare `null`
     // lowers as `ref.null $aTypeIdx` (`pendingNulString`).
     const saved = pendingNulString
     pendingNulString = true
     let rc = emitExpr(body, valIx, fnIx)
     pendingNulString = saved
+    if rc < 0 { return -1 }
+  } else {
+    // rep 2: a `boolean | null` arm — a non-null boolean rides its i32 0/1; a bare
+    // `null` lowers as the niche sentinel 2 (`pendingNulBool`).
+    const saved = pendingNulBool
+    pendingNulBool = true
+    let rc = emitExpr(body, valIx, fnIx)
+    pendingNulBool = saved
     if rc < 0 { return -1 }
   }
   fbLocalSet(idx)
@@ -11429,9 +11445,12 @@ function emitNulNullToLocal(body: i32[], idx: i32, rep: i32) {
     fbI32Const(scalarTagOf("null"))
     fbRefNullNone() // the payload slot is unread under the null tag
     fbStructNew(uBoxIdx)
-  } else {
+  } else if rep == 1 {
     wU8(208) // 0xd0 ref.null
     wSLEB(aTypeIdx)
+  } else {
+    // rep 2: a `boolean | null` else-less / explicit-null path — the niche sentinel 2.
+    fbI32Const(2)
   }
   fbLocalSet(idx)
   0
@@ -14781,8 +14800,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     // binding local IS the destination). The slot kind `collectLocals` already chose is
     // the authoritative rep: kind 4 the value-union box (rep 0, needs the union NAME to
     // box each arm's atom — taken from the annotation / `letUNm`), kind 16 a `string |
-    // null` ref (rep 1). A `boolean | null` local is a separate pre-existing gap (it is
-    // not yet a supported local rep at all), so it is left to the bare paths below.
+    // null` ref (rep 1), kind 17 a `boolean | null` niche i32 (rep 2, sentinel 2 = null).
     if exprIsIfStmt(s.letInit) {
       const slotKind = localIsRef[slot]
       let nulRep = -1
@@ -14793,6 +14811,8 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
         if nulNm != "" { nulRep = 0 }
       } else if slotKind == 16 {
         nulRep = 1
+      } else if slotKind == 17 {
+        nulRep = 2
       }
       if nulRep >= 0 {
         // The value-union box local (kind 4) is a NON-null `(ref $uBoxIdx)` — non-
@@ -14826,8 +14846,10 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       if emitExprAsI64(body, s.letInit, fnIx) < 0 { return -1 }
     } else {
       // A `boolean|null` NICHE binding lowers a bare `null` init as the sentinel 2; a
-      // `string|null` binding lowers it as `ref.null $aTypeIdx`.
-      pendingNulBool = letIsNulBoolAnn(stmtIx)
+      // `string|null` binding lowers it as `ref.null $aTypeIdx`. `letNulBool` (not just
+      // the annotation) so an INFERRED niche binding (`const r = f()` where `f` returns
+      // `boolean | null`) seeds the sentinel too.
+      pendingNulBool = letNulBool(stmtIx, fnIx)
       pendingNulString = letIsNulString(stmtIx, fnIx)
       if emitExpr(body, s.letInit, fnIx) < 0 { return -1 }
       pendingNulBool = false
@@ -16389,6 +16411,10 @@ function exprNulBool(exprIx: i32, fnIx: i32) {
 function letNulBool(letIx: i32, fnIx: i32) {
   if letIx < 0 { return false }
   if letIsNulBoolAnn(letIx) { return true }
+  // An un-annotated `const x = if c then true else null` infers `boolean | null` (a
+  // niche the emitter can't statically derive from the if-expr arms). The CHECKER
+  // typed it and exported the binding by node index; consult that before the init probe.
+  if isInferLetNulBool(letIx) { return true }
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType < 0 { return exprNulBool(d.letInit, fnIx) }
