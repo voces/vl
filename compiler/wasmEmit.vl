@@ -2275,6 +2275,18 @@ function exprNullableString(exprIx: i32, fnIx: i32) {
     if declaredNulString(e.identName) { return true }
     return globalIsNulString(e.identName)
   }
+  // A chained `a ?? b` over nullable strings is ITSELF nullable-string when the default
+  // `b` is also nullable (the result can still be null) — the left-associative
+  // `(f() ?? g()) ?? d` shape, where the classifier sees this nested `??` as `binLeft`
+  // before `emitExpr` re-associates it. Keeps print-routing / `exprString` consistent
+  // with the emitted rep.
+  if e is BinExpr {
+    if e.binOp == "??" {
+      if exprNullableString(e.binLeft, fnIx) {
+        return exprNullableString(e.binRight, fnIx)
+      }
+    }
+  }
   false
 }
 
@@ -3460,12 +3472,17 @@ let cloEqScratchBase = 0
 let fnUsesArrNew = false
 let arrNewScratchBase = 0
 
-// `f(x) ?? d` (call-LHS null-coalesce) frame: 1 `(ref $uBoxIdx)` slot stashing the
-// call's value-union box once, so the tag test + unbox read the SAME evaluation.
-// Flagged by `fnHasCoalesceCall`; appended LAST in the frame layout (after arrNew) so
-// every existing layout is untouched.
+// `f(x) ?? d` (call-LHS null-coalesce) frame: stashes the call's result once so the
+// null test + recovery read the SAME evaluation (a call cannot be re-evaluated). THREE
+// slots, one per rep the call may return: a `(ref $uBoxIdx)` for a value-union box, a
+// `(ref null $aTypeIdx)` for a `string | null` niche, and an i32 for a `boolean | null`
+// niche. Flagged by `fnHasCoalesceCall` (over-approximating ANY call-LHS `??`); all
+// three are appended LAST in the frame layout (after arrNew) so every existing layout
+// without a call-`??` is untouched.
 let fnUsesCoalesceCall = false
 let coalesceCallSlot = 0
+let coalesceCallStrSlot = 0
+let coalesceCallBoolSlot = 0
 
 // ── struct-type table (MULTIPLE structs per program) ──────────────────────────
 // A program may declare MANY struct `type`s. Mirroring the union variant table, the
@@ -10792,6 +10809,51 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
             }
           }
         }
+        // `f() ?? d` over a CALL returning `boolean | null` (the i32 niche): a call
+        // cannot be re-read, so STASH the single evaluation in the bool slot, then select
+        // `d` on the sentinel 2 — the call analogue of the `boolean | null` ident path.
+        if exprNulBool(e.binLeft, fnIx) {
+          if emitExpr(body, e.binLeft, fnIx) < 0 {
+            return -1 // the niche i32, evaluated ONCE
+          }
+          fbLocalSet(coalesceCallBoolSlot)
+          if emitExpr(body, e.binRight, fnIx) < 0 {
+            return -1 // d                                       [val1]
+          }
+          fbLocalGet(coalesceCallBoolSlot) // x                  [val2]
+          fbLocalGet(coalesceCallBoolSlot)
+          fbI32Const(2)
+          fbI32Bin(70)                     // 0x46 i32.eq → x == 2 (null)            [cond]
+          wU8(27)                          // 0x1b select → d if null else x
+          return 0
+        }
+        // `f() ?? d` over a CALL returning `string | null` (kind 16): STASH the nullable
+        // ref once (raw, via `pendingRawNullRead`), then a value-typed `if` on
+        // `ref.is_null` selects `d` or the recovered non-null string — the call analogue
+        // of the `string | null` ident path.
+        if exprNullableString(e.binLeft, fnIx) {
+          const savedRaw = pendingRawNullRead
+          pendingRawNullRead = true
+          const tre = emitExpr(body, e.binLeft, fnIx) // the raw nullable ref, ONCE
+          pendingRawNullRead = savedRaw
+          if tre < 0 { return -1 }
+          fbLocalSet(coalesceCallStrSlot)
+          fbLocalGet(coalesceCallStrSlot)
+          wU8(209)                                    // 0xd1 ref.is_null → 1 if null
+          wU8(4)                                      // 0x04 if
+          wU8(100)                                    // blocktype: (ref $aTypeIdx) — non-null string result
+          wSLEB(aTypeIdx)
+          ctrlEnter()
+          if emitExpr(body, e.binRight, fnIx) < 0 {
+            return -1 // d (a string)
+          }
+          fbElse()         // 0x05 else
+          fbLocalGet(coalesceCallStrSlot)
+          fbRefAsNonNull() // 0xd4 recover the non-null string the slot holds
+          fbEnd()          // 0x0b end
+          ctrlLeave()
+          return 0
+        }
       }
       // `o.v ?? d` over a VALUE-UNION struct field (`v: i32 | null`, code 16):
       // the field-read dual of the boxed-union name path above — read the box
@@ -15872,9 +15934,14 @@ function fbBeginFunc(nParams: i32, nLocals: i32) {
   // existing frame so layouts without it are untouched.
   arrNewScratchBase = fbScratchCur
   if fnUsesArrNew { fbReserve(1) }
-  // Call-LHS `??` box stash (1 `(ref $uBoxIdx)` slot), appended after every existing
-  // frame so layouts without it are untouched.
+  // Call-LHS `??` stash, appended after every existing frame so layouts without it are
+  // untouched: a `(ref $uBoxIdx)` box slot, then a `(ref null $aTypeIdx)` string|null
+  // slot, then an i32 boolean|null slot — one per rep the call result may take.
   coalesceCallSlot = fbScratchCur
+  if fnUsesCoalesceCall { fbReserve(1) }
+  coalesceCallStrSlot = fbScratchCur
+  if fnUsesCoalesceCall { fbReserve(1) }
+  coalesceCallBoolSlot = fbScratchCur
   if fnUsesCoalesceCall { fbReserve(1) }
   fbScratchCur
 }
@@ -15933,7 +16000,7 @@ function fbLocalsCount(nLocals: i32) {
   n = n + fnListEqRSlots.length * 4
   if fnUsesCloEq { n = n + 2 }
   if fnUsesArrNew { n = n + 1 }
-  if fnUsesCoalesceCall { n = n + 1 }
+  if fnUsesCoalesceCall { n = n + 3 }
   n
 }
 
@@ -16092,8 +16159,13 @@ function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   }
   // Array-intrinsic frame (1 i32 slot — the staged allocation length).
   if fnUsesArrNew { fbI32Run() }
-  // Call-LHS `??` box stash (1 `(ref $uBoxIdx)` slot, appended LAST).
-  if fnUsesCoalesceCall { fbRefRun(uBoxIdx) }
+  // Call-LHS `??` stash (3 slots, appended LAST): the `(ref $uBoxIdx)` box, the
+  // `(ref null $aTypeIdx)` string|null niche, then the i32 boolean|null niche.
+  if fnUsesCoalesceCall {
+    fbRefRun(uBoxIdx)
+    fbRefNullRun(aTypeIdx)
+    fbI32Run()
+  }
   wTarget(prev)
   0
 }
@@ -16401,6 +16473,14 @@ function exprNulBool(exprIx: i32, fnIx: i32) {
     const gi = globalLetOf(e.identName)
     if gi >= 0 { return letNulBool(gi, -1) }
     return false
+  }
+  // A chained `a ?? b` over `boolean | null` is itself `boolean | null` when the default
+  // `b` is also nullable — the left-associative `(f() ?? g()) ?? d` shape (see the
+  // `exprNullableString` companion). Keeps `??` print-routing consistent with the rep.
+  if e is BinExpr {
+    if e.binOp == "??" {
+      if exprNulBool(e.binLeft, fnIx) { return exprNulBool(e.binRight, fnIx) }
+    }
   }
   false
 }
