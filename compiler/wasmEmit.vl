@@ -10587,8 +10587,10 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
         if globalNameIsNonConst(e.identName) {
           // A NULLABLE-struct cell (kind 9) legitimately holds null — its reads
           // stay nullable (the member-access path recovers non-null at use); a
-          // nullable-LIST cell (kind 15) likewise. A SCALAR numeric cell (i32 0 /
-          // i64 10 / f64 11 / f32 13 / boolean) is not a ref, so it takes no
+          // nullable-LIST cell (kind 15) and a nullable-CLOSURE cell (kind 19)
+          // likewise (the `!= null` check reads raw, the narrowed call recovers
+          // non-null at the call site). A SCALAR numeric cell (i32 0 / i64 10 /
+          // f64 11 / f32 13 / boolean) is not a ref, so it takes no
           // `ref.as_non_null` either. (Slice 5 adds f32/i64/f64 scalars.)
           if (
             gck0 != 0 &&
@@ -10596,7 +10598,8 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
             gck0 != 10 &&
             gck0 != 11 &&
             gck0 != 13 &&
-            gck0 != 15
+            gck0 != 15 &&
+            gck0 != 19
           ) {
             wU8(212) // 0xd4 ref.as_non_null
           }
@@ -13246,14 +13249,18 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
             if emitUnionCoerce(body, gUNm, a.binRight, fnIx) < 0 { return -1 }
           } else {
             // A `boolean | null` NICHE global: seed the sentinel for a `null` RHS; a
-            // `string | null` global seeds the nullable-array ref.
+            // `string | null` global seeds the nullable-array ref; a nullable-CLOSURE
+            // global (kind 19) seeds `ref.null $cloStruct` for a `null` RHS.
             const savedGNB = pendingNulBool
             const savedGNS = pendingNulString
+            const savedGNC = pendingNulClosure
             if exprNulBool(a.binLeft, fnIx) { pendingNulBool = true }
             if exprNullableString(a.binLeft, fnIx) { pendingNulString = true }
+            if exprNulClosure(a.binLeft, fnIx) { pendingNulClosure = true }
             if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
             pendingNulBool = savedGNB
             pendingNulString = savedGNS
+            pendingNulClosure = savedGNC
           }
           pendingListKind = 0
           pendingListSlot = 0
@@ -13274,14 +13281,19 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         // A `boolean | null` NICHE local (`x = null` / `x = b`): the i32 cell holds
         // 0/1 or the sentinel 2 — seed `pendingNulBool` so a `null` RHS emits the
         // sentinel (a boolean RHS is a `BoolLit`, untouched). A `string | null` local
-        // seeds `pendingNulString` so a `null` RHS is `ref.null $aTypeIdx`.
+        // seeds `pendingNulString` so a `null` RHS is `ref.null $aTypeIdx`. A nullable-
+        // CLOSURE local (kind 19) seeds `pendingNulClosure` so a `null` RHS is
+        // `ref.null $cloStruct` (a function RHS builds the non-null closure value).
         const savedNB = pendingNulBool
         const savedNS = pendingNulString
+        const savedNC = pendingNulClosure
         if exprNulBool(a.binLeft, fnIx) { pendingNulBool = true }
         if exprNullableString(a.binLeft, fnIx) { pendingNulString = true }
+        if exprNulClosure(a.binLeft, fnIx) { pendingNulClosure = true }
         if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
         pendingNulBool = savedNB
         pendingNulString = savedNS
+        pendingNulClosure = savedNC
       }
       fbLocalSet(idx) // 0x21 local.set
       return 0
@@ -17480,6 +17492,11 @@ function globalCellKind(letIx: i32) {
   let d = P.nodes[letIx]
   if d is LetDecl {
     if globalHasTypeAnn(letIx) {
+      // A NULLABLE-function global (`let g: ((i32) => i32) | null = inc`) is a nullable
+      // closure cell (kind 19) — checked BEFORE the bare-function kind 14, mirroring
+      // `vtKindOfType` / `fieldTypeCode`: `((i32) => i32) | null` is a nullable function,
+      // whereas `(i32) => i32 | null` is a function returning a nullable.
+      if nulCloFlag(d.letType) == 1 { return 19 }
       // A function-typed global (`const g: (i32) => i32 = inc`) is a closure fat-pointer
       // cell (kind 14), like a function-valued local.
       if tyIsFuncType(d.letType) { return 14 }
@@ -17566,8 +17583,8 @@ function fbRefNullForKind(kind: i32, structIdx: i32) {
     wSLEB(mkListIdx)
   } else if kind == 12 {
     wSLEB(fl64TypeIdx) // the f64-list wrapper struct heap type (Slice 4)
-  } else if kind == 14 {
-    wSLEB(cloStructIdx) // the closure fat-pointer struct heap type
+  } else if kind == 14 || kind == 19 {
+    wSLEB(cloStructIdx) // the closure fat-pointer struct heap type (14 non-null, 19 nullable)
   } else {
     wSLEB(aTypeIdx)
   }
@@ -17624,6 +17641,9 @@ function fbValtypeNullable(kind: i32, structIdx: i32) {
     wU8(125) // 0x7d f32 (scalar, never a nullable ref — Slice 5)
   } else if kind == 14 {
     wU8(99) // 0x63 (ref null) — nullable closure ref (lambdas)
+    wSLEB(cloStructIdx)
+  } else if kind == 19 {
+    wU8(99) // 0x63 (ref null) — `((i32) => i32) | null` (already nullable)
     wSLEB(cloStructIdx)
   } else if kind == 15 {
     wU8(99) // 0x63 (ref null) — `i32[] | null` (already nullable)
@@ -18375,6 +18395,10 @@ function emitStartFnCode(out: i32[]) {
             // a `string|null` global lowers it as `ref.null $aTypeIdx` (kind 16).
             pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
             pendingNulString = letIsNulString(globalStmts[gi], -1)
+            // A nullable-CLOSURE global (kind 19) lowers a bare `null` init as
+            // `ref.null $cloStruct`; a function init builds the (non-null) closure value.
+            const savedSNC = pendingNulClosure
+            if gck == 19 { pendingNulClosure = true }
             // A UNION cell (kind 4) coerces a raw init value into the box
             // (`let w: string | i32 = n` boxes the i32 read) — a union-valued
             // init (a union-returning call) passes through unchanged.
@@ -18393,6 +18417,7 @@ function emitStartFnCode(out: i32[]) {
             }
             pendingNulBool = false
             pendingNulString = false
+            pendingNulClosure = savedSNC
             pendingMapSlot = -1
             pendingStructIdx = -1
           }
@@ -21956,7 +21981,11 @@ function exprNulClosure(exprIx: i32, fnIx: i32) {
   const e = P.nodes[ux]
   if e is Ident {
     if paramNulClosure(fnIx, e.identName) { return true }
-    return declaredNulClosure(e.identName)
+    if declaredNulClosure(e.identName) { return true }
+    // A module-global nullable-closure cell (kind 19).
+    const gl = globalLetOf(e.identName)
+    if gl >= 0 { return globalCellKind(gl) == 19 }
+    return false
   }
   // A nullable-closure struct FIELD read (`recv.op` over a `((i32) => i32) | null` field,
   // code 22): the raw `(ref null $cloStruct)` — its `!= null` lowers to `ref.is_null` and
@@ -24029,9 +24058,12 @@ function exprIsClosure(exprIx: i32, fnIx: i32) {
     if paramNulClosure(fnIx, e.identName) { return true }
     let slot = declaredSlotOf(e.identName)
     if slot >= 0 { return localIsRef[slot] == 14 || localIsRef[slot] == 19 }
-    // A module-global closure cell (kind 14).
+    // A module-global closure cell — a bare closure (kind 14) or a NULLABLE one (kind 19).
     const gl = globalLetOf(e.identName)
-    if gl >= 0 { return globalCellKind(gl) == 14 }
+    if gl >= 0 {
+      const gk = globalCellKind(gl)
+      return gk == 14 || gk == 19
+    }
     return false
   }
   if e is Call {
