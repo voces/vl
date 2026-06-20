@@ -1682,10 +1682,85 @@ function fieldValueFeOf(valIx: i32) {
   -1
 }
 
-// The EXTENDED `$fnsig` key of lifted function `fe`: `fnSigKeyOf`'s key when the
-// sig is value-eligible, else the same param spine with a VOID (`>v`) or
-// STRUCT-REF (`>sN;`) result — the field-closure dispatch sigs. "" when any
-// param/result kind is still outside the ABI.
+// The RESULT valtype KIND of lifted function `fe`'s `$fnsig` functype — the same kind the
+// function's OWN functype emits, read from an annotation (`vtKindOfType`) or the inferred
+// `fRet*` tables, so the closure functype byte-matches the callee. -1 for void (0 results)
+// and for the kinds still outside the value-call ABI (a ref-list / closure return — `5` /
+// `14` are minted by their own paths, not here). The slot (struct index for kinds 1 / 9)
+// comes from `cloRetValSlot`.
+function cloRetValKind(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  if fe >= fRetVoid.length { return -1 }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fRetVoid[fe] == 1 { return -1 }
+    if fn.fnRet >= 0 {
+      if tyIsFuncType(fn.fnRet) { return 14 }
+      return vtKindOfType(fn.fnRet)
+    }
+    if fnReturnsClosure(fe) { return 14 }
+    if fRetStr[fe] == 1 { return 3 }
+    if fRetArr[fe] == 1 { return 2 }
+    if fRetUni[fe] == 1 { return 4 }
+    if fRetRef[fe] == 1 { return 1 }
+    if fRetNul[fe] == 1 { return 9 }
+    if fRetRArr[fe] == 1 { return 5 }
+    if fRetStrArr[fe] == 1 { return 7 }
+    if fRetNulStr[fe] == 1 { return 16 }
+    if fRetF64[fe] == 1 { return 11 }
+    if fRetI64[fe] == 1 { return 10 }
+    // An f64 tail with no intervening local (a `.map`/`.filter` callback `n => n * 2.0`)
+    // — its f64-ness is detected structurally, not via `fRetF64` (mirrors the old
+    // `cloRetKindOf`; without this the callback's functype declared i32 over an f64 body).
+    if tailIsF64NoLocal(fnRetExprOf(fnStmts[fe]), fnStmts[fe]) { return 11 }
+    return 0
+  }
+  -1
+}
+
+// The struct-table slot for `fe`'s result valtype — a real index only for a struct (kind
+// 1) or nullable-struct (kind 9) return, `-1` otherwise.
+function cloRetValSlot(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 {
+      const k = vtKindOfType(fn.fnRet)
+      if k == 1 || k == 9 { return retStructIndex(fn.fnRet) }
+      return -1
+    }
+    if fRetRef[fe] == 1 { return fRetStructIdx[fe] }
+    if fRetNul[fe] == 1 { return fRetStructIdx[fe] }
+  }
+  -1
+}
+
+// The `>X` RESULT suffix of `fe`'s extended `$fnsig` key — one token per distinct result
+// functype shape, so two functions share a sig iff their params AND result byte-match.
+// Mirrors `cloRetValKind`: `>i`/`>d`/`>I` scalars, `>S` string, `>a`/`>A`/`>D` the i32/
+// string/f64 lists, `>u` a union box, `>N` `string | null`, `>sN;`/`>nN;` a struct /
+// nullable-struct. "" for the kinds not yet value-callable (a `>v` void is handled by the
+// caller; ref-list `5` and closure `14` returns are a later slice).
+function cloRetKeySuffix(fe: i32) {
+  const k = cloRetValKind(fe)
+  if k == 0 { return ">i" }
+  if k == 11 { return ">d" }
+  if k == 10 { return ">I" }
+  if k == 3 { return ">S" }
+  if k == 4 { return ">u" }
+  if k == 16 { return ">N" }
+  if k == 1 { return ">s" + i32ToStr(cloRetValSlot(fe)) + ";" }
+  if k == 9 { return ">n" + i32ToStr(cloRetValSlot(fe)) + ";" }
+  // List returns (`i32[]` 2, `string[]` 7, `f64[]` 12, ref-list 5) and a closure (`14`)
+  // return are a later slice: the list reps mismatch the closure `$fnsig` result, so they
+  // stay un-minted (a clean "no interned signature") rather than mis-lowering.
+  ""
+}
+
+// The EXTENDED `$fnsig` key of lifted function `fe`: `fnSigKeyOf`'s key when the sig is
+// value-eligible, else the same param spine with the extended RESULT suffix
+// (`cloRetKeySuffix`) — void, the i32/string/f64 lists, a union box, a nullable scalar/
+// struct, a struct ref. "" when any param OR the result kind is still outside the ABI.
 function cloSigKeyExt(fe: i32) {
   let base = fnSigKeyOf(fe)
   if base != "" { return base }
@@ -1693,9 +1768,7 @@ function cloSigKeyExt(fe: i32) {
   if fe >= fRetVoid.length { return "" }
   const fn = P.nodes[fnStmts[fe]]
   if fn is FuncDecl {
-    // Read every field of the narrowed `fn` BEFORE further narrowings.
     const params = fn.fnParams
-    const retTy = fn.fnRet
     let key = ""
     let pi = 0
     while pi < params.length {
@@ -1712,28 +1785,9 @@ function cloSigKeyExt(fe: i32) {
       pi = pi + 1
     }
     if fRetVoid[fe] == 1 { return key + ">v" }
-    if fnReturnsClosure(fe) { return "" }
-    if retTy >= 0 {
-      if vtKindOfType(retTy) == 1 {
-        return key + ">s" + i32ToStr(retStructIndex(retTy)) + ";"
-      }
-      // An annotated `: string` return — the raw i32-array ref `(ref $aTypeIdx)`, the
-      // `>S` value-call result kind.
-      if vtKindOfType(retTy) == 3 { return key + ">S" }
-      // An annotated `: i64` return — the `0x7e` scalar, the `>I` value-call result kind.
-      if vtKindOfType(retTy) == 10 { return key + ">I" }
-      return ""
-    }
-    // An INFERRED `string` return — same `>S` kind as the annotated case above.
-    if fRetStr[fe] == 1 { return key + ">S" }
-    // An INFERRED `i64` return — same `>I` scalar kind as the annotated case above.
-    if fRetI64[fe] == 1 { return key + ">I" }
-    if fRetRef[fe] == 1 {
-      if fRetStructIdx[fe] >= 0 {
-        return key + ">s" + i32ToStr(fRetStructIdx[fe]) + ";"
-      }
-    }
-    return ""
+    const suf = cloRetKeySuffix(fe)
+    if suf == "" { return "" }
+    return key + suf
   }
   ""
 }
@@ -2284,7 +2338,17 @@ function exprNullableString(exprIx: i32, fnIx: i32) {
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Call {
     const callee = P.nodes[e.callFn]
-    if callee is Ident { return fnRetNulString(callee.identName) }
+    if callee is Ident {
+      if fnRetNulString(callee.identName) { return true }
+      // A `string | null`-returning function VALUE (a binding / `(…) => string | null`
+      // param callee) — its result is the nullable raw array, `>N`.
+      return calleeRetKind(callee.identName, fnIx) == 16
+    }
+    // A `string | null`-returning FIELD-closure call.
+    if callee is Member {
+      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+      if ffe >= 0 { return fRetNulStr[ffe] == 1 }
+    }
     return false
   }
   if e is Ident {
@@ -2331,7 +2395,17 @@ function exprNullableStruct(exprIx: i32, fnIx: i32) {
   if e is Paren { return exprNullableStruct(e.parInner, fnIx) }
   if e is Call {
     const callee = P.nodes[e.callFn]
-    if callee is Ident { return fnRetNulRef(callee.identName) }
+    if callee is Ident {
+      if fnRetNulRef(callee.identName) { return true }
+      // An `S | null`-returning function VALUE (a binding / `(…) => S | null` param
+      // callee) — its result is the nullable struct ref, `>nN;`.
+      if calleeRetKind(callee.identName, fnIx) == 9 { return true }
+    }
+    // An `S | null`-returning FIELD-closure call.
+    if callee is Member {
+      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+      if ffe >= 0 && fRetNul[ffe] == 1 { return true }
+    }
     // `xs.pop()` / `xs.get(i)` over a STRUCT-element ref list yield `S | null` (the
     // host's nullable list reads — `pop` of an empty list / OOB `get` is null).
     return structListPopGetElem(exprIx, fnIx) >= 0
@@ -14832,7 +14906,7 @@ function emitReturnValue(
 ) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    let rsi = retStructIndex(fn.fnRet)
+    const rsi = retStructIndex(fn.fnRet)
     if rsi >= 0 {
       if retTRFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
       if retNulRefFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
@@ -18697,7 +18771,6 @@ function emitModule(stmts: i32[]) {
       const rep = P.nodes[fnStmts[repFe]]
       if rep is FuncDecl {
         const rparams = rep.fnParams
-        const rRetTy = rep.fnRet
         wU8(96)                   // 0x60 func
         wULEB(rparams.length + 1) // env + declared params
         wU8(107)                  // param 0 env: structref (0x6b)
@@ -18714,28 +18787,10 @@ function emitModule(stmts: i32[]) {
           wU8(0) // 0 results — the `>v` write-trap sig
         } else {
           wU8(1) // 1 result
-          let rk = cloRetKindOf(repFe)
-          let repStr = fRetStr[repFe] == 1
-          let repI64 = fRetI64[repFe] == 1
-          if rRetTy >= 0 {
-            if vtKindOfType(rRetTy) == 3 { repStr = true }
-            if vtKindOfType(rRetTy) == 10 { repI64 = true }
-          }
-          if repStr {
-            fbValtype(3, -1) // (ref $aTypeIdx) — the `>S` string-result sig
-          } else if repI64 {
-            fbValtype(10, -1) // 0x7e i64 — the `>I` scalar-result sig
-          } else if rk == 0 || rk == 11 {
-            fbValtype(rk, -1) // i32 (0) or f64 (11)
-          } else {
-            let rsi = -1
-            if rRetTy >= 0 {
-              rsi = retStructIndex(rRetTy)
-            } else {
-              rsi = fRetStructIdx[repFe]
-            }
-            fbValtype(1, rsi) // (ref $S) — the `>sN;` struct-result sig
-          }
+          // The result valtype the rep function's OWN functype emits — scalar (i32/f64/
+          // i64), string, an i32/string/f64 list, a union box, a nullable scalar/struct,
+          // or a struct ref (`cloRetValKind`/`cloRetValSlot`, the shared mapping).
+          fbValtype(cloRetValKind(repFe), cloRetValSlot(repFe))
         }
       }
       sai = sai + 1
@@ -22128,7 +22183,17 @@ function exprUnion(exprIx: i32, fnIx: i32) {
   if e is Paren { return exprUnion(e.parInner, fnIx) }
   if e is Call {
     const callee = P.nodes[e.callFn]
-    if callee is Ident { return fnRetUnion(callee.identName) }
+    if callee is Ident {
+      if fnRetUnion(callee.identName) { return true }
+      // A union-returning function VALUE (a binding / `(…) => A | B` param callee) — its
+      // result is the union box, `>u`.
+      return calleeRetKind(callee.identName, fnIx) == 4
+    }
+    // A union-returning FIELD-closure call.
+    if callee is Member {
+      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+      if ffe >= 0 { return fRetUni[ffe] == 1 }
+    }
     return false
   }
   if e is Ident {
@@ -23995,10 +24060,10 @@ function calleeReturnsI64(name: string, fnIx: i32) {
 }
 
 // The struct-table INDEX a function-VALUE callee `name` (in scope of `fnIx`) returns, or
-// -1. Its resolved `$fnsig` key ends in the struct-ref return marker `>sN;` (params never
-// contain `>`, so the last `>` begins the return). The value-call analogue of
-// `fnRetStructIndex` for a named function — drives the closure-call RESULT's struct typing
-// (`p.x` over `const p = f(5)`, a struct-returning closure value).
+// -1. Its resolved `$fnsig` key ends in the struct-ref return marker `>sN;` (a `S` struct)
+// or `>nN;` (an `S | null` nullable struct) — params never contain `>`, so the last `>`
+// begins the return. The value-call analogue of `fnRetStructIndex` — drives the closure-
+// call RESULT's struct typing (`p.x` over `const p = f(5)`, struct or nullable-struct).
 function calleeReturnsStructIdx(name: string, fnIx: i32) {
   const k = calleeCloSigKey(name, fnIx)
   const n = k.length
@@ -24011,7 +24076,7 @@ function calleeReturnsStructIdx(name: string, fnIx: i32) {
     i = i + 1
   }
   if gt < 0 || gt + 2 >= n { return -1 }
-  if k[gt + 1] != 's' { return -1 }
+  if k[gt + 1] != 's' && k[gt + 1] != 'n' { return -1 }
   let j = gt + 2
   let num = 0
   let any = false
@@ -24022,6 +24087,38 @@ function calleeReturnsStructIdx(name: string, fnIx: i32) {
   }
   if !any || j != n - 1 { return -1 }
   num
+}
+
+// The `cloRetValKind`-style RESULT kind of a function-VALUE callee `name` (in scope of
+// `fnIx`), decoded from the trailing `>X` token of its resolved `$fnsig` key — `0` i32,
+// `11` f64, `10` i64, `3` string, `2`/`7`/`12` the i32/string/f64 lists, `4` a union box,
+// `16` `string | null`, `1` a struct, `9` a nullable struct, `-1` void. `-3` when `name`
+// resolves to no value-call sig. Drives the per-kind closure-call RESULT classifiers.
+function calleeRetKind(name: string, fnIx: i32) {
+  const k = calleeCloSigKey(name, fnIx)
+  const n = k.length
+  if n < 2 { return -3 }
+  let i = 0
+  let gt = -1
+  while i < n {
+    if k[i] == '>' { gt = i }
+    i = i + 1
+  }
+  if gt < 0 || gt + 1 >= n { return -3 }
+  const c = k[gt + 1]
+  if c == 'i' { return 0 }
+  if c == 'd' { return 11 }
+  if c == 'I' { return 10 }
+  if c == 'S' { return 3 }
+  if c == 'a' { return 2 }
+  if c == 'A' { return 7 }
+  if c == 'D' { return 12 }
+  if c == 'u' { return 4 }
+  if c == 'N' { return 16 }
+  if c == 'v' { return -1 }
+  if c == 's' { return 1 }
+  if c == 'n' { return 9 }
+  -3
 }
 
 function paramCloSigKey(fnIx: i32, name: string) {
