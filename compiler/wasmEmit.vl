@@ -6646,7 +6646,13 @@ function emitUnionCoerce(
     fbStructNew(uBoxIdx)
     return 0
   }
-  if unionName == "" || !isValueUnionName(unionName) {
+  // A STRUCT value (an object literal, or a struct-typed expr) auto-boxes through
+  // `emitExpr`'s `uDeclared` variant path; only a SCALAR value is value-boxed below.
+  // This is what lets a MIXED union (`A | i32`) coerce either kind of member: an object
+  // arm boxes as a variant struct, a scalar arm as a value box.
+  if bare is ObjLit { return emitExpr(body, exprIx, fnIx) }
+  if exprStruct(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
+  if unionName == "" || !unionHasValueAtom(unionName) {
     return emitExpr(body, exprIx, fnIx)
   }
   // Classify the value's atom. Order mirrors the print-import ladder (f32 before
@@ -10293,6 +10299,20 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
       const gIdx = globalIndexOf(e.identName)
       if gIdx >= 0 {
         fbGlobalGet(gIdx)
+        const gck0 = globalCellKind(globalLetOf(e.identName))
+        // A `string | null` cell (kind 16) is ALWAYS a NULLABLE ref — const OR not (a
+        // const can still be initialized to `null`). So a VALUE read recovers the non-null
+        // string ref (`ref.as_non_null`, 0xd4 — the checker narrowed it non-null at every
+        // value read) INDEPENDENTLY of const-ness; the `!= null` null-check keeps the raw
+        // nullable ref (`pendingRawNullRead`). Without this a top-level `string | null`
+        // value read (`x ?? d`, `!= null`) left a `(ref null $array)` where a `(ref $array)`
+        // is expected (a function-scope local already recovers via the local path below).
+        if gck0 == 16 {
+          if !pendingRawNullRead {
+            wU8(212) // 0xd4 ref.as_non_null
+          }
+          return 0
+        }
         // A NON-const ref global rides in a NULLABLE cell (zero-initialized with
         // `ref.null`, set by the start function before any code runs). Recover the
         // non-null value type the rest of codegen expects with `ref.as_non_null`
@@ -10300,20 +10320,12 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
         // const global keeps its non-null cell, so no cast (goldens unchanged). A
         // scalar (i32/boolean) global needs no cast either.
         if globalNameIsNonConst(e.identName) {
-          const gck0 = globalCellKind(globalLetOf(e.identName))
           // A NULLABLE-struct cell (kind 9) legitimately holds null — its reads
           // stay nullable (the member-access path recovers non-null at use); a
           // nullable-LIST cell (kind 15) likewise. A SCALAR numeric cell (i32 0 /
           // i64 10 / f64 11 / f32 13 / boolean) is not a ref, so it takes no
           // `ref.as_non_null` either. (Slice 5 adds f32/i64/f64 scalars.)
-          // A `string | null` cell (kind 16) holds null legitimately — recover non-null
-          // only for a VALUE read; the `!= null` null-check (`pendingRawNullRead`) keeps
-          // the raw nullable ref for `ref.is_null`.
-          if gck0 == 16 {
-            if !pendingRawNullRead {
-              wU8(212) // 0xd4 ref.as_non_null
-            }
-          } else if (
+          if (
             gck0 != 0 &&
             gck0 != 9 &&
             gck0 != 10 &&
@@ -20713,6 +20725,21 @@ function isValueUnionName(name: string) {
   false
 }
 
+// True if union `name` has at least one NON-null value-atom member (`i32`/`f64`/
+// `boolean`/`string`/…) — true for a pure value union AND a MIXED struct+scalar union,
+// false for an all-struct union. Gates the scalar value-boxing in `emitUnionCoerce`.
+function unionHasValueAtom(name: string) {
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let i = 0
+  while i < atoms.length {
+    const k = valueAtomKind(atoms[i])
+    if k >= 0 && k != 6 { return true }
+    i = i + 1
+  }
+  false
+}
+
 // True if the value union `name` contains the member atom `atom`.
 function unionHasAtom(name: string, atom: string) {
   const atoms: string[] = []
@@ -20791,41 +20818,45 @@ function isDeclaredStructName(stmts: i32[], name: string) {
   false
 }
 
-// True if `name` is an inline STRUCT-VARIANT union annotation we can intern: two+
-// members, none `null`, every member a declared struct type. A primitive value union
-// (`i32 | string`) or a nullable (`S | null`) returns false — neither is a boxed
-// variant-struct union (the only union shape this slice's variant path lowers; the
-// named-alias path rejects them too).
-function isInlineStructUnion(stmts: i32[], name: string) {
+// True if the atom `a` is a STRUCT variant — a declared `type X = {…}`, or an INLINE
+// object shape `{x:i32}` (its fields parse from its own text; a map shape `{[…]}` is
+// not). The per-member test shared by `isVariantBoxUnion` and the registration loop.
+function isStructAtom(stmts: i32[], a: string) {
+  if isDeclaredStructName(stmts, a) { return true }
+  if a.length >= 2 {
+    if a[0] == '{' && a[1] != '[' && a[a.length - 1] == '}' { return true }
+  }
+  false
+}
+
+// True if `name` is a VARIANT-BOX union this emitter interns: two+ non-null members,
+// every member a struct variant OR a value-atom (`i32`/`string`/…), with AT LEAST ONE
+// struct. Covers the all-struct union (`A | B`, `A | B | null`) AND the MIXED struct +
+// scalar union (`A | i32`, `A | B | i32 | f64 | boolean | string | null`) — both ride
+// the `uBoxIdx` `{tag, value}` box, structs as variant-struct payloads, scalars as
+// value-box payloads, tag-discriminated. A PURE value union (`i32 | string`) has no
+// struct, so it is handled earlier by `isValueUnionName`; a single struct + `null`
+// (`A | null`) has one non-null member, so it stays the kind-9 niche nullable ref.
+function isVariantBoxUnion(stmts: i32[], name: string) {
   if unionMemberCount(name) < 2 { return false }
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
-  // A `null` atom is tolerated (`A | B | null` is the boxed struct union whose
-  // null rides in the tag — `scalarTagOf("null")`), but at least TWO members must
-  // be declared structs: a single struct + null (`A | null`) stays the kind-9
-  // niche nullable ref, not a box.
   let structAtoms = 0
+  let nonNull = 0
   let j = 0
   while j < atoms.length {
     if atoms[j] != "null" {
-      if !isDeclaredStructName(stmts, atoms[j]) {
-        // An INLINE-SHAPE member (`{x:i32}` in `{x:i32}|{y:i32}`) is a struct
-        // variant too — its fields parse from its own text. A map shape
-        // (`{[…]}`) is not.
-        const aj = atoms[j]
-        let shapeOk = false
-        if aj.length >= 2 {
-          if aj[0] == '{' && aj[1] != '[' && aj[aj.length - 1] == '}' {
-            shapeOk = true
-          }
-        }
-        if !shapeOk { return false }
+      nonNull = nonNull + 1
+      if isStructAtom(stmts, atoms[j]) {
+        structAtoms = structAtoms + 1
+      } else if valueAtomKind(atoms[j]) < 0 {
+        // Neither a struct variant nor a value-atom — not a union shape we box.
+        return false
       }
-      structAtoms = structAtoms + 1
     }
     j = j + 1
   }
-  structAtoms >= 2
+  structAtoms >= 1 && nonNull >= 2
 }
 
 // Register the inline union synthetic name `name` (e.g. `"A|B"`) as a union alias in
@@ -20847,29 +20878,38 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // does, so the box + value-box reps must be interned for it too.
   const pun = parenUnionArrElemName(name)
   if pun != "" { return registerValueUnionName(pun) }
-  if !isInlineStructUnion(stmts, name) { return 0 }
+  if !isVariantBoxUnion(stmts, name) { return 0 }
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
   uDeclared = true
   unNames.push(name)
   unMemberSet.push(name)
   unVarStart.push(uVariants.length)
-  // A `null` atom is no variant struct — only the struct members occupy slots.
+  // Only STRUCT members occupy variant slots (a `null` atom rides the tag, a value-atom
+  // tags via `scalarTagOf` and boxes into the shared value boxes). Count + push the
+  // struct variants; mark the value-box reps the scalar atoms need (the MIXED case).
   let nStructs = 0
   let cnt = 0
   while cnt < atoms.length {
-    if atoms[cnt] != "null" { nStructs = nStructs + 1 }
+    if atoms[cnt] != "null" {
+      if isStructAtom(stmts, atoms[cnt]) { nStructs = nStructs + 1 }
+    }
     cnt = cnt + 1
   }
   unVarCount.push(nStructs)
   let vi = 0
   while vi < atoms.length {
     if atoms[vi] != "null" {
-      uVariants.push(atoms[vi])
-      if collectVariantFields(stmts, atoms[vi]) < 0 { return -1 }
+      if isStructAtom(stmts, atoms[vi]) {
+        uVariants.push(atoms[vi])
+        if collectVariantFields(stmts, atoms[vi]) < 0 { return -1 }
+      }
     }
     vi = vi + 1
   }
+  // A MIXED union's scalar members box exactly like a value union's — intern their
+  // per-rep value boxes (a no-op for an all-struct union: no value atoms).
+  markValueUnionAtoms(name)
   0
 }
 
