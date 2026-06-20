@@ -1012,6 +1012,15 @@ function isNullTy(ty: i32) {
   false
 }
 
+// Whether `ty` is the `void` primitive (compared STRUCTURALLY — like `null`, `void` may
+// be interned at more than one arena index, so `== TY_VOID` is not reliable).
+function isVoidTy(ty: i32) {
+  if ty < 0 { return false }
+  let t = T.tys[ty]
+  if t is TyPrim { return t.primName == "void" }
+  false
+}
+
 // Whether `ty` is exactly `string | null` — a `TyNullable` wrapping the `string`
 // primitive. Cheap (no `tyToStr`); used to record an inferred niche if-binding.
 function isNulStringTy(ty: i32) {
@@ -7194,6 +7203,31 @@ function checkNode(ix: i32) {
     }
     let initTy = -1
     if n.letInit >= 0 { initTy = checkNode(n.letInit) }
+    // A `void` initializer (`const x = f()` over a void function) has NO value to bind.
+    // The assignment path (`x = f()`) already rejects it; the BINDING path did not — an
+    // un-annotated binding had no assignability check, and `assignableExpr(void, T)` is
+    // lenient — so a void binding slipped past `vl check` and CRASHED codegen. Reject it
+    // here with a clear, source-located message, poisoning `initTy` to suppress cascades.
+    if n.letInit >= 0 && isVoidTy(initTy) {
+      // EXCEPT an if-EXPRESSION init (`const x = if c then 5`): a statement-if is
+      // context-free `void`, but the if-binding inference below resolves it to `T | null`
+      // (the else-less false path is the implicit `null`) — that path owns it.
+      let vini = n.letInit
+      const vip = P.nodes[vini]
+      if vip is Paren { vini = vip.parInner }
+      const viNode = P.nodes[vini]
+      let voidOk = false
+      if viNode is IfStmt { voidOk = true }
+      if !voidOk {
+        tErr(
+          "cannot bind the void result of '" +
+            n.letName +
+            "' — a void function returns no value",
+          ix,
+        )
+        initTy = TY_ERR
+      }
+    }
     // Redundant explicit annotation: the initializer's CONTEXT-FREE type (checked
     // just above, before the annotation is consulted) already IS the annotation, so
     // `: T` adds nothing. Recorded BEFORE `constrainEmpty` runs, so an empty-
