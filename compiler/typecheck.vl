@@ -792,6 +792,13 @@ let inferRetTy: string[] = []
 // ident/expression arm). Captured DURING the check (scope live), keyed by node index.
 let inferLetIx: i32[] = []
 let inferLetTy: string[] = []
+// The NICHE analogue of `inferLetIx`: an un-annotated `const x = if c then "hi" else
+// null` infers `string | null`, which is a niche ref rep (`ref.null $aTypeIdx`), NOT a
+// value-union box — so `valueUnionRetName` renders "" and the `inferLetIx` table skips
+// it. Record such bindings by LetDecl NODE INDEX so the emitter's `letIsNulString`
+// classifies the slot as the kind-16 nullable-string rep and reuses the annotated
+// `string | null` if-binding lowering. No name is needed (the niche is monomorphic).
+let inferLetNulStrIx: i32[] = []
 let bodyChecked: {[string]: boolean} = Map()
 let inferQuiet = false
 let cycleBreakCount = 0
@@ -842,6 +849,7 @@ export function initChecker() {
   inferRetTy = []
   inferLetIx = []
   inferLetTy = []
+  inferLetNulStrIx = []
   bodyChecked = Map()
   inferQuiet = false
   cycleBreakCount = 0
@@ -989,6 +997,20 @@ function isNullTy(ty: i32) {
   if ty < 0 { return false }
   let t = T.tys[ty]
   if t is TyPrim { return t.primName == "null" }
+  false
+}
+
+// Whether `ty` is exactly `string | null` — a `TyNullable` wrapping the `string`
+// primitive. Cheap (no `tyToStr`); used to record an inferred niche if-binding.
+function isNulStringTy(ty: i32) {
+  if ty < 0 { return false }
+  let t = T.tys[ty]
+  if t is TyNullable {
+    const inr = t.nInner
+    if inr < 0 { return false }
+    const it = T.tys[inr]
+    if it is TyPrim { return it.primName == "string" }
+  }
   false
 }
 
@@ -7148,6 +7170,10 @@ function checkNode(ix: i32) {
         if lvn != "" {
           inferLetIx.push(ix)
           inferLetTy.push(lvn)
+        } else if isNulStringTy(bound) {
+          // `string | null` is a NICHE (not a value-union box) so `valueUnionRetName`
+          // renders "" — record it separately for the kind-16 slot classification.
+          inferLetNulStrIx.push(ix)
         }
       }
     } else {
@@ -7672,3 +7698,15 @@ export function inferLetNameOf(letIx: i32) {
 export function inferLetCount() { inferLetIx.length }
 export function inferLetIxAt(i: i32) { inferLetIx[i] }
 export function inferLetTyAt(i: i32) { inferLetTy[i] }
+
+// Whether the LetDecl at `letIx` was recorded as an inferred `string | null` niche
+// if-binding (the niche analogue of `inferLetNameOf`). The emitter's `letIsNulString`
+// consults this so the slot classifies as kind 16 and reuses the annotated lowering.
+export function isInferLetNulStr(letIx: i32) {
+  let i = 0
+  while i < inferLetNulStrIx.length {
+    if inferLetNulStrIx[i] == letIx { return true }
+    i = i + 1
+  }
+  false
+}
