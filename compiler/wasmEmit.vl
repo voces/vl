@@ -4030,6 +4030,11 @@ let pendingNulBool = false
 // those boundaries, consumed (and reset) by the `NullLit` emit, mirroring `pendingNulBool`.
 let pendingNulString = false
 
+// `true` while emitting a bare `null` in a NULLABLE FUNCTION-VALUE (`fn | null`, kind 19)
+// context — `ref.null $cloStruct`. Seeded at the binding/assignment boundary, consumed and
+// reset by the `NullLit` emit, mirroring `pendingNulString`.
+let pendingNulClosure = false
+
 // Set by the `== null`/`!= null` null-check around its receiver emit so a `string | null`
 // (kind 16) ident reads as the RAW nullable ref (for `ref.is_null`), NOT recovered to a
 // non-null string. Every OTHER read of a kind-16 binding is a narrowed value use and
@@ -4242,6 +4247,12 @@ function collectLocals(blockIx: i32, fnIx: i32) {
           slot = addLocalName(s.letName, 12, -1)
         } else if letIsRefArray(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 5, letRefListSlot(stmts[i], fnIx))
+        } else if letIsNulClosure(stmts[i], fnIx) {
+          // A NULLABLE function-VALUE local (`let c: ((i32) => i32) | null`), kind 19 — its
+          // cell is the NULLABLE closure fat-pointer `(ref null $cloStructIdx)`, so it holds
+          // a function OR `null`. BEFORE `letIsUnion` (the `fn | null` annotation reads as a
+          // union name) and the non-null closure (kind 14).
+          slot = addLocalName(s.letName, 19, -1)
         } else if letIsUnion(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 4, -1)
         } else if letIsStruct(stmts[i], fnIx) {
@@ -10732,6 +10743,13 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
       wSLEB(aTypeIdx)
       return 0
     }
+    // `null` in a nullable FUNCTION-VALUE (`fn | null`, kind 19) context — `ref.null
+    // $cloStruct` (the closure fat-pointer made nullable). Checked before the struct seed.
+    if pendingNulClosure {
+      wU8(208) // 0xd0 ref.null
+      wSLEB(cloStructIdx)
+      return 0
+    }
     // A bare `null` VALUE: its target struct comes from the binding/argument/
     // return seed (`pendingStructIdx`) — `ref.null $S`. With no seed it cannot
     // be typed here; fail loudly.
@@ -11479,6 +11497,16 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
           return 0
         }
         if exprNullableStruct(nref, fnIx) {
+          if emitExpr(body, nref, fnIx) < 0 { return -1 }
+          wU8(209) // 0xd1 ref.is_null
+          if e.binOp == "!=" {
+            fbI32Eqz() // invert: non-null
+          }
+          return 0
+        }
+        // `c == null` / `c != null` over a NULLABLE function value (`fn | null`, kind 19):
+        // the same `ref.is_null` lowering as the nullable struct.
+        if exprNulClosure(nref, fnIx) {
           if emitExpr(body, nref, fnIx) < 0 { return -1 }
           wU8(209) // 0xd1 ref.is_null
           if e.binOp == "!=" {
@@ -13067,6 +13095,12 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
     }
     // Evaluate the closure once into the call-ref scratch local (`callRefSlot`).
     if emitExpr(body, c.callFn, fnIx) < 0 { return -1 }
+    // A NULLABLE function value (`fn | null`, kind 19) loads as `(ref null $cloStruct)`;
+    // the scratch slot is non-null, and the checker proved it non-null here (the `if c !=
+    // null` narrowing), so recover to non-null.
+    if exprNulClosure(c.callFn, fnIx) {
+      wU8(212) // 0xd4 ref.as_non_null
+    }
     fbLocalSet(callRefSlot)
     // env = closure.env (field 1).
     fbLocalGet(callRefSlot)
@@ -15185,7 +15219,17 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
         return 0
       }
     }
-    if letUNm != "" {
+    if localIsRef[slot] == 19 {
+      // A NULLABLE function-value binding (`let c: ((i32) => i32) | null = …`): the slot is
+      // `(ref null $cloStruct)`. A bare `null` init lowers as `ref.null $cloStruct`
+      // (`pendingNulClosure`); a function init stores its closure ref directly. Takes
+      // priority over the union-coerce path (the `fn | null` annotation reads as a union
+      // NAME, but this is a niche nullable ref, not a box).
+      const savedNC = pendingNulClosure
+      pendingNulClosure = true
+      if emitExpr(body, s.letInit, fnIx) < 0 { return -1 }
+      pendingNulClosure = savedNC
+    } else if letUNm != "" {
       if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return -1 }
     } else if letIsF32(stmtIx) {
       const savedF32 = pendingF32
@@ -16882,6 +16926,31 @@ function nameIsNulBool(name: string) {
   b == "boolean" || b == "bool"
 }
 
+// A NULLABLE FUNCTION-VALUE type name — `((i32) => i32) | null` (kind 19): a
+// `(ref null $cloStruct)` cell, the closure analogue of the nullable struct (kind 9). The
+// non-null part must be a FUNCTION type, and the WHOLE name must NOT itself be a top-level
+// function type — `((i32) => i32) | null` (parens preserved by `canonEmitName`, arrow
+// nested at depth 1) is a nullable function, whereas `(i32) => i32 | null` (top-level
+// arrow) is a function RETURNING a nullable (handled by `annRetKind`, not here).
+function nameIsNulClosure(name: string) {
+  if annArrowAt(name) >= 0 { return false }
+  const b = nullablePartOf(name)
+  if b == "" { return false }
+  strContains(b, "=>")
+}
+
+// `1` if the type-annotation node at `tyIx` is a nullable function `(fn) | null`, else `0`
+// — the closure dual of `retNulRefFlag`.
+function nulCloFlag(tyIx: i32) {
+  if tyIx >= 0 {
+    const ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if nameIsNulClosure(ty.tyName) { return 1 }
+    }
+  }
+  0
+}
+
 // `1` if the type-annotation node at `tyIx` is `i32[] | null`, else `0` — the
 // nullable-LIST dual of `retNulRefFlag`. Feeds vt kind 15 (a NULLABLE `(ref null
 // $lTypeIdx)` slot: narrowing is type-level only, the slot stays nullable and
@@ -17596,6 +17665,11 @@ function fbValtype(kind: i32, structIdx: i32) {
     wU8(125) // 0x7d f32 (Slice 5: scalar f32 local/param/global/result)
   } else if kind == 14 {
     wU8(100) // 0x64 non-null ref — the closure fat-pointer struct (lambdas)
+    wSLEB(cloStructIdx)
+  } else if kind == 19 {
+    // `((i32) => i32) | null` — a NULLABLE ref to the SAME closure struct as kind 14:
+    // the nullability lives in the SLOT's valtype (holds a function OR `null`).
+    wU8(99) // 0x63 (ref null ht)
     wSLEB(cloStructIdx)
   } else if kind == 15 {
     // `i32[] | null` — a NULLABLE ref to the same i32-list wrapper as kind 2:
@@ -21811,6 +21885,24 @@ function declaredNulRef(name: string) {
   localIsRef[slot] == 9
 }
 
+// True if `name` is a declared NULLABLE function-value local (`fn | null`, kind 19) — the
+// closure dual of `declaredNulRef`.
+function declaredNulClosure(name: string) {
+  let slot = declaredSlotOf(name)
+  if slot < 0 { return false }
+  localIsRef[slot] == 19
+}
+
+// True if the expression at `exprIx` is a NULLABLE function value (`fn | null`, kind 19) —
+// currently a kind-19 local ident. Drives the `== null` / `!= null` test (`ref.is_null`)
+// and the narrowed-call recover, the closure analogue of `exprNullableStruct`.
+function exprNulClosure(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident { return declaredNulClosure(e.identName) }
+  false
+}
+
 // True if the already-collected declared local `name` is a nullable i32 list (kind 15).
 function declaredNulList(name: string) {
   let slot = declaredSlotOf(name)
@@ -23843,6 +23935,20 @@ function letIsClosure(letIx: i32, fnIx: i32) {
   false
 }
 
+// True if the `LetDecl` at `letIx` declares a NULLABLE function-value local (`fn | null`,
+// kind 19). ANNOTATION-ONLY (the closure dual of `letIsNulList`): no call yet returns a
+// nullable function, and a bare-function or `null` init under the annotation keeps the
+// nullable `(ref null $cloStruct)` slot — narrowing is type-level, the slot stays nullable.
+function letIsNulClosure(letIx: i32, fnIx: i32) {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      if nulCloFlag(d.letType) == 1 { return true }
+    }
+  }
+  false
+}
+
 // True if the expression at `exprIx` evaluates to a function value (a closure
 // fat-pointer): a `function(...)` literal, a bare reference to a top-level/lifted
 // function name, a reference to a closure-typed param/local, or a call returning a
@@ -23854,10 +23960,12 @@ function exprIsClosure(exprIx: i32, fnIx: i32) {
   if e is FuncDecl { return true }
   if e is Ident {
     if fnIndexOf(e.identName) >= 0 { return true }
-    // A closure-typed param/local (kind 14 in the registry).
+    // A closure-typed param/local (kind 14), or a NULLABLE one (kind 19) — both call via
+    // `call_ref`; the nullable cell is recovered to non-null at the call site (after the
+    // `if c != null` narrowing the checker requires).
     if paramIsClosure(fnIx, e.identName) { return true }
     let slot = declaredSlotOf(e.identName)
-    if slot >= 0 { return localIsRef[slot] == 14 }
+    if slot >= 0 { return localIsRef[slot] == 14 || localIsRef[slot] == 19 }
     // A module-global closure cell (kind 14).
     const gl = globalLetOf(e.identName)
     if gl >= 0 { return globalCellKind(gl) == 14 }
