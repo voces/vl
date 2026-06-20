@@ -1286,6 +1286,19 @@ function emitFail(msg: string) {
 // `fnIndices[i]`, which equals `i` here but is kept explicit for clarity.
 
 let fnNames: string[] = []
+// `fnName → fnStmts index` (FIRST occurrence wins, matching the old linear `fnIndexOf`
+// scan), so resolving a call's callee index is O(1) instead of an O(functions) string-
+// compare scan on every call site / classifier query. Built in `buildFnMap` alongside
+// `fnNames`/`fnIndices`.
+let fnNameMap: {[string]: i32} = Map()
+// Names that appear as a NESTED (lifted) function (`fnParent[i] >= 0`). `fnIndexOfInScope`
+// only needs its O(functions) parent-matching scan when the name actually names a nested
+// function; for a plain top-level name (the overwhelming common case) it can skip
+// straight to the O(1) `fnIndexOf`. Built in `buildFnMap`.
+let nestedNameSet: {[string]: boolean} = Map()
+// `globalName → its index in `globalNames`` (FIRST wins), so `globalIndexOf` is O(1)
+// rather than an O(globals) string-compare scan. Built in `collectFns`.
+let globalNameMap: {[string]: i32} = Map()
 // Per-function VOIDNESS (1 = `()->()`: no return annotation, no valued `return`,
 // and no tail value — computed as a monotone fixed point in `computeVoidFns`,
 // since a tail CALL to a void callee makes the CALLER void too).
@@ -1423,6 +1436,7 @@ function collectFns(stmts: i32[]) {
   fnParent = []
   globalStmts = []
   globalNames = []
+  globalNameMap = Map()
   startStmts = []
   lambdaCtr = 0
   fnValUsed = false
@@ -1435,6 +1449,9 @@ function collectFns(stmts: i32[]) {
     } else if s is LetDecl {
       // A top-level `let`/`const` — a module global; its position here is its index.
       globalStmts.push(stmts[i])
+      if !globalNameMap.has(s.letName) {
+        globalNameMap[s.letName] = globalNames.length
+      }
       globalNames.push(s.letName)
     } else if nodeIsTypeDecl(stmts[i]) {
     } else if s is UnionDecl {
@@ -2029,14 +2046,7 @@ function liftFnsInExpr(ix: i32, parent: i32) {
 }
 
 // The wasm global index for `name`, or -1 if no top-level global has that name.
-function globalIndexOf(name: string) {
-  let i = 0
-  while i < globalNames.length {
-    if globalNames[i] == name { return i }
-    i = i + 1
-  }
-  -1
-}
+function globalIndexOf(name: string) { globalNameMap[name] ?? -1 }
 
 // The arena index of the `LetDecl` for the global `name`, or -1 if not a global.
 function globalLetOf(name: string) {
@@ -2305,6 +2315,8 @@ function exprNullableStruct(exprIx: i32, fnIx: i32) {
 // record whether it returns the struct. Returns the function count.
 function buildFnMap(stmts: i32[]) {
   fnNames = []
+  fnNameMap = Map()
+  nestedNameSet = Map()
   fnIndices = []
   fRetVoid = []
   fRetRef = []
@@ -2326,6 +2338,13 @@ function buildFnMap(stmts: i32[]) {
     let s = P.nodes[fnStmts[i]]
     if s is FuncDecl {
       fnNames.push(s.fnName)
+      // FIRST occurrence wins (mirrors the old linear `fnIndexOf`): a later lifted
+      // function sharing a name does not overwrite the earlier slot.
+      if !fnNameMap.has(s.fnName) { fnNameMap[s.fnName] = i }
+      // A nested (lifted) function's name — drives `fnIndexOfInScope`'s scan gate.
+      if i < fnParent.length && fnParent[i] >= 0 {
+        nestedNameSet[s.fnName] = true
+      }
       fnIndices.push(i)
       fRetVoid.push(0)
       fRetRef.push(retTRFlag(s.fnRet))
@@ -2728,14 +2747,7 @@ function collectValuedReturnsInIf(ifIx: i32, out: i32[]) {
 
 // Look up the wasm function index for `name`, or -1 if no such top-level function
 // exists (an undefined callee — the caller fails loudly).
-function fnIndexOf(name: string) {
-  let i = 0
-  while i < fnNames.length {
-    if fnNames[i] == name { return fnIndices[i] }
-    i = i + 1
-  }
-  -1
-}
+function fnIndexOf(name: string) { fnNameMap[name] ?? -1 }
 
 // `fnIndexOf` but SCOPE-AWARE for a name referenced as a VALUE inside function `fnIx`
 // (a node index): when two lifted functions share a name (each `makeX` declaring its
@@ -2745,7 +2757,9 @@ function fnIndexOf(name: string) {
 // lookup (a top-level function, or no nested match). Only consulted on the function-
 // VALUE path (gated by `fnValUsed`), so by-name resolution elsewhere is unchanged.
 function fnIndexOfInScope(name: string, fnIx: i32) {
-  if fnIx >= 0 {
+  // The parent-matching scan can only succeed for a NESTED function named `name`; skip
+  // it entirely (→ O(1) `fnIndexOf`) when no lifted function carries this name.
+  if fnIx >= 0 && (nestedNameSet[name] ?? false) {
     const pp = fnStmtsPosOf(fnIx)
     if pp >= 0 {
       let i = 0
