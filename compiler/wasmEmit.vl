@@ -2415,6 +2415,13 @@ function buildFnMap(stmts: i32[]) {
           fRetNulStr[li] = 1
         } else if isValueUnionName(inm) {
           fRetUni[li] = 1
+        } else if isUName(inm) {
+          // A registered STRUCT-union inferred return (`Cat | Dog` — registered from this
+          // same name in `collectU`): the variant-boxed rep rides the SAME union result
+          // valtype as a value union (kind 4 box), so set `fRetUni`. The expression-based
+          // fallback would NOT catch it (a single object-literal return is not itself a
+          // union expression), so set it from the name here.
+          fRetUni[li] = 1
         }
       }
     }
@@ -2621,12 +2628,21 @@ function criClassify(rx0: i32, i: i32) {
     fRetUni[i] = 1
     criChanged = true
   }
-  if fRetNul[i] == 0 && exprNullableStruct(rx, fnStmts[i]) {
+  if fRetNul[i] == 0 && fRetUni[i] == 0 && exprNullableStruct(rx, fnStmts[i]) {
     fRetNul[i] = 1
     fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
     criChanged = true
   }
-  if fRetRef[i] == 0 && fRetNul[i] == 0 && exprStruct(rx, fnStmts[i]) {
+  if (
+    fRetRef[i] == 0 &&
+    fRetNul[i] == 0 &&
+    fRetUni[i] == 0 &&
+    exprStruct(rx, fnStmts[i])
+  ) {
+    // GUARD `fRetUni == 0`: an INFERRED struct-union return (`Cat | Dog`) sets `fRetUni`
+    // in the A20 name pass, but each of its returns is a SINGLE object literal that
+    // `exprStruct` would (wrongly) also classify as a plain struct return — the union
+    // flag dominates, so don't also set `fRetRef`/`fRetStructIdx` (a conflicting rep).
     fRetRef[i] = 1
     fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
     criChanged = true
@@ -21253,14 +21269,15 @@ function collectU(stmts: i32[]) {
   // `UnionDecl` pass (so a matching named alias makes the inline form a no-op) and
   // before `assignTags` (which ranks the FINAL variant set).
   if collectInlineUnions(stmts) < 0 { return -1 }
-  // Inferred VALUE-union returns (un-annotated functions whose returns JOIN to
-  // `i32 | string` / `i32 | null`): register each so its union box + value-box reps
-  // intern — even when an inferred return is the program's ONLY value union.
-  // `registerValueUnionName` self-gates (`isValueUnionName`) and dedups (`isUName`),
-  // so scalar/array entries and already-declared unions are no-ops.
+  // Inferred VALUE-union returns (`i32 | string` / `i32 | null`) AND inferred STRUCT-union
+  // returns (`Cat | Dog`): register each so its reps intern — even when an inferred
+  // return is the program's ONLY union. `registerInlineUnion` dispatches on the name
+  // shape (a value union → the shared box; a struct union → its variant structs) and
+  // self-gates / dedups (`isUName`), so scalar/array entries and already-declared unions
+  // are no-ops.
   let iru = 0
   while iru < inferRetCount() {
-    registerValueUnionName(inferRetTyAt(iru))
+    if registerInlineUnion(stmts, inferRetTyAt(iru)) < 0 { return -1 }
     iru = iru + 1
   }
   // Inferred VALUE-union BINDINGS (`const x = if c then v else null`): same treatment,
@@ -21920,7 +21937,11 @@ function unionNameOfExpr(exprIx: i32, fnIx: i32) {
           // and a narrowed read mis-types (arrayref vs the union box).
           if fn.fnRet < 0 {
             const im = inferRetNameOf(callee.identName)
+            // A value union (`isValueUnionName`) OR a registered struct union (`isUName`
+            // — registered from this same inferred name in `collectU`): either drives the
+            // binding's narrowing/unboxing exactly as an annotation would.
             if isValueUnionName(im) { return im }
+            if im != "" && isUName(im) { return im }
           }
         }
       }

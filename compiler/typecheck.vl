@@ -777,6 +777,11 @@ let moduleGlobals: {[string]: boolean} = Map()
 // inference (the demand call stack IS the dependency-order traversal). `bodyChecked`
 // lets the real pass still check each body once (the pre-pass only resolved types).
 let topUnannotFns: i32[] = []
+// The top-level statement list, captured at `checkProgram` entry so the return-inference
+// floor can reverse-map an inferred struct-union's object members to named types
+// (`structUnionRetName`) — the floor must accept EXACTLY the unions the emitter can
+// lower (all members named), so it uses the same predicate as the export.
+let gRootStmts: i32[] = []
 // A20: parallel arrays (name -> inferred concrete return-type name) for each
 // un-annotated top-level function, exported for the emitter so it can classify a
 // return from the inferred TYPE rather than re-deriving from the return expression
@@ -850,6 +855,7 @@ export function initChecker() {
   fnDeclIx = Map()
   moduleGlobals = Map()
   topUnannotFns = []
+  gRootStmts = []
   inferRetFn = []
   inferRetTy = []
   inferLetIx = []
@@ -1016,6 +1022,28 @@ function isNulStringTy(ty: i32) {
     if inr < 0 { return false }
     const it = T.tys[inr]
     if it is TyPrim { return it.primName == "string" }
+  }
+  false
+}
+
+// Whether `ty` is a union whose every member is a structural OBJECT (`Cat | Dog`) — the
+// variant-boxed struct-union rep the emitter lowers via its expression-based `exprUnion`
+// fallback. An inferred return of this shape no longer floors (the annotated form already
+// lowers + `is`-narrows). A MIXED union (a struct mixed with a scalar/string) is NOT this
+// — it has no single rep, so it stays floored.
+function isStructUnionTy(ty: i32) {
+  if ty < 0 { return false }
+  let t = T.tys[ty]
+  if t is TyUnion {
+    const members = t.uMembers
+    if members.length < 2 { return false }
+    let i = 0
+    while i < members.length {
+      const m = T.tys[members[i]]
+      if !(m is TyObj) { return false }
+      i = i + 1
+    }
+    return true
   }
   false
 }
@@ -5886,12 +5914,19 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     ) {
       const itt = T.tys[inferred]
       if itt is TyUnion {
-        tErr(
-          "cannot infer a union return type for '" +
-            n.fnName +
-            "' — annotate the return type",
-          n.fnBody,
-        )
+        // A pure STRUCT-union whose every member maps to a NAMED type (`Cat | Dog`) lowers
+        // un-annotated via the variant-boxed rep, exactly like the annotated form — so it
+        // does NOT floor. The export uses the SAME `structUnionRetName` predicate, so the
+        // floor accepts EXACTLY what the emitter can register/lower; a union mixing a
+        // scalar/string, or one with an anonymous/un-named-shape member, still floors.
+        if structUnionRetName(inferred, gRootStmts) == "" {
+          tErr(
+            "cannot infer a union return type for '" +
+              n.fnName +
+              "' — annotate the return type",
+            n.fnBody,
+          )
+        }
       } else if itt is TyNullable {
         // The NICHE nullables (`boolean | null` / `string | null`) now lower un-annotated
         // — the A20 table carries their inferred name and the emitter seeds the niche
@@ -7597,6 +7632,59 @@ function valueUnionRetName(er: i32) {
   ""
 }
 
+// The user-type NAME whose declared shape structurally equals object type `obj`, found
+// by scanning the program's `TypeDecl`s (`cUserTypes` is a `Map` the compiler subset
+// cannot iterate). Structural equality is bidirectional assignability — so a 1-field
+// `{meow}` does NOT match a 2-field `Cat = {meow, foo}` (the missing field breaks one
+// direction). "" if no named type matches.
+function nominalNameOfObj(obj: i32, stmts: i32[]) {
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is TypeDecl {
+      const nm = s.tdName
+      if cUserTypes.has(nm) {
+        const ti = cUserTypes[nm] ?? (-1)
+        if ti >= 0 {
+          const tt = T.tys[ti]
+          if tt is TyObj {
+            if assignable(obj, ti) && assignable(ti, obj) { return nm }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The emitter-format NAME of an inferred STRUCT-union return `er` — `Cat|Dog`, each
+// member reverse-mapped (`nominalNameOfObj`) to the user-type name whose shape it
+// equals. The emitter's union machinery is keyed on these NOMINAL names — the structural
+// `{meow: i32}` render `tyToStr` produces does NOT resolve through `registerInlineUnion`
+// / `structIndexByName`, so the reverse map is required. "" unless `er` is an all-object
+// union of ≥2 members AND every member resolves to a named type (else it declines, so the
+// emitter never sees an unregisterable name).
+function structUnionRetName(er: i32, stmts: i32[]) {
+  if er < 0 { return "" }
+  if !isStructUnionTy(er) { return "" }
+  const t = T.tys[er]
+  if t is TyUnion {
+    const members = t.uMembers
+    let name = ""
+    let i = 0
+    while i < members.length {
+      const nm = nominalNameOfObj(members[i], stmts)
+      if nm == "" { return "" }
+      if i > 0 { name = name + "|" }
+      name = name + nm
+      i = i + 1
+    }
+    return name
+  }
+  ""
+}
+
 // The public entry point: check the program rooted at node `rootIx`, returning
 // the number of diagnostics raised (diagnostics also accumulate on `T.diags`).
 // (The old PR #5 gap — a discarded/`let`-bound call return mis-lowering at module
@@ -7604,6 +7692,8 @@ function valueUnionRetName(er: i32) {
 // `tests/cases/statements/discarded-call-return.vl`; the discarded `checkNode`
 // below exercises it in this very module.)
 export function checkProgram(rootIx: i32) {
+  const rootN0 = P.nodes[rootIx]
+  if rootN0 is Program { gRootStmts = rootN0.progStmts }
   checkNode(rootIx)
   // The global scope (depth 0) is never popped, so flush its un-annotated
   // empty-collection bindings here: any still-open hole is genuinely uninferable.
@@ -7664,6 +7754,13 @@ export function checkProgram(rootIx: i32) {
               if un != "" {
                 inferRetFn.push(efn.fnName)
                 inferRetTy.push(un)
+              } else if structUnionRetName(er, gRootStmts) != "" {
+                // A STRUCT-union (`Cat | Dog`) lowers un-annotated via the variant-boxed
+                // rep — the SAME machinery as an annotated `: Cat | Dog`. Export its
+                // nominal name so the emitter registers the union + classifies the
+                // binding (`registerInlineUnion` / `unionNameOfExpr`).
+                inferRetFn.push(efn.fnName)
+                inferRetTy.push(structUnionRetName(er, gRootStmts))
               } else {
                 // A NICHE nullable (`boolean | null` / `string | null`) lowers via its
                 // sentinel / `ref.null $array` rep, not the box, so `valueUnionRetName`
