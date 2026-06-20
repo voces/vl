@@ -3179,6 +3179,35 @@ function nameHasSep(name: string, sep: i32) {
 
 function nameHasPipe(name: string) { nameHasSep(name, '|') }
 
+// The index of a TOP-LEVEL `=>` (`=` at depth 0, followed by `>`) in `name`, or -1 — the
+// FUNCTION-TYPE marker the parser emits for `(params) => ret`. Depth/quote-aware, so an
+// arrow nested in a param/return group (`((i32) => i32) => void`) is NOT the top one.
+function topLevelArrowIndex(name: string) {
+  let depth = 0
+  let i = 0
+  while i < name.length {
+    const c = name[i]
+    if c == '"' {
+      i = skipQuotedName(name, i)
+    } else {
+      if c == '{' || c == '[' || c == '(' {
+        depth = depth + 1
+      } else if c == '}' || c == ']' || c == ')' {
+        depth = depth - 1
+      } else if (
+        depth == 0 &&
+        c == '=' &&
+        i + 1 < name.length &&
+        name[i + 1] == '>'
+      ) {
+        return i
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
 // Split `name` on its TOP-LEVEL occurrences of `sep` (depth-aware, quoted
 // literal members skipped) into `out`. Shared by the union (`|`) and
 // intersection (`&`) arms of `nameToTy`.
@@ -3417,6 +3446,29 @@ function nameToTy(name: string) {
         }
       }
       if wraps { return nameToTy(name.slice(1, name.length - 1)) }
+    }
+    // A FUNCTION TYPE `(params)=>ret` (the parser's synthetic name for `(i32) => i32`):
+    // the leading `(...)` is the param list, then `=>`, then the return atom. Build a
+    // `TyFunc` so a function-typed binding/param/field type-checks (call arity + types).
+    const arrowAt = topLevelArrowIndex(name)
+    if arrowAt >= 1 && name[0] == '(' && name[arrowAt - 1] == ')' {
+      const paramsStr = name.slice(1, arrowAt - 1)
+      const retStr = name.slice(arrowAt + 2, name.length)
+      const ptys: i32[] = []
+      if paramsStr.length > 0 {
+        const pparts: string[] = []
+        splitTypeName(paramsStr, ',', pparts)
+        let pk = 0
+        while pk < pparts.length {
+          const pt = nameToTy(pparts[pk])
+          if pt < 0 { return -1 }
+          ptys.push(pt)
+          pk = pk + 1
+        }
+      }
+      const rty = nameToTy(retStr)
+      if rty < 0 { return -1 }
+      return mkFuncTy(ptys, rty)
     }
     // A STRING-LITERAL type `"a"` — the quoted lexeme is the member; keep the
     // RAW inner text (the literal expression side keeps its raw lexeme too, so
