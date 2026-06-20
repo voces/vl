@@ -1717,8 +1717,13 @@ function cloSigKeyExt(fe: i32) {
       if vtKindOfType(retTy) == 1 {
         return key + ">s" + i32ToStr(retStructIndex(retTy)) + ";"
       }
+      // An annotated `: string` return — the raw i32-array ref `(ref $aTypeIdx)`, the
+      // `>S` value-call result kind.
+      if vtKindOfType(retTy) == 3 { return key + ">S" }
       return ""
     }
+    // An INFERRED `string` return — same `>S` kind as the annotated case above.
+    if fRetStr[fe] == 1 { return key + ">S" }
     if fRetRef[fe] == 1 {
       if fRetStructIdx[fe] >= 0 {
         return key + ">s" + i32ToStr(fRetStructIdx[fe]) + ";"
@@ -18699,7 +18704,13 @@ function emitModule(stmts: i32[]) {
         } else {
           wU8(1) // 1 result
           let rk = cloRetKindOf(repFe)
-          if rk == 0 || rk == 11 {
+          let repStr = fRetStr[repFe] == 1
+          if rRetTy >= 0 {
+            if vtKindOfType(rRetTy) == 3 { repStr = true }
+          }
+          if repStr {
+            fbValtype(3, -1) // (ref $aTypeIdx) — the `>S` string-result sig
+          } else if rk == 0 || rk == 11 {
             fbValtype(rk, -1) // i32 (0) or f64 (11)
           } else {
             let rsi = -1
@@ -23540,7 +23551,17 @@ function exprString(exprIx: i32, fnIx: i32) {
     // bare call produces a string iff the callee declares a `string` return.
     if exprIsStrSlice(exprIx, fnIx) { return true }
     const callee = P.nodes[e.callFn]
-    if callee is Ident { return fnRetString(callee.identName) }
+    if callee is Ident {
+      if fnRetString(callee.identName) { return true }
+      // A string-returning function VALUE (a binding / `(i32) => string` param callee,
+      // invisible to `fnRetString`): its resolved `>S` sig.
+      return calleeReturnsString(callee.identName, fnIx)
+    }
+    // A string-returning FIELD-closure call (`o.label(3)` over a `(i32) => string` field).
+    if callee is Member {
+      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+      if ffe >= 0 { return fRetStr[ffe] == 1 }
+    }
     return false
   }
   if e is BinExpr {
@@ -23813,6 +23834,7 @@ function annRetKind(t: string) {
   if t == "i32" || t == "boolean" || t == "bool" { return ">i" }
   if t == "f64" { return ">d" }
   if t == "void" { return ">v" }
+  if t == "string" { return ">S" }
   const si = structIndexByName(t)
   if si >= 0 { return ">s" + i32ToStr(si) + ";" }
   ""
@@ -23934,6 +23956,16 @@ function calleeReturnsVoid(name: string, fnIx: i32) {
   const n = k.length
   if n < 2 { return false }
   k[n - 2] == '>' && k[n - 1] == 'v'
+}
+
+// True if the function-VALUE callee `name` (in scope of `fnIx`) returns a string — its
+// resolved `$fnsig` key ends in `>S`. The value-call analogue of `fnRetString` for a named
+// function — drives the closure-call RESULT's string typing (binding cell, print routing).
+function calleeReturnsString(name: string, fnIx: i32) {
+  const k = calleeCloSigKey(name, fnIx)
+  const n = k.length
+  if n < 2 { return false }
+  k[n - 2] == '>' && k[n - 1] == 'S'
 }
 
 // The struct-table INDEX a function-VALUE callee `name` (in scope of `fnIx`) returns, or
