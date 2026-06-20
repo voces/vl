@@ -6090,6 +6090,12 @@ function pushFieldStorage(code: i32, refSlot: i32) {
     // same backing as code 3, the nullability in the field's storage type).
     wU8(99) // 0x63 (ref null ht)
     wSLEB(aTypeIdx)
+  } else if code == 22 {
+    // A NULLABLE-closure field (`op: ((i32) => i32) | null`): a NULLABLE ref to the
+    // closure fat-pointer struct (the same backing as code 14, nullable storage) —
+    // `null` rides as `ref.null $cloStruct`, the field analogue of a kind-19 local.
+    wU8(99) // 0x63 (ref null ht)
+    wSLEB(cloStructIdx)
   } else {
     // code 21 (`boolean | null`, the i32 sentinel) shares this default i32 storage.
     wU8(127) // 0x7f i32 storagetype
@@ -6209,6 +6215,10 @@ function emitOmittedFieldNull(body: i32[], si: i32, fi: i32, scode: i32) {
     fbRefNull(lTypeIdx) // ref.null $lTypeIdx (i32[] | null)
     return 0
   }
+  if scode == 22 {
+    fbRefNull(cloStructIdx) // ref.null $cloStruct (a nullable-closure field, kind 19)
+    return 0
+  }
   if scode == 16 {
     // A value/box-union field defaults to null ONLY when `null` is a member.
     if unionHasAtom(sFieldElemNameAt(si, fi), "null") {
@@ -6324,6 +6334,15 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         const rcNB = emitExpr(body, valIx, fnIx)
         pendingNulBool = svNB
         if rcNB < 0 { return -1 }
+      } else if scode == 22 {
+        // A nullable-closure field (`op: ((i32) => i32) | null`): a `null` value lowers
+        // as `ref.null $cloStruct` (`pendingNulClosure`); a function value passes through
+        // as the non-null fat pointer (widened to the nullable storage on `struct.new`).
+        const svNC = pendingNulClosure
+        pendingNulClosure = true
+        const rcNC = emitExpr(body, valIx, fnIx)
+        pendingNulClosure = svNC
+        if rcNC < 0 { return -1 }
       } else {
         if emitExpr(body, valIx, fnIx) < 0 { return -1 }
       }
@@ -19579,6 +19598,12 @@ function nameIsF64Array(name: string) { name == "f64[]" }
 // struct/union ref backing — so it falls through to `-1`.)
 function fieldTypeCode(tyIx: i32) {
   if tyIx < 0 { return -1 }
+  // A NULLABLE-function field (`op: ((i32) => i32) | null`) stores a NULLABLE closure
+  // fat-pointer (code 22) — the field analogue of a kind-19 local. Checked BEFORE the
+  // bare-function test (and before `tyIsFuncType`, exactly as `vtKindOfType` orders it):
+  // `((i32) => i32) | null` is a nullable function (arrow nested under a top-level `|`),
+  // whereas `(i32) => i32 | null` is a function RETURNING a nullable (handled elsewhere).
+  if nulCloFlag(tyIx) == 1 { return 22 }
   // A function-typed field (`op: (i32) => i32`) stores the closure fat-pointer (code 14),
   // the field analogue of a function-valued local. Checked first (a `=>` name).
   if tyIsFuncType(tyIx) { return 14 }
@@ -21927,11 +21952,16 @@ function declaredNulClosure(name: string) {
 // and the narrowed-call recover, the closure analogue of `exprNullableStruct`.
 function exprNulClosure(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
-  const e = P.nodes[unwrapParen(exprIx)]
+  const ux = unwrapParen(exprIx)
+  const e = P.nodes[ux]
   if e is Ident {
     if paramNulClosure(fnIx, e.identName) { return true }
     return declaredNulClosure(e.identName)
   }
+  // A nullable-closure struct FIELD read (`recv.op` over a `((i32) => i32) | null` field,
+  // code 22): the raw `(ref null $cloStruct)` — its `!= null` lowers to `ref.is_null` and
+  // the narrowed call recovers non-null (`ref.as_non_null`) at the call site.
+  if e is Member { return memberFieldCode(ux, fnIx) == 22 }
   false
 }
 
@@ -24491,14 +24521,19 @@ function memberIsClosure(objIx: i32, prop: string, fnIx: i32) {
   return structFieldIsClosure(si, prop)
 }
 
-// True if field `prop` of struct table index `si` is a function-valued field (kind 14).
+// True if field `prop` of struct table index `si` is a function-valued field — a bare
+// closure (code 14) or a NULLABLE closure (code 22). Both read back as a closure and call
+// via `call_ref`; the nullable one is recovered to non-null at the call site.
 function structFieldIsClosure(si: i32, prop: string) {
   if si < 0 || si >= sNames.length { return false }
   let cnt = sFieldCount[si]
   let start = sFieldStart[si]
   let fj = 0
   while fj < cnt {
-    if sFieldNames[start + fj] == prop { return sFieldTypeAt(si, fj) == 14 }
+    if sFieldNames[start + fj] == prop {
+      const fc = sFieldTypeAt(si, fj)
+      return fc == 14 || fc == 22
+    }
     fj = fj + 1
   }
   false
