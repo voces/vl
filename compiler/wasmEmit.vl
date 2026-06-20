@@ -12173,6 +12173,13 @@ function exprIsF64(exprIx: i32, fnIx: i32) {
     if callee is Ident {
       const target = fnIndexOf(callee.identName)
       if target >= 0 { return fRetF64[target] == 1 }
+      // A function-VALUE (closure) callee returning f64 — its result routes as f64.
+      return calleeReturnsF64(callee.identName, fnIx)
+    }
+    // A FIELD-closure call `t.op(x)` whose field function returns f64.
+    if callee is Member {
+      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+      if ffe >= 0 { return cloRetKindOf(ffe) == 11 }
     }
     return false
   }
@@ -12977,7 +12984,10 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
     let sig = -1
     const cre = P.nodes[c.callFn]
     if cre is Ident {
-      const ck = paramCloSigKey(fnIx, cre.identName)
+      // The callee's REAL signature: a function-typed param/local/global annotation, or —
+      // for an inferred binding — the underlying function's own sig. Falls through to the
+      // all-i32 arity sig only when unresolved (`calleeCloSigKey` → "").
+      const ck = calleeCloSigKey(cre.identName, fnIx)
       if ck != "" {
         let cp = cloSigPosOfKey(ck)
         if cp >= 0 { sig = cloSigBase + cp }
@@ -23702,6 +23712,180 @@ function callMemProp(exprIx: i32) {
 // The `$fnsig` signature KEY a closure-pinned parameter carries — the part after
 // the `"=>"` of a monomorphized instance's synthetic annotation (`"=>ii>i"` →
 // `"ii>i"`), or "" when `name` is not such a param of function `fnIx`.
+// Top-level (paren/brace/bracket depth 0) index of `=>` in a synthetic function-type
+// name, or -1.
+function annArrowAt(name: string) {
+  let depth = 0
+  let i = 0
+  while i < name.length {
+    const c = name[i]
+    if c == '(' || c == '{' || c == '[' {
+      depth = depth + 1
+    } else if c == ')' || c == '}' || c == ']' {
+      depth = depth - 1
+    } else if (
+      depth == 0 &&
+      c == '=' &&
+      i + 1 < name.length &&
+      name[i + 1] == '>'
+    ) {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Split a function-type PARAM list (`i32,f64,S`) on top-level commas (depth-aware).
+function annSplitParams(s: string, out: string[]) {
+  let cur = ""
+  let depth = 0
+  let i = 0
+  while i < s.length {
+    const c = s[i]
+    if c == '(' || c == '{' || c == '[' {
+      depth = depth + 1
+      cur = cur + fromCodePoint(c)
+    } else if c == ')' || c == '}' || c == ']' {
+      depth = depth - 1
+      cur = cur + fromCodePoint(c)
+    } else if depth == 0 && c == ',' {
+      out.push(cur)
+      cur = ""
+    } else {
+      cur = cur + fromCodePoint(c)
+    }
+    i = i + 1
+  }
+  out.push(cur)
+  0
+}
+
+// The closure-ABI param-kind code for a type NAME (`i32`/`boolean` → "i", `f64` → "d", a
+// declared struct → "s<idx>;"), or "" for a type outside the value-call ABI.
+function annParamKind(t: string) {
+  if t == "i32" || t == "boolean" || t == "bool" { return "i" }
+  if t == "f64" { return "d" }
+  const si = structIndexByName(t)
+  if si >= 0 { return "s" + i32ToStr(si) + ";" }
+  ""
+}
+
+// The closure-ABI return suffix for a type NAME (`i32`/`boolean` → ">i", `f64` → ">d", a
+// struct → ">s<idx>;"), or "" outside the value-returning ABI. (`void` is a later slice —
+// its `>v` sig is not interned by the value-eligible pass.)
+function annRetKind(t: string) {
+  if t == "i32" || t == "boolean" || t == "bool" { return ">i" }
+  if t == "f64" { return ">d" }
+  const si = structIndexByName(t)
+  if si >= 0 { return ">s" + i32ToStr(si) + ";" }
+  ""
+}
+
+// The `$fnsig` KEY of a SOURCE function-type annotation `(params)=>ret` — the SAME
+// encoding `fnSigKeyOf` produces for a function (`"i>i"`, `"d>d"`, `"s3;>i"`), so a value
+// call over an annotated callee resolves the interned signature. "" if any param/return
+// type is outside the value-call ABI (the all-i32 arity fallback then applies).
+function annSigKey(name: string) {
+  const arrowAt = annArrowAt(name)
+  if arrowAt < 1 { return "" }
+  if name[0] != '(' { return "" }
+  if name[arrowAt - 1] != ')' { return "" }
+  const paramsStr = name.slice(1, arrowAt - 1)
+  const retStr = name.slice(arrowAt + 2, name.length)
+  let key = ""
+  if paramsStr.length > 0 {
+    const parts: string[] = []
+    annSplitParams(paramsStr, parts)
+    let i = 0
+    while i < parts.length {
+      const pc = annParamKind(parts[i])
+      if pc == "" { return "" }
+      key = key + pc
+      i = i + 1
+    }
+  }
+  const rc = annRetKind(retStr)
+  if rc == "" { return "" }
+  key + rc
+}
+
+// The lifted-function position (`fnStmts` index) of the function VALUE bound to `let`/
+// `const`/global `name` in scope of `fnIx` — `const f = dbl` traces to `dbl`, `const f =
+// function(…)…` to the lifted lambda. -1 when `name` is not a binding holding a bare
+// function value. Lets a closure call over an INFERRED binding resolve the callee's real
+// signature (`fnSigKeyOf`), not the all-i32 arity sig.
+function identClosureFe(name: string, fnIx: i32) {
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const li = parentLetOf(fn.fnBody, name)
+      if li >= 0 {
+        const d = P.nodes[li]
+        if d is LetDecl { return fieldValueFeOf(d.letInit) }
+      }
+    }
+  }
+  const gi = globalLetOf(name)
+  if gi >= 0 {
+    const gd = P.nodes[gi]
+    if gd is LetDecl { return fieldValueFeOf(gd.letInit) }
+  }
+  -1
+}
+
+// The function-type ANNOTATION NAME (`(f64)=>f64`) of a `let`/`const`/global `name` in
+// scope of `fnIx`, or "" when `name` is not a function-typed binding.
+function identFnTypeAnnName(name: string, fnIx: i32) {
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const li = parentLetOf(fn.fnBody, name)
+      if li >= 0 {
+        const d = P.nodes[li]
+        if d is LetDecl {
+          if tyIsFuncType(d.letType) { return tyNameOf(d.letType) }
+        }
+      }
+    }
+  }
+  const gi = globalLetOf(name)
+  if gi >= 0 {
+    const gd = P.nodes[gi]
+    if gd is LetDecl {
+      if tyIsFuncType(gd.letType) { return tyNameOf(gd.letType) }
+    }
+  }
+  ""
+}
+
+// The `$fnsig` KEY for a function-VALUE callee Ident `name` (in scope of `fnIx`): a
+// function-typed PARAM (its annotation / monomorphized pin), a function-typed LOCAL/GLOBAL
+// annotation, or — for an INFERRED binding — the underlying function's own sig. "" → the
+// all-i32 arity fallback applies (an unresolved or non-value-ABI signature, incl. void).
+function calleeCloSigKey(name: string, fnIx: i32) {
+  const pk = paramCloSigKey(fnIx, name)
+  if pk != "" { return pk }
+  const an = identFnTypeAnnName(name, fnIx)
+  if an != "" {
+    const ak = annSigKey(an)
+    if ak != "" { return ak }
+  }
+  const fe = identClosureFe(name, fnIx)
+  if fe >= 0 { return fnSigKeyOf(fe) }
+  ""
+}
+
+// True if the function-VALUE callee `name` (in scope of `fnIx`) returns f64 — its resolved
+// `$fnsig` key ends in `>d`. Drives the closure-call RESULT classification (print routing,
+// numeric-context coercion), the value-call analogue of `fRetF64` for a named function.
+function calleeReturnsF64(name: string, fnIx: i32) {
+  const k = calleeCloSigKey(name, fnIx)
+  const n = k.length
+  if n < 2 { return false }
+  k[n - 2] == '>' && k[n - 1] == 'd'
+}
+
 function paramCloSigKey(fnIx: i32, name: string) {
   if fnIx < 0 { return "" }
   const fn = P.nodes[fnIx]
@@ -23717,9 +23901,13 @@ function paramCloSigKey(fnIx: i32, name: string) {
             if ty is TypeRef {
               let nm = ty.tyName
               if nm.length > 2 {
+                // A MONOMORPHIZED closure-pinned param carries the bare `"=>sigkey"`.
                 if nm[0] == '=' && nm[1] == '>' {
                   return nm.slice(2, nm.length)
                 }
+                // A SOURCE function-type annotation `(params)=>ret`: derive its sig key,
+                // so a non-i32 (e.g. f64) signature casts to the right functype.
+                if strContains(nm, "=>") { return annSigKey(nm) }
               }
             }
           }
