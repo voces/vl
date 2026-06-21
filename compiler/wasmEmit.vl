@@ -20404,6 +20404,8 @@ function monoCloneBody(
   typarams: string[],
   tvN: string[],
   tvV: string[],
+  outName: string,
+  outType: string,
 ) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
@@ -20412,7 +20414,7 @@ function monoCloneBody(
     let changed = false
     let i = 0
     while i < n.blkStmts.length {
-      const cs = monoCloneBody(n.blkStmts[i], typarams, tvN, tvV)
+      const cs = monoCloneBody(n.blkStmts[i], typarams, tvN, tvV, outName, outType)
       ns.push(cs)
       if cs != n.blkStmts[i] { changed = true }
       i = i + 1
@@ -20421,39 +20423,47 @@ function monoCloneBody(
     return mkBlock(ns, n.pos)
   }
   if n is LetDecl {
-    const nt = monoSubstLetType(n.letType, typarams, tvN, tvV)
+    let nt = monoSubstLetType(n.letType, typarams, tvN, tvV)
+    // The inferred-list-return local (`const out = []`, element a hole so #543's synthesis is
+    // skipped): annotate its empty build with the pinned element type, per instance. Clones
+    // ONLY this `LetDecl` (and its enclosing Block), never the shared original.
+    if nt < 0 {
+      if outName != "" {
+        if n.letName == outName { nt = mkTypeRef(outType, -1) }
+      }
+    }
     if nt == n.letType { return ix }
     return mkLet(n.letKw, n.letName, nt, n.letInit, n.pos)
   }
   if n is WhileStmt {
-    const cb = monoCloneBody(n.whileBody, typarams, tvN, tvV)
+    const cb = monoCloneBody(n.whileBody, typarams, tvN, tvV, outName, outType)
     if cb == n.whileBody { return ix }
     return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
   }
   if n is IfStmt {
-    const ct = monoCloneBody(n.ifThen, typarams, tvN, tvV)
-    const ce = monoCloneBody(n.ifElse, typarams, tvN, tvV)
+    const ct = monoCloneBody(n.ifThen, typarams, tvN, tvV, outName, outType)
+    const ce = monoCloneBody(n.ifElse, typarams, tvN, tvV, outName, outType)
     if ct == n.ifThen && ce == n.ifElse { return ix }
     return mkIf(n.ifCond, ct, ce, n.pos)
   }
   if n is ForRange {
-    const cb = monoCloneBody(n.frBody, typarams, tvN, tvV)
+    const cb = monoCloneBody(n.frBody, typarams, tvN, tvV, outName, outType)
     if cb == n.frBody { return ix }
     return mkForRange(n.frVar, n.frFrom, n.frTo, n.frStep, cb, n.frLabel, n.pos)
   }
   if n is ForIn {
-    const cb = monoCloneBody(n.fiBody, typarams, tvN, tvV)
+    const cb = monoCloneBody(n.fiBody, typarams, tvN, tvV, outName, outType)
     if cb == n.fiBody { return ix }
     return mkForIn(n.fiVar, n.fiIter, cb, n.fiLabel, n.pos)
   }
   if n is RetStmt {
     // The return value may be a block / `if`-EXPRESSION carrying its own `LetDecl`s.
-    const ca = monoCloneBody(n.retArg, typarams, tvN, tvV)
+    const ca = monoCloneBody(n.retArg, typarams, tvN, tvV, outName, outType)
     if ca == n.retArg { return ix }
     return mkReturn(ca, n.pos)
   }
   if n is Paren {
-    const ci = monoCloneBody(n.parInner, typarams, tvN, tvV)
+    const ci = monoCloneBody(n.parInner, typarams, tvN, tvV, outName, outType)
     if ci == n.parInner { return ix }
     return mkParen(ci, n.pos)
   }
@@ -20726,6 +20736,12 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
       // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
       // (`{first:B,second:A}`); a concrete annotation passes through unchanged.
       let nret = fn.fnRet
+      // A hole-built return list local to annotate in the cloned instance body (so its `[]`
+      // build classifies per element type — f64/struct as well as i32/string). Captured from
+      // the return trace below, threaded into `monoCloneBody` which clones+annotates just
+      // that `LetDecl` per instance (never the shared original).
+      let monoOutName = ""
+      let monoOutType = ""
       if fn.fnRet >= 0 {
         const rn = tyNameOf(fn.fnRet)
         if monoAnnHasTyParam(rn, fn.fnTyParams) {
@@ -20804,7 +20820,11 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
                 const ppl = P.nodes[params[pli]]
                 if ppl is Param {
                   if ppl.parName == srcParam {
-                    if pinned[pli] != "" { nret = mkTypeRef(pinned[pli], -1) }
+                    if pinned[pli] != "" {
+                      nret = mkTypeRef(pinned[pli], -1)
+                      monoOutName = rxe.identName
+                      monoOutType = pinned[pli]
+                    }
                   }
                 }
                 pli = pli + 1
@@ -20820,7 +20840,14 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
       // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
       // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
       // no such annotation.
-      const instBody = monoCloneBody(fn.fnBody, fn.fnTyParams, tvN, tvV)
+      const instBody = monoCloneBody(
+        fn.fnBody,
+        fn.fnTyParams,
+        tvN,
+        tvV,
+        monoOutName,
+        monoOutType,
+      )
       const nfn = mkFunc(instName, noTyParams, nps, nret, instBody, -1)
       if count == 0 {
         // First instance: keep the bare name and the original's wasm index.
