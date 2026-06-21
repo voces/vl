@@ -479,10 +479,18 @@ function parsePrimary() {
     return mkNull("null", p0)
   }
   if k == "FUNCTION" {
-    // A FUNCTION EXPRESSION (lambda): `function(n: i32) n * 2` — an anonymous
-    // FuncDecl in expression position (name ""), with the same optional-generic /
-    // param / return / bare-or-braced-body shape as a declaration.
-    return parseFuncExpr()
+    // The `function(...)` EXPRESSION form was removed: an anonymous function is an
+    // arrow lambda `(params) => body`. (A named `function f(...)` DECLARATION is a
+    // statement — `parseStmt` dispatches it before expression parsing is reached —
+    // so a `function` token here is always a misplaced lambda.)
+    P.diags.push(
+      {
+        msg: "anonymous functions use arrow syntax `(params) => body`, not `function(...)`",
+        at: P.pos,
+      },
+    )
+    advance()
+    return mkErr("expr", P.pos, p0)
   }
   if k == "IF" {
     // `if` as an EXPRESSION (`print(if a > b then a else b)`) — the host's
@@ -492,6 +500,9 @@ function parsePrimary() {
   }
   if k == "IDENT" { return mkIdent(advance().text, p0) }
   if k == "LPAREN" {
+    // `(params) => body` — an arrow lambda — when `=>` follows the matching `)`;
+    // otherwise a grouped expression `(expr)`.
+    if looksLikeArrowLambda() { return parseArrowLambda(p0) }
     advance()
     skipNewlines() // a newline may immediately follow `(`
     const inner = parseExpr()
@@ -1065,29 +1076,13 @@ function parseParam() {
   ix
 }
 
-// The shared tail of every function form — the cursor on the `(` of the param
-// list. Parses `"(" params? ")" (":" type)? body` and builds the `FuncDecl`.
-// The body is:
-//   • a bare EXPRESSION (no `{`) — implicit return, wrapped in a one-stmt Block;
-//   • empty braces `{}` — a BLOCK (a void function), never an empty object
-//     (mirrors the host's `emptyBraces` special case);
-//   • braces that shape up as an object literal (`function makePoint() { x: 3 }`)
-//     — an object-literal EXPRESSION body (implicit return), decided by
-//     `looksLikeObject` exactly as the host's `parseStatement` path does;
-//   • otherwise a braced statement BLOCK.
-// `funcPos` is the function form's START offset (the `function` keyword, or the
-// method-shorthand key) — captured by the caller and stamped on the FuncDecl.
-function parseFuncTail(
-  name: string,
-  typarams: string[],
-  nameTok: i32,
-  funcPos: i32,
-) {
+// `"(" params? ")"` — the parameter list shared by every function form (and the
+// arrow lambda). The cursor is on the `(`. A signature may span several source
+// lines (`function f(` NEWLINE `a: T,` NEWLINE `b: U` NEWLINE `)`): NEWLINEs are
+// skipped after `(`, around each `,`, and before `)`, so the list tolerates line
+// breaks anywhere a separator may appear. A trailing comma before `)` is allowed.
+function parseParamList() {
   expect("LPAREN")
-  // A function signature may span several source lines (`function f(` NEWLINE
-  // `a: T,` NEWLINE `b: U` NEWLINE `)`). Mirror the host's `parseParams`: skip
-  // NEWLINEs after `(`, around each `,`, and before `)` so the param list
-  // tolerates line breaks anywhere a separator may appear.
   skipNewlines()
   const params: i32[] = []
   if peekKind() != "RPAREN" {
@@ -1108,8 +1103,30 @@ function parseFuncTail(
     }
   }
   expect("RPAREN")
-  let ret = -1
-  if accept("COLON") { ret = parseType() }
+  params
+}
+
+// Parse a function BODY and build the `FuncDecl` — the cursor on the first token
+// of the body (past the signature and any `=>`). The body is:
+//   • a bare EXPRESSION (no `{`) — implicit return, wrapped in a one-stmt Block;
+//   • empty braces `{}` — a BLOCK (a void function), never an empty object
+//     (mirrors the host's `emptyBraces` special case);
+//   • braces that shape up as an object literal (`function makePoint() { x: 3 }`)
+//     — an object-literal EXPRESSION body (implicit return), decided by
+//     `looksLikeObject` exactly as the host's `parseStatement` path does;
+//   • otherwise a braced statement BLOCK.
+// Shared by `parseFuncTail` (the `function`-keyword forms) and `parseArrowLambda`
+// (the `=>` form), so both bodies parse identically. `funcPos` is the form's
+// START offset, stamped on the FuncDecl; `nameTok` is the name token (`-1` for
+// the anonymous forms).
+function parseFuncBodyAndBuild(
+  name: string,
+  typarams: string[],
+  params: i32[],
+  ret: i32,
+  nameTok: i32,
+  funcPos: i32,
+) {
   // A BARE-EXPRESSION body (`function dbl(x: i32) x * 2`): no `{` after the
   // signature means the body is a single expression with an implicit return —
   // wrapped in a synthetic one-statement Block so downstream passes see the same
@@ -1146,6 +1163,60 @@ function parseFuncTail(
   const fix = mkFunc(name, typarams, params, ret, body, funcPos)
   mkDeclNameTok(fix, nameTok)
   fix
+}
+
+// The shared tail of every `function`-keyword form — the cursor on the `(` of the
+// param list. Parses `"(" params? ")" (":" type)? body` and builds the `FuncDecl`.
+// `funcPos` is the function form's START offset (the `function` keyword, or the
+// method-shorthand key) — captured by the caller and stamped on the FuncDecl.
+function parseFuncTail(
+  name: string,
+  typarams: string[],
+  nameTok: i32,
+  funcPos: i32,
+) {
+  const params = parseParamList()
+  let ret = -1
+  if accept("COLON") { ret = parseType() }
+  parseFuncBodyAndBuild(name, typarams, params, ret, nameTok, funcPos)
+}
+
+// Lookahead from a `(` in expression position: is this an arrow-lambda parameter
+// list (`(params) => …`) rather than a grouped expression (`(expr)`)? Scan to the
+// `)` that matches the opening `(` (paren-depth 0) and test whether `=>`
+// (`EQUAL` `GT`) immediately follows. A grouped expression's `)` is never
+// followed by `=>`, so this is unambiguous. The cursor stays put — pure lookahead.
+function looksLikeArrowLambda() {
+  let depth = 0
+  let i = P.pos
+  let scanning = true
+  while scanning {
+    const t = kindAt(i)
+    if t == "LPAREN" {
+      depth = depth + 1
+    } else if t == "RPAREN" {
+      depth = depth - 1
+      if depth == 0 { scanning = false }
+    } else if t == "EOF" {
+      return false
+    }
+    if scanning { i = i + 1 }
+  }
+  // `i` indexes the matching `)`. A lambda iff `=>` immediately follows.
+  kindAt(i + 1) == "EQUAL" && kindAt(i + 2) == "GT"
+}
+
+// `"(" params? ")" "=>" body` — an arrow lambda: anonymous, equivalent to
+// `function(params) body` but with `=>` before the body. It parses to the SAME
+// nameless `FuncDecl` (no generics, no name token), so the checker and emitter
+// treat the two forms identically (lifted to a top-level function, a closure
+// value built at each use site). `p0` is the `(`'s offset, stamped on the node.
+function parseArrowLambda(p0: i32) {
+  const params = parseParamList()
+  expect("EQUAL") // the `=` of `=>`
+  expect("GT")    // the `>` of `=>`
+  const noTyParams: string[] = []
+  parseFuncBodyAndBuild("", noTyParams, params, -1, -1, p0)
 }
 
 // The operator tokens a FUNCTION NAME may be (`function +(self, b)` — a free
@@ -1205,11 +1276,6 @@ function parseFuncHead(requireName: boolean) {
   }
   parseFuncTail(name, typarams, nameTok, p0)
 }
-
-// `"function" IDENT "(" params? ")" (":" type)? block`
-// A function EXPRESSION: like `parseFunc` but the name is optional (anonymous
-// lambdas are the norm: `xs.map(function(n: i32) n * 2)`).
-function parseFuncExpr() { parseFuncHead(false) }
 
 function parseFunc() { parseFuncHead(true) }
 
