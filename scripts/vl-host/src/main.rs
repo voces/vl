@@ -224,11 +224,19 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
     // `/`-separated paths relative to whatever the entry path was, so the host
     // just reads them; a missing file commits `found = 0` (the unresolvable
     // diagnostic fires inside the wasm instead of an infinite re-request).
+    // A re-export (`export { … } from "…"`) is a module dependency too, so it must
+    // also arm the fetch loop — gate on a leading `import {` OR `export {`.
     let has_imports = source.lines().any(|l| {
         let t = l.trim_start();
-        t.strip_prefix("import")
+        let imp = t
+            .strip_prefix("import")
             .map(|rest| rest.trim_start().starts_with('{'))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        let reexp = t
+            .strip_prefix("export")
+            .map(|rest| rest.trim_start().starts_with('{'))
+            .unwrap_or(false);
+        imp || reexp
     });
     if has_imports {
         if let (Ok(mod_reset), Ok(key_push), Ok(msrc_push), Ok(commit), Ok(pend_n), Ok(pend_len), Ok(pend_at)) = (
