@@ -1,0 +1,972 @@
+// `emit_query.vl` — PURE classification QUERIES over the AST: binding/value-kind
+// predicates (`param*`/`let*`/`is*`/`union*`) and control-flow / valued-return /
+// arr-new scans (`if*`/`block*`/`expr*`/`nli*`). State-free; depends only on
+// `emit_base` + the lower modules. Carved out of `wasmEmit.vl`.
+
+import { T, valueAtomKind } from "./typecheck"
+import { ArrayLit, BinExpr, Block, BoolLit, Call, ContinueStmt, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, RetStmt, StrLit, TypeRef, Unary, WhileStmt } from "./ast"
+import { numLexFitsI32 } from "./emit_bignum"
+import { isConstInit, nameIsF64Array, nameIsI32Array, nameIsMap, nameIsStringArray, nulCloFlag, numTextIsFloat, pushUniqueAtom, retF32Flag, retF64Flag, retI64Flag, retNulListFlag, retNulStringFlag, tyIsFuncType, tyIsNulBool, tyNameOf, unwrapParen } from "./emit_base"
+
+// True if param `name` of function `fnIx` is a NULLABLE function value (`fn | null`, kind
+// 19) — the closure dual of `paramNulRef`.
+export function paramNulClosure(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return nulCloFlag(p.parType) == 1 }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// True if the `LetDecl` at `letIx` declares a nullable i32-list local/global
+// (`i32[] | null`, kind 15). ANNOTATION-ONLY: an initializer cannot produce one
+// (no call returns a nullable list yet), and a `[…]` init under the annotation
+// keeps the NULLABLE slot — narrowing is type-level, the slot type is the
+// annotation's.
+export function letIsNulList(letIx: i32, fnIx: i32) {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      if retNulListFlag(d.letType) == 1 { return true }
+    }
+  }
+  false
+}
+// True if the parameter `name` of function `fnIx` is a nullable i32 list.
+export function paramNulList(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return retNulListFlag(p.parType) == 1 }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+export function paramNulString(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return retNulStringFlag(p.parType) == 1 }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// Does the block contain a `return e` WITH a value (recursing into if/while/for
+// bodies)? A bare `return` does not count — a void function may bare-return.
+export function blockHasValuedReturn(blockIx: i32) {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const st = P.nodes[stmts[i]]
+      if st is RetStmt {
+        if st.retArg >= 0 { return true }
+      } else if st is IfStmt {
+        if ifChainHasValuedReturn(stmts[i]) { return true }
+      } else if st is WhileStmt {
+        if blockHasValuedReturn(st.whileBody) { return true }
+      } else if st is ForRange {
+        if blockHasValuedReturn(st.frBody) { return true }
+      } else if st is ForIn {
+        if blockHasValuedReturn(st.fiBody) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+export function ifChainHasValuedReturn(ifIx: i32) {
+  const st = P.nodes[ifIx]
+  if st is IfStmt {
+    if blockHasValuedReturn(st.ifThen) { return true }
+    if st.ifElse >= 0 {
+      const els = P.nodes[st.ifElse]
+      if els is Block {
+        if blockHasValuedReturn(st.ifElse) { return true }
+      } else if els is IfStmt {
+        if ifChainHasValuedReturn(st.ifElse) { return true }
+      }
+    }
+  }
+  false
+}
+export function firstValuedReturn(blockIx: i32) {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const st = P.nodes[stmts[i]]
+      if st is RetStmt {
+        if st.retArg >= 0 { return st.retArg }
+      } else if st is IfStmt {
+        let r = firstValuedReturnIf(stmts[i])
+        if r >= 0 { return r }
+      } else if st is WhileStmt {
+        let r = firstValuedReturn(st.whileBody)
+        if r >= 0 { return r }
+      } else if st is ForRange {
+        let r = firstValuedReturn(st.frBody)
+        if r >= 0 { return r }
+      } else if st is ForIn {
+        let r = firstValuedReturn(st.fiBody)
+        if r >= 0 { return r }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+export function firstValuedReturnIf(ifIx: i32) {
+  const st = P.nodes[ifIx]
+  if st is IfStmt {
+    let r = firstValuedReturn(st.ifThen)
+    if r >= 0 { return r }
+    if st.ifElse >= 0 {
+      const els = P.nodes[st.ifElse]
+      if els is Block { return firstValuedReturn(st.ifElse) }
+      if els is IfStmt { return firstValuedReturnIf(st.ifElse) }
+    }
+  }
+  -1
+}
+export function collectValuedReturnsIn(blockIx: i32, out: i32[]) {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const st = P.nodes[stmts[i]]
+      if st is RetStmt {
+        if st.retArg >= 0 { out.push(st.retArg) }
+      } else if st is IfStmt {
+        collectValuedReturnsInIf(stmts[i], out)
+      } else if st is WhileStmt {
+        collectValuedReturnsIn(st.whileBody, out)
+      } else if st is ForRange {
+        collectValuedReturnsIn(st.frBody, out)
+      } else if st is ForIn {
+        collectValuedReturnsIn(st.fiBody, out)
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+export function collectValuedReturnsInIf(ifIx: i32, out: i32[]) {
+  const st = P.nodes[ifIx]
+  if st is IfStmt {
+    collectValuedReturnsIn(st.ifThen, out)
+    if st.ifElse >= 0 {
+      const els = P.nodes[st.ifElse]
+      if els is Block { collectValuedReturnsIn(st.ifElse, out) }
+      else if els is IfStmt { collectValuedReturnsInIf(st.ifElse, out) }
+    }
+  }
+  0
+}
+// ── parameter resolution ─────────────────────────────────────────────────────
+// A returned `Ident` is a parameter reference; its wasm `local.get` index is the
+// param's position in `fnParams` (params occupy locals 0..n-1, before any declared
+// locals). `paramIndexOf` scans the FuncDecl's `fnParams` for the param whose
+// `parName` matches `name`, returning its 0-based position or -1 if not a param.
+// Only i32 params exist in this slice, so position == local index directly.
+export function paramIndexOf(fnIx: i32, name: string) {
+  if fnIx < 0 {
+    return -1 // module-scope initializer (no enclosing function)
+  }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return i }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+// True if the expression at `exprIx` contains an intrinsic allocator call
+// (`__array_new__` / `__array_new_default__`) anywhere.
+export function exprHasArrNew(exprIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[exprIx]
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      if callee.identName == "__array_new__" { return true }
+      if callee.identName == "__array_new_default__" { return true }
+    }
+    if exprHasArrNew(e.callFn) { return true }
+    const args = e.callArgs
+    let i = 0
+    while i < args.length {
+      if exprHasArrNew(args[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if e is BinExpr {
+    if exprHasArrNew(e.binLeft) { return true }
+    return exprHasArrNew(e.binRight)
+  }
+  if e is Member { return exprHasArrNew(e.memObj) }
+  if e is Index {
+    if exprHasArrNew(e.idxArr) { return true }
+    return exprHasArrNew(e.idxIndex)
+  }
+  if e is Unary { return exprHasArrNew(e.unArg) }
+  if e is Paren { return exprHasArrNew(e.parInner) }
+  if e is IsExpr { return exprHasArrNew(e.isObj) }
+  if e is ObjLit {
+    const fields = e.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if exprHasArrNew(f.fiValue) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  if e is ArrayLit {
+    const elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      if exprHasArrNew(elems[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+// True if any statement in the block at `blockIx` (descending into if/else arms
+// and loop bodies) contains an intrinsic allocator call.
+export function blockHasArrNew(blockIx: i32) {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        if exprHasArrNew(s.letInit) { return true }
+      } else if s is RetStmt {
+        if exprHasArrNew(s.retArg) { return true }
+      } else if s is BinExpr {
+        if exprHasArrNew(stmts[i]) { return true }
+      } else if s is Call {
+        if exprHasArrNew(stmts[i]) { return true }
+      } else if s is ObjLit {
+        if exprHasArrNew(stmts[i]) { return true }
+      } else if s is IfStmt {
+        if ifChainHasArrNew(stmts[i]) { return true }
+      } else if s is WhileStmt {
+        if exprHasArrNew(s.whileCond) { return true }
+        if blockHasArrNew(s.whileBody) { return true }
+      } else if s is ForIn {
+        if exprHasArrNew(s.fiIter) { return true }
+        if blockHasArrNew(s.fiBody) { return true }
+      } else if s is ForRange {
+        if exprHasArrNew(s.frFrom) { return true }
+        if exprHasArrNew(s.frTo) { return true }
+        if blockHasArrNew(s.frBody) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// True if any arm of the `if` / `else if` chain at `ifIx` contains an intrinsic
+// allocator call — condition, then-branch, `else` block, or a chained `else if`.
+export function ifChainHasArrNew(ifIx: i32) {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if exprHasArrNew(s.ifCond) { return true }
+    if blockHasArrNew(s.ifThen) { return true }
+    if s.ifElse >= 0 {
+      const els = P.nodes[s.ifElse]
+      if els is Block { return blockHasArrNew(s.ifElse) }
+      if els is IfStmt { return ifChainHasArrNew(s.ifElse) }
+    }
+  }
+  false
+}
+// True if the FuncDecl at `fnIx` allocates via an intrinsic allocator — so it
+// reserves the 1-slot arrNew scratch frame.
+export function fnHasArrNew(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return blockHasArrNew(fn.fnBody) }
+  false
+}
+// ── `f(x) ?? d` (a CALL-LHS null-coalesce) scratch detection ───────────────────
+// A `??` whose left operand is a CALL cannot RE-EVALUATE its LHS the way an
+// ident/field `x ?? d` does (a call has effects + cost), so it stashes the call's
+// result (a value-union box) in a 1-slot `(ref $uBoxIdx)` frame, then tests the tag
+// and unboxes off the ONE evaluation. The scan reserves that slot for any function
+// containing such a `??`; a function without one keeps a byte-identical layout.
+// Over-approximates to ANY call-LHS `??` (the emit path uses the slot only for a
+// value-union-box result; an unhandled rep reserves-but-skips, still valid).
+export function exprHasCoalesceCall(exprIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[exprIx]
+  if e is BinExpr {
+    if e.binOp == "??" {
+      const l = P.nodes[unwrapParen(e.binLeft)]
+      if l is Call { return true }
+    }
+    if exprHasCoalesceCall(e.binLeft) { return true }
+    return exprHasCoalesceCall(e.binRight)
+  }
+  if e is Call {
+    if exprHasCoalesceCall(e.callFn) { return true }
+    const args = e.callArgs
+    let i = 0
+    while i < args.length {
+      if exprHasCoalesceCall(args[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if e is Member { return exprHasCoalesceCall(e.memObj) }
+  if e is OptMember { return exprHasCoalesceCall(e.omObj) }
+  if e is Index {
+    if exprHasCoalesceCall(e.idxArr) { return true }
+    return exprHasCoalesceCall(e.idxIndex)
+  }
+  if e is Unary { return exprHasCoalesceCall(e.unArg) }
+  if e is Paren { return exprHasCoalesceCall(e.parInner) }
+  if e is IsExpr { return exprHasCoalesceCall(e.isObj) }
+  if e is ObjLit {
+    const fields = e.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if exprHasCoalesceCall(f.fiValue) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  if e is ArrayLit {
+    const elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      if exprHasCoalesceCall(elems[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+// True if any statement in the block at `blockIx` (descending into if/else arms and
+// loop bodies) contains a call-LHS `??`. Mirrors `blockHasArrNew`.
+export function blockHasCoalesceCall(blockIx: i32) {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        if exprHasCoalesceCall(s.letInit) { return true }
+      } else if s is RetStmt {
+        if exprHasCoalesceCall(s.retArg) { return true }
+      } else if s is BinExpr {
+        if exprHasCoalesceCall(stmts[i]) { return true }
+      } else if s is Call {
+        if exprHasCoalesceCall(stmts[i]) { return true }
+      } else if s is ObjLit {
+        if exprHasCoalesceCall(stmts[i]) { return true }
+      } else if s is IfStmt {
+        if ifChainHasCoalesceCall(stmts[i]) { return true }
+      } else if s is WhileStmt {
+        if exprHasCoalesceCall(s.whileCond) { return true }
+        if blockHasCoalesceCall(s.whileBody) { return true }
+      } else if s is ForIn {
+        if exprHasCoalesceCall(s.fiIter) { return true }
+        if blockHasCoalesceCall(s.fiBody) { return true }
+      } else if s is ForRange {
+        if exprHasCoalesceCall(s.frFrom) { return true }
+        if exprHasCoalesceCall(s.frTo) { return true }
+        if blockHasCoalesceCall(s.frBody) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// True if any arm of the `if` / `else if` chain at `ifIx` contains a call-LHS `??`.
+export function ifChainHasCoalesceCall(ifIx: i32) {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if exprHasCoalesceCall(s.ifCond) { return true }
+    if blockHasCoalesceCall(s.ifThen) { return true }
+    if s.ifElse >= 0 {
+      const els = P.nodes[s.ifElse]
+      if els is Block { return blockHasCoalesceCall(s.ifElse) }
+      if els is IfStmt { return ifChainHasCoalesceCall(s.ifElse) }
+    }
+  }
+  false
+}
+// True if the FuncDecl at `fnIx` contains a call-LHS `??` — so it reserves the 1-slot
+// coalesce-call scratch frame.
+export function fnHasCoalesceCall(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return blockHasCoalesceCall(fn.fnBody) }
+  false
+}
+// True if the expression at `ix` is an if-EXPRESSION (an `IfStmt` in value position).
+export function exprIsIfStmt(ix: i32) {
+  if ix < 0 { return false }
+  const e = P.nodes[unwrapParen(ix)]
+  if e is IfStmt { return true }
+  false
+}
+// Lower a call expression at `callIx` onto `body`: evaluate every argument left-to-
+// right (each pushes one i32), then `call <funcIndex>`. The callee must be a bare
+// `Ident` naming a top-level function (no indirect/computed calls in this slice);
+// its index comes from the function-index map, so a recursive call resolves to the
+// enclosing function's own already-mapped index.
+//
+// Is the expression BOOLEAN-producing? Drives the `print` import choice
+// (`__print_bool__` renders true/false; everything else prints as i32). A bool
+// rides in an i32 at the wasm level, so this is a SYNTACTIC classification:
+// bool literals, comparisons, logical connectives, `!`, `is` guards, and calls
+// to a function that returns a boolean (annotated `boolean`/`bool`, or inferred —
+// `fRetBool` via `computeRetInference`). Identifiers are NOT classified (a
+// bool-typed local prints as 0/1 for now — annotation threading through the local
+// registry is a later slice).
+// True if the PARAMETER `name` of the function at `fnIx` is annotated `i64`.
+export function paramIsI64(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return retI64Flag(p.parType) == 1 }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// True if the PARAMETER `name` of the function at `fnIx` is annotated `f32`. (Slice 5.)
+export function paramIsF32(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return retF32Flag(p.parType) == 1 }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// The tail VALUE expression of an if-expression arm (the parser wraps `then <expr>` as a
+// Block of one statement) — its single statement index, or -1 if the arm is not a
+// one-statement block. (`exprIs*` guard `< 0`, so -1 classifies as the i32 default.)
+export function ifArmValueExpr(blockIx: i32) {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    if stmts.length == 1 { return stmts[0] }
+  }
+  -1
+}
+// True if the PARAMETER `name` of the function at `fnIx` is annotated `f64`. (Slice 3.)
+export function paramIsF64(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return retF64Flag(p.parType) == 1 }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// True if EVERY control path through the block at `blockIx` returns: a direct
+// `return` statement, or an `if`/`else` (incl. an `else if` chain) whose arms
+// all return. Conservative — a `while` etc. never counts (mirrors the host's
+// flow analysis only as far as the post-guard narrowing below needs).
+export function blockAlwaysReturns(blockIx: i32) {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      let s = P.nodes[stmts[i]]
+      if s is RetStmt { return true }
+      if s is IfStmt {
+        if ifAlwaysReturns(stmts[i]) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// True if the `if` at `ifIx` returns on EVERY path: it has an else, the
+// then-block always returns, and the else (a block or a chained `else if`)
+// always returns too.
+export function ifAlwaysReturns(ifIx: i32) {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse < 0 { return false }
+    if !blockAlwaysReturns(s.ifThen) { return false }
+    const els = P.nodes[s.ifElse]
+    if els is Block { return blockAlwaysReturns(s.ifElse) }
+    if els is IfStmt { return ifAlwaysReturns(s.ifElse) }
+    return false
+  }
+  false
+}
+// Does this loop BODY contain a `continue` that binds to THIS loop (whose label
+// is `label`, "" when unlabelled)? Two binding forms (mirroring the host's
+// `hasEscapingBreak` shape, applied to continue):
+//   • an UNLABELLED `continue` binds to the innermost loop — so it counts only
+//     when not `nested` inside another loop (descends `if` arms, a conditional
+//     continue, but NOT nested loops: their `continue` is their own);
+//   • a LABELLED `continue l` binds to the loop labelled `l` from ANYWHERE in
+//     the body, including inside nested loops — so when this loop HAS a label
+//     the scan also descends nested loop bodies looking for it.
+// Drives the for-range/for-in INNER continue block: a body without a binding
+// `continue` keeps the original (golden-pinned) two-frame shape, and an
+// unlabelled loop scans exactly as before (the nested-loop descent is gated on
+// `label != ""`), so existing modules stay byte-identical.
+export function blockHasContinueFor(
+  blockIx: i32,
+  label: string,
+  nested: boolean,
+) {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const st = P.nodes[stmts[i]]
+      if st is ContinueStmt {
+        if st.contLabel == "" {
+          if !nested { return true }
+        } else {
+          if label != "" && st.contLabel == label { return true }
+        }
+      } else if st is IfStmt {
+        if ifHasContinueFor(stmts[i], label, nested) { return true }
+      } else if st is WhileStmt {
+        if label != "" {
+          if blockHasContinueFor(st.whileBody, label, true) { return true }
+        }
+      } else if st is ForRange {
+        if label != "" {
+          if blockHasContinueFor(st.frBody, label, true) { return true }
+        }
+      } else if st is ForIn {
+        if label != "" {
+          if blockHasContinueFor(st.fiBody, label, true) { return true }
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// The `if`-statement descent of `blockHasContinueFor`: both arms, including a
+// chained `else if`.
+export function ifHasContinueFor(ifIx: i32, label: string, nested: boolean) {
+  const st = P.nodes[ifIx]
+  if st is IfStmt {
+    if blockHasContinueFor(st.ifThen, label, nested) { return true }
+    if st.ifElse >= 0 {
+      const els = P.nodes[st.ifElse]
+      if els is Block { return blockHasContinueFor(st.ifElse, label, nested) }
+      if els is IfStmt { return ifHasContinueFor(st.ifElse, label, nested) }
+    }
+  }
+  false
+}
+// True if the `LetDecl` at `letIx` is annotated `boolean|null`.
+export function letIsNulBoolAnn(letIx: i32) {
+  if letIx < 0 { return false }
+  let d = P.nodes[letIx]
+  if d is LetDecl { return tyIsNulBool(d.letType) }
+  false
+}
+// Whether the module global declared by the `LetDecl` at `letIx` has a non-const
+// initializer (so its cell is zero-initialized and set by the synthetic start
+// function). False for a non-`LetDecl` or a missing init.
+export function globalIsNonConst(letIx: i32) {
+  if letIx < 0 { return false }
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 { return false }
+    return !isConstInit(d.letInit)
+  }
+  false
+}
+// True if the module global `LetDecl` at `letIx` carries a TYPE ANNOTATION (`let g: T
+// = …`). When it does, the cell's wasm type must come from that annotation — exactly as
+// a local/param resolves its valtype — so a global agrees with a same-typed local/param/
+// field on the struct table index (otherwise a `global.get g` of an init-inferred struct
+// type mismatches a `local.set`/call of the annotation's struct type).
+export function globalHasTypeAnn(letIx: i32) {
+  let d = P.nodes[letIx]
+  if d is LetDecl { return d.letType >= 0 }
+  false
+}
+// The value-union ATOM name an assignment RHS fills a null hole with ("i32",
+// "boolean", "string", "f64", "i64"), or "" when the RHS is not classifiable at
+// collection time (an ident, a member read, …). A function-call RHS reads the
+// callee's declared return annotation straight from the arena (the fn tables are
+// not populated yet when this scan runs).
+export function nliAtomOfExpr(exprIx: i32) {
+  if exprIx < 0 { return "" }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is NumLit {
+    if numTextIsFloat(e.numText) { return "f64" }
+    if !numLexFitsI32(e.numText) { return "i64" }
+    return "i32"
+  }
+  if e is StrLit { return "string" }
+  if e is BoolLit { return "boolean" }
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      const cn = callee.identName
+      let ti = 0
+      while ti < P.nodes.length {
+        const f = P.nodes[ti]
+        if f is FuncDecl {
+          if f.fnName == cn {
+            const rn = tyNameOf(f.fnRet)
+            if valueAtomKind(rn) >= 0 && rn != "null" { return rn }
+            return ""
+          }
+        }
+        ti = ti + 1
+      }
+    }
+  }
+  ""
+}
+// Scan the statement list `walk` from position `from` for the FIRST classifiable
+// assignment `name = e`, descending into branch/loop blocks.
+export function nliScanStmts(walk: i32[], from: i32, name: string) {
+  let i = from
+  while i < walk.length {
+    const a = nliScanStmt(walk[i], name)
+    if a != "" { return a }
+    i = i + 1
+  }
+  ""
+}
+// Scan one statement (an `else if` chains a lone IfStmt through here too).
+export function nliScanStmt(stmtIx: i32, name: string) {
+  if stmtIx < 0 { return "" }
+  let s = P.nodes[stmtIx]
+  if s is BinExpr {
+    if s.binOp == "=" {
+      const tgt = P.nodes[s.binLeft]
+      if tgt is Ident {
+        if tgt.identName == name { return nliAtomOfExpr(s.binRight) }
+      }
+    }
+    return ""
+  }
+  if s is IfStmt {
+    const a = nliScanBlock(s.ifThen, name)
+    if a != "" { return a }
+    return nliScanStmt(s.ifElse, name)
+  }
+  if s is Block { return nliScanStmts(s.blkStmts, 0, name) }
+  if s is WhileStmt { return nliScanBlock(s.whileBody, name) }
+  if s is ForRange { return nliScanBlock(s.frBody, name) }
+  if s is ForIn { return nliScanBlock(s.fiBody, name) }
+  ""
+}
+export function nliScanBlock(blockIx: i32, name: string) {
+  if blockIx < 0 { return "" }
+  nliScanStmt(blockIx, name)
+}
+// Classify one if-EXPRESSION arm (`blockIx`, a one-statement Block) at REGISTRATION
+// time — a static pre-pass, so only LITERAL / annotated-call atoms resolve (the same
+// `nliAtomOfExpr` the `let x = null` hole uses). Returns 1 for a bare `null` arm, 0 for
+// a classified value atom (pushed onto `atoms`), or -2 if the arm is unclassifiable.
+export function collectArmAtom(blockIx: i32, atoms: string[]) {
+  const v = ifArmValueExpr(blockIx)
+  if v < 0 { return -2 }
+  const bare = P.nodes[unwrapParen(v)]
+  if bare is NullLit { return 1 }
+  const atom = nliAtomOfExpr(v)
+  if atom == "" { return -2 }
+  pushUniqueAtom(atoms, atom)
+  0
+}
+// Gather the value atoms of every arm of the if-expression at `ifIx` into `atoms`
+// (deduped), recursing through an `else if` chain. Returns -2 if any arm is
+// unclassifiable, else whether a `null` arm / else-less false path was seen (0/1).
+export function ifExprCollectAtoms(ifIx: i32, atoms: string[]) {
+  let s = P.nodes[unwrapParen(ifIx)]
+  if s is IfStmt {
+    let hasNull = 0
+    const t = collectArmAtom(s.ifThen, atoms)
+    if t == -2 { return -2 }
+    if t == 1 { hasNull = 1 }
+    if s.ifElse < 0 {
+      return 1 // else-less: the false path is null
+    }
+    const els = P.nodes[s.ifElse]
+    let e = 0
+    if els is IfStmt {
+      e = ifExprCollectAtoms(s.ifElse, atoms)
+    } else {
+      e = collectArmAtom(s.ifElse, atoms)
+    }
+    if e == -2 { return -2 }
+    if e == 1 { hasNull = 1 }
+    return hasNull
+  }
+  -2
+}
+// True if the parameter `name` of function `fnIx` is an array type.
+export function paramArray(fnIx: i32, name: string) {
+  if fnIx < 0 {
+    return false // module-scope initializer (no enclosing function)
+  }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            const ty = P.nodes[p.parType]
+            if ty is TypeRef { return nameIsI32Array(ty.tyName) }
+          }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// True if the parameter `name` of function `fnIx` is a `string[]` type.
+export function paramStringArray(fnIx: i32, name: string) {
+  if fnIx < 0 {
+    return false // module-scope initializer (no enclosing function)
+  }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            const ty = P.nodes[p.parType]
+            if ty is TypeRef { return nameIsStringArray(ty.tyName) }
+          }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// USAGE-DRIVEN element inference for an UN-ANNOTATED EMPTY `[]` binding: the
+// element type comes from what is PUSHED — a string-literal argument makes the
+// binding a `string[]` (`const xs = []; xs.push("hi")`), mirroring the host
+// checker's usage-driven inference. Scans the whole arena for a
+// `<name>.push("…")` call; string LITERAL arguments only (a richer operand would
+// need the full classifier, which would recurse back into this binding).
+export function letInfStrListByUse(letIx: i32) {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    if d.letInit < 0 { return false }
+    const ini = P.nodes[unwrapParen(d.letInit)]
+    if ini is ArrayLit {
+      if ini.arrElems.length != 0 { return false }
+      let i = 0
+      while i < P.nodes.length {
+        const nd = P.nodes[i]
+        if nd is Call {
+          const callee = P.nodes[nd.callFn]
+          if callee is Member {
+            if callee.memProp == "push" {
+              const recv = P.nodes[callee.memObj]
+              if recv is Ident {
+                if recv.identName == d.letName {
+                  if nd.callArgs.length == 1 {
+                    const argN = P.nodes[unwrapParen(nd.callArgs[0])]
+                    if argN is StrLit { return true }
+                  }
+                }
+              }
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  false
+}
+// True if the parameter `name` of function `fnIx` is an `f64[]` type.
+export function paramF64Array(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            const ty = P.nodes[p.parType]
+            if ty is TypeRef { return nameIsF64Array(ty.tyName) }
+          }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// True if the parameter `name` of function `fnIx` is a map type.
+export function paramMap(fnIx: i32, name: string) {
+  if fnIx < 0 {
+    return false // module-scope initializer (no enclosing function)
+  }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            const ty = P.nodes[p.parType]
+            if ty is TypeRef { return nameIsMap(ty.tyName) }
+          }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+// True if the `LetDecl` at `letIx` binds a SET — its initializer is the `Set()`
+// constructor. Set-ness is an emitter-side flavor bit over the shared map rep: a
+// set's `.values()` yields its ELEMENTS (the keys list), not the membership
+// booleans in `vals`. Mirrors the checker's `mSet` pin (typecheck.vl), which is
+// likewise seeded only by the `Set()` constructor form.
+export function letIsSet(letIx: i32) {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    const init = P.nodes[d.letInit]
+    if init is Call {
+      const callee = P.nodes[init.callFn]
+      if callee is Ident { return callee.identName == "Set" }
+    }
+  }
+  false
+}
+// True if the `LetDecl`/global at `letIx` declares an `f32` binding. ANNOTATION-ONLY:
+// a bare float literal stays f64 by default (keeps existing programs byte-identical),
+// so only an explicit `: f32` annotation selects the f32 slot (valtype `0x7d`, kind 13).
+// The initializer literal is then lowered as `f32.const`. (Slice 5.)
+export function letIsF32(letIx: i32) {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      const lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        if lt.tyName == "f32" { return true }
+      }
+    }
+  }
+  false
+}
+// True if the `LetDecl` at `letIx` declares a NULLABLE function-value local (`fn | null`,
+// kind 19). ANNOTATION-ONLY (the closure dual of `letIsNulList`): no call yet returns a
+// nullable function, and a bare-function or `null` init under the annotation keeps the
+// nullable `(ref null $cloStruct)` slot — narrowing is type-level, the slot stays nullable.
+export function letIsNulClosure(letIx: i32, fnIx: i32) {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      if nulCloFlag(d.letType) == 1 { return true }
+    }
+  }
+  false
+}
+// True if the parameter `name` of function `fnIx` is annotated as a function type
+// (lowered to the closure fat-pointer, kind 14).
+export function paramIsClosure(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return tyIsFuncType(p.parType) }
+      }
+      i = i + 1
+    }
+  }
+  false
+}

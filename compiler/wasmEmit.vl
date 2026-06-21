@@ -70,6 +70,8 @@ import {
   Program,
 } from "./ast"
 import { bigAddSmall, bigBitLen, bigDivmod, bigIsZero, bigMulSmall, bigShl1, bigShlK, bigShr1, gDivRemNonzero, numLexFitsI32, numLexIs2Pow31, parseI32, parseI64Pair } from "./emit_bignum"
+import { annArrowAt, annSplitParams, annSplitPipe, appendAll, atomEqOpcode, binOpcode, binOpcodeF32, binOpcodeF64, binOpcodeI64, callMemProp, capHas, capIsBound, decodeStr, directArgsBad, drwDispatchOp, f32Bytes, f64Bytes, gaeApplyFieldTy, gaeLtAt, gaeSplitArgs, inferNicheNullByName, isBuiltinFnName, isLitVariantName, isStructAtom, isVariantBoxUnion, loopStackFind, mapValNameOf, memberPathKeyOf, monoAnnHasTyParam, monoBindFromAnn, monoBindOf, monoIsGenericDecl, monoSubstAnn, monoTyParamOf, nameIsArray, nameIsClosureArray, nameIsClosureArrayTy, nameIsF64Array, nameIsI32Array, nameIsMap, nameIsMapArray, nameIsNulBool, nameIsNulI32List, nameIsNulString, nameIsString, nameIsStringArray, nameNamesFunction, nodeIsTypeDecl, nonNullMemberCountOf, nulCloFlag, nullablePartOf, numTextIsFloat, objFieldVal, parenUnionArrElemName, parentLetOf, removeAtomFrom, retArrFlag, retBoolFlag, retF32Flag, retF64ArrFlag, retF64Flag, retI64Flag, retNulListFlag, retNulStringFlag, retStrArrFlag, retStrFlag, slebToArr, strContains, strLess, strToCps, tyIsBool, tyIsFuncType, tyIsNulBool, tyNameOf, ulebToArr, unionEqOperandOk, unionHasAtom, unionHasValueAtom, unionStructAliasShape, unwrapParen } from "./emit_base"
+import { blockAlwaysReturns, blockHasArrNew, blockHasCoalesceCall, blockHasContinueFor, blockHasValuedReturn, exprHasArrNew, exprHasCoalesceCall, exprIsIfStmt, firstValuedReturn, fnHasArrNew, fnHasCoalesceCall, globalHasTypeAnn, globalIsNonConst, ifArmValueExpr, ifExprCollectAtoms, letInfStrListByUse, letIsF32, letIsNulBoolAnn, letIsNulClosure, letIsNulList, letIsSet, nliScanStmts, paramArray, paramF64Array, paramIndexOf, paramIsClosure, paramIsF32, paramIsF64, paramIsI64, paramMap, paramNulClosure, paramNulList, paramNulString, paramStringArray } from "./emit_query"
 //
 // Output representation: a VL `i32[]` of byte values 0..255. WasmGC has no `u8`,
 // so `i32[]` is used (see docs/selfhost-gaps.md). Bytes are masked to the low
@@ -208,67 +210,6 @@ function wBytes(bs: i32[]) {
 // continuation bit. The canonical `*ToArr` forms return a fresh `i32[]` so
 // they compose into nested payload builders; `wULEB`/`wSLEB` append straight to
 // the current buffer (`curBuf`) for section-length framing and operands.
-
-// Unsigned LEB128: 7 bits per byte, low-to-high, high bit set while more remain.
-function ulebToArr(value: i32) {
-  let out: i32[] = []
-  let v = value
-  let more = true
-  while more {
-    const byte = v & 0x7f
-    v = v >>> 7
-    if v == 0 {
-      out.push(byte)
-      more = false
-    } else {
-      out.push(byte | 0x80)
-    }
-  }
-  out
-}
-
-// SLEB-encode `value` into a fresh `i32[]`.
-function slebToArr(value: i32) {
-  let out: i32[] = []
-  let v = value
-  let more = true
-  while more {
-    const byte = v & 0x7f
-    v = v >> 7
-    let signBit = 0
-    if (byte & 0x40) != 0 { signBit = 1 }
-    if v == 0 {
-      if signBit == 0 {
-        out.push(byte)
-        more = false
-      } else {
-        out.push(byte | 0x80)
-      }
-    } else {
-      if v == -1 {
-        if signBit == 1 {
-          out.push(byte)
-          more = false
-        } else {
-          out.push(byte | 0x80)
-        }
-      } else {
-        out.push(byte | 0x80)
-      }
-    }
-  }
-  out
-}
-
-// Append all of `src` onto `dst` (in place) and return `dst`.
-function appendAll(dst: i32[], src: i32[]) {
-  let i = 0
-  while i < src.length {
-    dst.push(src[i])
-    i = i + 1
-  }
-  dst
-}
 
 // Streaming unsigned-LEB: append straight to the current buffer (used for
 // section-length framing and operand encoding). The `*ToArr` array forms are
@@ -424,134 +365,6 @@ function fbI64ExtendI32S() {
 // hardware IEEE-754 encoder for 2.5/1.0/0.5/3.14/0.1/0.2/0.3/1000.5/pi and rounding
 // torture cases before wiring in.
 
-// Encode the decimal literal `text` as its 8-byte little-endian IEEE-754 double,
-// returned as an i32[] of 8 bytes. Sign is parsed too (a leading `-`/`+`), though the
-// NumLit site never carries a sign (unary minus is a separate node) — kept for safety.
-function f64Bytes(text: string) {
-  let neg = false
-  let i = 0
-  if text.length > 0 {
-    if text[0] == '-' {
-      neg = true
-      i = 1
-    } else if text[0] == '+' {
-      i = 1
-    }
-  }
-  // Parse mantissa digits (ignoring `.` and `_`), counting fractional digits.
-  let mant: i32[] = []
-  mant.push(0)
-  let frac = 0
-  let dot = false
-  while i < text.length {
-    let c = text[i]
-    if c == '_' {
-      i = i + 1
-    } else if c == '.' {
-      dot = true
-      i = i + 1
-    } else {
-      mant = bigMulSmall(mant, 10)
-      mant = bigAddSmall(mant, c - '0')
-      if dot { frac = frac + 1 }
-      i = i + 1
-    }
-  }
-  // signWord is the high 16 bits of the high byte's eventual word; assembled at the end.
-  if bigIsZero(mant) {
-    // +/- zero: all bytes 0 except the sign in the top bit of byte 7.
-    const z: i32[] = []
-    let zi = 0
-    while zi < 8 {
-      z.push(0)
-      zi = zi + 1
-    }
-    if neg { z[7] = 0x80 }
-    return z
-  }
-  // value = mant / 10^frac. Build numerator and denominator bignums.
-  let num = mant
-  let den: i32[] = []
-  den.push(1)
-  let fk = 0
-  while fk < frac {
-    den = bigMulSmall(den, 10)
-    fk = fk + 1
-  }
-  // value = (num/den) * 2^exp. Align so floor(num/den) has exactly 54 bits, then round
-  // the 54th bit (guard) plus the remainder (sticky) down to a 53-bit significand.
-  let exp = 0
-  const diff = bigBitLen(num) - bigBitLen(den)
-  if diff < 54 {
-    num = bigShlK(num, 54 - diff)
-    exp = exp - (54 - diff)
-  } else if diff > 54 {
-    den = bigShlK(den, diff - 54)
-    exp = exp + (diff - 54)
-  }
-  let q = bigDivmod(num, den)
-  // The bit-length estimate can be one off; correct to exactly 54 bits.
-  while bigBitLen(q) < 54 {
-    num = bigShl1(num)
-    exp = exp - 1
-    q = bigDivmod(num, den)
-  }
-  while bigBitLen(q) > 54 {
-    den = bigShl1(den)
-    exp = exp + 1
-    q = bigDivmod(num, den)
-  }
-  // q is 54 bits; reduce to 53. guard = dropped low bit; sticky = remainder nonzero.
-  const guard = q[0] & 1
-  let sticky = 0
-  if gDivRemNonzero { sticky = 1 }
-  let q53 = bigShr1(q)
-  let e53 = exp + 1
-  // Round-to-nearest, ties-to-even: round up on guard=1 with sticky, or an exact tie
-  // (guard=1, sticky=0) when the kept LSB is odd.
-  let roundUp = false
-  if guard == 1 {
-    if sticky == 1 { roundUp = true }
-    else if (q53[0] & 1) == 1 { roundUp = true }
-  }
-  if roundUp {
-    q53 = bigAddSmall(q53, 1)
-    if bigBitLen(q53) > 53 {
-      q53 = bigShr1(q53)
-      e53 = e53 + 1
-    }
-  }
-  // q53 is exactly 53 bits in [2^52, 2^53): q53 = 1.f * 2^52, value = 1.f * 2^(e53+52).
-  const bigE = e53 + 52
-  const biased = bigE + 1023
-  // The low 52 bits of q53 are the stored fraction (drop the implicit leading 1, i.e.
-  // bit 52). Read the four low 16-bit limbs.
-  let m0 = 0
-  let m1 = 0
-  let m2 = 0
-  let m3 = 0
-  if q53.length > 0 { m0 = q53[0] }
-  if q53.length > 1 { m1 = q53[1] }
-  if q53.length > 2 { m2 = q53[2] }
-  if q53.length > 3 { m3 = q53[3] }
-  // The 8 little-endian bytes: 52-bit fraction in bytes 0..6 (low nibble of byte 6),
-  // 11-bit biased exponent straddling byte 6 (high nibble) and byte 7, sign in bit 7
-  // of byte 7. m3 holds bits 48..52: bit 52 is the implicit 1 (masked off), bits 48..51
-  // are the fraction's top nibble.
-  let out: i32[] = []
-  out.push(m0 & 0xff)                         // byte 0: frac bits 0..7
-  out.push((m0 >>> 8) & 0xff)                 // byte 1: frac bits 8..15
-  out.push(m1 & 0xff)                         // byte 2: frac bits 16..23
-  out.push((m1 >>> 8) & 0xff)                 // byte 3: frac bits 24..31
-  out.push(m2 & 0xff)                         // byte 4: frac bits 32..39
-  out.push((m2 >>> 8) & 0xff)                 // byte 5: frac bits 40..47
-  const fracHi = m3 & 0xf                     // frac bits 48..51 (bit 52 implicit-1 dropped)
-  out.push(fracHi | ((biased & 0xf) << 4))    // byte 6: frac 48..51 | exp low 4 bits
-  let signTop = 0
-  if neg { signTop = 0x80 }
-  out.push(((biased >>> 4) & 0x7f) | signTop) // byte 7: exp high 7 bits | sign
-  out
-}
 // f64.const: 0x44 followed by 8 raw little-endian IEEE-754 bytes (`f64Bytes`).
 function fbF64Const(text: string) {
   wU8(68) // 0x44 f64.const
@@ -565,130 +378,6 @@ function fbF64ConvertI32S() {
   0
 }
 
-// ── f32.const: pure-i32 decimal-string → IEEE-754 single (Slice 5) ─────────────
-// Mirrors `f64Bytes` exactly but rounds to a 24-bit significand (vs 53) and packs the
-// 4-byte single. The SAME bignum helpers (`bigShlK`/`bigDivmod`/`bigShr1`/…) are
-// reused; only the alignment width (25 = 24 + guard), the bias (127), the fraction
-// width (23 bits), and the byte layout differ. Rounding is a SINGLE round on the exact
-// decimal value (round-to-nearest-ties-to-even at bit 24) — never decimal→f64→f32, so
-// it never double-rounds. Validated bit-for-bit against `DataView.setFloat32` for
-// 2.5/5.0/4.0/6.5/0.1/3.14/etc before wiring in.
-function f32Bytes(text: string) {
-  let neg = false
-  let i = 0
-  if text.length > 0 {
-    if text[0] == '-' {
-      neg = true
-      i = 1
-    } else if text[0] == '+' {
-      i = 1
-    }
-  }
-  // Parse mantissa digits (ignoring `.` and `_`), counting fractional digits.
-  let mant: i32[] = []
-  mant.push(0)
-  let frac = 0
-  let dot = false
-  while i < text.length {
-    let c = text[i]
-    if c == '_' {
-      i = i + 1
-    } else if c == '.' {
-      dot = true
-      i = i + 1
-    } else {
-      mant = bigMulSmall(mant, 10)
-      mant = bigAddSmall(mant, c - '0')
-      if dot { frac = frac + 1 }
-      i = i + 1
-    }
-  }
-  if bigIsZero(mant) {
-    // +/- zero: all bytes 0 except the sign in the top bit of byte 3.
-    const z: i32[] = []
-    let zi = 0
-    while zi < 4 {
-      z.push(0)
-      zi = zi + 1
-    }
-    if neg { z[3] = 0x80 }
-    return z
-  }
-  // value = mant / 10^frac. Build numerator and denominator bignums.
-  let num = mant
-  let den: i32[] = []
-  den.push(1)
-  let fk = 0
-  while fk < frac {
-    den = bigMulSmall(den, 10)
-    fk = fk + 1
-  }
-  // value = (num/den) * 2^exp. Align so floor(num/den) has exactly 25 bits, then round
-  // the 25th bit (guard) plus the remainder (sticky) down to a 24-bit significand.
-  let exp = 0
-  const diff = bigBitLen(num) - bigBitLen(den)
-  if diff < 25 {
-    num = bigShlK(num, 25 - diff)
-    exp = exp - (25 - diff)
-  } else if diff > 25 {
-    den = bigShlK(den, diff - 25)
-    exp = exp + (diff - 25)
-  }
-  let q = bigDivmod(num, den)
-  // The bit-length estimate can be one off; correct to exactly 25 bits.
-  while bigBitLen(q) < 25 {
-    num = bigShl1(num)
-    exp = exp - 1
-    q = bigDivmod(num, den)
-  }
-  while bigBitLen(q) > 25 {
-    den = bigShl1(den)
-    exp = exp + 1
-    q = bigDivmod(num, den)
-  }
-  // q is 25 bits; reduce to 24. guard = dropped low bit; sticky = remainder nonzero.
-  const guard = q[0] & 1
-  let sticky = 0
-  if gDivRemNonzero { sticky = 1 }
-  let q24 = bigShr1(q)
-  let e24 = exp + 1
-  // Round-to-nearest, ties-to-even.
-  let roundUp = false
-  if guard == 1 {
-    if sticky == 1 { roundUp = true }
-    else if (q24[0] & 1) == 1 { roundUp = true }
-  }
-  if roundUp {
-    q24 = bigAddSmall(q24, 1)
-    if bigBitLen(q24) > 24 {
-      q24 = bigShr1(q24)
-      e24 = e24 + 1
-    }
-  }
-  // q24 is exactly 24 bits in [2^23, 2^24): q24 = 1.f * 2^23, value = 1.f * 2^(e24+23).
-  const bigE = e24 + 23
-  const biased = bigE + 127
-  // The low 23 bits of q24 are the stored fraction (drop the implicit leading 1, i.e.
-  // bit 23). Read the two low 16-bit limbs.
-  let m0 = 0
-  let m1 = 0
-  if q24.length > 0 { m0 = q24[0] }
-  if q24.length > 1 { m1 = q24[1] }
-  // 24-bit significand into a single i32: bits 0..15 = m0, bits 16..23 = m1 low byte.
-  let sig = (m0 & 0xffff) | ((m1 & 0xff) << 16)
-  // The 4 little-endian bytes: 23-bit fraction in bytes 0..2 (low 7 bits of byte 2),
-  // 8-bit biased exponent straddling byte 2 (high bit) and byte 3, sign in bit 7 of
-  // byte 3. Bit 23 of `sig` is the implicit 1 (masked off).
-  let out: i32[] = []
-  out.push(sig & 0xff)                        // byte 0: frac bits 0..7
-  out.push((sig >>> 8) & 0xff)                // byte 1: frac bits 8..15
-  const fracHi = (sig >>> 16) & 0x7f          // frac bits 16..22 (bit 23 implicit-1 dropped)
-  out.push(fracHi | ((biased & 1) << 7))      // byte 2: frac 16..22 | exp low bit
-  let signTop = 0
-  if neg { signTop = 0x80 }
-  out.push(((biased >>> 1) & 0x7f) | signTop) // byte 3: exp high 7 bits | sign
-  out
-}
 // f32.const: 0x43 followed by 4 raw little-endian IEEE-754 bytes (`f32Bytes`).
 function fbF32Const(text: string) {
   wU8(67) // 0x43 f32.const
@@ -1890,25 +1579,6 @@ function paramNulRef(fnIx: i32, name: string) {
   false
 }
 
-// True if param `name` of function `fnIx` is a NULLABLE function value (`fn | null`, kind
-// 19) — the closure dual of `paramNulRef`.
-function paramNulClosure(fnIx: i32, name: string) {
-  if fnIx < 0 { return false }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name { return nulCloFlag(p.parType) == 1 }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
 // True if the function `name` returns a nullable struct (`fRetNul`).
 function fnRetNulRef(name: string) {
   let i = 0
@@ -1928,39 +1598,6 @@ function letIsNulRef(letIx: i32, fnIx: i32) {
       if retNulRefFlag(d.letType) == 1 { return true }
     }
     return exprNullableStruct(d.letInit, fnIx)
-  }
-  false
-}
-
-// True if the `LetDecl` at `letIx` declares a nullable i32-list local/global
-// (`i32[] | null`, kind 15). ANNOTATION-ONLY: an initializer cannot produce one
-// (no call returns a nullable list yet), and a `[…]` init under the annotation
-// keeps the NULLABLE slot — narrowing is type-level, the slot type is the
-// annotation's.
-function letIsNulList(letIx: i32, fnIx: i32) {
-  let d = P.nodes[letIx]
-  if d is LetDecl {
-    if d.letType >= 0 {
-      if retNulListFlag(d.letType) == 1 { return true }
-    }
-  }
-  false
-}
-
-// True if the parameter `name` of function `fnIx` is a nullable i32 list.
-function paramNulList(fnIx: i32, name: string) {
-  if fnIx < 0 { return false }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name { return retNulListFlag(p.parType) == 1 }
-      }
-      i = i + 1
-    }
   }
   false
 }
@@ -1997,23 +1634,6 @@ function globalIsNulString(name: string) {
   let li = globalLetOf(name)
   if li < 0 { return false }
   letIsNulString(li, -1)
-}
-
-function paramNulString(fnIx: i32, name: string) {
-  if fnIx < 0 { return false }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name { return retNulStringFlag(p.parType) == 1 }
-      }
-      i = i + 1
-    }
-  }
-  false
 }
 
 function fnRetNulString(name: string) {
@@ -2236,48 +1856,6 @@ function buildFnMap(stmts: i32[]) {
   fnStmts.length
 }
 
-// Does the block contain a `return e` WITH a value (recursing into if/while/for
-// bodies)? A bare `return` does not count — a void function may bare-return.
-function blockHasValuedReturn(blockIx: i32) {
-  let b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      const st = P.nodes[stmts[i]]
-      if st is RetStmt {
-        if st.retArg >= 0 { return true }
-      } else if st is IfStmt {
-        if ifChainHasValuedReturn(stmts[i]) { return true }
-      } else if st is WhileStmt {
-        if blockHasValuedReturn(st.whileBody) { return true }
-      } else if st is ForRange {
-        if blockHasValuedReturn(st.frBody) { return true }
-      } else if st is ForIn {
-        if blockHasValuedReturn(st.fiBody) { return true }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
-function ifChainHasValuedReturn(ifIx: i32) {
-  const st = P.nodes[ifIx]
-  if st is IfStmt {
-    if blockHasValuedReturn(st.ifThen) { return true }
-    if st.ifElse >= 0 {
-      const els = P.nodes[st.ifElse]
-      if els is Block {
-        if blockHasValuedReturn(st.ifElse) { return true }
-      } else if els is IfStmt {
-        if ifChainHasValuedReturn(st.ifElse) { return true }
-      }
-    }
-  }
-  false
-}
-
 // Classify each function's VOIDNESS as a monotone fixed point: a candidate (no
 // return annotation) is void when its body has no valued `return` and no tail
 // value. `stmtIsTailValue` consults `fRetVoid` for tail CALLS, so marking a
@@ -2335,48 +1913,6 @@ function fnRetExprOf(fnIx: i32) {
       }
     }
     return firstValuedReturn(fn.fnBody)
-  }
-  -1
-}
-
-function firstValuedReturn(blockIx: i32) {
-  let b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      const st = P.nodes[stmts[i]]
-      if st is RetStmt {
-        if st.retArg >= 0 { return st.retArg }
-      } else if st is IfStmt {
-        let r = firstValuedReturnIf(stmts[i])
-        if r >= 0 { return r }
-      } else if st is WhileStmt {
-        let r = firstValuedReturn(st.whileBody)
-        if r >= 0 { return r }
-      } else if st is ForRange {
-        let r = firstValuedReturn(st.frBody)
-        if r >= 0 { return r }
-      } else if st is ForIn {
-        let r = firstValuedReturn(st.fiBody)
-        if r >= 0 { return r }
-      }
-      i = i + 1
-    }
-  }
-  -1
-}
-
-function firstValuedReturnIf(ifIx: i32) {
-  const st = P.nodes[ifIx]
-  if st is IfStmt {
-    let r = firstValuedReturn(st.ifThen)
-    if r >= 0 { return r }
-    if st.ifElse >= 0 {
-      const els = P.nodes[st.ifElse]
-      if els is Block { return firstValuedReturn(st.ifElse) }
-      if els is IfStmt { return firstValuedReturnIf(st.ifElse) }
-    }
   }
   -1
 }
@@ -2549,43 +2085,6 @@ function computeRetInference() {
   0
 }
 
-function collectValuedReturnsIn(blockIx: i32, out: i32[]) {
-  let b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      const st = P.nodes[stmts[i]]
-      if st is RetStmt {
-        if st.retArg >= 0 { out.push(st.retArg) }
-      } else if st is IfStmt {
-        collectValuedReturnsInIf(stmts[i], out)
-      } else if st is WhileStmt {
-        collectValuedReturnsIn(st.whileBody, out)
-      } else if st is ForRange {
-        collectValuedReturnsIn(st.frBody, out)
-      } else if st is ForIn {
-        collectValuedReturnsIn(st.fiBody, out)
-      }
-      i = i + 1
-    }
-  }
-  0
-}
-
-function collectValuedReturnsInIf(ifIx: i32, out: i32[]) {
-  const st = P.nodes[ifIx]
-  if st is IfStmt {
-    collectValuedReturnsIn(st.ifThen, out)
-    if st.ifElse >= 0 {
-      const els = P.nodes[st.ifElse]
-      if els is Block { collectValuedReturnsIn(st.ifElse, out) }
-      else if els is IfStmt { collectValuedReturnsInIf(st.ifElse, out) }
-    }
-  }
-  0
-}
-
 // Look up the wasm function index for `name`, or -1 if no such top-level function
 // exists (an undefined callee — the caller fails loudly).
 function fnIndexOf(name: string) { fnNameMap[name] ?? -1 }
@@ -2649,48 +2148,6 @@ function captureNamesOf(fe: i32) {
 function captureCountOf(fe: i32) {
   const caps = captureNamesOf(fe)
   caps.length
-}
-
-// True if `name` is currently in the `bound` set (a param or an in-scope `let`).
-function capIsBound(bound: string[], name: string) {
-  let i = 0
-  while i < bound.length {
-    if bound[i] == name { return true }
-    i = i + 1
-  }
-  false
-}
-
-// True if `name` is in `caps` already (dedup the capture list).
-export function capHas(caps: string[], name: string) {
-  let i = 0
-  while i < caps.length {
-    if caps[i] == name { return true }
-    i = i + 1
-  }
-  false
-}
-
-// Record a free-variable reference to `name`: a capture unless it is bound locally,
-// a module global, or a top-level/lifted function name (addressable directly).
-// A compiler BUILTIN function name (`print`, `toString`, `Map`, …): a call target the
-// emitter lowers directly, NOT a value — so it is never a captured variable. Excluded in
-// `capRecord` alongside user functions, else a closure whose body calls a builtin (e.g.
-// `function f() { print(1) }` used as a value) spuriously "captures" the builtin name and
-// fails `captured variable not found`.
-function isBuiltinFnName(name: string) {
-  if name == "print" { return true }
-  if name == "toString" { return true }
-  if name == "fromCodePoint" { return true }
-  if name == "fromCodePoints" { return true }
-  if name == "Map" { return true }
-  if name == "Set" { return true }
-  if name == "__array_new__" { return true }
-  if name == "__array_new_default__" { return true }
-  if name == "__array_copy__" { return true }
-  if name == "__log__" { return true }
-  if name == "__trap__" { return true }
-  false
 }
 
 function capRecord(name: string, bound: string[], caps: string[]) {
@@ -2865,35 +2322,6 @@ function parentBindingOf(fe: i32, name: string) {
   -1
 }
 
-// Find a `LetDecl` for `name` anywhere in the parent body block (incl. nested if/loop
-// bodies — wasm locals are function-scoped). Returns its arena index or -1.
-function parentLetOf(blockIx: i32, name: string) {
-  if blockIx < 0 { return -1 }
-  let b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      const st = P.nodes[stmts[i]]
-      if st is LetDecl {
-        if st.letName == name { return stmts[i] }
-      } else if st is IfStmt {
-        let r = parentLetOf(st.ifThen, name)
-        if r >= 0 { return r }
-        if st.ifElse >= 0 {
-          const r2 = parentLetOf(st.ifElse, name)
-          if r2 >= 0 { return r2 }
-        }
-      } else if st is WhileStmt {
-        const r3 = parentLetOf(st.whileBody, name)
-        if r3 >= 0 { return r3 }
-      }
-      i = i + 1
-    }
-  }
-  -1
-}
-
 // The `fbValtype` kind for a captured variable `name` of lifted function `fe`,
 // resolved against the parent frame's binding (a param's annotation, or a local
 // `let`'s annotation / struct-literal initializer). Defaults to i32 (kind 0).
@@ -2947,31 +2375,6 @@ function captureValStructIdx(fe: i32, name: string) {
       if letIsRefArray(b, pf) { return letRefListSlot(b, pf) }
       const iv = P.nodes[bn.letInit]
       if iv is ObjLit { return structIndexOfExpr(bn.letInit, pf) }
-    }
-  }
-  -1
-}
-
-// ── parameter resolution ─────────────────────────────────────────────────────
-// A returned `Ident` is a parameter reference; its wasm `local.get` index is the
-// param's position in `fnParams` (params occupy locals 0..n-1, before any declared
-// locals). `paramIndexOf` scans the FuncDecl's `fnParams` for the param whose
-// `parName` matches `name`, returning its 0-based position or -1 if not a param.
-// Only i32 params exist in this slice, so position == local index directly.
-function paramIndexOf(fnIx: i32, name: string) {
-  if fnIx < 0 {
-    return -1 // module-scope initializer (no enclosing function)
-  }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name { return i }
-      }
-      i = i + 1
     }
   }
   -1
@@ -3129,20 +2532,6 @@ function ctrlEnter() {
 function ctrlLeave() {
   ctrlDepth = ctrlDepth - 1
   0
-}
-
-// The loop-stack position a `break`/`continue` targets: "" (unlabelled) binds
-// to the TOP entry (the innermost loop); a label scans from the top for the
-// nearest enclosing loop carrying it. Returns -1 when the label names no
-// enclosing loop (the emit-time fail-loud guard).
-function loopStackFind(labels: string[], label: string) {
-  if label == "" { return labels.length - 1 }
-  let i = labels.length - 1
-  while i >= 0 {
-    if labels[i] == label { return i }
-    i = i - 1
-  }
-  -1
 }
 
 // ── per-function `.push` scratch locals ──────────────────────────────────────
@@ -3434,21 +2823,6 @@ let mvValKind: i32[] = []      // 3 = string value, 1 = struct value
 let mvValStructIdx: i32[] = [] // struct TABLE index of a kind-1 value, else -1
 let mvRlSlot: i32[] = []       // ref-list table slot of a kind-1 vals list, else -1
 let mvMapTypeIdx: i32[] = []   // this slot's map struct heap-type index (emitModule)
-
-// The VALUE type-name of a synthetic map type-name `{[K]:V}` — the text after the
-// FIRST "]:" (the key cannot contain `]`), minus the closing `}`. Mirrors the
-// checker's split (typecheck.vl `parseMapName`). "" if the name is not that shape.
-function mapValNameOf(name: string) {
-  if !nameIsMap(name) { return "" }
-  let i = 2
-  while i < name.length - 1 {
-    if name[i] == ']' {
-      if name[i + 1] == ':' { return name.slice(i + 2, name.length - 1) }
-    }
-    i = i + 1
-  }
-  ""
-}
 
 // Resolve a value type-NAME to a struct TABLE index: a declared struct by name, or
 // an inline object type `{a:T,b:U}` matched by FIELD-NAME SET against the table
@@ -5082,247 +4456,6 @@ function arrNewIntrKind(callIx: i32, fnIx: i32) {
   -1
 }
 
-// True if the expression at `exprIx` contains an intrinsic allocator call
-// (`__array_new__` / `__array_new_default__`) anywhere.
-function exprHasArrNew(exprIx: i32) {
-  if exprIx < 0 { return false }
-  const e = P.nodes[exprIx]
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      if callee.identName == "__array_new__" { return true }
-      if callee.identName == "__array_new_default__" { return true }
-    }
-    if exprHasArrNew(e.callFn) { return true }
-    const args = e.callArgs
-    let i = 0
-    while i < args.length {
-      if exprHasArrNew(args[i]) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  if e is BinExpr {
-    if exprHasArrNew(e.binLeft) { return true }
-    return exprHasArrNew(e.binRight)
-  }
-  if e is Member { return exprHasArrNew(e.memObj) }
-  if e is Index {
-    if exprHasArrNew(e.idxArr) { return true }
-    return exprHasArrNew(e.idxIndex)
-  }
-  if e is Unary { return exprHasArrNew(e.unArg) }
-  if e is Paren { return exprHasArrNew(e.parInner) }
-  if e is IsExpr { return exprHasArrNew(e.isObj) }
-  if e is ObjLit {
-    const fields = e.objFields
-    let i = 0
-    while i < fields.length {
-      const f = P.nodes[fields[i]]
-      if f is FieldInit {
-        if exprHasArrNew(f.fiValue) { return true }
-      }
-      i = i + 1
-    }
-    return false
-  }
-  if e is ArrayLit {
-    const elems = e.arrElems
-    let i = 0
-    while i < elems.length {
-      if exprHasArrNew(elems[i]) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  false
-}
-
-// True if any statement in the block at `blockIx` (descending into if/else arms
-// and loop bodies) contains an intrinsic allocator call.
-function blockHasArrNew(blockIx: i32) {
-  let b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      let s = P.nodes[stmts[i]]
-      if s is LetDecl {
-        if exprHasArrNew(s.letInit) { return true }
-      } else if s is RetStmt {
-        if exprHasArrNew(s.retArg) { return true }
-      } else if s is BinExpr {
-        if exprHasArrNew(stmts[i]) { return true }
-      } else if s is Call {
-        if exprHasArrNew(stmts[i]) { return true }
-      } else if s is ObjLit {
-        if exprHasArrNew(stmts[i]) { return true }
-      } else if s is IfStmt {
-        if ifChainHasArrNew(stmts[i]) { return true }
-      } else if s is WhileStmt {
-        if exprHasArrNew(s.whileCond) { return true }
-        if blockHasArrNew(s.whileBody) { return true }
-      } else if s is ForIn {
-        if exprHasArrNew(s.fiIter) { return true }
-        if blockHasArrNew(s.fiBody) { return true }
-      } else if s is ForRange {
-        if exprHasArrNew(s.frFrom) { return true }
-        if exprHasArrNew(s.frTo) { return true }
-        if blockHasArrNew(s.frBody) { return true }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
-// True if any arm of the `if` / `else if` chain at `ifIx` contains an intrinsic
-// allocator call — condition, then-branch, `else` block, or a chained `else if`.
-function ifChainHasArrNew(ifIx: i32) {
-  let s = P.nodes[ifIx]
-  if s is IfStmt {
-    if exprHasArrNew(s.ifCond) { return true }
-    if blockHasArrNew(s.ifThen) { return true }
-    if s.ifElse >= 0 {
-      const els = P.nodes[s.ifElse]
-      if els is Block { return blockHasArrNew(s.ifElse) }
-      if els is IfStmt { return ifChainHasArrNew(s.ifElse) }
-    }
-  }
-  false
-}
-
-// True if the FuncDecl at `fnIx` allocates via an intrinsic allocator — so it
-// reserves the 1-slot arrNew scratch frame.
-function fnHasArrNew(fnIx: i32) {
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl { return blockHasArrNew(fn.fnBody) }
-  false
-}
-
-// ── `f(x) ?? d` (a CALL-LHS null-coalesce) scratch detection ───────────────────
-// A `??` whose left operand is a CALL cannot RE-EVALUATE its LHS the way an
-// ident/field `x ?? d` does (a call has effects + cost), so it stashes the call's
-// result (a value-union box) in a 1-slot `(ref $uBoxIdx)` frame, then tests the tag
-// and unboxes off the ONE evaluation. The scan reserves that slot for any function
-// containing such a `??`; a function without one keeps a byte-identical layout.
-// Over-approximates to ANY call-LHS `??` (the emit path uses the slot only for a
-// value-union-box result; an unhandled rep reserves-but-skips, still valid).
-function exprHasCoalesceCall(exprIx: i32) {
-  if exprIx < 0 { return false }
-  const e = P.nodes[exprIx]
-  if e is BinExpr {
-    if e.binOp == "??" {
-      const l = P.nodes[unwrapParen(e.binLeft)]
-      if l is Call { return true }
-    }
-    if exprHasCoalesceCall(e.binLeft) { return true }
-    return exprHasCoalesceCall(e.binRight)
-  }
-  if e is Call {
-    if exprHasCoalesceCall(e.callFn) { return true }
-    const args = e.callArgs
-    let i = 0
-    while i < args.length {
-      if exprHasCoalesceCall(args[i]) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  if e is Member { return exprHasCoalesceCall(e.memObj) }
-  if e is OptMember { return exprHasCoalesceCall(e.omObj) }
-  if e is Index {
-    if exprHasCoalesceCall(e.idxArr) { return true }
-    return exprHasCoalesceCall(e.idxIndex)
-  }
-  if e is Unary { return exprHasCoalesceCall(e.unArg) }
-  if e is Paren { return exprHasCoalesceCall(e.parInner) }
-  if e is IsExpr { return exprHasCoalesceCall(e.isObj) }
-  if e is ObjLit {
-    const fields = e.objFields
-    let i = 0
-    while i < fields.length {
-      const f = P.nodes[fields[i]]
-      if f is FieldInit {
-        if exprHasCoalesceCall(f.fiValue) { return true }
-      }
-      i = i + 1
-    }
-    return false
-  }
-  if e is ArrayLit {
-    const elems = e.arrElems
-    let i = 0
-    while i < elems.length {
-      if exprHasCoalesceCall(elems[i]) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  false
-}
-
-// True if any statement in the block at `blockIx` (descending into if/else arms and
-// loop bodies) contains a call-LHS `??`. Mirrors `blockHasArrNew`.
-function blockHasCoalesceCall(blockIx: i32) {
-  let b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      let s = P.nodes[stmts[i]]
-      if s is LetDecl {
-        if exprHasCoalesceCall(s.letInit) { return true }
-      } else if s is RetStmt {
-        if exprHasCoalesceCall(s.retArg) { return true }
-      } else if s is BinExpr {
-        if exprHasCoalesceCall(stmts[i]) { return true }
-      } else if s is Call {
-        if exprHasCoalesceCall(stmts[i]) { return true }
-      } else if s is ObjLit {
-        if exprHasCoalesceCall(stmts[i]) { return true }
-      } else if s is IfStmt {
-        if ifChainHasCoalesceCall(stmts[i]) { return true }
-      } else if s is WhileStmt {
-        if exprHasCoalesceCall(s.whileCond) { return true }
-        if blockHasCoalesceCall(s.whileBody) { return true }
-      } else if s is ForIn {
-        if exprHasCoalesceCall(s.fiIter) { return true }
-        if blockHasCoalesceCall(s.fiBody) { return true }
-      } else if s is ForRange {
-        if exprHasCoalesceCall(s.frFrom) { return true }
-        if exprHasCoalesceCall(s.frTo) { return true }
-        if blockHasCoalesceCall(s.frBody) { return true }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
-// True if any arm of the `if` / `else if` chain at `ifIx` contains a call-LHS `??`.
-function ifChainHasCoalesceCall(ifIx: i32) {
-  let s = P.nodes[ifIx]
-  if s is IfStmt {
-    if exprHasCoalesceCall(s.ifCond) { return true }
-    if blockHasCoalesceCall(s.ifThen) { return true }
-    if s.ifElse >= 0 {
-      const els = P.nodes[s.ifElse]
-      if els is Block { return blockHasCoalesceCall(s.ifElse) }
-      if els is IfStmt { return ifChainHasCoalesceCall(s.ifElse) }
-    }
-  }
-  false
-}
-
-// True if the FuncDecl at `fnIx` contains a call-LHS `??` — so it reserves the 1-slot
-// coalesce-call scratch frame.
-function fnHasCoalesceCall(fnIx: i32) {
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl { return blockHasCoalesceCall(fn.fnBody) }
-  false
-}
-
 // The declared-local POSITION of `name`: the innermost live lexical binding if the
 // scope stack has one (so a same-named binding in a disjoint/inner block resolves to
 // ITS own slot, with its own valtype), else the first `localNames` slot of that name
@@ -5392,217 +4525,6 @@ function localIndexOf(fnIx: i32, name: string) {
   const pIx = paramIndexOf(fnIx, name)
   if pIx >= 0 { return envSlotShift(fnIx) + pIx }
   declaredIndexOf(fnIx, name)
-}
-
-// Map a binary operator lexeme to its i32 wasm opcode, or -1 if unsupported. The
-// three arithmetic ops and the six signed i32 comparisons are recognized; anything
-// else (`/`, `%`, `=`, logical `&&`/`||`, …) falls through to -1 so the caller
-// fails loudly rather than emitting a wrong opcode. Comparisons leave a 0/1 i32 on
-// the stack — exactly what a wasm `if` condition consumes.
-//   `+`  -> i32.add  (0x6a)   `-`  -> i32.sub  (0x6b)   `*`  -> i32.mul  (0x6c)
-//   `==` -> i32.eq   (0x46)   `!=` -> i32.ne   (0x47)
-//   `<`  -> i32.lt_s (0x48)   `>`  -> i32.gt_s (0x4a)
-//   `<=` -> i32.le_s (0x4c)   `>=` -> i32.ge_s (0x4e)
-function binOpcode(op: string) {
-  if op == "+" {
-    return 106 // 0x6a i32.add
-  }
-  if op == "-" {
-    return 107 // 0x6b i32.sub
-  }
-  if op == "*" {
-    return 108 // 0x6c i32.mul
-  }
-  if op == "/" {
-    return 109 // 0x6d i32.div_s (signed; VL `i32` division is signed)
-  }
-  if op == "%" {
-    return 111 // 0x6f i32.rem_s (signed remainder)
-  }
-  if op == "==" {
-    return 70 // 0x46 i32.eq
-  }
-  if op == "!=" {
-    return 71 // 0x47 i32.ne
-  }
-  if op == "<" {
-    return 72 // 0x48 i32.lt_s
-  }
-  if op == ">" {
-    return 74 // 0x4a i32.gt_s
-  }
-  if op == "<=" {
-    return 76 // 0x4c i32.le_s
-  }
-  if op == ">=" {
-    return 78 // 0x4e i32.ge_s
-  }
-  // Bitwise / shift (integer-only). VL `i32` is signed, so `>>` is the SIGNED
-  // (arithmetic) shift `shr_s` and `>>>` the UNSIGNED (logical) shift `shr_u` —
-  // the distinction the LEB encoders' `v >>> 7` relies on. Mirrors the host
-  // `INT_BINOPS` map in toWasm.ts (`&`->and, `|`->or, `>>`->shr_s, `>>>`->shr_u).
-  if op == "&" {
-    return 113 // 0x71 i32.and
-  }
-  if op == "|" {
-    return 114 // 0x72 i32.or
-  }
-  if op == "^" {
-    return 115 // 0x73 i32.xor
-  }
-  if op == "<<" {
-    return 116 // 0x74 i32.shl
-  }
-  if op == ">>" {
-    return 117 // 0x75 i32.shr_s (signed/arithmetic)
-  }
-  if op == ">>>" {
-    return 118 // 0x76 i32.shr_u (unsigned/logical)
-  }
-  -1
-}
-
-// The i64 instruction variant for `op` (Slice 2), selected when an operand is i64.
-// Arithmetic/bitwise/shift consume two i64 and leave an i64; comparisons consume two
-// i64 and leave an i32 BOOL. Returns -1 for an op with no i64 form (`&&`/`||`/`=`/`??`).
-//   +  i64.add 0x7c  -  i64.sub 0x7d  *  i64.mul 0x7e  /  i64.div_s 0x7f  %  i64.rem_s 0x81
-//   &  i64.and 0x83  |  i64.or 0x84   ^  i64.xor 0x85  << i64.shl  0x86
-//   >> i64.shr_s 0x87  >>> i64.shr_u 0x88
-//   == i64.eq 0x51  != i64.ne 0x52  < i64.lt_s 0x53  > i64.gt_s 0x55
-//   <= i64.le_s 0x57  >= i64.ge_s 0x59
-function binOpcodeI64(op: string) {
-  if op == "+" {
-    return 124 // 0x7c i64.add
-  }
-  if op == "-" {
-    return 125 // 0x7d i64.sub
-  }
-  if op == "*" {
-    return 126 // 0x7e i64.mul
-  }
-  if op == "/" {
-    return 127 // 0x7f i64.div_s
-  }
-  if op == "%" {
-    return 129 // 0x81 i64.rem_s
-  }
-  if op == "&" {
-    return 131 // 0x83 i64.and
-  }
-  if op == "|" {
-    return 132 // 0x84 i64.or
-  }
-  if op == "^" {
-    return 133 // 0x85 i64.xor
-  }
-  if op == "<<" {
-    return 134 // 0x86 i64.shl
-  }
-  if op == ">>" {
-    return 135 // 0x87 i64.shr_s
-  }
-  if op == ">>>" {
-    return 136 // 0x88 i64.shr_u
-  }
-  if op == "==" {
-    return 81 // 0x51 i64.eq
-  }
-  if op == "!=" {
-    return 82 // 0x52 i64.ne
-  }
-  if op == "<" {
-    return 83 // 0x53 i64.lt_s
-  }
-  if op == ">" {
-    return 85 // 0x55 i64.gt_s
-  }
-  if op == "<=" {
-    return 87 // 0x57 i64.le_s
-  }
-  if op == ">=" {
-    return 89 // 0x59 i64.ge_s
-  }
-  -1
-}
-
-// The f64 instruction variant for `op` (Slice 3), selected when an operand is f64.
-// Arithmetic consumes two f64 and leaves an f64; comparisons consume two f64 and leave
-// an i32 BOOL. Returns -1 for an op with no f64 form (`%`/bitwise/shift/`&&`/`||`/...).
-//   +  f64.add 0xa0  -  f64.sub 0xa1  *  f64.mul 0xa2  /  f64.div 0xa3
-//   == f64.eq 0x61   != f64.ne 0x62   <  f64.lt 0x63   >  f64.gt 0x64
-//   <= f64.le 0x65   >= f64.ge 0x66
-function binOpcodeF64(op: string) {
-  if op == "+" {
-    return 160 // 0xa0 f64.add
-  }
-  if op == "-" {
-    return 161 // 0xa1 f64.sub
-  }
-  if op == "*" {
-    return 162 // 0xa2 f64.mul
-  }
-  if op == "/" {
-    return 163 // 0xa3 f64.div
-  }
-  if op == "==" {
-    return 97 // 0x61 f64.eq
-  }
-  if op == "!=" {
-    return 98 // 0x62 f64.ne
-  }
-  if op == "<" {
-    return 99 // 0x63 f64.lt
-  }
-  if op == ">" {
-    return 100 // 0x64 f64.gt
-  }
-  if op == "<=" {
-    return 101 // 0x65 f64.le
-  }
-  if op == ">=" {
-    return 102 // 0x66 f64.ge
-  }
-  -1
-}
-
-// The f32 instruction variant for `op` (Slice 5), selected when an operand is f32.
-// Arithmetic consumes two f32 and leaves an f32; comparisons consume two f32 and leave
-// an i32 BOOL. Returns -1 for an op with no f32 form (`%`/bitwise/shift/`&&`/`||`/...).
-//   +  f32.add 0x92  -  f32.sub 0x93  *  f32.mul 0x94  /  f32.div 0x95
-//   == f32.eq 0x5b   != f32.ne 0x5c   <  f32.lt 0x5d   >  f32.gt 0x5e
-//   <= f32.le 0x5f   >= f32.ge 0x60
-function binOpcodeF32(op: string) {
-  if op == "+" {
-    return 146 // 0x92 f32.add
-  }
-  if op == "-" {
-    return 147 // 0x93 f32.sub
-  }
-  if op == "*" {
-    return 148 // 0x94 f32.mul
-  }
-  if op == "/" {
-    return 149 // 0x95 f32.div
-  }
-  if op == "==" {
-    return 91 // 0x5b f32.eq
-  }
-  if op == "!=" {
-    return 92 // 0x5c f32.ne
-  }
-  if op == "<" {
-    return 93 // 0x5d f32.lt
-  }
-  if op == ">" {
-    return 94 // 0x5e f32.gt
-  }
-  if op == "<=" {
-    return 95 // 0x5f f32.le
-  }
-  if op == ">=" {
-    return 96 // 0x60 f32.ge
-  }
-  -1
 }
 
 // Emit the instructions for the returned expression at `exprIx` onto `body`, in
@@ -5795,24 +4717,6 @@ function structIndexOfObjCtx(objIx: i32, fnIx: i32) {
         if ok { return si }
       }
       si = si + 1
-    }
-  }
-  -1
-}
-
-// Find the value-expr index for declared field `fieldName` in the object literal at
-// `objIx`, or -1 if the literal does not set that field.
-function objFieldVal(objIx: i32, fieldName: string) {
-  const o = P.nodes[objIx]
-  if o is ObjLit {
-    const fields = o.objFields
-    let i = 0
-    while i < fields.length {
-      const f = P.nodes[fields[i]]
-      if f is FieldInit {
-        if f.fiName == fieldName { return f.fiValue }
-      }
-      i = i + 1
     }
   }
   -1
@@ -6123,16 +5027,6 @@ function emitUnionBox(body: i32[], objIx: i32, fnIx: i32) {
   if emitVariantStruct(body, objIx, vi, fnIx) < 0 { return -1 }
   fbStructNew(uBoxIdx)  // 0xfb 0x00 <union box heap-type index>
   0
-}
-
-// True when an `is` RHS names a LITERAL type (`"a"`, `0`, `1.5`) — the runtime
-// value-test arm of `emitIs` (the place's literal-union ANNOTATION softened to
-// the base scalar in `canonEmitTypeNames`; the `is` compares the value).
-function isLitVariantName(name: string) {
-  if name.length == 0 { return false }
-  let c = name[0]
-  if c == '"' { return true }
-  c >= '0' && c <= '9'
 }
 
 // Lower a type guard `recv is Variant` onto `body` as the box-tag compare (mirroring
@@ -6580,34 +5474,6 @@ function emitUnionCoerce(
 // union operand is restricted to a simple BINDING read — re-reading an ident is
 // effect-free and yields the same box. Anything effectful fails loudly.
 
-// True when the union-box operand at `exprIx` can be re-evaluated without side
-// effects (an ident read — a param, local, or module global).
-function unionEqOperandOk(exprIx: i32) {
-  const e = P.nodes[unwrapParen(exprIx)]
-  if e is Ident { return true }
-  false
-}
-
-// The value-eq opcode (i32 result) for a scalar union atom: `i32`/`boolean`
-// share `i32.eq`; i64/f64/f32 take their own. -1 for `string` (its eq loop) /
-// `null` (tag equality alone decides it — no payload).
-function atomEqOpcode(atom: string) {
-  let k = valueAtomKind(atom)
-  if k == 0 || k == 1 {
-    return 70 // 0x46 i32.eq
-  }
-  if k == 3 {
-    return 81 // 0x51 i64.eq
-  }
-  if k == 4 {
-    return 97 // 0x61 f64.eq
-  }
-  if k == 5 {
-    return 91 // 0x5b f32.eq
-  }
-  -1
-}
-
 // Unbox a union payload already pushed as `anyref` (`struct.get $box 1`) to the
 // atom's rep: a string payload IS the string array (cast only); a scalar rides
 // its per-rep value box (cast + field 0). Mirrors `emitValueUnionUnboxRead`.
@@ -6912,26 +5778,6 @@ function memNarrowVariantIndex(memIx: i32) {
   -1
 }
 
-// Lower a field read `recv.field` onto `body`: evaluate the receiver (must be a
-// struct), then `struct.get $0 <fieldidx>` (`0xfb 0x02 0x00 idx`).
-// The narrowing-stack KEY of a member path over a plain Ident root (`o.y`, or
-// nested `n.a.b`) — the same string `setNarrowFromCond` pushes for a union-FIELD
-// `is`/null guard. "" for any other receiver shape (no path narrowing).
-function memberPathKeyOf(memIx: i32) {
-  const m = P.nodes[memIx]
-  if m is Member {
-    let r = P.nodes[unwrapParen(m.memObj)]
-    if r is Ident { return r.identName + "." + m.memProp }
-    // A nested path (`n.a.b`) keys through its receiver's own path key — a
-    // non-Ident, non-Member link (a call, an index) stays un-narrowable.
-    if r is Member {
-      const inner = memberPathKeyOf(unwrapParen(m.memObj))
-      if inner != "" { return inner + "." + m.memProp }
-    }
-  }
-  ""
-}
-
 // The VALUE-union name of a union-typed struct FIELD read `o.y` (field code 16),
 // or "" when the member is not a union-box field.
 function memberUnionFieldName(memIx: i32, fnIx: i32) {
@@ -7107,145 +5953,6 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
 // those code points with the same escape grammar the lexer applies (`scanQuoted`):
 // `\n \t \r \\ \" \' \0 \b \f \v`, `\xXX`, `\uXXXX`, `\u{…}`. The result is the
 // emittable code-point vector that `emitStr` lowers to `array.new_fixed`.
-
-// The hex value of a hex-digit code point `c` (`0-9 a-f A-F`), or -1 if not hex.
-function hexDigit(c: i32) {
-  if c >= '0' && c <= '9' { return c - '0' }
-  if c >= 'a' && c <= 'f' { return c - 'a' + 10 }
-  if c >= 'A' && c <= 'F' { return c - 'A' + 10 }
-  -1
-}
-
-// Decode the raw string lexeme `raw` (with its surrounding quotes) into the i32 vector
-// of code points it denotes, resolving escapes consistently with the lexer's
-// `scanQuoted`. The first and last chars are the quote delimiters and are skipped. An
-// unknown escape keeps the char after the backslash verbatim (the lexer's lenient
-// policy). `\u{…}`/`\xXX`/`\uXXXX` with too few/invalid hex digits keep the marker
-// char (`u`/`x`) verbatim — again matching the lexer — so this never fails loudly.
-function decodeStr(raw: i32[]) {
-  let out: i32[] = []
-  let n = raw.length
-  // Strip the surrounding quote chars (raw always has at least the two delimiters).
-  let i = 1
-  const last = n - 1
-  while i < last {
-    let c = raw[i]
-    if c == '\\' && i + 1 < last {
-      const e = raw[i + 1]
-      if e == 'n' {
-        out.push(10)
-        i = i + 2
-      } else if e == 't' {
-        out.push(9)
-        i = i + 2
-      } else if e == 'r' {
-        out.push(13)
-        i = i + 2
-      } else if e == '\\' {
-        out.push(92)
-        i = i + 2
-      } else if e == '"' {
-        out.push(34)
-        i = i + 2
-      } else if e == '\'' {
-        out.push(39)
-        i = i + 2
-      } else if e == '0' {
-        out.push(0)
-        i = i + 2
-      } else if e == 'b' {
-        out.push(8)
-        i = i + 2
-      } else if e == 'f' {
-        out.push(12)
-        i = i + 2
-      } else if e == 'v' {
-        out.push(11)
-        i = i + 2
-      } else if e == 'x' {
-        // `\xXX` — exactly two hex digits, else keep `x` verbatim.
-        let h1 = -1
-        let h2 = -1
-        if i + 3 < last {
-          h1 = hexDigit(raw[i + 2])
-          h2 = hexDigit(raw[i + 3])
-        }
-        if h1 >= 0 && h2 >= 0 {
-          out.push(h1 * 16 + h2)
-          i = i + 4
-        } else {
-          out.push('x')
-          i = i + 2
-        }
-      } else if e == 'u' {
-        if i + 2 < last && raw[i + 2] == '{' {
-          // `\u{…}` — 1-6 hex digits up to `}`.
-          let cp = 0
-          let cnt = 0
-          let j = i + 3
-          while j < last && raw[j] != '}' && hexDigit(raw[j]) >= 0 {
-            cp = cp * 16 + hexDigit(raw[j])
-            cnt = cnt + 1
-            j = j + 1
-          }
-          if (
-            j < last &&
-            raw[j] == '}' &&
-            cnt >= 1 &&
-            cnt <= 6 &&
-            cp <= 1114111
-          ) {
-            out.push(cp)
-            i = j + 1
-          } else {
-            out.push('u')
-            i = i + 2
-          }
-        } else {
-          // `\uXXXX` — exactly four hex digits, else keep `u` verbatim.
-          let u1 = -1
-          let u2 = -1
-          let u3 = -1
-          let u4 = -1
-          if i + 5 < last {
-            u1 = hexDigit(raw[i + 2])
-            u2 = hexDigit(raw[i + 3])
-            u3 = hexDigit(raw[i + 4])
-            u4 = hexDigit(raw[i + 5])
-          }
-          if u1 >= 0 && u2 >= 0 && u3 >= 0 && u4 >= 0 {
-            out.push(u1 * 4096 + u2 * 256 + u3 * 16 + u4)
-            i = i + 6
-          } else {
-            out.push('u')
-            i = i + 2
-          }
-        }
-      } else {
-        // Unknown escape: keep the char after the backslash verbatim.
-        out.push(e)
-        i = i + 2
-      }
-    } else {
-      out.push(c)
-      i = i + 1
-    }
-  }
-  out
-}
-
-// Copy a `string`'s code points into an `i32[]` so `decodeStr` can index past the end
-// safely with arithmetic. `s[i]` already yields the i32 code point (strings ARE
-// code-point arrays in this representation), so this is a straight element copy.
-function strToCps(s: string) {
-  let out: i32[] = []
-  let i = 0
-  while i < s.length {
-    out.push(s[i])
-    i = i + 1
-  }
-  out
-}
 
 // Lower a string literal `"abc"` onto `body`: decode `strText` to its code-point
 // vector, push each code point as `i32.const`, then `array.new_fixed $aTypeIdx <count>`
@@ -11412,14 +10119,6 @@ function emitBlockValueAs(body: i32[], blockIx: i32, fnIx: i32, kind: i32) {
 // A `boolean | null` local is not yet a supported rep at all (a separate pre-existing
 // gap), so it is not handled here.
 
-// True if the expression at `ix` is an if-EXPRESSION (an `IfStmt` in value position).
-function exprIsIfStmt(ix: i32) {
-  if ix < 0 { return false }
-  const e = P.nodes[unwrapParen(ix)]
-  if e is IfStmt { return true }
-  false
-}
-
 // Emit ONE arm value (`valIx`) in the binding's nullable rep, then `local.set idx`.
 function emitNulArmToLocal(
   body: i32[],
@@ -11531,14 +10230,6 @@ function emitNullableIfBinding(
   emitFail("emitProgram: expected an if expression")
 }
 
-// Peel any nested parentheses, returning the innermost wrapped expression index.
-function unwrapParen(exprIx: i32) {
-  let cur = exprIx
-  const node = P.nodes[cur]
-  if node is Paren { return unwrapParen(node.parInner) }
-  cur
-}
-
 // Emit the expression at `exprIx` as an i64 value (Slice 2). If it already yields
 // i64 (`exprIsI64`) it is emitted as-is. Otherwise it is an i32 expression flowing
 // into an i64 op: a bare integer LITERAL is lowered directly as `i64.const` (set
@@ -11590,38 +10281,6 @@ function emitExprAsF64(body: i32[], exprIx: i32, fnIx: i32) {
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   fbF64ConvertI32S()
   0
-}
-
-// Lower a call expression at `callIx` onto `body`: evaluate every argument left-to-
-// right (each pushes one i32), then `call <funcIndex>`. The callee must be a bare
-// `Ident` naming a top-level function (no indirect/computed calls in this slice);
-// its index comes from the function-index map, so a recursive call resolves to the
-// enclosing function's own already-mapped index.
-//
-// Is the expression BOOLEAN-producing? Drives the `print` import choice
-// (`__print_bool__` renders true/false; everything else prints as i32). A bool
-// rides in an i32 at the wasm level, so this is a SYNTACTIC classification:
-// bool literals, comparisons, logical connectives, `!`, `is` guards, and calls
-// to a function that returns a boolean (annotated `boolean`/`bool`, or inferred —
-// `fRetBool` via `computeRetInference`). Identifiers are NOT classified (a
-// bool-typed local prints as 0/1 for now — annotation threading through the local
-// registry is a later slice).
-// True if the PARAMETER `name` of the function at `fnIx` is annotated `i64`.
-function paramIsI64(fnIx: i32, name: string) {
-  if fnIx < 0 { return false }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name { return retI64Flag(p.parType) == 1 }
-      }
-      i = i + 1
-    }
-  }
-  false
 }
 
 // True if the DECLARED LOCAL `name` is an i64 slot (kind 10 in the local registry).
@@ -11747,24 +10406,6 @@ function exprIsI64(exprIx: i32, fnIx: i32) {
   false
 }
 
-// True if the PARAMETER `name` of the function at `fnIx` is annotated `f32`. (Slice 5.)
-function paramIsF32(fnIx: i32, name: string) {
-  if fnIx < 0 { return false }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name { return retF32Flag(p.parType) == 1 }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
 // True if the DECLARED LOCAL `name` is an f32 slot (kind 13 in the local registry).
 function declaredF32(name: string) {
   let slot = declaredSlotOf(name)
@@ -11852,18 +10493,6 @@ function armValueIsKind(exprIx: i32, fnIx: i32, kind: i32) {
   false
 }
 
-// The tail VALUE expression of an if-expression arm (the parser wraps `then <expr>` as a
-// Block of one statement) — its single statement index, or -1 if the arm is not a
-// one-statement block. (`exprIs*` guard `< 0`, so -1 classifies as the i32 default.)
-function ifArmValueExpr(blockIx: i32) {
-  let b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    if stmts.length == 1 { return stmts[0] }
-  }
-  -1
-}
-
 // Emit the expression at `exprIx` as an f32 value (Slice 5). If it already yields f32
 // (`exprIsF32`) it is emitted as-is. A bare float LITERAL is lowered directly as
 // `f32.const` (re-encoded at single precision, never demoted from f64). Otherwise it is
@@ -11890,24 +10519,6 @@ function emitExprAsF32(body: i32[], exprIx: i32, fnIx: i32) {
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   fbF32ConvertI32S()
   0
-}
-
-// True if the PARAMETER `name` of the function at `fnIx` is annotated `f64`. (Slice 3.)
-function paramIsF64(fnIx: i32, name: string) {
-  if fnIx < 0 { return false }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name { return retF64Flag(p.parType) == 1 }
-      }
-      i = i + 1
-    }
-  }
-  false
 }
 
 // True if the DECLARED LOCAL `name` is an f64 slot (kind 11 in the local registry).
@@ -12746,22 +11357,6 @@ function orderedDirectArgs(callIx: i32, target: i32) {
     return orderArgsByParamNames(pNames, c.callArgs, c.callArgNames)
   }
   none
-}
-
-// True when a parameter-ordered argument list failed to bind: a hole (-1, an
-// unfilled parameter slot) or a length differing from the source argument
-// count (a leftover named/positional arg appended past the slots).
-function directArgsBad(args: i32[], callIx: i32) {
-  let c = P.nodes[callIx]
-  if c is Call {
-    if args.length != c.callArgs.length { return true }
-  }
-  let i = 0
-  while i < args.length {
-    if args[i] < 0 { return true }
-    i = i + 1
-  }
-  false
 }
 
 // Lower a function-VALUE call `f(args)` via `call_ref` over the closure fat-pointer.
@@ -14280,43 +12875,6 @@ function restoreNarrow(n: i32) {
   0
 }
 
-// True if EVERY control path through the block at `blockIx` returns: a direct
-// `return` statement, or an `if`/`else` (incl. an `else if` chain) whose arms
-// all return. Conservative — a `while` etc. never counts (mirrors the host's
-// flow analysis only as far as the post-guard narrowing below needs).
-function blockAlwaysReturns(blockIx: i32) {
-  let b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      let s = P.nodes[stmts[i]]
-      if s is RetStmt { return true }
-      if s is IfStmt {
-        if ifAlwaysReturns(stmts[i]) { return true }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
-// True if the `if` at `ifIx` returns on EVERY path: it has an else, the
-// then-block always returns, and the else (a block or a chained `else if`)
-// always returns too.
-function ifAlwaysReturns(ifIx: i32) {
-  let s = P.nodes[ifIx]
-  if s is IfStmt {
-    if s.ifElse < 0 { return false }
-    if !blockAlwaysReturns(s.ifThen) { return false }
-    const els = P.nodes[s.ifElse]
-    if els is Block { return blockAlwaysReturns(s.ifElse) }
-    if els is IfStmt { return ifAlwaysReturns(s.ifElse) }
-    return false
-  }
-  false
-}
-
 // After a GUARD `if` — one with NO else whose then-branch always returns — the
 // rest of the enclosing block only runs when the guard was FALSE, so it sees
 // the same complement narrowing an explicit else-arm would (the host's flow
@@ -14543,68 +13101,6 @@ function emitForInList(body: i32[], iterIx: i32, fnIx: i32) {
   emitExpr(body, iterIx, fnIx)
 }
 
-// Does this loop BODY contain a `continue` that binds to THIS loop (whose label
-// is `label`, "" when unlabelled)? Two binding forms (mirroring the host's
-// `hasEscapingBreak` shape, applied to continue):
-//   • an UNLABELLED `continue` binds to the innermost loop — so it counts only
-//     when not `nested` inside another loop (descends `if` arms, a conditional
-//     continue, but NOT nested loops: their `continue` is their own);
-//   • a LABELLED `continue l` binds to the loop labelled `l` from ANYWHERE in
-//     the body, including inside nested loops — so when this loop HAS a label
-//     the scan also descends nested loop bodies looking for it.
-// Drives the for-range/for-in INNER continue block: a body without a binding
-// `continue` keeps the original (golden-pinned) two-frame shape, and an
-// unlabelled loop scans exactly as before (the nested-loop descent is gated on
-// `label != ""`), so existing modules stay byte-identical.
-function blockHasContinueFor(blockIx: i32, label: string, nested: boolean) {
-  let b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      const st = P.nodes[stmts[i]]
-      if st is ContinueStmt {
-        if st.contLabel == "" {
-          if !nested { return true }
-        } else {
-          if label != "" && st.contLabel == label { return true }
-        }
-      } else if st is IfStmt {
-        if ifHasContinueFor(stmts[i], label, nested) { return true }
-      } else if st is WhileStmt {
-        if label != "" {
-          if blockHasContinueFor(st.whileBody, label, true) { return true }
-        }
-      } else if st is ForRange {
-        if label != "" {
-          if blockHasContinueFor(st.frBody, label, true) { return true }
-        }
-      } else if st is ForIn {
-        if label != "" {
-          if blockHasContinueFor(st.fiBody, label, true) { return true }
-        }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
-// The `if`-statement descent of `blockHasContinueFor`: both arms, including a
-// chained `else if`.
-function ifHasContinueFor(ifIx: i32, label: string, nested: boolean) {
-  const st = P.nodes[ifIx]
-  if st is IfStmt {
-    if blockHasContinueFor(st.ifThen, label, nested) { return true }
-    if st.ifElse >= 0 {
-      const els = P.nodes[st.ifElse]
-      if els is Block { return blockHasContinueFor(st.ifElse, label, nested) }
-      if els is IfStmt { return ifHasContinueFor(st.ifElse, label, nested) }
-    }
-  }
-  false
-}
-
 // Lower a single statement at `stmtIx` onto `body`, resolving identifiers/params
 // against function `fnIx`. Returns 0, or -1 (via `emitFail`) on an unsupported shape.
 //
@@ -14693,23 +13189,6 @@ function emitReturnValue(
   pendingListKind = 0
   pendingListSlot = 0
   0
-}
-
-// True if function `fnIx`'s return type CARRIES `null` — a niche (`boolean|null` /
-// `string|null`), a nullable struct ref (`S|null`) / list (`i32[]|null`), or a value-union
-// box whose atoms include `null` (`i32|null`, annotated or inferred). A structural
-// fall-through in such a function is sound — it yields that null (`emitNullForRet`),
-// not dead `unreachable` padding. A non-nullable value return with a reachable
-// fall-through was already rejected by the checker, so it never reaches here.
-// The inferred NICHE-nullable name for an un-annotated function `name` — "boolean|null"
-// or "string|null" (canonicalized), or "" otherwise. A niche nullable lowers via its
-// sentinel / `ref.null $array` rep (not the value box), so it is recognized by NAME from
-// the A20 inferred-return table rather than by a `fn.fnRet` annotation node.
-function inferNicheNullByName(name: string) {
-  const im = inferRetNameOf(name)
-  if im == "boolean|null" || im == "bool|null" { return "boolean|null" }
-  if im == "string|null" { return "string|null" }
-  ""
 }
 
 function fnRetNullBearing(fnIx: i32) {
@@ -16363,32 +14842,6 @@ function emitFuncCode(out: i32[], fnIx: i32) {
   emitFail("emitProgram: not a function declaration")
 }
 
-// ── nullable struct refs (`S | null`) ─────────────────────────────────────────
-// "S|null" / "null|S" (exactly TWO `|` parts, one of them `null`) → the non-null
-// part's name, or "" when the name is not a two-part nullable.
-function nullablePartOf(name: string) {
-  // Depth-aware: a `|` INSIDE an inline shape (`{y:string|i32}|null`) is part of
-  // the FIELD's union, not the nullable wrapper — only a depth-0 bar splits.
-  let bar = -1
-  let depth = 0
-  let i = 0
-  while i < name.length {
-    const ch = name[i]
-    if ch == '{' || ch == '[' { depth = depth + 1 }
-    if ch == '}' || ch == ']' { depth = depth - 1 }
-    if ch == '|' && depth == 0 {
-      if bar < 0 { bar = i }
-    }
-    i = i + 1
-  }
-  if bar < 0 { return "" }
-  const a = name.slice(0, bar)
-  let b = name.slice(bar + 1, name.length)
-  if a == "null" { return b }
-  if b == "null" { return a }
-  ""
-}
-
 // The struct table index a type NAME names: a declared struct name directly, or an
 // INLINE object-shape name (`{x:i32,y:i32}`) matched by field-name SET against the
 // interned shapes (the anonymous literals interned the same sets). -1 if neither.
@@ -16437,28 +14890,6 @@ function structIndexOfTypeName(name: string) {
     }
   }
   -1
-}
-
-// `1` if the type-annotation node at `tyIx` is a NULLABLE STRUCT (`S | null` with a
-// resolvable struct part), else `0`. Feeds the `kind == 9` (nullable struct ref,
-// `0x63`) family.
-// True if the annotation node at `tyIx` is `boolean|null` — the NICHE scalar
-// nullable (host: `nullSentinel`): an i32 holding 0/1, with the spare value 2
-// encoding `null` (no box). `== null` is a sentinel compare; narrowing to
-// non-null is purely type-level (the i32 is already 0/1 in the branch).
-function tyIsNulBool(tyIx: i32) {
-  if tyIx < 0 { return false }
-  const ty = P.nodes[tyIx]
-  if ty is TypeRef { return nullablePartOf(ty.tyName) == "boolean" }
-  false
-}
-
-// True if the `LetDecl` at `letIx` is annotated `boolean|null`.
-function letIsNulBoolAnn(letIx: i32) {
-  if letIx < 0 { return false }
-  let d = P.nodes[letIx]
-  if d is LetDecl { return tyIsNulBool(d.letType) }
-  false
 }
 
 // True if the expression is a NAME (param / local / module global) annotated
@@ -16538,14 +14969,6 @@ function letNulBool(letIx: i32, fnIx: i32) {
   false
 }
 
-// True if the type-annotation node at `tyIx` is `boolean`/`bool`.
-function tyIsBool(tyIx: i32) {
-  if tyIx < 0 { return false }
-  const ty = P.nodes[tyIx]
-  if ty is TypeRef { return ty.tyName == "boolean" || ty.tyName == "bool" }
-  false
-}
-
 // True if `name` resolves (param / local / module global) to a BOOLEAN binding:
 // either a `: boolean`/`: bool` annotation, or an un-annotated `const`/`let` whose
 // initializer is itself boolean. A boolean local registers as kind 0 (== i32), so
@@ -16596,63 +15019,6 @@ function retNulRefFlag(tyIx: i32) {
       if base != "" {
         if structIndexOfTypeName(base) >= 0 { return 1 }
       }
-    }
-  }
-  0
-}
-
-// True if `name` is the nullable i32-list type `i32[] | null` (parser-joined as
-// `i32[]|null`, depth-aware either side of the bar). Only the i32-element list is
-// in scope; other nullable list kinds (`f64[]|null`, `S[]|null`, `string[]|null`)
-// keep failing loudly.
-function nameIsNulI32List(name: string) { nullablePartOf(name) == "i32[]" }
-
-// A `string | null` field type name — the niche FIELD (code 20): a `(ref null $aTypeIdx)`
-// storage slot (the array backing a string), the field analogue of the kind-16 local.
-function nameIsNulString(name: string) { nullablePartOf(name) == "string" }
-
-// A `boolean | null` field type name — the niche FIELD (code 21): an i32 storage slot
-// holding 0/1 with the spare value 2 = `null` (the field analogue of the sentinel local).
-function nameIsNulBool(name: string) {
-  const b = nullablePartOf(name)
-  b == "boolean" || b == "bool"
-}
-
-// A NULLABLE FUNCTION-VALUE type name — `((i32) => i32) | null` (kind 19): a
-// `(ref null $cloStruct)` cell, the closure analogue of the nullable struct (kind 9). The
-// non-null part must be a FUNCTION type, and the WHOLE name must NOT itself be a top-level
-// function type — `((i32) => i32) | null` (parens preserved by `canonEmitName`, arrow
-// nested at depth 1) is a nullable function, whereas `(i32) => i32 | null` (top-level
-// arrow) is a function RETURNING a nullable (handled by `annRetKind`, not here).
-function nameIsNulClosure(name: string) {
-  if annArrowAt(name) >= 0 { return false }
-  const b = nullablePartOf(name)
-  if b == "" { return false }
-  strContains(b, "=>")
-}
-
-// `1` if the type-annotation node at `tyIx` is a nullable function `(fn) | null`, else `0`
-// — the closure dual of `retNulRefFlag`.
-function nulCloFlag(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if nameIsNulClosure(ty.tyName) { return 1 }
-    }
-  }
-  0
-}
-
-// `1` if the type-annotation node at `tyIx` is `i32[] | null`, else `0` — the
-// nullable-LIST dual of `retNulRefFlag`. Feeds vt kind 15 (a NULLABLE `(ref null
-// $lTypeIdx)` slot: narrowing is type-level only, the slot stays nullable and
-// each list-op read site recovers non-null — mirroring the host's lowering, see
-// tests/cases/types/nullable-list-index.vl's header).
-function retNulListFlag(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if nameIsNulI32List(ty.tyName) { return 1 }
     }
   }
   0
@@ -16749,20 +15115,6 @@ function tyAnnRefListSlot(tyIx: i32) {
   0
 }
 
-// `1` if the type-annotation node at `tyIx` is the i32 array type (`i32[]`), else `0`.
-// The functype/local valtype layer multiplexes the struct/array/i32 cases through one
-// `kind` code, so this flat flag feeds the `kind == 2` (array) branch of `pushVT`. A REF
-// array (`S[]`/`N[]`) is NOT this — it feeds `kind == 5` via `retRefArrFlag`.
-function retArrFlag(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if nameIsI32Array(ty.tyName) { return 1 }
-    }
-  }
-  0
-}
-
 // `1` if the type-annotation node at `tyIx` is a REF array (`S[]`/`N[]`), else `0`.
 // Feeds the `kind == 5` (ref list) branch of `pushVT` and the `fRetRArr` table.
 function retRefArrFlag(tyIx: i32) {
@@ -16785,64 +15137,6 @@ function retRefArrElemName(tyIx: i32) {
     }
   }
   ""
-}
-
-// `1` if the type-annotation node at `tyIx` is `string`, else `0`. A string is
-// CURRENTLY the SAME `(array (mut i32))` of code points an array uses, so it feeds the
-// `kind == 3` branch of `pushVT` (which encodes the identical array ref valtype).
-function retStrFlag(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if nameIsString(ty.tyName) { return 1 }
-    }
-  }
-  0
-}
-
-// `1` if the type-annotation node at `tyIx` is `boolean`/`bool`, else `0`. A bool
-// rides in an i32 at the wasm level — this feeds ONLY the `print` import choice
-// (`fRetBool`), never a valtype.
-function retBoolFlag(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if ty.tyName == "boolean" || ty.tyName == "bool" { return 1 }
-    }
-  }
-  0
-}
-
-// `1` if the type-annotation node at `tyIx` is a `string | null` — the NULLABLE string
-// ref `(ref null $aTypeIdx)`, kind 16. A `string` is the raw i32 array `(ref $aTypeIdx)`;
-// the nullable form is the same backing made nullable (`null` is `ref.null`, `!= null`
-// is `ref.is_null`). Checked in `vtKindOfType` BEFORE the bare `string` (kind 3).
-function retNulStringFlag(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if nullablePartOf(ty.tyName) == "string" { return 1 }
-    }
-  }
-  0
-}
-
-// Combine the struct/array/string flags for a type-annotation node at `tyIx` into the
-// single `pushVT` `kind` code: `1` struct, `2` array, `3` string, `0` i32. (Struct
-// wins if a name were somehow both — it cannot be, the lexemes are disjoint.) String
-// is a distinct code from array purely for typedness clarity; `pushVT` emits the SAME
-// array ref valtype for both, since a string IS the i32-array type here.
-// `1` if the type-annotation node at `tyIx` is an ARRAY OF FUNCTIONS (`((i32) => i32)[]`),
-// else `0` — the closure-element ref-list guard `vtKindOfType` checks before the kind-14
-// function-type test.
-function nameIsClosureArrayTy(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if nameIsClosureArray(ty.tyName) { return 1 }
-    }
-  }
-  0
 }
 
 function vtKindOfType(tyIx: i32) {
@@ -16877,60 +15171,6 @@ function vtKindOfType(tyIx: i32) {
   0
 }
 
-// `1` if the type-annotation node at `tyIx` is an `f64[]` (the f64-element list), else
-// `0`. Feeds the `kind == 12` (f64-list wrapper) branch of `fbValtype`/`pushVT`. Checked
-// BEFORE the `retRefArrFlag`/`retArrFlag` cases since `f64[]` is an `[]` array name but
-// is neither a struct/union ref list nor the i32 list. (Slice 4.)
-function retF64ArrFlag(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if nameIsF64Array(ty.tyName) { return 1 }
-    }
-  }
-  0
-}
-
-// `1` if the type-annotation node at `tyIx` is `i64`, else `0`. A scalar i64
-// param/result/local/global classifies as kind 10 (valtype `0x7e`); checked LAST
-// (after every ref/array case) since `i64` is a plain TypeRef name like `i32`.
-function retI64Flag(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if ty.tyName == "i64" { return 1 }
-    }
-  }
-  0
-}
-
-// `1` if the type-annotation node at `tyIx` is `f64`, else `0`. A scalar f64
-// param/result/local/global classifies as kind 11 (valtype `0x7c`); checked LAST
-// (alongside `retI64Flag`) since `f64` is a plain TypeRef name like `i32`. (Slice 3.)
-function retF64Flag(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if ty.tyName == "f64" { return 1 }
-    }
-  }
-  0
-}
-
-// `1` if the type-annotation node at `tyIx` is `f32`, else `0`. A scalar f32
-// param/result/local/global classifies as kind 13 (valtype `0x7d`); checked LAST
-// (alongside `retI64Flag`/`retF64Flag`) since `f32` is a plain TypeRef name like `i32`.
-// (Slice 5.)
-function retF32Flag(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if ty.tyName == "f32" { return 1 }
-    }
-  }
-  0
-}
-
 // `1` if the type-annotation node at `tyIx` names a union VARIANT struct (e.g. `TyObj`
 // of `Ty`), else `0`. Feeds the `kind == 8` (concrete variant struct ref) branch of
 // `pushVT`. A variant-struct param/result is the unboxed variant ref directly — gap #2.
@@ -16939,20 +15179,6 @@ function retVariantFlag(tyIx: i32) {
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
       if variantIndexOf(ty.tyName) >= 0 { return 1 }
-    }
-  }
-  0
-}
-
-// `1` if the type-annotation node at `tyIx` is a `string[]` (string-ref list), else `0`.
-// Feeds the `kind == 7` (string-list wrapper) branch of `pushVT`. Checked BEFORE the
-// `retRefArrFlag`/`retArrFlag` cases since `string[]` is an `[]` array name but is NOT a
-// struct/union ref list nor the i32 list — it is the dedicated string-ref list.
-function retStrArrFlag(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef {
-      if nameIsStringArray(ty.tyName) { return 1 }
     }
   }
   0
@@ -17063,77 +15289,10 @@ function globalKind(initIx: i32) {
   0
 }
 
-// Whether the initializer expression at `exprIx` is a valid WasmGC *constant
-// expression* — the forms `emitProgram` already lowers inline in the global section
-// (`i32.const`, `struct.new`, `array.new_fixed`, the string array). Const forms:
-// `NumLit` / `CharLit` / `BoolLit` (an `i32.const`), `StrLit` (a constant `array.new_fixed`
-// over the code points), an `ArrayLit` whose elements are ALL const, an `ObjLit` whose
-// field values are ALL const, and a `Paren` wrapping a const. EVERYTHING ELSE is
-// non-const: an `Ident` (a `global.get` of another global), a `Member` / `Index` (a
-// `struct.get` / `array.get` — the `curBuf = W.bytes` shape), a `Call`, a `BinExpr` /
-// `Unary` (computed), an `IsExpr`. CONSERVATIVE by construction: an unrecognized node
-// falls through to the non-const `false`, so a form we have not proven const-safe is
-// initialized via the start function rather than emitted as an invalid constexpr.
-function isConstInit(exprIx: i32) {
-  if exprIx < 0 { return false }
-  const e = P.nodes[exprIx]
-  if e is NumLit { return true }
-  if e is CharLit { return true }
-  if e is BoolLit { return true }
-  if e is StrLit { return true }
-  if e is Paren { return isConstInit(e.parInner) }
-  if e is ArrayLit {
-    let i = 0
-    while i < e.arrElems.length {
-      if !isConstInit(e.arrElems[i]) { return false }
-      i = i + 1
-    }
-    return true
-  }
-  if e is ObjLit {
-    let i = 0
-    while i < e.objFields.length {
-      const f = P.nodes[e.objFields[i]]
-      if f is FieldInit {
-        if !isConstInit(f.fiValue) { return false }
-      } else {
-        return false
-      }
-      i = i + 1
-    }
-    return true
-  }
-  false
-}
-
-// Whether the module global declared by the `LetDecl` at `letIx` has a non-const
-// initializer (so its cell is zero-initialized and set by the synthetic start
-// function). False for a non-`LetDecl` or a missing init.
-function globalIsNonConst(letIx: i32) {
-  if letIx < 0 { return false }
-  let d = P.nodes[letIx]
-  if d is LetDecl {
-    if d.letInit < 0 { return false }
-    return !isConstInit(d.letInit)
-  }
-  false
-}
-
 // Whether the module global `name` has a non-const initializer — used at READ sites
 // (`global.get`) to decide whether the (nullable) cell needs a `ref.as_non_null`.
 function globalNameIsNonConst(name: string) {
   globalIsNonConst(globalLetOf(name))
-}
-
-// True if the module global `LetDecl` at `letIx` carries a TYPE ANNOTATION (`let g: T
-// = …`). When it does, the cell's wasm type must come from that annotation — exactly as
-// a local/param resolves its valtype — so a global agrees with a same-typed local/param/
-// field on the struct table index (otherwise a `global.get g` of an init-inferred struct
-// type mismatches a `local.set`/call of the annotation's struct type).
-function globalHasTypeAnn(letIx: i32) {
-  let d = P.nodes[letIx]
-  if d is LetDecl { return d.letType >= 0 }
-  false
 }
 
 // The `fbValtype` kind for a module global's CELL. When the binding has a TYPE
@@ -19183,51 +17342,6 @@ function emitModule(stmts: i32[]) {
 // True if the type-name `name` refers to one of the declared struct types.
 function isSName(name: string) { structIndexByName(name) >= 0 }
 
-// True if the type-name `name` is an ARRAY type — its lexeme ends in `[]` (the
-// suffix `parseType` appends for every `T[]` annotation). Only `i32[]` is emittable
-// in this slice; a non-i32 element array is rejected by `checkArrName`.
-function nameIsArray(name: string) {
-  let n = name.length
-  if n < 2 { return false }
-  if name[n - 2] != '[' { return false }
-  if name[n - 1] != ']' { return false }
-  true
-}
-
-// True if the array type-name `name` is `i32[]` (the value-element list whose backing
-// is the raw `(array (mut i32))`). A `T[]`/`N[]` (struct/union element) is NOT this.
-function nameIsI32Array(name: string) { name == "i32[]" }
-
-// True if the type-name `name` is a string-keyed MAP `{[string]: i32}` (G8) — the
-// synthetic name `parseType` builds for an index-signature type, which starts with
-// `"{["`. Only `{[string]: i32}` is emittable in this slice (the self-host checker's
-// scope-chain element); any other index signature still parses to this shape but the
-// map lowering assumes string keys + i32 values. A trailing `[]` (a list-of-maps
-// `{[string]:i32}[]`) is NOT a bare map — that is handled by the ref-array path.
-function nameIsMap(name: string) {
-  if name.length < 2 { return false }
-  // A trailing `[]` makes it a LIST of maps, not a bare map.
-  if name[name.length - 1] == ']' {
-    if name[name.length - 2] == '[' { return false }
-  }
-  if name[0] != '{' { return false }
-  if name[1] != '[' { return false }
-  true
-}
-
-// True if the array type-name `name` is a string-keyed-MAP list `{[string]:i32}[]` —
-// a ref list whose ELEMENT is the map struct (`mStructIdx`). It is a `nameIsMap` name
-// with a trailing `[]`. The scope chain (`typecheck.vl`'s `scopes: {[string]:i32}[]`)
-// is exactly this. Routed through the ref-list machinery as element-kind `3`.
-function nameIsMapArray(name: string) {
-  let n = name.length
-  if n < 2 { return false }
-  if name[n - 2] != '[' { return false }
-  if name[n - 1] != ']' { return false }
-  // The bare element (without the trailing `[]`) must be a map name.
-  nameIsMap(name.slice(0, n - 2))
-}
-
 // True if the array type-name `name` is a REF-element list — `S[]` over a declared
 // struct, `N[]` over the declared union alias (the box-ref element), or `{[string]:i32}[]`
 // (a map-struct element). Either lowers to the `{ backing: (ref $raTypeIdx), len, cap }`
@@ -19259,39 +17373,6 @@ function nameIsRefArray(name: string) {
   false
 }
 
-// True if `name` is an ARRAY OF FUNCTIONS — `((i32) => i32)[]`: a trailing `[]` whose
-// element is a fully-parenthesized FUNCTION type, the arrow NESTED (depth > 0). A
-// TOP-LEVEL arrow (`(i32) => i32[]`) is a function RETURNING a list, NOT an array of
-// functions — excluded via `annArrowAt` (the same disambiguation as the list-return
-// name guard). The element heap type is the shared closure fat-pointer struct
-// (`cloStructIdx`); the ref-list element kind is 5.
-function nameIsClosureArray(name: string) {
-  let n = name.length
-  if n < 4 { return false }
-  if name[n - 2] != '[' { return false }
-  if name[n - 1] != ']' { return false }
-  if annArrowAt(name) >= 0 { return false }
-  const elem = name.slice(0, n - 2)
-  if elem.length < 1 { return false }
-  if elem[0] != '(' { return false }
-  strContains(elem, "=>")
-}
-
-// The VALUE-union element name of a parenthesized union-array annotation:
-// `(string|i32)[]` → `string|i32` (`canonEmitName` keeps a union element's
-// grouping parens), or "" when `name` is not a value-union array name.
-// Registration-independent (classifies from the atom set, not `unNames`).
-function parenUnionArrElemName(name: string) {
-  if name.length < 5 { return "" }
-  if name[name.length - 2] != '[' { return "" }
-  if name[name.length - 1] != ']' { return "" }
-  if name[0] != '(' { return "" }
-  if name[name.length - 3] != ')' { return "" }
-  const inner = name.slice(1, name.length - 3)
-  if isValueUnionName(inner) { return inner }
-  ""
-}
-
 // The ref-element kind for an array type-name (assumes `nameIsRefArray(name)`):
 // `1` = a struct element, `2` = a union-box element (`uBoxIdx`), `3` = a map-struct
 // element (`mStructIdx`, the scope-chain `{[string]:i32}[]`).
@@ -19309,24 +17390,6 @@ function refArrElemKind(name: string) {
   }
   1
 }
-
-// True if the type-name `name` is exactly `string`. A VL string is CURRENTLY an
-// `array i32` of code points (`docs/strings-design.md`), so it shares the array heap
-// type — hence string use also sets `aUsed` and string valtypes reuse the array ref.
-// (`string[]` is NOT this — it ends in `[]`, so `nameIsArray` catches it first and
-// `checkArrName` rejects it as a non-i32 element array.)
-function nameIsString(name: string) { name == "string" }
-
-// True if the type-name `name` is exactly `string[]` — a growable list whose elements
-// are string refs. It reuses the map keys list types (the `{backing,len,cap}` wrapper
-// over a `(ref null $aTypeIdx)` string backing); field code `6`.
-function nameIsStringArray(name: string) { name == "string[]" }
-
-// True if the type-name `name` is exactly `f64[]` — a growable list whose elements are
-// scalar f64 (Slice 4). Its backing is `(array (mut f64))` (`fa64TypeIdx`); its wrapper
-// is the `{backing,len,cap}` triple over that f64 backing (`fl64TypeIdx`). Distinct from
-// `i32[]` so element reads/writes use the f64 element store.
-function nameIsF64Array(name: string) { name == "f64[]" }
 
 // The per-field wasm-type code for a struct / union-variant field whose type node is
 // `tyIx` (a `TypeRef`). Mirrors the inline classifier `collectS`/`collectVariantFields`
@@ -19879,32 +17942,6 @@ function rlSlotByName(name: string) {
   -1
 }
 
-// True if the node at `ix` is a struct `type` declaration (a single-level narrowing
-// helper, so callers avoid an inline `is TypeDecl` on the wide `Node` union).
-function nodeIsTypeDecl(ix: i32) {
-  let s = P.nodes[ix]
-  if s is TypeDecl { return true }
-  false
-}
-
-// True if `name` is the name of a FuncDecl ANYWHERE in the arena (top-level or a
-// nested/lifted function). Used at `collectS` time — BEFORE `buildFnMap` populates
-// `fnNames`, so `fnIndexOf` is not yet usable — to classify an anon-struct field
-// whose value is a bare function name (`{ go: add }`). A direct arena scan, so it
-// sees a function declared after the literal too.
-function nameNamesFunction(name: string) {
-  if name == "" { return false }
-  let i = 0
-  while i < P.nodes.length {
-    let n = P.nodes[i]
-    if n is FuncDecl {
-      if n.fnName == name { return true }
-    }
-    i = i + 1
-  }
-  false
-}
-
 // The struct field-type CODE for an ANONYMOUS-shape field, from its literal VALUE
 // (an anonymous literal has no `type` annotation to read): a number/boolean is i32
 // (`0`), a string literal is a string ref (`3`), a function VALUE is a closure
@@ -20140,22 +18177,6 @@ function internInlineShape(nm: string) {
   sNames.length - 1
 }
 
-// The inline-shape synthetic name of a STRUCT-ALIAS union decl — a `UnionDecl`
-// with exactly ONE variant that is an inline object shape (`{a:i32,b:i32}`,
-// not a map `{[…]}`) — or "". The shape a canonicalized object intersection
-// (`type AB = {a} & {b}` → the merged single variant) leaves behind: it is a
-// plain named STRUCT at runtime, so `collectS` interns it and `collectU`
-// skips it.
-function unionStructAliasShape(variants: string[]) {
-  if variants.length == 1 {
-    let v = variants[0]
-    if v.length >= 2 && v[0] == '{' && v[1] != '[' && v[v.length - 1] == '}' {
-      return v
-    }
-  }
-  ""
-}
-
 // Intern the inline shape name `nm` (`{a:i32,b:i32}`) as the NAMED struct
 // `key` — the same field parsing as `collectAnnShapes`, but keyed under the
 // alias name so `structIndexByName(key)` resolves params/locals/literals.
@@ -20361,42 +18382,6 @@ function gaeIndexOf(name: string) {
   -1
 }
 
-// The position of the first `<` in `name`, or -1 — a positive result with a
-// trailing `>` marks a generic declaration/application name.
-function gaeLtAt(name: string) {
-  let i = 0
-  while i < name.length {
-    if name[i] == '<' { return i }
-    i = i + 1
-  }
-  -1
-}
-
-// Split a type-argument list at its TOP-LEVEL commas (`<>`/`{}`/`[]`/`()`
-// nest); empty parts drop (a tolerated trailing comma).
-function gaeSplitArgs(s: string, out: string[]) {
-  let depth = 0
-  let start = 0
-  let i = 0
-  while i <= s.length {
-    const atEnd = i == s.length
-    let brk = atEnd
-    if !atEnd {
-      let c = s[i]
-      if c == '<' || c == '{' || c == '[' || c == '(' { depth = depth + 1 }
-      if c == '>' || c == '}' || c == ']' || c == ')' { depth = depth - 1 }
-      if c == ',' && depth == 0 { brk = true }
-    }
-    if brk {
-      const part = s.slice(start, i)
-      if part.length > 0 { out.push(part) }
-      start = i + 1
-    }
-    i = i + 1
-  }
-  0
-}
-
 // Record every generic-alias declaration into the registry.
 function gaeCollectDecls(stmts: i32[]) {
   gaeBases = []
@@ -20437,18 +18422,6 @@ function gaeCollectDecls(stmts: i32[]) {
     i = i + 1
   }
   0
-}
-
-// Substitute a declared param name (or its `T[]` array form) in a field's
-// type name with the application's argument name.
-function gaeApplyFieldTy(tn: string, pnames: string[], args: string[]) {
-  let i = 0
-  while i < pnames.length {
-    if tn == pnames[i] { return args[i] }
-    if tn == pnames[i] + "[]" { return args[i] + "[]" }
-    i = i + 1
-  }
-  tn
 }
 
 // Intern the application `name` ("Box<i32>") as a struct shape, once. A field
@@ -20771,23 +18744,6 @@ function variantSig(vi: i32) {
   out
 }
 
-// Lexicographic `a < b` over two strings by code point (VL has no `<` on `string`).
-// Compares char-by-char: at the first differing position the smaller code point wins;
-// if one is a prefix of the other, the shorter is smaller. Equal strings are NOT `<`.
-function strLess(a: string, b: string) {
-  let i = 0
-  const na = a.length
-  const nb = b.length
-  while i < na && i < nb {
-    const ca = a[i]
-    const cb = b[i]
-    if ca < cb { return true }
-    if ca > cb { return false }
-    i = i + 1
-  }
-  na < nb
-}
-
 // Assign each variant its GLOBAL tag = its rank when the variants are ordered by
 // structural signature (mirroring `toWasm.ts`'s sorted `variantKey` tag assignment).
 // `uTags[i]` is variant i's tag: the number of variants whose sig sorts strictly
@@ -20831,50 +18787,6 @@ function vbHeapIdxOfAtom(atom: string) {
   -1
 }
 
-// True if union `name` has at least one NON-null value-atom member (`i32`/`f64`/
-// `boolean`/`string`/…) — true for a pure value union AND a MIXED struct+scalar union,
-// false for an all-struct union. Gates the scalar value-boxing in `emitUnionCoerce`.
-function unionHasValueAtom(name: string) {
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
-  let i = 0
-  while i < atoms.length {
-    const k = valueAtomKind(atoms[i])
-    if k >= 0 && k != 6 { return true }
-    i = i + 1
-  }
-  false
-}
-
-// True if the value union `name` contains the member atom `atom`.
-function unionHasAtom(name: string, atom: string) {
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
-  let i = 0
-  while i < atoms.length {
-    if atoms[i] == atom { return true }
-    i = i + 1
-  }
-  false
-}
-
-// The pipe-joined complement of `set` (a union name / narrowed sub-set string)
-// with the atom `removed` taken out — the ELSE-branch narrowing of `is removed`.
-function removeAtomFrom(set: string, removed: string) {
-  const atoms: string[] = []
-  splitUnionAtoms(set, atoms)
-  let out = ""
-  let i = 0
-  while i < atoms.length {
-    if atoms[i] != removed {
-      if out != "" { out = out + "|" }
-      out = out + atoms[i]
-    }
-    i = i + 1
-  }
-  out
-}
-
 // Register the VALUE union `name` in the per-union table (no variant structs —
 // its atoms tag via `scalarTagOf`, its payloads ride the shared value boxes).
 // Idempotent; a non-value-union name is a no-op. Callable from any collection
@@ -20907,62 +18819,6 @@ function markValueUnionAtoms(name: string) {
     i = i + 1
   }
   0
-}
-
-// True if `name` is declared by a top-level struct `type X = {…}` (`TypeDecl`). Used
-// during `collectU` — BEFORE `collectS` runs — so it scans the arena directly rather
-// than reading the not-yet-populated `sNames` table.
-function isDeclaredStructName(stmts: i32[], name: string) {
-  let i = 0
-  while i < stmts.length {
-    let s = P.nodes[stmts[i]]
-    if s is TypeDecl {
-      if s.tdName == name { return true }
-    }
-    i = i + 1
-  }
-  false
-}
-
-// True if the atom `a` is a STRUCT variant — a declared `type X = {…}`, or an INLINE
-// object shape `{x:i32}` (its fields parse from its own text; a map shape `{[…]}` is
-// not). The per-member test shared by `isVariantBoxUnion` and the registration loop.
-function isStructAtom(stmts: i32[], a: string) {
-  if isDeclaredStructName(stmts, a) { return true }
-  if a.length >= 2 {
-    if a[0] == '{' && a[1] != '[' && a[a.length - 1] == '}' { return true }
-  }
-  false
-}
-
-// True if `name` is a VARIANT-BOX union this emitter interns: two+ non-null members,
-// every member a struct variant OR a value-atom (`i32`/`string`/…), with AT LEAST ONE
-// struct. Covers the all-struct union (`A | B`, `A | B | null`) AND the MIXED struct +
-// scalar union (`A | i32`, `A | B | i32 | f64 | boolean | string | null`) — both ride
-// the `uBoxIdx` `{tag, value}` box, structs as variant-struct payloads, scalars as
-// value-box payloads, tag-discriminated. A PURE value union (`i32 | string`) has no
-// struct, so it is handled earlier by `isValueUnionName`; a single struct + `null`
-// (`A | null`) has one non-null member, so it stays the kind-9 niche nullable ref.
-function isVariantBoxUnion(stmts: i32[], name: string) {
-  if unionMemberCount(name) < 2 { return false }
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
-  let structAtoms = 0
-  let nonNull = 0
-  let j = 0
-  while j < atoms.length {
-    if atoms[j] != "null" {
-      nonNull = nonNull + 1
-      if isStructAtom(stmts, atoms[j]) {
-        structAtoms = structAtoms + 1
-      } else if valueAtomKind(atoms[j]) < 0 {
-        // Neither a struct variant nor a value-atom — not a union shape we box.
-        return false
-      }
-    }
-    j = j + 1
-  }
-  structAtoms >= 1 && nonNull >= 2
 }
 
 // Register the inline union synthetic name `name` (e.g. `"A|B"`) as a union alias in
@@ -21019,18 +18875,6 @@ function registerInlineUnion(stmts: i32[], name: string) {
   0
 }
 
-// The synthetic type-name string of the annotation node at `tyIx` (a `TypeRef`), or
-// "" if `tyIx` is unset / not a type name. Lets the inline-union scan read a param /
-// return annotation's name without a `P.nodes[...] is TypeRef` round-trip at the call
-// site (this slice cannot narrow there).
-function tyNameOf(tyIx: i32) {
-  if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
-    if ty is TypeRef { return ty.tyName }
-  }
-  ""
-}
-
 // ── usage-driven `let x = null` nullable-hole inference (A-infer-null) ───────
 // The host's hole-bearing `null`: an UN-ANNOTATED `let x = null` is NOT pinned to
 // the exact `null` type — a later assignment `x = e` fills the hole's `T`, so `x`
@@ -21053,84 +18897,6 @@ function nliNameOf(letIx: i32) {
   ""
 }
 
-// The value-union ATOM name an assignment RHS fills a null hole with ("i32",
-// "boolean", "string", "f64", "i64"), or "" when the RHS is not classifiable at
-// collection time (an ident, a member read, …). A function-call RHS reads the
-// callee's declared return annotation straight from the arena (the fn tables are
-// not populated yet when this scan runs).
-function nliAtomOfExpr(exprIx: i32) {
-  if exprIx < 0 { return "" }
-  const e = P.nodes[unwrapParen(exprIx)]
-  if e is NumLit {
-    if numTextIsFloat(e.numText) { return "f64" }
-    if !numLexFitsI32(e.numText) { return "i64" }
-    return "i32"
-  }
-  if e is StrLit { return "string" }
-  if e is BoolLit { return "boolean" }
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      const cn = callee.identName
-      let ti = 0
-      while ti < P.nodes.length {
-        const f = P.nodes[ti]
-        if f is FuncDecl {
-          if f.fnName == cn {
-            const rn = tyNameOf(f.fnRet)
-            if valueAtomKind(rn) >= 0 && rn != "null" { return rn }
-            return ""
-          }
-        }
-        ti = ti + 1
-      }
-    }
-  }
-  ""
-}
-
-// Scan the statement list `walk` from position `from` for the FIRST classifiable
-// assignment `name = e`, descending into branch/loop blocks.
-function nliScanStmts(walk: i32[], from: i32, name: string) {
-  let i = from
-  while i < walk.length {
-    const a = nliScanStmt(walk[i], name)
-    if a != "" { return a }
-    i = i + 1
-  }
-  ""
-}
-
-// Scan one statement (an `else if` chains a lone IfStmt through here too).
-function nliScanStmt(stmtIx: i32, name: string) {
-  if stmtIx < 0 { return "" }
-  let s = P.nodes[stmtIx]
-  if s is BinExpr {
-    if s.binOp == "=" {
-      const tgt = P.nodes[s.binLeft]
-      if tgt is Ident {
-        if tgt.identName == name { return nliAtomOfExpr(s.binRight) }
-      }
-    }
-    return ""
-  }
-  if s is IfStmt {
-    const a = nliScanBlock(s.ifThen, name)
-    if a != "" { return a }
-    return nliScanStmt(s.ifElse, name)
-  }
-  if s is Block { return nliScanStmts(s.blkStmts, 0, name) }
-  if s is WhileStmt { return nliScanBlock(s.whileBody, name) }
-  if s is ForRange { return nliScanBlock(s.frBody, name) }
-  if s is ForIn { return nliScanBlock(s.fiBody, name) }
-  ""
-}
-
-function nliScanBlock(blockIx: i32, name: string) {
-  if blockIx < 0 { return "" }
-  nliScanStmt(blockIx, name)
-}
-
 // Infer + register the null hole of the un-annotated `let x = null` at
 // `walk[i]`, scanning the REST of `walk` for the filling assignment.
 function nliInferLet(walk: i32[], i: i32) {
@@ -21150,59 +18916,6 @@ function nliInferLet(walk: i32[], i: i32) {
     }
   }
   0
-}
-
-// Push `atom` onto `atoms` only if absent (dedup, preserving first-seen order).
-function pushUniqueAtom(atoms: string[], atom: string) {
-  let i = 0
-  while i < atoms.length {
-    if atoms[i] == atom { return 0 }
-    i = i + 1
-  }
-  atoms.push(atom)
-  0
-}
-
-// Classify one if-EXPRESSION arm (`blockIx`, a one-statement Block) at REGISTRATION
-// time — a static pre-pass, so only LITERAL / annotated-call atoms resolve (the same
-// `nliAtomOfExpr` the `let x = null` hole uses). Returns 1 for a bare `null` arm, 0 for
-// a classified value atom (pushed onto `atoms`), or -2 if the arm is unclassifiable.
-function collectArmAtom(blockIx: i32, atoms: string[]) {
-  const v = ifArmValueExpr(blockIx)
-  if v < 0 { return -2 }
-  const bare = P.nodes[unwrapParen(v)]
-  if bare is NullLit { return 1 }
-  const atom = nliAtomOfExpr(v)
-  if atom == "" { return -2 }
-  pushUniqueAtom(atoms, atom)
-  0
-}
-
-// Gather the value atoms of every arm of the if-expression at `ifIx` into `atoms`
-// (deduped), recursing through an `else if` chain. Returns -2 if any arm is
-// unclassifiable, else whether a `null` arm / else-less false path was seen (0/1).
-function ifExprCollectAtoms(ifIx: i32, atoms: string[]) {
-  let s = P.nodes[unwrapParen(ifIx)]
-  if s is IfStmt {
-    let hasNull = 0
-    const t = collectArmAtom(s.ifThen, atoms)
-    if t == -2 { return -2 }
-    if t == 1 { hasNull = 1 }
-    if s.ifElse < 0 {
-      return 1 // else-less: the false path is null
-    }
-    const els = P.nodes[s.ifElse]
-    let e = 0
-    if els is IfStmt {
-      e = ifExprCollectAtoms(s.ifElse, atoms)
-    } else {
-      e = collectArmAtom(s.ifElse, atoms)
-    }
-    if e == -2 { return -2 }
-    if e == 1 { hasNull = 1 }
-    return hasNull
-  }
-  -2
 }
 
 // The value-union NAME an un-annotated if-EXPRESSION binding init carries (`const x =
@@ -22307,19 +20020,6 @@ function currentStructNarrowSetOf(name: string, fnIx: i32) {
   unionMemberSetOf(unionNameOfIdent(name, fnIx))
 }
 
-// The number of NON-`null` members in the pipe-joined set `set`.
-function nonNullMemberCountOf(set: string) {
-  const atoms: string[] = []
-  splitUnionAtoms(set, atoms)
-  let n = 0
-  let i = 0
-  while i < atoms.length {
-    if atoms[i] != "null" { n = n + 1 }
-    i = i + 1
-  }
-  n
-}
-
 // The variant struct name an object literal at `objIx` matches: the union variant
 // whose field-name set EQUALS the literal's field names (order-independent), or "" if
 // none. Used to pick the tag + variant struct when boxing an object literal into the
@@ -22359,32 +20059,6 @@ function fnRetArray(name: string) {
   while i < fnNames.length {
     if fnNames[i] == name { return fRetArr[i] == 1 }
     i = i + 1
-  }
-  false
-}
-
-// True if the parameter `name` of function `fnIx` is an array type.
-function paramArray(fnIx: i32, name: string) {
-  if fnIx < 0 {
-    return false // module-scope initializer (no enclosing function)
-  }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name {
-          if p.parType >= 0 {
-            const ty = P.nodes[p.parType]
-            if ty is TypeRef { return nameIsI32Array(ty.tyName) }
-          }
-          return false
-        }
-      }
-      i = i + 1
-    }
   }
   false
 }
@@ -22809,32 +20483,6 @@ function letAnnStructIdx(letIx: i32) {
 // a `string[]` param/local, a parenthesized string-array, or a `string[]` FIELD read
 // (code `6`). An index read `xs[i]` (a string) / `.length` (i32) is NOT a list.
 
-// True if the parameter `name` of function `fnIx` is a `string[]` type.
-function paramStringArray(fnIx: i32, name: string) {
-  if fnIx < 0 {
-    return false // module-scope initializer (no enclosing function)
-  }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name {
-          if p.parType >= 0 {
-            const ty = P.nodes[p.parType]
-            if ty is TypeRef { return nameIsStringArray(ty.tyName) }
-          }
-          return false
-        }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
 // True if the already-collected declared local `name` is a string-list ref (code `7`).
 function declaredStringArray(name: string) {
   let slot = declaredSlotOf(name)
@@ -22906,75 +20554,11 @@ function letIsStringArray(letIx: i32, fnIx: i32) {
   false
 }
 
-// USAGE-DRIVEN element inference for an UN-ANNOTATED EMPTY `[]` binding: the
-// element type comes from what is PUSHED — a string-literal argument makes the
-// binding a `string[]` (`const xs = []; xs.push("hi")`), mirroring the host
-// checker's usage-driven inference. Scans the whole arena for a
-// `<name>.push("…")` call; string LITERAL arguments only (a richer operand would
-// need the full classifier, which would recurse back into this binding).
-function letInfStrListByUse(letIx: i32) {
-  let d = P.nodes[letIx]
-  if d is LetDecl {
-    if d.letType >= 0 { return false }
-    if d.letInit < 0 { return false }
-    const ini = P.nodes[unwrapParen(d.letInit)]
-    if ini is ArrayLit {
-      if ini.arrElems.length != 0 { return false }
-      let i = 0
-      while i < P.nodes.length {
-        const nd = P.nodes[i]
-        if nd is Call {
-          const callee = P.nodes[nd.callFn]
-          if callee is Member {
-            if callee.memProp == "push" {
-              const recv = P.nodes[callee.memObj]
-              if recv is Ident {
-                if recv.identName == d.letName {
-                  if nd.callArgs.length == 1 {
-                    const argN = P.nodes[unwrapParen(nd.callArgs[0])]
-                    if argN is StrLit { return true }
-                  }
-                }
-              }
-            }
-          }
-        }
-        i = i + 1
-      }
-    }
-  }
-  false
-}
-
 // ── f64-array-typedness of expressions (Slice 4) ──────────────────────────────
 // Parallel to the i32/string-array families: decide whether an expression / param /
 // local PRODUCES an `f64[]` list — a `(ref $fl64TypeIdx)`. Drives the index-read
 // dispatch (an f64-array `xs[i]` yields an f64 from `array.get $fa64TypeIdx`) and the
 // f64-list local/global cell kind (`12`). `localIsRef` code `12` flags an f64-list local.
-
-// True if the parameter `name` of function `fnIx` is an `f64[]` type.
-function paramF64Array(fnIx: i32, name: string) {
-  if fnIx < 0 { return false }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name {
-          if p.parType >= 0 {
-            const ty = P.nodes[p.parType]
-            if ty is TypeRef { return nameIsF64Array(ty.tyName) }
-          }
-          return false
-        }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
 
 // True if the already-collected declared local `name` is an f64-list ref (code `12`).
 function declaredF64Array(name: string) {
@@ -23037,32 +20621,6 @@ function letIsF64Array(letIx: i32, fnIx: i32) {
 // self-host checker are a map LOCAL (`let m: {[string]: i32} = Map()` → code `6`), a
 // map PARAM, and `Map()` itself (the empty-map constructor). An index read `m[k]` /
 // `m.has(k)` yields an i32, NOT a map, so neither counts here.
-
-// True if the parameter `name` of function `fnIx` is a map type.
-function paramMap(fnIx: i32, name: string) {
-  if fnIx < 0 {
-    return false // module-scope initializer (no enclosing function)
-  }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name {
-          if p.parType >= 0 {
-            const ty = P.nodes[p.parType]
-            if ty is TypeRef { return nameIsMap(ty.tyName) }
-          }
-          return false
-        }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
 
 // True if the already-collected declared local `name` is a map ref (code `6`).
 function declaredMap(name: string) {
@@ -23308,23 +20866,6 @@ function letIsMap(letIx: i32, fnIx: i32) {
       }
     }
     return exprMap(d.letInit, fnIx)
-  }
-  false
-}
-
-// True if the `LetDecl` at `letIx` binds a SET — its initializer is the `Set()`
-// constructor. Set-ness is an emitter-side flavor bit over the shared map rep: a
-// set's `.values()` yields its ELEMENTS (the keys list), not the membership
-// booleans in `vals`. Mirrors the checker's `mSet` pin (typecheck.vl), which is
-// likewise seeded only by the `Set()` constructor form.
-function letIsSet(letIx: i32) {
-  let d = P.nodes[letIx]
-  if d is LetDecl {
-    const init = P.nodes[d.letInit]
-    if init is Call {
-      const callee = P.nodes[init.callFn]
-      if callee is Ident { return callee.identName == "Set" }
-    }
   }
   false
 }
@@ -23611,17 +21152,6 @@ function letIsI64(letIx: i32, fnIx: i32) {
   false
 }
 
-// True if the `NumLit` lexeme `t` carries a `.` (a float literal). Mirrors the
-// checker's literal-default rule (`.`→f64). (Slice 3.)
-function numTextIsFloat(t: string) {
-  let i = 0
-  while i < t.length {
-    if t[i] == '.' { return true }
-    i = i + 1
-  }
-  false
-}
-
 // True if the `LetDecl`/global at `letIx` declares an `f64` binding: an explicit
 // `: f64` annotation, OR an UN-annotated binding whose initializer is a float `.`
 // literal (e.g. `const a = 1.5`). Such a binding selects the f64 slot (valtype 0x7c,
@@ -23652,23 +21182,6 @@ function letIsF64(letIx: i32, fnIx: i32) {
   false
 }
 
-// True if the `LetDecl`/global at `letIx` declares an `f32` binding. ANNOTATION-ONLY:
-// a bare float literal stays f64 by default (keeps existing programs byte-identical),
-// so only an explicit `: f32` annotation selects the f32 slot (valtype `0x7d`, kind 13).
-// The initializer literal is then lowered as `f32.const`. (Slice 5.)
-function letIsF32(letIx: i32) {
-  let d = P.nodes[letIx]
-  if d is LetDecl {
-    if d.letType >= 0 {
-      const lt = P.nodes[d.letType]
-      if lt is TypeRef {
-        if lt.tyName == "f32" { return true }
-      }
-    }
-  }
-  false
-}
-
 // True if the `LetDecl` at `letIx` binds a FUNCTION VALUE (kind 14): its initializer is
 // a `function(...)` literal, a bare reference to a top-level/lifted function name, or a
 // call returning a function value. The cell is the closure fat-pointer `(ref
@@ -23678,20 +21191,6 @@ function letIsClosure(letIx: i32, fnIx: i32) {
   if d is LetDecl {
     if d.letInit < 0 { return false }
     return exprIsClosure(d.letInit, fnIx)
-  }
-  false
-}
-
-// True if the `LetDecl` at `letIx` declares a NULLABLE function-value local (`fn | null`,
-// kind 19). ANNOTATION-ONLY (the closure dual of `letIsNulList`): no call yet returns a
-// nullable function, and a bare-function or `null` init under the annotation keeps the
-// nullable `(ref null $cloStruct)` slot — narrowing is type-level, the slot stays nullable.
-function letIsNulClosure(letIx: i32, fnIx: i32) {
-  let d = P.nodes[letIx]
-  if d is LetDecl {
-    if d.letType >= 0 {
-      if nulCloFlag(d.letType) == 1 { return true }
-    }
   }
   false
 }
@@ -23747,65 +21246,6 @@ function exprIsClosure(exprIx: i32, fnIx: i32) {
   false
 }
 
-// The `memProp` of a Member expression at `exprIx` (or "").
-function callMemProp(exprIx: i32) {
-  const e = P.nodes[exprIx]
-  if e is Member { return e.memProp }
-  ""
-}
-
-// The `$fnsig` signature KEY a closure-pinned parameter carries — the part after
-// the `"=>"` of a monomorphized instance's synthetic annotation (`"=>ii>i"` →
-// `"ii>i"`), or "" when `name` is not such a param of function `fnIx`.
-// Top-level (paren/brace/bracket depth 0) index of `=>` in a synthetic function-type
-// name, or -1.
-function annArrowAt(name: string) {
-  let depth = 0
-  let i = 0
-  while i < name.length {
-    const c = name[i]
-    if c == '(' || c == '{' || c == '[' {
-      depth = depth + 1
-    } else if c == ')' || c == '}' || c == ']' {
-      depth = depth - 1
-    } else if (
-      depth == 0 &&
-      c == '=' &&
-      i + 1 < name.length &&
-      name[i + 1] == '>'
-    ) {
-      return i
-    }
-    i = i + 1
-  }
-  -1
-}
-
-// Split a function-type PARAM list (`i32,f64,S`) on top-level commas (depth-aware).
-function annSplitParams(s: string, out: string[]) {
-  let cur = ""
-  let depth = 0
-  let i = 0
-  while i < s.length {
-    const c = s[i]
-    if c == '(' || c == '{' || c == '[' {
-      depth = depth + 1
-      cur = cur + fromCodePoint(c)
-    } else if c == ')' || c == '}' || c == ']' {
-      depth = depth - 1
-      cur = cur + fromCodePoint(c)
-    } else if depth == 0 && c == ',' {
-      out.push(cur)
-      cur = ""
-    } else {
-      cur = cur + fromCodePoint(c)
-    }
-    i = i + 1
-  }
-  out.push(cur)
-  0
-}
-
 // The closure-ABI param-kind code for a type NAME (`i32`/`boolean` → "i", `f64` → "d", a
 // declared struct → "s<idx>;"), or "" for a type outside the value-call ABI.
 function annParamKind(t: string) {
@@ -23814,35 +21254,6 @@ function annParamKind(t: string) {
   const si = structIndexByName(t)
   if si >= 0 { return "s" + i32ToStr(si) + ";" }
   ""
-}
-
-// The closure-ABI return suffix for a type NAME (`i32`/`boolean` → ">i", `f64` → ">d", a
-// struct → ">s<idx>;"), or "" outside the value-returning ABI. (`void` is a later slice —
-// its `>v` sig is not interned by the value-eligible pass.)
-// Depth-aware split of a type NAME on its top-level `|` (the union/nullable separator) —
-// the `annSplitParams` analogue for `|`.
-function annSplitPipe(s: string, out: string[]) {
-  let cur = ""
-  let depth = 0
-  let i = 0
-  while i < s.length {
-    const c = s[i]
-    if c == '(' || c == '{' || c == '[' {
-      depth = depth + 1
-      cur = cur + fromCodePoint(c)
-    } else if c == ')' || c == '}' || c == ']' {
-      depth = depth - 1
-      cur = cur + fromCodePoint(c)
-    } else if depth == 0 && c == '|' {
-      out.push(cur)
-      cur = ""
-    } else {
-      cur = cur + fromCodePoint(c)
-    }
-    i = i + 1
-  }
-  out.push(cur)
-  0
 }
 
 function annRetKind(t: string) {
@@ -24117,60 +21528,6 @@ function paramCloSigKey(fnIx: i32, name: string) {
     }
   }
   ""
-}
-
-// True if the parameter `name` of function `fnIx` is annotated as a function type
-// (lowered to the closure fat-pointer, kind 14).
-function paramIsClosure(fnIx: i32, name: string) {
-  if fnIx < 0 { return false }
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    const params = fn.fnParams
-    let i = 0
-    while i < params.length {
-      const p = P.nodes[params[i]]
-      if p is Param {
-        if p.parName == name { return tyIsFuncType(p.parType) }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
-// True if the type-annotation node at `tyIx` is a function type — the self-host parses a
-// function-typed annotation as a `TypeRef` whose name contains `=>` or `(`/`)->`. For the
-// corpus, function params are rare; a closure param is detected structurally elsewhere.
-function tyIsFuncType(tyIx: i32) {
-  if tyIx < 0 { return false }
-  const ty = P.nodes[tyIx]
-  if ty is TypeRef {
-    // A function-type annotation name carries an arrow; bare scalar/struct names do not.
-    return strContains(ty.tyName, "=>")
-  }
-  false
-}
-
-// True if `s` contains the substring `sub`.
-function strContains(s: string, sub: string) {
-  if sub.length == 0 { return true }
-  if sub.length > s.length { return false }
-  let i = 0
-  while i + sub.length <= s.length {
-    let j = 0
-    let ok = true
-    while j < sub.length {
-      if s[i + j] != sub[j] {
-        ok = false
-        j = sub.length
-      } else {
-        j = j + 1
-      }
-    }
-    if ok { return true }
-    i = i + 1
-  }
-  false
 }
 
 // True if the function at `fnStmts` position `t` returns a function value — its body's
@@ -24540,59 +21897,6 @@ let monoInstFe: i32[] = []
 // The root statement list, for the per-instance map/inference rebuilds.
 let monoProgStmts: i32[] = []
 
-// Is the FuncDecl at arena index `fnIx` generic — explicit `<T>` params, or any
-// un-annotated parameter (a per-callsite inference hole)?
-function monoIsGenericDecl(fnIx: i32) {
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    if fn.fnTyParams.length > 0 { return true }
-    const ps = fn.fnParams
-    let i = 0
-    while i < ps.length {
-      const p = P.nodes[ps[i]]
-      if p is Param {
-        if p.parType < 0 { return true }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
-// The type-parameter NAME a written annotation rides on — `ann == tp` (bare) or
-// `ann == tp + "[]"` (array-of) for some `tp` in `typarams` — or "" when the
-// annotation is concrete. Mirrors the checker's `resolveAnnot` shape.
-function monoTyParamOf(ann: string, typarams: string[]) {
-  let i = 0
-  while i < typarams.length {
-    if typarams[i] == ann { return typarams[i] }
-    i = i + 1
-  }
-  let n = ann.length
-  if n >= 2 {
-    if ann[n - 2] == '[' && ann[n - 1] == ']' {
-      let base = ann.slice(0, n - 2)
-      let j = 0
-      while j < typarams.length {
-        if typarams[j] == base { return typarams[j] }
-        j = j + 1
-      }
-    }
-  }
-  ""
-}
-
-// The first-use-wins binding of type-param `tp` in the per-call binding lists,
-// or "" if unbound.
-function monoBindOf(tvN: string[], tvV: string[], tp: string) {
-  let i = 0
-  while i < tvN.length {
-    if tvN[i] == tp { return tvV[i] }
-    i = i + 1
-  }
-  ""
-}
-
 // The concrete annotation NAME for the argument expression at `ix` inside
 // function `fnIx` (-1 = top level) — the same classification ladder the return-
 // kind inference runs (`exprString`/`exprArray`/…), rendered back to the
@@ -24637,162 +21941,6 @@ function monoArgTyName(ix: i32, fnIx: i32) {
   if exprIsF32(ix, fnIx) { return "f32" }
   if exprIsBool(ix, fnIx) { return "boolean" }
   "i32"
-}
-
-// Does the annotation NAME reach a declared type param — bare (`T`), array-of
-// (`T[]`), a generic-alias application argument (`Box<T>`), or an inline object
-// shape's field type (`{first:B,second:A}`)?
-function monoAnnHasTyParam(ann: string, typarams: string[]) {
-  if monoTyParamOf(ann, typarams) != "" { return true }
-  let n = ann.length
-  if n >= 3 && ann[n - 1] == '>' {
-    const lt = gaeLtAt(ann)
-    if lt > 0 {
-      const parts: string[] = []
-      gaeSplitArgs(ann.slice(lt + 1, n - 1), parts)
-      let i = 0
-      while i < parts.length {
-        if monoAnnHasTyParam(parts[i], typarams) { return true }
-        i = i + 1
-      }
-      return false
-    }
-  }
-  if n >= 2 && ann[0] == '{' && ann[n - 1] == '}' {
-    if n >= 3 && ann[1] == '[' { return false }
-    const fields: string[] = []
-    gaeSplitArgs(ann.slice(1, n - 1), fields)
-    let j = 0
-    while j < fields.length {
-      let ci = fields[j].indexOf(":")
-      if ci > 0 {
-        if (
-          monoAnnHasTyParam(fields[j].slice(ci + 1, fields[j].length), typarams)
-        ) {
-          return true
-        }
-      }
-      j = j + 1
-    }
-  }
-  false
-}
-
-// Substitute the per-call type-param bindings through an annotation NAME —
-// bare `T` / `T[]`, application arguments (`Box<T>` → `Box<i32>`), and inline
-// object-shape field types (`{first:B,second:A}` → `{first:string,second:i32}`).
-// Returns "" when an UNBOUND type param remains (the instance cannot be named);
-// a fully concrete annotation returns unchanged.
-function monoSubstAnn(
-  ann: string,
-  typarams: string[],
-  tvN: string[],
-  tvV: string[],
-) {
-  const tp = monoTyParamOf(ann, typarams)
-  if tp != "" {
-    let b = monoBindOf(tvN, tvV, tp)
-    if b == "" { return "" }
-    if ann == tp { return b }
-    return b + "[]"
-  }
-  let n = ann.length
-  if n >= 3 && ann[n - 1] == '>' {
-    const lt = gaeLtAt(ann)
-    if lt > 0 {
-      const parts: string[] = []
-      gaeSplitArgs(ann.slice(lt + 1, n - 1), parts)
-      let outAnn = ann.slice(0, lt) + "<"
-      let i = 0
-      while i < parts.length {
-        let s = monoSubstAnn(parts[i], typarams, tvN, tvV)
-        if s == "" { return "" }
-        if i > 0 { outAnn = outAnn + "," }
-        outAnn = outAnn + s
-        i = i + 1
-      }
-      return outAnn + ">"
-    }
-  }
-  if n >= 2 && ann[0] == '{' && ann[n - 1] == '}' {
-    if n >= 3 && ann[1] == '[' { return ann }
-    const fields: string[] = []
-    gaeSplitArgs(ann.slice(1, n - 1), fields)
-    let outObj = "{"
-    let j = 0
-    while j < fields.length {
-      let ci = fields[j].indexOf(":")
-      if ci <= 0 { return ann }
-      const fs = monoSubstAnn(
-        fields[j].slice(ci + 1, fields[j].length),
-        typarams,
-        tvN,
-        tvV,
-      )
-      if fs == "" { return "" }
-      if j > 0 { outObj = outObj + "," }
-      outObj = outObj + fields[j].slice(0, ci) + ":" + fs
-      j = j + 1
-    }
-    return outObj + "}"
-  }
-  ann
-}
-
-// Bind type params by matching a parameter's annotation PATTERN against the
-// argument's concrete type name: `T` against anything, `T[]` against `X[]`,
-// `Box<T>` against `Box<i32>` (same head, pairwise arguments). First use wins.
-function monoBindFromAnn(
-  pat: string,
-  actual: string,
-  typarams: string[],
-  tvN: string[],
-  tvV: string[],
-) {
-  const tp = monoTyParamOf(pat, typarams)
-  if tp != "" {
-    let bind = actual
-    if pat != tp {
-      const an = actual.length
-      if an < 2 { return 0 }
-      if an >= 2 && actual[an - 2] == '[' && actual[an - 1] == ']' {
-        bind = actual.slice(0, an - 2)
-      } else {
-        return 0
-      }
-    }
-    if monoBindOf(tvN, tvV, tp) == "" {
-      tvN.push(tp)
-      tvV.push(bind)
-    }
-    return 0
-  }
-  let n = pat.length
-  if n >= 3 && pat[n - 1] == '>' {
-    const lt = gaeLtAt(pat)
-    const alt = gaeLtAt(actual)
-    if (
-      lt > 0 &&
-      alt > 0 &&
-      actual.length >= 3 &&
-      actual[actual.length - 1] == '>'
-    ) {
-      if pat.slice(0, lt) == actual.slice(0, alt) {
-        const pparts: string[] = []
-        gaeSplitArgs(pat.slice(lt + 1, n - 1), pparts)
-        const aparts: string[] = []
-        gaeSplitArgs(actual.slice(alt + 1, actual.length - 1), aparts)
-        let i = 0
-        while i < pparts.length {
-          if i < aparts.length {
-            monoBindFromAnn(pparts[i], aparts[i], typarams, tvN, tvV)
-          }
-          i = i + 1
-        }
-      }
-    }
-  }
-  0
 }
 
 // Rebuild the name→index map and the voidness/return-kind inference after a new
@@ -25223,16 +22371,6 @@ function drwFieldClosure(si: i32, name: string) {
   let fi = sFieldIndex(si, name)
   if fi < 0 { return false }
   sFieldTypeAt(si, fi) == 14
-}
-
-// Is `op` an operator that may dispatch to a `self`-method / operator field?
-// Assignment, equality (structural compare), the logicals and `??` keep their
-// native forms.
-function drwDispatchOp(op: string) {
-  if op == "=" { return false }
-  if op == "==" || op == "!=" { return false }
-  if op == "&&" || op == "||" || op == "??" { return false }
-  true
 }
 
 // Post-order rewrite of the tree at `ix` (inside function `ctx`, -1 = top
