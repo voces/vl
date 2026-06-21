@@ -5485,6 +5485,24 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       if symEnabled != 0 {
         symRetainType(fnIx, mkFuncTy(paramTys, inferred), 2)
       }
+    } else if !inferQuiet {
+      // An ANONYMOUS lambda is lifted to a top-level function by the emitter under a
+      // synthesized `__lambda_N` name the checker never saw, so the name-keyed
+      // inferred-return table can't reach it (the emitter's `inferRetNameOf("__lambda_N")`
+      // misses, and the return mis-classifies as i32). Record the inferred SCALAR/STRING/
+      // LIST return under a node-index sentinel key (`#<nodeIx>` — `#` can't appear in a
+      // real name, so no collision), read back by `inferRetNameByNode`. This is the lambda
+      // analogue of the named loop in `checkProgram`; without it a non-i32 return reached
+      // through a VARIABLE (`(n) => { const x: i64 = …; return x }`) — which the emitter's
+      // expression-based fallback misses — emits invalid wasm.
+      const anm = tyToStr(inferred)
+      if isClassifiableRetName(anm) {
+        const nodeKey = "#" + i32ToStr(fnIx)
+        if inferRetNameOf(nodeKey) == "" {
+          inferRetFn.push(nodeKey)
+          inferRetTy.push(anm)
+        }
+      }
     }
     inferObserved = savedObserved
     inferSawErr = savedSawErr
@@ -7274,17 +7292,7 @@ export function checkProgram(rootIx: i32) {
             // (`{x: i32}`, `A | B`, `Tok[]`) can mis-classify, and the emitter's
             // expression-based fallback already handles those, so leave them be.
             const enm = tyToStr(er)
-            if (
-              enm == "i32" ||
-              enm == "i64" ||
-              enm == "f32" ||
-              enm == "f64" ||
-              enm == "boolean" ||
-              enm == "bool" ||
-              enm == "string" ||
-              enm == "i32[]" ||
-              enm == "string[]"
-            ) {
+            if isClassifiableRetName(enm) {
               inferRetFn.push(efn.fnName)
               inferRetTy.push(enm)
             } else {
@@ -7340,6 +7348,28 @@ export function inferRetNameOf(name: string) {
     i = i + 1
   }
   ""
+}
+
+// The inferred-return name of an ANONYMOUS lambda, keyed by its FuncDecl NODE INDEX (the
+// emitter passes `fnStmts[i]`). Anonymous lambdas are recorded under a `#<nodeIx>` sentinel
+// key (they have no real name); the emitter consults this when the name-keyed lookup misses.
+export function inferRetNameByNode(nodeIx: i32) {
+  return inferRetNameOf("#" + i32ToStr(nodeIx))
+}
+
+// Whether an inferred return TYPE name is one the emitter's A20 classifier carries directly
+// (a scalar / string / simple list) — the set the inferred-return table records. Shared by
+// the named-function recording loop and the anonymous-lambda recording in `checkFuncDeclNode`.
+function isClassifiableRetName(nm: string) {
+  return nm == "i32" ||
+    nm == "i64" ||
+    nm == "f32" ||
+    nm == "f64" ||
+    nm == "boolean" ||
+    nm == "bool" ||
+    nm == "string" ||
+    nm == "i32[]" ||
+    nm == "string[]"
 }
 
 // Iteration over the inferred-return table (the emitter's `collectU` registers any
