@@ -20100,6 +20100,65 @@ function collectMapFilterUse() {
 // kind inference runs (`exprString`/`exprArray`/…), rendered back to the
 // annotation name an instance's pinned `TypeRef` carries. "" = a kind this pass
 // cannot name (the caller fails loudly).
+// The RESULT type NAME of lifted function `fe` (`i32`, `string`, `i32[]`, a struct
+// name, …) — its declared return annotation, or the inferred kind mapped back to a
+// name. Used to build a closure argument's function-type name for generic binding.
+function cloRetTypeName(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return tyNameOf(fn.fnRet) }
+  }
+  const k = cloRetValKind(fe)
+  if k == 0 { return "i32" }
+  if k == 11 { return "f64" }
+  if k == 10 { return "i64" }
+  if k == 13 { return "f32" }
+  if k == 3 { return "string" }
+  if k == 2 { return "i32[]" }
+  if k == 7 { return "string[]" }
+  if k == 12 { return "f64[]" }
+  if k == 1 {
+    const slot = cloRetValSlot(fe)
+    if slot >= 0 && slot < sNames.length { return sNames[slot] }
+  }
+  ""
+}
+
+// The function-TYPE name `(p1, p2) => ret` of a closure-VALUE argument (a lambda
+// literal or a bare top-level function name) — the form `monoBindFromAnn` matches a
+// generic closure param `(A, T) => A` against. "" when the argument is not a resolvable
+// closure value or a param/return type lies outside the name vocabulary. (Distinct from
+// `monoArgTyName`'s `"=>sigkey"` pin, which an UN-annotated closure param wants.)
+function monoArgFnTypeName(argIx: i32, fnIx: i32) {
+  const ax = unwrapParen(argIx)
+  const an = P.nodes[ax]
+  let fe = -1
+  if an is FuncDecl { fe = fnStmtsPosOf(ax) }
+  else if an is Ident { fe = fnIndexOf(an.identName) }
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    let nm = "("
+    let i = 0
+    while i < fn.fnParams.length {
+      const p = P.nodes[fn.fnParams[i]]
+      if p is Param {
+        if p.parType < 0 { return "" }
+        const pn = tyNameOf(p.parType)
+        if pn == "" { return "" }
+        if i > 0 { nm = nm + "," }
+        nm = nm + pn
+      }
+      i = i + 1
+    }
+    const rn = cloRetTypeName(fe)
+    if rn == "" { return "" }
+    return nm + ")=>" + rn
+  }
+  ""
+}
+
 function monoArgTyName(ix: i32, fnIx: i32) {
   if exprIsClosure(ix, fnIx) {
     // A FUNCTION-VALUE argument pins its param as a CLOSURE (kind 14). The
@@ -20202,7 +20261,15 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
               // the substituted annotation. A fully concrete annotation pins
               // unchanged.
               if monoAnnHasTyParam(ann, fn.fnTyParams) {
-                const anC = monoArgTyName(args[i], ctx)
+                // A FUNCTION-TYPE param (`f: (A, T) => A`) binds from the closure
+                // argument's function-type NAME (`(i32, i32) => i32`); any other
+                // composite (`Box<T>`, `{a:T}`) from its concrete value-type name.
+                let anC = ""
+                if annArrowAt(ann) >= 1 {
+                  anC = monoArgFnTypeName(args[i], ctx)
+                } else {
+                  anC = monoArgTyName(args[i], ctx)
+                }
                 if anC == "" {
                   return emitFail(
                     "emitProgram: monomorphize: unsupported argument type for `" +
