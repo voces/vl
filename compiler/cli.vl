@@ -4,6 +4,7 @@ import { T } from "./typecheck"
 import { redunCount, redunEColAt, redunELineAt, redunNameAt, redunSColAt, redunSLineAt, redunTypeAt } from "./check_query"
 import { lint, lintCodeAt, lintColAt, lintCount, lintLineAt, lintLines, lintMsgAt, lintMsgs, lintSevAt } from "./lint"
 import { checkSrc, compileSrc, diagCol, diagCount, diagEndCol, diagLine, formatSrc, lintSrc, modCommit, modKeyPush, modOfTok, modPendingAt, modPendingCount, modPendingLen, modReset, modSrcPush, redunModuleAt, srcPush, srcReset, vcCodes, vcDiagMsg, vcFmtOut, vcSource } from "./driver"
+import { cliAnsi, cliDetab, cliEndsVl, cliFormatNow, cliGlobAt, cliHasImports, cliModCommitOne, cliPendingKey, cliPlural, cliPopLast, cliRepeat, cliSevCode, cliSevRank, cliSevValid, cliSkipDir, cliSplitLines, cliStrGt, cliUpper, cliVisualWidth } from "./cli_util"
 // ── `vl` CLI — the brain in VL (docs/cli-design.md) ──────────────────────────
 // The command-queue half of the CLI. The host (scripts/vl-host) is a thin PUMP:
 // it calls `cliNext()` until it returns CMD_DONE, services the one raw I/O
@@ -101,15 +102,6 @@ let cliDirIsDirs: i32[] = []
 let cliDirNameAcc: i32[] = []
 let cliDirWasDir = 0 // 1 if the last CMD_LIST_DIR target was a directory
 
-// Directories skipped when walking broadly (build output, deps, vendored,
-// retired ts-interpreter) — mirrors the host's former SKIP_DIRS.
-function cliSkipDir(name: string) {
-  name == "node_modules" ||
-    name == ".git" ||
-    name == "dist" ||
-    name == "reference"
-}
-
 // The reported diagnostics, as PARALLEL arrays (the compiler's own idiom — cf.
 // lint.vl's lintMsgs/lintLines/…): severity, 1-based line (0 = positionless),
 // 0-based col, 0-based end col, message. One entry per index.
@@ -199,109 +191,6 @@ export function cliDirCommit(isDir: i32) {
   0
 }
 
-// ── string helpers ─────────────────────────────────────────────────────────────
-function cliRepeat(s: string, n: i32) {
-  let out = ""
-  let i = 0
-  while i < n {
-    out = out + s
-    i = i + 1
-  }
-  out
-}
-function cliUpper(s: string) {
-  let out: i32[] = []
-  let i = 0
-  while i < s.length {
-    let c = s[i]
-    if c >= 'a' && c <= 'z' { c = c - 32 }
-    out.push(c)
-    i = i + 1
-  }
-  fromCodePoints(out)
-}
-// Tabs → 4 columns so carets line up under tab-indented source (the shown line is
-// detabbed to match). Mirrors the host's former `detab`.
-function cliDetab(s: string) {
-  let out: i32[] = []
-  let i = 0
-  while i < s.length {
-    let c = s[i]
-    if c == '\t' {
-      const pad = 4 - (out.length % 4)
-      let p = 0
-      while p < pad {
-        out.push(' ')
-        p = p + 1
-      }
-    } else {
-      out.push(c)
-    }
-    i = i + 1
-  }
-  fromCodePoints(out)
-}
-// The visual column the prefix `[0, n)` of `raw` ends at, after detabbing.
-function cliVisualWidth(raw: string, n: i32) {
-  let m = n
-  if m > raw.length { m = raw.length }
-  if m < 0 { m = 0 }
-  cliDetab(raw.slice(0, m)).length
-}
-// `str::lines()` semantics: split on `\n`, drop a trailing `\r`, no trailing
-// empty line for a final newline.
-function cliSplitLines(s: string) {
-  let out: string[] = []
-  let cur: i32[] = []
-  let i = 0
-  while i < s.length {
-    let c = s[i]
-    if c == '\n' {
-      let line = fromCodePoints(cur)
-      if line.length > 0 && line[line.length - 1] == '\r' {
-        line = line.slice(0, line.length - 1)
-      }
-      out.push(line)
-      cur = []
-    } else {
-      cur.push(c)
-    }
-    i = i + 1
-  }
-  if cur.length > 0 {
-    let line = fromCodePoints(cur)
-    if line.length > 0 && line[line.length - 1] == '\r' {
-      line = line.slice(0, line.length - 1)
-    }
-    out.push(line)
-  }
-  out
-}
-
-// ── severity model (mirror the host's SEVERITIES / severity_rank) ──────────────
-// Low → high, so the rank IS the index (hint=0 … error=3). An unknown lexeme
-// falls back to `warning` (still surfaces).
-function cliSevRank(s: string) {
-  if s == "hint" { return 0 }
-  if s == "info" { return 1 }
-  if s == "warning" { return 2 }
-  if s == "error" { return 3 }
-  2
-}
-function cliSevValid(s: string) {
-  s == "hint" || s == "info" || s == "warning" || s == "error"
-}
-function cliSevCode(s: string) {
-  if s == "error" { return "31" }
-  if s == "warning" { return "33" }
-  "34"
-}
-// ANSI wrap, gated on color (so call sites stay branch-free).
-function cliAnsi(color: i32, code: string, s: string) {
-  if color != 0 { return "\x1b[" + code + "m" + s + "\x1b[0m" }
-  s
-}
-
 // ── diagnostic formatting (the policy retired from the Rust host) ──────────────
 function cliAddDiag(sev: string, line: i32, col: i32, endc: i32, msg: string) {
   dgSev.push(sev)
@@ -369,11 +258,6 @@ function cliFmtPretty(d: i32) {
   }
   out
 }
-function cliPlural(n: i32, w: string) {
-  let out = i32ToStr(n) + " " + w
-  if n != 1 { out = out + "s" }
-  out
-}
 
 // Stable insertion sort of a diagnostic-INDEX array by (line, col): ties keep
 // insertion order, so error-tier diagnostics precede lint-tier ones at the same
@@ -397,40 +281,6 @@ function cliStableSort(order: i32[]) {
   0
 }
 
-// ── module-mode detection (mirror the host's cheap textual gate) ───────────────
-// True if `line`'s first non-space token is the keyword `kw` immediately followed
-// (after optional whitespace) by `{`.
-function cliLineStartsKwBrace(line: string, kw: string) {
-  let i = 0
-  while i < line.length && (line[i] == ' ' || line[i] == '\t') { i = i + 1 }
-  let k = 0
-  while k < kw.length {
-    if i + k >= line.length { return 0 }
-    if line[i + k] != kw[k] { return 0 }
-    k = k + 1
-  }
-  i = i + kw.length
-  while i < line.length && (line[i] == ' ' || line[i] == '\t') { i = i + 1 }
-  if i < line.length && line[i] == '{' { return 1 }
-  0
-}
-// A module-dependency line: `import { … }` OR a RE-EXPORT `export { … } from "…"`
-// (both pull another module, so both must arm the fetch loop for `check`/`--fix`).
-function cliLineIsImport(line: string) {
-  if cliLineStartsKwBrace(line, "import") != 0 { return 1 }
-  if cliLineStartsKwBrace(line, "export") != 0 { return 1 }
-  0
-}
-function cliHasImports(s: string) {
-  const lines = cliSplitLines(s)
-  let i = 0
-  while i < lines.length {
-    if cliLineIsImport(lines[i]) != 0 { return 1 }
-    i = i + 1
-  }
-  0
-}
-
 // ── the `check` policy ─────────────────────────────────────────────────────────
 // Parse `check`'s args. `--compiler <path>` is the host's concern (it selects the
 // module) — skip it and its value here.
@@ -442,32 +292,6 @@ function cliAddExclude(pat: string) {
   while p.length > 0 && p[p.length - 1] == '/' { p = p.slice(0, p.length - 1) }
   cliExcludes.push(p)
   0
-}
-// Match glob `pat` (from `pi`) against `text` (from `ti`). `*` matches a run of
-// non-`/` characters, `**` crosses separators, every other char is literal. A
-// completed pattern match succeeds when the remaining text is empty OR begins a
-// new `/`-segment — encoding the host's `^<pat>(/.*)?$` anchoring, so `tests`
-// gates `tests` and everything beneath it.
-function cliGlobAt(pat: string, pi: i32, text: string, ti: i32) {
-  if pi >= pat.length { return ti >= text.length || text[ti] == '/' }
-  if pat[pi] == '*' {
-    if pi + 1 < pat.length && pat[pi + 1] == '*' {
-      // `**` — match zero+ of ANY character (crosses `/`).
-      if cliGlobAt(pat, pi + 2, text, ti) { return true }
-      if ti < text.length { return cliGlobAt(pat, pi, text, ti + 1) }
-      return false
-    }
-    // `*` — match zero+ NON-`/` characters.
-    if cliGlobAt(pat, pi + 1, text, ti) { return true }
-    if ti < text.length && text[ti] != '/' {
-      return cliGlobAt(pat, pi, text, ti + 1)
-    }
-    return false
-  }
-  if ti < text.length && text[ti] == pat[pi] {
-    return cliGlobAt(pat, pi + 1, text, ti + 1)
-  }
-  false
 }
 // True if any exclude pattern matches the path RELATIVE TO THE CHECK ROOT or its
 // BASENAME — so `--exclude tests` prunes a whole subtree and `--exclude '*.gen.vl'`
@@ -536,53 +360,7 @@ function cliStageEntry() {
   }
   0
 }
-// Commit one (key, src, found) into the module table (the fetch protocol).
-function cliModCommitOne(key: string, src: string, found: i32) {
-  let i = 0
-  while i < key.length {
-    modKeyPush(key[i])
-    i = i + 1
-  }
-  if found != 0 {
-    let j = 0
-    while j < src.length {
-      modSrcPush(src[j])
-      j = j + 1
-    }
-  }
-  modCommit(found)
-  0
-}
-// The k-th pending module key, read per-code-point from the driver's accessors.
-function cliPendingKey(k: i32) {
-  let out: i32[] = []
-  let n = modPendingLen(k)
-  let j = 0
-  while j < n {
-    out.push(modPendingAt(k, j))
-    j = j + 1
-  }
-  fromCodePoints(out)
-}
 
-// ── directory walk ──────────────────────────────────────────────────────────
-// True when `name` ends in `.vl`.
-function cliEndsVl(name: string) {
-  if name.length < 3 { return false }
-  let a = name.length - 3
-  name[a] == '.' && name[a + 1] == 'v' && name[a + 2] == 'l'
-}
-// `a` sorts strictly AFTER `b` (code-point lexicographic order).
-function cliStrGt(a: string, b: string) {
-  let n = a.length
-  if b.length < n { n = b.length }
-  let i = 0
-  while i < n {
-    if a[i] != b[i] { return a[i] > b[i] }
-    i = i + 1
-  }
-  a.length > b.length
-}
 // Stable insertion sort of the collected file paths (stable output across runs).
 function cliSortFiles() {
   let i = 1
@@ -597,17 +375,6 @@ function cliSortFiles() {
     i = i + 1
   }
   0
-}
-// All but the last element of a stack (rebuild — a bare `.pop()` is an emit gap
-// in the native pipeline; the driver uses the same idiom).
-function cliPopLast(xs: string[]) {
-  let out: string[] = []
-  let i = 0
-  while i < xs.length - 1 {
-    out.push(xs[i])
-    i = i + 1
-  }
-  out
 }
 // Ingest one committed directory listing rooted at `base` (full path) / `relBase`
 // (relative to the check root): queue non-skipped, non-excluded subdirectories
@@ -885,22 +652,6 @@ function cliBeginCheck() {
     cliModMode = 0
   }
   cliFetchOrCheckFile()
-}
-
-// ── fmt per-file (A-impl 3) ─────────────────────────────────────────────────────
-// Format `src` via the AST formatter (format.vl / formatSrc), single-file and
-// purely syntactic — no module resolution. A lex/parse error (driver returns -1)
-// leaves the source unchanged rather than emit a corrupt partial.
-function cliFormatNow(src: string): string {
-  srcReset()
-  let i = 0
-  while i < src.length {
-    srcPush(src[i])
-    i = i + 1
-  }
-  const len = formatSrc()
-  if len < 0 { return src }
-  vcFmtOut
 }
 
 // ── check --fix (A-impl 4) ──────────────────────────────────────────────────────
