@@ -1664,6 +1664,26 @@ export function monoAnnHasTyParam(ann: string, typarams: string[]) {
       j = j + 1
     }
   }
+  // A FUNCTION-TYPE annotation `(p1, p2) => ret` (a closure param / return): a type
+  // param may ride any parameter or the result, so recurse into each (parallel to
+  // `monoSubstAnn`'s function-type branch). Without this, a generic closure param
+  // `f: (A, T) => A` reads as concrete and keeps its un-substituted annotation.
+  const fa = annArrowAt(ann)
+  if fa >= 1 && ann[0] == '(' && ann[fa - 1] == ')' {
+    const innerFn = ann.slice(1, fa - 1)
+    if innerFn.length > 0 {
+      const fparts: string[] = []
+      annSplitParams(innerFn, fparts)
+      let fi = 0
+      while fi < fparts.length {
+        if monoAnnHasTyParam(fparts[fi], typarams) { return true }
+        fi = fi + 1
+      }
+    }
+    if monoAnnHasTyParam(ann.slice(fa + 2, ann.length), typarams) {
+      return true
+    }
+  }
   false
 }
 // Substitute the per-call type-param bindings through an annotation NAME —
@@ -1724,6 +1744,31 @@ export function monoSubstAnn(
     }
     return outObj + "}"
   }
+  // A FUNCTION-TYPE annotation `(p1, p2) => ret` (a closure param / return) riding type
+  // params: substitute each parameter and the return through the binding, so a generic
+  // closure param `f: (A, T) => A` pins to `(string, string) => string` for the instance.
+  // Without it the instance body's `f(…)` call resolves no interned `$fnsig` (the param
+  // kept the un-substituted `(A, T) => A`) and the value call mis-lowers.
+  const fa = annArrowAt(ann)
+  if fa >= 1 && ann[0] == '(' && ann[fa - 1] == ')' {
+    let outFn = "("
+    const innerFn = ann.slice(1, fa - 1)
+    if innerFn.length > 0 {
+      const fparts: string[] = []
+      annSplitParams(innerFn, fparts)
+      let fi = 0
+      while fi < fparts.length {
+        const fs2 = monoSubstAnn(fparts[fi], typarams, tvN, tvV)
+        if fs2 == "" { return "" }
+        if fi > 0 { outFn = outFn + "," }
+        outFn = outFn + fs2
+        fi = fi + 1
+      }
+    }
+    const rs2 = monoSubstAnn(ann.slice(fa + 2, ann.length), typarams, tvN, tvV)
+    if rs2 == "" { return "" }
+    return outFn + ")=>" + rs2
+  }
   ann
 }
 // Bind type params by matching a parameter's annotation PATTERN against the
@@ -1778,6 +1823,37 @@ export function monoBindFromAnn(
         }
       }
     }
+  }
+  // A FUNCTION-TYPE pattern `(P1, P2) => R` against the argument's function type
+  // `(i32, i32) => i32`: bind type params pairwise across the parameters and the
+  // return (parallel to `monoSubstAnn` / `monoAnnHasTyParam`). Binds `reduce`'s
+  // `f: (A, T) => A` from the lambda argument's concrete `(i32, i32) => i32`.
+  const pfa = annArrowAt(pat)
+  const afa = annArrowAt(actual)
+  if (
+    pfa >= 1 &&
+    afa >= 1 &&
+    pat[0] == '(' &&
+    pat[pfa - 1] == ')' &&
+    actual[0] == '(' &&
+    actual[afa - 1] == ')'
+  ) {
+    const pp: string[] = []
+    const ap: string[] = []
+    annSplitParams(pat.slice(1, pfa - 1), pp)
+    annSplitParams(actual.slice(1, afa - 1), ap)
+    let fi = 0
+    while fi < pp.length {
+      if fi < ap.length { monoBindFromAnn(pp[fi], ap[fi], typarams, tvN, tvV) }
+      fi = fi + 1
+    }
+    monoBindFromAnn(
+      pat.slice(pfa + 2, pat.length),
+      actual.slice(afa + 2, actual.length),
+      typarams,
+      tvN,
+      tvV,
+    )
   }
   0
 }
