@@ -1,0 +1,124 @@
+// `check_state.vl` — the type-checker's LSP-query STATE: symbol-occurrence tables
+// (`symOcc*`), redundant-type findings (`redun*`), inlay buffers. Declarations-only
+// LEAF; the checker WRITES these, `check_query` READS them. Carved out of typecheck.
+
+// ── LSP symbol table (occurrences + binding types) ───────────────────────────
+// Off by default: `symEnabled == 0` (every existing consumer — the fixpoint
+// assemblies, `vl check`/`build`) records NOTHING, so checking is byte-identical
+// and free. The driver's symbol-query path sets it to 1 before `checkProgram`.
+// IMPORTANT: these tables are READ ONLY by the driver query exports; the emitter
+// re-derives its own information and never consults them, so populating them does
+// not perturb `emitProgram`'s output.
+//
+// The model mirrors `compiler/symbols.ts` (a flat OCCURRENCE list over a binding
+// set), specialized to what the native checker can produce cheaply:
+//   - A BINDING is identified by its DECLARING NODE INDEX (`bindingId`): the
+//     `LetDecl`/`Param`/`FuncDecl`/`TypeDecl`/`UnionDecl`/for-loop node. Stable
+//     and unique (no two source declarations share a node).
+//   - An OCCURRENCE is one identifier appearance. Parallel arrays: the
+//     identifier's TOKEN index (`symOccTok` — its source span), the binding it
+//     resolves to (`symOccDecl`, a bindingId), and whether it is the declaration
+//     itself (`symOccIsDecl`).
+//   - Resolution reuses the checker's own scope walk: `symDeclScope` is a
+//     name→declNodeIx chain pushed/popped in lockstep with `T.scopes`, so a use
+//     resolves to the SAME binding the type checker resolved (shadowing included).
+//   - `symBindNode`/`symBindType` retain each binding's type-arena index PAST
+//     scope-close (the arena `T.tys` persists for the whole check, so the index
+//     stays renderable via `tyToStr` at query time — hover types).
+export let symEnabled = 0
+export let symOccTok: i32[] = []
+export let symOccDecl: i32[] = []
+export let symOccIsDecl: i32[] = []
+export let symBindNode: i32[] = []
+export let symBindType: i32[] = []
+// Parallel to `symBindNode`: each binding's KIND, for semantic-token coloring
+// (the LSP classifies an identifier by what it binds to, which a lexer can't).
+// 0 = variable (let/const/loop var), 1 = parameter, 2 = function. Types and
+// properties aren't recorded as bindings here, so they never appear (the host
+// leaves those identifiers to its lexical pass). Looked up by occurrence via
+// `symBindKindOf` and exported as `tokBindKindAt`.
+export let symBindKind: i32[] = []
+// Member-access node types for hover (`o.x` / `o?.y`) — the property-name span
+// (1-based line, 0-based [col, endCol)) and the resolved member type-arena index,
+// keyed by the member node. Recorded in the Member/OptMember check arms when
+// `symEnabled`; queried by position via `symMemTypeStrAt`. The member node's
+// `nodeToks` entry IS the property token (the parser creates the node right after
+// consuming the prop IDENT), so its span pins the `.member` half, not the receiver.
+export let symMemNode: i32[] = []
+export let symMemTy: i32[] = []
+export let symMemLine: i32[] = []
+export let symMemCol: i32[] = []
+export let symMemEndCol: i32[] = []
+// Scope-at-position (completion). Each binding recorded by `symDecl` while
+// `symEnabled` also stamps its VISIBILITY scope — the [start, stop] source span
+// (1-based line, 0-based col) of the lexical scope it is visible in — keyed
+// positionally. `symVisNode` is the decl node (for the type lookup at query
+// time); `symVisKind` is 0=variable 1=parameter 2=function. Queried by
+// `symScopeAt`, which keeps the tightest-scoped binding per name (lexical
+// shadowing). Builtins/imports/types are NOT recorded here (the host folds those
+// in); this is the user-binding half — the native `bindingsInScopeAt`.
+export let symVisName: string[] = []
+export let symVisNode: i32[] = []
+export let symVisKind: i32[] = []
+export let symVisSL: i32[] = []
+export let symVisSC: i32[] = []
+export let symVisEL: i32[] = []
+export let symVisEC: i32[] = []
+// The last `symScopeAt` result — parallel per-binding arrays the driver reads by
+// index (name/kind/type are independent lookups, so name and type reads for one
+// index never clobber each other). Type strings are rendered once here.
+export let scopeResName: string[] = []
+export let scopeResKind: i32[] = []
+export let scopeResType: string[] = []
+// ── Inlay hints (LSP): the inferred type at an UNANNOTATED declaration ─────────
+// The native counterpart of the host's `deriveInlayHints`. `symInlayScan` walks
+// the declaration occurrences and records, per binding with a concrete retained
+// type, a hint: KIND 0 = a value binding (`let`/`const`/parameter) → its type,
+// anchored at the NAME end; KIND 1 = a function → its RETURN type, anchored at the
+// name end (the host walks forward to the `)` and places the hint there). The
+// host applies the source-scan filters it already owns — skip an annotation the
+// user wrote, honor the request range — so only the typing moves to the checker.
+// A type that's still an inference hole (a type variable / error placeholder) is
+// skipped (matching the host's `isHole`).
+export let inlayKind: i32[] = []
+export let inlayLine: i32[] = []
+export let inlayCol: i32[] = []
+export let inlayType: string[] = []
+// The occurrence index each hint was recorded from, so the driver can map the
+// hint back to its owning module (`symOccModuleAt`) and the host can drop a
+// dependency's hints — a multi-module compile records hints for EVERY module,
+// each with module-local line/col that would otherwise render against the entry.
+export let inlayOcc: i32[] = []
+// ── Redundant explicit type annotations (lint: lean on inference) ───────────────
+// A `let x: T = init` whose annotation T is EXACTLY the type inference gives the
+// initializer ON ITS OWN is redundant — removing `: T` yields the identical type.
+// The init is typed by `checkNode` BEFORE the annotation is consulted (the LetDecl
+// arm), so its context-free type is in hand; we compare the two there and record a
+// finding here. cli.vl surfaces each as a `hint` + a `--fix` that rewrites
+// `let x: T = init` → `let x = init` (replace the span [name-end, init-start) with
+// " = "). Empty-collection / `null` holes are excluded for free: their pre-constrain
+// init type never RENDERS equal to the concrete annotation, so the string compare
+// below skips them; a hole/error/`never` init is also skipped explicitly.
+export let redunSLine: i32[] = []   // replace-span start (just after the name) — line
+export let redunSCol: i32[] = []    //                                          — col
+export let redunELine: i32[] = []   // replace-span end (the initializer start) — line
+export let redunECol: i32[] = []    //                                          — col
+export let redunName: string[] = [] // the binding name (for the message)
+export let redunType: string[] = [] // the inferred type (for the message)
+export let redunTok: i32[] = []     // the name token — its module is the finding's owner.
+// The `symMemTy` sentinel for a method-CALL callee whose member name is recorded
+// for semantic tokens but whose type is not (method hover is not served
+// natively). Distinct from `-1` (unresolved) so `symMemberIsMethod` can tell a
+// recorded method apart while `symMemTypeStrAt` still treats it as un-typed.
+export const SYM_MEM_METHOD = -2
+// ── Member completion (LSP): the members of the receiver type under the cursor ──
+// The native counterpart of the host's `receiverObjectType` + `memberCompletions`.
+// `symMemberScanAt(line, col)` resolves the binding under the cursor (the receiver
+// identifier — the host strips the trailing `.` so it parses as a bare expression),
+// reads its retained type, softens a nullable, and records each completable member:
+// a `TyObj`'s identifier-named fields, or a `string`'s builtin methods. The result
+// lands in the `memc*` arrays, read by the per-index accessors. Arrays/maps expose
+// no members here (parity with the host, which surfaces none for them).
+export let memcName: string[] = []
+export let memcType: string[] = []
+export let memcIsFn: i32[] = []

@@ -1,0 +1,470 @@
+// `check_query.vl` — the read-only LSP QUERY layer over a finished check: symbol
+// occurrences / def / refs / hover (`sym*`), redundant-type reports (`redun*`), inlay
+// hints. Reads `check_state` + the checker's `T`/types, never drives checking.
+
+import { P } from "./ast"
+import { SYM_MEM_METHOD, inlayCol, inlayKind, inlayLine, inlayOcc, inlayType, memcIsFn, memcName, memcType, redunECol, redunELine, redunName, redunSCol, redunSLine, redunTok, redunType, scopeResKind, scopeResName, scopeResType, symBindKind, symBindNode, symBindType, symEnabled, symMemCol, symMemEndCol, symMemLine, symMemNode, symMemTy, symOccDecl, symOccIsDecl, symOccTok, symVisEC, symVisEL, symVisKind, symVisName, symVisNode, symVisSC, symVisSL } from "./check_state"
+import { T, TyFunc, TyNullable, TyObj, TyPrim, cUserTypes, demangleName, inlayHole, tyToStr } from "./typecheck"
+
+// The kind (0=variable 1=parameter 2=function) of the binding `declNode`
+// resolves to, or -1 when it is not a recorded binding — semantic-token coloring.
+export function symBindKindOf(declNode: i32) {
+  let i = 0
+  while i < symBindNode.length {
+    if symBindNode[i] == declNode { return symBindKind[i] }
+    i = i + 1
+  }
+  -1
+}
+// ── symbol-table QUERY API (consumed by the driver's exports) ────────────────
+// Turn the LSP symbol machinery on/off. The driver flips it on before a
+// symbol-aware `checkProgram`; everything else leaves it off (free, no recording).
+export function symSetEnabled(on: i32) {
+  symEnabled = on
+  0
+}
+// The recorded occurrences (declarations + uses), in source-walk order.
+export function symOccCount() { symOccTok.length }
+// The bindingId (declaring node index) the occurrence `i` resolves to.
+export function symOccBinding(i: i32) {
+  if i >= 0 && i < symOccDecl.length { return symOccDecl[i] }
+  -1
+}
+// 1 when occurrence `i` is its binding's declaration, 0 for a use.
+export function symOccIsDeclAt(i: i32) {
+  if i >= 0 && i < symOccIsDecl.length { return symOccIsDecl[i] }
+  0
+}
+// The binding KIND of occurrence `i` (0=variable 1=parameter 2=function), or -1
+// when out of range — semantic-token coloring reads this per identifier.
+export function symOccKindAt(i: i32) {
+  if i >= 0 && i < symOccDecl.length { return symBindKindOf(symOccDecl[i]) }
+  -1
+}
+// The four span coordinates of occurrence `i`, derived from its anchor token: a
+// lexeme never spans lines, so the end line equals the start line and the end
+// column is `col + text.length`. A missing/out-of-range token degrades to 0s.
+export function symOccTokOf(i: i32) {
+  if i >= 0 && i < symOccTok.length { return symOccTok[i] }
+  -1
+}
+// Occurrence `i`'s anchor TOKEN index (into `P.toks`), or -1. The driver maps it
+// to the owning MODULE (a module's tokens occupy a contiguous range of `P.toks`
+// after the merge) for cross-file find-references.
+export function symOccTokAt(i: i32) { symOccTokOf(i) }
+export function symOccStartLine(i: i32) {
+  const tk = symOccTokOf(i)
+  if tk >= 0 && tk < P.toks.length { return P.toks[tk].line }
+  0
+}
+export function symOccStartCol(i: i32) {
+  const tk = symOccTokOf(i)
+  if tk >= 0 && tk < P.toks.length { return P.toks[tk].col }
+  0
+}
+export function symOccEndLine(i: i32) { symOccStartLine(i) }
+export function symOccEndCol(i: i32) {
+  const tk = symOccTokOf(i)
+  if tk >= 0 && tk < P.toks.length {
+    return P.toks[tk].col + P.toks[tk].text.length
+  }
+  0
+}
+// Whether occurrence `i`'s span covers (line, col): start inclusive, end
+// inclusive (a cursor on the last char of a name still resolves — the host
+// `spanContains` convention).
+export function symOccCovers(i: i32, line: i32, col: i32) {
+  const sl = symOccStartLine(i)
+  if sl == 0 { return false }
+  if line != sl { return false }
+  const sc = symOccStartCol(i)
+  const ec = symOccEndCol(i)
+  col >= sc && col <= ec
+}
+// The occurrence index covering (line, col), tightest span winning (a name
+// nested in a larger construct beats an outer one); -1 if the cursor is off any
+// identifier occurrence.
+export function symOccAt(line: i32, col: i32) {
+  let best = -1
+  let bestWidth = 0
+  let i = 0
+  while i < symOccTok.length {
+    if symOccCovers(i, line, col) {
+      const w = symOccEndCol(i) - symOccStartCol(i)
+      if best < 0 || w < bestWidth {
+        best = i
+        bestWidth = w
+      }
+    }
+    i = i + 1
+  }
+  best
+}
+// The DECLARATION occurrence index for the binding under (line, col), or -1.
+// Drives go-to-definition: jump to this occurrence's span.
+export function symDefAt(line: i32, col: i32) {
+  const occ = symOccAt(line, col)
+  if occ < 0 { return -1 }
+  const binding = symOccDecl[occ]
+  let i = 0
+  while i < symOccTok.length {
+    if symOccDecl[i] == binding && symOccIsDecl[i] == 1 { return i }
+    i = i + 1
+  }
+  // A binding with no recorded declaration occurrence (defensive): the use under
+  // the cursor is itself the best available anchor.
+  occ
+}
+// The count of occurrences (declaration + uses) of the binding under (line, col)
+// — find-references. `symRefAt(line, col, k)` returns the k-th such occurrence
+// INDEX (read its span via the `symOcc*` accessors).
+export function symRefsCountAt(line: i32, col: i32) {
+  const occ = symOccAt(line, col)
+  if occ < 0 { return 0 }
+  const binding = symOccDecl[occ]
+  let n = 0
+  let i = 0
+  while i < symOccTok.length {
+    if symOccDecl[i] == binding { n = n + 1 }
+    i = i + 1
+  }
+  n
+}
+export function symRefAt(line: i32, col: i32, k: i32) {
+  const occ = symOccAt(line, col)
+  if occ < 0 { return -1 }
+  const binding = symOccDecl[occ]
+  let seen = 0
+  let i = 0
+  while i < symOccTok.length {
+    if symOccDecl[i] == binding {
+      if seen == k { return i }
+      seen = seen + 1
+    }
+    i = i + 1
+  }
+  -1
+}
+// The rendered TYPE STRING of the binding under (line, col), or "" when the
+// cursor is off any tracked binding or its type was not retained. The arena
+// `T.tys` persists for the whole check, so the retained index renders even after
+// the binding's scope closed (hover-types).
+// The retained type-arena index of binding `binding`, or -1 when none was kept.
+export function bindTypeOf(binding: i32) {
+  let i = 0
+  while i < symBindNode.length {
+    if symBindNode[i] == binding { return symBindType[i] }
+    i = i + 1
+  }
+  -1
+}
+export function symTypeStrAt(line: i32, col: i32) {
+  const occ = symOccAt(line, col)
+  if occ < 0 { return "" }
+  let ty = bindTypeOf(symOccDecl[occ])
+  if ty < 0 { return "" }
+  tyToStr(ty)
+}
+export function inlayPush(k: i32, occ: i32, ty: i32) {
+  inlayKind.push(k)
+  inlayLine.push(symOccEndLine(occ))
+  inlayCol.push(symOccEndCol(occ))
+  inlayType.push(tyToStr(ty))
+  inlayOcc.push(occ)
+}
+export function symInlayScan() {
+  inlayKind = []
+  inlayLine = []
+  inlayCol = []
+  inlayType = []
+  inlayOcc = []
+  let i = 0
+  while i < symOccIsDecl.length {
+    if symOccIsDecl[i] == 1 {
+      let ty = bindTypeOf(symOccDecl[i])
+      if ty >= 0 {
+        let k = symOccKindAt(i)
+        if k == 2 {
+          let t = T.tys[ty]
+          if t is TyFunc {
+            if !inlayHole(t.fnRet) { inlayPush(1, i, t.fnRet) }
+          }
+        } else {
+          if !inlayHole(ty) { inlayPush(0, i, ty) }
+        }
+      }
+    }
+    i = i + 1
+  }
+  inlayKind.length
+}
+export function symInlayCount() { inlayKind.length }
+export function symInlayKindAt(i: i32) { inlayKind[i] }
+export function symInlayLineAt(i: i32) { inlayLine[i] }
+export function symInlayColAt(i: i32) { inlayCol[i] }
+export function symInlayTypeLen(i: i32) { inlayType[i].length }
+export function symInlayTypeCharAt(i: i32, j: i32) { inlayType[i][j] }
+export function symInlayOccAt(i: i32) { inlayOcc[i] }
+export function redunCount() { redunName.length }
+export function redunSLineAt(i: i32) { redunSLine[i] }
+export function redunSColAt(i: i32) { redunSCol[i] }
+export function redunELineAt(i: i32) { redunELine[i] }
+export function redunEColAt(i: i32) { redunECol[i] }
+export function redunNameAt(i: i32) { redunName[i] }
+export function redunTypeAt(i: i32) { redunType[i] }
+export function redunTokAt(i: i32) { redunTok[i] }
+// Type-alias hover: the rendered type of the user TYPE NAME (a `type`-declared
+// struct/union alias) whose token covers (line, col) — the decl name or a use in
+// an annotation. A type name isn't a value-binding occurrence, so this scans the
+// token stream for the identifier at the cursor and resolves it through the
+// declared-types map (`cUserTypes`), reusing existing state (no occurrence table).
+// "" when the cursor is off a known user type. Builtins (`i32`, …) are NOT user
+// types — the host serves those from its builtin list. Line is 1-based, col 0-based.
+export function symTypeAliasAt(line: i32, col: i32) {
+  let i = 0
+  while i < P.toks.length {
+    let t = P.toks[i]
+    if (
+      t.kind == "IDENT" &&
+      t.line == line &&
+      col >= t.col &&
+      col < t.col + t.text.length
+    ) {
+      if cUserTypes.has(t.text) {
+        let ty = cUserTypes[t.text] ?? (-1)
+        if ty >= 0 { return tyToStr(ty) }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+// The rendered TYPE STRING of the member access whose PROPERTY NAME covers
+// (line, col) — member hover (`o.x` / `o?.y`). The narrowest covering span wins
+// (defensive against any overlap). "" when the cursor is off any recorded member.
+export function symMemTypeStrAt(line: i32, col: i32) {
+  let best = -1
+  let bestW = 0
+  let i = 0
+  while i < symMemNode.length {
+    if symMemLine[i] == line && col >= symMemCol[i] && col < symMemEndCol[i] {
+      const w = symMemEndCol[i] - symMemCol[i]
+      if best < 0 || w < bestW {
+        best = i
+        bestW = w
+      }
+    }
+    i = i + 1
+  }
+  if best < 0 { return "" }
+  let ty = symMemTy[best]
+  if ty < 0 { return "" }
+  tyToStr(ty)
+}
+// Whether type `ty` is a function — the `method` vs `property` distinction for
+// semantic tokens. Unwraps a nullable wrapper so an optional method (`o?.fn`)
+// still classifies as a method, matching the host member walk.
+export function symMemIsFn(ty: i32) {
+  if ty < 0 { return false }
+  let t = T.tys[ty]
+  if t is TyNullable { return symMemIsFn(t.nInner) }
+  t is TyFunc
+}
+// Member-access enumeration (semantic tokens): every recorded member-access
+// property name, in record order, with its span and method/property class — the
+// native equivalent of the host's AST member walk. The host reads
+// `symMemberCount()` then the per-index accessors. Line is 1-based, col 0-based;
+// `symMemberLen` is the property name's length; `symMemberIsMethod` is 1 for a
+// function-typed member, else 0.
+export function symMemberCount() { symMemNode.length }
+export function symMemberLine(i: i32) { symMemLine[i] }
+export function symMemberCol(i: i32) { symMemCol[i] }
+export function symMemberLen(i: i32) { symMemEndCol[i] - symMemCol[i] }
+export function symMemberIsMethod(i: i32) {
+  if symMemTy[i] == SYM_MEM_METHOD { return 1 }
+  if symMemIsFn(symMemTy[i]) { return 1 }
+  0
+}
+// The rendered TYPE STRING of binding `declNode`, or "" when no type was retained.
+// The arena persists for the whole check, so the index renders post-scope-close.
+export function symBindTypeStr(declNode: i32) {
+  let i = 0
+  while i < symBindNode.length {
+    if symBindNode[i] == declNode {
+      let ty = symBindType[i]
+      if ty < 0 { return "" }
+      return tyToStr(ty)
+    }
+    i = i + 1
+  }
+  ""
+}
+// Whether visibility entry `i`'s scope span contains (line, col) — `start`
+// inclusive, `stop` inclusive (a cursor at a scope's last column still counts).
+export function visContainsPos(i: i32, line: i32, col: i32) {
+  const afterStart = line > symVisSL[i] ||
+    (line == symVisSL[i] && col >= symVisSC[i])
+  const beforeEnd = line < symVisEL[i] ||
+    (line == symVisEL[i] && col <= symVisEC[i])
+  afterStart && beforeEnd
+}
+// Whether entry `a`'s scope is TIGHTER (more deeply nested) than entry `b`'s —
+// the lexical-shadowing tiebreak: a same-line scope compares by column width, a
+// multi-line scope by line count. Mirrors the host `spanShorter`.
+export function visTighter(a: i32, b: i32) {
+  const aSame = symVisSL[a] == symVisEL[a]
+  const bSame = symVisSL[b] == symVisEL[b]
+  if aSame && bSame {
+    return (symVisEC[a] - symVisSC[a]) < (symVisEC[b] - symVisSC[b])
+  }
+  (symVisEL[a] - symVisSL[a]) < (symVisEL[b] - symVisSL[b])
+}
+// Scope-at-position (completion): the user bindings (var/param/function) visible
+// at (line, col) — 1-based line, 0-based col. Computes the result into the
+// `scopeRes*` arrays (read by the per-index accessors) and returns the count.
+// One binding per name: when several of a name are visible, the TIGHTEST scope
+// wins (an inner `let` shadows an outer). The host folds in builtins/imports.
+// An imported name is recorded under its mangled merge name (`add$m1`); it's
+// de-mangled to its source name (`add`) for display, and de-dup is keyed on that
+// source name so a local and a same-named import collapse (tightest wins).
+export function symScopeAt(line: i32, col: i32) {
+  scopeResName = []
+  scopeResKind = []
+  scopeResType = []
+  const resVis: i32[] = []
+  const idxByName: {[string]: i32} = Map()
+  let i = 0
+  while i < symVisName.length {
+    if visContainsPos(i, line, col) {
+      const nm = demangleName(symVisName[i])
+      const existing = idxByName[nm] ?? (-1)
+      if existing < 0 {
+        idxByName[nm] = scopeResName.length
+        scopeResName.push(nm)
+        scopeResKind.push(symVisKind[i])
+        scopeResType.push(symBindTypeStr(symVisNode[i]))
+        resVis.push(i)
+      } else if visTighter(i, resVis[existing]) {
+        scopeResKind[existing] = symVisKind[i]
+        scopeResType[existing] = symBindTypeStr(symVisNode[i])
+        resVis[existing] = i
+      }
+    }
+    i = i + 1
+  }
+  scopeResName.length
+}
+export function symScopeNameLen(i: i32) {
+  if i < 0 || i >= scopeResName.length { return 0 }
+  scopeResName[i].length
+}
+export function symScopeNameCharAt(i: i32, j: i32) {
+  if i < 0 || i >= scopeResName.length { return 0 }
+  scopeResName[i][j]
+}
+export function symScopeKindAt(i: i32) {
+  if i < 0 || i >= scopeResKind.length { return 0 }
+  scopeResKind[i]
+}
+export function symScopeTypeLen(i: i32) {
+  if i < 0 || i >= scopeResType.length { return 0 }
+  scopeResType[i].length
+}
+export function symScopeTypeCharAt(i: i32, j: i32) {
+  if i < 0 || i >= scopeResType.length { return 0 }
+  scopeResType[i][j]
+}
+// Whether `nm` is a plain identifier (so it's dot-accessible) — excludes the
+// operator field names (`+`, `==`, …) an object type also carries. Mirrors the
+// host's `/^[A-Za-z_][A-Za-z0-9_]*$/` guard.
+export function isIdentName(nm: string) {
+  if nm.length == 0 { return false }
+  const c0 = nm[0]
+  if !((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95) {
+    return false
+  }
+  let k = 1
+  while k < nm.length {
+    const c = nm[k]
+    let ok = (c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      c == 95 ||
+      (c >= 48 && c <= 57)
+    if !ok { return false }
+    k = k + 1
+  }
+  true
+}
+// Soften a receiver type to its member-bearing core: unwrap a nullable (`o?.`).
+export function memcSoften(ty: i32) {
+  if ty < 0 { return ty }
+  let t = T.tys[ty]
+  if t is TyNullable { return memcSoften(t.nInner) }
+  ty
+}
+export function memcPush(nm: string, ds: string, fn: i32) {
+  memcName.push(nm)
+  memcType.push(ds)
+  memcIsFn.push(fn)
+}
+export function symMemberScanAt(line: i32, col: i32) {
+  memcName = []
+  memcType = []
+  memcIsFn = []
+  const occ = symOccAt(line, col)
+  if occ < 0 { return 0 }
+  const binding = symOccDecl[occ]
+  let ty = -1
+  let i = 0
+  while i < symBindNode.length {
+    if symBindNode[i] == binding { ty = symBindType[i] }
+    i = i + 1
+  }
+  if ty < 0 { return 0 }
+  ty = memcSoften(ty)
+  if ty < 0 { return 0 }
+  let t = T.tys[ty]
+  if t is TyObj {
+    let k = 0
+    while k < t.objFieldNames.length {
+      const nm = t.objFieldNames[k]
+      if isIdentName(nm) {
+        let fty = t.objFieldTypes[k]
+        let isfn = 0
+        if symMemIsFn(fty) { isfn = 1 }
+        memcPush(nm, tyToStr(fty), isfn)
+      }
+      k = k + 1
+    }
+  } else if t is TyPrim {
+    if t.primName == "string" {
+      // The string builtin methods the host surfaces (call-arms in this file).
+      memcPush("slice", "(i32, i32) -> string", 1)
+      memcPush("indexOf", "(string) -> i32", 1)
+      memcPush("includes", "(string) -> boolean", 1)
+      memcPush("charCodeAt", "(i32) -> i32", 1)
+    }
+  }
+  memcName.length
+}
+export function symMemberScanCount() { memcName.length }
+export function symMemberScanNameLen(i: i32) {
+  if i < 0 || i >= memcName.length { return 0 }
+  memcName[i].length
+}
+export function symMemberScanNameCharAt(i: i32, j: i32) {
+  if i < 0 || i >= memcName.length { return 0 }
+  memcName[i][j]
+}
+export function symMemberScanTypeLen(i: i32) {
+  if i < 0 || i >= memcType.length { return 0 }
+  memcType[i].length
+}
+export function symMemberScanTypeCharAt(i: i32, j: i32) {
+  if i < 0 || i >= memcType.length { return 0 }
+  memcType[i][j]
+}
+export function symMemberScanIsFn(i: i32) {
+  if i < 0 || i >= memcIsFn.length { return 0 }
+  memcIsFn[i]
+}
