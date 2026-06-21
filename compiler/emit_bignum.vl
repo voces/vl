@@ -1,0 +1,395 @@
+// `emit_bignum.vl` — arbitrary-precision integer math + numeric-literal helpers,
+// extracted from the emitter. A `bignum` is a little-endian `i32[]` of base-2^16
+// limbs powering the i64 / `2^31` literal range checks. A self-contained LEAF — no
+// emitter state beyond its own `gDivRemNonzero` flag, no cross-module calls, no
+// cycle. Split out to shrink `wasmEmit.vl`.
+
+// Scratch out-param for `bigDivmod`: set to `true` when the division left a NONZERO
+// remainder (the IEEE-754 "sticky" bit). The decimal→double encoder reads it after the
+// final divide to decide round-to-nearest-ties-to-even. (Slice 3.)
+export let gDivRemNonzero = false
+
+// Does the non-negative integer LEXEME `t` (a `NumLit.numText`: decimal / hex /
+// binary / octal, `_` separators skipped) fit the i32 range [0, 2147483647]?
+// Mirrors the checker's `intLexemeFitsI32` (the host `defaultIntegerType`
+// magnitude rule): a literal past the bound is TYPED i64, so it must lower as
+// `i64.const` — `i32.const` would silently wrap (0xDEAD_BEEF). The lexeme never
+// carries a sign (unary minus is a separate node). Digits fold with a
+// pre-multiply overflow guard (`v > (max - d) / base`), no 64-bit arithmetic.
+export function numLexFitsI32(t: string) {
+  let v = 0
+  let i = 0
+  let base = 10
+  if t.length >= 2 && t[0] == '0' {
+    const p = t[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  while i < t.length {
+    let c = t[i]
+    if c == '_' {
+      i = i + 1
+    } else {
+      let d = 0
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else { d = c - 'A' + 10 }
+      if v > (2147483647 - d) / base { return false }
+      v = v * base + d
+      i = i + 1
+    }
+  }
+  true
+}
+// Is the integer LEXEME's magnitude EXACTLY 2^31 (2147483648)? Mirrors the
+// checker's `intLexemeIs2Pow31`: the host folds a negated literal into a signed
+// literal before defaulting, so `-2147483648` is i32 (it sits AT I32_MIN) even
+// though the bare magnitude is one past I32_MAX. Used by the unary `-` arms.
+// Compares the significant digits (base prefix, `_` separators and leading
+// zeros stripped) against 2^31 written in the lexeme's base.
+export function numLexIs2Pow31(t: string) {
+  let digits = "2147483648"
+  let i = 0
+  if t.length >= 2 && t[0] == '0' {
+    const p = t[1]
+    if p == 'x' || p == 'X' {
+      digits = "80000000"
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      digits = "10000000000000000000000000000000"
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      digits = "20000000000"
+      i = 2
+    }
+  }
+  let started = false
+  let j = 0
+  while i < t.length {
+    let c = t[i]
+    if c == '_' {
+      i = i + 1
+    } else if !started && c == '0' {
+      i = i + 1
+    } else {
+      started = true
+      if j >= digits.length { return false }
+      if c != digits[j] { return false }
+      i = i + 1
+      j = j + 1
+    }
+  }
+  j == digits.length
+}
+// Fold a non-negative integer LEXEME (a `NumLit.numText`, possibly past the i32
+// range) into a 64-bit (hi, lo) i32 PAIR, returned as `[hi, lo]`. Mirrors
+// `parseI32`'s base detection (hex `0x`/binary `0b`/octal `0o`, else decimal,
+// with `_` separators skipped) but accumulates into the pair via 64-bit
+// multiply-add so values like `0xFFFFFFFFFF` survive intact. Each step computes
+// `pair = pair * base + digit` using `mulAdd64`.
+export function parseI64Pair(text: string) {
+  let hi = 0
+  let lo = 0
+  let i = 0
+  let base = 10
+  if text.length >= 2 && text[0] == '0' {
+    const p = text[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  while i < text.length {
+    let c = text[i]
+    if c == '_' {
+      i = i + 1
+    } else {
+      let d = 0
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else { d = c - 'A' + 10 }
+      let r = mulAdd64(hi, lo, base, d)
+      hi = r[0]
+      lo = r[1]
+      i = i + 1
+    }
+  }
+  let out: i32[] = []
+  out.push(hi)
+  out.push(lo)
+  out
+}
+// 64-bit `(hi, lo) * m + add`, returned as `[hi, lo]`. `m`/`add` are small
+// (base ≤ 16, digit ≤ 15) so the multiply fits without a full 64×64. The low
+// lane is split into two 16-bit halves so each partial product stays within i32;
+// carries propagate into the high lane. All lanes are treated as UNSIGNED 32-bit.
+export function mulAdd64(hi: i32, lo: i32, m: i32, add: i32) {
+  const loLow = lo & 0xffff
+  const loHigh = (lo >>> 16) & 0xffff
+  const p0 = loLow * m + add
+  const p1 = loHigh * m + (p0 >>> 16)
+  const newLo = (p0 & 0xffff) | ((p1 & 0xffff) << 16)
+  let carry = p1 >>> 16
+  // High lane: hi * m + carry, low 32 bits kept (overflow past 64 bits is dropped,
+  // as the host's `i64.const` wraps mod 2^64).
+  const hiLow = hi & 0xffff
+  const hiHigh = (hi >>> 16) & 0xffff
+  const q0 = hiLow * m + carry
+  const q1 = hiHigh * m + (q0 >>> 16)
+  const newHi = (q0 & 0xffff) | ((q1 & 0xffff) << 16)
+  let out: i32[] = []
+  out.push(newHi)
+  out.push(newLo)
+  out
+}
+// Drop leading-zero limbs (keep at least one). A bignum is always >= 1 limb.
+export function bigTrim(a: i32[]) {
+  while a.length > 1 && a[a.length - 1] == 0 { a.pop() }
+  a
+}
+// True when the bignum is exactly zero.
+export function bigIsZero(a: i32[]) { a.length == 1 && a[0] == 0 }
+// `a * m` for a small (<= 0xffff) multiplier. Each limb×m fits in i32; carry rolls up.
+export function bigMulSmall(a: i32[], m: i32) {
+  let out: i32[] = []
+  let carry = 0
+  let i = 0
+  while i < a.length {
+    const p = a[i] * m + carry
+    out.push(p & 0xffff)
+    carry = (p >>> 16) & 0xffff
+    i = i + 1
+  }
+  while carry != 0 {
+    out.push(carry & 0xffff)
+    carry = (carry >>> 16) & 0xffff
+  }
+  if out.length == 0 { out.push(0) }
+  bigTrim(out)
+}
+// `a + v` for a small (<= 0xffff) addend.
+export function bigAddSmall(a: i32[], v: i32) {
+  let out: i32[] = []
+  let i = 0
+  while i < a.length {
+    out.push(a[i])
+    i = i + 1
+  }
+  let carry = v
+  let j = 0
+  while carry != 0 {
+    if j >= out.length { out.push(0) }
+    let s = out[j] + carry
+    out[j] = s & 0xffff
+    carry = (s >>> 16) & 0xffff
+    j = j + 1
+  }
+  bigTrim(out)
+}
+// Compare two bignums: -1 if a<b, 0 if equal, 1 if a>b.
+export function bigCmp(a: i32[], b: i32[]) {
+  if a.length != b.length {
+    if a.length < b.length { return -1 }
+    return 1
+  }
+  let i = a.length - 1
+  while i >= 0 {
+    if a[i] != b[i] {
+      if a[i] < b[i] { return -1 }
+      return 1
+    }
+    i = i - 1
+  }
+  0
+}
+// `a - b`, requiring a >= b (caller guarantees). Borrow-propagating limb subtract.
+export function bigSub(a: i32[], b: i32[]) {
+  let out: i32[] = []
+  let borrow = 0
+  let i = 0
+  while i < a.length {
+    let bv = 0
+    if i < b.length { bv = b[i] }
+    let d = a[i] - bv - borrow
+    if d < 0 {
+      d = d + 0x10000
+      borrow = 1
+    } else {
+      borrow = 0
+    }
+    out.push(d)
+    i = i + 1
+  }
+  bigTrim(out)
+}
+// `a * 2` (left shift by one bit).
+export function bigShl1(a: i32[]) {
+  let out: i32[] = []
+  let carry = 0
+  let i = 0
+  while i < a.length {
+    let v = (a[i] << 1) | carry
+    out.push(v & 0xffff)
+    carry = (v >>> 16) & 1
+    i = i + 1
+  }
+  if carry != 0 { out.push(1) }
+  bigTrim(out)
+}
+// `a >> 1` (floor divide by two). Walk limbs high→low, threading the dropped bit.
+export function bigShr1(a: i32[]) {
+  let out: i32[] = []
+  let i = 0
+  while i < a.length {
+    out.push(0)
+    i = i + 1
+  }
+  let carry = 0
+  let k = a.length - 1
+  while k >= 0 {
+    let v = a[k] | (carry << 16)
+    out[k] = (v >>> 1) & 0xffff
+    carry = v & 1
+    k = k - 1
+  }
+  bigTrim(out)
+}
+// `a << bits` (multiply by 2^bits), applied bit-by-bit (`bits` is small here).
+export function bigShlK(a: i32[], bits: i32) {
+  let r = a
+  let i = 0
+  while i < bits {
+    r = bigShl1(r)
+    i = i + 1
+  }
+  r
+}
+// Number of significant bits in `a` (0 for zero).
+export function bigBitLen(a: i32[]) {
+  if bigIsZero(a) { return 0 }
+  let top = a[a.length - 1]
+  let bits = (a.length - 1) * 16
+  while top != 0 {
+    bits = bits + 1
+    top = top >>> 1
+  }
+  bits
+}
+// Bit `idx` (0 = least significant) of `a`.
+export function bigGetBit(a: i32[], idx: i32) {
+  const limb = idx >>> 4
+  const off = idx & 15
+  if limb >= a.length { return 0 }
+  (a[limb] >>> off) & 1
+}
+// floor(n / d) by bitwise long division. The REMAINDER's nonzero-ness (the sticky
+// bit) is returned via the `gDivRemNonzero` module global — that is all the encoder
+// needs from the remainder, so no second array is returned.
+export function bigDivmod(n: i32[], d: i32[]) {
+  const nb = bigBitLen(n)
+  let rem: i32[] = []
+  rem.push(0)
+  const qbits: i32[] = []
+  let b = nb - 1
+  while b >= 0 {
+    rem = bigShl1(rem)
+    if bigGetBit(n, b) == 1 { rem = bigAddSmall(rem, 1) }
+    if bigCmp(rem, d) >= 0 {
+      rem = bigSub(rem, d)
+      qbits.push(1)
+    } else {
+      qbits.push(0)
+    }
+    b = b - 1
+  }
+  // qbits are MSB-first; fold into a bignum.
+  let q: i32[] = []
+  q.push(0)
+  let i = 0
+  while i < qbits.length {
+    q = bigShl1(q)
+    if qbits[i] == 1 { q = bigAddSmall(q, 1) }
+    i = i + 1
+  }
+  gDivRemNonzero = !bigIsZero(rem)
+  bigTrim(q)
+}
+// Parse a non-negative integer lexeme (a `NumLit.numText`) into its i32 value.
+// The lexer stores the RAW source lexeme: a plain decimal digit run, OR a `0x`/
+// `0X` hex run, OR a `0b`/`0B` binary run (it mirrors the host's base set, but
+// keeps the lexeme un-normalized — so the base is folded here, at value time).
+// The prefix is detected from the first two chars; otherwise base-10 is assumed.
+// Each digit char's value is its char code minus the appropriate base offset.
+export function parseI32(text: string) {
+  let v = 0
+  let i = 0
+  // Hex `0x…` / binary `0b…` / octal `0o…` — skip the two-char prefix, then fold
+  // base 16 / 2 / 8. A `_` digit separator (legal in every base) is skipped.
+  if text.length >= 2 && text[0] == '0' {
+    const p = text[1]
+    if p == 'x' || p == 'X' {
+      i = 2
+      while i < text.length {
+        let c = text[i]
+        if c == '_' {
+          i = i + 1
+        } else {
+          let d = 0
+          if c >= '0' && c <= '9' { d = c - '0' }
+          else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+          else { d = c - 'A' + 10 }
+          v = v * 16 + d
+          i = i + 1
+        }
+      }
+      return v
+    }
+    if p == 'b' || p == 'B' {
+      i = 2
+      while i < text.length {
+        if text[i] == '_' {
+          i = i + 1
+        } else {
+          v = v * 2 + (text[i] - '0')
+          i = i + 1
+        }
+      }
+      return v
+    }
+    if p == 'o' || p == 'O' {
+      i = 2
+      while i < text.length {
+        if text[i] == '_' {
+          i = i + 1
+        } else {
+          v = v * 8 + (text[i] - '0')
+          i = i + 1
+        }
+      }
+      return v
+    }
+  }
+  while i < text.length {
+    if text[i] == '_' {
+      i = i + 1
+    } else {
+      v = v * 10 + (text[i] - '0')
+      i = i + 1
+    }
+  }
+  v
+}
