@@ -225,6 +225,10 @@ let tpEnvTys: i32[] = []
 // call's bindings (`?fld.x.?getx.0` → field `x` of the pinned argument).
 let holeShapeNames: string[] = []
 let holeShapeTys: i32[] = []
+// Hole NAMES that were INDEXED (`self[i]`) — so the hole demands an array. The call site
+// rejects a non-indexable scalar argument bound to such a param (`head(5)` where the body
+// read `self[0]`), the indexing analogue of the demanded-shape check above.
+let holeArrayDemand: string[] = []
 
 // The const-binding chain, PARALLEL to `T.scopes`: each frame records which of
 // its names were bound `const` (immutable NAME, not immutable data — a field
@@ -796,6 +800,7 @@ export function initChecker() {
   stSeenStack = []
   holeShapeNames = []
   holeShapeTys = []
+  holeArrayDemand = []
   fnDeclIx = Map()
   moduleGlobals = Map()
   topUnannotFns = []
@@ -3692,6 +3697,36 @@ function holeShapeOf(name: string) {
   -1
 }
 
+// Record that hole `name` was indexed (so it demands an array). Idempotent.
+function noteArrayDemand(name: string) {
+  let i = 0
+  while i < holeArrayDemand.length {
+    if holeArrayDemand[i] == name { return 0 }
+    i = i + 1
+  }
+  holeArrayDemand.push(name)
+  0
+}
+
+function holeIsArrayDemanded(name: string) {
+  let i = 0
+  while i < holeArrayDemand.length {
+    if holeArrayDemand[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// A type that definitively CANNOT be indexed `[i]`: a scalar primitive (i32 / f64 / i64 /
+// f32 / boolean / null / …) — anything but a `string`. An array / string / struct (may carry
+// a `"[]"` trap) / map / hole / error is NOT rejected here (it resolves or defers).
+function tyIsNonIndexableScalar(tyIx: i32) {
+  if tyIx < 0 { return false }
+  const t = T.tys[tyIx]
+  if t is TyPrim { return t.primName != "string" }
+  false
+}
+
 // Member access on an inference hole (host `getChildType` on `Infer<Unknown>`):
 // record the field on the hole's demanded shape — creating the shape on first
 // access, the field on first read — and return the field's DERIVED hole.
@@ -4139,6 +4174,14 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
                 tyToStr(hShape) +
                 ", got " +
                 tyToStr(at),
+              ix,
+            )
+          }
+        }
+        if holeIsArrayDemanded(pHole.tvName) {
+          if tyIsNonIndexableScalar(at) {
+            tErr(
+              "argument " + i32ToStr(i + 1) + ": expected an array, got " + tyToStr(at),
               ix,
             )
           }
@@ -4743,6 +4786,16 @@ function checkCallNode(n: Call, ix: i32) {
                 tyToStr(hShape) +
                 ", got " +
                 tyToStr(at),
+              ix,
+            )
+          }
+        }
+        // A hole the body INDEXED (`self[i]`) demands an array — a scalar argument can't be
+        // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
+        if holeIsArrayDemanded(pHole.tvName) {
+          if tyIsNonIndexableScalar(at) {
+            tErr(
+              "argument " + i32ToStr(i + 1) + ": expected an array, got " + tyToStr(at),
               ix,
             )
           }
@@ -6547,6 +6600,7 @@ function checkNodeReal(ix: i32) {
       if !assignable(idxTy, TY_I32) {
         tErr("array index must be i32, got " + tyToStr(idxTy), ix)
       }
+      noteArrayDemand(at.tvName)
       return mkTyVar("?elem." + at.tvName)
     }
     // Index TRAP (B13, host parser `indexTrap`): a user object that declares a
