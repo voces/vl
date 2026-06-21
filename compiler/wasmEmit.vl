@@ -1,7 +1,7 @@
 import { Diag, Tok } from "./ast"
 import { advance, gSrc, mkTok, scanQuoted } from "./lexer"
 import { accept, parseExpr, parseProgram, parseStmt, parseType, parseTypeName } from "./parser"
-import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
+import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, nodeTyName, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
 import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkBlock, mkCall, mkCallN, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkLet, mkMember, mkParam, mkParen, mkReturn, mkStr, mkTypeRef, mkWhile, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 // VL-in-VL wasm emitter — self-hosted codegen spike.
 //
@@ -21371,6 +21371,34 @@ function monomorphize(stmts: i32[]) {
   0
 }
 
+// Give each un-annotated parameter the concrete scalar/string type the checker recorded for
+// it (`nodeTyName`) — a contextually-inferred callback param (`xs.map((x) => x * 2.0)` ⇒
+// `x: f64`) whose annotation the emitter otherwise defaults to i32 (`checkParams`), so an
+// f64/string-element callback mis-lowered. Emit-time, post-check (fmt untouched); a generic
+// hole / already-annotated / non-scalar param yields "" and is left as-is.
+function synthParamAnnots() {
+  let fe = 0
+  while fe < fnStmts.length {
+    let fn = P.nodes[fnStmts[fe]]
+    if fn is FuncDecl {
+      const ps = fn.fnParams
+      let pi = 0
+      while pi < ps.length {
+        let p = P.nodes[ps[pi]]
+        if p is Param {
+          if p.parType < 0 {
+            const tn = nodeTyName(ps[pi])
+            if tn != "" { p.parType = mkTypeRef(tn, -1) }
+          }
+        }
+        pi = pi + 1
+      }
+    }
+    fe = fe + 1
+  }
+  0
+}
+
 export function emitProgram(rootIx: i32) {
   emitFailed = false
   emitErr = ""
@@ -21423,6 +21451,13 @@ export function emitProgram(rootIx: i32) {
     collectAnnShapes()
     if collectA(stmts) < 0 { return -1 }
     if buildFnMap(stmts) < 0 { return -1 }
+    // Synthesize an un-annotated CALLBACK param's annotation from the checker's recorded type
+    // (`xs.map((x) => x * 2.0)` over `f64[]` ⇒ `x: f64`), so its functype valtype follows the
+    // contextually-inferred element instead of defaulting to i32. Runs after monomorphization
+    // (so an instance's pinned params are in place) and BEFORE the `$fnsig` / map-filter
+    // collection that reads param valtypes. Usage-gated: a param with no recorded scalar type
+    // (generic hole, or already annotated) is left untouched → byte-identical.
+    synthParamAnnots()
     computeVoidFns()
     computeRetInference()
     // `.map`/`.filter` sites flip `fnValUsed` (the callback is a function value) and
