@@ -83,6 +83,7 @@ import {
   ForRange,
   ForIn,
 } from "./ast"
+import { binPrecOf, branchIsSimple, calleePrimary, codeWidthBefore, collapseWs, elseIsIf, exportPrefix, hasNewline, indentStr, isBlankLine, isBracedBlock, isLeafStmt, isOwnLineComment, isWs, joinLines, joinLinesRange, leadingSpaces, nodePos, normalizeProgram, parenForChain, rstrip, rstripNl, rstripWsAll, spaces, splitLines, tokIndexAt, trailingCommentAt, trimWs, trimWsStart, unwrapOuterParen } from "./fmt_util"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 let fmtWidth = 80
@@ -155,16 +156,6 @@ function fmtEmitRaw(s: string) {
   0
 }
 
-function indentStr(n: i32) {
-  let s = ""
-  let i = 0
-  while i < n {
-    s = s + "  "
-    i = i + 1
-  }
-  s
-}
-
 // Emit one full line `<indent><text>\n`.
 function emitLine(indent: i32, text: string) {
   outBuf.push(indentStr(indent) + text + "\n")
@@ -192,49 +183,6 @@ function lineOf(off: i32) {
     }
   }
   ln
-}
-
-// The START char offset (`pos`) of arena node `ix` — narrows to read the common
-// `pos` field (VL has no cross-variant field read). `-1` for an out-of-range or
-// synthesized node.
-function nodePos(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return -1 }
-  let n = P.nodes[ix]
-  if n is NumLit { return n.pos }
-  if n is StrLit { return n.pos }
-  if n is CharLit { return n.pos }
-  if n is BoolLit { return n.pos }
-  if n is NullLit { return n.pos }
-  if n is Ident { return n.pos }
-  if n is Unary { return n.pos }
-  if n is BinExpr { return n.pos }
-  if n is Call { return n.pos }
-  if n is Member { return n.pos }
-  if n is OptMember { return n.pos }
-  if n is Paren { return n.pos }
-  if n is ErrExpr { return n.pos }
-  if n is LetDecl { return n.pos }
-  if n is Param { return n.pos }
-  if n is TypeRef { return n.pos }
-  if n is FuncDecl { return n.pos }
-  if n is IfStmt { return n.pos }
-  if n is WhileStmt { return n.pos }
-  if n is BreakStmt { return n.pos }
-  if n is ContinueStmt { return n.pos }
-  if n is RetStmt { return n.pos }
-  if n is Block { return n.pos }
-  if n is Program { return n.pos }
-  if n is FieldDef { return n.pos }
-  if n is TypeDecl { return n.pos }
-  if n is FieldInit { return n.pos }
-  if n is ObjLit { return n.pos }
-  if n is ArrayLit { return n.pos }
-  if n is Index { return n.pos }
-  if n is UnionDecl { return n.pos }
-  if n is IsExpr { return n.pos }
-  if n is ForRange { return n.pos }
-  if n is ForIn { return n.pos }
-  -1
 }
 
 // The verbatim source slice `[start, stop)` of arena node `ix`, or "" when the
@@ -267,89 +215,6 @@ function stopLineOf(ix: i32) {
 
 // ── string normalization helpers (no regex in VL) ─────────────────────────────
 
-function isWs(c: i32) { c == ' ' || c == '\t' || c == '\n' || c == '\r' }
-
-// Trim leading + trailing ASCII whitespace.
-function trimWs(s: string) {
-  let a = 0
-  let b = s.length
-  while a < b && isWs(s[a]) { a = a + 1 }
-  while b > a && isWs(s[b - 1]) { b = b - 1 }
-  const r = s.slice(a, b)
-  r
-}
-
-// Trim only LEADING whitespace.
-function trimWsStart(s: string) {
-  let a = 0
-  while a < s.length && isWs(s[a]) { a = a + 1 }
-  const r = s.slice(a, s.length)
-  r
-}
-
-// Strip trailing spaces/tabs/CR (not newlines).
-function rstrip(s: string) {
-  let b = s.length
-  let going = b > 0
-  while going {
-    const c = s[b - 1]
-    if c == ' ' || c == '\t' || c == '\r' {
-      b = b - 1
-      going = b > 0
-    } else {
-      going = false
-    }
-  }
-  const r = s.slice(0, b)
-  r
-}
-
-// Collapse every run of ASCII whitespace to a single space and trim — the port of
-// the host's `.trim().replace(/\s+/g, " ")` type-slice normalization.
-function collapseWs(s: string) {
-  let out = ""
-  let i = 0
-  let inWs = false
-  while i < s.length {
-    const c = s[i]
-    if isWs(c) {
-      inWs = true
-    } else {
-      if inWs && out.length > 0 { out = out + " " }
-      inWs = false
-      out = out + s.slice(i, i + 1)
-    }
-    i = i + 1
-  }
-  out
-}
-
-// Whether `s` contains a newline.
-function hasNewline(s: string) {
-  let i = 0
-  while i < s.length {
-    if s[i] == '\n' { return true }
-    i = i + 1
-  }
-  false
-}
-
-// Split `s` on '\n' into a list of lines.
-function splitLines(s: string) {
-  let parts: string[] = []
-  let start = 0
-  let i = 0
-  while i < s.length {
-    if s[i] == '\n' {
-      parts.push(s.slice(start, i))
-      start = i + 1
-    }
-    i = i + 1
-  }
-  parts.push(s.slice(start, s.length))
-  parts
-}
-
 // ── trailing-comment alignment (a whole-text post-pass) ───────────────────────
 // `vl fmt` normalizes the spacing before a trailing `//`/`///` comment to a
 // SINGLE space per line; this pass re-aligns runs of them to a common column so
@@ -365,94 +230,6 @@ function splitLines(s: string) {
 // width) + 1`. A commented line whose code is already too wide keeps its single
 // space and does NOT drag the column out. The column is recomputed identically
 // on a re-run, so the pass is idempotent.
-
-function spaces(n: i32) {
-  let s = ""
-  let i = 0
-  while i < n {
-    s = s + " "
-    i = i + 1
-  }
-  s
-}
-
-// Concatenate `parts[lo..hi)` with a `\n` between every adjacent pair, splitting
-// the range in half so the total intermediate-string allocation is O(n log n)
-// rather than the O(n²) of a running `s = s + parts[i]` accumulator. That
-// quadratic blows up under the compiler's NON-FREEING null GC collector — on a
-// large file (e.g. the 6940-line typecheck.vl) the old form exhausted the heap
-// ("allocation size too large") or ran for minutes.
-function joinLinesRange(parts: string[], lo: i32, hi: i32) {
-  if hi - lo <= 0 { return "" }
-  if hi - lo == 1 { return parts[lo] }
-  const mid = lo + (hi - lo) / 2
-  joinLinesRange(parts, lo, mid) + "\n" + joinLinesRange(parts, mid, hi)
-}
-
-function joinLines(parts: string[]) { joinLinesRange(parts, 0, parts.length) }
-
-function isBlankLine(line: string) {
-  let i = 0
-  while i < line.length {
-    if line[i] != ' ' && line[i] != '\t' { return false }
-    i = i + 1
-  }
-  true
-}
-
-// First non-space char starts a `//` — the line is a comment of its own, not a
-// trailing comment, and so breaks an alignment block.
-function isOwnLineComment(line: string) {
-  let i = 0
-  while i < line.length && (line[i] == ' ' || line[i] == '\t') { i = i + 1 }
-  i + 1 < line.length && line[i] == '/' && line[i + 1] == '/'
-}
-
-// The char offset where a line's trailing comment begins, or -1 if it has none.
-// A `//` inside a string/char literal does not count; an own-line comment does
-// not count (it's not TRAILING any code).
-function trailingCommentAt(line: string) {
-  if isOwnLineComment(line) { return -1 }
-  let i = 0
-  let inStr = 0 // 0 = code, 1 = inside "…", 2 = inside '…'
-  while i < line.length {
-    const c = line[i]
-    if inStr == 0 {
-      if c == '"' {
-        inStr = 1
-        i = i + 1
-      } else if c == '\'' {
-        inStr = 2
-        i = i + 1
-      } else if c == '/' && i + 1 < line.length && line[i + 1] == '/' {
-        return i
-      } else {
-        i = i + 1
-      }
-    } else if c == '\\' {
-      i = i + 2 // skip an escaped char inside the literal
-    } else {
-      if inStr == 1 && c == '"' { inStr = 0 }
-      if inStr == 2 && c == '\'' { inStr = 0 }
-      i = i + 1
-    }
-  }
-  -1
-}
-
-// The code width of a line up to offset `c`, with trailing spaces/tabs removed.
-function codeWidthBefore(line: string, c: i32) {
-  let w = c
-  while w > 0 && (line[w - 1] == ' ' || line[w - 1] == '\t') { w = w - 1 }
-  w
-}
-
-// The count of leading spaces on a line (its indentation depth in columns).
-function leadingSpaces(line: string) {
-  let i = 0
-  while i < line.length && line[i] == ' ' { i = i + 1 }
-  i
-}
 
 function alignComments(text: string) {
   const lines = splitLines(text)
@@ -523,20 +300,6 @@ function alignComments(text: string) {
     }
   }
   joinLines(out)
-}
-
-// Strip ALL trailing ASCII whitespace (spaces, tabs, CR, and newlines).
-function rstripWsAll(s: string) {
-  let b = s.length
-  while b > 0 && isWs(s[b - 1]) { b = b - 1 }
-  const r = s.slice(0, b)
-  r
-}
-
-// Strip a single trailing newline.
-function rstripNl(s: string) {
-  if s.length > 0 && s[s.length - 1] == '\n' { return s.slice(0, s.length - 1) }
-  s
 }
 
 // ── comment placement ─────────────────────────────────────────────────────────
@@ -714,33 +477,6 @@ function joinOutRange(lo: i32, hi: i32) {
 
 function joinOut() { joinOutRange(0, outBuf.length) }
 
-// Final normalization: strip per-line trailing whitespace, collapse 2+ blank
-// lines to one, strip leading blank lines, ensure a single trailing newline.
-function normalizeProgram(text: string) {
-  const lines = splitLines(text)
-  // Collect the kept lines, then join ONCE — a running `out = out + line`
-  // accumulator here is O(n²) (and on a large file blew the non-freeing heap, the
-  // last fmt scalability hotspot alongside joinOut/lineOf/exportPrefix).
-  const out: string[] = []
-  let blanks = 0
-  let started = false
-  let i = 0
-  while i < lines.length {
-    let line = rstrip(lines[i])
-    if line.length == 0 {
-      blanks = blanks + 1
-    } else {
-      if started && blanks > 0 { out.push("") }
-      out.push(line)
-      started = true
-      blanks = 0
-    }
-    i = i + 1
-  }
-  if out.length == 0 { return "" }
-  joinLines(out) + "\n"
-}
-
 // ── statements ────────────────────────────────────────────────────────────────
 
 // Emit a sequence of statements at `indent`, preserving a single user blank line
@@ -774,15 +510,6 @@ function emitStatements(stmts: i32[], indent: i32) {
     i = i + 1
   }
   0
-}
-
-// A real braced block: a `Block` node with a source span (`pos >= 0`). A
-// synthesized one-statement wrapper (then/else/bare-fn-body sugar) has `pos < 0`.
-function isBracedBlock(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  let n = P.nodes[ix]
-  if n is Block { return n.pos >= 0 }
-  false
 }
 
 // Emit one closing `}` at `indent`, attaching a trailing comment on `stopLine`.
@@ -853,32 +580,6 @@ function emitExpressionStatement(ix: i32, indent: i32) {
   const rendered = expr(ix, indent, 0)
   emitMultiline(rendered, indent, line)
   0
-}
-
-// Index of the token whose `start` is exactly `pos`, or -1. Tokens are in source
-// order (ascending, distinct `start`), so binary-search it. The linear scans this
-// replaces were O(tokens) per call and run per declaration/field → O(n²) on a
-// large file.
-function tokIndexAt(pos: i32) {
-  let lo = 0
-  let hi = P.toks.length - 1
-  while lo <= hi {
-    const mid = lo + (hi - lo) / 2
-    const s = P.toks[mid].start
-    if s == pos { return mid }
-    if s < pos { lo = mid + 1 } else { hi = mid - 1 }
-  }
-  -1
-}
-
-// `export`-modifier recovery: the parser drops `export`, so look at the token
-// immediately before the declaration's start token for an EXPORT keyword.
-function exportPrefix(ix: i32) {
-  let p = nodePos(ix)
-  if p < 0 { return "" }
-  const i = tokIndexAt(p)
-  if i > 0 && P.toks[i - 1].kind == "EXPORT" { return "export " }
-  ""
 }
 
 function emitLet(ix: i32, node: LetDecl, indent: i32) {
@@ -1068,14 +769,6 @@ function emitLoopBody(head: string, body: i32, indent: i32, headerLine: i32) {
   0
 }
 
-// Whether the `else` chain of `node` is itself an `if` (an `else if` chain).
-function elseIsIf(elseIx: i32) {
-  if elseIx < 0 || elseIx >= P.nodes.length { return false }
-  let n = P.nodes[elseIx]
-  if n is IfStmt { return true }
-  false
-}
-
 function emitIf(ix: i32, node: IfStmt, indent: i32) {
   // An `if … else if … [else]` chain whose every branch is a brace block renders
   // as a clause sequence (one line if it fits, else one clause per line).
@@ -1167,19 +860,6 @@ function inlineBlockBody(blockIx: i32, indent: i32) {
     return "{ " + inner + " }"
   }
   ""
-}
-
-// A leaf statement holds no nested statement list (so it can collapse to a line).
-function isLeafStmt(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  let n = P.nodes[ix]
-  if n is WhileStmt { return false }
-  if n is ForRange { return false }
-  if n is ForIn { return false }
-  if n is IfStmt { return false }
-  if n is Block { return false }
-  if n is FuncDecl { return false }
-  true
 }
 
 // Render an `if … else if … [else]` chain whose every branch is a brace block, in
@@ -1440,30 +1120,6 @@ function literalSlice(ix: i32, fallback: string) {
   fallback
 }
 
-// Binary operator precedence (mirrors the parser / host PRECEDENCE table).
-function binPrecOf(op: string) {
-  if op == "||" { return 4 }
-  if op == "&&" { return 6 }
-  if op == "|" { return 7 }
-  if op == "^" { return 8 }
-  if op == "&" { return 9 }
-  if op == "==" { return 10 }
-  if op == "!=" { return 10 }
-  if op == "<" { return 12 }
-  if op == "<=" { return 12 }
-  if op == ">" { return 12 }
-  if op == ">=" { return 12 }
-  if op == "<<" { return 13 }
-  if op == ">>" { return 13 }
-  if op == ">>>" { return 13 }
-  if op == "+" { return 14 }
-  if op == "-" { return 14 }
-  if op == "*" { return 16 }
-  if op == "/" { return 16 }
-  if op == "%" { return 16 }
-  0
-}
-
 // The binary-chain cluster, defined in DEPENDENCY ORDER (callee before caller) so
 // no function within it forward-references another: the frozen TS host resolves a
 // single-level forward reference (`expr` → `renderBinary` below), but a TRANSITIVE
@@ -1475,16 +1131,6 @@ function binPrecOf(op: string) {
 // flattening is RE-ENTRANT (an operand may itself be a nested chain via
 // `expr` → `renderBinary` → `binaryChain`), and a shared global would be clobbered
 // by the inner call.
-
-// Parenthesize a chain operand when its own operator binds LOOSER than the chain.
-function parenForChain(ix: i32, rendered: string, parentPrec: i32) {
-  let n = P.nodes[ix]
-  if n is BinExpr {
-    const looser = n.binOp != "=" && binPrecOf(n.binOp) < parentPrec
-    if looser { return "(" + rendered + ")" }
-  }
-  rendered
-}
 
 // Recurse into a binary node, flattening same-precedence left-assoc operands into
 // the parallel `ops`/`txt` arrays (`ops[k]` = operator leading operand k, "" for
@@ -1546,24 +1192,6 @@ function binaryChain(ix: i32, node: BinExpr, indent: i32, column: i32) {
 function renderBinary(ix: i32, node: BinExpr, indent: i32, column: i32) {
   if node.binOp == "=" { return renderAssign(ix, node, indent, column) }
   binaryChain(ix, node, indent, column)
-}
-
-// ── conditional heads (`if` / `else if` / `while`) ────────────────────────────
-// A condition that fits prints inline (`if cond {`); one that would overflow the
-// line wraps in PARENTHESES, with one operand per line, so the `)` row cleanly
-// separates the condition from the body (the body and a hanging continuation
-// would otherwise share an indent):
-//   if (
-//     cond1 &&
-//     cond2
-//   ) {
-// fmt ADDS the parens, so on a re-format the condition is a `Paren` node; we peel
-// one layer before re-wrapping to keep the output idempotent.
-function unwrapOuterParen(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return ix }
-  let n = P.nodes[ix]
-  if n is Paren { return n.parInner }
-  ix
 }
 
 // Emit possibly-multiline `text` with only its FIRST line indented (continuation
@@ -1749,18 +1377,6 @@ function callExpr(ix: i32, node: Call, indent: i32, column: i32) {
   head + wrapList("(", args, ")", indent, column + head.length)
 }
 
-// The callee text, paren-wrapped if it is a composite (non-postfix) expression.
-function calleePrimary(ix: i32, rendered: string) {
-  let n = P.nodes[ix]
-  let composite = false
-  if n is BinExpr { composite = true }
-  else if n is Unary { composite = true }
-  else if n is IsExpr { composite = true }
-  else if n is IfStmt { composite = true }
-  if composite { return "(" + rendered + ")" }
-  rendered
-}
-
 function objectLiteral(ix: i32, node: ObjLit, indent: i32, column: i32) {
   if node.objFields.length == 0 { return "{}" }
   const items: string[] = []
@@ -1881,23 +1497,6 @@ function elseIfExpr(ix: i32, indent: i32) {
     return parts
   }
   ""
-}
-
-// Whether a synthesized one-statement branch holds a SIMPLE expression.
-function branchIsSimple(blockIx: i32) {
-  let n = P.nodes[blockIx]
-  if n is Block {
-    const st = n.blkStmts
-    if st.length != 1 { return false }
-    let s = P.nodes[st[0]]
-    if s is Block { return false }
-    if s is IfStmt { return false }
-    if s is WhileStmt { return false }
-    if s is ForRange { return false }
-    if s is ForIn { return false }
-    return true
-  }
-  false
 }
 
 function blockExpr(ix: i32, node: Block, indent: i32) {
