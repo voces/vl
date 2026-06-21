@@ -1,5 +1,5 @@
 // NATIVE `std:` resolution semantics — the SELF-HOSTED driver
-// (`scripts/vl-compiler-driver.vl`), exercised end to end through the native `vl`
+// (`compiler/driver.vl`), exercised end to end through the native `vl`
 // binary over `VL_STD` fixtures (the host maps a `std:<name>` key to
 // `$VL_STD/<name>.vl`). This is the native port of the retired TS
 // `std_resolution_test.ts` (which drove the now-doomed `compiler/modules.ts`

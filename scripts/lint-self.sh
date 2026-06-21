@@ -32,17 +32,10 @@ VL="${VL:-scripts/vl-host/target/release/vl}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# Same assembly as the fixpoint scripts (lexer Tok/Diag/advance de-collision).
-sed -E 's/\bTok\b/LexTok/g; s/\bDiag\b/LexDiag/g; s/\badvance\b/lexAdvance/g' \
-  compiler/lexer.vl > "$WORK/self.vl"
-cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.vl \
-  compiler/lint.vl compiler/format.vl scripts/vl-compiler-driver.vl compiler/cli.vl >> "$WORK/self.vl"
-# Blank the compiler's own import statements (range-aware; multi-line imports), so
-# the single-file check doesn't chase `./ast` against the temp dir.
-sed -i -E '/^import \{/,/\} from "/ s/.*//' "$WORK/self.vl"
-
-echo "== self-lint: the assembled compiler =="
-"$VL" check "$WORK/self.vl" --severity info
+# The compiler is a real module graph now — lint it through its entry, so the
+# checker resolves `import`/`export` across the modules exactly as a build does.
+echo "== self-lint: the compiler module graph =="
+"$VL" check compiler/entry.vl --severity info
 
 echo "== self-lint: std/ =="
 "$VL" check std/ --severity info

@@ -42,7 +42,7 @@ collections-design.md §LS.3.
   implemented` (:269-277). The CLI injects a Deno filesystem `ModuleReader`
   (cli.ts:66-86); `ModuleReader` is the injectable seam (modules.ts:61-66).
 - Native: `modResolveSpecifier` returns `""` for non-relative specifiers
-  (scripts/vl-compiler-driver.vl:389-395); `modVisit` emits the same
+  (compiler/driver.vl:389-395); `modVisit` emits the same
   diagnostic. The Rust fetch loop reads pending keys via
   `std::fs::read_to_string` (scripts/vl-host/src/main.rs:151-214).
 - Native diagnostics carry ONE path (the entry) — std-module errors will print
@@ -61,7 +61,7 @@ concatenating `compiler/*.vl` + the driver with import lines range-blanked
 
 **Generic exports are a known hole in BOTH module pipelines.** The native
 rename pass skips any declaration with `<` in its name ("exporting generics is
-out of phase-1 scope", vl-compiler-driver.vl:647-651); no corpus module case
+out of phase-1 scope", driver.vl:647-651); no corpus module case
 imports a generic. Std collections are generic (`List<T>`), and a generic
 `expect<T>` matcher needs it too — so it is its own EARLY slice here.
 

@@ -1,3 +1,8 @@
+import { Diag, Tok } from "./ast"
+import { advance, gSrc, mkTok, scanQuoted } from "./lexer"
+import { accept, parseExpr, parseProgram, parseStmt, parseType, parseTypeName } from "./parser"
+import { T, Ty, TyFunc, TyObj, TyPrim, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
+import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkCall, mkCallN, mkFunc, mkIdent, mkMember, mkParam, mkStr, mkTypeRef, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 // VL-in-VL wasm emitter — self-hosted codegen spike.
 //
 // A `.vl` program that produces RAW WebAssembly *bytes* for a minimal but valid
@@ -82,7 +87,13 @@ import {
 // Output representation: a VL `i32[]` of byte values 0..255 (WasmGC has no `u8`);
 // bytes are masked to the low 8 bits on emit.
 type Emitter = { bytes: i32[] }
-const W: Emitter = { bytes: [] }
+export const W: Emitter = { bytes: [] }
+// RE-EXPORT alias tables (`export { name } from "dep"`): the public bare name and its
+// merged (mangled) target function. POPULATED by the driver's `modCompile`, CONSUMED by
+// this module's export section — defined HERE (the consumer) so the driver imports them,
+// avoiding a driver↔emitter import cycle.
+export let reExpName: string[] = []
+export let reExpTarget: string[] = []
 // The buffer the streaming writer currently appends to. Initialized to the
 // module output buffer; rebound by `wTarget`, reset by `emitReset`.
 let curBuf = W.bytes
@@ -1258,7 +1269,7 @@ function emitHeader() {
 // `emitErr` carries the first message. Both are top-level mutable `let`s — they
 // lower to wasm globals readable from any helper.
 let emitFailed = false
-let emitErr = ""
+export let emitErr = ""
 
 // Record an unsupported-shape failure: keep the first message and drop any bytes
 // emitted so far, so a partial/garbage module can never reach instantiation.
@@ -1285,7 +1296,7 @@ function emitFail(msg: string) {
 // i-th name maps to the i-th function index. `fnNames[i]`'s function index is
 // `fnIndices[i]`, which equals `i` here but is kept explicit for clarity.
 
-let fnNames: string[] = []
+export let fnNames: string[] = []
 // `fnName → fnStmts index` (FIRST occurrence wins, matching the old linear `fnIndexOf`
 // scan), so resolving a call's callee index is O(1) instead of an O(functions) string-
 // compare scan on every call site / classifier query. Built in `buildFnMap` alongside
@@ -1303,7 +1314,7 @@ let globalNameMap: {[string]: i32} = Map()
 // and no tail value — computed as a monotone fixed point in `computeVoidFns`,
 // since a tail CALL to a void callee makes the CALLER void too).
 let fRetVoid: i32[] = []
-let fnIndices: i32[] = []
+export let fnIndices: i32[] = []
 
 // The node-arena indices of the top-level `FuncDecl`s, in order. The i-th entry is
 // wasm function index i — the order all of function/export/code sections follow.
@@ -1424,8 +1435,8 @@ let fRetF32: i32[] = []
 // `LetDecl`s (declaration order); `globalNames` the parallel names (name→index lookup).
 // A bare `Ident` that is not a param/local but matches a `globalName` reads/writes the
 // global (`0x23`/`0x24`) instead of a local (`0x20`/`0x21`).
-let globalStmts: i32[] = []
-let globalNames: string[] = []
+export let globalStmts: i32[] = []
+export let globalNames: string[] = []
 
 // Scan the program's top-level statements into `fnStmts` (FuncDecls only, in order),
 // skipping `TypeDecl`s and gathering top-level `LetDecl`s into `globalStmts` (module
@@ -2974,7 +2985,7 @@ function capIsBound(bound: string[], name: string) {
 }
 
 // True if `name` is in `caps` already (dedup the capture list).
-function capHas(caps: string[], name: string) {
+export function capHas(caps: string[], name: string) {
   let i = 0
   while i < caps.length {
     if caps[i] == name { return true }
@@ -3021,7 +3032,7 @@ function capRecord(name: string, bound: string[], caps: string[]) {
 // conservative but sound match for the corpus). A NESTED FuncDecl is NOT descended
 // (it is lifted to its own function with its own capture analysis); its name, if
 // any, binds locally.
-function capScan(ix: i32, bound: string[], caps: string[]) {
+export function capScan(ix: i32, bound: string[], caps: string[]) {
   if ix < 0 { return 0 }
   let n = P.nodes[ix]
   if n is Ident {
@@ -3368,7 +3379,7 @@ function paramIndexOf(fnIx: i32, name: string) {
 // order; the i-th name's wasm local index is `p + i` (with `p` the param count).
 // It is rebuilt per function by `buildLocals` before that function's body is
 // lowered, so only one function's locals are live at a time.
-let localNames: string[] = []
+export let localNames: string[] = []
 // Parallel to `localNames`: the i-th declared local's value-type CODE — `1` for a
 // struct `(ref $0)` local, `2` for a list `(ref $lTypeIdx)` local (the growable `i32[]`
 // wrapper struct), `3` for a `string` local (the raw `(array (mut i32))` of code points
@@ -21190,77 +21201,6 @@ function assignTags() {
   0
 }
 
-// ── inline union annotations (`v: A | B`) ─────────────────────────────────────
-// An INLINE union annotation parses to a `TypeRef` whose synthetic name is the
-// pipe-joined member list (`"A|B"`, mirroring the `i32[]` / `{[K]:V}` synthetic
-// names — see `parser.vl`'s `parseTypeName`). A NAMED alias `type N = A | B` is a
-// `UnionDecl` whose name `"N"` is registered in `unNames`; an inline annotation has
-// no such name, so none of the name-keyed union machinery (`isUName`, valtype
-// interning, narrowing) recognizes it. To make an inline `A | B` behave IDENTICALLY
-// to a named alias, we register the synthetic name itself as a union alias — the
-// same tables, the same heap-type interning, the same tags — so every downstream
-// lookup keyed on the type-name string just works.
-//
-// Append the member atoms of the synthetic union name `name` to `out`, split on its
-// TOP-LEVEL `|` separators (depth tracked so a nested `{…}` / `[…]` member is not
-// split inside). A bare name with no `|` appends one atom. The flat `out` accumulator
-// (vs returning a fresh `string[]`) keeps this off the self-host emitter's
-// empty-ref-array-literal return path.
-function splitUnionAtoms(name: string, out: string[]) {
-  let cur = ""
-  let depth = 0
-  let i = 0
-  while i < name.length {
-    let c = name[i]
-    if c == '{' || c == '[' {
-      depth = depth + 1
-      cur = cur + fromCodePoint(c)
-    } else if c == '}' || c == ']' {
-      depth = depth - 1
-      cur = cur + fromCodePoint(c)
-    } else if depth == 0 && c == '|' {
-      out.push(cur)
-      cur = ""
-    } else {
-      cur = cur + fromCodePoint(c)
-    }
-    i = i + 1
-  }
-  out.push(cur)
-  0
-}
-
-// The number of TOP-LEVEL `|`-separated members in the synthetic name `name` (1 for a
-// bare name). Counts separators without materializing the atom strings.
-function unionMemberCount(name: string) {
-  let n = 1
-  let depth = 0
-  let i = 0
-  while i < name.length {
-    let c = name[i]
-    if c == '{' || c == '[' { depth = depth + 1 }
-    else if c == '}' || c == ']' { depth = depth - 1 }
-    else if depth == 0 && c == '|' { n = n + 1 }
-    i = i + 1
-  }
-  n
-}
-
-// ── value-union atom classification ───────────────────────────────────────────
-// The atom KIND of a value-union member type name: 0 i32, 1 boolean, 2 string,
-// 3 i64, 4 f64, 5 f32, 6 null — or -1 for anything else (a struct name, an inline
-// shape, an array). The kind doubles as the atom's tag offset (`scalarTagOf`).
-function valueAtomKind(name: string) {
-  if name == "i32" { return 0 }
-  if name == "boolean" || name == "bool" { return 1 }
-  if name == "string" { return 2 }
-  if name == "i64" { return 3 }
-  if name == "f64" { return 4 }
-  if name == "f32" { return 5 }
-  if name == "null" { return 6 }
-  -1
-}
-
 // The GLOBALLY-stable tag of a value-union atom: every struct variant takes the
 // dense ranks `0 .. uVariants.length-1` (`assignTags`), so atom kinds claim the
 // fixed slots above them. Stable across every union in the module (mirroring the
@@ -21278,39 +21218,6 @@ function vbHeapIdxOfAtom(atom: string) {
   if k == 4 { return vbF64Idx }
   if k == 5 { return vbF32Idx }
   -1
-}
-
-// True if `name` is a VALUE union this emitter boxes: 2+ top-level atoms, every
-// atom a scalar/string/null name, and either (a) 2+ non-null atoms, or (b) exactly
-// one non-null NUMERIC atom plus `null` (`i32 | null` — a scalar has no spare null
-// niche, so it boxes; `boolean | null` keeps its existing sentinel NICHE encoding,
-// and a single REF member + null (`S | null`, `string | null`) stays a niche
-// nullable ref — neither is a box).
-function isValueUnionName(name: string) {
-  if unionMemberCount(name) < 2 { return false }
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
-  let nonNull = 0
-  let hasNull = false
-  let soloKind = -1
-  let i = 0
-  while i < atoms.length {
-    let k = valueAtomKind(atoms[i])
-    if k < 0 { return false }
-    if k == 6 {
-      hasNull = true
-    } else {
-      nonNull = nonNull + 1
-      soloKind = k
-    }
-    i = i + 1
-  }
-  if nonNull >= 2 { return true }
-  if nonNull == 1 && hasNull {
-    // Only a NUMERIC scalar boxes with null; boolean|null / string|null are niches.
-    return soloKind == 0 || soloKind == 3 || soloKind == 4 || soloKind == 5
-  }
-  false
 }
 
 // True if union `name` has at least one NON-null value-atom member (`i32`/`f64`/
@@ -26021,7 +25928,7 @@ function monomorphize(stmts: i32[]) {
   0
 }
 
-function emitProgram(rootIx: i32) {
+export function emitProgram(rootIx: i32) {
   emitFailed = false
   emitErr = ""
   narrowNames = []

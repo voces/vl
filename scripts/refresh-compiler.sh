@@ -47,22 +47,14 @@ if [ ! -f "$SEED" ]; then
   SEED="$SEED" scripts/fetch-seed.sh
 fi
 
-# The compiler's own source + the single-sourced driver — the same sed/cat
-# assembly as native-fixpoint.sh (lexer Tok/Diag/advance de-collision rename).
-sed -E 's/\bTok\b/LexTok/g; s/\bDiag\b/LexDiag/g; s/\badvance\b/lexAdvance/g' \
-  compiler/lexer.vl > "$WORK/vlsrc.vl"
-cat compiler/ast.vl compiler/parser.vl compiler/typecheck.vl compiler/wasmEmit.vl compiler/lint.vl compiler/format.vl \
-  scripts/vl-compiler-driver.vl compiler/cli.vl >> "$WORK/vlsrc.vl"
-# BLANK the compiler's own import statements (range-aware; multi-line imports) —
-# see native-fixpoint.sh: a line-leading `import {` would trip the vl binary's
-# module gate. Blanking preserves line numbers; byte-identical output.
-sed -i -E '/^import \{/,/\} from "/ s/.*//' "$WORK/vlsrc.vl"
-
+# The compiler is built from REAL `import`/`export` modules: `compiler/entry.vl`
+# re-exports the host ABI under bare names and the vl host's module fetch loop
+# resolves the graph (entry → driver → the pipeline). No sed/cat/rename glue.
 echo "== self-compile current compiler source with the seed =="
 # A seed that cannot compile current source is too stale (the compiler started
 # using a construct its emitter cannot lower). Fail LOUD — do not silently
 # re-enter the TS stage-0 path. The fix is an explicit break-glass re-mint.
-if ! "$VL" build "$WORK/vlsrc.vl" -o "$WORK/next.wasm" --compiler "$SEED"; then
+if ! "$VL" build compiler/entry.vl -o "$WORK/next.wasm" --compiler "$SEED"; then
   echo "ERROR: seed cannot compile current source (stale seed)." >&2
   echo "  The seed predates a construct the compiler now uses. Re-fetch the" >&2
   echo "  rolling seed-latest (scripts/fetch-seed.sh); if seed-latest ITSELF is too" >&2

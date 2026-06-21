@@ -33,7 +33,7 @@ The section is **off by default**, gated behind a module-level flag `gEmitNames`
 appended unconditionally would change every emitted module and break the goldens
 and both fixpoints. So:
 
-- The compiler driver (`scripts/vl-compiler-driver.vl`) **never** calls
+- The compiler driver (`compiler/driver.vl`) **never** calls
   `setEmitNames` — the goldens, `selfhost_emit_fixpoint_test.ts`, the full/native
   fixpoints and the self-typecheck all exercise this default path and are
   byte-for-byte unchanged.
