@@ -41,6 +41,18 @@ let impLocal: string[] = [] // the local binding name (after `as`)
 // Flat per-module export-name sets (token scan: `export`-modified declarations).
 let expMod: i32[] = []
 let expName: string[] = []
+// RE-EXPORTS (`export { a, b as c } from "spec"`): the PUBLIC name each re-export
+// surfaces (`a`/`c`) and the importing module — parallel arrays. The re-export is
+// ALSO recorded as an import (so the symbol is pulled + the dependency edge exists);
+// these tables additionally drive the emitter to alias the (merged, mangled) target
+// function under its bare PUBLIC name in the wasm export section, giving a stable ABI.
+let reExpMod: i32[] = []       // the re-exporting module's table index
+let reExpPublic: string[] = [] // the public bare name (the `as` alias, else the source name)
+let reExpLocal: string[] = []  // the local binding the import created (resolves to the target)
+// Filled by `modCompile` once renames are known: the public name → the merged
+// (mangled) target function name, consumed by `emitProgram`'s export section.
+let reExpName: string[] = []
+let reExpTarget: string[] = []
 // The export NAME token's source position (1-based line, 0-based col), parallel to
 // `expName` — the cross-file go-to-definition target (the exporting module's decl).
 let expDeclLine: i32[] = []
@@ -771,6 +783,11 @@ export function modReset(): i32 {
   expDeclCol = []
   expKwLine = []
   expKwCol = []
+  reExpMod = []
+  reExpPublic = []
+  reExpLocal = []
+  reExpName = []
+  reExpTarget = []
   modPending = []
   // Clear the token-load ranges too: a subsequent SINGLE-FILE check (no imports →
   // no `modCompile`) must not inherit a prior graph's ranges, or `symOccModuleAt`
@@ -1052,7 +1069,75 @@ function modScan(m: i32, src: string): i32 {
         impLocal.push("")
       }
     } else if k == "EXPORT" && depth == 0 {
-      if i + 2 < toks.length {
+      if i + 1 < toks.length && toks[i + 1].kind == "LBRACE" {
+        // A RE-EXPORT `export { a, b as c } from "spec"`: scanned like an import's
+        // name list, but each entry is ALSO recorded as a public re-export. The local
+        // binding (`as` alias, else the name) is what the import created; the public
+        // name is the same alias. Cursor advances past the trailing path STRING.
+        i = i + 2 // past EXPORT and LBRACE
+        const rnames: string[] = []
+        const rlocals: string[] = []
+        let rgoing = true
+        while rgoing && i < toks.length {
+          const ck = toks[i].kind
+          if ck == "RBRACE" {
+            i = i + 1
+            rgoing = false
+          } else {
+            if ck == "IDENT" {
+              let nm = toks[i].text
+              let loc = nm
+              if i + 2 < toks.length {
+                if (
+                  toks[i + 1].kind == "IDENT" &&
+                  toks[i + 1].text == "as" &&
+                  toks[i + 2].kind == "IDENT"
+                ) {
+                  loc = toks[i + 2].text
+                  i = i + 2
+                }
+              }
+              rnames.push(nm)
+              rlocals.push(loc)
+            }
+            i = i + 1
+          }
+        }
+        let rspec = ""
+        let rscan = true
+        while rscan && i < toks.length {
+          const sk = toks[i].kind
+          if sk == "STRING" {
+            rspec = toks[i].text
+            if rspec.length >= 2 {
+              if rspec[0] == '"' && rspec[rspec.length - 1] == '"' {
+                rspec = rspec.slice(1, rspec.length - 1)
+              }
+            }
+            i = i + 1
+            rscan = false
+          } else if sk == "EOF" {
+            rscan = false
+          } else {
+            i = i + 1
+          }
+        }
+        const rkey = modResolveSpecifier(rspec, modKeys[m])
+        let rn = 0
+        while rn < rnames.length {
+          // Pull the symbol (an import edge) so the merge binds it and the host fetches `spec`.
+          impMod.push(m)
+          impSpec.push(rspec)
+          impKey.push(rkey)
+          impName.push(rnames[rn])
+          impLocal.push(rlocals[rn])
+          // Record the PUBLIC re-export (its merged target is resolved in `modCompile`).
+          reExpMod.push(m)
+          reExpPublic.push(rlocals[rn])
+          reExpLocal.push(rlocals[rn])
+          rn = rn + 1
+        }
+      } else if i + 2 < toks.length {
         const dk = toks[i + 1].kind
         if dk == "FUNCTION" || dk == "LET" || dk == "CONST" || dk == "TYPE" {
           expMod.push(m)
@@ -1064,8 +1149,10 @@ function modScan(m: i32, src: string): i32 {
           expKwLine.push(toks[i].line)
           expKwCol.push(toks[i].col)
         }
+        i = i + 1
+      } else {
+        i = i + 1
       }
-      i = i + 1
     } else {
       i = i + 1
     }
@@ -1211,6 +1298,32 @@ function modCompile(emit: i32): i32 {
     modTyShadow = []
     modRwStmt(roots[o2])
     o2 = o2 + 1
+  }
+  // 4b. Resolve each RE-EXPORT's public name to its merged (mangled) target — the
+  // exporting module renamed its `name` to `name$mDD`, so a re-export `export { name }
+  // from "dep"` aliases the bare `name` onto that target in the emitter's export
+  // section. The re-export rode in as an import (same module + local binding), so the
+  // target is its `impName$m<depIndex>`.
+  reExpName = []
+  reExpTarget = []
+  let re = 0
+  while re < reExpMod.length {
+    const rm = reExpMod[re]
+    const rloc = reExpLocal[re]
+    let ii2 = 0
+    let done = false
+    while ii2 < impMod.length && !done {
+      if impMod[ii2] == rm && impLocal[ii2] == rloc && impName[ii2] != "" {
+        const dd = modIndexOfKey(impKey[ii2])
+        if dd >= 0 {
+          reExpName.push(reExpPublic[re])
+          reExpTarget.push(impName[ii2] + "$m" + i32ToStr(dd))
+        }
+        done = true
+      }
+      ii2 = ii2 + 1
+    }
+    re = re + 1
   }
   // 5. Merge: ONE Program concatenating the modules' statements dependency-first
   // (deps' top-level initializers run before their dependents', as in the host).
