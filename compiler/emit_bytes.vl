@@ -1,0 +1,939 @@
+// `emit_bytes.vl` — the wasm BYTE-EMISSION layer: the streaming writers (`wU8`/`wULEB`/
+// `wSLEB`/`wName`/`wSection`) and the `fb*` instruction/​type encoders (`fbValtype`,
+// `fbStructNew`, `fbCallRef`, …), plus `emitFail` and the map-type-index helpers they
+// use. It reads/writes the shared `emit_state` and calls the pure lower modules, but
+// never the lowering — a clean layer (`emit_state → emit_bytes → wasmEmit`).
+
+import { f32Bytes, f64Bytes, slebToArr, ulebToArr } from "./emit_base"
+import { W, aTypeIdx, arrNewScratchBase, callRefSlot, cloEqScratchBase, cloStructIdx, coalesceCallBoolSlot, coalesceCallSlot, coalesceCallStrSlot, curBuf, emitErr, emitFailed, f64PushScratchBase, fa64TypeIdx, fbScratchCur, fl64TypeIdx, fnListEqRSlots, fnMvBase, fnRefPushSlots, fnUsesArrNew, fnUsesCallRef, fnUsesCloEq, fnUsesCoalesceCall, fnUsesF64Push, fnUsesListEqI, fnUsesListEqS, fnUsesMap, fnUsesMapFilter, fnUsesPush, fnUsesStrOp, fnUsesStrPush, lTypeIdx, leqIScratchBase, leqRBases, leqSScratchBase, localIsRef, localStructIdx, mStructIdx, mapScratchBase, mfDstBases, mfDstKinds, mfScratchBase, mfSrcBases, mfSrcKinds, mfSrcSlots, mkArrIdx, mkListIdx, mvMapTypeIdx, mvRlSlot, mvValKind, mvValName, mvValStructIdx, pushScratchBase, refPushBaseBySlot, refPushScratchBase, rlBackIdx, rlElemHeap, rlWrapIdx, sHeapIdx, strPushScratchBase, strScratchBase, uBoxIdx, uVarIdx } from "./emit_state"
+
+// Redirect the writer at `buf`; return the PREVIOUS current buffer so the caller
+// can restore it (closure-free save/restore — replaces threading `body`/`payload`
+// through every helper).
+export function wTarget(buf: i32[]) {
+  const prev = curBuf
+  curBuf = buf
+  prev
+}
+// Append one byte (low 8 bits) to the current buffer.
+export function wU8(b: i32) {
+  curBuf.push(b & 0xff)
+  0
+}
+// Append every byte of `bs` in order to the current buffer.
+export function wBytes(bs: i32[]) {
+  let i = 0
+  while i < bs.length {
+    wU8(bs[i])
+    i = i + 1
+  }
+  0
+}
+// Streaming unsigned-LEB: append straight to the current buffer (used for
+// section-length framing and operand encoding). The `*ToArr` array forms are
+// retained for the few sites that genuinely compose a fresh payload array.
+export function wULEB(value: i32) {
+  wBytes(ulebToArr(value))
+  0
+}
+// Streaming signed-LEB: append straight to the current buffer.
+export function wSLEB(value: i32) {
+  wBytes(slebToArr(value))
+  0
+}
+// Write a name: ULEB(byte length) followed by its UTF-8 bytes. For an ASCII
+// identifier each `s[i]` char code IS its byte. Dedupes the hand-rolled
+// length-prefix + char-loop in the export/field-name emission.
+export function wName(s: string) {
+  wULEB(s.length)
+  let i = 0
+  while i < s.length {
+    wU8(s[i])
+    i = i + 1
+  }
+  0
+}
+// ── section framing ──────────────────────────────────────────────────────────
+// A section is: id byte, then ULEB(byte-length of payload), then payload. The
+// payload is built eagerly into a temporary `i32[]`, then framed onto the
+// current buffer. (No closures/builder objects — payloads are constructed
+// eagerly into arrays; no backpatching.)
+export function wSection(id: i32, payload: i32[]) {
+  wU8(id)
+  wULEB(payload.length)
+  wBytes(payload)
+  0
+}
+// ── control flow / locals / consts (the universal base — Phase B) ─────────────
+// local.get / local.set / local.tee: 0x20/0x21/0x22 <localidx-uleb>.
+export function fbLocalGet(i: i32) {
+  wU8(32) // 0x20 local.get
+  wULEB(i)
+  0
+}
+export function fbLocalSet(i: i32) {
+  wU8(33) // 0x21 local.set
+  wULEB(i)
+  0
+}
+// global.get / global.set: 0x23/0x24 <globalidx-uleb>.
+export function fbGlobalGet(i: i32) {
+  wU8(35) // 0x23 global.get
+  wULEB(i)
+  0
+}
+export function fbGlobalSet(i: i32) {
+  wU8(36) // 0x24 global.set
+  wULEB(i)
+  0
+}
+// i32.const: 0x41 <value-sleb>.
+export function fbI32Const(v: i32) {
+  wU8(65) // 0x41 i32.const
+  wSLEB(v)
+  0
+}
+// Signed-LEB128 over a 64-bit value carried as a (hi, lo) i32 PAIR (`hi` the high
+// 32 bits, `lo` the low 32 — both read as UNSIGNED 32-bit lanes). The self-host
+// compiler is i32-only internally, so a 64-bit literal cannot live in one i32: it
+// is carried as the pair and shifted RIGHT 7 bits at a time across the lane
+// boundary by hand. `wSLEB`'s i32 form cannot be reused (its `v >> 7` is a 32-bit
+// arithmetic shift). Termination mirrors `slebToArr`: stop once the remaining
+// value is all-0 (with the sign bit clear) or all-1 (sign bit set).
+export function wSLEB64(hi: i32, lo: i32) {
+  let h = hi
+  let l = lo
+  let more = true
+  while more {
+    const byte = l & 0x7f
+    // ARITHMETIC 64-bit right shift by 7: low lane gets its top 25 bits plus the
+    // low 7 bits of `hi` rotated in; high lane is a SIGNED `>> 7` so a negative
+    // value's sign bit propagates (the all-ones tail terminates correctly). For a
+    // non-negative value (top bit 0) signed and unsigned shift agree, so the
+    // Slice-1 non-negative literals are byte-identical.
+    const newLo = (l >>> 7) | (h << 25)
+    const newHi = h >> 7
+    l = newLo
+    h = newHi
+    let signBit = 0
+    if (byte & 0x40) != 0 { signBit = 1 }
+    // Remaining value is "done" when both lanes are 0 (non-negative tail) or both
+    // lanes are all-ones, i.e. -1 (negative tail) — matching SLEB's sign rule.
+    if l == 0 && h == 0 {
+      if signBit == 0 {
+        wU8(byte)
+        more = false
+      } else {
+        wU8(byte | 0x80)
+      }
+    } else if l == (-1) && h == (-1) {
+      if signBit == 1 {
+        wU8(byte)
+        more = false
+      } else {
+        wU8(byte | 0x80)
+      }
+    } else {
+      wU8(byte | 0x80)
+    }
+  }
+  0
+}
+// i64.const: 0x42 <value-sleb64>. The 64-bit literal value is carried as a (hi,
+// lo) i32 pair (`parseI64Pair`) and signed-LEB-encoded over 64 bits (`wSLEB64`).
+export function fbI64Const(hi: i32, lo: i32) {
+  wU8(66) // 0x42 i64.const
+  wSLEB64(hi, lo)
+  0
+}
+// i64.extend_i32_s: 0xac. Sign-extends an i32 on the stack to i64 — the bridge
+// inserted when an i32-typed value (e.g. a bare integer literal) is used where i64
+// is expected. (Slice 1 prefers typing the literal directly as i64; this is the
+// fallback for a non-literal i32 source.)
+export function fbI64ExtendI32S() {
+  wU8(172) // 0xac i64.extend_i32_s
+  0
+}
+// f64.const: 0x44 followed by 8 raw little-endian IEEE-754 bytes (`f64Bytes`).
+export function fbF64Const(text: string) {
+  wU8(68) // 0x44 f64.const
+  wBytes(f64Bytes(text))
+  0
+}
+// f64.convert_i32_s: 0xb7 — widen a signed i32 on the stack to f64 (the bridge for a
+// mixed i32/f64 operand, mirroring i64.extend_i32_s). (Slice 3.)
+export function fbF64ConvertI32S() {
+  wU8(183) // 0xb7 f64.convert_i32_s
+  0
+}
+// f32.const: 0x43 followed by 4 raw little-endian IEEE-754 bytes (`f32Bytes`).
+export function fbF32Const(text: string) {
+  wU8(67) // 0x43 f32.const
+  wBytes(f32Bytes(text))
+  0
+}
+// f32.convert_i32_s: 0xb2 — widen a signed i32 on the stack to f32. (Slice 5.)
+export function fbF32ConvertI32S() {
+  wU8(178) // 0xb2 f32.convert_i32_s
+  0
+}
+// f64.convert_i64_s: 0xb9 — convert a signed i64 to f64. (Slice 5.)
+export function fbF64ConvertI64S() {
+  wU8(185) // 0xb9 f64.convert_i64_s
+  0
+}
+// f64.promote_f32: 0xbb — promote an f32 on the stack to f64 (lossless). (Slice 5.)
+export function fbF64PromoteF32() {
+  wU8(187) // 0xbb f64.promote_f32
+  0
+}
+// if: 0x04 <blocktype>. `blockType` is a single byte (0x40 void, or a valtype byte).
+export function fbIf(blockType: i32) {
+  wU8(4) // 0x04 if
+  wU8(blockType)
+  0
+}
+export function fbElse() {
+  wU8(5) // 0x05 else
+  0
+}
+// block / loop: 0x02/0x03 <blocktype> (single byte, as `fbIf`).
+export function fbBlock(blockType: i32) {
+  wU8(2) // 0x02 block
+  wU8(blockType)
+  0
+}
+export function fbLoop(blockType: i32) {
+  wU8(3) // 0x03 loop
+  wU8(blockType)
+  0
+}
+// br / br_if: 0x0c/0x0d <depth-uleb>.
+export function fbBr(depth: i32) {
+  wU8(12) // 0x0c br
+  wULEB(depth)
+  0
+}
+export function fbBrIf(depth: i32) {
+  wU8(13) // 0x0d br_if
+  wULEB(depth)
+  0
+}
+export function fbEnd() {
+  wU8(11) // 0x0b end
+  0
+}
+export function fbDrop() {
+  wU8(26) // 0x1a drop
+  0
+}
+export function fbUnreachable() {
+  wU8(0) // 0x00 unreachable
+  0
+}
+export function fbReturn() {
+  wU8(15) // 0x0f return
+  0
+}
+// call: 0x10 <funcidx-uleb>.
+export function fbCall(fnIdx: i32) {
+  wU8(16) // 0x10 call
+  wULEB(fnIdx)
+  0
+}
+// i32.eqz: 0x45 (used for `!a` and the while-condition inversion).
+export function fbI32Eqz() {
+  wU8(69) // 0x45 i32.eqz
+  0
+}
+// One i32 arithmetic / comparison opcode (the `binOpcode` set: 0x6a add, 0x6b sub,
+// 0x6c mul, 0x6d div_s, 0x6f rem_s, 0x46 eq, 0x47 ne, 0x48 lt_s, 0x4a gt_s, 0x4c le_s,
+// 0x4e ge_s). The opcode byte is resolved by `binOpcode`; this just writes it.
+export function fbI32Bin(op: i32) {
+  wU8(op)
+  0
+}
+// i32.store: 0x36 <align-exp> <offset> — fixed align=4 bytes (exponent 2), offset 0,
+// matching the host's `__store_i32__` builtin body (`m.i32.store(0, 4, addr, v)`).
+export function fbI32Store() {
+  wU8(54) // 0x36 i32.store
+  wU8(2)  // align exponent (4-byte alignment)
+  wU8(0)  // offset 0
+  0
+}
+// i32.load: 0x28 <align-exp> <offset> — the `__load_i32__` twin of `fbI32Store`.
+export function fbI32Load() {
+  wU8(40) // 0x28 i32.load
+  wU8(2)  // align exponent (4-byte alignment)
+  wU8(0)  // offset 0
+  0
+}
+// ── opcode-method STUBS for the later families (Phases C–F) ───────────────────
+// Names declared now so the closed ~40-method set is coherent and self-documenting;
+// their CALL SITES (in `emitObj`/`emitArr`/`emitMap*`/string ops) are NOT converted in
+// this phase — they still push raw bytes. Each stub already emits the exact bytes its
+// family's sites emit, so converting those sites in C–F is a pure call-site swap.
+// GC struct ops (Phase C):
+export function fbStructNew(heapIdx: i32) {
+  wU8(251) // 0xfb GC prefix
+  wU8(0)   // struct.new
+  wULEB(heapIdx)
+  0
+}
+export function fbStructGet(heapIdx: i32, field: i32) {
+  wU8(251) // 0xfb GC prefix
+  wU8(2)   // struct.get
+  wULEB(heapIdx)
+  wULEB(field)
+  0
+}
+export function fbStructSet(heapIdx: i32, field: i32) {
+  wU8(251) // 0xfb GC prefix
+  wU8(5)   // struct.set
+  wULEB(heapIdx)
+  wULEB(field)
+  0
+}
+// GC array ops (Phase D):
+export function fbArrayNew(heapIdx: i32) {
+  wU8(251) // 0xfb GC prefix
+  wU8(6)   // array.new
+  wULEB(heapIdx)
+  0
+}
+export function fbArrayNewDefault(heapIdx: i32) {
+  wU8(251) // 0xfb GC prefix
+  wU8(7)   // array.new_default
+  wULEB(heapIdx)
+  0
+}
+export function fbArrayNewFixed(heapIdx: i32, n: i32) {
+  wU8(251) // 0xfb GC prefix
+  wU8(8)   // array.new_fixed
+  wULEB(heapIdx)
+  wULEB(n)
+  0
+}
+export function fbArrayGet(heapIdx: i32) {
+  wU8(251) // 0xfb GC prefix
+  wU8(11)  // 0x0b array.get
+  wULEB(heapIdx)
+  0
+}
+export function fbArraySet(heapIdx: i32) {
+  wU8(251) // 0xfb GC prefix
+  wU8(14)  // 0x0e array.set
+  wULEB(heapIdx)
+  0
+}
+export function fbArrayLen() {
+  wU8(251) // 0xfb GC prefix
+  wU8(15)  // 0x0f array.len
+  0
+}
+export function fbArrayCopy(destHeapIdx: i32, srcHeapIdx: i32) {
+  wU8(251)           // 0xfb GC prefix
+  wU8(17)            // 0x11 array.copy
+  wULEB(destHeapIdx) // dest array type index
+  wULEB(srcHeapIdx)  // src array type index
+  0
+}
+// GC ref ops (Phases C/D/F):
+export function fbRefCast(heapIdx: i32) {
+  wU8(251) // 0xfb GC prefix
+  wU8(22)  // 0x16 ref.cast (non-null)
+  wULEB(heapIdx)
+  0
+}
+// Function-value ops (lambdas):
+// `ref.func <funcidx>` (0xd2) — a typed funcref to function `funcidx`. The target must
+// be declared referenceable (the declarative elem segment, section 9).
+export function fbRefFunc(funcIdx: i32) {
+  wU8(210) // 0xd2 ref.func
+  wULEB(funcIdx)
+  0
+}
+// `call_ref <typeidx>` (0x14) — call through a typed funcref popped off the stack,
+// after the env + args. `typeidx` is the `$fnsig` env-leading functype.
+export function fbCallRef(typeIdx: i32) {
+  wU8(20) // 0x14 call_ref
+  wULEB(typeIdx)
+  0
+}
+// `ref.null struct` (0xd0 0x6b) — the null env for a non-capturing function value.
+export function fbRefNullStruct() {
+  wU8(208) // 0xd0 ref.null
+  wU8(107) // structref abstract heaptype (0x6b)
+  0
+}
+// `ref.null none` (0xd0 0x71) — the bottom null of the `any` hierarchy, the
+// payload slot of a boxed union's `null` tag (the slot is `anyref`; the tag says
+// it is never read).
+export function fbRefNullNone() {
+  wU8(208) // 0xd0 ref.null
+  wU8(113) // none abstract heaptype (0x71)
+  0
+}
+// `ref.null <heaptype>` (0xd0 <s33>) — a typed null (a missing map value, etc.).
+export function fbRefNull(heapIdx: i32) {
+  wU8(208) // 0xd0 ref.null
+  wSLEB(heapIdx)
+  0
+}
+// `ref.as_non_null` (0xd4) — recover the non-null ref a nullable slot holds.
+export function fbRefAsNonNull() {
+  wU8(212) // 0xd4 ref.as_non_null
+  0
+}
+// Record an unsupported-shape failure: keep the first message and drop any bytes
+// emitted so far, so a partial/garbage module can never reach instantiation.
+// Returns -1, the sentinel `emitProgram` propagates so callers can branch on it.
+export function emitFail(msg: string) {
+  if !emitFailed {
+    emitFailed = true
+    emitErr = msg
+  }
+  W.bytes = []
+  -1
+}
+// Per-slot type accessors, each answering for the MONO map on slot < 0 so callers
+// thread one code everywhere. `mapTypeIdxOf` is the struct.get/set TYPE immediate;
+// `mvValsWrapOf`/`mvValsBackOf` are the vals list wrapper/backing heap types;
+// `mvValElemHeapOf` is the heap type a ref VALUE slot holds (for ref.null / casts).
+export function mapTypeIdxOf(slot: i32) {
+  if slot < 0 { return mStructIdx }
+  mvMapTypeIdx[slot]
+}
+export function mvValsBackOf(slot: i32) {
+  if slot < 0 { return aTypeIdx }
+  if mvValKind[slot] == 3 { return mkArrIdx }
+  rlBackIdx[mvRlSlot[slot]]
+}
+export function mvValElemHeapOf(slot: i32) {
+  if slot < 0 { return aTypeIdx }
+  if mvValKind[slot] == 3 { return aTypeIdx }
+  sHeapIdx[mvValStructIdx[slot]]
+}
+// Reserve `n` wasm locals at the current cursor, returning the frame's base index
+// and advancing the cursor past the frame. The single place the cursor moves.
+export function fbReserve(n: i32) {
+  let base = fbScratchCur
+  fbScratchCur = fbScratchCur + n
+  base
+}
+// Lay out this function's local frame: set every `*ScratchBase` global from ONE
+// running cursor walked in frame order. Must run AFTER `fnUsesPush`/`fnUsesRefPush`/
+// `fnUsesStrPush`/`fnUsesStrOp`/`fnUsesMap` and `fnRefPushSlots` are populated, and
+// AFTER `buildLocals` (so `nLocals` is final). Returns the cursor's END index (the
+// first local index past all scratch frames).
+export function fbBeginFunc(nParams: i32, nLocals: i32) {
+  fbScratchCur = nParams + nLocals
+  // i32-list push grow quad (val / cap / backing / recvRef).
+  pushScratchBase = fbScratchCur
+  if fnUsesPush { fbReserve(4) }
+  // One typed 4-slot ref-push frame per distinct pushed element-type slot, in
+  // `fnRefPushSlots` order; `refPushScratchBase` aliases the FIRST such frame.
+  refPushScratchBase = fbScratchCur
+  let rk = 0
+  while rk < fnRefPushSlots.length {
+    refPushBaseBySlot.push(fbReserve(4))
+    rk = rk + 1
+  }
+  // String-list push quad.
+  strPushScratchBase = fbScratchCur
+  if fnUsesStrPush { fbReserve(4) }
+  // f64-list push quad (val f64 / cap / backing / recvRef).
+  f64PushScratchBase = fbScratchCur
+  if fnUsesF64Push { fbReserve(4) }
+  // String-op frame (3 non-null string refs + 4 i32 temporaries).
+  strScratchBase = fbScratchCur
+  if fnUsesStrOp { fbReserve(7) }
+  // G8 map scratch frame (14 slots).
+  mapScratchBase = fbScratchCur
+  if fnUsesMap { fbReserve(14) }
+  // Closure scratch frame (1 slot, a `(ref $cloStruct)`) for `call_ref` (lambdas).
+  callRefSlot = fbScratchCur
+  if fnUsesCallRef { fbReserve(1) }
+  // `.map`/`.filter` HOF frame: 4 shared slots (i, n, j, the callback closure), then
+  // one typed src-wrapper slot per distinct receiver list type and one typed
+  // dst-backing slot per distinct result element kind.
+  mfScratchBase = fbScratchCur
+  if fnUsesMapFilter { fbReserve(4) }
+  mfSrcBases = []
+  let mfk = 0
+  while mfk < mfSrcKinds.length {
+    mfSrcBases.push(fbReserve(1))
+    mfk = mfk + 1
+  }
+  mfDstBases = []
+  let mfd = 0
+  while mfd < mfDstKinds.length {
+    mfDstBases.push(fbReserve(1))
+    mfd = mfd + 1
+  }
+  // Ref-valued map frames: 3 typed slots PER MODULE MV SLOT in any map-using
+  // function — mapRef (ref <mv struct>), valsBk (ref <vals backing>), valStash
+  // (ref null <value elem>, the pushVal/get value temporary). Allocated for every
+  // mv slot rather than per-function-used ones (locals are cheap; an mv-free
+  // module reserves zero, keeping existing layouts byte-identical).
+  fnMvBase = fbScratchCur
+  if fnUsesMap {
+    let mvk = 0
+    while mvk < mvValName.length {
+      fbReserve(3)
+      mvk = mvk + 1
+    }
+  }
+  // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6), appended LAST so
+  // every existing layout is untouched: the i32-list frame (A/B wrappers + the
+  // concat out backing + n + i), the string-list frame, then one typed frame per
+  // compared ref-list slot.
+  leqIScratchBase = fbScratchCur
+  if fnUsesListEqI { fbReserve(5) }
+  leqSScratchBase = fbScratchCur
+  if fnUsesListEqS { fbReserve(4) }
+  leqRBases = []
+  let lqk = 0
+  while lqk < fnListEqRSlots.length {
+    leqRBases.push(fbReserve(4))
+    lqk = lqk + 1
+  }
+  // Closure equality frame (2 `(ref $cloStruct)` slots), appended LAST so every
+  // existing layout is untouched.
+  cloEqScratchBase = fbScratchCur
+  if fnUsesCloEq { fbReserve(2) }
+  // Array-intrinsic frame (1 i32 slot — the staged runtime length `n` of an
+  // `__array_new__`/`__array_new_default__` allocation), appended after every
+  // existing frame so layouts without it are untouched.
+  arrNewScratchBase = fbScratchCur
+  if fnUsesArrNew { fbReserve(1) }
+  // Call-LHS `??` stash, appended after every existing frame so layouts without it are
+  // untouched: a `(ref $uBoxIdx)` box slot, then a `(ref null $aTypeIdx)` string|null
+  // slot, then an i32 boolean|null slot — one per rep the call result may take.
+  coalesceCallSlot = fbScratchCur
+  if fnUsesCoalesceCall { fbReserve(1) }
+  coalesceCallStrSlot = fbScratchCur
+  if fnUsesCoalesceCall { fbReserve(1) }
+  coalesceCallBoolSlot = fbScratchCur
+  if fnUsesCoalesceCall { fbReserve(1) }
+  fbScratchCur
+}
+// One (1, i32) run — `0x7f`.
+export function fbI32Run() {
+  wU8(1)
+  wU8(127) // 0x7f i32
+  0
+}
+// One (1, (ref ht)) run — non-null `0x64 <uleb heapIdx>`.
+export function fbRefRun(heapIdx: i32) {
+  wU8(1)
+  wU8(100) // 0x64 (ref ht) — non-null ref
+  wSLEB(heapIdx)
+  0
+}
+// One (1, valtype) run for a DECLARED local, via the shared `fbValtype` switch
+// (`kind`/`structIdx` are the `localIsRef`/`localStructIdx` codes).
+export function fbLocalRun(kind: i32, structIdx: i32) {
+  wU8(1)
+  fbValtype(kind, structIdx)
+  0
+}
+// The number of (count=1) runs this function's locals vector holds: one per declared
+// local plus the slot count of every reserved scratch frame. DERIVED from the same
+// `fnUses*` flags + `fnRefPushSlots` that drove `fbBeginFunc`, so it cannot desync
+// from the actual layout.
+export function fbLocalsCount(nLocals: i32) {
+  let n = nLocals
+  if fnUsesPush { n = n + 4 }
+  n = n + fnRefPushSlots.length * 4
+  if fnUsesStrPush { n = n + 4 }
+  if fnUsesF64Push { n = n + 4 }
+  if fnUsesStrOp { n = n + 7 }
+  if fnUsesMap { n = n + 14 + mvValName.length * 3 }
+  if fnUsesCallRef { n = n + 1 }
+  if fnUsesMapFilter { n = n + 4 }
+  n = n + mfSrcKinds.length + mfDstKinds.length
+  if fnUsesListEqI { n = n + 5 }
+  if fnUsesListEqS { n = n + 4 }
+  n = n + fnListEqRSlots.length * 4
+  if fnUsesCloEq { n = n + 2 }
+  if fnUsesArrNew { n = n + 1 }
+  if fnUsesCoalesceCall { n = n + 3 }
+  n
+}
+// Emit the full locals vector onto `body`: the run count, then one (1, valtype) run
+// per declared local, then the scratch frames in `fbBeginFunc`'s layout order
+// (i32-push quad, per-slot ref-push quads, string-push quad, string-op frame, map
+// frame). Byte-identical to the old hand-written block; derived from the local set
+// and scratch flags rather than separately counted. Returns 0.
+export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
+  const prev = wTarget(body)
+  wULEB(fbLocalsCount(nLocals))
+  // Declared locals (struct / list / string / ref-list ref or i32 — see `fbValtype`).
+  let li = 0
+  while li < nLocals {
+    fbLocalRun(localIsRef[li], localStructIdx[li])
+    li = li + 1
+  }
+  // i32-list push grow quad: pushVal i32, pushNewCap i32, pushNewBacking (ref $aTypeIdx),
+  // pushRecvRef (ref $lTypeIdx) — the wrapper ref for a struct-FIELD receiver (gap #3).
+  if fnUsesPush {
+    fbI32Run()
+    fbI32Run()
+    fbRefRun(aTypeIdx)
+    fbRefRun(lTypeIdx)
+  }
+  // One typed 4-slot ref-push frame per distinct pushed element-type slot, in
+  // `fnRefPushSlots` order: pushRefVal (ref $elem), pushRefCap i32,
+  // pushRefBacking (ref $back), pushRefRecvRef (ref $wrap).
+  let rfk = 0
+  while rfk < fnRefPushSlots.length {
+    const rfs = fnRefPushSlots[rfk]
+    fbRefRun(rlElemHeap[rfs])
+    fbI32Run()
+    fbRefRun(rlBackIdx[rfs])
+    fbRefRun(rlWrapIdx[rfs])
+    rfk = rfk + 1
+  }
+  // String-list push quad: pushStrVal (ref $aTypeIdx), pushStrCap i32,
+  // pushStrBacking (ref $mkArrIdx), pushStrRecvRef (ref $mkListIdx).
+  if fnUsesStrPush {
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbRefRun(mkArrIdx)
+    fbRefRun(mkListIdx)
+  }
+  // f64-list push quad: pushF64Val f64, pushF64Cap i32, pushF64Backing
+  // (ref $fa64TypeIdx), pushF64RecvRef (ref $fl64TypeIdx).
+  if fnUsesF64Push {
+    wU8(1)
+    wU8(124) // 0x7c f64
+    fbI32Run()
+    fbRefRun(fa64TypeIdx)
+    fbRefRun(fl64TypeIdx)
+  }
+  // String-op frame: strScrA/B/Out (3 non-null `(ref $aTypeIdx)` string refs),
+  // then strScrI0..strScrI3 (4 i32 temporaries).
+  if fnUsesStrOp {
+    fbRefRun(aTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbI32Run()
+    fbI32Run()
+    fbI32Run()
+  }
+  // G8 map scratch frame, in slot order (see the map scratch layout / probe + rehash):
+  //   0 mapRef (ref $mStructIdx), 1 keyRef (ref $aTypeIdx), 2 curRef (ref $aTypeIdx),
+  //   3 slot i32, 4 cap i32, 5 entry i32, 6 keysBk (ref $mkArrIdx),
+  //   7 valsBk (ref $aTypeIdx), 8 chr i32, 9 hcur i32, 10 idxBk (ref $aTypeIdx),
+  //   11 rslot i32, 12 liveBk (ref $aTypeIdx), 13 hashBk (ref $aTypeIdx).
+  if fnUsesMap {
+    fbRefRun(mStructIdx)
+    fbRefRun(aTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbI32Run()
+    fbI32Run()
+    fbRefRun(mkArrIdx)
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbI32Run()
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbRefRun(aTypeIdx)
+    fbRefRun(aTypeIdx)
+  }
+  // Closure scratch slot (1, (ref $cloStruct)) for `call_ref` (lambdas).
+  if fnUsesCallRef { fbRefRun(cloStructIdx) }
+  // `.map`/`.filter` HOF frame: i, n, j (3 i32) + the callback closure
+  // (ref $cloStruct), then the typed src-wrapper slots, then the typed dst-backing
+  // slots — in `fbBeginFunc`'s reservation order.
+  if fnUsesMapFilter {
+    fbI32Run()
+    fbI32Run()
+    fbI32Run()
+    fbRefRun(cloStructIdx)
+  }
+  let mfv = 0
+  while mfv < mfSrcKinds.length {
+    if mfSrcKinds[mfv] == 1 { fbRefRun(fl64TypeIdx) }
+    else if mfSrcKinds[mfv] == 2 { fbRefRun(rlWrapIdx[mfSrcSlots[mfv]]) }
+    else { fbRefRun(lTypeIdx) }
+    mfv = mfv + 1
+  }
+  let mfw = 0
+  while mfw < mfDstKinds.length {
+    if mfDstKinds[mfw] == 1 {
+      fbRefRun(fa64TypeIdx)
+    } else {
+      fbRefRun(aTypeIdx)
+    }
+    mfw = mfw + 1
+  }
+  // Ref-valued map frames (3 typed slots per module mv slot, map-using functions
+  // only — `fbBeginFunc`'s reservation order): mapRef, valsBk, valStash (nullable —
+  // it holds a vals-slot read, which is a `(ref null <elem>)`).
+  if fnUsesMap {
+    let mvr = 0
+    while mvr < mvValName.length {
+      fbRefRun(mvMapTypeIdx[mvr])
+      fbRefRun(mvValsBackOf(mvr))
+      fbRefNullRun(mvValElemHeapOf(mvr))
+      mvr = mvr + 1
+    }
+  }
+  // List `==`/`!=`/`+` frames, in `fbBeginFunc`'s reservation order: the
+  // i32-list frame (A/B wrapper refs, the concat out backing, n, i), the
+  // string-list frame (A/B wrapper refs, n, i), then one typed frame per
+  // compared ref-list slot (A/B wrapper refs, n, i).
+  if fnUsesListEqI {
+    fbRefRun(lTypeIdx)
+    fbRefRun(lTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbI32Run()
+  }
+  if fnUsesListEqS {
+    fbRefRun(mkListIdx)
+    fbRefRun(mkListIdx)
+    fbI32Run()
+    fbI32Run()
+  }
+  let lqv = 0
+  while lqv < fnListEqRSlots.length {
+    const lqs = fnListEqRSlots[lqv]
+    fbRefRun(rlWrapIdx[lqs])
+    fbRefRun(rlWrapIdx[lqs])
+    fbI32Run()
+    fbI32Run()
+    lqv = lqv + 1
+  }
+  // Closure equality frame (2 `(ref $cloStruct)` slots, appended LAST).
+  if fnUsesCloEq {
+    fbRefRun(cloStructIdx)
+    fbRefRun(cloStructIdx)
+  }
+  // Array-intrinsic frame (1 i32 slot — the staged allocation length).
+  if fnUsesArrNew { fbI32Run() }
+  // Call-LHS `??` stash (3 slots, appended LAST): the `(ref $uBoxIdx)` box, the
+  // `(ref null $aTypeIdx)` string|null niche, then the i32 boolean|null niche.
+  if fnUsesCoalesceCall {
+    fbRefRun(uBoxIdx)
+    fbRefNullRun(aTypeIdx)
+    fbI32Run()
+  }
+  wTarget(prev)
+  0
+}
+// One (1, (ref null ht)) run — nullable `0x63 <uleb heapIdx>`.
+export function fbRefNullRun(heapIdx: i32) {
+  wU8(1)
+  wU8(99) // 0x63 (ref null ht) — nullable ref
+  wSLEB(heapIdx)
+  0
+}
+// Emit `ref.null <heaptype>` (0xd0 <heaptype-sleb>) for a global cell of ref `kind`,
+// the zero initializer that lets the cell be declared NULLABLE before the start
+// function `global.set`s the real value. The heap type mirrors `fbValtype`'s kind→
+// heap-index map (struct / i32-list / string array / union box / ref-list / map /
+// string-list). A scalar global (kind 0) never reaches here — it zero-inits with
+// `i32.const 0`.
+export function fbRefNullForKind(kind: i32, structIdx: i32) {
+  wU8(208) // 0xd0 ref.null
+  // Same unresolved-slot guard as `fbValtype`: fail loudly, never read a table OOB.
+  if kind == 1 || kind == 5 || kind == 9 {
+    if (
+      structIdx < 0 ||
+      ((kind == 1 || kind == 9) && structIdx >= sHeapIdx.length) ||
+      (kind == 5 && structIdx >= rlWrapIdx.length)
+    ) {
+      wSLEB(aTypeIdx)
+      return emitFail("emitProgram: ref.null with no interned shape")
+    }
+  }
+  if kind == 1 || kind == 9 {
+    wSLEB(sHeapIdx[structIdx])
+  } else if kind == 2 || kind == 15 {
+    wSLEB(lTypeIdx)
+  } else if kind == 3 {
+    wSLEB(aTypeIdx)
+  } else if kind == 4 {
+    wSLEB(uBoxIdx)
+  } else if kind == 5 {
+    wSLEB(rlWrapIdx[structIdx]) // THIS ref-list slot's wrapper struct heap-type index
+  } else if kind == 6 {
+    wSLEB(mapTypeIdxOf(structIdx)) // mono map, or THIS mv slot's map struct
+  } else if kind == 7 {
+    wSLEB(mkListIdx)
+  } else if kind == 12 {
+    wSLEB(fl64TypeIdx) // the f64-list wrapper struct heap type (Slice 4)
+  } else if kind == 14 || kind == 19 {
+    wSLEB(cloStructIdx) // the closure fat-pointer struct heap type (14 non-null, 19 nullable)
+  } else {
+    wSLEB(aTypeIdx)
+  }
+  0
+}
+// Emit a global cell valtype, NULLABLE for refs (`0x63` instead of `0x64`) so a
+// non-const ref cell can be `ref.null`-initialized. The scalar case (kind 0) is the
+// same `0x7f` i32 as `fbValtype`. Only used for NON-const globals; const globals keep
+// the non-null `fbValtype` (so goldens are unchanged).
+export function fbValtypeNullable(kind: i32, structIdx: i32) {
+  // A struct/ref-list kind with NO resolved table slot (or one past its table)
+  // would read a table out of bounds (a trap). Fail loudly instead, writing a
+  // placeholder i32 so the buffer stays well-formed while `emitFail` unwinds.
+  if kind == 1 || kind == 5 || kind == 8 || kind == 9 {
+    if (
+      structIdx < 0 ||
+      ((kind == 1 || kind == 9) && structIdx >= sHeapIdx.length) ||
+      (kind == 5 && structIdx >= rlWrapIdx.length)
+    ) {
+      wU8(127)
+      return emitFail("emitProgram: ref valtype with no interned shape")
+    }
+  }
+  if kind == 1 || kind == 9 {
+    wU8(99) // 0x63 (ref null ht)
+    wSLEB(sHeapIdx[structIdx])
+  } else if kind == 2 {
+    wU8(99)
+    wSLEB(lTypeIdx)
+  } else if kind == 3 {
+    wU8(99)
+    wSLEB(aTypeIdx)
+  } else if kind == 4 {
+    wU8(99)
+    wSLEB(uBoxIdx)
+  } else if kind == 5 {
+    wU8(99)
+    wSLEB(rlWrapIdx[structIdx]) // THIS ref-list slot's wrapper struct heap-type index
+  } else if kind == 6 {
+    wU8(99)
+    wSLEB(mapTypeIdxOf(structIdx)) // mono map, or THIS mv slot's map struct
+  } else if kind == 7 {
+    wU8(99)
+    wSLEB(mkListIdx)
+  } else if kind == 10 {
+    wU8(126) // 0x7e i64 (scalar, never a nullable ref)
+  } else if kind == 11 {
+    wU8(124) // 0x7c f64 (scalar, never a nullable ref)
+  } else if kind == 12 {
+    wU8(99)
+    wSLEB(fl64TypeIdx) // the f64-list wrapper struct heap-type index (Slice 4)
+  } else if kind == 13 {
+    wU8(125) // 0x7d f32 (scalar, never a nullable ref — Slice 5)
+  } else if kind == 14 {
+    wU8(99) // 0x63 (ref null) — nullable closure ref (lambdas)
+    wSLEB(cloStructIdx)
+  } else if kind == 19 {
+    wU8(99) // 0x63 (ref null) — `((i32) => i32) | null` (already nullable)
+    wSLEB(cloStructIdx)
+  } else if kind == 15 {
+    wU8(99) // 0x63 (ref null) — `i32[] | null` (already nullable)
+    wSLEB(lTypeIdx)
+  } else if kind == 16 {
+    wU8(99) // 0x63 (ref null) — `string | null`: the nullable raw-array ref
+    wSLEB(aTypeIdx)
+  } else {
+    wU8(127) // 0x7f i32
+  }
+  0
+}
+// ── valtype emission (Phase G — was `pushVT`) ─────────────────────────────────
+// Write a wasm value type onto the CURRENT buffer (`curBuf`). The `kind` tag
+// selects the encoding (the valtype ladder formerly in `pushVT`):
+//   0    → i32 (`0x7f`)
+//   1    → struct ref `(ref $sHeapIdx[structIdx])` — a standalone struct
+//   2    → i32-list ref `(ref $lTypeIdx)` (the growable `i32[]` wrapper struct)
+//   3    → string ref `(ref $aTypeIdx)` — the raw `(array (mut i32))` of code points
+//   4    → union-box ref `(ref $uBoxIdx)` — the `{tag, value}` box
+//   5    → ref-list ref `(ref $rlWrapIdx[structIdx])` — the ref-element list wrapper
+//          for THIS slot. For kind 5, `structIdx` is the ref-list TABLE SLOT (NOT a
+//          struct index): the self-host program has many distinct ref-list element
+//          types, each with its own wrapper, so the valtype must select the caller's
+//          slot — not collapse to slot 0 (`rlTypeIdx == rlWrapIdx[0]`).
+//   6    → map ref `(ref $mStructIdx)` — the string-keyed map struct
+//   7    → string-list ref `(ref $mkListIdx)` — the string-list wrapper
+//   8    → concrete union-variant ref `(ref $uVarIdx+structIdx)` (gap #2)
+// A ref is always non-null (`0x64`), matching binaryen's `(ref $T)` for a value
+// statically known present (a constructed list / struct / string, never `null`).
+// The kind→heap-index resolution reads the interned indices (`sHeapIdx`/`lTypeIdx`/
+// `aTypeIdx`/… — assigned by `emitModule`'s type-index pass). Replaces `pushVT`;
+// callers `wTarget(buf)` the destination buffer first (the writer streams to
+// `curBuf`), matching every other `fb*` method.
+export function fbValtype(kind: i32, structIdx: i32) {
+  // Same out-of-bounds guard as `fbValtypeNullable`: a struct/ref-list kind whose
+  // table slot never resolved (or overran its table) fails loudly, never traps.
+  if kind == 1 || kind == 5 || kind == 8 || kind == 9 {
+    if (
+      structIdx < 0 ||
+      ((kind == 1 || kind == 9) && structIdx >= sHeapIdx.length) ||
+      (kind == 5 && structIdx >= rlWrapIdx.length)
+    ) {
+      wU8(127)
+      return emitFail("emitProgram: ref valtype with no interned shape")
+    }
+  }
+  if kind == 9 {
+    // Nullable struct ref `S | null` — `(ref null $S)`, the 0x63 form.
+    wU8(99)
+    wSLEB(sHeapIdx[structIdx])
+    return 0
+  }
+  if kind == 1 {
+    wU8(100)                   // 0x64 (ref ht) — non-null ref
+    wSLEB(sHeapIdx[structIdx]) // this struct's heap-type index
+  } else if kind == 2 {
+    wU8(100)
+    wSLEB(lTypeIdx) // the i32-list wrapper struct heap-type index
+  } else if kind == 3 {
+    wU8(100)
+    wSLEB(aTypeIdx) // the raw i32 array heap-type index (string)
+  } else if kind == 4 {
+    wU8(100)
+    wSLEB(uBoxIdx) // the union box `{tag, value}` heap-type index
+  } else if kind == 5 {
+    wU8(100)
+    wSLEB(rlWrapIdx[structIdx]) // THIS ref-list slot's wrapper struct heap-type index
+  } else if kind == 6 {
+    wU8(100)
+    wSLEB(mapTypeIdxOf(structIdx)) // mono map (G8), or THIS mv slot's map struct
+  } else if kind == 7 {
+    wU8(100)
+    wSLEB(mkListIdx) // the STRING-LIST wrapper struct heap-type index
+  } else if kind == 8 {
+    wU8(100)
+    wSLEB(uVarIdx + structIdx) // the CONCRETE union-variant struct heap-type index (gap #2)
+  } else if kind == 10 {
+    wU8(126) // 0x7e i64 (Slice 1: scalar i64 local/param/global/result)
+  } else if kind == 11 {
+    wU8(124) // 0x7c f64 (Slice 3: scalar f64 local/param/global/result)
+  } else if kind == 12 {
+    wU8(100)
+    wSLEB(fl64TypeIdx) // the f64-list wrapper struct heap-type index (Slice 4)
+  } else if kind == 13 {
+    wU8(125) // 0x7d f32 (Slice 5: scalar f32 local/param/global/result)
+  } else if kind == 14 {
+    wU8(100) // 0x64 non-null ref — the closure fat-pointer struct (lambdas)
+    wSLEB(cloStructIdx)
+  } else if kind == 19 {
+    // `((i32) => i32) | null` — a NULLABLE ref to the SAME closure struct as kind 14:
+    // the nullability lives in the SLOT's valtype (holds a function OR `null`).
+    wU8(99) // 0x63 (ref null ht)
+    wSLEB(cloStructIdx)
+  } else if kind == 15 {
+    // `i32[] | null` — a NULLABLE ref to the same i32-list wrapper as kind 2:
+    // the nullability lives in the SLOT's valtype, never a separate heap type.
+    wU8(99) // 0x63 (ref null ht)
+    wSLEB(lTypeIdx)
+  } else if kind == 16 {
+    // `string | null` — a NULLABLE ref to the raw string array (kind 3's backing),
+    // the nullability in the slot valtype. The param/result/local valtype path.
+    wU8(99) // 0x63 (ref null ht)
+    wSLEB(aTypeIdx)
+  } else {
+    wU8(127) // 0x7f i32
+  }
+  0
+}
