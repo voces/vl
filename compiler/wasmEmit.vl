@@ -20473,6 +20473,59 @@ function monoRebuild() {
   0
 }
 
+// The PARAMETER an un-annotated `return <local>` list is built from: a
+// `<retName>.push(<param>[<idx>])` statement anywhere in `blockIx` (descending into
+// while / if / for bodies). The built list shares the indexed param's array type, so the
+// monomorphizer types the un-annotated return as that param's pinned type. "" = none found.
+function monoListSrcParam(blockIx: i32, retName: string) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const r = monoListSrcParamStmt(stmts[i], retName)
+      if r != "" { return r }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+function monoListSrcParamStmt(ix: i32, retName: string) {
+  const s = P.nodes[ix]
+  if s is Block { return monoListSrcParam(ix, retName) }
+  if s is WhileStmt { return monoListSrcParam(s.whileBody, retName) }
+  if s is ForRange { return monoListSrcParam(s.frBody, retName) }
+  if s is ForIn { return monoListSrcParam(s.fiBody, retName) }
+  if s is IfStmt {
+    const rt = monoListSrcParam(s.ifThen, retName)
+    if rt != "" { return rt }
+    if s.ifElse >= 0 { return monoListSrcParamStmt(s.ifElse, retName) }
+    return ""
+  }
+  // A `<retName>.push(<param>[<idx>])` statement: the param is the list's element source.
+  if s is Call {
+    const callee = P.nodes[s.callFn]
+    if callee is Member {
+      if callee.memProp == "push" {
+        const recv = P.nodes[callee.memObj]
+        if recv is Ident {
+          if recv.identName == retName {
+            if s.callArgs.length == 1 {
+              const arg = P.nodes[s.callArgs[0]]
+              if arg is Index {
+                const ia = P.nodes[arg.idxArr]
+                if ia is Ident { return ia.identName }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  ""
+}
+
 // Instantiate (or reuse) the instance of generic `origFe` for the call at
 // `callIx` (whose enclosing function is `ctx`, -1 = top level), and point the
 // call site at it. Returns 0, or -1 via `emitFail`.
@@ -20734,6 +20787,27 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
                   }
                 }
                 pqi = pqi + 1
+              }
+            }
+          }
+          if rxe is Ident {
+            // `return <local>` where the local is a hole-built list (`const out = [];
+            // out.push(self[i])`): the list shares the indexed param's array type, so type
+            // the un-annotated return as that param's pinned type. This lowers a fully
+            // un-annotated `reverse(self)` end-to-end (the un-annotated-return kind inference
+            // can't see a mono instance's inferred list local). No source param found → keep
+            // `nret = -1`, so a plain scalar/local return stays byte-identical.
+            const srcParam = monoListSrcParam(fn.fnBody, rxe.identName)
+            if srcParam != "" {
+              let pli = 0
+              while pli < params.length {
+                const ppl = P.nodes[params[pli]]
+                if ppl is Param {
+                  if ppl.parName == srcParam {
+                    if pinned[pli] != "" { nret = mkTypeRef(pinned[pli], -1) }
+                  }
+                }
+                pli = pli + 1
               }
             }
           }
