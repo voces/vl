@@ -7558,6 +7558,104 @@ export function nodeArrayElemName(ix: i32) {
 }
 export function inferLetTyAt(i: i32) { inferLetTy[i] }
 
+// MONOMORPHIC BODY INFERENCE — lift the element-hole ceiling for an un-annotated param.
+// The shared definition body of a function is type-checked ONCE with each un-annotated
+// parameter bound to an OPAQUE inference hole, so an inferred empty-list local built from a
+// pass-through (`out.push(self[i])`) pins its element (the indexed param's element name), but
+// one built from a NON-TRIVIAL expression over the element (`out.push(self[i] * 2)`) cannot —
+// the hole isn't known to be numeric. This re-checks the body for ONE concrete call shape:
+// each parameter is bound to its pinned type (`paramTyNames`, aligned with the decl's params),
+// so the SAME existing list-element inference resolves the local concretely. Returns the
+// inferred LIST type-name of `localName` (`"i32[]"`, `"f64[]"`), or "" when it is not an
+// inferred list or stays generic — in which case the emitter keeps its prior behavior.
+//
+// Runs fully ISOLATED at emit time (after the real check pass): `nodeTyIx` recording and
+// symbols are suppressed via `inferQuiet`, and every diagnostic / inference table the body
+// check appends to is truncated back to its saved length, so the global checker state the
+// emitter still reads is byte-identical afterwards. Mirrors `inferReturnsPrePass`'s discipline.
+export function monoInferListElem(
+  declIx: i32,
+  paramTyNames: string[],
+  localName: string,
+) {
+  if declIx < 0 { return "" }
+  const dn = P.nodes[declIx]
+  if !(dn is FuncDecl) { return "" }
+  const body = P.nodes[dn.fnBody]
+  if !(body is Block) { return "" }
+  // Snapshot the suppression flags and every append-only inference/diagnostic table.
+  const sQuiet = inferQuiet
+  const sSym = symEnabled
+  const sDiag = T.diags.length
+  const sHoleN = holeShapeNames.length
+  const sHoleT = holeShapeTys.length
+  const sHoleArr = holeArrayDemand.length
+  const sILet = inferLetIx.length
+  const sINulS = inferLetNulStrIx.length
+  const sINulB = inferLetNulBoolIx.length
+  const sIRet = inferRetFn.length
+  const sStack = inferStack.length
+  const sTent = inferTentative.length
+  const sRedun = redunName.length
+  inferQuiet = true
+  symEnabled = 0
+  // Bind the parameters concretely in a fresh scope, then check the body STATEMENTS in
+  // that scope directly (not `checkNode(dn.fnBody)`, whose Block arm would push+pop its own
+  // scope and drop the local before we can read it). The list element hole resolves through
+  // the pushes; a `return`'s check against a stale `T.curRet` only yields a truncated diag.
+  pushScope(dn.fnBody)
+  const params = dn.fnParams
+  let pi = 0
+  while pi < params.length {
+    const p = P.nodes[params[pi]]
+    if p is Param {
+      let pty = TY_ERR
+      if pi < paramTyNames.length {
+        if paramTyNames[pi] != "" { pty = nameToTy(paramTyNames[pi]) }
+      }
+      declare(p.parName, pty)
+    }
+    pi = pi + 1
+  }
+  const stmts = body.blkStmts
+  let s = 0
+  while s < stmts.length {
+    checkNode(stmts[s])
+    s = s + 1
+  }
+  // Read the resolved local: a fully-pinned `T[]` (element no longer a `TyVar`) renders its
+  // list type name; anything else (not a list, or still generic) yields "".
+  let listName = ""
+  const lt = lookup(localName)
+  if lt >= 0 {
+    const ltt = T.tys[lt]
+    if ltt is TyArray {
+      if ltt.aElem >= 0 {
+        const el = T.tys[ltt.aElem]
+        if !(el is TyVar) { listName = tyToStr(lt) }
+      }
+    }
+  }
+  popScope()
+  // Restore: truncate every table back, then the flags + diagnostic stream.
+  while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
+  while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
+  while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
+  while inferLetIx.length > sILet { inferLetIx.pop() }
+  while inferLetTy.length > sILet { inferLetTy.pop() }
+  while inferLetNulStrIx.length > sINulS { inferLetNulStrIx.pop() }
+  while inferLetNulBoolIx.length > sINulB { inferLetNulBoolIx.pop() }
+  while inferRetFn.length > sIRet { inferRetFn.pop() }
+  while inferRetTy.length > sIRet { inferRetTy.pop() }
+  while inferStack.length > sStack { inferStack.pop() }
+  while inferTentative.length > sTent { inferTentative.pop() }
+  redunTruncate(sRedun)
+  while T.diags.length > sDiag { T.diags.pop() }
+  symEnabled = sSym
+  inferQuiet = sQuiet
+  listName
+}
+
 // Whether the LetDecl at `letIx` was recorded as an inferred `string | null` niche
 // if-binding (the niche analogue of `inferLetNameOf`). The emitter's `letIsNulString`
 // consults this so the slot classifies as kind 16 and reuses the annotated lowering.
