@@ -2,7 +2,7 @@ import { Diag, Tok } from "./ast"
 import { advance, gSrc, mkTok, scanQuoted } from "./lexer"
 import { accept, parseExpr, parseProgram, parseStmt, parseType, parseTypeName } from "./parser"
 import { T, Ty, TyFunc, TyObj, TyPrim, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
-import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkCall, mkCallN, mkFunc, mkIdent, mkMember, mkParam, mkStr, mkTypeRef, orderArgsByParamNames, ufcsAliasOf } from "./ast"
+import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkBlock, mkCall, mkCallN, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkLet, mkMember, mkParam, mkParen, mkReturn, mkStr, mkTypeRef, mkWhile, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 // VL-in-VL wasm emitter — self-hosted codegen spike.
 //
 // A `.vl` program that produces RAW WebAssembly *bytes* for a minimal but valid
@@ -20259,6 +20259,99 @@ function monoArgTyName(ix: i32, fnIx: i32) {
   "i32"
 }
 
+// Substitute a `LetDecl` annotation `letType` (a `TypeRef`) through the instance binding,
+// returning a fresh `TypeRef` node when a type param substitutes (`T[]` → `f64[]`), else
+// the original node index. So a generic body's `const out: T[] = []` / `const x: T` lowers
+// against the instance's CONCRETE element type — reusing the (already-working) concrete
+// annotated path for EVERY element type, not the per-rep usage inference.
+function monoSubstLetType(
+  letType: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  if letType < 0 { return letType }
+  const tn = P.nodes[letType]
+  if tn is TypeRef {
+    if monoAnnHasTyParam(tn.tyName, typarams) {
+      const sub = monoSubstAnn(tn.tyName, typarams, tvN, tvV)
+      if sub != "" && sub != tn.tyName { return mkTypeRef(sub, tn.pos) }
+    }
+  }
+  letType
+}
+
+// Clone a monomorphized instance's BODY, substituting every `LetDecl` type-param
+// annotation through the binding. Only the STATEMENT SPINE (blocks, control-flow, the
+// `LetDecl`s themselves) is rebuilt; every leaf expression — INCLUDING a nested lambda —
+// is SHARED unchanged, so no new function node is created (a clone would not be re-lifted,
+// `collectFns` having already run) and a `T`-independent body shares its arena wholesale.
+// Returns the SAME node index when nothing in the subtree changed, so an instance with no
+// annotated body local keeps sharing the original body (byte-identical, usage-gated). A
+// lambda that annotates a type param (`(x: T) => …`) is left un-substituted — that case
+// is out of scope and stays as it was.
+function monoCloneBody(
+  ix: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  if ix < 0 { return ix }
+  const n = P.nodes[ix]
+  if n is Block {
+    const ns: i32[] = []
+    let changed = false
+    let i = 0
+    while i < n.blkStmts.length {
+      const cs = monoCloneBody(n.blkStmts[i], typarams, tvN, tvV)
+      ns.push(cs)
+      if cs != n.blkStmts[i] { changed = true }
+      i = i + 1
+    }
+    if !changed { return ix }
+    return mkBlock(ns, n.pos)
+  }
+  if n is LetDecl {
+    const nt = monoSubstLetType(n.letType, typarams, tvN, tvV)
+    if nt == n.letType { return ix }
+    return mkLet(n.letKw, n.letName, nt, n.letInit, n.pos)
+  }
+  if n is WhileStmt {
+    const cb = monoCloneBody(n.whileBody, typarams, tvN, tvV)
+    if cb == n.whileBody { return ix }
+    return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
+  }
+  if n is IfStmt {
+    const ct = monoCloneBody(n.ifThen, typarams, tvN, tvV)
+    const ce = monoCloneBody(n.ifElse, typarams, tvN, tvV)
+    if ct == n.ifThen && ce == n.ifElse { return ix }
+    return mkIf(n.ifCond, ct, ce, n.pos)
+  }
+  if n is ForRange {
+    const cb = monoCloneBody(n.frBody, typarams, tvN, tvV)
+    if cb == n.frBody { return ix }
+    return mkForRange(n.frVar, n.frFrom, n.frTo, n.frStep, cb, n.frLabel, n.pos)
+  }
+  if n is ForIn {
+    const cb = monoCloneBody(n.fiBody, typarams, tvN, tvV)
+    if cb == n.fiBody { return ix }
+    return mkForIn(n.fiVar, n.fiIter, cb, n.fiLabel, n.pos)
+  }
+  if n is RetStmt {
+    // The return value may be a block / `if`-EXPRESSION carrying its own `LetDecl`s.
+    const ca = monoCloneBody(n.retArg, typarams, tvN, tvV)
+    if ca == n.retArg { return ix }
+    return mkReturn(ca, n.pos)
+  }
+  if n is Paren {
+    const ci = monoCloneBody(n.parInner, typarams, tvN, tvV)
+    if ci == n.parInner { return ix }
+    return mkParen(ci, n.pos)
+  }
+  // A pure expression / other statement carries no `LetDecl` annotation to rewrite — share.
+  ix
+}
+
 // Rebuild the name→index map and the voidness/return-kind inference after a new
 // instance lands in `fnStmts`, so later argument classification sees its
 // concrete signature. Also re-runs `collectA` (a pinned `string[]`/`f64`
@@ -20522,7 +20615,11 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
       let instFe = origFe
       if count > 0 { instName = fn.fnName + "$" + i32ToStr(count) }
       const noTyParams: string[] = []
-      const nfn = mkFunc(instName, noTyParams, nps, nret, fn.fnBody, -1)
+      // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
+      // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
+      // no such annotation.
+      const instBody = monoCloneBody(fn.fnBody, fn.fnTyParams, tvN, tvV)
+      const nfn = mkFunc(instName, noTyParams, nps, nret, instBody, -1)
       if count == 0 {
         // First instance: keep the bare name and the original's wasm index.
         fnStmts[origFe] = nfn
