@@ -247,12 +247,58 @@ function collectFns(stmts: i32[]) {
   fnStmts.length
 }
 
+// The `$fnsig` PARAM-spine token for the parameter at `paramIx` — one token per distinct
+// param VALTYPE, so two functions share a `$fnsig` exactly when their param valtypes
+// byte-match. Mirrors `fbValtype`'s coverage (the functype emitter writes
+// `fbValtype(vtKindOfParam, paramStructIdxOf)` for each param) and the annotation-string
+// scheme in `annParamKind`. Single-char tokens for the FIXED-valtype kinds (every i32 /
+// string / closure / list param has an identical valtype); the struct-table index is
+// appended (delimited by `;`) for the per-shape kinds (struct, nullable struct, ref list).
+// "" for a kind still outside the value-call ABI (union box / variant / map param) — that
+// keeps the signature un-interned (a clean "no interned signature" rejection at the call /
+// value site, never a mis-lowered all-i32 fallback).
+function cloParamTok(paramIx: i32) {
+  const k = vtKindOfParam(paramIx)
+  if k == 0 {
+    return "i" // i32 / boolean
+  }
+  if k == 11 {
+    return "d" // f64
+  }
+  if k == 3 {
+    return "S" // string
+  }
+  if k == 2 {
+    return "a" // i32[]
+  }
+  if k == 7 {
+    return "A" // string[]
+  }
+  if k == 12 {
+    return "D" // f64[]
+  }
+  if k == 14 {
+    return "c" // closure (all closures share `$cloStruct`)
+  }
+  if k == 1 {
+    return "s" + i32ToStr(paramStructIdxOf(paramIx)) + ";" // struct
+  }
+  if k == 5 {
+    return "r" + i32ToStr(paramStructIdxOf(paramIx)) + ";" // ref list (T[])
+  }
+  // i64 / f32 / the nullable-ref kinds (9 struct|null, 15 i32[]|null, 16 string|null,
+  // 19 closure|null) still mis-lower as a closure-call param — left "" so the value's
+  // signature stays un-interned and the soundness floor (`emitClosureValue`) rejects it
+  // with a clear message rather than emitting invalid wasm.
+  ""
+}
+
 // The interning KEY for lifted function `fe`'s env-leading `$fnsig`, or "" when the
 // signature is not function-value-eligible (a void / closure-returning function, or a
-// param/return kind outside i32/boolean, f64, struct ref). The key encodes the param
-// kinds (with the struct TABLE index for a struct param — stable, assigned by
-// `collectS`) and the return kind, so two functions share one `$fnsig` exactly when
-// their env-leading functypes are byte-identical.
+// param/return kind outside the `cloParamTok` / value-result ABI). The key encodes the
+// param kinds (`cloParamTok`) and the return kind, so two functions share one `$fnsig`
+// exactly when their env-leading functypes are byte-identical. `fnSigKeyOf` is the
+// value-eligible (i32/f64-result) variant; `cloSigKeyExt` extends the RESULT spine.
 function fnSigKeyOf(fe: i32) {
   if fe < 0 || fe >= fnStmts.length { return "" }
   const fn = P.nodes[fnStmts[fe]]
@@ -261,16 +307,9 @@ function fnSigKeyOf(fe: i32) {
     const params = fn.fnParams
     let pi = 0
     while pi < params.length {
-      let k = vtKindOfParam(params[pi])
-      if k == 0 {
-        key = key + "i"
-      } else if k == 11 {
-        key = key + "d"
-      } else if k == 1 {
-        key = key + "s" + i32ToStr(paramStructIdxOf(params[pi])) + ";"
-      } else {
-        return ""
-      }
+      const tok = cloParamTok(params[pi])
+      if tok == "" { return "" }
+      key = key + tok
       pi = pi + 1
     }
     let r = cloRetKindOf(fe)
@@ -529,16 +568,9 @@ function cloSigKeyExt(fe: i32) {
     let key = ""
     let pi = 0
     while pi < params.length {
-      let k = vtKindOfParam(params[pi])
-      if k == 0 {
-        key = key + "i"
-      } else if k == 11 {
-        key = key + "d"
-      } else if k == 1 {
-        key = key + "s" + i32ToStr(paramStructIdxOf(params[pi])) + ";"
-      } else {
-        return ""
-      }
+      const tok = cloParamTok(params[pi])
+      if tok == "" { return "" }
+      key = key + tok
       pi = pi + 1
     }
     if fRetVoid[fe] == 1 { return key + ">v" }
@@ -3690,6 +3722,19 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
 function emitClosureValue(body: i32[], fe: i32, fnIx: i32) {
   if fe < 0 || fe >= fnStmts.length {
     return emitFail("emitProgram: function value with no lifted function")
+  }
+  // SOUNDNESS FLOOR: a function whose env-leading signature is not representable as a
+  // closure `$fnsig` (`cloSigKeyExt` returns "" — an i64/f32 or nullable-ref / union /
+  // map PARAMETER, or an f32 return) cannot be soundly `call_ref`'d: the call site would
+  // fall back to the all-i32 arity functype and `ref.cast` the funcref to the WRONG type,
+  // trapping wasm validation. Reject at the value site with a clear, source-located
+  // message instead of emitting invalid wasm (mirrors the inferred-union-return floor).
+  if cloSigKeyExt(fe) == "" {
+    return emitFail(
+      "emitProgram: a function value's signature is not yet supported — a function " +
+        "value may not take an i64, f32, nullable, union, or map parameter (or return " +
+        "f32); annotate and call it as a named function instead",
+    )
   }
   // field 0: the typed funcref to the lifted function (imports occupy 0..gImports-1).
   fbRefFunc(gImports + fe)
@@ -19405,11 +19450,18 @@ function exprIsClosure(exprIx: i32, fnIx: i32) {
   false
 }
 
-// The closure-ABI param-kind code for a type NAME (`i32`/`boolean` → "i", `f64` → "d", a
-// declared struct → "s<idx>;"), or "" for a type outside the value-call ABI.
+// The closure-ABI param-kind code for a type NAME — the annotation-string analogue of
+// `cloParamTok` (which reads the AST), producing the IDENTICAL token per valtype so a
+// value call over an annotated higher-order callee (`g: (string) => i32`) resolves the
+// same interned `$fnsig` the passed lambda was minted under. "" for a type outside the
+// value-call ABI (the all-i32 arity fallback / soundness floor then applies).
 function annParamKind(t: string) {
   if t == "i32" || t == "boolean" || t == "bool" { return "i" }
   if t == "f64" { return "d" }
+  if nameIsString(t) { return "S" }
+  if nameIsI32Array(t) { return "a" }
+  if nameIsStringArray(t) { return "A" }
+  if nameIsF64Array(t) { return "D" }
   const si = structIndexByName(t)
   if si >= 0 { return "s" + i32ToStr(si) + ";" }
   ""
