@@ -110,7 +110,7 @@ type TyUnion = { uMembers: i32[] }
 export type TyNullable = { nInner: i32 }
 // A growable array `T[]`: the element type-arena index (`-1` for an empty `[]`
 // whose element is not yet known — assignable to any array, like a hole).
-type TyArray = { aElem: i32 }
+export type TyArray = { aElem: i32 }
 // A string-keyed map `{[K]: V}` or a Set over it: key and value type-arena
 // indices (`-1` for the holes of a bare `Map()`/`Set()`, pinned by the binding
 // annotation or the first `.set`/`.add`). `mSet` is 1 for the SET flavor — a set
@@ -747,6 +747,13 @@ let inferLetNulStrIx: i32[] = []
 // emitter classifies the slot as the niche i32 rep and reuses the annotated lowering.
 let inferLetNulBoolIx: i32[] = []
 let bodyChecked: {[string]: boolean} = Map()
+// TYPED-IR FOUNDATION: node index → resolved type-arena index, recorded for EVERY node on
+// the real (non-quiet) check pass so the EMITTER can consume the checker's already-computed
+// type instead of re-deriving it syntactically from the AST (the per-kind `letIs*`/`expr*`
+// predicate ladders). A flat table sized to the node arena at `checkProgram`. Nodes the
+// emitter SYNTHESIZES after checking (monomorphized instance bodies) fall past the end and
+// read back -1 via `nodeTyIxOf`, so a consumer falls back to its syntactic path there.
+let nodeTyIx: i32[] = []
 let inferQuiet = false
 let cycleBreakCount = 0
 let inferTentative: string[] = []
@@ -800,6 +807,7 @@ export function initChecker() {
   inferLetNulStrIx = []
   inferLetNulBoolIx = []
   bodyChecked = Map()
+  nodeTyIx = []
   inferQuiet = false
   cycleBreakCount = 0
   inferTentative = []
@@ -5979,7 +5987,22 @@ function checkProgramNode(n: Program) {
 // narrowing, because no other function may narrow `Node` (Finding 2). It is the
 // direct analogue of the parser_harness's single `walk`. On a type error it
 // raises a diagnostic and returns `TY_ERR` so checking continues.
+// Thin recording wrapper around the real per-variant checker: on the real (non-quiet)
+// pass, store each node's resolved type-arena index into the typed-IR table. Recording the
+// arena INDEX (not a snapshot) means a hole pinned later in place — an empty `[]` element
+// fixed by a downstream `.push` — is reflected when the emitter reads it back. Last write
+// wins, so a re-checked node settles on its final type.
 function checkNode(ix: i32) {
+  const t = checkNodeReal(ix)
+  if !inferQuiet {
+    if ix >= 0 {
+      if ix < nodeTyIx.length { nodeTyIx[ix] = t }
+    }
+  }
+  t
+}
+
+function checkNodeReal(ix: i32) {
   if ix < 0 { return TY_ERR }
   let n = P.nodes[ix]
 
@@ -7272,6 +7295,13 @@ function structUnionRetName(er: i32, stmts: i32[]) {
 export function checkProgram(rootIx: i32) {
   const rootN0 = P.nodes[rootIx]
   if rootN0 is Program { gRootStmts = rootN0.progStmts }
+  // Size the typed-IR table to the (now fully parsed) node arena, all holes (-1).
+  nodeTyIx = []
+  let ntz = 0
+  while ntz < P.nodes.length {
+    nodeTyIx.push(-1)
+    ntz = ntz + 1
+  }
   checkNode(rootIx)
   // The global scope (depth 0) is never popped, so flush its un-annotated
   // empty-collection bindings here: any still-open hole is genuinely uninferable.
@@ -7411,6 +7441,16 @@ export function inferLetNameOf(letIx: i32) {
 }
 export function inferLetCount() { inferLetIx.length }
 export function inferLetIxAt(i: i32) { inferLetIx[i] }
+// TYPED-IR FOUNDATION: the resolved type-arena index the checker recorded for AST node
+// `ix`, or -1 if none (an emitter-synthesized node, or a node never checked). The emitter
+// reads the `Ty` at this index (`T.tys[...]`) to lower the node by its checked type rather
+// than re-deriving it syntactically.
+export function nodeTyIxOf(ix: i32) {
+  if ix >= 0 {
+    if ix < nodeTyIx.length { return nodeTyIx[ix] }
+  }
+  -1
+}
 export function inferLetTyAt(i: i32) { inferLetTy[i] }
 
 // Whether the LetDecl at `letIx` was recorded as an inferred `string | null` niche
