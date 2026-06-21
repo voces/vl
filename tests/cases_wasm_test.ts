@@ -9,7 +9,7 @@
 //
 // Seed loading follows `lsp/src/wasmChecker.ts`: `WebAssembly.Module`/
 // `Instance` over the seed with an EMPTY import object, then the driver
-// exports from `scripts/vl-compiler-driver.vl` — `srcReset`/`srcPush` (one
+// exports from `compiler/driver.vl` — `srcReset`/`srcPush` (one
 // call per code point), `checkSrc` (parse + typecheck) / `compileSrc` (+ emit;
 // rc 0|1|2|3 = ok|parse|type|emit), `rbyteLen`/`rbyteAt` for the emitted
 // bytes, `diagCount`/`diagMsgLen`/`diagMsgAt`/`diagLine`/`diagCol` for

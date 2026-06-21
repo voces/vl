@@ -32,7 +32,7 @@ I/O shim ("the brains land in the wasm, the adapter stays an I/O shim" —
 **fetch loop**: the compiler tells the host which module keys it still needs;
 the host reads them and pushes them in; repeat until the graph is closed.
 
-### New compiler-wasm exports (scripts/vl-compiler-driver.vl)
+### New compiler-wasm exports (compiler/driver.vl)
 
     modReset()              clear the module table
     modKeyPush(c: i32)      accumulate the next module's KEY (resolved path)
@@ -68,7 +68,7 @@ the host just does `read_to_string(key)`. Missing file ⇒ `found=0`.
 
 ### Module pipeline in VL (driver file, ~5 steps)
 
-All ported from `modules.ts` semantics; lives in `vl-compiler-driver.vl` (it IS
+All ported from `modules.ts` semantics; lives in `driver.vl` (it IS
 driver logic, and the driver is already single-sourced into both assemblies —
 no new concatenation point):
 

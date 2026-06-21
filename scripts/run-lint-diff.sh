@@ -22,8 +22,10 @@ sed -E 's/\bTok\b/LexTok/g; s/\bDiag\b/LexDiag/g; s/\badvance\b/lexAdvance/g' \
 cat compiler/ast.vl compiler/parser.vl compiler/lint.vl scripts/lint-harness.vl \
   >> "$WORK/asm.vl"
 # Blank the module import statements (the vl binary's module gate rejects a
-# line-leading `import {`); preserves line numbers.
-sed -i -E '/^import \{/,/\} from "/ s/.*//' "$WORK/asm.vl"
+# line-leading `import {`). Handles BOTH a single-line `import { … } from "…"`
+# and a `vl fmt`-wrapped multi-line one: accumulate from `import {` until the
+# line carrying `from "`, then blank the whole span.
+sed -i -E '/^import \{/{:a;/from "/!{N;ba};s/.*//}' "$WORK/asm.vl"
 
 # Splice the target source in as a VL string literal (Python does the escaping
 # so embedded backslashes/quotes/newlines survive intact).

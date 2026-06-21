@@ -47,7 +47,7 @@ Rolling pre-release, tag **`seed-latest`** (continuously re-pointed):
 | --- | --- |
 | `vl-compiler.wasm` | the seed; overwritten each master push (the "latest" pointer) |
 | `vl-compiler.wasm.sha256` | checksum sidecar; `fetch-seed.sh` fails closed on mismatch |
-| `seed-fingerprint.txt` | `sha256` over `compiler/*.vl` + `scripts/vl-compiler-driver.vl`, plus the producing commit SHA (provenance) |
+| `seed-fingerprint.txt` | `sha256` over `compiler/*.vl` + `compiler/driver.vl`, plus the producing commit SHA (provenance) |
 
 A second immutable tagged release **`seed-v0`** preserves the auditable genesis
 artifact (the one seed ever minted by TS).

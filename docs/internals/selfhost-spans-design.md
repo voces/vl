@@ -105,7 +105,7 @@ emitter never sees tokens, so it cannot perturb emitted bytes.
   note — so a literal MISSING a destination field FAILS to typecheck). Measured
   blast radius: **15 files** contain `P.toks.push({ … })`. Of those:
   - 4 are the real bridges/harnesses that inline `ast.vl`:
-    `scripts/vl-compiler-driver.vl` (the native/seed driver — fills from the lexed
+    `compiler/driver.vl` (the native/seed driver — fills from the lexed
     token), `tests/selfhost/pipeline_harness.vl` (fills from the lexed token),
     `tests/selfhost/parser_harness.vl` and `tests/selfhost/typecheck_harness.vl`
     (hand-built streams — fill `start:0, line:1, col:0` placeholders).
@@ -157,7 +157,7 @@ emitter never sees tokens, so it cannot perturb emitted bytes.
   the token's `line`/`col`. Add `tline`/`tcol` to `TDiag` (or compute at render).
 - `compiler/parser.vl`: `Diag = { msg, at }` where `at` is a **token index**
   (`P.pos`). Map `at` → `P.toks[at].line`/`.col` (rung 1, already available).
-- The driver (`scripts/vl-compiler-driver.vl`) `vcDiags()` would render
+- The driver (`compiler/driver.vl`) `vcDiags()` would render
   `line:col: message` so the native `vl` and the deno harness can adjudicate
   `@error-at`. The corpus/native-align tests would then promote `@error-at` files.
 - No emitter change.

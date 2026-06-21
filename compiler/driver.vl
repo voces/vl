@@ -1,13 +1,25 @@
-// The source-in / bytes-out DRIVER appended to the five compiler modules when
-// building `vl-compiler.wasm` — the interface `scripts/vl-host` embeds against.
-// SINGLE-SOURCED: `scripts/build-compiler-wasm.ts` (the stage-0 seed) and
-// `scripts/native-fixpoint.sh` (the no-TS self-rebuild) both append THIS file,
-// so the seed compiler and a self-rebuilt compiler expose the identical surface.
+// The source-in / bytes-out DRIVER — the interface `scripts/vl-host` embeds
+// against. A real `import`/`export` MODULE that imports the pipeline (lexer →
+// ast → parser → typecheck → wasmEmit → lint → format) and exposes the host ABI
+// (`srcReset`/`compileSrc`/`checkSrc`/`lintSrc`/`formatSrc` + the LSP query
+// families). `compiler/entry.vl` re-exports this ABI under bare names so the
+// module-resolved build (`vl build compiler/entry.vl`) keeps a stable surface.
 //
 // Source accumulates as an i32 CODE-POINT LIST (amortized push — string concat
 // per char is quadratic copy churn, pathological where GC array.copy is a
 // per-element host libcall), converted ONCE by the fromCodePoints builtin.
-let vcCodes: i32[] = []
+import { ArrayLit, BinExpr, Block, BreakStmt, Call, ContinueStmt, Diag, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, ObjLit, OptMember, Param, Paren, Program, RetStmt, Tok, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt } from "./ast"
+import { diag } from "./lexer"
+import { tErr } from "./typecheck"
+import { W, capHas, emitErr, emitProgram, fnIndices, fnNames, globalNames, globalStmts, localNames, reExpName, reExpTarget } from "./wasmEmit"
+import { tokenize } from "./lexer"
+import { P, declNameTok, i32ToStr, mkProgram, nodeToks, ufcsAliasAdd, ufcsAliasReset } from "./ast"
+import { parseProgram } from "./parser"
+import { T, checkProgram, initChecker, redunCount, redunEColAt, redunELineAt, redunNameAt, redunSColAt, redunSLineAt, redunTokAt, redunTypeAt, symDefAt, symInlayColAt, symInlayCount, symInlayKindAt, symInlayLineAt, symInlayOccAt, symInlayScan, symInlayTypeCharAt, symInlayTypeLen, symMemTypeStrAt, symMemberCol, symMemberCount, symMemberIsMethod, symMemberLen, symMemberLine, symMemberScanAt, symMemberScanCount, symMemberScanIsFn, symMemberScanNameCharAt, symMemberScanNameLen, symMemberScanTypeCharAt, symMemberScanTypeLen, symOccBinding, symOccCount, symOccEndCol, symOccEndLine, symOccIsDeclAt, symOccKindAt, symOccStartCol, symOccStartLine, symOccTokAt, symRefAt, symRefsCountAt, symScopeAt, symScopeKindAt, symScopeNameCharAt, symScopeNameLen, symScopeTypeCharAt, symScopeTypeLen, symSetEnabled, symTypeAliasAt, symTypeStrAt } from "./typecheck"
+import { W, capHas, emitErr, emitProgram, fnIndices, fnNames, globalNames, globalStmts, localNames, reExpName, reExpTarget } from "./wasmEmit"
+import { lint, lintCodeAt, lintColAt, lintCount, lintLineAt, lintMsgAt, lintSevAt } from "./lint"
+import { fmtAddComment, fmtResetComments, fmtSetSource, formatProgram } from "./format"
+export let vcCodes: i32[] = []
 export function srcReset(): i32 {
   vcCodes = []
   0
@@ -16,7 +28,7 @@ export function srcPush(c: i32): i32 {
   vcCodes.push(c)
   0
 }
-function vcSource(): string { fromCodePoints(vcCodes) }
+export function vcSource(): string { fromCodePoints(vcCodes) }
 // Source positions of the LEX diagnostics folded into `P.diags` (parallel to the
 // first `vcLexLines.length` entries of `P.diags`): a lex diag carries a real
 // `line`/`col` but `Diag.at` is a TOKEN index, so the positions ride here and
@@ -51,8 +63,8 @@ let reExpPublic: string[] = [] // the public bare name (the `as` alias, else the
 let reExpLocal: string[] = []  // the local binding the import created (resolves to the target)
 // Filled by `modCompile` once renames are known: the public name → the merged
 // (mangled) target function name, consumed by `emitProgram`'s export section.
-let reExpName: string[] = []
-let reExpTarget: string[] = []
+// `reExpName`/`reExpTarget` are DEFINED in wasmEmit (the consumer) and imported
+// here, so the driver→emitter→driver read does not form an import cycle.
 // The export NAME token's source position (1-based line, 0-based col), parallel to
 // `expName` — the cross-file go-to-definition target (the exporting module's decl).
 let expDeclLine: i32[] = []
@@ -240,7 +252,7 @@ export function lintCol(i: i32): i32 { lintColAt(i) }
 // or -1 on a lex/parse error (the formatter needs a valid AST). The host then
 // reads the bytes via `fmtByteAt(j)` (one UTF-32 code point per call, like the
 // other string accessors), 0 ≤ j < the returned length.
-let vcFmtOut = ""
+export let vcFmtOut = ""
 export function formatSrc(): i32 {
   symSetEnabled(0)
   P.toks = []
@@ -350,7 +362,7 @@ export function symBindingId(i: i32): i32 { symOccBinding(i) }
 // `modLoadStart`/`modLoadMod` during `modCompile`); map the occurrence's anchor
 // token into that range. Single-file mode (no module load) → 0. Lets the host
 // attribute each occurrence to its source file and collect refs across the graph.
-function modOfTok(tok: i32): i32 {
+export function modOfTok(tok: i32): i32 {
   let best = 0
   let o = 0
   while o < modLoadStart.length {
@@ -694,7 +706,7 @@ export function diagAt(i: i32): i32 { vcDiags()[i] }
 // `diagCol(i)` (0-based — the lexer's and `@error-at`'s convention). Order
 // matches `vcDiags`: parse diags (lex diags first), then type diags, then the
 // emit failure message (positionless).
-function vcDiagMsg(i: i32): string {
+export function vcDiagMsg(i: i32): string {
   if i < P.diags.length { return P.diags[i].msg }
   let j = i - P.diags.length
   if j < T.diags.length { return T.diags[j].tmsg }
