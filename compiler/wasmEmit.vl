@@ -9138,6 +9138,9 @@ function coalesceAtomKind(exprIx: i32, fnIx: i32) {
 // the direct-reference forms (the Slice-1 `print(x)` shape) classify as i64.
 function exprIsI64(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  if tyKindOf(nodeTyIxOf(exprIx)) == 10 {
+    return true // typed-IR fast path (see exprIsF64)
+  }
   if coalesceAtomKind(exprIx, fnIx) == 3 { return true }
   const e = P.nodes[exprIx]
   if e is Paren { return exprIsI64(e.parInner, fnIx) }
@@ -9242,6 +9245,9 @@ function globalIsF32(name: string) {
 // a mixed f32/float-literal expression routes to the f32 instructions. (Slice 5.)
 function exprIsF32(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  if tyKindOf(nodeTyIxOf(exprIx)) == 13 {
+    return true // typed-IR fast path (see exprIsF64)
+  }
   if coalesceAtomKind(exprIx, fnIx) == 5 { return true }
   const e = P.nodes[exprIx]
   if e is Paren { return exprIsF32(e.parInner, fnIx) }
@@ -9356,6 +9362,11 @@ function globalIsF64(name: string) {
 // per-operand opcode selection in the BinExpr path. (Slice 3.)
 function exprIsF64(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  // Typed-IR fast path through the single `tyKindOf` mapping (additive — only turns false
+  // into true, so the flow/union-narrowed cases below still apply; a node with no recorded
+  // type, e.g. a monomorphized instance body, reads -1 and falls through to the syntactic
+  // derivation).
+  if tyKindOf(nodeTyIxOf(exprIx)) == 11 { return true }
   if coalesceAtomKind(exprIx, fnIx) == 4 { return true }
   const e = P.nodes[exprIx]
   if e is NumLit { return numTextIsFloat(e.numText) }
@@ -18356,6 +18367,9 @@ function memFieldTypeCode(memIx: i32, fnIx: i32) {
 // expression. An index read / `.length` yields an i32, so neither counts.
 function exprArray(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  if tyKindOf(nodeTyIxOf(exprIx)) == 2 {
+    return true // typed-IR fast path (see exprIsF64)
+  }
   const e = P.nodes[exprIx]
   if e is ArrayLit { return !arrLitIsRef(exprIx) }
   if e is Paren { return exprArray(e.parInner, fnIx) }
@@ -18754,6 +18768,9 @@ function fnRetStringArray(name: string) {
 // `.length` is NOT a list.
 function exprStringArray(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  if tyKindOf(nodeTyIxOf(exprIx)) == 7 {
+    return true // typed-IR fast path (see exprIsF64)
+  }
   const e = P.nodes[exprIx]
   if e is ArrayLit { return arrLitIsStr(exprIx, fnIx) }
   if e is Paren { return exprStringArray(e.parInner, fnIx) }
@@ -18864,21 +18881,50 @@ function declaredF64Array(name: string) {
 
 // True if evaluating the expression at `exprIx` yields an f64 list: an f64-element
 // array literal, an f64-array param/local reference, or a parenthesized one.
-// TYPED-IR consumer: is the type the checker recorded for arena index `tyIx` an `f64[]`?
-// (`TyArray` whose element is the `f64` primitive.) The first use of the node→type table —
-// it lets the emitter recognize an f64 list the SYNTACTIC predicates miss (e.g. a value
-// returned from an `f64[]`-returning function, which `calleeRetKind` doesn't map to a list
-// kind), without another bespoke per-position predicate.
-function tyIsF64Array(tyIx: i32) {
-  if tyIx < 0 { return false }
+// THE single typed-IR → emitter-kind mapping (the unification centerpiece): map a checker
+// type-arena index to the emitter's local/value KIND code the per-rep predicates speak
+// (0 i32 · 3 string · 10 i64 · 11 f64 · 13 f32 · 2 i32-list · 7 string-list · 12 f64-list).
+// One place classifies a type; consumers compare the result to a specific kind instead of
+// each re-deriving it. Scalars and scalar-element lists resolve fully; a struct / ref / map
+// / nullable / closure type returns -1 (its lowering needs a slot/table the kind code alone
+// can't carry), and a node with no recorded type (a monomorphized instance body, whose
+// shared leaves can't hold a per-instance type) also reads -1 — both keep the syntactic path.
+function tyKindOf(tyIx: i32) {
+  if tyIx < 0 { return -1 }
   const t = T.tys[tyIx]
-  if t is TyArray {
-    if t.aElem < 0 { return false }
-    const el = T.tys[t.aElem]
-    if el is TyPrim { return el.primName == "f64" }
+  if t is TyPrim {
+    const n = t.primName
+    if n == "i32" { return 0 }
+    if n == "f64" { return 11 }
+    if n == "i64" { return 10 }
+    if n == "f32" { return 13 }
+    if n == "string" { return 3 }
+    if n == "bool" {
+      return 0 // boolean rides an i32 (0/1)
+    }
+    if n == "boolean" { return 0 }
+    return -1
   }
-  false
+  if t is TyArray {
+    if t.aElem < 0 { return -1 }
+    const el = T.tys[t.aElem]
+    if el is TyPrim {
+      const en = el.primName
+      if en == "i32" { return 2 }
+      if en == "f64" { return 12 }
+      if en == "string" { return 7 }
+      if en == "bool" { return 2 }
+      if en == "boolean" { return 2 }
+    }
+    return -1 // struct / ref / nested-list element — needs the ref-list slot
+  }
+  -1
 }
+
+// TYPED-IR consumer: is the type the checker recorded for `tyIx` an `f64[]`? Lets the emitter
+// recognize an f64 list the SYNTACTIC predicates miss (e.g. an `f64[]`-returning call, which
+// `calleeRetKind` doesn't map to a list kind) without a bespoke per-position predicate.
+function tyIsF64Array(tyIx: i32) { tyKindOf(tyIx) == 12 }
 
 function exprF64Array(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
