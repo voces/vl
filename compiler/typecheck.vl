@@ -7773,6 +7773,95 @@ export function monoInferListElem(
   listName
 }
 
+// The SCALAR sibling of `monoInferListElem`: re-check the body of `declIx` with its params
+// pinned to `paramTyNames` and read the resolved type of the LOCAL `localName`, returning its
+// prim NAME when it settles on a concrete NON-i32 scalar (`string` / `f64` / `i64` / `f32`),
+// else "". This lets the monomorphizer type an un-annotated `return <local>` whose local is a
+// scalar ELEMENT of a hole-pinned param (`const t = self[i]; return t`, or a `let acc = "";
+// acc = acc + self[i]; return acc` fold) — the emitter's return-kind inference runs BEFORE
+// locals are collected and the checker's typed-IR is stale for a hole-derived node, so without
+// this the instance's functype result defaults to i32 and clashes with the string/f64 ref the
+// body returns. i32 / boolean (both i32 valtype) and any still-generic local yield "" so the
+// existing inferred-return path is left byte-identical. The save/restore mirrors
+// `monoInferListElem` exactly (every append-only inference/diagnostic table is truncated back).
+export function monoInferLocalScalar(
+  declIx: i32,
+  paramTyNames: string[],
+  localName: string,
+) {
+  if declIx < 0 { return "" }
+  const dn = P.nodes[declIx]
+  if !(dn is FuncDecl) { return "" }
+  const body = P.nodes[dn.fnBody]
+  if !(body is Block) { return "" }
+  const sQuiet = inferQuiet
+  const sSym = symEnabled
+  const sDiag = T.diags.length
+  const sHoleN = holeShapeNames.length
+  const sHoleT = holeShapeTys.length
+  const sHoleArr = holeArrayDemand.length
+  const sILet = inferLetIx.length
+  const sINulS = inferLetNulStrIx.length
+  const sINulB = inferLetNulBoolIx.length
+  const sIRet = inferRetFn.length
+  const sStack = inferStack.length
+  const sTent = inferTentative.length
+  const sRedun = redunName.length
+  inferQuiet = true
+  symEnabled = 0
+  pushScope(dn.fnBody)
+  const params = dn.fnParams
+  let pi = 0
+  while pi < params.length {
+    const p = P.nodes[params[pi]]
+    if p is Param {
+      let pty = TY_ERR
+      if pi < paramTyNames.length {
+        if paramTyNames[pi] != "" { pty = nameToTy(paramTyNames[pi]) }
+      }
+      declare(p.parName, pty)
+    }
+    pi = pi + 1
+  }
+  const stmts = body.blkStmts
+  let s = 0
+  while s < stmts.length {
+    checkNode(stmts[s])
+    s = s + 1
+  }
+  // Read the resolved local: a concrete NON-i32 scalar prim renders its name; anything else
+  // (i32 / boolean / non-scalar / still-generic) yields "" → the inferred-return path is left
+  // untouched.
+  let scalarName = ""
+  const lt = lookup(localName)
+  if lt >= 0 {
+    const ltt = T.tys[lt]
+    if ltt is TyPrim {
+      const pn = ltt.primName
+      if pn == "string" || pn == "f64" || pn == "i64" || pn == "f32" {
+        scalarName = pn
+      }
+    }
+  }
+  popScope()
+  while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
+  while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
+  while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
+  while inferLetIx.length > sILet { inferLetIx.pop() }
+  while inferLetTy.length > sILet { inferLetTy.pop() }
+  while inferLetNulStrIx.length > sINulS { inferLetNulStrIx.pop() }
+  while inferLetNulBoolIx.length > sINulB { inferLetNulBoolIx.pop() }
+  while inferRetFn.length > sIRet { inferRetFn.pop() }
+  while inferRetTy.length > sIRet { inferRetTy.pop() }
+  while inferStack.length > sStack { inferStack.pop() }
+  while inferTentative.length > sTent { inferTentative.pop() }
+  redunTruncate(sRedun)
+  while T.diags.length > sDiag { T.diags.pop() }
+  symEnabled = sSym
+  inferQuiet = sQuiet
+  scalarName
+}
+
 // Whether the LetDecl at `letIx` was recorded as an inferred `string | null` niche
 // if-binding (the niche analogue of `inferLetNameOf`). The emitter's `letIsNulString`
 // consults this so the slot classifies as kind 16 and reuses the annotated lowering.
