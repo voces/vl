@@ -1,7 +1,7 @@
 import { Diag, Tok } from "./ast"
 import { advance, gSrc, mkTok, scanQuoted } from "./lexer"
 import { accept, parseExpr, parseProgram, parseStmt, parseType, parseTypeName } from "./parser"
-import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
+import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, nodeTyIsUnion, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
 import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkBlock, mkCall, mkCallN, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkLet, mkMember, mkParam, mkParen, mkReturn, mkStr, mkTypeRef, mkWhile, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 // VL-in-VL wasm emitter — self-hosted codegen spike.
 //
@@ -280,14 +280,20 @@ function cloParamTok(paramIx: i32) {
   if k == 14 {
     return "c" // closure (all closures share `$cloStruct`)
   }
+  if k == 10 {
+    return "I" // i64 (a scalar valtype — never a `>`-prefixed result token here)
+  }
+  if k == 4 {
+    return "u" // union box (all unions share `$uBox`; tags are program-global)
+  }
   if k == 1 {
     return "s" + i32ToStr(paramStructIdxOf(paramIx)) + ";" // struct
   }
   if k == 5 {
     return "r" + i32ToStr(paramStructIdxOf(paramIx)) + ";" // ref list (T[])
   }
-  // i64 / f32 / the nullable-ref kinds (9 struct|null, 15 i32[]|null, 16 string|null,
-  // 19 closure|null) still mis-lower as a closure-call param — left "" so the value's
+  // f32 / the nullable-ref kinds (9 struct|null, 15 i32[]|null, 16 string|null, 19
+  // closure|null) still mis-lower as a closure-call param — left "" so the value's
   // signature stays un-interned and the soundness floor (`emitClosureValue`) rejects it
   // with a clear message rather than emitting invalid wasm.
   ""
@@ -20071,6 +20077,12 @@ function exprIsClosure(exprIx: i32, fnIx: i32) {
 function annParamKind(t: string) {
   if t == "i32" || t == "boolean" || t == "bool" { return "i" }
   if t == "f64" { return "d" }
+  if t == "i64" {
+    return "I" // i64 scalar param (matches `cloParamTok` kind 10)
+  }
+  if isUName(t) {
+    return "u" // a declared union name (matches `cloParamTok` kind 4)
+  }
   if nameIsString(t) { return "S" }
   if nameIsI32Array(t) { return "a" }
   if nameIsStringArray(t) { return "A" }
@@ -22127,7 +22139,14 @@ function synthParamAnnots() {
       while pi < ps.length {
         let p = P.nodes[ps[pi]]
         if p is Param {
-          if p.parType < 0 {
+          if p.parType < 0 && nodeTyIsUnion(ps[pi]) && unNames.length > 0 {
+            // An un-annotated UNION-element callback param (`xs.filter((a) => a is Cat)`):
+            // the checker typed it as a value union. Pin it to a declared union alias so
+            // its `is`-narrowing and closure `$fnsig` param token (kind 4) resolve. All
+            // unions share `$uBox` and program-global variant tags, so any declared alias
+            // routes emission identically; the checker already validated the precise type.
+            p.parType = mkTypeRef(unNames[0], -1)
+          } else if p.parType < 0 {
             const tn = nodeTyName(ps[pi])
             if tn != "" {
               // A STRUCT shape (`{x: i32}`) resolves to the declared struct's NOMINAL name
