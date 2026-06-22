@@ -5,7 +5,7 @@
 // never the lowering — a clean layer (`emit_state → emit_bytes → wasmEmit`).
 
 import { f32Bytes, f64Bytes, slebToArr, ulebToArr } from "./emit_base"
-import { W, aTypeIdx, arrNewScratchBase, callRefSlot, cloEqScratchBase, cloStructIdx, coalesceCallBoolSlot, coalesceCallSlot, coalesceCallStrSlot, curBuf, emitErr, emitFailed, f64PushScratchBase, fa64TypeIdx, fbScratchCur, fl64TypeIdx, fnListEqRSlots, fnMvBase, fnRefPushSlots, fnUsesArrNew, fnUsesCallRef, fnUsesCloEq, fnUsesCoalesceCall, fnUsesF64Push, fnUsesListEqI, fnUsesListEqS, fnUsesMap, fnUsesMapFilter, fnUsesPush, fnUsesStrOp, fnUsesStrPush, lTypeIdx, leqIScratchBase, leqRBases, leqSScratchBase, localIsRef, localStructIdx, mStructIdx, mapScratchBase, mfDstBases, mfDstKinds, mfDstSlots, mfScratchBase, mfSrcBases, mfSrcKinds, mfSrcSlots, mkArrIdx, mkListIdx, mvMapTypeIdx, mvRlSlot, mvValKind, mvValName, mvValStructIdx, pushScratchBase, refPushBaseBySlot, refPushScratchBase, rlBackIdx, rlElemHeap, rlWrapIdx, sHeapIdx, strPushScratchBase, strScratchBase, uBoxIdx, uVarIdx } from "./emit_state"
+import { W, aTypeIdx, arrNewScratchBase, callRefSlot, cloEqScratchBase, cloStructIdx, coalesceCallBoolSlot, coalesceCallSlot, coalesceCallStrSlot, curBuf, emitErr, emitFailed, f64PushScratchBase, fa64TypeIdx, fbScratchCur, fl64TypeIdx, fnListEqRSlots, fnMvBase, fnRefPushSlots, fnUsesArrNew, fnUsesCallRef, fnUsesCloEq, fnUsesCoalesceCall, fnUsesF64Push, fnUsesListEqI, fnUsesListEqS, fnUsesMap, fnUsesMapFilter, fnUsesPush, fnUsesStrOp, fnUsesStrPush, lTypeIdx, leqIScratchBase, leqRBases, leqSScratchBase, localIsRef, localStructIdx, mStructIdx, mapScratchBase, mapKeysBase, fnUsesMapKeys, mfDstBases, mfDstKinds, mfDstSlots, mfScratchBase, mfSrcBases, mfSrcKinds, mfSrcSlots, mkArrIdx, mkListIdx, mvMapTypeIdx, mvRlSlot, mvValKind, mvValName, mvValStructIdx, pushScratchBase, refPushBaseBySlot, refPushScratchBase, rlBackIdx, rlElemHeap, rlWrapIdx, sHeapIdx, strPushScratchBase, strScratchBase, uBoxIdx, uVarIdx } from "./emit_state"
 
 // Redirect the writer at `buf`; return the PREVIOUS current buffer so the caller
 // can restore it (closure-free save/restore — replaces threading `body`/`payload`
@@ -407,11 +407,17 @@ export function mapTypeIdxOf(slot: i32) {
 export function mvValsBackOf(slot: i32) {
   if slot < 0 { return aTypeIdx }
   if mvValKind[slot] == 3 { return mkArrIdx }
+  if mvValKind[slot] == 11 {
+    return fa64TypeIdx // f64-valued map: f64 array backing
+  }
   rlBackIdx[mvRlSlot[slot]]
 }
 export function mvValElemHeapOf(slot: i32) {
   if slot < 0 { return aTypeIdx }
   if mvValKind[slot] == 3 { return aTypeIdx }
+  if mvValKind[slot] == 11 {
+    return fa64TypeIdx // f64-valued map: f64 array backing
+  }
   sHeapIdx[mvValStructIdx[slot]]
 }
 // Reserve `n` wasm locals at the current cursor, returning the frame's base index
@@ -451,6 +457,9 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   // G8 map scratch frame (14 slots).
   mapScratchBase = fbScratchCur
   if fnUsesMap { fbReserve(14) }
+  // `m.keys()` / `for k in m` key-list builder frame (6 slots).
+  mapKeysBase = fbScratchCur
+  if fnUsesMapKeys { fbReserve(6) }
   // Closure scratch frame (1 slot, a `(ref $cloStruct)`) for `call_ref` (lambdas).
   callRefSlot = fbScratchCur
   if fnUsesCallRef { fbReserve(1) }
@@ -524,6 +533,12 @@ export function fbI32Run() {
   wU8(127) // 0x7f i32
   0
 }
+// One (1, f64) run — `0x7c`.
+export function fbF64Run() {
+  wU8(1)
+  wU8(124) // 0x7c f64
+  0
+}
 // One (1, (ref ht)) run — non-null `0x64 <uleb heapIdx>`.
 export function fbRefRun(heapIdx: i32) {
   wU8(1)
@@ -550,6 +565,7 @@ export function fbLocalsCount(nLocals: i32) {
   if fnUsesF64Push { n = n + 4 }
   if fnUsesStrOp { n = n + 7 }
   if fnUsesMap { n = n + 14 + mvValName.length * 3 }
+  if fnUsesMapKeys { n = n + 6 }
   if fnUsesCallRef { n = n + 1 }
   if fnUsesMapFilter { n = n + 4 }
   n = n + mfSrcKinds.length + mfDstKinds.length
@@ -644,6 +660,16 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(aTypeIdx)
     fbRefRun(aTypeIdx)
   }
+  // `m.keys()` / `for k in m` key-list builder frame (6 slots): outBack (ref $mkArrIdx),
+  // keysBack (ref $mkArrIdx), live (ref $aTypeIdx), i, j, count (3 i32).
+  if fnUsesMapKeys {
+    fbRefRun(mkArrIdx)
+    fbRefRun(mkArrIdx)
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbI32Run()
+    fbI32Run()
+  }
   // Closure scratch slot (1, (ref $cloStruct)) for `call_ref` (lambdas).
   if fnUsesCallRef { fbRefRun(cloStructIdx) }
   // `.map`/`.filter` HOF frame: i, n, j (3 i32) + the callback closure
@@ -679,7 +705,13 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     while mvr < mvValName.length {
       fbRefRun(mvMapTypeIdx[mvr])
       fbRefRun(mvValsBackOf(mvr))
-      fbRefNullRun(mvValElemHeapOf(mvr))
+      // valStash: a SCALAR f64 local for an f64-valued map (kind 11), else the nullable
+      // `(ref null <elem>)` that holds a string/struct vals-slot read.
+      if mvValKind[mvr] == 11 {
+        fbF64Run()
+      } else {
+        fbRefNullRun(mvValElemHeapOf(mvr))
+      }
       mvr = mvr + 1
     }
   }
