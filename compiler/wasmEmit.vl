@@ -2993,6 +2993,21 @@ function exprIsStrEq(binIx: i32, fnIx: i32) {
   false
 }
 
+// True if `binIx` is an ORDERING comparison (`<`/`>`/`<=`/`>=`) over two STRING operands
+// — a lexicographic compare (`emitStrLessCore`), not the numeric `i32.lt_s` path that
+// would compare the array refs. BOTH operands must be strings (the checker rejects a
+// mixed string/numeric ordering); the frame reserved by `exprHasStrOp` carries the loop.
+function exprIsStrOrder(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const op = e.binOp
+    if op == "<" || op == ">" || op == "<=" || op == ">=" {
+      return exprString(e.binLeft, fnIx) && exprString(e.binRight, fnIx)
+    }
+  }
+  false
+}
+
 // True if `binIx` is a `==`/`!=` whose union-box value compare can hit the
 // STRING arm — a box compared against a string operand, or two boxes whose
 // shared arms include `string`. Those payload compares stage their operands in
@@ -3285,6 +3300,8 @@ function exprHasStrOp(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     if exprIsStrConcat(exprIx, fnIx) { return true }
     if exprIsStrEq(exprIx, fnIx) { return true }
+    // A string ORDERING (`<`/`>`/`<=`/`>=`) rides the same lexicographic compare loop.
+    if exprIsStrOrder(exprIx, fnIx) { return true }
     // A union-box `==`/`!=` whose value compare can hit the STRING arm stages
     // its payloads in the same frame (`emitStrEqCore`).
     if exprIsUnionStrEq(exprIx, fnIx) { return true }
@@ -3326,6 +3343,14 @@ function exprHasStrOp(exprIx: i32, fnIx: i32) {
   if e is Index {
     if exprHasStrOp(e.idxArr, fnIx) { return true }
     return exprHasStrOp(e.idxIndex, fnIx)
+  }
+  // An if-EXPRESSION in value position (`print(if a < b then …)`): a string op in the
+  // condition or either arm needs the frame reserved too.
+  if e is IfStmt {
+    if exprHasStrOp(e.ifCond, fnIx) { return true }
+    if blockHasStrOp(e.ifThen, fnIx) { return true }
+    if e.ifElse >= 0 { return blockHasStrOp(e.ifElse, fnIx) }
+    return false
   }
   if e is Unary { return exprHasStrOp(e.unArg, fnIx) }
   if e is Paren { return exprHasStrOp(e.parInner, fnIx) }
@@ -7221,6 +7246,120 @@ function emitStrEq(body: i32[], binIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string equality")
 }
 
+// Lower a string ORDERING comparison (`<`/`>`/`<=`/`>=`) onto `body`, leaving a 0/1.
+// Built on ONE primitive — `emitStrLessCore`, "first operand lexicographically < second":
+//   A <  B  ≡  less(A, B)
+//   A >  B  ≡  less(B, A)             (swap)
+//   A <= B  ≡  !less(B, A)            (swap + negate)
+//   A >= B  ≡  !less(A, B)            (negate)
+// The core sets B (stack top) then A (below), so the lower operand is its first arg.
+function emitStrOrder(body: i32[], binIx: i32, fnIx: i32) {
+  if !aUsed {
+    return emitFail("emitProgram: string ordering but array type not collected")
+  }
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const op = e.binOp
+    let swap = false
+    let neg = false
+    if op == ">" {
+      swap = true
+    } else if op == "<=" {
+      swap = true
+      neg = true
+    } else if op == ">=" {
+      neg = true
+    } else if op != "<" {
+      return emitFail("emitProgram: expected a string ordering operator")
+    }
+    // Push the core's first arg (lower on stack) then its second arg.
+    if swap {
+      if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+    } else {
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+      if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+    }
+    if emitStrLessCore(body) < 0 { return -1 }
+    if neg {
+      fbI32Eqz() // 0x45 i32.eqz — `<=`/`>=` negate the strict-less result
+    }
+    return 0
+  }
+  emitFail("emitProgram: expected a string ordering")
+}
+
+// The string strict-LESS core: expects the two string refs already ON THE STACK (first
+// below second), leaves 1 iff the first is lexicographically less than the second, else
+// 0. Compares code points (unsigned) up to the shorter length; on the first mismatch the
+// result is `a[i] < b[i]`; if one is a prefix of the other the shorter is less. Mirrors
+// `emitStrEqCore`'s frame/block/loop/br structure. Frame: refs A(0)/B(1); i32 temps
+// lenA(0)/lenB(1)/n(2)/i(3).
+function emitStrLessCore(body: i32[]) {
+  fbLocalSet(strScratchBase + 1) // B (stack top)
+  fbLocalSet(strScratchBase + 0) // A
+  fbBlock(127)                   // 0x02 block, 0x7f i32 blocktype → the 0/1 result
+  // lenA = len(A) ; lenB = len(B)
+  pushStrScrRef(body, 0)
+  fbArrayLen()
+  setStrScrI(body, 0) // lenA
+  pushStrScrRef(body, 1)
+  fbArrayLen()
+  setStrScrI(body, 1) // lenB
+  // n = min(lenA, lenB):  n = lenA ; if lenB < lenA { n = lenB }
+  pushStrScrI(body, 0)
+  setStrScrI(body, 2)
+  pushStrScrI(body, 1)
+  pushStrScrI(body, 0)
+  fbI32Bin(73)        // 0x49 i32.lt_u (lenB < lenA)
+  fbIf(64)            // 0x04 if, void
+  pushStrScrI(body, 1)
+  setStrScrI(body, 2) // n = lenB
+  fbEnd()
+  // i = 0
+  fbI32Const(0)
+  setStrScrI(body, 3)
+  // loop { if i >= n {} else { compare; i++; br } }
+  fbLoop(64)           // 0x03 loop, void
+  pushStrScrI(body, 3) // i
+  pushStrScrI(body, 2) // n
+  fbI32Bin(78)         // 0x4e i32.ge_s (i >= n → common prefix done)
+  fbIf(64)             // then: fall through (empty)
+  fbElse()
+  // if A[i] != B[i] { push (A[i] <_u B[i]) ; br out of block }
+  pushStrScrRef(body, 0)
+  pushStrScrI(body, 3)
+  fbArrayGet(aTypeIdx) // A[i]
+  pushStrScrRef(body, 1)
+  pushStrScrI(body, 3)
+  fbArrayGet(aTypeIdx) // B[i]
+  fbI32Bin(71)         // 0x47 i32.ne
+  fbIf(64)
+  pushStrScrRef(body, 0)
+  pushStrScrI(body, 3)
+  fbArrayGet(aTypeIdx) // A[i]
+  pushStrScrRef(body, 1)
+  pushStrScrI(body, 3)
+  fbArrayGet(aTypeIdx) // B[i]
+  fbI32Bin(73)         // 0x49 i32.lt_u (A[i] < B[i] → the answer at the first diff)
+  fbBr(3)              // 0x0c br depth 3 → out of: if(0)·else(1)·loop(2)·block(3)
+  fbEnd()              // end (mismatch if)
+  // i = i + 1
+  pushStrScrI(body, 3)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  setStrScrI(body, 3)
+  fbBr(1)       // 0x0c br depth 1 → loop header (else=0, loop=1)
+  fbEnd()       // end (ge_s if/else)
+  fbEnd()       // end (loop)
+  // Common prefix equal → the shorter string is less:  lenA < lenB.
+  pushStrScrI(body, 0)
+  pushStrScrI(body, 1)
+  fbI32Bin(73) // 0x49 i32.lt_u (lenA < lenB)
+  fbEnd()      // end (block) — leaves the 0/1 result
+  0
+}
+
 // The string value-equality CORE: expects the two string refs already ON THE
 // STACK (left below right), leaves the 0/1 result. Shared by `emitStrEq` and the
 // struct-equality field compare (which pushes field chains as operands).
@@ -9004,6 +9143,7 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
       return emitStrConcat(body, exprIx, fnIx)
     }
     if exprIsStrEq(exprIx, fnIx) { return emitStrEq(body, exprIx, fnIx) }
+    if exprIsStrOrder(exprIx, fnIx) { return emitStrOrder(body, exprIx, fnIx) }
     // List `==`/`!=` (length + element value-compare, recursive through nested
     // lists / string elements) and list `+` (concat) — collections-design
     // §VL.4/§VL.6, the host's `listEqFn`/concat lowerings, inlined.
