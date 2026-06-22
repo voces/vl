@@ -5502,6 +5502,22 @@ function mfScan(ix: i32, fnIx: i32) {
           }
         }
       }
+      // `xs.slice(start, end?)` builds a NEW list of the SAME element type — it reserves
+      // the same src wrapper + dst backing scratch locals as a `.filter` (result kind/slot
+      // == receiver). `emitArrSlice` reads the source backing/len through `srcL` and writes
+      // the copied range into a fresh `dstL` backing.
+      if callee.memProp == "slice" {
+        if n.callArgs.length == 1 || n.callArgs.length == 2 {
+          let rk = mfRecvKindOf(callee.memObj, fnIx)
+          if rk >= 0 {
+            fnUsesMapFilter = true
+            let slot = -1
+            if rk == 2 { slot = refListSlotOfExpr(callee.memObj, fnIx) }
+            mfRecordSrc(rk, slot)
+            mfRecordDst(rk, slot)
+          }
+        }
+      }
     }
     mfScan(n.callFn, fnIx)
     const args = n.callArgs
@@ -8376,6 +8392,10 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     // `(array i32)` over the clamped half-open range. Other member-calls in value
     // position are out of scope (the only member-call STATEMENT is `.push`).
     if exprIsStrSlice(exprIx, fnIx) { return emitStrSlice(body, exprIx, fnIx) }
+    // An array `xs.slice(start, end?)` over a LIST receiver — a same-element-kind
+    // sublist (`emitArrSlice`). Checked before the string slice's siblings so it does
+    // not fall into a struct member-call path.
+    if callIsArrSlice(exprIx, fnIx) { return emitArrSlice(body, exprIx, fnIx) }
     // `s.indexOf(sub)` / `s.includes(sub)` / `s.charCodeAt(i)` over a string
     // receiver are intrinsics too (A7), each yielding an i32.
     if exprIsStrIndexOf(exprIx, fnIx) {
@@ -12102,6 +12122,160 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
     }
   }
   emitFail("emitProgram: expected a .map/.filter call")
+}
+
+// `emitClampIdx`'s dual over plain wasm i32 LOCALS (not the string-op frame): emit
+// `clamp(idx, len)` reading `idx` from local `idxL`, `len` from `lenL`, leaving the
+// clamped value on the stack. Same JS slice semantics (`idx < 0 ? max(len+idx, 0) :
+// min(idx, len)`) built from `select`.
+function emitClampLocal(body: i32[], idxL: i32, lenL: i32) {
+  // negCase = max(len+idx, 0) = select( len+idx, 0, (len+idx) > 0 )
+  fbLocalGet(lenL)
+  fbLocalGet(idxL)
+  fbI32Bin(106) // i32.add → (len+idx)  [a]
+  fbI32Const(0) // [b]
+  fbLocalGet(lenL)
+  fbLocalGet(idxL)
+  fbI32Bin(106)
+  fbI32Const(0)
+  fbI32Bin(74)  // 0x4a i32.gt_s → (len+idx) > 0  [cond]
+  wU8(27)       // 0x1b select → negCase
+  // nonNegCase = min(idx, len) = select( idx, len, idx < len )
+  fbLocalGet(idxL)
+  fbLocalGet(lenL)
+  fbLocalGet(idxL)
+  fbLocalGet(lenL)
+  fbI32Bin(72) // 0x48 i32.lt_s → idx < len  [cond]
+  wU8(27)      // select → nonNegCase
+  // result = select( negCase, nonNegCase, idx < 0 )
+  fbLocalGet(idxL)
+  fbI32Const(0)
+  fbI32Bin(72) // 0x48 i32.lt_s → idx < 0
+  wU8(27)      // select → clamped
+  0
+}
+
+// Lower an array `xs.slice(start, end?)` onto `body`, leaving a NEW list wrapper of the
+// SAME element kind over the half-open clamped range `[start, end)` (JS semantics: a
+// missing `end` defaults to the length, negatives count from the end, the out length is
+// `max(end - start, 0)`). Rides the `.map`/`.filter` scratch frame — `srcL` (the source
+// wrapper, reserved by `mfScan`'s slice branch), `dstL` (the fresh backing), and the four
+// i32 temps `mfScratchBase + 0..3` as start/end/len/outLen — then one `array.copy`. The
+// receiver is evaluated ONCE into `srcL`; works for i32/boolean (kind 0), f64 (1), ref
+// (2), and string (3) lists.
+function emitArrSlice(body: i32[], callIx: i32, fnIx: i32) {
+  let c = P.nodes[callIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      const recvK = mfRecvKindOf(callee.memObj, fnIx)
+      if recvK < 0 {
+        return emitFail("emitProgram: .slice receiver is not a supported list")
+      }
+      let srcSlot = -1
+      if recvK == 2 { srcSlot = refListSlotOfExpr(callee.memObj, fnIx) }
+      // The element kind's wrapper + backing heap types.
+      let wrap = lTypeIdx
+      let back = aTypeIdx
+      if recvK == 1 {
+        if !fa64Used {
+          return emitFail(
+            "emitProgram: .slice over f64[] but f64 list type not collected",
+          )
+        }
+        wrap = fl64TypeIdx
+        back = fa64TypeIdx
+      } else if recvK == 2 {
+        if !rlUsed {
+          return emitFail(
+            "emitProgram: .slice over a ref list but ref list type not collected",
+          )
+        }
+        wrap = rlWrapIdx[srcSlot]
+        back = rlBackIdx[srcSlot]
+      } else if recvK == 3 {
+        if !slUsed {
+          return emitFail(
+            "emitProgram: .slice over string[] but string list type not collected",
+          )
+        }
+        wrap = mkListIdx
+        back = mkArrIdx
+      } else if !lUsed || !aUsed {
+        return emitFail("emitProgram: .slice but list type not collected")
+      }
+      const srcL = mfSrcLocalFor(recvK, srcSlot)
+      const dstL = mfDstLocalFor(recvK, srcSlot)
+      if !fnUsesMapFilter || srcL < 0 || dstL < 0 {
+        return emitFail("emitProgram: .slice scratch frame not reserved")
+      }
+      // The `.map`/`.filter` frame's first 3 slots are i32 (i, n, j); slot +3 is a
+      // closure ref. So slice has THREE i32 temps: `startL`, `endL`, and `auxL` which
+      // holds the length during clamping then is reused for the out length.
+      const startL = mfScratchBase + 0
+      const endL = mfScratchBase + 1
+      const auxL = mfScratchBase + 2
+      // src = <receiver>, evaluated ONCE (a NARROWED nullable i32 list recovers non-null).
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      if recvK == 0 {
+        if exprNullableList(callee.memObj, fnIx) {
+          wU8(212) // 0xd4 ref.as_non_null
+        }
+      }
+      fbLocalSet(srcL)
+      // auxL = src.len (the wrapper's logical length, field 1)
+      fbLocalGet(srcL)
+      fbStructGet(wrap, 1)
+      fbLocalSet(auxL)
+      // start = clamp(rawStart, len)
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+      fbLocalSet(startL)
+      emitClampLocal(body, startL, auxL)
+      fbLocalSet(startL)
+      // end = clamp(rawEnd, len), or len when omitted (the 1-arg form slices to the end)
+      if c.callArgs.length == 2 {
+        if emitExpr(body, c.callArgs[1], fnIx) < 0 { return -1 }
+        fbLocalSet(endL)
+        emitClampLocal(body, endL, auxL)
+        fbLocalSet(endL)
+      } else {
+        fbLocalGet(auxL)
+        fbLocalSet(endL)
+      }
+      // auxL (len now dead) = outLen = max(end - start, 0) = select(end-start, 0, end>start)
+      fbLocalGet(endL)
+      fbLocalGet(startL)
+      fbI32Bin(107) // i32.sub → end - start  [a]
+      fbI32Const(0) // [b]
+      fbLocalGet(endL)
+      fbLocalGet(startL)
+      fbI32Bin(74)  // 0x4a i32.gt_s → end > start  [cond]
+      wU8(27)       // 0x1b select
+      fbLocalSet(auxL)
+      // dst backing = array.new_default <back> outLen
+      fbLocalGet(auxL)
+      fbArrayNewDefault(back)
+      fbLocalSet(dstL)
+      // result wrapper = struct.new <wrap> (dstBacking, outLen, outLen) — pushed FIRST so
+      // it remains on the stack after the trailing `array.copy` consumes its own operands.
+      fbLocalGet(dstL)
+      fbLocalGet(auxL)
+      fbLocalGet(auxL)
+      fbStructNew(wrap)
+      // array.copy dst 0 src.backing start outLen
+      fbLocalGet(dstL)        // dest backing
+      fbI32Const(0)           // dest offset
+      fbLocalGet(srcL)
+      fbStructGet(wrap, 0)    // src backing
+      fbLocalGet(startL)      // src offset
+      fbLocalGet(auxL)        // count
+      fbArrayCopy(back, back) // array.copy (dest type, src type)
+      // The result wrapper from `struct.new` above is the value left on the stack.
+      return 0
+    }
+    return emitFail("emitProgram: .slice receiver is not a member access")
+  }
+  emitFail("emitProgram: expected an array slice call")
 }
 
 // Push `elem(i)` — `src.backing[i]` — onto the stack (`ref.as_non_null` for a ref
@@ -19524,6 +19698,9 @@ function exprArray(exprIx: i32, fnIx: i32) {
     if callIsMapFilter(exprIx, fnIx) {
       return mfResultKindOf(exprIx, fnIx) == 0
     }
+    // `xs.slice(...)` yields the same list kind as its receiver — an i32 list iff the
+    // receiver is one.
+    if callIsArrSlice(exprIx, fnIx) { return mfResultKindOf(exprIx, fnIx) == 0 }
     return false
   }
   if e is Ident {
@@ -19958,6 +20135,8 @@ function exprStringArray(exprIx: i32, fnIx: i32) {
     if arrNewIntrKind(exprIx, fnIx) == 2 { return true }
     // An INDEXED closure call `fs[i](x)` whose element signature returns `string[]`.
     if cloArrCallRetKind(exprIx, fnIx) == 7 { return true }
+    // `xs.slice(...)` over a string list yields a string list.
+    if callIsArrSlice(exprIx, fnIx) { return mfResultKindOf(exprIx, fnIx) == 3 }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       if fnRetStringArray(callee.identName) { return true }
@@ -20129,6 +20308,8 @@ function exprF64Array(exprIx: i32, fnIx: i32) {
     if callIsMapFilter(exprIx, fnIx) {
       return mfResultKindOf(exprIx, fnIx) == 1
     }
+    // `xs.slice(...)` over an f64 list yields an f64 list.
+    if callIsArrSlice(exprIx, fnIx) { return mfResultKindOf(exprIx, fnIx) == 1 }
     // An INDEXED closure call `fs[i](x)` whose element signature returns `f64[]`.
     if cloArrCallRetKind(exprIx, fnIx) == 12 { return true }
     const callee = P.nodes[e.callFn]
@@ -21250,6 +21431,25 @@ function callIsMapFilter(exprIx: i32, fnIx: i32) {
   false
 }
 
+// True if the expression at `exprIx` is an array `.slice(start, end?)` over a LIST
+// receiver — a sublist of the SAME element type. (A string `.slice` is a separate
+// `exprIsStrSlice` path; this is the array dual.)
+function callIsArrSlice(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[exprIx]
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Member {
+      if callee.memProp == "slice" {
+        if e.callArgs.length == 1 || e.callArgs.length == 2 {
+          return mfRecvKindOf(callee.memObj, fnIx) >= 0
+        }
+      }
+    }
+  }
+  false
+}
+
 // The RECEIVER list kind of a `.map`/`.filter` call: `0` (i32/boolean list), `1`
 // (f64 list), `2` (struct/union ref list), or -1 (not a supported list — a string
 // list or a non-list receiver).
@@ -21271,6 +21471,8 @@ function mfResultKindOf(callIx: i32, fnIx: i32) {
   if c is Call {
     const callee = P.nodes[c.callFn]
     if callee is Member {
+      // `.slice` preserves the element type — its result kind IS the receiver's.
+      if callee.memProp == "slice" { return mfRecvKindOf(callee.memObj, fnIx) }
       if callee.memProp == "filter" {
         let rk = mfRecvKindOf(callee.memObj, fnIx)
         if rk == 0 { return 0 }
@@ -21318,6 +21520,12 @@ function mfResultSlotOf(callIx: i32, fnIx: i32) {
   if c is Call {
     const callee = P.nodes[c.callFn]
     if callee is Member {
+      // `.slice` preserves the ref-list element — its result slot IS the receiver's.
+      if callee.memProp == "slice" {
+        if mfRecvKindOf(callee.memObj, fnIx) == 2 {
+          return refListSlotOfExpr(callee.memObj, fnIx)
+        }
+      }
       if callee.memProp == "filter" {
         if mfRecvKindOf(callee.memObj, fnIx) == 2 {
           return refListSlotOfExpr(callee.memObj, fnIx)
