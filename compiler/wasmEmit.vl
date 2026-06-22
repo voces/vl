@@ -1377,6 +1377,43 @@ function fnRetExprOf(fnIx: i32) {
 // True if `rx` is a reference to a LOCAL whose annotation is a mono `{[string]: i32}` map —
 // the ordering-safe way to classify a returned map local during the GLOBAL return pass (before
 // per-function local kinds are collected, so `exprMap`/`declaredMap` can't see it yet).
+// The map SHAPE of a RETURN expression, resolved from ANNOTATIONS ONLY (not collected local
+// state) — so it is valid at the type-section emit (before locals are collected) AND from a
+// DIFFERENT function (a caller resolving a map factory's value type). A returned map PARAM reads
+// its annotation (`paramMapShape`); a returned map LOCAL its `let` annotation (`mapAnnShape`); a
+// `Map()`/`Set()` is the mono map (-1); a call to another map fn recurses (`fnRetMapShape`).
+// -1 (mono) for anything else.
+function mapRetExprShape(rx: i32, fnIx: i32) {
+  let u = rx
+  let done = false
+  while !done {
+    const node = P.nodes[u]
+    if node is Paren { u = node.parInner } else { done = true }
+  }
+  const e = P.nodes[u]
+  if e is Ident {
+    if paramMap(fnIx, e.identName) { return paramMapShape(fnIx, e.identName) }
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const li = parentLetOf(fn.fnBody, e.identName)
+      if li >= 0 {
+        const d = P.nodes[li]
+        if d is LetDecl {
+          if d.letType >= 0 { return mapAnnShape(d.letType) }
+        }
+      }
+    }
+  }
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      if callee.identName == "Map" || callee.identName == "Set" { return -1 }
+      return fnRetMapShape(callee.identName)
+    }
+  }
+  -1
+}
+
 function retIsMapLocalAnnot(rx: i32, fnIx: i32) {
   let u = rx
   let done = false
@@ -1396,7 +1433,11 @@ function retIsMapLocalAnnot(rx: i32, fnIx: i32) {
             const lt = P.nodes[d.letType]
             if lt is TypeRef {
               if nameIsMap(lt.tyName) {
-                return mapValNameOf(lt.tyName) == "i32"
+                // A supported map value type (mono i32/boolean, or `string`) — the same set
+                // `retMapFlag` lets cross the boundary; the return's SHAPE is recovered at the
+                // functype-result site via `mapShapeOfExpr` over this same local.
+                const vn = mapValNameOf(lt.tyName)
+                return vn == "i32" || vn == "boolean" || vn == "string"
               }
             }
           }
@@ -9294,6 +9335,8 @@ function exprIsI64(exprIx: i32, fnIx: i32) {
   }
   // A call to an i64-returning function yields i64.
   if e is Call {
+    // An INDEXED closure call `fs[i](x)` whose element signature returns i64.
+    if cloArrCallRetKind(exprIx, fnIx) == 10 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOf(callee.identName)
@@ -9502,6 +9545,8 @@ function exprIsF64(exprIx: i32, fnIx: i32) {
     return false
   }
   if e is Call {
+    // An INDEXED closure call `fs[i](x)` whose element signature returns f64.
+    if cloArrCallRetKind(exprIx, fnIx) == 11 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOf(callee.identName)
@@ -10280,6 +10325,22 @@ function orderedDirectArgs(callIx: i32, target: i32) {
 // `call_ref $fnsig`. Mirrors the host's `indirectCall` (adapted to `call_ref`).
 // A NAMED argument needs the callee's parameter names, which a function VALUE
 // (its `TyFunc`) does not carry — fail loudly rather than mis-map positionally.
+// The closure `$fnsig` KEY for the elements of a closure-element ref list (kind 5): the
+// slot's element type-NAME is the parenthesized function type `((i32) => i32)`; strip the
+// grouping parens to `(i32) => i32` and read its signature key (`annSigKey`, which agrees
+// byte-for-byte with `fnSigKeyOf`/`cloSigKeyExt`). "" for a non-closure slot or an
+// un-keyable signature. Lets an INDEXED closure call (`fs[i](x)`) cast to the ELEMENT's
+// real functype instead of the all-i32 arity fallback — which a non-i32-signature array
+// (`((f64) => f64)[]`) doesn't even have interned.
+function cloArrSlotSigKey(slot: i32) {
+  if slot < 0 || slot >= rlElemName.length { return "" }
+  if rlElemKindTbl[slot] != 5 { return "" }
+  const nm = rlElemName[slot]
+  if nm.length < 2 { return "" }
+  if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
+  return annSigKey(nm.slice(1, nm.length - 1))
+}
+
 function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
   let c = P.nodes[callIx]
   if c is Call {
@@ -10333,6 +10394,18 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
         if mk != "" {
           const mp = cloSigPosOfKey(mk)
           if mp >= 0 { sig = cloSigBase + mp }
+        }
+      }
+    }
+    // An INDEXED closure value (`fs[i](x)` over a `((…) => …)[]`): the array's element type
+    // names the signature — resolve it so a non-all-i32 shape (`(f64) => f64`) casts to the
+    // right functype, and a program with NO i32 closure (hence no arity fallback) still lowers.
+    if cre is Index {
+      if exprRefArray(cre.idxArr, fnIx) {
+        const sk = cloArrSlotSigKey(refListSlotOfExpr(cre.idxArr, fnIx))
+        if sk != "" {
+          const sp = cloSigPosOfKey(sk)
+          if sp >= 0 { sig = cloSigBase + sp }
         }
       }
     }
@@ -13245,6 +13318,10 @@ function checkParams(fnIx: i32) {
           // (`collectA` already validated every array annotation is i32[].)
           if tyIsFuncType(p.parType) {
             // a function-typed (closure fat-pointer) param — kind 14
+          } else if nulCloFlag(p.parType) == 1 {
+            // a NULLABLE function-value param (`((i32) => i32) | null`, kind 19) — its `=>` is
+            // NESTED so `tyIsFuncType` (top-level-arrow only) no longer matches it; accept it
+            // here explicitly, as `vtKindOfType` already maps it to kind 19.
           } else if retNulRefFlag(p.parType) == 1 {
             // accepted — a `(ref null $S)` param
           } else if retNulListFlag(p.parType) == 1 {
@@ -13253,10 +13330,12 @@ function checkParams(fnIx: i32) {
             // accepted — a `boolean | null` NICHE param (the i32 sentinel 0/1/2)
           } else if retNulStringFlag(p.parType) == 1 {
             // accepted — a `string | null` param (`(ref null $aTypeIdx)`, kind 16)
-          } else if nameIsMap(ty.tyName) && mapValNameOf(ty.tyName) == "i32" {
-            // accepted — a MONO i32-valued map param (kind 6, `(ref $mapStruct)`, shape -1).
-            // The body's map ops resolve the param via `exprMap`/`paramMap`. A ref/string-
-            // valued map param needs its mv slot across the boundary (not yet) → rejected below.
+          } else if retMapFlag(p.parType) == 1 {
+            // accepted — a string-keyed map param (kind 6, `(ref $mapStruct)`). Mono i32/boolean
+            // rides shape -1; a `string`-valued map carries its mv slot (`mapAnnShape`) across the
+            // boundary. The body's map ops resolve the param via `exprMap`/`paramMap`/
+            // `mapShapeOfExpr` (which now reads the param annotation's shape). A struct/f64/i64-
+            // valued map is NOT yet supported (`retMapFlag` returns 0) → rejected below.
           } else if ty.tyName != "i32" {
             if ty.tyName != "i64" {
               // i64 rides the 0x7e valtype (Slice 1)
@@ -13798,15 +13877,80 @@ function retMapFlag(tyIx: i32) {
   if tyIx >= 0 {
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
-      // Only the MONO map (i32 value, shape -1) crosses a call boundary as kind 6 — its
-      // `fbValtype` arg is -1. A ref/string-valued map needs its per-shape mv slot passed,
-      // which the param valtype path does not yet carry, so it is left to a clean rejection.
+      // A string-keyed map crosses a call boundary as kind 6 (`(ref $mapStruct)`). Its
+      // `fbValtype` arg is the map SHAPE (`mapAnnShape`): -1 for the mono i32/boolean map,
+      // or the per-value-type mv slot for a `string`-valued map. (A struct/f64/i64-valued map
+      // has deeper local-level gaps — its value type is not yet carried across the boundary —
+      // so it stays a clean rejection: `mapAnnShape` would return -1 and mis-type it.)
       if nameIsMap(ty.tyName) {
-        if mapValNameOf(ty.tyName) == "i32" { return 1 }
+        const vn = mapValNameOf(ty.tyName)
+        if vn == "i32" || vn == "boolean" || vn == "string" { return 1 }
       }
     }
   }
   0
+}
+
+// The map SHAPE (`fbValtype`/`mapTypeIdxOf` second arg) of a string-keyed map type annotation:
+// -1 for the mono i32/boolean map (rides the shared `$mapStruct`), or the value type's interned
+// mv slot for a `string`-valued map. A non-map / un-interned value type yields -1 (the mono
+// shape) — safe, since `retMapFlag` only lets the supported value types reach kind 6. Shared by
+// the param valtype (`paramStructIdxOf`), the return valtype, and the body shape resolution
+// (`mapShapeOfExpr`) so all three agree on which `$mapStruct` a map param/return is.
+function mapAnnShape(tyIx: i32) {
+  if tyIx >= 0 {
+    const ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if nameIsMap(ty.tyName) {
+        const vn = mapValNameOf(ty.tyName)
+        if vn == "i32" || vn == "boolean" { return -1 }
+        let i = 0
+        while i < mvValName.length {
+          if mvValName[i] == vn { return i }
+          i = i + 1
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The map SHAPE of the map PARAM `name` of function `fnIx` (its annotation's value type),
+// or -1. Lets `mapShapeOfExpr` resolve a map param's VALUE type instead of assuming mono i32.
+function paramMapShape(fnIx: i32, name: string) {
+  if fnIx < 0 { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return mapAnnShape(p.parType) }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// The map SHAPE a function `name` RETURNS (its return annotation's value type), or -1 (the mono
+// map / an un-annotated return whose shape is not annotation-derived). Lets a caller resolve the
+// VALUE type of `mk()[k]` over a `string`-valued map factory.
+function fnRetMapShape(name: string) {
+  const fe = fnIndexOf(name)
+  if fe >= 0 {
+    const fn = P.nodes[fnStmts[fe]]
+    if fn is FuncDecl {
+      if fn.fnRet >= 0 { return mapAnnShape(fn.fnRet) }
+      // An UN-annotated map return (`function passthru(m) { return m }`): derive the shape from
+      // the returned expression (a map param/local/`Map()`), so a caller of a `string`-valued
+      // map factory resolves the value type.
+      const rx = fnRetExprOf(fnStmts[fe])
+      if rx >= 0 { return mapRetExprShape(rx, fnStmts[fe]) }
+    }
+  }
+  -1
 }
 
 // `1` if the type-annotation node at `tyIx` names a union VARIANT struct (e.g. `TyObj`
@@ -13851,6 +13995,10 @@ function paramStructIdxOf(paramIx: i32) {
   const p = P.nodes[paramIx]
   if p is Param {
     if retRefArrFlag(p.parType) == 1 { return tyAnnRefListSlot(p.parType) }
+    // A string-keyed MAP param's second `fbValtype` arg is the map SHAPE (mono ⇒ -1, or the
+    // value type's mv slot for a `string`-valued map), so the param valtype selects THIS map's
+    // `$mapStruct`.
+    if retMapFlag(p.parType) == 1 { return mapAnnShape(p.parType) }
     return retStructIndex(p.parType)
   }
   -1
@@ -14642,6 +14790,15 @@ function emitStartFnCode(out: i32[]) {
             // a `string|null` global lowers it as `ref.null $aTypeIdx` (kind 16).
             pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
             pendingNulString = letIsNulString(globalStmts[gi], -1)
+            // A CLOSURE-ARRAY global (kind 5) seeds the ref-list kind/slot so its `[add1, …]`
+            // init builds the closure backing+wrapper (its function-ident elements aren't an
+            // objlit, so `arrLitIsRef` misses them — the annotation is authoritative, exactly
+            // as the const-path and the local-`let` path seed it). Without this the start-fn
+            // init falls to the i32-list path and the closure refs mismatch the i32 backing.
+            if gck == 5 {
+              pendingListKind = letAnnRefListKind(globalStmts[gi])
+              pendingListSlot = letAnnRefListSlot(globalStmts[gi])
+            }
             // A nullable-CLOSURE global (kind 19) lowers a bare `null` init as
             // `ref.null $cloStruct`; a function init builds the (non-null) closure value.
             const savedSNC = pendingNulClosure
@@ -14667,6 +14824,8 @@ function emitStartFnCode(out: i32[]) {
             pendingNulClosure = savedSNC
             pendingMapSlot = -1
             pendingStructIdx = -1
+            pendingListKind = 0
+            pendingListSlot = 0
           }
           const setPrev = wTarget(bodyExpr)
           fbGlobalSet(gi)
@@ -15308,7 +15467,15 @@ function emitModule(stmts: i32[]) {
         // A mono map (`{[string]: i32}`) inferred return — kind 6, `(ref $mapStruct)` with the
         // mono shape (`infSlot` stays -1 → `mapTypeIdxOf(-1)`). Same result valtype the
         // annotated path picks via `vtKindOfType`.
-        if fRetMap[ti] == 1 { infKind = 6 }
+        if fRetMap[ti] == 1 {
+          infKind = 6
+          // The map SHAPE of the (un-annotated) returned map — mono ⇒ -1, or the mv slot for a
+          // `string`-valued map (`return m` over a `string`-valued map param/local). Without it
+          // the result valtype declares the mono `$mapStruct` while the body yields the
+          // string-map struct, a wasm mismatch.
+          const mrx = fnRetExprOf(fnStmts[ti])
+          if mrx >= 0 { infSlot = mapRetExprShape(mrx, fnStmts[ti]) }
+        }
         // A `string | null` niche inferred return — kind 16 (`ref null $array`), the same
         // result valtype the annotated path picks via `vtKindOfType`. (`boolean | null`
         // stays kind 0: its null is an i32 sentinel, not a ref.)
@@ -15330,6 +15497,9 @@ function emitModule(stmts: i32[]) {
         // result valtype selects THIS function's element wrapper, not slot 0's.
         let retSlot = retStructIndex(fn.fnRet)
         if retRefArrFlag(fn.fnRet) == 1 { retSlot = tyAnnRefListSlot(fn.fnRet) }
+        // A string-keyed MAP return's slot is the map SHAPE (mono ⇒ -1, or the value type's mv
+        // slot for a `string`-valued map), so the result valtype selects THIS map's `$mapStruct`.
+        if retMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
         fbValtype(vtKindOfType(fn.fnRet), retSlot)
       }
     }
@@ -18522,6 +18692,8 @@ function exprArray(exprIx: i32, fnIx: i32) {
   if e is ArrayLit { return !arrLitIsRef(exprIx) }
   if e is Paren { return exprArray(e.parInner, fnIx) }
   if e is Call {
+    // An INDEXED closure call `fs[i](x)` whose element signature returns `i32[]`.
+    if cloArrCallRetKind(exprIx, fnIx) == 2 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       // The intrinsic allocators yield an i32 list unless the fill is f64
@@ -18949,6 +19121,8 @@ function exprStringArray(exprIx: i32, fnIx: i32) {
   if e is Call {
     // `__array_new__(n, "s")` builds a string list (intrinsic kind 2).
     if arrNewIntrKind(exprIx, fnIx) == 2 { return true }
+    // An INDEXED closure call `fs[i](x)` whose element signature returns `string[]`.
+    if cloArrCallRetKind(exprIx, fnIx) == 7 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       if fnRetStringArray(callee.identName) { return true }
@@ -19120,6 +19294,8 @@ function exprF64Array(exprIx: i32, fnIx: i32) {
     if callIsMapFilter(exprIx, fnIx) {
       return mfResultKindOf(exprIx, fnIx) == 1
     }
+    // An INDEXED closure call `fs[i](x)` whose element signature returns `f64[]`.
+    if cloArrCallRetKind(exprIx, fnIx) == 12 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       // A NAMED function returning `f64[]` (annotated or inferred, `fRetF64Arr`).
@@ -19443,7 +19619,10 @@ function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       if callee.identName == "Set" { return -2 }
-      // A map-returning function yields the MONO map (shape -1); a `Map()` constructor too.
+      // A map-returning function yields its declared map SHAPE (mono ⇒ -1, or a `string`-valued
+      // map's mv slot); a `Map()` constructor is the mono map (-1).
+      const fe = fnIndexOf(callee.identName)
+      if fe >= 0 { return fnRetMapShape(callee.identName) }
       return -1
     }
     return -1
@@ -19454,7 +19633,10 @@ function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       if slot >= 0 { return localStructIdx[slot] }
       return -1
     }
-    if paramMap(fnIx, e.identName) { return -1 }
+    // A map PARAM's shape is its annotation's value type (mono ⇒ -1, or a `string`-valued
+    // map's mv slot) — so the body's map ops resolve the param's VALUE type, not the mono i32
+    // assumption a bare `-1` would force.
+    if paramMap(fnIx, e.identName) { return paramMapShape(fnIx, e.identName) }
     const gl = globalLetOf(e.identName)
     if gl >= 0 {
       if letIsMap(gl, -1) { return letMapShapeOf(gl, -1) }
@@ -19589,6 +19771,8 @@ function exprString(exprIx: i32, fnIx: i32) {
     // G6: `s.slice(...)` over a string receiver produces a string. Otherwise a
     // bare call produces a string iff the callee declares a `string` return.
     if exprIsStrSlice(exprIx, fnIx) { return true }
+    // An INDEXED closure call `fs[i](x)` whose element signature returns `string`.
+    if cloArrCallRetKind(exprIx, fnIx) == 3 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       if fnRetString(callee.identName) { return true }
@@ -20015,8 +20199,11 @@ function calleeReturnsStructIdx(name: string, fnIx: i32) {
 // `11` f64, `10` i64, `3` string, `2`/`7`/`12` the i32/string/f64 lists, `4` a union box,
 // `16` `string | null`, `1` a struct, `9` a nullable struct, `-1` void. `-3` when `name`
 // resolves to no value-call sig. Drives the per-kind closure-call RESULT classifiers.
-function calleeRetKind(name: string, fnIx: i32) {
-  const k = calleeCloSigKey(name, fnIx)
+// The RESULT value-KIND encoded in a closure `$fnsig` key (the atom after the final `>`),
+// or -3 when the key is empty / malformed. The kind codes match `cloRetValKind` /
+// `calleeRetKind`. Shared by the Ident-callee path (`calleeRetKind`) and the indexed-element
+// path (`cloArrCallRetKind`).
+function sigKeyRetKind(k: string) {
   const n = k.length
   if n < 2 { return -3 }
   let i = 0
@@ -20039,6 +20226,29 @@ function calleeRetKind(name: string, fnIx: i32) {
   if c == 'v' { return -1 }
   if c == 's' { return 1 }
   if c == 'n' { return 9 }
+  -3
+}
+
+function calleeRetKind(name: string, fnIx: i32) {
+  return sigKeyRetKind(calleeCloSigKey(name, fnIx))
+}
+
+// The RESULT value-KIND of a call whose CALLEE is an INDEX into a closure array
+// (`fs[i](x)`): the closure-element signature's return atom (`cloArrSlotSigKey` →
+// `sigKeyRetKind`). -3 when the call's callee is not an indexed closure value. The expr
+// classifiers (`exprString`/`exprIsF64`/… Call arms) consult this so an indexed closure
+// call's result routes to the right print / arithmetic / store path — the dual of the
+// call-SIGNATURE resolution `emitCallRef` does for the same shape.
+function cloArrCallRetKind(callIx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Index {
+      if exprRefArray(callee.idxArr, fnIx) {
+        return sigKeyRetKind(cloArrSlotSigKey(refListSlotOfExpr(callee.idxArr, fnIx)))
+      }
+    }
+  }
   -3
 }
 
@@ -20374,6 +20584,13 @@ function collectFnValUse() {
     // closure-pinned param.
     if nd is TypeRef {
       if tyIsFuncType(i) { fnValUsed = true }
+      // A closure-ARRAY annotation (`((i32) => i32)[]`) ALSO uses function values — its
+      // elements are closures stored/indexed/called through the array — so it flips the
+      // machinery on too. (`tyIsFuncType` is now top-level-arrow only, so the nested arrow
+      // here no longer trips it; without this, an array of functions whose ONLY function-type
+      // mention is the array annotation would leave its element signatures un-interned and a
+      // `fs[i](x)` call would find no signature.)
+      if nameIsClosureArrayTy(i) == 1 { fnValUsed = true }
     }
     i = i + 1
   }
