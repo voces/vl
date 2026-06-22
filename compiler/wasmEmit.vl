@@ -10496,6 +10496,14 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       const aUNm = unionNameOfIdent(target.identName, fnIx)
       if aUNm != "" {
         if emitUnionCoerce(body, aUNm, a.binRight, fnIx) < 0 { return -1 }
+      } else if exprIsI64(a.binLeft, fnIx) {
+        // An i64 target (`x = 0` over `let x: i64`) widens an i32 RHS to i64 — without this the
+        // bare `i32.const` clashes with the i64 slot (the checker accepts the assignment, so it
+        // is a soundness hole). `emitExprAsI64` is a no-op for an already-i64 RHS.
+        if emitExprAsI64(body, a.binRight, fnIx) < 0 { return -1 }
+      } else if exprIsF64(a.binLeft, fnIx) {
+        // An f64 target (`y = 3` over `let y: f64`) widens an i32 RHS to f64, same rationale.
+        if emitExprAsF64(body, a.binRight, fnIx) < 0 { return -1 }
       } else {
         // A `boolean | null` NICHE local (`x = null` / `x = b`): the i32 cell holds
         // 0/1 or the sentinel 2 — seed `pendingNulBool` so a `null` RHS emits the
@@ -12164,6 +12172,17 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if retF32Flag(fn.fnRet) == 1 { retF32 = true }
     if retF64Flag(fn.fnRet) == 1 { retF64 = true }
     if retI64Flag(fn.fnRet) == 1 { retI64 = true }
+    // An UN-annotated return INFERRED as i64/f64 (the `fRet*` tables the A20 pass fills) widens
+    // its value too — without this a `return 0` (an i32 literal) in a function whose other
+    // branch returns a big i64 / an f64 expression stays `i32.const`, clashing with the i64/f64
+    // functype result the inferred-return path declares (a soundness hole the checker accepts).
+    if fn.fnRet < 0 {
+      const rfe = fnStmtsPosOf(fnIx)
+      if rfe >= 0 {
+        if fRetI64[rfe] == 1 { retI64 = true }
+        if fRetF64[rfe] == 1 { retF64 = true }
+      }
+    }
     if retUnionFlag(fn.fnRet) == 1 { retUNm = tyNameOf(fn.fnRet) }
     if fn.fnRet < 0 {
       const im = inferRetNameOf(fn.fnName)
@@ -13565,7 +13584,10 @@ function structIndexOfTypeName(name: string) {
         }
       } else if depth == 0 && c == ',' {
         collecting = true
-      } else if depth == 0 && collecting {
+      } else if depth == 0 && collecting && c != ' ' {
+        // Skip the space after `, ` (`tyToStr` renders `{x: i32, y: i32}` with a separator
+        // space) — a field name is a bare identifier, so an embedded space is never part of it.
+        // Without this the 2nd+ field name collects as `" y"` and the field-set match fails.
         cur = cur + fromCodePoint(c)
       }
       i = i + 1
@@ -15956,16 +15978,6 @@ function nameIsRefArray(name: string) {
   // (element kind 4) — the existing ref-pair machinery serves it; only the
   // element heap type differs (`lTypeIdx`).
   if name == "i32[][]" { return true }
-  let i = 0
-  while i < sNames.length {
-    if name == sNames[i] + "[]" { return true }
-    i = i + 1
-  }
-  let u = 0
-  while u < unNames.length {
-    if name == unNames[u] + "[]" { return true }
-    u = u + 1
-  }
   // A `(string|i32)[]` annotation — a VALUE-union element list. The element
   // slots hold the same `{tag, value}` boxes a bare union binding does (the
   // host stores the coerced union value), so it is a kind-2 ref list.
@@ -15973,6 +15985,21 @@ function nameIsRefArray(name: string) {
   if nameIsMapArray(name) { return true }
   // An ARRAY OF FUNCTIONS (`((i32) => i32)[]`) — a closure-element ref list (kind 5).
   if nameIsClosureArray(name) { return true }
+  // Otherwise a `<Struct>[]` / `<Union>[]`: strip the trailing `[]` ONCE and match the bare
+  // element NAME against the struct/union tables. (The old form compared `name` to
+  // `sNames[i] + "[]"` — a fresh string allocation PER struct PER call; on a struct-heavy
+  // program this `O(structs)` garbage dominated emit time + GC. The strip-once form does the
+  // same match with no per-iteration allocation.)
+  const n = name.length
+  if n >= 3 && name[n - 2] == '[' && name[n - 1] == ']' {
+    const base = name.slice(0, n - 2)
+    if structIndexByName(base) >= 0 { return true }
+    let u = 0
+    while u < unNames.length {
+      if base == unNames[u] { return true }
+      u = u + 1
+    }
+  }
   false
 }
 
@@ -15986,10 +16013,16 @@ function refArrElemKind(name: string) {
   if parenUnionArrElemName(name) != "" { return 2 }
   // An `((i32) => i32)[]` array of functions is a closure-element list (kind 5).
   if nameIsClosureArray(name) { return 5 }
-  let u = 0
-  while u < unNames.length {
-    if name == unNames[u] + "[]" { return 2 }
-    u = u + 1
+  // A `<Union>[]` element list is kind 2 — strip the `[]` once and match the bare union name
+  // (no per-iteration `+ "[]"` concat). Anything else (a struct array) is kind 1.
+  const n = name.length
+  if n >= 3 && name[n - 2] == '[' && name[n - 1] == ']' {
+    const base = name.slice(0, n - 2)
+    let u = 0
+    while u < unNames.length {
+      if base == unNames[u] { return 2 }
+      u = u + 1
+    }
   }
   1
 }
@@ -16494,15 +16527,18 @@ function refArrElemName(name: string) {
   // `((i32) => i32)[]` → `((i32) => i32)` (the parenthesized function-type element, the
   // table key for the closure-element slot — all such slots share `cloStructIdx`).
   if nameIsClosureArray(name) { return name.slice(0, name.length - 2) }
-  let u = 0
-  while u < unNames.length {
-    if name == unNames[u] + "[]" { return unNames[u] }
-    u = u + 1
-  }
-  let i = 0
-  while i < sNames.length {
-    if name == sNames[i] + "[]" { return sNames[i] }
-    i = i + 1
+  // A `<Union>[]` / `<Struct>[]`: strip the trailing `[]` ONCE and confirm the bare name is a
+  // registered union/struct (the stripped base IS the table key — no per-iteration `+ "[]"`
+  // concat, which allocated a string per struct/union per call).
+  const n = name.length
+  if n >= 3 && name[n - 2] == '[' && name[n - 1] == ']' {
+    const base = name.slice(0, n - 2)
+    let u = 0
+    while u < unNames.length {
+      if base == unNames[u] { return base }
+      u = u + 1
+    }
+    if structIndexByName(base) >= 0 { return base }
   }
   ""
 }
@@ -17846,6 +17882,12 @@ function exprStruct(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is ObjLit { return true }
   if e is Paren { return exprStruct(e.parInner, fnIx) }
+  // A `m[k] ?? default` over a STRUCT-valued map (`{[string]: S}`) yields the value struct — so a
+  // bound `const p = m[k] ?? d` classifies as a struct local and `(m[k] ?? d).x` resolves.
+  if e is BinExpr {
+    const cms = coalesceMvSlot(exprIx, fnIx)
+    if cms >= 0 { return mvValKind[cms] == 1 }
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
@@ -18149,6 +18191,14 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is ObjLit { return structIndexOfObjCtx(exprIx, fnIx) }
   if e is Paren { return structIndexOfExpr(e.parInner, fnIx) }
+  // A `m[k] ?? default` over a STRUCT-valued map resolves to the value type's struct index (the
+  // mv slot's `mvValStructIdx`), so the field-read layout is found.
+  if e is BinExpr {
+    const cms = coalesceMvSlot(exprIx, fnIx)
+    if cms >= 0 {
+      if mvValKind[cms] == 1 { return mvValStructIdx[cms] }
+    }
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
@@ -22015,7 +22065,16 @@ function synthParamAnnots() {
         if p is Param {
           if p.parType < 0 {
             const tn = nodeTyName(ps[pi])
-            if tn != "" { p.parType = mkTypeRef(tn, -1) }
+            if tn != "" {
+              // A STRUCT shape (`{x: i32}`) resolves to the declared struct's NOMINAL name
+              // (`structIndexOfTypeName` matches by field-set) — `checkParams` / the struct-param
+              // machinery key on the name, not the inline shape. A scalar/string name (no struct
+              // match) passes through unchanged.
+              let resolved = tn
+              const si = structIndexOfTypeName(tn)
+              if si >= 0 { resolved = sNames[si] }
+              p.parType = mkTypeRef(resolved, -1)
+            }
           }
         }
         pi = pi + 1
