@@ -2106,6 +2106,11 @@ function mvShapeOfValName(valName: string) {
     // stored in a ref list whose element kind is 3 (a map element → the inner map struct).
     // Reuses the SAME ref-value spine as a struct-valued map; only the element heap differs.
     kind = 6
+  } else if nameIsI32Array(valName) {
+    // A LIST-valued map (`{[string]: i32[]}` / `boolean[]`): the value is an i32-list
+    // WRAPPER ref, stored in a ref list whose element kind is 4 (the i32-list wrapper, as
+    // in `i32[][]`). Same ref-value spine as a nested map; the element heap is `lTypeIdx`.
+    kind = 6
   } else {
     vsi = structIndexByValName(valName)
     if vsi >= 0 { kind = 1 }
@@ -2116,15 +2121,18 @@ function mvShapeOfValName(valName: string) {
     if mvValName[i] == valName { return i }
     i = i + 1
   }
-  // A map VALUE forces the map machinery + interns the INNER value's shape first (so a
-  // ref-valued inner map's struct exists) — for the common mono inner (`{[string]: i32}`)
-  // this is a no-op (`mvShapeOfValName("i32")` returns -1). Done BEFORE pushing this slot's
-  // parallel arrays so the recursive intern lands at an earlier slot index.
+  // A kind-6 (ref-VALUE: nested map / list) value forces the i32-list + map types, and a
+  // MAP value also interns its INNER value shape first (so a ref-valued inner map's struct
+  // exists) — for the common mono inner (`{[string]: i32}`) that is a no-op
+  // (`mvShapeOfValName("i32")` returns -1). Done BEFORE pushing this slot's parallel arrays
+  // so the recursive intern lands at an earlier slot index.
   if kind == 6 {
-    mUsed = true
     lUsed = true
     aUsed = true
-    mvShapeOfValName(mapValNameOf(valName))
+    if nameIsMap(valName) {
+      mUsed = true
+      mvShapeOfValName(mapValNameOf(valName))
+    }
   }
   mvValName.push(valName)
   mvValKind.push(kind)
@@ -2134,8 +2142,9 @@ function mvShapeOfValName(valName: string) {
     rlUsed = true
     raUsed = true
   } else if kind == 6 {
-    // The vals are a ref list of inner-map structs (element kind 3 → the map struct heap).
-    mvRlSlot.push(rlInternName(valName, 3))
+    // The vals are a ref list whose element is the inner map struct (kind 3) or i32-list
+    // wrapper (kind 4) — `refArrElemKind("<value>[]")` picks it (`{[…]}[]` → 3, `i32[][]` → 4).
+    mvRlSlot.push(rlInternName(valName, refArrElemKind(valName + "[]")))
     rlUsed = true
     raUsed = true
   } else {
@@ -2184,6 +2193,20 @@ function mvScalarValKind(slot: i32) {
   if mvValKind[slot] == 11 { return 11 }
   if mvValKind[slot] == 10 { return 10 }
   -1
+}
+
+// A kind-6 (ref-VALUE) map slot's values are either inner MAP structs (ref-list element
+// kind 3) or i32-LIST wrappers (element kind 4). These split the two so a read classifies
+// as the right thing — `m[k]` over a nested map is a Map, over a list-valued map an i32 list.
+function mvValIsMap(slot: i32) {
+  if slot < 0 { return false }
+  if mvValKind[slot] != 6 { return false }
+  rlElemKindTbl[mvRlSlot[slot]] == 3
+}
+function mvValIsList(slot: i32) {
+  if slot < 0 { return false }
+  if mvValKind[slot] != 6 { return false }
+  rlElemKindTbl[mvRlSlot[slot]] == 4
 }
 
 // ── scalar-list descriptor (the i32 / f64 / i64 list unification) ──────────────
@@ -20045,6 +20068,10 @@ function exprArray(exprIx: i32, fnIx: i32) {
         return exprArray(e.binRight, fnIx)
       }
     }
+    // `m[k] ?? d` over a LIST-valued map (`{[string]: i32[]}`) yields the value i32 list.
+    if e.binOp == "??" {
+      if mvValIsList(coalesceMvSlot(exprIx, fnIx)) { return true }
+    }
     return false
   }
   // A field read `p.items` whose struct field is an `i32[]` (code `4`) yields the i32
@@ -20063,6 +20090,9 @@ function exprArray(exprIx: i32, fnIx: i32) {
         if rlElemKindTbl[slot] == 4 { return true }
       }
     }
+    // A bare `m[k]` over a LIST-valued map yields the value i32 list (`V | null` — the
+    // list machinery recovers non-null at the read site).
+    if mvValIsList(mapReadMvSlot(exprIx, fnIx)) { return true }
   }
   false
 }
@@ -20737,7 +20767,7 @@ function exprMap(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cmm = coalesceMvSlot(exprIx, fnIx)
     if cmm >= 0 {
-      if mvValKind[cmm] == 6 { return true }
+      if mvValIsMap(cmm) { return true }
     }
   }
   // `scopes[i]` over a MAP ref list (`{[string]:i32}[]`, element kind 3) yields a Map ref
@@ -20751,7 +20781,7 @@ function exprMap(exprIx: i32, fnIx: i32) {
     }
     const mri = mapReadMvSlot(exprIx, fnIx)
     if mri >= 0 {
-      if mvValKind[mri] == 6 { return true }
+      if mvValIsMap(mri) { return true }
     }
   }
   false
