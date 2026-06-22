@@ -20471,6 +20471,178 @@ function monoCloneBody(
   ix
 }
 
+// Whether an inline `.map` callback PRESERVES the element type — its tail expression is
+// arithmetic / concatenation over the element (`x => x * 2`, `s => s + "!"`), so the result
+// element type equals the source element. Lets the monomorphizer set a concrete map-result
+// return annotation, since the inferred-return path has no f64/string-array map-result form.
+function monoLambdaPreservesElem(argIx: i32) {
+  const fnNodeIx = unwrapParen(argIx)
+  const a = P.nodes[fnNodeIx]
+  if a is FuncDecl {
+    const tail = fnRetExprOf(fnNodeIx)
+    if tail >= 0 {
+      const t = P.nodes[unwrapParen(tail)]
+      if t is BinExpr {
+        const op = t.binOp
+        return op == "+" || op == "-" || op == "*" || op == "/"
+      }
+    }
+  }
+  false
+}
+
+// The element type NAME of an array type name (`"f64[]"` → `"f64"`), or "" if not an array.
+function monoArrElemName(name: string) {
+  const n = name.length
+  if n >= 2 {
+    if name[n - 2] == '[' && name[n - 1] == ']' { return name.slice(0, n - 2) }
+  }
+  ""
+}
+
+// The element type of `recvIx` when it is (a paren around) a PARAMETER reference whose pinned
+// type is an array — looked up in the instance's (pNames → pElems) map. "" otherwise. Used to
+// pin a `.map`/`.filter` callback's element from the concrete receiver of THIS instance.
+function monoRecvParamElem(recvIx: i32, pNames: string[], pElems: string[]) {
+  const r = P.nodes[unwrapParen(recvIx)]
+  if r is Ident {
+    let i = 0
+    while i < pNames.length {
+      if pNames[i] == r.identName { return pElems[i] }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// Clone an INLINE `.map`/`.filter` callback lambda with its single un-annotated parameter
+// PINNED to `elemType`, lift the clone into `fnStmts`, and return its node index — or -1 when
+// the argument is not a cloneable un-annotated 1-param lambda (a named-function callback, an
+// already-annotated param, or a different arity all ride their existing paths). The body is
+// SHARED with the original: the emitter re-derives every operand type from the (now concrete)
+// parameter per function, so one body lowers correctly under each pinned param.
+function monoCloneLambdaPinned(argIx: i32, elemType: string) {
+  const a = P.nodes[unwrapParen(argIx)]
+  if a is FuncDecl {
+    if a.fnParams.length == 1 {
+      const p0 = P.nodes[a.fnParams[0]]
+      if p0 is Param {
+        if p0.parType < 0 {
+          const np = mkParam(p0.parName, mkTypeRef(elemType, -1), p0.pos)
+          const nm = "__lambda_" + i32ToStr(lambdaCtr)
+          lambdaCtr = lambdaCtr + 1
+          const noTP: string[] = []
+          const ps: i32[] = [np]
+          const clone = mkFunc(nm, noTP, ps, a.fnRet, a.fnBody, a.pos)
+          fnStmts.push(clone)
+          fnParent.push(-1)
+          fnDispNames.push("")
+          fnValUsed = true
+          return clone
+        }
+      }
+    }
+  }
+  -1
+}
+
+// Per-instance lambda monomorphization for `.map`/`.filter`. The shared definition body of an
+// un-annotated function is checked ONCE with the element as a hole, so an inline callback's
+// un-annotated param defaults to i32 at emit (`checkParams`) — correct only for the i32 shape.
+// When THIS instance pins the receiver param to a NON-i32 element (`self: f64[]`), clone the
+// callback with its param pinned to the element type (`monoCloneLambdaPinned`) and rebuild the
+// call to reference the clone, cloning the enclosing spine so sibling instances are untouched.
+// The i32 shape (element "i32") is left as-is, so the golden i32 path stays byte-identical.
+function monoPinMapLambdas(ix: i32, pNames: string[], pElems: string[]) {
+  if ix < 0 { return ix }
+  const n = P.nodes[ix]
+  if n is Block {
+    const ns: i32[] = []
+    let changed = false
+    let i = 0
+    while i < n.blkStmts.length {
+      const cs = monoPinMapLambdas(n.blkStmts[i], pNames, pElems)
+      ns.push(cs)
+      if cs != n.blkStmts[i] { changed = true }
+      i = i + 1
+    }
+    if !changed { return ix }
+    return mkBlock(ns, n.pos)
+  }
+  if n is RetStmt {
+    const ca = monoPinMapLambdas(n.retArg, pNames, pElems)
+    if ca == n.retArg { return ix }
+    return mkReturn(ca, n.pos)
+  }
+  if n is LetDecl {
+    const ci = monoPinMapLambdas(n.letInit, pNames, pElems)
+    if ci == n.letInit { return ix }
+    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+  }
+  if n is WhileStmt {
+    const cb = monoPinMapLambdas(n.whileBody, pNames, pElems)
+    if cb == n.whileBody { return ix }
+    return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
+  }
+  if n is IfStmt {
+    const ct = monoPinMapLambdas(n.ifThen, pNames, pElems)
+    const ce = monoPinMapLambdas(n.ifElse, pNames, pElems)
+    if ct == n.ifThen && ce == n.ifElse { return ix }
+    return mkIf(n.ifCond, ct, ce, n.pos)
+  }
+  if n is ForRange {
+    const cb = monoPinMapLambdas(n.frBody, pNames, pElems)
+    if cb == n.frBody { return ix }
+    return mkForRange(n.frVar, n.frFrom, n.frTo, n.frStep, cb, n.frLabel, n.pos)
+  }
+  if n is ForIn {
+    const cb = monoPinMapLambdas(n.fiBody, pNames, pElems)
+    if cb == n.fiBody { return ix }
+    return mkForIn(n.fiVar, n.fiIter, cb, n.fiLabel, n.pos)
+  }
+  if n is Paren {
+    const ci = monoPinMapLambdas(n.parInner, pNames, pElems)
+    if ci == n.parInner { return ix }
+    return mkParen(ci, n.pos)
+  }
+  if n is Call {
+    let newCallee = n.callFn
+    const callee = P.nodes[n.callFn]
+    // A `<paramRecv>.map/.filter(<lambda>)` over a concrete NON-i32 element: pin the callback.
+    if callee is Member {
+      const recvNew = monoPinMapLambdas(callee.memObj, pNames, pElems)
+      if recvNew != callee.memObj {
+        newCallee = mkMember(recvNew, callee.memProp, callee.pos)
+      }
+      if callee.memProp == "map" || callee.memProp == "filter" {
+        if n.callArgs.length == 1 {
+          const elem = monoRecvParamElem(callee.memObj, pNames, pElems)
+          if elem != "" && elem != "i32" {
+            const cloned = monoCloneLambdaPinned(n.callArgs[0], elem)
+            if cloned >= 0 {
+              const oneArg: i32[] = [cloned]
+              return mkCallN(newCallee, oneArg, n.callArgNames, n.pos)
+            }
+          }
+        }
+      }
+    }
+    // Otherwise recurse into the arguments (a map call may be nested in one).
+    const nargs: i32[] = []
+    let changed = newCallee != n.callFn
+    let ai = 0
+    while ai < n.callArgs.length {
+      const cca = monoPinMapLambdas(n.callArgs[ai], pNames, pElems)
+      nargs.push(cca)
+      if cca != n.callArgs[ai] { changed = true }
+      ai = ai + 1
+    }
+    if !changed { return ix }
+    return mkCallN(newCallee, nargs, n.callArgNames, n.pos)
+  }
+  ix
+}
+
 // Rebuild the name→index map and the voidness/return-kind inference after a new
 // instance lands in `fnStmts`, so later argument classification sees its
 // concrete signature. Also re-runs `collectA` (a pinned `string[]`/`f64`
@@ -20786,6 +20958,38 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
                 pq = pq + 1
               }
             }
+            // `return <param>.map/filter(<lambda>)` over a param this instance pinned to a
+            // NON-i32 array: type the un-annotated return as the concrete result list. The
+            // inferred-return path has no f64/string-array map/filter-result form, so set it
+            // here — `.filter` preserves the element; `.map` preserves it for an element-wise
+            // arithmetic/concat callback (`monoLambdaPreservesElem`). i32 keeps `nret = -1`
+            // (its inference already handles it) → byte-identical.
+            if rcal is Member {
+              if rcal.memProp == "map" || rcal.memProp == "filter" {
+                if rxe.callArgs.length == 1 {
+                  const mrecv = P.nodes[rcal.memObj]
+                  if mrecv is Ident {
+                    let pqm = 0
+                    while pqm < params.length {
+                      const ppm = P.nodes[params[pqm]]
+                      if ppm is Param {
+                        if ppm.parName == mrecv.identName {
+                          const srcElem = monoArrElemName(pinned[pqm])
+                          if srcElem != "" && srcElem != "i32" {
+                            if rcal.memProp == "filter" {
+                              nret = mkTypeRef(srcElem + "[]", -1)
+                            } else if monoLambdaPreservesElem(rxe.callArgs[0]) {
+                              nret = mkTypeRef(srcElem + "[]", -1)
+                            }
+                          }
+                        }
+                      }
+                      pqm = pqm + 1
+                    }
+                  }
+                }
+              }
+            }
           }
           if rxe is Index {
             // `return param[i]` where the param pinned to an f64 array yields an f64
@@ -20853,7 +21057,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
       // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
       // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
       // no such annotation.
-      const instBody = monoCloneBody(
+      const instBody0 = monoCloneBody(
         fn.fnBody,
         fn.fnTyParams,
         tvN,
@@ -20861,6 +21065,25 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
         monoOutName,
         monoOutType,
       )
+      // Pin any `.map`/`.filter` callback lambda whose receiver param this instance bound to a
+      // NON-i32 element (`self: f64[]` ⇒ the `(x) => …` callback's `x` is f64): the shared
+      // body's un-annotated lambda would otherwise emit as i32. Build the param→element map
+      // from the pinned param names, then clone+pin per instance (i32 shapes are left as-is →
+      // byte-identical).
+      const pElemNames: string[] = []
+      const pElemTypes: string[] = []
+      let pe = 0
+      while pe < params.length {
+        const pep = P.nodes[params[pe]]
+        if pep is Param {
+          pElemNames.push(pep.parName)
+        } else {
+          pElemNames.push("")
+        }
+        pElemTypes.push(monoArrElemName(pinned[pe]))
+        pe = pe + 1
+      }
+      const instBody = monoPinMapLambdas(instBody0, pElemNames, pElemTypes)
       const nfn = mkFunc(instName, noTyParams, nps, nret, instBody, -1)
       if count == 0 {
         // First instance: keep the bare name and the original's wasm index.
