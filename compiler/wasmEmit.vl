@@ -2178,6 +2178,59 @@ function mvValsWrapOf(slot: i32) {
   rlWrapIdx[mvRlSlot[slot]]
 }
 
+// ── scalar-list descriptor (the i32 / f64 / i64 list unification) ──────────────
+// A SCALAR-element list (`i32[]` / `boolean[]` / `f64[]` / `i64[]`) is one shape
+// parameterized by its element's valtype: a growable `{ backing, len, cap }` wrapper over
+// a raw `(array (mut <elem>))`. The list ops (`.get`/`.pop`/`.slice`/index/`.map`) used to
+// branch `if exprF64Array { fl64/fa64 } else { l/a }` — a binary fork with no room for a
+// third element type. These descriptors map a CANONICAL element kind (the `fbValtype`
+// codes: 0 i32/boolean · 11 f64 · 10 i64) to its list types + read shape, so a list op is
+// written ONCE over the kind and a new scalar type is a descriptor arm, not a new branch
+// in every function.
+
+// The canonical scalar element kind of a list-valued expression — 0 (i32/boolean), 11
+// (f64), 10 (i64) — or -1 (a ref / string / map list, or not a list). The single dispatch
+// the scalar list ops consult instead of each re-deriving `exprF64Array`.
+function scalarListElemKind(exprIx: i32, fnIx: i32) {
+  if exprF64Array(exprIx, fnIx) { return 11 }
+  if exprArray(exprIx, fnIx) { return 0 }
+  -1
+}
+
+// The WRAPPER struct heap type for a scalar element kind.
+function scalarListWrap(elemKind: i32) {
+  if elemKind == 11 { return fl64TypeIdx }
+  lTypeIdx
+}
+
+// The BACKING `(array (mut <elem>))` heap type for a scalar element kind.
+function scalarListBack(elemKind: i32) {
+  if elemKind == 11 { return fa64TypeIdx }
+  aTypeIdx
+}
+
+// The `array.get` RESULT blocktype byte for a scalar element kind (i32 `0x7f`, f64 `0x7c`,
+// i64 `0x7e`) — the value-typed-`if` rep a fused `?? d` read joins on.
+function scalarListBlocktype(elemKind: i32) {
+  if elemKind == 11 { return 124 }
+  127
+}
+
+// Whether the module-global list types for a scalar element kind were collected (the
+// loud-fail guard every list op shares).
+function scalarListUsed(elemKind: i32) {
+  if elemKind == 11 { return fa64Used }
+  lUsed
+}
+
+// Emit `exprIx` COERCED to a scalar element kind's value rep — the f64/i64 widen of a
+// narrower literal/`i32` so a list element / `?? d` default matches the backing element
+// type. The i32 kind passes through unchanged (byte-identical to a bare `emitExpr`).
+function emitScalarValue(body: i32[], exprIx: i32, fnIx: i32, elemKind: i32) {
+  if elemKind == 11 { return emitExprAsF64(body, exprIx, fnIx) }
+  emitExpr(body, exprIx, fnIx)
+}
+
 // ── active `is`-narrowing scope ───────────────────────────────────────────────
 // When emitting the THEN-branch of `if n is A { … }`, the union-typed identifier
 // `n` is narrowed to variant `A`, so a field read `n.f` in that branch lowers to
@@ -11924,18 +11977,17 @@ function emitListGetOr(body: i32[], getIx: i32, defIx: i32, fnIx: i32) {
       if c.callArgs.length != 1 {
         return emitFail("emitProgram: .get takes exactly one argument")
       }
-      const isF64 = exprF64Array(callee.memObj, fnIx)
-      let lTy = lTypeIdx
-      let aTy = aTypeIdx
-      if isF64 {
-        if !fa64Used {
-          return emitFail("emitProgram: f64 .get but f64 list type not collected")
-        }
-        lTy = fl64TypeIdx
-        aTy = fa64TypeIdx
-      } else if !lUsed {
+      // The scalar element kind (i32 / f64 / i64) selects the list types + read rep — one
+      // descriptor lookup instead of an `isF64 ? … : …` fork (so i64 is a descriptor arm).
+      const ek = scalarListElemKind(callee.memObj, fnIx)
+      if ek < 0 {
+        return emitFail("emitProgram: .get receiver is not a scalar list")
+      }
+      if !scalarListUsed(ek) {
         return emitFail("emitProgram: .get but list type not collected")
       }
+      const lTy = scalarListWrap(ek)
+      const aTy = scalarListBack(ek)
       const recvN = P.nodes[unwrapParen(callee.memObj)]
       let okRecv = false
       if recvN is Ident { okRecv = true }
@@ -11960,25 +12012,17 @@ function emitListGetOr(body: i32[], getIx: i32, defIx: i32, fnIx: i32) {
       // cond: idx u< len  (one unsigned compare covers negative + past-len)
       if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
       if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(lTy, 1) // field 1: len
-      fbI32Bin(73)        // 0x49 i32.lt_u
-      if isF64 {
-        fbIf(124) // 0x04 if, 0x7c f64 result blocktype
-      } else {
-        fbIf(127) // 0x04 if, 0x7f i32 result blocktype
-      }
+      fbStructGet(lTy, 1)           // field 1: len
+      fbI32Bin(73)                  // 0x49 i32.lt_u
+      fbIf(scalarListBlocktype(ek)) // 0x04 if, the element's result blocktype
       ctrlEnter()
       if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(lTy, 0) // field 0: backing
+      fbStructGet(lTy, 0)           // field 0: backing
       if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-      fbArrayGet(aTy)     // 0xfb 0x0b array.get — the element
-      fbElse()            // 0x05 else
-      if isF64 {
-        if emitExprAsF64(body, defIx, fnIx) < 0 { return -1 }
-      } else {
-        if emitExpr(body, defIx, fnIx) < 0 { return -1 }
-      }
-      fbEnd() // 0x0b end
+      fbArrayGet(aTy)               // 0xfb 0x0b array.get — the element
+      fbElse()                      // 0x05 else
+      if emitScalarValue(body, defIx, fnIx, ek) < 0 { return -1 }
+      fbEnd()                       // 0x0b end
       ctrlLeave()
       return 0
     }
