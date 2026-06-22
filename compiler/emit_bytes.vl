@@ -5,7 +5,7 @@
 // never the lowering — a clean layer (`emit_state → emit_bytes → wasmEmit`).
 
 import { f32Bytes, f64Bytes, slebToArr, ulebToArr } from "./emit_base"
-import { W, aTypeIdx, arrNewScratchBase, callRefSlot, cloEqScratchBase, cloStructIdx, coalesceCallBoolSlot, coalesceCallSlot, coalesceCallStrSlot, curBuf, emitErr, emitFailed, f64PushScratchBase, fnUsesI64Push, i64PushScratchBase, fa64TypeIdx, ia64TypeIdx, il64TypeIdx, fbScratchCur, fl64TypeIdx, fnListEqRSlots, fnMvBase, fnRefPushSlots, fnUsesArrNew, fnUsesCallRef, fnUsesCloEq, fnUsesCoalesceCall, fnUsesF64Push, fnUsesListEqI, fnUsesListEqS, fnUsesMap, fnUsesMapFilter, fnUsesPush, fnUsesStrOp, fnUsesStrPush, lTypeIdx, leqIScratchBase, leqRBases, leqSScratchBase, localIsRef, localStructIdx, mStructIdx, mapScratchBase, mapKeysBase, fnUsesMapKeys, mfDstBases, mfDstKinds, mfDstSlots, mfScratchBase, mfSrcBases, mfSrcKinds, mfSrcSlots, mkArrIdx, mkListIdx, mvMapTypeIdx, mvRlSlot, mvValKind, mvValName, mvValStructIdx, pushScratchBase, refPushBaseBySlot, refPushScratchBase, rlBackIdx, rlElemHeap, rlWrapIdx, sHeapIdx, strPushScratchBase, strScratchBase, uBoxIdx, uVarIdx } from "./emit_state"
+import { W, aTypeIdx, arrNewScratchBase, callRefSlot, cloEqScratchBase, cloStructIdx, coalesceCallBoolSlot, coalesceCallSlot, coalesceCallStrSlot, curBuf, emitErr, emitFailed, f64PushScratchBase, fnUsesI64Push, i64PushScratchBase, fa64TypeIdx, ia64TypeIdx, il64TypeIdx, fbScratchCur, fl64TypeIdx, fnListEqRSlots, fnMvBase, fnRefPushSlots, fnUsesArrNew, fnUsesCallRef, fnUsesCloEq, fnUsesCoalesceCall, fnUsesF64Push, fnUsesListEqI, fnUsesListEqS, fnUsesMap, fnUsesMapFilter, fnUsesPush, fnUsesStrOp, fnUsesStrPush, lTypeIdx, leqIScratchBase, leqRBases, leqSScratchBase, localIsRef, localStructIdx, mStructIdx, mapScratchBase, mapKeysBase, fnUsesMapKeys, mapValsBase, fnUsesMapVals, mvValsOutBase, mfDstBases, mfDstKinds, mfDstSlots, mfScratchBase, mfSrcBases, mfSrcKinds, mfSrcSlots, mkArrIdx, mkListIdx, mvMapTypeIdx, mvRlSlot, mvValKind, mvValName, mvValStructIdx, pushScratchBase, refPushBaseBySlot, refPushScratchBase, rlBackIdx, rlElemHeap, rlWrapIdx, sHeapIdx, strPushScratchBase, strScratchBase, uBoxIdx, uVarIdx } from "./emit_state"
 
 // Redirect the writer at `buf`; return the PREVIOUS current buffer so the caller
 // can restore it (closure-free save/restore — replaces threading `body`/`payload`
@@ -474,6 +474,9 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   // `m.keys()` / `for k in m` key-list builder frame (6 slots).
   mapKeysBase = fbScratchCur
   if fnUsesMapKeys { fbReserve(6) }
+  // `m.values()` (mono i32 map) value-list builder frame (6 slots).
+  mapValsBase = fbScratchCur
+  if fnUsesMapVals { fbReserve(6) }
   // Closure scratch frame (1 slot, a `(ref $cloStruct)`) for `call_ref` (lambdas).
   callRefSlot = fbScratchCur
   if fnUsesCallRef { fbReserve(1) }
@@ -505,6 +508,16 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
     while mvk < mvValName.length {
       fbReserve(3)
       mvk = mvk + 1
+    }
+  }
+  // `m.values()` per-mv-slot OUTPUT backing (1 slot per module mv slot), reserved only when
+  // the function builds a value list — the typed dual of the mv frame's `valsBk` source.
+  mvValsOutBase = fbScratchCur
+  if fnUsesMapVals {
+    let mvo = 0
+    while mvo < mvValName.length {
+      fbReserve(1)
+      mvo = mvo + 1
     }
   }
   // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6), appended LAST so
@@ -587,6 +600,7 @@ export function fbLocalsCount(nLocals: i32) {
   if fnUsesStrOp { n = n + 7 }
   if fnUsesMap { n = n + 14 + mvValName.length * 3 }
   if fnUsesMapKeys { n = n + 6 }
+  if fnUsesMapVals { n = n + 6 + mvValName.length }
   if fnUsesCallRef { n = n + 1 }
   if fnUsesMapFilter { n = n + 4 }
   n = n + mfSrcKinds.length + mfDstKinds.length
@@ -700,6 +714,16 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbI32Run()
     fbI32Run()
   }
+  // `m.values()` value-list builder frame (6 slots): outBack (ref $aTypeIdx), valsBack
+  // (ref $aTypeIdx), live (ref $aTypeIdx), i, j, count (3 i32).
+  if fnUsesMapVals {
+    fbRefRun(aTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbRefRun(aTypeIdx)
+    fbI32Run()
+    fbI32Run()
+    fbI32Run()
+  }
   // Closure scratch slot (1, (ref $cloStruct)) for `call_ref` (lambdas).
   if fnUsesCallRef { fbRefRun(cloStructIdx) }
   // `.map`/`.filter` HOF frame: i, n, j (3 i32) + the callback closure
@@ -741,6 +765,14 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
       else if mvValKind[mvr] == 10 { fbI64Run() }
       else { fbRefNullRun(mvValElemHeapOf(mvr)) }
       mvr = mvr + 1
+    }
+  }
+  // `m.values()` per-mv-slot output backing (1 per mv slot, typed as the value backing).
+  if fnUsesMapVals {
+    let mvo = 0
+    while mvo < mvValName.length {
+      fbRefRun(mvValsBackOf(mvo))
+      mvo = mvo + 1
     }
   }
   // List `==`/`!=`/`+` frames, in `fbBeginFunc`'s reservation order: the
