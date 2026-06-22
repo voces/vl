@@ -4592,10 +4592,17 @@ function emitValueUnionUnboxRead(
 // the normal lowering (`emitUnionBox` boxes it via the `uDeclared` path).
 function emitUnionCoerce(
   body: i32[],
-  unionName: string,
+  unionNameIn: string,
   exprIx: i32,
   fnIx: i32,
 ) {
+  // Resolve a union ALIAS (`type Tagged = {x:i32} | string`) to its pipe-joined member set
+  // so the value-atom boxing below (`unionHasValueAtom`/`unionHasAtom`/the atom ladder) sees
+  // the atoms — an alias name has no `|` to split. An INLINE union name (already a member
+  // set) and a non-union name resolve to "" and pass through unchanged.
+  let unionName = unionNameIn
+  const ums = unionMemberSetOf(unionName)
+  if ums != "" { unionName = ums }
   if exprUnion(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
   const bareIx = unwrapParen(exprIx)
   const bare = P.nodes[bareIx]
@@ -18998,13 +19005,32 @@ function collectU(stmts: i32[]) {
       }
       unMemberSet.push(udSet)
       unVarStart.push(uVariants.length)
-      unVarCount.push(vs.length)
+      // Only the STRUCT variants get a variant struct + fields; an atom member
+      // (`string`/`i32`/…) of a MIXED union (`{x:i32} | string`) boxes through the shared
+      // value boxes, exactly as the inline-annotation path registers it. (A pure struct
+      // union has every variant a struct, so this stays byte-identical for `Cat | Dog`.)
+      let nStructs = 0
+      let nc = 0
+      while nc < vs.length {
+        if vs[nc] != "null" {
+          if isStructAtom(stmts, vs[nc]) { nStructs = nStructs + 1 }
+        }
+        nc = nc + 1
+      }
+      unVarCount.push(nStructs)
       let vi = 0
       while vi < vs.length {
-        uVariants.push(vs[vi])
-        if collectVariantFields(stmts, vs[vi]) < 0 { return -1 }
+        if vs[vi] != "null" {
+          if isStructAtom(stmts, vs[vi]) {
+            uVariants.push(vs[vi])
+            if collectVariantFields(stmts, vs[vi]) < 0 { return -1 }
+          }
+        }
         vi = vi + 1
       }
+      // A MIXED union's scalar members intern their per-rep value boxes (no-op for an
+      // all-struct union).
+      markValueUnionAtoms(udSet)
     }
     i = i + 1
   }
