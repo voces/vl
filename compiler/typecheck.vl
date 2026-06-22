@@ -772,19 +772,103 @@ let fnSawValueRet = false
 let retNatural = -1
 let retNaturalErr = false
 
-// Contextual callback-param inference: when checking a function-literal argument
-// whose expected type is known from the call site (a `.map`/`.filter` receiver's
-// element type, or any HOF whose param is a known `TyFunc`), the caller stashes
-// the expected param types here BEFORE checking the literal. `checkFuncDeclNode`
-// consumes them — binding an UN-annotated param to the expected type rather than
-// reporting "cannot infer a type for parameter" — then clears them. The buffer is
-// single-shot (consumed by the next FuncDecl check and reset), so it never leaks
-// into a nested or unrelated function body.
-let expectedCbParamTys: i32[] = []
-let expectedCbPending = false
+// CONTEXTUAL (bidirectional) inference for un-annotated function-literal params. When an
+// expression is checked in a position with a known EXPECTED type, a lambda `(x) => …` sitting
+// there infers its params from the expected function type — even when nested inside a composite
+// (an `((i32) => i32)[]` array, a `{ f: (i32) => i32 }` object). `seedExpected` walks the
+// expected type and the expression in lockstep and records, PER LAMBDA NODE, its expected param
+// types; the lambda's `checkFuncDeclNode` then reads them by node index. Node-keyed rather than
+// a single-shot global, so the MANY lambdas of one composite each get their own seed and a seed
+// never leaks into an unrelated body. Every contextual position routes through `seedExpected`
+// (a HOF call arg, a `.map`/`.filter` receiver, an annotated `let`/return/field/element) — one
+// mechanism, all positions.
+let cbExpNode: i32[] = [] // lambda node index
+let cbExpOff: i32[] = []  // offset of its param-type run in `cbExpPool`
+let cbExpLen: i32[] = []  // run length (param count)
+let cbExpPool: i32[] = [] // flattened expected param-type arena indices
+
+// Record `paramTys` as the expected param types of the lambda at `nodeIx` (latest wins).
+function recordCbExpected(nodeIx: i32, paramTys: i32[]) {
+  cbExpNode.push(nodeIx)
+  cbExpOff.push(cbExpPool.length)
+  cbExpLen.push(paramTys.length)
+  let i = 0
+  while i < paramTys.length {
+    cbExpPool.push(paramTys[i])
+    i = i + 1
+  }
+  0
+}
+
+// The expected param types recorded for the lambda at `nodeIx` — the LAST recorded run (the
+// real pass overrides the pre-inference pass), or `[]` when none.
+function cbExpectedFor(nodeIx: i32) {
+  let found = -1
+  let i = 0
+  while i < cbExpNode.length {
+    if cbExpNode[i] == nodeIx { found = i }
+    i = i + 1
+  }
+  const out: i32[] = []
+  if found >= 0 {
+    let j = 0
+    while j < cbExpLen[found] {
+      out.push(cbExpPool[cbExpOff[found] + j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+// Propagate an EXPECTED type into an expression, recording per-lambda param expectations. A
+// lambda at a function-typed position is seeded directly; a composite LITERAL (array / object)
+// recurses into its elements / fields against the expected element / field types, so a lambda
+// nested anywhere in the expected shape is reached. Any other shape is a no-op.
+function seedExpected(exprIx: i32, expectedTy: i32) {
+  if exprIx < 0 || expectedTy < 0 { return 0 }
+  let u = exprIx
+  let done = false
+  while !done {
+    const node = P.nodes[u]
+    if node is Paren { u = node.parInner } else { done = true }
+  }
+  const en = P.nodes[u]
+  const et = T.tys[expectedTy]
+  if en is FuncDecl {
+    if en.fnName == "" {
+      if et is TyFunc { recordCbExpected(u, et.fnParamTypes) }
+    }
+  } else if en is ArrayLit {
+    if et is TyArray {
+      let i = 0
+      while i < en.arrElems.length {
+        seedExpected(en.arrElems[i], et.aElem)
+        i = i + 1
+      }
+    }
+  } else if en is ObjLit {
+    if et is TyObj {
+      const fields = en.objFields
+      let i = 0
+      while i < fields.length {
+        const fnode = P.nodes[fields[i]]
+        if fnode is FieldInit {
+          const fty = objFieldType(et, fnode.fiName)
+          if fty >= 0 { seedExpected(fnode.fiValue, fty) }
+        }
+        i = i + 1
+      }
+    }
+  }
+  0
+}
 
 export function initChecker() {
   redunReset()
+  cbExpNode = []
+  cbExpOff = []
+  cbExpLen = []
+  cbExpPool = []
   T.tys = []
   T.scopes = []
   T.diags = []
@@ -4336,14 +4420,10 @@ function checkCallNode(n: Call, ix: i32) {
         const cbArg = P.nodes[cargs[0]]
         if cbArg is FuncDecl {
           if cbArg.fnName == "" && rt.aElem >= 0 {
-            expectedCbParamTys = [rt.aElem]
-            expectedCbPending = true
+            recordCbExpected(cargs[0], [rt.aElem])
           }
         }
         const cbTy = checkNode(cargs[0])
-        // Defensively clear any unconsumed expectation (the arg was not the
-        // single-param literal that would consume it).
-        expectedCbPending = false
         const cb = T.tys[cbTy]
         if cb is TyFunc {
           const cbParams = cb.fnParamTypes
@@ -4771,23 +4851,12 @@ function checkCallNode(n: Call, ix: i32) {
     const bTys: i32[] = []
     let i = 0
     while i < args.length {
-      // Contextual param inference for a function-VALUE argument: when the
-      // expected param is a known function type and the arg is an anonymous
-      // function literal, stash the expected param types so an un-annotated
-      // literal param infers from the signature (the general HOF case, matching
-      // `.map`/`.filter`). Single-shot + cleared after the arg is checked.
-      const pExp = T.tys[params[i]]
-      if pExp is TyFunc {
-        const aNode = P.nodes[args[i]]
-        if aNode is FuncDecl {
-          if aNode.fnName == "" {
-            expectedCbParamTys = pExp.fnParamTypes
-            expectedCbPending = true
-          }
-        }
-      }
+      // Contextual param inference for a function-VALUE argument: propagate the expected
+      // param type into the argument so an un-annotated literal param infers from the
+      // signature (the general HOF case, matching `.map`/`.filter`) — including a lambda
+      // nested in a composite argument (`apply([(x) => …], …)`).
+      seedExpected(args[i], params[i])
       const at = checkNode(args[i])
-      expectedCbPending = false
       // Bind every TyVar reachable in the expected param position from the
       // argument's shape (first use wins), then check the argument against the
       // SUBSTITUTED expected type — a later disagreeing use errors here.
@@ -5240,16 +5309,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     }
   }
   const params = n.fnParams
-  // Consume any contextual expected-param types stashed by the call site (a
-  // `.map`/`.filter` receiver, or a HOF whose param is a known `TyFunc`). Snapshot
-  // and clear the single-shot buffer immediately so it cannot leak into a nested
-  // function literal checked while this body is processed.
-  let cbExpect: i32[] = []
-  if expectedCbPending {
-    cbExpect = expectedCbParamTys
-    expectedCbPending = false
-    expectedCbParamTys = []
-  }
+  // The contextual expected param types recorded for THIS lambda node (`seedExpected` at a
+  // call arg, a `.map`/`.filter` receiver, or an annotated let/return/field/element). Keyed by
+  // node index, so a composite's many lambdas each read their own — no single-shot leak.
+  const cbExpect = cbExpectedFor(fnIx)
   const cbExpectUsable = cbExpect.length == params.length
   const paramTys: i32[] = []
   let paramUninferable = false
@@ -6805,6 +6868,10 @@ function checkNodeReal(ix: i32) {
       }
     }
     let initTy = -1
+    // Bidirectional: a `const f: (i32) => i32 = (x) => …` (or a composite of such — an
+    // annotated array/object of lambdas) infers each un-annotated lambda param from the
+    // annotation BEFORE the initializer is checked.
+    if n.letInit >= 0 && annot >= 0 { seedExpected(n.letInit, annot) }
     if n.letInit >= 0 { initTy = checkNode(n.letInit) }
     // A `void` initializer (`const x = f()` over a void function) has NO value to bind.
     // The assignment path (`x = f()`) already rejects it; the BINDING path did not — an
@@ -7243,6 +7310,9 @@ function checkNodeReal(ix: i32) {
       noteInferredRet(checkNode(n.retArg))
       return TY_VOID
     }
+    // Bidirectional: `function mk(): (i32) => i32 { return (x) => … }` infers the returned
+    // lambda's param from the declared return type (also through a composite return shape).
+    if want >= 0 { seedExpected(n.retArg, want) }
     const got = checkNode(n.retArg)
     // Redundant-return rule: witness the explicit return's NATURAL type (before
     // constrainEmpty); an annotation-influenced return disqualifies the function.
