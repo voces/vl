@@ -357,6 +357,19 @@ function cloRetKindOf(fe: i32) {
   -1
 }
 
+// Whether the lifted callback at `fe` returns a STRING — its annotation (`: string`) or the
+// inferred `fRetStr`. `cloRetKindOf` folds string into -1 (it is outside the i32/f64 value
+// ABI), so `.map`/`.filter` consult this separately to pick the string-list result kind.
+function cloRetIsString(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return false }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return nameIsString(tyNameOf(fn.fnRet)) }
+    if fe < fRetStr.length { return fRetStr[fe] == 1 }
+  }
+  false
+}
+
 // Registry-independent f64-ness of a lifted callback's tail expression: float
 // literals, f64 PARAMS, f64 arithmetic over those, and f64-returning named calls.
 // Deliberately avoids `declaredF64`/`declaredSlotOf` (the locals registry belongs to
@@ -11240,6 +11253,18 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         srcWrap = rlWrapIdx[srcSlot]
         srcBack = rlBackIdx[srcSlot]
         srcElemRef = true
+      } else if recvK == 3 {
+        // A STRING list: wrapper `$mkListIdx`, backing `$mkArrIdx` (the array of string
+        // refs). The element is itself a ref (an `array i32` of code points), so it needs
+        // `ref.as_non_null` after `array.get`, exactly like a ref-list element.
+        if !slUsed {
+          return emitFail(
+            "emitProgram: .map/.filter over string[] but string list type not collected",
+          )
+        }
+        srcWrap = mkListIdx
+        srcBack = mkArrIdx
+        srcElemRef = true
       } else if !lUsed || !aUsed {
         return emitFail("emitProgram: .map/.filter but list type not collected")
       }
@@ -11254,6 +11279,17 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         }
         dstWrap = fl64TypeIdx
         dstBack = fa64TypeIdx
+      } else if resK == 3 {
+        // A STRING-list result: a `.filter` over a string list, or a `.map` whose callback
+        // returns a string. The backing `$mkArrIdx` holds string refs; `array.set` stores
+        // the callback's (non-null) string result directly.
+        if !slUsed {
+          return emitFail(
+            "emitProgram: .map/.filter result is string[] but string list type not collected",
+          )
+        }
+        dstWrap = mkListIdx
+        dstBack = mkArrIdx
       } else if !lUsed || !aUsed {
         return emitFail("emitProgram: .map/.filter result but list type not collected")
       }
@@ -20032,7 +20068,7 @@ function callIsMapFilter(exprIx: i32, fnIx: i32) {
 function mfRecvKindOf(recvIx: i32, fnIx: i32) {
   if exprF64Array(recvIx, fnIx) { return 1 }
   if exprRefArray(recvIx, fnIx) { return 2 }
-  if exprStringArray(recvIx, fnIx) { return -1 }
+  if exprStringArray(recvIx, fnIx) { return 3 }
   if exprArray(recvIx, fnIx) { return 0 }
   -1
 }
@@ -20051,11 +20087,15 @@ function mfResultKindOf(callIx: i32, fnIx: i32) {
         let rk = mfRecvKindOf(callee.memObj, fnIx)
         if rk == 0 { return 0 }
         if rk == 1 { return 1 }
+        if rk == 3 { return 3 }
         return -1
       }
       if c.callArgs.length == 1 {
         let fe = mfCallbackFe(c.callArgs[0], fnIx)
         if fe < 0 { return -1 }
+        // A string-returning callback maps to a string-list result (kind 3) — checked first
+        // since `cloRetKindOf` folds string into -1.
+        if cloRetIsString(fe) { return 3 }
         const rk2 = cloRetKindOf(fe)
         if rk2 == 0 { return 0 }
         if rk2 == 11 { return 1 }
@@ -20221,13 +20261,20 @@ function collectMapFilterUse() {
             fnValUsed = true
             if callee.memProp == "map" {
               let fe = mfCallbackFe(nd.callArgs[0], -1)
-              let rk = 0
-              if fe >= 0 { rk = cloRetKindOf(fe) }
-              if rk == 11 {
-                fa64Used = true
+              if fe >= 0 && cloRetIsString(fe) {
+                // A string-returning callback: the result list is a string list, which may be
+                // the program's ONLY one (an i32/struct source mapped to strings) — force its
+                // wrapper/backing collection.
+                slUsed = true
               } else {
-                aUsed = true
-                lUsed = true
+                let rk = 0
+                if fe >= 0 { rk = cloRetKindOf(fe) }
+                if rk == 11 {
+                  fa64Used = true
+                } else {
+                  aUsed = true
+                  lUsed = true
+                }
               }
             }
           }
