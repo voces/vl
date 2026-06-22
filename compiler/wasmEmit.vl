@@ -1511,6 +1511,15 @@ function criClassify(rx0: i32, i: i32) {
   }
   if fRetUni[i] == 0 && exprUnion(rx, fnStmts[i]) {
     fRetUni[i] = 1
+    // A union return SUBSUMES a per-arm struct classification: a value-if join (`if c {
+    // catVal } else { dogVal }`) has one arm a union-VARIANT object literal (which
+    // `exprStruct` would also claim as a plain struct return) and another the union. If the
+    // struct arm was classified FIRST it set `fRetRef` while `fRetUni` was still 0 (the
+    // `fRetRef` guard only blocks the reverse order). Clear it so the union wins — else the
+    // inferred-result valtype declares a struct ref over a body that yields the union box.
+    // Lambda-gated: only the lambda value-if path (above) sets both, and a named function's
+    // classification must stay byte-identical.
+    if criFnIsAnonLambda(i) { fRetRef[i] = 0 }
     criChanged = true
   }
   if fRetNul[i] == 0 && fRetUni[i] == 0 && exprNullableStruct(rx, fnStmts[i]) {
@@ -1543,6 +1552,24 @@ function criClassify(rx0: i32, i: i32) {
 // narrowing the emit loops apply: each `if` arm classifies under its
 // condition's then/else narrowing, and a divergent guard narrows the rest of
 // the block (`pushPostGuardNarrow`). The stack rewinds at block exit.
+// True if lifted function `i` (an `fnStmts` index) is an ANONYMOUS lambda (no source
+// name). Restricts the if-arm tail-value return classification below to lambdas, leaving
+// NAMED-function return inference byte-identical (a named function's inferred-return name
+// already rides `buildFnMap`'s A20 pass + `criWalkStmt`'s explicit-`return` classification;
+// perturbing it would change the compiler's own self-compilation).
+function criFnIsAnonLambda(i: i32) {
+  if i < 0 || i >= fnStmts.length { return false }
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    // The emitter rewrites an anonymous lambda's empty name to the synthesized
+    // `__lambda_N` (before this pass runs), so test that prefix — `fnName == ""` never
+    // matches a lifted lambda here. A source function never starts with `__lambda`.
+    const nm = fn.fnName
+    return nm.length >= 8 && nm.slice(0, 8) == "__lambda"
+  }
+  false
+}
+
 function criWalkBlock(blockIx: i32, i: i32) {
   if blockIx < 0 { return 0 }
   let b = P.nodes[blockIx]
@@ -1551,6 +1578,18 @@ function criWalkBlock(blockIx: i32, i: i32) {
     const savedGuardTop = narrowTop
     let k = 0
     while k < stmts.length {
+      // An if-ARM's last statement may be a bare tail VALUE (an implicit return —
+      // `if c { catVal } else { dogVal }`), not an explicit `return`. For an ANONYMOUS
+      // LAMBDA, classify it under the arm's active narrowing so a value-if union return
+      // types from its arms (a named union-returning callback already works via explicit
+      // `return`s). Lambda-gated to keep named-function inference byte-identical.
+      if (
+        k == stmts.length - 1 &&
+        criFnIsAnonLambda(i) &&
+        stmtIsTailValue(stmts[k], fnStmts[i])
+      ) {
+        criClassify(stmts[k], i)
+      }
       criWalkStmt(stmts[k], i)
       pushPostGuardNarrow(stmts[k], fnStmts[i])
       k = k + 1
@@ -4404,7 +4443,14 @@ function emitUnionCoerce(
   fnIx: i32,
 ) {
   if exprUnion(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
-  const bare = P.nodes[unwrapParen(exprIx)]
+  const bareIx = unwrapParen(exprIx)
+  const bare = P.nodes[bareIx]
+  // An if-EXPRESSION join (`return if c { catVal } else { dogVal }`): each arm is a distinct
+  // union member (a variant struct, a passed-through union, a scalar), so the join can't ride
+  // a single numeric blocktype — emit a value-typed `if` whose result IS the union box,
+  // union-coercing each arm. Without this the join defaults to an i32 blocktype over ref arms
+  // (invalid wasm — a pre-existing gap that hits named functions too).
+  if bare is IfStmt { return emitUnionIfValue(body, unionName, bareIx, fnIx) }
   if bare is NullLit {
     fbI32Const(scalarTagOf("null"))
     fbRefNullNone() // the payload slot is unread under the null tag
@@ -4463,6 +4509,71 @@ function emitUnionCoerce(
   }
   fbStructNew(uBoxIdx) // { tag, payload }
   0
+}
+
+// Lower an if-EXPRESSION whose VALUE is a union (`if c { A } else { B }` in a union return /
+// coerce position) as a value-typed `if` with the union BOX result type, each arm
+// union-coerced (`emitUnionCoerce`). Mirrors `emitIfExprAs` (narrowing save/restore, `else
+// if` recursion) but the blocktype is the `(ref $uBox)` valtype, not a numeric byte, and arms
+// route through `emitUnionCoerce` so a variant-struct / passthrough / scalar arm each boxes to
+// the same union rep.
+function emitUnionIfValue(
+  body: i32[],
+  unionName: string,
+  ifIx: i32,
+  fnIx: i32,
+) {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse < 0 {
+      return emitFail("emitProgram: union if-expression requires an else arm")
+    }
+    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    wU8(4)           // 0x04 if
+    fbValtype(4, -1) // result blocktype: the union box `(ref $uBox)`
+    const savedTop = narrowTop
+    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    const rcT = emitUnionIfArm(body, unionName, s.ifThen, fnIx)
+    if narrowed { restoreNarrow(savedTop) }
+    if rcT < 0 { return -1 }
+    fbElse()         // 0x05 else
+    const savedElseTop = narrowTop
+    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
+    const els = P.nodes[s.ifElse]
+    let rc = 0
+    if els is IfStmt {
+      rc = emitUnionIfValue(body, unionName, s.ifElse, fnIx)
+    } else {
+      rc = emitUnionIfArm(body, unionName, s.ifElse, fnIx)
+    }
+    if narrowedElse { restoreNarrow(savedElseTop) }
+    if rc < 0 { return -1 }
+    fbEnd() // 0x0b end
+    return 0
+  }
+  emitFail("emitProgram: expected a union if-expression")
+}
+
+// One arm of a union if-expression: the arm Block's single tail-value statement,
+// union-coerced to the box rep (`emitUnionCoerce` — a variant struct boxes, a passthrough
+// union rides as-is, a scalar value-boxes).
+function emitUnionIfArm(
+  body: i32[],
+  unionName: string,
+  blockIx: i32,
+  fnIx: i32,
+) {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    if stmts.length == 1 {
+      if stmtIsTailValue(stmts[0], fnIx) {
+        return emitUnionCoerce(body, unionName, stmts[0], fnIx)
+      }
+    }
+    return emitFail("emitProgram: union if-expression arm is not a single value")
+  }
+  emitFail("emitProgram: union if-expression arm is not a block")
 }
 
 // ── union `==`/`!=` (the host's structural-equality union branch) ─────────────
@@ -20552,6 +20663,10 @@ function mfResultKindOf(callIx: i32, fnIx: i32) {
         // source (`P[].map((p) => Q-shape)` ⇒ `Q[]`), so the dst slot is the RESULT struct's
         // ref-list slot, not the source's (`mfResultSlotOf`).
         if cloRetValKind(fe) == 1 { return 2 }
+        // A UNION-returning callback maps to a ref list of union BOXES (kind 2, element kind
+        // 2). All unions share `$uBox`, so the result element is the declared union; its box
+        // body is produced by the callback's own union-boxing return path.
+        if cloRetValKind(fe) == 4 { return 2 }
         const rk2 = cloRetKindOf(fe)
         if rk2 == 0 { return 0 }
         if rk2 == 11 { return 1 }
@@ -20581,6 +20696,11 @@ function mfResultSlotOf(callIx: i32, fnIx: i32) {
         if fe >= 0 && cloRetValKind(fe) == 1 {
           const si = cloRetValSlot(fe)
           if si >= 0 && si < sNames.length { return rlSlotByName(sNames[si]) }
+        }
+        // A UNION-returning `.map`: the result is a ref list of the declared union (all
+        // unions share `$uBox`, so the element key is the union alias name).
+        if fe >= 0 && cloRetValKind(fe) == 4 && unNames.length > 0 {
+          return rlSlotByName(unNames[0])
         }
       }
     }
@@ -20767,6 +20887,17 @@ function collectMapFilterUse() {
                   rlUsed = true
                   raUsed = true
                 }
+              } else if (
+                fe >= 0 &&
+                cloRetValKind(fe) == 4 &&
+                unNames.length > 0
+              ) {
+                // A UNION-returning callback (`xs.map((a) => unionVal)`): the result is a ref
+                // list of union boxes (element kind 2). Intern the union alias's slot so a map
+                // whose source is NOT itself a union array still has a result backing.
+                rlInternName(unNames[0], 2)
+                rlUsed = true
+                raUsed = true
               } else {
                 let rk = 0
                 if fe >= 0 { rk = cloRetKindOf(fe) }
