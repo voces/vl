@@ -9224,11 +9224,145 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
 // the statement form does. The blocktype is the SCALAR rep the branch-join produced —
 // i32 (127, the default), i64 (126), f32 (125), or f64 (124) — all single-byte
 // valtypes; both arms are emitted COERCED to that rep so a mixed `then 1 else 2.5`
-// widens its i32 arm to f64. REF-typed arms (string/struct/union) need an interned
-// blocktype functype and are NOT handled here yet. A missing else / non-value arm
-// fails loudly — the checker already proved both arms exist and agree.
+// widens its i32 arm to f64. A REF-typed join (string / struct / array — NOT a value
+// union or concrete variant, which `emitUnionIfValue`/`emitVariantIfValue` already
+// handle at their coerce sites) routes to `emitIfExprRef`, which writes the multi-byte
+// `(ref $ht)` blocktype via `fbValtype`. A missing else / non-value arm fails loudly —
+// the checker already proved both arms exist and agree.
 function emitIfExpr(body: i32[], ifIx: i32, fnIx: i32) {
+  const rk = ifExprRefKind(ifIx, fnIx)
+  if rk >= 0 {
+    return emitIfExprRef(body, ifIx, fnIx, rk, ifExprRefSlot(ifIx, fnIx, rk))
+  }
   emitIfExprAs(body, ifIx, fnIx, ifExprValtype(ifIx, fnIx))
+}
+
+// The single tail-value expression of an if-expression's THEN arm (the parser wraps
+// `then <expr>` as a one-statement Block), or -1. The arms share the checker's join
+// type, so the then arm's rep classifies the whole if-expression.
+function ifThenValueIx(ifIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    const b = P.nodes[s.ifThen]
+    if b is Block {
+      const stmts = b.blkStmts
+      if stmts.length == 1 { return stmts[0] }
+    }
+  }
+  -1
+}
+
+// The `fbValtype` KIND of a REF-typed if-expression join — string (3), string-list (7),
+// f64-list (12), ref-list (5), i32-list (2), or struct (1) — classified from the THEN
+// arm's tail value. -1 for a numeric join (the single-byte path) and for a value-union /
+// concrete-variant join (handled by `emitUnionIfValue` / `emitVariantIfValue` upstream).
+// The array predicates run BEFORE the i32-list `exprArray` (which would also claim a
+// string/ref/f64 list via its typed-IR fast path).
+function ifExprRefKind(ifIx: i32, fnIx: i32) {
+  const tv = ifThenValueIx(ifIx)
+  if tv < 0 { return -1 }
+  if exprString(tv, fnIx) { return 3 }
+  if exprStringArray(tv, fnIx) { return 7 }
+  if exprF64Array(tv, fnIx) { return 12 }
+  if exprRefArray(tv, fnIx) { return 5 }
+  if exprArray(tv, fnIx) { return 2 }
+  if structIndexOfExpr(tv, fnIx) >= 0 { return 1 }
+  // An object LITERAL arm in a struct-typed CONTEXT (return / binding seeds
+  // `pendingStructIdx`) — it has no self-derivable struct index.
+  const tn = P.nodes[tv]
+  if tn is ObjLit {
+    if pendingStructIdx >= 0 { return 1 }
+  }
+  -1
+}
+
+// The `fbValtype` SLOT (second arg) for a REF-typed if-expression join of `kind`: the
+// struct table index (kind 1) or the ref-list wrapper slot (kind 5); the other ref kinds
+// (string/string-list/f64-list/i32-list) ignore the slot. Prefers the pending context
+// seed (a struct/list RETURN or binding) over the then-arm's own derivation.
+function ifExprRefSlot(ifIx: i32, fnIx: i32, kind: i32) {
+  const tv = ifThenValueIx(ifIx)
+  if kind == 1 {
+    const si = structIndexOfExpr(tv, fnIx)
+    if si >= 0 { return si }
+    return pendingStructIdx
+  }
+  if kind == 5 {
+    if pendingListKind == 5 { return pendingListSlot }
+    return refListSlotOfExpr(tv, fnIx)
+  }
+  -1
+}
+
+// Lower a REF-typed if-expression join (string / struct / array) as a value-typed `if`
+// with the multi-byte `(ref $ht)` blocktype (`fbValtype`), each arm emitted in that rep.
+// Mirrors `emitIfExprAs` (narrowing save/restore, `else if` recursion) but the blocktype
+// is an interned reftype rather than a single numeric byte. The arm emitter re-seeds the
+// per-arm construction context so an `ObjLit` / list-literal arm builds the right shape.
+function emitIfExprRef(
+  body: i32[],
+  ifIx: i32,
+  fnIx: i32,
+  kind: i32,
+  slot: i32,
+) {
+  let s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse < 0 {
+      return emitFail("emitProgram: if-expression requires an else arm")
+    }
+    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    wU8(4)                // 0x04 if
+    fbValtype(kind, slot) // ref result blocktype `(ref $ht)`
+    const savedTop = narrowTop
+    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    const rcT = emitRefIfArm(body, s.ifThen, fnIx, kind, slot)
+    if narrowed { restoreNarrow(savedTop) }
+    if rcT < 0 { return -1 }
+    fbElse()              // 0x05 else
+    const savedElseTop = narrowTop
+    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
+    const els = P.nodes[s.ifElse]
+    let rc = 0
+    if els is IfStmt {
+      rc = emitIfExprRef(body, s.ifElse, fnIx, kind, slot)
+    } else {
+      rc = emitRefIfArm(body, s.ifElse, fnIx, kind, slot)
+    }
+    if narrowedElse { restoreNarrow(savedElseTop) }
+    if rc < 0 { return -1 }
+    fbEnd() // 0x0b end
+    return 0
+  }
+  emitFail("emitProgram: expected an if expression")
+}
+
+// One arm of a REF-typed if-expression: its single tail-value statement, emitted in the
+// join rep. Re-seeds `pendingStructIdx` (struct arms) / `pendingListKind`+`pendingListSlot`
+// (ref-list arms) first, since the previous arm's emit consumed the pending seed.
+function emitRefIfArm(
+  body: i32[],
+  blockIx: i32,
+  fnIx: i32,
+  kind: i32,
+  slot: i32,
+) {
+  let b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    if stmts.length == 1 {
+      if stmtIsTailValue(stmts[0], fnIx) {
+        if kind == 1 { pendingStructIdx = slot }
+        if kind == 5 {
+          pendingListKind = 5
+          pendingListSlot = slot
+        }
+        return emitExpr(body, stmts[0], fnIx)
+      }
+    }
+    return emitFail("emitProgram: if-expression arm is not a single value")
+  }
+  emitFail("emitProgram: if-expression arm is not a block")
 }
 
 // The single-byte blocktype valtype for a value-position if-expression: the widest
