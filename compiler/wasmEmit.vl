@@ -2108,10 +2108,16 @@ function mvShapeOfValName(valName: string) {
     // stored in a ref list whose element kind is 3 (a map element → the inner map struct).
     // Reuses the SAME ref-value spine as a struct-valued map; only the element heap differs.
     kind = 6
-  } else if nameIsI32Array(valName) {
-    // A LIST-valued map (`{[string]: i32[]}` / `boolean[]`): the value is an i32-list
-    // WRAPPER ref, stored in a ref list whose element kind is 4 (the i32-list wrapper, as
-    // in `i32[][]`). Same ref-value spine as a nested map; the element heap is `lTypeIdx`.
+  } else if (
+    nameIsI32Array(valName) ||
+    nameIsStringArray(valName) ||
+    nameIsF64Array(valName) ||
+    nameIsI64Array(valName)
+  ) {
+    // A LIST-valued map (`{[string]: i32[]}` / `string[]` / `f64[]` / `i64[]` / `boolean[]`):
+    // the value is a list WRAPPER ref, stored in a ref list whose element kind picks the
+    // inner list's wrapper (`refArrElemKind("<value>[]")` → 4/6/7/8). Same ref-value spine as
+    // a nested map.
     kind = 6
   } else {
     vsi = structIndexByValName(valName)
@@ -2135,6 +2141,10 @@ function mvShapeOfValName(valName: string) {
       mUsed = true
       mvShapeOfValName(mapValNameOf(valName))
     }
+    // A non-i32 LIST value forces its inner list's type so the element wrapper heap exists.
+    if nameIsStringArray(valName) { slUsed = true }
+    else if nameIsF64Array(valName) { fa64Used = true }
+    else if nameIsI64Array(valName) { ia64Used = true }
   }
   mvValName.push(valName)
   mvValKind.push(kind)
@@ -2214,7 +2224,22 @@ function mvValIsMap(slot: i32) {
 function mvValIsList(slot: i32) {
   if slot < 0 { return false }
   if mvValKind[slot] != 6 { return false }
-  rlElemKindTbl[mvRlSlot[slot]] == 4
+  const ek = rlElemKindTbl[mvRlSlot[slot]]
+  ek == 4 || ek == 6 || ek == 7 || ek == 8
+}
+
+// The list-element rep of a list-VALUED map slot — `2` i32-list (ref-list elem 4), `7`
+// string-list (elem 6), `12` f64-list (elem 7), `20` i64-list (elem 8) — or -1 if the slot's
+// value is not a list. Maps the ref-list element kind to the value list's classifier rep.
+function mvListValKind(slot: i32) {
+  if slot < 0 { return -1 }
+  if mvValKind[slot] != 6 { return -1 }
+  const ek = rlElemKindTbl[mvRlSlot[slot]]
+  if ek == 4 { return 2 }
+  if ek == 6 { return 7 }
+  if ek == 7 { return 12 }
+  if ek == 8 { return 20 }
+  -1
 }
 
 // ── scalar-list descriptor (the i32 / f64 / i64 list unification) ──────────────
@@ -6394,7 +6419,16 @@ function emitMapGetOr(
     if scalarVK >= 0 {
       if emitScalarValue(body, defIx, fnIx, scalarVK) < 0 { return -1 }
     } else {
+      // For a non-i32 LIST-valued map, hint an empty `[]` default to the value's list
+      // wrapper (`pendingListKind` 3 string / 4 f64 / 6 i64) — an unhinted `[]` defaults to
+      // the i32-list wrapper, which the `(ref null <wrapper>)` valStash would reject.
+      const savedPLK = pendingListKind
+      const lvk = mvListValKind(mslot)
+      if lvk == 7 { pendingListKind = 3 }
+      else if lvk == 12 { pendingListKind = 4 }
+      else if lvk == 20 { pendingListKind = 6 }
       if emitExpr(body, defIx, fnIx) < 0 { return -1 }
+      pendingListKind = savedPLK
     }
     cmSlot = mslot
     fbLocalSet(fnMvValStashLocal(mslot))
@@ -13309,6 +13343,15 @@ function coalesceMvSlot(exprIx: i32, fnIx: i32) {
   -1
 }
 
+// The list-element rep (2/7/12/20 — see `mvListValKind`) of a bare `m[k]` or `m[k] ?? d`
+// read over a list-VALUED map, else -1. The single classifier hook each `expr*Array` uses to
+// claim a list-valued-map read of its own element type.
+function mapReadListKind(exprIx: i32, fnIx: i32) {
+  const cm = coalesceMvSlot(exprIx, fnIx)
+  if cm >= 0 { return mvListValKind(cm) }
+  return mvListValKind(mapReadMvSlot(exprIx, fnIx))
+}
+
 // The map RECEIVER arena index of a `for v in m.keys()` / `m.values()` iterable, or -1
 // when the iterable is not a map keys/values walk. Drives the tombstone-aware skip in
 // the for-in loop (the map's `live` array is consulted per entry).
@@ -15721,6 +15764,15 @@ function mAssignTypeIndices(n: i32) {
       // An `i32[][]` slot's element is the i32-list WRAPPER (interned just above,
       // so `lTypeIdx` is already assigned).
       rlElemHeap[rs] = lTypeIdx
+    } else if (
+      rlElemKindTbl[rs] == 6 ||
+      rlElemKindTbl[rs] == 7 ||
+      rlElemKindTbl[rs] == 8
+    ) {
+      // string[][] / f64[][] / i64[][]: the element is the inner list's WRAPPER
+      // (`mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`) — but those wrappers are allocated AFTER
+      // this loop, so a second pass (below) fills these heaps once they exist.
+      rlElemHeap[rs] = 0
     } else {
       const esi = structIndexByName(rlElemName[rs])
       if esi >= 0 {
@@ -15791,6 +15843,17 @@ function mAssignTypeIndices(n: i32) {
   } else {
     ia64TypeIdx = oldIa64Idx
     il64TypeIdx = oldIa64Idx + 1
+  }
+  // Second pass: fill the NON-i32 nested-list ref-list element heaps now that the inner
+  // string/f64/i64 list wrappers exist (a `string[]`/`f64[]`/`i64[]`-VALUED map's vals
+  // ref-list — kinds 6/7/8). The wrappers are forced by `mvShapeOfValName` (slUsed / fa64Used
+  // / ia64Used), so the index is real here.
+  let rsfix = 0
+  while rsfix < rlElemName.length {
+    if rlElemKindTbl[rsfix] == 6 { rlElemHeap[rsfix] = mkListIdx }
+    else if rlElemKindTbl[rsfix] == 7 { rlElemHeap[rsfix] = fl64TypeIdx }
+    else if rlElemKindTbl[rsfix] == 8 { rlElemHeap[rsfix] = il64TypeIdx }
+    rsfix = rsfix + 1
   }
   // The function-value closure types (lambdas), interned LAST among the heap types so no
   // existing index shifts. The closure fat-pointer struct `{ code: (ref $fnsig), env:
@@ -17501,6 +17564,12 @@ function nameIsRefArray(name: string) {
 // element (`mStructIdx`, the scope-chain `{[string]:i32}[]`).
 function refArrElemKind(name: string) {
   if name == "i32[][]" { return 4 }
+  // Nested lists of a NON-i32 scalar/string element — the element is that inner list's
+  // WRAPPER (kinds 6/7/8 → `mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`). Used for a
+  // string[]/f64[]/i64[]-VALUED map's vals ref-list (the value analogue of `i32[][]` kind 4).
+  if name == "string[][]" { return 6 }
+  if name == "f64[][]" { return 7 }
+  if name == "i64[][]" { return 8 }
   if nameIsMapArray(name) { return 3 }
   // A `(string|i32)[]` value-union element list is a union-box list (kind 2).
   if parenUnionArrElemName(name) != "" { return 2 }
@@ -20308,9 +20377,9 @@ function exprArray(exprIx: i32, fnIx: i32) {
         return exprArray(e.binRight, fnIx)
       }
     }
-    // `m[k] ?? d` over a LIST-valued map (`{[string]: i32[]}`) yields the value i32 list.
+    // `m[k] ?? d` over an i32-LIST-valued map (`{[string]: i32[]}`) yields the value i32 list.
     if e.binOp == "??" {
-      if mvValIsList(coalesceMvSlot(exprIx, fnIx)) { return true }
+      if mvListValKind(coalesceMvSlot(exprIx, fnIx)) == 2 { return true }
     }
     return false
   }
@@ -20330,9 +20399,9 @@ function exprArray(exprIx: i32, fnIx: i32) {
         if rlElemKindTbl[slot] == 4 { return true }
       }
     }
-    // A bare `m[k]` over a LIST-valued map yields the value i32 list (`V | null` — the
+    // A bare `m[k]` over an i32-LIST-valued map yields the value i32 list (`V | null` — the
     // list machinery recovers non-null at the read site).
-    if mvValIsList(mapReadMvSlot(exprIx, fnIx)) { return true }
+    if mvListValKind(mapReadMvSlot(exprIx, fnIx)) == 2 { return true }
   }
   false
 }
@@ -20684,6 +20753,8 @@ function exprStringArray(exprIx: i32, fnIx: i32) {
   if tyKindOf(nodeTyIxOf(exprIx)) == 7 {
     return true // typed-IR fast path (see exprIsF64)
   }
+  // `m[k]` / `m[k] ?? d` over a string[]-VALUED map yields a string list.
+  if mapReadListKind(exprIx, fnIx) == 7 { return true }
   const e = P.nodes[exprIx]
   if e is ArrayLit { return arrLitIsStr(exprIx, fnIx) }
   if e is Paren { return exprStringArray(e.parInner, fnIx) }
@@ -20855,6 +20926,8 @@ function exprF64Array(exprIx: i32, fnIx: i32) {
   // synthesized nodes (monomorphized instance bodies) read back -1 and fall through to the
   // syntactic derivation below, so generic lowering is unaffected.
   if tyIsF64Array(nodeTyIxOf(exprIx)) { return true }
+  // `m[k]` / `m[k] ?? d` over an f64[]-VALUED map yields an f64 list.
+  if mapReadListKind(exprIx, fnIx) == 12 { return true }
   const e = P.nodes[exprIx]
   if e is ArrayLit { return arrLitIsF64(exprIx, fnIx) }
   if e is Paren { return exprF64Array(e.parInner, fnIx) }
@@ -20928,6 +21001,8 @@ function arrLitIsI64(arrIx: i32, fnIx: i32) {
 function exprI64Array(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   if tyIsI64Array(nodeTyIxOf(exprIx)) { return true }
+  // `m[k]` / `m[k] ?? d` over an i64[]-VALUED map yields an i64 list.
+  if mapReadListKind(exprIx, fnIx) == 20 { return true }
   const e = P.nodes[exprIx]
   if e is ArrayLit { return arrLitIsI64(exprIx, fnIx) }
   if e is Paren { return exprI64Array(e.parInner, fnIx) }
