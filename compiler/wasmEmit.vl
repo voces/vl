@@ -2119,6 +2119,15 @@ function mvShapeOfValName(valName: string) {
     // inner list's wrapper (`refArrElemKind("<value>[]")` → 4/6/7/8). Same ref-value spine as
     // a nested map.
     kind = 6
+  } else if (
+    nameIsRefArray(valName) &&
+    structIndexByValName(refArrElemName(valName)) >= 0
+  ) {
+    // A STRUCT-LIST-valued map (`{[string]: S[]}`): the value is a struct-list WRAPPER ref,
+    // stored in a ref list whose element is the INNER struct-list wrapper (element kind 9 —
+    // confined here so `refArrElemKind`, used broadly, is untouched). Same ref-value spine as
+    // a nested map; the read classifies as a ref list (not a Map).
+    kind = 6
   } else if isValueUnionName(valName) {
     // A VALUE-UNION-valued map (`{[string]: i32 | string}`): each value is the shared union
     // BOX ref (`uBoxIdx`), stored in a ref list whose element kind is 2 (the union box). The
@@ -2166,9 +2175,19 @@ function mvShapeOfValName(valName: string) {
     rlUsed = true
     raUsed = true
   } else if kind == 6 {
-    // The vals are a ref list whose element is the inner map struct (kind 3) or i32-list
-    // wrapper (kind 4) — `refArrElemKind("<value>[]")` picks it (`{[…]}[]` → 3, `i32[][]` → 4).
-    mvRlSlot.push(rlInternName(valName, refArrElemKind(valName + "[]")))
+    // The vals are a ref list whose element is the inner map struct (kind 3), i32-list wrapper
+    // (kind 4 — `refArrElemKind("<value>[]")` picks it), or — for a STRUCT-LIST value (`S[]`) —
+    // the inner struct-list WRAPPER (kind 9, resolved to `rlWrapIdx` of the inner `S` slot,
+    // which we intern FIRST so its index is lower for the heap-resolution pass).
+    if (
+      nameIsRefArray(valName) &&
+      structIndexByValName(refArrElemName(valName)) >= 0
+    ) {
+      rlInternName(refArrElemName(valName), 1) // the inner struct-list slot
+      mvRlSlot.push(rlInternName(valName, 9))
+    } else {
+      mvRlSlot.push(rlInternName(valName, refArrElemKind(valName + "[]")))
+    }
     rlUsed = true
     raUsed = true
   } else {
@@ -2251,6 +2270,24 @@ function mvListValKind(slot: i32) {
   if ek == 6 { return 7 }
   if ek == 7 { return 12 }
   if ek == 8 { return 20 }
+  if ek == 9 {
+    return 5 // struct-list value → a ref list
+  }
+  -1
+}
+
+// The mv slot of a `m[k]` / `m[k] ?? d` read over a struct-LIST-valued map (the value is a
+// struct list, element kind 9), else -1. The hook `refListElemNameOfExpr` uses to name the
+// read's element (the inner struct), so `(m[k] ?? []).length` / `[i].field` resolve.
+function mapReadStructListMvSlot(exprIx: i32, fnIx: i32) {
+  const cm = coalesceMvSlot(exprIx, fnIx)
+  if cm >= 0 {
+    if mvListValKind(cm) == 5 { return cm }
+  }
+  const mr = mapReadMvSlot(exprIx, fnIx)
+  if mr >= 0 {
+    if mvListValKind(mr) == 5 { return mr }
+  }
   -1
 }
 
@@ -6438,6 +6475,16 @@ function emitMapGetOr(
     } else if mslot >= 0 && mvValKind[mslot] == 2 {
       // A UNION-valued map's default is coerced into the shared box, like a stored value.
       if emitUnionCoerce(body, mvValName[mslot], defIx, fnIx) < 0 { return -1 }
+    } else if mslot >= 0 && mvListValKind(mslot) == 5 {
+      // A STRUCT-LIST value: hint an empty `[]` default to an empty ref list of the inner
+      // struct (`pendingListKind` 1 = struct-element, `pendingListSlot` the inner slot).
+      const savedSK = pendingListKind
+      const savedSS = pendingListSlot
+      pendingListKind = 1
+      pendingListSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
+      if emitExpr(body, defIx, fnIx) < 0 { return -1 }
+      pendingListKind = savedSK
+      pendingListSlot = savedSS
     } else {
       // For a non-i32 LIST-valued map, hint an empty `[]` default to the value's list
       // wrapper (`pendingListKind` 3 string / 4 f64 / 6 i64) — an unhinted `[]` defaults to
@@ -15803,6 +15850,10 @@ function mAssignTypeIndices(n: i32) {
       // (`mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`) — but those wrappers are allocated AFTER
       // this loop, so a second pass (below) fills these heaps once they exist.
       rlElemHeap[rs] = 0
+    } else if rlElemKindTbl[rs] == 9 {
+      // A struct-LIST value (`S[]`): the element is the inner struct-list WRAPPER, the ref-list
+      // wrapper of the inner `S` slot (interned at a LOWER index, so its `rlWrapIdx` is set).
+      rlElemHeap[rs] = rlWrapIdx[rlSlotByName(refArrElemName(rlElemName[rs]))]
     } else {
       const esi = structIndexByName(rlElemName[rs])
       if esi >= 0 {
@@ -20527,6 +20578,8 @@ function exprRefArray(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is ArrayLit { return arrLitIsRef(exprIx) }
   if e is Paren { return exprRefArray(e.parInner, fnIx) }
+  // `m[k]` / `m[k] ?? d` over a struct-LIST-valued map yields a struct ref list.
+  if mapReadListKind(exprIx, fnIx) == 5 { return true }
   if e is Call {
     // `__array_new__(n, {…})` builds a ref list of the element struct (kind 3).
     if arrNewIntrKind(exprIx, fnIx) == 3 { return true }
@@ -20620,6 +20673,9 @@ function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is ArrayLit { return arrLitElemName(exprIx) }
   if e is Paren { return refListElemNameOfExpr(e.parInner, fnIx) }
+  // `m[k]` / `m[k] ?? d` over a struct-LIST-valued map — the element is the value's struct.
+  const slsMv = mapReadStructListMvSlot(exprIx, fnIx)
+  if slsMv >= 0 { return refArrElemName(mvValName[slsMv]) }
   if e is Call {
     // `__array_new__(n, {…})` — the ref-list element name is the fill's struct.
     if arrNewIntrKind(exprIx, fnIx) == 3 {
