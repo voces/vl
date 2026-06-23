@@ -22720,6 +22720,51 @@ function monoArgTyName(ix: i32, fnIx: i32) {
     }
     return ""
   }
+  // A CALL ARGUMENT whose callee has a CONCRETE return annotation takes that annotation as
+  // its type. Needed for a generic call used as an argument (`box(box(7))`): `monoWalk`
+  // instantiates the inner call FIRST, but during monomorphization the instance's `fRet*` /
+  // struct tables are not built yet (buildFnMap is post-mono), so `exprStruct` /
+  // `structIndexOfExpr` cannot classify it and the type param would wrongly default to i32.
+  // Reading the instance's (already-substituted) return annotation resolves the nested bind.
+  const argN = P.nodes[unwrapParen(ix)]
+  if argN is Call {
+    const argCallee = P.nodes[argN.callFn]
+    if argCallee is Ident {
+      const acfe = fnIndexOf(argCallee.identName)
+      if acfe >= 0 {
+        const acfn = P.nodes[fnStmts[acfe]]
+        if acfn is FuncDecl {
+          if acfn.fnRet >= 0 {
+            const arn = tyNameOf(acfn.fnRet)
+            if arn != "" && !monoAnnHasTyParam(arn, acfn.fnTyParams) {
+              return arn
+            }
+          }
+        }
+      }
+    }
+  }
+  // An IDENT argument bound to a generic-call result (`const inner = box(7); box(inner)`):
+  // resolve via its un-annotated `let` INIT, since the local's type table isn't built during
+  // monomorphization either. Only adopt a resolved non-i32 type (an i32 local takes the i32
+  // default below anyway); a param / non-let ident has no `parentLetOf` and falls through.
+  if argN is Ident {
+    if fnIx >= 0 {
+      const ctxFn = P.nodes[fnIx]
+      if ctxFn is FuncDecl {
+        const li = parentLetOf(ctxFn.fnBody, argN.identName)
+        if li >= 0 {
+          const ld = P.nodes[li]
+          if ld is LetDecl {
+            if ld.letType < 0 && ld.letInit >= 0 {
+              const innerTy = monoArgTyName(ld.letInit, fnIx)
+              if innerTy != "" && innerTy != "i32" { return innerTy }
+            }
+          }
+        }
+      }
+    }
+  }
   if exprString(ix, fnIx) { return "string" }
   if exprStringArray(ix, fnIx) { return "string[]" }
   if exprF64Array(ix, fnIx) { return "f64[]" }
