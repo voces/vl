@@ -2472,6 +2472,24 @@ function isBoolLitExpr(ix: i32) {
   false
 }
 
+// True if `dstTy` has an f32 POSITION a float literal can re-encode into: a bare `f32`, a
+// nullable `f32?` (the inner), or any f32 member of a union (recursively).
+function dstAdmitsF32(dstTy: i32) {
+  if dstTy < 0 { return false }
+  if primNameOf(dstTy) == "f32" { return true }
+  const t = T.tys[dstTy]
+  if t is TyNullable { return dstAdmitsF32(t.nInner) }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if dstAdmitsF32(t.uMembers[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
 // True if `dstTy` is `f32[]` (an array whose element is f32).
 function isF32ArrayDst(dstTy: i32) {
   if dstTy < 0 { return false }
@@ -2500,8 +2518,11 @@ function isFloatLitArrayExpr(ix: i32) {
 
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if assignable(srcTy, dstTy) { return true }
-  if primNameOf(dstTy) == "f32" {
-    if isFloatLitExpr(srcExpr) { return true }
+  // A float literal re-encodes EXACTLY at f32, so it flows into any destination whose f32
+  // position it fits: a bare `f32`, a nullable `f32?` (a map value / niche), or an f32 MEMBER
+  // of a union (`f32 | string`). An arbitrary f64 VALUE is NOT covered (that is a lossy demote).
+  if isFloatLitExpr(srcExpr) {
+    if dstAdmitsF32(dstTy) { return true }
   }
   // A float-literal array → `f32[]` (the array analogue of the scalar float-literal→f32 rule).
   if isF32ArrayDst(dstTy) {
@@ -6432,7 +6453,14 @@ function checkNodeReal(ix: i32) {
     // LHS just yields itself.
     if op == "??" {
       const lt2 = T.tys[lt]
-      if lt2 is TyNullable { return joinTys(lt2.nInner, rt) }
+      if lt2 is TyNullable {
+        // A float-literal default re-encodes at an inner `f32`, so keep the result f32 — else
+        // `joinTys` widens `f32 + f64` to f64 and a downstream `f32` slot rejects the demote.
+        if primNameOf(lt2.nInner) == "f32" && isFloatLitExpr(n.binRight) {
+          return lt2.nInner
+        }
+        return joinTys(lt2.nInner, rt)
+      }
       return lt
     }
     // Equality: result bool; requires mutual compatibility.
