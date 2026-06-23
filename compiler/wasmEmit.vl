@@ -4892,6 +4892,36 @@ function emitUnionCoerce(
   0
 }
 
+// Coerce an expression into a union-BOX position whose wasm rep is `(ref $uBox)` — a call
+// ARGUMENT to a union param, or a RETURN where the return type is the union. A concrete
+// VARIANT-struct VALUE (`s: S` passed to a `C | S` param, or returned from a `: C | S`
+// function) is a raw `(ref $variant)`: a struct that is a union member is itself allocated as
+// a kind-8 variant local (so it narrows in place), but that raw ref does NOT match the boxed
+// param/return rep — passing / returning it was invalid wasm ("expected (ref $type), found
+// (ref $type)"). Box the existing variant ref into the shared `{tag, payload}` rep, exactly
+// as `emitUnionBox` boxes a struct LITERAL (the variant ref IS the payload type the box wants,
+// so no field copy is needed). Every other shape — a struct literal, a passed-through union
+// value, a scalar atom — defers to `emitUnionCoerce`. This wrapper is used ONLY at box-typed
+// positions; a let-init to a union-annotated-but-variant-init local stays a raw kind-8 variant
+// and keeps calling `emitUnionCoerce` directly (it must NOT box).
+function emitUnionBoxArg(
+  body: i32[],
+  unionName: string,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  if !exprUnion(exprIx, fnIx) {
+    const svi = exprVariantIndex(exprIx, fnIx)
+    if svi >= 0 {
+      fbI32Const(uTags[svi]) // 0x41 i32.const <variant tag> (program-global)
+      if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+      fbStructNew(uBoxIdx) // { tag, variant-ref }
+      return 0
+    }
+  }
+  emitUnionCoerce(body, unionName, exprIx, fnIx)
+}
+
 // Lower an if-EXPRESSION whose VALUE is a union (`if c { A } else { B }` in a union return /
 // coerce position) as a value-typed `if` with the union BOX result type, each arm
 // union-coerced (`emitUnionCoerce`). Mirrors `emitIfExprAs` (narrowing save/restore, `else
@@ -11486,7 +11516,9 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           i = i + 1
         } else {
           if cUNm != "" {
-            if emitUnionCoerce(body, cUNm, args[i], fnIx) < 0 { return -1 }
+            // `cUNm` is set only for a kind-4 union-BOX param (see above), so a concrete
+            // variant ARGUMENT (`area(s)` where `s: S`, param `C | S`) is boxed here.
+            if emitUnionBoxArg(body, cUNm, args[i], fnIx) < 0 { return -1 }
           } else {
             const savedCNB = pendingNulBool
             const savedCNS = pendingNulString
@@ -11796,7 +11828,16 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       // passes through unchanged. Value first, then store it into the slot.
       const aUNm = unionNameOfIdent(target.identName, fnIx)
       if aUNm != "" {
-        if emitUnionCoerce(body, aUNm, a.binRight, fnIx) < 0 { return -1 }
+        // A kind-4 union-BOX local boxes a concrete variant RHS (`u = s` where `u: C | S`,
+        // `s: S`), exactly like a call arg / return — `emitUnionBoxArg` boxes a variant and
+        // defers every other shape to `emitUnionCoerce`. A kind-8 variant-init local (`let u:
+        // C | S = someVariant`) keeps the RAW variant rep, so it must NOT box — use the plain
+        // coerce there.
+        if declaredKind(target.identName) == 4 {
+          if emitUnionBoxArg(body, aUNm, a.binRight, fnIx) < 0 { return -1 }
+        } else {
+          if emitUnionCoerce(body, aUNm, a.binRight, fnIx) < 0 { return -1 }
+        }
       } else if exprIsI64(a.binLeft, fnIx) {
         // An i64 target (`x = 0` over `let x: i64`) widens an i32 RHS to i64 — without this the
         // bare `i32.const` clashes with the i64 slot (the checker accepts the assignment, so it
@@ -13752,7 +13793,9 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   } else if retVi >= 0 {
     if emitVariantCoerce(body, retVi, retArg, fnIx) < 0 { return -1 }
   } else if retUNm != "" {
-    if emitUnionCoerce(body, retUNm, retArg, fnIx) < 0 { return -1 }
+    // `retUNm` is the union-BOX return (kind 4); a concrete variant `return s` (where `s: S`
+    // and the return type is `C | S`) is boxed into the shared `{tag, payload}` rep here.
+    if emitUnionBoxArg(body, retUNm, retArg, fnIx) < 0 { return -1 }
   } else {
     const savedRNB = pendingNulBool
     const savedRNS = pendingNulString
