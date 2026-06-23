@@ -2,7 +2,7 @@ import { Diag, Tok } from "./ast"
 import { advance, gSrc, mkTok, scanQuoted } from "./lexer"
 import { accept, parseExpr, parseProgram, parseStmt, parseType, parseTypeName } from "./parser"
 import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, nodeTyIsUnion, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
-import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkBlock, mkCall, mkCallN, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkLet, mkMember, mkParam, mkParen, mkReturn, mkStr, mkTypeRef, mkWhile, orderArgsByParamNames, ufcsAliasOf } from "./ast"
+import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkBlock, mkCall, mkCallN, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkLet, mkMember, mkIndex, mkArrayLit, mkNum, mkParam, mkParen, mkReturn, mkStr, mkTypeRef, mkWhile, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 // VL-in-VL wasm emitter — self-hosted codegen spike.
 //
 // A `.vl` program that produces RAW WebAssembly *bytes* for a minimal but valid
@@ -24077,6 +24077,333 @@ function synthParamAnnots() {
   0
 }
 
+// ── captured-MUTATION boxing ──────────────────────────────────────────────────────────────
+// Closures capture by VALUE (the env struct copies each captured local), so a local MUTATED
+// inside a closure cannot be reflected back — and a bare `c = …` in the closure has no local
+// slot, failing at emit ("assignment target is not a parameter, local, or global"). The fix is
+// a pure AST rewrite, done before monomorphization so instances inherit it: a captured-mutated
+// local is boxed as a LENGTH-1 ARRAY (a shared heap ref both scopes index). `let c = init`
+// becomes `let c = [init]`, and EVERY use of `c` (read OR assignment target) becomes `c[0]`, so
+// the closure's `c = c + 1` lowers to the indexed write `c[0] = c[0] + 1` into the shared array,
+// visible in the maker. Arrays are already capturable + index-assignable through a closure.
+//
+// Conservative: only a DIRECT `let` of the maker that is assigned INSIDE a nested lambda and is
+// NOT shadowed by any nested binding (param / let / loop var) is boxed. Anything else is left
+// untouched, falling back to the existing loud error rather than risking a mis-rewrite.
+
+// One scan of a maker body: `dlets` = the maker's own `let` names (depth 0); `alam` = names
+// ASSIGNED inside a nested lambda (depth > 0); `ndecls` = every binding declared inside a nested
+// lambda (params / lets / loop vars) — the shadow set.
+function cboxScan(
+  ix: i32,
+  depth: i32,
+  dlets: string[],
+  alam: string[],
+  ndecls: string[],
+) {
+  if ix < 0 { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    const ps = n.fnParams
+    let pi = 0
+    while pi < ps.length {
+      const p = P.nodes[ps[pi]]
+      if p is Param {
+        if !capHas(ndecls, p.parName) { ndecls.push(p.parName) }
+      }
+      pi = pi + 1
+    }
+    return cboxScan(n.fnBody, depth + 1, dlets, alam, ndecls)
+  }
+  if n is LetDecl {
+    if depth == 0 {
+      if !capHas(dlets, n.letName) { dlets.push(n.letName) }
+    } else {
+      if !capHas(ndecls, n.letName) { ndecls.push(n.letName) }
+    }
+    return cboxScan(n.letInit, depth, dlets, alam, ndecls)
+  }
+  if n is Block {
+    const bs = n.blkStmts
+    let i = 0
+    while i < bs.length {
+      cboxScan(bs[i], depth, dlets, alam, ndecls)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is BinExpr {
+    if n.binOp == "=" {
+      if depth > 0 {
+        const t = P.nodes[n.binLeft]
+        if t is Ident {
+          if !capHas(alam, t.identName) { alam.push(t.identName) }
+        }
+      }
+    }
+    cboxScan(n.binLeft, depth, dlets, alam, ndecls)
+    return cboxScan(n.binRight, depth, dlets, alam, ndecls)
+  }
+  if n is IfStmt {
+    cboxScan(n.ifCond, depth, dlets, alam, ndecls)
+    cboxScan(n.ifThen, depth, dlets, alam, ndecls)
+    return cboxScan(n.ifElse, depth, dlets, alam, ndecls)
+  }
+  if n is WhileStmt {
+    cboxScan(n.whileCond, depth, dlets, alam, ndecls)
+    return cboxScan(n.whileBody, depth, dlets, alam, ndecls)
+  }
+  if n is ForRange {
+    if !capHas(ndecls, n.frVar) { ndecls.push(n.frVar) }
+    cboxScan(n.frFrom, depth, dlets, alam, ndecls)
+    cboxScan(n.frTo, depth, dlets, alam, ndecls)
+    cboxScan(n.frStep, depth, dlets, alam, ndecls)
+    return cboxScan(n.frBody, depth, dlets, alam, ndecls)
+  }
+  if n is ForIn {
+    if !capHas(ndecls, n.fiVar) { ndecls.push(n.fiVar) }
+    cboxScan(n.fiIter, depth, dlets, alam, ndecls)
+    return cboxScan(n.fiBody, depth, dlets, alam, ndecls)
+  }
+  if n is RetStmt { return cboxScan(n.retArg, depth, dlets, alam, ndecls) }
+  if n is Unary { return cboxScan(n.unArg, depth, dlets, alam, ndecls) }
+  if n is Paren { return cboxScan(n.parInner, depth, dlets, alam, ndecls) }
+  if n is Member { return cboxScan(n.memObj, depth, dlets, alam, ndecls) }
+  if n is OptMember { return cboxScan(n.omObj, depth, dlets, alam, ndecls) }
+  if n is Index {
+    cboxScan(n.idxArr, depth, dlets, alam, ndecls)
+    return cboxScan(n.idxIndex, depth, dlets, alam, ndecls)
+  }
+  if n is IsExpr { return cboxScan(n.isObj, depth, dlets, alam, ndecls) }
+  if n is Call {
+    cboxScan(n.callFn, depth, dlets, alam, ndecls)
+    const args = n.callArgs
+    let ci = 0
+    while ci < args.length {
+      cboxScan(args[ci], depth, dlets, alam, ndecls)
+      ci = ci + 1
+    }
+    return 0
+  }
+  if n is ArrayLit {
+    const es = n.arrElems
+    let ei = 0
+    while ei < es.length {
+      cboxScan(es[ei], depth, dlets, alam, ndecls)
+      ei = ei + 1
+    }
+    return 0
+  }
+  if n is ObjLit {
+    const fs = n.objFields
+    let fi = 0
+    while fi < fs.length {
+      const f = P.nodes[fs[fi]]
+      if f is FieldInit { cboxScan(f.fiValue, depth, dlets, alam, ndecls) }
+      fi = fi + 1
+    }
+    return 0
+  }
+  0
+}
+
+// Rewrite the maker body (and its nested lambda bodies): a USE of a boxed name → `c[0]`, and a
+// boxed `let c = init` → `let c = [init]`. Returns the (possibly replaced) node index so parents
+// reassign — mirrors `drwWalk`, plus descending into `FuncDecl` bodies.
+function cboxWalk(ix: i32, boxed: string[]) {
+  if ix < 0 { return ix }
+  let n = P.nodes[ix]
+  if n is Ident {
+    if capHas(boxed, n.identName) {
+      return mkIndex(mkIdent(n.identName, -1), mkNum("0", -1), -1)
+    }
+    return ix
+  }
+  if n is FuncDecl {
+    n.fnBody = cboxWalk(n.fnBody, boxed)
+    return ix
+  }
+  if n is Block {
+    const bs = n.blkStmts
+    let i = 0
+    while i < bs.length {
+      bs[i] = cboxWalk(bs[i], boxed)
+      i = i + 1
+    }
+    return ix
+  }
+  if n is LetDecl {
+    n.letInit = cboxWalk(n.letInit, boxed)
+    if capHas(boxed, n.letName) {
+      const els: i32[] = []
+      els.push(n.letInit)
+      n.letInit = mkArrayLit(els, -1)
+    }
+    return ix
+  }
+  if n is BinExpr {
+    n.binLeft = cboxWalk(n.binLeft, boxed)
+    n.binRight = cboxWalk(n.binRight, boxed)
+    return ix
+  }
+  if n is IfStmt {
+    n.ifCond = cboxWalk(n.ifCond, boxed)
+    n.ifThen = cboxWalk(n.ifThen, boxed)
+    n.ifElse = cboxWalk(n.ifElse, boxed)
+    return ix
+  }
+  if n is WhileStmt {
+    n.whileCond = cboxWalk(n.whileCond, boxed)
+    n.whileBody = cboxWalk(n.whileBody, boxed)
+    return ix
+  }
+  if n is ForRange {
+    n.frFrom = cboxWalk(n.frFrom, boxed)
+    n.frTo = cboxWalk(n.frTo, boxed)
+    n.frStep = cboxWalk(n.frStep, boxed)
+    n.frBody = cboxWalk(n.frBody, boxed)
+    return ix
+  }
+  if n is ForIn {
+    n.fiIter = cboxWalk(n.fiIter, boxed)
+    n.fiBody = cboxWalk(n.fiBody, boxed)
+    return ix
+  }
+  if n is RetStmt {
+    n.retArg = cboxWalk(n.retArg, boxed)
+    return ix
+  }
+  if n is Unary {
+    n.unArg = cboxWalk(n.unArg, boxed)
+    return ix
+  }
+  if n is Paren {
+    n.parInner = cboxWalk(n.parInner, boxed)
+    return ix
+  }
+  if n is Member {
+    n.memObj = cboxWalk(n.memObj, boxed)
+    return ix
+  }
+  if n is OptMember {
+    n.omObj = cboxWalk(n.omObj, boxed)
+    return ix
+  }
+  if n is Index {
+    n.idxArr = cboxWalk(n.idxArr, boxed)
+    n.idxIndex = cboxWalk(n.idxIndex, boxed)
+    return ix
+  }
+  if n is IsExpr {
+    n.isObj = cboxWalk(n.isObj, boxed)
+    return ix
+  }
+  if n is Call {
+    n.callFn = cboxWalk(n.callFn, boxed)
+    const args = n.callArgs
+    let ci = 0
+    while ci < args.length {
+      args[ci] = cboxWalk(args[ci], boxed)
+      ci = ci + 1
+    }
+    return ix
+  }
+  if n is ArrayLit {
+    const es = n.arrElems
+    let ei = 0
+    while ei < es.length {
+      es[ei] = cboxWalk(es[ei], boxed)
+      ei = ei + 1
+    }
+    return ix
+  }
+  if n is ObjLit {
+    const fs = n.objFields
+    let fi = 0
+    while fi < fs.length {
+      const f = P.nodes[fs[fi]]
+      if f is FieldInit { f.fiValue = cboxWalk(f.fiValue, boxed) }
+      fi = fi + 1
+    }
+    return ix
+  }
+  return ix
+}
+
+// The INIT of the maker's direct `let name` (searching statements, NOT descending into a nested
+// lambda or an expression), or -1. Used to gate boxing on a known element type.
+function cboxInitOf(ix: i32, name: string) {
+  if ix < 0 { return -1 }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letName == name { return n.letInit }
+    return -1
+  }
+  if n is Block {
+    const bs = n.blkStmts
+    let i = 0
+    while i < bs.length {
+      const r = cboxInitOf(bs[i], name)
+      if r >= 0 { return r }
+      i = i + 1
+    }
+    return -1
+  }
+  if n is IfStmt {
+    const rt = cboxInitOf(n.ifThen, name)
+    if rt >= 0 { return rt }
+    return cboxInitOf(n.ifElse, name)
+  }
+  if n is WhileStmt { return cboxInitOf(n.whileBody, name) }
+  if n is ForRange { return cboxInitOf(n.frBody, name) }
+  if n is ForIn { return cboxInitOf(n.fiBody, name) }
+  -1
+}
+
+// True if `initIx` is an i32 INTEGER literal — the element type a boxed capture is restricted to
+// for now. A non-i32 captured-mutated local (string / f64 / i64 / struct list) would box into a
+// list whose element type the CLOSURE cannot yet classify off the captured env field, so it is
+// left to the existing loud error rather than mis-lowered. Covers the counter/accumulator case.
+function cboxInitIsI32(initIx: i32) {
+  if initIx < 0 { return false }
+  const n = P.nodes[initIx]
+  if n is NumLit {
+    if numTextIsFloat(n.numText) { return false }
+    return numLexFitsI32(n.numText)
+  }
+  false
+}
+
+// Per top-level function: box each direct `let` that is assigned inside a nested lambda and not
+// shadowed (and, for now, has an i32 integer init). Usage-gated — a program with no such local
+// rewrites nothing (identical bytes).
+function captureBoxRewrite(stmts: i32[]) {
+  let fe = 0
+  while fe < fnStmts.length {
+    const fn = P.nodes[fnStmts[fe]]
+    if fn is FuncDecl {
+      const dlets: string[] = []
+      const alam: string[] = []
+      const ndecls: string[] = []
+      cboxScan(fn.fnBody, 0, dlets, alam, ndecls)
+      const boxed: string[] = []
+      let di = 0
+      while di < dlets.length {
+        const nm = dlets[di]
+        if capHas(alam, nm) {
+          if !capHas(ndecls, nm) {
+            if cboxInitIsI32(cboxInitOf(fn.fnBody, nm)) { boxed.push(nm) }
+          }
+        }
+        di = di + 1
+      }
+      if boxed.length > 0 { fn.fnBody = cboxWalk(fn.fnBody, boxed) }
+    }
+    fe = fe + 1
+  }
+  0
+}
+
 export function emitProgram(rootIx: i32) {
   emitFailed = false
   emitErr = ""
@@ -24113,6 +24440,10 @@ export function emitProgram(rootIx: i32) {
     // already handle. Must run BEFORE monomorphization so a rewritten call
     // instantiates per receiver shape. Usage-gated: no such shape → no rewrite.
     dispatchRewrite(stmts)
+    // Box captured-MUTATION locals as shared length-1 arrays (a closure mutating a captured
+    // local needs a shared cell — captures are by-value). Runs BEFORE monomorphization so
+    // instances inherit the rewrite; usage-gated → identical bytes when nothing is boxed.
+    captureBoxRewrite(stmts)
     // Monomorphize: resolve every direct call to a generic (`<T>` / un-annotated
     // param) function into a concretely-annotated instance (cloned per distinct
     // call shape, host `instantiate` parity) BEFORE signatures and types are
