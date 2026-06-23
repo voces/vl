@@ -7289,9 +7289,18 @@ function emitMapSetV(
     if emitUnionBoxArg(body, mvValName[mslot], valIx, fnIx) < 0 { return -1 }
     cmSlot = mslot
   } else {
+    // Seed a non-i32 scalar-LIST value's inner list kind (as the append path / `?? default`
+    // read do) so an overwrite `m[k] = [1,2,3]` builds the i64/f64/string list wrapper, not
+    // the default i32-list that would mismatch the typed element slot.
+    const savedPLK = pendingListKind
+    const lvk = mvListValKind(mslot)
+    if lvk == 7 { pendingListKind = 3 }
+    else if lvk == 12 { pendingListKind = 4 }
+    else if lvk == 20 { pendingListKind = 6 }
     if emitExpr(body, valIx, fnIx) < 0 {
       return -1 // value
     }
+    pendingListKind = savedPLK
     cmSlot = mslot
   }
   fbArraySet(cmValsBack()) // array.set
@@ -7477,7 +7486,19 @@ function emitMapPushValV(
     if emitUnionBoxArg(body, mvValName[mslot], valIx, fnIx) < 0 { return -1 }
     cmSlot = mslot
   } else {
+    // A non-i32 scalar-LIST value (`{[string]: i64[]}` / `f64[]` / `string[]`): seed the
+    // inner list kind so a bare `[1,2,3]` / empty `[]` literal builds the value's list
+    // wrapper, not the default i32-list (whose `(ref $lTypeIdx)` mismatches the typed `(ref
+    // null <wrapper>)` element slot) — mirrors the `?? default` READ seeding. Bare integers
+    // default to i32, so an i64-list in particular needs this; f64/string self-identify by
+    // literal, but seeding is harmless and fixes their empty-`[]` store too.
+    const savedPLK = pendingListKind
+    const lvk = mvListValKind(mslot)
+    if lvk == 7 { pendingListKind = 3 }
+    else if lvk == 12 { pendingListKind = 4 }
+    else if lvk == 20 { pendingListKind = 6 }
     if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+    pendingListKind = savedPLK
     cmSlot = mslot
   }
   if mslot >= 0 {
@@ -24916,7 +24937,12 @@ export function emitProgram(rootIx: i32) {
       // import — harmless, and never the case for the existing byte-identical goldens,
       // none of which name `i64`.)
       if pn is TypeRef {
-        if pn.tyName == "i64" { sawI64Ann = true }
+        // ANY annotation mentioning i64 — bare `i64`, `i64[]`, an `i64 | …` value union, a
+        // `{[…]: i64}` map — implies an i64 value may be printed; pull in the `__print_i64__`
+        // import (an over-approximation, harmless if unused; no existing golden names i64).
+        // Without the union/array forms a `print(u)` over `u: i64 | string` narrowed to i64
+        // routed `fbCall(4)` to a non-existent import — invalid wasm.
+        if strContains(pn.tyName, "i64") { sawI64Ann = true }
         if pn.tyName == "f64" { sawF64 = true }
         // ANY annotation mentioning f32 — bare `f32`, `f32[]`, an `f32 | …` union, a `{[…]:
         // f32}` map — implies an f32 value may be printed; pull in the f32 print import (an
