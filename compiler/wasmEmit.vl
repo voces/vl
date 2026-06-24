@@ -5845,11 +5845,15 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       // already-union value passes through to its existing boxing.
       let elemUnionNm = ""
       if rlElemKindTbl[rslot] == 2 { elemUnionNm = rlElemName[rslot] }
+      // A nested LIST element kind (`i32[][]` 4 / `string[][]` 6 / `f64[][]` 7 / `i64[][]` 8):
+      // the elements ARE arrays. Kind 4 builds the default i32-list; 6/7/8 seed the inner list
+      // kind (`pendingListKind` 3 string / 4 f64 / 6 i64) so a bare `["a"]` / `[1.0]` / `[1,2]`
+      // element builds the right list, not the default i32-list.
+      const elemNest = rlElemKindTbl[rslot]
       let i = 0
       while i < elems.length {
-        // An `i32[][]` literal's elements ARE arrays (each lowers to the normal
-        // i32-list literal, yielding the `(ref $lTypeIdx)` element value).
-        if rlElemKindTbl[rslot] != 4 {
+        // A NON-nested-list element list must not hold array elements.
+        if (elemNest != 4 && elemNest != 6 && elemNest != 7 && elemNest != 8) {
           if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
             return emitFail("emitProgram: nested arrays are not supported")
           }
@@ -5863,7 +5867,17 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
             return -1
           }
         } else {
+          // Reset `pendingListKind` to the INNER list's kind so the element builds the right
+          // list, NOT the outer ref-list kind it would otherwise inherit (kind 4 i32 → 0, so a
+          // `[1,2]` inner of an `i32[][]` is an i32-list, not forced to a ref-list — the bug the
+          // `pendingListKind == 1` isRefLit force introduced for nested i32 arrays).
+          const savedNest = pendingListKind
+          if elemNest == 4 { pendingListKind = 0 }
+          else if elemNest == 6 { pendingListKind = 3 }
+          else if elemNest == 7 { pendingListKind = 4 }
+          else if elemNest == 8 { pendingListKind = 6 }
           if emitExpr(body, elems[i], fnIx) < 0 { return -1 }
+          pendingListKind = savedNest
         }
         pendingVariantIdx = -1
         i = i + 1
@@ -18011,6 +18025,13 @@ function nameIsRefArray(name: string) {
   // (element kind 4) — the existing ref-pair machinery serves it; only the
   // element heap type differs (`lTypeIdx`).
   if name == "i32[][]" { return true }
+  // A nested NON-i32 scalar / string 2D array (`i64[][]` / `f64[][]` / `string[][]`): the
+  // element is the inner list's WRAPPER (kinds 8 / 7 / 6 — the same the LIST-valued map vals
+  // ref-list uses). `refArrElemKind` already maps these names; recognize them here so a direct
+  // 2D array (not only a map value) is a supported ref list.
+  if name == "i64[][]" || name == "f64[][]" || name == "string[][]" {
+    return true
+  }
   // A `(string|i32)[]` annotation — a VALUE-union element list. The element
   // slots hold the same `{tag, value}` boxes a bare union binding does (the
   // host stores the coerced union value), so it is a kind-2 ref list.
@@ -18439,6 +18460,15 @@ function collectA(stmts: i32[]) {
           lUsed = true
           aUsed = true
         }
+        // A nested NON-i32 scalar / string 2D array (`string[][]`/`f64[][]`/`i64[][]`, element
+        // kinds 6/7/8) forces its INNER list's backing+wrapper, as the LIST-valued map path
+        // does — else the element wrapper heap (`mkListIdx`/`fl64`/`il64`) is never allocated.
+        if refArrElemKind(nd.tyName) == 6 {
+          slUsed = true
+          aUsed = true
+        }
+        if refArrElemKind(nd.tyName) == 7 { fa64Used = true }
+        if refArrElemKind(nd.tyName) == 8 { ia64Used = true }
         if nameIsMapArray(nd.tyName) {
           mUsed = true
           lUsed = true
@@ -18592,6 +18622,11 @@ function arrLitElemName(arrIx: i32) {
 // name. Mirrors `refArrElemKind` but yields the table key.
 function refArrElemName(name: string) {
   if name == "i32[][]" { return "i32[]" }
+  // A nested NON-i32 scalar / string 2D array — the inner list's name is the slot key (kind
+  // 8 / 7 / 6 element), mirroring `i32[][]` → `i32[]`.
+  if name == "i64[][]" { return "i64[]" }
+  if name == "f64[][]" { return "f64[]" }
+  if name == "string[][]" { return "string[]" }
   if nameIsMapArray(name) { return name.slice(0, name.length - 2) }
   // `(string|i32)[]` → `string|i32` (the parens are annotation grouping only —
   // the TABLE key is the bare atom-set name every other union position uses).
@@ -21425,6 +21460,16 @@ function exprStringArray(exprIx: i32, fnIx: i32) {
   if e is Member {
     if memFieldTypeCode(exprIx, fnIx) == 6 { return true }
   }
+  // `g[i]` over a `string[][]` (ref-list element kind 6 — the inner string-list wrapper)
+  // yields a `string[]`, so `g[i][j]` reads the string element.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      let slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        if rlElemKindTbl[slot] == 6 { return true }
+      }
+    }
+  }
   false
 }
 
@@ -21590,6 +21635,16 @@ function exprF64Array(exprIx: i32, fnIx: i32) {
     }
     return false
   }
+  // `g[i]` over an `f64[][]` (ref-list element kind 7 — the inner f64-list wrapper) yields an
+  // `f64[]`, so `g[i][j]` reads the f64 scalar.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      let slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        if rlElemKindTbl[slot] == 7 { return true }
+      }
+    }
+  }
   false
 }
 
@@ -21714,6 +21769,16 @@ function exprI64Array(exprIx: i32, fnIx: i32) {
       return calleeRetKind(callee.identName, fnIx) == 20
     }
     return false
+  }
+  // `g[i]` over an `i64[][]` (ref-list element kind 8 — the inner i64-list wrapper) yields an
+  // `i64[]`, so `g[i][j]` reads the i64 scalar.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      let slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        if rlElemKindTbl[slot] == 8 { return true }
+      }
+    }
   }
   false
 }
