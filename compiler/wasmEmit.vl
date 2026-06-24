@@ -10313,6 +10313,11 @@ function ifThenValueIx(ifIx: i32) {
 function ifExprRefKind(ifIx: i32, fnIx: i32) {
   const tv = ifThenValueIx(ifIx)
   if tv < 0 { return -1 }
+  // A CLOSURE join (`if c then (x) => x + 1 else (x) => x - 1`) — kind 14, `(ref $cloStruct)`.
+  // Checked FIRST: a bare lambda arm is a function value, not a string/array/struct. Each arm
+  // emits via `emitClosureValue` (the default `emitRefIfArm` path), and the binding/return
+  // classifies as a closure (`exprIsClosure` / `fnReturnsClosure`).
+  if exprIsClosure(tv, fnIx) { return 14 }
   if exprString(tv, fnIx) { return 3 }
   if exprStringArray(tv, fnIx) { return 7 }
   if exprF64Array(tv, fnIx) { return 12 }
@@ -22524,6 +22529,13 @@ function exprIsClosure(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is Paren { return exprIsClosure(e.parInner, fnIx) }
   if e is FuncDecl { return true }
+  // An if-EXPRESSION whose branch join is a CLOSURE (`const f = if c then g else h`): the value
+  // is a closure ref, so an un-annotated binding classifies kind 14 — the THEN arm's rep (the
+  // arms agreeing by the checker), matching the `(ref $cloStruct)` `emitIfExprRef` emits.
+  if e is IfStmt {
+    const tv = ifThenValueIx(exprIx)
+    return tv >= 0 && exprIsClosure(tv, fnIx)
+  }
   if e is Ident {
     if fnIndexOf(e.identName) >= 0 { return true }
     // A closure-typed param/local (kind 14), or a NULLABLE one (kind 19) — both call via
@@ -23327,6 +23339,20 @@ function collectFnValUse() {
     }
     if nd is FieldInit {
       if exprIsBareFnName(nd.fiValue) { fnValUsed = true }
+    }
+    // A closure if-VALUE whose ARM is a bare named function (`if c then inc else dec`): the
+    // named function is used as a VALUE, so flip `fnValUsed` so its `$fnsig` interns (a lambda
+    // arm already flips it during lifting). The loop visits every `IfStmt`, so this covers a
+    // binding / return / argument if-value alike; an `else if` chain's nested `IfStmt` is its own
+    // node, visited the same way, so each arm pair is checked.
+    if nd is IfStmt {
+      if exprIsBareFnName(ifArmValueExpr(nd.ifThen)) { fnValUsed = true }
+      if nd.ifElse >= 0 {
+        const el = P.nodes[nd.ifElse]
+        if el is Block {
+          if exprIsBareFnName(ifArmValueExpr(nd.ifElse)) { fnValUsed = true }
+        }
+      }
     }
     // A SOURCE function-type ANNOTATION (`f: (i32) => i32`, a `(…)=>…` TypeRef) flips the
     // function-value machinery on — the annotated param/field/binding is a closure
