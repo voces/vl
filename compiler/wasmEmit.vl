@@ -2716,6 +2716,12 @@ function collectLocals(blockIx: i32, fnIx: i32) {
           // A CLOSURE element (`((i32) => i32)[]`): the loop var is a kind-14 closure (no struct
           // index); the `#l` temp is the ref-list WRAPPER (code 5), like the struct case.
           fiLk = 5
+        } else if fiEk == 5 {
+          // A NESTED REF array (`S[][]`): the loop var is the inner REF LIST (kind 5) carrying its
+          // ref-list slot; the `#l` temp is the OUTER ref-list wrapper (code 5).
+          const fiOuter = refListSlotOfExpr(s.fiIter, fnIx)
+          fiVarIdx = rlSlotByName(refArrElemName(rlElemName[fiOuter]))
+          fiLk = 5
         } else if fiEk == 3 {
           fiLk = 7
         } else if fiEk == 11 {
@@ -2741,7 +2747,8 @@ function collectLocals(blockIx: i32, fnIx: i32) {
           fiEk == 7 ||
           fiEk == 12 ||
           fiEk == 20 ||
-          fiEk == 14
+          fiEk == 14 ||
+          fiEk == 5
         ) {
           const fiMvs = forInMapValsSlot(s.fiIter, fnIx)
           if fiMvs >= 0 {
@@ -5906,9 +5913,22 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       // element builds the right list, not the default i32-list.
       const elemNest = rlElemKindTbl[rslot]
       let i = 0
+      // A kind-9 element is itself a REF list (`Cell[]` of `Cell[][]`, any ref leaf, any depth):
+      // its inner ref-list slot, seeded so each element builds as that inner list (recursively).
+      let nestInnerSlot = -1
+      if elemNest == 9 {
+        nestInnerSlot = rlSlotByName(refArrElemName(rlElemName[rslot]))
+      }
       while i < elems.length {
-        // A NON-nested-list element list must not hold array elements.
-        if (elemNest != 4 && elemNest != 6 && elemNest != 7 && elemNest != 8) {
+        // A NON-nested-list element list must not hold array elements. Kinds 4/6/7/8 (scalar inner
+        // lists) and 9 (ref inner list) legitimately do.
+        if (
+          elemNest != 4 &&
+          elemNest != 6 &&
+          elemNest != 7 &&
+          elemNest != 8 &&
+          elemNest != 9
+        ) {
           if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
             return emitFail("emitProgram: nested arrays are not supported")
           }
@@ -5922,17 +5942,27 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
             return -1
           }
         } else {
-          // Reset `pendingListKind` to the INNER list's kind so the element builds the right
-          // list, NOT the outer ref-list kind it would otherwise inherit (kind 4 i32 → 0, so a
-          // `[1,2]` inner of an `i32[][]` is an i32-list, not forced to a ref-list — the bug the
-          // `pendingListKind == 1` isRefLit force introduced for nested i32 arrays).
+          // Reset `pendingListKind`/`pendingListSlot` to the INNER list's kind so the element
+          // builds the right list, NOT the outer ref-list kind it would inherit. Scalar inner
+          // lists seed kind 0/3/4/6; a ref inner list (kind 9) seeds kind 5 + the inner slot, so
+          // the element builds as that ref list — which may itself be kind 9 (nesting falls out).
           const savedNest = pendingListKind
-          if elemNest == 4 { pendingListKind = 0 }
-          else if elemNest == 6 { pendingListKind = 3 }
-          else if elemNest == 7 { pendingListKind = 4 }
-          else if elemNest == 8 { pendingListKind = 6 }
+          const savedSlot = pendingListSlot
+          if elemNest == 4 {
+            pendingListKind = 0
+          } else if elemNest == 6 {
+            pendingListKind = 3
+          } else if elemNest == 7 {
+            pendingListKind = 4
+          } else if elemNest == 8 {
+            pendingListKind = 6
+          } else if elemNest == 9 {
+            pendingListKind = 5
+            pendingListSlot = nestInnerSlot
+          }
           if emitExpr(body, elems[i], fnIx) < 0 { return -1 }
           pendingListKind = savedNest
+          pendingListSlot = savedSlot
         }
         pendingVariantIdx = -1
         i = i + 1
@@ -13734,6 +13764,11 @@ function forInElemKind(iterIx: i32, fnIx: i32) {
     // read recovers the closure ref non-null (like a struct); the `#l` temp is the ref-list
     // wrapper (code 5).
     if rlElemKindTbl[rslot] == 5 { return 14 }
+    // A NESTED REF array (`S[][]`/`(C|D)[][]`/`S[][][]`, element kind 9): the loop var binds the
+    // INNER REF LIST — a kind-5 ref-list local carrying the inner slot. `for row in g { … row[j]
+    // … }` then indexes/iterates it. The element read recovers the inner wrapper non-null; the
+    // `#l` temp is the outer ref-list wrapper. Recurses (the inner slot may itself be kind 9).
+    if rlElemKindTbl[rslot] == 9 { return 5 }
     return -1
   }
   // An f64 element list (`f64[]`): the loop var binds as a scalar f64 local (code 11, the
@@ -14673,12 +14708,14 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       ek == 7 ||
       ek == 12 ||
       ek == 20 ||
-      ek == 14
+      ek == 14 ||
+      ek == 5
     ) {
       // A struct ref list (`S[]`, ek 1), a UNION-box element list (`(C|S)[]`, ek 4), a
       // NULLABLE-struct element list (`(P|null)[]`, ek 9), a CLOSURE element list
-      // (`((i32)=>i32)[]`, ek 14), or a NESTED-ARRAY (`i32[][]` etc., ek 2/7/12/20 — the loop
-      // var is the inner LIST): the wrapper/backing are THIS ref-list
+      // (`((i32)=>i32)[]`, ek 14), a NESTED-ARRAY scalar inner list (ek 2/7/12/20), or a NESTED
+      // REF array whose loop var is the inner REF LIST (`S[][]`, ek 5): the wrapper/backing are
+      // THIS ref-list
       // slot's. All recover each element non-null EXCEPT ek 9 (the nullable niche). A
       // STRUCT-VALUED map walk reads its mv slot's vals list instead.
       const fimv = forInMapValsSlot(s.fiIter, fnIx)
@@ -14767,10 +14804,12 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       ek == 7 ||
       ek == 12 ||
       ek == 20 ||
-      ek == 14
+      ek == 14 ||
+      ek == 5
     ) {
-      // string / struct / union-box / CLOSURE element, or a NESTED-ARRAY inner-list wrapper — all
-      // are a non-null ref recovered from the `(ref null <elem>)` backing slot.
+      // string / struct / union-box / CLOSURE element, a NESTED-ARRAY inner-list wrapper, or a
+      // nested-ref-array inner REF LIST (ek 5) — all are a non-null ref recovered from the
+      // `(ref null <elem>)` backing slot.
       wU8(212) // 0xd4 ref.as_non_null
     }
     fbLocalSet(vIdx)
@@ -18161,6 +18200,11 @@ function nameIsRefArray(name: string) {
   if name == "i64[][]" || name == "f64[][]" || name == "string[][]" {
     return true
   }
+  // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
+  // ITSELF a ref array. Recurses to the leaf (a struct / union / closure / scalar-2D ref array),
+  // so any DEPTH and any ref leaf falls out — the outer element's heap is the inner list's
+  // wrapper (`refArrElemKind` → 9), resolved through the recursively-interned inner slot.
+  if nameIsArray(name) && nameIsRefArray(refArrElemName(name)) { return true }
   // A `(string|i32)[]` annotation — a VALUE-union element list. The element
   // slots hold the same `{tag, value}` boxes a bare union binding does (the
   // host stores the coerced union value), so it is a kind-2 ref list.
@@ -18191,6 +18235,18 @@ function nameIsRefArray(name: string) {
 // The ref-element kind for an array type-name (assumes `nameIsRefArray(name)`):
 // `1` = a struct element, `2` = a union-box element (`uBoxIdx`), `3` = a map-struct
 // element (`mStructIdx`, the scope-chain `{[string]:i32}[]`).
+// Intern the ref-list slot whose ELEMENT type is `elemName`, recursively interning a nested
+// inner list's element slot FIRST — so the inner wrapper lands at a LOWER type index and the
+// outer element heap (`rlElemHeap`, kind 9) resolves to it. The DRY core that makes arbitrary
+// `X[]…[]` nesting of any ref leaf (struct / union / closure) fall out: interning is inner-first,
+// recursively, bottoming out at the leaf array (whose element is not itself a ref array, k != 9).
+function ensureRefElem(elemName: string) {
+  if elemName == "" { return -1 }
+  const k = refArrElemKind(elemName + "[]")
+  if k == 9 { ensureRefElem(refArrElemName(elemName)) }
+  rlInternName(elemName, k)
+}
+
 function refArrElemKind(name: string) {
   if name == "i32[][]" { return 4 }
   // Nested lists of a NON-i32 scalar/string element — the element is that inner list's
@@ -18199,6 +18255,11 @@ function refArrElemKind(name: string) {
   if name == "string[][]" { return 6 }
   if name == "f64[][]" { return 7 }
   if name == "i64[][]" { return 8 }
+  // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
+  // itself a ref array, stored as the inner list's WRAPPER — kind 9. Recurses to any depth via
+  // the interned inner slots. The scalar-leaf 2D names above are NOT ref arrays at the inner
+  // level (a scalar inner list is a singleton wrapper), so they keep their explicit kinds.
+  if nameIsArray(name) && nameIsRefArray(refArrElemName(name)) { return 9 }
   if nameIsMapArray(name) { return 3 }
   // A `(P | null)[]` nullable-struct array is a STRUCT ref list (kind 1) — its element is a
   // `(ref null $P)` niche, not a union box. Checked before the value-union test below.
@@ -18582,7 +18643,7 @@ function collectA(stmts: i32[]) {
         rlUsed = true
         raUsed = true
         rElemKind = refArrElemKind(nd.tyName)
-        rlInternName(refArrElemName(nd.tyName), refArrElemKind(nd.tyName))
+        ensureRefElem(refArrElemName(nd.tyName))
         // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
         // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
         if refArrElemKind(nd.tyName) == 4 {
@@ -18778,6 +18839,9 @@ function refArrElemName(name: string) {
     if structIndexByName(base) >= 0 { return base }
     // A `Cat[]` concrete-variant element list — the bare variant name is the table key.
     if variantIndexOf(base) >= 0 { return base }
+    // A NESTED ref array (`Cell[]` as the element of `Cell[][]`): the base is itself a ref array
+    // — the inner list's name keys its slot. Recurses to the leaf struct/union/closure array.
+    if nameIsRefArray(base) { return base }
   }
   ""
 }
@@ -19719,6 +19783,14 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // alias) → a self-gated no-op. Map values nest (`{[string]: (C|S)[]}` → `(C|S)[]` → `C|S`).
   const pun = parenUnionArrElemName(name)
   if pun != "" { return registerInlineUnion(stmts, pun) }
+  // A NESTED array of an inline union (`(C|D)[][]`, `(C|D)[][][]`): `parenUnionArrElemName` only
+  // matches a SINGLE-bracket `(…)[]`, so strip the OUTER `[]` and recurse on the element list,
+  // reaching the inner union at any depth — the registration dual of the recursive ref-array
+  // interning. Bottoms out at the 1D `(…)[]` (the `pun` path above).
+  if nameIsArray(name) {
+    const inner = name.slice(0, name.length - 2)
+    if nameIsArray(inner) { return registerInlineUnion(stmts, inner) }
+  }
   if nameIsMap(name) {
     const mvn = mapValNameOf(name)
     if mvn != "" { return registerInlineUnion(stmts, mvn) }
@@ -21311,6 +21383,17 @@ function exprRefArray(exprIx: i32, fnIx: i32) {
   if e is Member {
     if memFieldTypeCode(exprIx, fnIx) == 5 { return true }
   }
+  // Indexing a NESTED ref array (`g[i]` where `g: S[][]`, kind-9 elements): each element IS the
+  // inner ref list, so the index yields a ref array. Recurses — `g[i][j]` over `S[][][]` is a ref
+  // array too (the inner slot is itself kind 9).
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      const slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        return rlElemKindTbl[slot] == 9
+      }
+    }
+  }
   false
 }
 
@@ -21434,6 +21517,13 @@ function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
       let fi = sFieldIndex(si, e.memProp)
       if fi >= 0 { return sFieldElemNameAt(si, fi) }
     }
+  }
+  // Indexing a NESTED ref array (`g[i]` where `g: S[][]`): the element of `g[i]` is the element
+  // of `g`'s element list — strip ONE `[]` off `g`'s element name (`S[]` → `S`). Recurses for
+  // deeper nesting (`g[i][j]` over `S[][][]`).
+  if e is Index {
+    const outer = refListElemNameOfExpr(e.idxArr, fnIx)
+    if outer != "" && nameIsArray(outer) { return refArrElemName(outer) }
   }
   ""
 }
