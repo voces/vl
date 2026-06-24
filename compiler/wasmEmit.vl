@@ -2717,6 +2717,9 @@ function collectLocals(blockIx: i32, fnIx: i32) {
         } else if fiEk == 13 {
           fiLk = 21 // f32 element → f32-list `#l` temp
         }
+        // A STRING iterable (`for ch in s`): the `#l` temp holds the string itself (code 3, the
+        // raw `(ref $aTypeIdx)` array), not an i32-list wrapper. The loop var stays code 0 (i32).
+        if fiEk == 0 && forInStringSrc(s.fiIter, fnIx) { fiLk = 3 }
         const fiSlot = addLocalName(s.fiVar, fiEk, fiVarIdx)
         markLoopVarSlot(fiSlot)
         scopeBind(s.fiVar, fiSlot)
@@ -13719,8 +13722,20 @@ function forInElemKind(iterIx: i32, fnIx: i32) {
   // An i64 element list (`i64[]`): the loop var binds as a scalar i64 local (code 10), and
   // the `#l` temp is the i64-list (code 20).
   if exprI64Array(iterIx, fnIx) { return 10 }
+  // A STRING iterable (`for ch in s`): each code unit is an i32 (loop-var code 0, same as an
+  // `i32[]`), but the source is the RAW i32 array — the `#l` temp is the string itself (code 3),
+  // and the length/element reads skip the list-wrapper `struct.get`. `forInStringSrc` flags it
+  // at the temp-kind and emit sites. Checked before `exprArray` (a string is not an i32 list).
+  if exprString(iterIx, fnIx) { return 0 }
   if exprArray(iterIx, fnIx) { return 0 }
   -1
+}
+
+// Whether a `for v in <iter>` iterable is a STRING (`for ch in s`) — the i32-code-unit walk over
+// the raw array, distinct from an `i32[]` (code 0 too) whose backing hides behind a list wrapper.
+function forInStringSrc(iterIx: i32, fnIx: i32) {
+  if forInElemKind(iterIx, fnIx) != 0 { return false }
+  exprString(iterIx, fnIx)
 }
 
 // The mv SLOT of a `for v in m.values()` walk over a REF-VALUED map, or -1 (not a
@@ -14602,6 +14617,10 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     // element read per iteration, cursor++.
     const ek = forInElemKind(s.fiIter, fnIx)
     if ek < 0 { return emitFail("emitProgram: unsupported for-in iterable") }
+    // A STRING iterable (`for ch in s`): the `#l` temp IS the raw `(ref $aTypeIdx)` array (no
+    // list wrapper), so the length is `array.len` and each element `array.get $aTypeIdx` —
+    // skipping the `struct.get wrapTy` the i32-list path uses. The loop var is an i32 code unit.
+    const strSrc = forInStringSrc(s.fiIter, fnIx)
     const vSlot = emitLetCursor
     emitLetCursor = emitLetCursor + 1
     const iSlot = emitLetCursor
@@ -14683,10 +14702,10 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     ctrlEnter()
     loopContDepth.push(ctrlDepth)
     loopContLabel.push(s.fiLabel)
-    // exit when cursor >= len (the list wrapper's field 1)
+    // exit when cursor >= len (the list wrapper's field 1; a STRING is the raw array → array.len)
     fbLocalGet(iIdx)
     fbLocalGet(lIdx)
-    fbStructGet(wrapTy, 1)
+    if strSrc { fbArrayLen() } else { fbStructGet(wrapTy, 1) }
     fbI32Bin(78) // 0x4e i32.ge_s
     fbBrIf(1)    // 0x0d br_if -> break out of block
     // TOMBSTONE SKIP: if M.live[cursor] == 0, advance the cursor and re-loop WITHOUT
@@ -14707,11 +14726,12 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       fbBr(1)              // 0x0c br -> loop header (re-check exit)
       fbEnd()              // 0x0b end (if)
     }
-    // v = backing[cursor] (a string element recovers its non-null ref)
+    // v = backing[cursor] (a string element recovers its non-null ref). A STRING source IS the
+    // raw array, so index it directly (no list-wrapper `struct.get`); the code unit is an i32.
     fbLocalGet(lIdx)
-    fbStructGet(wrapTy, 0)
+    if !strSrc { fbStructGet(wrapTy, 0) }
     fbLocalGet(iIdx)
-    fbArrayGet(backTy)
+    if strSrc { fbArrayGet(aTypeIdx) } else { fbArrayGet(backTy) }
     if (
       ek == 3 ||
       ek == 1 ||
