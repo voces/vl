@@ -3348,6 +3348,10 @@ function nameNeedsCanon(name: string) {
   while i < name.length {
     const c = name[i]
     if c == '"' || c == '&' || c == '!' || c == '(' { return true }
+    // A top-level union (`AB | null`) must be processed so a union-ALIAS member expands to
+    // its flattened members (the inline `(A|B)|null` already trips the `(` test above). The
+    // member-canon loop is idempotent for an already-flat union, so this is a no-op there.
+    if c == '|' { return true }
     if c >= '0' && c <= '9' {
       if i == 0 { return true }
       const p = name[i - 1]
@@ -3522,6 +3526,20 @@ function canonShapeName(name: string) {
 // block comment above). Structure-preserving: only literal members, `&` folds
 // and whole-name parens change; any name without those constructs is returned
 // byte-identical (the `nameNeedsCanon` fast path).
+// If `name` is a declared UNION ALIAS (`type AB = A | B`), its flattened member-set emit name
+// (`"A|B"`); "" for a struct alias / primitive / generic / unknown (which keep their own name).
+// `canonEmitName` uses this to FLATTEN a union-alias member of an OUTER union — `AB | null`
+// canonicalizes to `A | B | null`, the same name the inline `(A | B) | null` produces, which
+// the emitter's union machinery recognizes (an un-expanded alias name is not a union name, so
+// `AB | null` otherwise fell through to the i32-local default — "only i32 locals are supported").
+function unionAliasMembers(name: string) {
+  const ix = cUserTypes[name] ?? -1
+  if ix < 0 { return "" }
+  const t = T.tys[ix]
+  if t is TyUnion { return tyToEmitName(ix) }
+  ""
+}
+
 export function canonEmitName(name: string) {
   if name.length == 0 { return name }
   if !nameNeedsCanon(name) { return name }
@@ -3538,6 +3556,12 @@ export function canonEmitName(name: string) {
     let i = 0
     while i < parts.length {
       let c = canonEmitName(parts[i])
+      // A union-ALIAS member flattens into this outer union (`AB | null` → `A | B | null`):
+      // a union of unions is one union, so expand the alias to its members — matching the
+      // inline `(A | B) | null` form the emitter recognizes. (A bare `AB` annotation has no
+      // top-level `|`, so it never reaches here and stays its alias name.)
+      const exp = unionAliasMembers(c)
+      if exp != "" { c = exp }
       // A FUNCTION-type member keeps grouping parens (`((i32) => i32) | null` — a NULLABLE
       // function), so the rejoined name stays distinct from `(i32) => i32 | null` (a
       // function returning a nullable). `canonEmitName` strips a member's own wrapping
