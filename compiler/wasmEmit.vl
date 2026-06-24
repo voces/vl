@@ -1191,6 +1191,17 @@ function exprNullableStruct(exprIx: i32, fnIx: i32) {
   // non-null but shares the nullable storage, so the read is nullable-classified
   // (the consumer inserts `ref.as_non_null` before a chained field access).
   if e is Member { return memberFieldCode(exprIx, fnIx) == 15 }
+  // An INDEX into a NULLABLE-struct array (`(P | null)[]`, ref-list slot key "P | null")
+  // yields `P | null` — the element legitimately holds null, so the read is NOT recovered
+  // to non-null (unlike a `P[]` element). `const e = xs[i]` binds the kind-9 niche.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      let slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if rlElemKindTbl[slot] == 1 {
+        if nullablePartOf(rlElemName[slot]) != "" { return true }
+      }
+    }
+  }
   false
 }
 
@@ -2647,6 +2658,11 @@ function collectLocals(blockIx: i32, fnIx: i32) {
         if fiEk == 1 {
           fiVarIdx = forInRefArrayStructIdx(s.fiIter, fnIx)
           fiLk = 5
+        } else if fiEk == 9 {
+          // A NULLABLE-struct element (`(P | null)[]`): the loop var is a kind-9 niche carrying
+          // the element struct index; the `#l` temp is the ref-list WRAPPER (code 5).
+          fiVarIdx = forInRefArrayStructIdx(s.fiIter, fnIx)
+          fiLk = 5
         } else if fiEk == 4 {
           // A union-box element list: the loop var is a kind-4 union box (no struct index);
           // the `#l` temp is the ref-list WRAPPER (code 5), like the struct case.
@@ -2665,7 +2681,7 @@ function collectLocals(blockIx: i32, fnIx: i32) {
         scopeBind(s.fiVar, fiSlot)
         addLocalName(s.fiVar + "#i", 0, -1)
         let fiLs = -1
-        if fiEk == 1 || fiEk == 4 {
+        if fiEk == 1 || fiEk == 4 || fiEk == 9 {
           const fiMvs = forInMapValsSlot(s.fiIter, fnIx)
           if fiMvs >= 0 {
             fiLs = mvRlSlot[fiMvs]
@@ -5672,6 +5688,16 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       isStrLit = false
       isF64Lit = false
     }
+    // A STRUCT ref-list (kind 1) under a threaded annotation: authoritative, like kind 2/5.
+    // Matters for a NULLABLE-struct array (`(P | null)[]`) whose FIRST element is `null` —
+    // `arrLitIsRef` keys off the first element (a `null` is neither objlit nor nested array)
+    // and would otherwise mis-route the literal to the i32-list path.
+    if pendingListKind == 1 {
+      isRefLit = true
+      isStrLit = false
+      isF64Lit = false
+      isI64Lit = false
+    }
     if isF32Lit {
       if !fa32Used {
         return emitFail(
@@ -5787,12 +5813,16 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       let elemStructIdx = -1
       let elemVariantIdx = -1
       if rlElemKindTbl[rslot] == 1 {
-        elemStructIdx = structIndexByName(rlElemName[rslot])
+        // A NULLABLE-struct element list (`(P | null)[]`, slot key "P | null"): strip the
+        // `| null` to the bare struct so an object element builds `P` and a `null` element
+        // gets `ref.null $P` (the seeded `pendingStructIdx`).
+        let rlen = rlElemName[rslot]
+        const rnn = nullablePartOf(rlen)
+        if rnn != "" { rlen = rnn }
+        elemStructIdx = structIndexByName(rlen)
         // A concrete-VARIANT element list (`Cat[]`): no `sNames` entry, so seed the VARIANT
         // index instead so each element literal builds the bare variant struct (kind 8).
-        if elemStructIdx < 0 {
-          elemVariantIdx = variantIndexOf(rlElemName[rslot])
-        }
+        if elemStructIdx < 0 { elemVariantIdx = variantIndexOf(rlen) }
       }
       // A UNION-element list (kind 2) coerces each element into the box at the
       // write boundary (`emitUnionCoerce` — the host's per-element `coerceUnion`):
@@ -7660,7 +7690,13 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       fbStructGet(rlWrapIdx[rslot], 0) // 0xfb 0x02 <ref-list wrapper> field 0: backing
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
       fbArrayGet(rlBackIdx[rslot])     // 0xfb 0x0b <this slot's ref backing array>
-      wU8(212)                         // 0xd4 ref.as_non_null (recover the non-null element)
+      // A NULLABLE-struct element (`(P | null)[]`, slot key "P | null") legitimately holds
+      // null, so the read STAYS `(ref null $P)` — no `ref.as_non_null` recover (the bound
+      // `e` is a kind-9 niche the caller narrows with `e != null`).
+      if rlElemKindTbl[rslot] == 1 && nullablePartOf(rlElemName[rslot]) != "" {
+        return 0
+      }
+      wU8(212) // 0xd4 ref.as_non_null (recover the non-null element)
       return 0
     }
     // A STRING list `xs[i]` → unwrap to its `(ref null $aTypeIdx)` string backing,
@@ -11284,7 +11320,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           const anSlot = refListSlotOfExpr(callIx, fnIx)
           anBack = rlBackIdx[anSlot]
           anWrap = rlWrapIdx[anSlot]
-          anElemStructIdx = structIndexByName(rlElemName[anSlot])
+          anElemStructIdx = structIdxOfElemName(rlElemName[anSlot])
         } else {
           if !aUsed || !lUsed {
             return emitFail("emitProgram: array intrinsic but list types not collected")
@@ -11950,7 +11986,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
         if rlElemKindTbl[rslot] == 1 {
-          storeStructIdx = structIndexByName(rlElemName[rslot])
+          storeStructIdx = structIdxOfElemName(rlElemName[rslot])
         }
         if rlElemKindTbl[rslot] == 2 { storeUnionNm = rlElemName[rslot] }
       } else if isStr {
@@ -12178,7 +12214,7 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         aTy = rlBackIdx[rslot]
         base = refPushScratchBaseFor(rslot)
         if rlElemKindTbl[rslot] == 1 {
-          pushStructIdx = structIndexByName(rlElemName[rslot])
+          pushStructIdx = structIdxOfElemName(rlElemName[rslot])
         }
         if rlElemKindTbl[rslot] == 2 { pushUnionNm = rlElemName[rslot] }
       } else if isStr {
@@ -13576,7 +13612,13 @@ function forInElemKind(iterIx: i32, fnIx: i32) {
   // yet supported here — they fall through to the unsupported -1.)
   if exprRefArray(iterIx, fnIx) {
     let rslot = refListSlotOfExpr(iterIx, fnIx)
-    if rlElemKindTbl[rslot] == 1 { return 1 }
+    if rlElemKindTbl[rslot] == 1 {
+      // A NULLABLE-struct element ref list (`(P | null)[]`, slot key "P | null"): the loop var
+      // binds as a kind-9 niche (`for e in xs { if e != null { … e.v … } }`), and the element
+      // read stays nullable (no `ref.as_non_null`). A plain `S[]` is the non-null kind 1.
+      if nullablePartOf(rlElemName[rslot]) != "" { return 9 }
+      return 1
+    }
     // A UNION-box element ref list (`(C | S)[]`, kind 2): the loop var binds as a kind-4
     // union-box local (the element-kind code IS the loop-var local kind, as struct's `1` is),
     // so `for x in arr { … x is S … }` narrows each element. The `#l` temp is the ref-list
@@ -13631,7 +13673,9 @@ function forInRefArrayStructIdx(iterIx: i32, fnIx: i32) {
     return -1
   }
   if !exprRefArray(iterIx, fnIx) { return -1 }
-  structIndexByName(refListElemNameOfExpr(iterIx, fnIx))
+  // Strip a `| null` niche suffix (`(P | null)[]` → "P") so the nullable-struct loop var
+  // carries P's struct index.
+  structIdxOfElemName(refListElemNameOfExpr(iterIx, fnIx))
 }
 
 // True if the map-typed expression at `exprIx` is a SET (`Set()`-seeded binding or
@@ -14490,11 +14534,11 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     if ek == 3 {
       wrapTy = mkListIdx
       backTy = mkArrIdx
-    } else if ek == 1 || ek == 4 {
-      // A struct ref list (`S[]`, ek 1) or a UNION-box element list (`(C|S)[]`, ek 4): the
-      // wrapper/backing are THIS ref-list slot's, and each element is a ref recovered with
-      // `ref.as_non_null` — mirrors the indexed read (`xs[i]`) of the same slot. A
-      // STRUCT-VALUED map walk reads its mv slot's vals list instead.
+    } else if ek == 1 || ek == 4 || ek == 9 {
+      // A struct ref list (`S[]`, ek 1), a UNION-box element list (`(C|S)[]`, ek 4), or a
+      // NULLABLE-struct element list (`(P|null)[]`, ek 9): the wrapper/backing are THIS
+      // ref-list slot's. ek 1/4 recover each element non-null; ek 9 keeps it nullable (the
+      // niche). A STRUCT-VALUED map walk reads its mv slot's vals list instead.
       const fimv = forInMapValsSlot(s.fiIter, fnIx)
       if fimv >= 0 {
         wrapTy = mvValsWrapOf(fimv)
@@ -16123,13 +16167,18 @@ function mAssignTypeIndices(n: i32) {
       // wrapper of the inner `S` slot (interned at a LOWER index, so its `rlWrapIdx` is set).
       rlElemHeap[rs] = rlWrapIdx[rlSlotByName(refArrElemName(rlElemName[rs]))]
     } else {
-      const esi = structIndexByName(rlElemName[rs])
+      // A NULLABLE-struct element (`(P | null)[]`, slot key "P | null"): the backing is a
+      // `(ref null $P)` over the bare struct — strip the `| null` to resolve P's heap.
+      let rsen = rlElemName[rs]
+      const rsnn = nullablePartOf(rsen)
+      if rsnn != "" { rsen = rsnn }
+      const esi = structIndexByName(rsen)
       if esi >= 0 {
         rlElemHeap[rs] = sHeapIdx[esi]
       } else {
         // A concrete-VARIANT element (`Cat[]`): the element heap is the variant struct
         // `uVarIdx + vi` (no standalone `sNames` entry — variants ride the union's structs).
-        const evi = variantIndexOf(rlElemName[rs])
+        const evi = variantIndexOf(rsen)
         if evi >= 0 {
           rlElemHeap[rs] = uVarIdx + evi
         } else {
@@ -17908,6 +17957,31 @@ function emitModule(stmts: i32[]) {
 // True if the type-name `name` refers to one of the declared struct types.
 function isSName(name: string) { structIndexByName(name) >= 0 }
 
+// The struct-table index for a ref-list element NAME, stripping a `| null` niche suffix first
+// (a NULLABLE-struct array's slot keys on the full `"P | null"`, but the struct it stores/reads
+// is the bare `P`). For a plain `"P"` this is just `structIndexByName`.
+function structIdxOfElemName(name: string) {
+  let n = name
+  const nn = nullablePartOf(name)
+  if nn != "" { n = nn }
+  structIndexByName(n)
+}
+
+// The non-null STRUCT name of a NULLABLE-struct array element (`(P | null)[]` → "P"), or "".
+// `P | null` is a nullable-struct NICHE (a `(ref null $P)` slot), NOT a union box — so it is a
+// struct ref-list whose elements legitimately hold null (its backing is already nullable). The
+// SLOT keys on the full `"P | null"` so a read can tell it from a non-null `P[]` (different slot)
+// and skip the `ref.as_non_null` recover. A value-niche element (`(i32 | null)[]`) is excluded —
+// its non-null part is not a declared struct, so it stays the value-union-box path.
+function nullStructArrElem(name: string) {
+  const elem = parenUnionArrElemName(name)
+  if elem == "" { return "" }
+  const nn = nullablePartOf(elem)
+  if nn == "" { return "" }
+  if structIndexByName(nn) >= 0 { return nn }
+  ""
+}
+
 // True if the array type-name `name` is a REF-element list — `S[]` over a declared
 // struct, `N[]` over the declared union alias (the box-ref element), or `{[string]:i32}[]`
 // (a map-struct element). Either lowers to the `{ backing: (ref $raTypeIdx), len, cap }`
@@ -17915,6 +17989,9 @@ function isSName(name: string) { structIndexByName(name) >= 0 }
 // NOT a ref array. The element name is recovered by checking each declared struct/union
 // name + `"[]"` (a `string + string` concat; a `string + i32` would be a type error).
 function nameIsRefArray(name: string) {
+  // A `(P | null)[]` nullable-struct array is a (struct) ref list — checked before the
+  // value/struct-union element test so its niche element is not mis-read as a union box.
+  if nullStructArrElem(name) != "" { return true }
   // A NESTED `i32[][]` is a ref list whose elements are the i32-list wrapper
   // (element kind 4) — the existing ref-pair machinery serves it; only the
   // element heap type differs (`lTypeIdx`).
@@ -17958,6 +18035,9 @@ function refArrElemKind(name: string) {
   if name == "f64[][]" { return 7 }
   if name == "i64[][]" { return 8 }
   if nameIsMapArray(name) { return 3 }
+  // A `(P | null)[]` nullable-struct array is a STRUCT ref list (kind 1) — its element is a
+  // `(ref null $P)` niche, not a union box. Checked before the value-union test below.
+  if nullStructArrElem(name) != "" { return 1 }
   // A `(string|i32)[]` value-union element list is a union-box list (kind 2).
   if parenUnionArrElemName(name) != "" { return 2 }
   // An `((i32) => i32)[]` array of functions is a closure-element list (kind 5).
@@ -20287,6 +20367,10 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   if e is Index {
     if exprRefArray(e.idxArr, fnIx) {
       let nm = refListElemNameOfExpr(e.idxArr, fnIx)
+      // A NULLABLE-struct element (`(P | null)[]`, slot key "P | null") resolves to the bare
+      // struct `P` — strip the `| null` so a narrowed `xs[i].field` finds P's layout.
+      const nmnn = nullablePartOf(nm)
+      if nmnn != "" { nm = nmnn }
       let si = structIndexByName(nm)
       if si >= 0 { return si }
     }
@@ -22657,7 +22741,7 @@ function structListPopGetElem(exprIx: i32, fnIx: i32) {
           let slot = refListSlotOfExpr(callee.memObj, fnIx)
           if slot >= 0 && slot < rlElemKindTbl.length {
             if rlElemKindTbl[slot] == 1 {
-              return structIndexByName(rlElemName[slot])
+              return structIdxOfElemName(rlElemName[slot])
             }
           }
         }
