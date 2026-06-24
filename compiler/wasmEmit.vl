@@ -18161,6 +18161,11 @@ function nameIsRefArray(name: string) {
   if name == "i64[][]" || name == "f64[][]" || name == "string[][]" {
     return true
   }
+  // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
+  // ITSELF a ref array. Recurses to the leaf (a struct / union / closure / scalar-2D ref array),
+  // so any DEPTH and any ref leaf falls out — the outer element's heap is the inner list's
+  // wrapper (`refArrElemKind` → 9), resolved through the recursively-interned inner slot.
+  if nameIsArray(name) && nameIsRefArray(refArrElemName(name)) { return true }
   // A `(string|i32)[]` annotation — a VALUE-union element list. The element
   // slots hold the same `{tag, value}` boxes a bare union binding does (the
   // host stores the coerced union value), so it is a kind-2 ref list.
@@ -18191,6 +18196,18 @@ function nameIsRefArray(name: string) {
 // The ref-element kind for an array type-name (assumes `nameIsRefArray(name)`):
 // `1` = a struct element, `2` = a union-box element (`uBoxIdx`), `3` = a map-struct
 // element (`mStructIdx`, the scope-chain `{[string]:i32}[]`).
+// Intern the ref-list slot whose ELEMENT type is `elemName`, recursively interning a nested
+// inner list's element slot FIRST — so the inner wrapper lands at a LOWER type index and the
+// outer element heap (`rlElemHeap`, kind 9) resolves to it. The DRY core that makes arbitrary
+// `X[]…[]` nesting of any ref leaf (struct / union / closure) fall out: interning is inner-first,
+// recursively, bottoming out at the leaf array (whose element is not itself a ref array, k != 9).
+function ensureRefElem(elemName: string) {
+  if elemName == "" { return -1 }
+  const k = refArrElemKind(elemName + "[]")
+  if k == 9 { ensureRefElem(refArrElemName(elemName)) }
+  rlInternName(elemName, k)
+}
+
 function refArrElemKind(name: string) {
   if name == "i32[][]" { return 4 }
   // Nested lists of a NON-i32 scalar/string element — the element is that inner list's
@@ -18199,6 +18216,11 @@ function refArrElemKind(name: string) {
   if name == "string[][]" { return 6 }
   if name == "f64[][]" { return 7 }
   if name == "i64[][]" { return 8 }
+  // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
+  // itself a ref array, stored as the inner list's WRAPPER — kind 9. Recurses to any depth via
+  // the interned inner slots. The scalar-leaf 2D names above are NOT ref arrays at the inner
+  // level (a scalar inner list is a singleton wrapper), so they keep their explicit kinds.
+  if nameIsArray(name) && nameIsRefArray(refArrElemName(name)) { return 9 }
   if nameIsMapArray(name) { return 3 }
   // A `(P | null)[]` nullable-struct array is a STRUCT ref list (kind 1) — its element is a
   // `(ref null $P)` niche, not a union box. Checked before the value-union test below.
@@ -18582,7 +18604,7 @@ function collectA(stmts: i32[]) {
         rlUsed = true
         raUsed = true
         rElemKind = refArrElemKind(nd.tyName)
-        rlInternName(refArrElemName(nd.tyName), refArrElemKind(nd.tyName))
+        ensureRefElem(refArrElemName(nd.tyName))
         // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
         // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
         if refArrElemKind(nd.tyName) == 4 {
