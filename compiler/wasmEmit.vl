@@ -1188,6 +1188,10 @@ function exprNullableStruct(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramNulRef(fnIx, e.identName) { return true }
     if declaredNulRef(e.identName) { return true }
+    // A CAPTURED nullable struct (`const p: P | null = …; () => if p != null { p.x }`): the env
+    // field is `(ref null $S)` (kind 9), so classify it nullable — else `p != null` reads as
+    // struct equality. The struct index resolves via `capturedStructIndex`.
+    if capturedKindOf(fnIx, e.identName) == 9 { return true }
     return globalIsNulRef(e.identName)
   }
   // A NESTED-STRUCT field read (code 15) is stored `(ref null $S)` — a `S|null`
@@ -4818,6 +4822,9 @@ function emitUnionBoxPush(body: i32[], name: string, fnIx: i32) {
   } else {
     const gIdx = globalIndexOf(name)
     if gIdx < 0 {
+      // A captured VALUE-union (`i32 | string`) narrowed-atom read is not yet wired (the unbox
+      // would read off the env) — a clean reject, not invalid wasm. Captured STRUCT-unions,
+      // strings, and nullable structs DO work (their reads route through the ref env field).
       return emitFail("emitProgram: narrowed union binding is not a local or global")
     }
     fbGlobalGet(gIdx)
@@ -20509,6 +20516,29 @@ function capturedKindOf(fnIx: i32, name: string) {
   -1
 }
 
+// The union member-set NAME of a CAPTURED union-box variable `name` (kind 4) of the capturing
+// function `fnIx` — resolved from the PARENT frame's binding annotation / init, so `a is Cat`
+// narrows a captured `a: Cat | Dog`. "" when `name` is not a captured union. The union-name
+// dual of `capturedStructIndex`.
+function capturedUnionName(fnIx: i32, name: string) {
+  if capturedKindOf(fnIx, name) != 4 { return "" }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return "" }
+  const b = parentBindingOf(fe, name)
+  if b < 0 { return "" }
+  const bn = P.nodes[b]
+  if bn is Param {
+    const pn = tyNameOf(bn.parType)
+    if isUName(pn) { return pn }
+    return ""
+  }
+  if bn is LetDecl {
+    const par = fnParent[fe]
+    if par >= 0 { return letUnionNameOf(b, fnStmts[par]) }
+  }
+  ""
+}
+
 function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
@@ -20676,6 +20706,10 @@ function exprUnion(exprIx: i32, fnIx: i32) {
     if narrowedValueAtomOf(e.identName) != "" { return false }
     if paramUnion(fnIx, e.identName) { return true }
     if declaredUnion(e.identName) { return true }
+    // A CAPTURED union box (`const a: C | D = …; () => … a is C …`): the env field is the union
+    // box (kind 4). `capturedUnionName` resolves its member set from the parent binding so `is`
+    // narrows; here we only need to know it IS a union value.
+    if capturedKindOf(fnIx, e.identName) == 4 { return true }
     // A module GLOBAL union binding (a union annotation, or a union-returning
     // init): top-level `const a = make(42)` / `let w: string | i32 = "a"`.
     let gi = globalLetOf(e.identName)
@@ -20776,6 +20810,9 @@ function unionNameOfIdent(name: string, fnIx: i32) {
       }
     }
   }
+  // A CAPTURED union box — resolve its member set from the parent frame's binding.
+  const cun = capturedUnionName(fnIx, name)
+  if cun != "" { return cun }
   let gi = globalLetOf(name)
   if gi >= 0 { return letUnionNameOf(gi, -1) }
   ""
@@ -22411,6 +22448,9 @@ function exprString(exprIx: i32, fnIx: i32) {
     if uk != -3 { return uk == 2 }
     if paramString(fnIx, e.identName) { return true }
     if declaredString(e.identName) { return true }
+    // A CAPTURED string (`const s = "…"; () => s.length`): the env field is a string ref (kind
+    // 3), so classify it like a string param/local — else `s.length` reads as a struct field.
+    if capturedKindOf(fnIx, e.identName) == 3 { return true }
     return globalIsString(e.identName)
   }
   // An index read over a STRING list (`names[i]`, a `string[]` element) yields a
