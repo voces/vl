@@ -2164,18 +2164,17 @@ function mvShapeOfValName(valName: string) {
     structIndexByValName(refArrElemName(valName)) >= 0
   ) {
     // A STRUCT-LIST-valued map (`{[string]: S[]}`): the value is a struct-list WRAPPER ref,
-    // stored in a ref list whose element is the INNER struct-list wrapper (element kind 9 —
-    // confined here so `refArrElemKind`, used broadly, is untouched). Same ref-value spine as
-    // a nested map; the read classifies as a ref list (not a Map).
+    // stored in a ref list whose element is the INNER struct-list wrapper (element kind 9). The
+    // read classifies as a ref list (not a Map). (Full nested / closure list VALUES need the map
+    // store/read paths migrated to the recursive resolver — a separate, larger change.)
     kind = 6
   } else if (
     nameIsRefArray(valName) &&
     unionMemberCount(unionMemberSetOf(refArrElemName(valName))) > 1
   ) {
-    // A UNION-LIST-valued map (`{[string]: (C | S)[]}`): the value is a list of union BOXES,
-    // stored exactly like a struct-list value (kind 6, outer element kind 9) — only the INNER
-    // ref-list element is a union box (kind 2), not a struct. The element union is already
-    // registered (collectU recurses through the map-value annotation), so no intern here.
+    // A UNION-LIST-valued map (`{[string]: (C | S)[]}`): a list of union BOXES, stored like a
+    // struct-list value (kind 6, outer element kind 9) — only the inner ref-list element is a
+    // union box. The element union is registered by `collectU` (recursive).
     kind = 6
   } else if unionMemberCount(unionMemberSetOf(valName)) > 1 {
     // A UNION-valued map: each value is the shared union BOX ref (`uBoxIdx`), stored in a ref
@@ -2233,28 +2232,13 @@ function mvShapeOfValName(valName: string) {
     rlUsed = true
     raUsed = true
   } else if kind == 6 {
-    // The vals are a ref list whose element is the inner map struct (kind 3), i32-list wrapper
-    // (kind 4 — `refArrElemKind("<value>[]")` picks it), or — for a STRUCT-LIST value (`S[]`) —
-    // the inner struct-list WRAPPER (kind 9, resolved to `rlWrapIdx` of the inner `S` slot,
-    // which we intern FIRST so its index is lower for the heap-resolution pass).
-    if (
-      nameIsRefArray(valName) &&
-      structIndexByValName(refArrElemName(valName)) >= 0
-    ) {
-      rlInternName(refArrElemName(valName), 1) // the inner struct-list slot
-      mvRlSlot.push(rlInternName(valName, 9))
-    } else if (
-      nameIsRefArray(valName) &&
-      unionMemberCount(unionMemberSetOf(refArrElemName(valName))) > 1
-    ) {
-      // A UNION-LIST value: the inner ref list is a UNION-BOX list (element kind 2), the outer
-      // is the kind-9 list-of-lists wrapper (its heap resolves to the inner slot's wrapper by
-      // name — `rlSlotByName(refArrElemName(...))` — exactly as the struct-list case does).
-      rlInternName(refArrElemName(valName), 2) // the inner union-box list slot
-      mvRlSlot.push(rlInternName(valName, 9))
-    } else {
-      mvRlSlot.push(rlInternName(valName, refArrElemKind(valName + "[]")))
-    }
+    // The map's VALUE is a ref LIST (`S[]` struct-list, `(C|D)[]` union-list, `i32[]` scalar
+    // list, or a nested map). Its vals ref-list slot is keyed by the value name with the
+    // recursively-interned inner slots — the SAME `ensureRefElem` the array path uses, replacing
+    // the three hand-coded interning cases that duplicated it. (The `mvShapeOfValName` classifier
+    // still gates WHICH value types reach here; fully nested / closure list map VALUES additionally
+    // need the map store/read/coerce paths migrated to the recursive resolver — a larger change.)
+    mvRlSlot.push(ensureRefElem(valName))
     rlUsed = true
     raUsed = true
   } else if kind == 14 {
@@ -18244,6 +18228,21 @@ function ensureRefElem(elemName: string) {
   if elemName == "" { return -1 }
   const k = refArrElemKind(elemName + "[]")
   if k == 9 { ensureRefElem(refArrElemName(elemName)) }
+  // Force the leaf list-type wrapper `Used` flags for a SCALAR inner-list element, so its
+  // singleton wrapper (`lTypeIdx` / `mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`) is allocated. A
+  // ref inner list (k 9) forces these in the recursion above; a struct / union / closure element
+  // (k 1/2/5) needs none. Lets BOTH the array path and the map-value path share this one helper.
+  if k == 4 {
+    lUsed = true
+    aUsed = true
+  } else if k == 6 {
+    slUsed = true
+    aUsed = true
+  } else if k == 7 {
+    fa64Used = true
+  } else if k == 8 {
+    ia64Used = true
+  }
   rlInternName(elemName, k)
 }
 
