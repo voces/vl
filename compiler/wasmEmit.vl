@@ -583,9 +583,13 @@ function cloRetKeySuffix(fe: i32) {
   if k == 2 { return ">a" }
   if k == 7 { return ">A" }
   if k == 12 { return ">D" }
-  // A ref-list (5) and a closure (14) return remain a later slice: those reps still
-  // mismatch the closure `$fnsig` result, so they stay un-minted (a clean "no interned
-  // signature") rather than mis-lowering.
+  // A CLOSURE result (kind 14 — a function returning a function, `(i32) => ((i32) => i32)`):
+  // the `$fnsig` result is the shared closure fat-pointer `(ref $cloStructIdx)` (`fbValtype`
+  // kind 14), recovered non-null at the value-call site like any other ref result. Lets a
+  // curried lambda (`(a) => (b) => …`) lower as a callable closure VALUE.
+  if k == 14 { return ">c" }
+  // A ref-list (5) return remains a later slice: that rep still mismatches the closure
+  // `$fnsig` result, so it stays un-minted (a clean "no interned signature").
   ""
 }
 
@@ -1343,8 +1347,12 @@ function computeVoidFns() {
               // i32 expression but `stmtIsTailValue` rejects — still classifies void.
               if (
                 !blockTailIsValue(fn.fnBody, fnStmts[i]) &&
-                !unionHasAtom(inferRetNameOf(fn.fnName), "null")
+                !unionHasAtom(inferRetNameOf(fn.fnName), "null") &&
+                !fnReturnsClosure(i)
               ) {
+                // A function whose tail is a function VALUE (`(a) => (b) => …`) returns a
+                // closure, NOT void — `blockTailIsValue` ignores a bare lambda tail, so guard
+                // it here (else f's functype is `()->()` and `f(4)` reads as a void result).
                 fRetVoid[i] = 1
                 changed = true
               }
@@ -14772,6 +14780,10 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
 // lowered normally by `emitStmt`.
 function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
   let s = P.nodes[stmtIx]
+  // A bare lambda tail `(a) => (b) => …` is an implicit-return VALUE (a closure), so the
+  // outer arrow's body — `(b) => …` — emits as the function's result. Without this the tail
+  // is mis-read as a statement, the body emits nothing, and the function is just `unreachable`.
+  if s is FuncDecl { return true }
   if s is NumLit { return true }
   // A trailing `null` IS an implicit-return value (the function returns null) — seeded
   // per the return type by `emitReturnValue` (`ref.null` / sentinel / boxed null), the
@@ -22445,6 +22457,10 @@ function exprIsClosure(exprIx: i32, fnIx: i32) {
     if callee is Ident {
       const t = fnIndexOf(callee.identName)
       if t >= 0 { return fnReturnsClosure(t) }
+      // A CLOSURE-VALUE callee (`f(4)` where `f: (i32) => ((i32) => i32)`) whose result is
+      // itself a closure — resolved from `f`'s `$fnsig` result (`>c`). Lets a curried lambda
+      // `const g = f(4)` bind `g` as a closure and call it.
+      return calleeRetKind(callee.identName, fnIx) == 14
     }
     return false
   }
@@ -22512,6 +22528,29 @@ function annRetKind(t: string) {
   if t == "i32[]" { return ">a" }
   if nameIsStringArray(t) { return ">A" }
   if nameIsF64Array(t) { return ">D" }
+  // A CLOSURE return — a function-type result (`(i32) => ((i32) => i32)`) → `>c`, matching
+  // `cloRetKeySuffix`'s closure-result token so the AST and annotation sig producers agree
+  // (a curried lambda's `$fnsig` must byte-match, else the value-call `ref.cast` traps). The
+  // result often arrives PARENTHESIZED (`((i32) => i32)` — source groups the arrow result),
+  // hiding its arrow one paren-depth down, so peel a single fully-wrapping `(...)` first.
+  let tc = t
+  if tc.length >= 2 && tc[0] == '(' {
+    let depth = 0
+    let ci = 0
+    let wraps = true
+    while ci < tc.length {
+      const cch = tc[ci]
+      if cch == '(' {
+        depth = depth + 1
+      } else if cch == ')' {
+        depth = depth - 1
+        if depth == 0 && ci < tc.length - 1 { wraps = false }
+      }
+      ci = ci + 1
+    }
+    if wraps { tc = tc.slice(1, tc.length - 1) }
+  }
+  if annArrowAt(tc) >= 0 { return ">c" }
   const si = structIndexByName(t)
   if si >= 0 { return ">s" + i32ToStr(si) + ";" }
   // A UNION / NULLABLE return — `string | null` → `>N`, `S | null` → `>nN;`, a 2+-member
@@ -22603,6 +22642,20 @@ function identFnTypeAnnName(name: string, fnIx: i32) {
         const d = P.nodes[li]
         if d is LetDecl {
           if tyIsFuncType(d.letType) { return tyNameOf(d.letType) }
+          // An UN-annotated closure local from a CALL result (`const g = f(4)` where `f`
+          // returns a closure): recover the function type from the checker's recorded type of
+          // the init, so its `$fnsig` resolves (the intermediate binding of a curried lambda).
+          // Restricted to a Call init: for a bare LAMBDA init the authoritative sig is the
+          // lifted function's own `cloSigKeyExt` (via `identClosureFe`), and the checker's
+          // INFERRED return for that lambda can disagree (an assignment-tail lambda the checker
+          // reads as i32-returning but the emitter lowers as void) — which would mis-cast.
+          if d.letType < 0 && d.letInit >= 0 {
+            const ini = P.nodes[d.letInit]
+            if ini is Call {
+              const itn = nodeTyName(d.letInit)
+              if annArrowAt(itn) >= 0 { return itn }
+            }
+          }
         }
       }
     }
@@ -22743,6 +22796,9 @@ function sigKeyRetKind(k: string) {
   if c == 'V' {
     return 8 // a concrete-variant result
   }
+  if c == 'c' {
+    return 14 // a CLOSURE result (a function returning a function)
+  }
   -3
 }
 
@@ -22810,7 +22866,13 @@ function paramCloSigKey(fnIx: i32, name: string) {
 function fnReturnsClosure(t: i32) {
   if t < 0 || t >= fnStmts.length { return false }
   const fn = P.nodes[fnStmts[t]]
-  if fn is FuncDecl { return blockTailIsClosure(fn.fnBody, fnStmts[t]) }
+  if fn is FuncDecl {
+    // An ANNOTATED function-type return (`: (i32) => i32`) is a closure result regardless of
+    // how the body yields it — e.g. `return f(x)`, a higher-order call the tail scan can't see
+    // (`exprIsClosureNoLocal` has no Call case). The annotated result valtype is already kind 14.
+    if fn.fnRet >= 0 && tyIsFuncType(fn.fnRet) { return true }
+    return blockTailIsClosure(fn.fnBody, fnStmts[t])
+  }
   false
 }
 

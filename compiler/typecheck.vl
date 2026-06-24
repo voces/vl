@@ -3445,6 +3445,28 @@ function tyToEmitName(ix: i32) {
     if mk == "" || mv == "" { return "" }
     return "{[" + mk + "]:" + mv + "}"
   }
+  // A FUNCTION type renders the emitter's closure-annotation form `(p1, p2) => ret` — so an
+  // inferred closure VALUE (`const g = f(4)`) recovers an annotation-shaped name the closure
+  // `$fnsig` producers (`annSigKey`) can key. "" if any param / the result is unrenderable.
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let out = "("
+    let i = 0
+    while i < ps.length {
+      const ps1 = tyToEmitName(ps[i])
+      if ps1 == "" { return "" }
+      if i > 0 { out = out + "," }
+      out = out + ps1
+      i = i + 1
+    }
+    let rs = tyToEmitName(t.fnRet)
+    if rs == "" { return "" }
+    // A function-type RESULT keeps grouping parens so the outer `$fnsig` producers see a
+    // single result token (`(i32)=>((i32)=>i32)`), matching the source-annotation form.
+    const rt = T.tys[t.fnRet]
+    if rt is TyFunc { rs = "(" + rs + ")" }
+    return out + ")=>" + rs
+  }
   ""
 }
 
@@ -3616,9 +3638,38 @@ export function canonEmitName(name: string) {
     return core + "[]"
   }
   // A parenthesized group wrapping the whole (no top-level `|`/`&`/`[]` left):
-  // strip and canon the inside.
-  if name[0] == '(' && name[name.length - 1] == ')' {
+  // strip and canon the inside. NOT for a TOP-LEVEL function type whose RETURN is
+  // parenthesized (`(i32) => ((i32) => i32)` — a curried/closure-returning function): its
+  // leading `(` wraps only the PARAM list, so a blind first/last strip corrupts it to
+  // `i32)=>((i32)=>i32`. Such a name keeps its top-level arrow (handled below).
+  if (
+    name[0] == '(' &&
+    name[name.length - 1] == ')' &&
+    !isTopLevelFuncTypeName(name)
+  ) {
     return canonEmitName(name.slice(1, name.length - 1))
+  }
+  // A TOP-LEVEL function type with a parenthesized result (`(i32) => ((i32) => i32)`): canon
+  // the param list and the (paren-stripped) result, re-render with the result's grouping
+  // parens. A simple `(i32) => i32` ends in its return type (not `)`), so it never reached the
+  // strip above and falls through unchanged — this only re-canonicalizes the nested form.
+  if isTopLevelFuncTypeName(name) && name[name.length - 1] == ')' {
+    const fa = topLevelArrowIndex(name)
+    const psStr = name.slice(1, fa - 1)
+    let out = "("
+    if psStr.length > 0 {
+      const parts: string[] = []
+      splitTypeName(psStr, ',', parts)
+      let pi = 0
+      while pi < parts.length {
+        if pi > 0 { out = out + "," }
+        out = out + canonEmitName(parts[pi])
+        pi = pi + 1
+      }
+    }
+    let rc = canonEmitName(name.slice(fa + 2, name.length))
+    if isTopLevelFuncTypeName(rc) { rc = "(" + rc + ")" }
+    return out + ")=>" + rc
   }
   // A literal member → its base scalar.
   if name[0] == '"' { return "string" }
@@ -5402,6 +5453,13 @@ function ifChainExhausts(ifIx: i32) {
 // nothing concrete to latch onto and reports "cannot infer a return type".
 function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   const inferring = n.fnRet < 0
+  // The infer-stack KEY: a named function uses its name (so self-recursion is detected); an
+  // ANONYMOUS lambda has no name, so key it by NODE INDEX — else two nested anonymous lambdas
+  // (`(a) => (b) => …`) both key on "" and the inner falsely trips the recursive-cycle guard
+  // below, breaking with a provisional `void` (its return then mis-infers `void`, so a curried
+  // lambda `f(4)` reads as a void result).
+  let inferKey = n.fnName
+  if inferKey == "" { inferKey = "#L" + i32ToStr(fnIx) }
   // Already inferred on demand (a forward call checked this body before pass 2
   // reached it)? Skip the re-check so diagnostics aren't duplicated.
   if inferring {
@@ -5409,7 +5467,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     // provisional `void` (the binding-group fixpoint re-infers it once the cycle's
     // resolvable members settle), and COUNT the break so the completion below knows
     // the result is tentative rather than final.
-    if onInferStack(n.fnName) {
+    if onInferStack(inferKey) {
       cycleBreakCount = cycleBreakCount + 1
       return TY_VOID
     }
@@ -5522,7 +5580,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   retNatural = -1
   retNaturalErr = false
   if inferring {
-    inferStack.push(n.fnName)
+    inferStack.push(inferKey)
     inferObserved = -1
     inferSawErr = false
     fnSawValueRet = false
@@ -7853,6 +7911,9 @@ export function nodeTyName(ix: i32) {
   // field-set), so an un-annotated struct-element callback param (`ps.map((p) => p.x)`) gets
   // the same `p: P` annotation the explicit form would.
   if t is TyObj { return tyToStr(ty) }
+  // A FUNCTION type renders its closure-annotation name (`(i32) => i32`) so an un-annotated
+  // closure VALUE from a call result (`const g = f(4)`) recovers a sig-keyable name.
+  if t is TyFunc { return tyToEmitName(ty) }
   ""
 }
 
