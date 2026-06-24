@@ -2161,6 +2161,12 @@ function mvShapeOfValName(valName: string) {
     // struct/heterogeneous union just rides the box payload, so no value boxes are needed.
     kind = 2
     if isValueUnionName(valName) { registerValueUnionName(valName) }
+  } else if annArrowAt(valName) >= 0 {
+    // A FUNCTION-valued map (`{[string]: (i32) => i32}`): each value is a closure fat-pointer
+    // (`ref $cloStructIdx`), stored in a ref list whose element kind is 5 (the closure) — the
+    // SAME rep an `((i32) => i32)[]` array uses. A read yields a closure local; the call
+    // resolves its sig from the value annotation.
+    kind = 14
   } else {
     vsi = structIndexByValName(valName)
     if vsi >= 0 { kind = 1 }
@@ -2223,6 +2229,11 @@ function mvShapeOfValName(valName: string) {
     } else {
       mvRlSlot.push(rlInternName(valName, refArrElemKind(valName + "[]")))
     }
+    rlUsed = true
+    raUsed = true
+  } else if kind == 14 {
+    // A CLOSURE-VALUE ref list: element kind 5 (the closure fat-pointer, heap `cloStructIdx`).
+    mvRlSlot.push(rlInternName(valName, 5))
     rlUsed = true
     raUsed = true
   } else {
@@ -2553,11 +2564,15 @@ function collectLocals(blockIx: i32, fnIx: i32) {
           slot = addLocalName(s.letName, 20, -1)
         } else if letIsRefArray(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 5, letRefListSlot(stmts[i], fnIx))
-        } else if letIsNulClosure(stmts[i], fnIx) {
-          // A NULLABLE function-VALUE local (`let c: ((i32) => i32) | null`), kind 19 — its
-          // cell is the NULLABLE closure fat-pointer `(ref null $cloStructIdx)`, so it holds
-          // a function OR `null`. BEFORE `letIsUnion` (the `fn | null` annotation reads as a
-          // union name) and the non-null closure (kind 14).
+        } else if (
+          letIsNulClosure(stmts[i], fnIx) ||
+          letInfersNulClosure(stmts[i], fnIx)
+        ) {
+          // A NULLABLE function-VALUE local (`let c: ((i32) => i32) | null`, kind 19), OR an
+          // un-annotated `const f = m[k]` over a function-valued map (a bare map read is
+          // nullable — `letInfersNulClosure`). Its cell is the NULLABLE closure fat-pointer
+          // `(ref null $cloStructIdx)`, holding a function OR `null`. BEFORE `letIsUnion` (the
+          // `fn | null` annotation reads as a union name) and the non-null closure (kind 14).
           slot = addLocalName(s.letName, 19, -1)
         } else if letIsVariant(stmts[i], fnIx) {
           // A CONCRETE union-variant local (`const c: Cat = …`), kind 8 — its cell is the
@@ -20042,6 +20057,26 @@ function exprNulClosure(exprIx: i32, fnIx: i32) {
   // code 22): the raw `(ref null $cloStruct)` — its `!= null` lowers to `ref.is_null` and
   // the narrowed call recovers non-null (`ref.as_non_null`) at the call site.
   if e is Member { return memberFieldCode(ux, fnIx) == 22 }
+  // A bare `m[k]` over a FUNCTION-valued map (mv kind 14) reads back a NULLABLE closure
+  // `(ref null $cloStruct)` — `const f = m[k]` binds the kind-19 niche, narrowed `if f != null`.
+  if e is Index {
+    const mrs = mapReadMvSlot(ux, fnIx)
+    if mrs >= 0 { return mvValKind[mrs] == 14 }
+  }
+  false
+}
+
+// True if an UN-annotated `const f = <init>` should infer a NULLABLE-closure (kind 19) slot —
+// its init reads back a nullable closure (a bare `m[k]` over a function-valued map). The
+// annotated form is `letIsNulClosure`; this is its init-driven dual (it lives here, not in
+// `emit_query`, because it consults the wasmEmit-side `exprNulClosure`).
+function letInfersNulClosure(letIx: i32, fnIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    if d.letInit < 0 { return false }
+    return exprNulClosure(d.letInit, fnIx)
+  }
   false
 }
 
@@ -22322,6 +22357,15 @@ function exprIsClosure(exprIx: i32, fnIx: i32) {
         return rlElemKindTbl[slot] == 5
       }
     }
+    // A bare `m[k]` over a FUNCTION-valued map (`{[string]: (i32) => i32}`, mv kind 14) reads
+    // back the closure (nullable — narrow with `if f != null`).
+    const mrs = mapReadMvSlot(exprIx, fnIx)
+    if mrs >= 0 { return mvValKind[mrs] == 14 }
+  }
+  // `m[k] ?? d` over a function-valued map yields the closure.
+  if e is BinExpr {
+    const cm = coalesceMvSlot(exprIx, fnIx)
+    if cm >= 0 { return mvValKind[cm] == 14 }
   }
   false
 }
