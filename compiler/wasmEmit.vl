@@ -547,6 +547,9 @@ function cloRetValSlot(fe: i32) {
       if k == 1 || k == 9 { return retStructIndex(fn.fnRet) }
       // A `: Cat` annotated variant result (kind 8) — the slot is the VARIANT index.
       if k == 8 { return variantIndexOf(tyNameOf(fn.fnRet)) }
+      // A `: S[]` / `: ((i32) => i32)[]` annotated REF-LIST result (kind 5) — the slot is the
+      // ref-list slot (`rlWrapIdx`-bearing), the dual of a `cloParamTok` kind-5 param's slot.
+      if k == 5 { return tyAnnRefListSlot(fn.fnRet) }
       return -1
     }
     // A collapsed-to-one-variant inferred result (kind 8) — the variant index.
@@ -554,6 +557,9 @@ function cloRetValSlot(fe: i32) {
     if cvi >= 0 { return cvi }
     if fRetRef[fe] == 1 { return fRetStructIdx[fe] }
     if fRetNul[fe] == 1 { return fRetStructIdx[fe] }
+    // An inferred ref-list return (`() => [{…}]` / `() => [(x) => …]`, kind 5) — its element
+    // NAME (`fRetRArrElem`, set by the return-classify scan) resolves the ref-list slot.
+    if fRetListKind[fe] == 5 { return rlSlotByName(fRetRArrElem[fe]) }
   }
   -1
 }
@@ -588,8 +594,14 @@ function cloRetKeySuffix(fe: i32) {
   // kind 14), recovered non-null at the value-call site like any other ref result. Lets a
   // curried lambda (`(a) => (b) => …`) lower as a callable closure VALUE.
   if k == 14 { return ">c" }
-  // A ref-list (5) return remains a later slice: that rep still mismatches the closure
-  // `$fnsig` result, so it stays un-minted (a clean "no interned signature").
+  // A REF-LIST result (kind 5 — `S[]` / `((i32) => i32)[]` / a union list): the `$fnsig` result
+  // is the ref-list WRAPPER ref (`fbValtype` kind 5, slot = `cloRetValSlot`), recovered non-null
+  // at the value-call site like every other ref result. Keyed by the slot so two closures share a
+  // sig iff they return the SAME ref-list shape — the result dual of the `r<idx>;` PARAM token.
+  if k == 5 {
+    const rs = cloRetValSlot(fe)
+    if rs >= 0 { return ">r" + i32ToStr(rs) + ";" }
+  }
   ""
 }
 
@@ -21432,7 +21444,12 @@ function exprRefArray(exprIx: i32, fnIx: i32) {
     // `__array_new__(n, {…})` builds a ref list of the element struct (kind 3).
     if arrNewIntrKind(exprIx, fnIx) == 3 { return true }
     const callee = P.nodes[e.callFn]
-    if callee is Ident { return fnRetRefArray(callee.identName) }
+    if callee is Ident {
+      if fnRetRefArray(callee.identName) { return true }
+      // A closure-VALUE callee returning a ref list (`mk: () => S[]`) — its resolved `$fnsig`
+      // result is the ref-list wrapper (`>r<slot>;`, kind 5), so `mk()[i]` indexes it directly.
+      return calleeRetKind(callee.identName, fnIx) == 5
+    }
     // A `.filter` over a struct/union array yields the SAME ref list (kind 2).
     if callee is Member {
       if mfResultKindOf(exprIx, fnIx) == 2 { return true }
@@ -21543,7 +21560,15 @@ function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
       return ""
     }
     const callee = P.nodes[e.callFn]
-    if callee is Ident { return fnRetRefArrayName(callee.identName) }
+    if callee is Ident {
+      const fn = fnRetRefArrayName(callee.identName)
+      if fn != "" { return fn }
+      // A closure-VALUE callee returning a ref list (`mk: () => S[]`): its element name is the
+      // `rlElemName` of the `>r<slot>;` result slot parsed off the callee's resolved `$fnsig`.
+      const rs = sigKeyRetSlot(calleeCloSigKey(callee.identName, fnIx))
+      if rs >= 0 && rs < rlElemName.length { return rlElemName[rs] }
+      return ""
+    }
     // A ref-valued `m.values()` yields a ref list whose element is the map's VALUE — read
     // its name off the value's mv ref-list slot (`mvRlSlot`). Checked before the `.filter`
     // result-slot path (a `.values()` is not a `.map`/`.filter`).
@@ -22827,6 +22852,15 @@ function annRetKind(t: string) {
   if t == "i32[]" { return ">a" }
   if nameIsStringArray(t) { return ">A" }
   if nameIsF64Array(t) { return ">D" }
+  // A REF-LIST return — `S[]` / `((i32) => i32)[]` / a union list → `>r<slot>;`, matching
+  // `cloRetKeySuffix`. BEFORE the closure case so a closure-ELEMENT array's nested `=>` is not
+  // misread as a single-closure result. The slot resolves via the element name — the SAME
+  // `rlSlotByName(refArrElemName(...))` the AST producer's `cloRetValSlot` uses, so the two
+  // producers' keys byte-match (else the value-call `ref.cast` to this `$fnsig` traps).
+  if nameIsRefArray(t) {
+    const rs = rlSlotByName(refArrElemName(t))
+    if rs >= 0 { return ">r" + i32ToStr(rs) + ";" }
+  }
   // A CLOSURE return — a function-type result (`(i32) => ((i32) => i32)`) → `>c`, matching
   // `cloRetKeySuffix`'s closure-result token so the AST and annotation sig producers agree
   // (a curried lambda's `$fnsig` must byte-match, else the value-call `ref.cast` traps). The
@@ -23098,7 +23132,37 @@ function sigKeyRetKind(k: string) {
   if c == 'c' {
     return 14 // a CLOSURE result (a function returning a function)
   }
+  if c == 'r' {
+    return 5 // a REF-LIST result (`>r<slot>;` — struct / closure / union list)
+  }
   -3
+}
+
+// The ref-list SLOT of a `>r<slot>;` result key (the digits between `r` and `;`), or -1 when the
+// key's result is not a ref list. Lets a closure-VALUE call result (`mk()` with `mk: () => S[]`)
+// recover its element ref-list slot for an index/`.length`/for-in directly off the callee's sig.
+function sigKeyRetSlot(k: string) {
+  const n = k.length
+  let gt = -1
+  let i = 0
+  while i < n {
+    if k[i] == '>' { gt = i }
+    i = i + 1
+  }
+  if gt < 0 || gt + 2 >= n { return -1 }
+  if k[gt + 1] != 'r' { return -1 }
+  let j = gt + 2
+  let acc = 0
+  let saw = false
+  while j < n && k[j] != ';' {
+    const d = k[j]
+    if d < '0' || d > '9' { return -1 }
+    acc = acc * 10 + (d - '0')
+    saw = true
+    j = j + 1
+  }
+  if !saw { return -1 }
+  acc
 }
 
 function calleeRetKind(name: string, fnIx: i32) {
