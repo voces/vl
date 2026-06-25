@@ -4433,24 +4433,118 @@ function fnHasUnannotatedParam(fe: i32) {
   false
 }
 
+// Does `name` appear as a VALUE — any position OTHER than the callee of a direct `name(...)`
+// call — anywhere in the subtree at `ix`? A generic function value bound to `name` (`const g
+// = f`) is sound to emit only when every use is a direct call: `monomorphize` rewrites each
+// `g(args)` to its per-call instance, so the stored closure is `call_ref`'d only at the type
+// its slot was pinned to. A value-USE (an argument, a return, an array element) escapes to a
+// `call_ref` whose type the binding cannot guarantee. Mirrors `monoWalk`'s node coverage.
+function nameUsedAsValueIn(name: string, ix: i32) {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName == name }
+  if n is Call {
+    const callee = P.nodes[n.callFn]
+    let direct = false
+    if callee is Ident {
+      if callee.identName == name { direct = true }
+    }
+    if !direct {
+      if nameUsedAsValueIn(name, n.callFn) { return true }
+    }
+    const args = n.callArgs
+    let i = 0
+    while i < args.length {
+      if nameUsedAsValueIn(name, args[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if n is Block {
+    const bs = n.blkStmts
+    let i2 = 0
+    while i2 < bs.length {
+      if nameUsedAsValueIn(name, bs[i2]) { return true }
+      i2 = i2 + 1
+    }
+    return false
+  }
+  if n is LetDecl { return nameUsedAsValueIn(name, n.letInit) }
+  if n is IfStmt {
+    if nameUsedAsValueIn(name, n.ifCond) { return true }
+    if nameUsedAsValueIn(name, n.ifThen) { return true }
+    return nameUsedAsValueIn(name, n.ifElse)
+  }
+  if n is WhileStmt {
+    if nameUsedAsValueIn(name, n.whileCond) { return true }
+    return nameUsedAsValueIn(name, n.whileBody)
+  }
+  if n is ForRange {
+    if nameUsedAsValueIn(name, n.frFrom) { return true }
+    if nameUsedAsValueIn(name, n.frTo) { return true }
+    if nameUsedAsValueIn(name, n.frStep) { return true }
+    return nameUsedAsValueIn(name, n.frBody)
+  }
+  if n is ForIn {
+    if nameUsedAsValueIn(name, n.fiIter) { return true }
+    return nameUsedAsValueIn(name, n.fiBody)
+  }
+  if n is RetStmt { return nameUsedAsValueIn(name, n.retArg) }
+  if n is BinExpr {
+    if nameUsedAsValueIn(name, n.binLeft) { return true }
+    return nameUsedAsValueIn(name, n.binRight)
+  }
+  if n is Unary { return nameUsedAsValueIn(name, n.unArg) }
+  if n is Paren { return nameUsedAsValueIn(name, n.parInner) }
+  if n is Member { return nameUsedAsValueIn(name, n.memObj) }
+  if n is OptMember { return nameUsedAsValueIn(name, n.omObj) }
+  if n is Index {
+    if nameUsedAsValueIn(name, n.idxArr) { return true }
+    return nameUsedAsValueIn(name, n.idxIndex)
+  }
+  if n is IsExpr { return nameUsedAsValueIn(name, n.isObj) }
+  if n is ArrayLit {
+    const es = n.arrElems
+    let i3 = 0
+    while i3 < es.length {
+      if nameUsedAsValueIn(name, es[i3]) { return true }
+      i3 = i3 + 1
+    }
+    return false
+  }
+  if n is ObjLit {
+    const fs = n.objFields
+    let i4 = 0
+    while i4 < fs.length {
+      const f = P.nodes[fs[i4]]
+      if f is FieldInit {
+        if nameUsedAsValueIn(name, f.fiValue) { return true }
+      }
+      i4 = i4 + 1
+    }
+    return false
+  }
+  false
+}
+
 // `ref.null struct` for a non-capturing function, else a `struct.new $envStruct` of the
 // captured values, each READ in the enclosing frame `fnIx` (so a capture of `n` emits a
 // `local.get` of `n` in the maker's frame). The id is the lifted function's wasm index
 // (`gImports + fe`) — the `==` identity token. Mirrors the host's `closureValue`.
 function emitClosureValue(body: i32[], fe: i32, fnIx: i32) {
-  if fe < 0 || fe >= fnStmts.length {
-    return emitFail("emitProgram: function value with no lifted function")
-  }
   // SOUNDNESS FLOOR: a GENERIC function (un-annotated parameters) taken as a VALUE emits its
   // params at the i32 DEFAULT (`vtKindOfParam(-1)` → 0), so the value is only callable at i32 —
   // `g(2.5, …)` / `g("x", …)` then `ref.cast`s the funcref to the wrong functype (invalid wasm),
-  // and even the i32 case only "works" by coincidence. A function VALUE must be monomorphic: a
-  // direct name call monomorphizes per call site, but a value binding does not. Reject taking a
-  // generic function as a value (annotate its parameters, or call it directly by name). Making it
-  // WORK at the used type — value-flow monomorphization — is the follow-up. NAMED source functions
-  // only: a lifted LAMBDA with un-annotated params is either checker-rejected (a bare uninferable
-  // binding) or cloned/contextually-pinned per use (a `.map`/`.filter` callback), so its i32
-  // default is sound — `criFnIsAnonLambda` excludes it.
+  // and even the i32 case only "works" by coincidence. A function VALUE must be monomorphic. A
+  // `const g = f` binding whose `g` is used ONLY as a direct-call callee IS sound (each `g(args)`
+  // is monomorphized per call site, so the closure is `call_ref`'d only at the type its slot was
+  // pinned to) — that case routes through `emitClosureValueCore` directly (the LetDecl emit),
+  // skipping this floor. Every OTHER value-use (passed as an argument, returned, stored in an
+  // array) escapes to a `call_ref` whose type the binding can't guarantee, and lands here: reject
+  // (annotate its parameters, or call it directly by name). NAMED source functions only: a lifted
+  // LAMBDA with un-annotated params is either checker-rejected (a bare uninferable binding) or
+  // cloned/contextually-pinned per use (a `.map`/`.filter` callback), so its i32 default is sound
+  // — `criFnIsAnonLambda` excludes it.
   if fnHasUnannotatedParam(fe) {
     if !criFnIsAnonLambda(fe) {
       return emitFail(
@@ -4458,6 +4552,17 @@ function emitClosureValue(body: i32[], fe: i32, fnIx: i32) {
           "parameters would default to i32; annotate them, or call it directly by name",
       )
     }
+  }
+  return emitClosureValueCore(body, fe, fnIx)
+}
+
+// The closure-value emission WITHOUT the un-annotated-param floor — the `cloSigKeyExt`
+// representability floor still applies (even a sound direct-call-only binding is `call_ref`'d,
+// so its env-leading signature must be representable). Reached either through `emitClosureValue`
+// (after its floor) or directly from the LetDecl emit for a monomorphized direct-call-only alias.
+function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
+  if fe < 0 || fe >= fnStmts.length {
+    return emitFail("emitProgram: function value with no lifted function")
   }
   // SOUNDNESS FLOOR: a function whose env-leading signature is not representable as a
   // closure `$fnsig` (`cloSigKeyExt` returns "" — an i64/f32 or nullable-ref / union /
@@ -14347,6 +14452,30 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       // so later reads/writes resolve to this slot.
       scopeBind(s.letName, slot)
       return 0
+    }
+    // VALUE-FLOW MONOMORPHIZATION: a `const g = f` binding to a GENERIC (un-annotated-param)
+    // NAMED function, where `g` is used ONLY as a direct-call callee (`g(args)`), is sound.
+    // `monomorphize` rewrote each `g(args)` to its per-call instance (the first/i32 shape stays
+    // on `f`'s own slot, keeping its un-annotated params for byte-identity), so the closure
+    // stored here is `call_ref`'d only at the type its slot was pinned to. The value floor in
+    // `emitClosureValue` would reject it on those un-annotated params, so emit through the
+    // floor-LESS core. A value-USE of `g` (passed, returned, stored) escapes — `nameUsedAsValueIn`
+    // catches it — and falls through to the normal path, where the floor rejects it.
+    if fnIx >= 0 {
+      const aliasFe = fieldValueFeOf(s.letInit)
+      if fnHasUnannotatedParam(aliasFe) {
+        if !criFnIsAnonLambda(aliasFe) {
+          const encl = P.nodes[fnIx]
+          if encl is FuncDecl {
+            if !nameUsedAsValueIn(s.letName, encl.fnBody) {
+              if emitClosureValueCore(body, aliasFe, fnIx) < 0 { return -1 }
+              fbLocalSet(idx) // 0x21 local.set
+              scopeBind(s.letName, slot)
+              return 0
+            }
+          }
+        }
+      }
     }
     // A degenerate UN-ANNOTATED `let x = null` (A-infer-null): when NO later
     // assignment fills the hole (`nliNameOf` recorded nothing), the binding's
@@ -24785,6 +24914,18 @@ function monoWalk(ix: i32, ctx: i32) {
     const callee = P.nodes[n.callFn]
     if callee is Ident {
       let fe = fnIndexOf(callee.identName)
+      if fe < 0 {
+        // A direct call through a VALUE binding to a generic NAMED function (`const g = add;
+        // g(3, 4)`): resolve `g` to `add`'s lifted slot and monomorphize per call site, exactly
+        // as a by-name call. NAMED functions only — a lambda bound to a closure-typed local
+        // (`const f: (i32) => i32 = (x) => …`) is contextually pinned and `call_ref`'d, never
+        // monomorphized (`criFnIsAnonLambda` excludes it; the emit-time value floor and the
+        // LetDecl direct-call exemption keep the two paths sound).
+        const afe = identClosureFe(callee.identName, ctx)
+        if afe >= 0 {
+          if !criFnIsAnonLambda(afe) { fe = afe }
+        }
+      }
       if fe >= 0 && fe < monoGen.length {
         if monoGen[fe] == 1 { return monoInstantiate(fe, ix, ctx) }
       }
