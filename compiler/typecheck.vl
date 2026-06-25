@@ -2570,7 +2570,79 @@ function isFloatLitArrayExpr(ix: i32) {
   false
 }
 
+// Does function type `tyIx` carry an inference HOLE — a `TyVar` param or return? Such a type is a
+// GENERIC (capability-bounded) function value (`(a, b) => a + b`), not a concrete signature.
+function fnTyHasHole(tyIx: i32) {
+  const t = T.tys[tyIx]
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let i = 0
+    while i < ps.length {
+      if tyIsHole(ps[i]) { return true }
+      i = i + 1
+    }
+    return tyIsHole(t.fnRet)
+  }
+  false
+}
+
+// Do every deferred binary-op constraint THIS binding resolves hold (the capability check, as a
+// pure boolean — `validateBinCstrs` is the diagnostic-emitting twin)? A constraint still touching
+// an unbound hole defers (true here).
+function binCstrsHold(bNames: string[], bTys: i32[]) {
+  let ci = 0
+  while ci < binCstrOp.length {
+    const clt = substTyDeep(binCstrLt[ci], bNames, bTys)
+    const crt = substTyDeep(binCstrRt[ci], bNames, bTys)
+    if !tyIsHole(clt) {
+      if !tyIsHole(crt) {
+        if !binOpDefinedFor(binCstrOp[ci], clt, crt) { return false }
+      }
+    }
+    ci = ci + 1
+  }
+  true
+}
+
+// Is a GENERIC function value of type `srcTy` (hole params/return) assignable to the CONCRETE
+// function type `dstTy`? Instantiate it at `dstTy`'s param types (bind the holes), require the
+// body's capability to hold there and the substituted return to match `dstTy`'s return — exactly
+// the per-call-site instantiation, but driven by the target type. This governs every typed boundary
+// a generic function value meets (an annotated binding/param/return/element); the emitter then
+// materializes that instance (`monoInstanceFor`). The permissive structural `assignable` (which a
+// hole passes unconditionally) would wrongly accept a return/capability mismatch that cannot lower.
+function genericFnAssignable(srcTy: i32, dstTy: i32) {
+  const s = T.tys[srcTy]
+  const d = T.tys[dstTy]
+  if s is TyFunc {
+    if d is TyFunc {
+      const sp = s.fnParamTypes
+      const dp = d.fnParamTypes
+      if sp.length != dp.length { return false }
+      const bNames: string[] = []
+      const bTys: i32[] = []
+      let i = 0
+      while i < sp.length {
+        bindGenWalk(sp[i], dp[i], bNames, bTys)
+        if !assignable(dp[i], sp[i]) { return false }
+        i = i + 1
+      }
+      if !binCstrsHold(bNames, bTys) { return false }
+      return assignable(substTyDeep(s.fnRet, bNames, bTys), d.fnRet)
+    }
+  }
+  false
+}
+
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  // A GENERIC function value meeting a CONCRETE function type is governed by instantiation, NOT the
+  // permissive structural `assignable` (a hole param/return passes that unconditionally — so a
+  // return mismatch `(i32,i32)=>string = add` or an unsatisfiable capability `(Cat,Cat)=>Cat = add`
+  // would slip through and emit invalid wasm). Decide it by instantiating at the target's params.
+  if fnTyHasHole(srcTy) {
+    const dGen = T.tys[dstTy]
+    if dGen is TyFunc { return genericFnAssignable(srcTy, dstTy) }
+  }
   if assignable(srcTy, dstTy) { return true }
   // A float literal re-encodes EXACTLY at f32, so it flows into any destination whose f32
   // position it fits: a bare `f32`, a nullable `f32?` (a map value / niche), or an f32 MEMBER
