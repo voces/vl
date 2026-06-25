@@ -1051,6 +1051,25 @@ function letIsNulRef(letIx: i32, fnIx: i32) {
   false
 }
 
+// A bare `m[k]` map read is `V | null`. A struct (kind 9), string (16), or closure (19) value
+// binds a supported nullable local — but a UNION (mv kind 2) or ref-LIST (mv kind 6) value has no
+// nullable local rep, so the bare read would lower to a non-null local while `emitMapGet` yields a
+// `(ref null …)`: invalid wasm. Detect that shape so the binding is a CLEAN reject (use `m[k] ??
+// <default>`, which loads the non-null value) instead. Gated to un-annotated bindings — an
+// annotation drives the kind explicitly and is classified before this.
+function letBareUnwiredNulMapRead(letIx: i32, fnIx: i32) {
+  let d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    const mrs = mapReadMvSlot(d.letInit, fnIx)
+    if mrs >= 0 {
+      const k = mvValKind[mrs]
+      return k == 2 || k == 6
+    }
+  }
+  false
+}
+
 // True if evaluating the expression at `exprIx` yields a NULLABLE i32-list ref —
 // a nullable-list-annotated param/local/global reference or a `rest: i32[]|null`
 // FIELD read (code 18). The nullable-LIST dual of `exprNullableStruct`: list-op
@@ -1133,6 +1152,12 @@ function exprNullableString(exprIx: i32, fnIx: i32) {
   }
   // A `string | null` struct FIELD read (`a.v`, code 20) yields a nullable string ref.
   if e is Member { return memberFieldCode(exprIx, fnIx) == 20 }
+  // A BARE `m[k]` over a STRING-valued map is `string | null` (kind 16) — `emitMapGet` yields the
+  // `(ref null)` value unrecovered, the string dual of the bare struct-map read.
+  if e is Index {
+    const mrs = mapReadMvSlot(exprIx, fnIx)
+    if mrs >= 0 { return mvValKind[mrs] == 3 }
+  }
   // A chained `a ?? b` over nullable strings is ITSELF nullable-string when the default
   // `b` is also nullable (the result can still be null) — the left-associative
   // `(f() ?? g()) ?? d` shape, where the classifier sees this nested `??` as `binLeft`
@@ -1209,6 +1234,13 @@ function exprNullableStruct(exprIx: i32, fnIx: i32) {
         if nullablePartOf(rlElemName[slot]) != "" { return true }
       }
     }
+    // A BARE map get `m[k]` over a STRUCT-valued map (`{[string]: S}`) is `S | null` — the
+    // `vals` slot is `(ref null $S)` and `emitMapGet` yields it unrecovered (a miss is
+    // `ref.null`). So `const v = m[k]` binds the kind-9 niche and narrows with `if v != null`,
+    // the map-read dual of the nullable-struct ARRAY element above. (A `?? d` read is a BinExpr,
+    // not this Index, and stays the non-null value.)
+    const mrs = mapReadMvSlot(exprIx, fnIx)
+    if mrs >= 0 { return mvValKind[mrs] == 1 }
   }
   false
 }
@@ -2531,6 +2563,14 @@ function collectLocals(blockIx: i32, fnIx: i32) {
           // binding (its `.values()` walks the keys), an mv slot (>= 0) for a
           // ref-valued map, `-1` for the mono i32 map.
           slot = addLocalName(s.letName, 6, letMapShapeOf(stmts[i], fnIx))
+        } else if letBareUnwiredNulMapRead(stmts[i], fnIx) {
+          // `const v = m[k]` over a UNION- or ref-LIST-valued map is `V | null` with no nullable
+          // local rep — reject cleanly (bind `m[k] ?? <default>`) rather than emit invalid wasm.
+          // Struct / string / closure value reads fall through to their nullable kinds below.
+          return emitFail(
+            "emitProgram: a bare `m[k]` read of a union- or list-valued map is `V | null`; " +
+              "use `m[k] ?? <default>`",
+          )
         } else if letIsNulRef(stmts[i], fnIx) {
           // Nullable struct (`S | null`, code 9): annotation-first, else the
           // initializer's nullable-returning call. BEFORE the struct case (a
@@ -20697,6 +20737,12 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32) {
       if nmnn != "" { nm = nmnn }
       let si = structIndexByName(nm)
       if si >= 0 { return si }
+    }
+    // A BARE `m[k]` over a STRUCT-valued map resolves to the value type's struct index, so a
+    // narrowed `(m[k]).field` finds the layout — the Index dual of the `?? default` BinExpr case.
+    const mrs = mapReadMvSlot(exprIx, fnIx)
+    if mrs >= 0 {
+      if mvValKind[mrs] == 1 { return mvValStructIdx[mrs] }
     }
   }
   // A field read `o.inner` whose field is a NESTED STRUCT (code 15) yields the
