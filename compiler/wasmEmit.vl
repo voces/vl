@@ -493,6 +493,33 @@ function fieldValueFeOf(valIx: i32) {
   -1
 }
 
+// The single mapping from an UN-ANNOTATED function's inferred `fRet*` tables to its RESULT
+// valtype kind — the one place a new inferred-return kind is added. Shared by the named-function
+// functype-result emission and `cloRetValKind` (the closure result), so the two can no longer
+// drift (the f32/f64/i64 inferred-return holes were each one of these two sites missing a kind the
+// other had). LAST-MATCH wins, preserving the original override chains EXACTLY — the flags are NOT
+// all mutually exclusive (a struct-UNION return sets both `fRetUni` and `fRetRef`, and the later
+// `fRetRef` must win → kind 1). 0 (i32) when nothing matched. The closure- and variant-collapse
+// cases (kinds 14 / 8) and the `tailIsF64NoLocal` backup are layered by the callers — they are not
+// driven by these flags.
+function inferredRetKindCore(ti: i32) {
+  let k = 0
+  if fRetStr[ti] == 1 { k = 3 }
+  if fRetListKind[ti] == 2 { k = 2 }
+  if fRetUni[ti] == 1 { k = 4 }
+  if fRetRef[ti] == 1 { k = 1 }
+  if fRetNul[ti] == 1 { k = 9 }
+  if fRetListKind[ti] == 5 { k = 5 }
+  if fRetListKind[ti] == 7 { k = 7 }
+  if fRetListKind[ti] == 12 { k = 12 }
+  if fRetMap[ti] == 1 { k = 6 }
+  if fRetNulStr[ti] == 1 { k = 16 }
+  if fRetF64[ti] == 1 { k = 11 }
+  if fRetI64[ti] == 1 { k = 10 }
+  if fRetF32[ti] == 1 { k = 13 }
+  k
+}
+
 // The RESULT valtype KIND of lifted function `fe`'s `$fnsig` functype — the same kind the
 // function's OWN functype emits, read from an annotation (`vtKindOfType`) or the inferred
 // `fRet*` tables, so the closure functype byte-matches the callee. -1 for void (0 results)
@@ -515,18 +542,12 @@ function cloRetValKind(fe: i32) {
     // variant struct (kind 8), NOT the union box. Checked BEFORE `fRetUni`, which the
     // emitter's syntactic inference also sets for the narrowed receiver arm.
     if cbRetVariantIdx(fe) >= 0 { return 8 }
-    if fRetStr[fe] == 1 { return 3 }
-    if fRetListKind[fe] == 2 { return 2 }
-    if fRetUni[fe] == 1 { return 4 }
-    if fRetRef[fe] == 1 { return 1 }
-    if fRetNul[fe] == 1 { return 9 }
-    if fRetListKind[fe] == 5 { return 5 }
-    if fRetListKind[fe] == 7 { return 7 }
-    if fRetListKind[fe] == 12 { return 12 }
-    if fRetMap[fe] == 1 { return 6 }
-    if fRetNulStr[fe] == 1 { return 16 }
-    if fRetF64[fe] == 1 { return 11 }
-    if fRetI64[fe] == 1 { return 10 }
+    // The shared inferred-return-kind mapping (the SAME one the named-function functype result
+    // uses) — so a scalar/list/ref kind added there is reflected here too. The closure-specific
+    // cases (closure / variant-collapse above; the `tailIsF64NoLocal` backup below) are layered
+    // around it.
+    const core = inferredRetKindCore(fe)
+    if core != 0 { return core }
     // An f64 tail with no intervening local (a `.map`/`.filter` callback `n => n * 2.0`)
     // — its f64-ness is detected structurally, not via `fRetF64` (mirrors the old
     // `cloRetKindOf`; without this the callback's functype declared i32 over an f64 body).
@@ -17693,64 +17714,20 @@ function emitModule(stmts: i32[]) {
         // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
         // fRet* tables the annotation path fills). i32 when nothing matched.
         wU8(1) // 1 result
-        let infKind = 0
+        // The inferred result KIND from the single shared mapping (`inferredRetKindCore`) — so
+        // this site and `cloRetValKind` can't drift on a scalar/list/ref kind (the f32/f64/i64
+        // inferred-return holes were each one site missing what the other had). The SLOT follows
+        // the kind: struct index for a struct / nullable-struct ref (1 / 9), the element wrapper
+        // for a ref list (5, via the recorded element name), the map shape for a map (6); every
+        // other kind (string / scalar list / scalars) needs no per-function slot.
+        const infKind = inferredRetKindCore(ti)
         let infSlot = -1
-        if fRetStr[ti] == 1 { infKind = 3 }
-        if fRetListKind[ti] == 2 { infKind = 2 }
-        if fRetUni[ti] == 1 { infKind = 4 }
-        if fRetRef[ti] == 1 {
-          infKind = 1
-          infSlot = fRetStructIdx[ti]
-        }
-        if fRetNul[ti] == 1 {
-          infKind = 9
-          infSlot = fRetStructIdx[ti]
-        }
-        if fRetListKind[ti] == 5 {
-          infKind = 5
-          // The ref-list result valtype needs THIS function's element wrapper slot (the
-          // annotated path passes it as `retStructIndex`; the inferred path reads the recorded
-          // element name). Without it the kind-5 valtype has "no interned shape".
-          infSlot = rlSlotByName(fRetRArrElem[ti])
-        }
-        // A `string[]` (string-ref list) return — kind 7. Its wrapper heap type is the
-        // module-global `mkListIdx` singleton (no per-function slot), so `infSlot` is
-        // unused, exactly as for the annotated `string[]` path through `vtKindOfType`.
-        if fRetListKind[ti] == 7 { infKind = 7 }
-        // An f64 list (`f64[]`) inferred return — kind 12, wrapper `$fl64TypeIdx`. Same result
-        // valtype the annotated `: f64[]` path picks via `vtKindOfType`; without it an
-        // un-annotated `f64[]` return (a literal, built list, or `.map`/`.filter` result)
-        // declares an i32 result while the body yields the f64-list ref — a wasm mismatch.
-        if fRetListKind[ti] == 12 { infKind = 12 }
-        // A mono map (`{[string]: i32}`) inferred return — kind 6, `(ref $mapStruct)` with the
-        // mono shape (`infSlot` stays -1 → `mapTypeIdxOf(-1)`). Same result valtype the
-        // annotated path picks via `vtKindOfType`.
-        if fRetMap[ti] == 1 {
-          infKind = 6
-          // The map SHAPE of the (un-annotated) returned map — mono ⇒ -1, or the mv slot for a
-          // `string`-valued map (`return m` over a `string`-valued map param/local). Without it
-          // the result valtype declares the mono `$mapStruct` while the body yields the
-          // string-map struct, a wasm mismatch.
+        if infKind == 1 || infKind == 9 { infSlot = fRetStructIdx[ti] }
+        if infKind == 5 { infSlot = rlSlotByName(fRetRArrElem[ti]) }
+        if infKind == 6 {
           const mrx = fnRetExprOf(fnStmts[ti])
           if mrx >= 0 { infSlot = mapRetExprShape(mrx, fnStmts[ti]) }
         }
-        // A `string | null` niche inferred return — kind 16 (`ref null $array`), the same
-        // result valtype the annotated path picks via `vtKindOfType`. (`boolean | null`
-        // stays kind 0: its null is an i32 sentinel, not a ref.)
-        if fRetNulStr[ti] == 1 { infKind = 16 }
-        // An inferred SCALAR f64 (kind 11, `0x7c`) / i64 (kind 10, `0x7e`) return — the
-        // result valtype the annotated `: f64` / `: i64` path already picks via
-        // `vtKindOfType`. Without this an un-annotated `function dbl(n: f64) { return n *
-        // 2.0 }` declared an i32 result while its body returns f64, a wasm type mismatch IN
-        // the callee — masked until now because every f64/i64-return corpus case is
-        // explicitly annotated. (`fRetF64`/`fRetI64` are set from the checker's inferred
-        // return name in `buildFnMap`'s A20 pass, exactly as the scalar/string kinds are.)
-        if fRetF64[ti] == 1 { infKind = 11 }
-        if fRetI64[ti] == 1 { infKind = 10 }
-        // An inferred SCALAR f32 (kind 13, `0x7d`) return — the f32 dual of the f64/i64 case
-        // above. Without it an un-annotated `function half(x: f32) { return x }` declared an i32
-        // result over an f32-returning body (a wasm type mismatch the checker accepts).
-        if fRetF32[ti] == 1 { infKind = 13 }
         fbValtype(infKind, infSlot)
       } else {
         wU8(1) // 1 result
