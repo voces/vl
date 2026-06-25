@@ -4413,6 +4413,26 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
 // ── function-value construction (lambdas) ─────────────────────────────────────
 // Emit a function VALUE for the lifted function at `fnStmts` position `fe`: the closure
 // fat-pointer `struct.new $cloStruct [ ref.func $(gImports+fe), env, id ]`. The env is
+// True if lifted function `fe` has any UN-ANNOTATED parameter — a generic (its un-annotated param
+// is a per-call-site inference hole). Such a function monomorphizes per direct call but i32-defaults
+// when taken as a VALUE, so the value site rejects it.
+function fnHasUnannotatedParam(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return false }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    const ps = fn.fnParams
+    let i = 0
+    while i < ps.length {
+      const p = P.nodes[ps[i]]
+      if p is Param {
+        if p.parType < 0 { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
 // `ref.null struct` for a non-capturing function, else a `struct.new $envStruct` of the
 // captured values, each READ in the enclosing frame `fnIx` (so a capture of `n` emits a
 // `local.get` of `n` in the maker's frame). The id is the lifted function's wasm index
@@ -4420,6 +4440,24 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
 function emitClosureValue(body: i32[], fe: i32, fnIx: i32) {
   if fe < 0 || fe >= fnStmts.length {
     return emitFail("emitProgram: function value with no lifted function")
+  }
+  // SOUNDNESS FLOOR: a GENERIC function (un-annotated parameters) taken as a VALUE emits its
+  // params at the i32 DEFAULT (`vtKindOfParam(-1)` → 0), so the value is only callable at i32 —
+  // `g(2.5, …)` / `g("x", …)` then `ref.cast`s the funcref to the wrong functype (invalid wasm),
+  // and even the i32 case only "works" by coincidence. A function VALUE must be monomorphic: a
+  // direct name call monomorphizes per call site, but a value binding does not. Reject taking a
+  // generic function as a value (annotate its parameters, or call it directly by name). Making it
+  // WORK at the used type — value-flow monomorphization — is the follow-up. NAMED source functions
+  // only: a lifted LAMBDA with un-annotated params is either checker-rejected (a bare uninferable
+  // binding) or cloned/contextually-pinned per use (a `.map`/`.filter` callback), so its i32
+  // default is sound — `criFnIsAnonLambda` excludes it.
+  if fnHasUnannotatedParam(fe) {
+    if !criFnIsAnonLambda(fe) {
+      return emitFail(
+        "emitProgram: cannot take a generic function (un-annotated parameters) as a value — its " +
+          "parameters would default to i32; annotate them, or call it directly by name",
+      )
+    }
   }
   // SOUNDNESS FLOOR: a function whose env-leading signature is not representable as a
   // closure `$fnsig` (`cloSigKeyExt` returns "" — an i64/f32 or nullable-ref / union /
