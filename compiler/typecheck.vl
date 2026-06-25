@@ -230,6 +230,14 @@ let holeShapeTys: i32[] = []
 // read `self[0]`), the indexing analogue of the demanded-shape check above.
 let holeArrayDemand: string[] = []
 
+// Un-annotated-param holes USED with a numeric operator (`n + 1`, `n < 2`): the param is a
+// capability-bounded generic that demands a NUMERIC argument (or a type with the operator
+// overloaded). The call-arg check rejects a non-numeric argument bound to such a param — the
+// arithmetic/comparison analogue of `holeArrayDemand`. Without it a numerically-used hole stayed
+// permissive (`isNumeric(TyVar)` is true) and `f("hi")` over `n + 1` reached emit as `string + i32`
+// → invalid wasm.
+let holeNumericDemand: string[] = []
+
 // The const-binding chain, PARALLEL to `T.scopes`: each frame records which of
 // its names were bound `const` (immutable NAME, not immutable data — a field
 // write through a const stays legal). Kept module-level (not a `Checker` field)
@@ -916,6 +924,7 @@ export function initChecker() {
   holeShapeNames = []
   holeShapeTys = []
   holeArrayDemand = []
+  holeNumericDemand = []
   fnDeclIx = Map()
   moduleGlobals = Map()
   topUnannotFns = []
@@ -3981,6 +3990,44 @@ function holeIsArrayDemanded(name: string) {
   false
 }
 
+// Record that hole `name` was used with a numeric operator (so it demands a numeric argument).
+// Idempotent.
+function noteNumericDemand(name: string) {
+  let i = 0
+  while i < holeNumericDemand.length {
+    if holeNumericDemand[i] == name { return 0 }
+    i = i + 1
+  }
+  holeNumericDemand.push(name)
+  0
+}
+
+function holeIsNumericDemanded(name: string) {
+  let i = 0
+  while i < holeNumericDemand.length {
+    if holeNumericDemand[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// If `tyIx` is an un-annotated-param hole (`TyVar`), record a numeric demand on it — called from
+// the arithmetic / comparison operand checks, where a hole reaching the `isNumeric` gate is being
+// USED as a number (the gate passes it permissively; the demand makes the call-arg check enforce it).
+function noteNumericDemandIfHole(tyIx: i32) {
+  if tyIx < 0 { return 0 }
+  const t = T.tys[tyIx]
+  if t is TyVar { noteNumericDemand(t.tvName) }
+  0
+}
+
+// Whether `at` satisfies a numeric-demanded hole: a numeric type (i32/i64/f32/f64 — `isNumeric`
+// also passes a still-unresolved `TyVar`, deferring to the outer call). A type that overloads the
+// operator (`function +(self: T, …)`) should also satisfy it, but operator overloads do not yet
+// LOWER (a separate emitter gap), so that case is left for when they do — rejecting it now is a
+// clean type error rather than the invalid wasm it would otherwise become.
+function numericCapabilityOk(at: i32) { isNumeric(at) }
+
 // A type that definitively CANNOT be indexed `[i]`: a scalar primitive (i32 / f64 / i64 /
 // f32 / boolean / null / …) — anything but a `string`. An array / string / struct (may carry
 // a `"[]"` trap) / map / hole / error is NOT rejected here (it resolves or defers).
@@ -4446,6 +4493,17 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           if tyIsNonIndexableScalar(at) {
             tErr(
               "argument " + i32ToStr(i + 1) + ": expected an array, got " + tyToStr(at),
+              ix,
+            )
+          }
+        }
+        if holeIsNumericDemanded(pHole.tvName) {
+          if !numericCapabilityOk(at) {
+            tErr(
+              "argument " +
+                i32ToStr(i + 1) +
+                ": parameter is used as a number, so it needs a numeric argument, got " +
+                tyToStr(at),
               ix,
             )
           }
@@ -5093,6 +5151,17 @@ function checkCallNode(n: Call, ix: i32) {
           if tyIsNonIndexableScalar(at) {
             tErr(
               "argument " + i32ToStr(i + 1) + ": expected an array, got " + tyToStr(at),
+              ix,
+            )
+          }
+        }
+        if holeIsNumericDemanded(pHole.tvName) {
+          if !numericCapabilityOk(at) {
+            tErr(
+              "argument " +
+                i32ToStr(i + 1) +
+                ": parameter is used as a number, so it needs a numeric argument, got " +
+                tyToStr(at),
               ix,
             )
           }
@@ -6697,6 +6766,9 @@ function checkNodeReal(ix: i32) {
       const ort = softenLitTy(rt)
       // String ordering: a lexicographic compare of two strings yields a bool.
       if isStringTy(olt) && isStringTy(ort) { return TY_BOOL }
+      // A hole operand reaching a numeric comparison is USED numerically — record the demand.
+      noteNumericDemandIfHole(olt)
+      noteNumericDemandIfHole(ort)
       if !isNumeric(olt) || !isNumeric(ort) {
         tErr(
           "comparison expects numeric operands, got " +
@@ -6736,6 +6808,10 @@ function checkNodeReal(ix: i32) {
     // plain i32; the union constrains assignment, not arithmetic).
     lt = softenLitTy(lt)
     rt = softenLitTy(rt)
+    // A hole operand reaching arithmetic is USED numerically — record the demand so the call-arg
+    // check enforces a numeric (or operator-overloaded) argument (`isNumeric(TyVar)` passes below).
+    noteNumericDemandIfHole(lt)
+    noteNumericDemandIfHole(rt)
     if !isNumeric(lt) || !isNumeric(rt) {
       // Reached only AFTER string-concat and array-concat are ruled out above, so
       // this is a genuine operand-type mismatch — `+` does have string/array forms,
@@ -8000,6 +8076,7 @@ export function monoInferListElem(
   const sHoleN = holeShapeNames.length
   const sHoleT = holeShapeTys.length
   const sHoleArr = holeArrayDemand.length
+  const sHoleNum = holeNumericDemand.length
   const sILet = inferLetIx.length
   const sINulS = inferLetNulStrIx.length
   const sINulB = inferLetNulBoolIx.length
@@ -8051,6 +8128,7 @@ export function monoInferListElem(
   while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
   while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
   while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
+  while holeNumericDemand.length > sHoleNum { holeNumericDemand.pop() }
   while inferLetIx.length > sILet { inferLetIx.pop() }
   while inferLetTy.length > sILet { inferLetTy.pop() }
   while inferLetNulStrIx.length > sINulS { inferLetNulStrIx.pop() }
@@ -8093,6 +8171,7 @@ export function monoInferLocalScalar(
   const sHoleN = holeShapeNames.length
   const sHoleT = holeShapeTys.length
   const sHoleArr = holeArrayDemand.length
+  const sHoleNum = holeNumericDemand.length
   const sILet = inferLetIx.length
   const sINulS = inferLetNulStrIx.length
   const sINulB = inferLetNulBoolIx.length
@@ -8140,6 +8219,7 @@ export function monoInferLocalScalar(
   while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
   while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
   while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
+  while holeNumericDemand.length > sHoleNum { holeNumericDemand.pop() }
   while inferLetIx.length > sILet { inferLetIx.pop() }
   while inferLetTy.length > sILet { inferLetTy.pop() }
   while inferLetNulStrIx.length > sINulS { inferLetNulStrIx.pop() }
