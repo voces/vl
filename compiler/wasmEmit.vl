@@ -24828,6 +24828,47 @@ function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
   0
 }
 
+// If `exprIx` is an `Ident` naming a generic (un-annotated-param) function and `expectedTyIx` is a
+// CONCRETE function-type annotation, materialize the instance for that annotation's param types and
+// point the `Ident` at it (`monoInstanceFor`). The single coercion shared by every typed boundary a
+// generic function value flows into — an annotated binding, a concrete function-typed call ARGUMENT,
+// an annotated-return RETURN — so the value carries its concrete type wherever it escapes. The
+// checker (`genericFnAssignable`) has already proved the instantiation is valid; this only emits it.
+function monoCoerceFnValue(exprIx: i32, expectedTyIx: i32) {
+  if exprIx < 0 { return 0 }
+  if expectedTyIx < 0 { return 0 }
+  const e = P.nodes[exprIx]
+  if e is Ident {
+    let gfe = fnIndexOf(e.identName)
+    if gfe >= 0 && gfe < monoGen.length {
+      if monoGen[gfe] == 1 {
+        const pnames: string[] = []
+        if monoFnTypeAnnParams(expectedTyIx, pnames) {
+          return monoInstanceFor(gfe, pnames, exprIx)
+        }
+      }
+    }
+  }
+  0
+}
+
+// The written type-annotation node of parameter `i` of the named function `name` (its ORIGINAL
+// declaration, before monomorphization may replace the slot), or -1. Lets a call site read the
+// concrete function type a callback parameter declares, to coerce a generic function argument.
+function monoFnParamTypeAt(name: string, i: i32) {
+  const fe = fnIndexOf(name)
+  if fe < 0 { return -1 }
+  const fn = P.nodes[monoOrigNode[fe]]
+  if fn is FuncDecl {
+    const ps = fn.fnParams
+    if i < ps.length {
+      const p = P.nodes[ps[i]]
+      if p is Param { return p.parType }
+    }
+  }
+  -1
+}
+
 // Instantiate (or reuse) the instance of generic `origFe` for the call at
 // `callIx` (whose enclosing function is `ctx`, -1 = top level), and point the
 // call site at it. Returns 0, or -1 via `emitFail`.
@@ -24985,6 +25026,17 @@ function monoWalk(ix: i32, ctx: i32) {
     }
     const callee = P.nodes[n.callFn]
     if callee is Ident {
+      // A generic function value passed as an ARGUMENT to a concrete function-typed PARAMETER
+      // (`apply(add)` where `apply(f: (i32,i32)=>i32)`): materialize the instance for the
+      // parameter's declared function type so the argument closure carries it.
+      let ca = 0
+      while ca < args.length {
+        const pty = monoFnParamTypeAt(callee.identName, ca)
+        if pty >= 0 {
+          if monoCoerceFnValue(args[ca], pty) < 0 { return -1 }
+        }
+        ca = ca + 1
+      }
       let fe = fnIndexOf(callee.identName)
       if fe < 0 {
         // A direct call through a VALUE binding to a generic NAMED function (`const g = add;
@@ -25020,23 +25072,7 @@ function monoWalk(ix: i32, ctx: i32) {
     // so the value carries that concrete type independent of any call — it may ESCAPE (be passed,
     // returned, stored) where call-driven monomorphization can't reach. The annotation also governs
     // its calls (the checker pins them), so the instance the binding holds matches every use.
-    if n.letType >= 0 {
-      if n.letInit >= 0 {
-        const initN = P.nodes[n.letInit]
-        if initN is Ident {
-          let gfe = fnIndexOf(initN.identName)
-          if gfe >= 0 && gfe < monoGen.length {
-            if monoGen[gfe] == 1 {
-              const pnames: string[] = []
-              if monoFnTypeAnnParams(n.letType, pnames) {
-                if monoInstanceFor(gfe, pnames, n.letInit) < 0 { return -1 }
-                return 0
-              }
-            }
-          }
-        }
-      }
-    }
+    if monoCoerceFnValue(n.letInit, n.letType) < 0 { return -1 }
     return monoWalk(n.letInit, ctx)
   }
   if n is IfStmt {
@@ -25058,7 +25094,18 @@ function monoWalk(ix: i32, ctx: i32) {
     if monoWalk(n.fiIter, ctx) < 0 { return -1 }
     return monoWalk(n.fiBody, ctx)
   }
-  if n is RetStmt { return monoWalk(n.retArg, ctx) }
+  if n is RetStmt {
+    // A generic function value RETURNED where the enclosing function declares a concrete function
+    // return type (`function mk(): (f64,f64)=>f64 { return add }`): materialize the instance for
+    // that return type so the returned value carries it.
+    if ctx >= 0 {
+      const cf = P.nodes[ctx]
+      if cf is FuncDecl {
+        if monoCoerceFnValue(n.retArg, cf.fnRet) < 0 { return -1 }
+      }
+    }
+    return monoWalk(n.retArg, ctx)
+  }
   if n is BinExpr {
     if monoWalk(n.binLeft, ctx) < 0 { return -1 }
     return monoWalk(n.binRight, ctx)
