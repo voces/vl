@@ -230,13 +230,17 @@ let holeShapeTys: i32[] = []
 // read `self[0]`), the indexing analogue of the demanded-shape check above.
 let holeArrayDemand: string[] = []
 
-// Un-annotated-param holes USED with a numeric operator (`n + 1`, `n < 2`): the param is a
-// capability-bounded generic that demands a NUMERIC argument (or a type with the operator
-// overloaded). The call-arg check rejects a non-numeric argument bound to such a param — the
-// arithmetic/comparison analogue of `holeArrayDemand`. Without it a numerically-used hole stayed
-// permissive (`isNumeric(TyVar)` is true) and `f("hi")` over `n + 1` reached emit as `string + i32`
-// → invalid wasm.
-let holeNumericDemand: string[] = []
+// DEFERRED binary-op constraints over un-annotated-param holes. When `a + b` / `s + "!"` / `n < 2`
+// has a HOLE operand, its validity can't be decided in the body (a hole is permissively assignable
+// to string AND numeric, so the eager check greedily picks a branch). Record `(lt, op, rt)`; the
+// generic call-site re-validates each under the SUBSTITUTED argument types via `binOpDefinedFor` —
+// one rule for the whole capability: numeric (`n + 1` rejects a string), string (`s + "!"` rejects
+// a number), and RELATIONAL (`a + b` rejects `(i32, string)`) all fall out of one check. Operand
+// TYPE indices are stored (a hole is a `TyVar` index, stable in the arena); `substTyDeep` maps them
+// to the concrete argument types at the call.
+let binCstrLt: i32[] = []
+let binCstrOp: string[] = []
+let binCstrRt: i32[] = []
 
 // The const-binding chain, PARALLEL to `T.scopes`: each frame records which of
 // its names were bound `const` (immutable NAME, not immutable data — a field
@@ -924,7 +928,9 @@ export function initChecker() {
   holeShapeNames = []
   holeShapeTys = []
   holeArrayDemand = []
-  holeNumericDemand = []
+  binCstrLt = []
+  binCstrOp = []
+  binCstrRt = []
   fnDeclIx = Map()
   moduleGlobals = Map()
   topUnannotFns = []
@@ -3990,43 +3996,95 @@ function holeIsArrayDemanded(name: string) {
   false
 }
 
-// Record that hole `name` was used with a numeric operator (so it demands a numeric argument).
-// Idempotent.
-function noteNumericDemand(name: string) {
-  let i = 0
-  while i < holeNumericDemand.length {
-    if holeNumericDemand[i] == name { return 0 }
-    i = i + 1
-  }
-  holeNumericDemand.push(name)
-  0
-}
-
-function holeIsNumericDemanded(name: string) {
-  let i = 0
-  while i < holeNumericDemand.length {
-    if holeNumericDemand[i] == name { return true }
-    i = i + 1
-  }
+// A type that is still an inference HOLE (`TyVar`): an un-annotated param, or a derived hole.
+function tyIsHole(tyIx: i32) {
+  if tyIx < 0 { return false }
+  const t = T.tys[tyIx]
+  if t is TyVar { return true }
   false
 }
 
-// If `tyIx` is an un-annotated-param hole (`TyVar`), record a numeric demand on it — called from
-// the arithmetic / comparison operand checks, where a hole reaching the `isNumeric` gate is being
-// USED as a number (the gate passes it permissively; the demand makes the call-arg check enforce it).
-function noteNumericDemandIfHole(tyIx: i32) {
-  if tyIx < 0 { return 0 }
-  const t = T.tys[tyIx]
-  if t is TyVar { noteNumericDemand(t.tvName) }
+// Record a deferred binary-op constraint when either operand is a hole — the body can't yet decide
+// the operator's form, so the generic call-site validates it under substitution.
+function noteBinCstr(lt: i32, op: string, rt: i32) {
+  if tyIsHole(lt) || tyIsHole(rt) {
+    let k = 0
+    while k < binCstrOp.length {
+      if binCstrLt[k] == lt && binCstrOp[k] == op && binCstrRt[k] == rt {
+        return 0
+      }
+      k = k + 1
+    }
+    binCstrLt.push(lt)
+    binCstrOp.push(op)
+    binCstrRt.push(rt)
+  }
   0
 }
 
-// Whether `at` satisfies a numeric-demanded hole: a numeric type (i32/i64/f32/f64 — `isNumeric`
-// also passes a still-unresolved `TyVar`, deferring to the outer call). A type that overloads the
-// operator (`function +(self: T, …)`) should also satisfy it, but operator overloads do not yet
-// LOWER (a separate emitter gap), so that case is left for when they do — rejecting it now is a
-// clean type error rather than the invalid wasm it would otherwise become.
-function numericCapabilityOk(at: i32) { isNumeric(at) }
+// Whether the EMITTER can lower `lt op rt` for two CONCRETE operand types — the soundness criterion
+// the generic call-site checks after substituting a hole to its argument type. A still-unresolved
+// operand (`TyVar`, a nested generic) DEFERS (true — the outer call validates it). Mirrors
+// `checkBinary`'s accepted forms; an operator OVERLOAD (`opSelfFnTy`) would also satisfy it but does
+// not yet lower, so it stays a clean reject. Operators not modelled here return true (no false
+// reject — they keep today's behaviour).
+function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
+  const lt = softenLitTy(lt0)
+  const rt = softenLitTy(rt0)
+  if tyIsHole(lt) || tyIsHole(rt) { return true }
+  if op == "==" || op == "!=" { return true }
+  const lArr = T.tys[lt]
+  const rArr = T.tys[rt]
+  if op == "+" {
+    if isStringTy(lt) && isStringTy(rt) {
+      return true // string concat
+    }
+    if lArr is TyArray {
+      if rArr is TyArray {
+        return true // list concat (element agreement checked in the body)
+      }
+    }
+    return isNumeric(lt) && isNumeric(rt)
+  }
+  if op == "-" || op == "*" || op == "/" || op == "%" {
+    return isNumeric(lt) && isNumeric(rt)
+  }
+  if op == "<" || op == ">" || op == "<=" || op == ">=" {
+    if isStringTy(lt) && isStringTy(rt) { return true }
+    return isNumeric(lt) && isNumeric(rt)
+  }
+  true
+}
+
+// Re-validate every deferred binary-op constraint that THIS call resolves: substitute the holes to
+// the call's concrete argument types and check the operator is defined for them. A constraint still
+// touching an unresolved hole (not bound by this call, or a nested generic) defers. The general
+// capability check — numeric / string / relational all fall out of one rule.
+function validateBinCstrs(bNames: string[], bTys: i32[], ix: i32) {
+  let ci = 0
+  while ci < binCstrOp.length {
+    const clt = substTyDeep(binCstrLt[ci], bNames, bTys)
+    const crt = substTyDeep(binCstrRt[ci], bNames, bTys)
+    if !tyIsHole(clt) {
+      if !tyIsHole(crt) {
+        if !binOpDefinedFor(binCstrOp[ci], clt, crt) {
+          tErr(
+            "operator '" +
+              binCstrOp[ci] +
+              "' is not defined for " +
+              tyToStr(clt) +
+              " and " +
+              tyToStr(crt) +
+              " (the call's argument types)",
+            ix,
+          )
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
 
 // A type that definitively CANNOT be indexed `[i]`: a scalar primitive (i32 / f64 / i64 /
 // f32 / boolean / null / …) — anything but a `string`. An array / string / struct (may carry
@@ -4493,17 +4551,6 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           if tyIsNonIndexableScalar(at) {
             tErr(
               "argument " + i32ToStr(i + 1) + ": expected an array, got " + tyToStr(at),
-              ix,
-            )
-          }
-        }
-        if holeIsNumericDemanded(pHole.tvName) {
-          if !numericCapabilityOk(at) {
-            tErr(
-              "argument " +
-                i32ToStr(i + 1) +
-                ": parameter is used as a number, so it needs a numeric argument, got " +
-                tyToStr(at),
               ix,
             )
           }
@@ -5155,17 +5202,6 @@ function checkCallNode(n: Call, ix: i32) {
             )
           }
         }
-        if holeIsNumericDemanded(pHole.tvName) {
-          if !numericCapabilityOk(at) {
-            tErr(
-              "argument " +
-                i32ToStr(i + 1) +
-                ": parameter is used as a number, so it needs a numeric argument, got " +
-                tyToStr(at),
-              ix,
-            )
-          }
-        }
       }
       // Passing an empty-collection argument into a concrete `T[]` / map param pins
       // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
@@ -5189,7 +5225,10 @@ function checkCallNode(n: Call, ix: i32) {
     // function-typed field) concretizes per call site; a DERIVED `?ret.` hole
     // collapses to the pinned callee's return (see `substTyDeep`, which keeps
     // `functions/inferred-return-soundness.vl` rejecting).
-    if bNames.length > 0 { retTy = substTyDeep(retTy, bNames, bTys) }
+    if bNames.length > 0 {
+      validateBinCstrs(bNames, bTys, ix)
+      retTy = substTyDeep(retTy, bNames, bTys)
+    }
     return retTy
   }
   if ft is TyErr { return TY_ERR }
@@ -6565,6 +6604,9 @@ function checkNodeReal(ix: i32) {
     // param infers from the target (the let-init / arg / return positions already seed).
     if op == "=" { seedExpected(n.binRight, lt) }
     let rt = checkNode(n.binRight)
+    // A binary op with a HOLE operand can't decide its form until the hole is bound at the call —
+    // record the deferred constraint (skipping assignment / logical, handled by their own arms).
+    if op != "=" && op != "&&" && op != "||" { noteBinCstr(lt, op, rt) }
     // Assignment: RHS must be assignable to the LHS's (already-bound) type.
     if op == "=" {
       // A `const` NAME cannot be rebound (`x = …`, and the `x++`/`x += …`
@@ -6767,8 +6809,6 @@ function checkNodeReal(ix: i32) {
       // String ordering: a lexicographic compare of two strings yields a bool.
       if isStringTy(olt) && isStringTy(ort) { return TY_BOOL }
       // A hole operand reaching a numeric comparison is USED numerically — record the demand.
-      noteNumericDemandIfHole(olt)
-      noteNumericDemandIfHole(ort)
       if !isNumeric(olt) || !isNumeric(ort) {
         tErr(
           "comparison expects numeric operands, got " +
@@ -6810,8 +6850,6 @@ function checkNodeReal(ix: i32) {
     rt = softenLitTy(rt)
     // A hole operand reaching arithmetic is USED numerically — record the demand so the call-arg
     // check enforces a numeric (or operator-overloaded) argument (`isNumeric(TyVar)` passes below).
-    noteNumericDemandIfHole(lt)
-    noteNumericDemandIfHole(rt)
     if !isNumeric(lt) || !isNumeric(rt) {
       // Reached only AFTER string-concat and array-concat are ruled out above, so
       // this is a genuine operand-type mismatch — `+` does have string/array forms,
@@ -8076,7 +8114,7 @@ export function monoInferListElem(
   const sHoleN = holeShapeNames.length
   const sHoleT = holeShapeTys.length
   const sHoleArr = holeArrayDemand.length
-  const sHoleNum = holeNumericDemand.length
+  const sBinC = binCstrOp.length
   const sILet = inferLetIx.length
   const sINulS = inferLetNulStrIx.length
   const sINulB = inferLetNulBoolIx.length
@@ -8128,7 +8166,11 @@ export function monoInferListElem(
   while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
   while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
   while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
-  while holeNumericDemand.length > sHoleNum { holeNumericDemand.pop() }
+  while binCstrOp.length > sBinC {
+    binCstrOp.pop()
+    binCstrLt.pop()
+    binCstrRt.pop()
+  }
   while inferLetIx.length > sILet { inferLetIx.pop() }
   while inferLetTy.length > sILet { inferLetTy.pop() }
   while inferLetNulStrIx.length > sINulS { inferLetNulStrIx.pop() }
@@ -8171,7 +8213,7 @@ export function monoInferLocalScalar(
   const sHoleN = holeShapeNames.length
   const sHoleT = holeShapeTys.length
   const sHoleArr = holeArrayDemand.length
-  const sHoleNum = holeNumericDemand.length
+  const sBinC = binCstrOp.length
   const sILet = inferLetIx.length
   const sINulS = inferLetNulStrIx.length
   const sINulB = inferLetNulBoolIx.length
@@ -8219,7 +8261,11 @@ export function monoInferLocalScalar(
   while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
   while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
   while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
-  while holeNumericDemand.length > sHoleNum { holeNumericDemand.pop() }
+  while binCstrOp.length > sBinC {
+    binCstrOp.pop()
+    binCstrLt.pop()
+    binCstrRt.pop()
+  }
   while inferLetIx.length > sILet { inferLetIx.pop() }
   while inferLetTy.length > sILet { inferLetTy.pop() }
   while inferLetNulStrIx.length > sINulS { inferLetNulStrIx.pop() }

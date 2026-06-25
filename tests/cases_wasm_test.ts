@@ -84,8 +84,6 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
     "wasm CHECKER gap: a generic intersection `T & S` reports `unknown type 'T&S'` where the TS checker accepts it (not a lint divergence)",
   "soundness/README.vl":
     "a prose line parses as @run; the wasm emitter rejects a statement-less program (TS emits an empty module)",
-  "soundness/xfail-arith-hole-operand.vl":
-    "parked soundness xfail (arith-hole-operand, ROADMAP A13): the wasm pipeline emits an invalid module",
   "soundness/xfail-array-element-recursion.vl":
     "parked soundness xfail: wasm rejects the i32-keyed-map element recursion the TS checker accepts",
   "soundness/xfail-seq-guard-residual-codegen.vl":
