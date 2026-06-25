@@ -49,7 +49,7 @@
 import { Tok } from "./ast"
 import { peek } from "./lexer"
 import { accept, peekTok } from "./parser"
-import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, ErrExpr, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, Param, Paren, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, declNameTok } from "./ast"
+import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, ErrExpr, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, mkFunc, Node, NullLit, NumLit, ObjLit, OptMember, Param, Paren, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, declNameTok } from "./ast"
 import { P, i32ToStr, nodeToks, declNameTokOf, hasNamedArgs, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 import {
   NumLit,
@@ -7919,9 +7919,73 @@ function structUnionRetName(er: i32, stmts: i32[]) {
 // scale, which forced callers into expression position — is fixed and pinned by
 // `tests/cases/statements/discarded-call-return.vl`; the discarded `checkNode`
 // below exercises it in this very module.)
+// Does the FuncDecl node at `fnIx` have at least one UN-annotated parameter (an inference hole)?
+function funcDeclHasUnannotatedParam(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const ps = fn.fnParams
+    let i = 0
+    while i < ps.length {
+      const p = P.nodes[ps[i]]
+      if p is Param {
+        if p.parType < 0 { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Rewrite each TOP-LEVEL `const f = <anonymous lambda with un-annotated params>` binding into a NAMED
+// function declaration (`function f(…) …`), replacing the statement in place. A top-level lambda
+// captures nothing — it has no enclosing function frame, reading only globals, which a named function
+// reads too — so the rewrite is sound and lets an un-annotated lambda binding behave EXACTLY like the
+// equivalent named function: its hole params monomorphize per call / per typed boundary (the whole
+// generic-function-value machinery) instead of being rejected as an uninferable closure value.
+// SCOPED tightly so nothing that already works changes: only a `const` (never a reassignable `let`),
+// only an UN-annotated binding (an annotated `const f: (i32)=>i32 = …` is a contextually-typed
+// closure), only an ANONYMOUS lambda init (a `LetDecl` init is always one), and only when a parameter
+// is un-annotated (a fully-typed lambda already lowers as a closure). A NESTED binding needs capture
+// analysis and is left for a follow-up.
+function hoistLambdaBindings(stmts: i32[]) {
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is LetDecl {
+      if s.letKw == "const" {
+        if s.letType < 0 {
+          if s.letInit >= 0 {
+            const init = P.nodes[s.letInit]
+            if init is FuncDecl {
+              if init.fnName == "" {
+                if funcDeclHasUnannotatedParam(s.letInit) {
+                  stmts[i] = mkFunc(
+                    s.letName,
+                    init.fnTyParams,
+                    init.fnParams,
+                    init.fnRet,
+                    init.fnBody,
+                    init.pos,
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
 export function checkProgram(rootIx: i32) {
   const rootN0 = P.nodes[rootIx]
-  if rootN0 is Program { gRootStmts = rootN0.progStmts }
+  if rootN0 is Program {
+    gRootStmts = rootN0.progStmts
+    // Hoist top-level `const f = <un-annotated lambda>` bindings into named functions BEFORE
+    // checking (and before the typed-IR is sized, so the synthesized nodes are covered).
+    hoistLambdaBindings(rootN0.progStmts)
+  }
   // Size the typed-IR table to the (now fully parsed) node arena, all holes (-1).
   nodeTyIx = []
   let ntz = 0
