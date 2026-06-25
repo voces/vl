@@ -126,12 +126,13 @@ Deno.test({
   name: "native-diag-pos: corpus lambda-uninferable-param pins the parameter token",
   ignore: !ENABLED,
   fn: async () => {
-    // The real corpus file: `const f = (n) => n * 2` on line 7 — the uninferable
-    // parameter `n` sits at col 11 (0-based), shown 1-based as [7:12].
+    // The real corpus file: a NESTED `const f = (n) => n * 2` on line 9 (a top-level binding is now
+    // hoisted to a named function and works; the nested form stays uninferable). The parameter `n`
+    // sits at col 13 (0-based), shown 1-based as [9:14].
     const path = `${ROOT}/tests/cases/functions/lambda-uninferable-param.vl`;
     const r = await check(path);
     if (r.code === 0) throw new Error("expected rejection, vl check exited 0");
-    const needle = `${path}: error [7:12] cannot infer a type for parameter \`n\``;
+    const needle = `${path}: error [9:14] cannot infer a type for parameter \`n\``;
     if (!r.err.includes(needle)) {
       throw new Error(`expected stderr to contain "${needle}", got:\n${r.err}`);
     }
