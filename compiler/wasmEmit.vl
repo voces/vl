@@ -24482,6 +24482,352 @@ function monoListSrcParamStmt(ix: i32, retName: string) {
   ""
 }
 
+// The instance-creation core shared by `monoInstantiate` (call-driven) and `monoInstanceFor`
+// (annotation-driven): given the already-built `pinned` param-type names (and any `tvN`/`tvV`
+// type-param bindings), clone-or-reuse the instance of generic `origFe` and point the value site
+// at it. `calleeIx` is the `Ident` node (a call callee, or a binding init) rewritten to the
+// instance name on a registry hit / a `count > 0` append. `annotateI32` annotates an i32-pinned
+// param too (so the materialized closure passes the value floor) — `monoInstantiate` keeps it
+// false for byte-identity on the all-i32 call path. Returns 0, or -1 via `emitFail`.
+function monoMakeInstance(
+  origFe: i32,
+  pinned: string[],
+  tvN: string[],
+  tvV: string[],
+  calleeIx: i32,
+  annotateI32: boolean,
+) {
+  const fn = P.nodes[monoOrigNode[origFe]]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let key = i32ToStr(origFe) + "#"
+    let pk = 0
+    while pk < pinned.length {
+      key = key + pinned[pk] + ","
+      pk = pk + 1
+    }
+    // A closure-pinned param flips the module's function-value machinery on
+    // (the instance body `call_ref`s through it; the argument side builds the
+    // fat pointer) — the same flag a lifted lambda flips in `liftFnsInExpr`.
+    let pv = 0
+    while pv < pinned.length {
+      const pvn = pinned[pv]
+      if pvn.length > 2 {
+        if pvn[0] == '=' && pvn[1] == '>' { fnValUsed = true }
+      }
+      pv = pv + 1
+    }
+    // Registry hit: point this call site at the existing instance.
+    let k = 0
+    while k < monoKeys.length {
+      if monoKeys[k] == key {
+        const cal = P.nodes[calleeIx]
+        if cal is Ident {
+          if cal.identName != monoInstName[k] {
+            cal.identName = monoInstName[k]
+          }
+        }
+        return 0
+      }
+      k = k + 1
+    }
+    // New shape: clone the ORIGINAL declaration with pinned annotations. An
+    // un-annotated param pinned at plain i32 keeps `parType = -1` (the
+    // emitter's default kind — zero new arena nodes on the all-i32 path).
+    let count = 0
+    let k2 = 0
+    while k2 < monoInstOrig.length {
+      if monoInstOrig[k2] == origFe { count = count + 1 }
+      k2 = k2 + 1
+    }
+    const nps: i32[] = []
+    let pj = 0
+    while pj < params.length {
+      const p3 = P.nodes[params[pj]]
+      if p3 is Param {
+        let nt = -1
+        if p3.parType >= 0 {
+          // The pinned name differs from the written annotation exactly when
+          // a type param substituted through it (bare `T`, `T[]`, or a
+          // composite like `Box<T>`); a concrete annotation keeps its node.
+          if pinned[pj] == tyNameOf(p3.parType) {
+            nt = p3.parType
+          } else {
+            nt = mkTypeRef(pinned[pj], -1)
+          }
+        } else if annotateI32 || pinned[pj] != "i32" {
+          nt = mkTypeRef(pinned[pj], -1)
+        }
+        nps.push(mkParam(p3.parName, nt, -1))
+      }
+      pj = pj + 1
+    }
+    // Substitute a type-param-riding RETURN annotation through the binding —
+    // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
+    // (`{first:B,second:A}`); a concrete annotation passes through unchanged.
+    let nret = fn.fnRet
+    // A hole-built return list local to annotate in the cloned instance body (so its `[]`
+    // build classifies per element type — f64/struct as well as i32/string). Captured from
+    // the return trace below, threaded into `monoCloneBody` which clones+annotates just
+    // that `LetDecl` per instance (never the shared original).
+    let monoOutName = ""
+    let monoOutType = ""
+    if fn.fnRet >= 0 {
+      const rn = tyNameOf(fn.fnRet)
+      if monoAnnHasTyParam(rn, fn.fnTyParams) {
+        let rs = monoSubstAnn(rn, fn.fnTyParams, tvN, tvV)
+        if rs == "" {
+          return emitFail(
+            "emitProgram: monomorphize: a return type parameter of `" +
+              fn.fnName +
+              "` is not bound by any parameter",
+          )
+        }
+        nret = mkTypeRef(rs, -1)
+      }
+    }
+    // An UN-ANNOTATED return whose return expression is a value-call THROUGH a
+    // closure-pinned param takes that signature's RESULT kind as a concrete
+    // annotation (`"…>d"` → `f64`): the emitter's return-kind inference has no
+    // expression form for a `call_ref` result, so the instance's functype and
+    // its callers' classification ride the normal annotation tables instead.
+    if nret < 0 {
+      const rx2 = fnRetExprOf(monoOrigNode[origFe])
+      if rx2 >= 0 {
+        const rxe = P.nodes[rx2]
+        if rxe is Call {
+          const rcal = P.nodes[rxe.callFn]
+          if rcal is Ident {
+            let pq = 0
+            while pq < params.length {
+              const pp = P.nodes[params[pq]]
+              if pp is Param {
+                if pp.parName == rcal.identName {
+                  const pn = pinned[pq]
+                  if pn.length > 2 {
+                    if pn[0] == '=' && pn[1] == '>' {
+                      if pn[pn.length - 1] == 'd' {
+                        nret = mkTypeRef("f64", -1)
+                      }
+                    }
+                  }
+                }
+              }
+              pq = pq + 1
+            }
+          }
+          // `return <param>.map/filter(<lambda>)` over a param this instance pinned to a
+          // NON-i32 array: type the un-annotated return as the concrete result list. The
+          // inferred-return path has no f64/string-array map/filter-result form, so set it
+          // here — `.filter` preserves the element; `.map` preserves it for an element-wise
+          // arithmetic/concat callback (`monoLambdaPreservesElem`). i32 keeps `nret = -1`
+          // (its inference already handles it) → byte-identical.
+          if rcal is Member {
+            if rcal.memProp == "map" || rcal.memProp == "filter" {
+              if rxe.callArgs.length == 1 {
+                const mrecv = P.nodes[rcal.memObj]
+                if mrecv is Ident {
+                  let pqm = 0
+                  while pqm < params.length {
+                    const ppm = P.nodes[params[pqm]]
+                    if ppm is Param {
+                      if ppm.parName == mrecv.identName {
+                        const srcElem = monoArrElemName(pinned[pqm])
+                        if srcElem != "" && srcElem != "i32" {
+                          if rcal.memProp == "filter" {
+                            nret = mkTypeRef(srcElem + "[]", -1)
+                          } else if monoLambdaPreservesElem(rxe.callArgs[0]) {
+                            nret = mkTypeRef(srcElem + "[]", -1)
+                          }
+                        }
+                      }
+                    }
+                    pqm = pqm + 1
+                  }
+                }
+              }
+            }
+          }
+        }
+        if rxe is Index {
+          // `return param[i]` where the param pinned to an f64 array yields an f64
+          // element — synthesize the concrete `f64` return (the un-annotated-return kind
+          // inference has no f64 form for an indexed un-annotated array param). i32/string
+          // returns keep `nret = -1` (their inference handles them) → byte-identical.
+          const ria = P.nodes[rxe.idxArr]
+          if ria is Ident {
+            let pqi = 0
+            while pqi < params.length {
+              const ppi = P.nodes[params[pqi]]
+              if ppi is Param {
+                if ppi.parName == ria.identName {
+                  if pinned[pqi] == "f64[]" { nret = mkTypeRef("f64", -1) }
+                }
+              }
+              pqi = pqi + 1
+            }
+          }
+        }
+        if rxe is Ident {
+          // `return <local>` where the local is a hole-built list (`const out = [];
+          // out.push(self[i])`): the list shares the indexed param's array type, so type
+          // the un-annotated return as that param's pinned type. This lowers a fully
+          // un-annotated `reverse(self)` end-to-end (the un-annotated-return kind inference
+          // can't see a mono instance's inferred list local). No source param found → keep
+          // `nret = -1`, so a plain scalar/local return stays byte-identical.
+          const srcParam = monoListSrcParam(fn.fnBody, rxe.identName)
+          if srcParam != "" {
+            let pli = 0
+            while pli < params.length {
+              const ppl = P.nodes[params[pli]]
+              if ppl is Param {
+                if ppl.parName == srcParam {
+                  if pinned[pli] != "" {
+                    nret = mkTypeRef(pinned[pli], -1)
+                    monoOutName = rxe.identName
+                    monoOutType = pinned[pli]
+                  }
+                }
+              }
+              pli = pli + 1
+            }
+          } else {
+            // The pass-through trace found no `out.push(param[idx])` source — the list is
+            // built from a NON-TRIVIAL expression over the element (`out.push(self[i] * 2)`).
+            // Re-check the body for THIS shape (params pinned concretely) so the checker's
+            // own list-element inference resolves the local; that lifts the element-hole
+            // ceiling generically (any pushed expression, not just a bare index). "" when it
+            // is not an inferred list / stays generic → `nret` stays -1 (byte-identical).
+            const listTy = monoInferListElem(monoOrigNode[origFe], pinned, rxe.identName)
+            if listTy != "" {
+              nret = mkTypeRef(listTy, -1)
+              monoOutName = rxe.identName
+              monoOutType = listTy
+            } else {
+              // Not an inferred LIST local — try a SCALAR one (`const t = self[i]; return t`,
+              // or a `let acc = ""; acc = acc + self[i]; return acc` fold) whose type derives
+              // from a hole-pinned param. The return-kind inference runs before locals are
+              // collected and the typed-IR is stale for a hole-derived node, so type the
+              // un-annotated return from a re-check with the params pinned concretely. "" for
+              // i32 / boolean / non-scalar locals → `nret` stays -1 (byte-identical).
+              const scTy = monoInferLocalScalar(monoOrigNode[origFe], pinned, rxe.identName)
+              if scTy != "" { nret = mkTypeRef(scTy, -1) }
+            }
+          }
+        }
+      }
+    }
+    let instName = fn.fnName
+    let instFe = origFe
+    if count > 0 { instName = fn.fnName + "$" + i32ToStr(count) }
+    const noTyParams: string[] = []
+    // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
+    // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
+    // no such annotation.
+    const instBody0 = monoCloneBody(
+      fn.fnBody,
+      fn.fnTyParams,
+      tvN,
+      tvV,
+      monoOutName,
+      monoOutType,
+    )
+    // Pin any `.map`/`.filter` callback lambda whose receiver param this instance bound to a
+    // NON-i32 element (`self: f64[]` ⇒ the `(x) => …` callback's `x` is f64): the shared
+    // body's un-annotated lambda would otherwise emit as i32. Build the param→element map
+    // from the pinned param names, then clone+pin per instance (i32 shapes are left as-is →
+    // byte-identical).
+    const pElemNames: string[] = []
+    const pElemTypes: string[] = []
+    let pe = 0
+    while pe < params.length {
+      const pep = P.nodes[params[pe]]
+      if pep is Param {
+        pElemNames.push(pep.parName)
+      } else {
+        pElemNames.push("")
+      }
+      pElemTypes.push(monoArrElemName(pinned[pe]))
+      pe = pe + 1
+    }
+    const instBody = monoPinMapLambdas(instBody0, pElemNames, pElemTypes)
+    const nfn = mkFunc(instName, noTyParams, nps, nret, instBody, -1)
+    if count == 0 {
+      // First instance: keep the bare name and the original's wasm index.
+      fnStmts[origFe] = nfn
+    } else {
+      fnStmts.push(nfn)
+      fnParent.push(-1)
+      fnDispNames.push("")
+      instFe = fnStmts.length - 1
+      const cal2 = P.nodes[calleeIx]
+      if cal2 is Ident { cal2.identName = instName }
+    }
+    // REGISTER before walking the body, so a recursive self-call at the same
+    // shape resolves here instead of recursing (the host's discipline).
+    monoKeys.push(key)
+    monoInstOrig.push(origFe)
+    monoInstName.push(instName)
+    monoInstFe.push(instFe)
+    if monoRebuild() < 0 { return -1 }
+    // Walk the instance's body — a nested generic call instantiates its own
+    // callee against THIS instance's concrete annotations.
+    if monoWalk(fn.fnBody, nfn) < 0 { return -1 }
+    if monoRebuild() < 0 { return -1 }
+    return 0
+  }
+  0
+}
+
+// The param type NAMES of a function-type annotation (`(f64, f64) => f64` → ["f64", "f64"]),
+// appended to `out`. Mirrors `paramCloSigKey`'s parse of the canonical `(params) => ret` name.
+// false when `tyIx` is not a function type or the name is malformed.
+function monoFnTypeAnnParams(tyIx: i32, out: string[]) {
+  if !tyIsFuncType(tyIx) { return false }
+  const name = tyNameOf(tyIx)
+  const arrowAt = annArrowAt(name)
+  if arrowAt < 1 { return false }
+  if name[0] != '(' { return false }
+  if name[arrowAt - 1] != ')' { return false }
+  const paramsStr = name.slice(1, arrowAt - 1)
+  if paramsStr.length > 0 { annSplitParams(paramsStr, out) }
+  true
+}
+
+// Materialize (or reuse) the instance of generic `origFe` for an ANNOTATED function-typed binding
+// (`const c: (f64, f64) => f64 = add`): pin each parameter to the annotation's param type NAME and
+// create the instance (annotating an i32 param too, so the binding's closure value passes the value
+// floor), pointing the binding init `letInitIx` at it. Unlike the call-driven `monoInstantiate`,
+// this carries the value its concrete type INDEPENDENT of any call — so a binding that ESCAPES
+// (passed to a HOF / returned / stored) is `call_ref`'d at the type its annotation pinned. Restricted
+// to a generic whose params are ALL un-annotated holes (the capability-bounded case); a `<T>` or
+// annotated-param generic keeps the call-driven path. Returns 0, or -1 via `emitFail`.
+function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
+  const fn = P.nodes[monoOrigNode[origFe]]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    if params.length != pinnedNames.length { return 0 }
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parType >= 0 { return 0 }
+      }
+      i = i + 1
+    }
+    const pinned: string[] = []
+    let j = 0
+    while j < pinnedNames.length {
+      pinned.push(pinnedNames[j])
+      j = j + 1
+    }
+    const tvN: string[] = []
+    const tvV: string[] = []
+    return monoMakeInstance(origFe, pinned, tvN, tvV, letInitIx, true)
+  }
+  0
+}
+
 // Instantiate (or reuse) the instance of generic `origFe` for the call at
 // `callIx` (whose enclosing function is `ctx`, -1 = top level), and point the
 // call site at it. Returns 0, or -1 via `emitFail`.
@@ -24616,281 +24962,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
         }
         i = i + 1
       }
-      let key = i32ToStr(origFe) + "#"
-      let pk = 0
-      while pk < pinned.length {
-        key = key + pinned[pk] + ","
-        pk = pk + 1
-      }
-      // A closure-pinned param flips the module's function-value machinery on
-      // (the instance body `call_ref`s through it; the argument side builds the
-      // fat pointer) — the same flag a lifted lambda flips in `liftFnsInExpr`.
-      let pv = 0
-      while pv < pinned.length {
-        const pvn = pinned[pv]
-        if pvn.length > 2 {
-          if pvn[0] == '=' && pvn[1] == '>' { fnValUsed = true }
-        }
-        pv = pv + 1
-      }
-      // Registry hit: point this call site at the existing instance.
-      let k = 0
-      while k < monoKeys.length {
-        if monoKeys[k] == key {
-          const cal = P.nodes[c.callFn]
-          if cal is Ident {
-            if cal.identName != monoInstName[k] {
-              cal.identName = monoInstName[k]
-            }
-          }
-          return 0
-        }
-        k = k + 1
-      }
-      // New shape: clone the ORIGINAL declaration with pinned annotations. An
-      // un-annotated param pinned at plain i32 keeps `parType = -1` (the
-      // emitter's default kind — zero new arena nodes on the all-i32 path).
-      let count = 0
-      let k2 = 0
-      while k2 < monoInstOrig.length {
-        if monoInstOrig[k2] == origFe { count = count + 1 }
-        k2 = k2 + 1
-      }
-      const nps: i32[] = []
-      let pj = 0
-      while pj < params.length {
-        const p3 = P.nodes[params[pj]]
-        if p3 is Param {
-          let nt = -1
-          if p3.parType >= 0 {
-            // The pinned name differs from the written annotation exactly when
-            // a type param substituted through it (bare `T`, `T[]`, or a
-            // composite like `Box<T>`); a concrete annotation keeps its node.
-            if pinned[pj] == tyNameOf(p3.parType) {
-              nt = p3.parType
-            } else {
-              nt = mkTypeRef(pinned[pj], -1)
-            }
-          } else if pinned[pj] != "i32" {
-            nt = mkTypeRef(pinned[pj], -1)
-          }
-          nps.push(mkParam(p3.parName, nt, -1))
-        }
-        pj = pj + 1
-      }
-      // Substitute a type-param-riding RETURN annotation through the binding —
-      // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
-      // (`{first:B,second:A}`); a concrete annotation passes through unchanged.
-      let nret = fn.fnRet
-      // A hole-built return list local to annotate in the cloned instance body (so its `[]`
-      // build classifies per element type — f64/struct as well as i32/string). Captured from
-      // the return trace below, threaded into `monoCloneBody` which clones+annotates just
-      // that `LetDecl` per instance (never the shared original).
-      let monoOutName = ""
-      let monoOutType = ""
-      if fn.fnRet >= 0 {
-        const rn = tyNameOf(fn.fnRet)
-        if monoAnnHasTyParam(rn, fn.fnTyParams) {
-          let rs = monoSubstAnn(rn, fn.fnTyParams, tvN, tvV)
-          if rs == "" {
-            return emitFail(
-              "emitProgram: monomorphize: a return type parameter of `" +
-                fn.fnName +
-                "` is not bound by any parameter",
-            )
-          }
-          nret = mkTypeRef(rs, -1)
-        }
-      }
-      // An UN-ANNOTATED return whose return expression is a value-call THROUGH a
-      // closure-pinned param takes that signature's RESULT kind as a concrete
-      // annotation (`"…>d"` → `f64`): the emitter's return-kind inference has no
-      // expression form for a `call_ref` result, so the instance's functype and
-      // its callers' classification ride the normal annotation tables instead.
-      if nret < 0 {
-        const rx2 = fnRetExprOf(monoOrigNode[origFe])
-        if rx2 >= 0 {
-          const rxe = P.nodes[rx2]
-          if rxe is Call {
-            const rcal = P.nodes[rxe.callFn]
-            if rcal is Ident {
-              let pq = 0
-              while pq < params.length {
-                const pp = P.nodes[params[pq]]
-                if pp is Param {
-                  if pp.parName == rcal.identName {
-                    const pn = pinned[pq]
-                    if pn.length > 2 {
-                      if pn[0] == '=' && pn[1] == '>' {
-                        if pn[pn.length - 1] == 'd' {
-                          nret = mkTypeRef("f64", -1)
-                        }
-                      }
-                    }
-                  }
-                }
-                pq = pq + 1
-              }
-            }
-            // `return <param>.map/filter(<lambda>)` over a param this instance pinned to a
-            // NON-i32 array: type the un-annotated return as the concrete result list. The
-            // inferred-return path has no f64/string-array map/filter-result form, so set it
-            // here — `.filter` preserves the element; `.map` preserves it for an element-wise
-            // arithmetic/concat callback (`monoLambdaPreservesElem`). i32 keeps `nret = -1`
-            // (its inference already handles it) → byte-identical.
-            if rcal is Member {
-              if rcal.memProp == "map" || rcal.memProp == "filter" {
-                if rxe.callArgs.length == 1 {
-                  const mrecv = P.nodes[rcal.memObj]
-                  if mrecv is Ident {
-                    let pqm = 0
-                    while pqm < params.length {
-                      const ppm = P.nodes[params[pqm]]
-                      if ppm is Param {
-                        if ppm.parName == mrecv.identName {
-                          const srcElem = monoArrElemName(pinned[pqm])
-                          if srcElem != "" && srcElem != "i32" {
-                            if rcal.memProp == "filter" {
-                              nret = mkTypeRef(srcElem + "[]", -1)
-                            } else if monoLambdaPreservesElem(rxe.callArgs[0]) {
-                              nret = mkTypeRef(srcElem + "[]", -1)
-                            }
-                          }
-                        }
-                      }
-                      pqm = pqm + 1
-                    }
-                  }
-                }
-              }
-            }
-          }
-          if rxe is Index {
-            // `return param[i]` where the param pinned to an f64 array yields an f64
-            // element — synthesize the concrete `f64` return (the un-annotated-return kind
-            // inference has no f64 form for an indexed un-annotated array param). i32/string
-            // returns keep `nret = -1` (their inference handles them) → byte-identical.
-            const ria = P.nodes[rxe.idxArr]
-            if ria is Ident {
-              let pqi = 0
-              while pqi < params.length {
-                const ppi = P.nodes[params[pqi]]
-                if ppi is Param {
-                  if ppi.parName == ria.identName {
-                    if pinned[pqi] == "f64[]" { nret = mkTypeRef("f64", -1) }
-                  }
-                }
-                pqi = pqi + 1
-              }
-            }
-          }
-          if rxe is Ident {
-            // `return <local>` where the local is a hole-built list (`const out = [];
-            // out.push(self[i])`): the list shares the indexed param's array type, so type
-            // the un-annotated return as that param's pinned type. This lowers a fully
-            // un-annotated `reverse(self)` end-to-end (the un-annotated-return kind inference
-            // can't see a mono instance's inferred list local). No source param found → keep
-            // `nret = -1`, so a plain scalar/local return stays byte-identical.
-            const srcParam = monoListSrcParam(fn.fnBody, rxe.identName)
-            if srcParam != "" {
-              let pli = 0
-              while pli < params.length {
-                const ppl = P.nodes[params[pli]]
-                if ppl is Param {
-                  if ppl.parName == srcParam {
-                    if pinned[pli] != "" {
-                      nret = mkTypeRef(pinned[pli], -1)
-                      monoOutName = rxe.identName
-                      monoOutType = pinned[pli]
-                    }
-                  }
-                }
-                pli = pli + 1
-              }
-            } else {
-              // The pass-through trace found no `out.push(param[idx])` source — the list is
-              // built from a NON-TRIVIAL expression over the element (`out.push(self[i] * 2)`).
-              // Re-check the body for THIS shape (params pinned concretely) so the checker's
-              // own list-element inference resolves the local; that lifts the element-hole
-              // ceiling generically (any pushed expression, not just a bare index). "" when it
-              // is not an inferred list / stays generic → `nret` stays -1 (byte-identical).
-              const listTy = monoInferListElem(monoOrigNode[origFe], pinned, rxe.identName)
-              if listTy != "" {
-                nret = mkTypeRef(listTy, -1)
-                monoOutName = rxe.identName
-                monoOutType = listTy
-              } else {
-                // Not an inferred LIST local — try a SCALAR one (`const t = self[i]; return t`,
-                // or a `let acc = ""; acc = acc + self[i]; return acc` fold) whose type derives
-                // from a hole-pinned param. The return-kind inference runs before locals are
-                // collected and the typed-IR is stale for a hole-derived node, so type the
-                // un-annotated return from a re-check with the params pinned concretely. "" for
-                // i32 / boolean / non-scalar locals → `nret` stays -1 (byte-identical).
-                const scTy = monoInferLocalScalar(monoOrigNode[origFe], pinned, rxe.identName)
-                if scTy != "" { nret = mkTypeRef(scTy, -1) }
-              }
-            }
-          }
-        }
-      }
-      let instName = fn.fnName
-      let instFe = origFe
-      if count > 0 { instName = fn.fnName + "$" + i32ToStr(count) }
-      const noTyParams: string[] = []
-      // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
-      // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
-      // no such annotation.
-      const instBody0 = monoCloneBody(
-        fn.fnBody,
-        fn.fnTyParams,
-        tvN,
-        tvV,
-        monoOutName,
-        monoOutType,
-      )
-      // Pin any `.map`/`.filter` callback lambda whose receiver param this instance bound to a
-      // NON-i32 element (`self: f64[]` ⇒ the `(x) => …` callback's `x` is f64): the shared
-      // body's un-annotated lambda would otherwise emit as i32. Build the param→element map
-      // from the pinned param names, then clone+pin per instance (i32 shapes are left as-is →
-      // byte-identical).
-      const pElemNames: string[] = []
-      const pElemTypes: string[] = []
-      let pe = 0
-      while pe < params.length {
-        const pep = P.nodes[params[pe]]
-        if pep is Param {
-          pElemNames.push(pep.parName)
-        } else {
-          pElemNames.push("")
-        }
-        pElemTypes.push(monoArrElemName(pinned[pe]))
-        pe = pe + 1
-      }
-      const instBody = monoPinMapLambdas(instBody0, pElemNames, pElemTypes)
-      const nfn = mkFunc(instName, noTyParams, nps, nret, instBody, -1)
-      if count == 0 {
-        // First instance: keep the bare name and the original's wasm index.
-        fnStmts[origFe] = nfn
-      } else {
-        fnStmts.push(nfn)
-        fnParent.push(-1)
-        fnDispNames.push("")
-        instFe = fnStmts.length - 1
-        const cal2 = P.nodes[c.callFn]
-        if cal2 is Ident { cal2.identName = instName }
-      }
-      // REGISTER before walking the body, so a recursive self-call at the same
-      // shape resolves here instead of recursing (the host's discipline).
-      monoKeys.push(key)
-      monoInstOrig.push(origFe)
-      monoInstName.push(instName)
-      monoInstFe.push(instFe)
-      if monoRebuild() < 0 { return -1 }
-      // Walk the instance's body — a nested generic call instantiates its own
-      // callee against THIS instance's concrete annotations.
-      if monoWalk(fn.fnBody, nfn) < 0 { return -1 }
-      if monoRebuild() < 0 { return -1 }
-      return 0
+      return monoMakeInstance(origFe, pinned, tvN, tvV, c.callFn, false)
     }
   }
   0
@@ -24942,7 +25014,31 @@ function monoWalk(ix: i32, ctx: i32) {
     }
     return 0
   }
-  if n is LetDecl { return monoWalk(n.letInit, ctx) }
+  if n is LetDecl {
+    // An ANNOTATED function-typed binding to a generic NAMED function (`const c: (f64,f64)=>f64 =
+    // add`): materialize the instance for the ANNOTATION's param types and point the binding at it,
+    // so the value carries that concrete type independent of any call — it may ESCAPE (be passed,
+    // returned, stored) where call-driven monomorphization can't reach. The annotation also governs
+    // its calls (the checker pins them), so the instance the binding holds matches every use.
+    if n.letType >= 0 {
+      if n.letInit >= 0 {
+        const initN = P.nodes[n.letInit]
+        if initN is Ident {
+          let gfe = fnIndexOf(initN.identName)
+          if gfe >= 0 && gfe < monoGen.length {
+            if monoGen[gfe] == 1 {
+              const pnames: string[] = []
+              if monoFnTypeAnnParams(n.letType, pnames) {
+                if monoInstanceFor(gfe, pnames, n.letInit) < 0 { return -1 }
+                return 0
+              }
+            }
+          }
+        }
+      }
+    }
+    return monoWalk(n.letInit, ctx)
+  }
   if n is IfStmt {
     if monoWalk(n.ifCond, ctx) < 0 { return -1 }
     if monoWalk(n.ifThen, ctx) < 0 { return -1 }
@@ -25333,7 +25429,10 @@ function monomorphize(stmts: i32[]) {
     let s = P.nodes[stmts[i]]
     if s is FuncDecl {
     } else if s is LetDecl {
-      if monoWalk(s.letInit, -1) < 0 { return -1 }
+      // Walk the LetDecl NODE (not just its init) so the annotated-function-typed-binding
+      // materialization in `monoWalk`'s `LetDecl` arm reaches a TOP-LEVEL binding too; the arm
+      // still recurses into the init, so the existing behavior is unchanged for every other let.
+      if monoWalk(stmts[i], -1) < 0 { return -1 }
     } else if nodeIsTypeDecl(stmts[i]) {
     } else if s is UnionDecl {
     } else {
