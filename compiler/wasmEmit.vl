@@ -10494,7 +10494,10 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     // operand kind, so an i32-only program never enters it (i32 path stays byte-identical).
     const lF32 = exprIsF32(e.binLeft, fnIx)
     const rF32 = exprIsF32(e.binRight, fnIx)
-    if lF32 || rF32 {
+    // A GENUINE (non-literal) f64 operand makes the op f64 — the f32 side widens (`f32 + f64var`),
+    // so route to the f64 slice below instead of demoting the f64 here (which trapped). A float
+    // literal still adapts DOWN to the f32 operand, so `f32 + 1.0` stays on the f32 slice.
+    if (lF32 || rF32) && !binMixHardF64(e.binLeft, e.binRight, fnIx) {
       const opcF32 = binOpcodeF32(e.binOp)
       if opcF32 >= 0 {
         if emitExprAsF32(body, e.binLeft, fnIx) < 0 { return -1 }
@@ -11137,6 +11140,31 @@ function globalIsF32(name: string) {
 // NOT f32 (it defaults f64 — `exprIsF64`); it becomes f32 only as the operand of an f32
 // op or the init of an `: f32` binding. Checked BEFORE `exprIsF64` at every dispatch so
 // a mixed f32/float-literal expression routes to the f32 instructions. (Slice 5.)
+// Is the expression at `exprIx` (peeling parens) a FLOAT number literal (`2.5`)? A float literal is
+// polymorphic across the float types — it adapts DOWN to an f32 operand — so it does NOT force f64
+// the way a genuine f64 reference/result/variable does.
+function exprIsFloatLit(exprIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is NumLit { return numTextIsFloat(e.numText) }
+  false
+}
+
+// Does a binary op over `leftIx`/`rightIx` have a GENUINE (non-literal) f64 operand? Such an operand
+// makes the whole op f64 — an f32 / i32 / float-literal side widens to it (`f32var + f64var` is f64,
+// computed in f64). A float LITERAL is NOT genuine f64 (it adapts down to an f32 operand), so it does
+// not trigger this. Drives both the `exprIsF32` classification and the f32 emit slice: when true,
+// the op is f64 (the f64 slice), not f32 — without which the f32 slice demoted the f64 and trapped.
+function binMixHardF64(leftIx: i32, rightIx: i32, fnIx: i32) {
+  if exprIsF64(leftIx, fnIx) {
+    if !exprIsFloatLit(leftIx) { return true }
+  }
+  if exprIsF64(rightIx, fnIx) {
+    if !exprIsFloatLit(rightIx) { return true }
+  }
+  false
+}
+
 function exprIsF32(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   if tyKindOf(nodeTyIxOf(exprIx)) == 13 {
@@ -11164,6 +11192,9 @@ function exprIsF32(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const op = e.binOp
     if op == "+" || op == "-" || op == "*" || op == "/" {
+      // f32 arithmetic yields f32 only when NO operand is a genuine f64 — a genuine f64 side makes
+      // the op f64 (the f32 side widens). A float literal does not count (it adapts down to f32).
+      if binMixHardF64(e.binLeft, e.binRight, fnIx) { return false }
       if exprIsF32(e.binLeft, fnIx) { return true }
       return exprIsF32(e.binRight, fnIx)
     }
