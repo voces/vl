@@ -21535,6 +21535,40 @@ function letUnionNameOf(letIx: i32, fnIx: i32) {
   ""
 }
 
+// The union return-type NAME of a closure-typed PARAM `name` of function `fnIx` (`g: (i32) => A | B`
+// → "A | B", an alias `(i32) => Sh` → its member set), or "" when `name` is not a union-returning
+// closure param. Lets a value call THROUGH a closure param (`g(x)` inside a HOF) classify its result
+// union so a narrowed read unboxes — the param analogue of the binding case in `unionNameOfExpr`.
+function paramUnionRetName(fnIx: i32, name: string) {
+  if fnIx < 0 { return "" }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let i = 0
+    while i < fn.fnParams.length {
+      const p = P.nodes[fn.fnParams[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            const ty = P.nodes[p.parType]
+            if ty is TypeRef {
+              const nm = ty.tyName
+              const arrowAt = annArrowAt(nm)
+              if arrowAt >= 1 && nm[0] == '(' {
+                const ret = monoUnwrapParens(nm.slice(arrowAt + 2, nm.length))
+                if isUName(ret) { return ret }
+                if isValueUnionName(ret) { return ret }
+              }
+            }
+          }
+          return ""
+        }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
 // The union NAME the expression at `exprIx` produces (the name-typed mirror of the
 // boolean `exprUnion`): a union-returning call's return annotation, a union-typed
 // ident, a parenthesized union. "" when the expression is not union-valued.
@@ -21582,6 +21616,11 @@ function unionNameOfExpr(exprIx: i32, fnIx: i32) {
           }
         }
       }
+      // A union-returning closure PARAM callee (`callIt(g: (i32) => A | B, x) { … g(x) … }`): resolve
+      // the union from the param's function-type annotation, so a narrowed VALUE-union result unboxes
+      // inside the HOF body (the struct case reads a field off the variant, so it needs no name).
+      const pun = paramUnionRetName(fnIx, callee.identName)
+      if pun != "" { return pun }
     }
     // A union-returning FIELD-closure callee (`const r = o.run(7)` over a `(…) => A | B`
     // field) — the Member analogue of the binding case above: resolve the field's lifted
@@ -26391,20 +26430,13 @@ function closureAnnRetUnionName(name: string) {
 // `emitReturnValue`'s `retUNm` path, and the call's `ref.cast` resolves + the `is`-narrow classifies.
 // Mirrors `synthParamAnnots` (the param dual). SCOPED to a multi-member union return (the gap); scalar/
 // struct/nullable returns already infer correctly, so they are left untouched → byte-identical. Runs
-// BEFORE the shape-interning passes (`collectAnnShapes`/`collectA`) so the union's box + variants intern
-// for the lambda's return EXACTLY as for a named `: Cat | Dog` function.
-// Runs TWICE. `structOnly` (the PRE-monomorphization pass) restricts to a STRUCT/variant union return
-// (no value atom): such a lambda flowing into a HOF param is monomorphized — its `fnStmts` slot
-// REPLACED by an instance cloned with `nret = fnRet` — so its struct-union return must be pinned BEFORE
-// mono or the clone keeps `fnRet < 0` and emits a single-arm struct `$fnsig` result the call's
-// `ref.cast` to `i>u` rejects. A VALUE union (`i32 | string`) is deliberately EXCLUDED there: pinning it
-// pre-mono made the clone emit a `>u` body against an i32 functype result (invalid wasm), so it stays
-// on the post-mono pass where, if it escaped to a HOF, its clone keeps `fnRet < 0` and the value call is
-// a clean "no interned signature" reject — never invalid wasm. The POST pass (`structOnly == false`)
-// then pins EVERY remaining union return, covering the BOUND value-union case (`const g: (i32) => i32 |
-// string = …; g(1)`, no mono) exactly as before. A return already pinned by the pre pass is skipped
-// (`fnRet < 0` guard), so the two passes never double-set.
-function synthRetAnnots(structOnly: boolean) {
+// BEFORE monomorphization (so a lambda flowing into a HOF param — whose `fnStmts` slot the mono pass
+// REPLACES with an instance cloned `nret = fnRet` — has its union return pinned first; else the clone
+// keeps `fnRet < 0` and emits a single-arm `$fnsig` result the call's `ref.cast` to `i>u` rejects), and
+// thus before the shape-interning passes too (the union's box + variants intern for the return EXACTLY
+// as for a named `: Cat | Dog` function). Covers STRUCT, ALIAS and VALUE unions alike — a value union's
+// narrowed result unboxes via `paramUnionRetName` in the HOF body (`unionNameOfExpr`).
+function synthRetAnnots() {
   if !fnValUsed { return 0 }
   let ai = 0
   while ai < P.nodes.length {
@@ -26415,11 +26447,7 @@ function synthRetAnnots(structOnly: boolean) {
         if init is FuncDecl {
           if init.fnRet < 0 {
             const rt = closureAnnRetUnionName(tyNameOf(n.letType))
-            if rt != "" {
-              if !structOnly || !unionHasValueAtom(rt) {
-                init.fnRet = mkTypeRef(rt, -1)
-              }
-            }
+            if rt != "" { init.fnRet = mkTypeRef(rt, -1) }
           }
         }
       }
@@ -26848,9 +26876,9 @@ export function emitProgram(rootIx: i32) {
     // (`i>s-1;`) that the call-site `ref.cast` to `i>u` rejects. Also before the shape passes, so the
     // union's box + variants intern for the return like a named `: Cat | Dog` function. The union
     // registry (`collectU`, above) is already populated, so an alias return (`(i32) => Animal`)
-    // resolves via `isUName`. STRUCT unions only here — a value union stays for the post-mono pass
-    // (pinning it pre-mono makes a HOF-escaped clone emit invalid wasm; see `synthRetAnnots`).
-    synthRetAnnots(true)
+    // resolves via `isUName`. Covers struct / alias / value unions (a value union's narrowed result
+    // unboxes via `paramUnionRetName` in the HOF body), and the BOUND case (no mono) alike.
+    synthRetAnnots()
     // Monomorphize: resolve every direct call to a generic (`<T>` / un-annotated
     // param) function into a concretely-annotated instance (cloned per distinct
     // call shape, host `instantiate` parity) BEFORE signatures and types are
@@ -26863,11 +26891,6 @@ export function emitProgram(rootIx: i32) {
     // `fRetStructIdx` needs its just-interned return shape). All passes are
     // idempotent and usage-gated (no new TypeRef → no new shape → identical
     // bytes).
-    // The POST-mono union-return pass: pins EVERY remaining un-annotated union-returning lambda
-    // (value unions, and any not reached pre-mono) — covering the BOUND case (`const g: (i32) => i32 |
-    // string = …; g(1)`, no mono). Before the shape passes, so the value union's box interns for the
-    // return. A return the pre-mono pass already pinned is skipped (`fnRet < 0` guard).
-    synthRetAnnots(false)
     collectGenAliasShapes()
     collectAnnShapes()
     if collectA(stmts) < 0 { return -1 }
