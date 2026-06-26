@@ -20335,6 +20335,18 @@ function registerInlineUnion(stmts: i32[], name: string) {
     const mvn = mapValNameOf(name)
     if mvn != "" { return registerInlineUnion(stmts, mvn) }
   }
+  // A function-type annotation (`(i32) => C | S`) carries an inline union in its RETURN (a closure
+  // value whose result is a union). Register that return union so a value call's result narrows —
+  // the function type itself is not a union. Mirrors the array/map element recursion above.
+  if name.length > 0 && name[0] == '(' {
+    const fra = annArrowAt(name)
+    if fra >= 1 {
+      return registerInlineUnion(
+        stmts,
+        monoUnwrapParens(name.slice(fra + 2, name.length)),
+      )
+    }
+  }
   if !isVariantBoxUnion(stmts, name) { return 0 }
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
@@ -26318,6 +26330,65 @@ function resolveShapeToNominal(name: string) {
   name
 }
 
+// The multi-member UNION return type of a closure-type annotation NAME (`(i32)=>Cat|Dog` → "Cat|Dog"),
+// or "" if the annotation is not a function type or its return is not a 2+-member union. The nullable
+// niches (`T | null`) are excluded — they carry their own `>N` / `>n<idx>;` rep, not the union box.
+function closureAnnRetUnionName(name: string) {
+  const arrowAt = annArrowAt(name)
+  if arrowAt < 1 { return "" }
+  if name[0] != '(' { return "" }
+  const ret = monoUnwrapParens(name.slice(arrowAt + 2, name.length))
+  // A declared union ALIAS (`type Animal = Cat | Dog`) or an already-registered inline union.
+  if isUName(ret) { return ret }
+  // An inline multi-member union not yet registered (`Cat | Dog`) — gate on 2+ non-null members
+  // (a `T | null` niche has its own rep, handled elsewhere).
+  const parts: string[] = []
+  annSplitPipe(ret, parts)
+  if parts.length >= 2 {
+    let nonNull = 0
+    let pi = 0
+    while pi < parts.length {
+      if parts[pi] != "null" && parts[pi].length > 0 { nonNull = nonNull + 1 }
+      pi = pi + 1
+    }
+    if nonNull >= 2 { return ret }
+  }
+  ""
+}
+
+// Give an anonymous lambda bound to an annotated closure type a UNION RETURN annotation from that type
+// (`const g: (i32) => Cat | Dog = (n) => …`). An un-annotated lambda's return is inferred from its body,
+// which for a union join (`if … { aCat } else { aDog }`) collapses to ONE arm (a struct / string) — so
+// its emitted functype result and its interned `$fnsig` key (`i>s0;` / `i>S`) disagreed with the call
+// site's annotation-derived `i>u`, leaving the value call un-interned ("function-value call arity has no
+// interned signature"). Pinning `fnRet` to the union makes the lambda emit the boxed-union result (like
+// an annotated `: Cat | Dog` function), so it interns `i>u`, the body boxes each arm via
+// `emitReturnValue`'s `retUNm` path, and the call's `ref.cast` resolves + the `is`-narrow classifies.
+// Mirrors `synthParamAnnots` (the param dual). SCOPED to a multi-member union return (the gap); scalar/
+// struct/nullable returns already infer correctly, so they are left untouched → byte-identical. Runs
+// BEFORE the shape-interning passes (`collectAnnShapes`/`collectA`) so the union's box + variants intern
+// for the lambda's return EXACTLY as for a named `: Cat | Dog` function.
+function synthRetAnnots() {
+  if !fnValUsed { return 0 }
+  let ai = 0
+  while ai < P.nodes.length {
+    const n = P.nodes[ai]
+    if n is LetDecl {
+      if n.letType >= 0 && n.letInit >= 0 {
+        const init = P.nodes[n.letInit]
+        if init is FuncDecl {
+          if init.fnRet < 0 {
+            const rt = closureAnnRetUnionName(tyNameOf(n.letType))
+            if rt != "" { init.fnRet = mkTypeRef(rt, -1) }
+          }
+        }
+      }
+    }
+    ai = ai + 1
+  }
+  0
+}
+
 function synthParamAnnots() {
   let fe = 0
   while fe < fnStmts.length {
@@ -26742,6 +26813,9 @@ export function emitProgram(rootIx: i32) {
     // `fRetStructIdx` needs its just-interned return shape). All passes are
     // idempotent and usage-gated (no new TypeRef → no new shape → identical
     // bytes).
+    // Give a lambda bound to an annotated closure type a UNION return annotation BEFORE the shape
+    // passes, so the union's box + variants intern for its return like a named `: Cat | Dog` function.
+    synthRetAnnots()
     collectGenAliasShapes()
     collectAnnShapes()
     if collectA(stmts) < 0 { return -1 }
