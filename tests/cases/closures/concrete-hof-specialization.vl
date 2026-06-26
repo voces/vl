@@ -1,0 +1,64 @@
+// @run
+// @log 10
+// @log 24
+// @log 20
+// @log 50
+// @log y
+// @log z
+// CALLBACK SPECIALIZATION for a CONCRETE (non-generic) higher-order function. A concrete
+// `reduce(self: i32[], f: (i32, i32) => i32, init: i32): i32` never goes through `<T>`
+// monomorphization, so before this it kept the per-element `call_ref` through `f`. Now, when a call
+// passes a NON-CAPTURING concrete callback — a top-level name (`add`, `mul`) or an in-place lambda —
+// the function is cloned with that callback BAKED IN as a direct call (`reduce$cbN`), each distinct
+// callback getting its own clone. The ORIGINAL `reduce` is kept (its slot is never replaced), so a
+// CAPTURING callback still routes through it as a `call_ref`. Behavior is identical to the call_ref
+// form either way — this pins the behavior; the speedup (~4× on the native host) isn't observable.
+//
+// GUARD: a concrete HOF with an UN-ANNOTATED return whose value flows THROUGH the callback
+// (`applyN(g, x) { return g(x) }`) is NOT specialized — baking the `g(x)` into a direct call would
+// re-derive the return through a different inference path that doesn't re-establish the nullable rep,
+// breaking a downstream `?? d`. Only an annotated return (whose rep is pinned by the annotation, not
+// the body) is specialized. So `applyN(maybeName, …) ?? "z"` keeps working (it stays a `call_ref`).
+
+function reduce(self: i32[], f: (i32, i32) => i32, init: i32): i32 {
+  let acc = init
+  let i = 0
+  while i < self.length {
+    acc = f(acc, self[i])
+    i = i + 1
+  }
+  return acc
+}
+
+function add(a: i32, b: i32): i32 { return a + b }
+
+function mul(a: i32, b: i32): i32 { return a * b }
+
+// An un-annotated-return wrapper whose result flows through the callback — the specialization guard.
+function maybeName(n: i32): string | null {
+  if n > 0 { return "y" }
+  return null
+}
+
+function applyN(g: (i32) => string | null, x: i32) { return g(x) }
+
+function go() {
+  const xs = [1, 2, 3, 4]
+
+  // Two distinct non-capturing NAMED callbacks → two specialized clones.
+  print(reduce(xs, add, 0)) // 10
+  print(reduce(xs, mul, 1)) // 24
+
+  // A non-capturing lambda literal → specialized.
+  print(reduce(xs, (a: i32, b: i32) => a + b * 2, 0)) // 2 + 4 + 6 + 8 = 20
+
+  // A CAPTURING lambda (closes over `bias`) routes through the kept original as a call_ref.
+  const bias = 10
+  print(reduce(xs, (a: i32, b: i32) => a + b + bias, 0)) // 10 + 4*10 = 50
+
+  // Un-annotated-return HOF + `??` — guard keeps it a call_ref, so it still narrows/coalesces.
+  print(applyN(maybeName, 1) ?? "z") // y
+  print(applyN(maybeName, 0) ?? "z") // z
+}
+
+go()

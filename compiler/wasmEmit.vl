@@ -25591,6 +25591,146 @@ function monoSpecializableCallbackName(argIx: i32, ctx: i32) {
   ""
 }
 
+// Does the NON-generic function at `fe` take a closure-typed parameter (`f: (i32,i32)=>i32`)? —
+// i.e. is it a concrete higher-order function, a candidate for callback specialization. A `<T>`
+// generic is excluded (its callbacks are already baked via `monoInstantiate` + `monoBakeCallback`).
+function feHasClosureParam(fe: i32) {
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fn.fnTyParams.length > 0 { return false }
+    let i = 0
+    while i < fn.fnParams.length {
+      const p = P.nodes[fn.fnParams[i]]
+      if p is Param {
+        if p.parType >= 0 {
+          if annArrowAt(tyNameOf(p.parType)) >= 0 { return true }
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether the program defines ANY concrete higher-order function — the gate that lets the mono
+// pass run for callback specialization even when the program has no `<T>` generic. The compiler
+// itself has none (it is closure-free imperative code), so this stays false for it and the pass
+// stays skipped → the all-i32 native fixpoint is byte-identical.
+function monoHasConcreteHOFParam() {
+  let fe = 0
+  while fe < fnStmts.length {
+    if fe < monoGen.length {
+      if monoGen[fe] == 0 {
+        if feHasClosureParam(fe) { return true }
+      }
+    }
+    fe = fe + 1
+  }
+  false
+}
+
+// CALLBACK SPECIALIZATION for a CONCRETE (non-generic) HOF. A concrete `reduce(self: i32[], f:
+// (i32,i32)=>i32, init)` never goes through `monoInstantiate` (it is not type-parameterized), so its
+// body keeps the per-element `call_ref` through `f`. When a call passes a non-capturing concrete
+// callback, clone the function with that callback BAKED in as a direct call (`monoBakeCallback`),
+// append it as a fresh `<name>$cbN`, and point the call site at it — the concrete analogue of what
+// `monoMakeInstance` does for generics, keyed purely on the callback identity (the params carry their
+// own annotations, so there is no type pinning / return inference). Unlike a generic template, the
+// ORIGINAL concrete function is KEPT (its slot is never replaced): it still serves any non-bakeable
+// caller (a capturing lambda, a closure read from a binding/union). The closure VALUE is still passed
+// (the param stays), so a callback used in a non-call position keeps working. No bakeable callback →
+// returns 0 having changed nothing (byte-identical). Returns 0, or -1 via `emitFail`.
+function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const fn = P.nodes[fnStmts[fe]]
+    if fn is FuncDecl {
+      const params = fn.fnParams
+      const args = c.callArgs
+      if args.length != params.length { return 0 }
+      // Only an ANNOTATED return is specialized. An UN-annotated return is inferred THROUGH the
+      // callback param's call (`function applyN(g, x) { return g(x) }`): baking that `g(x)` into a
+      // direct `maybeName(x)` re-derives the return via a different inference path, which doesn't
+      // re-establish a nullable/union rep on the appended function (so a downstream `?? d` / `is`
+      // narrow fails). The annotation pins the rep independent of the body, so it survives the bake.
+      // The fold/reduce/search HOFs worth specializing annotate their return anyway; the un-annotated
+      // case is the thin `return g(x)` wrapper, which barely benefits. (The generic path has the same
+      // un-annotated-return limitation — a shared follow-up.)
+      if fn.fnRet < 0 { return 0 }
+      // The baked callback (and its param NAME) per position — "" where the argument is not a
+      // non-capturing concrete function (a capturing lambda / generic / non-closure stays call_ref).
+      const cbFnNames: string[] = []
+      const cbParamNames: string[] = []
+      let i = 0
+      while i < args.length {
+        const p = P.nodes[params[i]]
+        if p is Param {
+          cbParamNames.push(p.parName)
+        } else {
+          cbParamNames.push("")
+        }
+        cbFnNames.push(monoSpecializableCallbackName(args[i], ctx))
+        i = i + 1
+      }
+      if !monoAnyBakedCallback(cbFnNames) { return 0 }
+      // Key on the callee + each baked callback identity, so `reduce(xs, add, …)` and `reduce(xs,
+      // mul, …)` get distinct specializations. The `C` prefix keeps these out of the generic keyspace
+      // (which always carries a `#`), so the two registries share storage without colliding.
+      let key = "C" + i32ToStr(fe)
+      let kc = 0
+      while kc < cbFnNames.length {
+        if cbFnNames[kc] != "" { key = key + "@" + cbFnNames[kc] }
+        kc = kc + 1
+      }
+      // Registry hit: a prior call already specialized this (callee, callback-set) — reuse it.
+      let r = 0
+      while r < monoKeys.length {
+        if monoKeys[r] == key {
+          const cal = P.nodes[c.callFn]
+          if cal is Ident { cal.identName = monoInstName[r] }
+          return 0
+        }
+        r = r + 1
+      }
+      // Fresh specialization. `$cbN` is disambiguated by how many concrete specializations this
+      // callee already has (its prior `monoInstOrig` entries).
+      let count = 0
+      let kk = 0
+      while kk < monoInstOrig.length {
+        if monoInstOrig[kk] == fe { count = count + 1 }
+        kk = kk + 1
+      }
+      const instBody = monoBakeCallback(fn.fnBody, cbParamNames, cbFnNames)
+      const nps: i32[] = []
+      let pj = 0
+      while pj < params.length {
+        const p3 = P.nodes[params[pj]]
+        if p3 is Param { nps.push(mkParam(p3.parName, p3.parType, p3.pos)) }
+        pj = pj + 1
+      }
+      const noTP: string[] = []
+      const specName = fn.fnName + "$cb" + i32ToStr(count)
+      const nfn = mkFunc(specName, noTP, nps, fn.fnRet, instBody, fn.pos)
+      fnStmts.push(nfn)
+      fnParent.push(-1)
+      fnDispNames.push("")
+      const instFe = fnStmts.length - 1
+      const cal2 = P.nodes[c.callFn]
+      if cal2 is Ident { cal2.identName = specName }
+      monoKeys.push(key)
+      monoInstOrig.push(fe)
+      monoInstName.push(specName)
+      monoInstFe.push(instFe)
+      if monoRebuild() < 0 { return -1 }
+      // Walk the ORIGINAL body under this specialization's context so a nested generic call it
+      // contains instantiates (idempotent via the registry — the main loop also walks the original).
+      if monoWalk(fn.fnBody, nfn) < 0 { return -1 }
+      if monoRebuild() < 0 { return -1 }
+    }
+  }
+  0
+}
+
 // Walk the statement/expression tree at `ix` (inside function `ctx`, -1 = top
 // level) and instantiate every direct call to a generic function. Arguments are
 // walked BEFORE their call is classified, so an inner generic call's instance
@@ -25643,6 +25783,9 @@ function monoWalk(ix: i32, ctx: i32) {
       }
       if fe >= 0 && fe < monoGen.length {
         if monoGen[fe] == 1 { return monoInstantiate(fe, ix, ctx) }
+        // A CONCRETE callee: specialize it per non-capturing callback (no-op if none) — the
+        // concrete analogue of `monoInstantiate`'s callback baking.
+        return monoSpecializeConcrete(ix, fe, ctx)
       }
       return 0
     }
@@ -26059,6 +26202,12 @@ function monomorphize(stmts: i32[]) {
       monoGen.push(0)
     }
     fe = fe + 1
+  }
+  // The pass also runs for callback specialization of a CONCRETE higher-order function (no `<T>`
+  // generic needed). Gated on the program actually defining one, so a generic-free, HOF-free
+  // program (the compiler itself) still skips the pass entirely → byte-identical.
+  if !any {
+    if monoHasConcreteHOFParam() { any = true }
   }
   if !any { return 0 }
   // Top-level statements first, in source order (global inits + start stmts).
