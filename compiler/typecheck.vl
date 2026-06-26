@@ -2560,28 +2560,33 @@ function dstAdmitsF32(dstTy: i32) {
   false
 }
 
-// True if `dstTy` is `f32[]` (an array whose element is f32).
-function isF32ArrayDst(dstTy: i32) {
-  if dstTy < 0 { return false }
-  const t = T.tys[dstTy]
-  if t is TyArray { return primNameOf(t.aElem) == "f32" }
-  false
-}
-
-// True if `ix` is an array LITERAL whose every element is a float literal (or it is empty) —
-// the array analogue of `isFloatLitExpr`. Each element re-encodes exactly at f32, so such a
-// literal flows into an `f32[]` slot (an arbitrary `f64[]` VALUE would be a lossy demote).
-function isFloatLitArrayExpr(ix: i32) {
-  if ix < 0 { return false }
-  const e = P.nodes[ix]
-  if e is Paren { return isFloatLitArrayExpr(e.parInner) }
-  if e is ArrayLit {
-    let i = 0
-    while i < e.arrElems.length {
-      if !isFloatLitExpr(e.arrElems[i]) { return false }
-      i = i + 1
+// True if the array LITERAL `srcExpr` fits the f32-array type `dstTy` — every element a float
+// literal that re-encodes exactly at f32 (an arbitrary `f64[]` VALUE would be a lossy demote); an
+// empty `[]` fits. Peels one array level off both the type and the literal in lockstep so the shape
+// generalizes; a NESTED element (`f32[][]`) currently bails (see below) until the emitter wires the
+// f32 ref-list element, at which point the leaf check becomes a recursive call.
+function floatLitArrayFitsF32(srcExpr: i32, dstTy: i32) {
+  if srcExpr < 0 || dstTy < 0 { return false }
+  const d = T.tys[dstTy]
+  if d is TyArray {
+    const e = P.nodes[srcExpr]
+    if e is Paren { return floatLitArrayFitsF32(e.parInner, dstTy) }
+    if e is ArrayLit {
+      const elemTy = d.aElem
+      const elemT = T.tys[elemTy]
+      // Only a 1D `f32[]` literal adapts today — the emitter wires the f32 list rep for the
+      // scalar element, not yet the nested ref-list element (`f32[][]`). A nested element type
+      // falls through to the normal `assignable` path (a clean type-mismatch error) rather than
+      // a misleading emit floor; recurse here once the ref-list f32 wiring lands.
+      if elemT is TyArray { return false }
+      let i = 0
+      while i < e.arrElems.length {
+        if primNameOf(elemTy) != "f32" { return false }
+        if !isFloatLitExpr(e.arrElems[i]) { return false }
+        i = i + 1
+      }
+      return true
     }
-    return true
   }
   false
 }
@@ -2662,9 +2667,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
     if dstAdmitsF32(dstTy) { return true }
   }
   // A float-literal array → `f32[]` (the array analogue of the scalar float-literal→f32 rule).
-  if isF32ArrayDst(dstTy) {
-    if isFloatLitArrayExpr(srcExpr) { return true }
-  }
+  if floatLitArrayFitsF32(srcExpr, dstTy) { return true }
   // `boolean`-where-`i32`-expected coercion (A7): a boolean-typed VALUE flows
   // into an i32 slot as 1/0 (a no-op in codegen — boolean rides in an i32).
   // One-directional, and a bare `true`/`false` LITERAL is excluded.
@@ -4766,7 +4769,9 @@ function checkCallNode(n: Call, ix: i32) {
           // a clean type error.
           if rt.aElem < 0 {
             rt.aElem = pat
-          } else if !assignable(pat, rt.aElem) {
+          } else if !assignableExpr(margs[0], pat, rt.aElem) {
+            // `assignableExpr` (not bare `assignable`) so a float-literal argument re-encodes into
+            // an `f32` element (`xs.push(2.5)` over `f32[]`), exactly as it does at a binding.
             tErr("push: cannot add " + tyToStr(pat) + " to " + tyToStr(recvTy), ix)
           }
         }
