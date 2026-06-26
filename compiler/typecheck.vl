@@ -2560,38 +2560,6 @@ function dstAdmitsF32(dstTy: i32) {
   false
 }
 
-// True if the array LITERAL `srcExpr` fits the f32-array type `dstTy` — every element a float
-// literal that re-encodes exactly at f32 (an arbitrary `f64[]` VALUE would be a lossy demote); an
-// empty `[]` fits. Peels one array level off both the type and the literal in lockstep so the shape
-// generalizes; a NESTED element (`f32[][]`) currently bails (see below) until the emitter wires the
-// f32 ref-list element, at which point the leaf check becomes a recursive call.
-function floatLitArrayFitsF32(srcExpr: i32, dstTy: i32) {
-  if srcExpr < 0 || dstTy < 0 { return false }
-  const d = T.tys[dstTy]
-  if d is TyArray {
-    const e = P.nodes[srcExpr]
-    if e is Paren { return floatLitArrayFitsF32(e.parInner, dstTy) }
-    if e is ArrayLit {
-      const elemTy = d.aElem
-      const elemT = T.tys[elemTy]
-      let i = 0
-      while i < e.arrElems.length {
-        // Peel one array level off type + literal in lockstep: a nested element (`f32[][]`)
-        // recurses, a scalar leaf must be an f32-typed float literal that re-encodes exactly.
-        if elemT is TyArray {
-          if !floatLitArrayFitsF32(e.arrElems[i], elemTy) { return false }
-        } else {
-          if primNameOf(elemTy) != "f32" { return false }
-          if !isFloatLitExpr(e.arrElems[i]) { return false }
-        }
-        i = i + 1
-      }
-      return true
-    }
-  }
-  false
-}
-
 // Does function type `tyIx` carry an inference HOLE — a `TyVar` param or return? Such a type is a
 // GENERIC (capability-bounded) function value (`(a, b) => a + b`), not a concrete signature.
 function fnTyHasHole(tyIx: i32) {
@@ -2667,8 +2635,8 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if isFloatLitExpr(srcExpr) {
     if dstAdmitsF32(dstTy) { return true }
   }
-  // A float-literal array → `f32[]` (the array analogue of the scalar float-literal→f32 rule).
-  if floatLitArrayFitsF32(srcExpr, dstTy) { return true }
+  // (A float-literal array → `f32[]`, and any literal array adapting element-wise, is handled by
+  // the `ArrayLit` recursion in the literal-aware block below — the array dual of the ObjLit case.)
   // `boolean`-where-`i32`-expected coercion (A7): a boolean-typed VALUE flows
   // into an i32 slot as 1/0 (a no-op in codegen — boolean rides in an i32).
   // One-directional, and a bare `true`/`false` LITERAL is excluded.
@@ -2725,6 +2693,29 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
           }
           return ok
         }
+      }
+    }
+    // An array LITERAL checks element-wise against the target's element type, so a bare element
+    // adapts exactly as it would at a binding — the array analogue of the ObjLit recursion above.
+    // This SUBSUMES the scalar float-literal → `f32[]` rule and generalizes it to ANY element
+    // type and ANY nesting depth: a float-literal element fits `f32[]`, an object-literal element
+    // with an `f32` field fits `{x: f32}[]`, and a nested literal recurses (`[[1.5]]` → `f32[][]`).
+    // An empty `[]` fits any element type (the loop does not run). An arbitrary non-literal value
+    // element is NOT widened — the per-element `assignableExpr` still rejects a lossy f64 demote.
+    if e is ArrayLit {
+      const d = T.tys[dstTy]
+      if d is TyArray {
+        let i = 0
+        let ok = true
+        while i < e.arrElems.length {
+          if (
+            !assignableExpr(e.arrElems[i], nodeTyIxOf(e.arrElems[i]), d.aElem)
+          ) {
+            ok = false
+          }
+          i = i + 1
+        }
+        return ok
       }
     }
   }
