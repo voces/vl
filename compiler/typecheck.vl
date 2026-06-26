@@ -3321,8 +3321,28 @@ function nameToTy(name: string) {
       }
     }
   }
-  // A declared struct/union type (registered by the program's pre-pass).
-  if cUserTypes.has(name) { return cUserTypes[name] ?? -1 }
+  // A declared struct/union type (registered by the program's pre-pass). A SINGLE-MEMBER union
+  // alias (`type Id = i32`, `type Name = string`, `type MyCat = Cat`) is TRANSPARENT — it denotes
+  // its member, not a one-variant union box. The parser accepts a bare `type N = A` as a one-member
+  // union, but a union of one is just that one type, so resolve to the member (`x: Id` is a plain
+  // `i32`, usable with `+`; before this it was the box → "operator + not defined" / invalid wasm).
+  if cUserTypes.has(name) {
+    const ut = cUserTypes[name] ?? -1
+    if ut >= 0 {
+      const utt = T.tys[ut]
+      if utt is TyUnion {
+        // Collapse only a PRIMITIVE-scalar single member (the soundness hole). A struct / object /
+        // intersection single-member alias keeps its named union ty — the emitter resolves it through
+        // its named-struct path, and collapsing it would diverge the two sides (see
+        // `singleMemberAliasName`).
+        if utt.uMembers.length == 1 {
+          const m0 = T.tys[utt.uMembers[0]]
+          if m0 is TyPrim { return utt.uMembers[0] }
+        }
+      }
+    }
+    return ut
+  }
   // A BARE reference to a generic alias has no concrete type — its parameters
   // were never supplied (host: `Generic type … was used without any`).
   if gaIndexOf(name) >= 0 {
@@ -3474,6 +3494,12 @@ function nameNeedsCanon(name: string) {
   while i < name.length {
     const c = name[i]
     if c == '"' || c == '&' || c == '!' || c == '(' { return true }
+    // A composite form (`Id[]`, `{[string]: Id}`, `{x: Id}`) may embed a single-member alias in its
+    // element / value / field, which `canonEmitName`'s array/map/object recursion resolves — so it
+    // must run even when no other canon trigger is present. Idempotent for an already-canon composite
+    // (a non-alias element rewrites to itself), so this only broadens WHICH names recurse, not the
+    // result of any name that already canon'd.
+    if c == '[' || c == '{' { return true }
     // A top-level union (`AB | null`) must be processed so a union-ALIAS member expands to
     // its flattened members (the inline `(A|B)|null` already trips the `(` test above). The
     // member-canon loop is idempotent for an already-flat union, so this is a no-op there.
@@ -3688,8 +3714,43 @@ function unionAliasMembers(name: string) {
   ""
 }
 
+// The single member's EMIT name of a declared one-member union ALIAS (`type Id = i32` → "i32",
+// `type Name = string` → "string", `type MyCat = Cat` → "Cat"), or "" if `name` is not a declared
+// single-member union. Such an alias is TRANSPARENT — it denotes its member, so the emitter resolves
+// it to the member's own vocabulary rather than registering a one-variant union box.
+function singleMemberAliasName(name: string) {
+  if !cUserTypes.has(name) { return "" }
+  const ti = cUserTypes[name] ?? -1
+  if ti < 0 { return "" }
+  const t = T.tys[ti]
+  if t is TyUnion {
+    if t.uMembers.length == 1 {
+      // Only a PRIMITIVE-SCALAR member is resolved here (the documented soundness hole — `type Id =
+      // i32` / `type Name = string` miscompiling as a one-variant box). A struct / object / inline-
+      // intersection member (`type MyCat = Cat`, `type AB = {a}&{b}`) is left as its alias NAME, which
+      // the emitter already resolves through its named-struct / `unionStructAliasShape` path —
+      // expanding it to an inline shape here would lose that registration (a struct param then reads
+      // as an unrecognized inline-object annotation).
+      const mt = T.tys[t.uMembers[0]]
+      if mt is TyPrim {
+        // `tyToEmitName` renders the boolean prim by its INTERNAL name "bool"; the emitter's
+        // vocabulary is "boolean" (every other prim name already matches), so normalize it.
+        const m = tyToEmitName(t.uMembers[0])
+        if m == "bool" { return "boolean" }
+        return m
+      }
+    }
+  }
+  ""
+}
+
 export function canonEmitName(name: string) {
   if name.length == 0 { return name }
+  // A single-member union alias is transparent — resolve it to its member's emit name FIRST (before
+  // the `nameNeedsCanon` early-out, which would otherwise return a bare alias name unchanged). The
+  // member is itself canon'd, so `type Id = i32` → "i32" and `type Ids = Id[]`-style nesting resolves.
+  const sma = singleMemberAliasName(name)
+  if sma != "" { return canonEmitName(sma) }
   if !nameNeedsCanon(name) { return name }
   // A top-level UNION: canon each member and collapse duplicates (`"a" | "b"`
   // both soften to string → the bare scalar; a mixed-base union keeps each
