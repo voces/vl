@@ -2797,7 +2797,13 @@ function collectLocals(blockIx: i32, fnIx: i32) {
           // A union-box element list: the loop var is a kind-4 union box (no struct index);
           // the `#l` temp is the ref-list WRAPPER (code 5), like the struct case.
           fiLk = 5
-        } else if (fiEk == 2 || fiEk == 7 || fiEk == 12 || fiEk == 20) {
+        } else if (
+          fiEk == 2 ||
+          fiEk == 7 ||
+          fiEk == 12 ||
+          fiEk == 20 ||
+          fiEk == 21
+        ) {
           // A NESTED-ARRAY loop var — the inner LIST (kind 2/7/12/20). The `#l` temp is the
           // OUTER ref-list WRAPPER (code 5); each element is the inner list wrapper ref.
           fiLk = 5
@@ -2836,6 +2842,7 @@ function collectLocals(blockIx: i32, fnIx: i32) {
           fiEk == 7 ||
           fiEk == 12 ||
           fiEk == 20 ||
+          fiEk == 21 ||
           fiEk == 14 ||
           fiEk == 5
         ) {
@@ -6174,7 +6181,8 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
           elemNest != 6 &&
           elemNest != 7 &&
           elemNest != 8 &&
-          elemNest != 9
+          elemNest != 9 &&
+          elemNest != 10
         ) {
           if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
             return emitFail("emitProgram: nested arrays are not supported")
@@ -6203,6 +6211,8 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
             pendingListKind = 4
           } else if elemNest == 8 {
             pendingListKind = 6
+          } else if elemNest == 10 {
+            pendingListKind = 7 // f32-inner list -> build each element as an f32[] (kind 7)
           } else if elemNest == 9 {
             pendingListKind = 5
             pendingListSlot = nestInnerSlot
@@ -8072,8 +8082,14 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       let rslot = refListSlotOfExpr(nd.idxArr, fnIx)
       if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
       fbStructGet(rlWrapIdx[rslot], 0) // 0xfb 0x02 <ref-list wrapper> field 0: backing
+      // The INDEX is always i32 — clear any `pendingF32` an enclosing f32 context set, else a
+      // bare index literal emits as `f32.const` (matters for an INNER read `g[i][j]` over an
+      // `f32[][]`: the outer f32 read leaves `pendingF32` set while it emits this receiver).
+      const savedRlIxF32 = pendingF32
+      pendingF32 = false
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
-      fbArrayGet(rlBackIdx[rslot])     // 0xfb 0x0b <this slot's ref backing array>
+      pendingF32 = savedRlIxF32
+      fbArrayGet(rlBackIdx[rslot]) // 0xfb 0x0b <this slot's ref backing array>
       // A NULLABLE-struct element (`(P | null)[]`, slot key "P | null") legitimately holds
       // null, so the read STAYS `(ref null $P)` — no `ref.as_non_null` recover (the bound
       // `e` is a kind-9 niche the caller narrows with `e != null`).
@@ -14108,6 +14124,9 @@ function forInElemKind(iterIx: i32, fnIx: i32) {
     if rlElemKindTbl[rslot] == 6 { return 7 }
     if rlElemKindTbl[rslot] == 7 { return 12 }
     if rlElemKindTbl[rslot] == 8 { return 20 }
+    if rlElemKindTbl[rslot] == 10 {
+      return 21 // f32-inner list -> an f32-list local (kind 21)
+    }
     // A CLOSURE-element ref list (`((i32) => i32)[]`, element kind 5): the loop var binds as a
     // kind-14 closure local — `for f in fs { … f(x) … }` calls each via `call_ref`. The element
     // read recovers the closure ref non-null (like a struct); the `#l` temp is the ref-list
@@ -15081,6 +15100,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       ek == 7 ||
       ek == 12 ||
       ek == 20 ||
+      ek == 21 ||
       ek == 14 ||
       ek == 5
     ) {
@@ -15177,6 +15197,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       ek == 7 ||
       ek == 12 ||
       ek == 20 ||
+      ek == 21 ||
       ek == 14 ||
       ek == 5
     ) {
@@ -16742,7 +16763,8 @@ function mAssignTypeIndices(n: i32) {
     } else if (
       rlElemKindTbl[rs] == 6 ||
       rlElemKindTbl[rs] == 7 ||
-      rlElemKindTbl[rs] == 8
+      rlElemKindTbl[rs] == 8 ||
+      rlElemKindTbl[rs] == 10
     ) {
       // string[][] / f64[][] / i64[][]: the element is the inner list's WRAPPER
       // (`mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`) — but those wrappers are allocated AFTER
@@ -16849,6 +16871,7 @@ function mAssignTypeIndices(n: i32) {
   while rsfix < rlElemName.length {
     if rlElemKindTbl[rsfix] == 6 { rlElemHeap[rsfix] = mkListIdx }
     else if rlElemKindTbl[rsfix] == 7 { rlElemHeap[rsfix] = fl64TypeIdx }
+    else if rlElemKindTbl[rsfix] == 10 { rlElemHeap[rsfix] = fl32TypeIdx }
     else if rlElemKindTbl[rsfix] == 8 { rlElemHeap[rsfix] = il64TypeIdx }
     rsfix = rsfix + 1
   }
@@ -18553,7 +18576,12 @@ function nameIsRefArray(name: string) {
   // element is the inner list's WRAPPER (kinds 8 / 7 / 6 — the same the LIST-valued map vals
   // ref-list uses). `refArrElemKind` already maps these names; recognize them here so a direct
   // 2D array (not only a map value) is a supported ref list.
-  if name == "i64[][]" || name == "f64[][]" || name == "string[][]" {
+  if (
+    name == "i64[][]" ||
+    name == "f64[][]" ||
+    name == "f32[][]" ||
+    name == "string[][]"
+  ) {
     return true
   }
   // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
@@ -18614,6 +18642,8 @@ function ensureRefElem(elemName: string) {
     fa64Used = true
   } else if k == 8 {
     ia64Used = true
+  } else if k == 10 {
+    fa32Used = true
   }
   rlInternName(elemName, k)
 }
@@ -18626,6 +18656,9 @@ function refArrElemKind(name: string) {
   if name == "string[][]" { return 6 }
   if name == "f64[][]" { return 7 }
   if name == "i64[][]" { return 8 }
+  if name == "f32[][]" {
+    return 10 // f32 inner list (element is the `$fl32TypeIdx` wrapper)
+  }
   // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
   // itself a ref array, stored as the inner list's WRAPPER — kind 9. Recurses to any depth via
   // the interned inner slots. The scalar-leaf 2D names above are NOT ref arrays at the inner
@@ -19029,6 +19062,7 @@ function collectA(stmts: i32[]) {
           aUsed = true
         }
         if refArrElemKind(nd.tyName) == 7 { fa64Used = true }
+        if refArrElemKind(nd.tyName) == 10 { fa32Used = true }
         if refArrElemKind(nd.tyName) == 8 { ia64Used = true }
         if nameIsMapArray(nd.tyName) {
           mUsed = true
@@ -19210,6 +19244,7 @@ function refArrElemName(name: string) {
   // 8 / 7 / 6 element), mirroring `i32[][]` → `i32[]`.
   if name == "i64[][]" { return "i64[]" }
   if name == "f64[][]" { return "f64[]" }
+  if name == "f32[][]" { return "f32[]" }
   if name == "string[][]" { return "string[]" }
   if nameIsMapArray(name) { return name.slice(0, name.length - 2) }
   // `(string|i32)[]` → `string|i32` (the parens are annotation grouping only —
@@ -22378,6 +22413,16 @@ function exprF32Array(exprIx: i32, fnIx: i32) {
       if fnRetF32Array(callee.identName) { return true }
     }
     return false
+  }
+  // `g[i]` over an `f32[][]` (ref-list element kind 10 — the inner f32-list wrapper) yields an
+  // `f32[]`, so `g[i][j]` reads the f32 scalar.
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      let slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        if rlElemKindTbl[slot] == 10 { return true }
+      }
+    }
   }
   false
 }
