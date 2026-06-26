@@ -1,7 +1,7 @@
 import { Diag, Tok } from "./ast"
 import { advance, gSrc, mkTok, scanQuoted } from "./lexer"
 import { accept, parseExpr, parseProgram, parseStmt, parseType, parseTypeName } from "./parser"
-import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, nodeTyIsUnion, nodeUnionName, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
+import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, nodeTyIsUnion, nodeUnionName, nodeTyIsObj, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
 import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkBlock, mkCall, mkCallN, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkLet, mkMember, mkIndex, mkArrayLit, mkNum, mkParam, mkParen, mkReturn, mkStr, mkTypeRef, mkWhile, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 // VL-in-VL wasm emitter — self-hosted codegen spike.
 //
@@ -12259,15 +12259,32 @@ function cloCallSigKey(callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
     const cre = P.nodes[c.callFn]
-    if cre is Ident { return calleeCloSigKey(cre.identName, fnIx) }
+    // The syntactic resolvers — fast (no type render): a function-typed binding/param Ident, a struct
+    // field closure, an indexed closure-array element.
+    if cre is Ident {
+      const k = calleeCloSigKey(cre.identName, fnIx)
+      if k != "" { return k }
+    }
     if cre is Member {
       const mfe = fieldClosureFeOfRecv(cre.memObj, cre.memProp, fnIx)
       if mfe >= 0 { return cloSigKeyExt(mfe) }
     }
     if cre is Index {
       if exprRefArray(cre.idxArr, fnIx) {
-        return cloArrSlotSigKey(refListSlotOfExpr(cre.idxArr, fnIx))
+        const k = cloArrSlotSigKey(refListSlotOfExpr(cre.idxArr, fnIx))
+        if k != "" { return k }
       }
+    }
+    // GENERAL FALLBACK — derive the key from the callee's CHECKER type, uniformly for ANY callee the
+    // syntactic resolvers miss (an indexed closure-array element returning a struct/union, a value
+    // INFERRED from a factory call `const g = mk()`). `nodeTyName` renders the closure's `(params)=>ret`
+    // name (the checker proved its TyFunc), then the SAME `annSigKey` the annotation path uses produces
+    // a byte-identical key — so the call-site `ref.cast` resolves the functype the lambda interned, with
+    // no per-position sig producer. Off the hot path: reached only after the syntactic resolvers, so a
+    // common closure call (annotated binding/param) never renders.
+    const tn = nodeTyName(c.callFn)
+    if tn != "" {
+      if annArrowAt(tn) >= 0 { return annSigKey(tn) }
     }
   }
   ""
@@ -20812,8 +20829,9 @@ function exprStruct(exprIx: i32, fnIx: i32) {
     if callee is Ident {
       if fnRetStruct(callee.identName) { return true }
       // A struct-returning function VALUE (a binding / `(i32) => S` param callee): its
-      // resolved `>sN;` sig (mirrors `structIndexOfExpr`'s closure case).
-      return calleeReturnsStructIdx(callee.identName, fnIx) >= 0
+      // resolved `>sN;` sig (mirrors `structIndexOfExpr`'s closure case). Falls through to the
+      // per-node-type fallback below when the sig path misses (a factory-inferred value).
+      if calleeReturnsStructIdx(callee.identName, fnIx) >= 0 { return true }
     }
     // A FIELD-CLOSURE call (`(a."*")(2)` — a rewritten operator/index trap)
     // yields the field function's return struct (mirrors `structIndexOfExpr`).
@@ -20827,7 +20845,11 @@ function exprStruct(exprIx: i32, fnIx: i32) {
         }
       }
     }
-    return false
+    // FALLBACK (scoped to a CALL): a struct-returning closure value call whose callee the cases above
+    // miss — an INDEXED closure-array element (`arr[i](x)`) or a factory-inferred value. The cheap
+    // NO-RENDER `nodeTyIsObj` reads the checker's per-node type. Boolean dual of `structIndexOfExpr`'s
+    // fallback, so `letIsStruct` classifies such a binding (kind 1) and its field reads resolve.
+    return nodeTyIsObj(exprIx)
   }
   if e is Ident {
     if paramStruct(fnIx, e.identName) { return true }
@@ -21211,8 +21233,11 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32) {
       const ri = fnRetStructIndex(callee.identName)
       if ri >= 0 { return ri }
       // A struct-returning function VALUE (a binding / `(i32) => S` param callee, invisible
-      // to `fnRetStructIndex`): the struct index from its resolved `>sN;` sig.
-      return calleeReturnsStructIdx(callee.identName, fnIx)
+      // to `fnRetStructIndex`): the struct index from its resolved `>sN;` sig. Falls through to the
+      // per-node-type fallback below when the sig path misses (a value INFERRED from a factory call —
+      // `const g = mk()` — whose `>sN;` the syntactic path can't recover).
+      const ci = calleeReturnsStructIdx(callee.identName, fnIx)
+      if ci >= 0 { return ci }
     }
     // A FIELD-CLOSURE call (`(a."[]")(i)` — a chained index trap whose "[]"
     // returns another trap object) yields the field function's return struct.
@@ -21230,7 +21255,20 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     }
     // `xs.pop()` / `xs.get(i)` over a struct-element ref list yield that list's
     // element struct (as `S | null` — see `structListPopGetElem`).
-    return structListPopGetElem(exprIx, fnIx)
+    const slv = structListPopGetElem(exprIx, fnIx)
+    if slv >= 0 { return slv }
+    // FALLBACK (scoped to a CALL): a struct-returning closure value call whose callee the cases above
+    // miss — an INDEXED closure-array element (`arr[i](x).field`) or a value INFERRED from a factory
+    // call (`const g = mk(); g(x).field`). Resolve the struct from the checker's per-node type: gate on
+    // the cheap `nodeTyIsObj` (no render), then resolve the rendered inline shape to its declared index
+    // by field-set match (`structIndexOfTypeName`). The struct dual of the union `nodeUnionName`
+    // fallback, and the consumer half of the `cloCallSigKey` `nodeTyName` producer fallback. Off the
+    // hot path — declared / param / field-closure struct receivers resolve syntactically above.
+    if nodeTyIsObj(exprIx) {
+      const sn = nodeTyName(exprIx)
+      if sn != "" { return structIndexOfTypeName(sn) }
+    }
+    return -1
   }
   if e is Ident {
     let pi = paramStructIndex(fnIx, e.identName)
@@ -23435,6 +23473,12 @@ function annParamKind(t: string) {
   // a callback) left the value's `$fnsig` un-interned: the call fell back to the all-i32 arity sig
   // and emitted INVALID WASM. The arrow finder is recursive (a top-level `=>` at paren depth 0).
   if annArrowAt(t) >= 0 { return "c" }
+  // A struct param the CHECKER rendered structurally (`{x: i32}`, not a nominal `P`) — the call-site
+  // `nodeTyName` fallback in `cloCallSigKey` produces such a name. `structIndexOfTypeName` resolves
+  // BOTH a nominal name (above, via `structIndexByName`) and an inline shape (by field-set match), to
+  // the SAME struct index the AST producer's `cloParamTok` keys — so the two sig producers agree.
+  const sti = structIndexOfTypeName(t)
+  if sti >= 0 { return "s" + i32ToStr(sti) + ";" }
   ""
 }
 
@@ -23485,7 +23529,10 @@ function annRetKind(t: string) {
     if wraps { tc = tc.slice(1, tc.length - 1) }
   }
   if annArrowAt(tc) >= 0 { return ">c" }
-  const si = structIndexByName(t)
+  // `structIndexOfTypeName` (not `structIndexByName`) so a struct return the CHECKER rendered as an
+  // inline shape (`{x: i32}` — the `cloCallSigKey` `nodeTyName` fallback's form) resolves by field-set
+  // to the same index the AST producer's `cloRetValSlot` keys, as well as a nominal `P`.
+  const si = structIndexOfTypeName(t)
   if si >= 0 { return ">s" + i32ToStr(si) + ";" }
   // A UNION / NULLABLE return — `string | null` → `>N`, `S | null` → `>nN;`, a 2+-member
   // union → the box `>u` (matching `cloRetKeySuffix` for the underlying function). An
@@ -23507,7 +23554,7 @@ function annRetKind(t: string) {
     }
     if hasNull && nonNull.length == 1 {
       if nonNull[0] == "string" { return ">N" }
-      const msi = structIndexByName(nonNull[0])
+      const msi = structIndexOfTypeName(nonNull[0])
       if msi >= 0 { return ">n" + i32ToStr(msi) + ";" }
       return ""
     }
