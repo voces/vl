@@ -799,6 +799,21 @@ let cbExpOff: i32[] = []  // offset of its param-type run in `cbExpPool`
 let cbExpLen: i32[] = []  // run length (param count)
 let cbExpPool: i32[] = [] // flattened expected param-type arena indices
 
+// Lambda nodes that are the init of an UN-annotated `const`/`let` binding (`const add = (a, b) =>
+// a + b`). Such a lambda's un-annotated params are inference HOLES — monomorphized per use exactly
+// like a named generic function (the emitter value-flow-monomorphizes them, env and all) — rather
+// than rejected as uninferable. Any OTHER no-context anonymous lambda stays a clean rejection.
+let valBindLambda: i32[] = []
+function noteValBindLambda(nodeIx: i32) { valBindLambda.push(nodeIx) }
+function isValBindLambda(nodeIx: i32) {
+  let i = 0
+  while i < valBindLambda.length {
+    if valBindLambda[i] == nodeIx { return true }
+    i = i + 1
+  }
+  false
+}
+
 // Record `paramTys` as the expected param types of the lambda at `nodeIx` (latest wins).
 function recordCbExpected(nodeIx: i32, paramTys: i32[]) {
   cbExpNode.push(nodeIx)
@@ -912,6 +927,7 @@ export function initChecker() {
   cbExpOff = []
   cbExpLen = []
   cbExpPool = []
+  valBindLambda = []
   T.tys = []
   T.scopes = []
   T.diags = []
@@ -5740,13 +5756,18 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // instance per distinct shape. Inside the body the hole is opaque
         // (assignable both ways), exactly like an explicit `<T>` param.
         pt = mkTyVar("?" + n.fnName + "." + i32ToStr(pi))
+      } else if isValBindLambda(fnIx) {
+        // A lambda bound to an UN-annotated `const`/`let` (`const add = (a, b) => a + b`): its
+        // un-annotated param is a fresh inference HOLE, exactly like a named function's — the
+        // emitter value-flow-monomorphizes one instance per call shape (env and all). Keyed by NODE
+        // index (the lambda is anonymous), the dual of the named branch above.
+        pt = mkTyVar("?#L" + i32ToStr(fnIx) + "." + i32ToStr(pi))
       } else {
-        // An ANONYMOUS literal with no annotation and no contextual type is
-        // genuinely uninferable — its value-typed binding demands a concrete
-        // signature NOW (host parity: `lambda-uninferable-param`).
+        // An ANONYMOUS literal with no annotation and no contextual type is genuinely uninferable —
+        // its value-typed binding demands a concrete signature NOW (host parity).
         tErr("cannot infer a type for parameter `" + pNode.parName + "`", params[pi])
-        // The body can't be typed once a param is unknown — don't also cascade
-        // a "cannot infer a return type" from the resulting error-only return.
+        // The body can't be typed once a param is unknown — don't also cascade a "cannot infer a
+        // return type" from the resulting error-only return.
         paramUninferable = true
       }
     }
@@ -7303,6 +7324,15 @@ function checkNodeReal(ix: i32) {
     // annotated array/object of lambdas) infers each un-annotated lambda param from the
     // annotation BEFORE the initializer is checked.
     if n.letInit >= 0 && annot >= 0 { seedExpected(n.letInit, annot) }
+    // An UN-annotated binding to a bare lambda (`const add = (a, b) => …`): mark the lambda so its
+    // un-annotated params type as inference holes (a value-flow-monomorphized generic function)
+    // rather than being rejected as uninferable. Annotated bindings seed a concrete type above.
+    if annot < 0 && n.letInit >= 0 {
+      const liN = P.nodes[n.letInit]
+      if liN is FuncDecl {
+        if liN.fnName == "" { noteValBindLambda(n.letInit) }
+      }
+    }
     if n.letInit >= 0 { initTy = checkNode(n.letInit) }
     // A `void` initializer (`const x = f()` over a void function) has NO value to bind.
     // The assignment path (`x = f()`) already rejects it; the BINDING path did not — an

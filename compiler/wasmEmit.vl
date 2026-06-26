@@ -15650,6 +15650,15 @@ function fnStmtsPosOf(fnIx: i32) {
     if fnStmts[i] == fnIx { return i }
     i = i + 1
   }
+  // A monomorphized slot was REPLACED in place (a count-0 instance overwrote `fnStmts[fe]`), so the
+  // ORIGINAL node — a lambda literal a binding still points at — is no longer found by the scan
+  // above. `monoOrigNode[fe]` still records it, so recover the slot from there. (Pure fallback: a
+  // non-replaced slot is found above; a non-function node matches neither and stays -1.)
+  let j = 0
+  while j < monoOrigNode.length {
+    if monoOrigNode[j] == fnIx { return j }
+    j = j + 1
+  }
   -1
 }
 
@@ -24551,8 +24560,19 @@ function monoMakeInstance(
       if monoKeys[k] == key {
         const cal = P.nodes[calleeIx]
         if cal is Ident {
-          if cal.identName != monoInstName[k] {
-            cal.identName = monoInstName[k]
+          // A registry hit on a CAPTURING lambda in the binding's OWN slot (a count-0 instance,
+          // `monoInstFe == origFe`) must stay a `call_ref` through that binding — renaming the callee
+          // to the lifted instance name would make a by-name call that drops the captured env. A
+          // non-capturing instance keeps the by-name rename (a null env is fine), so the
+          // named-function path stays byte-identical.
+          let keepCallRef = false
+          if monoInstFe[k] == origFe {
+            if captureCountOf(origFe) > 0 { keepCallRef = true }
+          }
+          if !keepCallRef {
+            if cal.identName != monoInstName[k] {
+              cal.identName = monoInstName[k]
+            }
           }
         }
         return 0
@@ -24784,6 +24804,17 @@ function monoMakeInstance(
       // First instance: keep the bare name and the original's wasm index.
       fnStmts[origFe] = nfn
     } else {
+      // A CAPTURING lambda monomorphized at a SECOND type: the binding holds ONE closure whose
+      // funcref is the first-type instance, so a second-type call can be neither a `call_ref`
+      // through it (wrong functype) nor a by-name call (drops the env). Reject cleanly — value-flow
+      // monomorphization of a capturing lambda is single-type for now (annotate it, or use distinct
+      // bindings). A non-capturing instance has no env and lowers fine as a by-name call.
+      if captureCountOf(origFe) > 0 {
+        return emitFail(
+          "emitProgram: a capturing lambda used at more than one type is not yet supported — " +
+            "annotate its parameters, or bind a separate copy per type",
+        )
+      }
       fnStmts.push(nfn)
       fnParent.push(-1)
       fnDispNames.push("")
@@ -24888,7 +24919,7 @@ function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
 // concrete function-typed call ARGUMENT, an annotated RETURN, an ARRAY element — so the value carries
 // its concrete type wherever it escapes. The checker (`genericFnAssignable`) has already proved the
 // instantiation valid; this only emits it.
-function monoCoerceFnValueName(exprIx: i32, tname: string) {
+function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
   if e is ArrayLit {
@@ -24897,14 +24928,18 @@ function monoCoerceFnValueName(exprIx: i32, tname: string) {
       const es = e.arrElems
       let k = 0
       while k < es.length {
-        if monoCoerceFnValueName(es[k], elemName) < 0 { return -1 }
+        if monoCoerceFnValueName(es[k], elemName, ctx) < 0 { return -1 }
         k = k + 1
       }
     }
     return 0
   }
   if e is Ident {
+    // A bare function NAME, or a VALUE BINDING holding a generic function (`const add = (a,b) =>
+    // a + b`, or `const g = named`) — resolve the binding to its lifted slot so an escaping lambda
+    // binding materializes at the boundary type too, not just a by-name generic function.
     let gfe = fnIndexOf(e.identName)
+    if gfe < 0 { gfe = identClosureFe(e.identName, ctx) }
     if gfe >= 0 && gfe < monoGen.length {
       if monoGen[gfe] == 1 {
         const pnames: string[] = []
@@ -24918,10 +24953,10 @@ function monoCoerceFnValueName(exprIx: i32, tname: string) {
 }
 
 // `monoCoerceFnValueName` keyed on an expected TYPE-annotation node (`-1` / a non-function type is a
-// no-op).
-function monoCoerceFnValue(exprIx: i32, expectedTyIx: i32) {
+// no-op). `ctx` is the enclosing function (-1 = top level), for resolving a value binding.
+function monoCoerceFnValue(exprIx: i32, expectedTyIx: i32, ctx: i32) {
   if expectedTyIx < 0 { return 0 }
-  return monoCoerceFnValueName(exprIx, tyNameOf(expectedTyIx))
+  return monoCoerceFnValueName(exprIx, tyNameOf(expectedTyIx), ctx)
 }
 
 // The written type-annotation node of parameter `i` of the named function `name` (its ORIGINAL
@@ -25105,7 +25140,7 @@ function monoWalk(ix: i32, ctx: i32) {
       while ca < args.length {
         const pty = monoFnParamTypeAt(callee.identName, ca)
         if pty >= 0 {
-          if monoCoerceFnValue(args[ca], pty) < 0 { return -1 }
+          if monoCoerceFnValue(args[ca], pty, ctx) < 0 { return -1 }
         }
         ca = ca + 1
       }
@@ -25119,7 +25154,16 @@ function monoWalk(ix: i32, ctx: i32) {
         // LetDecl direct-call exemption keep the two paths sound).
         const afe = identClosureFe(callee.identName, ctx)
         if afe >= 0 {
-          if !criFnIsAnonLambda(afe) { fe = afe }
+          if !criFnIsAnonLambda(afe) {
+            fe = afe
+          } else if identFnTypeAnnName(callee.identName, ctx) == "" {
+            // A lambda bound to an UN-annotated `const` (`const add = (a, b) => a + b`): its params
+            // are inference holes — monomorphize it per call exactly like a named generic function.
+            // The slot-replacement keeps the binding's closure funcref pointing at the instance, so a
+            // CAPTURING lambda's env still rides through the `call_ref`. An ANNOTATED binding
+            // (`const f: (i32)=>i32 = …`) is contextually pinned and excluded.
+            fe = afe
+          }
         }
       }
       if fe >= 0 && fe < monoGen.length {
@@ -25144,7 +25188,7 @@ function monoWalk(ix: i32, ctx: i32) {
     // so the value carries that concrete type independent of any call — it may ESCAPE (be passed,
     // returned, stored) where call-driven monomorphization can't reach. The annotation also governs
     // its calls (the checker pins them), so the instance the binding holds matches every use.
-    if monoCoerceFnValue(n.letInit, n.letType) < 0 { return -1 }
+    if monoCoerceFnValue(n.letInit, n.letType, ctx) < 0 { return -1 }
     return monoWalk(n.letInit, ctx)
   }
   if n is IfStmt {
@@ -25173,7 +25217,7 @@ function monoWalk(ix: i32, ctx: i32) {
     if ctx >= 0 {
       const cf = P.nodes[ctx]
       if cf is FuncDecl {
-        if monoCoerceFnValue(n.retArg, cf.fnRet) < 0 { return -1 }
+        if monoCoerceFnValue(n.retArg, cf.fnRet, ctx) < 0 { return -1 }
       }
     }
     return monoWalk(n.retArg, ctx)
