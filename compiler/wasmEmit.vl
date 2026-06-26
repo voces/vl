@@ -21535,10 +21535,21 @@ function letUnionNameOf(letIx: i32, fnIx: i32) {
   ""
 }
 
+// The UNION return of a function-type NAME (`(i32) => A | B` → "A | B", an alias `(i32) => Sh` → its
+// member set via `isUName`), or "" when the name is not a function type returning a multi-member union.
+function unionRetOfFnType(fnTyName: string) {
+  const arrowAt = annArrowAt(fnTyName)
+  if arrowAt >= 1 && fnTyName.length > 0 && fnTyName[0] == '(' {
+    const ret = monoUnwrapParens(fnTyName.slice(arrowAt + 2, fnTyName.length))
+    if isUName(ret) { return ret }
+    if isValueUnionName(ret) { return ret }
+  }
+  ""
+}
+
 // The union return-type NAME of a closure-typed PARAM `name` of function `fnIx` (`g: (i32) => A | B`
-// → "A | B", an alias `(i32) => Sh` → its member set), or "" when `name` is not a union-returning
-// closure param. Lets a value call THROUGH a closure param (`g(x)` inside a HOF) classify its result
-// union so a narrowed read unboxes — the param analogue of the binding case in `unionNameOfExpr`.
+// → "A | B"), or "" when `name` is not a union-returning closure param. Lets a value call THROUGH a
+// closure param (`g(x)` inside a HOF) classify its result union so a narrowed read unboxes.
 function paramUnionRetName(fnIx: i32, name: string) {
   if fnIx < 0 { return "" }
   const fn = P.nodes[fnIx]
@@ -21550,15 +21561,7 @@ function paramUnionRetName(fnIx: i32, name: string) {
         if p.parName == name {
           if p.parType >= 0 {
             const ty = P.nodes[p.parType]
-            if ty is TypeRef {
-              const nm = ty.tyName
-              const arrowAt = annArrowAt(nm)
-              if arrowAt >= 1 && nm[0] == '(' {
-                const ret = monoUnwrapParens(nm.slice(arrowAt + 2, nm.length))
-                if isUName(ret) { return ret }
-                if isValueUnionName(ret) { return ret }
-              }
-            }
+            if ty is TypeRef { return unionRetOfFnType(ty.tyName) }
           }
           return ""
         }
@@ -21609,6 +21612,9 @@ function unionNameOfExpr(exprIx: i32, fnIx: i32) {
         if cfn is FuncDecl {
           const crn = tyNameOf(cfn.fnRet)
           if isUName(crn) { return crn }
+          // A VALUE-union annotated return (`i32 | string`, pinned on the lambda by `synthRetAnnots`):
+          // `isUName` covers struct unions only, so its narrowed result would not unbox without this.
+          if isValueUnionName(crn) { return crn }
           if cfn.fnRet < 0 {
             const cim = inferRetNameOf(cfn.fnName)
             if isValueUnionName(cim) { return cim }
@@ -21621,6 +21627,11 @@ function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       // inside the HOF body (the struct case reads a field off the variant, so it needs no name).
       const pun = paramUnionRetName(fnIx, callee.identName)
       if pun != "" { return pun }
+      // A closure binding whose function-type is INFERRED from a CALL (`const g = mk()` where `mk():
+      // (i32) => A | B`): `identClosureFe` can't see through the call result, so recover the closure
+      // type from `identFnTypeAnnName` and take its union return.
+      const bun = unionRetOfFnType(identFnTypeAnnName(callee.identName, fnIx))
+      if bun != "" { return bun }
     }
     // A union-returning FIELD-closure callee (`const r = o.run(7)` over a `(…) => A | B`
     // field) — the Member analogue of the binding case above: resolve the field's lifted
@@ -26394,65 +26405,39 @@ function resolveShapeToNominal(name: string) {
   name
 }
 
-// The multi-member UNION return type of a closure-type annotation NAME (`(i32)=>Cat|Dog` → "Cat|Dog"),
-// or "" if the annotation is not a function type or its return is not a 2+-member union. The nullable
-// niches (`T | null`) are excluded — they carry their own `>N` / `>n<idx>;` rep, not the union box.
-function closureAnnRetUnionName(name: string) {
-  const arrowAt = annArrowAt(name)
-  if arrowAt < 1 { return "" }
-  if name[0] != '(' { return "" }
-  const ret = monoUnwrapParens(name.slice(arrowAt + 2, name.length))
-  // A declared union ALIAS (`type Animal = Cat | Dog`) or an already-registered inline union.
-  if isUName(ret) { return ret }
-  // An inline multi-member union not yet registered (`Cat | Dog`) — gate on 2+ non-null members
-  // (a `T | null` niche has its own rep, handled elsewhere).
-  const parts: string[] = []
-  annSplitPipe(ret, parts)
-  if parts.length >= 2 {
-    let nonNull = 0
-    let pi = 0
-    while pi < parts.length {
-      if parts[pi] != "null" && parts[pi].length > 0 { nonNull = nonNull + 1 }
-      pi = pi + 1
-    }
-    if nonNull >= 2 { return ret }
-  }
-  ""
-}
-
-// Give an anonymous lambda bound to an annotated closure type a UNION RETURN annotation from that type
-// (`const g: (i32) => Cat | Dog = (n) => …`). An un-annotated lambda's return is inferred from its body,
-// which for a union join (`if … { aCat } else { aDog }`) collapses to ONE arm (a struct / string) — so
-// its emitted functype result and its interned `$fnsig` key (`i>s0;` / `i>S`) disagreed with the call
-// site's annotation-derived `i>u`, leaving the value call un-interned ("function-value call arity has no
-// interned signature"). Pinning `fnRet` to the union makes the lambda emit the boxed-union result (like
-// an annotated `: Cat | Dog` function), so it interns `i>u`, the body boxes each arm via
-// `emitReturnValue`'s `retUNm` path, and the call's `ref.cast` resolves + the `is`-narrow classifies.
-// Mirrors `synthParamAnnots` (the param dual). SCOPED to a multi-member union return (the gap); scalar/
-// struct/nullable returns already infer correctly, so they are left untouched → byte-identical. Runs
-// BEFORE monomorphization (so a lambda flowing into a HOF param — whose `fnStmts` slot the mono pass
-// REPLACES with an instance cloned `nret = fnRet` — has its union return pinned first; else the clone
-// keeps `fnRet < 0` and emits a single-arm `$fnsig` result the call's `ref.cast` to `i>u` rejects), and
-// thus before the shape-interning passes too (the union's box + variants intern for the return EXACTLY
-// as for a named `: Cat | Dog` function). Covers STRUCT, ALIAS and VALUE unions alike — a value union's
-// narrowed result unboxes via `paramUnionRetName` in the HOF body (`unionNameOfExpr`).
+// Pin every un-annotated lambda that returns a UNION to that union, by CONSUMING the contextual return
+// type the CHECKER already computed — instead of re-deriving it per boundary in the emitter.
+//
+// An un-annotated lambda's body-inferred return for a union join (`if … { aCat } else { aDog }`)
+// collapses to ONE arm (a struct / string), so its emitted functype result and `$fnsig` key (`i>s0;` /
+// `i>S`) disagree with a call site's `i>u` — leaving the value call un-interned and the body un-boxed.
+// Pinning `fnRet` to the union makes the lambda emit the boxed-union result (like an annotated `: Cat |
+// Dog` function): it interns `i>u`, boxes each arm via `emitReturnValue`'s `retUNm`, and the call's
+// `ref.cast` + `is`-narrow resolve. The checker proved the union the lambda returns AT ITS BOUNDARY
+// (binding / function-return / struct field / array element / call argument) and recorded it under a
+// node-index sentinel (`inferRetNameByNode`, the #533 channel) — so reading it pins the return at EVERY
+// position UNIFORMLY, with no per-boundary walk (the abstraction the emitter's syntactic re-derivation
+// otherwise lacks). Runs BEFORE monomorphization (a HOF-bound clone inherits `nret = fnRet`) and the
+// shape passes (the union's box + variants intern for the return). A non-union recorded return / an
+// already-annotated lambda is left untouched → byte-identical (the compiler has no union-returning
+// lambdas, so the native fixpoint is unaffected).
 function synthRetAnnots() {
   if !fnValUsed { return 0 }
-  let ai = 0
-  while ai < P.nodes.length {
-    const n = P.nodes[ai]
-    if n is LetDecl {
-      if n.letType >= 0 && n.letInit >= 0 {
-        const init = P.nodes[n.letInit]
-        if init is FuncDecl {
-          if init.fnRet < 0 {
-            const rt = closureAnnRetUnionName(tyNameOf(n.letType))
-            if rt != "" { init.fnRet = mkTypeRef(rt, -1) }
+  let fe = 0
+  while fe < fnStmts.length {
+    const lamIx = fnStmts[fe]
+    const fn = P.nodes[lamIx]
+    if fn is FuncDecl {
+      if fn.fnRet < 0 {
+        const ctx = inferRetNameByNode(lamIx)
+        if ctx != "" {
+          if isUName(ctx) || isValueUnionName(ctx) {
+            fn.fnRet = mkTypeRef(ctx, -1)
           }
         }
       }
     }
-    ai = ai + 1
+    fe = fe + 1
   }
   0
 }
