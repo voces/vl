@@ -283,6 +283,9 @@ function cloParamTok(paramIx: i32) {
   if k == 10 {
     return "I" // i64 (a scalar valtype — never a `>`-prefixed result token here)
   }
+  if k == 13 {
+    return "f" // f32 (a scalar valtype; the call site widens an i32/f32 argument to it)
+  }
   if k == 4 {
     return "u" // union box (all unions share `$uBox`; tags are program-global)
   }
@@ -596,6 +599,9 @@ function cloRetKeySuffix(fe: i32) {
   if k == 0 { return ">i" }
   if k == 11 { return ">d" }
   if k == 10 { return ">I" }
+  if k == 13 {
+    return ">f" // f32 scalar result (matches `annRetKind`)
+  }
   if k == 3 { return ">S" }
   if k == 4 { return ">u" }
   if k == 16 { return ">N" }
@@ -4565,16 +4571,16 @@ function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
     return emitFail("emitProgram: function value with no lifted function")
   }
   // SOUNDNESS FLOOR: a function whose env-leading signature is not representable as a
-  // closure `$fnsig` (`cloSigKeyExt` returns "" — an i64/f32 or nullable-ref / union /
-  // map PARAMETER, or an f32 return) cannot be soundly `call_ref`'d: the call site would
+  // closure `$fnsig` (`cloSigKeyExt` returns "" — a nullable-ref or map PARAMETER/result;
+  // i64/f32 are now in the ABI) cannot be soundly `call_ref`'d: the call site would
   // fall back to the all-i32 arity functype and `ref.cast` the funcref to the WRONG type,
   // trapping wasm validation. Reject at the value site with a clear, source-located
   // message instead of emitting invalid wasm (mirrors the inferred-union-return floor).
   if cloSigKeyExt(fe) == "" {
     return emitFail(
       "emitProgram: a function value's signature is not yet supported — a function " +
-        "value may not take an i64, f32, nullable, union, or map parameter (or return " +
-        "f32); annotate and call it as a named function instead",
+        "value may not take a nullable or map parameter (or return one); annotate and " +
+        "call it as a named function instead",
     )
   }
   // field 0: the typed funcref to the lifted function (imports occupy 0..gImports-1).
@@ -12133,6 +12139,54 @@ function cloArrSlotSigKey(slot: i32) {
   return annSigKey(nm.slice(1, nm.length - 1))
 }
 
+// The SCALAR-coercion kind of parameter `idx` read from a `$fnsig` KEY's param-token spine: `10`
+// (i64, token `I`), `11` (f64, `d`), `13` (f32, `f`), or `-1` (i32 / a ref kind — no coercion). The
+// tokens are `cloParamTok`'s: single-char scalars, or `s<idx>;` / `V<idx>;` / `r<idx>;` ref tokens
+// terminated by `;`. Lets a value CALL widen an i32-literal argument into an i64 / f32 / f64
+// parameter, exactly as a direct call does — without it the `call_ref` pushes an i32 and traps.
+function sigParamCoerceKind(key: string, idx: i32) {
+  let i = 0
+  let p = 0
+  while i < key.length {
+    const c = key[i]
+    if c == '>' { return -1 }
+    if p == idx {
+      if c == 'I' { return 10 }
+      if c == 'd' { return 11 }
+      if c == 'f' { return 13 }
+      return -1
+    }
+    if c == 's' || c == 'V' || c == 'r' {
+      while i < key.length && key[i] != ';' { i = i + 1 }
+      i = i + 1
+    } else {
+      i = i + 1
+    }
+    p = p + 1
+  }
+  -1
+}
+
+// The callee's interned `$fnsig` KEY for a value call (`f(x)`, `(o.field)(x)`, `fs[i](x)`), or "" —
+// the param tokens drive argument coercion and the key resolves the functype the `call_ref` casts to.
+function cloCallSigKey(callIx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cre = P.nodes[c.callFn]
+    if cre is Ident { return calleeCloSigKey(cre.identName, fnIx) }
+    if cre is Member {
+      const mfe = fieldClosureFeOfRecv(cre.memObj, cre.memProp, fnIx)
+      if mfe >= 0 { return cloSigKeyExt(mfe) }
+    }
+    if cre is Index {
+      if exprRefArray(cre.idxArr, fnIx) {
+        return cloArrSlotSigKey(refListSlotOfExpr(cre.idxArr, fnIx))
+      }
+    }
+  }
+  ""
+}
+
 function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
   let c = P.nodes[callIx]
   if c is Call {
@@ -12148,58 +12202,37 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
       wU8(212) // 0xd4 ref.as_non_null
     }
     fbLocalSet(callRefSlot)
+    // The callee's interned `$fnsig` KEY — a function-typed param/local/global annotation, an
+    // inferred binding's underlying sig, a field closure's, or an indexed closure-array element's.
+    // Its param tokens drive ARGUMENT coercion below, and it resolves the functype to `ref.cast` to
+    // (a non-all-i32 shape like `(f64,f64)->f64` casts to the right functype; "" falls back to the
+    // all-i32 arity sig).
+    const ckey = cloCallSigKey(callIx, fnIx)
     // env = closure.env (field 1).
     fbLocalGet(callRefSlot)
     fbStructGet(cloStructIdx, 1)
-    // args.
+    // args, each COERCED to its parameter's scalar valtype (an i32 literal widened into an i64 / f64
+    // / f32 param) — the `call_ref` functype demands the exact valtype, exactly as a direct call.
     const args = c.callArgs
     let i = 0
     while i < args.length {
-      if emitExpr(body, args[i], fnIx) < 0 { return -1 }
+      const pck = sigParamCoerceKind(ckey, i)
+      if pck == 10 {
+        if emitExprAsI64(body, args[i], fnIx) < 0 { return -1 }
+      } else if pck == 11 {
+        if emitExprAsF64(body, args[i], fnIx) < 0 { return -1 }
+      } else if pck == 13 {
+        if emitExprAsF32(body, args[i], fnIx) < 0 { return -1 }
+      } else {
+        if emitExpr(body, args[i], fnIx) < 0 { return -1 }
+      }
       i = i + 1
     }
-    // code = closure.code (field 0) — a generic funcref. ref.cast it to the concrete
-    // `$fnsig` for this call, then call_ref. A callee that is a CLOSURE-PINNED
-    // param (a monomorphized instance's `"=>sigkey"` annotation) carries its
-    // exact signature key — use it, so a non-all-i32 shape (`(f64,f64)->f64`)
-    // casts to the right functype; anything else keeps the all-i32 arity key.
+    // code = closure.code (field 0) — a generic funcref. ref.cast it to the concrete `$fnsig`.
     let sig = -1
-    const cre = P.nodes[c.callFn]
-    if cre is Ident {
-      // The callee's REAL signature: a function-typed param/local/global annotation, or —
-      // for an inferred binding — the underlying function's own sig. Falls through to the
-      // all-i32 arity sig only when unresolved (`calleeCloSigKey` → "").
-      const ck = calleeCloSigKey(cre.identName, fnIx)
-      if ck != "" {
-        let cp = cloSigPosOfKey(ck)
-        if cp >= 0 { sig = cloSigBase + cp }
-      }
-    }
-    // A FIELD-closure callee (`(o."[]")(k)`, an operator/index trap or any
-    // function-valued field): resolve the field's lifted function and cast to
-    // its REAL signature — a void (`>v`) or struct-returning (`>sN;`) field
-    // closure has no all-i32 arity sig to ride.
-    if cre is Member {
-      const mfe = fieldClosureFeOfRecv(cre.memObj, cre.memProp, fnIx)
-      if mfe >= 0 {
-        const mk = cloSigKeyExt(mfe)
-        if mk != "" {
-          const mp = cloSigPosOfKey(mk)
-          if mp >= 0 { sig = cloSigBase + mp }
-        }
-      }
-    }
-    // An INDEXED closure value (`fs[i](x)` over a `((…) => …)[]`): the array's element type
-    // names the signature — resolve it so a non-all-i32 shape (`(f64) => f64`) casts to the
-    // right functype, and a program with NO i32 closure (hence no arity fallback) still lowers.
-    if cre is Index {
-      if exprRefArray(cre.idxArr, fnIx) {
-        const sk = cloArrSlotSigKey(refListSlotOfExpr(cre.idxArr, fnIx))
-        if sk != "" {
-          const sp = cloSigPosOfKey(sk)
-          if sp >= 0 { sig = cloSigBase + sp }
-        }
-      }
+    if ckey != "" {
+      const cp = cloSigPosOfKey(ckey)
+      if cp >= 0 { sig = cloSigBase + cp }
     }
     if sig < 0 { sig = fnSigIdxForArity(args.length) }
     if sig < 0 {
@@ -23035,6 +23068,9 @@ function annParamKind(t: string) {
   if t == "i64" {
     return "I" // i64 scalar param (matches `cloParamTok` kind 10)
   }
+  if t == "f32" {
+    return "f" // f32 scalar param (matches `cloParamTok` kind 13)
+  }
   if isUName(t) {
     return "u" // a declared union name (matches `cloParamTok` kind 4)
   }
@@ -23069,6 +23105,9 @@ function annRetKind(t: string) {
   if t == "void" { return ">v" }
   if t == "string" { return ">S" }
   if t == "i64" { return ">I" }
+  if t == "f32" {
+    return ">f" // f32 scalar result (matches `cloRetKeySuffix` kind 13)
+  }
   // A LIST return — `i32[]` → `>a`, `string[]` → `>A`, `f64[]` → `>D` (matching
   // `cloRetKeySuffix` for the underlying function), so a `(i32) => i32[]` callback
   // resolves the interned signature and its value call lowers.
