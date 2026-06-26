@@ -1,0 +1,56 @@
+// @run
+// @log 31
+// @log 9
+// @log 50
+// @log 10
+// @log 20
+// CALLBACK SPECIALIZATION (devirtualization). When a generic higher-order function (`reduce`) is
+// called with a NON-CAPTURING, concrete callback — a top-level function name (`add`, `mx`) or an
+// in-place lambda literal — the monomorphizer bakes that callback into the instance as a DIRECT
+// call, turning the hot per-element `call_ref` through the fat pointer into a `call $fn` (the
+// emitter's direct-call path supplies the null env a non-capturing callee wants). Two calls passing
+// DIFFERENT non-capturing callbacks get DISTINCT instances (the callback identity extends the
+// monomorphization key), so `reduce(xs, add, …)` and `reduce(xs, mx, …)` each bake their own.
+//
+// A CAPTURING callback (`(a, b) => a + b + bias`, closing over `bias`) is NOT specialized — it
+// still needs its live env, so it keeps the `call_ref`. The closure VALUE is passed in every case
+// (so a callback that escaped, e.g. returned or threaded through recursion, would still work); only
+// the call positions inside the baked instance are redirected. Correctness is identical either way
+// — this test pins the BEHAVIOR; the speedup (~4× on the native host for this fold shape) is not
+// observable from output.
+
+function reduce<T, A>(self: T[], f: (A, T) => A, init: A): A {
+  let acc = init
+  let i = 0
+  while i < self.length {
+    acc = f(acc, self[i])
+    i = i + 1
+  }
+  return acc
+}
+
+function add(a: i32, b: i32): i32 { return a + b }
+
+function mx(a: i32, b: i32): i32 {
+  if a > b { return a }
+  return b
+}
+
+function go() {
+  const xs = [3, 1, 4, 1, 5, 9, 2, 6]
+
+  // Two distinct non-capturing NAMED callbacks → two specialized instances.
+  print(reduce(xs, add, 0)) // 31
+  print(reduce(xs, mx, 0)) // 9
+
+  // A CAPTURING lambda (closes over `bias`) stays a call_ref — still correct.
+  const ys = [1, 2, 3, 4]
+  const bias = 10
+  print(reduce(ys, (a: i32, b: i32) => a + b + bias, 0)) // 10 + 4*10 = 50
+
+  // A non-capturing NAMED callback again (`add` reused) and a non-capturing lambda literal.
+  print(reduce(ys, add, 0)) // 10
+  print(reduce(ys, (a: i32, b: i32) => a + b * 2, 0)) // 2 + 4 + 6 + 8 = 20
+}
+
+go()

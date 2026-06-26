@@ -24820,13 +24820,132 @@ function monoListSrcParamStmt(ix: i32, retName: string) {
   ""
 }
 
+// CALLBACK SPECIALIZATION (devirtualization): rewrite every call THROUGH a closure-typed param
+// `<cbParamNames[k]>(args)` in a cloned instance body into a DIRECT call to the concrete
+// non-capturing function `<cbFnNames[k]>` it was instantiated with. The per-element `call_ref`
+// through the fat pointer becomes a `call $fn` (the emitter's direct-call path pushes the null
+// env a non-capturing callee wants) — measured ~4× on the native host for the allocation-free
+// fold/reduce/search family. The closure VALUE is still passed (the param stays in the list), so non-call uses of
+// the callback (returning it, threading it through a recursive self-call) keep working through it;
+// only the call positions are redirected. Mirrors `monoPinMapLambdas`' clone-if-changed spine so
+// sibling instances (and the shared original body) are never mutated. A param with `cbFnNames ==
+// ""` (capturing / generic / not a known function) leaves its calls as `call_ref` → byte-identical.
+function monoBakeCallback(
+  ix: i32,
+  cbParamNames: string[],
+  cbFnNames: string[],
+) {
+  if ix < 0 { return ix }
+  const n = P.nodes[ix]
+  if n is Block {
+    const ns: i32[] = []
+    let changed = false
+    let i = 0
+    while i < n.blkStmts.length {
+      const cs = monoBakeCallback(n.blkStmts[i], cbParamNames, cbFnNames)
+      ns.push(cs)
+      if cs != n.blkStmts[i] { changed = true }
+      i = i + 1
+    }
+    if !changed { return ix }
+    return mkBlock(ns, n.pos)
+  }
+  if n is RetStmt {
+    const ca = monoBakeCallback(n.retArg, cbParamNames, cbFnNames)
+    if ca == n.retArg { return ix }
+    return mkReturn(ca, n.pos)
+  }
+  if n is LetDecl {
+    const ci = monoBakeCallback(n.letInit, cbParamNames, cbFnNames)
+    if ci == n.letInit { return ix }
+    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+  }
+  if n is WhileStmt {
+    const cb = monoBakeCallback(n.whileBody, cbParamNames, cbFnNames)
+    if cb == n.whileBody { return ix }
+    return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
+  }
+  if n is IfStmt {
+    const ct = monoBakeCallback(n.ifThen, cbParamNames, cbFnNames)
+    const ce = monoBakeCallback(n.ifElse, cbParamNames, cbFnNames)
+    if ct == n.ifThen && ce == n.ifElse { return ix }
+    return mkIf(n.ifCond, ct, ce, n.pos)
+  }
+  if n is ForRange {
+    const cb = monoBakeCallback(n.frBody, cbParamNames, cbFnNames)
+    if cb == n.frBody { return ix }
+    return mkForRange(n.frVar, n.frFrom, n.frTo, n.frStep, cb, n.frLabel, n.pos)
+  }
+  if n is ForIn {
+    const cb = monoBakeCallback(n.fiBody, cbParamNames, cbFnNames)
+    if cb == n.fiBody { return ix }
+    return mkForIn(n.fiVar, n.fiIter, cb, n.fiLabel, n.pos)
+  }
+  if n is Paren {
+    const ci = monoBakeCallback(n.parInner, cbParamNames, cbFnNames)
+    if ci == n.parInner { return ix }
+    return mkParen(ci, n.pos)
+  }
+  if n is Call {
+    // A call whose callee names a specialized closure param `f(...)` → direct call `cbFn(...)`;
+    // its arguments may themselves contain such calls (`f(g(x))`), so recurse there too.
+    let newCallee = n.callFn
+    const callee = P.nodes[n.callFn]
+    if callee is Ident {
+      let bk = 0
+      while bk < cbParamNames.length {
+        if cbFnNames[bk] != "" && callee.identName == cbParamNames[bk] {
+          newCallee = mkIdent(cbFnNames[bk], callee.pos)
+        }
+        bk = bk + 1
+      }
+    }
+    const nargs: i32[] = []
+    let changed = newCallee != n.callFn
+    let ai = 0
+    while ai < n.callArgs.length {
+      const cca = monoBakeCallback(n.callArgs[ai], cbParamNames, cbFnNames)
+      nargs.push(cca)
+      if cca != n.callArgs[ai] { changed = true }
+      ai = ai + 1
+    }
+    if !changed { return ix }
+    return mkCallN(newCallee, nargs, n.callArgNames, n.pos)
+  }
+  if n is BinExpr {
+    // Descend into a plain assignment / arithmetic node (`acc = f(acc, x)`, the reduce/fold
+    // shape). A COMPOUND-assignment node (`acc += f(x)`, `binCompound != ""`) is left intact —
+    // rebuilding it through `mkBinary` would drop its surface tag, and its callback call simply
+    // stays a `call_ref` (sound, just unspecialized — a rare shape).
+    if n.binCompound != "" { return ix }
+    const cl = monoBakeCallback(n.binLeft, cbParamNames, cbFnNames)
+    const cr = monoBakeCallback(n.binRight, cbParamNames, cbFnNames)
+    if cl == n.binLeft && cr == n.binRight { return ix }
+    return mkBinary(n.binOp, cl, cr, n.pos)
+  }
+  ix
+}
+
+// Whether a specialization callback was baked for ANY param (the instance has at least one
+// `cbFnNames[k] != ""`) — gates the body rewrite + key extension below.
+function monoAnyBakedCallback(cbFnNames: string[]) {
+  let i = 0
+  while i < cbFnNames.length {
+    if cbFnNames[i] != "" { return true }
+    i = i + 1
+  }
+  false
+}
+
 // The instance-creation core shared by `monoInstantiate` (call-driven) and `monoInstanceFor`
 // (annotation-driven): given the already-built `pinned` param-type names (and any `tvN`/`tvV`
 // type-param bindings), clone-or-reuse the instance of generic `origFe` and point the value site
 // at it. `calleeIx` is the `Ident` node (a call callee, or a binding init) rewritten to the
 // instance name on a registry hit / a `count > 0` append. `annotateI32` annotates an i32-pinned
 // param too (so the materialized closure passes the value floor) — `monoInstantiate` keeps it
-// false for byte-identity on the all-i32 call path. Returns 0, or -1 via `emitFail`.
+// false for byte-identity on the all-i32 call path. `cbFnNames` (parallel to params, "" = none)
+// bakes a non-capturing concrete callback into the instance as a direct call — see
+// `monoBakeCallback`. Returns 0, or -1 via `emitFail`.
 function monoMakeInstance(
   origFe: i32,
   pinned: string[],
@@ -24834,6 +24953,7 @@ function monoMakeInstance(
   tvV: string[],
   calleeIx: i32,
   annotateI32: boolean,
+  cbFnNames: string[],
 ) {
   const fn = P.nodes[monoOrigNode[origFe]]
   if fn is FuncDecl {
@@ -24843,6 +24963,15 @@ function monoMakeInstance(
     while pk < pinned.length {
       key = key + pinned[pk] + ","
       pk = pk + 1
+    }
+    // The baked-callback identities extend the key, so two calls passing the SAME pinned types but
+    // DIFFERENT non-capturing callbacks (`reduce(xs, add, …)` vs `reduce(xs, mul, …)`) get distinct
+    // instances — each body bakes its own direct call. No baked callback → no `@` suffix → the key
+    // (and the resulting instance) is byte-identical to the pre-specialization shape.
+    let ck = 0
+    while ck < cbFnNames.length {
+      if cbFnNames[ck] != "" { key = key + "@" + cbFnNames[ck] + "," }
+      ck = ck + 1
     }
     // A closure-pinned param flips the module's function-value machinery on
     // (the instance body `call_ref`s through it; the argument side builds the
@@ -25099,7 +25228,14 @@ function monoMakeInstance(
       pElemTypes.push(monoArrElemName(pinned[pe]))
       pe = pe + 1
     }
-    const instBody = monoPinMapLambdas(instBody0, pElemNames, pElemTypes)
+    const instBody1 = monoPinMapLambdas(instBody0, pElemNames, pElemTypes)
+    // Bake any non-capturing concrete callback into a DIRECT call (`pElemNames` already holds the
+    // per-position param NAMES, parallel to `cbFnNames`). No baked callback → no rewrite → the body
+    // is the same node `monoPinMapLambdas` produced (byte-identical to the pre-specialization path).
+    let instBody = instBody1
+    if monoAnyBakedCallback(cbFnNames) {
+      instBody = monoBakeCallback(instBody1, pElemNames, cbFnNames)
+    }
     const nfn = mkFunc(instName, noTyParams, nps, nret, instBody, -1)
     if count == 0 {
       // First instance: keep the bare name and the original's wasm index.
@@ -25206,7 +25342,10 @@ function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
     }
     const tvN: string[] = []
     const tvV: string[] = []
-    return monoMakeInstance(origFe, pinned, tvN, tvV, letInitIx, true)
+    // The annotation-driven binding path (`const c: (f64,f64)=>f64 = add`) bakes no callback — the
+    // value escapes its call sites, so its body keeps the `call_ref`. Empty → no key/body change.
+    const noCb: string[] = []
+    return monoMakeInstance(origFe, pinned, tvN, tvV, letInitIx, true, noCb)
   }
   0
 }
@@ -25411,10 +25550,45 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
         }
         i = i + 1
       }
-      return monoMakeInstance(origFe, pinned, tvN, tvV, c.callFn, false)
+      // CALLBACK SPECIALIZATION: for each closure-valued argument that is a KNOWN, NON-CAPTURING,
+      // NON-GENERIC function (a top-level name `add`, or an in-place lifted lambda literal), record
+      // the function's name so this instance bakes a direct call to it (`monoBakeCallback`) and keys
+      // on its identity (so `reduce(xs, add, …)` and `reduce(xs, mul, …)` get distinct instances).
+      // A capturing callback (needs its live env), a generic one (needs its own instantiation), or
+      // any non-resolvable closure value leaves "" → the param keeps its `call_ref` (byte-identical).
+      const cbFnNames: string[] = []
+      let ci = 0
+      while ci < args.length {
+        cbFnNames.push(monoSpecializableCallbackName(args[ci], ctx))
+        ci = ci + 1
+      }
+      return monoMakeInstance(origFe, pinned, tvN, tvV, c.callFn, false, cbFnNames)
     }
   }
   0
+}
+
+// The callback name to BAKE for a closure-valued argument, or "" when it is not specializable.
+// Specializable iff the argument is a closure VALUE resolving to a known function (a bare top-level
+// name, or an in-place lifted lambda literal) that CAPTURES NOTHING and is itself NON-GENERIC — so a
+// direct by-name `call` (which passes the null env a non-capturing callee wants) is valid. Anything
+// else (a capturing lambda, a generic function, a closure read from a binding/union/HOF result, a
+// non-closure argument) returns "" and keeps the per-element `call_ref`.
+function monoSpecializableCallbackName(argIx: i32, ctx: i32) {
+  if !exprIsClosure(argIx, ctx) { return "" }
+  const ax = unwrapParen(argIx)
+  const an = P.nodes[ax]
+  let fe = -1
+  if an is FuncDecl { fe = fnStmtsPosOf(ax) }
+  else if an is Ident { fe = fnIndexOf(an.identName) }
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  if captureCountOf(fe) > 0 { return "" }
+  if fe < monoGen.length {
+    if monoGen[fe] == 1 { return "" }
+  }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl { return fn.fnName }
+  ""
 }
 
 // Walk the statement/expression tree at `ix` (inside function `ctx`, -1 = top
