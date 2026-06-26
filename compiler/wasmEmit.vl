@@ -11062,6 +11062,10 @@ function exprIsI64(exprIx: i32, fnIx: i32) {
   if e is Member { return memFieldTypeCode(exprIx, fnIx) == 23 }
   // A bare `m[k]` read over an i64-valued map yields an i64.
   if e is Index {
+    // An indexed read of an i64 list (`xs[i]` over `i64[]`) is an i64 — the syntactic dual of
+    // `exprIsF64`'s Index case. Needed for a SYNTHETIC `c[0]` (e.g. a captured-mutation box) that
+    // carries no checker-recorded type for the typed-IR fast path above.
+    if exprI64Array(e.idxArr, fnIx) { return true }
     const mri = mapReadMvSlot(exprIx, fnIx)
     if mri >= 0 {
       if mvValKind[mri] == 10 { return true }
@@ -22265,7 +22269,9 @@ function exprStringArray(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramStringArray(fnIx, e.identName) { return true }
     if declaredStringArray(e.identName) { return true }
-    return globalIsStringArray(e.identName)
+    if globalIsStringArray(e.identName) { return true }
+    // A CAPTURED string-list read (incl. a boxed captured-mutated `string` local). Kind 7.
+    return capturedKindOf(fnIx, e.identName) == 7
   }
   // A field read `p.names` whose field is a `string[]` (code `6`) yields the string-list
   // wrapper ref — so `.length` / indexing / assignment / `.push` treat it as a string list.
@@ -22423,7 +22429,10 @@ function exprF64Array(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramF64Array(fnIx, e.identName) { return true }
     if declaredF64Array(e.identName) { return true }
-    return globalIsF64Array(e.identName)
+    if globalIsF64Array(e.identName) { return true }
+    // A CAPTURED f64-list read (`xs[i]` inside a closure capturing `xs` — incl. a boxed
+    // captured-mutated `f64` local, lowered to a length-1 `f64[]`). Kind 12 = f64 list.
+    return capturedKindOf(fnIx, e.identName) == 12
   }
   // A `.map`/`.filter` whose result ELEMENT kind is f64 yields an f64 list (an f64
   // receiver's filter, or a map whose callback returns f64). (Slices 3–4.)
@@ -22506,7 +22515,9 @@ function exprF32Array(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramF32Array(fnIx, e.identName) { return true }
     if declaredF32Array(e.identName) { return true }
-    return globalIsF32Array(e.identName)
+    if globalIsF32Array(e.identName) { return true }
+    // A CAPTURED f32-list read (incl. a boxed captured-mutated `f32` local). Kind 21 = f32 list.
+    return capturedKindOf(fnIx, e.identName) == 21
   }
   if e is Call {
     // `xs.map(f)` / `xs.filter(p)` whose result element is f32 (mf-result kind 13) — a `.map`
@@ -22585,7 +22596,9 @@ function exprI64Array(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramI64Array(fnIx, e.identName) { return true }
     if declaredI64Array(e.identName) { return true }
-    return globalIsI64Array(e.identName)
+    if globalIsI64Array(e.identName) { return true }
+    // A CAPTURED i64-list read (incl. a boxed captured-mutated `i64` local). Kind 20 = i64 list.
+    return capturedKindOf(fnIx, e.identName) == 20
   }
   if e is Call {
     if callIsMapFilter(exprIx, fnIx) {
@@ -26152,6 +26165,14 @@ function cboxWalk(ix: i32, boxed: string[]) {
   if n is LetDecl {
     n.letInit = cboxWalk(n.letInit, boxed)
     if capHas(boxed, n.letName) {
+      // Convert a SCALAR annotation to its array form so the boxed length-1 list classifies as the
+      // matching list type (`let c: f64` → `let c: f64[]`; an `f32` annotation is what makes the
+      // `[0.0]` literal build f32, not the f64 default). An UN-annotated local needs no conversion —
+      // the `[init]` literal infers its element type (`let c = 0` → i32[], `= 0.0` → f64[]).
+      if n.letType >= 0 {
+        const lt = P.nodes[n.letType]
+        if lt is TypeRef { n.letType = mkTypeRef(lt.tyName + "[]", -1) }
+      }
       const els: i32[] = []
       els.push(n.letInit)
       n.letInit = mkArrayLit(els, -1)
@@ -26277,17 +26298,18 @@ function cboxInitOf(ix: i32, name: string) {
   -1
 }
 
-// True if `initIx` is an i32 INTEGER literal — the element type a boxed capture is restricted to
-// for now. A non-i32 captured-mutated local (string / f64 / i64 / struct list) would box into a
-// list whose element type the CLOSURE cannot yet classify off the captured env field, so it is
-// left to the existing loud error rather than mis-lowered. Covers the counter/accumulator case.
-function cboxInitIsI32(initIx: i32) {
+// True if `initIx` is a SCALAR LITERAL — an integer (`i32`/`i64`), float (`f64`, or `f32` via the
+// annotation), or string. A captured-mutated local with such an init boxes cleanly into a length-1
+// list of the matching scalar type: `cboxWalk` converts the annotation to its array form, the list
+// type is collected (`cboxForceListUse`), and the CLOSURE classifies the captured env field's list
+// kind (`capturedKindOf`, consulted by `exprF64Array`/`exprI64Array`/`exprF32Array`/
+// `exprStringArray`). Covers the counter/accumulator case at every scalar type. A non-scalar-literal
+// init (struct / closure / call) is left to the loud error rather than mis-lowered.
+function cboxInitScalar(initIx: i32) {
   if initIx < 0 { return false }
   const n = P.nodes[initIx]
-  if n is NumLit {
-    if numTextIsFloat(n.numText) { return false }
-    return numLexFitsI32(n.numText)
-  }
+  if n is NumLit { return true }
+  if n is StrLit { return true }
   false
 }
 
@@ -26309,7 +26331,7 @@ function captureBoxRewrite(stmts: i32[]) {
         const nm = dlets[di]
         if capHas(alam, nm) {
           if !capHas(ndecls, nm) {
-            if cboxInitIsI32(cboxInitOf(fn.fnBody, nm)) { boxed.push(nm) }
+            if cboxInitScalar(cboxInitOf(fn.fnBody, nm)) { boxed.push(nm) }
           }
         }
         di = di + 1
