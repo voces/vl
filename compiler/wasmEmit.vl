@@ -1134,6 +1134,21 @@ function exprNullableList(exprIx: i32, fnIx: i32) {
       }
     }
   }
+  // A call to a function whose ANNOTATED return is `i32[] | null` yields a nullable list, so an
+  // un-annotated `const r = f(…)` infers kind 15 (and narrows with `if r != null`). Mirrors the
+  // niche-nullable call inference for bool/string returns.
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      const target = fnIndexOf(callee.identName)
+      if target >= 0 {
+        const fn = P.nodes[fnStmts[target]]
+        if fn is FuncDecl {
+          if fn.fnRet >= 0 { return retNulListFlag(fn.fnRet) == 1 }
+        }
+      }
+    }
+  }
   false
 }
 
@@ -12285,6 +12300,8 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         let cParamNulString = false
         // A `fn | null` param position (kind 19): a `null` argument is `ref.null $cloStruct`.
         let cParamNulClosure = false
+        // An `i32[] | null` param position (kind 15): a `null` argument is `ref.null $lTypeIdx`.
+        let cParamNulList = false
         if cFn is FuncDecl {
           const cParams = cFn.fnParams
           if i < cParams.length {
@@ -12293,6 +12310,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
               if tyIsNulBool(cpnb.parType) { cParamNulBool = true }
               if retNulStringFlag(cpnb.parType) == 1 { cParamNulString = true }
               if nulCloFlag(cpnb.parType) == 1 { cParamNulClosure = true }
+              if retNulListFlag(cpnb.parType) == 1 { cParamNulList = true }
             }
             if (
               vtKindOfParam(cParams[i]) == 1 ||
@@ -12372,9 +12390,11 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
             const savedCNB = pendingNulBool
             const savedCNS = pendingNulString
             const savedCNC = pendingNulClosure
+            const savedCNL = pendingNulList
             if cParamNulBool { pendingNulBool = true }
             if cParamNulString { pendingNulString = true }
             if cParamNulClosure { pendingNulClosure = true }
+            if cParamNulList { pendingNulList = true }
             // A variant-PARAM position (`loud(c: Cat)`): seed the variant index so an object
             // LITERAL argument builds the bare variant struct (kind 8). A variant/union VALUE
             // argument ignores the hint (the union-unbox cast below handles a boxed value).
@@ -12384,6 +12404,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
             pendingNulBool = savedCNB
             pendingNulString = savedCNS
             pendingNulClosure = savedCNC
+            pendingNulList = savedCNL
             // A nullable-REP value (a null-narrowed `S | null` param/local, or a
             // recursive `S | null` field read whose wasm slot stays `(ref null $S)`)
             // flowing into a NON-NULL `(ref $S)` param: recover the non-null ref at
@@ -12749,13 +12770,18 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         const savedNB = pendingNulBool
         const savedNS = pendingNulString
         const savedNC = pendingNulClosure
+        const savedNL = pendingNulList
         if exprNulBool(a.binLeft, fnIx) { pendingNulBool = true }
         if exprNullableString(a.binLeft, fnIx) { pendingNulString = true }
         if exprNulClosure(a.binLeft, fnIx) { pendingNulClosure = true }
+        // A kind-15 nullable i32-list local (`xs = null`): a `null` RHS is `ref.null $lTypeIdx`
+        // (a list RHS stores its non-null ref directly). The list analogue of the niche seeds above.
+        if exprNullableList(a.binLeft, fnIx) { pendingNulList = true }
         if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
         pendingNulBool = savedNB
         pendingNulString = savedNS
         pendingNulClosure = savedNC
+        pendingNulList = savedNL
       }
       fbLocalSet(idx) // 0x21 local.set
       return 0
@@ -14896,6 +14922,7 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   let retI64 = false
   let retNulBool = false
   let retNulString = false
+  let retNulList = false
   let retUNm = ""
   let retVi = -1
   if fn is FuncDecl {
@@ -14943,6 +14970,7 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if retVi >= 0 { pendingVariantIdx = -1 }
     if tyIsNulBool(fn.fnRet) { retNulBool = true }
     if retNulStringFlag(fn.fnRet) == 1 { retNulString = true }
+    if retNulListFlag(fn.fnRet) == 1 { retNulList = true }
     // Inferred niche nullable (un-annotated): seed the niche from the A20 name so a
     // `return null` / `return <bool|string>` lowers as the sentinel / `ref.null` rep.
     if fn.fnRet < 0 {
@@ -14969,11 +14997,14 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   } else {
     const savedRNB = pendingNulBool
     const savedRNS = pendingNulString
+    const savedRNL = pendingNulList
     if retNulBool { pendingNulBool = true }
     if retNulString { pendingNulString = true }
+    if retNulList { pendingNulList = true }
     if emitExpr(body, retArg, fnIx) < 0 { return -1 }
     pendingNulBool = savedRNB
     pendingNulString = savedRNS
+    pendingNulList = savedRNL
   }
   pendingStructIdx = -1
   pendingVariantIdx = -1
@@ -15145,6 +15176,11 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
         pendingNulRefHeap = rlWrapIdx[pendingListSlot]
       }
     }
+    // A kind-15 nullable i32-list binding (`i32[] | null = null`): a bare `null` init lowers as
+    // `ref.null $lTypeIdx` (the `pendingNulList` arm), the scalar-list analogue of the kind-18 seed above.
+    // Without this a literal `= null` init fell through to the bare-null error (the type/narrowing worked,
+    // but an actual null value never lowered).
+    let letNulList15 = localIsRef[slot] == 15
     // An UN-annotated empty `[]` whose USAGE pins a string element (`const out = [];
     // out.push(self[i])`): seed the string-list kind so `emitArr` builds the string-list
     // wrapper, MATCHING the slot `collectLocals` typed (kind 7, via the same
@@ -15259,9 +15295,12 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       // `boolean | null`) seeds the sentinel too.
       pendingNulBool = letNulBool(stmtIx, fnIx)
       pendingNulString = letIsNulString(stmtIx, fnIx)
+      const savedNulList = pendingNulList
+      if letNulList15 { pendingNulList = true }
       if emitExpr(body, s.letInit, fnIx) < 0 { return -1 }
       pendingNulBool = false
       pendingNulString = false
+      pendingNulList = savedNulList
     }
     pendingI64 = false
     pendingStructIdx = -1
