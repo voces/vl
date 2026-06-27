@@ -19074,6 +19074,10 @@ function fieldTypeCode(tyIx: i32) {
     const nb = nullablePartOf(base)
     if nb != "" { base = nb }
     if nameIsStructDecl(base) { return 15 }
+    // An INLINE-SHAPE struct field (`inner: {x:i32}`) — not a declared name, so resolve it
+    // STRUCTURALLY to its interned struct (pre-interned by `collectNestedFieldShapes`). The
+    // structural→nominal bridge applied at field classification, the dual of a nominal `inner: Inner`.
+    if structIndexOfTypeName(base) >= 0 { return 15 }
     return -1
   }
   -1
@@ -19119,8 +19123,13 @@ function fieldRefElemName(tyIx: i32) {
     const ty15 = P.nodes[tyIx]
     if ty15 is TypeRef {
       let base = nullablePartOf(ty15.tyName)
-      if base != "" { return base }
-      return ty15.tyName
+      if base == "" { base = ty15.tyName }
+      // An INLINE-SHAPE field (`inner: {x:i32}`) records the NOMINAL name of its interned struct
+      // (`structIndexOfTypeName` resolves the shape — to its own `{x:i32}` key, or a matching declared
+      // struct), so every nominal-keyed use site (`structIndexByName`) resolves it like `inner: Inner`.
+      const idx = structIndexOfTypeName(base)
+      if idx >= 0 { return sNames[idx] }
+      return base
     }
     return ""
   }
@@ -20202,6 +20211,43 @@ function collectGenAliasShapes() {
 // per-field wasm-type code: `0` = i32 / boolean, `3` = string). Each `type X = {…}`
 // interns its own WasmGC struct heap type. A field whose type is neither i32/boolean
 // nor string fails loudly. Returns 0 on success, or -1 (via `emitFail`).
+// Intern every INLINE-SHAPE struct field type (`type Box = { inner: {x:i32} }`) depth-first BEFORE the
+// struct decls that reference it, so `collectS`'s main loop resolves the nested shape (it can't be
+// interned mid-loop — `internInlineShape` shares the flat `sField*` arrays). `internInlineShape` is a
+// no-op for a non-shape name and idempotent (`annShapeIndexOf`), so a program with NO inline-shape
+// fields — like the compiler itself — interns nothing here and its struct layout is unchanged.
+function collectNestedFieldShapes(stmts: i32[]) {
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is TypeDecl {
+      if variantIndexOf(s.tdName) < 0 && gaeLtAt(s.tdName) < 0 {
+        const fields = s.tdFields
+        let fi = 0
+        while fi < fields.length {
+          const fnode = P.nodes[fields[fi]]
+          if fnode is FieldDef {
+            let nm = tyNameOf(fnode.fdType)
+            const nb = nullablePartOf(nm)
+            if nb != "" { nm = nb }
+            while (
+              nm.length > 2 &&
+              nm[nm.length - 2] == '[' &&
+              nm[nm.length - 1] == ']'
+            ) {
+              nm = nm.slice(0, nm.length - 2)
+            }
+            internInlineShape(nm)
+          }
+          fi = fi + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 function collectS(stmts: i32[]) {
   sDeclared = false
   sNames = []
@@ -20210,6 +20256,8 @@ function collectS(stmts: i32[]) {
   sFieldCount = []
   sFieldTypes = []
   sFieldElemName = []
+  // Nested inline-shape FIELD types intern first, so the struct decls that reference them resolve.
+  collectNestedFieldShapes(stmts)
   // A `type X = {…}` that is a UNION VARIANT is collected by `collectU` into its own
   // variant table — it is NOT a standalone struct, so skip it here. Any OTHER struct
   // `type` (e.g. `ast.vl`'s `Tok`/`Diag`, declared alongside the `Node` union) IS a
