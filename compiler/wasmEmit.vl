@@ -10712,6 +10712,11 @@ function ifExprRefKind(ifIx: i32, fnIx: i32) {
   if tn is ObjLit {
     if pendingStructIdx >= 0 { return 1 }
   }
+  // A NULLABLE-struct join whose THEN arm is `null` (its rep doesn't classify) — the checker typed the
+  // whole if `S | null`. Return the struct kind so the nullable blocktype + struct/null arms lower; the
+  // struct index resolves from the checker's inner struct in `ifExprRefSlot`. (The null-in-ELSE case is
+  // already caught above via the THEN arm's struct rep.)
+  if nodeTyIsNullableStruct(ifIx) { return 1 }
   -1
 }
 
@@ -10724,6 +10729,11 @@ function ifExprRefSlot(ifIx: i32, fnIx: i32, kind: i32) {
   if kind == 1 {
     const si = structIndexOfExpr(tv, fnIx)
     if si >= 0 { return si }
+    if pendingStructIdx >= 0 { return pendingStructIdx }
+    // THEN arm is `null` with no binding seed — resolve the struct from the checker's nullable join
+    // type (`P | null` → its inner `P`), so the arm rep + nullable blocktype find the layout.
+    const inn = nodeNulStructInnerName(ifIx)
+    if inn != "" { return structIndexOfTypeName(inn) }
     return pendingStructIdx
   }
   if kind == 5 {
@@ -10751,14 +10761,23 @@ function emitIfExprRef(
       return emitFail("emitProgram: if-expression requires an else arm")
     }
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
-    wU8(4)                // 0x04 if
-    fbValtype(kind, slot) // ref result blocktype `(ref $ht)`
+    wU8(4) // 0x04 if
+    // A struct join the checker typed `S | null` (one arm is `null` → `(ref null $S)`, the other a
+    // `(ref $S)`) needs a NULLABLE blocktype, else the null arm's `(ref null $S)` mismatches the
+    // non-null `(ref $S)` result. `nodeTyIsNullableStruct` reads the checker's recorded join type — the
+    // generic signal — rather than re-deriving from the arms. (A non-nullable struct join, or a binding
+    // annotated `S | null` whose arms are both non-null, stays non-null: the value widens on store.)
+    if kind == 1 && nodeTyIsNullableStruct(ifIx) {
+      fbValtypeNullable(kind, slot) // `(ref null $S)` result blocktype
+    } else {
+      fbValtype(kind, slot) // ref result blocktype `(ref $ht)`
+    }
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rcT = emitRefIfArm(body, s.ifThen, fnIx, kind, slot)
     if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
-    fbElse()              // 0x05 else
+    fbElse() // 0x05 else
     const savedElseTop = narrowTop
     const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     const els = P.nodes[s.ifElse]
