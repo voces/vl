@@ -53,10 +53,14 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
      `structIndexOfTypeName`. The remaining `structIndexByName` sites stay nominal-only for now — migrate
      each opportunistically when a structural name actually reaches it (premature otherwise: today they
      all receive nominal names, so a blanket swap is a no-op with risk).
-  2. ⬜ **Differential / fuzz tester for the NON-i32 reps (highest leverage — do before the rewrite).**
-     The self-compile fixpoint can't validate the rep layer (the compiler is i32-only — never exercises
-     floats/unions/closures/nullables), so the corpus is the only net and it has gaps. A property tester
-     that generates programs over the non-i32 reps de-risks every later rep change.
+  2. 🟡 **Differential / fuzz tester for the NON-i32 reps.** v1 SHIPPED — `scripts/fuzz.ts` (`deno task
+     fuzz`) + a fixed-seed smoke in `tests/fuzz_smoke_test.ts`. Generative oracle (no second compiler):
+     it builds a random program AND computes its expected output with wasm integer semantics, then
+     compiles+runs through the seed and asserts a match; a mismatch / compile-fail / trap is a finding
+     reported with the reproducing `--seed`. Covers scalar arith (i32/i64/f64/string), struct fields,
+     lists (index/sum), closures, unions, nullables, nested structs, `.map`. REMAINING: broaden the
+     generators (mixed-type struct round-trips beyond a single read, f32, maps, deeper nesting, HOFs,
+     narrowing chains); wire a small fixed-seed batch into CI (`ci-native`).
   3. ⬜ **`repOf(type) → descriptor` unification (the "rewrite") — strangler, NOT big-bang.** One
      structurally-keyed descriptor {valtype, heapIdx, nullRep, sigToken, listResultKind, …} that every
      site consults; introduce + delegate + migrate site-by-site (each gated) + delete the old schemes.
@@ -144,21 +148,12 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   is shipped. REMAINING: (a) infer `never` for a genuinely base-case-less divergent recursive cycle
   (currently a stopgap "annotate a return type" error); (b) an `unconditional-recursion` lint that fires
   even when the return type is explicitly annotated (catches accidental infinite loops).
-- 🟡 **A-infer-empty. Usage-based inference for empty collections.** Empty ARRAY `[]` inference shipped
-  (see `CHANGELOG.md`): `const xs = []; xs.push(1)` infers `xs: i32[]` from downstream usage (push /
-  `T[]` param / annotated assignment / `T[]`-returning tail / index-set). REMAINING: the same for
-  `Map()`/`Set()` — infer key/value/element from `m.set(k,v)` / `.add(x)` later usage; the `Map()`/`Set()`
-  hole isn't yet materialised into a `{[K]:V}` object by `.set`/`.add`.
-- ⬜ **A-infer-null. `let x = null` as a nullable hole.** Treat `let x = null` like `[]`: infer the `T`
-  in `T | null` from later usage (`x = 5` ⇒ `i32 | null`), the initializer contributing `| null`, with
-  flow-narrowing stripping the `| null` on definitely-assigned paths (no null tax on the straight line);
-  an unconstrained `let x = null` resolves to `null`. Today `let x = null` pins `x` to the exact `null`
-  type, so `let x = null; x = 5` errors. Distinct from a pin violation — `null` is hole-bearing, not a
-  complete type. Ties A-infer-empty (same usage-driven hole-filling) and A-definite-assign (shared flow
-  machinery). (Rationale: DECISIONS "`let x = null` is a nullable hole".)
-- ⬜ **A-infer-params. Top-level function param inference.** Infer named-function param types from
-  usage constraints (HM / the existing A13 row-poly inference path), consistent with "hide types where
-  possible." Requiring annotations on all named-fn params is NOT VL's stated stance.
+- ✅ **A-infer-empty / A-infer-map-set / A-infer-null — DONE, graduated to `CHANGELOG.md`.** Empty `[]`,
+  `Map()`/`Set()`, and `let x = null` all infer from downstream usage now (the hole-filling arc).
+- 🟡 **A-infer-params. Top-level function param inference.** SHIPPED for the common case — an
+  un-annotated named-function param infers from its body's usage (`function mx(a, b) { if a > b {…} }`
+  works; `tests/cases/functions/inferred-compare.vl`). REMAINING: confirm/extend coverage at the harder
+  edges (params used only through generic/HOF call sites, recursive constraints) and prune if complete.
 - 🟡 **A-exhaust. Exhaustiveness analysis for `is`-chains.** Dead-arm flagging and omit-the-`else`
   return-coverage shipped. REMAINING: **codegen** — elide the provably-true final discriminant test +
   drop the dead arm (a type-driven optimization binaryen cannot do; runtime already correct via the
@@ -237,9 +232,10 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   self-methods; `c.area` (no `()`) as a bound value; mutation/variance (A9).
 - 🟡 **B15. Lambdas + declaration-vs-value.** SELF-HOST function-value ABI shipped (#306: `call_ref`
   + closure struct, non-capturing + capturing; design `docs/internals/selfhost-lambdas-design.md`); escaping
-  closures + function-valued struct fields shipped (#310); `.map`/`.filter` EMIT is the next slice
-  (see Next). REMAINING (host): **untyped** lambdas (a stored closure has one signature — needs
-  pinning-by-use or boxing).
+  closures + function-valued struct fields shipped (#310). `.map`/`.filter` over function-value
+  callbacks (incl. closure-value callbacks, struct/union returns, and generic HOFs) SHIPPED (#644–#665,
+  see `CHANGELOG.md`). REMAINING: **untyped** lambdas (a stored closure has one signature — needs
+  pinning-by-use or boxing); leading-`,` / `$#` param-skip ergonomics (own item in Next).
 - ⬜ **B16. Redeclaration / overloading.** Current: same-scope redeclaration errors; nested shadowing
   allowed (uniquified in codegen). Future: ad-hoc overloading? Default "no" → `DECISIONS.md`.
 - 🟡 **B17. Diagnostics + lint.** BUILD OUT — the lint rule backlog (a few at a time). Shipped (see
@@ -495,7 +491,8 @@ piece that can land early, fully decoupled).
   finish folding the corpus RUN + CHECK verdicts onto the native/wasmtime tier (this is F-tiers +
   Next step 2) so no gate depends on Deno-as-an-engine. Then the only thing left for Deno is
   *orchestration*, not execution.
-- ⬜ **J2 — the test harness (the hard core).** All 52 `tests/*.ts` are `Deno.test`. Split by what
+- ⬜ **J2 — the test harness (the hard core).** The `tests/*.ts` files (~33 on current master, down
+  from 52 — the TS-internal unit tests were retired, commit 7606e95) are `Deno.test`. Split by what
   they test:
   - **Behavioral `.vl` corpus** (`cases_test`/`cases_wasm_test`, `selfhost_*`) → migrate to the
     native runner + `*.test.vl` under **`vl test`** (already designed/charted — see Next +
