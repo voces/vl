@@ -24640,6 +24640,33 @@ function cloRetTypeName(fe: i32) {
 // generic closure param `(A, T) => A` against. "" when the argument is not a resolvable
 // closure value or a param/return type lies outside the name vocabulary. (Distinct from
 // `monoArgTyName`'s `"=>sigkey"` pin, which an UN-annotated closure param wants.)
+// Resolve any STRUCTURAL shapes inside a `(params)=>ret` function-type name to their NOMINAL names —
+// the single structural→nominal bridge (`resolveShapeToNominal`, which also peels `[]`) applied to each
+// param and the return. The checker renders a lambda's struct part as `{x: i32}` / `{x: i32}[]`; the
+// monomorphizer's type-param bindings and every nominal-keyed emitter site (`nameIsRefArray`,
+// `rlSlotByName`, `structIndexByName`) want `P` / `P[]`. Applied ONCE at the mono boundary so the
+// instance is nominal throughout. A non-function name, or one with no resolvable shape, passes through.
+function nominalizeFnType(name: string) {
+  const at = annArrowAt(name)
+  if at < 1 { return name }
+  if name[0] != '(' { return name }
+  if name[at - 1] != ')' { return name }
+  const paramsStr = name.slice(1, at - 1)
+  const retStr = name.slice(at + 2, name.length)
+  let out = "("
+  if paramsStr.length > 0 {
+    const parts: string[] = []
+    annSplitParams(paramsStr, parts)
+    let i = 0
+    while i < parts.length {
+      if i > 0 { out = out + "," }
+      out = out + resolveShapeToNominal(parts[i])
+      i = i + 1
+    }
+  }
+  out + ")=>" + resolveShapeToNominal(retStr)
+}
+
 function monoArgFnTypeName(argIx: i32, fnIx: i32) {
   const ax = unwrapParen(argIx)
   const an = P.nodes[ax]
@@ -24647,10 +24674,13 @@ function monoArgFnTypeName(argIx: i32, fnIx: i32) {
   // types from the generic param's (substituted) expected type at the call site — `mapArr<T,R>(xs, f)`
   // called `mapArr([1,2,3], (x) => x*2)` types `f` as `(i32) => i32`, which the syntactic build below
   // CANNOT recover (the lambda param has no annotation). Used only when it yields a complete
-  // `(params)=>ret` name; a named-fn arg / a case the checker didn't type falls through.
+  // `(params)=>ret` name; a named-fn arg / a case the checker didn't type falls through. The checker
+  // renders a struct part STRUCTURALLY (`(i32) => {x: i32}`); NOMINALIZE it once here so the bound
+  // type param (`R = P`) — and thus every downstream site (`R[]` validation, the result ref-list
+  // interning, the binding type) — keys on the declared name, rather than each re-bridging the shape.
   const cn = nodeTyName(ax)
   if cn != "" {
-    if annArrowAt(cn) >= 0 { return cn }
+    if annArrowAt(cn) >= 0 { return nominalizeFnType(cn) }
   }
   let fe = -1
   if an is FuncDecl { fe = fnStmtsPosOf(ax) }
