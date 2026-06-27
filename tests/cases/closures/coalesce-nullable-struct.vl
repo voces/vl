@@ -1,0 +1,60 @@
+// @run
+// @log 9
+// @log 4
+// @log 42
+// @log 5
+// @log 7
+// @log 3
+// @log 8
+// `<S | null> ?? <S>` — coalescing a nullable STRUCT with a struct default — now lowers. The `??`
+// handler had paths for `string | null`, `boolean | null`, and boxed value-unions, but a nullable
+// STRUCT fell through to "`??` is only supported on a map index get" for EVERY source form (ident,
+// param, field, call).
+//
+// One GENERIC path closes all of them: `br_on_non_null` keeps the non-null struct or falls through to
+// the default, evaluating the LHS exactly ONCE — so it needs neither a re-eval (the effect-free ident /
+// field forms) nor a per-struct stash slot (the call form, whose distinct heap type a single slot can't
+// hold), unlike the split `string | null` paths. `structIndexOfExpr` (with the #654/#656 checker-type
+// fallback) gives the block's result struct type, incl. an indexed closure-array / factory call. The
+// consumer side (`exprStruct` / `structIndexOfExpr`) classifies the `??` result a struct so `(r ?? d).f`
+// and a bound `const p = r ?? d` resolve.
+
+type P = { x: i32 }
+
+// A nullable-returning closure factory, and a nullable-returning named fn.
+function mk(): (i32) => P | null {
+  return (n) => if n > 0 { { x: n } } else { null }
+}
+function maybe(n: i32): P | null {
+  if n > 0 { return { x: n } }
+  return null
+}
+
+// `??` over a nullable-struct PARAM (the null and non-null arms).
+function useP(r: P | null): i32 {
+  const p = r ?? { x: 9 }
+  return p.x
+}
+
+function go() {
+  print(useP(null))     // 9  (default)
+  print(useP({ x: 4 })) // 4  (the present value)
+
+  // `??` over an indexed closure-ARRAY call, both arms.
+  const g: (i32) => P | null = (n) => if n > 0 { { x: n } } else { null }
+  const arr = [g]
+  print((arr[0](-1) ?? { x: 42 }).x) // 42 (null → default)
+  print((arr[0](5) ?? { x: 42 }).x)  // 5  (present)
+
+  // `??` over a FACTORY-returned closure call.
+  const f = mk()
+  print((f(-1) ?? { x: 7 }).x) // 7
+  print((f(3) ?? { x: 7 }).x)  // 3
+
+  // `??` over a nullable-struct local bound from a CALL.
+  const r = maybe(-1)
+  const p = r ?? { x: 8 }
+  print(p.x) // 8
+}
+
+go()
