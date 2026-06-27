@@ -29,6 +29,10 @@ type Slot = {
   payload: string,
   expected: string,
   child: Slot | null,
+  // 1 if this nullable slot (kind 3) carries an ACTUAL `null` value (not its child). The read then
+  // takes the `else` arm and prints the NULL sentinel — exercising the null path the round-trip
+  // otherwise never hits (every nullable slot used to be built non-null).
+  isNull: i32,
 }
 
 function ch(c: i32): string { return fromCodePoint(c) }
@@ -64,15 +68,22 @@ function genLeaf(): Slot {
   const k = rr(0, 3)
   if k == 0 {
     const d = genDigits(rr(1, 6))
-    return { kind: 0, leaf: 0, payload: d, expected: d, child: null }
+    return { kind: 0, leaf: 0, payload: d, expected: d, child: null, isNull: 0 }
   }
   if k == 1 {
     const d = genDigits(rr(1, 9))
-    return { kind: 0, leaf: 1, payload: d, expected: d, child: null }
+    return { kind: 0, leaf: 1, payload: d, expected: d, child: null, isNull: 0 }
   }
   if k == 2 {
     const d = genDigits(rr(1, 5))
-    return { kind: 0, leaf: 2, payload: d + ".0", expected: d, child: null }
+    return {
+      kind: 0,
+      leaf: 2,
+      payload: d + ".0",
+      expected: d,
+      child: null,
+      isNull: 0,
+    }
   }
   const w = genWord()
   return {
@@ -81,6 +92,7 @@ function genLeaf(): Slot {
     payload: ch(34) + w + ch(34),
     expected: w,
     child: null,
+    isNull: 0,
   }
 }
 
@@ -94,10 +106,24 @@ function genSlot(depth: i32, allowNul: i32): Slot {
   if w == 0 || w > hi { return genLeaf() }
   if w == 3 {
     const c = genSlot(depth - 1, 0)
-    return { kind: 3, leaf: 0, payload: "", expected: c.expected, child: c }
+    // ~1/3 of nullable slots carry an ACTUAL null. The read then short-circuits to the NULL sentinel
+    // at THIS depth; since the sentinel string is depth-independent, the round-trip oracle (the first
+    // null on the carrier chain wins) stays consistent.
+    let nul = 0
+    if rr(0, 2) == 0 { nul = 1 }
+    let exp = c.expected
+    if nul == 1 { exp = "NULL" }
+    return { kind: 3, leaf: 0, payload: "", expected: exp, child: c, isNull: nul }
   }
   const c = genSlot(depth - 1, 1)
-  return { kind: w, leaf: 0, payload: "", expected: c.expected, child: c }
+  return {
+    kind: w,
+    leaf: 0,
+    payload: "",
+    expected: c.expected,
+    child: c,
+    isNull: 0,
+  }
 }
 
 function leafTy(l: i32): string {
@@ -123,6 +149,9 @@ function emitCtor(s: Slot): string {
   if s.kind == 0 { return s.payload }
   const c = s.child
   if c == null { return "0" }
+  if s.isNull == 1 {
+    return "null" // a nullable slot carrying an actual null
+  }
   if s.kind == 1 { return "{f: " + emitCtor(c) + "}" }
   if s.kind == 2 { return "[" + emitCtor(c) + "]" }
   return emitCtor(c)
@@ -146,7 +175,7 @@ function emitRead(acc: string, s: Slot, tmp: i32): string {
     t +
     " != null {\n" +
     emitRead(t, c, tmp + 1) +
-    "} else {\nprint(\"NULLFAIL\")\n}\n"
+    "} else {\nprint(\"NULL\")\n}\n"
 }
 
 function go() {
