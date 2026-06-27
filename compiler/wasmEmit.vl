@@ -4505,8 +4505,14 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         pendingListSlot = fslot
         if rlElemKindTbl[fslot] == 2 {
           pendingListKind = 2
-        } else {
+        } else if rlElemKindTbl[fslot] == 1 {
           pendingListKind = 1
+        } else {
+          // A NESTED-element ref-list field (element kind 9 a nested ref array, or a scalar-2D inner): the
+          // value is a ref list built THROUGH this slot, like a `<ref-array>[]` local binding
+          // (`pendingListKind` 5). `pendingListKind` 1 (struct) mis-built array elements as structs →
+          // invalid wasm (the construct-side hole for `{f: (i32|null)[][]}` / `{f: {g:i32}[][]}`).
+          pendingListKind = 5
         }
       } else if scode == 6 {
         pendingListKind = 3
@@ -20016,6 +20022,13 @@ function internShapeDeep(nm: string) {
   if nm[0] == '(' && nm[nm.length - 1] == ')' {
     return internShapeDeep(nm.slice(1, nm.length - 1))
   }
+  // A VALUE UNION leaf (`i32 | null`, `string | i32`) — register its box reps. Do NOT peel its `| null`:
+  // here the null is a union ATOM (a tag in a non-null box), NOT a nullable-niche wrapper. Checked AFTER
+  // the parens peel (so `(i32|null)` reaches here) but BEFORE the `| null` peel (which would lose the atom).
+  if isValueUnionName(nm) {
+    registerValueUnionName(nm)
+    return 0
+  }
   const np = nullablePartOf(nm)
   if np != "" { return internShapeDeep(np) }
   if nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
@@ -20081,15 +20094,13 @@ function internInlineShape(nm: string) {
         let ftxt = part.slice(ci + 1, part.length)
         let fc = nameFieldCode(ftxt)
         if fc == 5 {
-          // A ref-list field whose ELEMENT is an inline shape (`{g:i32}[]` / `({g:i32}|null)[]`): pre-
-          // intern the element shape HERE in the parse loop. Safe — the outer shape is pushed to `sNames`
-          // only after this loop; interning in the storage loop would corrupt the flat `sField*` arrays
-          // (the same reason `collectNestedFieldShapes` is a pre-pass). The element read then resolves it.
-          // A nominal / union / scalar element is not a shape (`internInlineShape` is a no-op).
-          let elemTxt = ftxt.slice(0, ftxt.length - 2)
-          const enb5 = nullablePartOf(elemTxt)
-          if enb5 != "" { elemTxt = enb5 }
-          internInlineShape(elemTxt)
+          // A ref-list field's ELEMENT may bury an inline shape (`{g:i32}[]`) or a value union
+          // (`(i32|null)[][]`) under array / nullable / grouping wrappers — pre-intern/register them HERE
+          // in the parse loop via the recursive `internShapeDeep` (it peels to the leaf and interns the
+          // shape or registers the value-union box). MUST be the parse loop, not the storage loop — the
+          // outer shape is pushed to `sNames` only after this, so the flat `sField*` arrays aren't
+          // corrupted (the same reason `collectNestedFieldShapes` is a pre-pass).
+          internShapeDeep(ftxt)
         }
         if fc < 0 {
           // A NESTED inline-shape field: intern the nested shape (its `|null`
