@@ -2736,6 +2736,16 @@ function collectLocals(blockIx: i32, fnIx: i32) {
         } else if letIsUnion(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 4, -1)
         } else if letIsStruct(stmts[i], fnIx) {
+          // `letIsStruct` also matches via the INIT object literal's field-name set — so an UN-INTERNABLE
+          // inline-shape ANNOTATION (an unsupported field type, e.g. `{f: {g:i32}[] | null}` /
+          // `{f: (i32|null)[][]}`) still lands here, but `structIndexOfLet` then resolves to a WRONG struct
+          // (a same-field-named one) and emits its layout → invalid wasm. Reject cleanly when the
+          // annotation shape itself could not be interned (the construct-side hole the read fuzzer masked).
+          if letAnnIsUninternedShape(stmts[i]) {
+            return emitFail(
+              "emitProgram: binding's inline-shape type has an unsupported field",
+            )
+          }
           slot = addLocalName(s.letName, 1, structIndexOfLet(stmts[i], fnIx))
         } else if letIsArray(stmts[i], fnIx) {
           slot = addLocalName(s.letName, 2, -1)
@@ -19183,7 +19193,11 @@ function fieldTypeCode(tyIx: i32) {
     // An INLINE-SHAPE struct field (`inner: {x:i32}`) — not a declared name, so resolve it
     // STRUCTURALLY to its interned struct (pre-interned by `collectNestedFieldShapes`). The
     // structural→nominal bridge applied at field classification, the dual of a nominal `inner: Inner`.
-    if structIndexOfTypeName(base) >= 0 { return 15 }
+    // GUARD against an array base (`{x:i32}[]` of a `{x:i32}[] | null` field): `structIndexOfTypeName`
+    // ignores the trailing `[]` and would match the element shape, mis-coding a NULLABLE STRUCT-LIST
+    // field as a nullable struct (code 15) — invalid wasm. A nominal `Node[] | null` already falls to
+    // -1 (clean reject); this brings the inline form to par until nullable ref-list fields are repped.
+    if !nameIsArray(base) && structIndexOfTypeName(base) >= 0 { return 15 }
     return -1
   }
   -1
@@ -21325,6 +21339,25 @@ function declaredStruct(name: string) { declaredKind(name) == 1 }
 // True if the `LetDecl` at `letIx` declares a struct-typed local: its annotation
 // names the struct, OR its initializer produces the struct. Picks the local's
 // valtype (`(ref $0)` vs i32) in `collectLocals`.
+// True if the binding's annotation is a SINGLE inline object shape (`{ … }`, with a trailing `| null`
+// stripped) that is NOT interned as a struct — i.e. its shape could not be built (an unsupported field
+// type). A map (`{[…]}`) is excluded. Checked only AFTER union / nullable-struct / struct classification,
+// so a valid inline-struct binding never reaches it; this catches the un-internable remainder so it
+// rejects cleanly instead of mis-emitting its object literal (a soundness guard).
+function letAnnIsUninternedShape(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType < 0 { return false }
+    let nm = tyNameOf(d.letType)
+    const nb = nullablePartOf(nm)
+    if nb != "" { nm = nb }
+    if nm.length < 2 { return false }
+    if nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' { return false }
+    return structIndexByName(nm) < 0
+  }
+  false
+}
+
 function letIsStruct(letIx: i32, fnIx: i32) {
   let d = P.nodes[letIx]
   if d is LetDecl {
