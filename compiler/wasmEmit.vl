@@ -6087,7 +6087,10 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
     // null` / `??` null-check sets `pendingRawNullRead` to keep the raw nullable ref. A
     // `boolean | null` field (code 21) needs no recovery (its i32 sentinel reads as-is).
     if sFieldTypeAt(si, idx) == 20 {
-      if !pendingRawNullRead {
+      // A nullable-string TARGET (`pendingNulString` — `const g = r.f` binding a `string | null`, or a
+      // nullable arg/return) keeps the raw nullable ref, like the kind-16 ident read: recovering would
+      // `ref.as_non_null` a possibly-null field value and trap.
+      if !pendingRawNullRead && !pendingNulString {
         wU8(212) // 0xd4 ref.as_non_null
       }
     }
@@ -9707,7 +9710,11 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     // A `string | null` (kind 16) param/local read AS A VALUE recovers the non-null
     // string ref — the checker narrowed it non-null at every such read. The `!= null`
     // null-check sets `pendingRawNullRead` to keep the raw nullable ref for `ref.is_null`.
-    if !pendingRawNullRead {
+    // A NULLABLE-string TARGET (`pendingNulString` — `const t: string | null = s`, `t = s`,
+    // a `string | null` arg/return) likewise keeps the raw nullable ref: recovering it would
+    // `ref.as_non_null` a value that may legitimately be null and trap. Mirrors the kind-15
+    // list read, which never eagerly recovers.
+    if !pendingRawNullRead && !pendingNulString {
       if paramNulString(fnIx, e.identName) || declaredNulString(e.identName) {
         fbRefAsNonNull() // 0xd4
       }
@@ -19772,6 +19779,12 @@ function collectA(stmts: i32[]) {
         aUsed = true
       } else if nameIsString(nd.tyName) {
         aUsed = true
+      } else if nameIsNulString(nd.tyName) {
+        // A `string | null` annotation (kind 16) is a `(ref null $aTypeIdx)` slot — it still needs the
+        // string backing forced, exactly like a plain `string`. Without this a bare `string | null = null`
+        // (no other string in the module to force `aUsed`) left `$aTypeIdx` unallocated, so the slot
+        // valtype + `ref.null` referenced a stale type index → invalid wasm at the read.
+        aUsed = true
       } else if nameIsNulI32List(nd.tyName) {
         // An `i32[] | null` annotation still constructs/reads the i32 list — the
         // nullable wrapper changes only the slot's valtype, not the types needed.
@@ -19800,6 +19813,11 @@ function collectA(stmts: i32[]) {
       raUsed = true
       ensureRefElem(sFieldElemName[sfi])
     }
+    // A `string | null` FIELD (code 20) is a `(ref null $aTypeIdx)` slot — force the string backing, like
+    // the standalone `string | null` annotation above. An inline `{ f: string | null }` field's inner type
+    // is never a standalone TypeRef the scan sees, so without this a `{ f: null }` (no other string in the
+    // module) left `$aTypeIdx` unallocated and the field read referenced a stale type → invalid wasm.
+    if sFieldTypes[sfi] == 20 { aUsed = true }
     sfi = sfi + 1
   }
   0
