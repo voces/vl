@@ -1145,6 +1145,8 @@ function exprNullableRefArray(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is Paren { return exprNullableRefArray(e.parInner, fnIx) }
   if e is Ident { return declaredKind(e.identName) == 18 }
+  // A `recv.f` read of a NULLABLE ref-list FIELD (`f: S[] | null`, code 28) yields a nullable ref array.
+  if e is Member { return memberFieldCode(exprIx, fnIx) == 28 }
   if e is Index {
     if exprRefArray(e.idxArr, fnIx) {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
@@ -1168,6 +1170,13 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
     if sl >= 0 { return localStructIdx[sl] }
     return -1
   }
+  // A code-28 nullable ref-list field member: its element ref-list slot (the field's element name).
+  if e is Member {
+    if memberFieldCode(exprIx, fnIx) == 28 {
+      return refListSlotOfExpr(exprIx, fnIx)
+    }
+    return -1
+  }
   if e is Index {
     const slot = refListSlotOfExpr(e.idxArr, fnIx)
     if slot >= 0 && slot < rlElemName.length {
@@ -1186,7 +1195,12 @@ function letIsNulRefArray(letIx: i32, fnIx: i32) {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
         const np = nullablePartOf(lt.tyName)
-        if np != "" && nameIsRefArray(np) { return true }
+        // A value-union-element inner (`(i32|null)[] | null`) is excluded — its annotated-local value
+        // build is not yet supported, so it falls through to a clean reject rather than the kind-18 path
+        // (which traps). A struct / nested-array inner is fine. The INFERRED path below is unaffected.
+        if np != "" && nameIsRefArray(np) && parenUnionArrElemName(np) == "" {
+          return true
+        }
       }
       return false
     }
@@ -4313,6 +4327,17 @@ function pushFieldStorage(code: i32, refSlot: i32) {
     // code 4, with NULLABLE storage — the field genuinely carries null.
     wU8(99) // 0x63 (ref null ht)
     wSLEB(lTypeIdx)
+  } else if code == 28 {
+    // A NULLABLE REF-LIST field (`S[] | null` / `(i32|null)[] | null`): a NULLABLE ref to the element's
+    // ref-list wrapper — the ref-list analogue of code 18. `refSlot` is the element ref-list slot.
+    if refSlot < 0 || refSlot >= rlWrapIdx.length {
+      wU8(127)
+      return emitFail(
+        "emitProgram: nullable ref-list field element type is not interned",
+      )
+    }
+    wU8(99) // 0x63 (ref null ht)
+    wSLEB(rlWrapIdx[refSlot])
   } else if code == 19 {
     // A MAP-typed field (`children: {[string]: Tree}`): a non-null ref to the
     // value type's map struct (`refSlot` is the mv SLOT here; -1 = the mono
@@ -4431,6 +4456,15 @@ function emitOmittedFieldNull(body: i32[], si: i32, fi: i32, scode: i32) {
     fbRefNull(lTypeIdx) // ref.null $lTypeIdx (i32[] | null)
     return 0
   }
+  if scode == 28 {
+    // A NULLABLE ref-list field omitted -> `ref.null $wrapper` (the element's ref-list wrapper).
+    const rs28 = sFieldRefSlot(si, fi)
+    if rs28 >= 0 && rs28 < rlWrapIdx.length {
+      fbRefNull(rlWrapIdx[rs28])
+      return 0
+    }
+    return -1
+  }
   if scode == 22 {
     fbRefNull(cloStructIdx) // ref.null $cloStruct (a nullable-closure field, kind 19)
     return 0
@@ -4499,6 +4533,7 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
       // is global (union box `2` when a union is declared, else a struct `1`).
       pendingListKind = 0
       pendingListSlot = 0
+      pendingNulRefHeap = -1
       if scode == 5 {
         let fslot = sFieldRefSlot(si, fi)
         if fslot < 0 { fslot = 0 }
@@ -4522,6 +4557,16 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         pendingListKind = 6 // i64[] field — widen bare-int elements to i64
       } else if scode == 27 {
         pendingListKind = 7 // f32[] field — re-encode float elements at f32
+      } else if scode == 28 {
+        // A NULLABLE ref-list field value is a list (build it THROUGH the element slot, like code 5) OR a
+        // bare `null` -> `ref.null $wrapper` (the `pendingNulRefHeap` seed; a list value ignores it).
+        let fslot28 = sFieldRefSlot(si, fi)
+        if fslot28 < 0 { fslot28 = 0 }
+        pendingListSlot = fslot28
+        if rlElemKindTbl[fslot28] == 2 { pendingListKind = 2 }
+        else if rlElemKindTbl[fslot28] == 1 { pendingListKind = 1 }
+        else { pendingListKind = 5 }
+        if fslot28 < rlWrapIdx.length { pendingNulRefHeap = rlWrapIdx[fslot28] }
       }
       // A NESTED-STRUCT field (code 15) seeds the TARGET struct so its literal
       // builds that struct (not a field-shape guess) and a bare `null` value
@@ -19241,6 +19286,15 @@ function forceScalarListField(code: i32) {
   0
 }
 
+// True if `name` is a `<ref-list> | null` — a NULLABLE ref-list field/local (`S[] | null`, `(i32|null)[] |
+// null`, `{g:i32}[] | null`), the ref-list analogue of `nameIsNulI32List`. Its non-null part is a ref array
+// (a struct / union / nested-array element list). NOT an `i32[] | null` (that is code 18, kind 15).
+function nameIsNulRefList(name: string) {
+  const np = nullablePartOf(name)
+  if np == "" { return false }
+  return nameIsRefArray(np)
+}
+
 function fieldTypeCode(tyIx: i32) {
   if tyIx < 0 { return -1 }
   // A NULLABLE-function field (`op: ((i32) => i32) | null`) stores a NULLABLE closure
@@ -19279,6 +19333,7 @@ function fieldTypeCode(tyIx: i32) {
     // the same wrapper as code 4 — code 18 (`0x63 lTypeIdx`). Checked before the
     // value-union test (`i32[]` is not a value atom, so 16 never claims it).
     if nameIsNulI32List(ty.tyName) { return 18 }
+    if nameIsNulRefList(ty.tyName) { return 28 }
     // A MAP-typed field (`children: {[string]: Tree}`) stores a non-null ref to
     // its value-type's map struct — code 19. The mv SLOT is interned by
     // `collectA`'s arena TypeRef scan (this same annotation node), so emission
@@ -19373,6 +19428,14 @@ function fieldRefElemName(tyIx: i32) {
   if code == 19 {
     const ty19 = P.nodes[tyIx]
     if ty19 is TypeRef { return mapValNameOf(ty19.tyName) }
+    return ""
+  }
+  // A NULLABLE REF-LIST field (code 28, `S[] | null`): its element is the ref-array element of the
+  // non-null part (`refArrElemName(nullablePartOf(name))` — `S[]|null` -> `S`, `(i32|null)[]|null` ->
+  // `i32|null`), so `sFieldRefSlot` (`rlSlotByName`) finds the element's interned slot.
+  if code == 28 {
+    const ty28 = P.nodes[tyIx]
+    if ty28 is TypeRef { return refArrElemName(nullablePartOf(ty28.tyName)) }
     return ""
   }
   if code != 5 { return "" }
@@ -19677,7 +19740,7 @@ function collectA(stmts: i32[]) {
     // whole `{f:N[]}`), so intern it from the struct table here — this runs after the rl-table reset, so
     // the slot persists. A NOMINAL field's element is already interned via its own TypeRef; `ensureRefElem`
     // dedupes, so this is byte-identical for programs with no inline ref-list field.
-    if sFieldTypes[sfi] == 5 {
+    if sFieldTypes[sfi] == 5 || sFieldTypes[sfi] == 28 {
       rlUsed = true
       raUsed = true
       ensureRefElem(sFieldElemName[sfi])
@@ -19986,6 +20049,7 @@ function nameFieldCode(t: string) {
   if nameIsMap(t) { return 19 }
   // A NULLABLE i32-list field (`rest: i32[] | null`) — code 18 (see fieldTypeCode).
   if nameIsNulI32List(t) { return 18 }
+  if nameIsNulRefList(t) { return 28 }
   // The niche FIELDS: `string | null` (`(ref null $aTypeIdx)`, code 20) and
   // `boolean | null` (i32 sentinel, code 21) — before the value-union test (a single
   // ref/scalar + null is a niche, not a box).
@@ -20092,16 +20156,14 @@ function internInlineShape(nm: string) {
         ok = false
       } else {
         let ftxt = part.slice(ci + 1, part.length)
+        // PRE-INTERN any inline shape / value union buried in the field type BEFORE classifying. A
+        // nullable ref-list field (`{g:i32}[] | null` / `(i32|null)[] | null`, code 28) needs its element
+        // shape interned (or value-union registered) for `nameFieldCode` to even recognize the non-null
+        // part as a ref array. `internShapeDeep` peels array / nullable / grouping wrappers to the leaf and
+        // interns/registers it; a no-op for a scalar / nominal / map field. MUST be the parse loop (the
+        // outer shape is pushed to `sNames` only after this, so the flat `sField*` arrays aren't corrupted).
+        internShapeDeep(ftxt)
         let fc = nameFieldCode(ftxt)
-        if fc == 5 {
-          // A ref-list field's ELEMENT may bury an inline shape (`{g:i32}[]`) or a value union
-          // (`(i32|null)[][]`) under array / nullable / grouping wrappers — pre-intern/register them HERE
-          // in the parse loop via the recursive `internShapeDeep` (it peels to the leaf and interns the
-          // shape or registers the value-union box). MUST be the parse loop, not the storage loop — the
-          // outer shape is pushed to `sNames` only after this, so the flat `sField*` arrays aren't
-          // corrupted (the same reason `collectNestedFieldShapes` is a pre-pass).
-          internShapeDeep(ftxt)
-        }
         if fc < 0 {
           // A NESTED inline-shape field: intern the nested shape (its `|null`
           // wrapper stripped) and store a struct ref on it.
@@ -20173,6 +20235,17 @@ function internInlineShape(nm: string) {
       }
       sFieldElemName.push(e5)
       if isValueUnionName(e5) { registerValueUnionName(e5) }
+    } else if codes[pi] == 28 {
+      // A NULLABLE ref-list field (`f: S[] | null`): its element name is the ref-array element of the
+      // non-null part; the element shape/union was pre-interned in the parse loop (`internShapeDeep`).
+      let e28 = refArrElemName(nullablePartOf(texts[pi]))
+      if e28 == "" {
+        let raw28 = nullablePartOf(texts[pi])
+        if raw28.length > 2 { raw28 = raw28.slice(0, raw28.length - 2) }
+        if structIndexByName(raw28) >= 0 { e28 = raw28 }
+      }
+      sFieldElemName.push(e28)
+      if isValueUnionName(e28) { registerValueUnionName(e28) }
     } else {
       sFieldElemName.push("")
     }
