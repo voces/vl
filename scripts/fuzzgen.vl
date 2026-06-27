@@ -1,0 +1,173 @@
+// VL-NATIVE rep-composition fuzzer — the generator half. Emits a batch of self-describing `.vl`
+// programs (each carrying its `// @log` expectation) that bury a literal PAYLOAD inside a randomly
+// nested rep (struct field / list element / nullable) and read it back. The round-trip property is the
+// oracle: print(read(build(payload))) must equal payload. The oracle is just the payload TEXT —
+// computed by nothing, so it stays independent of the compiler under test (unlike an arithmetic oracle,
+// which VL can't evaluate independently). Arithmetic is deliberately NOT fuzzed here (the corpus + the
+// fixpoint-validated i32 path cover it); the value is composition DEPTH the hand-written corpus lacks.
+//
+// `scripts/fuzz-vl.sh` runs this through the native `vl`, splits the batch on `===CASE` markers, and
+// runs each case — no Deno. Seed + count are sed-injected by the orchestrator (the two `let` lines).
+
+let SEED = 1
+let COUNT = 200
+let MAXDEPTH = 4
+
+// ── seeded PRNG (i32 LCG; the i32 path is fixpoint-trusted, so the generator's own arithmetic is fine)
+function nextRand(): i32 {
+  SEED = SEED * 1103515245 + 12345
+  return SEED & 2147483647
+}
+function rr(lo: i32, hi: i32): i32 { return lo + nextRand() % (hi - lo + 1) }
+
+// A rep tree. kind: 0 leaf · 1 struct{f:child} · 2 child[] · 3 child|null. leaf: 0 i32 · 1 i64 · 2 f64
+// · 3 string. `payload` is the source literal, `expected` its printed form (f64 drops `.0`; a string
+// literal's quotes are stripped). `child` is the single carrying sub-slot.
+type Slot = {
+  kind: i32,
+  leaf: i32,
+  payload: string,
+  expected: string,
+  child: Slot | null,
+}
+
+function ch(c: i32): string { return fromCodePoint(c) }
+
+// A run of `n` decimal digits, first digit 1-9 (no leading zero).
+function genDigits(n: i32): string {
+  let s = ch(49 + rr(0, 8))
+  let i = 1
+  while i < n {
+    s = s + ch(48 + rr(0, 9))
+    i = i + 1
+  }
+  return s
+}
+
+// A short alphanumeric run (lowercase letters + digits), length 1-5.
+function genWord(): string {
+  let s = ""
+  let n = rr(1, 5)
+  let i = 0
+  while i < n {
+    if rr(0, 1) == 0 {
+      s = s + ch(97 + rr(0, 25))
+    } else {
+      s = s + ch(48 + rr(0, 9))
+    }
+    i = i + 1
+  }
+  return s
+}
+
+function genLeaf(): Slot {
+  const k = rr(0, 3)
+  if k == 0 {
+    const d = genDigits(rr(1, 6))
+    return { kind: 0, leaf: 0, payload: d, expected: d, child: null }
+  }
+  if k == 1 {
+    const d = genDigits(rr(1, 9))
+    return { kind: 0, leaf: 1, payload: d, expected: d, child: null }
+  }
+  if k == 2 {
+    const d = genDigits(rr(1, 5))
+    return { kind: 0, leaf: 2, payload: d + ".0", expected: d, child: null }
+  }
+  const w = genWord()
+  return {
+    kind: 0,
+    leaf: 3,
+    payload: ch(34) + w + ch(34),
+    expected: w,
+    child: null,
+  }
+}
+
+// `allowNul` is false directly under a nullable (no `X|null|null`).
+function genSlot(depth: i32, allowNul: i32): Slot {
+  if depth <= 0 { return genLeaf() }
+  // bias toward leaves so trees stay small
+  let hi = 3
+  if allowNul == 0 { hi = 2 }
+  const w = rr(0, hi + 1)
+  if w == 0 || w > hi { return genLeaf() }
+  if w == 3 {
+    const c = genSlot(depth - 1, 0)
+    return { kind: 3, leaf: 0, payload: "", expected: c.expected, child: c }
+  }
+  const c = genSlot(depth - 1, 1)
+  return { kind: w, leaf: 0, payload: "", expected: c.expected, child: c }
+}
+
+function leafTy(l: i32): string {
+  if l == 0 { return "i32" }
+  if l == 1 { return "i64" }
+  if l == 2 { return "f64" }
+  return "string"
+}
+
+function emitTy(s: Slot): string {
+  if s.kind == 0 { return leafTy(s.leaf) }
+  const c = s.child
+  if c == null { return "i32" }
+  if s.kind == 1 { return "{f: " + emitTy(c) + "}" }
+  if s.kind == 2 {
+    if c.kind == 3 { return "(" + emitTy(c) + ")[]" }
+    return emitTy(c) + "[]"
+  }
+  return emitTy(c) + " | null"
+}
+
+function emitCtor(s: Slot): string {
+  if s.kind == 0 { return s.payload }
+  const c = s.child
+  if c == null { return "0" }
+  if s.kind == 1 { return "{f: " + emitCtor(c) + "}" }
+  if s.kind == 2 { return "[" + emitCtor(c) + "]" }
+  return emitCtor(c)
+}
+
+// Statements reading the payload reachable from `acc` and printing it. Only a nullable binds a fresh
+// temp (`tN`) to narrow on (`if t != null`); struct/list stay direct accessors. `tmp` is the next temp id.
+function emitRead(acc: string, s: Slot, tmp: i32): string {
+  if s.kind == 0 { return "print(" + acc + ")\n" }
+  const c = s.child
+  if c == null { return "print(-1)\n" }
+  if s.kind == 1 { return emitRead(acc + ".f", c, tmp) }
+  if s.kind == 2 { return emitRead(acc + "[0]", c, tmp) }
+  const t = "t" + ch(48 + tmp)
+  return "const " +
+    t +
+    " = " +
+    acc +
+    "\n" +
+    "if " +
+    t +
+    " != null {\n" +
+    emitRead(t, c, tmp + 1) +
+    "} else {\nprint(\"NULLFAIL\")\n}\n"
+}
+
+function go() {
+  let i = 0
+  while i < COUNT {
+    const s = genSlot(rr(1, MAXDEPTH), 1)
+    const prog = "// @run\n// @log " +
+      s.expected +
+      "\n" +
+      "function go() {\n" +
+      "const v: " +
+      emitTy(s) +
+      " = " +
+      emitCtor(s) +
+      "\n" +
+      emitRead("v", s, 0) +
+      "}\ngo()\n"
+    print("===CASE " + ch(48 + i % 10) + "===")
+    print(prog)
+    i = i + 1
+  }
+}
+
+go()
