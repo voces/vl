@@ -1,7 +1,7 @@
 import { Diag, Tok } from "./ast"
 import { advance, gSrc, mkTok, scanQuoted } from "./lexer"
 import { accept, parseExpr, parseProgram, parseStmt, parseType, parseTypeName } from "./parser"
-import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, nodeTyIsUnion, nodeUnionName, nodeTyIsObj, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
+import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, nodeTyIsUnion, nodeUnionName, nodeTyIsObj, nodeTyIsNullableStruct, nodeTyIsNullableString, nodeNulStructInnerName, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
 import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkBlock, mkCall, mkCallN, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkLet, mkMember, mkIndex, mkArrayLit, mkNum, mkParam, mkParen, mkReturn, mkStr, mkTypeRef, mkWhile, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 // VL-in-VL wasm emitter — self-hosted codegen spike.
 //
@@ -1182,7 +1182,11 @@ function exprNullableString(exprIx: i32, fnIx: i32) {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
       if ffe >= 0 { return fRetNulStr[ffe] == 1 }
     }
-    return false
+    // FALLBACK (scoped to a CALL): a `string | null`-returning closure value call whose callee the
+    // cases above miss — an INDEXED closure-array element (`arr[i](x)`). The cheap NO-RENDER
+    // `nodeTyIsNullableString` reads the checker's per-node type (the niche-string dual of
+    // `exprNullableStruct`'s `nodeTyIsNullableStruct` fallback).
+    return nodeTyIsNullableString(exprIx)
   }
   if e is Ident {
     if paramNulString(fnIx, e.identName) { return true }
@@ -1247,7 +1251,13 @@ function exprNullableStruct(exprIx: i32, fnIx: i32) {
     }
     // `xs.pop()` / `xs.get(i)` over a STRUCT-element ref list yield `S | null` (the
     // host's nullable list reads — `pop` of an empty list / OOB `get` is null).
-    return structListPopGetElem(exprIx, fnIx) >= 0
+    if structListPopGetElem(exprIx, fnIx) >= 0 { return true }
+    // FALLBACK (scoped to a CALL): a nullable-struct-returning closure value call whose callee the
+    // cases above miss — an INDEXED closure-array element (`arr[i](x)`). The cheap NO-RENDER
+    // `nodeTyIsNullableStruct` reads the checker's per-node type. The nullable dual of `exprStruct`'s
+    // `nodeTyIsObj` fallback (#654), so `letIsNulRef` classifies such a binding kind-9 and its
+    // `!= null` narrow gets the struct context.
+    return nodeTyIsNullableStruct(exprIx)
   }
   if e is Ident {
     if paramNulRef(fnIx, e.identName) { return true }
@@ -16077,7 +16087,29 @@ function emitFuncCode(out: i32[], fnIx: i32) {
 function structIndexOfTypeName(name: string) {
   let si = structIndexByName(name)
   if si >= 0 { return si }
+  // Only a SINGLE shape spanning the WHOLE name is a bare struct — a composite (`{…}|null`,
+  // `{…}|{…}`, `{…}[]`) is not, so its first `{`'s matching `}` must be the LAST char. Without this
+  // guard a nullable-struct name (`{x:i32}|null`) mis-matches its LEADING shape as the bare struct,
+  // silently masking the `| null` (e.g. `annRetKind` would key a nullable result `>s` instead of
+  // `>n`, breaking a nullable-returning closure value call).
+  let spanOk = false
   if name.length >= 2 && name[0] == '{' && name[1] != '[' {
+    let d0 = 0
+    let closeAt = -1
+    let q = 0
+    while q < name.length {
+      const cc = name[q]
+      if cc == '{' {
+        d0 = d0 + 1
+      } else if cc == '}' {
+        d0 = d0 - 1
+        if d0 == 0 && closeAt < 0 { closeAt = q }
+      }
+      q = q + 1
+    }
+    if closeAt == name.length - 1 { spanOk = true }
+  }
+  if spanOk {
     // Collect the top-level FIELD NAMES: a name run starts after `{` or a
     // depth-0 `,` and ends at the depth-0 `:` (nested `{…}`/`[…]` skipped).
     const fnames: string[] = []
@@ -21268,6 +21300,11 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32) {
       const sn = nodeTyName(exprIx)
       if sn != "" { return structIndexOfTypeName(sn) }
     }
+    // The NULLABLE-struct dual: a `S | null`-returning closure value call (`arr[i](x)` over a
+    // `((i32) => P | null)[]`) resolves to its INNER struct's layout index, so the kind-9 binding's
+    // `!= null` narrow and field read find `P`. `nodeNulStructInnerName` renders only the inner shape.
+    const nn = nodeNulStructInnerName(exprIx)
+    if nn != "" { return structIndexOfTypeName(nn) }
     return -1
   }
   if e is Ident {
