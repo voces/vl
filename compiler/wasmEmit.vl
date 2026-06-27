@@ -4180,6 +4180,20 @@ function pushFieldStorage(code: i32, refSlot: i32) {
     wU8(126) // 0x7e i64 storagetype
   } else if code == 24 {
     wU8(125) // 0x7d f32 storagetype
+  } else if code == 25 {
+    // An `f64[]` list field: a non-null ref to the f64-list WRAPPER (`$fl64TypeIdx`) — the scalar
+    // analogue of code 4's `i32[]`→`$lTypeIdx`. The value builds it via the generic `emitExpr` path
+    // (an f64 array literal lowers to this wrapper), the read indexes it via the checker's f64-list type.
+    wU8(100) // 0x64 (ref ht)
+    wSLEB(fl64TypeIdx)
+  } else if code == 26 {
+    // An `i64[]` list field: a non-null ref to the i64-list wrapper (`$il64TypeIdx`).
+    wU8(100) // 0x64 (ref ht)
+    wSLEB(il64TypeIdx)
+  } else if code == 27 {
+    // An `f32[]` list field: a non-null ref to the f32-list wrapper (`$fl32TypeIdx`).
+    wU8(100) // 0x64 (ref ht)
+    wSLEB(fl32TypeIdx)
   } else if code == 18 {
     // A NULLABLE i32-list field (`rest: i32[] | null`): the same wrapper as
     // code 4, with NULLABLE storage — the field genuinely carries null.
@@ -4382,6 +4396,12 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         }
       } else if scode == 6 {
         pendingListKind = 3
+      } else if scode == 25 {
+        pendingListKind = 4 // f64[] field — coerce the value's elements to f64 (`emitArr`)
+      } else if scode == 26 {
+        pendingListKind = 6 // i64[] field — widen bare-int elements to i64
+      } else if scode == 27 {
+        pendingListKind = 7 // f32[] field — re-encode float elements at f32
       }
       // A NESTED-STRUCT field (code 15) seeds the TARGET struct so its literal
       // builds that struct (not a field-shape guess) and a bare `null` value
@@ -19016,6 +19036,17 @@ function refArrElemKind(name: string) {
 // is not stored per-field. An unsupported field type yields `-1` (caller fails loudly).
 // (`string[]` is NOT yet supported — it would need a string-ref list distinct from the
 // struct/union ref backing — so it falls through to `-1`.)
+// Force the backing+wrapper type pair for a SCALAR-LIST field code (25 = f64[], 26 = i64[], 27 = f32[]),
+// so the wrapper heap type exists whenever a struct/inline-shape field uses it — the field analogue of a
+// ref-list field forcing `rlUsed`. A scalar-list LOCAL forces this via its annotation scan; a field-only
+// program must force it here (the field's own TypeRef scan is not guaranteed to set the flag).
+function forceScalarListField(code: i32) {
+  if code == 25 { fa64Used = true }
+  if code == 26 { ia64Used = true }
+  if code == 27 { fa32Used = true }
+  0
+}
+
 function fieldTypeCode(tyIx: i32) {
   if tyIx < 0 { return -1 }
   // A NULLABLE-function field (`op: ((i32) => i32) | null`) stores a NULLABLE closure
@@ -19042,6 +19073,12 @@ function fieldTypeCode(tyIx: i32) {
       // A `string[]` field is a string-ref list (code `6`) — it reuses the map keys
       // list types (`mkListIdx`/`mkArrIdx`). Any OTHER `X[]` is a struct/union ref list.
       if nameIsStringArray(ty.tyName) { return 6 }
+      // A SCALAR-element list field stores its scalar-list wrapper (code 25/26/27), NOT a ref-list
+      // wrapper (code 5 is for struct/union/closure elements only — returning 5 here emitted the wrong
+      // heap type, the invalid-wasm hole).
+      if nameIsF64Array(ty.tyName) { return 25 }
+      if nameIsI64Array(ty.tyName) { return 26 }
+      if nameIsF32Array(ty.tyName) { return 27 }
       return 5
     }
     // A NULLABLE i32-list field (`rest: i32[] | null`) stores a NULLABLE ref to
@@ -19712,6 +19749,10 @@ function nameFieldCode(t: string) {
   if nameIsArray(t) {
     if nameIsI32Array(t) { return 4 }
     if nameIsStringArray(t) { return 6 }
+    // Scalar-element list fields (code 25/26/27), same as `fieldTypeCode`.
+    if nameIsF64Array(t) { return 25 }
+    if nameIsI64Array(t) { return 26 }
+    if nameIsF32Array(t) { return 27 }
     return 5
   }
   // A MAP-typed field (`m: {[string]: i32}`) — code 19, the name-level mirror of the
@@ -19849,6 +19890,7 @@ function internInlineShape(nm: string) {
   while pi < codes.length {
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
+    forceScalarListField(codes[pi])
     if codes[pi] == 16 {
       // The union FIELD's name keys its atom set; registering it interns the
       // shared box + the value-box reps it needs (this runs after `collectU`,
@@ -20316,6 +20358,7 @@ function collectS(stmts: i32[]) {
             if code == 16 {
               registerValueUnionName(fieldRefElemName(fnode.fdType))
             }
+            forceScalarListField(code)
             cnt = cnt + 1
           } else {
             return emitFail("emitProgram: malformed struct field")
@@ -22899,6 +22942,12 @@ function exprF32Array(exprIx: i32, fnIx: i32) {
     if globalIsF32Array(e.identName) { return true }
     // A CAPTURED f32-list read (incl. a boxed captured-mutated `f32` local). Kind 21 = f32 list.
     return capturedKindOf(fnIx, e.identName) == 21
+  }
+  // A struct-field READ of an `f32[]` field (code 27) — the checker's per-node type does not always
+  // carry f32[] through a member, so recognize it directly by the field code (the f64/i64 duals get
+  // this from their typed-IR fast path; this keeps f32 fields on par).
+  if e is Member {
+    if memberFieldCode(exprIx, fnIx) == 27 { return true }
   }
   if e is Call {
     // `xs.map(f)` / `xs.filter(p)` whose result element is f32 (mf-result kind 13) — a `.map`
