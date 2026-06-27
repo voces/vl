@@ -1198,9 +1198,7 @@ function letIsNulRefArray(letIx: i32, fnIx: i32) {
         // A value-union-element inner (`(i32|null)[] | null`) is excluded — its annotated-local value
         // build is not yet supported, so it falls through to a clean reject rather than the kind-18 path
         // (which traps). A struct / nested-array inner is fine. The INFERRED path below is unaffected.
-        if np != "" && nameIsRefArray(np) && parenUnionArrElemName(np) == "" {
-          return true
-        }
+        if np != "" && nameIsRefArray(np) { return true }
       }
       return false
     }
@@ -15140,6 +15138,13 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     // the element kind to pick the ref-list construction — record it for `emitArr`.
     pendingListKind = letAnnRefListKind(stmtIx)
     pendingListSlot = letAnnRefListSlot(stmtIx)
+    // A kind-18 nullable ref-array binding: a bare `null` init lowers as `ref.null $innerWrapper`. The list
+    // value seeds above (`pendingListKind`/`Slot`) build a non-null list; this seeds the null arm.
+    if localIsRef[slot] == 18 {
+      if pendingListSlot >= 0 && pendingListSlot < rlWrapIdx.length {
+        pendingNulRefHeap = rlWrapIdx[pendingListSlot]
+      }
+    }
     // An UN-annotated empty `[]` whose USAGE pins a string element (`const out = [];
     // out.push(self[i])`): seed the string-list kind so `emitArr` builds the string-list
     // wrapper, MATCHING the slot `collectLocals` typed (kind 7, via the same
@@ -15264,6 +15269,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     pendingListKind = 0
     pendingListSlot = 0
     pendingMapSlot = -1
+    pendingNulRefHeap = -1
     fbLocalSet(idx) // 0x21 local.set
     // Bind `name → slot` in the current emit-time frame AFTER emitting the init (so the
     // init resolved any same-named OUTER binding), making this binding live for the rest
@@ -16769,11 +16775,16 @@ function tyAnnRefListKind(tyIx: i32) {
   if tyIx >= 0 {
     const lt = P.nodes[tyIx]
     if lt is TypeRef {
-      if nameIsRefArray(lt.tyName) {
-        if refArrElemKind(lt.tyName) == 2 { return 2 }
+      // A NULLABLE ref-array annotation (`S[] | null`, kind 18) threads the same kind as its non-null ref
+      // array, so the value literal builds the list (a value-union inner -> kind 2 boxes its bare scalars).
+      let rln = lt.tyName
+      const rnp = nullablePartOf(rln)
+      if rnp != "" && nameIsRefArray(rnp) { rln = rnp }
+      if nameIsRefArray(rln) {
+        if refArrElemKind(rln) == 2 { return 2 }
         // A closure-element ref list (`((i32) => i32)[]`, kind 5) threads kind 5 so
         // `emitArr` builds the closure backing (not a struct-shape guess).
-        if refArrElemKind(lt.tyName) == 5 { return 5 }
+        if refArrElemKind(rln) == 5 { return 5 }
         return 1
       }
       if nameIsStringArray(lt.tyName) { return 3 }
@@ -16797,8 +16808,11 @@ function tyAnnRefListSlot(tyIx: i32) {
   if tyIx >= 0 {
     const lt = P.nodes[tyIx]
     if lt is TypeRef {
-      if nameIsRefArray(lt.tyName) {
-        let s = rlSlotByName(refArrElemName(lt.tyName))
+      let rln = lt.tyName
+      const rnp = nullablePartOf(rln)
+      if rnp != "" && nameIsRefArray(rnp) { rln = rnp }
+      if nameIsRefArray(rln) {
+        let s = rlSlotByName(refArrElemName(rln))
         if s >= 0 { return s }
       }
     }
@@ -19669,31 +19683,35 @@ function collectA(stmts: i32[]) {
         // (`aUsed`, since the elements are `(ref null $aTypeIdx)`).
         slUsed = true
         aUsed = true
-      } else if nameIsRefArray(nd.tyName) {
-        // A `S[]`/`N[]` annotation is a ref list (wrapper + `(ref null $elem)` backing).
-        // A `{[string]:i32}[]` (map-array) ALSO forces the map struct + its keys/vals
-        // list types (the element is `(ref $mStructIdx)`).
+      } else if nameIsRefArray(nd.tyName) || nameIsNulRefList(nd.tyName) {
+        // A `S[]`/`N[]` annotation is a ref list (wrapper + `(ref null $elem)` backing) — and so is its
+        // NULLABLE form `S[] | null` (kind 18): force the wrapper/backing on the NON-null ref-array name,
+        // so a bare local whose value does not self-collect the element (e.g. `(i32|null)[] | null = [5]`)
+        // still emits the element's ref-list type.
+        let ran = nd.tyName
+        const ranp = nullablePartOf(ran)
+        if ranp != "" && nameIsRefArray(ranp) { ran = ranp }
         rlUsed = true
         raUsed = true
-        rElemKind = refArrElemKind(nd.tyName)
-        ensureRefElem(refArrElemName(nd.tyName))
+        rElemKind = refArrElemKind(ran)
+        ensureRefElem(refArrElemName(ran))
         // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
         // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
-        if refArrElemKind(nd.tyName) == 4 {
+        if refArrElemKind(ran) == 4 {
           lUsed = true
           aUsed = true
         }
         // A nested NON-i32 scalar / string 2D array (`string[][]`/`f64[][]`/`i64[][]`, element
         // kinds 6/7/8) forces its INNER list's backing+wrapper, as the LIST-valued map path
         // does — else the element wrapper heap (`mkListIdx`/`fl64`/`il64`) is never allocated.
-        if refArrElemKind(nd.tyName) == 6 {
+        if refArrElemKind(ran) == 6 {
           slUsed = true
           aUsed = true
         }
-        if refArrElemKind(nd.tyName) == 7 { fa64Used = true }
-        if refArrElemKind(nd.tyName) == 10 { fa32Used = true }
-        if refArrElemKind(nd.tyName) == 8 { ia64Used = true }
-        if nameIsMapArray(nd.tyName) {
+        if refArrElemKind(ran) == 7 { fa64Used = true }
+        if refArrElemKind(ran) == 10 { fa32Used = true }
+        if refArrElemKind(ran) == 8 { ia64Used = true }
+        if nameIsMapArray(ran) {
           mUsed = true
           lUsed = true
           aUsed = true
