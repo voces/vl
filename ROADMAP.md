@@ -37,6 +37,32 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 
 ## Next (highest leverage)
 
+- ⬜ **Emitter rep architecture — reduce the structural↔nominal / kind-scheme special-casing.** The
+  recurring smell (see `DECISIONS.md` if expanded): the checker is **structural** (`{x:i32}`), the
+  emitter is **nominal** (keyed by name in `structIndexByName`/`rlSlotByName`), and the same wasm rep
+  families are enumerated in **3+ numbering schemes** (`vtKind`, `sigKeyRetKind`, mf-result-kinds) with
+  translation functions between them. Plan, in order of leverage:
+  1. ⬜ **Structural-tolerant emitter (incremental, low-risk).** Migrate nominal-only resolvers to the
+     structural-aware `structIndexOfTypeName` (tries nominal first, then field-set match) so the
+     structural→nominal bridge is centralized, not re-added per consumer. Do it opportunistically when
+     touching a site; gate each step (fixpoint + corpus + suite). Migrating a resolver is
+     behavior-preserving for nominal names (`structIndexOfTypeName` tries `structIndexByName` first) and
+     only ADDS resolution for structural shapes — so the gate validates safety even where the fixpoint
+     (i32-only) can't. **First target — inline-shape nested struct field — DONE (#665):**
+     `collectNestedFieldShapes` pre-pass + `fieldTypeCode`/`fieldRefElemName` resolving via
+     `structIndexOfTypeName`. The remaining `structIndexByName` sites stay nominal-only for now — migrate
+     each opportunistically when a structural name actually reaches it (premature otherwise: today they
+     all receive nominal names, so a blanket swap is a no-op with risk).
+  2. ⬜ **Differential / fuzz tester for the NON-i32 reps (highest leverage — do before the rewrite).**
+     The self-compile fixpoint can't validate the rep layer (the compiler is i32-only — never exercises
+     floats/unions/closures/nullables), so the corpus is the only net and it has gaps. A property tester
+     that generates programs over the non-i32 reps de-risks every later rep change.
+  3. ⬜ **`repOf(type) → descriptor` unification (the "rewrite") — strangler, NOT big-bang.** One
+     structurally-keyed descriptor {valtype, heapIdx, nullRep, sigToken, listResultKind, …} that every
+     site consults; introduce + delegate + migrate site-by-site (each gated) + delete the old schemes.
+     Gate on: (a) a gap that needs touching 3+ schemes at once, (b) the type×position matrix mostly
+     closed so the descriptor shape is stable, (c) the tester from (2) in place. Recursive structural
+     types (canonical key terminating on cycles) is the main hazard.
 - ✅ **Kill the TS host. DONE — the TWO COMPILERS are now one.** The TS compiler core
   (`compiler/*.ts` front end + `cli.ts` + the `checker-parity-sweep.ts` oracle) is DELETED; the
   self-hosted `compiler/*.vl` (the wasm seed) is the sole compiler. Got here in stages:
