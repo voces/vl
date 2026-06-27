@@ -13457,6 +13457,40 @@ function emitPopOr(body: i32[], popIx: i32, defIx: i32, fnIx: i32) {
 // materializes it the same way). The result element kind is the callback's RETURN
 // kind for `map` (an i32→bool callback yields a bool/i32-element list; an f64
 // callback the f64 backing + wrapper), the receiver's element kind for `filter`.
+// The interned `$fnsig` KEY of a `.map`/`.filter` callback that is a CLOSURE VALUE — a function-typed
+// param or binding (`xs.map(f)` with `f: (i32) => i32`), NOT a literal lambda / named function (those
+// resolve a lifted `mfCallbackFe`). "" otherwise. Lets `.map`/`.filter` accept a runtime callback (the
+// `call_ref` loop already does), so a higher-order function can forward a callback to `.map`.
+function mfCallbackCloKey(cbIx: i32, fnIx: i32) {
+  const cb = P.nodes[unwrapParen(cbIx)]
+  if cb is Ident {
+    if fnIndexOf(cb.identName) >= 0 {
+      return "" // a named fn — uses the lifted-fe path
+    }
+    return calleeCloSigKey(cb.identName, fnIx)
+  }
+  ""
+}
+
+// Map a closure SIG-RETURN kind (`sigKeyRetKind`) to a `.map` RESULT element kind (`mfResultKindOf`'s
+// codes), for a SCALAR-returning closure-value callback. -1 for a struct / ref / void return (those
+// need the result ref-list slot — not yet wired for a closure-value callback).
+function mfResKindFromSigRet(k: i32) {
+  if k == 0 {
+    return 0 // i32
+  }
+  if k == 11 {
+    return 1 // f64 (mf result kind 1)
+  }
+  if k == 10 {
+    return 4 // i64 (mf result kind 4)
+  }
+  if k == 3 {
+    return 3 // string
+  }
+  -1
+}
+
 function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
   let c = P.nodes[callIx]
   if c is Call {
@@ -13478,10 +13512,20 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
       // result backing/wrapper + the matching dst scratch local. -1 for a non-ref result.
       const dstSlot = mfResultSlotOf(callIx, fnIx)
       const cbFe = mfCallbackFe(c.callArgs[0], fnIx)
-      if cbFe < 0 {
-        return emitFail("emitProgram: unsupported .map/.filter callback")
+      let sig = -1
+      if cbFe >= 0 {
+        sig = fnSigIdxOfFn(cbFe)
+      } else {
+        // A CLOSURE-VALUE callback (a function-typed param/binding — `xs.map(f)` where
+        // `f: (i32) => i32`): no lifted fe to inline, so resolve the interned sig from the closure's
+        // own `$fnsig` key. The loop `call_ref`s the closure value (emitted into `cL` below via the
+        // Ident path) exactly as for a named-function callback — enabling callback-passing HOFs.
+        const ck = mfCallbackCloKey(c.callArgs[0], fnIx)
+        if ck != "" {
+          const cp = cloSigPosOfKey(ck)
+          if cp >= 0 { sig = cloSigBase + cp }
+        }
       }
-      let sig = fnSigIdxOfFn(cbFe)
       if sig < 0 {
         return emitFail("emitProgram: .map/.filter callback signature is not interned")
       }
@@ -24170,7 +24214,13 @@ function mfResultKindOf(callIx: i32, fnIx: i32) {
       }
       if c.callArgs.length == 1 {
         let fe = mfCallbackFe(c.callArgs[0], fnIx)
-        if fe < 0 { return -1 }
+        if fe < 0 {
+          // A CLOSURE-VALUE callback (`xs.map(f)`, `f` a function-typed param/binding) — its result
+          // kind comes from the closure's sig RETURN token, not a lifted fe (scalar returns only).
+          const ck = mfCallbackCloKey(c.callArgs[0], fnIx)
+          if ck != "" { return mfResKindFromSigRet(sigKeyRetKind(ck)) }
+          return -1
+        }
         // A string-returning callback maps to a string-list result (kind 3) — checked first
         // since `cloRetKindOf` folds string into -1.
         if cloRetIsString(fe) { return 3 }
