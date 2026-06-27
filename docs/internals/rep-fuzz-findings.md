@@ -25,12 +25,31 @@ A valid program that compiles to bytes failing wasm validation / trapping, not a
 - **Struct inside list / nullable-list** ("field access receiver is not a struct"):
   `({f: f64} | null)[]`, `{f: {f: f64}[]}`, `{f: {f: {f: i32}[]}}`. The field-access classifier loses the
   struct through a list element or a nullable-list element.
-- **Deep nested struct** ("nested struct fields are not supported"): `{f: {f: {f: f64}}}` — 3-level
-  inline-shape struct nesting (2-level works via #665; the third level or the f64 leaf is the boundary).
+## FIXED
+- **Same-field-name nested inline struct** (#668): `{f: {f: {f: i32}}}` failed while `{f: {g: {h: i32}}}`
+  worked — the structural shape dedup (`annShapeIndexOf`) keyed each field on NAME + type CODE only, so a
+  same-name recursion produced an identical `(f, code 15)` signature at every level and the outer shape
+  collapsed onto the middle one. Fix: the dedup also compares each ref field's ELEMENT type. A clean LOGIC
+  bug (not a rep gap), which is why it was cleanly fixable. Closed the "nested struct fields" family 7→1.
+  #665's `Deep = {a:{b:{c}}}` used distinct names, so it never exercised same-name nesting.
+
+## Why the rest resist patching (evidence from attempted fixes)
+The fuzzer's nullable ctor emits the child VALUE, never a bare `null` — so every remaining failure is a
+genuine DEEP-COMPOSITION rep gap (3–4 nested wrappers). Shared root (3 independent diagnoses agreed):
+**rep resolution + interning don't recurse through composition boundaries.**
+
+Attempts to convert the invalid-wasm holes into clean rejects (tightening `fieldTypeCode` /
+`nameFieldCode`, rejecting un-internable shapes in `collectAnnShapes`) all OVER-REJECTED — the support
+matrix is irregular and any blanket rule catches valid programs:
+- `i32[][]` as a struct field WORKS (`lists/struct-field-pop-statement.vl`); `f64[][]` does NOT — the leaf
+  scalar type matters, so "reject nested-array fields" breaks the working i32 case.
+- generic shapes `{first: B, second: A}` (`generics/swap.vl`) and union-of-shapes `{x:i32}|{y:i32}`
+  (`types/ref-union.vl`) fail `internInlineShape` but are valid (monomorphization / union box).
+
+So: **don't patch these piecemeal** — each patch needs more special-casing and has wide blast radius. They
+are the strangler-fig REP REWRITE (emitter resolves type→rep RECURSIVELY + structurally), with THIS fuzzer
+as the differential tester. The i32-only self-compile fixpoint is blind to the entire rep layer.
 
 ## Notes
 - These are CANDIDATES for freezing into `tests/cases/` once fixed (each case is already a valid
   self-describing `.vl` with a `// @log`). The fuzzer emits exactly that form.
-- Fix order suggestion: the soundness holes first (invalid wasm > clean reject), then the families by
-  frequency. Several share a root — the rep machinery losing a type through one composition layer (the
-  structural↔nominal / kind-scheme special-casing the ROADMAP rep-architecture track is about).
