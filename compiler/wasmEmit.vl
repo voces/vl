@@ -10331,6 +10331,37 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
           }
         }
       }
+      // GENERIC nullable-STRUCT `??`: a `S | null` value — an ident / param binding, a struct FIELD,
+      // OR a closure / factory CALL (`arr[i](x) ?? d`) — coalesced with a struct default. Evaluated
+      // ONCE: `br_on_non_null` keeps the non-null struct or falls through to the default, so it needs
+      // NEITHER a re-eval (the ident / field forms) NOR a per-struct stash slot (the call form) — one
+      // path for every source, unlike the `string | null` paths split into re-eval + stash. The
+      // closing piece of nullable-struct closures (#655/#656): `structIndexOfExpr` resolves the inner
+      // struct (incl. an indexed closure-array / factory call via the checker-type fallback) for the
+      // block's result type. (A `string | null` LHS is handled by its own paths above.)
+      if exprNullableStruct(e.binLeft, fnIx) {
+        const csi = structIndexOfExpr(e.binLeft, fnIx)
+        if csi >= 0 && csi < sHeapIdx.length {
+          wU8(2)   // 0x02 block
+          wU8(100) // blocktype: (ref $struct) — the non-null result
+          wSLEB(sHeapIdx[csi])
+          ctrlEnter()
+          if emitExpr(body, e.binLeft, fnIx) < 0 {
+            return -1 // the nullable struct ref, evaluated ONCE
+          }
+          wU8(214) // 0xd6 br_on_non_null
+          wULEB(0) //   non-null → branch to the block end with the (ref $struct)
+          // null path: emit the default, seeding an ObjLit default to this struct.
+          const savedPsi = pendingStructIdx
+          pendingStructIdx = csi
+          const dres = emitExpr(body, e.binRight, fnIx)
+          pendingStructIdx = savedPsi
+          if dres < 0 { return -1 }
+          wU8(11) // 0x0b end
+          ctrlLeave()
+          return 0
+        }
+      }
       return emitFail("emitProgram: `??` is only supported on a map index get")
     }
     // Short-circuit logical operators lower to a VALUE-TYPED `if` (blocktype 0x7f),
@@ -20855,6 +20886,13 @@ function exprStruct(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cms = coalesceMvSlot(exprIx, fnIx)
     if cms >= 0 { return mvValKind[cms] == 1 }
+    // A `<S|null> ?? <S>` coalesce yields the non-null struct (the generic nullable-struct `??` emit) —
+    // so a bound `const p = r ?? d` classifies struct and `(r ?? d).x` resolves. The left is the
+    // nullable struct; the right is a plain struct default.
+    if e.binOp == "??" {
+      if exprNullableStruct(e.binLeft, fnIx) { return true }
+      return exprStruct(e.binRight, fnIx)
+    }
   }
   if e is Call {
     const callee = P.nodes[e.callFn]
@@ -21257,6 +21295,13 @@ function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     const cms = coalesceMvSlot(exprIx, fnIx)
     if cms >= 0 {
       if mvValKind[cms] == 1 { return mvValStructIdx[cms] }
+    }
+    // A `<S|null> ?? <S>` coalesce resolves to the (inner) struct index — so `(r ?? d).field` finds
+    // the layout. The left's nullable struct drives it (its inner struct), else the right default.
+    if e.binOp == "??" {
+      const ls = structIndexOfExpr(e.binLeft, fnIx)
+      if ls >= 0 { return ls }
+      return structIndexOfExpr(e.binRight, fnIx)
     }
   }
   if e is Call {
