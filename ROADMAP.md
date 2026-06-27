@@ -48,16 +48,11 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
      touching a site; gate each step (fixpoint + corpus + suite). Migrating a resolver is
      behavior-preserving for nominal names (`structIndexOfTypeName` tries `structIndexByName` first) and
      only ADDS resolution for structural shapes — so the gate validates safety even where the fixpoint
-     (i32-only) can't.
-     - ⬜ **Known structural-name bug — inline-shape NESTED struct field.** `type Box = { inner: {x:i32} }`
-       fails ("only i32/boolean/string/array struct fields are supported"); the nominal `inner: Inner`
-       works. DEEPER than a resolver swap: the field interner (`collectS`/`fieldTypeCode`, and the
-       string-keyed `internShapeAs`) runs BEFORE the nested inline shape `{x:i32}` is interned
-       (`collectAnnShapes` runs after), and it can't be interned mid-field-loop without corrupting the
-       flat `sField*` arrays. Needs a nested-shape PRE-PASS (collect inline shapes depth-first before the
-       struct decls that reference them), then resolve fields via `structIndexOfTypeName`. The
-       shape-matches-a-declared-struct sub-case (`type P={x:i32}; type Box={inner:{x:i32}}`) is the
-       easy half (P already interned). Bare inline nesting needs the pre-pass.
+     (i32-only) can't. **First target — inline-shape nested struct field — DONE (#665):**
+     `collectNestedFieldShapes` pre-pass + `fieldTypeCode`/`fieldRefElemName` resolving via
+     `structIndexOfTypeName`. The remaining `structIndexByName` sites stay nominal-only for now — migrate
+     each opportunistically when a structural name actually reaches it (premature otherwise: today they
+     all receive nominal names, so a blanket swap is a no-op with risk).
   2. ⬜ **Differential / fuzz tester for the NON-i32 reps (highest leverage — do before the rewrite).**
      The self-compile fixpoint can't validate the rep layer (the compiler is i32-only — never exercises
      floats/unions/closures/nullables), so the corpus is the only net and it has gaps. A property tester
