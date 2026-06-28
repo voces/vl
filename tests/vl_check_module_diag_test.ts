@@ -77,6 +77,14 @@ Deno.test({
       if (!/helper\.vl: error \[2:/.test(r.out)) {
         throw new Error(`expected \`helper.vl: error [2:...]\`, got:\n${r.out}`);
       }
+      // The message names the SOURCE binding `wrong`, never the module-merge mangle
+      // `wrong$m1` — `vcDiagMsg` demangles the `$mN` rename artifact.
+      if (!/'wrong'/.test(r.out)) {
+        throw new Error(`expected the source name 'wrong' in the message, got:\n${r.out}`);
+      }
+      if (/\$m\d/.test(r.out)) {
+        throw new Error(`a module-merge mangle ($mN) leaked into the message:\n${r.out}`);
+      }
       if (r.code === 0) {
         throw new Error(`expected a non-zero exit (type error), got 0:\n${r.out}`);
       }
