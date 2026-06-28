@@ -1,7 +1,7 @@
 import { Diag, Tok } from "./ast"
 import { advance, gSrc, mkTok, scanQuoted } from "./lexer"
 import { accept, parseExpr, parseProgram, parseStmt, parseType, parseTypeName } from "./parser"
-import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, nodeTyIsUnion, nodeUnionName, nodeTyIsObj, nodeTyIsNullableStruct, nameIsLitUnionType, nodeLitUnionMemberTexts, nodeTyIsLitUnion, nodeTyIsNullableString, nodeNulStructInnerName, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
+import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, nodeTyIsUnion, nodeUnionName, nodeTyIsObj, nodeTyIsNullableStruct, nameIsLitUnionType, anyLitUnionUsed, nodeLitUnionMemberTexts, nodeTyIsLitUnion, nodeTyIsNullableString, nodeNulStructInnerName, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
 import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkBlock, mkCall, mkCallN, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkLet, mkMember, mkIndex, mkArrayLit, mkNum, mkParam, mkParen, mkReturn, mkStr, mkTypeRef, mkWhile, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 // VL-in-VL wasm emitter — self-hosted codegen spike.
 //
@@ -3599,6 +3599,7 @@ function exprIsStrConcat(binIx: i32, fnIx: i32) {
 // atom widens to its member string (`emitAtomToStr`), which rides the string-op scratch frame.
 // An over-approximation (any atom arg + any `string` param) is fine: it only reserves a frame.
 function callWidensAtomToStr(callIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
   const c = P.nodes[callIx]
   if c is Call {
     const callee = P.nodes[c.callFn]
@@ -3632,6 +3633,7 @@ function callWidensAtomToStr(callIx: i32, fnIx: i32) {
 // local, global, or struct field) — the atom widens to its member string, riding the string-op
 // scratch frame. `exprString` over the TARGET uniformly covers all three lvalue forms.
 function assignWidensAtomToStr(binIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
   const a = P.nodes[binIx]
   if a is BinExpr {
     if a.binOp == "=" {
@@ -3663,6 +3665,7 @@ function globalInitIsLitAtom(initIx: i32) {
 // True if the global at `letIx` is a `string` cell (kind 3) initialized with a literal-union atom
 // — it widens to its member string in the start function, riding the string-op scratch frame.
 function globalInitWidensAtomToStr(letIx: i32) {
+  if gLitUnionUsed == 0 { return false }
   if letIx < 0 { return false }
   const gk = globalCellKind(letIx)
   if gk != 3 && gk != 16 { return false }
@@ -3677,6 +3680,7 @@ function globalInitWidensAtomToStr(letIx: i32) {
 // True if the binding at `letIx` is annotated `: string` and initialized with a literal-union
 // atom — it widens to its member string at the init, riding the string-op scratch frame.
 function letWidensAtomToStr(letIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
@@ -3691,6 +3695,7 @@ function letWidensAtomToStr(letIx: i32, fnIx: i32) {
 // True if `retArgIx` is a literal-union atom returned from a `string`-typed function (`fnIx`'s
 // `fnRet`) — it widens to its member string at the return, riding the string-op scratch frame.
 function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
   if retArgIx < 0 { return false }
   if fnIx < 0 { return false }
   const fn = P.nodes[fnIx]
@@ -20971,9 +20976,17 @@ let litAtomNext: i32 = 0
 // interned i32 id instead of a string. The atom analogue of `pendingNulString`.
 let pendingLitUnion: i32 = 0
 
+// Whether the module uses ANY literal-union type (named or inline). Set ONCE per program by a single
+// `P.nodes` scan; every per-node litunion detector (`exprIsLitAtom`, the `*WidensAtomToStr` predicates)
+// early-outs on it, so a program with no literal unions — e.g. the self-hosted compiler — pays none of
+// the per-node atom-detection cost during the str-op scan / classification.
+let gLitUnionUsed: i32 = 0
+
 function resetLitAtoms() {
   litAtomId = Map()
   litAtomNext = 0
+  gLitUnionUsed = 0
+  if anyLitUnionUsed() { gLitUnionUsed = 1 }
   0
 }
 
@@ -21003,6 +21016,7 @@ function letIsLitUnion(letIx: i32) {
 // True if `exprIx` is a literal-union ATOM VALUE (an i32 id) — a litunion-flagged local or a litunion-
 // annotated param. Distinguishes a real atom from a checker-inferred literal union (which is a string).
 function exprIsLitAtom(exprIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Ident {
     const slot = declaredSlotOf(e.identName)
