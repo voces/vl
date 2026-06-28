@@ -330,6 +330,7 @@ import {
 } from "./emit_query"
 import {
   Emitter,
+  MfKind,
   W,
   aTypeIdx,
   aUsed,
@@ -7231,7 +7232,7 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
 // `emitMapDelete` tombstones + amortized-`emitMapCompact`s.
 
 // Record a distinct (kind, ref-list slot) source frame requirement.
-function mfRecordSrc(kind: i32, slot: i32) {
+function mfRecordSrc(kind: MfKind, slot: i32) {
   let i = 0
   while i < mfSrcKinds.length {
     if mfSrcKinds[i] == kind && mfSrcSlots[i] == slot { return 0 }
@@ -7245,7 +7246,7 @@ function mfRecordSrc(kind: i32, slot: i32) {
 // Record a distinct (result-element-kind, ref-list slot) dest frame requirement. `slot` is the
 // ref-list table slot for a kind-2 (ref-list) dest (so two struct-array filters of DIFFERENT
 // element types get distinct backing locals), -1 for a non-ref dest.
-function mfRecordDst(kind: i32, slot: i32) {
+function mfRecordDst(kind: MfKind, slot: i32) {
   let i = 0
   while i < mfDstKinds.length {
     if mfDstKinds[i] == kind && mfDstSlots[i] == slot { return 0 }
@@ -7257,7 +7258,7 @@ function mfRecordDst(kind: i32, slot: i32) {
 }
 
 // The wasm local holding the SOURCE wrapper ref for (kind, slot), or -1.
-function mfSrcLocalFor(kind: i32, slot: i32) {
+function mfSrcLocalFor(kind: MfKind, slot: i32) {
   let i = 0
   while i < mfSrcKinds.length {
     if mfSrcKinds[i] == kind && mfSrcSlots[i] == slot {
@@ -7269,7 +7270,7 @@ function mfSrcLocalFor(kind: i32, slot: i32) {
 }
 
 // The wasm local holding the DEST backing ref for result (kind, slot), or -1.
-function mfDstLocalFor(kind: i32, slot: i32) {
+function mfDstLocalFor(kind: MfKind, slot: i32) {
   let i = 0
   while i < mfDstKinds.length {
     if mfDstKinds[i] == kind && mfDstSlots[i] == slot {
@@ -7294,13 +7295,13 @@ function mfScan(ix: i32, fnIx: i32) {
       if callee.memProp == "map" || callee.memProp == "filter" {
         if n.callArgs.length == 1 {
           let rk = mfRecvKindOf(callee.memObj, fnIx)
-          if rk >= 0 {
+          if rk != null {
             fnUsesMapFilter = true
             let slot = -1
-            if rk == 2 { slot = refListSlotOfExpr(callee.memObj, fnIx) }
+            if rk == "ref" { slot = refListSlotOfExpr(callee.memObj, fnIx) }
             mfRecordSrc(rk, slot)
             const resK = mfResultKindOf(ix, fnIx)
-            if resK >= 0 { mfRecordDst(resK, mfResultSlotOf(ix, fnIx)) }
+            if resK != null { mfRecordDst(resK, mfResultSlotOf(ix, fnIx)) }
           }
         }
       }
@@ -7311,10 +7312,10 @@ function mfScan(ix: i32, fnIx: i32) {
       if callee.memProp == "slice" {
         if n.callArgs.length == 1 || n.callArgs.length == 2 {
           let rk = mfRecvKindOf(callee.memObj, fnIx)
-          if rk >= 0 {
+          if rk != null {
             fnUsesMapFilter = true
             let slot = -1
-            if rk == 2 { slot = refListSlotOfExpr(callee.memObj, fnIx) }
+            if rk == "ref" { slot = refListSlotOfExpr(callee.memObj, fnIx) }
             mfRecordSrc(rk, slot)
             mfRecordDst(rk, slot)
           }
@@ -10613,7 +10614,7 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
       // closure-calling loop (Slices 3–4). A non-list receiver falls through (a
       // function-valued struct FIELD named `map` is a `call_ref` member call).
       if callee.memProp == "map" || callee.memProp == "filter" {
-        if mfRecvKindOf(callee.memObj, fnIx) >= 0 {
+        if mfRecvKindOf(callee.memObj, fnIx) != null {
           return emitMapFilter(body, exprIx, fnIx)
         }
       }
@@ -14571,23 +14572,13 @@ function mfCallbackCloKey(cbIx: i32, fnIx: i32) {
 // Map a closure SIG-RETURN kind (`sigKeyRetKind`) to a `.map` RESULT element kind (`mfResultKindOf`'s
 // codes), for a closure-value callback. A STRUCT return (1) maps to a ref-list result (2) — its slot
 // comes from `mfResultSlotOf`'s closure-value branch. -1 for a void / still-unwired ref kind.
-function mfResKindFromSigRet(k: i32) {
-  if k == 0 {
-    return 0 // i32
-  }
-  if k == 11 {
-    return 1 // f64 (mf result kind 1)
-  }
-  if k == 10 {
-    return 4 // i64 (mf result kind 4)
-  }
-  if k == 3 {
-    return 3 // string
-  }
-  if k == 1 {
-    return 2 // struct → a NEW ref list of the result struct (slot via `mfResultSlotOf`)
-  }
-  -1
+function mfResKindFromSigRet(k: i32): MfKind | null {
+  if k == 0 { return "i32" }
+  if k == 11 { return "f64" }
+  if k == 10 { return "i64" }
+  if k == 3 { return "str" }
+  if k == 1 { return "ref" }
+  null
 }
 
 // The struct-TABLE index in a closure sig key's `>s<idx>;` result token (a struct-returning callback),
@@ -14626,11 +14617,11 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         return emitFail("emitProgram: .map/.filter takes exactly one callback argument")
       }
       const recvK = mfRecvKindOf(callee.memObj, fnIx)
-      if recvK < 0 {
+      if recvK == null {
         return emitFail("emitProgram: .map/.filter receiver is not a supported list")
       }
       const resK = mfResultKindOf(callIx, fnIx)
-      if resK < 0 {
+      if resK == null {
         return emitFail("emitProgram: unsupported .map/.filter element type")
       }
       // The ref-list slot for a kind-2 result (`.filter` over a struct array) — picks the
@@ -14660,7 +14651,7 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
       let srcBack = aTypeIdx
       let srcElemRef = false
       let srcSlot = -1
-      if recvK == 1 {
+      if recvK == "f64" {
         if !fa64Used {
           return emitFail(
             "emitProgram: .map/.filter over f64[] but f64 list type not collected",
@@ -14668,7 +14659,7 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         }
         srcWrap = fl64TypeIdx
         srcBack = fa64TypeIdx
-      } else if recvK == 4 {
+      } else if recvK == "i64" {
         if !ia64Used {
           return emitFail(
             "emitProgram: .map/.filter over i64[] but i64 list type not collected",
@@ -14676,7 +14667,7 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         }
         srcWrap = il64TypeIdx
         srcBack = ia64TypeIdx
-      } else if recvK == 13 {
+      } else if recvK == "f32" {
         if !fa32Used {
           return emitFail(
             "emitProgram: .map/.filter over f32[] but f32 list type not collected",
@@ -14684,7 +14675,7 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         }
         srcWrap = fl32TypeIdx
         srcBack = fa32TypeIdx
-      } else if recvK == 2 {
+      } else if recvK == "ref" {
         if !rlUsed {
           return emitFail(
             "emitProgram: .map/.filter over a ref list but ref list type not collected",
@@ -14694,7 +14685,7 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         srcWrap = rlWrapIdx[srcSlot]
         srcBack = rlBackIdx[srcSlot]
         srcElemRef = true
-      } else if recvK == 3 {
+      } else if recvK == "str" {
         // A STRING list: wrapper `$mkListIdx`, backing `$mkArrIdx` (the array of string
         // refs). The element is itself a ref (an `array i32` of code points), so it needs
         // `ref.as_non_null` after `array.get`, exactly like a ref-list element.
@@ -14712,7 +14703,7 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
       // The RESULT wrapper/backing heap types.
       let dstWrap = lTypeIdx
       let dstBack = aTypeIdx
-      if resK == 1 {
+      if resK == "f64" {
         if !fa64Used {
           return emitFail(
             "emitProgram: .map result is f64[] but f64 list type not collected",
@@ -14720,7 +14711,7 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         }
         dstWrap = fl64TypeIdx
         dstBack = fa64TypeIdx
-      } else if resK == 4 {
+      } else if resK == "i64" {
         if !ia64Used {
           return emitFail(
             "emitProgram: .map result is i64[] but i64 list type not collected",
@@ -14728,7 +14719,7 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         }
         dstWrap = il64TypeIdx
         dstBack = ia64TypeIdx
-      } else if resK == 13 {
+      } else if resK == "f32" {
         if !fa32Used {
           return emitFail(
             "emitProgram: .map result is f32[] but f32 list type not collected",
@@ -14736,7 +14727,7 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         }
         dstWrap = fl32TypeIdx
         dstBack = fa32TypeIdx
-      } else if resK == 3 {
+      } else if resK == "str" {
         // A STRING-list result: a `.filter` over a string list, or a `.map` whose callback
         // returns a string. The backing `$mkArrIdx` holds string refs; `array.set` stores
         // the callback's (non-null) string result directly.
@@ -14747,7 +14738,7 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
         }
         dstWrap = mkListIdx
         dstBack = mkArrIdx
-      } else if resK == 2 {
+      } else if resK == "ref" {
         // A REF-list result (a `.filter` over a struct/union array preserves the element type):
         // the result is the SAME ref list as the source, so its wrapper/backing come from the
         // result slot (== the source slot for `.filter`).
@@ -14918,15 +14909,15 @@ function emitArrSlice(body: i32[], callIx: i32, fnIx: i32) {
     const callee = P.nodes[c.callFn]
     if callee is Member {
       const recvK = mfRecvKindOf(callee.memObj, fnIx)
-      if recvK < 0 {
+      if recvK == null {
         return emitFail("emitProgram: .slice receiver is not a supported list")
       }
       let srcSlot = -1
-      if recvK == 2 { srcSlot = refListSlotOfExpr(callee.memObj, fnIx) }
+      if recvK == "ref" { srcSlot = refListSlotOfExpr(callee.memObj, fnIx) }
       // The element kind's wrapper + backing heap types.
       let wrap = lTypeIdx
       let back = aTypeIdx
-      if recvK == 1 {
+      if recvK == "f64" {
         if !fa64Used {
           return emitFail(
             "emitProgram: .slice over f64[] but f64 list type not collected",
@@ -14934,7 +14925,7 @@ function emitArrSlice(body: i32[], callIx: i32, fnIx: i32) {
         }
         wrap = fl64TypeIdx
         back = fa64TypeIdx
-      } else if recvK == 4 {
+      } else if recvK == "i64" {
         if !ia64Used {
           return emitFail(
             "emitProgram: .slice over i64[] but i64 list type not collected",
@@ -14942,7 +14933,7 @@ function emitArrSlice(body: i32[], callIx: i32, fnIx: i32) {
         }
         wrap = il64TypeIdx
         back = ia64TypeIdx
-      } else if recvK == 13 {
+      } else if recvK == "f32" {
         if !fa32Used {
           return emitFail(
             "emitProgram: .slice over f32[] but f32 list type not collected",
@@ -14950,7 +14941,7 @@ function emitArrSlice(body: i32[], callIx: i32, fnIx: i32) {
         }
         wrap = fl32TypeIdx
         back = fa32TypeIdx
-      } else if recvK == 2 {
+      } else if recvK == "ref" {
         if !rlUsed {
           return emitFail(
             "emitProgram: .slice over a ref list but ref list type not collected",
@@ -14958,7 +14949,7 @@ function emitArrSlice(body: i32[], callIx: i32, fnIx: i32) {
         }
         wrap = rlWrapIdx[srcSlot]
         back = rlBackIdx[srcSlot]
-      } else if recvK == 3 {
+      } else if recvK == "str" {
         if !slUsed {
           return emitFail(
             "emitProgram: .slice over string[] but string list type not collected",
@@ -14982,7 +14973,7 @@ function emitArrSlice(body: i32[], callIx: i32, fnIx: i32) {
       const auxL = mfScratchBase + 2
       // src = <receiver>, evaluated ONCE (a NARROWED nullable i32 list recovers non-null).
       if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-      if recvK == 0 {
+      if recvK == "i32" {
         if exprNullableList(callee.memObj, fnIx) {
           wU8(212) // 0xd4 ref.as_non_null
         }
@@ -23885,11 +23876,13 @@ function exprArray(exprIx: i32, fnIx: i32) {
     // result ELEMENT kind is i32/boolean (map: the callback's return kind; filter:
     // the receiver's element kind).
     if callIsMapFilter(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == 0
+      return mfResultKindOf(exprIx, fnIx) == "i32"
     }
     // `xs.slice(...)` yields the same list kind as its receiver — an i32 list iff the
     // receiver is one.
-    if callIsArrSlice(exprIx, fnIx) { return mfResultKindOf(exprIx, fnIx) == 0 }
+    if callIsArrSlice(exprIx, fnIx) {
+      return mfResultKindOf(exprIx, fnIx) == "i32"
+    }
     // `m.values()` over an i32-valued map yields an i32 list.
     if mapValuesResultKind(exprIx, fnIx) == 2 { return true }
     return false
@@ -24007,7 +24000,7 @@ function exprRefArray(exprIx: i32, fnIx: i32) {
     }
     // A `.filter` over a struct/union array yields the SAME ref list (kind 2).
     if callee is Member {
-      if mfResultKindOf(exprIx, fnIx) == 2 { return true }
+      if mfResultKindOf(exprIx, fnIx) == "ref" { return true }
     }
     // `m.values()` over a struct- / nested-list- / nested-map-valued map yields a ref list.
     if mapValuesResultKind(exprIx, fnIx) == 5 { return true }
@@ -24353,7 +24346,9 @@ function exprStringArray(exprIx: i32, fnIx: i32) {
     // An INDEXED closure call `fs[i](x)` whose element signature returns `string[]`.
     if cloArrCallRetKind(exprIx, fnIx) == 7 { return true }
     // `xs.slice(...)` over a string list yields a string list.
-    if callIsArrSlice(exprIx, fnIx) { return mfResultKindOf(exprIx, fnIx) == 3 }
+    if callIsArrSlice(exprIx, fnIx) {
+      return mfResultKindOf(exprIx, fnIx) == "str"
+    }
     // `m.keys()` over a string-keyed map yields a string list of its keys.
     const kcallee = P.nodes[e.callFn]
     if kcallee is Member {
@@ -24542,10 +24537,12 @@ function exprF64Array(exprIx: i32, fnIx: i32) {
     // `__array_new__(n, <f64 fill>)` yields an f64 list.
     if arrNewIntrKind(exprIx, fnIx) == 1 { return true }
     if callIsMapFilter(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == 1
+      return mfResultKindOf(exprIx, fnIx) == "f64"
     }
     // `xs.slice(...)` over an f64 list yields an f64 list.
-    if callIsArrSlice(exprIx, fnIx) { return mfResultKindOf(exprIx, fnIx) == 1 }
+    if callIsArrSlice(exprIx, fnIx) {
+      return mfResultKindOf(exprIx, fnIx) == "f64"
+    }
     // An INDEXED closure call `fs[i](x)` whose element signature returns `f64[]`.
     if cloArrCallRetKind(exprIx, fnIx) == 12 { return true }
     const callee = P.nodes[e.callFn]
@@ -24631,11 +24628,11 @@ function exprF32Array(exprIx: i32, fnIx: i32) {
     // `xs.map(f)` / `xs.filter(p)` whose result element is f32 (mf-result kind 13) — a `.map`
     // with an f32-returning callback, or a `.filter` over an f32 list (preserves the element).
     if callIsMapFilter(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == 13
+      return mfResultKindOf(exprIx, fnIx) == "f32"
     }
     // `xs.slice(...)` over an f32 list yields an f32 list.
     if callIsArrSlice(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == 13
+      return mfResultKindOf(exprIx, fnIx) == "f32"
     }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
@@ -24710,9 +24707,11 @@ function exprI64Array(exprIx: i32, fnIx: i32) {
   }
   if e is Call {
     if callIsMapFilter(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == 4
+      return mfResultKindOf(exprIx, fnIx) == "i64"
     }
-    if callIsArrSlice(exprIx, fnIx) { return mfResultKindOf(exprIx, fnIx) == 4 }
+    if callIsArrSlice(exprIx, fnIx) {
+      return mfResultKindOf(exprIx, fnIx) == "i64"
+    }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       // A function/closure returning `i64[]` is recognized via the checker's recorded
@@ -25964,7 +25963,7 @@ function callIsMapFilter(exprIx: i32, fnIx: i32) {
     if callee is Member {
       if callee.memProp == "map" || callee.memProp == "filter" {
         if e.callArgs.length == 1 {
-          return mfRecvKindOf(callee.memObj, fnIx) >= 0
+          return mfRecvKindOf(callee.memObj, fnIx) != null
         }
       }
     }
@@ -25983,7 +25982,7 @@ function callIsArrSlice(exprIx: i32, fnIx: i32) {
     if callee is Member {
       if callee.memProp == "slice" {
         if e.callArgs.length == 1 || e.callArgs.length == 2 {
-          return mfRecvKindOf(callee.memObj, fnIx) >= 0
+          return mfRecvKindOf(callee.memObj, fnIx) != null
         }
       }
     }
@@ -25994,16 +25993,14 @@ function callIsArrSlice(exprIx: i32, fnIx: i32) {
 // The RECEIVER list kind of a `.map`/`.filter` call: `0` (i32/boolean list), `1`
 // (f64 list), `2` (struct/union ref list), or -1 (not a supported list — a string
 // list or a non-list receiver).
-function mfRecvKindOf(recvIx: i32, fnIx: i32) {
-  if exprF64Array(recvIx, fnIx) { return 1 }
-  // An i64 list (mf-kind 4) / f32 list (mf-kind 13) — the scalar siblings of the f64 list,
-  // checked before `exprArray` (the i32 fallback) since their elements are not i32.
-  if exprI64Array(recvIx, fnIx) { return 4 }
-  if exprF32Array(recvIx, fnIx) { return 13 }
-  if exprRefArray(recvIx, fnIx) { return 2 }
-  if exprStringArray(recvIx, fnIx) { return 3 }
-  if exprArray(recvIx, fnIx) { return 0 }
-  -1
+function mfRecvKindOf(recvIx: i32, fnIx: i32): MfKind | null {
+  if exprF64Array(recvIx, fnIx) { return "f64" }
+  if exprI64Array(recvIx, fnIx) { return "i64" }
+  if exprF32Array(recvIx, fnIx) { return "f32" }
+  if exprRefArray(recvIx, fnIx) { return "ref" }
+  if exprStringArray(recvIx, fnIx) { return "str" }
+  if exprArray(recvIx, fnIx) { return "i32" }
+  null
 }
 
 // The RESULT element kind of the `.map`/`.filter` call at `callIx`: `0` (i32/boolean
@@ -26011,26 +26008,14 @@ function mfRecvKindOf(recvIx: i32, fnIx: i32) {
 // (unsupported). `filter` keeps the receiver's element kind (a ref-list filter is
 // out of scope — it fails loudly at emit); `map`'s result element kind IS the
 // callback's RETURN kind (`cloRetKindOf`).
-function mfResultKindOf(callIx: i32, fnIx: i32) {
+function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
   let c = P.nodes[callIx]
   if c is Call {
     const callee = P.nodes[c.callFn]
     if callee is Member {
       // `.slice` preserves the element type — its result kind IS the receiver's.
       if callee.memProp == "slice" { return mfRecvKindOf(callee.memObj, fnIx) }
-      if callee.memProp == "filter" {
-        let rk = mfRecvKindOf(callee.memObj, fnIx)
-        if rk == 0 { return 0 }
-        if rk == 1 { return 1 }
-        // A REF list (struct/union elements) — `.filter` PRESERVES the element type, so the
-        // result is the SAME ref list (kind 2). Its backing/wrapper come from the source slot.
-        if rk == 2 { return 2 }
-        if rk == 3 { return 3 }
-        // i64 / f32 lists preserve their element type too (mf-kinds 4 / 13).
-        if rk == 4 { return 4 }
-        if rk == 13 { return 13 }
-        return -1
-      }
+      if callee.memProp == "filter" { return mfRecvKindOf(callee.memObj, fnIx) }
       if c.callArgs.length == 1 {
         let fe = mfCallbackFe(c.callArgs[0], fnIx)
         if fe < 0 {
@@ -26038,38 +26023,38 @@ function mfResultKindOf(callIx: i32, fnIx: i32) {
           // kind comes from the closure's sig RETURN token, not a lifted fe (scalar returns only).
           const ck = mfCallbackCloKey(c.callArgs[0], fnIx)
           if ck != "" { return mfResKindFromSigRet(sigKeyRetKind(ck)) }
-          return -1
+          return null
         }
         // A string-returning callback maps to a string-list result (kind 3) — checked first
         // since `cloRetKindOf` folds string into -1.
-        if cloRetIsString(fe) { return 3 }
+        if cloRetIsString(fe) { return "str" }
         // A STRUCT-returning callback maps to a NEW ref list of the result struct (kind 2) —
         // `cloRetKindOf` folds a struct into -1, so consult `cloRetValKind` (which classifies
         // the struct result as kind 1) directly. The result element type DIFFERS from the
         // source (`P[].map((p) => Q-shape)` ⇒ `Q[]`), so the dst slot is the RESULT struct's
         // ref-list slot, not the source's (`mfResultSlotOf`).
-        if cloRetValKind(fe) == 1 { return 2 }
+        if cloRetValKind(fe) == 1 { return "ref" }
         // A concrete-VARIANT-returning callback (a collapse) maps to a ref list of bare
         // variant structs (kind 2, element a variant) — checked before the union case since
         // `cloRetValKind` already prefers the variant.
-        if cloRetValKind(fe) == 8 { return 2 }
+        if cloRetValKind(fe) == 8 { return "ref" }
         // A UNION-returning callback maps to a ref list of union BOXES (kind 2, element kind
         // 2). All unions share `$uBox`, so the result element is the declared union; its box
         // body is produced by the callback's own union-boxing return path.
-        if cloRetValKind(fe) == 4 { return 2 }
+        if cloRetValKind(fe) == 4 { return "ref" }
         // An i64- / f32-returning callback maps to an i64- / f32-list result (mf-kinds 4 / 13).
         // `cloRetKindOf` folds these to -1 (out of the value-CALL ABI), so consult
         // `cloRetValKind` (10 = i64, 13 = f32) directly, as the struct/union cases above do.
-        if cloRetValKind(fe) == 10 { return 4 }
-        if cloRetValKind(fe) == 13 { return 13 }
+        if cloRetValKind(fe) == 10 { return "i64" }
+        if cloRetValKind(fe) == 13 { return "f32" }
         const rk2 = cloRetKindOf(fe)
-        if rk2 == 0 { return 0 }
-        if rk2 == 11 { return 1 }
+        if rk2 == 0 { return "i32" }
+        if rk2 == 11 { return "f64" }
       }
-      return -1
+      return null
     }
   }
-  -1
+  null
 }
 
 // The ref-list TABLE SLOT of a kind-2 `.map`/`.filter` result, or -1. `.filter` preserves the
@@ -26081,12 +26066,12 @@ function mfResultSlotOf(callIx: i32, fnIx: i32) {
     if callee is Member {
       // `.slice` preserves the ref-list element — its result slot IS the receiver's.
       if callee.memProp == "slice" {
-        if mfRecvKindOf(callee.memObj, fnIx) == 2 {
+        if mfRecvKindOf(callee.memObj, fnIx) == "ref" {
           return refListSlotOfExpr(callee.memObj, fnIx)
         }
       }
       if callee.memProp == "filter" {
-        if mfRecvKindOf(callee.memObj, fnIx) == 2 {
+        if mfRecvKindOf(callee.memObj, fnIx) == "ref" {
           return refListSlotOfExpr(callee.memObj, fnIx)
         }
       }
