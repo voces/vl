@@ -150,6 +150,34 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: a `match` renders one arm per line (or-patterns, wildcard), idempotent",
+  ignore: !ENABLED,
+  fn: async () => {
+    // A `match` crammed onto fewer lines normalizes to one arm per line; or-patterns keep ` | `,
+    // the `_` wildcard is preserved, and re-formatting is a no-op.
+    const src =
+      "type K = \"a\" | \"b\" | \"c\"\n" +
+      "function rank(k: K): i32 {\n" +
+      "  match k { \"a\" => 1\n" +
+      "    \"b\" | \"c\" => 2 }\n" +
+      "}\n" +
+      "function tag(k: K): i32 {\n" +
+      "  match k { \"a\" => 1 _ => 9 }\n" +
+      "}\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!/match k \{\n {4}"a" => 1\n {4}"b" \| "c" => 2\n {2}\}/.test(r.out)) {
+      throw new Error(`match not formatted one-arm-per-line with or-pattern:\n${r.out}`);
+    }
+    if (!/ {4}_ => 9\n/.test(r.out)) {
+      throw new Error(`wildcard arm not preserved:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`match formatting not idempotent:\n${r2.out}`);
+  },
+});
+
+Deno.test({
   name: "vl-fmt: -w rewrites a drifted file in place (idempotent)",
   ignore: !ENABLED,
   fn: async () => {
