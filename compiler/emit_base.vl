@@ -358,31 +358,60 @@ export function isBuiltinFnName(name: string) {
   if name == "__trap__" { return true }
   false
 }
-// Find a `LetDecl` for `name` anywhere in the parent body block (incl. nested if/loop
-// bodies — wasm locals are function-scoped). Returns its arena index or -1.
-export function parentLetOf(blockIx: i32, name: string) {
-  if blockIx < 0 { return -1 }
-  let b = P.nodes[blockIx]
+// A single-entry cache for `parentLetOf`: the block whose name->LetDecl map is built, and the
+// map (`name -> LetDecl arena index`, FIRST-wins). The emitter resolves identifiers in one
+// function at a time, and every `parentLetOf` caller passes that function's BODY block, so a
+// one-entry cache rebuilds once per function and serves the rest O(1) — `parentLetOf` was the
+// single hottest self-compile function (~10%) because each call re-walked the whole body.
+// `resetParentLetCache` clears it at `emitProgram` start (the arena is rebuilt each compile, so
+// a stale block index from a prior compile on a SHARED instance must not be trusted).
+let plCacheBlock: i32 = -1
+let plCacheMap: {[string]: i32} = Map()
+
+export function resetParentLetCache() {
+  plCacheBlock = -1
+  plCacheMap = Map()
+  0
+}
+
+// Fill `plCacheMap` with every function-scoped `LetDecl` reachable from `blockIx` (descending
+// into if/loop bodies — wasm locals are function-scoped), in the SAME pre-order `parentLetOf`
+// walked, FIRST-wins, so the map's entry for a name is the first declaration that walk found.
+function plBuildLetMap(blockIx: i32) {
+  if blockIx < 0 { return 0 }
+  const b = P.nodes[blockIx]
   if b is Block {
     const stmts = b.blkStmts
     let i = 0
     while i < stmts.length {
       const st = P.nodes[stmts[i]]
       if st is LetDecl {
-        if st.letName == name { return stmts[i] }
+        if !plCacheMap.has(st.letName) { plCacheMap[st.letName] = stmts[i] }
       } else if st is IfStmt {
-        let r = parentLetOf(st.ifThen, name)
-        if r >= 0 { return r }
-        if st.ifElse >= 0 {
-          const r2 = parentLetOf(st.ifElse, name)
-          if r2 >= 0 { return r2 }
-        }
+        plBuildLetMap(st.ifThen)
+        if st.ifElse >= 0 { plBuildLetMap(st.ifElse) }
       } else if st is WhileStmt {
-        const r3 = parentLetOf(st.whileBody, name)
-        if r3 >= 0 { return r3 }
+        plBuildLetMap(st.whileBody)
       }
       i = i + 1
     }
+  }
+  0
+}
+
+// Find a `LetDecl` for `name` anywhere in the parent body block (incl. nested if/loop
+// bodies — wasm locals are function-scoped). Returns its arena index or -1. Backed by the
+// single-entry per-block cache above (built on a miss, then O(1)).
+export function parentLetOf(blockIx: i32, name: string) {
+  if blockIx < 0 { return -1 }
+  if blockIx != plCacheBlock {
+    plCacheMap = Map()
+    plBuildLetMap(blockIx)
+    plCacheBlock = blockIx
+  }
+  if plCacheMap.has(name) {
+    const r = plCacheMap[name] ?? -1
+    return r
   }
   -1
 }
