@@ -4412,6 +4412,14 @@ function sFieldElemNameAt(si: i32, fi: i32) {
   sFieldElemName[sFieldStart[si] + fi]
 }
 
+// True if struct `si`'s field `fi` is a literal-union ATOM field (code 0 whose recorded elem name
+// is a literal union) — construction/read/assign seed the atom rep (`pendingLitUnion`) for it.
+function sFieldIsLitUnion(si: i32, fi: i32) {
+  if sFieldTypeAt(si, fi) != 0 { return false }
+  const r = nameIsLitUnionType(sFieldElemNameAt(si, fi))
+  r
+}
+
 // The ref-list table SLOT of struct `si`'s ref-list field `fi`, or -1 if not a ref list.
 function sFieldRefSlot(si: i32, fi: i32) {
   rlSlotByName(sFieldElemNameAt(si, fi))
@@ -4781,6 +4789,12 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
       } else if scode == 3 && exprIsLitAtom(valIx, fnIx) {
         // A literal-union atom in a `string` field (code 3) widens to its member string.
         if emitAtomToStr(body, valIx, fnIx) < 0 { return -1 }
+      } else if sFieldIsLitUnion(si, fi) {
+        // A literal-union atom FIELD (`{ kind: "b" }`): the member literal lowers as its atom id.
+        const savedFLU = pendingLitUnion
+        pendingLitUnion = 1
+        if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+        pendingLitUnion = savedFLU
       } else {
         if emitExpr(body, valIx, fnIx) < 0 { return -1 }
       }
@@ -13207,6 +13221,12 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       } else if fscode == 3 && exprIsLitAtom(a.binRight, fnIx) {
         // A literal-union atom assigned to a `string` field (code 3) widens to its member string.
         if emitAtomToStr(body, a.binRight, fnIx) < 0 { return -1 }
+      } else if sFieldIsLitUnion(si, fieldIdx) {
+        // A literal-union atom field assign (`b.kind = "a"`): the member RHS lowers as its atom id.
+        const savedWLU = pendingLitUnion
+        pendingLitUnion = 1
+        if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
+        pendingLitUnion = savedWLU
       } else {
         const savedWNS = pendingNulString
         const savedWNB = pendingNulBool
@@ -19650,6 +19670,11 @@ function fieldTypeCode(tyIx: i32) {
     if ty.tyName == "f64" { return 17 }
     if ty.tyName == "i64" { return 23 }
     if ty.tyName == "f32" { return 24 }
+    // A literal-union field (`kind: K`) stores an interned-i32 ATOM — code 0 (i32 valtype),
+    // NOT a box. Checked before the value/struct-union tests (a literal union registers as a
+    // union name, which would otherwise claim it as code 16). The field's union name is recorded
+    // in `sFieldElemName` so construction/read/assign recover the atom rep + membership.
+    if nameIsLitUnionType(ty.tyName) { return 0 }
     if nameIsString(ty.tyName) { return 3 }
     if nameIsArray(ty.tyName) {
       if nameIsI32Array(ty.tyName) { return 4 }
@@ -20387,7 +20412,9 @@ function nameFieldCode(t: string) {
   if t == "f64" { return 17 }
   if t == "i64" { return 23 }
   if t == "f32" { return 24 }
-
+  // A literal-union field (`kind: K`, or inline `"a"|"b"`) — an interned-i32 ATOM, code 0 (the
+  // name-based mirror of `fieldTypeCode`'s litunion branch). Before the union/string tests.
+  if nameIsLitUnionType(t) { return 0 }
   if nameIsString(t) { return 3 }
   if nameIsArray(t) {
     if nameIsI32Array(t) { return 4 }
@@ -20601,6 +20628,10 @@ function internInlineShape(nm: string) {
       }
       sFieldElemName.push(e28)
       if isValueUnionName(e28) { registerValueUnionName(e28) }
+    } else if codes[pi] == 0 && nameIsLitUnionType(texts[pi]) {
+      // A literal-union atom FIELD (code 0): record its union name so construction/read/assign
+      // recover the atom rep + membership (`sFieldIsLitUnion`).
+      sFieldElemName.push(texts[pi])
     } else {
       sFieldElemName.push("")
     }
@@ -21069,6 +21100,17 @@ function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     const r = nodeArrayElemIsLitUnion(e.idxArr)
     return r
   }
+  if e is Member {
+    // `b.kind` reading a literal-union atom FIELD yields the atom.
+    const msi = structIndexOfExpr(e.memObj, fnIx)
+    if msi >= 0 {
+      const mfi = sFieldIndex(msi, e.memProp)
+      if mfi >= 0 {
+        const r = sFieldIsLitUnion(msi, mfi)
+        return r
+      }
+    }
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
@@ -21239,7 +21281,14 @@ function collectS(stmts: i32[]) {
               )
             }
             sFieldTypes.push(code)
-            sFieldElemName.push(fieldRefElemName(fnode.fdType))
+            // A literal-union atom field (code 0) records its union NAME (not the ref-elem name,
+            // which is "" for it) so `sFieldIsLitUnion` recovers the atom rep + membership.
+            let elemNm = fieldRefElemName(fnode.fdType)
+            if code == 0 {
+              const ftn = tyNameOf(fnode.fdType)
+              if nameIsLitUnionType(ftn) { elemNm = ftn }
+            }
+            sFieldElemName.push(elemNm)
             sFieldNames.push(fnode.fdName)
             // A value-union field interns its box reps (collectAnnShapes parity).
             if code == 16 {
