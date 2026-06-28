@@ -49,7 +49,7 @@
 import { Tok } from "./ast"
 import { peek } from "./lexer"
 import { accept, peekTok } from "./parser"
-import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, ErrExpr, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, Param, Paren, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, declNameTok } from "./ast"
+import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, ErrExpr, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, MatchExpr, Member, Node, NullLit, NumLit, ObjLit, OptMember, Param, Paren, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, declNameTok, mkIf, mkBinary, mkBlock } from "./ast"
 import { P, i32ToStr, nodeToks, declNameTokOf, hasNamedArgs, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 import {
   NumLit,
@@ -6654,6 +6654,77 @@ function checkProgramNode(n: Program) {
 // arena INDEX (not a snapshot) means a hole pinned later in place — an empty `[]` element
 // fixed by a downstream `.push` — is reflected when the emitter reads it back. Last write
 // wins, so a re-checked node settles on its final type.
+// Wrap a match arm body as a Block (a bare-expression body becomes a one-statement block).
+function matchBlockOf(bodyIx: i32) {
+  const b = P.nodes[bodyIx]
+  if b is Block { return bodyIx }
+  const one: i32[] = []
+  one.push(bodyIx)
+  mkBlock(one, -1)
+}
+
+// `scrut == p0 [|| scrut == p1 …]` over match arm `k`'s OR-patterns.
+function matchArmCond(
+  scrut: i32,
+  pats: i32[],
+  armStart: i32[],
+  armCount: i32[],
+  k: i32,
+  pos: i32,
+) {
+  let cond = -1
+  let pj = 0
+  while pj < armCount[k] {
+    const pat = pats[armStart[k] + pj]
+    const eq = mkBinary("==", scrut, pat, pos)
+    if cond < 0 { cond = eq } else { cond = mkBinary("||", cond, eq, pos) }
+    pj = pj + 1
+  }
+  cond
+}
+
+// Lower the checked, exhaustive `MatchExpr` at `ix` to an if/else chain, OVERWRITING the arena slot
+// in place — so lint AND emit see only if-chains (no per-node `match` handling needed in either).
+// The wildcard arm (or, if none, the LAST arm — exhaustive, the only case left) becomes the bare
+// `else`. Runs in the REAL check pass only.
+function desugarMatchAt(ix: i32) {
+  const n = P.nodes[ix]
+  if n is MatchExpr {
+    const scrut = n.matchScrut
+    const pats = n.matchPats
+    const armStart = n.matchArmStart
+    const armCount = n.matchArmCount
+    const bodies = n.matchBodies
+    const mpos = n.pos
+    const nArms = armStart.length
+    let wildArm = -1
+    let ai = 0
+    while ai < nArms {
+      let pj = 0
+      while pj < armCount[ai] {
+        const p = P.nodes[pats[armStart[ai] + pj]]
+        if p is Ident { wildArm = ai }
+        pj = pj + 1
+      }
+      ai = ai + 1
+    }
+    let elseArm = wildArm
+    if elseArm < 0 { elseArm = nArms - 1 }
+    let chain = matchBlockOf(bodies[elseArm])
+    let k = nArms - 1
+    while k >= 0 {
+      if k != elseArm {
+        const cond = matchArmCond(scrut, pats, armStart, armCount, k, mpos)
+        const thenB = matchBlockOf(bodies[k])
+        chain = mkIf(cond, thenB, chain, mpos)
+      }
+      k = k - 1
+    }
+    P.nodes[ix] = P.nodes[chain]
+  }
+  0
+}
+
 function checkNode(ix: i32) {
   const t = checkNodeReal(ix)
   if !inferQuiet {
@@ -7692,6 +7763,108 @@ function checkNodeReal(ix: i32) {
     popScope()
     return TY_VOID
     // ── if / else ─────────────────────────────────────────────────────────────
+  } else if n is MatchExpr {
+    // `match scrut { pat => body … }` — exhaustive dispatch over a LITERAL UNION (phase 1).
+    // Type the scrutinee, check every pattern is a member, enforce EXHAUSTIVENESS (all members
+    // covered, or a `_` wildcard) and reject REDUNDANT arms, then join the arm VALUE types so a
+    // value-position `match` (`const x = match …`) and a return-tail `match` both type.
+    const mTail = retTailPos
+    retTailPos = false
+    const st = checkNode(n.matchScrut)
+    if !tyIsLitUnion(st) {
+      tErr("match scrutinee must be a literal union, got " + tyToStr(st), ix)
+      return TY_ERR
+    }
+    // The member texts (inner, no quotes), and a parallel covered-flag.
+    const members: string[] = []
+    const sty = T.tys[st]
+    if sty is TyUnion {
+      let mi = 0
+      while mi < sty.uMembers.length {
+        const mm = T.tys[sty.uMembers[mi]]
+        if mm is TyLit { members.push(mm.litText) }
+        mi = mi + 1
+      }
+    }
+    const covered: i32[] = []
+    let ci = 0
+    while ci < members.length {
+      covered.push(0)
+      ci = ci + 1
+    }
+    let hasWild = false
+    // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
+    // sentinel would POISON the join (every arm joins back to error), so never seed with it.
+    let matchTy = -1
+    let ai = 0
+    while ai < n.matchArmStart.length {
+      // Patterns of arm `ai`.
+      let pj = 0
+      while pj < n.matchArmCount[ai] {
+        const patIx = n.matchPats[n.matchArmStart[ai] + pj]
+        const pn = P.nodes[patIx]
+        if pn is Ident {
+          hasWild = true
+        } else if pn is StrLit {
+          // The member name is the pattern's inner text (strip the surrounding quotes).
+          const raw = pn.strText
+          let inner = raw
+          if raw.length >= 2 { inner = raw.slice(1, raw.length - 1) }
+          let found = -1
+          let fi = 0
+          while fi < members.length {
+            if members[fi] == inner { found = fi }
+            fi = fi + 1
+          }
+          if found < 0 {
+            tErr("match pattern \"" + inner + "\" is not a member of " + tyToStr(st), patIx)
+          } else if covered[found] == 1 {
+            tErr("redundant match arm: \"" + inner + "\" is already covered", patIx)
+          } else {
+            covered[found] = 1
+          }
+        }
+        pj = pj + 1
+      }
+      // Body value type. (Arm bodies are NOT checked in return-tail position; the match's joined
+      // value seeds the function return once, below — avoids a per-arm void/err mis-seed.)
+      const body = n.matchBodies[ai]
+      const bt = checkNode(body)
+      let armTy = bt
+      const bn = P.nodes[body]
+      if bn is Block {
+        armTy = blockTailTy
+        // A statement-tail block has `blockTailTy == -1` ("no value") — that is VOID, not the
+        // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
+        if armTy < 0 { armTy = TY_VOID }
+      }
+      matchTy = joinTys(matchTy, armTy)
+      ai = ai + 1
+    }
+    // A void-armed match leaves the join unset (-1) or void; normalize to VOID so the function-
+    // body-tail seeding (`noteInferredRet`) does not mistake it for the error sentinel.
+    if matchTy < 0 { matchTy = TY_VOID }
+    // Exhaustiveness: every member covered, or a wildcard.
+    if !hasWild {
+      let missing = ""
+      let mk = 0
+      while mk < members.length {
+        if covered[mk] == 0 {
+          if missing != "" { missing = missing + ", " }
+          missing = missing + "\"" + members[mk] + "\""
+        }
+        mk = mk + 1
+      }
+      if missing != "" {
+        tErr(
+          "non-exhaustive match — missing " + missing + " (add the arm or a `_`)",
+          ix,
+        )
+      }
+    }
+    // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
+    if !inferQuiet { desugarMatchAt(ix) }
+    return matchTy
   } else if n is IfStmt {
     // An `if`/`else` in VALUE position is an EXPRESSION whose value is the join of its
     // branch tail values (`if c { 1 } else { 2 }` is `i32`). Capture whether THIS `if`
