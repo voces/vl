@@ -85,6 +85,36 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: import name lists sort, and wrap one-per-line when over 80 cols",
+  ignore: !ENABLED,
+  fn: async () => {
+    // A short import: names sort, stays one line. A long import: sorts AND wraps to
+    // one name per line with a trailing comma. An `as` alias sorts by its source name.
+    const long =
+      "import { mike, alpha, charlie } from \"./x\"\n" +
+      "import { delta, bravo, echo, foxtrot, golf, hotel, india, juliet, kilo, lima, alpha, charlie } from \"./long\"\n" +
+      "print(1)\n";
+    const r = await run([], long);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!r.out.includes('import { alpha, charlie, mike } from "./x"')) {
+      throw new Error(`short import not sorted/one-line:\n${r.out}`);
+    }
+    // The long import must be wrapped (a `{` at end of the import line, names indented).
+    if (!/import \{\n {2}alpha,\n {2}bravo,\n/.test(r.out)) {
+      throw new Error(`long import not wrapped + sorted one-per-line:\n${r.out}`);
+    }
+    if (!/\n} from "\.\/long"/.test(r.out)) {
+      throw new Error(`wrapped import missing the \`} from "..."\` tail:\n${r.out}`);
+    }
+    // Idempotent: formatting the output again is a no-op.
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) {
+      throw new Error(`import formatting not idempotent:\n${r2.out}`);
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: -w rewrites a drifted file in place (idempotent)",
   ignore: !ENABLED,
   fn: async () => {
