@@ -3643,6 +3643,37 @@ function assignWidensAtomToStr(binIx: i32, fnIx: i32) {
   false
 }
 
+// True if `initIx` is a literal-union ATOM read in a GLOBAL initializer — an `Ident` referencing
+// another module global whose declared type is a literal union. (Module-global inits have no
+// locals/params, so an Ident is the only atom form; a member literal is a plain string, not an
+// atom.) Gates the start-fn `string`-global widening + its scratch-frame reservation.
+function globalInitIsLitAtom(initIx: i32) {
+  if initIx < 0 { return false }
+  const e = P.nodes[unwrapParen(initIx)]
+  if e is Ident {
+    const gli = globalLetOf(e.identName)
+    if gli >= 0 {
+      const r = letIsLitUnion(gli)
+      return r
+    }
+  }
+  false
+}
+
+// True if the global at `letIx` is a `string` cell (kind 3) initialized with a literal-union atom
+// — it widens to its member string in the start function, riding the string-op scratch frame.
+function globalInitWidensAtomToStr(letIx: i32) {
+  if letIx < 0 { return false }
+  const gk = globalCellKind(letIx)
+  if gk != 3 && gk != 16 { return false }
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    const r = globalInitIsLitAtom(d.letInit)
+    return r
+  }
+  false
+}
+
 // True if the binding at `letIx` is annotated `: string` and initialized with a literal-union
 // atom — it widens to its member string at the init, riding the string-op scratch frame.
 function letWidensAtomToStr(letIx: i32, fnIx: i32) {
@@ -17902,6 +17933,9 @@ function startFnDetectScratch() {
         if exprHasMemberPopKind(ix, -1, 5) { fnUsesF32Push = true }
         if exprHasMemberPopKind(ix, -1, 4) { fnUsesI64Push = true }
         if exprHasStrOp(ix, -1) { fnUsesStrOp = true }
+        // A `string` global initialized with a literal-union atom widens via the runtime tower
+        // (`emitAtomToStr`), which stages the atom id in the string-op scratch frame.
+        if globalInitWidensAtomToStr(globalStmts[gi]) { fnUsesStrOp = true }
         if exprHasArrNew(ix) { fnUsesArrNew = true }
         if exprHasCoalesceCall(ix) { fnUsesCoalesceCall = true }
         if exprHasMapOp(ix, -1) { fnUsesMap = true }
@@ -18183,6 +18217,17 @@ function emitStartFnCode(out: i32[]) {
             if gck == 4 { gun = letUnionNameOf(globalStmts[gi], -1) }
             if gun != "" {
               if emitUnionCoerce(bodyExpr, gun, g.letInit, -1) < 0 {
+                wTarget(exprPrev)
+                return -1
+              }
+            } else if (
+              (gck == 3 || gck == 16) &&
+              globalInitIsLitAtom(g.letInit)
+            ) {
+              // A literal-union atom initializing a `string` global widens to its member string.
+              // The start fn is a real function, so the runtime widening tower runs here (unlike a
+              // CONST global, whose constexpr init has no `select`/scratch).
+              if emitAtomToStr(bodyExpr, g.letInit, -1) < 0 {
                 wTarget(exprPrev)
                 return -1
               }
@@ -22547,10 +22592,17 @@ function letIsUnion(letIx: i32, fnIx: i32) {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
-        if isUName(lt.tyName) { return true }
+        // A literal union (`type K = "a" | "b"`, or an inline `"a" | "b"`) is an interned-i32
+        // ATOM, not a value-union box — never classify it kind 4.
+        if isUName(lt.tyName) && !nameIsLitUnionType(lt.tyName) { return true }
       }
     }
-    if exprUnion(d.letInit, fnIx) { return true }
+    // The init's union-ness applies when no annotation pinned the cell — but a literal-union
+    // ATOM init (allowed under a `: string` annotation as a subtype) is an atom, not a box, so
+    // it must not box the cell (`const b: string = colorAtom` stays a `string` cell).
+    if exprUnion(d.letInit, fnIx) && !exprIsLitAtom(d.letInit, fnIx) {
+      return true
+    }
     // A null-hole binding (`let x = null`, A-infer-null) is its inferred union.
     return nliNameOf(letIx) != ""
   }
