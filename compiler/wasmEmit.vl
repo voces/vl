@@ -3160,7 +3160,11 @@ function buildLocals(fnIx: i32) {
 // `kind` — `0` selects an i32-list push, `1` a ref-list push (G7-ref), `2` a string-list
 // push (`string[]`). Used to detect which inline-push scratch locals a function needs;
 // the three kinds get DISTINCT scratch frames so a function may push onto any mix.
-function stmtIsPushKind(stmtIx: i32, fnIx: i32, kind: i32) {
+// The `.push`/`.pop` element-kind SELECTOR threaded through the reservation walkers (C2 cleanup:
+// a named literal union replacing the bare 0–5 codes). `pop` only uses i32/ref/str.
+type PushKind = "i32" | "ref" | "str" | "f64" | "i64" | "f32"
+
+function stmtIsPushKind(stmtIx: i32, fnIx: i32, kind: PushKind) {
   let s = P.nodes[stmtIx]
   if s is Call {
     const callee = P.nodes[s.callFn]
@@ -3171,11 +3175,11 @@ function stmtIsPushKind(stmtIx: i32, fnIx: i32, kind: i32) {
         const isF64 = exprF64Array(callee.memObj, fnIx)
         const isI64 = exprI64Array(callee.memObj, fnIx)
         const isF32 = exprF32Array(callee.memObj, fnIx)
-        if kind == 1 { return isRef }
-        if kind == 2 { return isStr }
-        if kind == 3 { return isF64 }
-        if kind == 4 { return isI64 }
-        if kind == 5 { return isF32 }
+        if kind == "ref" { return isRef }
+        if kind == "str" { return isStr }
+        if kind == "f64" { return isF64 }
+        if kind == "i64" { return isI64 }
+        if kind == "f32" { return isF32 }
         return !isRef && !isStr && !isF64 && !isI64 && !isF32
       }
     }
@@ -3189,7 +3193,7 @@ function stmtIsPushKind(stmtIx: i32, fnIx: i32, kind: i32) {
 // in place), so it is NOT counted — only a Member receiver, which must be materialized
 // into the push frame's `recvRef` scratch slot. Lets a `.pop`-on-field function reserve
 // the same scratch frame a `.push`-on-field one does.
-function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: i32) {
+function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: PushKind) {
   let c = P.nodes[callIx]
   if c is Call {
     const callee = P.nodes[c.callFn]
@@ -3216,11 +3220,11 @@ function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: i32) {
           const isF64 = exprF64Array(callee.memObj, fnIx)
           const isI64 = exprI64Array(callee.memObj, fnIx)
           const isF32 = exprF32Array(callee.memObj, fnIx)
-          if kind == 1 { return isRef }
-          if kind == 2 { return isStr }
-          if kind == 3 { return isF64 }
-          if kind == 4 { return isI64 }
-          if kind == 5 { return isF32 }
+          if kind == "ref" { return isRef }
+          if kind == "str" { return isStr }
+          if kind == "f64" { return isF64 }
+          if kind == "i64" { return isI64 }
+          if kind == "f32" { return isF32 }
           return !isRef && !isStr && !isF64 && !isI64 && !isF32
         }
       }
@@ -3232,7 +3236,7 @@ function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: i32) {
 // True if any expression at `exprIx` (or a sub-expression) is a Member-receiver `.pop`
 // of `kind` — a `.pop` appears in VALUE position (`let x = T.scopes.pop()`), so the
 // reservation walk must descend expressions, not just statement receivers.
-function exprHasMemberPopKind(exprIx: i32, fnIx: i32, kind: i32) {
+function exprHasMemberPopKind(exprIx: i32, fnIx: i32, kind: PushKind) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
   if e is Call {
@@ -3262,7 +3266,7 @@ function exprHasMemberPopKind(exprIx: i32, fnIx: i32, kind: i32) {
 // True if the block at `blockIx` (descending into if/else + while, the scopes
 // `collectLocals` walks) contains a Member-receiver `.pop` of `kind` in any statement or
 // let-init / return / while-cond expression.
-function blockHasMemberPopKind(blockIx: i32, fnIx: i32, kind: i32) {
+function blockHasMemberPopKind(blockIx: i32, fnIx: i32, kind: PushKind) {
   let b = P.nodes[blockIx]
   if b is Block {
     const stmts = b.blkStmts
@@ -3298,7 +3302,7 @@ function blockHasMemberPopKind(blockIx: i32, fnIx: i32, kind: i32) {
 
 // True if any arm of the `if` / `else if` chain at `ifIx` contains a Member-receiver
 // `.pop` of `kind` (then-branch, `else` block, or recursively a chained `else if`).
-function ifChainHasMemberPopKind(ifIx: i32, fnIx: i32, kind: i32) {
+function ifChainHasMemberPopKind(ifIx: i32, fnIx: i32, kind: PushKind) {
   let s = P.nodes[ifIx]
   if s is IfStmt {
     if blockHasMemberPopKind(s.ifThen, fnIx, kind) { return true }
@@ -3317,7 +3321,7 @@ function ifChainHasMemberPopKind(ifIx: i32, fnIx: i32, kind: i32) {
 // True if the block at `blockIx` (descending into `if` branches and `while` bodies, the
 // same scopes `collectLocals` walks) contains a `.push` of kind `wantRef`. A function
 // with such a push reserves the matching three scratch locals after its declared locals.
-function blockHasPushKind(blockIx: i32, fnIx: i32, kind: i32) {
+function blockHasPushKind(blockIx: i32, fnIx: i32, kind: PushKind) {
   let b = P.nodes[blockIx]
   if b is Block {
     const stmts = b.blkStmts
@@ -3345,7 +3349,7 @@ function blockHasPushKind(blockIx: i32, fnIx: i32, kind: i32) {
 // `collectLocalsIf`'s recursion so a push buried under several `else if` arms (the
 // `parseProgram` / `parseStmt` recursive-descent dispatch shape) is detected, not just
 // the first one level (the prior hand-unrolled form missed 2+-deep chains).
-function ifChainHasPushKind(ifIx: i32, fnIx: i32, kind: i32) {
+function ifChainHasPushKind(ifIx: i32, fnIx: i32, kind: PushKind) {
   let s = P.nodes[ifIx]
   if s is IfStmt {
     if blockHasPushKind(s.ifThen, fnIx, kind) { return true }
@@ -3375,7 +3379,7 @@ function recordRefPushSlot(slot: i32) {
 
 // Walk the block at `blockIx` (descending into `if` branches + `while` bodies, the scopes
 // `collectLocals` walks) and collect every DISTINCT ref-list `.push` receiver slot into
-// `fnRefPushSlots`. Parallel to `blockHasPushKind(..., 1)`, but RECORDING the slot rather
+// `fnRefPushSlots`. Parallel to `blockHasPushKind(..., "ref")`, but RECORDING the slot rather
 // than just testing presence — so a function pushing onto `Tok[]` and `Diag[]` reserves a
 // separately-typed scratch frame for each.
 function collectRefPushSlots(blockIx: i32, fnIx: i32) {
@@ -3384,7 +3388,7 @@ function collectRefPushSlots(blockIx: i32, fnIx: i32) {
     const stmts = b.blkStmts
     let i = 0
     while i < stmts.length {
-      if stmtIsPushKind(stmts[i], fnIx, 1) {
+      if stmtIsPushKind(stmts[i], fnIx, "ref") {
         let s = P.nodes[stmts[i]]
         if s is Call {
           const callee = P.nodes[s.callFn]
@@ -3427,7 +3431,7 @@ function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
   if e is Call {
-    if callIsMemberPopKind(exprIx, fnIx, 1) {
+    if callIsMemberPopKind(exprIx, fnIx, "ref") {
       const callee = P.nodes[e.callFn]
       if callee is Member {
         recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
@@ -3512,8 +3516,8 @@ function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32) {
 function fnHasPush(fnIx: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    if blockHasPushKind(fn.fnBody, fnIx, 0) { return true }
-    return blockHasMemberPopKind(fn.fnBody, fnIx, 0)
+    if blockHasPushKind(fn.fnBody, fnIx, "i32") { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, "i32")
   }
   false
 }
@@ -3523,8 +3527,8 @@ function fnHasPush(fnIx: i32) {
 function fnHasRefPush(fnIx: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    if blockHasPushKind(fn.fnBody, fnIx, 1) { return true }
-    return blockHasMemberPopKind(fn.fnBody, fnIx, 1)
+    if blockHasPushKind(fn.fnBody, fnIx, "ref") { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, "ref")
   }
   false
 }
@@ -3534,8 +3538,8 @@ function fnHasRefPush(fnIx: i32) {
 function fnHasStrPush(fnIx: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    if blockHasPushKind(fn.fnBody, fnIx, 2) { return true }
-    return blockHasMemberPopKind(fn.fnBody, fnIx, 2)
+    if blockHasPushKind(fn.fnBody, fnIx, "str") { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, "str")
   }
   false
 }
@@ -3545,8 +3549,8 @@ function fnHasStrPush(fnIx: i32) {
 function fnHasF64Push(fnIx: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    if blockHasPushKind(fn.fnBody, fnIx, 3) { return true }
-    return blockHasMemberPopKind(fn.fnBody, fnIx, 3)
+    if blockHasPushKind(fn.fnBody, fnIx, "f64") { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, "f64")
   }
   false
 }
@@ -3556,8 +3560,8 @@ function fnHasF64Push(fnIx: i32) {
 function fnHasI64Push(fnIx: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    if blockHasPushKind(fn.fnBody, fnIx, 4) { return true }
-    return blockHasMemberPopKind(fn.fnBody, fnIx, 4)
+    if blockHasPushKind(fn.fnBody, fnIx, "i64") { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, "i64")
   }
   false
 }
@@ -3567,8 +3571,8 @@ function fnHasI64Push(fnIx: i32) {
 function fnHasF32Push(fnIx: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
-    if blockHasPushKind(fn.fnBody, fnIx, 5) { return true }
-    return blockHasMemberPopKind(fn.fnBody, fnIx, 5)
+    if blockHasPushKind(fn.fnBody, fnIx, "f32") { return true }
+    return blockHasMemberPopKind(fn.fnBody, fnIx, "f32")
   }
   false
 }
@@ -17893,18 +17897,18 @@ function recordStartRefPushSlot(stmtIx: i32) {
 // and a Member-receiver `.pop` (the pop walker, which reuses the push frame's
 // slots) each need the scratch quad.
 function startScanBlock(blockIx: i32) {
-  if blockHasPushKind(blockIx, -1, 0) { fnUsesPush = true }
-  if blockHasPushKind(blockIx, -1, 1) { fnUsesRefPush = true }
-  if blockHasPushKind(blockIx, -1, 2) { fnUsesStrPush = true }
-  if blockHasPushKind(blockIx, -1, 3) { fnUsesF64Push = true }
-  if blockHasPushKind(blockIx, -1, 5) { fnUsesF32Push = true }
-  if blockHasPushKind(blockIx, -1, 4) { fnUsesI64Push = true }
-  if blockHasMemberPopKind(blockIx, -1, 0) { fnUsesPush = true }
-  if blockHasMemberPopKind(blockIx, -1, 1) { fnUsesRefPush = true }
-  if blockHasMemberPopKind(blockIx, -1, 2) { fnUsesStrPush = true }
-  if blockHasMemberPopKind(blockIx, -1, 3) { fnUsesF64Push = true }
-  if blockHasMemberPopKind(blockIx, -1, 5) { fnUsesF32Push = true }
-  if blockHasMemberPopKind(blockIx, -1, 4) { fnUsesI64Push = true }
+  if blockHasPushKind(blockIx, -1, "i32") { fnUsesPush = true }
+  if blockHasPushKind(blockIx, -1, "ref") { fnUsesRefPush = true }
+  if blockHasPushKind(blockIx, -1, "str") { fnUsesStrPush = true }
+  if blockHasPushKind(blockIx, -1, "f64") { fnUsesF64Push = true }
+  if blockHasPushKind(blockIx, -1, "f32") { fnUsesF32Push = true }
+  if blockHasPushKind(blockIx, -1, "i64") { fnUsesI64Push = true }
+  if blockHasMemberPopKind(blockIx, -1, "i32") { fnUsesPush = true }
+  if blockHasMemberPopKind(blockIx, -1, "ref") { fnUsesRefPush = true }
+  if blockHasMemberPopKind(blockIx, -1, "str") { fnUsesStrPush = true }
+  if blockHasMemberPopKind(blockIx, -1, "f64") { fnUsesF64Push = true }
+  if blockHasMemberPopKind(blockIx, -1, "f32") { fnUsesF32Push = true }
+  if blockHasMemberPopKind(blockIx, -1, "i64") { fnUsesI64Push = true }
   if blockHasStrOp(blockIx, -1) { fnUsesStrOp = true }
   if blockHasArrNew(blockIx) { fnUsesArrNew = true }
   if blockHasCoalesceCall(blockIx) { fnUsesCoalesceCall = true }
@@ -17923,12 +17927,12 @@ function startScanIf(ifIx: i32) {
     if exprHasArrNew(st.ifCond) { fnUsesArrNew = true }
     if exprHasCoalesceCall(st.ifCond) { fnUsesCoalesceCall = true }
     if exprHasMapOp(st.ifCond, -1) { fnUsesMap = true }
-    if exprHasMemberPopKind(st.ifCond, -1, 0) { fnUsesPush = true }
-    if exprHasMemberPopKind(st.ifCond, -1, 1) { fnUsesRefPush = true }
-    if exprHasMemberPopKind(st.ifCond, -1, 2) { fnUsesStrPush = true }
-    if exprHasMemberPopKind(st.ifCond, -1, 3) { fnUsesF64Push = true }
-    if exprHasMemberPopKind(st.ifCond, -1, 5) { fnUsesF32Push = true }
-    if exprHasMemberPopKind(st.ifCond, -1, 4) { fnUsesI64Push = true }
+    if exprHasMemberPopKind(st.ifCond, -1, "i32") { fnUsesPush = true }
+    if exprHasMemberPopKind(st.ifCond, -1, "ref") { fnUsesRefPush = true }
+    if exprHasMemberPopKind(st.ifCond, -1, "str") { fnUsesStrPush = true }
+    if exprHasMemberPopKind(st.ifCond, -1, "f64") { fnUsesF64Push = true }
+    if exprHasMemberPopKind(st.ifCond, -1, "f32") { fnUsesF32Push = true }
+    if exprHasMemberPopKind(st.ifCond, -1, "i64") { fnUsesI64Push = true }
     // Narrow across each arm (mirroring `ifChainHasStrOp` / `emitStmt`): the
     // then-branch sees the guard's narrowing, the else-branch sees a VALUE
     // union's complement — so a top-level `if w is string { print(w) }`
@@ -17977,12 +17981,12 @@ function startFnDetectScratch() {
       const g = P.nodes[globalStmts[gi]]
       if g is LetDecl {
         const ix = g.letInit
-        if exprHasMemberPopKind(ix, -1, 0) { fnUsesPush = true }
-        if exprHasMemberPopKind(ix, -1, 1) { fnUsesRefPush = true }
-        if exprHasMemberPopKind(ix, -1, 2) { fnUsesStrPush = true }
-        if exprHasMemberPopKind(ix, -1, 3) { fnUsesF64Push = true }
-        if exprHasMemberPopKind(ix, -1, 5) { fnUsesF32Push = true }
-        if exprHasMemberPopKind(ix, -1, 4) { fnUsesI64Push = true }
+        if exprHasMemberPopKind(ix, -1, "i32") { fnUsesPush = true }
+        if exprHasMemberPopKind(ix, -1, "ref") { fnUsesRefPush = true }
+        if exprHasMemberPopKind(ix, -1, "str") { fnUsesStrPush = true }
+        if exprHasMemberPopKind(ix, -1, "f64") { fnUsesF64Push = true }
+        if exprHasMemberPopKind(ix, -1, "f32") { fnUsesF32Push = true }
+        if exprHasMemberPopKind(ix, -1, "i64") { fnUsesI64Push = true }
         if exprHasStrOp(ix, -1) { fnUsesStrOp = true }
         // A `string` global initialized with a literal-union atom widens via the runtime tower
         // (`emitAtomToStr`), which stages the atom id in the string-op scratch frame.
@@ -18030,18 +18034,28 @@ function startFnDetectScratch() {
     } else {
       // expression statements (a bare call / assignment): the per-statement push
       // detector plus the expr walkers
-      if stmtIsPushKind(startStmts[si], -1, 0) { fnUsesPush = true }
-      if stmtIsPushKind(startStmts[si], -1, 1) { fnUsesRefPush = true }
-      if stmtIsPushKind(startStmts[si], -1, 2) { fnUsesStrPush = true }
-      if stmtIsPushKind(startStmts[si], -1, 3) { fnUsesF64Push = true }
-      if stmtIsPushKind(startStmts[si], -1, 5) { fnUsesF32Push = true }
-      if stmtIsPushKind(startStmts[si], -1, 4) { fnUsesI64Push = true }
-      if exprHasMemberPopKind(startStmts[si], -1, 0) { fnUsesPush = true }
-      if exprHasMemberPopKind(startStmts[si], -1, 1) { fnUsesRefPush = true }
-      if exprHasMemberPopKind(startStmts[si], -1, 2) { fnUsesStrPush = true }
-      if exprHasMemberPopKind(startStmts[si], -1, 3) { fnUsesF64Push = true }
-      if exprHasMemberPopKind(startStmts[si], -1, 5) { fnUsesF32Push = true }
-      if exprHasMemberPopKind(startStmts[si], -1, 4) { fnUsesI64Push = true }
+      if stmtIsPushKind(startStmts[si], -1, "i32") { fnUsesPush = true }
+      if stmtIsPushKind(startStmts[si], -1, "ref") { fnUsesRefPush = true }
+      if stmtIsPushKind(startStmts[si], -1, "str") { fnUsesStrPush = true }
+      if stmtIsPushKind(startStmts[si], -1, "f64") { fnUsesF64Push = true }
+      if stmtIsPushKind(startStmts[si], -1, "f32") { fnUsesF32Push = true }
+      if stmtIsPushKind(startStmts[si], -1, "i64") { fnUsesI64Push = true }
+      if exprHasMemberPopKind(startStmts[si], -1, "i32") { fnUsesPush = true }
+      if exprHasMemberPopKind(startStmts[si], -1, "ref") {
+        fnUsesRefPush = true
+      }
+      if exprHasMemberPopKind(startStmts[si], -1, "str") {
+        fnUsesStrPush = true
+      }
+      if exprHasMemberPopKind(startStmts[si], -1, "f64") {
+        fnUsesF64Push = true
+      }
+      if exprHasMemberPopKind(startStmts[si], -1, "f32") {
+        fnUsesF32Push = true
+      }
+      if exprHasMemberPopKind(startStmts[si], -1, "i64") {
+        fnUsesI64Push = true
+      }
       if exprHasStrOp(startStmts[si], -1) { fnUsesStrOp = true }
       if exprHasArrNew(startStmts[si]) { fnUsesArrNew = true }
       if exprHasCoalesceCall(startStmts[si]) { fnUsesCoalesceCall = true }
@@ -18049,7 +18063,7 @@ function startFnDetectScratch() {
       if fnValUsed {
         if blockHasCallRef(startStmts[si], -1) { fnUsesCallRef = true }
       }
-      if stmtIsPushKind(startStmts[si], -1, 1) {
+      if stmtIsPushKind(startStmts[si], -1, "ref") {
         recordStartRefPushSlot(startStmts[si])
       }
       collectMemberPopRefSlotsExpr(startStmts[si], -1)
