@@ -617,6 +617,25 @@ function joinOut() { joinOutRange(0, outBuf.length) }
 
 // Emit a sequence of statements at `indent`, preserving a single user blank line
 // between them and placing own-line / trailing comments.
+// The end index (exclusive) of a maximal run `stmts[from..]` the user wrote on ONE source
+// line as a `;`-joined sequence (every member a leaf statement). `from + 1` when there is no
+// such run (the next statement is on another line or is not a leaf).
+function sameLineRunEnd(stmts: i32[], from: i32) {
+  const line0 = startLineOf(stmts[from])
+  if line0 == 0 || !isLeafStmt(stmts[from]) { return from + 1 }
+  let j = from + 1
+  let going = j < stmts.length
+  while going {
+    if !isLeafStmt(stmts[j]) || startLineOf(stmts[j]) != line0 {
+      going = false
+    } else {
+      j = j + 1
+      going = j < stmts.length
+    }
+  }
+  j
+}
+
 function emitStatements(stmts: i32[], indent: i32) {
   let prevLine = topPrevLine
   topPrevLine = 0
@@ -640,10 +659,44 @@ function emitStatements(stmts: i32[], indent: i32) {
       fmtEmitRaw("\n")
     }
     emitLeadingComments(indent, sLine)
-    emitStatement(ix, indent)
-    const sl = stopLineOf(ix)
-    if sl == 0 { prevLine = sLine } else { prevLine = sl }
-    i = i + 1
+    // PRESERVE a `;`-joined one-liner: a run of leaf statements the user put on one source
+    // line is re-emitted joined by `; ` IF it fits in the width (else each on its own line).
+    // Bail when a comment sits on that line (a trailing `// …` would be lost) — the per-
+    // statement path below handles it. Never INTRODUCE a join across separate source lines.
+    let grouped = false
+    const runEnd = sameLineRunEnd(stmts, i)
+    if runEnd - i >= 2 && !commentInSpan(sLine, sLine) {
+      let joined = ""
+      let ok = true
+      let g = i
+      while g < runEnd {
+        const inner = statementInline(stmts[g], indent)
+        if hasNewline(inner) { ok = false }
+        if g > i { joined = joined + "; " }
+        joined = joined + inner
+        g = g + 1
+      }
+      if ok && indent * 2 + joined.length <= fmtWidth {
+        emitLine(indent, joined)
+      } else {
+        // The one-liner is over the width (or an item went multi-line): expand the WHOLE
+        // run to one statement per line — never a PARTIAL regroup of the tail.
+        let e = i
+        while e < runEnd {
+          emitStatement(stmts[e], indent)
+          e = e + 1
+        }
+      }
+      prevLine = sLine
+      i = runEnd
+      grouped = true
+    }
+    if !grouped {
+      emitStatement(ix, indent)
+      const sl = stopLineOf(ix)
+      if sl == 0 { prevLine = sLine } else { prevLine = sl }
+      i = i + 1
+    }
   }
   0
 }
@@ -988,14 +1041,34 @@ function inlineBlockBody(blockIx: i32, indent: i32) {
     if sl > 0 && commentInSpan(sl, el) { return "" }
     const st = n.blkStmts
     if st.length == 0 { return "{}" }
-    if st.length != 1 { return "" }
-    const s0 = st[0]
-    if !isLeafStmt(s0) { return "" }
-    const inner = statementInline(s0, indent)
-    if hasNewline(inner) { return "" }
-    return "{ " + inner + " }"
+    // A MULTI-statement body inlines ONLY when the user wrote every statement on the SAME
+    // source line — i.e. a `;`-joined one-liner (`if c { f(); return x }`). We PRESERVE that
+    // (rejoined with `; `) but never INTRODUCE a join across statements on separate lines.
+    // The caller width-checks the result, so an over-width one-liner is expanded there. A
+    // SINGLE statement inlines regardless (the long-standing single-statement collapse).
+    if st.length > 1 {
+      const line0 = startLineOf(st[0])
+      if line0 == 0 { return "" }
+      let li = 1
+      while li < st.length {
+        if startLineOf(st[li]) != line0 { return "" }
+        li = li + 1
+      }
+    }
+    let parts = ""
+    let i = 0
+    while i < st.length {
+      if !isLeafStmt(st[i]) { return "" }
+      const inner = statementInline(st[i], indent)
+      if hasNewline(inner) { return "" }
+      if i > 0 { parts = parts + "; " }
+      parts = parts + inner
+      i = i + 1
+    }
+    "{ " + parts + " }"
+  } else {
+    ""
   }
-  ""
 }
 
 // Render an `if … else if … [else]` chain whose every branch is a brace block, in
