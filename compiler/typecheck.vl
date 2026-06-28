@@ -740,9 +740,15 @@ let gRootStmts: i32[] = []
 // return from the inferred TYPE rather than re-deriving from the return expression
 // (which misses a plain-variable return). Kept OUT of the AST `fnRet` so `fmt` never
 // re-adds the annotation. A string-VALUED map would do, but a `{[string]: string}`
-// with `?? ""` mis-lowers (nullable-ref vs ref), so use arrays. Reset per compile.
+// with `?? ""` mis-lowers (nullable-ref vs ref), so the TYPE stays in arrays. Reset per compile.
 let inferRetFn: string[] = []
 let inferRetTy: string[] = []
+// Name → its FIRST index in the arrays, so the hot `inferRetNameOf` is an O(1) map lookup
+// instead of a linear scan (it was ~6% of self-compile time). An i32-VALUED map (the well-
+// supported `{[string]: i32}` path — the string-valued map above mis-lowers), kept in sync via
+// `recordInferRet`. FIRST-wins, matching the old scan. The arrays stay for the emitter's INDEXED
+// access (`inferRetCount`/`inferRetTyAt`) and to hold the string type the map can't.
+let inferRetIdx: {[string]: i32} = Map()
 // The binding analogue of `inferRetFn`/`inferRetTy`: an un-annotated `const`/`let`
 // whose INFERRED type is a value union is recorded by its LetDecl NODE INDEX, so the
 // emitter classifies + lowers it like an annotated nullable/value-union binding even
@@ -953,6 +959,7 @@ export function initChecker() {
   gRootStmts = []
   inferRetFn = []
   inferRetTy = []
+  inferRetIdx = Map()
   inferLetIx = []
   inferLetTy = []
   inferLetNulStrIx = []
@@ -6179,8 +6186,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       if recordable || unm != "" {
         const nodeKey = "#" + i32ToStr(fnIx)
         if inferRetNameOf(nodeKey) == "" {
-          inferRetFn.push(nodeKey)
-          if recordable { inferRetTy.push(anm) } else { inferRetTy.push(unm) }
+          let rty = unm
+          if recordable { rty = anm }
+          recordInferRet(nodeKey, rty)
         }
       }
     }
@@ -8110,8 +8118,7 @@ export function checkProgram(rootIx: i32) {
             // expression-based fallback already handles those, so leave them be.
             const enm = tyToStr(er)
             if isClassifiableRetName(enm) {
-              inferRetFn.push(efn.fnName)
-              inferRetTy.push(enm)
+              recordInferRet(efn.fnName, enm)
             } else {
               // A VALUE union/nullable inferred return (`i32 | string`, `i32 | null`)
               // lowers through the same `uBoxIdx` machinery as an annotation — export
@@ -8119,15 +8126,13 @@ export function checkProgram(rootIx: i32) {
               // return site pick it up.
               const un = valueUnionRetName(er)
               if un != "" {
-                inferRetFn.push(efn.fnName)
-                inferRetTy.push(un)
+                recordInferRet(efn.fnName, un)
               } else if structUnionRetName(er, gRootStmts) != "" {
                 // A STRUCT-union (`Cat | Dog`) lowers un-annotated via the variant-boxed
                 // rep — the SAME machinery as an annotated `: Cat | Dog`. Export its
                 // nominal name so the emitter registers the union + classifies the
                 // binding (`registerInlineUnion` / `unionNameOfExpr`).
-                inferRetFn.push(efn.fnName)
-                inferRetTy.push(structUnionRetName(er, gRootStmts))
+                recordInferRet(efn.fnName, structUnionRetName(er, gRootStmts))
               } else {
                 // A NICHE nullable (`boolean | null` / `string | null`) lowers via its
                 // sentinel / `ref.null $array` rep, not the box, so `valueUnionRetName`
@@ -8138,11 +8143,9 @@ export function checkProgram(rootIx: i32) {
                 if ert is TyNullable {
                   const innerNm = tyToStr(ert.nInner)
                   if innerNm == "boolean" {
-                    inferRetFn.push(efn.fnName)
-                    inferRetTy.push("boolean|null")
+                    recordInferRet(efn.fnName, "boolean|null")
                   } else if innerNm == "string" {
-                    inferRetFn.push(efn.fnName)
-                    inferRetTy.push("string|null")
+                    recordInferRet(efn.fnName, "string|null")
                   }
                 }
               }
@@ -8158,11 +8161,19 @@ export function checkProgram(rootIx: i32) {
 
 // A20: the emitter reads this to classify an un-annotated function's return from its
 // inferred TYPE name rather than re-deriving from the return expression.
+// Record an inferred-return entry: push the parallel arrays AND the by-name map (first-wins).
+// Every `inferRetFn`/`inferRetTy` push goes through here so the map stays in sync.
+function recordInferRet(name: string, ty: string) {
+  if !inferRetIdx.has(name) { inferRetIdx[name] = inferRetFn.length }
+  inferRetFn.push(name)
+  inferRetTy.push(ty)
+  0
+}
+
 export function inferRetNameOf(name: string) {
-  let i = 0
-  while i < inferRetFn.length {
-    if inferRetFn[i] == name { return inferRetTy[i] }
-    i = i + 1
+  if inferRetIdx.has(name) {
+    const i = inferRetIdx[name] ?? -1
+    if i >= 0 { return inferRetTy[i] }
   }
   ""
 }
