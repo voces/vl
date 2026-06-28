@@ -1,7 +1,7 @@
 import { Diag, Tok } from "./ast"
 import { advance, gSrc, mkTok, scanQuoted } from "./lexer"
 import { accept, parseExpr, parseProgram, parseStmt, parseType, parseTypeName } from "./parser"
-import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, nodeTyIsUnion, nodeUnionName, nodeTyIsObj, nodeTyIsNullableStruct, nameIsLitUnionType, nodeTyIsLitUnion, nodeTyIsNullableString, nodeNulStructInnerName, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
+import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, nodeTyIsUnion, nodeUnionName, nodeTyIsObj, nodeTyIsNullableStruct, nameIsLitUnionType, nodeLitUnionMemberTexts, nodeTyIsLitUnion, nodeTyIsNullableString, nodeNulStructInnerName, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
 import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkBlock, mkCall, mkCallN, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkLet, mkMember, mkIndex, mkArrayLit, mkNum, mkParam, mkParen, mkReturn, mkStr, mkTypeRef, mkWhile, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 // VL-in-VL wasm emitter — self-hosted codegen spike.
 //
@@ -3937,6 +3937,9 @@ function exprHasStrOp(exprIx: i32, fnIx: i32) {
       if pcal.identName == "print" {
         if e.callArgs.length == 1 {
           if exprString(e.callArgs[0], fnIx) { return true }
+          // `print(<literal-union atom>)` widens to its member string — its per-member print chain rides
+          // the same string-op scratch frame.
+          if exprIsLitAtom(e.callArgs[0], fnIx) { return true }
         }
       }
       // `toString(x)` builds its digits in the string-op scratch frame.
@@ -11974,39 +11977,27 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           return emitFail("emitProgram: print takes exactly one argument")
         }
         if exprString(c.callArgs[0], fnIx) {
-          // print(string): stream each code point through __print_char__ (import 2),
-          // then one __print_str_flush__ (import 3) — the host's streaming contract.
-          // Rides the string-op scratch frame: A = the string ref, I0 = cursor,
-          // I1 = length (`fnUsesStrOp` is forced by the print-detection walkers).
-          if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-          fbLocalSet(strScratchBase + 0) // strScrA = the string
-          fbI32Const(0)
-          setStrScrI(body, 0)            // I0 = 0
-          pushStrScrRef(body, 0)
-          fbArrayLen()                   // array.len
-          setStrScrI(body, 1)            // I1 = len
-          fbBlock(64)                    // block (void)
-          ctrlEnter()
-          fbLoop(64)                     // loop (void)
-          ctrlEnter()
-          pushStrScrI(body, 0)
-          pushStrScrI(body, 1)
-          fbI32Bin(78)                   // 0x4e i32.ge_s — cursor >= len?
-          fbBrIf(1)                      // exit
-          pushStrScrRef(body, 0)
-          pushStrScrI(body, 0)
-          fbArrayGet(aTypeIdx)           // array.get -> the code point
-          fbCall(2)                      // __print_char__
-          pushStrScrI(body, 0)
-          fbI32Const(1)
-          fbI32Bin(106)                  // i32.add
-          setStrScrI(body, 0)            // I0++
-          fbBr(0)
-          fbEnd()                        // end loop
-          ctrlLeave()
-          fbEnd()                        // end block
-          ctrlLeave()
-          fbCall(3)                      // __print_str_flush__
+          return emitPrintStrExpr(body, c.callArgs[0], fnIx)
+        }
+        // print(literal-union ATOM): WIDEN it to its member STRING — a per-member `if id == <id> { print
+        // "<name>" }` chain (exactly one matches, so at most one prints). The atom→string widening in
+        // statement form; the value form (concat / string arg / return) is a follow-up.
+        if exprIsLitAtom(c.callArgs[0], fnIx) {
+          const lpTexts = nodeLitUnionMemberTexts(c.callArgs[0])
+          let lpi = 0
+          while lpi < lpTexts.length {
+            const lpQ = quoteLex(lpTexts[lpi])
+            if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+            fbI32Const(internAtom(lpQ))
+            fbI32Bin(70) // 0x46 i32.eq
+            fbIf(64)     // if (void)
+            ctrlEnter()
+            const lpSyn = mkStr(lpQ, -1)
+            if emitPrintStrExpr(body, lpSyn, fnIx) < 0 { return -1 }
+            fbEnd()
+            ctrlLeave()
+            lpi = lpi + 1
+          }
           return 0
         }
         // An i64-typed argument lowers to `i64.const`/`local.get` of an i64 slot, so it
@@ -19867,6 +19858,10 @@ function collectA(stmts: i32[]) {
         // nullable wrapper changes only the slot's valtype, not the types needed.
         lUsed = true
         aUsed = true
+      } else if nameIsLitUnionType(nd.tyName) {
+        // A literal-union annotation (`: K`): an atom WIDENS to its member `string` (`print(k)` etc.), so
+        // force the string backing even when the module has no other string literal.
+        aUsed = true
       }
     }
     i = i + 1
@@ -20866,6 +20861,48 @@ function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     }
   }
   false
+}
+
+// The re-quoted source LEXEME for a literal-union member's inner text (`i32` -> `"i32"`) — matches the
+// raw `StrLit.strText` so `internAtom` yields the SAME id, and feeds a synthetic `StrLit` for printing.
+function quoteLex(inner: string) {
+  const q = "\""
+  q + inner + q
+}
+
+// Emit `print(<string expr>)`: stream each code point through `__print_char__`, then one
+// `__print_str_flush__`. Factored from the print handler so the literal-union widening can reuse it.
+function emitPrintStrExpr(body: i32[], strExpr: i32, fnIx: i32) {
+  if emitExpr(body, strExpr, fnIx) < 0 { return -1 }
+  fbLocalSet(strScratchBase + 0)
+  fbI32Const(0)
+  setStrScrI(body, 0)
+  pushStrScrRef(body, 0)
+  fbArrayLen()
+  setStrScrI(body, 1)
+  fbBlock(64)
+  ctrlEnter()
+  fbLoop(64)
+  ctrlEnter()
+  pushStrScrI(body, 0)
+  pushStrScrI(body, 1)
+  fbI32Bin(78) // i32.ge_s
+  fbBrIf(1)
+  pushStrScrRef(body, 0)
+  pushStrScrI(body, 0)
+  fbArrayGet(aTypeIdx)
+  fbCall(2) // __print_char__
+  pushStrScrI(body, 0)
+  fbI32Const(1)
+  fbI32Bin(106) // i32.add
+  setStrScrI(body, 0)
+  fbBr(0)
+  fbEnd()
+  ctrlLeave()
+  fbEnd()
+  ctrlLeave()
+  fbCall(3) // __print_str_flush__
+  0
 }
 
 function collectS(stmts: i32[]) {
