@@ -49,7 +49,7 @@
 import { Tok } from "./ast"
 import { peek } from "./lexer"
 import { accept, peekTok } from "./parser"
-import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, ErrExpr, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, Param, Paren, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, declNameTok } from "./ast"
+import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, EnumDecl, ErrExpr, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, Param, Paren, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, declNameTok } from "./ast"
 import { P, i32ToStr, nodeToks, declNameTokOf, hasNamedArgs, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 import {
   NumLit,
@@ -196,6 +196,26 @@ let scopeEC: i32[] = []
 // a bare-map struct field, and there is exactly one checker instance, so this is
 // equivalent (and keeps the full compiler self-emittable). Reset by `initChecker`.
 export let cUserTypes: {[string]: i32} = Map()
+
+// `cEnumIx` — `enum Name { … }` declarations: a `name → EnumDecl node index` map (the member list is
+// read from the node's `enMembers`). An enum is i32-backed (its `cUserTypes` entry is `TY_I32`), so a
+// `: Name` annotation and a member value both type as i32; this registry only resolves `Name.Member`
+// access + validates the member exists. Module global, reset by `initChecker`, mirroring `cUserTypes`.
+export let cEnumIx: {[string]: i32} = Map()
+
+// The 0-based ORDINAL of `name` in enum decl node `edIx`, or -1 if `edIx` is not an `EnumDecl` or has no
+// such member. The ordinal is the source position; an enum value lowers to this i32 at emit.
+export function enumMemberOrdinal(edIx: i32, name: string) {
+  const ed = P.nodes[edIx]
+  if ed is EnumDecl {
+    let i = 0
+    while i < ed.enMembers.length {
+      if ed.enMembers[i] == name { return i }
+      i = i + 1
+    }
+  }
+  -1
+}
 
 // GENERIC TYPE ALIASES (A10 stage 3, host `instantiateAlias`): a parameterized
 // `type Box<T> = { value: T }` registers here (NOT in `cUserTypes` — it has no
@@ -933,6 +953,7 @@ export function initChecker() {
   T.diags = []
   T.curRet = -1
   cUserTypes = Map()
+  cEnumIx = Map()
   gaNames = []
   gaParamLists = []
   gaDeclIxs = []
@@ -6336,6 +6357,11 @@ function checkProgramNode(n: Program) {
     } else if sd0 is UnionDecl {
       const members0: i32[] = []
       cUserTypes[sd0.udName] = mkUnionTy(members0)
+    } else if sd0 is EnumDecl {
+      // An enum is i32-backed: the type resolves to `i32` (so `: Name` annotations + comparisons just
+      // work), and `cEnumIx` records the decl so `Name.Member` access resolves to its ordinal.
+      cUserTypes[sd0.enName] = TY_I32
+      cEnumIx[sd0.enName] = stmts[t0]
     }
     t0 = t0 + 1
   }
@@ -7094,6 +7120,18 @@ function checkNodeReal(ix: i32) {
     return checkCallNode(n, ix)
     // ── member access ───────────────────────────────────────────────────────────
   } else if n is Member {
+    // Enum member access `Name.Member`: `Name` is an enum TYPE, not a value, so resolve it HERE before
+    // `checkNode(n.memObj)` would reject `Name` as an undeclared identifier. The value is the i32 ordinal.
+    const emObj = P.nodes[n.memObj]
+    if emObj is Ident {
+      if cEnumIx.has(emObj.identName) {
+        if enumMemberOrdinal(cEnumIx[emObj.identName] ?? 0, n.memProp) >= 0 {
+          return symMem(ix, TY_I32)
+        }
+        tErr("enum '" + emObj.identName + "' has no member '" + n.memProp + "'", ix)
+        return TY_ERR
+      }
+    }
     // A flow-narrowed property path (`if o.v is T { … }`) overrides the stored
     // field type within the branch (the host's `narrowedPaths` overlay).
     const mKey = placeKeyOf(ix)

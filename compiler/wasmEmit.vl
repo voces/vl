@@ -2,7 +2,7 @@ import { Diag, Tok } from "./ast"
 import { advance, gSrc, mkTok, scanQuoted } from "./lexer"
 import { accept, parseExpr, parseProgram, parseStmt, parseType, parseTypeName } from "./parser"
 import { T, Ty, TyArray, TyFunc, TyObj, TyPrim, nodeTyIxOf, nodeArrayElemName, applyGenAlias, assignableExpr, canonEmitName, canonEmitTypeNames, declare, inferLetCount, inferLetNameOf, inferLetTyAt, inferRetCount, inferRetNameOf, inferRetNameByNode, inferRetTyAt, intLexemeFitsI32, intLexemeIs2Pow31, isInferLetNulBool, isInferLetNulStr, isValueUnionName, lookup, monoInferListElem, monoInferLocalScalar, nodeTyName, nodeTyIsUnion, nodeUnionName, nodeTyIsObj, nodeTyIsNullableStruct, nodeTyIsNullableString, nodeNulStructInnerName, resolveAnnot, sameNumeric, splitUnionAtoms, unionMemberCount, valueAtomKind } from "./typecheck"
-import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkBlock, mkCall, mkCallN, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkLet, mkMember, mkIndex, mkArrayLit, mkNum, mkParam, mkParen, mkReturn, mkStr, mkTypeRef, mkWhile, orderArgsByParamNames, ufcsAliasOf } from "./ast"
+import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, EnumDecl, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, Node, NullLit, NumLit, ObjLit, OptMember, P, Param, Paren, Parser, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt, addNode, hasNamedArgs, i32ToStr, mkBinary, mkBlock, mkCall, mkCallN, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkLet, mkMember, mkIndex, mkArrayLit, mkNum, mkParam, mkParen, mkReturn, mkStr, mkTypeRef, mkWhile, orderArgsByParamNames, ufcsAliasOf } from "./ast"
 // VL-in-VL wasm emitter — self-hosted codegen spike.
 //
 // A `.vl` program that produces RAW WebAssembly *bytes* for a minimal but valid
@@ -203,6 +203,8 @@ function collectFns(stmts: i32[]) {
     } else if nodeIsTypeDecl(stmts[i]) {
     } else if s is UnionDecl {
       // A `type N = A | B` union alias — collected by `collectU`, skipped here.
+    } else if s is EnumDecl {
+      // An `enum N { … }` decl — i32-backed, no runtime type; members lower as `i32.const` at use sites.
     } else {
       // A top-level STATEMENT — runs in the synthetic start function (source order).
       startStmts.push(stmts[i])
@@ -3072,6 +3074,8 @@ function checkLocalI32(letIx: i32) {
         const ty = P.nodes[d.letType]
         if ty is TypeRef {
           if ty.tyName == "i32" || ty.tyName == "boolean" { return 0 }
+          // An enum is i32-backed, so an enum-typed uninitialized scalar local is fine.
+          if emEnumIx.has(ty.tyName) { return 0 }
         }
       }
       return emitFail("emitProgram: local declaration needs an initializer")
@@ -3082,7 +3086,10 @@ function checkLocalI32(letIx: i32) {
         // `boolean` rides in an i32 (0/1), so a `boolean` local is the SAME i32 slot.
         if ty.tyName != "i32" {
           if ty.tyName != "boolean" {
-            return emitFail("emitProgram: only i32 locals are supported")
+            // An enum is i32-backed (its members are i32 ordinals), so an enum-typed local is an i32 slot.
+            if !emEnumIx.has(ty.tyName) {
+              return emitFail("emitProgram: only i32 locals are supported")
+            }
           }
         }
       } else {
@@ -9964,6 +9971,16 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     return emitIndex(body, exprIx, fnIx)
   }
   if e is Member {
+    // Enum member access `Name.Member` lowers to its i32 ordinal constant (`Name` is an enum TYPE, not a
+    // value — there is nothing to load). Checked first so it never falls into the struct-field path.
+    const emO = P.nodes[e.memObj]
+    if emO is Ident {
+      const eord = emEnumOrdinal(emO.identName, e.memProp)
+      if eord >= 0 {
+        fbI32Const(eord)
+        return 0
+      }
+    }
     // `a.length` on an array OR string receiver is `array.len` (a string is the SAME
     // `array i32` of code points, so `.length` is the code-point count); every other
     // member access is a struct field read. `length` over a non-array/non-string
@@ -16226,6 +16243,8 @@ function checkParams(fnIx: i32) {
             // boundary. The body's map ops resolve the param via `exprMap`/`paramMap`/
             // `mapShapeOfExpr` (which now reads the param annotation's shape). A struct/f64/i64-
             // valued map is NOT yet supported (`retMapFlag` returns 0) → rejected below.
+          } else if emEnumIx.has(ty.tyName) {
+            // accepted — an enum param is i32-backed (its members are i32 ordinals), kind 0.
           } else if ty.tyName != "i32" {
             if ty.tyName != "i64" {
               // i64 rides the 0x7e valtype (Slice 1)
@@ -20694,6 +20713,37 @@ function collectNestedFieldShapes(stmts: i32[]) {
     i = i + 1
   }
   0
+}
+
+// Emit-side enum registry: `enum Name { … }` member name -> ordinal lookup. An enum value lowers to its
+// i32 ordinal; `collectEnums` records each `EnumDecl` node by name so `emitExpr`'s Member arm can resolve
+// `Name.Member` to an `i32.const`. Rebuilt per program (mirrors the checker's `cEnumIx`).
+let emEnumIx: {[string]: i32} = Map()
+
+function collectEnums(stmts: i32[]) {
+  emEnumIx = Map()
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is EnumDecl { emEnumIx[s.enName] = stmts[i] }
+    i = i + 1
+  }
+  0
+}
+
+// The 0-based ordinal of enum `name`'s member `member`, or -1 if `name` is not a known enum or has no
+// such member. Reads the recorded `EnumDecl` node's `enMembers` (source order == ordinal).
+function emEnumOrdinal(name: string, member: string) {
+  if !emEnumIx.has(name) { return -1 }
+  const ed = P.nodes[emEnumIx[name] ?? 0]
+  if ed is EnumDecl {
+    let i = 0
+    while i < ed.enMembers.length {
+      if ed.enMembers[i] == member { return i }
+      i = i + 1
+    }
+  }
+  -1
 }
 
 function collectS(stmts: i32[]) {
@@ -27084,6 +27134,7 @@ function dispatchRewrite(stmts: i32[]) {
       s.letInit = drwWalk(s.letInit, -1)
     } else if nodeIsTypeDecl(stmts[i]) {
     } else if s is UnionDecl {
+    } else if s is EnumDecl {
     } else {
       const oldIx = stmts[i]
       const newIx = drwWalk(oldIx, -1)
@@ -27149,6 +27200,7 @@ function monomorphize(stmts: i32[]) {
       if monoWalk(stmts[i], -1) < 0 { return -1 }
     } else if nodeIsTypeDecl(stmts[i]) {
     } else if s is UnionDecl {
+    } else if s is EnumDecl {
     } else {
       if monoWalk(stmts[i], -1) < 0 { return -1 }
     }
@@ -27661,6 +27713,7 @@ export function emitProgram(rootIx: i32) {
     // function list (FuncDecls only), then the name→index map. Forward references and
     // recursion resolve because every name is mapped before any body is emitted.
     if collectU(stmts) < 0 { return -1 }
+    if collectEnums(stmts) < 0 { return -1 }
     if collectS(stmts) < 0 { return -1 }
     if collectA(stmts) < 0 { return -1 }
     if collectFns(stmts) < 0 { return -1 }
