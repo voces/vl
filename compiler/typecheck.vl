@@ -3744,6 +3744,32 @@ function singleMemberAliasName(name: string) {
   ""
 }
 
+// A NULLABLE LITERAL-UNION's preserved canonical name, or "" if `parts` (the top-level `|`-split
+// members of a union annotation) are not one. `K | null` / `"a" | "b" | null` must keep the litunion
+// members intact — the generic union soften below collapses each quoted literal to `string`, erasing
+// the litunion identity and mis-routing the type to the `string | null` ref box (kind 16) instead of
+// the i32 ATOM NICHE (`-1` = null). Reconstructs as `<litunion-core>|null` (alias preserved, literals
+// kept quoted), which `nameIsNulLitUnion` recognizes and `vtKindOfType` maps to the i32 kind 0.
+function nulLitUnionPreserve(parts: string[]) {
+  let hasNull = false
+  const rest: string[] = []
+  let i = 0
+  while i < parts.length {
+    if parts[i] == "null" { hasNull = true } else { rest.push(parts[i]) }
+    i = i + 1
+  }
+  if !hasNull { return "" }
+  if rest.length == 0 { return "" }
+  let core = rest[0]
+  let j = 1
+  while j < rest.length {
+    core = core + "|" + rest[j]
+    j = j + 1
+  }
+  if nameIsLitUnionType(core) { return core + "|null" }
+  ""
+}
+
 export function canonEmitName(name: string) {
   if name.length == 0 { return name }
   // A single-member union alias is transparent — resolve it to its member's emit name FIRST (before
@@ -3761,6 +3787,9 @@ export function canonEmitName(name: string) {
   if nameHasPipe(name) && !isTopLevelFuncTypeName(name) {
     const parts: string[] = []
     splitTypeName(name, '|', parts)
+    // A nullable literal-union (`K | null`) keeps its litunion members — see `nulLitUnionPreserve`.
+    const nlu = nulLitUnionPreserve(parts)
+    if nlu != "" { return nlu }
     const kept: string[] = []
     let i = 0
     while i < parts.length {
@@ -8569,10 +8598,23 @@ export function anyLitUnionUsed() {
     const n = P.nodes[i]
     if n is TypeRef {
       if nameIsLitUnionType(n.tyName) { return true }
+      // A `K | null` annotation USES the litunion K too — without this, a program whose ONLY litunion
+      // mention is nullable (`K | null` everywhere, no bare `K`) leaves `gLitUnionUsed` at 0 and the
+      // emitter's atom-widening (`exprIsLitAtom`) short-circuits, printing the raw id instead of the member.
+      if annNamesNulLitUnion(n.tyName) { return true }
     }
     i = i + 1
   }
   false
+}
+
+// True if the annotation `name` is a nullable literal-union (`K | null`) — its top-level members are a
+// litunion plus `null` (`nulLitUnionPreserve`). Used by `anyLitUnionUsed` to count the litunion as used.
+function annNamesNulLitUnion(name: string) {
+  if !nameHasPipe(name) { return false }
+  const parts: string[] = []
+  splitTypeName(name, '|', parts)
+  nulLitUnionPreserve(parts) != ""
 }
 
 // True if node `ix` has a recorded ARRAY type whose ELEMENT is a literal union (`K[]`). The
