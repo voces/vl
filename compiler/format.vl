@@ -45,45 +45,111 @@
 
 import { advance, peek } from "./lexer"
 import { T, lookup } from "./typecheck"
-import { ArrayLit, BinExpr, Block, BoolLit, BreakStmt, Call, CharLit, ContinueStmt, ErrExpr, FieldDef, FieldInit, ForIn, ForRange, FuncDecl, Ident, IfStmt, Index, IsExpr, LetDecl, Member, NullLit, NumLit, ObjLit, OptMember, Param, Paren, Program, RetStmt, StrLit, TypeDecl, TypeRef, Unary, UnionDecl, WhileStmt } from "./ast"
-import { P, Node, nodeEndOf, i32ToStr } from "./ast"
 import {
-  NumLit,
-  StrLit,
-  CharLit,
-  BoolLit,
-  NullLit,
-  Ident,
-  Unary,
-  BinExpr,
-  Call,
-  Member,
-  OptMember,
-  Paren,
-  ErrExpr,
-  LetDecl,
-  Param,
-  TypeRef,
-  FuncDecl,
-  IfStmt,
-  WhileStmt,
-  BreakStmt,
-  ContinueStmt,
-  RetStmt,
-  Block,
-  Program,
-  FieldDef,
-  TypeDecl,
-  FieldInit,
-  ObjLit,
   ArrayLit,
-  Index,
-  UnionDecl,
-  IsExpr,
-  ForRange,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
   ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  IsExpr,
+  LetDecl,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
 } from "./ast"
-import { binPrecOf, branchIsSimple, calleePrimary, codeWidthBefore, collapseWs, elseIsIf, exportPrefix, hasNewline, indentStr, isBlankLine, isBracedBlock, isLeafStmt, isOwnLineComment, isWs, joinLines, joinLinesRange, leadingSpaces, nodePos, normalizeProgram, parenForChain, rstrip, rstripNl, rstripWsAll, spaces, splitLines, tokIndexAt, trailingCommentAt, trimWs, trimWsStart, unwrapOuterParen } from "./fmt_util"
+import { Node, P, i32ToStr, nodeEndOf } from "./ast"
+import {
+  ArrayLit,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  IsExpr,
+  LetDecl,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+} from "./ast"
+import {
+  binPrecOf,
+  branchIsSimple,
+  calleePrimary,
+  codeWidthBefore,
+  collapseWs,
+  elseIsIf,
+  exportPrefix,
+  hasNewline,
+  indentStr,
+  isBlankLine,
+  isBracedBlock,
+  isLeafStmt,
+  isOwnLineComment,
+  isWs,
+  joinLines,
+  joinLinesRange,
+  leadingSpaces,
+  nodePos,
+  normalizeProgram,
+  parenForChain,
+  rstrip,
+  rstripNl,
+  rstripWsAll,
+  spaces,
+  splitLines,
+  tokIndexAt,
+  trailingCommentAt,
+  trimWs,
+  trimWsStart,
+  unwrapOuterParen,
+} from "./fmt_util"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 let fmtWidth = 80
@@ -420,6 +486,76 @@ export function formatProgram(progRoot: i32) {
   alignComments(normalizeProgram(text))
 }
 
+// Format one recovered `import`/re-export spanning tokens `[kw .. pathTok]`. A BRACED
+// form (`import { a, b } from "p"` / `export { … } from "p"`) is reconstructed and reflowed
+// through `wrapList` — it stays one line when it fits in `fmtWidth`, else wraps ONE NAME PER
+// LINE with a trailing comma (the convention every other list uses). This both wraps the
+// pathologically long imports AND normalizes an already-wrapped one. A non-braced form
+// (`import x from "p"`) has no name list to reflow, so it is kept verbatim.
+function fmtImport(kw: i32, pathTok: i32) {
+  const t = P.toks[kw]
+  const endTok = P.toks[pathTok]
+  const afterKw = kw + 1
+  if afterKw >= P.toks.length || P.toks[afterKw].kind != "LBRACE" {
+    return fmtSrc.slice(t.start, endTok.start + endTok.text.length)
+  }
+  // The flat `{ … }` name list: find its closing `}` (imports never nest braces).
+  let rb = afterKw + 1
+  while rb < pathTok && P.toks[rb].kind != "RBRACE" { rb = rb + 1 }
+  const lbrace = P.toks[afterKw]
+  const rbrace = P.toks[rb]
+  const inner = fmtSrc.slice(lbrace.start + lbrace.text.length, rbrace.start)
+  // Split on top-level commas; each item (a bare name or `a as b`) is whitespace-collapsed.
+  const items: string[] = []
+  let cur = ""
+  let p = 0
+  while p < inner.length {
+    if inner[p] == ',' {
+      const it = trimWs(collapseWs(cur))
+      if it.length > 0 { items.push(it) }
+      cur = ""
+    } else {
+      cur = cur + fromCodePoint(inner[p])
+    }
+    p = p + 1
+  }
+  const last = trimWs(collapseWs(cur))
+  if last.length > 0 { items.push(last) }
+  // Sort the names (a `{ … }` list is a SET — order is not significant), so the wrapped
+  // one-per-line block reads alphabetically and duplicate/stale imports are easy to spot.
+  // Case-sensitive ASCII: capitalised types/singletons (`P`, `T`, `Tok`) sort before
+  // lowercase functions. An `a as b` item sorts by its full text (i.e. the source name `a`).
+  fmtSortNames(items)
+  const head = t.text + " "
+  const tail = " from " + endTok.text
+  head + wrapList("{ ", items, " }", 0, head.length + tail.length) + tail
+}
+
+// Lexicographic (case-sensitive, code-point) `a < b`.
+function fmtNameLess(a: string, b: string) {
+  let i = 0
+  while i < a.length && i < b.length {
+    if a[i] != b[i] { return a[i] < b[i] }
+    i = i + 1
+  }
+  a.length < b.length
+}
+// In-place insertion sort of import-name items by `fmtNameLess` (lists are short).
+function fmtSortNames(items: string[]) {
+  let i = 1
+  while i < items.length {
+    const key = items[i]
+    let j = i - 1
+    while j >= 0 && fmtNameLess(key, items[j]) {
+      items[j + 1] = items[j]
+      j = j - 1
+    }
+    items[j + 1] = key
+    i = i + 1
+  }
+  0
+}
+
 // Recover `import { … } from "path"` AND re-export `export { … } from "path"`
 // statements from `P.toks` (the parser consumes both without building a node).
 // Each runs from its leading keyword to its path `STRING`; slice that span
@@ -455,7 +591,7 @@ function emitImports() {
         fmtEmitRaw("\n")
       }
       emitLeadingComments(0, startLine)
-      const src = fmtSrc.slice(t.start, endTok.start + endTok.text.length)
+      const src = fmtImport(i, found)
       emitLine(0, src + trailerSuffix(endTok.line))
       prevLine = endTok.line
       i = found + 1
