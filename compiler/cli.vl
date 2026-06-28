@@ -3,7 +3,7 @@ import { advance } from "./lexer"
 import { T } from "./typecheck"
 import { redunCount, redunEColAt, redunELineAt, redunNameAt, redunSColAt, redunSLineAt, redunTypeAt } from "./check_query"
 import { lint, lintCodeAt, lintColAt, lintCount, lintLineAt, lintLines, lintMsgAt, lintMsgs, lintSevAt } from "./lint"
-import { checkSrc, compileSrc, diagCol, diagCount, diagEndCol, diagLine, formatSrc, lintSrc, modCommit, modKeyPush, modOfTok, modPendingAt, modPendingCount, modPendingLen, modReset, modSrcPush, redunModuleAt, srcPush, srcReset, vcCodes, vcDiagMsg, vcFmtOut, vcSource } from "./driver"
+import { checkSrc, compileSrc, diagCol, diagCount, diagEndCol, diagLine, diagModule, formatSrc, lintSrc, modCommit, modKeyPush, modOfTok, modPendingAt, modPendingCount, modPendingLen, modReset, modSrcPush, redunModuleAt, srcPush, srcReset, vcCodes, vcDiagMsg, vcFmtOut, vcSource } from "./driver"
 import { cliAnsi, cliDetab, cliEndsVl, cliFormatNow, cliGlobAt, cliHasImports, cliModCommitOne, cliPendingKey, cliPlural, cliPopLast, cliRepeat, cliSevCode, cliSevRank, cliSevValid, cliSkipDir, cliSplitLines, cliStrGt, cliUpper, cliVisualWidth } from "./cli_util"
 // ── `vl` CLI — the brain in VL (docs/cli-design.md) ──────────────────────────
 // The command-queue half of the CLI. The host (scripts/vl-host) is a thin PUMP:
@@ -110,6 +110,21 @@ let dgLine: i32[] = []
 let dgCol: i32[] = []
 let dgEnd: i32[] = []
 let dgMsg: string[] = []
+// The table index of the module that OWNS each diagnostic (parallel to the arrays
+// above) — so a graph-compile error in an IMPORTED module is labelled (and its caret
+// context drawn) against THAT file, not the entry. 0 = the entry / a positionless
+// diagnostic / single-file (non-module) mode.
+let dgMod: i32[] = []
+// The committed modules' keys + sources, in COMMIT order (so the index matches the
+// driver's module-table index, what `diagModule`/`modOfTok` return) — the per-module
+// file label + caret-context source for a graph-compile diagnostic. Reset + filled by
+// the module fetch loop (`cliBeginCheck` / each `cliModCommitOne`).
+let cliModKeys: string[] = []
+let cliModSrcs: string[] = []
+// Memo for `cliDiagSrcLines`: the last module whose source was split into lines (a
+// file's diagnostics cluster, so this avoids re-splitting per diagnostic).
+let cliDiagLineCacheMod = -1
+let cliDiagLineCache: string[] = []
 let cliSrcLines: string[] = []
 
 // ── argv intake (host pushes each arg before the run loop) ─────────────────────
@@ -192,19 +207,27 @@ export function cliDirCommit(isDir: i32) {
 }
 
 // ── diagnostic formatting (the policy retired from the Rust host) ──────────────
-function cliAddDiag(sev: string, line: i32, col: i32, endc: i32, msg: string) {
+function cliAddDiag(
+  sev: string,
+  line: i32,
+  col: i32,
+  endc: i32,
+  msg: string,
+  mod: i32,
+) {
   dgSev.push(sev)
   dgLine.push(line)
   dgCol.push(col)
   dgEnd.push(endc)
   dgMsg.push(msg)
+  dgMod.push(mod)
   0
 }
 // Concise one-liner: `<file>: <severity> [<line>:<col>] <message>` (1-based L:C).
 function cliFmtConcise(d: i32) {
   let line = dgLine[d]
   if line <= 0 { line = 1 }
-  cliCurFile +
+  cliDiagFile(d) +
     ": " +
     dgSev[d] +
     " [" +
@@ -213,6 +236,27 @@ function cliFmtConcise(d: i32) {
     i32ToStr(dgCol[d] + 1) +
     "] " +
     dgMsg[d]
+}
+// The FILE PATH to label diagnostic `d` with: the owning module's key in module mode
+// (so a graph-compile error in an imported file points at THAT file, not the entry),
+// else the entry path. `dgMod[d]` is 0 (the entry) for lint/redundant + single-file.
+function cliDiagFile(d: i32) {
+  const m = dgMod[d]
+  if cliModMode != 0 && m >= 0 && m < cliModKeys.length { return cliModKeys[m] }
+  cliCurFile
+}
+// The SOURCE LINES of diagnostic `d`'s owning module (its caret-context line), memoized
+// by module index. Falls back to the entry's lines (`cliSrcLines`) outside module mode.
+function cliDiagSrcLines(d: i32) {
+  const m = dgMod[d]
+  if cliModMode != 0 && m >= 0 && m < cliModSrcs.length {
+    if cliDiagLineCacheMod != m {
+      cliDiagLineCache = cliSplitLines(cliModSrcs[m])
+      cliDiagLineCacheMod = m
+    }
+    return cliDiagLineCache
+  }
+  cliSrcLines
 }
 // Pretty rustc/Deno-style block: `[SEVERITY]: msg` / source line / caret /
 // `at file:line:col`. A positionless diagnostic drops the source+caret block.
@@ -225,10 +269,12 @@ function cliFmtPretty(d: i32) {
   )
   let out = head + ": " + dgMsg[d]
   const col = dgCol[d]
+  const dgFile = cliDiagFile(d)
+  const dgSrcLines = cliDiagSrcLines(d)
   if dgLine[d] > 0 {
     const idx = dgLine[d] - 1
-    if idx >= 0 && idx < cliSrcLines.length {
-      const raw = cliSrcLines[idx]
+    if idx >= 0 && idx < dgSrcLines.length {
+      const raw = dgSrcLines[idx]
       const shown = cliDetab(raw)
       out = out + "\n  " + shown
       const start = cliVisualWidth(raw, col)
@@ -251,10 +297,10 @@ function cliFmtPretty(d: i32) {
       cliAnsi(
       cliColor,
       "2",
-      "  at " + cliCurFile + ":" + i32ToStr(dgLine[d]) + ":" + i32ToStr(col + 1),
+      "  at " + dgFile + ":" + i32ToStr(dgLine[d]) + ":" + i32ToStr(col + 1),
     )
   } else {
-    out = out + "\n" + cliAnsi(cliColor, "2", "  at " + cliCurFile)
+    out = out + "\n" + cliAnsi(cliColor, "2", "  at " + dgFile)
   }
   out
 }
@@ -422,10 +468,20 @@ function cliCheckCurFile() {
   dgCol = []
   dgEnd = []
   dgMsg = []
+  dgMod = []
   let n = diagCount()
   let i = 0
   while i < n {
-    cliAddDiag("error", diagLine(i), diagCol(i), diagEndCol(i), vcDiagMsg(i))
+    // Capture the owning module NOW — before `lintSrc` below resets `P.toks`/`nodeToks`
+    // (the anchor `diagModule` resolves through). Single-file mode → 0 (the entry).
+    cliAddDiag(
+      "error",
+      diagLine(i),
+      diagCol(i),
+      diagEndCol(i),
+      vcDiagMsg(i),
+      diagModule(i),
+    )
     i = i + 1
   }
 
@@ -468,7 +524,8 @@ function cliCheckCurFile() {
   while k < ln {
     let sev = lintSevAt(k)
     if sev.length == 0 { sev = "warning" }
-    cliAddDiag(sev, lintLineAt(k), lintColAt(k), lintColAt(k) + 1, lintMsgAt(k))
+    // Lint is parse-only over the ENTRY source, so its findings are the entry's (module 0).
+    cliAddDiag(sev, lintLineAt(k), lintColAt(k), lintColAt(k) + 1, lintMsgAt(k), 0)
     k = k + 1
   }
   // Redundant explicit type annotations (a `hint`): `let x: T = e` where the
@@ -488,6 +545,7 @@ function cliCheckCurFile() {
           "` is inferred as `" +
           redunTypeAt(ri) +
           "` — remove it to lean on inference",
+        0,
       )
     }
     ri = ri + 1
@@ -645,8 +703,13 @@ function cliFetchOrCheckFile() {
 // imports, then run the fetch-or-check loop. Shared by the plain and `--fix` paths.
 function cliBeginCheck() {
   modReset()
+  cliModKeys = []
+  cliModSrcs = []
+  cliDiagLineCacheMod = -1
   if cliHasImports(cliEntrySrc) != 0 {
     cliModMode = 1
+    cliModKeys.push(cliCurFile)
+    cliModSrcs.push(cliEntrySrc)
     cliModCommitOne(cliCurFile, cliEntrySrc, 1)
   } else {
     cliModMode = 0
@@ -898,6 +961,8 @@ export function cliNext() {
     return cliBeginCheck()
   }
   if st == ST_CHECK_FETCH {
+    cliModKeys.push(cliFetchKey)
+    cliModSrcs.push(cliFileSrc)
     cliModCommitOne(cliFetchKey, cliFileSrc, cliFileFound)
     return cliFetchOrCheckFile()
   }

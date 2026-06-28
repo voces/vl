@@ -17,7 +17,7 @@ import { capHas } from "./emit_base"
 import { tokenize } from "./lexer"
 import { P, declNameTok, i32ToStr, mkProgram, nodeToks, ufcsAliasAdd, ufcsAliasReset } from "./ast"
 import { parseProgram } from "./parser"
-import { T, checkProgram, initChecker } from "./typecheck"
+import { T, checkProgram, demangleMsg, initChecker } from "./typecheck"
 import { redunCount, redunEColAt, redunELineAt, redunNameAt, redunSColAt, redunSLineAt, redunTokAt, redunTypeAt, symDefAt, symInlayColAt, symInlayCount, symInlayKindAt, symInlayLineAt, symInlayOccAt, symInlayScan, symInlayTypeCharAt, symInlayTypeLen, symMemTypeStrAt, symMemberCol, symMemberCount, symMemberIsMethod, symMemberLen, symMemberLine, symMemberScanAt, symMemberScanCount, symMemberScanIsFn, symMemberScanNameCharAt, symMemberScanNameLen, symMemberScanTypeCharAt, symMemberScanTypeLen, symOccBinding, symOccCount, symOccEndCol, symOccEndLine, symOccIsDeclAt, symOccKindAt, symOccStartCol, symOccStartLine, symOccTokAt, symRefAt, symRefsCountAt, symScopeAt, symScopeKindAt, symScopeNameCharAt, symScopeNameLen, symScopeTypeCharAt, symScopeTypeLen, symSetEnabled, symTypeAliasAt, symTypeStrAt } from "./check_query"
 import { emitProgram } from "./wasmEmit"
 import { W, emitErr, fnIndices, fnNames, globalNames, globalStmts, localNames, reExpName, reExpTarget } from "./emit_state"
@@ -687,16 +687,16 @@ function vcDiags(): string {
   let i = 0
   while i < P.diags.length {
     let d = P.diags[i]
-    out = out + d.msg + "\n"
+    out = out + demangleMsg(d.msg) + "\n"
     i = i + 1
   }
   let j = 0
   while j < T.diags.length {
     const d2 = T.diags[j]
-    out = out + d2.tmsg + "\n"
+    out = out + demangleMsg(d2.tmsg) + "\n"
     j = j + 1
   }
-  if emitErr.length > 0 { out = out + emitErr + "\n" }
+  if emitErr.length > 0 { out = out + demangleMsg(emitErr) + "\n" }
   out
 }
 export function diagLen(): i32 { vcDiags().length }
@@ -712,10 +712,11 @@ export function diagAt(i: i32): i32 { vcDiags()[i] }
 // matches `vcDiags`: parse diags (lex diags first), then type diags, then the
 // emit failure message (positionless).
 export function vcDiagMsg(i: i32): string {
-  if i < P.diags.length { return P.diags[i].msg }
+  // Demangle the module-merge `$mN` rename artifact so the user sees SOURCE names.
+  if i < P.diags.length { return demangleMsg(P.diags[i].msg) }
   let j = i - P.diags.length
-  if j < T.diags.length { return T.diags[j].tmsg }
-  emitErr
+  if j < T.diags.length { return demangleMsg(T.diags[j].tmsg) }
+  demangleMsg(emitErr)
 }
 export function diagCount(): i32 {
   let n = P.diags.length + T.diags.length
@@ -870,6 +871,27 @@ export function expKwColAt(i: i32): i32 { expKwCol[i] }
 export function modKeyCount(): i32 { modKeys.length }
 export function modKeyAtLen(m: i32): i32 { modKeys[m].length }
 export function modKeyAtCharAt(m: i32, j: i32): i32 { modKeys[m][j] }
+
+// The table index of the module that OWNS diagnostic `i` (its anchor token's module
+// via `modOfTok`), or 0 (the entry) when the anchor is positionless / out of range.
+// Mirrors `diagLine`/`diagEndCol`'s anchor resolution: a parse diag is anchored at a
+// TOKEN index (`Diag.at`), a type diag at an AST NODE resolved through `nodeToks`.
+// MUST be read BEFORE `lintSrc` re-parses the entry (which resets `P.toks`/`nodeToks`,
+// so the anchor would no longer map) — same capture window as the error-tier stream.
+export function diagModule(i: i32): i32 {
+  let at = -1
+  if i < P.diags.length {
+    at = P.diags[i].at
+  } else {
+    let j = i - P.diags.length
+    if j < T.diags.length {
+      const nd = T.diags[j].tat
+      if nd >= 0 && nd < nodeToks.length { at = nodeToks[nd] }
+    }
+  }
+  if at >= 0 && at < P.toks.length { return modOfTok(at) }
+  0
+}
 
 // ── specifier resolution (ports of the host's pure string math) ───────────────
 function modIsRelative(spec: string): boolean {
