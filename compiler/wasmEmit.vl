@@ -3585,7 +3585,58 @@ function exprIsStrConcat(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp == "+" {
-      return exprString(e.binLeft, fnIx) || exprString(e.binRight, fnIx)
+      // A literal-union atom is a `string` subtype, so `"x" + k` / `k + "y"` (and `k1 + k2`)
+      // concatenate — the atom operand widens to its member string in `emitStrConcat`.
+      const lStr = exprString(e.binLeft, fnIx) || exprIsLitAtom(e.binLeft, fnIx)
+      const rStr = exprString(e.binRight, fnIx) || exprIsLitAtom(e.binRight, fnIx)
+      return lStr || rStr
+    }
+  }
+  false
+}
+
+// True if the Call at `callIx` passes a literal-union ATOM into a `string` parameter — the
+// atom widens to its member string (`emitAtomToStr`), which rides the string-op scratch frame.
+// An over-approximation (any atom arg + any `string` param) is fine: it only reserves a frame.
+function callWidensAtomToStr(callIx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Ident {
+      const target = fnIndexOf(callee.identName)
+      if target >= 0 {
+        const cFn = P.nodes[fnStmts[target]]
+        if cFn is FuncDecl {
+          let anyAtom = false
+          let ai = 0
+          while ai < c.callArgs.length {
+            if exprIsLitAtom(c.callArgs[ai], fnIx) { anyAtom = true }
+            ai = ai + 1
+          }
+          if anyAtom {
+            const params = cFn.fnParams
+            let pi = 0
+            while pi < params.length {
+              if vtKindOfParam(params[pi]) == 3 { return true }
+              pi = pi + 1
+            }
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if `retArgIx` is a literal-union atom returned from a `string`-typed function (`fnIx`'s
+// `fnRet`) — it widens to its member string at the return, riding the string-op scratch frame.
+function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
+  if retArgIx < 0 { return false }
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if tyNameOf(fn.fnRet) == "string" {
+      if exprIsLitAtom(retArgIx, fnIx) { return true }
     }
   }
   false
@@ -3926,6 +3977,9 @@ function exprHasStrOp(exprIx: i32, fnIx: i32) {
   }
   if e is Call {
     if exprIsStrSlice(exprIx, fnIx) { return true }
+    // A literal-union atom argument flowing into a `string` param widens (`emitAtomToStr`),
+    // which stages the atom id in the string-op scratch frame.
+    if callWidensAtomToStr(exprIx, fnIx) { return true }
     // `s.indexOf(sub)` / `s.includes(sub)` stage their receiver + needle + loop
     // counters in the same string scratch frame. (`charCodeAt` is a bare
     // `array.get` — no frame needed; its operands recurse below.)
@@ -4023,6 +4077,8 @@ function blockHasStrOpScan(blockIx: i32, fnIx: i32) {
         if exprHasStrOp(s.letInit, fnIx) { return true }
       } else if s is RetStmt {
         if exprHasStrOp(s.retArg, fnIx) { return true }
+        // A literal-union atom returned as `string` widens — reserve the string-op frame.
+        if retWidensAtomToStr(s.retArg, fnIx) { return true }
       } else if s is BinExpr {
         if exprHasStrOp(stmts[i], fnIx) { return true }
       } else if s is Call {
@@ -8615,9 +8671,10 @@ function emitStrConcat(body: i32[], binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     // Eval BOTH operands onto the stack first (nested string ops complete here),
-    // then pop into the scratch refs (B first — it is on top).
-    if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-    if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+    // then pop into the scratch refs (B first — it is on top). A literal-union atom
+    // operand widens to its member string (`emitStrValue`) before the scratch stash.
+    if emitStrValue(body, e.binLeft, fnIx) < 0 { return -1 }
+    if emitStrValue(body, e.binRight, fnIx) < 0 { return -1 }
     fbLocalSet(strScratchBase + 1) // local.set strScrB
     fbLocalSet(strScratchBase + 0) // local.set strScrA
     // I0 = lenA = array.len(A)
@@ -12332,6 +12389,9 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         let cParamNulList = false
         // A literal-union param position: a member-literal argument lowers as its interned i32 id.
         let cParamLitUnion = false
+        // A `string` param position (kind 3): a literal-union atom ARGUMENT widens to its member
+        // string at the boundary (the atom-as-string-subtype edge).
+        let cParamStr = false
         if cFn is FuncDecl {
           const cParams = cFn.fnParams
           if i < cParams.length {
@@ -12345,6 +12405,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
                 cParamLitUnion = true
               }
             }
+            if vtKindOfParam(cParams[i]) == 3 { cParamStr = true }
             if (
               vtKindOfParam(cParams[i]) == 1 ||
               vtKindOfParam(cParams[i]) == 9
@@ -12415,7 +12476,11 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           pendingI64 = false
           i = i + 1
         } else {
-          if cUNm != "" {
+          if cParamStr && exprIsLitAtom(args[i], fnIx) {
+            // A literal-union atom flowing into a `string` param widens to its member string.
+            // (Shared tail below resets the `pending*` hints and advances `i`.)
+            if emitAtomToStr(body, args[i], fnIx) < 0 { return -1 }
+          } else if cUNm != "" {
             // `cUNm` is set only for a kind-4 union-BOX param (see above), so a concrete
             // variant ARGUMENT (`area(s)` where `s: S`, param `C | S`) is boxed here.
             if emitUnionBoxArg(body, cUNm, args[i], fnIx) < 0 { return -1 }
@@ -14964,6 +15029,9 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   let retNulString = false
   let retNulList = false
   let retLitUnion = false
+  // A `string`-returning function whose `return` value is a literal-union atom: widen the
+  // atom to its member string at the return boundary (the atom-as-string-subtype edge).
+  let retStrWiden = false
   let retUNm = ""
   let retVi = -1
   if fn is FuncDecl {
@@ -15017,6 +15085,9 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if retNulStringFlag(fn.fnRet) == 1 { retNulString = true }
     if retNulListFlag(fn.fnRet) == 1 { retNulList = true }
     if nameIsLitUnionType(tyNameOf(fn.fnRet)) { retLitUnion = true }
+    if tyNameOf(fn.fnRet) == "string" {
+      if exprIsLitAtom(retArg, fnIx) { retStrWiden = true }
+    }
     // Inferred niche nullable (un-annotated): seed the niche from the A20 name so a
     // `return null` / `return <bool|string>` lowers as the sentinel / `ref.null` rep.
     if fn.fnRet < 0 {
@@ -15040,6 +15111,9 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     // `retUNm` is the union-BOX return (kind 4); a concrete variant `return s` (where `s: S`
     // and the return type is `C | S`) is boxed into the shared `{tag, payload}` rep here.
     if emitUnionBoxArg(body, retUNm, retArg, fnIx) < 0 { return -1 }
+  } else if retStrWiden {
+    // A literal-union atom returned from a `string`-typed function widens to its member string.
+    if emitAtomToStr(body, retArg, fnIx) < 0 { return -1 }
   } else {
     const savedRNB = pendingNulBool
     const savedRNS = pendingNulString
@@ -20903,6 +20977,69 @@ function emitPrintStrExpr(body: i32[], strExpr: i32, fnIx: i32) {
   ctrlLeave()
   fbCall(3) // __print_str_flush__
   0
+}
+
+// Widen a literal-union ATOM (an i32 id) to a STRING VALUE — a `select` tower mapping each
+// member's id to its string constant. Membership is checker-guaranteed, so the LAST member is
+// the unconditional default arm. The id is evaluated once into the string-op scratch i32 slot 0
+// (`setStrScrI`) and re-read per member; each arm builds a tiny constant string, leaving a
+// NON-NULL string ref (the `string` rep, kind 3). The string-subtype analogue of the numeric
+// i32->f64 widening — its callers (`emitStrConcat`, the `string` arg / return boundaries)
+// reserve the str-op frame via `callWidensAtomToStr` / `retWidensAtomToStr` / `exprIsStrConcat`.
+function emitAtomToStr(body: i32[], atomIx: i32, fnIx: i32) {
+  const texts = nodeLitUnionMemberTexts(atomIx)
+  if texts.length == 0 {
+    return emitFail("emitProgram: literal-union string widening with no members")
+  }
+  if !aUsed {
+    return emitFail(
+      "emitProgram: literal-union string widening but array type not collected",
+    )
+  }
+  // Evaluate the atom (its i32 id) once, stash in the str-op scratch i32 slot 0.
+  const savedLU = pendingLitUnion
+  pendingLitUnion = 1
+  if emitExpr(body, atomIx, fnIx) < 0 { return -1 }
+  pendingLitUnion = savedLU
+  setStrScrI(body, 0)
+  const r = emitAtomToStrChain(body, texts, 0)
+  r
+}
+
+// The `select` tower for `emitAtomToStr`: member `i`'s string if its interned id matches the
+// stashed atom, else the chain for `i+1`. The last member is the unconditional default arm
+// (membership is total, so no compare is needed there).
+function emitAtomToStrChain(body: i32[], texts: string[], i: i32) {
+  if i >= texts.length - 1 {
+    const rd = emitStr(body, mkStr(quoteLex(texts[i]), -1), -1)
+    return rd
+  }
+  // val1 = this member's string constant
+  if emitStr(body, mkStr(quoteLex(texts[i]), -1), -1) < 0 { return -1 }
+  // val2 = the remaining chain
+  if emitAtomToStrChain(body, texts, i + 1) < 0 { return -1 }
+  // cond = (stashed id == this member's id)
+  pushStrScrI(body, 0)
+  fbI32Const(internAtom(quoteLex(texts[i])))
+  fbI32Bin(70) // i32.eq
+  // select_t typed for a non-null string ref (0x64 $aTypeIdx): val1 if cond else val2
+  wU8(28)  // 0x1c select_t
+  wU8(1)   // one result valtype
+  wU8(100) // 0x64 (ref ht) — non-null
+  wSLEB(aTypeIdx)
+  0
+}
+
+// Emit `ix` as a STRING VALUE: a literal-union atom widens to its member string; anything
+// else lowers normally (it is already a string). Used at every `string`-typed boundary that
+// can receive an atom — concat operands, a `string` arg position, a `string` return.
+function emitStrValue(body: i32[], ix: i32, fnIx: i32) {
+  if exprIsLitAtom(ix, fnIx) {
+    const rw = emitAtomToStr(body, ix, fnIx)
+    return rw
+  }
+  const re = emitExpr(body, ix, fnIx)
+  re
 }
 
 function collectS(stmts: i32[]) {
