@@ -43,7 +43,7 @@
 // cursor primitives stay PRIVATE to this module.
 import { Diag } from "./ast"
 import { gDiags, peek } from "./lexer"
-import { ArrayLit, Block, ErrExpr, FieldDef, FieldInit, FuncDecl, Index, ObjLit, Parser, TypeDecl, TypeRef, Unary, UnionDecl, mkArrayLit, mkBinary, mkBlock, mkBool, mkBreak, mkCall, mkCallN, mkChar, mkCompoundAssign, mkContinue, mkErr, mkFieldDef, mkFieldInit, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkIndex, mkIsExpr, mkIsExprNeg, mkLet, mkMember, mkNull, mkNum, mkObjLit, mkOptMember, mkParam, mkParen, mkPreIncr, mkProgram, mkReturn, mkStr, mkTypeDecl, mkTypeRef, mkUnary, mkUnionDecl, mkWhile, nodeEndOf } from "./ast"
+import { ArrayLit, Block, ErrExpr, FieldDef, FieldInit, FuncDecl, Index, ObjLit, Parser, TypeDecl, TypeRef, Unary, UnionDecl, mkArrayLit, mkBinary, mkBlock, mkBool, mkBreak, mkCall, mkCallN, mkChar, mkCompoundAssign, mkContinue, mkErr, mkFieldDef, mkFieldInit, mkForIn, mkForRange, mkFunc, mkIdent, mkIf, mkIndex, mkIsExpr, mkIsExprNeg, mkLet, mkMatch, mkMember, mkNull, mkNum, mkObjLit, mkOptMember, mkParam, mkParen, mkPreIncr, mkProgram, mkReturn, mkStr, mkTypeDecl, mkTypeRef, mkUnary, mkUnionDecl, mkWhile, nodeEndOf } from "./ast"
 import { Tok, P, Ident, mkDeclNameTok } from "./ast"
 import {
   mkNum,
@@ -497,6 +497,11 @@ function parsePrimary() {
     // `parsePrimary` dispatches `IF` to `parseIf` in expression position; the
     // same If node serves as statement and expression downstream.
     return parseIf()
+  }
+  if k == "MATCH" {
+    // `match` is value-returning (an expression); dispatched here so it serves both
+    // statement and expression position (like `if`).
+    return parseMatch()
   }
   if k == "IDENT" { return mkIdent(advance().text, p0) }
   if k == "LPAREN" {
@@ -1348,6 +1353,71 @@ function parseIf() {
     }
   }
   mkIf(cond, thenB, els, p0)
+}
+
+// `match scrut { pat [| pat]* => body … }` — exhaustive value dispatch. Reached from
+// `parsePrimary` (expression position), so a bare `match` statement is an expression statement.
+// Each arm is one-or-more patterns (a STRING literal, or `_` wildcard) joined by `|`, then `=>`
+// and a body (a `{` block, or a bare expression for the value-mapping case). Arms are newline-
+// or comma-separated.
+function parseMatch(): i32 {
+  const p0 = peekTok().start // "match"
+  advance()                  // "match"
+  const scrut = parseExpr()
+  expect("LBRACE")
+  skipNewlines()
+  const pats: i32[] = []
+  const armStart: i32[] = []
+  const armCount: i32[] = []
+  const bodies: i32[] = []
+  let going = peekKind() != "RBRACE" && peekKind() != "EOF"
+  while going {
+    armStart.push(pats.length)
+    let cnt = 0
+    let morePat = true
+    while morePat {
+      pats.push(parseMatchPattern())
+      cnt = cnt + 1
+      if peekKind() == "PIPE" {
+        advance() // "|"  (an OR-pattern)
+        skipNewlines()
+      } else {
+        morePat = false
+      }
+    }
+    armCount.push(cnt)
+    expect("EQUAL") // `=` of `=>`
+    expect("GT")    // `>` of `=>`
+    skipNewlines()
+    let body = -1
+    if peekKind() == "LBRACE" {
+      body = parseBlock()
+    } else {
+      body = parseExpr()
+    }
+    bodies.push(body)
+    skipNewlines()
+    if peekKind() == "COMMA" {
+      advance()
+      skipNewlines()
+    }
+    going = peekKind() != "RBRACE" && peekKind() != "EOF"
+  }
+  expect("RBRACE")
+  mkMatch(scrut, pats, armStart, armCount, bodies, p0)
+}
+
+// One match arm pattern: a STRING literal (a litunion member), or `_` (the wildcard, lexed as
+// the identifier `_`). Any other token is a parse error.
+function parseMatchPattern(): i32 {
+  const pp = peekTok().start
+  if peekKind() == "STRING" { return mkStr(advance().text, pp) }
+  if peekKind() == "IDENT" { return mkIdent(advance().text, pp) }
+  P.diags.push(
+    { msg: "match pattern must be a string literal or `_`", at: P.pos },
+  )
+  advance()
+  mkErr("pat", P.pos, pp)
 }
 
 // `"while" expr block` — `label` is the loop's label when dispatched from the
