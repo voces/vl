@@ -115,6 +115,41 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: a `;`-joined one-liner is preserved when it fits, expanded when it overflows",
+  ignore: !ENABLED,
+  fn: async () => {
+    // A short guard one-liner + a short top-level `;`-run are PRESERVED; an over-width
+    // `;`-run is expanded to one statement per line; statements on SEPARATE source lines
+    // are NEVER joined (we don't introduce `;`).
+    const src =
+      "function f(x: i32): i32 {\n" +
+      "  if x > 0 { print(\"p\"); return 1 }\n" +
+      "  return 0\n" +
+      "}\n" +
+      "const a = 1; const b = 2\n" +
+      "print(aaaaaaaaaaaaaaaaaaaa); print(bbbbbbbbbbbbbbbbbbbb); print(cccccccccccccccccccc); print(d)\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!r.out.includes('if x > 0 { print("p"); return 1 }')) {
+      throw new Error(`short guard one-liner not preserved:\n${r.out}`);
+    }
+    if (!r.out.includes("const a = 1; const b = 2")) {
+      throw new Error(`short top-level ;-run not preserved:\n${r.out}`);
+    }
+    // The over-width run must FULLY expand — no partial regroup of the tail.
+    if (/print\(bbbbbbbbbbbbbbbbbbbb\); print\(/.test(r.out)) {
+      throw new Error(`over-width ;-run was not fully expanded:\n${r.out}`);
+    }
+    if (!/print\(aaaaaaaaaaaaaaaaaaaa\)\n/.test(r.out)) {
+      throw new Error(`over-width ;-run did not expand to one per line:\n${r.out}`);
+    }
+    // Idempotent.
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`; formatting not idempotent:\n${r2.out}`);
+  },
+});
+
+Deno.test({
   name: "vl-fmt: -w rewrites a drifted file in place (idempotent)",
   ignore: !ENABLED,
   fn: async () => {
