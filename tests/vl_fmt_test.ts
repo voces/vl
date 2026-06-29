@@ -235,6 +235,47 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: an over-width union/struct type decl wraps one member/field per line (comments stay long; idempotent)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // A union whose CODE exceeds 80 cols wraps with the first member on the `=`
+    // line and each remaining member on its own `| …` line (the form the parser
+    // accepts). A struct record wraps one field per line with a trailing comma and
+    // the decl's trailing comment on the `}`. A decl that fits in code but only
+    // overflows via a trailing COMMENT is left on one line (comments may be long).
+    const src =
+      "export type K = \"aa\" | \"bb\" | \"cc\" | \"dd\" | \"ee\" | \"ff\" | \"gg\" | \"hh\" | \"ii\" | \"jj\" | \"kk\" | \"ll\"\n" +
+      "export type R = { aaaaaaaa: i32, bbbbbbbb: string, cccccccc: i32, dddddddd: string, ee: i32 } // a record\n" +
+      "type Short = { a: i32, b: i32 } // this short decl is only long because of THIS trailing comment xxxxxx\n" +
+      "print(0)\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    // Union: first member on the `=` line, rest as `  | "…"`.
+    if (!/export type K = "aa"\n {2}\| "bb"\n {2}\| "cc"\n/.test(r.out)) {
+      throw new Error(`union not wrapped one-member-per-line:\n${r.out}`);
+    }
+    // Struct: one field per line, trailing comma, comment on the `}`.
+    if (!/export type R = \{\n {2}aaaaaaaa: i32,\n/.test(r.out)) {
+      throw new Error(`struct not wrapped one-field-per-line:\n${r.out}`);
+    }
+    if (!/ {2}ee: i32,\n\} \/\/ a record\n/.test(r.out)) {
+      throw new Error(`struct close/comment not on the } line:\n${r.out}`);
+    }
+    // Comment-only-over-width decl stays on one line.
+    if (!/type Short = \{ a: i32, b: i32 \} \/\/ this short decl/.test(r.out)) {
+      throw new Error(`comment-only-over-width decl should NOT wrap:\n${r.out}`);
+    }
+    // No wrapped CODE line exceeds 80 (comments excluded).
+    for (const line of r.out.split("\n")) {
+      const code = line.replace(/\s*\/\/.*$/, "");
+      if (code.length > 80) throw new Error(`over-width code line remains: ${line}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`type-decl wrapping not idempotent:\n${r2.out}`);
+  },
+});
+
+Deno.test({
   name: "vl-fmt: a wrapped object literal indents fields/`}` to its own depth (no over- or under-indent)",
   ignore: !ENABLED,
   fn: async () => {
