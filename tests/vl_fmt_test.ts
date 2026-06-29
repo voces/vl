@@ -713,3 +713,68 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "vl-fmt: an over-width call / `+`-chain wraps at its indent (one arg / operand per line, idempotent)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      // The width check accounts for the leading indent, so a call (or `+`-chain)
+      // that only overflows because it is nested wraps: a call breaks to one
+      // argument per line with a trailing comma and `)` on its own line; a `+`-chain
+      // breaks at the operators (operator trailing each line). A string literal that
+      // can't be split stays long, but the call AROUND it still wraps.
+      const f = `${dir}/w.vl`;
+      const src =
+        "function emitMapSet(a: i32, b: i32, c: i32, d: i32, e: i32): i32 { a }\n" +
+        "function foo(targetLonger: i32, fnIxLonger: i32): i32 {\n" +
+        "  if targetLonger > 0 {\n" +
+        "    return emitMapSet(targetLonger, targetLonger, targetLonger, targetLonger, fnIxLonger)\n" +
+        "  }\n" +
+        "  0\n" +
+        "}\n" +
+        "function g(): string {\n" +
+        "  let resultValue = \"alpha\" + \"beta\" + \"gamma\" + \"delta\" + \"epsilon\" + \"zeta\" + \"eta\"\n" +
+        "  resultValue\n" +
+        "}\n";
+      await Deno.writeTextFile(f, src);
+      const once = await run([f]);
+      if (once.code !== 0) throw new Error(`fmt failed: ${once.err}`);
+      // The over-width call breaks one arg per line, trailing comma, `)` on its own
+      // line at the statement's own indent.
+      if (
+        !once.out.includes("    return emitMapSet(\n") ||
+        !once.out.includes("\n      targetLonger,\n") ||
+        !once.out.includes("\n      fnIxLonger,\n") ||
+        !once.out.includes("\n    )\n")
+      ) {
+        throw new Error(`over-width call did not wrap one-arg-per-line:\n${once.out}`);
+      }
+      // The over-width `+`-chain breaks at the operators (operator trailing).
+      if (
+        !once.out.includes("  let resultValue = \"alpha\" +\n") ||
+        !once.out.includes("\n    \"beta\" +\n") ||
+        !once.out.includes("\n    \"eta\"\n")
+      ) {
+        throw new Error(`over-width \`+\`-chain did not wrap at operators:\n${once.out}`);
+      }
+      // No emitted non-comment, non-string line exceeds 80 columns.
+      for (const line of once.out.split("\n")) {
+        const code = line.replace(/\s*\/\/.*$/, "");
+        if (code.length > 80 && !/"/.test(code)) {
+          throw new Error(`line over 80 cols after wrap:\n${line}`);
+        }
+      }
+      // Idempotent across the wrap.
+      const f2 = `${dir}/w2.vl`;
+      await Deno.writeTextFile(f2, once.out);
+      const twice = await run([f2]);
+      if (twice.out !== once.out) {
+        throw new Error(`fmt not idempotent:\n--- once ---\n${once.out}\n--- twice ---\n${twice.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
