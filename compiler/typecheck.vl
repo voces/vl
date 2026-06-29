@@ -7040,378 +7040,7 @@ function checkNodeReal(ix: i32) {
     return arg
     // ── binary ────────────────────────────────────────────────────────────────
   } else if n is BinExpr {
-    const op = n.binOp
-    // `a && b` / `a || b`: the LEFT side's narrowings hold while CHECKING the
-    // right (`p != null && p.x > 0` checks `p.x` under a non-null `p`; for `||`
-    // the right is reached only when the left was FALSE, so its else-narrowings
-    // hold — `p == null || p.x > 0`).
-    if op == "&&" || op == "||" {
-      const clt = checkNode(n.binLeft)
-      const cnames: string[] = []
-      const ctys: i32[] = []
-      if op == "&&" {
-        collectThenNarrows(n.binLeft, cnames, ctys)
-      } else {
-        collectElseNarrows(n.binLeft, cnames, ctys)
-      }
-      let cpushed = 0
-      if cnames.length > 0 {
-        pushScope(-1)
-        applyNarrows(cnames, ctys)
-        cpushed = 1
-      }
-      const crt = checkNode(n.binRight)
-      if cpushed == 1 { popScope() }
-      if !assignable(clt, TY_BOOL) || !assignable(crt, TY_BOOL) {
-        tErr("operator '" + op + "' expects boolean operands", ix)
-      }
-      return TY_BOOL
-    }
-    // Definite-assignment: the LHS of a plain `=` with a bare-name target is a
-    // pure WRITE — flag the target node so the `Ident` arm does not trip
-    // use-before-assign on it (the assignment is what assigns it). A compound
-    // `x += …` is desugared to `x = x + (…)`: the inner `x` in the RHS is NOT the
-    // write target, so its read is still gated. Cleared after the target is
-    // checked. Saved/restored so a nested `=` (e.g. `a = (b = c)`) is exact.
-    const savedWriteTarget = daWriteTarget
-    if op == "=" {
-      const wtgt = P.nodes[n.binLeft]
-      if wtgt is Ident { daWriteTarget = n.binLeft }
-    }
-    let lt = checkNode(n.binLeft)
-    daWriteTarget = savedWriteTarget
-    // Contextual typing for an assignment RHS (`m[k] = (x) => …` over a `{[…]: (i32)=>i32}`
-    // map, `xs[i] = (n) => …`, `f = (n) => …`): seed the LHS type so an un-annotated lambda
-    // param infers from the target (the let-init / arg / return positions already seed).
-    if op == "=" { seedExpected(n.binRight, lt) }
-    let rt = checkNode(n.binRight)
-    // A binary op with a HOLE operand can't decide its form until the hole is bound at the call —
-    // record the deferred constraint (skipping assignment / logical, handled by their own arms).
-    if op != "=" && op != "&&" && op != "||" { noteBinCstr(lt, op, rt) }
-    // Assignment: RHS must be assignable to the LHS's (already-bound) type.
-    if op == "=" {
-      // A `const` NAME cannot be rebound (`x = …`, and the `x++`/`x += …`
-      // desugarings). Data behind it stays mutable (a Member/Index target).
-      const tgt = P.nodes[n.binLeft]
-      if tgt is Ident {
-        if isConstName(tgt.identName) {
-          tErr("cannot reassign `const` " + tgt.identName, ix)
-        }
-        // This write makes the binding definitely assigned on the current path.
-        daMarkAssigned(tgt.identName)
-      }
-      // An index-set into an empty `[]` (`xs[i] = v`) pins its element type to
-      // `typeof v` in place — usage-driven inference (`infer-empty-index-set.vl`),
-      // clearing the uninferred floor. `lt` is the (open `-1`) element type, so
-      // every assignment succeeds against it until it is pinned.
-      if tgt is Index {
-        const arrTy0 = checkNode(tgt.idxArr)
-        const arrT0 = T.tys[arrTy0]
-        if arrT0 is TyArray {
-          if arrT0.aElem < 0 { arrT0.aElem = rt }
-        }
-        // Index WRITE trap (B13, host `indexTrap` "[]="): `o[k] = v` on an
-        // object that declares `"[]="` checks the value against the method's
-        // VALUE parameter (index/wrong-value-type.vl rejects); an object with
-        // only a READ trap rejects the write (host: the missing-method error).
-        if arrT0 is TyObj {
-          const wtrap = objFieldType(arrT0, "[]=")
-          if wtrap >= 0 {
-            const wt = T.tys[wtrap]
-            if wt is TyFunc {
-              if wt.fnParamTypes.length == 2 {
-                if !assignableExpr(n.binRight, rt, wt.fnParamTypes[1]) {
-                  tErr(
-                    "index write: expected " +
-                      tyToStr(wt.fnParamTypes[1]) +
-                      ", got " +
-                      tyToStr(rt),
-                    ix,
-                  )
-                }
-                return rt
-              }
-            }
-          } else if objFieldType(arrT0, "[]") >= 0 {
-            tErr(
-              "no \"[]=\" method for index assignment on " + tyToStr(arrTy0),
-              ix,
-            )
-            return TY_ERR
-          }
-        }
-      }
-      if !assignableExpr(n.binRight, rt, lt) {
-        tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(lt), ix)
-      }
-      // A-infer-null: a nullable binding's open inner HOLE (`let x = null`)
-      // fills from the first non-null assignment (in place, so the binding
-      // becomes `T | null` everywhere); and a straight-line non-null `x = e`
-      // narrows `x` for the REST of the enclosing block (host
-      // `assignmentNarrowing` — an assignment inside a branch unwinds with the
-      // branch's scope, so it never leaks past the join).
-      const asgTgt = P.nodes[n.binLeft]
-      if asgTgt is Ident {
-        const asgCur = lookup(asgTgt.identName)
-        if asgCur >= 0 {
-          const asgCt = T.tys[asgCur]
-          if asgCt is TyNullable {
-            const rtT = T.tys[rt]
-            let rhsNullable = false
-            if rtT is TyNullable { rhsNullable = true }
-            if !rhsNullable && !isNullTy(rt) && rt >= 0 {
-              if asgCt.nInner < 0 { asgCt.nInner = rt }
-              declare(asgTgt.identName, nonNullTy(asgCur))
-            }
-          }
-        }
-      }
-      // Assignment is an expression yielding its RIGHT-HAND SIDE (host parity;
-      // DECISIONS: assignment-as-expression).
-      return rt
-    }
-    // Nullish coalescing: `a ?? d` — the result is `a`'s NON-NULL part unioned
-    // with `d`'s type (host `NullCoalesce`: `a ?? b` with a nullable `b` stays
-    // nullable; a non-null default collapses to the inner type). A non-nullable
-    // LHS just yields itself.
-    if op == "??" {
-      const lt2 = T.tys[lt]
-      if lt2 is TyNullable {
-        // A float-literal default re-encodes at an inner `f32`, so keep the result f32 — else
-        // `joinTys` widens `f32 + f64` to f64 and a downstream `f32` slot rejects the demote.
-        if primNameOf(lt2.nInner) == "f32" && isFloatLitExpr(n.binRight) {
-          return lt2.nInner
-        }
-        return joinTys(lt2.nInner, rt)
-      }
-      return lt
-    }
-    // Equality: result bool; requires mutual compatibility.
-    if op == "==" || op == "!=" {
-      // CLOSED SET (literal unions): comparing a literal-union place against a
-      // literal OUTSIDE its set can never be true — reject rather than compile
-      // an always-false test (host: discrimination is total over the union;
-      // `literal-union-reject-compare`). Only fires when one side's TYPE
-      // carries literal members and the OTHER side is a bare literal.
-      if isLitBearing(lt) {
-        const eqR = litTyOfExpr(n.binRight)
-        if eqR >= 0 {
-          if !assignable(eqR, lt) {
-            tErr(
-              "cannot compare " +
-                tyToStr(lt) +
-                " with " +
-                tyToStr(eqR) +
-                " — not a member of the union",
-              ix,
-            )
-          }
-          // A MEMBER compare is always a valid discrimination (`v == 7` over
-          // `"x" | 7` — the mixed union's softened sides aren't mutually
-          // assignable, so it must not fall through to the general rule).
-          return TY_BOOL
-        }
-      } else if isLitBearing(rt) {
-        const eqL = litTyOfExpr(n.binLeft)
-        if eqL >= 0 {
-          if !assignable(eqL, rt) {
-            tErr(
-              "cannot compare " +
-                tyToStr(eqL) +
-                " with " +
-                tyToStr(rt) +
-                " — not a member of the union",
-              ix,
-            )
-          }
-          return TY_BOOL
-        }
-      }
-      if !assignable(lt, rt) && !assignable(rt, lt) {
-        tErr("cannot compare " + tyToStr(lt) + " with " + tyToStr(rt), ix)
-      } else {
-        // SOUNDNESS: a STRUCTURAL `==`/`!=` on a plain object (or array) defaults
-        // to field-by-field equality, which is sound only when every field is
-        // itself value-comparable. A non-discriminated union/nullable/map field is
-        // not — so reject the default structural compare and ask for an explicit
-        // `==`. (Unions/nullables compared DIRECTLY — value-union equality, `==
-        // null` nullness tests — never reach here: only an object/array operand is
-        // tested, matching the host's anonymous-object structural fallback.)
-        const lT = T.tys[lt]
-        let structural = false
-        if lT is TyObj { structural = true }
-        else if lT is TyArray { structural = true }
-        if structural {
-          let seen: i32[] = []
-          if !isEquatable(lt, seen) {
-            tErr(
-              tyToStr(lt) +
-                " isn't equatable (a field is not value-comparable) — define a `==` operator for it",
-              ix,
-            )
-          }
-        }
-      }
-      return TY_BOOL
-    }
-    // OPERATOR DISPATCH on a user object (B13 + B14): `a op b` with a STRUCT
-    // left operand resolves through a free `self`-function named for the
-    // operator (host parser dispatch — checked FIRST, host order), else
-    // through an operator closure FIELD (`"*": function(s) …` — host
-    // `opFunc`). Equality/logicals/`=`/`??` returned above, so only the
-    // arithmetic/comparison operators reach here.
-    if op != "&&" && op != "||" {
-      const odsp = T.tys[lt]
-      if odsp is TyObj {
-        const osf = opSelfFnTy(op, lt, rt, n.binRight, ix)
-        if osf >= 0 { return osf }
-        const ofld = objFieldType(odsp, op)
-        if ofld >= 0 {
-          const oft = T.tys[ofld]
-          if oft is TyFunc {
-            if oft.fnParamTypes.length == 1 {
-              if !assignableExpr(n.binRight, rt, oft.fnParamTypes[0]) {
-                tErr(
-                  "operator '" +
-                    op +
-                    "': expected " +
-                    tyToStr(oft.fnParamTypes[0]) +
-                    ", got " +
-                    tyToStr(rt),
-                  ix,
-                )
-              }
-              return oft.fnRet
-            }
-          }
-        }
-      }
-    }
-    // Ordering comparison: result bool; requires matching numeric types. A
-    // literal / literal-union operand is its base scalar here (`n < 2` over
-    // `0 | 1 | 2` compares as i32 — host: a numeric-literal union softens).
-    if op == "<" || op == ">" || op == "<=" || op == ">=" {
-      const olt = softenLitTy(lt)
-      const ort = softenLitTy(rt)
-      // String ordering: a lexicographic compare of two strings yields a bool.
-      if isStringTy(olt) && isStringTy(ort) { return TY_BOOL }
-      // A hole operand reaching a numeric comparison is USED numerically — record the demand.
-      if !isNumeric(olt) || !isNumeric(ort) {
-        tErr(
-          "comparison expects numeric operands, got " +
-            tyToStr(olt) +
-            " and " +
-            tyToStr(ort),
-          ix,
-        )
-      } else if !sameNumeric(olt, ort) && !mixesNumeric(olt, ort) {
-        // Mixed numerics may be compared when one side widens to the other
-        // (i32/i64, i32/f64, f32/f64, …); the narrower side widens. Other mixes error.
-        tErr("comparison mixes " + tyToStr(olt) + " and " + tyToStr(ort), ix)
-      }
-      return TY_BOOL
-    }
-    // `+` also concatenates strings.
-    if op == "+" {
-      // String concat requires an operand that ACTUALLY is a string. A hole (un-annotated
-      // param) is permissively `assignable` to string, so the bare `assignable(_, STR)` test
-      // collapsed `a + b` over two holes to `string` — wrong: that op is instantiation-dependent
-      // (i32+i32→i32, f64→f64, string→string) and must DEFER its result to the operand hole
-      // (resolved per call site through `substTyDeep`, so `const x: i32 = add(3, 4)` types and
-      // `const x: string = add(3, 4)` is rejected). A hole paired with a REAL string (`s + "!"`)
-      // still concatenates. With one concrete-string operand present, fall back to the
-      // assignability test (so the other side may be a hole that pins to string).
-      if isStringTy(lt) || isStringTy(rt) {
-        if assignable(lt, TY_STR) && assignable(rt, TY_STR) { return TY_STR }
-      }
-      // List concat `a + b` → a new `T[]` (collections-design §VL.4); the two
-      // element types must agree (an empty `[]` adopts the other side's).
-      const lta = T.tys[lt]
-      if lta is TyArray {
-        const rta = T.tys[rt]
-        if rta is TyArray {
-          constrainEmpty(rt, lt)
-          constrainEmpty(lt, rt)
-          if assignable(rt, lt) { return lt }
-          if assignable(lt, rt) { return rt }
-          tErr("cannot concat " + tyToStr(lt) + " and " + tyToStr(rt), ix)
-          return TY_ERR
-        }
-      }
-    }
-    // Remaining arithmetic: numeric-only, both the SAME numeric type (no implicit
-    // i32 ↔ f64). A literal / all-literal-union operand SOFTENS to its base
-    // scalar first (host: `n + 10` over `1 | 2 | 3` computes — and yields — a
-    // plain i32; the union constrains assignment, not arithmetic).
-    lt = softenLitTy(lt)
-    rt = softenLitTy(rt)
-    // A hole operand reaching arithmetic is USED numerically — record the demand so the call-arg
-    // check enforces a numeric (or operator-overloaded) argument (`isNumeric(TyVar)` passes below).
-    if !isNumeric(lt) || !isNumeric(rt) {
-      // Reached only AFTER string-concat and array-concat are ruled out above, so
-      // this is a genuine operand-type mismatch — `+` does have string/array forms,
-      // so don't claim it is "numeric-only"; just report no form fits these types.
-      tErr(
-        "operator '" +
-          op +
-          "' is not defined for " +
-          tyToStr(lt) +
-          " and " +
-          tyToStr(rt),
-        ix,
-      )
-      return TY_ERR
-    }
-    // BITWISE / SHIFT operators are INTEGER-ONLY: a float operand (i32↔f64 mixing or
-    // even same-type f64) has no bitwise form. Reject before the numeric-widening rules
-    // so `1.0 & 2` errors (the float-widening lattice must not make it pass). Arithmetic
-    // (`+ - * /`), `%`, and comparisons are unaffected.
-    if (
-      op == "&" ||
-      op == "|" ||
-      op == "^" ||
-      op == "<<" ||
-      op == ">>" ||
-      op == ">>>"
-    ) {
-      if (
-        primNameOf(lt) == "f64" ||
-        primNameOf(lt) == "f32" ||
-        primNameOf(rt) == "f64" ||
-        primNameOf(rt) == "f32"
-      ) {
-        tErr(
-          "operator '" +
-            op +
-            "' is integer-only, got " +
-            tyToStr(lt) +
-            " and " +
-            tyToStr(rt),
-          ix,
-        )
-        return TY_ERR
-      }
-    }
-    // A FLOAT LITERAL operand adopts the OTHER side's f32 type (the literal re-encodes
-    // exactly at f32, so `x + 4.0` with `x: f32` stays f32 — the `4.0` is NOT demoted
-    // f64). Checked before the general mixed rule so the result is f32, not the wider
-    // f64. (One side is the f32 variable; the other the float literal typed f64.)
-    if primNameOf(lt) == "f32" && isFloatLitExpr(n.binRight) { return lt }
-    if primNameOf(rt) == "f32" && isFloatLitExpr(n.binLeft) { return rt }
-    // A mixed-numeric op widens the narrower operand to the wider one and yields the
-    // wider type (`i32 op i64`→i64, `f64 op i32`→f64, `f32 op f64`→f64, …). Done BEFORE
-    // the same-type check so a compatible mixed pair is accepted (B2). i32-only programs
-    // never reach here (they are `sameNumeric` and fall through to `return lt`).
-    if mixesNumeric(lt, rt) { return widerNumeric(lt, rt) }
-    if !sameNumeric(lt, rt) {
-      tErr(
-        "operator '" + op + "' mixes " + tyToStr(lt) + " and " + tyToStr(rt),
-        ix,
-      )
-      return TY_ERR
-    }
-    return lt
-    // ── call ──────────────────────────────────────────────────────────────────
+    return checkBinExprNode(n, ix)
   } else if n is Call {
     return checkCallNode(n, ix)
     // ── member access ───────────────────────────────────────────────────────────
@@ -7705,224 +7334,7 @@ function checkNodeReal(ix: i32) {
     return TY_ERR
     // ── let / const ─────────────────────────────────────────────────────────────
   } else if n is LetDecl {
-    // Resolve the annotation (if any) by reading the TypeRef child INLINE.
-    let annot = -1
-    if n.letType >= 0 {
-      const tn = P.nodes[n.letType]
-      if tn is TypeRef {
-        annot = nameToTy(tn.tyName)
-        if annot < 0 {
-          // An i32-keyed map shape (`{[i32]: V}`) is the native list/array path,
-          // not the string-keyed hash map — report that directly (with the fix)
-          // instead of a bare "unknown type", naming the constructor in play.
-          if mapShapeKeyName(tn.tyName) == "i32" {
-            tErr(
-              "An i32-keyed " +
-                initMapCtorName(n.letInit) +
-                " isn't supported yet — i32 keys use a list/array (`T[]`); " +
-                "`Map`/`Set` keys must be `string` for now",
-              n.letType,
-            )
-          } else {
-            tErr("unknown type '" + tn.tyName + "'", n.letType)
-          }
-          annot = TY_ERR
-        }
-      }
-    }
-    let initTy = -1
-    // Bidirectional: a `const f: (i32) => i32 = (x) => …` (or a composite of such — an
-    // annotated array/object of lambdas) infers each un-annotated lambda param from the
-    // annotation BEFORE the initializer is checked.
-    if n.letInit >= 0 && annot >= 0 { seedExpected(n.letInit, annot) }
-    // An UN-annotated binding to a bare lambda (`const add = (a, b) => …`): mark the lambda so its
-    // un-annotated params type as inference holes (a value-flow-monomorphized generic function)
-    // rather than being rejected as uninferable. Annotated bindings seed a concrete type above.
-    if annot < 0 && n.letInit >= 0 {
-      const liN = P.nodes[n.letInit]
-      if liN is FuncDecl {
-        if liN.fnName == "" { noteValBindLambda(n.letInit) }
-      }
-    }
-    if n.letInit >= 0 { initTy = checkNode(n.letInit) }
-    // A `void` initializer (`const x = f()` over a void function) has NO value to bind.
-    // The assignment path (`x = f()`) already rejects it; the BINDING path did not — an
-    // un-annotated binding had no assignability check, and `assignableExpr(void, T)` is
-    // lenient — so a void binding slipped past `vl check` and CRASHED codegen. Reject it
-    // here with a clear, source-located message, poisoning `initTy` to suppress cascades.
-    if n.letInit >= 0 && isVoidTy(initTy) {
-      // EXCEPT an if-EXPRESSION init (`const x = if c then 5`): a statement-if is
-      // context-free `void`, but the if-binding inference below resolves it to `T | null`
-      // (the else-less false path is the implicit `null`) — that path owns it.
-      let vini = n.letInit
-      const vip = P.nodes[vini]
-      if vip is Paren { vini = vip.parInner }
-      const viNode = P.nodes[vini]
-      let voidOk = false
-      if viNode is IfStmt { voidOk = true }
-      if !voidOk {
-        tErr(
-          "cannot bind the void result of '" +
-            n.letName +
-            "' — a void function returns no value",
-          ix,
-        )
-        initTy = TY_ERR
-      }
-    }
-    // Redundant explicit annotation: the initializer's CONTEXT-FREE type (checked
-    // just above, before the annotation is consulted) already IS the annotation, so
-    // `: T` adds nothing. Recorded BEFORE `constrainEmpty` runs, so an empty-
-    // collection hole the annotation legitimately pins is naturally excluded.
-    if annot >= 0 && initTy >= 0 && n.letInit >= 0 {
-      recordRedundantAnnot(n, ix, initTy, annot)
-    }
-    let bound = TY_ERR
-    if annot >= 0 {
-      bound = annot
-      if initTy >= 0 {
-        // An annotated assignment of an empty-collection initializer pins the
-        // SOURCE binding's open holes from the annotation (`const ys: i32[] = zs`
-        // resolves `zs`'s element) — clearing its uninferred floor in place.
-        constrainEmpty(initTy, annot)
-        // A `never`-typed annotation (a degenerate/empty-intersection alias) was
-        // ALREADY reported at its declaration; don't also cascade a "cannot assign
-        // … of type <empty>" at every use site.
-        const neverAnnot = isNeverTy(annot)
-        if !neverAnnot && !assignableExpr(n.letInit, initTy, annot) {
-          // An object literal (`{}` / `{x: 1}`) assigned to a map type is a
-          // category error, not a width mismatch — point at the fix (`Map()`)
-          // rather than the opaque "cannot assign {} to … of type {[string]: …}".
-          const annT = T.tys[annot]
-          const initN = P.nodes[n.letInit]
-          let objToMap = false
-          if annT is TyMap {
-            if initN is ObjLit { objToMap = true }
-          }
-          if objToMap {
-            tErr(
-              "An object literal isn't a map value — construct a map with " +
-                "`Map()` (or a set with `Set()`), e.g. `let m: {[string]: i32} = Map()`",
-              ix,
-            )
-          } else if isNumeric(initTy) && isNumeric(annot) {
-            // Both sides numeric but not assignable ⇒ a lossy/narrowing edge the
-            // lossless-only implicit-widening rule (#298) won't take silently.
-            // Explain the lossiness rather than the opaque "cannot assign i32 to f32".
-            tErr(
-              tyToStr(initTy) +
-                " doesn't fit in " +
-                tyToStr(annot) +
-                " — the conversion is lossy and must be made explicit " +
-                "(narrowing truncates the value)",
-              ix,
-            )
-          } else {
-            tErr(
-              "cannot assign " +
-                tyToStr(initTy) +
-                " to '" +
-                n.letName +
-                "' of type " +
-                tyToStr(annot),
-              ix,
-            )
-          }
-        }
-        // A `Set()` initializer keeps its SET flavor even under a map-shaped
-        // annotation (`let s: {[string]: boolean} = Set()`): the binding exposes
-        // the Set surface (`.add`, no `.set`/`.get`/`.keys`), with the
-        // annotation's key/value types.
-        const it2 = T.tys[initTy]
-        if it2 is TyMap {
-          if it2.mSet == 1 {
-            const an2 = T.tys[annot]
-            if an2 is TyMap { bound = mkMapTy(an2.mKey, an2.mVal, 1) }
-          }
-        }
-      }
-    } else if initTy >= 0 {
-      bound = initTy
-      // USAGE-DRIVEN NULLABLE HOLE (A-infer-null): an un-annotated `let x =
-      // null` is NOT pinned to the exact `null` type — `null` is hole-bearing
-      // (it inhabits every `T | null`). Bind a nullable with an OPEN inner
-      // hole; the first non-null assignment fills `T` in place (see the `=`
-      // arm), so `x` becomes `T | null`. A COMPLETE initializer still pins.
-      if isNullTy(initTy) { bound = mkNullableTy(-1) }
-      // UN-INFERRED EMPTY-COLLECTION FLOOR: an un-annotated `[]` / `Map()` / `Set()`
-      // whose hole is still open here may yet be pinned by a downstream
-      // `.push`/`.set`/`.add` (those mutate the shared arena entry in place), so we
-      // can't decide now. Record it for the scope-close re-check; if the hole stays
-      // open it is genuinely uninferable and `flushUninferred` reports it.
-      if unresolvedHole(bound) { notePending(n.letName, bound, ix) }
-      // Export an un-annotated IF-EXPRESSION binding's INFERRED value-union type (by
-      // node index) for the emitter, so it lowers like an annotated nullable/value-union
-      // binding even when an arm is one the emitter can't statically classify (an ident
-      // `if c then v else null`). Niches/non-unions render "" and are skipped — the
-      // emitter's existing paths handle those. Mirrors the inferred-RETURN export.
-      //
-      // GATED to an if-expression init: the emitter's SOLE consumer is `nliInferIfLet`
-      // (if-expr bindings), and `valueUnionRetName` renders the bound type via `tyToStr`
-      // — cheap for a small union, but ruinous on the huge AST-node union that every
-      // `const e = P.nodes[i]` binds. Restricting to if-expr inits keeps the render off
-      // that hot path (the cause of the #494 ~4× self-compile regression).
-      let initIf = n.letInit
-      if initIf >= 0 {
-        const ini0 = P.nodes[initIf]
-        if ini0 is Paren { initIf = ini0.parInner }
-      }
-      let isIfInit = false
-      if initIf >= 0 {
-        const ini1 = P.nodes[initIf]
-        if ini1 is IfStmt { isIfInit = true }
-      }
-      if isIfInit {
-        const lvn = valueUnionRetName(bound)
-        if lvn != "" {
-          inferLetIx.push(ix)
-          inferLetTy.push(lvn)
-        } else if isNulStringTy(bound) {
-          // `string | null` is a NICHE (not a value-union box) so `valueUnionRetName`
-          // renders "" — record it separately for the kind-16 slot classification.
-          inferLetNulStrIx.push(ix)
-        } else if isNulBoolTy(bound) {
-          // `boolean | null` is the OTHER niche (the i32 sentinel-2 rep) — same story,
-          // recorded for the niche slot classification (`isInferLetNulBool`).
-          inferLetNulBoolIx.push(ix)
-        }
-      }
-    } else {
-      tErr("'" + n.letName + "' needs a type annotation or initializer", ix)
-    }
-    // Same-scope redeclaration (B16): a second `let`/`const` of a name already
-    // bound in the INNERMOST scope frame is an error — `let a = 1; let a = 2` in
-    // one block silently overwrites otherwise. Only the same frame is rejected;
-    // shadowing a name from an OUTER scope in a nested block is legal (the scope
-    // chain is innermost-wins), so we check `T.scopes[top].has` — the current
-    // frame only — not the full `lookup` chain.
-    const dtop = T.scopes.length - 1
-    // A module global is pre-declared by the pass-1.5 hoist, so its own pass-2
-    // declaration would falsely trip the same-frame redeclare check — skip it there
-    // (genuine top-level dups are caught in the hoist). Nested `let`s are unaffected.
-    const preHoisted = dtop == 0 && (moduleGlobals[n.letName] ?? false)
-    if !preHoisted && T.scopes[dtop].has(n.letName) {
-      tErr("redeclared " + n.letName, ix)
-    }
-    declare(n.letName, bound)
-    if symEnabled != 0 { symDecl(n.letName, ix, bound, 0) }
-    if n.letKw == "const" {
-      const ctop = constScopes.length - 1
-      if ctop >= 0 { constScopes[ctop][n.letName] = true }
-    }
-    // Definite-assignment: an uninitialized `let x` / `let x: T` (no initializer)
-    // starts UNASSIGNED; a later read before it is written is an error. An
-    // initialized `let x = …` (and every `const`, which must have a value) is
-    // assigned from the start, so it is never tracked. A re-declaration that
-    // shadows clears any prior assigned/unassigned record under that name.
-    daMarkAssigned(n.letName)
-    if n.letInit < 0 { daAdd(n.letName) }
-    return TY_VOID
-    // ── function declaration ─────────────────────────────────────────────────────
+    return checkLetDeclNode(n, ix)
   } else if n is FuncDecl {
     return checkFuncDeclNode(n, ix)
     // ── while ─────────────────────────────────────────────────────────────────
@@ -8025,271 +7437,9 @@ function checkNodeReal(ix: i32) {
     return TY_VOID
     // ── if / else ─────────────────────────────────────────────────────────────
   } else if n is MatchExpr {
-    // `match scrut { pat => body … }` — exhaustive dispatch over a LITERAL UNION (phase 1).
-    // Type the scrutinee, check every pattern is a member, enforce EXHAUSTIVENESS (all members
-    // covered, or a `_` wildcard) and reject REDUNDANT arms, then join the arm VALUE types so a
-    // value-position `match` (`const x = match …`) and a return-tail `match` both type.
-    const mTail = retTailPos
-    retTailPos = false
-    const st = checkNode(n.matchScrut)
-    if !tyIsLitUnion(st) {
-      tErr("match scrutinee must be a literal union, got " + tyToStr(st), ix)
-      return TY_ERR
-    }
-    // The member texts (inner, no quotes), and a parallel covered-flag.
-    const members: string[] = []
-    const sty = T.tys[st]
-    if sty is TyUnion {
-      let mi = 0
-      while mi < sty.uMembers.length {
-        const mm = T.tys[sty.uMembers[mi]]
-        if mm is TyLit { members.push(mm.litText) }
-        mi = mi + 1
-      }
-    }
-    const covered: i32[] = []
-    let ci = 0
-    while ci < members.length {
-      covered.push(0)
-      ci = ci + 1
-    }
-    let hasWild = false
-    // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
-    // sentinel would POISON the join (every arm joins back to error), so never seed with it.
-    let matchTy = -1
-    let ai = 0
-    while ai < n.matchArmStart.length {
-      // Patterns of arm `ai`.
-      let pj = 0
-      while pj < n.matchArmCount[ai] {
-        const patIx = n.matchPats[n.matchArmStart[ai] + pj]
-        const pn = P.nodes[patIx]
-        if pn is Ident {
-          hasWild = true
-        } else if pn is StrLit {
-          // The member name is the pattern's inner text (strip the surrounding quotes).
-          const raw = pn.strText
-          let inner = raw
-          if raw.length >= 2 { inner = raw.slice(1, raw.length - 1) }
-          let found = -1
-          let fi = 0
-          while fi < members.length {
-            if members[fi] == inner { found = fi }
-            fi = fi + 1
-          }
-          if found < 0 {
-            tErr(
-              "match pattern \"" + inner + "\" is not a member of " + tyToStr(st),
-              patIx,
-            )
-          } else if covered[found] == 1 {
-            tErr(
-              "redundant match arm: \"" + inner + "\" is already covered",
-              patIx,
-            )
-          } else {
-            covered[found] = 1
-          }
-        }
-        pj = pj + 1
-      }
-      // Body value type. (Arm bodies are NOT checked in return-tail position; the match's joined
-      // value seeds the function return once, below — avoids a per-arm void/err mis-seed.)
-      const body = n.matchBodies[ai]
-      const bt = checkNode(body)
-      let armTy = bt
-      const bn = P.nodes[body]
-      if bn is Block {
-        armTy = blockTailTy
-        // A statement-tail block has `blockTailTy == -1` ("no value") — that is VOID, not the
-        // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
-        if armTy < 0 { armTy = TY_VOID }
-      }
-      matchTy = joinTys(matchTy, armTy)
-      ai = ai + 1
-    }
-    // A void-armed match leaves the join unset (-1) or void; normalize to VOID so the function-
-    // body-tail seeding (`noteInferredRet`) does not mistake it for the error sentinel.
-    if matchTy < 0 { matchTy = TY_VOID }
-    // Exhaustiveness: every member covered, or a wildcard.
-    if !hasWild {
-      let missing = ""
-      let mk = 0
-      while mk < members.length {
-        if covered[mk] == 0 {
-          if missing != "" { missing = missing + ", " }
-          missing = missing + "\"" + members[mk] + "\""
-        }
-        mk = mk + 1
-      }
-      if missing != "" {
-        tErr(
-          "non-exhaustive match — missing " + missing + " (add the arm or a `_`)",
-          ix,
-        )
-      }
-    }
-    // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
-    if !inferQuiet { desugarMatchAt(ix) }
-    return matchTy
+    return checkMatchExprNode(n, ix)
   } else if n is IfStmt {
-    // An `if`/`else` in VALUE position is an EXPRESSION whose value is the join of its
-    // branch tail values (`if c { 1 } else { 2 }` is `i32`). Capture whether THIS `if`
-    // sits in the function's return-tail position; the condition itself never does.
-    const ifTail = retTailPos
-    retTailPos = false
-    const condTy = checkNode(n.ifCond)
-    if !assignable(condTy, TY_BOOL) {
-      tErr("if-condition must be boolean, got " + tyToStr(condTy), ix)
-    }
-    // Narrowing over a simple identifier:
-    //  - `if x is T { … }` refines `x` to the variant `T` in the THEN branch.
-    //  - `if x != null { … }` refines a nullable `x` to its inner type in the THEN.
-    //  - `if x == null { … } else { … }` refines `x` to inner in the ELSE; and when
-    //    the THEN always exits (a guard clause), `x` is inner AFTER the `if` too.
-    // Branch narrowing rides a pushed scope that shadows `x`. (Union-complement
-    // narrowing after `is T` was tried and REVERTED — it made VL miss real errors;
-    // null-stripping is the well-defined core and is what the corpus leans on.)
-    // The condition's TRUE narrowings hold in the THEN branch, its FALSE
-    // narrowings in the ELSE (and, for a diverging then — a guard clause — for
-    // the rest of the enclosing block). The collectors handle `is` / null
-    // compares / `&&`-`||` chains / `!(…)` / parens.
-    const tnNames: string[] = []
-    const tnTys: i32[] = []
-    collectThenNarrows(n.ifCond, tnNames, tnTys)
-    const enNames: string[] = []
-    const enTys: i32[] = []
-    collectElseNarrows(n.ifCond, enNames, enTys)
-    // Definite-assignment fork/join: each branch is a separate path forked off
-    // the if-entry state; after the chain they JOIN. A binding is assigned after
-    // the `if` only if assigned on EVERY surviving (non-diverging) path. With no
-    // `else`, the implicit fall-through (condition false) is a surviving path
-    // that assigns nothing — so a write only inside `if c { x = 1 }` does NOT
-    // make `x` assigned afterwards. A branch that always exits (`return`/`break`/
-    // `continue`) contributes nothing to the merge (its end is unreachable).
-    const daEntry = daSnapshot()
-    const daThenDiverges = daBranchDiverges(n.ifThen)
-    if tnNames.length > 0 {
-      pushScope(-1)
-      applyNarrows(tnNames, tnTys)
-    }
-    retTailPos = ifTail
-    checkNode(n.ifThen)
-    retTailPos = false
-    const thenTy = blockTailTy
-    if tnNames.length > 0 { popScope() }
-    // SEED the inferred return from the then-branch value BEFORE the else is checked, so
-    // a recursive call in the else (`fib(n-1)+fib(n-2)`) resolves against the base-case
-    // type (`return n` → i32) instead of an unresolved hole (the #487 mechanism, now
-    // reached through an implicit-return branch value, not just an explicit `return`).
-    // Seed only from a genuine value-`if` (one WITH an `else` — a no-else `if` is a
-    // statement, not a value expression) and only a CONCRETE branch value: a TY_VOID
-    // (a statement-tail branch, e.g. a void procedure's recursive tail call) or a still-
-    // unresolved TY_ERR (a recursive call with no base case seeded yet) must not be
-    // mistaken for the return type, or a void procedure infers a spurious value/error.
-    if ifTail && n.ifElse >= 0 {
-      if thenTy != TY_VOID && thenTy != TY_ERR { noteInferredRet(thenTy) }
-    }
-    // Surviving paths' end-states, each as an unassigned snapshot. Seed with the
-    // then-branch end if it survived.
-    const daThenEnd = daSnapshot()
-    daRestore(daEntry)
-    let daElseDiverges = false
-    let daElseEnd = daEntry
-    let elseTy = TY_VOID
-    const daHasElse = n.ifElse >= 0
-    if daHasElse {
-      daElseDiverges = daBranchDiverges(n.ifElse)
-      if enNames.length > 0 {
-        pushScope(-1)
-        applyNarrows(enNames, enTys)
-      }
-      retTailPos = ifTail
-      checkNode(n.ifElse)
-      retTailPos = false
-      elseTy = blockTailTy
-      if enNames.length > 0 { popScope() }
-      if ifTail {
-        if elseTy != TY_VOID && elseTy != TY_ERR { noteInferredRet(elseTy) }
-      }
-      daElseEnd = daSnapshot()
-    }
-    // Join the surviving paths. Start from the empty set and fold in every
-    // surviving path's unassigned set (the union = "unassigned on some surviving
-    // path"). The else path (or, with no `else`, the entry fall-through) always
-    // counts unless it diverges.
-    daClear()
-    if !daThenDiverges { daJoinInto(daThenEnd) }
-    if daHasElse {
-      if !daElseDiverges { daJoinInto(daElseEnd) }
-    } else {
-      daJoinInto(daEntry)
-    }
-    // GUARD CLAUSE: a THEN that always exits applies the FALSE narrowings to
-    // the rest of the enclosing block (`if x == null { return } … x.f …`).
-    // Host `postGuardNarrowings` parity: only a SINGLE-arm `if` with NO `else`
-    // (an `else`/`else if` chain does not post-narrow the fall-through), and
-    // only ONE union SUBTRACTION per place per block — the host checker accepts
-    // a twice-subtracted residual but both codegens reject it
-    // (xfail-seq-guard-residual-codegen), so the front end keeps rejecting the
-    // second subtraction. Null-STRIPS always apply (guard sequences rely on
-    // them). Path-keyed entries unwind at the ENCLOSING scope's `popScope`.
-    if enNames.length > 0 && !daHasElse {
-      const tn2 = P.nodes[n.ifThen]
-      if tn2 is Block {
-        const tst = tn2.blkStmts
-        if tst.length > 0 {
-          const last = P.nodes[tst[tst.length - 1]]
-          let diverges = false
-          if last is RetStmt { diverges = true }
-          else if last is BreakStmt { diverges = true }
-          else if last is ContinueStmt { diverges = true }
-          if diverges {
-            let gi2 = 0
-            while gi2 < enNames.length {
-              const gKey = enNames[gi2]
-              const gTy = enTys[gi2]
-              if isPathKey(gKey) {
-                npKeys.push(gKey)
-                npTys.push(gTy)
-              } else if gTy == nonNullTy(lookup(gKey)) {
-                declare(gKey, gTy)
-              } else {
-                let gSeen = false
-                let gj = 0
-                while gj < pgKeys.length {
-                  if pgKeys[gj] == gKey { gSeen = true }
-                  gj = gj + 1
-                }
-                if !gSeen {
-                  pgKeys.push(gKey)
-                  declare(gKey, gTy)
-                }
-              }
-              gi2 = gi2 + 1
-            }
-          }
-        }
-      }
-    }
-    retTailPos = ifTail
-    // The `if`-expression's VALUE type: the join of the two branch tail values. With no
-    // `else` the `if` may not yield a value (the fall-through has none), so it is valueless
-    // (TY_VOID) — a value-position use without `else` stays as before. A statement `if`
-    // (void branches) joins to TY_VOID, unchanged.
-    if daHasElse { return joinTys(thenTy, elseTy) }
-    // An else-less `if` in RETURN-TAIL position: the false fall-through yields no value —
-    // that path is `null` (exactly the #484 function fall-through), so the function's
-    // return is `thenTy | null`. The emitter routes this to `emitIfTail` (the then-arm
-    // returns the value; the false path falls through to the function-end null padding,
-    // `emitNullForRet`). Outside tail position (an inline `const x = if c then 5`) the
-    // emitter can't yet leave a nullable value on the stack, so it stays TY_VOID — a clean
-    // "cannot assign void" at the use site, pending a typed-blocktype if-expression.
-    if ifTail && thenTy != TY_VOID && thenTy != TY_ERR {
-      return mkNullableTy(thenTy)
-    }
-    return TY_VOID
-    // ── return ────────────────────────────────────────────────────────────────
+    return checkIfStmtNode(n, ix)
   } else if n is RetStmt {
     const want = T.curRet
     if n.retArg < 0 {
@@ -9326,3 +8476,873 @@ export function isValueUnionName(name: string) {
   }
   false
 }
+
+// Extracted from `checkNodeReal`'s `BinExpr` arm (C3: thin the dispatcher).
+function checkBinExprNode(n: BinExpr, ix: i32) {
+  const op = n.binOp
+  // `a && b` / `a || b`: the LEFT side's narrowings hold while CHECKING the
+  // right (`p != null && p.x > 0` checks `p.x` under a non-null `p`; for `||`
+  // the right is reached only when the left was FALSE, so its else-narrowings
+  // hold — `p == null || p.x > 0`).
+  if op == "&&" || op == "||" {
+    const clt = checkNode(n.binLeft)
+    const cnames: string[] = []
+    const ctys: i32[] = []
+    if op == "&&" {
+      collectThenNarrows(n.binLeft, cnames, ctys)
+    } else {
+      collectElseNarrows(n.binLeft, cnames, ctys)
+    }
+    let cpushed = 0
+    if cnames.length > 0 {
+      pushScope(-1)
+      applyNarrows(cnames, ctys)
+      cpushed = 1
+    }
+    const crt = checkNode(n.binRight)
+    if cpushed == 1 { popScope() }
+    if !assignable(clt, TY_BOOL) || !assignable(crt, TY_BOOL) {
+      tErr("operator '" + op + "' expects boolean operands", ix)
+    }
+    return TY_BOOL
+  }
+  // Definite-assignment: the LHS of a plain `=` with a bare-name target is a
+  // pure WRITE — flag the target node so the `Ident` arm does not trip
+  // use-before-assign on it (the assignment is what assigns it). A compound
+  // `x += …` is desugared to `x = x + (…)`: the inner `x` in the RHS is NOT the
+  // write target, so its read is still gated. Cleared after the target is
+  // checked. Saved/restored so a nested `=` (e.g. `a = (b = c)`) is exact.
+  const savedWriteTarget = daWriteTarget
+  if op == "=" {
+    const wtgt = P.nodes[n.binLeft]
+    if wtgt is Ident { daWriteTarget = n.binLeft }
+  }
+  let lt = checkNode(n.binLeft)
+  daWriteTarget = savedWriteTarget
+  // Contextual typing for an assignment RHS (`m[k] = (x) => …` over a `{[…]: (i32)=>i32}`
+  // map, `xs[i] = (n) => …`, `f = (n) => …`): seed the LHS type so an un-annotated lambda
+  // param infers from the target (the let-init / arg / return positions already seed).
+  if op == "=" { seedExpected(n.binRight, lt) }
+  let rt = checkNode(n.binRight)
+  // A binary op with a HOLE operand can't decide its form until the hole is bound at the call —
+  // record the deferred constraint (skipping assignment / logical, handled by their own arms).
+  if op != "=" && op != "&&" && op != "||" { noteBinCstr(lt, op, rt) }
+  // Assignment: RHS must be assignable to the LHS's (already-bound) type.
+  if op == "=" {
+    // A `const` NAME cannot be rebound (`x = …`, and the `x++`/`x += …`
+    // desugarings). Data behind it stays mutable (a Member/Index target).
+    const tgt = P.nodes[n.binLeft]
+    if tgt is Ident {
+      if isConstName(tgt.identName) {
+        tErr("cannot reassign `const` " + tgt.identName, ix)
+      }
+      // This write makes the binding definitely assigned on the current path.
+      daMarkAssigned(tgt.identName)
+    }
+    // An index-set into an empty `[]` (`xs[i] = v`) pins its element type to
+    // `typeof v` in place — usage-driven inference (`infer-empty-index-set.vl`),
+    // clearing the uninferred floor. `lt` is the (open `-1`) element type, so
+    // every assignment succeeds against it until it is pinned.
+    if tgt is Index {
+      const arrTy0 = checkNode(tgt.idxArr)
+      const arrT0 = T.tys[arrTy0]
+      if arrT0 is TyArray {
+        if arrT0.aElem < 0 { arrT0.aElem = rt }
+      }
+      // Index WRITE trap (B13, host `indexTrap` "[]="): `o[k] = v` on an
+      // object that declares `"[]="` checks the value against the method's
+      // VALUE parameter (index/wrong-value-type.vl rejects); an object with
+      // only a READ trap rejects the write (host: the missing-method error).
+      if arrT0 is TyObj {
+        const wtrap = objFieldType(arrT0, "[]=")
+        if wtrap >= 0 {
+          const wt = T.tys[wtrap]
+          if wt is TyFunc {
+            if wt.fnParamTypes.length == 2 {
+              if !assignableExpr(n.binRight, rt, wt.fnParamTypes[1]) {
+                tErr(
+                  "index write: expected " +
+                    tyToStr(wt.fnParamTypes[1]) +
+                    ", got " +
+                    tyToStr(rt),
+                  ix,
+                )
+              }
+              return rt
+            }
+          }
+        } else if objFieldType(arrT0, "[]") >= 0 {
+          tErr(
+            "no \"[]=\" method for index assignment on " + tyToStr(arrTy0),
+            ix,
+          )
+          return TY_ERR
+        }
+      }
+    }
+    if !assignableExpr(n.binRight, rt, lt) {
+      tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(lt), ix)
+    }
+    // A-infer-null: a nullable binding's open inner HOLE (`let x = null`)
+    // fills from the first non-null assignment (in place, so the binding
+    // becomes `T | null` everywhere); and a straight-line non-null `x = e`
+    // narrows `x` for the REST of the enclosing block (host
+    // `assignmentNarrowing` — an assignment inside a branch unwinds with the
+    // branch's scope, so it never leaks past the join).
+    const asgTgt = P.nodes[n.binLeft]
+    if asgTgt is Ident {
+      const asgCur = lookup(asgTgt.identName)
+      if asgCur >= 0 {
+        const asgCt = T.tys[asgCur]
+        if asgCt is TyNullable {
+          const rtT = T.tys[rt]
+          let rhsNullable = false
+          if rtT is TyNullable { rhsNullable = true }
+          if !rhsNullable && !isNullTy(rt) && rt >= 0 {
+            if asgCt.nInner < 0 { asgCt.nInner = rt }
+            declare(asgTgt.identName, nonNullTy(asgCur))
+          }
+        }
+      }
+    }
+    // Assignment is an expression yielding its RIGHT-HAND SIDE (host parity;
+    // DECISIONS: assignment-as-expression).
+    return rt
+  }
+  // Nullish coalescing: `a ?? d` — the result is `a`'s NON-NULL part unioned
+  // with `d`'s type (host `NullCoalesce`: `a ?? b` with a nullable `b` stays
+  // nullable; a non-null default collapses to the inner type). A non-nullable
+  // LHS just yields itself.
+  if op == "??" {
+    const lt2 = T.tys[lt]
+    if lt2 is TyNullable {
+      // A float-literal default re-encodes at an inner `f32`, so keep the result f32 — else
+      // `joinTys` widens `f32 + f64` to f64 and a downstream `f32` slot rejects the demote.
+      if primNameOf(lt2.nInner) == "f32" && isFloatLitExpr(n.binRight) {
+        return lt2.nInner
+      }
+      return joinTys(lt2.nInner, rt)
+    }
+    return lt
+  }
+  // Equality: result bool; requires mutual compatibility.
+  if op == "==" || op == "!=" {
+    // CLOSED SET (literal unions): comparing a literal-union place against a
+    // literal OUTSIDE its set can never be true — reject rather than compile
+    // an always-false test (host: discrimination is total over the union;
+    // `literal-union-reject-compare`). Only fires when one side's TYPE
+    // carries literal members and the OTHER side is a bare literal.
+    if isLitBearing(lt) {
+      const eqR = litTyOfExpr(n.binRight)
+      if eqR >= 0 {
+        if !assignable(eqR, lt) {
+          tErr(
+            "cannot compare " +
+              tyToStr(lt) +
+              " with " +
+              tyToStr(eqR) +
+              " — not a member of the union",
+            ix,
+          )
+        }
+        // A MEMBER compare is always a valid discrimination (`v == 7` over
+        // `"x" | 7` — the mixed union's softened sides aren't mutually
+        // assignable, so it must not fall through to the general rule).
+        return TY_BOOL
+      }
+    } else if isLitBearing(rt) {
+      const eqL = litTyOfExpr(n.binLeft)
+      if eqL >= 0 {
+        if !assignable(eqL, rt) {
+          tErr(
+            "cannot compare " +
+              tyToStr(eqL) +
+              " with " +
+              tyToStr(rt) +
+              " — not a member of the union",
+            ix,
+          )
+        }
+        return TY_BOOL
+      }
+    }
+    if !assignable(lt, rt) && !assignable(rt, lt) {
+      tErr("cannot compare " + tyToStr(lt) + " with " + tyToStr(rt), ix)
+    } else {
+      // SOUNDNESS: a STRUCTURAL `==`/`!=` on a plain object (or array) defaults
+      // to field-by-field equality, which is sound only when every field is
+      // itself value-comparable. A non-discriminated union/nullable/map field is
+      // not — so reject the default structural compare and ask for an explicit
+      // `==`. (Unions/nullables compared DIRECTLY — value-union equality, `==
+      // null` nullness tests — never reach here: only an object/array operand is
+      // tested, matching the host's anonymous-object structural fallback.)
+      const lT = T.tys[lt]
+      let structural = false
+      if lT is TyObj { structural = true }
+      else if lT is TyArray { structural = true }
+      if structural {
+        let seen: i32[] = []
+        if !isEquatable(lt, seen) {
+          tErr(
+            tyToStr(lt) +
+              " isn't equatable (a field is not value-comparable) — define a `==` operator for it",
+            ix,
+          )
+        }
+      }
+    }
+    return TY_BOOL
+  }
+  // OPERATOR DISPATCH on a user object (B13 + B14): `a op b` with a STRUCT
+  // left operand resolves through a free `self`-function named for the
+  // operator (host parser dispatch — checked FIRST, host order), else
+  // through an operator closure FIELD (`"*": function(s) …` — host
+  // `opFunc`). Equality/logicals/`=`/`??` returned above, so only the
+  // arithmetic/comparison operators reach here.
+  if op != "&&" && op != "||" {
+    const odsp = T.tys[lt]
+    if odsp is TyObj {
+      const osf = opSelfFnTy(op, lt, rt, n.binRight, ix)
+      if osf >= 0 { return osf }
+      const ofld = objFieldType(odsp, op)
+      if ofld >= 0 {
+        const oft = T.tys[ofld]
+        if oft is TyFunc {
+          if oft.fnParamTypes.length == 1 {
+            if !assignableExpr(n.binRight, rt, oft.fnParamTypes[0]) {
+              tErr(
+                "operator '" +
+                  op +
+                  "': expected " +
+                  tyToStr(oft.fnParamTypes[0]) +
+                  ", got " +
+                  tyToStr(rt),
+                ix,
+              )
+            }
+            return oft.fnRet
+          }
+        }
+      }
+    }
+  }
+  // Ordering comparison: result bool; requires matching numeric types. A
+  // literal / literal-union operand is its base scalar here (`n < 2` over
+  // `0 | 1 | 2` compares as i32 — host: a numeric-literal union softens).
+  if op == "<" || op == ">" || op == "<=" || op == ">=" {
+    const olt = softenLitTy(lt)
+    const ort = softenLitTy(rt)
+    // String ordering: a lexicographic compare of two strings yields a bool.
+    if isStringTy(olt) && isStringTy(ort) { return TY_BOOL }
+    // A hole operand reaching a numeric comparison is USED numerically — record the demand.
+    if !isNumeric(olt) || !isNumeric(ort) {
+      tErr(
+        "comparison expects numeric operands, got " +
+          tyToStr(olt) +
+          " and " +
+          tyToStr(ort),
+        ix,
+      )
+    } else if !sameNumeric(olt, ort) && !mixesNumeric(olt, ort) {
+      // Mixed numerics may be compared when one side widens to the other
+      // (i32/i64, i32/f64, f32/f64, …); the narrower side widens. Other mixes error.
+      tErr("comparison mixes " + tyToStr(olt) + " and " + tyToStr(ort), ix)
+    }
+    return TY_BOOL
+  }
+  // `+` also concatenates strings.
+  if op == "+" {
+    // String concat requires an operand that ACTUALLY is a string. A hole (un-annotated
+    // param) is permissively `assignable` to string, so the bare `assignable(_, STR)` test
+    // collapsed `a + b` over two holes to `string` — wrong: that op is instantiation-dependent
+    // (i32+i32→i32, f64→f64, string→string) and must DEFER its result to the operand hole
+    // (resolved per call site through `substTyDeep`, so `const x: i32 = add(3, 4)` types and
+    // `const x: string = add(3, 4)` is rejected). A hole paired with a REAL string (`s + "!"`)
+    // still concatenates. With one concrete-string operand present, fall back to the
+    // assignability test (so the other side may be a hole that pins to string).
+    if isStringTy(lt) || isStringTy(rt) {
+      if assignable(lt, TY_STR) && assignable(rt, TY_STR) { return TY_STR }
+    }
+    // List concat `a + b` → a new `T[]` (collections-design §VL.4); the two
+    // element types must agree (an empty `[]` adopts the other side's).
+    const lta = T.tys[lt]
+    if lta is TyArray {
+      const rta = T.tys[rt]
+      if rta is TyArray {
+        constrainEmpty(rt, lt)
+        constrainEmpty(lt, rt)
+        if assignable(rt, lt) { return lt }
+        if assignable(lt, rt) { return rt }
+        tErr("cannot concat " + tyToStr(lt) + " and " + tyToStr(rt), ix)
+        return TY_ERR
+      }
+    }
+  }
+  // Remaining arithmetic: numeric-only, both the SAME numeric type (no implicit
+  // i32 ↔ f64). A literal / all-literal-union operand SOFTENS to its base
+  // scalar first (host: `n + 10` over `1 | 2 | 3` computes — and yields — a
+  // plain i32; the union constrains assignment, not arithmetic).
+  lt = softenLitTy(lt)
+  rt = softenLitTy(rt)
+  // A hole operand reaching arithmetic is USED numerically — record the demand so the call-arg
+  // check enforces a numeric (or operator-overloaded) argument (`isNumeric(TyVar)` passes below).
+  if !isNumeric(lt) || !isNumeric(rt) {
+    // Reached only AFTER string-concat and array-concat are ruled out above, so
+    // this is a genuine operand-type mismatch — `+` does have string/array forms,
+    // so don't claim it is "numeric-only"; just report no form fits these types.
+    tErr(
+      "operator '" +
+        op +
+        "' is not defined for " +
+        tyToStr(lt) +
+        " and " +
+        tyToStr(rt),
+      ix,
+    )
+    return TY_ERR
+  }
+  // BITWISE / SHIFT operators are INTEGER-ONLY: a float operand (i32↔f64 mixing or
+  // even same-type f64) has no bitwise form. Reject before the numeric-widening rules
+  // so `1.0 & 2` errors (the float-widening lattice must not make it pass). Arithmetic
+  // (`+ - * /`), `%`, and comparisons are unaffected.
+  if (
+    op == "&" ||
+    op == "|" ||
+    op == "^" ||
+    op == "<<" ||
+    op == ">>" ||
+    op == ">>>"
+  ) {
+    if (
+      primNameOf(lt) == "f64" ||
+      primNameOf(lt) == "f32" ||
+      primNameOf(rt) == "f64" ||
+      primNameOf(rt) == "f32"
+    ) {
+      tErr(
+        "operator '" +
+          op +
+          "' is integer-only, got " +
+          tyToStr(lt) +
+          " and " +
+          tyToStr(rt),
+        ix,
+      )
+      return TY_ERR
+    }
+  }
+  // A FLOAT LITERAL operand adopts the OTHER side's f32 type (the literal re-encodes
+  // exactly at f32, so `x + 4.0` with `x: f32` stays f32 — the `4.0` is NOT demoted
+  // f64). Checked before the general mixed rule so the result is f32, not the wider
+  // f64. (One side is the f32 variable; the other the float literal typed f64.)
+  if primNameOf(lt) == "f32" && isFloatLitExpr(n.binRight) { return lt }
+  if primNameOf(rt) == "f32" && isFloatLitExpr(n.binLeft) { return rt }
+  // A mixed-numeric op widens the narrower operand to the wider one and yields the
+  // wider type (`i32 op i64`→i64, `f64 op i32`→f64, `f32 op f64`→f64, …). Done BEFORE
+  // the same-type check so a compatible mixed pair is accepted (B2). i32-only programs
+  // never reach here (they are `sameNumeric` and fall through to `return lt`).
+  if mixesNumeric(lt, rt) { return widerNumeric(lt, rt) }
+  if !sameNumeric(lt, rt) {
+    tErr(
+      "operator '" + op + "' mixes " + tyToStr(lt) + " and " + tyToStr(rt),
+      ix,
+    )
+    return TY_ERR
+  }
+  return lt
+}
+// ── call ──────────────────────────────────────────────────────────────────
+
+// Extracted from `checkNodeReal`'s `LetDecl` arm (C3: thin the dispatcher).
+function checkLetDeclNode(n: LetDecl, ix: i32) {
+  // Resolve the annotation (if any) by reading the TypeRef child INLINE.
+  let annot = -1
+  if n.letType >= 0 {
+    const tn = P.nodes[n.letType]
+    if tn is TypeRef {
+      annot = nameToTy(tn.tyName)
+      if annot < 0 {
+        // An i32-keyed map shape (`{[i32]: V}`) is the native list/array path,
+        // not the string-keyed hash map — report that directly (with the fix)
+        // instead of a bare "unknown type", naming the constructor in play.
+        if mapShapeKeyName(tn.tyName) == "i32" {
+          tErr(
+            "An i32-keyed " +
+              initMapCtorName(n.letInit) +
+              " isn't supported yet — i32 keys use a list/array (`T[]`); " +
+              "`Map`/`Set` keys must be `string` for now",
+            n.letType,
+          )
+        } else {
+          tErr("unknown type '" + tn.tyName + "'", n.letType)
+        }
+        annot = TY_ERR
+      }
+    }
+  }
+  let initTy = -1
+  // Bidirectional: a `const f: (i32) => i32 = (x) => …` (or a composite of such — an
+  // annotated array/object of lambdas) infers each un-annotated lambda param from the
+  // annotation BEFORE the initializer is checked.
+  if n.letInit >= 0 && annot >= 0 { seedExpected(n.letInit, annot) }
+  // An UN-annotated binding to a bare lambda (`const add = (a, b) => …`): mark the lambda so its
+  // un-annotated params type as inference holes (a value-flow-monomorphized generic function)
+  // rather than being rejected as uninferable. Annotated bindings seed a concrete type above.
+  if annot < 0 && n.letInit >= 0 {
+    const liN = P.nodes[n.letInit]
+    if liN is FuncDecl {
+      if liN.fnName == "" { noteValBindLambda(n.letInit) }
+    }
+  }
+  if n.letInit >= 0 { initTy = checkNode(n.letInit) }
+  // A `void` initializer (`const x = f()` over a void function) has NO value to bind.
+  // The assignment path (`x = f()`) already rejects it; the BINDING path did not — an
+  // un-annotated binding had no assignability check, and `assignableExpr(void, T)` is
+  // lenient — so a void binding slipped past `vl check` and CRASHED codegen. Reject it
+  // here with a clear, source-located message, poisoning `initTy` to suppress cascades.
+  if n.letInit >= 0 && isVoidTy(initTy) {
+    // EXCEPT an if-EXPRESSION init (`const x = if c then 5`): a statement-if is
+    // context-free `void`, but the if-binding inference below resolves it to `T | null`
+    // (the else-less false path is the implicit `null`) — that path owns it.
+    let vini = n.letInit
+    const vip = P.nodes[vini]
+    if vip is Paren { vini = vip.parInner }
+    const viNode = P.nodes[vini]
+    let voidOk = false
+    if viNode is IfStmt { voidOk = true }
+    if !voidOk {
+      tErr(
+        "cannot bind the void result of '" +
+          n.letName +
+          "' — a void function returns no value",
+        ix,
+      )
+      initTy = TY_ERR
+    }
+  }
+  // Redundant explicit annotation: the initializer's CONTEXT-FREE type (checked
+  // just above, before the annotation is consulted) already IS the annotation, so
+  // `: T` adds nothing. Recorded BEFORE `constrainEmpty` runs, so an empty-
+  // collection hole the annotation legitimately pins is naturally excluded.
+  if annot >= 0 && initTy >= 0 && n.letInit >= 0 {
+    recordRedundantAnnot(n, ix, initTy, annot)
+  }
+  let bound = TY_ERR
+  if annot >= 0 {
+    bound = annot
+    if initTy >= 0 {
+      // An annotated assignment of an empty-collection initializer pins the
+      // SOURCE binding's open holes from the annotation (`const ys: i32[] = zs`
+      // resolves `zs`'s element) — clearing its uninferred floor in place.
+      constrainEmpty(initTy, annot)
+      // A `never`-typed annotation (a degenerate/empty-intersection alias) was
+      // ALREADY reported at its declaration; don't also cascade a "cannot assign
+      // … of type <empty>" at every use site.
+      const neverAnnot = isNeverTy(annot)
+      if !neverAnnot && !assignableExpr(n.letInit, initTy, annot) {
+        // An object literal (`{}` / `{x: 1}`) assigned to a map type is a
+        // category error, not a width mismatch — point at the fix (`Map()`)
+        // rather than the opaque "cannot assign {} to … of type {[string]: …}".
+        const annT = T.tys[annot]
+        const initN = P.nodes[n.letInit]
+        let objToMap = false
+        if annT is TyMap {
+          if initN is ObjLit { objToMap = true }
+        }
+        if objToMap {
+          tErr(
+            "An object literal isn't a map value — construct a map with " +
+              "`Map()` (or a set with `Set()`), e.g. `let m: {[string]: i32} = Map()`",
+            ix,
+          )
+        } else if isNumeric(initTy) && isNumeric(annot) {
+          // Both sides numeric but not assignable ⇒ a lossy/narrowing edge the
+          // lossless-only implicit-widening rule (#298) won't take silently.
+          // Explain the lossiness rather than the opaque "cannot assign i32 to f32".
+          tErr(
+            tyToStr(initTy) +
+              " doesn't fit in " +
+              tyToStr(annot) +
+              " — the conversion is lossy and must be made explicit " +
+              "(narrowing truncates the value)",
+            ix,
+          )
+        } else {
+          tErr(
+            "cannot assign " +
+              tyToStr(initTy) +
+              " to '" +
+              n.letName +
+              "' of type " +
+              tyToStr(annot),
+            ix,
+          )
+        }
+      }
+      // A `Set()` initializer keeps its SET flavor even under a map-shaped
+      // annotation (`let s: {[string]: boolean} = Set()`): the binding exposes
+      // the Set surface (`.add`, no `.set`/`.get`/`.keys`), with the
+      // annotation's key/value types.
+      const it2 = T.tys[initTy]
+      if it2 is TyMap {
+        if it2.mSet == 1 {
+          const an2 = T.tys[annot]
+          if an2 is TyMap { bound = mkMapTy(an2.mKey, an2.mVal, 1) }
+        }
+      }
+    }
+  } else if initTy >= 0 {
+    bound = initTy
+    // USAGE-DRIVEN NULLABLE HOLE (A-infer-null): an un-annotated `let x =
+    // null` is NOT pinned to the exact `null` type — `null` is hole-bearing
+    // (it inhabits every `T | null`). Bind a nullable with an OPEN inner
+    // hole; the first non-null assignment fills `T` in place (see the `=`
+    // arm), so `x` becomes `T | null`. A COMPLETE initializer still pins.
+    if isNullTy(initTy) { bound = mkNullableTy(-1) }
+    // UN-INFERRED EMPTY-COLLECTION FLOOR: an un-annotated `[]` / `Map()` / `Set()`
+    // whose hole is still open here may yet be pinned by a downstream
+    // `.push`/`.set`/`.add` (those mutate the shared arena entry in place), so we
+    // can't decide now. Record it for the scope-close re-check; if the hole stays
+    // open it is genuinely uninferable and `flushUninferred` reports it.
+    if unresolvedHole(bound) { notePending(n.letName, bound, ix) }
+    // Export an un-annotated IF-EXPRESSION binding's INFERRED value-union type (by
+    // node index) for the emitter, so it lowers like an annotated nullable/value-union
+    // binding even when an arm is one the emitter can't statically classify (an ident
+    // `if c then v else null`). Niches/non-unions render "" and are skipped — the
+    // emitter's existing paths handle those. Mirrors the inferred-RETURN export.
+    //
+    // GATED to an if-expression init: the emitter's SOLE consumer is `nliInferIfLet`
+    // (if-expr bindings), and `valueUnionRetName` renders the bound type via `tyToStr`
+    // — cheap for a small union, but ruinous on the huge AST-node union that every
+    // `const e = P.nodes[i]` binds. Restricting to if-expr inits keeps the render off
+    // that hot path (the cause of the #494 ~4× self-compile regression).
+    let initIf = n.letInit
+    if initIf >= 0 {
+      const ini0 = P.nodes[initIf]
+      if ini0 is Paren { initIf = ini0.parInner }
+    }
+    let isIfInit = false
+    if initIf >= 0 {
+      const ini1 = P.nodes[initIf]
+      if ini1 is IfStmt { isIfInit = true }
+    }
+    if isIfInit {
+      const lvn = valueUnionRetName(bound)
+      if lvn != "" {
+        inferLetIx.push(ix)
+        inferLetTy.push(lvn)
+      } else if isNulStringTy(bound) {
+        // `string | null` is a NICHE (not a value-union box) so `valueUnionRetName`
+        // renders "" — record it separately for the kind-16 slot classification.
+        inferLetNulStrIx.push(ix)
+      } else if isNulBoolTy(bound) {
+        // `boolean | null` is the OTHER niche (the i32 sentinel-2 rep) — same story,
+        // recorded for the niche slot classification (`isInferLetNulBool`).
+        inferLetNulBoolIx.push(ix)
+      }
+    }
+  } else {
+    tErr("'" + n.letName + "' needs a type annotation or initializer", ix)
+  }
+  // Same-scope redeclaration (B16): a second `let`/`const` of a name already
+  // bound in the INNERMOST scope frame is an error — `let a = 1; let a = 2` in
+  // one block silently overwrites otherwise. Only the same frame is rejected;
+  // shadowing a name from an OUTER scope in a nested block is legal (the scope
+  // chain is innermost-wins), so we check `T.scopes[top].has` — the current
+  // frame only — not the full `lookup` chain.
+  const dtop = T.scopes.length - 1
+  // A module global is pre-declared by the pass-1.5 hoist, so its own pass-2
+  // declaration would falsely trip the same-frame redeclare check — skip it there
+  // (genuine top-level dups are caught in the hoist). Nested `let`s are unaffected.
+  const preHoisted = dtop == 0 && (moduleGlobals[n.letName] ?? false)
+  if !preHoisted && T.scopes[dtop].has(n.letName) {
+    tErr("redeclared " + n.letName, ix)
+  }
+  declare(n.letName, bound)
+  if symEnabled != 0 { symDecl(n.letName, ix, bound, 0) }
+  if n.letKw == "const" {
+    const ctop = constScopes.length - 1
+    if ctop >= 0 { constScopes[ctop][n.letName] = true }
+  }
+  // Definite-assignment: an uninitialized `let x` / `let x: T` (no initializer)
+  // starts UNASSIGNED; a later read before it is written is an error. An
+  // initialized `let x = …` (and every `const`, which must have a value) is
+  // assigned from the start, so it is never tracked. A re-declaration that
+  // shadows clears any prior assigned/unassigned record under that name.
+  daMarkAssigned(n.letName)
+  if n.letInit < 0 { daAdd(n.letName) }
+  return TY_VOID
+}
+// ── function declaration ─────────────────────────────────────────────────────
+
+// Extracted from `checkNodeReal`'s `MatchExpr` arm (C3: thin the dispatcher).
+function checkMatchExprNode(n: MatchExpr, ix: i32) {
+  // `match scrut { pat => body … }` — exhaustive dispatch over a LITERAL UNION (phase 1).
+  // Type the scrutinee, check every pattern is a member, enforce EXHAUSTIVENESS (all members
+  // covered, or a `_` wildcard) and reject REDUNDANT arms, then join the arm VALUE types so a
+  // value-position `match` (`const x = match …`) and a return-tail `match` both type.
+  const mTail = retTailPos
+  retTailPos = false
+  const st = checkNode(n.matchScrut)
+  if !tyIsLitUnion(st) {
+    tErr("match scrutinee must be a literal union, got " + tyToStr(st), ix)
+    return TY_ERR
+  }
+  // The member texts (inner, no quotes), and a parallel covered-flag.
+  const members: string[] = []
+  const sty = T.tys[st]
+  if sty is TyUnion {
+    let mi = 0
+    while mi < sty.uMembers.length {
+      const mm = T.tys[sty.uMembers[mi]]
+      if mm is TyLit { members.push(mm.litText) }
+      mi = mi + 1
+    }
+  }
+  const covered: i32[] = []
+  let ci = 0
+  while ci < members.length {
+    covered.push(0)
+    ci = ci + 1
+  }
+  let hasWild = false
+  // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
+  // sentinel would POISON the join (every arm joins back to error), so never seed with it.
+  let matchTy = -1
+  let ai = 0
+  while ai < n.matchArmStart.length {
+    // Patterns of arm `ai`.
+    let pj = 0
+    while pj < n.matchArmCount[ai] {
+      const patIx = n.matchPats[n.matchArmStart[ai] + pj]
+      const pn = P.nodes[patIx]
+      if pn is Ident {
+        hasWild = true
+      } else if pn is StrLit {
+        // The member name is the pattern's inner text (strip the surrounding quotes).
+        const raw = pn.strText
+        let inner = raw
+        if raw.length >= 2 { inner = raw.slice(1, raw.length - 1) }
+        let found = -1
+        let fi = 0
+        while fi < members.length {
+          if members[fi] == inner { found = fi }
+          fi = fi + 1
+        }
+        if found < 0 {
+          tErr(
+            "match pattern \"" + inner + "\" is not a member of " + tyToStr(st),
+            patIx,
+          )
+        } else if covered[found] == 1 {
+          tErr(
+            "redundant match arm: \"" + inner + "\" is already covered",
+            patIx,
+          )
+        } else {
+          covered[found] = 1
+        }
+      }
+      pj = pj + 1
+    }
+    // Body value type. (Arm bodies are NOT checked in return-tail position; the match's joined
+    // value seeds the function return once, below — avoids a per-arm void/err mis-seed.)
+    const body = n.matchBodies[ai]
+    const bt = checkNode(body)
+    let armTy = bt
+    const bn = P.nodes[body]
+    if bn is Block {
+      armTy = blockTailTy
+      // A statement-tail block has `blockTailTy == -1` ("no value") — that is VOID, not the
+      // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
+      if armTy < 0 { armTy = TY_VOID }
+    }
+    matchTy = joinTys(matchTy, armTy)
+    ai = ai + 1
+  }
+  // A void-armed match leaves the join unset (-1) or void; normalize to VOID so the function-
+  // body-tail seeding (`noteInferredRet`) does not mistake it for the error sentinel.
+  if matchTy < 0 { matchTy = TY_VOID }
+  // Exhaustiveness: every member covered, or a wildcard.
+  if !hasWild {
+    let missing = ""
+    let mk = 0
+    while mk < members.length {
+      if covered[mk] == 0 {
+        if missing != "" { missing = missing + ", " }
+        missing = missing + "\"" + members[mk] + "\""
+      }
+      mk = mk + 1
+    }
+    if missing != "" {
+      tErr(
+        "non-exhaustive match — missing " + missing + " (add the arm or a `_`)",
+        ix,
+      )
+    }
+  }
+  // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
+  if !inferQuiet { desugarMatchAt(ix) }
+  return matchTy
+}
+
+// Extracted from `checkNodeReal`'s `IfStmt` arm (C3: thin the dispatcher).
+function checkIfStmtNode(n: IfStmt, ix: i32) {
+  // An `if`/`else` in VALUE position is an EXPRESSION whose value is the join of its
+  // branch tail values (`if c { 1 } else { 2 }` is `i32`). Capture whether THIS `if`
+  // sits in the function's return-tail position; the condition itself never does.
+  const ifTail = retTailPos
+  retTailPos = false
+  const condTy = checkNode(n.ifCond)
+  if !assignable(condTy, TY_BOOL) {
+    tErr("if-condition must be boolean, got " + tyToStr(condTy), ix)
+  }
+  // Narrowing over a simple identifier:
+  //  - `if x is T { … }` refines `x` to the variant `T` in the THEN branch.
+  //  - `if x != null { … }` refines a nullable `x` to its inner type in the THEN.
+  //  - `if x == null { … } else { … }` refines `x` to inner in the ELSE; and when
+  //    the THEN always exits (a guard clause), `x` is inner AFTER the `if` too.
+  // Branch narrowing rides a pushed scope that shadows `x`. (Union-complement
+  // narrowing after `is T` was tried and REVERTED — it made VL miss real errors;
+  // null-stripping is the well-defined core and is what the corpus leans on.)
+  // The condition's TRUE narrowings hold in the THEN branch, its FALSE
+  // narrowings in the ELSE (and, for a diverging then — a guard clause — for
+  // the rest of the enclosing block). The collectors handle `is` / null
+  // compares / `&&`-`||` chains / `!(…)` / parens.
+  const tnNames: string[] = []
+  const tnTys: i32[] = []
+  collectThenNarrows(n.ifCond, tnNames, tnTys)
+  const enNames: string[] = []
+  const enTys: i32[] = []
+  collectElseNarrows(n.ifCond, enNames, enTys)
+  // Definite-assignment fork/join: each branch is a separate path forked off
+  // the if-entry state; after the chain they JOIN. A binding is assigned after
+  // the `if` only if assigned on EVERY surviving (non-diverging) path. With no
+  // `else`, the implicit fall-through (condition false) is a surviving path
+  // that assigns nothing — so a write only inside `if c { x = 1 }` does NOT
+  // make `x` assigned afterwards. A branch that always exits (`return`/`break`/
+  // `continue`) contributes nothing to the merge (its end is unreachable).
+  const daEntry = daSnapshot()
+  const daThenDiverges = daBranchDiverges(n.ifThen)
+  if tnNames.length > 0 {
+    pushScope(-1)
+    applyNarrows(tnNames, tnTys)
+  }
+  retTailPos = ifTail
+  checkNode(n.ifThen)
+  retTailPos = false
+  const thenTy = blockTailTy
+  if tnNames.length > 0 { popScope() }
+  // SEED the inferred return from the then-branch value BEFORE the else is checked, so
+  // a recursive call in the else (`fib(n-1)+fib(n-2)`) resolves against the base-case
+  // type (`return n` → i32) instead of an unresolved hole (the #487 mechanism, now
+  // reached through an implicit-return branch value, not just an explicit `return`).
+  // Seed only from a genuine value-`if` (one WITH an `else` — a no-else `if` is a
+  // statement, not a value expression) and only a CONCRETE branch value: a TY_VOID
+  // (a statement-tail branch, e.g. a void procedure's recursive tail call) or a still-
+  // unresolved TY_ERR (a recursive call with no base case seeded yet) must not be
+  // mistaken for the return type, or a void procedure infers a spurious value/error.
+  if ifTail && n.ifElse >= 0 {
+    if thenTy != TY_VOID && thenTy != TY_ERR { noteInferredRet(thenTy) }
+  }
+  // Surviving paths' end-states, each as an unassigned snapshot. Seed with the
+  // then-branch end if it survived.
+  const daThenEnd = daSnapshot()
+  daRestore(daEntry)
+  let daElseDiverges = false
+  let daElseEnd = daEntry
+  let elseTy = TY_VOID
+  const daHasElse = n.ifElse >= 0
+  if daHasElse {
+    daElseDiverges = daBranchDiverges(n.ifElse)
+    if enNames.length > 0 {
+      pushScope(-1)
+      applyNarrows(enNames, enTys)
+    }
+    retTailPos = ifTail
+    checkNode(n.ifElse)
+    retTailPos = false
+    elseTy = blockTailTy
+    if enNames.length > 0 { popScope() }
+    if ifTail {
+      if elseTy != TY_VOID && elseTy != TY_ERR { noteInferredRet(elseTy) }
+    }
+    daElseEnd = daSnapshot()
+  }
+  // Join the surviving paths. Start from the empty set and fold in every
+  // surviving path's unassigned set (the union = "unassigned on some surviving
+  // path"). The else path (or, with no `else`, the entry fall-through) always
+  // counts unless it diverges.
+  daClear()
+  if !daThenDiverges { daJoinInto(daThenEnd) }
+  if daHasElse {
+    if !daElseDiverges { daJoinInto(daElseEnd) }
+  } else {
+    daJoinInto(daEntry)
+  }
+  // GUARD CLAUSE: a THEN that always exits applies the FALSE narrowings to
+  // the rest of the enclosing block (`if x == null { return } … x.f …`).
+  // Host `postGuardNarrowings` parity: only a SINGLE-arm `if` with NO `else`
+  // (an `else`/`else if` chain does not post-narrow the fall-through), and
+  // only ONE union SUBTRACTION per place per block — the host checker accepts
+  // a twice-subtracted residual but both codegens reject it
+  // (xfail-seq-guard-residual-codegen), so the front end keeps rejecting the
+  // second subtraction. Null-STRIPS always apply (guard sequences rely on
+  // them). Path-keyed entries unwind at the ENCLOSING scope's `popScope`.
+  if enNames.length > 0 && !daHasElse {
+    const tn2 = P.nodes[n.ifThen]
+    if tn2 is Block {
+      const tst = tn2.blkStmts
+      if tst.length > 0 {
+        const last = P.nodes[tst[tst.length - 1]]
+        let diverges = false
+        if last is RetStmt { diverges = true }
+        else if last is BreakStmt { diverges = true }
+        else if last is ContinueStmt { diverges = true }
+        if diverges {
+          let gi2 = 0
+          while gi2 < enNames.length {
+            const gKey = enNames[gi2]
+            const gTy = enTys[gi2]
+            if isPathKey(gKey) {
+              npKeys.push(gKey)
+              npTys.push(gTy)
+            } else if gTy == nonNullTy(lookup(gKey)) {
+              declare(gKey, gTy)
+            } else {
+              let gSeen = false
+              let gj = 0
+              while gj < pgKeys.length {
+                if pgKeys[gj] == gKey { gSeen = true }
+                gj = gj + 1
+              }
+              if !gSeen {
+                pgKeys.push(gKey)
+                declare(gKey, gTy)
+              }
+            }
+            gi2 = gi2 + 1
+          }
+        }
+      }
+    }
+  }
+  retTailPos = ifTail
+  // The `if`-expression's VALUE type: the join of the two branch tail values. With no
+  // `else` the `if` may not yield a value (the fall-through has none), so it is valueless
+  // (TY_VOID) — a value-position use without `else` stays as before. A statement `if`
+  // (void branches) joins to TY_VOID, unchanged.
+  if daHasElse { return joinTys(thenTy, elseTy) }
+  // An else-less `if` in RETURN-TAIL position: the false fall-through yields no value —
+  // that path is `null` (exactly the #484 function fall-through), so the function's
+  // return is `thenTy | null`. The emitter routes this to `emitIfTail` (the then-arm
+  // returns the value; the false path falls through to the function-end null padding,
+  // `emitNullForRet`). Outside tail position (an inline `const x = if c then 5`) the
+  // emitter can't yet leave a nullable value on the stack, so it stays TY_VOID — a clean
+  // "cannot assign void" at the use site, pending a typed-blocktype if-expression.
+  if ifTail && thenTy != TY_VOID && thenTy != TY_ERR {
+    return mkNullableTy(thenTy)
+  }
+  return TY_VOID
+}
+// ── return ────────────────────────────────────────────────────────────────
