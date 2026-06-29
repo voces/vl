@@ -545,7 +545,6 @@ import {
   vbI32Used,
   vbI64Idx,
   vbI64Used,
-  vkCode,
   vkOfCode,
 } from "./emit_state"
 import {
@@ -1932,7 +1931,7 @@ function exprNullableStruct(exprIx: i32, fnIx: i32) {
     // A CAPTURED nullable struct (`const p: P | null = …; () => if p != null { p.x }`): the env
     // field is `(ref null $S)` (kind 9), so classify it nullable — else `p != null` reads as
     // struct equality. The struct index resolves via `capturedStructIndex`.
-    if capturedKindOf(fnIx, e.identName) == 9 { return true }
+    if capturedKindOf(fnIx, e.identName) == "nulstruct" { return true }
     return globalIsNulRef(e.identName)
   }
   // A NESTED-STRUCT field read (code 15) is stored `(ref null $S)` — a `S|null`
@@ -6237,14 +6236,14 @@ function emitUnionIfValue(
       return emitFail("emitProgram: union if-expression requires an else arm")
     }
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
-    wU8(4)           // 0x04 if
-    fbValtype(4, -1) // result blocktype: the union box `(ref $uBox)`
+    wU8(4)                 // 0x04 if
+    fbValtype("union", -1) // result blocktype: the union box `(ref $uBox)`
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rcT = emitUnionIfArm(body, unionName, s.ifThen, fnIx)
     if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
-    fbElse()         // 0x05 else
+    fbElse()               // 0x05 else
     const savedElseTop = narrowTop
     const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     const els = P.nodes[s.ifElse]
@@ -6323,14 +6322,14 @@ function emitVariantIfValue(body: i32[], vi: i32, ifIx: i32, fnIx: i32) {
       return emitFail("emitProgram: variant if-expression requires an else arm")
     }
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
-    wU8(4)           // 0x04 if
-    fbValtype(8, vi) // result blocktype: the variant struct `(ref $(uVarIdx + vi))`
+    wU8(4)                   // 0x04 if
+    fbValtype("variant", vi) // result blocktype: the variant struct `(ref $(uVarIdx + vi))`
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rcT = emitVariantIfArm(body, vi, s.ifThen, fnIx)
     if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
-    fbElse()         // 0x05 else
+    fbElse()                 // 0x05 else
     const savedElseTop = narrowTop
     const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     const els = P.nodes[s.ifElse]
@@ -11796,9 +11795,9 @@ function emitIfExprRef(
     // generic signal — rather than re-deriving from the arms. (A non-nullable struct join, or a binding
     // annotated `S | null` whose arms are both non-null, stays non-null: the value widens on store.)
     if kind == "struct" && nodeTyIsNullableStruct(ifIx) {
-      fbValtypeNullable(vkCode(kind), slot) // `(ref null $S)` result blocktype
+      fbValtypeNullable(kind, slot) // `(ref null $S)` result blocktype
     } else {
-      fbValtype(vkCode(kind), slot) // ref result blocktype `(ref $ht)`
+      fbValtype(kind, slot) // ref result blocktype `(ref $ht)`
     }
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
@@ -19542,7 +19541,7 @@ function emitModule(stmts: i32[]) {
         wU8(107)                  // param 0 env: structref (0x6b)
         let pj = 0
         while pj < rparams.length {
-          fbValtype(vkCode(vtKindOfParam(rparams[pj])), paramStructIdxOf(rparams[pj]))
+          fbValtype(vtKindOfParam(rparams[pj]), paramStructIdxOf(rparams[pj]))
           pj = pj + 1
         }
         // The RESULT must byte-match the rep function's own functype result so
@@ -19557,8 +19556,8 @@ function emitModule(stmts: i32[]) {
           // i64), string, an i32/string/f64 list, a union box, a nullable scalar/struct,
           // or a struct ref (`cloRetValKind`/`cloRetValSlot`, the shared mapping).
           const rrk = cloRetValKind(repFe)
-          let rrkCode = 0
-          if rrk != null { rrkCode = vkCode(rrk) }
+          let rrkCode: VKind = "i32"
+          if rrk != null { rrkCode = rrk }
           fbValtype(rrkCode, cloRetValSlot(repFe))
         }
       }
@@ -19577,10 +19576,7 @@ function emitModule(stmts: i32[]) {
         wULEB(caps.length)
         let ci = 0
         while ci < caps.length {
-          fbValtype(
-            vkCode(captureValKind(fe, caps[ci])),
-            captureValStructIdx(fe, caps[ci]),
-          )
+          fbValtype(captureValKind(fe, caps[ci]), captureValStructIdx(fe, caps[ci]))
           wU8(0) // immutable
           ci = ci + 1
         }
@@ -19640,7 +19636,7 @@ function emitModule(stmts: i32[]) {
       }
       let pi = 0
       while pi < nParams {
-        fbValtype(vkCode(vtKindOfParam(params[pi])), paramStructIdxOf(params[pi]))
+        fbValtype(vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
         pi = pi + 1
       }
       if fRetVoid[ti] == 1 {
@@ -19648,7 +19644,7 @@ function emitModule(stmts: i32[]) {
       } else if fn.fnRet < 0 && fnReturnsClosure(ti) {
         // A function VALUE return (un-annotated; its tail is a function value) — kind 14.
         wU8(1)
-        fbValtype(14, -1)
+        fbValtype("closure", -1)
       } else if fn.fnRet < 0 {
         // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
         // fRet* tables the annotation path fills). i32 when nothing matched.
@@ -19669,7 +19665,7 @@ function emitModule(stmts: i32[]) {
           const mrx = fnRetExprOf(fnStmts[ti])
           if mrx >= 0 { infSlot = mapRetExprShape(mrx, fnStmts[ti]) }
         }
-        fbValtype(vkCode(infKind), infSlot)
+        fbValtype(infKind, infSlot)
       } else {
         wU8(1) // 1 result
         // A `T[]` return is kind 5 — its second `fbValtype` arg is the ref-list TABLE
@@ -19685,7 +19681,7 @@ function emitModule(stmts: i32[]) {
         if retVariantFlag(fn.fnRet) == 1 {
           retSlot = variantIndexOf(tyNameOf(fn.fnRet))
         }
-        fbValtype(vkCode(vtKindOfType(fn.fnRet)), retSlot)
+        fbValtype(vtKindOfType(fn.fnRet), retSlot)
       }
     }
     ti = ti + 1
@@ -19899,8 +19895,8 @@ function emitModule(stmts: i32[]) {
           // A map cell (kind 6) passes its map SHAPE (mv slot / -1 mono / -2 set)
           // so the cell valtype + ref.null zero select THIS map's struct type.
           if ck == "map" { cs = letMapShapeOf(globalStmts[gi], -1) }
-          fbValtypeNullable(vkCode(ck), cs) // nullable valtype
-          wU8(1)                            // 0x01 mutable
+          fbValtypeNullable(ck, cs) // nullable valtype
+          wU8(1)                    // 0x01 mutable
           if ck == "i32" {
             fbI32Const(0) // i32 scalar zero
           } else if ck == "i64" {
@@ -19910,7 +19906,7 @@ function emitModule(stmts: i32[]) {
           } else if ck == "f32" {
             fbF32Const("0.0") // f32 scalar zero (Slice 5)
           } else {
-            fbRefNullForKind(vkCode(ck), cs) // ref.null zero
+            fbRefNullForKind(ck, cs) // ref.null zero
           }
           fbEnd() // 0x0b end of init expr
         } else {
@@ -19941,8 +19937,8 @@ function emitModule(stmts: i32[]) {
             gcs = letMapShapeOf(globalStmts[gi], -1)
             pendingMapSlot = gcs
           }
-          fbValtype(vkCode(gck), gcs) // valtype
-          wU8(1)                      // 0x01 mutable
+          fbValtype(gck, gcs) // valtype
+          wU8(1)              // 0x01 mutable
           // An `: i64` global lowers its literal init as `i64.const` (kind 10 / 0x7e);
           // an `: f32`/`: f64` global as `f32.const`/`f64.const` (kind 13 / 0x7d, 11 /
           // 0x7c) — re-encoding an integer literal directly so the init stays a valid
@@ -23126,19 +23122,19 @@ function capturedIsBool(fnIx: i32, name: string) {
 // `capturedStructIndex` — this is the classifier-side mirror, so an expression
 // classifier (`exprArray` & co) can type a captured-list/string read exactly as
 // a param/local/global receiver would.
-function capturedKindOf(fnIx: i32, name: string) {
-  if fnIx < 0 { return -1 }
-  if !fnValUsed { return -1 }
+function capturedKindOf(fnIx: i32, name: string): VKind | null {
+  if fnIx < 0 { return null }
+  if !fnValUsed { return null }
   let fe = fnStmtsPosOf(fnIx)
-  if fe < 0 { return -1 }
-  if fnEnvIdxOf(fe) < 0 { return -1 }
+  if fe < 0 { return null }
+  if fnEnvIdxOf(fe) < 0 { return null }
   const caps = captureNamesOf(fe)
   let ci = 0
   while ci < caps.length {
-    if caps[ci] == name { return vkCode(captureValKind(fe, name)) }
+    if caps[ci] == name { return captureValKind(fe, name) }
     ci = ci + 1
   }
-  -1
+  null
 }
 
 // The union member-set NAME of a CAPTURED union-box variable `name` (kind 4) of the capturing
@@ -23146,7 +23142,7 @@ function capturedKindOf(fnIx: i32, name: string) {
 // narrows a captured `a: Cat | Dog`. "" when `name` is not a captured union. The union-name
 // dual of `capturedStructIndex`.
 function capturedUnionName(fnIx: i32, name: string) {
-  if capturedKindOf(fnIx, name) != 4 { return "" }
+  if capturedKindOf(fnIx, name) != "union" { return "" }
   const fe = fnStmtsPosOf(fnIx)
   if fe < 0 { return "" }
   const b = parentBindingOf(fe, name)
@@ -23368,7 +23364,7 @@ function exprUnion(exprIx: i32, fnIx: i32) {
     // A CAPTURED union box (`const a: C | D = …; () => … a is C …`): the env field is the union
     // box (kind 4). `capturedUnionName` resolves its member set from the parent binding so `is`
     // narrows; here we only need to know it IS a union value.
-    if capturedKindOf(fnIx, e.identName) == 4 { return true }
+    if capturedKindOf(fnIx, e.identName) == "union" { return true }
     // A module GLOBAL union binding (a union annotation, or a union-returning
     // init): top-level `const a = make(42)` / `let w: string | i32 = "a"`.
     let gi = globalLetOf(e.identName)
@@ -23921,7 +23917,7 @@ function exprArray(exprIx: i32, fnIx: i32) {
     if declaredNulList(e.identName) { return true }
     if globalIsNulList(e.identName) { return true }
     // A CAPTURED i32-list read (`store[k]` inside a closure capturing `store`).
-    return capturedKindOf(fnIx, e.identName) == 2
+    return capturedKindOf(fnIx, e.identName) == "list"
   }
   // A list CONCAT `a + b` yields a NEW i32 list (collections-design §VL.4).
   if e is BinExpr {
@@ -24395,7 +24391,7 @@ function exprStringArray(exprIx: i32, fnIx: i32) {
     if declaredStringArray(e.identName) { return true }
     if globalIsStringArray(e.identName) { return true }
     // A CAPTURED string-list read (incl. a boxed captured-mutated `string` local). Kind 7.
-    return capturedKindOf(fnIx, e.identName) == 7
+    return capturedKindOf(fnIx, e.identName) == "strlist"
   }
   // A field read `p.names` whose field is a `string[]` (code `6`) yields the string-list
   // wrapper ref — so `.length` / indexing / assignment / `.push` treat it as a string list.
@@ -24552,7 +24548,7 @@ function exprF64Array(exprIx: i32, fnIx: i32) {
     if globalIsF64Array(e.identName) { return true }
     // A CAPTURED f64-list read (`xs[i]` inside a closure capturing `xs` — incl. a boxed
     // captured-mutated `f64` local, lowered to a length-1 `f64[]`). Kind 12 = f64 list.
-    return capturedKindOf(fnIx, e.identName) == 12
+    return capturedKindOf(fnIx, e.identName) == "f64list"
   }
   // A `.map`/`.filter` whose result ELEMENT kind is f64 yields an f64 list (an f64
   // receiver's filter, or a map whose callback returns f64). (Slices 3–4.)
@@ -24639,7 +24635,7 @@ function exprF32Array(exprIx: i32, fnIx: i32) {
     if declaredF32Array(e.identName) { return true }
     if globalIsF32Array(e.identName) { return true }
     // A CAPTURED f32-list read (incl. a boxed captured-mutated `f32` local). Kind 21 = f32 list.
-    return capturedKindOf(fnIx, e.identName) == 21
+    return capturedKindOf(fnIx, e.identName) == "f32list"
   }
   // A struct-field READ of an `f32[]` field (code 27) — the checker's per-node type does not always
   // carry f32[] through a member, so recognize it directly by the field code (the f64/i64 duals get
@@ -24726,7 +24722,7 @@ function exprI64Array(exprIx: i32, fnIx: i32) {
     if declaredI64Array(e.identName) { return true }
     if globalIsI64Array(e.identName) { return true }
     // A CAPTURED i64-list read (incl. a boxed captured-mutated `i64` local). Kind 20 = i64 list.
-    return capturedKindOf(fnIx, e.identName) == 20
+    return capturedKindOf(fnIx, e.identName) == "i64list"
   }
   if e is Call {
     if callIsMapFilter(exprIx, fnIx) {
@@ -25251,7 +25247,7 @@ function exprString(exprIx: i32, fnIx: i32) {
     if declaredString(e.identName) { return true }
     // A CAPTURED string (`const s = "…"; () => s.length`): the env field is a string ref (kind
     // 3), so classify it like a string param/local — else `s.length` reads as a struct field.
-    if capturedKindOf(fnIx, e.identName) == 3 { return true }
+    if capturedKindOf(fnIx, e.identName) == "str" { return true }
     return globalIsString(e.identName)
   }
   // An index read over a STRING list (`names[i]`, a `string[]` element) yields a
