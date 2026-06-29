@@ -331,6 +331,7 @@ import {
 import {
   Emitter,
   MfKind,
+  VKind,
   W,
   aTypeIdx,
   aUsed,
@@ -544,6 +545,8 @@ import {
   vbI32Used,
   vbI64Idx,
   vbI64Used,
+  vkCode,
+  vkOfCode,
 } from "./emit_state"
 import {
   emitFail,
@@ -1697,7 +1700,7 @@ function exprNullableRefArray(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
   if e is Paren { return exprNullableRefArray(e.parInner, fnIx) }
-  if e is Ident { return declaredKind(e.identName) == 18 }
+  if e is Ident { return declaredKind(e.identName) == "nulreflist" }
   // A `recv.f` read of a NULLABLE ref-list FIELD (`f: S[] | null`, code 28) yields a nullable ref array.
   if e is Member { return memberFieldCode(exprIx, fnIx) == 28 }
   if e is Index {
@@ -1795,7 +1798,7 @@ function letIsNulListInfer(letIx: i32, fnIx: i32) {
 // the nullable-list family above; `null` is `ref.null $aTypeIdx`, `!= null` is
 // `ref.is_null`. Unlike a nullable list, an INITIALIZER can produce one (a string
 // literal, or a `string | null`-returning call), so `letIsNulString` consults the init.
-function declaredNulString(name: string) { declaredKind(name) == 16 }
+function declaredNulString(name: string) { declaredKind(name) == "nulstr" }
 
 function globalIsNulString(name: string) {
   let li = globalLetOf(name)
@@ -3243,7 +3246,7 @@ function pushNarrow(name: string, variant: string) {
 function addLocalName(name: string, isRef: i32, structIdx: i32) {
   let pos = localNames.length
   localNames.push(name)
-  localIsRef.push(isRef)
+  localIsRef.push(vkOfCode(isRef))
   localStructIdx.push(structIdx)
   localLoopVar.push(0)
   localLitUnion.push(0)
@@ -4870,14 +4873,15 @@ function declaredSlotOf(name: string) {
   -1
 }
 
-// The local-kind code (`localIsRef`) of declared local `name`, or -1 if there is no such
-// declared local. The single `declaredSlotOf` + `localIsRef` lookup the `declared*` type
-// predicates share — each compares the result against its kind code (2 i32-list, 5 ref-
-// list, 7 string-list, 12 f64-list, 20 i64-list, 1 struct, 4 union, 6 map, 3 string, 9/15/
-// 16/19 the niche nullables, 10/11/13 scalar i64/f64/f32).
-function declaredKind(name: string) {
+// The `VKind` of declared local `name`, or `null` if there is no such declared local. The
+// single `declaredSlotOf` + `localIsRef` lookup the `declared*` type predicates share —
+// each compares the result against its kind atom (`"list"` i32-list, `"reflist"`,
+// `"strlist"`, `"f64list"`, `"i64list"`, `"struct"`, `"union"`, `"map"`, `"str"`, the
+// `"nul*"` niche nullables, `"i64"`/`"f64"`/`"f32"` scalars). The `null` arm matches no
+// atom, so an absent local reads as "none of these" exactly as the old `-1` sentinel did.
+function declaredKind(name: string): VKind | null {
   const slot = declaredSlotOf(name)
-  if slot < 0 { return -1 }
+  if slot < 0 { return null }
   localIsRef[slot]
 }
 
@@ -7430,11 +7434,11 @@ function mfScan(ix: i32, fnIx: i32) {
 function fnHasMap(fnIx: i32) {
   let i = 0
   while i < localNames.length {
-    if localIsRef[i] == 6 { return true }
+    if localIsRef[i] == "map" { return true }
     // A map-ARRAY local (`{[string]:i32}[]`, code 5 with element kind 3) lets map ops
     // run on an indexed element (`scopes[i][k]`) — so the function needs the map scratch
     // frame even though no bare map local is declared.
-    if localIsRef[i] == 5 {
+    if localIsRef[i] == "reflist" {
       let s = localStructIdx[i]
       if s >= 0 {
         if s < rlElemKindTbl.length {
@@ -12113,7 +12117,7 @@ function emitExprAsF64(body: i32[], exprIx: i32, fnIx: i32) {
 }
 
 // True if the DECLARED LOCAL `name` is an i64 slot (kind 10 in the local registry).
-function declaredI64(name: string) { declaredKind(name) == 10 }
+function declaredI64(name: string) { declaredKind(name) == "i64" }
 
 // True if the module GLOBAL `name` is an i64 cell.
 function globalIsI64(name: string) {
@@ -12255,7 +12259,7 @@ function exprIsI64(exprIx: i32, fnIx: i32) {
 }
 
 // True if the DECLARED LOCAL `name` is an f32 slot (kind 13 in the local registry).
-function declaredF32(name: string) { declaredKind(name) == 13 }
+function declaredF32(name: string) { declaredKind(name) == "f32" }
 
 // True if the UN-annotated `LetDecl` at `letIx` should INFER an f32 slot — its initializer
 // already yields an f32 (`exprIsF32`: an f32 field/index/param/local read, an f32-returning
@@ -12444,7 +12448,7 @@ function emitExprAsF32(body: i32[], exprIx: i32, fnIx: i32) {
 }
 
 // True if the DECLARED LOCAL `name` is an f64 slot (kind 11 in the local registry).
-function declaredF64(name: string) { declaredKind(name) == 11 }
+function declaredF64(name: string) { declaredKind(name) == "f64" }
 
 // True if the module GLOBAL `name` is an f64 cell. (Slice 3.)
 function globalIsF64(name: string) {
@@ -13558,7 +13562,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         // defers every other shape to `emitUnionCoerce`. A kind-8 variant-init local (`let u:
         // C | S = someVariant`) keeps the RAW variant rep, so it must NOT box — use the plain
         // coerce there.
-        if declaredKind(target.identName) == 4 {
+        if declaredKind(target.identName) == "union" {
           if emitUnionBoxArg(body, aUNm, a.binRight, fnIx) < 0 { return -1 }
         } else {
           if emitUnionCoerce(body, aUNm, a.binRight, fnIx) < 0 { return -1 }
@@ -16040,7 +16044,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     pendingListSlot = letAnnRefListSlot(stmtIx)
     // A kind-18 nullable ref-array binding: a bare `null` init lowers as `ref.null $innerWrapper`. The list
     // value seeds above (`pendingListKind`/`Slot`) build a non-null list; this seeds the null arm.
-    if localIsRef[slot] == 18 {
+    if localIsRef[slot] == "nulreflist" {
       if pendingListSlot >= 0 && pendingListSlot < rlWrapIdx.length {
         pendingNulRefHeap = rlWrapIdx[pendingListSlot]
       }
@@ -16049,7 +16053,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     // `ref.null $lTypeIdx` (the `pendingNulList` arm), the scalar-list analogue of the kind-18 seed above.
     // Without this a literal `= null` init fell through to the bare-null error (the type/narrowing worked,
     // but an actual null value never lowered).
-    let letNulList15 = localIsRef[slot] == 15
+    let letNulList15 = localIsRef[slot] == "nullist"
     // An UN-annotated empty `[]` whose USAGE pins a string element (`const out = [];
     // out.push(self[i])`): seed the string-list kind so `emitArr` builds the string-list
     // wrapper, MATCHING the slot `collectLocals` typed (kind 7, via the same
@@ -16071,7 +16075,9 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     // `ref.null $P` (the union annotation names no `sNames` entry, so `letAnnStructIdx`
     // gave -1), a struct literal builds that struct. Mirrors the global kind-9 cell seeding.
     if pendingStructIdx < 0 {
-      if localIsRef[slot] == 9 { pendingStructIdx = localStructIdx[slot] }
+      if localIsRef[slot] == "nulstruct" {
+        pendingStructIdx = localStructIdx[slot]
+      }
     }
     // A `const c: Cat = { … }` variant-typed binding seeds the VARIANT index so the object
     // literal builds the bare variant struct (kind 8) instead of boxing into the union.
@@ -16110,13 +16116,13 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       const slotKind = localIsRef[slot]
       let nulRep = -1
       let nulNm = ""
-      if slotKind == 4 {
+      if slotKind == "union" {
         if letUNm != "" { nulNm = letUNm }
         else if s.letType >= 0 { nulNm = tyNameOf(s.letType) }
         if nulNm != "" { nulRep = 0 }
-      } else if slotKind == 16 {
+      } else if slotKind == "nulstr" {
         nulRep = 1
-      } else if slotKind == 17 {
+      } else if slotKind == "nulbool" {
         nulRep = 2
       }
       if nulRep >= 0 {
@@ -16138,7 +16144,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
         return 0
       }
     }
-    if localIsRef[slot] == 19 {
+    if localIsRef[slot] == "nulclosure" {
       // A NULLABLE function-value binding (`let c: ((i32) => i32) | null = …`): the slot is
       // `(ref null $cloStruct)`. A bare `null` init lowers as `ref.null $cloStruct`
       // (`pendingNulClosure`); a function init stores its closure ref directly. Takes
@@ -22795,11 +22801,11 @@ function exprStruct(exprIx: i32, fnIx: i32) {
 }
 
 // True if the already-collected declared local `name` is a nullable struct (code 9).
-function declaredNulRef(name: string) { declaredKind(name) == 9 }
+function declaredNulRef(name: string) { declaredKind(name) == "nulstruct" }
 
 // True if `name` is a declared NULLABLE function-value local (`fn | null`, kind 19) — the
 // closure dual of `declaredNulRef`.
-function declaredNulClosure(name: string) { declaredKind(name) == 19 }
+function declaredNulClosure(name: string) { declaredKind(name) == "nulclosure" }
 
 // True if the expression at `exprIx` is a NULLABLE function value (`fn | null`, kind 19) —
 // currently a kind-19 local ident. Drives the `== null` / `!= null` test (`ref.is_null`)
@@ -22844,12 +22850,12 @@ function letInfersNulClosure(letIx: i32, fnIx: i32) {
 }
 
 // True if the already-collected declared local `name` is a nullable i32 list (kind 15).
-function declaredNulList(name: string) { declaredKind(name) == 15 }
+function declaredNulList(name: string) { declaredKind(name) == "nullist" }
 
 // True if the already-collected declared local `name` is a struct ref. Resolves to
 // the IN-SCOPE binding's slot (so a same-named binding in a sibling/inner block reads
 // ITS own valtype, not an unrelated branch's).
-function declaredStruct(name: string) { declaredKind(name) == 1 }
+function declaredStruct(name: string) { declaredKind(name) == "struct" }
 
 // True if the `LetDecl` at `letIx` declares a struct-typed local: its annotation
 // names the struct, OR its initializer produces the struct. Picks the local's
@@ -23020,7 +23026,7 @@ function fnRetVariantIndex(name: string) {
 function declaredVariantIndex(name: string) {
   let slot = declaredSlotOf(name)
   if slot < 0 { return -1 }
-  if localIsRef[slot] == 8 { return localStructIdx[slot] }
+  if localIsRef[slot] == "variant" { return localStructIdx[slot] }
   -1
 }
 
@@ -23029,8 +23035,8 @@ function declaredVariantIndex(name: string) {
 function declaredStructIndex(name: string) {
   let slot = declaredSlotOf(name)
   if slot < 0 { return -1 }
-  if localIsRef[slot] == 1 { return localStructIdx[slot] }
-  if localIsRef[slot] == 9 { return localStructIdx[slot] }
+  if localIsRef[slot] == "struct" { return localStructIdx[slot] }
+  if localIsRef[slot] == "nulstruct" { return localStructIdx[slot] }
   -1
 }
 
@@ -23316,7 +23322,7 @@ function paramUnion(fnIx: i32, name: string) {
 }
 
 // True if the already-collected declared local `name` is a union ref (code `4`).
-function declaredUnion(name: string) { declaredKind(name) == 4 }
+function declaredUnion(name: string) { declaredKind(name) == "union" }
 
 // True if evaluating the expression at `exprIx` yields the union box: a union-returning
 // call, a union param/local reference, or a parenthesized union expression. (A bare
@@ -23448,7 +23454,7 @@ function unionNameOfIdent(name: string, fnIx: i32) {
       // already being a kind-4 union box, so a non-union loop var (an f32 `for v in
       // m.values()`, a struct `for s in ss`) never reaches the ref-array reclassification
       // below (which could mis-name it and corrupt its codegen).
-      if declaredKind(name) == 4 {
+      if declaredKind(name) == "union" {
         const iter = forInIterBlock(body, name)
         if iter >= 0 {
           if exprRefArray(iter, fnIx) {
@@ -23816,7 +23822,7 @@ function fnRetArray(name: string) {
 }
 
 // True if the already-collected declared local `name` is an i32-array ref (code `2`).
-function declaredArray(name: string) { declaredKind(name) == 2 }
+function declaredArray(name: string) { declaredKind(name) == "list" }
 
 // True if evaluating the expression at `exprIx` yields the i32 array: an array
 // literal (with i32 / no elements — a ref-element literal is NOT this), an
@@ -23982,7 +23988,7 @@ function paramRefArray(fnIx: i32, name: string) {
 }
 
 // True if the already-collected declared local `name` is a ref-list ref (code `5`).
-function declaredRefArray(name: string) { declaredKind(name) == 5 }
+function declaredRefArray(name: string) { declaredKind(name) == "reflist" }
 
 // True if evaluating the expression at `exprIx` yields a ref list: a ref-element array
 // literal, a ref-array-returning call, a ref-array param/local reference, or a
@@ -24015,7 +24021,7 @@ function exprRefArray(exprIx: i32, fnIx: i32) {
   if e is Ident {
     // A kind-18 NULLABLE ref-array local is a ref array too (narrowed `if t != null`) — so indexing /
     // `.length` reuse the ref-array machinery; the index emit recovers non-null for the niche receiver.
-    if declaredKind(e.identName) == 18 { return true }
+    if declaredKind(e.identName) == "nulreflist" { return true }
     if paramRefArray(fnIx, e.identName) { return true }
     if declaredRefArray(e.identName) { return true }
     return globalIsRefArray(e.identName)
@@ -24081,7 +24087,7 @@ function fnRetRefArrayName(name: string) {
 function declaredRefArrayName(name: string) {
   let i = declaredSlotOf(name)
   if i >= 0 {
-    if localIsRef[i] == 5 {
+    if localIsRef[i] == "reflist" {
       let slot = localStructIdx[i]
       if slot >= 0 {
         if slot < rlElemName.length { return rlElemName[slot] }
@@ -24147,7 +24153,7 @@ function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   if e is Ident {
     // A kind-18 nullable ref-array local stores its INNER ref-list slot in `localStructIdx`; its element
     // name is that inner slot's element name, so `refListSlotOfExpr` round-trips back to the inner slot.
-    if declaredKind(e.identName) == 18 {
+    if declaredKind(e.identName) == "nulreflist" {
       const sl18 = declaredSlotOf(e.identName)
       if sl18 >= 0 {
         const is18 = localStructIdx[sl18]
@@ -24303,7 +24309,7 @@ function letAnnVariantIdx(letIx: i32) {
 // (code `6`). An index read `xs[i]` (a string) / `.length` (i32) is NOT a list.
 
 // True if the already-collected declared local `name` is a string-list ref (code `7`).
-function declaredStringArray(name: string) { declaredKind(name) == 7 }
+function declaredStringArray(name: string) { declaredKind(name) == "strlist" }
 
 // True if function `name` declares (or, un-annotated, infers) a `string[]` return type
 // (`fRetListKind` == 7). Mirrors `fnRetArray`/`fnRetRefArray` — lets a `string[]`-returning call
@@ -24472,7 +24478,7 @@ function letIsStringArray(letIx: i32, fnIx: i32) {
 // f64-list local/global cell kind (`12`). `localIsRef` code `12` flags an f64-list local.
 
 // True if the already-collected declared local `name` is an f64-list ref (code `12`).
-function declaredF64Array(name: string) { declaredKind(name) == 12 }
+function declaredF64Array(name: string) { declaredKind(name) == "f64list" }
 
 // True if evaluating the expression at `exprIx` yields an f64 list: an f64-element
 // array literal, an f64-array param/local reference, or a parenthesized one.
@@ -24581,7 +24587,7 @@ function exprF64Array(exprIx: i32, fnIx: i32) {
 // f32[] only when its declared type says so.
 function tyIsF32Array(tyIx: i32) { tyKindOf(tyIx) == 21 }
 
-function declaredF32Array(name: string) { declaredKind(name) == 21 }
+function declaredF32Array(name: string) { declaredKind(name) == "f32list" }
 
 function globalIsF32Array(name: string) {
   let li = globalLetOf(name)
@@ -24665,7 +24671,7 @@ function exprF32Array(exprIx: i32, fnIx: i32) {
 // fallback covers a monomorphized body whose nodes have no recorded type.
 function tyIsI64Array(tyIx: i32) { tyKindOf(tyIx) == 20 }
 
-function declaredI64Array(name: string) { declaredKind(name) == 20 }
+function declaredI64Array(name: string) { declaredKind(name) == "i64list" }
 
 function letIsI64Array(letIx: i32, fnIx: i32) {
   let d = P.nodes[letIx]
@@ -24764,7 +24770,7 @@ function letIsF64Array(letIx: i32, fnIx: i32) {
 // `m.has(k)` yields an i32, NOT a map, so neither counts here.
 
 // True if the already-collected declared local `name` is a map ref (code `6`).
-function declaredMap(name: string) { declaredKind(name) == 6 }
+function declaredMap(name: string) { declaredKind(name) == "map" }
 
 // True if evaluating the expression at `exprIx` yields a string-keyed map: the
 // `Map()` constructor call, a map param/local reference, or a parenthesized map
@@ -25136,7 +25142,7 @@ function declaredString(name: string) {
   // and the array ops (`array.len`/`array.get`) accept the nullable ref. The `!= null`
   // null-check reads it through `exprNullableString` FIRST, so this never mis-routes it.
   const dk = declaredKind(name)
-  return dk == 3 || dk == 16
+  return dk == "str" || dk == "nulstr"
 }
 
 // True if evaluating the expression at `exprIx` yields a string: a string literal, a
@@ -25368,7 +25374,9 @@ function exprIsClosure(exprIx: i32, fnIx: i32) {
     if paramIsClosure(fnIx, e.identName) { return true }
     if paramNulClosure(fnIx, e.identName) { return true }
     let slot = declaredSlotOf(e.identName)
-    if slot >= 0 { return localIsRef[slot] == 14 || localIsRef[slot] == 19 }
+    if slot >= 0 {
+      return localIsRef[slot] == "closure" || localIsRef[slot] == "nulclosure"
+    }
     // A module-global closure cell — a bare closure (kind 14) or a NULLABLE one (kind 19).
     const gl = globalLetOf(e.identName)
     if gl >= 0 {
