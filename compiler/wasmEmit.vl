@@ -14810,238 +14810,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     // no-op in its enclosing body. Its name resolves as a closure value when referenced.
     return 0
   }
-  if s is LetDecl {
-    // `let x = <expr>` / `const x = <expr>`: emit the init, then store it into the
-    // local's slot. This `LetDecl`'s slot is the next cursor position (collect allocated
-    // slots in this SAME pre-order), so it owns declared-local slot `emitLetCursor` —
-    // do NOT name-resolve it (a name lookup would hit an outer same-named binding still
-    // in scope here). `paramN + slot` is its wasm local index.
-    let slot = emitLetCursor
-    emitLetCursor = emitLetCursor + 1
-    let paramN = 0
-    // The START function (`fnIx == -1`, top-level statements) has no params — and no
-    // arena node to read, so the lookup must be guarded.
-    if fnIx >= 0 {
-      const fn = P.nodes[fnIx]
-      if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
-    }
-    const idx = paramN + slot
-    if s.letInit < 0 {
-      // UNINITIALIZED scalar local (validated by `checkLocalI32`): nothing to store
-      // — the wasm local's implicit zero-init covers the declaration; bind the name
-      // so later reads/writes resolve to this slot.
-      scopeBind(s.letName, slot)
-      return 0
-    }
-    // VALUE-FLOW MONOMORPHIZATION: a `const g = f` binding to a GENERIC (un-annotated-param)
-    // NAMED function, where `g` is used ONLY as a direct-call callee (`g(args)`), is sound.
-    // `monomorphize` rewrote each `g(args)` to its per-call instance (the first/i32 shape stays
-    // on `f`'s own slot, keeping its un-annotated params for byte-identity), so the closure
-    // stored here is `call_ref`'d only at the type its slot was pinned to. The value floor in
-    // `emitClosureValue` would reject it on those un-annotated params, so emit through the
-    // floor-LESS core. A value-USE of `g` (passed, returned, stored) escapes — `nameUsedAsValueIn`
-    // catches it — and falls through to the normal path, where the floor rejects it.
-    if fnIx >= 0 {
-      const aliasFe = fieldValueFeOf(s.letInit)
-      if fnHasUnannotatedParam(aliasFe) {
-        if !criFnIsAnonLambda(aliasFe) {
-          const encl = P.nodes[fnIx]
-          if encl is FuncDecl {
-            if !nameUsedAsValueIn(s.letName, encl.fnBody) {
-              if emitClosureValueCore(body, aliasFe, fnIx) < 0 { return -1 }
-              fbLocalSet(idx) // 0x21 local.set
-              scopeBind(s.letName, slot)
-              return 0
-            }
-          }
-        }
-      }
-    }
-    // A degenerate UN-ANNOTATED `let x = null` (A-infer-null): when NO later
-    // assignment fills the hole (`nliNameOf` recorded nothing), the binding's
-    // type is the plain `null` type — it is never read as a non-null value, so
-    // its i32 cell just zero-inits. A FILLED hole (`x = 5` later) is a `T|null`
-    // value-union binding (kind 4) and takes the union-coerce path below.
-    if s.letType < 0 {
-      const bareN = P.nodes[unwrapParen(s.letInit)]
-      if bareN is NullLit {
-        if nliNameOf(stmtIx) == "" {
-          fbI32Const(0)
-          fbLocalSet(idx) // 0x21 local.set
-          scopeBind(s.letName, slot)
-          return 0
-        }
-      }
-    }
-    // An empty `[]` initializer over a ref-array annotation (`let xs: T[] = []`) needs
-    // the element kind to pick the ref-list construction — record it for `emitArr`.
-    pendingListKind = letAnnRefListKind(stmtIx)
-    pendingListSlot = letAnnRefListSlot(stmtIx)
-    // A kind-18 nullable ref-array binding: a bare `null` init lowers as `ref.null $innerWrapper`. The list
-    // value seeds above (`pendingListKind`/`Slot`) build a non-null list; this seeds the null arm.
-    if localIsRef[slot] == "nulreflist" {
-      if pendingListSlot >= 0 && pendingListSlot < rlWrapIdx.length {
-        pendingNulRefHeap = rlWrapIdx[pendingListSlot]
-      }
-    }
-    // A kind-15 nullable i32-list binding (`i32[] | null = null`): a bare `null` init lowers as
-    // `ref.null $lTypeIdx` (the `pendingNulList` arm), the scalar-list analogue of the kind-18 seed above.
-    // Without this a literal `= null` init fell through to the bare-null error (the type/narrowing worked,
-    // but an actual null value never lowered).
-    let letNulList15 = localIsRef[slot] == "nullist"
-    // An UN-annotated empty `[]` whose USAGE pins a string element (`const out = [];
-    // out.push(self[i])`): seed the string-list kind so `emitArr` builds the string-list
-    // wrapper, MATCHING the slot `collectLocals` typed (kind 7, via the same
-    // `letInfStrListByUseV`). Without this the inferred `[]` defaults to the i32 list and
-    // the slot store mismatches. Unblocks a generic build-loop (`slice`/`reverse`) over
-    // `string[]`.
-    if pendingListKind == 0 && letInfStrListByUseV(stmtIx, fnIx) {
-      pendingListKind = 3
-    }
-    // A `let b: B = { … }` struct LITERAL must build the annotation's struct, not a
-    // first-field-name match — seed `pendingStructIdx` (consumed by `emitObj`) from the
-    // annotation when it names a standalone struct, so a same-field-name sibling struct
-    // does not win. Mirrors the call-arg / element / return / global seeding. A union
-    // annotation names no `sNames` entry (`letAnnStructIdx` is -1) so a variant literal
-    // still boxes; a non-struct-literal init ignores the hint.
-    pendingStructIdx = letAnnStructIdx(stmtIx)
-    // A NULLABLE-struct binding (`let b: P | null = …`, slot kind 9) seeds the SAME struct
-    // context from the slot's recorded struct index — a bare `null` init lowers as
-    // `ref.null $P` (the union annotation names no `sNames` entry, so `letAnnStructIdx`
-    // gave -1), a struct literal builds that struct. Mirrors the global kind-9 cell seeding.
-    if pendingStructIdx < 0 {
-      if localIsRef[slot] == "nulstruct" {
-        pendingStructIdx = localStructIdx[slot]
-      }
-    }
-    // A `const c: Cat = { … }` variant-typed binding seeds the VARIANT index so the object
-    // literal builds the bare variant struct (kind 8) instead of boxing into the union.
-    pendingVariantIdx = letAnnVariantIdx(stmtIx)
-    // A map-typed binding seeds the map SHAPE so a `Map()` initializer constructs
-    // THIS binding's map struct (mono, or the annotation's ref-valued mv slot).
-    if letIsMap(stmtIx, fnIx) { pendingMapSlot = letMapShapeOf(stmtIx, fnIx) }
-    // Numeric WIDENING at the binding boundary: an `: f64` / `: f32` / `: i64` slot
-    // coerces a narrower init value (the lattice convert is inserted by the `emitExprAs*`
-    // helpers — i32/i64/f32→f64, i32→f32, i32→i64). A float/integer literal re-encodes in
-    // place via `pendingF32`/`pendingI64`. An i32-only binding stays byte-identical.
-    // A UNION-annotated binding (kind 4) coerces a raw init value into the box
-    // (`let u: boolean | i32 = 5` boxes the 5 with its atom tag); an already-union
-    // init (a union-returning call) and a struct-union object literal pass through
-    // `emitUnionCoerce` unchanged.
-    let letUNm = ""
-    let letAnnNm = ""
-    if s.letType >= 0 { letAnnNm = tyNameOf(s.letType) }
-    // A filled null hole (`let x = null` + later `x = e`, A-infer-null) is its
-    // inferred `T|null` value union — coerce the bare `null` init into the box.
-    if isUName(letAnnNm) && !nameIsLitUnionType(letAnnNm) {
-      // A literal union (`type K = "a" | "b"`) reads as a union NAME but is an i32 ATOM, not a value-union
-      // box — so it must NOT take the `emitUnionCoerce` path (which would `struct.new` the member).
-      letUNm = letAnnNm
-    } else if !isUName(letAnnNm) {
-      letUNm = nliNameOf(stmtIx)
-    }
-    // A nullable / value-union if-EXPRESSION init (`const x: i32 | null = if c then 5
-    // else null`, `else if` chains) lowers by writing the binding's own local in each
-    // arm of a void `if` — no value-typed-if blocktype or scratch slot needed (the
-    // binding local IS the destination). The slot kind `collectLocals` already chose is
-    // the authoritative rep: kind 4 the value-union box (rep 0, needs the union NAME to
-    // box each arm's atom — taken from the annotation / `letUNm`), kind 16 a `string |
-    // null` ref (rep 1), kind 17 a `boolean | null` niche i32 (rep 2, sentinel 2 = null).
-    if exprIsIfStmt(s.letInit) {
-      const slotKind = localIsRef[slot]
-      let nulRep = -1
-      let nulNm = ""
-      if slotKind == "union" {
-        if letUNm != "" { nulNm = letUNm }
-        else if s.letType >= 0 { nulNm = tyNameOf(s.letType) }
-        if nulNm != "" { nulRep = 0 }
-      } else if slotKind == "nulstr" {
-        nulRep = 1
-      } else if slotKind == "nulbool" {
-        nulRep = 2
-      }
-      if nulRep >= 0 {
-        // The value-union box local (kind 4) is a NON-null `(ref $uBoxIdx)` — non-
-        // defaultable, so the validator needs it definitely assigned. Both arms below
-        // set it, but a void-`if` merge does not satisfy V8's local-init check; pre-seed
-        // the rep's null first (overwritten by every arm). The `string | null` (nullable
-        // ref) rep is defaultable and needs no pre-seed.
-        if nulRep == 0 {
-          if emitNulNullToLocal(body, idx, 0) < 0 { return -1 }
-        }
-        if (
-          emitNullableIfBinding(body, s.letInit, idx, nulRep, nulNm, fnIx) <
-          0
-        ) {
-          return -1
-        }
-        scopeBind(s.letName, slot)
-        return 0
-      }
-    }
-    if localIsRef[slot] == "nulclosure" {
-      // A NULLABLE function-value binding (`let c: ((i32) => i32) | null = …`): the slot is
-      // `(ref null $cloStruct)`. A bare `null` init lowers as `ref.null $cloStruct`
-      // (`pendingNulClosure`); a function init stores its closure ref directly. Takes
-      // priority over the union-coerce path (the `fn | null` annotation reads as a union
-      // NAME, but this is a niche nullable ref, not a box).
-      const savedNC = pendingNulClosure
-      pendingNulClosure = true
-      if emitExpr(body, s.letInit, fnIx) < 0 { return -1 }
-      pendingNulClosure = savedNC
-    } else if letUNm != "" {
-      if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return -1 }
-    } else if letIsF32(stmtIx) {
-      const savedF32 = pendingF32
-      pendingF32 = true
-      if emitExprAsF32(body, s.letInit, fnIx) < 0 { return -1 }
-      pendingF32 = savedF32
-    } else if letIsF64(stmtIx, fnIx) {
-      if emitExprAsF64(body, s.letInit, fnIx) < 0 { return -1 }
-    } else if letIsI64(stmtIx, fnIx) {
-      if emitExprAsI64(body, s.letInit, fnIx) < 0 { return -1 }
-    } else if letAnnNm == "string" && exprIsLitAtom(s.letInit, fnIx) {
-      // A literal-union atom initializing a `string` local widens to its member string.
-      if emitAtomToStr(body, s.letInit, fnIx) < 0 { return -1 }
-    } else {
-      // A `boolean|null` NICHE binding lowers a bare `null` init as the sentinel 2; a
-      // `string|null` binding lowers it as `ref.null $aTypeIdx`. `letNulBool` (not just
-      // the annotation) so an INFERRED niche binding (`const r = f()` where `f` returns
-      // `boolean | null`) seeds the sentinel too.
-      pendingNulBool = letNulBool(stmtIx, fnIx)
-      pendingNulString = letIsNulString(stmtIx, fnIx)
-      if s.letType >= 0 {
-        if nameIsLitUnionType(tyNameOf(s.letType)) { pendingLitUnion = 1 }
-        // A `K | null` NICHE binding: a member init lowers as its atom id, a bare `null` init as the
-        // i32 sentinel `-1` — seed both, like the param-arg / return boundaries.
-        if nameIsNulLitUnion(tyNameOf(s.letType)) {
-          pendingLitUnion = 1
-          pendingNulLitUnion = true
-        }
-      }
-      const savedNulList = pendingNulList
-      if letNulList15 { pendingNulList = true }
-      if emitExpr(body, s.letInit, fnIx) < 0 { return -1 }
-      pendingNulBool = false
-      pendingNulString = false
-      pendingNulList = savedNulList
-      pendingLitUnion = 0
-      pendingNulLitUnion = false
-    }
-    pendingI64 = false
-    pendingStructIdx = -1
-    pendingVariantIdx = -1
-    pendingListKind = 0
-    pendingListSlot = 0
-    pendingMapSlot = -1
-    pendingNulRefHeap = -1
-    fbLocalSet(idx) // 0x21 local.set
-    // Bind `name → slot` in the current emit-time frame AFTER emitting the init (so the
-    // init resolved any same-named OUTER binding), making this binding live for the rest
-    // of the block — mirrors the collect pass so resolution matches slot allocation.
-    scopeBind(s.letName, slot)
-    return 0
-  }
+  if s is LetDecl { return emitLetDeclStmt(body, s, stmtIx, fnIx) }
   if s is BinExpr {
     // A bare `BinExpr` statement is an assignment (`x = <expr>`); any OTHER operator
     // in statement position is a DISCARDED value (`1 + 1` as a tail statement of a
@@ -15060,121 +14829,7 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     }
     return emitFail("emitProgram: unsupported unary statement")
   }
-  if s is Call {
-    // The only call STATEMENT this slice lowers is a list append `recv.push(x)` (a
-    // `Call` whose `callFn` is a `Member`). A bare top-level call statement (a function
-    // call whose value is discarded) is out of scope.
-    const callee = P.nodes[s.callFn]
-    if callee is Member {
-      if callee.memProp == "push" { return emitPush(body, stmtIx, fnIx) }
-      // A `.pop()` STATEMENT discards the popped element — emit the pop, then `drop`
-      // the value it leaves on the stack.
-      if callee.memProp == "pop" {
-        if emitPop(body, stmtIx, fnIx) < 0 { return -1 }
-        fbDrop() // 0x1a drop
-        return 0
-      }
-      // A `.clear()` STATEMENT resets the list's length to 0 (backing retained).
-      if callee.memProp == "clear" {
-        if (
-          exprArray(callee.memObj, fnIx) ||
-          exprRefArray(callee.memObj, fnIx) ||
-          exprStringArray(callee.memObj, fnIx)
-        ) {
-          return emitClear(body, stmtIx, fnIx)
-        }
-      }
-      // G8: a map `m.set(k, v)` STATEMENT is the method form of `m[k] = v` — the
-      // same scan/overwrite-or-append lowering.
-      if callee.memProp == "set" {
-        if exprMap(callee.memObj, fnIx) {
-          if s.callArgs.length != 2 {
-            return emitFail("emitProgram: map set takes exactly two arguments")
-          }
-          return emitMapSet(
-            body,
-            callee.memObj,
-            s.callArgs[0],
-            s.callArgs[1],
-            fnIx,
-          )
-        }
-      }
-      // A Set `s.add(k)` STATEMENT is the membership-insert form of `s[k] = true` — the
-      // SAME scan/overwrite-or-append lowering as `emitMapSet`, but storing the constant
-      // boolean `1` (true) as the value (the Set vals-list carries true for live keys).
-      // It takes EXACTLY one arg; the result (if any) is discarded.
-      if callee.memProp == "add" {
-        if exprMap(callee.memObj, fnIx) {
-          if s.callArgs.length != 1 {
-            return emitFail("emitProgram: set add takes exactly one argument")
-          }
-          return emitMapSetV(body, callee.memObj, s.callArgs[0], -1, fnIx, true)
-        }
-      }
-      // G8: a bare `m.delete(k)` STATEMENT discards the boolean result — emit the
-      // delete, then `drop` the 0/1 it leaves on the stack.
-      if callee.memProp == "delete" {
-        if exprMap(callee.memObj, fnIx) {
-          if s.callArgs.length != 1 {
-            return emitFail(
-              "emitProgram: map delete takes exactly one argument",
-            )
-          }
-          if emitMapDelete(body, callee.memObj, s.callArgs[0], fnIx) < 0 {
-            return -1
-          }
-          fbDrop() // 0x1a drop (discard the boolean result)
-          return 0
-        }
-      }
-      // A CLOSURE-FIELD member call STATEMENT (`(o."[]=")(k, v)` — the rewritten
-      // index WRITE trap, or any function-valued field invoked for effect):
-      // `call_ref` it; drop the result unless the field's function is void.
-      if exprIsClosure(s.callFn, fnIx) {
-        if emitCallRef(body, stmtIx, fnIx) < 0 { return -1 }
-        const mcFe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        let mcVoid = false
-        if mcFe >= 0 {
-          if fRetVoid[mcFe] == 1 { mcVoid = true }
-        }
-        if !mcVoid {
-          fbDrop() // 0x1a drop (discard the unused result)
-        }
-        return 0
-      }
-      return emitFail("emitProgram: unsupported member-call statement")
-    }
-    if callee is Ident {
-      // A bare call whose RESULT is discarded (a helper invoked for its side
-      // effects): emit the call, then `drop` the value it leaves — EXCEPT `print`
-      // (a void import) and a VOID function (`()->()` leaves nothing).
-      if emitCall(body, stmtIx, fnIx) < 0 { return -1 }
-      let dropIt = callee.identName != "print"
-      // The void memory intrinsics leave nothing on the stack.
-      if callee.identName == "__store_i32__" { dropIt = false }
-      if callee.identName == "__log__" { dropIt = false }
-      // The void array intrinsics: `__array_copy__` leaves nothing; `__trap__`
-      // is `unreachable` (no value reaches the drop).
-      if callee.identName == "__array_copy__" { dropIt = false }
-      if callee.identName == "__trap__" { dropIt = false }
-      if dropIt {
-        const vt = fnIndexOf(callee.identName)
-        if vt >= 0 {
-          if fRetVoid[vt] == 1 { dropIt = false }
-        } else if calleeReturnsVoid(callee.identName, fnIx) {
-          // A closure-VALUE callee (a param / binding, invisible to `fnIndexOf`) whose
-          // `$fnsig` is void leaves nothing — no `drop`.
-          dropIt = false
-        }
-      }
-      if dropIt {
-        fbDrop() // 0x1a drop
-      }
-      return 0
-    }
-    return emitFail("emitProgram: bare call statement is not supported")
-  }
+  if s is Call { return emitCallStmt(body, s, stmtIx, fnIx) }
   if s is RetStmt {
     if s.retArg < 0 {
       return emitFail("emitProgram: bare return is not supported")
@@ -15185,111 +14840,464 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     fbReturn() // 0x0f return
     return 0
   }
-  if s is IfStmt {
-    // Structured void `if`: push the i32 condition, then `if 0x04` with void
-    // blocktype `0x40`. The then-branch's statements run when the condition is
-    // non-zero; an optional `else 0x05` branch runs otherwise; `end 0x0b` closes it.
-    // Both branches `return` on their own, so the `if` yields no value.
-    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
-    fbIf(64) // 0x04 if, 0x40 void blocktype
-    // The `if` opens ONE control frame (the `else` reuses it, `end` closes it), so a
-    // `break`/`continue` nested in either arm sees the right relative `br` depth.
-    ctrlEnter()
-    // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
-    // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
-    // outer narrowing around the branch so nesting and the else-branch are unaffected.
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
-    if emitStmts(body, s.ifThen, fnIx) < 0 { return -1 }
-    if narrowed { restoreNarrow(savedTop) }
-    if s.ifElse >= 0 {
-      fbElse() // 0x05 else
-      // The else may be a Block or a nested IfStmt (`else if`); both go through
-      // `emitStmt` (a lone statement) — a Block re-enters `emitStmts`. The then
-      // narrowing does NOT hold in the else-branch (the guard was false there);
-      // a VALUE union narrows to the COMPLEMENT set instead (`is T` removes `T`).
-      const savedElseTop = narrowTop
-      const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
-      const els = P.nodes[s.ifElse]
-      if els is Block {
-        if emitStmts(body, s.ifElse, fnIx) < 0 { return -1 }
-      } else {
-        if emitStmt(body, s.ifElse, fnIx) < 0 { return -1 }
-      }
-      if narrowedElse { restoreNarrow(savedElseTop) }
-    }
-    fbEnd() // 0x0b end
-    ctrlLeave()
+  if s is IfStmt { return emitIfStmtStmt(body, s, stmtIx, fnIx) }
+  if s is WhileStmt { return emitWhileStmtStmt(body, s, stmtIx, fnIx) }
+  if s is ForRange { return emitForRangeStmt(body, s, stmtIx, fnIx) }
+  if s is ForIn { return emitForInStmt(body, s, stmtIx, fnIx) }
+  if s is BreakStmt { return emitBreakStmtStmt(body, s, stmtIx, fnIx) }
+  if s is ContinueStmt { return emitContinueStmtStmt(body, s, stmtIx, fnIx) }
+  emitFail("emitProgram: unsupported statement in body")
+}
+
+function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
+  // `let x = <expr>` / `const x = <expr>`: emit the init, then store it into the
+  // local's slot. This `LetDecl`'s slot is the next cursor position (collect allocated
+  // slots in this SAME pre-order), so it owns declared-local slot `emitLetCursor` —
+  // do NOT name-resolve it (a name lookup would hit an outer same-named binding still
+  // in scope here). `paramN + slot` is its wasm local index.
+  let slot = emitLetCursor
+  emitLetCursor = emitLetCursor + 1
+  let paramN = 0
+  // The START function (`fnIx == -1`, top-level statements) has no params — and no
+  // arena node to read, so the lookup must be guarded.
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
+  }
+  const idx = paramN + slot
+  if s.letInit < 0 {
+    // UNINITIALIZED scalar local (validated by `checkLocalI32`): nothing to store
+    // — the wasm local's implicit zero-init covers the declaration; bind the name
+    // so later reads/writes resolve to this slot.
+    scopeBind(s.letName, slot)
     return 0
   }
-  if s is WhileStmt {
-    // Structured while loop: block (void) wrapping a loop (void).
-    // The condition is checked at the top; if false (eqz), br_if 1 exits the block;
-    // body runs, then br 0 continues the loop. Two `end` bytes close loop then block.
-    // Track the two control frames so `break`/`continue` in the body compute their
-    // relative `br` depth: the BLOCK is the `break` target (resume after the loop),
-    // the LOOP is the `continue` target (re-check the condition). Push the ABSOLUTE
-    // `ctrlDepth` of each frame; a branch site at depth D uses `D - <that depth>`.
-    fbBlock(64) // 0x02 block, 0x40 void blocktype
-    ctrlEnter()
-    loopBrkDepth.push(ctrlDepth)
-    loopBrkLabel.push(s.whileLabel)
-    fbLoop(64)  // 0x03 loop, 0x40 void blocktype
-    ctrlEnter()
-    loopContDepth.push(ctrlDepth)
-    loopContLabel.push(s.whileLabel)
-    // condition + eqz: if condition is false (zero), exit block
-    if emitExpr(body, s.whileCond, fnIx) < 0 { return -1 }
-    fbI32Eqz() // 0x45 i32.eqz (invert: exit if condition was false)
-    fbBrIf(1)  // 0x0d br_if, depth 1 = break out of block
-    // body statements
-    if emitStmts(body, s.whileBody, fnIx) < 0 { return -1 }
-    fbBr(0) // 0x0c br, depth 0 = continue loop
-    fbEnd() // 0x0b end (loop)
-    ctrlLeave()
-    loopContDepth.pop()
-    loopContLabel.pop()
-    fbEnd() // 0x0b end (block)
-    ctrlLeave()
-    loopBrkDepth.pop()
-    loopBrkLabel.pop()
-    return 0
-  }
-  if s is ForRange {
-    // `for v in A to B [step K] { body }` — an INCLUSIVE numeric range, lowered to
-    // the same block/loop shape as `while`. The loop var `v` and a synthetic bound
-    // temp own the next TWO cursor slots (collectLocals allocated them in this same
-    // pre-order). The step must be a CONSTANT integer literal (optionally negated);
-    // its SIGN picks the exit comparison: ascending exits when v > bound (i32.le_s
-    // + eqz), descending when v < bound (i32.ge_s + eqz). The bound is evaluated
-    // ONCE into the temp.
-    const vSlot = emitLetCursor
-    emitLetCursor = emitLetCursor + 1
-    const bSlot = emitLetCursor
-    emitLetCursor = emitLetCursor + 1
-    let paramN = 0
-    if fnIx >= 0 {
-      const fn = P.nodes[fnIx]
-      if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
-    }
-    const vIdx = paramN + vSlot
-    const bIdx = paramN + bSlot
-    // Static step: default +1; `step <int>` / `step -<int>`.
-    let stepK = 1
-    if s.frStep >= 0 {
-      const st = P.nodes[s.frStep]
-      if st is NumLit {
-        stepK = parseI32(st.numText)
-      } else if st is Unary {
-        if st.unOp == "-" {
-          const inner = P.nodes[st.unArg]
-          if inner is NumLit {
-            stepK = 0 - parseI32(inner.numText)
-          } else {
-            return emitFail(
-              "emitProgram: for-range step must be a constant integer",
-            )
+  // VALUE-FLOW MONOMORPHIZATION: a `const g = f` binding to a GENERIC (un-annotated-param)
+  // NAMED function, where `g` is used ONLY as a direct-call callee (`g(args)`), is sound.
+  // `monomorphize` rewrote each `g(args)` to its per-call instance (the first/i32 shape stays
+  // on `f`'s own slot, keeping its un-annotated params for byte-identity), so the closure
+  // stored here is `call_ref`'d only at the type its slot was pinned to. The value floor in
+  // `emitClosureValue` would reject it on those un-annotated params, so emit through the
+  // floor-LESS core. A value-USE of `g` (passed, returned, stored) escapes — `nameUsedAsValueIn`
+  // catches it — and falls through to the normal path, where the floor rejects it.
+  if fnIx >= 0 {
+    const aliasFe = fieldValueFeOf(s.letInit)
+    if fnHasUnannotatedParam(aliasFe) {
+      if !criFnIsAnonLambda(aliasFe) {
+        const encl = P.nodes[fnIx]
+        if encl is FuncDecl {
+          if !nameUsedAsValueIn(s.letName, encl.fnBody) {
+            if emitClosureValueCore(body, aliasFe, fnIx) < 0 { return -1 }
+            fbLocalSet(idx) // 0x21 local.set
+            scopeBind(s.letName, slot)
+            return 0
           }
+        }
+      }
+    }
+  }
+  // A degenerate UN-ANNOTATED `let x = null` (A-infer-null): when NO later
+  // assignment fills the hole (`nliNameOf` recorded nothing), the binding's
+  // type is the plain `null` type — it is never read as a non-null value, so
+  // its i32 cell just zero-inits. A FILLED hole (`x = 5` later) is a `T|null`
+  // value-union binding (kind 4) and takes the union-coerce path below.
+  if s.letType < 0 {
+    const bareN = P.nodes[unwrapParen(s.letInit)]
+    if bareN is NullLit {
+      if nliNameOf(stmtIx) == "" {
+        fbI32Const(0)
+        fbLocalSet(idx) // 0x21 local.set
+        scopeBind(s.letName, slot)
+        return 0
+      }
+    }
+  }
+  // An empty `[]` initializer over a ref-array annotation (`let xs: T[] = []`) needs
+  // the element kind to pick the ref-list construction — record it for `emitArr`.
+  pendingListKind = letAnnRefListKind(stmtIx)
+  pendingListSlot = letAnnRefListSlot(stmtIx)
+  // A kind-18 nullable ref-array binding: a bare `null` init lowers as `ref.null $innerWrapper`. The list
+  // value seeds above (`pendingListKind`/`Slot`) build a non-null list; this seeds the null arm.
+  if localIsRef[slot] == "nulreflist" {
+    if pendingListSlot >= 0 && pendingListSlot < rlWrapIdx.length {
+      pendingNulRefHeap = rlWrapIdx[pendingListSlot]
+    }
+  }
+  // A kind-15 nullable i32-list binding (`i32[] | null = null`): a bare `null` init lowers as
+  // `ref.null $lTypeIdx` (the `pendingNulList` arm), the scalar-list analogue of the kind-18 seed above.
+  // Without this a literal `= null` init fell through to the bare-null error (the type/narrowing worked,
+  // but an actual null value never lowered).
+  let letNulList15 = localIsRef[slot] == "nullist"
+  // An UN-annotated empty `[]` whose USAGE pins a string element (`const out = [];
+  // out.push(self[i])`): seed the string-list kind so `emitArr` builds the string-list
+  // wrapper, MATCHING the slot `collectLocals` typed (kind 7, via the same
+  // `letInfStrListByUseV`). Without this the inferred `[]` defaults to the i32 list and
+  // the slot store mismatches. Unblocks a generic build-loop (`slice`/`reverse`) over
+  // `string[]`.
+  if pendingListKind == 0 && letInfStrListByUseV(stmtIx, fnIx) {
+    pendingListKind = 3
+  }
+  // A `let b: B = { … }` struct LITERAL must build the annotation's struct, not a
+  // first-field-name match — seed `pendingStructIdx` (consumed by `emitObj`) from the
+  // annotation when it names a standalone struct, so a same-field-name sibling struct
+  // does not win. Mirrors the call-arg / element / return / global seeding. A union
+  // annotation names no `sNames` entry (`letAnnStructIdx` is -1) so a variant literal
+  // still boxes; a non-struct-literal init ignores the hint.
+  pendingStructIdx = letAnnStructIdx(stmtIx)
+  // A NULLABLE-struct binding (`let b: P | null = …`, slot kind 9) seeds the SAME struct
+  // context from the slot's recorded struct index — a bare `null` init lowers as
+  // `ref.null $P` (the union annotation names no `sNames` entry, so `letAnnStructIdx`
+  // gave -1), a struct literal builds that struct. Mirrors the global kind-9 cell seeding.
+  if pendingStructIdx < 0 {
+    if localIsRef[slot] == "nulstruct" {
+      pendingStructIdx = localStructIdx[slot]
+    }
+  }
+  // A `const c: Cat = { … }` variant-typed binding seeds the VARIANT index so the object
+  // literal builds the bare variant struct (kind 8) instead of boxing into the union.
+  pendingVariantIdx = letAnnVariantIdx(stmtIx)
+  // A map-typed binding seeds the map SHAPE so a `Map()` initializer constructs
+  // THIS binding's map struct (mono, or the annotation's ref-valued mv slot).
+  if letIsMap(stmtIx, fnIx) { pendingMapSlot = letMapShapeOf(stmtIx, fnIx) }
+  // Numeric WIDENING at the binding boundary: an `: f64` / `: f32` / `: i64` slot
+  // coerces a narrower init value (the lattice convert is inserted by the `emitExprAs*`
+  // helpers — i32/i64/f32→f64, i32→f32, i32→i64). A float/integer literal re-encodes in
+  // place via `pendingF32`/`pendingI64`. An i32-only binding stays byte-identical.
+  // A UNION-annotated binding (kind 4) coerces a raw init value into the box
+  // (`let u: boolean | i32 = 5` boxes the 5 with its atom tag); an already-union
+  // init (a union-returning call) and a struct-union object literal pass through
+  // `emitUnionCoerce` unchanged.
+  let letUNm = ""
+  let letAnnNm = ""
+  if s.letType >= 0 { letAnnNm = tyNameOf(s.letType) }
+  // A filled null hole (`let x = null` + later `x = e`, A-infer-null) is its
+  // inferred `T|null` value union — coerce the bare `null` init into the box.
+  if isUName(letAnnNm) && !nameIsLitUnionType(letAnnNm) {
+    // A literal union (`type K = "a" | "b"`) reads as a union NAME but is an i32 ATOM, not a value-union
+    // box — so it must NOT take the `emitUnionCoerce` path (which would `struct.new` the member).
+    letUNm = letAnnNm
+  } else if !isUName(letAnnNm) {
+    letUNm = nliNameOf(stmtIx)
+  }
+  // A nullable / value-union if-EXPRESSION init (`const x: i32 | null = if c then 5
+  // else null`, `else if` chains) lowers by writing the binding's own local in each
+  // arm of a void `if` — no value-typed-if blocktype or scratch slot needed (the
+  // binding local IS the destination). The slot kind `collectLocals` already chose is
+  // the authoritative rep: kind 4 the value-union box (rep 0, needs the union NAME to
+  // box each arm's atom — taken from the annotation / `letUNm`), kind 16 a `string |
+  // null` ref (rep 1), kind 17 a `boolean | null` niche i32 (rep 2, sentinel 2 = null).
+  if exprIsIfStmt(s.letInit) {
+    const slotKind = localIsRef[slot]
+    let nulRep = -1
+    let nulNm = ""
+    if slotKind == "union" {
+      if letUNm != "" { nulNm = letUNm }
+      else if s.letType >= 0 { nulNm = tyNameOf(s.letType) }
+      if nulNm != "" { nulRep = 0 }
+    } else if slotKind == "nulstr" {
+      nulRep = 1
+    } else if slotKind == "nulbool" {
+      nulRep = 2
+    }
+    if nulRep >= 0 {
+      // The value-union box local (kind 4) is a NON-null `(ref $uBoxIdx)` — non-
+      // defaultable, so the validator needs it definitely assigned. Both arms below
+      // set it, but a void-`if` merge does not satisfy V8's local-init check; pre-seed
+      // the rep's null first (overwritten by every arm). The `string | null` (nullable
+      // ref) rep is defaultable and needs no pre-seed.
+      if nulRep == 0 {
+        if emitNulNullToLocal(body, idx, 0) < 0 { return -1 }
+      }
+      if (
+        emitNullableIfBinding(body, s.letInit, idx, nulRep, nulNm, fnIx) <
+        0
+      ) {
+        return -1
+      }
+      scopeBind(s.letName, slot)
+      return 0
+    }
+  }
+  if localIsRef[slot] == "nulclosure" {
+    // A NULLABLE function-value binding (`let c: ((i32) => i32) | null = …`): the slot is
+    // `(ref null $cloStruct)`. A bare `null` init lowers as `ref.null $cloStruct`
+    // (`pendingNulClosure`); a function init stores its closure ref directly. Takes
+    // priority over the union-coerce path (the `fn | null` annotation reads as a union
+    // NAME, but this is a niche nullable ref, not a box).
+    const savedNC = pendingNulClosure
+    pendingNulClosure = true
+    if emitExpr(body, s.letInit, fnIx) < 0 { return -1 }
+    pendingNulClosure = savedNC
+  } else if letUNm != "" {
+    if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return -1 }
+  } else if letIsF32(stmtIx) {
+    const savedF32 = pendingF32
+    pendingF32 = true
+    if emitExprAsF32(body, s.letInit, fnIx) < 0 { return -1 }
+    pendingF32 = savedF32
+  } else if letIsF64(stmtIx, fnIx) {
+    if emitExprAsF64(body, s.letInit, fnIx) < 0 { return -1 }
+  } else if letIsI64(stmtIx, fnIx) {
+    if emitExprAsI64(body, s.letInit, fnIx) < 0 { return -1 }
+  } else if letAnnNm == "string" && exprIsLitAtom(s.letInit, fnIx) {
+    // A literal-union atom initializing a `string` local widens to its member string.
+    if emitAtomToStr(body, s.letInit, fnIx) < 0 { return -1 }
+  } else {
+    // A `boolean|null` NICHE binding lowers a bare `null` init as the sentinel 2; a
+    // `string|null` binding lowers it as `ref.null $aTypeIdx`. `letNulBool` (not just
+    // the annotation) so an INFERRED niche binding (`const r = f()` where `f` returns
+    // `boolean | null`) seeds the sentinel too.
+    pendingNulBool = letNulBool(stmtIx, fnIx)
+    pendingNulString = letIsNulString(stmtIx, fnIx)
+    if s.letType >= 0 {
+      if nameIsLitUnionType(tyNameOf(s.letType)) { pendingLitUnion = 1 }
+      // A `K | null` NICHE binding: a member init lowers as its atom id, a bare `null` init as the
+      // i32 sentinel `-1` — seed both, like the param-arg / return boundaries.
+      if nameIsNulLitUnion(tyNameOf(s.letType)) {
+        pendingLitUnion = 1
+        pendingNulLitUnion = true
+      }
+    }
+    const savedNulList = pendingNulList
+    if letNulList15 { pendingNulList = true }
+    if emitExpr(body, s.letInit, fnIx) < 0 { return -1 }
+    pendingNulBool = false
+    pendingNulString = false
+    pendingNulList = savedNulList
+    pendingLitUnion = 0
+    pendingNulLitUnion = false
+  }
+  pendingI64 = false
+  pendingStructIdx = -1
+  pendingVariantIdx = -1
+  pendingListKind = 0
+  pendingListSlot = 0
+  pendingMapSlot = -1
+  pendingNulRefHeap = -1
+  fbLocalSet(idx) // 0x21 local.set
+  // Bind `name → slot` in the current emit-time frame AFTER emitting the init (so the
+  // init resolved any same-named OUTER binding), making this binding live for the rest
+  // of the block — mirrors the collect pass so resolution matches slot allocation.
+  scopeBind(s.letName, slot)
+  return 0
+}
+
+function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
+  // The only call STATEMENT this slice lowers is a list append `recv.push(x)` (a
+  // `Call` whose `callFn` is a `Member`). A bare top-level call statement (a function
+  // call whose value is discarded) is out of scope.
+  const callee = P.nodes[s.callFn]
+  if callee is Member {
+    if callee.memProp == "push" { return emitPush(body, stmtIx, fnIx) }
+    // A `.pop()` STATEMENT discards the popped element — emit the pop, then `drop`
+    // the value it leaves on the stack.
+    if callee.memProp == "pop" {
+      if emitPop(body, stmtIx, fnIx) < 0 { return -1 }
+      fbDrop() // 0x1a drop
+      return 0
+    }
+    // A `.clear()` STATEMENT resets the list's length to 0 (backing retained).
+    if callee.memProp == "clear" {
+      if (
+        exprArray(callee.memObj, fnIx) ||
+        exprRefArray(callee.memObj, fnIx) ||
+        exprStringArray(callee.memObj, fnIx)
+      ) {
+        return emitClear(body, stmtIx, fnIx)
+      }
+    }
+    // G8: a map `m.set(k, v)` STATEMENT is the method form of `m[k] = v` — the
+    // same scan/overwrite-or-append lowering.
+    if callee.memProp == "set" {
+      if exprMap(callee.memObj, fnIx) {
+        if s.callArgs.length != 2 {
+          return emitFail("emitProgram: map set takes exactly two arguments")
+        }
+        return emitMapSet(
+          body,
+          callee.memObj,
+          s.callArgs[0],
+          s.callArgs[1],
+          fnIx,
+        )
+      }
+    }
+    // A Set `s.add(k)` STATEMENT is the membership-insert form of `s[k] = true` — the
+    // SAME scan/overwrite-or-append lowering as `emitMapSet`, but storing the constant
+    // boolean `1` (true) as the value (the Set vals-list carries true for live keys).
+    // It takes EXACTLY one arg; the result (if any) is discarded.
+    if callee.memProp == "add" {
+      if exprMap(callee.memObj, fnIx) {
+        if s.callArgs.length != 1 {
+          return emitFail("emitProgram: set add takes exactly one argument")
+        }
+        return emitMapSetV(body, callee.memObj, s.callArgs[0], -1, fnIx, true)
+      }
+    }
+    // G8: a bare `m.delete(k)` STATEMENT discards the boolean result — emit the
+    // delete, then `drop` the 0/1 it leaves on the stack.
+    if callee.memProp == "delete" {
+      if exprMap(callee.memObj, fnIx) {
+        if s.callArgs.length != 1 {
+          return emitFail("emitProgram: map delete takes exactly one argument")
+        }
+        if emitMapDelete(body, callee.memObj, s.callArgs[0], fnIx) < 0 {
+          return -1
+        }
+        fbDrop() // 0x1a drop (discard the boolean result)
+        return 0
+      }
+    }
+    // A CLOSURE-FIELD member call STATEMENT (`(o."[]=")(k, v)` — the rewritten
+    // index WRITE trap, or any function-valued field invoked for effect):
+    // `call_ref` it; drop the result unless the field's function is void.
+    if exprIsClosure(s.callFn, fnIx) {
+      if emitCallRef(body, stmtIx, fnIx) < 0 { return -1 }
+      const mcFe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+      let mcVoid = false
+      if mcFe >= 0 {
+        if fRetVoid[mcFe] == 1 { mcVoid = true }
+      }
+      if !mcVoid {
+        fbDrop() // 0x1a drop (discard the unused result)
+      }
+      return 0
+    }
+    return emitFail("emitProgram: unsupported member-call statement")
+  }
+  if callee is Ident {
+    // A bare call whose RESULT is discarded (a helper invoked for its side
+    // effects): emit the call, then `drop` the value it leaves — EXCEPT `print`
+    // (a void import) and a VOID function (`()->()` leaves nothing).
+    if emitCall(body, stmtIx, fnIx) < 0 { return -1 }
+    let dropIt = callee.identName != "print"
+    // The void memory intrinsics leave nothing on the stack.
+    if callee.identName == "__store_i32__" { dropIt = false }
+    if callee.identName == "__log__" { dropIt = false }
+    // The void array intrinsics: `__array_copy__` leaves nothing; `__trap__`
+    // is `unreachable` (no value reaches the drop).
+    if callee.identName == "__array_copy__" { dropIt = false }
+    if callee.identName == "__trap__" { dropIt = false }
+    if dropIt {
+      const vt = fnIndexOf(callee.identName)
+      if vt >= 0 {
+        if fRetVoid[vt] == 1 { dropIt = false }
+      } else if calleeReturnsVoid(callee.identName, fnIx) {
+        // A closure-VALUE callee (a param / binding, invisible to `fnIndexOf`) whose
+        // `$fnsig` is void leaves nothing — no `drop`.
+        dropIt = false
+      }
+    }
+    if dropIt {
+      fbDrop() // 0x1a drop
+    }
+    return 0
+  }
+  return emitFail("emitProgram: bare call statement is not supported")
+}
+
+function emitIfStmtStmt(body: i32[], s: IfStmt, stmtIx: i32, fnIx: i32) {
+  // Structured void `if`: push the i32 condition, then `if 0x04` with void
+  // blocktype `0x40`. The then-branch's statements run when the condition is
+  // non-zero; an optional `else 0x05` branch runs otherwise; `end 0x0b` closes it.
+  // Both branches `return` on their own, so the `if` yields no value.
+  if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+  fbIf(64) // 0x04 if, 0x40 void blocktype
+  // The `if` opens ONE control frame (the `else` reuses it, `end` closes it), so a
+  // `break`/`continue` nested in either arm sees the right relative `br` depth.
+  ctrlEnter()
+  // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
+  // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
+  // outer narrowing around the branch so nesting and the else-branch are unaffected.
+  const savedTop = narrowTop
+  const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+  if emitStmts(body, s.ifThen, fnIx) < 0 { return -1 }
+  if narrowed { restoreNarrow(savedTop) }
+  if s.ifElse >= 0 {
+    fbElse() // 0x05 else
+    // The else may be a Block or a nested IfStmt (`else if`); both go through
+    // `emitStmt` (a lone statement) — a Block re-enters `emitStmts`. The then
+    // narrowing does NOT hold in the else-branch (the guard was false there);
+    // a VALUE union narrows to the COMPLEMENT set instead (`is T` removes `T`).
+    const savedElseTop = narrowTop
+    const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
+    const els = P.nodes[s.ifElse]
+    if els is Block {
+      if emitStmts(body, s.ifElse, fnIx) < 0 { return -1 }
+    } else {
+      if emitStmt(body, s.ifElse, fnIx) < 0 { return -1 }
+    }
+    if narrowedElse { restoreNarrow(savedElseTop) }
+  }
+  fbEnd() // 0x0b end
+  ctrlLeave()
+  return 0
+}
+
+function emitWhileStmtStmt(body: i32[], s: WhileStmt, stmtIx: i32, fnIx: i32) {
+  // Structured while loop: block (void) wrapping a loop (void).
+  // The condition is checked at the top; if false (eqz), br_if 1 exits the block;
+  // body runs, then br 0 continues the loop. Two `end` bytes close loop then block.
+  // Track the two control frames so `break`/`continue` in the body compute their
+  // relative `br` depth: the BLOCK is the `break` target (resume after the loop),
+  // the LOOP is the `continue` target (re-check the condition). Push the ABSOLUTE
+  // `ctrlDepth` of each frame; a branch site at depth D uses `D - <that depth>`.
+  fbBlock(64) // 0x02 block, 0x40 void blocktype
+  ctrlEnter()
+  loopBrkDepth.push(ctrlDepth)
+  loopBrkLabel.push(s.whileLabel)
+  fbLoop(64)  // 0x03 loop, 0x40 void blocktype
+  ctrlEnter()
+  loopContDepth.push(ctrlDepth)
+  loopContLabel.push(s.whileLabel)
+  // condition + eqz: if condition is false (zero), exit block
+  if emitExpr(body, s.whileCond, fnIx) < 0 { return -1 }
+  fbI32Eqz() // 0x45 i32.eqz (invert: exit if condition was false)
+  fbBrIf(1)  // 0x0d br_if, depth 1 = break out of block
+  // body statements
+  if emitStmts(body, s.whileBody, fnIx) < 0 { return -1 }
+  fbBr(0) // 0x0c br, depth 0 = continue loop
+  fbEnd() // 0x0b end (loop)
+  ctrlLeave()
+  loopContDepth.pop()
+  loopContLabel.pop()
+  fbEnd() // 0x0b end (block)
+  ctrlLeave()
+  loopBrkDepth.pop()
+  loopBrkLabel.pop()
+  return 0
+}
+
+function emitForRangeStmt(body: i32[], s: ForRange, stmtIx: i32, fnIx: i32) {
+  // `for v in A to B [step K] { body }` — an INCLUSIVE numeric range, lowered to
+  // the same block/loop shape as `while`. The loop var `v` and a synthetic bound
+  // temp own the next TWO cursor slots (collectLocals allocated them in this same
+  // pre-order). The step must be a CONSTANT integer literal (optionally negated);
+  // its SIGN picks the exit comparison: ascending exits when v > bound (i32.le_s
+  // + eqz), descending when v < bound (i32.ge_s + eqz). The bound is evaluated
+  // ONCE into the temp.
+  const vSlot = emitLetCursor
+  emitLetCursor = emitLetCursor + 1
+  const bSlot = emitLetCursor
+  emitLetCursor = emitLetCursor + 1
+  let paramN = 0
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
+  }
+  const vIdx = paramN + vSlot
+  const bIdx = paramN + bSlot
+  // Static step: default +1; `step <int>` / `step -<int>`.
+  let stepK = 1
+  if s.frStep >= 0 {
+    const st = P.nodes[s.frStep]
+    if st is NumLit {
+      stepK = parseI32(st.numText)
+    } else if st is Unary {
+      if st.unOp == "-" {
+        const inner = P.nodes[st.unArg]
+        if inner is NumLit {
+          stepK = 0 - parseI32(inner.numText)
         } else {
           return emitFail(
             "emitProgram: for-range step must be a constant integer",
@@ -15300,298 +15308,305 @@ function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
           "emitProgram: for-range step must be a constant integer",
         )
       }
+    } else {
+      return emitFail("emitProgram: for-range step must be a constant integer")
     }
-    if stepK == 0 {
-      return emitFail("emitProgram: for-range step must not be zero")
-    }
-    // v = A; bound = B (each evaluated once, in source order)
-    if emitExpr(body, s.frFrom, fnIx) < 0 { return -1 }
-    fbLocalSet(vIdx)
-    if emitExpr(body, s.frTo, fnIx) < 0 { return -1 }
-    fbLocalSet(bIdx)
-    // Bind the loop var for the body (mirrors the collect pass's scopeBind).
-    scopeBind(s.frVar, vSlot)
-    fbBlock(64) // 0x02 block, void
-    ctrlEnter()
-    loopBrkDepth.push(ctrlDepth)
-    loopBrkLabel.push(s.frLabel)
-    fbLoop(64)  // 0x03 loop, void
+  }
+  if stepK == 0 {
+    return emitFail("emitProgram: for-range step must not be zero")
+  }
+  // v = A; bound = B (each evaluated once, in source order)
+  if emitExpr(body, s.frFrom, fnIx) < 0 { return -1 }
+  fbLocalSet(vIdx)
+  if emitExpr(body, s.frTo, fnIx) < 0 { return -1 }
+  fbLocalSet(bIdx)
+  // Bind the loop var for the body (mirrors the collect pass's scopeBind).
+  scopeBind(s.frVar, vSlot)
+  fbBlock(64) // 0x02 block, void
+  ctrlEnter()
+  loopBrkDepth.push(ctrlDepth)
+  loopBrkLabel.push(s.frLabel)
+  fbLoop(64)  // 0x03 loop, void
+  ctrlEnter()
+  loopContDepth.push(ctrlDepth)
+  loopContLabel.push(s.frLabel)
+  // continue-condition: le_s (ascending) / ge_s (descending), inverted to exit
+  fbLocalGet(vIdx)
+  fbLocalGet(bIdx)
+  if stepK > 0 {
+    fbI32Bin(76) // 0x4c i32.le_s
+  } else {
+    fbI32Bin(78) // 0x4e i32.ge_s
+  }
+  fbI32Eqz() // 0x45 invert: exit when out of range
+  fbBrIf(1)  // 0x0d br_if -> break out of block
+  // A body with a `continue` binding to THIS loop (direct, or `continue
+  // <label>` from a nested loop) needs an INNER block as the continue
+  // target: branching to its END falls into the increment (a branch to the
+  // loop header would SKIP the increment — an infinite loop). A body without
+  // one keeps the original two-frame shape (goldens pinned on it). The inner
+  // block carries the loop's LABEL too, shadowing the header entry, so a
+  // binding `continue` lands on the increment.
+  const frHasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
+  if frHasCont {
+    fbBlock(64) // continue block
     ctrlEnter()
     loopContDepth.push(ctrlDepth)
     loopContLabel.push(s.frLabel)
-    // continue-condition: le_s (ascending) / ge_s (descending), inverted to exit
-    fbLocalGet(vIdx)
-    fbLocalGet(bIdx)
-    if stepK > 0 {
-      fbI32Bin(76) // 0x4c i32.le_s
-    } else {
-      fbI32Bin(78) // 0x4e i32.ge_s
-    }
-    fbI32Eqz() // 0x45 invert: exit when out of range
-    fbBrIf(1)  // 0x0d br_if -> break out of block
-    // A body with a `continue` binding to THIS loop (direct, or `continue
-    // <label>` from a nested loop) needs an INNER block as the continue
-    // target: branching to its END falls into the increment (a branch to the
-    // loop header would SKIP the increment — an infinite loop). A body without
-    // one keeps the original two-frame shape (goldens pinned on it). The inner
-    // block carries the loop's LABEL too, shadowing the header entry, so a
-    // binding `continue` lands on the increment.
-    const frHasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
-    if frHasCont {
-      fbBlock(64) // continue block
-      ctrlEnter()
-      loopContDepth.push(ctrlDepth)
-      loopContLabel.push(s.frLabel)
-    }
-    if emitStmts(body, s.frBody, fnIx) < 0 { return -1 }
-    if frHasCont {
-      fbEnd() // end continue block — `continue` lands here
-      ctrlLeave()
-      loopContDepth.pop()
-      loopContLabel.pop()
-    }
-    // v = v + K
-    fbLocalGet(vIdx)
-    fbI32Const(stepK)
-    fbI32Bin(106) // 0x6a i32.add
-    fbLocalSet(vIdx)
-    fbBr(0)       // continue loop
-    fbEnd()       // end loop
+  }
+  if emitStmts(body, s.frBody, fnIx) < 0 { return -1 }
+  if frHasCont {
+    fbEnd() // end continue block — `continue` lands here
     ctrlLeave()
     loopContDepth.pop()
     loopContLabel.pop()
-    fbEnd()       // end block
-    ctrlLeave()
-    loopBrkDepth.pop()
-    loopBrkLabel.pop()
-    // The loop variable's scope is the loop (see `scopeUnbind`).
-    scopeUnbind()
-    return 0
   }
-  if s is ForIn {
-    // `for v in <list> { body }` — iterate an i32 list, a string list, a struct
-    // `S[]` ref list, or a map's ordered `.keys()`/`.values()` list. THREE cursor
-    // slots in collect pre-order: the element var `v` (i32, a string ref, or a struct
-    // ref), a hidden i32 cursor `v#i`, and a hidden list temp `v#l` (the iterable
-    // evaluates ONCE). Shape mirrors `while`: block/loop, exit on `cursor >= len`,
-    // element read per iteration, cursor++.
-    const ek = vkOrKind(forInElemKind(s.fiIter, fnIx), "map")
-    if ek == "map" {
-      return emitFail("emitProgram: unsupported for-in iterable")
+  // v = v + K
+  fbLocalGet(vIdx)
+  fbI32Const(stepK)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(vIdx)
+  fbBr(0)       // continue loop
+  fbEnd()       // end loop
+  ctrlLeave()
+  loopContDepth.pop()
+  loopContLabel.pop()
+  fbEnd()       // end block
+  ctrlLeave()
+  loopBrkDepth.pop()
+  loopBrkLabel.pop()
+  // The loop variable's scope is the loop (see `scopeUnbind`).
+  scopeUnbind()
+  return 0
+}
+
+function emitForInStmt(body: i32[], s: ForIn, stmtIx: i32, fnIx: i32) {
+  // `for v in <list> { body }` — iterate an i32 list, a string list, a struct
+  // `S[]` ref list, or a map's ordered `.keys()`/`.values()` list. THREE cursor
+  // slots in collect pre-order: the element var `v` (i32, a string ref, or a struct
+  // ref), a hidden i32 cursor `v#i`, and a hidden list temp `v#l` (the iterable
+  // evaluates ONCE). Shape mirrors `while`: block/loop, exit on `cursor >= len`,
+  // element read per iteration, cursor++.
+  const ek = vkOrKind(forInElemKind(s.fiIter, fnIx), "map")
+  if ek == "map" { return emitFail("emitProgram: unsupported for-in iterable") }
+  // A STRING iterable (`for ch in s`): the `#l` temp IS the raw `(ref $aTypeIdx)` array (no
+  // list wrapper), so the length is `array.len` and each element `array.get $aTypeIdx` —
+  // skipping the `struct.get wrapTy` the i32-list path uses. The loop var is an i32 code unit.
+  const strSrc = forInStringSrc(s.fiIter, fnIx)
+  const vSlot = emitLetCursor
+  emitLetCursor = emitLetCursor + 1
+  const iSlot = emitLetCursor
+  emitLetCursor = emitLetCursor + 1
+  const lSlot = emitLetCursor
+  emitLetCursor = emitLetCursor + 1
+  let paramN = 0
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
+  }
+  const vIdx = paramN + vSlot
+  const iIdx = paramN + iSlot
+  let lIdx = paramN + lSlot
+  let wrapTy = lTypeIdx
+  let backTy = aTypeIdx
+  if ek == "str" {
+    wrapTy = mkListIdx
+    backTy = mkArrIdx
+  } else if (
+    ek == "struct" ||
+    ek == "union" ||
+    ek == "nulstruct" ||
+    ek == "list" ||
+    ek == "strlist" ||
+    ek == "f64list" ||
+    ek == "i64list" ||
+    ek == "f32list" ||
+    ek == "closure" ||
+    ek == "reflist"
+  ) {
+    // A struct ref list (`S[]`, ek 1), a UNION-box element list (`(C|S)[]`, ek 4), a
+    // NULLABLE-struct element list (`(P|null)[]`, ek 9), a CLOSURE element list
+    // (`((i32)=>i32)[]`, ek 14), a NESTED-ARRAY scalar inner list (ek 2/7/12/20), or a NESTED
+    // REF array whose loop var is the inner REF LIST (`S[][]`, ek 5): the wrapper/backing are
+    // THIS ref-list
+    // slot's. All recover each element non-null EXCEPT ek 9 (the nullable niche). A
+    // STRUCT-VALUED map walk reads its mv slot's vals list instead.
+    const fimv = forInMapValsSlot(s.fiIter, fnIx)
+    if fimv >= 0 {
+      wrapTy = mvValsWrapOf(fimv)
+      backTy = mvValsBackOf(fimv)
+    } else {
+      let rslot = refListSlotOfExpr(s.fiIter, fnIx)
+      wrapTy = rlWrapIdx[rslot]
+      backTy = rlBackIdx[rslot]
     }
-    // A STRING iterable (`for ch in s`): the `#l` temp IS the raw `(ref $aTypeIdx)` array (no
-    // list wrapper), so the length is `array.len` and each element `array.get $aTypeIdx` —
-    // skipping the `struct.get wrapTy` the i32-list path uses. The loop var is an i32 code unit.
-    const strSrc = forInStringSrc(s.fiIter, fnIx)
-    const vSlot = emitLetCursor
-    emitLetCursor = emitLetCursor + 1
-    const iSlot = emitLetCursor
-    emitLetCursor = emitLetCursor + 1
-    const lSlot = emitLetCursor
-    emitLetCursor = emitLetCursor + 1
-    let paramN = 0
-    if fnIx >= 0 {
-      const fn = P.nodes[fnIx]
-      if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
-    }
-    const vIdx = paramN + vSlot
-    const iIdx = paramN + iSlot
-    let lIdx = paramN + lSlot
-    let wrapTy = lTypeIdx
-    let backTy = aTypeIdx
-    if ek == "str" {
-      wrapTy = mkListIdx
-      backTy = mkArrIdx
-    } else if (
-      ek == "struct" ||
-      ek == "union" ||
-      ek == "nulstruct" ||
-      ek == "list" ||
-      ek == "strlist" ||
-      ek == "f64list" ||
-      ek == "i64list" ||
-      ek == "f32list" ||
-      ek == "closure" ||
-      ek == "reflist"
-    ) {
-      // A struct ref list (`S[]`, ek 1), a UNION-box element list (`(C|S)[]`, ek 4), a
-      // NULLABLE-struct element list (`(P|null)[]`, ek 9), a CLOSURE element list
-      // (`((i32)=>i32)[]`, ek 14), a NESTED-ARRAY scalar inner list (ek 2/7/12/20), or a NESTED
-      // REF array whose loop var is the inner REF LIST (`S[][]`, ek 5): the wrapper/backing are
-      // THIS ref-list
-      // slot's. All recover each element non-null EXCEPT ek 9 (the nullable niche). A
-      // STRUCT-VALUED map walk reads its mv slot's vals list instead.
-      const fimv = forInMapValsSlot(s.fiIter, fnIx)
-      if fimv >= 0 {
-        wrapTy = mvValsWrapOf(fimv)
-        backTy = mvValsBackOf(fimv)
-      } else {
-        let rslot = refListSlotOfExpr(s.fiIter, fnIx)
-        wrapTy = rlWrapIdx[rslot]
-        backTy = rlBackIdx[rslot]
-      }
-    } else if ek == "f64" || ek == "i64" || ek == "f32" {
-      // A scalar f64/i64/f32 element list: the wrapper/backing come from the descriptor, and
-      // `array.get <back>` yields the scalar directly (no `ref.as_non_null`).
-      wrapTy = scalarListWrap(ek)
-      backTy = scalarListBack(ek)
-    }
-    // For a map `.keys()`/`.values()` walk, stash the MAP ref (mono scratch slot 0,
-    // or the mv frame's typed mapRef) so the loop can consult `M.live[cursor]` and
-    // SKIP tombstoned entries (host-matching tombstone-aware iteration).
-    // `mapRecv >= 0` iff this is a map iteration. The pinned `cmSlot` drives both
-    // the stash and the skip's `pushMapLive` struct.get type.
-    const mapRecv = forInMapRecv(s.fiIter, fnIx)
-    let mwShape = -1
-    if mapRecv >= 0 {
-      mwShape = mapShapeOfExpr(mapRecv, fnIx)
-      if mwShape == -2 || mwShape == -3 { mwShape = -1 }
-      if emitExpr(body, mapRecv, fnIx) < 0 { return -1 }
-      cmSlot = mwShape
-      setMapRef(body) // mapRef
-    }
-    // list = <iter> (evaluated once); cursor = 0
-    if emitForInList(body, s.fiIter, fnIx) < 0 { return -1 }
-    // A NARROWED nullable-list iterable (`i32[] | null`, kind 15) keeps its
-    // nullable slot; the `#l` temp is non-null, so recover first (checker-guarded).
-    if exprNullableList(s.fiIter, fnIx) {
-      wU8(212) // 0xd4 ref.as_non_null
-    }
-    fbLocalSet(lIdx)
-    fbI32Const(0)
+  } else if ek == "f64" || ek == "i64" || ek == "f32" {
+    // A scalar f64/i64/f32 element list: the wrapper/backing come from the descriptor, and
+    // `array.get <back>` yields the scalar directly (no `ref.as_non_null`).
+    wrapTy = scalarListWrap(ek)
+    backTy = scalarListBack(ek)
+  }
+  // For a map `.keys()`/`.values()` walk, stash the MAP ref (mono scratch slot 0,
+  // or the mv frame's typed mapRef) so the loop can consult `M.live[cursor]` and
+  // SKIP tombstoned entries (host-matching tombstone-aware iteration).
+  // `mapRecv >= 0` iff this is a map iteration. The pinned `cmSlot` drives both
+  // the stash and the skip's `pushMapLive` struct.get type.
+  const mapRecv = forInMapRecv(s.fiIter, fnIx)
+  let mwShape = -1
+  if mapRecv >= 0 {
+    mwShape = mapShapeOfExpr(mapRecv, fnIx)
+    if mwShape == -2 || mwShape == -3 { mwShape = -1 }
+    if emitExpr(body, mapRecv, fnIx) < 0 { return -1 }
+    cmSlot = mwShape
+    setMapRef(body) // mapRef
+  }
+  // list = <iter> (evaluated once); cursor = 0
+  if emitForInList(body, s.fiIter, fnIx) < 0 { return -1 }
+  // A NARROWED nullable-list iterable (`i32[] | null`, kind 15) keeps its
+  // nullable slot; the `#l` temp is non-null, so recover first (checker-guarded).
+  if exprNullableList(s.fiIter, fnIx) {
+    wU8(212) // 0xd4 ref.as_non_null
+  }
+  fbLocalSet(lIdx)
+  fbI32Const(0)
+  fbLocalSet(iIdx)
+  scopeBind(s.fiVar, vSlot)
+  fbBlock(64) // 0x02 block, void
+  ctrlEnter()
+  loopBrkDepth.push(ctrlDepth)
+  loopBrkLabel.push(s.fiLabel)
+  fbLoop(64)  // 0x03 loop, void
+  ctrlEnter()
+  loopContDepth.push(ctrlDepth)
+  loopContLabel.push(s.fiLabel)
+  // exit when cursor >= len (the list wrapper's field 1; a STRING is the raw array → array.len)
+  fbLocalGet(iIdx)
+  fbLocalGet(lIdx)
+  if strSrc { fbArrayLen() } else { fbStructGet(wrapTy, 1) }
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbBrIf(1)    // 0x0d br_if -> break out of block
+  // TOMBSTONE SKIP: if M.live[cursor] == 0, advance the cursor and re-loop WITHOUT
+  // binding `v` / running the body — the deleted entry is invisible to iteration
+  // (insertion order of the survivors preserved). `br 1` targets the loop header
+  // (if-frame is 0, loop is 1). A delete-free map has live all-1s, so never taken.
+  if mapRecv >= 0 {
+    cmSlot = mwShape
+    pushMapLive(body)    // M.live (off the pinned mapRef)
+    fbLocalGet(iIdx)
+    fbArrayGet(aTypeIdx) // M.live[cursor]
+    fbI32Eqz()           // live[cursor] == 0 ?
+    fbIf(64)             // 0x04 if, void
+    fbLocalGet(iIdx)
+    fbI32Const(1)
+    fbI32Bin(106)        // cursor + 1
     fbLocalSet(iIdx)
-    scopeBind(s.fiVar, vSlot)
-    fbBlock(64) // 0x02 block, void
-    ctrlEnter()
-    loopBrkDepth.push(ctrlDepth)
-    loopBrkLabel.push(s.fiLabel)
-    fbLoop(64)  // 0x03 loop, void
+    fbBr(1)              // 0x0c br -> loop header (re-check exit)
+    fbEnd()              // 0x0b end (if)
+  }
+  // v = backing[cursor] (a string element recovers its non-null ref). A STRING source IS the
+  // raw array, so index it directly (no list-wrapper `struct.get`); the code unit is an i32.
+  fbLocalGet(lIdx)
+  if !strSrc { fbStructGet(wrapTy, 0) }
+  fbLocalGet(iIdx)
+  if strSrc { fbArrayGet(aTypeIdx) } else { fbArrayGet(backTy) }
+  if (
+    ek == "str" ||
+    ek == "struct" ||
+    ek == "union" ||
+    ek == "list" ||
+    ek == "strlist" ||
+    ek == "f64list" ||
+    ek == "i64list" ||
+    ek == "f32list" ||
+    ek == "closure" ||
+    ek == "reflist"
+  ) {
+    // string / struct / union-box / CLOSURE element, a NESTED-ARRAY inner-list wrapper, or a
+    // nested-ref-array inner REF LIST (ek 5) — all are a non-null ref recovered from the
+    // `(ref null <elem>)` backing slot.
+    wU8(212) // 0xd4 ref.as_non_null
+  }
+  fbLocalSet(vIdx)
+  // Same INNER continue block as for-range: `continue` must still increment.
+  const fiHasCont = blockHasContinueFor(s.fiBody, s.fiLabel, false)
+  if fiHasCont {
+    fbBlock(64) // continue block
     ctrlEnter()
     loopContDepth.push(ctrlDepth)
     loopContLabel.push(s.fiLabel)
-    // exit when cursor >= len (the list wrapper's field 1; a STRING is the raw array → array.len)
-    fbLocalGet(iIdx)
-    fbLocalGet(lIdx)
-    if strSrc { fbArrayLen() } else { fbStructGet(wrapTy, 1) }
-    fbI32Bin(78) // 0x4e i32.ge_s
-    fbBrIf(1)    // 0x0d br_if -> break out of block
-    // TOMBSTONE SKIP: if M.live[cursor] == 0, advance the cursor and re-loop WITHOUT
-    // binding `v` / running the body — the deleted entry is invisible to iteration
-    // (insertion order of the survivors preserved). `br 1` targets the loop header
-    // (if-frame is 0, loop is 1). A delete-free map has live all-1s, so never taken.
-    if mapRecv >= 0 {
-      cmSlot = mwShape
-      pushMapLive(body)    // M.live (off the pinned mapRef)
-      fbLocalGet(iIdx)
-      fbArrayGet(aTypeIdx) // M.live[cursor]
-      fbI32Eqz()           // live[cursor] == 0 ?
-      fbIf(64)             // 0x04 if, void
-      fbLocalGet(iIdx)
-      fbI32Const(1)
-      fbI32Bin(106)        // cursor + 1
-      fbLocalSet(iIdx)
-      fbBr(1)              // 0x0c br -> loop header (re-check exit)
-      fbEnd()              // 0x0b end (if)
-    }
-    // v = backing[cursor] (a string element recovers its non-null ref). A STRING source IS the
-    // raw array, so index it directly (no list-wrapper `struct.get`); the code unit is an i32.
-    fbLocalGet(lIdx)
-    if !strSrc { fbStructGet(wrapTy, 0) }
-    fbLocalGet(iIdx)
-    if strSrc { fbArrayGet(aTypeIdx) } else { fbArrayGet(backTy) }
-    if (
-      ek == "str" ||
-      ek == "struct" ||
-      ek == "union" ||
-      ek == "list" ||
-      ek == "strlist" ||
-      ek == "f64list" ||
-      ek == "i64list" ||
-      ek == "f32list" ||
-      ek == "closure" ||
-      ek == "reflist"
-    ) {
-      // string / struct / union-box / CLOSURE element, a NESTED-ARRAY inner-list wrapper, or a
-      // nested-ref-array inner REF LIST (ek 5) — all are a non-null ref recovered from the
-      // `(ref null <elem>)` backing slot.
-      wU8(212) // 0xd4 ref.as_non_null
-    }
-    fbLocalSet(vIdx)
-    // Same INNER continue block as for-range: `continue` must still increment.
-    const fiHasCont = blockHasContinueFor(s.fiBody, s.fiLabel, false)
-    if fiHasCont {
-      fbBlock(64) // continue block
-      ctrlEnter()
-      loopContDepth.push(ctrlDepth)
-      loopContLabel.push(s.fiLabel)
-    }
-    if emitStmts(body, s.fiBody, fnIx) < 0 { return -1 }
-    if fiHasCont {
-      fbEnd() // end continue block — `continue` lands here
-      ctrlLeave()
-      loopContDepth.pop()
-      loopContLabel.pop()
-    }
-    // cursor = cursor + 1
-    fbLocalGet(iIdx)
-    fbI32Const(1)
-    fbI32Bin(106) // 0x6a i32.add
-    fbLocalSet(iIdx)
-    fbBr(0)       // continue loop
-    fbEnd()       // end loop
+  }
+  if emitStmts(body, s.fiBody, fnIx) < 0 { return -1 }
+  if fiHasCont {
+    fbEnd() // end continue block — `continue` lands here
     ctrlLeave()
     loopContDepth.pop()
     loopContLabel.pop()
-    fbEnd()       // end block
-    ctrlLeave()
-    loopBrkDepth.pop()
-    loopBrkLabel.pop()
-    // The loop variable's scope is the loop (see `scopeUnbind`).
-    scopeUnbind()
-    return 0
   }
-  if s is BreakStmt {
-    // `break [label]`: branch out of a loop's wrapping BLOCK, so control resumes
-    // after the whole loop. Unlabelled targets the innermost (`loopBrkDepth` top);
-    // `break outer` scans the parallel label stack from the top for `outer` —
-    // the host's `brkLabel(node.label ?? loopLabels[last])` target selection.
-    // The relative `br` operand is the frame distance `ctrlDepth - <block depth>`.
-    // A `break` outside any loop / to an unknown label fails loudly, not with a
-    // bad `br`.
-    if loopBrkDepth.length == 0 {
-      return emitFail("emitProgram: `break` outside a loop")
-    }
-    const brkAt = loopStackFind(loopBrkLabel, s.brkLabel)
-    if brkAt < 0 {
-      return emitFail(
-        "emitProgram: `break` label does not name an enclosing loop",
-      )
-    }
-    const blkDepth = loopBrkDepth[brkAt]
-    fbBr(ctrlDepth - blkDepth) // 0x0c br to the loop's wrapping block
-    return 0
+  // cursor = cursor + 1
+  fbLocalGet(iIdx)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iIdx)
+  fbBr(0)       // continue loop
+  fbEnd()       // end loop
+  ctrlLeave()
+  loopContDepth.pop()
+  loopContLabel.pop()
+  fbEnd()       // end block
+  ctrlLeave()
+  loopBrkDepth.pop()
+  loopBrkLabel.pop()
+  // The loop variable's scope is the loop (see `scopeUnbind`).
+  scopeUnbind()
+  return 0
+}
+
+function emitBreakStmtStmt(body: i32[], s: BreakStmt, stmtIx: i32, fnIx: i32) {
+  // `break [label]`: branch out of a loop's wrapping BLOCK, so control resumes
+  // after the whole loop. Unlabelled targets the innermost (`loopBrkDepth` top);
+  // `break outer` scans the parallel label stack from the top for `outer` —
+  // the host's `brkLabel(node.label ?? loopLabels[last])` target selection.
+  // The relative `br` operand is the frame distance `ctrlDepth - <block depth>`.
+  // A `break` outside any loop / to an unknown label fails loudly, not with a
+  // bad `br`.
+  if loopBrkDepth.length == 0 {
+    return emitFail("emitProgram: `break` outside a loop")
   }
-  if s is ContinueStmt {
-    // `continue [label]`: branch to a loop's continue target — the loop header
-    // for a `while` (re-check the condition), the inner continue block for a
-    // `for` (fall into the increment). Unlabelled targets the innermost;
-    // `continue outer` scans the label stack from the top (the labelled for's
-    // INNER block shadows its header entry — both carry the label — so a
-    // binding `continue` never skips the increment).
-    if loopContDepth.length == 0 {
-      return emitFail("emitProgram: `continue` outside a loop")
-    }
-    const contAt = loopStackFind(loopContLabel, s.contLabel)
-    if contAt < 0 {
-      return emitFail(
-        "emitProgram: `continue` label does not name an enclosing loop",
-      )
-    }
-    const loopDepth = loopContDepth[contAt]
-    fbBr(ctrlDepth - loopDepth) // 0x0c br to the loop's continue target
-    return 0
+  const brkAt = loopStackFind(loopBrkLabel, s.brkLabel)
+  if brkAt < 0 {
+    return emitFail(
+      "emitProgram: `break` label does not name an enclosing loop",
+    )
   }
-  emitFail("emitProgram: unsupported statement in body")
+  const blkDepth = loopBrkDepth[brkAt]
+  fbBr(ctrlDepth - blkDepth) // 0x0c br to the loop's wrapping block
+  return 0
+}
+
+function emitContinueStmtStmt(
+  body: i32[],
+  s: ContinueStmt,
+  stmtIx: i32,
+  fnIx: i32,
+) {
+  // `continue [label]`: branch to a loop's continue target — the loop header
+  // for a `while` (re-check the condition), the inner continue block for a
+  // `for` (fall into the increment). Unlabelled targets the innermost;
+  // `continue outer` scans the label stack from the top (the labelled for's
+  // INNER block shadows its header entry — both carry the label — so a
+  // binding `continue` never skips the increment).
+  if loopContDepth.length == 0 {
+    return emitFail("emitProgram: `continue` outside a loop")
+  }
+  const contAt = loopStackFind(loopContLabel, s.contLabel)
+  if contAt < 0 {
+    return emitFail(
+      "emitProgram: `continue` label does not name an enclosing loop",
+    )
+  }
+  const loopDepth = loopContDepth[contAt]
+  fbBr(ctrlDepth - loopDepth) // 0x0c br to the loop's continue target
+  return 0
 }
 
 // True if the statement at `stmtIx` is a BARE VALUE EXPRESSION usable as an IMPLICIT
