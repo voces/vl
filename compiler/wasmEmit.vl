@@ -17697,11 +17697,6 @@ function emitModule(stmts: i32[]) {
   // reject. (binaryen emits the same single rec group; functypes inside it are valid.)
   // So the section's rectype count is 1 (the rec group), and the rec group holds the
   // `n + typeOffset` actual type definitions.
-  const typePayload: i32[] = []
-  // Bind the writer at `typePayload` for the WHOLE type-section payload build, so the
-  // raw framing bytes, `pushFieldStorage`, and `fbValtype` all stream to `curBuf ==
-  // typePayload` identically. Restored just before `wSection` frames it (below).
-  const tyPrev = wTarget(typePayload)
   // The print-import functypes are emitted as STANDALONE rectypes AFTER the rec group,
   // NOT inside it: a rec-group-member functype carries nominal rec-group identity that
   // a strict WasmGC host (wasmtime) refuses to match against a host-provided function,
@@ -17709,7 +17704,9 @@ function emitModule(stmts: i32[]) {
   // structurally. (V8 accepted either; this makes the emitted output portable.) The
   // print functype INDICES are unchanged — they still trail every rec-group type — so
   // the import-section references and the print-FREE goldens/fixpoint (nPrintTypes == 0,
-  // section rectype count stays 1, rec-group count unchanged) are byte-identical.
+  // section rectype count stays 1, rec-group count unchanged) are byte-identical. Counted
+  // here in the coordinator because both the type section and the function section (the
+  // `__log__` functype index) need it.
   let nPrintTypes = 0
   if gImports > 0 {
     nPrintTypes = 2 // (i32)->() and ()->() for the print imports
@@ -17723,582 +17720,12 @@ function emitModule(stmts: i32[]) {
   if gNeedsF32Print {
     nPrintTypes = nPrintTypes + 1 // + (f32)->() for __print_f32__
   }
-  wULEB(1 + nPrintTypes + memFn)   // rectypes: the rec group + the standalone print/(log) functypes
-  wU8(78)                          // 0x4e rec group
-  wULEB(n + typeOffset + hasStart) // types inside the rec group (print functypes excluded)
-  if sDeclared {
-    // One `0x5f` struct per declared type (declaration order = heap-type index),
-    // each a struct of its fields in declaration order. A field is `0x7f` i32
-    // (`sFieldTypes == 0`) or, for a string field (`== 3`), a non-null `(ref
-    // $aTypeIdx)` (`0x64 <aTypeIdx>` — the raw `(array i32)` string rep); both mutable.
-    let si = 0
-    while si < sNames.length {
-      wU8(95) // 0x5f struct
-      let cnt = sFieldCount[si]
-      wULEB(cnt)
-      let fj = 0
-      while fj < cnt {
-        const fjCode = sFieldTypeAt(si, fj)
-        let fjSlot = sFieldRefSlot(si, fj)
-        // A NESTED-STRUCT field (code 15) passes its TARGET struct table index.
-        if fjCode == 15 { fjSlot = structIndexByName(sFieldElemNameAt(si, fj)) }
-        // A MAP-typed field (code 19) passes its value type's mv SLOT.
-        if fjCode == 19 {
-          fjSlot = mvSlotOfValNameFind(sFieldElemNameAt(si, fj))
-        }
-        pushFieldStorage(fjCode, fjSlot)
-        wU8(1) // mutable
-        fj = fj + 1
-      }
-      si = si + 1
-    }
-  }
-  if uDeclared {
-    // The `nv` variant structs FIRST (heap types 0..nv-1), each a struct of its i32
-    // fields in declaration order (`0x5f` struct, count, then `0x7f 0x01` per field —
-    // mutable i32). Then the union BOX `{ tag: i32, value: anyref }` at index `nv`:
-    // `0x5f` struct, 2 fields — `0x7f 0x00` (i32, IMMUTABLE tag) and `0x6e 0x00`
-    // (`anyref` abbreviation, IMMUTABLE value) — mirroring binaryen's `5f 02 7f 00
-    // 6e 00` (verified against `toWasm.ts`'s `unionStruct`).
-    let vi = 0
-    while vi < uVariants.length {
-      wU8(95) // 0x5f struct
-      let cnt = uFieldCount[vi]
-      wULEB(cnt)
-      let fj = 0
-      while fj < cnt {
-        const vjCode = variantFieldTypeAt(vi, fj)
-        let vjSlot = variantFieldRefSlot(vi, fj)
-        // A NESTED-STRUCT variant field (code 15) passes its struct table index.
-        if vjCode == 15 {
-          vjSlot = structIndexByName(uFieldElemName[uFieldStart[vi] + fj])
-        }
-        // A MAP-typed variant field (code 19) passes its value type's mv SLOT.
-        if vjCode == 19 {
-          vjSlot = mvSlotOfValNameFind(uFieldElemName[uFieldStart[vi] + fj])
-        }
-        pushFieldStorage(vjCode, vjSlot)
-        wU8(1) // mutable
-        fj = fj + 1
-      }
-      vi = vi + 1
-    }
-    wU8(95)  // 0x5f struct (union box)
-    wU8(2)   // 2 fields
-    wU8(127) // field 0 tag: 0x7f i32
-    wU8(0)   // immutable
-    wU8(110) // field 1 value: 0x6e anyref
-    wU8(0)   // immutable
-    // The per-rep VALUE BOXES — each a one-field immutable struct `{ rep }` that
-    // carries a scalar value-union payload behind the box's `anyref` slot
-    // (mirroring `toWasm.ts`'s `valueBoxStruct`). Emitted in the SAME fixed order
-    // `mAssignTypeIndices` interned them (i32, i64, f32, f64).
-    if vbI32Used {
-      wU8(95)  // 0x5f struct (i32 value box — boolean shares it)
-      wU8(1)
-      wU8(127) // 0x7f i32
-      wU8(0)   // immutable
-    }
-    if vbI64Used {
-      wU8(95)  // 0x5f struct (i64 value box)
-      wU8(1)
-      wU8(126) // 0x7e i64
-      wU8(0)   // immutable
-    }
-    if vbF32Used {
-      wU8(95)  // 0x5f struct (f32 value box)
-      wU8(1)
-      wU8(125) // 0x7d f32
-      wU8(0)   // immutable
-    }
-    if vbF64Used {
-      wU8(95)  // 0x5f struct (f64 value box)
-      wU8(1)
-      wU8(124) // 0x7c f64
-      wU8(0)   // immutable
-    }
-  }
-  if aUsed {
-    wU8(94)  // 0x5e array
-    wU8(127) // 0x7f i32 storagetype
-    wU8(1)   // mutable
-  }
-  if lUsed {
-    wU8(95)         // 0x5f struct
-    wU8(3)          // 3 fields
-    wU8(100)        // field 0 backing: 0x64 (ref ht) — non-null
-    wSLEB(aTypeIdx) // ...to the raw array heap type
-    wU8(1)          // mutable
-    wU8(127)        // field 1 len: 0x7f i32
-    wU8(1)          // mutable
-    wU8(127)        // field 2 cap: 0x7f i32
-    wU8(1)          // mutable
-  }
-  // One (backing, wrapper) PAIR per distinct ref-list element type, interleaved so each
-  // wrapper immediately follows (and references) its own backing — the heap indices laid
-  // out above. Each backing is `(array (mut (ref null $elem)))` over the slot's element
-  // (struct heap idx / union box); each wrapper is `{ backing: (ref $back), len, cap }`.
-  let rti = 0
-  while rti < rlElemName.length {
-    wU8(94)               // 0x5e array (ref backing)
-    wU8(99)               // 0x63 (ref null ht) — nullable element ref
-    wSLEB(rlElemHeap[rti])
-    wU8(1)                // mutable
-    wU8(95)               // 0x5f struct (ref-list wrapper)
-    wU8(3)                // 3 fields
-    wU8(100)              // field 0 backing: 0x64 (ref ht) — non-null
-    wSLEB(rlBackIdx[rti]) // ...to THIS slot's ref backing
-    wU8(1)                // mutable
-    wU8(127)              // field 1 len: 0x7f i32
-    wU8(1)                // mutable
-    wU8(127)              // field 2 cap: 0x7f i32
-    wU8(1)                // mutable
-    rti = rti + 1
-  }
-  if slUsed || mUsed {
-    // The STRING-REF list types, shared by the map's keys list and any `string[]`
-    // field. (1) the backing array `(array (mut (ref null $aTypeIdx)))` — element is a
-    // NULLABLE string ref (`0x63 <aTypeIdx>`) so `array.new_default` defaults spare
-    // slots to null; an element read recovers the non-null string. (2) the list wrapper
-    // `{ backing: (ref $mkArrIdx), len, cap }` — the same `{backing,len,cap}` triple as
-    // the i32 list, over the string backing.
-    wU8(94)  // 0x5e array (keys/string backing)
-    wU8(99)  // 0x63 (ref null ht) — nullable string ref
-    wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    wU8(95)  // 0x5f struct (string-list wrapper)
-    wU8(3)   // 3 fields
-    wU8(100) // field 0 backing: 0x64 (ref ht) — non-null
-    wSLEB(mkArrIdx)
-    wU8(1)   // mutable
-    wU8(127) // field 1 len: 0x7f i32
-    wU8(1)   // mutable
-    wU8(127) // field 2 cap: 0x7f i32
-    wU8(1)   // mutable
-  }
-  if mUsed {
-    // The MAP struct `{ keys: (ref $mkListIdx), vals: (ref $lTypeIdx), live: (ref
-    // $aTypeIdx), index: (ref $aTypeIdx), count, size, hashes: (ref $aTypeIdx) }` — two
-    // non-null list refs (the keys string-list + the i32 vals list), the i32 `live`
-    // tombstone array, the i32 `index` hash-slot array, the `count`/`size` counters, and
-    // the i32 `hashes` per-entry FNV cache. FIELD ORDER + COUNT now match the host's
-    // 7-field general-purpose rep EXACTLY (`compiler/builtins/maps.ts`, `MAP_HASHES = 6`):
-    // the cached per-entry hash lets resize/compact RE-PLACE entries without re-hashing
-    // keys and gates the (string) key comparison on a hash mismatch — justified for
-    // large/long-key maps, not a compiler-symbol-table-narrow optimization. live is at
-    // index 2, index/count/size at 3/4/5, hashes at 6.
-    wU8(95)  // 0x5f struct (map)
-    wU8(7)   // 7 fields (open-addressing hash map, host-aligned)
-    wU8(100) // field 0 keys: 0x64 (ref $mkListIdx) — non-null
-    wSLEB(mkListIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
-    wSLEB(lTypeIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
-    wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
-    wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    wU8(127) // field 4 count: 0x7f i32
-    wU8(1)   // mutable
-    wU8(127) // field 5 size: 0x7f i32
-    wU8(1)   // mutable
-    wU8(100) // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
-    wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-  }
-  if fa64Used {
-    // The f64 array `(array (mut f64))` (Slice 4): `0x5e` array form, `0x7c` f64
-    // storagetype, `0x01` mutable — the f64 analogue of the `5e 7f 01` i32 array.
-    wU8(94)  // 0x5e array
-    wU8(124) // 0x7c f64 storagetype
-    wU8(1)   // mutable
-    // The f64-list wrapper `{ backing: (ref $fa64TypeIdx), len: i32, cap: i32 }` — the
-    // same `{backing,len,cap}` triple as the i32 list, over the f64 backing.
-    wU8(95)            // 0x5f struct
-    wU8(3)             // 3 fields
-    wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
-    wSLEB(fa64TypeIdx) // ...to the f64 array heap type
-    wU8(1)             // mutable
-    wU8(127)           // field 1 len: 0x7f i32
-    wU8(1)             // mutable
-    wU8(127)           // field 2 cap: 0x7f i32
-    wU8(1)             // mutable
-  }
-  if ia64Used {
-    // The i64 array `(array (mut i64))` — `0x5e` array form, `0x7e` i64 storagetype,
-    // `0x01` mutable (the i64 sibling of the `5e 7c 01` f64 array). Emitted right after the
-    // f64 pair, matching the type-index allocation order.
-    wU8(94)  // 0x5e array
-    wU8(126) // 0x7e i64 storagetype
-    wU8(1)   // mutable
-    // The i64-list wrapper `{ backing: (ref $ia64TypeIdx), len: i32, cap: i32 }`.
-    wU8(95)            // 0x5f struct
-    wU8(3)             // 3 fields
-    wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
-    wSLEB(ia64TypeIdx) // ...to the i64 array heap type
-    wU8(1)             // mutable
-    wU8(127)           // field 1 len: 0x7f i32
-    wU8(1)             // mutable
-    wU8(127)           // field 2 cap: 0x7f i32
-    wU8(1)             // mutable
-  }
-  if fa32Used {
-    // The f32 array `(array (mut f32))` — `0x5e` array form, `0x7d` f32 storagetype, `0x01`
-    // mutable (the f32 sibling of the `5e 7c 01` f64 / `5e 7e 01` i64 arrays). Emitted right
-    // after the i64 pair, matching the type-index allocation order.
-    wU8(94)  // 0x5e array
-    wU8(125) // 0x7d f32 storagetype
-    wU8(1)   // mutable
-    // The f32-list wrapper `{ backing: (ref $fa32TypeIdx), len: i32, cap: i32 }`.
-    wU8(95)            // 0x5f struct
-    wU8(3)             // 3 fields
-    wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
-    wSLEB(fa32TypeIdx) // ...to the f32 array heap type
-    wU8(1)             // mutable
-    wU8(127)           // field 1 len: 0x7f i32
-    wU8(1)             // mutable
-    wU8(127)           // field 2 cap: 0x7f i32
-    wU8(1)             // mutable
-  }
-  if fnValUsed {
-    // The closure fat-pointer struct `{ code: funcref, env: (ref null struct),
-    // id: i32 }` (lambdas) — field 0 a GENERIC `funcref` (so ONE closure struct
-    // serves every function arity), field 1 a nullable `structref` env (null when
-    // non-capturing), field 2 the lifted function's wasm INDEX (`gImports + fe`) —
-    // the identity token for `==` (funcrefs admit no `ref.eq`). All IMMUTABLE. At a
-    // `call_ref` site the funcref is `ref.cast` to the concrete env-leading `$fnsig`
-    // for that call's arity, then `call_ref`. The interned `$fnsig` functypes (one
-    // per distinct value-call arity) follow.
-    wU8(95)  // 0x5f struct
-    wU8(3)   // 3 fields
-    wU8(99)  // field 0 code: 0x63 (ref null) funcref
-    wU8(112) // ...the abstract `func` heaptype (0x70 funcref)
-    wU8(0)   // immutable
-    wU8(99)  // field 1 env: 0x63 (ref null ht)
-    wU8(107) // ...to the abstract `struct` heaptype (structref)
-    wU8(0)   // immutable
-    wU8(127) // field 2 id: 0x7f i32 — the function-identity token
-    wU8(0)   // immutable
-    // One env-leading `$fnsig` functype per distinct eligible SIGNATURE, in
-    // `cloSigKeys` order: `(structref, params...) -> ret`, the param/result valtypes
-    // read off the representative function (`cloSigRepFn` — every function sharing
-    // the key has byte-identical kinds, by construction of the key).
-    let sai = 0
-    while sai < cloSigKeys.length {
-      const repFe = cloSigRepFn[sai]
-      const rep = P.nodes[fnStmts[repFe]]
-      if rep is FuncDecl {
-        const rparams = rep.fnParams
-        wU8(96)                   // 0x60 func
-        wULEB(rparams.length + 1) // env + declared params
-        wU8(107)                  // param 0 env: structref (0x6b)
-        let pj = 0
-        while pj < rparams.length {
-          fbValtype(vtKindOfParam(rparams[pj]), paramStructIdxOf(rparams[pj]))
-          pj = pj + 1
-        }
-        // The RESULT must byte-match the rep function's own functype result so
-        // the call-site `ref.cast` to this `$fnsig` accepts the callee funcref:
-        // a VOID field-closure sig (`>v`) has 0 results; a STRUCT-returning one
-        // (`>sN;`) yields the struct ref exactly as the function functype does.
-        if fRetVoid[repFe] == 1 {
-          wU8(0) // 0 results — the `>v` write-trap sig
-        } else {
-          wU8(1) // 1 result
-          // The result valtype the rep function's OWN functype emits — scalar (i32/f64/
-          // i64), string, an i32/string/f64 list, a union box, a nullable scalar/struct,
-          // or a struct ref (`cloRetValKind`/`cloRetValSlot`, the shared mapping).
-          const rrk = cloRetValKind(repFe)
-          let rrkCode: VKind = "i32"
-          if rrk != null { rrkCode = rrk }
-          fbValtype(rrkCode, cloRetValSlot(repFe))
-        }
-      }
-      sai = sai + 1
-    }
-    // One env struct per CAPTURING lifted function (`fnEnvIdx[fe] >= 0`), in `fnStmts`
-    // order — the order `mAssignTypeIndices` minted them. Each is a struct of one
-    // IMMUTABLE i32 field per captured variable (capture order = field order). The
-    // corpus captures are all i32 (and one struct-ref capture in `closure.vl`'s
-    // `sumPoint`, handled by emitting the captured ref's valtype).
-    let fe = 0
-    while fe < fnStmts.length {
-      if fnEnvIdxOf(fe) >= 0 {
-        const caps = captureNamesOf(fe)
-        wU8(95) // 0x5f struct
-        wULEB(caps.length)
-        let ci = 0
-        while ci < caps.length {
-          fbValtype(
-            captureValKind(fe, caps[ci]),
-            captureValStructIdx(fe, caps[ci]),
-          )
-          wU8(0) // immutable
-          ci = ci + 1
-        }
-      }
-      fe = fe + 1
-    }
-  }
-  // The ref-valued map structs (one per mv slot), in `mvMapTypeIdx` mint order —
-  // the SAME 7-field shape as the mono map struct, with `vals` referencing this
-  // slot's ref-list wrapper (the string-list pair for string values, the element's
-  // `rlWrapIdx` for struct values). Keys/live/index/count/size/hashes are identical
-  // across all map structs, so the shared probe/rehash/compact bytes apply as-is.
-  let mvs = 0
-  while mvs < mvValName.length {
-    wU8(95)  // 0x5f struct (ref-valued map)
-    wU8(7)   // 7 fields (host-aligned open-addressing hash map)
-    wU8(100) // field 0 keys: 0x64 (ref $mkListIdx) — non-null
-    wSLEB(mkListIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 1 vals: 0x64 (ref <this slot's wrapper>)
-    wSLEB(mvValsWrapOf(mvs))
-    wU8(1)   // mutable
-    wU8(100) // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
-    wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
-    wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    wU8(127) // field 4 count: 0x7f i32
-    wU8(1)   // mutable
-    wU8(127) // field 5 size: 0x7f i32
-    wU8(1)   // mutable
-    wU8(100) // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
-    wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    mvs = mvs + 1
-  }
-  // The functype param/result valtypes (`fbValtype`) stream to `curBuf == typePayload`,
-  // interleaved identically with the surrounding raw framing bytes (the `wTarget` bind
-  // covering this whole payload build was established above).
-  let ti = 0
-  while ti < n {
-    const fn = P.nodes[fnStmts[ti]]
-    if fn is FuncDecl {
-      const params = fn.fnParams
-      const nParams = params.length
-      wU8(96) // 0x60 func
-      // When a function value exists module-wide, EVERY function carries a hidden
-      // leading `structref env` param (local 0). The declared params follow at 1..p.
-      // A non-capturing function ignores its env; a capturing one `ref.cast`s + reads
-      // it. Gated on `fnValUsed` so a no-lambda module's functypes are byte-identical.
-      if fnValUsed {
-        wULEB(nParams + 1) // param count incl. the env param
-        wU8(107)           // env param: structref (0x6b)
-      } else {
-        wULEB(nParams) // param count
-      }
-      let pi = 0
-      while pi < nParams {
-        fbValtype(vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
-        pi = pi + 1
-      }
-      if fRetVoid[ti] == 1 {
-        wU8(0) // 0 results — a VOID function (`()->()`)
-      } else if fn.fnRet < 0 && fnReturnsClosure(ti) {
-        // A function VALUE return (un-annotated; its tail is a function value) — kind 14.
-        wU8(1)
-        fbValtype("closure", -1)
-      } else if fn.fnRet < 0 {
-        // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
-        // fRet* tables the annotation path fills). i32 when nothing matched.
-        wU8(1) // 1 result
-        // The inferred result KIND from the single shared mapping (`inferredRetKindCore`) — so
-        // this site and `cloRetValKind` can't drift on a scalar/list/ref kind (the f32/f64/i64
-        // inferred-return holes were each one site missing what the other had). The SLOT follows
-        // the kind: struct index for a struct / nullable-struct ref (1 / 9), the element wrapper
-        // for a ref list (5, via the recorded element name), the map shape for a map (6); every
-        // other kind (string / scalar list / scalars) needs no per-function slot.
-        const infKind = inferredRetKindCore(ti)
-        let infSlot = -1
-        if infKind == "struct" || infKind == "nulstruct" {
-          infSlot = fRetStructIdx[ti]
-        }
-        if infKind == "reflist" { infSlot = rlSlotByName(fRetRArrElem[ti]) }
-        if infKind == "map" {
-          const mrx = fnRetExprOf(fnStmts[ti])
-          if mrx >= 0 { infSlot = mapRetExprShape(mrx, fnStmts[ti]) }
-        }
-        fbValtype(infKind, infSlot)
-      } else {
-        wU8(1) // 1 result
-        // A `T[]` return is kind 5 — its second `fbValtype` arg is the ref-list TABLE
-        // SLOT for the element type (`retStructIndex` is -1 for a ref array), so the
-        // result valtype selects THIS function's element wrapper, not slot 0's.
-        let retSlot = retStructIndex(fn.fnRet)
-        if retRefArrFlag(fn.fnRet) == 1 { retSlot = tyAnnRefListSlot(fn.fnRet) }
-        // A string-keyed MAP return's slot is the map SHAPE (mono ⇒ -1, or the value type's mv
-        // slot for a `string`-valued map), so the result valtype selects THIS map's `$mapStruct`.
-        if retMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
-        // A `: Cat` concrete-variant return is kind 8 — its `fbValtype` slot is the VARIANT
-        // index (`uVarIdx + vi`), which `retStructIndex` (standalone structs only) misses.
-        if retVariantFlag(fn.fnRet) == 1 {
-          retSlot = variantIndexOf(tyNameOf(fn.fnRet))
-        }
-        fbValtype(vtKindOfType(fn.fnRet), retSlot)
-      }
-    }
-    ti = ti + 1
-  }
-  // The synthetic start function's `()->()` functype (lands at index `typeOffset + n`,
-  // AFTER every user functype — so no user type index shifts and the Phase-G assert is
-  // untouched). `0x60` func, 0 params, 0 results.
-  if hasStart == 1 {
-    wU8(96) // 0x60 func
-    wU8(0)  // 0 params
-    wU8(0)  // 0 results
-  }
-  // The print-import functypes (only when a `print` exists): `(i32)->()` at index
-  // `typeOffset + n + hasStart` (shared by __print_i32__/__print_bool__/__print_char__)
-  // and `()->()` at +1 (__print_str_flush__). Emitted LAST and as STANDALONE rectypes
-  // (the rec-group count above excludes them) so a strict-GC host can match the import
-  // against a host function; no user/start functype index shifts.
-  if gImports > 0 {
-    wU8(96)  // 0x60 func
-    wU8(1)   // 1 param
-    wU8(127) // 0x7f i32
-    wU8(0)   // 0 results
-    wU8(96)  // 0x60 func
-    wU8(0)   // 0 params
-    wU8(0)   // 0 results
-  }
-  // The `(i64)->()` functype for `__print_i64__` (only when an i64 program prints),
-  // standalone AFTER the two existing print functypes — its index is `ftVoid + 1`,
-  // so no existing functype index shifts.
-  if gNeedsI64Print {
-    wU8(96)  // 0x60 func
-    wU8(1)   // 1 param
-    wU8(126) // 0x7e i64
-    wU8(0)   // 0 results
-  }
-  // The `(f64)->()` functype for `__print_f64__`, standalone AFTER the i64 one (if any),
-  // so no existing functype index shifts. (Slice 3.)
-  if gNeedsF64Print {
-    wU8(96)  // 0x60 func
-    wU8(1)   // 1 param
-    wU8(124) // 0x7c f64
-    wU8(0)   // 0 results
-  }
-  // The `(f32)->()` functype for `__print_f32__`, standalone AFTER the i64/f64 ones (if
-  // any), so no existing functype index shifts. (Slice 5.)
-  if gNeedsF32Print {
-    wU8(96)  // 0x60 func
-    wU8(1)   // 1 param
-    wU8(125) // 0x7d f32
-    wU8(0)   // 0 results
-  }
-  // The `(i32, i32) -> ()` functype for the synthetic `__log__` decoder, standalone
-  // LAST (after every print functype) so no existing functype index shifts. Its
-  // index is `typeOffset + n + hasStart + nPrintTypes`.
-  if memLogUsed {
-    wU8(96)  // 0x60 func
-    wU8(2)   // 2 params
-    wU8(127) // 0x7f i32 (offset)
-    wU8(127) // 0x7f i32 (length)
-    wU8(0)   // 0 results
-  }
-  wTarget(tyPrev)
-  wSection(1, typePayload)
 
-  // Import section (id 2, between type and function): the 4-entry print family from
-  // the host's `"imports"` module, occupying function indices 0..3 in this exact
-  // order (the call lowering hardcodes them): __print_i32__, __print_bool__,
-  // __print_char__ (all `(i32)->()`), __print_str_flush__ (`()->()`).
-  if gImports > 0 {
-    const ftI32 = typeOffset + n + hasStart
-    const ftVoid = ftI32 + 1
-    const ftI64 = ftVoid + 1
-    // The `(f64)->()` functype index trails the i64 one when present, else the void one.
-    let ftF64 = ftVoid + 1
-    if gNeedsI64Print { ftF64 = ftI64 + 1 }
-    // The `(f32)->()` functype index trails the f64 one when present, else wherever the
-    // f64 index would be (the standalone functypes are emitted i64 → f64 → f32 in order).
-    let ftF32 = ftF64
-    if gNeedsF64Print { ftF32 = ftF64 + 1 }
-    const importPayload: i32[] = []
-    const imPrev = wTarget(importPayload)
-    // 4 imports normally; +1 each for `__print_i64__` / `__print_f64__` / `__print_f32__`.
-    let nImports = 4
-    if gNeedsI64Print { nImports = nImports + 1 }
-    if gNeedsF64Print { nImports = nImports + 1 }
-    if gNeedsF32Print { nImports = nImports + 1 }
-    wULEB(nImports)
-    wName("imports")
-    wName("__print_i32__")
-    wU8(0) // import kind: func
-    wULEB(ftI32)
-    wName("imports")
-    wName("__print_bool__")
-    wU8(0)
-    wULEB(ftI32)
-    wName("imports")
-    wName("__print_char__")
-    wU8(0)
-    wULEB(ftI32)
-    wName("imports")
-    wName("__print_str_flush__")
-    wU8(0)
-    wULEB(ftVoid)
-    // `__print_i64__` LAST, at function index 4 (`fbCall(4)` in the print router), so
-    // the existing imports keep indices 0..3 and only this entry is conditionally added.
-    if gNeedsI64Print {
-      wName("imports")
-      wName("__print_i64__")
-      wU8(0)
-      wULEB(ftI64)
-    }
-    // `__print_f64__` LAST, at function index `gF64PrintIdx` (4 or 5). (Slice 3.)
-    if gNeedsF64Print {
-      wName("imports")
-      wName("__print_f64__")
-      wU8(0)
-      wULEB(ftF64)
-    }
-    // `__print_f32__` LAST, at function index `gF32PrintIdx` (4/5/6). (Slice 5.)
-    if gNeedsF32Print {
-      wName("imports")
-      wName("__print_f32__")
-      wU8(0)
-      wULEB(ftF32)
-    }
-    wTarget(imPrev)
-    wSection(2, importPayload)
-  }
+  emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes)
 
-  // Function section (id 3): N functions; func i uses functype `typeOffset + i`. The
-  // synthetic start function (if any) is the LAST entry — function index `n` — using
-  // the `()->()` functype at index `typeOffset + n`.
-  const funcPayload: i32[] = []
-  const fnPrev = wTarget(funcPayload)
-  wULEB(n + hasStart + memFn)
-  let fi = 0
-  while fi < n {
-    // A function whose env-leading signature matches an interned `$fnsig` is declared
-    // with that `$fnsig` functype, so `ref.func` of it produces a value the call_ref
-    // site's `ref.cast` to `$fnsig` accepts (its ACTUAL type IS `$fnsig`). Others keep
-    // their own functype. Only when `fnValUsed`. (Lambdas.)
-    if fnValUsed && fnSigIsClosure(fi) {
-      wULEB(fnSigIdxOfFn(fi))
-    } else {
-      wULEB(typeOffset + fi) // functype index
-    }
-    fi = fi + 1
-  }
-  if hasStart == 1 {
-    wULEB(typeOffset + n) // start fn functype index
-  }
-  if memLogUsed {
-    // The synthetic `__log__` decoder uses the standalone `(i32,i32)->()` functype
-    // emitted after the print functypes.
-    wULEB(typeOffset + n + hasStart + nPrintTypes)
-  }
-  wTarget(fnPrev)
-  wSection(3, funcPayload)
+  emitImportSection(n, typeOffset, hasStart)
+
+  emitFunctionSection(n, typeOffset, hasStart, memFn, nPrintTypes)
 
   // Memory section (id 5, between function (3) and global (6)): ONE module-DEFINED
   // memory, min 1 page (64 KiB — ample for the corpus' tag/value scratch region), no
@@ -18315,187 +17742,9 @@ function emitModule(stmts: i32[]) {
     wSection(5, memPayload)
   }
 
-  // Global section (id 6): one mutable global per top-level `let`/`const`, in
-  // declaration order (that order IS the global index `global.get`/`global.set` use).
-  // Each entry is `<valtype> 0x01 <init constexpr> 0x0b`. The valtype mirrors `pushVT`'s
-  // kind for the initializer (i32 / struct ref / list ref / string ref); the init reuses
-  // the ordinary `emitExpr` literal lowering — `i32.const`, `struct.new`, and
-  // `array.new_fixed` are all valid WasmGC constant expressions, so no start function is
-  // needed for the literal initializers in scope. A non-constexpr init (a reference to a
-  // local/param) fails loudly via `emitExpr(fnIx = -1)` (start-fn fallback deferred).
-  const ng = globalStmts.length
-  if ng > 0 {
-    const globalPayload: i32[] = []
-    // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
-    // the count, each entry's valtype (`fbValtype`), mutability flag, and init constexpr
-    // (`fb*` opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
-    const gPrev = wTarget(globalPayload)
-    wULEB(ng)
-    let gi = 0
-    while gi < ng {
-      const g = P.nodes[globalStmts[gi]]
-      if g is LetDecl {
-        if g.letInit < 0 {
-          return emitFail("emitProgram: module global has no initializer")
-        }
-        if globalIsNonConst(globalStmts[gi]) {
-          // A non-constexpr init (`curBuf = W.bytes` — a `global.get`+`struct.get`, a
-          // reference to another global, a call, etc.) cannot be a WasmGC constant
-          // expression. Declare the cell NULLABLE and zero-init it (`i32.const 0` for a
-          // scalar, `ref.null` for a ref); the synthetic start function below runs the
-          // real init via `global.set` before any other code, so reads never see the
-          // zero. The cell stays mutable.
-          const ck = globalCellKind(globalStmts[gi])
-          // For a ref-array cell (kind 5) the second `fbValtype`/`fbRefNullForKind` arg is
-          // the ref-list TABLE SLOT (`globalCellStructIdx` is -1 for a ref array), so the
-          // cell valtype and its `ref.null` zero select THIS global's element wrapper.
-          let cs = globalCellStructIdx(globalStmts[gi])
-          if ck == "reflist" { cs = letAnnRefListSlot(globalStmts[gi]) }
-          // A map cell (kind 6) passes its map SHAPE (mv slot / -1 mono / -2 set)
-          // so the cell valtype + ref.null zero select THIS map's struct type.
-          if ck == "map" { cs = letMapShapeOf(globalStmts[gi], -1) }
-          fbValtypeNullable(ck, cs) // nullable valtype
-          wU8(1)                    // 0x01 mutable
-          if ck == "i32" {
-            fbI32Const(0) // i32 scalar zero
-          } else if ck == "i64" {
-            fbI64Const(0, 0) // i64 scalar zero (Slice 1)
-          } else if ck == "f64" {
-            fbF64Const("0.0") // f64 scalar zero (Slice 3)
-          } else if ck == "f32" {
-            fbF32Const("0.0") // f32 scalar zero (Slice 5)
-          } else {
-            fbRefNullForKind(ck, cs) // ref.null zero
-          }
-          fbEnd() // 0x0b end of init expr
-        } else {
-          // The cell's valtype comes from the binding's ANNOTATION when present (so a
-          // global agrees with a same-typed local/param/field on its struct table index),
-          // falling back to the literal-init kind for an un-annotated global. The init
-          // constexpr (`emitExpr`) lowers the literal — and must build the SAME wasm type:
-          // `pendingStructIdx` seeds an `ObjLit` to the annotated struct (not the first
-          // field-name match), and `pendingListKind`/`pendingListSlot` seed an empty `[]`
-          // to the annotation's ref/string list (not the i32-list the bare literal infers),
-          // exactly as the local-`let` path threads them.
-          const gck = globalCellKind(globalStmts[gi])
-          let gcs = globalCellStructIdx(globalStmts[gi])
-          if gck == "struct" { pendingStructIdx = gcs }
-          // A NULLABLE-struct cell (kind 9) seeds the same struct context: a bare
-          // `null` init lowers as `ref.null $S` (a valid constexpr), a struct
-          // literal as that struct.
-          if gck == "nulstruct" { pendingStructIdx = gcs }
-          pendingListKind = letAnnRefListKind(globalStmts[gi])
-          pendingListSlot = letAnnRefListSlot(globalStmts[gi])
-          // A ref-array cell (kind 5) passes the ref-list TABLE SLOT as `fbValtype`'s
-          // second arg (`globalCellStructIdx` is -1 for a ref array) so the cell valtype
-          // selects THIS global's element wrapper, not slot 0's.
-          if gck == "reflist" { gcs = letAnnRefListSlot(globalStmts[gi]) }
-          // A map cell (kind 6): the map SHAPE picks the struct type; the
-          // `pendingMapSlot` seed makes the `Map()` init constexpr build it.
-          if gck == "map" {
-            gcs = letMapShapeOf(globalStmts[gi], -1)
-            pendingMapSlot = gcs
-          }
-          fbValtype(gck, gcs) // valtype
-          wU8(1)              // 0x01 mutable
-          // An `: i64` global lowers its literal init as `i64.const` (kind 10 / 0x7e);
-          // an `: f32`/`: f64` global as `f32.const`/`f64.const` (kind 13 / 0x7d, 11 /
-          // 0x7c) — re-encoding an integer literal directly so the init stays a valid
-          // constexpr (no convert op). (Slice 5.)
-          pendingI64 = (gck == "i64")
-          pendingF32 = (gck == "f32")
-          pendingF64 = (gck == "f64")
-          // A literal-union const global (`const D: K = "a"`) lowers its member init as `i32.const <id>`
-          // (a valid constexpr).
-          if letIsLitUnion(globalStmts[gi]) { pendingLitUnion = 1 }
-          // A UNION cell (kind 4) with a CONST init boxes it in the constexpr —
-          // `struct.new` / `array.new_fixed` / `i32.const` are all constant in
-          // WasmGC, so `let w: string | i32 = "a"` builds the box inline.
-          let gun2 = ""
-          if gck == "union" { gun2 = letUnionNameOf(globalStmts[gi], -1) }
-          if gun2 != "" {
-            if emitUnionCoerce(globalPayload, gun2, g.letInit, -1) < 0 {
-              return -1
-            }
-          } else {
-            if emitExpr(globalPayload, g.letInit, -1) < 0 {
-              return -1 // init constexpr
-            }
-          }
-          pendingI64 = false
-          pendingF32 = false
-          pendingF64 = false
-          pendingListKind = 0
-          pendingListSlot = 0
-          pendingLitUnion = 0
-          fbEnd() // 0x0b end of init expr
-        }
-      }
-      gi = gi + 1
-    }
-    wTarget(gPrev)
-    wSection(6, globalPayload)
-  }
+  emitGlobalSection()
 
-  // Export section (id 7): export each function under its own name. A name is a
-  // UTF-8 byte vec; for an ASCII identifier each `name[i]` char code IS its byte.
-  // RE-EXPORTS (`export { name } from "dep"`) add ALIAS entries: the bare public name
-  // mapped to the (merged, mangled) target function's index, so a module graph can
-  // present a STABLE wasm ABI (`compileSrc`, not `compileSrc$mN`). Resolved entries
-  // are gathered first so the section count is exact.
-  const reExpEi: i32[] = [] // the target function's `fnStmts` position, parallel to its public name
-  const reExpNm: string[] = []
-  let rxi = 0
-  while rxi < reExpName.length {
-    let tj = 0
-    let hit = -1
-    while tj < fnStmts.length && hit < 0 {
-      const tfn = P.nodes[fnStmts[tj]]
-      if tfn is FuncDecl {
-        if tfn.fnName == reExpTarget[rxi] { hit = tj }
-      }
-      tj = tj + 1
-    }
-    if hit >= 0 {
-      reExpNm.push(reExpName[rxi])
-      reExpEi.push(hit)
-    }
-    rxi = rxi + 1
-  }
-  const exportPayload: i32[] = []
-  const exPrev = wTarget(exportPayload)
-  wULEB(n + reExpNm.length)
-  // Export names must be UNIQUE. Lifted nested functions keep their source name, so two
-  // makers each declaring a nested `add` would both export `add` (a duplicate-name
-  // validation error). Disambiguate a repeat by suffixing its `fnStmts` position
-  // (`add#3`) — the FIRST occurrence keeps the bare name. No golden program has a
-  // repeated function name, so their export bytes are unchanged.
-  const usedExportNames: string[] = []
-  let ei = 0
-  while ei < n {
-    const fn = P.nodes[fnStmts[ei]]
-    if fn is FuncDecl {
-      let exName = fn.fnName
-      if capHas(usedExportNames, exName) {
-        exName = exName + "#" + i32ToStr(ei)
-      }
-      usedExportNames.push(exName)
-      wName(exName)
-      wU8(0)               // export kind: func
-      wULEB(gImports + ei) // func index (imports occupy 0..gImports-1)
-    }
-    ei = ei + 1
-  }
-  // The re-export ALIAS entries — a bare public name pointing at the target's func index.
-  let rei = 0
-  while rei < reExpNm.length {
-    wName(reExpNm[rei])
-    wU8(0) // export kind: func
-    wULEB(gImports + reExpEi[rei])
-    rei = rei + 1
-  }
-  wTarget(exPrev)
-  wSection(7, exportPayload)
+  emitExportSection(n)
 
   // Start section (id 8): names the function the runtime invokes once at instantiation,
   // before any export is callable — here the synthetic start fn that runs the non-const
@@ -18532,24 +17781,7 @@ function emitModule(stmts: i32[]) {
     wSection(9, elemPayload)
   }
 
-  // Code section (id 10): one size-prefixed body per function, in index order, then
-  // (if any) the synthetic start function's body LAST.
-  const codePayload: i32[] = []
-  const codePrev = wTarget(codePayload)
-  wULEB(n + hasStart + memFn)
-  wTarget(codePrev)
-  let ci = 0
-  while ci < n {
-    if emitFuncCode(codePayload, fnStmts[ci]) < 0 { return -1 }
-    ci = ci + 1
-  }
-  if hasStart == 1 {
-    if emitStartFnCode(codePayload) < 0 { return -1 }
-  }
-  if memLogUsed {
-    if emitMemLogFnCode(codePayload) < 0 { return -1 }
-  }
-  wSection(10, codePayload)
+  if emitCodeSection(n, hasStart, memFn) < 0 { return -1 }
 
   // Custom "name" section LAST (after the code section, where it conventionally
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is
@@ -29429,4 +28661,827 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     }
   }
   return emitFail("emitProgram: `??` is only supported on a map index get")
+}
+
+// Type section (id 1): all WasmGC types in ONE recursion group, followed by the
+// standalone print/(log) functypes. Extracted verbatim from emitModule (C3); see the
+// inline comments below for the per-type framing. The rec-group count excludes the
+// `nPrintTypes` standalone print functypes (and the `memFn` __log__ functype).
+function emitTypeSection(
+  n: i32,
+  typeOffset: i32,
+  hasStart: i32,
+  memFn: i32,
+  nPrintTypes: i32,
+) {
+  const typePayload: i32[] = []
+  // Bind the writer at `typePayload` for the WHOLE type-section payload build, so the
+  // raw framing bytes, `pushFieldStorage`, and `fbValtype` all stream to `curBuf ==
+  // typePayload` identically. Restored just before `wSection` frames it (below).
+  const tyPrev = wTarget(typePayload)
+  wULEB(1 + nPrintTypes + memFn)   // rectypes: the rec group + the standalone print/(log) functypes
+  wU8(78)                          // 0x4e rec group
+  wULEB(n + typeOffset + hasStart) // types inside the rec group (print functypes excluded)
+  if sDeclared {
+    // One `0x5f` struct per declared type (declaration order = heap-type index),
+    // each a struct of its fields in declaration order. A field is `0x7f` i32
+    // (`sFieldTypes == 0`) or, for a string field (`== 3`), a non-null `(ref
+    // $aTypeIdx)` (`0x64 <aTypeIdx>` — the raw `(array i32)` string rep); both mutable.
+    let si = 0
+    while si < sNames.length {
+      wU8(95) // 0x5f struct
+      let cnt = sFieldCount[si]
+      wULEB(cnt)
+      let fj = 0
+      while fj < cnt {
+        const fjCode = sFieldTypeAt(si, fj)
+        let fjSlot = sFieldRefSlot(si, fj)
+        // A NESTED-STRUCT field (code 15) passes its TARGET struct table index.
+        if fjCode == 15 { fjSlot = structIndexByName(sFieldElemNameAt(si, fj)) }
+        // A MAP-typed field (code 19) passes its value type's mv SLOT.
+        if fjCode == 19 {
+          fjSlot = mvSlotOfValNameFind(sFieldElemNameAt(si, fj))
+        }
+        pushFieldStorage(fjCode, fjSlot)
+        wU8(1) // mutable
+        fj = fj + 1
+      }
+      si = si + 1
+    }
+  }
+  if uDeclared {
+    // The `nv` variant structs FIRST (heap types 0..nv-1), each a struct of its i32
+    // fields in declaration order (`0x5f` struct, count, then `0x7f 0x01` per field —
+    // mutable i32). Then the union BOX `{ tag: i32, value: anyref }` at index `nv`:
+    // `0x5f` struct, 2 fields — `0x7f 0x00` (i32, IMMUTABLE tag) and `0x6e 0x00`
+    // (`anyref` abbreviation, IMMUTABLE value) — mirroring binaryen's `5f 02 7f 00
+    // 6e 00` (verified against `toWasm.ts`'s `unionStruct`).
+    let vi = 0
+    while vi < uVariants.length {
+      wU8(95) // 0x5f struct
+      let cnt = uFieldCount[vi]
+      wULEB(cnt)
+      let fj = 0
+      while fj < cnt {
+        const vjCode = variantFieldTypeAt(vi, fj)
+        let vjSlot = variantFieldRefSlot(vi, fj)
+        // A NESTED-STRUCT variant field (code 15) passes its struct table index.
+        if vjCode == 15 {
+          vjSlot = structIndexByName(uFieldElemName[uFieldStart[vi] + fj])
+        }
+        // A MAP-typed variant field (code 19) passes its value type's mv SLOT.
+        if vjCode == 19 {
+          vjSlot = mvSlotOfValNameFind(uFieldElemName[uFieldStart[vi] + fj])
+        }
+        pushFieldStorage(vjCode, vjSlot)
+        wU8(1) // mutable
+        fj = fj + 1
+      }
+      vi = vi + 1
+    }
+    wU8(95)  // 0x5f struct (union box)
+    wU8(2)   // 2 fields
+    wU8(127) // field 0 tag: 0x7f i32
+    wU8(0)   // immutable
+    wU8(110) // field 1 value: 0x6e anyref
+    wU8(0)   // immutable
+    // The per-rep VALUE BOXES — each a one-field immutable struct `{ rep }` that
+    // carries a scalar value-union payload behind the box's `anyref` slot
+    // (mirroring `toWasm.ts`'s `valueBoxStruct`). Emitted in the SAME fixed order
+    // `mAssignTypeIndices` interned them (i32, i64, f32, f64).
+    if vbI32Used {
+      wU8(95)  // 0x5f struct (i32 value box — boolean shares it)
+      wU8(1)
+      wU8(127) // 0x7f i32
+      wU8(0)   // immutable
+    }
+    if vbI64Used {
+      wU8(95)  // 0x5f struct (i64 value box)
+      wU8(1)
+      wU8(126) // 0x7e i64
+      wU8(0)   // immutable
+    }
+    if vbF32Used {
+      wU8(95)  // 0x5f struct (f32 value box)
+      wU8(1)
+      wU8(125) // 0x7d f32
+      wU8(0)   // immutable
+    }
+    if vbF64Used {
+      wU8(95)  // 0x5f struct (f64 value box)
+      wU8(1)
+      wU8(124) // 0x7c f64
+      wU8(0)   // immutable
+    }
+  }
+  if aUsed {
+    wU8(94)  // 0x5e array
+    wU8(127) // 0x7f i32 storagetype
+    wU8(1)   // mutable
+  }
+  if lUsed {
+    wU8(95)         // 0x5f struct
+    wU8(3)          // 3 fields
+    wU8(100)        // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(aTypeIdx) // ...to the raw array heap type
+    wU8(1)          // mutable
+    wU8(127)        // field 1 len: 0x7f i32
+    wU8(1)          // mutable
+    wU8(127)        // field 2 cap: 0x7f i32
+    wU8(1)          // mutable
+  }
+  // One (backing, wrapper) PAIR per distinct ref-list element type, interleaved so each
+  // wrapper immediately follows (and references) its own backing — the heap indices laid
+  // out above. Each backing is `(array (mut (ref null $elem)))` over the slot's element
+  // (struct heap idx / union box); each wrapper is `{ backing: (ref $back), len, cap }`.
+  let rti = 0
+  while rti < rlElemName.length {
+    wU8(94)               // 0x5e array (ref backing)
+    wU8(99)               // 0x63 (ref null ht) — nullable element ref
+    wSLEB(rlElemHeap[rti])
+    wU8(1)                // mutable
+    wU8(95)               // 0x5f struct (ref-list wrapper)
+    wU8(3)                // 3 fields
+    wU8(100)              // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(rlBackIdx[rti]) // ...to THIS slot's ref backing
+    wU8(1)                // mutable
+    wU8(127)              // field 1 len: 0x7f i32
+    wU8(1)                // mutable
+    wU8(127)              // field 2 cap: 0x7f i32
+    wU8(1)                // mutable
+    rti = rti + 1
+  }
+  if slUsed || mUsed {
+    // The STRING-REF list types, shared by the map's keys list and any `string[]`
+    // field. (1) the backing array `(array (mut (ref null $aTypeIdx)))` — element is a
+    // NULLABLE string ref (`0x63 <aTypeIdx>`) so `array.new_default` defaults spare
+    // slots to null; an element read recovers the non-null string. (2) the list wrapper
+    // `{ backing: (ref $mkArrIdx), len, cap }` — the same `{backing,len,cap}` triple as
+    // the i32 list, over the string backing.
+    wU8(94)  // 0x5e array (keys/string backing)
+    wU8(99)  // 0x63 (ref null ht) — nullable string ref
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(95)  // 0x5f struct (string-list wrapper)
+    wU8(3)   // 3 fields
+    wU8(100) // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(mkArrIdx)
+    wU8(1)   // mutable
+    wU8(127) // field 1 len: 0x7f i32
+    wU8(1)   // mutable
+    wU8(127) // field 2 cap: 0x7f i32
+    wU8(1)   // mutable
+  }
+  if mUsed {
+    // The MAP struct `{ keys: (ref $mkListIdx), vals: (ref $lTypeIdx), live: (ref
+    // $aTypeIdx), index: (ref $aTypeIdx), count, size, hashes: (ref $aTypeIdx) }` — two
+    // non-null list refs (the keys string-list + the i32 vals list), the i32 `live`
+    // tombstone array, the i32 `index` hash-slot array, the `count`/`size` counters, and
+    // the i32 `hashes` per-entry FNV cache. FIELD ORDER + COUNT now match the host's
+    // 7-field general-purpose rep EXACTLY (`compiler/builtins/maps.ts`, `MAP_HASHES = 6`):
+    // the cached per-entry hash lets resize/compact RE-PLACE entries without re-hashing
+    // keys and gates the (string) key comparison on a hash mismatch — justified for
+    // large/long-key maps, not a compiler-symbol-table-narrow optimization. live is at
+    // index 2, index/count/size at 3/4/5, hashes at 6.
+    wU8(95)  // 0x5f struct (map)
+    wU8(7)   // 7 fields (open-addressing hash map, host-aligned)
+    wU8(100) // field 0 keys: 0x64 (ref $mkListIdx) — non-null
+    wSLEB(mkListIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
+    wSLEB(lTypeIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(127) // field 4 count: 0x7f i32
+    wU8(1)   // mutable
+    wU8(127) // field 5 size: 0x7f i32
+    wU8(1)   // mutable
+    wU8(100) // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+  }
+  if fa64Used {
+    // The f64 array `(array (mut f64))` (Slice 4): `0x5e` array form, `0x7c` f64
+    // storagetype, `0x01` mutable — the f64 analogue of the `5e 7f 01` i32 array.
+    wU8(94)  // 0x5e array
+    wU8(124) // 0x7c f64 storagetype
+    wU8(1)   // mutable
+    // The f64-list wrapper `{ backing: (ref $fa64TypeIdx), len: i32, cap: i32 }` — the
+    // same `{backing,len,cap}` triple as the i32 list, over the f64 backing.
+    wU8(95)            // 0x5f struct
+    wU8(3)             // 3 fields
+    wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(fa64TypeIdx) // ...to the f64 array heap type
+    wU8(1)             // mutable
+    wU8(127)           // field 1 len: 0x7f i32
+    wU8(1)             // mutable
+    wU8(127)           // field 2 cap: 0x7f i32
+    wU8(1)             // mutable
+  }
+  if ia64Used {
+    // The i64 array `(array (mut i64))` — `0x5e` array form, `0x7e` i64 storagetype,
+    // `0x01` mutable (the i64 sibling of the `5e 7c 01` f64 array). Emitted right after the
+    // f64 pair, matching the type-index allocation order.
+    wU8(94)  // 0x5e array
+    wU8(126) // 0x7e i64 storagetype
+    wU8(1)   // mutable
+    // The i64-list wrapper `{ backing: (ref $ia64TypeIdx), len: i32, cap: i32 }`.
+    wU8(95)            // 0x5f struct
+    wU8(3)             // 3 fields
+    wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(ia64TypeIdx) // ...to the i64 array heap type
+    wU8(1)             // mutable
+    wU8(127)           // field 1 len: 0x7f i32
+    wU8(1)             // mutable
+    wU8(127)           // field 2 cap: 0x7f i32
+    wU8(1)             // mutable
+  }
+  if fa32Used {
+    // The f32 array `(array (mut f32))` — `0x5e` array form, `0x7d` f32 storagetype, `0x01`
+    // mutable (the f32 sibling of the `5e 7c 01` f64 / `5e 7e 01` i64 arrays). Emitted right
+    // after the i64 pair, matching the type-index allocation order.
+    wU8(94)  // 0x5e array
+    wU8(125) // 0x7d f32 storagetype
+    wU8(1)   // mutable
+    // The f32-list wrapper `{ backing: (ref $fa32TypeIdx), len: i32, cap: i32 }`.
+    wU8(95)            // 0x5f struct
+    wU8(3)             // 3 fields
+    wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(fa32TypeIdx) // ...to the f32 array heap type
+    wU8(1)             // mutable
+    wU8(127)           // field 1 len: 0x7f i32
+    wU8(1)             // mutable
+    wU8(127)           // field 2 cap: 0x7f i32
+    wU8(1)             // mutable
+  }
+  if fnValUsed {
+    // The closure fat-pointer struct `{ code: funcref, env: (ref null struct),
+    // id: i32 }` (lambdas) — field 0 a GENERIC `funcref` (so ONE closure struct
+    // serves every function arity), field 1 a nullable `structref` env (null when
+    // non-capturing), field 2 the lifted function's wasm INDEX (`gImports + fe`) —
+    // the identity token for `==` (funcrefs admit no `ref.eq`). All IMMUTABLE. At a
+    // `call_ref` site the funcref is `ref.cast` to the concrete env-leading `$fnsig`
+    // for that call's arity, then `call_ref`. The interned `$fnsig` functypes (one
+    // per distinct value-call arity) follow.
+    wU8(95)  // 0x5f struct
+    wU8(3)   // 3 fields
+    wU8(99)  // field 0 code: 0x63 (ref null) funcref
+    wU8(112) // ...the abstract `func` heaptype (0x70 funcref)
+    wU8(0)   // immutable
+    wU8(99)  // field 1 env: 0x63 (ref null ht)
+    wU8(107) // ...to the abstract `struct` heaptype (structref)
+    wU8(0)   // immutable
+    wU8(127) // field 2 id: 0x7f i32 — the function-identity token
+    wU8(0)   // immutable
+    // One env-leading `$fnsig` functype per distinct eligible SIGNATURE, in
+    // `cloSigKeys` order: `(structref, params...) -> ret`, the param/result valtypes
+    // read off the representative function (`cloSigRepFn` — every function sharing
+    // the key has byte-identical kinds, by construction of the key).
+    let sai = 0
+    while sai < cloSigKeys.length {
+      const repFe = cloSigRepFn[sai]
+      const rep = P.nodes[fnStmts[repFe]]
+      if rep is FuncDecl {
+        const rparams = rep.fnParams
+        wU8(96)                   // 0x60 func
+        wULEB(rparams.length + 1) // env + declared params
+        wU8(107)                  // param 0 env: structref (0x6b)
+        let pj = 0
+        while pj < rparams.length {
+          fbValtype(vtKindOfParam(rparams[pj]), paramStructIdxOf(rparams[pj]))
+          pj = pj + 1
+        }
+        // The RESULT must byte-match the rep function's own functype result so
+        // the call-site `ref.cast` to this `$fnsig` accepts the callee funcref:
+        // a VOID field-closure sig (`>v`) has 0 results; a STRUCT-returning one
+        // (`>sN;`) yields the struct ref exactly as the function functype does.
+        if fRetVoid[repFe] == 1 {
+          wU8(0) // 0 results — the `>v` write-trap sig
+        } else {
+          wU8(1) // 1 result
+          // The result valtype the rep function's OWN functype emits — scalar (i32/f64/
+          // i64), string, an i32/string/f64 list, a union box, a nullable scalar/struct,
+          // or a struct ref (`cloRetValKind`/`cloRetValSlot`, the shared mapping).
+          const rrk = cloRetValKind(repFe)
+          let rrkCode: VKind = "i32"
+          if rrk != null { rrkCode = rrk }
+          fbValtype(rrkCode, cloRetValSlot(repFe))
+        }
+      }
+      sai = sai + 1
+    }
+    // One env struct per CAPTURING lifted function (`fnEnvIdx[fe] >= 0`), in `fnStmts`
+    // order — the order `mAssignTypeIndices` minted them. Each is a struct of one
+    // IMMUTABLE i32 field per captured variable (capture order = field order). The
+    // corpus captures are all i32 (and one struct-ref capture in `closure.vl`'s
+    // `sumPoint`, handled by emitting the captured ref's valtype).
+    let fe = 0
+    while fe < fnStmts.length {
+      if fnEnvIdxOf(fe) >= 0 {
+        const caps = captureNamesOf(fe)
+        wU8(95) // 0x5f struct
+        wULEB(caps.length)
+        let ci = 0
+        while ci < caps.length {
+          fbValtype(
+            captureValKind(fe, caps[ci]),
+            captureValStructIdx(fe, caps[ci]),
+          )
+          wU8(0) // immutable
+          ci = ci + 1
+        }
+      }
+      fe = fe + 1
+    }
+  }
+  // The ref-valued map structs (one per mv slot), in `mvMapTypeIdx` mint order —
+  // the SAME 7-field shape as the mono map struct, with `vals` referencing this
+  // slot's ref-list wrapper (the string-list pair for string values, the element's
+  // `rlWrapIdx` for struct values). Keys/live/index/count/size/hashes are identical
+  // across all map structs, so the shared probe/rehash/compact bytes apply as-is.
+  let mvs = 0
+  while mvs < mvValName.length {
+    wU8(95)  // 0x5f struct (ref-valued map)
+    wU8(7)   // 7 fields (host-aligned open-addressing hash map)
+    wU8(100) // field 0 keys: 0x64 (ref $mkListIdx) — non-null
+    wSLEB(mkListIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 1 vals: 0x64 (ref <this slot's wrapper>)
+    wSLEB(mvValsWrapOf(mvs))
+    wU8(1)   // mutable
+    wU8(100) // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(127) // field 4 count: 0x7f i32
+    wU8(1)   // mutable
+    wU8(127) // field 5 size: 0x7f i32
+    wU8(1)   // mutable
+    wU8(100) // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    mvs = mvs + 1
+  }
+  // The functype param/result valtypes (`fbValtype`) stream to `curBuf == typePayload`,
+  // interleaved identically with the surrounding raw framing bytes (the `wTarget` bind
+  // covering this whole payload build was established above).
+  let ti = 0
+  while ti < n {
+    const fn = P.nodes[fnStmts[ti]]
+    if fn is FuncDecl {
+      const params = fn.fnParams
+      const nParams = params.length
+      wU8(96) // 0x60 func
+      // When a function value exists module-wide, EVERY function carries a hidden
+      // leading `structref env` param (local 0). The declared params follow at 1..p.
+      // A non-capturing function ignores its env; a capturing one `ref.cast`s + reads
+      // it. Gated on `fnValUsed` so a no-lambda module's functypes are byte-identical.
+      if fnValUsed {
+        wULEB(nParams + 1) // param count incl. the env param
+        wU8(107)           // env param: structref (0x6b)
+      } else {
+        wULEB(nParams) // param count
+      }
+      let pi = 0
+      while pi < nParams {
+        fbValtype(vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
+        pi = pi + 1
+      }
+      if fRetVoid[ti] == 1 {
+        wU8(0) // 0 results — a VOID function (`()->()`)
+      } else if fn.fnRet < 0 && fnReturnsClosure(ti) {
+        // A function VALUE return (un-annotated; its tail is a function value) — kind 14.
+        wU8(1)
+        fbValtype("closure", -1)
+      } else if fn.fnRet < 0 {
+        // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
+        // fRet* tables the annotation path fills). i32 when nothing matched.
+        wU8(1) // 1 result
+        // The inferred result KIND from the single shared mapping (`inferredRetKindCore`) — so
+        // this site and `cloRetValKind` can't drift on a scalar/list/ref kind (the f32/f64/i64
+        // inferred-return holes were each one site missing what the other had). The SLOT follows
+        // the kind: struct index for a struct / nullable-struct ref (1 / 9), the element wrapper
+        // for a ref list (5, via the recorded element name), the map shape for a map (6); every
+        // other kind (string / scalar list / scalars) needs no per-function slot.
+        const infKind = inferredRetKindCore(ti)
+        let infSlot = -1
+        if infKind == "struct" || infKind == "nulstruct" {
+          infSlot = fRetStructIdx[ti]
+        }
+        if infKind == "reflist" { infSlot = rlSlotByName(fRetRArrElem[ti]) }
+        if infKind == "map" {
+          const mrx = fnRetExprOf(fnStmts[ti])
+          if mrx >= 0 { infSlot = mapRetExprShape(mrx, fnStmts[ti]) }
+        }
+        fbValtype(infKind, infSlot)
+      } else {
+        wU8(1) // 1 result
+        // A `T[]` return is kind 5 — its second `fbValtype` arg is the ref-list TABLE
+        // SLOT for the element type (`retStructIndex` is -1 for a ref array), so the
+        // result valtype selects THIS function's element wrapper, not slot 0's.
+        let retSlot = retStructIndex(fn.fnRet)
+        if retRefArrFlag(fn.fnRet) == 1 { retSlot = tyAnnRefListSlot(fn.fnRet) }
+        // A string-keyed MAP return's slot is the map SHAPE (mono ⇒ -1, or the value type's mv
+        // slot for a `string`-valued map), so the result valtype selects THIS map's `$mapStruct`.
+        if retMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
+        // A `: Cat` concrete-variant return is kind 8 — its `fbValtype` slot is the VARIANT
+        // index (`uVarIdx + vi`), which `retStructIndex` (standalone structs only) misses.
+        if retVariantFlag(fn.fnRet) == 1 {
+          retSlot = variantIndexOf(tyNameOf(fn.fnRet))
+        }
+        fbValtype(vtKindOfType(fn.fnRet), retSlot)
+      }
+    }
+    ti = ti + 1
+  }
+  // The synthetic start function's `()->()` functype (lands at index `typeOffset + n`,
+  // AFTER every user functype — so no user type index shifts and the Phase-G assert is
+  // untouched). `0x60` func, 0 params, 0 results.
+  if hasStart == 1 {
+    wU8(96) // 0x60 func
+    wU8(0)  // 0 params
+    wU8(0)  // 0 results
+  }
+  // The print-import functypes (only when a `print` exists): `(i32)->()` at index
+  // `typeOffset + n + hasStart` (shared by __print_i32__/__print_bool__/__print_char__)
+  // and `()->()` at +1 (__print_str_flush__). Emitted LAST and as STANDALONE rectypes
+  // (the rec-group count above excludes them) so a strict-GC host can match the import
+  // against a host function; no user/start functype index shifts.
+  if gImports > 0 {
+    wU8(96)  // 0x60 func
+    wU8(1)   // 1 param
+    wU8(127) // 0x7f i32
+    wU8(0)   // 0 results
+    wU8(96)  // 0x60 func
+    wU8(0)   // 0 params
+    wU8(0)   // 0 results
+  }
+  // The `(i64)->()` functype for `__print_i64__` (only when an i64 program prints),
+  // standalone AFTER the two existing print functypes — its index is `ftVoid + 1`,
+  // so no existing functype index shifts.
+  if gNeedsI64Print {
+    wU8(96)  // 0x60 func
+    wU8(1)   // 1 param
+    wU8(126) // 0x7e i64
+    wU8(0)   // 0 results
+  }
+  // The `(f64)->()` functype for `__print_f64__`, standalone AFTER the i64 one (if any),
+  // so no existing functype index shifts. (Slice 3.)
+  if gNeedsF64Print {
+    wU8(96)  // 0x60 func
+    wU8(1)   // 1 param
+    wU8(124) // 0x7c f64
+    wU8(0)   // 0 results
+  }
+  // The `(f32)->()` functype for `__print_f32__`, standalone AFTER the i64/f64 ones (if
+  // any), so no existing functype index shifts. (Slice 5.)
+  if gNeedsF32Print {
+    wU8(96)  // 0x60 func
+    wU8(1)   // 1 param
+    wU8(125) // 0x7d f32
+    wU8(0)   // 0 results
+  }
+  // The `(i32, i32) -> ()` functype for the synthetic `__log__` decoder, standalone
+  // LAST (after every print functype) so no existing functype index shifts. Its
+  // index is `typeOffset + n + hasStart + nPrintTypes`.
+  if memLogUsed {
+    wU8(96)  // 0x60 func
+    wU8(2)   // 2 params
+    wU8(127) // 0x7f i32 (offset)
+    wU8(127) // 0x7f i32 (length)
+    wU8(0)   // 0 results
+  }
+  wTarget(tyPrev)
+  wSection(1, typePayload)
+  0
+}
+
+// Import section (id 2), extracted verbatim from emitModule (C3).
+function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
+  // Import section (id 2, between type and function): the 4-entry print family from
+  // the host's `"imports"` module, occupying function indices 0..3 in this exact
+  // order (the call lowering hardcodes them): __print_i32__, __print_bool__,
+  // __print_char__ (all `(i32)->()`), __print_str_flush__ (`()->()`).
+  if gImports > 0 {
+    const ftI32 = typeOffset + n + hasStart
+    const ftVoid = ftI32 + 1
+    const ftI64 = ftVoid + 1
+    // The `(f64)->()` functype index trails the i64 one when present, else the void one.
+    let ftF64 = ftVoid + 1
+    if gNeedsI64Print { ftF64 = ftI64 + 1 }
+    // The `(f32)->()` functype index trails the f64 one when present, else wherever the
+    // f64 index would be (the standalone functypes are emitted i64 → f64 → f32 in order).
+    let ftF32 = ftF64
+    if gNeedsF64Print { ftF32 = ftF64 + 1 }
+    const importPayload: i32[] = []
+    const imPrev = wTarget(importPayload)
+    // 4 imports normally; +1 each for `__print_i64__` / `__print_f64__` / `__print_f32__`.
+    let nImports = 4
+    if gNeedsI64Print { nImports = nImports + 1 }
+    if gNeedsF64Print { nImports = nImports + 1 }
+    if gNeedsF32Print { nImports = nImports + 1 }
+    wULEB(nImports)
+    wName("imports")
+    wName("__print_i32__")
+    wU8(0) // import kind: func
+    wULEB(ftI32)
+    wName("imports")
+    wName("__print_bool__")
+    wU8(0)
+    wULEB(ftI32)
+    wName("imports")
+    wName("__print_char__")
+    wU8(0)
+    wULEB(ftI32)
+    wName("imports")
+    wName("__print_str_flush__")
+    wU8(0)
+    wULEB(ftVoid)
+    // `__print_i64__` LAST, at function index 4 (`fbCall(4)` in the print router), so
+    // the existing imports keep indices 0..3 and only this entry is conditionally added.
+    if gNeedsI64Print {
+      wName("imports")
+      wName("__print_i64__")
+      wU8(0)
+      wULEB(ftI64)
+    }
+    // `__print_f64__` LAST, at function index `gF64PrintIdx` (4 or 5). (Slice 3.)
+    if gNeedsF64Print {
+      wName("imports")
+      wName("__print_f64__")
+      wU8(0)
+      wULEB(ftF64)
+    }
+    // `__print_f32__` LAST, at function index `gF32PrintIdx` (4/5/6). (Slice 5.)
+    if gNeedsF32Print {
+      wName("imports")
+      wName("__print_f32__")
+      wU8(0)
+      wULEB(ftF32)
+    }
+    wTarget(imPrev)
+    wSection(2, importPayload)
+  }
+  0
+}
+
+// Function section (id 3), extracted verbatim from emitModule (C3).
+function emitFunctionSection(
+  n: i32,
+  typeOffset: i32,
+  hasStart: i32,
+  memFn: i32,
+  nPrintTypes: i32,
+) {
+  // Function section (id 3): N functions; func i uses functype `typeOffset + i`. The
+  // synthetic start function (if any) is the LAST entry — function index `n` — using
+  // the `()->()` functype at index `typeOffset + n`.
+  const funcPayload: i32[] = []
+  const fnPrev = wTarget(funcPayload)
+  wULEB(n + hasStart + memFn)
+  let fi = 0
+  while fi < n {
+    // A function whose env-leading signature matches an interned `$fnsig` is declared
+    // with that `$fnsig` functype, so `ref.func` of it produces a value the call_ref
+    // site's `ref.cast` to `$fnsig` accepts (its ACTUAL type IS `$fnsig`). Others keep
+    // their own functype. Only when `fnValUsed`. (Lambdas.)
+    if fnValUsed && fnSigIsClosure(fi) {
+      wULEB(fnSigIdxOfFn(fi))
+    } else {
+      wULEB(typeOffset + fi) // functype index
+    }
+    fi = fi + 1
+  }
+  if hasStart == 1 {
+    wULEB(typeOffset + n) // start fn functype index
+  }
+  if memLogUsed {
+    // The synthetic `__log__` decoder uses the standalone `(i32,i32)->()` functype
+    // emitted after the print functypes.
+    wULEB(typeOffset + n + hasStart + nPrintTypes)
+  }
+  wTarget(fnPrev)
+  wSection(3, funcPayload)
+  0
+}
+
+// Global section (id 6), extracted verbatim from emitModule (C3).
+function emitGlobalSection() {
+  // Global section (id 6): one mutable global per top-level `let`/`const`, in
+  // declaration order (that order IS the global index `global.get`/`global.set` use).
+  // Each entry is `<valtype> 0x01 <init constexpr> 0x0b`. The valtype mirrors `pushVT`'s
+  // kind for the initializer (i32 / struct ref / list ref / string ref); the init reuses
+  // the ordinary `emitExpr` literal lowering — `i32.const`, `struct.new`, and
+  // `array.new_fixed` are all valid WasmGC constant expressions, so no start function is
+  // needed for the literal initializers in scope. A non-constexpr init (a reference to a
+  // local/param) fails loudly via `emitExpr(fnIx = -1)` (start-fn fallback deferred).
+  const ng = globalStmts.length
+  if ng > 0 {
+    const globalPayload: i32[] = []
+    // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
+    // the count, each entry's valtype (`fbValtype`), mutability flag, and init constexpr
+    // (`fb*` opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
+    const gPrev = wTarget(globalPayload)
+    wULEB(ng)
+    let gi = 0
+    while gi < ng {
+      const g = P.nodes[globalStmts[gi]]
+      if g is LetDecl {
+        if g.letInit < 0 {
+          return emitFail("emitProgram: module global has no initializer")
+        }
+        if globalIsNonConst(globalStmts[gi]) {
+          // A non-constexpr init (`curBuf = W.bytes` — a `global.get`+`struct.get`, a
+          // reference to another global, a call, etc.) cannot be a WasmGC constant
+          // expression. Declare the cell NULLABLE and zero-init it (`i32.const 0` for a
+          // scalar, `ref.null` for a ref); the synthetic start function below runs the
+          // real init via `global.set` before any other code, so reads never see the
+          // zero. The cell stays mutable.
+          const ck = globalCellKind(globalStmts[gi])
+          // For a ref-array cell (kind 5) the second `fbValtype`/`fbRefNullForKind` arg is
+          // the ref-list TABLE SLOT (`globalCellStructIdx` is -1 for a ref array), so the
+          // cell valtype and its `ref.null` zero select THIS global's element wrapper.
+          let cs = globalCellStructIdx(globalStmts[gi])
+          if ck == "reflist" { cs = letAnnRefListSlot(globalStmts[gi]) }
+          // A map cell (kind 6) passes its map SHAPE (mv slot / -1 mono / -2 set)
+          // so the cell valtype + ref.null zero select THIS map's struct type.
+          if ck == "map" { cs = letMapShapeOf(globalStmts[gi], -1) }
+          fbValtypeNullable(ck, cs) // nullable valtype
+          wU8(1)                    // 0x01 mutable
+          if ck == "i32" {
+            fbI32Const(0) // i32 scalar zero
+          } else if ck == "i64" {
+            fbI64Const(0, 0) // i64 scalar zero (Slice 1)
+          } else if ck == "f64" {
+            fbF64Const("0.0") // f64 scalar zero (Slice 3)
+          } else if ck == "f32" {
+            fbF32Const("0.0") // f32 scalar zero (Slice 5)
+          } else {
+            fbRefNullForKind(ck, cs) // ref.null zero
+          }
+          fbEnd() // 0x0b end of init expr
+        } else {
+          // The cell's valtype comes from the binding's ANNOTATION when present (so a
+          // global agrees with a same-typed local/param/field on its struct table index),
+          // falling back to the literal-init kind for an un-annotated global. The init
+          // constexpr (`emitExpr`) lowers the literal — and must build the SAME wasm type:
+          // `pendingStructIdx` seeds an `ObjLit` to the annotated struct (not the first
+          // field-name match), and `pendingListKind`/`pendingListSlot` seed an empty `[]`
+          // to the annotation's ref/string list (not the i32-list the bare literal infers),
+          // exactly as the local-`let` path threads them.
+          const gck = globalCellKind(globalStmts[gi])
+          let gcs = globalCellStructIdx(globalStmts[gi])
+          if gck == "struct" { pendingStructIdx = gcs }
+          // A NULLABLE-struct cell (kind 9) seeds the same struct context: a bare
+          // `null` init lowers as `ref.null $S` (a valid constexpr), a struct
+          // literal as that struct.
+          if gck == "nulstruct" { pendingStructIdx = gcs }
+          pendingListKind = letAnnRefListKind(globalStmts[gi])
+          pendingListSlot = letAnnRefListSlot(globalStmts[gi])
+          // A ref-array cell (kind 5) passes the ref-list TABLE SLOT as `fbValtype`'s
+          // second arg (`globalCellStructIdx` is -1 for a ref array) so the cell valtype
+          // selects THIS global's element wrapper, not slot 0's.
+          if gck == "reflist" { gcs = letAnnRefListSlot(globalStmts[gi]) }
+          // A map cell (kind 6): the map SHAPE picks the struct type; the
+          // `pendingMapSlot` seed makes the `Map()` init constexpr build it.
+          if gck == "map" {
+            gcs = letMapShapeOf(globalStmts[gi], -1)
+            pendingMapSlot = gcs
+          }
+          fbValtype(gck, gcs) // valtype
+          wU8(1)              // 0x01 mutable
+          // An `: i64` global lowers its literal init as `i64.const` (kind 10 / 0x7e);
+          // an `: f32`/`: f64` global as `f32.const`/`f64.const` (kind 13 / 0x7d, 11 /
+          // 0x7c) — re-encoding an integer literal directly so the init stays a valid
+          // constexpr (no convert op). (Slice 5.)
+          pendingI64 = (gck == "i64")
+          pendingF32 = (gck == "f32")
+          pendingF64 = (gck == "f64")
+          // A literal-union const global (`const D: K = "a"`) lowers its member init as `i32.const <id>`
+          // (a valid constexpr).
+          if letIsLitUnion(globalStmts[gi]) { pendingLitUnion = 1 }
+          // A UNION cell (kind 4) with a CONST init boxes it in the constexpr —
+          // `struct.new` / `array.new_fixed` / `i32.const` are all constant in
+          // WasmGC, so `let w: string | i32 = "a"` builds the box inline.
+          let gun2 = ""
+          if gck == "union" { gun2 = letUnionNameOf(globalStmts[gi], -1) }
+          if gun2 != "" {
+            if emitUnionCoerce(globalPayload, gun2, g.letInit, -1) < 0 {
+              return -1
+            }
+          } else {
+            if emitExpr(globalPayload, g.letInit, -1) < 0 {
+              return -1 // init constexpr
+            }
+          }
+          pendingI64 = false
+          pendingF32 = false
+          pendingF64 = false
+          pendingListKind = 0
+          pendingListSlot = 0
+          pendingLitUnion = 0
+          fbEnd() // 0x0b end of init expr
+        }
+      }
+      gi = gi + 1
+    }
+    wTarget(gPrev)
+    wSection(6, globalPayload)
+  }
+  0
+}
+
+// Export section (id 7), extracted verbatim from emitModule (C3).
+function emitExportSection(n: i32) {
+  // Export section (id 7): export each function under its own name. A name is a
+  // UTF-8 byte vec; for an ASCII identifier each `name[i]` char code IS its byte.
+  // RE-EXPORTS (`export { name } from "dep"`) add ALIAS entries: the bare public name
+  // mapped to the (merged, mangled) target function's index, so a module graph can
+  // present a STABLE wasm ABI (`compileSrc`, not `compileSrc$mN`). Resolved entries
+  // are gathered first so the section count is exact.
+  const reExpEi: i32[] = [] // the target function's `fnStmts` position, parallel to its public name
+  const reExpNm: string[] = []
+  let rxi = 0
+  while rxi < reExpName.length {
+    let tj = 0
+    let hit = -1
+    while tj < fnStmts.length && hit < 0 {
+      const tfn = P.nodes[fnStmts[tj]]
+      if tfn is FuncDecl {
+        if tfn.fnName == reExpTarget[rxi] { hit = tj }
+      }
+      tj = tj + 1
+    }
+    if hit >= 0 {
+      reExpNm.push(reExpName[rxi])
+      reExpEi.push(hit)
+    }
+    rxi = rxi + 1
+  }
+  const exportPayload: i32[] = []
+  const exPrev = wTarget(exportPayload)
+  wULEB(n + reExpNm.length)
+  // Export names must be UNIQUE. Lifted nested functions keep their source name, so two
+  // makers each declaring a nested `add` would both export `add` (a duplicate-name
+  // validation error). Disambiguate a repeat by suffixing its `fnStmts` position
+  // (`add#3`) — the FIRST occurrence keeps the bare name. No golden program has a
+  // repeated function name, so their export bytes are unchanged.
+  const usedExportNames: string[] = []
+  let ei = 0
+  while ei < n {
+    const fn = P.nodes[fnStmts[ei]]
+    if fn is FuncDecl {
+      let exName = fn.fnName
+      if capHas(usedExportNames, exName) {
+        exName = exName + "#" + i32ToStr(ei)
+      }
+      usedExportNames.push(exName)
+      wName(exName)
+      wU8(0)               // export kind: func
+      wULEB(gImports + ei) // func index (imports occupy 0..gImports-1)
+    }
+    ei = ei + 1
+  }
+  // The re-export ALIAS entries — a bare public name pointing at the target's func index.
+  let rei = 0
+  while rei < reExpNm.length {
+    wName(reExpNm[rei])
+    wU8(0) // export kind: func
+    wULEB(gImports + reExpEi[rei])
+    rei = rei + 1
+  }
+  wTarget(exPrev)
+  wSection(7, exportPayload)
+  0
+}
+
+// Code section (id 10), extracted verbatim from emitModule (C3). Returns -1 if any
+// function body fails to emit (propagated by the caller), else 0.
+function emitCodeSection(n: i32, hasStart: i32, memFn: i32) {
+  // Code section (id 10): one size-prefixed body per function, in index order, then
+  // (if any) the synthetic start function's body LAST.
+  const codePayload: i32[] = []
+  const codePrev = wTarget(codePayload)
+  wULEB(n + hasStart + memFn)
+  wTarget(codePrev)
+  let ci = 0
+  while ci < n {
+    if emitFuncCode(codePayload, fnStmts[ci]) < 0 { return -1 }
+    ci = ci + 1
+  }
+  if hasStart == 1 {
+    if emitStartFnCode(codePayload) < 0 { return -1 }
+  }
+  if memLogUsed {
+    if emitMemLogFnCode(codePayload) < 0 { return -1 }
+  }
+  wSection(10, codePayload)
+  0
 }
