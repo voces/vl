@@ -40,11 +40,13 @@ trap 'rm -rf "$WORK"' EXIT
 [ -x "$VL" ] || { echo "missing vl binary: $VL (cd scripts/vl-host && cargo build --release)"; exit 1; }
 # Missing seed: fetch the rolling `seed-latest` release, then fall through to the
 # self-compile below — the fetched seed need only compile current source.
+fetched=0
 if [ ! -f "$SEED" ]; then
   if [ "$FALLBACK" = 0 ]; then
     echo "missing seed: $SEED (run scripts/fetch-seed.sh)"; exit 1
   fi
   SEED="$SEED" scripts/fetch-seed.sh
+  fetched=1
 fi
 
 # The compiler is built from REAL `import`/`export` modules: `compiler/entry.vl`
@@ -54,12 +56,32 @@ echo "== self-compile current compiler source with the seed =="
 # A seed that cannot compile current source is too stale (the compiler started
 # using a construct its emitter cannot lower). Fail LOUD — do not silently
 # re-enter the TS stage-0 path. The fix is an explicit break-glass re-mint.
-if ! "$VL" build compiler/entry.vl -o "$WORK/next.wasm" --compiler "$SEED"; then
+selfcompile() { "$VL" build compiler/entry.vl -o "$WORK/next.wasm" --compiler "$SEED"; }
+
+ok=0
+if selfcompile; then ok=1; fi
+# STALE CACHED SEED: a WARM seed (a pre-existing build/vl-compiler.wasm, e.g. a CI
+# cache restored by a prefix `restore-keys` match) can be arbitrarily stale — older
+# than the rolling `seed-latest` that DOES compile current source. If the warm seed
+# fails and we have not already fetched fresh this run, re-fetch `seed-latest`
+# (republished on every master push) and retry the self-compile ONCE before failing
+# loud. This makes the refresh robust to the CI seed-cache staleness race.
+if [ "$ok" = 0 ] && [ "$FALLBACK" = 1 ] && [ "$fetched" = 0 ]; then
+  echo "  seed cannot compile current source — may be a stale CACHED seed;" >&2
+  echo "  re-fetching the rolling seed-latest and retrying once..." >&2
+  # `fetch-seed.sh` no-ops when a seed file is already present, so remove the
+  # stale one first to force a real download of the current `seed-latest`.
+  rm -f "$SEED"
+  SEED="$SEED" scripts/fetch-seed.sh
+  fetched=1
+  if selfcompile; then ok=1; fi
+fi
+if [ "$ok" = 0 ]; then
   echo "ERROR: seed cannot compile current source (stale seed)." >&2
-  echo "  The seed predates a construct the compiler now uses. Re-fetch the" >&2
-  echo "  rolling seed-latest (scripts/fetch-seed.sh); if seed-latest ITSELF is too" >&2
-  echo "  old, land the enabling change in smaller steps so each seed self-compiles" >&2
-  echo "  the next (there is no TS re-mint — the project keeps no second compiler)." >&2
+  echo "  The seed predates a construct the compiler now uses, AND the rolling" >&2
+  echo "  seed-latest could not compile it either. Land the enabling change in" >&2
+  echo "  smaller steps so each seed self-compiles the next (there is no TS re-mint" >&2
+  echo "  — the project keeps no second compiler)." >&2
   exit 1
 fi
 
