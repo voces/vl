@@ -95,6 +95,74 @@ import {
   uVarIdx,
 } from "./emit_state"
 
+// ── wasm opcode / type-byte constants (M5) ────────────────────────────────────
+// Named constants for the raw wasm bytes this encoder emits — instruction
+// opcodes, GC-prefixed sub-opcodes, valtype/reftype/heaptype bytes — so a reader
+// no longer decodes hex from a trailing comment. Each has the SAME value as the
+// literal it replaces, so emitted output is byte-identical. Data bytes (SLEB
+// payloads, counts, indices, memarg align/offset) are NOT named — they are
+// operands, not opcodes.
+// Control flow / blocks.
+const OP_UNREACHABLE = 0 // 0x00
+const OP_BLOCK = 2       // 0x02
+const OP_LOOP = 3        // 0x03
+const OP_IF = 4          // 0x04
+const OP_ELSE = 5        // 0x05
+const OP_END = 11        // 0x0b
+const OP_BR = 12         // 0x0c
+const OP_BR_IF = 13      // 0x0d
+const OP_RETURN = 15     // 0x0f
+const OP_CALL = 16       // 0x10
+const OP_CALL_REF = 20   // 0x14
+const OP_DROP = 26       // 0x1a
+// Locals / globals.
+const OP_LOCAL_GET = 32  // 0x20
+const OP_LOCAL_SET = 33  // 0x21
+const OP_GLOBAL_GET = 35 // 0x23
+const OP_GLOBAL_SET = 36 // 0x24
+// Memory.
+const OP_I32_LOAD = 40  // 0x28
+const OP_I32_STORE = 54 // 0x36
+// Numeric consts.
+const OP_I32_CONST = 65 // 0x41
+const OP_I64_CONST = 66 // 0x42
+const OP_F32_CONST = 67 // 0x43
+const OP_F64_CONST = 68 // 0x44
+// Comparisons / conversions.
+const OP_I32_EQZ = 69            // 0x45
+const OP_I64_EXTEND_I32_S = 172  // 0xac
+const OP_F32_CONVERT_I32_S = 178 // 0xb2
+const OP_F64_CONVERT_I32_S = 183 // 0xb7
+const OP_F64_CONVERT_I64_S = 185 // 0xb9
+const OP_F64_PROMOTE_F32 = 187   // 0xbb
+// Reference instructions.
+const OP_REF_NULL = 208        // 0xd0
+const OP_REF_FUNC = 210        // 0xd2
+const OP_REF_AS_NON_NULL = 212 // 0xd4
+// GC prefix (0xfb) + its sub-opcodes (the byte following the prefix).
+const GC_PREFIX = 251          // 0xfb
+const GC_STRUCT_NEW = 0        // struct.new
+const GC_STRUCT_GET = 2        // struct.get
+const GC_STRUCT_SET = 5        // struct.set
+const GC_ARRAY_NEW = 6         // array.new
+const GC_ARRAY_NEW_DEFAULT = 7 // array.new_default
+const GC_ARRAY_NEW_FIXED = 8   // array.new_fixed
+const GC_ARRAY_GET = 11        // 0x0b array.get
+const GC_ARRAY_SET = 14        // 0x0e array.set
+const GC_ARRAY_LEN = 15        // 0x0f array.len
+const GC_ARRAY_COPY = 17       // 0x11 array.copy
+const GC_REF_CAST = 22         // 0x16 ref.cast (non-null)
+// Value-type bytes.
+const VT_F64 = 124 // 0x7c
+const VT_F32 = 125 // 0x7d
+const VT_I64 = 126 // 0x7e
+const VT_I32 = 127 // 0x7f
+// Reference-type leading bytes.
+const RT_REF_NULL = 99 // 0x63 (ref null ht) — nullable ref
+const RT_REF = 100     // 0x64 (ref ht) — non-null ref
+// Abstract heap-type bytes (operand of `ref.null`).
+const HT_STRUCT = 107 // 0x6b structref
+const HT_NONE = 113   // 0x71 none
 // Redirect the writer at `buf`; return the PREVIOUS current buffer so the caller
 // can restore it (closure-free save/restore — replaces threading `body`/`payload`
 // through every helper).
@@ -155,29 +223,29 @@ export function wSection(id: i32, payload: i32[]) {
 // ── control flow / locals / consts (the universal base — Phase B) ─────────────
 // local.get / local.set / local.tee: 0x20/0x21/0x22 <localidx-uleb>.
 export function fbLocalGet(i: i32) {
-  wU8(32) // 0x20 local.get
+  wU8(OP_LOCAL_GET) // 0x20 local.get
   wULEB(i)
   0
 }
 export function fbLocalSet(i: i32) {
-  wU8(33) // 0x21 local.set
+  wU8(OP_LOCAL_SET) // 0x21 local.set
   wULEB(i)
   0
 }
 // global.get / global.set: 0x23/0x24 <globalidx-uleb>.
 export function fbGlobalGet(i: i32) {
-  wU8(35) // 0x23 global.get
+  wU8(OP_GLOBAL_GET) // 0x23 global.get
   wULEB(i)
   0
 }
 export function fbGlobalSet(i: i32) {
-  wU8(36) // 0x24 global.set
+  wU8(OP_GLOBAL_SET) // 0x24 global.set
   wULEB(i)
   0
 }
 // i32.const: 0x41 <value-sleb>.
 export function fbI32Const(v: i32) {
-  wU8(65) // 0x41 i32.const
+  wU8(OP_I32_CONST) // 0x41 i32.const
   wSLEB(v)
   0
 }
@@ -230,7 +298,7 @@ export function wSLEB64(hi: i32, lo: i32) {
 // i64.const: 0x42 <value-sleb64>. The 64-bit literal value is carried as a (hi,
 // lo) i32 pair (`parseI64Pair`) and signed-LEB-encoded over 64 bits (`wSLEB64`).
 export function fbI64Const(hi: i32, lo: i32) {
-  wU8(66) // 0x42 i64.const
+  wU8(OP_I64_CONST) // 0x42 i64.const
   wSLEB64(hi, lo)
   0
 }
@@ -239,99 +307,99 @@ export function fbI64Const(hi: i32, lo: i32) {
 // is expected. (Slice 1 prefers typing the literal directly as i64; this is the
 // fallback for a non-literal i32 source.)
 export function fbI64ExtendI32S() {
-  wU8(172) // 0xac i64.extend_i32_s
+  wU8(OP_I64_EXTEND_I32_S) // 0xac i64.extend_i32_s
   0
 }
 // f64.const: 0x44 followed by 8 raw little-endian IEEE-754 bytes (`f64Bytes`).
 export function fbF64Const(text: string) {
-  wU8(68) // 0x44 f64.const
+  wU8(OP_F64_CONST) // 0x44 f64.const
   wBytes(f64Bytes(text))
   0
 }
 // f64.convert_i32_s: 0xb7 — widen a signed i32 on the stack to f64 (the bridge for a
 // mixed i32/f64 operand, mirroring i64.extend_i32_s). (Slice 3.)
 export function fbF64ConvertI32S() {
-  wU8(183) // 0xb7 f64.convert_i32_s
+  wU8(OP_F64_CONVERT_I32_S) // 0xb7 f64.convert_i32_s
   0
 }
 // f32.const: 0x43 followed by 4 raw little-endian IEEE-754 bytes (`f32Bytes`).
 export function fbF32Const(text: string) {
-  wU8(67) // 0x43 f32.const
+  wU8(OP_F32_CONST) // 0x43 f32.const
   wBytes(f32Bytes(text))
   0
 }
 // f32.convert_i32_s: 0xb2 — widen a signed i32 on the stack to f32. (Slice 5.)
 export function fbF32ConvertI32S() {
-  wU8(178) // 0xb2 f32.convert_i32_s
+  wU8(OP_F32_CONVERT_I32_S) // 0xb2 f32.convert_i32_s
   0
 }
 // f64.convert_i64_s: 0xb9 — convert a signed i64 to f64. (Slice 5.)
 export function fbF64ConvertI64S() {
-  wU8(185) // 0xb9 f64.convert_i64_s
+  wU8(OP_F64_CONVERT_I64_S) // 0xb9 f64.convert_i64_s
   0
 }
 // f64.promote_f32: 0xbb — promote an f32 on the stack to f64 (lossless). (Slice 5.)
 export function fbF64PromoteF32() {
-  wU8(187) // 0xbb f64.promote_f32
+  wU8(OP_F64_PROMOTE_F32) // 0xbb f64.promote_f32
   0
 }
 // if: 0x04 <blocktype>. `blockType` is a single byte (0x40 void, or a valtype byte).
 export function fbIf(blockType: i32) {
-  wU8(4) // 0x04 if
+  wU8(OP_IF) // 0x04 if
   wU8(blockType)
   0
 }
 export function fbElse() {
-  wU8(5) // 0x05 else
+  wU8(OP_ELSE) // 0x05 else
   0
 }
 // block / loop: 0x02/0x03 <blocktype> (single byte, as `fbIf`).
 export function fbBlock(blockType: i32) {
-  wU8(2) // 0x02 block
+  wU8(OP_BLOCK) // 0x02 block
   wU8(blockType)
   0
 }
 export function fbLoop(blockType: i32) {
-  wU8(3) // 0x03 loop
+  wU8(OP_LOOP) // 0x03 loop
   wU8(blockType)
   0
 }
 // br / br_if: 0x0c/0x0d <depth-uleb>.
 export function fbBr(depth: i32) {
-  wU8(12) // 0x0c br
+  wU8(OP_BR) // 0x0c br
   wULEB(depth)
   0
 }
 export function fbBrIf(depth: i32) {
-  wU8(13) // 0x0d br_if
+  wU8(OP_BR_IF) // 0x0d br_if
   wULEB(depth)
   0
 }
 export function fbEnd() {
-  wU8(11) // 0x0b end
+  wU8(OP_END) // 0x0b end
   0
 }
 export function fbDrop() {
-  wU8(26) // 0x1a drop
+  wU8(OP_DROP) // 0x1a drop
   0
 }
 export function fbUnreachable() {
-  wU8(0) // 0x00 unreachable
+  wU8(OP_UNREACHABLE) // 0x00 unreachable
   0
 }
 export function fbReturn() {
-  wU8(15) // 0x0f return
+  wU8(OP_RETURN) // 0x0f return
   0
 }
 // call: 0x10 <funcidx-uleb>.
 export function fbCall(fnIdx: i32) {
-  wU8(16) // 0x10 call
+  wU8(OP_CALL) // 0x10 call
   wULEB(fnIdx)
   0
 }
 // i32.eqz: 0x45 (used for `!a` and the while-condition inversion).
 export function fbI32Eqz() {
-  wU8(69) // 0x45 i32.eqz
+  wU8(OP_I32_EQZ) // 0x45 i32.eqz
   0
 }
 // One i32 arithmetic / comparison opcode (the `binOpcode` set: 0x6a add, 0x6b sub,
@@ -344,16 +412,16 @@ export function fbI32Bin(op: i32) {
 // i32.store: 0x36 <align-exp> <offset> — fixed align=4 bytes (exponent 2), offset 0,
 // matching the host's `__store_i32__` builtin body (`m.i32.store(0, 4, addr, v)`).
 export function fbI32Store() {
-  wU8(54) // 0x36 i32.store
-  wU8(2)  // align exponent (4-byte alignment)
-  wU8(0)  // offset 0
+  wU8(OP_I32_STORE) // 0x36 i32.store
+  wU8(2)            // align exponent (4-byte alignment)
+  wU8(0)            // offset 0
   0
 }
 // i32.load: 0x28 <align-exp> <offset> — the `__load_i32__` twin of `fbI32Store`.
 export function fbI32Load() {
-  wU8(40) // 0x28 i32.load
-  wU8(2)  // align exponent (4-byte alignment)
-  wU8(0)  // offset 0
+  wU8(OP_I32_LOAD) // 0x28 i32.load
+  wU8(2)           // align exponent (4-byte alignment)
+  wU8(0)           // offset 0
   0
 }
 // ── opcode-method STUBS for the later families (Phases C–F) ───────────────────
@@ -363,73 +431,73 @@ export function fbI32Load() {
 // family's sites emit, so converting those sites in C–F is a pure call-site swap.
 // GC struct ops (Phase C):
 export function fbStructNew(heapIdx: i32) {
-  wU8(251) // 0xfb GC prefix
-  wU8(0)   // struct.new
+  wU8(GC_PREFIX) // 0xfb GC prefix
+  wU8(GC_STRUCT_NEW) // struct.new
   wULEB(heapIdx)
   0
 }
 export function fbStructGet(heapIdx: i32, field: i32) {
-  wU8(251) // 0xfb GC prefix
-  wU8(2)   // struct.get
+  wU8(GC_PREFIX) // 0xfb GC prefix
+  wU8(GC_STRUCT_GET) // struct.get
   wULEB(heapIdx)
   wULEB(field)
   0
 }
 export function fbStructSet(heapIdx: i32, field: i32) {
-  wU8(251) // 0xfb GC prefix
-  wU8(5)   // struct.set
+  wU8(GC_PREFIX) // 0xfb GC prefix
+  wU8(GC_STRUCT_SET) // struct.set
   wULEB(heapIdx)
   wULEB(field)
   0
 }
 // GC array ops (Phase D):
 export function fbArrayNew(heapIdx: i32) {
-  wU8(251) // 0xfb GC prefix
-  wU8(6)   // array.new
+  wU8(GC_PREFIX) // 0xfb GC prefix
+  wU8(GC_ARRAY_NEW) // array.new
   wULEB(heapIdx)
   0
 }
 export function fbArrayNewDefault(heapIdx: i32) {
-  wU8(251) // 0xfb GC prefix
-  wU8(7)   // array.new_default
+  wU8(GC_PREFIX) // 0xfb GC prefix
+  wU8(GC_ARRAY_NEW_DEFAULT) // array.new_default
   wULEB(heapIdx)
   0
 }
 export function fbArrayNewFixed(heapIdx: i32, n: i32) {
-  wU8(251) // 0xfb GC prefix
-  wU8(8)   // array.new_fixed
+  wU8(GC_PREFIX) // 0xfb GC prefix
+  wU8(GC_ARRAY_NEW_FIXED) // array.new_fixed
   wULEB(heapIdx)
   wULEB(n)
   0
 }
 export function fbArrayGet(heapIdx: i32) {
-  wU8(251) // 0xfb GC prefix
-  wU8(11)  // 0x0b array.get
+  wU8(GC_PREFIX) // 0xfb GC prefix
+  wU8(GC_ARRAY_GET) // 0x0b array.get
   wULEB(heapIdx)
   0
 }
 export function fbArraySet(heapIdx: i32) {
-  wU8(251) // 0xfb GC prefix
-  wU8(14)  // 0x0e array.set
+  wU8(GC_PREFIX) // 0xfb GC prefix
+  wU8(GC_ARRAY_SET) // 0x0e array.set
   wULEB(heapIdx)
   0
 }
 export function fbArrayLen() {
-  wU8(251) // 0xfb GC prefix
-  wU8(15)  // 0x0f array.len
+  wU8(GC_PREFIX) // 0xfb GC prefix
+  wU8(GC_ARRAY_LEN) // 0x0f array.len
   0
 }
 export function fbArrayCopy(destHeapIdx: i32, srcHeapIdx: i32) {
-  wU8(251)           // 0xfb GC prefix
-  wU8(17)            // 0x11 array.copy
+  wU8(GC_PREFIX)     // 0xfb GC prefix
+  wU8(GC_ARRAY_COPY) // 0x11 array.copy
   wULEB(destHeapIdx) // dest array type index
   wULEB(srcHeapIdx)  // src array type index
   0
 }
 // GC ref ops (Phases C/D/F):
 export function fbRefCast(heapIdx: i32) {
-  wU8(251) // 0xfb GC prefix
-  wU8(22)  // 0x16 ref.cast (non-null)
+  wU8(GC_PREFIX) // 0xfb GC prefix
+  wU8(GC_REF_CAST) // 0x16 ref.cast (non-null)
   wULEB(heapIdx)
   0
 }
@@ -437,40 +505,40 @@ export function fbRefCast(heapIdx: i32) {
 // `ref.func <funcidx>` (0xd2) — a typed funcref to function `funcidx`. The target must
 // be declared referenceable (the declarative elem segment, section 9).
 export function fbRefFunc(funcIdx: i32) {
-  wU8(210) // 0xd2 ref.func
+  wU8(OP_REF_FUNC) // 0xd2 ref.func
   wULEB(funcIdx)
   0
 }
 // `call_ref <typeidx>` (0x14) — call through a typed funcref popped off the stack,
 // after the env + args. `typeidx` is the `$fnsig` env-leading functype.
 export function fbCallRef(typeIdx: i32) {
-  wU8(20) // 0x14 call_ref
+  wU8(OP_CALL_REF) // 0x14 call_ref
   wULEB(typeIdx)
   0
 }
 // `ref.null struct` (0xd0 0x6b) — the null env for a non-capturing function value.
 export function fbRefNullStruct() {
-  wU8(208) // 0xd0 ref.null
-  wU8(107) // structref abstract heaptype (0x6b)
+  wU8(OP_REF_NULL) // 0xd0 ref.null
+  wU8(HT_STRUCT) // structref abstract heaptype (0x6b)
   0
 }
 // `ref.null none` (0xd0 0x71) — the bottom null of the `any` hierarchy, the
 // payload slot of a boxed union's `null` tag (the slot is `anyref`; the tag says
 // it is never read).
 export function fbRefNullNone() {
-  wU8(208) // 0xd0 ref.null
-  wU8(113) // none abstract heaptype (0x71)
+  wU8(OP_REF_NULL) // 0xd0 ref.null
+  wU8(HT_NONE) // none abstract heaptype (0x71)
   0
 }
 // `ref.null <heaptype>` (0xd0 <s33>) — a typed null (a missing map value, etc.).
 export function fbRefNull(heapIdx: i32) {
-  wU8(208) // 0xd0 ref.null
+  wU8(OP_REF_NULL) // 0xd0 ref.null
   wSLEB(heapIdx)
   0
 }
 // `ref.as_non_null` (0xd4) — recover the non-null ref a nullable slot holds.
 export function fbRefAsNonNull() {
-  wU8(212) // 0xd4 ref.as_non_null
+  wU8(OP_REF_AS_NON_NULL) // 0xd4 ref.as_non_null
   0
 }
 // Record an unsupported-shape failure: keep the first message and drop any bytes
@@ -656,31 +724,31 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
 // One (1, i32) run — `0x7f`.
 export function fbI32Run() {
   wU8(1)
-  wU8(127) // 0x7f i32
+  wU8(VT_I32) // 0x7f i32
   0
 }
 // One (1, f64) run — `0x7c`.
 export function fbF64Run() {
   wU8(1)
-  wU8(124) // 0x7c f64
+  wU8(VT_F64) // 0x7c f64
   0
 }
 // One (1, i64) run — `0x7e`.
 export function fbI64Run() {
   wU8(1)
-  wU8(126) // 0x7e i64
+  wU8(VT_I64) // 0x7e i64
   0
 }
 // One (1, f32) run — `0x7d`.
 export function fbF32Run() {
   wU8(1)
-  wU8(125) // 0x7d f32
+  wU8(VT_F32) // 0x7d f32
   0
 }
 // One (1, (ref ht)) run — non-null `0x64 <uleb heapIdx>`.
 export function fbRefRun(heapIdx: i32) {
   wU8(1)
-  wU8(100) // 0x64 (ref ht) — non-null ref
+  wU8(RT_REF) // 0x64 (ref ht) — non-null ref
   wSLEB(heapIdx)
   0
 }
@@ -771,7 +839,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   // (ref $fa64TypeIdx), pushF64RecvRef (ref $fl64TypeIdx).
   if fnUsesF64Push {
     wU8(1)
-    wU8(124) // 0x7c f64
+    wU8(VT_F64) // 0x7c f64
     fbI32Run()
     fbRefRun(fa64TypeIdx)
     fbRefRun(fl64TypeIdx)
@@ -780,7 +848,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   // (ref $ia64TypeIdx), pushI64RecvRef (ref $il64TypeIdx).
   if fnUsesI64Push {
     wU8(1)
-    wU8(126) // 0x7e i64
+    wU8(VT_I64) // 0x7e i64
     fbI32Run()
     fbRefRun(ia64TypeIdx)
     fbRefRun(il64TypeIdx)
@@ -789,7 +857,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   // (ref $fa32TypeIdx), pushF32RecvRef (ref $fl32TypeIdx).
   if fnUsesF32Push {
     wU8(1)
-    wU8(125) // 0x7d f32
+    wU8(VT_F32) // 0x7d f32
     fbI32Run()
     fbRefRun(fa32TypeIdx)
     fbRefRun(fl32TypeIdx)
@@ -957,7 +1025,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
 // One (1, (ref null ht)) run — nullable `0x63 <uleb heapIdx>`.
 export function fbRefNullRun(heapIdx: i32) {
   wU8(1)
-  wU8(99) // 0x63 (ref null ht) — nullable ref
+  wU8(RT_REF_NULL) // 0x63 (ref null ht) — nullable ref
   wSLEB(heapIdx)
   0
 }
@@ -968,7 +1036,7 @@ export function fbRefNullRun(heapIdx: i32) {
 // string-list). A scalar global (kind 0) never reaches here — it zero-inits with
 // `i32.const 0`.
 export function fbRefNullForKind(kind: VKind, structIdx: i32) {
-  wU8(208) // 0xd0 ref.null
+  wU8(OP_REF_NULL) // 0xd0 ref.null
   // Same unresolved-slot guard as `fbValtype`: fail loudly, never read a table OOB.
   if kind == "struct" || kind == "reflist" || kind == "nulstruct" {
     if (
@@ -1022,54 +1090,54 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
       ((kind == "struct" || kind == "nulstruct") && structIdx >= sHeapIdx.length) ||
       (kind == "reflist" && structIdx >= rlWrapIdx.length)
     ) {
-      wU8(127)
+      wU8(VT_I32)
       return emitFail("emitProgram: ref valtype with no interned shape")
     }
   }
   if kind == "struct" || kind == "nulstruct" {
-    wU8(99) // 0x63 (ref null ht)
+    wU8(RT_REF_NULL) // 0x63 (ref null ht)
     wSLEB(sHeapIdx[structIdx])
   } else if kind == "list" {
-    wU8(99)
+    wU8(RT_REF_NULL)
     wSLEB(lTypeIdx)
   } else if kind == "str" {
-    wU8(99)
+    wU8(RT_REF_NULL)
     wSLEB(aTypeIdx)
   } else if kind == "union" {
-    wU8(99)
+    wU8(RT_REF_NULL)
     wSLEB(uBoxIdx)
   } else if kind == "reflist" {
-    wU8(99)
+    wU8(RT_REF_NULL)
     wSLEB(rlWrapIdx[structIdx]) // THIS ref-list slot's wrapper struct heap-type index
   } else if kind == "map" {
-    wU8(99)
+    wU8(RT_REF_NULL)
     wSLEB(mapTypeIdxOf(structIdx)) // mono map, or THIS mv slot's map struct
   } else if kind == "strlist" {
-    wU8(99)
+    wU8(RT_REF_NULL)
     wSLEB(mkListIdx)
   } else if kind == "i64" {
-    wU8(126) // 0x7e i64 (scalar, never a nullable ref)
+    wU8(VT_I64) // 0x7e i64 (scalar, never a nullable ref)
   } else if kind == "f64" {
-    wU8(124) // 0x7c f64 (scalar, never a nullable ref)
+    wU8(VT_F64) // 0x7c f64 (scalar, never a nullable ref)
   } else if kind == "f64list" {
-    wU8(99)
+    wU8(RT_REF_NULL)
     wSLEB(fl64TypeIdx) // the f64-list wrapper struct heap-type index (Slice 4)
   } else if kind == "f32" {
-    wU8(125) // 0x7d f32 (scalar, never a nullable ref — Slice 5)
+    wU8(VT_F32) // 0x7d f32 (scalar, never a nullable ref — Slice 5)
   } else if kind == "closure" {
-    wU8(99) // 0x63 (ref null) — nullable closure ref (lambdas)
+    wU8(RT_REF_NULL) // 0x63 (ref null) — nullable closure ref (lambdas)
     wSLEB(cloStructIdx)
   } else if kind == "nulclosure" {
-    wU8(99) // 0x63 (ref null) — `((i32) => i32) | null` (already nullable)
+    wU8(RT_REF_NULL) // 0x63 (ref null) — `((i32) => i32) | null` (already nullable)
     wSLEB(cloStructIdx)
   } else if kind == "nullist" {
-    wU8(99) // 0x63 (ref null) — `i32[] | null` (already nullable)
+    wU8(RT_REF_NULL) // 0x63 (ref null) — `i32[] | null` (already nullable)
     wSLEB(lTypeIdx)
   } else if kind == "nulstr" {
-    wU8(99) // 0x63 (ref null) — `string | null`: the nullable raw-array ref
+    wU8(RT_REF_NULL) // 0x63 (ref null) — `string | null`: the nullable raw-array ref
     wSLEB(aTypeIdx)
   } else {
-    wU8(127) // 0x7f i32
+    wU8(VT_I32) // 0x7f i32
   }
   0
 }
@@ -1111,7 +1179,7 @@ export function fbValtype(kind: VKind, structIdx: i32) {
       ((kind == "reflist" || kind == "nulreflist") &&
         structIdx >= rlWrapIdx.length)
     ) {
-      wU8(127)
+      wU8(VT_I32)
       return emitFail("emitProgram: ref valtype with no interned shape")
     }
   }
@@ -1121,86 +1189,86 @@ export function fbValtype(kind: VKind, structIdx: i32) {
   // VKind member without an arm is a compile error, not a silent i32 fallthrough.
   match kind {
     "i32" => {
-      wU8(127)
+      wU8(VT_I32)
     }
     "nulbool" => {
-      wU8(127)
+      wU8(VT_I32)
     }
     "i64" => {
-      wU8(126)
+      wU8(VT_I64)
     }
     "f64" => {
-      wU8(124)
+      wU8(VT_F64)
     }
     "f32" => {
-      wU8(125)
+      wU8(VT_F32)
     }
     "struct" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(sHeapIdx[structIdx])
     }
     "list" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(lTypeIdx)
     }
     "str" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(aTypeIdx)
     }
     "union" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(uBoxIdx)
     }
     "reflist" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(rlWrapIdx[structIdx])
     }
     "map" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(mapTypeIdxOf(structIdx))
     }
     "strlist" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(mkListIdx)
     }
     "variant" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(uVarIdx + structIdx)
     }
     "f64list" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(fl64TypeIdx)
     }
     "i64list" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(il64TypeIdx)
     }
     "f32list" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(fl32TypeIdx)
     }
     "closure" => {
-      wU8(100)
+      wU8(RT_REF)
       wSLEB(cloStructIdx)
     }
     "nulstruct" => {
-      wU8(99)
+      wU8(RT_REF_NULL)
       wSLEB(sHeapIdx[structIdx])
     }
     "nullist" => {
-      wU8(99)
+      wU8(RT_REF_NULL)
       wSLEB(lTypeIdx)
     }
     "nulstr" => {
-      wU8(99)
+      wU8(RT_REF_NULL)
       wSLEB(aTypeIdx)
     }
     "nulreflist" => {
-      wU8(99)
+      wU8(RT_REF_NULL)
       wSLEB(rlWrapIdx[structIdx])
     }
     "nulclosure" => {
-      wU8(99)
+      wU8(RT_REF_NULL)
       wSLEB(cloStructIdx)
     }
   }
