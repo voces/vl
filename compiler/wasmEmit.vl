@@ -10371,408 +10371,20 @@ function emitStrCharCode(body: i32[], callIx: i32, fnIx: i32) {
 function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
   const e = P.nodes[exprIx]
-  if e is NumLit {
-    // A FLOAT literal (lexeme carries a `.`) in f32 CONTEXT (`pendingF32` — an `: f32`
-    // binding/param/return) lowers as `f32.const`. Checked before the default f64 path
-    // so a float literal re-encodes at single precision in an f32 slot (never demoted
-    // from f64). Outside f32 context a `.` literal stays f64, byte-identical. (Slice 5.)
-    if numTextIsFloat(e.numText) {
-      if pendingF32 {
-        fbF32Const(e.numText)
-        return 0
-      }
-      fbF64Const(e.numText)
-      return 0
-    }
-    // An integer literal in f32 CONTEXT lowers DIRECTLY as `f32.const` (re-encoded at
-    // single precision — `f32Bytes` parses an integer lexeme as `mant/10^0`), so it is a
-    // valid constexpr in a const-global init (a convert op is not). (Slice 5.)
-    if pendingF32 {
-      fbF32Const(e.numText)
-      return 0
-    }
-    // An integer literal in f64 CONTEXT (const-global init) lowers directly as
-    // `f64.const`, keeping the global init a constexpr (`const b: f64 = 5`). (Slice 5.)
-    if pendingF64 {
-      fbF64Const(e.numText)
-      return 0
-    }
-    // An integer literal in i64 CONTEXT (`pendingI64`) lowers as `i64.const` over the
-    // 64-bit (hi, lo) pair parsed from its lexeme — so a value past the i32 range
-    // (`9000000000`, `0xFFFFFFFFFF`) survives. Otherwise the default i32 path is
-    // byte-identical to before (bare integer literals stay i32 — Slice 1 invariant).
-    if pendingI64 {
-      const pr = parseI64Pair(e.numText)
-      fbI64Const(pr[0], pr[1])
-      return 0
-    }
-    // An integer literal past the i32 range is TYPED i64 by the checker (the host's
-    // `defaultIntegerType` magnitude rule), so it lowers as `i64.const` even with no
-    // i64 context — the old default `i32.const` silently wrapped (0xDEAD_BEEF).
-    if !numLexFitsI32(e.numText) {
-      const pr = parseI64Pair(e.numText)
-      fbI64Const(pr[0], pr[1])
-      return 0
-    }
-    fbI32Const(parseI32(e.numText))
-    return 0
-  }
+  if e is NumLit { return emitNumLitNode(body, e, exprIx, fnIx) }
   if e is BoolLit {
     // `boolean` rides in an i32: true=1, false=0 (already decoded into `boolVal`).
     fbI32Const(e.boolVal)
     return 0
   }
-  if e is CharLit {
-    // A char literal IS its single Unicode code point as an i32. `charText` is the RAW
-    // lexeme (quotes kept, escapes unresolved), so decode it the SAME way string
-    // literals decode (`decodeStr` strips the quotes + resolves escapes); a well-formed
-    // char yields exactly one code point.
-    const cps = decodeStr(strToCps(e.charText))
-    if cps.length != 1 {
-      return emitFail(
-        "emitProgram: char literal must denote exactly one code point",
-      )
-    }
-    fbI32Const(cps[0])
-    return 0
-  }
-  if e is Ident {
-    // A CAPTURED variable (a free var of a capturing lifted function): read it from the
-    // env struct threaded as the leading param (local 0) —
-    // `struct.get $env <fieldIdx> (ref.cast (local.get 0) (ref $env))`. Checked FIRST so
-    // a capture shadows nothing (it is neither a param/local of this function nor a
-    // global). Only fires inside a capturing lifted function.
-    if emitCapturedRead(body, e.identName, fnIx) == 1 { return 0 }
-    // A VALUE-union binding narrowed to ONE scalar atom reads UNBOXED: push the
-    // box, recover the `anyref` payload, cast it, and (for a scalar atom) read
-    // the value-box field — `if u is i32 { print(u) }` yields the raw i32.
-    const vAtom = narrowedValueAtomOf(e.identName)
-    if vAtom != "" {
-      if unionNameOfIdent(e.identName, fnIx) != "" {
-        return emitValueUnionUnboxRead(body, e.identName, vAtom, fnIx)
-      }
-    }
-    // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
-    const idx = localIndexOf(fnIx, e.identName)
-    if idx < 0 {
-      // A bare top-level/lifted function NAME in value position constructs a function
-      // value (closure fat-pointer). `fnIndexOf` IS the `fnStmts` position (the function
-      // index), exactly what `emitClosureValue` expects — passed directly (a top-level
-      // function never captures, so its env is null; a captured lifted function reads its
-      // captures live in the enclosing frame `fnIx`). Scope-aware so a nested function
-      // sharing a name with another maker's nested function resolves to THIS frame's.
-      let fe = fnIndexOfInScope(e.identName, fnIx)
-      if fe >= 0 { return emitClosureValue(body, fe, fnIx) }
-      // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
-      const gIdx = globalIndexOf(e.identName)
-      if gIdx >= 0 {
-        fbGlobalGet(gIdx)
-        const gck0 = globalCellKind(globalLetOf(e.identName))
-        // A `string | null` cell (kind 16) is ALWAYS a NULLABLE ref — const OR not (a
-        // const can still be initialized to `null`). So a VALUE read recovers the non-null
-        // string ref (`ref.as_non_null`, 0xd4 — the checker narrowed it non-null at every
-        // value read) INDEPENDENTLY of const-ness; the `!= null` null-check keeps the raw
-        // nullable ref (`pendingRawNullRead`). Without this a top-level `string | null`
-        // value read (`x ?? d`, `!= null`) left a `(ref null $array)` where a `(ref $array)`
-        // is expected (a function-scope local already recovers via the local path below).
-        if gck0 == "nulstr" {
-          if !pendingRawNullRead {
-            wU8(212) // 0xd4 ref.as_non_null
-          }
-          return 0
-        }
-        // A NON-const ref global rides in a NULLABLE cell (zero-initialized with
-        // `ref.null`, set by the start function before any code runs). Recover the
-        // non-null value type the rest of codegen expects with `ref.as_non_null`
-        // (0xd4); the cell is always initialized first, so the cast never traps. A
-        // const global keeps its non-null cell, so no cast (goldens unchanged). A
-        // scalar (i32/boolean) global needs no cast either.
-        if globalNameIsNonConst(e.identName) {
-          // A NULLABLE-struct cell (kind 9) legitimately holds null — its reads
-          // stay nullable (the member-access path recovers non-null at use); a
-          // nullable-LIST cell (kind 15) and a nullable-CLOSURE cell (kind 19)
-          // likewise (the `!= null` check reads raw, the narrowed call recovers
-          // non-null at the call site). A SCALAR numeric cell (i32 0 / i64 10 /
-          // f64 11 / f32 13 / boolean) is not a ref, so it takes no
-          // `ref.as_non_null` either. (Slice 5 adds f32/i64/f64 scalars.)
-          if (
-            gck0 != "i32" &&
-            gck0 != "nulstruct" &&
-            gck0 != "i64" &&
-            gck0 != "f64" &&
-            gck0 != "f32" &&
-            gck0 != "nullist" &&
-            gck0 != "nulclosure"
-          ) {
-            wU8(212) // 0xd4 ref.as_non_null
-          }
-        }
-        return 0
-      }
-      return emitFail(
-        "emitProgram: identifier is not a parameter, local, or global",
-      )
-    }
-    fbLocalGet(idx)
-    // A `string | null` (kind 16) param/local read AS A VALUE recovers the non-null
-    // string ref — the checker narrowed it non-null at every such read. The `!= null`
-    // null-check sets `pendingRawNullRead` to keep the raw nullable ref for `ref.is_null`.
-    // A NULLABLE-string TARGET (`pendingNulString` — `const t: string | null = s`, `t = s`,
-    // a `string | null` arg/return) likewise keeps the raw nullable ref: recovering it would
-    // `ref.as_non_null` a value that may legitimately be null and trap. Mirrors the kind-15
-    // list read, which never eagerly recovers.
-    if !pendingRawNullRead && !pendingNulString {
-      if paramNulString(fnIx, e.identName) || declaredNulString(e.identName) {
-        fbRefAsNonNull() // 0xd4
-      }
-    }
-    return 0
-  }
+  if e is CharLit { return emitCharLitNode(body, e, exprIx, fnIx) }
+  if e is Ident { return emitIdentNode(body, e, exprIx, fnIx) }
   if e is Paren { return emitExpr(body, e.parInner, fnIx) }
-  if e is Unary {
-    // Logical not `!a`: a boolean rides in an i32 (0/1), so `i32.eqz` (0x45) maps
-    // 0→1 and any non-zero→0 — exactly `a == 0`. Push the operand, then eqz.
-    if e.unOp == "!" {
-      if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
-      fbI32Eqz() // 0x45 i32.eqz
-      return 0
-    }
-    // Postfix `x++` / `x--` in EXPRESSION position yields the OLD value. `unArg` is
-    // the increment assignment `x = x ± 1`, which as an expression yields the NEW
-    // value (store-then-re-read); undo the step (new ∓ 1) to recover the pre-
-    // increment value. (In STATEMENT position `emitStmt` unwraps to the bare
-    // assignment, so this adjustment is only paid when the value is actually used.)
-    if e.unOp == "p+" || e.unOp == "p-" {
-      if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
-      fbI32Const(1)
-      if e.unOp == "p+" {
-        fbI32Bin(107) // 0x6b i32.sub: (x+1) - 1
-      } else {
-        fbI32Bin(106) // 0x6a i32.add: (x-1) + 1
-      }
-      return 0
-    }
-    // Bitwise NOT `~x` == `x ^ -1` (flip every bit). The all-ones mask is an i64
-    // `-1` when the operand is i64, an i32 `-1` otherwise; the XOR opcode follows
-    // suit. (Slice 2 — the i64 path; the i32 path is the same shape over i32 ops.)
-    if e.unOp == "~" {
-      if exprIsI64(e.unArg, fnIx) {
-        if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
-        fbI64Const(-1, -1) // i64 -1 (all ones)
-        fbI32Bin(133)      // 0x85 i64.xor
-        return 0
-      }
-      if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
-      fbI32Const(-1) // i32 -1 (all ones)
-      fbI32Bin(115)  // 0x73 i32.xor
-      return 0
-    }
-    // Integer negation: `-x` == `0 - x`, so push 0, the operand, then sub. For an
-    // i64 operand the zero and the subtract are i64 (Slice 2).
-    if e.unOp != "-" {
-      return emitFail("emitProgram: unsupported unary operator")
-    }
-    // f32 negation uses the dedicated `f32.neg` (0x8c) — flips the sign bit. Checked
-    // before f64 (an f32 expr is never `exprIsF64`, but this keeps the float cases
-    // grouped and explicit). (Slice 5.)
-    if exprIsF32(e.unArg, fnIx) {
-      if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
-      wU8(140) // 0x8c f32.neg
-      return 0
-    }
-    // f64 negation uses the dedicated `f64.neg` (0x9a) — flips the sign bit (Slice 3).
-    if exprIsF64(e.unArg, fnIx) {
-      if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
-      wU8(154) // 0x9a f64.neg
-      return 0
-    }
-    // A negated magnitude-2^31 INTEGER literal (`-2147483648`) is i32 (the host
-    // folds the sign in before defaulting), but the bare operand lexeme is one
-    // past I32_MAX, so the `exprIsI64(e.unArg)` branch below would lower it as
-    // an i64 negation. Lower it directly as a WRAPPING i32 negation instead:
-    // `parseI32` folds 0x80000000 to I32_MIN, and `0 - I32_MIN` wraps back to
-    // I32_MIN — the right value. Checked BEFORE the operand i64 classification.
-    const negInner = unwrapParen(e.unArg)
-    const negNode = P.nodes[negInner]
-    if negNode is NumLit {
-      if !numTextIsFloat(negNode.numText) {
-        if numLexIs2Pow31(negNode.numText) {
-          fbI32Const(0)
-          fbI32Const(parseI32(negNode.numText))
-          fbI32Bin(107) // 0x6b i32.sub
-          return 0
-        }
-      }
-    }
-    if exprIsI64(e.unArg, fnIx) {
-      fbI64Const(0, 0) // i64 0
-      if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
-      fbI32Bin(125)    // 0x7d i64.sub
-      return 0
-    }
-    fbI32Const(0)
-    if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
-    fbI32Bin(107) // 0x6b i32.sub
-    return 0
-  }
-  if e is Call {
-    // G6: `s.slice(start, end)` over a string receiver is an intrinsic — a new
-    // `(array i32)` over the clamped half-open range. Other member-calls in value
-    // position are out of scope (the only member-call STATEMENT is `.push`).
-    if exprIsStrSlice(exprIx, fnIx) { return emitStrSlice(body, exprIx, fnIx) }
-    // An array `xs.slice(start, end?)` over a LIST receiver — a same-element-kind
-    // sublist (`emitArrSlice`). Checked before the string slice's siblings so it does
-    // not fall into a struct member-call path.
-    if callIsArrSlice(exprIx, fnIx) { return emitArrSlice(body, exprIx, fnIx) }
-    // `s.indexOf(sub)` / `s.includes(sub)` / `s.charCodeAt(i)` over a string
-    // receiver are intrinsics too (A7), each yielding an i32.
-    if exprIsStrIndexOf(exprIx, fnIx) {
-      return emitStrIndexOf(body, exprIx, fnIx)
-    }
-    if exprIsStrCharCode(exprIx, fnIx) {
-      return emitStrCharCode(body, exprIx, fnIx)
-    }
-    // G8: the `Map()` builtin constructs an empty string-keyed map. `Set()` is a
-    // boolean-valued string map over the SAME 7-field struct, so it emits the
-    // IDENTICAL empty-map construction.
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      if callee.identName == "Map" || callee.identName == "Set" {
-        return emitMapNew(body)
-      }
-    }
-    // G8: a map `m.has(k)` member-call yields a 0/1 i32 (linear scan).
-    if callee is Member {
-      if callee.memProp == "has" {
-        if exprMap(callee.memObj, fnIx) {
-          if e.callArgs.length != 1 {
-            return emitFail("emitProgram: .has takes exactly one argument")
-          }
-          return emitMapHas(body, callee.memObj, e.callArgs[0], fnIx)
-        }
-      }
-      // G8: a map `m.delete(k)` member-call in VALUE position yields a 0/1 boolean
-      // (whether a key was removed). The same lowering serves the bare-statement form.
-      if callee.memProp == "delete" {
-        if exprMap(callee.memObj, fnIx) {
-          if e.callArgs.length != 1 {
-            return emitFail("emitProgram: .delete takes exactly one argument")
-          }
-          return emitMapDelete(body, callee.memObj, e.callArgs[0], fnIx)
-        }
-      }
-      // `m.keys()` over a map yields a fresh string list of its LIVE keys.
-      if callee.memProp == "keys" {
-        if exprMap(callee.memObj, fnIx) {
-          if e.callArgs.length != 0 {
-            return emitFail("emitProgram: .keys() takes no arguments")
-          }
-          return emitMapKeys(body, callee.memObj, fnIx)
-        }
-      }
-      // `m.values()` over a mono i32 map yields a fresh i32 list of its LIVE values.
-      if callee.memProp == "values" {
-        if exprMap(callee.memObj, fnIx) {
-          if e.callArgs.length != 0 {
-            return emitFail("emitProgram: .values() takes no arguments")
-          }
-          return emitMapValues(body, callee.memObj, fnIx)
-        }
-      }
-      // `xs.pop()` removes + returns the last list element (any list kind).
-      if callee.memProp == "pop" { return emitPop(body, exprIx, fnIx) }
-      // `xs.get(i)` over a STRUCT-element ref list: the checked nullable read —
-      // in-bounds yields the (still nullable) element slot, out-of-bounds `ref.null $S`.
-      if callee.memProp == "get" {
-        if structListPopGetElem(exprIx, fnIx) >= 0 {
-          return emitListGet(body, exprIx, fnIx)
-        }
-      }
-      // `xs.map(f)` / `xs.filter(p)` over a LIST receiver lower to the inline
-      // closure-calling loop (Slices 3–4). A non-list receiver falls through (a
-      // function-valued struct FIELD named `map` is a `call_ref` member call).
-      if callee.memProp == "map" || callee.memProp == "filter" {
-        if mfRecvKindOf(callee.memObj, fnIx) != null {
-          return emitMapFilter(body, exprIx, fnIx)
-        }
-      }
-    }
-    return emitCall(body, exprIx, fnIx)
-  }
+  if e is Unary { return emitUnaryNode(body, e, exprIx, fnIx) }
+  if e is Call { return emitCallNode(body, e, exprIx, fnIx) }
   if e is IsExpr { return emitIs(body, exprIx, fnIx) }
-  if e is NullLit {
-    // `null` in a `boolean|null` NICHE context is the scalar sentinel 2 (an i32,
-    // not a ref) — checked before the struct seed.
-    if pendingNulBool {
-      fbI32Const(2)
-      return 0
-    }
-    // `null` in a `K | null` NICHE context is the i32 sentinel `-1` (atom ids are ≥ 0) — an i32,
-    // not a ref. Checked before the struct seed (a litunion atom is not a struct).
-    if pendingNulLitUnion {
-      fbI32Const(-1)
-      return 0
-    }
-    // `null` in a `string | null` (kind 16) context — `ref.null $aTypeIdx` (the raw
-    // string array made nullable). Checked before the struct seed (a string is not a
-    // struct). Seeded at the param-arg / assignment / return boundaries.
-    if pendingNulString {
-      wU8(208) // 0xd0 ref.null
-      wSLEB(aTypeIdx)
-      return 0
-    }
-    // `null` in a nullable FUNCTION-VALUE (`fn | null`, kind 19) context — `ref.null
-    // $cloStruct` (the closure fat-pointer made nullable). Checked before the struct seed.
-    if pendingNulClosure {
-      wU8(208) // 0xd0 ref.null
-      wSLEB(cloStructIdx)
-      return 0
-    }
-    // `null` as a NULLABLE-i32-LIST element of a `(i32[] | null)[]` literal — `ref.null $lTypeIdx`.
-    if pendingNulList {
-      wU8(208) // 0xd0 ref.null
-      wSLEB(lTypeIdx)
-      return 0
-    }
-    // `null` as a NULLABLE-REF-ARRAY element of a `(<ref-array> | null)[]` literal — `ref.null
-    // $innerWrapper` (the seeded inner ref-list wrapper heap type). Reset the seed after consuming it so it
-    // never persists past this `null` (a stray non-(-1) value would mis-type a later bare `null`).
-    if pendingNulRefHeap >= 0 {
-      const nrh = pendingNulRefHeap
-      pendingNulRefHeap = -1
-      wU8(208) // 0xd0 ref.null
-      wSLEB(nrh)
-      return 0
-    }
-    // A bare `null` VALUE: its target struct comes from the binding/argument/
-    // return seed (`pendingStructIdx`) — `ref.null $S`. With no seed it cannot
-    // be typed here; fail loudly.
-    if pendingStructIdx >= 0 {
-      if pendingStructIdx < sHeapIdx.length {
-        wU8(208) // 0xd0 ref.null
-        wSLEB(sHeapIdx[pendingStructIdx])
-        return 0
-      }
-    }
-    return emitFail("emitProgram: bare null needs a struct-typed context")
-  }
-  if e is ObjLit {
-    // A CONTEXT that expects a CONCRETE variant (`const c: Cat = { … }`, a `Cat[]`
-    // element) constructs the BARE variant struct `(ref $(uVarIdx + vi))` — NOT a union
-    // box. `pendingVariantIdx` is the variant; consume it so a nested literal doesn't
-    // inherit the hint.
-    if pendingVariantIdx >= 0 {
-      const pvi = pendingVariantIdx
-      pendingVariantIdx = -1
-      return emitVariantStruct(body, exprIx, pvi, fnIx)
-    }
-    // A literal whose field-set matches a STANDALONE struct constructs that struct
-    // directly (even alongside a union — `ast.vl`'s `Tok`/`Diag` coexist with `Node`).
-    // Otherwise, in a union program, it is a union variant: box it `{tag, value}`.
-    if structIndexOfObj(exprIx) >= 0 { return emitObj(body, exprIx, fnIx) }
-    if uDeclared { return emitUnionBox(body, exprIx, fnIx) }
-    return emitObj(body, exprIx, fnIx)
-  }
+  if e is NullLit { return emitNullLitNode(body, e, exprIx, fnIx) }
+  if e is ObjLit { return emitObjLitNode(body, e, exprIx, fnIx) }
   if e is StrLit {
     // A literal-union MEMBER in atom context (`pendingLitUnion`) lowers as its interned i32 id.
     if pendingLitUnion == 1 {
@@ -10790,998 +10402,8 @@ function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     }
     return emitIndex(body, exprIx, fnIx)
   }
-  if e is Member {
-    // `a.length` on an array OR string receiver is `array.len` (a string is the SAME
-    // `array i32` of code points, so `.length` is the code-point count); every other
-    // member access is a struct field read. `length` over a non-array/non-string
-    // receiver falls through to the struct path (which fails loudly if no such field),
-    // matching the slice's scope.
-    if e.memProp == "length" {
-      if (
-        exprArray(e.memObj, fnIx) ||
-        exprString(e.memObj, fnIx) ||
-        exprRefArray(e.memObj, fnIx) ||
-        exprStringArray(e.memObj, fnIx) ||
-        exprF64Array(e.memObj, fnIx) ||
-        exprI64Array(e.memObj, fnIx) ||
-        exprF32Array(e.memObj, fnIx)
-      ) {
-        return emitArrLen(body, exprIx, fnIx)
-      }
-      // G8: `m.length` on a MAP is the LIVE entry count — struct field 5 (`size`),
-      // maintained by set/delete (NOT `count`, which includes tombstones).
-      if exprMap(e.memObj, fnIx) {
-        if emitExpr(body, e.memObj, fnIx) < 0 { return -1 }
-        let lsl = mapShapeOfExpr(e.memObj, fnIx)
-        if lsl == -2 || lsl == -3 { lsl = -1 }
-        fbStructGet(mapTypeIdxOf(lsl), 5) // 0xfb 0x02: field 5 `size`
-        return 0
-      }
-    }
-    // `m.size` on a MAP / Set is the same live-entry count as `m.length` (field 5) — the
-    // JS Map/Set name. (`.size` is not valid on arrays/strings; they fall through.)
-    if e.memProp == "size" {
-      if exprMap(e.memObj, fnIx) {
-        if emitExpr(body, e.memObj, fnIx) < 0 { return -1 }
-        let ssl = mapShapeOfExpr(e.memObj, fnIx)
-        if ssl == -2 || ssl == -3 { ssl = -1 }
-        fbStructGet(mapTypeIdxOf(ssl), 5) // 0xfb 0x02: field 5 `size`
-        return 0
-      }
-    }
-    return emitMem(body, exprIx, fnIx)
-  }
-  if e is BinExpr {
-    // Assignment (`=`) is a STATEMENT, not a value expression in this slice: it has
-    // no result on the stack (it `local.set`s). It is lowered by `emitAssign` from
-    // `emitStmt`, so seeing it as an operand here is an unsupported nested-assignment.
-    if e.binOp == "=" {
-      // Assignment is an EXPRESSION yielding its right-hand side (DECISIONS:
-      // assignment-as-expression): `b = (a = 5)`, `while (a = a - 1) > 0`, and a
-      // trailing `count = count + 1` returning the new value. Lowered as
-      // STORE-then-RE-READ — `emitAssign` stores, then the target re-reads through
-      // the normal Ident path (which carries the non-const-ref re-cast logic).
-      // Ident targets only (a local or module global); an Index/Member assignment
-      // in VALUE position is out of this slice.
-      const tgt = P.nodes[e.binLeft]
-      if tgt is Ident {
-        if emitAssign(body, exprIx, fnIx) < 0 { return -1 }
-        return emitExpr(body, e.binLeft, fnIx)
-      }
-      return emitFail(
-        "emitProgram: only an identifier assignment is a value expression",
-      )
-    }
-    // G8: nullish-coalescing `m[k] ?? d` — a FUSED map get-with-default: scan `m` for
-    // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
-    // every scope map through `?? -1`. The LHS must be a map index in this slice.
-    if e.binOp == "??" {
-      // Unwrap a parenthesized LHS so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
-      // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
-      // unwrapped place every structural branch below dispatches on and emits; the generic niche
-      // paths re-evaluate `e.binLeft` directly (and `emitExpr` / `exprNullableString` already peel
-      // parens), so they are unaffected.
-      const lhsIx = unwrapParen(e.binLeft)
-      const lhs = P.nodes[lhsIx]
-      // `a ?? b ?? d` parses LEFT-associative (`(a ?? b) ?? d`); `??` is
-      // associative, so RE-ASSOCIATE to `a ?? (b ?? d)` — the inner coalesce
-      // becomes the outer's default and each LHS is again a plain place the
-      // single-step lowerings below handle (host: same chained-coalesce value).
-      if lhs is BinExpr {
-        if lhs.binOp == "??" {
-          return emitExpr(
-            body,
-            mkBinary(
-              "??",
-              lhs.binLeft,
-              mkBinary("??", lhs.binRight, e.binRight, -1),
-              -1,
-            ),
-            fnIx,
-          )
-        }
-      }
-      if lhs is Index {
-        if exprMap(lhs.idxArr, fnIx) {
-          return emitMapGetOr(body, lhs.idxArr, lhs.idxIndex, e.binRight, fnIx)
-        }
-      }
-      // The METHOD form `recv.get(k) ?? d` over a map receiver is the SAME fused
-      // get-with-default as `recv[k] ?? d` — lower it identically. (The LIST `.get`
-      // at ~6890 is a distinct struct-element get and is NOT a map; `exprMap` gates
-      // this to map receivers only.)
-      if lhs is Call {
-        const lcallee = P.nodes[lhs.callFn]
-        if lcallee is Member {
-          if lcallee.memProp == "get" {
-            if exprMap(lcallee.memObj, fnIx) {
-              if lhs.callArgs.length != 1 {
-                return emitFail(
-                  "emitProgram: map .get takes exactly one argument",
-                )
-              }
-              return emitMapGetOr(
-                body,
-                lcallee.memObj,
-                lhs.callArgs[0],
-                e.binRight,
-                fnIx,
-              )
-            }
-            // `xs.get(i) ?? d` over a SCALAR-element list (i32 / boolean / f64) is
-            // the FUSED checked read-with-default (B6) — one bounds compare.
-            if (
-              exprF64Array(lcallee.memObj, fnIx) ||
-              exprArray(lcallee.memObj, fnIx)
-            ) {
-              return emitListGetOr(body, lhsIx, e.binRight, fnIx)
-            }
-          }
-          // `xs.pop() ?? d` over a SCALAR-element list is the FUSED checked
-          // pop-with-default: `len != 0` selects decrement-and-read or `d`.
-          if lcallee.memProp == "pop" {
-            if exprArray(lcallee.memObj, fnIx) {
-              if (
-                !exprRefArray(lcallee.memObj, fnIx) &&
-                !exprStringArray(lcallee.memObj, fnIx) &&
-                !exprF64Array(lcallee.memObj, fnIx)
-              ) {
-                return emitPopOr(body, lhsIx, e.binRight, fnIx)
-              }
-            }
-          }
-        }
-      }
-      // These generic niche `??` paths RE-EVALUATE `e.binLeft` (twice for the bool select,
-      // and in the else arm for the string), so they apply only to an effect-free place —
-      // an ident binding or a struct FIELD. A CALL lhs (`f() ?? d`) cannot be re-evaluated
-      // and is handled by the stash-based call path in the `lhs is Call` block below.
-      let lhsReEval = true
-      if lhs is Call { lhsReEval = false }
-      // `<e> ?? d` over a `boolean | null` NICHE (an ident binding OR a `boolean | null`
-      // struct FIELD, code 21) — the i32 cell holds 0/1 or the sentinel 2 (`null`); select
-      // the default on 2. Generic in `e.binLeft`, so it covers a member field read too.
-      if lhsReEval && exprNulBool(e.binLeft, fnIx) {
-        if emitExpr(body, e.binRight, fnIx) < 0 {
-          return -1 // d   [a]
-        }
-        if emitExpr(body, e.binLeft, fnIx) < 0 {
-          return -1 // x   [b]
-        }
-        if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-        fbI32Const(2)
-        fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)      [cond]
-        wU8(27)      // 0x1b select → d if null else x
-        return 0
-      }
-      // `<e> ?? d` over a `string | null` NICHE (an ident binding OR a `string | null`
-      // struct FIELD, code 20): the nullable raw-array ref — a VALUE-typed `if` on
-      // `ref.is_null` (the else arm reads `e` as a non-null value). `pendingRawNullRead`
-      // keeps the test read raw. Generic in `e.binLeft`, so it covers a member field too.
-      if lhsReEval && exprNullableString(e.binLeft, fnIx) {
-        const savedRawN = pendingRawNullRead
-        pendingRawNullRead = true
-        const treN = emitExpr(body, e.binLeft, fnIx) // the raw nullable ref
-        pendingRawNullRead = savedRawN
-        if treN < 0 { return -1 }
-        wU8(209)                                     // 0xd1 ref.is_null → 1 if null
-        wU8(4)                                       // 0x04 if
-        wU8(100)                                     // blocktype: (ref $aTypeIdx) — non-null string result
-        wSLEB(aTypeIdx)
-        ctrlEnter()
-        if emitExpr(body, e.binRight, fnIx) < 0 {
-          return -1 // d (a string)
-        }
-        fbElse() // 0x05 else
-        if emitExpr(body, e.binLeft, fnIx) < 0 {
-          return -1 // e recovered non-null
-        }
-        fbEnd() // 0x0b end
-        ctrlLeave()
-        return 0
-      }
-      // `x ?? d` over a binding seeded by a BOOLEAN-list `.pop()`: the i32 cell
-      // holds 0/1 or the niche sentinel 2 (`null`) — select the default on 2.
-      if lhs is Ident {
-        if identNullableBoolPop(lhs.identName, fnIx) {
-          if emitExpr(body, e.binRight, fnIx) < 0 {
-            return -1 // d   [a]
-          }
-          if emitExpr(body, e.binLeft, fnIx) < 0 {
-            return -1 // x   [b]
-          }
-          if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-          fbI32Const(2)
-          fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)      [cond]
-          wU8(27)      // 0x1b select → d if null else x
-          return 0
-        }
-        // `x ?? d` over a BOXED value union containing `null` (`i32 | null`):
-        // the value-level dual of the null guard — read the box tag; the null
-        // tag selects the default, anything else unboxes the SINGLE remaining
-        // scalar atom (the host's `??` result is the non-null base type). The
-        // receiver is a pure name, re-read in the non-null arm. Scalar atoms
-        // only (the value-typed `if` blocktype carries the unboxed rep).
-        const cunm = unionNameOfIdent(lhs.identName, fnIx)
-        if cunm != "" {
-          if isValueUnionName(cunm) && unionHasAtom(cunm, "null") {
-            const crest = removeAtomFrom(
-              currentNarrowSetOf(lhs.identName, fnIx),
-              "null",
-            )
-            const cak = valueAtomKind(crest)
-            if cak >= 0 && cak != 6 {
-              if cak == 2 {
-                return emitFail(
-                  "emitProgram: `??` over a string|null union is not supported yet",
-                )
-              }
-              if emitExpr(body, e.binLeft, fnIx) < 0 {
-                return -1 // the box
-              }
-              fbStructGet(uBoxIdx, 0) // field 0: tag
-              fbI32Const(scalarTagOf("null"))
-              fbI32Bin(70)            // 0x46 i32.eq → null?
-              let cbt = 127           // 0x7f i32 (boolean shares it)
-              if cak == 3 {
-                cbt = 126 // 0x7e i64
-              }
-              if cak == 4 {
-                cbt = 124 // 0x7c f64
-              }
-              if cak == 5 {
-                cbt = 125 // 0x7d f32
-              }
-              fbIf(cbt) // 0x04 if, value blocktype
-              ctrlEnter()
-              if cak == 3 {
-                if emitExprAsI64(body, e.binRight, fnIx) < 0 { return -1 }
-              } else if cak == 4 {
-                if emitExprAsF64(body, e.binRight, fnIx) < 0 { return -1 }
-              } else if cak == 5 {
-                if emitExprAsF32(body, e.binRight, fnIx) < 0 { return -1 }
-              } else {
-                if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-              }
-              fbElse() // 0x05 else — present → unbox
-              if emitValueUnionUnboxRead(body, lhs.identName, crest, fnIx) < 0 {
-                return -1
-              }
-              fbEnd() // 0x0b end
-              ctrlLeave()
-              return 0
-            }
-          }
-        }
-      }
-      // `f(x) ?? d` over a CALL returning a value union with `null` (`i32 | null`,
-      // …): a call CANNOT be re-evaluated (effects + cost) the way the ident/field
-      // paths above re-read their place, so STASH the box once in the coalesce-call
-      // slot, then test the tag and unbox off that single evaluation. Scalar atoms
-      // only (the value-typed `if` blocktype); a `string | null` call result is
-      // deferred like the ident/field forms. One slot is sound across nesting: each
-      // `??` sets-tests-uses within its own evaluation, and the null arm never reads
-      // the box again (so a nested call-LHS `??` in the default may reuse the slot).
-      if lhs is Call {
-        const kunm = unionNameOfExpr(e.binLeft, fnIx)
-        if kunm != "" {
-          if isValueUnionName(kunm) && unionHasAtom(kunm, "null") {
-            const krest = removeAtomFrom(kunm, "null")
-            const kak = valueAtomKind(krest)
-            if kak >= 0 && kak != 6 {
-              if kak == 2 {
-                return emitFail(
-                  "emitProgram: `??` over a string|null call result is not supported yet",
-                )
-              }
-              if emitExpr(body, e.binLeft, fnIx) < 0 {
-                return -1 // the box, evaluated ONCE
-              }
-              fbLocalSet(coalesceCallSlot)
-              fbLocalGet(coalesceCallSlot)
-              fbStructGet(uBoxIdx, 0) // field 0: tag
-              fbI32Const(scalarTagOf("null"))
-              fbI32Bin(70)            // 0x46 i32.eq → null?
-              let kbt = 127           // 0x7f i32 (boolean shares it)
-              if kak == 3 {
-                kbt = 126 // 0x7e i64
-              }
-              if kak == 4 {
-                kbt = 124 // 0x7c f64
-              }
-              if kak == 5 {
-                kbt = 125 // 0x7d f32
-              }
-              fbIf(kbt) // 0x04 if, value blocktype
-              ctrlEnter()
-              if kak == 3 {
-                if emitExprAsI64(body, e.binRight, fnIx) < 0 { return -1 }
-              } else if kak == 4 {
-                if emitExprAsF64(body, e.binRight, fnIx) < 0 { return -1 }
-              } else if kak == 5 {
-                if emitExprAsF32(body, e.binRight, fnIx) < 0 { return -1 }
-              } else {
-                if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-              }
-              fbElse()                // 0x05 else — present → unbox the stash
-              fbLocalGet(coalesceCallSlot)
-              fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-              const kvb = vbHeapIdxOfAtom(krest)
-              if kvb < 0 {
-                return emitFail("emitProgram: union call atom has no value box")
-              }
-              fbRefCast(kvb)
-              fbStructGet(kvb, 0) // the scalar payload
-              fbEnd()             // 0x0b end
-              ctrlLeave()
-              return 0
-            }
-          }
-        }
-        // `f() ?? d` over a CALL returning `boolean | null` (the i32 niche): a call
-        // cannot be re-read, so STASH the single evaluation in the bool slot, then select
-        // `d` on the sentinel 2 — the call analogue of the `boolean | null` ident path.
-        if exprNulBool(e.binLeft, fnIx) {
-          if emitExpr(body, e.binLeft, fnIx) < 0 {
-            return -1 // the niche i32, evaluated ONCE
-          }
-          fbLocalSet(coalesceCallBoolSlot)
-          if emitExpr(body, e.binRight, fnIx) < 0 {
-            return -1 // d                                       [val1]
-          }
-          fbLocalGet(coalesceCallBoolSlot) // x                  [val2]
-          fbLocalGet(coalesceCallBoolSlot)
-          fbI32Const(2)
-          fbI32Bin(70)                     // 0x46 i32.eq → x == 2 (null)            [cond]
-          wU8(27)                          // 0x1b select → d if null else x
-          return 0
-        }
-        // `f() ?? d` over a CALL returning `string | null` (kind 16): STASH the nullable
-        // ref once (raw, via `pendingRawNullRead`), then a value-typed `if` on
-        // `ref.is_null` selects `d` or the recovered non-null string — the call analogue
-        // of the `string | null` ident path.
-        if exprNullableString(e.binLeft, fnIx) {
-          const savedRaw = pendingRawNullRead
-          pendingRawNullRead = true
-          const tre = emitExpr(body, e.binLeft, fnIx) // the raw nullable ref, ONCE
-          pendingRawNullRead = savedRaw
-          if tre < 0 { return -1 }
-          fbLocalSet(coalesceCallStrSlot)
-          fbLocalGet(coalesceCallStrSlot)
-          wU8(209)                                    // 0xd1 ref.is_null → 1 if null
-          wU8(4)                                      // 0x04 if
-          wU8(100)                                    // blocktype: (ref $aTypeIdx) — non-null string result
-          wSLEB(aTypeIdx)
-          ctrlEnter()
-          if emitExpr(body, e.binRight, fnIx) < 0 {
-            return -1 // d (a string)
-          }
-          fbElse()         // 0x05 else
-          fbLocalGet(coalesceCallStrSlot)
-          fbRefAsNonNull() // 0xd4 recover the non-null string the slot holds
-          fbEnd()          // 0x0b end
-          ctrlLeave()
-          return 0
-        }
-      }
-      // `o.v ?? d` over a VALUE-UNION struct field (`v: i32 | null`, code 16):
-      // the field-read dual of the boxed-union name path above — read the box
-      // off the field, test its tag for `null`, and select the default or the
-      // unboxed single remaining scalar atom. The receiver re-reads in the
-      // non-null arm (a name/field chain, like the nullable-struct `?.` path).
-      if lhs is Member {
-        const msi = structIndexOfExpr(lhs.memObj, fnIx)
-        if msi >= 0 {
-          let mfi = sFieldIndex(msi, lhs.memProp)
-          if mfi >= 0 {
-            if sFieldTypeAt(msi, mfi) == 16 {
-              const munm = sFieldElemNameAt(msi, mfi)
-              if isValueUnionName(munm) && unionHasAtom(munm, "null") {
-                const mrest = removeAtomFrom(munm, "null")
-                const mak = valueAtomKind(mrest)
-                if mak >= 0 && mak != 6 {
-                  if mak == 2 {
-                    return emitFail(
-                      "emitProgram: `??` over a string|null union field is not supported yet",
-                    )
-                  }
-                  if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
-                  fbStructGet(sHeapIdx[msi], mfi) // the union box
-                  fbStructGet(uBoxIdx, 0)         // field 0: tag
-                  fbI32Const(scalarTagOf("null"))
-                  fbI32Bin(70)                    // 0x46 i32.eq → null?
-                  let mbt = 127                   // 0x7f i32 (boolean shares it)
-                  if mak == 3 {
-                    mbt = 126 // 0x7e i64
-                  }
-                  if mak == 4 {
-                    mbt = 124 // 0x7c f64
-                  }
-                  if mak == 5 {
-                    mbt = 125 // 0x7d f32
-                  }
-                  fbIf(mbt) // 0x04 if, value blocktype
-                  ctrlEnter()
-                  if mak == 3 {
-                    if emitExprAsI64(body, e.binRight, fnIx) < 0 { return -1 }
-                  } else if mak == 4 {
-                    if emitExprAsF64(body, e.binRight, fnIx) < 0 { return -1 }
-                  } else if mak == 5 {
-                    if emitExprAsF32(body, e.binRight, fnIx) < 0 { return -1 }
-                  } else {
-                    if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-                  }
-                  fbElse()                // 0x05 else — present → unbox
-                  if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
-                  fbStructGet(sHeapIdx[msi], mfi)
-                  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-                  const mvb = vbHeapIdxOfAtom(mrest)
-                  if mvb < 0 {
-                    return emitFail(
-                      "emitProgram: union field atom has no value box",
-                    )
-                  }
-                  fbRefCast(mvb)
-                  fbStructGet(mvb, 0) // the scalar payload
-                  fbEnd()             // 0x0b end
-                  ctrlLeave()
-                  return 0
-                }
-              }
-            }
-          }
-        }
-      }
-      // The null-safe field read `m[k]?.f ?? d` over a STRUCT-VALUED map is the
-      // FUSED form: probe; on a hit read the field off the (non-null) value
-      // struct, else push the default. A live entry's value slot is never null,
-      // so the `?.` null test coincides with the probe's hit test — no
-      // intermediate nullable materializes. Scalar (i32/boolean) fields only (a
-      // value-typed `if` blocktype carries them; ref fields would need an
-      // interned blocktype functype).
-      if lhs is OptMember {
-        const omInner = P.nodes[lhs.omObj]
-        if omInner is Index {
-          if exprMap(omInner.idxArr, fnIx) {
-            const omSl = mapShapeOfExpr(omInner.idxArr, fnIx)
-            if omSl >= 0 {
-              if mvValKind[omSl] != 1 {
-                return emitFail("emitProgram: `?.` needs a struct-valued map")
-              }
-              const omSi = mvValStructIdx[omSl]
-              const omFi = sFieldIndex(omSi, lhs.omProp)
-              if omFi < 0 {
-                return emitFail(
-                  "emitProgram: `?.` field is not on the map's value struct",
-                )
-              }
-              if sFieldTypeAt(omSi, omFi) != 0 {
-                return emitFail(
-                  "emitProgram: `?.` over a map read supports only i32/boolean fields",
-                )
-              }
-              if emitMapPrep(body, omInner.idxArr, omInner.idxIndex, fnIx) < 0 {
-                return -1
-              }
-              pushMapScr(body, 5)               // entry
-              fbIf(127)                         // if (entry != 0 → hit), i32 blocktype
-              pushMapVals(body)
-              fbStructGet(cmValsWrap(), 0)      // vals backing
-              pushMapScr(body, 5)               // entry
-              fbI32Const(1)
-              fbI32Bin(107)                     // i32.sub (entry - 1)
-              fbArrayGet(cmValsBack())          // (ref null <value struct>)
-              fbRefAsNonNull()                  // a live entry's value is non-null
-              fbStructGet(sHeapIdx[omSi], omFi) // .f
-              fbElse()                          // else
-              if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-              fbEnd()                           // end (if)
-              return 0
-            }
-          }
-        }
-        // `p?.f ?? d` over a NULLABLE-STRUCT receiver (`p: S | null`, OR a nullable-struct
-        // FIELD read `n.next`): null → the default, else the field read off the (non-null)
-        // struct. The receiver is a re-readable PLACE (a name, or a member chain of names —
-        // an effect-free `struct.get`), re-read in the non-null branch. Scalar fields only
-        // (the value-typed `if` blocktype carries them).
-        if optRecvReReadable(lhs.omObj) {
-          if exprNullableStruct(lhs.omObj, fnIx) {
-            const nsi = structIndexOfExpr(lhs.omObj, fnIx)
-            if nsi >= 0 {
-              const nfi = sFieldIndex(nsi, lhs.omProp)
-              if nfi < 0 {
-                return emitFail("emitProgram: `?.` field is not on the struct")
-              }
-              if sFieldTypeAt(nsi, nfi) != 0 {
-                return emitFail(
-                  "emitProgram: `?.` over a nullable struct supports only i32/boolean fields",
-                )
-              }
-              if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
-              wU8(209)  // 0xd1 ref.is_null
-              fbIf(127) // 0x04 if, 0x7f i32 blocktype — null → default
-              ctrlEnter()
-              if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-              fbElse()  // 0x05 else — present → the field
-              if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
-              fbStructGet(sHeapIdx[nsi], nfi)
-              fbEnd()   // 0x0b end
-              ctrlLeave()
-              return 0
-            }
-          }
-        }
-        // A NESTED optional chain `o?.inner?.v ?? d` (niche nullable links): any
-        // null link selects the default; otherwise the chain reads through
-        // non-null refs (each `S|null` link recovers `ref.as_non_null`). The
-        // links are effect-free places, re-evaluated in the value arm. Scalar
-        // (i32/boolean) leaf fields only (the value-typed `if` blocktype).
-        const omDeep = P.nodes[unwrapParen(lhs.omObj)]
-        if omDeep is OptMember {
-          const dsi = optChainStructIdxOf(lhs.omObj, fnIx)
-          if dsi >= 0 {
-            const dfi = sFieldIndex(dsi, lhs.omProp)
-            if dfi >= 0 {
-              if sFieldTypeAt(dsi, dfi) != 0 {
-                return emitFail(
-                  "emitProgram: `?.` chain supports only i32/boolean leaf fields",
-                )
-              }
-              if emitOptChainIsNull(body, lhs.omObj, fnIx) < 0 { return -1 }
-              fbIf(127) // 0x04 if, i32 result — a null link → default
-              ctrlEnter()
-              if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-              fbElse()  // 0x05 else — every link present → the leaf
-              if emitOptChainValue(body, lhs.omObj, fnIx) < 0 { return -1 }
-              fbStructGet(sHeapIdx[dsi], dfi)
-              fbEnd()   // 0x0b end
-              ctrlLeave()
-              return 0
-            }
-          }
-        }
-        // `xs.get(i)?.f ?? d` over a STRUCT-element ref list is the FUSED form:
-        // one bounds compare; in range read the field off the (non-null) element,
-        // else the default. A live in-range element is never null (pushes store
-        // non-null), so the `?.` null test coincides with the bounds test —
-        // mirroring the map `m[k]?.f ?? d` path above. Scalar fields only.
-        const omGet = P.nodes[unwrapParen(lhs.omObj)]
-        if omGet is Call {
-          const gCallee = P.nodes[omGet.callFn]
-          if gCallee is Member {
-            if gCallee.memProp == "get" {
-              const gSi = structListPopGetElem(unwrapParen(lhs.omObj), fnIx)
-              if gSi >= 0 && rlUsed {
-                if omGet.callArgs.length != 1 {
-                  return emitFail(
-                    "emitProgram: .get takes exactly one argument",
-                  )
-                }
-                const gFi = sFieldIndex(gSi, lhs.omProp)
-                if gFi < 0 {
-                  return emitFail(
-                    "emitProgram: `?.` field is not on the list's element struct",
-                  )
-                }
-                if sFieldTypeAt(gSi, gFi) != 0 {
-                  return emitFail(
-                    "emitProgram: `?.` over a list .get supports only i32/boolean fields",
-                  )
-                }
-                const gRecvN = P.nodes[unwrapParen(gCallee.memObj)]
-                let gOkRecv = false
-                if gRecvN is Ident { gOkRecv = true }
-                if !gOkRecv {
-                  return emitFail(
-                    "emitProgram: .get receiver must be a named list binding",
-                  )
-                }
-                const gIdxN = P.nodes[unwrapParen(omGet.callArgs[0])]
-                let gOkIdx = false
-                if gIdxN is NumLit { gOkIdx = true }
-                if gIdxN is Ident { gOkIdx = true }
-                if !gOkIdx {
-                  return emitFail(
-                    "emitProgram: .get index must be a literal or a name",
-                  )
-                }
-                const gSlot = refListSlotOfExpr(gCallee.memObj, fnIx)
-                // cond: idx u< len
-                if emitExpr(body, omGet.callArgs[0], fnIx) < 0 { return -1 }
-                if emitExpr(body, gCallee.memObj, fnIx) < 0 { return -1 }
-                fbStructGet(rlWrapIdx[gSlot], 1) // field 1: len
-                fbI32Bin(73)                     // 0x49 i32.lt_u
-                fbIf(127)                        // 0x04 if, 0x7f i32 result blocktype
-                ctrlEnter()
-                if emitExpr(body, gCallee.memObj, fnIx) < 0 { return -1 }
-                fbStructGet(rlWrapIdx[gSlot], 0) // field 0: backing
-                if emitExpr(body, omGet.callArgs[0], fnIx) < 0 { return -1 }
-                fbArrayGet(rlBackIdx[gSlot])     // → (ref null $elem)
-                fbRefAsNonNull()                 // a live in-range element is non-null
-                fbStructGet(sHeapIdx[gSi], gFi)  // .f
-                fbElse()                         // 0x05 else
-                if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-                fbEnd()                          // 0x0b end
-                ctrlLeave()
-                return 0
-              }
-            }
-          }
-        }
-      }
-      // GENERIC nullable-STRUCT `??`: a `S | null` value — an ident / param binding, a struct FIELD,
-      // OR a closure / factory CALL (`arr[i](x) ?? d`) — coalesced with a struct default. Evaluated
-      // ONCE: `br_on_non_null` keeps the non-null struct or falls through to the default, so it needs
-      // NEITHER a re-eval (the ident / field forms) NOR a per-struct stash slot (the call form) — one
-      // path for every source, unlike the `string | null` paths split into re-eval + stash. The
-      // closing piece of nullable-struct closures (#655/#656): `structIndexOfExpr` resolves the inner
-      // struct (incl. an indexed closure-array / factory call via the checker-type fallback) for the
-      // block's result type. (A `string | null` LHS is handled by its own paths above.)
-      if exprNullableStruct(e.binLeft, fnIx) {
-        const csi = structIndexOfExpr(e.binLeft, fnIx)
-        if csi >= 0 && csi < sHeapIdx.length {
-          wU8(2)   // 0x02 block
-          wU8(100) // blocktype: (ref $struct) — the non-null result
-          wSLEB(sHeapIdx[csi])
-          ctrlEnter()
-          if emitExpr(body, e.binLeft, fnIx) < 0 {
-            return -1 // the nullable struct ref, evaluated ONCE
-          }
-          wU8(214) // 0xd6 br_on_non_null
-          wULEB(0) //   non-null → branch to the block end with the (ref $struct)
-          // null path: emit the default, seeding an ObjLit default to this struct.
-          const savedPsi = pendingStructIdx
-          pendingStructIdx = csi
-          const dres = emitExpr(body, e.binRight, fnIx)
-          pendingStructIdx = savedPsi
-          if dres < 0 { return -1 }
-          wU8(11) // 0x0b end
-          ctrlLeave()
-          return 0
-        }
-      }
-      return emitFail("emitProgram: `??` is only supported on a map index get")
-    }
-    // Short-circuit logical operators lower to a VALUE-TYPED `if` (blocktype 0x7f),
-    // an `if` expression that leaves one i32 on the stack — both arms push an i32:
-    //   `a && b`  ≡  if (a) { b } else { 0 }   (skip b when a is false → 0)
-    //   `a || b`  ≡  if (a) { 1 } else { b }   (skip b when a is true  → 1)
-    // The condition `a` is evaluated first, then `if 0x04` with i32 result-type
-    // blocktype `0x7f`; the then-branch, `else 0x05`, the else-branch, then `end 0x0b`.
-    if e.binOp == "&&" || e.binOp == "||" {
-      if emitExpr(body, e.binLeft, fnIx) < 0 {
-        return -1 // condition `a`
-      }
-      fbIf(127) // 0x04 if, 0x7f i32 result-type blocktype (yields an i32)
-      if e.binOp == "&&" {
-        // then = b, else = 0
-        if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-        fbElse() // 0x05 else
-        fbI32Const(0)
-      } else {
-        // then = 1, else = b
-        fbI32Const(1)
-        fbElse() // 0x05 else
-        if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-      }
-      fbEnd() // 0x0b end
-      return 0
-    }
-    // Structural `==`/`!=` with a still-BOXED value-union operand (either side,
-    // or both — equality is symmetric). Checked BEFORE the string-eq routing (a
-    // union box compared against a string would otherwise misclassify as a bare
-    // string compare) and SKIPS `null` literals — the box-tag null compare below
-    // owns `v == null` (the host's `variantTag(info, null)` path).
-    if e.binOp == "==" || e.binOp == "!=" {
-      const uql = P.nodes[unwrapParen(e.binLeft)]
-      const uqr = P.nodes[unwrapParen(e.binRight)]
-      let uqNull = false
-      if uql is NullLit { uqNull = true }
-      if uqr is NullLit { uqNull = true }
-      const uqLit = exprIsLitAtom(e.binLeft, fnIx) ||
-        exprIsLitAtom(e.binRight, fnIx)
-      if !uqNull && !uqLit {
-        const uqL = exprUnion(e.binLeft, fnIx)
-        const uqR = exprUnion(e.binRight, fnIx)
-        if uqL && uqR {
-          return emitUnionUnionEq(
-            body,
-            e.binLeft,
-            e.binRight,
-            e.binOp == "!=",
-            fnIx,
-          )
-        }
-        if uqL {
-          return emitUnionConcreteEq(
-            body,
-            e.binLeft,
-            e.binRight,
-            e.binOp == "!=",
-            fnIx,
-          )
-        }
-        if uqR {
-          return emitUnionConcreteEq(
-            body,
-            e.binRight,
-            e.binLeft,
-            e.binOp == "!=",
-            fnIx,
-          )
-        }
-      }
-    }
-    // A literal-union ATOM compare (`k == "a"`, `k1 == k2`): both operands are i32 ids. Emit them as atoms
-    // (a member StrLit -> its id; a litunion var -> its i32 value) and i32-compare. BEFORE the string-eq
-    // path, which would otherwise treat the member literal as a string.
-    if e.binOp == "==" || e.binOp == "!=" {
-      // SKIP a `null` operand: `r == null` over a `K | null` niche is the `-1` sentinel compare (the
-      // nullable-struct block below owns it). A litunion atom never equals the `null` literal here, and
-      // lowering `null` with `pendingLitUnion` would mis-route it to a bare-null struct context.
-      let atomNull = false
-      if P.nodes[unwrapParen(e.binLeft)] is NullLit { atomNull = true }
-      if P.nodes[unwrapParen(e.binRight)] is NullLit { atomNull = true }
-      if !atomNull {
-        if exprIsLitAtom(e.binLeft, fnIx) || exprIsLitAtom(e.binRight, fnIx) {
-          const savedLU = pendingLitUnion
-          pendingLitUnion = 1
-          if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-          if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-          pendingLitUnion = savedLU
-          fbI32Bin(70) // 0x46 i32.eq
-          if e.binOp == "!=" {
-            fbI32Eqz() // 0x45 i32.eqz -> `!=`
-          }
-          return 0
-        }
-      }
-    }
-    // G6 string operators (a string is a `(array i32)` of code points): `+` is a NEW
-    // concatenated array; `==`/`!=` are ELEMENT-WISE value-equality, NOT ref identity
-    // — so they take their own inline lowering BEFORE the i32 `binOpcode` path (which
-    // would emit `i32.eq` = ref identity, the WRONG answer for strings). Only string-
-    // typed operands route here; i32/other-type `+`/`==`/`!=` are unchanged.
-    if exprIsStrConcat(exprIx, fnIx) {
-      return emitStrConcat(body, exprIx, fnIx)
-    }
-    if exprIsStrEq(exprIx, fnIx) { return emitStrEq(body, exprIx, fnIx) }
-    if exprIsStrOrder(exprIx, fnIx) { return emitStrOrder(body, exprIx, fnIx) }
-    // List `==`/`!=` (length + element value-compare, recursive through nested
-    // lists / string elements) and list `+` (concat) — collections-design
-    // §VL.4/§VL.6, the host's `listEqFn`/concat lowerings, inlined.
-    const lopK = listOpKindOfBin(exprIx, fnIx)
-    if lopK >= 0 {
-      if e.binOp == "+" {
-        if lopK != 0 {
-          return emitFail(
-            "emitProgram: list concat over this element kind is not supported",
-          )
-        }
-        return emitListConcatI(body, e.binLeft, e.binRight, fnIx)
-      }
-      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-      if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-      if lopK == 0 {
-        if emitListEqICore(body) < 0 { return -1 }
-      } else if lopK == 3 {
-        if emitListEqSCore(body) < 0 { return -1 }
-      } else {
-        const lslot = refListSlotOfExpr(e.binLeft, fnIx)
-        const lbase = leqRBaseOfSlot(lslot)
-        if lbase < 0 {
-          return emitFail("emitProgram: ref-list compare frame not reserved")
-        }
-        if emitListEqRCore(body, lslot, lbase) < 0 { return -1 }
-      }
-      if e.binOp == "!=" {
-        fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
-      }
-      return 0
-    }
-    // `p == null` / `p != null` over a NULLABLE struct ref: `ref.is_null`
-    // (inverted with `eqz` for `!=`) — never the i32 compare.
-    if e.binOp == "==" || e.binOp == "!=" {
-      const nlhs = P.nodes[e.binLeft]
-      const nrhs = P.nodes[e.binRight]
-      let nref = -1
-      if nrhs is NullLit { nref = e.binLeft }
-      if nlhs is NullLit { nref = e.binRight }
-      if nref >= 0 {
-        // `x == null` over a `boolean|null` NICHE value is a SENTINEL compare
-        // (`x == 2`) — the i32 never holds a ref. Checked before the struct path.
-        if exprNulBool(nref, fnIx) {
-          if emitExpr(body, nref, fnIx) < 0 { return -1 }
-          fbI32Const(2)
-          if e.binOp == "!=" {
-            fbI32Bin(71) // 0x47 i32.ne
-          } else {
-            fbI32Bin(70) // 0x46 i32.eq
-          }
-          return 0
-        }
-        // `x == null` over a `K | null` NICHE value is a SENTINEL compare against `-1`
-        // (the atom ids are ≥ 0) — the i32 never holds a ref. Checked before the struct path.
-        if exprNulLitUnion(nref, fnIx) {
-          if emitExpr(body, nref, fnIx) < 0 { return -1 }
-          fbI32Const(-1)
-          if e.binOp == "!=" {
-            fbI32Bin(71) // 0x47 i32.ne
-          } else {
-            fbI32Bin(70) // 0x46 i32.eq
-          }
-          return 0
-        }
-        // `<opt-chain> == null` / `!= null` (`o?.y != null`): any null LINK makes
-        // the chain's value null (the host's OptionalAccess folds null through),
-        // so the compare IS the chain's null test (inverted for `!=`).
-        const ncN = P.nodes[unwrapParen(nref)]
-        if ncN is OptMember {
-          if emitOptChainIsNull(body, nref, fnIx) < 0 { return -1 }
-          if e.binOp == "!=" {
-            fbI32Eqz() // 0x45 invert: the chain value is present
-          }
-          return 0
-        }
-        // `x == null` / `x != null` over a BOXED union (`i32 | null`,
-        // `A | B | null`): the box itself is never null — the null VARIANT rides
-        // in the TAG — so compare the box tag against the global null tag (the
-        // host's `variantTag(info, null)` path), never `ref.is_null`.
-        if exprUnion(nref, fnIx) {
-          if emitExpr(body, nref, fnIx) < 0 { return -1 }
-          fbStructGet(uBoxIdx, 0) // box field 0: tag
-          fbI32Const(scalarTagOf("null"))
-          if e.binOp == "!=" {
-            fbI32Bin(71) // 0x47 i32.ne
-          } else {
-            fbI32Bin(70) // 0x46 i32.eq
-          }
-          return 0
-        }
-        if exprNullableStruct(nref, fnIx) {
-          if emitExpr(body, nref, fnIx) < 0 { return -1 }
-          wU8(209) // 0xd1 ref.is_null
-          if e.binOp == "!=" {
-            fbI32Eqz() // invert: non-null
-          }
-          return 0
-        }
-        // `c == null` / `c != null` over a NULLABLE function value (`fn | null`, kind 19):
-        // the same `ref.is_null` lowering as the nullable struct.
-        if exprNulClosure(nref, fnIx) {
-          if emitExpr(body, nref, fnIx) < 0 { return -1 }
-          wU8(209) // 0xd1 ref.is_null
-          if e.binOp == "!=" {
-            fbI32Eqz() // invert: non-null
-          }
-          return 0
-        }
-        // `xs == null` / `xs != null` over a NULLABLE i32 list (`i32[] | null`,
-        // kind 15): the same `ref.is_null` lowering as the nullable struct.
-        if exprNullableList(nref, fnIx) {
-          if emitExpr(body, nref, fnIx) < 0 { return -1 }
-          wU8(209) // 0xd1 ref.is_null
-          if e.binOp == "!=" {
-            fbI32Eqz() // invert: non-null
-          }
-          return 0
-        }
-        // `t == null` / `t != null` over a NULLABLE ref array (`i32[][] | null`, kind 18) — same
-        // `ref.is_null` lowering (the `(ref null $innerWrapper)` niche).
-        if exprNullableRefArray(nref, fnIx) {
-          if emitExpr(body, nref, fnIx) < 0 { return -1 }
-          wU8(209) // 0xd1 ref.is_null
-          if e.binOp == "!=" {
-            fbI32Eqz() // invert: non-null
-          }
-          return 0
-        }
-        // `s == null` / `s != null` over a `string | null` (kind 16): the nullable raw
-        // array ref — same `ref.is_null` lowering. Checked before the structural string
-        // equality below (which would element-compare a non-null string). The receiver
-        // is read RAW (`pendingRawNullRead`) so the kind-16 ident keeps its nullable ref
-        // instead of being recovered to non-null (which would make `ref.is_null` const 0).
-        if exprNullableString(nref, fnIx) {
-          const savedRaw = pendingRawNullRead
-          pendingRawNullRead = true
-          const re = emitExpr(body, nref, fnIx)
-          pendingRawNullRead = savedRaw
-          if re < 0 { return -1 }
-          wU8(209) // 0xd1 ref.is_null
-          if e.binOp == "!=" {
-            fbI32Eqz() // invert: non-null
-          }
-          return 0
-        }
-      }
-      // STRUCTURAL struct equality: same-shape operands compare field-wise
-      // (`emitStructEq` — scalars native, strings via the eq loop, `i32[]` via a
-      // length+element loop, nested structs recursively, function-valued fields
-      // by identity via `emitCloEqCore`).
-      const eqLsi = structIndexOfExpr(e.binLeft, fnIx)
-      const eqRsi = structIndexOfExpr(e.binRight, fnIx)
-      if eqLsi >= 0 || eqRsi >= 0 {
-        if eqLsi >= 0 && eqLsi == eqRsi {
-          return emitStructEq(body, exprIx, fnIx)
-        }
-        return emitFail("emitProgram: struct equality is not supported yet")
-      }
-      // Function-value `==`/`!=`: IDENTITY — the same lifted function (the id
-      // field) AND the same captured env (`ref.eq`). Mirrors the host (same
-      // table index AND same env; null == null envs are equal).
-      if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
-        if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-        if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-        if emitCloEqCore(body) < 0 { return -1 }
-        if e.binOp == "!=" {
-          fbI32Eqz() // 0x45 i32.eqz — negate identity-equality
-        }
-        return 0
-      }
-    }
-    // Slice 5 — f32 operators. If EITHER operand is f32, emit the f32 instruction
-    // variant and coerce the other operand (an i32 or a float LITERAL) to f32 first
-    // (`emitExprAsF32`). Covers arithmetic (f32 result) AND comparisons (i32 bool
-    // result, COMPARE consumes two f32). Checked BEFORE f64 because a float literal is
-    // `exprIsF64` too — so `x + 4.0` with `x: f32` must route here, not to f64. Keyed on
-    // operand kind, so an i32-only program never enters it (i32 path stays byte-identical).
-    const lF32 = exprIsF32(e.binLeft, fnIx)
-    const rF32 = exprIsF32(e.binRight, fnIx)
-    // A GENUINE (non-literal) f64 operand makes the op f64 — the f32 side widens (`f32 + f64var`),
-    // so route to the f64 slice below instead of demoting the f64 here (which trapped). A float
-    // literal still adapts DOWN to the f32 operand, so `f32 + 1.0` stays on the f32 slice.
-    if (lF32 || rF32) && !binMixHardF64(e.binLeft, e.binRight, fnIx) {
-      const opcF32 = binOpcodeF32(e.binOp)
-      if opcF32 >= 0 {
-        if emitExprAsF32(body, e.binLeft, fnIx) < 0 { return -1 }
-        if emitExprAsF32(body, e.binRight, fnIx) < 0 { return -1 }
-        fbI32Bin(opcF32)
-        return 0
-      }
-    }
-    // Slice 3 — f64 operators. If EITHER operand is f64, emit the f64 instruction
-    // variant and widen the i32 operand (if any) to f64 first (`emitExprAsF64`). Covers
-    // arithmetic (f64 result) AND comparisons (i32 bool result, COMPARE consumes two
-    // f64). Checked BEFORE i64 since a float operand is never i64. Keyed on operand kind,
-    // so an i32-only program never enters it — the i32 path below is byte-identical.
-    const lF64 = exprIsF64(e.binLeft, fnIx)
-    const rF64 = exprIsF64(e.binRight, fnIx)
-    if lF64 || rF64 {
-      const opcF = binOpcodeF64(e.binOp)
-      if opcF >= 0 {
-        if emitExprAsF64(body, e.binLeft, fnIx) < 0 { return -1 }
-        if emitExprAsF64(body, e.binRight, fnIx) < 0 { return -1 }
-        fbI32Bin(opcF)
-        return 0
-      }
-    }
-    // Slice 2 — i64 operators. If EITHER operand is i64, emit the i64 instruction
-    // variant and widen the i32 operand (if any) to i64 first (`emitExprAsI64`). This
-    // covers arithmetic/bitwise/shift (i64 result) AND comparisons (i32 bool result,
-    // but the COMPARE consumes two i64). The whole branch is keyed on operand kind, so
-    // an i32-only program never enters it — the i32 path below is byte-identical.
-    const lI64 = exprIsI64(e.binLeft, fnIx)
-    const rI64 = exprIsI64(e.binRight, fnIx)
-    if lI64 || rI64 {
-      const opc64 = binOpcodeI64(e.binOp)
-      if opc64 >= 0 {
-        if emitExprAsI64(body, e.binLeft, fnIx) < 0 { return -1 }
-        if emitExprAsI64(body, e.binRight, fnIx) < 0 { return -1 }
-        fbI32Bin(opc64)
-        return 0
-      }
-    }
-    const opcode = binOpcode(e.binOp)
-    if opcode < 0 {
-      return emitFail("emitProgram: unsupported binary operator")
-    }
-    // Operands first (left then right), then the operator — wasm's stack order.
-    if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-    if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-    fbI32Bin(opcode)
-    return 0
-  }
+  if e is Member { return emitMemberNode(body, e, exprIx, fnIx) }
+  if e is BinExpr { return emitBinExprNode(body, e, exprIx, fnIx) }
   if e is FuncDecl {
     // An anonymous `function(...)` literal in value position (it was lifted to a
     // top-level function by `collectFns`, keeping its name). Construct its closure value.
@@ -29372,4 +27994,1403 @@ export function emitProgram(rootIx: i32) {
     return rc
   }
   emitFail("emitProgram: root node is not a Program")
+}
+
+// Extracted from `emitExpr`'s `NumLit` arm (C3: thin the dispatcher).
+function emitNumLitNode(body: i32[], e: NumLit, exprIx: i32, fnIx: i32) {
+  // A FLOAT literal (lexeme carries a `.`) in f32 CONTEXT (`pendingF32` — an `: f32`
+  // binding/param/return) lowers as `f32.const`. Checked before the default f64 path
+  // so a float literal re-encodes at single precision in an f32 slot (never demoted
+  // from f64). Outside f32 context a `.` literal stays f64, byte-identical. (Slice 5.)
+  if numTextIsFloat(e.numText) {
+    if pendingF32 {
+      fbF32Const(e.numText)
+      return 0
+    }
+    fbF64Const(e.numText)
+    return 0
+  }
+  // An integer literal in f32 CONTEXT lowers DIRECTLY as `f32.const` (re-encoded at
+  // single precision — `f32Bytes` parses an integer lexeme as `mant/10^0`), so it is a
+  // valid constexpr in a const-global init (a convert op is not). (Slice 5.)
+  if pendingF32 {
+    fbF32Const(e.numText)
+    return 0
+  }
+  // An integer literal in f64 CONTEXT (const-global init) lowers directly as
+  // `f64.const`, keeping the global init a constexpr (`const b: f64 = 5`). (Slice 5.)
+  if pendingF64 {
+    fbF64Const(e.numText)
+    return 0
+  }
+  // An integer literal in i64 CONTEXT (`pendingI64`) lowers as `i64.const` over the
+  // 64-bit (hi, lo) pair parsed from its lexeme — so a value past the i32 range
+  // (`9000000000`, `0xFFFFFFFFFF`) survives. Otherwise the default i32 path is
+  // byte-identical to before (bare integer literals stay i32 — Slice 1 invariant).
+  if pendingI64 {
+    const pr = parseI64Pair(e.numText)
+    fbI64Const(pr[0], pr[1])
+    return 0
+  }
+  // An integer literal past the i32 range is TYPED i64 by the checker (the host's
+  // `defaultIntegerType` magnitude rule), so it lowers as `i64.const` even with no
+  // i64 context — the old default `i32.const` silently wrapped (0xDEAD_BEEF).
+  if !numLexFitsI32(e.numText) {
+    const pr = parseI64Pair(e.numText)
+    fbI64Const(pr[0], pr[1])
+    return 0
+  }
+  fbI32Const(parseI32(e.numText))
+  return 0
+}
+
+// Extracted from `emitExpr`'s `CharLit` arm (C3: thin the dispatcher).
+function emitCharLitNode(body: i32[], e: CharLit, exprIx: i32, fnIx: i32) {
+  // A char literal IS its single Unicode code point as an i32. `charText` is the RAW
+  // lexeme (quotes kept, escapes unresolved), so decode it the SAME way string
+  // literals decode (`decodeStr` strips the quotes + resolves escapes); a well-formed
+  // char yields exactly one code point.
+  const cps = decodeStr(strToCps(e.charText))
+  if cps.length != 1 {
+    return emitFail(
+      "emitProgram: char literal must denote exactly one code point",
+    )
+  }
+  fbI32Const(cps[0])
+  return 0
+}
+
+// Extracted from `emitExpr`'s `Ident` arm (C3: thin the dispatcher).
+function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
+  // A CAPTURED variable (a free var of a capturing lifted function): read it from the
+  // env struct threaded as the leading param (local 0) —
+  // `struct.get $env <fieldIdx> (ref.cast (local.get 0) (ref $env))`. Checked FIRST so
+  // a capture shadows nothing (it is neither a param/local of this function nor a
+  // global). Only fires inside a capturing lifted function.
+  if emitCapturedRead(body, e.identName, fnIx) == 1 { return 0 }
+  // A VALUE-union binding narrowed to ONE scalar atom reads UNBOXED: push the
+  // box, recover the `anyref` payload, cast it, and (for a scalar atom) read
+  // the value-box field — `if u is i32 { print(u) }` yields the raw i32.
+  const vAtom = narrowedValueAtomOf(e.identName)
+  if vAtom != "" {
+    if unionNameOfIdent(e.identName, fnIx) != "" {
+      return emitValueUnionUnboxRead(body, e.identName, vAtom, fnIx)
+    }
+  }
+  // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
+  const idx = localIndexOf(fnIx, e.identName)
+  if idx < 0 {
+    // A bare top-level/lifted function NAME in value position constructs a function
+    // value (closure fat-pointer). `fnIndexOf` IS the `fnStmts` position (the function
+    // index), exactly what `emitClosureValue` expects — passed directly (a top-level
+    // function never captures, so its env is null; a captured lifted function reads its
+    // captures live in the enclosing frame `fnIx`). Scope-aware so a nested function
+    // sharing a name with another maker's nested function resolves to THIS frame's.
+    let fe = fnIndexOfInScope(e.identName, fnIx)
+    if fe >= 0 { return emitClosureValue(body, fe, fnIx) }
+    // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
+    const gIdx = globalIndexOf(e.identName)
+    if gIdx >= 0 {
+      fbGlobalGet(gIdx)
+      const gck0 = globalCellKind(globalLetOf(e.identName))
+      // A `string | null` cell (kind 16) is ALWAYS a NULLABLE ref — const OR not (a
+      // const can still be initialized to `null`). So a VALUE read recovers the non-null
+      // string ref (`ref.as_non_null`, 0xd4 — the checker narrowed it non-null at every
+      // value read) INDEPENDENTLY of const-ness; the `!= null` null-check keeps the raw
+      // nullable ref (`pendingRawNullRead`). Without this a top-level `string | null`
+      // value read (`x ?? d`, `!= null`) left a `(ref null $array)` where a `(ref $array)`
+      // is expected (a function-scope local already recovers via the local path below).
+      if gck0 == "nulstr" {
+        if !pendingRawNullRead {
+          wU8(212) // 0xd4 ref.as_non_null
+        }
+        return 0
+      }
+      // A NON-const ref global rides in a NULLABLE cell (zero-initialized with
+      // `ref.null`, set by the start function before any code runs). Recover the
+      // non-null value type the rest of codegen expects with `ref.as_non_null`
+      // (0xd4); the cell is always initialized first, so the cast never traps. A
+      // const global keeps its non-null cell, so no cast (goldens unchanged). A
+      // scalar (i32/boolean) global needs no cast either.
+      if globalNameIsNonConst(e.identName) {
+        // A NULLABLE-struct cell (kind 9) legitimately holds null — its reads
+        // stay nullable (the member-access path recovers non-null at use); a
+        // nullable-LIST cell (kind 15) and a nullable-CLOSURE cell (kind 19)
+        // likewise (the `!= null` check reads raw, the narrowed call recovers
+        // non-null at the call site). A SCALAR numeric cell (i32 0 / i64 10 /
+        // f64 11 / f32 13 / boolean) is not a ref, so it takes no
+        // `ref.as_non_null` either. (Slice 5 adds f32/i64/f64 scalars.)
+        if (
+          gck0 != "i32" &&
+          gck0 != "nulstruct" &&
+          gck0 != "i64" &&
+          gck0 != "f64" &&
+          gck0 != "f32" &&
+          gck0 != "nullist" &&
+          gck0 != "nulclosure"
+        ) {
+          wU8(212) // 0xd4 ref.as_non_null
+        }
+      }
+      return 0
+    }
+    return emitFail(
+      "emitProgram: identifier is not a parameter, local, or global",
+    )
+  }
+  fbLocalGet(idx)
+  // A `string | null` (kind 16) param/local read AS A VALUE recovers the non-null
+  // string ref — the checker narrowed it non-null at every such read. The `!= null`
+  // null-check sets `pendingRawNullRead` to keep the raw nullable ref for `ref.is_null`.
+  // A NULLABLE-string TARGET (`pendingNulString` — `const t: string | null = s`, `t = s`,
+  // a `string | null` arg/return) likewise keeps the raw nullable ref: recovering it would
+  // `ref.as_non_null` a value that may legitimately be null and trap. Mirrors the kind-15
+  // list read, which never eagerly recovers.
+  if !pendingRawNullRead && !pendingNulString {
+    if paramNulString(fnIx, e.identName) || declaredNulString(e.identName) {
+      fbRefAsNonNull() // 0xd4
+    }
+  }
+  return 0
+}
+
+// Extracted from `emitExpr`'s `Unary` arm (C3: thin the dispatcher).
+function emitUnaryNode(body: i32[], e: Unary, exprIx: i32, fnIx: i32) {
+  // Logical not `!a`: a boolean rides in an i32 (0/1), so `i32.eqz` (0x45) maps
+  // 0→1 and any non-zero→0 — exactly `a == 0`. Push the operand, then eqz.
+  if e.unOp == "!" {
+    if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+    fbI32Eqz() // 0x45 i32.eqz
+    return 0
+  }
+  // Postfix `x++` / `x--` in EXPRESSION position yields the OLD value. `unArg` is
+  // the increment assignment `x = x ± 1`, which as an expression yields the NEW
+  // value (store-then-re-read); undo the step (new ∓ 1) to recover the pre-
+  // increment value. (In STATEMENT position `emitStmt` unwraps to the bare
+  // assignment, so this adjustment is only paid when the value is actually used.)
+  if e.unOp == "p+" || e.unOp == "p-" {
+    if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+    fbI32Const(1)
+    if e.unOp == "p+" {
+      fbI32Bin(107) // 0x6b i32.sub: (x+1) - 1
+    } else {
+      fbI32Bin(106) // 0x6a i32.add: (x-1) + 1
+    }
+    return 0
+  }
+  // Bitwise NOT `~x` == `x ^ -1` (flip every bit). The all-ones mask is an i64
+  // `-1` when the operand is i64, an i32 `-1` otherwise; the XOR opcode follows
+  // suit. (Slice 2 — the i64 path; the i32 path is the same shape over i32 ops.)
+  if e.unOp == "~" {
+    if exprIsI64(e.unArg, fnIx) {
+      if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+      fbI64Const(-1, -1) // i64 -1 (all ones)
+      fbI32Bin(133)      // 0x85 i64.xor
+      return 0
+    }
+    if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+    fbI32Const(-1) // i32 -1 (all ones)
+    fbI32Bin(115)  // 0x73 i32.xor
+    return 0
+  }
+  // Integer negation: `-x` == `0 - x`, so push 0, the operand, then sub. For an
+  // i64 operand the zero and the subtract are i64 (Slice 2).
+  if e.unOp != "-" {
+    return emitFail("emitProgram: unsupported unary operator")
+  }
+  // f32 negation uses the dedicated `f32.neg` (0x8c) — flips the sign bit. Checked
+  // before f64 (an f32 expr is never `exprIsF64`, but this keeps the float cases
+  // grouped and explicit). (Slice 5.)
+  if exprIsF32(e.unArg, fnIx) {
+    if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+    wU8(140) // 0x8c f32.neg
+    return 0
+  }
+  // f64 negation uses the dedicated `f64.neg` (0x9a) — flips the sign bit (Slice 3).
+  if exprIsF64(e.unArg, fnIx) {
+    if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+    wU8(154) // 0x9a f64.neg
+    return 0
+  }
+  // A negated magnitude-2^31 INTEGER literal (`-2147483648`) is i32 (the host
+  // folds the sign in before defaulting), but the bare operand lexeme is one
+  // past I32_MAX, so the `exprIsI64(e.unArg)` branch below would lower it as
+  // an i64 negation. Lower it directly as a WRAPPING i32 negation instead:
+  // `parseI32` folds 0x80000000 to I32_MIN, and `0 - I32_MIN` wraps back to
+  // I32_MIN — the right value. Checked BEFORE the operand i64 classification.
+  const negInner = unwrapParen(e.unArg)
+  const negNode = P.nodes[negInner]
+  if negNode is NumLit {
+    if !numTextIsFloat(negNode.numText) {
+      if numLexIs2Pow31(negNode.numText) {
+        fbI32Const(0)
+        fbI32Const(parseI32(negNode.numText))
+        fbI32Bin(107) // 0x6b i32.sub
+        return 0
+      }
+    }
+  }
+  if exprIsI64(e.unArg, fnIx) {
+    fbI64Const(0, 0) // i64 0
+    if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+    fbI32Bin(125)    // 0x7d i64.sub
+    return 0
+  }
+  fbI32Const(0)
+  if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+  fbI32Bin(107) // 0x6b i32.sub
+  return 0
+}
+
+// Extracted from `emitExpr`'s `Call` arm (C3: thin the dispatcher).
+function emitCallNode(body: i32[], e: Call, exprIx: i32, fnIx: i32) {
+  // G6: `s.slice(start, end)` over a string receiver is an intrinsic — a new
+  // `(array i32)` over the clamped half-open range. Other member-calls in value
+  // position are out of scope (the only member-call STATEMENT is `.push`).
+  if exprIsStrSlice(exprIx, fnIx) { return emitStrSlice(body, exprIx, fnIx) }
+  // An array `xs.slice(start, end?)` over a LIST receiver — a same-element-kind
+  // sublist (`emitArrSlice`). Checked before the string slice's siblings so it does
+  // not fall into a struct member-call path.
+  if callIsArrSlice(exprIx, fnIx) { return emitArrSlice(body, exprIx, fnIx) }
+  // `s.indexOf(sub)` / `s.includes(sub)` / `s.charCodeAt(i)` over a string
+  // receiver are intrinsics too (A7), each yielding an i32.
+  if exprIsStrIndexOf(exprIx, fnIx) {
+    return emitStrIndexOf(body, exprIx, fnIx)
+  }
+  if exprIsStrCharCode(exprIx, fnIx) {
+    return emitStrCharCode(body, exprIx, fnIx)
+  }
+  // G8: the `Map()` builtin constructs an empty string-keyed map. `Set()` is a
+  // boolean-valued string map over the SAME 7-field struct, so it emits the
+  // IDENTICAL empty-map construction.
+  const callee = P.nodes[e.callFn]
+  if callee is Ident {
+    if callee.identName == "Map" || callee.identName == "Set" {
+      return emitMapNew(body)
+    }
+  }
+  // G8: a map `m.has(k)` member-call yields a 0/1 i32 (linear scan).
+  if callee is Member {
+    if callee.memProp == "has" {
+      if exprMap(callee.memObj, fnIx) {
+        if e.callArgs.length != 1 {
+          return emitFail("emitProgram: .has takes exactly one argument")
+        }
+        return emitMapHas(body, callee.memObj, e.callArgs[0], fnIx)
+      }
+    }
+    // G8: a map `m.delete(k)` member-call in VALUE position yields a 0/1 boolean
+    // (whether a key was removed). The same lowering serves the bare-statement form.
+    if callee.memProp == "delete" {
+      if exprMap(callee.memObj, fnIx) {
+        if e.callArgs.length != 1 {
+          return emitFail("emitProgram: .delete takes exactly one argument")
+        }
+        return emitMapDelete(body, callee.memObj, e.callArgs[0], fnIx)
+      }
+    }
+    // `m.keys()` over a map yields a fresh string list of its LIVE keys.
+    if callee.memProp == "keys" {
+      if exprMap(callee.memObj, fnIx) {
+        if e.callArgs.length != 0 {
+          return emitFail("emitProgram: .keys() takes no arguments")
+        }
+        return emitMapKeys(body, callee.memObj, fnIx)
+      }
+    }
+    // `m.values()` over a mono i32 map yields a fresh i32 list of its LIVE values.
+    if callee.memProp == "values" {
+      if exprMap(callee.memObj, fnIx) {
+        if e.callArgs.length != 0 {
+          return emitFail("emitProgram: .values() takes no arguments")
+        }
+        return emitMapValues(body, callee.memObj, fnIx)
+      }
+    }
+    // `xs.pop()` removes + returns the last list element (any list kind).
+    if callee.memProp == "pop" { return emitPop(body, exprIx, fnIx) }
+    // `xs.get(i)` over a STRUCT-element ref list: the checked nullable read —
+    // in-bounds yields the (still nullable) element slot, out-of-bounds `ref.null $S`.
+    if callee.memProp == "get" {
+      if structListPopGetElem(exprIx, fnIx) >= 0 {
+        return emitListGet(body, exprIx, fnIx)
+      }
+    }
+    // `xs.map(f)` / `xs.filter(p)` over a LIST receiver lower to the inline
+    // closure-calling loop (Slices 3–4). A non-list receiver falls through (a
+    // function-valued struct FIELD named `map` is a `call_ref` member call).
+    if callee.memProp == "map" || callee.memProp == "filter" {
+      if mfRecvKindOf(callee.memObj, fnIx) != null {
+        return emitMapFilter(body, exprIx, fnIx)
+      }
+    }
+  }
+  return emitCall(body, exprIx, fnIx)
+}
+
+// Extracted from `emitExpr`'s `NullLit` arm (C3: thin the dispatcher).
+function emitNullLitNode(body: i32[], e: NullLit, exprIx: i32, fnIx: i32) {
+  // `null` in a `boolean|null` NICHE context is the scalar sentinel 2 (an i32,
+  // not a ref) — checked before the struct seed.
+  if pendingNulBool {
+    fbI32Const(2)
+    return 0
+  }
+  // `null` in a `K | null` NICHE context is the i32 sentinel `-1` (atom ids are ≥ 0) — an i32,
+  // not a ref. Checked before the struct seed (a litunion atom is not a struct).
+  if pendingNulLitUnion {
+    fbI32Const(-1)
+    return 0
+  }
+  // `null` in a `string | null` (kind 16) context — `ref.null $aTypeIdx` (the raw
+  // string array made nullable). Checked before the struct seed (a string is not a
+  // struct). Seeded at the param-arg / assignment / return boundaries.
+  if pendingNulString {
+    wU8(208) // 0xd0 ref.null
+    wSLEB(aTypeIdx)
+    return 0
+  }
+  // `null` in a nullable FUNCTION-VALUE (`fn | null`, kind 19) context — `ref.null
+  // $cloStruct` (the closure fat-pointer made nullable). Checked before the struct seed.
+  if pendingNulClosure {
+    wU8(208) // 0xd0 ref.null
+    wSLEB(cloStructIdx)
+    return 0
+  }
+  // `null` as a NULLABLE-i32-LIST element of a `(i32[] | null)[]` literal — `ref.null $lTypeIdx`.
+  if pendingNulList {
+    wU8(208) // 0xd0 ref.null
+    wSLEB(lTypeIdx)
+    return 0
+  }
+  // `null` as a NULLABLE-REF-ARRAY element of a `(<ref-array> | null)[]` literal — `ref.null
+  // $innerWrapper` (the seeded inner ref-list wrapper heap type). Reset the seed after consuming it so it
+  // never persists past this `null` (a stray non-(-1) value would mis-type a later bare `null`).
+  if pendingNulRefHeap >= 0 {
+    const nrh = pendingNulRefHeap
+    pendingNulRefHeap = -1
+    wU8(208) // 0xd0 ref.null
+    wSLEB(nrh)
+    return 0
+  }
+  // A bare `null` VALUE: its target struct comes from the binding/argument/
+  // return seed (`pendingStructIdx`) — `ref.null $S`. With no seed it cannot
+  // be typed here; fail loudly.
+  if pendingStructIdx >= 0 {
+    if pendingStructIdx < sHeapIdx.length {
+      wU8(208) // 0xd0 ref.null
+      wSLEB(sHeapIdx[pendingStructIdx])
+      return 0
+    }
+  }
+  return emitFail("emitProgram: bare null needs a struct-typed context")
+}
+
+// Extracted from `emitExpr`'s `ObjLit` arm (C3: thin the dispatcher).
+function emitObjLitNode(body: i32[], e: ObjLit, exprIx: i32, fnIx: i32) {
+  // A CONTEXT that expects a CONCRETE variant (`const c: Cat = { … }`, a `Cat[]`
+  // element) constructs the BARE variant struct `(ref $(uVarIdx + vi))` — NOT a union
+  // box. `pendingVariantIdx` is the variant; consume it so a nested literal doesn't
+  // inherit the hint.
+  if pendingVariantIdx >= 0 {
+    const pvi = pendingVariantIdx
+    pendingVariantIdx = -1
+    return emitVariantStruct(body, exprIx, pvi, fnIx)
+  }
+  // A literal whose field-set matches a STANDALONE struct constructs that struct
+  // directly (even alongside a union — `ast.vl`'s `Tok`/`Diag` coexist with `Node`).
+  // Otherwise, in a union program, it is a union variant: box it `{tag, value}`.
+  if structIndexOfObj(exprIx) >= 0 { return emitObj(body, exprIx, fnIx) }
+  if uDeclared { return emitUnionBox(body, exprIx, fnIx) }
+  return emitObj(body, exprIx, fnIx)
+}
+
+// Extracted from `emitExpr`'s `Member` arm (C3: thin the dispatcher).
+function emitMemberNode(body: i32[], e: Member, exprIx: i32, fnIx: i32) {
+  // `a.length` on an array OR string receiver is `array.len` (a string is the SAME
+  // `array i32` of code points, so `.length` is the code-point count); every other
+  // member access is a struct field read. `length` over a non-array/non-string
+  // receiver falls through to the struct path (which fails loudly if no such field),
+  // matching the slice's scope.
+  if e.memProp == "length" {
+    if (
+      exprArray(e.memObj, fnIx) ||
+      exprString(e.memObj, fnIx) ||
+      exprRefArray(e.memObj, fnIx) ||
+      exprStringArray(e.memObj, fnIx) ||
+      exprF64Array(e.memObj, fnIx) ||
+      exprI64Array(e.memObj, fnIx) ||
+      exprF32Array(e.memObj, fnIx)
+    ) {
+      return emitArrLen(body, exprIx, fnIx)
+    }
+    // G8: `m.length` on a MAP is the LIVE entry count — struct field 5 (`size`),
+    // maintained by set/delete (NOT `count`, which includes tombstones).
+    if exprMap(e.memObj, fnIx) {
+      if emitExpr(body, e.memObj, fnIx) < 0 { return -1 }
+      let lsl = mapShapeOfExpr(e.memObj, fnIx)
+      if lsl == -2 || lsl == -3 { lsl = -1 }
+      fbStructGet(mapTypeIdxOf(lsl), 5) // 0xfb 0x02: field 5 `size`
+      return 0
+    }
+  }
+  // `m.size` on a MAP / Set is the same live-entry count as `m.length` (field 5) — the
+  // JS Map/Set name. (`.size` is not valid on arrays/strings; they fall through.)
+  if e.memProp == "size" {
+    if exprMap(e.memObj, fnIx) {
+      if emitExpr(body, e.memObj, fnIx) < 0 { return -1 }
+      let ssl = mapShapeOfExpr(e.memObj, fnIx)
+      if ssl == -2 || ssl == -3 { ssl = -1 }
+      fbStructGet(mapTypeIdxOf(ssl), 5) // 0xfb 0x02: field 5 `size`
+      return 0
+    }
+  }
+  return emitMem(body, exprIx, fnIx)
+}
+
+// Extracted from `emitExpr`'s `BinExpr` arm (C3: thin the dispatcher).
+function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
+  // Assignment (`=`) is a STATEMENT, not a value expression in this slice: it has
+  // no result on the stack (it `local.set`s). It is lowered by `emitAssign` from
+  // `emitStmt`, so seeing it as an operand here is an unsupported nested-assignment.
+  if e.binOp == "=" {
+    // Assignment is an EXPRESSION yielding its right-hand side (DECISIONS:
+    // assignment-as-expression): `b = (a = 5)`, `while (a = a - 1) > 0`, and a
+    // trailing `count = count + 1` returning the new value. Lowered as
+    // STORE-then-RE-READ — `emitAssign` stores, then the target re-reads through
+    // the normal Ident path (which carries the non-const-ref re-cast logic).
+    // Ident targets only (a local or module global); an Index/Member assignment
+    // in VALUE position is out of this slice.
+    const tgt = P.nodes[e.binLeft]
+    if tgt is Ident {
+      if emitAssign(body, exprIx, fnIx) < 0 { return -1 }
+      return emitExpr(body, e.binLeft, fnIx)
+    }
+    return emitFail(
+      "emitProgram: only an identifier assignment is a value expression",
+    )
+  }
+  // G8: nullish-coalescing `m[k] ?? d` — a FUSED map get-with-default: scan `m` for
+  // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
+  // every scope map through `?? -1`. The LHS must be a map index in this slice.
+  if e.binOp == "??" {
+    // Unwrap a parenthesized LHS so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
+    // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
+    // unwrapped place every structural branch below dispatches on and emits; the generic niche
+    // paths re-evaluate `e.binLeft` directly (and `emitExpr` / `exprNullableString` already peel
+    // parens), so they are unaffected.
+    const lhsIx = unwrapParen(e.binLeft)
+    const lhs = P.nodes[lhsIx]
+    // `a ?? b ?? d` parses LEFT-associative (`(a ?? b) ?? d`); `??` is
+    // associative, so RE-ASSOCIATE to `a ?? (b ?? d)` — the inner coalesce
+    // becomes the outer's default and each LHS is again a plain place the
+    // single-step lowerings below handle (host: same chained-coalesce value).
+    if lhs is BinExpr {
+      if lhs.binOp == "??" {
+        return emitExpr(
+          body,
+          mkBinary(
+            "??",
+            lhs.binLeft,
+            mkBinary("??", lhs.binRight, e.binRight, -1),
+            -1,
+          ),
+          fnIx,
+        )
+      }
+    }
+    if lhs is Index {
+      if exprMap(lhs.idxArr, fnIx) {
+        return emitMapGetOr(body, lhs.idxArr, lhs.idxIndex, e.binRight, fnIx)
+      }
+    }
+    // The METHOD form `recv.get(k) ?? d` over a map receiver is the SAME fused
+    // get-with-default as `recv[k] ?? d` — lower it identically. (The LIST `.get`
+    // at ~6890 is a distinct struct-element get and is NOT a map; `exprMap` gates
+    // this to map receivers only.)
+    if lhs is Call {
+      const lcallee = P.nodes[lhs.callFn]
+      if lcallee is Member {
+        if lcallee.memProp == "get" {
+          if exprMap(lcallee.memObj, fnIx) {
+            if lhs.callArgs.length != 1 {
+              return emitFail(
+                "emitProgram: map .get takes exactly one argument",
+              )
+            }
+            return emitMapGetOr(
+              body,
+              lcallee.memObj,
+              lhs.callArgs[0],
+              e.binRight,
+              fnIx,
+            )
+          }
+          // `xs.get(i) ?? d` over a SCALAR-element list (i32 / boolean / f64) is
+          // the FUSED checked read-with-default (B6) — one bounds compare.
+          if (
+            exprF64Array(lcallee.memObj, fnIx) ||
+            exprArray(lcallee.memObj, fnIx)
+          ) {
+            return emitListGetOr(body, lhsIx, e.binRight, fnIx)
+          }
+        }
+        // `xs.pop() ?? d` over a SCALAR-element list is the FUSED checked
+        // pop-with-default: `len != 0` selects decrement-and-read or `d`.
+        if lcallee.memProp == "pop" {
+          if exprArray(lcallee.memObj, fnIx) {
+            if (
+              !exprRefArray(lcallee.memObj, fnIx) &&
+              !exprStringArray(lcallee.memObj, fnIx) &&
+              !exprF64Array(lcallee.memObj, fnIx)
+            ) {
+              return emitPopOr(body, lhsIx, e.binRight, fnIx)
+            }
+          }
+        }
+      }
+    }
+    // These generic niche `??` paths RE-EVALUATE `e.binLeft` (twice for the bool select,
+    // and in the else arm for the string), so they apply only to an effect-free place —
+    // an ident binding or a struct FIELD. A CALL lhs (`f() ?? d`) cannot be re-evaluated
+    // and is handled by the stash-based call path in the `lhs is Call` block below.
+    let lhsReEval = true
+    if lhs is Call { lhsReEval = false }
+    // `<e> ?? d` over a `boolean | null` NICHE (an ident binding OR a `boolean | null`
+    // struct FIELD, code 21) — the i32 cell holds 0/1 or the sentinel 2 (`null`); select
+    // the default on 2. Generic in `e.binLeft`, so it covers a member field read too.
+    if lhsReEval && exprNulBool(e.binLeft, fnIx) {
+      if emitExpr(body, e.binRight, fnIx) < 0 {
+        return -1 // d   [a]
+      }
+      if emitExpr(body, e.binLeft, fnIx) < 0 {
+        return -1 // x   [b]
+      }
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+      fbI32Const(2)
+      fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)      [cond]
+      wU8(27)      // 0x1b select → d if null else x
+      return 0
+    }
+    // `<e> ?? d` over a `string | null` NICHE (an ident binding OR a `string | null`
+    // struct FIELD, code 20): the nullable raw-array ref — a VALUE-typed `if` on
+    // `ref.is_null` (the else arm reads `e` as a non-null value). `pendingRawNullRead`
+    // keeps the test read raw. Generic in `e.binLeft`, so it covers a member field too.
+    if lhsReEval && exprNullableString(e.binLeft, fnIx) {
+      const savedRawN = pendingRawNullRead
+      pendingRawNullRead = true
+      const treN = emitExpr(body, e.binLeft, fnIx) // the raw nullable ref
+      pendingRawNullRead = savedRawN
+      if treN < 0 { return -1 }
+      wU8(209)                                     // 0xd1 ref.is_null → 1 if null
+      wU8(4)                                       // 0x04 if
+      wU8(100)                                     // blocktype: (ref $aTypeIdx) — non-null string result
+      wSLEB(aTypeIdx)
+      ctrlEnter()
+      if emitExpr(body, e.binRight, fnIx) < 0 {
+        return -1 // d (a string)
+      }
+      fbElse() // 0x05 else
+      if emitExpr(body, e.binLeft, fnIx) < 0 {
+        return -1 // e recovered non-null
+      }
+      fbEnd() // 0x0b end
+      ctrlLeave()
+      return 0
+    }
+    // `x ?? d` over a binding seeded by a BOOLEAN-list `.pop()`: the i32 cell
+    // holds 0/1 or the niche sentinel 2 (`null`) — select the default on 2.
+    if lhs is Ident {
+      if identNullableBoolPop(lhs.identName, fnIx) {
+        if emitExpr(body, e.binRight, fnIx) < 0 {
+          return -1 // d   [a]
+        }
+        if emitExpr(body, e.binLeft, fnIx) < 0 {
+          return -1 // x   [b]
+        }
+        if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+        fbI32Const(2)
+        fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)      [cond]
+        wU8(27)      // 0x1b select → d if null else x
+        return 0
+      }
+      // `x ?? d` over a BOXED value union containing `null` (`i32 | null`):
+      // the value-level dual of the null guard — read the box tag; the null
+      // tag selects the default, anything else unboxes the SINGLE remaining
+      // scalar atom (the host's `??` result is the non-null base type). The
+      // receiver is a pure name, re-read in the non-null arm. Scalar atoms
+      // only (the value-typed `if` blocktype carries the unboxed rep).
+      const cunm = unionNameOfIdent(lhs.identName, fnIx)
+      if cunm != "" {
+        if isValueUnionName(cunm) && unionHasAtom(cunm, "null") {
+          const crest = removeAtomFrom(
+            currentNarrowSetOf(lhs.identName, fnIx),
+            "null",
+          )
+          const cak = valueAtomKind(crest)
+          if cak >= 0 && cak != 6 {
+            if cak == 2 {
+              return emitFail(
+                "emitProgram: `??` over a string|null union is not supported yet",
+              )
+            }
+            if emitExpr(body, e.binLeft, fnIx) < 0 {
+              return -1 // the box
+            }
+            fbStructGet(uBoxIdx, 0) // field 0: tag
+            fbI32Const(scalarTagOf("null"))
+            fbI32Bin(70)            // 0x46 i32.eq → null?
+            let cbt = 127           // 0x7f i32 (boolean shares it)
+            if cak == 3 {
+              cbt = 126 // 0x7e i64
+            }
+            if cak == 4 {
+              cbt = 124 // 0x7c f64
+            }
+            if cak == 5 {
+              cbt = 125 // 0x7d f32
+            }
+            fbIf(cbt) // 0x04 if, value blocktype
+            ctrlEnter()
+            if cak == 3 {
+              if emitExprAsI64(body, e.binRight, fnIx) < 0 { return -1 }
+            } else if cak == 4 {
+              if emitExprAsF64(body, e.binRight, fnIx) < 0 { return -1 }
+            } else if cak == 5 {
+              if emitExprAsF32(body, e.binRight, fnIx) < 0 { return -1 }
+            } else {
+              if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+            }
+            fbElse() // 0x05 else — present → unbox
+            if emitValueUnionUnboxRead(body, lhs.identName, crest, fnIx) < 0 {
+              return -1
+            }
+            fbEnd() // 0x0b end
+            ctrlLeave()
+            return 0
+          }
+        }
+      }
+    }
+    // `f(x) ?? d` over a CALL returning a value union with `null` (`i32 | null`,
+    // …): a call CANNOT be re-evaluated (effects + cost) the way the ident/field
+    // paths above re-read their place, so STASH the box once in the coalesce-call
+    // slot, then test the tag and unbox off that single evaluation. Scalar atoms
+    // only (the value-typed `if` blocktype); a `string | null` call result is
+    // deferred like the ident/field forms. One slot is sound across nesting: each
+    // `??` sets-tests-uses within its own evaluation, and the null arm never reads
+    // the box again (so a nested call-LHS `??` in the default may reuse the slot).
+    if lhs is Call {
+      const kunm = unionNameOfExpr(e.binLeft, fnIx)
+      if kunm != "" {
+        if isValueUnionName(kunm) && unionHasAtom(kunm, "null") {
+          const krest = removeAtomFrom(kunm, "null")
+          const kak = valueAtomKind(krest)
+          if kak >= 0 && kak != 6 {
+            if kak == 2 {
+              return emitFail(
+                "emitProgram: `??` over a string|null call result is not supported yet",
+              )
+            }
+            if emitExpr(body, e.binLeft, fnIx) < 0 {
+              return -1 // the box, evaluated ONCE
+            }
+            fbLocalSet(coalesceCallSlot)
+            fbLocalGet(coalesceCallSlot)
+            fbStructGet(uBoxIdx, 0) // field 0: tag
+            fbI32Const(scalarTagOf("null"))
+            fbI32Bin(70)            // 0x46 i32.eq → null?
+            let kbt = 127           // 0x7f i32 (boolean shares it)
+            if kak == 3 {
+              kbt = 126 // 0x7e i64
+            }
+            if kak == 4 {
+              kbt = 124 // 0x7c f64
+            }
+            if kak == 5 {
+              kbt = 125 // 0x7d f32
+            }
+            fbIf(kbt) // 0x04 if, value blocktype
+            ctrlEnter()
+            if kak == 3 {
+              if emitExprAsI64(body, e.binRight, fnIx) < 0 { return -1 }
+            } else if kak == 4 {
+              if emitExprAsF64(body, e.binRight, fnIx) < 0 { return -1 }
+            } else if kak == 5 {
+              if emitExprAsF32(body, e.binRight, fnIx) < 0 { return -1 }
+            } else {
+              if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+            }
+            fbElse()                // 0x05 else — present → unbox the stash
+            fbLocalGet(coalesceCallSlot)
+            fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+            const kvb = vbHeapIdxOfAtom(krest)
+            if kvb < 0 {
+              return emitFail("emitProgram: union call atom has no value box")
+            }
+            fbRefCast(kvb)
+            fbStructGet(kvb, 0) // the scalar payload
+            fbEnd()             // 0x0b end
+            ctrlLeave()
+            return 0
+          }
+        }
+      }
+      // `f() ?? d` over a CALL returning `boolean | null` (the i32 niche): a call
+      // cannot be re-read, so STASH the single evaluation in the bool slot, then select
+      // `d` on the sentinel 2 — the call analogue of the `boolean | null` ident path.
+      if exprNulBool(e.binLeft, fnIx) {
+        if emitExpr(body, e.binLeft, fnIx) < 0 {
+          return -1 // the niche i32, evaluated ONCE
+        }
+        fbLocalSet(coalesceCallBoolSlot)
+        if emitExpr(body, e.binRight, fnIx) < 0 {
+          return -1 // d                                       [val1]
+        }
+        fbLocalGet(coalesceCallBoolSlot) // x                  [val2]
+        fbLocalGet(coalesceCallBoolSlot)
+        fbI32Const(2)
+        fbI32Bin(70)                     // 0x46 i32.eq → x == 2 (null)            [cond]
+        wU8(27)                          // 0x1b select → d if null else x
+        return 0
+      }
+      // `f() ?? d` over a CALL returning `string | null` (kind 16): STASH the nullable
+      // ref once (raw, via `pendingRawNullRead`), then a value-typed `if` on
+      // `ref.is_null` selects `d` or the recovered non-null string — the call analogue
+      // of the `string | null` ident path.
+      if exprNullableString(e.binLeft, fnIx) {
+        const savedRaw = pendingRawNullRead
+        pendingRawNullRead = true
+        const tre = emitExpr(body, e.binLeft, fnIx) // the raw nullable ref, ONCE
+        pendingRawNullRead = savedRaw
+        if tre < 0 { return -1 }
+        fbLocalSet(coalesceCallStrSlot)
+        fbLocalGet(coalesceCallStrSlot)
+        wU8(209)                                    // 0xd1 ref.is_null → 1 if null
+        wU8(4)                                      // 0x04 if
+        wU8(100)                                    // blocktype: (ref $aTypeIdx) — non-null string result
+        wSLEB(aTypeIdx)
+        ctrlEnter()
+        if emitExpr(body, e.binRight, fnIx) < 0 {
+          return -1 // d (a string)
+        }
+        fbElse()         // 0x05 else
+        fbLocalGet(coalesceCallStrSlot)
+        fbRefAsNonNull() // 0xd4 recover the non-null string the slot holds
+        fbEnd()          // 0x0b end
+        ctrlLeave()
+        return 0
+      }
+    }
+    // `o.v ?? d` over a VALUE-UNION struct field (`v: i32 | null`, code 16):
+    // the field-read dual of the boxed-union name path above — read the box
+    // off the field, test its tag for `null`, and select the default or the
+    // unboxed single remaining scalar atom. The receiver re-reads in the
+    // non-null arm (a name/field chain, like the nullable-struct `?.` path).
+    if lhs is Member {
+      const msi = structIndexOfExpr(lhs.memObj, fnIx)
+      if msi >= 0 {
+        let mfi = sFieldIndex(msi, lhs.memProp)
+        if mfi >= 0 {
+          if sFieldTypeAt(msi, mfi) == 16 {
+            const munm = sFieldElemNameAt(msi, mfi)
+            if isValueUnionName(munm) && unionHasAtom(munm, "null") {
+              const mrest = removeAtomFrom(munm, "null")
+              const mak = valueAtomKind(mrest)
+              if mak >= 0 && mak != 6 {
+                if mak == 2 {
+                  return emitFail(
+                    "emitProgram: `??` over a string|null union field is not supported yet",
+                  )
+                }
+                if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
+                fbStructGet(sHeapIdx[msi], mfi) // the union box
+                fbStructGet(uBoxIdx, 0)         // field 0: tag
+                fbI32Const(scalarTagOf("null"))
+                fbI32Bin(70)                    // 0x46 i32.eq → null?
+                let mbt = 127                   // 0x7f i32 (boolean shares it)
+                if mak == 3 {
+                  mbt = 126 // 0x7e i64
+                }
+                if mak == 4 {
+                  mbt = 124 // 0x7c f64
+                }
+                if mak == 5 {
+                  mbt = 125 // 0x7d f32
+                }
+                fbIf(mbt) // 0x04 if, value blocktype
+                ctrlEnter()
+                if mak == 3 {
+                  if emitExprAsI64(body, e.binRight, fnIx) < 0 { return -1 }
+                } else if mak == 4 {
+                  if emitExprAsF64(body, e.binRight, fnIx) < 0 { return -1 }
+                } else if mak == 5 {
+                  if emitExprAsF32(body, e.binRight, fnIx) < 0 { return -1 }
+                } else {
+                  if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+                }
+                fbElse()                // 0x05 else — present → unbox
+                if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
+                fbStructGet(sHeapIdx[msi], mfi)
+                fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+                const mvb = vbHeapIdxOfAtom(mrest)
+                if mvb < 0 {
+                  return emitFail(
+                    "emitProgram: union field atom has no value box",
+                  )
+                }
+                fbRefCast(mvb)
+                fbStructGet(mvb, 0) // the scalar payload
+                fbEnd()             // 0x0b end
+                ctrlLeave()
+                return 0
+              }
+            }
+          }
+        }
+      }
+    }
+    // The null-safe field read `m[k]?.f ?? d` over a STRUCT-VALUED map is the
+    // FUSED form: probe; on a hit read the field off the (non-null) value
+    // struct, else push the default. A live entry's value slot is never null,
+    // so the `?.` null test coincides with the probe's hit test — no
+    // intermediate nullable materializes. Scalar (i32/boolean) fields only (a
+    // value-typed `if` blocktype carries them; ref fields would need an
+    // interned blocktype functype).
+    if lhs is OptMember {
+      const omInner = P.nodes[lhs.omObj]
+      if omInner is Index {
+        if exprMap(omInner.idxArr, fnIx) {
+          const omSl = mapShapeOfExpr(omInner.idxArr, fnIx)
+          if omSl >= 0 {
+            if mvValKind[omSl] != 1 {
+              return emitFail("emitProgram: `?.` needs a struct-valued map")
+            }
+            const omSi = mvValStructIdx[omSl]
+            const omFi = sFieldIndex(omSi, lhs.omProp)
+            if omFi < 0 {
+              return emitFail(
+                "emitProgram: `?.` field is not on the map's value struct",
+              )
+            }
+            if sFieldTypeAt(omSi, omFi) != 0 {
+              return emitFail(
+                "emitProgram: `?.` over a map read supports only i32/boolean fields",
+              )
+            }
+            if emitMapPrep(body, omInner.idxArr, omInner.idxIndex, fnIx) < 0 {
+              return -1
+            }
+            pushMapScr(body, 5)               // entry
+            fbIf(127)                         // if (entry != 0 → hit), i32 blocktype
+            pushMapVals(body)
+            fbStructGet(cmValsWrap(), 0)      // vals backing
+            pushMapScr(body, 5)               // entry
+            fbI32Const(1)
+            fbI32Bin(107)                     // i32.sub (entry - 1)
+            fbArrayGet(cmValsBack())          // (ref null <value struct>)
+            fbRefAsNonNull()                  // a live entry's value is non-null
+            fbStructGet(sHeapIdx[omSi], omFi) // .f
+            fbElse()                          // else
+            if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+            fbEnd()                           // end (if)
+            return 0
+          }
+        }
+      }
+      // `p?.f ?? d` over a NULLABLE-STRUCT receiver (`p: S | null`, OR a nullable-struct
+      // FIELD read `n.next`): null → the default, else the field read off the (non-null)
+      // struct. The receiver is a re-readable PLACE (a name, or a member chain of names —
+      // an effect-free `struct.get`), re-read in the non-null branch. Scalar fields only
+      // (the value-typed `if` blocktype carries them).
+      if optRecvReReadable(lhs.omObj) {
+        if exprNullableStruct(lhs.omObj, fnIx) {
+          const nsi = structIndexOfExpr(lhs.omObj, fnIx)
+          if nsi >= 0 {
+            const nfi = sFieldIndex(nsi, lhs.omProp)
+            if nfi < 0 {
+              return emitFail("emitProgram: `?.` field is not on the struct")
+            }
+            if sFieldTypeAt(nsi, nfi) != 0 {
+              return emitFail(
+                "emitProgram: `?.` over a nullable struct supports only i32/boolean fields",
+              )
+            }
+            if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
+            wU8(209)  // 0xd1 ref.is_null
+            fbIf(127) // 0x04 if, 0x7f i32 blocktype — null → default
+            ctrlEnter()
+            if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+            fbElse()  // 0x05 else — present → the field
+            if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
+            fbStructGet(sHeapIdx[nsi], nfi)
+            fbEnd()   // 0x0b end
+            ctrlLeave()
+            return 0
+          }
+        }
+      }
+      // A NESTED optional chain `o?.inner?.v ?? d` (niche nullable links): any
+      // null link selects the default; otherwise the chain reads through
+      // non-null refs (each `S|null` link recovers `ref.as_non_null`). The
+      // links are effect-free places, re-evaluated in the value arm. Scalar
+      // (i32/boolean) leaf fields only (the value-typed `if` blocktype).
+      const omDeep = P.nodes[unwrapParen(lhs.omObj)]
+      if omDeep is OptMember {
+        const dsi = optChainStructIdxOf(lhs.omObj, fnIx)
+        if dsi >= 0 {
+          const dfi = sFieldIndex(dsi, lhs.omProp)
+          if dfi >= 0 {
+            if sFieldTypeAt(dsi, dfi) != 0 {
+              return emitFail(
+                "emitProgram: `?.` chain supports only i32/boolean leaf fields",
+              )
+            }
+            if emitOptChainIsNull(body, lhs.omObj, fnIx) < 0 { return -1 }
+            fbIf(127) // 0x04 if, i32 result — a null link → default
+            ctrlEnter()
+            if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+            fbElse()  // 0x05 else — every link present → the leaf
+            if emitOptChainValue(body, lhs.omObj, fnIx) < 0 { return -1 }
+            fbStructGet(sHeapIdx[dsi], dfi)
+            fbEnd()   // 0x0b end
+            ctrlLeave()
+            return 0
+          }
+        }
+      }
+      // `xs.get(i)?.f ?? d` over a STRUCT-element ref list is the FUSED form:
+      // one bounds compare; in range read the field off the (non-null) element,
+      // else the default. A live in-range element is never null (pushes store
+      // non-null), so the `?.` null test coincides with the bounds test —
+      // mirroring the map `m[k]?.f ?? d` path above. Scalar fields only.
+      const omGet = P.nodes[unwrapParen(lhs.omObj)]
+      if omGet is Call {
+        const gCallee = P.nodes[omGet.callFn]
+        if gCallee is Member {
+          if gCallee.memProp == "get" {
+            const gSi = structListPopGetElem(unwrapParen(lhs.omObj), fnIx)
+            if gSi >= 0 && rlUsed {
+              if omGet.callArgs.length != 1 {
+                return emitFail("emitProgram: .get takes exactly one argument")
+              }
+              const gFi = sFieldIndex(gSi, lhs.omProp)
+              if gFi < 0 {
+                return emitFail(
+                  "emitProgram: `?.` field is not on the list's element struct",
+                )
+              }
+              if sFieldTypeAt(gSi, gFi) != 0 {
+                return emitFail(
+                  "emitProgram: `?.` over a list .get supports only i32/boolean fields",
+                )
+              }
+              const gRecvN = P.nodes[unwrapParen(gCallee.memObj)]
+              let gOkRecv = false
+              if gRecvN is Ident { gOkRecv = true }
+              if !gOkRecv {
+                return emitFail(
+                  "emitProgram: .get receiver must be a named list binding",
+                )
+              }
+              const gIdxN = P.nodes[unwrapParen(omGet.callArgs[0])]
+              let gOkIdx = false
+              if gIdxN is NumLit { gOkIdx = true }
+              if gIdxN is Ident { gOkIdx = true }
+              if !gOkIdx {
+                return emitFail(
+                  "emitProgram: .get index must be a literal or a name",
+                )
+              }
+              const gSlot = refListSlotOfExpr(gCallee.memObj, fnIx)
+              // cond: idx u< len
+              if emitExpr(body, omGet.callArgs[0], fnIx) < 0 { return -1 }
+              if emitExpr(body, gCallee.memObj, fnIx) < 0 { return -1 }
+              fbStructGet(rlWrapIdx[gSlot], 1) // field 1: len
+              fbI32Bin(73)                     // 0x49 i32.lt_u
+              fbIf(127)                        // 0x04 if, 0x7f i32 result blocktype
+              ctrlEnter()
+              if emitExpr(body, gCallee.memObj, fnIx) < 0 { return -1 }
+              fbStructGet(rlWrapIdx[gSlot], 0) // field 0: backing
+              if emitExpr(body, omGet.callArgs[0], fnIx) < 0 { return -1 }
+              fbArrayGet(rlBackIdx[gSlot])     // → (ref null $elem)
+              fbRefAsNonNull()                 // a live in-range element is non-null
+              fbStructGet(sHeapIdx[gSi], gFi)  // .f
+              fbElse()                         // 0x05 else
+              if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+              fbEnd()                          // 0x0b end
+              ctrlLeave()
+              return 0
+            }
+          }
+        }
+      }
+    }
+    // GENERIC nullable-STRUCT `??`: a `S | null` value — an ident / param binding, a struct FIELD,
+    // OR a closure / factory CALL (`arr[i](x) ?? d`) — coalesced with a struct default. Evaluated
+    // ONCE: `br_on_non_null` keeps the non-null struct or falls through to the default, so it needs
+    // NEITHER a re-eval (the ident / field forms) NOR a per-struct stash slot (the call form) — one
+    // path for every source, unlike the `string | null` paths split into re-eval + stash. The
+    // closing piece of nullable-struct closures (#655/#656): `structIndexOfExpr` resolves the inner
+    // struct (incl. an indexed closure-array / factory call via the checker-type fallback) for the
+    // block's result type. (A `string | null` LHS is handled by its own paths above.)
+    if exprNullableStruct(e.binLeft, fnIx) {
+      const csi = structIndexOfExpr(e.binLeft, fnIx)
+      if csi >= 0 && csi < sHeapIdx.length {
+        wU8(2)   // 0x02 block
+        wU8(100) // blocktype: (ref $struct) — the non-null result
+        wSLEB(sHeapIdx[csi])
+        ctrlEnter()
+        if emitExpr(body, e.binLeft, fnIx) < 0 {
+          return -1 // the nullable struct ref, evaluated ONCE
+        }
+        wU8(214) // 0xd6 br_on_non_null
+        wULEB(0) //   non-null → branch to the block end with the (ref $struct)
+        // null path: emit the default, seeding an ObjLit default to this struct.
+        const savedPsi = pendingStructIdx
+        pendingStructIdx = csi
+        const dres = emitExpr(body, e.binRight, fnIx)
+        pendingStructIdx = savedPsi
+        if dres < 0 { return -1 }
+        wU8(11) // 0x0b end
+        ctrlLeave()
+        return 0
+      }
+    }
+    return emitFail("emitProgram: `??` is only supported on a map index get")
+  }
+  // Short-circuit logical operators lower to a VALUE-TYPED `if` (blocktype 0x7f),
+  // an `if` expression that leaves one i32 on the stack — both arms push an i32:
+  //   `a && b`  ≡  if (a) { b } else { 0 }   (skip b when a is false → 0)
+  //   `a || b`  ≡  if (a) { 1 } else { b }   (skip b when a is true  → 1)
+  // The condition `a` is evaluated first, then `if 0x04` with i32 result-type
+  // blocktype `0x7f`; the then-branch, `else 0x05`, the else-branch, then `end 0x0b`.
+  if e.binOp == "&&" || e.binOp == "||" {
+    if emitExpr(body, e.binLeft, fnIx) < 0 {
+      return -1 // condition `a`
+    }
+    fbIf(127) // 0x04 if, 0x7f i32 result-type blocktype (yields an i32)
+    if e.binOp == "&&" {
+      // then = b, else = 0
+      if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+      fbElse() // 0x05 else
+      fbI32Const(0)
+    } else {
+      // then = 1, else = b
+      fbI32Const(1)
+      fbElse() // 0x05 else
+      if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+    }
+    fbEnd() // 0x0b end
+    return 0
+  }
+  // Structural `==`/`!=` with a still-BOXED value-union operand (either side,
+  // or both — equality is symmetric). Checked BEFORE the string-eq routing (a
+  // union box compared against a string would otherwise misclassify as a bare
+  // string compare) and SKIPS `null` literals — the box-tag null compare below
+  // owns `v == null` (the host's `variantTag(info, null)` path).
+  if e.binOp == "==" || e.binOp == "!=" {
+    const uql = P.nodes[unwrapParen(e.binLeft)]
+    const uqr = P.nodes[unwrapParen(e.binRight)]
+    let uqNull = false
+    if uql is NullLit { uqNull = true }
+    if uqr is NullLit { uqNull = true }
+    const uqLit = exprIsLitAtom(e.binLeft, fnIx) ||
+      exprIsLitAtom(e.binRight, fnIx)
+    if !uqNull && !uqLit {
+      const uqL = exprUnion(e.binLeft, fnIx)
+      const uqR = exprUnion(e.binRight, fnIx)
+      if uqL && uqR {
+        return emitUnionUnionEq(
+          body,
+          e.binLeft,
+          e.binRight,
+          e.binOp == "!=",
+          fnIx,
+        )
+      }
+      if uqL {
+        return emitUnionConcreteEq(
+          body,
+          e.binLeft,
+          e.binRight,
+          e.binOp == "!=",
+          fnIx,
+        )
+      }
+      if uqR {
+        return emitUnionConcreteEq(
+          body,
+          e.binRight,
+          e.binLeft,
+          e.binOp == "!=",
+          fnIx,
+        )
+      }
+    }
+  }
+  // A literal-union ATOM compare (`k == "a"`, `k1 == k2`): both operands are i32 ids. Emit them as atoms
+  // (a member StrLit -> its id; a litunion var -> its i32 value) and i32-compare. BEFORE the string-eq
+  // path, which would otherwise treat the member literal as a string.
+  if e.binOp == "==" || e.binOp == "!=" {
+    // SKIP a `null` operand: `r == null` over a `K | null` niche is the `-1` sentinel compare (the
+    // nullable-struct block below owns it). A litunion atom never equals the `null` literal here, and
+    // lowering `null` with `pendingLitUnion` would mis-route it to a bare-null struct context.
+    let atomNull = false
+    if P.nodes[unwrapParen(e.binLeft)] is NullLit { atomNull = true }
+    if P.nodes[unwrapParen(e.binRight)] is NullLit { atomNull = true }
+    if !atomNull {
+      if exprIsLitAtom(e.binLeft, fnIx) || exprIsLitAtom(e.binRight, fnIx) {
+        const savedLU = pendingLitUnion
+        pendingLitUnion = 1
+        if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+        if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+        pendingLitUnion = savedLU
+        fbI32Bin(70) // 0x46 i32.eq
+        if e.binOp == "!=" {
+          fbI32Eqz() // 0x45 i32.eqz -> `!=`
+        }
+        return 0
+      }
+    }
+  }
+  // G6 string operators (a string is a `(array i32)` of code points): `+` is a NEW
+  // concatenated array; `==`/`!=` are ELEMENT-WISE value-equality, NOT ref identity
+  // — so they take their own inline lowering BEFORE the i32 `binOpcode` path (which
+  // would emit `i32.eq` = ref identity, the WRONG answer for strings). Only string-
+  // typed operands route here; i32/other-type `+`/`==`/`!=` are unchanged.
+  if exprIsStrConcat(exprIx, fnIx) { return emitStrConcat(body, exprIx, fnIx) }
+  if exprIsStrEq(exprIx, fnIx) { return emitStrEq(body, exprIx, fnIx) }
+  if exprIsStrOrder(exprIx, fnIx) { return emitStrOrder(body, exprIx, fnIx) }
+  // List `==`/`!=` (length + element value-compare, recursive through nested
+  // lists / string elements) and list `+` (concat) — collections-design
+  // §VL.4/§VL.6, the host's `listEqFn`/concat lowerings, inlined.
+  const lopK = listOpKindOfBin(exprIx, fnIx)
+  if lopK >= 0 {
+    if e.binOp == "+" {
+      if lopK != 0 {
+        return emitFail(
+          "emitProgram: list concat over this element kind is not supported",
+        )
+      }
+      return emitListConcatI(body, e.binLeft, e.binRight, fnIx)
+    }
+    if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+    if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+    if lopK == 0 {
+      if emitListEqICore(body) < 0 { return -1 }
+    } else if lopK == 3 {
+      if emitListEqSCore(body) < 0 { return -1 }
+    } else {
+      const lslot = refListSlotOfExpr(e.binLeft, fnIx)
+      const lbase = leqRBaseOfSlot(lslot)
+      if lbase < 0 {
+        return emitFail("emitProgram: ref-list compare frame not reserved")
+      }
+      if emitListEqRCore(body, lslot, lbase) < 0 { return -1 }
+    }
+    if e.binOp == "!=" {
+      fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
+    }
+    return 0
+  }
+  // `p == null` / `p != null` over a NULLABLE struct ref: `ref.is_null`
+  // (inverted with `eqz` for `!=`) — never the i32 compare.
+  if e.binOp == "==" || e.binOp == "!=" {
+    const nlhs = P.nodes[e.binLeft]
+    const nrhs = P.nodes[e.binRight]
+    let nref = -1
+    if nrhs is NullLit { nref = e.binLeft }
+    if nlhs is NullLit { nref = e.binRight }
+    if nref >= 0 {
+      // `x == null` over a `boolean|null` NICHE value is a SENTINEL compare
+      // (`x == 2`) — the i32 never holds a ref. Checked before the struct path.
+      if exprNulBool(nref, fnIx) {
+        if emitExpr(body, nref, fnIx) < 0 { return -1 }
+        fbI32Const(2)
+        if e.binOp == "!=" {
+          fbI32Bin(71) // 0x47 i32.ne
+        } else {
+          fbI32Bin(70) // 0x46 i32.eq
+        }
+        return 0
+      }
+      // `x == null` over a `K | null` NICHE value is a SENTINEL compare against `-1`
+      // (the atom ids are ≥ 0) — the i32 never holds a ref. Checked before the struct path.
+      if exprNulLitUnion(nref, fnIx) {
+        if emitExpr(body, nref, fnIx) < 0 { return -1 }
+        fbI32Const(-1)
+        if e.binOp == "!=" {
+          fbI32Bin(71) // 0x47 i32.ne
+        } else {
+          fbI32Bin(70) // 0x46 i32.eq
+        }
+        return 0
+      }
+      // `<opt-chain> == null` / `!= null` (`o?.y != null`): any null LINK makes
+      // the chain's value null (the host's OptionalAccess folds null through),
+      // so the compare IS the chain's null test (inverted for `!=`).
+      const ncN = P.nodes[unwrapParen(nref)]
+      if ncN is OptMember {
+        if emitOptChainIsNull(body, nref, fnIx) < 0 { return -1 }
+        if e.binOp == "!=" {
+          fbI32Eqz() // 0x45 invert: the chain value is present
+        }
+        return 0
+      }
+      // `x == null` / `x != null` over a BOXED union (`i32 | null`,
+      // `A | B | null`): the box itself is never null — the null VARIANT rides
+      // in the TAG — so compare the box tag against the global null tag (the
+      // host's `variantTag(info, null)` path), never `ref.is_null`.
+      if exprUnion(nref, fnIx) {
+        if emitExpr(body, nref, fnIx) < 0 { return -1 }
+        fbStructGet(uBoxIdx, 0) // box field 0: tag
+        fbI32Const(scalarTagOf("null"))
+        if e.binOp == "!=" {
+          fbI32Bin(71) // 0x47 i32.ne
+        } else {
+          fbI32Bin(70) // 0x46 i32.eq
+        }
+        return 0
+      }
+      if exprNullableStruct(nref, fnIx) {
+        if emitExpr(body, nref, fnIx) < 0 { return -1 }
+        wU8(209) // 0xd1 ref.is_null
+        if e.binOp == "!=" {
+          fbI32Eqz() // invert: non-null
+        }
+        return 0
+      }
+      // `c == null` / `c != null` over a NULLABLE function value (`fn | null`, kind 19):
+      // the same `ref.is_null` lowering as the nullable struct.
+      if exprNulClosure(nref, fnIx) {
+        if emitExpr(body, nref, fnIx) < 0 { return -1 }
+        wU8(209) // 0xd1 ref.is_null
+        if e.binOp == "!=" {
+          fbI32Eqz() // invert: non-null
+        }
+        return 0
+      }
+      // `xs == null` / `xs != null` over a NULLABLE i32 list (`i32[] | null`,
+      // kind 15): the same `ref.is_null` lowering as the nullable struct.
+      if exprNullableList(nref, fnIx) {
+        if emitExpr(body, nref, fnIx) < 0 { return -1 }
+        wU8(209) // 0xd1 ref.is_null
+        if e.binOp == "!=" {
+          fbI32Eqz() // invert: non-null
+        }
+        return 0
+      }
+      // `t == null` / `t != null` over a NULLABLE ref array (`i32[][] | null`, kind 18) — same
+      // `ref.is_null` lowering (the `(ref null $innerWrapper)` niche).
+      if exprNullableRefArray(nref, fnIx) {
+        if emitExpr(body, nref, fnIx) < 0 { return -1 }
+        wU8(209) // 0xd1 ref.is_null
+        if e.binOp == "!=" {
+          fbI32Eqz() // invert: non-null
+        }
+        return 0
+      }
+      // `s == null` / `s != null` over a `string | null` (kind 16): the nullable raw
+      // array ref — same `ref.is_null` lowering. Checked before the structural string
+      // equality below (which would element-compare a non-null string). The receiver
+      // is read RAW (`pendingRawNullRead`) so the kind-16 ident keeps its nullable ref
+      // instead of being recovered to non-null (which would make `ref.is_null` const 0).
+      if exprNullableString(nref, fnIx) {
+        const savedRaw = pendingRawNullRead
+        pendingRawNullRead = true
+        const re = emitExpr(body, nref, fnIx)
+        pendingRawNullRead = savedRaw
+        if re < 0 { return -1 }
+        wU8(209) // 0xd1 ref.is_null
+        if e.binOp == "!=" {
+          fbI32Eqz() // invert: non-null
+        }
+        return 0
+      }
+    }
+    // STRUCTURAL struct equality: same-shape operands compare field-wise
+    // (`emitStructEq` — scalars native, strings via the eq loop, `i32[]` via a
+    // length+element loop, nested structs recursively, function-valued fields
+    // by identity via `emitCloEqCore`).
+    const eqLsi = structIndexOfExpr(e.binLeft, fnIx)
+    const eqRsi = structIndexOfExpr(e.binRight, fnIx)
+    if eqLsi >= 0 || eqRsi >= 0 {
+      if eqLsi >= 0 && eqLsi == eqRsi {
+        return emitStructEq(body, exprIx, fnIx)
+      }
+      return emitFail("emitProgram: struct equality is not supported yet")
+    }
+    // Function-value `==`/`!=`: IDENTITY — the same lifted function (the id
+    // field) AND the same captured env (`ref.eq`). Mirrors the host (same
+    // table index AND same env; null == null envs are equal).
+    if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+      if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+      if emitCloEqCore(body) < 0 { return -1 }
+      if e.binOp == "!=" {
+        fbI32Eqz() // 0x45 i32.eqz — negate identity-equality
+      }
+      return 0
+    }
+  }
+  // Slice 5 — f32 operators. If EITHER operand is f32, emit the f32 instruction
+  // variant and coerce the other operand (an i32 or a float LITERAL) to f32 first
+  // (`emitExprAsF32`). Covers arithmetic (f32 result) AND comparisons (i32 bool
+  // result, COMPARE consumes two f32). Checked BEFORE f64 because a float literal is
+  // `exprIsF64` too — so `x + 4.0` with `x: f32` must route here, not to f64. Keyed on
+  // operand kind, so an i32-only program never enters it (i32 path stays byte-identical).
+  const lF32 = exprIsF32(e.binLeft, fnIx)
+  const rF32 = exprIsF32(e.binRight, fnIx)
+  // A GENUINE (non-literal) f64 operand makes the op f64 — the f32 side widens (`f32 + f64var`),
+  // so route to the f64 slice below instead of demoting the f64 here (which trapped). A float
+  // literal still adapts DOWN to the f32 operand, so `f32 + 1.0` stays on the f32 slice.
+  if (lF32 || rF32) && !binMixHardF64(e.binLeft, e.binRight, fnIx) {
+    const opcF32 = binOpcodeF32(e.binOp)
+    if opcF32 >= 0 {
+      if emitExprAsF32(body, e.binLeft, fnIx) < 0 { return -1 }
+      if emitExprAsF32(body, e.binRight, fnIx) < 0 { return -1 }
+      fbI32Bin(opcF32)
+      return 0
+    }
+  }
+  // Slice 3 — f64 operators. If EITHER operand is f64, emit the f64 instruction
+  // variant and widen the i32 operand (if any) to f64 first (`emitExprAsF64`). Covers
+  // arithmetic (f64 result) AND comparisons (i32 bool result, COMPARE consumes two
+  // f64). Checked BEFORE i64 since a float operand is never i64. Keyed on operand kind,
+  // so an i32-only program never enters it — the i32 path below is byte-identical.
+  const lF64 = exprIsF64(e.binLeft, fnIx)
+  const rF64 = exprIsF64(e.binRight, fnIx)
+  if lF64 || rF64 {
+    const opcF = binOpcodeF64(e.binOp)
+    if opcF >= 0 {
+      if emitExprAsF64(body, e.binLeft, fnIx) < 0 { return -1 }
+      if emitExprAsF64(body, e.binRight, fnIx) < 0 { return -1 }
+      fbI32Bin(opcF)
+      return 0
+    }
+  }
+  // Slice 2 — i64 operators. If EITHER operand is i64, emit the i64 instruction
+  // variant and widen the i32 operand (if any) to i64 first (`emitExprAsI64`). This
+  // covers arithmetic/bitwise/shift (i64 result) AND comparisons (i32 bool result,
+  // but the COMPARE consumes two i64). The whole branch is keyed on operand kind, so
+  // an i32-only program never enters it — the i32 path below is byte-identical.
+  const lI64 = exprIsI64(e.binLeft, fnIx)
+  const rI64 = exprIsI64(e.binRight, fnIx)
+  if lI64 || rI64 {
+    const opc64 = binOpcodeI64(e.binOp)
+    if opc64 >= 0 {
+      if emitExprAsI64(body, e.binLeft, fnIx) < 0 { return -1 }
+      if emitExprAsI64(body, e.binRight, fnIx) < 0 { return -1 }
+      fbI32Bin(opc64)
+      return 0
+    }
+  }
+  const opcode = binOpcode(e.binOp)
+  if opcode < 0 { return emitFail("emitProgram: unsupported binary operator") }
+  // Operands first (left then right), then the operator — wasm's stack order.
+  if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+  if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+  fbI32Bin(opcode)
+  return 0
 }
