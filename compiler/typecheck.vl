@@ -7009,327 +7009,24 @@ function checkNodeReal(ix: i32) {
     return checkNode(n.parInner)
     // ── unary ─────────────────────────────────────────────────────────────────
   } else if n is Unary {
-    const arg = checkNode(n.unArg)
-    if n.unOp == "!" {
-      if !assignable(arg, TY_BOOL) {
-        tErr("operator '!' expects boolean, got " + tyToStr(arg), ix)
-      }
-      return TY_BOOL
-    }
-    // Postfix `x++` / `x--` (`"p+"`/`"p-"`): `unArg` is the `x = x ± 1` assignment,
-    // already fully checked by `checkNode` above (const-reassign, numeric arithmetic,
-    // assignability). The postfix expression's type is that of the operand.
-    if n.unOp == "p+" || n.unOp == "p-" {
-      if !isNumeric(arg) {
-        tErr("'++'/'--' expects a numeric variable, got " + tyToStr(arg), ix)
-        return TY_ERR
-      }
-      return arg
-    }
-    // "-"
-    if !isNumeric(arg) {
-      tErr("unary '-' expects a numeric type, got " + tyToStr(arg), ix)
-      return TY_ERR
-    }
-    // Host parity: the host folds `-lit` into a signed literal BEFORE defaulting,
-    // so `-2147483648` (magnitude 2^31, one past I32_MAX) sits at I32_MIN and is
-    // i32 — even though the bare operand literal alone types i64.
-    if n.unOp == "-" {
-      if isNegI32MinLit(n.unArg) { return TY_I32 }
-    }
-    return arg
-    // ── binary ────────────────────────────────────────────────────────────────
+    return checkUnaryNode(n, ix)
   } else if n is BinExpr {
     return checkBinExprNode(n, ix)
   } else if n is Call {
     return checkCallNode(n, ix)
     // ── member access ───────────────────────────────────────────────────────────
   } else if n is Member {
-    // A flow-narrowed property path (`if o.v is T { … }`) overrides the stored
-    // field type within the branch (the host's `narrowedPaths` overlay).
-    const mKey = placeKeyOf(ix)
-    if mKey != "" {
-      const mOv = narrowedPathTy(mKey)
-      if mOv >= 0 { return symMem(ix, mOv) }
-    }
-    const objTy = checkNode(n.memObj)
-    // A NEGATIVE receiver type is an unpinned inference hole (the `-1` element
-    // of a never-pinned empty `[]` read back through `xs[i]`), not an arena
-    // index — indexing `T.tys` with it would CRASH. The hole itself is already
-    // reported (`flushUninferred` / the unknown-annotation path), so don't
-    // cascade.
-    if objTy < 0 { return TY_ERR }
-    const ot = T.tys[objTy]
-    if ot is TyObj {
-      let ft = objFieldType(ot, n.memProp)
-      if ft < 0 {
-        tErr("no field '" + n.memProp + "' on " + tyToStr(objTy), ix)
-        return TY_ERR
-      }
-      return symMem(ix, ft)
-    }
-    if ot is TyErr { return TY_ERR }
-    // SHARED-FIELD ACCESS over a struct union — `(A | B).tag` when every
-    // member carries the field at the same type (the host's
-    // `sharedUnionField`); an unshared field still needs an `is` narrowing.
-    if ot is TyUnion {
-      const sf = sharedUnionFieldTy(ot, n.memProp)
-      if sf >= 0 { return symMem(ix, sf) }
-      // The field is on SOME but not all members of the union — reading it is
-      // unsafe until the value is narrowed (`is`) to a member that has it.
-      // (NOT "non-object": the members ARE objects; the field just isn't shared.)
-      tErr(
-        "field '" +
-          n.memProp +
-          "' is not on every member of " +
-          tyToStr(objTy) +
-          " — narrow with `is` first",
-        ix,
-      )
-      return TY_ERR
-    }
-    // `.length` on an array, a map, or a string is an i32.
-    if ot is TyArray {
-      if n.memProp == "length" { return symMem(ix, TY_I32) }
-      tErr("no field '" + n.memProp + "' on array " + tyToStr(objTy), ix)
-      return TY_ERR
-    }
-    if ot is TyMap {
-      // `.length` and `.size` are both the live-entry count (an i32) — `.size` is the
-      // JS Map/Set name, `.length` the list-consistent alias; both read the same field.
-      if n.memProp == "length" { return symMem(ix, TY_I32) }
-      if n.memProp == "size" { return symMem(ix, TY_I32) }
-      tErr("no field '" + n.memProp + "' on map " + tyToStr(objTy), ix)
-      return TY_ERR
-    }
-    if ot is TyPrim {
-      if ot.primName == "string" {
-        if n.memProp == "length" { return symMem(ix, TY_I32) }
-        tErr("no field '" + n.memProp + "' on string", ix)
-        return TY_ERR
-      }
-    }
-    // Member access on an INFERENCE HOLE (`self.x` where `self` is the
-    // un-annotated param hole `?add.0` — host: `getChildType` pins the
-    // `Infer<Unknown>` to a growing object shape): record the demanded field
-    // and yield its derived hole; the call site pins both (A13).
-    if ot is TyVar {
-      if ot.tvName.length > 0 {
-        if ot.tvName[0] == '?' {
-          // `.length` is the i32 length an array / string / map exposes — treat it as that
-          // (not a struct field) so an un-annotated param used as a collection (`self[i]` +
-          // `self.length`) infers without growing a bogus `{length}` shape that an array
-          // argument can't satisfy. A NON-length field still grows the hole's struct shape.
-          if n.memProp == "length" { return symMem(ix, TY_I32) }
-          return symMem(ix, holeMemberTy(ot.tvName, n.memProp))
-        }
-      }
-    }
-    tErr(
-      "member access '." + n.memProp + "' on non-object " + tyToStr(objTy),
-      ix,
-    )
-    return TY_ERR
-    // ── array literal ───────────────────────────────────────────────────────────
-    // `[e, e, …]` types as `T[]` where `T` is the first element's type (the rest must
-    // be assignable to it). An empty `[]` is `T[]` with an unknown element (`-1`),
-    // assignable to any array — its concrete element is pinned by the binding's
-    // annotation (`let a: i32[] = []`).
+    return checkMemberNode(n, ix)
   } else if n is ArrayLit {
-    const elems = n.arrElems
-    if elems.length < 1 { return mkArrayTy(-1) }
-    let elemTy = checkNode(elems[0])
-    let ei = 1
-    while ei < elems.length {
-      const et = checkNode(elems[ei])
-      // Host parity: the element type is the UNION of every element's type
-      // (flattened/deduped) — `[a, b, c]` over mixed struct variants types as
-      // `(A | B | C)[]`; an annotation then checks each member structurally.
-      elemTy = joinTys(elemTy, et)
-      ei = ei + 1
-    }
-    return mkArrayTy(elemTy)
-    // ── index `a[i]` ────────────────────────────────────────────────────────────
+    return checkArrayLitNode(n, ix)
   } else if n is Index {
-    const arrTy = checkNode(n.idxArr)
-    const idxTy = checkNode(n.idxIndex)
-    // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
-    if arrTy < 0 { return TY_ERR }
-    const at = T.tys[arrTy]
-    // A MAP index `m[k]`: the key must match the map's key type; a READ yields the
-    // NULLABLE value (`V | null` — the key may be absent; default with `??`), and an
-    // assignment target `m[k] = v` accepts a plain `V` (assignable to `V | null`).
-    if at is TyMap {
-      if !assignable(idxTy, at.mKey) {
-        tErr(
-          "map key must be " + tyToStr(at.mKey) + ", got " + tyToStr(idxTy),
-          ix,
-        )
-      }
-      return mkNullableTy(at.mVal)
-    }
-    // Indexing an un-annotated-param HOLE (`self[i]`) constrains it to an array: demand an
-    // i32 index and return the element as a DERIVED hole (`?elem.<hole>`), resolved per call
-    // site against the pinned array's element (`substHoleByName`). Mirrors `holeMemberTy`
-    // for `self.x`, so an un-annotated `function head(self) { return self[0] }` infers.
-    if at is TyVar {
-      if !assignable(idxTy, TY_I32) {
-        tErr("array index must be i32, got " + tyToStr(idxTy), ix)
-      }
-      noteArrayDemand(at.tvName)
-      return mkTyVar("?elem." + at.tvName)
-    }
-    // Index TRAP (B13, host parser `indexTrap`): a user object that declares a
-    // `"[]"` method handles `o[k]` itself — the key checks against the
-    // method's parameter (so an i32-keyed trap indexed with a string REJECTS,
-    // index/wrong-key-type.vl), the result is its return. Checked BEFORE the
-    // native i32-index rule (a trap key may be any type); a struct with no
-    // `"[]"` falls through to the cannot-index error. Write traps (`o[k] = v`)
-    // check in the assignment arm against `"[]="`.
-    if at is TyObj {
-      const trap = objFieldType(at, "[]")
-      if trap >= 0 {
-        const tt = T.tys[trap]
-        if tt is TyFunc {
-          if tt.fnParamTypes.length == 1 {
-            if !assignableExpr(n.idxIndex, idxTy, tt.fnParamTypes[0]) {
-              tErr(
-                "index: expected " +
-                  tyToStr(tt.fnParamTypes[0]) +
-                  ", got " +
-                  tyToStr(idxTy),
-                ix,
-              )
-            }
-            return tt.fnRet
-          }
-        }
-      }
-      tErr("cannot index non-array " + tyToStr(arrTy), ix)
-      return TY_ERR
-    }
-    if !assignable(idxTy, TY_I32) {
-      tErr("array index must be i32, got " + tyToStr(idxTy), ix)
-    }
-    if at is TyArray { return at.aElem }
-    if at is TyErr { return TY_ERR }
-    // Indexing a string yields the i32 code point at that position.
-    if at is TyPrim {
-      if at.primName == "string" { return TY_I32 }
-    }
-    tErr("cannot index non-array " + tyToStr(arrTy), ix)
-    return TY_ERR
-    // ── object literal ──────────────────────────────────────────────────────────
-    // `{ x: e, y: e }` types as a structural `TyObj` whose fields carry each value's
-    // checked type. Assignability against an annotation/param/return then matches it
-    // to a declared struct by structure (`assignable`), so field ORDER need not match
-    // the declaration. Reads each FieldInit child INLINE (Finding 2).
+    return checkIndexNode(n, ix)
   } else if n is ObjLit {
-    const fields = n.objFields
-    const fnames: string[] = []
-    const ftys: i32[] = []
-    let i = 0
-    while i < fields.length {
-      const fnode = P.nodes[fields[i]]
-      if fnode is FieldInit {
-        fnames.push(fnode.fiName)
-        ftys.push(checkNode(fnode.fiValue))
-      }
-      i = i + 1
-    }
-    return mkObjTy(fnames, ftys)
-    // ── type guard `x is T` ─────────────────────────────────────────────────────
-    // Always a `bool`. Checks the operand and that `T` names a known type. The actual
-    // narrowing of `x` to `T` happens in the THEN branch of an enclosing `if` (see the
-    // IfStmt case); used elsewhere it is just a boolean test.
+    return checkObjLitNode(n, ix)
   } else if n is IsExpr {
-    const objTy = checkNode(n.isObj)
-    const chkTy = nameToTy(n.isVariant)
-    if chkTy < 0 {
-      tErr("unknown type '" + n.isVariant + "' in 'is'", ix)
-    } else if n.isVariant != "null" {
-      // SOUNDNESS: `x is T` is meaningful only when `T` is one of the value's
-      // possible variants (or `null`). When the value's type is a union/nullable,
-      // the check type must be assignable to its non-null part — otherwise the
-      // test can never hold (e.g. `(string | i32) is boolean`, or a struct outside
-      // the union), so reject it rather than compile an always-false branch. Only
-      // a union/nullable value is "testable"; a plain (incl. generic/inferred)
-      // operand is left alone, matching the host.
-      const ot = T.tys[objTy]
-      let testable = false
-      let baseTy = objTy
-      if ot is TyUnion {
-        testable = true
-      } else if ot is TyNullable {
-        testable = true
-        baseTy = ot.nInner
-      }
-      if testable {
-        if !assignable(chkTy, baseTy) {
-          tErr(
-            "`is` check type '" +
-              n.isVariant +
-              "' is not a variant of " +
-              tyToStr(objTy),
-            ix,
-          )
-        }
-      }
-    }
-    return TY_BOOL
-    // ── optional member `o?.field` ─────────────────────────────────────────────
-    // Null-safe access: a NULLABLE receiver reads the field off its inner type and
-    // re-wraps the result nullable (`{x: i32} | null` ?. x → `i32 | null`); a
-    // non-null receiver behaves like a plain member read.
+    return checkIsExprNode(n, ix)
   } else if n is OptMember {
-    // `x?.y` keys the same narrowed place as `x.y` (host `placeKey`).
-    const omKey = placeKeyOf(ix)
-    if omKey != "" {
-      const omOv = narrowedPathTy(omKey)
-      if omOv >= 0 { return symMem(ix, omOv) }
-    }
-    const recv = checkNode(n.omObj)
-    // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
-    if recv < 0 { return TY_ERR }
-    const rcv = T.tys[recv]
-    let wasNullable = false
-    let baseTy = recv
-    if rcv is TyNullable {
-      wasNullable = true
-      baseTy = rcv.nInner
-      // Peel a SECOND nullable layer too: the host's `flattenType` collapses
-      // `T??` to `T?`, so a doubly-nullable receiver (`m[k]?.v` off a nullable
-      // map read) still reads its field with one `?.`.
-      if baseTy >= 0 {
-        const rcv2 = T.tys[baseTy]
-        if rcv2 is TyNullable { baseTy = rcv2.nInner }
-      }
-    }
-    if baseTy < 0 { return TY_ERR }
-    const bt = T.tys[baseTy]
-    if bt is TyObj {
-      const oft = objFieldType(bt, n.omProp)
-      if oft < 0 {
-        tErr("no field '" + n.omProp + "' on " + tyToStr(baseTy), ix)
-        return TY_ERR
-      }
-      if wasNullable { return symMem(ix, mkNullableTy(oft)) }
-      return symMem(ix, oft)
-    }
-    if bt is TyErr { return TY_ERR }
-    // Shared union field through `?.` — same rule as the plain member read.
-    if bt is TyUnion {
-      const osf = sharedUnionFieldTy(bt, n.omProp)
-      if osf >= 0 {
-        if wasNullable { return symMem(ix, mkNullableTy(osf)) }
-        return symMem(ix, osf)
-      }
-    }
-    tErr(
-      "member access '?." + n.omProp + "' on non-object " + tyToStr(recv),
-      ix,
-    )
-    return TY_ERR
+    return checkOptMemberNode(n, ix)
   } else if n is ErrExpr {
     return TY_ERR
     // ── let / const ─────────────────────────────────────────────────────────────
@@ -7339,21 +7036,7 @@ function checkNodeReal(ix: i32) {
     return checkFuncDeclNode(n, ix)
     // ── while ─────────────────────────────────────────────────────────────────
   } else if n is WhileStmt {
-    const wc = checkNode(n.whileCond)
-    if !assignable(wc, TY_BOOL) {
-      tErr("while-condition must be boolean, got " + tyToStr(wc), ix)
-    }
-    // Definite-assignment: a loop body may run ZERO times, so an assignment
-    // inside it is NOT guaranteed to reach code after the loop. Check the body
-    // with the live state (so a read AFTER an in-body assignment is fine), then
-    // RESTORE the pre-loop state for the fall-through.
-    const daLoopEntry = daSnapshot()
-    checkNode(n.whileBody)
-    daRestore(daLoopEntry)
-    return TY_VOID
-    // ── break / continue ────────────────────────────────────────────────────────
-    // Valid only inside a loop, but loop-nesting is not tracked yet, so they are
-    // accepted unconditionally (a misplaced `break`/`continue` is a parser concern).
+    return checkWhileStmtNode(n, ix)
   } else if n is BreakStmt {
     return TY_VOID
   } else if n is ContinueStmt {
@@ -7362,163 +7045,17 @@ function checkNodeReal(ix: i32) {
     // A numeric range loop: the bounds (and step, if present) must be i32; the loop
     // variable is i32 in the body's scope.
   } else if n is ForRange {
-    const frFrom = checkNode(n.frFrom)
-    const frTo = checkNode(n.frTo)
-    if !assignable(frFrom, TY_I32) || !assignable(frTo, TY_I32) {
-      tErr(
-        "for-range bounds must be i32, got " +
-          tyToStr(frFrom) +
-          " and " +
-          tyToStr(frTo),
-        ix,
-      )
-    }
-    if n.frStep >= 0 {
-      const frStep = checkNode(n.frStep)
-      if !assignable(frStep, TY_I32) {
-        tErr("for-range step must be i32, got " + tyToStr(frStep), ix)
-      }
-      // A range `for` with a LITERAL `step 0` never advances its loop variable —
-      // a degenerate / infinite loop. Catch only a literal integer 0 (a negative
-      // step parses as a Unary wrapping the NumLit, and a runtime-0 step is not
-      // statically known, so neither is matched here).
-      const stepNode = P.nodes[n.frStep]
-      if stepNode is NumLit {
-        if stepNode.numText == "0" { tErr("`for` step is 0", n.frStep) }
-      }
-    }
-    pushScope(ix)
-    declare(n.frVar, TY_I32)
-    if symEnabled != 0 { symDecl(n.frVar, ix, TY_I32, 0) }
-    // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
-    const daFrEntry = daSnapshot()
-    // The loop variable is always assigned in the body; clear it from the dead-zone
-    // so a body read isn't flagged when the loop var SHADOWS a still-uninitialized
-    // module global of the same name (the `daRestore` below preserves that global's
-    // TDZ for any post-loop read).
-    daMarkAssigned(n.frVar)
-    checkNode(n.frBody)
-    daRestore(daFrEntry)
-    popScope()
-    return TY_VOID
-    // ── for v in iterable ───────────────────────────────────────────────────────
-    // A for-in loop over an array: the loop variable binds to the element type.
+    return checkForRangeNode(n, ix)
   } else if n is ForIn {
-    const iterTy = checkNode(n.fiIter)
-    let elemTy = TY_ERR
-    const it = T.tys[iterTy]
-    if it is TyArray {
-      elemTy = it.aElem
-    } else if it is TyMap {
-      // `for k in m` over a map / set iterates its KEYS (the key type) — like
-      // `for k in m.keys()`.
-      elemTy = it.mKey
-    } else if isStringTy(iterTy) {
-      // `for ch in s` iterates a STRING's code units — each an i32, exactly as `s[i]`
-      // reads one. A string IS the raw i32 array at the wasm level, so this rides the
-      // same element-iteration machinery as an `i32[]`.
-      elemTy = TY_I32
-    } else if it is TyErr {
-      elemTy = TY_ERR
-    } else {
-      tErr("for-in expects an array or map, got " + tyToStr(iterTy), ix)
-    }
-    pushScope(ix)
-    declare(n.fiVar, elemTy)
-    if symEnabled != 0 { symDecl(n.fiVar, ix, elemTy, 0) }
-    // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
-    const daFiEntry = daSnapshot()
-    // See ForRange: clear the loop var from the dead-zone for the body so it can't
-    // collide with a shadowed, still-uninitialized module global of the same name.
-    daMarkAssigned(n.fiVar)
-    checkNode(n.fiBody)
-    daRestore(daFiEntry)
-    popScope()
-    return TY_VOID
-    // ── if / else ─────────────────────────────────────────────────────────────
+    return checkForInNode(n, ix)
   } else if n is MatchExpr {
     return checkMatchExprNode(n, ix)
   } else if n is IfStmt {
     return checkIfStmtNode(n, ix)
   } else if n is RetStmt {
-    const want = T.curRet
-    if n.retArg < 0 {
-      if want >= 0 && !assignable(TY_VOID, want) {
-        tErr("return needs a value of type " + tyToStr(want), ix)
-      }
-      return TY_VOID
-    }
-    // Under a PENDING return type (-2: this function's return is being inferred),
-    // record the returned type as a witness instead of checking a mismatch.
-    if want == -2 {
-      // `return <expr>` is always a value return position.
-      fnSawValueRet = true
-      noteInferredRet(checkNode(n.retArg))
-      return TY_VOID
-    }
-    // Bidirectional: `function mk(): (i32) => i32 { return (x) => … }` infers the returned
-    // lambda's param from the declared return type (also through a composite return shape).
-    if want >= 0 { seedExpected(n.retArg, want) }
-    const got = checkNode(n.retArg)
-    // Redundant-return rule: witness the explicit return's NATURAL type (before
-    // constrainEmpty); an annotation-influenced return disqualifies the function.
-    if retInfluencedByAnnot(n.retArg) { retNaturalErr = true }
-    noteNaturalRet(got)
-    // An explicit `return inner` of an empty collection pins its element from the
-    // declared return type — usage-driven inference clearing the floor.
-    constrainEmpty(got, want)
-    if want >= 0 && !assignableExpr(n.retArg, got, want) {
-      tErr(
-        "return type mismatch: expected " +
-          tyToStr(want) +
-          ", got " +
-          tyToStr(got),
-        ix,
-      )
-    }
-    return TY_VOID
-    // ── block ─────────────────────────────────────────────────────────────────
+    return checkRetStmtNode(n, ix)
   } else if n is Block {
-    pushScope(ix)
-    const stmts = n.blkStmts
-    const savedRTP = retTailPos
-    let tailTy = TY_VOID
-    let i = 0
-    while i < stmts.length {
-      // Only the LAST statement is the block's value (and inherits tail position); the
-      // rest are not the block's value, so they never carry the return tail.
-      if i == stmts.length - 1 {
-        retTailPos = savedRTP
-      } else {
-        retTailPos = false
-      }
-      const sty = checkNode(stmts[i])
-      if i == stmts.length - 1 {
-        // A value-producing trailing expression is the block's value; a trailing
-        // STATEMENT (return / let / assignment / loop) leaves the block valueless.
-        if !isStmtNode(stmts[i]) {
-          tailTy = sty
-        } else {
-          // An if-EXPRESSION tail (`{ … if c { v1 } else { v2 } }`) IS the block's value, even
-          // though an `IfStmt` is otherwise a statement node — `checkNode` already returned the
-          // arms' join (`joinTys`). Non-void only for a genuine value-`if` WITH an else (a
-          // statement-`if`/else-less tail stays valueless), so a nested if-expression as an
-          // if-expression ARM (`if c { if d { 1 } else { 2 } } else { 3 }`) types as a value.
-          const lastN2 = P.nodes[stmts[i]]
-          if lastN2 is IfStmt {
-            if lastN2.ifElse >= 0 {
-              if sty != TY_VOID && sty != TY_ERR { tailTy = sty }
-            }
-          }
-        }
-      }
-      i = i + 1
-    }
-    retTailPos = savedRTP
-    popScope()
-    blockTailTy = tailTy
-    return TY_VOID
-    // ── program ───────────────────────────────────────────────────────────────
+    return checkBlockNode(n, ix)
   } else if n is Program {
     return checkProgramNode(n)
   } else if n is Param {
@@ -9346,3 +8883,517 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   return TY_VOID
 }
 // ── return ────────────────────────────────────────────────────────────────
+
+// Extracted from `checkNodeReal`'s `Unary` arm (C3: thin the dispatcher).
+function checkUnaryNode(n: Unary, ix: i32) {
+  const arg = checkNode(n.unArg)
+  if n.unOp == "!" {
+    if !assignable(arg, TY_BOOL) {
+      tErr("operator '!' expects boolean, got " + tyToStr(arg), ix)
+    }
+    return TY_BOOL
+  }
+  // Postfix `x++` / `x--` (`"p+"`/`"p-"`): `unArg` is the `x = x ± 1` assignment,
+  // already fully checked by `checkNode` above (const-reassign, numeric arithmetic,
+  // assignability). The postfix expression's type is that of the operand.
+  if n.unOp == "p+" || n.unOp == "p-" {
+    if !isNumeric(arg) {
+      tErr("'++'/'--' expects a numeric variable, got " + tyToStr(arg), ix)
+      return TY_ERR
+    }
+    return arg
+  }
+  // "-"
+  if !isNumeric(arg) {
+    tErr("unary '-' expects a numeric type, got " + tyToStr(arg), ix)
+    return TY_ERR
+  }
+  // Host parity: the host folds `-lit` into a signed literal BEFORE defaulting,
+  // so `-2147483648` (magnitude 2^31, one past I32_MAX) sits at I32_MIN and is
+  // i32 — even though the bare operand literal alone types i64.
+  if n.unOp == "-" {
+    if isNegI32MinLit(n.unArg) { return TY_I32 }
+  }
+  return arg
+}
+// ── binary ────────────────────────────────────────────────────────────────
+
+// Extracted from `checkNodeReal`'s `Member` arm (C3: thin the dispatcher).
+function checkMemberNode(n: Member, ix: i32) {
+  // A flow-narrowed property path (`if o.v is T { … }`) overrides the stored
+  // field type within the branch (the host's `narrowedPaths` overlay).
+  const mKey = placeKeyOf(ix)
+  if mKey != "" {
+    const mOv = narrowedPathTy(mKey)
+    if mOv >= 0 { return symMem(ix, mOv) }
+  }
+  const objTy = checkNode(n.memObj)
+  // A NEGATIVE receiver type is an unpinned inference hole (the `-1` element
+  // of a never-pinned empty `[]` read back through `xs[i]`), not an arena
+  // index — indexing `T.tys` with it would CRASH. The hole itself is already
+  // reported (`flushUninferred` / the unknown-annotation path), so don't
+  // cascade.
+  if objTy < 0 { return TY_ERR }
+  const ot = T.tys[objTy]
+  if ot is TyObj {
+    let ft = objFieldType(ot, n.memProp)
+    if ft < 0 {
+      tErr("no field '" + n.memProp + "' on " + tyToStr(objTy), ix)
+      return TY_ERR
+    }
+    return symMem(ix, ft)
+  }
+  if ot is TyErr { return TY_ERR }
+  // SHARED-FIELD ACCESS over a struct union — `(A | B).tag` when every
+  // member carries the field at the same type (the host's
+  // `sharedUnionField`); an unshared field still needs an `is` narrowing.
+  if ot is TyUnion {
+    const sf = sharedUnionFieldTy(ot, n.memProp)
+    if sf >= 0 { return symMem(ix, sf) }
+    // The field is on SOME but not all members of the union — reading it is
+    // unsafe until the value is narrowed (`is`) to a member that has it.
+    // (NOT "non-object": the members ARE objects; the field just isn't shared.)
+    tErr(
+      "field '" +
+        n.memProp +
+        "' is not on every member of " +
+        tyToStr(objTy) +
+        " — narrow with `is` first",
+      ix,
+    )
+    return TY_ERR
+  }
+  // `.length` on an array, a map, or a string is an i32.
+  if ot is TyArray {
+    if n.memProp == "length" { return symMem(ix, TY_I32) }
+    tErr("no field '" + n.memProp + "' on array " + tyToStr(objTy), ix)
+    return TY_ERR
+  }
+  if ot is TyMap {
+    // `.length` and `.size` are both the live-entry count (an i32) — `.size` is the
+    // JS Map/Set name, `.length` the list-consistent alias; both read the same field.
+    if n.memProp == "length" { return symMem(ix, TY_I32) }
+    if n.memProp == "size" { return symMem(ix, TY_I32) }
+    tErr("no field '" + n.memProp + "' on map " + tyToStr(objTy), ix)
+    return TY_ERR
+  }
+  if ot is TyPrim {
+    if ot.primName == "string" {
+      if n.memProp == "length" { return symMem(ix, TY_I32) }
+      tErr("no field '" + n.memProp + "' on string", ix)
+      return TY_ERR
+    }
+  }
+  // Member access on an INFERENCE HOLE (`self.x` where `self` is the
+  // un-annotated param hole `?add.0` — host: `getChildType` pins the
+  // `Infer<Unknown>` to a growing object shape): record the demanded field
+  // and yield its derived hole; the call site pins both (A13).
+  if ot is TyVar {
+    if ot.tvName.length > 0 {
+      if ot.tvName[0] == '?' {
+        // `.length` is the i32 length an array / string / map exposes — treat it as that
+        // (not a struct field) so an un-annotated param used as a collection (`self[i]` +
+        // `self.length`) infers without growing a bogus `{length}` shape that an array
+        // argument can't satisfy. A NON-length field still grows the hole's struct shape.
+        if n.memProp == "length" { return symMem(ix, TY_I32) }
+        return symMem(ix, holeMemberTy(ot.tvName, n.memProp))
+      }
+    }
+  }
+  tErr("member access '." + n.memProp + "' on non-object " + tyToStr(objTy), ix)
+  return TY_ERR
+}
+// ── array literal ───────────────────────────────────────────────────────────
+// `[e, e, …]` types as `T[]` where `T` is the first element's type (the rest must
+// be assignable to it). An empty `[]` is `T[]` with an unknown element (`-1`),
+// assignable to any array — its concrete element is pinned by the binding's
+// annotation (`let a: i32[] = []`).
+
+// Extracted from `checkNodeReal`'s `ArrayLit` arm (C3: thin the dispatcher).
+function checkArrayLitNode(n: ArrayLit, ix: i32) {
+  const elems = n.arrElems
+  if elems.length < 1 { return mkArrayTy(-1) }
+  let elemTy = checkNode(elems[0])
+  let ei = 1
+  while ei < elems.length {
+    const et = checkNode(elems[ei])
+    // Host parity: the element type is the UNION of every element's type
+    // (flattened/deduped) — `[a, b, c]` over mixed struct variants types as
+    // `(A | B | C)[]`; an annotation then checks each member structurally.
+    elemTy = joinTys(elemTy, et)
+    ei = ei + 1
+  }
+  return mkArrayTy(elemTy)
+}
+// ── index `a[i]` ────────────────────────────────────────────────────────────
+
+// Extracted from `checkNodeReal`'s `Index` arm (C3: thin the dispatcher).
+function checkIndexNode(n: Index, ix: i32) {
+  const arrTy = checkNode(n.idxArr)
+  const idxTy = checkNode(n.idxIndex)
+  // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
+  if arrTy < 0 { return TY_ERR }
+  const at = T.tys[arrTy]
+  // A MAP index `m[k]`: the key must match the map's key type; a READ yields the
+  // NULLABLE value (`V | null` — the key may be absent; default with `??`), and an
+  // assignment target `m[k] = v` accepts a plain `V` (assignable to `V | null`).
+  if at is TyMap {
+    if !assignable(idxTy, at.mKey) {
+      tErr(
+        "map key must be " + tyToStr(at.mKey) + ", got " + tyToStr(idxTy),
+        ix,
+      )
+    }
+    return mkNullableTy(at.mVal)
+  }
+  // Indexing an un-annotated-param HOLE (`self[i]`) constrains it to an array: demand an
+  // i32 index and return the element as a DERIVED hole (`?elem.<hole>`), resolved per call
+  // site against the pinned array's element (`substHoleByName`). Mirrors `holeMemberTy`
+  // for `self.x`, so an un-annotated `function head(self) { return self[0] }` infers.
+  if at is TyVar {
+    if !assignable(idxTy, TY_I32) {
+      tErr("array index must be i32, got " + tyToStr(idxTy), ix)
+    }
+    noteArrayDemand(at.tvName)
+    return mkTyVar("?elem." + at.tvName)
+  }
+  // Index TRAP (B13, host parser `indexTrap`): a user object that declares a
+  // `"[]"` method handles `o[k]` itself — the key checks against the
+  // method's parameter (so an i32-keyed trap indexed with a string REJECTS,
+  // index/wrong-key-type.vl), the result is its return. Checked BEFORE the
+  // native i32-index rule (a trap key may be any type); a struct with no
+  // `"[]"` falls through to the cannot-index error. Write traps (`o[k] = v`)
+  // check in the assignment arm against `"[]="`.
+  if at is TyObj {
+    const trap = objFieldType(at, "[]")
+    if trap >= 0 {
+      const tt = T.tys[trap]
+      if tt is TyFunc {
+        if tt.fnParamTypes.length == 1 {
+          if !assignableExpr(n.idxIndex, idxTy, tt.fnParamTypes[0]) {
+            tErr(
+              "index: expected " +
+                tyToStr(tt.fnParamTypes[0]) +
+                ", got " +
+                tyToStr(idxTy),
+              ix,
+            )
+          }
+          return tt.fnRet
+        }
+      }
+    }
+    tErr("cannot index non-array " + tyToStr(arrTy), ix)
+    return TY_ERR
+  }
+  if !assignable(idxTy, TY_I32) {
+    tErr("array index must be i32, got " + tyToStr(idxTy), ix)
+  }
+  if at is TyArray { return at.aElem }
+  if at is TyErr { return TY_ERR }
+  // Indexing a string yields the i32 code point at that position.
+  if at is TyPrim {
+    if at.primName == "string" { return TY_I32 }
+  }
+  tErr("cannot index non-array " + tyToStr(arrTy), ix)
+  return TY_ERR
+}
+// ── object literal ──────────────────────────────────────────────────────────
+// `{ x: e, y: e }` types as a structural `TyObj` whose fields carry each value's
+// checked type. Assignability against an annotation/param/return then matches it
+// to a declared struct by structure (`assignable`), so field ORDER need not match
+// the declaration. Reads each FieldInit child INLINE (Finding 2).
+
+// Extracted from `checkNodeReal`'s `ObjLit` arm (C3: thin the dispatcher).
+function checkObjLitNode(n: ObjLit, ix: i32) {
+  const fields = n.objFields
+  const fnames: string[] = []
+  const ftys: i32[] = []
+  let i = 0
+  while i < fields.length {
+    const fnode = P.nodes[fields[i]]
+    if fnode is FieldInit {
+      fnames.push(fnode.fiName)
+      ftys.push(checkNode(fnode.fiValue))
+    }
+    i = i + 1
+  }
+  return mkObjTy(fnames, ftys)
+}
+// ── type guard `x is T` ─────────────────────────────────────────────────────
+// Always a `bool`. Checks the operand and that `T` names a known type. The actual
+// narrowing of `x` to `T` happens in the THEN branch of an enclosing `if` (see the
+// IfStmt case); used elsewhere it is just a boolean test.
+
+// Extracted from `checkNodeReal`'s `IsExpr` arm (C3: thin the dispatcher).
+function checkIsExprNode(n: IsExpr, ix: i32) {
+  const objTy = checkNode(n.isObj)
+  const chkTy = nameToTy(n.isVariant)
+  if chkTy < 0 {
+    tErr("unknown type '" + n.isVariant + "' in 'is'", ix)
+  } else if n.isVariant != "null" {
+    // SOUNDNESS: `x is T` is meaningful only when `T` is one of the value's
+    // possible variants (or `null`). When the value's type is a union/nullable,
+    // the check type must be assignable to its non-null part — otherwise the
+    // test can never hold (e.g. `(string | i32) is boolean`, or a struct outside
+    // the union), so reject it rather than compile an always-false branch. Only
+    // a union/nullable value is "testable"; a plain (incl. generic/inferred)
+    // operand is left alone, matching the host.
+    const ot = T.tys[objTy]
+    let testable = false
+    let baseTy = objTy
+    if ot is TyUnion {
+      testable = true
+    } else if ot is TyNullable {
+      testable = true
+      baseTy = ot.nInner
+    }
+    if testable {
+      if !assignable(chkTy, baseTy) {
+        tErr(
+          "`is` check type '" +
+            n.isVariant +
+            "' is not a variant of " +
+            tyToStr(objTy),
+          ix,
+        )
+      }
+    }
+  }
+  return TY_BOOL
+}
+// ── optional member `o?.field` ─────────────────────────────────────────────
+// Null-safe access: a NULLABLE receiver reads the field off its inner type and
+// re-wraps the result nullable (`{x: i32} | null` ?. x → `i32 | null`); a
+// non-null receiver behaves like a plain member read.
+
+// Extracted from `checkNodeReal`'s `OptMember` arm (C3: thin the dispatcher).
+function checkOptMemberNode(n: OptMember, ix: i32) {
+  // `x?.y` keys the same narrowed place as `x.y` (host `placeKey`).
+  const omKey = placeKeyOf(ix)
+  if omKey != "" {
+    const omOv = narrowedPathTy(omKey)
+    if omOv >= 0 { return symMem(ix, omOv) }
+  }
+  const recv = checkNode(n.omObj)
+  // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
+  if recv < 0 { return TY_ERR }
+  const rcv = T.tys[recv]
+  let wasNullable = false
+  let baseTy = recv
+  if rcv is TyNullable {
+    wasNullable = true
+    baseTy = rcv.nInner
+    // Peel a SECOND nullable layer too: the host's `flattenType` collapses
+    // `T??` to `T?`, so a doubly-nullable receiver (`m[k]?.v` off a nullable
+    // map read) still reads its field with one `?.`.
+    if baseTy >= 0 {
+      const rcv2 = T.tys[baseTy]
+      if rcv2 is TyNullable { baseTy = rcv2.nInner }
+    }
+  }
+  if baseTy < 0 { return TY_ERR }
+  const bt = T.tys[baseTy]
+  if bt is TyObj {
+    const oft = objFieldType(bt, n.omProp)
+    if oft < 0 {
+      tErr("no field '" + n.omProp + "' on " + tyToStr(baseTy), ix)
+      return TY_ERR
+    }
+    if wasNullable { return symMem(ix, mkNullableTy(oft)) }
+    return symMem(ix, oft)
+  }
+  if bt is TyErr { return TY_ERR }
+  // Shared union field through `?.` — same rule as the plain member read.
+  if bt is TyUnion {
+    const osf = sharedUnionFieldTy(bt, n.omProp)
+    if osf >= 0 {
+      if wasNullable { return symMem(ix, mkNullableTy(osf)) }
+      return symMem(ix, osf)
+    }
+  }
+  tErr("member access '?." + n.omProp + "' on non-object " + tyToStr(recv), ix)
+  return TY_ERR
+}
+
+// Extracted from `checkNodeReal`'s `WhileStmt` arm (C3: thin the dispatcher).
+function checkWhileStmtNode(n: WhileStmt, ix: i32) {
+  const wc = checkNode(n.whileCond)
+  if !assignable(wc, TY_BOOL) {
+    tErr("while-condition must be boolean, got " + tyToStr(wc), ix)
+  }
+  // Definite-assignment: a loop body may run ZERO times, so an assignment
+  // inside it is NOT guaranteed to reach code after the loop. Check the body
+  // with the live state (so a read AFTER an in-body assignment is fine), then
+  // RESTORE the pre-loop state for the fall-through.
+  const daLoopEntry = daSnapshot()
+  checkNode(n.whileBody)
+  daRestore(daLoopEntry)
+  return TY_VOID
+}
+// ── break / continue ────────────────────────────────────────────────────────
+// Valid only inside a loop, but loop-nesting is not tracked yet, so they are
+// accepted unconditionally (a misplaced `break`/`continue` is a parser concern).
+
+// Extracted from `checkNodeReal`'s `ForRange` arm (C3: thin the dispatcher).
+function checkForRangeNode(n: ForRange, ix: i32) {
+  const frFrom = checkNode(n.frFrom)
+  const frTo = checkNode(n.frTo)
+  if !assignable(frFrom, TY_I32) || !assignable(frTo, TY_I32) {
+    tErr(
+      "for-range bounds must be i32, got " +
+        tyToStr(frFrom) +
+        " and " +
+        tyToStr(frTo),
+      ix,
+    )
+  }
+  if n.frStep >= 0 {
+    const frStep = checkNode(n.frStep)
+    if !assignable(frStep, TY_I32) {
+      tErr("for-range step must be i32, got " + tyToStr(frStep), ix)
+    }
+    // A range `for` with a LITERAL `step 0` never advances its loop variable —
+    // a degenerate / infinite loop. Catch only a literal integer 0 (a negative
+    // step parses as a Unary wrapping the NumLit, and a runtime-0 step is not
+    // statically known, so neither is matched here).
+    const stepNode = P.nodes[n.frStep]
+    if stepNode is NumLit {
+      if stepNode.numText == "0" { tErr("`for` step is 0", n.frStep) }
+    }
+  }
+  pushScope(ix)
+  declare(n.frVar, TY_I32)
+  if symEnabled != 0 { symDecl(n.frVar, ix, TY_I32, 0) }
+  // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
+  const daFrEntry = daSnapshot()
+  // The loop variable is always assigned in the body; clear it from the dead-zone
+  // so a body read isn't flagged when the loop var SHADOWS a still-uninitialized
+  // module global of the same name (the `daRestore` below preserves that global's
+  // TDZ for any post-loop read).
+  daMarkAssigned(n.frVar)
+  checkNode(n.frBody)
+  daRestore(daFrEntry)
+  popScope()
+  return TY_VOID
+}
+// ── for v in iterable ───────────────────────────────────────────────────────
+// A for-in loop over an array: the loop variable binds to the element type.
+
+// Extracted from `checkNodeReal`'s `ForIn` arm (C3: thin the dispatcher).
+function checkForInNode(n: ForIn, ix: i32) {
+  const iterTy = checkNode(n.fiIter)
+  let elemTy = TY_ERR
+  const it = T.tys[iterTy]
+  if it is TyArray {
+    elemTy = it.aElem
+  } else if it is TyMap {
+    // `for k in m` over a map / set iterates its KEYS (the key type) — like
+    // `for k in m.keys()`.
+    elemTy = it.mKey
+  } else if isStringTy(iterTy) {
+    // `for ch in s` iterates a STRING's code units — each an i32, exactly as `s[i]`
+    // reads one. A string IS the raw i32 array at the wasm level, so this rides the
+    // same element-iteration machinery as an `i32[]`.
+    elemTy = TY_I32
+  } else if it is TyErr {
+    elemTy = TY_ERR
+  } else {
+    tErr("for-in expects an array or map, got " + tyToStr(iterTy), ix)
+  }
+  pushScope(ix)
+  declare(n.fiVar, elemTy)
+  if symEnabled != 0 { symDecl(n.fiVar, ix, elemTy, 0) }
+  // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
+  const daFiEntry = daSnapshot()
+  // See ForRange: clear the loop var from the dead-zone for the body so it can't
+  // collide with a shadowed, still-uninitialized module global of the same name.
+  daMarkAssigned(n.fiVar)
+  checkNode(n.fiBody)
+  daRestore(daFiEntry)
+  popScope()
+  return TY_VOID
+}
+// ── if / else ─────────────────────────────────────────────────────────────
+
+// Extracted from `checkNodeReal`'s `RetStmt` arm (C3: thin the dispatcher).
+function checkRetStmtNode(n: RetStmt, ix: i32) {
+  const want = T.curRet
+  if n.retArg < 0 {
+    if want >= 0 && !assignable(TY_VOID, want) {
+      tErr("return needs a value of type " + tyToStr(want), ix)
+    }
+    return TY_VOID
+  }
+  // Under a PENDING return type (-2: this function's return is being inferred),
+  // record the returned type as a witness instead of checking a mismatch.
+  if want == -2 {
+    // `return <expr>` is always a value return position.
+    fnSawValueRet = true
+    noteInferredRet(checkNode(n.retArg))
+    return TY_VOID
+  }
+  // Bidirectional: `function mk(): (i32) => i32 { return (x) => … }` infers the returned
+  // lambda's param from the declared return type (also through a composite return shape).
+  if want >= 0 { seedExpected(n.retArg, want) }
+  const got = checkNode(n.retArg)
+  // Redundant-return rule: witness the explicit return's NATURAL type (before
+  // constrainEmpty); an annotation-influenced return disqualifies the function.
+  if retInfluencedByAnnot(n.retArg) { retNaturalErr = true }
+  noteNaturalRet(got)
+  // An explicit `return inner` of an empty collection pins its element from the
+  // declared return type — usage-driven inference clearing the floor.
+  constrainEmpty(got, want)
+  if want >= 0 && !assignableExpr(n.retArg, got, want) {
+    tErr(
+      "return type mismatch: expected " + tyToStr(want) + ", got " + tyToStr(got),
+      ix,
+    )
+  }
+  return TY_VOID
+}
+// ── block ─────────────────────────────────────────────────────────────────
+
+// Extracted from `checkNodeReal`'s `Block` arm (C3: thin the dispatcher).
+function checkBlockNode(n: Block, ix: i32) {
+  pushScope(ix)
+  const stmts = n.blkStmts
+  const savedRTP = retTailPos
+  let tailTy = TY_VOID
+  let i = 0
+  while i < stmts.length {
+    // Only the LAST statement is the block's value (and inherits tail position); the
+    // rest are not the block's value, so they never carry the return tail.
+    if i == stmts.length - 1 {
+      retTailPos = savedRTP
+    } else {
+      retTailPos = false
+    }
+    const sty = checkNode(stmts[i])
+    if i == stmts.length - 1 {
+      // A value-producing trailing expression is the block's value; a trailing
+      // STATEMENT (return / let / assignment / loop) leaves the block valueless.
+      if !isStmtNode(stmts[i]) {
+        tailTy = sty
+      } else {
+        // An if-EXPRESSION tail (`{ … if c { v1 } else { v2 } }`) IS the block's value, even
+        // though an `IfStmt` is otherwise a statement node — `checkNode` already returned the
+        // arms' join (`joinTys`). Non-void only for a genuine value-`if` WITH an else (a
+        // statement-`if`/else-less tail stays valueless), so a nested if-expression as an
+        // if-expression ARM (`if c { if d { 1 } else { 2 } } else { 3 }`) types as a value.
+        const lastN2 = P.nodes[stmts[i]]
+        if lastN2 is IfStmt {
+          if lastN2.ifElse >= 0 {
+            if sty != TY_VOID && sty != TY_ERR { tailTy = sty }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  retTailPos = savedRTP
+  popScope()
+  blockTailTy = tailTy
+  return TY_VOID
+}
+// ── program ───────────────────────────────────────────────────────────────
