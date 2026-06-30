@@ -325,33 +325,38 @@ export function resetParentLetCache() {
 // Fill `plCacheMap` with every function-scoped `LetDecl` reachable from `blockIx` (descending
 // into if/loop bodies — wasm locals are function-scoped), in the SAME pre-order `parentLetOf`
 // walked, FIRST-wins, so the map's entry for a name is the first declaration that walk found.
-function plBuildLetMap(blockIx: i32) {
-  if blockIx < 0 { return 0 }
-  const b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
+// Scan one statement node (or a block) for `let`/`const` declarations, recording each into
+// `plCacheMap` (first occurrence wins). Recurses through every body that shares the function's
+// local scope: BOTH branches of an `if`/`else if` CHAIN — crucially the else slot may be a bare
+// `Block` OR a nested `IfStmt` (an `else if`), and the old code descended only Blocks, so lets in
+// `else if` arms were invisible — plus `while`/`for` loop bodies and nested blocks. wasm locals are
+// function-scoped, so a binding ANYWHERE in the function must be found regardless of nesting.
+function plScanStmt(ix: i32) {
+  if ix < 0 { return 0 }
+  const st = P.nodes[ix]
+  if st is LetDecl {
+    if !plCacheMap.has(st.letName) { plCacheMap[st.letName] = ix }
+  } else if st is IfStmt {
+    plScanStmt(st.ifThen)
+    if st.ifElse >= 0 { plScanStmt(st.ifElse) }
+  } else if st is WhileStmt {
+    plScanStmt(st.whileBody)
+  } else if st is ForRange {
+    plScanStmt(st.frBody)
+  } else if st is ForIn {
+    plScanStmt(st.fiBody)
+  } else if st is Block {
+    const stmts = st.blkStmts
     let i = 0
     while i < stmts.length {
-      const st = P.nodes[stmts[i]]
-      if st is LetDecl {
-        if !plCacheMap.has(st.letName) { plCacheMap[st.letName] = stmts[i] }
-      } else if st is IfStmt {
-        plBuildLetMap(st.ifThen)
-        if st.ifElse >= 0 { plBuildLetMap(st.ifElse) }
-      } else if st is WhileStmt {
-        plBuildLetMap(st.whileBody)
-      } else if st is ForRange {
-        plBuildLetMap(st.frBody)
-      } else if st is ForIn {
-        plBuildLetMap(st.fiBody)
-      } else if st is Block {
-        plBuildLetMap(stmts[i])
-      }
+      plScanStmt(stmts[i])
       i = i + 1
     }
   }
   0
 }
+
+function plBuildLetMap(blockIx: i32) { plScanStmt(blockIx) }
 
 // Find a `LetDecl` for `name` anywhere in the parent body block (incl. nested if/loop
 // bodies — wasm locals are function-scoped). Returns its arena index or -1. Backed by the
