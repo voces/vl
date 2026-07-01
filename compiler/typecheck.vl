@@ -856,6 +856,13 @@ let bodyChecked: {[string]: boolean} = Map()
 // emitter SYNTHESIZES after checking (monomorphized instance bodies) fall past the end and
 // read back -1 via `nodeTyIxOf`, so a consumer falls back to its syntactic path there.
 let nodeTyIx: i32[] = []
+// NOMINAL-IDENTITY sidecar (C1): the `Ty`-arena indices of DECLARED STRUCT types (`cStructTyIxs`)
+// and of UNION-VARIANT MEMBER types (`cVariantMemberTyIxs`). A struct annotation's node reads
+// `nodeTyIsStruct` = "its recorded type IS a declared struct and NOT a variant member" — the emitter's
+// nominal classifier then confirms structurally instead of an O(nodes) `nameIsStructDecl` AST scan.
+// The arena stays purely STRUCTURAL (`TyObj` has no name); nominal-ness is checker metadata, not a Ty.
+let cStructTyIxs: i32[] = []
+let cVariantMemberTyIxs: i32[] = []
 let inferQuiet = false
 let cycleBreakCount = 0
 let inferTentative: string[] = []
@@ -6538,6 +6545,8 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
 // pass 2 checks every top-level statement.
 function checkProgramNode(n: Program) {
   const stmts = n.progStmts
+  cStructTyIxs = []
+  cVariantMemberTyIxs = []
   // Pass 0: register top-level struct `type` declarations BEFORE anything else, so
   // a struct name in a param/return/let annotation (pass 1/2) or in a later struct's
   // field resolves via `nameToTy`. Types register in source order, so a field may
@@ -6587,7 +6596,9 @@ function checkProgramNode(n: Program) {
         } else {
           const fnames0: string[] = []
           const ftys0: i32[] = []
-          cUserTypes[sd0.tdName] = mkObjTy(fnames0, ftys0)
+          const sIx0 = mkObjTy(fnames0, ftys0)
+          cUserTypes[sd0.tdName] = sIx0
+          cStructTyIxs.push(sIx0)
         }
       }
     } else if sd0 is UnionDecl {
@@ -6683,6 +6694,7 @@ function checkProgramNode(n: Program) {
             while vi < variants.length {
               const m = nameToTy(variants[vi])
               if m >= 0 {
+                cVariantMemberTyIxs.push(m)
                 resolvedAny = true
                 // A member that folds to `never` (an empty intersection —
                 // `A & B` over disjoint operands) DROPS from the union
@@ -7510,6 +7522,52 @@ export function nodeTyIsClosureArray(ix: i32) {
       const et = T.tys[e]
       if et is TyFunc { return true }
     }
+  }
+  false
+}
+// Linear membership over a small nominal-index set (a handful of struct/variant decls per program).
+function cTyIxListHas(xs: i32[], v: i32) {
+  let i = 0
+  while i < xs.length {
+    if xs[i] == v { return true }
+    i = i + 1
+  }
+  false
+}
+// STRUCTURAL (C1): node `ix`'s recorded type IS a declared struct and NOT a union-variant member —
+// the nominal analogue of the emitter's `isSName(tyNameOf(ix))`, read from the checker's arena-index
+// sets instead of an O(nodes) `nameIsStructDecl` AST scan. Under-approximates (a struct not covered by
+// `nodeTyIx`, or a UnionDecl struct-alias, reads false) so callers keep the name test as the fallback.
+export function nodeTyIsStruct(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  if !cTyIxListHas(cStructTyIxs, ty) { return false }
+  !cTyIxListHas(cVariantMemberTyIxs, ty)
+}
+// STRUCTURAL (C1): node `ix`'s recorded type IS an OBJECT union-variant member — the nominal analogue
+// of `variantIndexOf(tyNameOf(ix)) >= 0`, read from the checker's variant-member arena-index set. The
+// `is TyObj` guard excludes a TRANSPARENT single-member PRIMITIVE alias (`type Id = i32`, a one-member
+// union whose member `i32` lands in the set but denotes the scalar, not a variant box). Confirms only.
+export function nodeTyIsVariant(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  if !cTyIxListHas(cVariantMemberTyIxs, ty) { return false }
+  const t = T.tys[ty]
+  if t is TyObj { return true }
+  false
+}
+// STRUCTURAL (C1): node `ix`'s recorded type is a NULLABLE declared struct (`S | null`) — a
+// `TyNullable` whose inner is a declared struct (never a variant member, never `string | null`,
+// which its `TyPrim` inner already excludes). The nominal analogue of `retNulRefFlag`'s name path.
+export function nodeTyIsNulStruct(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const inner = t.nInner
+    if inner < 0 { return false }
+    if !cTyIxListHas(cStructTyIxs, inner) { return false }
+    return !cTyIxListHas(cVariantMemberTyIxs, inner)
   }
   false
 }
