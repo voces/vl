@@ -61,6 +61,37 @@ Deno.test({ name: "wasm-checker: a type error carries a message and a non-empty 
       `expected a non-empty range (diagEndCol), got ${JSON.stringify(d.range)}`,
     );
   }
+  // A plain type-soundness rejection carries NO category code.
+  if (d.code !== undefined) {
+    throw new Error(`expected no code on a type error, got ${JSON.stringify(d.code)}`);
+  }
+});
+
+Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // Type-valid, but codegen cannot lower the boxed value-union print — raised
+  // on the distinct channel whose `unsupported-lowering` code rides the
+  // `diagCodeLen`/`diagCodeByte` ABI into `VLDiagnostic.code`.
+  const diags = await checker.check(
+    [
+      "function pick(c: boolean): i32 | string {",
+      "  if c { return 1 }",
+      '  return "x"',
+      "}",
+      "print(pick(true))",
+      "",
+    ].join("\n"),
+    "/tmp/x.vl",
+    noSiblings,
+  );
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (diags[0].code !== "unsupported-lowering") {
+    throw new Error(
+      `expected code "unsupported-lowering", got: ${JSON.stringify(diags[0])}`,
+    );
+  }
 });
 
 Deno.test({ name: "wasm-checker: imports resolve through the injected reader", ignore }, async () => {
