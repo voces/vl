@@ -1126,6 +1126,14 @@ export function retStrArrFlag(tyIx: i32) {
   if arrElemRep(tyIx) == "string" { return 1 }
   0
 }
+// The `array.new_fixed` operand cap engines enforce (V8/binaryen/wasmtime reject
+// more than 10,000 operands). A literal longer than this cannot lower as one
+// `array.new_fixed`: in a FUNCTION body it builds chunked (`array.new_default` +
+// per-chunk `array.new_fixed`/`array.copy` — see `emitStr`/`emitArr`), and a
+// GLOBAL initializer holding one is routed through the start function
+// (`isConstInit` below returns false — a wasm constant expression has no locals
+// to chunk through).
+export const NEW_FIXED_MAX = 10000
 // Whether the initializer expression at `exprIx` is a valid WasmGC *constant
 // expression* — the forms `emitProgram` already lowers inline in the global section
 // (`i32.const`, `struct.new`, `array.new_fixed`, the string array). Const forms:
@@ -1134,18 +1142,23 @@ export function retStrArrFlag(tyIx: i32) {
 // field values are ALL const, and a `Paren` wrapping a const. EVERYTHING ELSE is
 // non-const: an `Ident` (a `global.get` of another global), a `Member` / `Index` (a
 // `struct.get` / `array.get` — the `curBuf = W.bytes` shape), a `Call`, a `BinExpr` /
-// `Unary` (computed), an `IsExpr`. CONSERVATIVE by construction: an unrecognized node
-// falls through to the non-const `false`, so a form we have not proven const-safe is
-// initialized via the start function rather than emitted as an invalid constexpr.
+// `Unary` (computed), an `IsExpr`. A literal past the `array.new_fixed` operand cap
+// is non-const too — it must build CHUNKED through locals, which only a function
+// body has (the raw `strText` length bounds the decoded length from above, so the
+// `+ 2` quote allowance never under-routes a too-long string). CONSERVATIVE by
+// construction: an unrecognized node falls through to the non-const `false`, so a
+// form we have not proven const-safe is initialized via the start function rather
+// than emitted as an invalid constexpr.
 export function isConstInit(exprIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
   if e is NumLit { return true }
   if e is CharLit { return true }
   if e is BoolLit { return true }
-  if e is StrLit { return true }
+  if e is StrLit { return e.strText.length <= NEW_FIXED_MAX + 2 }
   if e is Paren { return isConstInit(e.parInner) }
   if e is ArrayLit {
+    if e.arrElems.length > NEW_FIXED_MAX { return false }
     let i = 0
     while i < e.arrElems.length {
       if !isConstInit(e.arrElems[i]) { return false }

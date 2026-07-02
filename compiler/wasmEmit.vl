@@ -210,6 +210,7 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import {
+  NEW_FIXED_MAX,
   annArrowAt,
   annSplitParams,
   annSplitPipe,
@@ -445,6 +446,7 @@ import {
   leqIScratchBase,
   leqRBases,
   leqSScratchBase,
+  liBack,
   liKinds,
   liSlots,
   listIdxScratchBase,
@@ -6911,8 +6913,10 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
 // Lower a string literal `"abc"` onto `body`: decode `strText` to its code-point
 // vector, push each code point as `i32.const`, then `array.new_fixed $aTypeIdx <count>`
 // — i.e. the IDENTICAL shape an `i32[]` literal of those code points uses (a string is
-// CURRENTLY an `array i32` of code points; `docs/strings-design.md`). The UTF-8
-// `array i8` storage migration is the deliberate B7 follow-up and is NOT built here.
+// CURRENTLY an `array i32` of code points; `docs/strings-design.md`). A literal past
+// the `array.new_fixed` operand cap builds CHUNKED (`arrLitChunkStart`/`arrLitChunkFlush`)
+// — same value, engine-valid module. The UTF-8 `array i8` storage migration is the
+// deliberate B7 follow-up and is NOT built here.
 function emitStr(body: i32[], strIx: i32, fnIx: i32) {
   if !aUsed {
     return emitFail("emitProgram: string literal but array type not collected")
@@ -6920,6 +6924,22 @@ function emitStr(body: i32[], strIx: i32, fnIx: i32) {
   let s = P.nodes[strIx]
   if s is StrLit {
     const cps = decodeStr(strToCps(s.strText))
+    if cps.length > NEW_FIXED_MAX {
+      // Past the engines' `array.new_fixed` operand cap — build chunked (an
+      // unchunked emit validates nowhere). A string IS the raw i32 code-point
+      // array, so the finished backing is the value itself.
+      const dst = arrLitChunkStart("i32", 0, aTypeIdx, cps.length)
+      let ci = 0
+      let coff = 0
+      while ci < cps.length {
+        fbI32Const(cps[ci])
+        ci = ci + 1
+        coff = arrLitChunkFlush(dst, aTypeIdx, coff, ci, cps.length)
+      }
+      fbLocalGet(dst)
+      wU8(212) // 0xd4 ref.as_non_null (the slot is declared nullable)
+      return 0
+    }
     let i = 0
     while i < cps.length {
       fbI32Const(cps[i]) // 0x41 i32.const <code point>
@@ -7020,6 +7040,11 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
           "emitProgram: f32 array literal but f32 list type not collected",
         )
       }
+      let dstF32 = -1
+      let coffF32 = 0
+      if elems.length > NEW_FIXED_MAX {
+        dstF32 = arrLitChunkStart("f32", 0, fa32TypeIdx, elems.length)
+      }
       let i32f = 0
       while i32f < elems.length {
         if exprArray(elems[i32f], fnIx) || exprRefArray(elems[i32f], fnIx) {
@@ -7029,8 +7054,22 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
         // via `f32.convert_i32_s`) so the backing's element type matches.
         if emitExprAsF32(body, elems[i32f], fnIx) < 0 { return -1 }
         i32f = i32f + 1
+        if dstF32 >= 0 {
+          coffF32 = arrLitChunkFlush(
+            dstF32,
+            fa32TypeIdx,
+            coffF32,
+            i32f,
+            elems.length,
+          )
+        }
       }
-      fbArrayNewFixed(fa32TypeIdx, elems.length) // builds the f32 backing
+      if dstF32 >= 0 {
+        fbLocalGet(dstF32)
+        wU8(212) // 0xd4 ref.as_non_null — the chunk-built f32 backing
+      } else {
+        fbArrayNewFixed(fa32TypeIdx, elems.length) // builds the f32 backing
+      }
       fbI32Const(elems.length) // len
       fbI32Const(elems.length) // cap
       fbStructNew(fl32TypeIdx) // the f32-list wrapper
@@ -7042,6 +7081,11 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
           "emitProgram: f64 array literal but f64 list type not collected",
         )
       }
+      let dstF64 = -1
+      let coffF64 = 0
+      if elems.length > NEW_FIXED_MAX {
+        dstF64 = arrLitChunkStart("f64", 0, fa64TypeIdx, elems.length)
+      }
       let i = 0
       while i < elems.length {
         if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
@@ -7051,8 +7095,22 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
         // operand widened via `f64.convert_i32_s`) so the backing's element type matches.
         if emitExprAsF64(body, elems[i], fnIx) < 0 { return -1 }
         i = i + 1
+        if dstF64 >= 0 {
+          coffF64 = arrLitChunkFlush(
+            dstF64,
+            fa64TypeIdx,
+            coffF64,
+            i,
+            elems.length,
+          )
+        }
       }
-      fbArrayNewFixed(fa64TypeIdx, elems.length) // 0xfb 0x08; builds the f64 backing
+      if dstF64 >= 0 {
+        fbLocalGet(dstF64)
+        wU8(212) // 0xd4 ref.as_non_null — the chunk-built f64 backing
+      } else {
+        fbArrayNewFixed(fa64TypeIdx, elems.length) // 0xfb 0x08; builds the f64 backing
+      }
       fbI32Const(elems.length) // 0x41 i32.const (len)
       fbI32Const(elems.length) // 0x41 i32.const (cap)
       fbStructNew(fl64TypeIdx) // 0xfb 0x00 <f64-list wrapper struct type index>
@@ -7064,6 +7122,11 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
           "emitProgram: i64 array literal but i64 list type not collected",
         )
       }
+      let dstI64 = -1
+      let coffI64 = 0
+      if elems.length > NEW_FIXED_MAX {
+        dstI64 = arrLitChunkStart("i64", 0, ia64TypeIdx, elems.length)
+      }
       let i = 0
       while i < elems.length {
         if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
@@ -7073,8 +7136,22 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
         // extended via `i64.extend_i32_s`) so the backing's element type matches.
         if emitExprAsI64(body, elems[i], fnIx) < 0 { return -1 }
         i = i + 1
+        if dstI64 >= 0 {
+          coffI64 = arrLitChunkFlush(
+            dstI64,
+            ia64TypeIdx,
+            coffI64,
+            i,
+            elems.length,
+          )
+        }
       }
-      fbArrayNewFixed(ia64TypeIdx, elems.length) // builds the i64 backing
+      if dstI64 >= 0 {
+        fbLocalGet(dstI64)
+        wU8(212) // 0xd4 ref.as_non_null — the chunk-built i64 backing
+      } else {
+        fbArrayNewFixed(ia64TypeIdx, elems.length) // builds the i64 backing
+      }
       fbI32Const(elems.length) // len
       fbI32Const(elems.length) // cap
       fbStructNew(il64TypeIdx) // the i64-list wrapper
@@ -7086,15 +7163,28 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
           "emitProgram: string array literal but string list type not collected",
         )
       }
+      let dstStr = -1
+      let coffStr = 0
+      if elems.length > NEW_FIXED_MAX {
+        dstStr = arrLitChunkStart("str", 0, mkArrIdx, elems.length)
+      }
       let i = 0
       while i < elems.length {
         if emitExpr(body, elems[i], fnIx) < 0 { return -1 }
         i = i + 1
+        if dstStr >= 0 {
+          coffStr = arrLitChunkFlush(dstStr, mkArrIdx, coffStr, i, elems.length)
+        }
       }
-      fbArrayNewFixed(mkArrIdx, elems.length) // 0xfb 0x08; builds the string-ref backing
-      fbI32Const(elems.length)                // 0x41 i32.const (len)
-      fbI32Const(elems.length)                // 0x41 i32.const (cap)
-      fbStructNew(mkListIdx)                  // 0xfb 0x00 <string-list wrapper struct type index>
+      if dstStr >= 0 {
+        fbLocalGet(dstStr)
+        wU8(212) // 0xd4 ref.as_non_null — the chunk-built string-ref backing
+      } else {
+        fbArrayNewFixed(mkArrIdx, elems.length) // 0xfb 0x08; builds the string-ref backing
+      }
+      fbI32Const(elems.length) // 0x41 i32.const (len)
+      fbI32Const(elems.length) // 0x41 i32.const (cap)
+      fbStructNew(mkListIdx)   // 0xfb 0x00 <string-list wrapper struct type index>
       return 0
     }
     if isRefLit {
@@ -7153,6 +7243,11 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       // kind (`pendingListKind` 3 string / 4 f64 / 6 i64) so a bare `["a"]` / `[1.0]` / `[1,2]`
       // element builds the right list, not the default i32-list.
       const elemNest = rlElemKindTbl[rslot]
+      let dstRef = -1
+      let coffRef = 0
+      if elems.length > NEW_FIXED_MAX {
+        dstRef = arrLitChunkStart("ref", rslot, rlBackIdx[rslot], elems.length)
+      }
       let i = 0
       // A kind-9 element is itself a REF list (`Cell[]` of `Cell[][]`, any ref leaf, any depth):
       // its inner ref-list slot, seeded so each element builds as that inner list (recursively).
@@ -7223,12 +7318,26 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
         }
         pendingVariantIdx = -1
         i = i + 1
+        if dstRef >= 0 {
+          coffRef = arrLitChunkFlush(
+            dstRef,
+            rlBackIdx[rslot],
+            coffRef,
+            i,
+            elems.length,
+          )
+        }
       }
       pendingStructIdx = -1
-      fbArrayNewFixed(rlBackIdx[rslot], elems.length) // 0xfb 0x08; builds the ref backing
-      fbI32Const(elems.length)                        // 0x41 i32.const (len)
-      fbI32Const(elems.length)                        // 0x41 i32.const (cap)
-      fbStructNew(rlWrapIdx[rslot])                   // 0xfb 0x00 <this slot's ref-list wrapper>
+      if dstRef >= 0 {
+        fbLocalGet(dstRef)
+        wU8(212) // 0xd4 ref.as_non_null — the chunk-built ref backing
+      } else {
+        fbArrayNewFixed(rlBackIdx[rslot], elems.length) // 0xfb 0x08; builds the ref backing
+      }
+      fbI32Const(elems.length)      // 0x41 i32.const (len)
+      fbI32Const(elems.length)      // 0x41 i32.const (cap)
+      fbStructNew(rlWrapIdx[rslot]) // 0xfb 0x00 <this slot's ref-list wrapper>
       return 0
     }
     if !lUsed {
@@ -7240,6 +7349,11 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
     const litArr = nodeArrayElemIsLitUnion(arrIx)
     const savedArrLU = pendingLitUnion
     if litArr { pendingLitUnion = 1 }
+    let dstI32 = -1
+    let coffI32 = 0
+    if elems.length > NEW_FIXED_MAX {
+      dstI32 = arrLitChunkStart("i32", 0, aTypeIdx, elems.length)
+    }
     let i = 0
     while i < elems.length {
       if !litArr {
@@ -7254,9 +7368,17 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       }
       if emitExpr(body, elems[i], fnIx) < 0 { return -1 }
       i = i + 1
+      if dstI32 >= 0 {
+        coffI32 = arrLitChunkFlush(dstI32, aTypeIdx, coffI32, i, elems.length)
+      }
     }
     pendingLitUnion = savedArrLU
-    fbArrayNewFixed(aTypeIdx, elems.length) // 0xfb 0x08; builds the raw backing
+    if dstI32 >= 0 {
+      fbLocalGet(dstI32)
+      wU8(212) // 0xd4 ref.as_non_null — the chunk-built raw backing
+    } else {
+      fbArrayNewFixed(aTypeIdx, elems.length) // 0xfb 0x08; builds the raw backing
+    }
     // Wrap { backing, len = count, cap = count } via struct.new.
     fbI32Const(elems.length) // 0x41 i32.const (len)
     fbI32Const(elems.length) // 0x41 i32.const (cap)
@@ -9099,14 +9221,52 @@ function listIdxKindOf(ek: VKind): MfKind {
 function listIdxWrapSlot(kind: MfKind, slot: i32) {
   let k = 0
   while k < liKinds.length {
-    if liKinds[k] == kind && liSlots[k] == slot {
+    if liKinds[k] == kind && liSlots[k] == slot && liBack[k] == 0 {
       return listIdxScratchBase + 1 + k
     }
     k = k + 1
   }
   liKinds.push(kind)
   liSlots.push(slot)
+  liBack.push(0)
   listIdxScratchBase + liKinds.length
+}
+
+// Begin a CHUNKED long-literal build: allocate the full `n`-element backing
+// (`array.new_default $backTy`) into a FRESH backing-typed slot of the lazy
+// list frame (fresh per literal, so a nested chunked literal inside an element
+// expression cannot clobber this one), then open the first chunk by staging
+// the copy destination + offset under the coming element values. Returns the
+// destination slot.
+function arrLitChunkStart(kind: MfKind, rslot: i32, backTy: i32, n: i32) {
+  liKinds.push(kind)
+  liSlots.push(rslot)
+  liBack.push(1)
+  const dst = listIdxScratchBase + liKinds.length
+  fbI32Const(n)
+  fbArrayNewDefault(backTy) // 0xfb 0x07 <typeidx>
+  fbLocalSet(dst)
+  fbLocalGet(dst)           // the open chunk's copy destination …
+  fbI32Const(0)             // … and destination offset
+  dst
+}
+
+// Chunk boundary check after element `i` of `n` was pushed (`coff` = the open
+// chunk's first element). At `NEW_FIXED_MAX` elements or the literal's end,
+// close the chunk — `array.new_fixed` the pushed elements, `array.copy` them
+// into the destination — and open the next one (destination + offset) when
+// elements remain. Returns the new open-chunk start.
+function arrLitChunkFlush(dst: i32, backTy: i32, coff: i32, i: i32, n: i32) {
+  if i - coff < NEW_FIXED_MAX && i < n { return coff }
+  fbArrayNewFixed(backTy, i - coff) // the chunk source array
+  fbI32Const(0)                     // source offset
+  fbI32Const(i - coff)              // element count
+  fbArrayCopy(backTy, backTy)       // 0xfb 0x11 — consumes [dst, off, src, 0, k]
+  if i < n {
+    fbLocalGet(dst)
+    fbI32Const(i)
+  }
+  i
 }
 
 // Lower the `len`-bounds guard of a list `xs[i]` read/write. On entry the stack
