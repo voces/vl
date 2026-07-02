@@ -10,6 +10,13 @@
 
 import { nodeTyIsLitUnionAlias, nodeTyIsNulLitUnion } from "./typecheck"
 import {
+  REP_SCAL_F32,
+  REP_SCAL_F64,
+  REP_SCAL_I64,
+  repNodeScalarMask,
+  repReset,
+} from "./emit_rep"
+import {
   Block,
   Call,
   ForIn,
@@ -1927,28 +1934,30 @@ function scanPrintUse() {
         }
       }
     }
-    // Any `i64` type annotation anywhere flags the program as i64-using. Combined
-    // with `print`, it pulls in the `__print_i64__` import. (An over-approximation:
-    // a program with an i64 binding but no `print(<i64>)` would carry one unused
-    // import — harmless, and never the case for the existing byte-identical goldens,
-    // none of which name `i64`.)
+    // Any type annotation CONTAINING an i64/f64/f32 leaf anywhere — bare, `T[]`
+    // element, union member, `{[…]: T}` map value, `() => T` closure result,
+    // struct field, nullable inner — flags the program as using that scalar.
+    // Combined with `print`, it pulls in the matching `__print_*__` import (an
+    // over-approximation: a program with an i64 binding but no `print(<i64>)`
+    // carries one unused import — harmless; a MISSED flag is invalid wasm, a
+    // narrowed/read value `print`-routed to a non-existent import index).
     if pn is TypeRef {
-      // ANY annotation mentioning i64 — bare `i64`, `i64[]`, an `i64 | …` value union, a
-      // `{[…]: i64}` map — implies an i64 value may be printed; pull in the `__print_i64__`
-      // import (an over-approximation, harmless if unused; no existing golden names i64).
-      // Without the union/array forms a `print(u)` over `u: i64 | string` narrowed to i64
-      // routed `fbCall(4)` to a non-existent import — invalid wasm.
-      if strContains(pn.tyName, "i64") { sawI64Ann = true }
-      // ANY annotation mentioning f64 — bare `f64`, `f64[]`, an `f64 | null` value union, a
-      // `() => f64` closure, a `{[…]: f64}` map — implies an f64 value may be printed (a
-      // narrowed union read unboxes to a raw f64; a closure call yields one), same
-      // over-approximation as the i64/f32 forms. An exact `== "f64"` match missed both
-      // `f64 | null` and `() => f64`, routing their prints to import 0 — invalid wasm.
-      if strContains(pn.tyName, "f64") { sawF64 = true }
-      // ANY annotation mentioning f32 — bare `f32`, `f32[]`, an `f32 | …` union, a `{[…]:
-      // f32}` map — implies an f32 value may be printed; pull in the f32 print import (an
-      // over-approximation, harmless if unused; no existing golden names f32).
-      if strContains(pn.tyName, "f32") { sawF32 = true }
+      // EXACT containment via the checker's recorded type (`repTyScalarMask`
+      // walks the `Ty` arena transitively, terminating on recursive types) —
+      // so an alias whose NAME never spells the scalar (`type Big = i64`)
+      // still flags it. Only a node with no recorded type (an
+      // emitter-internal name past the typed-IR table) falls back to the
+      // name-substring test, which sees exactly what the synthesis spelled.
+      const scal = repNodeScalarMask(pscan)
+      if scal >= 0 {
+        if (scal & REP_SCAL_I64) != 0 { sawI64Ann = true }
+        if (scal & REP_SCAL_F64) != 0 { sawF64 = true }
+        if (scal & REP_SCAL_F32) != 0 { sawF32 = true }
+      } else {
+        if strContains(pn.tyName, "i64") { sawI64Ann = true }
+        if strContains(pn.tyName, "f64") { sawF64 = true }
+        if strContains(pn.tyName, "f32") { sawF32 = true }
+      }
     }
     // A float `.` literal flags the program as f64-using (the checker types it f64).
     // An INTEGER literal past the i32 range flags it as i64-using (the checker
@@ -2051,6 +2060,10 @@ export function emitProgram(rootIx: i32) {
     }
     resetLitAtoms()
     resetParentLetCache()
+    // The repOf scratch (visited stamps + component-mask memo) is keyed by
+    // `Ty`-arena index — stale across programs, since the arena is re-minted
+    // per compile.
+    repReset()
     // The ordered pass table — see the pass-manager block comment above
     // `passDoneHas` for the row grammar. WHY each ordering edge holds:
     //  · collectU first, so `collectS` knows whether the program's structs are
