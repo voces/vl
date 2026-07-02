@@ -244,9 +244,13 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
   allowed (uniquified in codegen). Future: ad-hoc overloading? Default "no" → `DECISIONS.md`.
 - 🟡 **B17. Diagnostics + lint.** BUILD OUT — the lint rule backlog (a few at a time). Shipped (see
   `CHANGELOG.md`): prefer-`const`, unused-import, dead/constant branch (`constant-condition`), `step 0`
-  (`for-step-zero`), unreachable-after-return / -break / -diverging-if/else. REMAINING:
-  - **unused function** — a never-referenced (non-exported) top-level function (today only unused
-    variables/params/imports are flagged; functions are excluded via the `kind` guard).
+  (`for-step-zero`), unreachable-after-return / -break / -diverging-if/else, unused function,
+  match-arm coverage via the unified lint walker, binding-keyed use tracking. REMAINING:
+  - **division by constant zero** — a literal / constant-foldable zero divisor: hard **error** for
+    integer division (`x / 0` WILL trap at runtime — wasm `i32.div_s`), **warning** for float
+    (`0.0 / 0.0` is a defined quiet NaN per IEEE-754, but a literal zero divisor is almost always
+    a typo). Runtime semantics stay untouched (int: trap; float: IEEE NaN/±inf — the standard
+    modern-language split). Precedent: the `for-step-zero` lint.
   - **discarded call result** — a non-void call whose result is silently dropped at statement
     position (`work()` for an `(): i32`) is likely a bug; warn (with an explicit-discard escape
     hatch TBD, e.g. `_ = work()`). Codegen correctly emits `drop` today
@@ -289,7 +293,8 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
 - 🟡 **B-debug. Source maps + trap diagnostics follow-ups.** REMAINING: (1) **full source-mapped
   stack traces** — map every wasm frame in the trap's stack → VL `function (file:L:C)`, not just
   the top frame; (2) **value-rich panic messages** — a host `panic(msg)` abort path that formats
-  the offending values (e.g. `index 7 out of bounds (length 3)`); (3) an index-assignment LHS has
+  the offending values (e.g. `index 7 out of bounds (length 3)`, `integer division by zero` —
+  today both surface as a bare wasm backtrace); (3) an index-assignment LHS has
   no parser span yet — broaden parser span coverage for OOB *write* errors. Also feasible: a
   **REPL** (accumulate-session-source + recompile-per-entry) as a future CLI item.
 - ⬜ **B-emitmsg. Human, clear, explainable emit-failure errors.** Codegen/emit failures still
