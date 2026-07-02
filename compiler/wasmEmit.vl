@@ -431,6 +431,8 @@ import {
   gNeedsF64Print,
   gNeedsI64Print,
   gStrInfLet,
+  gStrPoolIx,
+  gStrPoolTexts,
   gaeBases,
   gaeFieldCount,
   gaeFieldNames,
@@ -5632,7 +5634,7 @@ function emitCaptureRead(body: i32[], name: string, fnIx: i32) {
   }
   const gIdx = globalIndexOf(name)
   if gIdx >= 0 {
-    fbGlobalGet(gIdx)
+    fbGlobalGet(userGlobalIdx(gIdx))
     return 0
   }
   emitFail("emitProgram: captured variable not found in enclosing frame")
@@ -6061,7 +6063,7 @@ function emitUnionBoxPush(body: i32[], name: string, fnIx: i32) {
         "emitProgram: narrowed union binding is not a local or global",
       )
     }
-    fbGlobalGet(gIdx)
+    fbGlobalGet(userGlobalIdx(gIdx))
     // A non-const global box rides in a NULLABLE cell (start-fn initialized);
     // recover the non-null box ref (same as the plain Ident global read).
     if globalNameIsNonConst(name) {
@@ -6928,6 +6930,14 @@ function emitStr(body: i32[], strIx: i32, fnIx: i32) {
   }
   let s = P.nodes[strIx]
   if s is StrLit {
+    // A POOLED literal (every distinct literal within the `array.new_fixed` cap —
+    // `collectStrPool`) reads its interned immutable global: one `global.get`
+    // instead of an i32.const-per-codepoint allocation at every evaluation.
+    const pi = gStrPoolIx[s.strText] ?? -1
+    if pi >= 0 {
+      fbGlobalGet(pi) // the pool occupies global indices 0..pool-1
+      return 0
+    }
     const cps = decodeStr(strToCps(s.strText))
     if cps.length > NEW_FIXED_MAX {
       // Past the engines' `array.new_fixed` operand cap — build chunked (an
@@ -11909,7 +11919,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           }
           pendingListKind = 0
           pendingListSlot = 0
-          fbGlobalSet(gIdx) // 0x24 global.set
+          fbGlobalSet(userGlobalIdx(gIdx)) // 0x24 global.set
           return 0
         }
         return emitFail(
@@ -17318,7 +17328,7 @@ function emitStartFnCode(out: i32[]) {
             pendingLitUnion = 0
           }
           const setPrev = wTarget(bodyExpr)
-          fbGlobalSet(gi)
+          fbGlobalSet(userGlobalIdx(gi))
           wTarget(setPrev)
         }
       }
@@ -17863,6 +17873,37 @@ function emitNameSection(n: i32) {
 // as `(ref $0)`. The function section binds func i to its functype, an export per
 // function under its own name, and one code body per function — every section framed
 // through the SAME LEB/section helpers the fixed builders use.
+// Collect the STRING-LITERAL POOL: every distinct `StrLit` lexeme in the arena
+// (first-seen arena order — deterministic per program) whose decoded length fits
+// one `array.new_fixed` (a constexpr admits no locals, so an over-cap literal
+// keeps the inline chunked build). An arena scan over-approximates live code
+// (mirroring the print-detection scan): a dead literal costs one small unused
+// immutable global, never correctness. Monomorphized clones share one entry —
+// the pool dedupes by lexeme.
+function collectStrPool() {
+  gStrPoolTexts = []
+  gStrPoolIx = Map()
+  if !aUsed { return 0 }
+  let i = 0
+  while i < P.nodes.length {
+    const nd = P.nodes[i]
+    if nd is StrLit {
+      if (gStrPoolIx[nd.strText] ?? -1) < 0 {
+        if decodeStr(strToCps(nd.strText)).length <= NEW_FIXED_MAX {
+          gStrPoolIx[nd.strText] = gStrPoolTexts.length
+          gStrPoolTexts.push(nd.strText)
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The wasm GLOBAL INDEX of the user global at `globalStmts` position `gi`: the
+// string-literal pool occupies indices 0..pool-1, so user cells follow it.
+function userGlobalIdx(gi: i32) { gStrPoolTexts.length + gi }
+
 function emitModule(stmts: i32[]) {
   emitReset()
   emitHeader()
@@ -17927,6 +17968,10 @@ function emitModule(stmts: i32[]) {
     gHelpMapResize = helpBase + nHelpers
     nHelpers = nHelpers + 1
   }
+
+  // Intern the string-literal pool (its globals PRECEDE the user cells — every
+  // user-global index below rides `userGlobalIdx`).
+  collectStrPool()
 
   // Heap-type indices, in type-section order: standalone structs at 0..ns-1, then
   // (for the union path) the variant structs + box, then the raw i32 array, the
@@ -27197,7 +27242,7 @@ function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
     // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
     const gIdx = globalIndexOf(e.identName)
     if gIdx >= 0 {
-      fbGlobalGet(gIdx)
+      fbGlobalGet(userGlobalIdx(gIdx))
       const gck0 = globalCellKind(globalLetOf(e.identName))
       // A `string | null` cell (kind 16) is ALWAYS a NULLABLE ref — const OR not (a
       // const can still be initialized to `null`). So a VALUE read recovers the non-null
@@ -29611,13 +29656,33 @@ function emitGlobalSection() {
   // needed for the literal initializers in scope. A non-constexpr init (a reference to a
   // local/param) fails loudly via `emitExpr(fnIx = -1)` (start-fn fallback deferred).
   const ng = globalStmts.length
-  if ng > 0 {
+  const np = gStrPoolTexts.length
+  if ng + np > 0 {
     const globalPayload: i32[] = []
     // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
     // the count, each entry's valtype (`fbValtype`), mutability flag, and init constexpr
     // (`fb*` opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
     const gPrev = wTarget(globalPayload)
-    wULEB(ng)
+    wULEB(ng + np)
+    // The string-literal POOL first (indices 0..np-1, before the user cells — see
+    // `gStrPoolTexts`): each entry an IMMUTABLE non-null string ref whose init
+    // constexpr builds the literal once (`i32.const` per code point +
+    // `array.new_fixed` — every pooled literal fits the cap by construction).
+    let pli = 0
+    while pli < np {
+      wU8(100) // 0x64 (ref $aTypeIdx) — non-null string ref
+      wSLEB(aTypeIdx)
+      wU8(0)   // immutable
+      const pcps = decodeStr(strToCps(gStrPoolTexts[pli]))
+      let pci = 0
+      while pci < pcps.length {
+        fbI32Const(pcps[pci])
+        pci = pci + 1
+      }
+      fbArrayNewFixed(aTypeIdx, pcps.length)
+      fbEnd() // 0x0b end of init expr
+      pli = pli + 1
+    }
     let gi = 0
     while gi < ng {
       const g = P.nodes[globalStmts[gi]]
