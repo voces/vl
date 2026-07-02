@@ -768,8 +768,48 @@ function mkTyVar(name: string) {
   addTy(t)
 }
 
+// The CANONICAL decimal form of an integer literal LEXEME (`0x10` → `16`,
+// `1_000` → `1000`, `007` → `7`), so literal-type identity compares VALUES,
+// not raw source spellings — `0x10` is a member of `16 | 32`. A lexeme whose
+// value exceeds the i32 range keeps its raw spelling (an i64-sized literal
+// never denotes a literal-union member; identity then stays textual, exactly
+// as before).
+function canonIntLexeme(t: string) {
+  if !intLexemeFitsI32(t) { return t }
+  let v = 0
+  let i = 0
+  let base = 10
+  if t.length >= 2 && t[0] == '0' {
+    const p = t[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  while i < t.length {
+    const c = t[i]
+    if c != '_' {
+      let d = 0
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else { d = c - 'A' + 10 }
+      v = v * base + d
+    }
+    i = i + 1
+  }
+  i32ToStr(v)
+}
+
 function mkLitTy(kind: string, text: string) {
-  let t: Ty = { litKind: kind, litText: text }
+  let canon = text
+  if kind == "int" { canon = canonIntLexeme(text) }
+  let t: Ty = { litKind: kind, litText: canon }
   addTy(t)
 }
 
@@ -4644,6 +4684,13 @@ function bindGenWalk(expIx: i32, atIx: i32, bNames: string[], bTys: i32[]) {
       }
       bindGenWalk(e.fnRet, a.fnRet, bNames, bTys)
     }
+  } else if e is TyMap {
+    // A map/set param (`{[string]: T}`) pins `T` from the argument's value
+    // type (the key position walks too, for symmetry).
+    if a is TyMap {
+      bindGenWalk(e.mKey, a.mKey, bNames, bTys)
+      bindGenWalk(e.mVal, a.mVal, bNames, bTys)
+    }
   }
   bgSrcStack.pop()
   bgDstStack.pop()
@@ -4725,6 +4772,13 @@ function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       u = u + 1
     }
     if changed3 { res = mkUnionTy(out3) }
+  } else if t is TyMap {
+    const k2 = substTyDeep(t.mKey, bNames, bTys)
+    const v2 = substTyDeep(t.mVal, bNames, bTys)
+    if k2 != t.mKey || v2 != t.mVal { res = mkMapTy(k2, v2, t.mSet) }
+  } else if t is TyNeg {
+    const g2 = substTyDeep(t.negTy, bNames, bTys)
+    if g2 != t.negTy { res = mkNegTy(g2) }
   }
   stSeenStack.pop()
   res
@@ -8586,7 +8640,12 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
     // clearing the uninferred floor. `lt` is the (open `-1`) element type, so
     // every assignment succeeds against it until it is pinned.
     if tgt is Index {
-      const arrTy0 = checkNode(tgt.idxArr)
+      // The whole left-hand side (receiver included) was already checked as
+      // `lt` above — READ the recorded type instead of re-checking, so a
+      // diagnostic inside the receiver subtree isn't reported twice. The
+      // fallback re-check only fires for a node the table doesn't cover.
+      let arrTy0 = nodeTyIxOf(tgt.idxArr)
+      if arrTy0 < 0 { arrTy0 = checkNode(tgt.idxArr) }
       const arrT0 = T.tys[arrTy0]
       if arrT0 is TyArray {
         if arrT0.aElem < 0 { arrT0.aElem = rt }
