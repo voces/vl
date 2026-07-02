@@ -1468,6 +1468,9 @@ function sameVariantTy(a: i32, b: i32) {
   if ta is TyVar { return false }
   const tb = T.tys[b]
   if tb is TyVar { return false }
+  // Named variants resolve to one canonical arena entry (`cUserTypes`), so
+  // the common same-variant case is index equality — skip both traversals.
+  if a == b { return true }
   if !assignable(a, b) { return false }
   assignable(b, a)
 }
@@ -2304,7 +2307,7 @@ function recordRedundantAnnot(
   if inlayHole(initTy) { return 0 }
   if isNeverTy(initTy) { return 0 }
   if annot == TY_ERR { return 0 }
-  if tyToStr(initTy) != tyToStr(annot) { return 0 }
+  if !tyEq(initTy, annot) { return 0 }
   const nameTok = declNameTokOf(declIx)
   if nameTok < 0 { return 0 }
   // The fix deletes the annotation, so the span runs from just after the NAME to
@@ -3670,6 +3673,154 @@ function tyToStrGo(ix: i32) {
     return "!" + tyToStr(t.negTy)
   }
   "<?>"
+}
+
+// ── structural type equality ─────────────────────────────────────────────────
+// Whether two arena types RENDER identically (`tyToStr(a) == tyToStr(b)`),
+// decided structurally without building the strings. Powers the "redundant
+// annotation" hints, whose meaning is literally "the annotation spells what
+// inference already prints" — so this mirrors the RENDERING rules rather than
+// plain shape equality:
+//   - union LAYERS flatten in the render and a one-member union prints as its
+//     member, so members compare through `unionMembersInto`;
+//   - every internal inference hole prints "any", so two holes compare equal;
+//   - object field ORDER is significant (the render is ordered).
+// Mutual assignability is NOT equality (width subtyping accepts extra fields);
+// `sameVariantTy` keeps its two-way `assignable` check.
+let tyEqAStack: i32[] = []
+let tyEqBStack: i32[] = []
+
+function tyEq(a: i32, b: i32) {
+  if a == b { return true }
+  if a < 0 || b < 0 { return false }
+  // A pair already being compared higher in the recursion is assumed equal —
+  // the cycle guard for recursive named types, like `assignable`'s.
+  let gi = tyEqAStack.length - 1
+  while gi >= 0 {
+    if tyEqAStack[gi] == a && tyEqBStack[gi] == b { return true }
+    gi = gi - 1
+  }
+  tyEqAStack.push(a)
+  tyEqBStack.push(b)
+  const ok = tyEqGo(a, b)
+  tyEqAStack.pop()
+  tyEqBStack.pop()
+  ok
+}
+
+// Flatten nested union LAYERS only — a nullable renders `T?`, not `T | null`,
+// so (unlike `flattenVariantsInto`) a nullable stays opaque here.
+function unionMembersInto(ty: i32, out: i32[]) {
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyUnion {
+      const ms = t.uMembers
+      let i = 0
+      while i < ms.length {
+        unionMembersInto(ms[i], out)
+        i = i + 1
+      }
+      return 0
+    }
+  }
+  out.push(ty)
+  0
+}
+
+// Union render-equality: the flattened member sequences match pairwise.
+function unionEq(a: i32, b: i32) {
+  const av: i32[] = []
+  unionMembersInto(a, av)
+  const bv: i32[] = []
+  unionMembersInto(b, bv)
+  if av.length != bv.length { return false }
+  let i = 0
+  while i < av.length {
+    if !tyEq(av[i], bv[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+function tyEqGo(a: i32, b: i32) {
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyUnion { return unionEq(a, b) }
+  if tb is TyUnion { return unionEq(a, b) }
+  if ta is TyPrim {
+    if tb is TyPrim { return ta.primName == tb.primName }
+    return false
+  }
+  if ta is TyErr {
+    if tb is TyErr { return true }
+    return false
+  }
+  if ta is TyVar {
+    if tb is TyVar {
+      // An inference hole renders "any" regardless of its internal name.
+      if ta.tvName[0] == '?' { return tb.tvName[0] == '?' }
+      return ta.tvName == tb.tvName
+    }
+    return false
+  }
+  if ta is TyLit {
+    if tb is TyLit {
+      return ta.litKind == tb.litKind && ta.litText == tb.litText
+    }
+    return false
+  }
+  if ta is TyNullable {
+    if tb is TyNullable { return tyEq(ta.nInner, tb.nInner) }
+    return false
+  }
+  if ta is TyArray {
+    if tb is TyArray { return tyEq(ta.aElem, tb.aElem) }
+    return false
+  }
+  if ta is TyMap {
+    if tb is TyMap {
+      if ta.mSet != tb.mSet { return false }
+      return tyEq(ta.mKey, tb.mKey) && tyEq(ta.mVal, tb.mVal)
+    }
+    return false
+  }
+  if ta is TyFunc {
+    if tb is TyFunc {
+      const ap = ta.fnParamTypes
+      const bp = tb.fnParamTypes
+      if ap.length != bp.length { return false }
+      if !tyEq(ta.fnRet, tb.fnRet) { return false }
+      let i = 0
+      while i < ap.length {
+        if !tyEq(ap[i], bp[i]) { return false }
+        i = i + 1
+      }
+      return true
+    }
+    return false
+  }
+  if ta is TyObj {
+    if tb is TyObj {
+      const an = ta.objFieldNames
+      const bn = tb.objFieldNames
+      if an.length != bn.length { return false }
+      const aty = ta.objFieldTypes
+      const bty = tb.objFieldTypes
+      let i = 0
+      while i < an.length {
+        if an[i] != bn[i] { return false }
+        if !tyEq(aty[i], bty[i]) { return false }
+        i = i + 1
+      }
+      return true
+    }
+    return false
+  }
+  if ta is TyNeg {
+    if tb is TyNeg { return tyEq(ta.negTy, tb.negTy) }
+    return false
+  }
+  false
 }
 
 // The type-arena index of object `o`'s field `name`, or `-1` if absent. Takes a
@@ -6660,9 +6811,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     !retNaturalErr
   ) {
     if !inlayHole(retNatural) && !isNeverTy(retNatural) && ret != TY_ERR {
-      if tyToStr(retNatural) == tyToStr(ret) {
-        recordRedundantRet(n, fnIx, ret)
-      }
+      if tyEq(retNatural, ret) { recordRedundantRet(n, fnIx, ret) }
     }
   }
   retNatural = savedRetNatural
