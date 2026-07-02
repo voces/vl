@@ -18103,7 +18103,8 @@ function emitModule(stmts: i32[]) {
 // <expr> is built from integer literals, parameter / local references, calls to any
 // top-level function (recursion included), the `+`/`-`/`*` arithmetic operators, the
 // six signed i32 comparisons, and unary negation. Declared locals get wasm slots
-// AFTER the params (see `buildLocals`). Each function is exported under its own NAME.
+// AFTER the params (see `buildLocals`). Only the driver-staged alias tables are
+// exported (see `emitExportSection`).
 // Returns 0 on success; on any unsupported shape it calls `emitFail` (leaving
 // `emitErr` set and the buffer empty) and returns -1.
 //
@@ -29793,12 +29794,18 @@ function emitGlobalSection() {
 
 // Export section (id 7), extracted verbatim from emitModule (C3).
 function emitExportSection(n: i32) {
-  // Export section (id 7): export each function under its own name. A name is a
-  // UTF-8 byte vec; for an ASCII identifier each `name[i]` char code IS its byte.
-  // RE-EXPORTS (`export { name } from "dep"`) add ALIAS entries: the bare public name
-  // mapped to the (merged, mangled) target function's index, so a module graph can
-  // present a STABLE wasm ABI (`compileSrc`, not `compileSrc$mN`). Resolved entries
-  // are gathered first so the section count is exact.
+  // Export section (id 7): the module's ABI is EXACTLY the alias tables the
+  // driver staged — re-export entries (`export { name } from "dep"` → the
+  // merged, mangled target) plus the root module's plain `export`-marked
+  // functions (a single-source program's `export function f` rides the same
+  // tables, unmangled). Nothing else is exported: an internal function (a
+  // lifted `__lambda_N` closure, a `name#k` mono instance, a dependency's
+  // machinery) stays private — a program RUNS by instantiation (the start fn
+  // is the top level), and a lean surface lets `wasm-opt` prune unreached
+  // code. A name is a UTF-8 byte vec; for an ASCII identifier each `name[i]`
+  // char code IS its byte. Entries are resolved against `fnStmts` first so the
+  // section count is exact; a duplicate public name keeps its FIRST entry
+  // (export names must be unique). An export-free program omits the section.
   const reExpEi: i32[] = [] // the target function's `fnStmts` position, parallel to its public name
   const reExpNm: string[] = []
   let rxi = 0
@@ -29812,37 +29819,17 @@ function emitExportSection(n: i32) {
       }
       tj = tj + 1
     }
-    if hit >= 0 {
+    if hit >= 0 && !capHas(reExpNm, reExpName[rxi]) {
       reExpNm.push(reExpName[rxi])
       reExpEi.push(hit)
     }
     rxi = rxi + 1
   }
+  if reExpNm.length == 0 { return 0 }
   const exportPayload: i32[] = []
   const exPrev = wTarget(exportPayload)
-  wULEB(n + reExpNm.length)
-  // Export names must be UNIQUE. Lifted nested functions keep their source name, so two
-  // makers each declaring a nested `add` would both export `add` (a duplicate-name
-  // validation error). Disambiguate a repeat by suffixing its `fnStmts` position
-  // (`add#3`) — the FIRST occurrence keeps the bare name. No golden program has a
-  // repeated function name, so their export bytes are unchanged.
-  const usedExportNames: string[] = []
-  let ei = 0
-  while ei < n {
-    const fn = P.nodes[fnStmts[ei]]
-    if fn is FuncDecl {
-      let exName = fn.fnName
-      if capHas(usedExportNames, exName) {
-        exName = exName + "#" + i32ToStr(ei)
-      }
-      usedExportNames.push(exName)
-      wName(exName)
-      wU8(0)               // export kind: func
-      wULEB(gImports + ei) // func index (imports occupy 0..gImports-1)
-    }
-    ei = ei + 1
-  }
-  // The re-export ALIAS entries — a bare public name pointing at the target's func index.
+  wULEB(reExpNm.length)
+  // Each entry: the bare public name pointing at the target's func index.
   let rei = 0
   while rei < reExpNm.length {
     wName(reExpNm[rei])
