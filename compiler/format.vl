@@ -1517,7 +1517,12 @@ function matchExprFmt(ix: i32, n: MatchExpr, indent: i32) {
   const scrut = expr(n.matchScrut, indent, 0)
   const pad = indentStr(indent + 1)
   const closePad = indentStr(indent)
-  let out = "match " + scrut + " {\n"
+  // One line per arm, joined once — a running `out = out + line` accumulator
+  // here was O(arms²) allocation under the non-freeing GC (`joinLinesRange`'s
+  // documented cost class). Or-pattern lists stay a plain accumulator: arms
+  // hold a handful of patterns.
+  const out: string[] = []
+  out.push("match " + scrut + " {")
   let k = 0
   while k < n.matchArmStart.length {
     const start = n.matchArmStart[k]
@@ -1530,10 +1535,11 @@ function matchExprFmt(ix: i32, n: MatchExpr, indent: i32) {
       p = p + 1
     }
     const body = expr(n.matchBodies[k], indent + 1, 0)
-    out = out + pad + pats + " => " + body + "\n"
+    out.push(pad + pats + " => " + body)
     k = k + 1
   }
-  out + closePad + "}"
+  out.push(closePad + "}")
+  joinLines(out)
 }
 
 // A literal: prefer the verbatim source lexeme; fall back to structural text.
@@ -1750,10 +1756,16 @@ function recoverIsType(ix: i32) {
   let start = nodePos(ix)
   const stop = nodeEndOf(ix)
   if start < 0 || stop < 0 { return "" }
-  let i = 0
+  // Seat the scan at the node's start token (binary search) and stop once past
+  // the node's end: this runs once per `is` expression, and the old scan from
+  // token 0 was O(tokens) each — measurably superlinear on a large file. A
+  // `pos` not landing exactly on a token start degrades to the full scan.
+  let i = tokIndexAt(start)
+  if i < 0 { i = 0 }
   while i < P.toks.length {
     const t = P.toks[i]
-    if t.kind == "IS" && t.start >= start && t.start < stop {
+    if t.start >= stop { return "" }
+    if t.kind == "IS" && t.start >= start {
       const afterStart = t.start + t.text.length
       return collapseWs(fmtSrc.slice(afterStart, stop))
     }
@@ -1836,12 +1848,11 @@ function fieldKeyText(ix: i32, name: string) {
   if p >= 0 && p < fmtSrc.length {
     const c = fmtSrc.slice(p, p + 1)
     if c == "\"" || c == "'" {
-      let i = 0
-      while i < P.toks.length {
-        const t = P.toks[i]
-        if t.start == p && t.kind == "STRING" { return t.text }
-        i = i + 1
-      }
+      // The key token starts exactly at the node's `pos`; binary-search it
+      // (token starts are unique and ascending) instead of scanning `P.toks`
+      // from 0 per quoted key.
+      const i = tokIndexAt(p)
+      if i >= 0 && P.toks[i].kind == "STRING" { return P.toks[i].text }
     }
   }
   name
@@ -1879,15 +1890,18 @@ function functionExpr(ix: i32, node: FuncDecl, indent: i32) {
       emitStatements(bn.blkStmts, indent + 1)
       const inner = joinOut()
       outBuf = saved
-      let result = header + " => {\n"
+      // Rejoin the body ONCE — a running `result = result + line` accumulator
+      // here was O(lines²) allocation under the non-freeing GC.
+      const out: string[] = []
+      out.push(header + " => {")
       const lines = splitLines(rstripNl(inner))
       let i = 0
       while i < lines.length {
-        result = result + lines[i] + "\n"
+        out.push(lines[i])
         i = i + 1
       }
-      result = result + indentStr(indent) + "}"
-      return result
+      out.push(indentStr(indent) + "}")
+      return joinLines(out)
     }
   }
   header + " => " + bareBodyInline(body, indent)
@@ -1962,14 +1976,18 @@ function blockExpr(ix: i32, node: Block, indent: i32) {
   emitStatements(node.blkStmts, indent + 1)
   const inner = joinOut()
   outBuf = saved
-  let result = "{\n"
+  // Rejoin the body ONCE — a running `result = result + line` accumulator here
+  // was O(lines²) allocation under the non-freeing GC.
+  const out: string[] = []
+  out.push("{")
   const lines = splitLines(rstripNl(inner))
   let i = 0
   while i < lines.length {
-    result = result + lines[i] + "\n"
+    out.push(lines[i])
     i = i + 1
   }
-  result + indentStr(indent) + "}"
+  out.push(indentStr(indent) + "}")
+  joinLines(out)
 }
 
 // ── list wrapping (calls / arrays / objects / params) ─────────────────────────
