@@ -190,10 +190,18 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   adding decoy types, keep that invariant or the round-trip claims a bug the spec doesn't make.
 - The i32-only leaves of the OLD generator hid every family above — all of them involve i64/f32/
   boolean/atom leaves, maps, closures, or the param/return/global positions.
-- Discovered while triaging (NOT yet fixed): a PARENTHESIZED `is` condition defeats the emitter's
-  narrow rewrite — `if (x is i64) { print(x) }` over a value union emits the boxed read (invalid
-  wasm, `expected i64, found (ref $type)`); the un-parenthesized spelling lowers fine. The fuzzer
-  never parenthesizes, so no shape pins it.
+- FIXED — a PARENTHESIZED `is` condition defeated the emitter's narrow rewrite: `if (x is i64)
+  { print(x) }` over a value union emitted the BOXED read (invalid wasm, `expected i64, found
+  (ref $type)`) while the bare spelling lowered fine. The checker's narrowing collectors peel
+  `Paren`; the emitter's condition matchers (`setNarrowFromCond`/`setNarrowFromCondElse` — the
+  single seam every if/else/guard/`&&`-conjunct narrow routes through) matched the raw condition
+  node, so checker and emitter disagreed on exactly the paren spelling. Same blindness in the
+  checker's own chain classifiers (`ifChainExhausts`/`ifCondIsDiscriminating`), which
+  spurious-flagged a parenthesized exhaustive `is`-chain as missing-return. Fix: peel parens at
+  those seams. Fixtures: `unions/paren-is-narrow.vl` (if/else-if/else/guard/`&&`/nested-paren/
+  `!= null`/member-field/struct/while, each beside its bare control), `unions/paren-is-chain-exhausts.vl`.
+  A parenthesized RECEIVER (`(x) is i64`) is unchanged: neither side narrows it (`placeKeyOf`
+  keys "" for a non-place), a consistent loud reject — not part of this class.
 - Still failing (other agents' families, seen in the re-sweeps): `() => {f: i64}` closure-struct
   sigs, `{[string]: {f: i64}}` map values, `i64[] | null` GLOBAL initializers.
 
