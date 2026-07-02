@@ -123,3 +123,23 @@ fields, struct through list/nullable-list).
   adding decoy types, keep that invariant or the round-trip claims a bug the spec doesn't make.
 - The i32-only leaves of the OLD generator hid every family above — all of them involve i64/f32/
   boolean/atom leaves, maps, closures, or the param/return/global positions.
+
+## RESOLVED
+
+- **Maps with non-{i32,string,struct} values at the RETURN/param boundary** (`{[string]: i64}` /
+  f64 / f32 / closure / union valued): the boundary gate (`retMapFlag`) enumerated the supported
+  value types independently of the local interner (`mvShapeOfValName`) and lacked the scalar /
+  closure / union arms — the functype result fell through to i32 over a ref-returning body
+  (invalid wasm at the return seam). Fix: ONE classifier (`mvValKindOfName`) that both read.
+  A third parallel enumeration of the same set (`retIsMapLocalAnnot`, the un-annotated-return
+  classifier) now reads it too. Prime repOf evidence: three sites, one kind vocabulary.
+- **Atom-valued maps** (`{[string]: K0}`, depth 1!): classified as UNION-boxed values (the member
+  count claimed the litunion alias) while the reads/consumers treated the value as the bare i32
+  atom — invalid wasm even as a LOCAL. Fix: an atom value IS an i32, so the map rides the MONO
+  map; member literals lower in atom context (`pendingLitUnion`) at the store / `??`-default
+  sites, the map KEY is shielded from the ambient atom context, and the fused `m[k] ?? <member>`
+  read keeps the union type (checker) so `print` widens the atom. A `??` default outside the atom
+  rep (a `string` value / non-member literal) is a LOUD `tErrUnsupported` reject.
+  Graduated (seeds 101/202/303): `{[string]: i64|f32|f64|K0}` at p1/p2, `{[string]: {[string]:
+  K0}}`, `{[string]: () => {f: i64}}`, `{[string]: (i32) => {a,f,z}}` — frozen in
+  `tests/cases/maps/map-return-value-kinds.vl` + `atom-valued-map.vl`.

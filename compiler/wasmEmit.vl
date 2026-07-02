@@ -7,6 +7,8 @@ import {
   nodeTyIsLitUnionAlias,
   nodeTyIsNulLitUnion,
   nodeTyIsNullableStruct,
+  nodeTyMapValIsLitUnion,
+  nodeTyMapValLitUnionTexts,
   splitUnionAtoms,
   valueAtomKind,
 } from "./typecheck"
@@ -3046,8 +3048,15 @@ function emitMapPrep(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   // which clobbers `cmSlot` — re-pin it before the probe.
   if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
   cmSlot = mshape
-  setMapRef(body)    // mapRef (the shared mono slot, or this mv frame's)
-  if emitExpr(body, keyIx, fnIx) < 0 { return -1 }
+  setMapRef(body) // mapRef (the shared mono slot, or this mv frame's)
+  // The KEY is always a STRING ref — shield it from an ambient atom context (an
+  // atom-typed binding init `const x: K = m["k"] ?? "a"` seeds `pendingLitUnion`
+  // around the whole init, which would lower the key literal as an i32 atom id).
+  const savedKeyLU = pendingLitUnion
+  pendingLitUnion = 0
+  const kr = emitExpr(body, keyIx, fnIx)
+  pendingLitUnion = savedKeyLU
+  if kr < 0 { return -1 }
   cmSlot = mshape
   setMapScr(body, 1) // keyRef
   emitMapProbe(body)
@@ -3128,8 +3137,34 @@ function emitMapGetOr(
   fbI32Bin(107)            // 0x6b i32.sub  (entry - 1)
   fbArrayGet(aTypeIdx)     // array.get
   fbElse()                 // else
-  if emitExpr(body, defIx, fnIx) < 0 { return -1 }
-  fbEnd()                  // end (if)
+  // An ATOM-valued mono map's default lowers as an i32 atom id: a MEMBER literal (atom
+  // context — `pendingLitUnion`) or an atom-typed expression. Anything else (a general
+  // string, a NON-member literal — which would mint a fresh id under a `string`-typed
+  // result) has the wrong rep for the fused i32 result — fail loudly.
+  const atomTexts = nodeTyMapValLitUnionTexts(recvIx)
+  let atomDef = false
+  if atomTexts.length > 0 {
+    const du = P.nodes[unwrapParen(defIx)]
+    if du is StrLit {
+      let mi = 0
+      while mi < atomTexts.length {
+        if quoteLex(atomTexts[mi]) == du.strText { atomDef = true }
+        mi = mi + 1
+      }
+    } else if exprIsLitAtom(defIx, fnIx) {
+      atomDef = true
+    }
+    if !atomDef {
+      return emitFail(
+        "emitProgram: `??` over an atom-valued map needs a member-literal (or atom) default",
+      )
+    }
+  }
+  if atomDef { pendingLitUnion = 1 }
+  const dfr = emitExpr(body, defIx, fnIx)
+  if atomDef { pendingLitUnion = 0 }
+  if dfr < 0 { return -1 }
+  fbEnd() // end (if)
   0
 }
 
@@ -3703,12 +3738,17 @@ function emitMapSetV(
   fnIx: i32,
   valConst1: boolean,
 ) {
+  // An ATOM-valued map (`{[string]: K}`, `K` a literal union) rides the MONO map: each
+  // value is the interned atom id (a plain i32). Its member-literal value is a StrLit
+  // syntactically — it must BYPASS the mono string guard below and emit in atom context
+  // (`pendingLitUnion`), so resolve the receiver's value type up front.
+  const atomVal = nodeTyMapValIsLitUnion(recvIx)
   // A MONO (i32/boolean-valued) map cannot store a REF value (a string / struct /
   // list ref into an i32 array is invalid wasm) — fail loudly. A ref-valued map
   // (mv slot) stores string/struct values through its own typed vals list. (A
   // constant-true Set value is always a valid i32 boolean.) The shape is resolved
   // here only for the GATE; `emitMapPrep` re-resolves it into the op context.
-  if valConst1 == false {
+  if valConst1 == false && !atomVal {
     if mapShapeOfExpr(recvIx, fnIx) < 0 {
       if (
         exprString(valIx, fnIx) ||
@@ -3764,6 +3804,8 @@ function emitMapSetV(
       ovCtx.listKind = 5
       ovCtx.listSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
     }
+    // An atom-valued mono map's member-literal value lowers as its interned atom id.
+    if atomVal { ovCtx.litUnion = 1 }
     if emitExprExpect(body, valIx, fnIx, ovCtx) < 0 {
       return -1 // value
     }
@@ -3780,7 +3822,11 @@ function emitMapSetV(
   fbArraySet(aTypeIdx) // array.set
   // keys.push(keyRef) ; vals.push(v)  (clobbers slots 3/4 — already linked above).
   if emitMapPushKey(body) < 0 { return -1 }
-  if emitMapPushValV(body, valIx, fnIx, valConst1) < 0 { return -1 }
+  // The append path re-emits the value — same atom-context seeding as the overwrite.
+  if atomVal { pendingLitUnion = 1 }
+  const pvr = emitMapPushValV(body, valIx, fnIx, valConst1)
+  if atomVal { pendingLitUnion = 0 }
+  if pvr < 0 { return -1 }
   // count = count + 1
   pushMapRef(body)          // mapRef (struct.set receiver)
   pushMapCount(body)

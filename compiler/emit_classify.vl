@@ -32,6 +32,7 @@ import {
   nodeTyIsUnionAlias,
   nodeTyIsVariant,
   nodeTyIxOf,
+  nodeTyMapValIsLitUnion,
   nodeTyName,
   nodeUnionName,
   recordClonedNodeTy,
@@ -1343,14 +1344,10 @@ function retIsMapLocalAnnot(rx: i32, fnIx: i32) {
             const lt = P.nodes[d.letType]
             if lt is TypeRef {
               if nameIsMap(lt.tyName) {
-                // A supported map value type (mono i32/boolean, `string`, or a struct) — the
-                // same set `retMapFlag` lets cross the boundary; the return's SHAPE is recovered
-                // at the functype-result site via `mapShapeOfExpr` over this same local.
-                const vn = mapValNameOf(lt.tyName)
-                if vn == "i32" || vn == "boolean" || vn == "string" {
-                  return true
-                }
-                return structIndexByValName(vn) >= 0
+                // A supported map value type — the same classifier `retMapFlag` gates the
+                // boundary with (`mvValKindOfName`); the return's SHAPE is recovered at the
+                // functype-result site via `mapShapeOfExpr` over this same local.
+                return mvValKindOfName(mapValNameOf(lt.tyName)) != -3
               }
             }
           }
@@ -2064,17 +2061,23 @@ function structIndexByValName(name: string) {
   -1
 }
 
-// Classify + intern a map VALUE type-name, returning the binding's map SHAPE code:
-// `-1` mono i32 map (i32 / boolean values), a slot `>= 0` for a ref value type
-// (string / struct), or `-3` unsupported (unions, arrays, nested maps — the op
-// sites fail loudly). Interning is idempotent (one slot per distinct name).
-// Kind-1 (struct) values force the element's ref-list types (`rlInternName`), and
-// every ref-valued map forces the string-list (keys) + mono map types — the shared
-// probe machinery and the keys list ride on them.
-export function mvShapeOfValName(valName: string) {
+// The mv value KIND of a map VALUE type-name — the ONE enumeration of which value types a
+// string-keyed map supports (`mvValKind` vocabulary): `-1` a mono i32 value (i32 / boolean /
+// literal-union atom — the value IS an i32, riding the shared mono `$mapStruct`), `-3`
+// unsupported, else the per-slot kind (3 string · 11 f64 · 10 i64 · 13 f32 · 6 ref-list /
+// nested-map value · 2 union box · 14 closure · 1 struct). Read by BOTH `mvShapeOfValName`
+// (the slot interner — the local path) and `retMapFlag` (the param/return valtype gate) so
+// the two cannot drift: when the gate enumerated the value types independently it lacked the
+// scalar/atom/closure/union arms, and an annotated map return fell through to an i32 result
+// valtype over a ref-returning body — invalid wasm at the return seam.
+export function mvValKindOfName(valName: string): i32 {
   if valName == "i32" || valName == "boolean" { return -1 }
+  // A literal-union ATOM value (`{[string]: K0}`, `K0 = "aa" | "bb"`): each value IS the
+  // interned atom code — a plain i32 — so the map is the MONO i32 map. Checked BEFORE the
+  // union arm, whose member count would otherwise claim the alias and BOX the values (the
+  // store coerced the i32 atom into a union box the read then handed to an i32 consumer).
+  if nameIsLitUnionType(valName) { return -1 }
   let kind = -1
-  let vsi = -1
   if valName == "string" {
     kind = 3
   } else if valName == "f64" {
@@ -2118,10 +2121,7 @@ export function mvShapeOfValName(valName: string) {
     // value, only the element heap + the store-coerce / read-classify differ. Covers a VALUE
     // union (`{[string]: i32 | string}`), a STRUCT / heterogeneous union (`{[string]: C | S}`),
     // and a union ALIAS (`type Shape = C | S`; `unionMemberSetOf` expands it before the count).
-    // A value union also interns its scalar value-box reps (`registerValueUnionName`); a
-    // struct/heterogeneous union just rides the box payload, so no value boxes are needed.
     kind = 2
-    if isValueUnionName(valName) { registerValueUnionName(valName) }
   } else if annArrowAt(valName) >= 0 {
     // A FUNCTION-valued map (`{[string]: (i32) => i32}`): each value is a closure fat-pointer
     // (`ref $cloStructIdx`), stored in a ref list whose element kind is 5 (the closure) — the
@@ -2129,10 +2129,30 @@ export function mvShapeOfValName(valName: string) {
     // resolves its sig from the value annotation.
     kind = 14
   } else {
-    vsi = structIndexByValName(valName)
-    if vsi >= 0 { kind = 1 }
+    if structIndexByValName(valName) >= 0 { kind = 1 }
   }
   if kind < 0 { return -3 }
+  kind
+}
+
+// Classify + intern a map VALUE type-name, returning the binding's map SHAPE code:
+// `-1` mono i32 map (i32 / boolean / atom values), a slot `>= 0` for a ref/scalar
+// value type, or `-3` unsupported (the op sites fail loudly). Interning is
+// idempotent (one slot per distinct name). Kind-1 (struct) values force the
+// element's ref-list types (`rlInternName`), and every ref-valued map forces the
+// string-list (keys) + mono map types — the shared probe machinery and the keys
+// list ride on them.
+export function mvShapeOfValName(valName: string) {
+  const kind = mvValKindOfName(valName)
+  if kind == -1 { return -1 }
+  if kind < 0 { return -3 }
+  let vsi = -1
+  if kind == 1 { vsi = structIndexByValName(valName) }
+  // A VALUE union also interns its scalar value-box reps; a struct/heterogeneous
+  // union just rides the box payload, so no value boxes are needed.
+  if kind == 2 {
+    if isValueUnionName(valName) { registerValueUnionName(valName) }
+  }
   let i = 0
   while i < mvValName.length {
     if mvValName[i] == valName { return i }
@@ -5850,19 +5870,13 @@ export function retMapFlag(tyIx: i32) {
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
       // A string-keyed map crosses a call boundary as kind 6 (`(ref $mapStruct)`). Its
-      // `fbValtype` arg is the map SHAPE (`mapAnnShape`): -1 for the mono i32/boolean map, or
-      // the per-value-type mv slot for a `string`- or STRUCT-valued map (the value type's
-      // interned mv slot carries its `$mapStruct` across the boundary). An f64/i64-valued map
-      // has deeper local-level gaps, so it stays a clean rejection.
+      // `fbValtype` arg is the map SHAPE (`mapAnnShape`): -1 for the mono map, or the
+      // per-value-type mv slot (the value type's interned `$mapStruct` carries across the
+      // boundary). The gate is the SAME classifier the local path interns with
+      // (`mvValKindOfName`) — every map value type that binds locally also crosses a
+      // param/return boundary; anything outside it stays a loud rejection.
       if nameIsMap(ty.tyName) {
-        const vn = mapValNameOf(ty.tyName)
-        if vn == "i32" || vn == "boolean" || vn == "string" { return 1 }
-        if structIndexByValName(vn) >= 0 { return 1 }
-        // A ref-LIST value (`S[]`, `i32[]`, a nested `S[][]`, a closure / union list) or a NESTED
-        // map value: its `mvShapeOfValName` slot carries the value's `$mapStruct` across the call
-        // boundary like a struct value does, and the recursive ref-list machinery makes the
-        // value store/read fall out — so a list-valued map RETURNS the same as it binds locally.
-        if nameIsArray(vn) || nameIsMap(vn) { return 1 }
+        if mvValKindOfName(mapValNameOf(ty.tyName)) != -3 { return 1 }
       }
     }
   }
@@ -7360,6 +7374,14 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
           }
         }
       }
+    }
+  }
+  if e is BinExpr {
+    // `m[k] ?? d` over an ATOM-valued map yields the atom — the mono vals list holds
+    // ids, so the fused get's result is a real i32 atom (like an atom array element).
+    if e.binOp == "??" {
+      const bl = P.nodes[unwrapParen(e.binLeft)]
+      if bl is Index { return nodeTyMapValIsLitUnion(bl.idxArr) }
     }
   }
   false
