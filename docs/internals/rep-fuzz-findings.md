@@ -233,3 +233,18 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
     (name-based vs node-based field codes) that had drifted. A LOCAL binding of this shape is still a
     clean loud reject (`isValueUnionName` has no closure atom kind — a follow-up, not a hole).
     Frozen: `tests/cases/globals/union-closure-member-field-global.vl`.
+- **Lambda returning a struct with an i64 field** (`() => {f: i64}` — invalid wasm in the body;
+  block-bodied broke at the CALL side): a lambda's return shape is inferred from its LITERAL
+  (`anonFieldCode` — no annotation to read), and the VALUE-based field-code enumeration lacked the
+  scalar-leaf arms the ANNOTATION-based one (`fieldTypeCode`) had: an i64-magnitude literal coded
+  its field i32 (the body `struct.new`ed an i64 into an i32 field), and a float / i64-magnitude
+  ARRAY element coded an i32 list over an f64/i64-list value. Added codes 23 / 25 / 26 to
+  `anonFieldCode` and the `arrLitIsI64` collect branch (the i64 sibling of the f64 one). More repOf
+  evidence: the same field-code vocabulary had three producers (annotation node, annotation text,
+  literal value) drifting independently. Graduated 7 pinned-seed shapes (i64/f64 fields inside map
+  values, closure-returned multi-field structs, `i64[] | null` global construct); frozen in
+  `tests/cases/closures/lambda-i64-struct-return.vl` + `tests/cases/objects/anon-shape-i64-f64-fields.vl`.
+  STILL OPEN (the widening seam, not this shape family): a SMALL literal into an i64 STRUCT FIELD
+  through a lambda (`() => {f: i64} = () => ({f: 5})`) — the literal-inferred shape codes the field
+  i32 and only the contextual annotation knows better (the scalar spelling `() => i64 = () => (5)`
+  is fixed — the lambda contextual-return widening).
