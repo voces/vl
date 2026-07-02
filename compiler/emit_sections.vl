@@ -1,0 +1,3031 @@
+// `emit_sections.vl` — the emitter's DRIVER and SECTION EMISSION: the
+// `emitProgram` entry point with its ordered pass table, and the assembly of
+// the final module bytes — header, type section (the one rec group), import/
+// function/global/export/code sections, the shared runtime helper bodies
+// (string hash/eq/concat, map probe/resize, mem-log), the start-function
+// model for non-const globals, per-function code emission (`emitFuncCode`),
+// and the opt-in name section. Sits ABOVE the lowering core (`wasmEmit.vl`),
+// calling down into it for every statement/expression body. Carved out of
+// `wasmEmit.vl` (review N18).
+
+import { nodeTyIsLitUnionAlias, nodeTyIsNulLitUnion } from "./typecheck"
+import {
+  Block,
+  Call,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  LetDecl,
+  Member,
+  NumLit,
+  P,
+  Param,
+  Program,
+  StrLit,
+  TypeRef,
+  WhileStmt,
+} from "./ast"
+import { numLexFitsI32 } from "./emit_bignum"
+import {
+  NEW_FIXED_MAX,
+  appendAll,
+  capHas,
+  decodeStr,
+  nameIsArray,
+  nameIsString,
+  nulCloFlag,
+  numTextIsFloat,
+  resetParentLetCache,
+  retNulListFlag,
+  retNulStringFlag,
+  strContains,
+  strToCps,
+  tyIsFuncType,
+  tyIsNulBool,
+  tyNameOf,
+} from "./emit_base"
+import {
+  blockHasArrNew,
+  blockHasCoalesceCall,
+  exprHasArrNew,
+  exprHasCoalesceCall,
+  fnHasArrNew,
+  fnHasCoalesceCall,
+  globalIsNonConst,
+  letIsNulBoolAnn,
+} from "./emit_query"
+import {
+  VKind,
+  W,
+  aTypeIdx,
+  aUsed,
+  capCacheOn,
+  cloSigKeys,
+  cloSigRepFn,
+  ctrlDepth,
+  curBuf,
+  emitErr,
+  emitFailed,
+  emitLetCursor,
+  fRetRArrElem,
+  fRetStructIdx,
+  fRetVoid,
+  fa32TypeIdx,
+  fa32Used,
+  fa64TypeIdx,
+  fa64Used,
+  fnDispNames,
+  fnListEqRSlots,
+  fnRefPushSlots,
+  fnStmts,
+  fnUsesArrNew,
+  fnUsesCallRef,
+  fnUsesCloEq,
+  fnUsesCoalesceCall,
+  fnUsesF32Push,
+  fnUsesF64Push,
+  fnUsesI64Push,
+  fnUsesListEqI,
+  fnUsesListEqS,
+  fnUsesMap,
+  fnUsesMapFilter,
+  fnUsesMapKeys,
+  fnUsesMapVals,
+  fnUsesPush,
+  fnUsesRefPush,
+  fnUsesStrOp,
+  fnUsesStrPush,
+  fnValUsed,
+  gEmitNames,
+  gF32PrintIdx,
+  gF64PrintIdx,
+  gHelpMapProbe,
+  gHelpMapResize,
+  gHelpStrConcat,
+  gHelpStrEq,
+  gHelpStrHash,
+  gImports,
+  gMemLogIdx,
+  gNeedsF32Print,
+  gNeedsF64Print,
+  gNeedsI64Print,
+  gStrPoolIx,
+  gStrPoolTexts,
+  globalStmts,
+  ia64TypeIdx,
+  ia64Used,
+  lTypeIdx,
+  lUsed,
+  localIsRef,
+  localLitUnion,
+  localLoopVar,
+  localNames,
+  localStructIdx,
+  loopBrkDepth,
+  loopBrkLabel,
+  loopContDepth,
+  loopContLabel,
+  mUsed,
+  memLogUsed,
+  memUsed,
+  mfDstBases,
+  mfDstKinds,
+  mfDstSlots,
+  mfSrcBases,
+  mfSrcKinds,
+  mfSrcSlots,
+  mkArrIdx,
+  mkListIdx,
+  mvValName,
+  narrowNames,
+  narrowTop,
+  narrowVariants,
+  pendingF32,
+  pendingF64,
+  pendingI64,
+  pendingListKind,
+  pendingListSlot,
+  pendingMapSlot,
+  pendingNulBool,
+  pendingNulClosure,
+  pendingNulString,
+  pendingStructIdx,
+  reExpName,
+  reExpTarget,
+  refPushBaseBySlot,
+  rlBackIdx,
+  rlElemHeap,
+  rlElemName,
+  sDeclared,
+  sFieldCount,
+  sNames,
+  scopeFrames,
+  scopeNames,
+  scopeSlots,
+  slUsed,
+  startStmts,
+  uDeclared,
+  uFieldCount,
+  uFieldElemName,
+  uFieldStart,
+  uVariants,
+  vbF32Used,
+  vbF64Used,
+  vbI32Used,
+  vbI64Used,
+} from "./emit_state"
+import {
+  emitFail,
+  fbArrayCopy,
+  fbArrayGet,
+  fbArrayLen,
+  fbArrayNewDefault,
+  fbArrayNewFixed,
+  fbArraySet,
+  fbBeginFunc,
+  fbBlock,
+  fbBr,
+  fbBrIf,
+  fbCall,
+  fbElse,
+  fbEmitLocalsVec,
+  fbEnd,
+  fbF32Const,
+  fbF64Const,
+  fbGlobalSet,
+  fbI32Bin,
+  fbI32Const,
+  fbI32Eqz,
+  fbI32Load,
+  fbI64Const,
+  fbIf,
+  fbLocalGet,
+  fbLocalSet,
+  fbLoop,
+  fbRefAsNonNull,
+  fbRefNullForKind,
+  fbReturn,
+  fbUnreachable,
+  fbValtype,
+  fbValtypeNullable,
+  wBytes,
+  wName,
+  wSLEB,
+  wSection,
+  wTarget,
+  wU8,
+  wULEB,
+} from "./emit_bytes"
+import {
+  addLocalName,
+  applyPushPopBits,
+  blockHasCallRef,
+  blockHasMapOp,
+  blockHasStrOp,
+  blockPushPopBits,
+  bodyEndsInReturn,
+  captureNamesOf,
+  captureValKind,
+  captureValStructIdx,
+  cloRetValKind,
+  cloRetValSlot,
+  envSlotShift,
+  exprHasMapOp,
+  exprHasStrOp,
+  exprPopBits,
+  fnEnvIdxOf,
+  fnHasGlobalMapOp,
+  fnHasMap,
+  fnHasStrOp,
+  fnRetExprOf,
+  fnRetNullBearing,
+  fnReturnsClosure,
+  fnSigIdxOfFn,
+  fnSigIsClosure,
+  fnStmtsPosOf,
+  forInElemKind,
+  forInRefArrayStructIdx,
+  globalCellKind,
+  globalCellStructIdx,
+  globalInitIsLitAtom,
+  globalInitWidensAtomToStr,
+  globalRefListSlot,
+  inferredRetKindCore,
+  isSName,
+  isUName,
+  letAnnRefListKind,
+  letAnnRefListSlot,
+  letIsLitUnion,
+  letIsNulString,
+  letMapShapeOf,
+  letUnionNameOf,
+  mapAnnShape,
+  mapRetExprShape,
+  markLoopVarSlot,
+  mvSlotOfValNameFind,
+  paramStructIdxOf,
+  pendingLitUnion,
+  pushPostGuardNarrow,
+  recordRefPushSlot,
+  refListSlotOfExpr,
+  resetLitAtoms,
+  restoreNarrow,
+  retMapFlag,
+  retNulRefFlag,
+  retRefArrFlag,
+  retStructIndex,
+  retVariantFlag,
+  rlSlotByName,
+  sFieldElemNameAt,
+  sFieldTypeAt,
+  scopeBind,
+  scopePop,
+  scopePush,
+  scopeUnbind,
+  setNarrowFromCond,
+  setNarrowFromCondElse,
+  stmtIsPushKind,
+  stmtPushBits,
+  structIndexByName,
+  tyAnnRefListSlot,
+  variantFieldRefSlot,
+  variantFieldTypeAt,
+  variantIndexOf,
+  vtKindOfParam,
+  vtKindOfType,
+} from "./emit_classify"
+import {
+  buildFnMap,
+  collectA,
+  collectAnnShapes,
+  collectCloSigs,
+  collectFnValUse,
+  collectFns,
+  collectGenAliasShapes,
+  collectLocals,
+  collectLocalsIf,
+  collectMapFilterUse,
+  collectMemberPopRefSlots,
+  collectMemberPopRefSlotsExpr,
+  collectRefPushSlots,
+  collectS,
+  collectU,
+  computeRetInference,
+  computeVoidFns,
+  leqScanBlock,
+  leqScanExpr,
+  leqScanStmt,
+  mAssignTypeIndices,
+  mfScan,
+} from "./emit_collect"
+import {
+  captureBoxRewrite,
+  dispatchRewrite,
+  synthParamAnnots,
+  synthRetAnnots,
+} from "./emit_rewrite"
+import { monomorphize } from "./emit_mono"
+import {
+  capCacheBuild,
+  emitAtomToStr,
+  emitExpr,
+  emitExprAsF32,
+  emitExprAsF64,
+  emitExprAsI64,
+  emitFuncBody,
+  emitNullForRet,
+  emitStmt,
+  emitUnionCoerce,
+  mvValsWrapOf,
+  pushFieldStorage,
+  sFieldRefSlot,
+  userGlobalIdx,
+} from "./wasmEmit"
+
+// Host opt-in for the name section (see `gEmitNames`). The driver does NOT call
+// this, so every golden/fixpoint emit leaves names OFF; only the native tool
+// turns it on. Idempotent — any nonzero `on` enables, `0` disables.
+export function setEmitNames(on: i32) {
+  if on != 0 { gEmitNames = 1 } else { gEmitNames = 0 }
+  0
+}
+
+function emitReset() {
+  // NOTE: `gImports` and `startStmts` are NOT reset here — they are assigned by
+  // their own passes (the print-detection scan in `emitProgram`, `collectFns`)
+  // which run BEFORE `emitModule` calls this; resetting them here would clobber
+  // those passes' results.
+  W.bytes = []
+  curBuf = W.bytes
+  0
+}
+
+// ── module header ────────────────────────────────────────────────────────────
+function emitHeader() {
+  // "\0asm" magic + version 1
+  wU8(0)
+  wU8(97)  // 'a'
+  wU8(115) // 's'
+  wU8(109) // 'm'
+  wU8(1)
+  wU8(0)
+  wU8(0)
+  wU8(0)
+  0
+}
+
+// Rebuild `localNames` for the function at `fnIx`: clear it, then collect every
+// declared-local name in the body (validating each as i32). Returns 0 on success,
+// or -1 (via `emitFail`) on any unsupported local. Must run before lowering the
+// body so identifier resolution and the locals vector see the full set.
+function buildLocals(fnIx: i32) {
+  localNames = []
+  localIsRef = []
+  localStructIdx = []
+  localLoopVar = []
+  localLitUnion = []
+  localLitUnion = []
+  // Reset the lexical scope stack per function. `collectLocals` pushes/pops frames as
+  // it walks (leaving it balanced/empty), then the emit pass rebuilds it in lockstep.
+  scopeNames = []
+  scopeSlots = []
+  scopeFrames = []
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return collectLocals(fn.fnBody, fnIx) }
+  emitFail("emitProgram: not a function declaration")
+}
+
+// Verify every parameter of the FuncDecl at `fnIx` is typed `i32` — the only type
+// this slice emits. Returns 0 on success or -1 (via `emitFail`) otherwise.
+function checkParams(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let pi = 0
+    while pi < params.length {
+      const p = P.nodes[params[pi]]
+      if p is Param {
+        if p.parType < 0 {
+          // An UN-ANNOTATED parameter — a contextually-inferred callback literal
+          // (`xs.map(function(n) n * 2)`, Slice 5's checker half). The checker has
+          // already pinned its type from the receiver; this emitter's default kind
+          // for a missing annotation is i32 (`vtKindOfType(-1)` → 0), which is the
+          // only inferred-param receiver element kind in scope. Accepted as-is.
+          pi = pi + 1
+          continue
+        }
+        const ty = P.nodes[p.parType]
+        if ty is TypeRef {
+          // i32, `boolean` (which rides in an i32, 0/1 — encoded as the SAME 0x7f
+          // valtype), the declared struct type, a NULLABLE struct (`S | null`), an
+          // array (`i32[]`), or `string` (the SAME `array i32` of code points) are
+          // allowed; anything else fails.
+          // (`collectA` already validated every array annotation is i32[].)
+          if tyIsFuncType(p.parType) {
+            // a function-typed (closure fat-pointer) param — kind 14
+          } else if nulCloFlag(p.parType) == 1 {
+            // a NULLABLE function-value param (`((i32) => i32) | null`, kind 19) — its `=>` is
+            // NESTED so `tyIsFuncType` (top-level-arrow only) no longer matches it; accept it
+            // here explicitly, as `vtKindOfType` already maps it to kind 19.
+          } else if retNulRefFlag(p.parType) == 1 {
+            // accepted — a `(ref null $S)` param
+          } else if retNulListFlag(p.parType) == 1 {
+            // accepted — a `(ref null $lTypeIdx)` param (`i32[] | null`, kind 15)
+          } else if tyIsNulBool(p.parType) {
+            // accepted — a `boolean | null` NICHE param (the i32 sentinel 0/1/2)
+          } else if retNulStringFlag(p.parType) == 1 {
+            // accepted — a `string | null` param (`(ref null $aTypeIdx)`, kind 16)
+          } else if retMapFlag(p.parType) == 1 {
+            // accepted — a string-keyed map param (kind 6, `(ref $mapStruct)`). Mono i32/boolean
+            // rides shape -1; a `string`-valued map carries its mv slot (`mapAnnShape`) across the
+            // boundary. The body's map ops resolve the param via `exprMap`/`paramMap`/
+            // `mapShapeOfExpr` (which now reads the param annotation's shape). A struct/f64/i64-
+            // valued map is NOT yet supported (`retMapFlag` returns 0) → rejected below.
+          } else if nodeTyIsLitUnionAlias(p.parType) {
+            // accepted — a literal-union param is an i32-backed interned atom (kind 0).
+          } else if nodeTyIsNulLitUnion(p.parType) {
+            // accepted — a `K | null` NICHE param is the i32 atom with the spare `-1` = null (kind 0).
+          } else if ty.tyName != "i32" {
+            if ty.tyName != "i64" {
+              // i64 rides the 0x7e valtype (Slice 1)
+              if ty.tyName != "f64" {
+                // f64 rides the 0x7c valtype (Slice 3)
+                if ty.tyName != "f32" {
+                  // f32 rides the 0x7d valtype (Slice 5)
+                  if ty.tyName != "boolean" {
+                    if !isSName(ty.tyName) {
+                      if !isUName(ty.tyName) {
+                        if variantIndexOf(ty.tyName) < 0 {
+                          if !nameIsArray(ty.tyName) {
+                            if !nameIsString(ty.tyName) {
+                              return emitFail(
+                                "emitProgram: only i32, i64, f64, f32, boolean, struct, union, array, or string parameters are supported",
+                              )
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } else {
+          return emitFail("emitProgram: parameter type is not a type name")
+        }
+      } else {
+        return emitFail("emitProgram: malformed parameter")
+      }
+      pi = pi + 1
+    }
+    return 0
+  }
+  emitFail("emitProgram: not a function declaration")
+}
+
+// ── locals-vector emission (derived, never separately counted) ────────────────
+// The locals vector is a sequence of (count, valtype) runs. This emitter uses a
+// count of 1 per local — one run per declared local and per scratch slot — so the
+// run total equals the local count. The run helpers below stream straight to
+// `curBuf` (bind it with `wTarget` first); each emits the `1` count then a valtype.
+
+// Build the size-prefixed code-section body for the FuncDecl at `fnIx`: the locals
+// vector (declared locals, all i32 — see `buildLocals`), the body's statement
+// instructions, then `end`. The framed bytes are appended onto `out`. Returns 0, or
+// -1 (via `emitFail`) on any unsupported shape.
+//
+// The locals vector groups consecutive locals of the same type into (count, valtype)
+// runs. Every declared local is i32 here, so it is a single run `(L, 0x7f)` for
+// `L = localNames.length` declared locals (or an empty vector `0` when there are
+// none). Params are NOT counted here — they are encoded in the functype, not the
+// code body's locals vector.
+function emitFuncCode(out: i32[], fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    // Collect + validate declared locals BEFORE lowering, so identifier resolution
+    // and the locals vector both see the full per-function set.
+    if buildLocals(fnIx) < 0 { return -1 }
+
+    // If this function pushes, reserve three scratch locals after the declared ones.
+    // `pushScratchBase` is their first wasm index (= params + declared locals); the
+    // inline-push sequence reads `pushScratchBase`+0/+1/+2. Set BEFORE `emitStmts` so a
+    // `.push` can resolve its scratch slots. ONE body walk (`blockPushPopBits`)
+    // classifies every `.push`/Member-`.pop` receiver once and yields all six kind
+    // flags together.
+    fnUsesPush = false
+    fnUsesRefPush = false
+    fnUsesStrPush = false
+    fnUsesF64Push = false
+    fnUsesI64Push = false
+    fnUsesF32Push = false
+    applyPushPopBits(blockPushPopBits(fn.fnBody, fnIx))
+    fnUsesStrOp = fnHasStrOp(fnIx)
+    fnUsesArrNew = fnHasArrNew(fnIx)
+    fnUsesCoalesceCall = fnHasCoalesceCall(fnIx)
+    fnUsesMap = fnHasMap(fnIx)
+    // `fnHasMap` only scans LOCALS/params; also reserve the frame when a map op runs
+    // on a GLOBAL struct-field map-array element (e.g. `T.scopes[top][k] = v`).
+    if !fnUsesMap { fnUsesMap = fnHasGlobalMapOp(fnIx) }
+    // A function-value call (`call_ref`) anywhere in the body reserves the closure
+    // scratch slot. Only detected when a function value exists module-wide (lambdas).
+    fnUsesCallRef = false
+    if fnValUsed { fnUsesCallRef = blockHasCallRef(fn.fnBody, fnIx) }
+    // Collect the DISTINCT ref-list element-type slots this function pushes onto (each
+    // gets its own typed 4-slot scratch frame). Empty unless `fnUsesRefPush`.
+    fnRefPushSlots = []
+    refPushBaseBySlot = []
+    collectRefPushSlots(fn.fnBody, fnIx)
+    // A Member-receiver ref-list `.pop` (`T.scopes.pop()`) needs the SAME typed scratch
+    // frame as a ref `.push` onto that slot — record its slot too, so a pop-only function
+    // reserves the frame whose `recvRef` holds the field's wrapper ref.
+    collectMemberPopRefSlots(fn.fnBody, fnIx)
+    // Collect the `.map`/`.filter` HOF sites this body lowers (each reserves the
+    // shared 4-slot frame + one typed src/dst slot per distinct receiver/result type).
+    fnUsesMapFilter = false
+    fnUsesMapKeys = false
+    fnUsesMapVals = false
+    fnUsesMapVals = false
+    mfSrcKinds = []
+    mfSrcSlots = []
+    mfSrcBases = []
+    mfDstKinds = []
+    mfDstSlots = []
+    mfDstBases = []
+    mfScan(fn.fnBody, fnIx)
+    // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6). May also flip
+    // `fnUsesStrOp` (a string-list compare rides the string-op frame), so it
+    // runs AFTER the `fnHasStrOp` assignment above.
+    fnUsesListEqI = false
+    fnUsesListEqS = false
+    fnListEqRSlots = []
+    fnUsesCloEq = false
+    leqScanBlock(fn.fnBody, fnIx)
+    const nLocals = localNames.length
+    // Lay out every scratch frame after the params + declared locals via the
+    // FuncBuilder cursor (Phase H), which sets `pushScratchBase` /
+    // `refPushScratchBase` / `refPushBaseBySlot` / `strPushScratchBase` /
+    // `strScratchBase` / `mapScratchBase` from ONE running offset in frame order.
+    // Scratch frames land after the params AND the hidden env param (local 0) when a
+    // function value exists module-wide, so the cursor starts past `envSlotShift`.
+    fbBeginFunc(fn.fnParams.length + envSlotShift(fnIx), nLocals)
+
+    const bodyExpr: i32[] = []
+    // Bind the writer at `bodyExpr` so the `fb*` opcode methods (which append to
+    // `curBuf`) write the function-body instructions; the recursive lowering threads
+    // the SAME `bodyExpr` as its `body` arg, so `curBuf == body` throughout and the
+    // not-yet-converted raw `body.push(...)` sites interleave identically. Restore
+    // the previous target afterwards.
+    const exprPrev = wTarget(bodyExpr)
+    // Reset the emit-time scope stack + slot cursor; `emitFuncBody` re-walks the body
+    // in collect's pre-order, so the n-th `LetDecl` it emits re-derives declared-local
+    // slot `n` and binds it for in-scope resolution.
+    scopeNames = []
+    scopeSlots = []
+    scopeFrames = []
+    emitLetCursor = 0
+    // Reset the loop control-frame tracking (`break`/`continue` branch-depth state)
+    // so a previous function's open frames never leak into this one.
+    ctrlDepth = 0
+    loopContDepth = []
+    loopBrkDepth = []
+    loopContLabel = []
+    loopBrkLabel = []
+    if emitFuncBody(bodyExpr, fn.fnBody, fnIx) < 0 { return -1 }
+    wTarget(exprPrev)
+
+    const body: i32[] = []
+    // Locals vector: one (count=1, valtype) run per DECLARED local, then the scratch
+    // frames in `fbBeginFunc`'s layout order. Derived from the local set + scratch
+    // flags by the FuncBuilder (Phase H) — the run count and every valtype come from
+    // ONE place, so they cannot desync from the frame layout above.
+    if fbEmitLocalsVec(body, nLocals) < 0 { return -1 }
+    appendAll(body, bodyExpr)
+    // Bind the writer at `body` (the framed code entry) for the trailing padding/end
+    // opcodes emitted via the `fb*` methods.
+    const endPrev = wTarget(body)
+    // If the body does NOT end in an explicit `return` / tail value, control
+    // structurally falls through to the function `end` with an empty stack (e.g. a
+    // body ending in `if c { return a } else { return b }`, whose `return`s exit from
+    // inside the structured `if`). The validator requires the function's result type
+    // at fallthrough, so something must occupy it. Two cases:
+    //   • NULLABLE return — the fall-through is a LIVE path that yields `null` (the
+    //     checker permits it precisely because `null` is in the return type), so emit
+    //     that null value (`emitNullForRet`) as the function's result.
+    //   • non-nullable return — the typechecker has proven the fallthrough is DEAD
+    //     (every path returns), so `unreachable` (0x00) is sound padding, never run.
+    const fnPos = fnStmtsPosOf(fnIx)
+    let isVoidFn = false
+    if fnPos >= 0 {
+      if fRetVoid[fnPos] == 1 { isVoidFn = true }
+    }
+    if !isVoidFn && !bodyEndsInReturn(fn.fnBody, fnIx) {
+      if fnRetNullBearing(fnIx) {
+        if emitNullForRet(body, fnIx) < 0 { return -1 }
+      } else {
+        fbUnreachable() // 0x00 unreachable (dead padding for the result type)
+      }
+    }
+    fbEnd() // 0x0b end
+    wTarget(endPrev)
+    // Stream the size-prefixed code entry onto `out` (the code-section payload). Bind
+    // the writer at `out` explicitly: the caller restores `curBuf` off the payload
+    // before this loop, so `curBuf` is NOT `out` on entry here.
+    const outPrev = wTarget(out)
+    wULEB(body.length)
+    wBytes(body)
+    wTarget(outPrev)
+    return 0
+  }
+  emitFail("emitProgram: not a function declaration")
+}
+
+// Detect, over the SET of non-const global init expressions, the scratch frames the
+// start function's body needs — the start-fn analogue of `emitFuncCode`'s per-function
+// `fnHas*` detection. A `.push` is a statement-level void call (never in an init VALUE
+// position), so the i32/ref/string-push frames are driven by Member-receiver `.pop`s
+// (which DO appear in value position, `let x = T.scopes.pop()` shape) via
+// `exprPopBits`; string ops and map ops are detected over the same exprs. Sets
+// the `fnUses*` flags + `fnRefPushSlots`/`refPushBaseBySlot` exactly as `emitFuncCode`
+// does, so the shared `fbBeginFunc`/`fbEmitLocalsVec` lay out an identical frame. For
+// the common `curBuf = W.bytes` shape (a plain `global.get`+`struct.get`) every flag is
+// false and the locals vector is empty.
+// Record the ref-list slot of a bare top-level `recv.push(x)` statement (the
+// block-level collector handles pushes nested in loop/if bodies).
+function recordStartRefPushSlot(stmtIx: i32) {
+  const s = P.nodes[stmtIx]
+  if s is Call {
+    const callee = P.nodes[s.callFn]
+    if callee is Member {
+      if callee.memProp == "push" {
+        recordRefPushSlot(refListSlotOfExpr(callee.memObj, -1))
+      }
+    }
+  }
+  0
+}
+
+// Run every scratch-detection walker over one start-fn BLOCK (a loop body, an if
+// arm), feeding the `fnUses*` flags + the ref-push slot recorders. The single
+// push/pop walk feeds the push flags, mirroring `emitFuncCode`: a `.push` and a
+// Member-receiver `.pop` (which reuses the push frame's slots) each need the
+// scratch quad.
+function startScanBlock(blockIx: i32) {
+  applyPushPopBits(blockPushPopBits(blockIx, -1))
+  if blockHasStrOp(blockIx, -1) { fnUsesStrOp = true }
+  if blockHasArrNew(blockIx) { fnUsesArrNew = true }
+  if blockHasCoalesceCall(blockIx) { fnUsesCoalesceCall = true }
+  if blockHasMapOp(blockIx, -1) { fnUsesMap = true }
+  collectRefPushSlots(blockIx, -1)
+  collectMemberPopRefSlots(blockIx, -1)
+  0
+}
+
+// Scan a TOP-LEVEL `if` chain: the condition expression plus every arm's block
+// (an `else if` recurses through this function).
+function startScanIf(ifIx: i32) {
+  const st = P.nodes[ifIx]
+  if st is IfStmt {
+    if exprHasStrOp(st.ifCond, -1) { fnUsesStrOp = true }
+    if exprHasArrNew(st.ifCond) { fnUsesArrNew = true }
+    if exprHasCoalesceCall(st.ifCond) { fnUsesCoalesceCall = true }
+    if exprHasMapOp(st.ifCond, -1) { fnUsesMap = true }
+    applyPushPopBits(exprPopBits(st.ifCond, -1))
+    // Narrow across each arm (mirroring `ifChainHasStrOp` / `emitStmt`): the
+    // then-branch sees the guard's narrowing, the else-branch sees a VALUE
+    // union's complement — so a top-level `if w is string { print(w) }`
+    // reserves the string scratch frame in the start function.
+    const savedTop = narrowTop
+    const narrowed = setNarrowFromCond(st.ifCond, -1)
+    startScanBlock(st.ifThen)
+    if narrowed { restoreNarrow(savedTop) }
+    if st.ifElse >= 0 {
+      const savedElseTop = narrowTop
+      const narrowedElse = setNarrowFromCondElse(st.ifCond, -1)
+      const els = P.nodes[st.ifElse]
+      if els is Block { startScanBlock(st.ifElse) }
+      if els is IfStmt { startScanIf(st.ifElse) }
+      if narrowedElse { restoreNarrow(savedElseTop) }
+    }
+  }
+  0
+}
+
+function startFnDetectScratch() {
+  fnUsesPush = false
+  fnUsesRefPush = false
+  fnUsesStrPush = false
+  fnUsesF64Push = false
+  fnUsesF32Push = false
+  fnUsesI64Push = false
+  fnUsesStrOp = false
+  fnUsesArrNew = false
+  fnUsesCoalesceCall = false
+  fnUsesMap = false
+  fnUsesCallRef = false
+  fnRefPushSlots = []
+  refPushBaseBySlot = []
+  fnUsesMapFilter = false
+  fnUsesMapKeys = false
+  mfSrcKinds = []
+  mfSrcSlots = []
+  mfSrcBases = []
+  mfDstKinds = []
+  mfDstSlots = []
+  mfDstBases = []
+  let gi = 0
+  while gi < globalStmts.length {
+    if globalIsNonConst(globalStmts[gi]) {
+      const g = P.nodes[globalStmts[gi]]
+      if g is LetDecl {
+        const ix = g.letInit
+        applyPushPopBits(exprPopBits(ix, -1))
+        if exprHasStrOp(ix, -1) { fnUsesStrOp = true }
+        // A `string` global initialized with a literal-union atom widens via the runtime tower
+        // (`emitAtomToStr`), which stages the atom id in the string-op scratch frame.
+        if globalInitWidensAtomToStr(globalStmts[gi]) { fnUsesStrOp = true }
+        if exprHasArrNew(ix) { fnUsesArrNew = true }
+        if exprHasCoalesceCall(ix) { fnUsesCoalesceCall = true }
+        if exprHasMapOp(ix, -1) { fnUsesMap = true }
+        if fnValUsed {
+          if blockHasCallRef(ix, -1) { fnUsesCallRef = true }
+        }
+        collectMemberPopRefSlotsExpr(ix, -1)
+        // A `.map`/`.filter` in a non-const global initializer (`const ys =
+        // xs.map(...)`) runs in the start function — reserve its HOF frame here.
+        mfScan(ix, -1)
+      }
+    }
+    gi = gi + 1
+  }
+  // `.map`/`.filter` sites in top-level STATEMENTS (`print(e.map(...).length)`)
+  // also run in the start function; `mfScan` recurses every statement shape itself.
+  let mfi = 0
+  while mfi < startStmts.length {
+    mfScan(startStmts[mfi], -1)
+    mfi = mfi + 1
+  }
+  // Top-level STATEMENTS may also need scratch (a `.push` / string op / map op in a
+  // top-level `for`/`while`/`if` body or a bare call). Scan each through the same
+  // walkers (which recurse into for/while/if bodies). `startScanBlock` runs every
+  // block walker over one body; `startScanIf` descends an if/else-if chain.
+  let si = 0
+  while si < startStmts.length {
+    const st = P.nodes[startStmts[si]]
+    if st is ForRange {
+      startScanBlock(st.frBody)
+    } else if st is ForIn {
+      startScanBlock(st.fiBody)
+      if exprHasStrOp(st.fiIter, -1) { fnUsesStrOp = true }
+      if exprHasArrNew(st.fiIter) { fnUsesArrNew = true }
+      if exprHasCoalesceCall(st.fiIter) { fnUsesCoalesceCall = true }
+      if exprHasMapOp(st.fiIter, -1) { fnUsesMap = true }
+    } else if st is WhileStmt {
+      startScanBlock(st.whileBody)
+    } else if st is IfStmt {
+      startScanIf(startStmts[si])
+    } else {
+      // expression statements (a bare call / assignment): the per-statement push
+      // detector plus the expr walkers
+      applyPushPopBits(stmtPushBits(startStmts[si], -1))
+      applyPushPopBits(exprPopBits(startStmts[si], -1))
+      if exprHasStrOp(startStmts[si], -1) { fnUsesStrOp = true }
+      if exprHasArrNew(startStmts[si]) { fnUsesArrNew = true }
+      if exprHasCoalesceCall(startStmts[si]) { fnUsesCoalesceCall = true }
+      if exprHasMapOp(startStmts[si], -1) { fnUsesMap = true }
+      if fnValUsed {
+        if blockHasCallRef(startStmts[si], -1) { fnUsesCallRef = true }
+      }
+      if stmtIsPushKind(startStmts[si], -1, "ref") {
+        recordStartRefPushSlot(startStmts[si])
+      }
+      collectMemberPopRefSlotsExpr(startStmts[si], -1)
+    }
+    si = si + 1
+  }
+  // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6) — non-const
+  // global inits and every top-level statement run in the start function.
+  fnUsesListEqI = false
+  fnUsesListEqS = false
+  fnListEqRSlots = []
+  fnUsesCloEq = false
+  let lgi = 0
+  while lgi < globalStmts.length {
+    if globalIsNonConst(globalStmts[lgi]) {
+      const lg = P.nodes[globalStmts[lgi]]
+      if lg is LetDecl { leqScanExpr(lg.letInit, -1) }
+    }
+    lgi = lgi + 1
+  }
+  let lsi = 0
+  while lsi < startStmts.length {
+    leqScanStmt(startStmts[lsi], -1)
+    lsi = lsi + 1
+  }
+  0
+}
+
+// Emit the synthetic start function's size-prefixed code entry onto `out` (the code
+// section payload). The body runs every NON-const global initializer in declaration
+// order — `emitExpr(body, letInit, -1)` (module scope, `fnIx = -1`) then `global.set gi`
+// — so each cell holds its real value before any other code runs. Mirrors
+// `emitFuncCode`'s framing: detect scratch frames, lay out locals via `fbBeginFunc`,
+// emit the locals vector (`fbEmitLocalsVec`) with NO declared locals, then the body and
+// the `end`, size-prefixed. Returns 0, or -1 (via `emitFail`).
+// Collect the start function's DECLARED locals from the top-level statements: a
+// `for` range loop's var+bound pair (and any `let`s nested in loop/if bodies, via
+// the same collectLocals walkers user functions use, with the module-level
+// `fnIx = -1`). Resets the local registry + scope stack like `buildLocals`.
+function collectStartLocals() {
+  localNames = []
+  localIsRef = []
+  localStructIdx = []
+  localLoopVar = []
+  localLitUnion = []
+  scopeNames = []
+  scopeSlots = []
+  scopeFrames = []
+  scopePush()
+  let i = 0
+  while i < startStmts.length {
+    const s = P.nodes[startStmts[i]]
+    if s is ForRange {
+      const fvSlot = addLocalName(s.frVar, "i32", -1)
+      markLoopVarSlot(fvSlot)
+      scopeBind(s.frVar, fvSlot)
+      addLocalName(s.frVar + "#b", "i32", -1)
+      if collectLocals(s.frBody, -1) < 0 {
+        scopePop()
+        return -1
+      }
+      // The loop variable's scope is the loop (see `scopeUnbind`).
+      scopeUnbind()
+    } else if s is ForIn {
+      const fiEk = forInElemKind(s.fiIter, -1)
+      if fiEk == null {
+        scopePop()
+        return emitFail("emitProgram: unsupported for-in iterable")
+      }
+      // A struct element (`S[]`, code 1) binds the loop var as a struct local carrying
+      // the element struct table index; the `#l` temp holds the ref-list WRAPPER
+      // (code 5 + the ref-list slot). i32/string elements keep their slots.
+      let fiVarIdx = -1
+      let fiLk: VKind = "list"
+      if fiEk == "struct" {
+        fiVarIdx = forInRefArrayStructIdx(s.fiIter, -1)
+        fiLk = "reflist"
+      } else if fiEk == "str" {
+        fiLk = "strlist"
+      } else if fiEk == "f64" {
+        fiLk = "f64list" // f64 element → f64-list `#l` temp
+      } else if fiEk == "i64" {
+        fiLk = "i64list" // i64 element → i64-list `#l` temp
+      }
+      const fiSlot = addLocalName(s.fiVar, fiEk, fiVarIdx)
+      markLoopVarSlot(fiSlot)
+      scopeBind(s.fiVar, fiSlot)
+      addLocalName(s.fiVar + "#i", "i32", -1)
+      let fiLs = -1
+      if fiEk == "struct" { fiLs = refListSlotOfExpr(s.fiIter, -1) }
+      addLocalName(s.fiVar + "#l", fiLk, fiLs)
+      if collectLocals(s.fiBody, -1) < 0 {
+        scopePop()
+        return -1
+      }
+      // The loop variable's scope is the loop (see `scopeUnbind`).
+      scopeUnbind()
+    } else if s is WhileStmt {
+      if collectLocals(s.whileBody, -1) < 0 {
+        scopePop()
+        return -1
+      }
+    } else if s is IfStmt {
+      if collectLocalsIf(startStmts[i], -1) < 0 {
+        scopePop()
+        return -1
+      }
+    }
+    i = i + 1
+  }
+  scopePop()
+  localNames.length
+}
+
+function emitStartFnCode(out: i32[]) {
+  // Locals FIRST, detection SECOND: the scratch detectors classify expressions
+  // through the declared-locals registry (`declaredString(k)` for a `print(k)` over
+  // a for-in string element), so the registry must be populated before they run —
+  // `declaredSlotOf` falls back to the flat `localNames` scan when no scope frame
+  // is active, exactly for detection passes. Then the frames follow the locals.
+  const nStartLocals = collectStartLocals()
+  if nStartLocals < 0 { return -1 }
+  startFnDetectScratch()
+  fbBeginFunc(0, nStartLocals)
+
+  const bodyExpr: i32[] = []
+  const exprPrev = wTarget(bodyExpr)
+  // Reset the emit-time scope/loop bookkeeping (the start fn has its own empty frame),
+  // mirroring `emitFuncCode` — no leak from the last user function.
+  scopeNames = []
+  scopeSlots = []
+  scopeFrames = []
+  emitLetCursor = 0
+  ctrlDepth = 0
+  loopContDepth = []
+  loopBrkDepth = []
+  loopContLabel = []
+  loopBrkLabel = []
+  // Non-const global initializers and top-level STATEMENTS run INTERLEAVED in source
+  // order (merged on arena index — top-level statements are parsed sequentially, so
+  // arena order IS source order): `xs.push(1)` before `const ys = xs.map(f)` must
+  // execute before that init. A program with only inits, or only statements, emits
+  // the exact same order as the previous inits-then-statements split (every golden
+  // has at most one of the two, so the bytes are unchanged). The emit context is
+  // module-level (`fnIx = -1`): identifier reads/writes resolve to globals.
+  let gi = 0
+  let si = 0
+  // Post-statement narrowing for the top-level statement list (the assignment
+  // narrowing of `pushPostGuardNarrow` — a top-level guard `if` cannot
+  // `return`, so only the assignment arm ever fires here). Restored at loop end.
+  const savedStartNarrowTop = narrowTop
+  while gi < globalStmts.length || si < startStmts.length {
+    let takeGlobal = gi < globalStmts.length
+    if takeGlobal && si < startStmts.length {
+      if startStmts[si] < globalStmts[gi] { takeGlobal = false }
+    }
+    if takeGlobal {
+      if globalIsNonConst(globalStmts[gi]) {
+        const g = P.nodes[globalStmts[gi]]
+        if g is LetDecl {
+          // Numeric WIDENING at the global-init boundary (a non-const `: f64`/`: f32`/`: i64`
+          // global whose init is a narrower numeric — e.g. `const b: f64 = a` with `a: i32`):
+          // the `emitExprAs*` helper inserts the lattice convert so the start-fn `global.set`
+          // matches the cell valtype. An i32 cell stays byte-identical. (Slice 5 widening.)
+          const gck = globalCellKind(globalStmts[gi])
+          if gck == "f32" {
+            const savedF32 = pendingF32
+            pendingF32 = true
+            if emitExprAsF32(bodyExpr, g.letInit, -1) < 0 {
+              wTarget(exprPrev)
+              return -1
+            }
+            pendingF32 = savedF32
+          } else if gck == "f64" {
+            if emitExprAsF64(bodyExpr, g.letInit, -1) < 0 {
+              wTarget(exprPrev)
+              return -1
+            }
+          } else if gck == "i64" {
+            if emitExprAsI64(bodyExpr, g.letInit, -1) < 0 {
+              wTarget(exprPrev)
+              return -1
+            }
+          } else {
+            // A map global's start-fn init seeds the map SHAPE (mirrors the
+            // local-`let` seeding) so `Map()` builds THIS global's map struct.
+            if gck == "map" {
+              pendingMapSlot = letMapShapeOf(globalStmts[gi], -1)
+            }
+            // A struct / nullable-struct cell seeds the struct context so a bare
+            // `null` init lowers as `ref.null $S` and a literal builds THIS
+            // global's annotated struct (mirrors the const-path seeding).
+            if gck == "struct" || gck == "nulstruct" {
+              pendingStructIdx = globalCellStructIdx(globalStmts[gi])
+            }
+            // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
+            // a `string|null` global lowers it as `ref.null $aTypeIdx` (kind 16).
+            pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
+            pendingNulString = letIsNulString(globalStmts[gi], -1)
+            if letIsLitUnion(globalStmts[gi]) { pendingLitUnion = 1 }
+            // A CLOSURE-ARRAY global (kind 5) seeds the ref-list kind/slot so its `[add1, …]`
+            // init builds the closure backing+wrapper (its function-ident elements aren't an
+            // objlit, so `arrLitIsRef` misses them — the annotation is authoritative, exactly
+            // as the const-path and the local-`let` path seed it). Without this the start-fn
+            // init falls to the i32-list path and the closure refs mismatch the i32 backing.
+            if gck == "reflist" {
+              pendingListKind = letAnnRefListKind(globalStmts[gi])
+              pendingListSlot = letAnnRefListSlot(globalStmts[gi])
+            }
+            // A nullable-CLOSURE global (kind 19) lowers a bare `null` init as
+            // `ref.null $cloStruct`; a function init builds the (non-null) closure value.
+            const savedSNC = pendingNulClosure
+            if gck == "nulclosure" { pendingNulClosure = true }
+            // A UNION cell (kind 4) coerces a raw init value into the box
+            // (`let w: string | i32 = n` boxes the i32 read) — a union-valued
+            // init (a union-returning call) passes through unchanged.
+            let gun = ""
+            if gck == "union" { gun = letUnionNameOf(globalStmts[gi], -1) }
+            if gun != "" {
+              if emitUnionCoerce(bodyExpr, gun, g.letInit, -1) < 0 {
+                wTarget(exprPrev)
+                return -1
+              }
+            } else if (
+              (gck == "str" || gck == "nulstr") &&
+              globalInitIsLitAtom(g.letInit)
+            ) {
+              // A literal-union atom initializing a `string` global widens to its member string.
+              // The start fn is a real function, so the runtime widening tower runs here (unlike a
+              // CONST global, whose constexpr init has no `select`/scratch).
+              if emitAtomToStr(bodyExpr, g.letInit, -1) < 0 {
+                wTarget(exprPrev)
+                return -1
+              }
+            } else {
+              if emitExpr(bodyExpr, g.letInit, -1) < 0 {
+                wTarget(exprPrev)
+                return -1
+              }
+            }
+            pendingNulBool = false
+            pendingNulString = false
+            pendingNulClosure = savedSNC
+            pendingMapSlot = -1
+            pendingStructIdx = -1
+            pendingListKind = 0
+            pendingListSlot = 0
+            pendingLitUnion = 0
+          }
+          const setPrev = wTarget(bodyExpr)
+          fbGlobalSet(userGlobalIdx(gi))
+          wTarget(setPrev)
+        }
+      }
+      gi = gi + 1
+    } else {
+      if emitStmt(bodyExpr, startStmts[si], -1) < 0 {
+        wTarget(exprPrev)
+        return -1
+      }
+      pushPostGuardNarrow(startStmts[si], -1)
+      si = si + 1
+    }
+  }
+  restoreNarrow(savedStartNarrowTop)
+  wTarget(exprPrev)
+
+  const body: i32[] = []
+  // Locals vector: the start fn's declared locals (for-loop vars), then the scratch frames.
+  if fbEmitLocalsVec(body, nStartLocals) < 0 { return -1 }
+  appendAll(body, bodyExpr)
+  const endPrev = wTarget(body)
+  fbEnd() // 0x0b end (void → void: stack already empty)
+  wTarget(endPrev)
+
+  const outPrev = wTarget(out)
+  wULEB(body.length)
+  wBytes(body)
+  wTarget(outPrev)
+  0
+}
+
+// The synthetic `__log__(offset, length)` decoder body: walk the tag/value pairs in
+// linear memory ([offset, offset+length), 8 bytes per pair) and print each value.
+// Mirrors the host runner's `__log__` import (compile.ts `runWasm`): tag 0 = plain
+// i32, printed via `__print_i32__` (import 0 — `memLogUsed` forces the print family).
+// A non-zero tag (i64/f32/f64 payloads, which span extra words) traps (`unreachable`)
+// — no corpus program logs them natively yet, and a silent wrong decode is worse.
+// DIVERGENCE (justified): the host joins a multi-pair log into ONE space-separated
+// line; this prints one line per pair. Every corpus `__log__` call logs exactly one
+// pair, so stdout is identical.
+function emitMemLogFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  // Locals vector: params occupy 0 (offset) and 1 (length); local 2 is the cursor.
+  wULEB(1)      // 1 locals run
+  wULEB(1)      // count 1
+  wU8(127)      // 0x7f i32
+  fbLocalGet(0)
+  fbLocalSet(2) // cursor = offset
+  fbBlock(64)   // block (void)
+  fbLoop(64)    // loop (void)
+  fbLocalGet(2)
+  fbLocalGet(0)
+  fbLocalGet(1)
+  fbI32Bin(106) // 0x6a i32.add — offset + length (the end)
+  fbI32Bin(78)  // 0x4e i32.ge_s — cursor >= end?
+  fbBrIf(1)     // exit the block
+  fbLocalGet(2)
+  fbI32Load()   // the pair's TAG
+  fbIf(64)      // tag != 0 → unsupported payload kind
+  fbUnreachable()
+  fbEnd()
+  fbLocalGet(2)
+  fbI32Const(4)
+  fbI32Bin(106) // i32.add — the value word
+  fbI32Load()
+  fbCall(0)     // __print_i32__ (import 0)
+  fbLocalGet(2)
+  fbI32Const(8)
+  fbI32Bin(106) // i32.add
+  fbLocalSet(2) // cursor += 8
+  fbBr(0)       // next pair
+  fbEnd()       // end loop
+  fbEnd()       // end block
+  fbEnd()       // 0x0b end (void function: stack empty)
+  wTarget(prev)
+  const outPrev = wTarget(out)
+  wULEB(body.length)
+  wBytes(body)
+  wTarget(outPrev)
+  0
+}
+
+// ── shared runtime helper BODIES (module-tail functions) ──────────────────────
+// Each body below is the once-per-module copy of machinery every lowering site
+// used to inline (see `gHelpStrHash` & co. in emit_state). Hand-rolled like the
+// `__log__` decoder above: a locals vector, then straight `fb*` opcodes against
+// wasm param/local indices (no scratch-frame indirection — params ARE the frame).
+
+// Frame a finished helper body (locals vec + code already in `body`) onto `out`.
+function helpFrameBody(out: i32[], body: i32[]) {
+  const outPrev = wTarget(out)
+  wULEB(body.length)
+  wBytes(body)
+  wTarget(outPrev)
+  0
+}
+
+// `__str_hash__(s) -> i32`: the masked non-negative FNV-1a hash of a string —
+// `h = 2166136261; for c in s { h = (h ^ c) * 16777619 }; h & 0x7fffffff`. The
+// 32-bit wasm `i32.mul` wraps exactly as the host's hash does. Params: s(0).
+// Locals: h(1), i(2).
+function emitStrHashFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(1)                // 1 locals run
+  wULEB(2)                // count 2
+  wU8(127)                // 0x7f i32
+  fbI32Const(-2128831035) // 2166136261 as signed (the FNV offset basis)
+  fbLocalSet(1)           // h
+  fbI32Const(0)
+  fbLocalSet(2)           // i = 0
+  fbLoop(64)              // loop, void
+  fbLocalGet(2)           // i
+  fbLocalGet(0)           // s
+  fbArrayLen()
+  fbI32Bin(78)            // 0x4e i32.ge_s (i >= len → done)
+  fbIf(64)                // then: done (empty)
+  fbElse()
+  // h = (h ^ s[i]) * 16777619
+  fbLocalGet(1)
+  fbLocalGet(0)
+  fbLocalGet(2)
+  fbArrayGet(aTypeIdx)
+  fbI32Bin(115) // 0x73 i32.xor
+  fbI32Const(16777619)
+  fbI32Bin(108) // 0x6c i32.mul
+  fbLocalSet(1)
+  // i = i + 1
+  fbLocalGet(2)
+  fbI32Const(1)
+  fbI32Bin(106) // i32.add
+  fbLocalSet(2)
+  fbBr(1)       // → loop header
+  fbEnd()       // end (ge_s if)
+  fbEnd()       // end (loop)
+  // h & 0x7fffffff — force non-negative (the result).
+  fbLocalGet(1)
+  fbI32Const(2147483647)
+  fbI32Bin(113) // 0x71 i32.and
+  fbEnd()       // end (function) — leaves the i32 result
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// `__str_eq__(a, b) -> i32`: element-wise string value-equality — 0 if the lengths
+// differ or any code point differs, else 1. Params: a(0), b(1). Locals: n(2), i(3).
+function emitStrEqFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(1)     // 1 locals run
+  wULEB(2)     // count 2
+  wU8(127)     // 0x7f i32
+  fbBlock(127) // block i32 — yields the 0/1 result
+  // n = len(a) ; if n != len(b) { 0 ; br out }
+  fbLocalGet(0)
+  fbArrayLen()
+  fbLocalSet(2) // n
+  fbLocalGet(2)
+  fbLocalGet(1)
+  fbArrayLen()
+  fbI32Bin(71)  // 0x47 i32.ne
+  fbIf(64)      // if, void
+  fbI32Const(0)
+  fbBr(1)       // → out of the i32 block
+  fbEnd()
+  // i = 0
+  fbI32Const(0)
+  fbLocalSet(3)
+  fbLoop(64)   // loop, void
+  fbLocalGet(3)
+  fbLocalGet(2)
+  fbI32Bin(78) // i32.ge_s (i >= n → done)
+  fbIf(64)     // then: done (empty)
+  fbElse()
+  // if a[i] != b[i] { 0 ; br out }
+  fbLocalGet(0)
+  fbLocalGet(3)
+  fbArrayGet(aTypeIdx)
+  fbLocalGet(1)
+  fbLocalGet(3)
+  fbArrayGet(aTypeIdx)
+  fbI32Bin(71) // i32.ne
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(3)      // → out of: if(0)·else(1)·loop(2)·block(3)
+  fbEnd()
+  // i = i + 1
+  fbLocalGet(3)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(3)
+  fbBr(1)       // → loop header
+  fbEnd()       // end (ge_s if/else)
+  fbEnd()       // end (loop)
+  fbI32Const(1) // every element matched
+  fbEnd()       // end (block)
+  fbEnd()       // end (function) — leaves the 0/1 result
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// `__str_concat__(a, b) -> (ref str)`: allocate a fresh `lenA + lenB` string and
+// `array.copy` both operands in. Params: a(0), b(1). Locals: lenA(2), lenB(3) i32;
+// out(4) a NON-NULL `(ref $aTypeIdx)` (set before every read — validation accepts
+// a non-defaultable local under init tracking).
+function emitStrConcatFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(2) // 2 locals runs
+  wULEB(2) // count 2
+  wU8(127) // 0x7f i32 (lenA, lenB)
+  wULEB(1) // count 1
+  wU8(100) // 0x64 (ref $aTypeIdx) — out
+  wSLEB(aTypeIdx)
+  // lenA = len(a) ; lenB = len(b)
+  fbLocalGet(0)
+  fbArrayLen()
+  fbLocalSet(2)
+  fbLocalGet(1)
+  fbArrayLen()
+  fbLocalSet(3)
+  // out = array.new_default $aTypeIdx (lenA + lenB)
+  fbLocalGet(2)
+  fbLocalGet(3)
+  fbI32Bin(106) // i32.add
+  fbArrayNewDefault(aTypeIdx)
+  fbLocalSet(4)
+  // array.copy out 0 a 0 lenA
+  fbLocalGet(4)
+  fbI32Const(0)
+  fbLocalGet(0)
+  fbI32Const(0)
+  fbLocalGet(2)
+  fbArrayCopy(aTypeIdx, aTypeIdx)
+  // array.copy out lenA b 0 lenB
+  fbLocalGet(4)
+  fbLocalGet(2)
+  fbLocalGet(1)
+  fbI32Const(0)
+  fbLocalGet(3)
+  fbArrayCopy(aTypeIdx, aTypeIdx)
+  fbLocalGet(4)
+  fbEnd() // end (function) — leaves the fresh string ref
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// `__map_probe__(index, hashes, live, keysBacking, key) -> i32`: hash the key
+// (via `__str_hash__`) and linear-probe (wrapping) to the slot holding either the
+// matching key's entry or a free (0) slot — the shared core of every map op. The
+// stored per-entry hash gates the string compare, and a tombstoned entry
+// (`live[entry-1] == 0`) probes past (a marker, not a hit) — see `emitMapProbe`'s
+// caller-side contract. Returns the PROBE SLOT; the caller re-reads
+// `index[slot]` for the entry. Params: index(0), hashes(1), live(2),
+// keysBack(3), key(4). Locals: cap(5), keyHash(6), slot(7), entry(8).
+function emitMapProbeFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(1) // 1 locals run
+  wULEB(4) // count 4
+  wU8(127) // 0x7f i32
+  // cap = array.len(index)
+  fbLocalGet(0)
+  fbArrayLen()
+  fbLocalSet(5)
+  // keyHash = __str_hash__(key)
+  fbLocalGet(4)
+  fbCall(gHelpStrHash)
+  fbLocalSet(6)
+  // slot = keyHash % cap
+  fbLocalGet(6)
+  fbLocalGet(5)
+  fbI32Bin(112) // 0x70 i32.rem_u
+  fbLocalSet(7)
+  fbBlock(64)   // block (probe break target), void
+  fbLoop(64)    // loop, void
+  // entry = index[slot] ; if entry == 0 { br out (miss) }
+  fbLocalGet(0)
+  fbLocalGet(7)
+  fbArrayGet(aTypeIdx)
+  fbLocalSet(8)
+  fbLocalGet(8)
+  fbI32Eqz()
+  fbBrIf(1) // → out of the probe block
+  // hashes[entry-1] == keyHash && live[entry-1] != 0
+  //   ? __str_eq__(keysBack[entry-1], key) : 0
+  fbLocalGet(1)
+  fbLocalGet(8)
+  fbI32Const(1)
+  fbI32Bin(107)        // i32.sub (entry - 1)
+  fbArrayGet(aTypeIdx)
+  fbLocalGet(6)
+  fbI32Bin(70)         // 0x46 i32.eq
+  fbLocalGet(2)
+  fbLocalGet(8)
+  fbI32Const(1)
+  fbI32Bin(107)
+  fbArrayGet(aTypeIdx)
+  fbI32Const(0)
+  fbI32Bin(71)         // 0x47 i32.ne (live != 0)
+  fbI32Bin(113)        // 0x71 i32.and — the expensive compare rides an `if`
+  fbIf(127)            // if, i32 blocktype
+  fbLocalGet(3)
+  fbLocalGet(8)
+  fbI32Const(1)
+  fbI32Bin(107)
+  fbArrayGet(mkArrIdx) // keysBack[entry-1] — (ref null $aTypeIdx)
+  fbRefAsNonNull()     // a stored slot is populated
+  fbLocalGet(4)
+  fbCall(gHelpStrEq)
+  fbElse()
+  fbI32Const(0)        // hash/live mismatch → not a hit
+  fbEnd()
+  // if match { br out (hit) }
+  fbBrIf(1)
+  // slot = (slot + 1) % cap  (collision OR a tombstone marker: keep probing)
+  fbLocalGet(7)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalGet(5)
+  fbI32Bin(112) // i32.rem_u
+  fbLocalSet(7)
+  fbBr(0)       // → loop header
+  fbEnd()       // end (loop)
+  fbEnd()       // end (probe block)
+  fbLocalGet(7) // the probe slot
+  fbEnd()       // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// `__map_resize__(index, hashes, live, count, size) -> (ref $aTypeIdx)`: when the
+// load factor crosses 1/2 (`size*2 >= len(index)`) allocate a doubled index and
+// RE-PLACE every LIVE entry from its STORED hash (no key re-hashing — mirrors
+// `emitMapRehashTo`), returning the fresh backing; otherwise return `index`
+// unchanged. The caller unconditionally stores the result back into `M.index`
+// (its own map struct type — the one shape-typed step stays at the call site).
+// Params: index(0), hashes(1), live(2), count(3), size(4). Locals: newCap(5),
+// i(6), rslot(7) i32; newIdx(8) a non-null `(ref $aTypeIdx)` (set before read).
+function emitMapResizeFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(2) // 2 locals runs
+  wULEB(3) // count 3
+  wU8(127) // 0x7f i32 (newCap, i, rslot)
+  wULEB(1) // count 1
+  wU8(100) // 0x64 (ref $aTypeIdx) — newIdx
+  wSLEB(aTypeIdx)
+  // if size * 2 >= len(index) { grow + rehash + early-return newIdx }
+  fbLocalGet(4)
+  fbI32Const(2)
+  fbI32Bin(108) // i32.mul (size * 2)
+  fbLocalGet(0)
+  fbArrayLen()
+  fbI32Bin(79)  // 0x4f i32.ge_u
+  fbIf(64)      // if, void
+  // newCap = 2 * len(index) ; newIdx = array.new_default $aTypeIdx newCap
+  fbLocalGet(0)
+  fbArrayLen()
+  fbI32Const(2)
+  fbI32Bin(108)
+  fbLocalSet(5)
+  fbLocalGet(5)
+  fbArrayNewDefault(aTypeIdx)
+  fbLocalSet(8)
+  // i = 0
+  fbI32Const(0)
+  fbLocalSet(6)
+  // loop { if i >= count {} else { re-place LIVE entry i ; i++ ; br } }
+  fbLoop(64)
+  fbLocalGet(6)
+  fbLocalGet(3)
+  fbI32Bin(78) // i32.ge_s (i >= count → done)
+  fbIf(64)     // then: done (empty)
+  fbElse()
+  // if live[i] != 0 { rslot = hashes[i] % newCap ; probe free ; newIdx[rslot] = i+1 }
+  fbLocalGet(2)
+  fbLocalGet(6)
+  fbArrayGet(aTypeIdx)
+  fbI32Const(0)
+  fbI32Bin(71) // i32.ne
+  fbIf(64)
+  // rslot = hashes[i] % newCap — RE-PLACE FROM THE STORED HASH
+  fbLocalGet(1)
+  fbLocalGet(6)
+  fbArrayGet(aTypeIdx)
+  fbLocalGet(5)
+  fbI32Bin(112) // i32.rem_u
+  fbLocalSet(7)
+  // while newIdx[rslot] != 0 { rslot = (rslot + 1) % newCap }
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(8)
+  fbLocalGet(7)
+  fbArrayGet(aTypeIdx)
+  fbI32Eqz()
+  fbBrIf(1) // → out of the inner block
+  fbLocalGet(7)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalGet(5)
+  fbI32Bin(112)
+  fbLocalSet(7)
+  fbBr(0)   // → inner loop header
+  fbEnd()   // end (inner loop)
+  fbEnd()   // end (inner block)
+  // newIdx[rslot] = i + 1
+  fbLocalGet(8)
+  fbLocalGet(7)
+  fbLocalGet(6)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbArraySet(aTypeIdx)
+  fbEnd() // end (live if)
+  // i = i + 1
+  fbLocalGet(6)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(6)
+  fbBr(1)       // → outer loop header
+  fbEnd()       // end (ge_s if)
+  fbEnd()       // end (outer loop)
+  fbLocalGet(8)
+  fbReturn()    // the fresh, rebuilt index
+  fbEnd()       // end (resize if)
+  fbLocalGet(0) // load factor fine → the index unchanged
+  fbEnd()       // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// Emit the wasm "name" custom section (section id 0, name "name") so a wasmtime
+// trap backtrace shows real function names instead of `<wasm function N>`. GATED
+// on `gEmitNames` — a no-op when off, so the default emit path (goldens +
+// fixpoints) is byte-identical. `n` is the user-function count (`fnStmts.length`)
+// and `gImports` the imported-function count (0 or 4); the imports occupy wasm
+// indices 0..gImports-1 (the print family), the user functions gImports..gImports+n-1.
+//
+// Layout (per the WebAssembly name-section appendix):
+//   section: id 0, ULEB(size), wName("name"), <subsections>
+//   module-name  subsection (id 0): ULEB(size), wName("vl")
+//   function-name subsection (id 1): ULEB(size), namemap
+//     namemap = ULEB(count), then count * { ULEB(funcidx), wName(name) }
+//   indices MUST be strictly increasing — we emit imports (0..3) then user
+//   functions in their natural index order, so the sequence is already sorted.
+function emitNameSection(n: i32) {
+  if gEmitNames == 0 { return 0 }
+
+  // ── function-name subsection (id 1) ──────────────────────────────────────────
+  // Build the namemap (count + entries) into a temp buffer, then frame it as the
+  // subsection payload. The print imports (if present) are named first at their
+  // hardcoded indices 0..3, then each user function at `gImports + i`.
+  const fnameMap: i32[] = []
+  const mapPrev = wTarget(fnameMap)
+  let count = gImports + n
+  if gHelpStrHash >= 0 { count = count + 3 }
+  if gHelpMapProbe >= 0 { count = count + 2 }
+  wULEB(count)
+  if gImports > 0 {
+    wULEB(0)
+    wName("__print_i32__")
+    wULEB(1)
+    wName("__print_bool__")
+    wULEB(2)
+    wName("__print_char__")
+    wULEB(3)
+    wName("__print_str_flush__")
+    // The 5th import (index 4) is named only when an i64 program prints.
+    if gNeedsI64Print {
+      wULEB(4)
+      wName("__print_i64__")
+    }
+    // The `__print_f64__` import is named at its computed index (`gF64PrintIdx`, 4 or 5).
+    if gNeedsF64Print {
+      wULEB(gF64PrintIdx)
+      wName("__print_f64__")
+    }
+    // The `__print_f32__` import is named at its computed index (`gF32PrintIdx`, 4/5/6).
+    if gNeedsF32Print {
+      wULEB(gF32PrintIdx)
+      wName("__print_f32__")
+    }
+  }
+  let fi = 0
+  while fi < n {
+    const fn = P.nodes[fnStmts[fi]]
+    if fn is FuncDecl {
+      wULEB(gImports + fi)
+      // Prefer a lambda's DEBUG display name (its binding, `const foo = …` → "foo")
+      // over the synthesized `__lambda_N`, so a trap backtrace reads `foo`.
+      const disp = fnDispNames[fi]
+      if disp.length > 0 { wName(disp) } else { wName(fn.fnName) }
+    }
+    fi = fi + 1
+  }
+  // The shared runtime helpers (module-tail indices — after the start fn and the
+  // `__log__` decoder, so the namemap stays strictly increasing).
+  if gHelpStrHash >= 0 {
+    wULEB(gHelpStrHash)
+    wName("__str_hash__")
+    wULEB(gHelpStrEq)
+    wName("__str_eq__")
+    wULEB(gHelpStrConcat)
+    wName("__str_concat__")
+  }
+  if gHelpMapProbe >= 0 {
+    wULEB(gHelpMapProbe)
+    wName("__map_probe__")
+    wULEB(gHelpMapResize)
+    wName("__map_resize__")
+  }
+  wTarget(mapPrev)
+
+  // ── assemble the section payload: wName("name") + the two subsections ─────────
+  const namePayload: i32[] = []
+  const npPrev = wTarget(namePayload)
+  wName("name")
+  // module-name subsection (id 0): a single name. Its payload is a length-prefixed
+  // name, built into a temp so the subsection-size ULEB frames the right length.
+  const modName: i32[] = []
+  const mnPrev = wTarget(modName)
+  wName("vl")
+  wTarget(mnPrev)
+  wU8(0) // subsection id 0: module name
+  wULEB(modName.length)
+  wBytes(modName)
+  // function-name subsection (id 1): the namemap built above.
+  wU8(1) // subsection id 1: function names
+  wULEB(fnameMap.length)
+  wBytes(fnameMap)
+  wTarget(npPrev)
+
+  wSection(0, namePayload) // custom section id 0
+  0
+}
+
+// Emit the complete module for the top-level functions in `fnStmts` (each a FuncDecl,
+// validated by `collectFns`/`buildFnMap`/`checkParams`). If a struct `type` was
+// declared, its WasmGC struct type is emitted FIRST (type index 0) and the functypes
+// follow (1..N); otherwise functypes start at 0. Struct-typed params/results encode
+// as `(ref $0)`. The function section binds func i to its functype, an export per
+// function under its own name, and one code body per function — every section framed
+// through the SAME LEB/section helpers the fixed builders use.
+// Collect the STRING-LITERAL POOL: every distinct `StrLit` lexeme in the arena
+// (first-seen arena order — deterministic per program) whose decoded length fits
+// one `array.new_fixed` (a constexpr admits no locals, so an over-cap literal
+// keeps the inline chunked build). An arena scan over-approximates live code
+// (mirroring the print-detection scan): a dead literal costs one small unused
+// immutable global, never correctness. Monomorphized clones share one entry —
+// the pool dedupes by lexeme.
+function collectStrPool() {
+  gStrPoolTexts = []
+  gStrPoolIx = Map()
+  if !aUsed { return 0 }
+  let i = 0
+  while i < P.nodes.length {
+    const nd = P.nodes[i]
+    if nd is StrLit {
+      if (gStrPoolIx[nd.strText] ?? -1) < 0 {
+        if decodeStr(strToCps(nd.strText)).length <= NEW_FIXED_MAX {
+          gStrPoolIx[nd.strText] = gStrPoolTexts.length
+          gStrPoolTexts.push(nd.strText)
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+function emitModule(_stmts: i32[]) {
+  emitReset()
+  emitHeader()
+
+  const n = fnStmts.length
+
+  // ── Start-function model (non-const module-global initializers) ──────────────
+  // A module global whose initializer is NOT a WasmGC constant expression (a member
+  // access like `curBuf = W.bytes`, a reference to another global, a call, …) cannot
+  // be emitted inline in the global section. Its cell is zero-initialized there
+  // (nullable `ref.null` / `i32.const 0`) and a SINGLE synthetic start function — the
+  // LAST function index, so no user index shifts — runs every such init via
+  // `global.set` before any other code. Count them up front; the count drives one
+  // extra `()->()` functype, one extra function-section + code-section entry, and the
+  // start section (id 8). When zero (the case for EVERY golden), nothing below
+  // changes, so the module stays byte-identical.
+  let nNonConst = 0
+  let gci = 0
+  while gci < globalStmts.length {
+    if globalIsNonConst(globalStmts[gci]) { nNonConst = nNonConst + 1 }
+    gci = gci + 1
+  }
+  let hasStart = 0
+  if nNonConst > 0 { hasStart = 1 }
+  if startStmts.length > 0 { hasStart = 1 }
+  // The synthetic start function's index (last, after all `n` user functions, which
+  // themselves sit after any imports) and its `()->()` functype index (one past the
+  // user functypes). Both unused when no start.
+  const startFnIdx = gImports + n
+  // The synthetic `__log__` decoder (memory intrinsics) is the LAST function index —
+  // after the imports, the user functions, AND the start fn — so no other function
+  // index shifts. `memFn` (0 or 1) feeds the function/code section counts.
+  let memFn = 0
+  if memLogUsed { memFn = 1 }
+  gMemLogIdx = gImports + n + hasStart
+
+  // ── shared runtime helpers (module-tail functions) ───────────────────────────
+  // Assign each enabled helper the NEXT function index after the start fn and the
+  // `__log__` decoder (so no other index shifts), in a FIXED order (string hash /
+  // eq / concat, then map probe / resize) keyed only on the type-presence flags —
+  // deterministic per program, so the self-compile fixpoint converges. The string
+  // trio rides `aUsed` (the string array type exists) and the map pair `mUsed`;
+  // an enabled-but-uncalled helper costs a few dozen bytes, never correctness.
+  gHelpStrHash = -1
+  gHelpStrEq = -1
+  gHelpStrConcat = -1
+  gHelpMapProbe = -1
+  gHelpMapResize = -1
+  let nHelpers = 0
+  const helpBase = gImports + n + hasStart + memFn
+  if aUsed {
+    gHelpStrHash = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpStrEq = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpStrConcat = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  if mUsed {
+    gHelpMapProbe = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpMapResize = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+
+  // Intern the string-literal pool (its globals PRECEDE the user cells — every
+  // user-global index below rides `userGlobalIdx`).
+  collectStrPool()
+
+  // Heap-type indices, in type-section order: standalone structs at 0..ns-1, then
+  // (for the union path) the variant structs + box, then the raw i32 array, the
+  // i32-list wrapper, each ref-list (backing, wrapper) pair, the string-list
+  // (backing, wrapper), the map struct, and finally the functypes. Every index is
+  // minted by the centralized `mIntern*` counter inside `mAssignTypeIndices`, which
+  // assigns the module-global index state (`sHeapIdx`/`uVarIdx`/`uBoxIdx`/`aTypeIdx`/
+  // `lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`raTypeIdx`/`rlTypeIdx`/`mkArrIdx`/`mkListIdx`/
+  // `mStructIdx`) in that order and returns the functype base index (`typeOffset` —
+  // where the first functype lands). All types are emitted inside ONE recursion
+  // group below, so a type may reference one that lands later (a string field's
+  // `(ref $aTypeIdx)`).
+  const typeOffset = mAssignTypeIndices(n)
+
+  // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
+  // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`);
+  // the raw i32 array type (if used) next — `0x5e` array form, `0x7f` i32 storagetype,
+  // `0x01` mutable (derived from binaryen: `5e 7f 01`); the growable-list wrapper struct
+  // (if used) next — `0x5f` struct of three mutable fields `{ backing: (ref $aTypeIdx),
+  // len: i32, cap: i32 }` (verified against binaryen's `listType`); then one functype
+  // per function (`(i32|ref)* -> i32|ref`).
+  // The type section is a vector of rectypes. We emit ALL types inside ONE recursion
+  // group (`0x4e <count>`), so every type index is mutually visible — a struct field
+  // can reference the raw array type that lands AFTER it (a string field's `(ref
+  // $aTypeIdx)`), which a non-grouped section's strictly-earlier-only index rule would
+  // reject. (binaryen emits the same single rec group; functypes inside it are valid.)
+  // So the section's rectype count is 1 (the rec group), and the rec group holds the
+  // `n + typeOffset` actual type definitions.
+  // The print-import functypes are emitted as STANDALONE rectypes AFTER the rec group,
+  // NOT inside it: a rec-group-member functype carries nominal rec-group identity that
+  // a strict WasmGC host (wasmtime) refuses to match against a host-provided function,
+  // so `__print_i32__` & co. fail to instantiate. A standalone functype matches
+  // structurally. (V8 accepted either; this makes the emitted output portable.) The
+  // print functype INDICES are unchanged — they still trail every rec-group type — so
+  // the import-section references and the print-FREE goldens/fixpoint (nPrintTypes == 0,
+  // section rectype count stays 1, rec-group count unchanged) are byte-identical. Counted
+  // here in the coordinator because both the type section and the function section (the
+  // `__log__` functype index) need it.
+  let nPrintTypes = 0
+  if gImports > 0 {
+    nPrintTypes = 2 // (i32)->() and ()->() for the print imports
+  }
+  if gNeedsI64Print {
+    nPrintTypes = nPrintTypes + 1 // + (i64)->() for __print_i64__
+  }
+  if gNeedsF64Print {
+    nPrintTypes = nPrintTypes + 1 // + (f64)->() for __print_f64__
+  }
+  if gNeedsF32Print {
+    nPrintTypes = nPrintTypes + 1 // + (f32)->() for __print_f32__
+  }
+
+  emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
+
+  emitImportSection(n, typeOffset, hasStart)
+
+  emitFunctionSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
+
+  // Memory section (id 5, between function (3) and global (6)): ONE module-DEFINED
+  // memory, min 1 page (64 KiB — ample for the corpus' tag/value scratch region), no
+  // max. The host IMPORTS `imports.memory` instead; the native runner provides no
+  // memory import, so the module defines its own (same observable behavior). Emitted
+  // only when a memory intrinsic is used — byte-identical output otherwise.
+  if memUsed {
+    const memPayload: i32[] = []
+    const memPrev = wTarget(memPayload)
+    wULEB(1) // 1 memory
+    wU8(0)   // limits flag 0x00: min only
+    wULEB(1) // min: 1 page
+    wTarget(memPrev)
+    wSection(5, memPayload)
+  }
+
+  emitGlobalSection()
+
+  emitExportSection(n)
+
+  // Start section (id 8): names the function the runtime invokes once at instantiation,
+  // before any export is callable — here the synthetic start fn that runs the non-const
+  // global initializers. Per the section-id order it sits AFTER the export section (7)
+  // and BEFORE the code section (10). Omitted entirely when no non-const global exists
+  // (so EVERY golden, which has only const globals, emits no start section).
+  if hasStart == 1 {
+    const startPayload: i32[] = []
+    const stPrev = wTarget(startPayload)
+    wULEB(startFnIdx)
+    wTarget(stPrev)
+    wSection(8, startPayload)
+  }
+
+  // Element section (id 9): a single DECLARATIVE elem segment declaring every user
+  // function as `ref.func`-referenceable (lambdas). `ref.func` requires its target be
+  // forward-declared; with no table we use a declarative segment (flags 0x03, elemkind
+  // 0x00 funcref, then the func-index vec). Emitted ONLY when a function value exists
+  // (`fnValUsed`), so a no-lambda module emits no section 9 and stays byte-identical —
+  // mirroring the start-section conditional. Sits AFTER start (8), BEFORE code (10).
+  if fnValUsed {
+    const elemPayload: i32[] = []
+    const elPrev = wTarget(elemPayload)
+    wULEB(1) // 1 element segment
+    wU8(3)   // flags 0x03: declarative, elemkind + func-index vec
+    wU8(0)   // elemkind 0x00 — funcref
+    wULEB(n) // count of declared funcs
+    let di = 0
+    while di < n {
+      wULEB(gImports + di) // func index (imports occupy 0..gImports-1)
+      di = di + 1
+    }
+    wTarget(elPrev)
+    wSection(9, elemPayload)
+  }
+
+  if emitCodeSection(n, hasStart, memFn, nHelpers) < 0 { return -1 }
+
+  // Custom "name" section LAST (after the code section, where it conventionally
+  // lives). A no-op unless `gEmitNames` is set, so the default emit path is
+  // byte-identical to every golden.
+  emitNameSection(n)
+  0
+}
+
+// ── emitProgram pass manager ──────────────────────────────────────────────────
+// The front half of `emitProgram` is a sequence of ordered passes over the arena.
+// The pass TABLE in `emitProgram` is the one place that order lives: each row is
+// `"pass"` or `"pass > prereq prereq …"`, rows run top to bottom, and the driver
+// asserts every prerequisite has already run before dispatching — so a reordered
+// table fails loudly (`emitFail`) instead of miscompiling. A `#2` suffix names an
+// explicit RE-RUN of an earlier pass: monomorphization mints late annotations
+// (instance-pinned params/returns) that the first arena scans could not see, so
+// its dependents re-scan after it.
+
+// True if `done` (the names of the passes run so far) contains the pass name
+// spelled at `needs[i..j)` — a membership test without building a substring.
+function passDoneHas(done: string[], needs: string, i: i32, j: i32) {
+  let d = 0
+  while d < done.length {
+    const nm = done[d]
+    if nm.length == j - i {
+      let k = 0
+      let same = true
+      while k < nm.length {
+        if nm[k] != needs[i + k] { same = false }
+        k = k + 1
+      }
+      if same { return true }
+    }
+    d = d + 1
+  }
+  false
+}
+
+// True if every space-separated pass name in `needs` is present in `done`.
+function passNeedsMet(needs: string, done: string[]) {
+  let i = 0
+  while i < needs.length {
+    if needs[i] == 32 {
+      i = i + 1 // skip the separator (space)
+    } else {
+      let j = i
+      while j < needs.length && needs[j] != 32 { j = j + 1 }
+      if !passDoneHas(done, needs, i, j) { return false }
+      i = j
+    }
+  }
+  true
+}
+
+// The pass NAME of a table row (`"buildFnMap#2 > monomorphize"` → `"buildFnMap#2"`):
+// the leading run up to the first space or `>`.
+function passRowName(row: string) {
+  let e = 0
+  while e < row.length && row[e] != 32 && row[e] != 62 { e = e + 1 }
+  const nm = row.slice(0, e)
+  nm
+}
+
+// The prerequisite list of a table row — everything after the `>` (`""` when the
+// row declares none). Space-separated pass names, consumed by `passNeedsMet`.
+function passRowNeeds(row: string) {
+  let g = 0
+  while g < row.length && row[g] != 62 { g = g + 1 }
+  if g >= row.length { return "" }
+  const nd = row.slice(g + 1, row.length)
+  nd
+}
+
+// The `collectFns` post-condition, as a pass so the table orders it explicitly:
+// a program must declare at least one top-level function or start statement.
+function passCheckTopLevel() {
+  if fnStmts.length < 1 && startStmts.length < 1 {
+    return emitFail(
+      "emitProgram: expected at least one top-level function or statement",
+    )
+  }
+  0
+}
+
+// Detect `print(...)` / memory-intrinsic use anywhere in the program: any print
+// pulls in the 4-import print family (imports shift every local function's wasm
+// index, so this is decided up front; a print-free program emits no import
+// section at all). Scans the WHOLE arena, so it must run after every pass that
+// mints nodes (monomorphization instances, synthesized annotations).
+function scanPrintUse() {
+  gImports = 0
+  gNeedsI64Print = false
+  gNeedsF64Print = false
+  gF64PrintIdx = 0
+  gNeedsF32Print = false
+  gF32PrintIdx = 0
+  memUsed = false
+  memLogUsed = false
+  let pscan = 0
+  let sawI64Ann = false
+  let sawF64 = false
+  let sawF32 = false
+  while pscan < P.nodes.length {
+    const pn = P.nodes[pscan]
+    if pn is Call {
+      const pcallee = P.nodes[pn.callFn]
+      if pcallee is Ident {
+        if pcallee.identName == "print" { gImports = 4 }
+        // The linear-memory intrinsics: any store/load forces the module-defined
+        // memory; `__log__` additionally forces the synthetic decoder function,
+        // which prints through `__print_i32__` — so it pulls in the print-import
+        // family exactly as a `print(...)` call does.
+        if (
+          pcallee.identName == "__store_i32__" ||
+          pcallee.identName == "__load_i32__"
+        ) {
+          memUsed = true
+        }
+        if pcallee.identName == "__log__" {
+          memUsed = true
+          memLogUsed = true
+          gImports = 4
+        }
+      }
+    }
+    // Any `i64` type annotation anywhere flags the program as i64-using. Combined
+    // with `print`, it pulls in the `__print_i64__` import. (An over-approximation:
+    // a program with an i64 binding but no `print(<i64>)` would carry one unused
+    // import — harmless, and never the case for the existing byte-identical goldens,
+    // none of which name `i64`.)
+    if pn is TypeRef {
+      // ANY annotation mentioning i64 — bare `i64`, `i64[]`, an `i64 | …` value union, a
+      // `{[…]: i64}` map — implies an i64 value may be printed; pull in the `__print_i64__`
+      // import (an over-approximation, harmless if unused; no existing golden names i64).
+      // Without the union/array forms a `print(u)` over `u: i64 | string` narrowed to i64
+      // routed `fbCall(4)` to a non-existent import — invalid wasm.
+      if strContains(pn.tyName, "i64") { sawI64Ann = true }
+      if pn.tyName == "f64" { sawF64 = true }
+      // ANY annotation mentioning f32 — bare `f32`, `f32[]`, an `f32 | …` union, a `{[…]:
+      // f32}` map — implies an f32 value may be printed; pull in the f32 print import (an
+      // over-approximation, harmless if unused; no existing golden names f32).
+      if strContains(pn.tyName, "f32") { sawF32 = true }
+    }
+    // A float `.` literal flags the program as f64-using (the checker types it f64).
+    // An INTEGER literal past the i32 range flags it as i64-using (the checker
+    // types it i64 — the host `defaultIntegerType` rule), so `print(0xDEAD_BEEF)`
+    // pulls in the `__print_i64__` import even with no `i64` annotation.
+    if pn is NumLit {
+      if numTextIsFloat(pn.numText) { sawF64 = true }
+      else if !numLexFitsI32(pn.numText) { sawI64Ann = true }
+    }
+    pscan = pscan + 1
+  }
+  // When the program both prints (`gImports == 4`, the print family) and names
+  // an i64 type, add the 5th `__print_i64__` import.
+  if gImports == 4 {
+    if sawI64Ann {
+      gImports = gImports + 1
+      gNeedsI64Print = true
+    }
+    // Then `__print_f64__` (at the next index — 4 or 5). The f64 import always
+    // trails the i64 one so the i64 print index (4) is unchanged. (Slice 3.)
+    if sawF64 {
+      gF64PrintIdx = gImports
+      gImports = gImports + 1
+      gNeedsF64Print = true
+    }
+    // Then `__print_f32__` (at the next index — 4/5/6). It always TRAILS the i64 and
+    // f64 imports so their indices are unchanged. (Slice 5.)
+    if sawF32 {
+      gF32PrintIdx = gImports
+      gImports = gImports + 1
+      gNeedsF32Print = true
+    }
+  }
+  0
+}
+
+// Every function's parameters must be i32 or the struct type before we commit.
+function checkFnParams() {
+  let i = 0
+  while i < fnStmts.length {
+    if checkParams(fnStmts[i]) < 0 { return -1 }
+    i = i + 1
+  }
+  0
+}
+
+// Dispatch one pass-table row by name. Every pass returns an i32 status (< 0 =
+// failed emit). The `#2` rows are the explicit re-run stage — each branch calls
+// the same pass function a second time, post-monomorphization.
+function runEmitPass(name: string, stmts: i32[]) {
+  if name == "collectU" { return collectU(stmts) }
+  if name == "collectS" { return collectS(stmts) }
+  if name == "collectA" { return collectA(stmts) }
+  if name == "collectFns" { return collectFns(stmts) }
+  if name == "checkTopLevel" { return passCheckTopLevel() }
+  if name == "buildFnMap" { return buildFnMap(stmts) }
+  if name == "computeVoidFns" { return computeVoidFns() }
+  if name == "computeRetInference" { return computeRetInference() }
+  if name == "dispatchRewrite" { return dispatchRewrite(stmts) }
+  if name == "captureBoxRewrite" { return captureBoxRewrite(stmts) }
+  if name == "synthRetAnnots" { return synthRetAnnots() }
+  if name == "monomorphize" { return monomorphize(stmts) }
+  if name == "collectGenAliasShapes" { return collectGenAliasShapes() }
+  if name == "collectAnnShapes" { return collectAnnShapes() }
+  // RE-RUN stage: instance-pinned annotations minted DURING monomorphization
+  // (`Box<i32>` applications, structural returns) postdate the first arena scans —
+  // rescan so they intern too, then refresh the name→index tables that resolve
+  // against the struct table (an instance's `fRetStructIdx` needs its
+  // just-interned return shape). All four are idempotent and usage-gated (no new
+  // TypeRef → no new shape → identical bytes).
+  if name == "collectA#2" { return collectA(stmts) }
+  if name == "buildFnMap#2" { return buildFnMap(stmts) }
+  if name == "synthParamAnnots" { return synthParamAnnots() }
+  if name == "computeVoidFns#2" { return computeVoidFns() }
+  if name == "computeRetInference#2" { return computeRetInference() }
+  if name == "collectMapFilterUse" { return collectMapFilterUse() }
+  if name == "collectFnValUse" { return collectFnValUse() }
+  if name == "collectCloSigs" { return collectCloSigs() }
+  if name == "scanPrintUse" { return scanPrintUse() }
+  if name == "checkFnParams" { return checkFnParams() }
+  if name == "capCacheBuild" { return capCacheBuild() }
+  emitFail("emitProgram: unknown pass in the pass table: " + name)
+}
+
+export function emitProgram(rootIx: i32) {
+  emitFailed = false
+  emitErr = ""
+  narrowNames = []
+  narrowVariants = []
+  narrowTop = 0
+  // The capture cache is only valid for a FINAL AST — drop it before the
+  // rewrite/monomorphize passes run (they mutate bodies and `fnStmts` slots).
+  capCacheOn = false
+  if rootIx < 0 { return emitFail("emitProgram: empty arena (root index < 0)") }
+  const root = P.nodes[rootIx]
+  if root is Program {
+    const stmts = root.progStmts
+    if stmts.length < 1 {
+      return emitFail("emitProgram: expected at least one top-level statement")
+    }
+    resetLitAtoms()
+    resetParentLetCache()
+    // The ordered pass table — see the pass-manager block comment above
+    // `passDoneHas` for the row grammar. WHY each ordering edge holds:
+    //  · collectU first, so `collectS` knows whether the program's structs are
+    //    union variants vs a single direct struct; then the struct shapes, the
+    //    arena arrays, the function list (FuncDecls only), and the name→index
+    //    map. Forward references and recursion resolve because every name is
+    //    mapped before any body is emitted.
+    //  · dispatchRewrite (UFCS `self`-methods, operator overloads, index traps)
+    //    resolves `o.f(args)` / `a op b` / `o[k]` into the plain-call forms the
+    //    lowerings AND the monomorphizer handle — before mono, so a rewritten
+    //    call instantiates per receiver shape.
+    //  · captureBoxRewrite boxes captured-MUTATION locals as shared length-1
+    //    arrays — before mono, so instances inherit the rewrite.
+    //  · synthRetAnnots pins a bound lambda's UNION return annotation from its
+    //    annotated closure type — before mono (an instance is cloned with
+    //    `nret = fnRet`, so the return must be pinned first or it emits a
+    //    single-arm `$fnsig` result the call-site `ref.cast` rejects), and
+    //    before the shape passes, so the union's box + variants intern for the
+    //    return. Reads the union registry, hence the `collectU` edge.
+    //  · monomorphize clones a concretely-annotated instance per distinct call
+    //    shape — BEFORE signatures and types are collected.
+    //  · the `#2` rows re-scan what monomorphization's late-minted annotations
+    //    invalidated (see `runEmitPass`).
+    //  · synthParamAnnots fills an un-annotated CALLBACK param's annotation from
+    //    the checker's recorded type — after mono (an instance's pinned params
+    //    are in place), before the `$fnsig` / map-filter collection that reads
+    //    param valtypes.
+    //  · collectMapFilterUse flips `fnValUsed` + forces the RESULT list's types;
+    //    the `$fnsig` set (collectCloSigs) is collected after it and after
+    //    collectFnValUse — both need the re-inferred return kinds.
+    //  · scanPrintUse / checkFnParams read the FINAL arena; capCacheBuild
+    //    snapshots capture lists only once the AST and `fnStmts` are final —
+    //    after every mutating pass.
+    const passTable = [
+      "collectU",
+      "collectS > collectU",
+      "collectA > collectS",
+      "collectFns > collectU collectS",
+      "checkTopLevel > collectFns",
+      "buildFnMap > collectFns",
+      "computeVoidFns > buildFnMap",
+      "computeRetInference > buildFnMap computeVoidFns",
+      "dispatchRewrite > buildFnMap computeRetInference",
+      "captureBoxRewrite > collectFns",
+      "synthRetAnnots > collectU buildFnMap",
+      "monomorphize > dispatchRewrite captureBoxRewrite synthRetAnnots",
+      "collectGenAliasShapes > monomorphize",
+      "collectAnnShapes > monomorphize",
+      "collectA#2 > collectGenAliasShapes collectAnnShapes",
+      "buildFnMap#2 > monomorphize collectA#2",
+      "synthParamAnnots > monomorphize buildFnMap#2",
+      "computeVoidFns#2 > synthParamAnnots",
+      "computeRetInference#2 > synthParamAnnots computeVoidFns#2",
+      "collectMapFilterUse > synthParamAnnots computeRetInference#2",
+      "collectFnValUse > synthParamAnnots computeRetInference#2",
+      "collectCloSigs > collectMapFilterUse collectFnValUse",
+      "scanPrintUse > monomorphize synthParamAnnots",
+      "checkFnParams > monomorphize synthParamAnnots",
+      "capCacheBuild > monomorphize synthParamAnnots",
+    ]
+    const passDone: string[] = []
+    let pi = 0
+    while pi < passTable.length {
+      const prow = passTable[pi]
+      const pname = passRowName(prow)
+      if !passNeedsMet(passRowNeeds(prow), passDone) {
+        return emitFail(
+          "emitProgram: pass " +
+            pname +
+            " ran before a prerequisite (pass table reordered)",
+        )
+      }
+      if runEmitPass(pname, stmts) < 0 { return -1 }
+      passDone.push(pname)
+      pi = pi + 1
+    }
+    const rc = emitModule(stmts)
+    if rc < 0 { return rc }
+    // An `emitFail` whose -1 a deep helper swallowed (e.g. inside a valtype write)
+    // must still fail the WHOLE emit: a failed module never reaches instantiation.
+    if emitFailed { return -1 }
+    return rc
+  }
+  emitFail("emitProgram: root node is not a Program")
+}
+
+// Emit one shared-runtime-helper FUNCTYPE (`0x60 func`, params, results) onto the
+// current buffer. `params`/`res` are valtype descriptor strings, one char per slot:
+// 'i' = i32 (`0x7f`), 'a' = a non-null `(ref $aTypeIdx)` string/i32-array ref,
+// 'm' = a non-null `(ref $mkArrIdx)` string-list backing ref.
+function helpFuncType(params: string, res: string) {
+  wU8(96) // 0x60 func
+  wULEB(params.length)
+  let i = 0
+  while i < params.length {
+    helpValtype(params[i])
+    i = i + 1
+  }
+  wULEB(res.length)
+  let j = 0
+  while j < res.length {
+    helpValtype(res[j])
+    j = j + 1
+  }
+  0
+}
+
+// One descriptor char (see `helpFuncType`) as a valtype.
+function helpValtype(c: i32) {
+  if c == 'i' {
+    wU8(127) // 0x7f i32
+    return 0
+  }
+  wU8(100) // 0x64 (ref ht) — non-null
+  if c == 'm' { wSLEB(mkArrIdx) } else { wSLEB(aTypeIdx) }
+  0
+}
+
+// Type section (id 1): all WasmGC types in ONE recursion group, followed by the
+// standalone print/(log) functypes. Extracted verbatim from emitModule (C3); see the
+// inline comments below for the per-type framing. The rec-group count excludes the
+// `nPrintTypes` standalone print functypes (and the `memFn` __log__ functype).
+function emitTypeSection(
+  n: i32,
+  typeOffset: i32,
+  hasStart: i32,
+  memFn: i32,
+  nPrintTypes: i32,
+  nHelpers: i32,
+) {
+  const typePayload: i32[] = []
+  // Bind the writer at `typePayload` for the WHOLE type-section payload build, so the
+  // raw framing bytes, `pushFieldStorage`, and `fbValtype` all stream to `curBuf ==
+  // typePayload` identically. Restored just before `wSection` frames it (below).
+  const tyPrev = wTarget(typePayload)
+  wULEB(1 + nPrintTypes + memFn + nHelpers) // rectypes: the rec group + the standalone print/(log)/helper functypes
+  wU8(78)                                   // 0x4e rec group
+  wULEB(n + typeOffset + hasStart)          // types inside the rec group (print functypes excluded)
+  if sDeclared {
+    // One `0x5f` struct per declared type (declaration order = heap-type index),
+    // each a struct of its fields in declaration order. A field is `0x7f` i32
+    // (`sFieldTypes == 0`) or, for a string field (`== 3`), a non-null `(ref
+    // $aTypeIdx)` (`0x64 <aTypeIdx>` — the raw `(array i32)` string rep); both mutable.
+    let si = 0
+    while si < sNames.length {
+      wU8(95) // 0x5f struct
+      const cnt = sFieldCount[si]
+      wULEB(cnt)
+      let fj = 0
+      while fj < cnt {
+        const fjCode = sFieldTypeAt(si, fj)
+        let fjSlot = sFieldRefSlot(si, fj)
+        // A NESTED-STRUCT field (code 15) passes its TARGET struct table index.
+        if fjCode == 15 { fjSlot = structIndexByName(sFieldElemNameAt(si, fj)) }
+        // A MAP-typed field (code 19) passes its value type's mv SLOT.
+        if fjCode == 19 {
+          fjSlot = mvSlotOfValNameFind(sFieldElemNameAt(si, fj))
+        }
+        pushFieldStorage(fjCode, fjSlot)
+        wU8(1) // mutable
+        fj = fj + 1
+      }
+      si = si + 1
+    }
+  }
+  if uDeclared {
+    // The `nv` variant structs FIRST (heap types 0..nv-1), each a struct of its i32
+    // fields in declaration order (`0x5f` struct, count, then `0x7f 0x01` per field —
+    // mutable i32). Then the union BOX `{ tag: i32, value: anyref }` at index `nv`:
+    // `0x5f` struct, 2 fields — `0x7f 0x00` (i32, IMMUTABLE tag) and `0x6e 0x00`
+    // (`anyref` abbreviation, IMMUTABLE value) — mirroring binaryen's `5f 02 7f 00
+    // 6e 00` (verified against `toWasm.ts`'s `unionStruct`).
+    let vi = 0
+    while vi < uVariants.length {
+      wU8(95) // 0x5f struct
+      const cnt = uFieldCount[vi]
+      wULEB(cnt)
+      let fj = 0
+      while fj < cnt {
+        const vjCode = variantFieldTypeAt(vi, fj)
+        let vjSlot = variantFieldRefSlot(vi, fj)
+        // A NESTED-STRUCT variant field (code 15) passes its struct table index.
+        if vjCode == 15 {
+          vjSlot = structIndexByName(uFieldElemName[uFieldStart[vi] + fj])
+        }
+        // A MAP-typed variant field (code 19) passes its value type's mv SLOT.
+        if vjCode == 19 {
+          vjSlot = mvSlotOfValNameFind(uFieldElemName[uFieldStart[vi] + fj])
+        }
+        pushFieldStorage(vjCode, vjSlot)
+        wU8(1) // mutable
+        fj = fj + 1
+      }
+      vi = vi + 1
+    }
+    wU8(95)  // 0x5f struct (union box)
+    wU8(2)   // 2 fields
+    wU8(127) // field 0 tag: 0x7f i32
+    wU8(0)   // immutable
+    wU8(110) // field 1 value: 0x6e anyref
+    wU8(0)   // immutable
+    // The per-rep VALUE BOXES — each a one-field immutable struct `{ rep }` that
+    // carries a scalar value-union payload behind the box's `anyref` slot
+    // (mirroring `toWasm.ts`'s `valueBoxStruct`). Emitted in the SAME fixed order
+    // `mAssignTypeIndices` interned them (i32, i64, f32, f64).
+    if vbI32Used {
+      wU8(95)  // 0x5f struct (i32 value box — boolean shares it)
+      wU8(1)
+      wU8(127) // 0x7f i32
+      wU8(0)   // immutable
+    }
+    if vbI64Used {
+      wU8(95)  // 0x5f struct (i64 value box)
+      wU8(1)
+      wU8(126) // 0x7e i64
+      wU8(0)   // immutable
+    }
+    if vbF32Used {
+      wU8(95)  // 0x5f struct (f32 value box)
+      wU8(1)
+      wU8(125) // 0x7d f32
+      wU8(0)   // immutable
+    }
+    if vbF64Used {
+      wU8(95)  // 0x5f struct (f64 value box)
+      wU8(1)
+      wU8(124) // 0x7c f64
+      wU8(0)   // immutable
+    }
+  }
+  if aUsed {
+    wU8(94)  // 0x5e array
+    wU8(127) // 0x7f i32 storagetype
+    wU8(1)   // mutable
+  }
+  if lUsed {
+    wU8(95)         // 0x5f struct
+    wU8(3)          // 3 fields
+    wU8(100)        // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(aTypeIdx) // ...to the raw array heap type
+    wU8(1)          // mutable
+    wU8(127)        // field 1 len: 0x7f i32
+    wU8(1)          // mutable
+    wU8(127)        // field 2 cap: 0x7f i32
+    wU8(1)          // mutable
+  }
+  // One (backing, wrapper) PAIR per distinct ref-list element type, interleaved so each
+  // wrapper immediately follows (and references) its own backing — the heap indices laid
+  // out above. Each backing is `(array (mut (ref null $elem)))` over the slot's element
+  // (struct heap idx / union box); each wrapper is `{ backing: (ref $back), len, cap }`.
+  let rti = 0
+  while rti < rlElemName.length {
+    wU8(94)               // 0x5e array (ref backing)
+    wU8(99)               // 0x63 (ref null ht) — nullable element ref
+    wSLEB(rlElemHeap[rti])
+    wU8(1)                // mutable
+    wU8(95)               // 0x5f struct (ref-list wrapper)
+    wU8(3)                // 3 fields
+    wU8(100)              // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(rlBackIdx[rti]) // ...to THIS slot's ref backing
+    wU8(1)                // mutable
+    wU8(127)              // field 1 len: 0x7f i32
+    wU8(1)                // mutable
+    wU8(127)              // field 2 cap: 0x7f i32
+    wU8(1)                // mutable
+    rti = rti + 1
+  }
+  if slUsed || mUsed {
+    // The STRING-REF list types, shared by the map's keys list and any `string[]`
+    // field. (1) the backing array `(array (mut (ref null $aTypeIdx)))` — element is a
+    // NULLABLE string ref (`0x63 <aTypeIdx>`) so `array.new_default` defaults spare
+    // slots to null; an element read recovers the non-null string. (2) the list wrapper
+    // `{ backing: (ref $mkArrIdx), len, cap }` — the same `{backing,len,cap}` triple as
+    // the i32 list, over the string backing.
+    wU8(94)  // 0x5e array (keys/string backing)
+    wU8(99)  // 0x63 (ref null ht) — nullable string ref
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(95)  // 0x5f struct (string-list wrapper)
+    wU8(3)   // 3 fields
+    wU8(100) // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(mkArrIdx)
+    wU8(1)   // mutable
+    wU8(127) // field 1 len: 0x7f i32
+    wU8(1)   // mutable
+    wU8(127) // field 2 cap: 0x7f i32
+    wU8(1)   // mutable
+  }
+  if mUsed {
+    // The MAP struct `{ keys: (ref $mkListIdx), vals: (ref $lTypeIdx), live: (ref
+    // $aTypeIdx), index: (ref $aTypeIdx), count, size, hashes: (ref $aTypeIdx) }` — two
+    // non-null list refs (the keys string-list + the i32 vals list), the i32 `live`
+    // tombstone array, the i32 `index` hash-slot array, the `count`/`size` counters, and
+    // the i32 `hashes` per-entry FNV cache. FIELD ORDER + COUNT now match the host's
+    // 7-field general-purpose rep EXACTLY (`compiler/builtins/maps.ts`, `MAP_HASHES = 6`):
+    // the cached per-entry hash lets resize/compact RE-PLACE entries without re-hashing
+    // keys and gates the (string) key comparison on a hash mismatch — justified for
+    // large/long-key maps, not a compiler-symbol-table-narrow optimization. live is at
+    // index 2, index/count/size at 3/4/5, hashes at 6.
+    wU8(95)  // 0x5f struct (map)
+    wU8(7)   // 7 fields (open-addressing hash map, host-aligned)
+    wU8(100) // field 0 keys: 0x64 (ref $mkListIdx) — non-null
+    wSLEB(mkListIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
+    wSLEB(lTypeIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(127) // field 4 count: 0x7f i32
+    wU8(1)   // mutable
+    wU8(127) // field 5 size: 0x7f i32
+    wU8(1)   // mutable
+    wU8(100) // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+  }
+  if fa64Used {
+    // The f64 array `(array (mut f64))` (Slice 4): `0x5e` array form, `0x7c` f64
+    // storagetype, `0x01` mutable — the f64 analogue of the `5e 7f 01` i32 array.
+    wU8(94)  // 0x5e array
+    wU8(124) // 0x7c f64 storagetype
+    wU8(1)   // mutable
+    // The f64-list wrapper `{ backing: (ref $fa64TypeIdx), len: i32, cap: i32 }` — the
+    // same `{backing,len,cap}` triple as the i32 list, over the f64 backing.
+    wU8(95)            // 0x5f struct
+    wU8(3)             // 3 fields
+    wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(fa64TypeIdx) // ...to the f64 array heap type
+    wU8(1)             // mutable
+    wU8(127)           // field 1 len: 0x7f i32
+    wU8(1)             // mutable
+    wU8(127)           // field 2 cap: 0x7f i32
+    wU8(1)             // mutable
+  }
+  if ia64Used {
+    // The i64 array `(array (mut i64))` — `0x5e` array form, `0x7e` i64 storagetype,
+    // `0x01` mutable (the i64 sibling of the `5e 7c 01` f64 array). Emitted right after the
+    // f64 pair, matching the type-index allocation order.
+    wU8(94)  // 0x5e array
+    wU8(126) // 0x7e i64 storagetype
+    wU8(1)   // mutable
+    // The i64-list wrapper `{ backing: (ref $ia64TypeIdx), len: i32, cap: i32 }`.
+    wU8(95)            // 0x5f struct
+    wU8(3)             // 3 fields
+    wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(ia64TypeIdx) // ...to the i64 array heap type
+    wU8(1)             // mutable
+    wU8(127)           // field 1 len: 0x7f i32
+    wU8(1)             // mutable
+    wU8(127)           // field 2 cap: 0x7f i32
+    wU8(1)             // mutable
+  }
+  if fa32Used {
+    // The f32 array `(array (mut f32))` — `0x5e` array form, `0x7d` f32 storagetype, `0x01`
+    // mutable (the f32 sibling of the `5e 7c 01` f64 / `5e 7e 01` i64 arrays). Emitted right
+    // after the i64 pair, matching the type-index allocation order.
+    wU8(94)  // 0x5e array
+    wU8(125) // 0x7d f32 storagetype
+    wU8(1)   // mutable
+    // The f32-list wrapper `{ backing: (ref $fa32TypeIdx), len: i32, cap: i32 }`.
+    wU8(95)            // 0x5f struct
+    wU8(3)             // 3 fields
+    wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(fa32TypeIdx) // ...to the f32 array heap type
+    wU8(1)             // mutable
+    wU8(127)           // field 1 len: 0x7f i32
+    wU8(1)             // mutable
+    wU8(127)           // field 2 cap: 0x7f i32
+    wU8(1)             // mutable
+  }
+  if fnValUsed {
+    // The closure fat-pointer struct `{ code: funcref, env: (ref null struct),
+    // id: i32 }` (lambdas) — field 0 a GENERIC `funcref` (so ONE closure struct
+    // serves every function arity), field 1 a nullable `structref` env (null when
+    // non-capturing), field 2 the lifted function's wasm INDEX (`gImports + fe`) —
+    // the identity token for `==` (funcrefs admit no `ref.eq`). All IMMUTABLE. At a
+    // `call_ref` site the funcref is `ref.cast` to the concrete env-leading `$fnsig`
+    // for that call's arity, then `call_ref`. The interned `$fnsig` functypes (one
+    // per distinct value-call arity) follow.
+    wU8(95)  // 0x5f struct
+    wU8(3)   // 3 fields
+    wU8(99)  // field 0 code: 0x63 (ref null) funcref
+    wU8(112) // ...the abstract `func` heaptype (0x70 funcref)
+    wU8(0)   // immutable
+    wU8(99)  // field 1 env: 0x63 (ref null ht)
+    wU8(107) // ...to the abstract `struct` heaptype (structref)
+    wU8(0)   // immutable
+    wU8(127) // field 2 id: 0x7f i32 — the function-identity token
+    wU8(0)   // immutable
+    // One env-leading `$fnsig` functype per distinct eligible SIGNATURE, in
+    // `cloSigKeys` order: `(structref, params...) -> ret`, the param/result valtypes
+    // read off the representative function (`cloSigRepFn` — every function sharing
+    // the key has byte-identical kinds, by construction of the key).
+    let sai = 0
+    while sai < cloSigKeys.length {
+      const repFe = cloSigRepFn[sai]
+      const rep = P.nodes[fnStmts[repFe]]
+      if rep is FuncDecl {
+        const rparams = rep.fnParams
+        wU8(96)                   // 0x60 func
+        wULEB(rparams.length + 1) // env + declared params
+        wU8(107)                  // param 0 env: structref (0x6b)
+        let pj = 0
+        while pj < rparams.length {
+          fbValtype(vtKindOfParam(rparams[pj]), paramStructIdxOf(rparams[pj]))
+          pj = pj + 1
+        }
+        // The RESULT must byte-match the rep function's own functype result so
+        // the call-site `ref.cast` to this `$fnsig` accepts the callee funcref:
+        // a VOID field-closure sig (`>v`) has 0 results; a STRUCT-returning one
+        // (`>sN;`) yields the struct ref exactly as the function functype does.
+        if fRetVoid[repFe] == 1 {
+          wU8(0) // 0 results — the `>v` write-trap sig
+        } else {
+          wU8(1) // 1 result
+          // The result valtype the rep function's OWN functype emits — scalar (i32/f64/
+          // i64), string, an i32/string/f64 list, a union box, a nullable scalar/struct,
+          // or a struct ref (`cloRetValKind`/`cloRetValSlot`, the shared mapping).
+          const rrk = cloRetValKind(repFe)
+          let rrkCode: VKind = "i32"
+          if rrk != null { rrkCode = rrk }
+          fbValtype(rrkCode, cloRetValSlot(repFe))
+        }
+      }
+      sai = sai + 1
+    }
+    // One env struct per CAPTURING lifted function (`fnEnvIdx[fe] >= 0`), in `fnStmts`
+    // order — the order `mAssignTypeIndices` minted them. Each is a struct of one
+    // IMMUTABLE i32 field per captured variable (capture order = field order). The
+    // corpus captures are all i32 (and one struct-ref capture in `closure.vl`'s
+    // `sumPoint`, handled by emitting the captured ref's valtype).
+    let fe = 0
+    while fe < fnStmts.length {
+      if fnEnvIdxOf(fe) >= 0 {
+        const caps = captureNamesOf(fe)
+        wU8(95) // 0x5f struct
+        wULEB(caps.length)
+        let ci = 0
+        while ci < caps.length {
+          fbValtype(
+            captureValKind(fe, caps[ci]),
+            captureValStructIdx(fe, caps[ci]),
+          )
+          wU8(0) // immutable
+          ci = ci + 1
+        }
+      }
+      fe = fe + 1
+    }
+  }
+  // The ref-valued map structs (one per mv slot), in `mvMapTypeIdx` mint order —
+  // the SAME 7-field shape as the mono map struct, with `vals` referencing this
+  // slot's ref-list wrapper (the string-list pair for string values, the element's
+  // `rlWrapIdx` for struct values). Keys/live/index/count/size/hashes are identical
+  // across all map structs, so the shared probe/rehash/compact bytes apply as-is.
+  let mvs = 0
+  while mvs < mvValName.length {
+    wU8(95)  // 0x5f struct (ref-valued map)
+    wU8(7)   // 7 fields (host-aligned open-addressing hash map)
+    wU8(100) // field 0 keys: 0x64 (ref $mkListIdx) — non-null
+    wSLEB(mkListIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 1 vals: 0x64 (ref <this slot's wrapper>)
+    wSLEB(mvValsWrapOf(mvs))
+    wU8(1)   // mutable
+    wU8(100) // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(100) // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    wU8(127) // field 4 count: 0x7f i32
+    wU8(1)   // mutable
+    wU8(127) // field 5 size: 0x7f i32
+    wU8(1)   // mutable
+    wU8(100) // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wSLEB(aTypeIdx)
+    wU8(1)   // mutable
+    mvs = mvs + 1
+  }
+  // The functype param/result valtypes (`fbValtype`) stream to `curBuf == typePayload`,
+  // interleaved identically with the surrounding raw framing bytes (the `wTarget` bind
+  // covering this whole payload build was established above).
+  let ti = 0
+  while ti < n {
+    const fn = P.nodes[fnStmts[ti]]
+    if fn is FuncDecl {
+      const params = fn.fnParams
+      const nParams = params.length
+      wU8(96) // 0x60 func
+      // When a function value exists module-wide, EVERY function carries a hidden
+      // leading `structref env` param (local 0). The declared params follow at 1..p.
+      // A non-capturing function ignores its env; a capturing one `ref.cast`s + reads
+      // it. Gated on `fnValUsed` so a no-lambda module's functypes are byte-identical.
+      if fnValUsed {
+        wULEB(nParams + 1) // param count incl. the env param
+        wU8(107)           // env param: structref (0x6b)
+      } else {
+        wULEB(nParams) // param count
+      }
+      let pi = 0
+      while pi < nParams {
+        fbValtype(vtKindOfParam(params[pi]), paramStructIdxOf(params[pi]))
+        pi = pi + 1
+      }
+      if fRetVoid[ti] == 1 {
+        wU8(0) // 0 results — a VOID function (`()->()`)
+      } else if fn.fnRet < 0 && fnReturnsClosure(ti) {
+        // A function VALUE return (un-annotated; its tail is a function value) — kind 14.
+        wU8(1)
+        fbValtype("closure", -1)
+      } else if fn.fnRet < 0 {
+        // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
+        // fRet* tables the annotation path fills). i32 when nothing matched.
+        wU8(1) // 1 result
+        // The inferred result KIND from the single shared mapping (`inferredRetKindCore`) — so
+        // this site and `cloRetValKind` can't drift on a scalar/list/ref kind (the f32/f64/i64
+        // inferred-return holes were each one site missing what the other had). The SLOT follows
+        // the kind: struct index for a struct / nullable-struct ref (1 / 9), the element wrapper
+        // for a ref list (5, via the recorded element name), the map shape for a map (6); every
+        // other kind (string / scalar list / scalars) needs no per-function slot.
+        const infKind = inferredRetKindCore(ti)
+        let infSlot = -1
+        if infKind == "struct" || infKind == "nulstruct" {
+          infSlot = fRetStructIdx[ti]
+        }
+        if infKind == "reflist" { infSlot = rlSlotByName(fRetRArrElem[ti]) }
+        if infKind == "map" {
+          const mrx = fnRetExprOf(fnStmts[ti])
+          if mrx >= 0 { infSlot = mapRetExprShape(mrx, fnStmts[ti]) }
+        }
+        fbValtype(infKind, infSlot)
+      } else {
+        wU8(1) // 1 result
+        // A `T[]` return is kind 5 — its second `fbValtype` arg is the ref-list TABLE
+        // SLOT for the element type (`retStructIndex` is -1 for a ref array), so the
+        // result valtype selects THIS function's element wrapper, not slot 0's.
+        let retSlot = retStructIndex(fn.fnRet)
+        if retRefArrFlag(fn.fnRet) == 1 { retSlot = tyAnnRefListSlot(fn.fnRet) }
+        // A string-keyed MAP return's slot is the map SHAPE (mono ⇒ -1, or the value type's mv
+        // slot for a `string`-valued map), so the result valtype selects THIS map's `$mapStruct`.
+        if retMapFlag(fn.fnRet) == 1 { retSlot = mapAnnShape(fn.fnRet) }
+        // A `: Cat` concrete-variant return is kind 8 — its `fbValtype` slot is the VARIANT
+        // index (`uVarIdx + vi`), which `retStructIndex` (standalone structs only) misses.
+        if retVariantFlag(fn.fnRet) == 1 {
+          retSlot = variantIndexOf(tyNameOf(fn.fnRet))
+        }
+        fbValtype(vtKindOfType(fn.fnRet), retSlot)
+      }
+    }
+    ti = ti + 1
+  }
+  // The synthetic start function's `()->()` functype (lands at index `typeOffset + n`,
+  // AFTER every user functype — so no user type index shifts and the Phase-G assert is
+  // untouched). `0x60` func, 0 params, 0 results.
+  if hasStart == 1 {
+    wU8(96) // 0x60 func
+    wU8(0)  // 0 params
+    wU8(0)  // 0 results
+  }
+  // The print-import functypes (only when a `print` exists): `(i32)->()` at index
+  // `typeOffset + n + hasStart` (shared by __print_i32__/__print_bool__/__print_char__)
+  // and `()->()` at +1 (__print_str_flush__). Emitted LAST and as STANDALONE rectypes
+  // (the rec-group count above excludes them) so a strict-GC host can match the import
+  // against a host function; no user/start functype index shifts.
+  if gImports > 0 {
+    wU8(96)  // 0x60 func
+    wU8(1)   // 1 param
+    wU8(127) // 0x7f i32
+    wU8(0)   // 0 results
+    wU8(96)  // 0x60 func
+    wU8(0)   // 0 params
+    wU8(0)   // 0 results
+  }
+  // The `(i64)->()` functype for `__print_i64__` (only when an i64 program prints),
+  // standalone AFTER the two existing print functypes — its index is `ftVoid + 1`,
+  // so no existing functype index shifts.
+  if gNeedsI64Print {
+    wU8(96)  // 0x60 func
+    wU8(1)   // 1 param
+    wU8(126) // 0x7e i64
+    wU8(0)   // 0 results
+  }
+  // The `(f64)->()` functype for `__print_f64__`, standalone AFTER the i64 one (if any),
+  // so no existing functype index shifts. (Slice 3.)
+  if gNeedsF64Print {
+    wU8(96)  // 0x60 func
+    wU8(1)   // 1 param
+    wU8(124) // 0x7c f64
+    wU8(0)   // 0 results
+  }
+  // The `(f32)->()` functype for `__print_f32__`, standalone AFTER the i64/f64 ones (if
+  // any), so no existing functype index shifts. (Slice 5.)
+  if gNeedsF32Print {
+    wU8(96)  // 0x60 func
+    wU8(1)   // 1 param
+    wU8(125) // 0x7d f32
+    wU8(0)   // 0 results
+  }
+  // The `(i32, i32) -> ()` functype for the synthetic `__log__` decoder, standalone
+  // LAST (after every print functype) so no existing functype index shifts. Its
+  // index is `typeOffset + n + hasStart + nPrintTypes`.
+  if memLogUsed {
+    wU8(96)  // 0x60 func
+    wU8(2)   // 2 params
+    wU8(127) // 0x7f i32 (offset)
+    wU8(127) // 0x7f i32 (length)
+    wU8(0)   // 0 results
+  }
+  // The shared-runtime-helper functypes, standalone LAST (after every print/(log)
+  // functype) in helper-index order, so no existing functype index shifts. Each may
+  // reference earlier rec-group types (`$aTypeIdx` / `$mkArrIdx`) — a later rectype
+  // referencing an earlier type index is always valid. A helper's functype index is
+  // `typeOffset + n + hasStart + nPrintTypes + memFn + <its order>` (see
+  // `emitFunctionSection`).
+  if gHelpStrHash >= 0 {
+    helpFuncType("a", "i")  // __str_hash__: (str) -> i32
+    helpFuncType("aa", "i") // __str_eq__: (str, str) -> i32
+    helpFuncType("aa", "a") // __str_concat__: (str, str) -> (ref str)
+  }
+  if gHelpMapProbe >= 0 {
+    helpFuncType("aaama", "i") // __map_probe__: (index, hashes, live, keysBacking, key) -> slot
+    helpFuncType("aaaii", "a") // __map_resize__: (index, hashes, live, count, size) -> index'
+  }
+  wTarget(tyPrev)
+  wSection(1, typePayload)
+  0
+}
+
+// Import section (id 2), extracted verbatim from emitModule (C3).
+function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
+  // Import section (id 2, between type and function): the 4-entry print family from
+  // the host's `"imports"` module, occupying function indices 0..3 in this exact
+  // order (the call lowering hardcodes them): __print_i32__, __print_bool__,
+  // __print_char__ (all `(i32)->()`), __print_str_flush__ (`()->()`).
+  if gImports > 0 {
+    const ftI32 = typeOffset + n + hasStart
+    const ftVoid = ftI32 + 1
+    const ftI64 = ftVoid + 1
+    // The `(f64)->()` functype index trails the i64 one when present, else the void one.
+    let ftF64 = ftVoid + 1
+    if gNeedsI64Print { ftF64 = ftI64 + 1 }
+    // The `(f32)->()` functype index trails the f64 one when present, else wherever the
+    // f64 index would be (the standalone functypes are emitted i64 → f64 → f32 in order).
+    let ftF32 = ftF64
+    if gNeedsF64Print { ftF32 = ftF64 + 1 }
+    const importPayload: i32[] = []
+    const imPrev = wTarget(importPayload)
+    // 4 imports normally; +1 each for `__print_i64__` / `__print_f64__` / `__print_f32__`.
+    let nImports = 4
+    if gNeedsI64Print { nImports = nImports + 1 }
+    if gNeedsF64Print { nImports = nImports + 1 }
+    if gNeedsF32Print { nImports = nImports + 1 }
+    wULEB(nImports)
+    wName("imports")
+    wName("__print_i32__")
+    wU8(0) // import kind: func
+    wULEB(ftI32)
+    wName("imports")
+    wName("__print_bool__")
+    wU8(0)
+    wULEB(ftI32)
+    wName("imports")
+    wName("__print_char__")
+    wU8(0)
+    wULEB(ftI32)
+    wName("imports")
+    wName("__print_str_flush__")
+    wU8(0)
+    wULEB(ftVoid)
+    // `__print_i64__` LAST, at function index 4 (`fbCall(4)` in the print router), so
+    // the existing imports keep indices 0..3 and only this entry is conditionally added.
+    if gNeedsI64Print {
+      wName("imports")
+      wName("__print_i64__")
+      wU8(0)
+      wULEB(ftI64)
+    }
+    // `__print_f64__` LAST, at function index `gF64PrintIdx` (4 or 5). (Slice 3.)
+    if gNeedsF64Print {
+      wName("imports")
+      wName("__print_f64__")
+      wU8(0)
+      wULEB(ftF64)
+    }
+    // `__print_f32__` LAST, at function index `gF32PrintIdx` (4/5/6). (Slice 5.)
+    if gNeedsF32Print {
+      wName("imports")
+      wName("__print_f32__")
+      wU8(0)
+      wULEB(ftF32)
+    }
+    wTarget(imPrev)
+    wSection(2, importPayload)
+  }
+  0
+}
+
+// Function section (id 3), extracted verbatim from emitModule (C3).
+function emitFunctionSection(
+  n: i32,
+  typeOffset: i32,
+  hasStart: i32,
+  memFn: i32,
+  nPrintTypes: i32,
+  nHelpers: i32,
+) {
+  // Function section (id 3): N functions; func i uses functype `typeOffset + i`. The
+  // synthetic start function (if any) is the LAST entry — function index `n` — using
+  // the `()->()` functype at index `typeOffset + n`.
+  const funcPayload: i32[] = []
+  const fnPrev = wTarget(funcPayload)
+  wULEB(n + hasStart + memFn + nHelpers)
+  let fi = 0
+  while fi < n {
+    // A function whose env-leading signature matches an interned `$fnsig` is declared
+    // with that `$fnsig` functype, so `ref.func` of it produces a value the call_ref
+    // site's `ref.cast` to `$fnsig` accepts (its ACTUAL type IS `$fnsig`). Others keep
+    // their own functype. Only when `fnValUsed`. (Lambdas.)
+    if fnValUsed && fnSigIsClosure(fi) {
+      wULEB(fnSigIdxOfFn(fi))
+    } else {
+      wULEB(typeOffset + fi) // functype index
+    }
+    fi = fi + 1
+  }
+  if hasStart == 1 {
+    wULEB(typeOffset + n) // start fn functype index
+  }
+  if memLogUsed {
+    // The synthetic `__log__` decoder uses the standalone `(i32,i32)->()` functype
+    // emitted after the print functypes.
+    wULEB(typeOffset + n + hasStart + nPrintTypes)
+  }
+  // The shared runtime helpers, each on its own standalone functype (emitted after
+  // the `__log__` functype in the SAME helper order, so functype k belongs to
+  // helper k).
+  const helpTyBase = typeOffset + n + hasStart + nPrintTypes + memFn
+  let hi = 0
+  while hi < nHelpers {
+    wULEB(helpTyBase + hi)
+    hi = hi + 1
+  }
+  wTarget(fnPrev)
+  wSection(3, funcPayload)
+  0
+}
+
+// Global section (id 6), extracted verbatim from emitModule (C3).
+function emitGlobalSection() {
+  // Global section (id 6): one mutable global per top-level `let`/`const`, in
+  // declaration order (that order IS the global index `global.get`/`global.set` use).
+  // Each entry is `<valtype> 0x01 <init constexpr> 0x0b`. The valtype mirrors `pushVT`'s
+  // kind for the initializer (i32 / struct ref / list ref / string ref); the init reuses
+  // the ordinary `emitExpr` literal lowering — `i32.const`, `struct.new`, and
+  // `array.new_fixed` are all valid WasmGC constant expressions, so no start function is
+  // needed for the literal initializers in scope. A non-constexpr init (a reference to a
+  // local/param) fails loudly via `emitExpr(fnIx = -1)` (start-fn fallback deferred).
+  const ng = globalStmts.length
+  const np = gStrPoolTexts.length
+  if ng + np > 0 {
+    const globalPayload: i32[] = []
+    // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
+    // the count, each entry's valtype (`fbValtype`), mutability flag, and init constexpr
+    // (`fb*` opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
+    const gPrev = wTarget(globalPayload)
+    wULEB(ng + np)
+    // The string-literal POOL first (indices 0..np-1, before the user cells — see
+    // `gStrPoolTexts`): each entry an IMMUTABLE non-null string ref whose init
+    // constexpr builds the literal once (`i32.const` per code point +
+    // `array.new_fixed` — every pooled literal fits the cap by construction).
+    let pli = 0
+    while pli < np {
+      wU8(100) // 0x64 (ref $aTypeIdx) — non-null string ref
+      wSLEB(aTypeIdx)
+      wU8(0)   // immutable
+      const pcps = decodeStr(strToCps(gStrPoolTexts[pli]))
+      let pci = 0
+      while pci < pcps.length {
+        fbI32Const(pcps[pci])
+        pci = pci + 1
+      }
+      fbArrayNewFixed(aTypeIdx, pcps.length)
+      fbEnd() // 0x0b end of init expr
+      pli = pli + 1
+    }
+    let gi = 0
+    while gi < ng {
+      const g = P.nodes[globalStmts[gi]]
+      if g is LetDecl {
+        if g.letInit < 0 {
+          return emitFail("emitProgram: module global has no initializer")
+        }
+        if globalIsNonConst(globalStmts[gi]) {
+          // A non-constexpr init (`curBuf = W.bytes` — a `global.get`+`struct.get`, a
+          // reference to another global, a call, etc.) cannot be a WasmGC constant
+          // expression. Declare the cell NULLABLE and zero-init it (`i32.const 0` for a
+          // scalar, `ref.null` for a ref); the synthetic start function below runs the
+          // real init via `global.set` before any other code, so reads never see the
+          // zero. The cell stays mutable.
+          const ck = globalCellKind(globalStmts[gi])
+          // For a ref-array cell (kind 5) the second `fbValtype`/`fbRefNullForKind` arg is
+          // the ref-list TABLE SLOT (`globalCellStructIdx` is -1 for a ref array), so the
+          // cell valtype and its `ref.null` zero select THIS global's element wrapper.
+          let cs = globalCellStructIdx(globalStmts[gi])
+          if ck == "reflist" { cs = globalRefListSlot(globalStmts[gi]) }
+          // A map cell (kind 6) passes its map SHAPE (mv slot / -1 mono / -2 set)
+          // so the cell valtype + ref.null zero select THIS map's struct type.
+          if ck == "map" { cs = letMapShapeOf(globalStmts[gi], -1) }
+          fbValtypeNullable(ck, cs) // nullable valtype
+          wU8(1)                    // 0x01 mutable
+          if ck == "i32" {
+            fbI32Const(0) // i32 scalar zero
+          } else if ck == "i64" {
+            fbI64Const(0, 0) // i64 scalar zero (Slice 1)
+          } else if ck == "f64" {
+            fbF64Const("0.0") // f64 scalar zero (Slice 3)
+          } else if ck == "f32" {
+            fbF32Const("0.0") // f32 scalar zero (Slice 5)
+          } else {
+            fbRefNullForKind(ck, cs) // ref.null zero
+          }
+          fbEnd() // 0x0b end of init expr
+        } else {
+          // The cell's valtype comes from the binding's ANNOTATION when present (so a
+          // global agrees with a same-typed local/param/field on its struct table index),
+          // falling back to the literal-init kind for an un-annotated global. The init
+          // constexpr (`emitExpr`) lowers the literal — and must build the SAME wasm type:
+          // `pendingStructIdx` seeds an `ObjLit` to the annotated struct (not the first
+          // field-name match), and `pendingListKind`/`pendingListSlot` seed an empty `[]`
+          // to the annotation's ref/string list (not the i32-list the bare literal infers),
+          // exactly as the local-`let` path threads them.
+          const gck = globalCellKind(globalStmts[gi])
+          let gcs = globalCellStructIdx(globalStmts[gi])
+          if gck == "struct" { pendingStructIdx = gcs }
+          // A NULLABLE-struct cell (kind 9) seeds the same struct context: a bare
+          // `null` init lowers as `ref.null $S` (a valid constexpr), a struct
+          // literal as that struct.
+          if gck == "nulstruct" { pendingStructIdx = gcs }
+          pendingListKind = letAnnRefListKind(globalStmts[gi])
+          pendingListSlot = letAnnRefListSlot(globalStmts[gi])
+          // A ref-array cell (kind 5) passes the ref-list TABLE SLOT as `fbValtype`'s
+          // second arg (`globalCellStructIdx` is -1 for a ref array) so the cell valtype
+          // selects THIS global's element wrapper — annotation-first, init-inferred when
+          // un-annotated — not slot 0's.
+          if gck == "reflist" { gcs = globalRefListSlot(globalStmts[gi]) }
+          // A map cell (kind 6): the map SHAPE picks the struct type; the
+          // `pendingMapSlot` seed makes the `Map()` init constexpr build it.
+          if gck == "map" {
+            gcs = letMapShapeOf(globalStmts[gi], -1)
+            pendingMapSlot = gcs
+          }
+          fbValtype(gck, gcs) // valtype
+          wU8(1)              // 0x01 mutable
+          // An `: i64` global lowers its literal init as `i64.const` (kind 10 / 0x7e);
+          // an `: f32`/`: f64` global as `f32.const`/`f64.const` (kind 13 / 0x7d, 11 /
+          // 0x7c) — re-encoding an integer literal directly so the init stays a valid
+          // constexpr (no convert op). (Slice 5.)
+          pendingI64 = (gck == "i64")
+          pendingF32 = (gck == "f32")
+          pendingF64 = (gck == "f64")
+          // A literal-union const global (`const D: K = "a"`) lowers its member init as `i32.const <id>`
+          // (a valid constexpr).
+          if letIsLitUnion(globalStmts[gi]) { pendingLitUnion = 1 }
+          // A UNION cell (kind 4) with a CONST init boxes it in the constexpr —
+          // `struct.new` / `array.new_fixed` / `i32.const` are all constant in
+          // WasmGC, so `let w: string | i32 = "a"` builds the box inline.
+          let gun2 = ""
+          if gck == "union" { gun2 = letUnionNameOf(globalStmts[gi], -1) }
+          if gun2 != "" {
+            if emitUnionCoerce(globalPayload, gun2, g.letInit, -1) < 0 {
+              return -1
+            }
+          } else {
+            if emitExpr(globalPayload, g.letInit, -1) < 0 {
+              return -1 // init constexpr
+            }
+          }
+          pendingI64 = false
+          pendingF32 = false
+          pendingF64 = false
+          pendingListKind = 0
+          pendingListSlot = 0
+          pendingLitUnion = 0
+          fbEnd() // 0x0b end of init expr
+        }
+      }
+      gi = gi + 1
+    }
+    wTarget(gPrev)
+    wSection(6, globalPayload)
+  }
+  0
+}
+
+// Export section (id 7), extracted verbatim from emitModule (C3).
+function emitExportSection(_n: i32) {
+  // Export section (id 7): the module's ABI is EXACTLY the alias tables the
+  // driver staged — re-export entries (`export { name } from "dep"` → the
+  // merged, mangled target) plus the root module's plain `export`-marked
+  // functions (a single-source program's `export function f` rides the same
+  // tables, unmangled). Nothing else is exported: an internal function (a
+  // lifted `__lambda_N` closure, a `name#k` mono instance, a dependency's
+  // machinery) stays private — a program RUNS by instantiation (the start fn
+  // is the top level), and a lean surface lets `wasm-opt` prune unreached
+  // code. A name is a UTF-8 byte vec; for an ASCII identifier each `name[i]`
+  // char code IS its byte. Entries are resolved against `fnStmts` first so the
+  // section count is exact; a duplicate public name keeps its FIRST entry
+  // (export names must be unique). An export-free program omits the section.
+  const reExpEi: i32[] = [] // the target function's `fnStmts` position, parallel to its public name
+  const reExpNm: string[] = []
+  let rxi = 0
+  while rxi < reExpName.length {
+    let tj = 0
+    let hit = -1
+    while tj < fnStmts.length && hit < 0 {
+      const tfn = P.nodes[fnStmts[tj]]
+      if tfn is FuncDecl {
+        if tfn.fnName == reExpTarget[rxi] { hit = tj }
+      }
+      tj = tj + 1
+    }
+    if hit >= 0 && !capHas(reExpNm, reExpName[rxi]) {
+      reExpNm.push(reExpName[rxi])
+      reExpEi.push(hit)
+    }
+    rxi = rxi + 1
+  }
+  if reExpNm.length == 0 { return 0 }
+  const exportPayload: i32[] = []
+  const exPrev = wTarget(exportPayload)
+  wULEB(reExpNm.length)
+  // Each entry: the bare public name pointing at the target's func index.
+  let rei = 0
+  while rei < reExpNm.length {
+    wName(reExpNm[rei])
+    wU8(0) // export kind: func
+    wULEB(gImports + reExpEi[rei])
+    rei = rei + 1
+  }
+  wTarget(exPrev)
+  wSection(7, exportPayload)
+  0
+}
+
+// Code section (id 10), extracted verbatim from emitModule (C3). Returns -1 if any
+// function body fails to emit (propagated by the caller), else 0.
+function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
+  // Code section (id 10): one size-prefixed body per function, in index order, then
+  // (if any) the synthetic start function's body, the `__log__` decoder's, and the
+  // shared-runtime-helper bodies LAST (in helper-index order).
+  const codePayload: i32[] = []
+  const codePrev = wTarget(codePayload)
+  wULEB(n + hasStart + memFn + nHelpers)
+  wTarget(codePrev)
+  let ci = 0
+  while ci < n {
+    if emitFuncCode(codePayload, fnStmts[ci]) < 0 { return -1 }
+    ci = ci + 1
+  }
+  if hasStart == 1 {
+    if emitStartFnCode(codePayload) < 0 { return -1 }
+  }
+  if memLogUsed {
+    if emitMemLogFnCode(codePayload) < 0 { return -1 }
+  }
+  if gHelpStrHash >= 0 {
+    if emitStrHashFnCode(codePayload) < 0 { return -1 }
+    if emitStrEqFnCode(codePayload) < 0 { return -1 }
+    if emitStrConcatFnCode(codePayload) < 0 { return -1 }
+  }
+  if gHelpMapProbe >= 0 {
+    if emitMapProbeFnCode(codePayload) < 0 { return -1 }
+    if emitMapResizeFnCode(codePayload) < 0 { return -1 }
+  }
+  wSection(10, codePayload)
+  0
+}
