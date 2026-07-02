@@ -26740,6 +26740,226 @@ function captureBoxRewrite(stmts: i32[]) {
   0
 }
 
+// ── emitProgram pass manager ──────────────────────────────────────────────────
+// The front half of `emitProgram` is a sequence of ordered passes over the arena.
+// The pass TABLE in `emitProgram` is the one place that order lives: each row is
+// `"pass"` or `"pass > prereq prereq …"`, rows run top to bottom, and the driver
+// asserts every prerequisite has already run before dispatching — so a reordered
+// table fails loudly (`emitFail`) instead of miscompiling. A `#2` suffix names an
+// explicit RE-RUN of an earlier pass: monomorphization mints late annotations
+// (instance-pinned params/returns) that the first arena scans could not see, so
+// its dependents re-scan after it.
+
+// True if `done` (the names of the passes run so far) contains the pass name
+// spelled at `needs[i..j)` — a membership test without building a substring.
+function passDoneHas(done: string[], needs: string, i: i32, j: i32) {
+  let d = 0
+  while d < done.length {
+    const nm = done[d]
+    if nm.length == j - i {
+      let k = 0
+      let same = true
+      while k < nm.length {
+        if nm[k] != needs[i + k] { same = false }
+        k = k + 1
+      }
+      if same { return true }
+    }
+    d = d + 1
+  }
+  false
+}
+
+// True if every space-separated pass name in `needs` is present in `done`.
+function passNeedsMet(needs: string, done: string[]) {
+  let i = 0
+  while i < needs.length {
+    if needs[i] == 32 {
+      i = i + 1 // skip the separator (space)
+    } else {
+      let j = i
+      while j < needs.length && needs[j] != 32 { j = j + 1 }
+      if !passDoneHas(done, needs, i, j) { return false }
+      i = j
+    }
+  }
+  true
+}
+
+// The pass NAME of a table row (`"buildFnMap#2 > monomorphize"` → `"buildFnMap#2"`):
+// the leading run up to the first space or `>`.
+function passRowName(row: string) {
+  let e = 0
+  while e < row.length && row[e] != 32 && row[e] != 62 { e = e + 1 }
+  const nm = row.slice(0, e)
+  nm
+}
+
+// The prerequisite list of a table row — everything after the `>` (`""` when the
+// row declares none). Space-separated pass names, consumed by `passNeedsMet`.
+function passRowNeeds(row: string) {
+  let g = 0
+  while g < row.length && row[g] != 62 { g = g + 1 }
+  if g >= row.length { return "" }
+  const nd = row.slice(g + 1, row.length)
+  nd
+}
+
+// The `collectFns` post-condition, as a pass so the table orders it explicitly:
+// a program must declare at least one top-level function or start statement.
+function passCheckTopLevel() {
+  if fnStmts.length < 1 && startStmts.length < 1 {
+    return emitFail(
+      "emitProgram: expected at least one top-level function or statement",
+    )
+  }
+  0
+}
+
+// Detect `print(...)` / memory-intrinsic use anywhere in the program: any print
+// pulls in the 4-import print family (imports shift every local function's wasm
+// index, so this is decided up front; a print-free program emits no import
+// section at all). Scans the WHOLE arena, so it must run after every pass that
+// mints nodes (monomorphization instances, synthesized annotations).
+function scanPrintUse() {
+  gImports = 0
+  gNeedsI64Print = false
+  gNeedsF64Print = false
+  gF64PrintIdx = 0
+  gNeedsF32Print = false
+  gF32PrintIdx = 0
+  memUsed = false
+  memLogUsed = false
+  let pscan = 0
+  let sawI64Ann = false
+  let sawF64 = false
+  let sawF32 = false
+  while pscan < P.nodes.length {
+    const pn = P.nodes[pscan]
+    if pn is Call {
+      const pcallee = P.nodes[pn.callFn]
+      if pcallee is Ident {
+        if pcallee.identName == "print" { gImports = 4 }
+        // The linear-memory intrinsics: any store/load forces the module-defined
+        // memory; `__log__` additionally forces the synthetic decoder function,
+        // which prints through `__print_i32__` — so it pulls in the print-import
+        // family exactly as a `print(...)` call does.
+        if (
+          pcallee.identName == "__store_i32__" ||
+          pcallee.identName == "__load_i32__"
+        ) {
+          memUsed = true
+        }
+        if pcallee.identName == "__log__" {
+          memUsed = true
+          memLogUsed = true
+          gImports = 4
+        }
+      }
+    }
+    // Any `i64` type annotation anywhere flags the program as i64-using. Combined
+    // with `print`, it pulls in the `__print_i64__` import. (An over-approximation:
+    // a program with an i64 binding but no `print(<i64>)` would carry one unused
+    // import — harmless, and never the case for the existing byte-identical goldens,
+    // none of which name `i64`.)
+    if pn is TypeRef {
+      // ANY annotation mentioning i64 — bare `i64`, `i64[]`, an `i64 | …` value union, a
+      // `{[…]: i64}` map — implies an i64 value may be printed; pull in the `__print_i64__`
+      // import (an over-approximation, harmless if unused; no existing golden names i64).
+      // Without the union/array forms a `print(u)` over `u: i64 | string` narrowed to i64
+      // routed `fbCall(4)` to a non-existent import — invalid wasm.
+      if strContains(pn.tyName, "i64") { sawI64Ann = true }
+      if pn.tyName == "f64" { sawF64 = true }
+      // ANY annotation mentioning f32 — bare `f32`, `f32[]`, an `f32 | …` union, a `{[…]:
+      // f32}` map — implies an f32 value may be printed; pull in the f32 print import (an
+      // over-approximation, harmless if unused; no existing golden names f32).
+      if strContains(pn.tyName, "f32") { sawF32 = true }
+    }
+    // A float `.` literal flags the program as f64-using (the checker types it f64).
+    // An INTEGER literal past the i32 range flags it as i64-using (the checker
+    // types it i64 — the host `defaultIntegerType` rule), so `print(0xDEAD_BEEF)`
+    // pulls in the `__print_i64__` import even with no `i64` annotation.
+    if pn is NumLit {
+      if numTextIsFloat(pn.numText) { sawF64 = true }
+      else if !numLexFitsI32(pn.numText) { sawI64Ann = true }
+    }
+    pscan = pscan + 1
+  }
+  // When the program both prints (gImports > 0, i.e. == 4) and names an i64 type,
+  // add the 5th `__print_i64__` import. (Bumped from the proven `gImports > 0` form;
+  // a direct `gImports == 4` is avoided — the host bootstrap typechecker mishandles
+  // the literal comparison on this reassigned module global.)
+  if gImports > 0 {
+    if sawI64Ann {
+      gImports = gImports + 1
+      gNeedsI64Print = true
+    }
+    // Then `__print_f64__` (at the next index — 4 or 5). The f64 import always
+    // trails the i64 one so the i64 print index (4) is unchanged. (Slice 3.)
+    if sawF64 {
+      gF64PrintIdx = gImports
+      gImports = gImports + 1
+      gNeedsF64Print = true
+    }
+    // Then `__print_f32__` (at the next index — 4/5/6). It always TRAILS the i64 and
+    // f64 imports so their indices are unchanged. (Slice 5.)
+    if sawF32 {
+      gF32PrintIdx = gImports
+      gImports = gImports + 1
+      gNeedsF32Print = true
+    }
+  }
+  0
+}
+
+// Every function's parameters must be i32 or the struct type before we commit.
+function checkFnParams() {
+  let i = 0
+  while i < fnStmts.length {
+    if checkParams(fnStmts[i]) < 0 { return -1 }
+    i = i + 1
+  }
+  0
+}
+
+// Dispatch one pass-table row by name. Every pass returns an i32 status (< 0 =
+// failed emit). The `#2` rows are the explicit re-run stage — each branch calls
+// the same pass function a second time, post-monomorphization.
+function runEmitPass(name: string, stmts: i32[]) {
+  if name == "collectU" { return collectU(stmts) }
+  if name == "collectS" { return collectS(stmts) }
+  if name == "collectA" { return collectA(stmts) }
+  if name == "collectFns" { return collectFns(stmts) }
+  if name == "checkTopLevel" { return passCheckTopLevel() }
+  if name == "buildFnMap" { return buildFnMap(stmts) }
+  if name == "computeVoidFns" { return computeVoidFns() }
+  if name == "computeRetInference" { return computeRetInference() }
+  if name == "dispatchRewrite" { return dispatchRewrite(stmts) }
+  if name == "captureBoxRewrite" { return captureBoxRewrite(stmts) }
+  if name == "synthRetAnnots" { return synthRetAnnots() }
+  if name == "monomorphize" { return monomorphize(stmts) }
+  if name == "collectGenAliasShapes" { return collectGenAliasShapes() }
+  if name == "collectAnnShapes" { return collectAnnShapes() }
+  // RE-RUN stage: instance-pinned annotations minted DURING monomorphization
+  // (`Box<i32>` applications, structural returns) postdate the first arena scans —
+  // rescan so they intern too, then refresh the name→index tables that resolve
+  // against the struct table (an instance's `fRetStructIdx` needs its
+  // just-interned return shape). All four are idempotent and usage-gated (no new
+  // TypeRef → no new shape → identical bytes).
+  if name == "collectA#2" { return collectA(stmts) }
+  if name == "buildFnMap#2" { return buildFnMap(stmts) }
+  if name == "synthParamAnnots" { return synthParamAnnots() }
+  if name == "computeVoidFns#2" { return computeVoidFns() }
+  if name == "computeRetInference#2" { return computeRetInference() }
+  if name == "collectMapFilterUse" { return collectMapFilterUse() }
+  if name == "collectFnValUse" { return collectFnValUse() }
+  if name == "collectCloSigs" { return collectCloSigs() }
+  if name == "scanPrintUse" { return scanPrintUse() }
+  if name == "checkFnParams" { return checkFnParams() }
+  if name == "capCacheBuild" { return capCacheBuild() }
+  emitFail("emitProgram: unknown pass in the pass table: " + name)
+}
+
 export function emitProgram(rootIx: i32) {
   emitFailed = false
   emitErr = ""
@@ -26756,176 +26976,84 @@ export function emitProgram(rootIx: i32) {
     if stmts.length < 1 {
       return emitFail("emitProgram: expected at least one top-level statement")
     }
-    // Collect the union alias FIRST (so `collectS` knows whether the program's
-    // structs are union variants vs a single direct struct), then the (single)
-    // struct type, so param/return/local checks can recognize its name, then the
-    // function list (FuncDecls only), then the name→index map. Forward references and
-    // recursion resolve because every name is mapped before any body is emitted.
     resetLitAtoms()
     resetParentLetCache()
-    if collectU(stmts) < 0 { return -1 }
-    if collectS(stmts) < 0 { return -1 }
-    if collectA(stmts) < 0 { return -1 }
-    if collectFns(stmts) < 0 { return -1 }
-    if fnStmts.length < 1 && startStmts.length < 1 {
-      return emitFail(
-        "emitProgram: expected at least one top-level function or statement",
-      )
+    // The ordered pass table — see the pass-manager block comment above
+    // `passDoneHas` for the row grammar. WHY each ordering edge holds:
+    //  · collectU first, so `collectS` knows whether the program's structs are
+    //    union variants vs a single direct struct; then the struct shapes, the
+    //    arena arrays, the function list (FuncDecls only), and the name→index
+    //    map. Forward references and recursion resolve because every name is
+    //    mapped before any body is emitted.
+    //  · dispatchRewrite (UFCS `self`-methods, operator overloads, index traps)
+    //    resolves `o.f(args)` / `a op b` / `o[k]` into the plain-call forms the
+    //    lowerings AND the monomorphizer handle — before mono, so a rewritten
+    //    call instantiates per receiver shape.
+    //  · captureBoxRewrite boxes captured-MUTATION locals as shared length-1
+    //    arrays — before mono, so instances inherit the rewrite.
+    //  · synthRetAnnots pins a bound lambda's UNION return annotation from its
+    //    annotated closure type — before mono (an instance is cloned with
+    //    `nret = fnRet`, so the return must be pinned first or it emits a
+    //    single-arm `$fnsig` result the call-site `ref.cast` rejects), and
+    //    before the shape passes, so the union's box + variants intern for the
+    //    return. Reads the union registry, hence the `collectU` edge.
+    //  · monomorphize clones a concretely-annotated instance per distinct call
+    //    shape — BEFORE signatures and types are collected.
+    //  · the `#2` rows re-scan what monomorphization's late-minted annotations
+    //    invalidated (see `runEmitPass`).
+    //  · synthParamAnnots fills an un-annotated CALLBACK param's annotation from
+    //    the checker's recorded type — after mono (an instance's pinned params
+    //    are in place), before the `$fnsig` / map-filter collection that reads
+    //    param valtypes.
+    //  · collectMapFilterUse flips `fnValUsed` + forces the RESULT list's types;
+    //    the `$fnsig` set (collectCloSigs) is collected after it and after
+    //    collectFnValUse — both need the re-inferred return kinds.
+    //  · scanPrintUse / checkFnParams read the FINAL arena; capCacheBuild
+    //    snapshots capture lists only once the AST and `fnStmts` are final —
+    //    after every mutating pass.
+    const passTable = [
+      "collectU",
+      "collectS > collectU",
+      "collectA > collectS",
+      "collectFns > collectU collectS",
+      "checkTopLevel > collectFns",
+      "buildFnMap > collectFns",
+      "computeVoidFns > buildFnMap",
+      "computeRetInference > buildFnMap computeVoidFns",
+      "dispatchRewrite > buildFnMap computeRetInference",
+      "captureBoxRewrite > collectFns",
+      "synthRetAnnots > collectU buildFnMap",
+      "monomorphize > dispatchRewrite captureBoxRewrite synthRetAnnots",
+      "collectGenAliasShapes > monomorphize",
+      "collectAnnShapes > monomorphize",
+      "collectA#2 > collectGenAliasShapes collectAnnShapes",
+      "buildFnMap#2 > monomorphize collectA#2",
+      "synthParamAnnots > monomorphize buildFnMap#2",
+      "computeVoidFns#2 > synthParamAnnots",
+      "computeRetInference#2 > synthParamAnnots computeVoidFns#2",
+      "collectMapFilterUse > synthParamAnnots computeRetInference#2",
+      "collectFnValUse > synthParamAnnots computeRetInference#2",
+      "collectCloSigs > collectMapFilterUse collectFnValUse",
+      "scanPrintUse > monomorphize synthParamAnnots",
+      "checkFnParams > monomorphize synthParamAnnots",
+      "capCacheBuild > monomorphize synthParamAnnots",
+    ]
+    const passDone: string[] = []
+    let pi = 0
+    while pi < passTable.length {
+      const prow = passTable[pi]
+      const pname = passRowName(prow)
+      if !passNeedsMet(passRowNeeds(prow), passDone) {
+        return emitFail(
+          "emitProgram: pass " +
+            pname +
+            " ran before a prerequisite (pass table reordered)",
+        )
+      }
+      if runEmitPass(pname, stmts) < 0 { return -1 }
+      passDone.push(pname)
+      pi = pi + 1
     }
-    if buildFnMap(stmts) < 0 { return -1 }
-    computeVoidFns()
-    computeRetInference()
-    // Dispatch rewrite (UFCS `self`-methods, operator overloads, index traps):
-    // resolve `o.f(args)` / `a op b` / `o[k]` shapes into the plain-call /
-    // member-call forms the existing lowerings (and the monomorphizer, next)
-    // already handle. Must run BEFORE monomorphization so a rewritten call
-    // instantiates per receiver shape. Usage-gated: no such shape → no rewrite.
-    dispatchRewrite(stmts)
-    // Box captured-MUTATION locals as shared length-1 arrays (a closure mutating a captured
-    // local needs a shared cell — captures are by-value). Runs BEFORE monomorphization so
-    // instances inherit the rewrite; usage-gated → identical bytes when nothing is boxed.
-    captureBoxRewrite(stmts)
-    // Give a lambda bound to an annotated closure type a UNION return annotation from it. Runs
-    // BEFORE monomorphization: a union-returning lambda that flows into a HOF param is monomorphized
-    // (its `fnStmts` slot REPLACED by an instance cloned with `nret = fnRet`), so its return must be
-    // pinned first or the instance keeps `fnRet < 0` and emits a single-arm struct `$fnsig` result
-    // (`i>s-1;`) that the call-site `ref.cast` to `i>u` rejects. Also before the shape passes, so the
-    // union's box + variants intern for the return like a named `: Cat | Dog` function. The union
-    // registry (`collectU`, above) is already populated, so an alias return (`(i32) => Animal`)
-    // resolves via `isUName`. Covers struct / alias / value unions (a value union's narrowed result
-    // unboxes via `paramUnionRetName` in the HOF body), and the BOUND case (no mono) alike.
-    synthRetAnnots()
-    // Monomorphize: resolve every direct call to a generic (`<T>` / un-annotated
-    // param) function into a concretely-annotated instance (cloned per distinct
-    // call shape, host `instantiate` parity) BEFORE signatures and types are
-    // collected. Usage-gated: zero instances → byte-identical output.
-    if monomorphize(stmts) < 0 { return -1 }
-    // Instance-pinned annotations minted DURING monomorphization (`Box<i32>`
-    // applications, `{first:string,second:i32}` structural returns) postdate
-    // the `collectS` arena scan — rescan so they intern too, then refresh the
-    // name→index tables that resolve against the struct table (an instance's
-    // `fRetStructIdx` needs its just-interned return shape). All passes are
-    // idempotent and usage-gated (no new TypeRef → no new shape → identical
-    // bytes).
-    collectGenAliasShapes()
-    collectAnnShapes()
-    if collectA(stmts) < 0 { return -1 }
-    if buildFnMap(stmts) < 0 { return -1 }
-    // Synthesize an un-annotated CALLBACK param's annotation from the checker's recorded type
-    // (`xs.map((x) => x * 2.0)` over `f64[]` ⇒ `x: f64`), so its functype valtype follows the
-    // contextually-inferred element instead of defaulting to i32. Runs after monomorphization
-    // (so an instance's pinned params are in place) and BEFORE the `$fnsig` / map-filter
-    // collection that reads param valtypes. Usage-gated: a param with no recorded scalar type
-    // (generic hole, or already annotated) is left untouched → byte-identical.
-    synthParamAnnots()
-    computeVoidFns()
-    computeRetInference()
-    // `.map`/`.filter` sites flip `fnValUsed` (the callback is a function value) and
-    // force the RESULT list's types; the `$fnsig` signature set is then collected
-    // (both need the inferred return kinds, so they run after `computeRetInference`).
-    collectMapFilterUse()
-    collectFnValUse()
-    collectCloSigs()
-    // Detect `print(...)` anywhere in the program: any use pulls in the 4-import
-    // print family (imports shift every local function's wasm index, so this is
-    // decided up front; a print-free program emits no import section at all).
-    gImports = 0
-    gNeedsI64Print = false
-    gNeedsF64Print = false
-    gF64PrintIdx = 0
-    gNeedsF32Print = false
-    gF32PrintIdx = 0
-    memUsed = false
-    memLogUsed = false
-    let pscan = 0
-    let sawI64Ann = false
-    let sawF64 = false
-    let sawF32 = false
-    while pscan < P.nodes.length {
-      const pn = P.nodes[pscan]
-      if pn is Call {
-        const pcallee = P.nodes[pn.callFn]
-        if pcallee is Ident {
-          if pcallee.identName == "print" { gImports = 4 }
-          // The linear-memory intrinsics: any store/load forces the module-defined
-          // memory; `__log__` additionally forces the synthetic decoder function,
-          // which prints through `__print_i32__` — so it pulls in the print-import
-          // family exactly as a `print(...)` call does.
-          if (
-            pcallee.identName == "__store_i32__" ||
-            pcallee.identName == "__load_i32__"
-          ) {
-            memUsed = true
-          }
-          if pcallee.identName == "__log__" {
-            memUsed = true
-            memLogUsed = true
-            gImports = 4
-          }
-        }
-      }
-      // Any `i64` type annotation anywhere flags the program as i64-using. Combined
-      // with `print`, it pulls in the `__print_i64__` import. (An over-approximation:
-      // a program with an i64 binding but no `print(<i64>)` would carry one unused
-      // import — harmless, and never the case for the existing byte-identical goldens,
-      // none of which name `i64`.)
-      if pn is TypeRef {
-        // ANY annotation mentioning i64 — bare `i64`, `i64[]`, an `i64 | …` value union, a
-        // `{[…]: i64}` map — implies an i64 value may be printed; pull in the `__print_i64__`
-        // import (an over-approximation, harmless if unused; no existing golden names i64).
-        // Without the union/array forms a `print(u)` over `u: i64 | string` narrowed to i64
-        // routed `fbCall(4)` to a non-existent import — invalid wasm.
-        if strContains(pn.tyName, "i64") { sawI64Ann = true }
-        if pn.tyName == "f64" { sawF64 = true }
-        // ANY annotation mentioning f32 — bare `f32`, `f32[]`, an `f32 | …` union, a `{[…]:
-        // f32}` map — implies an f32 value may be printed; pull in the f32 print import (an
-        // over-approximation, harmless if unused; no existing golden names f32).
-        if strContains(pn.tyName, "f32") { sawF32 = true }
-      }
-      // A float `.` literal flags the program as f64-using (the checker types it f64).
-      // An INTEGER literal past the i32 range flags it as i64-using (the checker
-      // types it i64 — the host `defaultIntegerType` rule), so `print(0xDEAD_BEEF)`
-      // pulls in the `__print_i64__` import even with no `i64` annotation.
-      if pn is NumLit {
-        if numTextIsFloat(pn.numText) { sawF64 = true }
-        else if !numLexFitsI32(pn.numText) { sawI64Ann = true }
-      }
-      pscan = pscan + 1
-    }
-    // When the program both prints (gImports > 0, i.e. == 4) and names an i64 type,
-    // add the 5th `__print_i64__` import. (Bumped from the proven `gImports > 0` form;
-    // a direct `gImports == 4` is avoided — the host bootstrap typechecker mishandles
-    // the literal comparison on this reassigned module global.)
-    if gImports > 0 {
-      if sawI64Ann {
-        gImports = gImports + 1
-        gNeedsI64Print = true
-      }
-      // Then `__print_f64__` (at the next index — 4 or 5). The f64 import always
-      // trails the i64 one so the i64 print index (4) is unchanged. (Slice 3.)
-      if sawF64 {
-        gF64PrintIdx = gImports
-        gImports = gImports + 1
-        gNeedsF64Print = true
-      }
-      // Then `__print_f32__` (at the next index — 4/5/6). It always TRAILS the i64 and
-      // f64 imports so their indices are unchanged. (Slice 5.)
-      if sawF32 {
-        gF32PrintIdx = gImports
-        gImports = gImports + 1
-        gNeedsF32Print = true
-      }
-    }
-    // Every function's parameters must be i32 or the struct type before we commit.
-    let i = 0
-    while i < fnStmts.length {
-      if checkParams(fnStmts[i]) < 0 { return -1 }
-      i = i + 1
-    }
-    // The AST and `fnStmts` are FINAL past this point — snapshot every function's
-    // capture list once, so the emission phases (identifier reads, classifiers,
-    // the env-struct type walk) query the cache instead of re-walking bodies.
-    capCacheBuild()
     let rc = emitModule(stmts)
     if rc < 0 { return rc }
     // An `emitFail` whose -1 a deep helper swallowed (e.g. inside a valtype write)
