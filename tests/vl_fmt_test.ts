@@ -778,3 +778,108 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "vl-fmt: a comment in a non-collapsible if-expression branch keeps its line structure (no corruption, idempotent)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The N2 repro: collapsing this branch onto one line would put `log(1)`,
+    // `1`, AND the closing brace behind the `//` — commenting them out and
+    // producing unparseable output. The formatter must keep the slice's line
+    // structure instead.
+    const src =
+      "function pick(c: boolean): i32 {\n" +
+      "  const x = if c {\n" +
+      "    // pick one\n" +
+      "    log(1)\n" +
+      "    1\n" +
+      "  } else {\n" +
+      "    2\n" +
+      "  }\n" +
+      "  return x\n" +
+      "}\n" +
+      "function log(n: i32) { print(n) }\n" +
+      "print(pick(true))\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    // The corruption: the comment swallowing the code that follows it.
+    if (/\/\/ pick one .*log\(1\)/.test(r.out)) {
+      throw new Error(`comment swallowed the branch body:\n${r.out}`);
+    }
+    // The comment stays on its own line, the branch body on the next.
+    if (!/\/\/ pick one\n\s*log\(1\)\n/.test(r.out)) {
+      throw new Error(`comment/body line structure not preserved:\n${r.out}`);
+    }
+    // Exactly one copy of the comment (not re-emitted after the statement too).
+    const copies = (r.out.match(/\/\/ pick one/g) ?? []).length;
+    if (copies !== 1) {
+      throw new Error(`expected exactly 1 comment copy, got ${copies}:\n${r.out}`);
+    }
+    // Idempotent — and the re-format also proves the output still parses.
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) {
+      throw new Error(`not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a comment in a collapsible if-expression branch stays anchored (no relocation below the statement)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The collapsible variant: without the comment this if-expression would
+    // fold to `if c then 1 else 2`; with it, folding would tear the comment off
+    // its branch and dump it below the statement. It must stay put.
+    const src =
+      "function pick(c: boolean): i32 {\n" +
+      "  const x = if c {\n" +
+      "    // pick one\n" +
+      "    1\n" +
+      "  } else {\n" +
+      "    2\n" +
+      "  }\n" +
+      "  return x\n" +
+      "}\n" +
+      "print(pick(true))\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!/\/\/ pick one\n\s*1\n/.test(r.out)) {
+      throw new Error(`comment not anchored above its branch value:\n${r.out}`);
+    }
+    if (/return x\n[\s\S]*\/\/ pick one/.test(r.out)) {
+      throw new Error(`comment relocated below the statement:\n${r.out}`);
+    }
+    const copies = (r.out.match(/\/\/ pick one/g) ?? []).length;
+    if (copies !== 1) {
+      throw new Error(`expected exactly 1 comment copy, got ${copies}:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) {
+      throw new Error(`not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a comment in a statement-position if branch is unchanged (regression guard)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // Statement-position `if` prints structurally (not via the slice fallback);
+    // its comment handling must be unaffected by the fallback changes.
+    const src =
+      "const c = true\n" +
+      "if c {\n" +
+      "  // only\n" +
+      "  print(1)\n" +
+      "}\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!/\/\/ only\n\s*print\(1\)\n/.test(r.out)) {
+      throw new Error(`statement-position comment misplaced:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) {
+      throw new Error(`not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`);
+    }
+  },
+});
