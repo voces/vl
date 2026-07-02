@@ -42,6 +42,8 @@ import {
   nodeLitUnionMemberTexts,
   nodeNulStructInnerName,
   nodeTyIsLitUnion,
+  nodeTyIsLitUnionAlias,
+  nodeTyIsNulLitUnion,
   nodeTyIsNulStruct,
   nodeTyIsNullableString,
   nodeTyIsNullableStruct,
@@ -3671,7 +3673,7 @@ function checkLocalI32(letIx: i32) {
         // `boolean` rides in an i32 (0/1), so a `boolean` local is the SAME i32 slot.
         if ty.tyName != "i32" {
           if ty.tyName != "boolean" {
-            if !nameIsLitUnionType(ty.tyName) {
+            if !nodeTyIsLitUnionAlias(d.letType) {
               return emitFail("emitProgram: only i32 locals are supported")
             }
           }
@@ -14233,7 +14235,7 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     // A literal-union return reads as a union NAME but is an i32 ATOM — exclude it from the value-union
     // box return (`emitUnionBoxArg` would `struct.new` the member).
     if retUnionFlag(fn.fnRet) == 1 {
-      if !nameIsLitUnionType(tyNameOf(fn.fnRet)) { retUNm = tyNameOf(fn.fnRet) }
+      if !nodeTyIsLitUnionAlias(fn.fnRet) { retUNm = tyNameOf(fn.fnRet) }
     }
     if fn.fnRet < 0 {
       const im = inferRetNameOf(fn.fnName)
@@ -14252,10 +14254,10 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if tyIsNulBool(fn.fnRet) { retNulBool = true }
     if retNulStringFlag(fn.fnRet) == 1 { retNulString = true }
     if retNulListFlag(fn.fnRet) == 1 { retNulList = true }
-    if nameIsLitUnionType(tyNameOf(fn.fnRet)) { retLitUnion = true }
+    if nodeTyIsLitUnionAlias(fn.fnRet) { retLitUnion = true }
     // A `K | null` NICHE return: a `return null` lowers as the i32 sentinel `-1`, a `return "a"`
     // as its atom id — so seed BOTH the niche flag and `pendingLitUnion`.
-    if nameIsNulLitUnion(tyNameOf(fn.fnRet)) { retNulLitUnion = true }
+    if nodeTyIsNulLitUnion(fn.fnRet) { retNulLitUnion = true }
     if tyNameOf(fn.fnRet) == "string" {
       if exprIsLitAtom(retArg, fnIx) { retStrWiden = true }
     }
@@ -14642,10 +14644,10 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     pendingNulBool = letNulBool(stmtIx, fnIx)
     pendingNulString = letIsNulString(stmtIx, fnIx)
     if s.letType >= 0 {
-      if nameIsLitUnionType(tyNameOf(s.letType)) { pendingLitUnion = 1 }
+      if nodeTyIsLitUnionAlias(s.letType) { pendingLitUnion = 1 }
       // A `K | null` NICHE binding: a member init lowers as its atom id, a bare `null` init as the
       // i32 sentinel `-1` — seed both, like the param-arg / return boundaries.
-      if nameIsNulLitUnion(tyNameOf(s.letType)) {
+      if nodeTyIsNulLitUnion(s.letType) {
         pendingLitUnion = 1
         pendingNulLitUnion = true
       }
@@ -15585,9 +15587,9 @@ function checkParams(fnIx: i32) {
             // boundary. The body's map ops resolve the param via `exprMap`/`paramMap`/
             // `mapShapeOfExpr` (which now reads the param annotation's shape). A struct/f64/i64-
             // valued map is NOT yet supported (`retMapFlag` returns 0) → rejected below.
-          } else if nameIsLitUnionType(ty.tyName) {
+          } else if nodeTyIsLitUnionAlias(p.parType) {
             // accepted — a literal-union param is an i32-backed interned atom (kind 0).
-          } else if nameIsNulLitUnion(ty.tyName) {
+          } else if nodeTyIsNulLitUnion(p.parType) {
             // accepted — a `K | null` NICHE param is the i32 atom with the spare `-1` = null (kind 0).
           } else if ty.tyName != "i32" {
             if ty.tyName != "i64" {
@@ -16070,7 +16072,7 @@ function exprNulLitUnion(exprIx: i32, fnIx: i32) {
       if t >= 0 {
         const cfn = P.nodes[fnStmts[t]]
         if cfn is FuncDecl {
-          if cfn.fnRet >= 0 { return nameIsNulLitUnion(tyNameOf(cfn.fnRet)) }
+          if cfn.fnRet >= 0 { return nodeTyIsNulLitUnion(cfn.fnRet) }
         }
       }
     }
@@ -16086,7 +16088,7 @@ function exprNulLitUnion(exprIx: i32, fnIx: i32) {
           const p = P.nodes[params[i]]
           if p is Param {
             if p.parName == e.identName {
-              return nameIsNulLitUnion(tyNameOf(p.parType))
+              return nodeTyIsNulLitUnion(p.parType)
             }
           }
           i = i + 1
@@ -16108,7 +16110,7 @@ function letNulLitUnion(letIx: i32, fnIx: i32) {
   if letIx < 0 { return false }
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 { return nameIsNulLitUnion(tyNameOf(d.letType)) }
+    if d.letType >= 0 { return nodeTyIsNulLitUnion(d.letType) }
     return exprNulLitUnion(d.letInit, fnIx)
   }
   false
@@ -16330,11 +16332,19 @@ function synthTypeRef(name: string, pos: i32) {
 function vtKindOfType(tyIx: i32): VKind {
   // A literal-union annotation (`type K = "a" | "b"`) is an i32-backed interned atom (`"i32"`), NOT
   // a value-union box — checked first (it IS a `TyUnion`, so `retUnionFlag` would claim it).
-  if nameIsLitUnionType(tyNameOf(tyIx)) { return "i32" }
+  if tyIx >= 0 {
+    if P.nodes[tyIx] is TypeRef {
+      if nodeTyIsLitUnionAlias(tyIx) { return "i32" }
+    }
+  }
   // A NULLABLE literal-union (`K | null`) is the SAME i32 atom (`"i32"`), with the spare value `-1`
   // encoding `null` (no box). Checked before the `string | null` niche (`"nulstr"`) — `canonEmitName`
   // preserves the litunion members, but a defensive position keeps it ahead of any base-collapse.
-  if nameIsNulLitUnion(tyNameOf(tyIx)) { return "i32" }
+  if tyIx >= 0 {
+    if P.nodes[tyIx] is TypeRef {
+      if nodeTyIsNulLitUnion(tyIx) { return "i32" }
+    }
+  }
   // A NULLABLE function `(fn) | null` is the closure fat-pointer made nullable, `"nulclosure"` —
   // checked BEFORE `tyIsFuncType` (whose `=>` test would otherwise claim it as the non-null
   // `"closure"`). The non-null part is a function, but the `| null` makes the slot nullable.
@@ -18091,7 +18101,7 @@ function fieldTypeCode(tyIx: i32) {
     // NOT a box. Checked before the value/struct-union tests (a literal union registers as a
     // union name, which would otherwise claim it as code 16). The field's union name is recorded
     // in `sFieldElemName` so construction/read/assign recover the atom rep + membership.
-    if nameIsLitUnionType(ty.tyName) { return 0 }
+    if nodeTyIsLitUnionAlias(tyIx) { return 0 }
     if nameIsString(ty.tyName) { return 3 }
     if nameIsArray(ty.tyName) {
       if nameIsI32Array(ty.tyName) { return 4 }
@@ -18510,7 +18520,7 @@ function collectA(stmts: i32[]) {
         // nullable wrapper changes only the slot's valtype, not the types needed.
         lUsed = true
         aUsed = true
-      } else if nameIsLitUnionType(nd.tyName) {
+      } else if nodeTyIsLitUnionAlias(i) {
         // A literal-union annotation (`: K`): an atom WIDENS to its member `string` (`print(k)` etc.), so
         // force the string backing even when the module has no other string literal.
         aUsed = true
@@ -19484,7 +19494,7 @@ function letIsLitUnion(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
-      const r = nameIsLitUnionType(tyNameOf(d.letType))
+      const r = nodeTyIsLitUnionAlias(d.letType)
       return r
     }
   }
@@ -19521,7 +19531,7 @@ function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     }
     const pt = paramTypeNode(fnIx, e.identName)
     if pt >= 0 {
-      const r = nameIsLitUnionType(tyNameOf(pt))
+      const r = nodeTyIsLitUnionAlias(pt)
       return r
     }
     const gli = globalLetOf(e.identName)
@@ -19554,7 +19564,7 @@ function exprIsLitAtom(exprIx: i32, fnIx: i32) {
         const cf = P.nodes[fnStmts[target]]
         if cf is FuncDecl {
           if cf.fnRet >= 0 {
-            const r = nameIsLitUnionType(tyNameOf(cf.fnRet))
+            const r = nodeTyIsLitUnionAlias(cf.fnRet)
             return r
           }
         }
@@ -21135,7 +21145,9 @@ function letIsUnion(letIx: i32, fnIx: i32) {
       if lt is TypeRef {
         // A literal union (`type K = "a" | "b"`, or an inline `"a" | "b"`) is an interned-i32
         // ATOM, not a value-union box — never classify it kind 4.
-        if isUName(lt.tyName) && !nameIsLitUnionType(lt.tyName) { return true }
+        if isUName(lt.tyName) && !nodeTyIsLitUnionAlias(d.letType) {
+          return true
+        }
       }
     }
     // The init's union-ness applies when no annotation pinned the cell — but a literal-union
@@ -27745,14 +27757,10 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
           if retNulStringFlag(cpnb.parType) == 1 { cParamNulString = true }
           if nulCloFlag(cpnb.parType) == 1 { cParamNulClosure = true }
           if retNulListFlag(cpnb.parType) == 1 { cParamNulList = true }
-          if nameIsLitUnionType(tyNameOf(cpnb.parType)) {
-            cParamLitUnion = true
-          }
+          if nodeTyIsLitUnionAlias(cpnb.parType) { cParamLitUnion = true }
           // A `K | null` NICHE param: a member-literal arg (`f("a")`) lowers as its atom id
           // (`pendingLitUnion`), a `null` arg as the i32 sentinel `-1` (`pendingNulLitUnion`).
-          if nameIsNulLitUnion(tyNameOf(cpnb.parType)) {
-            cParamNulLitUnion = true
-          }
+          if nodeTyIsNulLitUnion(cpnb.parType) { cParamNulLitUnion = true }
         }
         if vtKindOfParam(cParams[i]) == "str" { cParamStr = true }
         if (
