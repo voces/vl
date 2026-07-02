@@ -289,7 +289,12 @@ import {
   vbI64Used,
 } from "./emit_state"
 import { emitFail } from "./emit_bytes"
-import { repOfNode } from "./emit_rep"
+import {
+  repKindOfSigTok,
+  repLegacyCodeOfKind,
+  repOfNode,
+  repSigTokOfKind,
+} from "./emit_rep"
 
 // The `$fnsig` PARAM-spine token for the parameter at `paramIx` — one token per distinct
 // param VALTYPE, so two functions share a `$fnsig` exactly when their param valtypes
@@ -303,50 +308,22 @@ import { repOfNode } from "./emit_rep"
 // value site, never a mis-lowered all-i32 fallback).
 function cloParamTok(paramIx: i32) {
   const k = vtKindOfParam(paramIx)
-  if k == "i32" {
-    return "i" // i32 / boolean
+  // The slot-CARRYING kinds append their interned table slot (struct index /
+  // variant index / ref-list slot), so two sigs share a `$fnsig` exactly when
+  // the param SHAPES match, not just the kind.
+  if k == "struct" || k == "variant" || k == "reflist" {
+    return repSigTokOfKind(k) + i32ToStr(paramStructIdxOf(paramIx)) + ";"
   }
-  if k == "f64" {
-    return "d" // f64
-  }
-  if k == "str" {
-    return "S" // string
-  }
-  if k == "list" {
-    return "a" // i32[]
-  }
-  if k == "strlist" {
-    return "A" // string[]
-  }
-  if k == "f64list" {
-    return "D" // f64[]
-  }
-  if k == "closure" {
-    return "c" // closure (all closures share `$cloStruct`)
-  }
-  if k == "i64" {
-    return "I" // i64 (a scalar valtype — never a `>`-prefixed result token here)
-  }
-  if k == "f32" {
-    return "f" // f32 (a scalar valtype; the call site widens an i32/f32 argument to it)
-  }
-  if k == "union" {
-    return "u" // union box (all unions share `$uBox`; tags are program-global)
-  }
-  if k == "struct" {
-    return "s" + i32ToStr(paramStructIdxOf(paramIx)) + ";" // struct
-  }
-  if k == "variant" {
-    return "V" + i32ToStr(paramStructIdxOf(paramIx)) + ";" // concrete variant (`uVarIdx + vi`)
-  }
-  if k == "reflist" {
-    return "r" + i32ToStr(paramStructIdxOf(paramIx)) + ";" // ref list (T[])
-  }
-  // f32 / the nullable-ref kinds (9 struct|null, 15 i32[]|null, 16 string|null, 19
-  // closure|null) still mis-lower as a closure-call param — left "" so the value's
-  // signature stays un-interned and the soundness floor (`emitClosureValue`) rejects it
-  // with a clear message rather than emitting invalid wasm.
-  ""
+  // Param-position ABI gate: the nullable-REF kinds (struct|null, string|null —
+  // and via the empty table entries i32[]|null, closure|null) still mis-lower as
+  // a closure-call param — left "" so the value's signature stays un-interned
+  // and the soundness floor (`emitClosureValue`) rejects it with a clear message
+  // rather than emitting invalid wasm. (`nulstr`/`nulstruct` DO carry result
+  // tokens, so the exclusion must be explicit here.)
+  if k == "nulstr" || k == "nulstruct" { return "" }
+  // Every slot-free kind reads the shared canonical token table (emit_rep) —
+  // "" for the kinds outside the value-call ABI (maps, scalar lists, niches).
+  repSigTokOfKind(k)
 }
 
 // The interning KEY for lifted function `fe`'s env-leading `$fnsig`, or "" when the
@@ -573,40 +550,31 @@ export function cloRetValSlot(fe: i32) {
 // caller; ref-list `5` and closure `14` returns are a later slice).
 function cloRetKeySuffix(fe: i32) {
   const k = cloRetValKind(fe)
-  if k == "i32" { return ">i" }
-  if k == "f64" { return ">d" }
-  if k == "i64" { return ">I" }
-  if k == "f32" {
-    return ">f" // f32 scalar result (matches `annRetKind`)
+  // The slot-CARRYING result kinds: a struct / nullable-struct result keyed by
+  // its struct index, a concrete-VARIANT result by its variant index — so two
+  // callbacks share a sig iff they return the SAME shape.
+  if k == "struct" || k == "nulstruct" || k == "variant" {
+    return ">" + repSigTokOfKind(k) + i32ToStr(cloRetValSlot(fe)) + ";"
   }
-  if k == "str" { return ">S" }
-  if k == "union" { return ">u" }
-  if k == "nulstr" { return ">N" }
-  if k == "struct" { return ">s" + i32ToStr(cloRetValSlot(fe)) + ";" }
-  if k == "nulstruct" { return ">n" + i32ToStr(cloRetValSlot(fe)) + ";" }
-  // A concrete-VARIANT result (kind 8) — the `(ref $(uVarIdx + vi))` struct, keyed by the
-  // variant index so two callbacks share a sig iff they return the SAME variant.
-  if k == "variant" { return ">V" + i32ToStr(cloRetValSlot(fe)) + ";" }
-  // List returns: `i32[]` (2) → `>a`, `string[]` (7) → `>A`, `f64[]` (12) → `>D`. The
-  // closure `$fnsig` result is the list WRAPPER ref (`fbValtype` kinds 2/7/12), recovered
-  // non-null at the value-call site like every other non-null closure result.
-  if k == "list" { return ">a" }
-  if k == "strlist" { return ">A" }
-  if k == "f64list" { return ">D" }
-  // A CLOSURE result (kind 14 — a function returning a function, `(i32) => ((i32) => i32)`):
-  // the `$fnsig` result is the shared closure fat-pointer `(ref $cloStructIdx)` (`fbValtype`
-  // kind 14), recovered non-null at the value-call site like any other ref result. Lets a
-  // curried lambda (`(a) => (b) => …`) lower as a callable closure VALUE.
-  if k == "closure" { return ">c" }
-  // A REF-LIST result (kind 5 — `S[]` / `((i32) => i32)[]` / a union list): the `$fnsig` result
-  // is the ref-list WRAPPER ref (`fbValtype` kind 5, slot = `cloRetValSlot`), recovered non-null
-  // at the value-call site like every other ref result. Keyed by the slot so two closures share a
-  // sig iff they return the SAME ref-list shape — the result dual of the `r<idx>;` PARAM token.
+  // A REF-LIST result (`S[]` / `((i32) => i32)[]` / a union list): the `$fnsig`
+  // result is the ref-list WRAPPER ref (slot = `cloRetValSlot`), recovered
+  // non-null at the value-call site like every other ref result — the result
+  // dual of the `r<idx>;` PARAM token. No resolved slot → no sig.
   if k == "reflist" {
     const rs = cloRetValSlot(fe)
-    if rs >= 0 { return ">r" + i32ToStr(rs) + ";" }
+    if rs >= 0 { return ">" + repSigTokOfKind(k) + i32ToStr(rs) + ";" }
+    return ""
   }
-  ""
+  // Every slot-free kind reads the shared canonical token table (emit_rep):
+  // the scalars, string, the i32/string/f64 list wrappers, the union box, the
+  // `string | null` niche, and a CLOSURE result (a function returning a
+  // function — the shared fat-pointer, so a curried lambda lowers as a
+  // callable value). "" (no sig) for the kinds still outside the value ABI —
+  // and for a void/unresolved result (`null`), which the CALLER key-builds
+  // as `>v` before consulting this suffix.
+  const t = repSigTokOfKind(k)
+  if t == "" { return "" }
+  ">" + t
 }
 
 // The EXTENDED `$fnsig` key of lifted function `fe`: `fnSigKeyOf`'s key when the sig is
@@ -10722,28 +10690,15 @@ function sigKeyRetKind(k: string) {
   }
   if gt < 0 || gt + 1 >= n { return -3 }
   const c = k[gt + 1]
-  if c == 'i' { return 0 }
-  if c == 'd' { return 11 }
-  if c == 'I' { return 10 }
-  if c == 'S' { return 3 }
-  if c == 'a' { return 2 }
-  if c == 'A' { return 7 }
-  if c == 'D' { return 12 }
-  if c == 'u' { return 4 }
-  if c == 'N' { return 16 }
+  // Void is the ABSENCE of a result kind, not a member of the token
+  // vocabulary — tested before the shared table.
   if c == 'v' { return -1 }
-  if c == 's' { return 1 }
-  if c == 'n' { return 9 }
-  if c == 'V' {
-    return 8 // a concrete-variant result
-  }
-  if c == 'c' {
-    return 14 // a CLOSURE result (a function returning a function)
-  }
-  if c == 'r' {
-    return 5 // a REF-LIST result (`>r<slot>;` — struct / closure / union list)
-  }
-  -3
+  // ONE vocabulary with the encode sites: the token decodes through the
+  // canonical char→kind table (`repKindOfSigTok` — the inverse of the
+  // `repSigTokOfKind` the encoders read), then projects to this classifier
+  // web's raw-code convention (`repLegacyCodeOfKind`; -3 = no value-call
+  // sig). An encoder arm can no longer exist without its decoder twin.
+  repLegacyCodeOfKind(repKindOfSigTok(c))
 }
 
 // The ref-list SLOT of a `>r<slot>;` result key (the digits between `r` and `;`), or -1 when the
