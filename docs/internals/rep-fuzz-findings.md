@@ -138,11 +138,54 @@ contexts through a wrapper (`cannot assign {f: f64} to {f: f32}?` / `(i32) -> f6
 variant`) · plus the pre-expansion families above (nested arrays in composition, nullable lists in
 fields, struct through list/nullable-list).
 
+## FIXED — the i64 widening-seam families (small-literal rep vs an i64-demanding context)
+Three families shared one root: a small int literal's rep is decided by the LITERAL (i32) where the
+CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its seam, corpus-frozen:
+- **Small literal at a lambda return** (`const v: () => i64 = () => (5)`, all positions): the checker
+  seeded only the lambda's expected PARAMS; the body inferred `() => i32` and function-type
+  assignability covariantly widened the return — a rep change no function VALUE can adapt to (the
+  call site trusted the annotation's i64 result; the lambda's functype said i32). Fix: `seedExpected`
+  also records the expected RETURN and the lambda ADOPTS it when the body's numeric widens into it
+  (the literal then widens INSIDE the body at the return seam, `emitReturnValue`); numeric prims are
+  now INVARIANT inside function types (`fnSlotAssignable`), so the named-function-value spelling is a
+  clean reject. Also: the print-import scan matched only an EXACT `f64` annotation (i64/f32 used
+  substring match), so `() => f64`'s print routed to a non-existent import — now substring, which
+  incidentally fixed `p2r f64 | null`. Frozen: `closures/lambda-return-widens-{i64,f64}.vl`,
+  `types/fn-value-numeric-return-invariant.vl`. Graduated: `p1r () => i64`, `p3r () => i64`,
+  `p3r (() => i64)[]`, `p2r f64 | null`.
+- **Small literal in a union-VARIANT struct field** (`{f: 5}` into `{f: i64} | i32` — the live remnant
+  of the union-param family): `emitVariantStruct` threaded ref/string list kinds but not the scalar
+  f64/i64/f32 field coercions (codes 17/23/24) or the scalar-list element kinds (25/26/27) the plain
+  struct-literal path has. Fix: mirror that dispatch. Frozen: `unions/variant-field-scalar-widens.vl`.
+  (The original `useIt(5000000077)` into `p: f64 | i64` spelling already lowered correctly — the
+  scalar atom ladder in `emitUnionCoerce` widens; only the variant-struct boundary missed.)
+- **`is` mis-tags an i64 list built from small literals** (`i64[] | boolean = [670563]` — silent
+  wrong result): the checker types the member `i64[]`; `emitUnionCoerce` classified the literal's own
+  rep (`i32[]`) and tagged the box with it. The emitter was wrong — fix: an int-element list adopts
+  the union's `i64[]`/`f64[]` atom when `i32[]` is not a member, seeding `pendingListKind` so the
+  backing builds wide (elements widen at the store). Frozen: `unions/i64-list-union-is-tag.vl`
+  (behavioral `print`s prove `is` now matches). The f64[] READ side (`t[0]` on the narrowed atom)
+  stays a pre-existing clean reject ("index access but list type not collected").
+- **Map member in a union** (`({[string]: i32} | boolean)[]` — the related silent mis-tag): a map is
+  neither a struct variant nor a value atom, so `registerInlineUnion` silently SKIPPED the union
+  (`nameIsMap` even prefix-matched the union name and swallowed it down the map-value recursion) —
+  deeper seams then mis-tagged and every `is` missed. Fixed the wrong (emitter) side by failing
+  loudly, plus the checker capability floor (`tyHasMapUnion`, unsupported-lowering channel) so the
+  reject is positioned at the annotation. Frozen: `unions/map-union-member-reject.vl`. This turns the
+  construct-only `p2c (i32) => {[string]: f32} | {w: i32}` (previously passed unused) into a pinned
+  clean reject.
+
 ## Notes
 - The union `is`-oracle needs the decoy to NOT admit the carrier literal (see `pickAlt`); when
   adding decoy types, keep that invariant or the round-trip claims a bug the spec doesn't make.
 - The i32-only leaves of the OLD generator hid every family above — all of them involve i64/f32/
   boolean/atom leaves, maps, closures, or the param/return/global positions.
+- Discovered while triaging (NOT yet fixed): a PARENTHESIZED `is` condition defeats the emitter's
+  narrow rewrite — `if (x is i64) { print(x) }` over a value union emits the boxed read (invalid
+  wasm, `expected i64, found (ref $type)`); the un-parenthesized spelling lowers fine. The fuzzer
+  never parenthesizes, so no shape pins it.
+- Still failing (other agents' families, seen in the re-sweeps): `() => {f: i64}` closure-struct
+  sigs, `{[string]: {f: i64}}` map values, `i64[] | null` GLOBAL initializers.
 
 ## RESOLVED
 

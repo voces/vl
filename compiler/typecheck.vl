@@ -956,6 +956,33 @@ let cbExpOff: i32[] = []  // offset of its param-type run in `cbExpPool`
 let cbExpLen: i32[] = []  // run length (param count)
 let cbExpPool: i32[] = [] // flattened expected param-type arena indices
 
+// The contextual expected RETURN type per lambda node — the return-side dual of the
+// param seeding above. A lambda whose body infers a NARROWER numeric than the expected
+// return (`const v: () => i64 = () => (5)`) ADOPTS the expected return, so the widening
+// happens INSIDE the body at the return seam (where codegen inserts the convert) instead
+// of riding function-type variance, which has no adapter (see `fnSlotAssignable`).
+let cbExpRetNode: i32[] = []
+let cbExpRetTy: i32[] = []
+
+// Record `retTy` as the expected return type of the lambda at `nodeIx` (latest wins).
+function recordCbExpectedRet(nodeIx: i32, retTy: i32) {
+  cbExpRetNode.push(nodeIx)
+  cbExpRetTy.push(retTy)
+  0
+}
+
+// The expected return type recorded for the lambda at `nodeIx` — the LAST recorded one
+// (the real pass overrides the pre-inference pass), or -1 when none.
+function cbExpectedRetFor(nodeIx: i32) {
+  let found = -1
+  let i = 0
+  while i < cbExpRetNode.length {
+    if cbExpRetNode[i] == nodeIx { found = cbExpRetTy[i] }
+    i = i + 1
+  }
+  found
+}
+
 // Lambda nodes that are the init of an UN-annotated `const`/`let` binding (`const add = (a, b) =>
 // a + b`). Such a lambda's un-annotated params are inference HOLES — monomorphized per use exactly
 // like a named generic function (the emitter value-flow-monomorphizes them, env and all) — rather
@@ -1047,6 +1074,7 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
     if en.fnName == "" {
       if et is TyFunc {
         recordCbExpected(u, et.fnParamTypes)
+        recordCbExpectedRet(u, et.fnRet)
         // RECURSE into the lambda's BODY against the expected RESULT type — the dual of the
         // array/object recursion below. A curried `(a) => (b) => …` against `(i32) => ((i32) =>
         // i32)` then types its inner lambda's params from the result function type, at any depth.
@@ -1084,6 +1112,8 @@ export function initChecker() {
   cbExpOff = []
   cbExpLen = []
   cbExpPool = []
+  cbExpRetNode = []
+  cbExpRetTy = []
   valBindLambda = []
   T.tys = []
   T.scopes = []
@@ -3241,6 +3271,7 @@ function nameToTyAt(name: string, at: i32) {
   annotDiagAt = at
   const r = nameToTy(name)
   annotDiagAt = saved
+  floorMapUnion(r, at)
   r
 }
 
@@ -4391,6 +4422,19 @@ function isEquatable(ty: i32, seen: i32[]) {
 // value is assignable to a nullable when it is assignable to the inner type (or
 // is itself nullable). A union source is assignable when EVERY member is; a union
 // target accepts a source assignable to ANY member. Narrows `Ty` only.
+// A param/return SLOT of a function type: numeric prims are INVARIANT here. The numeric
+// widening lattice (`numWidensName`) holds for a VALUE flowing into a wider slot — codegen
+// converts at the boundary — but a function VALUE's wasm functype fixes each param/result
+// rep and no adapter thunk exists, so `() => i32` must not flow into a `() => i64` slot
+// (accepted, it emits an i32-result functype every i64-expecting call site mistrusts —
+// invalid wasm). A lambda LITERAL in that position still works: the checker seeds the
+// expected return (`recordCbExpectedRet`) and the body ADOPTS it, widening at its return
+// seam, so the lambda reaches this comparison already at the wider type.
+function fnSlotAssignable(src: i32, dst: i32) {
+  if numWidens(src, dst) { return false }
+  assignable(src, dst)
+}
+
 function assignable(src: i32, dst: i32) {
   if src < 0 || dst < 0 { return true }
   if src == dst { return true }
@@ -4522,9 +4566,9 @@ function assignableGo(src: i32, dst: i32) {
       const dp = d.fnParamTypes
       if sp.length != dp.length { return false }
       let i = 0
-      let ok = assignable(s.fnRet, d.fnRet)
+      let ok = fnSlotAssignable(s.fnRet, d.fnRet)
       while i < sp.length {
-        if !assignable(dp[i], sp[i]) { ok = false }
+        if !fnSlotAssignable(dp[i], sp[i]) { ok = false }
         i = i + 1
       }
       return ok
@@ -6049,6 +6093,56 @@ export function resolveAnnot(name: string, typarams: string[]) {
   r
 }
 
+// True when the resolved annotation type carries a UNION with a MAP member alongside
+// another non-null member (`{[string]: i32} | boolean`), at any nesting (a list element,
+// a map value, a closure param/return, an object field). Such a union has no lowering:
+// a map shape is neither a struct variant nor a value atom, so the emitter cannot
+// register it — deeper seams mis-tagged its box and every `is` silently missed. The
+// NULLABLE map (`{[string]: i32} | null`) is a niche ref, not a union — it parses to
+// `TyNullable`, so it never trips this. Depth-guarded against recursive aliases.
+function tyHasMapUnion(t: i32, depth: i32) {
+  if t < 0 || depth > 8 { return false }
+  const n = T.tys[t]
+  if n is TyUnion {
+    const ms = n.uMembers
+    let nonNull = 0
+    let hasMap = false
+    let i = 0
+    while i < ms.length {
+      if ms[i] != TY_NULL {
+        nonNull = nonNull + 1
+        const m = T.tys[ms[i]]
+        if m is TyMap { hasMap = true }
+      }
+      if tyHasMapUnion(ms[i], depth + 1) { return true }
+      i = i + 1
+    }
+    return hasMap && nonNull >= 2
+  }
+  if n is TyArray { return tyHasMapUnion(n.aElem, depth + 1) }
+  if n is TyNullable { return tyHasMapUnion(n.nInner, depth + 1) }
+  if n is TyMap { return tyHasMapUnion(n.mVal, depth + 1) }
+  if n is TyFunc {
+    const ps = n.fnParamTypes
+    let pi = 0
+    while pi < ps.length {
+      if tyHasMapUnion(ps[pi], depth + 1) { return true }
+      pi = pi + 1
+    }
+    return tyHasMapUnion(n.fnRet, depth + 1)
+  }
+  if n is TyObj {
+    const fts = n.objFieldTypes
+    let fi = 0
+    while fi < fts.length {
+      if tyHasMapUnion(fts[fi], depth + 1) { return true }
+      fi = fi + 1
+    }
+    return false
+  }
+  false
+}
+
 // `resolveAnnot` with resolution diagnostics anchored at node `at` (the
 // annotation's TypeRef) — see `annotDiagAt`.
 function resolveAnnotAt(name: string, typarams: string[], at: i32) {
@@ -6056,7 +6150,24 @@ function resolveAnnotAt(name: string, typarams: string[], at: i32) {
   annotDiagAt = at
   const r = resolveAnnot(name, typarams)
   annotDiagAt = saved
+  floorMapUnion(r, at)
   r
+}
+
+// The map-member-union capability floor (unsupported-lowering channel) — see
+// `tyHasMapUnion`. Called from both annotation resolvers (`nameToTyAt` for let/field
+// annotations, `resolveAnnotAt` for param/return annotations), anchored at the
+// annotation node; the emitter's registration reject backstops the seams no
+// annotation names (an inferred union).
+function floorMapUnion(r: i32, at: i32) {
+  if inferQuiet || r < 0 { return 0 }
+  if tyHasMapUnion(r, 0) {
+    tErrUnsupported(
+      "a union with a map member is type-valid but not yet supported by codegen — use a struct member instead",
+      at,
+    )
+  }
+  0
 }
 
 // Is `name` currently being inferred (on the in-progress stack)?
@@ -6729,6 +6840,19 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         )
       }
       inferred = TY_ERR
+    }
+    // CONTEXTUAL RETURN ADOPTION: an anonymous lambda whose body infers a NARROWER numeric
+    // than the contextual expected return (`const v: () => i64 = () => (5)`, an arg to a
+    // `p: () => i64` param, a `{f: () => i64}` field) takes the EXPECTED return as its own,
+    // so the widening lands at the lambda's return seam — where codegen inserts the convert
+    // (`emitReturnValue`) — and its emitted functype result matches every call site. Numeric
+    // widening through function-type VARIANCE is rejected instead (`fnSlotAssignable`): a
+    // function VALUE's rep is fixed, so the body is the only place the value can widen.
+    if n.fnName == "" && inferred >= 0 {
+      const expRet = cbExpectedRetFor(fnIx)
+      if expRet >= 0 {
+        if numWidens(inferred, expRet) { inferred = expRet }
+      }
     }
     // PERMISSIVE FALL-THROUGH (totality): an un-annotated function that can fall off the
     // end on some path implicitly yields `null` there, so its inferred return widens to
