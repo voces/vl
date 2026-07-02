@@ -149,6 +149,43 @@ passes `--color=auto|always|never` resolution into argv (it knows `isatty` +
 `NO_COLOR`), and the VL formatter honors the resolved flag — keeping the
 TTY-detection (mechanism) in the host and the ANSI rendering (policy) in VL.
 
+## `check --json` — machine-readable diagnostics
+
+`vl check <path> --json` replaces the pretty/concise stderr rendering with **one
+JSON array on a single stdout line** (via `CMD_PRINT_OUT`), so editors and CI
+consume diagnostics with `JSON.parse(stdout)` instead of screen-scraping. One
+object per diagnostic, in the same order the pretty renderer would print them
+(per file, position-sorted); an empty run (clean tree, or no `.vl` files found)
+still emits a parseable `[]`.
+
+```json
+[{"file":"src/a.vl","severity":"info","code":"prefer-const",
+  "line":3,"col":1,"endCol":4,
+  "message":"`x` is never reassigned; use `const` instead of `let`"}]
+```
+
+Fields:
+
+- `file` — the diagnostic's owning file: the imported module's path for a
+  graph-compile error, else the checked file (same resolution as the pretty
+  label).
+- `severity` — `"error" | "warning" | "info" | "hint"`.
+- `code` — the stable machine id: the lint rule id (`prefer-const`,
+  `unused-variable`, …) or `redundant-type` for the annotation hint. **Omitted**
+  for compile (parse/type/emit/resolution) errors — those carry no code.
+- `line` (1-based), `col` (1-based, inclusive), `endCol` (1-based, EXCLUSIVE —
+  `endCol - col` is the caret-span length, ≥ 1). All three **omitted** for a
+  positionless diagnostic.
+- `message` — the diagnostic text, unstyled.
+
+Semantics shared with the human renderers, unchanged: `--severity` sets both the
+display floor and the exit gate exactly as in pretty mode, and the exit codes are
+identical (0 clean, 1 gating diagnostics, 2 usage/read error — usage and
+cannot-read errors keep their stderr message and emit no JSON). ANSI is never
+emitted in `--json` mode regardless of the host-resolved `--color`; the human
+summary line is suppressed (stderr keeps only notes like the `--fix` count, so
+stdout stays pure JSON).
+
 ## defaultScope, std, and sync
 
 Three layers, kept distinct:
