@@ -421,6 +421,9 @@ import {
   gEmitNames,
   gF32PrintIdx,
   gF64PrintIdx,
+  gHelpStrConcat,
+  gHelpStrEq,
+  gHelpStrHash,
   gImports,
   gMemLogIdx,
   gNeedsF32Print,
@@ -7399,7 +7402,8 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
 // touches a map reserves a 14-slot scratch frame (`mapScratchBase` + 0..13):
 //   +0  mapRef : (ref $mStructIdx)  — the map value
 //   +1  keyRef : (ref $aTypeIdx)    — the target key string
-//   +2  curRef : (ref $aTypeIdx)    — the current probed key string
+//   +2  curRef : (ref $aTypeIdx)    — spare (the probed-key compare rides the
+//                                     wasm stack into the shared `__str_eq__`)
 //   +3  slot   : i32                — probe slot offset into `index`
 //   +4  cap    : i32                — index length / newCap (resize)
 //   +5  entry  : i32                — index[slot] (entry+1; 0 = miss)
@@ -7849,103 +7853,12 @@ function pushMapHashes(body: i32[]) {
   0
 }
 
-// Element-wise string equality of the two refs in map scratch slots `aSlot`/`bSlot`,
-// leaving a 0/1 on the stack. A SELF-CONTAINED port of `emitStrEq`'s compare core
-// (no operands consumed; reads the two scratch string locals directly) so the map
-// scan can compare a stored key against the target key WITHOUT the str-op frame.
-function emitMapKeyEq(body: i32[], aSlot: i32, bSlot: i32) {
-  // block i32 { ... } — yields the 0/1 result.
-  fbBlock(127) // 0x02 block, 0x7f i32 blocktype
-  // if len(A) != len(B) { push 0 ; br 1 }
-  pushMapScr(body, aSlot)
-  fbArrayLen()  // array.len(A)
-  pushMapScr(body, bSlot)
-  fbArrayLen()  // array.len(B)
-  fbI32Bin(71)  // 0x47 i32.ne
-  fbIf(64)      // 0x04 if, 0x40 void blocktype
-  fbI32Const(0) // i32.const 0
-  fbBr(1)       // 0x0c br depth 1 → out of the i32 block
-  fbEnd()       // 0x0b end (if)
-  // I = 0  (slot 8, the dedicated char cursor — distinct from the OUTER scan's `idx`
-  // in slot 3, which must survive across the key compare to set `hit = idx`)
-  fbI32Const(0)
-  setMapScr(body, 8)
-  // loop { if I >= len(A) {} else { A[I] != B[I] ? 0,br : I++ , br loop } }
-  fbLoop(64)          // 0x03 loop, 0x40 void blocktype
-  pushMapScr(body, 8) // I
-  pushMapScr(body, aSlot)
-  fbArrayLen()        // array.len(A)
-  fbI32Bin(78)        // 0x4e i32.ge_s  (I >= len → done)
-  fbIf(64)            // 0x04 if, void
-  // then: done (empty)
-  fbElse() // 0x05 else
-  // A[I] != B[I] ?
-  pushMapScr(body, aSlot)
-  pushMapScr(body, 8)
-  fbArrayGet(aTypeIdx) // array.get
-  pushMapScr(body, bSlot)
-  pushMapScr(body, 8)
-  fbArrayGet(aTypeIdx) // array.get
-  fbI32Bin(71)         // 0x47 i32.ne
-  fbIf(64)             // 0x04 if (mismatch → 0, exit block), void
-  fbI32Const(0)        // i32.const 0
-  fbBr(3)              // 0x0c br depth 3 → out of: if(0)·else(1)·loop(2)·block(3)
-  fbEnd()              // 0x0b end (mismatch if)
-  // I = I + 1
-  pushMapScr(body, 8)
-  fbI32Const(1)
-  fbI32Bin(106) // i32.add
-  setMapScr(body, 8)
-  fbBr(1)       // 0x0c br depth 1 → loop header
-  fbEnd()       // 0x0b end (ge_s if)
-  fbEnd()       // 0x0b end (loop)
-  // All chars matched → 1.
-  fbI32Const(1)
-  fbEnd() // 0x0b end (block)
-  0
-}
-
 // FNV-1a hash of the string in scratch slot `strSlot`, leaving a NON-NEGATIVE i32
-// hash on the stack. `h = 2166136261; for c in str { h = (h ^ c) * 16777619 };
-// h & 0x7fffffff`. Uses slot 9 (accumulator `h`) and slot 8 (char cursor `i`). The
-// 32-bit wasm `i32.mul` wraps exactly as the host's hash does.
+// hash on the stack — a `call` into the shared `__str_hash__` helper (the loop
+// lives once per module, `emitStrHashFnCode`).
 function emitMapHashOf(body: i32[], strSlot: i32) {
-  // h = 2166136261 (0x811c9dc5 — the FNV offset basis, as a signed i32 constant).
-  fbI32Const(-2128831035) // i32.const; 2166136261 as signed = -2128831035
-  setMapScr(body, 9)      // h
-  // i = 0
-  fbI32Const(0)
-  setMapScr(body, 8) // i
-  // loop { if i >= len(str) {} else { h = (h ^ str[i]) * 16777619 ; i++ ; br } }
-  fbLoop(64)          // 0x03 loop, void
-  pushMapScr(body, 8) // i
   pushMapScr(body, strSlot)
-  fbArrayLen()        // array.len
-  fbI32Bin(78)        // i32.ge_s (i >= len → done)
-  fbIf(64)            // if, void
-  // then: done (empty)
-  fbElse() // else
-  // h = (h ^ str[i]) * 16777619
-  pushMapScr(body, 9)  // h
-  pushMapScr(body, strSlot)
-  pushMapScr(body, 8)  // i
-  fbArrayGet(aTypeIdx) // array.get
-  fbI32Bin(115)        // 0x73 i32.xor
-  fbI32Const(16777619) // i32.const 16777619
-  fbI32Bin(108)        // 0x6c i32.mul
-  setMapScr(body, 9)   // h
-  // i = i + 1
-  pushMapScr(body, 8)
-  fbI32Const(1)
-  fbI32Bin(106) // i32.add
-  setMapScr(body, 8)
-  fbBr(1)       // br → loop header
-  fbEnd()       // end (ge_s if)
-  fbEnd()       // end (loop)
-  // h & 0x7fffffff  — force non-negative (left on the stack).
-  pushMapScr(body, 9)
-  fbI32Const(2147483647) // i32.const 0x7fffffff
-  fbI32Bin(113)          // 0x71 i32.and
+  fbCall(gHelpStrHash)
   0
 }
 
@@ -7992,9 +7905,9 @@ function emitMapProbe(body: i32[]) {
   fbI32Eqz() // i32.eqz
   fbBrIf(1)  // 0x0d br_if depth 1 → out of the probe block
   // Match test, yielding 0/1 on the stack: hashes[entry-1] == keyHash
-  //   && live[entry-1] != 0 && keyEq(keys[entry-1], keyRef). `i32.and` is
-  //   unconditional, so the expensive `keyEq` rides an `if` to keep it off the
-  //   mismatch path (mirrors the host's guarded `keyEq`).
+  //   && live[entry-1] != 0 && __str_eq__(keys[entry-1], keyRef). `i32.and` is
+  //   unconditional, so the expensive string compare rides an `if` to keep it off
+  //   the mismatch path (mirrors the host's guarded `keyEq`).
   // hashes[entry-1] == keyHash
   pushMapHashes(body)
   pushMapScr(body, 5)  // entry
@@ -8012,18 +7925,18 @@ function emitMapProbe(body: i32[]) {
   fbI32Const(0)
   fbI32Bin(71)         // 0x47 i32.ne (live != 0)
   fbI32Bin(113)        // 0x71 i32.and (hash-match AND live)
-  // ? keyEq(keys[entry-1], keyRef) : 0   — a value-typed if yielding i32.
-  fbIf(127) // 0x04 if, 0x7f i32 blocktype
-  // curRef = keys.backing[entry-1]  (ref.as_non_null — a stored slot is populated)
+  // ? __str_eq__(keys.backing[entry-1], keyRef) : 0 — a value-typed if yielding
+  // i32; the stored key rides the wasm stack straight into the shared helper.
+  fbIf(127)                 // 0x04 if, 0x7f i32 blocktype
   pushMapKeys(body)
   fbStructGet(mkListIdx, 0) // field 0: backing
   pushMapScr(body, 5)       // entry
   fbI32Const(1)
   fbI32Bin(107)             // 0x6b i32.sub  (entry - 1)
   fbArrayGet(mkArrIdx)      // array.get
-  wU8(212)                  // 0xd4 ref.as_non_null
-  setMapScr(body, 2)        // curRef
-  if emitMapKeyEq(body, 2, 1) < 0 { return -1 }
+  fbRefAsNonNull()          // a stored slot is populated
+  pushMapScr(body, 1)       // keyRef
+  fbCall(gHelpStrEq)
   fbElse()                  // else
   fbI32Const(0)             // hash/live mismatch → not a hit
   fbEnd()                   // end (if)
@@ -9608,43 +9521,13 @@ function emitStrConcat(body: i32[], binIx: i32, fnIx: i32) {
   }
   const e = P.nodes[binIx]
   if e is BinExpr {
-    // Eval BOTH operands onto the stack first (nested string ops complete here),
-    // then pop into the scratch refs (B first — it is on top). A literal-union atom
-    // operand widens to its member string (`emitStrValue`) before the scratch stash.
+    // Eval BOTH operands onto the stack (nested string ops complete here) and call
+    // the shared `__str_concat__` helper — the allocate+copy core lives once per
+    // module (`emitStrConcatFnCode`). A literal-union atom operand widens to its
+    // member string (`emitStrValue`) before the call.
     if emitStrValue(body, e.binLeft, fnIx) < 0 { return -1 }
     if emitStrValue(body, e.binRight, fnIx) < 0 { return -1 }
-    fbLocalSet(strScratchBase + 1) // local.set strScrB
-    fbLocalSet(strScratchBase + 0) // local.set strScrA
-    // I0 = lenA = array.len(A)
-    pushStrScrRef(body, 0)
-    fbArrayLen() // 0xfb 0x0f array.len
-    setStrScrI(body, 0)
-    // I1 = lenB = array.len(B)
-    pushStrScrRef(body, 1)
-    fbArrayLen() // array.len
-    setStrScrI(body, 1)
-    // Out = array.new_default $aTypeIdx (lenA + lenB)
-    pushStrScrI(body, 0)
-    pushStrScrI(body, 1)
-    fbI32Bin(106)                  // 0x6a i32.add
-    fbArrayNewDefault(aTypeIdx)    // 0xfb 0x07 array.new_default <typeidx>
-    fbLocalSet(strScratchBase + 2) // local.set strScrOut
-    // array.copy Out 0 A 0 lenA
-    pushStrScrRef(body, 2)          // dest
-    fbI32Const(0)                   // i32.const 0 (dest offset)
-    pushStrScrRef(body, 0)          // src A
-    fbI32Const(0)                   // i32.const 0 (src offset)
-    pushStrScrI(body, 0)            // count lenA
-    fbArrayCopy(aTypeIdx, aTypeIdx) // 0xfb 0x11 array.copy (dest type, src type)
-    // array.copy Out lenA B 0 lenB
-    pushStrScrRef(body, 2)          // dest
-    pushStrScrI(body, 0)            // dest offset = lenA
-    pushStrScrRef(body, 1)          // src B
-    fbI32Const(0)                   // i32.const 0 (src offset)
-    pushStrScrI(body, 1)            // count lenB
-    fbArrayCopy(aTypeIdx, aTypeIdx) // array.copy (dest type, src type)
-    // Result: the new string ref.
-    pushStrScrRef(body, 2)
+    fbCall(gHelpStrConcat)
     return 0
   }
   emitFail("emitProgram: expected a string concatenation")
@@ -9804,62 +9687,11 @@ function emitStrLessCore(body: i32[]) {
 
 // The string value-equality CORE: expects the two string refs already ON THE
 // STACK (left below right), leaves the 0/1 result. Shared by `emitStrEq` and the
-// struct-equality field compare (which pushes field chains as operands).
+// struct-equality field compare (which pushes field chains as operands). A single
+// `call` — the element loop lives in the shared `__str_eq__` helper, emitted once
+// per module (`emitStrEqFnCode`).
 function emitStrEqCore(body: i32[]) {
-  if true {
-    fbLocalSet(strScratchBase + 1) // local.set strScrB
-    fbLocalSet(strScratchBase + 0) // local.set strScrA
-    // block i32 { ... }  — yields the 0/1 result.
-    fbBlock(127) // 0x02 block, 0x7f i32 blocktype
-    // I0 = len(A)
-    pushStrScrRef(body, 0)
-    fbArrayLen() // array.len
-    setStrScrI(body, 0)
-    // if I0 != len(B) { push 0 ; br 0 (out of block) }
-    pushStrScrI(body, 0)
-    pushStrScrRef(body, 1)
-    fbArrayLen()  // array.len(B)
-    fbI32Bin(71)  // 0x47 i32.ne
-    fbIf(64)      // 0x04 if, 0x40 void blocktype
-    fbI32Const(0) // i32.const 0
-    fbBr(1)       // 0x0c br depth 1 → out of the i32 block (this `if` is depth 0)
-    fbEnd()       // 0x0b end (if)
-    // I1 = 0
-    fbI32Const(0)
-    setStrScrI(body, 1)
-    // loop (void) { if I1 >= I0 {} else { compare; I1++; br loop } }
-    fbLoop(64)           // 0x03 loop, 0x40 void blocktype
-    pushStrScrI(body, 1) // I1
-    pushStrScrI(body, 0) // I0
-    fbI32Bin(78)         // 0x4e i32.ge_s  (I1 >= I0 → done)
-    fbIf(64)             // 0x04 if, 0x40 void blocktype
-    // then: done — fall through (empty)
-    fbElse() // 0x05 else
-    // A[I1] != B[I1] ?
-    pushStrScrRef(body, 0)
-    pushStrScrI(body, 1)
-    fbArrayGet(aTypeIdx) // 0xfb 0x0b array.get
-    pushStrScrRef(body, 1)
-    pushStrScrI(body, 1)
-    fbArrayGet(aTypeIdx) // array.get
-    fbI32Bin(71)         // 0x47 i32.ne
-    fbIf(64)             // 0x04 if (mismatch → 0, exit block), 0x40 void blocktype
-    fbI32Const(0)        // i32.const 0
-    fbBr(3)              // 0x0c br depth 3 → out of: if(0)·else(1)·loop(2)·block(3)
-    fbEnd()              // 0x0b end (mismatch if)
-    // I1 = I1 + 1
-    pushStrScrI(body, 1)
-    fbI32Const(1)
-    fbI32Bin(106) // i32.add
-    setStrScrI(body, 1)
-    fbBr(1)       // 0x0c br depth 1 → back to the loop header (else=0, loop=1)
-    fbEnd()       // 0x0b end (else's if — i.e. the ge_s if)
-    fbEnd()       // 0x0b end (loop)
-    // Every element matched → 1.
-    fbI32Const(1) // i32.const 1
-    fbEnd()       // 0x0b end (block) — leaves the 0/1 result
-    return 0
-  }
+  fbCall(gHelpStrEq)
   0
 }
 
@@ -17647,6 +17479,171 @@ function emitMemLogFnCode(out: i32[]) {
   0
 }
 
+// ── shared runtime helper BODIES (module-tail functions) ──────────────────────
+// Each body below is the once-per-module copy of machinery every lowering site
+// used to inline (see `gHelpStrHash` & co. in emit_state). Hand-rolled like the
+// `__log__` decoder above: a locals vector, then straight `fb*` opcodes against
+// wasm param/local indices (no scratch-frame indirection — params ARE the frame).
+
+// Frame a finished helper body (locals vec + code already in `body`) onto `out`.
+function helpFrameBody(out: i32[], body: i32[]) {
+  const outPrev = wTarget(out)
+  wULEB(body.length)
+  wBytes(body)
+  wTarget(outPrev)
+  0
+}
+
+// `__str_hash__(s) -> i32`: the masked non-negative FNV-1a hash of a string —
+// `h = 2166136261; for c in s { h = (h ^ c) * 16777619 }; h & 0x7fffffff`. The
+// 32-bit wasm `i32.mul` wraps exactly as the host's hash does. Params: s(0).
+// Locals: h(1), i(2).
+function emitStrHashFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(1)                // 1 locals run
+  wULEB(2)                // count 2
+  wU8(127)                // 0x7f i32
+  fbI32Const(-2128831035) // 2166136261 as signed (the FNV offset basis)
+  fbLocalSet(1)           // h
+  fbI32Const(0)
+  fbLocalSet(2)           // i = 0
+  fbLoop(64)              // loop, void
+  fbLocalGet(2)           // i
+  fbLocalGet(0)           // s
+  fbArrayLen()
+  fbI32Bin(78)            // 0x4e i32.ge_s (i >= len → done)
+  fbIf(64)                // then: done (empty)
+  fbElse()
+  // h = (h ^ s[i]) * 16777619
+  fbLocalGet(1)
+  fbLocalGet(0)
+  fbLocalGet(2)
+  fbArrayGet(aTypeIdx)
+  fbI32Bin(115) // 0x73 i32.xor
+  fbI32Const(16777619)
+  fbI32Bin(108) // 0x6c i32.mul
+  fbLocalSet(1)
+  // i = i + 1
+  fbLocalGet(2)
+  fbI32Const(1)
+  fbI32Bin(106) // i32.add
+  fbLocalSet(2)
+  fbBr(1)       // → loop header
+  fbEnd()       // end (ge_s if)
+  fbEnd()       // end (loop)
+  // h & 0x7fffffff — force non-negative (the result).
+  fbLocalGet(1)
+  fbI32Const(2147483647)
+  fbI32Bin(113) // 0x71 i32.and
+  fbEnd()       // end (function) — leaves the i32 result
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// `__str_eq__(a, b) -> i32`: element-wise string value-equality — 0 if the lengths
+// differ or any code point differs, else 1. Params: a(0), b(1). Locals: n(2), i(3).
+function emitStrEqFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(1)     // 1 locals run
+  wULEB(2)     // count 2
+  wU8(127)     // 0x7f i32
+  fbBlock(127) // block i32 — yields the 0/1 result
+  // n = len(a) ; if n != len(b) { 0 ; br out }
+  fbLocalGet(0)
+  fbArrayLen()
+  fbLocalSet(2) // n
+  fbLocalGet(2)
+  fbLocalGet(1)
+  fbArrayLen()
+  fbI32Bin(71)  // 0x47 i32.ne
+  fbIf(64)      // if, void
+  fbI32Const(0)
+  fbBr(1)       // → out of the i32 block
+  fbEnd()
+  // i = 0
+  fbI32Const(0)
+  fbLocalSet(3)
+  fbLoop(64)   // loop, void
+  fbLocalGet(3)
+  fbLocalGet(2)
+  fbI32Bin(78) // i32.ge_s (i >= n → done)
+  fbIf(64)     // then: done (empty)
+  fbElse()
+  // if a[i] != b[i] { 0 ; br out }
+  fbLocalGet(0)
+  fbLocalGet(3)
+  fbArrayGet(aTypeIdx)
+  fbLocalGet(1)
+  fbLocalGet(3)
+  fbArrayGet(aTypeIdx)
+  fbI32Bin(71) // i32.ne
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(3)      // → out of: if(0)·else(1)·loop(2)·block(3)
+  fbEnd()
+  // i = i + 1
+  fbLocalGet(3)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(3)
+  fbBr(1)       // → loop header
+  fbEnd()       // end (ge_s if/else)
+  fbEnd()       // end (loop)
+  fbI32Const(1) // every element matched
+  fbEnd()       // end (block)
+  fbEnd()       // end (function) — leaves the 0/1 result
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// `__str_concat__(a, b) -> (ref str)`: allocate a fresh `lenA + lenB` string and
+// `array.copy` both operands in. Params: a(0), b(1). Locals: lenA(2), lenB(3) i32;
+// out(4) a NON-NULL `(ref $aTypeIdx)` (set before every read — validation accepts
+// a non-defaultable local under init tracking).
+function emitStrConcatFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(2) // 2 locals runs
+  wULEB(2) // count 2
+  wU8(127) // 0x7f i32 (lenA, lenB)
+  wULEB(1) // count 1
+  wU8(100) // 0x64 (ref $aTypeIdx) — out
+  wSLEB(aTypeIdx)
+  // lenA = len(a) ; lenB = len(b)
+  fbLocalGet(0)
+  fbArrayLen()
+  fbLocalSet(2)
+  fbLocalGet(1)
+  fbArrayLen()
+  fbLocalSet(3)
+  // out = array.new_default $aTypeIdx (lenA + lenB)
+  fbLocalGet(2)
+  fbLocalGet(3)
+  fbI32Bin(106) // i32.add
+  fbArrayNewDefault(aTypeIdx)
+  fbLocalSet(4)
+  // array.copy out 0 a 0 lenA
+  fbLocalGet(4)
+  fbI32Const(0)
+  fbLocalGet(0)
+  fbI32Const(0)
+  fbLocalGet(2)
+  fbArrayCopy(aTypeIdx, aTypeIdx)
+  // array.copy out lenA b 0 lenB
+  fbLocalGet(4)
+  fbLocalGet(2)
+  fbLocalGet(1)
+  fbI32Const(0)
+  fbLocalGet(3)
+  fbArrayCopy(aTypeIdx, aTypeIdx)
+  fbLocalGet(4)
+  fbEnd() // end (function) — leaves the fresh string ref
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
 // Emit the wasm "name" custom section (section id 0, name "name") so a wasmtime
 // trap backtrace shows real function names instead of `<wasm function N>`. GATED
 // on `gEmitNames` — a no-op when off, so the default emit path (goldens +
@@ -17671,6 +17668,7 @@ function emitNameSection(n: i32) {
   const fnameMap: i32[] = []
   const mapPrev = wTarget(fnameMap)
   let count = gImports + n
+  if gHelpStrHash >= 0 { count = count + 3 }
   wULEB(count)
   if gImports > 0 {
     wULEB(0)
@@ -17708,6 +17706,16 @@ function emitNameSection(n: i32) {
       if disp.length > 0 { wName(disp) } else { wName(fn.fnName) }
     }
     fi = fi + 1
+  }
+  // The shared runtime helpers (module-tail indices — after the start fn and the
+  // `__log__` decoder, so the namemap stays strictly increasing).
+  if gHelpStrHash >= 0 {
+    wULEB(gHelpStrHash)
+    wName("__str_hash__")
+    wULEB(gHelpStrEq)
+    wName("__str_eq__")
+    wULEB(gHelpStrConcat)
+    wName("__str_concat__")
   }
   wTarget(mapPrev)
 
@@ -17777,6 +17785,27 @@ function emitModule(stmts: i32[]) {
   if memLogUsed { memFn = 1 }
   gMemLogIdx = gImports + n + hasStart
 
+  // ── shared runtime helpers (module-tail functions) ───────────────────────────
+  // Assign each enabled helper the NEXT function index after the start fn and the
+  // `__log__` decoder (so no other index shifts), in a FIXED order (string hash /
+  // eq / concat) keyed only on the type-presence flag — deterministic per program,
+  // so the self-compile fixpoint converges. The trio rides `aUsed` (the string
+  // array type exists); an enabled-but-uncalled helper costs a few dozen bytes,
+  // never correctness.
+  gHelpStrHash = -1
+  gHelpStrEq = -1
+  gHelpStrConcat = -1
+  let nHelpers = 0
+  const helpBase = gImports + n + hasStart + memFn
+  if aUsed {
+    gHelpStrHash = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpStrEq = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpStrConcat = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+
   // Heap-type indices, in type-section order: standalone structs at 0..ns-1, then
   // (for the union path) the variant structs + box, then the raw i32 array, the
   // i32-list wrapper, each ref-list (backing, wrapper) pair, the string-list
@@ -17828,11 +17857,11 @@ function emitModule(stmts: i32[]) {
     nPrintTypes = nPrintTypes + 1 // + (f32)->() for __print_f32__
   }
 
-  emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes)
+  emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
 
   emitImportSection(n, typeOffset, hasStart)
 
-  emitFunctionSection(n, typeOffset, hasStart, memFn, nPrintTypes)
+  emitFunctionSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
 
   // Memory section (id 5, between function (3) and global (6)): ONE module-DEFINED
   // memory, min 1 page (64 KiB — ample for the corpus' tag/value scratch region), no
@@ -17888,7 +17917,7 @@ function emitModule(stmts: i32[]) {
     wSection(9, elemPayload)
   }
 
-  if emitCodeSection(n, hasStart, memFn) < 0 { return -1 }
+  if emitCodeSection(n, hasStart, memFn, nHelpers) < 0 { return -1 }
 
   // Custom "name" section LAST (after the code section, where it conventionally
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is
@@ -28910,6 +28939,38 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   return emitFail("emitProgram: `??` is only supported on a map index get")
 }
 
+// Emit one shared-runtime-helper FUNCTYPE (`0x60 func`, params, results) onto the
+// current buffer. `params`/`res` are valtype descriptor strings, one char per slot:
+// 'i' = i32 (`0x7f`), 'a' = a non-null `(ref $aTypeIdx)` string/i32-array ref,
+// 'm' = a non-null `(ref $mkArrIdx)` string-list backing ref.
+function helpFuncType(params: string, res: string) {
+  wU8(96) // 0x60 func
+  wULEB(params.length)
+  let i = 0
+  while i < params.length {
+    helpValtype(params[i])
+    i = i + 1
+  }
+  wULEB(res.length)
+  let j = 0
+  while j < res.length {
+    helpValtype(res[j])
+    j = j + 1
+  }
+  0
+}
+
+// One descriptor char (see `helpFuncType`) as a valtype.
+function helpValtype(c: i32) {
+  if c == 'i' {
+    wU8(127) // 0x7f i32
+    return 0
+  }
+  wU8(100) // 0x64 (ref ht) — non-null
+  if c == 'm' { wSLEB(mkArrIdx) } else { wSLEB(aTypeIdx) }
+  0
+}
+
 // Type section (id 1): all WasmGC types in ONE recursion group, followed by the
 // standalone print/(log) functypes. Extracted verbatim from emitModule (C3); see the
 // inline comments below for the per-type framing. The rec-group count excludes the
@@ -28920,15 +28981,16 @@ function emitTypeSection(
   hasStart: i32,
   memFn: i32,
   nPrintTypes: i32,
+  nHelpers: i32,
 ) {
   const typePayload: i32[] = []
   // Bind the writer at `typePayload` for the WHOLE type-section payload build, so the
   // raw framing bytes, `pushFieldStorage`, and `fbValtype` all stream to `curBuf ==
   // typePayload` identically. Restored just before `wSection` frames it (below).
   const tyPrev = wTarget(typePayload)
-  wULEB(1 + nPrintTypes + memFn)   // rectypes: the rec group + the standalone print/(log) functypes
-  wU8(78)                          // 0x4e rec group
-  wULEB(n + typeOffset + hasStart) // types inside the rec group (print functypes excluded)
+  wULEB(1 + nPrintTypes + memFn + nHelpers) // rectypes: the rec group + the standalone print/(log)/helper functypes
+  wU8(78)                                   // 0x4e rec group
+  wULEB(n + typeOffset + hasStart)          // types inside the rec group (print functypes excluded)
   if sDeclared {
     // One `0x5f` struct per declared type (declaration order = heap-type index),
     // each a struct of its fields in declaration order. A field is `0x7f` i32
@@ -29405,6 +29467,17 @@ function emitTypeSection(
     wU8(127) // 0x7f i32 (length)
     wU8(0)   // 0 results
   }
+  // The shared-runtime-helper functypes, standalone LAST (after every print/(log)
+  // functype) in helper-index order, so no existing functype index shifts. Each may
+  // reference earlier rec-group types (`$aTypeIdx` / `$mkArrIdx`) — a later rectype
+  // referencing an earlier type index is always valid. A helper's functype index is
+  // `typeOffset + n + hasStart + nPrintTypes + memFn + <its order>` (see
+  // `emitFunctionSection`).
+  if gHelpStrHash >= 0 {
+    helpFuncType("a", "i")  // __str_hash__: (str) -> i32
+    helpFuncType("aa", "i") // __str_eq__: (str, str) -> i32
+    helpFuncType("aa", "a") // __str_concat__: (str, str) -> (ref str)
+  }
   wTarget(tyPrev)
   wSection(1, typePayload)
   0
@@ -29486,13 +29559,14 @@ function emitFunctionSection(
   hasStart: i32,
   memFn: i32,
   nPrintTypes: i32,
+  nHelpers: i32,
 ) {
   // Function section (id 3): N functions; func i uses functype `typeOffset + i`. The
   // synthetic start function (if any) is the LAST entry — function index `n` — using
   // the `()->()` functype at index `typeOffset + n`.
   const funcPayload: i32[] = []
   const fnPrev = wTarget(funcPayload)
-  wULEB(n + hasStart + memFn)
+  wULEB(n + hasStart + memFn + nHelpers)
   let fi = 0
   while fi < n {
     // A function whose env-leading signature matches an interned `$fnsig` is declared
@@ -29513,6 +29587,15 @@ function emitFunctionSection(
     // The synthetic `__log__` decoder uses the standalone `(i32,i32)->()` functype
     // emitted after the print functypes.
     wULEB(typeOffset + n + hasStart + nPrintTypes)
+  }
+  // The shared runtime helpers, each on its own standalone functype (emitted after
+  // the `__log__` functype in the SAME helper order, so functype k belongs to
+  // helper k).
+  const helpTyBase = typeOffset + n + hasStart + nPrintTypes + memFn
+  let hi = 0
+  while hi < nHelpers {
+    wULEB(helpTyBase + hi)
+    hi = hi + 1
   }
   wTarget(fnPrev)
   wSection(3, funcPayload)
@@ -29712,12 +29795,13 @@ function emitExportSection(n: i32) {
 
 // Code section (id 10), extracted verbatim from emitModule (C3). Returns -1 if any
 // function body fails to emit (propagated by the caller), else 0.
-function emitCodeSection(n: i32, hasStart: i32, memFn: i32) {
+function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
   // Code section (id 10): one size-prefixed body per function, in index order, then
-  // (if any) the synthetic start function's body LAST.
+  // (if any) the synthetic start function's body, the `__log__` decoder's, and the
+  // shared-runtime-helper bodies LAST (in helper-index order).
   const codePayload: i32[] = []
   const codePrev = wTarget(codePayload)
-  wULEB(n + hasStart + memFn)
+  wULEB(n + hasStart + memFn + nHelpers)
   wTarget(codePrev)
   let ci = 0
   while ci < n {
@@ -29729,6 +29813,11 @@ function emitCodeSection(n: i32, hasStart: i32, memFn: i32) {
   }
   if memLogUsed {
     if emitMemLogFnCode(codePayload) < 0 { return -1 }
+  }
+  if gHelpStrHash >= 0 {
+    if emitStrHashFnCode(codePayload) < 0 { return -1 }
+    if emitStrEqFnCode(codePayload) < 0 { return -1 }
+    if emitStrConcatFnCode(codePayload) < 0 { return -1 }
   }
   wSection(10, codePayload)
   0
