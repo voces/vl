@@ -234,7 +234,17 @@ export type Ty = TyPrim |
 // line, 0-based column — the lexer's convention), resolved by `tErr` through the
 // `nodeToks` side table at raise time; `tline == 0` means "no position" (the
 // node had no token mapping), in which case the diagnostic renders bare.
-type TDiag = { tmsg: string, tat: i32, tline: i32, tcol: i32 }
+// `tcode` is the stable CATEGORY code: "" for a type-soundness rejection (the
+// default), or `CODE_UNSUPPORTED_LOWERING` for a program the type system
+// accepts but codegen cannot lower yet (see `tErrUnsupported`).
+type TDiag = { tmsg: string, tat: i32, tline: i32, tcol: i32, tcode: string }
+
+// The stable category code for EMITTER-CAPABILITY rejections: the construct is
+// type-valid, but codegen cannot lower it yet. Machine-distinguishable from a
+// type-soundness verdict (the LSP/tooling read it via `diagCodeLen`/
+// `diagCodeByte`), yet still an error — a program that cannot build must not
+// pass `vl check`.
+const CODE_UNSUPPORTED_LOWERING = "unsupported-lowering"
 
 // ── Checker state (one struct, held in the global `T`) ───────────────────────
 // `tys`     — the type arena (every type is an index into it).
@@ -2560,7 +2570,21 @@ export function lookup(name: string) {
 // builds `P.nodes` by hand (or resets it without resetting `nodeToks`) yields
 // an out-of-range index, which degrades to "no position" (`tline == 0`), never
 // a trap.
-export function tErr(msg: string, at: i32) {
+export function tErr(msg: string, at: i32) { tErrCoded(msg, at, "") }
+
+// The EMITTER-CAPABILITY channel: raise an error for a construct the type
+// system ACCEPTS but codegen cannot lower yet, under the stable
+// `unsupported-lowering` category code. Keeps codegen maturity out of the type
+// system's verdict vocabulary: a `tErr` says "this program is type-invalid", a
+// `tErrUnsupported` says "this program is type-valid but cannot build". Both
+// are errors (an unbuildable program must not pass), but tooling can tell them
+// apart by code. Message convention: name the type-valid construct, then the
+// workaround after an em dash.
+function tErrUnsupported(msg: string, at: i32) {
+  tErrCoded(msg, at, CODE_UNSUPPORTED_LOWERING)
+}
+
+function tErrCoded(msg: string, at: i32, code: string) {
   let ln = 0
   let co = 0
   if at >= 0 && at < nodeToks.length {
@@ -2571,7 +2595,7 @@ export function tErr(msg: string, at: i32) {
       co = t.col
     }
   }
-  T.diags.push({ tmsg: msg, tat: at, tline: ln, tcol: co })
+  T.diags.push({ tmsg: msg, tat: at, tline: ln, tcol: co, tcode: code })
   0
 }
 
@@ -5632,13 +5656,16 @@ function checkCallNode(n: Call, ix: i32) {
         const pt = checkNode(pargs[pj])
         // `print` renders ONE scalar/string rep at runtime; a BOXED value-union (`i32 |
         // string` — `≥2` distinct value atoms) has no fixed rep, so emit cannot lower
-        // `print(<union>)` (it produced invalid wasm). Reject it cleanly — the union must be
-        // narrowed with `is` first. `valueUnionRetName` is the exact boxing gate: it stays ""
-        // for a same-rep literal union (`0 | 1` is plain i32) and for `never` (empty), so
-        // those still print.
+        // `print(<union>)` (it produced invalid wasm). An emitter-capability rejection,
+        // not a type error — the union must be narrowed with `is` first.
+        // `valueUnionRetName` is the exact boxing gate: it stays "" for a same-rep
+        // literal union (`0 | 1` is plain i32) and for `never` (empty), so those still
+        // print.
         if valueUnionRetName(pt) != "" {
-          tErr(
-            "print does not accept a union value — narrow it first, e.g. `if v is i32 { print(v) }`",
+          tErrUnsupported(
+            "print of a union value (" +
+              tyToStr(pt) +
+              ") is type-valid but not yet supported by codegen — narrow it first, e.g. `if v is i32 { print(v) }`",
             pargs[pj],
           )
         }
@@ -6687,10 +6714,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // floor accepts EXACTLY what the emitter can register/lower; a union mixing a
         // scalar/string, or one with an anonymous/un-named-shape member, still floors.
         if structUnionRetName(inferred, gRootStmts) == "" {
-          tErr(
-            "cannot infer a union return type for '" +
+          tErrUnsupported(
+            "'" +
               n.fnName +
-              "' — annotate the return type",
+              "' infers the union return type " +
+              tyToStr(inferred) +
+              " — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type",
             n.fnBody,
           )
         }
@@ -6702,10 +6731,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // hits the floor.
         const innerNm = tyToStr(itt.nInner)
         if innerNm != "boolean" && innerNm != "string" {
-          tErr(
-            "cannot infer a nullable return type for '" +
+          tErrUnsupported(
+            "'" +
               n.fnName +
-              "' — annotate the return type",
+              "' infers the nullable return type " +
+              tyToStr(inferred) +
+              " — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type",
             n.fnBody,
           )
         }
@@ -9137,8 +9168,10 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
         // An i32-keyed map shape (`{[i32]: V}`) is the native list/array path,
         // not the string-keyed hash map — report that directly (with the fix)
         // instead of a bare "unknown type", naming the constructor in play.
+        // An emitter/runtime-capability rejection (the map rep is string-keyed),
+        // not a type error — the unsupported-lowering channel.
         if mapShapeKeyName(tn.tyName) == "i32" {
-          tErr(
+          tErrUnsupported(
             "An i32-keyed " +
               initMapCtorName(n.letInit) +
               " isn't supported yet — i32 keys use a list/array (`T[]`); " +
