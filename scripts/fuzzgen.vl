@@ -1,17 +1,34 @@
 // VL-NATIVE rep-composition fuzzer — the generator half. Emits a batch of self-describing `.vl`
 // programs (each carrying its `// @log` expectation) that bury a literal PAYLOAD inside a randomly
-// nested rep (struct field / list element / nullable) and read it back. The round-trip property is the
-// oracle: print(read(build(payload))) must equal payload. The oracle is just the payload TEXT —
-// computed by nothing, so it stays independent of the compiler under test (unlike an arithmetic oracle,
-// which VL can't evaluate independently). Arithmetic is deliberately NOT fuzzed here (the corpus + the
-// fixpoint-validated i32 path cover it); the value is composition DEPTH the hand-written corpus lacks.
+// nested rep and read it back. The round-trip property is the oracle: print(read(build(payload)))
+// must equal payload. The oracle is just the payload TEXT — computed by nothing, so it stays
+// independent of the compiler under test (unlike an arithmetic oracle, which VL can't evaluate
+// independently). Arithmetic is deliberately NOT fuzzed here (the corpus + the fixpoint-validated
+// i32 path cover it); the value is composition DEPTH × the rep MATRIX the hand-written corpus lacks.
+//
+// The matrix generated over:
+//   leaves      — i32 · i64 (full 64-bit range) · f64 · string · f32 · boolean · literal-union atom
+//   containers  — struct {f:T} · list T[] · nullable T|null · multi-field struct {a,f,z} (mixed-rep
+//                 decoy siblings) · map {[string]:T} (read via `?? <same-shape dummy>`) · union
+//                 T | decoy (read via `is`, sometimes CARRYING the decoy) · closure ()=>T / (i32)=>T
+//   positions   — local binding · function param · function return · global binding
+//   variants    — READ (round-trip) + CONSTRUCT-ONLY (build, never read: catches construct-side
+//                 soundness holes the read path would mask by rejecting cleanly first)
+//
+// Each case also carries a `// @shape p<pos><variant> <type>` line — a stable signature for the
+// orchestrator's known-failure baseline (regressions = a shape failing that isn't in the baseline).
 //
 // `scripts/fuzz-vl.sh` runs this through the native `vl`, splits the batch on `===CASE` markers, and
-// runs each case — no Deno. Seed + count are sed-injected by the orchestrator (the two `let` lines).
+// runs each case — no Deno. Seed + count are sed-injected by the orchestrator (the three `let` lines).
 
 let SEED = 1
 let COUNT = 200
 let MAXDEPTH = 4
+
+// per-case emission state
+let ALIASES = "" // literal-union `type K<n> = …` declarations for the current case
+let LUC = 0 // literal-union alias counter (per case)
+let GSYM = 0 // gensym counter for hoisted map temps + lambda params (per case)
 
 // ── seeded PRNG (i32 LCG; the i32 path is fixpoint-trusted, so the generator's own arithmetic is fine)
 function nextRand(): i32 {
@@ -20,22 +37,68 @@ function nextRand(): i32 {
 }
 function rr(lo: i32, hi: i32): i32 { return lo + nextRand() % (hi - lo + 1) }
 
-// A rep tree. kind: 0 leaf · 1 struct{f:child} · 2 child[] · 3 child|null. leaf: 0 i32 · 1 i64 · 2 f64
-// · 3 string. `payload` is the source literal, `expected` its printed form (f64 drops `.0`; a string
-// literal's quotes are stripped). `child` is the single carrying sub-slot.
+// A rep tree.
+// kind: 0 leaf · 1 struct{f:child} · 2 list · 3 nullable · 4 multi-field struct · 5 map · 6 union
+//       · 7 closure. leaf: 0 i32 · 1 i64 · 2 f64 · 3 string · 4 f32 · 5 boolean · 6 literal-union.
+// `payload` is the source literal, `expected` its printed form (a float drops a `.0`; a string /
+// atom literal's quotes are stripped). `child` is the single carrying sub-slot.
 type Slot = {
   kind: i32,
   leaf: i32,
   payload: string,
   expected: string,
   child: Slot | null,
-  // 1 if this nullable slot (kind 3) carries an ACTUAL `null` value (not its child). The read then
-  // takes the `else` arm and prints the NULL sentinel — exercising the null path the round-trip
-  // otherwise never hits (every nullable slot used to be built non-null).
+  // 1 if this nullable slot (kind 3) carries an ACTUAL `null` (not its child). The read then takes
+  // the `else` arm and prints the NULL sentinel — exercising the null path the round-trip
+  // otherwise never hits.
   isNull: i32,
+  // 1 if this union slot (kind 6) carries its DECOY value (not its child). The read's `is` check
+  // then fails and prints the OTHER sentinel — exercising the non-carrier tag path.
+  carriesAlt: i32,
+  tyname: string, // leaf 6: the alias name of the literal union
+  dummy: string, // leaf: a same-typed literal DIFFERENT from payload (the map `??` default)
+  altTy: string, // kind 6: the decoy member type
+  altVal: string, // kind 6: a literal of the decoy type
+  d1ty: string, // kind 4: decoy sibling field types/values
+  d1v: string,
+  d2ty: string,
+  d2v: string,
+  arg: i32, // kind 7: 0 → `() => T`, 1 → `(i32) => T`
+}
+
+function slot(
+  kind: i32,
+  leaf: i32,
+  payload: string,
+  expected: string,
+  child: Slot | null,
+): Slot {
+  return {
+    kind: kind,
+    leaf: leaf,
+    payload: payload,
+    expected: expected,
+    child: child,
+    isNull: 0,
+    carriesAlt: 0,
+    tyname: "",
+    dummy: "",
+    altTy: "",
+    altVal: "",
+    d1ty: "",
+    d1v: "",
+    d2ty: "",
+    d2v: "",
+    arg: 0,
+  }
 }
 
 function ch(c: i32): string { return fromCodePoint(c) }
+
+function itoa(n: i32): string {
+  if n < 10 { return ch(48 + n) }
+  return itoa(n / 10) + ch(48 + n % 10)
+}
 
 // A run of `n` decimal digits, first digit 1-9 (no leading zero).
 function genDigits(n: i32): string {
@@ -65,114 +128,359 @@ function genWord(): string {
 }
 
 function genLeaf(): Slot {
-  const k = rr(0, 3)
+  const k = rr(0, 6)
   if k == 0 {
     const d = genDigits(rr(1, 6))
-    return { kind: 0, leaf: 0, payload: d, expected: d, child: null, isNull: 0 }
+    const s = slot(0, 0, d, d, null)
+    s.dummy = "12121"
+    return s
   }
   if k == 1 {
-    const d = genDigits(rr(1, 9))
-    return { kind: 0, leaf: 1, payload: d, expected: d, child: null, isNull: 0 }
+    // up to 18 digits — exercises the full i64 range, not just the i32-overlapping low end
+    const d = genDigits(rr(1, 18))
+    const s = slot(0, 1, d, d, null)
+    s.dummy = "13131313131"
+    return s
   }
   if k == 2 {
     const d = genDigits(rr(1, 5))
-    return {
-      kind: 0,
-      leaf: 2,
-      payload: d + ".0",
-      expected: d,
-      child: null,
-      isNull: 0,
-    }
+    let sl = slot(0, 2, d + ".0", d, null)
+    if rr(0, 1) == 0 { sl = slot(0, 2, d + ".5", d + ".5", null) }
+    sl.dummy = "14.5"
+    return sl
   }
-  const w = genWord()
-  return {
-    kind: 0,
-    leaf: 3,
-    payload: ch(34) + w + ch(34),
-    expected: w,
-    child: null,
-    isNull: 0,
+  if k == 3 {
+    const w = genWord()
+    const s = slot(0, 3, ch(34) + w + ch(34), w, null)
+    s.dummy = ch(34) + "zdmy" + ch(34)
+    return s
+  }
+  if k == 4 {
+    // halves are exactly representable in f32, so the printed form is exact
+    const d = genDigits(rr(1, 4))
+    let sl = slot(0, 4, d + ".0", d, null)
+    if rr(0, 1) == 0 { sl = slot(0, 4, d + ".5", d + ".5", null) }
+    sl.dummy = "15.5"
+    return sl
+  }
+  if k == 5 {
+    let p = "true"
+    if rr(0, 1) == 0 { p = "false" }
+    const s = slot(0, 5, p, p, null)
+    if p == "true" { s.dummy = "false" } else { s.dummy = "true" }
+    return s
+  }
+  // literal-union atom: a fresh named alias of 2-3 distinct members; payload is one member
+  const w1 = genWord()
+  let w2 = genWord()
+  while w2 == w1 { w2 = genWord() }
+  const name = "K" + itoa(LUC)
+  LUC = LUC + 1
+  let mems = ch(34) + w1 + ch(34) + " | " + ch(34) + w2 + ch(34)
+  if rr(0, 1) == 0 {
+    let w3 = genWord()
+    while w3 == w1 || w3 == w2 { w3 = genWord() }
+    mems = mems + " | " + ch(34) + w3 + ch(34)
+  }
+  ALIASES = ALIASES + "type " + name + " = " + mems + "\n"
+  let pick = w1
+  if rr(0, 1) == 0 { pick = w2 }
+  const s = slot(0, 6, ch(34) + pick + ch(34), pick, null)
+  s.tyname = name
+  if pick == w1 {
+    s.dummy = ch(34) + w2 + ch(34)
+  } else {
+    s.dummy = ch(34) + w1 + ch(34)
+  }
+  return s
+}
+
+// The union decoy pool. Re-picks until the decoy type differs from the carrier's type text AND
+// cannot ADMIT the carrier's literal — a numeric literal fits every wider numeric member and a
+// literal-union word fits `string`, so such a pair would make the constructed variant AMBIGUOUS
+// (the checker may legitimately tag the decoy) and the `is <carrier>` oracle unsound. The struct
+// decoy's field name (`w`) is deliberately not used by any generated shape, so no struct literal
+// the generator builds is structurally admissible to it.
+function pickAlt(s: Slot, c: Slot) {
+  const childTy = emitTy(c)
+  let numericLeaf = 0
+  let atomLeaf = 0
+  if c.kind == 0 {
+    if c.leaf == 0 || c.leaf == 1 || c.leaf == 2 || c.leaf == 4 {
+      numericLeaf = 1
+    }
+    if c.leaf == 6 { atomLeaf = 1 }
+  }
+  while s.altTy == "" || s.altTy == childTy {
+    const k = rr(0, 5)
+    if k == 0 && numericLeaf == 0 {
+      s.altTy = "i32"
+      s.altVal = "77"
+    }
+    if k == 1 && numericLeaf == 0 {
+      s.altTy = "i64"
+      s.altVal = "5000000077"
+    }
+    if k == 2 && numericLeaf == 0 {
+      s.altTy = "f64"
+      s.altVal = "9.25"
+    }
+    if k == 3 && atomLeaf == 0 {
+      s.altTy = "string"
+      s.altVal = ch(34) + "other" + ch(34)
+    }
+    if k == 4 {
+      s.altTy = "boolean"
+      s.altVal = "false"
+    }
+    if k == 5 {
+      s.altTy = "{w: i32}"
+      s.altVal = "{w: 77}"
+    }
   }
 }
 
-// `allowNul` is false directly under a nullable (no `X|null|null`).
-function genSlot(depth: i32, allowNul: i32): Slot {
+// A decoy sibling field for the multi-field struct — mixed reps so the payload field's offset and
+// valtype sit next to unlike neighbors.
+function pickDecoyField(which: i32, s: Slot) {
+  const k = rr(0, 5)
+  let ty = "i32"
+  let v = "11"
+  if k == 1 {
+    ty = "f64"
+    v = "2.5"
+  }
+  if k == 2 {
+    ty = "string"
+    v = ch(34) + "dx" + ch(34)
+  }
+  if k == 3 {
+    ty = "boolean"
+    v = "true"
+  }
+  if k == 4 {
+    ty = "i64"
+    v = "6000000000"
+  }
+  if k == 5 {
+    ty = "f32"
+    v = "3.5"
+  }
+  if which == 1 {
+    s.d1ty = ty
+    s.d1v = v
+  } else {
+    s.d2ty = ty
+    s.d2v = v
+  }
+}
+
+// `allowNul` is 0 directly under a nullable (no `X|null|null`), under a map (a stored null is
+// indistinguishable from a miss through the `??` read), and under a union (no `is (T|null)`).
+// `allowUni` is 0 directly under a union (a flattened `a|b|alt` has no `is (a|b)` narrow).
+function genSlot(depth: i32, allowNul: i32, allowUni: i32): Slot {
   if depth <= 0 { return genLeaf() }
   // bias toward leaves so trees stay small
-  let hi = 3
-  if allowNul == 0 { hi = 2 }
-  const w = rr(0, hi + 1)
-  if w == 0 || w > hi { return genLeaf() }
-  if w == 3 {
-    const c = genSlot(depth - 1, 0)
-    // ~1/3 of nullable slots carry an ACTUAL null. The read then short-circuits to the NULL sentinel
-    // at THIS depth; since the sentinel string is depth-independent, the round-trip oracle (the first
-    // null on the carrier chain wins) stays consistent.
-    let nul = 0
-    if rr(0, 2) == 0 { nul = 1 }
-    let exp = c.expected
-    if nul == 1 { exp = "NULL" }
-    return {
-      kind: 3,
-      leaf: 0,
-      payload: "",
-      expected: exp,
-      child: c,
-      isNull: nul,
+  if rr(0, 9) <= 2 { return genLeaf() }
+  let k = rr(1, 7)
+  while (k == 3 && allowNul == 0) || (k == 6 && allowUni == 0) { k = rr(1, 7) }
+  if k == 3 {
+    const c = genSlot(depth - 1, 0, 1)
+    // ~1/3 of nullable slots carry an ACTUAL null. The read then short-circuits to the NULL
+    // sentinel at THIS depth; the sentinel is depth-independent, so the oracle (the first sentinel
+    // on the carrier chain wins) stays consistent.
+    const s = slot(3, 0, "", c.expected, c)
+    if rr(0, 2) == 0 {
+      s.isNull = 1
+      s.expected = "NULL"
     }
+    return s
   }
-  const c = genSlot(depth - 1, 1)
-  return {
-    kind: w,
-    leaf: 0,
-    payload: "",
-    expected: c.expected,
-    child: c,
-    isNull: 0,
+  if k == 6 {
+    const c = genSlot(depth - 1, 0, 0)
+    const s = slot(6, 0, "", c.expected, c)
+    pickAlt(s, c)
+    // ~1/4 of union slots carry the DECOY — the `is <carrier>` read fails and prints OTHER.
+    if rr(0, 3) == 0 {
+      s.carriesAlt = 1
+      s.expected = "OTHER"
+    }
+    return s
   }
+  if k == 4 {
+    const c = genSlot(depth - 1, 1, 1)
+    const s = slot(4, 0, "", c.expected, c)
+    pickDecoyField(1, s)
+    pickDecoyField(2, s)
+    return s
+  }
+  if k == 7 {
+    const c = genSlot(depth - 1, 1, 1)
+    const s = slot(7, 0, "", c.expected, c)
+    s.arg = rr(0, 1)
+    return s
+  }
+  // struct{f} · list · map
+  const c = genSlot(depth - 1, 1, 1)
+  if k == 5 { return slot(5, 0, "", c.expected, c) }
+  return slot(k, 0, "", c.expected, c)
 }
 
 function leafTy(l: i32): string {
   if l == 0 { return "i32" }
   if l == 1 { return "i64" }
   if l == 2 { return "f64" }
-  return "string"
+  if l == 3 { return "string" }
+  if l == 4 { return "f32" }
+  if l == 5 { return "boolean" }
+  return "K?"
+}
+
+// Parenthesize a member type where the surrounding type syntax needs it: a nullable/union/closure
+// list element, and a closure member of a nullable/union (`(() => T) | null` — bare would parse as
+// a closure RETURNING the nullable).
+function elemTy(c: Slot): string {
+  if c.kind == 3 || c.kind == 6 || c.kind == 7 { return "(" + emitTy(c) + ")" }
+  return emitTy(c)
+}
+function memberTy(c: Slot): string {
+  if c.kind == 7 { return "(" + emitTy(c) + ")" }
+  return emitTy(c)
 }
 
 function emitTy(s: Slot): string {
-  if s.kind == 0 { return leafTy(s.leaf) }
+  if s.kind == 0 {
+    if s.leaf == 6 { return s.tyname }
+    return leafTy(s.leaf)
+  }
   const c = s.child
   if c == null { return "i32" }
   if s.kind == 1 { return "{f: " + emitTy(c) + "}" }
-  if s.kind == 2 {
-    if c.kind == 3 { return "(" + emitTy(c) + ")[]" }
-    return emitTy(c) + "[]"
+  if s.kind == 2 { return elemTy(c) + "[]" }
+  if s.kind == 3 { return memberTy(c) + " | null" }
+  if s.kind == 4 {
+    return "{a: " + s.d1ty + ", f: " + emitTy(c) + ", z: " + s.d2ty + "}"
   }
-  return emitTy(c) + " | null"
+  if s.kind == 5 { return "{[string]: " + emitTy(c) + "}" }
+  if s.kind == 6 { return memberTy(c) + " | " + s.altTy }
+  // closure: a nullable/union child is the RETURN type (`() => T | null` parses as returning
+  // nullable); only a closure child needs parens
+  let ret = emitTy(c)
+  if c.kind == 7 { ret = "(" + ret + ")" }
+  if s.arg == 1 { return "(i32) => " + ret }
+  return "() => " + ret
 }
 
-function emitCtor(s: Slot): string {
-  if s.kind == 0 { return s.payload }
+// A constructor is (pre-statements, expression): maps have no expression form, so a map anywhere in
+// the tree hoists a `const h<n> = Map(); h<n>["k"] = …` prefix and the expression is the temp.
+type Built = { pre: string, expr: string }
+
+// `dum` = 1 builds the DUMMY twin: same shape, different leaf payloads, never null / never the
+// decoy — the well-typed `??` default for the map read (the key is always present, so the dummy is
+// never observed; a dummy leaking through IS a finding).
+function emitCtor(s: Slot, dum: i32): Built {
+  if s.kind == 0 {
+    if dum == 1 { return { pre: "", expr: s.dummy } }
+    return { pre: "", expr: s.payload }
+  }
   const c = s.child
-  if c == null { return "0" }
-  if s.isNull == 1 {
-    return "null" // a nullable slot carrying an actual null
+  if c == null { return { pre: "", expr: "0" } }
+  if s.kind == 3 && s.isNull == 1 && dum == 0 {
+    return { pre: "", expr: "null" }
   }
-  if s.kind == 1 { return "{f: " + emitCtor(c) + "}" }
-  if s.kind == 2 { return "[" + emitCtor(c) + "]" }
-  return emitCtor(c)
+  if s.kind == 6 && s.carriesAlt == 1 && dum == 0 {
+    return { pre: "", expr: s.altVal }
+  }
+  const b = emitCtor(c, dum)
+  if s.kind == 1 { return { pre: b.pre, expr: "{f: " + b.expr + "}" } }
+  if s.kind == 2 { return { pre: b.pre, expr: "[" + b.expr + "]" } }
+  if s.kind == 4 {
+    return {
+      pre: b.pre,
+      expr: "{a: " + s.d1v + ", f: " + b.expr + ", z: " + s.d2v + "}",
+    }
+  }
+  if s.kind == 5 {
+    const h = "h" + itoa(GSYM)
+    GSYM = GSYM + 1
+    const pre = b.pre +
+      "const " +
+      h +
+      ": " +
+      emitTy(s) +
+      " = Map()\n" +
+      h +
+      "[" +
+      ch(34) +
+      "k" +
+      ch(34) +
+      "] = " +
+      b.expr +
+      "\n"
+    return { pre: pre, expr: h }
+  }
+  if s.kind == 7 {
+    // the child's pre-statements hoist OUT of the lambda (the lambda captures the temps)
+    let head = "() => ("
+    if s.arg == 1 {
+      const q = "q" + itoa(GSYM)
+      GSYM = GSYM + 1
+      head = "(" + q + ") => ("
+    }
+    return { pre: b.pre, expr: head + b.expr + ")" }
+  }
+  // kind 3 (non-null) / kind 6 (carrier): the child value widens into the nullable/union
+  return b
 }
 
-// Statements reading the payload reachable from `acc` and printing it. Only a nullable binds a fresh
-// temp (`tN`) to narrow on (`if t != null`); struct/list stay direct accessors. `tmp` is the next temp id.
+// Statements reading the payload reachable from `acc` and printing it. A nullable / union / map hop
+// binds a fresh temp (`t<n>`) to narrow on; struct/list/closure stay direct accessors.
 function emitRead(acc: string, s: Slot, tmp: i32): string {
   if s.kind == 0 { return "print(" + acc + ")\n" }
   const c = s.child
   if c == null { return "print(-1)\n" }
-  if s.kind == 1 { return emitRead(acc + ".f", c, tmp) }
+  if s.kind == 1 || s.kind == 4 { return emitRead(acc + ".f", c, tmp) }
   if s.kind == 2 { return emitRead(acc + "[0]", c, tmp) }
-  const t = "t" + ch(48 + tmp)
+  if s.kind == 7 {
+    if s.arg == 1 { return emitRead(acc + "(1)", c, tmp) }
+    return emitRead(acc + "()", c, tmp)
+  }
+  const t = "t" + itoa(tmp)
+  if s.kind == 5 {
+    // read through `?? <same-shape dummy>`: the key is present, so the dummy must never win
+    const d = emitCtor(c, 1)
+    return d.pre +
+      "const " +
+      t +
+      " = " +
+      acc +
+      "[" +
+      ch(34) +
+      "k" +
+      ch(34) +
+      "] ?? " +
+      d.expr +
+      "\n" +
+      emitRead(t, c, tmp + 1)
+  }
+  if s.kind == 6 {
+    return "const " +
+      t +
+      " = " +
+      acc +
+      "\n" +
+      "if " +
+      t +
+      " is " +
+      emitTy(c) +
+      " {\n" +
+      emitRead(t, c, tmp + 1) +
+      "} else {\nprint(" +
+      ch(34) +
+      "OTHER" +
+      ch(34) +
+      ")\n}\n"
+  }
   return "const " +
     t +
     " = " +
@@ -182,41 +490,139 @@ function emitRead(acc: string, s: Slot, tmp: i32): string {
     t +
     " != null {\n" +
     emitRead(t, c, tmp + 1) +
-    "} else {\nprint(\"NULL\")\n}\n"
+    "} else {\nprint(" +
+    ch(34) +
+    "NULL" +
+    ch(34) +
+    ")\n}\n"
+}
+
+// Assemble one program placing the value at `pos` (0 local · 1 param · 2 return · 3 global) and
+// running `body` against it. `readBody` is "" for the construct-only variant (print(0) instead).
+function assemble(pos: i32, ty: string, b: Built, s: Slot): string {
+  const read = emitRead("v", s, 0)
+  if pos == 1 {
+    return "function useIt(p: " +
+      ty +
+      ") {\n" +
+      emitRead("p", s, 0) +
+      "}\n" +
+      "function go() {\n" +
+      b.pre +
+      "useIt(" +
+      b.expr +
+      ")\n}\ngo()\n"
+  }
+  if pos == 2 {
+    return "function makeIt(): " +
+      ty +
+      " {\n" +
+      b.pre +
+      "return " +
+      b.expr +
+      "\n}\n" +
+      "function go() {\nconst v: " +
+      ty +
+      " = makeIt()\n" +
+      read +
+      "}\ngo()\n"
+  }
+  if pos == 3 {
+    return "const g: " +
+      ty +
+      " = " +
+      b.expr +
+      "\n" +
+      "function go() {\n" +
+      emitRead("g", s, 0) +
+      "}\ngo()\n"
+  }
+  return "function go() {\n" +
+    b.pre +
+    "const v: " +
+    ty +
+    " = " +
+    b.expr +
+    "\n" +
+    read +
+    "}\ngo()\n"
+}
+
+function assembleConstruct(pos: i32, ty: string, b: Built): string {
+  if pos == 1 {
+    return "function useIt(p: " +
+      ty +
+      ") {\nprint(0)\n}\n" +
+      "function go() {\n" +
+      b.pre +
+      "useIt(" +
+      b.expr +
+      ")\n}\ngo()\n"
+  }
+  if pos == 2 {
+    return "function makeIt(): " +
+      ty +
+      " {\n" +
+      b.pre +
+      "return " +
+      b.expr +
+      "\n}\n" +
+      "function go() {\nconst v: " +
+      ty +
+      " = makeIt()\nprint(0)\n}\ngo()\n"
+  }
+  if pos == 3 {
+    return "const g: " +
+      ty +
+      " = " +
+      b.expr +
+      "\nfunction go() {\nprint(0)\n}\ngo()\n"
+  }
+  return "function go() {\n" +
+    b.pre +
+    "const v: " +
+    ty +
+    " = " +
+    b.expr +
+    "\nprint(0)\n}\ngo()\n"
 }
 
 function go() {
   let i = 0
   while i < COUNT {
-    const s = genSlot(rr(1, MAXDEPTH), 1)
+    ALIASES = ""
+    LUC = 0
+    GSYM = 0
+    const s = genSlot(rr(1, MAXDEPTH), 1, 1)
     const ty = emitTy(s)
-    const ctor = emitCtor(s)
+    const b = emitCtor(s, 0)
+    // a global has no statement slot for map hoists — fall back to the return position
+    let pos = rr(0, 3)
+    if pos == 3 && b.pre != "" { pos = 2 }
+    const shape = "// @shape p" + itoa(pos)
     // The READ case: build + read-back (the round-trip oracle).
     const prog = "// @run\n// @log " +
       s.expected +
       "\n" +
-      "function go() {\n" +
-      "const v: " +
+      shape +
+      "r " +
       ty +
-      " = " +
-      ctor +
       "\n" +
-      emitRead("v", s, 0) +
-      "}\ngo()\n"
-    print("===CASE " + ch(48 + i % 10) + "===")
+      ALIASES +
+      assemble(pos, ty, b, s)
+    print("===CASE " + itoa(i) + "===")
     print(prog)
-    // The CONSTRUCT-ONLY case: build the SAME literal but never read it. Catches a CONSTRUCT-side
-    // soundness hole the read path would otherwise mask — the read may reject cleanly BEFORE the bad
-    // construct wasm matters, hiding it. Oracle is the trivial `0`; only a compile-fail / trap is a finding.
+    // The CONSTRUCT-ONLY case: build the SAME value but never read it. Catches a construct-side
+    // soundness hole the read path would otherwise mask — the read may reject cleanly BEFORE the
+    // bad construct wasm matters, hiding it. Only a compile-fail / trap / non-"0" is a finding.
     const cprog = "// @run\n// @log 0\n" +
-      "function go() {\n" +
-      "const v: " +
+      shape +
+      "c " +
       ty +
-      " = " +
-      ctor +
       "\n" +
-      "print(0)\n}\ngo()\n"
-    print("===CASE " + ch(48 + i % 10) + "c===")
+      ALIASES +
+      assembleConstruct(pos, ty, b)
+    print("===CASE " + itoa(i) + "c===")
     print(cprog)
     i = i + 1
   }
