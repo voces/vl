@@ -16694,77 +16694,35 @@ function mAllocType() {
   idx
 }
 
-// The Phase-G safety assert (risk R2): the interned index MUST equal the value the
-// old offset formula computes. On divergence, fail loudly (drops the buffer so a
-// mis-indexed module never reaches instantiation) — never silence it. Retained as
-// a cheap debug check for one release after the old arithmetic is deleted.
-function mAssertIdx(got: i32, want: i32, who: string) {
-  if got != want {
-    return emitFail("emitProgram: Phase G type-index drift in " + who)
-  }
-  0
-}
-
 // Walk the type-section emit order with the `mAllocType` counter, assigning each
 // type's heap index into the module-global index state (`sHeapIdx`/`uVarIdx`/
 // `uBoxIdx`/`aTypeIdx`/`lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`mkArrIdx`/`mkListIdx`/
-// `mStructIdx`) and asserting each equals the old offset formula. Returns the
-// functype base index (`typeOffset` — where the first functype lands), or -1 on a
-// drift (via `mAssertIdx`/`emitFail`). The order MUST match the type-section
-// emission below EXACTLY: standalone structs → union variants → union box → raw
-// i32 array → i32-list wrapper → ref-list (backing, wrapper) pairs → string-list
-// (backing, wrapper) → map struct → functypes.
+// `mStructIdx`). Returns the functype base index (`typeOffset` — where the first
+// functype lands). The order MUST match the type-section emission below EXACTLY:
+// standalone structs → union variants → union box → raw i32 array → i32-list
+// wrapper → ref-list (backing, wrapper) pairs → string-list (backing, wrapper) →
+// map struct → functypes. An ABSENT type family mints nothing; its index globals
+// still take the counter position they would have occupied (never emitted — the
+// value only matters when the family is present).
 function mAssignTypeIndices(n: i32) {
   mResetTypeIntern()
 
-  // ── the OLD offset formulas (kept as the Phase-G debug-assert oracle) ──
-  const structOffset = sNames.length
-  let oldUnionOffset = 0
-  const oldUVarIdx = structOffset
-  const oldUBoxIdx = structOffset + uVariants.length
-  // The per-rep VALUE BOXES (value unions) land right after the union box; every
-  // later offset formula shifts by however many are interned.
-  let vbTotal = 0
-  if vbI32Used { vbTotal = vbTotal + 1 }
-  if vbI64Used { vbTotal = vbTotal + 1 }
-  if vbF32Used { vbTotal = vbTotal + 1 }
-  if vbF64Used { vbTotal = vbTotal + 1 }
-  if uDeclared { oldUnionOffset = uVariants.length + 1 + vbTotal }
-  const preTypes = structOffset + oldUnionOffset
-  let arrayOffset = 0
-  if aUsed { arrayOffset = 1 }
-  let listOffset = 0
-  if lUsed { listOffset = 1 }
-  const oldATypeIdx = preTypes
-  const oldLTypeIdx = preTypes + arrayOffset
-  const refPairBase = preTypes + arrayOffset + listOffset
-  const refPairsTotal = rlElemName.length * 2
-  const preMap = refPairBase + refPairsTotal
-  const oldMkArrIdx = preMap
-  const oldMkListIdx = preMap + 1
-  const oldMStructIdx = preMap + 2
-
-  // ── the NEW interned assignment (the single auditable counter) ──
   // Standalone structs occupy the first `sNames.length` indices (decl order).
   sHeapIdx = []
   let shi = 0
   while shi < sNames.length {
-    let si = mAllocType()
-    if mAssertIdx(si, shi, "struct") < 0 { return -1 }
-    sHeapIdx.push(si)
+    sHeapIdx.push(mAllocType())
     shi = shi + 1
   }
   // Union variant structs (nv of them) then the union box.
   if uDeclared {
     uVarIdx = mNextType
-    if mAssertIdx(uVarIdx, oldUVarIdx, "uVarIdx") < 0 { return -1 }
     let vi = 0
     while vi < uVariants.length {
       mAllocType()
       vi = vi + 1
     }
     uBoxIdx = mAllocType()
-    if mAssertIdx(uBoxIdx, oldUBoxIdx, "uBoxIdx") < 0 { return -1 }
     // The per-rep VALUE BOXES (`{ i32 }` / `{ i64 }` / `{ f32 }` / `{ f64 }`),
     // in this fixed rep order — only the reps a registered value union uses.
     if vbI32Used { vbI32Idx = mAllocType() }
@@ -16773,32 +16731,18 @@ function mAssignTypeIndices(n: i32) {
     if vbF64Used { vbF64Idx = mAllocType() }
   }
   // The raw i32 array (string rep + list/map backing), then the i32-list wrapper.
-  if aUsed {
-    aTypeIdx = mAllocType()
-    if mAssertIdx(aTypeIdx, oldATypeIdx, "aTypeIdx") < 0 { return -1 }
-  } else {
-    aTypeIdx = oldATypeIdx
-  }
-  if lUsed {
-    lTypeIdx = mAllocType()
-    if mAssertIdx(lTypeIdx, oldLTypeIdx, "lTypeIdx") < 0 { return -1 }
-  } else {
-    lTypeIdx = oldLTypeIdx
-  }
+  if aUsed { aTypeIdx = mAllocType() } else { aTypeIdx = mNextType }
+  if lUsed { lTypeIdx = mAllocType() } else { lTypeIdx = mNextType }
   // The map struct index is needed BELOW to resolve a map-array ref-list element
   // (it references `(ref null $mStructIdx)`), yet the map struct lands AFTER the ref
   // pairs + string-list. It is computable up front from the counter: it follows the
-  // `refPairsTotal` ref-pair slots plus the 2 string-list slots.
-  const mStructIdxPre = mNextType + refPairsTotal + 2
+  // ref-pair slots (two per distinct element type) plus the 2 string-list slots.
+  const mStructIdxPre = mNextType + rlElemName.length * 2 + 2
   // One (backing, wrapper) pair per distinct ref-list element type, interleaved.
   let rs = 0
   while rs < rlElemName.length {
-    const back = mAllocType()
-    const wrap = mAllocType()
-    if mAssertIdx(back, refPairBase + rs * 2, "rlBackIdx") < 0 { return -1 }
-    if mAssertIdx(wrap, refPairBase + rs * 2 + 1, "rlWrapIdx") < 0 { return -1 }
-    rlBackIdx[rs] = back
-    rlWrapIdx[rs] = wrap
+    rlBackIdx[rs] = mAllocType()
+    rlWrapIdx[rs] = mAllocType()
     if rlElemKindTbl[rs] == 2 {
       rlElemHeap[rs] = uBoxIdx
     } else if rlElemKindTbl[rs] == 3 {
@@ -16850,65 +16794,48 @@ function mAssignTypeIndices(n: i32) {
   } else {
     raTypeIdx = mNextType
     rlTypeIdx = mNextType
-    if mAssertIdx(raTypeIdx, refPairBase, "raTypeIdx") < 0 { return -1 }
   }
   // The string-ref list (keys backing + keys wrapper), shared by the map's keys
   // list AND any `string[]` field (present when `slUsed || mUsed`).
   if slUsed || mUsed {
     mkArrIdx = mAllocType()
     mkListIdx = mAllocType()
-    if mAssertIdx(mkArrIdx, oldMkArrIdx, "mkArrIdx") < 0 { return -1 }
-    if mAssertIdx(mkListIdx, oldMkListIdx, "mkListIdx") < 0 { return -1 }
   } else {
-    mkArrIdx = oldMkArrIdx
-    mkListIdx = oldMkListIdx
+    mkArrIdx = mNextType
+    mkListIdx = mNextType + 1
   }
-  // The map struct (present only when `mUsed`).
-  if mUsed {
-    mStructIdx = mAllocType()
-    if mAssertIdx(mStructIdx, oldMStructIdx, "mStructIdx") < 0 { return -1 }
-    if mAssertIdx(mStructIdx, mStructIdxPre, "mStructIdxPre") < 0 { return -1 }
-  } else {
-    mStructIdx = oldMStructIdx
-  }
+  // The map struct (present only when `mUsed`); `mStructIdxPre` is this counter
+  // position, precomputed above for the ref-pair loop.
+  if mUsed { mStructIdx = mAllocType() } else { mStructIdx = mStructIdxPre }
   // The f64 array + list-wrapper pair (Slice 4), interned LAST among the heap types so no
   // existing index shifts. The `(array (mut f64))` backing first, then its `{backing,len,
   // cap}` wrapper struct (which references the backing). Present only when `fa64Used`.
-  const oldFa64Idx = preMap + strListOffsetOf() + mapStructOffsetOf()
   if fa64Used {
     fa64TypeIdx = mAllocType()
     fl64TypeIdx = mAllocType()
-    if mAssertIdx(fa64TypeIdx, oldFa64Idx, "fa64TypeIdx") < 0 { return -1 }
-    if mAssertIdx(fl64TypeIdx, oldFa64Idx + 1, "fl64TypeIdx") < 0 { return -1 }
   } else {
-    fa64TypeIdx = oldFa64Idx
-    fl64TypeIdx = oldFa64Idx + 1
+    fa64TypeIdx = mNextType
+    fl64TypeIdx = mNextType + 1
   }
   // The i64-list pair, immediately after the f64 pair (same "interned late so no existing
   // index shifts" discipline): the `(array (mut i64))` backing then its `{backing,len,cap}`
   // wrapper. Present only when `ia64Used`; aliases its slots otherwise (zero types minted).
-  const oldIa64Idx = oldFa64Idx + f64ListOffsetOf()
   if ia64Used {
     ia64TypeIdx = mAllocType()
     il64TypeIdx = mAllocType()
-    if mAssertIdx(ia64TypeIdx, oldIa64Idx, "ia64TypeIdx") < 0 { return -1 }
-    if mAssertIdx(il64TypeIdx, oldIa64Idx + 1, "il64TypeIdx") < 0 { return -1 }
   } else {
-    ia64TypeIdx = oldIa64Idx
-    il64TypeIdx = oldIa64Idx + 1
+    ia64TypeIdx = mNextType
+    il64TypeIdx = mNextType + 1
   }
   // The f32-list pair, immediately after the i64 pair (same "interned late" discipline): the
   // `(array (mut f32))` backing then its `{backing,len,cap}` wrapper. Present only when
   // `fa32Used`; aliases its slots otherwise (zero types minted).
-  const oldFa32Idx = oldIa64Idx + i64ListOffsetOf()
   if fa32Used {
     fa32TypeIdx = mAllocType()
     fl32TypeIdx = mAllocType()
-    if mAssertIdx(fa32TypeIdx, oldFa32Idx, "fa32TypeIdx") < 0 { return -1 }
-    if mAssertIdx(fl32TypeIdx, oldFa32Idx + 1, "fl32TypeIdx") < 0 { return -1 }
   } else {
-    fa32TypeIdx = oldFa32Idx
-    fl32TypeIdx = oldFa32Idx + 1
+    fa32TypeIdx = mNextType
+    fl32TypeIdx = mNextType + 1
   }
   // Second pass: fill the NON-i32 nested-list ref-list element heaps now that the inner
   // string/f64/i64 list wrappers exist (a `string[]`/`f64[]`/`i64[]`-VALUED map's vals
@@ -16928,11 +16855,9 @@ function mAssignTypeIndices(n: i32) {
   // i32`. Both reference each other (mutually recursive in the one rec group). Then one
   // env struct per CAPTURING lifted function (capture order = field order), interned
   // after `$fnsig`. Present only when `fnValUsed`; zero types minted otherwise.
-  const oldCloIdx = oldFa32Idx + f32ListOffsetOf()
   fnEnvIdx = []
   if fnValUsed {
     cloStructIdx = mAllocType()
-    if mAssertIdx(cloStructIdx, oldCloIdx, "cloStructIdx") < 0 { return -1 }
     // A CLOSURE-element ref-list slot (kind 5, `((i32) => i32)[]`) backs onto the closure
     // fat-pointer struct. `cloStructIdx` is interned HERE (after the ref-pair loop above),
     // so backfill those slots' element heap type now — the backing array `(array (mut (ref
@@ -16958,83 +16883,19 @@ function mAssignTypeIndices(n: i32) {
       fe = fe + 1
     }
   } else {
-    cloStructIdx = oldCloIdx
-    cloSigBase = oldCloIdx + 1
+    cloStructIdx = mNextType
+    cloSigBase = mNextType + 1
   }
   // The ref-valued map structs (one 7-field map struct per mv slot), interned LAST
   // among the heap types so no existing index shifts; zero types when no ref-valued
-  // map exists (`mvOffsetOf` = 0 → byte-identical output for every existing program).
-  const oldMvIdx = oldCloIdx + fnClosureOffsetOf()
+  // map exists.
   let mvi = 0
   while mvi < mvValName.length {
     mvMapTypeIdx[mvi] = mAllocType()
-    if mAssertIdx(mvMapTypeIdx[mvi], oldMvIdx + mvi, "mvMapTypeIdx") < 0 {
-      return -1
-    }
     mvi = mvi + 1
   }
   // The functypes follow; the first lands at the current counter (`typeOffset`).
-  const typeOffset = mNextType
-  const oldTypeOffset = preMap +
-    strListOffsetOf() +
-    mapStructOffsetOf() +
-    f64ListOffsetOf() +
-    i64ListOffsetOf() +
-    f32ListOffsetOf() +
-    fnClosureOffsetOf() +
-    mvOffsetOf()
-  if mAssertIdx(typeOffset, oldTypeOffset, "typeOffset") < 0 { return -1 }
-  typeOffset
-}
-
-// The ref-valued-map struct count: one map struct per interned mv slot.
-function mvOffsetOf() { mvValName.length }
-
-// The closure-type count interned ahead of the functypes: the closure struct + the
-// `$fnsig` functype (2) plus one env struct per capturing lifted function, or 0 when
-// no function value exists. Mirrors `f64ListOffsetOf` — keeps `typeOffset`'s oracle
-// formula in step with the live counter.
-function fnClosureOffsetOf() {
-  if !fnValUsed { return 0 }
-  // 1 closure struct + one `$fnsig` per distinct value-call signature + one env struct
-  // per capturing lifted function.
-  let total = 1 + cloSigKeys.length
-  let fe = 0
-  while fe < fnStmts.length {
-    if captureCountOf(fe) > 0 { total = total + 1 }
-    fe = fe + 1
-  }
-  total
-}
-
-// The f64-list type count (backing + wrapper): 2 when present, else 0.
-function f64ListOffsetOf() {
-  if fa64Used { return 2 }
-  0
-}
-
-// The i64-list type count (backing + wrapper): 2 when present, else 0.
-function i64ListOffsetOf() {
-  if ia64Used { return 2 }
-  0
-}
-
-// The f32-list type count (backing + wrapper): 2 when present, else 0.
-function f32ListOffsetOf() {
-  if fa32Used { return 2 }
-  0
-}
-
-// The string-list type count (keys backing + wrapper): 2 when present, else 0.
-function strListOffsetOf() {
-  if slUsed || mUsed { return 2 }
-  0
-}
-
-// The map-struct type count: 1 when a map is used, else 0.
-function mapStructOffsetOf() {
-  if mUsed { return 1 }
-  0
+  mNextType
 }
 
 // Detect, over the SET of non-const global init expressions, the scratch frames the
@@ -17706,14 +17567,11 @@ function emitModule(stmts: i32[]) {
   // minted by the centralized `mIntern*` counter inside `mAssignTypeIndices`, which
   // assigns the module-global index state (`sHeapIdx`/`uVarIdx`/`uBoxIdx`/`aTypeIdx`/
   // `lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`raTypeIdx`/`rlTypeIdx`/`mkArrIdx`/`mkListIdx`/
-  // `mStructIdx`) in that order and ALSO asserts each equals the old offset formula
-  // (risk R2 — index drift; the formulas survive as the assert oracle, scheduled for
-  // deletion one release after Phase G). It returns the functype base index
-  // (`typeOffset` — where the first functype lands), or -1 on a drift. All types are
-  // emitted inside ONE recursion group below, so a type may reference one that lands
-  // later (a string field's `(ref $aTypeIdx)`).
+  // `mStructIdx`) in that order and returns the functype base index (`typeOffset` —
+  // where the first functype lands). All types are emitted inside ONE recursion
+  // group below, so a type may reference one that lands later (a string field's
+  // `(ref $aTypeIdx)`).
   const typeOffset = mAssignTypeIndices(n)
-  if typeOffset < 0 { return -1 }
 
   // Type section (id 1): the struct type (if any) at index 0 — `0x5f` struct form,
   // field count, then each field's storagetype (`0x7f` i32) + mutability (`0x01`);
