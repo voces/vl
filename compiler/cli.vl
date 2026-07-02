@@ -123,8 +123,8 @@ let cliCodegen = 0
 let cliColor = 0
 let cliSeverity = "error"
 let cliSeverityGiven = 0
-const cliExcludes: string[] = [] // --exclude glob patterns (normalized)
-let cliArgErr = ""               // a fatal arg-parse message (printed, exit 2)
+let cliExcludes: string[] = [] // --exclude glob patterns (normalized)
+let cliArgErr = ""             // a fatal arg-parse message (printed, exit 2)
 
 // ── work + output ──────────────────────────────────────────────────────────────
 let cliEntrySrc = ""      // the entry file's source
@@ -191,6 +191,10 @@ let cliDiagLineCache: string[] = []
 let cliSrcLines: string[] = []
 
 // ── argv intake (host pushes each arg before the run loop) ─────────────────────
+// The COMPLETE instance reset: every CLI global above returns to its declared
+// state, so a reused compiler instance starts each run clean. (A partial reset
+// is a latent desync — e.g. `dgMod` surviving while its parallel siblings
+// dgSev…dgMsg clear, or a prior run's `--exclude` patterns still filtering.)
 export function cliArgReset() {
   cliArgs = []
   cliArgAcc = []
@@ -207,17 +211,47 @@ export function cliArgReset() {
   cliColor = 0
   cliSeverity = "error"
   cliSeverityGiven = 0
+  cliExcludes = []
   cliArgErr = ""
   cliEntrySrc = ""
   cliModMode = 0
   cliFetchKey = ""
   cliOut = []
   cliOutIdx = 0
+  cliDirMode = 0
+  cliWalkStack = []
+  cliWalkRel = []
+  cliFiles = []
+  cliFileIdx = 0
+  cliCurFile = ""
+  cliCurDir = ""
+  cliCurRel = ""
+  cliLastStage = ""
+  cliErrors = 0
+  cliWarnings = 0
+  cliGating = 0
+  cliCmd = 0
+  cliFmtWrite = 0
+  cliFmtCheck = 0
+  cliFmtDrift = 0
+  cliFmtResult = ""
+  cliFix = 0
+  cliFixCount = 0
+  cliFileFixed = 0
+  cliDirNames = []
+  cliDirIsDirs = []
+  cliDirNameAcc = []
+  cliDirWasDir = 0
   dgSev = []
   dgLine = []
   dgCol = []
   dgEnd = []
   dgMsg = []
+  dgMod = []
+  cliModKeys = []
+  cliModSrcs = []
+  cliDiagLineCacheMod = -1
+  cliDiagLineCache = []
   cliSrcLines = []
   0
 }
@@ -416,42 +450,81 @@ function cliExcluded(relPath: string, basename: string) {
   false
 }
 
+// A flag-shaped argument (so a value-taking flag never swallows one — e.g. the
+// host-injected trailing `--color=<v>` after a bare `--severity`).
+function cliIsFlag(a: string) { a.length > 0 && a[0] == '-' }
+// Record a usage error (first one wins; printed at exit tier 2).
+function cliUsageErr(msg: string) {
+  if cliArgErr == "" { cliArgErr = msg }
+  0
+}
+// Parse the subcommand's args STRICTLY: an unknown flag or a second positional
+// argument is a usage error (exit 2), never silently ignored — `vl check a.vl
+// b.vl` must not quietly check only `a.vl`. Flags are validated per subcommand
+// (cliArgs[0]); a value-taking flag requires a non-flag value.
 function cliParseArgs() {
+  let sub = "check"
+  if cliArgs.length > 0 && cliArgs[0] == "fmt" { sub = "fmt" }
   let i = 1
   while i < cliArgs.length {
     let a = cliArgs[i]
     if a == "--compiler" {
+      // The host's concern (it selects the compiler module) — skip flag + value.
       i = i + 1
-    } else if a == "--concise" {
+    } else if sub == "check" && a == "--concise" {
       cliConcise = 1
-    } else if a == "--codegen" {
+    } else if sub == "check" && a == "--codegen" {
       cliCodegen = 1
-    } else if a == "--severity" {
-      if i + 1 < cliArgs.length { cliSeverity = cliArgs[i + 1] }
+    } else if sub == "check" && a == "--severity" {
       cliSeverityGiven = 1
-      i = i + 1
-    } else if a.length > 11 && a.slice(0, 11) == "--severity=" {
+      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
+        cliSeverity = cliArgs[i + 1]
+        i = i + 1
+      } else {
+        cliUsageErr(
+          "check: --severity requires a value (error, warning, info, hint)",
+        )
+      }
+    } else if (
+      sub == "check" &&
+      a.length > 11 &&
+      a.slice(0, 11) == "--severity="
+    ) {
       cliSeverity = a.slice(11, a.length)
       cliSeverityGiven = 1
     } else if a.length > 8 && a.slice(0, 8) == "--color=" {
       if a.slice(8, a.length) == "always" { cliColor = 1 } else { cliColor = 0 }
-    } else if a == "--exclude" {
-      if i + 1 < cliArgs.length { cliAddExclude(cliArgs[i + 1]) }
-      i = i + 1
-    } else if a.length > 10 && a.slice(0, 10) == "--exclude=" {
+    } else if sub == "check" && a == "--exclude" {
+      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
+        cliAddExclude(cliArgs[i + 1])
+        i = i + 1
+      } else {
+        cliUsageErr("check: --exclude requires a glob pattern")
+      }
+    } else if (
+      sub == "check" &&
+      a.length > 10 &&
+      a.slice(0, 10) == "--exclude="
+    ) {
       cliAddExclude(a.slice(10, a.length))
-    } else if a == "-w" || a == "--write" {
+    } else if sub == "fmt" && (a == "-w" || a == "--write") {
       cliFmtWrite = 1
-    } else if a == "--check" {
+    } else if sub == "fmt" && a == "--check" {
       cliFmtCheck = 1
-    } else if a == "--fix" {
+    } else if sub == "check" && a == "--fix" {
       cliFix = 1
-    } else if a.length > 0 && a[0] != '-' && cliFile.length == 0 {
+    } else if cliIsFlag(a) {
+      cliUsageErr(sub + ": unknown flag `" + a + "`")
+    } else if a.length > 0 && cliFile.length == 0 {
       cliFile = a
+    } else if a.length > 0 {
+      cliUsageErr(
+        sub + ": unexpected extra argument `" + a + "` (one path per run)",
+      )
     }
     i = i + 1
   }
-  if cliSeverityGiven != 0 && !cliSevValid(cliSeverity) {
+  if cliArgErr == "" && cliSeverityGiven != 0 && !cliSevValid(cliSeverity) {
     cliArgErr = "check: invalid --severity `" +
       cliSeverity +
       "` (expected one of: error, warning, info, hint)"
