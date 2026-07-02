@@ -1,5 +1,4 @@
 import {
-  inferRetNameByNode,
   inferRetNameOf,
   isValueUnionName,
   monoInferListElem,
@@ -10,10 +9,8 @@ import {
   nodeTyIsLitUnionAlias,
   nodeTyIsNulLitUnion,
   nodeTyIsNullableStruct,
-  nodeTyIsUnion,
   nodeTyName,
   recordClonedNodeTy,
-  recordNodeTyFrom,
   splitUnionAtoms,
   valueAtomKind,
 } from "./typecheck"
@@ -49,14 +46,11 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
-  mkArrayLit,
   mkBlock,
   mkForIn,
   mkForRange,
   mkIf,
-  mkIndex,
   mkLet,
-  mkNum,
   mkParen,
   mkReturn,
   mkWhile,
@@ -81,7 +75,6 @@ import {
   hasNamedArgs,
   i32ToStr,
   mkBinary,
-  mkCall,
   mkCallN,
   mkFunc,
   mkIdent,
@@ -143,7 +136,6 @@ import {
   capHas,
   decodeStr,
   directArgsBad,
-  drwDispatchOp,
   inferNicheNullByName,
   isLitVariantName,
   loopStackFind,
@@ -376,7 +368,6 @@ import {
   uTags,
   uVarIdx,
   uVariants,
-  unNames,
   vbF32Used,
   vbF64Used,
   vbI32Used,
@@ -481,7 +472,6 @@ import {
   currentStructNarrowSetOf,
   declaredKind,
   declaredNulString,
-  drwFieldClosure,
   elseLessNullableTail,
   envSlotShift,
   exprArray,
@@ -614,7 +604,6 @@ import {
   refListSlotOfExpr,
   refPushScratchBaseFor,
   resetLitAtoms,
-  resolveShapeToNominal,
   restoreNarrow,
   retMapFlag,
   retNulRefFlag,
@@ -686,6 +675,12 @@ import {
   mAssignTypeIndices,
   mfScan,
 } from "./emit_collect"
+import {
+  captureBoxRewrite,
+  dispatchRewrite,
+  synthParamAnnots,
+  synthRetAnnots,
+} from "./emit_rewrite"
 //
 // Output representation: a VL `i32[]` of byte values 0..255. WasmGC has no `u8`,
 // so `i32[]` is used (see docs/selfhost-gaps.md). Bytes are masked to the low
@@ -12606,296 +12601,6 @@ function monoWalk(ix: i32, ctx: i32) {
 // `get` before a later `first(ys)` reads its return kind) and every NON-generic
 // function body; instance bodies are walked as they are created. Usage-gated:
 // a program with no generic declaration returns immediately.
-// ── self-method / operator / index-trap dispatch REWRITE (B13 + B14) ─────────
-// The HOST resolves these in its type-aware parser; the native parser is
-// type-free, so the emitter rewrites the arena BEFORE monomorphization:
-//   o.f(args)  → f(o, args)         a free `self`-function, receiver a struct
-//                                   that lacks a field `f` (UFCS)
-//   a op b     → op(a, b)           a free `self`-function named for the
-//                                   operator, struct left operand
-//   a op b     → (a."op")(b)        the left operand carries an operator
-//                                   closure FIELD ("*", "/", …)
-//   o[k]       → (o."[]")(k)        a "[]" trap field (native arrays/maps/
-//                                   strings never classify as structs, so they
-//                                   keep their fast paths)
-//   o[k] = v   → (o."[]=")(k, v)    a "[]=" trap field on the assignment form
-// The walk is POST-ORDER (children first, parents store the returned — possibly
-// new — child index back into their i32 child fields), so a chained `a[1][2]`
-// rewrites its inner trap before the outer looks at its receiver. The rewritten
-// forms ride the EXISTING lowerings: plain calls monomorphize per receiver
-// shape; field-closure calls use the member-call machinery. Usage-gated: a
-// program with none of these shapes rewrites nothing (byte-identical bytes).
-
-// The `fnStmts` index of a free `self`-function `name` of `argc` total params
-// (first param NAMED `self`), or -1 — the host's UFCS reachability rule, so a
-// non-`self` function is NOT a method (objects/self-method-pollution.vl).
-function drwSelfFnOf(name: string, argc: i32) {
-  const fe = fnIndexOf(name)
-  if fe < 0 { return -1 }
-  const fn = P.nodes[fnStmts[fe]]
-  if fn is FuncDecl {
-    const ps = fn.fnParams
-    if ps.length != argc { return -1 }
-    if ps.length > 0 {
-      const p0 = P.nodes[ps[0]]
-      if p0 is Param {
-        if p0.parName == "self" { return fe }
-      }
-    }
-  }
-  -1
-}
-
-// Post-order rewrite of the tree at `ix` (inside function `ctx`, -1 = top
-// level). Returns the node index to use in `ix`'s place (usually `ix` itself).
-function drwWalk(ix: i32, ctx: i32) {
-  if ix < 0 { return ix }
-  const n = P.nodes[ix]
-  if n is Call {
-    const args = n.callArgs
-    let i = 0
-    while i < args.length {
-      args[i] = drwWalk(args[i], ctx)
-      i = i + 1
-    }
-    const callee = P.nodes[n.callFn]
-    if callee is Member {
-      callee.memObj = drwWalk(callee.memObj, ctx)
-      // UFCS (host parser.ts case 2): `o.f(args)` where `f` is a free function
-      // whose FIRST parameter is named `self` (arity matching) lowers to the
-      // direct call `f(o, args)`. The receiver TYPE does not gate it — string,
-      // i32, and value-union receivers dispatch identically to struct ones.
-      // The Call node mutates in place: the receiver shifts in as argument 0,
-      // the callee becomes a bare Ident, and any named args slide right of the
-      // unnamed receiver ("" rides slot 0).
-      //
-      // The module merge mangles a free `self`-function (`shout` → `shout$m1`)
-      // but leaves the call's property plain so field precedence still resolves
-      // from the receiver shape; `ufcsAliasOf` maps the plain property to the
-      // mangled function, and the rebuilt direct-call Ident carries that name so
-      // every downstream pass (string detection, print routing, coercion) sees a
-      // normal named call. Identity single-file.
-      const uName = ufcsAliasOf(callee.memProp)
-      // Precedence, mirroring the host:
-      //   • a REAL struct field of that name wins (a value access, not a call);
-      //   • a callable FIELD (closure-valued, kind 14) wins as a `call_ref`
-      //     member-call (`exprIsClosure`), so it is NOT UFCS-rewritten.
-      // A non-struct receiver has no fields, so neither precedence case can
-      // apply — the rewrite fires once a matching `self`-function exists.
-      const si = structIndexOfExpr(callee.memObj, ctx)
-      let ufcs = false
-      if si >= 0 {
-        if sFieldIndex(si, callee.memProp) < 0 {
-          if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
-        }
-      }
-      if si < 0 {
-        if !exprIsClosure(n.callFn, ctx) {
-          if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
-        }
-      }
-      if ufcs {
-        const recvIx = callee.memObj
-        args.push(-1)
-        let j = args.length - 1
-        while j > 0 {
-          args[j] = args[j - 1]
-          j = j - 1
-        }
-        args[0] = recvIx
-        // Named-arg parity: the injected receiver is an UNNAMED slot-0
-        // positional. Only when the call already carries names does the name
-        // list need a leading "" (an all-positional call keeps its empty
-        // list, so `hasNamedArgs` stays false downstream).
-        if hasNamedArgs(n.callArgNames) {
-          const nm = n.callArgNames
-          nm.push("")
-          let k = nm.length - 1
-          while k > 0 {
-            nm[k] = nm[k - 1]
-            k = k - 1
-          }
-          nm[0] = ""
-        }
-        n.callFn = mkIdent(uName, -1)
-      }
-      return ix
-    }
-    n.callFn = drwWalk(n.callFn, ctx)
-    return ix
-  }
-  if n is Block {
-    const bs = n.blkStmts
-    let i2 = 0
-    while i2 < bs.length {
-      bs[i2] = drwWalk(bs[i2], ctx)
-      i2 = i2 + 1
-    }
-    return ix
-  }
-  if n is LetDecl {
-    n.letInit = drwWalk(n.letInit, ctx)
-    return ix
-  }
-  if n is IfStmt {
-    n.ifCond = drwWalk(n.ifCond, ctx)
-    n.ifThen = drwWalk(n.ifThen, ctx)
-    n.ifElse = drwWalk(n.ifElse, ctx)
-    return ix
-  }
-  if n is WhileStmt {
-    n.whileCond = drwWalk(n.whileCond, ctx)
-    n.whileBody = drwWalk(n.whileBody, ctx)
-    return ix
-  }
-  if n is ForRange {
-    n.frFrom = drwWalk(n.frFrom, ctx)
-    n.frTo = drwWalk(n.frTo, ctx)
-    n.frStep = drwWalk(n.frStep, ctx)
-    n.frBody = drwWalk(n.frBody, ctx)
-    return ix
-  }
-  if n is ForIn {
-    n.fiIter = drwWalk(n.fiIter, ctx)
-    n.fiBody = drwWalk(n.fiBody, ctx)
-    return ix
-  }
-  if n is RetStmt {
-    n.retArg = drwWalk(n.retArg, ctx)
-    return ix
-  }
-  if n is BinExpr {
-    // The index WRITE-TRAP form `o[k] = v` — handled BEFORE the general child
-    // walk so the assignment-target Index is not first rewritten into a READ
-    // trap (host: the assignment parser recovers the object + key).
-    if n.binOp == "=" {
-      const tgt = P.nodes[n.binLeft]
-      if tgt is Index {
-        tgt.idxArr = drwWalk(tgt.idxArr, ctx)
-        tgt.idxIndex = drwWalk(tgt.idxIndex, ctx)
-        n.binRight = drwWalk(n.binRight, ctx)
-        const wsi = structIndexOfExpr(tgt.idxArr, ctx)
-        if drwFieldClosure(wsi, "[]=") {
-          const wargs: i32[] = []
-          wargs.push(tgt.idxIndex)
-          wargs.push(n.binRight)
-          return mkCall(mkMember(tgt.idxArr, "[]=", -1), wargs, -1)
-        }
-        return ix
-      }
-    }
-    n.binLeft = drwWalk(n.binLeft, ctx)
-    n.binRight = drwWalk(n.binRight, ctx)
-    if drwDispatchOp(n.binOp) {
-      const osi = structIndexOfExpr(n.binLeft, ctx)
-      if osi >= 0 {
-        // A free `self`-function named for the operator wins (host parser
-        // order); else an operator closure FIELD dispatches member-call style.
-        if drwSelfFnOf(n.binOp, 2) >= 0 {
-          const oargs: i32[] = []
-          oargs.push(n.binLeft)
-          oargs.push(n.binRight)
-          return mkCall(mkIdent(n.binOp, -1), oargs, -1)
-        }
-        if drwFieldClosure(osi, n.binOp) {
-          const fargs: i32[] = []
-          fargs.push(n.binRight)
-          return mkCall(mkMember(n.binLeft, n.binOp, -1), fargs, -1)
-        }
-      }
-    }
-    return ix
-  }
-  if n is Unary {
-    n.unArg = drwWalk(n.unArg, ctx)
-    return ix
-  }
-  if n is Paren {
-    n.parInner = drwWalk(n.parInner, ctx)
-    return ix
-  }
-  if n is Member {
-    n.memObj = drwWalk(n.memObj, ctx)
-    return ix
-  }
-  if n is OptMember {
-    n.omObj = drwWalk(n.omObj, ctx)
-    return ix
-  }
-  if n is Index {
-    n.idxArr = drwWalk(n.idxArr, ctx)
-    n.idxIndex = drwWalk(n.idxIndex, ctx)
-    // The index READ trap: a struct receiver carrying a "[]" closure field.
-    const tsi = structIndexOfExpr(n.idxArr, ctx)
-    if drwFieldClosure(tsi, "[]") {
-      const targs: i32[] = []
-      targs.push(n.idxIndex)
-      return mkCall(mkMember(n.idxArr, "[]", -1), targs, -1)
-    }
-    return ix
-  }
-  if n is IsExpr {
-    n.isObj = drwWalk(n.isObj, ctx)
-    return ix
-  }
-  if n is ArrayLit {
-    const es = n.arrElems
-    let i3 = 0
-    while i3 < es.length {
-      es[i3] = drwWalk(es[i3], ctx)
-      i3 = i3 + 1
-    }
-    return ix
-  }
-  if n is ObjLit {
-    const fs = n.objFields
-    let i4 = 0
-    while i4 < fs.length {
-      const f = P.nodes[fs[i4]]
-      if f is FieldInit { f.fiValue = drwWalk(f.fiValue, ctx) }
-      i4 = i4 + 1
-    }
-    return ix
-  }
-  ix
-}
-
-// The dispatch-rewrite driver: top-level statements, then every lifted
-// function's body (a nested FuncDecl was lambda-lifted into `fnStmts`).
-function dispatchRewrite(stmts: i32[]) {
-  let i = 0
-  while i < stmts.length {
-    const s = P.nodes[stmts[i]]
-    if s is FuncDecl {
-    } else if s is LetDecl {
-      s.letInit = drwWalk(s.letInit, -1)
-    } else if nodeIsTypeDecl(stmts[i]) {
-    } else if s is UnionDecl {
-    } else {
-      const oldIx = stmts[i]
-      const newIx = drwWalk(oldIx, -1)
-      if newIx != oldIx {
-        // The statement node was REPLACED (e.g. `o[k] = v` → the `(o."[]=")(k,v)`
-        // write-trap call). `startStmts` captured the OLD arena index during
-        // `collectFns` — repoint it so the start function emits the rewritten form.
-        stmts[i] = newIx
-        let ssj = 0
-        while ssj < startStmts.length {
-          if startStmts[ssj] == oldIx { startStmts[ssj] = newIx }
-          ssj = ssj + 1
-        }
-      }
-    }
-    i = i + 1
-  }
-  let fe = 0
-  while fe < fnStmts.length {
-    const fn = P.nodes[fnStmts[fe]]
-    if fn is FuncDecl { fn.fnBody = drwWalk(fn.fnBody, fnStmts[fe]) }
-    fe = fe + 1
-  }
-  0
-}
 
 function monomorphize(stmts: i32[]) {
   monoGen = []
@@ -12992,426 +12697,6 @@ function monomorphize(stmts: i32[]) {
       }
     }
     gp = gp + 1
-  }
-  0
-}
-
-// Pin every un-annotated lambda that returns a UNION to that union, by CONSUMING the contextual return
-// type the CHECKER already computed — instead of re-deriving it per boundary in the emitter.
-//
-// An un-annotated lambda's body-inferred return for a union join (`if … { aCat } else { aDog }`)
-// collapses to ONE arm (a struct / string), so its emitted functype result and `$fnsig` key (`i>s0;` /
-// `i>S`) disagree with a call site's `i>u` — leaving the value call un-interned and the body un-boxed.
-// Pinning `fnRet` to the union makes the lambda emit the boxed-union result (like an annotated `: Cat |
-// Dog` function): it interns `i>u`, boxes each arm via `emitReturnValue`'s `retUNm`, and the call's
-// `ref.cast` + `is`-narrow resolve. The checker proved the union the lambda returns AT ITS BOUNDARY
-// (binding / function-return / struct field / array element / call argument) and recorded it under a
-// node-index sentinel (`inferRetNameByNode`, the #533 channel) — so reading it pins the return at EVERY
-// position UNIFORMLY, with no per-boundary walk (the abstraction the emitter's syntactic re-derivation
-// otherwise lacks). Runs BEFORE monomorphization (a HOF-bound clone inherits `nret = fnRet`) and the
-// shape passes (the union's box + variants intern for the return). A non-union recorded return / an
-// already-annotated lambda is left untouched → byte-identical (the compiler has no union-returning
-// lambdas, so the native fixpoint is unaffected).
-function synthRetAnnots() {
-  if !fnValUsed { return 0 }
-  let fe = 0
-  while fe < fnStmts.length {
-    const lamIx = fnStmts[fe]
-    const fn = P.nodes[lamIx]
-    if fn is FuncDecl {
-      if fn.fnRet < 0 {
-        const ctx = inferRetNameByNode(lamIx)
-        if ctx != "" {
-          if isUName(ctx) || isValueUnionName(ctx) {
-            fn.fnRet = synthTypeRef(ctx, -1)
-          } else if nullablePartOf(ctx) != "" {
-            // A NULLABLE-ref return (`P | null`, `string | null`) the checker proved at the lambda's
-            // boundary — pin it so the lambda's `$fnsig` result keys the nullable token (`>n<idx>;` /
-            // `>N`), matching the value call's key. The niche/nullable-struct lowering already exists
-            // for the annotated form; this routes the anonymous lambda through it. (Nullable dual of
-            // the union pin.)
-            fn.fnRet = synthTypeRef(ctx, -1)
-          }
-        }
-      }
-    }
-    fe = fe + 1
-  }
-  0
-}
-
-function synthParamAnnots() {
-  let fe = 0
-  while fe < fnStmts.length {
-    const fn = P.nodes[fnStmts[fe]]
-    if fn is FuncDecl {
-      const ps = fn.fnParams
-      let pi = 0
-      while pi < ps.length {
-        const p = P.nodes[ps[pi]]
-        if p is Param {
-          if p.parType < 0 && nodeTyIsUnion(ps[pi]) && unNames.length > 0 {
-            // An un-annotated UNION-element callback param (`xs.filter((a) => a is Cat)`):
-            // the checker typed it as a value union. Pin it to a declared union alias so
-            // its `is`-narrowing and closure `$fnsig` param token (kind 4) resolve. All
-            // unions share `$uBox` and program-global variant tags, so any declared alias
-            // routes emission identically; the checker already validated the precise type.
-            p.parType = synthTypeRef(unNames[0], -1)
-          } else if p.parType < 0 {
-            const tn = nodeTyName(ps[pi])
-            if tn != "" {
-              // Resolve the checker's shape name to the emitter's nominal form — a struct / variant
-              // shape to its declared name, a ref-array shape recursively to `<element>[]` — so
-              // `checkParams` / the struct- and ref-list-param machinery key on it. A scalar /
-              // string / closure name passes through.
-              const nn = synthTypeRef(resolveShapeToNominal(tn), -1)
-              // Copy the param's recorded arena type onto the synthesized annotation — its interned
-              // `#anonN` shape name is not `nameToTy`-resolvable, but the param node carries the type.
-              recordNodeTyFrom(nn, ps[pi])
-              p.parType = nn
-            }
-          }
-        }
-        pi = pi + 1
-      }
-    }
-    fe = fe + 1
-  }
-  0
-}
-
-// ── captured-MUTATION boxing ──────────────────────────────────────────────────────────────
-// Closures capture by VALUE (the env struct copies each captured local), so a local MUTATED
-// inside a closure cannot be reflected back — and a bare `c = …` in the closure has no local
-// slot, failing at emit ("assignment target is not a parameter, local, or global"). The fix is
-// a pure AST rewrite, done before monomorphization so instances inherit it: a captured-mutated
-// local is boxed as a LENGTH-1 ARRAY (a shared heap ref both scopes index). `let c = init`
-// becomes `let c = [init]`, and EVERY use of `c` (read OR assignment target) becomes `c[0]`, so
-// the closure's `c = c + 1` lowers to the indexed write `c[0] = c[0] + 1` into the shared array,
-// visible in the maker. Arrays are already capturable + index-assignable through a closure.
-//
-// Conservative: only a DIRECT `let` of the maker that is assigned INSIDE a nested lambda and is
-// NOT shadowed by any nested binding (param / let / loop var) is boxed. Anything else is left
-// untouched, falling back to the existing loud error rather than risking a mis-rewrite.
-
-// One scan of a maker body: `dlets` = the maker's own `let` names (depth 0); `alam` = names
-// ASSIGNED inside a nested lambda (depth > 0); `ndecls` = every binding declared inside a nested
-// lambda (params / lets / loop vars) — the shadow set.
-function cboxScan(
-  ix: i32,
-  depth: i32,
-  dlets: string[],
-  alam: string[],
-  ndecls: string[],
-) {
-  if ix < 0 { return 0 }
-  const n = P.nodes[ix]
-  if n is FuncDecl {
-    const ps = n.fnParams
-    let pi = 0
-    while pi < ps.length {
-      const p = P.nodes[ps[pi]]
-      if p is Param {
-        if !capHas(ndecls, p.parName) { ndecls.push(p.parName) }
-      }
-      pi = pi + 1
-    }
-    return cboxScan(n.fnBody, depth + 1, dlets, alam, ndecls)
-  }
-  if n is LetDecl {
-    if depth == 0 {
-      if !capHas(dlets, n.letName) { dlets.push(n.letName) }
-    } else {
-      if !capHas(ndecls, n.letName) { ndecls.push(n.letName) }
-    }
-    return cboxScan(n.letInit, depth, dlets, alam, ndecls)
-  }
-  if n is Block {
-    const bs = n.blkStmts
-    let i = 0
-    while i < bs.length {
-      cboxScan(bs[i], depth, dlets, alam, ndecls)
-      i = i + 1
-    }
-    return 0
-  }
-  if n is BinExpr {
-    if n.binOp == "=" {
-      if depth > 0 {
-        const t = P.nodes[n.binLeft]
-        if t is Ident {
-          if !capHas(alam, t.identName) { alam.push(t.identName) }
-        }
-      }
-    }
-    cboxScan(n.binLeft, depth, dlets, alam, ndecls)
-    return cboxScan(n.binRight, depth, dlets, alam, ndecls)
-  }
-  if n is IfStmt {
-    cboxScan(n.ifCond, depth, dlets, alam, ndecls)
-    cboxScan(n.ifThen, depth, dlets, alam, ndecls)
-    return cboxScan(n.ifElse, depth, dlets, alam, ndecls)
-  }
-  if n is WhileStmt {
-    cboxScan(n.whileCond, depth, dlets, alam, ndecls)
-    return cboxScan(n.whileBody, depth, dlets, alam, ndecls)
-  }
-  if n is ForRange {
-    if !capHas(ndecls, n.frVar) { ndecls.push(n.frVar) }
-    cboxScan(n.frFrom, depth, dlets, alam, ndecls)
-    cboxScan(n.frTo, depth, dlets, alam, ndecls)
-    cboxScan(n.frStep, depth, dlets, alam, ndecls)
-    return cboxScan(n.frBody, depth, dlets, alam, ndecls)
-  }
-  if n is ForIn {
-    if !capHas(ndecls, n.fiVar) { ndecls.push(n.fiVar) }
-    cboxScan(n.fiIter, depth, dlets, alam, ndecls)
-    return cboxScan(n.fiBody, depth, dlets, alam, ndecls)
-  }
-  if n is RetStmt { return cboxScan(n.retArg, depth, dlets, alam, ndecls) }
-  if n is Unary { return cboxScan(n.unArg, depth, dlets, alam, ndecls) }
-  if n is Paren { return cboxScan(n.parInner, depth, dlets, alam, ndecls) }
-  if n is Member { return cboxScan(n.memObj, depth, dlets, alam, ndecls) }
-  if n is OptMember { return cboxScan(n.omObj, depth, dlets, alam, ndecls) }
-  if n is Index {
-    cboxScan(n.idxArr, depth, dlets, alam, ndecls)
-    return cboxScan(n.idxIndex, depth, dlets, alam, ndecls)
-  }
-  if n is IsExpr { return cboxScan(n.isObj, depth, dlets, alam, ndecls) }
-  if n is Call {
-    cboxScan(n.callFn, depth, dlets, alam, ndecls)
-    const args = n.callArgs
-    let ci = 0
-    while ci < args.length {
-      cboxScan(args[ci], depth, dlets, alam, ndecls)
-      ci = ci + 1
-    }
-    return 0
-  }
-  if n is ArrayLit {
-    const es = n.arrElems
-    let ei = 0
-    while ei < es.length {
-      cboxScan(es[ei], depth, dlets, alam, ndecls)
-      ei = ei + 1
-    }
-    return 0
-  }
-  if n is ObjLit {
-    const fs = n.objFields
-    let fi = 0
-    while fi < fs.length {
-      const f = P.nodes[fs[fi]]
-      if f is FieldInit { cboxScan(f.fiValue, depth, dlets, alam, ndecls) }
-      fi = fi + 1
-    }
-    return 0
-  }
-  0
-}
-
-// Rewrite the maker body (and its nested lambda bodies): a USE of a boxed name → `c[0]`, and a
-// boxed `let c = init` → `let c = [init]`. Returns the (possibly replaced) node index so parents
-// reassign — mirrors `drwWalk`, plus descending into `FuncDecl` bodies.
-function cboxWalk(ix: i32, boxed: string[]) {
-  if ix < 0 { return ix }
-  const n = P.nodes[ix]
-  if n is Ident {
-    if capHas(boxed, n.identName) {
-      return mkIndex(mkIdent(n.identName, -1), mkNum("0", -1), -1)
-    }
-    return ix
-  }
-  if n is FuncDecl {
-    n.fnBody = cboxWalk(n.fnBody, boxed)
-    return ix
-  }
-  if n is Block {
-    const bs = n.blkStmts
-    let i = 0
-    while i < bs.length {
-      bs[i] = cboxWalk(bs[i], boxed)
-      i = i + 1
-    }
-    return ix
-  }
-  if n is LetDecl {
-    n.letInit = cboxWalk(n.letInit, boxed)
-    if capHas(boxed, n.letName) {
-      // Convert a SCALAR annotation to its array form so the boxed length-1 list classifies as the
-      // matching list type (`let c: f64` → `let c: f64[]`; an `f32` annotation is what makes the
-      // `[0.0]` literal build f32, not the f64 default). An UN-annotated local needs no conversion —
-      // the `[init]` literal infers its element type (`let c = 0` → i32[], `= 0.0` → f64[]).
-      if n.letType >= 0 {
-        const lt = P.nodes[n.letType]
-        if lt is TypeRef { n.letType = synthTypeRef(lt.tyName + "[]", -1) }
-      }
-      const els: i32[] = []
-      els.push(n.letInit)
-      n.letInit = mkArrayLit(els, -1)
-    }
-    return ix
-  }
-  if n is BinExpr {
-    n.binLeft = cboxWalk(n.binLeft, boxed)
-    n.binRight = cboxWalk(n.binRight, boxed)
-    return ix
-  }
-  if n is IfStmt {
-    n.ifCond = cboxWalk(n.ifCond, boxed)
-    n.ifThen = cboxWalk(n.ifThen, boxed)
-    n.ifElse = cboxWalk(n.ifElse, boxed)
-    return ix
-  }
-  if n is WhileStmt {
-    n.whileCond = cboxWalk(n.whileCond, boxed)
-    n.whileBody = cboxWalk(n.whileBody, boxed)
-    return ix
-  }
-  if n is ForRange {
-    n.frFrom = cboxWalk(n.frFrom, boxed)
-    n.frTo = cboxWalk(n.frTo, boxed)
-    n.frStep = cboxWalk(n.frStep, boxed)
-    n.frBody = cboxWalk(n.frBody, boxed)
-    return ix
-  }
-  if n is ForIn {
-    n.fiIter = cboxWalk(n.fiIter, boxed)
-    n.fiBody = cboxWalk(n.fiBody, boxed)
-    return ix
-  }
-  if n is RetStmt {
-    n.retArg = cboxWalk(n.retArg, boxed)
-    return ix
-  }
-  if n is Unary {
-    n.unArg = cboxWalk(n.unArg, boxed)
-    return ix
-  }
-  if n is Paren {
-    n.parInner = cboxWalk(n.parInner, boxed)
-    return ix
-  }
-  if n is Member {
-    n.memObj = cboxWalk(n.memObj, boxed)
-    return ix
-  }
-  if n is OptMember {
-    n.omObj = cboxWalk(n.omObj, boxed)
-    return ix
-  }
-  if n is Index {
-    n.idxArr = cboxWalk(n.idxArr, boxed)
-    n.idxIndex = cboxWalk(n.idxIndex, boxed)
-    return ix
-  }
-  if n is IsExpr {
-    n.isObj = cboxWalk(n.isObj, boxed)
-    return ix
-  }
-  if n is Call {
-    n.callFn = cboxWalk(n.callFn, boxed)
-    const args = n.callArgs
-    let ci = 0
-    while ci < args.length {
-      args[ci] = cboxWalk(args[ci], boxed)
-      ci = ci + 1
-    }
-    return ix
-  }
-  if n is ArrayLit {
-    const es = n.arrElems
-    let ei = 0
-    while ei < es.length {
-      es[ei] = cboxWalk(es[ei], boxed)
-      ei = ei + 1
-    }
-    return ix
-  }
-  if n is ObjLit {
-    const fs = n.objFields
-    let fi = 0
-    while fi < fs.length {
-      const f = P.nodes[fs[fi]]
-      if f is FieldInit { f.fiValue = cboxWalk(f.fiValue, boxed) }
-      fi = fi + 1
-    }
-    return ix
-  }
-  return ix
-}
-
-// The INIT of the maker's direct `let name` (searching statements, NOT descending into a nested
-// lambda or an expression), or -1. Used to gate boxing on a known element type.
-function cboxInitOf(ix: i32, name: string) {
-  if ix < 0 { return -1 }
-  const n = P.nodes[ix]
-  if n is LetDecl {
-    if n.letName == name { return n.letInit }
-    return -1
-  }
-  if n is Block {
-    const bs = n.blkStmts
-    let i = 0
-    while i < bs.length {
-      const r = cboxInitOf(bs[i], name)
-      if r >= 0 { return r }
-      i = i + 1
-    }
-    return -1
-  }
-  if n is IfStmt {
-    const rt = cboxInitOf(n.ifThen, name)
-    if rt >= 0 { return rt }
-    return cboxInitOf(n.ifElse, name)
-  }
-  if n is WhileStmt { return cboxInitOf(n.whileBody, name) }
-  if n is ForRange { return cboxInitOf(n.frBody, name) }
-  if n is ForIn { return cboxInitOf(n.fiBody, name) }
-  -1
-}
-
-// True if `initIx` is a SCALAR LITERAL — an integer (`i32`/`i64`), float (`f64`, or `f32` via the
-// annotation), or string. A captured-mutated local with such an init boxes cleanly into a length-1
-// list of the matching scalar type: `cboxWalk` converts the annotation to its array form, the list
-// type is collected (`cboxForceListUse`), and the CLOSURE classifies the captured env field's list
-// kind (`capturedKindOf`, consulted by `exprF64Array`/`exprI64Array`/`exprF32Array`/
-// `exprStringArray`). Covers the counter/accumulator case at every scalar type. A non-scalar-literal
-// init (struct / closure / call) is left to the loud error rather than mis-lowered.
-function cboxInitScalar(initIx: i32) {
-  if initIx < 0 { return false }
-  const n = P.nodes[initIx]
-  if n is NumLit { return true }
-  if n is StrLit { return true }
-  false
-}
-
-// Per top-level function: box each direct `let` that is assigned inside a nested lambda and not
-// shadowed (and, for now, has an i32 integer init). Usage-gated — a program with no such local
-// rewrites nothing (identical bytes).
-function captureBoxRewrite(_stmts: i32[]) {
-  let fe = 0
-  while fe < fnStmts.length {
-    const fn = P.nodes[fnStmts[fe]]
-    if fn is FuncDecl {
-      const dlets: string[] = []
-      const alam: string[] = []
-      const ndecls: string[] = []
-      cboxScan(fn.fnBody, 0, dlets, alam, ndecls)
-      const boxed: string[] = []
-      let di = 0
-      while di < dlets.length {
-        const nm = dlets[di]
-        if capHas(alam, nm) {
-          if !capHas(ndecls, nm) {
-            if cboxInitScalar(cboxInitOf(fn.fnBody, nm)) { boxed.push(nm) }
-          }
-        }
-        di = di + 1
-      }
-      if boxed.length > 0 { fn.fnBody = cboxWalk(fn.fnBody, boxed) }
-    }
-    fe = fe + 1
   }
   0
 }
