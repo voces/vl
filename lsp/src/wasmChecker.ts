@@ -1077,6 +1077,11 @@ export const createWasmChecker = (
     const endColOf = typeof exp.diagEndCol === "function"
       ? (i: number) => exp.diagEndCol(i)
       : (i: number) => exp.diagCol(i);
+    // The stable per-diagnostic category code (`unsupported-lowering`, …) rides
+    // the `diagCodeLen`/`diagCodeByte` exports; an older seed lacks them, so the
+    // code is simply absent (editors show the bare message).
+    const hasCodes = typeof exp.diagCodeLen === "function" &&
+      typeof exp.diagCodeByte === "function";
     for (let i = 0; i < count; i++) {
       const message = readString(exp.diagMsgLen(i), (j) => exp.diagMsgAt(i, j));
       const line = exp.diagLine(i); // 1-based; 0 = positionless
@@ -1084,10 +1089,14 @@ export const createWasmChecker = (
       const lspLine = line > 0 ? line - 1 : 0;
       const startChar = line > 0 ? col : 0;
       const endChar = line > 0 ? Math.max(endColOf(i), col) : 0;
+      const code = hasCodes
+        ? readString(exp.diagCodeLen(i), (j) => exp.diagCodeByte(i, j))
+        : "";
       diags.push({
         message,
         severity: "error",
         source: "vital",
+        ...(code.length > 0 ? { code } : {}),
         range: {
           start: { line: lspLine, character: startChar },
           end: { line: lspLine, character: endChar },
