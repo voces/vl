@@ -181,22 +181,30 @@ fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>,
                 }
                 _ => false,
             };
-            if fresh {
-                match unsafe { Module::deserialize_file(engine, &sidecar) } {
-                    Ok(m) => m,
-                    Err(_) => Module::from_file(engine, compiler_path)?, // stale config/version — recompile
-                }
-            } else {
+            // Compile from the `.wasm` and rewrite the sidecar. The write is
+            // best-effort (read-only dirs etc. are non-fatal) and also runs on
+            // the fresh-but-undeserializable path below, so a sidecar from a
+            // different wasmtime version/config (e.g. restored by a CI cache
+            // with its mtime intact) heals on first use instead of forcing a
+            // recompile on every later invocation.
+            let compile_and_cache = || -> Result<Module> {
                 let m = Module::from_file(engine, compiler_path).map_err(|e| {
                     e.context(format!(
                         "loading compiler module `{compiler_path}` (build it with: scripts/refresh-compiler.sh)"
                     ))
                 })?;
-                // Best-effort cache write; failure is non-fatal (read-only dirs etc.).
                 if let Ok(bytes) = m.serialize() {
                     let _ = std::fs::write(&sidecar, bytes);
                 }
-                m
+                Ok(m)
+            };
+            if fresh {
+                match unsafe { Module::deserialize_file(engine, &sidecar) } {
+                    Ok(m) => m,
+                    Err(_) => compile_and_cache()?, // stale config/version — recompile
+                }
+            } else {
+                compile_and_cache()?
             }
         }
     };

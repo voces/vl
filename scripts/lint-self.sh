@@ -14,11 +14,15 @@
 # is excluded by construction (never passed in).
 #
 # fmt IS gated here too (below): `vl fmt --check` over the source `.vl`
-# (compiler/, std/, scripts/) — the directory walk only visits `.vl`, so the
-# `.ts`/`.sh` alongside scripts/ are ignored. `tests/` is excluded by
-# construction (the deliberately-malformed fixture corpus is never fmt-clean and
-# is not source we ship). Unlike the lint above, fmt is PER-FILE (it needs no
-# cross-file resolution), so the real source files are checked directly.
+# (compiler/, std/, scripts/) — only `.vl` files are gathered, so the `.ts`/`.sh`
+# alongside scripts/ are ignored. `tests/` is excluded by construction (the
+# deliberately-malformed fixture corpus is never fmt-clean and is not source we
+# ship). Unlike the lint above, fmt is PER-FILE (it needs no cross-file
+# resolution), so the files fan out over the cores (`xargs -P`) — the formatter
+# is the dominant cost of this gate and every file is independent — while the
+# module-graph check runs concurrently in the background. Same files, same
+# checks, same gates as running everything sequentially; only the schedule
+# differs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -29,20 +33,31 @@ VL="${VL:-scripts/vl-host/target/release/vl}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# The compiler is a real module graph now — lint it through its entry, so the
-# checker resolves `import`/`export` across the modules exactly as a build does.
-echo "== self-lint: the compiler module graph =="
-"$VL" check compiler/entry.vl --severity info
-
+# std/ goes first: it is near-instant AND its module load warms the seed's
+# `.cwasm` sidecar, so the parallel workers below all deserialize instead of
+# racing to Cranelift-compile (and write the same sidecar) at once.
 echo "== self-lint: std/ =="
 "$VL" check std/ --severity info
 
+# The compiler is a real module graph — lint it through its entry, so the
+# checker resolves `import`/`export` across the modules exactly as a build does.
+# Backgrounded across the fmt sweep: it shares no state with fmt (diagnostics
+# buffer to a log, replayed below, so output stays unscrambled).
+echo "== self-lint: the compiler module graph (concurrent with fmt) =="
+"$VL" check compiler/entry.vl --severity info > "$WORK/graph.log" 2>&1 &
+GRAPH_PID=$!
+
 # fmt gate: the source tree must be `vl fmt`-clean. `--check` exits non-zero on
-# any drift (set -e fails the run), naming the offending file on stderr. tests/
-# is NOT passed in.
-echo "== fmt-check: compiler/ std/ scripts/ =="
-"$VL" fmt --check compiler/
-"$VL" fmt --check std/
-"$VL" fmt --check scripts/
+# any drift, naming the offending file on stderr; xargs propagates any failure
+# (exit 123) and set -e fails the run. tests/ is NOT passed in.
+echo "== fmt-check: compiler/ std/ scripts/ (parallel per file) =="
+find compiler std scripts -name '*.vl' -print0 \
+  | xargs -0 -n 1 -P "$(nproc)" "$VL" fmt --check
+
+echo "== self-lint: the compiler module graph (result) =="
+GRAPH_RC=0
+wait "$GRAPH_PID" || GRAPH_RC=$?
+cat "$WORK/graph.log"
+[ "$GRAPH_RC" = 0 ] || exit "$GRAPH_RC"
 
 echo "self-lint + fmt-check clean ✅"
