@@ -4,17 +4,14 @@
 # `prefer-const` opportunity, an unused binding/function, or any warning/error in
 # our source fails CI.
 #
-# The compiler is a CONCATENATION (the sed-rename + cat assembly that
-# refresh-compiler.sh / native-fixpoint.sh use), so we lint the WHOLE assembled
-# program as one unit rather than per file: the driver and cli.vl reference
-# globals from across the assembly and don't type-check standalone, and a
-# whole-program pass keeps cross-file reassignments visible (so `prefer-const`
-# doesn't false-positive on an exported global the driver rebinds). `std/` is
-# linted as ordinary modules. `tests/` — the corpus of deliberately-malformed
-# fixtures — is excluded by construction (never assembled, never passed in).
-#
-# A failure prints positions against the assembled file; to get source-file
-# positions while developing, run `vl check <file.vl>` (or `vl check compiler/`).
+# The compiler is a real module graph (entry.vl → driver → the pipeline), and a
+# single-file `vl check` lints EVERY module of the resolved graph (the
+# per-module lint tier), each finding attributed to its own file — so checking
+# the entry covers all of compiler/*.vl with source-file positions.
+# `prefer-const` stays safe on cross-module reassignment because EXPORTED
+# bindings are exempt (another module may rebind them). `std/` is linted as
+# ordinary modules. `tests/` — the corpus of deliberately-malformed fixtures —
+# is excluded by construction (never passed in).
 #
 # fmt IS gated here too (below): `vl fmt --check` over the source `.vl`
 # (compiler/, std/, scripts/) — the directory walk only visits `.vl`, so the
