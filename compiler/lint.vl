@@ -63,6 +63,7 @@ import {
   BreakStmt,
   Call,
   ContinueStmt,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
@@ -81,6 +82,7 @@ import {
   Paren,
   Program,
   RetStmt,
+  TypeDecl,
   Unary,
   WhileStmt,
   declNameTok,
@@ -205,23 +207,162 @@ export function lint(progRoot: i32) {
   const root = P.nodes[progRoot]
   if root is Program {
     const stmts = root.progStmts
-    // Rule order mirrors the TS `lint` driver so the diagnostic SEQUENCE matches:
-    // unused-variable, unused-function, prefer-const, then the per-statement
-    // structural rules. The use/write reference set drives the binding rules and
-    // unused-function alike, so collect it once first.
+    // Rule order: unused-variable, unused-function, prefer-const, then one
+    // full-program walk per structural rule. Display order is position-sorted
+    // downstream (the CLI's stable sort), so the emit sequence here only breaks
+    // same-position ties. The use/write reference set drives the binding rules
+    // and unused-function alike, so collect it once first.
     collectReferencedNames(progRoot)
     unusedBindings(progRoot)
     unusedFunctions(stmts)
     preferConst(progRoot)
+    lintWalk(lintRuleUnreachable, progRoot)
+    lintWalk(lintRuleConstBranch, progRoot)
+    lintWalk(lintRuleStepZero, progRoot)
+  }
+  lintCodes.length
+}
+
+// ── Generic AST walk (one child-enumerator, per-rule visit dispatch) ──────────
+// Every structural rule needs the same full recursive traversal of the node
+// arena. One shared walker carries the recursion: `nodeChildren` is the ONE
+// place that knows each variant's child slots, and `lintWalk` drives a pre-order
+// traversal calling one rule's per-node visit, selected by a rule id (module-
+// level function dispatch — the codebase's no-closures idiom). Growing the AST
+// means extending `nodeChildren` once; every rule picks the new kind up.
+const lintRuleRef = 0
+const lintRuleDecl = 1
+const lintRuleConstBranch = 2
+const lintRuleStepZero = 3
+const lintRuleUnreachable = 4
+
+// Visit `ix` for `rule`, then recurse into its children (pre-order: a rule sees
+// a node before any of its descendants). `-1` child slots (absent) and any
+// out-of-range index are skipped by the bounds check, so the walk never traps.
+function lintWalk(rule: i32, ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  if rule == lintRuleRef { refVisit(ix) }
+  else if rule == lintRuleDecl { declVisit(ix) }
+  else if rule == lintRuleConstBranch { constantBranchVisit(ix) }
+  else if rule == lintRuleStepZero { degenerateStepVisit(ix) }
+  else if rule == lintRuleUnreachable { unreachableVisit(ix) }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    lintWalk(rule, kids[i])
+    i = i + 1
+  }
+  0
+}
+
+// The child arena indices of `P.nodes[ix]`, in source order. A slot holding
+// `-1` (absent) is pushed as-is; the walker's bounds check skips it. Covers
+// VALUE children (expressions, statements, bodies, initializers) and
+// type-annotation slots (`TypeRef`/`FieldDef` — inert leaves for every current
+// rule, but traversed so a richer type AST is covered automatically). A
+// `MatchExpr`'s PATTERNS are deliberately NOT children: a pattern is a literal
+// shape or the wildcard `_` (an `Ident "_"`), not a value reference, so the
+// reference rule must not count one as a use.
+function nodeChildren(ix: i32) {
+  const out: i32[] = []
+  if ix < 0 || ix >= P.nodes.length { return out }
+  const n = P.nodes[ix]
+  if n is Unary {
+    out.push(n.unArg)
+  } else if n is BinExpr {
+    out.push(n.binLeft)
+    out.push(n.binRight)
+  } else if n is Call {
+    out.push(n.callFn)
     let i = 0
-    while i < stmts.length {
-      unreachableInStatement(stmts[i])
-      constantBranchInStatement(stmts[i])
-      degenerateStepInStatement(stmts[i])
+    while i < n.callArgs.length {
+      out.push(n.callArgs[i])
+      i = i + 1
+    }
+  } else if n is Member {
+    out.push(n.memObj)
+  } else if n is OptMember {
+    out.push(n.omObj)
+  } else if n is Paren {
+    out.push(n.parInner)
+  } else if n is Index {
+    out.push(n.idxArr)
+    out.push(n.idxIndex)
+  } else if n is ArrayLit {
+    let i = 0
+    while i < n.arrElems.length {
+      out.push(n.arrElems[i])
+      i = i + 1
+    }
+  } else if n is ObjLit {
+    let i = 0
+    while i < n.objFields.length {
+      out.push(n.objFields[i])
+      i = i + 1
+    }
+  } else if n is FieldInit {
+    out.push(n.fiValue)
+  } else if n is IsExpr {
+    out.push(n.isObj)
+  } else if n is LetDecl {
+    out.push(n.letType)
+    out.push(n.letInit)
+  } else if n is Param {
+    out.push(n.parType)
+  } else if n is FuncDecl {
+    let i = 0
+    while i < n.fnParams.length {
+      out.push(n.fnParams[i])
+      i = i + 1
+    }
+    out.push(n.fnRet)
+    out.push(n.fnBody)
+  } else if n is IfStmt {
+    out.push(n.ifCond)
+    out.push(n.ifThen)
+    out.push(n.ifElse)
+  } else if n is WhileStmt {
+    out.push(n.whileCond)
+    out.push(n.whileBody)
+  } else if n is ForRange {
+    out.push(n.frFrom)
+    out.push(n.frTo)
+    out.push(n.frStep)
+    out.push(n.frBody)
+  } else if n is ForIn {
+    out.push(n.fiIter)
+    out.push(n.fiBody)
+  } else if n is MatchExpr {
+    out.push(n.matchScrut)
+    let i = 0
+    while i < n.matchBodies.length {
+      out.push(n.matchBodies[i])
+      i = i + 1
+    }
+  } else if n is RetStmt {
+    out.push(n.retArg)
+  } else if n is Block {
+    let i = 0
+    while i < n.blkStmts.length {
+      out.push(n.blkStmts[i])
+      i = i + 1
+    }
+  } else if n is Program {
+    let i = 0
+    while i < n.progStmts.length {
+      out.push(n.progStmts[i])
+      i = i + 1
+    }
+  } else if n is FieldDef {
+    out.push(n.fdType)
+  } else if n is TypeDecl {
+    let i = 0
+    while i < n.tdFields.length {
+      out.push(n.tdFields[i])
       i = i + 1
     }
   }
-  lintCodes.length
+  out
 }
 
 // ── 3. Dead / constant branch (literal-boolean condition) ────────────────────
@@ -230,60 +371,18 @@ export function lint(progRoot: i32) {
 //   - `if false { … }`            → the then-branch is dead.
 //   - `if true { … } else { … }`  → the else-branch is dead.
 //   - `while false { … }`         → the body never runs.
-// One warning per dead construct, pointing at the dead branch/body. Recurses so
-// nested constructs are still scanned (including the live branch's contents).
+// One warning per dead construct, pointing at the dead branch/body. The shared
+// walker (`lintWalk`) carries the recursion, so nested constructs — including
+// the live branch's contents — are still scanned.
 //
 // VL desugars an `else if` chain into a NESTED `IfStmt` in the `ifElse` slot
 // (the TS host keeps a flat `conditionals[]` array). So a chained `else if false`
 // is reached by the ordinary recursion into `ifElse` — each `IfStmt` examines its
 // OWN single condition, which is the natural fit for the desugared shape.
-function constantBranchInStatement(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
+function constantBranchVisit(ix: i32) {
   const s = P.nodes[ix]
-  if s is IfStmt {
-    reportConstantIf(s)
-    constantBranchInStatement(s.ifThen)
-    if s.ifElse >= 0 { constantBranchInStatement(s.ifElse) }
-  } else if s is WhileStmt {
-    reportConstantWhile(s)
-    constantBranchInStatement(s.whileBody)
-  } else if s is Block {
-    const st = s.blkStmts
-    let i = 0
-    while i < st.length {
-      constantBranchInStatement(st[i])
-      i = i + 1
-    }
-  } else if s is ForRange {
-    constantBranchInStatement(s.frBody)
-  } else if s is ForIn {
-    constantBranchInStatement(s.fiBody)
-  } else if s is RetStmt {
-    if s.retArg >= 0 { constantBranchInExpr(s.retArg) }
-  } else if s is LetDecl {
-    if s.letInit >= 0 { constantBranchInExpr(s.letInit) }
-  } else {
-    constantBranchInExpr(ix)
-  }
-  0
-}
-
-// Descend expressions that can host statements (blocks-as-values, fn bodies).
-function constantBranchInExpr(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const e = P.nodes[ix]
-  if e is Block {
-    const st = e.blkStmts
-    let i = 0
-    while i < st.length {
-      constantBranchInStatement(st[i])
-      i = i + 1
-    }
-  } else if e is IfStmt {
-    constantBranchInStatement(ix)
-  } else if e is FuncDecl {
-    constantBranchInStatement(e.fnBody)
-  }
+  if s is IfStmt { reportConstantIf(s) }
+  else if s is WhileStmt { reportConstantWhile(s) }
   0
 }
 
@@ -333,55 +432,14 @@ function reportConstantWhile(node: WhileStmt) {
 
 // ── 4. Degenerate `for` step (literal `step 0`) ──────────────────────────────
 // A range `for` written with a literal `step 0` never advances its loop variable
-// — a degenerate / infinite loop. Reported as an ERROR. Recurses into nested
-// bodies. (The native type checker ALSO flags this — see `typecheck.vl` — so the
-// two would double-report if combined; this port reproduces the lint rule's
-// own diagnostic for the standalone-lint differential.)
-function degenerateStepInStatement(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
+// — a degenerate / infinite loop. Reported as an ERROR. The shared walker
+// reaches nested bodies. (The native type checker ALSO flags this — see
+// `typecheck.vl` — so the two would double-report if combined; this port
+// reproduces the lint rule's own diagnostic for the standalone-lint
+// differential.)
+function degenerateStepVisit(ix: i32) {
   const s = P.nodes[ix]
-  if s is ForRange {
-    reportDegenerateStep(s)
-    degenerateStepInStatement(s.frBody)
-  } else if s is ForIn {
-    degenerateStepInStatement(s.fiBody)
-  } else if s is WhileStmt {
-    degenerateStepInStatement(s.whileBody)
-  } else if s is IfStmt {
-    degenerateStepInStatement(s.ifThen)
-    if s.ifElse >= 0 { degenerateStepInStatement(s.ifElse) }
-  } else if s is Block {
-    const st = s.blkStmts
-    let i = 0
-    while i < st.length {
-      degenerateStepInStatement(st[i])
-      i = i + 1
-    }
-  } else if s is RetStmt {
-    if s.retArg >= 0 { degenerateStepInExpr(s.retArg) }
-  } else if s is LetDecl {
-    if s.letInit >= 0 { degenerateStepInExpr(s.letInit) }
-  } else {
-    degenerateStepInExpr(ix)
-  }
-  0
-}
-
-function degenerateStepInExpr(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const e = P.nodes[ix]
-  if e is Block {
-    const st = e.blkStmts
-    let i = 0
-    while i < st.length {
-      degenerateStepInStatement(st[i])
-      i = i + 1
-    }
-  } else if e is IfStmt {
-    degenerateStepInStatement(ix)
-  } else if e is FuncDecl {
-    degenerateStepInStatement(e.fnBody)
-  }
+  if s is ForRange { reportDegenerateStep(s) }
   0
 }
 
@@ -442,66 +500,30 @@ function stmtDiverges(ix: i32) {
   false
 }
 
-// Walk a statement, reporting the FIRST unreachable statement in every block it
-// contains (one diagnostic per block). Recurses through nested blocks, `if`
-// branches, and loop bodies so unreachable code is found at any depth.
-function unreachableInStatement(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
+// Report the FIRST unreachable statement in each block (one diagnostic per
+// block). The shared walker reaches every block — nested blocks, `if` branches,
+// loop bodies, blocks in expression position, function bodies — and still
+// recurses into an already-dead tail, so unreachable code nested deeper is
+// reported too.
+function unreachableVisit(ix: i32) {
   const s = P.nodes[ix]
   if s is Block {
-    unreachableInBlock(s)
-  } else if s is IfStmt {
-    unreachableInExpr(s.ifCond)
-    unreachableInStatement(s.ifThen)
-    if s.ifElse >= 0 { unreachableInStatement(s.ifElse) }
-  } else if s is WhileStmt {
-    unreachableInExpr(s.whileCond)
-    unreachableInStatement(s.whileBody)
-  } else if s is ForRange {
-    unreachableInStatement(s.frBody)
-  } else if s is ForIn {
-    unreachableInStatement(s.fiBody)
-  } else if s is RetStmt {
-    if s.retArg >= 0 { unreachableInExpr(s.retArg) }
-  } else if s is LetDecl {
-    if s.letInit >= 0 { unreachableInExpr(s.letInit) }
-  } else {
-    unreachableInExpr(ix)
+    const st = s.blkStmts
+    let dead = -1
+    let i = 1
+    while i < st.length {
+      if dead < 0 && stmtDiverges(st[i - 1]) { dead = i }
+      i = i + 1
+    }
+    if dead >= 0 {
+      lintEmit(
+        "unreachable-code",
+        "Unreachable code: this can never execute",
+        "warning",
+        st[dead],
+      )
+    }
   }
-  0
-}
-
-function unreachableInBlock(block: Block) {
-  const st = block.blkStmts
-  let dead = -1
-  let i = 0
-  while i < st.length {
-    if dead < 0 && i > 0 && stmtDiverges(st[i - 1]) { dead = i }
-    // Always recurse into each statement so unreachable code nested deeper is
-    // still reported even within an already-dead tail.
-    unreachableInStatement(st[i])
-    i = i + 1
-  }
-  if dead >= 0 {
-    lintEmit(
-      "unreachable-code",
-      "Unreachable code: this can never execute",
-      "warning",
-      st[dead],
-    )
-  }
-  0
-}
-
-// Descend into expressions to reach embedded statements: a block can appear in
-// expression position (`let x = { stmt; value }`), and a function declaration's
-// body is a statement nested under an expression.
-function unreachableInExpr(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const e = P.nodes[ix]
-  if e is Block { unreachableInBlock(e) }
-  else if e is IfStmt { unreachableInStatement(ix) }
-  else if e is FuncDecl { unreachableInStatement(e.fnBody) }
   0
 }
 
@@ -552,10 +574,9 @@ function refNamesAdd(name: string) {
 }
 
 // Record a name only at the two precise shapes the TS walk records: the callee
-// IDENT of a `Call`, and any bare `Ident` value reference. Structural recursion
-// over every child slot of every node kind.
-function collectRefVisit(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
+// IDENT of a `Call`, and any bare `Ident` value reference. The shared walker
+// carries the structural recursion; this visit inspects one node.
+function refVisit(ix: i32) {
   const n = P.nodes[ix]
   if n is Call {
     // The TS `collectReferencedNames` records the callee NAME of every
@@ -570,24 +591,17 @@ function collectRefVisit(ix: i32) {
       if fn is Ident { refNamesAdd(fn.identName) }
       else if fn is Member { refNamesAdd(fn.memProp) }
     }
-    collectRefVisit(n.callFn)
-    let a = 0
-    while a < n.callArgs.length {
-      collectRefVisit(n.callArgs[a])
-      a = a + 1
-    }
   } else if n is Ident {
     refNamesAdd(n.identName)
   } else if n is Unary {
     // An operator method (`-x` → `function -(self)`) dispatches by operator name;
     // the TS reference walk records it as a `FunctionCall` callee, so mirror it.
     refNamesAdd(n.unOp)
-    collectRefVisit(n.unArg)
   } else if n is BinExpr {
     // An assignment `x = e` (the parser desugars `x += e` / `x++` to this shape)
     // whose LHS is a bare name marks that name WRITTEN — prefer-const consults
-    // this. The LHS is still recorded as a reference (visited below), matching the
-    // TS model where a write occurrence also counts as a use.
+    // this. The LHS is still recorded as a reference (the walker visits it),
+    // matching the TS model where a write occurrence also counts as a use.
     if n.binOp == "=" {
       if n.binLeft >= 0 && n.binLeft < P.nodes.length {
         const lhs = P.nodes[n.binLeft]
@@ -599,75 +613,6 @@ function collectRefVisit(ix: i32) {
       // Assignment `=` is not a method call, so it is excluded above.
       refNamesAdd(n.binOp)
     }
-    collectRefVisit(n.binLeft)
-    collectRefVisit(n.binRight)
-  } else if n is Member {
-    collectRefVisit(n.memObj)
-  } else if n is OptMember {
-    collectRefVisit(n.omObj)
-  } else if n is Paren {
-    collectRefVisit(n.parInner)
-  } else if n is Index {
-    collectRefVisit(n.idxArr)
-    collectRefVisit(n.idxIndex)
-  } else if n is ArrayLit {
-    let i = 0
-    while i < n.arrElems.length {
-      collectRefVisit(n.arrElems[i])
-      i = i + 1
-    }
-  } else if n is ObjLit {
-    let i = 0
-    while i < n.objFields.length {
-      collectRefVisit(n.objFields[i])
-      i = i + 1
-    }
-  } else if n is FieldInit {
-    collectRefVisit(n.fiValue)
-  } else if n is IsExpr {
-    collectRefVisit(n.isObj)
-  } else if n is LetDecl {
-    if n.letInit >= 0 { collectRefVisit(n.letInit) }
-  } else if n is RetStmt {
-    if n.retArg >= 0 { collectRefVisit(n.retArg) }
-  } else if n is IfStmt {
-    collectRefVisit(n.ifCond)
-    collectRefVisit(n.ifThen)
-    if n.ifElse >= 0 { collectRefVisit(n.ifElse) }
-  } else if n is MatchExpr {
-    // The scrutinee + arm bodies reference names (patterns are literals); the lint runs before the
-    // check-time desugar, so `match k { … }` must be seen to use `k`.
-    collectRefVisit(n.matchScrut)
-    let mi = 0
-    while mi < n.matchBodies.length {
-      collectRefVisit(n.matchBodies[mi])
-      mi = mi + 1
-    }
-  } else if n is WhileStmt {
-    collectRefVisit(n.whileCond)
-    collectRefVisit(n.whileBody)
-  } else if n is ForRange {
-    collectRefVisit(n.frFrom)
-    collectRefVisit(n.frTo)
-    if n.frStep >= 0 { collectRefVisit(n.frStep) }
-    collectRefVisit(n.frBody)
-  } else if n is ForIn {
-    collectRefVisit(n.fiIter)
-    collectRefVisit(n.fiBody)
-  } else if n is FuncDecl {
-    collectRefVisit(n.fnBody)
-  } else if n is Block {
-    let i = 0
-    while i < n.blkStmts.length {
-      collectRefVisit(n.blkStmts[i])
-      i = i + 1
-    }
-  } else if n is Program {
-    let i = 0
-    while i < n.progStmts.length {
-      collectRefVisit(n.progStmts[i])
-      i = i + 1
-    }
   }
   0
 }
@@ -675,7 +620,7 @@ function collectRefVisit(ix: i32) {
 function collectReferencedNames(progRoot: i32) {
   lintRefNames = []
   lintWriteNames = []
-  collectRefVisit(progRoot)
+  lintWalk(lintRuleRef, progRoot)
   0
 }
 
@@ -717,87 +662,18 @@ function declIsExported(ix: i32) {
 let declNodes: i32[] = []
 let declKinds: i32[] = []
 
-function collectDeclVisit(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
+// A pre-order walker visit: a `let`/`const` records itself, a parameter records
+// itself (every `Param` node in the arena is reached through its `FuncDecl`'s
+// `fnParams` slot). The shared walker's source-order traversal keeps the
+// collected list in source order.
+function declVisit(ix: i32) {
   const n = P.nodes[ix]
   if n is LetDecl {
     declNodes.push(ix)
     declKinds.push(0)
-    if n.letInit >= 0 { collectDeclVisit(n.letInit) }
-  } else if n is FuncDecl {
-    let p = 0
-    while p < n.fnParams.length {
-      declNodes.push(n.fnParams[p])
-      declKinds.push(1)
-      p = p + 1
-    }
-    collectDeclVisit(n.fnBody)
-  } else if n is Block {
-    let i = 0
-    while i < n.blkStmts.length {
-      collectDeclVisit(n.blkStmts[i])
-      i = i + 1
-    }
-  } else if n is Program {
-    let i = 0
-    while i < n.progStmts.length {
-      collectDeclVisit(n.progStmts[i])
-      i = i + 1
-    }
-  } else if n is IfStmt {
-    collectDeclVisit(n.ifCond)
-    collectDeclVisit(n.ifThen)
-    if n.ifElse >= 0 { collectDeclVisit(n.ifElse) }
-  } else if n is WhileStmt {
-    collectDeclVisit(n.whileCond)
-    collectDeclVisit(n.whileBody)
-  } else if n is ForRange {
-    collectDeclVisit(n.frFrom)
-    collectDeclVisit(n.frTo)
-    if n.frStep >= 0 { collectDeclVisit(n.frStep) }
-    collectDeclVisit(n.frBody)
-  } else if n is ForIn {
-    collectDeclVisit(n.fiIter)
-    collectDeclVisit(n.fiBody)
-  } else if n is RetStmt {
-    if n.retArg >= 0 { collectDeclVisit(n.retArg) }
-  } else if n is Call {
-    collectDeclVisit(n.callFn)
-    let a = 0
-    while a < n.callArgs.length {
-      collectDeclVisit(n.callArgs[a])
-      a = a + 1
-    }
-  } else if n is BinExpr {
-    collectDeclVisit(n.binLeft)
-    collectDeclVisit(n.binRight)
-  } else if n is Unary {
-    collectDeclVisit(n.unArg)
-  } else if n is Paren {
-    collectDeclVisit(n.parInner)
-  } else if n is Member {
-    collectDeclVisit(n.memObj)
-  } else if n is OptMember {
-    collectDeclVisit(n.omObj)
-  } else if n is Index {
-    collectDeclVisit(n.idxArr)
-    collectDeclVisit(n.idxIndex)
-  } else if n is ArrayLit {
-    let i = 0
-    while i < n.arrElems.length {
-      collectDeclVisit(n.arrElems[i])
-      i = i + 1
-    }
-  } else if n is ObjLit {
-    let i = 0
-    while i < n.objFields.length {
-      collectDeclVisit(n.objFields[i])
-      i = i + 1
-    }
-  } else if n is FieldInit {
-    collectDeclVisit(n.fiValue)
-  } else if n is IsExpr {
-    collectDeclVisit(n.isObj)
+  } else if n is Param {
+    declNodes.push(ix)
+    declKinds.push(1)
   }
   0
 }
@@ -824,7 +700,7 @@ function declIsConst(ix: i32) {
 function unusedBindings(progRoot: i32) {
   declNodes = []
   declKinds = []
-  collectDeclVisit(progRoot)
+  lintWalk(lintRuleDecl, progRoot)
   let i = 0
   while i < declNodes.length {
     const ix = declNodes[i]
@@ -915,24 +791,25 @@ function unusedFunctions(stmts: i32[]) {
         // A referenced function (called, passed as a value, method/operator
         // dispatch) is not dead. Exported functions are public surface.
         if !refNamesHas(s.fnName) && !declIsExported(ix) {
+          let sev = "warning"
+          let msg = "Unused function `" +
+            s.fnName +
+            "` (prefix with `_` to suppress, remove it, or `export` it)"
           if startsUnderscore(s.fnName) {
-            lintEmit(
-              "unused-function",
-              "Intentionally-unused function `" +
-                s.fnName +
-                "` (leading `_` marks it unused)",
-              "hint",
-              ix,
-            )
+            sev = "hint"
+            msg = "Intentionally-unused function `" +
+              s.fnName +
+              "` (leading `_` marks it unused)"
+          }
+          // Anchor at the declaration's NAME token (like unused-variable /
+          // prefer-const): the node's own anchor is its LAST token — the closing
+          // `}` — which points the diagnostic at the wrong line. Fall back to
+          // the node anchor when no name token was stamped.
+          const nameTok = declNameTokOf(ix)
+          if nameTok >= 0 {
+            lintEmitAtTok("unused-function", msg, sev, nameTok)
           } else {
-            lintEmit(
-              "unused-function",
-              "Unused function `" +
-                s.fnName +
-                "` (prefix with `_` to suppress, remove it, or `export` it)",
-              "warning",
-              ix,
-            )
+            lintEmit("unused-function", msg, sev, ix)
           }
         }
       }
