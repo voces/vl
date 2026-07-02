@@ -322,6 +322,17 @@ let binCstrLt: i32[] = []
 let binCstrOp: string[] = []
 let binCstrRt: i32[] = []
 
+// DEFERRED call-argument constraints over un-annotated-param holes: inside a generic
+// body a HOLE flowed as an argument into a CONCRETE parameter (`function f(x) { g(x) }`
+// with `g(n: i32)`). The body can't judge it — a hole is permissively assignable both
+// ways — so the demand is recorded (hole type, expected param type, callee name) and the
+// generic CALL SITE re-validates it under the substituted argument types, exactly like
+// the binary-op constraints above. Indices are arena type indices; `substTyDeep` maps
+// the hole to the call's concrete argument type.
+let argCstrAt: i32[] = []
+let argCstrExp: i32[] = []
+let argCstrWho: string[] = []
+
 // The const-binding chain, PARALLEL to `T.scopes`: each frame records which of
 // its names were bound `const` (immutable NAME, not immutable data — a field
 // write through a const stays legal). Kept module-level (not a `Checker` field)
@@ -1046,6 +1057,9 @@ export function initChecker() {
   binCstrLt = []
   binCstrOp = []
   binCstrRt = []
+  argCstrAt = []
+  argCstrExp = []
+  argCstrWho = []
   fnDeclIx = Map()
   moduleGlobals = Map()
   topUnannotFns = []
@@ -2753,6 +2767,7 @@ function genericFnAssignable(srcTy: i32, dstTy: i32) {
         i = i + 1
       }
       if !binCstrsHold(bNames, bTys) { return false }
+      if !argCstrsHold(bNames, bTys) { return false }
       return assignable(substTyDeep(s.fnRet, bNames, bTys), d.fnRet)
     }
   }
@@ -4380,6 +4395,72 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   true
 }
 
+// Record a deferred call-argument constraint: hole-typed argument `at` flowed into the
+// CONCRETE param type `exp` of callee `who`. Idempotent per (at, exp) pair. An `exp` that
+// still carries a hole is NOT recorded — after `bindGenWalk`+`substTyDeep` at the inner
+// call it could only be one of the enclosing body's own holes, and that hole's demands
+// surface through its own bindings instead.
+function noteArgCstr(at: i32, exp: i32, who: string) {
+  let k = 0
+  while k < argCstrAt.length {
+    if argCstrAt[k] == at && argCstrExp[k] == exp { return 0 }
+    k = k + 1
+  }
+  argCstrAt.push(at)
+  argCstrExp.push(exp)
+  argCstrWho.push(who)
+  0
+}
+
+// Re-validate every deferred call-argument constraint that THIS call resolves: substitute
+// the hole to the call's concrete argument type and check it against the recorded param
+// type. A constraint still touching an unresolved hole (not bound by this call, or a
+// nested generic) defers — `validateBinCstrs` for argument flow.
+function validateArgCstrs(bNames: string[], bTys: i32[], ix: i32) {
+  let ci = 0
+  while ci < argCstrAt.length {
+    const rat = substTyDeep(argCstrAt[ci], bNames, bTys)
+    const rexp = substTyDeep(argCstrExp[ci], bNames, bTys)
+    if !tyIsHole(rat) {
+      if !tyIsHole(rexp) {
+        if !assignable(rat, rexp) {
+          let who = argCstrWho[ci]
+          if who == "" { who = "a call" } else { who = "`" + who + "`" }
+          tErr(
+            "argument of type " +
+              tyToStr(rat) +
+              " flows into " +
+              who +
+              " expecting " +
+              tyToStr(rexp) +
+              " (the call's argument types)",
+            ix,
+          )
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// Do every deferred call-argument constraint THIS binding resolves hold (the pure-boolean
+// twin of `validateArgCstrs`, for `genericFnAssignable`)? An unresolved hole defers.
+function argCstrsHold(bNames: string[], bTys: i32[]) {
+  let ci = 0
+  while ci < argCstrAt.length {
+    const rat = substTyDeep(argCstrAt[ci], bNames, bTys)
+    const rexp = substTyDeep(argCstrExp[ci], bNames, bTys)
+    if !tyIsHole(rat) {
+      if !tyIsHole(rexp) {
+        if !assignable(rat, rexp) { return false }
+      }
+    }
+    ci = ci + 1
+  }
+  true
+}
+
 // Re-validate every deferred binary-op constraint that THIS call resolves: substitute the holes to
 // the call's concrete argument types and check the operator is defined for them. A constraint still
 // touching an unresolved hole (not bound by this call, or a nested generic) defers. The general
@@ -5580,6 +5661,18 @@ function checkCallNode(n: Call, ix: i32) {
       // SUBSTITUTED expected type — a later disagreeing use errors here.
       bindGenWalk(params[i], at, bNames, bTys)
       const expected = substTyDeep(params[i], bNames, bTys)
+      // A HOLE argument meeting a CONCRETE param can't be judged here — a hole is
+      // permissively assignable both ways, so the check below passes vacuously.
+      // Record the demand; the generic call site that pins the hole re-validates
+      // it under the substituted argument types (the deferred binary-op-constraint
+      // pattern), so `function f(x) { g(x) }` with `g(n: i32)` rejects `f("s")`.
+      if tyIsHole(at) {
+        if !tyIsHole(expected) {
+          let ccWho = ""
+          if cfn is Ident { ccWho = cfn.identName }
+          noteArgCstr(at, expected, ccWho)
+        }
+      }
       // A hole param whose body DEMANDED fields (member access on the hole)
       // checks the argument against the demanded shape, so `getx(5)` rejects
       // when the body read `o.x` (host: the grown `Infer<{x,…}>` pin).
@@ -5637,6 +5730,7 @@ function checkCallNode(n: Call, ix: i32) {
     // `functions/inferred-return-soundness.vl` rejecting).
     if bNames.length > 0 {
       validateBinCstrs(bNames, bTys, ix)
+      validateArgCstrs(bNames, bTys, ix)
       retTy = substTyDeep(retTy, bNames, bTys)
     }
     return retTy
