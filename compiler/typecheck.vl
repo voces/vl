@@ -7695,16 +7695,57 @@ export function nodeTyIsUnionAlias(ix: i32) {
   // both in `unNames` (`isUName`). Excluded: a nullable niche (a `TyNullable`, not a `TyUnion`), and a
   // LITERAL union — string OR numeric (`0 | 1 | 2` canon-names `i32`), whose members are all `TyLit`
   // and which reps as an interned atom, not a `{tag, value}` box. A struct-alias is single-member.
+  if isValueUnionBox(ty) { return true }
+  // A SAME-SHAPE union (`A | B` with A, B structurally IDENTICAL) collapses to a single `TyObj` in the
+  // arena — structural equality dedups the members — losing its union-ness, though the emitter keeps the
+  // union box for tag discrimination (`isUName`). The arena can't represent this, so recover it locally
+  // from the annotation node: a `TypeRef` whose name has a TOP-LEVEL `|` yet resolved to a struct.
+  if t is TyObj {
+    const nd = P.nodes[ix]
+    if nd is TypeRef {
+      const parts: string[] = []
+      splitTypeName(nd.tyName, '|', parts)
+      if parts.length >= 2 { return true }
+    }
+  }
+  if t is TyNullable {
+    const inner = t.nInner
+    if inner >= 0 {
+      const it = T.tys[inner]
+      if it is TyPrim {
+        const pn = it.primName
+        if pn == "i32" || pn == "f64" || pn == "i64" || pn == "f32" {
+          return true
+        }
+      }
+      if isValueUnionBox(inner) { return true }
+    }
+  }
+  false
+}
+// A `{tag, value}` value/struct union box: `TyUnion`, 2+ members, NOT a pure literal union.
+function isValueUnionBox(tyix: i32) {
+  if tyix < 0 { return false }
+  const t = T.tys[tyix]
   if t is TyUnion {
     if t.uMembers.length < 2 { return false }
-    let allLit = true
+    // A HOMOGENEOUS literal union (all members `TyLit` of the SAME `litKind`) is an interned atom,
+    // NOT a box: all-`str` (`"a"|"b"`) or all-numeric (`0|1|2`). A MIXED-kind literal union (`"x"|7`,
+    // a string lit + a numeric lit) can't share one atom rep, so it boxes as a value union.
+    let allSameLit = true
+    let litKind = ""
     let i = 0
     while i < t.uMembers.length {
       const m = T.tys[t.uMembers[i]]
-      if m is TyLit {} else { allLit = false }
+      if m is TyLit {
+        if litKind == "" { litKind = m.litKind }
+        else if litKind != m.litKind { allSameLit = false }
+      } else {
+        allSameLit = false
+      }
       i = i + 1
     }
-    return !allLit
+    return !allSameLit
   }
   false
 }
