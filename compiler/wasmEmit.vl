@@ -2230,6 +2230,20 @@ function retIsMapLocalAnnot(rx: i32, fnIx: i32) {
   false
 }
 
+// The parent-`let` arena index a returned bare IDENT names in function `i`'s
+// body, or -1 (the return is not an ident, or the name is a param / global —
+// `parentLetOf` only finds body-declared `let`s). The lookup half of the
+// returned-LOCAL classification in `criClassify`, mirroring `retIsMapLocalAnnot`.
+function criRetLocalLet(rx: i32, i: i32) {
+  const u = unwrapParen(rx)
+  const e = P.nodes[u]
+  if e is Ident {
+    const fn = P.nodes[fnStmts[i]]
+    if fn is FuncDecl { return parentLetOf(fn.fnBody, e.identName) }
+  }
+  -1
+}
+
 // Classify ONE valued return expression at `rx0` of the function at `fnStmts`
 // position `i`, under the CURRENT narrowing stack — the loop body the flat
 // return scan used to run, extracted so the narrowing-aware walk shares it.
@@ -2312,6 +2326,39 @@ function criClassify(rx0: i32, i: i32) {
     fRetRef[i] = 1
     fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
     criChanged = true
+  }
+  // A returned LOCAL `let` of a REF kind (`const c: Ctx = {…}; return c`,
+  // `const xs = [[1,2]]; return xs`): during this GLOBAL pass the function's
+  // locals are not collected, so the `expr*` Ident cases above miss it and the
+  // functype result would default to i32 over a body that yields a ref — invalid
+  // wasm. Classify through the DECLARATION (annotation first, else the
+  // initializer's shape) via the shared per-let classifiers, exactly as
+  // `retIsMapLocalAnnot` does for a returned map local. The scalar / string /
+  // scalar-list local kinds never reach here — the checker's recorded
+  // inferred-return name (the A20 pass) already covers them.
+  const rll = criRetLocalLet(rx, i)
+  if rll >= 0 {
+    if fRetListKind[i] == 0 && letIsRefArray(rll, fnStmts[i]) {
+      fRetListKind[i] = 5
+      if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+        fRetRArrElem[i] = letRefListElemName(rll, fnStmts[i])
+      }
+      criChanged = true
+    }
+    if (
+      fRetRef[i] == 0 &&
+      fRetNul[i] == 0 &&
+      fRetUni[i] == 0 &&
+      fRetListKind[i] == 0 &&
+      letIsStruct(rll, fnStmts[i])
+    ) {
+      // `structIndexOfLet` prefers the ANNOTATION's struct over the literal's
+      // first field-shape match, so `const c: Ctx = {…}` returns Ctx even when
+      // another declared struct shares its field names.
+      fRetRef[i] = 1
+      fRetStructIdx[i] = structIndexOfLet(rll, fnStmts[i])
+      criChanged = true
+    }
   }
   if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
     fRetBool[i] = 1
