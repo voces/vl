@@ -106,7 +106,7 @@ Deno.test({
     await assertPositioned(
       "let x: i32 = 1\nlet = 5\n",
       "parse",
-      ": error [2:5] expected IDENT but found EQUAL",
+      ": error [2:5] expected an identifier but found `=`",
     );
   },
 });

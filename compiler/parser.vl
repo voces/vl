@@ -203,17 +203,91 @@ function skipNewlines() {
   0
 }
 
-// Consume a token of the expected `kind`; on mismatch record a diagnostic but
-// still advance (so the parser makes progress and never loops on bad input).
+// The statement-boundary tokens (panic-mode SYNC points): NEWLINE/SEMI end the
+// statement, `}` closes an enclosing block, EOF ends the input. The enclosing
+// statement loops recover at these, so the `expect` error paths must never
+// consume them — eating a closer is how one mis-parse cascades.
+function isSyncKind(k: string) {
+  k == "NEWLINE" || k == "SEMI" || k == "RBRACE" || k == "EOF"
+}
+
+// The display form of a token KIND in an `expected …` message: the concrete
+// lexeme for punctuation, a noun for the open classes, the raw kind tag as the
+// fallback for the rest.
+function kindDesc(k: string) {
+  if k == "RPAREN" { return "`)`" }
+  if k == "RBRACK" { return "`]`" }
+  if k == "RBRACE" { return "`}`" }
+  if k == "LPAREN" { return "`(`" }
+  if k == "LBRACK" { return "`[`" }
+  if k == "LBRACE" { return "`{`" }
+  if k == "GT" { return "`>`" }
+  if k == "COLON" { return "`:`" }
+  if k == "EQUAL" { return "`=`" }
+  if k == "COMMA" { return "`,`" }
+  if k == "IDENT" { return "an identifier" }
+  if k == "NEWLINE" { return "end of line" }
+  if k == "EOF" { return "end of input" }
+  k
+}
+
+// The display form of the OFFENDING token: its source lexeme, backticked
+// (NEWLINE/EOF have no printable lexeme and get a noun instead).
+function foundDesc(t: Tok) {
+  if t.kind == "NEWLINE" { return "end of line" }
+  if t.kind == "EOF" { return "end of input" }
+  if t.text == "" { return t.kind }
+  "`" + t.text + "`"
+}
+
+// Consume a token of the expected `kind`; on mismatch record a diagnostic and
+// advance PAST the offender — unless it is a sync token (or a `{` opening a
+// nested construct), which is left for the enclosing recovery to handle.
 function expect(kind: string) {
   if peekKind() == kind {
     P.pos = P.pos + 1
     return true
   }
   P.diags.push(
-    { msg: "expected " + kind + " but found " + peekKind(), at: P.pos },
+    {
+      msg: "expected " + kindDesc(kind) + " but found " + foundDesc(peekTok()),
+      at: P.pos,
+    },
   )
-  P.pos = P.pos + 1
+  const k = peekKind()
+  if !isSyncKind(k) && k != "LBRACE" { P.pos = P.pos + 1 }
+  false
+}
+
+// `expect` for a structural CLOSER (`)`, `]`, `}`, the generic `>`): on
+// mismatch, diagnose once and skip forward to the closer, consuming it — so
+// `f(a b)` costs one diagnostic and the `)` still closes the call. The skip is
+// bounded by the sync tokens, a statement-start keyword, and `{` (a nested
+// construct), so a genuinely MISSING closer abandons at the boundary instead
+// of swallowing following code.
+function expectClose(kind: string) {
+  if peekKind() == kind {
+    P.pos = P.pos + 1
+    return true
+  }
+  P.diags.push(
+    {
+      msg: "expected " + kindDesc(kind) + " but found " + foundDesc(peekTok()),
+      at: P.pos,
+    },
+  )
+  let scanning = true
+  while scanning {
+    const k = peekKind()
+    if k == kind {
+      P.pos = P.pos + 1
+      scanning = false
+    } else if isSyncKind(k) || isStmtKeyword(k) || k == "LBRACE" {
+      scanning = false
+    } else {
+      P.pos = P.pos + 1
+    }
+  }
   false
 }
 
@@ -313,7 +387,7 @@ function expectTypeGt() {
     pendingGt = 2
     return 0
   }
-  expect("GT")
+  expectClose("GT")
   0
 }
 // A type-name leaf (`i32`, `string`, a user type), optionally followed by one or
@@ -324,7 +398,16 @@ function expectTypeGt() {
 // after a base name, an `LBRACK` must be immediately followed by `RBRACK`.
 export function parseType() {
   const p0 = peekTok().start
-  mkTypeRef(parseTypeName(), p0)
+  const ix = mkTypeRef(parseTypeName(), p0)
+  // A well-formed annotation drains every `>` a `>>`/`>>>` banked (the credits
+  // are consumed by the enclosing generic closes inside the recursion above).
+  // A credit left here is an EXTRA `>` — report it and drop it, or it would
+  // silently close some later unrelated generic annotation.
+  if pendingGt > 0 {
+    pendingGt = 0
+    P.diags.push({ msg: "extra `>` in type annotation", at: P.pos })
+  }
+  ix
 }
 
 // Parse a type ANNOTATION and return its synthetic NAME string (the lexeme the
@@ -407,7 +490,7 @@ function parseTypeAtom() {
         }
       }
     }
-    expect("RPAREN")
+    expectClose("RPAREN")
     if peekKind() == "EQUAL" && peek2Kind() == "GT" {
       advance() // "="
       advance() // ">"
@@ -434,10 +517,10 @@ function parseTypeAtom() {
       } else {
         expect("IDENT")
       }
-      expect("RBRACK")                // "]"
+      expectClose("RBRACK")           // "]"
       expect("COLON")                 // ":"
       const valName = parseTypeName() // the value type's name (recurses for nesting)
-      expect("RBRACE")                // "}"
+      expectClose("RBRACE")           // "}"
       name = "{[" + keyName + "]:" + valName + "}"
     } else {
       // An INLINE OBJECT type `{ x: i32, y: string }` (an anonymous structural
@@ -465,7 +548,7 @@ function parseTypeAtom() {
           fgoing = false
         }
       }
-      expect("RBRACE")
+      expectClose("RBRACE")
       name = name + "}"
     }
   } else if peekKind() == "NULL" {
@@ -500,8 +583,8 @@ function parseTypeAtom() {
   }
   let going = peekKind() == "LBRACK"
   while going {
-    advance()        // "["
-    expect("RBRACK") // "]"
+    advance()             // "["
+    expectClose("RBRACK") // "]"
     name = name + "[]"
     going = peekKind() == "LBRACK"
   }
@@ -566,7 +649,7 @@ function parsePrimary() {
     skipNewlines() // a newline may immediately follow `(`
     const inner = parseExpr()
     skipNewlines() // …and immediately precede `)`
-    expect("RPAREN")
+    expectClose("RPAREN")
     return mkParen(inner, p0)
   }
   if k == "LBRACE" {
@@ -627,7 +710,7 @@ function parseArgs() {
       }
     }
   }
-  expect("RPAREN")
+  expectClose("RPAREN")
   gCallArgNames = names
   args
 }
@@ -731,7 +814,7 @@ function parseObjLit() {
       going = false
     }
   }
-  expect("RBRACE")
+  expectClose("RBRACE")
   mkObjLit(fields, p0)
 }
 
@@ -758,7 +841,7 @@ function parseArrayLit() {
       going = false
     }
   }
-  expect("RBRACK")
+  expectClose("RBRACK")
   mkArrayLit(elems, p0)
 }
 
@@ -798,7 +881,7 @@ function parsePostfix() {
     } else if k == "LBRACK" {
       advance()
       const index = parseExpr()
-      expect("RBRACK")
+      expectClose("RBRACK")
       node = mkIndex(node, index, p0)
     } else {
       going = false
@@ -827,6 +910,16 @@ function parsePostfix() {
         mkBinary("=", node, mkBinary(pop, node, mkNum("1", -1), p0), p0),
         p0,
       )
+    } else {
+      // A postfix `++`/`--` on a non-identifier (`a.b++`, `a[i]++`) isn't
+      // supported: say so and CONSUME the operator — left in the stream it
+      // would silently re-parse as a prefix operator on whatever follows.
+      let opTxt = "++"
+      if pk2 == "MINUSMINUS" { opTxt = "--" }
+      P.diags.push(
+        { msg: "postfix `" + opTxt + "` target must be an identifier", at: P.pos },
+      )
+      advance()
     }
   }
   node
@@ -996,7 +1089,7 @@ function parseTypeDecl() {
         tgoing = false
       }
     }
-    expect("GT") // ">"
+    expectClose("GT") // ">"
     name = name + ">"
   }
   // A bodyless `type Bar` (no `= body`) is reported ONCE, at the declaration,
@@ -1082,7 +1175,7 @@ function parseTypeDecl() {
       going = false
     }
   }
-  expect("RBRACE")
+  expectClose("RBRACE")
   // Object-type structural intersection `type AB = { … } & { … }`, or a
   // union whose FIRST variant is an inline object: the struct body was only the
   // first operand. Re-encode the RHS as a `UnionDecl` over synthetic names —
@@ -1164,7 +1257,7 @@ function parseParamList() {
       }
     }
   }
-  expect("RPAREN")
+  expectClose("RPAREN")
   params
 }
 
@@ -1349,7 +1442,7 @@ function parseFuncHead(requireName: boolean) {
         tgoing = false
       }
     }
-    expect("GT") // ">"
+    expectClose("GT") // ">"
   }
   parseFuncTail(name, typarams, nameTok, p0)
 }
@@ -1467,7 +1560,7 @@ function parseMatch(): i32 {
     }
     going = peekKind() != "RBRACE" && peekKind() != "EOF"
   }
-  expect("RBRACE")
+  expectClose("RBRACE")
   mkMatch(scrut, pats, armStart, armCount, bodies, p0)
 }
 
@@ -1581,7 +1674,7 @@ function parseBlock() {
     else if k == "NEWLINE" || k == "SEMI" { advance() }
     else { stmts.push(parseStmt()) }
   }
-  expect("RBRACE")
+  expectClose("RBRACE")
   mkBlock(stmts, p0)
 }
 
@@ -1692,6 +1785,10 @@ function looksLikeObject(bracePos: i32) {
 
 // One statement: dispatch on the leading keyword, else an expression statement.
 export function parseStmt() {
+  // No type annotation spans statements, so any `>` credit still banked here
+  // was abandoned by a malformed generic in an EARLIER declaration — drop it
+  // rather than let it silently close some later unrelated `Box<T` annotation.
+  pendingGt = 0
   // `export` is a top-level visibility MODIFIER — the back end exports every
   // top-level function by name regardless, so the AST drops the modifier and
   // parses the underlying `function`/`type`/`let`/`const` declaration.
@@ -1740,24 +1837,7 @@ export function parseStmt() {
 // AST — it is consumed and produces no node. Tokens up to and INCLUDING the
 // trailing path STRING are skipped (the `from` clause keyword rides as an
 // `IDENT`, so it needs no dedicated keyword).
-function skipImport() {
-  advance() // "import"
-  // Skip the import clause: either a brace-enclosed name list `{ … }` or a bare
-  // name. Then the `from` identifier and the path string literal.
-  let going = true
-  while going {
-    let k = peekKind()
-    if k == "EOF" {
-      going = false
-    } else if k == "STRING" {
-      advance() // the path literal — the import ends here
-      going = false
-    } else {
-      advance()
-    }
-  }
-  0
-}
+function skipImport() { skipModuleClause("import") }
 
 // Consume a RE-EXPORT `export { a, b as c, … } from "path"`, the cursor on the
 // leading `export`. Like an import, it is a module-front-end concern (the merge
@@ -1765,25 +1845,56 @@ function skipImport() {
 // public names) and produces NO AST node. Tokens up to and INCLUDING the trailing
 // path STRING are skipped (the `from` keyword rides as an `IDENT`). Distinguished
 // from an `export function/let/const/type` by the `{` immediately after `export`.
-function skipReexport() {
-  advance() // "export"
+function skipReexport() { skipModuleClause("re-export") }
+
+// The shared skip for both module-statement forms, the cursor on the leading
+// `import`/`export` keyword. Skips the clause — a brace-enclosed name list
+// `{ … }` (which may span lines) or a bare name — then the `from` identifier
+// and the path string literal. The skip is BOUNDED: a NEWLINE/SEMI outside the
+// braces or a statement-start keyword anywhere ends it, so a malformed clause
+// missing its path literal is diagnosed here instead of silently swallowing
+// all following code up to the next unrelated string literal.
+function skipModuleClause(what: string) {
+  const kwAt = P.pos // the `import`/`export` keyword, anchor for the diagnostic
+  advance()
+  let depth = 0 // `{ … }` nesting — a NEWLINE inside the name list is legal
+  let found = false
   let going = true
   while going {
     let k = peekKind()
-    if k == "EOF" {
+    if k == "STRING" {
+      advance() // the path literal — the statement ends here
+      found = true
       going = false
-    } else if k == "STRING" {
-      advance() // the path literal — the re-export ends here
+    } else if k == "EOF" {
       going = false
+    } else if (k == "NEWLINE" || k == "SEMI") && depth == 0 {
+      going = false
+    } else if isStmtKeyword(k) {
+      going = false // a name list never contains these — an unclosed clause
     } else {
+      if k == "LBRACE" { depth = depth + 1 }
+      if k == "RBRACE" && depth > 0 { depth = depth - 1 }
       advance()
     }
+  }
+  if !found {
+    P.diags.push(
+      {
+        msg: "malformed " + what + ": expected a module path string literal",
+        at: kwAt,
+      },
+    )
   }
   0
 }
 
 // The public entry point: parse a whole program, return the root node index.
 export function parseProgram() {
+  // Module-global parser state must not leak in from an earlier (possibly
+  // malformed) run: a banked `>` credit would silently close some later
+  // unrelated generic.
+  pendingGt = 0
   const p0 = peekTok().start // the first token of the source
   const stmts: i32[] = []
   let going = true
