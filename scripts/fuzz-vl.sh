@@ -4,8 +4,15 @@
 # each through `vl run`, and asserts the output matches the case's own `// @log` directive. NO Deno —
 # the native host compiles + runs; the generator + the oracle (the buried literal) are pure VL.
 #
-# USAGE: scripts/fuzz-vl.sh [--seed N] [--count M]
+# USAGE: scripts/fuzz-vl.sh [--seed N] [--count M] [--depth D] [--keep DIR] [--baseline FILE] [--quiet]
 #   A mismatch / compile-fail / trap is a finding, printed with the failing case + the --seed to repro.
+#   Classes: REJECT (parse/type/emit error — the fail-loudly long tail), INVALID-WASM (emitted bytes
+#   fail validation — a soundness hole), TRAP (runtime error), MISMATCH (silent wrong result).
+#   --keep DIR      copy every failing case (+ its error) into DIR for triage.
+#   --baseline FILE only NEW failures count: a failure whose `// @shape` line appears in FILE is
+#                   known (reported in the summary, exit 0). This is the CI mode — a bounded seed
+#                   set with the known-failure shapes pinned; a regression = a new shape failing.
+#   --quiet         suppress the per-class case dumps (shape lines + summary only).
 # Requires a fresh seed: bash scripts/refresh-compiler.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -15,16 +22,23 @@ SEED_WASM="${SEED_WASM:-build/vl-compiler.wasm}"
 SEED=$((RANDOM * RANDOM))
 COUNT=200
 DEPTH=4
+KEEP=""
+BASELINE=""
+QUIET=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --seed) SEED="$2"; shift 2 ;;
     --count) COUNT="$2"; shift 2 ;;
     --depth) DEPTH="$2"; shift 2 ;;
+    --keep) KEEP="$2"; shift 2 ;;
+    --baseline) BASELINE="$2"; shift 2 ;;
+    --quiet) QUIET=1; shift ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
 
 [ -f "$SEED_WASM" ] || { echo "no seed at $SEED_WASM — run scripts/refresh-compiler.sh"; exit 2; }
+[ -z "$KEEP" ] || mkdir -p "$KEEP"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -45,31 +59,46 @@ awk -v dir="$WORK" '
 echo "fuzz-vl: seed $SEED, $(ls "$WORK"/case_*.vl 2>/dev/null | wc -l | tr -d ' ') cases"
 
 findings=0
-seen_compile=0; seen_trap=0; seen_mismatch=0
+known=0
+declare -A seen=()
+declare -A count=()
 for f in "$WORK"/case_*.vl; do
   [ -f "$f" ] || continue
   expected="$(sed -n 's|^// @log ||p' "$f")"
+  shape="$(sed -n 's|^// @shape ||p' "$f")"
+  why=""
   if ! actual="$("$VL" run "$f" --compiler "$SEED_WASM" 2>"$WORK/run.err")"; then
-    findings=$((findings + 1))
-    if grep -q "type error\|parse error" "$WORK/run.err"; then why="COMPILE"; else why="TRAP"; fi
-    if { [ "$why" = COMPILE ] && [ $seen_compile -eq 0 ]; } || { [ "$why" = TRAP ] && [ $seen_trap -eq 0 ]; }; then
-      [ "$why" = COMPILE ] && seen_compile=1 || seen_trap=1
-      echo; echo "✗ $why  (repro: scripts/fuzz-vl.sh --seed $SEED --count $COUNT)"
-      echo "  ── case ──"; sed 's/^/  /' "$f"; echo "  ── error ──"; sed 's/^/  /' "$WORK/run.err"
-    fi
+    if grep -q "type error\|parse error\|emit error" "$WORK/run.err"; then why="REJECT"
+    elif grep -q "failed to compile\|failed to parse WebAssembly\|translation error\|Invalid input WebAssembly" "$WORK/run.err"; then why="INVALID-WASM"
+    else why="TRAP"; fi
+  elif [ "$actual" != "$expected" ]; then
+    why="MISMATCH"
+    { echo "expected: [$expected]"; echo "actual:   [$actual]"; } > "$WORK/run.err"
+  fi
+  [ -n "$why" ] || continue
+
+  # a baselined shape is a KNOWN failure, not a finding
+  if [ -n "$BASELINE" ] && grep -qxF "$shape" "$BASELINE" 2>/dev/null; then
+    known=$((known + 1))
     continue
   fi
-  if [ "$actual" != "$expected" ]; then
-    findings=$((findings + 1))
-    if [ $seen_mismatch -eq 0 ]; then
-      seen_mismatch=1
-      echo; echo "✗ OUTPUT-MISMATCH  (repro: scripts/fuzz-vl.sh --seed $SEED --count $COUNT)"
-      echo "  ── case ──"; sed 's/^/  /' "$f"
-      echo "  expected: [$expected]"; echo "  actual:   [$actual]"
-    fi
+  findings=$((findings + 1))
+  count[$why]=$(( ${count[$why]:-0} + 1 ))
+  if [ -n "$KEEP" ]; then
+    base="$(basename "$f" .vl)"
+    cp "$f" "$KEEP/$base.vl"
+    cp "$WORK/run.err" "$KEEP/$base.err"
   fi
+  if [ "$QUIET" -eq 0 ] && [ -z "${seen[$why]:-}" ]; then
+    seen[$why]=1
+    echo; echo "✗ $why  (repro: scripts/fuzz-vl.sh --seed $SEED --count $COUNT --depth $DEPTH)"
+    echo "  ── case ──"; sed 's/^/  /' "$f"; echo "  ── error ──"; sed 's/^/  /' "$WORK/run.err"
+  fi
+  echo "✗ $why  $shape"
 done
 
 echo
-echo "done. $findings findings."
+summary=""
+for k in "${!count[@]}"; do summary="$summary $k=${count[$k]}"; done
+echo "done. $findings findings ($known known-baseline).${summary}"
 [ "$findings" -eq 0 ] || exit 1
