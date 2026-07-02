@@ -346,6 +346,10 @@ import {
   aUsed,
   arrNewScratchBase,
   callRefSlot,
+  capCacheOn,
+  capCountTbl,
+  capNamesFlat,
+  capStartTbl,
   cloEqScratchBase,
   cloSigBase,
   cloSigKeys,
@@ -2513,14 +2517,15 @@ function fnIndexOfInScope(name: string, fnIx: i32) {
 
 // ── capture analysis (closures) ───────────────────────────────────────────────
 // The captured-variable NAMES of the lifted function at `fnStmts[fe]`, in
-// encounter (= env field) order. A capture is a free variable: an identifier read
-// in the body that is NOT one of the function's own params, NOT a `let`/`const`
-// declared in the body, NOT a module global, and NOT a top-level/lifted function
-// name (those are addressable directly). Recomputed on demand (no `string[][]`
-// state — that type is not self-host-emittable). The walk threads a growable
-// `bound` set (params, then each `let` as it is declared) and accumulates free
-// names into `caps` (deduped). Mirrors the host's `captureCollector`.
-function captureNamesOf(fe: i32) {
+// encounter (= env field) order, by DIRECT WALK. A capture is a free variable: an
+// identifier read in the body that is NOT one of the function's own params, NOT a
+// `let`/`const` declared in the body, NOT a module global, and NOT a top-level/
+// lifted function name (those are addressable directly). The walk threads a
+// growable `bound` set (params, then each `let` as it is declared) and
+// accumulates free names into `caps` (deduped). Mirrors the host's
+// `captureCollector`. Callers go through `captureNamesOf`, which serves the
+// emission phases from the capture cache instead of re-walking.
+function capComputeNamesOf(fe: i32) {
   const caps: string[] = []
   if fe < 0 || fe >= fnStmts.length { return caps }
   const fn = P.nodes[fnStmts[fe]]
@@ -2538,9 +2543,56 @@ function captureNamesOf(fe: i32) {
   caps
 }
 
-// The number of captured variables of the lifted function at `fnStmts[fe]`.
+// Fill the capture cache (emit_state `capStartTbl`/`capCountTbl`/`capNamesFlat`)
+// with every lifted function's capture list — ONE walk per function, ever, where
+// the on-demand recompute cost O(body) per QUERY (an identifier read in a
+// capturing closure, a classifier probe of a captured name). Call exactly once
+// per program, after the last AST-mutating pass (`emitProgram` clears the cache
+// up front, so earlier phases use the direct walk).
+function capCacheBuild() {
+  capStartTbl = []
+  capCountTbl = []
+  capNamesFlat = []
+  let fe = 0
+  while fe < fnStmts.length {
+    const caps = capComputeNamesOf(fe)
+    capStartTbl.push(capNamesFlat.length)
+    capCountTbl.push(caps.length)
+    let ci = 0
+    while ci < caps.length {
+      capNamesFlat.push(caps[ci])
+      ci = ci + 1
+    }
+    fe = fe + 1
+  }
+  capCacheOn = true
+  0
+}
+
+// The captured-variable NAMES of the lifted function at `fnStmts[fe]` — from the
+// capture cache when it is valid (the emission phases), else by direct walk (the
+// rewrite/monomorphize phases, which still mutate bodies). Returns a fresh small
+// array either way (a `string[][]` cache row is not self-host-emittable).
+function captureNamesOf(fe: i32) {
+  if capCacheOn && fe >= 0 && fe < capStartTbl.length {
+    const caps: string[] = []
+    const start = capStartTbl[fe]
+    const cnt = capCountTbl[fe]
+    let ci = 0
+    while ci < cnt {
+      caps.push(capNamesFlat[start + ci])
+      ci = ci + 1
+    }
+    return caps
+  }
+  capComputeNamesOf(fe)
+}
+
+// The number of captured variables of the lifted function at `fnStmts[fe]` —
+// O(1) from the cache when valid, else the direct walk's length.
 function captureCountOf(fe: i32) {
-  const caps = captureNamesOf(fe)
+  if capCacheOn && fe >= 0 && fe < capCountTbl.length { return capCountTbl[fe] }
+  const caps = capComputeNamesOf(fe)
   caps.length
 }
 
@@ -5605,6 +5657,24 @@ function emitCapturedRead(body: i32[], name: string, fnIx: i32) {
   if fe < 0 { return 0 }
   const envIdx = fnEnvIdxOf(fe)
   if envIdx < 0 { return 0 }
+  // This runs per IDENTIFIER READ in a capturing closure — scan the capture
+  // cache's flat slice in place (no per-read array build).
+  if capCacheOn && fe < capCountTbl.length {
+    const start = capStartTbl[fe]
+    const cnt = capCountTbl[fe]
+    let fi = 0
+    while fi < cnt {
+      if capNamesFlat[start + fi] == name {
+        // (ref.cast (ref $env) (local.get 0)) then struct.get $env fi.
+        fbLocalGet(0)     // the leading env param (structref)
+        fbRefCast(envIdx) // 0xfb 0x16 <env heap> ref.cast — narrow to this env
+        fbStructGet(envIdx, fi)
+        return 1
+      }
+      fi = fi + 1
+    }
+    return 0
+  }
   const caps = captureNamesOf(fe)
   let ci = 0
   while ci < caps.length {
@@ -26686,6 +26756,9 @@ export function emitProgram(rootIx: i32) {
   narrowNames = []
   narrowVariants = []
   narrowTop = 0
+  // The capture cache is only valid for a FINAL AST — drop it before the
+  // rewrite/monomorphize passes run (they mutate bodies and `fnStmts` slots).
+  capCacheOn = false
   if rootIx < 0 { return emitFail("emitProgram: empty arena (root index < 0)") }
   const root = P.nodes[rootIx]
   if root is Program {
@@ -26859,6 +26932,10 @@ export function emitProgram(rootIx: i32) {
       if checkParams(fnStmts[i]) < 0 { return -1 }
       i = i + 1
     }
+    // The AST and `fnStmts` are FINAL past this point — snapshot every function's
+    // capture list once, so the emission phases (identifier reads, classifiers,
+    // the env-struct type walk) query the cache instead of re-walking bodies.
+    capCacheBuild()
     let rc = emitModule(stmts)
     if rc < 0 { return rc }
     // An `emitFail` whose -1 a deep helper swallowed (e.g. inside a valtype write)
