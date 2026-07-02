@@ -238,6 +238,57 @@ let modSelfFnArity: i32[] = []
 // segment matching one must NOT rewrite through the rename map — it names the
 // parameter, not a top-level binding.
 let modTyShadow: string[] = []
+// ── per-INSTANCE module scan/token cache ──────────────────────────────────────
+// A directory check (`vl check <dir>`) rebuilds the module table once PER FILE
+// (modReset + the fetch loop), so a shared dependency is token-scanned
+// (modCommit → modScan) and tokenized again (modCompile → vcLoadToks) once per
+// dependent. Cache both per (module key, source text): the scan's import/
+// export entries replay under the new table index, and the token stream
+// re-pushes with fresh global `pos` anchors. Slices are FLATTENED into shared
+// arrays with per-slot [off, end) ranges (`string[][]` is not
+// self-host-emittable). The cache spans modReset by design; a slot is keyed on
+// the exact source, so a rewrite (e.g. `check --fix`) misses and a fresh slot
+// is appended.
+const modCacheKeys: string[] = []
+const modCacheSrcs: string[] = []
+const modCacheImpOff: i32[] = []
+const modCacheImpEnd: i32[] = []
+const modCacheReOff: i32[] = []
+const modCacheReEnd: i32[] = []
+const modCacheExpOff: i32[] = []
+const modCacheExpEnd: i32[] = []
+// Token slice, filled lazily at the parse stage (-1 = not captured yet); only
+// a CLEAN tokenization (no lex diags) is cached, so a hit never has diags to
+// re-fold.
+const modCacheTokOff: i32[] = []
+const modCacheTokEnd: i32[] = []
+// Flat storage backing the slices above.
+const modCacheImpSpec: string[] = []
+const modCacheImpKey: string[] = []
+const modCacheImpName: string[] = []
+const modCacheImpLocal: string[] = []
+const modCacheRePublic: string[] = []
+const modCacheReLocal: string[] = []
+const modCacheExpName: string[] = []
+const modCacheExpDeclLine: i32[] = []
+const modCacheExpDeclCol: i32[] = []
+const modCacheExpKwLine: i32[] = []
+const modCacheExpKwCol: i32[] = []
+const modCacheTokKind: string[] = []
+const modCacheTokText: string[] = []
+const modCacheTokStart: i32[] = []
+const modCacheTokLine: i32[] = []
+const modCacheTokCol: i32[] = []
+// The cache slot for (key, src), or -1. Duplicate keys may exist (a source
+// rewritten mid-run appends a new slot); the src must match exactly.
+function modCacheLookup(key: string, src: string): i32 {
+  let i = 0
+  while i < modCacheKeys.length {
+    if modCacheKeys[i] == key && modCacheSrcs[i] == src { return i }
+    i = i + 1
+  }
+  -1
+}
 
 function vcLoadToks(src: string): i32 {
   const r = tokenize(src)
@@ -1022,9 +1073,125 @@ export function modCommit(found: i32): i32 {
   modKeys.push(key)
   modSrcs.push(src)
   modFound.push(found)
-  if found != 0 { modScan(modKeys.length - 1, src) }
+  if found != 0 { modScanCached(modKeys.length - 1, key, src) }
   modRecomputePending()
   0
+}
+// `modScan` through the per-instance cache: replay a recorded scan under table
+// index `m` on a hit; on a miss, scan and record the entries the scan appended
+// (modScan only ever appends, and only for `m`, so the [before, after) slice IS
+// this module's scan result).
+function modScanCached(m: i32, key: string, src: string): i32 {
+  const ci = modCacheLookup(key, src)
+  if ci >= 0 {
+    let ii = modCacheImpOff[ci]
+    while ii < modCacheImpEnd[ci] {
+      impMod.push(m)
+      impSpec.push(modCacheImpSpec[ii])
+      impKey.push(modCacheImpKey[ii])
+      impName.push(modCacheImpName[ii])
+      impLocal.push(modCacheImpLocal[ii])
+      ii = ii + 1
+    }
+    let ri = modCacheReOff[ci]
+    while ri < modCacheReEnd[ci] {
+      reExpMod.push(m)
+      reExpPublic.push(modCacheRePublic[ri])
+      reExpLocal.push(modCacheReLocal[ri])
+      ri = ri + 1
+    }
+    let ei = modCacheExpOff[ci]
+    while ei < modCacheExpEnd[ci] {
+      expMod.push(m)
+      expName.push(modCacheExpName[ei])
+      expDeclLine.push(modCacheExpDeclLine[ei])
+      expDeclCol.push(modCacheExpDeclCol[ei])
+      expKwLine.push(modCacheExpKwLine[ei])
+      expKwCol.push(modCacheExpKwCol[ei])
+      ei = ei + 1
+    }
+    return 0
+  }
+  const impBefore = impSpec.length
+  const reBefore = reExpPublic.length
+  const expBefore = expName.length
+  modScan(m, src)
+  modCacheKeys.push(key)
+  modCacheSrcs.push(src)
+  modCacheImpOff.push(modCacheImpSpec.length)
+  let ci2 = impBefore
+  while ci2 < impSpec.length {
+    modCacheImpSpec.push(impSpec[ci2])
+    modCacheImpKey.push(impKey[ci2])
+    modCacheImpName.push(impName[ci2])
+    modCacheImpLocal.push(impLocal[ci2])
+    ci2 = ci2 + 1
+  }
+  modCacheImpEnd.push(modCacheImpSpec.length)
+  modCacheReOff.push(modCacheRePublic.length)
+  let cr = reBefore
+  while cr < reExpPublic.length {
+    modCacheRePublic.push(reExpPublic[cr])
+    modCacheReLocal.push(reExpLocal[cr])
+    cr = cr + 1
+  }
+  modCacheReEnd.push(modCacheRePublic.length)
+  modCacheExpOff.push(modCacheExpName.length)
+  let ce = expBefore
+  while ce < expName.length {
+    modCacheExpName.push(expName[ce])
+    modCacheExpDeclLine.push(expDeclLine[ce])
+    modCacheExpDeclCol.push(expDeclCol[ce])
+    modCacheExpKwLine.push(expKwLine[ce])
+    modCacheExpKwCol.push(expKwCol[ce])
+    ce = ce + 1
+  }
+  modCacheExpEnd.push(modCacheExpName.length)
+  modCacheTokOff.push(-1)
+  modCacheTokEnd.push(-1)
+  0
+}
+// `vcLoadToks` for module `m` through the per-instance cache: on a hit, re-push
+// the cached token stream with fresh global `pos` anchors (no lex diags — only
+// a clean tokenization is cached); on a miss, tokenize and capture the stream
+// into `m`'s cache slot when it produced no lex diags.
+function vcLoadToksMod(m: i32): i32 {
+  const ci = modCacheLookup(modKeys[m], modSrcs[m])
+  if ci >= 0 && modCacheTokOff[ci] >= 0 {
+    let ti = modCacheTokOff[ci]
+    while ti < modCacheTokEnd[ci] {
+      P.toks.push(
+        {
+          kind: modCacheTokKind[ti],
+          text: modCacheTokText[ti],
+          pos: P.toks.length,
+          start: modCacheTokStart[ti],
+          line: modCacheTokLine[ti],
+          col: modCacheTokCol[ti],
+        },
+      )
+      ti = ti + 1
+    }
+    return P.toks.length
+  }
+  const tokBefore = P.toks.length
+  const diagBefore = P.diags.length
+  vcLoadToks(modSrcs[m])
+  if ci >= 0 && P.diags.length == diagBefore {
+    modCacheTokOff[ci] = modCacheTokKind.length
+    let ti2 = tokBefore
+    while ti2 < P.toks.length {
+      const t = P.toks[ti2]
+      modCacheTokKind.push(t.kind)
+      modCacheTokText.push(t.text)
+      modCacheTokStart.push(t.start)
+      modCacheTokLine.push(t.line)
+      modCacheTokCol.push(t.col)
+      ti2 = ti2 + 1
+    }
+    modCacheTokEnd[ci] = modCacheTokKind.length
+  }
+  P.toks.length
 }
 export function modPendingCount(): i32 { modPending.length }
 export function modPendingLen(i: i32): i32 { modPending[i].length }
@@ -1520,7 +1687,7 @@ function modCompile(emit: i32): i32 {
     // to its module (`modOfTok`) for cross-file find-references.
     modLoadStart.push(P.toks.length)
     modLoadMod.push(m)
-    vcLoadToks(modSrcs[m])
+    vcLoadToksMod(m)
     roots.push(parseProgram())
     if P.diags.length > 0 { return 1 }
     o = o + 1
