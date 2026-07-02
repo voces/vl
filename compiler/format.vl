@@ -578,6 +578,13 @@ function fmtImport(kw: i32, pathTok: i32) {
   if afterKw >= P.toks.length || P.toks[afterKw].kind != "LBRACE" {
     return fmtSrc.slice(t.start, endTok.start + endTok.text.length)
   }
+  // A comment inside the braces cannot ride the reflowed list — rebuilt on one
+  // line, the `//` would swallow the names after it AND the `} from "…"` tail
+  // (and the wrapped form would tear it off its name). Keep such an import
+  // VERBATIM; the caller consumes the comments the slice reproduces.
+  if importHasComment(t.start, endTok.start) {
+    return fmtSrc.slice(t.start, endTok.start + endTok.text.length)
+  }
   // The flat `{ … }` name list: find its closing `}` (imports never nest braces).
   let rb = afterKw + 1
   while rb < pathTok && P.toks[rb].kind != "RBRACE" { rb = rb + 1 }
@@ -608,6 +615,18 @@ function fmtImport(kw: i32, pathTok: i32) {
   const head = t.text + " "
   const tail = " from " + endTok.text
   head + wrapList("{ ", items, " }", 0, head.length + tail.length) + tail
+}
+
+// Whether any pending comment starts inside the char span `[start, stop)` — a
+// comment within an `import`/re-export statement's extent.
+function importHasComment(start: i32, stop: i32) {
+  let i = cmtCursor
+  while i < cmtText.length {
+    if cmtStart[i] >= stop { return false }
+    if cmtStart[i] >= start { return true }
+    i = i + 1
+  }
+  false
 }
 
 // Lexicographic (case-sensitive, code-point) `a < b`.
@@ -671,6 +690,10 @@ function emitImports() {
       }
       emitLeadingComments(0, startLine)
       const src = fmtImport(i, found)
+      // A comment-bearing import came back VERBATIM with its interior comments
+      // reproduced in place — consume them so they are not re-emitted after it
+      // (no-op for the reflowed form: no pending comment lies in its span).
+      consumeInlineSpan(startLine, endTok.line)
       emitLine(0, src + trailerSuffix(endTok.line))
       prevLine = endTok.line
       i = found + 1
@@ -1382,8 +1405,12 @@ function emitFunction(ix: i32, node: FuncDecl, indent: i32) {
         emitLine(indent, header + " " + inline)
         return 0
       }
+      // `emitBlockBody`, not a bare `emitStatements`: it also flushes the
+      // comments after the body's last statement, so a comment on the final
+      // line of a function stays INSIDE the closing `}` instead of leaking
+      // after it (at top level: after the program's final `}`).
       emitLine(indent, header + " {")
-      emitStatements(bn.blkStmts, indent + 1)
+      emitBlockBody(body, indent)
       closingBrace(indent, stopLineOf(body))
       return 0
     }
@@ -1888,6 +1915,10 @@ function functionExpr(ix: i32, node: FuncDecl, indent: i32) {
       const saved = outBuf
       outBuf = []
       emitStatements(bn.blkStmts, indent + 1)
+      // Flush the comments after the body's last statement (still inside the
+      // swapped buffer) so they stay within the lambda's `}` — the same
+      // trailing-comment flush `emitBlockBody` does for statement blocks.
+      emitLeadingComments(indent + 1, stopLineOf(body))
       const inner = joinOut()
       outBuf = saved
       // Rejoin the body ONCE — a running `result = result + line` accumulator
@@ -1974,6 +2005,10 @@ function blockExpr(ix: i32, node: Block, indent: i32) {
   const saved = outBuf
   outBuf = []
   emitStatements(node.blkStmts, indent + 1)
+  // Flush the comments after the block's last statement (still inside the
+  // swapped buffer) so they stay within the closing `}` — the same
+  // trailing-comment flush `emitBlockBody` does for statement blocks.
+  emitLeadingComments(indent + 1, stopLineOf(ix))
   const inner = joinOut()
   outBuf = saved
   // Rejoin the body ONCE — a running `result = result + line` accumulator here
