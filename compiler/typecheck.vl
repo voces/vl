@@ -3195,6 +3195,25 @@ function splitGenArgs(s: string, out: string[]) {
   0
 }
 
+// The AST node (a TypeRef / annotation child) that diagnostics raised INSIDE
+// name resolution anchor to — the generic-alias ARITY error (`applyGenAlias`)
+// and the BARE-generic-use error (`nameToTy`). Resolution is name-keyed (no
+// node flows through it), so the positioned entry points (let / param / return
+// / field annotation resolution) bank their TypeRef node here via
+// `nameToTyAt` / `resolveAnnotAt`; -1 (no position) outside them (e.g. the
+// emitter's re-resolution calls, which re-raise errors the checker already
+// reported positioned).
+let annotDiagAt = -1
+
+// Resolve annotation NAME with resolution diagnostics anchored at node `at`.
+function nameToTyAt(name: string, at: i32) {
+  const saved = annotDiagAt
+  annotDiagAt = at
+  const r = nameToTy(name)
+  annotDiagAt = saved
+  r
+}
+
 // Apply a generic alias (`Box<i32>`, `Pair<i32,string>`, `Box<T>` under a live
 // type-param env): resolve the arguments in the CURRENT environment, check the
 // arity, bind the declared parameter names to the argument types, and resolve
@@ -3206,7 +3225,8 @@ function splitGenArgs(s: string, out: string[]) {
 // application (`type A<T> = { next: A<T> | null }`) lands on its own (cyclic)
 // arena index instead of recursing forever. Returns -1 for an unknown
 // base/argument (the caller reports "unknown type"); a wrong ARITY reports
-// here (the full name is otherwise well-formed) and yields the error type.
+// here (the full name is otherwise well-formed, anchored at `annotDiagAt`)
+// and yields the error type.
 export function applyGenAlias(head: string, inner: string) {
   let gi = gaIndexOf(head)
   if gi < 0 { return -1 }
@@ -3230,7 +3250,7 @@ export function applyGenAlias(head: string, inner: string) {
         i32ToStr(pnames.length) +
         " type arguments but got " +
         i32ToStr(argTys.length),
-      -1,
+      annotDiagAt,
     )
     return TY_ERR
   }
@@ -3570,7 +3590,7 @@ function nameToTy(name: string) {
       "Generic type `" +
         name +
         "` expects type arguments but was used without any",
-      -1,
+      annotDiagAt,
     )
     return TY_ERR
   }
@@ -5996,6 +6016,16 @@ export function resolveAnnot(name: string, typarams: string[]) {
   r
 }
 
+// `resolveAnnot` with resolution diagnostics anchored at node `at` (the
+// annotation's TypeRef) — see `annotDiagAt`.
+function resolveAnnotAt(name: string, typarams: string[], at: i32) {
+  const saved = annotDiagAt
+  annotDiagAt = at
+  const r = resolveAnnot(name, typarams)
+  annotDiagAt = saved
+  r
+}
+
 // Is `name` currently being inferred (on the in-progress stack)?
 function onInferStack(name: string) {
   let i = 0
@@ -6172,6 +6202,14 @@ function redunTruncate(n: i32) {
   0
 }
 
+// The UNCOVERED union members of the last non-exhaustive `is`-chain
+// `ifChainExhausts` analyzed (rendered, comma-joined), so the diagnostic can
+// NAME what is missing — the `match` exhaustiveness error's sibling. "" when
+// the chain was exhaustive, or when it was non-exhaustive for a reason other
+// than member coverage (a non-coverable arm shape, an uncovered `null` path):
+// there is no member list to name, so the caller keeps its generic wording.
+let chainMissing = ""
+
 // SOUNDNESS — exhaustiveness of an else-less `is`-chain. Does the flat
 // `if p is A {…} else if p is B {…}` chain rooted at `ifIx` (no final `else`)
 // COVER every variant of `p`'s union type? If so its fall-through is unreachable
@@ -6184,6 +6222,7 @@ function redunTruncate(n: i32) {
 // different place, a null test) makes the chain non-exhaustive (returns false),
 // never wrongly exhaustive.
 function ifChainExhausts(ifIx: i32) {
+  chainMissing = ""
   let havePlace = false
   let placeName = "?"
   const testedTys: i32[] = []
@@ -6280,7 +6319,8 @@ function ifChainExhausts(ifIx: i32) {
     return false
   }
   if pt is TyUnion {
-    // Cover each union member against the tested set.
+    // Cover each union member against the tested set; collect the uncovered
+    // ones (rendered) so the diagnostic can name exactly what is missing.
     const members = pt.uMembers
     let mi = 0
     let allCovered = true
@@ -6291,7 +6331,11 @@ function ifChainExhausts(ifIx: i32) {
         if assignable(members[mi], testedTys[ti]) { covered = true }
         ti = ti + 1
       }
-      if !covered { allCovered = false }
+      if !covered {
+        allCovered = false
+        if chainMissing != "" { chainMissing = chainMissing + ", " }
+        chainMissing = chainMissing + tyToStr(members[mi])
+      }
       mi = mi + 1
     }
     return allCovered
@@ -6367,7 +6411,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       if pNode.parType >= 0 {
         const ptn = P.nodes[pNode.parType]
         if ptn is TypeRef {
-          pt = resolveAnnot(ptn.tyName, n.fnTyParams)
+          pt = resolveAnnotAt(ptn.tyName, n.fnTyParams, pNode.parType)
           if pt < 0 {
             tErr("unknown type '" + ptn.tyName + "'", pNode.parType)
             pt = TY_ERR
@@ -6430,7 +6474,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     ret = TY_VOID
     const rtn = P.nodes[n.fnRet]
     if rtn is TypeRef {
-      ret = resolveAnnot(rtn.tyName, n.fnTyParams)
+      ret = resolveAnnotAt(rtn.tyName, n.fnTyParams, n.fnRet)
       if ret < 0 {
         tErr("unknown type '" + rtn.tyName + "'", n.fnRet)
         ret = TY_ERR
@@ -6578,13 +6622,25 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             const retT = T.tys[ret]
             let retNullable = false
             if retT is TyNullable { retNullable = true }
-            if isChain && ret != TY_VOID && ret != TY_ERR && !retNullable {
+            if isChain && !isVoidTy(ret) && ret != TY_ERR && !retNullable {
               if !ifChainExhausts(stmts[s]) {
-                tErr(
-                  "non-exhaustive `is`-chain falls through with no `else`" +
-                    " — add the missing variant(s) or an `else` (expected " +
+                // Name the uncovered variants when member coverage computed
+                // them (the `match` sibling's courtesy); a chain that is
+                // non-exhaustive for a SHAPE reason (a non-coverable arm, an
+                // uncovered `null` path) has no member list, so stay generic.
+                let chainFix = "add the missing variant(s) or an `else` (expected " +
+                  tyToStr(ret) +
+                  ")"
+                if chainMissing != "" {
+                  chainFix = "missing " +
+                    chainMissing +
+                    " (add the arm(s) or an `else`; expected " +
                     tyToStr(ret) +
-                    ")",
+                    ")"
+                }
+                tErr(
+                  "non-exhaustive `is`-chain falls through with no `else` — " +
+                    chainFix,
                   stmts[s],
                 )
               }
@@ -6653,7 +6709,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     if (
       !bodyTotalForRet &&
       inferred >= 0 &&
-      inferred != TY_VOID &&
+      !isVoidTy(inferred) &&
       inferred != TY_ERR
     ) {
       const inT = T.tys[inferred]
@@ -6793,7 +6849,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   }
   if (
     !inferQuiet &&
-    ret != TY_VOID &&
+    !isVoidTy(ret) &&
     ret != TY_ERR &&
     !bodyTotalForRet &&
     !retNullableNow
@@ -6966,7 +7022,7 @@ function checkProgramNode(n: Program) {
               if fd.fdType >= 0 {
                 const ftn = P.nodes[fd.fdType]
                 if ftn is TypeRef {
-                  const r = nameToTy(ftn.tyName)
+                  const r = nameToTyAt(ftn.tyName, dfields[fi])
                   if r >= 0 {
                     fty = r
                     // Record the resolved type on the field's annotation node so the emitter
@@ -7120,7 +7176,7 @@ function checkProgramNode(n: Program) {
           if hpn.parType >= 0 {
             const hptn = P.nodes[hpn.parType]
             if hptn is TypeRef {
-              const r = resolveAnnot(hptn.tyName, s.fnTyParams)
+              const r = resolveAnnotAt(hptn.tyName, s.fnTyParams, hpn.parType)
               if r >= 0 { t = r }
             }
           } else {
@@ -7140,7 +7196,7 @@ function checkProgramNode(n: Program) {
       if s.fnRet >= 0 {
         const hrtn = P.nodes[s.fnRet]
         if hrtn is TypeRef {
-          const r = resolveAnnot(hrtn.tyName, s.fnTyParams)
+          const r = resolveAnnotAt(hrtn.tyName, s.fnTyParams, s.fnRet)
           if r >= 0 { hret = r } else { hret = TY_VOID }
         }
       }
@@ -7186,7 +7242,7 @@ function checkProgramNode(n: Program) {
         if sm.letType >= 0 {
           const mtn = P.nodes[sm.letType]
           if mtn is TypeRef {
-            const r = nameToTy(mtn.tyName)
+            const r = nameToTyAt(mtn.tyName, sm.letType)
             if r >= 0 { mty = r }
           }
         } else if sm.letInit >= 0 {
@@ -9132,7 +9188,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   if n.letType >= 0 {
     const tn = P.nodes[n.letType]
     if tn is TypeRef {
-      annot = nameToTy(tn.tyName)
+      annot = nameToTyAt(tn.tyName, n.letType)
       if annot < 0 {
         // An i32-keyed map shape (`{[i32]: V}`) is the native list/array path,
         // not the string-keyed hash map — report that directly (with the fix)
@@ -9383,6 +9439,12 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
     ci = ci + 1
   }
   let hasWild = false
+  // A pattern that is neither a member STRING literal nor the `_` wildcard covers
+  // nothing — report it AT THE PATTERN (silently skipping it surfaced later as a
+  // misattributed "non-exhaustive match", or as a phantom wildcard for a non-`_`
+  // identifier) and suppress the exhaustiveness error below (the bad pattern is
+  // the root cause; don't cascade).
+  let sawBadPat = false
   // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
   // sentinel would POISON the join (every arm joins back to error), so never seed with it.
   let matchTy = -1
@@ -9394,7 +9456,19 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
       const patIx = n.matchPats[n.matchArmStart[ai] + pj]
       const pn = P.nodes[patIx]
       if pn is Ident {
-        hasWild = true
+        // Only `_` is the wildcard; any other identifier is not a pattern VL
+        // supports (patterns don't bind) and must not silently cover every member.
+        if pn.identName == "_" {
+          hasWild = true
+        } else {
+          sawBadPat = true
+          tErr(
+            "invalid match pattern `" +
+              pn.identName +
+              "` — a pattern is a member string literal or the `_` wildcard",
+            patIx,
+          )
+        }
       } else if pn is StrLit {
         // The member name is the pattern's inner text (strip the surrounding quotes).
         const raw = pn.strText
@@ -9419,6 +9493,14 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
         } else {
           covered[found] = 1
         }
+      } else {
+        // Any other node kind (a parse-recovered pattern, a future literal form):
+        // same story — it covers nothing, so name it rather than mis-blame coverage.
+        sawBadPat = true
+        tErr(
+          "invalid match pattern — a pattern is a member string literal or the `_` wildcard",
+          patIx,
+        )
       }
       pj = pj + 1
     }
@@ -9440,8 +9522,10 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   // A void-armed match leaves the join unset (-1) or void; normalize to VOID so the function-
   // body-tail seeding (`noteInferredRet`) does not mistake it for the error sentinel.
   if matchTy < 0 { matchTy = TY_VOID }
-  // Exhaustiveness: every member covered, or a wildcard.
-  if !hasWild {
+  // Exhaustiveness: every member covered, or a wildcard. Skipped after an invalid
+  // pattern — that arm covers nothing, so a missing-member report would mis-blame
+  // coverage for what the pattern diagnostic already explained.
+  if !hasWild && !sawBadPat {
     let missing = ""
     let mk = 0
     while mk < members.length {
