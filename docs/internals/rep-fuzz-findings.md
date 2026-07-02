@@ -166,6 +166,16 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   backing builds wide (elements widen at the store). Frozen: `unions/i64-list-union-is-tag.vl`
   (behavioral `print`s prove `is` now matches). The f64[] READ side (`t[0]` on the narrowed atom)
   stays a pre-existing clean reject ("index access but list type not collected").
+- **Int-element list under an `f64[]` annotation** (`const xs: f64[] = [2]` — handed over from the
+  nullable/union-rep triage): `emitArr` honored `pendingListKind` 4 only for an EMPTY literal (kinds
+  6/7 were already authoritative for non-empty ones), so the literal built the i32-backed wrapper
+  against the f64-list slot. Fix: kind 4 is authoritative too; a bare int element re-encodes directly
+  as `f64.const` (exact, and it keeps a const-global init a valid constexpr — `emitExprAsF64` used a
+  non-constant convert), and the START-FN global-init path now threads the annotation's list kind for
+  scalar lists like the const path does. Frozen: `lists/f64-list-int-elements.vl`. Pre-existing and
+  NOT covered (globals family, fails identically on master): a NON-const scalar-list global whose
+  CELL kind mis-classifies (`const xs: i64[] = [-2]`, `const xs: f32[] = [-1.5]` — the cell emits as
+  `(mut i32)`); `f64[] = [6000000000]` is a correct checker reject (i64→f64 is lossy).
 - **Map member in a union** (`({[string]: i32} | boolean)[]` — the related silent mis-tag): a map is
   neither a struct variant nor a value atom, so `registerInlineUnion` silently SKIPPED the union
   (`nameIsMap` even prefix-matched the union name and swallowed it down the map-value recursion) —
