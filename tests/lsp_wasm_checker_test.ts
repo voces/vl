@@ -265,6 +265,24 @@ Deno.test({ name: "wasm-symbols: typeAliasAt renders a user type name (decl + us
   }
 });
 
+Deno.test({ name: "wasm-symbols: hover containment is end-inclusive at a name's right edge", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // A cursor JUST PAST a name's last character still resolves: every position
+  // query shares `symOccCovers`'s end-inclusive convention (the host
+  // `spanContains`), including the type-alias and member hovers.
+  const src = "type Pt = { x: i32 }\nlet p: Pt = { x: 1 }\nprint(p.x)\n";
+  // `Pt` use on line 1 spans cols 7-8; its right edge (col 9) still hits.
+  const aliasEdge = await checker.typeAliasAt(src, "/tmp/x.vl", noSiblings, 1, 9);
+  if (aliasEdge !== "{x: i32}") {
+    throw new Error(`expected the alias at its right edge, got ${JSON.stringify(aliasEdge)}`);
+  }
+  // The member `x` of `p.x` on line 2 sits at col 8; its right edge (col 9) still hits.
+  const memberEdge = await checker.memberTypeAt(src, "/tmp/x.vl", noSiblings, 2, 9);
+  if (memberEdge !== "i32") {
+    throw new Error(`expected the member type at its right edge, got ${JSON.stringify(memberEdge)}`);
+  }
+});
+
 Deno.test({ name: "wasm-symbols: an unannotated function's inferred return is retained (hover)", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // No return annotation — the checker now writes the demand-inferred return back

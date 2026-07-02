@@ -20,10 +20,13 @@ file; the lexer/parser are the grammar.
 
 ## Commands
 
-- **Gate (run all three after changes):**
-  - `deno check compiler/*.ts tests/run.ts` — type-check the core + test runner.
+- **Gate (run after changes):**
+  - `deno check compiler/*.ts` — type-check the TS leaves (`coreTypes.ts`/`diagnostics.ts`).
   - `deno lint` — lint (excludes `reference/`).
-  - `deno task test` — the `.vl` corpus (the behavior oracle).
+  - `deno task test` — the test suite, including the `.vl` corpus (`tests/cases_wasm_test.ts`, the behavior oracle).
+  - After a `compiler/*.vl` change: `scripts/refresh-compiler.sh` (rebuild the seed),
+    `scripts/native-fixpoint.sh` (byte-exact self-compile), `scripts/lint-self.sh`
+    (self-lint + fmt-check) — the CI `ci-native` job runs all three.
 - **Run / build / check / fmt a file:** the native `vl` binary (`scripts/vl-host`, built with
   `cd scripts/vl-host && cargo build --release`): `vl run <file.vl>` (also `-e "<src>"` / stdin /
   a prebuilt `.wasm`) · `vl build <file> [-o out.wasm]` · `vl check <path>` · `vl fmt <file> [-w|--check]`.
