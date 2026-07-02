@@ -159,12 +159,29 @@ export function srcPush(c: i32): i32 {
   0
 }
 export function vcSource(): string { fromCodePoints(vcCodes) }
-// Source positions of the LEX diagnostics folded into `P.diags` (parallel to the
-// first `vcLexLines.length` entries of `P.diags`): a lex diag carries a real
-// `line`/`col` but `Diag.at` is a TOKEN index, so the positions ride here and
-// `diagLine`/`diagCol` consult this table first. Reset per compile.
-let vcLexLines: i32[] = []
-let vcLexCols: i32[] = []
+// Source positions (and owning module) for the `P.diags` entries that carry NO
+// token anchor: LEX diagnostics (`Diag.at` is a token index, which a lex diag
+// doesn't have) and MODULE-RESOLUTION diagnostics (emitted before any tokens
+// load). Keyed by the diagnostic's `P.diags` INDEX (`vcDgIdx`), so tokenless
+// and token-anchored entries interleave freely (a multi-module parse aggregates
+// both); `diagLine`/`diagCol`/`diagEndCol`/`diagModule` consult this table
+// first. Reset per compile.
+let vcDgIdx: i32[] = []
+let vcDgLine: i32[] = []
+let vcDgCol: i32[] = []
+let vcDgMod: i32[] = []
+// The module whose source `vcLoadToks` is currently loading — a lex diag's
+// owner. The modCompile parse loop sets it per module; 0 elsewhere.
+let vcLoadMod = 0
+// The side-table slot for `P.diags` index `i`, or -1 (a token-anchored diag).
+function vcDgFind(i: i32): i32 {
+  let k = 0
+  while k < vcDgIdx.length {
+    if vcDgIdx[k] == i { return k }
+    k = k + 1
+  }
+  -1
+}
 
 // ── H3 module-table state (globals precede their first textual use; the module
 // SUBSYSTEM itself — exports, scan, pipeline, rewrite — lives at the bottom of
@@ -180,6 +197,16 @@ let impSpec: string[] = []  // the raw specifier text (diagnostics)
 let impKey: string[] = []   // resolved key ("" = unsupported specifier)
 let impName: string[] = []  // the exported (source) name ("" = bare import)
 let impLocal: string[] = [] // the local binding name (after `as`)
+// Source positions per import entry (1-based line, 0-based col — the
+// diagnostic convention): the imported NAME token (the `import`/`export`
+// keyword for a bare import) and the specifier STRING token (the keyword when
+// the statement never reaches a string). `modVisit` anchors its resolution
+// diagnostics here — a spec-shaped problem (unsupported / unresolvable /
+// cycle) at the specifier, a name-shaped one (not exported) at the name.
+let impNameLine: i32[] = []
+let impNameCol: i32[] = []
+let impSpecLine: i32[] = []
+let impSpecCol: i32[] = []
 // Flat per-module export-name sets (token scan: `export`-modified declarations).
 let expMod: i32[] = []
 let expName: string[] = []
@@ -267,6 +294,10 @@ const modCacheImpSpec: string[] = []
 const modCacheImpKey: string[] = []
 const modCacheImpName: string[] = []
 const modCacheImpLocal: string[] = []
+const modCacheImpNameLine: i32[] = []
+const modCacheImpNameCol: i32[] = []
+const modCacheImpSpecLine: i32[] = []
+const modCacheImpSpecCol: i32[] = []
 const modCacheRePublic: string[] = []
 const modCacheReLocal: string[] = []
 const modCacheExpName: string[] = []
@@ -312,14 +343,16 @@ function vcLoadToks(src: string): i32 {
   // Fold the lexer's diagnostics into the parse-stage store so a LEX error (e.g.
   // an empty `''` or multi-char `'ab'` char literal) is rejected at the parse
   // stage. Mirrors the host's `checkOnly`, which seeds its diagnostics list from
-  // `tokenize(...).diagnostics` BEFORE appending parse errors. The token index is
-  // not tracked on a lex diag, so it is anchored at 0; the diag's REAL source
-  // position is kept in the parallel `vcLexLines`/`vcLexCols`.
+  // `tokenize(...).diagnostics` BEFORE appending parse errors. A lex diag has no
+  // token to anchor at (at: -1); its REAL source position (and owning module)
+  // rides in the index-keyed `vcDg*` side table.
   let d = 0
   while d < r.diags.length {
-    P.diags.push({ msg: r.diags[d].msg, at: 0 })
-    vcLexLines.push(r.diags[d].line)
-    vcLexCols.push(r.diags[d].col)
+    vcDgIdx.push(P.diags.length)
+    vcDgLine.push(r.diags[d].line)
+    vcDgCol.push(r.diags[d].col)
+    vcDgMod.push(vcLoadMod)
+    P.diags.push({ msg: r.diags[d].msg, at: -1 })
     d = d + 1
   }
   P.toks.length
@@ -334,9 +367,13 @@ export function compileSrc(): i32 {
   P.pos = 0
   nodeToks = []
   declNameTok = []
-  vcLexLines = []
-  vcLexCols = []
+  vcDgIdx = []
+  vcDgLine = []
+  vcDgCol = []
+  vcDgMod = []
+  vcLoadMod = 0
   W.bytes = []
+  emitErr = ""
   fnNames = []
   fnIndices = []
   localNames = []
@@ -372,13 +409,22 @@ export function checkSrc(): i32 {
   P.pos = 0
   nodeToks = []
   declNameTok = []
-  vcLexLines = []
-  vcLexCols = []
+  vcDgIdx = []
+  vcDgLine = []
+  vcDgCol = []
+  vcDgMod = []
+  vcLoadMod = 0
   fnNames = []
   fnIndices = []
   localNames = []
   globalStmts = []
   globalNames = []
+  // `check` never emits, so clear the emit-stage ABI a prior `compileSrc` on
+  // this instance populated: stale `W.bytes` would read back through
+  // `rbyteLen`/`rbyteAt`, and a stale `emitErr` would append a phantom emit
+  // diagnostic to THIS check's `diagCount`/`vcDiags` stream.
+  W.bytes = []
+  emitErr = ""
   initChecker()
   // Module mode (H3) — see compileSrc; `check` runs the same pipeline minus emit.
   if modKeys.length > 0 { return modCompile(0) }
@@ -408,8 +454,11 @@ export function lintSrc(): i32 {
   P.pos = 0
   nodeToks = []
   declNameTok = []
-  vcLexLines = []
-  vcLexCols = []
+  vcDgIdx = []
+  vcDgLine = []
+  vcDgCol = []
+  vcDgMod = []
+  vcLoadMod = 0
   vcLoadToks(vcSource())
   const root = parseProgram()
   if P.diags.length > 0 { return -1 }
@@ -449,8 +498,11 @@ export function formatSrc(): i32 {
   P.pos = 0
   nodeToks = []
   declNameTok = []
-  vcLexLines = []
-  vcLexCols = []
+  vcDgIdx = []
+  vcDgLine = []
+  vcDgCol = []
+  vcDgMod = []
+  vcLoadMod = 0
   const src = vcSource()
   // Lex once, feeding tokens into the parser AND the formatter's comment table
   // (the formatter slices spans from `src` and places comments around them).
@@ -474,11 +526,13 @@ export function formatSrc(): i32 {
   }
   let d = 0
   while d < r.diags.length {
-    P.diags.push({ msg: r.diags[d].msg, at: 0 })
-    // Keep the lex diag's real position (`diagLine`/`diagCol` read these), so a
-    // caller can point at the offending source instead of token 0.
-    vcLexLines.push(r.diags[d].line)
-    vcLexCols.push(r.diags[d].col)
+    // Keep the lex diag's real position (`diagLine`/`diagCol` read the vcDg*
+    // side table), so a caller can point at the offending source.
+    vcDgIdx.push(P.diags.length)
+    vcDgLine.push(r.diags[d].line)
+    vcDgCol.push(r.diags[d].col)
+    vcDgMod.push(0)
+    P.diags.push({ msg: r.diags[d].msg, at: -1 })
     d = d + 1
   }
   let c = 0
@@ -510,8 +564,11 @@ export function formatSrc(): i32 {
   P.pos = 0
   nodeToks = []
   declNameTok = []
-  vcLexLines = []
-  vcLexCols = []
+  vcDgIdx = []
+  vcDgLine = []
+  vcDgCol = []
+  vcDgMod = []
+  vcLoadMod = 0
   vcLoadToks(vcFmtOut)
   if P.diags.length == 0 { parseProgram() }
   if P.diags.length > 0 { return -2 }
@@ -538,13 +595,19 @@ export function checkSrcSym(): i32 {
   P.pos = 0
   nodeToks = []
   declNameTok = []
-  vcLexLines = []
-  vcLexCols = []
+  vcDgIdx = []
+  vcDgLine = []
+  vcDgCol = []
+  vcDgMod = []
+  vcLoadMod = 0
   fnNames = []
   fnIndices = []
   localNames = []
   globalStmts = []
   globalNames = []
+  // Clear the emit-stage ABI — see checkSrc (a symbol-aware check never emits).
+  W.bytes = []
+  emitErr = ""
   initChecker()
   if modKeys.length > 0 {
     const mrc = modCompile(0)
@@ -967,8 +1030,9 @@ export function diagMsgLen(i: i32): i32 { vcDiagMsgMemo(i).length }
 export function diagMsgAt(i: i32, j: i32): i32 { vcDiagMsgMemo(i)[j] }
 export function diagLine(i: i32): i32 {
   if i < P.diags.length {
-    // A lex diag (always at the front of `P.diags`) carries its own position.
-    if i < vcLexLines.length { return vcLexLines[i] }
+    // A tokenless diag (lex / module-resolution) carries its own position.
+    const k = vcDgFind(i)
+    if k >= 0 { return vcDgLine[k] }
     // A parse diag is anchored at a token index; out of range ⇒ no position.
     let at = P.diags[i].at
     if at >= 0 && at < P.toks.length { return P.toks[at].line }
@@ -980,7 +1044,8 @@ export function diagLine(i: i32): i32 {
 }
 export function diagCol(i: i32): i32 {
   if i < P.diags.length {
-    if i < vcLexCols.length { return vcLexCols[i] }
+    const k = vcDgFind(i)
+    if k >= 0 { return vcDgCol[k] }
     let at = P.diags[i].at
     if at >= 0 && at < P.toks.length { return P.toks[at].col }
     return 0
@@ -992,16 +1057,14 @@ export function diagCol(i: i32): i32 {
 // The diagnostic's END column: the anchor token's start + its lexeme length
 // (lexemes never span lines, so the end LINE is `diagLine`). A parse diag is
 // anchored at a TOKEN index; a type diag at an AST NODE index, resolved through
-// the `nodeToks` side table — the same resolution `tErr` applies. A lex diag or
-// a positionless/out-of-range anchor degrades to `diagCol` — a zero-width range
-// at the start, which an LSP host may widen client-side.
+// the `nodeToks` side table — the same resolution `tErr` applies. A tokenless
+// diag (lex / module-resolution) or a positionless/out-of-range anchor degrades
+// to `diagCol` — a zero-width range at the start, which an LSP host may widen
+// client-side.
 export function diagEndCol(i: i32): i32 {
   let at = -1
   if i < P.diags.length {
-    if i >= vcLexLines.length {
-      // a lex diag carries no token anchor
-      at = P.diags[i].at
-    }
+    if vcDgFind(i) < 0 { at = P.diags[i].at }
   } else {
     let j = i - P.diags.length
     if j < T.diags.length {
@@ -1035,6 +1098,10 @@ export function modReset(): i32 {
   impKey = []
   impName = []
   impLocal = []
+  impNameLine = []
+  impNameCol = []
+  impSpecLine = []
+  impSpecCol = []
   expMod = []
   expName = []
   expDeclLine = []
@@ -1091,6 +1158,10 @@ function modScanCached(m: i32, key: string, src: string): i32 {
       impKey.push(modCacheImpKey[ii])
       impName.push(modCacheImpName[ii])
       impLocal.push(modCacheImpLocal[ii])
+      impNameLine.push(modCacheImpNameLine[ii])
+      impNameCol.push(modCacheImpNameCol[ii])
+      impSpecLine.push(modCacheImpSpecLine[ii])
+      impSpecCol.push(modCacheImpSpecCol[ii])
       ii = ii + 1
     }
     let ri = modCacheReOff[ci]
@@ -1125,6 +1196,10 @@ function modScanCached(m: i32, key: string, src: string): i32 {
     modCacheImpKey.push(impKey[ci2])
     modCacheImpName.push(impName[ci2])
     modCacheImpLocal.push(impLocal[ci2])
+    modCacheImpNameLine.push(impNameLine[ci2])
+    modCacheImpNameCol.push(impNameCol[ci2])
+    modCacheImpSpecLine.push(impSpecLine[ci2])
+    modCacheImpSpecCol.push(impSpecCol[ci2])
     ci2 = ci2 + 1
   }
   modCacheImpEnd.push(modCacheImpSpec.length)
@@ -1237,6 +1312,9 @@ export function modKeyAtCharAt(m: i32, j: i32): i32 { modKeys[m][j] }
 export function diagModule(i: i32): i32 {
   let at = -1
   if i < P.diags.length {
+    // A tokenless diag (lex / module-resolution) records its owner directly.
+    const k = vcDgFind(i)
+    if k >= 0 { return vcDgMod[k] }
     at = P.diags[i].at
   } else {
     let j = i - P.diags.length
@@ -1391,9 +1469,13 @@ function modScan(m: i32, src: string): i32 {
       // specifier (the `as` local rename honored); a specifier-less import
       // records one entry with empty names (a pure graph edge). The cursor
       // ends just past the trailing path STRING.
+      const kwLine = toks[i].line
+      const kwCol = toks[i].col
       i = i + 1
       const names: string[] = []
       const locals: string[] = []
+      const nameLines: i32[] = []
+      const nameCols: i32[] = []
       if i < toks.length {
         if toks[i].kind == "LBRACE" {
           i = i + 1
@@ -1407,6 +1489,8 @@ function modScan(m: i32, src: string): i32 {
               if ck == "IDENT" {
                 let nm = toks[i].text
                 let loc = nm
+                nameLines.push(toks[i].line)
+                nameCols.push(toks[i].col)
                 if i + 2 < toks.length {
                   if (
                     toks[i + 1].kind == "IDENT" &&
@@ -1428,11 +1512,15 @@ function modScan(m: i32, src: string): i32 {
       // Forward to the path STRING (the `from` keyword rides as an IDENT). The
       // STRING token's `text` keeps its surrounding quotes — strip them.
       let spec = ""
+      let specLine = kwLine
+      let specCol = kwCol
       let scanning = true
       while scanning && i < toks.length {
         const sk = toks[i].kind
         if sk == "STRING" {
           spec = toks[i].text
+          specLine = toks[i].line
+          specCol = toks[i].col
           if spec.length >= 2 {
             if spec[0] == '"' && spec[spec.length - 1] == '"' {
               spec = spec.slice(1, spec.length - 1)
@@ -1454,6 +1542,10 @@ function modScan(m: i32, src: string): i32 {
         impKey.push(key)
         impName.push(names[n])
         impLocal.push(locals[n])
+        impNameLine.push(nameLines[n])
+        impNameCol.push(nameCols[n])
+        impSpecLine.push(specLine)
+        impSpecCol.push(specCol)
         n = n + 1
       }
       if names.length == 0 {
@@ -1462,6 +1554,10 @@ function modScan(m: i32, src: string): i32 {
         impKey.push(key)
         impName.push("")
         impLocal.push("")
+        impNameLine.push(kwLine)
+        impNameCol.push(kwCol)
+        impSpecLine.push(specLine)
+        impSpecCol.push(specCol)
       }
     } else if k == "EXPORT" && depth == 0 {
       if i + 1 < toks.length && toks[i + 1].kind == "LBRACE" {
@@ -1469,9 +1565,13 @@ function modScan(m: i32, src: string): i32 {
         // name list, but each entry is ALSO recorded as a public re-export. The local
         // binding (`as` alias, else the name) is what the import created; the public
         // name is the same alias. Cursor advances past the trailing path STRING.
+        const rkwLine = toks[i].line
+        const rkwCol = toks[i].col
         i = i + 2 // past EXPORT and LBRACE
         const rnames: string[] = []
         const rlocals: string[] = []
+        const rnameLines: i32[] = []
+        const rnameCols: i32[] = []
         let rgoing = true
         while rgoing && i < toks.length {
           const ck = toks[i].kind
@@ -1482,6 +1582,8 @@ function modScan(m: i32, src: string): i32 {
             if ck == "IDENT" {
               let nm = toks[i].text
               let loc = nm
+              rnameLines.push(toks[i].line)
+              rnameCols.push(toks[i].col)
               if i + 2 < toks.length {
                 if (
                   toks[i + 1].kind == "IDENT" &&
@@ -1499,11 +1601,15 @@ function modScan(m: i32, src: string): i32 {
           }
         }
         let rspec = ""
+        let rspecLine = rkwLine
+        let rspecCol = rkwCol
         let rscan = true
         while rscan && i < toks.length {
           const sk = toks[i].kind
           if sk == "STRING" {
             rspec = toks[i].text
+            rspecLine = toks[i].line
+            rspecCol = toks[i].col
             if rspec.length >= 2 {
               if rspec[0] == '"' && rspec[rspec.length - 1] == '"' {
                 rspec = rspec.slice(1, rspec.length - 1)
@@ -1526,6 +1632,10 @@ function modScan(m: i32, src: string): i32 {
           impKey.push(rkey)
           impName.push(rnames[rn])
           impLocal.push(rlocals[rn])
+          impNameLine.push(rnameLines[rn])
+          impNameCol.push(rnameCols[rn])
+          impSpecLine.push(rspecLine)
+          impSpecCol.push(rspecCol)
           // Record the PUBLIC re-export (its merged target is resolved in `modCompile`).
           reExpMod.push(m)
           reExpPublic.push(rlocals[rn])
@@ -1579,8 +1689,23 @@ function modRecomputePending(): i32 {
 // DFS state lives at the top of this file: 0 unvisited, 1 loading (on the stack
 // — a back-edge is a cycle), 2 done. `modOrder` collects table indices in
 // dependency-first (post) order.
-function modDiag(msg: string): i32 {
-  if !capHas(modDiags, msg) { modDiags.push(msg) }
+// Record one module-resolution diagnostic with its position and owning module.
+// Deduped on (module, message) — the same missing module imported by TWO files
+// is two findings, one per importer; repeated imports WITHIN one module (e.g.
+// several names pulled from one unresolvable specifier) still fold into one.
+let modDiagLine: i32[] = []
+let modDiagCol: i32[] = []
+let modDiagMod: i32[] = []
+function modDiag(m: i32, line: i32, col: i32, msg: string): i32 {
+  let i = 0
+  while i < modDiags.length {
+    if modDiagMod[i] == m && modDiags[i] == msg { return 0 }
+    i = i + 1
+  }
+  modDiags.push(msg)
+  modDiagLine.push(line)
+  modDiagCol.push(col)
+  modDiagMod.push(m)
   0
 }
 function modExportsHas(m: i32, name: string): boolean {
@@ -1603,15 +1728,22 @@ function modVisit(m: i32): i32 {
       let spec = impSpec[i]
       const key = impKey[i]
       if key == "" {
-        // Texts mirror the host's `loadProgram` — keep them aligned.
+        // Texts mirror the host's `loadProgram` — keep them aligned. Spec-shaped
+        // problems anchor at the specifier STRING token of THIS import.
         if modKeyIsStd(modKeys[m]) && modIsRelative(spec) {
           modDiag(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
             "Unsupported import specifier \"" +
               spec +
               "\" — std modules import only via `std:` specifiers (relative imports inside std are not allowed)",
           )
         } else {
           modDiag(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
             "Unsupported import specifier \"" +
               spec +
               "\" — supported: relative paths (`./`, `../`) and `std:` modules; bare specifiers are not yet implemented",
@@ -1621,14 +1753,23 @@ function modVisit(m: i32): i32 {
         let d = modIndexOfKey(key)
         if d < 0 {
           modDiag(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
             "Cannot resolve import \"" + spec + "\" (no module `" + key + "`)",
           )
         } else if modFound[d] == 0 {
           modDiag(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
             "Cannot resolve import \"" + spec + "\" (no module `" + key + "`)",
           )
         } else if modState[d] == 1 {
           modDiag(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
             "Import cycle detected through \"" +
               spec +
               "\" (module `" +
@@ -1639,7 +1780,11 @@ function modVisit(m: i32): i32 {
           if modState[d] == 0 { modVisit(d) }
           if impName[i] != "" {
             if !modExportsHas(d, impName[i]) {
+              // A name-shaped problem anchors at the imported NAME token.
               modDiag(
+                m,
+                impNameLine[i],
+                impNameCol[i],
                 "\"" + impName[i] + "\" is not exported by \"" + spec + "\"",
               )
             }
@@ -1659,6 +1804,9 @@ function modCompile(emit: i32): i32 {
   modState = []
   modOrder = []
   modDiags = []
+  modDiagLine = []
+  modDiagCol = []
+  modDiagMod = []
   let s = 0
   while s < modKeys.length {
     modState.push(0)
@@ -1666,8 +1814,14 @@ function modCompile(emit: i32): i32 {
   }
   modVisit(0)
   if modDiags.length > 0 {
+    // Tokenless (no tokens are loaded yet): position + owner ride the `vcDg*`
+    // side table, keyed on each entry's `P.diags` index.
     let d = 0
     while d < modDiags.length {
+      vcDgIdx.push(P.diags.length)
+      vcDgLine.push(modDiagLine[d])
+      vcDgCol.push(modDiagCol[d])
+      vcDgMod.push(modDiagMod[d])
       P.diags.push({ msg: modDiags[d], at: -1 })
       d = d + 1
     }
@@ -1679,6 +1833,11 @@ function modCompile(emit: i32): i32 {
   const roots: i32[] = []
   modLoadStart = []
   modLoadMod = []
+  // Sibling modules are independent: parse EVERY module and aggregate their
+  // parse/lex diagnostics rather than aborting at the first failing module —
+  // one run reports every file's syntax errors. `vcLoadMod` attributes a lex
+  // diag (tokenless) to the module being loaded; parse diags anchor at tokens
+  // and resolve their owner through `modOfTok`.
   let o = 0
   while o < modOrder.length {
     const m = modOrder[o]
@@ -1687,11 +1846,13 @@ function modCompile(emit: i32): i32 {
     // to its module (`modOfTok`) for cross-file find-references.
     modLoadStart.push(P.toks.length)
     modLoadMod.push(m)
+    vcLoadMod = m
     vcLoadToksMod(m)
     roots.push(parseProgram())
-    if P.diags.length > 0 { return 1 }
     o = o + 1
   }
+  vcLoadMod = 0
+  if P.diags.length > 0 { return 1 }
   // 2b. Duplicate-binding check: a top-level declaration whose name collides
   // with an import local would be silently ORPHANED by the merge rename (the
   // import mapping wins, so every reference rewrites to the IMPORT's target) —
