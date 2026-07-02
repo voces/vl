@@ -479,6 +479,7 @@ const REJECT_CASES = [
   "literals/err-prefix-separator.vl",
   "literals/err-trailing-separator.vl",
   "loops/for-in-not-array.vl",
+  "loops/step-out-of-range-reject.vl",
   "maps/error-i32-keyed.vl",
   "maps/error-infer-conflict.vl",
   "maps/error-no-annotation.vl",
