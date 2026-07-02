@@ -47,6 +47,7 @@
 // variant type the single `checkNode` visitor `is`-narrows. The checker's own
 // `Ty` type algebra stays PRIVATE to this module.
 import { Tok } from "./ast"
+import { f32LitOverflows, f64LitOverflows } from "./emit_bignum"
 import { peek } from "./lexer"
 import { accept, peekTok } from "./parser"
 import {
@@ -2683,7 +2684,13 @@ function isFloatLitExpr(ix: i32) {
   if e is Unary {
     if e.unOp == "-" { return isFloatLitExpr(e.unArg) }
   }
-  if e is NumLit { return hasDot(e.numText) }
+  // A literal whose magnitude overflows f32 does NOT re-encode at f32 (it would
+  // encode ±infinity), so it gets no f32 grant — it takes the normal
+  // f64-value-into-f32 lossy-demote rejection at the flow site.
+  if e is NumLit {
+    if !hasDot(e.numText) { return false }
+    return !f32LitOverflows(e.numText)
+  }
   false
 }
 
@@ -7344,7 +7351,16 @@ function checkNodeReal(ix: i32) {
     // A literal with a "." is f64. An integer literal defaults to the NARROWEST
     // type that holds it exactly — i32 if its magnitude fits, else i64 — the
     // host's `defaultIntegerType` rule (`intLexemeFitsI32`).
-    if hasDot(n.numText) { return TY_F64 }
+    if hasDot(n.numText) {
+      // A literal whose magnitude rounds past the largest finite double names a
+      // value f64 cannot represent — and VL has no infinity spelling to encode
+      // it honestly, so it is an ERROR (silent ±inf would be a lossy implicit
+      // conversion). The judgement is the ENCODER's own rounding
+      // (`f64LitOverflows`), exact at the boundary. Runtime arithmetic still
+      // yields ±inf per IEEE-754 — this rejects only literal text.
+      if f64LitOverflows(n.numText) { tErr("float literal overflows f64", ix) }
+      return TY_F64
+    }
     if intLexemeFitsI32(n.numText) { return TY_I32 }
     return TY_I64
   } else if n is StrLit {
