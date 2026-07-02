@@ -867,6 +867,8 @@ let cVariantMemberTyIxs: i32[] = []
 let cUnionTyIxs: i32[] = []
 // A single placeholder `TyFunc` arena index for monomorphizer `=>sigkey` closure pins (C1 endgame).
 let cFuncPinTyIx = -1
+// A single placeholder `TyObj` arena index for interned anonymous-shape `#anonN` names (C1 endgame).
+let cObjPinTyIx = -1
 let inferQuiet = false
 let cycleBreakCount = 0
 let inferTentative: string[] = []
@@ -1058,6 +1060,7 @@ export function initChecker() {
   bodyChecked = Map()
   nodeTyIx = []
   cFuncPinTyIx = -1
+  cObjPinTyIx = -1
   inferQuiet = false
   cycleBreakCount = 0
   inferTentative = []
@@ -7253,6 +7256,7 @@ export function checkProgram(rootIx: i32) {
   // Size the typed-IR table to the (now fully parsed) node arena, all holes (-1).
   nodeTyIx = []
   cFuncPinTyIx = -1
+  cObjPinTyIx = -1
   let ntz = 0
   while ntz < P.nodes.length {
     nodeTyIx.push(-1)
@@ -7455,6 +7459,16 @@ function funcPinTyIx() {
   }
   cFuncPinTyIx
 }
+// The lazily-built placeholder `TyObj` for interned anonymous shapes — only its `is TyObj`-ness is
+// read (`nodeTyIsStruct`); the real layout rides the `#anonN` NAME (the emitter's `sNames` table).
+function objPinTyIx() {
+  if cObjPinTyIx < 0 {
+    const ns: string[] = []
+    const ts: i32[] = []
+    cObjPinTyIx = mkObjTy(ns, ts)
+  }
+  cObjPinTyIx
+}
 export function recordClonedNodeTy(nodeIx: i32, name: string) {
   if nodeIx < 0 { return 0 }
   let ty = nameToTy(name)
@@ -7463,6 +7477,17 @@ export function recordClonedNodeTy(nodeIx: i32, name: string) {
     // function type — record a placeholder `TyFunc` so `nodeTyIsFunc` classifies the pin structurally.
     if name.length >= 2 && name[0] == '=' && name[1] == '>' {
       ty = funcPinTyIx()
+    } else if (
+      name.length >= 5 &&
+      name[0] == '#' &&
+      name[1] == 'a' &&
+      name[2] == 'n' &&
+      name[3] == 'o' &&
+      name[4] == 'n'
+    ) {
+      // An interned anonymous-shape `#anonN` (`nameToTy` can't resolve the synthetic name) is a
+      // struct-shaped object — a placeholder `TyObj` so `nodeTyIsStruct` classifies it structurally.
+      ty = objPinTyIx()
     }
   }
   while nodeTyIx.length <= nodeIx { nodeTyIx.push(-1) }
@@ -7599,6 +7624,14 @@ export function nodeTyIsStruct(ix: i32) {
   if cTyIxListHas(cStructTyIxs, ty) { return true }
   const t = T.tys[ty]
   if t is TyObj { return true }
+  if t is TyUnion {
+    // A struct-alias union — a canonicalized `{a} & {b}` object intersection wraps its single merged
+    // object shape in a one-member union; the emitter interns it as a struct (`isSName`), so match it.
+    if t.uMembers.length == 1 {
+      const m = T.tys[t.uMembers[0]]
+      if m is TyObj { return true }
+    }
+  }
   false
 }
 // STRUCTURAL (C1): node `ix`'s recorded type IS an OBJECT union-variant member — the nominal analogue
@@ -7657,10 +7690,22 @@ export function nodeTyIsStructArray(ix: i32) {
 export function nodeTyIsUnionAlias(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
-  if !cTyIxListHas(cUnionTyIxs, ty) { return false }
-  if tyIsLitUnion(ty) { return false }
   const t = T.tys[ty]
-  if t is TyUnion { return t.uMembers.length >= 2 }
+  // A value/struct union box (`i32 | string`, `Cat | Dog`) — inline OR declared; the emitter registers
+  // both in `unNames` (`isUName`). Excluded: a nullable niche (a `TyNullable`, not a `TyUnion`), and a
+  // LITERAL union — string OR numeric (`0 | 1 | 2` canon-names `i32`), whose members are all `TyLit`
+  // and which reps as an interned atom, not a `{tag, value}` box. A struct-alias is single-member.
+  if t is TyUnion {
+    if t.uMembers.length < 2 { return false }
+    let allLit = true
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyLit {} else { allLit = false }
+      i = i + 1
+    }
+    return !allLit
+  }
   false
 }
 export function nodeTyIsNulClosure(ix: i32) {
