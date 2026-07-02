@@ -99,6 +99,7 @@ const RUN_CASES = [
   "arrays/equality.vl",
   "arrays/boolean-elements.vl",
   "arrays/capacity-and-get.vl",
+  "arrays/index-len-bounds-ok.vl",
   "arrays/f64-elems.vl",
   "arrays/infer-empty-from-usage.vl",
   "arrays/infer-empty-index-set.vl",
@@ -439,6 +440,10 @@ const TRAP_CASES = [
   "intrinsics/trap.vl",
   "traps/array-oob-read.vl",
   "traps/divide-by-zero.vl",
+  "traps/list-index-slack-read.vl",
+  "traps/list-index-slack-read-ref.vl",
+  "traps/list-index-beyond-cap-read.vl",
+  "traps/list-index-slack-write.vl",
 ];
 
 // ── REJECT_CASES (@error): `vl check` rejects at the parse/type stage ──

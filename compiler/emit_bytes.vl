@@ -53,6 +53,9 @@ import {
   leqIScratchBase,
   leqRBases,
   leqSScratchBase,
+  liKinds,
+  liSlots,
+  listIdxScratchBase,
   localIsRef,
   localStructIdx,
   mStructIdx,
@@ -739,6 +742,14 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   if fnUsesCoalesceCall { fbReserve(1) }
   coalesceCallBoolSlot = fbScratchCur
   if fnUsesCoalesceCall { fbReserve(1) }
+  // List-index bounds-check frame: slot 0 the shared i32 index stash, then one
+  // nullable wrapper-ref slot per distinct indexed list kind. Discovered lazily
+  // DURING lowering (`listIdxWrapSlot`), so nothing is reserved here — the frame
+  // sits after every eager frame, which fixes its base even before its size is
+  // known (the locals vector is written only after the body is lowered).
+  listIdxScratchBase = fbScratchCur
+  liKinds = []
+  liSlots = []
   fbScratchCur
 }
 // One (1, i32) run — `0x7f`.
@@ -804,6 +815,7 @@ export function fbLocalsCount(nLocals: i32) {
   if fnUsesCloEq { n = n + 2 }
   if fnUsesArrNew { n = n + 1 }
   if fnUsesCoalesceCall { n = n + 3 }
+  if liKinds.length > 0 { n = n + 1 + liKinds.length }
   n
 }
 // Emit the full locals vector onto `body`: the run count, then one (1, valtype) run
@@ -1038,6 +1050,26 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(uBoxIdx)
     fbRefNullRun(aTypeIdx)
     fbI32Run()
+  }
+  // List-index bounds-check frame (lazy, appended LAST — after even the frames
+  // above, matching `fbBeginFunc`'s base): the shared i32 index stash, then one
+  // NULLABLE wrapper-ref slot per distinct indexed list kind (nullable so the
+  // slot is defaultable; the staged value is always a live wrapper ref).
+  if liKinds.length > 0 {
+    fbI32Run()
+    let lix = 0
+    while lix < liKinds.length {
+      const lk = liKinds[lix]
+      match lk {
+        "f64" => fbRefNullRun(fl64TypeIdx)
+        "i64" => fbRefNullRun(il64TypeIdx)
+        "f32" => fbRefNullRun(fl32TypeIdx)
+        "ref" => fbRefNullRun(rlWrapIdx[liSlots[lix]])
+        "str" => fbRefNullRun(mkListIdx)
+        "i32" => fbRefNullRun(lTypeIdx)
+      }
+      lix = lix + 1
+    }
   }
   wTarget(prev)
   0

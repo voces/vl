@@ -441,6 +441,9 @@ import {
   leqIScratchBase,
   leqRBases,
   leqSScratchBase,
+  liKinds,
+  liSlots,
+  listIdxScratchBase,
   localIsRef,
   localLitUnion,
   localLoopVar,
@@ -9087,6 +9090,59 @@ function pushMapScrHB(body: i32[]) {
 //                   i32 CODE POINT (unchanged from the fixed-array string rep).
 // `array.get` is `0xfb 0x0b <typeidx>` (the `_s/_u` forms `0x0c/0x0d` are only for
 // PACKED arrays; an unpacked i32 array uses `0x0b`).
+// The bounds-check wrapper-ref slot for list kind `kind` (`slot` = the ref-list
+// table slot for kind "ref", else 0) — found in this function's lazily grown
+// `liKinds` table, or reserved now. Slot 0 of the frame (`listIdxScratchBase`)
+// is the shared i32 index stash; wrapper slot k lives at `base + 1 + k`. The
+// frame's base is fixed by `fbBeginFunc` (it lays out after every eager frame),
+// so handing slots out mid-lowering is safe, and first-use order keeps the
+// layout deterministic (the locals vector is derived from the same table).
+// The bounds-check frame kind for a SCALAR list element kind (`scalarListElemKind`
+// only ever yields the four scalar members of `VKind`).
+function listIdxKindOf(ek: VKind): MfKind {
+  if ek == "f64" { return "f64" }
+  if ek == "i64" { return "i64" }
+  if ek == "f32" { return "f32" }
+  "i32"
+}
+
+function listIdxWrapSlot(kind: MfKind, slot: i32) {
+  let k = 0
+  while k < liKinds.length {
+    if liKinds[k] == kind && liSlots[k] == slot {
+      return listIdxScratchBase + 1 + k
+    }
+    k = k + 1
+  }
+  liKinds.push(kind)
+  liSlots.push(slot)
+  listIdxScratchBase + liKinds.length
+}
+
+// Lower the `len`-bounds guard of a list `xs[i]` read/write. On entry the stack
+// holds [wrapper, index] — both FULLY evaluated (a nested index op inside either
+// expression has already come and gone through this same frame). Stages both,
+// then leaves [backing, safeIndex] where safeIndex is `i` when `i u< len` (one
+// unsigned compare covers negative + past-len) and `-1` otherwise — an index the
+// backing can never satisfy, so the following `array.get`/`array.set` traps AT
+// ITS OWN instruction, exactly like a beyond-`cap` access always has. Without
+// the guard, reads in the `len <= i < cap` slack (`.push` grows `cap` past
+// `len`) return the backing's zero-init silently.
+function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
+  fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
+  fbLocalSet(wrapSlot)           // 0x21 local.set — stash the wrapper ref
+  fbLocalGet(wrapSlot)
+  fbStructGet(lTy, 0)            // field 0: backing
+  fbLocalGet(listIdxScratchBase)
+  fbI32Const(-1)                 // the out-of-range replacement index
+  fbLocalGet(listIdxScratchBase)
+  fbLocalGet(wrapSlot)
+  fbStructGet(lTy, 1)            // field 1: len
+  fbI32Bin(73)                   // 0x49 i32.lt_u
+  wU8(27)                        // 0x1b select → i if in-bounds else -1
+  0
+}
+
 function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
   const nd = P.nodes[idxIx]
   if nd is Index {
@@ -9107,7 +9163,6 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       if exprNullableRefArray(nd.idxArr, fnIx) {
         wU8(212) // 0xd4 ref.as_non_null
       }
-      fbStructGet(rlWrapIdx[rslot], 0) // 0xfb 0x02 <ref-list wrapper> field 0: backing
       // The INDEX is always i32 — clear any `pendingF32` an enclosing f32 context set, else a
       // bare index literal emits as `f32.const` (matters for an INNER read `g[i][j]` over an
       // `f32[][]`: the outer f32 read leaves `pendingF32` set while it emits this receiver).
@@ -9115,6 +9170,8 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       pendingF32 = false
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
       pendingF32 = savedRlIxF32
+      // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
+      emitListIdxGuard(listIdxWrapSlot("ref", rslot), rlWrapIdx[rslot])
       fbArrayGet(rlBackIdx[rslot]) // 0xfb 0x0b <this slot's ref backing array>
       // A NULLABLE-NICHE element legitimately holds null, so the read STAYS `(ref null $elem)` — no
       // `ref.as_non_null` recover (the bound `e` is the niche the caller narrows with `e != null`). The
@@ -9134,10 +9191,11 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
         )
       }
       if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
-      fbStructGet(mkListIdx, 0) // 0xfb 0x02 <string-list wrapper> field 0: backing
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
-      fbArrayGet(mkArrIdx)      // 0xfb 0x0b <string backing array type index>
-      wU8(212)                  // 0xd4 ref.as_non_null (recover the non-null string)
+      // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
+      emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
+      fbArrayGet(mkArrIdx) // 0xfb 0x0b <string backing array type index>
+      wU8(212)             // 0xd4 ref.as_non_null (recover the non-null string)
       return 0
     }
     // A SCALAR list `xs[i]` → unwrap to its backing, `array.get <back>` — yielding the
@@ -9149,13 +9207,17 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
         return emitFail("emitProgram: index access but list type not collected")
       }
       if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
-      fbStructGet(scalarListWrap(ek), 0) // field 0: backing
       // The INDEX is always i32 — clear any f32 coercion signal an enclosing `f32` context
       // set (`pendingF32`), else a bare index literal `xs[0]` would emit as `f32.const`.
       const savedIxF32 = pendingF32
       pendingF32 = false
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
       pendingF32 = savedIxF32
+      // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
+      emitListIdxGuard(
+        listIdxWrapSlot(listIdxKindOf(ek), 0),
+        scalarListWrap(ek),
+      )
       fbArrayGet(scalarListBack(ek)) // yields the element in its rep
       return 0
     }
@@ -12015,10 +12077,11 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           fnIx,
         )
       }
-      // Indexed store `a[i] = v`: unwrap the list to its backing (`struct.get $lTy 0`),
-      // push the index, then the value, then `array.set $aTy` (`0xfb 0x0e <typeidx>`). A
-      // REF list (G7-ref) stores a struct ref / union box (a subtype of the `(ref null
-      // $elem)` slot) over the ref list/backing indices; an i32 list stores an i32.
+      // Indexed store `a[i] = v`: evaluate the wrapper + index, guard `i u< len`
+      // and unwrap to the backing (`emitListIdxGuard`), then the value, then
+      // `array.set $aTy` (`0xfb 0x0e <typeidx>`). A REF list (G7-ref) stores a
+      // struct ref / union box (a subtype of the `(ref null $elem)` slot) over
+      // the ref list/backing indices; an i32 list stores an i32.
       const isRef = exprRefArray(target.idxArr, fnIx)
       const isStr = exprStringArray(target.idxArr, fnIx)
       // The scalar non-i32 lists (`f64[]`/`i64[]`/`f32[]`): the SAME unwrap+`array.set` spine over
@@ -12028,6 +12091,10 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       const isF32 = exprF32Array(target.idxArr, fnIx)
       let lTy = lTypeIdx
       let aTy = aTypeIdx
+      // The bounds-check frame kind (+ ref-list table slot) for this target list —
+      // the write guards `i u< len` exactly like the read path.
+      let idxKind: MfKind = "i32"
+      let idxSlot = 0
       // A ref list of STRUCT elements (kind 1) types the stored value literal as the
       // list's declared element struct — seed `pendingStructIdx` (consumed by `emitObj`)
       // so `xs[i] = { … }` builds the element struct over a first-field-name match.
@@ -12044,6 +12111,8 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         let rslot = refListSlotOfExpr(target.idxArr, fnIx)
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
+        idxKind = "ref"
+        idxSlot = rslot
         if rlElemKindTbl[rslot] == 1 {
           storeStructIdx = structIdxOfElemName(rlElemName[rslot])
         }
@@ -12061,6 +12130,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         }
         lTy = mkListIdx
         aTy = mkArrIdx
+        idxKind = "str"
       } else if isF64 {
         if !fa64Used {
           return emitFail(
@@ -12069,6 +12139,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         }
         lTy = fl64TypeIdx
         aTy = fa64TypeIdx
+        idxKind = "f64"
       } else if isI64 {
         if !ia64Used {
           return emitFail(
@@ -12077,6 +12148,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         }
         lTy = il64TypeIdx
         aTy = ia64TypeIdx
+        idxKind = "i64"
       } else if isF32 {
         if !fa32Used {
           return emitFail(
@@ -12085,6 +12157,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         }
         lTy = fl32TypeIdx
         aTy = fa32TypeIdx
+        idxKind = "f32"
       } else {
         if !lUsed {
           return emitFail(
@@ -12098,8 +12171,11 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         }
       }
       if emitExpr(body, target.idxArr, fnIx) < 0 { return -1 }
-      fbStructGet(lTy, 0) // 0xfb 0x02 <list wrapper struct type index> field 0: backing
       if emitExpr(body, target.idxIndex, fnIx) < 0 { return -1 }
+      // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
+      // [backing, safeIndex]; the value then evaluates ABOVE them, so a nested
+      // index op inside the RHS is free to reuse the guard frame.
+      emitListIdxGuard(listIdxWrapSlot(idxKind, idxSlot), lTy)
       pendingStructIdx = storeStructIdx
       if storeUnionNm != "" {
         if emitUnionBoxArg(body, storeUnionNm, a.binRight, fnIx) < 0 {
