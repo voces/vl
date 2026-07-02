@@ -381,9 +381,56 @@ function alignComments(text: string) {
 // Comments are consumed in source order. `cmtCursor` is the next unconsumed
 // comment; all placement helpers advance it monotonically (host `pending` shift).
 
+// Char spans the printer reproduced VERBATIM in the output (the comment-bearing
+// slice fallbacks — see `sliceFallback`). A pending comment that starts inside
+// one was already emitted as part of that verbatim text, so the placement
+// helpers SKIP it instead of re-emitting it after the statement. Spans are
+// RECORDED rather than the comments consumed at render time because expression
+// rendering is speculative (a one-line attempt may be discarded and the node
+// re-rendered) — marking is idempotent where consuming would lose the comment.
+let vbStart: i32[] = []
+let vbStop: i32[] = []
+
+function markVerbatim(start: i32, stop: i32) {
+  vbStart.push(start)
+  vbStop.push(stop)
+  0
+}
+
+// Whether comment `k` lies inside a recorded verbatim span (already emitted).
+function commentCovered(k: i32) {
+  let i = 0
+  while i < vbStart.length {
+    if cmtStart[k] >= vbStart[i] && cmtStart[k] < vbStop[i] { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Advance the cursor past comments a verbatim slice already reproduced.
+function skipCovered() {
+  while cmtCursor < cmtText.length && commentCovered(cmtCursor) {
+    cmtCursor = cmtCursor + 1
+  }
+  0
+}
+
+// Whether any pending comment starts inside the char span `[start, stop)`.
+function commentInCharSpan(start: i32, stop: i32) {
+  if start < 0 || stop < 0 { return false }
+  let i = cmtCursor
+  while i < cmtText.length {
+    if cmtStart[i] >= stop { return false }
+    if cmtStart[i] >= start { return true }
+    i = i + 1
+  }
+  false
+}
+
 // Emit every own-line comment that starts strictly before source `line`.
 function emitLeadingComments(indent: i32, line: i32) {
   let prev = 0
+  skipCovered()
   while cmtCursor < cmtText.length && cmtLine[cmtCursor] < line {
     // Keep a single source blank line between consecutive own-line comments, so a
     // section header stays separated from the comment that follows it.
@@ -391,6 +438,7 @@ function emitLeadingComments(indent: i32, line: i32) {
     emitLine(indent, cmtText[cmtCursor])
     prev = cmtLine[cmtCursor]
     cmtCursor = cmtCursor + 1
+    skipCovered()
   }
   // …and a blank between the last comment and the code it precedes.
   if prev > 0 && line > 0 && line - prev > 1 { fmtEmitRaw("\n") }
@@ -402,7 +450,7 @@ function peekLeadingCount(line: i32) {
   let n = 0
   let i = cmtCursor
   while i < cmtText.length && cmtLine[i] < line {
-    n = n + 1
+    if !commentCovered(i) { n = n + 1 }
     i = i + 1
   }
   n
@@ -410,6 +458,7 @@ function peekLeadingCount(line: i32) {
 
 // The text of a trailing comment on exactly `line` (consumed), or "" if none.
 function trailingOn(line: i32) {
+  skipCovered()
   if cmtCursor < cmtText.length {
     const isTrail = cmtTrailing[cmtCursor] == 1
     if isTrail && cmtLine[cmtCursor] == line {
@@ -438,6 +487,7 @@ function gapBefore(off: i32) {
 // (where the original gap would otherwise be normalized away). A run with no such
 // signal is left at one space.
 function trailerSuffix(line: i32) {
+  skipCovered()
   let wide = false
   if (
     cmtCursor < cmtText.length &&
@@ -454,11 +504,29 @@ function trailerSuffix(line: i32) {
 
 // Drain every remaining comment as own-line text at `indent`.
 function flushRemaining(indent: i32) {
+  skipCovered()
   while cmtCursor < cmtText.length {
     emitLine(indent, cmtText[cmtCursor])
     cmtCursor = cmtCursor + 1
+    skipCovered()
   }
   0
+}
+
+// Comment-aware verbatim fallback for a construct printed from its source slice.
+// A slice with no comment inside collapses to one line (the canonical inline
+// form). One that CONTAINS a `//` comment must keep its line structure —
+// collapsing would splice the following code AND the closing brace onto the
+// comment's line, commenting them out (unparseable output). Such a slice is
+// reproduced verbatim (interior lines keep their source indentation, which makes
+// a re-format reproduce them unchanged — idempotent) and its span recorded so
+// the placement helpers skip the comments it already carries.
+function sliceFallback(ix: i32) {
+  const start = nodePos(ix)
+  const stop = nodeEndOf(ix)
+  if !commentInCharSpan(start, stop) { return collapseWs(sliceNode(ix)) }
+  markVerbatim(start, stop)
+  rstripWsAll(sliceNode(ix))
 }
 
 // Whether any pending comment starts on a line within `[startLine, stopLine]`.
@@ -481,6 +549,8 @@ export function formatProgram(progRoot: i32) {
   fmtWidth = 80
   outBuf = []
   cmtCursor = 0
+  vbStart = []
+  vbStop = []
   if progRoot < 0 || progRoot >= P.nodes.length { return "" }
   const root = P.nodes[progRoot]
   if root is Program {
@@ -651,6 +721,9 @@ function emitStatements(stmts: i32[], indent: i32) {
   let i = 0
   while i < stmts.length {
     const ix = stmts[i]
+    // A comment reproduced inside the PREVIOUS statement's verbatim slice must
+    // not steer this statement's blank-line policy — skip covered ones first.
+    skipCovered()
     let sLine = startLineOf(ix)
     // A synthesized statement (no span) gets `0`; sequence it right after the
     // previous one. (`< 1` not `== 0`: a bare `== 0` if-cond whose body reassigns
@@ -1387,11 +1460,11 @@ function statementInline(ix: i32, indent: i32) {
     return "continue"
   }
   if n is LetDecl { return letInline(ix, n, indent) }
-  if n is WhileStmt { return collapseWs(sliceNode(ix)) }
-  if n is ForRange { return collapseWs(sliceNode(ix)) }
-  if n is ForIn { return collapseWs(sliceNode(ix)) }
-  if n is Block { return collapseWs(sliceNode(ix)) }
-  if n is IfStmt { return collapseWs(sliceNode(ix)) }
+  if n is WhileStmt { return sliceFallback(ix) }
+  if n is ForRange { return sliceFallback(ix) }
+  if n is ForIn { return sliceFallback(ix) }
+  if n is Block { return sliceFallback(ix) }
+  if n is IfStmt { return sliceFallback(ix) }
   expr(ix, indent, 0)
 }
 
@@ -1433,7 +1506,7 @@ function expr(ix: i32, indent: i32, column: i32) {
   if n is IfStmt { return ifExpr(ix, n, indent) }
   if n is Block { return blockExpr(ix, n, indent) }
   if n is MatchExpr { return matchExprFmt(ix, n, indent) }
-  collapseWs(sliceNode(ix))
+  sliceFallback(ix)
 }
 
 // A `match` (value- or statement-position): the scrutinee on the header line, then ONE arm per
@@ -1840,10 +1913,13 @@ function arrowHeader(node: FuncDecl, reserved: i32) {
 
 function ifExpr(ix: i32, node: IfStmt, indent: i32) {
   // An `if` as an expression value: single-line `if c then a else b` when every
-  // branch is a simple expression; else fall back to the source slice.
+  // branch is a simple expression AND no comment lives inside the expression (a
+  // comment cannot ride the inline `then`/`else` form — keep it anchored by
+  // falling through to the verbatim slice); else fall back to the source slice.
+  const hasCmt = commentInCharSpan(nodePos(ix), nodeEndOf(ix))
   let elseOk = node.ifElse < 0
   if !elseOk { elseOk = branchIsSimple(node.ifElse) || elseIsIf(node.ifElse) }
-  if branchIsSimple(node.ifThen) && elseOk {
+  if !hasCmt && branchIsSimple(node.ifThen) && elseOk {
     const cond = expr(node.ifCond, indent, 0)
     const thenE = bareBodyInline(node.ifThen, indent)
     let parts = "if " + cond + " then " + thenE
@@ -1857,7 +1933,7 @@ function ifExpr(ix: i32, node: IfStmt, indent: i32) {
     }
     return parts
   }
-  collapseWs(sliceNode(ix))
+  sliceFallback(ix)
 }
 
 // An `else if`-chain tail in expression position.
