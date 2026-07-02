@@ -156,3 +156,36 @@ Deno.test({
     });
   },
 });
+
+Deno.test({
+  name: "check: an identically-positioned repeat diagnostic is reported once",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      // A generic-alias arity error and a bare-use error each resolve in BOTH
+      // the pass-1.5 hoist and the real pass — the checker drops the exact
+      // (message, anchor) repeat, so each renders exactly once.
+      await Deno.writeTextFile(
+        `${dir}/a.vl`,
+        [
+          "type Box<T> = { val: T }",
+          "const _b: Box<i32, string> = { val: 1 }",
+          "const _c: Box = { val: 2 }",
+          "",
+        ].join("\n"),
+      );
+      const { code, err } = await run(["check", `${dir}/a.vl`, "--concise"]);
+      if (code !== 1) throw new Error(`expected exit 1, got ${code}: ${err}`);
+      const count = (needle: string): number =>
+        err.split(needle).length - 1;
+      const arity = "expects 1 type arguments but got 2";
+      const bare = "expects type arguments but was used without any";
+      if (count(arity) !== 1) {
+        throw new Error(`expected the arity error once, got: ${err}`);
+      }
+      if (count(bare) !== 1) {
+        throw new Error(`expected the bare-use error once, got: ${err}`);
+      }
+    });
+  },
+});

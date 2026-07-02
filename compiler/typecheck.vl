@@ -2591,6 +2591,16 @@ function tErrCoded(msg: string, at: i32, code: string) {
       co = t.col
     }
   }
+  // An EXACT repeat (same message, same anchor) is noise, not information — two
+  // passes can resolve the same annotation (the pass-1.5 hoist and the real pass
+  // both report a generic-alias arity/bare-use error, identically positioned).
+  // Drop the repeat; the diagnostic count stays small, so the scan is cheap.
+  let di = 0
+  while di < T.diags.length {
+    const d = T.diags[di]
+    if d.tat == at && d.tmsg == msg { return 0 }
+    di = di + 1
+  }
   T.diags.push({ tmsg: msg, tat: at, tline: ln, tcol: co, tcode: code })
   0
 }
@@ -9439,11 +9449,16 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   // Type the scrutinee, check every pattern is a member, enforce EXHAUSTIVENESS (all members
   // covered, or a `_` wildcard) and reject REDUNDANT arms, then join the arm VALUE types so a
   // value-position `match` (`const x = match …`) and a return-tail `match` both type.
-  const _mTail = retTailPos
+  // The scrutinee and the arm bodies are NOT in return-tail position; RESTORE the flag on
+  // every exit (mirroring `checkIfStmtNode`) so a `match` subexpression is transparent to a
+  // SIBLING in the same statement — a stale `false` re-typed a following else-less tail-`if`
+  // as void instead of `then | null`.
+  const mTail = retTailPos
   retTailPos = false
   const st = checkNode(n.matchScrut)
   if !tyIsLitUnion(st) {
     tErr("match scrutinee must be a literal union, got " + tyToStr(st), ix)
+    retTailPos = mTail
     return TY_ERR
   }
   // The member texts (inner, no quotes), and a parallel covered-flag.
@@ -9569,6 +9584,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   }
   // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
   if !inferQuiet { desugarMatchAt(ix) }
+  retTailPos = mTail
   return matchTy
 }
 
