@@ -211,6 +211,7 @@ const RUN_CASES = [
   "lists/struct-pop-get-map.vl",
   "literals/binary.vl",
   "literals/hex.vl",
+  "literals/long-literal-chunked.vl",
   "literals/octal.vl",
   "literals/separators.vl",
   "literals/wide-hex.vl",
