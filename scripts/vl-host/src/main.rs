@@ -238,6 +238,11 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
             .unwrap_or(false);
         imp || reexp
     });
+    // Set when the module fetch loop stages the program: `compileSrc`/`checkSrc`
+    // then run the module pipeline off the module table and never read the
+    // single-source buffer, so pushing the entry source AGAIN through the
+    // per-code-point boundary would only double the staging cost.
+    let mut staged_via_modules = false;
     if has_imports {
         if let (Ok(mod_reset), Ok(key_push), Ok(msrc_push), Ok(commit), Ok(pend_n), Ok(pend_len), Ok(pend_at)) = (
             inst.get_typed_func::<(), i32>(&mut *store, "modReset"),
@@ -294,12 +299,15 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
                     commit_module(store, &key, src.as_deref())?;
                 }
             }
+            staged_via_modules = true;
         }
     }
 
-    src_reset.call(&mut *store, ())?;
-    for ch in source.chars() {
-        src_push.call(&mut *store, ch as i32)?;
+    if !staged_via_modules {
+        src_reset.call(&mut *store, ())?;
+        for ch in source.chars() {
+            src_push.call(&mut *store, ch as i32)?;
+        }
     }
     Ok(())
 }
