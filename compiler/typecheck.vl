@@ -8391,6 +8391,45 @@ export function nodeTyIsLitUnion(ix: i32) {
   return r
 }
 
+// True if node `ix`'s recorded type is a string-keyed MAP whose VALUE type is a literal
+// union (`{[string]: K}`, `K = "a" | "b"`) — the atom-valued MONO map (each value is the
+// interned atom id, a plain i32). The emitter's map store / `??`-default sites read this
+// off the RECEIVER to seed the atom context, so a member literal lowers as its id, not a
+// string ref.
+export function nodeTyMapValIsLitUnion(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyMap { return tyIsLitUnion(t.mVal) }
+  false
+}
+
+// The member literal TEXTS (raw inner lexeme, no quotes) of the VALUE literal union of node
+// `ix`'s recorded map type — the atom-map dual of `nodeLitUnionMemberTexts`. Empty if `ix`
+// is not an atom-valued map. The emitter's `??`-default gate checks the default literal is
+// a MEMBER (a non-member would mint a fresh atom id under a `string`-typed result).
+export function nodeTyMapValLitUnionTexts(ix: i32) {
+  const out: string[] = []
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return out }
+  const t = T.tys[ty]
+  if t is TyMap {
+    if !tyIsLitUnion(t.mVal) { return out }
+    const v = T.tys[t.mVal]
+    if v is TyUnion {
+      let i = 0
+      while i < v.uMembers.length {
+        const m = T.tys[v.uMembers[i]]
+        if m is TyLit {
+          if m.litKind == "str" { out.push(m.litText) }
+        }
+        i = i + 1
+      }
+    }
+  }
+  out
+}
+
 // The member literal TEXTS (raw inner lexeme, no quotes) of node `ix`'s literal-union type, in source
 // order — used by the emitter to widen an atom to its member `string` (`print(k)` etc.). Empty if `ix`
 // is not a literal union.
@@ -8981,6 +9020,32 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
       // `joinTys` widens `f32 + f64` to f64 and a downstream `f32` slot rejects the demote.
       if primNameOf(lt2.nInner) == "f32" && isFloatLitExpr(n.binRight) {
         return lt2.nInner
+      }
+      // A literal-union inner with a MEMBER-LITERAL default stays the union (`m[k] ?? "aa"`
+      // over a `{[string]: K}` map is a `K`, an i32 atom) — else the bare literal types
+      // `string` and `joinTys` widens the whole result to `string`, divorcing the checked
+      // type from the atom rep the read produces.
+      if isLitBearing(lt2.nInner) {
+        const dl = litTyOfExpr(n.binRight)
+        if dl >= 0 {
+          if assignable(dl, lt2.nInner) { return lt2.nInner }
+        }
+        // An ATOM-VALUED MAP get's default must itself be an atom — a member literal
+        // (accepted above) or a value of the same literal union. The fused read's rep is
+        // the bare i32 atom id, so a `string`-typed default (or a NON-member literal,
+        // which would mint a fresh id) cannot lower: type-valid (`joinTys` widens to
+        // `string`) but unbuildable — the emitter-capability channel.
+        const mgl = P.nodes[n.binLeft]
+        if mgl is Index {
+          if nodeTyMapValIsLitUnion(mgl.idxArr) {
+            if !assignable(rt, lt2.nInner) {
+              tErrUnsupported(
+                "`??` over an atom-valued map needs a member-literal (or atom) default",
+                ix,
+              )
+            }
+          }
+        }
       }
       return joinTys(lt2.nInner, rt)
     }
