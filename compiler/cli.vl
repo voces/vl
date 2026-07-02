@@ -189,6 +189,38 @@ let cliModSrcs: string[] = []
 let cliDiagLineCacheMod = -1
 let cliDiagLineCache: string[] = []
 let cliSrcLines: string[] = []
+// ── per-RUN module source cache ─────────────────────────────────────────────────
+// A directory check runs the module fetch loop once PER FILE, and a shared
+// dependency is imported by many dependents — without a cache it is re-read from
+// disk and re-pushed across the host boundary one code point at a time, once per
+// dependent (O(files × closure) boundary traffic). Keyed on the module key; holds
+// every source read this run (deps AND entries — an entry is often another file's
+// dep). `found = 0` is cached too, so a missing module is asked of the host once.
+// The cache spans `modReset()` calls by design: within one run the tree is stable
+// (`--fix` updates the entry it rewrote).
+let cliSrcCacheKeys: string[] = []
+let cliSrcCacheSrcs: string[] = []
+let cliSrcCacheFound: i32[] = []
+function cliSrcCacheGet(key: string) {
+  let i = 0
+  while i < cliSrcCacheKeys.length {
+    if cliSrcCacheKeys[i] == key { return i }
+    i = i + 1
+  }
+  -1
+}
+function cliSrcCachePut(key: string, src: string, found: i32) {
+  const i = cliSrcCacheGet(key)
+  if i >= 0 {
+    cliSrcCacheSrcs[i] = src
+    cliSrcCacheFound[i] = found
+    return 0
+  }
+  cliSrcCacheKeys.push(key)
+  cliSrcCacheSrcs.push(src)
+  cliSrcCacheFound.push(found)
+  0
+}
 
 // ── argv intake (host pushes each arg before the run loop) ─────────────────────
 export function cliArgReset() {
@@ -573,6 +605,9 @@ function cliCheckCurFile() {
     const fixed = cliComputeFixes(cliEntrySrc)
     if fixed != cliEntrySrc {
       cliEntrySrc = fixed
+      // Keep the per-run source cache coherent with the rewrite the host is
+      // about to perform, so later files that import this one see the fix.
+      cliSrcCachePut(cliCurFile, fixed, 1)
       cliCmdPath = cliCurFile
       cliCmdData = fixed
       cliState = ST_FIX_WROTE
@@ -755,19 +790,35 @@ function cliStartFile() {
     return cliBeginPrint()
   }
   cliCurFile = cliFiles[cliFileIdx]
-  cliCmdPath = cliCurFile
   cliFileFixed = 0
+  // Already read this run as another file's dependency? Check it straight from
+  // the cache — no host round-trip. A cached miss (found = 0) falls through to
+  // a real read: the not-found path differs by target kind (see ST_CHECK_READ).
+  const ci = cliSrcCacheGet(cliCurFile)
+  if ci >= 0 && cliSrcCacheFound[ci] != 0 {
+    cliEntrySrc = cliSrcCacheSrcs[ci]
+    return cliBeginCheck()
+  }
+  cliCmdPath = cliCurFile
   cliState = ST_CHECK_READ
   CMD_READ_FILE // — the file's source
 }
-// For the current file: fetch the next pending module, or — graph closed — check
-// it and advance to the next file.
+// For the current file: fetch the next pending module — from the per-run source
+// cache when this run already read it, else from the host — or, graph closed,
+// check it and advance to the next file.
 function cliFetchOrCheckFile() {
-  if modPendingCount() > 0 {
-    cliFetchKey = cliPendingKey(0)
-    cliCmdPath = cliFetchKey
-    cliState = ST_CHECK_FETCH
-    return CMD_READ_FILE
+  while modPendingCount() > 0 {
+    const key = cliPendingKey(0)
+    const ci = cliSrcCacheGet(key)
+    if ci < 0 {
+      cliFetchKey = key
+      cliCmdPath = key
+      cliState = ST_CHECK_FETCH
+      return CMD_READ_FILE
+    }
+    cliModKeys.push(key)
+    cliModSrcs.push(cliSrcCacheSrcs[ci])
+    cliModCommitOne(key, cliSrcCacheSrcs[ci], cliSrcCacheFound[ci])
   }
   // cliCheckCurFile reports + advances to the next file itself — or, for --fix,
   // returns CMD_WRITE_FILE mid-way to write the fixed source (then re-check).
@@ -985,6 +1036,9 @@ export function cliNext() {
     cliFiles = []
     cliDirNames = []
     cliDirIsDirs = []
+    cliSrcCacheKeys = []
+    cliSrcCacheSrcs = []
+    cliSrcCacheFound = []
     // `fmt` with no path formats stdin to stdout; `check` with no path → cwd.
     if cliCmd == 1 && cliFile.length == 0 {
       cliState = ST_FMT_STDIN
@@ -1027,6 +1081,7 @@ export function cliNext() {
     // applies the safe edits AFTER the resolved check (so the types are reliable),
     // writes the fixed source, and re-enters here via ST_FIX_WROTE.
     cliEntrySrc = cliFileSrc
+    cliSrcCachePut(cliCurFile, cliFileSrc, 1)
     return cliBeginCheck()
   }
   if st == ST_FIX_WROTE {
@@ -1035,6 +1090,7 @@ export function cliNext() {
     return cliBeginCheck()
   }
   if st == ST_CHECK_FETCH {
+    cliSrcCachePut(cliFetchKey, cliFileSrc, cliFileFound)
     cliModKeys.push(cliFetchKey)
     cliModSrcs.push(cliFileSrc)
     cliModCommitOne(cliFetchKey, cliFileSrc, cliFileFound)
