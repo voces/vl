@@ -15,50 +15,13 @@ jobs:
           # On push events base_sha is available; on PRs we need the base ref.
           fetch-depth: 0
 
-      # ---------------------------------------------------------------------------
-      # Docs-only gate
-      #
-      # Detect whether every changed file matches *.md or docs/**. If so, the
-      # heavy steps below are skipped and the job still exits green — which keeps
-      # any required "ci" status check satisfied without blocking merges.
-      #
-      # We intentionally do NOT use top-level `paths`/`paths-ignore` to skip the
-      # whole workflow: that would leave the required check in a permanent "pending"
-      # state for docs-only PRs and block merges. The in-job conditional approach
-      # keeps the job name stable so branch protection is never broken.
-      #
-      # On `pull_request` events we diff the PR head against its base branch.
-      # On `push` events we diff against the previous commit (BEFORE~1..AFTER).
-      # ---------------------------------------------------------------------------
+      # Docs-only gate — the shared detection (one implementation for both
+      # jobs, so they cannot drift) lives in .github/actions/docs-only; heavy
+      # steps below skip when it reports true and the job exits green, keeping
+      # the required status check satisfied.
       - name: Detect docs-only change
         id: docs_check
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-            HEAD="${{ github.event.pull_request.head.sha }}"
-          else
-            BASE="${{ github.event.before }}"
-            HEAD="${{ github.event.after }}"
-          fi
-
-          # Fall back to HEAD~1 if before-sha is the all-zeros sha (first push
-          # to a new branch) or empty.
-          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
-            BASE="HEAD~1"
-          fi
-
-          # List files changed between base and head. Filter to only non-docs files.
-          NON_DOCS=$(git diff --name-only "$BASE" "$HEAD" \
-            | grep -Ev '^(docs/|.*\.md$)' || true)
-
-          if [ -z "$NON_DOCS" ]; then
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-            echo "Docs-only change detected — heavy steps will be skipped."
-          else
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "Non-docs files changed:"
-            echo "$NON_DOCS"
-          fi
+        uses: ./.github/actions/docs-only
 
       - uses: denoland/setup-deno@v2
         if: steps.docs_check.outputs.docs_only != 'true'
@@ -115,13 +78,17 @@ jobs:
   # critical path (the maintainer is duration-sensitive), and a slow cold cargo
   # build here can't delay the deno suite's result.
   #
-  # Steps: build the vl-host binary → build the seed compiler wasm → prove the
-  # native fixpoint (stage3 == stage4 byte-for-byte) → run the native corpus
-  # alignment + `build -O` suites (env-gated, drive the corpus through `vl`).
+  # Steps: build the vl-host binary → refresh the seed compiler wasm + prove the
+  # native fixpoint (the self-reproduction ladder: an observed
+  # `compile(X, source) == X` byte-equality for the shipped seed) → self-lint in
+  # the background while the native corpus alignment + `build -O` suites run
+  # (env-gated, drive the corpus through `vl`).
   #
-  # Caching: ubuntu-latest ships cargo, so we only cache ~/.cargo + the cargo
-  # target dir (cold wasmtime build ~2-4 min, warm seconds — busted only when
-  # scripts/vl-host/Cargo.lock changes).
+  # Caching: ubuntu-latest ships cargo, so we cache ~/.cargo + the cargo target
+  # dir (cold wasmtime build ~2-4 min, warm seconds — busted only when
+  # scripts/vl-host/Cargo.lock changes), the finished `vl` binary (skips cargo
+  # entirely when rustc + lockfile + crate source are unchanged), and the seed +
+  # its `.cwasm` sidecar keyed on the compiler source it was built from.
   #
   # Docs-only skip is mirrored from `ci` so a docs-only PR exits this job green
   # too (keeping the stable job name satisfied for branch protection).
@@ -133,32 +100,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Docs-only gate — the same shared detection the `ci` job uses (see
+      # .github/actions/docs-only).
       - name: Detect docs-only change
         id: docs_check
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-            HEAD="${{ github.event.pull_request.head.sha }}"
-          else
-            BASE="${{ github.event.before }}"
-            HEAD="${{ github.event.after }}"
-          fi
-
-          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
-            BASE="HEAD~1"
-          fi
-
-          NON_DOCS=$(git diff --name-only "$BASE" "$HEAD" \
-            | grep -Ev '^(docs/|.*\.md$)' || true)
-
-          if [ -z "$NON_DOCS" ]; then
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-            echo "Docs-only change detected — heavy steps will be skipped."
-          else
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "Non-docs files changed:"
-            echo "$NON_DOCS"
-          fi
+        uses: ./.github/actions/docs-only
 
       # deno serves only the test tooling in this job (the corpus oracle + native
       # suites). The seed is obtained natively — cache, else the release seed via
@@ -207,47 +153,77 @@ jobs:
             cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-
             cargo-${{ runner.os }}-
 
-      - name: Build vl-host (native tool)
+      # The finished `vl` binary, keyed on EVERYTHING that determines it (rustc,
+      # Cargo.lock, the crate source). An exact hit means cargo would reproduce
+      # this same binary, so the build step is skipped outright — and "the host
+      # still compiles" stays covered every run regardless: the embedded-seed
+      # step at the end compiles the same crate (a feature superset) from
+      # scratch inputs.
+      - name: Cache vl-host binary
         if: steps.docs_check.outputs.docs_only != 'true'
+        id: vlbin
+        uses: actions/cache@v4
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: vl-bin-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**') }}
+
+      - name: Build vl-host (native tool)
+        if: steps.docs_check.outputs.docs_only != 'true' && steps.vlbin.outputs.cache-hit != 'true'
         run: cargo build --release
         working-directory: scripts/vl-host
 
       # The rolling seed cache (F-tiers): an exact hit means the seed was built
       # from THIS compiler source; a restore-keys hit hands refresh-compiler.sh a
-      # healthy older seed to SELF-compile current source with (~3s). On a cold
-      # cache refresh-compiler.sh fetches the release seed (scripts/fetch-seed.sh,
-      # below) rather than TS-minting. The downstream fixpoint step (stage3 ==
-      # stage4) re-proves the refreshed seed every run, so neither a cache hit nor
-      # a fetched seed weakens the gate.
+      # healthy older seed to SELF-compile current source with. On a cold cache
+      # refresh-compiler.sh fetches the release seed (scripts/fetch-seed.sh)
+      # rather than TS-minting. The fixpoint ladder below re-proves the seed
+      # every run, so neither a cache hit nor a fetched seed weakens the gate.
+      #
+      # The `.cwasm` sidecar (the host's wasmtime-compilation cache) rides along:
+      # on an exact hit every `vl` invocation in the job deserializes instead of
+      # re-JITing the seed. A sidecar from a different wasmtime version fails
+      # deserialization and the host recompiles + rewrites it (self-healing), so
+      # a stale sidecar can cost time but never correctness.
       - name: Cache seed compiler wasm
         if: steps.docs_check.outputs.docs_only != 'true'
         uses: actions/cache@v4
         with:
-          path: build/vl-compiler.wasm
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.cwasm
           key: vl-seed-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
           restore-keys: |
             vl-seed-${{ runner.os }}-
 
-      # Self-compile current source with the seed. On a cold cache
-      # refresh-compiler.sh fetches the release `seed-latest` (one push stale is
-      # fine — the fixpoint re-proves it); a seed too stale to compile current
-      # source fails loud (re-fetch seed-latest / land the change in smaller steps).
-      # GH_TOKEN lets fetch-seed.sh use `gh release download` on the cold path.
-      - name: Refresh seed compiler wasm (self-compile; release-seed fetch fallback)
+      # Self-compile current source with the seed AND prove the shipped seed is a
+      # self-compilation fixed point (`--prove-fixpoint`): the ladder stops at the
+      # first stage X with an OBSERVED `compile(X, source) == X` byte-equality —
+      # the same witness the classic stage3/stage4 rebuild produced, without
+      # recompiling byte-identical inputs. An exact seed-cache hit proves out in
+      # ONE compiler self-compile (the seed reproduces itself); a stale
+      # restore-keys/fetched seed climbs the classic two or three rungs. On a cold
+      # cache refresh-compiler.sh fetches the release `seed-latest` (one push
+      # stale is fine — the ladder re-proves it); a seed too stale to compile
+      # current source fails loud (re-fetch seed-latest / land the change in
+      # smaller steps). GH_TOKEN lets fetch-seed.sh use `gh release download` on
+      # the cold path.
+      - name: Refresh seed + native fixpoint (self-reproduction ladder)
         if: steps.docs_check.outputs.docs_only != 'true'
-        run: ./scripts/refresh-compiler.sh
+        run: ./scripts/refresh-compiler.sh --prove-fixpoint
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Native fixpoint (stage3 == stage4)
+      # Dogfood: `vl` lints + fmt-checks its own source (`compiler/*.vl` + driver
+      # + `std/`), gated at `info` (prefer-const / unused / warnings / errors all
+      # fail). STARTED here, in the background, so it overlaps the deno-driven
+      # native suites below (they only read the same binary + seed; nothing
+      # writes either until the embedded-seed step, which is fenced behind the
+      # result step). The exit code + log are collected by "Self-lint (result)".
+      - name: Self-lint (start, concurrent with the native suites)
         if: steps.docs_check.outputs.docs_only != 'true'
-        run: ./scripts/native-fixpoint.sh
-
-      # Dogfood: `vl` lints its own source (`compiler/*.vl` + driver + `std/`),
-      # gated at `info` (prefer-const / unused / warnings / errors all fail).
-      - name: Self-lint (vl check on the compiler's own source)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: ./scripts/lint-self.sh
+        run: |
+          ( ./scripts/lint-self.sh > /tmp/lint-self.log 2>&1
+            echo $? > /tmp/lint-self.rc ) &
 
       # Rep-composition fuzz smoke: pinned seeds against the known-failure
       # baseline — only a NEW shape failing (a rep regression) fails the job.
@@ -263,9 +239,12 @@ jobs:
       # discovered by convention — `selfhost_native_*` (corpus alignment / -O /
       # conversion / diag positions) and `vl_*` (the `vl` CLI: check, fmt, …) — so
       # a new native test is picked up by naming alone, no edit here.
+      # `--parallel` fans the test FILES across the cores (one worker process
+      # each); every case spawns its own `vl` subprocess, so cases are isolated
+      # regardless of schedule.
       - name: Native binary suites (corpus alignment, build -O, vl CLI)
         if: steps.docs_check.outputs.docs_only != 'true'
-        run: deno test -A --no-check tests/selfhost_native_*_test.ts tests/vl_*_test.ts
+        run: deno test -A --no-check --parallel tests/selfhost_native_*_test.ts tests/vl_*_test.ts
         env:
           SELFHOST_NATIVE_ALIGN: "1"
 
@@ -301,6 +280,17 @@ jobs:
           tests/playground_lsp_wasm_test.ts
           tests/playground_completion_test.ts
 
+      # Collect the backgrounded self-lint: wait for its rc file, replay the full
+      # log, and fail the job on any lint/fmt finding. Sits BEFORE the
+      # embedded-seed build as a fence — that build overwrites target/release/vl,
+      # and lint must not race an in-place binary rewrite.
+      - name: Self-lint (result)
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: |
+          while [ ! -f /tmp/lint-self.rc ]; do sleep 1; done
+          cat /tmp/lint-self.log
+          exit "$(cat /tmp/lint-self.rc)"
+
       # The release distribution build (roadmap H-M2): `--features embed-seed` bakes
       # the seed into the binary so a shipped `vl` is one self-contained file. Built
       # here (the seed now exists) and smoke-tested from a dir with NO on-disk seed,
@@ -308,9 +298,14 @@ jobs:
       # every push, not just at release time. Runs LAST: the feature build overwrites
       # target/release/vl, and no later step uses it. (The seed defaults to repo
       # build/vl-compiler.wasm; the earlier steps' `vl` is the no-feature build.)
+      #
+      # The plain binary is stashed and put back afterward, so the vl-bin cache's
+      # post-job save (and anything else that reads target/release/vl later)
+      # sees the NO-FEATURE binary, never the embed-seed one.
       - name: Verify embedded-seed build (distribution path)
         if: steps.docs_check.outputs.docs_only != 'true'
         run: |
+          cp scripts/vl-host/target/release/vl /tmp/vl-plain
           cargo build --release --features embed-seed --manifest-path scripts/vl-host/Cargo.toml
           probe="$(mktemp -d)"
           out="$(cd "$probe" && echo 'print(6 * 7)' | "$GITHUB_WORKSPACE/scripts/vl-host/target/release/vl" run)"
@@ -319,3 +314,4 @@ jobs:
             exit 1
           fi
           echo "embedded-seed build runs with no on-disk seed (got 42)."
+          mv /tmp/vl-plain scripts/vl-host/target/release/vl
