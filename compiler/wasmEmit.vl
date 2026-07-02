@@ -114,6 +114,7 @@ import {
   memberPathKeyOf,
   nulCloFlag,
   nullablePartOf,
+  numLexIsDecimal,
   numTextIsFloat,
   objFieldVal,
   removeAtomFrom,
@@ -1165,7 +1166,8 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
     }
     // An empty `[]` literal for a ref-list (code 5) / string-list (code 6) variant field
     // needs its element kind threaded (the same `pendingListKind` an annotated `let`
-    // uses): a struct/union ref list (1/2) or a string list (3).
+    // uses): a struct/union ref list (1/2), a string list (3), or a scalar-element list
+    // (4/6/7 — its elements coerce to f64 / widen to i64 / re-encode at f32 in `emitArr`).
     pendingListKind = 0
     pendingListSlot = 0
     const vcode = variantFieldTypeAt(vi, fj)
@@ -1191,7 +1193,19 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
     } else if vcode == 27 {
       pendingListKind = 7
     }
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+    // A SCALAR f64/i64/f32 variant field widens its value at the construction boundary,
+    // exactly as the plain struct-literal path does (`{f: i64} | i32` built from
+    // `{f: 567}` must store an i64 — without the widen the box's variant struct got an
+    // `i32.const`, invalid wasm at `struct.new`).
+    if vcode == 17 {
+      if emitExprAsF64(body, valIx, fnIx) < 0 { return -1 }
+    } else if vcode == 23 {
+      if emitExprAsI64(body, valIx, fnIx) < 0 { return -1 }
+    } else if vcode == 24 {
+      if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
+    } else {
+      if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+    }
     pendingListKind = 0
     fj = fj + 1
   }
@@ -1670,6 +1684,15 @@ export function emitUnionCoerce(
   // arm boxes as a variant struct, a scalar arm as a value box.
   if bare is ObjLit { return emitExpr(body, exprIx, fnIx) }
   if exprStruct(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
+  // A MAP value has no union-member rep (`({[string]: i32} | boolean)[] = [h]`): the
+  // depth-1 binding already rejects, but the deeper seams (a list element, a return)
+  // reached the atom ladder, defaulted the tag, and every later `is` silently missed —
+  // a SILENT wrong result. Fail loudly at the seam instead.
+  if exprMap(exprIx, fnIx) {
+    return emitFail(
+      "emitProgram: a map value is not a supported union member — use a struct member instead",
+    )
+  }
   if unionName == "" || !unionHasValueAtom(unionName) {
     return emitExpr(body, exprIx, fnIx)
   }
@@ -1713,6 +1736,22 @@ export function emitUnionCoerce(
   ) {
     atom = "f32"
   }
+  // An INT-element list whose union has no `i32[]` member but an `i64[]`/`f64[]` one
+  // (`i64[] | boolean = [670563]` — the elements are small int literals, so the list
+  // classifies `i32[]`): the union demands the wider list — adopt its atom and thread the
+  // element kind, so the backing builds `(array (mut i64/f64))` with each element widening
+  // at the store (as an annotated `let` does). Without this the box TAGGED `i32[]` while
+  // the checker typed the member `i64[]` — `is i64[]` was silently FALSE.
+  let coerceListKind = 0
+  if atom == "i32[]" && !unionHasAtom(unionName, "i32[]") {
+    if unionHasAtom(unionName, "i64[]") {
+      atom = "i64[]"
+      coerceListKind = 6
+    } else if unionHasAtom(unionName, "f64[]") {
+      atom = "f64[]"
+      coerceListKind = 4
+    }
+  }
   fbI32Const(scalarTagOf(atom))
   if atom == "i64" {
     if emitExprAsI64(body, exprIx, fnIx) < 0 { return -1 }
@@ -1723,6 +1762,12 @@ export function emitUnionCoerce(
     pendingF32 = true
     if emitExprAsF32(body, exprIx, fnIx) < 0 { return -1 }
     pendingF32 = savedF32
+  } else if coerceListKind != 0 {
+    const savedCLK = pendingListKind
+    pendingListKind = coerceListKind
+    const rcCLK = emitExpr(body, exprIx, fnIx)
+    pendingListKind = savedCLK
+    if rcCLK < 0 { return -1 }
   } else {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   }
@@ -2421,6 +2466,16 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
     if pendingListKind == 6 {
       isI64Lit = true
       isF64Lit = false
+      isStrLit = false
+    }
+    // An `f64[]` annotation (kind 4) is authoritative for a NON-empty literal too,
+    // mirroring kinds 6/7: a literal of bare INT elements (`const xs: f64[] = [2]`) does
+    // not self-identify as f64 (`arrLitIsF64` keys off float elements), so it built the
+    // i32-backed wrapper against the f64-list slot — invalid wasm. Each element coerces
+    // at the store (`emitExprAsF64` — `f64.convert_i32_s` for an i32 operand).
+    if pendingListKind == 4 {
+      isF64Lit = true
+      isI64Lit = false
       isStrLit = false
     }
     // An f32-element literal is set ONLY by an `f32[]` binding/annotation (`pendingListKind ==
@@ -5817,6 +5872,30 @@ export function emitExprAsF64(body: i32[], exprIx: i32, fnIx: i32) {
     return 0
   }
   if exprIsF64(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
+  // A bare INT literal (optionally negated) re-encodes directly as `f64.const` — exact
+  // (f64.convert would produce the identical value), and it keeps a CONST-GLOBAL init a
+  // valid constexpr (`const xs: f64[] = [2]` — a convert op is not constant). Checked
+  // BEFORE the i64 branch so a big literal stays one `f64.const` too. Mirrors the
+  // `pendingF64` NumLit lowering and `emitExprAsF32`'s literal path.
+  const f64Inner = unwrapParen(exprIx)
+  const f64Node = P.nodes[f64Inner]
+  if f64Node is NumLit {
+    if numLexIsDecimal(f64Node.numText) {
+      fbF64Const(f64Node.numText)
+      return 0
+    }
+  }
+  if f64Node is Unary {
+    if f64Node.unOp == "-" {
+      const negInner = P.nodes[unwrapParen(f64Node.unArg)]
+      if negInner is NumLit {
+        if numLexIsDecimal(negInner.numText) {
+          fbF64Const("-" + negInner.numText)
+          return 0
+        }
+      }
+    }
+  }
   // An i64 source converts (signed) to f64.
   if exprIsI64(exprIx, fnIx) {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }

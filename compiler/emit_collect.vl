@@ -1954,6 +1954,16 @@ export function collectA(_stmts: i32[]) {
   mvValStructIdx = []
   mvRlSlot = []
   mvMapTypeIdx = []
+  // Re-mark the list-type flags the REGISTERED value unions force: `collectU` set them at
+  // registration (`markValueUnionAtoms`) but the resets above cleared them, and a union
+  // annotation (`f64[] | boolean`) is none of the bare-name forms the walk below recognizes
+  // — a scalar-list type mentioned ONLY as a union member lost its backing/wrapper, so the
+  // adopted-atom construction (`emitUnionCoerce`) failed "list type not collected".
+  let umk = 0
+  while umk < unMemberSet.length {
+    markValueUnionAtoms(unMemberSet[umk])
+    umk = umk + 1
+  }
   let i = 0
   while i < P.nodes.length {
     const nd = P.nodes[i]
@@ -2667,6 +2677,37 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // its variant slice is empty. Registering interns the shared box (`uDeclared`)
   // and the per-rep value boxes it needs.
   if isValueUnionName(name) { return registerValueUnionName(name) }
+  // A MAP member of a 2+-member union (`{[string]:i32}|boolean`) has no union rep: it is
+  // neither a struct variant (a map shape carries no field set) nor a value atom, so the
+  // union silently failed to REGISTER — every deeper seam (a list element, a return) then
+  // mis-tagged its box and every `is` missed, a SILENT wrong result. Fail loudly at
+  // registration, and BEFORE the map-value recursion below: `nameIsMap` prefix-matches a
+  // union whose FIRST member is a map, and `mapValNameOf` would swallow the name as a
+  // garbled map-value recursion. A map-VALUED union (`{[string]: C | S}`) splits to one
+  // atom (the `|` sits inside the braces), so it passes through to that recursion.
+  const matoms: string[] = []
+  splitUnionAtoms(name, matoms)
+  if matoms.length >= 2 {
+    let mNonNull = 0
+    let mHasMap = false
+    let mk = 0
+    while mk < matoms.length {
+      const ma = matoms[mk]
+      if ma != "null" {
+        mNonNull = mNonNull + 1
+        if ma.length >= 2 && ma[0] == '{' && ma[1] == '[' { mHasMap = true }
+      }
+      mk = mk + 1
+    }
+    // A single map + `null` is exempt: `{[string]:i32}|null` is the NULLABLE map, owned
+    // by the nullable machinery (not a box union) — only a map alongside another non-null
+    // member is the unregisterable shape.
+    if mHasMap && mNonNull >= 2 {
+      return emitFail(
+        "emitProgram: a map union member is not supported — use a struct member instead",
+      )
+    }
+  }
   // A union used ONLY as a COLLECTION element / value (`(C | S)[]`, `{[string]: C | S}`)
   // registers that INNER union — without this a union that never appears in a param /
   // return / let / field annotation (only inside a collection) is never interned, so an
