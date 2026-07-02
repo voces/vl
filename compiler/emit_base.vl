@@ -208,30 +208,74 @@ function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
     exp = exp + 1
     q = bigDivmod(num, den)
   }
-  // q is `alignW` bits; reduce to `sigBits`. guard = dropped low bit; sticky = remainder nonzero.
-  const guard = q[0] & 1
-  let sticky = 0
-  if gDivRemNonzero { sticky = 1 }
-  let qs = bigShr1(q)
-  let es = exp + 1
-  // Round-to-nearest, ties-to-even: round up on guard=1 with sticky, or an exact tie
-  // (guard=1, sticky=0) when the kept LSB is odd.
-  let roundUp = false
-  if guard == 1 {
-    if sticky == 1 { roundUp = true }
-    else if (qs[0] & 1) == 1 { roundUp = true }
-  }
-  if roundUp {
-    qs = bigAddSmall(qs, 1)
-    if bigBitLen(qs) > sigBits {
-      qs = bigShr1(qs)
-      es = es + 1
+  // ── exponent-range clamp (IEEE-754 overflow / gradual underflow) ────────────
+  // q is `alignW` bits, so value = q * 2^exp = 1.xx * 2^(exp + sigBits): encoded
+  // NORMAL this value carries biased exponent `exp + sigBits + bias`. Outside
+  // [1, 2*bias] the packing below would mask the exponent's high bits and encode
+  // an arbitrary WRONG finite value — clamp instead: at or past all-ones encode
+  // ±infinity; at or below zero take the gradual-underflow path.
+  const preBiased = exp + sigBits + bias
+  let qs: i32[] = []
+  let biased = 0
+  if preBiased <= 0 {
+    // GRADUAL UNDERFLOW: too small for a normal — round AT THE SUBNORMAL
+    // precision (fixed exponent Emin = 1 - bias, fewer significand bits). The
+    // integer significand is f = value * 2^(sigBits - 1 - Emin); compute
+    // floor(2f) exactly from the num/den ratio (the extra low bit is the round
+    // guard, the division remainder the sticky), then round-to-nearest-ties-
+    // to-even — ONE rounding at the target precision, so no double-round. A
+    // value below half the smallest subnormal yields qs = 0 and packs as ±0.
+    // The scale 2f = (num/den) * 2^(preBiased - 1) is always a den shift here.
+    den = bigShlK(den, 1 - preBiased)
+    const q2 = bigDivmod(num, den) // floor(2f)
+    const sGuard = q2[0] & 1
+    let sSticky = 0
+    if gDivRemNonzero { sSticky = 1 }
+    qs = bigShr1(q2) // floor(f)
+    let sRoundUp = false
+    if sGuard == 1 {
+      if sSticky == 1 { sRoundUp = true }
+      else if (qs[0] & 1) == 1 { sRoundUp = true }
+    }
+    if sRoundUp { qs = bigAddSmall(qs, 1) }
+    // `biased` stays 0 (subnormal) unless rounding carried all the way up to
+    // 1.0 * 2^Emin — the smallest NORMAL (fraction 0, biased exponent 1). The
+    // shared packing below masks off the implicit-1 bit either way.
+    if bigBitLen(qs) >= sigBits { biased = 1 }
+  } else {
+    // q is `alignW` bits; reduce to `sigBits`. guard = dropped low bit; sticky =
+    // remainder nonzero.
+    const guard = q[0] & 1
+    let sticky = 0
+    if gDivRemNonzero { sticky = 1 }
+    qs = bigShr1(q)
+    let es = exp + 1
+    // Round-to-nearest, ties-to-even: round up on guard=1 with sticky, or an exact tie
+    // (guard=1, sticky=0) when the kept LSB is odd.
+    let roundUp = false
+    if guard == 1 {
+      if sticky == 1 { roundUp = true }
+      else if (qs[0] & 1) == 1 { roundUp = true }
+    }
+    if roundUp {
+      qs = bigAddSmall(qs, 1)
+      if bigBitLen(qs) > sigBits {
+        qs = bigShr1(qs)
+        es = es + 1
+      }
+    }
+    // qs is exactly `sigBits` bits in [2^(sigBits-1), 2^sigBits): qs = 1.f * 2^(sigBits-1),
+    // value = 1.f * 2^(es + sigBits - 1).
+    const bigE = es + (sigBits - 1)
+    biased = bigE + bias
+    // OVERFLOW: at or past the all-ones exponent (rounding included) — encode
+    // ±infinity (exponent all ones, fraction 0; the empty `qs` reads as 0 limbs).
+    const maxBiased = bias + bias + 1
+    if biased >= maxBiased {
+      qs = []
+      biased = maxBiased
     }
   }
-  // qs is exactly `sigBits` bits in [2^(sigBits-1), 2^sigBits): qs = 1.f * 2^(sigBits-1),
-  // value = 1.f * 2^(es + sigBits - 1).
-  const bigE = es + (sigBits - 1)
-  const biased = bigE + bias
   // Read the low 16-bit limbs of the significand.
   let m0 = 0
   let m1 = 0
