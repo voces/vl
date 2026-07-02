@@ -138,3 +138,32 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "native-diag-pos: unused-function anchors at the declaration's NAME token",
+  ignore: !ENABLED,
+  fn: async () => {
+    // A LINT diagnostic's position: `dead` starts at line 1, col 9 (0-based) —
+    // shown 1-based as [1:10]. Pins the name-token anchor (`declNameTokOf`,
+    // matching unused-variable/prefer-const); the node's own anchor is its LAST
+    // token — the closing `}` on line 3 — which is the wrong line entirely.
+    const dir = await Deno.makeTempDir({ prefix: "vl_diag_pos_" });
+    try {
+      const path = `${dir}/case.vl`;
+      await Deno.writeTextFile(
+        path,
+        "function dead(n: i32) {\n  print(n)\n}\nprint(1)\n",
+      );
+      const r = await check(path);
+      if (r.code !== 0) {
+        throw new Error(`expected exit 0 (warning only), got ${r.code}:\n${r.err}`);
+      }
+      const needle = `${path}: warning [1:10] Unused function \`dead\``;
+      if (!r.err.includes(needle)) {
+        throw new Error(`expected stderr to contain "${needle}", got:\n${r.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
