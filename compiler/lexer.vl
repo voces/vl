@@ -108,6 +108,26 @@ function hexVal(c: i32) {
   -1
 }
 
+// One uppercase hex digit char for `d` in 0..15 (the inverse of `hexVal`).
+function hexDigit(d: i32) {
+  if d < 10 { return fromCodePoint('0' + d) }
+  fromCodePoint('A' + (d - 10))
+}
+
+// Describe a char code for a diagnostic: quoted verbatim when printable,
+// `U+XXXX` (4+ uppercase hex digits) for controls and other unprintables.
+function charDesc(c: i32) {
+  if c >= ' ' && c != 127 { return "'" + fromCodePoint(c) + "'" }
+  let hex = ""
+  let m = c
+  while m > 0 {
+    hex = hexDigit(m % 16) + hex
+    m = m / 16
+  }
+  while hex.length < 4 { hex = "0" + hex }
+  "U+" + hex
+}
+
 // A binary digit `0` / `1` (for `0b…` literals).
 function isBinDigit(c: i32) { c == '0' || c == '1' }
 
@@ -142,11 +162,13 @@ function peekN(n: i32) {
   gSrc[gPos + n]
 }
 
-// Consume one char, tracking line/column, and return its code.
+// Consume one char, tracking line/column, and return its code. A line ends at
+// `\n` or at a lone `\r` (classic-Mac / stray-CR input) — a `\r` that is part
+// of `\r\n` defers the bump to the `\n` so the pair counts as one line.
 export function advance() {
   const c = gSrc[gPos]
   gPos = gPos + 1
-  if c == '\n' {
+  if c == '\n' || (c == '\r' && peek() != '\n') {
     gLine = gLine + 1
     gCol = 0
   } else {
@@ -159,6 +181,14 @@ export function advance() {
 // (VL has no `void`; functions infer their return type).
 export function diag(msg: string) {
   gDiags.push({ msg: msg, line: gLine, col: gCol })
+  gDiags.length
+}
+
+// Record a diagnostic at an explicit position (1-based line, 0-based column) —
+// for reports that anchor at a construct's START (an opening quote, a
+// backslash) after the scanner has already moved past it.
+function diagAt(msg: string, line: i32, col: i32) {
+  gDiags.push({ msg: msg, line: line, col: col })
   gDiags.length
 }
 
@@ -361,15 +391,40 @@ function scanRadix(base: i32, baseName: string, prefixChar: i32) {
 // Scan a quoted literal (the cursor is on the opening quote). `quote` is the
 // quote char code. Returns the decoded `value` with escapes resolved; `\xXX` /
 // `\uXXXX` / `\u{…}` decode to the actual code point via `fromCodePoint`.
+//
+// The decoded value is built from `[runStart, gPos)` RUNS of escape-free text —
+// one slice per run, concatenating only at escape boundaries — rather than one
+// slice per character (which is O(k²) on immutable strings). Every branch that
+// consumes non-run input (an escape, the closing quote) flushes the pending run
+// first and re-anchors `runStart`; the tail flush after the loop covers the
+// unterminated paths.
 export function scanQuoted(quote: i32) {
+  // The opening quote anchors the unterminated-literal diagnostic: reporting
+  // there (not wherever scanning stopped) keeps a missing quote a local error.
+  const openLine = gLine
+  const openCol = gCol
   advance() // opening quote
   let value = ""
   let closed = false
+  let runStart = gPos
   while gPos < gSrc.length {
     const ch = peek()
+    // A raw newline terminates the literal: the closing quote is missing.
+    // The newline is left in the input (it becomes an ordinary NEWLINE token),
+    // so one missing quote yields a single local error at the opening quote
+    // instead of masking every later error up to EOF.
+    if ch == '\n' || ch == '\r' { break }
     if ch == '\\' {
+      value = value + gSrc.slice(runStart, gPos)
+      // Escape diagnostics anchor at the backslash, not the scan position
+      // after the sequence has been consumed.
+      const escLine = gLine
+      const escCol = gCol
       advance() // backslash
-      if gPos >= gSrc.length { break }
+      if gPos >= gSrc.length {
+        runStart = gPos
+        break
+      }
       const e = peek()
       // \xXX — two hex digits.
       if e == 'x' {
@@ -380,9 +435,10 @@ export function scanQuoted(quote: i32) {
           value = value + fromCodePoint(hexVal(h1) * 16 + hexVal(h2))
         } else {
           advance() // x
-          diag("Invalid \\x escape (needs two hex digits)")
+          diagAt("Invalid \\x escape (needs two hex digits)", escLine, escCol)
           value = value + "x"
         }
+        runStart = gPos
         continue
       }
       // \uXXXX — four hex digits — or \u{…} — 1-6 hex digits.
@@ -401,13 +457,16 @@ export function scanQuoted(quote: i32) {
             advance() // }
             value = value + fromCodePoint(cp)
           } else {
-            diag(
+            diagAt(
               "Invalid \\u{…} escape (needs 1-6 hex digits for a valid code point)",
+              escLine,
+              escCol,
             )
             value = value + "u"
             // Consume a closing `}` if present so the span stays sane.
             if peek() == '}' { advance() }
           }
+          runStart = gPos
           continue
         }
         if (
@@ -428,15 +487,21 @@ export function scanQuoted(quote: i32) {
           value = value + fromCodePoint(cp)
         } else {
           advance() // u
-          diag("Invalid \\u escape (needs four hex digits or \\u{…})")
+          diagAt(
+            "Invalid \\u escape (needs four hex digits or \\u{…})",
+            escLine,
+            escCol,
+          )
           value = value + "u"
         }
+        runStart = gPos
         continue
       }
       // Line continuation: a backslash immediately before a newline drops both.
       if e == '\n' || e == '\r' {
         advance() // the newline char
         if e == '\r' && peek() == '\n' { advance() }
+        runStart = gPos
         continue
       }
       // Simple escape (\n \t \r \\ \" \' \0 \b \f \v) or unknown (verbatim char).
@@ -444,26 +509,29 @@ export function scanQuoted(quote: i32) {
       const dec = decodeSimpleEscape(e)
       if dec == "" {
         // Unknown escape: keep the char after the backslash verbatim, and warn.
-        diag("Unknown escape sequence")
-        value = value + gSrc.slice(gPos - 1, gPos)
+        diagAt("Unknown escape sequence", escLine, escCol)
+        runStart = gPos - 1
       } else {
         value = value + dec
+        runStart = gPos
       }
       continue
     }
     if ch == quote {
+      value = value + gSrc.slice(runStart, gPos)
       advance() // closing quote
+      runStart = gPos
       closed = true
       break
     }
-    value = value + gSrc.slice(gPos, gPos + 1)
     advance()
   }
+  value = value + gSrc.slice(runStart, gPos)
   if !closed {
     if quote == '\'' {
-      diag("Unterminated char literal")
+      diagAt("Unterminated char literal", openLine, openCol)
     } else {
-      diag("Unterminated string literal")
+      diagAt("Unterminated string literal", openLine, openCol)
     }
   }
   value
@@ -651,9 +719,10 @@ export function tokenize(source: string): LexResult {
       continue
     }
 
-    // Unknown character — record a diagnostic, emit an ERROR token, make progress.
+    // Unknown character — record a diagnostic naming the offender (positioned
+    // AT the char, not one past it), emit an ERROR token, make progress.
+    diag("Unexpected character " + charDesc(c))
     advance()
-    diag("Unexpected character")
     toks.push(mkTok("ERROR", "", startPos, startLine, startCol))
   }
 
