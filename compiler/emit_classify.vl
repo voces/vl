@@ -100,6 +100,7 @@ import {
   nameIsMap,
   nameIsMapArray,
   nameIsNulBool,
+  nameIsNulClosure,
   nameIsNulI32List,
   nameIsNulString,
   nameIsString,
@@ -3301,6 +3302,16 @@ export function sFieldElemNameAt(si: i32, fi: i32) {
 export function sFieldIsLitUnion(si: i32, fi: i32) {
   if sFieldTypeAt(si, fi) != 0 { return false }
   const r = nameIsLitUnionType(sFieldElemNameAt(si, fi))
+  r
+}
+
+// True if struct `si`'s field `fi` is an ATOM-ARRAY field (`f: K[]` — code 4 whose recorded
+// elem name is a litunion array). The field IS the i32 list; construction/assign seed the
+// atom-element context so member literals build the i32 backing (not a string list whose
+// wrapper ref would mismatch the field type — the `{f: K0[]}` invalid-wasm hole).
+export function sFieldIsLitUnionArray(si: i32, fi: i32) {
+  if sFieldTypeAt(si, fi) != 4 { return false }
+  const r = nameIsLitUnionArray(sFieldElemNameAt(si, fi))
   r
 }
 
@@ -6546,6 +6557,18 @@ export function fieldRefElemName(tyIx: i32) {
     if ty28 is TypeRef { return refArrElemName(nullablePartOf(ty28.tyName)) }
     return ""
   }
+  // An ATOM-ARRAY field (`f: K[]`, code 4 via `nameIsLitUnionArray`) records its ARRAY
+  // type-name so `sFieldIsLitUnionArray` recovers the atom-element rep at the construct/
+  // assign sites (a plain `i32[]`/`boolean[]` field stays ""). The ARRAY name — not the
+  // element — so `sFieldIsLitUnion` (code-0 scalar atoms, `nameIsLitUnionType`-keyed)
+  // does not claim the list-ref field.
+  if code == 4 {
+    const ty4 = P.nodes[tyIx]
+    if ty4 is TypeRef {
+      if nameIsLitUnionArray(ty4.tyName) { return ty4.tyName }
+    }
+    return ""
+  }
   if code != 5 { return "" }
   const ty = P.nodes[tyIx]
   if ty is TypeRef { return ty.tyName.slice(0, ty.tyName.length - 2) }
@@ -6855,8 +6878,15 @@ export function anonFieldElemName(valIx: i32, code: i32) {
 // (`x:i32` → 0, `name:string` → 3, `tags:i32[]` → 4, …) — the NAME-level mirror
 // of `fieldTypeCode` (which reads a TypeRef node).
 export function nameFieldCode(t: string) {
-  // A function-typed field name (`(i32)=>i32` — carries `=>`) is the closure rep, code 14.
-  if strContains(t, "=>") { return 14 }
+  // A NULLABLE function field text (`((i32) => i32) | null`) is the nullable closure
+  // fat-pointer, code 22 — the text mirror of `fieldTypeCode`'s `nulCloFlag` arm.
+  if nameIsNulClosure(t) { return 22 }
+  // A function-typed field name — a TOP-LEVEL arrow (`(i32)=>i32`) — is the closure rep,
+  // code 14. Depth-aware (`annArrowAt`, not a substring test): a UNION carrying a closure
+  // MEMBER (`(() => i32) | string`) nests its arrow in parens and is a value union (code
+  // 16, the box) — the substring test claimed it as a bare closure and the constructed
+  // box ref mismatched the closure-typed field (an unparseable module when global).
+  if annArrowAt(t) >= 0 { return 14 }
   if t == "i32" { return 0 }
   if t == "boolean" { return 0 }
   if t == "f64" { return 17 }
@@ -7072,6 +7102,11 @@ export function internInlineShape(nm: string) {
       // A literal-union atom FIELD (code 0): record its union name so construction/read/assign
       // recover the atom rep + membership (`sFieldIsLitUnion`).
       sFieldElemName.push(texts[pi])
+    } else if codes[pi] == 4 && nameIsLitUnionArray(texts[pi]) {
+      // An ATOM-ARRAY field (`f: K[]`, code 4): record the array type-name so
+      // `sFieldIsLitUnionArray` seeds the atom-element context at construct/assign
+      // (and `collectA`'s field-table pass forces the i32 list types off it).
+      sFieldElemName.push(texts[pi])
     } else {
       sFieldElemName.push("")
     }
@@ -7241,6 +7276,10 @@ export function gaeEnsure(name: string) {
     } else if code == 16 {
       elem = tn
       registerValueUnionName(tn)
+    } else if code == 4 && nameIsLitUnionArray(tn) {
+      // An ATOM-ARRAY field of a generic instance (`f: K[]`) — same recording as the
+      // inline-shape path, so `sFieldIsLitUnionArray` covers monomorphized shapes.
+      elem = tn
     }
     if code < 0 { ok = false }
     names.push(gaeFieldNames[fs + fi])

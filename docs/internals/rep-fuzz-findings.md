@@ -216,3 +216,20 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   Graduated (seeds 101/202/303): `{[string]: i64|f32|f64|K0}` at p1/p2, `{[string]: {[string]:
   K0}}`, `{[string]: () => {f: i64}}`, `{[string]: (i32) => {a,f,z}}` — frozen in
   `tests/cases/maps/map-return-value-kinds.vl` + `atom-valued-map.vl`.
+- **Composite global initializers → unparseable modules**: two field-classification arms, not the
+  global path itself (the same shapes broke as LOCALS; the constexpr global made it a PARSE failure
+  because the mismatch sits in the global section).
+  - `{f: K0[]}` (atom-array field, any position): the field is code 4 — the i32 list of atom ids —
+    but the member-literal value self-classified as a STRING list (its elements are string exprs
+    syntactically) and the wrapper ref mismatched the field type. Fix: record the litunion-array
+    name on code-4 fields (`sFieldIsLitUnionArray`), seed the atom-element context at the
+    construct/assign sites, route the literal to the i32-list build under that context, and force
+    the i32-list types from the field table (an inline-shape field type is never a standalone
+    TypeRef the collect scan sees). Frozen: `tests/cases/structs/atom-array-field.vl`.
+  - `{f: (() => T) | string}` (union field carrying a CLOSURE member): `nameFieldCode`'s SUBSTRING
+    `=>` test claimed the whole union as a bare closure field (code 14) while the initializer built
+    another ref. Fix: the depth-aware `annArrowAt` (a union member's arrow is nested in parens), plus
+    the nullable-closure text arm (code 22) `fieldTypeCode` already had — one more enumeration pair
+    (name-based vs node-based field codes) that had drifted. A LOCAL binding of this shape is still a
+    clean loud reject (`isValueUnionName` has no closure atom kind — a follow-up, not a hole).
+    Frozen: `tests/cases/globals/union-closure-member-field-global.vl`.
