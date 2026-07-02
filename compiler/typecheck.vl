@@ -865,6 +865,8 @@ let cStructTyIxs: i32[] = []
 let cVariantMemberTyIxs: i32[] = []
 // Declared UNION-ALIAS `Ty` indices (`type T = A | B`), for the emitter's `isUName` (C1).
 let cUnionTyIxs: i32[] = []
+// A single placeholder `TyFunc` arena index for monomorphizer `=>sigkey` closure pins (C1 endgame).
+let cFuncPinTyIx = -1
 let inferQuiet = false
 let cycleBreakCount = 0
 let inferTentative: string[] = []
@@ -1055,6 +1057,7 @@ export function initChecker() {
   inferLetNulBoolIx = []
   bodyChecked = Map()
   nodeTyIx = []
+  cFuncPinTyIx = -1
   inferQuiet = false
   cycleBreakCount = 0
   inferTentative = []
@@ -6647,6 +6650,11 @@ function checkProgramNode(n: Program) {
                   const r = nameToTy(ftn.tyName)
                   if r >= 0 {
                     fty = r
+                    // Record the resolved type on the field's annotation node so the emitter
+                    // classifies a struct field structurally from the arena, not the name (C1).
+                    if !inferQuiet && fd.fdType < nodeTyIx.length {
+                      nodeTyIx[fd.fdType] = r
+                    }
                   } else {
                     tErr(
                       "unknown type '" +
@@ -7244,6 +7252,7 @@ export function checkProgram(rootIx: i32) {
   if rootN0 is Program { gRootStmts = rootN0.progStmts }
   // Size the typed-IR table to the (now fully parsed) node arena, all holes (-1).
   nodeTyIx = []
+  cFuncPinTyIx = -1
   let ntz = 0
   while ntz < P.nodes.length {
     nodeTyIx.push(-1)
@@ -7437,9 +7446,25 @@ export function recordNodeTyFrom(destNode: i32, srcNode: i32) {
   nodeTyIx[destNode] = ty
   0
 }
+// The lazily-built placeholder `TyFunc` for closure pins — only its `is TyFunc`-ness is read (via
+// `nodeTyIsFunc`); the real signature rides the `=>sigkey` NAME elsewhere. Reset per program.
+function funcPinTyIx() {
+  if cFuncPinTyIx < 0 {
+    const ps: i32[] = []
+    cFuncPinTyIx = mkFuncTy(ps, -1)
+  }
+  cFuncPinTyIx
+}
 export function recordClonedNodeTy(nodeIx: i32, name: string) {
   if nodeIx < 0 { return 0 }
-  const ty = nameToTy(name)
+  let ty = nameToTy(name)
+  if ty < 0 {
+    // A monomorphizer closure-pin `=>sigkey` (an emitter sig encoding `nameToTy` can't parse) IS a
+    // function type — record a placeholder `TyFunc` so `nodeTyIsFunc` classifies the pin structurally.
+    if name.length >= 2 && name[0] == '=' && name[1] == '>' {
+      ty = funcPinTyIx()
+    }
+  }
   while nodeTyIx.length <= nodeIx { nodeTyIx.push(-1) }
   nodeTyIx[nodeIx] = ty
   0
