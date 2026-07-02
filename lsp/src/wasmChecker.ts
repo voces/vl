@@ -459,10 +459,27 @@ const pushString = (push: (cp: number) => number, text: string) => {
   for (const ch of text) push(ch.codePointAt(0)!);
 };
 
+/**
+ * Chunked decode: `String.fromCodePoint(...cps)` spreads each code point as a
+ * JS argument, and V8 caps a call's argument count at the stack size — an
+ * MB-scale string (e.g. `formatSrc` returning a whole file) throws RangeError.
+ * Decoding a bounded slice per call keeps every spread far under the cap.
+ */
+const READ_CHUNK = 4096;
 const readString = (len: number, at: (j: number) => number): string => {
-  const cps = new Array<number>(len);
-  for (let j = 0; j < len; j++) cps[j] = at(j);
-  return String.fromCodePoint(...cps);
+  if (len <= READ_CHUNK) {
+    const cps = new Array<number>(len);
+    for (let j = 0; j < len; j++) cps[j] = at(j);
+    return String.fromCodePoint(...cps);
+  }
+  const parts: string[] = [];
+  for (let base = 0; base < len; base += READ_CHUNK) {
+    const n = Math.min(READ_CHUNK, len - base);
+    const cps = new Array<number>(n);
+    for (let j = 0; j < n; j++) cps[j] = at(base + j);
+    parts.push(String.fromCodePoint(...cps));
+  }
+  return parts.join("");
 };
 
 /** Mirrors the Rust host's module gate: a LINE-LEADING `import {`. */
