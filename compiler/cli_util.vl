@@ -162,29 +162,67 @@ export function cliHasImports(s: string) {
   }
   0
 }
-// Match glob `pat` (from `pi`) against `text` (from `ti`). `*` matches a run of
-// non-`/` characters, `**` crosses separators, every other char is literal. A
-// completed pattern match succeeds when the remaining text is empty OR begins a
-// new `/`-segment — encoding the host's `^<pat>(/.*)?$` anchoring, so `tests`
-// gates `tests` and everything beneath it.
-export function cliGlobAt(pat: string, pi: i32, text: string, ti: i32) {
-  if pi >= pat.length { return ti >= text.length || text[ti] == '/' }
-  if pat[pi] == '*' {
-    if pi + 1 < pat.length && pat[pi + 1] == '*' {
-      // `**` — match zero+ of ANY character (crosses `/`).
-      if cliGlobAt(pat, pi + 2, text, ti) { return true }
-      if ti < text.length { return cliGlobAt(pat, pi, text, ti + 1) }
-      return false
-    }
-    // `*` — match zero+ NON-`/` characters.
-    if cliGlobAt(pat, pi + 1, text, ti) { return true }
-    if ti < text.length && text[ti] != '/' {
-      return cliGlobAt(pat, pi, text, ti + 1)
-    }
-    return false
+// Match glob `pat` against `text`. `*` matches a run of non-`/` characters,
+// `**` crosses separators, every other char is literal. A completed match
+// succeeds when the remaining text is empty OR begins a new `/`-segment —
+// encoding the host's `^<pat>(/.*)?$` anchoring, so `tests` gates `tests` and
+// everything beneath it. Iterative O(|pat| × |text|) dynamic program — one
+// row per pattern token, `row[t]` = "the tokens so far match text[0, t)" — so
+// an adversarial `*a*a*a…` pattern stays polynomial (backtracking recursion
+// is exponential there) and nothing recurses on the wasm call stack.
+export function cliGlob(pat: string, text: string) {
+  const n = text.length
+  let row: i32[] = []
+  let z = 0
+  while z <= n {
+    row.push(0)
+    z = z + 1
   }
-  if ti < text.length && text[ti] == pat[pi] {
-    return cliGlobAt(pat, pi + 1, text, ti + 1)
+  row[0] = 1
+  let pi = 0
+  while pi < pat.length {
+    const cur: i32[] = []
+    let f = 0
+    while f <= n {
+      cur.push(0)
+      f = f + 1
+    }
+    const pc = pat[pi]
+    if pc == '*' && pi + 1 < pat.length && pat[pi + 1] == '*' {
+      // `**` — zero+ of ANY character: carry the previous row's match forward
+      // across every text position.
+      let k = 0
+      while k <= n {
+        if row[k] != 0 { cur[k] = 1 }
+        if k > 0 && cur[k - 1] != 0 { cur[k] = 1 }
+        k = k + 1
+      }
+      pi = pi + 2
+    } else if pc == '*' {
+      // `*` — zero+ NON-`/` characters: the carry stops at a separator.
+      let k = 0
+      while k <= n {
+        if row[k] != 0 { cur[k] = 1 }
+        if k > 0 && cur[k - 1] != 0 && text[k - 1] != '/' { cur[k] = 1 }
+        k = k + 1
+      }
+      pi = pi + 1
+    } else {
+      // A literal: extend each match by exactly this character.
+      let k = 1
+      while k <= n {
+        if row[k - 1] != 0 && text[k - 1] == pc { cur[k] = 1 }
+        k = k + 1
+      }
+      pi = pi + 1
+    }
+    row = cur
+  }
+  // Anchor: the full pattern must land at the text end or a segment boundary.
+  let k = 0
+  while k <= n {
+    if row[k] != 0 && (k >= n || text[k] == '/') { return true }
+    k = k + 1
   }
   false
 }

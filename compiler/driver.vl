@@ -121,19 +121,6 @@ import {
   symTypeAliasAt,
   symTypeStrAt,
 } from "./check_query"
-import { emitProgram } from "./wasmEmit"
-import {
-  W,
-  emitErr,
-  fnIndices,
-  fnNames,
-  globalNames,
-  globalStmts,
-  localNames,
-  reExpName,
-  reExpTarget,
-} from "./emit_state"
-import { capHas } from "./emit_base"
 import {
   lint,
   lintCodeAt,
@@ -1720,7 +1707,11 @@ function modExportsHas(m: i32, name: string): boolean {
 // unresolvable key, cycle back-edge, name-not-exported), recursing into deps
 // first. Message texts match the host's `modules.ts` (the corpus `@error`s
 // substring them).
-function modVisit(m: i32): i32 {
+// The DFS recurses once per import-chain link, so an adversarially deep chain
+// would overflow the wasm call stack — an opaque trap. Capped with a real
+// diagnostic instead; genuine dependency chains sit orders of magnitude below.
+const MOD_DEPTH_MAX = 256
+function modVisit(m: i32, depth: i32): i32 {
   modState[m] = 1
   let i = 0
   while i < impMod.length {
@@ -1777,7 +1768,24 @@ function modVisit(m: i32): i32 {
               "`)",
           )
         } else {
-          if modState[d] == 0 { modVisit(d) }
+          if modState[d] == 0 {
+            if depth >= MOD_DEPTH_MAX {
+              modDiag(
+                m,
+                impSpecLine[i],
+                impSpecCol[i],
+                "Import chain exceeds the maximum depth (" +
+                  i32ToStr(MOD_DEPTH_MAX) +
+                  ") at \"" +
+                  spec +
+                  "\" (module `" +
+                  key +
+                  "`)",
+              )
+            } else {
+              modVisit(d, depth + 1)
+            }
+          }
           if impName[i] != "" {
             if !modExportsHas(d, impName[i]) {
               // A name-shaped problem anchors at the imported NAME token.
@@ -1812,7 +1820,7 @@ function modCompile(emit: i32): i32 {
     modState.push(0)
     s = s + 1
   }
-  modVisit(0)
+  modVisit(0, 0)
   if modDiags.length > 0 {
     // Tokenless (no tokens are loaded yet): position + owner ride the `vcDg*`
     // side table, keyed on each entry's `P.diags` index.
