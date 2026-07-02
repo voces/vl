@@ -5359,10 +5359,9 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         if emitAtomToStr(body, valIx, fnIx) < 0 { return -1 }
       } else if sFieldIsLitUnion(si, fi) {
         // A literal-union atom FIELD (`{ kind: "b" }`): the member literal lowers as its atom id.
-        const savedFLU = pendingLitUnion
-        pendingLitUnion = 1
-        if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-        pendingLitUnion = savedFLU
+        const fluCtx = expCtxHere()
+        fluCtx.litUnion = 1
+        if emitExprExpect(body, valIx, fnIx, fluCtx) < 0 { return -1 }
       } else {
         if emitExpr(body, valIx, fnIx) < 0 { return -1 }
       }
@@ -7279,42 +7278,35 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
             return -1
           }
         } else {
-          // Reset `pendingListKind`/`pendingListSlot` to the INNER list's kind so the element
+          // Reset the `listKind`/`listSlot` context to the INNER list's kind so the element
           // builds the right list, NOT the outer ref-list kind it would inherit. Scalar inner
           // lists seed kind 0/3/4/6; a ref inner list (kind 9) seeds kind 5 + the inner slot, so
           // the element builds as that ref list — which may itself be kind 9 (nesting falls out).
-          const savedNest = pendingListKind
-          const savedSlot = pendingListSlot
+          const elCtx = expCtxHere()
           if elemNest == 4 {
-            pendingListKind = 0
+            elCtx.listKind = 0
           } else if elemNest == 6 {
-            pendingListKind = 3
+            elCtx.listKind = 3
           } else if elemNest == 7 {
-            pendingListKind = 4
+            elCtx.listKind = 4
           } else if elemNest == 8 {
-            pendingListKind = 6
+            elCtx.listKind = 6
           } else if elemNest == 10 {
-            pendingListKind = 7 // f32-inner list -> build each element as an f32[] (kind 7)
+            elCtx.listKind = 7 // f32-inner list -> build each element as an f32[] (kind 7)
           } else if elemNest == 9 {
-            pendingListKind = 5
-            pendingListSlot = nestInnerSlot
+            elCtx.listKind = 5
+            elCtx.listSlot = nestInnerSlot
           }
           // A `(i32[] | null)[]` element (kind 4 nullable niche) may be a bare `null` → `ref.null
           // $lTypeIdx`; a `(<ref-array> | null)[]` element (kind 9 nullable niche) → `ref.null
           // $innerWrapper`. Each seed only affects a `null` element (a non-null literal ignores it).
-          const savedNulList = pendingNulList
-          const savedNRH = pendingNulRefHeap
           if elemNest == 4 && rlElemNullable[rslot] == 1 {
-            pendingNulList = true
+            elCtx.nulList = true
           }
           if elemNest == 9 && rlElemNullable[rslot] == 1 && nestInnerSlot >= 0 {
-            pendingNulRefHeap = rlWrapIdx[nestInnerSlot]
+            elCtx.nulRefHeap = rlWrapIdx[nestInnerSlot]
           }
-          if emitExpr(body, elems[i], fnIx) < 0 { return -1 }
-          pendingNulList = savedNulList
-          pendingNulRefHeap = savedNRH
-          pendingListKind = savedNest
-          pendingListSlot = savedSlot
+          if emitExprExpect(body, elems[i], fnIx, elCtx) < 0 { return -1 }
         }
         pendingVariantIdx = -1
         i = i + 1
@@ -8163,26 +8155,22 @@ function emitMapGetOr(
       if emitUnionBoxArg(body, mvValName[mslot], defIx, fnIx) < 0 { return -1 }
     } else if mslot >= 0 && mvListValKind(mslot) == "reflist" {
       // A STRUCT-LIST value: hint an empty `[]` default to an empty ref list of the inner
-      // struct (`pendingListKind` 1 = struct-element, `pendingListSlot` the inner slot).
-      const savedSK = pendingListKind
-      const savedSS = pendingListSlot
-      pendingListKind = 1
-      pendingListSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
-      if emitExpr(body, defIx, fnIx) < 0 { return -1 }
-      pendingListKind = savedSK
-      pendingListSlot = savedSS
+      // struct (`listKind` 1 = struct-element, `listSlot` the inner slot).
+      const slCtx = expCtxHere()
+      slCtx.listKind = 1
+      slCtx.listSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
+      if emitExprExpect(body, defIx, fnIx, slCtx) < 0 { return -1 }
     } else {
       // For a non-i32 LIST-valued map, hint an empty `[]` default to the value's list
-      // wrapper (`pendingListKind` 3 string / 4 f64 / 6 i64) — an unhinted `[]` defaults to
+      // wrapper (`listKind` 3 string / 4 f64 / 6 i64) — an unhinted `[]` defaults to
       // the i32-list wrapper, which the `(ref null <wrapper>)` valStash would reject.
-      const savedPLK = pendingListKind
+      const dfCtx = expCtxHere()
       const lvk = mvListValKind(mslot)
-      if lvk == "strlist" { pendingListKind = 3 }
-      else if lvk == "f64list" { pendingListKind = 4 }
-      else if lvk == "i64list" { pendingListKind = 6 }
-      else if lvk == "f32list" { pendingListKind = 7 }
-      if emitExpr(body, defIx, fnIx) < 0 { return -1 }
-      pendingListKind = savedPLK
+      if lvk == "strlist" { dfCtx.listKind = 3 }
+      else if lvk == "f64list" { dfCtx.listKind = 4 }
+      else if lvk == "i64list" { dfCtx.listKind = 6 }
+      else if lvk == "f32list" { dfCtx.listKind = 7 }
+      if emitExprExpect(body, defIx, fnIx, dfCtx) < 0 { return -1 }
     }
     cmSlot = mslot
     fbLocalSet(fnMvValStashLocal(mslot))
@@ -8826,29 +8814,26 @@ function emitMapSetV(
     // Seed a non-i32 scalar-LIST value's inner list kind (as the append path / `?? default`
     // read do) so an overwrite `m[k] = [1,2,3]` builds the i64/f64/string list wrapper, not
     // the default i32-list that would mismatch the typed element slot.
-    const savedPLK = pendingListKind
-    const savedPLS = pendingListSlot
+    const ovCtx = expCtxHere()
     const lvk = mvListValKind(mslot)
     if lvk == "strlist" {
-      pendingListKind = 3
+      ovCtx.listKind = 3
     } else if lvk == "f64list" {
-      pendingListKind = 4
+      ovCtx.listKind = 4
     } else if lvk == "i64list" {
-      pendingListKind = 6
+      ovCtx.listKind = 6
     } else if lvk == "f32list" {
-      pendingListKind = 7
+      ovCtx.listKind = 7
     } else if mslot >= 0 && nameIsRefArray(mvValName[mslot]) {
       // A REF-list value (`S[]` / `(C|D)[]` / a nested `S[][]` / a closure list): seed the value's
       // ref-list slot (keyed by its element name) so the value literal builds as that list — its
       // inner elements recurse through the literal build. Mirrors the array-binding ref-list seed.
-      pendingListKind = 5
-      pendingListSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
+      ovCtx.listKind = 5
+      ovCtx.listSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
     }
-    if emitExpr(body, valIx, fnIx) < 0 {
+    if emitExprExpect(body, valIx, fnIx, ovCtx) < 0 {
       return -1 // value
     }
-    pendingListKind = savedPLK
-    pendingListSlot = savedPLS
     cmSlot = mslot
   }
   fbArraySet(cmValsBack()) // array.set
@@ -9039,26 +9024,23 @@ function emitMapPushValV(
     // null <wrapper>)` element slot) — mirrors the `?? default` READ seeding. Bare integers
     // default to i32, so an i64-list in particular needs this; f64/string self-identify by
     // literal, but seeding is harmless and fixes their empty-`[]` store too.
-    const savedPLK = pendingListKind
-    const savedPLS = pendingListSlot
+    const pvCtx = expCtxHere()
     const lvk = mvListValKind(mslot)
     if lvk == "strlist" {
-      pendingListKind = 3
+      pvCtx.listKind = 3
     } else if lvk == "f64list" {
-      pendingListKind = 4
+      pvCtx.listKind = 4
     } else if lvk == "i64list" {
-      pendingListKind = 6
+      pvCtx.listKind = 6
     } else if lvk == "f32list" {
-      pendingListKind = 7
+      pvCtx.listKind = 7
     } else if mslot >= 0 && nameIsRefArray(mvValName[mslot]) {
       // A REF-list value (`S[]` / `(C|D)[]` / nested `S[][]` / closure list): seed the value's
       // ref-list slot so the value literal builds as that list (inner elements recurse).
-      pendingListKind = 5
-      pendingListSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
+      pvCtx.listKind = 5
+      pvCtx.listSlot = rlSlotByName(refArrElemName(mvValName[mslot]))
     }
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-    pendingListKind = savedPLK
-    pendingListSlot = savedPLS
+    if emitExprExpect(body, valIx, fnIx, pvCtx) < 0 { return -1 }
     cmSlot = mslot
   }
   if mslot >= 0 {
@@ -10925,20 +10907,16 @@ function emitNulArmToLocal(
     if emitUnionBoxArg(body, unionName, valIx, fnIx) < 0 { return -1 }
   } else if rep == 1 {
     // rep 1: a `string | null` arm — a non-null string passes through, a bare `null`
-    // lowers as `ref.null $aTypeIdx` (`pendingNulString`).
-    const saved = pendingNulString
-    pendingNulString = true
-    let rc = emitExpr(body, valIx, fnIx)
-    pendingNulString = saved
-    if rc < 0 { return -1 }
+    // lowers as `ref.null $aTypeIdx` (`nulString`).
+    const nsArmCtx = expCtxHere()
+    nsArmCtx.nulString = true
+    if emitExprExpect(body, valIx, fnIx, nsArmCtx) < 0 { return -1 }
   } else {
     // rep 2: a `boolean | null` arm — a non-null boolean rides its i32 0/1; a bare
-    // `null` lowers as the niche sentinel 2 (`pendingNulBool`).
-    const saved = pendingNulBool
-    pendingNulBool = true
-    let rc = emitExpr(body, valIx, fnIx)
-    pendingNulBool = saved
-    if rc < 0 { return -1 }
+    // `null` lowers as the niche sentinel 2 (`nulBool`).
+    const nbArmCtx = expCtxHere()
+    nbArmCtx.nulBool = true
+    if emitExprExpect(body, valIx, fnIx, nbArmCtx) < 0 { return -1 }
   }
   fbLocalSet(idx)
   0
@@ -12126,16 +12104,11 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
             // A `boolean | null` NICHE global: seed the sentinel for a `null` RHS; a
             // `string | null` global seeds the nullable-array ref; a nullable-CLOSURE
             // global (kind 19) seeds `ref.null $cloStruct` for a `null` RHS.
-            const savedGNB = pendingNulBool
-            const savedGNS = pendingNulString
-            const savedGNC = pendingNulClosure
-            if exprNulBool(a.binLeft, fnIx) { pendingNulBool = true }
-            if exprNullableString(a.binLeft, fnIx) { pendingNulString = true }
-            if exprNulClosure(a.binLeft, fnIx) { pendingNulClosure = true }
-            if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
-            pendingNulBool = savedGNB
-            pendingNulString = savedGNS
-            pendingNulClosure = savedGNC
+            const gsCtx = expCtxHere()
+            if exprNulBool(a.binLeft, fnIx) { gsCtx.nulBool = true }
+            if exprNullableString(a.binLeft, fnIx) { gsCtx.nulString = true }
+            if exprNulClosure(a.binLeft, fnIx) { gsCtx.nulClosure = true }
+            if emitExprExpect(body, a.binRight, fnIx, gsCtx) < 0 { return -1 }
           }
           pendingListKind = 0
           pendingListSlot = 0
@@ -12168,13 +12141,10 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         // sentinel `-1`. Seed `pendingNulLitUnion` (a `null` RHS → `-1`) and `pendingLitUnion` (a
         // member RHS → its interned id). BEFORE the `string` branch — a litunion target reads as a
         // string subtype, which would otherwise widen the member RHS to a heap string.
-        const savedANLU = pendingNulLitUnion
-        const savedALU2 = pendingLitUnion
-        pendingNulLitUnion = true
-        pendingLitUnion = 1
-        if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
-        pendingNulLitUnion = savedANLU
-        pendingLitUnion = savedALU2
+        const nluCtx = expCtxHere()
+        nluCtx.nulLitUnion = true
+        nluCtx.litUnion = 1
+        if emitExprExpect(body, a.binRight, fnIx, nluCtx) < 0 { return -1 }
       } else if exprIsI64(a.binLeft, fnIx) {
         // An i64 target (`x = 0` over `let x: i64`) widens an i32 RHS to i64 — without this the
         // bare `i32.const` clashes with the i64 slot (the checker accepts the assignment, so it
@@ -12193,23 +12163,14 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         // seeds `pendingNulString` so a `null` RHS is `ref.null $aTypeIdx`. A nullable-
         // CLOSURE local (kind 19) seeds `pendingNulClosure` so a `null` RHS is
         // `ref.null $cloStruct` (a function RHS builds the non-null closure value).
-        const savedNB = pendingNulBool
-        const savedNS = pendingNulString
-        const savedNC = pendingNulClosure
-        const savedNL = pendingNulList
-        const savedALU = pendingLitUnion
-        if exprNulBool(a.binLeft, fnIx) { pendingNulBool = true }
-        if exprNullableString(a.binLeft, fnIx) { pendingNulString = true }
-        if exprNulClosure(a.binLeft, fnIx) { pendingNulClosure = true }
-        if exprNullableList(a.binLeft, fnIx) { pendingNulList = true }
+        const asCtx = expCtxHere()
+        if exprNulBool(a.binLeft, fnIx) { asCtx.nulBool = true }
+        if exprNullableString(a.binLeft, fnIx) { asCtx.nulString = true }
+        if exprNulClosure(a.binLeft, fnIx) { asCtx.nulClosure = true }
+        if exprNullableList(a.binLeft, fnIx) { asCtx.nulList = true }
         // A literal-union local (`k = "b"`): the member RHS lowers as its interned i32 id.
-        if exprIsLitAtom(a.binLeft, fnIx) { pendingLitUnion = 1 }
-        if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
-        pendingNulBool = savedNB
-        pendingNulString = savedNS
-        pendingNulClosure = savedNC
-        pendingNulList = savedNL
-        pendingLitUnion = savedALU
+        if exprIsLitAtom(a.binLeft, fnIx) { asCtx.litUnion = 1 }
+        if emitExprExpect(body, a.binRight, fnIx, asCtx) < 0 { return -1 }
       }
       fbLocalSet(idx) // 0x21 local.set
       return 0
@@ -12344,10 +12305,9 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         pendingF32 = savedPF32
       } else if nodeArrayElemIsLitUnion(target.idxArr) {
         // `xs[i] = "a"` over a literal-union array: the member RHS lowers as its atom id.
-        const savedXLU = pendingLitUnion
-        pendingLitUnion = 1
-        if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
-        pendingLitUnion = savedXLU
+        const xluCtx = expCtxHere()
+        xluCtx.litUnion = 1
+        if emitExprExpect(body, a.binRight, fnIx, xluCtx) < 0 { return -1 }
       } else {
         if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
       }
@@ -12464,19 +12424,15 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         if emitAtomToStr(body, a.binRight, fnIx) < 0 { return -1 }
       } else if sFieldIsLitUnion(si, fieldIdx) {
         // A literal-union atom field assign (`b.kind = "a"`): the member RHS lowers as its atom id.
-        const savedWLU = pendingLitUnion
-        pendingLitUnion = 1
-        if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
-        pendingLitUnion = savedWLU
+        const wluCtx = expCtxHere()
+        wluCtx.litUnion = 1
+        if emitExprExpect(body, a.binRight, fnIx, wluCtx) < 0 { return -1 }
       } else {
-        const savedWNS = pendingNulString
-        const savedWNB = pendingNulBool
-        if fscode == 20 { pendingNulString = true }
-        if fscode == 21 { pendingNulBool = true }
-        const rcW = emitExpr(body, a.binRight, fnIx) // then the value
-        pendingNulString = savedWNS
-        pendingNulBool = savedWNB
-        if rcW < 0 { return -1 }
+        const fwCtx = expCtxHere()
+        if fscode == 20 { fwCtx.nulString = true }
+        if fscode == 21 { fwCtx.nulBool = true }
+        // then the value
+        if emitExprExpect(body, a.binRight, fnIx, fwCtx) < 0 { return -1 }
       }
       pendingListKind = 0
       fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
@@ -12680,10 +12636,9 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
             return -1
           }
         } else if isLitArr {
-          const savedPLU = pendingLitUnion
-          pendingLitUnion = 1
-          if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-          pendingLitUnion = savedPLU
+          const pluCtx = expCtxHere()
+          pluCtx.litUnion = 1
+          if emitExprExpect(body, c.callArgs[0], fnIx, pluCtx) < 0 { return -1 }
         } else {
           if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
         }
@@ -14514,25 +14469,16 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     // A literal-union atom returned from a `string`-typed function widens to its member string.
     if emitAtomToStr(body, retArg, fnIx) < 0 { return -1 }
   } else {
-    const savedRNB = pendingNulBool
-    const savedRNS = pendingNulString
-    const savedRNL = pendingNulList
-    const savedRLU = pendingLitUnion
-    const savedRNLU = pendingNulLitUnion
-    if retNulBool { pendingNulBool = true }
-    if retNulString { pendingNulString = true }
-    if retNulList { pendingNulList = true }
-    if retLitUnion { pendingLitUnion = 1 }
+    const retCtx = expCtxHere()
+    if retNulBool { retCtx.nulBool = true }
+    if retNulString { retCtx.nulString = true }
+    if retNulList { retCtx.nulList = true }
+    if retLitUnion { retCtx.litUnion = 1 }
     if retNulLitUnion {
-      pendingNulLitUnion = true
-      pendingLitUnion = 1
+      retCtx.nulLitUnion = true
+      retCtx.litUnion = 1
     }
-    if emitExpr(body, retArg, fnIx) < 0 { return -1 }
-    pendingNulBool = savedRNB
-    pendingNulString = savedRNS
-    pendingNulList = savedRNL
-    pendingLitUnion = savedRLU
-    pendingNulLitUnion = savedRNLU
+    if emitExprExpect(body, retArg, fnIx, retCtx) < 0 { return -1 }
   }
   pendingStructIdx = -1
   pendingVariantIdx = -1
@@ -14844,10 +14790,9 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     // (`pendingNulClosure`); a function init stores its closure ref directly. Takes
     // priority over the union-coerce path (the `fn | null` annotation reads as a union
     // NAME, but this is a niche nullable ref, not a box).
-    const savedNC = pendingNulClosure
-    pendingNulClosure = true
-    if emitExpr(body, s.letInit, fnIx) < 0 { return -1 }
-    pendingNulClosure = savedNC
+    const ncCtx = expCtxHere()
+    ncCtx.nulClosure = true
+    if emitExprExpect(body, s.letInit, fnIx, ncCtx) < 0 { return -1 }
   } else if letUNm != "" {
     if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return -1 }
   } else if letIsF32(stmtIx) {
@@ -19523,6 +19468,92 @@ let litAtomNext: i32 = 0
 // Seeded around a literal-union BOUNDARY (binding init / `==` operand) so a member `StrLit` lowers as its
 // interned i32 id instead of a string. The atom analogue of `pendingNulString`.
 let pendingLitUnion: i32 = 0
+
+// ── explicit expected-type context (N20) ──────────────────────────────────────
+// The `pending*` globals above (and in `emit_state.vl`) are implicit parameters:
+// a site seeds what the immediately-following `emitExpr` should build, and a
+// hand-rolled save/…/restore at every site is the only thing keeping a seed from
+// leaking into a DISTANT emit (a missed restore is a silent miscompile). `ExpCtx`
+// makes that context an explicit VALUE: a site snapshots the ambient seeds
+// (`expCtxHere`), overrides the fields it knows, and hands the context to
+// `emitExprExpect` — which applies it around the ONE emit and always restores,
+// so a missed restore cannot happen. The globals remain the transport the deep
+// consumers (the literal / null / ident lowerings) read; migrating those
+// consumers to take the context as a parameter is the remainder of N20.
+type ExpCtx = {
+  listKind: i32,        // pendingListKind — what an empty `[]` builds
+  listSlot: i32,        // pendingListSlot — WHICH ref-list element type
+  structIdx: i32,       // pendingStructIdx — the struct an ObjLit must build
+  variantIdx: i32,      // pendingVariantIdx — bare variant an ObjLit must build
+  mapSlot: i32,         // pendingMapSlot — the map shape a `Map()` builds
+  wantI64: boolean,     // pendingI64 — a NumLit lowers as i64.const
+  wantF32: boolean,     // pendingF32 — a NumLit lowers as f32.const
+  wantF64: boolean,     // pendingF64 — an integer NumLit lowers as f64.const
+  nulBool: boolean,     // pendingNulBool — a bare `null` is the sentinel 2
+  nulLitUnion: boolean, // pendingNulLitUnion — a bare `null` is the sentinel -1
+  nulString: boolean,   // pendingNulString — a bare `null` is `ref.null $aTypeIdx`
+  nulClosure: boolean,  // pendingNulClosure — a bare `null` is `ref.null $cloStruct`
+  nulList: boolean,     // pendingNulList — a bare `null` is `ref.null $lTypeIdx`
+  nulRefHeap: i32,      // pendingNulRefHeap — heap index a bare `null` refs, -1 none
+  rawNullRead: boolean, // pendingRawNullRead — a nullable read stays the RAW ref
+  litUnion: i32,        // pendingLitUnion — a member StrLit lowers as its atom id
+}
+
+// The current pending seeds as an explicit context — the BASE every site starts
+// from (exact ambient semantics), overriding only the fields it knows.
+function expCtxHere(): ExpCtx {
+  const c: ExpCtx = {
+    listKind: pendingListKind,
+    listSlot: pendingListSlot,
+    structIdx: pendingStructIdx,
+    variantIdx: pendingVariantIdx,
+    mapSlot: pendingMapSlot,
+    wantI64: pendingI64,
+    wantF32: pendingF32,
+    wantF64: pendingF64,
+    nulBool: pendingNulBool,
+    nulLitUnion: pendingNulLitUnion,
+    nulString: pendingNulString,
+    nulClosure: pendingNulClosure,
+    nulList: pendingNulList,
+    nulRefHeap: pendingNulRefHeap,
+    rawNullRead: pendingRawNullRead,
+    litUnion: pendingLitUnion,
+  }
+  return c
+}
+
+// Write a context into the pending seeds (the transport the consumers read).
+function expCtxApply(c: ExpCtx) {
+  pendingListKind = c.listKind
+  pendingListSlot = c.listSlot
+  pendingStructIdx = c.structIdx
+  pendingVariantIdx = c.variantIdx
+  pendingMapSlot = c.mapSlot
+  pendingI64 = c.wantI64
+  pendingF32 = c.wantF32
+  pendingF64 = c.wantF64
+  pendingNulBool = c.nulBool
+  pendingNulLitUnion = c.nulLitUnion
+  pendingNulString = c.nulString
+  pendingNulClosure = c.nulClosure
+  pendingNulList = c.nulList
+  pendingNulRefHeap = c.nulRefHeap
+  pendingRawNullRead = c.rawNullRead
+  pendingLitUnion = c.litUnion
+  0
+}
+
+// Emit `exprIx` under the explicit expected-type context `ctx`: the ambient
+// seeds are saved, `ctx` applied, the expression emitted, and EVERY seed
+// restored — scoping the whole context to this one emit.
+function emitExprExpect(body: i32[], exprIx: i32, fnIx: i32, ctx: ExpCtx) {
+  const saved = expCtxHere()
+  expCtxApply(ctx)
+  const r = emitExpr(body, exprIx, fnIx)
+  expCtxApply(saved)
+  r
+}
 
 // Whether the module uses ANY literal-union type (named or inline). Set ONCE per program by a single
 // `P.nodes` scan; every per-node litunion detector (`exprIsLitAtom`, the `*WidensAtomToStr` predicates)
@@ -27496,11 +27527,10 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if P.nodes[unwrapParen(e.binRight)] is NullLit { atomNull = true }
     if !atomNull {
       if exprIsLitAtom(e.binLeft, fnIx) || exprIsLitAtom(e.binRight, fnIx) {
-        const savedLU = pendingLitUnion
-        pendingLitUnion = 1
-        if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-        if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-        pendingLitUnion = savedLU
+        const luCtx = expCtxHere()
+        luCtx.litUnion = 1
+        if emitExprExpect(body, e.binLeft, fnIx, luCtx) < 0 { return -1 }
+        if emitExprExpect(body, e.binRight, fnIx, luCtx) < 0 { return -1 }
         fbI32Bin(70) // 0x46 i32.eq
         if e.binOp == "!=" {
           fbI32Eqz() // 0x45 i32.eqz -> `!=`
@@ -27652,11 +27682,9 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       // is read RAW (`pendingRawNullRead`) so the kind-16 ident keeps its nullable ref
       // instead of being recovered to non-null (which would make `ref.is_null` const 0).
       if exprNullableString(nref, fnIx) {
-        const savedRaw = pendingRawNullRead
-        pendingRawNullRead = true
-        const re = emitExpr(body, nref, fnIx)
-        pendingRawNullRead = savedRaw
-        if re < 0 { return -1 }
+        const nsCtx = expCtxHere()
+        nsCtx.rawNullRead = true
+        if emitExprExpect(body, nref, fnIx, nsCtx) < 0 { return -1 }
         wU8(209) // 0xd1 ref.is_null
         if e.binOp == "!=" {
           fbI32Eqz() // invert: non-null
@@ -27909,33 +27937,22 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
         // variant ARGUMENT (`area(s)` where `s: S`, param `C | S`) is boxed here.
         if emitUnionBoxArg(body, cUNm, args[i], fnIx) < 0 { return -1 }
       } else {
-        const savedCNB = pendingNulBool
-        const savedCNS = pendingNulString
-        const savedCNC = pendingNulClosure
-        const savedCNL = pendingNulList
-        const savedCLU = pendingLitUnion
-        const savedCNLU = pendingNulLitUnion
-        if cParamNulBool { pendingNulBool = true }
-        if cParamNulString { pendingNulString = true }
-        if cParamNulClosure { pendingNulClosure = true }
-        if cParamNulList { pendingNulList = true }
-        if cParamLitUnion { pendingLitUnion = 1 }
+        const argCtx = expCtxHere()
+        if cParamNulBool { argCtx.nulBool = true }
+        if cParamNulString { argCtx.nulString = true }
+        if cParamNulClosure { argCtx.nulClosure = true }
+        if cParamNulList { argCtx.nulList = true }
+        if cParamLitUnion { argCtx.litUnion = 1 }
         if cParamNulLitUnion {
-          pendingLitUnion = 1
-          pendingNulLitUnion = true
+          argCtx.litUnion = 1
+          argCtx.nulLitUnion = true
         }
         // A variant-PARAM position (`loud(c: Cat)`): seed the variant index so an object
         // LITERAL argument builds the bare variant struct (kind 8). A variant/union VALUE
         // argument ignores the hint (the union-unbox cast below handles a boxed value).
-        if cVi >= 0 { pendingVariantIdx = cVi }
-        if emitExpr(body, args[i], fnIx) < 0 { return -1 }
+        if cVi >= 0 { argCtx.variantIdx = cVi }
+        if emitExprExpect(body, args[i], fnIx, argCtx) < 0 { return -1 }
         pendingVariantIdx = -1
-        pendingNulBool = savedCNB
-        pendingNulString = savedCNS
-        pendingNulClosure = savedCNC
-        pendingNulList = savedCNL
-        pendingLitUnion = savedCLU
-        pendingNulLitUnion = savedCNLU
         // A nullable-REP value (a null-narrowed `S | null` param/local, or a
         // recursive `S | null` field read whose wasm slot stays `(ref null $S)`)
         // flowing into a NON-NULL `(ref $S)` param: recover the non-null ref at
@@ -28284,14 +28301,13 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // `ref.is_null` (the else arm reads `e` as a non-null value). `pendingRawNullRead`
   // keeps the test read raw. Generic in `e.binLeft`, so it covers a member field too.
   if lhsReEval && exprNullableString(e.binLeft, fnIx) {
-    const savedRawN = pendingRawNullRead
-    pendingRawNullRead = true
-    const treN = emitExpr(body, e.binLeft, fnIx) // the raw nullable ref
-    pendingRawNullRead = savedRawN
-    if treN < 0 { return -1 }
-    wU8(209)                                     // 0xd1 ref.is_null → 1 if null
-    wU8(4)                                       // 0x04 if
-    wU8(100)                                     // blocktype: (ref $aTypeIdx) — non-null string result
+    const rawCtx = expCtxHere()
+    rawCtx.rawNullRead = true
+    // the raw nullable ref
+    if emitExprExpect(body, e.binLeft, fnIx, rawCtx) < 0 { return -1 }
+    wU8(209) // 0xd1 ref.is_null → 1 if null
+    wU8(4)   // 0x04 if
+    wU8(100) // blocktype: (ref $aTypeIdx) — non-null string result
     wSLEB(aTypeIdx)
     ctrlEnter()
     if emitExpr(body, e.binRight, fnIx) < 0 {
@@ -28466,16 +28482,15 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     // `ref.is_null` selects `d` or the recovered non-null string — the call analogue
     // of the `string | null` ident path.
     if exprNullableString(e.binLeft, fnIx) {
-      const savedRaw = pendingRawNullRead
-      pendingRawNullRead = true
-      const tre = emitExpr(body, e.binLeft, fnIx) // the raw nullable ref, ONCE
-      pendingRawNullRead = savedRaw
-      if tre < 0 { return -1 }
+      const rawCCtx = expCtxHere()
+      rawCCtx.rawNullRead = true
+      // the raw nullable ref, ONCE
+      if emitExprExpect(body, e.binLeft, fnIx, rawCCtx) < 0 { return -1 }
       fbLocalSet(coalesceCallStrSlot)
       fbLocalGet(coalesceCallStrSlot)
-      wU8(209)                                    // 0xd1 ref.is_null → 1 if null
-      wU8(4)                                      // 0x04 if
-      wU8(100)                                    // blocktype: (ref $aTypeIdx) — non-null string result
+      wU8(209) // 0xd1 ref.is_null → 1 if null
+      wU8(4)   // 0x04 if
+      wU8(100) // blocktype: (ref $aTypeIdx) — non-null string result
       wSLEB(aTypeIdx)
       ctrlEnter()
       if emitExpr(body, e.binRight, fnIx) < 0 {
@@ -28754,11 +28769,9 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       wU8(214) // 0xd6 br_on_non_null
       wULEB(0) //   non-null → branch to the block end with the (ref $struct)
       // null path: emit the default, seeding an ObjLit default to this struct.
-      const savedPsi = pendingStructIdx
-      pendingStructIdx = csi
-      const dres = emitExpr(body, e.binRight, fnIx)
-      pendingStructIdx = savedPsi
-      if dres < 0 { return -1 }
+      const defCtx = expCtxHere()
+      defCtx.structIdx = csi
+      if emitExprExpect(body, e.binRight, fnIx, defCtx) < 0 { return -1 }
       wU8(11) // 0x0b end
       ctrlLeave()
       return 0
