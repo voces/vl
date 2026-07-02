@@ -206,6 +206,25 @@ fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>,
     Ok((store, inst))
 }
 
+/// Read a file as UTF-8, distinguishing "missing/unreadable" from "present but
+/// not UTF-8": the latter gets a stderr note naming the real cause — otherwise
+/// it surfaces downstream as a generic "cannot read" / "cannot resolve import"
+/// diagnostic pointing the user at the wrong problem.
+fn read_utf8(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!(
+                "vl: `{}` is not valid UTF-8 (first invalid byte at offset {}) — treating it as unreadable",
+                path.display(),
+                e.utf8_error().valid_up_to()
+            );
+            None
+        }
+    }
+}
+
 /// Stage `source` (as `source_path`) into a freshly-loaded compiler instance: run
 /// the module fetch loop when it has imports, then `srcReset` + `srcPush`. Leaves
 /// the instance ready for a `checkSrc` / `compileSrc` / `lintSrc` call. Used by
@@ -292,9 +311,10 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
                     // commits `found = 0` either way (the compiler's
                     // Cannot-resolve diagnostic fires, never the host).
                     let src = match key.strip_prefix("std:") {
-                        Some(name) => std_dir()
-                            .and_then(|dir| std::fs::read_to_string(dir.join(format!("{name}.vl"))).ok()),
-                        None => std::fs::read_to_string(&key).ok(),
+                        Some(name) => {
+                            std_dir().and_then(|dir| read_utf8(&dir.join(format!("{name}.vl"))))
+                        }
+                        None => read_utf8(std::path::Path::new(&key)),
                     };
                     commit_module(store, &key, src.as_deref())?;
                 }
@@ -592,8 +612,13 @@ fn read_cli_str(
     let n = len.call(&mut *store, ())?;
     let mut s = String::with_capacity(n.max(0) as usize);
     for j in 0..n {
-        if let Some(c) = char::from_u32(at.call(&mut *store, j)? as u32) {
-            s.push(c);
+        let v = at.call(&mut *store, j)? as u32;
+        match char::from_u32(v) {
+            Some(c) => s.push(c),
+            // The seed only stores code points that came from valid strings, so
+            // an unmappable value is a protocol bug — surface it in debug builds
+            // rather than silently shortening the payload.
+            None => debug_assert!(false, "invalid code point {v:#x} in a CLI payload at index {j}"),
         }
     }
     Ok(s)
@@ -688,9 +713,10 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // A missing file commits `found = 0` (the VL program raises its own
                 // unresolvable-import / cannot-read diagnostic).
                 let data = match path.strip_prefix("std:") {
-                    Some(name) => std_dir()
-                        .and_then(|d| std::fs::read_to_string(d.join(format!("{name}.vl"))).ok()),
-                    None => std::fs::read_to_string(&path).ok(),
+                    Some(name) => {
+                        std_dir().and_then(|d| read_utf8(&d.join(format!("{name}.vl"))))
+                    }
+                    None => read_utf8(std::path::Path::new(&path)),
                 };
                 match data {
                     Some(s) => {
