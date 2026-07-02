@@ -53,10 +53,10 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
      `structIndexOfTypeName`. The remaining `structIndexByName` sites stay nominal-only for now — migrate
      each opportunistically when a structural name actually reaches it (premature otherwise: today they
      all receive nominal names, so a blanket swap is a no-op with risk).
-  2. ⬜ **Differential / fuzz tester for the NON-i32 reps (highest leverage — do before the rewrite).**
-     The self-compile fixpoint can't validate the rep layer (the compiler is i32-only — never exercises
-     floats/unions/closures/nullables), so the corpus is the only net and it has gaps. A property tester
-     that generates programs over the non-i32 reps de-risks every later rep change.
+  2. 🟡 **Rep-bug burn-down.** The fuzz tester itself SHIPPED (→ `CHANGELOG.md`; findings log
+     `docs/internals/rep-fuzz-findings.md`). REMAINING: fix the confirmed bug families from the
+     sweeps (fix wave in flight), graduating each fixed shape from `scripts/rep-fuzz-baseline.txt`
+     into `tests/cases/`; extend matrix coverage as new reps land.
   3. ⬜ **`repOf(type) → descriptor` unification (the "rewrite") — strangler, NOT big-bang.** One
      structurally-keyed descriptor {valtype, heapIdx, nullRep, sigToken, listResultKind, …} that every
      site consults; introduce + delegate + migrate site-by-site (each gated) + delete the old schemes.
@@ -426,11 +426,6 @@ independent).*
   residue is the parked soundness xfails — see "Kill the TS host" in Next; history →
   `CHANGELOG.md`). The port compiles ITSELF to a byte-exact native fixpoint (stage3 == stage4,
   `scripts/native-fixpoint.sh`, ~6s, gated in CI by `ci-native`). REMAINING:
-  - **Real import/export for the `.vl` BUILD** — retire the concat + symbol-rename glue (the
-    assembly renames the lexer's colliding `Tok`/`Diag`/`advance`). Import HEADERS landed (every
-    compiler file checks as a module — LSP/`vl check` clean); switching the BUILD waits on the
-    post-parity module revisit (symbol-based resolution — don't bet the compiler on the rename
-    walker; → `docs/internals/native-modules-design.md` §Post-parity revisit).
   - **Spans** — continue the rungs (rung 1 = token positions; rung 2 = native `path:line:col:`
     diagnostics, #312; rung 3 = end positions for LSP ranges, `diagEndCol`) so more diagnostics
     carry real positions; message/span parity gates the deno-CHECK-tier deletion (F-tiers).
