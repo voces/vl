@@ -154,6 +154,8 @@ let cliFmtWrite = 0   // -w / --write (rewrite in place)
 let cliFmtCheck = 0   // --check (CI gate: nonzero exit on any drift)
 let cliFmtDrift = 0   // count of not-already-formatted files (--check)
 let cliFmtResult = "" // the formatted source of the current file
+let cliFmtBad = 0     // count of files whose INPUT did not parse (exit 2)
+let cliFmtBug = 0     // count of round-trip gate trips — formatter bug (exit 3)
 let cliFix = 0        // check --fix: apply the safe lint fixes in place
 let cliFixCount = 0   // total safe fixes applied across the run
 let cliFileFixed = 0  // 1 once the current file's fixes were applied — so
@@ -932,16 +934,44 @@ function cliStartFmtFile() {
   cliState = ST_FMT_READ
   CMD_READ_FILE
 }
-// `--check`: nonzero exit + a stderr "not formatted" line per drifted file (those
-// lines were accumulated into cliOut during the loop). `-w`/stdout: output was
-// interleaved per file, nothing left to print.
-function cliFmtFinish() {
-  if cliFmtCheck != 0 {
-    cliExit = 0
-    if cliFmtDrift > 0 { cliExit = 1 }
-    return cliBeginPrint()
+// One stderr line for a failed `fmt` of `path`; `status` is `cliFormatNow`'s
+// nonzero result. An unparseable INPUT (1) reports its first parse diagnostic;
+// a round-trip gate trip (2) is a FORMATTER bug — the file was left unchanged,
+// and the message says so loudly.
+function cliFmtFailNote(path: string, status: i32) {
+  if status == 2 {
+    cliFmtBug = cliFmtBug + 1
+    cliOut.push(
+      "fmt: " +
+        path +
+        ": formatter produced invalid output — file left unchanged, please report",
+    )
+    return 0
   }
+  cliFmtBad = cliFmtBad + 1
+  let msg = "parse error"
+  if diagCount() > 0 {
+    const line = diagLine(0)
+    if line > 0 {
+      msg = msg + " [" + i32ToStr(line) + ":" + i32ToStr(diagCol(0) + 1) + "]"
+    }
+    msg = msg + ": " + vcDiagMsg(0)
+  }
+  cliOut.push("fmt: " + path + ": " + msg + " — not formatted")
+  0
+}
+
+// End of the fmt work-list: compute the exit code and drain any accumulated
+// stderr lines (`--check` drift reports, parse-error / gate-trip notes). Drift
+// gates only under `--check` (exit 1); an unparseable input outranks drift
+// (exit 2); a round-trip gate trip outranks both (exit 3 — a formatter bug must
+// never look like mere drift).
+function cliFmtFinish() {
   cliExit = 0
+  if cliFmtCheck != 0 && cliFmtDrift > 0 { cliExit = 1 }
+  if cliFmtBad > 0 { cliExit = 2 }
+  if cliFmtBug > 0 { cliExit = 3 }
+  if cliOut.length > 0 { return cliBeginPrint() }
   cliState = ST_DONE
   CMD_DONE
 }
@@ -979,6 +1009,8 @@ export function cliNext() {
     cliWarnings = 0
     cliGating = 0
     cliFmtDrift = 0
+    cliFmtBad = 0
+    cliFmtBug = 0
     cliFixCount = 0
     cliWalkStack = []
     cliWalkRel = []
@@ -1042,16 +1074,27 @@ export function cliNext() {
   }
   if st == ST_FMT_STDIN {
     // stdin formatted to stdout (`… | vl fmt`); `--check` reports drift via exit.
-    cliCurFile = ""
-    cliFmtResult = cliFormatNow(cliFileSrc)
+    // A failed format (parse error / gate trip) passes the INPUT through so a
+    // mid-pipeline `vl fmt` never eats the data — the note + nonzero exit carry
+    // the failure. Finishing through the (empty) work-list drains the note.
+    cliCurFile = "<stdin>"
+    cliFiles = []
+    cliFileIdx = 0
+    const fst = cliFormatNow(cliFileSrc)
+    cliFmtResult = cliFileSrc
+    if fst == 0 {
+      cliFmtResult = vcFmtOut
+    } else {
+      cliFmtFailNote(cliCurFile, fst)
+    }
     if cliFmtCheck != 0 {
-      cliExit = 0
-      if cliFmtResult != cliFileSrc { cliExit = 1 }
-      cliState = ST_DONE
-      return CMD_DONE
+      if fst == 0 && cliFmtResult != cliFileSrc {
+        cliFmtDrift = cliFmtDrift + 1
+      }
+      return cliFmtFinish()
     }
     cliCmdData = cliFmtResult
-    cliState = ST_DONE
+    cliState = ST_FMT_AFTER
     return CMD_PRINT_OUT
   }
   if st == ST_FMT_READ {
@@ -1064,7 +1107,15 @@ export function cliNext() {
       cliFileIdx = cliFileIdx + 1
       return cliStartFmtFile()
     }
-    cliFmtResult = cliFormatNow(cliFileSrc)
+    const fst = cliFormatNow(cliFileSrc)
+    if fst != 0 {
+      // Parse error or gate trip: the file is untouched (and nothing is printed
+      // in stdout mode); the note + exit code carry the failure.
+      cliFmtFailNote(cliCurFile, fst)
+      cliFileIdx = cliFileIdx + 1
+      return cliStartFmtFile()
+    }
+    cliFmtResult = vcFmtOut
     const changed = cliFmtResult != cliFileSrc
     if cliFmtCheck != 0 {
       if changed {

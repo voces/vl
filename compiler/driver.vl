@@ -381,10 +381,13 @@ export function lintCol(i: i32): i32 { lintColAt(i) }
 // Run the AST-driven formatter (compiler/format.vl) over the current source and
 // expose its canonical-form output as a string, so the native `vl fmt` and the
 // deno harness can reformat VL. Lexes (capturing the retained `//`/`///` comments
-// the formatter places), parses, and formats. Returns the formatted string length,
-// or -1 on a lex/parse error (the formatter needs a valid AST). The host then
-// reads the bytes via `fmtByteAt(j)` (one UTF-32 code point per call, like the
-// other string accessors), 0 ≤ j < the returned length.
+// the formatter places), parses, formats, and RE-PARSES the output (the
+// round-trip safety gate). Returns the formatted string length; -1 when the
+// INPUT does not lex/parse (the formatter needs a valid AST; its diagnostics
+// stay readable via `diagCount`/`vcDiagMsg`/…); -2 when the OUTPUT does not
+// re-parse — a formatter bug, so callers must keep the input bytes and report.
+// The host then reads the bytes via `fmtByteAt(j)` (one UTF-32 code point per
+// call, like the other string accessors), 0 ≤ j < the returned length.
 export let vcFmtOut = ""
 export function formatSrc(): i32 {
   symSetEnabled(0)
@@ -421,6 +424,10 @@ export function formatSrc(): i32 {
   let d = 0
   while d < r.diags.length {
     P.diags.push({ msg: r.diags[d].msg, at: 0 })
+    // Keep the lex diag's real position (`diagLine`/`diagCol` read these), so a
+    // caller can point at the offending source instead of token 0.
+    vcLexLines.push(r.diags[d].line)
+    vcLexCols.push(r.diags[d].col)
     d = d + 1
   }
   let c = 0
@@ -435,6 +442,28 @@ export function formatSrc(): i32 {
   const root = parseProgram()
   if P.diags.length > 0 { return -1 }
   vcFmtOut = formatProgram(root)
+  // ── round-trip safety gate ────────────────────────────────────────────────
+  // Re-lex + re-parse the OUTPUT before handing it back: a printer bug that
+  // emits unparseable text must surface as a loud diagnostic (-2, callers keep
+  // the input bytes), never as data loss through `fmt -w`. The gate costs one
+  // extra lex+parse of the formatted text — no re-format, no typecheck. An
+  // output byte-identical to the input needs no gate (the input just parsed):
+  // that keeps the already-clean case — every file of a green `fmt --check`
+  // run — at zero extra cost (which matters under the non-freeing GC, where a
+  // re-lex of each file in a directory run would accumulate for the whole
+  // process life).
+  if vcFmtOut == src { return vcFmtOut.length }
+  P.toks = []
+  P.nodes = []
+  P.diags = []
+  P.pos = 0
+  nodeToks = []
+  declNameTok = []
+  vcLexLines = []
+  vcLexCols = []
+  vcLoadToks(vcFmtOut)
+  if P.diags.length == 0 { parseProgram() }
+  if P.diags.length > 0 { return -2 }
   vcFmtOut.length
 }
 export function fmtLen(): i32 { vcFmtOut.length }
