@@ -24,6 +24,14 @@ import {
   diagEndCol,
   diagLine,
   diagModule,
+  lintGraph,
+  lintGraphCodeAt,
+  lintGraphCol,
+  lintGraphCount,
+  lintGraphLine,
+  lintGraphModule,
+  lintGraphMsgAt,
+  lintGraphSevAt,
   lintSrc,
   modPendingCount,
   modReset,
@@ -142,16 +150,17 @@ let cliWarnings = 0
 let cliGating = 0
 // fmt mode (A-impl 3): the walk + file collection are shared with `check`; only
 // the per-file action and the finish differ.
-let cliCmd = 0        // subcommand: 0 = check, 1 = fmt
-let cliFmtWrite = 0   // -w / --write (rewrite in place)
-let cliFmtCheck = 0   // --check (CI gate: nonzero exit on any drift)
-let cliFmtDrift = 0   // count of not-already-formatted files (--check)
-let cliFmtResult = "" // the formatted source of the current file
-let cliFmtBad = 0     // count of files whose INPUT did not parse (exit 2)
-let cliFmtBug = 0     // count of round-trip gate trips — formatter bug (exit 3)
-let cliFix = 0        // check --fix: apply the safe lint fixes in place
-let cliFixCount = 0   // total safe fixes applied across the run
-let cliFileFixed = 0  // 1 once the current file's fixes were applied — so
+let cliCmd = 0         // subcommand: 0 = check, 1 = fmt
+let cliFmtWrite = 0    // -w / --write (rewrite in place)
+let cliFmtCheck = 0    // --check (CI gate: nonzero exit on any drift)
+let cliFmtDrift = 0    // count of not-already-formatted files (--check)
+let cliFmtResult = ""  // the formatted source of the current file
+let cliFmtBad = 0      // count of files whose INPUT did not parse (exit 2)
+let cliFmtBug = 0      // count of round-trip gate trips — formatter bug (exit 3)
+let cliFix = 0         // check --fix: apply the safe lint fixes in place
+let cliFixCount = 0    // total safe fixes applied across the run
+let cliLintGraphed = 0 // 1 = the current file's lint ran module-aware (lintGraph)
+let cliFileFixed = 0   // 1 once the current file's fixes were applied — so
 // the module-aware re-check (for the report) doesn't
 // re-fix. Reset per file in cliStartFile.
 // One committed directory listing (parallel arrays), refilled per CMD_LIST_DIR.
@@ -271,6 +280,7 @@ export function cliArgReset() {
   cliFmtResult = ""
   cliFix = 0
   cliFixCount = 0
+  cliLintGraphed = 0
   cliFileFixed = 0
   cliDirNames = []
   cliDirIsDirs = []
@@ -335,6 +345,40 @@ export function cliDirEntryPush(isDir: i32) {
 // the path as a single file.
 export function cliDirCommit(isDir: i32) {
   cliDirWasDir = isDir
+  0
+}
+
+// ── lint-stream adapters ────────────────────────────────────────────────────────
+// The current file's lint findings, read from whichever stream the lint run above
+// populated: the module-aware graph accumulators (`cliLintGraphed`, one entry per
+// finding with its owning module index) or lint.vl's single-module sink (module 0
+// throughout — the entry).
+function cliLintCount() {
+  if cliLintGraphed != 0 { return lintGraphCount() }
+  lintCount()
+}
+function cliLintSevAt(k: i32) {
+  if cliLintGraphed != 0 { return lintGraphSevAt(k) }
+  lintSevAt(k)
+}
+function cliLintMsgAt(k: i32) {
+  if cliLintGraphed != 0 { return lintGraphMsgAt(k) }
+  lintMsgAt(k)
+}
+function cliLintCodeAt(k: i32) {
+  if cliLintGraphed != 0 { return lintGraphCodeAt(k) }
+  lintCodeAt(k)
+}
+function cliLintLineAt(k: i32) {
+  if cliLintGraphed != 0 { return lintGraphLine(k) }
+  lintLineAt(k)
+}
+function cliLintColAt(k: i32) {
+  if cliLintGraphed != 0 { return lintGraphCol(k) }
+  lintColAt(k)
+}
+function cliLintModAt(k: i32) {
+  if cliLintGraphed != 0 { return lintGraphModule(k) }
   0
 }
 
@@ -690,18 +734,28 @@ function cliCheckCurFile() {
     i = i + 1
   }
 
-  // Lint (single-file, parse-only over the ENTRY source — re-stage; module mode
-  // left the module table populated, `lintSrc` ignores it and reads vcSource()).
-  // Run BEFORE the --fix block (which needs the lint stream) and reused, via
-  // `lintCount`, by the report below. (The redundant-annotation stream is type-
-  // populated and survives this re-parse.)
+  // Lint (parse-only). Run BEFORE the --fix block (which needs the lint stream)
+  // and reused by the report below. (The redundant-annotation stream is type-
+  // populated and survives this re-parse.) SCOPE policy:
+  //   - a SINGLE-FILE target in module mode lints the WHOLE graph (`lintGraph`),
+  //     so an unused local in an imported module — or an unused import in the
+  //     importer — is reported, attributed to the owning file;
+  //   - a DIRECTORY run lints the ENTRY module only: every file in the walk gets
+  //     its turn as the entry, so per-module coverage is complete WITHOUT
+  //     re-reporting a shared dependency's findings once per importer.
   srcReset()
   let li = 0
   while li < cliEntrySrc.length {
     srcPush(cliEntrySrc[li])
     li = li + 1
   }
-  lintSrc()
+  cliLintGraphed = 0
+  if cliModMode != 0 && cliDirMode == 0 {
+    cliLintGraphed = 1
+    lintGraph()
+  } else {
+    lintSrc()
+  }
 
   // --fix (MODULE-AWARE): the redundant-annotation stream (from the resolved check
   // above) + the lint stream are now reliable, so apply the safe edits, write the
@@ -726,21 +780,22 @@ function cliCheckCurFile() {
   }
 
   // ── report ──────────────────────────────────────────────────────────────────
-  // Lint-tier diagnostics (from the `lintSrc` above; read the stored count).
-  const ln = lintCount()
+  // Lint-tier diagnostics (from the lint run above; read the stored count).
+  // Module-aware: a graph lint's finding carries the owning module's index, so
+  // the report labels it (and draws its caret context) against THAT file.
+  const ln = cliLintCount()
   let k = 0
   while k < ln {
-    let sev = lintSevAt(k)
+    let sev = cliLintSevAt(k)
     if sev.length == 0 { sev = "warning" }
-    // Lint is parse-only over the ENTRY source, so its findings are the entry's (module 0).
     cliAddDiag(
       sev,
-      lintCodeAt(k),
-      lintLineAt(k),
-      lintColAt(k),
-      lintColAt(k) + 1,
-      lintMsgAt(k),
-      0,
+      cliLintCodeAt(k),
+      cliLintLineAt(k),
+      cliLintColAt(k),
+      cliLintColAt(k) + 1,
+      cliLintMsgAt(k),
+      cliLintModAt(k),
     )
     k = k + 1
   }
@@ -1004,7 +1059,7 @@ function cliBeginCheck() {
 // re-check (a per-file check without its imports gives unreliable types, which is
 // exactly what corrupted an empty-array annotation before this was module-aware).
 function cliComputeFixes(src: string) {
-  const n = lintCount()
+  const n = cliLintCount()
   // The absolute offset where each 0-based line begins.
   const starts = [0]
   let s = 0
@@ -1017,10 +1072,13 @@ function cliComputeFixes(src: string) {
   const txt: string[] = []
   let k = 0
   while k < n {
-    const code = lintCodeAt(k)
-    const ln = lintLineAt(k) - 1
-    const col = lintColAt(k)
-    if ln >= 0 && ln < starts.length {
+    const code = cliLintCodeAt(k)
+    const ln = cliLintLineAt(k) - 1
+    const col = cliLintColAt(k)
+    // Entry module only (like the redundant-annotation block below): a graph
+    // lint carries other modules' findings, whose positions do not map onto
+    // `src` (the entry source being rewritten).
+    if cliLintModAt(k) == 0 && ln >= 0 && ln < starts.length {
       const off = starts[ln] + col
       if code == "prefer-const" {
         if (

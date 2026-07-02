@@ -40,9 +40,13 @@
 //                           name downgrades to a `hint`; exported top-level
 //                           bindings are exempt).
 //   - prefer-const        : a `let` that is read but never reassigned.
+//   - unused-import       : an `ImportDecl` local binding never referenced in
+//                           its own module — by an `Ident` occurrence resolving
+//                           to it (binding-keyed, via the scope stack), a UFCS
+//                           member-call property, or a TYPE position (an
+//                           annotation/`is`/union-variant name segment).
 //
 // NOT ported (need metadata the native front end does not produce):
-//   - unused-import       : no `isImport` binding flag in the native model.
 //   - empty-intersection  : needs the `emptyIntersectionInfo` records the type
 //     checker attaches; the native type checker ALREADY emits the equivalent
 //     `never`-type error itself, so the standalone lint adds nothing here.
@@ -71,6 +75,7 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
@@ -84,7 +89,9 @@ import {
   Program,
   RetStmt,
   TypeDecl,
+  TypeRef,
   Unary,
+  UnionDecl,
   WhileStmt,
 } from "./ast"
 import { P, declNameTokOf, nodeToks } from "./ast"
@@ -214,6 +221,7 @@ export function lint(progRoot: i32) {
     // and unused-function alike, so collect it once first.
     collectBindingsAndRefs(progRoot)
     unusedBindings()
+    unusedImports()
     unusedFunctions(stmts)
     preferConst()
     lintWalk(lintRuleUnreachable, progRoot)
@@ -550,6 +558,83 @@ function refNamesAdd(name: string) {
   0
 }
 
+// ── Import-use side channels (unused-import) ─────────────────────────────────
+// An import can be used in ways an `Ident` occurrence never captures:
+//   - a UFCS member-call `x.m(…)` dispatching to an imported free function `m`
+//     (the property is a string on the `Member`, not an `Ident` — and it names
+//     the FUNCTION regardless of any local shadowing, so it must not ride the
+//     binding-keyed channel);
+//   - a TYPE position: an annotation (`p: Point`, `Box<Point>`, `Tok[]`), an
+//     `x is T` guard, or a union alias's variant list — type names never appear
+//     as value `Ident`s.
+// Two name SETS collect those (populated by `nameVisit` and the flat arena scan
+// `collectTypeNameRefs`); `unusedImports` consults them alongside the
+// binding-keyed `declUsed` flag.
+let lintPropNames: {[string]: i32} = Map()
+
+function propNamesHas(name: string) { (lintPropNames[name] ?? 0) != 0 }
+
+function propNamesAdd(name: string) {
+  lintPropNames[name] = 1
+  0
+}
+
+let lintTypeNames: {[string]: i32} = Map()
+
+function typeNamesHas(name: string) { (lintTypeNames[name] ?? 0) != 0 }
+
+// Add every maximal identifier RUN of a (possibly compound) type-annotation
+// name to the type-name set: `Box<Point>` → Box, Point; `i32[]` → i32;
+// `{[string]: Tok}` → string, Tok; `A | B` → A, B. Segment-wise because the
+// parser folds compound annotations into a single synthetic name string.
+function typeNamesAddSegments(name: string) {
+  let run: i32[] = []
+  let i = 0
+  while i <= name.length {
+    let isIdent = false
+    if i < name.length {
+      const c = name[i]
+      if c >= 'a' && c <= 'z' { isIdent = true }
+      if c >= 'A' && c <= 'Z' { isIdent = true }
+      if c >= '0' && c <= '9' { isIdent = true }
+      if c == '_' { isIdent = true }
+    }
+    if isIdent {
+      run.push(name[i])
+    } else if run.length > 0 {
+      lintTypeNames[fromCodePoints(run)] = 1
+      run = []
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Flat arena scan for TYPE-position name references. Position-independent (type
+// names have no value scope here), so a flat pass over `P.nodes` covers every
+// annotation slot — including the ones the scope-aware `bindScan` skips (a
+// `let`'s/param's/return's `TypeRef` child) — plus `is` guards and union
+// variant lists. Struct-field annotations are `TypeRef` arena nodes too.
+function collectTypeNameRefs() {
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is TypeRef {
+      typeNamesAddSegments(n.tyName)
+    } else if n is IsExpr {
+      typeNamesAddSegments(n.isVariant)
+    } else if n is UnionDecl {
+      let v = 0
+      while v < n.udVariants.length {
+        typeNamesAddSegments(n.udVariants[v])
+        v = v + 1
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // ── Binding-keyed use/write tracking (the scope-aware scan) ──────────────────
 // unused-variable and prefer-const key on BINDING IDENTITY, not name: each
 // `let`/`const`/parameter declaration gets an entry in `declNodes`/`declKinds`
@@ -580,11 +665,16 @@ let declWritten: i32[] = []
 let visNames: string[] = []
 let visIds: i32[] = []
 
-// Register the declaration at node `ix` (kind 0 = let/const, 1 = param) and
-// push it onto the scope stack; returns its `declNodes` index.
-function bindPush(name: string, ix: i32, kind: i32) {
+// Register the declaration at node `ix` (kind 0 = let/const, 1 = param, 2 =
+// import local) and push it onto the scope stack. `tok` is the binding's NAME
+// token when the node itself can't provide it (an `ImportDecl` declares SEVERAL
+// names, so `declNameTokOf` is ambiguous — kind 2 passes its per-name token);
+// kinds 0/1 pass -1 and their consumers keep reading `declNameTokOf`.
+function bindPush(name: string, ix: i32, kind: i32, tok: i32) {
   declNodes.push(ix)
   declKinds.push(kind)
+  declNames.push(name)
+  declToks.push(tok)
   declUsed.push(0)
   declWritten.push(0)
   visNames.push(name)
@@ -634,8 +724,14 @@ function nameVisit(ix: i32) {
     // Member callee's property name (the UFCS method name the call dispatches to).
     if n.callFn >= 0 && n.callFn < P.nodes.length {
       const fn = P.nodes[n.callFn]
-      if fn is Ident { refNamesAdd(fn.identName) }
-      else if fn is Member { refNamesAdd(fn.memProp) }
+      if fn is Ident {
+        refNamesAdd(fn.identName)
+      } else if fn is Member {
+        refNamesAdd(fn.memProp)
+        // A UFCS property names the FUNCTION it dispatches to regardless of any
+        // local shadowing — record it on the import-use side channel too.
+        propNamesAdd(fn.memProp)
+      }
     }
   } else if n is Ident {
     // Every occurrence counts as a use — including an assignment LHS (the TS
@@ -682,15 +778,27 @@ function bindScan(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
   if n is Program {
-    // Hoist top-level `let`s: bind them all first, so a use inside a function
-    // declared ABOVE the global still resolves to it, then scan statements.
+    // Hoist top-level `let`s AND import locals: bind them all first, so a use
+    // inside a function declared ABOVE the global still resolves to it, then
+    // scan statements. An `ImportDecl` registers one kind-2 binding PER LOCAL
+    // (its `as` alias, else the name), each with its own name token.
     const mark = visNames.length
     let h = 0
     while h < n.progStmts.length {
       const six = n.progStmts[h]
       if six >= 0 && six < P.nodes.length {
         const s = P.nodes[six]
-        if s is LetDecl { bindPush(s.letName, six, 0) }
+        if s is LetDecl {
+          bindPush(s.letName, six, 0, -1)
+        } else if s is ImportDecl {
+          let q = 0
+          while q < s.impLocals.length {
+            let qTok = -1
+            if q < s.impNameToks.length { qTok = s.impNameToks[q] }
+            bindPush(s.impLocals[q], six, 2, qTok)
+            q = q + 1
+          }
+        }
       }
       h = h + 1
     }
@@ -718,7 +826,7 @@ function bindScan(ix: i32) {
     // Initializer first (reads the OUTER binding on a same-name init), then the
     // binding — visible until the enclosing scope's trim.
     bindScanLetInit(ix)
-    bindPush(n.letName, ix, 0)
+    bindPush(n.letName, ix, 0, -1)
   } else if n is FuncDecl {
     // A function scope: parameters, then the body block.
     const mark = visNames.length
@@ -727,7 +835,7 @@ function bindScan(ix: i32) {
       const pix = n.fnParams[p]
       if pix >= 0 && pix < P.nodes.length {
         const pn = P.nodes[pix]
-        if pn is Param { bindPush(pn.parName, pix, 1) }
+        if pn is Param { bindPush(pn.parName, pix, 1, -1) }
       }
       p = p + 1
     }
@@ -763,13 +871,18 @@ function bindScan(ix: i32) {
 
 function collectBindingsAndRefs(progRoot: i32) {
   lintRefNames = Map()
+  lintPropNames = Map()
+  lintTypeNames = Map()
   declNodes = []
   declKinds = []
+  declNames = []
+  declToks = []
   declUsed = []
   declWritten = []
   visNames = []
   visIds = []
   bindScan(progRoot)
+  collectTypeNameRefs()
   0
 }
 
@@ -799,11 +912,15 @@ function declIsExported(ix: i32) {
 // local), and a use the scan cannot resolve to a scope entry marks no binding.
 
 // Declarations to consider, registered by `bindPush` in scan order (source
-// order). Parallel arrays: the declaring node index and a KIND (0 = variable
-// `let`/`const`, 1 = parameter). De-dup is unnecessary — each declaration is
-// one node, bound exactly once.
+// order). Parallel arrays: the declaring node index, a KIND (0 = variable
+// `let`/`const`, 1 = parameter, 2 = import local), the declared NAME, and the
+// name TOKEN (kind 2 only; -1 elsewhere — kinds 0/1 read `declNameTokOf`).
+// De-dup is unnecessary — each declaration is one node, bound exactly once
+// (one entry PER NAME for an `ImportDecl`, which declares several).
 let declNodes: i32[] = []
 let declKinds: i32[] = []
+let declNames: string[] = []
+let declToks: i32[] = []
 
 // The declared NAME of a `let`/`const` (kind 0) or parameter (kind 1) node.
 function declNameOf(ix: i32, kind: i32): string {
@@ -829,6 +946,12 @@ function unusedBindings() {
   while i < declNodes.length {
     const ix = declNodes[i]
     const kind = declKinds[i]
+    if kind == 2 {
+      // Import locals are the unused-import rule's (its own code, message, and
+      // use channels) — never "unused variable"s.
+      i = i + 1
+      continue
+    }
     const name = declNameOf(ix, kind)
     // A binding some occurrence resolved to (read OR written) is used — not dead.
     if declUsed[i] == 0 {
@@ -863,6 +986,38 @@ function unusedBindings() {
             nameTok,
           )
         }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// unused-import: an import local (kind-2 binding) never referenced in its own
+// module. USED means any of the three channels hit:
+//   - an `Ident` occurrence resolved to the binding (binding-keyed — the scope
+//     stack, so a use of a SHADOWING local does not spare the import);
+//   - a UFCS member-call property naming it (`x.m(…)` dispatches to the free
+//     function by name, unaffected by value shadowing);
+//   - a TYPE position naming it (annotation segment, `is` guard, union variant).
+// Message/severity/code mirror the retired TS rule (`Unused import `x` (remove
+// it)`, warning, `unused-import` — the code the LSP remove-import quick-fix
+// dispatches on). No `_`-downgrade: an import has no `_`-prefix suppression
+// (that would need aliasing); the fix is to remove the specifier. Anchored at
+// the imported NAME token. A re-export never registers a binding (it is not an
+// `ImportDecl`), so re-exported names are never flagged.
+function unusedImports() {
+  let i = 0
+  while i < declNodes.length {
+    if declKinds[i] == 2 && declUsed[i] == 0 {
+      const name = declNames[i]
+      if !propNamesHas(name) && !typeNamesHas(name) {
+        lintEmitAtTok(
+          "unused-import",
+          "Unused import `" + name + "` (remove it)",
+          "warning",
+          declToks[i],
+        )
       }
     }
     i = i + 1

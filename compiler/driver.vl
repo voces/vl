@@ -472,6 +472,99 @@ export function lintCodeByte(i: i32, j: i32): i32 { lintCodeAt(i)[j] }
 export function lintLine(i: i32): i32 { lintLineAt(i) }
 export function lintCol(i: i32): i32 { lintColAt(i) }
 
+// ── Module-graph lint (per-module, with file attribution) ─────────────────────
+// Run the lint pass over EVERY resolved module of the committed graph — not just
+// the entry — so an unused local in an imported file (or an unused import in the
+// importer) is reported against THAT file. Each module is re-parsed IN ISOLATION
+// (its own arena — the merged/renamed program would leak `name$mN` mangles into
+// messages and break the token-scan `export` detection), linted, and its findings
+// copied into the accumulators below with the owning module's TABLE index (the
+// same index `diagModule`/`cliModKeys` use). A module that fails to parse is
+// skipped (the error tier already reported it); a missing module (`modFound` 0)
+// likewise. With an EMPTY module table this lints `vcSource()` as module 0 —
+// byte-compatible with `lintSrc` — so callers can use it unconditionally.
+// Returns the total finding count. NOTE: like `lintSrc`, this resets `P.toks`/
+// `nodeToks`, so error-tier anchors (`diagModule`) must be read BEFORE calling.
+let lgCodes: string[] = []
+let lgMsgs: string[] = []
+let lgSevs: string[] = []
+let lgLines: i32[] = []
+let lgCols: i32[] = []
+let lgMods: i32[] = []
+
+// Copy the lint sink (one module's `lint(root)` run) into the graph accumulators
+// under module index `m`.
+function lgCopySink(m: i32): i32 {
+  let i = 0
+  while i < lintCount() {
+    lgCodes.push(lintCodeAt(i))
+    lgMsgs.push(lintMsgAt(i))
+    lgSevs.push(lintSevAt(i))
+    lgLines.push(lintLineAt(i))
+    lgCols.push(lintColAt(i))
+    lgMods.push(m)
+    i = i + 1
+  }
+  0
+}
+
+export function lintGraph(): i32 {
+  lgCodes = []
+  lgMsgs = []
+  lgSevs = []
+  lgLines = []
+  lgCols = []
+  lgMods = []
+  if modKeys.length == 0 {
+    // No graph: the single-source path (module 0 = the entry, like `lintSrc`).
+    if lintSrc() < 0 { return 0 }
+    lgCopySink(0)
+    return lgCodes.length
+  }
+  symSetEnabled(0)
+  let m = 0
+  while m < modKeys.length {
+    if modFound[m] != 0 {
+      P.toks = []
+      P.nodes = []
+      P.diags = []
+      vcDiagMemoReset()
+      P.pos = 0
+      nodeToks = []
+      declNameTok = []
+      vcDgIdx = []
+      vcDgLine = []
+      vcDgCol = []
+      vcDgMod = []
+      vcLoadMod = 0
+      vcLoadToksMod(m)
+      const root = parseProgram()
+      if P.diags.length == 0 {
+        lint(root)
+        lgCopySink(m)
+      }
+    }
+    m = m + 1
+  }
+  lgCodes.length
+}
+
+// Per-finding accessors (the `lint*` idiom, plus the owning module's index).
+export function lintGraphCount(): i32 { lgCodes.length }
+export function lintGraphModule(i: i32): i32 { lgMods[i] }
+export function lintGraphLine(i: i32): i32 { lgLines[i] }
+export function lintGraphCol(i: i32): i32 { lgCols[i] }
+export function lintGraphSevLen(i: i32): i32 { lgSevs[i].length }
+export function lintGraphSevByte(i: i32, j: i32): i32 { lgSevs[i][j] }
+export function lintGraphMsgLen(i: i32): i32 { lgMsgs[i].length }
+export function lintGraphMsgByte(i: i32, j: i32): i32 { lgMsgs[i][j] }
+export function lintGraphCodeLen(i: i32): i32 { lgCodes[i].length }
+export function lintGraphCodeByte(i: i32, j: i32): i32 { lgCodes[i][j] }
+// String reads for same-assembly consumers (the CLI): the code/sev/msg values.
+export function lintGraphCodeAt(i: i32): string { lgCodes[i] }
+export function lintGraphSevAt(i: i32): string { lgSevs[i] }
+export function lintGraphMsgAt(i: i32): string { lgMsgs[i] }
+
 // ── Format tier (kill-TS step 1) ──────────────────────────────────────────────
 // Run the AST-driven formatter (compiler/format.vl) over the current source and
 // expose its canonical-form output as a string, so the native `vl fmt` and the
