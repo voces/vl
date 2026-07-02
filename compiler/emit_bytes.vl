@@ -4,13 +4,7 @@
 // use. It reads/writes the shared `emit_state` and calls the pure lower modules, but
 // never the lowering — a clean layer (`emit_state → emit_bytes → wasmEmit`).
 
-import {
-  f32Bytes,
-  f64Bytes,
-  nullablePartOf,
-  slebToArr,
-  ulebToArr,
-} from "./emit_base"
+import { f32Bytes, f64Bytes, nullablePartOf } from "./emit_base"
 import {
   MfKind,
   VKind,
@@ -186,15 +180,41 @@ export function wBytes(bs: i32[]) {
   0
 }
 // Streaming unsigned-LEB: append straight to the current buffer (used for
-// section-length framing and operand encoding). The `*ToArr` array forms are
-// retained for the few sites that genuinely compose a fresh payload array.
+// section-length framing and operand encoding). A direct 7-bit shift loop —
+// one LEB is written per wasm operand, so this path must not allocate.
 export function wULEB(value: i32) {
-  wBytes(ulebToArr(value))
+  let v = value
+  let more = true
+  while more {
+    const byte = v & 0x7f
+    v = v >>> 7
+    if v == 0 {
+      curBuf.push(byte)
+      more = false
+    } else {
+      curBuf.push(byte | 0x80)
+    }
+  }
   0
 }
-// Streaming signed-LEB: append straight to the current buffer.
+// Streaming signed-LEB: append straight to the current buffer. Same shift loop
+// with the SLEB termination rule: stop once the remaining value is all-0 with
+// the sign bit clear, or all-1 with the sign bit set.
 export function wSLEB(value: i32) {
-  wBytes(slebToArr(value))
+  let v = value
+  let more = true
+  while more {
+    const byte = v & 0x7f
+    v = v >> 7
+    let signBit = 0
+    if (byte & 0x40) != 0 { signBit = 1 }
+    if (v == 0 && signBit == 0) || (v == -1 && signBit == 1) {
+      curBuf.push(byte)
+      more = false
+    } else {
+      curBuf.push(byte | 0x80)
+    }
+  }
   0
 }
 // Write a name: ULEB(byte length) followed by its UTF-8 bytes. For an ASCII
