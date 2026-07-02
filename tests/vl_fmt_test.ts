@@ -883,3 +883,107 @@ Deno.test({
     }
   },
 });
+
+// `vl check` runner for the safety-gate tests (the parse/type oracle).
+const runCheck = async (path: string): Promise<{ code: number; err: string }> => {
+  const cmd = new Deno.Command(VL, {
+    args: ["check", path, "--compiler", COMPILER],
+    stdout: "piped",
+    stderr: "piped",
+    env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+  });
+  const { code, stderr } = await cmd.output();
+  return { code, err: new TextDecoder().decode(stderr) };
+};
+
+Deno.test({
+  name: "vl-fmt: unparseable input gets a diagnostic + exit 2 and is never touched",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      const bad = "const x =\n";
+      const f = `${dir}/bad.vl`;
+      await Deno.writeTextFile(f, bad);
+      // Plain stdout mode: nothing printed, a stderr note, exit 2.
+      const plain = await run([f]);
+      if (plain.code !== 2) throw new Error(`expected exit 2, got ${plain.code}:\n${plain.err}`);
+      if (plain.out !== "") throw new Error(`expected no stdout for a parse-error file:\n${plain.out}`);
+      if (!/parse error/.test(plain.err) || !/not formatted/.test(plain.err)) {
+        throw new Error(`expected a parse-error note on stderr:\n${plain.err}`);
+      }
+      // -w: exit 2, the file is untouched.
+      const w = await run(["-w", f]);
+      if (w.code !== 2) throw new Error(`expected -w exit 2, got ${w.code}:\n${w.err}`);
+      if ((await Deno.readTextFile(f)) !== bad) throw new Error("-w must not touch a parse-error file");
+      // --check over a dir with one bad + one drifted file: the parse error
+      // outranks drift (exit 2) and BOTH notes surface.
+      await Deno.writeTextFile(`${dir}/drift.vl`, UNFORMATTED);
+      const chk = await run(["--check", dir]);
+      if (chk.code !== 2) throw new Error(`expected --check exit 2, got ${chk.code}:\n${chk.err}`);
+      if (!/bad\.vl: parse error/.test(chk.err) || !/drift\.vl: not formatted/.test(chk.err)) {
+        throw new Error(`expected both the parse-error and drift notes:\n${chk.err}`);
+      }
+      // stdin: the input passes through (a mid-pipeline fmt never eats data),
+      // with the note + exit 2 carrying the failure.
+      const sin = await run([], bad);
+      if (sin.code !== 2) throw new Error(`expected stdin exit 2, got ${sin.code}:\n${sin.err}`);
+      if (sin.out !== bad) throw new Error(`stdin must pass unparseable input through:\n${sin.out}`);
+      if (!/<stdin>.*parse error/.test(sin.err)) {
+        throw new Error(`expected a <stdin> parse-error note:\n${sin.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: the round-trip gate — `fmt -w` never leaves a valid program broken",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      // A valid program from the formatter's historic worst case (a comment in a
+      // non-collapsible if-expression branch — the N2 corruption repro). The
+      // invariant under test is the GATE's guarantee, not the printer's output:
+      // after `fmt -w` the file must still parse+check — either the printer
+      // handled it (exit 0) or the gate kept the original bytes (exit 3, loud
+      // note). Silent corruption is the one forbidden outcome.
+      const src =
+        "function pick(c: boolean): i32 {\n" +
+        "  const x = if c {\n" +
+        "    // pick one\n" +
+        "    log(1)\n" +
+        "    1\n" +
+        "  } else {\n" +
+        "    2\n" +
+        "  }\n" +
+        "  return x\n" +
+        "}\n" +
+        "function log(n: i32) { print(n) }\n" +
+        "print(pick(true))\n";
+      const f = `${dir}/gate.vl`;
+      await Deno.writeTextFile(f, src);
+      const pre = await runCheck(f);
+      if (pre.code !== 0) throw new Error(`fixture must check clean before fmt:\n${pre.err}`);
+      const w = await run(["-w", f]);
+      if (w.code !== 0 && w.code !== 3) {
+        throw new Error(`expected exit 0 (formatted) or 3 (gate), got ${w.code}:\n${w.err}`);
+      }
+      const after = await Deno.readTextFile(f);
+      if (w.code === 3) {
+        if (after !== src) throw new Error("gate exit 3 must leave the file byte-identical");
+        if (!/formatter produced invalid output — file left unchanged/.test(w.err)) {
+          throw new Error(`expected the loud gate note:\n${w.err}`);
+        }
+      }
+      const post = await runCheck(f);
+      if (post.code !== 0) {
+        throw new Error(`fmt -w broke a valid program (gate failed):\n${after}\n${post.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
