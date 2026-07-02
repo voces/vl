@@ -74,11 +74,6 @@ decoy that could ADMIT the carrier literal — `i64 | i32` with a small literal,
 member word — makes the checker's variant pick legitimate either way).
 
 ## Soundness holes — INVALID WASM at depth 1–2 (minimal repros)
-- **`const v: f64 | null = null`** — an actual `null` into a nullable-f64 LOCAL → `expected i32,
-  found f64`. The non-null carrier works; `i64|null`, `f32|null`, `boolean|null` with `null` all work.
-- **`(f64 | null)[] = [8161.5]`** and **`(boolean | null)[] = [true]`** — CONSTRUCTING a
-  nullable-f64/boolean list from a value → invalid wasm (`(i32|null)[]` works; the READ side of the
-  f64 case is a clean reject — the construct-only variant exposed it).
 - **Lambda returning a struct with an i64 field**: `const v: () => {f: i64} = () => ({f: 6000000000})`
   → invalid wasm in the lambda body (`expected i32, found i64`); block-bodied variant breaks at the
   CALL side instead (`v().f` reads i32). A NAMED function value (`const v: () => {f: i64} = mk`) works.
@@ -89,8 +84,6 @@ member word — makes the checker's variant pick legitimate either way).
   Locals + params of the same types work (params of some shapes are clean rejects).
 - **Union PARAM carrying an i64 literal**: `useIt(5000000077)` into `useIt(p: f64 | i64)` → invalid
   wasm in the callee (the local binding works).
-- **Multi-field struct with an i64-list field as a union variant**: `{a: i32, f: i64[]} | i32`
-  construct → invalid wasm (single-field `{f: i64[]} | i32` and i32[]/f64[]/string[] fields work).
 - **GLOBAL initializers of composite shapes** — `const g: {f: K0[]} = {f: ["aa"]}` → the emitted
   MODULE fails to parse (invalid global init, `failed to parse WebAssembly module`); many p3 shapes
   in the baseline (`{a,f,z}` with union/atom-list/f32 fields, `() => i64 | boolean`, lists of
@@ -102,10 +95,37 @@ member word — makes the checker's variant pick legitimate either way).
   boxed with a non-i64[] tag, and the checker accepts the widening — checker/emitter disagreement.
   Also seen: `({[string]: i32} | boolean)[]` loses the map variant's tag (depth-1 map-in-union is a
   clean reject; the list wrapper turns it into a silent mis-tag).
-- **boolean prints as 0/1 instead of false/true** through: a struct FIELD read (`{f: boolean}` —
-  depth 1!), a map `??` result, a closure-call result (`(i32) => boolean`), and a `boolean[]`
-  PARAM's element (a local `boolean[]` element prints `true`). print's boolean rendering is
-  type-driven and these read paths surface the value as bare i32.
+## FIXED (nullable/union rep seams + the boolean print classifier)
+- **`const v: f64 | null = null` → invalid wasm**: `scanPrintUse` matched f64 annotations with an
+  EXACT `== "f64"` compare (i64/f32 use a contains match), so a program whose only f64 mention is
+  the `f64 | null` annotation (a null carrier has no float literal) never imported `__print_f64__`
+  and the narrowed `print` called import 0 with an f64 on the stack. Fix: the same contains match
+  the i64/f32 forms use. Fixture: `unions/nullable-f64-local.vl`.
+- **`(f64 | null)[]` / `(i64 | null)[]` construct → invalid wasm**: two seams. The scalar-list
+  `let` classifiers' INIT fallback (`letIsF64Array` & siblings) claimed a binding whose ANNOTATION
+  is a ref array — the slot became a scalar f64/i64 list while the literal built the kind-2
+  union-box list. And `emitArr`'s kind-2 override cleared the f64/string literal claims but not
+  the i64 one. Fix: a ref-array annotation is authoritative (the fallback is skipped), and kind 2
+  clears `isI64Lit`. Fixture: `lists/nullable-scalar-elem-list.vl`.
+- **`(boolean | null)[]` / `(string | null)[]` construct → invalid wasm**: the element is a NICHE
+  nullable (one non-null member + null — deliberately not a value union, no box rep), and the
+  kind-2 lowering emitted its raw value. No list rep exists for these elements; `collectA` now
+  rejects cleanly ("a nullable-boolean list element has no rep") — pinned in the fuzz baseline as
+  REJECT shapes (the corpus harness cannot assert emit-time errors, so no `@error` fixture).
+- **Union variant with a scalar-list field (`{a: i32, f: i64[]} | i32`) construct → invalid
+  wasm/clean fail**: the variant-field collectors never forced the scalar-list backing/wrapper
+  types (`forceScalarListField`, which struct fields already call), and `emitVariantStruct`
+  threaded the element-kind context only for ref/string list fields — an i64[] field's
+  small-literal elements built an i32 list into the i64-list slot. Fixture:
+  `unions/variant-scalar-list-field.vl`. (The field READ back out of the variant is a separate,
+  still-open composition gap — it fails loudly.)
+- **boolean prints 0/1 instead of true/false** through a struct FIELD read (`{f: boolean}` — depth
+  1!), a map `??` result, a closure-call result, and a `boolean[]` PARAM element: boolean shares
+  the i32 rep everywhere and the syntactic print-routing lost the tag on exactly the read paths
+  with no boolean-carrying table. Fix: `exprIsBool` consults the checker's recorded node type
+  first (`nodeTyWidenedRepName` — the same typed-IR fast path `exprIsF64` has), which covers all
+  four paths at once; 5 existing fixtures that had frozen the 0/1 rendering were updated to
+  true/false, and 14 baseline shapes graduated. Fixture: `functions/boolean-print-paths.vl`.
 
 ## Clean-reject families (fail-loudly long tail — NOT bugs, for the record)
 Map params (`only i32, i64, f64, f32, boolean, struct, union, array, or string parameters`) · map
