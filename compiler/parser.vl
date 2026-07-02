@@ -75,6 +75,7 @@ import {
   mkFunc,
   mkIdent,
   mkIf,
+  mkImport,
   mkIndex,
   mkIsExpr,
   mkIsExprNeg,
@@ -1830,14 +1831,82 @@ export function parseStmt() {
   parseExpr()
 }
 
-// Consume an `import { a, b, … } from "path"` (or `import x from "path"`)
-// statement, the cursor on the leading `import`. Import binding is the module
-// front end's job (each module is parsed separately and merged into one
-// program, mirroring the host's `modules.ts`), so an import is a NO-OP for the
-// AST — it is consumed and produces no node. Tokens up to and INCLUDING the
-// trailing path STRING are skipped (the `from` clause keyword rides as an
-// `IDENT`, so it needs no dedicated keyword).
-function skipImport() { skipModuleClause("import") }
+// Parse an `import { a, b as c, … } from "path"` (or `import x from "path"`)
+// statement into an `ImportDecl` node, the cursor on the leading `import`.
+// Import BINDING stays the module front end's job (the driver's token-level
+// `modScan` is the resolver and never reads this node) — the node exists for
+// AST consumers (the lint tier: a never-referenced imported name). Token
+// consumption is IDENTICAL to the old skip (`skipModuleClause`): tokens up to
+// and INCLUDING the trailing path STRING (the `from` clause keyword rides as an
+// `IDENT`), BOUNDED by a NEWLINE/SEMI outside the braces or a statement-start
+// keyword — a malformed clause missing its path literal is diagnosed here
+// instead of silently swallowing code up to the next unrelated string literal.
+// Only brace-list names are recorded (`a` / `a as b`, each with its NAME
+// token); a bare `import x from "path"` records no names — a pure graph edge,
+// exactly `modScan`'s reading.
+function parseImport(): i32 {
+  const kwAt = P.pos // the `import` keyword, anchor for the diagnostic
+  const p0 = peekTok().start
+  advance()
+  let depth = 0 // `{ … }` nesting — a NEWLINE inside the name list is legal
+  let found = false
+  let going = true
+  const names: string[] = []
+  const locals: string[] = []
+  const nameToks: i32[] = []
+  let path = ""
+  while going {
+    let k = peekKind()
+    if k == "STRING" {
+      // The path literal — the statement ends here. The STRING token's `text`
+      // keeps its surrounding quotes (mirroring `modScan`): strip them.
+      let raw = advance().text
+      if raw.length >= 2 {
+        if raw[0] == '"' && raw[raw.length - 1] == '"' {
+          raw = raw.slice(1, raw.length - 1)
+        }
+      }
+      path = raw
+      found = true
+      going = false
+    } else if k == "EOF" {
+      going = false
+    } else if (k == "NEWLINE" || k == "SEMI") && depth == 0 {
+      going = false
+    } else if isStmtKeyword(k) {
+      going = false // a name list never contains these — an unclosed clause
+    } else {
+      if k == "LBRACE" { depth = depth + 1 }
+      if k == "RBRACE" && depth > 0 { depth = depth - 1 }
+      if k == "IDENT" && depth == 1 {
+        // One name-list item: `a` or `a as b` (the `as` rides as an IDENT).
+        // On the rename form, consume through the `as` so the loop's shared
+        // `advance()` below lands past the alias — the same tokens the old
+        // skip consumed one at a time.
+        const nmTok = P.pos
+        const nm = peekTok().text
+        let loc = nm
+        if kindAt(P.pos + 1) == "IDENT" && kindAt(P.pos + 2) == "IDENT" {
+          if P.toks[P.pos + 1].text == "as" {
+            advance() // the source name
+            advance() // `as` — the cursor lands on the local alias
+            loc = peekTok().text
+          }
+        }
+        names.push(nm)
+        locals.push(loc)
+        nameToks.push(nmTok)
+      }
+      advance()
+    }
+  }
+  if !found {
+    P.diags.push(
+      { msg: "malformed import: expected a module path string literal", at: kwAt },
+    )
+  }
+  mkImport(path, names, locals, nameToks, p0)
+}
 
 // Consume a RE-EXPORT `export { a, b as c, … } from "path"`, the cursor on the
 // leading `export`. Like an import, it is a module-front-end concern (the merge
@@ -1847,8 +1916,8 @@ function skipImport() { skipModuleClause("import") }
 // from an `export function/let/const/type` by the `{` immediately after `export`.
 function skipReexport() { skipModuleClause("re-export") }
 
-// The shared skip for both module-statement forms, the cursor on the leading
-// `import`/`export` keyword. Skips the clause — a brace-enclosed name list
+// The bounded skip for the re-export form, the cursor on the leading
+// `export` keyword. Skips the clause — a brace-enclosed name list
 // `{ … }` (which may span lines) or a bare name — then the `from` identifier
 // and the path string literal. The skip is BOUNDED: a NEWLINE/SEMI outside the
 // braces or a statement-start keyword anywhere ends it, so a malformed clause
@@ -1902,7 +1971,7 @@ export function parseProgram() {
     let k = peekKind()
     if k == "EOF" { going = false }
     else if k == "NEWLINE" || k == "SEMI" { advance() }
-    else if k == "IMPORT" { skipImport() }
+    else if k == "IMPORT" { stmts.push(parseImport()) }
     else if k == "EXPORT" && kindAt(P.pos + 1) == "LBRACE" { skipReexport() }
     else { stmts.push(parseStmt()) }
   }
