@@ -42,7 +42,7 @@
 // `P`, and the arena `mk*` constructors. The parser's own `advance`/`peekTok`
 // cursor primitives stay PRIVATE to this module.
 import { mkMatch } from "./ast"
-import { Ident, P, Tok, mkDeclNameTok } from "./ast"
+import { BinExpr, Ident, P, Tok, mkDeclNameTok } from "./ast"
 import {
   mkArrayLit,
   mkBinary,
@@ -944,6 +944,7 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
     if prec == 0 || prec < minPrec {
       going = false
     } else {
+      const opTok = P.pos // the operator token (anchors the mixing diagnostic)
       const opText = advance().text
       // A binary operator at END of a line continues onto the next: the operand is on
       // the following source line, so a NEWLINE (or SEMI) token may sit between the
@@ -961,11 +962,54 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
         // with the surface op so the printer reprints `a += b` (see `mkCompoundAssign`).
         acc = mkCompoundAssign(opText.slice(0, 1), acc, right, leftPos)
       } else {
+        // `??` never shares an UNPARENTHESIZED operand chain with `||`/`&&`
+        // (the JS rule): `??` and `||` sit on one precedence tier here, so
+        // `a ?? b || c` would silently group left-to-right — a coin-flip for
+        // the reader. Demand explicit parentheses instead. A `Paren` operand
+        // is explicit grouping; only a DIRECT `BinExpr` operand of the other
+        // family trips the error.
+        const mixed = coalesceMixOp(opText, acc, right)
+        if mixed != "" {
+          P.diags.push(
+            {
+              msg: "unparenthesized `??` mixed with `" +
+                mixed +
+                "` — add parentheses to make the grouping explicit",
+              at: opTok,
+            },
+          )
+        }
         acc = mkBinary(opText, acc, right, leftPos)
       }
     }
   }
   acc
+}
+
+// The `binOp` of node `ix` when it is a (non-parenthesized) binary expression, else "".
+function binOpOf(ix: i32) {
+  if ix >= 0 && ix < P.nodes.length {
+    const n = P.nodes[ix]
+    if n is BinExpr { return n.binOp }
+  }
+  ""
+}
+
+// Building `l op r`: does the coalesce-vs-logical mixing rule fire? Returns the
+// CONFLICTING operator's text (for the diagnostic), or "" when the mix is fine.
+function coalesceMixOp(op: string, l: i32, r: i32) {
+  if op == "??" {
+    const lo = binOpOf(l)
+    if lo == "||" || lo == "&&" { return lo }
+    const ro = binOpOf(r)
+    if ro == "||" || ro == "&&" { return ro }
+    return ""
+  }
+  if op == "||" || op == "&&" {
+    if binOpOf(l) == "??" { return op }
+    if binOpOf(r) == "??" { return op }
+  }
+  ""
 }
 
 // The expression entry point: a unary operand, then binary precedence climbing
