@@ -1,0 +1,3107 @@
+// `emit_collect.vl` — the emitter's COLLECTION passes: the pre-lowering walks
+// that fill the shared emitter tables (`emit_state.vl`) before any bytes are
+// emitted — function/global gathering + lambda lifting (`collectFns`), closure
+// signatures, per-function locals and scratch-slot scans, shape/union/ref-list
+// table builds (`collectA`/`collectS`/`collectU`, annotation + anonymous
+// shapes), return-kind inference (`computeRetInference`), and the heap-type
+// index assignment (`mAssignTypeIndices`). Consults the classifiers
+// (`emit_classify.vl`); writes no bytes. Carved out of `wasmEmit.vl`
+// (review N18).
+
+import {
+  inferLetCount,
+  inferLetNameOf,
+  inferLetTyAt,
+  inferRetCount,
+  inferRetNameByNode,
+  inferRetNameOf,
+  inferRetTyAt,
+  isValueUnionName,
+  nameIsLitUnionType,
+  nodeArrayElemIsLitUnion,
+  nodeArrayElemName,
+  nodeTyIsLitUnionAlias,
+  splitUnionAtoms,
+} from "./typecheck"
+import {
+  ArrayLit,
+  BinExpr,
+  Block,
+  Call,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  RetStmt,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+  i32ToStr,
+} from "./ast"
+import {
+  annArrowAt,
+  gaeLtAt,
+  isStructAtom,
+  isVariantBoxUnion,
+  mapValNameOf,
+  nameIsArray,
+  nameIsClosureArrayTy,
+  nameIsF32Array,
+  nameIsF64Array,
+  nameIsI64Array,
+  nameIsMap,
+  nameIsMapArray,
+  nameIsNulI32List,
+  nameIsNulString,
+  nameIsString,
+  nameIsStringArray,
+  nameNamesFunction,
+  nodeIsTypeDecl,
+  nullablePartOf,
+  parenUnionArrElemName,
+  retBoolFlag,
+  retF32Flag,
+  retF64Flag,
+  retI64Flag,
+  retNulStringFlag,
+  retStrFlag,
+  strContains,
+  strLess,
+  tyIsFuncType,
+  tyNameOf,
+  unionHasAtom,
+  unionStructAliasShape,
+  unwrapParen,
+} from "./emit_base"
+import {
+  blockHasValuedReturn,
+  exprIsIfStmt,
+  ifArmValueExpr,
+  letIsF32,
+  letIsNulClosure,
+  nliScanStmts,
+} from "./emit_query"
+import {
+  VKind,
+  aTypeIdx,
+  aUsed,
+  cloSigBase,
+  cloSigKeys,
+  cloSigRepFn,
+  cloStructIdx,
+  criChanged,
+  fRetBool,
+  fRetF32,
+  fRetF64,
+  fRetI64,
+  fRetListKind,
+  fRetMap,
+  fRetNul,
+  fRetNulStr,
+  fRetRArrElem,
+  fRetRef,
+  fRetStr,
+  fRetStructIdx,
+  fRetUni,
+  fRetVoid,
+  fa32TypeIdx,
+  fa32Used,
+  fa64TypeIdx,
+  fa64Used,
+  fl32TypeIdx,
+  fl64TypeIdx,
+  fnDispNames,
+  fnEnvIdx,
+  fnIndices,
+  fnListEqRSlots,
+  fnNameMap,
+  fnNames,
+  fnParent,
+  fnStmts,
+  fnUsesListEqI,
+  fnUsesListEqS,
+  fnUsesMapFilter,
+  fnUsesMapKeys,
+  fnUsesMapVals,
+  fnUsesStrOp,
+  fnValUsed,
+  gaeBases,
+  gaeFieldCount,
+  gaeFieldNames,
+  gaeFieldStart,
+  gaeFieldTyNames,
+  gaeParams,
+  genTyParamNames,
+  globalNameMap,
+  globalNames,
+  globalStmts,
+  ia64TypeIdx,
+  ia64Used,
+  il64TypeIdx,
+  lTypeIdx,
+  lUsed,
+  lambdaCtr,
+  localLitUnion,
+  mNextType,
+  mStructIdx,
+  mUsed,
+  mkArrIdx,
+  mkListIdx,
+  mvMapTypeIdx,
+  mvRlSlot,
+  mvValKind,
+  mvValName,
+  mvValStructIdx,
+  narrowTop,
+  nestedNameSet,
+  nliLetIxs,
+  nliNames,
+  pendingNulRefHeap,
+  rElemKind,
+  raTypeIdx,
+  raUsed,
+  rlBackIdx,
+  rlElemHeap,
+  rlElemKindTbl,
+  rlElemName,
+  rlElemNullable,
+  rlTypeIdx,
+  rlUsed,
+  rlWrapIdx,
+  sDeclared,
+  sFieldCount,
+  sFieldElemName,
+  sFieldNames,
+  sFieldStart,
+  sFieldTypes,
+  sHeapIdx,
+  sNames,
+  slUsed,
+  startStmts,
+  uBoxIdx,
+  uDeclared,
+  uFieldCount,
+  uFieldElemName,
+  uFieldNames,
+  uFieldStart,
+  uFieldTypes,
+  uTags,
+  uVarIdx,
+  uVariants,
+  unMemberSet,
+  unNames,
+  unVarCount,
+  unVarStart,
+  vbF32Idx,
+  vbF32Used,
+  vbF64Idx,
+  vbF64Used,
+  vbI32Idx,
+  vbI32Used,
+  vbI64Idx,
+  vbI64Used,
+} from "./emit_state"
+import { emitFail } from "./emit_bytes"
+import {
+  addLocalName,
+  anonFieldCode,
+  anonFieldElemName,
+  arrLitElemKind,
+  arrLitElemName,
+  arrLitIsF64,
+  arrLitIsRef,
+  arrLitIsStr,
+  arrNewIntrKind,
+  blockTailIsValue,
+  callIsMemberPopKind,
+  captureCountOf,
+  checkArrName,
+  cloEqNoteBin,
+  cloRetIsString,
+  cloRetKindOf,
+  cloRetValKind,
+  cloRetValSlot,
+  cloSigKeyExt,
+  cloSigPosOfKey,
+  criClassify,
+  criWalkBlock,
+  ensureRefElem,
+  exprIsBareFnName,
+  exprMap,
+  fieldRefElemName,
+  fieldTypeCode,
+  fieldValueFeOf,
+  fnReturnsClosure,
+  fnSigKeyOf,
+  forInElemKind,
+  forInMapValsSlot,
+  forInRefArrayStructIdx,
+  forInStringSrc,
+  forceScalarListField,
+  gaeEnsure,
+  genTyParamArr,
+  ifExprNliName,
+  internInlineShape,
+  internShapeAs,
+  internShapeDeep,
+  isUName,
+  letAnnIsUninternedShape,
+  letBareUnwiredNulMapRead,
+  letInfersF32,
+  letInfersNulClosure,
+  letInitIsLitAtom,
+  letIsArray,
+  letIsClosure,
+  letIsF32Array,
+  letIsF64,
+  letIsF64Array,
+  letIsI64,
+  letIsI64Array,
+  letIsLitUnion,
+  letIsMap,
+  letIsNulListInfer,
+  letIsNulRef,
+  letIsNulRefArray,
+  letIsNulString,
+  letIsRefArray,
+  letIsString,
+  letIsStringArray,
+  letIsStruct,
+  letIsUnion,
+  letIsVariant,
+  letMapShapeOf,
+  letNulBool,
+  letNulLitUnion,
+  letRefListSlot,
+  listOpKindOfBin,
+  mapShapeOfExpr,
+  markLoopVarSlot,
+  markValueUnionAtoms,
+  mfCallbackFe,
+  mfRecordDst,
+  mfRecordSrc,
+  mfRecvKindOf,
+  mfResultKindOf,
+  mfResultSlotOf,
+  monoUnwrapParens,
+  mvShapeOfValName,
+  nameFieldCode,
+  nameIsNulRefList,
+  nameIsRefArray,
+  nulRefArrayInnerSlotOfLet,
+  nulRefStructIdxOfLet,
+  objVariantName,
+  recordRefPushSlot,
+  refArrElemKind,
+  refArrElemName,
+  refListElemNameOfExpr,
+  refListSlotOfExpr,
+  registerValueUnionName,
+  restoreNarrow,
+  retListKindFlag,
+  retMapFlag,
+  retNulRefFlag,
+  retRefArrElemName,
+  retStructIndex,
+  retTRFlag,
+  retUnionFlag,
+  rlInternName,
+  rlSlotByName,
+  scopeBind,
+  scopePop,
+  scopePush,
+  scopeUnbind,
+  setNarrowFromCond,
+  shapeFieldElemName,
+  stmtIsPushKind,
+  stmtIsTailValue,
+  structIndexByName,
+  structIndexOfLet,
+  structIndexOfObj,
+  structIndexOfTypeName,
+  synthTypeRef,
+  variantIndexOf,
+  variantIndexOfLet,
+  variantSig,
+} from "./emit_classify"
+
+// Scan the program's top-level statements into `fnStmts` (FuncDecls only, in order),
+// skipping `TypeDecl`s and gathering top-level `LetDecl`s into `globalStmts` (module
+// globals, declaration order = global index). Any other top-level statement fails
+// loudly. Returns the function count, or -1 (via `emitFail`).
+export function collectFns(stmts: i32[]) {
+  fnStmts = []
+  fnParent = []
+  globalStmts = []
+  globalNames = []
+  globalNameMap = Map()
+  startStmts = []
+  lambdaCtr = 0
+  fnDispNames = []
+  fnValUsed = false
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is FuncDecl {
+      fnStmts.push(stmts[i])
+      fnParent.push(-1)
+      fnDispNames.push("")
+    } else if s is LetDecl {
+      // A top-level `let`/`const` — a module global; its position here is its index.
+      globalStmts.push(stmts[i])
+      if !globalNameMap.has(s.letName) {
+        globalNameMap[s.letName] = globalNames.length
+      }
+      globalNames.push(s.letName)
+    } else if nodeIsTypeDecl(stmts[i]) {
+    } else if s is UnionDecl {
+      // A `type N = A | B` union alias — collected by `collectU`, skipped here.
+    } else if s is ImportDecl {
+      // A tooling node (the lint tier reads it) — the module front end already
+      // resolved and merged the import, so the emitter has nothing to lower.
+    } else {
+      // A top-level STATEMENT — runs in the synthetic start function (source order).
+      startStmts.push(stmts[i])
+    }
+    i = i + 1
+  }
+  // Lift nested function declarations and anonymous `function(...)...` literals into
+  // the flat `fnStmts` list (lambda support). Each lifted FuncDecl becomes a real
+  // top-level wasm function with its own index. Scan the bodies of every function
+  // already collected AND every top-level global init / start statement; the worklist
+  // grows as nested functions are discovered (a closure inside a closure). Anonymous
+  // literals (`fnName == ""`) get a synthesized `__lambda_N` name written into the node.
+  let wi = 0
+  while wi < fnStmts.length {
+    const fn = P.nodes[fnStmts[wi]]
+    if fn is FuncDecl { liftFnsInExpr(fn.fnBody, wi) }
+    wi = wi + 1
+  }
+  // Also lift lambdas in top-level global initializers and start statements (parent -1).
+  let gi = 0
+  while gi < globalStmts.length {
+    const g = P.nodes[globalStmts[gi]]
+    if g is LetDecl {
+      if g.letInit >= 0 {
+        const before = fnStmts.length
+        liftFnsInExpr(g.letInit, -1)
+        recordLambdaDispName(before, g.letInit, g.letName)
+      }
+    }
+    gi = gi + 1
+  }
+  let si = 0
+  while si < startStmts.length {
+    liftFnsInExpr(startStmts[si], -1)
+    si = si + 1
+  }
+  // The `$fnsig` signature collection happens LATER (`collectCloSigs`, after
+  // `computeRetInference`): a signature key reads each function's param AND return
+  // kinds, and an un-annotated callback's return kind is only known once inference ran.
+  cloSigKeys = []
+  cloSigRepFn = []
+  fnStmts.length
+}
+
+// Collect the distinct `$fnsig` env-leading functypes — one per distinct eligible
+// signature KEY across all lifted functions (any could be used as a value), in
+// `fnStmts` order. Runs AFTER `computeRetInference` (the key reads inferred return
+// kinds) and after `collectMapFilterUse` (which may flip `fnValUsed` for a program
+// whose only function value is a named `.map`/`.filter` callback). Empty (zero new
+// types) unless `fnValUsed` — the byte-identical-golden invariant.
+export function collectCloSigs() {
+  cloSigKeys = []
+  cloSigRepFn = []
+  if !fnValUsed { return 0 }
+  let fe = 0
+  while fe < fnStmts.length {
+    let key = fnSigKeyOf(fe)
+    // A VOID- (`>v`) or STRUCT-returning (`>sN;`) function used as a VALUE (bound,
+    // passed, returned) needs its EXTENDED sig interned too — the value-eligible key
+    // above excludes both. Mirrors the object-field-closure pass below, but for a
+    // function reached through a binding / param rather than a struct field.
+    // `cloSigKeyExt` yields "" for the kinds still outside the value ABI (string, i64),
+    // so those stay unminted; usage-gated by `fnValUsed`, so a program without such a
+    // function value emits byte-identical types.
+    if key == "" { key = cloSigKeyExt(fe) }
+    if key != "" {
+      if cloSigPosOfKey(key) < 0 {
+        cloSigKeys.push(key)
+        cloSigRepFn.push(fe)
+      }
+    }
+    fe = fe + 1
+  }
+  // EXTENDED field-closure signatures (index/operator-trap dispatch): a closure
+  // that is an OBJECT-FIELD VALUE may be void (`"[]=": function(k,v) {…}`) or
+  // struct-returning (`"[]": function(i) row(i)`, an operator field returning a
+  // struct) — sigs the value ABI above excludes. Intern each such field
+  // closure's extended key (`>v` / `>sN;` results) so the member-call site can
+  // `ref.cast` to the callee's REAL functype. Usage-gated: only fires for a
+  // field closure whose sig is NOT already value-eligible, so a program without
+  // one emits byte-identical types.
+  let ai = 0
+  while ai < P.nodes.length {
+    const an = P.nodes[ai]
+    if an is ObjLit {
+      const fs = an.objFields
+      let fi = 0
+      while fi < fs.length {
+        const f = P.nodes[fs[fi]]
+        if f is FieldInit {
+          const ffe = fieldValueFeOf(f.fiValue)
+          if ffe >= 0 {
+            if fnSigKeyOf(ffe) == "" {
+              const ek = cloSigKeyExt(ffe)
+              if ek != "" {
+                if cloSigPosOfKey(ek) < 0 {
+                  cloSigKeys.push(ek)
+                  cloSigRepFn.push(ffe)
+                }
+              }
+            }
+          }
+        }
+        fi = fi + 1
+      }
+    }
+    ai = ai + 1
+  }
+  0
+}
+
+// Recursively walk the node at `ix` (a statement or expression subtree) and append
+// every nested `FuncDecl` — whether a nested declaration statement or an arrow
+// lambda in expression position — to `fnStmts` (lambda lifting). An anonymous
+// lambda (`fnName == ""`) is given a synthesized unique name first, so it resolves
+// like a named function. The function's OWN body is NOT descended here (the outer
+// worklist loop in `collectFns` descends each lifted function once it is in
+// `fnStmts`), preventing double-collection. Any function value's existence flips the
+// module-wide `fnValUsed` flag.
+//
+// Record a directly-bound lambda's DEBUG display name (the `let`/`const` it is
+// assigned to) for the name section. `initIx` is the initializer node and `slot` is
+// the `fnStmts` index it lifted to (`fnStmts.length` captured BEFORE the lift call —
+// a directly-bound lambda is the first and only push of that call). `fnName` is left
+// as the synthesized `__lambda_N` so call resolution and `fnNameMap` are untouched —
+// only a trap backtrace reads the friendlier name.
+function recordLambdaDispName(slot: i32, initIx: i32, name: string) {
+  if initIx < 0 || name.length == 0 || slot >= fnDispNames.length { return 0 }
+  const iv = P.nodes[initIx]
+  if iv is FuncDecl { fnDispNames[slot] = name }
+  0
+}
+
+function liftFnsInExpr(ix: i32, parent: i32) {
+  if ix < 0 { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    if n.fnName == "" {
+      n.fnName = "__lambda_" + i32ToStr(lambdaCtr)
+      lambdaCtr = lambdaCtr + 1
+    }
+    fnStmts.push(ix)
+    fnParent.push(parent)
+    fnDispNames.push("")
+    fnValUsed = true
+    return 0
+  }
+  if n is Block {
+    const stmts = n.blkStmts
+    let i = 0
+    while i < stmts.length {
+      liftFnsInExpr(stmts[i], parent)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is LetDecl {
+    if n.letInit >= 0 {
+      const before = fnStmts.length
+      liftFnsInExpr(n.letInit, parent)
+      recordLambdaDispName(before, n.letInit, n.letName)
+    }
+    return 0
+  }
+  if n is RetStmt {
+    if n.retArg >= 0 { liftFnsInExpr(n.retArg, parent) }
+    return 0
+  }
+  if n is IfStmt {
+    liftFnsInExpr(n.ifCond, parent)
+    liftFnsInExpr(n.ifThen, parent)
+    if n.ifElse >= 0 { liftFnsInExpr(n.ifElse, parent) }
+    return 0
+  }
+  if n is WhileStmt {
+    liftFnsInExpr(n.whileCond, parent)
+    liftFnsInExpr(n.whileBody, parent)
+    return 0
+  }
+  if n is ForRange {
+    liftFnsInExpr(n.frFrom, parent)
+    liftFnsInExpr(n.frTo, parent)
+    if n.frStep >= 0 { liftFnsInExpr(n.frStep, parent) }
+    liftFnsInExpr(n.frBody, parent)
+    return 0
+  }
+  if n is ForIn {
+    liftFnsInExpr(n.fiIter, parent)
+    liftFnsInExpr(n.fiBody, parent)
+    return 0
+  }
+  if n is Call {
+    liftFnsInExpr(n.callFn, parent)
+    const args = n.callArgs
+    let i = 0
+    while i < args.length {
+      liftFnsInExpr(args[i], parent)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is BinExpr {
+    liftFnsInExpr(n.binLeft, parent)
+    liftFnsInExpr(n.binRight, parent)
+    return 0
+  }
+  if n is Unary {
+    liftFnsInExpr(n.unArg, parent)
+    return 0
+  }
+  if n is Paren {
+    liftFnsInExpr(n.parInner, parent)
+    return 0
+  }
+  if n is Member {
+    liftFnsInExpr(n.memObj, parent)
+    return 0
+  }
+  if n is Index {
+    liftFnsInExpr(n.idxArr, parent)
+    liftFnsInExpr(n.idxIndex, parent)
+    return 0
+  }
+  if n is ObjLit {
+    const fields = n.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit { liftFnsInExpr(f.fiValue, parent) }
+      i = i + 1
+    }
+    return 0
+  }
+  if n is ArrayLit {
+    const elems = n.arrElems
+    let i = 0
+    while i < elems.length {
+      liftFnsInExpr(elems[i], parent)
+      i = i + 1
+    }
+    return 0
+  }
+  0
+}
+
+// Map each function NAME to its wasm function index (its position in `fnStmts`), and
+// record whether it returns the struct. Returns the function count.
+export function buildFnMap(_stmts: i32[]) {
+  fnNames = []
+  fnNameMap = Map()
+  nestedNameSet = Map()
+  fnIndices = []
+  fRetVoid = []
+  fRetRef = []
+  fRetStructIdx = []
+  fRetListKind = []
+  fRetStr = []
+  fRetUni = []
+  fRetRArrElem = []
+  fRetMap = []
+  fRetBool = []
+  fRetNul = []
+  fRetNulStr = []
+  fRetI64 = []
+  fRetF64 = []
+  fRetF32 = []
+  let i = 0
+  while i < fnStmts.length {
+    const s = P.nodes[fnStmts[i]]
+    if s is FuncDecl {
+      fnNames.push(s.fnName)
+      // FIRST occurrence wins (mirrors the old linear `fnIndexOf`): a later lifted
+      // function sharing a name does not overwrite the earlier slot.
+      if !fnNameMap.has(s.fnName) { fnNameMap[s.fnName] = i }
+      // A nested (lifted) function's name — drives `fnIndexOfInScope`'s scan gate.
+      if i < fnParent.length && fnParent[i] >= 0 {
+        nestedNameSet[s.fnName] = true
+      }
+      fnIndices.push(i)
+      fRetVoid.push(0)
+      fRetRef.push(retTRFlag(s.fnRet))
+      fRetStructIdx.push(retStructIndex(s.fnRet))
+      // The folded list-return code (mutually-exclusive flags → one rep code, in priority
+      // order; `0` when the return is not a list).
+      fRetListKind.push(retListKindFlag(s.fnRet))
+      fRetStr.push(retStrFlag(s.fnRet))
+      fRetUni.push(retUnionFlag(s.fnRet))
+      fRetRArrElem.push(retRefArrElemName(s.fnRet))
+      fRetMap.push(retMapFlag(s.fnRet))
+      fRetBool.push(retBoolFlag(s.fnRet))
+      fRetNul.push(retNulRefFlag(s.fnRet))
+      fRetNulStr.push(retNulStringFlag(s.fnRet))
+      fRetI64.push(retI64Flag(s.fnRet))
+      fRetF64.push(retF64Flag(s.fnRet))
+      fRetF32.push(retF32Flag(s.fnRet))
+      // A20: an un-annotated SCALAR/STRING/array function's return is set DIRECTLY from
+      // the checker's inferred return name — the emitter's expression-based fallback
+      // below misses a return that is a plain variable (a `let`-bound string or list),
+      // which then mis-classifies and fails codegen. Set the one classifying flag from
+      // the name; no AST node is synthesized (so `fmt` is untouched and the node arena
+      // isn't grown mid-pass) and `i32` needs nothing (it is the default). `string[]`
+      // rides `fRetListKind` (kind 7, the module-global string-list wrapper) — the
+      // signature-emission path maps that flag to the right result valtype, where a bare
+      // un-annotated return would otherwise fall back to i32.
+      if s.fnRet < 0 {
+        // An anonymous lambda's inferred return is keyed by NODE INDEX (the checker
+        // recorded `#<nodeIx>`, since the lambda has no name the checker saw); fall back
+        // to that when the name-keyed lookup misses (`__lambda_N` is unknown to the checker).
+        let inm = inferRetNameOf(s.fnName)
+        if inm == "" { inm = inferRetNameByNode(fnStmts[i]) }
+        const li = fRetStr.length - 1
+        if inm == "string" {
+          fRetStr[li] = 1
+        } else if inm == "i64" {
+          fRetI64[li] = 1
+        } else if inm == "f64" {
+          fRetF64[li] = 1
+        } else if inm == "f32" {
+          fRetF32[li] = 1
+        } else if inm == "boolean" {
+          fRetBool[li] = 1
+        } else if inm == "i32[]" {
+          fRetListKind[li] = 2
+        } else if inm == "string[]" {
+          fRetListKind[li] = 7
+        } else if inm == "f64[]" {
+          fRetListKind[li] = 12
+        } else if nameIsMap(inm) && mapValNameOf(inm) == "i32" {
+          // A mono `{[string]: i32}` map inferred return (a returned map local). `criClassify`'s
+          // `exprMap` can miss it (a returned LOCAL's kind isn't collected during the global
+          // return pass), so set it reliably from the checker's inferred return NAME.
+          fRetMap[li] = 1
+        } else if inm == "string|null" {
+          // A `string | null` niche inferred return drives the kind-16 result valtype
+          // (`ref null $array`) — same flag the annotated `: string | null` path sets, so
+          // `fnRetNulString` and the signature emission both classify it. The `boolean |
+          // null` niche needs NO flag: its result valtype is plain i32 (the sentinel rides
+          // an i32), so it falls through to the default.
+          fRetNulStr[li] = 1
+        } else if isValueUnionName(inm) {
+          fRetUni[li] = 1
+        } else if isUName(inm) {
+          // A registered STRUCT-union inferred return (`Cat | Dog` — registered from this
+          // same name in `collectU`): the variant-boxed rep rides the SAME union result
+          // valtype as a value union (kind 4 box), so set `fRetUni`. The expression-based
+          // fallback would NOT catch it (a single object-literal return is not itself a
+          // union expression), so set it from the name here.
+          fRetUni[li] = 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  fnStmts.length
+}
+
+// Classify each function's VOIDNESS as a monotone fixed point: a candidate (no
+// return annotation) is void when its body has no valued `return` and no tail
+// value. `stmtIsTailValue` consults `fRetVoid` for tail CALLS, so marking a
+// callee void can make its CALLERS' tails non-values — iterate until stable
+// (the void set only grows; bounded by the function count).
+export function computeVoidFns() {
+  let changed = true
+  while changed {
+    changed = false
+    let i = 0
+    while i < fnStmts.length {
+      if fRetVoid[i] == 0 {
+        const fn = P.nodes[fnStmts[i]]
+        if fn is FuncDecl {
+          if fn.fnRet < 0 {
+            if !blockHasValuedReturn(fn.fnBody) {
+              // An else-less tail `if` makes the return `T | null` (`function f(c) { if
+              // c then 5 }`), but `blockTailIsValue` deliberately ignores else-less ifs
+              // (they feed THIS fixpoint — a void procedure's recursive tail
+              // `if n>0 { rec(n-1) }` must not look like a value). So also consult the
+              // static checker classification: a NULLABLE inferred return (a name with a
+              // `null` atom) is non-void. Gated to nullable specifically (not just
+              // non-empty) so an i32-valued tail the emitter can't lower as a value — e.g.
+              // a Member-target assignment `state.x = …`, which the checker reads as an
+              // i32 expression but `stmtIsTailValue` rejects — still classifies void.
+              if (
+                !blockTailIsValue(fn.fnBody, fnStmts[i]) &&
+                !unionHasAtom(inferRetNameOf(fn.fnName), "null") &&
+                !fnReturnsClosure(i)
+              ) {
+                // A function whose tail is a function VALUE (`(a) => (b) => …`) returns a
+                // closure, NOT void — `blockTailIsValue` ignores a bare lambda tail, so guard
+                // it here (else f's functype is `()->()` and `f(4)` reads as a void result).
+                fRetVoid[i] = 1
+                changed = true
+              }
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+export function computeRetInference() {
+  let changed = true
+  while changed {
+    changed = false
+    let i = 0
+    while i < fnStmts.length {
+      const fn = P.nodes[fnStmts[i]]
+      if fn is FuncDecl {
+        if fn.fnRet < 0 && fRetVoid[i] == 0 {
+          // Classify over EVERY valued return (tail value first — the same
+          // preference `fnRetExprOf` had), not just the first: a function whose
+          // first return is an unclassifiable narrowed path read (`if x?.y is
+          // string { return x.y } return "-1"`) still types from its other
+          // returns — the checker already proved all returns agree. The walk is
+          // NARROWING-AWARE (`criWalkBlock` mirrors the emit loops' condition /
+          // post-guard narrowing), so `if v !is i32 { return v }` classifies the
+          // narrowed `v` as its complement (a string return, not the union box) —
+          // the host's flow-sensitive return typing.
+          criChanged = false
+          const fnb = P.nodes[fnStmts[i]]
+          if fnb is FuncDecl {
+            const fb = P.nodes[fnb.fnBody]
+            if fb is Block {
+              const fbs = fb.blkStmts
+              if fbs.length > 0 {
+                const tailIx = fbs[fbs.length - 1]
+                if stmtIsTailValue(tailIx, fnStmts[i]) {
+                  criClassify(tailIx, i)
+                } else {
+                  // A tail VALUE-IF (`function pick(c) if c > 1 then mk(1) else mk(2)`) is not a
+                  // `stmtIsTailValue` (that predicate has no IfStmt case), so a NAMED function's
+                  // inferred STRUCT return through an if-join went unclassified — the name path
+                  // records only scalar/string/list returns and `criWalkBlock` classifies a tail
+                  // value only for anonymous lambdas. Classify the whole `if` here: `exprStruct`/
+                  // `exprString` see through it (then-arm rep), so the join's struct/string ref is
+                  // picked up. A struct-UNION join is already `fRetUni` (name path) — the
+                  // `fRetUni == 0` guard in `criClassify` keeps it from being re-claimed a struct.
+                  const tn = P.nodes[tailIx]
+                  if tn is IfStmt {
+                    if tn.ifElse >= 0 { criClassify(tailIx, i) }
+                  }
+                }
+              }
+            }
+            criWalkBlock(fnb.fnBody, i)
+          }
+          if criChanged { changed = true }
+        }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Recursively collect the declared-local names of the block at `blockIx` into
+// `localNames`, descending into `if` then/else branches (wasm locals span the whole
+// function, so a local declared inside a branch still needs a slot). Each declared
+// local's init type is validated as i32-compatible here, so a non-i32 local fails
+// loudly BEFORE any bytes are emitted. Returns 0, or -1 (via `emitFail`) on a
+// non-block node, an out-of-scope statement (e.g. a loop), or a non-i32 local.
+export function collectLocals(blockIx: i32, fnIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    // Enter this block's lexical scope: bindings appended below are live (and resolve
+    // a same-named init expr to the RIGHT slot) only within it, and are dropped on exit.
+    scopePush()
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        // TYPED-IR: an un-annotated empty `[]` whose element a downstream `.push` pinned —
+        // synthesize the equivalent `<elem>[]` annotation from the checker's recorded type,
+        // so the slot classifier below AND the later `[]`-seeding (`letAnnRefListKind`) and
+        // every other annotation-reading path agree for ALL element types. This extends the
+        // i32/string-only inferred build to f64/struct without per-rep usage predicates.
+        // Emit-time (post-check), so `fmt` is untouched; the generic case is excluded by
+        // `nodeArrayElemName` returning "" for a `TyVar` element.
+        if s.letType < 0 {
+          const synInit = unwrapParen(s.letInit)
+          const synN = P.nodes[synInit]
+          if synN is ArrayLit {
+            if synN.arrElems.length == 0 {
+              const synElem = nodeArrayElemName(synInit)
+              if synElem != "" {
+                // A STRUCT element renders as a structural shape (`{v: i32}`), but the
+                // ref-list machinery (`nameIsRefArray`/`rlSlotByName`) keys on the DECLARED
+                // struct name — so resolve the shape to its interned struct's name. A scalar
+                // element (`f64`) is not a struct, so it passes through unchanged.
+                let synName = synElem
+                const synSi = structIndexOfTypeName(synElem)
+                if synSi >= 0 {
+                  if sNames[synSi] != "" { synName = sNames[synSi] }
+                }
+                s.letType = synthTypeRef(synName + "[]", -1)
+              }
+            }
+          }
+        }
+        // Classify the init type BEFORE binding the name, then allocate a fresh slot and
+        // bind `name → slot` so a LATER reference (or a shadowing inner `let`) resolves to
+        // THIS slot. `slot` is the new slot's declared-local position.
+        let slot = -1
+        if letIsLitUnion(stmts[i]) || letInitIsLitAtom(stmts[i], fnIx) {
+          // A literal-union local — annotated `: K`, or UN-annotated off an atom init (`const sk =
+          // xs[i]` over a `K[]`). It is an i32-backed interned ATOM, NOT a value-union box. FIRST: its
+          // members register as value-union variants, so it must be intercepted before `letIsVariant`
+          // / `letIsUnion`; AND before `letIsString` (its `string`-subtype checker type would else
+          // pick the kind-3 ref slot and store the i32 atom into a `(ref $array)` cell — invalid wasm).
+          slot = addLocalName(s.letName, "i32", -1)
+          localLitUnion[slot] = 1
+        } else if letNulLitUnion(stmts[i], fnIx) {
+          // A `K | null` NICHE local (kind 0, plain i32): atom ids ≥ 0 with the spare `-1` = null.
+          // BEFORE `letIsNulString` (a litunion softens to `string`, so `string | null` would else
+          // claim it as the kind-16 ref). Marked `localLitUnion` so reads widen as atoms; the write
+          // path seeds `-1` for a `null` assignment (`exprNulLitUnion`, an AST walk, not the slot kind).
+          slot = addLocalName(s.letName, "i32", -1)
+          localLitUnion[slot] = 1
+        } else if letIsMap(stmts[i], fnIx) {
+          // The kind-6 parallel slot carries the map SHAPE: `-2` for a `Set()`
+          // binding (its `.values()` walks the keys), an mv slot (>= 0) for a
+          // ref-valued map, `-1` for the mono i32 map.
+          slot = addLocalName(s.letName, "map", letMapShapeOf(stmts[i], fnIx))
+        } else if letBareUnwiredNulMapRead(stmts[i], fnIx) {
+          // `const v = m[k]` over a UNION- or ref-LIST-valued map is `V | null` with no nullable
+          // local rep — reject cleanly (bind `m[k] ?? <default>`) rather than emit invalid wasm.
+          // Struct / string / closure value reads fall through to their nullable kinds below.
+          return emitFail(
+            "emitProgram: a bare `m[k]` read of a union- or list-valued map is `V | null`; " +
+              "use `m[k] ?? <default>`",
+          )
+        } else if letIsNulRef(stmts[i], fnIx) {
+          // Nullable struct (`S | null`, code 9): annotation-first, else the
+          // initializer's nullable-returning call. BEFORE the struct case (a
+          // nullable init must not collapse to the non-null kind 1).
+          slot = addLocalName(
+            s.letName,
+            "nulstruct",
+            nulRefStructIdxOfLet(stmts[i], fnIx),
+          )
+        } else if letIsNulListInfer(stmts[i], fnIx) {
+          // Nullable i32 list (`i32[] | null`, kind 15): BEFORE the array case —
+          // `letIsArray`'s init fallback would otherwise claim the binding as a
+          // non-null kind 2, and a later `xs = null` write would be invalid.
+          slot = addLocalName(s.letName, "nullist", -1)
+          // The scalar-list checks gate on `!letIsUnion`: a `f64[] | string` (etc.) binding
+          // whose INIT is a bare list literal would otherwise let `letIsF64Array`'s init
+          // fallback claim it as an f64 list instead of the value-union box (kind 4). A plain
+          // `f64[]` binding is not a union name, so the guard never blocks it.
+        } else if (
+          letIsStringArray(stmts[i], fnIx) &&
+          !letIsUnion(stmts[i], fnIx)
+        ) {
+          slot = addLocalName(s.letName, "strlist", -1)
+        } else if letIsF32Array(stmts[i], fnIx) && !letIsUnion(stmts[i], fnIx) {
+          // Scalar-f32-element list local (`let xs: f32[] = …`), kind 21 — `(ref $fl32TypeIdx)`.
+          // BEFORE the f64 case: an `f32[]` annotation over a float-literal init would else be
+          // claimed by `letIsF64Array`'s init fallback (a `[1.5]` is `exprF64Array`).
+          slot = addLocalName(s.letName, "f32list", -1)
+        } else if letIsF64Array(stmts[i], fnIx) && !letIsUnion(stmts[i], fnIx) {
+          // Scalar-f64-element list local (`let xs: f64[] = …` / a float-literal array
+          // init), kind 12 — its cell is `(ref $fl64TypeIdx)`. (Slice 4.)
+          slot = addLocalName(s.letName, "f64list", -1)
+        } else if letIsI64Array(stmts[i], fnIx) && !letIsUnion(stmts[i], fnIx) {
+          // Scalar-i64-element list local (`let xs: i64[] = …`), kind 20 — `(ref $il64TypeIdx)`.
+          slot = addLocalName(s.letName, "i64list", -1)
+        } else if letIsNulRefArray(stmts[i], fnIx) {
+          // A NULLABLE ref-array local (`i32[][] | null`, kind 18) — BEFORE the non-null ref-array case
+          // (its init `v[i]` over a `(<ref-array>|null)[]` would otherwise be claimed as a non-null kind
+          // 5). Stores the INNER ref-list slot in `localStructIdx`, like kind 5 (the analogue of kind 15).
+          slot = addLocalName(
+            s.letName,
+            "nulreflist",
+            nulRefArrayInnerSlotOfLet(stmts[i], fnIx),
+          )
+        } else if letIsRefArray(stmts[i], fnIx) {
+          slot = addLocalName(
+            s.letName,
+            "reflist",
+            letRefListSlot(stmts[i], fnIx),
+          )
+        } else if (
+          letIsNulClosure(stmts[i], fnIx) ||
+          letInfersNulClosure(stmts[i], fnIx)
+        ) {
+          // A NULLABLE function-VALUE local (`let c: ((i32) => i32) | null`, kind 19), OR an
+          // un-annotated `const f = m[k]` over a function-valued map (a bare map read is
+          // nullable — `letInfersNulClosure`). Its cell is the NULLABLE closure fat-pointer
+          // `(ref null $cloStructIdx)`, holding a function OR `null`. BEFORE `letIsUnion` (the
+          // `fn | null` annotation reads as a union name) and the non-null closure (kind 14).
+          slot = addLocalName(s.letName, "nulclosure", -1)
+        } else if letIsVariant(stmts[i], fnIx) {
+          // A CONCRETE union-variant local (`const c: Cat = …`), kind 8 — its cell is the
+          // variant struct ref `(ref $(uVarIdx + vi))`. BEFORE `letIsUnion`/`letIsStruct`:
+          // a variant name is neither the union box nor a standalone struct.
+          slot = addLocalName(
+            s.letName,
+            "variant",
+            variantIndexOfLet(stmts[i], fnIx),
+          )
+        } else if letIsUnion(stmts[i], fnIx) {
+          slot = addLocalName(s.letName, "union", -1)
+        } else if letIsStruct(stmts[i], fnIx) {
+          // `letIsStruct` also matches via the INIT object literal's field-name set — so an UN-INTERNABLE
+          // inline-shape ANNOTATION (an unsupported field type, e.g. `{f: {g:i32}[] | null}` /
+          // `{f: (i32|null)[][]}`) still lands here, but `structIndexOfLet` then resolves to a WRONG struct
+          // (a same-field-named one) and emits its layout → invalid wasm. Reject cleanly when the
+          // annotation shape itself could not be interned (the construct-side hole the read fuzzer masked).
+          if letAnnIsUninternedShape(stmts[i]) {
+            return emitFail(
+              "emitProgram: binding's inline-shape type has an unsupported field",
+            )
+          }
+          slot = addLocalName(
+            s.letName,
+            "struct",
+            structIndexOfLet(stmts[i], fnIx),
+          )
+        } else if letIsArray(stmts[i], fnIx) {
+          slot = addLocalName(s.letName, "list", -1)
+        } else if letIsNulString(stmts[i], fnIx) {
+          // Nullable string (`string | null`, kind 16): BEFORE the string case so a
+          // nullable annotation/init doesn't collapse to the non-null kind 3 (a later
+          // `x = null` write would then be invalid).
+          slot = addLocalName(s.letName, "nulstr", -1)
+        } else if letIsString(stmts[i], fnIx) {
+          slot = addLocalName(s.letName, "str", -1)
+        } else if letIsI64(stmts[i], fnIx) {
+          // Scalar i64 local (`let x: i64 = …`, kind 10, valtype 0x7e). Bypasses
+          // `checkLocalI32` (which rejects a non-i32 annotation); the init literal
+          // lowers as `i64.const` in `emitStmt`'s LetDecl path.
+          slot = addLocalName(s.letName, "i64", -1)
+        } else if letIsF32(stmts[i]) || letInfersF32(stmts[i], fnIx) {
+          // Scalar f32 local (`let x: f32 = …`, kind 13, valtype 0x7d), OR an un-annotated
+          // `let y = <f32 expr>` (`letInfersF32`: an f32 field/index/call/arith source — the
+          // f32 dual of the init fallback `letIsF64`/`letIsI64` carry). An annotated float
+          // literal lowers as `f32.const`; an inferred f32 init is already an f32 VALUE, so
+          // the LetDecl emit's `else` arm pushes it as-is into this kind-13 slot. A BARE
+          // un-annotated float literal stays f64 (`letIsF64` below). (Slice 5.)
+          slot = addLocalName(s.letName, "f32", -1)
+        } else if letIsF64(stmts[i], fnIx) {
+          // Scalar f64 local (`let x: f64 = …` OR an un-annotated `.` literal init,
+          // kind 11, valtype 0x7c). Bypasses `checkLocalI32`; the init literal lowers
+          // as `f64.const` in `emitStmt`'s LetDecl path. (Slice 3.)
+          slot = addLocalName(s.letName, "f64", -1)
+        } else if letIsClosure(stmts[i], fnIx) {
+          // A function-VALUE local (`const f = function(...)...` or `const g = namedFn`),
+          // kind 14 — its cell is the closure fat-pointer struct `(ref $cloStructIdx)`.
+          slot = addLocalName(s.letName, "closure", -1)
+        } else if letNulBool(stmts[i], fnIx) {
+          // `boolean | null` NICHE local (kind 17): the cell is a plain i32 holding 0/1,
+          // with the spare value 2 encoding `null` (no box) — so `fbValtype` renders it
+          // i32 (the default), same as a plain boolean. A DEDICATED kind so the annotation
+          // / inferred-if init isn't rejected by `checkLocalI32` and the if-binding emit
+          // routes it to the sentinel-2 rep (rep 2); a later `x = null` stays valid (the
+          // write consults `exprNulBool`, an AST walk, not the slot kind).
+          slot = addLocalName(s.letName, "nulbool", -1)
+        } else {
+          if checkLocalI32(stmts[i]) < 0 {
+            scopePop()
+            return -1
+          }
+          slot = addLocalName(s.letName, "i32", -1)
+        }
+        scopeBind(s.letName, slot)
+      } else if s is IfStmt {
+        if collectLocalsIf(stmts[i], fnIx) < 0 {
+          scopePop()
+          return -1
+        }
+      } else if s is WhileStmt {
+        // Wasm locals are function-scoped, so collect locals from the while body too.
+        if collectLocals(s.whileBody, fnIx) < 0 {
+          scopePop()
+          return -1
+        }
+      } else if s is ForRange {
+        // A range `for` introduces TWO i32 slots in pre-order: the loop variable and
+        // a synthetic bound temp (the `to` expression is evaluated ONCE). The temp's
+        // name carries a `#` so it can never collide with a user identifier.
+        const fvSlot = addLocalName(s.frVar, "i32", -1)
+        markLoopVarSlot(fvSlot)
+        scopeBind(s.frVar, fvSlot)
+        addLocalName(s.frVar + "#b", "i32", -1)
+        if collectLocals(s.frBody, fnIx) < 0 {
+          scopePop()
+          return -1
+        }
+        // The loop variable's scope is the loop (see `scopeUnbind`).
+        scopeUnbind()
+      } else if s is ForIn {
+        // A `for v in <list>` introduces THREE slots in pre-order: the element var
+        // (i32, or a string ref for a string-list / `.keys()` iterable), a hidden
+        // i32 cursor, and a hidden list temp holding the iterable (evaluated ONCE).
+        // The hidden names carry `#` so they can never collide with user identifiers.
+        const fiEk = forInElemKind(s.fiIter, fnIx)
+        if fiEk == null {
+          scopePop()
+          return emitFail("emitProgram: unsupported for-in iterable")
+        }
+        // A struct element (`S[]`, code 1) binds the loop var as a struct local
+        // carrying the element struct table index; the `#l` temp holds the ref-list
+        // WRAPPER (code 5 + the ref-list slot). i32/string elements keep their slots.
+        let fiVarIdx = -1
+        let fiLk: VKind = "list"
+        if fiEk == "struct" {
+          fiVarIdx = forInRefArrayStructIdx(s.fiIter, fnIx)
+          fiLk = "reflist"
+        } else if fiEk == "nulstruct" {
+          // A NULLABLE-struct element (`(P | null)[]`): the loop var is a kind-9 niche carrying
+          // the element struct index; the `#l` temp is the ref-list WRAPPER (code 5).
+          fiVarIdx = forInRefArrayStructIdx(s.fiIter, fnIx)
+          fiLk = "reflist"
+        } else if fiEk == "union" {
+          // A union-box element list: the loop var is a kind-4 union box (no struct index);
+          // the `#l` temp is the ref-list WRAPPER (code 5), like the struct case.
+          fiLk = "reflist"
+        } else if (
+          fiEk == "list" ||
+          fiEk == "strlist" ||
+          fiEk == "f64list" ||
+          fiEk == "i64list" ||
+          fiEk == "f32list"
+        ) {
+          // A NESTED-ARRAY loop var — the inner LIST (kind 2/7/12/20). The `#l` temp is the
+          // OUTER ref-list WRAPPER (code 5); each element is the inner list wrapper ref.
+          fiLk = "reflist"
+        } else if fiEk == "closure" {
+          // A CLOSURE element (`((i32) => i32)[]`): the loop var is a kind-14 closure (no struct
+          // index); the `#l` temp is the ref-list WRAPPER (code 5), like the struct case.
+          fiLk = "reflist"
+        } else if fiEk == "reflist" {
+          // A NESTED REF array (`S[][]`): the loop var is the inner REF LIST (kind 5) carrying its
+          // ref-list slot; the `#l` temp is the OUTER ref-list wrapper (code 5).
+          const fiOuter = refListSlotOfExpr(s.fiIter, fnIx)
+          fiVarIdx = rlSlotByName(refArrElemName(rlElemName[fiOuter]))
+          fiLk = "reflist"
+        } else if fiEk == "str" {
+          fiLk = "strlist"
+        } else if fiEk == "f64" {
+          fiLk = "f64list" // f64 element → f64-list `#l` temp
+        } else if fiEk == "i64" {
+          fiLk = "i64list" // i64 element → i64-list `#l` temp
+        } else if fiEk == "f32" {
+          fiLk = "f32list" // f32 element → f32-list `#l` temp
+        }
+        // A STRING iterable (`for ch in s`): the `#l` temp holds the string itself (code 3, the
+        // raw `(ref $aTypeIdx)` array), not an i32-list wrapper. The loop var stays code 0 (i32).
+        if fiEk == "i32" && forInStringSrc(s.fiIter, fnIx) { fiLk = "str" }
+        const fiSlot = addLocalName(s.fiVar, fiEk, fiVarIdx)
+        // A literal-union array (`for k in xs`, `xs: K[]`): the loop var is an i32 atom (kind 0),
+        // but flag it so `k`-as-atom (print widening, `==`, member compare) is recognized.
+        if nodeArrayElemIsLitUnion(s.fiIter) { localLitUnion[fiSlot] = 1 }
+        markLoopVarSlot(fiSlot)
+        scopeBind(s.fiVar, fiSlot)
+        addLocalName(s.fiVar + "#i", "i32", -1)
+        let fiLs = -1
+        if (
+          fiEk == "struct" ||
+          fiEk == "union" ||
+          fiEk == "nulstruct" ||
+          fiEk == "list" ||
+          fiEk == "strlist" ||
+          fiEk == "f64list" ||
+          fiEk == "i64list" ||
+          fiEk == "f32list" ||
+          fiEk == "closure" ||
+          fiEk == "reflist"
+        ) {
+          const fiMvs = forInMapValsSlot(s.fiIter, fnIx)
+          if fiMvs >= 0 {
+            fiLs = mvRlSlot[fiMvs]
+          } else {
+            fiLs = refListSlotOfExpr(s.fiIter, fnIx)
+          }
+        }
+        addLocalName(s.fiVar + "#l", fiLk, fiLs)
+        if collectLocals(s.fiBody, fnIx) < 0 {
+          scopePop()
+          return -1
+        }
+        // The loop variable's scope is the loop (see `scopeUnbind`).
+        scopeUnbind()
+      }
+      i = i + 1
+    }
+    scopePop()
+    return 0
+  }
+  emitFail("emitProgram: function has no block body")
+}
+
+// Collect the declared locals of the `IfStmt` at `ifIx`: its then-branch block, plus
+// its else, which is either a `Block` (a plain `else { … }`) or another `IfStmt`
+// (an `else if …`). The `else if` case recurses through THIS function, so an
+// arbitrarily long `if / else if / else if / … / else` chain has EVERY arm walked —
+// not just the first nested level. (Mirrors how `emitStmt` re-enters each arm via
+// `emitStmts`/`emitStmt`, so the slots `collectLocals` allocates match the `let`s
+// `emitStmt` stores into, at any nesting depth.) Returns 0, or -1 (via `emitFail`).
+export function collectLocalsIf(ifIx: i32, fnIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    // Narrow `n` to its variant across the THEN-branch (mirroring `emitStmt`), so a
+    // `let x = n.arrField` over a narrowed union-variant ARRAY field is classified as
+    // an array local here — `exprArray`/`memFieldTypeCode` resolve the variant field
+    // type only while narrowing is active. Save/restore so the else-branch + nesting
+    // are unaffected.
+    const savedTop = narrowTop
+    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    const trc = collectLocals(s.ifThen, fnIx)
+    if narrowed { restoreNarrow(savedTop) }
+    if trc < 0 { return -1 }
+    if s.ifElse >= 0 {
+      const els = P.nodes[s.ifElse]
+      if els is Block {
+        if collectLocals(s.ifElse, fnIx) < 0 { return -1 }
+      } else if els is IfStmt {
+        // `else if …` — walk the nested if (and its own else chain) recursively.
+        if collectLocalsIf(s.ifElse, fnIx) < 0 { return -1 }
+      }
+    }
+    return 0
+  }
+  emitFail("emitProgram: collectLocalsIf: not an if statement")
+}
+
+// Validate the `LetDecl` at `letIx`: its initializer must exist and be an i32 value
+// (this slice has i32 locals only). A missing init, or an init whose type annotation
+// names a non-i32 type, fails loudly. Without a per-expr type checker the init's
+// VALUE-type is approximated: a `let x: T = …` annotation must be `i32` if present;
+// init expressions outside the i32 vocabulary (string/char/bool/float literals)
+// fail loudly. Returns 0, or -1 (via `emitFail`).
+function checkLocalI32(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 {
+      // An UNINITIALIZED `let x: T` (A-definite-assign) is legal for a SCALAR
+      // (i32/boolean) annotation: the checker guarantees write-before-read, and the
+      // wasm local's implicit zero-init covers the declaration. A ref-typed or
+      // un-annotated uninitialized local still fails (non-null refs have no default).
+      if d.letType >= 0 {
+        const ty = P.nodes[d.letType]
+        if ty is TypeRef {
+          if ty.tyName == "i32" || ty.tyName == "boolean" { return 0 }
+        }
+      }
+      return emitFail("emitProgram: local declaration needs an initializer")
+    }
+    if d.letType >= 0 {
+      const ty = P.nodes[d.letType]
+      if ty is TypeRef {
+        // `boolean` rides in an i32 (0/1), so a `boolean` local is the SAME i32 slot.
+        if ty.tyName != "i32" {
+          if ty.tyName != "boolean" {
+            if !nodeTyIsLitUnionAlias(d.letType) {
+              return emitFail("emitProgram: only i32 locals are supported")
+            }
+          }
+        }
+      } else {
+        return emitFail("emitProgram: local type is not a type name")
+      }
+    }
+    return checkExprI32(d.letInit)
+  }
+  emitFail("emitProgram: not a local declaration")
+}
+
+// Reject init expressions that cannot yield an i32: a string literal, or a float
+// `NumLit` whose lexeme has a `.`, fails loudly. `BoolLit` (true=1 / false=0) and
+// `CharLit` (a code point) ARE i32 values — they ride in an i32 — so they pass. i32
+// literals, identifiers, parens, unary/binary arithmetic and calls are all i32 in
+// this slice, so they pass too (the per-node emitters re-check operand shapes).
+// Returns 0, or -1.
+function checkExprI32(exprIx: i32) {
+  if exprIx < 0 {
+    return emitFail("emitProgram: missing local initializer expression")
+  }
+  const e = P.nodes[exprIx]
+  if e is StrLit {
+    return emitFail("emitProgram: only i32 locals are supported")
+  }
+  if e is NumLit {
+    // A float literal carries a "." in its lexeme — out of scope (i32 only).
+    let i = 0
+    while i < e.numText.length {
+      if e.numText[i] == '.' {
+        return emitFail("emitProgram: only i32 locals are supported")
+      }
+      i = i + 1
+    }
+    return 0
+  }
+  0
+}
+
+// Walk the block at `blockIx` (descending into `if` branches + `while` bodies, the scopes
+// `collectLocals` walks) and collect every DISTINCT ref-list `.push` receiver slot into
+// `fnRefPushSlots`. Parallel to the `blockPushPopBits` walk, but RECORDING the slot rather
+// than just testing presence — so a function pushing onto `Tok[]` and `Diag[]` reserves a
+// separately-typed scratch frame for each.
+export function collectRefPushSlots(blockIx: i32, fnIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      if stmtIsPushKind(stmts[i], fnIx, "ref") {
+        const s = P.nodes[stmts[i]]
+        if s is Call {
+          const callee = P.nodes[s.callFn]
+          if callee is Member {
+            recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
+          }
+        }
+      }
+      const s = P.nodes[stmts[i]]
+      if s is IfStmt { collectRefPushSlotsIf(stmts[i], fnIx) }
+      else if s is WhileStmt { collectRefPushSlots(s.whileBody, fnIx) }
+      else if s is ForRange { collectRefPushSlots(s.frBody, fnIx) }
+      else if s is ForIn { collectRefPushSlots(s.fiBody, fnIx) }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Collect ref-push receiver slots from every arm of the `if` / `else if` chain at `ifIx`
+// — the then-branch, an `else` block, and (RECURSIVELY) each chained `else if`. Mirrors
+// `ifChainPushPopBits`'s recursion so a push under 2+ `else if` arms is recorded.
+function collectRefPushSlotsIf(ifIx: i32, fnIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    collectRefPushSlots(s.ifThen, fnIx)
+    if s.ifElse >= 0 {
+      const els = P.nodes[s.ifElse]
+      if els is Block { collectRefPushSlots(s.ifElse, fnIx) }
+      else if els is IfStmt { collectRefPushSlotsIf(s.ifElse, fnIx) }
+    }
+  }
+  0
+}
+
+// Record the ref-list table slot of every Member-receiver ref-list `.pop` in expression
+// `exprIx` into `fnRefPushSlots` (so its typed scratch frame is reserved) — the pop-side
+// analogue of `collectRefPushSlots`, descending VALUE positions (a `.pop` is a value).
+export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return 0 }
+  const e = P.nodes[exprIx]
+  if e is Call {
+    if callIsMemberPopKind(exprIx, fnIx, "ref") {
+      const callee = P.nodes[e.callFn]
+      if callee is Member {
+        recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
+      }
+    }
+    const args = e.callArgs
+    let i = 0
+    while i < args.length {
+      collectMemberPopRefSlotsExpr(args[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  if e is BinExpr {
+    collectMemberPopRefSlotsExpr(e.binLeft, fnIx)
+    collectMemberPopRefSlotsExpr(e.binRight, fnIx)
+    return 0
+  }
+  if e is Member { return collectMemberPopRefSlotsExpr(e.memObj, fnIx) }
+  if e is Index {
+    collectMemberPopRefSlotsExpr(e.idxArr, fnIx)
+    collectMemberPopRefSlotsExpr(e.idxIndex, fnIx)
+    return 0
+  }
+  if e is Unary { return collectMemberPopRefSlotsExpr(e.unArg, fnIx) }
+  if e is Paren { return collectMemberPopRefSlotsExpr(e.parInner, fnIx) }
+  0
+}
+
+// Walk the block at `blockIx` (if/else + while) collecting Member-receiver ref-list
+// `.pop` slots from statements + let-inits / returns / while-conds.
+export function collectMemberPopRefSlots(blockIx: i32, fnIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        collectMemberPopRefSlotsExpr(s.letInit, fnIx)
+      } else if s is RetStmt {
+        collectMemberPopRefSlotsExpr(s.retArg, fnIx)
+      } else if s is BinExpr {
+        collectMemberPopRefSlotsExpr(stmts[i], fnIx)
+      } else if s is Call {
+        collectMemberPopRefSlotsExpr(stmts[i], fnIx)
+      } else if s is IfStmt {
+        collectMemberPopRefSlotsIf(stmts[i], fnIx)
+      } else if s is WhileStmt {
+        collectMemberPopRefSlotsExpr(s.whileCond, fnIx)
+        collectMemberPopRefSlots(s.whileBody, fnIx)
+      } else if s is ForIn {
+        collectMemberPopRefSlotsExpr(s.fiIter, fnIx)
+        collectMemberPopRefSlots(s.fiBody, fnIx)
+      } else if s is ForRange {
+        collectMemberPopRefSlotsExpr(s.frFrom, fnIx)
+        collectMemberPopRefSlotsExpr(s.frTo, fnIx)
+        collectMemberPopRefSlots(s.frBody, fnIx)
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Collect Member-receiver ref-list `.pop` slots from every arm of the `if` chain.
+function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    collectMemberPopRefSlots(s.ifThen, fnIx)
+    if s.ifElse >= 0 {
+      const els = P.nodes[s.ifElse]
+      if els is Block { collectMemberPopRefSlots(s.ifElse, fnIx) }
+      else if els is IfStmt { collectMemberPopRefSlotsIf(s.ifElse, fnIx) }
+    }
+  }
+  0
+}
+
+// Note one BinExpr's list-op kind into the per-function frame flags.
+function leqNoteBin(binIx: i32, fnIx: i32) {
+  const k = listOpKindOfBin(binIx, fnIx)
+  if k == 0 { fnUsesListEqI = true }
+  if k == 3 {
+    fnUsesListEqS = true
+    // The per-element string compares stage operands in the string-op frame.
+    fnUsesStrOp = true
+  }
+  if k == 4 {
+    // The nested element compare recurses into the i32-list frame.
+    fnUsesListEqI = true
+    const e = P.nodes[binIx]
+    if e is BinExpr {
+      const slot = refListSlotOfExpr(e.binLeft, fnIx)
+      if slot >= 0 {
+        let seen = false
+        let i = 0
+        while i < fnListEqRSlots.length {
+          if fnListEqRSlots[i] == slot { seen = true }
+          i = i + 1
+        }
+        if !seen { fnListEqRSlots.push(slot) }
+      }
+    }
+  }
+  0
+}
+
+// Recursive expression walk noting every list `==`/`!=`/`+` site (and, riding the
+// same walk, every function-identity equality site — `cloEqNoteBin`).
+export function leqScanExpr(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return 0 }
+  const e = P.nodes[exprIx]
+  if e is BinExpr {
+    leqNoteBin(exprIx, fnIx)
+    cloEqNoteBin(exprIx, fnIx)
+    leqScanExpr(e.binLeft, fnIx)
+    return leqScanExpr(e.binRight, fnIx)
+  }
+  if e is Unary { return leqScanExpr(e.unArg, fnIx) }
+  if e is Paren { return leqScanExpr(e.parInner, fnIx) }
+  if e is Call {
+    leqScanExpr(e.callFn, fnIx)
+    const args = e.callArgs
+    let i = 0
+    while i < args.length {
+      leqScanExpr(args[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  if e is Member { return leqScanExpr(e.memObj, fnIx) }
+  if e is OptMember { return leqScanExpr(e.omObj, fnIx) }
+  if e is Index {
+    leqScanExpr(e.idxArr, fnIx)
+    return leqScanExpr(e.idxIndex, fnIx)
+  }
+  if e is ArrayLit {
+    const es = e.arrElems
+    let i2 = 0
+    while i2 < es.length {
+      leqScanExpr(es[i2], fnIx)
+      i2 = i2 + 1
+    }
+    return 0
+  }
+  if e is ObjLit {
+    const fs = e.objFields
+    let i3 = 0
+    while i3 < fs.length {
+      const f = P.nodes[fs[i3]]
+      if f is FieldInit { leqScanExpr(f.fiValue, fnIx) }
+      i3 = i3 + 1
+    }
+    return 0
+  }
+  if e is IsExpr { return leqScanExpr(e.isObj, fnIx) }
+  0
+}
+
+// Statement-level walk (descends branch/loop bodies; a bare expression
+// statement falls through to the expression walk).
+export function leqScanStmt(stmtIx: i32, fnIx: i32) {
+  if stmtIx < 0 { return 0 }
+  const s = P.nodes[stmtIx]
+  if s is LetDecl { return leqScanExpr(s.letInit, fnIx) }
+  if s is RetStmt { return leqScanExpr(s.retArg, fnIx) }
+  if s is IfStmt {
+    leqScanExpr(s.ifCond, fnIx)
+    leqScanBlock(s.ifThen, fnIx)
+    return leqScanBlock(s.ifElse, fnIx)
+  }
+  if s is WhileStmt {
+    leqScanExpr(s.whileCond, fnIx)
+    return leqScanBlock(s.whileBody, fnIx)
+  }
+  if s is ForRange {
+    leqScanExpr(s.frFrom, fnIx)
+    leqScanExpr(s.frTo, fnIx)
+    leqScanExpr(s.frStep, fnIx)
+    return leqScanBlock(s.frBody, fnIx)
+  }
+  if s is ForIn {
+    leqScanExpr(s.fiIter, fnIx)
+    return leqScanBlock(s.fiBody, fnIx)
+  }
+  if s is Block { return leqScanBlock(stmtIx, fnIx) }
+  leqScanExpr(stmtIx, fnIx)
+}
+
+export function leqScanBlock(ix: i32, fnIx: i32) {
+  if ix < 0 { return 0 }
+  const b = P.nodes[ix]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      leqScanStmt(stmts[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  leqScanStmt(ix, fnIx)
+}
+
+// Walk the statement/expression tree at `ix`, recording every `.map`/`.filter` call
+// over a LIST receiver into the scratch-frame requirement lists above (and setting
+// `fnUsesMapFilter`). Mirrors `blockHasCallRef`'s node coverage; a nested `FuncDecl`
+// (a lifted callback literal) is NOT descended — its own body's sites are detected
+// when that lifted function is emitted.
+export function mfScan(ix: i32, fnIx: i32) {
+  if ix < 0 { return 0 }
+  const n = P.nodes[ix]
+  if n is Call {
+    const callee = P.nodes[n.callFn]
+    if callee is Member {
+      if callee.memProp == "map" || callee.memProp == "filter" {
+        if n.callArgs.length == 1 {
+          const rk = mfRecvKindOf(callee.memObj, fnIx)
+          if rk != null {
+            fnUsesMapFilter = true
+            let slot = -1
+            if rk == "ref" { slot = refListSlotOfExpr(callee.memObj, fnIx) }
+            mfRecordSrc(rk, slot)
+            const resK = mfResultKindOf(ix, fnIx)
+            if resK != null { mfRecordDst(resK, mfResultSlotOf(ix, fnIx)) }
+          }
+        }
+      }
+      // `xs.slice(start, end?)` builds a NEW list of the SAME element type — it reserves
+      // the same src wrapper + dst backing scratch locals as a `.filter` (result kind/slot
+      // == receiver). `emitArrSlice` reads the source backing/len through `srcL` and writes
+      // the copied range into a fresh `dstL` backing.
+      if callee.memProp == "slice" {
+        if n.callArgs.length == 1 || n.callArgs.length == 2 {
+          const rk = mfRecvKindOf(callee.memObj, fnIx)
+          if rk != null {
+            fnUsesMapFilter = true
+            let slot = -1
+            if rk == "ref" { slot = refListSlotOfExpr(callee.memObj, fnIx) }
+            mfRecordSrc(rk, slot)
+            mfRecordDst(rk, slot)
+          }
+        }
+      }
+      // `m.keys()` builds a fresh LIVE-key string list — reserve its 6-slot frame.
+      if callee.memProp == "keys" {
+        if exprMap(callee.memObj, fnIx) { fnUsesMapKeys = true }
+      }
+      // `m.values()` builds a fresh LIVE-value list. A MONO map uses the self-contained
+      // `mapValsBase` frame; an mv-slot (ref/scalar-valued) map uses its per-slot output
+      // backing (`mvValsOutBase`) + the key-list frame for live/i/j/count.
+      if callee.memProp == "values" {
+        if exprMap(callee.memObj, fnIx) {
+          const vsh = mapShapeOfExpr(callee.memObj, fnIx)
+          if vsh == -1 {
+            fnUsesMapVals = true
+          } else if vsh >= 0 {
+            fnUsesMapVals = true
+            fnUsesMapKeys = true
+          }
+        }
+      }
+    }
+    mfScan(n.callFn, fnIx)
+    const args = n.callArgs
+    let i = 0
+    while i < args.length {
+      mfScan(args[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is Block {
+    const stmts = n.blkStmts
+    let i = 0
+    while i < stmts.length {
+      mfScan(stmts[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is LetDecl {
+    if n.letInit >= 0 { mfScan(n.letInit, fnIx) }
+    return 0
+  }
+  if n is RetStmt {
+    if n.retArg >= 0 { mfScan(n.retArg, fnIx) }
+    return 0
+  }
+  if n is IfStmt {
+    mfScan(n.ifCond, fnIx)
+    mfScan(n.ifThen, fnIx)
+    if n.ifElse >= 0 { mfScan(n.ifElse, fnIx) }
+    return 0
+  }
+  if n is WhileStmt {
+    mfScan(n.whileCond, fnIx)
+    mfScan(n.whileBody, fnIx)
+    return 0
+  }
+  if n is ForRange {
+    mfScan(n.frFrom, fnIx)
+    mfScan(n.frTo, fnIx)
+    if n.frStep >= 0 { mfScan(n.frStep, fnIx) }
+    mfScan(n.frBody, fnIx)
+    return 0
+  }
+  if n is ForIn {
+    mfScan(n.fiIter, fnIx)
+    mfScan(n.fiBody, fnIx)
+    return 0
+  }
+  if n is BinExpr {
+    mfScan(n.binLeft, fnIx)
+    mfScan(n.binRight, fnIx)
+    return 0
+  }
+  if n is Unary { return mfScan(n.unArg, fnIx) }
+  if n is Paren { return mfScan(n.parInner, fnIx) }
+  if n is Member { return mfScan(n.memObj, fnIx) }
+  if n is Index {
+    mfScan(n.idxArr, fnIx)
+    mfScan(n.idxIndex, fnIx)
+    return 0
+  }
+  if n is ObjLit {
+    const fields = n.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit { mfScan(f.fiValue, fnIx) }
+      i = i + 1
+    }
+    return 0
+  }
+  if n is ArrayLit {
+    const elems = n.arrElems
+    let i = 0
+    while i < elems.length {
+      mfScan(elems[i], fnIx)
+      i = i + 1
+    }
+    return 0
+  }
+  0
+}
+
+// Reset the interning counter (call once per module, before assigning indices).
+function mResetTypeIntern() {
+  mNextType = 0
+  0
+}
+
+// Allocate the next heap-type index (interning in emit order): return the current
+// counter, then advance it by one. This is the single auditable place a type index
+// is minted — every `mIntern*` below funnels through here.
+function mAllocType() {
+  const idx = mNextType
+  mNextType = mNextType + 1
+  idx
+}
+
+// Walk the type-section emit order with the `mAllocType` counter, assigning each
+// type's heap index into the module-global index state (`sHeapIdx`/`uVarIdx`/
+// `uBoxIdx`/`aTypeIdx`/`lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`mkArrIdx`/`mkListIdx`/
+// `mStructIdx`). Returns the functype base index (`typeOffset` — where the first
+// functype lands). The order MUST match the type-section emission below EXACTLY:
+// standalone structs → union variants → union box → raw i32 array → i32-list
+// wrapper → ref-list (backing, wrapper) pairs → string-list (backing, wrapper) →
+// map struct → functypes. An ABSENT type family mints nothing; its index globals
+// still take the counter position they would have occupied (never emitted — the
+// value only matters when the family is present).
+export function mAssignTypeIndices(_n: i32) {
+  mResetTypeIntern()
+
+  // Standalone structs occupy the first `sNames.length` indices (decl order).
+  sHeapIdx = []
+  let shi = 0
+  while shi < sNames.length {
+    sHeapIdx.push(mAllocType())
+    shi = shi + 1
+  }
+  // Union variant structs (nv of them) then the union box.
+  if uDeclared {
+    uVarIdx = mNextType
+    let vi = 0
+    while vi < uVariants.length {
+      mAllocType()
+      vi = vi + 1
+    }
+    uBoxIdx = mAllocType()
+    // The per-rep VALUE BOXES (`{ i32 }` / `{ i64 }` / `{ f32 }` / `{ f64 }`),
+    // in this fixed rep order — only the reps a registered value union uses.
+    if vbI32Used { vbI32Idx = mAllocType() }
+    if vbI64Used { vbI64Idx = mAllocType() }
+    if vbF32Used { vbF32Idx = mAllocType() }
+    if vbF64Used { vbF64Idx = mAllocType() }
+  }
+  // The raw i32 array (string rep + list/map backing), then the i32-list wrapper.
+  if aUsed { aTypeIdx = mAllocType() } else { aTypeIdx = mNextType }
+  if lUsed { lTypeIdx = mAllocType() } else { lTypeIdx = mNextType }
+  // The map struct index is needed BELOW to resolve a map-array ref-list element
+  // (it references `(ref null $mStructIdx)`), yet the map struct lands AFTER the ref
+  // pairs + string-list. It is computable up front from the counter: it follows the
+  // ref-pair slots (two per distinct element type) plus the 2 string-list slots.
+  const mStructIdxPre = mNextType + rlElemName.length * 2 + 2
+  // One (backing, wrapper) pair per distinct ref-list element type, interleaved.
+  let rs = 0
+  while rs < rlElemName.length {
+    rlBackIdx[rs] = mAllocType()
+    rlWrapIdx[rs] = mAllocType()
+    if rlElemKindTbl[rs] == 2 {
+      rlElemHeap[rs] = uBoxIdx
+    } else if rlElemKindTbl[rs] == 3 {
+      rlElemHeap[rs] = mStructIdxPre
+    } else if rlElemKindTbl[rs] == 4 {
+      // An `i32[][]` slot's element is the i32-list WRAPPER (interned just above,
+      // so `lTypeIdx` is already assigned).
+      rlElemHeap[rs] = lTypeIdx
+    } else if (
+      rlElemKindTbl[rs] == 6 ||
+      rlElemKindTbl[rs] == 7 ||
+      rlElemKindTbl[rs] == 8 ||
+      rlElemKindTbl[rs] == 10
+    ) {
+      // string[][] / f64[][] / i64[][]: the element is the inner list's WRAPPER
+      // (`mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`) — but those wrappers are allocated AFTER
+      // this loop, so a second pass (below) fills these heaps once they exist.
+      rlElemHeap[rs] = 0
+    } else if rlElemKindTbl[rs] == 9 {
+      // A struct-LIST value (`S[]`): the element is the inner struct-list WRAPPER, the ref-list
+      // wrapper of the inner `S` slot (interned at a LOWER index, so its `rlWrapIdx` is set).
+      rlElemHeap[rs] = rlWrapIdx[rlSlotByName(refArrElemName(rlElemName[rs]))]
+    } else {
+      // A NULLABLE-struct element (`(P | null)[]`, slot key "P | null"): the backing is a
+      // `(ref null $P)` over the bare struct — strip the `| null` to resolve P's heap.
+      let rsen = rlElemName[rs]
+      const rsnn = nullablePartOf(rsen)
+      if rsnn != "" { rsen = rsnn }
+      const esi = structIndexByName(rsen)
+      if esi >= 0 {
+        rlElemHeap[rs] = sHeapIdx[esi]
+      } else {
+        // A concrete-VARIANT element (`Cat[]`): the element heap is the variant struct
+        // `uVarIdx + vi` (no standalone `sNames` entry — variants ride the union's structs).
+        const evi = variantIndexOf(rsen)
+        if evi >= 0 {
+          rlElemHeap[rs] = uVarIdx + evi
+        } else {
+          rlElemHeap[rs] = 0
+        }
+      }
+    }
+    rs = rs + 1
+  }
+  // The legacy singletons alias slot 0 (or the next index when no ref list).
+  if rlElemName.length >= 1 {
+    raTypeIdx = rlBackIdx[0]
+    rlTypeIdx = rlWrapIdx[0]
+  } else {
+    raTypeIdx = mNextType
+    rlTypeIdx = mNextType
+  }
+  // The string-ref list (keys backing + keys wrapper), shared by the map's keys
+  // list AND any `string[]` field (present when `slUsed || mUsed`).
+  if slUsed || mUsed {
+    mkArrIdx = mAllocType()
+    mkListIdx = mAllocType()
+  } else {
+    mkArrIdx = mNextType
+    mkListIdx = mNextType + 1
+  }
+  // The map struct (present only when `mUsed`); `mStructIdxPre` is this counter
+  // position, precomputed above for the ref-pair loop.
+  if mUsed { mStructIdx = mAllocType() } else { mStructIdx = mStructIdxPre }
+  // The f64 array + list-wrapper pair (Slice 4), interned LAST among the heap types so no
+  // existing index shifts. The `(array (mut f64))` backing first, then its `{backing,len,
+  // cap}` wrapper struct (which references the backing). Present only when `fa64Used`.
+  if fa64Used {
+    fa64TypeIdx = mAllocType()
+    fl64TypeIdx = mAllocType()
+  } else {
+    fa64TypeIdx = mNextType
+    fl64TypeIdx = mNextType + 1
+  }
+  // The i64-list pair, immediately after the f64 pair (same "interned late so no existing
+  // index shifts" discipline): the `(array (mut i64))` backing then its `{backing,len,cap}`
+  // wrapper. Present only when `ia64Used`; aliases its slots otherwise (zero types minted).
+  if ia64Used {
+    ia64TypeIdx = mAllocType()
+    il64TypeIdx = mAllocType()
+  } else {
+    ia64TypeIdx = mNextType
+    il64TypeIdx = mNextType + 1
+  }
+  // The f32-list pair, immediately after the i64 pair (same "interned late" discipline): the
+  // `(array (mut f32))` backing then its `{backing,len,cap}` wrapper. Present only when
+  // `fa32Used`; aliases its slots otherwise (zero types minted).
+  if fa32Used {
+    fa32TypeIdx = mAllocType()
+    fl32TypeIdx = mAllocType()
+  } else {
+    fa32TypeIdx = mNextType
+    fl32TypeIdx = mNextType + 1
+  }
+  // Second pass: fill the NON-i32 nested-list ref-list element heaps now that the inner
+  // string/f64/i64 list wrappers exist (a `string[]`/`f64[]`/`i64[]`-VALUED map's vals
+  // ref-list — kinds 6/7/8). The wrappers are forced by `mvShapeOfValName` (slUsed / fa64Used
+  // / ia64Used), so the index is real here.
+  let rsfix = 0
+  while rsfix < rlElemName.length {
+    if rlElemKindTbl[rsfix] == 6 { rlElemHeap[rsfix] = mkListIdx }
+    else if rlElemKindTbl[rsfix] == 7 { rlElemHeap[rsfix] = fl64TypeIdx }
+    else if rlElemKindTbl[rsfix] == 10 { rlElemHeap[rsfix] = fl32TypeIdx }
+    else if rlElemKindTbl[rsfix] == 8 { rlElemHeap[rsfix] = il64TypeIdx }
+    rsfix = rsfix + 1
+  }
+  // The function-value closure types (lambdas), interned LAST among the heap types so no
+  // existing index shifts. The closure fat-pointer struct `{ code: (ref $fnsig), env:
+  // structref }` first, then the env-leading functype `$fnsig` `(structref, i32...) ->
+  // i32`. Both reference each other (mutually recursive in the one rec group). Then one
+  // env struct per CAPTURING lifted function (capture order = field order), interned
+  // after `$fnsig`. Present only when `fnValUsed`; zero types minted otherwise.
+  fnEnvIdx = []
+  if fnValUsed {
+    cloStructIdx = mAllocType()
+    // A CLOSURE-element ref-list slot (kind 5, `((i32) => i32)[]`) backs onto the closure
+    // fat-pointer struct. `cloStructIdx` is interned HERE (after the ref-pair loop above),
+    // so backfill those slots' element heap type now — the backing array `(array (mut (ref
+    // null $cloStructIdx)))` forward-references it within the shared rec group.
+    let rcs = 0
+    while rcs < rlElemName.length {
+      if rlElemKindTbl[rcs] == 5 { rlElemHeap[rcs] = cloStructIdx }
+      rcs = rcs + 1
+    }
+    // One `$fnsig` functype per distinct value-call signature (`cloSigKeys`).
+    cloSigBase = mNextType
+    let sa = 0
+    while sa < cloSigKeys.length {
+      mAllocType()
+      sa = sa + 1
+    }
+    // One env struct per capturing lifted function (in `fnStmts` order). A
+    // non-capturing function gets `-1` (its closure env is `ref.null structref`).
+    let fe = 0
+    while fe < fnStmts.length {
+      const ncap = captureCountOf(fe)
+      if ncap > 0 { fnEnvIdx.push(mAllocType()) } else { fnEnvIdx.push(-1) }
+      fe = fe + 1
+    }
+  } else {
+    cloStructIdx = mNextType
+    cloSigBase = mNextType + 1
+  }
+  // The ref-valued map structs (one 7-field map struct per mv slot), interned LAST
+  // among the heap types so no existing index shifts; zero types when no ref-valued
+  // map exists.
+  let mvi = 0
+  while mvi < mvValName.length {
+    mvMapTypeIdx[mvi] = mAllocType()
+    mvi = mvi + 1
+  }
+  // The functypes follow; the first lands at the current counter (`typeOffset`).
+  mNextType
+}
+
+// stable: it fixes whether the program needs the array heap type BEFORE the type
+// section is emitted. Each `[]` annotation is validated as `i32[]` here, so a non-i32
+// element array (e.g. `string[]`) fails loudly up-front. Returns 0, or -1 (via
+// `emitFail`).
+export function collectA(_stmts: i32[]) {
+  // Gather every FuncDecl TYPE-PARAMETER name first (a separate cheap pass — a
+  // `T[]` annotation node precedes its FuncDecl in the arena, so the main walk
+  // below would see it too early). Consulted by `genTyParamArr` to skip a
+  // generic original's `T[]` annotation. Empty for any program without `<T>`
+  // declarations — zero behavior change.
+  genTyParamNames = []
+  let gtp = 0
+  while gtp < P.nodes.length {
+    const gnd = P.nodes[gtp]
+    if gnd is FuncDecl {
+      const gtps = gnd.fnTyParams
+      let gj = 0
+      while gj < gtps.length {
+        genTyParamNames.push(gtps[gj])
+        gj = gj + 1
+      }
+    }
+    gtp = gtp + 1
+  }
+  aUsed = false
+  lUsed = false
+  raUsed = false
+  rlUsed = false
+  rElemKind = 0
+  rlElemName = []
+  rlElemHeap = []
+  rlBackIdx = []
+  rlWrapIdx = []
+  rlElemKindTbl = []
+  rlElemNullable = []
+  pendingNulRefHeap = -1
+  mUsed = false
+  slUsed = false
+  fa64Used = false
+  mvValName = []
+  mvValKind = []
+  mvValStructIdx = []
+  mvRlSlot = []
+  mvMapTypeIdx = []
+  let i = 0
+  while i < P.nodes.length {
+    const nd = P.nodes[i]
+    if nd is ArrayLit {
+      // A `[…]` literal is a growable list. A literal with struct/union-variant
+      // elements is a REF list (its backing is `(ref null $elem)`); an i32-element
+      // or EMPTY literal contributes the i32 list (an empty `[]` over a REF type is
+      // typed by its binding's annotation, collected via the TypeRef branch — so the
+      // i32 list types it also forces are harmless presence, never wrong bytes).
+      if arrLitIsRef(i) {
+        rlUsed = true
+        raUsed = true
+        rElemKind = arrLitElemKind(i)
+        rlInternName(arrLitElemName(i), arrLitElemKind(i))
+        // A nested `[[…]]` literal's elements are i32-list wrappers — force the
+        // i32 list + raw array types for them.
+        if arrLitElemKind(i) == 4 {
+          lUsed = true
+          aUsed = true
+        }
+      } else if arrLitIsStr(i, -1) {
+        // A STRING-element literal is a string-ref list — the same wrapper/backing
+        // a `string[]` annotation forces.
+        slUsed = true
+        aUsed = true
+      } else if arrLitIsF64(i, -1) {
+        // An f64-element literal is an f64 list — its own `(array (mut f64))` backing +
+        // wrapper. Does NOT force `aUsed`/`lUsed` (those are the i32 array/list). (Slice 4.)
+        fa64Used = true
+      } else {
+        lUsed = true
+        aUsed = true
+      }
+    } else if nd is StrLit {
+      aUsed = true
+    } else if nd is Call {
+      // A `fromCodePoint(code)` call (H2) constructs a length-1 VL string — the shared
+      // `(array i32)` heap type — so it forces `aUsed` just like a string literal, even
+      // in a program with no other string. The callee is a bare `Ident`.
+      const cf = P.nodes[nd.callFn]
+      // `m.keys()` builds a fresh STRING list of the map's keys — force the string-list
+      // wrapper/backing (`mkListIdx`/`mkArrIdx`) + the shared `(array i32)`. `.keys()` is
+      // only valid on a map (checker-enforced), so any such call contributes the type.
+      if cf is Member {
+        if cf.memProp == "keys" {
+          slUsed = true
+          aUsed = true
+        }
+      }
+      if cf is Ident {
+        if cf.identName == "fromCodePoint" { aUsed = true }
+        // `toString(x)` builds a fresh string (decimal digits / "true"/"false").
+        if cf.identName == "toString" { aUsed = true }
+        // `fromCodePoints(xs)` builds a fresh string from an i32 list.
+        if cf.identName == "fromCodePoints" {
+          aUsed = true
+          lUsed = true
+        }
+        // An un-annotated `Map()` (usage-inferred binding) still constructs the map
+        // struct — force the same types a `{[string]: i32}` annotation does. `Set()`
+        // is the same 7-field map struct, so it forces the IDENTICAL types.
+        if cf.identName == "Map" || cf.identName == "Set" {
+          mUsed = true
+          lUsed = true
+          aUsed = true
+        }
+        // The array-intrinsic allocators (std-design D1) construct a list even
+        // with no literal/annotation in sight: an f64 FILL forces the f64
+        // array+wrapper pair, anything else the i32 list (wrapper + backing).
+        if (
+          cf.identName == "__array_new__" ||
+          cf.identName == "__array_new_default__"
+        ) {
+          const ank = arrNewIntrKind(i, -1)
+          if ank == 1 {
+            fa64Used = true
+          } else if ank == 2 {
+            // String fill → the string list (wrapper/backing shared with `string[]`).
+            slUsed = true
+            aUsed = true
+          } else if ank == 3 {
+            // Struct fill → the ref list of the element struct (intern its slot).
+            rlUsed = true
+            raUsed = true
+            rlInternName(refListElemNameOfExpr(i, -1), 1)
+          } else {
+            lUsed = true
+            aUsed = true
+          }
+        }
+      }
+      // A `<recv>.push("…")` (string-LITERAL argument) appends to a STRING list:
+      // the usage-driven inference for an un-annotated empty `[]` binding makes
+      // its receiver a `string[]`, so force the string-list types. Idempotent
+      // when an annotation already forced them (a string push onto a non-string
+      // list is a checker error, so this never fires spuriously).
+      if cf is Member {
+        if cf.memProp == "push" {
+          if nd.callArgs.length == 1 {
+            const spArg = P.nodes[nd.callArgs[0]]
+            if spArg is StrLit {
+              slUsed = true
+              aUsed = true
+            }
+          }
+        }
+      }
+    } else if nd is TypeRef {
+      if annArrowAt(nd.tyName) >= 0 {
+        // A TOP-LEVEL function-type annotation (`(i32) => R`): the function-type name
+        // itself needs no array/list type, but its RETURN `R` may (an `i32[]`/`string[]`/
+        // `f64[]` result list, or a `string`). Force the return's backing types so the
+        // closure `$fnsig` result valtype resolves even when the only `i32[]` in the
+        // module rides this annotation. The arrow is TOP-LEVEL, so `((i32) => i32)[]` (a
+        // NESTED arrow — an array OF functions) is NOT caught here; it falls through to
+        // the array branches below. Checked FIRST so the trailing `[]` of a list-returning
+        // function type (`(i32) => i32[]`) is never mis-read as an array name.
+        const fra = annArrowAt(nd.tyName)
+        const frRet = nd.tyName.slice(fra + 2, nd.tyName.length)
+        if frRet == "i32[]" {
+          lUsed = true
+          aUsed = true
+        } else if nameIsStringArray(frRet) {
+          slUsed = true
+          aUsed = true
+        } else if nameIsF64Array(frRet) {
+          fa64Used = true
+        } else if nameIsString(frRet) {
+          aUsed = true
+        }
+      } else if nameIsMap(nd.tyName) {
+        // A `{[string]: i32}` annotation (G8) is a string-keyed map: the map struct
+        // + the keys list (string-ref backing) + the i32 VALS list (the existing
+        // `lTypeIdx`/`aTypeIdx`). So it forces `aUsed` (string backing + vals backing)
+        // and `lUsed` (the vals wrapper) alongside the three dedicated map types.
+        mUsed = true
+        lUsed = true
+        aUsed = true
+        // A REF value type (`{[string]: string}` / `{[string]: {x:i32}}`) interns a
+        // per-value-type map slot (its own map struct over a ref vals list). All mv
+        // interning happens HERE (collect scans every TypeRef), so the type-index
+        // assignment in `emitModule` sees the full slot set; later resolutions are
+        // idempotent lookups.
+        mvShapeOfValName(mapValNameOf(nd.tyName))
+      } else if nameIsStringArray(nd.tyName) {
+        // A `string[]` annotation is a string-ref list — the SAME wrapper/backing as
+        // the map keys list. Force the keys list types (`slUsed`) + the string backing
+        // (`aUsed`, since the elements are `(ref null $aTypeIdx)`).
+        slUsed = true
+        aUsed = true
+      } else if nameIsRefArray(nd.tyName) || nameIsNulRefList(nd.tyName) {
+        // A `S[]`/`N[]` annotation is a ref list (wrapper + `(ref null $elem)` backing) — and so is its
+        // NULLABLE form `S[] | null` (kind 18): force the wrapper/backing on the NON-null ref-array name,
+        // so a bare local whose value does not self-collect the element (e.g. `(i32|null)[] | null = [5]`)
+        // still emits the element's ref-list type.
+        let ran = nd.tyName
+        const ranp = nullablePartOf(ran)
+        if ranp != "" && nameIsRefArray(ranp) { ran = ranp }
+        rlUsed = true
+        raUsed = true
+        rElemKind = refArrElemKind(ran)
+        ensureRefElem(refArrElemName(ran))
+        // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
+        // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
+        if refArrElemKind(ran) == 4 {
+          lUsed = true
+          aUsed = true
+        }
+        // A nested NON-i32 scalar / string 2D array (`string[][]`/`f64[][]`/`i64[][]`, element
+        // kinds 6/7/8) forces its INNER list's backing+wrapper, as the LIST-valued map path
+        // does — else the element wrapper heap (`mkListIdx`/`fl64`/`il64`) is never allocated.
+        if refArrElemKind(ran) == 6 {
+          slUsed = true
+          aUsed = true
+        }
+        if refArrElemKind(ran) == 7 { fa64Used = true }
+        if refArrElemKind(ran) == 10 { fa32Used = true }
+        if refArrElemKind(ran) == 8 { ia64Used = true }
+        if nameIsMapArray(ran) {
+          mUsed = true
+          lUsed = true
+          aUsed = true
+        }
+      } else if nameIsF64Array(nd.tyName) {
+        // An `f64[]` annotation forces the f64 array + wrapper pair (Slice 4) — its own
+        // `(array (mut f64))` backing, independent of the i32 array/list.
+        fa64Used = true
+      } else if nameIsI64Array(nd.tyName) {
+        // An `i64[]` annotation forces the i64 array + wrapper pair (`ia64`/`il64`).
+        ia64Used = true
+      } else if nameIsF32Array(nd.tyName) {
+        // An `f32[]` annotation forces the f32 array + wrapper pair (`fa32`/`fl32`).
+        fa32Used = true
+      } else if genTyParamArr(nd.tyName) {
+        // A `T[]` over a FuncDecl TYPE PARAMETER — a generic ORIGINAL's
+        // annotation. Its monomorphized instances carry concrete pinned names
+        // (collected when `monomorphize` re-runs this pass); the original is
+        // replaced by its first instance and never emitted, so nothing is
+        // forced or validated here.
+      } else if nameIsArray(nd.tyName) {
+        if checkArrName(nd.tyName) < 0 { return -1 }
+        // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
+        lUsed = true
+        aUsed = true
+      } else if nameIsString(nd.tyName) {
+        aUsed = true
+      } else if nameIsNulString(nd.tyName) {
+        // A `string | null` annotation (kind 16) is a `(ref null $aTypeIdx)` slot — it still needs the
+        // string backing forced, exactly like a plain `string`. Without this a bare `string | null = null`
+        // (no other string in the module to force `aUsed`) left `$aTypeIdx` unallocated, so the slot
+        // valtype + `ref.null` referenced a stale type index → invalid wasm at the read.
+        aUsed = true
+      } else if nameIsNulI32List(nd.tyName) {
+        // An `i32[] | null` annotation still constructs/reads the i32 list — the
+        // nullable wrapper changes only the slot's valtype, not the types needed.
+        lUsed = true
+        aUsed = true
+      } else if nodeTyIsLitUnionAlias(i) {
+        // A literal-union annotation (`: K`): an atom WIDENS to its member `string` (`print(k)` etc.), so
+        // force the string backing even when the module has no other string literal.
+        aUsed = true
+      }
+    }
+    i = i + 1
+  }
+  // Inline-struct MAP FIELDS (`const s: { m: {[string]: V} }`): `collectAnnShapes` registered
+  // them as code-19 fields with the value name in `sFieldElemName`, but their inner map is
+  // not a standalone TypeRef the scan above sees (the whole `{m:{[string]:V}}` is ONE name).
+  // Intern each code-19 field's mv slot here so emit resolves it. Idempotent (mvShapeOfValName
+  // dedupes), so a named struct's already-interned field is a no-op — byte-identical for any
+  // program without an inline map-valued field.
+  let sfi = 0
+  while sfi < sFieldTypes.length {
+    if sFieldTypes[sfi] == 19 { mvShapeOfValName(sFieldElemName[sfi]) }
+    // A REF-LIST field (code 5): intern its element so `sFieldRefSlot` (`rlSlotByName`) resolves. An
+    // INLINE-shape ref-list field's element is NEVER a standalone TypeRef the scan above sees (only the
+    // whole `{f:N[]}`), so intern it from the struct table here — this runs after the rl-table reset, so
+    // the slot persists. A NOMINAL field's element is already interned via its own TypeRef; `ensureRefElem`
+    // dedupes, so this is byte-identical for programs with no inline ref-list field.
+    if sFieldTypes[sfi] == 5 || sFieldTypes[sfi] == 28 {
+      rlUsed = true
+      raUsed = true
+      ensureRefElem(sFieldElemName[sfi])
+    }
+    // A `string | null` FIELD (code 20) is a `(ref null $aTypeIdx)` slot — force the string backing, like
+    // the standalone `string | null` annotation above. An inline `{ f: string | null }` field's inner type
+    // is never a standalone TypeRef the scan sees, so without this a `{ f: null }` (no other string in the
+    // module) left `$aTypeIdx` unallocated and the field read referenced a stale type → invalid wasm.
+    if sFieldTypes[sfi] == 20 { aUsed = true }
+    sfi = sfi + 1
+  }
+  0
+}
+
+export function collectAnnShapes() {
+  let ti = 0
+  while ti < P.nodes.length {
+    const tn = P.nodes[ti]
+    if tn is TypeRef { internShapeDeep(tn.tyName) }
+    ti = ti + 1
+  }
+  0
+}
+
+// ANONYMOUS shapes: an object literal naming NO declared struct and NO union variant
+// still constructs a WasmGC struct (`const p = { y: 4, x: 3 }` with no `type` in
+// sight — the host interns every shape). Intern each distinct field-name SET as an
+// unnamed struct (name "", field order = literal order, field types from the literal
+// values), APPENDED after every declared struct so declared indices are unchanged —
+// a program with no anonymous literal emits byte-identical bytes. A later literal
+// with the same name set matches the interned shape via `structIndexOfObj`. A field
+// value `anonFieldCode` can't type leaves the whole shape un-interned; that literal
+// then fails loudly downstream (never a trap). Must run AFTER `collectU` (variant
+// shapes are the union's, not standalone structs).
+function collectAnonShapes() {
+  let ai = 0
+  while ai < P.nodes.length {
+    const an = P.nodes[ai]
+    if an is ObjLit {
+      if structIndexOfObj(ai) < 0 && objVariantName(ai) == "" {
+        const fields = an.objFields
+        // Does this literal carry a FUNCTION-valued field? An operator/index
+        // TRAP MAKER (`{ "*": fn, x: x, y: y }`) mixes closures with plain
+        // ident fields — classify the idents as i32 there (the host types them
+        // exactly; a mis-typed non-i32 binding fails loudly at the validator).
+        // A literal with NO function field keeps idents unclassifiable, so a
+        // generic's structural-return literal (`{ first: b, second: a }`) stays
+        // un-interned here and matches its instance-pinned ANNOTATION shape.
+        let hasFnField = false
+        let ffi = 0
+        while ffi < fields.length {
+          const ff = P.nodes[fields[ffi]]
+          if ff is FieldInit {
+            // (Direct node checks, not `fieldValueFeOf` — `fnStmts` is not yet
+            // populated when `collectS`/`collectAnonShapes` run.)
+            const fv = P.nodes[ff.fiValue]
+            if fv is FuncDecl { hasFnField = true }
+            if fv is Ident {
+              if nameNamesFunction(fv.identName) { hasFnField = true }
+            }
+          }
+          ffi = ffi + 1
+        }
+        const codes: i32[] = []
+        const names: string[] = []
+        const elemNames: string[] = []
+        let ok = true
+        let fi = 0
+        while fi < fields.length {
+          const f = P.nodes[fields[fi]]
+          if f is FieldInit {
+            let code = anonFieldCode(f.fiValue)
+            if code < 0 && hasFnField {
+              const iv = P.nodes[f.fiValue]
+              if iv is Ident {
+                if !nameNamesFunction(iv.identName) { code = 0 }
+              }
+            }
+            if code < 0 { ok = false }
+            codes.push(code)
+            names.push(f.fiName)
+            elemNames.push(anonFieldElemName(f.fiValue, code))
+          } else {
+            ok = false
+          }
+          fi = fi + 1
+        }
+        if ok && codes.length > 0 {
+          sDeclared = true
+          // A synthetic UNIQUE name (the `#` prefix can never collide with a user
+          // identifier or annotation) — a real key, so a ref LIST of this element
+          // shape interns a per-element-type slot (`rlInternName` treats the empty
+          // string as its "not a ref element" sentinel).
+          sNames.push("#anon" + i32ToStr(sNames.length))
+          sFieldStart.push(sFieldNames.length)
+          sFieldCount.push(codes.length)
+          let pi = 0
+          while pi < codes.length {
+            sFieldNames.push(names[pi])
+            sFieldTypes.push(codes[pi])
+            sFieldElemName.push(elemNames[pi])
+            // A function-valued field (code 14) interns a closure cell `(ref
+            // $cloStruct)`; flag the module so the closure rec-group types are
+            // emitted even when no lambda is otherwise lifted (e.g. a top-level
+            // function used purely as a struct-field value, `{ f: inc }`).
+            if codes[pi] == 14 { fnValUsed = true }
+            // (A code-4 i32-list field always rides an ArrayLit value, which the
+            // later `collectA` arena scan classifies — `lUsed`/`aUsed` set there.)
+            pi = pi + 1
+          }
+        }
+      }
+    }
+    ai = ai + 1
+  }
+  0
+}
+
+// Record every generic-alias declaration into the registry.
+function gaeCollectDecls(stmts: i32[]) {
+  gaeBases = []
+  gaeParams = []
+  gaeFieldStart = []
+  gaeFieldCount = []
+  gaeFieldNames = []
+  gaeFieldTyNames = []
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is TypeDecl {
+      const lt = gaeLtAt(s.tdName)
+      if lt > 0 && s.tdName[s.tdName.length - 1] == '>' {
+        gaeBases.push(s.tdName.slice(0, lt))
+        gaeParams.push(s.tdName.slice(lt + 1, s.tdName.length - 1))
+        gaeFieldStart.push(gaeFieldNames.length)
+        let cnt = 0
+        const fields = s.tdFields
+        let fi = 0
+        while fi < fields.length {
+          const fnode = P.nodes[fields[fi]]
+          if fnode is FieldDef {
+            let tname = ""
+            if fnode.fdType >= 0 {
+              const ftn = P.nodes[fnode.fdType]
+              if ftn is TypeRef { tname = ftn.tyName }
+            }
+            gaeFieldNames.push(fnode.fdName)
+            gaeFieldTyNames.push(tname)
+            cnt = cnt + 1
+          }
+          fi = fi + 1
+        }
+        gaeFieldCount.push(cnt)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Scan every TypeRef in the arena for generic-alias applications (behind
+// `|null` and `[]` wrappers) and intern each one.
+export function collectGenAliasShapes() {
+  if gaeBases.length == 0 { return 0 }
+  let ti = 0
+  while ti < P.nodes.length {
+    const tn = P.nodes[ti]
+    if tn is TypeRef {
+      let nm = tn.tyName
+      const nb = nullablePartOf(nm)
+      if nb != "" { nm = nb }
+      while (
+        nm.length > 2 &&
+        nm[nm.length - 2] == '[' &&
+        nm[nm.length - 1] == ']'
+      ) {
+        nm = nm.slice(0, nm.length - 2)
+      }
+      gaeEnsure(nm)
+    }
+    ti = ti + 1
+  }
+  0
+}
+
+// Scan the top-level statements for EVERY struct `type` declaration and record each
+// into the flat multi-struct table (name + field names in declaration order, plus a
+// per-field wasm-type code: `0` = i32 / boolean, `3` = string). Each `type X = {…}`
+// interns its own WasmGC struct heap type. A field whose type is neither i32/boolean
+// nor string fails loudly. Returns 0 on success, or -1 (via `emitFail`).
+// Intern every INLINE-SHAPE struct field type (`type Box = { inner: {x:i32} }`) depth-first BEFORE the
+// struct decls that reference it, so `collectS`'s main loop resolves the nested shape (it can't be
+// interned mid-loop — `internInlineShape` shares the flat `sField*` arrays). `internInlineShape` is a
+// no-op for a non-shape name and idempotent (`annShapeIndexOf`), so a program with NO inline-shape
+// fields — like the compiler itself — interns nothing here and its struct layout is unchanged.
+function collectNestedFieldShapes(stmts: i32[]) {
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is TypeDecl {
+      if variantIndexOf(s.tdName) < 0 && gaeLtAt(s.tdName) < 0 {
+        const fields = s.tdFields
+        let fi = 0
+        while fi < fields.length {
+          const fnode = P.nodes[fields[fi]]
+          if fnode is FieldDef {
+            let nm = tyNameOf(fnode.fdType)
+            const nb = nullablePartOf(nm)
+            if nb != "" { nm = nb }
+            while (
+              nm.length > 2 &&
+              nm[nm.length - 2] == '[' &&
+              nm[nm.length - 1] == ']'
+            ) {
+              nm = nm.slice(0, nm.length - 2)
+            }
+            internInlineShape(nm)
+          }
+          fi = fi + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+export function collectS(stmts: i32[]) {
+  sDeclared = false
+  sNames = []
+  sFieldNames = []
+  sFieldStart = []
+  sFieldCount = []
+  sFieldTypes = []
+  sFieldElemName = []
+  // Nested inline-shape FIELD types intern first, so the struct decls that reference them resolve.
+  collectNestedFieldShapes(stmts)
+  // A `type X = {…}` that is a UNION VARIANT is collected by `collectU` into its own
+  // variant table — it is NOT a standalone struct, so skip it here. Any OTHER struct
+  // `type` (e.g. `ast.vl`'s `Tok`/`Diag`, declared alongside the `Node` union) IS a
+  // standalone struct and is interned here, so standalone structs coexist with a union.
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    // A STRUCT-ALIAS union decl (a canonicalized object intersection — single
+    // inline-shape variant) is a plain named struct: intern it here (collectU
+    // skipped it).
+    if s is UnionDecl {
+      const aliasShape = unionStructAliasShape(s.udVariants)
+      if aliasShape != "" {
+        if internShapeAs(s.udName, aliasShape) < 0 { return -1 }
+      }
+    }
+    // A union variant `TypeDecl` is owned by the variant table, NOT a standalone
+    // struct; a GENERIC alias declaration ("Box<T>") has no concrete shape — its
+    // APPLICATIONS intern via `collectGenAliasShapes` below.
+    if s is TypeDecl {
+      if variantIndexOf(s.tdName) < 0 && gaeLtAt(s.tdName) < 0 {
+        sDeclared = true
+        sNames.push(s.tdName)
+        sFieldStart.push(sFieldNames.length)
+        const fields = s.tdFields
+        let cnt = 0
+        let fi = 0
+        while fi < fields.length {
+          const fnode = P.nodes[fields[fi]]
+          if fnode is FieldDef {
+            const code = fieldTypeCode(fnode.fdType)
+            if code < 0 {
+              return emitFail(
+                "emitProgram: only i32 / boolean / string / array struct fields are supported",
+              )
+            }
+            sFieldTypes.push(code)
+            // A literal-union atom field (code 0) records its union NAME (not the ref-elem name,
+            // which is "" for it) so `sFieldIsLitUnion` recovers the atom rep + membership.
+            let elemNm = fieldRefElemName(fnode.fdType)
+            if code == 0 {
+              const ftn = tyNameOf(fnode.fdType)
+              if nameIsLitUnionType(ftn) { elemNm = ftn }
+            }
+            sFieldElemName.push(elemNm)
+            sFieldNames.push(fnode.fdName)
+            // A value-union field interns its box reps (collectAnnShapes parity).
+            if code == 16 {
+              registerValueUnionName(fieldRefElemName(fnode.fdType))
+            }
+            forceScalarListField(code)
+            cnt = cnt + 1
+          } else {
+            return emitFail("emitProgram: malformed struct field")
+          }
+          fi = fi + 1
+        }
+        sFieldCount.push(cnt)
+      }
+    }
+    i = i + 1
+  }
+  // Generic-alias APPLICATION shapes next (the declared structs they may
+  // reference are interned above; their own names then resolve as code-15
+  // struct-ref fields and annotation/literal sites).
+  gaeCollectDecls(stmts)
+  collectGenAliasShapes()
+  // Inline object-TYPE annotation shapes first, so a literal whose values are
+  // unclassifiable param reads (`{ x: n }`) still matches the annotation's shape.
+  collectAnnShapes()
+  collectAnonShapes()
+}
+
+// ── union collection (G1) ─────────────────────────────────────────────────────
+// The struct field names + per-field wasm-type codes (`0` i32/boolean, `3` string) of
+// the `TypeDecl` named `name` are recorded into the flat
+// `uFieldNames`/`uFieldStart`/`uFieldCount`/`uFieldTypes` table (declaration order =
+// wasm field index). The struct must exist among the top-level statements and carry
+// only i32/boolean/string fields, else fails loudly. Returns 0, or -1 (via `emitFail`).
+// Parse the inline-shape variant `nm` (`{x:i32,y:string}`) into the flat
+// union-variant field tables — the variant-table twin of `collectAnnShapes`'s
+// field split (same depth-aware `,`/`:` grammar).
+function collectShapeVariantFields(nm: string) {
+  const inner = nm.slice(1, nm.length - 1)
+  uFieldStart.push(uFieldNames.length)
+  let cnt = 0
+  let depth = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    const atEnd = k == inner.length
+    let brk = false
+    if !atEnd {
+      if inner[k] == '{' || inner[k] == '[' || inner[k] == '(' {
+        depth = depth + 1
+      }
+      if inner[k] == '}' || inner[k] == ']' || inner[k] == ')' {
+        depth = depth - 1
+      }
+      if inner[k] == ',' && depth == 0 { brk = true }
+    } else {
+      brk = true
+    }
+    if brk {
+      const part = inner.slice(start, k)
+      const ci = part.indexOf(":")
+      if ci <= 0 {
+        return emitFail("emitProgram: malformed inline union-variant shape")
+      }
+      const ftxt = part.slice(ci + 1, part.length)
+      const fc = nameFieldCode(ftxt)
+      if fc < 0 {
+        return emitFail(
+          "emitProgram: only i32 / boolean / string / array union-variant fields are supported",
+        )
+      }
+      uFieldTypes.push(fc)
+      uFieldElemName.push(shapeFieldElemName(ftxt, fc))
+      uFieldNames.push(part.slice(0, ci))
+      cnt = cnt + 1
+      start = k + 1
+    }
+    k = k + 1
+  }
+  uFieldCount.push(cnt)
+  0
+}
+
+function collectVariantFields(stmts: i32[], name: string) {
+  // An INLINE-SHAPE variant (`{x:i32}` inside `{x:i32}|{y:i32}`) carries its
+  // fields in its own text — parse them (the annotation-shape field grammar)
+  // instead of looking for a TypeDecl.
+  if name.length >= 2 {
+    if name[0] == '{' && name[1] != '[' && name[name.length - 1] == '}' {
+      return collectShapeVariantFields(name)
+    }
+  }
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is TypeDecl {
+      if s.tdName == name {
+        uFieldStart.push(uFieldNames.length)
+        const fields = s.tdFields
+        let cnt = 0
+        let fi = 0
+        while fi < fields.length {
+          const fnode = P.nodes[fields[fi]]
+          if fnode is FieldDef {
+            const code = fieldTypeCode(fnode.fdType)
+            if code < 0 {
+              return emitFail(
+                "emitProgram: only i32 / boolean / string / array union-variant fields are supported",
+              )
+            }
+            uFieldTypes.push(code)
+            uFieldElemName.push(fieldRefElemName(fnode.fdType))
+            uFieldNames.push(fnode.fdName)
+            cnt = cnt + 1
+          } else {
+            return emitFail("emitProgram: malformed union-variant field")
+          }
+          fi = fi + 1
+        }
+        uFieldCount.push(cnt)
+        return 0
+      }
+    }
+    i = i + 1
+  }
+  emitFail("emitProgram: union variant names an unknown struct type")
+}
+
+// Assign each variant its GLOBAL tag = its rank when the variants are ordered by
+// structural signature (mirroring `toWasm.ts`'s sorted `variantKey` tag assignment).
+// `uTags[i]` is variant i's tag: the number of variants whose sig sorts strictly
+// before variant i's (sigs are distinct, so this is a dense 0..n-1 permutation).
+function assignTags() {
+  uTags = []
+  let i = 0
+  while i < uVariants.length {
+    const sigI = variantSig(i)
+    let rank = 0
+    let j = 0
+    while j < uVariants.length {
+      if j != i {
+        const sigJ = variantSig(j)
+        if strLess(sigJ, sigI) { rank = rank + 1 }
+      }
+      j = j + 1
+    }
+    uTags.push(rank)
+    i = i + 1
+  }
+  0
+}
+
+// Register the inline union synthetic name `name` (e.g. `"A|B"`) as a union alias in
+// the per-union tables, exactly as `collectU` registers a `UnionDecl`: record the
+// name + its variant-slice range, append each member to the GLOBAL `uVariants` list,
+// and collect each member's fields into the flat table. A no-op if `name` is already
+// a registered union (a named alias OR a previously-seen inline annotation), or if it
+// is not an inline struct-variant union. Returns 0, or -1 (via `emitFail`).
+function registerInlineUnion(stmts: i32[], name: string) {
+  if isUName(name) { return 0 }
+  // A VALUE union (`i32 | null`, `string | i32`, `i32 | f64`) registers the name
+  // alone — it owns NO variant structs (its members are scalar atoms whose tags
+  // come from `scalarTagOf` and whose payloads ride the shared value boxes), so
+  // its variant slice is empty. Registering interns the shared box (`uDeclared`)
+  // and the per-rep value boxes it needs.
+  if isValueUnionName(name) { return registerValueUnionName(name) }
+  // A union used ONLY as a COLLECTION element / value (`(C | S)[]`, `{[string]: C | S}`)
+  // registers that INNER union — without this a union that never appears in a param /
+  // return / let / field annotation (only inside a collection) is never interned, so an
+  // `is` over a read element fails ("`is` test but no union type declared"). RECURSE on the
+  // inner name through the same dispatch: a VALUE element union → the shared box (the
+  // `(string|i32)[]` case `parenUnionArrElemName` already covered), a STRUCT / heterogeneous
+  // element union → its variant structs, and a non-union inner (`i32`, a struct, a registered
+  // alias) → a self-gated no-op. Map values nest (`{[string]: (C|S)[]}` → `(C|S)[]` → `C|S`).
+  const pun = parenUnionArrElemName(name)
+  if pun != "" { return registerInlineUnion(stmts, pun) }
+  // A NESTED array of an inline union (`(C|D)[][]`, `(C|D)[][][]`): `parenUnionArrElemName` only
+  // matches a SINGLE-bracket `(…)[]`, so strip the OUTER `[]` and recurse on the element list,
+  // reaching the inner union at any depth — the registration dual of the recursive ref-array
+  // interning. Bottoms out at the 1D `(…)[]` (the `pun` path above).
+  if nameIsArray(name) {
+    const inner = name.slice(0, name.length - 2)
+    if nameIsArray(inner) { return registerInlineUnion(stmts, inner) }
+  }
+  if nameIsMap(name) {
+    const mvn = mapValNameOf(name)
+    if mvn != "" { return registerInlineUnion(stmts, mvn) }
+  }
+  // A function-type annotation (`(i32) => C | S`) carries an inline union in its RETURN (a closure
+  // value whose result is a union). Register that return union so a value call's result narrows —
+  // the function type itself is not a union. Mirrors the array/map element recursion above.
+  if name.length > 0 && name[0] == '(' {
+    const fra = annArrowAt(name)
+    if fra >= 1 {
+      return registerInlineUnion(
+        stmts,
+        monoUnwrapParens(name.slice(fra + 2, name.length)),
+      )
+    }
+  }
+  if !isVariantBoxUnion(stmts, name) { return 0 }
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  uDeclared = true
+  unNames.push(name)
+  unMemberSet.push(name)
+  unVarStart.push(uVariants.length)
+  // Only STRUCT members occupy variant slots (a `null` atom rides the tag, a value-atom
+  // tags via `scalarTagOf` and boxes into the shared value boxes). Count + push the
+  // struct variants; mark the value-box reps the scalar atoms need (the MIXED case).
+  let nStructs = 0
+  let cnt = 0
+  while cnt < atoms.length {
+    if atoms[cnt] != "null" {
+      if isStructAtom(stmts, atoms[cnt]) { nStructs = nStructs + 1 }
+    }
+    cnt = cnt + 1
+  }
+  unVarCount.push(nStructs)
+  let vi = 0
+  while vi < atoms.length {
+    if atoms[vi] != "null" {
+      if isStructAtom(stmts, atoms[vi]) {
+        uVariants.push(atoms[vi])
+        if collectVariantFields(stmts, atoms[vi]) < 0 { return -1 }
+      }
+    }
+    vi = vi + 1
+  }
+  // A MIXED union's scalar members box exactly like a value union's — intern their
+  // per-rep value boxes (a no-op for an all-struct union: no value atoms).
+  markValueUnionAtoms(name)
+  0
+}
+
+// ── usage-driven `let x = null` nullable-hole inference (A-infer-null) ───────
+// The host's hole-bearing `null`: an UN-ANNOTATED `let x = null` is NOT pinned to
+// the exact `null` type — a later assignment `x = e` fills the hole's `T`, so `x`
+// is the value union `T | null`. The native mirror infers `T` once at collection
+// time (the FIRST classifiable assignment in the binding's enclosing statement
+// list, descending into branch/loop blocks but NOT nested function bodies — their
+// same-named locals are different bindings), registers `T|null` as a value union
+// (interning its box reps), and records it per LetDecl arena index so every later
+// classifier (`letIsUnion` / `letUnionNameOf` / `globalCellKind`) sees the union.
+// (The `nliLetIxs`/`nliNames` tables are declared with the narrowing stack —
+// module-level `let`s must precede their first textual use site.)
+
+// Infer + register the null hole of the un-annotated `let x = null` at
+// `walk[i]`, scanning the REST of `walk` for the filling assignment.
+function nliInferLet(walk: i32[], i: i32) {
+  const s = P.nodes[walk[i]]
+  if s is LetDecl {
+    if s.letType < 0 && s.letInit >= 0 {
+      const ini = P.nodes[s.letInit]
+      if ini is NullLit {
+        const atom = nliScanStmts(walk, i + 1, s.letName)
+        if atom != "" {
+          const nn = atom + "|null"
+          registerValueUnionName(nn)
+          nliLetIxs.push(walk[i])
+          nliNames.push(nn)
+        }
+      }
+    }
+  }
+  0
+}
+
+// Infer + register the value union of an un-annotated `const x = <if-expression>` at
+// `walk[i]` — the if-expression counterpart of `nliInferLet`. Records it in the same
+// `nli` tables so `nliNameOf` drives the slot classification (`letIsUnion` → kind 4 box)
+// and the binding-init emit (`emitNullableIfBinding` via `letUNm`), reusing the
+// annotated-binding lowering with NO annotation. The union NAME comes from the CHECKER's
+// inferred-binding export (`inferLetNameOf`) — which already resolved the arm types
+// (so an ident/expression arm `if c then v else null` works) and the numeric-widening
+// join (`if c then 1 else 2.5` is f64, not a union) — falling back to a static atom
+// derivation (`ifExprNliName`) for any binding the export does not carry.
+function nliInferIfLet(walk: i32[], i: i32) {
+  const s = P.nodes[walk[i]]
+  if s is LetDecl {
+    if s.letType < 0 && s.letInit >= 0 {
+      if exprIsIfStmt(s.letInit) {
+        let nn = inferLetNameOf(walk[i])
+        if nn == "" { nn = ifExprNliName(s.letInit) }
+        if nn != "" {
+          registerValueUnionName(nn)
+          nliLetIxs.push(walk[i])
+          nliNames.push(nn)
+        }
+      }
+    }
+  }
+  0
+}
+
+// Scan every top-level FuncDecl's parameter + return annotations and every top-level
+// `let`/`const` annotation for INLINE union types, registering each as a synthetic
+// union alias (so it interns its variant shapes + heap types exactly like a named
+// alias). Must run AFTER the `UnionDecl` pass (so an inline name matching a named
+// alias is a no-op) and BEFORE `assignTags` (which ranks the FINAL `uVariants` set).
+// Returns 0, or -1 (via `emitFail`).
+function collectInlineUnions(stmts: i32[]) {
+  nliLetIxs = []
+  nliNames = []
+  collectInlineUnionsIn(stmts, stmts)
+}
+
+// The recursive worker: scan the statement list `walk` (registering against the
+// TOP-LEVEL `stmts`, where struct `TypeDecl`s live), descending into function
+// bodies and branch blocks so a `let v: A | B = …` INSIDE a function (or a nested
+// `if`/loop body) registers its inline union too — value unions especially appear
+// as local annotations, not just at module scope.
+function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
+  let i = 0
+  while i < walk.length {
+    const s = P.nodes[walk[i]]
+    if s is FuncDecl {
+      // Read both annotation-bearing fields of the narrowed `s` BEFORE the inner loop
+      // introduces a `Param` narrowing (a fresh `is`-narrowing pins its own binding;
+      // reading `s.fnRet` after it would no longer see `s`'s FuncDecl narrowing).
+      const params = s.fnParams
+      const retTy = s.fnRet
+      const fnBody = s.fnBody
+      if registerInlineUnion(stmts, tyNameOf(retTy)) < 0 { return -1 }
+      let pi = 0
+      while pi < params.length {
+        const p = P.nodes[params[pi]]
+        if p is Param {
+          if registerInlineUnion(stmts, tyNameOf(p.parType)) < 0 { return -1 }
+        }
+        pi = pi + 1
+      }
+      if collectInlineUnionsBlock(stmts, fnBody) < 0 { return -1 }
+    } else if s is LetDecl {
+      if registerInlineUnion(stmts, tyNameOf(s.letType)) < 0 { return -1 }
+      // Usage-driven `let x = null` hole (A-infer-null): infer + register `T|null`.
+      nliInferLet(walk, i)
+      // An un-annotated `const x = if … then … else …` whose arms join to a value
+      // union: register the inferred name so the slot classifies + lowers like an
+      // annotated nullable/value-union binding.
+      nliInferIfLet(walk, i)
+    } else if s is TypeDecl {
+      // A struct FIELD annotated with an inline union (`type T = { v: A | B }`,
+      // `{ v: A | i32 }`) registers that union here — in `collectU`, BEFORE `collectS`
+      // interns the variant heap types — so the field classifies as the kind-16 box
+      // (`fieldTypeCode` sees `isUName`). A value-union field is interned at field
+      // collection instead; this is the struct/heterogeneous variant-box case.
+      const flds = s.tdFields
+      let tfi = 0
+      while tfi < flds.length {
+        if flds[tfi] >= 0 {
+          const fdn = P.nodes[flds[tfi]]
+          if fdn is FieldDef {
+            if registerInlineUnion(stmts, tyNameOf(fdn.fdType)) < 0 {
+              return -1
+            }
+          }
+        }
+        tfi = tfi + 1
+      }
+    } else if s is IfStmt {
+      const thenB = s.ifThen
+      const elseN = s.ifElse
+      if collectInlineUnionsBlock(stmts, thenB) < 0 { return -1 }
+      if elseN >= 0 {
+        const els = P.nodes[elseN]
+        if els is Block {
+          if collectInlineUnionsBlock(stmts, elseN) < 0 { return -1 }
+        } else {
+          // `else if`: a lone nested statement — wrap it in a one-shot walk.
+          const one: i32[] = []
+          one.push(elseN)
+          if collectInlineUnionsIn(stmts, one) < 0 { return -1 }
+        }
+      }
+    } else if s is WhileStmt {
+      if collectInlineUnionsBlock(stmts, s.whileBody) < 0 { return -1 }
+    } else if s is ForRange {
+      if collectInlineUnionsBlock(stmts, s.frBody) < 0 { return -1 }
+    } else if s is ForIn {
+      if collectInlineUnionsBlock(stmts, s.fiBody) < 0 { return -1 }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Recurse into a Block node's statement list (a function body / branch arm).
+function collectInlineUnionsBlock(stmts: i32[], blockIx: i32) {
+  if blockIx < 0 { return 0 }
+  const b = P.nodes[blockIx]
+  if b is Block { return collectInlineUnionsIn(stmts, b.blkStmts) }
+  0
+}
+
+// Scan the top-level statements for EVERY union alias `type N = A | B | …` (a
+// `UnionDecl`); for each, record its name + variant-slice range in the per-union table
+// (`unNames`/`unVarStart`/`unVarCount`), append its variant struct names to the GLOBAL
+// `uVariants` list, collect each variant's i32 fields into the flat table, and finally
+// assign globally-unique tags across all variants of all unions. Multiple unions
+// coexist (mirroring the multi-struct table). Returns 0, or -1 (via `emitFail`).
+export function collectU(stmts: i32[]) {
+  uDeclared = false
+  vbI32Used = false
+  vbI64Used = false
+  vbF32Used = false
+  vbF64Used = false
+  unNames = []
+  unMemberSet = []
+  unVarStart = []
+  unVarCount = []
+  uVariants = []
+  uFieldNames = []
+  uFieldStart = []
+  uFieldCount = []
+  uFieldTypes = []
+  uFieldElemName = []
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is UnionDecl {
+      // A STRUCT-ALIAS union (single inline-shape variant — a canonicalized
+      // `type AB = {…} & {…}` object intersection) is a named STRUCT, not a
+      // union: `collectS` interns it; skip it here.
+      if unionStructAliasShape(s.udVariants) != "" {
+        i = i + 1
+        continue
+      }
+      uDeclared = true
+      const vs = s.udVariants
+      if vs.length < 1 {
+        return emitFail("emitProgram: union must have at least one variant")
+      }
+      unNames.push(s.udName)
+      // The alias's full member set, pipe-joined (atom members like `null` kept).
+      let udSet = ""
+      let usj = 0
+      while usj < vs.length {
+        if udSet != "" { udSet = udSet + "|" }
+        udSet = udSet + vs[usj]
+        usj = usj + 1
+      }
+      unMemberSet.push(udSet)
+      unVarStart.push(uVariants.length)
+      // Only the STRUCT variants get a variant struct + fields; an atom member
+      // (`string`/`i32`/…) of a MIXED union (`{x:i32} | string`) boxes through the shared
+      // value boxes, exactly as the inline-annotation path registers it. (A pure struct
+      // union has every variant a struct, so this stays byte-identical for `Cat | Dog`.)
+      let nStructs = 0
+      let nc = 0
+      while nc < vs.length {
+        if vs[nc] != "null" {
+          if isStructAtom(stmts, vs[nc]) { nStructs = nStructs + 1 }
+        }
+        nc = nc + 1
+      }
+      unVarCount.push(nStructs)
+      let vi = 0
+      while vi < vs.length {
+        if vs[vi] != "null" {
+          if isStructAtom(stmts, vs[vi]) {
+            uVariants.push(vs[vi])
+            if collectVariantFields(stmts, vs[vi]) < 0 { return -1 }
+          }
+        }
+        vi = vi + 1
+      }
+      // A MIXED union's scalar members intern their per-rep value boxes (no-op for an
+      // all-struct union).
+      markValueUnionAtoms(udSet)
+    }
+    i = i + 1
+  }
+  // Inline union annotations (`v: A | B`) carry no `UnionDecl`; register each as a
+  // synthetic alias keyed on its pipe-joined name, so its variant shapes are interned
+  // and every name-keyed lookup treats it like a named alias. Runs after the
+  // `UnionDecl` pass (so a matching named alias makes the inline form a no-op) and
+  // before `assignTags` (which ranks the FINAL variant set).
+  if collectInlineUnions(stmts) < 0 { return -1 }
+  // Inferred VALUE-union returns (`i32 | string` / `i32 | null`) AND inferred STRUCT-union
+  // returns (`Cat | Dog`): register each so its reps intern — even when an inferred
+  // return is the program's ONLY union. `registerInlineUnion` dispatches on the name
+  // shape (a value union → the shared box; a struct union → its variant structs) and
+  // self-gates / dedups (`isUName`), so scalar/array entries and already-declared unions
+  // are no-ops.
+  let iru = 0
+  while iru < inferRetCount() {
+    if registerInlineUnion(stmts, inferRetTyAt(iru)) < 0 { return -1 }
+    iru = iru + 1
+  }
+  // Inferred VALUE-union BINDINGS (`const x = if c then v else null`): same treatment,
+  // so an inferred binding union's box reps intern even when it is the program's only
+  // value union and `nliInferIfLet` is the only consumer. Self-gating, like the returns.
+  let ilu = 0
+  while ilu < inferLetCount() {
+    registerValueUnionName(inferLetTyAt(ilu))
+    ilu = ilu + 1
+  }
+  if uDeclared {
+    if assignTags() < 0 { return -1 }
+  }
+  0
+}
+
+// Detect bare named-function VALUE uses the other flips miss (arena scan): a
+// `let`/`const` initialized to a function name (`const f = inc`), a reassignment
+// (`x = inc`), a function name as an equality operand (`inc == h`), or a
+// function-valued object-literal field (`{ f: inc }` — `collectAnonShapes`' own
+// flip is wiped by `collectFns`' reset, which runs after `collectS`; a LAMBDA
+// field re-flips during the lift, a named-function field only here). Each such
+// cell is a closure fat-pointer (kind 14), so the closure rec-group types must
+// intern (`fnValUsed`) even when no lambda/`.map` site otherwise flips it.
+// Programs without such uses set nothing — every golden stays byte-identical.
+export function collectFnValUse() {
+  let i = 0
+  while i < P.nodes.length {
+    const nd = P.nodes[i]
+    if nd is LetDecl {
+      if exprIsBareFnName(nd.letInit) { fnValUsed = true }
+    }
+    if nd is BinExpr {
+      if nd.binOp == "=" || nd.binOp == "==" || nd.binOp == "!=" {
+        if exprIsBareFnName(nd.binLeft) { fnValUsed = true }
+        if exprIsBareFnName(nd.binRight) { fnValUsed = true }
+      }
+    }
+    if nd is FieldInit {
+      if exprIsBareFnName(nd.fiValue) { fnValUsed = true }
+    }
+    // A closure if-VALUE whose ARM is a bare named function (`if c then inc else dec`): the
+    // named function is used as a VALUE, so flip `fnValUsed` so its `$fnsig` interns (a lambda
+    // arm already flips it during lifting). The loop visits every `IfStmt`, so this covers a
+    // binding / return / argument if-value alike; an `else if` chain's nested `IfStmt` is its own
+    // node, visited the same way, so each arm pair is checked.
+    if nd is IfStmt {
+      if exprIsBareFnName(ifArmValueExpr(nd.ifThen)) { fnValUsed = true }
+      if nd.ifElse >= 0 {
+        const el = P.nodes[nd.ifElse]
+        if el is Block {
+          if exprIsBareFnName(ifArmValueExpr(nd.ifElse)) { fnValUsed = true }
+        }
+      }
+    }
+    // A SOURCE function-type ANNOTATION (`f: (i32) => i32`, a `(…)=>…` TypeRef) flips the
+    // function-value machinery on — the annotated param/field/binding is a closure
+    // fat-pointer (kind 14) whose call site `call_ref`s through it, so its signature must
+    // intern (`collectCloSigs`), exactly like a lifted lambda or a monomorphized
+    // closure-pinned param.
+    if nd is TypeRef {
+      if tyIsFuncType(i) { fnValUsed = true }
+      // A closure-ARRAY annotation (`((i32) => i32)[]`) ALSO uses function values — its
+      // elements are closures stored/indexed/called through the array — so it flips the
+      // machinery on too. (`tyIsFuncType` is now top-level-arrow only, so the nested arrow
+      // here no longer trips it; without this, an array of functions whose ONLY function-type
+      // mention is the array annotation would leave its element signatures un-interned and a
+      // `fs[i](x)` call would find no signature.)
+      if nameIsClosureArrayTy(i) == 1 { fnValUsed = true }
+    }
+    // An inferred CLOSURE-element array LITERAL (`const fs = [add, mul]`, no annotation): the
+    // checker typed its element as a function type (`=>` in the element name), so its elements are
+    // closures stored / indexed / called through the array — flip the machinery on to intern their
+    // signatures, exactly as the closure-array ANNOTATION above does.
+    if nd is ArrayLit {
+      const aen = nodeArrayElemName(i)
+      if aen != "" {
+        if strContains(aen, "=>") { fnValUsed = true }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+export function collectMapFilterUse() {
+  let i = 0
+  while i < P.nodes.length {
+    const nd = P.nodes[i]
+    if nd is Call {
+      const callee = P.nodes[nd.callFn]
+      if callee is Member {
+        if callee.memProp == "map" || callee.memProp == "filter" {
+          if nd.callArgs.length == 1 {
+            fnValUsed = true
+            if callee.memProp == "map" {
+              const fe = mfCallbackFe(nd.callArgs[0], -1)
+              if fe >= 0 && cloRetIsString(fe) {
+                // A string-returning callback: the result list is a string list, which may be
+                // the program's ONLY one (an i32/struct source mapped to strings) — force its
+                // wrapper/backing collection.
+                slUsed = true
+              } else if fe >= 0 && cloRetValKind(fe) == "struct" {
+                // A STRUCT-returning callback (`P[].map((p) => Q-shape)`): the result is a NEW
+                // ref list of the callback's result struct — intern ITS slot (a `Q` reached only
+                // as a map result has no `Q[]` annotation to force it) so `emitModule` assigns its
+                // wrapper/backing and `mfResultSlotOf` resolves it. `cloRetKindOf` folds a struct
+                // to -1, so consult `cloRetValKind`/`cloRetValSlot` directly.
+                const rsi = cloRetValSlot(fe)
+                if rsi >= 0 && rsi < sNames.length {
+                  rlInternName(sNames[rsi], 1)
+                  rlUsed = true
+                  raUsed = true
+                }
+              } else if fe >= 0 && cloRetValKind(fe) == "variant" {
+                // A concrete-VARIANT-returning callback (a collapse): intern the variant's
+                // ref-list slot (kind 1 — its element heap is `uVarIdx + vi`).
+                const cvi = cloRetValSlot(fe)
+                if cvi >= 0 && cvi < uVariants.length {
+                  rlInternName(uVariants[cvi], 1)
+                  rlUsed = true
+                  raUsed = true
+                }
+              } else if (
+                fe >= 0 &&
+                cloRetValKind(fe) == "union" &&
+                unNames.length > 0
+              ) {
+                // A UNION-returning callback (`xs.map((a) => unionVal)`): the result is a ref
+                // list of union boxes (element kind 2). Intern the union alias's slot so a map
+                // whose source is NOT itself a union array still has a result backing.
+                rlInternName(unNames[0], 2)
+                rlUsed = true
+                raUsed = true
+              } else {
+                let rk = 0
+                if fe >= 0 { rk = cloRetKindOf(fe) }
+                if rk == 11 {
+                  fa64Used = true
+                } else {
+                  aUsed = true
+                  lUsed = true
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
