@@ -987,3 +987,78 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "vl-fmt: a comment after the last statement of a body stays inside the closing brace",
+  ignore: !ENABLED,
+  fn: async () => {
+    // Function declaration, arrow-lambda body, and match-arm block: each used to
+    // leak a body-final comment past its `}` (after the program's final `}` for
+    // a top-level function).
+    const src =
+      "function f() {\n" +
+      "  print(1)\n" +
+      "  // done here\n" +
+      "}\n" +
+      "const g = (n: i32) => {\n" +
+      "  print(n)\n" +
+      "  // tail\n" +
+      "}\n" +
+      "type K = \"a\" | \"b\"\n" +
+      "function h(k: K): i32 {\n" +
+      "  match k {\n" +
+      "    \"a\" => {\n" +
+      "      print(1)\n" +
+      "      // chose a\n" +
+      "      1\n" +
+      "    }\n" +
+      "    _ => 2\n" +
+      "  }\n" +
+      "}\n" +
+      "f()\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!/ {2}\/\/ done here\n\}/.test(r.out)) {
+      throw new Error(`function-final comment leaked past its }:\n${r.out}`);
+    }
+    if (!/ {2}\/\/ tail\n\}/.test(r.out)) {
+      throw new Error(`lambda-final comment leaked past its }:\n${r.out}`);
+    }
+    if (!/ {6}\/\/ chose a\n {6}1\n {4}\}/.test(r.out)) {
+      throw new Error(`match-arm block comment misplaced:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) {
+      throw new Error(`not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a comment inside an import name list keeps the import verbatim (no corruption, no duplication)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // Reflowing this list onto one line would put the names after the `//` —
+    // and the `} from "…"` tail — inside the comment, silently deleting the
+    // import. The import must stay as written, the comment emitted exactly once.
+    const src =
+      "import {\n" +
+      "  alpha, // the first\n" +
+      "  beta,\n" +
+      "} from \"./x\"\n" +
+      "print(alpha + beta)\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!/import \{\n {2}alpha, \/\/ the first\n {2}beta,\n\} from "\.\/x"/.test(r.out)) {
+      throw new Error(`comment-bearing import not kept verbatim:\n${r.out}`);
+    }
+    const copies = (r.out.match(/\/\/ the first/g) ?? []).length;
+    if (copies !== 1) {
+      throw new Error(`expected exactly 1 comment copy, got ${copies}:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) {
+      throw new Error(`not idempotent:\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`);
+    }
+  },
+});
