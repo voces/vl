@@ -47,11 +47,14 @@
 //     checker attaches; the native type checker ALREADY emits the equivalent
 //     `never`-type error itself, so the standalone lint adds nothing here.
 //
-// KNOWN DIVERGENCE (name-keying vs binding identity): use/write tracking keys by
-// NAME, so a file that SHADOWS a name (an inner binding reusing an outer name, or
-// a method/field whose name equals a function's) can differ from the oracle's
-// binding-identity model. Exact for programs without same-name shadowing (the
-// common case and the whole lint corpus).
+// BINDING IDENTITY: variable/parameter use/write tracking is BINDING-keyed — a
+// lexical scope stack resolves each `Ident` occurrence to the innermost visible
+// declaration (see the binding-scan section) — so an inner binding reusing an
+// outer binding's name no longer masks the outer one. FUNCTION references stay
+// name-keyed (functions are hoisted and dispatch by name — `Call` callees,
+// UFCS `.m(…)` properties, operator methods), which is also the residual
+// divergence: a local shadowing a FUNCTION name attributes the name's uses to
+// the local. Exact for programs that don't shadow function names.
 
 import { Checker, T, tErr } from "./typecheck"
 import { capScan } from "./wasmEmit"
@@ -210,12 +213,12 @@ export function lint(progRoot: i32) {
     // Rule order: unused-variable, unused-function, prefer-const, then one
     // full-program walk per structural rule. Display order is position-sorted
     // downstream (the CLI's stable sort), so the emit sequence here only breaks
-    // same-position ties. The use/write reference set drives the binding rules
+    // same-position ties. The binding/reference scan drives the binding rules
     // and unused-function alike, so collect it once first.
-    collectReferencedNames(progRoot)
-    unusedBindings(progRoot)
+    collectBindingsAndRefs(progRoot)
+    unusedBindings()
     unusedFunctions(stmts)
-    preferConst(progRoot)
+    preferConst()
     lintWalk(lintRuleUnreachable, progRoot)
     lintWalk(lintRuleConstBranch, progRoot)
     lintWalk(lintRuleStepZero, progRoot)
@@ -229,21 +232,20 @@ export function lint(progRoot: i32) {
 // place that knows each variant's child slots, and `lintWalk` drives a pre-order
 // traversal calling one rule's per-node visit, selected by a rule id (module-
 // level function dispatch — the codebase's no-closures idiom). Growing the AST
-// means extending `nodeChildren` once; every rule picks the new kind up.
-const lintRuleRef = 0
-const lintRuleDecl = 1
-const lintRuleConstBranch = 2
-const lintRuleStepZero = 3
-const lintRuleUnreachable = 4
+// means extending `nodeChildren` once; every rule picks the new kind up. (The
+// binding/reference scan is the one traversal NOT driven through `lintWalk`: it
+// needs scope enter/exit and statement ordering — see `bindScan` — but its
+// default case still recurses through `nodeChildren`.)
+const lintRuleConstBranch = 0
+const lintRuleStepZero = 1
+const lintRuleUnreachable = 2
 
 // Visit `ix` for `rule`, then recurse into its children (pre-order: a rule sees
 // a node before any of its descendants). `-1` child slots (absent) and any
 // out-of-range index are skipped by the bounds check, so the walk never traps.
 function lintWalk(rule: i32, ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
-  if rule == lintRuleRef { refVisit(ix) }
-  else if rule == lintRuleDecl { declVisit(ix) }
-  else if rule == lintRuleConstBranch { constantBranchVisit(ix) }
+  if rule == lintRuleConstBranch { constantBranchVisit(ix) }
   else if rule == lintRuleStepZero { degenerateStepVisit(ix) }
   else if rule == lintRuleUnreachable { unreachableVisit(ix) }
   const kids = nodeChildren(ix)
@@ -540,43 +542,90 @@ function unreachableVisit(ix: i32) {
 // Exemptions matching the TS rule: an `export`ed function is public surface
 // (never flagged); a `_`-prefixed name is the intentionally-unused marker
 // (downgraded to a `hint`, not a warning).
-let lintRefNames: string[] = []
-// Names that appear as the LHS of an assignment (`x = …`, including the desugared
-// `x += …` / `x++`). prefer-const flags a `let` that is referenced but never here.
-let lintWriteNames: string[] = []
+// A string-keyed presence map (the `idxByName` idiom): O(1) has/add per name,
+// where the previous string-array scan was O(names) per identifier.
+let lintRefNames: {[string]: i32} = Map()
 
-function writeNamesHas(name: string) {
-  let i = 0
-  while i < lintWriteNames.length {
-    if lintWriteNames[i] == name { return true }
-    i = i + 1
-  }
-  false
-}
-
-function writeNamesAdd(name: string) {
-  if !writeNamesHas(name) { lintWriteNames.push(name) }
-  0
-}
-
-function refNamesHas(name: string) {
-  let i = 0
-  while i < lintRefNames.length {
-    if lintRefNames[i] == name { return true }
-    i = i + 1
-  }
-  false
-}
+function refNamesHas(name: string) { (lintRefNames[name] ?? 0) != 0 }
 
 function refNamesAdd(name: string) {
-  if !refNamesHas(name) { lintRefNames.push(name) }
+  lintRefNames[name] = 1
   0
 }
 
-// Record a name only at the two precise shapes the TS walk records: the callee
-// IDENT of a `Call`, and any bare `Ident` value reference. The shared walker
-// carries the structural recursion; this visit inspects one node.
-function refVisit(ix: i32) {
+// ── Binding-keyed use/write tracking (the scope-aware scan) ──────────────────
+// unused-variable and prefer-const key on BINDING IDENTITY, not name: each
+// `let`/`const`/parameter declaration gets an entry in `declNodes`/`declKinds`
+// (source order) with parallel `declUsed`/`declWritten` flags, and every `Ident`
+// occurrence resolves to the INNERMOST visible binding of that name (a lexical
+// scope stack), marking only that binding. So an inner binding reusing an outer
+// binding's name no longer masks the outer one (name-keying's known divergence).
+//
+// The name map above still records EVERY referenced name: function/operator/
+// UFCS-method dispatch is name-keyed (`unusedFunctions`), and function names are
+// hoisted — they resolve without a scope position.
+//
+// Scope model (approximations, all conservative for the rules that consume it):
+//   - TOP-LEVEL `let`s are hoisted for resolution: a function body above a
+//     global's declaration still marks it used (functions only run later).
+//   - Block-local `let`s bind from their statement onward (their initializer is
+//     scanned first, so `let x = x + 1` reads the OUTER x).
+//   - A loop variable (`for v in …`) is a scope entry that shadows without
+//     being a reported binding (no unused-loop-variable rule yet).
+//   - FUNCTION names are not scope entries (name-keyed, hoisted, handled by
+//     unusedFunctions); a local `let` shadowing a function name attributes the
+//     name's uses to the `let` — exact for the no-shadowing common case.
+let declUsed: i32[] = []
+let declWritten: i32[] = []
+
+// The lexical scope stack: parallel (name, declNodes-index) entries; `-1` marks
+// a shadowing-only entry (a loop variable). Innermost binding = highest index.
+let visNames: string[] = []
+let visIds: i32[] = []
+
+// Register the declaration at node `ix` (kind 0 = let/const, 1 = param) and
+// push it onto the scope stack; returns its `declNodes` index.
+function bindPush(name: string, ix: i32, kind: i32) {
+  declNodes.push(ix)
+  declKinds.push(kind)
+  declUsed.push(0)
+  declWritten.push(0)
+  visNames.push(name)
+  visIds.push(declNodes.length - 1)
+  0
+}
+
+// Pop scope entries down to `mark` (a `visNames.length` captured at scope entry).
+function bindTrim(mark: i32) {
+  while visNames.length > mark {
+    visNames.pop()
+    visIds.pop()
+  }
+  0
+}
+
+// Resolve `name` to its innermost visible binding; `flag` 0 marks it USED,
+// 1 marks it WRITTEN. A shadowing-only entry (`visIds` -1, a loop variable)
+// stops resolution — the name is that entry's, not an outer binding's.
+function bindMark(name: string, flag: i32) {
+  let i = visNames.length - 1
+  while i >= 0 {
+    if visNames[i] == name {
+      const id = visIds[i]
+      if id >= 0 {
+        if flag == 0 { declUsed[id] = 1 } else { declWritten[id] = 1 }
+      }
+      return 0
+    }
+    i = i - 1
+  }
+  0
+}
+
+// Record the node-local names exactly as the TS walk does — the callee IDENT of
+// a `Call`, any bare `Ident` value reference, and operator-method dispatch —
+// into the name map, AND resolve Ident occurrences to their binding.
+function nameVisit(ix: i32) {
   const n = P.nodes[ix]
   if n is Call {
     // The TS `collectReferencedNames` records the callee NAME of every
@@ -592,20 +641,23 @@ function refVisit(ix: i32) {
       else if fn is Member { refNamesAdd(fn.memProp) }
     }
   } else if n is Ident {
+    // Every occurrence counts as a use — including an assignment LHS (the TS
+    // model, where a write occurrence is also a use, keeping a write-only
+    // binding off the unused-variable list).
     refNamesAdd(n.identName)
+    bindMark(n.identName, 0)
   } else if n is Unary {
     // An operator method (`-x` → `function -(self)`) dispatches by operator name;
     // the TS reference walk records it as a `FunctionCall` callee, so mirror it.
     refNamesAdd(n.unOp)
   } else if n is BinExpr {
     // An assignment `x = e` (the parser desugars `x += e` / `x++` to this shape)
-    // whose LHS is a bare name marks that name WRITTEN — prefer-const consults
-    // this. The LHS is still recorded as a reference (the walker visits it),
-    // matching the TS model where a write occurrence also counts as a use.
+    // whose LHS is a bare name marks that BINDING written — prefer-const
+    // consults this. The LHS Ident is still visited as a child (use + name).
     if n.binOp == "=" {
       if n.binLeft >= 0 && n.binLeft < P.nodes.length {
         const lhs = P.nodes[n.binLeft]
-        if lhs is Ident { writeNamesAdd(lhs.identName) }
+        if lhs is Ident { bindMark(lhs.identName, 1) }
       }
     } else {
       // An operator (`a + b` → `function +(self, b)`) dispatches by operator
@@ -617,10 +669,110 @@ function refVisit(ix: i32) {
   0
 }
 
-function collectReferencedNames(progRoot: i32) {
-  lintRefNames = []
-  lintWriteNames = []
-  lintWalk(lintRuleRef, progRoot)
+// Scan the initializer (and inert type slot) of the `LetDecl` at `six`, WITHOUT
+// binding its name — the Program arm hoists top-level bindings up front, and
+// the sequential arms bind AFTER the initializer, so `let x = x` reads outer x.
+function bindScanLetInit(six: i32) {
+  const s = P.nodes[six]
+  if s is LetDecl { bindScan(s.letInit) }
+  0
+}
+
+// The scope-aware traversal. Statements execute in order, so scope-introducing
+// nodes get explicit arms; everything else records its node-local names
+// (`nameVisit`) and recurses through the shared `nodeChildren`.
+function bindScan(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Program {
+    // Hoist top-level `let`s: bind them all first, so a use inside a function
+    // declared ABOVE the global still resolves to it, then scan statements.
+    const mark = visNames.length
+    let h = 0
+    while h < n.progStmts.length {
+      const six = n.progStmts[h]
+      if six >= 0 && six < P.nodes.length {
+        const s = P.nodes[six]
+        if s is LetDecl { bindPush(s.letName, six, 0) }
+      }
+      h = h + 1
+    }
+    let i = 0
+    while i < n.progStmts.length {
+      const six = n.progStmts[i]
+      if six >= 0 && six < P.nodes.length {
+        const s = P.nodes[six]
+        if s is LetDecl { bindScanLetInit(six) } else { bindScan(six) }
+      }
+      i = i + 1
+    }
+    bindTrim(mark)
+  } else if n is Block {
+    // A block scope: bindings a `LetDecl` statement pushes stay visible for the
+    // rest of the block and pop at its end.
+    const mark = visNames.length
+    let i = 0
+    while i < n.blkStmts.length {
+      bindScan(n.blkStmts[i])
+      i = i + 1
+    }
+    bindTrim(mark)
+  } else if n is LetDecl {
+    // Initializer first (reads the OUTER binding on a same-name init), then the
+    // binding — visible until the enclosing scope's trim.
+    bindScanLetInit(ix)
+    bindPush(n.letName, ix, 0)
+  } else if n is FuncDecl {
+    // A function scope: parameters, then the body block.
+    const mark = visNames.length
+    let p = 0
+    while p < n.fnParams.length {
+      const pix = n.fnParams[p]
+      if pix >= 0 && pix < P.nodes.length {
+        const pn = P.nodes[pix]
+        if pn is Param { bindPush(pn.parName, pix, 1) }
+      }
+      p = p + 1
+    }
+    bindScan(n.fnBody)
+    bindTrim(mark)
+  } else if n is ForRange {
+    bindScan(n.frFrom)
+    bindScan(n.frTo)
+    bindScan(n.frStep)
+    const mark = visNames.length
+    visNames.push(n.frVar)
+    visIds.push(-1)
+    bindScan(n.frBody)
+    bindTrim(mark)
+  } else if n is ForIn {
+    bindScan(n.fiIter)
+    const mark = visNames.length
+    visNames.push(n.fiVar)
+    visIds.push(-1)
+    bindScan(n.fiBody)
+    bindTrim(mark)
+  } else {
+    nameVisit(ix)
+    const kids = nodeChildren(ix)
+    let i = 0
+    while i < kids.length {
+      bindScan(kids[i])
+      i = i + 1
+    }
+  }
+  0
+}
+
+function collectBindingsAndRefs(progRoot: i32) {
+  lintRefNames = Map()
+  declNodes = []
+  declKinds = []
+  declUsed = []
+  declWritten = []
+  visNames = []
+  visIds = []
+  bindScan(progRoot)
   0
 }
 
@@ -640,43 +792,21 @@ function declIsExported(ix: i32) {
 }
 
 // ── 1. Unused variables / parameters + 2. prefer-const ───────────────────────
-// These two rules consume per-BINDING use/write information. The TS lint reads it
-// from the symbol table (`Binding` identity + occurrence `isWrite`); the native
-// front end carries no such binding metadata, so this port reconstructs it from
-// the AST by NAME: a name is "used" iff some `Ident`/`Call`-callee references it
-// (`refNamesHas`), "written" iff it is the LHS of an assignment (`writeNamesHas`).
-//
-// CAVEAT vs the TS rule (a known divergence on shadowing): name-keying cannot
-// distinguish two same-named bindings in disjoint scopes the way the symbol
-// table's binding identity does. A file that shadows a name (an inner `let x`
-// over an outer `x`, or a param named like an outer local) can therefore differ
-// from the oracle. The native AST has no binding-identity model to key on (the
-// symbol-table fields the TS rule needs — `kind` / `mutable` / `isWrite` per
-// occurrence — are not produced; see this file's header), so this name-based
-// reconstruction is the closest faithful approximation available. It is exact for
-// programs without same-name shadowing (the common case + the lint corpus).
+// These two rules consume the per-BINDING use/write flags the scope-aware scan
+// (`bindScan` above) reconstructs from the AST — the native front end produces
+// no symbol table with `Binding` identity / occurrence `isWrite`, so the lint
+// derives the equivalent: `declUsed[i]` iff some `Ident` occurrence resolved to
+// declaration `i`, `declWritten[i]` iff such an occurrence was an assignment
+// LHS. Residual divergences vs the TS oracle's symbol table: function names
+// stay name-keyed (a local shadowing a function name attributes its uses to the
+// local), and a use the scan cannot resolve to a scope entry marks no binding.
 
-// Declarations to consider, collected in source (arena-walk) order. Parallel
-// arrays: the declaring node index and a KIND (0 = variable `let`/`const`,
-// 1 = parameter). De-dup is unnecessary — each declaration is one node.
+// Declarations to consider, registered by `bindPush` in scan order (source
+// order). Parallel arrays: the declaring node index and a KIND (0 = variable
+// `let`/`const`, 1 = parameter). De-dup is unnecessary — each declaration is
+// one node, bound exactly once.
 let declNodes: i32[] = []
 let declKinds: i32[] = []
-
-// A pre-order walker visit: a `let`/`const` records itself, a parameter records
-// itself (every `Param` node in the arena is reached through its `FuncDecl`'s
-// `fnParams` slot). The shared walker's source-order traversal keeps the
-// collected list in source order.
-function declVisit(ix: i32) {
-  const n = P.nodes[ix]
-  if n is LetDecl {
-    declNodes.push(ix)
-    declKinds.push(0)
-  } else if n is Param {
-    declNodes.push(ix)
-    declKinds.push(1)
-  }
-  0
-}
 
 // The declared NAME of a `let`/`const` (kind 0) or parameter (kind 1) node.
 function declNameOf(ix: i32, kind: i32): string {
@@ -697,17 +827,14 @@ function declIsConst(ix: i32) {
   false
 }
 
-function unusedBindings(progRoot: i32) {
-  declNodes = []
-  declKinds = []
-  lintWalk(lintRuleDecl, progRoot)
+function unusedBindings() {
   let i = 0
   while i < declNodes.length {
     const ix = declNodes[i]
     const kind = declKinds[i]
     const name = declNameOf(ix, kind)
-    // A referenced name (read OR written) is used — not dead.
-    if !refNamesHas(name) {
+    // A binding some occurrence resolved to (read OR written) is used — not dead.
+    if declUsed[i] == 0 {
       // An exported top-level binding is public surface (the native parser drops
       // the `export` keyword; recovered from the token stream).
       if !declIsExported(ix) {
@@ -751,7 +878,7 @@ function unusedBindings(progRoot: i32) {
 // names, and an UNUSED binding (the more specific unused-variable rule owns it).
 // Emitted as `info`, pointed at the `let` keyword (the token the fix rewrites),
 // which is the token immediately before the declaration's name token.
-function preferConst(progRoot: i32) {
+function preferConst() {
   let i = 0
   while i < declNodes.length {
     const ix = declNodes[i]
@@ -764,7 +891,7 @@ function preferConst(progRoot: i32) {
       // can't be proven safe. (Mirrors the unused-variable rule's export skip.)
       if !declIsConst(ix) && !startsUnderscore(name) && !declIsExported(ix) {
         // Used (else unused-variable owns it) and never written.
-        if refNamesHas(name) && !writeNamesHas(name) {
+        if declUsed[i] != 0 && declWritten[i] == 0 {
           const nameTok = declNameTokOf(ix)
           const kwTok = nameTok - 1
           lintEmitAtTok(
