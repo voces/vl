@@ -274,6 +274,18 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   unchanged. Graduated (seeds 101/202/303): `p3c`/`p3r {f: string | null} | {w: i32}`, 0 regressions.
   Frozen: `tests/cases/unions/union-variant-nullable-field.vl`.
 
+- **A value union with a `string` MEMBER but no constructed string → invalid wasm** (`string | i32 =
+  42`, `string | f64 = 1.5`, `string | boolean = true`): the `is string` arm's narrowed read emits a
+  `ref.cast $aTypeIdx` (dead when the box holds the OTHER member, but it must still VALIDATE), and
+  `markValueUnionAtoms` forced the box/list types for every atom kind EXCEPT the string atom (k==2) —
+  so a program that never CONSTRUCTS a string left `$aTypeIdx` unallocated and the cast pointed at a
+  bogus heap index (`expected funcref, found anyref`). Fix: a `string` member forces `aUsed`, exactly
+  as the list-member arms force their wrapper types. A one-line collect-classifier add; the box read
+  and narrowing were already correct. This is the load-bearing string-member composition unlock (it
+  also unblocks value-union results that carry a string arm). Frozen:
+  `tests/cases/unions/value-union-string-member-no-string.vl`. Fuzz-neutral at the pinned/wide seeds
+  (the generator always constructs the string carrier, so the dead-arm case is hand-found) — 0
+  graduations, 0 regressions; native-fixpoint holds; 989 tests pass.
 - **R3 (partial) — a literal-union ALIAS member of a VALUE union, positive `is K0` test**
   (`K0 | boolean`, `K0 | i32`, `K0 | f64`, `K0 | {w:i32}`, and the struct-field carrier
   `{a, f: K0 | i64, z}`): `is K0` rejected at emit (`` `is` names a type that is not a union
