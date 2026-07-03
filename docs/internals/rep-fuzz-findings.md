@@ -251,6 +251,40 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   scope (a distinct member-path seam, not the ident path the fuzzer binds): a DIRECT narrowed
   member read `o.f is K0 { print(o.f) }` without the `const t0 = o.f` binding.
 
+- **R2/closures — f32 closure RESULT via a float-literal-bodied lambda** (`(i32) => f32`, and the
+  composite `(i32) => {a: f32, f: f64, z: i32}`): a CHECKER reject (`cannot assign (i32) -> f64 to
+  … (i32) -> f32`), the "float literal into an f32 context through a wrapper" clean-reject family the
+  landscape flagged — but it is an ADOPTION gap, not a genuine reject. The f32 result REP already
+  lowers: a named-function-VALUE spelling (`const v: (i32) => f32 = mk`) round-trips today. Only the
+  inline lambda's contextual RETURN adoption was missing. Root: a float-literal-bodied lambda infers
+  f64 (a `.` literal's default); the return-adoption block (`checkFuncDeclNode`) widened only via
+  `numWidens` (i32→i64/f64, f32→f64) and `objRetWidenAdopt`'s int-literal fields — neither covers the
+  f64-literal→f32 exact re-encode the direct `const v: f32 = 5.5` binding grants (`isFloatLitExpr` /
+  `assignableExpr`). Fix, three surgical seams:
+  - the scalar arm: a float-literal body tail against an f32 expected return adopts f32
+    (`isFloatLitExpr(lambdaBodyTail)` + `primNameOf(expRet) == "f32"`), so the lambda's functype
+    result is f32 and `emitReturnValue` encodes the literal at f32 (the `retF32` path was already
+    there for a bare f32 body).
+  - the FIELD arm (`objRetWidenAdopt`): an f32 field whose value is a float literal is recorded like
+    the numeric-widen fields — `nodeTyIx[value] = f32` — and `anonFieldCode` codes the f32 slot (24)
+    for a recorded-f32 float literal (it else codes a `.` literal f64/17). The literal-shape interner
+    then interns the f32 field slot, structurally deduping with the annotation's shape.
+  - the emit seam it exposed (`emitExprAsF32`): the fast-path `if exprIsF32 { return emitExpr }` fired
+    for the newly-recorded-f32 literal and delegated to `emitExpr`, which lowers a bare `.` literal at
+    f64 — an `f64.const` into an f32 field, invalid wasm at `struct.new`. Fix: handle a bare
+    (possibly negated) numeric literal DIRECTLY as `f32.const` BEFORE the `exprIsF32` delegation (the
+    delegation now serves only genuine f32 VALUE exprs — a variable / arithmetic / call result).
+  All three are scoped to lambda-return f32 adoption (the field arm runs only from the lambda-return
+  block; the emit reorder changes behavior only for a recorded-f32 float literal, which only this
+  adoption creates) — non-lambda f32 paths are byte-identical, native-fixpoint holds, 987 tests pass.
+  Graduated (seeds 101/202/303): `p0c/p0r/p2c/p2r (i32) => f32`, `p0c/p0r (i32) => {a: f32, f: f64,
+  z: i32}`; the wider 4242/7777 d3–4 sweep additionally graduated 11 more f32-result shapes (nested
+  `{f: (i32) => f32}`, arrays `((i32) => f32)[]`, nullable `(() => ((i32) => f32)) | null`, f32/i64
+  mixed-field structs) — the finding-set strictly SHRANK (0 new). Frozen:
+  `tests/cases/closures/lambda-f32-result.vl`. NOT part of this slice (fails identically for a named
+  function value — a genuine reject, not an adoption gap): an ARBITRARY f64 VALUE into an f32 return
+  (`(i32) => f32 = (x) => someF64Var`) stays a lossy-demote reject.
+
 - **Inline value-union struct FIELD not registered like the named-alias one** (`{f: f32 | {w:i32}}`,
   every member type — i32/i64/f32/f64/string/boolean/struct): the inline spelling rejected on a
   scalar-arm read (`field access receiver is not a struct`) — or emitted invalid wasm on the box read

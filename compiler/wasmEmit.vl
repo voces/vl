@@ -5973,8 +5973,12 @@ export function emitExprAsF64(body: i32[], exprIx: i32, fnIx: i32) {
 // rejects i32→f32 as lossy (above 2^24 the i32 would round to the nearest f32), so
 // only a literal (exact by construction within the op's value range) takes this path.
 export function emitExprAsF32(body: i32[], exprIx: i32, fnIx: i32) {
-  if exprIsF32(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
-  // Peel parens to find a bare float literal we can emit directly as f32.const.
+  // Peel parens to find a bare (possibly negated) numeric literal — a literal lowers
+  // DIRECTLY as `f32.const`, checked BEFORE the `exprIsF32` delegation. `emitExpr` lowers
+  // a bare `.` literal at f64 (its default), even one the checker typed f32: a
+  // context-ADOPTED f32 field literal (`objRetWidenAdopt` records f32 on the value node,
+  // so `exprIsF32` is now true for it) would else delegate to `emitExpr` and emit an
+  // `f64.const` into an f32 field — invalid wasm at `struct.new`.
   const inner = unwrapParen(exprIx)
   const innerNode = P.nodes[inner]
   if innerNode is NumLit {
@@ -5989,8 +5993,7 @@ export function emitExprAsF32(body: i32[], exprIx: i32, fnIx: i32) {
   }
   // A unary-minus over a literal (`-1.5` / `-3`) in f32 context: `f32Bytes` parses the
   // leading `-` so a negated float re-encodes directly as `f32.const -1.5` (no `f32.neg`
-  // op, no lossy f64 round-trip); a negated integer converts the negated i32. (The
-  // exprIsF32 guard above already handles `-x` where x is an f32 value.)
+  // op, no lossy f64 round-trip); a negated integer converts the negated i32.
   if innerNode is Unary {
     if innerNode.unOp == "-" {
       const negArg = P.nodes[unwrapParen(innerNode.unArg)]
@@ -6005,6 +6008,9 @@ export function emitExprAsF32(body: i32[], exprIx: i32, fnIx: i32) {
       }
     }
   }
+  // An already-f32-valued expression (a variable, an f32 arithmetic / call result) emits
+  // directly; only a bare numeric literal needed the direct-`f32.const` handling above.
+  if exprIsF32(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
   // Non-literal i32: evaluate, then convert to f32.
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   fbF32ConvertI32S()

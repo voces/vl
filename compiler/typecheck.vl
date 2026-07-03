@@ -1092,18 +1092,20 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
         const dty = d.objFieldTypes[i]
         const sty = objFieldType(s, d.objFieldNames[i])
         if sty < 0 { return false }
+        // The field's VALUE expression in the literal body (shared by the numeric-widen
+        // and the float-literal→f32 arms below).
+        let fv = -1
+        const fl = lit.objFields
+        let fi = 0
+        while fi < fl.length {
+          const fn = P.nodes[fl[fi]]
+          if fn is FieldInit {
+            if fn.fiName == d.objFieldNames[i] { fv = fn.fiValue }
+          }
+          fi = fi + 1
+        }
         if numWidens(sty, dty) {
           // The widening field's value must be a small int literal in the literal body.
-          let fv = -1
-          const fl = lit.objFields
-          let fi = 0
-          while fi < fl.length {
-            const fn = P.nodes[fl[fi]]
-            if fn is FieldInit {
-              if fn.fiName == d.objFieldNames[i] { fv = fn.fiValue }
-            }
-            fi = fi + 1
-          }
           if fv < 0 { return false }
           const fvn = P.nodes[fv]
           if fvn is NumLit {
@@ -1114,6 +1116,13 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
           } else {
             return false
           }
+        } else if primNameOf(dty) == "f32" && isFloatLitExpr(fv) {
+          // FLOAT-LITERAL → f32 field (`() => ({a: 3.5, …})` against `{a: f32, …}`): the field
+          // infers f64 but the literal re-encodes exactly at f32 (the field dual of the scalar
+          // arm above). Record f32 on the value node so `anonFieldCode` interns the f32 field
+          // slot (it would else code the float literal's default f64).
+          recNodes.push(fv)
+          recTys.push(dty)
         } else {
           // A non-widening field must match exactly (mutual assignability) — a shape
           // difference beyond numeric widening is not an adoption, it is a mismatch.
@@ -6979,6 +6988,15 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       const expRet = cbExpectedRetFor(fnIx)
       if expRet >= 0 {
         if numWidens(inferred, expRet) { inferred = expRet }
+        // FLOAT-LITERAL → f32 dual of the numeric widen: a float-literal-bodied lambda
+        // whose contextual return is f32 (`(i32) => f32 = (x) => 5.5`) infers f64 (a float
+        // literal's default), but the literal re-encodes EXACTLY at f32 — the same grant
+        // `isFloatLitExpr`/`assignableExpr` make at a direct `const v: f32 = 5.5` binding.
+        // Adopt f32 so the lambda's functype result is f32 and `emitReturnValue` encodes the
+        // literal at f32 in the body (the named-function-value spelling `= mk` already lowers).
+        if inferred != expRet && primNameOf(expRet) == "f32" {
+          if isFloatLitExpr(lambdaBodyTail(n.fnBody)) { inferred = expRet }
+        }
         // Object-shaped dual: `() => ({f: 5})` against `() => {f: i64}` — adopt the
         // expected shape when every widening field is a re-encodable literal
         // (`objRetWidenAdopt` also records the field types for the emitter's interner).
