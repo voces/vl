@@ -53,16 +53,22 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
      `structIndexOfTypeName`. The remaining `structIndexByName` sites stay nominal-only for now — migrate
      each opportunistically when a structural name actually reaches it (premature otherwise: today they
      all receive nominal names, so a blanket swap is a no-op with risk).
-  2. 🟡 **Rep-bug burn-down.** The fuzz tester itself SHIPPED (→ `CHANGELOG.md`; findings log
-     `docs/internals/rep-fuzz-findings.md`). REMAINING: fix the confirmed bug families from the
-     sweeps (fix wave in flight), graduating each fixed shape from `scripts/rep-fuzz-baseline.txt`
-     into `tests/cases/`; extend matrix coverage as new reps land.
-  3. ⬜ **`repOf(type) → descriptor` unification (the "rewrite") — strangler, NOT big-bang.** One
-     structurally-keyed descriptor {valtype, heapIdx, nullRep, sigToken, listResultKind, …} that every
-     site consults; introduce + delegate + migrate site-by-site (each gated) + delete the old schemes.
-     Gate on: (a) a gap that needs touching 3+ schemes at once, (b) the type×position matrix mostly
-     closed so the descriptor shape is stable, (c) the tester from (2) in place. Recursive structural
-     types (canonical key terminating on cycles) is the main hazard.
+  2. 🟡 **Rep-bug burn-down.** The tester and the ten confirmed bug families from its first
+     sweeps are SHIPPED/FIXED (→ `CHANGELOG.md`; findings log `docs/internals/rep-fuzz-findings.md`).
+     REMAINING: the deferral tail (small literal into an i64 struct field through a LAMBDA context;
+     `for k in K[]` litunion-array iteration emits invalid wasm; niche-element lists
+     `(boolean|null)[]`/`(string|null)[]` are clean rejects, not reps; audit the `??` litunion join
+     for over-widening at other sites) + keep graduating baseline shapes as fixes land.
+  3. 🟡 **`repOf(type) → descriptor` unification (the "rewrite") — strangler, in progress.**
+     Foundation SHIPPED (→ `CHANGELOG.md`): `emit_rep.vl`'s `RepDesc` derived table-driven from the
+     `Ty` arena (cycle-safe: kind arms recurse ≤1 wrapper level; generation-stamped visited marks),
+     with the print-import scan exact, `vtKindOfType` delegated, `$fnsig` tokens on one vocabulary,
+     and the first `fRet*` fold. REMAINING migration order: (a) fold the remaining ~16 `fRet*`
+     tables to stored `VKind` (makes `inferredRetKindCore` a read); (b) move `sigKeyRetKind`
+     consumers off raw codes onto `VKind`, then delete `repLegacyCodeOfKind`; (c) `annSigKey`/
+     `fnSigKeyOf` onto the token table; (d) widen `repOfTy` coverage (typed-value maps,
+     litunion/union-element arrays); (e) the SLOT layer (`structIndexByName`/`rlSlotByName` —
+     needs the canonical-structural-key-on-cycles design, the remaining hazard).
 - ✅ **Kill the TS host. DONE — the TWO COMPILERS are now one.** The TS compiler core
   (`compiler/*.ts` front end + `cli.ts` + the `checker-parity-sweep.ts` oracle) is DELETED; the
   self-hosted `compiler/*.vl` (the wasm seed) is the sole compiler. Got here in stages:
