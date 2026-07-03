@@ -228,6 +228,29 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
 
 ## RESOLVED
 
+- **R3 (partial) — a literal-union ALIAS member of a VALUE union, positive `is K0` test**
+  (`K0 | boolean`, `K0 | i32`, `K0 | f64`, `K0 | {w:i32}`, and the struct-field carrier
+  `{a, f: K0 | i64, z}`): `is K0` rejected at emit (`` `is` names a type that is not a union
+  variant ``) even though the box already CONSTRUCTED, NARROWED-TO-OTHER-MEMBER, and printed a
+  litunion member correctly. Root: `emitUnionCoerce` boxes a litunion member as a STRING ref (its
+  members are string literals, so `exprString` claims them), tagged `scalarTagOf("string")` — but
+  the `is`-narrow (`emitIs`) and the narrowed read (`narrowedValueAtomOf`) both keyed on
+  `valueAtomKind`, which returns -1 for a litunion ALIAS name, so `is K0` fell through to the
+  struct-variant path and the then-branch read had no atom to unbox. Fix: both seams resolve a
+  litunion-alias variant to its boxed atom `"string"` (`nameIsLitUnionType`-gated) — `emitIs`
+  tag-compares against the string tag, `narrowedValueAtomOf` unboxes the string ref. Sound because
+  a real `string` member cannot coexist (`K0 | string` collapses to plain `string`), so the string
+  tag never collides. Graduated (seeds 101/202/303): `p0r K0 | boolean`, `p0r K0 | i32`,
+  `p0r K0 | f64`, `p3r K0 | {w:i32}`, `p1r {a: f64, f: K0 | i64, z: i64}`; the 4242/7777 sweep
+  additionally fixed 7 shapes (`K0 | i64`, `K0 | i64 | null`, `{[string]: K0 | i64 | null}`,
+  `{f: {[string]: K0 | {w:i32}}}`), 0 new. Frozen: `tests/cases/unions/litunion-value-union-is.vl`.
+  Pre-existing and OUT of scope (a SEPARATE value-union gap, fails IDENTICALLY for a plain-atom
+  union `string | boolean` / `string | {w:i32}`): an ELSE-branch complement read of the OTHER
+  member (`else { print(v) }` / `else { print(t.w) }`) — invalid wasm / emit error; the fuzzer's
+  else prints a literal, so the graduated shapes exercise only the positive branch. Also OUT of
+  scope (a distinct member-path seam, not the ident path the fuzzer binds): a DIRECT narrowed
+  member read `o.f is K0 { print(o.f) }` without the `const t0 = o.f` binding.
+
 - **Inline value-union struct FIELD not registered like the named-alias one** (`{f: f32 | {w:i32}}`,
   every member type — i32/i64/f32/f64/string/boolean/struct): the inline spelling rejected on a
   scalar-arm read (`field access receiver is not a struct`) — or emitted invalid wasm on the box read
