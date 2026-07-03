@@ -121,6 +121,14 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   A14 forward-compat: a future nominal/opaque type opts OUT of dedup by injecting
   its nominal identity into `repCanonKey`, giving it a unique key and a private heap
   type — no other change needed. (structural slot dedup, roadmap Next#1)
+  The same dedup extends to the REF-LIST table: a ref-list's (backing, wrapper) pair
+  is structurally uniform across element kinds, so two slots resolving to the same
+  element heap (`A[]` and `B[]` after struct dedup) emit identical pairs and share
+  one wrapper (`rlTwin` → shared `rlBackIdx`/`rlWrapIdx`) — fixing the same
+  invalid-wasm crossing one list level up (a `B[]` passed where an `A[]` is
+  expected). The map-array element and any unresolved element stay unique (the
+  map-struct index interlock); non-twins (`i32[]` vs `i64[]`) keep distinct element
+  heaps and wrappers. (structural slot dedup, ref-list layer)
 - **No `this` keyword.** A method is a function whose first parameter is `self`
   (Rust-style); `o.f(a)` is sugar for `f(o, a)` (UFCS). `self` is an _explicit,
   optional_ marker: first param `self` → a method reachable as `o.f()`; no
