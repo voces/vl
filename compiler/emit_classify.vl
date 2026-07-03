@@ -6358,6 +6358,17 @@ export function ensureRefElem(elemName: string) {
   if enp != "" && nameIsArray(enp) { arrName = "(" + elemName + ")[]" }
   const k = refArrElemKind(arrName)
   if k == 9 { ensureRefElem(refArrElemName(elemName)) }
+  // A MAP element (`{[string]: V}[]`, kind 3): force the map heap types + intern the element
+  // map's VALUE mv slot, so a TYPED-value map in a COMPOSITION position (a list element, a
+  // struct field, a nested-map value) resolves the SAME per-value map struct a standalone
+  // `{[string]: V}` binding does — position-independent. A mono / atom value interns nothing
+  // (`mvShapeOfValName` returns -1), riding the shared mono `$mapStruct`.
+  if k == 3 {
+    mUsed = true
+    lUsed = true
+    aUsed = true
+    mvShapeOfValName(mapValNameOf(elemName))
+  }
   // Force the leaf list-type wrapper `Used` flags for a SCALAR inner-list element, so its
   // singleton wrapper (`lTypeIdx` / `mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`) is allocated. A
   // ref inner list (k 9) forces these in the recursion above; a struct / union / closure element
@@ -10133,6 +10144,53 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
         }
       }
     }
+  }
+  // A composition MAP READ that yields a typed-value map — either a NESTED-map read
+  // (`outer[k]` / `outer[k] ?? d`, whose receiver's VALUE is itself a map) or a LIST-of-maps
+  // element read (`xs[i]`). The read produces the element map, whose shape is the element
+  // map's OWN value slot. Without this the binding falls to the mono map (-1) and its
+  // `(ref $mStructIdx)` local rejects the typed map ref the read produces.
+  const cms2 = compositionMapReadSlot(exprIx, fnIx)
+  if cms2 != -2 { return cms2 }
+  -1
+}
+
+// The mv slot of the map a COMPOSITION read yields, `-1` for a mono/atom-valued map (it
+// rides the shared `$mStructIdx`), or the sentinel `-2` when the expression is not a
+// composition map read at all (so the caller keeps its own `-1` default). Two shapes:
+//   · a NESTED-map read (`outer[k]` / `outer[k] ?? d`): the inner map is the receiver's
+//     vals ref-list element (`{[string]: V}` → `V`).
+//   · a LIST-of-maps element read (`xs[i]`): the map is the ref-list element itself.
+function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
+  // Nested-map read: resolve the receiver's mv slot, then its inner map value.
+  let os = coalesceMvSlot(exprIx, fnIx)
+  if os < 0 { os = mapReadMvSlot(exprIx, fnIx) }
+  if os >= 0 && mvValIsMap(os) {
+    return mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[mvRlSlot[os]]))
+  }
+  // List-of-maps element read: the element name is the map type; its value picks the slot.
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      const slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length && rlElemKindTbl[slot] == 3 {
+        return mvSlotOfMapValNameOrMono(mapValNameOf(rlElemName[slot]))
+      }
+    }
+  }
+  -2
+}
+
+// The mv slot whose map value type-name is `iv`, or `-1` for a mono / atom value
+// (`i32` / `boolean` / literal-union atom — never interned, rides `$mStructIdx`). A
+// non-failing find (unlike `mvSlotOfValNameFind`, which fails loudly on the mono miss)
+// for the composition read resolvers.
+function mvSlotOfMapValNameOrMono(iv: string): i32 {
+  if mvValKindOfName(iv) == -1 { return -1 }
+  let i = 0
+  while i < mvValName.length {
+    if mvValName[i] == iv { return i }
+    i = i + 1
   }
   -1
 }

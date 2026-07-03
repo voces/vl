@@ -240,6 +240,28 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   - array-literal element joins (`[k, "cc"]`): loud reject (list-rep classifiers), unchanged.
   Frozen: `tests/cases/unions/atom-string-join.vl`.
 
+- **Typed-value maps in COMPOSITION positions** (a map as a LIST element / a NESTED-map value /
+  inside a STRUCT field): `{[string]: f32}[]`, `{[string]: f64[]}[]`, `{[string]: {f: string}}[]`,
+  `{[string]: {[string]: f64}}`, `{f: {[string]: {[string]: f32}}}` — all emitted invalid wasm
+  (`type mismatch: expected (ref $type), found (ref $type)`) while the SAME value types worked at a
+  local / return / param boundary. Root (position-DEPENDENT rep): a map ref-list ELEMENT (kind 3)
+  hard-coded its struct heap to the mono `$mStructIdx` (`mAssignTypeIndices`), so a store/read of a
+  TYPED map ref mismatched the element heap — an atom-valued inner map worked only because atoms
+  ride the mono struct. Fix (position-INDEPENDENT): the kind-3 element heap resolves the element
+  map's OWN per-value struct (`mvMapTypeIdx`, deferred to a second pass since those are minted after
+  the ref-pair loop); `ensureRefElem` interns the element map's value mv slot so a composition
+  position forces the same slot a standalone `{[string]: V}` binding does; and `mapShapeOfExpr`
+  gained a composition-read arm (`compositionMapReadSlot`) so a nested-map read (`outer[k] ?? d`) and
+  a list-of-maps read (`xs[i]`) bind the yielded map with its TYPED slot instead of falling to the
+  mono `$mStructIdx` local. The store/read machinery was already generic over `rlElemHeap`, so no map
+  op changed. Graduated (seeds 101/202/303): the five shapes above at p1/p2 c+r (10 baseline lines);
+  wide sweeps 4242/7777 additionally graduated 14 deeper compositions (`{[string]: f64}[]` at p0,
+  `{[string]: {[string]: f32}}`, map-in-union-in-list, deeply-nested string maps in struct fields).
+  Frozen in `tests/cases/maps/map-in-list-composition.vl` + `nested-map-typed-value.vl`. Still open
+  (a distinct closure-result seam, NOT this family): a map RETURNED FROM A CLOSURE
+  (`() => {[string]: string}` / `(i32) => {[string]: f32}`, construct-only `p2c`) — the closure
+  functype result has no `$fnsig` token for a map (`repSigTokOfKind("map") == ""`), so the fat-pointer
+  result rep is unresolved; the READ variants (`p2r`) already reject cleanly.
 - **Maps with non-{i32,string,struct} values at the RETURN/param boundary** (`{[string]: i64}` /
   f64 / f32 / closure / union valued): the boundary gate (`retMapFlag`) enumerated the supported
   value types independently of the local interner (`mvShapeOfValName`) and lacked the scalar /

@@ -1719,6 +1719,20 @@ function mAllocType() {
   idx
 }
 
+// The mv slot whose value type-name is `vn`, or -1 when none — a mono map value (i32 /
+// boolean / literal-union atom) is never interned, so a map ELEMENT (`{[string]:V}[]`, a
+// nested-map value) resolves its struct heap to `mStructIdxPre` (mono) or `mvMapTypeIdx`
+// (typed) by this lookup. A non-failing sibling of `mvSlotOfValNameFind` (which fails on a
+// mono value): the element-heap resolver below must tolerate the mono case.
+function mvSlotByValNameOr(vn: string): i32 {
+  let i = 0
+  while i < mvValName.length {
+    if mvValName[i] == vn { return i }
+    i = i + 1
+  }
+  -1
+}
+
 // Walk the type-section emit order with the `mAllocType` counter, assigning each
 // type's heap index into the module-global index state (`sHeapIdx`/`uVarIdx`/
 // `uBoxIdx`/`aTypeIdx`/`lTypeIdx`/`rlBackIdx`/`rlWrapIdx`/`mkArrIdx`/`mkListIdx`/
@@ -1849,7 +1863,17 @@ export function mAssignTypeIndices(_n: i32) {
     if rlElemKindTbl[rs] == 2 {
       rlElemHeap[rs] = uBoxIdx
     } else if rlElemKindTbl[rs] == 3 {
-      rlElemHeap[rs] = mStructIdxPre
+      // A map-struct element. The MONO map (i32 / boolean / atom value) is the shared
+      // `mStructIdxPre`; a TYPED-value map element (`{[string]: f32}[]`, a nested
+      // `{[string]: {[string]: f64}}`) has its OWN map struct (`mvMapTypeIdx`, minted
+      // AFTER this loop) — deferred to the second pass below (heap 0 here). This is the
+      // position-independent rep: a map element resolves the SAME struct a standalone
+      // `{[string]: V}` binding does, whichever value type it carries.
+      if mvSlotByValNameOr(mapValNameOf(rlElemName[rs])) < 0 {
+        rlElemHeap[rs] = mStructIdxPre
+      } else {
+        rlElemHeap[rs] = 0
+      }
     } else if rlElemKindTbl[rs] == 4 {
       // An `i32[][]` slot's element is the i32-list WRAPPER (interned just above,
       // so `lTypeIdx` is already assigned).
@@ -1996,6 +2020,17 @@ export function mAssignTypeIndices(_n: i32) {
   while mvi < mvValName.length {
     mvMapTypeIdx[mvi] = mAllocType()
     mvi = mvi + 1
+  }
+  // Second pass for the TYPED-value map ref-list elements (kind 3, deferred above): now
+  // that `mvMapTypeIdx` is minted, point each such element's heap at its own typed map
+  // struct. A mono / atom map element kept `mStructIdxPre` in the first pass (slot -1).
+  let rmf = 0
+  while rmf < rlElemName.length {
+    if rlElemKindTbl[rmf] == 3 {
+      const mmv = mvSlotByValNameOr(mapValNameOf(rlElemName[rmf]))
+      if mmv >= 0 { rlElemHeap[rmf] = mvMapTypeIdx[mmv] }
+    }
+    rmf = rmf + 1
   }
   // The functypes follow; the first lands at the current counter (`typeOffset`).
   mNextType
