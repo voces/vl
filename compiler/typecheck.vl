@@ -933,6 +933,10 @@ let cStructTyIxs: i32[] = []
 let cVariantMemberTyIxs: i32[] = []
 // Declared UNION-ALIAS `Ty` indices (`type T = A | B`), for the emitter's `isUName` (C1).
 let cUnionTyIxs: i32[] = []
+// The declared NAME of each `cUnionTyIxs` entry (parallel array), so a union type index can
+// resolve back to its alias name — used to pin an anonymous lambda's litunion return as the
+// ALIAS (an inline litunion spelling reps as a string ref, so the alias name is required).
+let cUnionNames: string[] = []
 // A single placeholder `TyFunc` arena index for monomorphizer `=>sigkey` closure pins (C1 endgame).
 let cFuncPinTyIx = -1
 // A single placeholder `TyObj` arena index for interned anonymous-shape `#anonN` names (C1 endgame).
@@ -7001,6 +7005,18 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // expected shape when every widening field is a re-encodable literal
         // (`objRetWidenAdopt` also records the field types for the emitter's interner).
         if objRetWidenAdopt(n.fnBody, inferred, expRet) { inferred = expRet }
+        // LITERAL-UNION dual: a bare string-literal body that is a MEMBER of the expected
+        // literal-union (`(i32) => K = (x) => "b"`) adopts the litunion. Its inferred type is
+        // the softened `string`; the direct `const k: K = "b"` binding grants the member flow
+        // via `assignableExpr`/`litTyOfExpr`, but the lambda-return path only had the
+        // numeric/object arms. Adopting makes the lambda's functype result the litunion (an i32
+        // atom), and the member literal encodes as its atom id at the return seam.
+        if inferred != expRet && tyIsLitUnion(expRet) {
+          const luTail = lambdaBodyTail(n.fnBody)
+          if luTail >= 0 && assignableExpr(luTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
       }
     }
     // PERMISSIVE FALL-THROUGH (totality): an un-annotated function that can fall off the
@@ -7132,6 +7148,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // node sentinel so `synthRetAnnots` pins a nullable-returning closure value position-
         // independently (the nullable dual of the union pin).
         if unm == "" { unm = nullableRetName(inferred, gRootStmts) }
+        // A LITERAL-UNION contextual return (`(i32) => K = (x) => "b"`, adopted just above) — record
+        // the ALIAS name so `synthRetAnnots` pins the lambda's `fnRet` as the litunion, whose functype
+        // result reps as an i32 atom (`vtKindOfType`): the `$fnsig` result keys `>i` to match the value
+        // call, and `emitReturnValue` encodes the member literal as its atom id (`retLitUnion`).
+        if unm == "" { unm = litUnionAliasNameOfTy(inferred) }
       }
       if recordable || unm != "" {
         const nodeKey = "#" + i32ToStr(fnIx)
@@ -7240,6 +7261,7 @@ function checkProgramNode(n: Program) {
   cStructTyIxs = []
   cVariantMemberTyIxs = []
   cUnionTyIxs = []
+  cUnionNames = []
   // Pass 0: register top-level struct `type` declarations BEFORE anything else, so
   // a struct name in a param/return/let annotation (pass 1/2) or in a later struct's
   // field resolves via `nameToTy`. Types register in source order, so a field may
@@ -7299,6 +7321,7 @@ function checkProgramNode(n: Program) {
       const uIx0 = mkUnionTy(members0)
       cUserTypes[sd0.udName] = uIx0
       cUnionTyIxs.push(uIx0)
+      cUnionNames.push(sd0.udName)
     }
     t0 = t0 + 1
   }
@@ -8418,6 +8441,21 @@ export function nodeTyIsNulLitUnion(ix: i32) {
   const t = T.tys[ty]
   if t is TyNullable { return tyIsLitUnion(t.nInner) }
   false
+}
+
+// The declared ALIAS NAME of litunion TYPE index `ty` (`type K = "a" | "b"` → "K"), or "" when
+// `ty` is not a registered litunion alias. Reverse of `cUserTypes` via the parallel
+// `cUnionTyIxs`/`cUnionNames` arrays — used to pin an anonymous lambda's adopted litunion return
+// as its alias (the alias reps as an i32 atom; the inline member spelling would rep as a string).
+export function litUnionAliasNameOfTy(ty: i32) {
+  if ty < 0 { return "" }
+  if !tyIsLitUnion(ty) { return "" }
+  let i = 0
+  while i < cUnionTyIxs.length {
+    if cUnionTyIxs[i] == ty { return cUnionNames[i] }
+    i = i + 1
+  }
+  ""
 }
 export function nodeTyIsLitUnionAlias(ix: i32) {
   const ty = nodeTyIxOf(ix)
