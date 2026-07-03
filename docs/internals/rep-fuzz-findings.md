@@ -264,6 +264,16 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   results (`() => string | i32`, `() => i64 | boolean`) and nullable-scalar (`(i32) => i32 | null`) need
   their box/niche READ to compose (C2/C3) before the lambda can safely adopt them.
 
+- **A value-union struct VARIANT with a niche-nullable FIELD = null** (`{f: string | null} | {w: i32}`
+  built as `{f: null}`): emit rejected with `bare null needs a struct-typed context`.
+  `emitVariantStruct` (the union-box variant-payload builder) threaded the scalar-widen field codes
+  (17/23/24) and the list codes (5/6/25/26/27) but NOT the niche-nullable field codes 20 (`string |
+  null`), 21 (`boolean | null`), 22 (`closure | null`) — so a `null` field value reached the bare-null
+  path with no seed. Fix: mirror the plain struct-literal path's three arms (`pendingNulString` /
+  `pendingNulBool` / `pendingNulClosure`) in `emitVariantStruct`. A non-null field value passes through
+  unchanged. Graduated (seeds 101/202/303): `p3c`/`p3r {f: string | null} | {w: i32}`, 0 regressions.
+  Frozen: `tests/cases/unions/union-variant-nullable-field.vl`.
+
 - **R3 (partial) — a literal-union ALIAS member of a VALUE union, positive `is K0` test**
   (`K0 | boolean`, `K0 | i32`, `K0 | f64`, `K0 | {w:i32}`, and the struct-field carrier
   `{a, f: K0 | i64, z}`): `is K0` rejected at emit (`` `is` names a type that is not a union
