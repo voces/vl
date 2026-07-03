@@ -233,6 +233,26 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   and an `else`-branch narrow to a struct member of a two-struct-member field union (`{v}|{w}` — read
   via the carrier's positive `is` arm instead).
 
+- **Aliased literal-union VALUE returned from a call, straight into print / another call**
+  (`print(pick(ks))` / `useK(pick(ks))` where `pick(p: K[]): K`, `type K = "a" | "b" | "c"` — the
+  1-D litunion-call-result seam the R4 note flagged as separate): INVALID-WASM
+  (`expected (ref $type), found i32`). Indexing the result first (`print(mk()[0])`) lowered.
+  Root: an ALIASED litunion reps as an i32 ATOM (its functype result is i32, via `vtKindOfType` /
+  `nodeTyIsLitUnionAlias`), but `retStrFlag` flagged the return `fRetStr` — because
+  `nodeTyWidenedRepName` renders EVERY litunion "string" (the print-widening name). So the
+  functype declared i32 while every call-result CONSUMER (`fnRetString` → `exprString`, the
+  inferred-return chain) treated the returned atom as a STRING REF and routed it to the string-ref
+  path. Fix: `retStrFlag` returns 0 for an aliased litunion return (its `fRetStr` now agrees with
+  the i32-atom functype); the atom widens to its member string at the print seam (`exprIsLitAtom`),
+  not by claiming a string RETURN. An INLINE litunion (`"a" | "b"` at the annotation) reps as the
+  string ref (its functype result IS the `retStrFlag` fallthrough), so the guard is ALIAS-ONLY —
+  matching `vtKindOfType` — leaving inline litunions byte-identical. Also closed the sibling that the
+  root-fix EXPOSED (an un-annotated GLOBAL binding off an atom init — `const r = pick(ks)` /
+  `const r = ks[0]` — printed the raw atom id, a pre-existing mismatch): `exprIsLitAtom`'s global
+  arm now consults `letInitIsLitAtom`, the global dual of the `localLitUnion` init classification a
+  function-body binding already had. Frozen: `tests/cases/literal-unions/atom-call-result-print.vl`.
+  Fuzz-neutral (the seam is hand-found, not generator-produced — 0 new / 0 fixed at seeds
+  4242/7777, 0 regressions at pinned 101/202/303); native-fixpoint holds; 982 tests pass.
 - **R4 — a 2-D array of an i32-backed scalar list** (`K[][]` literal-union, `boolean[][]`): rejected
   at emit (`only i32[] arrays and struct/union element arrays are supported`), the last live remnant
   of the "nested arrays" family — `i32[][]` / `f64[][]` / `i64[][]` / `f32[][]` / `string[][]` and any
