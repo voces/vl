@@ -1,7 +1,8 @@
 # VL collections design — VL's one user-facing collection, spelled `T[]` (B6)
 
-> Status: **design / research only.** No compiler code exists for this yet. This
-> document is the mental model and the decision record for VL's primary
+> Status: **core landed; surface still settling.** The growable `T[]` core, plus
+> `Map` and `Set`, have shipped (CHANGELOG B6); this document remains the mental
+> model and the decision record for VL's primary
 > collection — the growable sequence written `T[]` — so the follow-up
 > implementation PR can be small and uncontested. It deliberately surveys how other
 > languages do it, then commits to a concrete shape for VL's WasmGC backend with
