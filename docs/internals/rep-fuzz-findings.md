@@ -229,18 +229,31 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   (`print(pick(ks))` where `pick(p: K[]): K` — 1-D too), invalid wasm; index the result first
   (`print(mk()[0][0])`) and it lowers.
 - **R5 — nullable lists of a NON-i32 leaf** (`K[]|null`, `i64[]|null`, `f64[]|null`, `f32[]|null`,
-  `string[]|null`, in a binding/field/return): DEFERRED missing-rep. The i32/boolean case
-  (`i32[]|null` / `boolean[]|null` — the shape the R5 briefing named) is green everywhere (field code
-  18 / `nameIsNulI32List`, the shared i32-list wrapper niche); the other scalar leaves have no
-  nullable-niche rep over their scalar-list wrappers (`fl64TypeIdx` / `il64TypeIdx` / `mkListIdx` /
-  `fl32TypeIdx`), so a field yields `binding's inline-shape type has an unsupported field` and a
-  standalone binding yields `bare null needs a struct-typed context` — a LOUD reject, not invalid
-  wasm. Precise sites for the add: `fieldTypeCode` (a new nullable-scalar-list field code beside code
-  18, per leaf), `nameIsNulI32List`'s binding-local twin, and the null-check-narrowing read path. The
-  litunion sub-case (`K[]|null`) could fold into the code-18 path the way R4 folded into kind 4
-  (extend `nameIsNulI32List` to `nameIsI32Array(nullablePartOf(name))`), but it needs the litunion
-  atom lowering (`pendingLitUnion`) threaded at the nullable-list construct/store site — verify
-  end-to-end before landing.
+  `string[]|null`, in a binding/field/return): the LITUNION sub-case is RESOLVED; the distinct-backing
+  scalar/ref leaves remain a deferred missing-rep.
+  - **RESOLVED — litunion `K[]|null` / inline `("a"|"b")[]|null`** (field AND binding): a litunion's
+    atoms are interned i32 ids, so its list shares the `i32[]` backing EXACTLY like `boolean[]` — it
+    folds into the existing code-18 / `nullist` niche with NO new rep, the nullable dual of R4's kind-4
+    fold. One predicate change per position: `nameIsNulI32List` → `nameIsI32Array(nullablePartOf(name))`
+    (the name path, `fieldTypeCode`/`nameFieldCode`) and its arena twin `nodeTyIsNulI32List` +
+    `repOfNullable`'s array arm gain a `tyIsLitUnion` element check (the structural path,
+    `retNulListFlag`/`vtKindOfType`). The litunion atom lowering the construct/store site needs was
+    already threaded by the shared i32-list path (`nameIsI32Array` already claims a litunion array), so
+    no store-site change was required. Graduated (seeds 101/202/303): `p2c`/`p2r K0[] | null`; the
+    4242/7777 sweep fixed those two shapes, 0 new. Frozen: `tests/cases/lists/litunion-nullable-list.vl`.
+    Pre-existing and OUT of scope (fails IDENTICALLY for `i32[]|null` — a shared limitation, not a
+    litunion gap): a bare `= null` INITIALIZER value (`const xs: K[] | null = null` → `bare null needs a
+    struct-typed context`); a list VALUE init and the `!= null`-narrowed read both work.
+  - **DEFERRED — distinct-backing leaves** (`i64[]|null`, `f64[]|null`, `f32[]|null`, `string[]|null`):
+    these have no nullable-niche rep over their OWN scalar-list wrappers (`il64TypeIdx` / `fl64TypeIdx` /
+    `fl32TypeIdx` / `mkListIdx`), so a field yields `binding's inline-shape type has an unsupported field`
+    / `ref valtype with no interned shape` and a standalone binding yields `bare null needs a struct-typed
+    context` — a LOUD reject, not invalid wasm. Precise sites for the add: a new nullable-scalar-list
+    kind + field code PER leaf (a distinct `(ref null $wrapper)` — `fbValtype`/`fbValtypeNullable`/
+    `fbRefNullForKind`, `pushFieldStorage`, `emitOmittedFieldNull`), the `letIsNul<X>List` collect
+    classifier + `exprNullableList`'s per-kind twin, and the narrowed index-read dispatch (the
+    `lvk == "f64list"…` arms) gaining nullable arms. Unlike the litunion fold, these do NOT share a
+    backing, so each is a genuine new rep (a larger follow-up, not a predicate fold).
 
 - **Literal-union array LITERALS built the string list** (`const ks: VK[] = ["aa", "bb"]` —
   invalid wasm at the first atom-context use of an element: a `: VK` binding, a `VK` param,
