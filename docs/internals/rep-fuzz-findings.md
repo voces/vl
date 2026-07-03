@@ -527,6 +527,27 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   - array-literal element joins (`[k, "cc"]`): loud reject (list-rep classifiers), unchanged.
   Frozen: `tests/cases/unions/atom-string-join.vl`.
 
+- **`m[k] ?? <inline literal>` WIDENED a litunion struct field to `string` (silent MISMATCH)**
+  (`{[string]: {a: f32, f: K0, z: i32}}`, `{f: {[string]: {a: boolean, f: K1, z: i64}}}`, K a
+  litunion alias): reading the atom field — `print((m[k] ?? {…, f: "28", …}).f)` — rendered the RAW
+  ATOM ID (`2`) instead of its member string. The map-value struct's litunion field is an i32 ATOM
+  (interned in #847), so the read must widen the atom at `print`; but the `??` type-checker returned
+  `joinTys(nonNull, default)`, and the LUB of the litunion field `{f: K}` and the inline default's bare
+  `{f: string}` field WIDENED it to `string` — divorcing the checked node type from the atom rep, so
+  `print`'s widening had no litunion members (`nodeLitUnionMemberTexts` empty) and fell through to
+  `__print_i32__`. The VARIABLE-default spelling (`?? d`, `d: {f: K}`) was already correct (`joinTys`
+  of two identical `{f: K}` types), so only the inline-literal default — the form the fuzzer's `??
+  <same-shape dummy>` read emits — was wrong. Fix: the `??` result is the NON-NULL LHS type whenever
+  the default is assignable to it WITH the field-wise object-literal coercion `assignableExpr` applies
+  (the coercion #851 added through `| null`), preserving the litunion field; only an incompatible
+  default falls through to `joinTys`. A one-line checker change (no emit-side change — the store already
+  built the atom correctly, and once the read node types `K` the existing atom-widening path fires;
+  the `K`-typed node also self-trips `anyLitUnionUsed`, so no `gLitUnionUsed` gate change was needed).
+  Graduated (seeds 101/202/303): `p0r {[string]: (f32 | null)[]}`, `p1r {[string]: {a: f64, f: K0,
+  z: i32}}`; the wider 4242/7777 sweep additionally graduated the two shapes above + `{[string]:
+  {[string]: K0[]}}` (5 shapes, 0 new findings, 0 regressions). Frozen:
+  `tests/cases/maps/coalesce-litunion-field.vl` (reproduces the raw-atom mismatch on master).
+
 - **INLINE struct shapes as MAP VALUES were never interned** (`{[string]: {f: f32}}`, the nested-map
   struct field `{[string]: {f: {[string]: i64}}}`): emitted `unsupported map value type` while the
   NAMED-alias spelling (`type S = {f: f32}; {[string]: S}`) round-tripped. Root (position-DEPENDENT
