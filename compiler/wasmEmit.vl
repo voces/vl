@@ -310,6 +310,7 @@ import {
   mapTypeIdxOf,
   mvValElemHeapOf,
   mvValsBackOf,
+  nulScalarListWrapHeap,
   wSLEB,
   wU8,
   wULEB,
@@ -361,6 +362,7 @@ import {
   exprNulBool,
   exprNulClosure,
   exprNulLitUnion,
+  exprNulScalarListKind,
   exprNullableList,
   exprNullableRefArray,
   exprNullableString,
@@ -399,6 +401,7 @@ import {
   ifExprRefSlot,
   ifExprValtype,
   internAtom,
+  isNulScalarListKind,
   isUName,
   lastStmtIsValueIf,
   letAnnRefListKind,
@@ -436,6 +439,8 @@ import {
   narrowVariantFor,
   narrowedValueAtomOf,
   nliNameOf,
+  nulScalarListBuildKind,
+  nulScalarListKindOfNode,
   objVariantName,
   optChainStructIdxOf,
   paramStructIdxOf,
@@ -4306,6 +4311,33 @@ function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
 function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
   const nd = P.nodes[idxIx]
   if nd is Index {
+    // A DISTINCT-backing nullable scalar list `t[i]` (narrowed inside `if t != null`): the slot is
+    // `(ref null $wrapper)`, so recover non-null (the guard proved it present) then read as the leaf
+    // list. Checked FIRST — the plain classifiers below do not see through the `| null`.
+    const nsk = exprNulScalarListKind(nd.idxArr, fnIx)
+    if nsk != null {
+      if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
+      wU8(212) // 0xd4 ref.as_non_null (the `!= null` guard makes this safe)
+      const savedNslF32 = pendingF32
+      pendingF32 = false
+      if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
+      pendingF32 = savedNslF32
+      if nsk == "nulstrlist" {
+        emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
+        fbArrayGet(mkArrIdx) // 0xfb 0x0b string backing
+        wU8(212)             // 0xd4 ref.as_non_null (non-null string element)
+        return 0
+      }
+      let nek: VKind = "f64"
+      if nsk == "nuli64list" { nek = "i64" }
+      if nsk == "nulf32list" { nek = "f32" }
+      emitListIdxGuard(
+        listIdxWrapSlot(listIdxKindOf(nek), 0),
+        scalarListWrap(nek),
+      )
+      fbArrayGet(scalarListBack(nek)) // yields the element in its rep
+      return 0
+    }
     // A REF list `xs[i]` → unwrap to its `(ref null $elem)` backing, `array.get`, then
     // `ref.as_non_null` (`0xd4`) to surface the non-null element (a struct ref / union
     // box) — slots in `[0,len)` are always populated, so the cast never traps. (Checked
@@ -8000,6 +8032,7 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   let retNulBool = false
   let retNulString = false
   let retNulList = false
+  let retNulSLKind: VKind | null = null
   let retLitUnion = false
   let retNulLitUnion = false
   // A `string`-returning function whose `return` value is a literal-union atom: widen the
@@ -8057,6 +8090,7 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if tyIsNulBool(fn.fnRet) { retNulBool = true }
     if retNulStringFlag(fn.fnRet) == 1 { retNulString = true }
     if retNulListFlag(fn.fnRet) == 1 { retNulList = true }
+    retNulSLKind = nulScalarListKindOfNode(fn.fnRet)
     if nodeTyIsLitUnionAlias(fn.fnRet) { retLitUnion = true }
     // A `K | null` NICHE return: a `return null` lowers as the i32 sentinel `-1`, a `return "a"`
     // as its atom id — so seed BOTH the niche flag and `pendingLitUnion`.
@@ -8102,6 +8136,12 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if retNulBool { retCtx.nulBool = true }
     if retNulString { retCtx.nulString = true }
     if retNulList { retCtx.nulList = true }
+    // A DISTINCT-backing nullable scalar list return: a `return [x]` builds the leaf list
+    // (`listKind`, which subtypes the nullable result), a `return null` is `ref.null $wrapper`.
+    if retNulSLKind != null {
+      retCtx.listKind = nulScalarListBuildKind(retNulSLKind)
+      retCtx.nulRefHeap = nulScalarListWrapHeap(retNulSLKind)
+    }
     if retLitUnion { retCtx.litUnion = 1 }
     if retNulLitUnion {
       retCtx.nulLitUnion = true
@@ -8405,6 +8445,15 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     const ncCtx = expCtxHere()
     ncCtx.nulClosure = true
     if emitExprExpect(body, s.letInit, fnIx, ncCtx) < 0 { return -1 }
+  } else if isNulScalarListKind(localIsRef[slot]) {
+    // A DISTINCT-backing nullable scalar list binding (`string[]|null`, `f64[]|null`,
+    // `i64[]|null`, `f32[]|null`): a bare `null` init lowers as `ref.null $wrapper`
+    // (`nulRefHeap`), a list value builds the leaf list (`listKind`) which subtypes the
+    // nullable slot. Priority over the union-coerce path (the niche is not a box).
+    const nslCtx = expCtxHere()
+    nslCtx.nulRefHeap = nulScalarListWrapHeap(localIsRef[slot])
+    nslCtx.listKind = nulScalarListBuildKind(localIsRef[slot])
+    if emitExprExpect(body, s.letInit, fnIx, nslCtx) < 0 { return -1 }
   } else if letUNm != "" {
     if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return -1 }
   } else if letIsF32(stmtIx) {
@@ -10089,6 +10138,17 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       // `xs == null` / `xs != null` over a NULLABLE i32 list (`i32[] | null`,
       // kind 15): the same `ref.is_null` lowering as the nullable struct.
       if exprNullableList(nref, fnIx) {
+        if emitExpr(body, nref, fnIx) < 0 { return -1 }
+        wU8(209) // 0xd1 ref.is_null
+        if e.binOp == "!=" {
+          fbI32Eqz() // invert: non-null
+        }
+        return 0
+      }
+      // `t == null` / `t != null` over a DISTINCT-backing nullable scalar list (`string[]|null`,
+      // `f64[]|null`, `i64[]|null`, `f32[]|null`) — same `ref.is_null` lowering over the
+      // `(ref null $wrapper)` niche.
+      if exprNulScalarListKind(nref, fnIx) != null {
         if emitExpr(body, nref, fnIx) < 0 { return -1 }
         wU8(209) // 0xd1 ref.is_null
         if e.binOp == "!=" {
