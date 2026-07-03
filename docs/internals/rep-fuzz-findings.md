@@ -286,6 +286,19 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   `tests/cases/unions/value-union-string-member-no-string.vl`. Fuzz-neutral at the pinned/wide seeds
   (the generator always constructs the string carrier, so the dead-arm case is hand-found) — 0
   graduations, 0 regressions; native-fixpoint holds; 989 tests pass.
+
+- **Extracting a narrowed value-union member into a fresh EXPLICITLY-TYPED local → invalid wasm**
+  (`const x: i32 = r` / `const b: boolean = r` where `r: i32 | boolean` / `string | i32` is narrowed):
+  `letIsUnion` consulted the INIT's union-ness (`exprUnion(d.letInit)`) even when an explicit NON-union
+  annotation pinned the cell — so `x` was classified a union BOX and the unboxed scalar was stored into
+  a `(ref $box)` slot (`expected (ref …), found i32`). The comment already said the init check "applies
+  when no annotation pinned the cell", but the code did not enforce it; the fix gates the init-union
+  check on `d.letType < 0`. An explicit annotation now makes the binding that concrete type and the init
+  UNBOXES the narrowed atom into it. 0 regressions (pinned + 4242/7777); native-fixpoint holds; 990
+  tests pass. Frozen: `tests/cases/unions/value-union-narrowed-extract.vl`. Fuzz-neutral at the pinned/
+  wide seeds (the generator's value-union arms print a literal, never re-extract) — hand-found, and the
+  composition unlock the closures workstream needs for value-union results.
+
 - **R3 (partial) — a literal-union ALIAS member of a VALUE union, positive `is K0` test**
   (`K0 | boolean`, `K0 | i32`, `K0 | f64`, `K0 | {w:i32}`, and the struct-field carrier
   `{a, f: K0 | i64, z}`): `is K0` rejected at emit (`` `is` names a type that is not a union
