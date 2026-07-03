@@ -207,6 +207,32 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
 
 ## RESOLVED
 
+- **Inline value-union struct FIELD not registered like the named-alias one** (`{f: f32 | {w:i32}}`,
+  every member type — i32/i64/f32/f64/string/boolean/struct): the inline spelling rejected on a
+  scalar-arm read (`field access receiver is not a struct`) — or emitted invalid wasm on the box read
+  — while the named-alias `type U = f32 | {w:i32}; {f: U}` round-tripped. Root: a struct field's union
+  is carried in its FIELD, not at the annotation's top level. A named `type T = {f: A|B}` registers each
+  field union in `collectInlineUnionsIn`'s TypeDecl branch (iterating `tdFields`), but an INLINE shape
+  annotation reached `registerInlineUnion` as one whole-shape name, which had array / map / function-
+  return / value-union / variant-box arms but no arm that DESCENDED into a struct shape's fields — so a
+  field union `f32|{w:i32}` was only later half-registered by `internInlineShape`'s `registerValueUnionName`
+  (the value-box reps, NOT the struct VARIANT), and negative (`else`-branch) narrowing to the struct
+  member had no variant to recover. Fix: `registerInlineUnion` gains a single-shape arm
+  (`nameIsSingleShape` gates out a union-of-shapes `{x}|{y}` and a map `{[…]}`) that splits the shape
+  body at depth 0 and recurses on each field type (`registerShapeFieldUnions`) — the inline dual of the
+  named-`TypeDecl` field loop, running in `collectU` BEFORE `collectS`/`internInlineShape` so the full
+  variant-box registration wins. A CLOSURE field (`f: (i32) => i32 | {w:i32}`) is skipped (top-level
+  arrow): its union sits in the composite closure RESULT, an R2-adjacent family whose shape may not
+  lower — registering it would over-reach a field the named spelling only reaches through the same
+  still-irregular closure-result path. Graduated (seeds 101/202/303): `p1c`/`p1r
+  {a: boolean, f: boolean | {w: i32}, z: i32}`, `p3r {a: boolean, f: {a,f:f64,z} | {w: i32}, z}`; the
+  wider 4242/7777 sweep additionally fixed 9 field-union shapes (0 new findings). Frozen:
+  `tests/cases/unions/inline-union-field.vl`. Pre-existing and OUT of scope (fails IDENTICALLY for the
+  named alias, a separate field-union READ gap, not a collection difference): a `string | {struct}`
+  field read against a struct VALUE (`narrowed string union field read but array type not collected`),
+  and an `else`-branch narrow to a struct member of a two-struct-member field union (`{v}|{w}` — read
+  via the carrier's positive `is` arm instead).
+
 - **R4 — a 2-D array of an i32-backed scalar list** (`K[][]` literal-union, `boolean[][]`): rejected
   at emit (`only i32[] arrays and struct/union element arrays are supported`), the last live remnant
   of the "nested arrays" family — `i32[][]` / `f64[][]` / `i64[][]` / `f32[][]` / `string[][]` and any

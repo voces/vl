@@ -2802,6 +2802,69 @@ function assignTags() {
   0
 }
 
+// True if `name` is a SINGLE inline struct-shape group (`{…}`) — its leading `{` closes at the
+// FINAL char, never at depth 0 earlier. Rejects a union of shapes (`{x:i32}|{y:i32}`, whose first
+// `{` closes mid-string) and a map (`{[string]:V}`), both of which also start `{` and end `}`.
+function nameIsSingleShape(name: string) {
+  if name.length < 2 { return false }
+  if name[0] != '{' || name[1] == '[' || name[name.length - 1] != '}' {
+    return false
+  }
+  let depth = 0
+  let k = 0
+  while k < name.length {
+    const c = name[k]
+    if c == '{' || c == '[' || c == '(' { depth = depth + 1 }
+    if c == '}' || c == ']' || c == ')' { depth = depth - 1 }
+    // A close returning to depth 0 before the final char means the leading group
+    // ended early — the remainder is a union tail / another shape.
+    if depth == 0 && k < name.length - 1 { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Register every FIELD union of an inline struct-shape annotation `name` (`{f:A|B,g:C}`) — split
+// the shape body at depth 0 and recurse `registerInlineUnion` on each field's type text. The
+// inline-shape dual of `collectInlineUnionsIn`'s named-`TypeDecl` field loop, so a field union
+// (`{f: f32 | {w:i32}}`) interns its variant structs regardless of whether the struct is spelled
+// inline or as a named alias. A non-union field (`i32`, a nested plain struct, a map) is a
+// self-gated no-op through the same dispatch. Returns 0, or -1 (via `emitFail`).
+function registerShapeFieldUnions(stmts: i32[], name: string) {
+  const inner = name.slice(1, name.length - 1)
+  let depth = 0
+  let start = 0
+  let k = 0
+  while k <= inner.length {
+    let brk = false
+    if k == inner.length {
+      brk = true
+    } else {
+      const c = inner[k]
+      if c == '{' || c == '[' || c == '(' { depth = depth + 1 }
+      if c == '}' || c == ']' || c == ')' { depth = depth - 1 }
+      if c == ',' && depth == 0 { brk = true }
+    }
+    if brk {
+      const part = inner.slice(start, k)
+      const ci = part.indexOf(":")
+      if ci > 0 {
+        const ftxt = part.slice(ci + 1, part.length)
+        // Skip a CLOSURE field (`f: (i32) => i32 | {w:i32}`): any union sits in the closure
+        // RESULT, a composite-closure-result concern (its shape may not lower) — not this field's
+        // own rep. Registering it here would over-reach a field the named-alias spelling only reaches
+        // through the same still-irregular closure-result path. A top-level arrow marks the closure.
+        if annArrowAt(ftxt) < 0 {
+          if registerInlineUnion(stmts, ftxt) < 0 { return -1 }
+        }
+      }
+      start = k + 1
+    }
+    k = k + 1
+  }
+  0
+}
+
 // Register the inline union synthetic name `name` (e.g. `"A|B"`) as a union alias in
 // the per-union tables, exactly as `collectU` registers a `UnionDecl`: record the
 // name + its variant-slice range, append each member to the GLOBAL `uVariants` list,
@@ -2881,6 +2944,14 @@ function registerInlineUnion(stmts: i32[], name: string) {
       )
     }
   }
+  // An inline STRUCT-SHAPE annotation (`{f: A | B}`, `{a: C | i32, b: {g: D | E}}`) carries its
+  // unions in its FIELDS, not at the top level — so `isVariantBoxUnion` sees one atom and misses
+  // them. A named `type T = {f: A | B}` registers each field union in `collectInlineUnionsIn`'s
+  // TypeDecl branch; give the inline form the SAME descent so a field union interns its variant
+  // structs the way the named-alias spelling does (not just the value-box reps `internInlineShape`
+  // would later mark). `nameIsSingleShape` gates out a union-of-shapes (`{x:i32}|{y:i32}`, handled
+  // by `isVariantBoxUnion` below) and a map (`{[string]: V}`, whose value recursion is above).
+  if nameIsSingleShape(name) { return registerShapeFieldUnions(stmts, name) }
   if !isVariantBoxUnion(stmts, name) { return 0 }
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
