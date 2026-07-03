@@ -27,13 +27,15 @@
 // sidecar (`nodeTy*`) established; coverage widens arm by arm as consumers
 // migrate, never by a blanket claim.
 //
-// SLOTS. `rdSlot` carries a rep's interned table slot only where a consumer has
-// resolved it (struct table / variant index / ref-list slot / map shape). The
-// ARENA-level derivation leaves it -1: slot resolution is still name-keyed
-// (`structIndexByName` / `rlSlotByName` / `mvValName`, all in emit_classify,
-// ABOVE this module), so it layers in at the consumer. Folding slot resolution
-// down here — a canonical structural key that terminates on recursive types —
-// is the follow-up wave, not this one.
+// SLOTS. `rdSlot` carries a rep's interned STRUCT-table slot. The arena
+// derivation resolves it for a DECLARED-struct object type via `repSlotOfTy`
+// (keyed on the checker's memoized arena index, so nominal twins stay distinct —
+// see the note there); it stays -1 for inline shapes, variants, ref-list and map
+// reps, whose slots remain name-keyed at the consumer (`structIndexByName` /
+// `rlSlotByName` / `mvValName`, all in emit_classify, ABOVE this module). No
+// consumer reads `rdSlot` yet — it is the descriptor foundation the slot-layer
+// migration builds on; the canonical structural key (`repCanonKey`) that makes it
+// cycle-safe lives just below.
 //
 // CYCLES. Recursive structural types are REAL arena cycles: `type Tree = {kids:
 // Tree[]}` resolves `Tree` through `cUserTypes` memoization, so the field's
@@ -43,7 +45,8 @@
 // loop. The TRANSITIVE queries (`repTyScalarMask`) walk the full graph and
 // terminate via a generation-stamped visited mark per arena index.
 
-import { VKind } from "./emit_state"
+import { i32ToStr } from "./ast"
+import { VKind, sNames } from "./emit_state"
 import {
   T,
   TyArray,
@@ -54,6 +57,7 @@ import {
   TyObj,
   TyPrim,
   TyUnion,
+  cUserTypes,
   nodeTyIsUnionAlias,
   nodeTyIxOf,
   tyIsLitUnion,
@@ -171,6 +175,122 @@ function repMk(kind: VKind, nul: i32, elem: string): RepDesc {
   return d
 }
 
+// ── Canonical structural key (cycle-terminating) ─────────────────────────────
+// A string that identifies a type's STRUCTURE, walked in FULL so `{a:i32}` and
+// `{a:i32,b:i32}` differ (unlike the descriptor arms, which classify at most one
+// wrapper deep). Recursive arena cycles (`type List = {next: List | null}`, mutual
+// `A→B→A`) terminate via a visited STACK: re-entering a type already being
+// expanded emits a RELATIVE back-edge `#<k>` (k = stack distance to the enclosing
+// occurrence — a de Bruijn index), so two isomorphic cyclic types render the same
+// key regardless of their (per-compile, non-deduped) arena indices. Two
+// structurally-identical types — including through cycles — share a key; two
+// distinct ones never collide. A leaf variant the emitter does not narrow
+// (`TyVar`/`TyLit`/`TyErr`) is keyed by its arena index (`@N`): distinctness is
+// preserved (never a false merge); isomorphism across such leaves is not — the
+// slot resolver only consults DECLARED-struct keys, where these do not arise.
+const repKeyStack: i32[] = []
+
+export function repCanonKey(ty: i32): string {
+  if ty < 0 { return "!" }
+  let si = repKeyStack.length - 1
+  while si >= 0 {
+    if repKeyStack[si] == ty { return "#" + i32ToStr(repKeyStack.length - si) }
+    si = si - 1
+  }
+  repKeyStack.push(ty)
+  const s = repCanonKeyGo(ty)
+  repKeyStack.pop()
+  s
+}
+
+function repCanonKeyGo(ty: i32): string {
+  const t = T.tys[ty]
+  if t is TyPrim { return t.primName }
+  if t is TyObj {
+    let s = "{"
+    let i = 0
+    while i < t.objFieldNames.length {
+      s = s + t.objFieldNames[i] + ":" + repCanonKey(t.objFieldTypes[i]) + ","
+      i = i + 1
+    }
+    return s + "}"
+  }
+  if t is TyArray { return repCanonKey(t.aElem) + "[]" }
+  if t is TyNullable { return repCanonKey(t.nInner) + "?" }
+  if t is TyUnion {
+    let s = "("
+    let i = 0
+    while i < t.uMembers.length {
+      if i > 0 { s = s + "|" }
+      s = s + repCanonKey(t.uMembers[i])
+      i = i + 1
+    }
+    return s + ")"
+  }
+  if t is TyFunc {
+    let s = "("
+    let i = 0
+    while i < t.fnParamTypes.length {
+      if i > 0 { s = s + "," }
+      s = s + repCanonKey(t.fnParamTypes[i])
+      i = i + 1
+    }
+    return s + ")=>" + repCanonKey(t.fnRet)
+  }
+  if t is TyMap {
+    let s = "M"
+    if t.mSet == 1 { s = "Se" }
+    return s + "[" + repCanonKey(t.mKey) + ":" + repCanonKey(t.mVal) + "]"
+  }
+  if t is TyNeg { return "!" + repCanonKey(t.negTy) }
+  // TyVar / TyLit / TyErr — not narrowable here; key by arena index (see above).
+  "@" + i32ToStr(ty)
+}
+
+// The interned STRUCT-table slot for an object type `ty`, derived from the arena
+// alone, or -1 when none is claimed (the consumer keeps its nominal path).
+//
+// The struct table is keyed NOMINALLY: a declared `type A = {v:i32}` and a
+// declared `type B = {v:i32}` occupy DISTINCT slots even though their structure —
+// hence `repCanonKey` — is identical, and the emitter deliberately keeps them
+// apart (a `B`-typed value resolves its OWN slot). So the canonical key alone
+// cannot reproduce nominal slot identity; the checker's MEMOIZED arena index does
+// (`cUserTypes` mints one index per declared alias, so `A` and `B` differ THERE).
+// This resolver therefore:
+//   · returns a slot on an EXACT arena-index match against a declared slot's
+//     memoized type (nominal identity — `A`↦A, `B`↦B); else
+//   · returns the UNIQUE declared slot whose structural key matches (the
+//     structural→nominal bridge for an inline shape with exactly one declared
+//     twin); else -1 when zero or MANY declared slots match (an inline shape with
+//     structural twins is left to the nominal path — never collapsed).
+// Only DECLARED-struct slots (`cUserTypes[name] >= 0`) participate; inline-shape
+// slots stay -1 in this layer. Cycle-safe via `repCanonKey`.
+export function repSlotOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if !(t is TyObj) { return -1 }
+  const key = repCanonKey(ty)
+  let found = -1
+  let n = 0
+  let si = 0
+  while si < sNames.length {
+    const di = cUserTypes[sNames[si]] ?? -1
+    if di >= 0 {
+      const dt = T.tys[di]
+      if dt is TyObj {
+        if di == ty { return si }
+        if repCanonKey(di) == key {
+          found = si
+          n = n + 1
+        }
+      }
+    }
+    si = si + 1
+  }
+  if n == 1 { return found }
+  -1
+}
+
 // ── The derivation: one table-driven arm per `Ty` variant ────────────────────
 // INVARIANT: every covered arm must decide the rep EXACTLY as the emitter's
 // annotation-name classifier ladder (`vtKindOfType`'s arm order) does for the
@@ -190,7 +310,9 @@ export function repOfTy(ty: i32): RepDesc {
     // variant index, not a struct-table index); any other object shape is a
     // standalone struct ref.
     if tyIxIsVariantMember(ty) { return repMk("variant", 0, "") }
-    return repMk("struct", 0, "")
+    const d = repMk("struct", 0, "")
+    d.rdSlot = repSlotOfTy(ty)
+    return d
   }
   if t is TyUnion {
     // A homogeneous string-literal union: a DECLARED alias (`type K = "a"|"b"`)
