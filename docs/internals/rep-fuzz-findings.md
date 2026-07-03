@@ -299,3 +299,122 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   same-field-name-set shapes with different scalar reps in one program (`type S = {f: i32}` +
   `() => {f: i64}`) — invalid wasm on master even for magnitude literals, now a loud
   "no interned signature" reject; the name-set-keyed interning is the documented limitation.
+
+---
+
+# Wave re-grounding (2026-07) — structural interning is COMPLETE; taxonomy of what remains
+
+A fresh authoritative sweep against master (post `repCanonKey` / `buildStructTwins`, #833 +
+#834) re-derives this workstream's state from scratch. Sweeps: seeds 101/202/303/4242/7777,
+depths 3–4, count 300 (`--keep` per seed); plus the pinned-param baseline check
+(101·d2 / 202·d3 / 303·d4 × count 120). Result: `native-fixpoint` CONVERGES, the baseline is
+ACCURATE (0 graduations, 0 regressions at pinned params), and the finding-set is unchanged.
+
+## Verdict: the struct-shape STRUCTURAL-INTERNING slice is already landed
+Every collision "the rep rewrite" named as the interning target round-trips on master today —
+verified by direct probes AND already frozen as `@run` regression fixtures:
+- `{f:i32}` vs `{f:i64}` (declared aliases AND inline `{f:i32}`/`{f:i64}` in one program) —
+  distinct slots, the i64 stays 64-bit. Frozen: `structs/structural-non-twin-distinct.vl`.
+- deep same-shape `{f:{f:{f:i32}}}`, and `{f:{g:i32}}` vs `{f:{g:i64}}` — distinct.
+  Frozen: `structs/inline-shape-same-name-nesting.vl`.
+- union-of-shapes `{x:i32}|{y:i32}` — `is`-narrows and reads correctly.
+- generic monomorphs `Pair<i32,i64>` vs `Pair<i32,i32>` (same field-name set, different rep) —
+  distinct slots. Frozen: `generics/type-alias-pair.vl`, `generics/swap.vl`.
+- structural twins `type A={v:i32}`/`type B={v:i32}` share ONE heap type.
+  Frozen: `structs/structural-twin-heap-dedup.vl`.
+
+Why it is closed: `annShapeIndexOf` already keys each field on (name, emitter field-CODE,
+recursive element-TEXT) and recurses through nested shapes — nested field TYPES are NOT
+ignored (the #668 element-name comparison + the field-code axis separate every scalar/nested
+rep). The heap layer then dedups the truly-structural twins via `repCanonKey` (#834), guarded
+by `structFieldCodesEq` so only same-LAYOUT twins merge.
+
+ARCHITECTURAL NOTE — the intern table must NOT be re-keyed onto `repCanonKey`. The intern
+table is a LAYOUT table, not a checker-structure table. Two structurally-identical checker
+types can lower to DIFFERENT layouts (an atom-backed litunion field `type K="a"|"b"` vs an
+inline `"a"|"b"` string field — the `WithAlias`/`WithInline` case in the non-twin fixture).
+`repCanonKey` equates them (same checker structure); the emitter must keep them apart. So
+`annShapeIndexOf` correctly keys on field CODES (layout identity), and `repCanonKey` is
+confined to the heap-dedup layer where `structFieldCodesEq` re-imposes the layout guard.
+"Recursive structural interning" was delivered as this TWO-LAYER split (field-code intern +
+structural heap dedup), not a single key — unifying the intern onto `repCanonKey` would
+OVER-merge distinct layouts.
+
+## Current failure taxonomy (post-#834), grouped by ROOT
+All remaining findings are GENUINE MISSING REPS in composition (codegen adds for later
+waves), NOT intern routing losses — except the one seam noted in R3. Classes: INVALID-WASM
+(soundness) · REJECT (fail-loudly tail). Family sizes are unique-shape counts across the
+five sweep seeds at d3–d4.
+
+### R1. Typed-value maps IN COMPOSITION — MISSING REP (dominant: ~106 INVALID-WASM shapes)
+Repro: `const g: {[string]: f32} = {…}`; also map-in-map `{[string]:{[string]:T}}`,
+struct-valued `{[string]:{f:T}}`, map-in-list `{[string]:T}[]`, nullable map
+`{[string]:T} | null`, map-in-field `{f:{[string]:T}}`, closure-returned `() => {[string]:T}`.
+Class: INVALID-WASM.
+Losing site: `repOfMap` (emit_rep.vl ~539) returns `repUncovered()` for any value beyond
+i32/boolean; the mv interner `mvValKindOfName` (emit_classify) resolves typed map values ONLY
+at the return/param boundary (prior wave), never as a struct-field code, a list-element kind,
+or a nested-map value kind.
+Verdict: MISSING REP — the map value rep does not compose. Give the mv interner a
+composition entry (field code + list element + nested-map value) backed by a per-value-kind
+map struct.
+
+### R2. Closures over COMPOSITE results/params — MISSING REP (~19 shapes)
+Repro: `() => {f:i32}`, `{f: () => {f:i32}}`, `() => i64[]`, `(i32) => {[string]:T}`. Also the
+documented `type S={f:i32}` + `() => {f:i64}` case surfaces HERE.
+Class: INVALID-WASM / REJECT (`function-value call arity has no interned signature`).
+Losing site: the value-call ABI token table `repSigTokOfKind` (emit_rep.vl ~113) has tokens
+only for scalar/string/a-few-list results; `cloSigPosOfKey` / `fnSigIdxForArity`
+(wasmEmit.vl ~6346) find no `$fnsig` slot for a composite result.
+Verdict: MISSING REP — no closure ABI signature token for composite results. Coordinate with
+the closures workstream.
+
+### R3. Value-union BOX carrying a scalar/composite member — MIXED (~10 pure-struct shapes)
+Repro: `{f: f32 | {w:i32}}` (INVALID-WASM `expected f32, found f64` on the box read),
+`{a,f,z} | scalar`, `(boolean|i32)[] | null`, `(boolean | {w:i32})[] | null`.
+Class: INVALID-WASM.
+Losing site: the union-box field READ / `emitUnionCoerce` scalar-widening seam (an f32 member
+read back as f64), plus the box rep for a composite member.
+Verdict: MIXED — the f32/f64 read seam is a ROUTING LOSS (same family as the prior FIXED
+widening seams, an `emitUnionCoerce`/box-read arm; the ONLY routing loss left); the
+composite-member box is a MISSING REP. Separable.
+
+### R4. Nested (2-D) arrays under a composition wrapper — MISSING REP ("2-D array backing")
+Repro: `{f: f64[][]}`, `{f: {f:i32}[][]}`, `(i32[][] | null)[]`, `{[string]: boolean[][]}`.
+Class: INVALID-WASM / REJECT (`nested arrays are not supported`).
+Losing site: `repOfArray` (emit_rep.vl ~501) returns uncovered when the element is itself a
+`TyArray`; no 2-D backing wrapper for an array-of-array reached under a nullable/struct/list/
+map. (Bare `i32[][]` works, `f64[][]` does not — the leaf scalar matters, which is why blanket
+rejects over-reject.)
+Verdict: MISSING REP — the 2-D array backing type.
+
+### R5. Nullable list in a struct field / binding — MISSING REP ("nullable-list-in-field wrapper")
+Repro: `{f: i32[] | null}`, `{f: (i32|null)[] | null}`.
+Class: REJECT (`bare null needs a struct-typed context`).
+Losing site: `repOfNullable` (emit_rep.vl ~443) covers `i32[]|null` at the STANDALONE position
+only; a nullable list has no rep as a FIELD or a non-standalone binding.
+Verdict: MISSING REP — the nullable-list-in-field wrapper.
+
+### R6. Struct through a LIST / nullable-list receiver — MISSING REP ("struct-through-list receiver")
+Repro: `({f:f64}|null)[]`, `{f: {f:f64}[]}`, `{f: {f:{f:i32}[]}}`.
+Class: REJECT (`field access receiver is not a struct`).
+Losing site: the field-access receiver classifier loses the struct through a list element / a
+nullable-list element.
+Verdict: MISSING REP — struct-through-list receiver.
+
+### Clean-reject long tail (NOT bugs) — unchanged
+Map params, deep lambda-param inference, f32-through-wrapper, string→litunion-through-nullable,
+`is` over some deep structural types. Fail-loudly; pinned in the baseline.
+
+## Recommended remaining holistic sequence (per-family site)
+1. R3a (ROUTING LOSS): the union-box scalar-read widening seam (`emitUnionCoerce` / box field
+   read) — the only remaining routing loss; smallest, gated like the prior widening waves.
+2. R1 (MISSING REP): typed-value maps in composition — the mv interner composition entry
+   (`mvValKindOfName` → field code / list element / nested-map value) + per-value-kind map
+   backing. Highest shape count.
+3. R4 (MISSING REP): 2-D array backing wrapper (`repOfArray` element recursion + a nested-list
+   backing type).
+4. R5 (MISSING REP): nullable-list-in-field wrapper (`repOfNullable` field arm + a field code).
+5. R6 (MISSING REP): struct-through-list receiver (the field-access receiver classifier).
+6. R2 (MISSING REP): composite closure-result ABI token (`repSigTokOfKind` + `$fnsig`
+   composite slots) — with the closures workstream.

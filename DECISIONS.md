@@ -129,6 +129,22 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   expected). The map-array element and any unresolved element stay unique (the
   map-struct index interlock); non-twins (`i32[]` vs `i64[]`) keep distinct element
   heaps and wrappers. (structural slot dedup, ref-list layer)
+- **The shape-INTERN table keys on field CODES (layout), not `repCanonKey`
+  (structure); the two are deliberately separate layers.** `annShapeIndexOf` is a
+  LAYOUT table — two structurally-identical checker types can lower to DIFFERENT
+  layouts (an atom-backed litunion field `type K="a"|"b"` vs an inline `"a"|"b"`
+  string field), and the emitter must keep them apart. `repCanonKey` equates them,
+  so it is confined to the heap-dedup layer, where `structFieldCodesEq` re-imposes
+  the layout guard before any merge. "Recursive structural interning" is this
+  two-layer split (field-code intern + structural heap dedup, with the per-field
+  recursive element-text comparison in `annShapeIndexOf` separating nested reps) —
+  NOT a single `repCanonKey`-keyed intern, which would over-merge distinct layouts.
+  Verified complete: `{f:i32}`/`{f:i64}`, deep same-shape, union-of-shape, and
+  generic `Pair<i32,i64>`/`Pair<i32,i32>` all stay distinct and lower correctly. The
+  remaining rep-fuzz families are genuine MISSING reps in composition (typed-value
+  maps, 2-D arrays, nullable-list-in-field, struct-through-list, composite closure
+  results), not intern losses — see `docs/internals/rep-fuzz-findings.md`.
+  (structural interning, roadmap Next#1)
 - **No `this` keyword.** A method is a function whose first parameter is `self`
   (Rust-style); `o.f(a)` is sugar for `f(o, a)` (UFCS). `self` is an _explicit,
   optional_ marker: first param `self` → a method reachable as `o.f()`; no
