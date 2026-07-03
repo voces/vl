@@ -67,8 +67,12 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
      tables to stored `VKind` (makes `inferredRetKindCore` a read); (b) move `sigKeyRetKind`
      consumers off raw codes onto `VKind`, then delete `repLegacyCodeOfKind`; (c) `annSigKey`/
      `fnSigKeyOf` onto the token table; (d) widen `repOfTy` coverage (typed-value maps,
-     litunion/union-element arrays); (e) the SLOT layer (`structIndexByName`/`rlSlotByName` —
-     needs the canonical-structural-key-on-cycles design, the remaining hazard).
+     litunion/union-element arrays); (e) the SLOT layer — STRUCT table DONE (structural
+     heap-type dedup: `repCanonKey` → `sTwin` → shared `sHeapIdx`, fixing the structural-twin
+     invalid-wasm bug `takeA(b)` where `A`/`B` are structurally-identical declared types; see
+     `DECISIONS.md`). REMAINING: the REF-LIST table (`rlSlotByName` — a `B[]` still interns a
+     distinct list-wrapper heap type from `A[]`, so `sumA(bs: B[])` given an `A[]` mismatches;
+     extend the same `repCanonKey`-keyed dedup to the ref-list wrapper/backing slots).
 - ✅ **Kill the TS host. DONE — the TWO COMPILERS are now one.** The TS compiler core
   (`compiler/*.ts` front end + `cli.ts` + the `checker-parity-sweep.ts` oracle) is DELETED; the
   self-hosted `compiler/*.vl` (the wasm seed) is the sole compiler. Got here in stages:
