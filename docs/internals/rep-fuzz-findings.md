@@ -285,6 +285,40 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   function value — a genuine reject, not an adoption gap): an ARBITRARY f64 VALUE into an f32 return
   (`(i32) => f32 = (x) => someF64Var`) stays a lossy-demote reject.
 
+- **R2/closures — litunion RESULT via a lambda, + the value-call-result print widening**
+  (`(i32) => K`, and the nested `{a: i64, f: {f: (i32) => K}, z: boolean}`): TWO seams, one CHECKER
+  + one EMITTER, both required for the shape to round-trip.
+  - **Emitter (a MISMATCH, `(i32) => K = mk` printed the raw atom id).** A NAMED-function VALUE call
+    `v(0)` whose result is an aliased litunion holds an i32 atom (its functype result reps i32, #843),
+    but `exprIsLitAtom`'s `Call` arm only handled a NAMED-function callee (`fnIndexOf(name)`), so a
+    closure VALUE call — and a struct-field / indexed closure call — fell through and `print(v(0))`
+    emitted the raw id (0/1/2). Fix: any `Call` whose CHECKED result type is an aliased litunion
+    (`nodeTyIsLitUnionAlias(callNode)`) widens at print — the value-call dual of the named-call arm.
+    Alias-only (`nodeTyIsLitUnionAlias`), so an INLINE-litunion-returning call (string rep) is
+    correctly excluded, and a Member/Index callee (`s.f.f(0)`) is reached (the arm keys the call
+    node, not the callee shape).
+  - **Checker (a REJECT, the lambda spelling `(x) => "b"` was un-adopted).** A litunion-member string
+    literal body infers the softened `string`; the return-adoption block widened only via
+    `numWidens` / `objRetWidenAdopt`, so `cannot assign (i32) -> string to … (i32) -> K`. Fix: a
+    litunion adoption arm — a bare string-literal body that `assignableExpr` proves a member of the
+    expected litunion adopts it. For the lambda to LOWER, its `$fnsig` result must key the i32 atom
+    (`>i`) to match the value call and `emitReturnValue` must encode the member as its atom id, so the
+    anonymous lambda's adopted return is recorded as the litunion ALIAS name and `synthRetAnnots` pins
+    `fnRet` to it (the alias reps as an i32 atom; an inline member spelling reps as a string, so the
+    alias name is required — a new `litUnionAliasNameOfTy` reverse-lookup off a parallel
+    `cUnionNames`/`cUnionTyIxs`). Once pinned, the existing annotated litunion machinery
+    (`vtKindOfType` → `>i`, `retLitUnion`) lowers it — no new `$fnsig` token: the ABI vocabulary is
+    unchanged (a litunion result IS the i32 token, `repSigTokOfKind`/`repKindOfSigTok` untouched).
+  native-fixpoint holds; 987 tests pass. Graduated (seeds 101/202/303): `p0c/p0r/p2c/p2r (i32) => K0`,
+  `p0c/p0r {a: i64, f: {f: (i32) => K0}, z: boolean}` (6 baseline lines); the 4242/7777 d3–4 sweep
+  additionally graduated 13 more litunion-result shapes (arrays `((i32) => K0)[]`, nullable
+  `((i32) => K0) | null`, struct-field `{f: (i32) => K0}` and its nullable), finding-set strictly
+  SHRANK (0 new). Frozen: `tests/cases/closures/lambda-litunion-result.vl`. NOT part of this slice
+  (a value-union / nullable box a sibling owns, not a bare litunion result): `K0 | i32` / `K0 | f64` /
+  `K0 | {w:i32}` value unions, `(() => K0 | null)[]`, `(i32) => ((i32) => K0) | null` (nullable of a
+  nested closure) all remain baselined — the closure side is right; they need the value-union/nullable
+  rep first.
+
 - **Inline value-union struct FIELD not registered like the named-alias one** (`{f: f32 | {w:i32}}`,
   every member type — i32/i64/f32/f64/string/boolean/struct): the inline spelling rejected on a
   scalar-arm read (`field access receiver is not a struct`) — or emitted invalid wasm on the box read
