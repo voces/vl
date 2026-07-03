@@ -1,0 +1,461 @@
+// `emit_rep.vl` — `repOf`: the unified wasm-REP descriptor, derived STRUCTURALLY
+// from the checker's `Ty` arena (ROADMAP "repOf unification").
+//
+// WHY THIS MODULE EXISTS. The emitter historically enumerates the same wasm rep
+// families in FIVE parallel schemes that must agree by convention:
+//   1. the `VKind` string union (emit_state.vl) — locals/params/results,
+//   2. raw numeric codes 0–21 (the historical `VKind` codes, still live in the
+//      closure-result classifiers and struct FIELD codes),
+//   3. single-char `$fnsig` tokens (`cloParamTok` / `cloRetKeySuffix` encode,
+//      `sigKeyRetKind` decodes — different numbers again),
+//   4. the per-function `fRet*` inferred-return flag tables,
+//   5. side enums (`MfKind`/`BtKind`/`PushKind`).
+// Every translation ladder between them is a place a new rep can be missed — each
+// wave-4 rep bug was one enumeration arm that had drifted from its twins. `repOf`
+// is the strangler replacement: ONE descriptor, derived ONCE from the checked
+// type, that every scheme becomes a projection of. Consumers migrate site by
+// site (each migration gated by the fixpoint + corpus byte-compare + the rep
+// fuzzer); the old schemes then become delegation shims and finally die.
+//
+// COVERAGE DISCIPLINE (`rdCovered`). The derivation is deliberately PARTIAL: an
+// arm is marked covered only where the arena structure decides the rep exactly
+// as the emitter's name-based classifier ladder does today. Everything else —
+// shapes whose rep still depends on emitter interning gates (typed-value maps,
+// union-element lists, nested arrays, nullable lists beyond `i32[] | null`) —
+// returns `rdCovered == 0`, and the consumer keeps its legacy path. This is the
+// same consult-the-checker-first / fall-back-syntactic pattern the typed-IR
+// sidecar (`nodeTy*`) established; coverage widens arm by arm as consumers
+// migrate, never by a blanket claim.
+//
+// SLOTS. `rdSlot` carries a rep's interned table slot only where a consumer has
+// resolved it (struct table / variant index / ref-list slot / map shape). The
+// ARENA-level derivation leaves it -1: slot resolution is still name-keyed
+// (`structIndexByName` / `rlSlotByName` / `mvValName`, all in emit_classify,
+// ABOVE this module), so it layers in at the consumer. Folding slot resolution
+// down here — a canonical structural key that terminates on recursive types —
+// is the follow-up wave, not this one.
+//
+// CYCLES. Recursive structural types are REAL arena cycles: `type Tree = {kids:
+// Tree[]}` resolves `Tree` through `cUserTypes` memoization, so the field's
+// `TyArray.aElem` points back at the enclosing `TyObj`'s index. The KIND arms
+// below never recurse more than one wrapper deep (an array classifies by its
+// element's variant, never by the element's own descriptor), so they cannot
+// loop. The TRANSITIVE queries (`repTyScalarMask`) walk the full graph and
+// terminate via a generation-stamped visited mark per arena index.
+
+import { VKind } from "./emit_state"
+import {
+  T,
+  TyArray,
+  TyFunc,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  nodeTyIsUnionAlias,
+  nodeTyIxOf,
+  tyIsLitUnion,
+  tyIsValueUnionBox,
+  tyIxIsUnionAliasDecl,
+  tyIxIsVariantMember,
+} from "./typecheck"
+
+// ── The descriptor ────────────────────────────────────────────────────────────
+// One struct per classified type. Field semantics:
+//   rdCovered  — 1: structurally derived from the arena; 0: the arena does not
+//                decide this shape yet — the consumer MUST use its legacy path.
+//   rdKind     — the `VKind` member (the valtype byte and heap index follow from
+//                `fbValtype(rdKind, rdSlot)` — the one declarative kind→byte
+//                table; the descriptor does not duplicate it).
+//   rdNul      — how the rep encodes `null`:
+//                  0 not nullable · 1 nullable ref (`ref.null` niche) ·
+//                  2 i32 sentinel 2 (`boolean | null`) ·
+//                  3 i32 atom sentinel -1 (`K | null` litunion) ·
+//                  4 boxed (`null` is a member atom tag in the value-union box).
+//   rdSlot     — the interned table slot where the consumer resolved one
+//                (struct index / variant index / ref-list slot / map shape);
+//                -1 at the arena level (see SLOTS above).
+//   rdSigTok   — the canonical `$fnsig` token character for this kind ("" when
+//                the kind has no token in the value-call ABI). Slot-carrying
+//                tokens (`s`/`n`/`V`/`r`) append `<slot>;` at the encode site.
+//   rdListElem — for the list kinds, the ELEMENT's rep vocabulary name
+//                ("i32" / "i64" / "f64" / "f32" / "string" / "struct" /
+//                "closure"), else "".
+export type RepDesc = {
+  rdCovered: i32,
+  rdKind: VKind,
+  rdNul: i32,
+  rdSlot: i32,
+  rdSigTok: string,
+  rdListElem: string,
+}
+
+// The canonical kind→`$fnsig` token character — scheme 3's single source. The
+// PARAM and RESULT eligibility sets stay at their encode sites (`cloParamTok` /
+// `cloRetKeySuffix`): they encode which kinds may CROSS the value-call ABI at
+// each position, not what the token character is. "" = the kind has no token
+// (maps, the nullable niches without result tokens, the scalar lists not yet in
+// the ABI).
+export function repSigTokOfKind(kind: VKind): string {
+  if kind == "i32" { return "i" }
+  if kind == "i64" { return "I" }
+  if kind == "f64" { return "d" }
+  if kind == "f32" { return "f" }
+  if kind == "str" { return "S" }
+  if kind == "list" { return "a" }
+  if kind == "strlist" { return "A" }
+  if kind == "f64list" { return "D" }
+  if kind == "union" { return "u" }
+  if kind == "nulstr" { return "N" }
+  if kind == "closure" { return "c" }
+  if kind == "struct" { return "s" }
+  if kind == "nulstruct" { return "n" }
+  if kind == "variant" { return "V" }
+  if kind == "reflist" { return "r" }
+  ""
+}
+
+// An uncovered descriptor — the consumer must take its legacy path. `rdKind`
+// deliberately carries the ladder's own default ("i32") so a consumer that
+// forgets the `rdCovered` check degrades to the same fallthrough the legacy
+// chain has, never to a bogus ref kind.
+function repUncovered(): RepDesc {
+  const d: RepDesc = {
+    rdCovered: 0,
+    rdKind: "i32",
+    rdNul: 0,
+    rdSlot: -1,
+    rdSigTok: "",
+    rdListElem: "",
+  }
+  return d
+}
+
+function repMk(kind: VKind, nul: i32, elem: string): RepDesc {
+  const d: RepDesc = {
+    rdCovered: 1,
+    rdKind: kind,
+    rdNul: nul,
+    rdSlot: -1,
+    rdSigTok: repSigTokOfKind(kind),
+    rdListElem: elem,
+  }
+  return d
+}
+
+// ── The derivation: one table-driven arm per `Ty` variant ────────────────────
+// INVARIANT: every covered arm must decide the rep EXACTLY as the emitter's
+// annotation-name classifier ladder (`vtKindOfType`'s arm order) does for the
+// same type — the migration gates (fixpoint + corpus byte-compare) hold each
+// arm to that. The ladder's priority order is inherent here: a `Ty` is exactly
+// one variant, so no arm can shadow another.
+export function repOfTy(ty: i32): RepDesc {
+  if ty < 0 { return repUncovered() }
+  const t = T.tys[ty]
+  if t is TyPrim { return repOfPrim(t.primName) }
+  // A function type is the closure fat-pointer. (A nullable closure is a
+  // `TyNullable`, a closure ARRAY a `TyArray` — each classified by its own arm,
+  // so the bare-arrow ambiguity of the name-based test cannot arise.)
+  if t is TyFunc { return repMk("closure", 0, "") }
+  if t is TyObj {
+    // A union-VARIANT member is the concrete variant struct ref (its slot is a
+    // variant index, not a struct-table index); any other object shape is a
+    // standalone struct ref.
+    if tyIxIsVariantMember(ty) { return repMk("variant", 0, "") }
+    return repMk("struct", 0, "")
+  }
+  if t is TyUnion {
+    // A homogeneous string-literal union: a DECLARED alias (`type K = "a"|"b"`)
+    // reps as the interned i32 atom; an INLINE one is name-softened to `string`
+    // by the canon pass, and its rep questions route through the name ladder —
+    // uncovered here (the atom-vs-string split is the alias-ness, which is
+    // checker metadata, not structure).
+    if tyIsLitUnion(ty) {
+      if tyIxIsUnionAliasDecl(ty) { return repMk("i32", 0, "") }
+      return repUncovered()
+    }
+    // A single-member object union is the canonicalized `{a} & {b}` struct
+    // alias — reps as the struct itself.
+    if t.uMembers.length == 1 {
+      const m = T.tys[t.uMembers[0]]
+      if m is TyObj { return repMk("struct", 0, "") }
+      return repUncovered()
+    }
+    // A `{tag, value}` value/struct union box. (Numeric literal unions —
+    // `0 | 1` — are neither litunion-atoms nor boxes; they canon-collapse to
+    // their base scalar and stay with the name ladder.)
+    if tyIsValueUnionBox(ty) { return repMk("union", 0, "") }
+    return repUncovered()
+  }
+  if t is TyNullable { return repOfNullable(t.nInner) }
+  if t is TyArray { return repOfArray(t.aElem) }
+  if t is TyMap { return repOfMap(t.mKey, t.mVal, t.mSet) }
+  // TyVar / TyLit / TyErr / TyNeg — no wasm rep of their own (a generic
+  // instantiates, a literal widens, an error never reaches emit).
+  repUncovered()
+}
+
+function repOfPrim(pn: string): RepDesc {
+  // boolean shares the i32 rep; `void` follows the ladder's fallthrough ("i32")
+  // — the void-ness of a RESULT is a separate axis (`fRetVoid`), not a valtype.
+  if pn == "i32" || pn == "boolean" { return repMk("i32", 0, "") }
+  if pn == "i64" { return repMk("i64", 0, "") }
+  if pn == "f64" { return repMk("f64", 0, "") }
+  if pn == "f32" { return repMk("f32", 0, "") }
+  if pn == "string" { return repMk("str", 0, "") }
+  if pn == "void" { return repMk("i32", 0, "") }
+  // `null` (and any future prim) — no standalone rep.
+  repUncovered()
+}
+
+// A nullable's rep is decided by its INNER variant — four distinct null
+// disciplines exist (see `rdNul`), one per inner rep family.
+function repOfNullable(inner: i32): RepDesc {
+  if inner < 0 { return repUncovered() }
+  const it = T.tys[inner]
+  if it is TyPrim {
+    // `string | null` — the nullable raw-array ref niche.
+    if it.primName == "string" { return repMk("nulstr", 1, "") }
+    // `boolean | null` — the i32 sentinel-2 niche; the VALTYPE is plain i32.
+    if it.primName == "boolean" { return repMk("i32", 2, "") }
+    // A nullable SCALAR (`i32 | null`, `f64 | null`, …) has no spare value to
+    // niche into — it boxes as a value union whose `null` is a member atom.
+    if (
+      it.primName == "i32" ||
+      it.primName == "i64" ||
+      it.primName == "f64" ||
+      it.primName == "f32"
+    ) {
+      return repMk("union", 4, "")
+    }
+    return repUncovered()
+  }
+  // `((…) => …) | null` — the closure fat-pointer made nullable.
+  if it is TyFunc { return repMk("nulclosure", 1, "") }
+  if it is TyObj {
+    // `S | null` over a standalone struct — the nullable struct ref. A VARIANT
+    // member's nullable stays with the name ladder (its slot vocabulary is the
+    // variant index, and the ladder's nulstruct arm resolves it by name).
+    if tyIxIsVariantMember(inner) { return repUncovered() }
+    return repMk("nulstruct", 1, "")
+  }
+  if it is TyUnion {
+    // `K | null` over a litunion — the i32 atom with the -1 null sentinel (the
+    // members are preserved through canon for exactly this classification).
+    if tyIsLitUnion(inner) { return repMk("i32", 3, "") }
+    // `(A | B) | null` — the box already has a null member atom.
+    if tyIsValueUnionBox(inner) { return repMk("union", 4, "") }
+    return repUncovered()
+  }
+  if it is TyArray {
+    // `i32[] | null` / `boolean[] | null` — the nullable i32-list ref. Every
+    // OTHER nullable list (scalar-elem, ref-elem, litunion-elem) has no settled
+    // rep yet — those must keep failing loudly through the legacy chain.
+    if it.aElem >= 0 {
+      const et = T.tys[it.aElem]
+      if et is TyPrim {
+        if et.primName == "i32" || et.primName == "boolean" {
+          return repMk("nullist", 1, "i32")
+        }
+      }
+    }
+    return repUncovered()
+  }
+  // A nullable MAP (the niche-exempt `{[string]: T} | null`) and the rest —
+  // legacy owns them.
+  repUncovered()
+}
+
+// An array's rep is decided by its ELEMENT variant — one wrapper level, never
+// the element's own descriptor (which is what keeps this arm cycle-free).
+function repOfArray(elem: i32): RepDesc {
+  // An element hole (`[]` never pinned) has no rep to claim.
+  if elem < 0 { return repUncovered() }
+  const et = T.tys[elem]
+  if et is TyPrim {
+    if et.primName == "i32" || et.primName == "boolean" {
+      return repMk("list", 0, "i32")
+    }
+    if et.primName == "f64" { return repMk("f64list", 0, "f64") }
+    if et.primName == "i64" { return repMk("i64list", 0, "i64") }
+    if et.primName == "f32" { return repMk("f32list", 0, "f32") }
+    if et.primName == "string" { return repMk("strlist", 0, "string") }
+    return repUncovered()
+  }
+  // `((i32) => i32)[]` — a closure-element ref list.
+  if et is TyFunc { return repMk("reflist", 0, "closure") }
+  // `S[]` / `{f: i32}[]` — a struct-element ref list (a variant-member element
+  // is also a ref-list element; the slot layer resolves which).
+  if et is TyObj { return repMk("reflist", 0, "struct") }
+  if et is TyUnion {
+    // `K[]` over a DECLARED litunion alias — atom-id elements share the i32
+    // list. An inline litunion element rides the name ladder (canon-softening,
+    // as at the standalone position); union-BOX-element lists keep their
+    // still-irregular legacy seams.
+    if tyIsLitUnion(elem) {
+      if tyIxIsUnionAliasDecl(elem) { return repMk("list", 0, "i32") }
+      return repUncovered()
+    }
+    return repUncovered()
+  }
+  // Nested arrays, nullable elements, map elements — legacy owns.
+  repUncovered()
+}
+
+// A string-keyed map (or Set) whose value shares the mono `$mapStruct` (i32 /
+// boolean values). TYPED-value maps (`{[string]: f64}`, …) gate on the mv
+// interner (`mvValKindOfName`, in emit_classify above this module) — uncovered
+// here until the slot layer folds down.
+function repOfMap(mKey: i32, mVal: i32, mSet: i32): RepDesc {
+  if mKey >= 0 {
+    const kt = T.tys[mKey]
+    if kt is TyPrim {
+      if kt.primName == "string" {
+        // A Set is internally a boolean-valued map — always the mono shape.
+        if mSet == 1 { return repMk("map", 0, "") }
+        if mVal >= 0 {
+          const vt = T.tys[mVal]
+          if vt is TyPrim {
+            if vt.primName == "i32" || vt.primName == "boolean" {
+              return repMk("map", 0, "")
+            }
+          }
+        }
+      }
+    }
+  }
+  repUncovered()
+}
+
+// ── The node-level bridge ─────────────────────────────────────────────────────
+// `repOf` for an AST node (an annotation / expression the checker recorded a
+// type for): the arena derivation, plus the ONE recovery only the node can
+// make — a SAME-SHAPE union (`A | B` with structurally identical members)
+// collapses to a single `TyObj` in the arena, losing its union-ness, while the
+// emitter still boxes it for tag discrimination. The node's name (a top-level
+// `|`) is the only witness; `nodeTyIsUnionAlias` performs that test.
+export function repOfNode(nodeIx: i32): RepDesc {
+  const d = repOfTy(nodeTyIxOf(nodeIx))
+  if d.rdCovered == 1 {
+    if d.rdKind == "struct" || d.rdKind == "variant" {
+      if nodeTyIsUnionAlias(nodeIx) { return repMk("union", 0, "") }
+    }
+  }
+  d
+}
+
+// ── Transitive scalar-mention query (cycle-safe) ─────────────────────────────
+// Whether a type CONTAINS an i64 / f64 / f32 leaf anywhere — through arrays,
+// nullables, unions, map keys/values, function params/results, object fields,
+// and negations. Drives the print-import scan: a program that can hold one of
+// these scalars can narrow/read/print one, so the matching `__print_*__`
+// import must exist. Returned as a bitmask (`REP_SCAL_*`).
+export const REP_SCAL_I64 = 1
+export const REP_SCAL_F64 = 2
+export const REP_SCAL_F32 = 4
+
+// Generation-stamped visited marks + a completed-QUERY memo, both indexed by
+// `Ty`-arena index. The visited stamp makes one query terminate on arena
+// CYCLES (recursive structural types); the memo is written only for a query's
+// ROOT — a completed walk covers the root's whole reachable component, so its
+// union is exact — and folded in whenever a later walk re-reaches that node
+// (interior nodes of a cycle are never memoized mid-walk, which could record
+// an under-approximation). Reset per program (`repReset`): arena indices are
+// re-minted per compile.
+let repSeenGen: i32[] = []
+let repMaskMemo: i32[] = []
+let repGen = 0
+
+export function repReset() {
+  repSeenGen = []
+  repMaskMemo = []
+  repGen = 0
+  0
+}
+
+function repGrowTo(n: i32) {
+  while repSeenGen.length < n { repSeenGen.push(0) }
+  while repMaskMemo.length < n { repMaskMemo.push(-1) }
+  0
+}
+
+export function repTyScalarMask(root: i32) {
+  if root < 0 { return 0 }
+  repGrowTo(T.tys.length)
+  if root < repMaskMemo.length {
+    if repMaskMemo[root] >= 0 { return repMaskMemo[root] }
+  }
+  repGen = repGen + 1
+  let mask = 0
+  // An index worklist (breadth-order); `wp` is the read cursor.
+  const work: i32[] = []
+  work.push(root)
+  let wp = 0
+  while wp < work.length {
+    const ix = work[wp]
+    wp = wp + 1
+    if ix >= 0 && ix < T.tys.length {
+      // The arena can GROW mid-emit (monomorphization records late types) —
+      // re-grow so the stamp arrays cover any index the walk reaches.
+      repGrowTo(T.tys.length)
+      if repSeenGen[ix] != repGen {
+        repSeenGen[ix] = repGen
+        if repMaskMemo[ix] >= 0 {
+          // A prior query completed from this node — fold its exact component
+          // union instead of re-walking.
+          mask = mask | repMaskMemo[ix]
+        } else {
+          const t = T.tys[ix]
+          if t is TyPrim {
+            if t.primName == "i64" { mask = mask | REP_SCAL_I64 }
+            if t.primName == "f64" { mask = mask | REP_SCAL_F64 }
+            if t.primName == "f32" { mask = mask | REP_SCAL_F32 }
+          }
+          if t is TyArray { work.push(t.aElem) }
+          if t is TyNullable { work.push(t.nInner) }
+          if t is TyUnion {
+            let mi = 0
+            while mi < t.uMembers.length {
+              work.push(t.uMembers[mi])
+              mi = mi + 1
+            }
+          }
+          if t is TyMap {
+            work.push(t.mKey)
+            work.push(t.mVal)
+          }
+          if t is TyFunc {
+            let pi = 0
+            while pi < t.fnParamTypes.length {
+              work.push(t.fnParamTypes[pi])
+              pi = pi + 1
+            }
+            work.push(t.fnRet)
+          }
+          if t is TyObj {
+            let fi = 0
+            while fi < t.objFieldTypes.length {
+              work.push(t.objFieldTypes[fi])
+              fi = fi + 1
+            }
+          }
+          if t is TyNeg { work.push(t.negTy) }
+        }
+      }
+    }
+  }
+  repMaskMemo[root] = mask
+  mask
+}
+
+// The scalar-mention mask of the type the checker recorded for node `ix`, or
+// -1 when the node has NO recorded type — the caller must fall back to its
+// name-based test (an emitter-synthesized node past the typed-IR table, or an
+// emitter-internal name `nameToTy` cannot resolve).
+export function repNodeScalarMask(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return -1 }
+  repTyScalarMask(ty)
+}
