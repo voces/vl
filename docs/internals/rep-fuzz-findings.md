@@ -473,16 +473,30 @@ on current master. The remaining live gaps are NARROWER and NOT the sig token:
     `tests/cases/closures/error-composite-closure-result-map-field.vl`. Graduated (CI seeds):
     `p0c/p0r (i32) => {f: boolean[]}`. Zero-regression: fuzz finding-set only SHRANK (8 shapes
     fixed across seeds 101/202/303/4242/7777 d4–5, 0 new).
-  - **R2b — i64[]/f32[] closure RESULT (STILL OPEN, INVALID-WASM).** `() => i64[]` emits invalid
-    wasm ("expected (ref $type), found (ref $type)"): the return-kind inference (`fRetListKind`,
-    emit_classify ~1370) has arms only for i32-list (2), reflist (5), strlist (7), f64list (12) —
-    NO i64-list or f32-list — so an i64-magnitude-literal body builds an i64-list wrapper against
-    an i32-list functype result. Plain `function mk(): i64[]` and `const xs: i64[]` locals work;
-    only the closure result mis-infers. Fix needs an i64list/f32list arm in `retKindChainOf` +
-    an `"i64list"`/`"f32list"` token in `repSigTokOfKind`/`repKindOfSigTok` + `cloRetValKind` +
-    the functype-result wrapper emission. Deferred to a follow-up (the sig-token extension the
-    original R2 anticipated, but only for the i64/f32 list results — the struct/i32/string/f64
-    list results already lower).
+  - **R2b — i64[]/f32[] closure RESULT (RESOLVED, was INVALID-WASM).** `() => i64[]` / `() => f32[]`
+    emitted invalid wasm ("expected (ref $type), found (ref $type)" in the lambda body, then
+    "expected (ref $type), found i32" at the value call): the inferred return-kind chain had arms
+    only for i32-list (2) / reflist (5) / strlist (7) / f64list (12), so an i64/f32-list body built
+    the wide wrapper against a functype result the chain defaulted to the i32 list. Fix — route the
+    two leaves through the SAME closure-result machinery f64list already uses: `fRetListKind` codes
+    20 (i64-list) / 21 (f32-list) added to `retKindChainOf` and to the inferred-return classifiers
+    (`criClassify`'s `exprI64Array`/`exprF32Array` arms, before the generic `exprArray` arm; the
+    `buildFnMap` inferred-return-name pass), plus the ABI tokens `L` (i64list) / `F` (f32list) in
+    `repSigTokOfKind` ⇄ `repKindOfSigTok` (kept EXACT INVERSES — verified by a full pinned-seed
+    round-trip: 0 regressions), reflected on both `$fnsig` producers (`annRetKind`/`annParamKind`
+    for the annotation side; `cloRetValKind`/`cloParamTok` already read the shared token). The
+    checker's per-node f32[] typing is unreliable (a float literal types f64), so the anonymous
+    lambda's inferred RETURN NAME is recorded (`isScalarListRetName`, a lambda-only gate that does
+    NOT reach the redundant-return lint) — the syntactic classifier alone missed the f32 case.
+    `fbValtype` already had the `il64TypeIdx`/`fl32TypeIdx` result arms. Bonus: an i64[]/f32[] PARAM
+    closure (`(i64[]) => i64`) now lowers too (the same token feeds `cloParamTok`; previously a
+    clean reject). Frozen: `tests/cases/closures/lambda-scalar-list-result.vl`. Graduated (wide
+    sweeps 4242/7777 d3–4): `() => i64[]` (p1c/p1r) and `{f: () => i64[]}` (p1c/p1r) — the fuzz
+    finding-set STRICTLY SHRANK (6 shapes fixed, 0 new). Still position-DEPENDENT and OUT of scope:
+    an i64/f32-list closure result stored into an UN-annotated module GLOBAL (`const xs = v()` at
+    top level) hits the pre-existing global-CELL i64/f32-list bug (a `const xs: i64[] = [-2]` global
+    fails identically on master — its cell mis-emits) — the closure result lowers correctly in every
+    function-body position.
   - `() => {[string]:T}` map result stays a clean documented reject ("a function value may not
     ... return [a map]"), R1-adjacent, not part of R2.
 
