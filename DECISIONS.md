@@ -228,6 +228,14 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   add/delete churn. Spelled with the index-sig syntax (`{[string]:V}` map,
   `{[T]:boolean}` set), `string` keys only for now (i32 keys stay the native
   `T[]` path). (B6a)
+- **A typed-value map has ONE struct heap type per value type, resolved
+  position-independently.** `{[string]:f32}` mints its own `mvMapTypeIdx` struct
+  (its `vals` field differs from the mono `$mStructIdx`); a map in COMPOSITION (a
+  list element, a nested-map value, a struct field) resolves that SAME struct — the
+  ref-list element heap picks `mvMapTypeIdx`, not the mono struct, and a
+  composition read binds the yielded map with its typed mv slot. Distinct value
+  types keep distinct layouts (no over-merge); an atom/mono value keeps the shared
+  mono struct. (B6a)
 - **Generics infer through collections, not just scalars.** A generic element
   type is pinned from the argument's element type (the checker unifies
   index-signature _value_ types, not just keys), so `first<T>(xs: T[])` resolves
