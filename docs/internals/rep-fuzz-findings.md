@@ -402,16 +402,26 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
     Pre-existing and OUT of scope (fails IDENTICALLY for `i32[]|null` — a shared limitation, not a
     litunion gap): a bare `= null` INITIALIZER value (`const xs: K[] | null = null` → `bare null needs a
     struct-typed context`); a list VALUE init and the `!= null`-narrowed read both work.
-  - **DEFERRED — distinct-backing leaves** (`i64[]|null`, `f64[]|null`, `f32[]|null`, `string[]|null`):
-    these have no nullable-niche rep over their OWN scalar-list wrappers (`il64TypeIdx` / `fl64TypeIdx` /
-    `fl32TypeIdx` / `mkListIdx`), so a field yields `binding's inline-shape type has an unsupported field`
-    / `ref valtype with no interned shape` and a standalone binding yields `bare null needs a struct-typed
-    context` — a LOUD reject, not invalid wasm. Precise sites for the add: a new nullable-scalar-list
-    kind + field code PER leaf (a distinct `(ref null $wrapper)` — `fbValtype`/`fbValtypeNullable`/
-    `fbRefNullForKind`, `pushFieldStorage`, `emitOmittedFieldNull`), the `letIsNul<X>List` collect
-    classifier + `exprNullableList`'s per-kind twin, and the narrowed index-read dispatch (the
-    `lvk == "f64list"…` arms) gaining nullable arms. Unlike the litunion fold, these do NOT share a
-    backing, so each is a genuine new rep (a larger follow-up, not a predicate fold).
+  - **RESOLVED — distinct-backing leaves** (`i64[]|null`, `f64[]|null`, `f32[]|null`, `string[]|null`),
+    at the BINDING / RETURN / GLOBAL positions: each leaf now has its OWN `(ref null $wrapper)` niche over
+    the leaf-list wrapper (`il64TypeIdx` / `fl64TypeIdx` / `fl32TypeIdx` / `mkListIdx`) — four new VKinds
+    `nuli64list` / `nulf64list` / `nulf32list` / `nulstrlist`, the nullable dual of `nullist`. A non-null
+    list value SUBTYPES the nullable slot (no rebuild), a bare `null` is `ref.null $wrapper`, and a
+    narrowed `t[i]` recovers non-null then reads the leaf list. Sites wired: the valtype ladders
+    (`fbValtype` / `fbValtypeNullable` / `fbRefNullForKind`, one arm per kind), the structural type→kind
+    seam (`repOfNullable`'s array arm, so `vtKindOfType` covers return/param), the classifiers
+    (`nulScalarListKind` name→kind, `letNulScalarListKind` / `exprNulScalarListKind` binding+init
+    inference), the local-slot chain (`emit_collect`, before the non-null scalar-list arms), the
+    global cell (`globalCellKind` + the const-init leaf-build seed in `emit_sections`, which the SMALL-i64
+    / f32 literal needs so the const cell builds the RIGHT wrapper), the binding + return null-seed
+    (`ExpCtx.nulRefHeap`/`listKind`), the `!= null` fold, the narrowed index read, and the collect
+    classifiers (forcing the leaf list wrapper even for a `= null`-only module). Graduated (seeds
+    101/202/303): `p0c`/`p0r string[] | null`, `p2c`/`p2r f32[] | null`, `p3r i64[] | null`; the 4242/7777
+    sweep additionally graduated `f64[] | null` (p0c/p0r/p3r), 0 new findings. Frozen:
+    `tests/cases/lists/nullable-scalar-list.vl`. Pre-existing and OUT of scope (a SEPARATE param-gate
+    rejection, a clean fail-loudly, not a target shape): a nullable-scalar-list PARAM
+    (`useIt(p: f32[]|null)`) still rejects at `only i32, i64, … parameters are supported`; the nullable
+    scalar list as a struct FIELD is the remaining position (R5's field arm — a per-leaf field code).
 
 - **Literal-union array LITERALS built the string list** (`const ks: VK[] = ["aa", "bb"]` —
   invalid wasm at the first atom-context use of an element: a `: VK` binding, a `VK` param,

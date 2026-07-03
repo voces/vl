@@ -1082,6 +1082,48 @@ export function letIsNulListInfer(letIx: i32, fnIx: i32) {
   false
 }
 
+// The DISTINCT-backing nullable-scalar-list VKind of a BINDING (`const v: string[]|null = …`), or
+// "" — the annotation's `nulScalarListKind`, else an un-annotated init that yields such a list (a
+// `string[]|null`-returning call / field read). Feeds the local-slot + null-seed classification.
+export function letNulScalarListKind(letIx: i32, fnIx: i32): VKind | null {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return nulScalarListKindOfNode(d.letType) }
+    return exprNulScalarListKind(d.letInit, fnIx)
+  }
+  null
+}
+
+// The nullable-scalar-list VKind an EXPRESSION yields (a `string[]|null`-returning call), or "" —
+// the per-leaf analogue of `exprNullableList`'s call-inference arm (an un-annotated `const r = f()`).
+export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
+  if exprIx < 0 { return null }
+  const e = P.nodes[exprIx]
+  if e is Paren { return exprNulScalarListKind(e.parInner, fnIx) }
+  if e is Ident {
+    // A nullable-scalar-list PARAM, a same-kind LOCAL (`const t0 = v`), or a GLOBAL cell.
+    const pk = nulScalarListKindOfNode(paramTypeNode(fnIx, e.identName))
+    if pk != null { return pk }
+    const dk = declaredKind(e.identName)
+    if isNulScalarListKind(dk) { return dk }
+    const gl = globalLetOf(e.identName)
+    if gl >= 0 { return letNulScalarListKind(gl, fnIx) }
+  }
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      const target = fnIndexOf(callee.identName)
+      if target >= 0 {
+        const fn = P.nodes[fnStmts[target]]
+        if fn is FuncDecl {
+          if fn.fnRet >= 0 { return nulScalarListKindOfNode(fn.fnRet) }
+        }
+      }
+    }
+  }
+  null
+}
+
 // ── nullable-string (`string | null`, kind 16) predicates — the ref-rep analog of
 // the nullable-list family above; `null` is `ref.null $aTypeIdx`, `!= null` is
 // `ref.is_null`. Unlike a nullable list, an INITIALIZER can produce one (a string
@@ -5880,6 +5922,45 @@ export function synthTypeRef(name: string, pos: i32) {
   n
 }
 
+// The nullable-scalar-list VKind of a DISTINCT-backing nullable list type name (`string[] | null`,
+// `f64[] | null`, `i64[] | null`, `f32[] | null`), or "" for anything else. Each leaf has its OWN
+// wrapper heap type, so — unlike the i32-backed `nameIsNulI32List` fold — each is a genuinely
+// distinct `(ref null $wrapper)` cell. A bare `= null` init lowers as `ref.null $wrapper`; a list
+// value stores its (non-null) wrapper ref, which subtypes the nullable slot.
+export function nulScalarListKind(name: string): VKind | null {
+  const b = nullablePartOf(name)
+  if nameIsStringArray(b) { return "nulstrlist" }
+  if nameIsF64Array(b) { return "nulf64list" }
+  if nameIsI64Array(b) { return "nuli64list" }
+  if nameIsF32Array(b) { return "nulf32list" }
+  null
+}
+// The nullable-scalar-list VKind of annotation node `tyIx`, or `null`.
+export function nulScalarListKindOfNode(tyIx: i32): VKind | null {
+  if tyIx < 0 { return null }
+  const ty = P.nodes[tyIx]
+  if ty is TypeRef { return nulScalarListKind(ty.tyName) }
+  null
+}
+// The `emitArr` list-build code (`pendingListKind` / `ExpCtx.listKind`) a nullable-scalar-list
+// value's list literal builds with: strlist 3 · f64list 4 · i64list 6 · f32list 7 (the leaf-list
+// build codes), or 0 if `kind` is not a nullable scalar list.
+export function nulScalarListBuildKind(kind: VKind | null): i32 {
+  if kind == "nulstrlist" { return 3 }
+  if kind == "nulf64list" { return 4 }
+  if kind == "nuli64list" { return 6 }
+  if kind == "nulf32list" { return 7 }
+  0
+}
+// True if `kind` is one of the four distinct-backing nullable-scalar-list VKinds.
+export function isNulScalarListKind(kind: VKind | null): boolean {
+  if kind == null { return false }
+  kind == "nulstrlist" ||
+    kind == "nulf64list" ||
+    kind == "nuli64list" ||
+    kind == "nulf32list"
+}
+
 export function vtKindOfType(tyIx: i32): VKind {
   // repOf-FIRST (the strangler seam, roadmap Next#1): where the checker's arena covers the
   // annotation's shape, the descriptor (`emit_rep.vl`) decides the kind — ONE structural
@@ -6183,6 +6264,11 @@ export function globalCellKind(letIx: i32): VKind {
       if tyIsFuncType(d.letType) { return "closure" }
       if letIsNulRef(letIx, -1) { return "nulstruct" }
       if letIsNulList(letIx, -1) { return "nullist" }
+      // A DISTINCT-backing nullable scalar list global (`string[]|null`, `f64[]|null`,
+      // `i64[]|null`, `f32[]|null`): its own `(ref null $wrapper)` cell — BEFORE the non-null
+      // list arms (whose init fallback would else claim a bare list value as a non-null cell).
+      const gNulSL = nulScalarListKindOfNode(d.letType)
+      if gNulSL != null { return gNulSL }
       if letIsMap(letIx, -1) { return "map" }
       // A UNION-annotated global cell is the box ref (kind 4), exactly as `buildLocals`
       // classifies a union local — BEFORE the struct/string/scalar-list cases (a `string |
