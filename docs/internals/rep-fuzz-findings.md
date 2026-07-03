@@ -240,6 +240,29 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   `{[string]: {a: f32, f: string, z: i32}}[]`, `{[string]: {a: f64, f: K0, z: i32}}`) — map VALUES are
   nullable `V?` slots, so the same peel coerces their struct literals. 0 regressions. Frozen:
   `tests/cases/objects/obj-literal-coerce-through-nullable.vl`.
+- **R2/closures — `string | null` closure RESULT via a lambda** (`(i32) => string | null`): a REJECT
+  (`function-value call arity has no interned signature`). The niche rep already lowers — a
+  named-function VALUE (`const v: (i32) => string | null = mk`) round-trips — only the inline lambda's
+  contextual RETURN adoption was missing: a `"hey"` body infers the softened `string` member, so the
+  lambda's functype result stayed `string` (`>S`) while the value call keyed the `string | null` niche
+  (`>N`), and the sig never interned. Fix: a nullable-string return-adoption arm — a body tail that
+  `assignableExpr` proves assignable to the expected `string | null` adopts the nullable, so the
+  functype result is the `ref.null` string niche; the existing `nullableRetName` recording arm +
+  `synthRetAnnots` pin it and `emitReturnValue` niches the value (the exact machinery the named-fn
+  value already uses). RESTRICTED to the string niche (checked as `TyNullable`-inner-`string`, before
+  `valueUnionRetName` which also claims `T | null`): a nullable SCALAR (`i32 | null`) and a VALUE-UNION
+  result (`string | i32`, `i64 | boolean`) lower STANDALONE but their box/niche READ does NOT yet
+  compose through a nullable-closure PARAM or a MAP VALUE — verified the named-function VALUE spelling
+  cleanly REJECTS those composed positions (no interned sig), so adopting the lambda there would EXPOSE
+  invalid wasm (a REJECT→INVALID regression the full-seed invalid-wasm diff caught); they stay LOUD
+  rejects until the sibling value-union / nullable COMPOSITION reps land (C2/C3). No new `$fnsig` token.
+  native-fixpoint holds; 990 tests pass. Graduated (seeds 101/202/303): `p0r (i32) => string | null`;
+  the 4242/7777 d3–4 invalid-wasm diff confirmed 0 new invalid-wasm and 0 new findings. Frozen:
+  `tests/cases/closures/lambda-nullable-string-result.vl`. Cross-dependency (left baselined, the
+  closure side is right): `() => boolean | null` fails even as a NAMED-fn value (the `boolean | null`
+  niche has no closure-result rep — a genuine missing rep, not an adoption gap); the value-union closure
+  results (`() => string | i32`, `() => i64 | boolean`) and nullable-scalar (`(i32) => i32 | null`) need
+  their box/niche READ to compose (C2/C3) before the lambda can safely adopt them.
 
 - **R3 (partial) — a literal-union ALIAS member of a VALUE union, positive `is K0` test**
   (`K0 | boolean`, `K0 | i32`, `K0 | f64`, `K0 | {w:i32}`, and the struct-field carrier
