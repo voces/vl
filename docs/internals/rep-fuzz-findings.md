@@ -416,15 +416,49 @@ Verdict: MISSING REP — the map value rep does not compose. Give the mv interne
 composition entry (field code + list element + nested-map value) backed by a per-value-kind
 map struct.
 
-### R2. Closures over COMPOSITE results/params — MISSING REP (~19 shapes)
+### R2. Closures over COMPOSITE results/params — PARTLY the sig token (STALE), partly shape-interning + i64/f32-list
 Repro: `() => {f:i32}`, `{f: () => {f:i32}}`, `() => i64[]`, `(i32) => {[string]:T}`. Also the
 documented `type S={f:i32}` + `() => {f:i64}` case surfaces HERE.
 Class: INVALID-WASM / REJECT (`function-value call arity has no interned signature`).
-Losing site: the value-call ABI token table `repSigTokOfKind` (emit_rep.vl ~113) has tokens
-only for scalar/string/a-few-list results; `cloSigPosOfKey` / `fnSigIdxForArity`
-(wasmEmit.vl ~6346) find no `$fnsig` slot for a composite result.
-Verdict: MISSING REP — no closure ABI signature token for composite results. Coordinate with
-the closures workstream.
+Losing site (as originally diagnosed): the value-call ABI token table `repSigTokOfKind`
+(emit_rep.vl ~113).
+Verdict UPDATE (fresh sweep, post-#836): the token-table diagnosis is STALE. `repSigTokOfKind`
+already carries `s`/`n`/`V`/`r` (struct/nulstruct/variant/reflist) and `a`/`A`/`D` list tokens,
+and the closure sig machinery (`cloRetKeySuffix`/`cloParamTok`/`cloSigKeyExt`, emit_classify)
+already keys composite results/params. `() => {f:i32}`, `{f: () => {f:i32}}`, the scalar-list
+results (`() => i32[]`/`string[]`/`f64[]`), and composite PARAMS (`({f:i32}) => i32`) all LOWER
+on current master. The remaining live gaps are NARROWER and NOT the sig token:
+  - **R2a — inline-shape-in-functype not interned (RESOLVED here).** A lambda whose inferred
+    return is an inline struct with BARE-PARAM field values (`(i32) => {f:i32} = (x) => ({f: x})`,
+    also `{a,b}`, `{f:{g}}`, captured-var fields) failed loudly ("ref valtype with no interned
+    shape"). A literal `{f:1}` / expr `{f:x+0}` field coded a rep and interned via
+    `collectAnonShapes`; a bare param field codes -1 (`anonFieldCode`), so the literal had to
+    NAME-SET match a pre-interned annotation shape — but the inline shape lives inside a
+    FUNCTION-TYPE annotation (one TypeRef name `(i32)=>{f:i32}`), which `internShapeDeep` never
+    descended (a plain local `const o: {f:i32} = {f: g}` interned fine; a named-function value
+    `= mk` worked — only the inline lambda failed). Fix: `internShapeDeep` now recurses into a
+    functype's params + result (`internFuncTypeShapes`), interning each PLAINLY-LOWERABLE inline
+    shape (scalar / string / scalar-list / nested-struct fields — `funcTypeShapeLowerable`). A
+    struct-with-map (R1) / value-union (R3) / nullable-list (R5) field is NOT interned, so the
+    closure stays a CLEAN reject (never invalid wasm) — a broad intern turned 5 clean REJECTs
+    into module-level INVALID-WASM in the sweep (the interned f32-map/union-box field emitted a
+    broken type), so the interning is gated on lowerability. Frozen:
+    `tests/cases/closures/lambda-struct-result-param-field.vl`,
+    `tests/cases/closures/error-composite-closure-result-map-field.vl`. Graduated (CI seeds):
+    `p0c/p0r (i32) => {f: boolean[]}`. Zero-regression: fuzz finding-set only SHRANK (8 shapes
+    fixed across seeds 101/202/303/4242/7777 d4–5, 0 new).
+  - **R2b — i64[]/f32[] closure RESULT (STILL OPEN, INVALID-WASM).** `() => i64[]` emits invalid
+    wasm ("expected (ref $type), found (ref $type)"): the return-kind inference (`fRetListKind`,
+    emit_classify ~1370) has arms only for i32-list (2), reflist (5), strlist (7), f64list (12) —
+    NO i64-list or f32-list — so an i64-magnitude-literal body builds an i64-list wrapper against
+    an i32-list functype result. Plain `function mk(): i64[]` and `const xs: i64[]` locals work;
+    only the closure result mis-infers. Fix needs an i64list/f32list arm in `retKindChainOf` +
+    an `"i64list"`/`"f32list"` token in `repSigTokOfKind`/`repKindOfSigTok` + `cloRetValKind` +
+    the functype-result wrapper emission. Deferred to a follow-up (the sig-token extension the
+    original R2 anticipated, but only for the i64/f32 list results — the struct/i32/string/f64
+    list results already lower).
+  - `() => {[string]:T}` map result stays a clean documented reject ("a function value may not
+    ... return [a map]"), R1-adjacent, not part of R2.
 
 ### R3. Value-union BOX carrying a scalar/composite member — MIXED (~10 pure-struct shapes)
 Repro: `{f: f32 | {w:i32}}` (INVALID-WASM `expected f32, found f64` on the box read),
