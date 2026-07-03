@@ -2694,6 +2694,12 @@ function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
     if tyNameOf(fn.fnRet) == "string" {
       if exprIsLitAtom(retArgIx, fnIx) { return true }
     }
+    // The INFERRED-string dual (mirrors `emitReturnValue`'s widen): an UN-annotated
+    // function whose A20 return is `string` (one path returns a member literal,
+    // another the atom) widens an atom return too — reserve the frame.
+    if fn.fnRet < 0 && cloRetIsString(fnStmtsPosOf(fnIx)) {
+      if exprIsLitAtom(retArgIx, fnIx) { return true }
+    }
   }
   false
 }
@@ -2952,6 +2958,12 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
   // condition or either arm needs the frame reserved too.
   if e is IfStmt {
     if exprHasStrOp(e.ifCond, fnIx) { return true }
+    // An ATOM arm under a `string`-typed join widens (`emitRefIfArm` →
+    // `emitAtomToStr`), staging the atom id in the string-op frame — reserve it.
+    // Mirrors the emit decision (join type recorded by the checker, any arm).
+    if tyKindOf(nodeTyIxOf(exprIx)) == 3 {
+      if ifChainHasAtomArm(exprIx, fnIx) { return true }
+    }
     if blockHasStrOp(e.ifThen, fnIx) { return true }
     if e.ifElse >= 0 { return blockHasStrOp(e.ifElse, fnIx) }
     return false
@@ -2988,6 +3000,29 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
       i = i + 1
     }
     return false
+  }
+  false
+}
+
+// True if any arm TAIL of the value if/else-if chain at `ifIx` is a literal-union
+// atom (`if c then k else "cc"` — under a `string`-typed join the atom arm widens
+// to its member string, which rides the string-op scratch frame).
+function ifChainHasAtomArm(ifIx: i32, fnIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    const tv = ifThenValueIx(ifIx)
+    if tv >= 0 {
+      if exprIsLitAtom(tv, fnIx) { return true }
+    }
+    if s.ifElse >= 0 {
+      const els = P.nodes[s.ifElse]
+      if els is IfStmt { return ifChainHasAtomArm(s.ifElse, fnIx) }
+      if els is Block {
+        if els.blkStmts.length == 1 {
+          return exprIsLitAtom(els.blkStmts[0], fnIx)
+        }
+      }
+    }
   }
   false
 }
@@ -3749,6 +3784,13 @@ export function ifExprRefKind(ifIx: i32, fnIx: i32): VKind | null {
   // emits via `emitClosureValue` (the default `emitRefIfArm` path), and the binding/return
   // classifies as a closure (`exprIsClosure` / `fnReturnsClosure`).
   if exprIsClosure(tv, fnIx) { return "closure" }
+  // The JOIN's checked type is the arm-order-independent string signal: a `string`-typed
+  // join (an ATOM arm + a string/member-literal arm — `if c then k else "cc"`, either
+  // order) is the string ref kind even when the THEN arm alone doesn't classify stringy
+  // (an atom ident reads as its litunion, not `string`); the atom arm then widens at
+  // `emitRefIfArm`. A pure-atom join types the LITUNION (not `string`), so it stays the
+  // bare i32 path.
+  if tyKindOf(nodeTyIxOf(ifIx)) == 3 { return "str" }
   if exprString(tv, fnIx) { return "str" }
   if exprStringArray(tv, fnIx) { return "strlist" }
   if exprF64Array(tv, fnIx) { return "f64list" }
@@ -7423,6 +7465,29 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     const r = nodeArrayElemIsLitUnion(e.idxArr)
     return r
   }
+  if e is IfStmt {
+    // A VALUE if-expression joining two ATOMS (`if c then k else k2`) yields an atom —
+    // the join rep is the bare i32 id, so the binding/print classifiers must see through
+    // it. Both arms must be atoms; a mixed atom/string join types `string` (its atom arm
+    // widens at the string-join seam), so it deliberately does NOT classify here.
+    if e.ifElse < 0 { return false }
+    const tb = P.nodes[e.ifThen]
+    if tb is Block {
+      if tb.blkStmts.length == 1 {
+        if exprIsLitAtom(tb.blkStmts[0], fnIx) {
+          const eb = P.nodes[e.ifElse]
+          // An `else if` chain recurses on the nested IfStmt directly.
+          if eb is IfStmt { return exprIsLitAtom(e.ifElse, fnIx) }
+          if eb is Block {
+            if eb.blkStmts.length == 1 {
+              return exprIsLitAtom(eb.blkStmts[0], fnIx)
+            }
+          }
+        }
+      }
+    }
+    return false
+  }
   if e is Member {
     // `b.kind` reading a literal-union atom FIELD yields the atom.
     const msi = structIndexOfExpr(e.memObj, fnIx)
@@ -10162,6 +10227,10 @@ export function exprString(exprIx: i32, fnIx: i32) {
   // duals consult `ifExprArmIsKind` the same way). Without this an un-annotated string if-value
   // bound an i32 local while the `if` yielded a string ref — a wasm type mismatch.
   if e is IfStmt {
+    // The JOIN's checked type is the arm-order-independent signal: a `string`-typed
+    // join may LEAD with an atom arm (`if c then k else "cc"`), which alone doesn't
+    // read stringy — the atom arm widens at `emitRefIfArm`, so the value IS a string.
+    if tyKindOf(nodeTyIxOf(exprIx)) == 3 { return true }
     const tv = ifThenValueIx(exprIx)
     return tv >= 0 && exprString(tv, fnIx)
   }
