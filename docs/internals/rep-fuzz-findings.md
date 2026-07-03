@@ -265,7 +265,17 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   literal value) drifting independently. Graduated 7 pinned-seed shapes (i64/f64 fields inside map
   values, closure-returned multi-field structs, `i64[] | null` global construct); frozen in
   `tests/cases/closures/lambda-i64-struct-return.vl` + `tests/cases/objects/anon-shape-i64-f64-fields.vl`.
-  STILL OPEN (the widening seam, not this shape family): a SMALL literal into an i64 STRUCT FIELD
-  through a lambda (`() => {f: i64} = () => ({f: 5})`) — the literal-inferred shape codes the field
-  i32 and only the contextual annotation knows better (the scalar spelling `() => i64 = () => (5)`
-  is fixed — the lambda contextual-return widening).
+  RESOLVED (the widening seam): a SMALL literal into an i64/f64 STRUCT FIELD through a lambda
+  (`() => {f: i64} = () => ({f: 5})`, expr- and block-bodied, arg/array positions) — the checker's
+  contextual return adoption now has a FIELD-LEVEL arm (`objRetWidenAdopt`, the object dual of the
+  scalar rule): when every widening field of the literal-bodied return is a re-encodable int
+  literal, the lambda adopts the expected shape and the wide field type is RECORDED on the literal
+  node — `anonFieldCode` (the literal-shape interner) and `emitNumLitNode` (the value emit) both
+  honor it, and `structIndexOfObjCtx` gains the i64 discrimination axis its f64 rule already had.
+  Non-adoptable spellings (`= mk` named value, `{f: n}` non-literal) are clean rejects via
+  `objNumWidens` in `fnSlotAssignable` (object dual of the scalar invariance). Frozen:
+  `tests/cases/closures/lambda-widens-struct-field.vl`,
+  `tests/cases/types/fn-value-struct-field-invariant.vl`. Pre-existing and OUT of scope: two
+  same-field-name-set shapes with different scalar reps in one program (`type S = {f: i32}` +
+  `() => {f: i64}`) — invalid wasm on master even for magnitude literals, now a loud
+  "no interned signature" reject; the name-set-keyed interning is the documented limitation.
