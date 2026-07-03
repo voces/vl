@@ -207,6 +207,41 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
 
 ## RESOLVED
 
+- **R4 — a 2-D array of an i32-backed scalar list** (`K[][]` literal-union, `boolean[][]`): rejected
+  at emit (`only i32[] arrays and struct/union element arrays are supported`), the last live remnant
+  of the "nested arrays" family — `i32[][]` / `f64[][]` / `i64[][]` / `f32[][]` / `string[][]` and any
+  ref-leaf `S[][]…` already lowered (recent scalar-2D + ref-recursion arms), and `{f: i32[]|null}` /
+  the struct-through-list R6 shapes (`({f:f64}|null)[]`, `{f:{f:f64}[]}`, `{f:{f:{f:i32}[]}}`) were
+  already green by the time of the re-sweep (R6 fixed by the #833–835 structural-slot-dedup work).
+  Root: the THREE ref-array classifiers (`nameIsRefArray` / `refArrElemKind` / `refArrElemName`) each
+  special-cased only the literal name `"i32[][]"` — a fourth parallel enumeration of the same fact —
+  so the atom/boolean leaf was unreachable even though `i32[]`, `boolean[]` and a litunion `K[]` share
+  ONE i32[] backing (`nameIsI32Array`) and hence the identical `i32[][]` rep (element kind 4, the
+  `lTypeIdx` i32-list wrapper). Fix: one shared predicate `nameIsI32ListArray(name)` = "a 2-D array
+  whose element is `nameIsI32Array`", routed through all three (replacing each `== "i32[][]"` arm) —
+  no new rep, no new element kind, just the existing kind-4 path generalized to the leaf. A deeper
+  `i32[][][]` stays kind-9 ref recursion (its element `i32[][]` is itself a ref array, not
+  `nameIsI32Array`), unaffected. Graduated (seeds 101/202/303): `p1c K0[][]`, `p1r K0[][]`; also
+  `(K0[]|null)[]` and `boolean[]`-valued maps (their vals ref-list is the same `boolean[][]` rep) at
+  the wider gate seeds. Frozen: `tests/cases/lists/atom-2d-array.vl`. Pre-existing and OUT of scope
+  (fails identically on master, a SEPARATE litunion-call-result seam, not a 2-D-array rep gap): a
+  literal-union VALUE returned from a function directly into `print`/another call arg
+  (`print(pick(ks))` where `pick(p: K[]): K` — 1-D too), invalid wasm; index the result first
+  (`print(mk()[0][0])`) and it lowers.
+- **R5 — nullable lists of a NON-i32 leaf** (`K[]|null`, `i64[]|null`, `f64[]|null`, `f32[]|null`,
+  `string[]|null`, in a binding/field/return): DEFERRED missing-rep. The i32/boolean case
+  (`i32[]|null` / `boolean[]|null` — the shape the R5 briefing named) is green everywhere (field code
+  18 / `nameIsNulI32List`, the shared i32-list wrapper niche); the other scalar leaves have no
+  nullable-niche rep over their scalar-list wrappers (`fl64TypeIdx` / `il64TypeIdx` / `mkListIdx` /
+  `fl32TypeIdx`), so a field yields `binding's inline-shape type has an unsupported field` and a
+  standalone binding yields `bare null needs a struct-typed context` — a LOUD reject, not invalid
+  wasm. Precise sites for the add: `fieldTypeCode` (a new nullable-scalar-list field code beside code
+  18, per leaf), `nameIsNulI32List`'s binding-local twin, and the null-check-narrowing read path. The
+  litunion sub-case (`K[]|null`) could fold into the code-18 path the way R4 folded into kind 4
+  (extend `nameIsNulI32List` to `nameIsI32Array(nullablePartOf(name))`), but it needs the litunion
+  atom lowering (`pendingLitUnion`) threaded at the nullable-list construct/store site — verify
+  end-to-end before landing.
+
 - **Literal-union array LITERALS built the string list** (`const ks: VK[] = ["aa", "bb"]` —
   invalid wasm at the first atom-context use of an element: a `: VK` binding, a `VK` param,
   a top-level or in-function `for k in ks`; `print(ks[0])` "worked" by printing the string
