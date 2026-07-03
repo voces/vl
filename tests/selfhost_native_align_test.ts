@@ -628,3 +628,60 @@ for (const rel of REJECT_CASES) {
     },
   });
 }
+
+// ── EMIT_REJECT cases (@emit-error): `vl check --codegen` rejects at the EMIT stage ──
+// Discovered by DIRECTIVE, not by list: any corpus file carrying `// @emit-error TEXT`
+// is in this tier (the directive itself is the whitelist, so the two runners cannot
+// drift). The emit message comes from the same seed both runners drive, so message
+// substrings are pinned here too (folded like the corpus oracle's matcher). A plain
+// `vl check` skips codegen (exit 0 on these), hence `--codegen`.
+const emitErrorsOf = (s: string) =>
+  [...s.matchAll(/^\s*\/\/\s*@emit-error (.*)$/gm)].map((m) => m[1]);
+const foldMsg = (s: string) => s.toLowerCase().replace(/`/g, "'");
+const walkVl = function* (dir: URL): Generator<string> {
+  for (const entry of Deno.readDirSync(dir)) {
+    const child = new URL(entry.name + (entry.isDirectory ? "/" : ""), dir);
+    if (entry.isDirectory) yield* walkVl(child);
+    else if (entry.name.endsWith(".vl")) {
+      yield child.pathname.slice(CASES.pathname.length);
+    }
+  }
+};
+const EMIT_REJECT_CASES = [...walkVl(CASES)]
+  .filter((rel) => emitErrorsOf(src(rel)).length > 0)
+  .sort();
+
+for (const rel of EMIT_REJECT_CASES) {
+  Deno.test({
+    name:
+      `native-align emit-reject: ${rel} — vl check --codegen rejects at emit`,
+    ignore: !ENABLED,
+    fn: async () => {
+      const wants = emitErrorsOf(src(rel));
+      const r = await vl(["check", "--codegen", path(rel)]);
+      if (r.code === 0) {
+        throw new Error(
+          `${rel}: expected an emit-stage rejection, vl check --codegen exited 0`,
+        );
+      }
+      const all = r.out + r.err;
+      const stage = stageOf(all);
+      if (stage !== "emit") {
+        throw new Error(
+          `${rel}: rejected at "${stage}" stage, expected emit — an earlier-stage reject belongs in REJECT_CASES/@error\n  ${
+            all.trim().split("\n").slice(0, 2).join(" / ")
+          }`,
+        );
+      }
+      for (const want of wants) {
+        if (!foldMsg(all).includes(foldMsg(want))) {
+          throw new Error(
+            `${rel}: expected the emit error to contain ${
+              JSON.stringify(want)
+            }\n  got: ${all.trim().split("\n").slice(0, 3).join(" / ")}`,
+          );
+        }
+      }
+    },
+  });
+}

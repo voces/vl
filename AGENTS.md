@@ -54,7 +54,9 @@ file; the lexer/parser are the grammar.
 
 Drop a `.vl` file under `tests/cases/<area>/` with `// @directive` comments at the top:
 `// @run` (compile + run), `// @log TEXT` (assert the Nth log line), `// @error TEXT` (assert an error
-diagnostic contains TEXT; `// @error at L:C TEXT` for position), `// @warning TEXT`. The runner is
+diagnostic contains TEXT; `// @error at L:C TEXT` for position), `// @emit-error TEXT` (assert the
+full compile fails at the EMIT stage with a message containing TEXT — pins the emitter's fail-loudly
+rejects, which `@error` cannot), `// @warning TEXT`. The runner is
 strict-by-default (an unexpected error fails the test).
 
 To assert a value, use `print(x)` (logs any printable type; booleans render as `true`/`false`). The
