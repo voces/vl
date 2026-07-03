@@ -1,0 +1,53 @@
+// @run
+// @log 42
+// @log 10
+// @log 10
+// @log 42
+// @log 10
+// @log 9
+// @log 16
+// STRUCTURAL SLOT DEDUP. VL is structurally typed: `type A = {v:i32}` and
+// `type B = {v:i32}` are THE SAME type — the checker accepts a `B` value wherever
+// an `A` is expected. Before the dedup the emitter minted a DISTINCT WasmGC heap
+// type per declared alias, so a `B` flowing into an `A`-typed slot emitted an
+// invalid module (`expected (ref $A), found (ref $B)` — the checker accepted it,
+// codegen produced un-instantiable wasm). Structurally-identical declarations now
+// share ONE heap type (`sTwin`/`sHeapIdx` dedup keyed by `repCanonKey`), so every
+// crossing below is a plain `(ref $S)`.
+type A = { v: i32 }
+type B = { v: i32 }
+
+// PARAM: a `B` value passed to an `A`-typed parameter (the core bug).
+function takeA(a: A) { return a.v }
+// RETURN: a function typed to return `A`, its result bound to a `B`.
+function mkA(): A { return { v: 10 } }
+
+const b: B = { v: 42 }
+print(takeA(b))               // 42
+const bb: B = mkA()
+print(bb.v)                   // 10
+print(takeA(bb))              // 10
+
+// FIELD: a struct whose field is `A`, constructed and read through `B` values.
+type Box = { inner: A }
+const bx: Box = { inner: b }
+print(bx.inner.v)             // 42
+function takeBox(x: Box) { return x.inner.v }
+print(takeBox({ inner: bb })) // 10
+
+// RECURSIVE twins: `type L1 = {n: L1|null, …}` and `type L2 = {n: L2|null, …}` are
+// isomorphic cycles — the canonical key's de Bruijn back-edge renders them equal,
+// so they share a heap type too. An `L2` chain walks through an `L1`-typed param.
+type L1 = { n: L1 | null, v: i32 }
+type L2 = { n: L2 | null, v: i32 }
+function headV(x: L1) { return x.v }
+const tail: L2 = { n: null, v: 7 }
+const b2: L2 = { n: tail, v: 9 }
+print(headV(b2))              // 9
+function sumChain(x: L1) {
+  let t = x.v
+  const nx = x.n
+  if nx != null { t = t + sumChain(nx) }
+  return t
+}
+print(sumChain(b2))           // 16

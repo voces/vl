@@ -102,17 +102,25 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 - **Keep binaryen (unlike antlr4).** Pure WASM/JS, does the IR/validate/optimize
   heavy lifting, and is a library binding that does _not_ block self-hosting —
   it stays for the TS compiler. (Track B)
-- **`repOf` slot identity is nominal (the checker's memoized arena index), not a
-  purely-structural canonical key.** Two nominally-distinct types with identical
-  structure (`type A = {v:i32}`, `type B = {v:i32}`) must keep distinct interned
-  slots / heap types — a `B`-typed value resolves its own slot — so slot identity
-  keys on the per-alias arena index the checker mints (distinct for `A` and `B`),
-  which a structural key would instead collapse. The cycle-terminating structural
-  key (full traversal, back-edge tokens for recursive types) is kept only as the
-  structural-equality oracle and future dedup foundation, never as slot identity;
-  the structural→nominal bridge for an inline shape resolves to a declared slot
-  only when exactly ONE declared twin matches (else it stays on the nominal path).
-  (repOf unification, roadmap Next#1)
+- **Struct heap-type identity is STRUCTURAL: structural twins share one WasmGC
+  heap type.** VL is structurally typed — `type A = {v:i32}` and `type B = {v:i32}`
+  are THE SAME type (the checker accepts a `B` wherever an `A` is expected), so they
+  MUST share one heap type. Minting a distinct heap type per declared alias was an
+  active soundness bug: a `B`-value flowing into an `A`-typed slot emitted an
+  un-instantiable module (`expected (ref $A), found (ref $B)` — the checker accepted
+  it, codegen produced invalid wasm). The emitter now dedups struct slots by the
+  cycle-terminating canonical key `repCanonKey` (full traversal; de Bruijn back-edge
+  tokens make recursive twins `type L1={n:L1|null}` / `type L2={n:L2|null}` share a
+  key), guarded by an emitter field-CODE match so a key collision whose emitted
+  LAYOUT would differ (an atom-backed litunion field vs a string one) never merges.
+  Each alias keeps its own `sNames` entry and field table (so diagnostics still read
+  the declared name); only `sHeapIdx` collapses — twins get one heap-type index
+  (`sTwin`, built in `buildStructTwins`). Non-twins (`{f:i32}` vs `{f:i64}`) keep
+  distinct keys and slots. This SUPERSEDES the earlier nominal-slot framing: nominal
+  names are a WasmGC implementation detail (heap types need names), not semantics.
+  A14 forward-compat: a future nominal/opaque type opts OUT of dedup by injecting
+  its nominal identity into `repCanonKey`, giving it a unique key and a private heap
+  type — no other change needed. (structural slot dedup, roadmap Next#1)
 - **No `this` keyword.** A method is a function whose first parameter is `self`
   (Rust-style); `o.f(a)` is sugar for `f(o, a)` (UFCS). `self` is an _explicit,
   optional_ marker: first param `self` → a method reachable as `o.f()`; no

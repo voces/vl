@@ -46,7 +46,14 @@
 // terminate via a generation-stamped visited mark per arena index.
 
 import { i32ToStr } from "./ast"
-import { VKind, sNames } from "./emit_state"
+import {
+  VKind,
+  sFieldCount,
+  sFieldStart,
+  sFieldTypes,
+  sNames,
+  sTwin,
+} from "./emit_state"
 import {
   T,
   TyArray,
@@ -289,6 +296,79 @@ export function repSlotOfTy(ty: i32): i32 {
   }
   if n == 1 { return found }
   -1
+}
+
+// ── Structural heap-type dedup (roadmap Next#1, the slot layer) ───────────────
+// The canonical structural key for struct slot `si`, or "" when `si` does not
+// participate in dedup. Only a DECLARED struct (a `cUserTypes` arena index whose
+// type is a `TyObj`) participates — inline / generic-application shapes already
+// dedup at intern time (`annShapeIndexOf`), so no live duplicate reaches the heap
+// layer through them. The key is `repCanonKey` on the checker's memoized arena
+// index: two structurally-identical declarations (including recursive twins
+// `type L1={n:L1|null}` / `type L2={n:L2|null}`, canonicalized by the de Bruijn
+// back-edge) render the SAME key; distinct structures never collide.
+//
+// A14 FORWARD-COMPAT SEAM: a future nominal/opaque type OPTS OUT of dedup by
+// making its `repCanonKey` unique (injecting its nominal identity into the key at
+// the `repCanonKeyGo` construction point above) — its slot then matches no twin
+// and keeps a private heap type. Nothing here needs to change for that.
+function slotCanonKey(si: i32): string {
+  if si < 0 || si >= sNames.length { return "" }
+  const di = cUserTypes[sNames[si]] ?? -1
+  if di < 0 { return "" }
+  const t = T.tys[di]
+  if !(t is TyObj) { return "" }
+  repCanonKey(di)
+}
+
+// True when struct slots `a` and `b` have an IDENTICAL emitter field-code list
+// (same count, same per-field wasm code in order). A layout guard on top of the
+// structural key: `repCanonKey` equality guarantees the CHECKER structure is the
+// same, but a key collision whose EMITTED layout would differ (e.g. an atom-backed
+// litunion field `type K="a"|"b"` vs an inline `"a"|"b"`, coded differently by the
+// emitter) must NOT merge. Same key AND same codes ⟹ same emitted heap layout.
+function structFieldCodesEq(a: i32, b: i32): i32 {
+  if sFieldCount[a] != sFieldCount[b] { return 0 }
+  let i = 0
+  while i < sFieldCount[a] {
+    if sFieldTypes[sFieldStart[a] + i] != sFieldTypes[sFieldStart[b] + i] {
+      return 0
+    }
+    i = i + 1
+  }
+  1
+}
+
+// Populate `sTwin` (parallel to `sNames`): `sTwin[i]` is the representative struct
+// slot for slot `i`'s WasmGC heap type — the smallest earlier slot with the same
+// canonical key AND field-code layout, or `i` itself when `i` is the first of its
+// structure. Keys are computed ONCE up front (`repCanonKey` per slot), then matched
+// pairwise; a non-participating slot ("" key) is always its own representative.
+// Called from `mAssignTypeIndices` before `sHeapIdx` allocation.
+export function buildStructTwins() {
+  const keys: string[] = []
+  let i = 0
+  while i < sNames.length {
+    keys.push(slotCanonKey(i))
+    i = i + 1
+  }
+  sTwin = []
+  i = 0
+  while i < sNames.length {
+    let rep = i
+    if keys[i] != "" {
+      let j = 0
+      while j < i {
+        if keys[j] == keys[i] && structFieldCodesEq(j, i) == 1 {
+          rep = j
+          j = i // stop at the first (smallest) twin
+        }
+        j = j + 1
+      }
+    }
+    sTwin.push(rep)
+    i = i + 1
+  }
 }
 
 // ── The derivation: one table-driven arm per `Ty` variant ────────────────────
