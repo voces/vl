@@ -220,6 +220,26 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   Plus the start-fn locals pass gains the ForIn atom flag (`localLitUnion`) its
   `collectLocals` twin already had — another drifted parallel enumeration. Graduated
   (seed sweep): `p1c K0[]`, `p1r K0[]`. Frozen: `tests/cases/lists/atom-array-literal-binding.vl`.
+- **`??` litunion-join audit (the follow-up to the atom-map `m[k] ?? <member>` fix) + the
+  atom↔string VALUE-JOIN family it surfaced.** Verdicts per join seam:
+  - `??` sites: SOUND. The member-literal rule is general (any `K | null` LHS, not just map
+    gets); an atom (non-literal) default keeps the union; a `string`/non-member default over
+    the niche or atom-map is a loud reject (`` `??` is only supported on a map index get `` /
+    the `tErrUnsupported` channel). No other over-widening `??` spelling found.
+  - if-EXPRESSION / match-arm / un-annotated-return joins: FIXED — the same class at three
+    more seams. An atom joining a string types `string` and the raw i32 id flowed into the
+    string-ref join (invalid wasm, both arm orders; match desugars to the chain). Fixes: the
+    join's CHECKED type routes the if-expression string kind (`ifExprRefKind`/`exprString`,
+    arm-order independent); the atom arm widens at `emitRefIfArm`; `retStrWiden` covers the
+    INFERRED-string return (`cloRetIsString`) like the annotated one; the string-op scratch
+    scan reserves the frame for atom arms (`ifChainHasAtomArm`). Two adjacent finds fixed
+    with it: an ALL-ATOM join lost atom-ness at the binding (printed the raw id —
+    `exprIsLitAtom` sees through a value-if now), and the checker's `else if` CHAIN join
+    read the innermost block tail instead of the inner if's own join (dropping arms from
+    the join type — `checkIfNode` now joins the chain correctly).
+  - array-literal element joins (`[k, "cc"]`): loud reject (list-rep classifiers), unchanged.
+  Frozen: `tests/cases/unions/atom-string-join.vl`.
+
 - **Maps with non-{i32,string,struct} values at the RETURN/param boundary** (`{[string]: i64}` /
   f64 / f32 / closure / union valued): the boundary gate (`retMapFlag`) enumerated the supported
   value types independently of the local interner (`mvShapeOfValName`) and lacked the scalar /
