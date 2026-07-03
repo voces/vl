@@ -176,6 +176,27 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   NOT covered (globals family, fails identically on master): a NON-const scalar-list global whose
   CELL kind mis-classifies (`const xs: i64[] = [-2]`, `const xs: f32[] = [-1.5]` — the cell emits as
   `(mut i32)`); `f64[] = [6000000000]` is a correct checker reject (i64→f64 is lossy).
+  - **RESOLVED — the i64-list / f32-list global CELL** (`const xs: i64[] = [-2]`, `let xs: f32[] = [-1.5]`,
+    both `const` and `let`, annotated and inferred): a NEGATIVE element is a unary `-x` (not a NumLit),
+    so `isConstInit` classified the init non-const and the global routed through the synthetic start
+    function. The non-const CELL emitters `fbValtypeNullable` / `fbRefNullForKind` carried a `f64list`
+    arm but no `i64list` / `f32list` arm, so the cell fell through to a bare `(mut i32)` while the
+    start-fn `global.set` stored the wide-list ref — invalid module (`expected i32, found (ref null
+    $type)`). Fix: the two missing arms, mirroring `f64list` (route through `il64TypeIdx` / `fl32TypeIdx`,
+    the same wrappers the const-path `fbValtype` already selected). The start-fn init path already
+    threaded the scalar-list kind (the f64 wave), so only the cell valtype was wrong. A large-magnitude
+    element (`6000000000`) stayed on the const path and worked already; a small POSITIVE one (`[2]`) is a
+    NumLit that `isConstInit` accepts. Also covered the UN-ANNOTATED global cell (`globalKind` gained
+    `exprI64Array`/`exprF32Array` for a call-returned list and `arrLitIsI64` for a bare i64-literal
+    init) — this closes the #841 deferral (a captured-var i64/f32-list closure result into an
+    un-annotated module global, `const g = v()`, now lowers). Frozen:
+    `tests/cases/globals/i64-list-global-cell.vl`. Fuzz-neutral (the shape is not generated at the
+    pinned or wide seeds — 0 new / 0 fixed at 4242/7777 d3–4 and 101/202/303; native-fixpoint holds;
+    986 tests pass). Pre-existing and still OUT of scope (a SEPARATE gap, fails identically as a LOCAL):
+    an INLINE-literal-bodied scalar-list lambda whose element is a small int (`() => ([-2])`, value-call
+    → `function-value call arity has no interned signature`) and an un-annotated `f32[]` list READ from a
+    named-function result (`index access but array type not collected`); the still-deferred `i64[] | null`
+    / `f32[] | null` nullable-list globals (R5, distinct-backing niche) also remain baselined.
 - **Map member in a union** (`({[string]: i32} | boolean)[]` — the related silent mis-tag): a map is
   neither a struct variant nor a value atom, so `registerInlineUnion` silently SKIPPED the union
   (`nameIsMap` even prefix-matched the union name and swallowed it down the map-value recursion) —
