@@ -102,6 +102,17 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 - **Keep binaryen (unlike antlr4).** Pure WASM/JS, does the IR/validate/optimize
   heavy lifting, and is a library binding that does _not_ block self-hosting —
   it stays for the TS compiler. (Track B)
+- **`repOf` slot identity is nominal (the checker's memoized arena index), not a
+  purely-structural canonical key.** Two nominally-distinct types with identical
+  structure (`type A = {v:i32}`, `type B = {v:i32}`) must keep distinct interned
+  slots / heap types — a `B`-typed value resolves its own slot — so slot identity
+  keys on the per-alias arena index the checker mints (distinct for `A` and `B`),
+  which a structural key would instead collapse. The cycle-terminating structural
+  key (full traversal, back-edge tokens for recursive types) is kept only as the
+  structural-equality oracle and future dedup foundation, never as slot identity;
+  the structural→nominal bridge for an inline shape resolves to a declared slot
+  only when exactly ONE declared twin matches (else it stays on the nominal path).
+  (repOf unification, roadmap Next#1)
 - **No `this` keyword.** A method is a function whose first parameter is `self`
   (Rust-style); `o.f(a)` is sugar for `f(o, a)` (UFCS). `self` is an _explicit,
   optional_ marker: first param `self` → a method reachable as `o.f()`; no
