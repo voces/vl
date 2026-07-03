@@ -182,6 +182,7 @@ import {
   rlElemKindTbl,
   rlElemName,
   rlElemNullable,
+  rlTwin,
   rlTypeIdx,
   rlUsed,
   rlWrapIdx,
@@ -1768,16 +1769,83 @@ export function mAssignTypeIndices(_n: i32) {
   // The raw i32 array (string rep + list/map backing), then the i32-list wrapper.
   if aUsed { aTypeIdx = mAllocType() } else { aTypeIdx = mNextType }
   if lUsed { lTypeIdx = mAllocType() } else { lTypeIdx = mNextType }
+  // Ref-list slot dedup (roadmap Next#1, ref-list layer — the `sTwin` analogue). Two
+  // ref-list slots emit BYTE-IDENTICAL (backing, wrapper) pairs iff they resolve to
+  // the same element heap (`rlElemHeap`): the pair shape — `(array (mut (ref null
+  // $elem)))` + `{backing, len, cap}` — is uniform across every element kind. After
+  // struct dedup `A[]` and `B[]` already share an element heap (`sHeapIdx` collapsed),
+  // so they SHOULD share one wrapper — else a `B[]` passed where an `A[]` is expected
+  // mismatches the wrapper `(ref $S)`. `rlTwin[s]` is `s`'s representative slot, from
+  // a signature that mirrors the `rlElemHeap` resolution below but is knowable UP
+  // FRONT: heap-resolved kinds (struct / nullable-struct / variant / union-box /
+  // i32-list element) key on the resolved heap; a nested-list kind whose element is a
+  // post-loop SINGLETON (closure / string / f64 / f32 / i64 inner list) keys on its
+  // KIND — every same-kind slot shares that one singleton; a struct-LIST element
+  // (kind 9, `S[][]`) keys on its INNER slot's representative (equal reps ⟹ equal
+  // inner wrapper ⟹ equal element heap); the map-array element (kind 3) and any
+  // unresolved element stay UNIQUE (never merged — the map-struct index interlock).
+  rlTwin = []
+  const rlSig: string[] = []
+  let rss = 0
+  while rss < rlElemName.length {
+    const rsk = rlElemKindTbl[rss]
+    let sig = "u:" + i32ToStr(rss) // default: unique (no dedup)
+    if rsk == 2 {
+      sig = "h:" + i32ToStr(uBoxIdx)
+    } else if rsk == 4 {
+      sig = "h:" + i32ToStr(lTypeIdx)
+    } else if rsk == 5 || rsk == 6 || rsk == 7 || rsk == 8 || rsk == 10 {
+      sig = "k:" + i32ToStr(rsk)
+    } else if rsk == 9 {
+      const inner = rlSlotByName(refArrElemName(rlElemName[rss]))
+      if inner >= 0 { sig = "9:" + i32ToStr(rlTwin[inner]) }
+    } else if rsk != 3 {
+      // Struct / nullable-struct / variant element — the `else` heap resolution below.
+      let rsen = rlElemName[rss]
+      const rsnn = nullablePartOf(rsen)
+      if rsnn != "" { rsen = rsnn }
+      const esi = structIndexByName(rsen)
+      if esi >= 0 {
+        sig = "h:" + i32ToStr(sHeapIdx[esi])
+      } else {
+        const evi = variantIndexOf(rsen)
+        if evi >= 0 { sig = "h:" + i32ToStr(uVarIdx + evi) }
+      }
+    }
+    rlSig.push(sig)
+    let rep = rss
+    let sj = 0
+    while sj < rss {
+      if rlSig[sj] == sig { rep = sj; sj = rss }
+      sj = sj + 1
+    }
+    rlTwin.push(rep)
+    rss = rss + 1
+  }
+  // Distinct pairs = slots that are their own representative (each mints 2 heap types).
+  let rlDistinctPairs = 0
+  let rdp = 0
+  while rdp < rlElemName.length {
+    if rlTwin[rdp] == rdp { rlDistinctPairs = rlDistinctPairs + 1 }
+    rdp = rdp + 1
+  }
   // The map struct index is needed BELOW to resolve a map-array ref-list element
   // (it references `(ref null $mStructIdx)`), yet the map struct lands AFTER the ref
   // pairs + string-list. It is computable up front from the counter: it follows the
-  // ref-pair slots (two per distinct element type) plus the 2 string-list slots.
-  const mStructIdxPre = mNextType + rlElemName.length * 2 + 2
-  // One (backing, wrapper) pair per distinct ref-list element type, interleaved.
+  // DISTINCT ref-pair slots (two per emitted pair, post-dedup) plus the 2 string-list
+  // slots.
+  const mStructIdxPre = mNextType + rlDistinctPairs * 2 + 2
+  // One (backing, wrapper) pair per DISTINCT ref-list element type, interleaved; a
+  // twin (`rlTwin[rs] < rs`) reuses its representative's pair (no new heap type).
   let rs = 0
   while rs < rlElemName.length {
-    rlBackIdx[rs] = mAllocType()
-    rlWrapIdx[rs] = mAllocType()
+    if rlTwin[rs] < rs {
+      rlBackIdx[rs] = rlBackIdx[rlTwin[rs]]
+      rlWrapIdx[rs] = rlWrapIdx[rlTwin[rs]]
+    } else {
+      rlBackIdx[rs] = mAllocType()
+      rlWrapIdx[rs] = mAllocType()
+    }
     if rlElemKindTbl[rs] == 2 {
       rlElemHeap[rs] = uBoxIdx
     } else if rlElemKindTbl[rs] == 3 {
@@ -1966,6 +2034,7 @@ export function collectA(_stmts: i32[]) {
   rlElemHeap = []
   rlBackIdx = []
   rlWrapIdx = []
+  rlTwin = []
   rlElemKindTbl = []
   rlElemNullable = []
   pendingNulRefHeap = -1
