@@ -729,6 +729,39 @@ Losing site: the field-access receiver classifier loses the struct through a lis
 nullable-list element.
 Verdict: MISSING REP — struct-through-list receiver.
 
+### R7. Struct-ARRAY member of a value union — DEFERRED (MISMATCH + MISSING REP; needs a clean base)
+Repro: `{a: f32, f: K0, z: string}[] | {w: i32}` (p1c/p1r), and the minimal `S[] | {w: i32}`.
+Class: MISMATCH (silent wrong result) + REJECT. TWO distinct sub-issues, both DEFERRED (the
+merge train was too deep to add a rep + a discrimination fix on a moving base):
+- **(a) INLINE-annotation `is` MISMATCH (pre-existing on master).** An INLINE union annotation
+  `S[] | {w: i32}` built with the `{w: i32}` member value mis-discriminates: `if v is {w: i32}`
+  is FALSE (prints the array arm — a silent wrong result), while the NAMED-alias spelling
+  `type U = S[] | {w: i32}; const v: U = {w}` round-trips CORRECTLY. So the inline union's
+  member registration does not tag the struct-array vs struct members the way the named alias
+  does — a registration/tagging difference, the value-union-box analogue of the inline-vs-named
+  FIELD-union gap #840 fixed for fields. Precise site: the inline-union member registration
+  (`registerInlineUnion` / the struct-array-member arm of the value-box variant registration) —
+  make the inline struct-array-union member intern + tag exactly like the named-alias path.
+- **(b) inline MULTI-FIELD struct-array element — MISSING REP.** The element `{a: f32, f: K0, z:
+  string}` (an f32 + litunion + string field mix) rejects at emit (`binding's inline-shape type
+  has an unsupported field`): a ref-list-of-inline-multi-field-struct is not internable as a
+  value-union member payload. A single-field `S[]` element interns; the multi-field mixed-rep
+  element does not. Precise site: the union-member ref-list element interning
+  (`letAnnIsUninternedShape` / the value-box list-member arm) must intern a multi-field struct
+  element the same way a standalone `S[]` binding does.
+Verdict: DEFERRED — (a) is a silent-wrong-result discrimination bug (NOT merely a missing rep),
+(b) a missing rep; both want a clean, drained base and careful work, not a rushed add.
+
+### R8. `(boolean | null)[]` — DOCUMENTED CLEAN REJECT (acceptable fail-loud, NOT a bug)
+Repro: `(boolean | null)[]` (p1c/p1r). Class: REJECT (`a nullable-boolean list element has no
+rep; use a non-null element type`). The element is a NICHE nullable (one non-null member + null —
+deliberately not a value-union box, so no box rep), and a nullable-boolean list element has no
+settled backing (`boolean`'s i32-sentinel niche does not compose into a list slot). `collectA`
+rejects it cleanly at emit — a LOUD fail, never invalid wasm. This is an ACCEPTED long-tail reject
+pinned in the baseline (the corpus harness cannot assert emit-time errors, so no `@error`
+fixture); a rep would need a distinct nullable-boolean list backing that the matrix does not yet
+justify.
+
 ### Clean-reject long tail (NOT bugs) — unchanged
 Map params, deep lambda-param inference, f32-through-wrapper, string→litunion-through-nullable,
 `is` over some deep structural types. Fail-loudly; pinned in the baseline.
