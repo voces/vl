@@ -228,6 +228,19 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
 
 ## RESOLVED
 
+- **An object literal did not coerce field-wise through a `| null` wrapper** (`{a, f, z: f32} | null`,
+  and the same struct as a `V?` map value): a float-literal `f32` field (`z: 3.5`) failed the CHECKER
+  against a nullable-struct target (`expected {…, z: f32}?, got {…, z: f64}`) even though the NON-null
+  target coerces it. Root: `assignableExpr`'s `ObjLit` field-wise-coercion arm required `dstTy` itself
+  to be a `TyObj`, but a nullable target is a `TyNullable` wrapping the struct, so the arm was skipped
+  and the literal kept its un-coerced f64 field. The sibling `ArrayLit` arm already peeled the nullable
+  (`dN is TyNullable { dtix = dN.nInner }`); the fix gives `ObjLit` the same peel. Graduated (seeds
+  101/202/303): `p1c`/`p1r {a: string, f: i32, z: f32} | null`, `p1c`/`p1r {a: i32, f: {[string]:
+  string}, z: f32} | null`, plus map-value structs with an f32 field (`{[string]: {f: f32}}`,
+  `{[string]: {a: f32, f: string, z: i32}}[]`, `{[string]: {a: f64, f: K0, z: i32}}`) — map VALUES are
+  nullable `V?` slots, so the same peel coerces their struct literals. 0 regressions. Frozen:
+  `tests/cases/objects/obj-literal-coerce-through-nullable.vl`.
+
 - **R3 (partial) — a literal-union ALIAS member of a VALUE union, positive `is K0` test**
   (`K0 | boolean`, `K0 | i32`, `K0 | f64`, `K0 | {w:i32}`, and the struct-field carrier
   `{a, f: K0 | i64, z}`): `is K0` rejected at emit (`` `is` names a type that is not a union
