@@ -28,6 +28,11 @@
 //   - @error-at matches the LINE only. Column anchors diverge between the two
 //     checkers on ~80 corpus files (the checker-parity sweep) — column
 //     matching is residue for the span rungs (ROADMAP H-M "Spans").
+//   - @emit-error asserts the FULL compile (`compileSrc`) fails at the EMIT
+//     stage (rc 3) with a message containing TEXT — the emitter's fail-loudly
+//     rejects (shapes the checker accepts but the emitter has no rep for),
+//     which the checker-tier @error cannot pin. Exclusive with @run/@trap and
+//     with @error/@error-at (a checker reject never reaches emit).
 //   - @trap asserts a runtime trap (a `VLRuntimeError` from `runWasm`) and
 //     matches MESSAGE substrings only. `line:col` trap substrings are skipped:
 //     they assert the source-map-located message, and the wasm pipeline does
@@ -116,6 +121,11 @@ type Directives = {
   mode: "check" | "run";
   errors: string[];
   errorsAt: { line: number; col: number; text: string }[];
+  /** `@emit-error TEXT`: the FULL compile must fail at the EMIT stage (rc 3)
+   * with a diagnostic containing TEXT — pins the emitter's fail-loudly rejects
+   * (a shape the checker accepts but the emitter has no rep for), which the
+   * checker-tier `@error` cannot express. */
+  emitErrors: string[];
   warnings: string[];
   infos: string[];
   hints: string[];
@@ -130,6 +140,7 @@ const parseDirectives = (src: string): Directives => {
     mode: "check",
     errors: [],
     errorsAt: [],
+    emitErrors: [],
     warnings: [],
     infos: [],
     hints: [],
@@ -153,6 +164,9 @@ const parseDirectives = (src: string): Directives => {
         break;
       case "error":
         d.errors.push(rest);
+        break;
+      case "emit-error":
+        d.emitErrors.push(rest);
         break;
       case "warning":
         d.warnings.push(rest);
@@ -191,7 +205,6 @@ const parseDirectives = (src: string): Directives => {
   }
   return d;
 };
-
 
 type Case =
   | { kind: "single"; url: URL }
@@ -346,6 +359,55 @@ const assertCase = async (
     throw new Error(
       `unrecognized directive(s): ${d.unknown.map((k) => `@${k}`).join(", ")}`,
     );
+  }
+
+  // @emit-error: the compile must fail at the EMIT stage (rc 3) with each
+  // declared message. Exclusive with the run tier (an emit failure has no
+  // bytes to run) and with checker-tier @error (the compile never reaches
+  // emit when the checker rejects — pin one stage per case).
+  if (d.emitErrors.length) {
+    if (d.mode === "run") {
+      throw new Error("@emit-error cannot be combined with @run/@trap");
+    }
+    if (d.errors.length || d.errorsAt.length) {
+      throw new Error(
+        "@emit-error cannot be combined with @error/@error-at — a checker " +
+          "reject never reaches the emit stage",
+      );
+    }
+    if (r.rc === 0) {
+      throw new Error(
+        "@emit-error expected an emit-stage failure, but the compile succeeded",
+      );
+    }
+    if (r.rc !== 3) {
+      throw new Error(
+        `@emit-error expected an EMIT-stage failure (rc 3), but the compile ` +
+          `failed earlier (rc ${r.rc} = ${r.rc === 1 ? "parse" : "type"}): ${
+            fmtDiags(r.diags)
+          }`,
+      );
+    }
+    for (const want of d.emitErrors) {
+      if (!r.diags.some((di) => matches(di.message, want))) {
+        throw new Error(
+          `expected an emit error containing "${want}", got: ${
+            fmtDiags(r.diags)
+          }`,
+        );
+      }
+    }
+    const extraEmit = r.diags.filter((di) =>
+      !d.emitErrors.some((w) => matches(di.message, w))
+    );
+    if (extraEmit.length) {
+      throw new Error(
+        `unexpected emit error(s) (declare with @emit-error if intended): ${
+          fmtDiags(extraEmit)
+        }`,
+      );
+    }
+    return;
   }
 
   for (const want of d.errors) {
@@ -512,7 +574,8 @@ for (const c of cases) {
         exports!,
         entryKey,
         src,
-        d.mode === "run",
+        // @emit-error pins the EMIT stage, so it needs the full compile too.
+        d.mode === "run" || d.emitErrors.length > 0,
         c.kind === "module",
       );
       await assertCase(d, r);
@@ -523,7 +586,8 @@ for (const c of cases) {
       // TS host, which doesn't lint a failed compile — so error cases skip the
       // lint tier here (module-graph lint is a later slice too).
       if (
-        c.kind === "single" && d.errors.length === 0 && d.errorsAt.length === 0
+        c.kind === "single" && d.errors.length === 0 &&
+        d.errorsAt.length === 0 && d.emitErrors.length === 0
       ) {
         assertLint(d, driveLint(exports!, src));
       }
