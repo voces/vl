@@ -207,6 +207,19 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
 
 ## RESOLVED
 
+- **Literal-union array LITERALS built the string list** (`const ks: VK[] = ["aa", "bb"]` —
+  invalid wasm at the first atom-context use of an element: a `: VK` binding, a `VK` param,
+  a top-level or in-function `for k in ks`; `print(ks[0])` "worked" by printing the string
+  ref). Root: a bare `StrLit` types as `string`, so the literal's recorded type is
+  `string[]` and `arrLitIsStr` (syntactic, first-element string-ness) claimed the
+  string-list SLOT + collect + build, while every consumer read the i32 atom rep. Fix at
+  the adoption seam: `assignableExpr`'s ArrayLit arm RECORDS the destination array type on
+  the literal node when the element target is a literal union (the same context-adoption
+  move as lambda expected-returns), and `arrLitIsStr` defers to the recorded type
+  (`nodeArrayElemIsLitUnion`) — one signal, every position (binding/global/arg/return).
+  Plus the start-fn locals pass gains the ForIn atom flag (`localLitUnion`) its
+  `collectLocals` twin already had — another drifted parallel enumeration. Graduated
+  (seed sweep): `p1c K0[]`, `p1r K0[]`. Frozen: `tests/cases/lists/atom-array-literal-binding.vl`.
 - **Maps with non-{i32,string,struct} values at the RETURN/param boundary** (`{[string]: i64}` /
   f64 / f32 / closure / union valued): the boundary gate (`retMapFlag`) enumerated the supported
   value types independently of the local interner (`mvShapeOfValName`) and lacked the scalar /
