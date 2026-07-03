@@ -355,6 +355,34 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   - array-literal element joins (`[k, "cc"]`): loud reject (list-rep classifiers), unchanged.
   Frozen: `tests/cases/unions/atom-string-join.vl`.
 
+- **INLINE struct shapes as MAP VALUES were never interned** (`{[string]: {f: f32}}`, the nested-map
+  struct field `{[string]: {f: {[string]: i64}}}`): emitted `unsupported map value type` while the
+  NAMED-alias spelling (`type S = {f: f32}; {[string]: S}`) round-tripped. Root (position-DEPENDENT
+  interning): `internShapeDeep` (the `collectAnnShapes` per-TypeRef interner) peeled paren / nullable /
+  array / functype wrappers to reach a buried inline shape but had NO map arm — the whole map is ONE
+  TypeRef name, so `internInlineShape` no-op'd on it and the value's struct shape never entered `sNames`.
+  The mv-slot interner (`mvShapeOfValName` → `structIndexByValName`) then found no struct and rejected
+  (kind -3). A `{f: i64}` / `{a:i32,f:f64,z:i32}` value "worked" only by luck — its STORE LITERAL
+  (`{f: 5000000000}`) self-collected via `collectAnonShapes`; an f32 field written from a variable
+  (`{f: v}`) or a map field (`{f: inner}`) codes -1 in `anonFieldCode`, so neither path interned it.
+  Fix (position-INDEPENDENT, the #837 template): `internShapeDeep` gains a `nameIsMap` arm that recurses
+  into the value (`mapValNameOf`), the inline dual of the named-alias value's own TypeRef — so any inline
+  shape buried in a map value at any depth interns before `collectA` resolves the mv slot. Exposed +
+  fixed a LATENT same-field-name-set collision: two inline struct map values sharing a field-name SET but
+  differing in field CODE (`{f: f32}` and `{f: {[string]: i64}}`) both interning now let the map STORE
+  and the `?? default` READ resolve the value-struct literal via `structIndexOfObj` (field-name-set
+  match) to whichever struct interned FIRST — a wrong-layout `struct.new` (invalid wasm). Fix: the map
+  store (`emitMapSetV` overwrite + `emitMapPushValV` append) and the `?? default` read seed the
+  expectation ctx's `structIdx` from the mv slot's `mvValStructIdx` (a kind-1 struct value) so `emitObj`
+  builds the map's DECLARED value struct — the same `pendingStructIdx` hint a struct-typed call arg
+  already uses. Graduated (seeds 101/202/303): `{[string]: {f: {[string]: i64}}}` p0c/p0r; the wider
+  4242/7777 sweep additionally graduated `{[string]: {f: {[string]: boolean}}}` p2c/p2r and
+  `{[string]: {a: boolean, f: i64 | null, z: i64}}` p2r (5 shapes total, 0 new findings, 0 regressions).
+  Frozen: `tests/cases/maps/inline-struct-value-intern.vl`. Still baselined (a DIFFERENT family's residue,
+  not a map gap — fail identically at a plain local): `{[string]: {f: f32}}` / `{[string]: {a:f32,...}}[]`
+  (the fuzzer's float-literal store trips the f32-widening reject `cannot assign {f: f64} to {f: f32}?`),
+  `{[string]: {a: f64, f: K0, z: i32}}` (the litunion field widening `{...f: string...}` vs `{...f: K0...}`).
+
 - **Typed-value maps in COMPOSITION positions** (a map as a LIST element / a NESTED-map value /
   inside a STRUCT field): `{[string]: f32}[]`, `{[string]: f64[]}[]`, `{[string]: {f: string}}[]`,
   `{[string]: {[string]: f64}}`, `{f: {[string]: {[string]: f32}}}` — all emitted invalid wasm
