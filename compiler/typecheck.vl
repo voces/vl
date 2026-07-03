@@ -1060,6 +1060,84 @@ function lambdaBodyTail(bodyIx: i32) {
   -1
 }
 
+// FIELD-LEVEL contextual return adoption — the object dual of the scalar rule in
+// `checkFuncDeclNode`: an object-literal-bodied lambda whose inferred return shape widens
+// FIELD-WISE into the contextual expected return (`const v: () => {f: i64} = () => ({f: 5})`)
+// ADOPTS the expected shape. Sound only when every widening field's VALUE is a small int
+// literal — the literal re-encodes at the wider rep inside the body, and the expected field
+// type is RECORDED on the literal node so the emitter's literal-shape interner
+// (`anonFieldCode`, which otherwise codes a small literal i32) interns the wide slot.
+// Anything else keeps the inferred shape, and `objNumWidens` in `fnSlotAssignable` rejects
+// it loudly (a function value's field rep is fixed; only a literal body can re-encode).
+function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
+  if inferredTy < 0 || expRetTy < 0 { return false }
+  let u = lambdaBodyTail(bodyIx)
+  if u < 0 { return false }
+  let done = false
+  while !done {
+    const pn = P.nodes[u]
+    if pn is Paren { u = pn.parInner } else { done = true }
+  }
+  const lit = P.nodes[u]
+  if !(lit is ObjLit) { return false }
+  const s = T.tys[inferredTy]
+  const d = T.tys[expRetTy]
+  if s is TyObj {
+    if d is TyObj {
+      if s.objFieldNames.length != d.objFieldNames.length { return false }
+      const recNodes: i32[] = []
+      const recTys: i32[] = []
+      let i = 0
+      while i < d.objFieldNames.length {
+        const dty = d.objFieldTypes[i]
+        const sty = objFieldType(s, d.objFieldNames[i])
+        if sty < 0 { return false }
+        if numWidens(sty, dty) {
+          // The widening field's value must be a small int literal in the literal body.
+          let fv = -1
+          const fl = lit.objFields
+          let fi = 0
+          while fi < fl.length {
+            const fn = P.nodes[fl[fi]]
+            if fn is FieldInit {
+              if fn.fiName == d.objFieldNames[i] { fv = fn.fiValue }
+            }
+            fi = fi + 1
+          }
+          if fv < 0 { return false }
+          const fvn = P.nodes[fv]
+          if fvn is NumLit {
+            if hasDot(fvn.numText) { return false }
+            if !intLexemeFitsI32(fvn.numText) { return false }
+            recNodes.push(fv)
+            recTys.push(dty)
+          } else {
+            return false
+          }
+        } else {
+          // A non-widening field must match exactly (mutual assignability) — a shape
+          // difference beyond numeric widening is not an adoption, it is a mismatch.
+          if !assignable(sty, dty) { return false }
+          if !assignable(dty, sty) { return false }
+        }
+        i = i + 1
+      }
+      if recNodes.length == 0 { return false }
+      if !inferQuiet {
+        let r = 0
+        while r < recNodes.length {
+          const rn = recNodes[r]
+          while nodeTyIx.length <= rn { nodeTyIx.push(-1) }
+          nodeTyIx[rn] = recTys[r]
+          r = r + 1
+        }
+      }
+      return true
+    }
+  }
+  false
+}
+
 // Propagate an EXPECTED type into an expression, recording per-lambda param expectations. A
 // lambda at a function-typed position is seeded directly — its params from the expected param
 // types AND its body recursively against the expected RESULT type (so a CURRIED `(a) => (b) => …`
@@ -4442,7 +4520,36 @@ function isEquatable(ty: i32, seen: i32[]) {
 // seam, so the lambda reaches this comparison already at the wider type.
 function fnSlotAssignable(src: i32, dst: i32) {
   if numWidens(src, dst) { return false }
+  if objNumWidens(src, dst) { return false }
   assignable(src, dst)
+}
+
+// A struct type with a numerically-WIDER field on the destination side (`{f: i32}` vs
+// `{f: i64}`): assignable as a VALUE (construction converts at the field store) but NOT
+// as a function-type slot — a function value's functype fixes the field rep, so the
+// covariant accept emitted an i32-field shape every call site mistrusts (invalid wasm).
+// The object dual of the scalar invariance in `fnSlotAssignable`; recursion covers a
+// nested struct field. A lambda LITERAL in that position still works: the checker adopts
+// the expected shape when the widening fields are literals (`objRetWidenAdopt`), so it
+// reaches the comparison already at the wider type.
+function objNumWidens(src: i32, dst: i32) {
+  if src < 0 || dst < 0 { return false }
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyObj {
+    if d is TyObj {
+      let i = 0
+      while i < d.objFieldNames.length {
+        const sf = objFieldType(s, d.objFieldNames[i])
+        if sf >= 0 {
+          if numWidens(sf, d.objFieldTypes[i]) { return true }
+          if objNumWidens(sf, d.objFieldTypes[i]) { return true }
+        }
+        i = i + 1
+      }
+    }
+  }
+  false
 }
 
 function assignable(src: i32, dst: i32) {
@@ -6863,6 +6970,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       const expRet = cbExpectedRetFor(fnIx)
       if expRet >= 0 {
         if numWidens(inferred, expRet) { inferred = expRet }
+        // Object-shaped dual: `() => ({f: 5})` against `() => {f: i64}` — adopt the
+        // expected shape when every widening field is a re-encodable literal
+        // (`objRetWidenAdopt` also records the field types for the emitter's interner).
+        if objRetWidenAdopt(n.fnBody, inferred, expRet) { inferred = expRet }
       }
     }
     // PERMISSIVE FALL-THROUGH (totality): an un-annotated function that can fall off the
