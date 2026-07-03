@@ -7029,7 +7029,128 @@ export function internShapeDeep(nm: string) {
   if nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
     return internShapeDeep(nm.slice(0, nm.length - 2))
   }
+  // A FUNCTION-TYPE name (`(p1,p2)=>ret`): the inline shapes buried in a PARAM or
+  // the RESULT position are otherwise unreachable — the whole functype is ONE
+  // TypeRef name, so a composite closure result (`(i32)=>{f:i32}`, `()=>{a:i32,b:i32}`,
+  // `(i32)=>{f:{g:i32}}`) or a composite param hides its shape from
+  // `internInlineShape`. A lambda's inferred return literal (`{f:x}` with a param
+  // field value `anonFieldCode` codes -1) then has no interned shape to name-set
+  // match, and the closure functype result fails loudly ("ref valtype with no
+  // interned shape"). `internFuncTypeShapes` interns each PLAINLY-LOWERABLE shape
+  // reached — see the soundness note there.
+  if annArrowAt(nm) >= 1 && nm[0] == '(' { return internFuncTypeShapes(nm) }
   internInlineShape(nm) // no-op for any non-shape leaf
+  0
+}
+
+// Whether field CODE `c` is a scalar / string / scalar-list / nested-struct field —
+// the reps a struct lowers as a closure result/param WITHOUT touching an unsupported
+// composite field (a typed-value MAP is R1, a value-UNION box is R3, a nullable/ref
+// list is R5/R6). Nested-struct fields (code 15) are checked recursively at the
+// `funcTypeShapeLowerable` leaf.
+function funcTypeFieldCodeSafe(c: i32): boolean {
+  c == 0 ||
+    c == 3 ||
+    c == 4 ||
+    c == 6 ||
+    c == 15 ||
+    c == 17 ||
+    c == 23 ||
+    c == 24 ||
+    c == 25 ||
+    c == 26 ||
+    c == 27
+}
+
+// Whether inline shape `nm` (`{f:i32,g:{h:i32}}`) lowers as a closure result/param
+// with NO unsupported composite field, recursing through nested inline shapes (and
+// their `| null`). A map / value-union / nullable-list / ref-list / closure field
+// makes it un-lowerable — those reps are R1/R3/R5/R6, out of THIS slice, and the
+// closure must stay a CLEAN reject (never invalid wasm), so the shape is not interned.
+function funcTypeShapeLowerable(nm: string): boolean {
+  if nm.length < 2 || nm[0] != '{' || nm[1] == '[' || nm[nm.length - 1] != '}' {
+    return false
+  }
+  const inner = nm.slice(1, nm.length - 1)
+  let depth = 0
+  let start = 0
+  let k = 0
+  let okAll = true
+  let fieldCount = 0
+  while k <= inner.length {
+    const atEnd = k == inner.length
+    let brk = false
+    if !atEnd {
+      const ch = inner[k]
+      if ch == '{' || ch == '[' || ch == '(' { depth = depth + 1 }
+      if ch == '}' || ch == ']' || ch == ')' { depth = depth - 1 }
+      if ch == ',' && depth == 0 { brk = true }
+    } else {
+      brk = true
+    }
+    if brk {
+      const part = inner.slice(start, k)
+      const ci = part.indexOf(":")
+      if ci <= 0 {
+        okAll = false
+      } else {
+        const ftxt = part.slice(ci + 1, part.length)
+        const fc = nameFieldCode(ftxt)
+        if fc < 0 {
+          // A NESTED inline-shape field (`g:{h:i32}` / `g:{h:i32}|null`): recurse
+          // into the base shape — lowerable only if IT is.
+          let base = ftxt
+          const nb = nullablePartOf(base)
+          if nb != "" { base = nb }
+          if !funcTypeShapeLowerable(base) { okAll = false }
+        } else if !funcTypeFieldCodeSafe(fc) {
+          okAll = false
+        }
+        fieldCount = fieldCount + 1
+      }
+      start = k + 1
+    }
+    k = k + 1
+  }
+  okAll && fieldCount > 0
+}
+
+// Intern the PLAINLY-LOWERABLE inline shapes buried in the params / result of a
+// function-type name `nm` (`(i32)=>{f:i32}`, `({a:i32})=>{b:i32}`), peeling the
+// grouping / nullable / array / nested-functype wrappers around each position. Only
+// a fully-lowerable struct leaf (`funcTypeShapeLowerable`) is interned — a shape
+// with an unsupported composite field (map / value-union / nullable-list) is LEFT
+// un-interned so the closure stays a clean reject, exactly as before this slice
+// (never invalid wasm). Idempotent (`annShapeIndexOf`); registers no value union
+// and interns no map, so a functype over unsupported reps is byte-identical to the
+// pre-slice behavior.
+function internFuncTypeShapes(nm: string): i32 {
+  if nm.length < 2 { return 0 }
+  if nm[0] == '(' && nm[nm.length - 1] == ')' {
+    return internFuncTypeShapes(nm.slice(1, nm.length - 1))
+  }
+  const np = nullablePartOf(nm)
+  if np != "" { return internFuncTypeShapes(np) }
+  if nm.length > 2 && nm[nm.length - 2] == '[' && nm[nm.length - 1] == ']' {
+    return internFuncTypeShapes(nm.slice(0, nm.length - 2))
+  }
+  const fa = annArrowAt(nm)
+  if fa >= 1 && nm[0] == '(' && nm[fa - 1] == ')' {
+    const inner = nm.slice(1, fa - 1)
+    if inner.length > 0 {
+      const parts: string[] = []
+      annSplitParams(inner, parts)
+      let pi = 0
+      while pi < parts.length {
+        internFuncTypeShapes(parts[pi])
+        pi = pi + 1
+      }
+    }
+    return internFuncTypeShapes(nm.slice(fa + 2, nm.length))
+  }
+  if nm[0] == '{' && nm[1] != '[' && nm[nm.length - 1] == '}' {
+    if funcTypeShapeLowerable(nm) { internInlineShape(nm) }
+  }
   0
 }
 
