@@ -7015,6 +7015,32 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
                 inferred = expRet
               }
             }
+            // The NULLABLE-CLOSURE dual (`(i32) => ((i32) => K0) | null = (q0) => (null)`): a
+            // lambda whose body infers `null` (or a closure) against an expected nullable-closure
+            // result adopts the niche — its functype result is `(ref null $cloStruct)`, and
+            // `emitReturnValue`'s `retNulClosure` arm niches a `return null` as `ref.null
+            // $cloStruct`. Recorded by `nullableRetName`'s `TyFunc`-inner arm + pinned by
+            // `synthRetAnnots`. Position-independent, exactly as the annotated `: ((i32)=>K0)|null`
+            // return already lowers (the pin only removes the annotation).
+            const etInnerTy = T.tys[etU.nInner]
+            if etInnerTy is TyFunc {
+              const ncTail = lambdaBodyTail(n.fnBody)
+              if ncTail >= 0 && assignableExpr(ncTail, inferred, expRet) {
+                inferred = expRet
+              }
+            }
+            // The NULLABLE-LITUNION dual (`() => K0 | null = () => ("42")`): a lambda whose body
+            // infers a bare `string` MEMBER of the expected `K | null` litunion adopts the niche —
+            // its functype result is the i32 atom (the `-1` sentinel = null), and `emitReturnValue`'s
+            // `retNulLitUnion` arm encodes the member literal as its atom id / a `return null` as
+            // `-1`. Recorded by `nulLitUnionRetName` + pinned by `synthRetAnnots` (`nullablePartOf`
+            // non-empty). Exposed already by the annotated `: () => K | null` form.
+            if tyIsLitUnion(etU.nInner) {
+              const nluTail = lambdaBodyTail(n.fnBody)
+              if nluTail >= 0 && assignableExpr(nluTail, inferred, expRet) {
+                inferred = expRet
+              }
+            }
           }
         }
         // VALUE-UNION result (C1, `() => i64 | boolean`): a lambda whose body infers a bare
@@ -7189,6 +7215,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // node sentinel so `synthRetAnnots` pins a nullable-returning closure value position-
         // independently (the nullable dual of the union pin).
         if unm == "" { unm = nullableRetName(inferred, gRootStmts) }
+        // A NULLABLE-LITUNION contextual return (`() => K0 | null`, adopted just above) — record
+        // the alias name so `synthRetAnnots` pins the lambda's `fnRet` as the nullable litunion
+        // (an i32 atom with `-1` = null), whose member-encoding `emitReturnValue` already performs.
+        if unm == "" { unm = nulLitUnionRetName(inferred) }
         // An ELEMENT-NULLABLE list contextual return (`() => (f64|null)[]`, adopted just
         // above) — record its emitter name so `synthRetAnnots` pins the lambda's `fnRet` as
         // the value-union-box list, whose `[null]` element seeding `emitReturnValue` already
@@ -8016,6 +8046,31 @@ function nullableRetName(er: i32, stmts: i32[]) {
       // NON-spaced (`P|null`) — the emitter's internal name convention (`nullablePartOf`,
       // `structUnionRetName`'s `Cat|Dog`), not the spaced `tyToStr` render.
       if nm != "" { return nm + "|null" }
+    } else if it is TyFunc {
+      // A NULLABLE-CLOSURE contextual return (`((i32) => K0) | null`, kind 19): the closure
+      // fat-pointer made nullable (`(ref null $cloStruct)` — the niche). Render the inner
+      // function type in the emitter's NON-spaced `=>` form, PARENTHESIZED and NON-spaced around
+      // the bar (`((i32)=>K0)|null`) — the form `nameIsNulClosure` / `nullablePartOf` recognize
+      // (`tyToStr`'s spaced `->` render does not). The RESULT preserves a literal-union ALIAS
+      // (`litUnionAliasNameOfTy`) rather than `tyToEmitName`'s softened `string`, so the inner
+      // value-call (`t0(1)`) and the interned inner `$fnsig` agree on the litunion's i32-atom
+      // token (`>i`, via `annRetKind`) — NOT the string `>S`, whose `(ref array)` result would
+      // clash with the litunion-atom `print`. `synthRetAnnots` pins the lambda's `fnRet` to this,
+      // and `emitReturnValue`'s `retNulClosure` arm niches a `return null` as `ref.null
+      // $cloStruct`. (Closure dual of the nullable-struct pin; the lambda's `$fnsig` result keys `>C`.)
+      let ips = ""
+      const pts = it.fnParamTypes
+      let pj = 0
+      while pj < pts.length {
+        const pn = tyToEmitName(pts[pj])
+        if pn == "" { return "" }
+        if pj > 0 { ips = ips + "," }
+        ips = ips + pn
+        pj = pj + 1
+      }
+      let irs = litUnionAliasNameOfTy(it.fnRet)
+      if irs == "" { irs = tyToEmitName(it.fnRet) }
+      if irs != "" { return "((" + ips + ")=>" + irs + ")|null" }
     } else if tyToStr(t.nInner) == "string" {
       return "string|null"
     } else if tyToStr(t.nInner) == "boolean" {
@@ -8024,6 +8079,23 @@ function nullableRetName(er: i32, stmts: i32[]) {
       // arm niches a `return null` / `return <bool>`, matching the annotated form.
       return "boolean|null"
     }
+  }
+  ""
+}
+
+// The emitter-format NAME of an inferred NULLABLE-LITUNION return `er` (`() => K0 | null`): a
+// `TyNullable` (or a `TyUnion` with a `null` atom) whose non-null part is a LITERAL union. The
+// emitter niches it as the i32 atom with `-1` = null (`nodeTyIsNulLitUnion` → `retNulLitUnion`),
+// so the pin (`synthRetAnnots`, via `nullablePartOf` non-empty) routes the anonymous lambda
+// through the SAME sound rep the annotated `: () => K | null` return already lowers. Renders the
+// litunion by its ALIAS (`K0|null`); an inline `("a"|"b")|null` litunion has no alias and stays
+// "" (a clean reject — the fuzzer's shapes alias the union). "" for any non-nullable-litunion.
+function nulLitUnionRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyNullable {
+    const alias = litUnionAliasNameOfTy(t.nInner)
+    if alias != "" { return alias + "|null" }
   }
   ""
 }
