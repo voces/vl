@@ -3,6 +3,7 @@ import {
   isValueUnionName,
   nameIsLitUnionType,
   nodeArrayElemIsLitUnion,
+  nodeArrayElemIsNulBool,
   nodeLitUnionMemberTexts,
   nodeTyIsLitUnionAlias,
   nodeTyIsNulLitUnion,
@@ -2656,6 +2657,9 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
         isI64Lit = true
       } else if pendingListKind == 7 {
         isF32Lit = true
+      } else if pendingListKind == 8 {
+        // A `(boolean | null)[]` empty literal — a plain i32-list wrapper (the boolean
+        // sentinel niche shares the i32 backing); nothing to force here.
       } else {
         if pendingListKind != 0 { isRefLit = true }
       }
@@ -3010,6 +3014,14 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
     const litArr = nodeArrayElemIsLitUnion(arrIx)
     const savedArrLU = pendingLitUnion
     if litArr { pendingLitUnion = 1 }
+    // A `(boolean | null)[]` literal shares the i32 backing, but a `null` element must
+    // lower as the sentinel 2 (a `true`/`false` element already emits its i32 0/1) —
+    // seed `pendingNulBool` for the element emits, the niche analogue of `litArr`. The
+    // `pendingListKind == 8` arm catches an all-`null` `[null]` (which self-infers as
+    // `null[]`, so the node-type probe alone misses it) via the threaded annotation.
+    const nbArr = nodeArrayElemIsNulBool(arrIx) || pendingListKind == 8
+    const savedArrNB = pendingNulBool
+    if nbArr { pendingNulBool = true }
     let dstI32 = -1
     let coffI32 = 0
     if elems.length > NEW_FIXED_MAX {
@@ -3034,6 +3046,7 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       }
     }
     pendingLitUnion = savedArrLU
+    pendingNulBool = savedArrNB
     if dstI32 >= 0 {
       fbLocalGet(dstI32)
       wU8(212) // 0xd4 ref.as_non_null — the chunk-built raw backing
@@ -6823,6 +6836,14 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         const xluCtx = expCtxHere()
         xluCtx.litUnion = 1
         if emitExprExpect(body, a.binRight, fnIx, xluCtx) < 0 { return -1 }
+      } else if nodeArrayElemIsNulBool(target.idxArr) {
+        // `p[i] = null` over a `(boolean | null)[]`: the i32 cell holds 0/1 or the
+        // sentinel 2 — seed `pendingNulBool` (via the ctx) so a `null` RHS emits 2 (a
+        // boolean RHS is a `BoolLit`, untouched). The list analogue of the scalar niche
+        // assignment above.
+        const nbCtx = expCtxHere()
+        nbCtx.nulBool = true
+        if emitExprExpect(body, a.binRight, fnIx, nbCtx) < 0 { return -1 }
       } else {
         if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
       }
@@ -7007,6 +7028,9 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
       // A LITERAL-UNION array push (`xs.push("a")` over `xs: K[]`) rides the i32-list spine, but the
       // pushed member literal must lower as its atom id — seed `pendingLitUnion` for the value emit.
       const isLitArr = nodeArrayElemIsLitUnion(callee.memObj)
+      // A `(boolean | null)[]` push (`p.push(null)`) also rides the i32-list spine, but a `null`
+      // value must lower as the sentinel 2 — seed `pendingNulBool` for the value emit.
+      const isNbArr = nodeArrayElemIsNulBool(callee.memObj)
       if (
         !isRef &&
         !isStr &&
@@ -7161,6 +7185,10 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
           const pluCtx = expCtxHere()
           pluCtx.litUnion = 1
           if emitExprExpect(body, c.callArgs[0], fnIx, pluCtx) < 0 { return -1 }
+        } else if isNbArr {
+          const pnbCtx = expCtxHere()
+          pnbCtx.nulBool = true
+          if emitExprExpect(body, c.callArgs[0], fnIx, pnbCtx) < 0 { return -1 }
         } else {
           if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
         }
