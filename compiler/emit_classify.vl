@@ -3766,6 +3766,14 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
       }
     } else {
       if exprIsClosure(n.callFn, fnIx) { isVal = true }
+      // `p[0]()` where `p` is a union with a CLOSURE-ARRAY arm (`(() => f64)[] | i64`): the
+      // `is`-narrowing that makes `p` a closure array is NOT active during this frame pre-pass,
+      // so `exprIsClosure(p[0])` (which needs the narrowing to see `p` as a ref array) is false —
+      // reserve `callRefSlot` conservatively so the narrowed emit's `call_ref` has its scratch
+      // local (an unused reservation is a harmless spare local, never invalid wasm).
+      if !isVal && calleeIsUnionClosureArrayIndex(n.callFn, fnIx) {
+        isVal = true
+      }
     }
     if isVal { return true }
     if blockHasCallRef(n.callFn, fnIx) { return true }
@@ -7922,6 +7930,24 @@ export function scalarTagOf(atom: string) {
   uVariants.length + valueAtomKind(atom)
 }
 
+// The globally-stable tag of the REF-ELEMENT-ARRAY arm whose interned reflist slot is `slot`.
+// Value-atom tags fill the fixed band `uVariants.length + 0..11` (the `valueAtomKind` codes —
+// scalar/string/null/scalar-list/closure), so ref-array arms claim the band ABOVE it,
+// `uVariants.length + 12 + slot`. A distinct element type interns a distinct reflist slot
+// (`rlSlotByName`), so it gets a distinct, deterministic tag that stays stable across every
+// sub-union (mirroring `scalarTagOf`'s cross-union stability). The `+ 12` clears the fixed
+// value-atom band (max `valueAtomKind` code 11).
+export function refArrSlotTag(slot: i32) { uVariants.length + 12 + slot }
+
+// The tag of a ref-element-array union ARM by its type NAME (`S[]`, `(() => f64)[]`,
+// `(C | D)[]`), or -1 when the arm's reflist slot was never interned (a mis-registered
+// union — a loud caller failure, never a silent wrong tag).
+export function refArrTagOf(atom: string) {
+  const slot = rlSlotByName(refArrElemName(atom))
+  if slot < 0 { return -1 }
+  refArrSlotTag(slot)
+}
+
 // The interned VALUE-BOX heap-type index for a scalar atom (`boolean` shares the
 // i32 box — same wasm rep), or -1 for `string`/`null` (no inner box: a string ref
 // is already an `anyref` subtype; a null payload is `ref.null`).
@@ -7989,6 +8015,87 @@ export function markValueUnionAtoms(name: string) {
     i = i + 1
   }
   0
+}
+
+// Intern the reflist wrapper slot for every REF-ELEMENT-ARRAY arm of the union `name` (`S[]`,
+// `(() => f64)[]`, `(C | D)[]`) — its box payload rides that wrapper ref, and `refArrTagOf`
+// needs the slot to exist. The ref-array analogue of `markValueUnionAtoms` (which marks the
+// scalar arms' value-box reps). `internShapeDeep` first interns any INLINE-shape element struct
+// (`{a: f32}[]`) so `refArrElemName`/`ensureRefElem` resolve it; then `ensureRefElem` interns
+// the element's reflist slot (recursively for a nested `S[][]`). Gated on a NON-value array atom
+// (`valueAtomKind < 0`), so scalar-element lists (`i32[]`, kinds 7-10 — `markValueUnionAtoms`
+// owns those) are skipped. A no-op for a union with no ref-array arm; called from BOTH the inline
+// and named registration paths so the two spellings intern identically.
+export function markRefArrayArms(name: string) {
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let i = 0
+  while i < atoms.length {
+    const a = atoms[i]
+    if a != "null" && valueAtomKind(a) < 0 && nameIsArray(a) {
+      internShapeDeep(a)
+      const elem = refArrElemName(a)
+      if elem != "" {
+        ensureRefElem(elem)
+        // Force the ref-list flags so the backing/wrapper heaps emit and the index/`.length`
+        // machinery is enabled — a ref-array mentioned ONLY as a union arm (`S[] | {w:i32}`)
+        // otherwise leaves `raUsed`/`rlUsed` false and the narrowed `x[i]` read fails "ref array
+        // type not collected". The union-arm analogue of the array-literal / ref-array-local flips.
+        rlUsed = true
+        raUsed = true
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// True if the union member-set `name` has a CLOSURE-ARRAY arm (`(() => f64)[]`). `p[0]()` on
+// such a union (narrowed to the closure array) is a `call_ref`, so the frame pre-pass reserves
+// `callRefSlot` for it — see `blockHasCallRef`. Resolves an alias to its member set first.
+export function unionHasClosureArrayArm(name: string) {
+  let nm = unionMemberSetOf(name)
+  if nm == "" { nm = name }
+  const atoms: string[] = []
+  splitUnionAtoms(nm, atoms)
+  let i = 0
+  while i < atoms.length {
+    if nameIsClosureArray(atoms[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True if `exprIx` is `p[0]` where `p` is a union IDENT whose union has a closure-array arm —
+// the callee shape `blockHasCallRef` reserves `callRefSlot` for (the narrowing-blind pre-pass).
+export function calleeIsUnionClosureArrayIndex(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Index {
+    const arr = P.nodes[unwrapParen(e.idxArr)]
+    if arr is Ident {
+      const un = unionNameOfIdent(arr.identName, fnIx)
+      if un != "" { return unionHasClosureArrayArm(un) }
+    }
+  }
+  false
+}
+
+// True if the union member-set `name` (pipe-joined atoms) has a REF-ELEMENT array arm whose
+// interned reflist slot is `slot` — the guard `emitUnionCoerce` uses to confirm a ref-array
+// carrier actually matches an arm before boxing it with that arm's `refArrSlotTag`. A ref-array
+// expr whose slot matches no arm falls through (a checker-impossible case) rather than mis-tag.
+export function unionHasRefArrayArmSlot(name: string, slot: i32) {
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let i = 0
+  while i < atoms.length {
+    const a = atoms[i]
+    if a != "null" && valueAtomKind(a) < 0 && nameIsRefArray(a) {
+      if rlSlotByName(refArrElemName(a)) == slot { return true }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // The inferred `T|null` union name of the null-init `LetDecl` at `letIx`, or "".
@@ -9104,6 +9211,20 @@ export function narrowedValueAtomOf(name: string) {
   ""
 }
 
+// The REF-ELEMENT-ARRAY arm a union binding `name` is currently narrowed to (`if x is S[]`
+// → `S[]`, `if x is (() => f64)[]` → `(() => f64)[]`), or "" when it is not narrowed to a
+// ref array (un-narrowed / a scalar atom / a struct variant / `null` / a sub-union). The
+// ref-array analogue of `narrowedValueAtomOf`: a non-"" answer means an ident READ recovers
+// the reflist WRAPPER ref from the box (`ref.cast` of the anyref payload) so indexing /
+// `.length` see the list directly.
+export function narrowedRefArrayOf(name: string) {
+  const v = narrowVariantFor(name)
+  if v == "" { return "" }
+  if valueAtomKind(v) >= 0 { return "" }
+  if nameIsRefArray(v) { return v }
+  ""
+}
+
 // The atom KIND an IDENT expression currently reads as, for the scalar/string
 // classifiers (`exprString`/`exprIsBool`/`exprIsI64`/`exprIsF64`/`exprIsF32`):
 // `valueAtomKind` codes when the ident is a union binding narrowed to ONE scalar
@@ -9410,6 +9531,10 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
     return false
   }
   if e is Ident {
+    // A union binding NARROWED to a ref-element array arm (`if x is S[]` then `x[i]` / `x.length`):
+    // its box unboxes to the reflist wrapper, so it IS a ref array in the narrowed branch. Checked
+    // FIRST — the binding's DECLARED type is a union, so the param/local/global tests below miss it.
+    if narrowedRefArrayOf(e.identName) != "" { return true }
     // A kind-18 NULLABLE ref-array local is a ref array too (narrowed `if t != null`) — so indexing /
     // `.length` reuse the ref-array machinery; the index emit recovers non-null for the niche receiver.
     if declaredKind(e.identName) == "nulreflist" { return true }
@@ -9542,6 +9667,10 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     return ""
   }
   if e is Ident {
+    // A union binding NARROWED to a ref-element array arm (`if x is S[]` then `x[i]`): its element
+    // name is the arm's, so `refListSlotOfExpr` resolves the wrapper the narrowed read casts to.
+    const raN = narrowedRefArrayOf(e.identName)
+    if raN != "" { return refArrElemName(raN) }
     // A kind-18 nullable ref-array local stores its INNER ref-list slot in `localStructIdx`; its element
     // name is that inner slot's element name, so `refListSlotOfExpr` round-trips back to the inner slot.
     if declaredKind(e.identName) == "nulreflist" {
@@ -9603,6 +9732,10 @@ export function letIsRefArray(letIx: i32, fnIx: i32) {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
+        // A UNION annotation (even `S[] | i64`, a union WITH a ref-array member) is a union-BOX
+        // local, NOT a reflist local — the init coerces into the box. Return false so a ref-array
+        // INIT below does not mis-pick the reflist valtype (an invalid boxed-store otherwise).
+        if isUName(lt.tyName) { return false }
         if nameIsRefArray(lt.tyName) { return true }
       }
     }
