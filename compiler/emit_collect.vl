@@ -69,6 +69,7 @@ import {
   nameIsI64Array,
   nameIsMap,
   nameIsMapArray,
+  nameIsMapMemberUnion,
   nameIsNulI32List,
   nameIsNulString,
   nameIsString,
@@ -298,6 +299,7 @@ import {
   listOpKindOfBin,
   mapShapeOfExpr,
   markLoopVarSlot,
+  markMapUnionArms,
   markRefArrayArms,
   markValueUnionAtoms,
   mfCallbackFe,
@@ -2113,6 +2115,10 @@ export function collectA(_stmts: i32[]) {
     // the AUTHORITATIVE ref-array-arm interning: `collectU`'s registration-time call is wiped
     // by these same resets, so the box payload's wrapper heap comes from here.
     markRefArrayArms(unMemberSet[umk])
+    // The AUTHORITATIVE map-arm re-intern (`{[string]: string} | f64`): the mv tables were just
+    // cleared, so re-intern each map arm's value slot here — its per-value map struct heap comes
+    // from this pass (before `mAssignTypeIndices`), the map twin of the ref-array re-mark above.
+    markMapUnionArms(unMemberSet[umk])
     umk = umk + 1
   }
   let i = 0
@@ -2249,7 +2255,7 @@ export function collectA(_stmts: i32[]) {
         } else if nameIsString(frRet) {
           aUsed = true
         }
-      } else if nameIsMap(nd.tyName) {
+      } else if nameIsMap(nd.tyName) && !nameIsMapMemberUnion(nd.tyName) {
         // A `{[string]: i32}` annotation (G8) is a string-keyed map: the map struct
         // + the keys list (string-ref backing) + the i32 VALS list (the existing
         // `lTypeIdx`/`aTypeIdx`). So it forces `aUsed` (string backing + vals backing)
@@ -2921,14 +2927,14 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // its variant slice is empty. Registering interns the shared box (`uDeclared`)
   // and the per-rep value boxes it needs.
   if isValueUnionName(name) { return registerValueUnionName(name) }
-  // A MAP member of a 2+-member union (`{[string]:i32}|boolean`) has no union rep: it is
-  // neither a struct variant (a map shape carries no field set) nor a value atom, so the
-  // union silently failed to REGISTER — every deeper seam (a list element, a return) then
-  // mis-tagged its box and every `is` missed, a SILENT wrong result. Fail loudly at
-  // registration, and BEFORE the map-value recursion below: `nameIsMap` prefix-matches a
-  // union whose FIRST member is a map, and `mapValNameOf` would swallow the name as a
-  // garbled map-value recursion. A map-VALUED union (`{[string]: C | S}`) splits to one
-  // atom (the `|` sits inside the braces), so it passes through to that recursion.
+  // A MAP member of a 2+-member union (`{[string]: string} | f64`) rides the variant box like a
+  // ref-array arm: its map STRUCT ref sits on the box anyref, tagged by `mapSlotTag`. Register it
+  // through the `isVariantBoxUnion` path below and return EARLY — a map-FIRST union name matches
+  // `nameIsMap` (it starts `{[`), so the map-value recursion further down would otherwise swallow
+  // the whole union name as a garbled map value. A map alongside an UNSUPPORTED neighbour (one
+  // `isVariantBoxUnion` still rejects) stays a LOUD fail rather than a silent mis-tagged box. A
+  // map-VALUED union (`{[string]: C | S}`) splits to one atom (the `|` sits inside the braces), so
+  // `matoms.length < 2` and it passes through to the value recursion untouched.
   const matoms: string[] = []
   splitUnionAtoms(name, matoms)
   if matoms.length >= 2 {
@@ -2943,13 +2949,18 @@ function registerInlineUnion(stmts: i32[], name: string) {
       }
       mk = mk + 1
     }
-    // A single map + `null` is exempt: `{[string]:i32}|null` is the NULLABLE map, owned
-    // by the nullable machinery (not a box union) — only a map alongside another non-null
-    // member is the unregisterable shape.
+    // A single map + `null` is exempt: `{[string]:i32}|null` is the NULLABLE map, owned by the
+    // nullable machinery (not a box union). Only a map alongside another non-null member is the
+    // box-union shape handled here.
     if mHasMap && mNonNull >= 2 {
-      return emitFail(
-        "emitProgram: a map union member is not supported — use a struct member instead",
-      )
+      // Supported ⇒ fall through to the `isVariantBoxUnion` registration below (the `nameIsMap`
+      // value-recursion is skipped via its `matoms.length < 2` guard, so this map-FIRST union
+      // name is not mis-parsed). Unsupported neighbour ⇒ a LOUD fail, never a silent mis-tag.
+      if !isVariantBoxUnion(stmts, name) {
+        return emitFail(
+          "emitProgram: a map union member is not supported — use a struct member instead",
+        )
+      }
     }
   }
   // A union used ONLY as a COLLECTION element / value (`(C | S)[]`, `{[string]: C | S}`)
@@ -2970,7 +2981,11 @@ function registerInlineUnion(stmts: i32[], name: string) {
     const inner = name.slice(0, name.length - 2)
     if nameIsArray(inner) { return registerInlineUnion(stmts, inner) }
   }
-  if nameIsMap(name) {
+  // A bare MAP annotation with a union VALUE (`{[string]: C | S}`) registers that inner value union;
+  // the `matoms.length < 2` guard restricts this to a bare map (one top-level atom) so a map-
+  // MEMBER union (`{[string]: i32} | boolean`, which also matches `nameIsMap` — it starts `{[`) is
+  // NOT mis-parsed as a map value but instead falls through to the `isVariantBoxUnion` box path.
+  if nameIsMap(name) && matoms.length < 2 {
     const mvn = mapValNameOf(name)
     if mvn != "" { return registerInlineUnion(stmts, mvn) }
   }
@@ -3031,6 +3046,10 @@ function registerInlineUnion(stmts: i32[], name: string) {
   // marking. `collectA` re-interns the reflist slot after its resets; this early call ensures
   // the element STRUCT is in `sNames` before heap assignment. (No-op with no ref-array arm.)
   markRefArrayArms(name)
+  // A MAP arm (`{[string]: string} | f64`) interns its value shape + forces the shared map heap
+  // flags — the map twin of the ref-array marking. `collectA` re-interns after its mv-table reset;
+  // this early call keeps the inline + named spellings identical. (No-op with no map arm.)
+  markMapUnionArms(name)
   0
 }
 
@@ -3272,6 +3291,9 @@ export function collectU(stmts: i32[]) {
       // A REF-ARRAY arm of a NAMED union (`type U = S[] | i64`) interns its element shape +
       // reflist slot, the same as the inline path — so the two spellings register identically.
       markRefArrayArms(udSet)
+      // A MAP arm of a NAMED union (`type U = {[string]: string} | f64`) interns its value shape,
+      // matching the inline path.
+      markMapUnionArms(udSet)
     }
     i = i + 1
   }
