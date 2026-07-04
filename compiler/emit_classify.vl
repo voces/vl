@@ -100,6 +100,7 @@ import {
   nameIsLitUnionArray,
   nameIsMap,
   nameIsMapArray,
+  nameIsMapMemberUnion,
   nameIsNulBool,
   nameIsNulClosure,
   nameIsNulI32List,
@@ -1434,7 +1435,7 @@ function retIsMapLocalAnnot(rx: i32, fnIx: i32) {
           if d.letType >= 0 {
             const lt = P.nodes[d.letType]
             if lt is TypeRef {
-              if nameIsMap(lt.tyName) {
+              if nameIsMap(lt.tyName) && !nameIsMapMemberUnion(lt.tyName) {
                 // A supported map value type — the same classifier `retMapFlag` gates the
                 // boundary with (`mvValKindOfName`); the return's SHAPE is recovered at the
                 // functype-result site via `mapShapeOfExpr` over this same local.
@@ -6711,7 +6712,9 @@ export function fieldTypeCode(tyIx: i32) {
     // `collectA`'s arena TypeRef scan (this same annotation node), so emission
     // re-finds it by the value name (`fieldRefElemName`). A NULLABLE map field
     // (`{[…]}|null`) stays unsupported (falls through to -1).
-    if nameIsMap(ty.tyName) { return 19 }
+    // A map-MEMBER union field (`{[string]: string} | string`) starts with `{[` too, but it is a
+    // union BOX field (code 16), not a map — `!nameIsMapMemberUnion` lets it fall to the union test.
+    if nameIsMap(ty.tyName) && !nameIsMapMemberUnion(ty.tyName) { return 19 }
     // A `string | null` niche field — `(ref null $aTypeIdx)`, code 20. Checked before
     // the value-union test (it is NOT a value union — a single ref + null is a niche).
     if nameIsNulString(ty.tyName) { return 20 }
@@ -7932,12 +7935,13 @@ export function scalarTagOf(atom: string) {
 
 // The globally-stable tag of the REF-ELEMENT-ARRAY arm whose interned reflist slot is `slot`.
 // Value-atom tags fill the fixed band `uVariants.length + 0..11` (the `valueAtomKind` codes —
-// scalar/string/null/scalar-list/closure), so ref-array arms claim the band ABOVE it,
-// `uVariants.length + 12 + slot`. A distinct element type interns a distinct reflist slot
-// (`rlSlotByName`), so it gets a distinct, deterministic tag that stays stable across every
-// sub-union (mirroring `scalarTagOf`'s cross-union stability). The `+ 12` clears the fixed
-// value-atom band (max `valueAtomKind` code 11).
-export function refArrSlotTag(slot: i32) { uVariants.length + 12 + slot }
+// scalar/string/null/scalar-list/closure), so ref-array arms claim the band ABOVE it. Ref-array
+// and MAP arms can coexist in one union (`S[] | {[string]: i32}`) with INDEPENDENT intern-slot
+// tables, so the two bands interleave by PARITY to stay collision-free: ref-arrays take the EVEN
+// offsets `uVariants.length + 12 + 2*slot`, maps the ODD offsets (`mapSlotTag`). A distinct element
+// type interns a distinct reflist slot (`rlSlotByName`), so it gets a distinct, deterministic tag
+// stable across every sub-union (mirroring `scalarTagOf`). The `+ 12` clears the value-atom band.
+export function refArrSlotTag(slot: i32) { uVariants.length + 12 + slot * 2 }
 
 // The tag of a ref-element-array union ARM by its type NAME (`S[]`, `(() => f64)[]`,
 // `(C | D)[]`), or -1 when the arm's reflist slot was never interned (a mis-registered
@@ -7946,6 +7950,23 @@ export function refArrTagOf(atom: string) {
   const slot = rlSlotByName(refArrElemName(atom))
   if slot < 0 { return -1 }
   refArrSlotTag(slot)
+}
+
+// The globally-stable tag of the MAP arm whose interned map value-slot is `slot` (the mono i32 /
+// atom map rides slot `-1`, its shared `$mStructIdx`). Maps claim the ODD offsets of the band above
+// the value-atom band — `uVariants.length + 15 + 2*slot` — interleaved with the ref-array EVEN band
+// (`refArrSlotTag`) so a union carrying BOTH a ref-array and a map arm never collides. The `slot+1`
+// shift (folded into `15 = 12 + 3`) maps the mono `-1` slot to the first odd offset (`+13`), typed
+// value slots to `+15`, `+17`, … A distinct map VALUE type interns a distinct mv slot
+// (`mvShapeOfValName`), so it gets a distinct, deterministic, sub-union-stable tag.
+export function mapSlotTag(slot: i32) { uVariants.length + 15 + slot * 2 }
+
+// The tag of a map union ARM by its type NAME (`{[string]: string}`, `{[string]: i32}`), keyed on
+// its map VALUE's interned mv slot (`-1` for a mono/atom value). Non-failing: an un-interned value
+// resolves to the mono slot, so a map arm the union failed to register would tag as the mono map
+// rather than trap — a mis-registration is a loud caller failure at boxing/`is` time, not here.
+export function mapTagOf(atom: string) {
+  mapSlotTag(mvSlotOfMapValNameOrMono(mapValNameOf(atom)))
 }
 
 // The interned VALUE-BOX heap-type index for a scalar atom (`boolean` shares the
@@ -8048,6 +8069,79 @@ export function markRefArrayArms(name: string) {
     i = i + 1
   }
   0
+}
+
+// Intern the map value-slot for every MAP arm of the union `name` (`{[string]: string}`,
+// `{[string]: () => boolean}`) — its box payload rides that arm's map STRUCT ref, and `mapTagOf`
+// needs the slot to exist. The map analogue of `markRefArrayArms` / `markValueUnionAtoms`. Forces
+// the shared map heap flags (`mUsed`/`lUsed`/`aUsed` — the mono `$mStructIdx` + its key/val lists)
+// and interns the arm's VALUE shape via `mvShapeOfValName` (recursively, for a typed/ref/closure
+// value), exactly the `ensureRefElem` kind-3 (map element) path. A mono/atom value interns no slot
+// (rides `-1`); a typed value gets a distinct mv slot → a distinct `mapSlotTag`. A no-op for a union
+// with no map arm; called from BOTH the inline and named registration paths so the two spellings
+// intern identically. Runs in `collectA` too (the AUTHORITATIVE re-intern after the mv-table reset).
+export function markMapUnionArms(name: string) {
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let i = 0
+  while i < atoms.length {
+    const a = atoms[i]
+    if a != "null" && nameIsMap(a) {
+      mUsed = true
+      lUsed = true
+      aUsed = true
+      mvShapeOfValName(mapValNameOf(a))
+    }
+    i = i + 1
+  }
+  0
+}
+
+// True if the union member-set `name` has a MAP arm whose interned map value-slot is `slot` — the
+// guard `emitUnionCoerce` uses to confirm a map carrier actually matches an arm before boxing it
+// with that arm's `mapSlotTag`. A map expr whose value-slot matches no arm falls through (a
+// checker-impossible case) rather than mis-tag. The map twin of `unionHasRefArrayArmSlot`.
+export function unionHasMapArmSlot(name: string, slot: i32) {
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  let i = 0
+  while i < atoms.length {
+    const a = atoms[i]
+    if a != "null" && nameIsMap(a) {
+      if mvSlotOfMapValNameOrMono(mapValNameOf(a)) == slot { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True if the union member-set `name` has a MAP arm (`{[string]: V}`). Resolves an alias to its
+// member set first. Used by the frame pre-pass (`exprHasMapOp` → `unionMapArmIdent`) to reserve the
+// map scratch frame for a `t[k]` on a union binding narrowed to its map arm — the narrowing is not
+// active in that pass, so the map op must be spotted from the binding's DECLARED union.
+export function unionHasMapArm(name: string) {
+  let nm = unionMemberSetOf(name)
+  if nm == "" { nm = name }
+  const atoms: string[] = []
+  splitUnionAtoms(nm, atoms)
+  let i = 0
+  while i < atoms.length {
+    if nameIsMap(atoms[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True if `exprIx` is an IDENT whose DECLARED union has a map arm — the receiver shape the frame
+// pre-pass reserves the map scratch for (`t[k]` / `t[k] ?? d` / `t.has(k)` on a union narrowed to
+// a map). Narrowing-blind: reads the binding's declared union, not the active narrowing.
+export function unionMapArmIdent(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    const un = unionNameOfIdent(e.identName, fnIx)
+    if un != "" { return unionHasMapArm(un) }
+  }
+  false
 }
 
 // True if the union member-set `name` has a CLOSURE-ARRAY arm (`(() => f64)[]`). `p[0]()` on
@@ -9225,6 +9319,19 @@ export function narrowedRefArrayOf(name: string) {
   ""
 }
 
+// The MAP arm a union binding `name` is currently narrowed to (`if x is {[string]: string}` →
+// `{[string]: string}`), or "" when it is not narrowed to a map (un-narrowed / a scalar atom /
+// a struct variant / a ref array / `null` / a sub-union). The map analogue of `narrowedRefArrayOf`:
+// a non-"" answer means an ident READ recovers the MAP STRUCT ref from the box (`ref.cast` of the
+// anyref payload) so `x[k]` / `x[k] ?? d` / `x.has(k)` route through the map lowering directly.
+export function narrowedMapOf(name: string) {
+  const v = narrowVariantFor(name)
+  if v == "" { return "" }
+  if valueAtomKind(v) >= 0 { return "" }
+  if nameIsMap(v) { return v }
+  ""
+}
+
 // The atom KIND an IDENT expression currently reads as, for the scalar/string
 // classifiers (`exprString`/`exprIsBool`/`exprIsI64`/`exprIsF64`/`exprIsF32`):
 // `valueAtomKind` codes when the ident is a union binding narrowed to ONE scalar
@@ -10335,6 +10442,10 @@ export function exprMap(exprIx: i32, fnIx: i32) {
     return false
   }
   if e is Ident {
+    // A union binding NARROWED to a MAP arm (`if x is {[string]: string}` then `x[k]`): its box
+    // unboxes to the map struct ref, so it IS a map in the narrowed branch. Checked FIRST — the
+    // binding's DECLARED type is a union, so `paramMap`/`declaredMap`/`globalIsMap` below miss it.
+    if narrowedMapOf(e.identName) != "" { return true }
     if paramMap(fnIx, e.identName) { return true }
     if declaredMap(e.identName) { return true }
     return globalIsMap(e.identName)
@@ -10399,6 +10510,10 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
   if e is Index {
     // Map GET `recv[k]`.
     if exprMap(e.idxArr, fnIx) { return true }
+    // A union binding with a MAP arm indexed `t[k]`: the `is`-narrowing that makes `t` a map is
+    // not active in this frame pre-pass, so `exprMap` misses it — spot the union-with-map-arm ident
+    // directly so the map scratch frame is reserved (an unused reservation is a harmless spare).
+    if unionMapArmIdent(e.idxArr, fnIx) { return true }
     if exprHasMapOp(e.idxArr, fnIx) { return true }
     return exprHasMapOp(e.idxIndex, fnIx)
   }
@@ -10408,6 +10523,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
       const lhs = P.nodes[e.binLeft]
       if lhs is Index {
         if exprMap(lhs.idxArr, fnIx) { return true }
+        if unionMapArmIdent(lhs.idxArr, fnIx) { return true }
       }
       if lhs is Call {
         const lcallee = P.nodes[lhs.callFn]
@@ -10423,6 +10539,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
       const target = P.nodes[e.binLeft]
       if target is Index {
         if exprMap(target.idxArr, fnIx) { return true }
+        if unionMapArmIdent(target.idxArr, fnIx) { return true }
       }
     }
     if exprHasMapOp(e.binLeft, fnIx) { return true }
@@ -10436,12 +10553,15 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
     if callee is Member {
       if callee.memProp == "has" {
         if exprMap(callee.memObj, fnIx) { return true }
+        if unionMapArmIdent(callee.memObj, fnIx) { return true }
       }
       if callee.memProp == "delete" {
         if exprMap(callee.memObj, fnIx) { return true }
+        if unionMapArmIdent(callee.memObj, fnIx) { return true }
       }
       if callee.memProp == "keys" || callee.memProp == "values" {
         if exprMap(callee.memObj, fnIx) { return true }
+        if unionMapArmIdent(callee.memObj, fnIx) { return true }
       }
     }
     if exprHasMapOp(e.callFn, fnIx) { return true }
@@ -10555,7 +10675,13 @@ export function letIsMap(letIx: i32, fnIx: i32) {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
-        if nameIsMap(lt.tyName) { return true }
+        // A UNION annotation whose FIRST atom is a map (`{[string]: string} | f64`) has a name that
+        // STARTS with `{[`, so `nameIsMap` matches the whole union name — but it is a union BOX local,
+        // NOT a map (the map arm boxes into the union). A bare map has ONE top-level atom; a union has
+        // 2+. Gate so the union rides its box, and the map arm's read narrows through the union.
+        if nameIsMap(lt.tyName) && !nameIsMapMemberUnion(lt.tyName) {
+          return true
+        }
       }
     }
     return exprMap(d.letInit, fnIx)
@@ -10574,7 +10700,9 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
-        if nameIsMap(lt.tyName) {
+        // A map-member UNION annotation is NOT a bare map (see `letIsMap`) — skip it so the union
+        // box, not a garbled map value shape, is picked.
+        if nameIsMap(lt.tyName) && !nameIsMapMemberUnion(lt.tyName) {
           return mvShapeOfValName(mapValNameOf(lt.tyName))
         }
       }
@@ -10607,6 +10735,12 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     return -1
   }
   if e is Ident {
+    // A union binding NARROWED to a MAP arm resolves its shape from the arm's VALUE type (mono ⇒
+    // -1, or a typed value's mv slot) — the map ops in the narrowed branch read that value type,
+    // not the mono i32 assumption a bare -1 would force. Checked FIRST (the declared type is a
+    // union, so `declaredMap`/`paramMap`/global below miss it), mirroring `exprMap`.
+    const nm = narrowedMapOf(e.identName)
+    if nm != "" { return mvSlotOfMapValNameOrMono(mapValNameOf(nm)) }
     if declaredMap(e.identName) {
       const slot = declaredSlotOf(e.identName)
       if slot >= 0 { return localStructIdx[slot] }
@@ -10674,7 +10808,7 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
 // (`i32` / `boolean` / literal-union atom — never interned, rides `$mStructIdx`). A
 // non-failing find (unlike `mvSlotOfValNameFind`, which fails loudly on the mono miss)
 // for the composition read resolvers.
-function mvSlotOfMapValNameOrMono(iv: string): i32 {
+export function mvSlotOfMapValNameOrMono(iv: string): i32 {
   if mvValKindOfName(iv) == -1 { return -1 }
   let i = 0
   while i < mvValName.length {

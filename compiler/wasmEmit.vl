@@ -111,7 +111,9 @@ import {
   inferNicheNullByName,
   isLitVariantName,
   loopStackFind,
+  mapValNameOf,
   memberPathKeyOf,
+  nameIsMap,
   nulCloFlag,
   nullablePartOf,
   numLexIsDecimal,
@@ -423,6 +425,8 @@ import {
   localIndexOf,
   mapIsSetExpr,
   mapShapeOfExpr,
+  mapSlotTag,
+  mapTagOf,
   memIsNarrowed,
   memNarrowVariantIndex,
   memberUnionFieldName,
@@ -434,9 +438,11 @@ import {
   mfResultSlotOf,
   mfSrcLocalFor,
   mvListValKind,
+  mvSlotOfMapValNameOrMono,
   mvSlotOfValNameFind,
   nameIsRefArray,
   narrowVariantFor,
+  narrowedMapOf,
   narrowedRefArrayOf,
   narrowedValueAtomOf,
   nliNameOf,
@@ -484,6 +490,7 @@ import {
   tyAnnRefListKind,
   tyAnnRefListSlot,
   unionEqAtomOf,
+  unionHasMapArmSlot,
   unionHasRefArrayArmSlot,
   unionMemberSetOf,
   unionNameOfExpr,
@@ -1319,6 +1326,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
     // ref-array arm) falls through to the struct-variant / literal paths.
     let armTag = -1
     if valueAtomKind(isAtom) >= 0 { armTag = scalarTagOf(isAtom) }
+    else if nameIsMap(isAtom) { armTag = mapTagOf(isAtom) }
     else if nameIsRefArray(isAtom) { armTag = refArrTagOf(isAtom) }
     if armTag >= 0 {
       // A union-typed IDENT receiver pushes its RAW box slot directly — even
@@ -1728,6 +1736,24 @@ function emitRefArrayUnionUnboxRead(
   0
 }
 
+// Recover the MAP STRUCT ref a union binding narrowed to a MAP arm holds (`if x is {[string]: V}`
+// then `x[k]` / `x[k] ?? d` / `x.has(k)`): push the box, read its `anyref` value (field 1),
+// `ref.cast` it to the arm's per-value map struct heap (`mapTypeIdxOf`, the mono `$mStructIdx` for
+// an i32/atom value). The map analogue of `emitRefArrayUnionUnboxRead` — the result is the same
+// `(ref $mapStruct)` a bare map binding pushes, which `emitMapPrep` stores into `mapRef`.
+function emitMapUnionUnboxRead(
+  body: i32[],
+  name: string,
+  atom: string,
+  fnIx: i32,
+) {
+  if emitUnionBoxPush(body, name, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
+  const slot = mvSlotOfMapValNameOrMono(mapValNameOf(atom))
+  fbRefCast(mapTypeIdxOf(slot)) // the payload IS the map struct ref
+  0
+}
+
 // Lower the expression at `exprIx` COERCED into the boxed union `unionName`'s
 // representation (the host's `coerceToUnion` at a flow boundary — a binding init,
 // an assignment, an argument, a return). Pass-through when the value already IS
@@ -1770,10 +1796,26 @@ export function emitUnionCoerce(
   // arm boxes as a variant struct, a scalar arm as a value box.
   if bare is ObjLit { return emitExpr(body, exprIx, fnIx) }
   if exprStruct(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
-  // A MAP value has no union-member rep (`({[string]: i32} | boolean)[] = [h]`): the
-  // depth-1 binding already rejects, but the deeper seams (a list element, a return)
-  // reached the atom ladder, defaulted the tag, and every later `is` silently missed —
-  // a SILENT wrong result. Fail loudly at the seam instead.
+  // A MAP carrier (`{[string]: string}`, `{[string]: i32}`) flowing into a union with a matching
+  // map arm: the map STRUCT ref rides the box anyref directly (like a reflist wrapper), tagged by
+  // its interned value-slot (`mapSlotTag`). Checked BEFORE the value-atom gate below — such a union
+  // may have NO value atom (`{[string]:string} | {w:i32}`), so that gate would bail and emit the RAW
+  // map ref where a `(ref $uBox)` is expected. The slot match guards a map whose value is not an arm.
+  if unionName != "" && exprMap(exprIx, fnIx) {
+    let mSlot = mapShapeOfExpr(exprIx, fnIx)
+    if mSlot == -2 {
+      mSlot = -1 // a Set rides the mono map slot
+    }
+    if mSlot >= -1 && unionHasMapArmSlot(unionName, mSlot) {
+      fbI32Const(mapSlotTag(mSlot))
+      if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+      fbStructNew(uBoxIdx) // { tag, map-struct ref }
+      return 0
+    }
+  }
+  // A MAP carrier the union does NOT box (a checker-impossible slot mismatch, or an unsupported map
+  // VALUE type `mapShapeOfExpr` returns -3 for): fail loudly rather than default the tag and let
+  // every later `is` silently miss — a SILENT wrong result. The pre-fix behaviour for ALL map arms.
   if exprMap(exprIx, fnIx) {
     return emitFail(
       "emitProgram: a map value is not a supported union member — use a struct member instead",
@@ -9652,6 +9694,15 @@ function emitIdentNode(body: i32[], e: Ident, _exprIx: i32, fnIx: i32) {
   if raNm != "" {
     if unionNameOfIdent(e.identName, fnIx) != "" {
       return emitRefArrayUnionUnboxRead(body, e.identName, raNm, fnIx)
+    }
+  }
+  // A union binding narrowed to a MAP arm reads UNBOXED to the map struct ref (`if x is {[string]:
+  // V} { x[k] }`): push the box, recover the anyref payload, `ref.cast` to the arm's map struct —
+  // the map analogue of the ref-array unbox above, so `emitMapPrep` sees the map ref directly.
+  const mNm = narrowedMapOf(e.identName)
+  if mNm != "" {
+    if unionNameOfIdent(e.identName, fnIx) != "" {
+      return emitMapUnionUnboxRead(body, e.identName, mNm, fnIx)
     }
   }
   // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
