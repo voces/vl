@@ -17,6 +17,7 @@ import {
   REP_SCAL_F32,
   REP_SCAL_F64,
   REP_SCAL_I64,
+  repKindOfSigTok,
   repNodeScalarMask,
   repReset,
 } from "./emit_rep"
@@ -2193,6 +2194,93 @@ function helpValtype(c: i32) {
   0
 }
 
+// Read a `;`-terminated decimal index following a ref `$fnsig` token (`s3;`, `r0;`),
+// starting at `i` (the first digit). Returns the parsed index; `outNext` receives the
+// position just past the `;`. The token scheme (`repSigTokOfKind`/`repKindOfSigTok`)
+// terminates every index-carrying ref token with `;`, so the loop is bounded.
+function synthSigIdxAt(key: string, i: i32, outNext: i32[]) {
+  let idx = 0
+  let j = i
+  while j < key.length && key[j] != ';' {
+    idx = idx * 10 + (key[j] - '0')
+    j = j + 1
+  }
+  outNext.push(j + 1) // skip the ';'
+  idx
+}
+
+// True if a `$fnsig` token char carries a `;`-terminated index (`s`/`V`/`r`/`n`/`m`) —
+// the ref shapes whose functype valtype needs a heap slot. The scalars (`i`/`I`/`d`/`f`),
+// string (`S`/`N`), lists (`a`/`A`/`D`/`L`/`F`), union (`u`) and closure (`c`) carry none.
+function synthSigTokHasIdx(c: i32) {
+  c == 's' || c == 'V' || c == 'r' || c == 'n' || c == 'm'
+}
+
+// Emit ONE `$fnsig` functype SYNTHESIZED purely from its interned KEY string — the path
+// for a signature interned from a bare union-arm / annotation function type that has NO
+// concrete closure (`cloSigRepFn` sentinel -1), so the rep-function-node reader cannot
+// run. The bytes are byte-identical to what the rep path emits for the same key, because
+// both stream valtypes through the SAME `fbValtype`, and a key token's trailing index IS
+// the `fbValtype` heap slot (by construction of `annParamKind`/`cloParamTok`). Shape:
+// `(structref env, params...) -> ret` — the env leader (0x6b) exactly as the rep path,
+// then each param token's valtype, then 0 results for a `>v` (void) sig or 1 otherwise.
+function emitSynthCloSig(key: string) {
+  // Locate the result marker `>` (no param/index token contains it).
+  let gi = 0
+  while gi < key.length && key[gi] != '>' { gi = gi + 1 }
+  // Pass 1 — count params (advance token by token over `key[0..gi)`).
+  let nparams = 0
+  let ci = 0
+  while ci < gi {
+    if synthSigTokHasIdx(key[ci]) {
+      ci = ci + 1
+      while ci < gi && key[ci] != ';' { ci = ci + 1 }
+      ci = ci + 1 // skip ';'
+    } else {
+      ci = ci + 1
+    }
+    nparams = nparams + 1
+  }
+  wU8(96)                // 0x60 func
+  wULEB(nparams + 1)     // env + declared params
+  wU8(107)               // param 0 env: structref (0x6b)
+  // Pass 2 — emit each param's valtype.
+  let pi = 0
+  while pi < gi {
+    const pc = key[pi]
+    const pk = repKindOfSigTok(pc)
+    let pkc: VKind = "i32"
+    if pk != null { pkc = pk }
+    let pidx = -1
+    if synthSigTokHasIdx(pc) {
+      const nx: i32[] = []
+      pidx = synthSigIdxAt(key, pi + 1, nx)
+      pi = nx[0]
+    } else {
+      pi = pi + 1
+    }
+    fbValtype(pkc, pidx)
+  }
+  // Result — a `>v` (void field-closure) sig has 0 results; else the single result token.
+  const ri = gi + 1
+  if ri < key.length && key[ri] == 'v' {
+    wU8(0)
+  } else {
+    wU8(1)
+    const rc = key[ri]
+    const rk = repKindOfSigTok(rc)
+    let rkc: VKind = "i32"
+    if rk != null { rkc = rk }
+    let ridx = -1
+    if synthSigTokHasIdx(rc) {
+      const rnx: i32[] = []
+      ridx = synthSigIdxAt(key, ri + 1, rnx)
+    }
+    fbValtype(rkc, ridx)
+  }
+  0
+}
+
 // Type section (id 1): all WasmGC types in ONE recursion group, followed by the
 // standalone print/(log) functypes. Extracted verbatim from emitModule (C3); see the
 // inline comments below for the per-type framing. The rec-group count excludes the
@@ -2492,6 +2580,14 @@ function emitTypeSection(
     let sai = 0
     while sai < cloSigKeys.length {
       const repFe = cloSigRepFn[sai]
+      // A union-arm / annotation signature with NO concrete closure (`collectCloSigs`
+      // interned it from a bare `(…)=>…` type) carries the -1 rep sentinel: synthesize
+      // its functype from the KEY string (byte-identical to the rep path for that key).
+      if repFe < 0 {
+        emitSynthCloSig(cloSigKeys[sai])
+        sai = sai + 1
+        continue
+      }
       const rep = P.nodes[fnStmts[repFe]]
       if rep is FuncDecl {
         const rparams = rep.fnParams
