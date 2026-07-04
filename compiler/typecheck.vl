@@ -7048,6 +7048,21 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             }
           }
         }
+        // VALUE-UNION result (C1, `() => i64 | boolean`): a lambda whose body infers a bare
+        // SCALAR arm of the expected value-union box result adopts the union, so the widening
+        // lands at the return seam — `emitReturnValue` boxes the scalar into the `{tag, value}`
+        // rep and the lambda's functype result IS the box (`synthRetAnnots` pins `fnRet` to the
+        // recorded union name; `fRetUni` then drives the union result valtype). Without this the
+        // body returned a raw scalar into a union-box functype result (INVALID-WASM at the call
+        // site's box-typed local). The scalar-arm boxing is position-independent, so this is the
+        // closure-return dual of the array-element boxing. Checked AFTER the niche arms (a
+        // `T | null` niche must not be swallowed as a value union).
+        if inferred != expRet && valueUnionRetName(expRet) != "" {
+          const vuTail = lambdaBodyTail(n.fnBody)
+          if vuTail >= 0 && assignableExpr(vuTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
       }
     }
     // PERMISSIVE FALL-THROUGH (totality): an un-annotated function that can fall off the
@@ -9158,16 +9173,40 @@ export function isInferLetNulBool(letIx: i32) {
 // empty-ref-array-literal return path.
 export function splitUnionAtoms(name: string, out: string[]) {
   let cur = ""
+  // `depth` (braces/brackets only) drives `|` splitting — unchanged legacy behavior. `pdepth`
+  // ALSO counts parens, so a TOP-LEVEL `=>` (a function type whose return follows) is detected:
+  // `(i32) => i32 | string` is ONE function-type member (the `|` binds to the RETURN), whereas
+  // `((i32) => i32) | string` splits (the arrow is nested, the `|` at the top level). Without
+  // this a closure-returning-union name split into a bogus `(i32) => i32` + `string` union.
   let depth = 0
+  let pdepth = 0
   let i = 0
   while i < name.length {
     const c = name[i]
     if c == '{' || c == '[' {
       depth = depth + 1
+      pdepth = pdepth + 1
       cur = cur + fromCodePoint(c)
     } else if c == '}' || c == ']' {
       depth = depth - 1
+      pdepth = pdepth - 1
       cur = cur + fromCodePoint(c)
+    } else if c == '(' {
+      pdepth = pdepth + 1
+      cur = cur + fromCodePoint(c)
+    } else if c == ')' {
+      pdepth = pdepth - 1
+      cur = cur + fromCodePoint(c)
+    } else if (
+      pdepth == 0 &&
+      c == '=' &&
+      i + 1 < name.length &&
+      name[i + 1] == '>'
+    ) {
+      // A top-level function arrow: the whole name is a single function-type member — absorb
+      // the return verbatim (a `|` inside it belongs to the return union, split separately).
+      cur = cur + name.slice(i, name.length)
+      i = name.length
     } else if depth == 0 && c == '|' {
       out.push(cur)
       cur = ""
@@ -9185,21 +9224,100 @@ export function splitUnionAtoms(name: string, out: string[]) {
 export function unionMemberCount(name: string) {
   let n = 1
   let depth = 0
+  let pdepth = 0
   let i = 0
   while i < name.length {
     const c = name[i]
-    if c == '{' || c == '[' { depth = depth + 1 }
-    else if c == '}' || c == ']' { depth = depth - 1 }
-    else if depth == 0 && c == '|' { n = n + 1 }
+    if c == '{' || c == '[' {
+      depth = depth + 1; pdepth = pdepth + 1
+    } else if c == '}' || c == ']' {
+      depth = depth - 1; pdepth = pdepth - 1
+    } else if c == '(' {
+      pdepth = pdepth + 1
+    } else if c == ')' {
+      pdepth = pdepth - 1
+    } else if (
+      pdepth == 0 &&
+      c == '=' &&
+      i + 1 < name.length &&
+      name[i + 1] == '>'
+    ) {
+      // A top-level `=>` — the rest is the function RETURN (one member); stop counting so
+      // `(i32) => i32 | string` is ONE function type, not a 2-member union (paren-aware dual
+      // of `splitUnionAtoms`).
+      return n
+    } else if depth == 0 && c == '|' {
+      n = n + 1
+    }
     i = i + 1
   }
   n
 }
 
+// True if the type-name `name` is a FUNCTION type (`() => i64`, `(i32) => i32`) — a
+// TOP-LEVEL `=>` (parens/braces/brackets balanced). A value-union member that is a
+// closure rides the box's anyref `value` as the closure fat-pointer struct (a
+// `structref` subtype), exactly as a string/list member rides its wrapper ref — so it
+// is a REF atom (kind 11), with no per-rep scalar value box. Local to typecheck (the
+// emitter's `annArrowAt` lives in `emit_base`, which imports THIS module).
+export function nameIsFuncTypeAtom(nameIn: string) {
+  // A union member keeps its GROUPING parens (`(() => i64) | i64` splits to the atom
+  // `(() => i64)`), so peel every fully-enclosing balanced paren layer before the
+  // top-level `=>` scan — otherwise the arrow reads as nested (depth 1) and misses.
+  let name = nameIn
+  while (
+    name.length >= 2 &&
+    name[0] == '(' &&
+    name[name.length - 1] == ')' &&
+    parenEnclosesWhole(name)
+  ) {
+    name = name.slice(1, name.length - 1)
+  }
+  let depth = 0
+  let i = 0
+  while i < name.length {
+    const c = name[i]
+    if c == '(' || c == '{' || c == '[' {
+      depth = depth + 1
+    } else if c == ')' || c == '}' || c == ']' {
+      depth = depth - 1
+    } else if (
+      depth == 0 &&
+      c == '=' &&
+      i + 1 < name.length &&
+      name[i + 1] == '>'
+    ) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True when the LEADING `(` of `name` closes only at the FINAL char — i.e. the outer
+// parens enclose the whole string (`(()=>i64)` yes; `(i32)=>(i32)` no, the first `)`
+// closes mid-string). Lets `nameIsFuncTypeAtom` strip only genuine grouping parens.
+function parenEnclosesWhole(name: string) {
+  let depth = 0
+  let i = 0
+  while i < name.length {
+    const c = name[i]
+    if c == '(' || c == '{' || c == '[' {
+      depth = depth + 1
+    } else if c == ')' || c == '}' || c == ']' {
+      depth = depth - 1
+      if depth == 0 { return i == name.length - 1 }
+    }
+    i = i + 1
+  }
+  false
+}
+
 // ── value-union atom classification ───────────────────────────────────────────
 // The atom KIND of a value-union member type name: 0 i32, 1 boolean, 2 string,
-// 3 i64, 4 f64, 5 f32, 6 null — or -1 for anything else (a struct name, an inline
-// shape, an array). The kind doubles as the atom's tag offset (`scalarTagOf`).
+// 3 i64, 4 f64, 5 f32, 6 null, 11 closure (a function type — a REF atom riding the
+// box anyref) — or -1 for anything else (a struct name, an inline shape, an array).
+// The kind doubles as the atom's tag offset (`scalarTagOf`).
 export function valueAtomKind(name: string) {
   if name == "i32" { return 0 }
   if name == "boolean" { return 1 }
@@ -9215,6 +9333,11 @@ export function valueAtomKind(name: string) {
   if name == "f64[]" { return 8 }
   if name == "string[]" { return 9 }
   if name == "i64[]" { return 10 }
+  // A CLOSURE member (`(() => i64) | i64`) is a REF atom (kind 11) — the closure
+  // fat-pointer struct rides the box's anyref `value` directly (a `structref`
+  // subtype), no per-rep scalar value box. Checked LAST so a concrete scalar/list
+  // name (none of which carry a top-level `=>`) never reaches it.
+  if nameIsFuncTypeAtom(name) { return 11 }
   -1
 }
 
