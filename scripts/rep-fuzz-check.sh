@@ -45,7 +45,10 @@ unsound="$(grep -vP '^REJECT\t' "$SHAPES" 2>/dev/null | sort -u || true)"
 
 # Current reject shapes (union across seeds) vs the baseline.
 cut -f2 <(grep -P '^REJECT\t' "$SHAPES" 2>/dev/null || true) | sort -u > "$WORK/cur.txt"
-grep '^p' "$BASELINE" | sort -u > "$WORK/base.txt"
+# `|| true`: an EMPTY baseline shape list (the ZERO goal — every shape graduated) makes `grep`
+# exit 1, which under `set -euo pipefail` would abort the script before the analysis. Tolerate
+# no matches so the all-clear (`exact ✅ (0 reject shapes …)`) can actually be reported.
+{ grep '^p' "$BASELINE" || true; } | sort -u > "$WORK/base.txt"
 new="$(comm -23 "$WORK/cur.txt" "$WORK/base.txt")"    # failing now, not in baseline → regression
 stale="$(comm -13 "$WORK/cur.txt" "$WORK/base.txt")"  # in baseline, not failing now → graduate
 
