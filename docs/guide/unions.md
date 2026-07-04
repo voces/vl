@@ -1,10 +1,11 @@
 # Unions — representation & discrimination
 
-How VL represents and discriminates union types at runtime. Implementation: `unionInfo`,
-`coerceUnion`, and the global tag registry in `compiler/toWasm.ts`; the type side
-(`isEquatable`, soften, narrowing) in `compiler/typecheck.ts`. Roadmap items A6 / A16.
+How VL represents and discriminates union types at runtime. Implementation: the
+union-representation classifier, `coerceUnion`, and the global tag registry in the WasmGC emitter
+(`compiler/wasmEmit.vl`); the type side (`isEquatable`, soften, narrowing) in the checker
+(`compiler/typecheck.vl`). Roadmap items A6 / A16.
 
-## Three encodings (chosen by `unionInfo`)
+## Three encodings (chosen by the representation classifier)
 
 1. **Niche** — when one variant is "free", no box and no tag:
    - `T | null` where `T` is a reference → a WasmGC nullable ref; `is null` is `ref.is_null`.
@@ -46,15 +47,15 @@ discriminated directly.
 
 A field present on **every** member of a struct union with the **same** type is readable on the
 union directly, without narrowing — `(A | B).tag`. The type side (`sharedUnionField` in
-`typecheck.ts`) admits the access only when every member is a struct carrying that field at a
-mutually-assignable type; codegen (`sharedUnionFieldRead` in `toWasm.ts`) dispatches on the variant
+`typecheck.vl`) admits the access only when every member is a struct carrying that field at a
+mutually-assignable type; codegen (`sharedUnionFieldRead` in `wasmEmit.vl`) dispatches on the variant
 tag and reads the field at **that member's own index** (members may store a shared field at
 different struct indices, since fields are sorted by name per shape). A field that is not shared — or
 shared at a differing rep — still requires an `is`/`==` narrowing.
 
 ## Boxing happens at value-flow boundaries
 
-One hook — `coerceUnion` (toWasm) — boxes a value into the desired union representation at every
+One hook — `coerceUnion` (in the emitter) — boxes a value into the desired union representation at every
 boundary: assignment, argument, return. So discrimination works across function boundaries. The
 typed core `coerceToUnion(value, fromType, toType)` is shared by that hook and the `?.`/`??` lowering.
 

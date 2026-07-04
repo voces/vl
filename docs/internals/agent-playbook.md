@@ -6,8 +6,10 @@ the capability, the file scope, the target corpus bucket, and any
 subsystem-avoidance notes.
 
 ## Mission invariants
-- The TS host (`compiler/*.ts`) is the spec oracle. Port host behavior into
-  `compiler/*.vl`; never add host features; never change language semantics.
+- Preserve language semantics: the corpus goldens and each case's `@log` oracle
+  are the spec. Fix/extend behavior inside `compiler/*.vl`; never change what the
+  language accepts or emits. (The former TS host that once served as the spec
+  oracle is retired — ROADMAP "Kill the TS host. DONE".)
 - **Golden-neutral**: `git status tests/golden/` must be empty at every
   commit. Never run `UPDATE_GOLDENS`. Rep changes that re-pin goldens are
   serialized work for the orchestrator, not agents.
@@ -32,9 +34,9 @@ Re-run `bash scripts/refresh-compiler.sh` after every `compiler/*.vl` edit.
     scripts/vl-host/target/release/vl check <file> --compiler build/vl-compiler.wasm
     scripts/vl-host/target/release/vl run   <file> --compiler build/vl-compiler.wasm
 A file is PROMOTABLE only when check passes AND run stdout exactly equals
-`sed -n 's|^// @log ||p' <file>`. Promote to BOTH whitelists:
-`tests/selfhost_corpus_run_test.ts` WHITELIST and
-`tests/selfhost_native_align_test.ts` RUN_CASES. A file that advances to a
+`sed -n 's|^// @log ||p' <file>`. Promote by adding it to
+`tests/selfhost_native_align_test.ts` (both its `WHITELIST` and `RUN_CASES`
+lists). A file that advances to a
 later failure stage is progress to report, not promote.
 
 To diagnose invalid emitted wasm:

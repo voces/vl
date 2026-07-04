@@ -1,8 +1,10 @@
 # VL module system (import/export) + standard-library layout
 
-> Status: **design — owner-reviewed direction, pending implementation.** No
-> compiler code exists for this yet, and this document changes none; the final
-> word lands in `DECISIONS.md` at implementation time (in the spirit of
+> Status: **phase 1 landed; broader direction owner-reviewed, rest pending.**
+> The module system's first phase — relative-path named `import`/`export` with a
+> whole-program resolver — has shipped (CHANGELOG H0 phase 1); the standard-library
+> layout and remaining points below stay design. The final word lands in
+> `DECISIONS.md` (in the spirit of
 > `docs/guide/collections-design.md`). The eight points the owner reviewed (§5) are now
 > **decided directions (pending implementation)** — settled leanings, not open
 > questions — and the prose below reflects them. Remaining sub-questions and exact

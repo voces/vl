@@ -1,19 +1,19 @@
 # Flow narrowing
 
-How VL refines types along control flow. Implementation in `compiler/typecheck.ts`
-(`conditionNarrowing` / `atomFact` / `thenNarrowings` / `elseNarrowings` / `postGuardNarrowings` /
-`withNarrowings`, plus the `intersectType` / `subtractType` algebra), applied by **both**
-`compiler/toAST.ts` and `compiler/toWasm.ts`. Roadmap items A5 / A3 / A4.
+How VL refines types along control flow. Implementation in `compiler/typecheck.vl`
+(`conditionNarrowing` / `atomFact` / `postGuardNarrowings`, plus the `intersectType` /
+`subtractType` algebra and the `narrowedPaths` overlay), consumed by the WasmGC emitter
+(`compiler/wasmEmit.vl`). Roadmap items A5 / A3 / A4.
 
-## The shared fact, applied by both passes
+## The shared fact, applied by both phases
 
 A narrowing is a fact about a **place** — a name (`x`) or a property path (`o.v`, `x.y`) — that
-becomes a different type within a branch. The fact is produced once (in `typecheck.ts`) and applied
-by both passes:
+becomes a different type within a branch. The fact is produced once (in the checker,
+`typecheck.vl`) and applied by both phases:
 
-- **toAST** narrows the type scope around the branch (a name via the scope stack, a path via the
-  `narrowedPaths` overlay).
-- **toWasm** keeps a `narrowed` overlay consulted by `codegenType`. The local keeps its *declared*
+- **The checker** narrows the type scope around the branch (a name via the scope stack, a path via
+  the `narrowedPaths` overlay).
+- **The emitter** keeps a `narrowed` overlay consulted during codegen. The local keeps its *declared*
   (possibly nullable) wasm type — only the type-level view changes — so `local.get` / `struct.get`
   (which accept a nullable ref) stay valid; codegen unboxes a union per the narrowed view.
 

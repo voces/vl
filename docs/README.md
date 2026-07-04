@@ -25,6 +25,7 @@ Compiler internals, self-hosting, contributor and agent process.
 - [`internals/codegen-architecture.md`](internals/codegen-architecture.md) — wasm emitter architecture.
 - [`internals/codegen-builder-migration-plan.md`](internals/codegen-builder-migration-plan.md) — emitter builder refactor plan.
 - [`internals/monomorphization-design.md`](internals/monomorphization-design.md) — generic instantiation.
+- [`internals/match-design.md`](internals/match-design.md) — `match` exhaustive value/variant dispatch.
 - [`internals/modules-design.md`](internals/modules-design.md) — module system (`import`/`export`).
 - [`internals/native-modules-design.md`](internals/native-modules-design.md) — module resolution in the native build.
 - [`internals/incremental-build-design.md`](internals/incremental-build-design.md) — build caching.
@@ -42,6 +43,8 @@ Compiler internals, self-hosting, contributor and agent process.
 - [`internals/selfhost-name-section.md`](internals/selfhost-name-section.md) — wasm name-section emission.
 - [`internals/selfhost-print-emit-plan.md`](internals/selfhost-print-emit-plan.md) — `print` emission staging.
 - [`internals/selfhost-corpus-paydown-findings.md`](internals/selfhost-corpus-paydown-findings.md) — emitter coverage notes.
+- [`internals/rep-fuzz-findings.md`](internals/rep-fuzz-findings.md) — rep-composition fuzzer findings.
+- [`internals/compiler-code-review.md`](internals/compiler-code-review.md) — synthesized code-review priorities (live to-do).
 - [`internals/vl-tech-debt.md`](internals/vl-tech-debt.md) — remaining cleanups and limitations.
 - [`internals/vl-dogfooding-notes.md`](internals/vl-dogfooding-notes.md) — dogfooding friction notes.
 - [`internals/agent-playbook.md`](internals/agent-playbook.md) — agent operating playbook.
