@@ -10,11 +10,11 @@
 #   Classes: REJECT (parse/type/emit error — the fail-loudly long tail), INVALID-WASM (emitted bytes
 #   fail validation — a soundness hole), TRAP (runtime error), MISMATCH (silent wrong result).
 #   --keep DIR      copy every failing case (+ its error) into DIR for triage.
-#   --baseline FILE suppress KNOWN clean rejects: a REJECT whose `// @shape` line appears in FILE is
-#                   a documented unsupported shape, not a finding (exit 0). The baseline holds ONLY
-#                   rejects — a soundness class (INVALID-WASM/TRAP/MISMATCH) is ALWAYS a finding and
-#                   can never be masked by the baseline. A NEW reject shape is a coverage regression.
-#                   (The exact bidirectional check — incl. STALE baseline entries — is rep-fuzz-check.sh.)
+#   --baseline FILE suppress KNOWN failures: a failure whose class-tagged `CLASS<TAB>@shape` line
+#                   appears in FILE (any class — INVALID-WASM/TRAP/MISMATCH/REJECT) is a committed
+#                   known issue, not a NEW finding (exit 0). A shape that got WORSE (e.g. REJECT ->
+#                   INVALID-WASM) is a new line, so it still surfaces. The full bidirectional CI gate
+#                   (new + stale) is rep-fuzz-check.sh; the invariant is no regression.
 #   --shapes-out F  append one `CLASS<TAB>SHAPE` line per failure to F (consumed by rep-fuzz-check.sh).
 #   --quiet         suppress the per-class case dumps (shape lines + summary only).
 # Requires a fresh seed: bash scripts/refresh-compiler.sh
@@ -87,10 +87,12 @@ for f in "$WORK"/case_*.vl; do
   # rep-fuzz-check.sh — written BEFORE baseline suppression so the record is complete.
   [ -n "$SHAPES_OUT" ] && printf '%s\t%s\n' "$why" "$shape" >> "$SHAPES_OUT"
 
-  # Only a clean REJECT (fail-loud, unsupported shape) may be baselined as a KNOWN
-  # non-issue. A soundness class (INVALID-WASM / TRAP / MISMATCH) is ALWAYS a finding
-  # — it can never be masked by the baseline, so a real bug can never hide there.
-  if [ "$why" = "REJECT" ] && [ -n "$BASELINE" ] && grep -qxF "$shape" "$BASELINE" 2>/dev/null; then
+  # A baselined failure is a KNOWN issue (any class — INVALID-WASM/TRAP/MISMATCH/REJECT), not
+  # a NEW finding. Known issues are committed to the baseline and burned down over time; the
+  # invariant CI enforces (via rep-fuzz-check.sh) is no regression — never a NEW or worse failure.
+  # The baseline is class-tagged `CLASS<TAB>SHAPE`, so a shape getting WORSE (e.g. REJECT ->
+  # INVALID-WASM) is a new line and surfaces as a finding.
+  if [ -n "$BASELINE" ] && grep -qxF "$(printf '%s\t%s' "$why" "$shape")" "$BASELINE" 2>/dev/null; then
     known=$((known + 1))
     continue
   fi

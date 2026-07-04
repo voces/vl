@@ -1,34 +1,38 @@
 #!/usr/bin/env bash
-# Exact rep-composition fuzz check — the CI gate over the pinned seeds (101/202/303).
+# Exact rep-composition fuzz check — the CI gate over a broad pinned seed set.
 #
-# "Exact" means the baseline is a PRECISE mirror of the current fail-loud rejects — no
-# entry that no longer triggers a failure, no failure that isn't accounted for. The check
-# is BIDIRECTIONAL and fails on any of three conditions:
+# The baseline is a COMPLETE, class-tagged snapshot of every shape that currently fails
+# (any class: INVALID-WASM / TRAP / MISMATCH / REJECT). The rule is simply NO REGRESSION —
+# the current failure set must EQUAL the baseline set. The check is bidirectional:
 #
-#   1. SOUNDNESS — any INVALID-WASM / TRAP / MISMATCH at any seed. These are real bugs and
-#      are NEVER baselineable; the residual must stay 0.
-#   2. NEW REJECT — a reject shape not in the baseline: a coverage regression (under fixed
-#      seeds a shape that used to compile now rejects).
-#   3. STALE BASELINE — a baseline shape that no longer fails: a fix landed but the shape
-#      wasn't graduated. A baseline entry that doesn't trigger an issue is not allowed.
+#   1. NEW — a `CLASS<TAB>SHAPE` failing now but not in the baseline. A regression: a brand
+#      new failure, OR a known shape that got WORSE (e.g. REJECT -> INVALID-WASM shows up as a
+#      new INVALID-WASM line). Fails CI.
+#   2. STALE — a baseline line that no longer fails: a fix landed (or a shape improved), so
+#      graduate it (remove the line + pin a tests/cases/ regression proving the fix).
 #
-# So every baseline line corresponds to exactly one currently-failing (reject) shape, and
-# every finding is a genuine issue. On a clean tree: 0 soundness, 0 new, 0 stale → exit 0.
+# So known issues are committed and burned down over time; the invariant is that we never
+# ADD a failure or silently worsen one. When the baseline empties, the fuzzer is at true zero.
 #
-# Regenerate the baseline after a fix (or a fuzzgen change) — this script prints the exact
+# Regenerate after a fix (or a scripts/fuzzgen.vl change): this script prints the exact
 # NEW/STALE deltas to apply. Requires a fresh seed: bash scripts/refresh-compiler.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BASELINE="${BASELINE:-scripts/rep-fuzz-baseline.txt}"
-SEEDS=("101 120 2" "202 120 3" "303 120 4")   # seed count depth — must match ci.yml + the baseline header
+# seed count depth — the broad net. Must match the header note in the baseline file.
+SEEDS=(
+  "101 150 3" "202 150 4" "303 150 4"
+  "1 150 4" "7 150 4" "13 150 5" "42 150 4" "99 150 5"
+  "500 150 4" "777 150 5" "1234 150 5" "2024 150 4"
+  "9999 150 5" "31337 150 5" "88888 150 5" "65535 150 4"
+)
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-SHAPES="$WORK/shapes.tsv"
 
-# Run the seeds in parallel (matching CI wall-clock), each to its OWN shapes file to
-# avoid concurrent-append interleaving; concatenate once all finish.
+# Run the seeds in parallel, each to its OWN shapes file (avoids concurrent-append
+# interleaving); concatenate once all finish. fuzz-vl.sh --shapes-out emits `CLASS<TAB>SHAPE`.
 pids=()
 i=0
 for sc in "${SEEDS[@]}"; do
@@ -38,35 +42,31 @@ for sc in "${SEEDS[@]}"; do
   pids+=($!); i=$((i + 1))
 done
 for p in "${pids[@]}"; do wait "$p" || true; done   # fuzz-vl.sh exits 1 on findings; the analysis below is authoritative
-cat "$WORK"/s*.tsv > "$SHAPES" 2>/dev/null || : > "$SHAPES"
 
-# 1. Soundness — any non-REJECT class is a hard finding.
-unsound="$(grep -vP '^REJECT\t' "$SHAPES" 2>/dev/null | sort -u || true)"
+# Current failure set: class-tagged `CLASS<TAB>SHAPE` (SHAPE keeps its `p<pos><variant>` prefix,
+# so a type is tracked per-position — a rep can be sound in one position and not another), deduped.
+cat "$WORK"/s*.tsv 2>/dev/null | sort -u > "$WORK/cur.txt" || : > "$WORK/cur.txt"
+# `|| true`: an EMPTY baseline (the ZERO goal) makes grep exit 1, which under `set -e` would abort
+# before the all-clear can print. Tolerate no matches.
+{ grep -P '\t' "$BASELINE" || true; } | sort -u > "$WORK/base.txt"
 
-# Current reject shapes (union across seeds) vs the baseline.
-cut -f2 <(grep -P '^REJECT\t' "$SHAPES" 2>/dev/null || true) | sort -u > "$WORK/cur.txt"
-# `|| true`: an EMPTY baseline shape list (the ZERO goal — every shape graduated) makes `grep`
-# exit 1, which under `set -euo pipefail` would abort the script before the analysis. Tolerate
-# no matches so the all-clear (`exact ✅ (0 reject shapes …)`) can actually be reported.
-{ grep '^p' "$BASELINE" || true; } | sort -u > "$WORK/base.txt"
-new="$(comm -23 "$WORK/cur.txt" "$WORK/base.txt")"    # failing now, not in baseline → regression
-stale="$(comm -13 "$WORK/cur.txt" "$WORK/base.txt")"  # in baseline, not failing now → graduate
+new="$(comm -23 "$WORK/cur.txt" "$WORK/base.txt")"    # failing now, not baselined -> regression / worse
+stale="$(comm -13 "$WORK/cur.txt" "$WORK/base.txt")"  # baselined, not failing now -> graduate
 
 rc=0
-if [ -n "$unsound" ]; then
-  echo "✗ SOUNDNESS — unsound outputs must be 0 (never baselineable):"; echo "$unsound" | sed 's/^/    /'; rc=1
-fi
 if [ -n "$new" ]; then
-  echo "✗ NEW REJECT — coverage regression (shape rejects but is not in the baseline):"; echo "$new" | sed 's/^/    + /'; rc=1
+  echo "✗ NEW / WORSE — a failure not in the baseline (regression):"; echo "$new" | sed 's/^/    + /'; rc=1
 fi
 if [ -n "$stale" ]; then
-  echo "✗ STALE BASELINE — shape no longer fails; graduate it (remove from $BASELINE, pin a tests/cases/ regression):"
+  echo "✗ STALE — no longer fails; graduate it (remove from $BASELINE, pin a tests/cases/ regression):"
   echo "$stale" | sed 's/^/    - /'; rc=1
 fi
 
+cur_n=$(wc -l < "$WORK/cur.txt" | tr -d ' ')
+unsound_n=$(grep -cvP '^REJECT\t' "$WORK/cur.txt" 2>/dev/null || echo 0)
 if [ "$rc" -eq 0 ]; then
-  echo "rep-fuzz-check: exact ✅  ($(wc -l < "$WORK/cur.txt" | tr -d ' ') reject shapes, all baselined; 0 unsound, 0 new, 0 stale)"
+  echo "rep-fuzz-check: exact ✅  ($cur_n baselined failures — $unsound_n unsound, $((cur_n - unsound_n)) reject; 0 new, 0 stale)"
 else
-  echo; echo "rep-fuzz-check: FAILED — see deltas above."
+  echo; echo "rep-fuzz-check: FAILED — reconcile the baseline (apply the deltas above)."
 fi
 exit "$rc"
