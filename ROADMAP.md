@@ -58,14 +58,16 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
      33 shapes, ALL fail-loud REJECT (coverage gaps the compiler refuses cleanly, never silent
      miscompiles), and the check is now EXACT/bidirectional (`scripts/rep-fuzz-check.sh`: soundness
      never baselineable, new rejects + stale entries both fail). Details + wave history in
-     `docs/internals/rep-fuzz-findings.md`. REMAINING (coverage, not soundness), largest-first:
-     **(a) union with a MAP member** (`{[string]:V} | X`, ~16 shapes — the biggest family; needs the
-     union interner to carry a map atom); **(b) array of a UNION element** (`(C | D)[]`) — the bounded
-     remainder after union-with-array-member shipped (#863); `splitUnionAtoms` needs paren-depth
-     tracking (module-wide, real fixpoint risk); never unsound; **(c)** the map READER path through
-     the value-call ABI (construct-and-return is fixed, #860); **(d)** niche nullable-scalar lists
-     `(boolean|null)[]`/`(f64|null)[]` (clean rejects, no box rep) + the lambda-param i64-context
-     deferral tail. Keep graduating baseline shapes as fixes land.
+     `docs/internals/rep-fuzz-findings.md`. Baseline down to 25 shapes after union-with-array (#863)
+     and union-with-map, scalar/string/mono values (#865) shipped. REMAINING (coverage, not
+     soundness): **(a) ref-VALUE map-union arms** (`{[string]: S} | X`, `{[string]: () => T} | X`,
+     `{[string]: A|B} | X`) — a #860-style heap-type-identity hazard, deferred from #865 as a loud
+     reject (`error-map-member-refvalue.vl`); needs the map-value heap type to dedup across the box
+     seam before the guard can lift; **(b) array of a UNION element** (`(C | D)[]`) — `splitUnionAtoms`
+     needs paren-depth tracking (module-wide, real fixpoint risk); never unsound; **(c)** the map
+     READER path through the value-call ABI (construct-and-return is fixed, #860); **(d)** niche
+     nullable-scalar lists `(boolean|null)[]`/`(f64|null)[]` (clean rejects, no box rep) + the
+     lambda-param i64-context deferral tail. Keep graduating baseline shapes as fixes land.
   3. 🟡 **`repOf(type) → descriptor` unification (the "rewrite") — strangler, in progress.**
      Foundation SHIPPED (→ `CHANGELOG.md`): `emit_rep.vl`'s `RepDesc` derived table-driven from the
      `Ty` arena (cycle-safe: kind arms recurse ≤1 wrapper level; generation-stamped visited marks),
