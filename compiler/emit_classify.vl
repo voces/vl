@@ -322,6 +322,12 @@ function cloParamTok(paramIx: i32) {
   // rather than emitting invalid wasm. (`nulstr`/`nulstruct` DO carry result
   // tokens, so the exclusion must be explicit here.)
   if k == "nulstr" || k == "nulstruct" { return "" }
+  // A NULLABLE-closure param (`((i32) => i32) | null`, kind 19) stays OUTSIDE the value-call
+  // ABI (only nullable-closure RESULTS are wired — the closure result carries the niche).
+  // `repSigTokOfKind("nulclosure")` now yields a RESULT token (`C`), so exclude it explicitly
+  // here (like map/nulstr/nulstruct) — else a nulclosure param would key a slot-less `C` and
+  // mis-lower. The soundness floor rejects a nulclosure-param value with a clear message.
+  if k == "nulclosure" { return "" }
   // A MAP param stays OUTSIDE the value-call ABI (only map RESULTS are wired — the closure
   // result carries the map shape). `repSigTokOfKind("map")` now yields a result token, so
   // exclude it explicitly here (like `nulstr`/`nulstruct`) — else a map param would key a
@@ -4533,6 +4539,22 @@ function cloArrSlotSigKey(slot: i32) {
   return annSigKey(nm.slice(1, nm.length - 1))
 }
 
+// The closure RESULT type-NAME of a closure-element ref-list slot (kind 5): the element name is the
+// parenthesized function type `(() => K0 | null)`; strip the grouping parens and return the text
+// after the top-level `=>` (`K0 | null`). "" for a non-closure slot / an un-parseable element. Lets
+// an INDEXED closure call (`p[i]()`) classify its result niche (`exprNulLitUnion` → `p[i]() : K|null`).
+export function cloArrSlotRetName(slot: i32) {
+  if slot < 0 || slot >= rlElemName.length { return "" }
+  if rlElemKindTbl[slot] != 5 { return "" }
+  const nm = rlElemName[slot]
+  if nm.length < 2 { return "" }
+  if nm[0] != '(' || nm[nm.length - 1] != ')' { return "" }
+  const inner = nm.slice(1, nm.length - 1)
+  const at = annArrowAt(inner)
+  if at < 0 { return "" }
+  return inner.slice(at + 2, inner.length)
+}
+
 // The SCALAR-coercion kind of parameter `idx` read from a `$fnsig` KEY's param-token spine: `10`
 // (i64, token `I`), `11` (f64, `d`), `13` (f32, `f`), or `-1` (i32 / a ref kind — no coercion). The
 // tokens are `cloParamTok`'s: single-char scalars, or `s<idx>;` / `V<idx>;` / `r<idx>;` ref tokens
@@ -5820,6 +5842,16 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
       // local / global whose `K | null` niche return `fnIndexOf` can't see.
       if nameIsNulLitUnion(calleeCloRetName(callee.identName, fnIx)) {
         return true
+      }
+    }
+    // An INDEXED closure-array call (`p[i]()` where `p: (() => K | null)[]`): the element's
+    // closure result is the `K | null` niche. `cloArrSlotRetName` reads it off the ref-list slot,
+    // the indexed dual of the Ident `calleeCloRetName` above — so `const t0 = p[i]()` binds the
+    // kind-0 litunion niche (an i32) instead of mis-inferring the softened `string | null` ref.
+    if callee is Index {
+      if exprRefArray(callee.idxArr, fnIx) {
+        const rn = cloArrSlotRetName(refListSlotOfExpr(callee.idxArr, fnIx))
+        if nameIsNulLitUnion(rn) { return true }
       }
     }
     return false
@@ -11373,6 +11405,15 @@ function annParamKind(t: string) {
 function annRetKind(t: string) {
   if t == "i32" || t == "boolean" { return ">" + repSigTokOfKind("i32") }
   if t == "f64" { return ">" + repSigTokOfKind("f64") }
+  // A LITERAL-UNION result (`type K = "a"|"b"`, or inline `"a"|"b"`), OR a NULLABLE literal-union
+  // (`K | null`): both rep as the interned i32 ATOM (`vtKindOfType` → "i32", the `-1`-sentinel niche
+  // for the nullable), so the result token is `>i` — the SAME token `cloRetKeySuffix` yields (its
+  // `cloRetValKind` reads `vtKindOfType`). Checked BEFORE the union-split below, which would
+  // otherwise mis-key a litunion's 2+ string atoms as a value-union box (`>u`). Without this the
+  // annotation and construct sig producers disagreed on a litunion closure result.
+  if nameIsLitUnionType(t) || nameIsNulLitUnion(t) {
+    return ">" + repSigTokOfKind("i32")
+  }
   // Void is the ABSENCE of a result kind, not a member of the `VKind` vocabulary
   // (`repSigTokOfKind` deliberately has no arm for it) — stays a literal token.
   if t == "void" { return ">v" }
@@ -11401,7 +11442,12 @@ function annRetKind(t: string) {
   // byte-match). The slot is the map SHAPE (mono ⇒ -1, else the value type's mv slot) — the
   // SAME `mapAnnShape`/`cloRetValSlot` the AST producer keys. BEFORE the closure case (a map
   // annotation carries no top-level arrow, but keep the ABI arms grouped).
-  if nameIsMap(t) {
+  // A map-member UNION (`{[string]: f32} | {w: i32}`) also STARTS with `{[`, so `nameIsMap`
+  // matches it — but it is a union BOX, not a bare map. Exclude it (`nameIsMapMemberUnion`) so
+  // it falls through to the union arm below (`>u`), byte-matching the lambda's pinned map-union
+  // `$fnsig` (`cloRetKeySuffix` reaches the box via `cloRetValKind` → "union"). Without this the
+  // value call keyed `>m` while the closure interned `>u` — a "no interned signature" reject.
+  if nameIsMap(t) && !nameIsMapMemberUnion(t) {
     return ">" +
       repSigTokOfKind("map") +
       i32ToStr(mvSlotOfMapValNameOrMono(mapValNameOf(t))) +
@@ -11458,6 +11504,14 @@ function annRetKind(t: string) {
       const msi = structIndexOfTypeName(nonNull[0])
       if msi >= 0 {
         return ">" + repSigTokOfKind("nulstruct") + i32ToStr(msi) + ";"
+      }
+      // A NULLABLE-CLOSURE result (`((i32) => K0) | null`, kind 19): the shared closure
+      // fat-pointer made nullable (`(ref null $cloStruct)`, slot-free). Matches
+      // `cloRetKeySuffix`'s `>C` (via `cloRetValKind` → "nulclosure"), so the value call's
+      // `ref.cast` byte-matches the closure's pinned `$fnsig` — without it the call keyed ""
+      // and fell to the all-i32 arity sig (an invalid `(ref $cloStruct)`-where-i32 cast).
+      if strContains(nonNull[0], "=>") {
+        return ">" + repSigTokOfKind("nulclosure")
       }
       return ""
     }
