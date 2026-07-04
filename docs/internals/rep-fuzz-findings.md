@@ -11,7 +11,7 @@ depth 4 fail, in these families (example signature → error):
 
 ## ✅ MILESTONE (2026-07-03): zero unsound outputs at the CI seeds
 **Every soundness class — INVALID-WASM, TRAP, MISMATCH — is now 0** at the pinned seeds
-(101/202/303, depths 2/3/4). The residual is **36 shapes, ALL fail-loud REJECT**: the compiler
+(101/202/303, depths 2/3/4). The residual is **33 shapes, ALL fail-loud REJECT**: the compiler
 refuses each with a clear emit/type diagnostic — never silently-wrong bytes, never invalid wasm.
 The rep-fuzzer's original purpose (surface silent miscompiles from rep composition) is discharged;
 what remains is a coverage backlog of unsupported-but-cleanly-rejected shapes, pinned in the
@@ -19,18 +19,24 @@ baseline.
 
 The soundness holes below were driven to zero across these waves: structural heap-type dedup
 (#833/#834/#835), value-union box read (#855), map-as-closure-return heap-type identity (#860),
-and scalar-union-arm boxing in composite position + function-type-as-REF-atom (#861). The original
-example holes (`{f: f64[][]}`, `{f: f64[]}[]`, `{f: {f: (i32|null)[]}}`) all compile + round-trip
-now and are pinned as `tests/cases/` regressions.
+scalar-union-arm boxing in composite position + function-type-as-REF-atom (#861), and a real rep
+for a union whose member is an array (#863). The original example holes (`{f: f64[][]}`,
+`{f: f64[]}[]`, `{f: {f: (i32|null)[]}}`) all compile + round-trip now and are pinned as
+`tests/cases/` regressions.
 
-### Remaining fail-loud REJECT families (the 36-shape residual — coverage, not soundness)
+### The check is now EXACT (`scripts/rep-fuzz-check.sh`)
+The baseline is a precise mirror of the current fail-loud rejects, enforced bidirectionally: a
+soundness class is NEVER baselineable (always a finding); a NEW reject fails CI (coverage
+regression); a STALE baseline entry that no longer fails ALSO fails CI (graduate it). So the
+fuzzer never reports "a finding that doesn't trigger an issue," and the baseline can never drift.
+
+### Remaining fail-loud REJECT families (the 33-shape residual — coverage, not soundness)
 - **Union with a MAP member** (~16 shapes): `{[string]: V} | X`, `{f: {[string]: …} | string}` —
   `a union with a map member is type-valid but not yet supported by codegen`. Largest family.
-- **Union with an ARRAY member** (F3, DEFERRED): `{…}[] | {w}`, `(() => f64)[] | i64`,
-  `(i32) => (string | {w})[]` — needs a real multi-layer feature (register ref-array arm → new tag
-  sub-scheme → box in `emitUnionCoerce` → `is <ref-array>` → narrowed reflist read). A naive
-  registration-only patch turns the loud REJECT into a SILENT invalid-wasm, so it is scoped as its
-  own dedicated deep task (see ROADMAP), NOT a bounded classification fix.
+- **Array of a UNION element** (`(string | {w: i32})[]`, `(i32) => (string | {w})[]`): distinct from
+  the now-shipped union-with-array-member (#863) — here the ARRAY's element is a union. `splitUnionAtoms`
+  splits the `|` inside `(C | D)` because it tracks brace/bracket but not paren depth; never unsound
+  (construction may compile, a read errors loudly at `is`). The bounded remainder of #863.
 - **Map READER path** (`(i32) => {[string]: f32}` p2r, `() => {[string]: string}` p2r): the
   construct-and-return path is fixed (#860); reading a returned map back through the value-call ABI
   still rejects fail-loud.
