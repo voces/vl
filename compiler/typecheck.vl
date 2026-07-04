@@ -1157,6 +1157,24 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
 // recurses into its elements / fields. So a lambda nested anywhere in the expected shape — under
 // arrows, arrays, or object fields, at any depth — is reached by ONE recursive mechanism. Any
 // other shape is a no-op.
+// The union member index of `u`'s FUNCTION arm whose parameter arity is `arity` (`(() => i64) |
+// {w:i32}` with a 0-arg lambda → the `() => i64` member), or -1 when no function arm matches. Lets
+// `seedExpected` adopt a bare LAMBDA into a union's closure arm (the emit already boxes a closure
+// arm — this is the checker seam that widens `f: () => 5` to the `() => i64` member). The FIRST
+// matching arm wins (a union with two same-arity func arms is not a supported shape).
+function unionFuncArmForArity(u: TyUnion, arity: i32) {
+  const members = u.uMembers
+  let i = 0
+  while i < members.length {
+    const m = members[i]
+    const mt = T.tys[m]
+    if mt is TyFunc {
+      if mt.fnParamTypes.length == arity { return m }
+    }
+    i = i + 1
+  }
+  -1
+}
 function seedExpected(exprIx: i32, expectedTy: i32) {
   if exprIx < 0 || expectedTy < 0 { return 0 }
   let u = exprIx
@@ -1179,6 +1197,15 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
         // array/object recursion below. A curried `(a) => (b) => …` against `(i32) => ((i32) =>
         // i32)` then types its inner lambda's params from the result function type, at any depth.
         seedExpected(lambdaBodyTail(en.fnBody), et.fnRet)
+      } else if et is TyUnion {
+        // A lambda flowing into a UNION with a bare-closure arm (`f: (() => i64) | {w:i32}`):
+        // seed it against the arity-matching function arm, so `() => 5` widens to `() => i64`
+        // and adopts the union (the emit boxes the closure arm into the `{tag, value}` rep).
+        // Without this the lambda infers its own bare `() => i32` and the union assignment is a
+        // loud type error — the checker seam the emit layers depend on. Arity-matched so a
+        // non-function arm (or a wrong-arity closure) is left to the normal assignability check.
+        const arm = unionFuncArmForArity(et, en.fnParams.length)
+        if arm >= 0 { seedExpected(u, arm) }
       }
     }
   } else if en is ArrayLit {
@@ -9258,7 +9285,7 @@ export function nameIsFuncTypeAtom(nameIn: string) {
 // True when the LEADING `(` of `name` closes only at the FINAL char — i.e. the outer
 // parens enclose the whole string (`(()=>i64)` yes; `(i32)=>(i32)` no, the first `)`
 // closes mid-string). Lets `nameIsFuncTypeAtom` strip only genuine grouping parens.
-function parenEnclosesWhole(name: string) {
+export function parenEnclosesWhole(name: string) {
   let depth = 0
   let i = 0
   while i < name.length {

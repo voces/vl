@@ -3763,6 +3763,13 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
       const t = fnIndexOf(callee.identName)
       if t < 0 {
         if exprIsClosure(n.callFn, fnIx) { isVal = true }
+        // `t()` where `t` is a union binding with a bare-closure arm (`const t = p.f; t()`,
+        // `const e = arr[0]; e()`): the `is`-narrowing that makes `t` a closure is NOT active
+        // during this pre-pass, so `exprIsClosure(t)` is false — reserve `callRefSlot`
+        // conservatively so the narrowed emit's `call_ref` has its scratch local (an unused
+        // reservation is a harmless spare local, never invalid wasm). The bare-binding twin of
+        // the `calleeIsUnionClosureArrayIndex` reservation below.
+        if !isVal && calleeIsUnionClosureIdent(n.callFn, fnIx) { isVal = true }
       } else {
         // A direct call to a CAPTURING function is lowered via call_ref too.
         if captureCountOf(t) > 0 { isVal = true }
@@ -8176,6 +8183,56 @@ export function calleeIsUnionClosureArrayIndex(exprIx: i32, fnIx: i32) {
   false
 }
 
+// True if the union member-set `name` has a BARE-CLOSURE arm (`(() => i64) | {w:i32}`,
+// `(() => i64) | i32`). A closure is value-atom KIND 11 (a REF atom riding the box anyref as
+// the `$cloStructIdx` fat-pointer), so — unlike the ref-array / map arms — it needs no new tag
+// band: its `scalarTagOf` (`uVariants.length + 11`) already discriminates. Resolves an alias to
+// its member set first, mirroring `unionHasClosureArrayArm` (which tests the closure-ELEMENT
+// array arm, a distinct shape whose arrow is nested inside `[]`).
+export function unionHasClosureArm(name: string) {
+  let nm = unionMemberSetOf(name)
+  if nm == "" { nm = name }
+  const atoms: string[] = []
+  splitUnionAtoms(nm, atoms)
+  let i = 0
+  while i < atoms.length {
+    if valueAtomKind(atoms[i]) == 11 { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The BARE-CLOSURE arm NAME of the union member-set `name` (`(() => i64)` in `(() => i64) | i32`),
+// or "" when it has none. `emitUnionCoerce` boxes a closure carrier with this arm's `scalarTagOf`.
+// (A union with two distinct closure arms shares one kind-11 tag — a pre-existing value-atom-scheme
+// limitation, not exercised by the supported single-closure-arm shapes; returns the FIRST here.)
+export function unionClosureArmName(name: string) {
+  let nm = unionMemberSetOf(name)
+  if nm == "" { nm = name }
+  const atoms: string[] = []
+  splitUnionAtoms(nm, atoms)
+  let i = 0
+  while i < atoms.length {
+    if valueAtomKind(atoms[i]) == 11 { return atoms[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// True if `exprIx` is an IDENT whose declared union has a bare-closure arm — the callee shape
+// `blockHasCallRef` reserves `callRefSlot` for (the `is`-narrowing that makes the ident a closure
+// is NOT active during the narrowing-blind frame pre-pass, so `exprIsClosure` is false there).
+// The bare-binding analogue of `calleeIsUnionClosureArrayIndex` (`const t = p.f; t()` /
+// `const e = arr[0]; e()`, where the closure arm was extracted to a plain union binding first).
+export function calleeIsUnionClosureIdent(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    const un = unionNameOfIdent(e.identName, fnIx)
+    if un != "" { return unionHasClosureArm(un) }
+  }
+  false
+}
+
 // True if the union member-set `name` (pipe-joined atoms) has a REF-ELEMENT array arm whose
 // interned reflist slot is `slot` — the guard `emitUnionCoerce` uses to confirm a ref-array
 // carrier actually matches an arm before boxing it with that arm's `refArrSlotTag`. A ref-array
@@ -9318,6 +9375,17 @@ export function narrowedRefArrayOf(name: string) {
   if v == "" { return "" }
   if valueAtomKind(v) >= 0 { return "" }
   if nameIsRefArray(v) { return v }
+  ""
+}
+
+// The BARE-CLOSURE arm a union binding `name` is currently narrowed to (`if x is () => i64` →
+// `() => i64`), or "" when it is not narrowed to a closure. A closure is value-atom KIND 11, so
+// the narrowed READ already unboxes via `narrowedValueAtomOf` + `emitValueUnionUnboxRead` (which
+// casts the box payload to `$cloStructIdx`); this filter isolates the closure case so `exprIsClosure`
+// can route the narrowed ident's CALL to `call_ref` (and `calleeCloSigKey` to the arm's `$fnsig`).
+export function narrowedClosureOf(name: string) {
+  const v = narrowedValueAtomOf(name)
+  if v != "" && valueAtomKind(v) == 11 { return v }
   ""
 }
 
@@ -11100,6 +11168,11 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
   }
   if e is Ident {
     if fnIndexOf(e.identName) >= 0 { return true }
+    // A union binding NARROWED to a bare-closure arm (`if x is () => i64 { x() }`): its box
+    // payload IS the closure fat-pointer (`emitValueUnionUnboxRead` casts to `$cloStructIdx`),
+    // so it calls via `call_ref` exactly like a closure local — route the CALL here. Checked
+    // FIRST since the binding's DECLARED type is a union, so the param/local closure tests miss it.
+    if narrowedClosureOf(e.identName) != "" { return true }
     // A closure-typed param/local (kind 14), or a NULLABLE one (kind 19) — both call via
     // `call_ref`; the nullable cell is recovered to non-null at the call site (after the
     // `if c != null` narrowing the checker requires).
@@ -11393,6 +11466,14 @@ export function identFnTypeAnnName(name: string, fnIx: i32) {
 // annotation, or — for an INFERRED binding — the underlying function's own sig. "" → the
 // all-i32 arity fallback applies (an unresolved or non-value-ABI signature, incl. void).
 function calleeCloSigKey(name: string, fnIx: i32) {
+  // A union binding narrowed to a bare-closure arm (`if x is () => i64 { x() }`): the arm's
+  // function-type name interns the SAME `$fnsig` an annotated closure would — so the `call_ref`
+  // casts to the right functype and the result classifiers (`calleeReturnsI64`/…) read its return.
+  const nc = narrowedClosureOf(name)
+  if nc != "" {
+    const nk = annSigKey(nc)
+    if nk != "" { return nk }
+  }
   const pk = paramCloSigKey(fnIx, name)
   if pk != "" { return pk }
   const an = identFnTypeAnnName(name, fnIx)
