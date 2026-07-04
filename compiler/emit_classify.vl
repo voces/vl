@@ -106,6 +106,7 @@ import {
   nameIsNulBool,
   nameIsNulClosure,
   nameIsNulI32List,
+  nameIsNulLitUnion,
   nameIsNulString,
   nameIsString,
   nameIsStringArray,
@@ -5673,6 +5674,44 @@ export function cbRetVariantIdx(fe: i32) {
   return variantIndexOfTypeName(inferRetNameByNode(fnStmts[fe]))
 }
 
+// The RETURN-type NAME of a function-VALUE callee `name` (in scope of `fnIx`): the return
+// part of its source function-type annotation — a closure-typed PARAM of the enclosing
+// function, a closure-typed LOCAL/GLOBAL binding, or a union arm narrowed to a bare closure.
+// "" when `name` is not a resolvable closure value or its annotation is not a `(…) => R`
+// arrow. Lets the niche-nullable classifiers recognize `p()` where `p: () => boolean | null`
+// (a closure-param call `fnIndexOf` can't see) as the niche its RETURN type declares — the
+// resolved `$fnsig` key can't (a `boolean|null` niche rides `>i`, same as a plain `boolean`).
+export function calleeCloRetName(name: string, fnIx: i32) {
+  let ft = ""
+  // A union binding narrowed to a bare-closure arm carries the arm's `(…) => R` name.
+  const nc = narrowedClosureOf(name)
+  if nc != "" {
+    ft = nc
+  } else if fnIx >= 0 {
+    // A closure-typed PARAM of the enclosing function.
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const params = fn.fnParams
+      let i = 0
+      while i < params.length {
+        const p = P.nodes[params[i]]
+        if p is Param {
+          if p.parName == name {
+            const pn = tyNameOf(p.parType)
+            if annArrowAt(pn) >= 0 { ft = pn }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  // A closure-typed LOCAL / GLOBAL binding annotation.
+  if ft == "" { ft = identFnTypeAnnName(name, fnIx) }
+  const at = annArrowAt(ft)
+  if at < 0 { return "" }
+  return ft.slice(at + 2, ft.length)
+}
+
 // True if the expression is a NAME (param / local / module global) annotated
 // `boolean|null` — the niche scalar nullable.
 export function exprNulBool(exprIx: i32, fnIx: i32) {
@@ -5696,6 +5735,9 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
           return false
         }
       }
+      // A call of a closure-typed VALUE (`p()` where `p: () => boolean | null`) — a
+      // param / local / global `fnIndexOf` can't see: read its return-type annotation.
+      if nameIsNulBool(calleeCloRetName(callee.identName, fnIx)) { return true }
     }
     return false
   }
@@ -5766,6 +5808,9 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
           if cfn.fnRet >= 0 { return nodeTyIsNulLitUnion(cfn.fnRet) }
         }
       }
+      // A call of a closure-typed VALUE (`p()` where `p: () => K | null`) — a param /
+      // local / global whose `K | null` niche return `fnIndexOf` can't see.
+      if nameIsNulLitUnion(calleeCloRetName(callee.identName, fnIx)) { return true }
     }
     return false
   }
