@@ -316,8 +316,14 @@ function cloParamTok(paramIx: i32) {
   // rather than emitting invalid wasm. (`nulstr`/`nulstruct` DO carry result
   // tokens, so the exclusion must be explicit here.)
   if k == "nulstr" || k == "nulstruct" { return "" }
+  // A MAP param stays OUTSIDE the value-call ABI (only map RESULTS are wired — the closure
+  // result carries the map shape). `repSigTokOfKind("map")` now yields a result token, so
+  // exclude it explicitly here (like `nulstr`/`nulstruct`) — else a map param would key a
+  // slot-less `m` and mis-lower. The soundness floor rejects a map-param value with a clear
+  // message.
+  if k == "map" { return "" }
   // Every slot-free kind reads the shared canonical token table (emit_rep) —
-  // "" for the kinds outside the value-call ABI (maps, scalar lists, niches).
+  // "" for the kinds outside the value-call ABI (scalar lists, niches).
   repSigTokOfKind(k)
 }
 
@@ -542,6 +548,9 @@ export function cloRetValSlot(fe: i32) {
       // A `: S[]` / `: ((i32) => i32)[]` annotated REF-LIST result (kind 5) — the slot is the
       // ref-list slot (`rlWrapIdx`-bearing), the dual of a `cloParamTok` kind-5 param's slot.
       if k == "reflist" { return tyAnnRefListSlot(fn.fnRet) }
+      // A `: {[string]: V}` annotated MAP result (kind 6) — the slot is the map SHAPE (mono ⇒
+      // -1, or the value type's mv slot), so the `$fnsig` result selects THIS map's `$mapStruct`.
+      if k == "map" { return mapAnnShape(fn.fnRet) }
       return -1
     }
     // A collapsed-to-one-variant inferred result (kind 8) — the variant index.
@@ -549,6 +558,13 @@ export function cloRetValSlot(fe: i32) {
     if cvi >= 0 { return cvi }
     if fRetRef[fe] == 1 { return fRetStructIdx[fe] }
     if fRetNul[fe] == 1 { return fRetStructIdx[fe] }
+    // An INFERRED map return (`() => (h)` over a captured/local map) — the map SHAPE from the
+    // return expression (`mapRetExprShape`, capture-aware), so the `$fnsig` result matches the
+    // returned map value's typed `$mapStruct`.
+    if fRetMap[fe] == 1 {
+      const mrx = fnRetExprOf(fnStmts[fe])
+      if mrx >= 0 { return mapRetExprShape(mrx, fnStmts[fe]) }
+    }
     // An inferred ref-list return (`() => [{…}]` / `() => [(x) => …]`, kind 5) — its element
     // NAME (`fRetRArrElem`, set by the return-classify scan) resolves the ref-list slot.
     if fRetListKind[fe] == 5 { return rlSlotByName(fRetRArrElem[fe]) }
@@ -568,6 +584,14 @@ function cloRetKeySuffix(fe: i32) {
   // its struct index, a concrete-VARIANT result by its variant index — so two
   // callbacks share a sig iff they return the SAME shape.
   if k == "struct" || k == "nulstruct" || k == "variant" {
+    return ">" + repSigTokOfKind(k) + i32ToStr(cloRetValSlot(fe)) + ";"
+  }
+  // A MAP result carries its map SHAPE slot (`cloRetValSlot` → the mv slot; mono = -1), so
+  // two map-returning closures share a `$fnsig` exactly when their value types match, and the
+  // `$fnsig` result `(ref $mapStruct)` selects THIS map's struct — the heap type the returned
+  // map value and the closure's env field both carry. Makes a map-returning closure
+  // representable (a non-empty key) instead of tripping the soundness floor.
+  if k == "map" {
     return ">" + repSigTokOfKind(k) + i32ToStr(cloRetValSlot(fe)) + ";"
   }
   // A REF-LIST result (`S[]` / `((i32) => i32)[]` / a union list): the `$fnsig`
@@ -1349,7 +1373,47 @@ export function mapRetExprShape(rx: i32, fnIx: i32) {
       return fnRetMapShape(callee.identName)
     }
   }
+  // A CAPTURED map return (`(q) => (h)` over an enclosing-frame map `h`): the ident is
+  // neither a param nor a local of THIS function, so the arms above miss it. Resolve its
+  // shape from the capture — the SAME `captureValStructIdx` the env field uses — so the
+  // functype result `$mapStruct` heap type matches the env field AND the captured value.
+  const cap = retCapturedMapShape(fnIx, rx)
+  if cap != -3 { return cap }
   -1
+}
+
+// The map SHAPE of a return expression that is a CAPTURED map variable — an ident lifted
+// function `fnIx` closes over whose enclosing binding is a `{[string]: V}` map — as the mv
+// slot (>= -1; mono = -1), or -3 when the return is NOT a captured map. The capture SET
+// (`captureNamesOf`) is the source of truth: only a name that is an actual env field is
+// resolved here (a same-named local/param shadowing a capture stays with the local arms).
+// A map-returning closure over a captured map is invisible to the local/param map tests, so
+// without this its result inferred as i32 over a map-ref body — invalid wasm at the return.
+function retCapturedMapShape(fnIx: i32, rx: i32): i32 {
+  let u = rx
+  let done = false
+  while !done {
+    const node = P.nodes[u]
+    if node is Paren { u = node.parInner } else { done = true }
+  }
+  const e = P.nodes[u]
+  if e is Ident {
+    const fe = fnStmtsPosOf(fnIx)
+    if fe >= 0 {
+      const caps = captureNamesOf(fe)
+      let ci = 0
+      while ci < caps.length {
+        if caps[ci] == e.identName {
+          if captureValKind(fe, e.identName) == "map" {
+            return captureValStructIdx(fe, e.identName)
+          }
+          return -3
+        }
+        ci = ci + 1
+      }
+    }
+  }
+  -3
 }
 
 function retIsMapLocalAnnot(rx: i32, fnIx: i32) {
@@ -1449,7 +1513,11 @@ export function criClassify(rx0: i32, i: i32) {
     // `exprMap` classifies a returned map PARAM (reads `parType` directly) and a `Map()`/
     // map-returning-call. A returned map LOCAL needs `retIsMapLocalAnnot` — its kind isn't
     // collected during this GLOBAL return pass, so read its `{[string]: i32}` annotation.
-    if exprMap(rx, fnStmts[i]) || retIsMapLocalAnnot(rx, fnStmts[i]) {
+    if (
+      exprMap(rx, fnStmts[i]) ||
+      retIsMapLocalAnnot(rx, fnStmts[i]) ||
+      retCapturedMapShape(fnStmts[i], rx) != -3
+    ) {
       fRetMap[i] = 1
       criChanged = true
     }
@@ -1950,9 +2018,22 @@ export function captureValStructIdx(fe: i32, name: string) {
   const b = parentBindingOf(fe, name)
   if b < 0 { return -1 }
   const bn = P.nodes[b]
-  if bn is Param { return retStructIndex(bn.parType) }
+  // A captured MAP binding's companion slot is its map SHAPE (mono ⇒ -1, or the value
+  // type's mv slot) — the SAME `mapAnnShape` the local/param/return valtypes resolve, so the
+  // env field's `$mapStruct` heap type matches the captured map value's exactly (a typed
+  // `{[string]: f32}` capture is `(ref $mvMapTypeIdx)`, not the mono `$mapStruct`). Mirrors
+  // `captureValKind`, whose annotation arm already yields "map"; without this the annotated
+  // arms fell through to `retStructIndex` (−1 for a map) and the env boxed a typed map into a
+  // mono field — invalid wasm at the closure `struct.new`.
+  if bn is Param {
+    if retMapFlag(bn.parType) == 1 { return mapAnnShape(bn.parType) }
+    return retStructIndex(bn.parType)
+  }
   if bn is LetDecl {
-    if bn.letType >= 0 { return retStructIndex(bn.letType) }
+    if bn.letType >= 0 {
+      if retMapFlag(bn.letType) == 1 { return mapAnnShape(bn.letType) }
+      return retStructIndex(bn.letType)
+    }
     if bn.letInit >= 0 {
       const pf = fnParent[fe]
       // The kind-specific companion index, mirroring `captureValKind`'s ladder:
@@ -10859,6 +10940,17 @@ function annRetKind(t: string) {
   if nameIsRefArray(t) {
     const rs = rlSlotByName(refArrElemName(t))
     if rs >= 0 { return ">" + repSigTokOfKind("reflist") + i32ToStr(rs) + ";" }
+  }
+  // A MAP return — `{[string]: V}`, matching `cloRetKeySuffix`'s map result token so the AST
+  // and annotation sig producers agree (a value call's `ref.cast` to this `$fnsig` must
+  // byte-match). The slot is the map SHAPE (mono ⇒ -1, else the value type's mv slot) — the
+  // SAME `mapAnnShape`/`cloRetValSlot` the AST producer keys. BEFORE the closure case (a map
+  // annotation carries no top-level arrow, but keep the ABI arms grouped).
+  if nameIsMap(t) {
+    return ">" +
+      repSigTokOfKind("map") +
+      i32ToStr(mvSlotOfMapValNameOrMono(mapValNameOf(t))) +
+      ";"
   }
   // A CLOSURE return — a function-type result (`(i32) => ((i32) => i32)`), matching
   // `cloRetKeySuffix`'s closure-result token so the AST and annotation sig producers agree
