@@ -53,12 +53,19 @@ only; the parser is hand-written) · `tests/` — `.vl` corpus + runner · `docs
      `structIndexOfTypeName`. The remaining `structIndexByName` sites stay nominal-only for now — migrate
      each opportunistically when a structural name actually reaches it (premature otherwise: today they
      all receive nominal names, so a blanket swap is a no-op with risk).
-  2. 🟡 **Rep-bug burn-down.** The tester and the ten confirmed bug families from its first
-     sweeps are SHIPPED/FIXED (→ `CHANGELOG.md`; findings log `docs/internals/rep-fuzz-findings.md`).
-     REMAINING: the deferral tail (small literal into an i64 struct field through a LAMBDA context;
-     `for k in K[]` litunion-array iteration emits invalid wasm; niche-element lists
-     `(boolean|null)[]`/`(string|null)[]` are clean rejects, not reps; audit the `??` litunion join
-     for over-widening at other sites) + keep graduating baseline shapes as fixes land.
+  2. 🟡 **Rep-bug burn-down.** ✅ **Soundness milestone reached:** every unsound class
+     (INVALID-WASM, TRAP, MISMATCH) is now **0** at the pinned CI seeds — the residual baseline is
+     36 shapes, ALL fail-loud REJECT (coverage gaps the compiler refuses cleanly, never silent
+     miscompiles). Details + wave history in `docs/internals/rep-fuzz-findings.md`.
+     REMAINING (coverage, not soundness), largest-first: **(a) union with a MAP member**
+     (`{[string]:V} | X`, ~16 shapes — the biggest family; needs the union interner to carry a
+     map atom); **(b) union with an ARRAY member** — a genuine multi-layer feature (register the
+     ref-array arm → new tag sub-scheme → box in `emitUnionCoerce` → `is <ref-array>` → narrowed
+     reflist read); a registration-only patch would turn the loud REJECT into a SILENT invalid-wasm,
+     so this is scoped as its own **dedicated deep task**, not a bounded fix; **(c)** the map READER
+     path through the value-call ABI (construct-and-return is fixed, #860); **(d)** niche
+     nullable-scalar lists `(boolean|null)[]`/`(f64|null)[]` (clean rejects, no box rep) + the
+     lambda-param i64-context deferral tail. Keep graduating baseline shapes as fixes land.
   3. 🟡 **`repOf(type) → descriptor` unification (the "rewrite") — strangler, in progress.**
      Foundation SHIPPED (→ `CHANGELOG.md`): `emit_rep.vl`'s `RepDesc` derived table-driven from the
      `Ty` arena (cycle-safe: kind arms recurse ≤1 wrapper level; generation-stamped visited marks),
