@@ -7032,6 +7032,20 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             inferred = expRet
           }
         }
+        // MAP-MEMBER-UNION result (`() => {[string]:f32} | {w:i32}`): a lambda whose body infers
+        // one struct arm of the expected map-member-union box result adopts the union, so the
+        // widening lands at the return seam — `emitReturnValue` boxes the struct/map arm into the
+        // #865/#868 map-union box and the lambda's functype result IS the box (`synthRetAnnots` pins
+        // `fnRet` to the recorded union name). Without this the body returned a bare struct into a
+        // union-box functype result (a `ref valtype with no interned shape` crash). Position-
+        // independent, like the value-union arm: the annotated `: {[string]:f32}|{w:i32}` return
+        // exposes this rep already, so the lambda pin adds no invalid wasm.
+        if inferred != expRet && mapUnionRetName(expRet) != "" {
+          const muTail = lambdaBodyTail(n.fnBody)
+          if muTail >= 0 && assignableExpr(muTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
         // ELEMENT-NULLABLE LIST result (`() => (f64|null)[]`): a lambda whose body is an
         // array literal assignable to the expected value-union-box list adopts it, so
         // `emitReturnValue` seeds each nullable element (`[null]`) through the SAME rep the
@@ -7180,6 +7194,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // the value-union-box list, whose `[null]` element seeding `emitReturnValue` already
         // performs for the annotated form.
         if unm == "" { unm = nulElemListRetName(inferred) }
+        // A MAP-MEMBER-UNION contextual return (`() => {[string]:f32} | {w:i32}`, adopted just above)
+        // — record its emitter name so `synthRetAnnots` pins the lambda's `fnRet` as the map-union box
+        // (#865/#868), whose arm boxing `emitReturnValue` already performs for the annotated form.
+        if unm == "" { unm = mapUnionRetName(inferred) }
         // A LITERAL-UNION contextual return (`(i32) => K = (x) => "b"`, adopted just above) — record
         // the ALIAS name so `synthRetAnnots` pins the lambda's `fnRet` as the litunion, whose functype
         // result reps as an i32 atom (`vtKindOfType`): the `$fnsig` result keys `>i` to match the value
@@ -8028,6 +8046,34 @@ function nulElemListRetName(er: i32) {
         return "(" + inner + "|null)[]"
       }
     }
+  }
+  ""
+}
+
+// The emitter-format NAME of an inferred MAP-MEMBER-UNION return `er` (`{[string]:f32}|{w:i32}`):
+// a ≥2-member union whose FIRST member is a MAP and whose every member is a map or object shape.
+// `tyToEmitName` renders it in the emitter's non-spaced vocabulary, MAP-FIRST (so the name matches
+// `nameIsMap`, the shape the emitter's `registerInlineUnion` map-member-union box path — #865/#868 —
+// keys on). Pinning a lambda's `fnRet` to this (`synthRetAnnots`) routes the anonymous lambda through
+// the SAME sound rep the annotated `: {[string]:f32}|{w:i32}` return lowers (verified: the annotated
+// spelling interns + prints; the pin only removes the annotation). "" for a non-union, a map-SECOND
+// union (the emitter's classifiers assume map-first — left a LOUD reject, never invalid wasm), or a
+// union with a non-map/non-object member (an unrepresentable arm the box path rejects downstream).
+function mapUnionRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyUnion {
+    const members = t.uMembers
+    if members.length < 2 { return "" }
+    const first = T.tys[members[0]]
+    if !(first is TyMap) { return "" }
+    let i = 0
+    while i < members.length {
+      const m = T.tys[members[i]]
+      if !(m is TyMap) && !(m is TyObj) { return "" }
+      i = i + 1
+    }
+    return tyToEmitName(er)
   }
   ""
 }
