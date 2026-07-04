@@ -7003,7 +7003,13 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         if inferred != expRet {
           const etU = T.tys[expRet]
           if etU is TyNullable {
-            if tyToStr(etU.nInner) == "string" {
+            const etInner = tyToStr(etU.nInner)
+            // The BOOLEAN-niche dual of the string niche: a lambda whose body infers a bare
+            // `boolean` / `null` member of an expected `boolean | null` (`() => boolean | null =
+            // () => null`) adopts the niche — its functype result is the i32 sentinel (2 = null),
+            // exactly as the annotated `: boolean | null` return and the named-function VALUE lower.
+            // Recorded by `nullableRetName` + pinned by `synthRetAnnots` (`nullablePartOf` non-empty).
+            if etInner == "string" || etInner == "boolean" {
               const nsTail = lambdaBodyTail(n.fnBody)
               if nsTail >= 0 && assignableExpr(nsTail, inferred, expRet) {
                 inferred = expRet
@@ -7023,6 +7029,18 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         if inferred != expRet && valueUnionRetName(expRet) != "" {
           const vuTail = lambdaBodyTail(n.fnBody)
           if vuTail >= 0 && assignableExpr(vuTail, inferred, expRet) {
+            inferred = expRet
+          }
+        }
+        // ELEMENT-NULLABLE LIST result (`() => (f64|null)[]`): a lambda whose body is an
+        // array literal assignable to the expected value-union-box list adopts it, so
+        // `emitReturnValue` seeds each nullable element (`[null]`) through the SAME rep the
+        // annotated `(f64|null)[]` return / named-function form already lowers soundly
+        // (`synthRetAnnots` pins `fnRet`). Position-independent: the annotated spelling
+        // exposes this rep everywhere already, so the lambda pin cannot add invalid wasm.
+        if inferred != expRet && nulElemListRetName(expRet) != "" {
+          const elTail = lambdaBodyTail(n.fnBody)
+          if elTail >= 0 && assignableExpr(elTail, inferred, expRet) {
             inferred = expRet
           }
         }
@@ -7157,6 +7175,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // node sentinel so `synthRetAnnots` pins a nullable-returning closure value position-
         // independently (the nullable dual of the union pin).
         if unm == "" { unm = nullableRetName(inferred, gRootStmts) }
+        // An ELEMENT-NULLABLE list contextual return (`() => (f64|null)[]`, adopted just
+        // above) — record its emitter name so `synthRetAnnots` pins the lambda's `fnRet` as
+        // the value-union-box list, whose `[null]` element seeding `emitReturnValue` already
+        // performs for the annotated form.
+        if unm == "" { unm = nulElemListRetName(inferred) }
         // A LITERAL-UNION contextual return (`(i32) => K = (x) => "b"`, adopted just above) — record
         // the ALIAS name so `synthRetAnnots` pins the lambda's `fnRet` as the litunion, whose functype
         // result reps as an i32 atom (`vtKindOfType`): the `$fnsig` result keys `>i` to match the value
@@ -7977,6 +8000,33 @@ function nullableRetName(er: i32, stmts: i32[]) {
       if nm != "" { return nm + "|null" }
     } else if tyToStr(t.nInner) == "string" {
       return "string|null"
+    } else if tyToStr(t.nInner) == "boolean" {
+      // The boolean niche (`boolean | null`): the i32 sentinel rep (2 = null). Pinned by
+      // `synthRetAnnots` (`nullablePartOf` non-empty) so `emitReturnValue`'s `tyIsNulBool`
+      // arm niches a `return null` / `return <bool>`, matching the annotated form.
+      return "boolean|null"
+    }
+  }
+  ""
+}
+
+// The emitter-format NAME of an inferred ELEMENT-NULLABLE list return `er` — `(f64|null)[]`,
+// `(i32|null)[]`, `(i64|null)[]`, `(f32|null)[]`: a `TyArray` whose element is a `TyNullable`
+// over a numeric scalar. Its elements are the value-union `{tag, payload}` boxes (element kind
+// 2, the SAME rep the annotated `(f64|null)[]` return uses), so the emitter pins a lambda to it
+// (`synthRetAnnots`) and routes through that existing sound path. The parser renders the union
+// with NO spaces (`f64|null`), matching `parenUnionArrElemName` / `isValueUnionName`. "" unless
+// `er` is such an array (a struct / string / boolean element uses a distinct or absent rep).
+function nulElemListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    const et = T.tys[t.aElem]
+    if et is TyNullable {
+      const inner = tyToStr(et.nInner)
+      if inner == "f64" || inner == "i32" || inner == "i64" || inner == "f32" {
+        return "(" + inner + "|null)[]"
+      }
     }
   }
   ""
